@@ -15,6 +15,20 @@ import mcp.protocol.capabilities;
 import mcp.protocol.types;
 import mcp.protocol.draft;
 
+/// Internal signal that the modern single-endpoint POST returned an HTTP
+/// 400/404/405, the trigger for the legacy HTTP+SSE (2024-11-05) fallback.
+private final class LegacyFallbackException : Exception
+{
+    int status;
+    this(int status) @safe
+    {
+        import std.conv : to;
+
+        super("legacy HTTP+SSE fallback (HTTP " ~ status.to!string ~ ")");
+        this.status = status;
+    }
+}
+
 /// A Model Context Protocol client over the Streamable HTTP transport.
 ///
 /// Drives the lifecycle (`initialize` + `notifications/initialized`) and the
@@ -36,6 +50,21 @@ final class MCPClient
     private string sseLastEventId;
     private long sseRetryMs;
     private string pendingLastEventId;
+    // Legacy HTTP+SSE (2024-11-05) transport state. When `legacyMode` is set,
+    // JSON-RPC messages are POSTed to `legacyEndpoint` (discovered from the GET
+    // stream's `endpoint` event) and responses arrive on the standalone GET SSE
+    // stream rather than on the POST response.
+    private bool legacyMode;
+    private string legacyEndpoint;
+    // The most recent HTTP status seen on a POST, so the lifecycle code can
+    // detect the 400/404/405 backward-compatibility trigger.
+    private int lastPostStatus;
+    // When awaiting a legacy response on the GET stream, the id we expect and
+    // the slot the GET-stream reader fills in.
+    private long legacyExpectId;
+    private Json legacyResult;
+    private bool legacyGot;
+    private McpException legacyErr;
 
     /// Capabilities this client advertises at initialize.
     ClientCapabilities capabilities;
@@ -125,6 +154,15 @@ final class MCPClient
         try
         {
             serverVersions = discover().protocolVersions;
+        }
+        catch (LegacyFallbackException)
+        {
+            // Modern POST rejected with 400/404/405: this is (or may be) an old
+            // HTTP+SSE server. Open the GET SSE stream, read its `endpoint`
+            // event, and drive the two-endpoint legacy transport.
+            startLegacyHttpSse();
+            initialize(ProtocolVersion.v2024_11_05.toWire);
+            return negotiated;
         }
         catch (McpException e)
         {
@@ -291,7 +329,10 @@ final class MCPClient
         const id = nextId++;
         if (useDraft)
             params = injectDraftMeta(params);
-        return postAndAwait(makeRequest(Json(id), method, params), id);
+        auto message = makeRequest(Json(id), method, params);
+        if (legacyMode)
+            return legacyRpc(message, id);
+        return postAndAwait(message, id);
     }
 
     /// Add the draft per-request `_meta` (protocol version, client identity,
@@ -316,10 +357,12 @@ final class MCPClient
     }
 
     /// POST a message that expects no correlated reply (notification/response).
+    /// In legacy HTTP+SSE mode, messages go to the server-supplied endpoint URI.
     private void post(Json message) @safe
     {
+        const target = legacyMode ? legacyEndpoint : url;
         () @trusted {
-            requestHTTP(url, (scope HTTPClientRequest req) {
+            requestHTTP(target, (scope HTTPClientRequest req) {
                 setupRequest(req, message);
             }, (scope HTTPClientResponse res) {
                 captureSession(res);
@@ -349,6 +392,12 @@ final class MCPClient
                 setupRequest(req, message);
             }, (scope HTTPClientResponse res) {
                 captureSession(res);
+                lastPostStatus = res.statusCode;
+                if (isLegacyFallbackStatus(res.statusCode))
+                {
+                    res.dropBody();
+                    return; // signalled below via lastPostStatus
+                }
                 const ct = res.headers.get("Content-Type", "");
                 if (ct.canFind("text/event-stream"))
                 {
@@ -368,6 +417,12 @@ final class MCPClient
                 }
             });
         }();
+
+        // An HTTP 400/404/405 on the modern single endpoint is the signal to try
+        // the legacy HTTP+SSE (2024-11-05) transport. Surface it as a typed
+        // exception so the lifecycle code (`connect`) can drive the fallback.
+        if (isLegacyFallbackStatus(lastPostStatus) && !got && err is null)
+            throw new LegacyFallbackException(lastPostStatus);
 
         if (err !is null)
             throw err;
@@ -936,6 +991,236 @@ final class MCPClient
         }
     }
 
+    /// Establish the legacy HTTP+SSE (2024-11-05) two-endpoint transport:
+    /// open the GET SSE stream at the server URL, read the first `endpoint`
+    /// event to learn the message-POST URI, then keep the stream open in a
+    /// background task to receive JSON-RPC responses and server notifications.
+    /// Throws if the `endpoint` event is not received.
+    private void startLegacyHttpSse() @safe
+    {
+        import vibe.core.core : runTask, sleep;
+        import core.time : msecs;
+
+        legacyMode = true;
+        legacyEndpoint = null;
+
+        // The GET SSE stream is long-lived: run its reader on a background task
+        // so this method can return once the `endpoint` event has arrived.
+        runTask(() nothrow{
+            try
+                runLegacyStream();
+            catch (Exception)
+            {
+            }
+        });
+
+        // Wait (bounded) for the background task to discover the endpoint URI.
+        foreach (_; 0 .. 200) // up to ~10s at 50ms granularity
+        {
+            if (legacyEndpoint.length)
+                break;
+            () @trusted { sleep(50.msecs); }();
+        }
+        if (legacyEndpoint.length == 0)
+        {
+            legacyMode = false;
+            throw internalError(
+                    "legacy HTTP+SSE server did not send an `endpoint` event on the GET stream");
+        }
+    }
+
+    /// Send a JSON-RPC request over the legacy transport: POST it to the
+    /// server-supplied endpoint URI, then await the correlated response, which
+    /// arrives asynchronously on the standalone GET SSE stream.
+    private Json legacyRpc(Json message, long expectId) @safe
+    {
+        import vibe.core.core : sleep;
+        import core.time : msecs;
+
+        legacyExpectId = expectId;
+        legacyResult = Json.undefined;
+        legacyGot = false;
+        legacyErr = null;
+
+        post(message); // POST to legacyEndpoint; server replies on the GET stream
+
+        foreach (_; 0 .. 1200) // up to ~60s at 50ms granularity
+        {
+            if (legacyGot || legacyErr !is null)
+                break;
+            () @trusted { sleep(50.msecs); }();
+        }
+        legacyExpectId = 0;
+        if (legacyErr !is null)
+            throw legacyErr;
+        if (legacyGot)
+            return legacyResult;
+        throw internalError("No legacy HTTP+SSE response for request " ~ method2(expectId));
+    }
+
+    /// Read the legacy GET SSE stream over a raw TCP connection, dispatching
+    /// each event by type: an `endpoint` event sets the message-POST URI; a
+    /// `message` (or default) event is a JSON-RPC message routed to the awaited
+    /// response slot or to the inbound dispatcher.
+    private void runLegacyStream() @safe
+    {
+        import vibe.core.net : connectTCP;
+        import vibe.stream.operations : readLine;
+        import vibe.core.stream : IOMode;
+        import std.string : indexOf, startsWith, strip, toLower;
+        import std.conv : to, parse;
+
+        auto rest = url;
+        const sep = rest.indexOf("://");
+        if (sep >= 0)
+            rest = rest[sep + 3 .. $];
+        const slash = rest.indexOf('/');
+        const hostPort = (slash < 0) ? rest : rest[0 .. slash];
+        const path = (slash < 0) ? "/" : rest[slash .. $];
+        const colon = hostPort.indexOf(':');
+        const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
+        const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
+
+        () @trusted {
+            try
+            {
+                auto conn = connectTCP(host, port);
+                scope (exit)
+                    conn.close();
+
+                string req = "GET " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
+                    ~ "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n";
+                if (bearerToken.length)
+                    req ~= "Authorization: Bearer " ~ bearerToken ~ "\r\n";
+                if (sessionId.length)
+                    req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
+                req ~= "\r\n";
+                conn.write(cast(const(ubyte)[]) req);
+
+                auto statusLine = cast(string) readLine(conn).idup;
+                if (statusLine.indexOf(" 200") < 0)
+                    return;
+                bool chunked;
+                for (;;)
+                {
+                    auto h = cast(string) readLine(conn).idup;
+                    if (h.length && h[$ - 1] == '\r')
+                        h = h[0 .. $ - 1];
+                    if (h.toLower.indexOf("transfer-encoding:") == 0
+                            && h.toLower.indexOf("chunked") >= 0)
+                        chunked = true;
+                    if (h.length == 0)
+                        break;
+                }
+
+                string acc, data, eventType;
+                void handleEvent()
+                {
+                    scope (exit)
+                    {
+                        data = null;
+                        eventType = null;
+                    }
+                    if (data.length == 0)
+                        return;
+                    if (eventType == "endpoint")
+                    {
+                        legacyEndpoint = resolveEndpointUri(url, data.strip);
+                        return;
+                    }
+                    // `message` event (or untyped): a JSON-RPC message.
+                    try
+                    {
+                        auto m = Message(parseJsonString(data));
+                        if ((m.kind == MessageKind.response
+                                || m.kind == MessageKind.errorResponse)
+                                && m.id.type == Json.Type.int_ && m.id.get!long == legacyExpectId)
+                        {
+                            if (m.kind == MessageKind.errorResponse)
+                                legacyErr = errorFrom(m.error);
+                            else
+                            {
+                                legacyResult = m.result;
+                                legacyGot = true;
+                            }
+                        }
+                        else
+                            dispatchInbound(m);
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+
+                void parseSse()
+                {
+                    for (;;)
+                    {
+                        const nl = acc.indexOf('\n');
+                        if (nl < 0)
+                            break;
+                        auto line = acc[0 .. nl];
+                        acc = acc[nl + 1 .. $];
+                        if (line.length && line[$ - 1] == '\r')
+                            line = line[0 .. $ - 1];
+                        if (line.length == 0)
+                            handleEvent();
+                        else if (line.startsWith("event:"))
+                        {
+                            auto v = line["event:".length .. $];
+                            if (v.startsWith(" "))
+                                v = v[1 .. $];
+                            eventType = v;
+                        }
+                        else if (line.startsWith("data:"))
+                        {
+                            auto d = line["data:".length .. $];
+                            if (d.startsWith(" "))
+                                d = d[1 .. $];
+                            data ~= (data.length ? "\n" : "") ~ d;
+                        }
+                    }
+                }
+
+                for (;;)
+                {
+                    if (chunked)
+                    {
+                        auto sizeLine = (cast(string) readLine(conn).idup).strip;
+                        if (sizeLine.length == 0)
+                            continue;
+                        uint sz;
+                        try
+                            sz = parse!uint(sizeLine, 16);
+                        catch (Exception)
+                            break;
+                        if (sz == 0)
+                            break;
+                        auto chunk = new ubyte[sz];
+                        conn.read(chunk, IOMode.all);
+                        acc ~= cast(string) chunk.idup;
+                        readLine(conn);
+                        parseSse();
+                    }
+                    else
+                    {
+                        const avail = conn.leastSize;
+                        if (avail == 0)
+                            break;
+                        const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
+                        auto buf = new ubyte[toRead];
+                        conn.read(buf, IOMode.once);
+                        acc ~= cast(string) buf.idup;
+                        parseSse();
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }();
+    }
+
     /// Answer a server->client request by dispatching to the matching handler
     /// and POSTing the response on a *separate* task. Posting on its own task is
     /// essential: we are currently inside the SSE-read callback of the original
@@ -1020,6 +1305,100 @@ bool selectMutualVersion(const string[] serverVersions, out ProtocolVersion chos
     return false;
 }
 
+/// Whether an HTTP status from the initial modern POST should trigger the
+/// legacy HTTP+SSE (2024-11-05) backward-compatibility fallback. Per
+/// basic/transports §Backwards Compatibility, a client probing a single modern
+/// endpoint should fall back when the POST fails with 400 Bad Request, 404 Not
+/// Found, or 405 Method Not Allowed.
+bool isLegacyFallbackStatus(int status) pure nothrow @safe @nogc
+{
+    return status == 400 || status == 404 || status == 405;
+}
+
+/// Parse a legacy HTTP+SSE event stream looking for the first `endpoint` event,
+/// returning its `data:` payload (the message-POST URI) in `uri`. Returns false
+/// if no `endpoint` event is found in the supplied buffer. Handles CRLF and LF
+/// line endings and the optional single leading space after `data:`.
+bool parseEndpointEvent(string sse, out string uri) @safe
+{
+    import std.string : startsWith, splitLines;
+
+    string eventType;
+    string data;
+    bool haveData;
+
+    bool flush()
+    {
+        if (eventType == "endpoint" && haveData)
+        {
+            uri = data;
+            return true;
+        }
+        eventType = null;
+        data = null;
+        haveData = false;
+        return false;
+    }
+
+    foreach (raw; sse.splitLines())
+    {
+        auto line = raw;
+        if (line.length && line[$ - 1] == '\r')
+            line = line[0 .. $ - 1];
+        if (line.length == 0)
+        {
+            if (flush())
+                return true;
+            continue;
+        }
+        if (line.startsWith("event:"))
+        {
+            auto v = line["event:".length .. $];
+            if (v.startsWith(" "))
+                v = v[1 .. $];
+            eventType = v;
+        }
+        else if (line.startsWith("data:"))
+        {
+            auto d = line["data:".length .. $];
+            if (d.startsWith(" "))
+                d = d[1 .. $];
+            data ~= (haveData ? "\n" : "") ~ d;
+            haveData = true;
+        }
+    }
+    // A trailing event without a terminating blank line.
+    return flush();
+}
+
+/// Resolve a legacy `endpoint` event URI (which may be absolute, root-relative,
+/// or document-relative) against the GET-SSE base URL, yielding the absolute URL
+/// to POST subsequent JSON-RPC messages to.
+string resolveEndpointUri(string baseUrl, string endpoint) @safe
+{
+    import std.string : indexOf, startsWith, lastIndexOf;
+
+    if (endpoint.startsWith("http://") || endpoint.startsWith("https://"))
+        return endpoint;
+
+    // Split base into scheme://authority and path.
+    const sep = baseUrl.indexOf("://");
+    if (sep < 0)
+        return endpoint;
+    const afterScheme = sep + 3;
+    const slash = baseUrl[afterScheme .. $].indexOf('/');
+    string origin = (slash < 0) ? baseUrl : baseUrl[0 .. afterScheme + slash];
+    string basePath = (slash < 0) ? "/" : baseUrl[afterScheme + slash .. $];
+
+    if (endpoint.startsWith("/"))
+        return origin ~ endpoint;
+
+    // Document-relative: replace the last path segment of the base.
+    const lastSlash = basePath.lastIndexOf('/');
+    string dir = (lastSlash < 0) ? "/" : basePath[0 .. lastSlash + 1];
+    return origin ~ dir ~ endpoint;
+}
+
 /// Validate the protocol version the server returned in its `initialize`
 /// response and return the version to operate under. Per the Lifecycle /
 /// Version Negotiation requirement ("If the client does not support the version
@@ -1074,4 +1453,70 @@ unittest  // selectMutualVersion reports no overlap
     ProtocolVersion v;
     assert(!selectMutualVersion(["1999-01-01"], v));
     assert(!selectMutualVersion([], v));
+}
+
+unittest  // isLegacyFallbackStatus recognises the spec's 400/404/405 triggers
+{
+    assert(isLegacyFallbackStatus(400));
+    assert(isLegacyFallbackStatus(404));
+    assert(isLegacyFallbackStatus(405));
+}
+
+unittest  // isLegacyFallbackStatus ignores success and other errors
+{
+    assert(!isLegacyFallbackStatus(200));
+    assert(!isLegacyFallbackStatus(202));
+    assert(!isLegacyFallbackStatus(401));
+    assert(!isLegacyFallbackStatus(500));
+}
+
+unittest  // parseEndpointEvent extracts the message URI from a legacy SSE endpoint event
+{
+    // A real 2024-11-05 HTTP+SSE server's first event on the GET stream.
+    string sse = "event: endpoint\ndata: /messages?sessionId=abc123\n\n";
+    string uri;
+    assert(parseEndpointEvent(sse, uri));
+    assert(uri == "/messages?sessionId=abc123");
+}
+
+unittest  // parseEndpointEvent handles CRLF line endings and leading data space
+{
+    string sse = "event: endpoint\r\ndata:/messages\r\n\r\n";
+    string uri;
+    assert(parseEndpointEvent(sse, uri));
+    assert(uri == "/messages");
+}
+
+unittest  // parseEndpointEvent ignores a message event and finds a later endpoint event
+{
+    string sse = "event: message\ndata: {\"jsonrpc\":\"2.0\"}\n\n"
+        ~ "event: endpoint\ndata: /post\n\n";
+    string uri;
+    assert(parseEndpointEvent(sse, uri));
+    assert(uri == "/post");
+}
+
+unittest  // parseEndpointEvent returns false when no endpoint event is present
+{
+    string sse = "event: message\ndata: {}\n\n";
+    string uri;
+    assert(!parseEndpointEvent(sse, uri));
+}
+
+unittest  // resolveEndpointUri keeps an absolute URI unchanged
+{
+    assert(resolveEndpointUri("http://host:8080/mcp",
+            "http://other:9000/messages") == "http://other:9000/messages");
+}
+
+unittest  // resolveEndpointUri resolves a root-relative path against the server origin
+{
+    assert(resolveEndpointUri("http://host:8080/sse",
+            "/messages?sessionId=abc") == "http://host:8080/messages?sessionId=abc");
+}
+
+unittest  // resolveEndpointUri resolves a relative path against the base directory
+{
+    assert(resolveEndpointUri("http://host:8080/api/sse",
+            "messages") == "http://host:8080/api/messages");
 }
