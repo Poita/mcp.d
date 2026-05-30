@@ -15,6 +15,7 @@ module mcp.protocol.sampling;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 import mcp.protocol.types : Content;
+import mcp.protocol.errors : McpException, invalidParams;
 
 @safe:
 
@@ -186,6 +187,117 @@ struct CreateMessageRequest
         if ("metadata" in j)
             r.metadata = j["metadata"];
         return r;
+    }
+}
+
+/// Validate a `sampling/createMessage` request's `messages` against the
+/// tool-result message-content constraints in client/sampling §Tool Result
+/// Messages and §Tool Use and Result Balance:
+///
+/// - A `user` message that contains any `tool_result` content block MUST
+///   contain ONLY `tool_result` blocks (no text/image/audio mixed in).
+/// - Every `assistant` message that contains `tool_use` blocks MUST be
+///   immediately followed by a `user` message that consists entirely of
+///   `tool_result` blocks, with each `tool_use` `id` matched by a
+///   `tool_result` `toolUseId`, before any other message.
+///
+/// On violation throws an `McpException` with the spec's `-32602` (Invalid
+/// params) code; the message distinguishes "Tool result missing in request"
+/// from "Tool results mixed with other content". A well-formed (or
+/// tool-free) request returns normally.
+///
+/// `params` is the raw `sampling/createMessage` params JSON — the same value
+/// passed to a client `onSampling` delegate — so a delegate can call this as a
+/// one-liner before forwarding to its model. Content blocks may be a single
+/// object or an array of blocks; both shapes are accepted.
+void validateSamplingMessages(Json params) @safe
+{
+    if (params.type != Json.Type.object || "messages" !in params)
+        return;
+    auto msgs = params["messages"];
+    if (msgs.type != Json.Type.array)
+        return;
+
+    // Normalize a message's `content` to a list of content-block objects.
+    static Json[] blocksOf(Json msg) @safe
+    {
+        Json[] blocks;
+        if (msg.type != Json.Type.object || "content" !in msg)
+            return blocks;
+        auto c = msg["content"];
+        if (c.type == Json.Type.array)
+            foreach (i; 0 .. c.length)
+                blocks ~= c[i];
+        else
+            blocks ~= c;
+        return blocks;
+    }
+
+    static string blockType(Json b) @safe
+    {
+        return (b.type == Json.Type.object && "type" in b && b["type"].type == Json.Type.string) ? b["type"]
+            .get!string : "";
+    }
+
+    foreach (mi; 0 .. msgs.length)
+    {
+        auto msg = msgs[mi];
+        const role = (msg.type == Json.Type.object && "role" in msg
+                && msg["role"].type == Json.Type.string) ? msg["role"].get!string : "";
+        auto blocks = blocksOf(msg);
+
+        // §Tool Result Messages: a user message containing any tool_result
+        // block must contain ONLY tool_result blocks.
+        if (role == "user")
+        {
+            bool hasToolResult, hasOther;
+            foreach (b; blocks)
+            {
+                if (blockType(b) == "tool_result")
+                    hasToolResult = true;
+                else
+                    hasOther = true;
+            }
+            if (hasToolResult && hasOther)
+                throw invalidParams("Tool results mixed with other content");
+        }
+
+        // §Tool Use and Result Balance: every assistant message with tool_use
+        // blocks must be followed by a user message that is entirely
+        // tool_result blocks, each tool_use id matched by a toolUseId.
+        if (role == "assistant")
+        {
+            string[] toolUseIds;
+            foreach (b; blocks)
+                if (blockType(b) == "tool_use")
+                    toolUseIds ~= (b.type == Json.Type.object && "id" in b
+                            && b["id"].type == Json.Type.string) ? b["id"].get!string : "";
+            if (toolUseIds.length == 0)
+                continue;
+
+            if (mi + 1 >= msgs.length)
+                throw invalidParams("Tool result missing in request");
+            auto next = msgs[mi + 1];
+            const nextRole = (next.type == Json.Type.object && "role" in next
+                    && next["role"].type == Json.Type.string) ? next["role"].get!string : "";
+            auto nextBlocks = blocksOf(next);
+            if (nextRole != "user" || nextBlocks.length == 0)
+                throw invalidParams("Tool result missing in request");
+
+            bool[string] resultIds;
+            foreach (b; nextBlocks)
+            {
+                if (blockType(b) != "tool_result")
+                    throw invalidParams("Tool results mixed with other content");
+                const id = (b.type == Json.Type.object && "toolUseId" in b
+                        && b["toolUseId"].type == Json.Type.string) ? b["toolUseId"].get!string
+                    : "";
+                resultIds[id] = true;
+            }
+            foreach (id; toolUseIds)
+                if (id !in resultIds)
+                    throw invalidParams("Tool result missing in request");
+        }
     }
 }
 
@@ -394,4 +506,158 @@ unittest  // unknown / provider-specific stop reasons stay as raw string
     r.stopReason = "contentFilter";
     assert(r.stopReasonEnum.isNull);
     assert(r.stopReason == "contentFilter");
+}
+
+version (unittest)
+{
+    import mcp.protocol.errors : ErrorCode;
+
+    // Build a sampling params object from raw message JSON objects.
+    private Json samplingParams(Json[] messages...) @safe
+    {
+        Json p = Json.emptyObject;
+        Json arr = Json.emptyArray;
+        foreach (m; messages)
+            arr ~= m;
+        p["messages"] = arr;
+        return p;
+    }
+
+    private Json textMsg(string role, string text) @safe
+    {
+        Json b = Json.emptyObject;
+        b["type"] = "text";
+        b["text"] = text;
+        Json m = Json.emptyObject;
+        m["role"] = role;
+        m["content"] = Json([b]);
+        return m;
+    }
+
+    private Json toolUse(string id, string name) @safe
+    {
+        Json b = Json.emptyObject;
+        b["type"] = "tool_use";
+        b["id"] = id;
+        b["name"] = name;
+        b["input"] = Json.emptyObject;
+        return b;
+    }
+
+    private Json toolResult(string toolUseId) @safe
+    {
+        Json b = Json.emptyObject;
+        b["type"] = "tool_result";
+        b["toolUseId"] = toolUseId;
+        b["content"] = Json.emptyArray;
+        return b;
+    }
+
+    private Json msg(string role, Json[] blocks...) @safe
+    {
+        Json arr = Json.emptyArray;
+        foreach (b; blocks)
+            arr ~= b;
+        Json m = Json.emptyObject;
+        m["role"] = role;
+        m["content"] = arr;
+        return m;
+    }
+}
+
+unittest  // a plain text conversation with no tool use validates cleanly
+{
+    auto p = samplingParams(textMsg("user", "hi"), textMsg("assistant", "hello"));
+    validateSamplingMessages(p); // must not throw
+}
+
+unittest  // a user message mixing tool_result with text is rejected (-32602)
+{
+    Json text = Json.emptyObject;
+    text["type"] = "text";
+    text["text"] = "extra";
+    auto bad = msg("user", toolResult("call_1"), text);
+    auto p = samplingParams(msg("assistant", toolUse("call_1", "get_weather")), bad);
+
+    bool threw;
+    try
+        validateSamplingMessages(p);
+    catch (McpException e)
+    {
+        threw = true;
+        assert(e.code == ErrorCode.invalidParams);
+        assert(e.msg == "Tool results mixed with other content");
+    }
+    assert(threw);
+}
+
+unittest  // a tool_use with no following tool_result is rejected (-32602)
+{
+    auto p = samplingParams(msg("assistant", toolUse("call_1", "get_weather")));
+
+    bool threw;
+    try
+        validateSamplingMessages(p);
+    catch (McpException e)
+    {
+        threw = true;
+        assert(e.code == ErrorCode.invalidParams);
+        assert(e.msg == "Tool result missing in request");
+    }
+    assert(threw);
+}
+
+unittest  // an unmatched toolUseId among parallel tool uses is rejected
+{
+    auto p = samplingParams(msg("assistant", toolUse("call_1", "get_weather"),
+            toolUse("call_2", "get_weather")), msg("user", toolResult("call_1")));
+
+    bool threw;
+    try
+        validateSamplingMessages(p);
+    catch (McpException e)
+    {
+        threw = true;
+        assert(e.code == ErrorCode.invalidParams);
+        assert(e.msg == "Tool result missing in request");
+    }
+    assert(threw);
+}
+
+unittest  // balanced parallel tool use + matching results validates cleanly
+{
+    auto p = samplingParams(textMsg("user", "weather in Paris and London?"), msg("assistant", toolUse("call_1",
+            "get_weather"), toolUse("call_2", "get_weather")), msg("user",
+            toolResult("call_1"), toolResult("call_2")), textMsg("assistant", "both nice"));
+    validateSamplingMessages(p); // must not throw
+}
+
+unittest  // a tool_use followed by an assistant message (not user) is rejected
+{
+    auto p = samplingParams(msg("assistant", toolUse("call_1", "get_weather")),
+            textMsg("assistant", "ignoring tools"));
+
+    bool threw;
+    try
+        validateSamplingMessages(p);
+    catch (McpException e)
+    {
+        threw = true;
+        assert(e.msg == "Tool result missing in request");
+    }
+    assert(threw);
+}
+
+unittest  // a lone user tool_result message (no other content) is allowed
+{
+    auto p = samplingParams(msg("user", toolResult("call_1")));
+    validateSamplingMessages(p); // single-block tool_result-only user msg is fine
+}
+
+unittest  // missing/empty messages is a no-op (nothing to validate)
+{
+    validateSamplingMessages(Json.emptyObject);
+    Json p = Json.emptyObject;
+    p["messages"] = Json.emptyArray;
+    validateSamplingMessages(p);
 }

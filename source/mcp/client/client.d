@@ -13,6 +13,7 @@ import mcp.protocol.errors;
 import mcp.protocol.versions;
 import mcp.protocol.capabilities;
 import mcp.protocol.types;
+import mcp.protocol.sampling : validateSamplingMessages;
 import mcp.protocol.draft;
 
 /// Internal signal that the modern single-endpoint POST returned an HTTP
@@ -1306,6 +1307,12 @@ final class MCPClient
         case "sampling/createMessage":
             if (onSampling is null)
                 throw methodNotFound(method);
+            // Enforce the spec's tool-result message-content constraints
+            // before handing off to the delegate: a tool_result user message
+            // must contain only tool results, and every assistant tool_use
+            // must be answered by a matching tool_result. Violations surface
+            // as -32602 (Invalid params) per client/sampling §Error Handling.
+            validateSamplingMessages(params);
             return onSampling(params);
         case "elicitation/create":
             if (onElicitation is null)
@@ -1620,4 +1627,60 @@ unittest  // validateOutput is a no-op when there is no structured content
     Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
     CallToolResult r; // structuredContent stays undefined
     assert(MCPClient.validateOutput(t, r) == "");
+}
+
+unittest  // sampling dispatch rejects an unbalanced tool_use with -32602
+{
+    auto c = new MCPClient("http://localhost");
+    bool delegateCalled;
+    c.onSampling = (Json params) @safe {
+        delegateCalled = true;
+        return Json.emptyObject;
+    };
+
+    // assistant tool_use with no following tool_result user message.
+    Json tu = Json.emptyObject;
+    tu["type"] = "tool_use";
+    tu["id"] = "call_1";
+    tu["name"] = "get_weather";
+    tu["input"] = Json.emptyObject;
+    Json m = Json.emptyObject;
+    m["role"] = "assistant";
+    m["content"] = Json([tu]);
+    Json params = Json.emptyObject;
+    params["messages"] = Json([m]);
+
+    bool threw;
+    try
+        c.dispatchServerMethod("sampling/createMessage", params);
+    catch (McpException e)
+    {
+        threw = true;
+        assert(e.code == ErrorCode.invalidParams);
+        assert(e.msg == "Tool result missing in request");
+    }
+    assert(threw);
+    assert(!delegateCalled); // validation runs before the delegate
+}
+
+unittest  // sampling dispatch forwards a valid request to the delegate
+{
+    auto c = new MCPClient("http://localhost");
+    bool delegateCalled;
+    c.onSampling = (Json params) @safe {
+        delegateCalled = true;
+        return Json.emptyObject;
+    };
+
+    Json b = Json.emptyObject;
+    b["type"] = "text";
+    b["text"] = "hi";
+    Json m = Json.emptyObject;
+    m["role"] = "user";
+    m["content"] = Json([b]);
+    Json params = Json.emptyObject;
+    params["messages"] = Json([m]);
+
+    c.dispatchServerMethod("sampling/createMessage", params);
+    assert(delegateCalled);
 }
