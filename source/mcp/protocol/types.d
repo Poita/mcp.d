@@ -1380,6 +1380,74 @@ struct CompletionReference
     }
 }
 
+/// A parsed `completion/complete` request, as received by a server. Per
+/// server/utilities/completion §"Data Types > CompleteRequest" a client sends a
+/// `ref` (a `ref/prompt` or `ref/resource` reference), an `argument`
+/// (`{name, value}`) naming the argument being completed and its partial value,
+/// and an optional `context.arguments` map of previously-resolved argument
+/// values. Use `fromJson` to parse the raw params handed to a completion handler.
+struct CompleteRequest
+{
+    /// What is being completed (a prompt or a resource template).
+    CompletionReference reference;
+    /// Name of the argument being completed.
+    string argumentName;
+    /// Partial value typed so far for that argument.
+    string argumentValue;
+    /// Previously-resolved argument values (`context.arguments`), if supplied.
+    string[string] context;
+
+    /// `true` if this request targets a prompt argument (`ref/prompt`).
+    bool isPrompt() const @safe
+    {
+        return reference.type == "ref/prompt";
+    }
+
+    /// `true` if this request targets a resource template (`ref/resource`).
+    bool isResource() const @safe
+    {
+        return reference.type == "ref/resource";
+    }
+
+    /// Parse the raw `completion/complete` params object.
+    static CompleteRequest fromJson(Json params) @safe
+    {
+        CompleteRequest r;
+        if (params.type != Json.Type.object)
+            return r;
+        if ("ref" in params && params["ref"].type == Json.Type.object)
+        {
+            auto refJson = params["ref"];
+            if ("type" in refJson && refJson["type"].type == Json.Type.string)
+                r.reference.type = refJson["type"].get!string;
+            if ("name" in refJson && refJson["name"].type == Json.Type.string)
+                r.reference.name = refJson["name"].get!string;
+            if ("uri" in refJson && refJson["uri"].type == Json.Type.string)
+                r.reference.uri = refJson["uri"].get!string;
+        }
+        if ("argument" in params && params["argument"].type == Json.Type.object)
+        {
+            auto arg = params["argument"];
+            if ("name" in arg && arg["name"].type == Json.Type.string)
+                r.argumentName = arg["name"].get!string;
+            if ("value" in arg && arg["value"].type == Json.Type.string)
+                r.argumentValue = arg["value"].get!string;
+        }
+        if ("context" in params && params["context"].type == Json.Type.object)
+        {
+            auto ctx = params["context"];
+            if ("arguments" in ctx && ctx["arguments"].type == Json.Type.object)
+            {
+                auto args = ctx["arguments"];
+                foreach (string k, v; args.byKeyValue)
+                    if (v.type == Json.Type.string)
+                        r.context[k] = v.get!string;
+            }
+        }
+        return r;
+    }
+}
+
 /// Result of `completion/complete`.
 struct CompleteResult
 {
@@ -1572,6 +1640,65 @@ unittest  // CompletionReference.forResource builds a ref/resource with a uri
     assert(j["type"].get!string == "ref/resource");
     assert(j["uri"].get!string == "file:///{path}");
     assert("name" !in j);
+}
+
+unittest  // CompleteRequest.fromJson parses a prompt reference
+{
+    Json p = Json.emptyObject;
+    p["ref"] = CompletionReference.forPrompt("greet").toJson();
+    Json arg = Json.emptyObject;
+    arg["name"] = "who";
+    arg["value"] = "al";
+    p["argument"] = arg;
+    auto r = CompleteRequest.fromJson(p);
+    assert(r.isPrompt);
+    assert(!r.isResource);
+    assert(r.reference.name == "greet");
+    assert(r.argumentName == "who");
+    assert(r.argumentValue == "al");
+    assert(r.context.length == 0);
+}
+
+unittest  // CompleteRequest.fromJson parses a resource reference
+{
+    Json p = Json.emptyObject;
+    p["ref"] = CompletionReference.forResource("file:///{path}").toJson();
+    Json arg = Json.emptyObject;
+    arg["name"] = "path";
+    arg["value"] = "/ho";
+    p["argument"] = arg;
+    auto r = CompleteRequest.fromJson(p);
+    assert(r.isResource);
+    assert(!r.isPrompt);
+    assert(r.reference.uri == "file:///{path}");
+    assert(r.argumentName == "path");
+    assert(r.argumentValue == "/ho");
+}
+
+unittest  // CompleteRequest.fromJson parses context.arguments
+{
+    Json p = Json.emptyObject;
+    p["ref"] = CompletionReference.forPrompt("pr").toJson();
+    Json arg = Json.emptyObject;
+    arg["name"] = "branch";
+    arg["value"] = "m";
+    p["argument"] = arg;
+    Json args = Json.emptyObject;
+    args["repo"] = "mcp.d";
+    Json ctx = Json.emptyObject;
+    ctx["arguments"] = args;
+    p["context"] = ctx;
+    auto r = CompleteRequest.fromJson(p);
+    assert(r.context["repo"] == "mcp.d");
+}
+
+unittest  // CompleteRequest.fromJson tolerates an empty/garbage params object
+{
+    auto r = CompleteRequest.fromJson(Json.emptyObject);
+    assert(r.reference.type.length == 0);
+    assert(r.argumentName.length == 0);
+    assert(!r.isPrompt);
+    assert(!r.isResource);
 }
 
 unittest  // Resource/ResourceContents/Prompt/GetPrompt fromJson round-trips
