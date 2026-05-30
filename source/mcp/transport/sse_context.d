@@ -366,6 +366,10 @@ final class HttpStreamContext : RequestContext
             return clientCaps.samplingContext;
         case "elicitation":
             return clientCaps.elicitation;
+        case "elicitation.form":
+            return clientCaps.elicitationForm;
+        case "elicitation.url":
+            return clientCaps.elicitationUrl;
         case "roots":
             return clientCaps.roots;
         default:
