@@ -73,6 +73,25 @@ struct resourceTemplate
     string mimeType;
 }
 
+/// UDA declaring optional MCP `Annotations` (audience / priority /
+/// lastModified) for a `@resource`- or `@resourceTemplate`-annotated method.
+/// Attach alongside the resource UDA; each field defaults to "unset" and is
+/// omitted from the wire form unless assigned.
+///
+/// Example:
+/// ---
+/// import std.typecons : nullable;
+/// @resource("file:///readme", "Readme", "text/markdown")
+/// @resourceAnnotations(audience: ["user"], priority: 0.9.nullable)
+/// string readme() { return "..."; }
+/// ---
+struct resourceAnnotations
+{
+    string[] audience; /// intended audience, e.g. ["user", "assistant"]
+    Nullable!double priority; /// importance 0.0..1.0
+    Nullable!string lastModified; /// ISO 8601 last-modified timestamp
+}
+
 /// Optional per-parameter description, attached to a function parameter or used
 /// alongside `@tool` to document a named argument.
 struct describe
