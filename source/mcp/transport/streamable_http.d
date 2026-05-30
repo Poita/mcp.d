@@ -169,7 +169,15 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
         if (ctx.streaming)
             ctx.finishWith(resp.get);
         else
-            res.writeBody(resp.get.toString(), "application/json");
+        {
+            // Draft: an UnsupportedProtocolVersionError is surfaced as 400.
+            auto j = resp.get;
+            if ("error" in j && j["error"].type == Json.Type.object
+                    && "code" in j["error"]
+                    && j["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion)
+                res.statusCode = HTTPStatus.badRequest;
+            res.writeBody(j.toString(), "application/json");
+        }
         return;
     }
 }

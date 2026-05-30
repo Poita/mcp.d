@@ -263,6 +263,13 @@ final class MCPServer
                         logLevel = meta.logLevel.get;
                 }
             }
+            else
+            {
+                // Per-request protocol-version negotiation (draft): the client
+                // declared a version we do not support -> reject with the list of
+                // versions we do support so it can retry with a compatible one.
+                return makeErrorResponse(msg.id, unsupportedVersionError(meta.protocolVersion));
+            }
         }
 
         try
@@ -291,6 +298,20 @@ final class MCPServer
         if (effectiveVersion.cacheableResults)
             return withCache(result, cacheTtlMs, cacheScope_);
         return result;
+    }
+
+    /// Build the draft `UnsupportedProtocolVersionError` (-32004) listing the
+    /// versions this server supports and the one the client requested.
+    private McpException unsupportedVersionError(string requested) @safe
+    {
+        Json supported = Json.emptyArray;
+        foreach (v; supportedVersions)
+            supported ~= Json(v.toWire);
+        Json data = Json.emptyObject;
+        data["supported"] = supported;
+        data["requested"] = requested;
+        return new McpException(ErrorCode.unsupportedProtocolVersion,
+                "Unsupported protocol version", data);
     }
 
     private void handleNotification(Message msg) @safe
@@ -980,4 +1001,47 @@ unittest  // draft is stateless: tools/call works without a prior initialize
     p["arguments"] = Json(["a": Json(20), "b": Json(22)]);
     auto resp = s.handle(draftReq(5, "tools/call", p)).get;
     assert(resp["result"]["structuredContent"]["result"].get!int == 42);
+}
+
+version (unittest)
+{
+    // A request whose _meta declares an arbitrary protocol version.
+    private Message versionedReq(long id, string method, string ver) @safe
+    {
+        Json meta = Json.emptyObject;
+        meta[MetaKey.protocolVersion] = ver;
+        Json params = Json.emptyObject;
+        params["_meta"] = meta;
+        return Message(makeRequest(Json(id), method, params));
+    }
+}
+
+unittest  // draft negotiation: unsupported version -> UnsupportedProtocolVersionError
+{
+    auto s = makeTestServer();
+    auto resp = s.handle(versionedReq(1, "tools/list", "1900-01-01")).get;
+    assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
+    assert(resp["error"]["data"]["requested"].get!string == "1900-01-01");
+    // The supported list advertises our versions, including the draft revision.
+    auto sup = resp["error"]["data"]["supported"];
+    bool hasDraft;
+    foreach (i; 0 .. sup.length)
+        if (sup[i].get!string == "2026-07-28")
+            hasDraft = true;
+    assert(hasDraft);
+}
+
+unittest  // draft negotiation: a supported version is accepted (no error)
+{
+    auto s = makeTestServer();
+    auto resp = s.handle(versionedReq(2, "tools/list", "2025-11-25")).get;
+    assert("error" !in resp);
+    assert(resp["result"]["tools"].length == 1);
+}
+
+unittest  // requests without a per-request version are unaffected (legacy path)
+{
+    auto s = makeTestServer();
+    auto resp = s.handle(req(3, "tools/list")).get;
+    assert("error" !in resp);
 }

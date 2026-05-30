@@ -16,7 +16,9 @@ enum ErrorCode : int
     resourceNotFound = -32002,
     requestCancelled = -32800,
     // draft Streamable HTTP: header/body validation failure
-    headerMismatch = -32001
+    headerMismatch = -32001,
+    // draft: requested protocol version not supported (data: {supported, requested})
+    unsupportedProtocolVersion = -32004
 }
 
 /// An error that maps onto a JSON-RPC error object.
