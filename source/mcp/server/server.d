@@ -109,6 +109,7 @@ final class MCPServer
     private RegisteredTemplate[] templates;
     private RegisteredPrompt[string] prompts;
     private CompleteResult delegate(Json params) @safe completionHandler;
+    private CompleteResult delegate(CompleteRequest request) @safe typedCompletionHandler;
     private bool loggingEnabled;
     private string logLevel = "info";
     private bool resourceSubscriptionsEnabled;
@@ -327,10 +328,22 @@ final class MCPServer
     }
 
     /// Set the handler for `completion/complete`. Declaring it advertises the
-    /// completions capability.
+    /// completions capability. This receives the raw `params` Json; for an
+    /// ergonomic, pre-parsed request use `setCompletionRequestHandler`.
     void setCompletionHandler(CompleteResult delegate(Json params) @safe handler) @safe
     {
         completionHandler = handler;
+    }
+
+    /// Set the handler for `completion/complete`, receiving a parsed
+    /// `CompleteRequest` (the `ref`, the `argument` name/value, and any
+    /// `context.arguments`) instead of raw Json. Declaring it advertises the
+    /// completions capability. Use `request.isPrompt` / `request.isResource`
+    /// to route to the appropriate per-target completer. Takes precedence over a
+    /// raw-Json handler set via `setCompletionHandler` if both are registered.
+    void setCompletionRequestHandler(CompleteResult delegate(CompleteRequest request) @safe handler) @safe
+    {
+        typedCompletionHandler = handler;
     }
 
     /// Advertise the logging capability and accept `logging/setLevel`.
@@ -466,7 +479,7 @@ final class MCPServer
                     resourcesListChangedEnabled);
         if (prompts.length > 0)
             caps.prompts = ListChangedCapability(promptsListChangedEnabled);
-        if (completionHandler !is null)
+        if (completionHandler !is null || typedCompletionHandler !is null)
             caps.completions = true;
         if (loggingEnabled)
             caps.logging = true;
@@ -807,12 +820,12 @@ final class MCPServer
 
     private Json doComplete(Json params) @safe
     {
-        if (completionHandler is null)
-        {
-            CompleteResult empty;
-            return empty.toJson();
-        }
-        return completionHandler(params).toJson();
+        if (typedCompletionHandler !is null)
+            return typedCompletionHandler(CompleteRequest.fromJson(params)).toJson();
+        if (completionHandler !is null)
+            return completionHandler(params).toJson();
+        CompleteResult empty;
+        return empty.toJson();
     }
 
     private Json doSetLevel(Json params) @safe
@@ -1349,6 +1362,44 @@ unittest  // completion/complete uses the registered handler
     });
     auto resp = s.handle(req(1, "completion/complete", Json.emptyObject)).get;
     assert(resp["result"]["completion"]["values"].length == 2);
+}
+
+unittest  // typed completion handler receives a parsed CompleteRequest
+{
+    auto s = new MCPServer("t", "1");
+    string seenName;
+    string seenArg;
+    bool wasPrompt;
+    s.setCompletionRequestHandler((CompleteRequest r) @safe {
+        seenName = r.reference.name;
+        seenArg = r.argumentValue;
+        wasPrompt = r.isPrompt;
+        CompleteResult res;
+        res.values = ["paris"];
+        return res;
+    });
+    Json p = Json.emptyObject;
+    p["ref"] = CompletionReference.forPrompt("greet").toJson();
+    Json arg = Json.emptyObject;
+    arg["name"] = "city";
+    arg["value"] = "par";
+    p["argument"] = arg;
+    auto resp = s.handle(req(1, "completion/complete", p)).get;
+    assert(resp["result"]["completion"]["values"][0].get!string == "paris");
+    assert(seenName == "greet");
+    assert(seenArg == "par");
+    assert(wasPrompt);
+}
+
+unittest  // typed completion handler advertises the completions capability
+{
+    auto s = new MCPServer("t", "1");
+    s.setCompletionRequestHandler((CompleteRequest) @safe {
+        CompleteResult res;
+        return res;
+    });
+    auto init = s.handle(req(1, "initialize", Json.emptyObject)).get;
+    assert("completions" in init["result"]["capabilities"]);
 }
 
 unittest  // logging/setLevel stores the level and returns an empty object
