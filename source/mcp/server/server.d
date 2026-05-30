@@ -1391,6 +1391,34 @@ unittest  // typed completion handler receives a parsed CompleteRequest
     assert(wasPrompt);
 }
 
+unittest  // typed completion handler receives the resolved context.arguments
+{
+    auto s = new MCPServer("t", "1");
+    string[string] seenContext;
+    s.setCompletionRequestHandler((CompleteRequest r) @safe {
+        seenContext = r.context;
+        CompleteResult res;
+        res.values = ["main"];
+        return res;
+    });
+    Json p = Json.emptyObject;
+    p["ref"] = CompletionReference.forPrompt("greet").toJson();
+    Json arg = Json.emptyObject;
+    arg["name"] = "branch";
+    arg["value"] = "ma";
+    p["argument"] = arg;
+    Json args = Json.emptyObject;
+    args["repo"] = "mcp.d";
+    args["owner"] = "Poita";
+    Json ctx = Json.emptyObject;
+    ctx["arguments"] = args;
+    p["context"] = ctx;
+    auto resp = s.handle(req(1, "completion/complete", p)).get;
+    assert(resp["result"]["completion"]["values"][0].get!string == "main");
+    assert(seenContext["repo"] == "mcp.d");
+    assert(seenContext["owner"] == "Poita");
+}
+
 unittest  // typed completion handler advertises the completions capability
 {
     auto s = new MCPServer("t", "1");
