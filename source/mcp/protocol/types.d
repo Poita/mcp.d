@@ -1079,6 +1079,7 @@ struct Prompt
     Nullable!string title; /// optional human-readable display name
     Nullable!string description;
     PromptArgument[] arguments;
+    Icon[] icons; /// optional icons for display in user interfaces
 
     Json toJson() const @safe
     {
@@ -1094,6 +1095,13 @@ struct Prompt
             foreach (a; arguments)
                 arr ~= a.toJson();
             j["arguments"] = arr;
+        }
+        if (icons.length)
+        {
+            Json arr = Json.emptyArray;
+            foreach (icon; icons)
+                arr ~= icon.toJson();
+            j["icons"] = arr;
         }
         return j;
     }
@@ -1112,6 +1120,9 @@ struct Prompt
             foreach (i; 0 .. arr.length)
                 p.arguments ~= PromptArgument.fromJson(arr[i]);
         }
+        if ("icons" in j && j["icons"].type == Json.Type.array)
+            foreach (i; 0 .. j["icons"].length)
+                p.icons ~= Icon.fromJson(j["icons"][i]);
         return p;
     }
 }
@@ -1285,6 +1296,46 @@ unittest  // Prompt omits title when unset
     auto j = p.toJson();
     assert("title" !in j);
     assert(Prompt.fromJson(j).title.isNull);
+}
+
+unittest  // Prompt emits icons array when present
+{
+    Prompt p = {name: "greet"};
+    p.icons = [
+        Icon("https://example.com/greet.png", nullable("image/png"), ["48x48"])
+    ];
+    auto j = p.toJson();
+    assert(j["icons"].type == Json.Type.array);
+    assert(j["icons"].length == 1);
+    assert(j["icons"][0]["src"].get!string == "https://example.com/greet.png");
+    assert(j["icons"][0]["mimeType"].get!string == "image/png");
+    assert(j["icons"][0]["sizes"][0].get!string == "48x48");
+}
+
+unittest  // Prompt omits icons when empty
+{
+    Prompt p = {name: "noicons"};
+    auto j = p.toJson();
+    assert("icons" !in j);
+}
+
+unittest  // Prompt icons round-trip through fromJson
+{
+    Prompt p = {name: "greet"};
+    p.icons = [
+        Icon("https://example.com/a.svg"),
+        Icon("https://example.com/b.png", nullable("image/png"), [
+            "16x16", "32x32"
+        ])
+    ];
+    auto back = Prompt.fromJson(p.toJson());
+    assert(back.icons.length == 2);
+    assert(back.icons[0].src == "https://example.com/a.svg");
+    assert(back.icons[0].mimeType.isNull);
+    assert(back.icons[0].sizes.length == 0);
+    assert(back.icons[1].src == "https://example.com/b.png");
+    assert(back.icons[1].mimeType.get == "image/png");
+    assert(back.icons[1].sizes == ["16x16", "32x32"]);
 }
 
 unittest  // GetPromptResult serializes messages with object content
