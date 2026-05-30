@@ -4,6 +4,7 @@ import std.typecons : Nullable;
 import vibe.data.json : Json;
 
 import mcp.protocol.errors;
+import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
 import mcp.auth.resource_server : TokenInfo;
 
 @safe:
@@ -79,6 +80,14 @@ interface RequestContext
                         "Client does not support context-enabled sampling (sampling.context)");
         }
         return sendRequest("sampling/createMessage", params);
+    }
+
+    /// Typed convenience over `sample(Json)`: build a `CreateMessageRequest`,
+    /// send it, and parse the client's reply into a `CreateMessageResult`. Same
+    /// preconditions and exceptions as the JSON overload.
+    final CreateMessageResult sample(CreateMessageRequest request) @safe
+    {
+        return CreateMessageResult.fromJson(sample(request.toJson()));
     }
 
     /// Request structured user input from the client (`elicitation/create`).
@@ -194,4 +203,75 @@ final class RequestScope : RequestContext
     {
         return inner.auth();
     }
+}
+
+version (unittest) private final class SamplingProbe : RequestContext
+{
+    Json lastParams;
+
+    void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
+    {
+    }
+
+    void log(string, Json, string = null) @safe
+    {
+    }
+
+    Json sendRequest(string method, Json params) @safe
+    {
+        lastParams = params;
+        // Echo back a typed-looking sampling result.
+        Json r = Json.emptyObject;
+        r["role"] = "assistant";
+        Json content = Json.emptyObject;
+        content["type"] = "text";
+        content["text"] = "echoed";
+        r["content"] = content;
+        r["model"] = "test-model";
+        r["stopReason"] = "endTurn";
+        return r;
+    }
+
+    bool clientSupports(string capability) @safe
+    {
+        return capability == "sampling";
+    }
+
+    bool isStateless() @safe
+    {
+        return false;
+    }
+
+    Json[string] inputResponses() @safe
+    {
+        Json[string] empty;
+        return empty;
+    }
+
+    TokenInfo auth() @safe
+    {
+        return TokenInfo.invalid();
+    }
+}
+
+unittest  // typed sample() builds params and parses the typed result
+{
+    import mcp.protocol.sampling : CreateMessageRequest, SamplingMessage, StopReason;
+    import mcp.protocol.types : Content;
+
+    auto probe = new SamplingProbe;
+    CreateMessageRequest req;
+    req.messages = [SamplingMessage("user", Content.makeText("hi"))];
+    req.maxTokens = 50;
+    auto result = probe.sample(req);
+
+    // Request was serialized to the wire shape.
+    assert(probe.lastParams["messages"][0]["content"]["text"].get!string == "hi");
+    assert(probe.lastParams["maxTokens"].get!long == 50);
+
+    // Result parsed into a typed struct.
+    assert(result.role == "assistant");
+    assert(result.content.text == "echoed");
+    assert(result.model == "test-model");
+    assert(result.stopReasonEnum.get == StopReason.endTurn);
 }
