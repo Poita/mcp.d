@@ -205,6 +205,59 @@ struct Icon
     }
 }
 
+/// Optional annotations attached to resources, resource templates, and content
+/// blocks, per the MCP spec's `Annotations` shape. All fields are optional and
+/// advisory; a field left unset is omitted from the serialized form.
+///
+/// - `audience`: who the object is intended for (e.g. `["user"]`,
+///   `["assistant"]`).
+/// - `priority`: importance from 0.0 (least) to 1.0 (most).
+/// - `lastModified`: ISO 8601 timestamp of last modification.
+struct Annotations
+{
+    string[] audience; /// intended audience, e.g. ["user", "assistant"]
+    Nullable!double priority; /// importance 0.0..1.0
+    Nullable!string lastModified; /// ISO 8601 last-modified timestamp
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        if (audience.length)
+        {
+            Json arr = Json.emptyArray;
+            foreach (a; audience)
+                arr ~= Json(a);
+            j["audience"] = arr;
+        }
+        if (!priority.isNull)
+            j["priority"] = priority.get;
+        if (!lastModified.isNull)
+            j["lastModified"] = lastModified.get;
+        return j;
+    }
+
+    static Annotations fromJson(Json j) @safe
+    {
+        Annotations a;
+        if ("audience" in j && j["audience"].type == Json.Type.array)
+            foreach (i; 0 .. j["audience"].length)
+                a.audience ~= j["audience"][i].get!string;
+        if ("priority" in j && j["priority"].type == Json.Type.float_)
+            a.priority = j["priority"].get!double;
+        else if ("priority" in j && j["priority"].type == Json.Type.int_)
+            a.priority = cast(double) j["priority"].get!long;
+        if ("lastModified" in j && j["lastModified"].type == Json.Type.string)
+            a.lastModified = j["lastModified"].get!string;
+        return a;
+    }
+
+    /// True if no annotation is set (serializes to an empty object).
+    bool empty() const @safe
+    {
+        return audience.length == 0 && priority.isNull && lastModified.isNull;
+    }
+}
+
 /// Optional properties describing a tool's behavior, per the MCP spec's
 /// `ToolAnnotations`. All hints are advisory and optional; a hint that is left
 /// `null` is omitted from the serialized form (and clients SHOULD treat its
@@ -654,6 +707,9 @@ struct Resource
     Nullable!string description;
     Nullable!string mimeType;
     Nullable!string title;
+    Annotations annotations; /// optional audience/priority/lastModified annotations
+    Nullable!long size; /// optional size in bytes
+    Icon[] icons; /// optional icons for display in user interfaces
 
     Json toJson() const @safe
     {
@@ -666,6 +722,17 @@ struct Resource
             j["description"] = description.get;
         if (!mimeType.isNull)
             j["mimeType"] = mimeType.get;
+        if (!annotations.empty)
+            j["annotations"] = annotations.toJson();
+        if (!size.isNull)
+            j["size"] = size.get;
+        if (icons.length)
+        {
+            Json arr = Json.emptyArray;
+            foreach (icon; icons)
+                arr ~= icon.toJson();
+            j["icons"] = arr;
+        }
         return j;
     }
 
@@ -680,6 +747,13 @@ struct Resource
             r.description = j["description"].get!string;
         if ("mimeType" in j && j["mimeType"].type == Json.Type.string)
             r.mimeType = j["mimeType"].get!string;
+        if ("annotations" in j && j["annotations"].type == Json.Type.object)
+            r.annotations = Annotations.fromJson(j["annotations"]);
+        if ("size" in j && j["size"].type == Json.Type.int_)
+            r.size = j["size"].get!long;
+        if ("icons" in j && j["icons"].type == Json.Type.array)
+            foreach (i; 0 .. j["icons"].length)
+                r.icons ~= Icon.fromJson(j["icons"][i]);
         return r;
     }
 }
@@ -692,6 +766,8 @@ struct ResourceTemplate
     Nullable!string description;
     Nullable!string mimeType;
     Nullable!string title;
+    Annotations annotations; /// optional audience/priority/lastModified annotations
+    Icon[] icons; /// optional icons for display in user interfaces
 
     Json toJson() const @safe
     {
@@ -704,7 +780,35 @@ struct ResourceTemplate
             j["description"] = description.get;
         if (!mimeType.isNull)
             j["mimeType"] = mimeType.get;
+        if (!annotations.empty)
+            j["annotations"] = annotations.toJson();
+        if (icons.length)
+        {
+            Json arr = Json.emptyArray;
+            foreach (icon; icons)
+                arr ~= icon.toJson();
+            j["icons"] = arr;
+        }
         return j;
+    }
+
+    static ResourceTemplate fromJson(Json j) @safe
+    {
+        ResourceTemplate t;
+        t.uriTemplate = ("uriTemplate" in j) ? j["uriTemplate"].get!string : "";
+        t.name = ("name" in j) ? j["name"].get!string : "";
+        if ("title" in j && j["title"].type == Json.Type.string)
+            t.title = j["title"].get!string;
+        if ("description" in j && j["description"].type == Json.Type.string)
+            t.description = j["description"].get!string;
+        if ("mimeType" in j && j["mimeType"].type == Json.Type.string)
+            t.mimeType = j["mimeType"].get!string;
+        if ("annotations" in j && j["annotations"].type == Json.Type.object)
+            t.annotations = Annotations.fromJson(j["annotations"]);
+        if ("icons" in j && j["icons"].type == Json.Type.array)
+            foreach (i; 0 .. j["icons"].length)
+                t.icons ~= Icon.fromJson(j["icons"][i]);
+        return t;
     }
 }
 
@@ -816,6 +920,94 @@ struct ListResourceTemplatesResult
             j["nextCursor"] = nextCursor.get;
         return j;
     }
+}
+
+unittest  // Resource omits annotations/size/icons when unset
+{
+    Resource r = {uri: "test://x", name: "x"};
+    auto j = r.toJson();
+    assert("annotations" !in j);
+    assert("size" !in j);
+    assert("icons" !in j);
+}
+
+unittest  // Resource emits annotations (audience/priority/lastModified)
+{
+    Resource r = {uri: "test://x", name: "x"};
+    r.annotations.audience = ["user", "assistant"];
+    r.annotations.priority = 0.8;
+    r.annotations.lastModified = nullable("2025-01-01T00:00:00Z");
+    auto j = r.toJson();
+    assert(j["annotations"]["audience"][0].get!string == "user");
+    assert(j["annotations"]["audience"][1].get!string == "assistant");
+    assert(j["annotations"]["priority"].get!double == 0.8);
+    assert(j["annotations"]["lastModified"].get!string == "2025-01-01T00:00:00Z");
+}
+
+unittest  // Resource emits size in bytes
+{
+    Resource r = {uri: "test://x", name: "x"};
+    r.size = 1234L;
+    auto j = r.toJson();
+    assert(j["size"].get!long == 1234);
+}
+
+unittest  // Resource emits icons array
+{
+    Resource r = {uri: "test://x", name: "x"};
+    r.icons = [
+        Icon("https://example.com/x.png", nullable("image/png"), ["48x48"])
+    ];
+    auto j = r.toJson();
+    assert(j["icons"].type == Json.Type.array);
+    assert(j["icons"][0]["src"].get!string == "https://example.com/x.png");
+    assert(j["icons"][0]["mimeType"].get!string == "image/png");
+    assert(j["icons"][0]["sizes"][0].get!string == "48x48");
+}
+
+unittest  // Resource round-trips annotations/size/icons through fromJson
+{
+    Resource r = {uri: "test://x", name: "x"};
+    r.annotations.audience = ["user"];
+    r.annotations.priority = 0.5;
+    r.size = 99L;
+    r.icons = [Icon("https://e/x.png", nullable("image/png"), ["16x16"])];
+    auto back = Resource.fromJson(r.toJson());
+    assert(back.annotations.audience == ["user"]);
+    assert(back.annotations.priority.get == 0.5);
+    assert(back.size.get == 99);
+    assert(back.icons.length == 1);
+    assert(back.icons[0].src == "https://e/x.png");
+}
+
+unittest  // ResourceTemplate emits annotations and icons
+{
+    ResourceTemplate t = {uriTemplate: "test://{id}", name: "t"};
+    t.annotations.audience = ["assistant"];
+    t.icons = [Icon("https://e/t.png", nullable("image/png"), [])];
+    auto j = t.toJson();
+    assert(j["annotations"]["audience"][0].get!string == "assistant");
+    assert(j["icons"][0]["src"].get!string == "https://e/t.png");
+}
+
+unittest  // ResourceTemplate round-trips annotations/icons through fromJson
+{
+    ResourceTemplate t = {uriTemplate: "test://{id}", name: "t"};
+    t.annotations.lastModified = nullable("2025-06-01T00:00:00Z");
+    t.icons = [Icon("https://e/t.png", Nullable!string.init, [])];
+    auto back = ResourceTemplate.fromJson(t.toJson());
+    assert(back.uriTemplate == "test://{id}");
+    assert(back.annotations.lastModified.get == "2025-06-01T00:00:00Z");
+    assert(back.icons.length == 1);
+    assert(back.icons[0].src == "https://e/t.png");
+}
+
+unittest  // Annotations.empty reflects whether any field is set
+{
+    Annotations a;
+    assert(a.empty);
+    a.priority = 0.1;
+    assert(!a.empty);
 }
 
 /// Result of `resources/read`.

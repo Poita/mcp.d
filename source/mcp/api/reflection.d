@@ -270,6 +270,17 @@ private void registerResourceMethod(T, string memberName, alias overload)(
     if (attr.mimeType.length)
         descriptor.mimeType = nullable(attr.mimeType);
 
+    // Fold any @resourceAnnotations UDA on the same method into the descriptor.
+    static foreach (a; __traits(getAttributes, overload))
+    {
+        static if (is(typeof(a) == resourceAnnotations))
+        {
+            descriptor.annotations.audience = a.audience;
+            descriptor.annotations.priority = a.priority;
+            descriptor.annotations.lastModified = a.lastModified;
+        }
+    }
+
     server.registerResource(descriptor, () @safe {
         return toResourceContents(__traits(getMember, obj, memberName)(), attr.uri, attr.mimeType);
     });
@@ -283,6 +294,17 @@ private void registerTemplateMethod(T, string memberName, alias overload)(
     descriptor.name = attr.name;
     if (attr.mimeType.length)
         descriptor.mimeType = nullable(attr.mimeType);
+
+    // Fold any @resourceAnnotations UDA on the same method into the descriptor.
+    static foreach (a; __traits(getAttributes, overload))
+    {
+        static if (is(typeof(a) == resourceAnnotations))
+        {
+            descriptor.annotations.audience = a.audience;
+            descriptor.annotations.priority = a.priority;
+            descriptor.annotations.lastModified = a.lastModified;
+        }
+    }
 
     server.registerResourceTemplate(descriptor, (string uri, string[string] params) @safe {
         alias names = ParameterIdentifierTuple!overload;
@@ -356,6 +378,13 @@ version (unittest)
         string doc() @safe
         {
             return "document body";
+        }
+
+        @resource("test://readme", "Readme", "text/markdown") @resourceAnnotations(audience
+                : ["user"], priority:
+                0.9.nullable) string readme() @safe
+        {
+            return "readme body";
         }
 
         @prompt("intro", "Intro prompt")
@@ -488,6 +517,36 @@ unittest  // @resource and @prompt reflection register and dispatch
     pp["arguments"] = Json(["topic": Json("MCP")]);
     auto pr = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
     assert(pr["result"]["messages"][0]["content"]["text"].get!string == "Tell me about MCP");
+}
+
+unittest  // @resourceAnnotations reflection: annotations appear in resources/list
+{
+    import mcp.protocol.jsonrpc : Message, makeRequest;
+
+    auto s = new MCPServer("t", "1");
+    registerHandlers(s, new DemoApi);
+
+    auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
+            Json.emptyObject))).get["result"]["resources"];
+
+    bool foundReadme, foundDoc;
+    foreach (i; 0 .. res.length)
+    {
+        auto uri = res[i]["uri"].get!string;
+        if (uri == "test://readme")
+        {
+            foundReadme = true;
+            assert(res[i]["annotations"]["audience"][0].get!string == "user");
+            assert(res[i]["annotations"]["priority"].get!double == 0.9);
+        }
+        else if (uri == "test://doc")
+        {
+            foundDoc = true;
+            // A resource without @resourceAnnotations carries no annotations.
+            assert("annotations" !in res[i]);
+        }
+    }
+    assert(foundReadme && foundDoc);
 }
 
 unittest  // @tool reflection: optional title is emitted in tools/list
