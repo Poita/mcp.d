@@ -214,6 +214,30 @@ final class MCPServer
         return notify("notifications/tools/list_changed");
     }
 
+    /// Notify subscribers that a watched resource changed by emitting a
+    /// `notifications/resources/updated` on the standalone GET SSE stream (per
+    /// server/resources Subscriptions: "Server delivers
+    /// notifications/resources/updated ... whenever a watched resource
+    /// changes"). The notification carries `{ "uri": ... }`, plus an optional
+    /// `title` (2025-11-25). It is delivered only when a client is currently
+    /// subscribed to `uri` (via `resources/subscribe`); for an unsubscribed URI
+    /// it is a no-op returning `0`. For the draft protocol the notification is
+    /// additionally suppressed unless a client opted in via `subscriptions/listen`
+    /// with `resourceSubscriptions:true`. Returns the number of GET-stream
+    /// listeners reached; `0` when no GET stream is open.
+    size_t notifyResourceUpdated(string uri, Nullable!string title = Nullable!string.init) @safe
+    {
+        if (!isSubscribed(uri))
+            return 0;
+        if (effectiveVersion.isDraft && !listensFor("resourceSubscriptions"))
+            return 0;
+        Json params = Json.emptyObject;
+        params["uri"] = uri;
+        if (!title.isNull)
+            params["title"] = title.get;
+        return notify("notifications/resources/updated", params);
+    }
+
     /// The capabilities advertised by the connected client (valid after
     /// `initialize`).
     ClientCapabilities clientCapabilities() const @safe
@@ -1637,6 +1661,73 @@ unittest  // notify delivers unsolicited notifications to GET-stream listeners
     import std.algorithm : canFind;
 
     assert(received[0].canFind("notifications/resources/updated"));
+}
+
+unittest  // notifyResourceUpdated emits resources/updated for a subscribed uri
+{
+    auto s = new MCPServer("t", "1");
+    s.enableResourceSubscriptions();
+    auto coord = new StreamCoordinator;
+    auto ch = s.serverPushChannel(coord);
+    string[] received;
+    ch.addListener((string f) @safe { received ~= f; });
+
+    Json p = Json.emptyObject;
+    p["uri"] = "test://w";
+    s.handle(req(1, "resources/subscribe", p));
+
+    const n = s.notifyResourceUpdated("test://w");
+    assert(n == 1);
+    import std.algorithm : canFind;
+
+    assert(received.length == 1);
+    assert(received[0].canFind("notifications/resources/updated"));
+    assert(received[0].canFind("test://w"));
+}
+
+unittest  // notifyResourceUpdated is a no-op for a uri nobody subscribed to
+{
+    auto s = new MCPServer("t", "1");
+    s.enableResourceSubscriptions();
+    auto coord = new StreamCoordinator;
+    auto ch = s.serverPushChannel(coord);
+    string[] received;
+    ch.addListener((string f) @safe { received ~= f; });
+
+    const n = s.notifyResourceUpdated("test://never");
+    assert(n == 0);
+    assert(received.length == 0);
+}
+
+unittest  // notifyResourceUpdated includes the optional title param when given
+{
+    auto s = new MCPServer("t", "1");
+    s.enableResourceSubscriptions();
+    auto coord = new StreamCoordinator;
+    auto ch = s.serverPushChannel(coord);
+    string[] received;
+    ch.addListener((string f) @safe { received ~= f; });
+
+    Json p = Json.emptyObject;
+    p["uri"] = "test://w";
+    s.handle(req(1, "resources/subscribe", p));
+
+    const n = s.notifyResourceUpdated("test://w", nullable("My Resource"));
+    assert(n == 1);
+    import std.algorithm : canFind;
+
+    assert(received[0].canFind("\"title\""));
+    assert(received[0].canFind("My Resource"));
+}
+
+unittest  // notifyResourceUpdated is a no-op before a push channel exists
+{
+    auto s = new MCPServer("t", "1");
+    s.enableResourceSubscriptions();
+    Json p = Json.emptyObject;
+    p["uri"] = "test://w";
+    s.handle(req(1, "resources/subscribe", p));
+    assert(s.notifyResourceUpdated("test://w") == 0);
 }
 
 unittest  // tools listChanged is not advertised by default
