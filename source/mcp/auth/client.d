@@ -28,6 +28,12 @@ final class OAuthClient
     TokenEndpointAuthMethod authMethod = TokenEndpointAuthMethod.none;
     /// EC private key (PKCS#8 PEM) for `private_key_jwt` client assertions.
     string privateKeyPem;
+    /// SEP-991: this client's OAuth Client ID Metadata Document URL — an
+    /// HTTPS URL (with a path component) at which the client hosts its metadata
+    /// document. When set and the authorization server advertises
+    /// `client_id_metadata_document_supported`, this URL is used directly as the
+    /// `client_id` (no Dynamic Client Registration needed).
+    string clientIdMetadataUrl;
 
     /// Build the `client_assertion_type` + `client_assertion` form fields for
     /// `private_key_jwt` token-endpoint authentication (RFC 7523), or "".
@@ -140,6 +146,50 @@ final class OAuthClient
         reg.tokenEndpointAuthMethod = cast(string) authMethod;
         auto resp = postJson(as_.registrationEndpoint, reg.toJson());
         return RegisteredClient.fromJson(resp);
+    }
+
+    /// Select the client-registration approach for an authorization server,
+    /// per the spec priority order ("Client Registration Approaches"):
+    /// pre-registration, then Client ID Metadata Documents (SEP-991), then
+    /// Dynamic Client Registration, then prompting the user. `havePreRegistered`
+    /// indicates the caller already holds a `client_id` for this AS.
+    ClientRegistrationApproach registrationApproach(AuthorizationServerMetadata as_,
+            bool havePreRegistered = false) @safe
+    {
+        return selectClientRegistrationApproach(as_, havePreRegistered, clientIdMetadataUrl);
+    }
+
+    /// Use this client's configured OAuth Client ID Metadata Document URL
+    /// (SEP-991) as the `client_id` for the authorization and token requests.
+    /// The returned `RegisteredClient` carries the HTTPS-URL `client_id` and no
+    /// secret, so it can be passed to `authorizationUrl`, `exchangeCode`,
+    /// `refresh`, etc. exactly like a registered or pre-registered client.
+    ///
+    /// Throws when the authorization server does not advertise
+    /// `client_id_metadata_document_supported`, or when no valid HTTPS-URL
+    /// `client_id` (with a path component) is configured.
+    RegisteredClient clientIdMetadataClient(AuthorizationServerMetadata as_) @safe
+    {
+        if (!as_.clientIdMetadataDocumentSupported)
+            throw internalError(
+                    "Authorization server does not support OAuth Client ID Metadata Documents");
+        if (!isValidClientIdMetadataUrl(clientIdMetadataUrl))
+            throw internalError("clientIdMetadataUrl must be an https URL with a path component");
+        return RegisteredClient(clientIdMetadataUrl, "");
+    }
+
+    /// Build the OAuth Client ID Metadata Document (SEP-991) this client should
+    /// host at its `clientIdMetadataUrl`. The document's `client_id` is the URL
+    /// itself and `redirect_uris` is the configured `redirectUri`.
+    ClientIdMetadataDocument clientIdMetadataDocument(string clientName = "", string scopeStr = "") @safe
+    {
+        ClientIdMetadataDocument d;
+        d.clientId = clientIdMetadataUrl;
+        d.clientName = clientName;
+        d.redirectUris = [redirectUri];
+        d.tokenEndpointAuthMethod = cast(string) authMethod;
+        d.scope_ = scopeStr;
+        return d;
     }
 
     /// Exchange an authorization code for tokens (PKCE auth-code grant).
@@ -367,4 +417,79 @@ final class OAuthClient
         }();
         return result;
     }
+}
+
+unittest  // CIMD client uses the configured HTTPS-URL client_id when advertised
+{
+    auto c = new OAuthClient();
+    c.clientIdMetadataUrl = "https://app.example.com/oauth/client.json";
+    AuthorizationServerMetadata as_;
+    as_.clientIdMetadataDocumentSupported = true;
+    auto rc = c.clientIdMetadataClient(as_);
+    assert(rc.clientId == "https://app.example.com/oauth/client.json");
+    assert(rc.clientSecret.length == 0);
+}
+
+unittest  // CIMD client refuses when the AS does not advertise support
+{
+    import std.exception : assertThrown;
+
+    auto c = new OAuthClient();
+    c.clientIdMetadataUrl = "https://app.example.com/oauth/client.json";
+    AuthorizationServerMetadata as_; // clientIdMetadataDocumentSupported == false
+    assertThrown(c.clientIdMetadataClient(as_));
+}
+
+unittest  // CIMD client refuses an invalid (non-https / pathless) client_id URL
+{
+    import std.exception : assertThrown;
+
+    auto c = new OAuthClient();
+    c.clientIdMetadataUrl = "https://app.example.com"; // no path component
+    AuthorizationServerMetadata as_;
+    as_.clientIdMetadataDocumentSupported = true;
+    assertThrown(c.clientIdMetadataClient(as_));
+}
+
+unittest  // registrationApproach prefers CIMD over DCR when advertised
+{
+    auto c = new OAuthClient();
+    c.clientIdMetadataUrl = "https://app.example.com/oauth/client.json";
+    AuthorizationServerMetadata as_;
+    as_.clientIdMetadataDocumentSupported = true;
+    as_.registrationEndpoint = "https://as.example.com/register";
+    assert(c.registrationApproach(as_) == ClientRegistrationApproach.clientIdMetadataDocument);
+    // Pre-registration still wins when the caller already has a client_id.
+    assert(c.registrationApproach(as_, true) == ClientRegistrationApproach.preRegistered);
+}
+
+unittest  // the CIMD authorization URL carries the URL client_id verbatim
+{
+    auto c = new OAuthClient();
+    c.clientIdMetadataUrl = "https://app.example.com/oauth/client.json";
+    c.redirectUri = "http://localhost:8765/callback";
+    AuthorizationServerMetadata as_;
+    as_.clientIdMetadataDocumentSupported = true;
+    as_.authorizationEndpoint = "https://as.example.com/authorize";
+    auto rc = c.clientIdMetadataClient(as_);
+    auto pkce = makePkce(new ubyte[32]);
+    auto url = c.authorizationUrl(as_, rc, pkce, "mcp:read", "state1");
+    import std.algorithm : canFind;
+    import std.uri : encodeComponent;
+
+    assert(url.canFind("client_id=" ~ encodeComponent("https://app.example.com/oauth/client.json")));
+}
+
+unittest  // clientIdMetadataDocument builds a hostable document for the URL
+{
+    auto c = new OAuthClient();
+    c.clientIdMetadataUrl = "https://app.example.com/oauth/client.json";
+    c.redirectUri = "http://localhost:8765/callback";
+    auto d = c.clientIdMetadataDocument("dlang-mcp", "mcp:read");
+    assert(d.clientId == "https://app.example.com/oauth/client.json");
+    assert(d.clientName == "dlang-mcp");
+    assert(d.redirectUris == ["http://localhost:8765/callback"]);
+    assert(d.tokenEndpointAuthMethod == "none");
+    auto j = d.toJson();
+    assert(j["client_id"].get!string == "https://app.example.com/oauth/client.json");
 }

@@ -224,6 +224,10 @@ struct AuthorizationServerMetadata
     /// RFC 9207: whether the AS includes the `iss` parameter in authorization
     /// responses. When true, clients MUST require and validate `iss`.
     bool authorizationResponseIssParameterSupported;
+    /// SEP-991: whether the AS supports OAuth Client ID Metadata Documents (an
+    /// HTTPS-URL `client_id` that points at a hosted client metadata document).
+    /// When true, a client SHOULD prefer this over Dynamic Client Registration.
+    bool clientIdMetadataDocumentSupported;
 
     /// PKCE S256 support is mandatory for MCP; clients MUST refuse otherwise.
     bool supportsS256() const @safe
@@ -247,6 +251,7 @@ struct AuthorizationServerMetadata
                 "token_endpoint_auth_methods_supported");
         m.authorizationResponseIssParameterSupported = boolField(j,
                 "authorization_response_iss_parameter_supported");
+        m.clientIdMetadataDocumentSupported = boolField(j, "client_id_metadata_document_supported");
         return m;
     }
 }
@@ -514,6 +519,240 @@ struct RegisteredClient
         c.clientSecret = strField(j, "client_secret");
         return c;
     }
+}
+
+// ===========================================================================
+// Client ID Metadata Documents (SEP-991)
+// ===========================================================================
+
+/// Validate an OAuth Client ID Metadata Document `client_id` URL (SEP-991):
+/// it MUST use the `https` scheme and contain a non-empty path component.
+bool isValidClientIdMetadataUrl(string clientId) @safe pure nothrow @nogc
+{
+    import std.string : indexOf;
+
+    // Must use the https scheme.
+    if (clientId.length < 8 || clientId[0 .. 8] != "https://")
+        return false;
+    auto rest = clientId[8 .. $];
+    // A path component must exist after the host: a '/' that is followed by at
+    // least one more character (a bare trailing '/' is not a path component).
+    const slash = rest.indexOf('/');
+    if (slash < 0)
+        return false;
+    return slash + 1 < rest.length;
+}
+
+unittest  // valid CIMD client_id: https with a path component
+{
+    assert(isValidClientIdMetadataUrl("https://app.example.com/oauth/client.json"));
+}
+
+unittest  // CIMD client_id without a path component is rejected
+{
+    assert(!isValidClientIdMetadataUrl("https://app.example.com"));
+    assert(!isValidClientIdMetadataUrl("https://app.example.com/"));
+}
+
+unittest  // CIMD client_id must use https
+{
+    assert(!isValidClientIdMetadataUrl("http://app.example.com/oauth/client.json"));
+    assert(!isValidClientIdMetadataUrl("app.example.com/oauth/client.json"));
+}
+
+/// An OAuth Client ID Metadata Document (SEP-991) a client hosts at its
+/// HTTPS-URL `client_id`. The authorization server fetches this document to
+/// learn the client's metadata (name, redirect URIs, auth method) without any
+/// prior registration. `clientId` MUST equal the document's own URL.
+struct ClientIdMetadataDocument
+{
+    string clientId;
+    string clientName;
+    string clientUri;
+    string[] redirectUris;
+    string[] grantTypes = ["authorization_code", "refresh_token"];
+    string[] responseTypes = ["code"];
+    string tokenEndpointAuthMethod = "none";
+    string scope_;
+
+    /// Serialize to the JSON document hosted at the `client_id` URL. `client_id`
+    /// and `redirect_uris` are always present (per SEP-991 minimum fields);
+    /// optional fields are emitted only when set.
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["client_id"] = clientId;
+        if (clientName.length)
+            j["client_name"] = clientName;
+        if (clientUri.length)
+            j["client_uri"] = clientUri;
+        Json ru = Json.emptyArray;
+        foreach (u; redirectUris)
+            ru ~= Json(u);
+        j["redirect_uris"] = ru;
+        Json gt = Json.emptyArray;
+        foreach (g; grantTypes)
+            gt ~= Json(g);
+        j["grant_types"] = gt;
+        Json rt = Json.emptyArray;
+        foreach (r; responseTypes)
+            rt ~= Json(r);
+        j["response_types"] = rt;
+        j["token_endpoint_auth_method"] = tokenEndpointAuthMethod;
+        if (scope_.length)
+            j["scope"] = scope_;
+        return j;
+    }
+
+    static ClientIdMetadataDocument fromJson(Json j) @safe
+    {
+        ClientIdMetadataDocument d;
+        d.clientId = strField(j, "client_id");
+        d.clientName = strField(j, "client_name");
+        d.clientUri = strField(j, "client_uri");
+        d.redirectUris = stringArray(j, "redirect_uris");
+        auto gt = stringArray(j, "grant_types");
+        if (gt.length)
+            d.grantTypes = gt;
+        auto rt = stringArray(j, "response_types");
+        if (rt.length)
+            d.responseTypes = rt;
+        auto am = strField(j, "token_endpoint_auth_method");
+        if (am.length)
+            d.tokenEndpointAuthMethod = am;
+        d.scope_ = strField(j, "scope");
+        return d;
+    }
+}
+
+unittest  // CIMD document emits the SEP-991 minimum fields
+{
+    ClientIdMetadataDocument d;
+    d.clientId = "https://app.example.com/oauth/client.json";
+    d.clientName = "Example MCP Client";
+    d.redirectUris = ["http://localhost:3000/callback"];
+    auto j = d.toJson();
+    assert(j["client_id"].get!string == "https://app.example.com/oauth/client.json");
+    assert(j["client_name"].get!string == "Example MCP Client");
+    assert(j["redirect_uris"][0].get!string == "http://localhost:3000/callback");
+    assert(j["token_endpoint_auth_method"].get!string == "none");
+}
+
+unittest  // CIMD document round-trips through toJson/fromJson
+{
+    ClientIdMetadataDocument d;
+    d.clientId = "https://app.example.com/oauth/client.json";
+    d.clientName = "Example MCP Client";
+    d.clientUri = "https://app.example.com";
+    d.redirectUris = ["http://localhost:3000/callback"];
+    d.scope_ = "mcp:read";
+    auto back = ClientIdMetadataDocument.fromJson(d.toJson());
+    assert(back.clientId == d.clientId);
+    assert(back.clientName == d.clientName);
+    assert(back.clientUri == d.clientUri);
+    assert(back.redirectUris == d.redirectUris);
+    assert(back.scope_ == d.scope_);
+}
+
+/// The client-registration approach an MCP client should use for an
+/// authorization server, per the spec priority order ("Client Registration
+/// Approaches", 2025-11-25 / draft).
+enum ClientRegistrationApproach
+{
+    /// Use pre-registered client information the client already has.
+    preRegistered,
+    /// Use an OAuth Client ID Metadata Document (HTTPS-URL `client_id`).
+    clientIdMetadataDocument,
+    /// Fall back to Dynamic Client Registration (RFC 7591).
+    dynamicClientRegistration,
+    /// Nothing applies — prompt the user to enter client information.
+    promptUser,
+}
+
+/// Select the client-registration approach for an authorization server,
+/// following the spec priority order:
+///   1. pre-registered client information, if available;
+///   2. Client ID Metadata Documents, if the AS advertises support
+///      (`client_id_metadata_document_supported`) and a valid HTTPS-URL
+///      `client_id` is configured;
+///   3. Dynamic Client Registration, if the AS exposes a `registration_endpoint`;
+///   4. otherwise prompt the user.
+///
+/// `havePreRegistered` is true when the caller already holds a client_id for
+/// this AS; `clientIdMetadataUrl` is the configured CIMD URL (empty if none).
+ClientRegistrationApproach selectClientRegistrationApproach(
+        const AuthorizationServerMetadata as_, bool havePreRegistered, string clientIdMetadataUrl) @safe
+{
+    if (havePreRegistered)
+        return ClientRegistrationApproach.preRegistered;
+    if (as_.clientIdMetadataDocumentSupported && isValidClientIdMetadataUrl(clientIdMetadataUrl))
+        return ClientRegistrationApproach.clientIdMetadataDocument;
+    if (as_.registrationEndpoint.length)
+        return ClientRegistrationApproach.dynamicClientRegistration;
+    return ClientRegistrationApproach.promptUser;
+}
+
+unittest  // pre-registration wins over everything else
+{
+    AuthorizationServerMetadata as_;
+    as_.clientIdMetadataDocumentSupported = true;
+    as_.registrationEndpoint = "https://as.example.com/register";
+    assert(selectClientRegistrationApproach(as_, true,
+            "https://app.example.com/oauth/client.json") == ClientRegistrationApproach
+            .preRegistered);
+}
+
+unittest  // CIMD chosen when advertised and a valid URL is configured
+{
+    AuthorizationServerMetadata as_;
+    as_.clientIdMetadataDocumentSupported = true;
+    as_.registrationEndpoint = "https://as.example.com/register";
+    assert(selectClientRegistrationApproach(as_, false,
+            "https://app.example.com/oauth/client.json") == ClientRegistrationApproach
+            .clientIdMetadataDocument);
+}
+
+unittest  // CIMD skipped when AS does not advertise support, falls back to DCR
+{
+    AuthorizationServerMetadata as_;
+    as_.clientIdMetadataDocumentSupported = false;
+    as_.registrationEndpoint = "https://as.example.com/register";
+    assert(selectClientRegistrationApproach(as_, false,
+            "https://app.example.com/oauth/client.json") == ClientRegistrationApproach
+            .dynamicClientRegistration);
+}
+
+unittest  // CIMD skipped when no/invalid URL configured, falls back to DCR
+{
+    AuthorizationServerMetadata as_;
+    as_.clientIdMetadataDocumentSupported = true;
+    as_.registrationEndpoint = "https://as.example.com/register";
+    assert(selectClientRegistrationApproach(as_, false,
+            "") == ClientRegistrationApproach.dynamicClientRegistration);
+    assert(selectClientRegistrationApproach(as_, false,
+            "http://app.example.com/x") == ClientRegistrationApproach.dynamicClientRegistration);
+}
+
+unittest  // prompt the user when nothing else applies
+{
+    AuthorizationServerMetadata as_;
+    assert(selectClientRegistrationApproach(as_, false, "") == ClientRegistrationApproach
+            .promptUser);
+}
+
+unittest  // metadata parses client_id_metadata_document_supported
+{
+    auto j = parseJson(
+            `{"issuer":"https://as.example.com","client_id_metadata_document_supported":true}`);
+    auto m = AuthorizationServerMetadata.fromJson(j);
+    assert(m.clientIdMetadataDocumentSupported);
+}
+
+unittest  // metadata defaults client_id_metadata_document_supported to false
+{
+    auto j = parseJson(`{"issuer":"https://as.example.com"}`);
+    auto m = AuthorizationServerMetadata.fromJson(j);
+    assert(!m.clientIdMetadataDocumentSupported);
 }
 
 /// A token endpoint response (RFC 6749 §5.1).
