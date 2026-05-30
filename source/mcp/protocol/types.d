@@ -29,6 +29,17 @@ struct Content
     string uri; /// resourceLink/embeddedResource
     string name; /// resourceLink
     Json resource = Json.undefined; /// embeddedResource: the resource contents object
+    Json annotations = Json.undefined; /// optional annotations (audience/priority/lastModified)
+
+    /// Attach optional annotations (audience/priority/lastModified) to this
+    /// content block. Returns a copy so calls can be chained, e.g.
+    /// `Content.makeText("hi").withAnnotations(a)`.
+    Content withAnnotations(Json a) const @safe
+    {
+        Content c = this;
+        c.annotations = a;
+        return c;
+    }
 
     static Content makeText(string t) @safe
     {
@@ -111,6 +122,8 @@ struct Content
             j["resource"] = resource;
             break;
         }
+        if (annotations.type != Json.Type.undefined)
+            j["annotations"] = annotations;
         return j;
     }
 
@@ -148,6 +161,8 @@ struct Content
             c.kind = ContentKind.text;
             break;
         }
+        if ("annotations" in j)
+            c.annotations = j["annotations"];
         return c;
     }
 }
@@ -423,6 +438,36 @@ unittest  // image content uses data + mimeType
     assert(j["mimeType"].get!string == "image/png");
     auto back = Content.fromJson(j);
     assert(back.kind == ContentKind.image && back.data == "YWJj");
+}
+
+unittest  // content omits annotations key when none are set
+{
+    auto c = Content.makeText("hello");
+    auto j = c.toJson();
+    assert("annotations" !in j);
+}
+
+unittest  // content emits annotations when present
+{
+    Json a = Json.emptyObject;
+    a["audience"] = Json([Json("user")]);
+    a["priority"] = Json(0.9);
+    auto c = Content.makeImage("YWJj", "image/png").withAnnotations(a);
+    auto j = c.toJson();
+    assert(j["annotations"]["audience"][0].get!string == "user");
+    assert(j["annotations"]["priority"].get!double == 0.9);
+}
+
+unittest  // inbound content annotations are preserved on fromJson
+{
+    Json a = Json.emptyObject;
+    a["audience"] = Json([Json("assistant")]);
+    a["lastModified"] = Json("2025-01-01T00:00:00Z");
+    auto orig = Content.makeText("hi").withAnnotations(a);
+    auto back = Content.fromJson(orig.toJson());
+    assert(back.annotations.type == Json.Type.object);
+    assert(back.annotations["audience"][0].get!string == "assistant");
+    assert(back.annotations["lastModified"].get!string == "2025-01-01T00:00:00Z");
 }
 
 unittest  // Tool defaults to an empty object input schema
