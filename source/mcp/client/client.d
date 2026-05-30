@@ -400,10 +400,40 @@ final class MCPClient
         return params;
     }
 
+    /// Test seam: when set, `notify` routes the built notification message here
+    /// instead of POSTing it, so the public notification API can be exercised
+    /// without a live server. Production code never sets this.
+    package void delegate(Json message) @safe onNotifyForTest;
+
     /// Send a notification (no reply expected).
     private void notify(string method, Json params) @safe
     {
-        post(makeNotification(method, params));
+        auto message = makeNotification(method, params);
+        if (onNotifyForTest !is null)
+        {
+            onNotifyForTest(message);
+            return;
+        }
+        post(message);
+    }
+
+    /// Send an arbitrary client-originated JSON-RPC notification to the server
+    /// (no reply expected). This is the public entry point for client→server
+    /// notifications such as `notifications/roots/list_changed`; the lifecycle's
+    /// `notifications/initialized` is sent automatically by `initialize`.
+    void sendNotification(string method, Json params = Json.emptyObject) @safe
+    {
+        notify(method, params);
+    }
+
+    /// Emit `notifications/roots/list_changed`, informing the server that this
+    /// client's set of roots has changed. Per client/roots §Root List Changes,
+    /// a client that advertises the roots `listChanged` capability MUST send
+    /// this notification whenever its roots change. Call this after updating the
+    /// roots returned by `onListRoots`.
+    void notifyRootsListChanged() @safe
+    {
+        notify("notifications/roots/list_changed", Json.emptyObject);
     }
 
     /// POST a message that expects no correlated reply (notification/response).
@@ -1661,6 +1691,38 @@ unittest  // sampling dispatch rejects an unbalanced tool_use with -32602
     }
     assert(threw);
     assert(!delegateCalled); // validation runs before the delegate
+}
+
+unittest  // notifyRootsListChanged emits the spec notification method
+{
+    auto c = new MCPClient("http://localhost");
+    Json sent = Json.undefined;
+    c.onNotifyForTest = (Json message) @safe { sent = message; };
+
+    c.notifyRootsListChanged();
+
+    assert(sent.type == Json.Type.object);
+    assert(sent["jsonrpc"].get!string == "2.0");
+    assert("id" !in sent); // a notification has no id
+    assert(sent["method"].get!string == "notifications/roots/list_changed");
+}
+
+unittest  // sendNotification sends an arbitrary client-originated notification
+{
+    auto c = new MCPClient("http://localhost");
+    Json sent = Json.undefined;
+    c.onNotifyForTest = (Json message) @safe { sent = message; };
+
+    Json params = Json.emptyObject;
+    params["progressToken"] = "tok-1";
+    params["progress"] = 42;
+    c.sendNotification("notifications/progress", params);
+
+    assert(sent.type == Json.Type.object);
+    assert(sent["method"].get!string == "notifications/progress");
+    assert("id" !in sent);
+    assert(sent["params"]["progressToken"].get!string == "tok-1");
+    assert(sent["params"]["progress"].get!int == 42);
 }
 
 unittest  // sampling dispatch forwards a valid request to the delegate
