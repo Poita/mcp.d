@@ -3,6 +3,7 @@ module mcp.protocol.types;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json, parseJsonString;
 import mcp.protocol.capabilities;
+import mcp.protocol.draft : InputRequest;
 
 @safe:
 
@@ -385,10 +386,28 @@ struct CallToolResult
     bool isError;
     Json structuredContent = Json.undefined;
     Json meta; /// optional result-level `_meta` object
+    /// Multi Round-Trip Requests (MRTR / SEP-2322): when the draft server needs
+    /// more input to complete the call, it answers `tools/call` with an
+    /// `InputRequiredResult` instead of a `CallToolResult` — a set of
+    /// `InputRequest`s the client must satisfy (via its sampling / elicitation /
+    /// roots handlers) and resubmit. When non-empty, `content` is meaningless and
+    /// the caller should gather input and retry the request with matching
+    /// `inputResponses`. See `isInputRequired`.
+    InputRequest[] inputRequests;
 
     Json toJson() const @safe
     {
         Json j = Json.emptyObject;
+        // An `InputRequiredResult` is a distinct result shape (only `inputRequests`),
+        // not a `CallToolResult` with content — serialise it as such.
+        if (inputRequests.length)
+        {
+            Json reqs = Json.emptyArray;
+            foreach (req; inputRequests)
+                reqs ~= req.toJson();
+            j["inputRequests"] = reqs;
+            return j;
+        }
         Json arr = Json.emptyArray;
         foreach (c; content)
             arr ~= c.toJson();
@@ -417,7 +436,22 @@ struct CallToolResult
             r.structuredContent = j["structuredContent"];
         if ("_meta" in j && j["_meta"].type == Json.Type.object)
             r.meta = j["_meta"];
+        // MRTR: detect an `InputRequiredResult` (the server asks for more input).
+        if ("inputRequests" in j && j["inputRequests"].type == Json.Type.array)
+        {
+            auto arr = j["inputRequests"];
+            foreach (i; 0 .. arr.length)
+                r.inputRequests ~= InputRequest.fromJson(arr[i]);
+        }
         return r;
+    }
+
+    /// Whether this result is an MRTR `InputRequiredResult`: the server needs the
+    /// client to gather input (`inputRequests`) and retry the original `tools/call`
+    /// with matching `inputResponses`, rather than a completed tool result.
+    bool isInputRequired() const @safe nothrow
+    {
+        return inputRequests.length > 0;
     }
 
     /// Fluent setter for the result-level `_meta` object, e.g.
@@ -770,6 +804,33 @@ unittest  // CallToolResult.withMeta is a fluent setter
     m["x.example/k"] = "v";
     auto r = CallToolResult([Content.makeText("ok")]).withMeta(m);
     assert(r.meta["x.example/k"].get!string == "v");
+}
+
+unittest  // CallToolResult.fromJson detects an MRTR InputRequiredResult
+{
+    Json req = Json.emptyObject;
+    req["id"] = "date";
+    req["type"] = "elicitation";
+    req["params"] = Json(["message": Json("When?")]);
+    Json j = Json.emptyObject;
+    j["inputRequests"] = Json([req]);
+
+    auto r = CallToolResult.fromJson(j);
+    assert(r.isInputRequired());
+    assert(r.inputRequests.length == 1);
+    assert(r.inputRequests[0].id == "date");
+    assert(r.inputRequests[0].type == "elicitation");
+    assert(r.inputRequests[0].params["message"].get!string == "When?");
+}
+
+unittest  // a completed CallToolResult is not an InputRequiredResult
+{
+    CallToolResult r;
+    r.content = [Content.makeText("done")];
+    auto back = CallToolResult.fromJson(r.toJson());
+    assert(!back.isInputRequired());
+    assert(back.inputRequests.length == 0);
+    assert(back.content[0].text == "done");
 }
 
 unittest  // ListToolsResult carries tools and optional cursor

@@ -402,20 +402,102 @@ final class MCPClient
     }
 
     /// `tools/call`.
+    ///
+    /// Against a draft (MRTR / SEP-2322) server this transparently completes a
+    /// Multi Round-Trip Request: if the server answers with an
+    /// `InputRequiredResult` (the result carries `inputRequests`), each request is
+    /// dispatched to the matching `onSampling` / `onElicitation` / `onListRoots`
+    /// handler and the original `tools/call` is resubmitted with the answers
+    /// attached under `_meta["io.modelcontextprotocol/inputResponses"]`, looping
+    /// until the server returns a completed `CallToolResult`. The loop only
+    /// engages when draft mode is enabled (see `enableDraft`/`connect`); other
+    /// protocol versions never see `inputRequests`.
     CallToolResult callTool(string name, Json arguments = Json.emptyObject) @safe
     {
-        return CallToolResult.fromJson(rpc("tools/call",
-                buildToolCallParams(name, arguments, ProgressToken.init)));
+        return callToolLoop(name, arguments, ProgressToken.init);
     }
 
     /// `tools/call`, requesting progress updates for the call. The server may
     /// then emit `notifications/progress` carrying `progressToken`, observable
     /// via `onNotification`. Per basic/utilities/progress, the token is sent in
-    /// `params._meta.progressToken`.
+    /// `params._meta.progressToken`. Drives the same MRTR loop as the no-token
+    /// overload (see `callTool`).
     CallToolResult callTool(string name, Json arguments, ProgressToken progressToken) @safe
     {
+        return callToolLoop(name, arguments, progressToken);
+    }
+
+    /// Issue `tools/call` and, against a draft server, complete any MRTR
+    /// (SEP-2322) round-trips by satisfying each `InputRequest` and resubmitting
+    /// the request with the answers. Returns the first completed `CallToolResult`.
+    ///
+    /// A bound is placed on the number of rounds so a misbehaving server that
+    /// keeps asking for input cannot loop forever. If a handler for a requested
+    /// input type is missing, or the loop bound is exceeded, the (still
+    /// `inputRequired`) result is returned so the caller can inspect it via
+    /// `CallToolResult.isInputRequired`.
+    private CallToolResult callToolLoop(string name, Json arguments, ProgressToken progressToken) @safe
+    {
+        enum maxRounds = 16;
+        InputResponse[] responses;
+        foreach (round; 0 .. maxRounds)
+        {
+            auto params = buildToolCallParams(name, arguments, progressToken, responses);
+            auto result = CallToolResult.fromJson(rpc("tools/call", params));
+            if (!result.isInputRequired)
+                return result;
+            // Gather an answer for each requested input. If any cannot be
+            // satisfied (no handler registered), stop and hand the
+            // inputRequired result back to the caller.
+            InputResponse[] answers;
+            foreach (req; result.inputRequests)
+            {
+                InputResponse answer;
+                if (!resolveInputRequest(req, answer))
+                    return result;
+                answers ~= answer;
+            }
+            responses = answers;
+        }
+        // Bound exceeded: return whatever the last round produced (still an
+        // inputRequired result) rather than looping forever.
         return CallToolResult.fromJson(rpc("tools/call",
-                buildToolCallParams(name, arguments, progressToken)));
+                buildToolCallParams(name, arguments, progressToken, responses)));
+    }
+
+    /// Satisfy one MRTR `InputRequest` by dispatching it to the matching client
+    /// handler, writing the answer into `answer` (keyed by `req.id`). Returns
+    /// `false` (leaving `answer` untouched) when no handler is registered for the
+    /// request's type, so the caller can surface the unanswered
+    /// `InputRequiredResult`. `req.type` maps to the server-initiated request the
+    /// MRTR round replaces: `"sampling"`→`onSampling`, `"elicitation"`→
+    /// `onElicitation`, `"roots"`→`onListRoots`.
+    private bool resolveInputRequest(InputRequest req, out InputResponse answer) @safe
+    {
+        Json result;
+        switch (req.type)
+        {
+        case "sampling":
+            if (onSampling is null)
+                return false;
+            validateSamplingMessages(req.params);
+            result = onSampling(req.params);
+            break;
+        case "elicitation":
+            if (onElicitation is null)
+                return false;
+            result = onElicitation(req.params);
+            break;
+        case "roots":
+            if (onListRoots is null)
+                return false;
+            result = onListRoots(req.params);
+            break;
+        default:
+            return false;
+        }
+        answer = InputResponse(req.id, result);
+        return true;
     }
 
     /// Build the `tools/call` params, optionally attaching a progress token.
@@ -428,6 +510,40 @@ final class MCPClient
         p["name"] = name;
         p["arguments"] = arguments;
         return withProgressToken(p, progressToken);
+    }
+
+    /// Build the `tools/call` params with any gathered MRTR (SEP-2322) input
+    /// responses attached under `_meta["io.modelcontextprotocol/inputResponses"]`
+    /// (`MetaKey.inputResponses`), the reserved key a draft server reads via
+    /// `readInputResponses`. With no responses this is identical to the plain
+    /// `buildToolCallParams`. Separated as a package static so the resubmission
+    /// param shaping can be unit-tested without a live server.
+    package static Json buildToolCallParams(string name, Json arguments,
+            ProgressToken progressToken, InputResponse[] responses) @safe
+    {
+        Json p = buildToolCallParams(name, arguments, progressToken);
+        return withInputResponses(p, responses);
+    }
+
+    /// Attach MRTR (SEP-2322) input responses to a request's
+    /// `params._meta["io.modelcontextprotocol/inputResponses"]`
+    /// (`MetaKey.inputResponses`), preserving any existing `_meta` entries. An
+    /// empty `responses` list returns `params` unchanged. Exposed so callers can
+    /// attach answers to a hand-built params object.
+    static Json withInputResponses(Json params, InputResponse[] responses) @safe
+    {
+        if (responses.length == 0)
+            return params;
+        if (params.type != Json.Type.object)
+            params = Json.emptyObject;
+        Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"]
+            : Json.emptyObject;
+        Json arr = Json.emptyArray;
+        foreach (resp; responses)
+            arr ~= resp.toJson();
+        meta[MetaKey.inputResponses] = arr;
+        params["_meta"] = meta;
+        return params;
     }
 
     /// `tools/call` for a tool whose descriptor (and therefore `outputSchema`) is
@@ -2948,4 +3064,103 @@ unittest  // cacheToolSchema records a schema and ignores a non-object one
     // Non-object schema is ignored.
     c.cacheToolSchema("bad", Json("not-an-object"));
     assert("bad" !in c.toolInputSchemas_);
+}
+
+unittest  // MRTR: withInputResponses attaches answers under the reserved _meta key
+{
+    auto resp = InputResponse("date", Json([
+            "content": Json(["day": Json("monday")])
+    ]));
+    auto params = MCPClient.buildToolCallParams("book", Json.emptyObject,
+            ProgressToken.init, [resp]);
+    auto arr = params["_meta"][MetaKey.inputResponses];
+    assert(arr.type == Json.Type.array);
+    assert(arr.length == 1);
+    assert(arr[0]["id"].get!string == "date");
+    assert(arr[0]["result"]["content"]["day"].get!string == "monday");
+}
+
+unittest  // MRTR: withInputResponses with no answers leaves params untouched
+{
+    auto params = MCPClient.buildToolCallParams("book", Json.emptyObject, ProgressToken.init, [
+    ]);
+    assert("_meta" !in params);
+}
+
+unittest  // MRTR: withInputResponses preserves existing _meta entries
+{
+    Json p = Json.emptyObject;
+    Json meta = Json.emptyObject;
+    meta["progressToken"] = "p1";
+    p["_meta"] = meta;
+    auto resp = InputResponse("q1", Json(["action": Json("accept")]));
+    auto out_ = MCPClient.withInputResponses(p, [resp]);
+    assert(out_["_meta"]["progressToken"].get!string == "p1");
+    assert(out_["_meta"][MetaKey.inputResponses].length == 1);
+}
+
+unittest  // MRTR: resolveInputRequest routes an elicitation request to onElicitation
+{
+    auto c = new MCPClient("http://localhost/mcp");
+    Json seen = Json.undefined;
+    c.onElicitation = (Json params) @safe {
+        seen = params;
+        return Json([
+            "action": Json("accept"),
+            "content": Json(["day": Json("tuesday")])
+        ]);
+    };
+    Json ep = Json.emptyObject;
+    ep["message"] = "When?";
+    InputResponse answer;
+    const ok = c.resolveInputRequest(InputRequest("date", "elicitation", ep), answer);
+    assert(ok);
+    assert(seen["message"].get!string == "When?");
+    assert(answer.id == "date");
+    assert(answer.result["content"]["day"].get!string == "tuesday");
+}
+
+unittest  // MRTR: resolveInputRequest routes a sampling request to onSampling
+{
+    auto c = new MCPClient("http://localhost/mcp");
+    c.onSampling = (Json params) @safe {
+        return Json(["role": Json("assistant")]);
+    };
+    InputResponse answer;
+    const ok = c.resolveInputRequest(InputRequest("s1", "sampling", Json.emptyObject), answer);
+    assert(ok);
+    assert(answer.id == "s1");
+    assert(answer.result["role"].get!string == "assistant");
+}
+
+unittest  // MRTR: resolveInputRequest routes a roots request to onListRoots
+{
+    auto c = new MCPClient("http://localhost/mcp");
+    c.onListRoots = (Json params) @safe {
+        return Json(["roots": Json.emptyArray]);
+    };
+    InputResponse answer;
+    const ok = c.resolveInputRequest(InputRequest("r1", "roots", Json.emptyObject), answer);
+    assert(ok);
+    assert(answer.id == "r1");
+    assert(answer.result["roots"].type == Json.Type.array);
+}
+
+unittest  // MRTR: resolveInputRequest fails (no answer) when no handler is registered
+{
+    auto c = new MCPClient("http://localhost/mcp");
+    InputResponse answer;
+    // onElicitation is null by default -> cannot satisfy the request.
+    const ok = c.resolveInputRequest(InputRequest("x", "elicitation", Json.emptyObject), answer);
+    assert(!ok);
+    assert(answer.id.length == 0);
+}
+
+unittest  // MRTR: resolveInputRequest fails for an unknown input type
+{
+    auto c = new MCPClient("http://localhost/mcp");
+    c.onElicitation = (Json) @safe { return Json.emptyObject; };
+    InputResponse answer;
+    const ok = c.resolveInputRequest(InputRequest("x", "bogus", Json.emptyObject), answer);
+    assert(!ok);
 }
