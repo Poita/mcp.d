@@ -301,6 +301,64 @@ private void handleGet(MCPServer server, ServerPushChannel push,
     }
 }
 
+/// Serve a draft `subscriptions/listen` request as a long-lived SSE notification
+/// stream (draft basic/transports / basic/utilities/subscriptions): "subscriptions/
+/// listen opens a long-lived notification stream from the server to the client ...
+/// the stream stays open and delivers notifications until the client cancels it."
+///
+/// The request is first routed through `server.handle` so the server records the
+/// opted-in change-notification filters. The response is then upgraded to
+/// `text/event-stream`; the leading event is
+/// `notifications/subscriptions/acknowledged` carrying the agreed-upon subset, and
+/// the stream is registered as a listener on the server-push channel so the
+/// existing `notify*` / `notifyResourceUpdated` APIs deliver opted-in change
+/// notifications onto it. The connection is held open (with SSE comment
+/// heartbeats) until the client disconnects.
+private void handleListenStream(MCPServer server, StreamCoordinator coord,
+        Message msg, HTTPServerResponse res) @safe
+{
+    import vibe.core.core : sleep;
+    import core.time : seconds;
+
+    // Record the opted-in filters (route -> doSubscribeListen). The one-shot
+    // JSON result is discarded: on this path the acknowledgement is delivered as
+    // the first SSE event instead.
+    server.handle(msg);
+
+    res.contentType = "text/event-stream";
+    res.headers["Cache-Control"] = "no-cache";
+
+    auto push = server.serverPushChannel(coord);
+    const listenerId = push.addListener((string frame) @safe {
+        () @trusted {
+            res.bodyWriter.write(cast(const(ubyte)[]) frame);
+            res.bodyWriter.flush();
+        }();
+    });
+    // Drop the listener when the stream ends so the channel self-heals.
+    scope (exit)
+        push.removeListener(listenerId);
+
+    // First event: acknowledge with the agreed-upon subset, delivered only to
+    // this stream (not broadcast to any other open listen stream).
+    push.emitTo(listenerId,
+            subscriptionsAcknowledgedNotification(server.acknowledgedListenSubset()));
+
+    // Hold the connection open, emitting an SSE comment heartbeat so a write
+    // failure (client disconnect) is observed and the loop terminates.
+    while (true)
+    {
+        sleep(15.seconds);
+        try
+            () @trusted {
+            res.bodyWriter.write(cast(const(ubyte)[]) ": ping\n\n");
+            res.bodyWriter.flush();
+        }();
+        catch (Exception)
+            break;
+    }
+}
+
 private void handlePost(MCPServer server, StreamCoordinator coord,
         SessionManager sessions, TokenInfo token, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
@@ -414,6 +472,19 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
                 res.writeBody(makeErrorResponse(msg.id, perr).toString(), "application/json");
                 return;
             }
+        }
+        // Draft subscriptions/listen: the response is itself a long-lived SSE
+        // stream that stays open and delivers change notifications until the
+        // client closes it (draft basic/transports / basic/utilities/
+        // subscriptions). Record the opted-in filters, open the stream, send the
+        // acknowledgement as the first event, then hold it open — wired to the
+        // server-push channel so notify*/notifyResourceUpdated reach it.
+        const isDraftReq = tryDraft(req.headers.get(HttpHeader.protocolVersion, ""))
+            || tryDraft(RequestMeta.fromParams(msg.params).protocolVersion);
+        if (opensListenStream(msg.method, isDraftReq))
+        {
+            handleListenStream(server, coord, msg, res);
+            return;
         }
         auto ctx = new HttpStreamContext(res, coord, server.clientCapabilities,
                 extractProgressToken(msg.params), token);
@@ -758,6 +829,47 @@ private bool tryDraft(string protoHeader) @safe
     return tryParseVersion(protoHeader, pv) && pv.isDraft;
 }
 
+/// Decide whether a request must be answered with a long-lived `text/event-stream`
+/// notification stream rather than the ordinary one-shot JSON response
+/// (draft basic/transports / basic/utilities/subscriptions). Only the draft
+/// `subscriptions/listen` request takes this path: "The server's response is
+/// itself an SSE stream that stays open and delivers the change notifications."
+/// Pre-draft versions never defined `subscriptions/listen`, so they answer
+/// normally.
+bool opensListenStream(string method, bool isDraft) @safe
+{
+    return isDraft && method == "subscriptions/listen";
+}
+
+unittest  // only a draft subscriptions/listen opens the long-lived stream
+{
+    assert(opensListenStream("subscriptions/listen", true));
+    assert(!opensListenStream("subscriptions/listen", false));
+    assert(!opensListenStream("tools/list", true));
+    assert(!opensListenStream("initialize", true));
+}
+
+/// Build the leading event the transport sends when it opens a
+/// `subscriptions/listen` stream: a `notifications/subscriptions/acknowledged`
+/// notification carrying the agreed-upon subset of change-notification types the
+/// server will deliver on the stream (draft basic/utilities/subscriptions). The
+/// `subset` is what `MCPServer.acknowledgedListenSubset` reported.
+Json subscriptionsAcknowledgedNotification(Json subset) @safe
+{
+    return makeNotification("notifications/subscriptions/acknowledged", subset);
+}
+
+unittest  // the acknowledgement carries the agreed subset as its params
+{
+    Json subset = Json.emptyObject;
+    subset["toolsListChanged"] = true;
+    auto n = subscriptionsAcknowledgedNotification(subset);
+    assert(n["method"].get!string == "notifications/subscriptions/acknowledged");
+    assert(n["params"]["toolsListChanged"].get!bool);
+    // It is a notification: no id.
+    assert("id" !in n);
+}
+
 /// Render a JSON scalar the way the draft requires for `Mcp-Param-*` header
 /// comparison: strings as-is, integers as decimal, booleans as "true"/"false".
 private string jsonScalarToString(Json v) @safe
@@ -916,4 +1028,41 @@ unittest  // ordinary application errors (e.g. invalidParams) ride on HTTP 200
     auto r = errResponse(ErrorCode.invalidParams);
     assert(httpStatusForResponse(r, true) == 200);
     assert(httpStatusForResponse(r, false) == 200);
+}
+
+unittest  // draft subscriptions/listen: ack first, then opted-in change notifications flow
+{
+    import mcp.transport.sse_context : StreamCoordinator, ServerPushChannel;
+    import std.algorithm : canFind;
+
+    auto server = new MCPServer("t", "1");
+
+    // Drive the server onto the draft via a draft subscriptions/listen request,
+    // mirroring what handleListenStream does: record the opted-in filters.
+    Json listenParams = Json.emptyObject;
+    listenParams["toolsListChanged"] = true;
+    auto m = draftMsg("subscriptions/listen", listenParams);
+    server.handle(m);
+    assert(server.listensFor("toolsListChanged"));
+    assert(!server.listensFor("resourcesListChanged"));
+
+    // The listen stream registers as a push-channel listener and receives the ack.
+    auto coord = new StreamCoordinator;
+    auto push = server.serverPushChannel(coord);
+    string[] frames;
+    const lid = push.addListener((string f) @safe { frames ~= f; });
+    push.emitTo(lid, subscriptionsAcknowledgedNotification(server.acknowledgedListenSubset()));
+    assert(frames.length == 1);
+    assert(frames[0].canFind("notifications/subscriptions/acknowledged"));
+    assert(frames[0].canFind("toolsListChanged"));
+
+    // An opted-in change notification is delivered onto the open stream.
+    assert(server.notifyToolsListChanged() == 1);
+    assert(frames.length == 2);
+    assert(frames[1].canFind("notifications/tools/list_changed"));
+
+    // A change type the client did NOT opt into is suppressed (no new frame).
+    server.enableResourcesListChanged();
+    assert(server.notifyResourcesListChanged() == 0);
+    assert(frames.length == 2);
 }
