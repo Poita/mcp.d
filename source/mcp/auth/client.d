@@ -26,6 +26,24 @@ final class OAuthClient
     string redirectUri = "http://localhost:8765/callback";
     /// How to authenticate at the token endpoint.
     TokenEndpointAuthMethod authMethod = TokenEndpointAuthMethod.none;
+    /// EC private key (PKCS#8 PEM) for `private_key_jwt` client assertions.
+    string privateKeyPem;
+
+    /// Build the `client_assertion_type` + `client_assertion` form fields for
+    /// `private_key_jwt` token-endpoint authentication (RFC 7523), or "".
+    private string clientAssertionParams(string clientId, string audience) @safe
+    {
+        import std.uri : encodeComponent;
+        import std.datetime.systime : Clock;
+        import mcp.auth.jwt : makeClientAssertion, jwtBearerAssertionType;
+
+        if (authMethod != TokenEndpointAuthMethod.privateKeyJwt || privateKeyPem.length == 0)
+            return "";
+        const now = () @trusted { return Clock.currTime().toUnixTime(); }();
+        const jwt = makeClientAssertion(clientId, audience, privateKeyPem, now);
+        return "&client_assertion_type=" ~ encodeComponent(
+                jwtBearerAssertionType) ~ "&client_assertion=" ~ encodeComponent(jwt);
+    }
 
     /// Discover the protected-resource metadata for an MCP endpoint, using the
     /// `resource_metadata` URL from a `WWW-Authenticate` header when present, else
@@ -130,7 +148,8 @@ final class OAuthClient
     {
         const post = authMethod == TokenEndpointAuthMethod.clientSecretPost;
         auto form = buildAuthCodeTokenForm(code, redirectUri, codeVerifier,
-                client.clientId, resource, post ? client.clientSecret : "");
+                client.clientId, resource, post ? client.clientSecret : "") ~ clientAssertionParams(client.clientId,
+                as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
         return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
     }
 
@@ -140,7 +159,8 @@ final class OAuthClient
     {
         const post = authMethod == TokenEndpointAuthMethod.clientSecretPost;
         auto form = buildClientCredentialsForm(client.clientId, scopeStr,
-                resource, post ? client.clientSecret : "");
+                resource, post ? client.clientSecret : "") ~ clientAssertionParams(client.clientId,
+                as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
         return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
     }
 

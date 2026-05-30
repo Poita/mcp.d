@@ -398,6 +398,7 @@ enum TokenEndpointAuthMethod : string
     none = "none",
     clientSecretBasic = "client_secret_basic",
     clientSecretPost = "client_secret_post",
+    privateKeyJwt = "private_key_jwt",
 }
 
 /// A Dynamic Client Registration request body (RFC 7591).

@@ -240,9 +240,18 @@ private int runAuthScenario(string url, string scenario) @safe
         client = oauth.register(as_, "dlang-mcp-client", scopeStr);
     }
 
-    // Choose the token-endpoint auth method: if we hold a secret and the AS
-    // supports a secret-based method, use it; otherwise prefer "none".
-    oauth.authMethod = chooseAuthMethod(as_, client.clientSecret.length > 0);
+    // A private key in the context means private_key_jwt client authentication.
+    if ("private_key_pem" in context && context["private_key_pem"].type == Json.Type.string)
+    {
+        oauth.privateKeyPem = context["private_key_pem"].get!string;
+        oauth.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+    }
+    else
+    {
+        // Choose the token-endpoint auth method: if we hold a secret and the AS
+        // supports a secret-based method, use it; otherwise prefer "none".
+        oauth.authMethod = chooseAuthMethod(as_, client.clientSecret.length > 0);
+    }
 
     TokenSet tokens;
     if (scenario.canFind("client-credentials"))
