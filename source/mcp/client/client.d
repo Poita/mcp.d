@@ -374,6 +374,17 @@ final class MCPClient
                 break;
             if (line.length && line[$ - 1] == '\r')
                 line = line[0 .. $ - 1];
+            () @trusted {
+                import std.stdio : stderr;
+                import std.process : environment;
+
+                if (environment.get("MCP_CLIENT_DEBUG", "").length)
+                    try
+                        stderr.writeln("[c] POST line: ", line);
+                    catch (Exception)
+                    {
+                    }
+            }();
 
             if (line.length == 0)
             {
@@ -555,54 +566,110 @@ final class MCPClient
                     req ~= "\r\n";
                     conn.write(cast(const(ubyte)[]) req);
 
-                    // Status line + headers (consume through the blank line).
+                    import vibe.core.stream : IOMode;
+                    import std.conv : parse;
+
+                    // Status line + headers (note chunked transfer-encoding).
                     auto statusLine = cast(string) readLine(conn).idup;
                     if (statusLine.indexOf(" 200") < 0)
                         return;
+                    bool chunked;
                     for (;;)
                     {
                         auto h = cast(string) readLine(conn).idup;
+                        if (h.length && h[$ - 1] == '\r')
+                            h = h[0 .. $ - 1];
+                        import std.string : toLower;
+
+                        if (h.toLower.indexOf("transfer-encoding:") == 0
+                                && h.toLower.indexOf("chunked") >= 0)
+                            chunked = true;
                         if (h.length == 0)
                             break;
                     }
 
-                    // SSE event loop.
-                    string data;
-                    for (;;)
+                    // SSE parser shared across chunk boundaries.
+                    string acc, data;
+                    void parseSse()
                     {
-                        auto line = cast(string) readLine(conn).idup;
-                        if (line.length && line[$ - 1] == '\r')
-                            line = line[0 .. $ - 1];
-                        if (line.length == 0)
+                        for (;;)
                         {
-                            if (data.length)
+                            const nl = acc.indexOf('\n');
+                            if (nl < 0)
+                                break;
+                            auto line = acc[0 .. nl];
+                            acc = acc[nl + 1 .. $];
+                            if (line.length && line[$ - 1] == '\r')
+                                line = line[0 .. $ - 1];
+                            if (line.length == 0)
                             {
-                                sawData = true;
+                                if (data.length)
+                                {
+                                    sawData = true;
+                                    try
+                                        dispatchInbound(Message(parseJsonString(data)));
+                                    catch (Exception)
+                                    {
+                                    }
+                                    data = null;
+                                }
+                            }
+                            else if (line.startsWith("data:"))
+                            {
+                                auto d = line["data:".length .. $];
+                                if (d.startsWith(" "))
+                                    d = d[1 .. $];
+                                data ~= (data.length ? "\n" : "") ~ d;
+                            }
+                            else if (line.startsWith("id:"))
+                                lastEventId = line["id:".length .. $].strip;
+                            else if (line.startsWith("retry:"))
+                            {
                                 try
-                                    dispatchInbound(Message(parseJsonString(data)));
+                                    retryMs = line["retry:".length .. $].strip.to!long;
                                 catch (Exception)
                                 {
                                 }
-                                data = null;
                             }
-                            continue;
                         }
-                        if (line.startsWith("data:"))
+                    }
+
+                    // Body loop: decode chunked transfer-encoding (each chunk is a
+                    // hex size line, that many bytes, then CRLF), feeding the SSE
+                    // parser; or read raw to EOF when not chunked.
+                    for (;;)
+                    {
+                        if (chunked)
                         {
-                            auto d = line["data:".length .. $];
-                            if (d.startsWith(" "))
-                                d = d[1 .. $];
-                            data ~= (data.length ? "\n" : "") ~ d;
-                        }
-                        else if (line.startsWith("id:"))
-                            lastEventId = line["id:".length .. $].strip;
-                        else if (line.startsWith("retry:"))
-                        {
+                            auto sizeLine = (cast(string) readLine(conn).idup).strip;
+                            if (sizeLine.length == 0)
+                                continue;
+                            uint sz;
                             try
-                                retryMs = line["retry:".length .. $].strip.to!long;
-                            catch (Exception)
                             {
+                                auto sl = sizeLine;
+                                sz = parse!uint(sl, 16);
                             }
+                            catch (Exception)
+                                break;
+                            if (sz == 0)
+                                break; // last chunk
+                            auto chunk = new ubyte[sz];
+                            conn.read(chunk, IOMode.all);
+                            acc ~= cast(string) chunk.idup;
+                            readLine(conn); // trailing CRLF after the chunk data
+                            parseSse();
+                        }
+                        else
+                        {
+                            const avail = conn.leastSize;
+                            if (avail == 0)
+                                break;
+                            const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
+                            auto buf = new ubyte[toRead];
+                            conn.read(buf, IOMode.once);
+                            acc ~= cast(string) buf.idup;
+                            parseSse();
                         }
                     }
                 }
