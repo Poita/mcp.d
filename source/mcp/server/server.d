@@ -10,6 +10,7 @@ import mcp.protocol.capabilities;
 import mcp.protocol.types;
 import mcp.protocol.draft;
 import mcp.server.context;
+import mcp.transport.sse_context : ServerPushChannel, StreamCoordinator;
 
 @safe:
 
@@ -121,6 +122,7 @@ final class MCPServer
     private long cacheTtlMs;
     private CacheScope cacheScope_ = CacheScope.public_;
     private bool[string] listenFilters;
+    private ServerPushChannel pushChannel;
 
     this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
     {
@@ -269,6 +271,42 @@ final class MCPServer
     string currentLogLevel() const @safe
     {
         return logLevel;
+    }
+
+    /// The server->client push channel for *unsolicited* traffic — the messages
+    /// a server sends on the standalone SSE stream a client opens with an HTTP
+    /// GET to the MCP endpoint (basic/transports §Listening for Messages from the
+    /// Server), outside any in-flight POST. The Streamable HTTP transport creates
+    /// it (sharing the supplied `StreamCoordinator`) when the mount is set up;
+    /// it is created lazily on first access so callers can hold a reference
+    /// before mounting. Use `notify` (or the returned channel's `emit`) to deliver
+    /// notifications/requests to every connected GET listener.
+    ServerPushChannel serverPushChannel(StreamCoordinator coord) @safe
+    {
+        if (pushChannel is null)
+            pushChannel = new ServerPushChannel(coord);
+        return pushChannel;
+    }
+
+    /// The active server->client push channel, or null if none has been created
+    /// (e.g. the server is not mounted on a Streamable HTTP transport).
+    ServerPushChannel serverPushChannel() @safe
+    {
+        return pushChannel;
+    }
+
+    /// Send an *unsolicited* JSON-RPC notification to every client currently
+    /// listening on the standalone GET SSE stream. This is the public entry point
+    /// for server-initiated traffic outside an in-flight request — e.g. a
+    /// `notifications/resources/updated` for a subscribed resource, or a
+    /// `notifications/tools/list_changed`. Returns the number of listeners the
+    /// notification was delivered to; `0` when no GET stream is open (or the
+    /// server is not on a Streamable HTTP transport).
+    size_t notify(string method, Json params = Json.undefined) @safe
+    {
+        if (pushChannel is null)
+            return 0;
+        return pushChannel.notify(method, params);
     }
 
     /// Capabilities this server advertises, derived from what is registered.
@@ -1407,4 +1445,30 @@ version (unittest)
         p["arguments"] = Json.emptyObject;
         return p;
     }
+}
+
+unittest  // notify is a no-op (returns 0) before a push channel exists
+{
+    auto s = new MCPServer("t", "1");
+    assert(s.serverPushChannel() is null);
+    assert(s.notify("notifications/message") == 0);
+}
+
+unittest  // notify delivers unsolicited notifications to GET-stream listeners
+{
+    auto s = new MCPServer("t", "1");
+    auto coord = new StreamCoordinator;
+    auto ch = s.serverPushChannel(coord);
+    assert(s.serverPushChannel() is ch); // same instance returned thereafter
+
+    string[] received;
+    ch.addListener((string f) @safe { received ~= f; });
+    const n = s.notify("notifications/resources/updated", Json([
+        "uri": Json("test://x")
+    ]));
+    assert(n == 1);
+    assert(received.length == 1);
+    import std.algorithm : canFind;
+
+    assert(received[0].canFind("notifications/resources/updated"));
 }

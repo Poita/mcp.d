@@ -97,6 +97,165 @@ final class StreamCoordinator
     }
 }
 
+/// A long-lived server->client SSE channel for *unsolicited* traffic — the
+/// stream a client opens with an HTTP GET to the MCP endpoint (basic/transports
+/// §Listening for Messages from the Server). Unlike `HttpStreamContext`, which
+/// is bound to one in-flight POST, this channel fans a single notification (or
+/// server->client request) out to every currently-connected GET listener.
+///
+/// A handler is registered per accepted GET; `emit` frames the JSON-RPC message
+/// as an SSE event with a globally-unique id (via the shared `StreamCoordinator`
+/// ordinal scheme) and writes it to every live listener. Listeners that fail to
+/// write (a disconnected client) are dropped so the channel self-heals.
+///
+/// One instance is shared across a server mount. Thread-safety is the caller's
+/// responsibility on multi-threaded vibe.d setups; the default single-fiber
+/// dispatch needs none.
+final class ServerPushChannel
+{
+    /// A connected GET listener: an opaque id plus the writer that delivers a
+    /// pre-framed SSE block to it.
+    private struct Listener
+    {
+        long id;
+        void delegate(string frame) @safe write;
+    }
+
+    private StreamCoordinator coord;
+    private Listener[] listeners;
+    private long[long] streamOf; /// listener id -> its allocated stream ordinal
+    private long[long] seqOf; /// listener id -> its monotonic event sequence
+    private long nextListenerId = 1;
+
+    this(StreamCoordinator coord) @safe
+    {
+        this.coord = coord;
+    }
+
+    /// Register a connected GET listener and return its id. Each listener gets a
+    /// distinct stream ordinal so its event ids stay globally unique within the
+    /// mount/session.
+    long addListener(void delegate(string frame) @safe write) @safe
+    {
+        const id = nextListenerId++;
+        listeners ~= Listener(id, write);
+        streamOf[id] = coord.allocStream();
+        seqOf[id] = 0;
+        return id;
+    }
+
+    /// Drop a listener (e.g. when its GET stream is closed).
+    void removeListener(long id) @safe
+    {
+        import std.algorithm : remove;
+
+        listeners = listeners.remove!(l => l.id == id);
+        streamOf.remove(id);
+        seqOf.remove(id);
+    }
+
+    /// Number of currently-connected listeners.
+    size_t listenerCount() const @safe
+    {
+        return listeners.length;
+    }
+
+    /// Frame `msg` as an SSE event (with a per-listener globally-unique id) and
+    /// write it to every connected listener. A listener whose write throws (a
+    /// disconnected client) is removed. Returns the number of listeners the
+    /// message was delivered to.
+    size_t emit(Json msg) @safe
+    {
+        long[] dead;
+        size_t delivered;
+        foreach (ref l; listeners)
+        {
+            import std.conv : to;
+
+            const eid = streamOf[l.id].to!string ~ "-" ~ seqOf[l.id].to!string;
+            const frame = formatSseEvent(eid, msg);
+            try
+            {
+                l.write(frame);
+                seqOf[l.id]++;
+                delivered++;
+            }
+            catch (Exception)
+            {
+                dead ~= l.id;
+            }
+        }
+        foreach (id; dead)
+            removeListener(id);
+        return delivered;
+    }
+
+    /// Convenience: broadcast a JSON-RPC notification to every listener.
+    size_t notify(string method, Json params = Json.undefined) @safe
+    {
+        return emit(makeNotification(method, params));
+    }
+}
+
+unittest  // a listener receives framed events, with monotonic per-listener ids
+{
+    auto coord = new StreamCoordinator;
+    auto ch = new ServerPushChannel(coord);
+    string[] received;
+    const id = ch.addListener((string f) @safe { received ~= f; });
+    assert(ch.listenerCount == 1);
+
+    const n = ch.notify("notifications/resources/updated", Json([
+        "uri": Json("test://x")
+    ]));
+    assert(n == 1);
+    assert(received.length == 1);
+    import std.string : startsWith;
+    import std.algorithm : canFind;
+
+    assert(received[0].startsWith("id: "));
+    assert(received[0].canFind("notifications/resources/updated"));
+
+    ch.notify("notifications/message");
+    assert(received.length == 2);
+    // event ids advance monotonically for the same listener.
+    assert(received[0] != received[1]);
+    ch.removeListener(id);
+    assert(ch.listenerCount == 0);
+}
+
+unittest  // emit fans out to every listener and self-heals broken ones
+{
+    auto coord = new StreamCoordinator;
+    auto ch = new ServerPushChannel(coord);
+    int aCount;
+    ch.addListener((string) @safe { aCount++; });
+    // A listener that always throws simulates a disconnected client.
+    ch.addListener((string) @safe { throw new Exception("closed"); });
+    assert(ch.listenerCount == 2);
+
+    const delivered = ch.notify("notifications/message");
+    assert(delivered == 1); // only the healthy listener received it
+    assert(aCount == 1);
+    assert(ch.listenerCount == 1); // the broken listener was dropped
+}
+
+unittest  // distinct listeners get distinct stream ordinals, so ids stay unique
+{
+    auto coord = new StreamCoordinator;
+    auto ch = new ServerPushChannel(coord);
+    string aFrame, bFrame;
+    ch.addListener((string f) @safe { aFrame = f; });
+    ch.addListener((string f) @safe { bFrame = f; });
+    ch.notify("notifications/message");
+    assert(aFrame.length && bFrame.length);
+    // The first line ("id: <stream>-<seq>") differs because the stream ordinal
+    // differs between the two listeners.
+    import std.string : splitLines;
+
+    assert(aFrame.splitLines()[0] != bFrame.splitLines()[0]);
+}
+
 /// A `RequestContext` backed by an HTTP response that is (lazily) upgraded to a
 /// Server-Sent Events stream the first time the handler emits server->client
 /// traffic. Progress/logging become SSE notification events; sampling/
