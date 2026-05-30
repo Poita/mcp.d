@@ -259,16 +259,45 @@ final class OAuthClient
     /// `code` query parameter from the `Location` response header.
     string authorizeAndGetCode(string authzUrl) @safe
     {
-        string code;
+        string code, iss;
         () @trusted {
             requestHTTP(authzUrl, (scope HTTPClientRequest req) {
                 req.method = HTTPMethod.GET;
             }, (scope HTTPClientResponse res) {
                 const loc = res.headers.get("Location", "");
                 code = extractQueryParam(loc, "code");
+                iss = extractQueryParam(loc, "iss");
                 res.dropBody();
             });
         }();
+        return code;
+    }
+
+    /// GET an authorization URL (without following redirects), extract the
+    /// `code` from the redirect `Location` header, and validate the RFC 9207
+    /// `iss` authorization-response parameter against the selected authorization
+    /// server's recorded issuer (mix-up attack protection required by the MCP
+    /// 2025-11-25 / draft authorization spec). Throws when `iss` is missing while
+    /// `authorization_response_iss_parameter_supported` is true, or when it does
+    /// not match the recorded issuer (simple string comparison, no
+    /// normalization). The authorization code is NOT returned on rejection.
+    string authorizeAndGetCode(AuthorizationServerMetadata as_, string authzUrl) @safe
+    {
+        string code, iss;
+        () @trusted {
+            requestHTTP(authzUrl, (scope HTTPClientRequest req) {
+                req.method = HTTPMethod.GET;
+            }, (scope HTTPClientResponse res) {
+                const loc = res.headers.get("Location", "");
+                code = extractQueryParam(loc, "code");
+                iss = extractQueryParam(loc, "iss");
+                res.dropBody();
+            });
+        }();
+        if (!validateAuthorizationResponseIss(iss, as_.issuer,
+                as_.authorizationResponseIssParameterSupported))
+            throw invalidRequest(
+                    "Authorization response failed RFC 9207 'iss' validation (possible mix-up attack)");
         return code;
     }
 
