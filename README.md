@@ -19,7 +19,7 @@ Active development.
   tools with every content type, resources + templates + subscribe, prompts, completion,
   logging, progress/logging streaming, sampling, elicitation (incl. SEP-1034/1330),
   DNS-rebinding protection.
-- ✅ Client conformance: **276/287 checks** including the full **OAuth 2.1** suite — token-endpoint auth (none/basic/post), metadata discovery (all variants + 2025-03-26 backcompat + endpoint fallback), scope selection + step-up + retry-limit, offline-access, Dynamic Client Registration, pre-registration, and resource-mismatch. (Remaining: JWT client-assertion / token-exchange flows, SSE retry, and a long-lived GET-stream elicitation timing case.)
+- ✅ Client conformance: **280/287 checks** including the **complete OAuth 2.1** suite — token-endpoint auth (none/basic/post + **`private_key_jwt`** ES256), metadata discovery (all variants + 2025-03-26 backcompat + endpoint fallback), scope selection + step-up + retry-limit, offline-access, Dynamic Client Registration, pre-registration, resource-mismatch, and **cross-app access** (token-exchange → JWT-bearer). The only remaining 7 checks (2 scenarios: `elicitation-sep1034-client-defaults`, `sse-retry`) are blocked by a vibe.d HTTP-client interaction with the harness's long-lived GET listening stream — the SDK's SSE streaming otherwise works (all 38 server scenarios incl. sampling/elicitation/progress, and draft client↔server).
 - ✅ **FastMCP-style UDA API** — `@tool` / `@resource` / `@prompt` with auto JSON-Schema.
 - ✅ **DRAFT (2026-07-28)** — stateless per-request `_meta`, `server/discover`,
   `subscriptions/listen`, `CacheableResult` (`ttlMs`/`cacheScope`), MRTR types, the standard
