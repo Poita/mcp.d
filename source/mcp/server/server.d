@@ -125,6 +125,7 @@ final class MCPServer
     private ServerPushChannel pushChannel;
     private bool toolListChangedEnabled;
     private bool resourcesListChangedEnabled;
+    private bool promptsListChangedEnabled;
     private bool validateOutputSchema_;
 
     this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
@@ -230,6 +231,20 @@ final class MCPServer
         return notify("notifications/resources/list_changed");
     }
 
+    /// Broadcast a `notifications/prompts/list_changed` to every client listening
+    /// on the standalone GET SSE stream, informing them the set of available
+    /// prompts changed (per the server/prompts List Changed Notification).
+    /// Returns the number of listeners reached; `0` when no GET stream is open.
+    /// Call after a runtime `registerPrompt` (or a removal). For the draft
+    /// protocol, the notification is suppressed unless a client opted in via
+    /// `subscriptions/listen` with `promptsListChanged:true`.
+    size_t notifyPromptsListChanged() @safe
+    {
+        if (effectiveVersion.isDraft && !listensFor("promptsListChanged"))
+            return 0;
+        return notify("notifications/prompts/list_changed");
+    }
+
     /// Notify subscribers that a watched resource changed by emitting a
     /// `notifications/resources/updated` on the standalone GET SSE stream (per
     /// server/resources Subscriptions: "Server delivers
@@ -319,6 +334,16 @@ final class MCPServer
     void enableResourcesListChanged() @safe
     {
         resourcesListChangedEnabled = true;
+    }
+
+    /// Advertise the prompts `listChanged` capability so `capabilities()` emits
+    /// `prompts: { listChanged: true }`. Declare this (before `initialize` /
+    /// `server/discover`) when the server may add or remove prompts at runtime
+    /// and will emit `notifications/prompts/list_changed` via
+    /// `notifyPromptsListChanged`.
+    void enablePromptListChanged() @safe
+    {
+        promptsListChangedEnabled = true;
     }
 
     /// Advertise the 2025-11-25 `tasks` capability (support for task-augmented
@@ -420,7 +445,7 @@ final class MCPServer
             caps.resources = ResourcesCapability(resourceSubscriptionsEnabled,
                     resourcesListChangedEnabled);
         if (prompts.length > 0)
-            caps.prompts = ListChangedCapability(false);
+            caps.prompts = ListChangedCapability(promptsListChangedEnabled);
         if (completionHandler !is null)
             caps.completions = true;
         if (loggingEnabled)
@@ -1925,4 +1950,65 @@ unittest  // notifyResourcesListChanged is a no-op before a push channel exists
 {
     auto s = new MCPServer("t", "1");
     assert(s.notifyResourcesListChanged() == 0);
+}
+
+unittest  // prompts listChanged is not advertised by default
+{
+    auto s = new MCPServer("t", "1");
+    Prompt pr = {name: "greet"};
+    s.registerPrompt(pr, (Json) @safe { return GetPromptResult(); });
+    auto caps = s.capabilities();
+    assert(!caps.prompts.isNull);
+    assert(!caps.prompts.get.listChanged);
+}
+
+unittest  // enablePromptListChanged advertises listChanged:true for prompts
+{
+    auto s = new MCPServer("t", "1");
+    Prompt pr = {name: "greet"};
+    s.registerPrompt(pr, (Json) @safe { return GetPromptResult(); });
+    s.enablePromptListChanged();
+    auto caps = s.capabilities();
+    assert(!caps.prompts.isNull);
+    assert(caps.prompts.get.listChanged);
+    assert(caps.toJson()["prompts"]["listChanged"].get!bool);
+}
+
+unittest  // notifyPromptsListChanged broadcasts notifications/prompts/list_changed
+{
+    auto s = new MCPServer("t", "1");
+    auto coord = new StreamCoordinator;
+    auto ch = s.serverPushChannel(coord);
+    string[] received;
+    ch.addListener((string f) @safe { received ~= f; });
+    const n = s.notifyPromptsListChanged();
+    assert(n == 1);
+    import std.algorithm : canFind;
+
+    assert(received.length == 1);
+    assert(received[0].canFind("notifications/prompts/list_changed"));
+}
+
+unittest  // notifyPromptsListChanged is a no-op before a push channel exists
+{
+    auto s = new MCPServer("t", "1");
+    assert(s.notifyPromptsListChanged() == 0);
+}
+
+unittest  // draft: notifyPromptsListChanged suppressed unless client opted in
+{
+    auto s = new MCPServer("t", "1");
+    s.effectiveVersion = ProtocolVersion.draft;
+    auto coord = new StreamCoordinator;
+    auto ch = s.serverPushChannel(coord);
+    string[] received;
+    ch.addListener((string f) @safe { received ~= f; });
+    // No subscriptions/listen opt-in: suppressed.
+    assert(s.notifyPromptsListChanged() == 0);
+    assert(received.length == 0);
+    // After opting in via subscriptions/listen, it is delivered.
+    Json p = Json.emptyObject;
+    p["promptsListChanged"] = true;
+    s.handle(req(1, "subscriptions/listen", p));
+    assert(s.notifyPromptsListChanged() == 1);
 }
