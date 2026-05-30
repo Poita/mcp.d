@@ -5,6 +5,7 @@ import vibe.data.json : Json;
 
 import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
+import mcp.protocol.types : ListRootsResult;
 import mcp.auth.resource_server : TokenInfo;
 
 @safe:
@@ -105,6 +106,17 @@ interface RequestContext
         params["message"] = message;
         params["requestedSchema"] = requestedSchema;
         return sendRequest("elicitation/create", params);
+    }
+
+    /// List the client's filesystem roots (`roots/list`). Per client/roots
+    /// §Implementation Guidelines, checks the client's `roots` capability before
+    /// usage and throws `McpException` if the client does not support it; parses
+    /// the client's reply into a typed `ListRootsResult`.
+    final ListRootsResult listRoots() @safe
+    {
+        if (!clientSupports("roots"))
+            throw invalidRequest("Client does not support roots");
+        return ListRootsResult.fromJson(sendRequest("roots/list", Json.emptyObject));
     }
 }
 
@@ -252,6 +264,77 @@ version (unittest) private final class SamplingProbe : RequestContext
     {
         return TokenInfo.invalid();
     }
+}
+
+version (unittest) private final class RootsProbe : RequestContext
+{
+    string lastMethod;
+    Json lastParams;
+    bool supportsRoots = true;
+
+    void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
+    {
+    }
+
+    void log(string, Json, string = null) @safe
+    {
+    }
+
+    Json sendRequest(string method, Json params) @safe
+    {
+        lastMethod = method;
+        lastParams = params;
+        Json r = Json.emptyObject;
+        Json arr = Json.emptyArray;
+        Json root = Json.emptyObject;
+        root["uri"] = "file:///home/user/project";
+        root["name"] = "My Project";
+        arr ~= root;
+        r["roots"] = arr;
+        return r;
+    }
+
+    bool clientSupports(string capability) @safe
+    {
+        return capability == "roots" && supportsRoots;
+    }
+
+    bool isStateless() @safe
+    {
+        return false;
+    }
+
+    Json[string] inputResponses() @safe
+    {
+        Json[string] empty;
+        return empty;
+    }
+
+    TokenInfo auth() @safe
+    {
+        return TokenInfo.invalid();
+    }
+}
+
+unittest  // listRoots() sends roots/list and parses the typed result
+{
+    auto probe = new RootsProbe;
+    auto result = probe.listRoots();
+
+    assert(probe.lastMethod == "roots/list");
+    assert(result.roots.length == 1);
+    assert(result.roots[0].uri == "file:///home/user/project");
+    assert(result.roots[0].name.get == "My Project");
+}
+
+unittest  // listRoots() throws when client does not support roots
+{
+    import std.exception : assertThrown;
+    import mcp.protocol.errors : McpException;
+
+    auto probe = new RootsProbe;
+    probe.supportsRoots = false;
+    assertThrown!McpException(probe.listRoots());
 }
 
 unittest  // typed sample() builds params and parses the typed result
