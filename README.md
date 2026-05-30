@@ -13,22 +13,27 @@ the D programming language — client and server, built on [vibe-d](https://vibe
 
 ## Status
 
-Active development.
+**All official conformance tests pass** (0 failures): **server 38/38**, **client 287/287**
+(one advisory `SHOULD` warning on the optional Client-ID-Metadata-Document flow).
 
-- ✅ **All 30 official server conformance scenarios pass** (38/38 checks): lifecycle,
-  tools with every content type, resources + templates + subscribe, prompts, completion,
-  logging, progress/logging streaming, sampling, elicitation (incl. SEP-1034/1330),
-  DNS-rebinding protection.
-- ✅ Client conformance: **280/287 checks** including the **complete OAuth 2.1** suite — token-endpoint auth (none/basic/post + **`private_key_jwt`** ES256), metadata discovery (all variants + 2025-03-26 backcompat + endpoint fallback), scope selection + step-up + retry-limit, offline-access, Dynamic Client Registration, pre-registration, resource-mismatch, and **cross-app access** (token-exchange → JWT-bearer). The only remaining 7 checks (2 scenarios: `elicitation-sep1034-client-defaults`, `sse-retry`) are blocked by a vibe.d HTTP-client interaction with the harness's long-lived GET listening stream — the SDK's SSE streaming otherwise works (all 38 server scenarios incl. sampling/elicitation/progress, and draft client↔server).
+- ✅ **All 30 server scenarios**: lifecycle, tools with every content type, resources +
+  templates + subscribe, prompts, completion, logging, progress/logging streaming, sampling,
+  elicitation (incl. SEP-1034/1330), DNS-rebinding protection.
+- ✅ **All client scenarios**, including the **complete OAuth 2.1** suite — token-endpoint
+  auth (none/basic/post + **`private_key_jwt`** ES256), metadata discovery (all variants +
+  2025-03-26 backcompat + endpoint fallback), scope selection/step-up/retry-limit,
+  offline-access, DCR, pre-registration, resource-mismatch, **cross-app access**
+  (token-exchange → JWT-bearer); **elicitation** with schema defaults; and **SSE
+  resumption** (`retry:` + `Last-Event-ID`).
 - ✅ **FastMCP-style UDA API** — `@tool` / `@resource` / `@prompt` with auto JSON-Schema.
 - ✅ **DRAFT (2026-07-28)** — stateless per-request `_meta`, `server/discover`,
   `subscriptions/listen`, `CacheableResult` (`ttlMs`/`cacheScope`), MRTR types, the standard
   request headers (`Mcp-Method`/`Mcp-Name`/`MCP-Protocol-Version`) with `HeaderMismatch`
   validation, and `x-mcp-header` mirroring — on both client and server.
 
-Remaining edge cases: JWT client-assertion (`private_key_jwt`) + cross-app token-exchange
-auth flows, SSE `retry`/`Last-Event-ID` resumption, a long-lived GET-stream elicitation
-timing case, and MRTR end-to-end retry.
+Optional follow-ups (not required for conformance): Client-ID-Metadata-Document client_id
+(currently uses DCR, a passing SHOULD warning), MRTR end-to-end client retry helper, and a
+built-in loopback redirect listener for the interactive auth-code flow.
 
 ## Build & test
 
