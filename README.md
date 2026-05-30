@@ -134,27 +134,17 @@ npx @modelcontextprotocol/conformance server --url http://127.0.0.1:3000/mcp
 
 ```
 source/mcp/
-  protocol/   versions  errors  jsonrpc  capabilities  types
-  transport/  streamable_http   (stdio + SSE streaming: planned)
-  server/     server            (transport-agnostic dispatch core)
+  protocol/   versions  jsonrpc  errors  capabilities  types  draft
+  transport/  stdio  streamable_http  sse_context   (both transports + SSE streaming)
+  server/     server  context        (transport-agnostic dispatch + per-request Context)
+  client/     client                 (MCPClient, auto-pagination, SSE + resumption)
+  api/        attributes  schema  reflection   (@tool/@resource/@prompt UDA layer)
+  auth/       oauth  client  jwt      (OAuth 2.1: PKCE, DCR, JWT assertions, token exchange)
 ```
 
 `MCPServer` is a transport-agnostic JSON-RPC dispatch core (`handle` / `handleRaw`);
-transports are thin drivers over it. All wire types serialize through presence-aware
-`toJson`/`fromJson` so optional fields are omitted, not nulled.
-
-## Roadmap
-
-The remaining conformance scenarios require the **server→client streaming channel** over
-SSE, plus follow-on features:
-
-- [ ] Streamable HTTP SSE upgrade + per-request `Context` (progress / logging notifications)
-- [ ] Server→client requests: **sampling**, **elicitation**
-- [ ] Resource **subscribe / unsubscribe** + `resources/updated` notifications
-- [ ] SSE resumability (`Last-Event-ID` + event store), session management
-- [ ] stdio transport + `MCPClient` (with auto-pagination)
-- [ ] FastMCP-style UDA layer (`@tool`/`@resource`/`@prompt` + auto JSON-Schema)
-- [ ] OAuth 2.1 (server token validation + client flows)
+transports (stdio + Streamable HTTP) are thin drivers over it. All wire types serialize
+through presence-aware `toJson`/`fromJson` so optional fields are omitted, not nulled.
 
 See `docs/superpowers/specs` and `docs/superpowers/plans` for the design and staged plans.
 
