@@ -128,6 +128,40 @@ Json makeRequest(Json id, string method, Json params = Json.undefined) @safe
     return j;
 }
 
+/// Render a JSON-RPC request id (a string or a number per the spec) to a stable
+/// string form. Used where an id must be carried as a string value — e.g. the
+/// draft `subscriptions/listen` id stamped into outbound notifications'
+/// `_meta["io.modelcontextprotocol/subscriptionId"]`. A string id is returned
+/// verbatim; a numeric id is rendered as its decimal text; anything else (null /
+/// absent) yields an empty string.
+string rpcIdString(Json id) @safe
+{
+    import std.conv : to;
+
+    switch (id.type)
+    {
+    case Json.Type.string:
+        return id.get!string;
+    case Json.Type.int_:
+        return id.get!long
+            .to!string;
+    case Json.Type.bigInt:
+        return id.toString();
+    case Json.Type.float_:
+        return id.get!double
+            .to!string;
+    default:
+        return "";
+    }
+}
+
+unittest  // rpcIdString renders string and numeric ids, empties null
+{
+    assert(rpcIdString(Json("abc")) == "abc");
+    assert(rpcIdString(Json(42)) == "42");
+    assert(rpcIdString(Json(null)) == "");
+}
+
 /// Build a notification object (no id).
 Json makeNotification(string method, Json params = Json.undefined) @safe
 {

@@ -329,18 +329,25 @@ private void handleListenStream(MCPServer server, StreamCoordinator coord,
     res.headers["Cache-Control"] = "no-cache";
 
     auto push = server.serverPushChannel(coord);
+    // The listen request's id becomes the stream's subscriptionId: every
+    // notification delivered to this listener (including the leading
+    // acknowledgement) is stamped with it in
+    // `params._meta["io.modelcontextprotocol/subscriptionId"]` (draft
+    // basic/utilities/subscriptions).
     const listenerId = push.addListener((string frame) @safe {
         () @trusted {
             res.bodyWriter.write(cast(const(ubyte)[]) frame);
             res.bodyWriter.flush();
         }();
-    });
+    }, rpcIdString(msg.id));
     // Drop the listener when the stream ends so the channel self-heals.
     scope (exit)
         push.removeListener(listenerId);
 
     // First event: acknowledge with the agreed-upon subset, delivered only to
-    // this stream (not broadcast to any other open listen stream).
+    // this stream (not broadcast to any other open listen stream). It is stamped
+    // with the subscriptionId by the push channel, so it carries the listen id in
+    // `_meta` like every subsequent notification on the stream.
     push.emitTo(listenerId,
             subscriptionsAcknowledgedNotification(server.acknowledgedListenSubset()));
 
@@ -1033,6 +1040,7 @@ unittest  // ordinary application errors (e.g. invalidParams) ride on HTTP 200
 unittest  // draft subscriptions/listen: ack first, then opted-in change notifications flow
 {
     import mcp.transport.sse_context : StreamCoordinator, ServerPushChannel;
+    import mcp.protocol.draft : MetaKey;
     import std.algorithm : canFind;
 
     auto server = new MCPServer("t", "1");
@@ -1046,20 +1054,27 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
     assert(server.listensFor("toolsListChanged"));
     assert(!server.listensFor("resourcesListChanged"));
 
-    // The listen stream registers as a push-channel listener and receives the ack.
+    // The listen stream registers as a push-channel listener (carrying the listen
+    // request's id as the stream's subscriptionId) and receives the ack.
     auto coord = new StreamCoordinator;
     auto push = server.serverPushChannel(coord);
     string[] frames;
-    const lid = push.addListener((string f) @safe { frames ~= f; });
+    const lid = push.addListener((string f) @safe { frames ~= f; }, rpcIdString(m.id));
     push.emitTo(lid, subscriptionsAcknowledgedNotification(server.acknowledgedListenSubset()));
     assert(frames.length == 1);
     assert(frames[0].canFind("notifications/subscriptions/acknowledged"));
     assert(frames[0].canFind("toolsListChanged"));
+    // The ack is the FIRST message and carries the subscriptionId (the listen id).
+    assert(frames[0].canFind(cast(string) MetaKey.subscriptionId));
+    assert(frames[0].canFind(rpcIdString(m.id)));
 
-    // An opted-in change notification is delivered onto the open stream.
+    // An opted-in change notification is delivered onto the open stream, also
+    // stamped with the subscriptionId.
     assert(server.notifyToolsListChanged() == 1);
     assert(frames.length == 2);
     assert(frames[1].canFind("notifications/tools/list_changed"));
+    assert(frames[1].canFind(cast(string) MetaKey.subscriptionId));
+    assert(frames[1].canFind(rpcIdString(m.id)));
 
     // A change type the client did NOT opt into is suppressed (no new frame).
     server.enableResourcesListChanged();

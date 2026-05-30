@@ -10,6 +10,7 @@ import vibe.http.server : HTTPServerResponse;
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.capabilities;
+import mcp.protocol.draft : withSubscriptionId;
 import mcp.server.context;
 import mcp.auth.resource_server : TokenInfo;
 
@@ -115,11 +116,17 @@ final class StreamCoordinator
 final class ServerPushChannel
 {
     /// A connected GET listener: an opaque id plus the writer that delivers a
-    /// pre-framed SSE block to it.
+    /// pre-framed SSE block to it. `subscriptionId`, when non-empty, is the
+    /// JSON-RPC id of the `subscriptions/listen` request that opened this stream;
+    /// every notification delivered to the listener is stamped with it in
+    /// `params._meta["io.modelcontextprotocol/subscriptionId"]` so the client can
+    /// correlate notifications with the listen request (draft basic/utilities/
+    /// subscriptions).
     private struct Listener
     {
         long id;
         void delegate(string frame) @safe write;
+        string subscriptionId;
     }
 
     private StreamCoordinator coord;
@@ -135,11 +142,13 @@ final class ServerPushChannel
 
     /// Register a connected GET listener and return its id. Each listener gets a
     /// distinct stream ordinal so its event ids stay globally unique within the
-    /// mount/session.
-    long addListener(void delegate(string frame) @safe write) @safe
+    /// mount/session. When `subscriptionId` is non-empty (a `subscriptions/listen`
+    /// stream), every notification delivered to this listener is stamped with it
+    /// in `params._meta["io.modelcontextprotocol/subscriptionId"]`.
+    long addListener(void delegate(string frame) @safe write, string subscriptionId = "") @safe
     {
         const id = nextListenerId++;
-        listeners ~= Listener(id, write);
+        listeners ~= Listener(id, write, subscriptionId);
         streamOf[id] = coord.allocStream();
         seqOf[id] = 0;
         return id;
@@ -174,7 +183,7 @@ final class ServerPushChannel
             import std.conv : to;
 
             const eid = streamOf[l.id].to!string ~ "-" ~ seqOf[l.id].to!string;
-            const frame = formatSseEvent(eid, msg);
+            const frame = formatSseEvent(eid, withSubscriptionId(msg, l.subscriptionId));
             try
             {
                 l.write(frame);
@@ -212,7 +221,7 @@ final class ServerPushChannel
             if (l.id != listenerId)
                 continue;
             const eid = streamOf[l.id].to!string ~ "-" ~ seqOf[l.id].to!string;
-            const frame = formatSseEvent(eid, msg);
+            const frame = formatSseEvent(eid, withSubscriptionId(msg, l.subscriptionId));
             try
             {
                 l.write(frame);
@@ -289,6 +298,44 @@ unittest  // emitTo delivers only to the named listener, not the others
 
     // An unknown listener id is a no-op returning false.
     assert(!ch.emitTo(9999, makeNotification("notifications/message")));
+}
+
+unittest  // a subscriptions/listen listener stamps subscriptionId on broadcast notifications
+{
+    import std.algorithm : canFind;
+    import mcp.protocol.draft : MetaKey;
+
+    auto coord = new StreamCoordinator;
+    auto ch = new ServerPushChannel(coord);
+    string listenFrame, plainFrame;
+    // A listen stream (subscriptionId set) and a plain GET stream (none).
+    ch.addListener((string f) @safe { listenFrame = f; }, "listen-9");
+    ch.addListener((string f) @safe { plainFrame = f; });
+
+    ch.notify("notifications/tools/list_changed");
+
+    // The listen stream's notification carries the subscriptionId in _meta;
+    // the plain GET stream's does not.
+    assert(listenFrame.canFind(cast(string) MetaKey.subscriptionId));
+    assert(listenFrame.canFind("listen-9"));
+    assert(!plainFrame.canFind(cast(string) MetaKey.subscriptionId));
+}
+
+unittest  // emitTo to a listen stream stamps subscriptionId (e.g. the leading ack)
+{
+    import std.algorithm : canFind;
+    import mcp.protocol.draft : MetaKey;
+
+    auto coord = new StreamCoordinator;
+    auto ch = new ServerPushChannel(coord);
+    string frame;
+    const id = ch.addListener((string f) @safe { frame = f; }, "ack-id-1");
+
+    assert(ch.emitTo(id, makeNotification("notifications/subscriptions/acknowledged",
+            Json(["toolsListChanged": Json(true)]))));
+    assert(frame.canFind("notifications/subscriptions/acknowledged"));
+    assert(frame.canFind(cast(string) MetaKey.subscriptionId));
+    assert(frame.canFind("ack-id-1"));
 }
 
 unittest  // distinct listeners get distinct stream ordinals, so ids stay unique

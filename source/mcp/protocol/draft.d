@@ -160,6 +160,72 @@ bool isUserMetaKeyAllowed(string key) @safe pure nothrow
     return isValidMetaKey(key) && !isReservedMetaPrefix(key);
 }
 
+/// Stamp the draft `io.modelcontextprotocol/subscriptionId` (`MetaKey.subscriptionId`)
+/// into `params._meta` of a JSON-RPC notification and return it, leaving the
+/// original untouched. Per draft basic/utilities/subscriptions every notification
+/// delivered on a `subscriptions/listen` stream MUST carry the listen request's id
+/// as `subscriptionId` in `_meta`, so clients can correlate the notification with
+/// the listen request that established the stream — this is the producer for that
+/// key. `subscriptionId` is the (string-rendered) JSON-RPC id of the originating
+/// `subscriptions/listen` request. An empty `subscriptionId` is a no-op (the
+/// notification is returned unchanged). Notifications carry their payload under
+/// `params`, so the key is nested as `params._meta.<subscriptionId>`.
+Json withSubscriptionId(Json notification, string subscriptionId) @safe
+{
+    if (subscriptionId.length == 0)
+        return notification;
+
+    Json n = notification.clone();
+    Json params = ("params" in n && n["params"].type == Json.Type.object) ? n["params"]
+        : Json.emptyObject;
+    Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"]
+        : Json.emptyObject;
+    meta[MetaKey.subscriptionId] = subscriptionId;
+    params["_meta"] = meta;
+    n["params"] = params;
+    return n;
+}
+
+unittest  // withSubscriptionId stamps the listen request id into params._meta
+{
+    auto n = Json([
+        "jsonrpc": Json("2.0"),
+        "method": Json("notifications/tools/list_changed")
+    ]);
+    auto stamped = withSubscriptionId(n, "listen-7");
+    assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "listen-7");
+    // The original is left untouched.
+    assert("params" !in n);
+}
+
+unittest  // withSubscriptionId preserves an existing params payload and _meta entries
+{
+    Json params = Json.emptyObject;
+    params["uri"] = "file:///x";
+    Json meta = Json.emptyObject;
+    meta["other.vendor/flag"] = true;
+    params["_meta"] = meta;
+    auto n = Json([
+        "jsonrpc": Json("2.0"),
+        "method": Json("notifications/resources/updated"),
+        "params": params
+    ]);
+    auto stamped = withSubscriptionId(n, "id-42");
+    assert(stamped["params"]["uri"].get!string == "file:///x");
+    assert(stamped["params"]["_meta"]["other.vendor/flag"].get!bool);
+    assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "id-42");
+}
+
+unittest  // withSubscriptionId with an empty id is a no-op
+{
+    auto n = Json([
+        "jsonrpc": Json("2.0"),
+        "method": Json("notifications/message")
+    ]);
+    auto same = withSubscriptionId(n, "");
+    assert("params" !in same);
+}
+
 /// Standard Streamable HTTP request headers introduced by the draft.
 enum HttpHeader : string
 {
