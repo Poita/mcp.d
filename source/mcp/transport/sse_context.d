@@ -301,6 +301,15 @@ final class HttpStreamContext : RequestContext
         return streaming_;
     }
 
+    /// Cancellation for this request is tracked by the server's `RequestScope`
+    /// (which holds the shared token flipped by `notifications/cancelled`), so the
+    /// transport context itself reports never-cancelled. The wrapping
+    /// `RequestScope.isCancelled` consults its token before delegating here.
+    bool isCancelled() @safe
+    {
+        return false;
+    }
+
     private void beginStream() @safe
     {
         if (streaming_)

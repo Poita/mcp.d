@@ -74,6 +74,15 @@ final class MCPClient
     // rule "Clients MUST ignore notifications referencing unknown or
     // already-completed IDs."
     private bool[string] elicitationIds_;
+    // Request ids this client has cancelled via notifications/cancelled. Per
+    // basic/utilities/cancellation, "The sender of the cancellation notification
+    // SHOULD ignore any response to the request that arrives afterward", so a
+    // late response correlated to one of these ids is dropped rather than
+    // returned. Keyed by the JSON-RPC id under which the request was POSTed.
+    private bool[long] cancelledRequests_;
+    // The JSON-RPC id used for the `initialize` request, so cancel() can enforce
+    // the spec rule that clients MUST NOT cancel initialize. 0 until sent.
+    private long initializeRequestId;
 
     /// Capabilities this client advertises at initialize.
     ClientCapabilities capabilities;
@@ -141,6 +150,9 @@ final class MCPClient
         params.capabilities = capabilities;
         params.clientInfo = clientInfo;
 
+        // Record the id the initialize request will use so cancel() can refuse
+        // to cancel it (clients MUST NOT cancel initialize).
+        initializeRequestId = nextId;
         auto result = rpc("initialize", params.toJson());
         auto init = InitializeResult.fromJson(result);
         // Per the Lifecycle / Version Negotiation rules: if the client does not
@@ -474,6 +486,38 @@ final class MCPClient
     void sendNotification(string method, Json params = Json.emptyObject) @safe
     {
         notify(method, params);
+    }
+
+    /// The JSON-RPC id assigned to the most recently issued request. Useful to
+    /// learn the id of an in-flight request so it can be `cancel`led from another
+    /// task (the blocking `rpc` does not otherwise surface it). Returns `0`
+    /// before any request has been sent.
+    long lastRequestId() const @safe nothrow @nogc
+    {
+        return nextId - 1;
+    }
+
+    /// Cancel an in-flight request by sending `notifications/cancelled` for
+    /// `requestId` (basic/utilities/cancellation: "Either side can send a
+    /// cancellation notification ... to indicate that a previously-issued request
+    /// should be terminated"). After this call, any response the server still
+    /// sends for `requestId` is ignored, per "The sender of the cancellation
+    /// notification SHOULD ignore any response to the request that arrives
+    /// afterward". `reason` is an optional free-form explanation included in the
+    /// notification when non-empty.
+    ///
+    /// Per spec, the `initialize` request MUST NOT be cancelled by clients;
+    /// attempting to cancel the id of the `initialize` request throws.
+    void cancel(long requestId, string reason = null) @safe
+    {
+        if (requestId == initializeRequestId && initializeRequestId != 0)
+            throw invalidRequest("The initialize request MUST NOT be cancelled by clients");
+        cancelledRequests_[requestId] = true;
+        Json params = Json.emptyObject;
+        params["requestId"] = requestId;
+        if (reason.length)
+            params["reason"] = reason;
+        notify("notifications/cancelled", params);
     }
 
     /// Register the client's filesystem roots using the typed `Root` API,
@@ -870,6 +914,12 @@ final class MCPClient
             msg = Message(parseJsonString(data));
         catch (Exception)
             return; // ignore non-JSON SSE comments/heartbeats
+
+        // A response for a request we have cancelled is ignored per spec, even if
+        // it matches the id we are awaiting.
+        if ((msg.kind == MessageKind.response || msg.kind == MessageKind.errorResponse)
+                && msg.id.type == Json.Type.int_ && isResponseCancelled(msg.id.get!long))
+            return;
 
         final switch (msg.kind)
         {
@@ -1483,6 +1533,21 @@ final class MCPClient
         }
     }
 
+    /// Whether a response with JSON-RPC id `id` belongs to a request this client
+    /// has cancelled (and so should be ignored per basic/utilities/cancellation).
+    /// Exposed for tests; cheap membership check on the cancelled-id set.
+    package bool isResponseCancelled(long id) const @safe nothrow
+    {
+        return (id in cancelledRequests_) !is null;
+    }
+
+    /// Test seam: set the id `cancel()` treats as the (uncancellable) initialize
+    /// request, without driving the live `initialize` handshake.
+    package void setInitializeRequestIdForTest(long id) @safe nothrow @nogc
+    {
+        initializeRequestId = id;
+    }
+
     private static McpException errorFrom(Json error) @safe
     {
         const code = ("code" in error) ? error["code"].get!int : ErrorCode.internalError;
@@ -1870,6 +1935,61 @@ unittest  // sendNotification sends an arbitrary client-originated notification
     assert("id" !in sent);
     assert(sent["params"]["progressToken"].get!string == "tok-1");
     assert(sent["params"]["progress"].get!int == 42);
+}
+
+unittest  // cancel() emits notifications/cancelled with the requestId and reason
+{
+    auto c = new MCPClient("http://localhost");
+    Json sent = Json.undefined;
+    c.onNotifyForTest = (Json message) @safe { sent = message; };
+
+    c.cancel(7, "user aborted");
+
+    assert(sent.type == Json.Type.object);
+    assert(sent["jsonrpc"].get!string == "2.0");
+    assert("id" !in sent); // a notification has no id
+    assert(sent["method"].get!string == "notifications/cancelled");
+    assert(sent["params"]["requestId"].get!long == 7);
+    assert(sent["params"]["reason"].get!string == "user aborted");
+}
+
+unittest  // cancel() without a reason omits the reason field
+{
+    auto c = new MCPClient("http://localhost");
+    Json sent = Json.undefined;
+    c.onNotifyForTest = (Json message) @safe { sent = message; };
+
+    c.cancel(3);
+
+    assert(sent["params"]["requestId"].get!long == 3);
+    assert("reason" !in sent["params"]);
+}
+
+unittest  // after cancel(), a response for that id is treated as cancelled (ignored)
+{
+    auto c = new MCPClient("http://localhost");
+    c.onNotifyForTest = (Json message) @safe {};
+
+    assert(!c.isResponseCancelled(11));
+    c.cancel(11);
+    assert(c.isResponseCancelled(11));
+    // Unrelated ids are unaffected.
+    assert(!c.isResponseCancelled(12));
+}
+
+unittest  // cancel() refuses to cancel the initialize request per spec
+{
+    import std.exception : assertThrown;
+    import mcp.protocol.errors : McpException;
+
+    auto c = new MCPClient("http://localhost");
+    c.onNotifyForTest = (Json message) @safe {};
+    // Simulate that the initialize request used id 5.
+    c.setInitializeRequestIdForTest(5);
+    assertThrown!McpException(c.cancel(5));
+    // A different in-flight request id is still cancellable.
+    c.cancel(6);
+    assert(c.isResponseCancelled(6));
 }
 
 unittest  // sampling dispatch forwards a valid request to the delegate
