@@ -186,7 +186,14 @@ struct ClientCapabilities
 {
     bool roots; /// presence (with optional listChanged below)
     bool rootsListChanged;
-    bool sampling; /// presence-only
+    bool sampling; /// presence (with optional tools/context sub-caps below)
+    /// sampling.tools sub-capability (>= 2025-11-25): declares support for
+    /// tool use in sampling requests. Servers MUST NOT send tool-enabled
+    /// sampling requests unless this is advertised. Implies `sampling`.
+    bool samplingTools;
+    /// sampling.context sub-capability (soft-deprecated): gates the
+    /// `includeContext` values `thisServer`/`allServers`. Implies `sampling`.
+    bool samplingContext;
     bool elicitation; /// presence-only (>= 2025-06-18)
     /// task-augmented requests (>= 2025-11-25); client form carries only the
     /// `requests` map (its `list`/`cancel` fields are server-only).
@@ -207,8 +214,15 @@ struct ClientCapabilities
                 r["listChanged"] = true;
             j["roots"] = r;
         }
-        if (sampling)
-            j["sampling"] = Json.emptyObject;
+        if (sampling || samplingTools || samplingContext)
+        {
+            Json s = Json.emptyObject;
+            if (samplingTools)
+                s["tools"] = Json.emptyObject;
+            if (samplingContext)
+                s["context"] = Json.emptyObject;
+            j["sampling"] = s;
+        }
         if (elicitation)
             j["elicitation"] = Json.emptyObject;
         if (!tasks.isNull)
@@ -231,7 +245,16 @@ struct ClientCapabilities
                 c.rootsListChanged = r["listChanged"].get!bool;
         }
         if ("sampling" in j)
+        {
             c.sampling = true;
+            if (j["sampling"].type == Json.Type.object)
+            {
+                if ("tools" in j["sampling"])
+                    c.samplingTools = true;
+                if ("context" in j["sampling"])
+                    c.samplingContext = true;
+            }
+        }
         if ("elicitation" in j)
             c.elicitation = true;
         if ("tasks" in j && j["tasks"].type == Json.Type.object)
@@ -417,6 +440,67 @@ unittest  // ClientCapabilities omits `tasks` when unset
 {
     ClientCapabilities caps;
     assert("tasks" !in caps.toJson());
+}
+
+unittest  // ClientCapabilities advertises sampling.tools sub-capability (2025-11-25)
+{
+    ClientCapabilities caps;
+    caps.sampling = true;
+    caps.samplingTools = true;
+    auto j = caps.toJson();
+    assert(j["sampling"].type == Json.Type.object);
+    assert(j["sampling"]["tools"].type == Json.Type.object && j["sampling"]["tools"].length == 0);
+    assert("context" !in j["sampling"]);
+}
+
+unittest  // ClientCapabilities advertises sampling.context sub-capability (2025-11-25)
+{
+    ClientCapabilities caps;
+    caps.sampling = true;
+    caps.samplingContext = true;
+    auto j = caps.toJson();
+    assert(j["sampling"]["context"].type == Json.Type.object && j["sampling"]["context"].length == 0);
+    assert("tools" !in j["sampling"]);
+}
+
+unittest  // ClientCapabilities round-trips both sampling sub-capabilities
+{
+    ClientCapabilities caps;
+    caps.sampling = true;
+    caps.samplingTools = true;
+    caps.samplingContext = true;
+    auto back = ClientCapabilities.fromJson(caps.toJson());
+    assert(back.sampling && back.samplingTools && back.samplingContext);
+}
+
+unittest  // ClientCapabilities emits bare empty sampling object when no sub-caps set
+{
+    ClientCapabilities caps;
+    caps.sampling = true;
+    auto j = caps.toJson();
+    assert(j["sampling"].type == Json.Type.object && j["sampling"].length == 0);
+    auto back = ClientCapabilities.fromJson(j);
+    assert(back.sampling && !back.samplingTools && !back.samplingContext);
+}
+
+unittest  // ClientCapabilities parses sampling sub-caps from a server-style payload
+{
+    Json j = Json.emptyObject;
+    Json s = Json.emptyObject;
+    s["tools"] = Json.emptyObject;
+    s["context"] = Json.emptyObject;
+    j["sampling"] = s;
+    auto back = ClientCapabilities.fromJson(j);
+    assert(back.sampling && back.samplingTools && back.samplingContext);
+}
+
+unittest  // ClientCapabilities sub-caps imply sampling presence on serialization
+{
+    ClientCapabilities caps;
+    caps.samplingTools = true;
+    auto j = caps.toJson();
+    assert("sampling" in j);
+    assert(j["sampling"]["tools"].type == Json.Type.object);
 }
 
 unittest  // TasksCapability with empty `requests` map still round-trips presence
