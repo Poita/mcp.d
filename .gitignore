@@ -9,3 +9,7 @@ mcp-test-library
 __test__*__
 dub.selections.json
 conformance-results/
+
+# build artifacts
+conformance-server
+conformance-client
