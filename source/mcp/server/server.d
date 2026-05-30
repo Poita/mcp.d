@@ -269,6 +269,26 @@ final class MCPServer
         return notify("notifications/resources/updated", params);
     }
 
+    /// Emit a `notifications/elicitation/complete` for a URL-mode elicitation,
+    /// telling the client an out-of-band interaction it was asked to complete (via
+    /// `RequestContext.elicitUrl`) has finished, so the client can stop waiting on
+    /// it (basic/utilities/elicitation §"Completion Notifications for URL Mode
+    /// Elicitation"). Per spec the notification MUST carry the `elicitationId` that
+    /// correlates it with the original request. It is delivered on the standalone
+    /// GET SSE stream (the unsolicited server->client channel); returns the number
+    /// of listeners reached, or `0` when no GET stream is open (or the server is
+    /// not on a Streamable HTTP transport). Throws `invalidParams` on an empty
+    /// `elicitationId`.
+    size_t notifyElicitationComplete(string elicitationId) @safe
+    {
+        if (elicitationId.length == 0)
+            throw invalidParams(
+                    "notifications/elicitation/complete requires a non-empty elicitationId");
+        Json params = Json.emptyObject;
+        params["elicitationId"] = elicitationId;
+        return notify("notifications/elicitation/complete", params);
+    }
+
     /// The capabilities advertised by the connected client (valid after
     /// `initialize`).
     ClientCapabilities clientCapabilities() const @safe
@@ -1853,6 +1873,38 @@ unittest  // notifyResourceUpdated is a no-op before a push channel exists
     p["uri"] = "test://w";
     s.handle(req(1, "resources/subscribe", p));
     assert(s.notifyResourceUpdated("test://w") == 0);
+}
+
+unittest  // notifyElicitationComplete emits notifications/elicitation/complete with the id
+{
+    auto s = new MCPServer("t", "1");
+    auto coord = new StreamCoordinator;
+    auto ch = s.serverPushChannel(coord);
+    string[] received;
+    ch.addListener((string f) @safe { received ~= f; });
+
+    const n = s.notifyElicitationComplete("elic-123");
+    assert(n == 1);
+    import std.algorithm : canFind;
+
+    assert(received.length == 1);
+    assert(received[0].canFind("notifications/elicitation/complete"));
+    assert(received[0].canFind("elicitationId"));
+    assert(received[0].canFind("elic-123"));
+}
+
+unittest  // notifyElicitationComplete is a no-op before a push channel exists
+{
+    auto s = new MCPServer("t", "1");
+    assert(s.notifyElicitationComplete("elic-1") == 0);
+}
+
+unittest  // notifyElicitationComplete rejects an empty elicitationId
+{
+    import std.exception : assertThrown;
+
+    auto s = new MCPServer("t", "1");
+    assertThrown!McpException(s.notifyElicitationComplete(""));
 }
 
 unittest  // tools listChanged is not advertised by default
