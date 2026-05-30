@@ -1282,6 +1282,39 @@ unittest  // tools/call invokes the handler and returns its result
     assert("isError" !in resp["result"]);
 }
 
+unittest  // tools/list emits a tool descriptor's _meta
+{
+    auto s = new MCPServer("meta-srv", "0.1.0");
+    Tool t = {name: "tagged"};
+    Json m = Json.emptyObject;
+    m["x.example/group"] = "demo";
+    t.meta = m;
+    s.registerTool(t, (Json args) @safe {
+        CallToolResult r;
+        r.content = [Content.makeText("ok")];
+        return r;
+    });
+
+    auto resp = s.handle(req(1, "tools/list")).get;
+    assert(resp["result"]["tools"][0]["_meta"]["x.example/group"].get!string == "demo");
+}
+
+unittest  // tools/call propagates a handler's result-level _meta to the wire
+{
+    auto s = new MCPServer("meta-srv", "0.1.0");
+    Tool t = {name: "withmeta"};
+    s.registerTool(t, (Json args) @safe {
+        Json m = Json.emptyObject;
+        m["io.modelcontextprotocol/cacheHit"] = true;
+        return CallToolResult([Content.makeText("ok")]).withMeta(m);
+    });
+
+    Json params = Json.emptyObject;
+    params["name"] = "withmeta";
+    auto resp = s.handle(req(2, "tools/call", params)).get;
+    assert(resp["result"]["_meta"]["io.modelcontextprotocol/cacheHit"].get!bool);
+}
+
 unittest  // tools/call with unknown tool is an invalid-params protocol error
 {
     auto s = makeTestServer();

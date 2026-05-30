@@ -320,6 +320,7 @@ struct Tool
     Json outputSchema = Json.undefined; /// optional JSON Schema for structured results
     Json annotations = Json.undefined; /// optional ToolAnnotations
     Icon[] icons; /// optional icons for display in user interfaces
+    Json meta; /// optional descriptor-level `_meta` object
 
     Json toJson() const @safe
     {
@@ -341,6 +342,8 @@ struct Tool
                 arr ~= icon.toJson();
             j["icons"] = arr;
         }
+        if (meta.type == Json.Type.object)
+            j["_meta"] = meta;
         return j;
     }
 
@@ -361,6 +364,8 @@ struct Tool
         if ("icons" in j && j["icons"].type == Json.Type.array)
             foreach (i; 0 .. j["icons"].length)
                 t.icons ~= Icon.fromJson(j["icons"][i]);
+        if ("_meta" in j && j["_meta"].type == Json.Type.object)
+            t.meta = j["_meta"];
         return t;
     }
 }
@@ -379,6 +384,7 @@ struct CallToolResult
     Content[] content;
     bool isError;
     Json structuredContent = Json.undefined;
+    Json meta; /// optional result-level `_meta` object
 
     Json toJson() const @safe
     {
@@ -391,6 +397,8 @@ struct CallToolResult
             j["isError"] = true;
         if (structuredContent.type != Json.Type.undefined)
             j["structuredContent"] = structuredContent;
+        if (meta.type == Json.Type.object)
+            j["_meta"] = meta;
         return j;
     }
 
@@ -407,7 +415,17 @@ struct CallToolResult
             r.isError = j["isError"].get!bool;
         if ("structuredContent" in j)
             r.structuredContent = j["structuredContent"];
+        if ("_meta" in j && j["_meta"].type == Json.Type.object)
+            r.meta = j["_meta"];
         return r;
+    }
+
+    /// Fluent setter for the result-level `_meta` object, e.g.
+    /// `CallToolResult([Content.makeText("ok")]).withMeta(m)`.
+    CallToolResult withMeta(Json m) @safe
+    {
+        meta = m;
+        return this;
     }
 }
 
@@ -657,6 +675,103 @@ unittest  // CallToolResult omits isError when false
     assert("isError" !in r.toJson());
 }
 
+unittest  // CallToolResult emits result-level _meta when set, omits when unset
+{
+    CallToolResult r;
+    r.content = [Content.makeText("ok")];
+    assert("_meta" !in r.toJson());
+
+    Json m = Json.emptyObject;
+    m["io.modelcontextprotocol/cacheHit"] = true;
+    r.meta = m;
+    auto j = r.toJson();
+    assert(j["_meta"]["io.modelcontextprotocol/cacheHit"].get!bool);
+    auto back = CallToolResult.fromJson(j);
+    assert(back.meta["io.modelcontextprotocol/cacheHit"].get!bool);
+}
+
+unittest  // Tool emits descriptor-level _meta when set
+{
+    Tool t = {name: "withmeta"};
+    Json m = Json.emptyObject;
+    m["x.example/hint"] = "v";
+    t.meta = m;
+    auto j = t.toJson();
+    assert(j["_meta"]["x.example/hint"].get!string == "v");
+    auto back = Tool.fromJson(j);
+    assert(back.meta["x.example/hint"].get!string == "v");
+}
+
+unittest  // Tool omits _meta when unset
+{
+    Tool t = {name: "nometa"};
+    assert("_meta" !in t.toJson());
+}
+
+unittest  // Resource round-trips _meta
+{
+    Resource r = {uri: "test://x", name: "x"};
+    Json m = Json.emptyObject;
+    m["x.example/tag"] = 7;
+    r.meta = m;
+    auto back = Resource.fromJson(r.toJson());
+    assert(back.meta["x.example/tag"].get!long == 7);
+}
+
+unittest  // Prompt round-trips _meta
+{
+    Prompt p = {name: "p"};
+    Json m = Json.emptyObject;
+    m["x.example/group"] = "demo";
+    p.meta = m;
+    auto back = Prompt.fromJson(p.toJson());
+    assert(back.meta["x.example/group"].get!string == "demo");
+}
+
+unittest  // ReadResourceResult round-trips _meta
+{
+    ReadResourceResult r;
+    r.contents = [ResourceContents.makeText("file://x", "text/plain", "hi")];
+    assert("_meta" !in r.toJson());
+    Json m = Json.emptyObject;
+    m["x.example/etag"] = "abc";
+    r.meta = m;
+    auto back = ReadResourceResult.fromJson(r.toJson());
+    assert(back.meta["x.example/etag"].get!string == "abc");
+}
+
+unittest  // GetPromptResult round-trips _meta
+{
+    GetPromptResult r;
+    r.messages = [PromptMessage("user", Content.makeText("hi"))];
+    Json m = Json.emptyObject;
+    m["x.example/v"] = 1;
+    r.meta = m;
+    auto back = GetPromptResult.fromJson(r.toJson());
+    assert(back.meta["x.example/v"].get!long == 1);
+}
+
+unittest  // CompleteResult round-trips _meta
+{
+    CompleteResult r;
+    r.values = ["a", "b"];
+    Json m = Json.emptyObject;
+    m["x.example/src"] = "cache";
+    r.meta = m;
+    auto j = r.toJson();
+    assert(j["_meta"]["x.example/src"].get!string == "cache");
+    auto back = CompleteResult.fromJson(j);
+    assert(back.meta["x.example/src"].get!string == "cache");
+}
+
+unittest  // CallToolResult.withMeta is a fluent setter
+{
+    Json m = Json.emptyObject;
+    m["x.example/k"] = "v";
+    auto r = CallToolResult([Content.makeText("ok")]).withMeta(m);
+    assert(r.meta["x.example/k"].get!string == "v");
+}
+
 unittest  // ListToolsResult carries tools and optional cursor
 {
     ListToolsResult r;
@@ -710,6 +825,7 @@ struct Resource
     Annotations annotations; /// optional audience/priority/lastModified annotations
     Nullable!long size; /// optional size in bytes
     Icon[] icons; /// optional icons for display in user interfaces
+    Json meta; /// optional descriptor-level `_meta` object
 
     Json toJson() const @safe
     {
@@ -733,6 +849,8 @@ struct Resource
                 arr ~= icon.toJson();
             j["icons"] = arr;
         }
+        if (meta.type == Json.Type.object)
+            j["_meta"] = meta;
         return j;
     }
 
@@ -754,6 +872,8 @@ struct Resource
         if ("icons" in j && j["icons"].type == Json.Type.array)
             foreach (i; 0 .. j["icons"].length)
                 r.icons ~= Icon.fromJson(j["icons"][i]);
+        if ("_meta" in j && j["_meta"].type == Json.Type.object)
+            r.meta = j["_meta"];
         return r;
     }
 }
@@ -1135,6 +1255,7 @@ unittest  // Annotations.empty reflects whether any field is set
 struct ReadResourceResult
 {
     ResourceContents[] contents;
+    Json meta; /// optional result-level `_meta` object
 
     Json toJson() const @safe
     {
@@ -1143,6 +1264,8 @@ struct ReadResourceResult
         foreach (c; contents)
             arr ~= c.toJson();
         j["contents"] = arr;
+        if (meta.type == Json.Type.object)
+            j["_meta"] = meta;
         return j;
     }
 
@@ -1155,7 +1278,16 @@ struct ReadResourceResult
             foreach (i; 0 .. arr.length)
                 r.contents ~= ResourceContents.fromJson(arr[i]);
         }
+        if ("_meta" in j && j["_meta"].type == Json.Type.object)
+            r.meta = j["_meta"];
         return r;
+    }
+
+    /// Fluent setter for the result-level `_meta` object.
+    ReadResourceResult withMeta(Json m) @safe
+    {
+        meta = m;
+        return this;
     }
 }
 
@@ -1201,6 +1333,7 @@ struct Prompt
     Nullable!string description;
     PromptArgument[] arguments;
     Icon[] icons; /// optional icons for display in user interfaces
+    Json meta; /// optional descriptor-level `_meta` object
 
     Json toJson() const @safe
     {
@@ -1224,6 +1357,8 @@ struct Prompt
                 arr ~= icon.toJson();
             j["icons"] = arr;
         }
+        if (meta.type == Json.Type.object)
+            j["_meta"] = meta;
         return j;
     }
 
@@ -1244,6 +1379,8 @@ struct Prompt
         if ("icons" in j && j["icons"].type == Json.Type.array)
             foreach (i; 0 .. j["icons"].length)
                 p.icons ~= Icon.fromJson(j["icons"][i]);
+        if ("_meta" in j && j["_meta"].type == Json.Type.object)
+            p.meta = j["_meta"];
         return p;
     }
 }
@@ -1310,6 +1447,7 @@ struct GetPromptResult
 {
     Nullable!string description;
     PromptMessage[] messages;
+    Json meta; /// optional result-level `_meta` object
 
     Json toJson() const @safe
     {
@@ -1320,6 +1458,8 @@ struct GetPromptResult
         foreach (m; messages)
             arr ~= m.toJson();
         j["messages"] = arr;
+        if (meta.type == Json.Type.object)
+            j["_meta"] = meta;
         return j;
     }
 
@@ -1334,7 +1474,16 @@ struct GetPromptResult
             foreach (i; 0 .. arr.length)
                 r.messages ~= PromptMessage.fromJson(arr[i]);
         }
+        if ("_meta" in j && j["_meta"].type == Json.Type.object)
+            r.meta = j["_meta"];
         return r;
+    }
+
+    /// Fluent setter for the result-level `_meta` object.
+    GetPromptResult withMeta(Json m) @safe
+    {
+        meta = m;
+        return this;
     }
 }
 
@@ -1454,6 +1603,7 @@ struct CompleteResult
     string[] values;
     Nullable!size_t total;
     bool hasMore;
+    Json meta; /// optional result-level `_meta` object
 
     Json toJson() const @safe
     {
@@ -1467,6 +1617,8 @@ struct CompleteResult
         completion["hasMore"] = hasMore;
         Json j = Json.emptyObject;
         j["completion"] = completion;
+        if (meta.type == Json.Type.object)
+            j["_meta"] = meta;
         return j;
     }
 
@@ -1490,6 +1642,8 @@ struct CompleteResult
             r.total = cast(size_t) c["total"].get!long;
         if ("hasMore" in c && c["hasMore"].type == Json.Type.bool_)
             r.hasMore = c["hasMore"].get!bool;
+        if ("_meta" in j && j["_meta"].type == Json.Type.object)
+            r.meta = j["_meta"];
         return r;
     }
 }
