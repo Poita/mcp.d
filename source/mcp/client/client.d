@@ -189,6 +189,11 @@ final class MCPClient
     // The JSON-RPC id used for the `initialize` request, so cancel() can enforce
     // the spec rule that clients MUST NOT cancel initialize. 0 until sent.
     private long initializeRequestId;
+    // Tool inputSchemas seen via tools/list, keyed by tool name. Used by the
+    // draft client to mirror x-mcp-header-annotated tool-call arguments into
+    // Mcp-Param-{Name} headers (draft basic/transports, "Custom Headers from
+    // Tool Parameters"). Populated by listTools; consumed by addDraftHeaders.
+    private Json[string] toolInputSchemas_;
 
     /// Capabilities this client advertises at initialize.
     ClientCapabilities capabilities;
@@ -376,7 +381,24 @@ final class MCPClient
             cursor = res.nextCursor;
         }
         while (!cursor.isNull);
+        // Cache each tool's inputSchema so a subsequent tools/call can mirror any
+        // x-mcp-header-annotated arguments into Mcp-Param-{Name} headers (draft
+        // basic/transports, "Custom Headers from Tool Parameters").
+        foreach (t; all)
+            cacheToolSchema(t.name, t.inputSchema);
         return all;
+    }
+
+    /// Record a tool's `inputSchema` (keyed by tool name) so the draft client can
+    /// mirror its x-mcp-header-annotated arguments into `Mcp-Param-*` headers on a
+    /// later `tools/call`. Normally populated automatically by `listTools`; exposed
+    /// so callers that obtain a `Tool` descriptor by other means (e.g. a cached
+    /// `tools/list` result, or a `notifications/tools/list_changed` refresh) can
+    /// register it too. A non-object schema is ignored.
+    void cacheToolSchema(string name, Json inputSchema) @safe
+    {
+        if (name.length && inputSchema.type == Json.Type.object)
+            toolInputSchemas_[name] = inputSchema;
     }
 
     /// `tools/call`.
@@ -1059,6 +1081,68 @@ final class MCPClient
         }
         if (name.length)
             req.headers[HttpHeader.name] = name;
+
+        // Mirror x-mcp-header-annotated tool arguments into Mcp-Param-{Name}
+        // headers (draft basic/transports, "Custom Headers from Tool
+        // Parameters"): clients MUST inspect the tool's inputSchema and append a
+        // header for each annotated argument that is present and non-null.
+        if (method == "tools/call" && name.length)
+        {
+            auto schema = name in toolInputSchemas_;
+            if (schema !is null)
+            {
+                auto args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
+                foreach (header, value; paramHeaders(*schema, args))
+                    req.headers[header] = value;
+            }
+        }
+    }
+
+    /// Compute the `Mcp-Param-*` headers to emit for a `tools/call`, given the
+    /// tool's `inputSchema` and the call `arguments`. For each top-level property
+    /// annotated with `x-mcp-header` (see `paramHeaderMap`), the matching argument
+    /// value is encoded with `encodeHeaderValue` and mapped to its
+    /// `Mcp-Param-{Name}` header. Per the draft spec's mirroring table, an
+    /// argument that is absent or `null` produces no header. Non-string scalars
+    /// (numbers, booleans) are stringified; object/array values are emitted as
+    /// their compact JSON. Separated as a pure static helper so the mirroring can
+    /// be unit-tested without a live server.
+    package static string[string] paramHeaders(Json inputSchema, Json arguments) @safe
+    {
+        string[string] headers;
+        auto map = paramHeaderMap(inputSchema);
+        if (map.length == 0 || arguments.type != Json.Type.object)
+            return headers;
+        foreach (param, header; map)
+        {
+            if (param !in arguments)
+                continue; // absent -> no header
+            auto v = arguments[param];
+            if (v.type == Json.Type.null_ || v.type == Json.Type.undefined)
+                continue; // null -> no header
+            string raw;
+            final switch (v.type)
+            {
+            case Json.Type.string:
+                raw = v.get!string;
+                break;
+            case Json.Type.int_:
+            case Json.Type.bigInt:
+            case Json.Type.float_:
+            case Json.Type.bool_:
+                raw = v.toString();
+                break;
+            case Json.Type.object:
+            case Json.Type.array:
+                raw = v.toString();
+                break;
+            case Json.Type.null_:
+            case Json.Type.undefined:
+                continue;
+            }
+            headers[header] = encodeHeaderValue(raw);
+        }
+        return headers;
     }
 
     private void captureSession(scope HTTPClientResponse res) @safe
@@ -2753,4 +2837,115 @@ unittest  // buildGetPromptParams attaches a progressToken under _meta
     auto p = MCPClient.buildGetPromptParams("greet", Json.emptyObject, ProgressToken("g1"));
     assert(p["name"].get!string == "greet");
     assert(p["_meta"]["progressToken"].get!string == "g1");
+}
+
+unittest  // paramHeaders mirrors an x-mcp-header-annotated argument into Mcp-Param-{Name}
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["region"] = Json([
+        "type": Json("string"),
+        "x-mcp-header": Json("Region")
+    ]);
+    props["query"] = Json(["type": Json("string")]);
+    schema["properties"] = props;
+
+    Json args = Json.emptyObject;
+    args["region"] = "us-west1";
+    args["query"] = "weather";
+
+    auto headers = MCPClient.paramHeaders(schema, args);
+    assert("Mcp-Param-Region" in headers);
+    assert(headers["Mcp-Param-Region"] == "us-west1");
+    // A non-annotated argument never becomes a header.
+    assert("Mcp-Param-query" !in headers);
+}
+
+unittest  // paramHeaders omits headers for absent or null annotated arguments
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["region"] = Json([
+        "type": Json("string"),
+        "x-mcp-header": Json("Region")
+    ]);
+    props["zone"] = Json(["type": Json("string"), "x-mcp-header": Json("Zone")]);
+    schema["properties"] = props;
+
+    Json args = Json.emptyObject;
+    args["zone"] = null; // explicit null -> no header
+    // region absent entirely -> no header
+
+    auto headers = MCPClient.paramHeaders(schema, args);
+    assert("Mcp-Param-Region" !in headers);
+    assert("Mcp-Param-Zone" !in headers);
+}
+
+unittest  // paramHeaders base64-encodes a non-ASCII annotated value
+{
+    import mcp.protocol.draft : decodeHeaderValue;
+
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["label"] = Json([
+        "type": Json("string"),
+        "x-mcp-header": Json("Label")
+    ]);
+    schema["properties"] = props;
+
+    Json args = Json.emptyObject;
+    args["label"] = "Hello, 世界";
+
+    auto headers = MCPClient.paramHeaders(schema, args);
+    assert("Mcp-Param-Label" in headers);
+    assert(headers["Mcp-Param-Label"][0 .. 9] == "=?base64?");
+    assert(decodeHeaderValue(headers["Mcp-Param-Label"]) == "Hello, 世界");
+}
+
+unittest  // paramHeaders stringifies a non-string scalar annotated value
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["limit"] = Json([
+        "type": Json("integer"),
+        "x-mcp-header": Json("Limit")
+    ]);
+    schema["properties"] = props;
+
+    Json args = Json.emptyObject;
+    args["limit"] = 42;
+
+    auto headers = MCPClient.paramHeaders(schema, args);
+    assert(headers["Mcp-Param-Limit"] == "42");
+}
+
+unittest  // paramHeaders yields nothing when the schema has no x-mcp-header annotations
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["query"] = Json(["type": Json("string")]);
+    schema["properties"] = props;
+
+    Json args = Json.emptyObject;
+    args["query"] = "x";
+
+    auto headers = MCPClient.paramHeaders(schema, args);
+    assert(headers.length == 0);
+}
+
+unittest  // cacheToolSchema records a schema and ignores a non-object one
+{
+    auto c = new MCPClient("http://localhost/mcp");
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    c.cacheToolSchema("search", schema);
+    assert("search" in c.toolInputSchemas_);
+    // Non-object schema is ignored.
+    c.cacheToolSchema("bad", Json("not-an-object"));
+    assert("bad" !in c.toolInputSchemas_);
 }
