@@ -10,6 +10,7 @@ public import mcp.protocol.errors;
 public import mcp.protocol.jsonrpc;
 public import mcp.protocol.capabilities;
 public import mcp.protocol.types;
+public import mcp.protocol.sampling;
 public import mcp.protocol.draft;
 public import mcp.server.context;
 public import mcp.server.server;
