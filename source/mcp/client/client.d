@@ -29,6 +29,7 @@ final class MCPClient
     private ProtocolVersion negotiated = latestStable;
     private bool didInitialize;
     private bool useDraft;
+    private string bearerToken;
     private long nextId = 1;
 
     /// Capabilities this client advertises at initialize.
@@ -73,6 +74,13 @@ final class MCPClient
     DiscoverResult discover() @safe
     {
         return DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject));
+    }
+
+    /// Attach an OAuth bearer access token, sent as `Authorization: Bearer
+    /// <token>` on every subsequent request. Pass an empty string to clear it.
+    void setBearerToken(string token) @safe
+    {
+        bearerToken = token;
     }
 
     /// Perform the initialize handshake and send `notifications/initialized`.
@@ -299,6 +307,8 @@ final class MCPClient
         req.method = HTTPMethod.POST;
         req.headers["Accept"] = "application/json, text/event-stream";
         req.contentType = "application/json";
+        if (bearerToken.length)
+            req.headers["Authorization"] = "Bearer " ~ bearerToken;
         if (sessionId.length)
             req.headers["Mcp-Session-Id"] = sessionId;
         if (useDraft)
