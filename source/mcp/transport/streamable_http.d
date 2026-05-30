@@ -143,10 +143,21 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
         res.writeBody("", "text/plain");
         return;
     case MessageKind.request:
+        // Spec (2025-06-18 / 2025-11-25 Transports): an invalid or unsupported
+        // MCP-Protocol-Version header MUST be rejected with 400, independent of
+        // the negotiated/draft state.
+        auto verErr = validateProtocolVersionHeader(
+                req.headers.get(HttpHeader.protocolVersion, ""));
+        if (verErr !is null)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            res.writeBody(makeErrorResponse(msg.id, verErr).toString(), "application/json");
+            return;
+        }
         // Draft: validate the standard request headers against the body.
-        auto hdrErr = validateDraftHeaders(req.headers.get(
-                HttpHeader.protocolVersion, ""), req.headers.get(HttpHeader.method,
-                ""), req.headers.get(HttpHeader.name, ""), msg);
+        auto hdrErr = validateDraftHeaders(req.headers.get(HttpHeader.protocolVersion,
+                ""), req.headers.get(HttpHeader.method, ""),
+                req.headers.get(HttpHeader.name, ""), msg);
         if (hdrErr !is null)
         {
             res.statusCode = HTTPStatus.badRequest;
@@ -260,6 +271,31 @@ McpException validateDraftHeaders(string protoHeader, string methodHeader,
         return new McpException(ErrorCode.headerMismatch,
                 "Mcp-Name header '" ~ nameHeader ~ "' does not match body value '" ~ bodyName ~ "'");
     return null;
+}
+
+/// Validate the HTTP `MCP-Protocol-Version` header for a request. Per the
+/// 2025-06-18 / 2025-11-25 transport ("Protocol Version Header"): if the header
+/// is present but carries an invalid or unsupported version, the server MUST
+/// respond with `400 Bad Request`. Returns an `UnsupportedProtocolVersionError`
+/// (-32004, which the transport maps to HTTP 400) in that case, else null.
+///
+/// An absent header is permitted: older clients omit it, and the request then
+/// proceeds under the previously negotiated version.
+McpException validateProtocolVersionHeader(string protoHeader) @safe
+{
+    if (protoHeader.length == 0)
+        return null; // header optional; fall back to negotiated version
+    ProtocolVersion pv;
+    if (tryParseVersion(protoHeader, pv))
+        return null; // a known, supported version
+    Json data = Json.emptyObject;
+    Json supported = Json.emptyArray;
+    foreach (v; supportedVersions)
+        supported ~= Json(v.toWire);
+    data["supported"] = supported;
+    data["requested"] = Json(protoHeader);
+    return new McpException(ErrorCode.unsupportedProtocolVersion,
+            "Unsupported MCP-Protocol-Version header: " ~ protoHeader, data);
 }
 
 /// Whether a `Host` header value (e.g. "127.0.0.1:3000") is localhost or listed.
@@ -413,6 +449,43 @@ unittest  // draft resources/read mirrors uri into Mcp-Name
     auto m = draftMsg("resources/read", p);
     assert(validateDraftHeaders("2026-07-28", "resources/read", "test://x", m) is null);
     assert(validateDraftHeaders("2026-07-28", "resources/read", "test://y", m) !is null);
+}
+
+unittest  // absent MCP-Protocol-Version header is permitted (falls back to negotiated)
+{
+    assert(validateProtocolVersionHeader("") is null);
+}
+
+unittest  // a supported stable MCP-Protocol-Version header passes
+{
+    assert(validateProtocolVersionHeader("2025-06-18") is null);
+    assert(validateProtocolVersionHeader("2025-11-25") is null);
+    assert(validateProtocolVersionHeader("2024-11-05") is null);
+}
+
+unittest  // the draft MCP-Protocol-Version header passes
+{
+    assert(validateProtocolVersionHeader("2026-07-28") is null);
+    assert(validateProtocolVersionHeader("draft") is null);
+}
+
+unittest  // an unsupported/invalid MCP-Protocol-Version header is rejected with -32004 (HTTP 400)
+{
+    auto e = validateProtocolVersionHeader("1.0.0");
+    assert(e !is null);
+    assert(e.code == ErrorCode.unsupportedProtocolVersion);
+    // maps to HTTP 400 in the transport
+    auto j = makeErrorResponse(Json(1), e);
+    assert(httpStatusForResponse(j, false) == 400);
+    assert(httpStatusForResponse(j, true) == 400);
+    // data carries the supported list and the rejected value
+    assert(e.data["requested"].get!string == "1.0.0");
+    assert(e.data["supported"].length == supportedVersions.length);
+}
+
+unittest  // a garbage MCP-Protocol-Version header is rejected
+{
+    assert(validateProtocolVersionHeader("not-a-version") !is null);
 }
 
 /// True if the protocol-version header denotes a draft+ request.
