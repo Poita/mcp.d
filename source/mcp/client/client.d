@@ -106,6 +106,72 @@ final class MCPClient
         return init;
     }
 
+    /// Connect to a server whose protocol era is unknown, per the transport
+    /// backward-compatibility rules. Probes `server/discover` first:
+    ///   - success → modern server; switch to the newest mutually-supported
+    ///     version (stateless draft mode if that version uses per-request
+    ///     `_meta`, otherwise an `initialize` handshake for that stable version);
+    ///   - `Method not found` (-32601) → legacy server; fall back to the
+    ///     `initialize` handshake;
+    ///   - `UnsupportedProtocolVersionError` (-32004) → modern server; pick from
+    ///     the advertised `supported` list rather than falling back.
+    /// Returns the negotiated protocol version. Throws if there is no mutually
+    /// supported version, or on any other error.
+    ProtocolVersion connect() @safe
+    {
+        string[] serverVersions;
+        try
+        {
+            serverVersions = discover().protocolVersions;
+        }
+        catch (McpException e)
+        {
+            if (e.code == ErrorCode.methodNotFound)
+            {
+                initialize(); // legacy initialize-based server
+                return negotiated;
+            }
+            if (e.code == ErrorCode.unsupportedProtocolVersion)
+                serverVersions = supportedListFromError(e);
+            else
+                throw e;
+        }
+
+        ProtocolVersion chosen;
+        if (!selectMutualVersion(serverVersions, chosen))
+            throw new McpException(ErrorCode.unsupportedProtocolVersion,
+                    "No mutually supported protocol version");
+
+        if (chosen.isDraft)
+        {
+            useDraft = true;
+            negotiated = chosen;
+        }
+        else
+            initialize(chosen.toWire); // modern discovery, pre-draft version
+        return negotiated;
+    }
+
+    /// Extract the `supported` wire-version list from an
+    /// `UnsupportedProtocolVersionError`. `errorFrom` stores the whole JSON-RPC
+    /// error object in `data`, so the list lives at `data.data.supported`.
+    private static string[] supportedListFromError(McpException e) @safe
+    {
+        auto d = e.data;
+        if (d.type == Json.Type.object && "data" in d && d["data"].type == Json.Type.object)
+            d = d["data"];
+        string[] versions;
+        if (d.type == Json.Type.object && "supported" in d && d["supported"].type == Json
+                .Type.array)
+        {
+            auto arr = d["supported"];
+            foreach (i; 0 .. arr.length)
+                if (arr[i].type == Json.Type.string)
+                    versions ~= arr[i].get!string;
+        }
+        return versions;
+    }
+
     /// `ping` — returns when the server acknowledges.
     void ping() @safe
     {
@@ -926,4 +992,42 @@ final class MCPClient
         const m = ("message" in error) ? error["message"].get!string : "server error";
         return new McpException(code, m, error);
     }
+}
+
+/// Pick the newest protocol version both this SDK and the server support, given
+/// the server's advertised wire-string list (from `server/discover` or the
+/// `supported` field of an `UnsupportedProtocolVersionError`). Returns false
+/// when there is no overlap. Used by `MCPClient.connect` for modern-vs-legacy
+/// server detection per the transport backward-compatibility rules.
+bool selectMutualVersion(const string[] serverVersions, out ProtocolVersion chosen) @safe
+{
+    import std.range : retro;
+
+    foreach (cand; supportedVersions.retro) // newest (draft) first
+    {
+        foreach (s; serverVersions)
+        {
+            ProtocolVersion sv;
+            if (tryParseVersion(s, sv) && sv == cand)
+            {
+                chosen = cand;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+unittest  // selectMutualVersion prefers the newest mutually-supported version
+{
+    ProtocolVersion v;
+    assert(selectMutualVersion(["2025-11-25", "2026-07-28"], v) && v == ProtocolVersion.draft);
+    assert(selectMutualVersion(["2024-11-05", "2025-03-26"], v) && v == ProtocolVersion.v2025_03_26);
+}
+
+unittest  // selectMutualVersion reports no overlap
+{
+    ProtocolVersion v;
+    assert(!selectMutualVersion(["1999-01-01"], v));
+    assert(!selectMutualVersion([], v));
 }
