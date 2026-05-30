@@ -683,7 +683,7 @@ unittest  // prompts/list and prompts/get with arguments
 unittest  // completion/complete uses the registered handler
 {
     auto s = new MCPServer("t", "1");
-    s.setCompletionHandler((Json params) @safe {
+    s.setCompletionHandler((Json) @safe {
         CompleteResult r;
         r.values = ["paris", "park"];
         return r;
