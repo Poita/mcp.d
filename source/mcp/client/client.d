@@ -426,11 +426,27 @@ final class MCPClient
         notify(method, params);
     }
 
+    /// Register the client's filesystem roots using the typed `Root` API,
+    /// mirroring the typed result types the SDK provides for tools, resources
+    /// and prompts. This installs an `onListRoots` handler that answers
+    /// `roots/list` with a properly-shaped `{roots: [{uri, name}]}` envelope, so
+    /// callers no longer have to hand-construct the raw JSON. Each `uri` MUST be
+    /// a `file://` URI per client/roots §Data Types.
+    void setRoots(Root[] roots) @safe
+    {
+        auto rs = roots.dup;
+        onListRoots = (Json params) @safe {
+            ListRootsResult result;
+            result.roots = rs;
+            return result.toJson();
+        };
+    }
+
     /// Emit `notifications/roots/list_changed`, informing the server that this
     /// client's set of roots has changed. Per client/roots §Root List Changes,
     /// a client that advertises the roots `listChanged` capability MUST send
     /// this notification whenever its roots change. Call this after updating the
-    /// roots returned by `onListRoots`.
+    /// roots returned by `onListRoots` (or after `setRoots`).
     void notifyRootsListChanged() @safe
     {
         notify("notifications/roots/list_changed", Json.emptyObject);
@@ -1705,6 +1721,29 @@ unittest  // notifyRootsListChanged emits the spec notification method
     assert(sent["jsonrpc"].get!string == "2.0");
     assert("id" !in sent); // a notification has no id
     assert(sent["method"].get!string == "notifications/roots/list_changed");
+}
+
+unittest  // setRoots answers roots/list with the typed envelope
+{
+    auto c = new MCPClient("http://localhost");
+    c.setRoots([
+        Root("file:///home/user/project", nullable("My Project")),
+        Root("file:///tmp")
+    ]);
+
+    assert(c.onListRoots !is null);
+    auto result = c.onListRoots(Json.emptyObject);
+    assert(result["roots"].type == Json.Type.array);
+    assert(result["roots"].length == 2);
+    assert(result["roots"][0]["uri"].get!string == "file:///home/user/project");
+    assert(result["roots"][0]["name"].get!string == "My Project");
+    assert(result["roots"][1]["uri"].get!string == "file:///tmp");
+    assert("name" !in result["roots"][1]);
+
+    // The typed result parses back into a ListRootsResult.
+    auto parsed = ListRootsResult.fromJson(result);
+    assert(parsed.roots.length == 2);
+    assert(parsed.roots[0].name.get == "My Project");
 }
 
 unittest  // sendNotification sends an arbitrary client-originated notification
