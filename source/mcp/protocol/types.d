@@ -1076,6 +1076,7 @@ struct PromptArgument
 struct Prompt
 {
     string name;
+    Nullable!string title; /// optional human-readable display name
     Nullable!string description;
     PromptArgument[] arguments;
 
@@ -1083,6 +1084,8 @@ struct Prompt
     {
         Json j = Json.emptyObject;
         j["name"] = name;
+        if (!title.isNull)
+            j["title"] = title.get;
         if (!description.isNull)
             j["description"] = description.get;
         if (arguments.length)
@@ -1099,6 +1102,8 @@ struct Prompt
     {
         Prompt p;
         p.name = ("name" in j) ? j["name"].get!string : "";
+        if ("title" in j && j["title"].type == Json.Type.string)
+            p.title = j["title"].get!string;
         if ("description" in j && j["description"].type == Json.Type.string)
             p.description = j["description"].get!string;
         if ("arguments" in j && j["arguments"].type == Json.Type.array)
@@ -1261,6 +1266,25 @@ unittest  // Prompt with arguments serializes the argument list
     assert(j["name"].get!string == "greet");
     assert(j["arguments"][0]["name"].get!string == "who");
     assert(j["arguments"][0]["required"].get!bool);
+}
+
+unittest  // Prompt emits an optional title and round-trips it
+{
+    Prompt p = {
+        name: "greet", title: nullable("Greeting"), description: nullable("greets")
+    };
+    auto j = p.toJson();
+    assert(j["title"].get!string == "Greeting");
+    auto back = Prompt.fromJson(j);
+    assert(back.title.get == "Greeting");
+}
+
+unittest  // Prompt omits title when unset
+{
+    Prompt p = {name: "greet"};
+    auto j = p.toJson();
+    assert("title" !in j);
+    assert(Prompt.fromJson(j).title.isNull);
 }
 
 unittest  // GetPromptResult serializes messages with object content
