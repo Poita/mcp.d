@@ -700,7 +700,12 @@ final class MCPServer
             }
         }
         // Draft aligns the code to invalidParams (-32602); older versions -32002.
-        throw new McpException(effectiveVersion.resourceNotFoundCode, "Resource not found: " ~ uri);
+        // The spec's not-found example carries structured data {"uri": ...} so
+        // clients can read the offending URI without parsing the message string.
+        Json data = Json.emptyObject;
+        data["uri"] = uri;
+        throw new McpException(effectiveVersion.resourceNotFoundCode,
+                "Resource not found: " ~ uri, data);
     }
 
     private Json doSubscribe(Json params) @safe
@@ -1180,6 +1185,15 @@ unittest  // resources/read for an unknown uri is resourceNotFound
     p["uri"] = "test://missing";
     auto resp = s.handle(req(1, "resources/read", p)).get;
     assert(resp["error"]["code"].get!int == ErrorCode.resourceNotFound);
+}
+
+unittest  // resources/read not-found carries structured data.uri (spec example shape)
+{
+    auto s = new MCPServer("t", "1");
+    Json p = Json.emptyObject;
+    p["uri"] = "test://missing";
+    auto resp = s.handle(req(1, "resources/read", p)).get;
+    assert(resp["error"]["data"]["uri"].get!string == "test://missing");
 }
 
 unittest  // resource templates resolve and read with captured params
