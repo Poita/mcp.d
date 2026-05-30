@@ -18,7 +18,11 @@ enum ErrorCode : int
     // draft Streamable HTTP: header/body validation failure
     headerMismatch = -32001,
     // draft: requested protocol version not supported (data: {supported, requested})
-    unsupportedProtocolVersion = -32004
+    unsupportedProtocolVersion = -32004,
+    // sampling (client/sampling §Error Handling): the user declined the
+    // server's `sampling/createMessage` request. Not a JSON-RPC reserved code;
+    // the spec assigns this conventional value.
+    userRejected = -1
 }
 
 /// An error that maps onto a JSON-RPC error object.
@@ -77,6 +81,15 @@ McpException resourceNotFound(string uri, Json data = Json.undefined) @safe pure
     return new McpException(ErrorCode.resourceNotFound, "Resource not found: " ~ uri, data);
 }
 
+/// Build the conventional `-1` "User rejected sampling request" error a client
+/// `onSampling` delegate SHOULD return when the user declines the request
+/// (client/sampling §Error Handling).
+McpException userRejected(string message = "User rejected sampling request",
+        Json data = Json.undefined) @safe pure nothrow
+{
+    return new McpException(ErrorCode.userRejected, message, data);
+}
+
 unittest  // McpException carries code and message
 {
     auto e = new McpException(ErrorCode.invalidParams, "bad arg");
@@ -98,6 +111,21 @@ unittest  // toErrorJson produces a JSON-RPC error object
     assert(j["code"].get!int == -32603);
     assert(j["message"].get!string == "boom");
     assert("data" !in j); // undefined data omitted
+}
+
+unittest  // userRejected uses the conventional -1 sampling code
+{
+    auto e = userRejected();
+    assert(e.code == -1);
+    assert(e.code == ErrorCode.userRejected);
+    assert(e.msg == "User rejected sampling request");
+}
+
+unittest  // userRejected accepts a custom message
+{
+    auto e = userRejected("nope, not this time");
+    assert(e.code == ErrorCode.userRejected);
+    assert(e.msg == "nope, not this time");
 }
 
 unittest  // toErrorJson includes data when present
