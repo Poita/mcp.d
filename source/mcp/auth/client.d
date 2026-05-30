@@ -164,6 +164,24 @@ final class OAuthClient
         return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
     }
 
+    /// RFC 8693 token exchange: swap a subject token (e.g. an IdP id_token) for
+    /// a requested token type (e.g. an ID-JAG assertion) at `tokenEndpoint`.
+    TokenSet tokenExchange(string tokenEndpoint, string subjectToken,
+            string subjectTokenType, string requestedTokenType, string audience, string clientId) @safe
+    {
+        auto form = buildTokenExchangeForm(subjectToken, subjectTokenType,
+                requestedTokenType, audience, resource, clientId);
+        return TokenSet.fromJson(postForm(tokenEndpoint, form, RegisteredClient(clientId, "")));
+    }
+
+    /// RFC 7523 JWT-bearer grant: exchange an assertion JWT for an access token.
+    TokenSet jwtBearerGrant(AuthorizationServerMetadata as_,
+            RegisteredClient client, string assertion, string scopeStr) @safe
+    {
+        auto form = buildJwtBearerForm(assertion, scopeStr, resource, client.clientId);
+        return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
+    }
+
     /// Refresh an access token.
     TokenSet refresh(AuthorizationServerMetadata as_, RegisteredClient client, string refreshToken) @safe
     {

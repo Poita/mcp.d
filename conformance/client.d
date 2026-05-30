@@ -254,7 +254,20 @@ private int runAuthScenario(string url, string scenario) @safe
     }
 
     TokenSet tokens;
-    if (scenario.canFind("client-credentials"))
+    if ("idp_id_token" in context && context["idp_id_token"].type == Json.Type.string)
+    {
+        // Cross-app access (identity-assertion grant): exchange the IdP id_token
+        // for an ID-JAG assertion, then redeem it via the JWT-bearer grant.
+        const idpToken = context["idp_id_token"].get!string;
+        const idpEndpoint = ("idp_token_endpoint" in context) ? context["idp_token_endpoint"].get!string
+            : "";
+        const idpClientId = ("idp_client_id" in context) ? context["idp_client_id"].get!string : "";
+        auto jag = oauth.tokenExchange(idpEndpoint, idpToken, "urn:ietf:params:oauth:token-type:id_token",
+                "urn:ietf:params:oauth:token-type:id-jag", issuer, idpClientId);
+        const assertion = jag.accessToken.length ? jag.accessToken : idpToken;
+        tokens = oauth.jwtBearerGrant(as_, client, assertion, scopeStr);
+    }
+    else if (scenario.canFind("client-credentials"))
         tokens = oauth.clientCredentials(as_, client, scopeStr);
     else
         tokens = authCodeFlow(oauth, as_, client, scopeStr);

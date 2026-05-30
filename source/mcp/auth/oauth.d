@@ -534,6 +534,40 @@ string buildClientCredentialsForm(string clientId, string scopeStr,
     return body_;
 }
 
+/// Build an RFC 8693 token-exchange request body (used by the cross-app /
+/// identity-assertion grant to swap an IdP id_token for an ID-JAG assertion).
+string buildTokenExchangeForm(string subjectToken, string subjectTokenType,
+        string requestedTokenType, string audience, string resource, string clientId) @safe
+{
+    auto body_ = "grant_type=" ~ enc("urn:ietf:params:oauth:grant-type:token-exchange");
+    body_ ~= "&subject_token=" ~ enc(subjectToken);
+    body_ ~= "&subject_token_type=" ~ enc(subjectTokenType);
+    if (requestedTokenType.length)
+        body_ ~= "&requested_token_type=" ~ enc(requestedTokenType);
+    if (audience.length)
+        body_ ~= "&audience=" ~ enc(audience);
+    if (resource.length)
+        body_ ~= "&resource=" ~ enc(resource);
+    if (clientId.length)
+        body_ ~= "&client_id=" ~ enc(clientId);
+    return body_;
+}
+
+/// Build an RFC 7523 JWT-bearer grant request body (exchange an assertion JWT
+/// for an access token).
+string buildJwtBearerForm(string assertion, string scopeStr, string resource, string clientId) @safe
+{
+    auto body_ = "grant_type=" ~ enc("urn:ietf:params:oauth:grant-type:jwt-bearer");
+    body_ ~= "&assertion=" ~ enc(assertion);
+    if (scopeStr.length)
+        body_ ~= "&scope=" ~ enc(scopeStr);
+    if (resource.length)
+        body_ ~= "&resource=" ~ enc(resource);
+    if (clientId.length)
+        body_ ~= "&client_id=" ~ enc(clientId);
+    return body_;
+}
+
 /// Build the token-request body for refreshing an access token.
 string buildRefreshTokenForm(string refreshToken, string clientId, string resource) @safe
 {
