@@ -358,3 +358,228 @@ version (unittest) private Json parseJson(string s) @safe
 
     return parseJsonString(s);
 }
+
+// ===========================================================================
+// Dynamic Client Registration (RFC 7591) + token types
+// ===========================================================================
+
+/// How the client authenticates at the token endpoint.
+enum TokenEndpointAuthMethod : string
+{
+    none = "none",
+    clientSecretBasic = "client_secret_basic",
+    clientSecretPost = "client_secret_post",
+}
+
+/// A Dynamic Client Registration request body (RFC 7591).
+struct ClientRegistration
+{
+    string[] redirectUris;
+    string[] grantTypes = ["authorization_code", "refresh_token"];
+    string[] responseTypes = ["code"];
+    string tokenEndpointAuthMethod = "none";
+    string clientName;
+    string scope_;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        Json ru = Json.emptyArray;
+        foreach (u; redirectUris)
+            ru ~= Json(u);
+        j["redirect_uris"] = ru;
+        Json gt = Json.emptyArray;
+        foreach (g; grantTypes)
+            gt ~= Json(g);
+        j["grant_types"] = gt;
+        Json rt = Json.emptyArray;
+        foreach (r; responseTypes)
+            rt ~= Json(r);
+        j["response_types"] = rt;
+        j["token_endpoint_auth_method"] = tokenEndpointAuthMethod;
+        if (clientName.length)
+            j["client_name"] = clientName;
+        if (scope_.length)
+            j["scope"] = scope_;
+        return j;
+    }
+}
+
+/// The credentials returned by the registration endpoint.
+struct RegisteredClient
+{
+    string clientId;
+    string clientSecret;
+
+    static RegisteredClient fromJson(Json j) @safe
+    {
+        RegisteredClient c;
+        c.clientId = strField(j, "client_id");
+        c.clientSecret = strField(j, "client_secret");
+        return c;
+    }
+}
+
+/// A token endpoint response (RFC 6749 §5.1).
+struct TokenSet
+{
+    string accessToken;
+    string tokenType;
+    long expiresIn;
+    string refreshToken;
+    string scope_;
+
+    static TokenSet fromJson(Json j) @safe
+    {
+        TokenSet t;
+        t.accessToken = strField(j, "access_token");
+        t.tokenType = strField(j, "token_type");
+        if ("expires_in" in j && j["expires_in"].type == Json.Type.int_)
+            t.expiresIn = j["expires_in"].get!long;
+        t.refreshToken = strField(j, "refresh_token");
+        t.scope_ = strField(j, "scope");
+        return t;
+    }
+}
+
+private string enc(string s) @safe
+{
+    import std.uri : encodeComponent;
+
+    return encodeComponent(s);
+}
+
+/// Build the authorization-request URL for the PKCE auth-code flow.
+string buildAuthorizationUrl(string authorizationEndpoint, string clientId,
+        string redirectUri, string codeChallenge, string scopeStr, string resource, string state) @safe
+{
+    import std.string : indexOf;
+
+    auto url = authorizationEndpoint;
+    url ~= (authorizationEndpoint.indexOf('?') < 0) ? "?" : "&";
+    url ~= "response_type=code";
+    url ~= "&client_id=" ~ enc(clientId);
+    url ~= "&redirect_uri=" ~ enc(redirectUri);
+    url ~= "&code_challenge=" ~ enc(codeChallenge);
+    url ~= "&code_challenge_method=S256";
+    if (scopeStr.length)
+        url ~= "&scope=" ~ enc(scopeStr);
+    if (resource.length)
+        url ~= "&resource=" ~ enc(resource);
+    if (state.length)
+        url ~= "&state=" ~ enc(state);
+    return url;
+}
+
+/// Build the `application/x-www-form-urlencoded` body for the authorization-code
+/// token request. `clientSecret` is included only for the `client_secret_post`
+/// auth method (pass empty otherwise).
+string buildAuthCodeTokenForm(string code, string redirectUri, string codeVerifier,
+        string clientId, string resource, string clientSecretForPost = "") @safe
+{
+    auto body_ = "grant_type=authorization_code";
+    body_ ~= "&code=" ~ enc(code);
+    body_ ~= "&redirect_uri=" ~ enc(redirectUri);
+    body_ ~= "&code_verifier=" ~ enc(codeVerifier);
+    body_ ~= "&client_id=" ~ enc(clientId);
+    if (resource.length)
+        body_ ~= "&resource=" ~ enc(resource);
+    if (clientSecretForPost.length)
+        body_ ~= "&client_secret=" ~ enc(clientSecretForPost);
+    return body_;
+}
+
+/// Build the token-request body for the `client_credentials` grant.
+string buildClientCredentialsForm(string clientId, string scopeStr,
+        string resource, string clientSecretForPost = "") @safe
+{
+    auto body_ = "grant_type=client_credentials";
+    body_ ~= "&client_id=" ~ enc(clientId);
+    if (scopeStr.length)
+        body_ ~= "&scope=" ~ enc(scopeStr);
+    if (resource.length)
+        body_ ~= "&resource=" ~ enc(resource);
+    if (clientSecretForPost.length)
+        body_ ~= "&client_secret=" ~ enc(clientSecretForPost);
+    return body_;
+}
+
+/// Build the token-request body for refreshing an access token.
+string buildRefreshTokenForm(string refreshToken, string clientId, string resource) @safe
+{
+    auto body_ = "grant_type=refresh_token";
+    body_ ~= "&refresh_token=" ~ enc(refreshToken);
+    body_ ~= "&client_id=" ~ enc(clientId);
+    if (resource.length)
+        body_ ~= "&resource=" ~ enc(resource);
+    return body_;
+}
+
+/// Build the HTTP `Authorization: Basic` header value for `client_secret_basic`.
+string basicAuthHeader(string clientId, string clientSecret) @safe
+{
+    import std.base64 : Base64;
+
+    const raw = clientId ~ ":" ~ clientSecret;
+    return "Basic " ~ () @trusted {
+        return cast(string) Base64.encode(cast(const(ubyte)[]) raw);
+    }();
+}
+
+unittest  // DCR request + responses round-trip
+{
+    ClientRegistration reg;
+    reg.redirectUris = ["http://localhost:3000/callback"];
+    reg.clientName = "dlang-mcp";
+    auto j = reg.toJson();
+    assert(j["redirect_uris"][0].get!string == "http://localhost:3000/callback");
+    assert(j["grant_types"][0].get!string == "authorization_code");
+    assert(j["token_endpoint_auth_method"].get!string == "none");
+
+    auto rc = RegisteredClient.fromJson(parseJson(`{"client_id":"abc","client_secret":"shh"}`));
+    assert(rc.clientId == "abc" && rc.clientSecret == "shh");
+
+    auto ts = TokenSet.fromJson(parseJson(
+            `{"access_token":"tok","token_type":"Bearer","expires_in":3600,"refresh_token":"r"}`));
+    assert(ts.accessToken == "tok" && ts.tokenType == "Bearer" && ts.expiresIn == 3600);
+    assert(ts.refreshToken == "r");
+}
+
+unittest  // authorization URL includes PKCE S256, resource, scope, state
+{
+    auto url = buildAuthorizationUrl("https://auth.example.com/authorize", "client1",
+            "http://localhost:3000/cb", "CHAL", "read write", "https://mcp.example.com", "xyz");
+    import std.algorithm : canFind;
+
+    assert(url.canFind("response_type=code"));
+    assert(url.canFind("code_challenge=CHAL"));
+    assert(url.canFind("code_challenge_method=S256"));
+    assert(url.canFind("client_id=client1"));
+    assert(url.canFind("scope=read%20write"));
+    assert(url.canFind("resource=https%3A%2F%2Fmcp.example.com"));
+    assert(url.canFind("state=xyz"));
+}
+
+unittest  // token request forms carry the right grant + params
+{
+    auto f = buildAuthCodeTokenForm("CODE", "http://localhost/cb", "VERIFIER",
+            "client1", "https://mcp.example.com");
+    import std.algorithm : canFind;
+
+    assert(f.canFind("grant_type=authorization_code"));
+    assert(f.canFind("code=CODE"));
+    assert(f.canFind("code_verifier=VERIFIER"));
+    assert(f.canFind("resource=https%3A%2F%2Fmcp.example.com"));
+
+    auto cc = buildClientCredentialsForm("client1", "api", "https://mcp.example.com");
+    assert(cc.canFind("grant_type=client_credentials"));
+
+    auto rf = buildRefreshTokenForm("RT", "client1", "");
+    assert(rf.canFind("grant_type=refresh_token") && rf.canFind("refresh_token=RT"));
+}
+
+unittest  // basic auth header is base64(client:secret)
+{
+    // base64("id:secret") = aWQ6c2VjcmV0
+    assert(basicAuthHeader("id", "secret") == "Basic aWQ6c2VjcmV0");
+}
