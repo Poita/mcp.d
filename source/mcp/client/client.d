@@ -68,6 +68,12 @@ final class MCPClient
     private McpException legacyErr;
     // Opt-in: validate tool results against the tool's outputSchema (client side).
     private bool validateOutputSchema_;
+    // URL-mode elicitation correlation: ids the server asked us to complete via
+    // an `elicitation/create` with `mode:"url"`, mapped to whether we have already
+    // observed their `notifications/elicitation/complete`. Used to honour the spec
+    // rule "Clients MUST ignore notifications referencing unknown or
+    // already-completed IDs."
+    private bool[string] elicitationIds_;
 
     /// Capabilities this client advertises at initialize.
     ClientCapabilities capabilities;
@@ -846,10 +852,35 @@ final class MCPClient
             handleServerRequest(msg);
             break;
         case MessageKind.notification:
-            if (onNotification !is null)
-                onNotification(msg.method, msg.params);
+            dispatchNotification(msg.method, msg.params);
             break;
         }
+    }
+
+    /// Forward an inbound notification to `onNotification`, applying the protocol
+    /// rules for notifications the SDK understands. Currently this enforces the
+    /// URL-mode elicitation rule (basic/utilities/elicitation §"Completion
+    /// Notifications for URL Mode Elicitation"): "Clients MUST ignore
+    /// notifications referencing unknown or already-completed IDs." A
+    /// `notifications/elicitation/complete` for an `elicitationId` we never issued
+    /// a URL-mode request for, or one we have already seen completed, is dropped
+    /// (never forwarded); the first valid completion for a known id is forwarded
+    /// and then marked completed. Every other notification is forwarded unchanged.
+    private void dispatchNotification(string method, Json params) @safe
+    {
+        if (method == "notifications/elicitation/complete")
+        {
+            if (params.type != Json.Type.object || "elicitationId" !in params
+                    || params["elicitationId"].type != Json.Type.string)
+                return; // malformed: no id to correlate -> ignore
+            const eid = params["elicitationId"].get!string;
+            auto seen = eid in elicitationIds_;
+            if (seen is null || *seen)
+                return; // unknown or already-completed id -> ignore per spec
+            elicitationIds_[eid] = true; // mark completed
+        }
+        if (onNotification !is null)
+            onNotification(method, params);
     }
 
     /// Dispatch a message arriving on the standalone GET SSE stream: server->
@@ -862,8 +893,7 @@ final class MCPClient
             handleServerRequest(msg);
             break;
         case MessageKind.notification:
-            if (onNotification !is null)
-                onNotification(msg.method, msg.params);
+            dispatchNotification(msg.method, msg.params);
             break;
         case MessageKind.response:
         case MessageKind.errorResponse:
@@ -1393,6 +1423,16 @@ final class MCPClient
                 }
                 if (!supported)
                     throw invalidParams("Unsupported elicitation mode: " ~ mode);
+                // Remember the id of a URL-mode request so a later
+                // notifications/elicitation/complete can be correlated; an
+                // unknown id is ignored per the spec.
+                if (mode == "url" && "elicitationId" in params
+                        && params["elicitationId"].type == Json.Type.string)
+                {
+                    const eid = params["elicitationId"].get!string;
+                    if (eid.length && eid !in elicitationIds_)
+                        elicitationIds_[eid] = false; // tracked, not yet completed
+                }
             }
             return onElicitation(params);
         case "roots/list":
@@ -1894,6 +1934,66 @@ unittest  // elicitation/create forwards an advertised mode to the delegate
 
     c.dispatchServerMethod("elicitation/create", params);
     assert(delegateCalled);
+}
+
+unittest  // elicitation/complete for a known id is forwarded once, then ignored
+{
+    auto c = new MCPClient("http://localhost");
+    c.capabilities.elicitation = true;
+    c.capabilities.elicitationForm = true;
+    c.capabilities.elicitationUrl = true;
+    c.onElicitation = (Json) @safe { return Json.emptyObject; };
+
+    // The server issues a URL-mode request; the client records the id.
+    Json create = Json.emptyObject;
+    create["mode"] = "url";
+    create["url"] = "https://example.com/elicit";
+    create["elicitationId"] = "e-known";
+    c.dispatchServerMethod("elicitation/create", create);
+
+    string[] seenMethods;
+    c.onNotification = (string method, Json) @safe { seenMethods ~= method; };
+
+    Json note = Json.emptyObject;
+    note["elicitationId"] = "e-known";
+    c.dispatchNotification("notifications/elicitation/complete", note);
+    assert(seenMethods.length == 1); // forwarded once
+
+    // A second completion for the same (already-completed) id is ignored.
+    c.dispatchNotification("notifications/elicitation/complete", note);
+    assert(seenMethods.length == 1);
+}
+
+unittest  // elicitation/complete for an unknown id is ignored
+{
+    auto c = new MCPClient("http://localhost");
+    bool forwarded;
+    c.onNotification = (string, Json) @safe { forwarded = true; };
+
+    Json note = Json.emptyObject;
+    note["elicitationId"] = "never-issued";
+    c.dispatchNotification("notifications/elicitation/complete", note);
+    assert(!forwarded);
+}
+
+unittest  // elicitation/complete without an elicitationId is ignored
+{
+    auto c = new MCPClient("http://localhost");
+    bool forwarded;
+    c.onNotification = (string, Json) @safe { forwarded = true; };
+
+    c.dispatchNotification("notifications/elicitation/complete", Json.emptyObject);
+    assert(!forwarded);
+}
+
+unittest  // other notifications are forwarded unchanged
+{
+    auto c = new MCPClient("http://localhost");
+    string forwarded;
+    c.onNotification = (string method, Json) @safe { forwarded = method; };
+
+    c.dispatchNotification("notifications/message", Json.emptyObject);
+    assert(forwarded == "notifications/message");
 }
 
 unittest  // elicitation/create defaults to form mode when mode is absent
