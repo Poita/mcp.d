@@ -11,6 +11,10 @@ import mcp.protocol.errors;
 import mcp.protocol.versions;
 import mcp.protocol.draft;
 import mcp.transport.sse_context;
+import mcp.transport.session;
+
+/// The HTTP header carrying the session id (basic/transports §Session Management).
+enum SessionHeader = "Mcp-Session-Id";
 
 /// Configuration for the Streamable HTTP server transport.
 struct StreamableHttpOptions
@@ -25,6 +29,15 @@ struct StreamableHttpOptions
     bool validateOrigin = true;
     string[] allowedHosts = []; /// extra Host header values to accept
     string[] allowedOrigins = []; /// extra Origin header values to accept
+
+    /// Enable stateful session management (basic/transports §Session Management).
+    /// When true, the server assigns a cryptographically-secure `Mcp-Session-Id`
+    /// on the response carrying the `InitializeResult`, requires that header on
+    /// every subsequent request (HTTP 400 when absent, HTTP 404 when unknown or
+    /// terminated), and honours client-driven termination via HTTP DELETE
+    /// (HTTP 404 for an unknown session). When false (the default) the transport
+    /// is stateless and never issues or checks a session id.
+    bool enableSessions = false;
 }
 
 /// Mount an `MCPServer` onto a vibe.d `URLRouter` at the configured path,
@@ -37,11 +50,12 @@ void mountMcp(URLRouter router, MCPServer server,
         StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
     auto coord = new StreamCoordinator;
+    auto sessions = opts.enableSessions ? new SessionManager : null;
 
     router.post(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
         if (!guardOrigin(req, res, opts))
             return;
-        handlePost(server, coord, req, res);
+        handlePost(server, coord, sessions, req, res);
     });
     router.get(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
         if (!guardOrigin(req, res, opts))
@@ -57,10 +71,31 @@ void mountMcp(URLRouter router, MCPServer server,
             HTTPServerResponse res) @safe {
         if (!guardOrigin(req, res, opts))
             return;
-        // The draft has no protocol-level sessions, so there is nothing to tear
-        // down: per the backward-compatibility rules, DELETE -> 405. (Also
-        // conformant for 2025-11-25, where the server simply does not allow
-        // client-driven session termination.)
+        if (sessions !is null)
+        {
+            // Session Management: a client signals it no longer needs the
+            // session via DELETE with the Mcp-Session-Id header. Terminate it
+            // and reply 204; an absent header is 400, an unknown/already-
+            // terminated session is 404.
+            const sid = req.headers.get(SessionHeader, "");
+            if (sid.length == 0)
+            {
+                res.statusCode = HTTPStatus.badRequest;
+                res.writeBody("Missing Mcp-Session-Id header", "text/plain");
+                return;
+            }
+            if (!sessions.terminate(sid))
+            {
+                res.statusCode = HTTPStatus.notFound;
+                res.writeBody("Unknown or terminated session", "text/plain");
+                return;
+            }
+            res.statusCode = HTTPStatus.noContent;
+            res.writeBody("", "text/plain");
+            return;
+        }
+        // Stateless mode has no protocol-level sessions, so there is nothing to
+        // tear down: per the backward-compatibility rules, DELETE -> 405.
         res.statusCode = HTTPStatus.methodNotAllowed;
         res.headers["Allow"] = "POST";
         res.writeBody("", "text/plain");
@@ -94,7 +129,7 @@ private bool guardOrigin(scope HTTPServerRequest req, scope HTTPServerResponse r
 }
 
 private void handlePost(MCPServer server, StreamCoordinator coord,
-        HTTPServerRequest req, HTTPServerResponse res) @safe
+        SessionManager sessions, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
     const payload = req.bodyReader.readAllUTF8();
 
@@ -111,6 +146,29 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
         res.writeBody(makeErrorResponse(Json(null), parseError(e.msg))
                 .toString(), "application/json");
         return;
+    }
+
+    // Session Management: when enabled, the very first request MUST be an
+    // `initialize` (which receives a freshly-minted Mcp-Session-Id); every
+    // later request MUST carry that id (400 when absent, 404 when unknown or
+    // terminated). The id is also issued for the InitializeResult below.
+    if (sessions !is null)
+    {
+        const isInit = !input.isBatch && input.messages.length == 1
+            && input.messages[0].method == "initialize";
+        if (!isInit)
+        {
+            const sid = req.headers.get(SessionHeader, "");
+            const status = sessionStatus(sessions, sid);
+            if (status != 0)
+            {
+                res.statusCode = cast(HTTPStatus) status;
+                res.writeBody(status == 400
+                        ? "Missing Mcp-Session-Id header" : "Unknown or terminated session",
+                        "text/plain");
+                return;
+            }
+        }
     }
 
     // Batches take the non-streaming path (no in-flight server->client traffic).
@@ -143,11 +201,15 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
         res.writeBody("", "text/plain");
         return;
     case MessageKind.request:
+        // Session Management: assign a session id on the InitializeResult so the
+        // client can echo it on subsequent requests. Set before writing the body.
+        if (sessions !is null
+                && msg.method == "initialize")
+            res.headers[SessionHeader] = sessions.create();
         // Spec (2025-06-18 / 2025-11-25 Transports): an invalid or unsupported
         // MCP-Protocol-Version header MUST be rejected with 400, independent of
         // the negotiated/draft state.
-        auto verErr = validateProtocolVersionHeader(
-                req.headers.get(HttpHeader.protocolVersion, ""));
+        auto verErr = validateProtocolVersionHeader(req.headers.get(HttpHeader.protocolVersion, ""));
         if (verErr !is null)
         {
             res.statusCode = HTTPStatus.badRequest;
@@ -198,6 +260,34 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
         }
         return;
     }
+}
+
+/// Decide the HTTP status for a non-initialize request when session management is
+/// enabled (basic/transports §Session Management):
+///   - `0`   — the session id is present and active; proceed.
+///   - `400` — no `Mcp-Session-Id` header was supplied ("Servers that require a
+///             session ID SHOULD respond to requests without an Mcp-Session-Id
+///             header (other than initialization) with HTTP 400 Bad Request").
+///   - `404` — the id names an unknown or already-terminated session ("after
+///             [termination] it MUST respond ... with HTTP 404 Not Found").
+int sessionStatus(SessionManager sessions, string sessionId) @safe
+{
+    if (sessionId.length == 0)
+        return 400;
+    if (!sessions.isActive(sessionId))
+        return 404;
+    return 0;
+}
+
+unittest  // missing session id -> 400, unknown -> 404, active -> 0
+{
+    auto mgr = new SessionManager;
+    const id = mgr.create();
+    assert(sessionStatus(mgr, "") == 400);
+    assert(sessionStatus(mgr, "bogus") == 404);
+    assert(sessionStatus(mgr, id) == 0);
+    mgr.terminate(id);
+    assert(sessionStatus(mgr, id) == 404);
 }
 
 /// Map a JSON-RPC response to the HTTP status the Streamable HTTP transport must
