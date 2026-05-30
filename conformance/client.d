@@ -57,6 +57,9 @@ private bool draftRequested() @trusted
 
 private int runScenario(string url, string scenario) @safe
 {
+    if (scenario.startsWith("auth/"))
+        return runAuthScenario(url, scenario);
+
     auto client = new MCPClient(url);
     client.capabilities.sampling = true;
     client.capabilities.elicitation = true;
@@ -173,4 +176,63 @@ private Json handleElicitation(Json params) @safe
     result["action"] = "accept";
     result["content"] = content;
     return result;
+}
+
+/// Drive the OAuth 2.1 authorization flow for `auth/*` conformance scenarios:
+/// 401 probe -> metadata discovery -> Dynamic Client Registration -> (PKCE
+/// authorization-code or client-credentials) token acquisition -> retry the MCP
+/// request with the bearer token.
+private int runAuthScenario(string url, string scenario) @safe
+{
+    import std.algorithm : canFind;
+
+    auto oauth = new OAuthClient();
+    oauth.resource = canonicalResourceUri(url);
+    oauth.redirectUri = "http://localhost:8765/callback";
+
+    const www = oauth.probeUnauthorized(url);
+    auto prm = oauth.discoverProtectedResource(url, www);
+    const issuer = prm.authorizationServers.length ? prm.authorizationServers[0] : oauth.resource;
+    auto as_ = oauth.discoverAuthServer(issuer);
+
+    // Pick the token-endpoint auth method the AS advertises (prefer none).
+    if (as_.tokenEndpointAuthMethodsSupported.canFind("none")
+            || as_.tokenEndpointAuthMethodsSupported.length == 0)
+        oauth.authMethod = TokenEndpointAuthMethod.none;
+    else if (as_.tokenEndpointAuthMethodsSupported.canFind("client_secret_basic"))
+        oauth.authMethod = TokenEndpointAuthMethod.clientSecretBasic;
+    else if (as_.tokenEndpointAuthMethodsSupported.canFind("client_secret_post"))
+        oauth.authMethod = TokenEndpointAuthMethod.clientSecretPost;
+
+    const w = parseWwwAuthenticate(www);
+    const scopeStr = selectScope(w.scope_, prm.scopesSupported.length
+            ? prm.scopesSupported : as_.scopesSupported);
+
+    auto client = oauth.register(as_, "dlang-mcp-client", scopeStr);
+
+    TokenSet tokens;
+    if (scenario.canFind("client-credentials"))
+    {
+        tokens = oauth.clientCredentials(as_, client, scopeStr);
+    }
+    else
+    {
+        auto pkce = generatePkce();
+        auto authzUrl = oauth.authorizationUrl(as_, client, pkce, scopeStr, "state-123");
+        const code = oauth.authorizeAndGetCode(authzUrl);
+        if (code.length)
+            tokens = oauth.exchangeCode(as_, client, code, pkce.verifier);
+    }
+
+    if (tokens.accessToken.length)
+    {
+        auto mcp = new MCPClient(url);
+        mcp.setBearerToken(tokens.accessToken);
+        try
+            mcp.initialize();
+        catch (Exception)
+        {
+        }
+    }
+    return 0;
 }

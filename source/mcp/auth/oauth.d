@@ -583,3 +583,33 @@ unittest  // basic auth header is base64(client:secret)
     // base64("id:secret") = aWQ6c2VjcmV0
     assert(basicAuthHeader("id", "secret") == "Basic aWQ6c2VjcmV0");
 }
+
+/// Extract a query-string parameter value from a URL (URL-decoded), or "".
+string extractQueryParam(string url, string key) @safe
+{
+    import std.string : indexOf;
+    import std.uri : decodeComponent;
+
+    const q = url.indexOf('?');
+    auto query = (q < 0) ? url : url[q + 1 .. $];
+    const needle = key ~ "=";
+    size_t i;
+    while (i < query.length)
+    {
+        const amp = query[i .. $].indexOf('&');
+        const end = (amp < 0) ? query.length : i + amp;
+        auto pair = query[i .. end];
+        if (pair.length >= needle.length && pair[0 .. needle.length] == needle)
+            return () @trusted { return decodeComponent(pair[needle.length .. $]); }();
+        i = end + 1;
+    }
+    return "";
+}
+
+unittest  // extractQueryParam pulls and decodes a parameter
+{
+    assert(extractQueryParam("http://x/cb?code=abc123&state=xyz", "code") == "abc123");
+    assert(extractQueryParam("http://x/cb?code=a%20b", "code") == "a b");
+    assert(extractQueryParam("http://x/cb?state=xyz", "code") == "");
+    assert(extractQueryParam("http://x/cb", "code") == "");
+}

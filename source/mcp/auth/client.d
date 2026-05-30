@@ -113,6 +113,49 @@ final class OAuthClient
                 redirectUri, pkce.challenge, scopeStr, resource, state);
     }
 
+    /// POST a minimal request to the MCP endpoint; if it returns 401, return the
+    /// `WWW-Authenticate` header value (else empty). Used to trigger discovery.
+    string probeUnauthorized(string mcpEndpoint) @safe
+    {
+        string www;
+        () @trusted {
+            try
+            {
+                requestHTTP(mcpEndpoint, (scope HTTPClientRequest req) {
+                    req.method = HTTPMethod.POST;
+                    req.contentType = "application/json";
+                    req.headers["Accept"] = "application/json, text/event-stream";
+                    req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}`);
+                }, (scope HTTPClientResponse res) {
+                    if (res.statusCode == 401)
+                        www = res.headers.get("WWW-Authenticate", "");
+                    res.dropBody();
+                });
+            }
+            catch (Exception)
+            {
+            }
+        }();
+        return www;
+    }
+
+    /// GET an authorization URL (without following redirects) and extract the
+    /// `code` query parameter from the `Location` response header.
+    string authorizeAndGetCode(string authzUrl) @safe
+    {
+        string code;
+        () @trusted {
+            requestHTTP(authzUrl, (scope HTTPClientRequest req) {
+                req.method = HTTPMethod.GET;
+            }, (scope HTTPClientResponse res) {
+                const loc = res.headers.get("Location", "");
+                code = extractQueryParam(loc, "code");
+                res.dropBody();
+            });
+        }();
+        return code;
+    }
+
     // --- HTTP helpers --------------------------------------------------------
 
     private bool tryGetJson(string url, out Json result) @safe
