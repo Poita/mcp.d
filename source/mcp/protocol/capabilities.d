@@ -194,7 +194,16 @@ struct ClientCapabilities
     /// sampling.context sub-capability (soft-deprecated): gates the
     /// `includeContext` values `thisServer`/`allServers`. Implies `sampling`.
     bool samplingContext;
-    bool elicitation; /// presence-only (>= 2025-06-18)
+    bool elicitation; /// presence (>= 2025-06-18); empty object => form mode only
+    /// elicitation.form submode (2025-11-25): declares support for schema-driven
+    /// form elicitation. Implies `elicitation`. An empty `elicitation` object is
+    /// equivalent to declaring form mode only, so this is treated as set when a
+    /// peer advertises a bare `{}`.
+    bool elicitationForm;
+    /// elicitation.url submode (2025-11-25): declares support for URL-mode
+    /// elicitation (`elicitUrl`). Implies `elicitation`. Servers MUST NOT send
+    /// URL-mode elicitation requests unless this is advertised.
+    bool elicitationUrl;
     /// task-augmented requests (>= 2025-11-25); client form carries only the
     /// `requests` map (its `list`/`cancel` fields are server-only).
     Nullable!TasksCapability tasks;
@@ -223,8 +232,17 @@ struct ClientCapabilities
                 s["context"] = Json.emptyObject;
             j["sampling"] = s;
         }
-        if (elicitation)
-            j["elicitation"] = Json.emptyObject;
+        if (elicitation || elicitationForm || elicitationUrl)
+        {
+            Json e = Json.emptyObject;
+            // Emit explicit submodes only when set; a bare `{}` is equivalent to
+            // declaring form mode only (backwards compatible with 2025-06-18).
+            if (elicitationForm)
+                e["form"] = Json.emptyObject;
+            if (elicitationUrl)
+                e["url"] = Json.emptyObject;
+            j["elicitation"] = e;
+        }
         if (!tasks.isNull)
             j["tasks"] = tasks.get.toJson();
         if (experimental.type == Json.Type.object)
@@ -256,7 +274,22 @@ struct ClientCapabilities
             }
         }
         if ("elicitation" in j)
+        {
             c.elicitation = true;
+            if (j["elicitation"].type == Json.Type.object && j["elicitation"].length > 0)
+            {
+                if ("form" in j["elicitation"])
+                    c.elicitationForm = true;
+                if ("url" in j["elicitation"])
+                    c.elicitationUrl = true;
+            }
+            else
+            {
+                // An empty (or non-object) elicitation declaration is equivalent
+                // to declaring form mode only.
+                c.elicitationForm = true;
+            }
+        }
         if ("tasks" in j && j["tasks"].type == Json.Type.object)
             c.tasks = TasksCapability.fromJson(j["tasks"]);
         if ("experimental" in j)
@@ -501,6 +534,80 @@ unittest  // ClientCapabilities sub-caps imply sampling presence on serializatio
     auto j = caps.toJson();
     assert("sampling" in j);
     assert(j["sampling"]["tools"].type == Json.Type.object);
+}
+
+unittest  // ClientCapabilities advertises elicitation form/url submodes (2025-11-25)
+{
+    ClientCapabilities caps;
+    caps.elicitation = true;
+    caps.elicitationForm = true;
+    caps.elicitationUrl = true;
+    auto j = caps.toJson();
+    assert(j["elicitation"].type == Json.Type.object);
+    assert(j["elicitation"]["form"].type == Json.Type.object && j["elicitation"]["form"].length == 0);
+    assert(j["elicitation"]["url"].type == Json.Type.object && j["elicitation"]["url"].length == 0);
+}
+
+unittest  // ClientCapabilities advertises URL-only elicitation mode
+{
+    ClientCapabilities caps;
+    caps.elicitation = true;
+    caps.elicitationUrl = true;
+    auto j = caps.toJson();
+    assert(j["elicitation"]["url"].type == Json.Type.object);
+    assert("form" !in j["elicitation"]);
+}
+
+unittest  // ClientCapabilities round-trips elicitation submodes
+{
+    ClientCapabilities caps;
+    caps.elicitation = true;
+    caps.elicitationForm = true;
+    caps.elicitationUrl = true;
+    auto back = ClientCapabilities.fromJson(caps.toJson());
+    assert(back.elicitation && back.elicitationForm && back.elicitationUrl);
+}
+
+unittest  // ClientCapabilities elicitation empty object => form-only (backwards compat)
+{
+    ClientCapabilities caps;
+    caps.elicitation = true;
+    auto j = caps.toJson();
+    // Backwards-compatible empty-object emission.
+    assert(j["elicitation"].type == Json.Type.object && j["elicitation"].length == 0);
+    auto back = ClientCapabilities.fromJson(j);
+    // Empty object is equivalent to declaring form mode only.
+    assert(back.elicitation && back.elicitationForm && !back.elicitationUrl);
+}
+
+unittest  // ClientCapabilities parses explicit elicitation submodes from peer payload
+{
+    Json j = Json.emptyObject;
+    Json e = Json.emptyObject;
+    e["form"] = Json.emptyObject;
+    e["url"] = Json.emptyObject;
+    j["elicitation"] = e;
+    auto back = ClientCapabilities.fromJson(j);
+    assert(back.elicitation && back.elicitationForm && back.elicitationUrl);
+}
+
+unittest  // ClientCapabilities parses url-only elicitation from peer payload
+{
+    Json j = Json.emptyObject;
+    Json e = Json.emptyObject;
+    e["url"] = Json.emptyObject;
+    j["elicitation"] = e;
+    auto back = ClientCapabilities.fromJson(j);
+    assert(back.elicitation && !back.elicitationForm && back.elicitationUrl);
+}
+
+unittest  // ClientCapabilities elicitation submodes imply elicitation presence
+{
+    ClientCapabilities caps;
+    caps.elicitationUrl = true;
+    auto j = caps.toJson();
+    assert("elicitation" in j);
+    assert(j["elicitation"]["url"].type == Json.Type.object);
 }
 
 unittest  // TasksCapability with empty `requests` map still round-trips presence
