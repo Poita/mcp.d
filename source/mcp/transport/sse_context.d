@@ -360,6 +360,10 @@ final class HttpStreamContext : RequestContext
         {
         case "sampling":
             return clientCaps.sampling;
+        case "sampling.tools":
+            return clientCaps.samplingTools;
+        case "sampling.context":
+            return clientCaps.samplingContext;
         case "elicitation":
             return clientCaps.elicitation;
         case "roots":

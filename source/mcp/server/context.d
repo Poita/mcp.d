@@ -63,6 +63,21 @@ interface RequestContext
                     "sample() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
         if (!clientSupports("sampling"))
             throw invalidRequest("Client does not support sampling");
+        // Per spec, servers MUST NOT send tool-enabled sampling requests to
+        // clients that have not declared the `sampling.tools` sub-capability.
+        if (params.type == Json.Type.object && "tools" in params
+                && !clientSupports("sampling.tools"))
+            throw invalidRequest("Client does not support tool use in sampling (sampling.tools)");
+        // The soft-deprecated `sampling.context` sub-capability gates the
+        // `includeContext` values `thisServer`/`allServers`.
+        if (params.type == Json.Type.object && "includeContext" in params
+                && params["includeContext"].type == Json.Type.string)
+        {
+            const inc = params["includeContext"].get!string;
+            if ((inc == "thisServer" || inc == "allServers") && !clientSupports("sampling.context"))
+                throw invalidRequest(
+                        "Client does not support context-enabled sampling (sampling.context)");
+        }
         return sendRequest("sampling/createMessage", params);
     }
 
