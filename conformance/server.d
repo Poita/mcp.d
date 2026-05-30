@@ -33,6 +33,8 @@ void main(string[] args)
     registerConformanceFixtures(server);
     registerResourceFixtures(server);
     registerPromptFixtures(server);
+    registerStreamingFixtures(server);
+    registerElicitationSepFixtures(server);
     server.enableLogging();
     server.enableResourceSubscriptions();
     server.setCompletionHandler((Json params) @safe {
@@ -280,4 +282,203 @@ private void registerPromptFixtures(MCPServer server) @safe
         ];
         return r;
     });
+}
+
+/// Streaming fixtures: progress, logging, sampling, elicitation.
+private void registerStreamingFixtures(MCPServer server) @safe
+{
+    import core.time : msecs;
+    import vibe.core.core : sleep;
+    import std.typecons : nullable, Nullable;
+
+    // tools-call-with-progress: emit 0/50/100 progress (when a token is present).
+    Tool progressTool = {
+        name: "test_tool_with_progress", description: nullable("Reports progress")
+    };
+    server.registerTool(progressTool, (Json args, RequestContext ctx) @safe {
+        ctx.reportProgress(0, nullable(100.0));
+        sleep(50.msecs);
+        ctx.reportProgress(50, nullable(100.0));
+        sleep(50.msecs);
+        ctx.reportProgress(100, nullable(100.0));
+        CallToolResult r;
+        r.content = [Content.makeText("Progress complete")];
+        return r;
+    });
+
+    // tools-call-with-logging: 3 info logs during execution.
+    Tool loggingTool = {
+        name: "test_tool_with_logging", description: nullable("Logs during execution")
+    };
+    server.registerTool(loggingTool, (Json args, RequestContext ctx) @safe {
+        ctx.log("info", Json("Tool execution started"));
+        sleep(50.msecs);
+        ctx.log("info", Json("Tool processing data"));
+        sleep(50.msecs);
+        ctx.log("info", Json("Tool execution completed"));
+        CallToolResult r;
+        r.content = [Content.makeText("Logging complete")];
+        return r;
+    });
+
+    // tools-call-sampling: ask the client to sample an LLM completion.
+    Tool samplingTool = {
+        name: "test_sampling", description: nullable("Requests LLM sampling")
+    };
+    server.registerTool(samplingTool, (Json args, RequestContext ctx) @safe {
+        const prompt = ("prompt" in args) ? args["prompt"].get!string : "";
+        Json msg = Json.emptyObject;
+        msg["role"] = "user";
+        msg["content"] = Json(["type": Json("text"), "text": Json(prompt)]);
+        Json params = Json.emptyObject;
+        params["messages"] = Json([msg]);
+        params["maxTokens"] = 100;
+        auto result = ctx.sample(params);
+        string text;
+        if ("content" in result && "text" in result["content"])
+            text = result["content"]["text"].get!string;
+        CallToolResult r;
+        r.content = [Content.makeText("LLM response: " ~ text)];
+        return r;
+    });
+
+    // tools-call-elicitation: ask the client to elicit user input.
+    Tool elicitTool = {
+        name: "test_elicitation", description: nullable("Requests user input")
+    };
+    server.registerTool(elicitTool, (Json args, RequestContext ctx) @safe {
+        const message = ("message" in args) ? args["message"].get!string : "";
+        Json schema = Json.emptyObject;
+        schema["type"] = "object";
+        Json props = Json.emptyObject;
+        props["username"] = Json([
+            "type": Json("string"),
+            "description": Json("User's response")
+        ]);
+        props["email"] = Json([
+            "type": Json("string"),
+            "description": Json("User's email address")
+        ]);
+        schema["properties"] = props;
+        schema["required"] = Json([Json("username"), Json("email")]);
+
+        auto result = ctx.elicit(message, schema);
+        const action = ("action" in result) ? result["action"].get!string : "";
+        const content = ("content" in result) ? result["content"] : Json.emptyObject;
+        CallToolResult r;
+        r.content = [
+            Content.makeText("User response: action: " ~ action ~ ", content: " ~ content.toString())
+        ];
+        return r;
+    });
+}
+
+/// SEP-1034 (defaults) and SEP-1330 (enum variants) elicitation fixtures.
+private void registerElicitationSepFixtures(MCPServer server) @safe
+{
+    import std.typecons : nullable;
+
+    Tool defaults = {
+        name: "test_elicitation_sep1034_defaults", description: nullable(
+                "Elicitation with default values for all primitive types")
+    };
+    server.registerTool(defaults, (Json args, RequestContext ctx) @safe {
+        Json props = Json.emptyObject;
+        props["name"] = Json([
+            "type": Json("string"),
+            "default": Json("John Doe")
+        ]);
+        props["age"] = Json(["type": Json("integer"), "default": Json(30)]);
+        props["score"] = Json(["type": Json("number"), "default": Json(95.5)]);
+        Json status = Json.emptyObject;
+        status["type"] = "string";
+        status["enum"] = Json([
+            Json("active"), Json("inactive"), Json("pending")
+        ]);
+        status["default"] = "active";
+        props["status"] = status;
+        props["verified"] = Json([
+            "type": Json("boolean"),
+            "default": Json(true)
+        ]);
+
+        Json schema = Json.emptyObject;
+        schema["type"] = "object";
+        schema["properties"] = props;
+
+        auto result = ctx.elicit("Please provide your details", schema);
+        return elicitationResultText(result);
+    });
+
+    Tool enums = {
+        name: "test_elicitation_sep1330_enums", description: nullable(
+                "Elicitation with all enum schema variants")
+    };
+    server.registerTool(enums, (Json args, RequestContext ctx) @safe {
+        Json props = Json.emptyObject;
+
+        // 1. Untitled single-select.
+        props["untitledSingle"] = Json([
+            "type": Json("string"),
+            "enum": Json([Json("option1"), Json("option2"), Json("option3")])
+        ]);
+
+        // 2. Titled single-select (oneOf with const+title).
+        Json titledSingle = Json.emptyObject;
+        titledSingle["type"] = "string";
+        titledSingle["oneOf"] = Json([
+            Json(["const": Json("value1"), "title": Json("First Option")]),
+            Json(["const": Json("value2"), "title": Json("Second Option")]),
+            Json(["const": Json("value3"), "title": Json("Third Option")])
+        ]);
+        props["titledSingle"] = titledSingle;
+
+        // 3. Single-select with enumNames.
+        Json named = Json.emptyObject;
+        named["type"] = "string";
+        named["enum"] = Json([Json("a"), Json("b"), Json("c")]);
+        named["enumNames"] = Json([Json("Alpha"), Json("Beta"), Json("Gamma")]);
+        props["legacyEnum"] = named;
+
+        // 4. Untitled multi-select.
+        Json multi = Json.emptyObject;
+        multi["type"] = "array";
+        multi["items"] = Json([
+            "type": Json("string"),
+            "enum": Json([Json("option1"), Json("option2"), Json("option3")])
+        ]);
+        props["untitledMulti"] = multi;
+
+        // 5. Titled multi-select (items.anyOf with const+title).
+        Json titledMulti = Json.emptyObject;
+        titledMulti["type"] = "array";
+        Json items = Json.emptyObject;
+        items["anyOf"] = Json([
+            Json(["const": Json("value1"), "title": Json("First Choice")]),
+            Json(["const": Json("value2"), "title": Json("Second Choice")]),
+            Json(["const": Json("value3"), "title": Json("Third Choice")])
+        ]);
+        titledMulti["items"] = items;
+        props["titledMulti"] = titledMulti;
+
+        Json schema = Json.emptyObject;
+        schema["type"] = "object";
+        schema["properties"] = props;
+
+        auto result = ctx.elicit("Please make your selections", schema);
+        return elicitationResultText(result);
+    });
+}
+
+/// Format an elicitation result as the text the SEP scenarios expect.
+private CallToolResult elicitationResultText(Json result) @safe
+{
+    const action = ("action" in result) ? result["action"].get!string : "";
+    const content = ("content" in result) ? result["content"] : Json.emptyObject;
+    CallToolResult r;
+    r.content = [
+        Content.makeText(
+                "Elicitation completed: action=" ~ action ~ ", content=" ~ content.toString())
+    ];
+    return r;
 }

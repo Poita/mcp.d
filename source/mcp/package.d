@@ -11,5 +11,7 @@ public import mcp.protocol.errors;
 public import mcp.protocol.jsonrpc;
 public import mcp.protocol.capabilities;
 public import mcp.protocol.types;
+public import mcp.server.context;
 public import mcp.server.server;
+public import mcp.transport.sse_context;
 public import mcp.transport.streamable_http;

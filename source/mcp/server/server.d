@@ -8,14 +8,18 @@ import mcp.protocol.errors;
 import mcp.protocol.jsonrpc;
 import mcp.protocol.capabilities;
 import mcp.protocol.types;
+import mcp.server.context;
 
 @safe:
+
+/// A tool handler receiving the parsed arguments and the per-request context.
+alias ToolHandler = CallToolResult delegate(Json arguments, RequestContext ctx) @safe;
 
 /// A registered tool: its descriptor plus the handler that executes it.
 struct RegisteredTool
 {
     Tool descriptor;
-    CallToolResult delegate(Json arguments) @safe handler;
+    ToolHandler handler;
 }
 
 /// A registered direct resource: descriptor + reader producing its contents.
@@ -76,10 +80,25 @@ final class MCPServer
         return negotiated;
     }
 
-    /// Register a tool with its execution handler.
-    void registerTool(Tool descriptor, CallToolResult delegate(Json) @safe handler) @safe
+    /// Register a tool with a context-aware handler (progress / logging /
+    /// sampling / elicitation available via `ctx`).
+    void registerTool(Tool descriptor, ToolHandler handler) @safe
     {
         tools[descriptor.name] = RegisteredTool(descriptor, handler);
+    }
+
+    /// Register a tool with a simple handler that ignores the request context.
+    void registerTool(Tool descriptor, CallToolResult delegate(Json) @safe handler) @safe
+    {
+        tools[descriptor.name] = RegisteredTool(descriptor, (Json args,
+                RequestContext) => handler(args));
+    }
+
+    /// The capabilities advertised by the connected client (valid after
+    /// `initialize`).
+    ClientCapabilities clientCapabilities() const @safe
+    {
+        return clientCaps;
     }
 
     /// Register a direct resource with a reader for its contents.
@@ -153,12 +172,14 @@ final class MCPServer
 
     /// Dispatch a single parsed message. Returns the JSON-RPC response for
     /// requests, or `Nullable.init` for notifications (which get no reply).
-    Nullable!Json handle(Message msg) @safe
+    /// `ctx` is the channel for any server->client traffic the handler emits;
+    /// when omitted, a `NullContext` is used (no streaming).
+    Nullable!Json handle(Message msg, RequestContext ctx) @safe
     {
         final switch (msg.kind)
         {
         case MessageKind.request:
-            return nullable(handleRequest(msg));
+            return nullable(handleRequest(msg, ctx));
         case MessageKind.notification:
             handleNotification(msg);
             return Nullable!Json.init;
@@ -167,6 +188,12 @@ final class MCPServer
             // A server core does not expect inbound responses on this path.
             return Nullable!Json.init;
         }
+    }
+
+    /// Convenience overload using a `NullContext` (no server->client channel).
+    Nullable!Json handle(Message msg) @safe
+    {
+        return handle(msg, new NullContext);
     }
 
     /// Process a raw wire payload (single message or batch) and return the raw
@@ -201,11 +228,11 @@ final class MCPServer
         return responses.length == 0 ? "" : responses.toString();
     }
 
-    private Json handleRequest(Message msg) @safe
+    private Json handleRequest(Message msg, RequestContext ctx) @safe
     {
         try
         {
-            auto result = route(msg.method, msg.params);
+            auto result = route(msg.method, msg.params, ctx);
             return makeResponse(msg.id, result);
         }
         catch (McpException e)
@@ -226,7 +253,7 @@ final class MCPServer
         }
     }
 
-    private Json route(string method, Json params) @safe
+    private Json route(string method, Json params, RequestContext ctx) @safe
     {
         switch (method)
         {
@@ -237,7 +264,7 @@ final class MCPServer
         case "tools/list":
             return doListTools(params);
         case "tools/call":
-            return doCallTool(params);
+            return doCallTool(params, ctx);
         case "resources/list":
             return doListResources(params);
         case "resources/templates/list":
@@ -386,7 +413,7 @@ final class MCPServer
         return result.toJson();
     }
 
-    private Json doCallTool(Json params) @safe
+    private Json doCallTool(Json params, RequestContext ctx) @safe
     {
         if ("name" !in params || params["name"].type != Json.Type.string)
             throw invalidParams("tools/call requires a string 'name'");
@@ -397,7 +424,7 @@ final class MCPServer
 
         Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
         try
-            return entry.handler(args).toJson();
+            return entry.handler(args, ctx).toJson();
         catch (McpException e)
             throw e; // protocol-level errors propagate as JSON-RPC errors
         catch (Exception e)

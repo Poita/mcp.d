@@ -3,8 +3,12 @@ module mcp.transport.streamable_http;
 import vibe.http.server;
 import vibe.http.router : URLRouter;
 import vibe.stream.operations : readAllUTF8;
+import vibe.data.json : Json;
 
 import mcp.server.server;
+import mcp.protocol.jsonrpc;
+import mcp.protocol.errors;
+import mcp.transport.sse_context;
 
 /// Configuration for the Streamable HTTP server transport.
 struct StreamableHttpOptions
@@ -30,21 +34,24 @@ struct StreamableHttpOptions
 void mountMcp(URLRouter router, MCPServer server,
         StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
-    router.post(opts.path, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+    auto coord = new StreamCoordinator;
+
+    router.post(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
         if (!guardOrigin(req, res, opts))
             return;
-        handlePost(server, req, res);
+        handlePost(server, coord, req, res);
     });
-    router.get(opts.path, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+    router.get(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
         if (!guardOrigin(req, res, opts))
             return;
-        // No server-initiated SSE stream offered by the core yet.
+        // No standalone server-initiated SSE stream yet; server->client traffic
+        // flows on the SSE response to the relevant POST.
         res.statusCode = HTTPStatus.methodNotAllowed;
         res.headers["Allow"] = "POST, DELETE";
         res.writeBody("", "text/plain");
     });
-    router.match(HTTPMethod.DELETE, opts.path, (scope HTTPServerRequest req,
-            scope HTTPServerResponse res) @safe {
+    router.match(HTTPMethod.DELETE, opts.path, (HTTPServerRequest req,
+            HTTPServerResponse res) @safe {
         if (!guardOrigin(req, res, opts))
             return;
         res.statusCode = HTTPStatus.noContent;
@@ -78,18 +85,65 @@ private bool guardOrigin(scope HTTPServerRequest req, scope HTTPServerResponse r
     return true;
 }
 
-private void handlePost(MCPServer server, scope HTTPServerRequest req, scope HTTPServerResponse res) @safe
+private void handlePost(MCPServer server, StreamCoordinator coord,
+        HTTPServerRequest req, HTTPServerResponse res) @safe
 {
     const payload = req.bodyReader.readAllUTF8();
-    const responseText = server.handleRaw(payload);
-    if (responseText.length == 0)
+
+    ParsedInput input;
+    try
+        input = parseAny(payload);
+    catch (McpException e)
     {
-        // Notifications/responses only: nothing to return.
+        res.writeBody(makeErrorResponse(Json(null), e).toString(), "application/json");
+        return;
+    }
+    catch (Exception e)
+    {
+        res.writeBody(makeErrorResponse(Json(null), parseError(e.msg))
+                .toString(), "application/json");
+        return;
+    }
+
+    // Batches take the non-streaming path (no in-flight server->client traffic).
+    if (input.isBatch)
+    {
+        const txt = server.handleRaw(payload);
+        if (txt.length == 0)
+        {
+            res.statusCode = HTTPStatus.accepted;
+            res.writeBody("", "text/plain");
+        }
+        else
+            res.writeBody(txt, "application/json");
+        return;
+    }
+
+    auto msg = input.messages[0];
+    final switch (msg.kind)
+    {
+    case MessageKind.response:
+    case MessageKind.errorResponse:
+        // A client's reply to a server->client request: route it to the waiter.
+        coord.resolve(msg.id, msg.result, msg.error);
         res.statusCode = HTTPStatus.accepted;
         res.writeBody("", "text/plain");
         return;
+    case MessageKind.notification:
+        server.handle(msg);
+        res.statusCode = HTTPStatus.accepted;
+        res.writeBody("", "text/plain");
+        return;
+    case MessageKind.request:
+        auto ctx = new HttpStreamContext(res, coord,
+                server.clientCapabilities, extractProgressToken(msg.params));
+        auto resp = server.handle(msg, ctx);
+        if (ctx.streaming)
+            ctx.finishWith(resp.get);
+        else
+            res.writeBody(resp.get.toString(), "application/json");
+        return;
     }
-    res.writeBody(responseText, "application/json");
 }
 
 /// Whether a `Host` header value (e.g. "127.0.0.1:3000") is localhost or listed.
