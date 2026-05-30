@@ -102,7 +102,33 @@ private P marshalScalar(P)(Json v) @safe
         return () @trusted { return deserializeJson!P(v); }();
 }
 
-/// Wrap a tool method's return value into a `CallToolResult`.
+/// The JSON Schema describing a tool's structured output, derived from its
+/// return type — or `Json.undefined` when the tool produces unstructured text
+/// (a `string`) or supplies its own `CallToolResult`. Aggregate (`struct`)
+/// returns map to their object schema directly; scalar/array/enum returns are
+/// wrapped under a `result` property so `structuredContent` is always an object.
+private Json outputSchemaOf(R)() @safe
+{
+    static if (is(R == CallToolResult) || isSomeString!R || is(R == void))
+        return Json.undefined;
+    else static if (is(R == struct))
+        return jsonSchemaOf!R;
+    else
+    {
+        Json s = Json.emptyObject;
+        s["type"] = "object";
+        Json props = Json.emptyObject;
+        props["result"] = jsonSchemaOf!R;
+        s["properties"] = props;
+        s["required"] = Json([Json("result")]);
+        return s;
+    }
+}
+
+/// Wrap a tool method's return value into a `CallToolResult`. The structured
+/// result mirrors `outputSchemaOf!R`: structs serialize to an object; scalars,
+/// arrays, and enums are wrapped under a `result` key; strings become text
+/// content with no structured output.
 private CallToolResult toToolResult(R)(R ret) @safe
 {
     static if (is(R == CallToolResult))
@@ -115,10 +141,14 @@ private CallToolResult toToolResult(R)(R ret) @safe
     }
     else
     {
-        import std.conv : to;
-
         CallToolResult r;
-        auto structured = () @trusted { return serializeToJson(ret); }();
+        static if (is(R == struct))
+            auto structured = () @trusted { return serializeToJson(ret); }();
+        else
+        {
+            Json structured = Json.emptyObject;
+            structured["result"] = () @trusted { return serializeToJson(ret); }();
+        }
         r.structuredContent = structured;
         r.content = [Content.makeText(structured.toString())];
         return r;
@@ -128,11 +158,16 @@ private CallToolResult toToolResult(R)(R ret) @safe
 private void registerToolMethod(T, string memberName, alias overload)(
         MCPServer server, T obj, tool attr) @safe
 {
+    import std.traits : ReturnType;
+
     Tool descriptor;
     descriptor.name = attr.name;
     if (attr.description.length)
         descriptor.description = nullable(attr.description);
     descriptor.inputSchema = parametersSchema!overload();
+    auto outSchema = outputSchemaOf!(ReturnType!overload)();
+    if (outSchema.type == Json.Type.object)
+        descriptor.outputSchema = outSchema;
 
     server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
         alias names = ParameterIdentifierTuple!overload;
@@ -254,12 +289,30 @@ version (unittest)
         high
     }
 
+    private struct Stats
+    {
+        int count;
+        double total;
+    }
+
     private final class DemoApi
     {
         @tool("add", "Add two integers")
         int add(int a, int b) @safe
         {
             return a + b;
+        }
+
+        @tool("stats", "Summarize a list of integers")
+        Stats stats(int[] values) @safe
+        {
+            Stats s;
+            foreach (v; values)
+            {
+                s.count++;
+                s.total += v;
+            }
+            return s;
         }
 
         @tool("greet", "Greet someone")
@@ -297,14 +350,65 @@ unittest  // @tool reflection: schema derivation + typed dispatch
 
     Json lp = Json.emptyObject;
     auto list = s.handle(Message(makeRequest(Json(1), "tools/list", lp))).get;
-    assert(list["result"]["tools"].length == 3);
+    assert(list["result"]["tools"].length == 4);
 
-    // add -> structured integer result
+    // add -> scalar return wrapped under `result`, with an inferred outputSchema.
     Json p = Json.emptyObject;
     p["name"] = "add";
     p["arguments"] = Json(["a": Json(4), "b": Json(5)]);
     auto r = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
-    assert(r["result"]["structuredContent"].get!int == 9);
+    assert(r["result"]["structuredContent"]["result"].get!int == 9);
+}
+
+unittest  // @tool reflection: outputSchema is inferred from the return type
+{
+    import mcp.protocol.jsonrpc : Message, makeRequest;
+
+    auto s = new MCPServer("t", "1");
+    registerHandlers(s, new DemoApi);
+    auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+            Json.emptyObject))).get["result"]["tools"];
+
+    Json addSchema, statsSchema, greetTool;
+    foreach (i; 0 .. tools.length)
+    {
+        const name = tools[i]["name"].get!string;
+        if (name == "add")
+            addSchema = tools[i]["outputSchema"];
+        else if (name == "stats")
+            statsSchema = tools[i]["outputSchema"];
+        else if (name == "greet")
+            greetTool = tools[i];
+    }
+
+    // Scalar return -> object schema wrapping the value under `result`.
+    assert(addSchema["type"].get!string == "object");
+    assert(addSchema["properties"]["result"]["type"].get!string == "integer");
+
+    // Struct return -> the struct's object schema directly.
+    assert(statsSchema["type"].get!string == "object");
+    assert(statsSchema["properties"]["count"]["type"].get!string == "integer");
+    assert(statsSchema["properties"]["total"]["type"].get!string == "number");
+
+    // String return -> unstructured text, no outputSchema.
+    assert("outputSchema" !in greetTool);
+}
+
+unittest  // @tool reflection: struct return produces matching structuredContent
+{
+    import mcp.protocol.jsonrpc : Message, makeRequest;
+
+    auto s = new MCPServer("t", "1");
+    registerHandlers(s, new DemoApi);
+    Json p = Json.emptyObject;
+    p["name"] = "stats";
+    p["arguments"] = Json(["values": Json([Json(2), Json(3), Json(5)])]);
+    auto r = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
+    assert(r["result"]["structuredContent"]["count"].get!int == 3);
+    // `total` (a double) serializes as a JSON number; just confirm it's present
+    // and numeric (int/float representation is vibe's choice for whole values).
+    auto total = r["result"]["structuredContent"]["total"];
+    assert(total.type == Json.Type.float_ || total.type == Json.Type.int_);
 }
 
 unittest  // @tool reflection: string return becomes text content

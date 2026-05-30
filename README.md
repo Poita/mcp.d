@@ -52,15 +52,18 @@ dub run dscanner -- --styleCheck source/
 
 ## Example: a server with the ergonomic UDA API
 
-Write plain typed D methods and annotate them — the JSON Schema is derived from
-the parameter types and the arguments are marshalled for you (FastMCP-style):
+Write plain typed D methods and annotate them — both the **input schema** (from
+the parameter types) and the **output schema** (from the return type) are derived
+automatically, and arguments/results are marshalled for you (FastMCP-style):
 
 ```d
 import mcp;
 import std.typecons : Nullable;
 
-/// Each annotated method becomes an MCP feature. The input schema is generated
-/// from the parameter types; `Nullable!T` parameters are optional.
+/// Each annotated method becomes an MCP feature. The `inputSchema` is generated
+/// from the parameter types (`Nullable!T` params are optional); the `outputSchema`
+/// is generated from the return type (a struct → its object schema; a scalar/
+/// array → wrapped under `result`; a plain `string` → unstructured text content).
 final class MyServer
 {
     @tool("add", "Add two integers")
