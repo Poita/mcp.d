@@ -122,6 +122,9 @@ final class MCPServer
     private bool initialized;
     private long cacheTtlMs;
     private CacheScope cacheScope_ = CacheScope.public_;
+    // Maximum number of items returned per `*/list` page. 0 (the default) means
+    // unbounded: the full list is returned in a single response with no cursor.
+    private size_t pageSize_;
     private bool[string] listenFilters;
     private ServerPushChannel pushChannel;
     private bool toolListChangedEnabled;
@@ -675,6 +678,25 @@ final class MCPServer
         cacheScope_ = scope_;
     }
 
+    /// Set the maximum number of items returned per `*/list` page
+    /// (server/utilities/pagination). When `size > 0`, `tools/list`,
+    /// `resources/list`, `resources/templates/list` and `prompts/list` return at
+    /// most `size` items per response and emit an opaque `nextCursor` whenever
+    /// more results remain; the client passes that cursor back as `params.cursor`
+    /// to fetch the next page (the bundled `MCPClient` list helpers follow these
+    /// cursors automatically). A `size` of `0` (the default) disables pagination:
+    /// each list returns its full contents in a single response with no cursor.
+    void setPageSize(size_t size) @safe
+    {
+        pageSize_ = size;
+    }
+
+    /// The current `*/list` page size (`0` = unbounded; see `setPageSize`).
+    size_t pageSize() const @safe
+    {
+        return pageSize_;
+    }
+
     /// Apply the draft cacheable-result fields when the effective version is
     /// draft+. A no-op for earlier versions.
     private Json maybeCache(Json result) @safe
@@ -682,6 +704,70 @@ final class MCPServer
         if (effectiveVersion.cacheableResults)
             return withCache(result, cacheTtlMs, cacheScope_);
         return result;
+    }
+
+    /// Encode an offset into the opaque pagination cursor handed to the client.
+    /// The format is intentionally opaque per spec ("Clients MUST treat cursors
+    /// as opaque tokens"); we base64url-encode the decimal offset.
+    private static string encodeCursor(size_t offset) @safe
+    {
+        import std.conv : to;
+        import std.string : representation;
+        import mcp.auth.oauth : base64UrlNoPad;
+
+        return base64UrlNoPad(offset.to!string.representation);
+    }
+
+    /// Decode a pagination cursor previously produced by `encodeCursor`. Throws
+    /// `invalidParams` (-32602) for a malformed cursor, per the pagination spec
+    /// ("If the cursor is invalid ... SHOULD return ... Invalid params").
+    private static size_t decodeCursor(string cursor) @safe
+    {
+        import std.base64 : Base64URLNoPadding, Base64Exception;
+        import std.conv : to, ConvException;
+
+        try
+        {
+            auto decoded = () @trusted {
+                return cast(string) Base64URLNoPadding.decode(cursor);
+            }();
+            return decoded.to!size_t;
+        }
+        catch (Base64Exception)
+            throw invalidParams("Invalid pagination cursor");
+        catch (ConvException)
+            throw invalidParams("Invalid pagination cursor");
+    }
+
+    /// Compute the slice `[begin, end)` of a sorted list of `total` items for the
+    /// page requested by `params.cursor`, honouring the configured page size.
+    /// When more items remain after `end`, `next` is set to the cursor for the
+    /// following page (otherwise left null). With pagination disabled
+    /// (`pageSize_ == 0`) the whole list is returned and `next` stays null.
+    /// Throws `invalidParams` for a malformed or out-of-range cursor.
+    private void pageBounds(Json params, size_t total, out size_t begin,
+            out size_t end, out Nullable!string next) @safe
+    {
+        begin = 0;
+        if (params.type == Json.Type.object && "cursor" in params
+                && params["cursor"].type == Json.Type.string)
+        {
+            begin = decodeCursor(params["cursor"].get!string);
+            // A cursor pointing past the end of the (now possibly shorter) list
+            // is invalid rather than silently returning an empty final page.
+            if (begin > total)
+                throw invalidParams("Invalid pagination cursor");
+        }
+
+        if (pageSize_ == 0 || begin + pageSize_ >= total)
+        {
+            end = total;
+        }
+        else
+        {
+            end = begin + pageSize_;
+            next = encodeCursor(end);
+        }
     }
 
     /// Build the draft `UnsupportedProtocolVersionError` (-32004) listing the
@@ -806,23 +892,33 @@ final class MCPServer
         return (changeType in listenFilters) !is null;
     }
 
-    private Json doListResources(Json /* params */ ) @safe
+    private Json doListResources(Json params) @safe
     {
         import std.algorithm : sort;
 
-        ListResourcesResult result;
         auto uris = resources.keys;
         sort(uris);
-        foreach (uri; uris)
+        size_t begin, end;
+        Nullable!string next;
+        pageBounds(params, uris.length, begin, end, next);
+
+        ListResourcesResult result;
+        foreach (uri; uris[begin .. end])
             result.resources ~= resources[uri].descriptor;
+        result.nextCursor = next;
         return maybeCache(result.toJson());
     }
 
-    private Json doListResourceTemplates(Json /* params */ ) @safe
+    private Json doListResourceTemplates(Json params) @safe
     {
+        size_t begin, end;
+        Nullable!string next;
+        pageBounds(params, templates.length, begin, end, next);
+
         ListResourceTemplatesResult result;
-        foreach (t; templates)
+        foreach (t; templates[begin .. end])
             result.resourceTemplates ~= t.descriptor;
+        result.nextCursor = next;
         return maybeCache(result.toJson());
     }
 
@@ -874,15 +970,20 @@ final class MCPServer
         return Json.emptyObject;
     }
 
-    private Json doListPrompts(Json /* params */ ) @safe
+    private Json doListPrompts(Json params) @safe
     {
         import std.algorithm : sort;
 
-        ListPromptsResult result;
         auto names = prompts.keys;
         sort(names);
-        foreach (name; names)
+        size_t begin, end;
+        Nullable!string next;
+        pageBounds(params, names.length, begin, end, next);
+
+        ListPromptsResult result;
+        foreach (name; names[begin .. end])
             result.prompts ~= prompts[name].descriptor;
+        result.nextCursor = next;
         return maybeCache(result.toJson());
     }
 
@@ -948,11 +1049,17 @@ final class MCPServer
         return result.toJson();
     }
 
-    private Json doListTools(Json /* params */ ) @safe
+    private Json doListTools(Json params) @safe
     {
+        auto names = sortedToolNames();
+        size_t begin, end;
+        Nullable!string next;
+        pageBounds(params, names.length, begin, end, next);
+
         ListToolsResult result;
-        foreach (name; sortedToolNames())
+        foreach (name; names[begin .. end])
             result.tools ~= tools[name].descriptor;
+        result.nextCursor = next;
         return maybeCache(result.toJson());
     }
 
@@ -2542,4 +2649,201 @@ unittest  // draft: notifyPromptsListChanged suppressed unless client opted in
     p["promptsListChanged"] = true;
     s.handle(req(1, "subscriptions/listen", p));
     assert(s.notifyPromptsListChanged() == 1);
+}
+
+version (unittest)
+{
+    // Extract the names from a list result's items array (handler returns @safe).
+    private string[] itemNames(Json items, string field) @safe
+    {
+        string[] names;
+        foreach (i; 0 .. items.length)
+            names ~= items[i][field].get!string;
+        return names;
+    }
+}
+
+unittest  // setPageSize paginates tools/list across cursor-following pages
+{
+    import std.conv : to;
+
+    auto s = new MCPServer("t", "1");
+    foreach (i; 0 .. 5)
+    {
+        Tool tool = {name: "tool" ~ i.to!string};
+        s.registerTool(tool, (Json) @safe {
+            CallToolResult r;
+            r.content = [Content.makeText("ok")];
+            return r;
+        });
+    }
+    s.setPageSize(2);
+
+    // First page: 2 tools + a nextCursor.
+    auto page1 = s.handle(req(1, "tools/list")).get;
+    assert(page1["result"]["tools"].length == 2);
+    assert(page1["result"]["nextCursor"].type == Json.Type.string);
+    const cursor1 = page1["result"]["nextCursor"].get!string;
+
+    // Second page via the cursor: next 2 + another nextCursor.
+    Json p2 = Json.emptyObject;
+    p2["cursor"] = cursor1;
+    auto page2 = s.handle(req(2, "tools/list", p2)).get;
+    assert(page2["result"]["tools"].length == 2);
+    assert(page2["result"]["nextCursor"].type == Json.Type.string);
+    const cursor2 = page2["result"]["nextCursor"].get!string;
+
+    // Final page: the last tool, no nextCursor.
+    Json p3 = Json.emptyObject;
+    p3["cursor"] = cursor2;
+    auto page3 = s.handle(req(3, "tools/list", p3)).get;
+    assert(page3["result"]["tools"].length == 1);
+    assert("nextCursor" !in page3["result"]);
+}
+
+unittest  // without setPageSize, tools/list returns everything in one page (no cursor)
+{
+    import std.conv : to;
+
+    auto s = new MCPServer("t", "1");
+    foreach (i; 0 .. 5)
+    {
+        Tool tool = {name: "tool" ~ i.to!string};
+        s.registerTool(tool, (Json) @safe {
+            CallToolResult r;
+            r.content = [Content.makeText("ok")];
+            return r;
+        });
+    }
+    auto resp = s.handle(req(1, "tools/list")).get;
+    assert(resp["result"]["tools"].length == 5);
+    assert("nextCursor" !in resp["result"]);
+}
+
+unittest  // setPageSize paginates resources/list
+{
+    import std.conv : to;
+
+    auto s = new MCPServer("t", "1");
+    foreach (i; 0 .. 3)
+    {
+        Resource r = {uri: "test://r" ~ i.to!string, name: "r"};
+        s.registerResource(r, () @safe => ResourceContents.makeText("test://r", "text/plain", "x"));
+    }
+    s.setPageSize(2);
+
+    auto p1 = s.handle(req(1, "resources/list")).get;
+    assert(p1["result"]["resources"].length == 2);
+    const c = p1["result"]["nextCursor"].get!string;
+
+    Json p = Json.emptyObject;
+    p["cursor"] = c;
+    auto p2 = s.handle(req(2, "resources/list", p)).get;
+    assert(p2["result"]["resources"].length == 1);
+    assert("nextCursor" !in p2["result"]);
+}
+
+unittest  // setPageSize paginates prompts/list
+{
+    import std.conv : to;
+
+    auto s = new MCPServer("t", "1");
+    foreach (i; 0 .. 3)
+    {
+        Prompt pr = {name: "p" ~ i.to!string};
+        s.registerPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
+    }
+    s.setPageSize(2);
+
+    auto p1 = s.handle(req(1, "prompts/list")).get;
+    assert(p1["result"]["prompts"].length == 2);
+    const c = p1["result"]["nextCursor"].get!string;
+
+    Json p = Json.emptyObject;
+    p["cursor"] = c;
+    auto p2 = s.handle(req(2, "prompts/list", p)).get;
+    assert(p2["result"]["prompts"].length == 1);
+    assert("nextCursor" !in p2["result"]);
+}
+
+unittest  // setPageSize paginates resources/templates/list
+{
+    import std.conv : to;
+
+    auto s = new MCPServer("t", "1");
+    foreach (i; 0 .. 3)
+    {
+        ResourceTemplate t = {
+            uriTemplate: "test://t" ~ i.to!string ~ "/{id}", name: "t"
+        };
+        s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
+            return ResourceContents.makeText(uri, "text/plain", "x");
+        });
+    }
+    s.setPageSize(2);
+
+    auto p1 = s.handle(req(1, "resources/templates/list")).get;
+    assert(p1["result"]["resourceTemplates"].length == 2);
+    const c = p1["result"]["nextCursor"].get!string;
+
+    Json p = Json.emptyObject;
+    p["cursor"] = c;
+    auto p2 = s.handle(req(2, "resources/templates/list", p)).get;
+    assert(p2["result"]["resourceTemplates"].length == 1);
+    assert("nextCursor" !in p2["result"]);
+}
+
+unittest  // an invalid pagination cursor yields invalidParams (-32602)
+{
+    auto s = new MCPServer("t", "1");
+    Tool tool = {name: "only"};
+    s.registerTool(tool, (Json) @safe {
+        CallToolResult r;
+        r.content = [Content.makeText("ok")];
+        return r;
+    });
+    s.setPageSize(1);
+    Json p = Json.emptyObject;
+    p["cursor"] = "!!!not-a-valid-cursor!!!";
+    auto resp = s.handle(req(1, "tools/list", p)).get;
+    assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // a full roundtrip through cursor-following pagination yields every tool exactly once
+{
+    import std.algorithm : sort, uniq;
+    import std.array : array;
+    import std.conv : to;
+
+    auto s = new MCPServer("t", "1");
+    foreach (i; 0 .. 7)
+    {
+        Tool tool = {name: "tool" ~ i.to!string};
+        s.registerTool(tool, (Json) @safe {
+            CallToolResult r;
+            r.content = [Content.makeText("ok")];
+            return r;
+        });
+    }
+    s.setPageSize(3);
+
+    string[] collected;
+    Nullable!string cursor;
+    do
+    {
+        Json p = Json.emptyObject;
+        if (!cursor.isNull)
+            p["cursor"] = cursor.get;
+        auto resp = s.handle(req(1, "tools/list", p)).get;
+        collected ~= itemNames(resp["result"]["tools"], "name");
+        if ("nextCursor" in resp["result"])
+            cursor = resp["result"]["nextCursor"].get!string;
+        else
+            cursor.nullify();
+    }
+    while (!cursor.isNull);
+
+    assert(collected.length == 7);
+    auto deduped = collected.dup.sort.uniq.array;
+    assert(deduped.length == 7);
 }
