@@ -870,16 +870,58 @@ final class MCPServer
     /// `subscriptions/listen` (draft): record the opted-in change-notification
     /// types and acknowledge. The long-lived delivery stream is provided by the
     /// transport; this records the filter and returns the acknowledgement.
+    ///
+    /// Per draft basic/utilities/subscriptions the filter is nested under
+    /// `params.notifications` (a `SubscriptionFilter`): the `toolsListChanged`,
+    /// `promptsListChanged` and `resourcesListChanged` flags are booleans, while
+    /// `resourceSubscriptions` is a `string[]` of resource URIs the client wants
+    /// `notifications/resources/updated` for. Those URIs are recorded as per-URI
+    /// subscriptions (so `isSubscribed`/`notifyResourceUpdated` honour them) and
+    /// the `resourceSubscriptions` opt-in is flagged when the array is non-empty.
+    /// For backward compatibility a flat top-level filter (the pre-spec shape) is
+    /// still accepted when no `notifications` object is present.
     private Json doSubscribeListen(Json params) @safe
     {
-        static immutable known = [
-            "toolsListChanged", "promptsListChanged", "resourcesListChanged",
-            "resourceSubscriptions"
-        ];
-        foreach (k; known)
-            if (params.type == Json.Type.object && k in params
-                    && params[k].type == Json.Type.bool_ && params[k].get!bool)
-                listenFilters[k] = true;
+        Json filter = Json.undefined;
+        if (params.type == Json.Type.object && "notifications" in params
+                && params["notifications"].type == Json.Type.object)
+            filter = params["notifications"];
+        else
+            filter = params; // tolerate the legacy flat shape
+
+        if (filter.type == Json.Type.object)
+        {
+            static immutable boolKeys = [
+                "toolsListChanged", "promptsListChanged", "resourcesListChanged"
+            ];
+            foreach (k; boolKeys)
+                if (k in filter && filter[k].type == Json.Type.bool_ && filter[k].get!bool)
+                    listenFilters[k] = true;
+
+            if ("resourceSubscriptions" in filter)
+            {
+                auto rs = filter["resourceSubscriptions"];
+                if (rs.type == Json.Type.array)
+                {
+                    bool any;
+                    foreach (i; 0 .. rs.length)
+                        if (rs[i].type == Json.Type.string)
+                        {
+                            subscriptions[rs[i].get!string] = true;
+                            any = true;
+                        }
+                    if (any)
+                        listenFilters["resourceSubscriptions"] = true;
+                }
+                else if (rs.type == Json.Type.bool_ && rs.get!bool)
+                {
+                    // Legacy boolean opt-in (pre-spec): blanket interest in
+                    // resource-update notifications without per-URI URIs.
+                    listenFilters["resourceSubscriptions"] = true;
+                }
+            }
+        }
+
         Json j = Json.emptyObject;
         j["acknowledged"] = true;
         return j;
@@ -2156,7 +2198,24 @@ unittest  // draft resources/read unknown uri uses invalidParams (-32602)
     assert(resp["error"]["code"].get!int == -32602);
 }
 
-unittest  // subscriptions/listen records the opted-in filter and acknowledges
+unittest  // subscriptions/listen reads the spec-shaped filter nested under params.notifications
+{
+    auto s = makeTestServer();
+    Json filter = Json.emptyObject;
+    filter["toolsListChanged"] = true;
+    filter["resourceSubscriptions"] = Json([Json("file:///project/config.json")]);
+    Json p = Json.emptyObject;
+    p["notifications"] = filter;
+    auto resp = s.handle(draftReq(4, "subscriptions/listen", p)).get;
+    assert(resp["result"]["acknowledged"].get!bool);
+    assert(s.listensFor("toolsListChanged"));
+    assert(s.listensFor("resourceSubscriptions"));
+    assert(!s.listensFor("promptsListChanged"));
+    // resourceSubscriptions URIs are tracked as per-URI subscriptions.
+    assert(s.isSubscribed("file:///project/config.json"));
+}
+
+unittest  // subscriptions/listen still accepts the legacy flat (top-level) filter shape
 {
     auto s = makeTestServer();
     Json p = Json.emptyObject;
@@ -2169,6 +2228,17 @@ unittest  // subscriptions/listen records the opted-in filter and acknowledges
     assert(!s.listensFor("promptsListChanged"));
 }
 
+unittest  // subscriptions/listen with an empty resourceSubscriptions array does not opt in
+{
+    auto s = makeTestServer();
+    Json filter = Json.emptyObject;
+    filter["resourceSubscriptions"] = Json.emptyArray;
+    Json p = Json.emptyObject;
+    p["notifications"] = filter;
+    s.handle(draftReq(4, "subscriptions/listen", p));
+    assert(!s.listensFor("resourceSubscriptions"));
+}
+
 unittest  // acknowledgedListenSubset reflects exactly the opted-in change types
 {
     auto s = makeTestServer();
@@ -2176,10 +2246,12 @@ unittest  // acknowledgedListenSubset reflects exactly the opted-in change types
     assert(s.acknowledgedListenSubset().type == Json.Type.object);
     assert(s.acknowledgedListenSubset().length == 0);
 
+    Json filter = Json.emptyObject;
+    filter["toolsListChanged"] = true;
+    filter["resourceSubscriptions"] = Json([Json("file:///project/config.json")]);
+    filter["promptsListChanged"] = false; // explicitly not opted in
     Json p = Json.emptyObject;
-    p["toolsListChanged"] = true;
-    p["resourceSubscriptions"] = true;
-    p["promptsListChanged"] = false; // explicitly not opted in
+    p["notifications"] = filter;
     s.handle(draftReq(7, "subscriptions/listen", p));
 
     auto subset = s.acknowledgedListenSubset();
