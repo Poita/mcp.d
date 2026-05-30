@@ -4,6 +4,7 @@ import std.typecons : Nullable;
 import vibe.data.json : Json;
 
 import mcp.protocol.errors;
+import mcp.auth.resource_server : TokenInfo;
 
 @safe:
 
@@ -44,6 +45,13 @@ interface RequestContext
     /// request, keyed by the `InputRequest.id` the server issued on the prior
     /// round. Empty on the first call and on non-stateless requests.
     Json[string] inputResponses() @safe;
+
+    /// The validated OAuth 2.1 access-token info for this request, when the
+    /// transport enforces authorization (Streamable HTTP with a configured
+    /// `ResourceServerConfig`). `TokenInfo.valid` is false on transports without
+    /// auth (stdio, in-process) or when no token was required; handlers that need
+    /// the authenticated subject or token scopes read it here.
+    TokenInfo auth() @safe;
 
     /// Request an LLM completion from the client (`sampling/createMessage`).
     /// Throws on a stateless (MRTR) request — use `ToolResponse.inputRequired`
@@ -109,6 +117,11 @@ final class NullContext : RequestContext
         Json[string] empty;
         return empty;
     }
+
+    TokenInfo auth() @safe
+    {
+        return TokenInfo.invalid();
+    }
 }
 
 /// Wraps a transport-supplied `RequestContext` with the per-request protocol
@@ -160,5 +173,10 @@ final class RequestScope : RequestContext
     Json[string] inputResponses() @safe
     {
         return responses;
+    }
+
+    TokenInfo auth() @safe
+    {
+        return inner.auth();
     }
 }

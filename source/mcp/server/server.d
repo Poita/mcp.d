@@ -1328,6 +1328,13 @@ version (unittest)
             Json[string] empty;
             return empty;
         }
+
+        import mcp.auth.resource_server : TokenInfo;
+
+        TokenInfo auth() @safe
+        {
+            return TokenInfo.invalid();
+        }
     }
 
     // Register a tool that books a flight, asking for the date either via MRTR

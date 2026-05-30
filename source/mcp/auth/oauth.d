@@ -152,6 +152,62 @@ struct ProtectedResourceMetadata
         m.scopesSupported = stringArray(j, "scopes_supported");
         return m;
     }
+
+    /// Serialize to the RFC 9728 metadata document a protected resource server
+    /// publishes at `/.well-known/oauth-protected-resource`. `resource` and
+    /// `authorization_servers` are always present; `scopes_supported` is emitted
+    /// only when non-empty.
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["resource"] = resource;
+        Json as = Json.emptyArray;
+        foreach (s; authorizationServers)
+            as ~= Json(s);
+        j["authorization_servers"] = as;
+        if (scopesSupported.length)
+        {
+            Json ss = Json.emptyArray;
+            foreach (s; scopesSupported)
+                ss ~= Json(s);
+            j["scopes_supported"] = ss;
+        }
+        return j;
+    }
+}
+
+unittest  // ProtectedResourceMetadata.toJson emits the RFC 9728 fields
+{
+    ProtectedResourceMetadata m;
+    m.resource = "https://mcp.example.com/mcp";
+    m.authorizationServers = ["https://auth.example.com"];
+    m.scopesSupported = ["read", "write"];
+    auto j = m.toJson();
+    assert(j["resource"].get!string == "https://mcp.example.com/mcp");
+    assert(j["authorization_servers"].length == 1);
+    assert(j["authorization_servers"][0].get!string == "https://auth.example.com");
+    assert(j["scopes_supported"].length == 2);
+}
+
+unittest  // ProtectedResourceMetadata.toJson omits empty scopes_supported
+{
+    ProtectedResourceMetadata m;
+    m.resource = "https://mcp.example.com/mcp";
+    m.authorizationServers = ["https://auth.example.com"];
+    auto j = m.toJson();
+    assert("scopes_supported" !in j);
+}
+
+unittest  // ProtectedResourceMetadata round-trips through toJson/fromJson
+{
+    ProtectedResourceMetadata m;
+    m.resource = "https://mcp.example.com/mcp";
+    m.authorizationServers = ["https://a.example.com", "https://b.example.com"];
+    m.scopesSupported = ["mcp:read"];
+    auto back = ProtectedResourceMetadata.fromJson(m.toJson());
+    assert(back.resource == m.resource);
+    assert(back.authorizationServers == m.authorizationServers);
+    assert(back.scopesSupported == m.scopesSupported);
 }
 
 /// OAuth 2.0 Authorization Server Metadata (RFC 8414).
