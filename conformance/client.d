@@ -190,43 +190,77 @@ private int runAuthScenario(string url, string scenario) @safe
     oauth.resource = canonicalResourceUri(url);
     oauth.redirectUri = "http://localhost:8765/callback";
 
+    auto context = readContext();
+
     const www = oauth.probeUnauthorized(url);
     ProtectedResourceMetadata prm;
+    bool havePrm;
     try
+    {
         prm = oauth.discoverProtectedResource(url, www);
+        havePrm = true;
+    }
     catch (Exception)
     {
     }
+
+    // resource-mismatch: the PRM `resource` MUST match the server we are talking
+    // to; if it does not, refuse to proceed with authorization (RFC 9728).
+    if (havePrm && prm.resource.length && canonicalResourceUri(prm.resource) != oauth.resource)
+    {
+        () @trusted {
+            import std.stdio : stderr;
+
+            stderr.writeln("PRM resource mismatch — refusing to authorize");
+        }();
+        return 0;
+    }
+
     const issuer = oauth.resolveIssuer(url, www);
     auto as_ = oauth.discoverAuthServer(issuer);
 
-    // Pick the token-endpoint auth method the AS advertises (prefer none).
-    if (as_.tokenEndpointAuthMethodsSupported.canFind("none")
-            || as_.tokenEndpointAuthMethodsSupported.length == 0)
-        oauth.authMethod = TokenEndpointAuthMethod.none;
-    else if (as_.tokenEndpointAuthMethodsSupported.canFind("client_secret_basic"))
-        oauth.authMethod = TokenEndpointAuthMethod.clientSecretBasic;
-    else if (as_.tokenEndpointAuthMethodsSupported.canFind("client_secret_post"))
-        oauth.authMethod = TokenEndpointAuthMethod.clientSecretPost;
-
     const w = parseWwwAuthenticate(www);
-    const scopeStr = selectScope(w.scope_, prm.scopesSupported.length
+    auto scopeStr = selectScope(w.scope_, prm.scopesSupported.length
             ? prm.scopesSupported : as_.scopesSupported);
 
-    auto client = oauth.register(as_, "dlang-mcp-client", scopeStr);
-
-    TokenSet tokens;
-    if (scenario.canFind("client-credentials"))
+    // Client identity: a pre-registered client supplied via the scenario context,
+    // else Dynamic Client Registration.
+    RegisteredClient client;
+    if ("client_id" in context && context["client_id"].type == Json.Type.string)
     {
-        tokens = oauth.clientCredentials(as_, client, scopeStr);
+        client.clientId = context["client_id"].get!string;
+        if ("client_secret" in context && context["client_secret"].type == Json.Type.string)
+            client.clientSecret = context["client_secret"].get!string;
     }
     else
     {
-        auto pkce = generatePkce();
-        auto authzUrl = oauth.authorizationUrl(as_, client, pkce, scopeStr, "state-123");
-        const code = oauth.authorizeAndGetCode(authzUrl);
-        if (code.length)
-            tokens = oauth.exchangeCode(as_, client, code, pkce.verifier);
+        client = oauth.register(as_, "dlang-mcp-client", scopeStr);
+    }
+
+    // Choose the token-endpoint auth method: if we hold a secret and the AS
+    // supports a secret-based method, use it; otherwise prefer "none".
+    oauth.authMethod = chooseAuthMethod(as_, client.clientSecret.length > 0);
+
+    TokenSet tokens;
+    if (scenario.canFind("client-credentials"))
+        tokens = oauth.clientCredentials(as_, client, scopeStr);
+    else
+        tokens = authCodeFlow(oauth, as_, client, scopeStr);
+
+    // Step-up: if the resource still challenges us for a broader scope, run the
+    // authorization flow again with the escalated scope.
+    foreach (attempt; 0 .. 3)
+    {
+        if (tokens.accessToken.length == 0)
+            break;
+        const challenge = oauth.probeOperation(url, tokens.accessToken);
+        if (challenge.length == 0)
+            break; // accepted
+        const newScope = parseWwwAuthenticate(challenge).scope_;
+        if (newScope.length == 0 || newScope == scopeStr)
+            break;
+        scopeStr = newScope;
+        tokens = authCodeFlow(oauth, as_, client, scopeStr);
     }
 
     if (tokens.accessToken.length)
@@ -240,4 +274,50 @@ private int runAuthScenario(string url, string scenario) @safe
         }
     }
     return 0;
+}
+
+/// Run the PKCE authorization-code flow and return the resulting tokens.
+private TokenSet authCodeFlow(OAuthClient oauth, AuthorizationServerMetadata as_,
+        RegisteredClient client, string scopeStr) @safe
+{
+    auto pkce = generatePkce();
+    auto authzUrl = oauth.authorizationUrl(as_, client, pkce, scopeStr, "state-123");
+    const code = oauth.authorizeAndGetCode(authzUrl);
+    TokenSet tokens;
+    if (code.length)
+        tokens = oauth.exchangeCode(as_, client, code, pkce.verifier);
+    return tokens;
+}
+
+/// Choose the token-endpoint auth method based on AS support and whether we hold
+/// a client secret.
+private TokenEndpointAuthMethod chooseAuthMethod(AuthorizationServerMetadata as_, bool haveSecret) @safe
+{
+    import std.algorithm : canFind;
+
+    if (haveSecret)
+    {
+        if (as_.tokenEndpointAuthMethodsSupported.canFind("client_secret_basic"))
+            return TokenEndpointAuthMethod.clientSecretBasic;
+        if (as_.tokenEndpointAuthMethodsSupported.canFind("client_secret_post"))
+            return TokenEndpointAuthMethod.clientSecretPost;
+    }
+    if (as_.tokenEndpointAuthMethodsSupported.canFind("client_secret_basic") && haveSecret)
+        return TokenEndpointAuthMethod.clientSecretBasic;
+    return TokenEndpointAuthMethod.none;
+}
+
+/// Parse the `MCP_CONFORMANCE_CONTEXT` environment variable (scenario context).
+private Json readContext() @trusted
+{
+    import std.process : environment;
+    import vibe.data.json : parseJsonString;
+
+    const c = environment.get("MCP_CONFORMANCE_CONTEXT", "");
+    if (c.length == 0)
+        return Json.emptyObject;
+    try
+        return parseJsonString(c);
+    catch (Exception)
+        return Json.emptyObject;
 }

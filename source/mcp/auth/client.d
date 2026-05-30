@@ -159,9 +159,10 @@ final class OAuthClient
                 redirectUri, pkce.challenge, scopeStr, resource, state);
     }
 
-    /// POST a minimal request to the MCP endpoint; if it returns 401, return the
-    /// `WWW-Authenticate` header value (else empty). Used to trigger discovery.
-    string probeUnauthorized(string mcpEndpoint) @safe
+    /// POST a minimal request to the MCP endpoint (optionally with a bearer
+    /// token); if it returns 401, return the `WWW-Authenticate` header value
+    /// (else empty). Used to trigger discovery and detect step-up challenges.
+    string probeUnauthorized(string mcpEndpoint, string bearer = "") @safe
     {
         string www;
         () @trusted {
@@ -171,9 +172,40 @@ final class OAuthClient
                     req.method = HTTPMethod.POST;
                     req.contentType = "application/json";
                     req.headers["Accept"] = "application/json, text/event-stream";
+                    if (bearer.length)
+                        req.headers["Authorization"] = "Bearer " ~ bearer;
                     req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}`);
                 }, (scope HTTPClientResponse res) {
-                    if (res.statusCode == 401)
+                    if (res.statusCode == 401 || res.statusCode == 403)
+                        www = res.headers.get("WWW-Authenticate", "");
+                    res.dropBody();
+                });
+            }
+            catch (Exception)
+            {
+            }
+        }();
+        return www;
+    }
+
+    /// POST a `tools/list` request with a bearer token; if the server challenges
+    /// with 401/403 (insufficient scope), return the `WWW-Authenticate` header.
+    /// Used to detect step-up authorization requirements.
+    string probeOperation(string mcpEndpoint, string bearer) @safe
+    {
+        string www;
+        () @trusted {
+            try
+            {
+                requestHTTP(mcpEndpoint, (scope HTTPClientRequest req) {
+                    req.method = HTTPMethod.POST;
+                    req.contentType = "application/json";
+                    req.headers["Accept"] = "application/json, text/event-stream";
+                    if (bearer.length)
+                        req.headers["Authorization"] = "Bearer " ~ bearer;
+                    req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"step-up","arguments":{}}}`);
+                }, (scope HTTPClientResponse res) {
+                    if (res.statusCode == 401 || res.statusCode == 403)
                         www = res.headers.get("WWW-Authenticate", "");
                     res.dropBody();
                 });
