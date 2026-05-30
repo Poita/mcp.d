@@ -112,6 +112,7 @@ final class MCPServer
     private string logLevel = "info";
     private bool resourceSubscriptionsEnabled;
     private bool[string] subscriptions;
+    private Json extensions = Json.undefined;
     private ProtocolVersion negotiated = latestStable;
     private ProtocolVersion effectiveVersion = latestStable;
     private ClientCapabilities clientCaps;
@@ -216,6 +217,25 @@ final class MCPServer
         resourceSubscriptionsEnabled = true;
     }
 
+    /// Advertise a draft protocol extension (e.g. "io.modelcontextprotocol/tasks")
+    /// with an optional per-extension settings object. The identifier and its
+    /// settings appear in the `extensions` field of the server capabilities sent
+    /// during `initialize` / `server/discover`, per the draft Extension
+    /// Negotiation rules. `settings` defaults to an empty object.
+    void advertiseExtension(string identifier, Json settings = Json.emptyObject) @safe
+    {
+        if (extensions.type != Json.Type.object)
+            extensions = Json.emptyObject;
+        extensions[identifier] = settings;
+    }
+
+    /// The extension identifiers and settings the connected client advertised
+    /// (valid after `initialize`). `Json.undefined` if the client advertised none.
+    Json clientExtensions() const @safe
+    {
+        return clientCaps.extensions;
+    }
+
     /// Whether a client is currently subscribed to updates for `uri`.
     bool isSubscribed(string uri) const @safe
     {
@@ -242,6 +262,8 @@ final class MCPServer
             caps.completions = true;
         if (loggingEnabled)
             caps.logging = true;
+        if (extensions.type == Json.Type.object && extensions.length > 0)
+            caps.extensions = extensions;
         return caps;
     }
 
@@ -959,6 +981,39 @@ unittest  // capabilities reflect registered features
     assert(!caps.resources.isNull);
     assert(caps.logging);
     assert(caps.prompts.isNull);
+}
+
+unittest  // advertised extensions appear in initialize capabilities
+{
+    auto s = new MCPServer("t", "1");
+    Json settings = Json.emptyObject;
+    settings["maxConcurrent"] = 4;
+    s.advertiseExtension("io.modelcontextprotocol/tasks", settings);
+
+    Json params = Json.emptyObject;
+    params["protocolVersion"] = "2025-06-18";
+    auto resp = s.handle(req(1, "initialize", params)).get;
+    auto ext = resp["result"]["capabilities"]["extensions"];
+    assert(ext.type == Json.Type.object);
+    assert(ext["io.modelcontextprotocol/tasks"]["maxConcurrent"].get!int == 4);
+}
+
+unittest  // server reads the extensions a client advertises at initialize
+{
+    auto s = new MCPServer("t", "1");
+    Json caps = Json.emptyObject;
+    Json ext = Json.emptyObject;
+    ext["io.modelcontextprotocol/ui"] = Json.emptyObject;
+    caps["extensions"] = ext;
+
+    Json params = Json.emptyObject;
+    params["protocolVersion"] = "2025-06-18";
+    params["capabilities"] = caps;
+    s.handle(req(1, "initialize", params));
+
+    assert(s.clientExtensions.type == Json.Type.object);
+    assert("io.modelcontextprotocol/ui" in s.clientExtensions);
+    assert("io.modelcontextprotocol/ui" in s.clientCapabilities.extensions);
 }
 
 unittest  // resources/subscribe and unsubscribe track URIs and return {}

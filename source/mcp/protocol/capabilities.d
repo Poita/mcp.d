@@ -91,6 +91,10 @@ struct ServerCapabilities
     bool logging; /// presence-only ({} when set)
     bool completions; /// presence-only ({} when set)
     Json experimental = Json.undefined;
+    /// draft Extension Negotiation: map of extension identifiers (e.g.
+    /// "io.modelcontextprotocol/tasks") to per-extension settings objects.
+    /// Distinct from `experimental`.
+    Json extensions = Json.undefined;
 
     Json toJson() const @safe
     {
@@ -107,6 +111,8 @@ struct ServerCapabilities
             j["completions"] = Json.emptyObject;
         if (experimental.type == Json.Type.object)
             j["experimental"] = experimental;
+        if (extensions.type == Json.Type.object)
+            j["extensions"] = extensions;
         return j;
     }
 
@@ -125,6 +131,8 @@ struct ServerCapabilities
             c.completions = true;
         if ("experimental" in j)
             c.experimental = j["experimental"];
+        if ("extensions" in j)
+            c.extensions = j["extensions"];
         return c;
     }
 }
@@ -137,6 +145,10 @@ struct ClientCapabilities
     bool sampling; /// presence-only
     bool elicitation; /// presence-only (>= 2025-06-18)
     Json experimental = Json.undefined;
+    /// draft Extension Negotiation: map of extension identifiers (e.g.
+    /// "io.modelcontextprotocol/ui") to per-extension settings objects.
+    /// Distinct from `experimental`.
+    Json extensions = Json.undefined;
 
     Json toJson() const @safe
     {
@@ -154,6 +166,8 @@ struct ClientCapabilities
             j["elicitation"] = Json.emptyObject;
         if (experimental.type == Json.Type.object)
             j["experimental"] = experimental;
+        if (extensions.type == Json.Type.object)
+            j["extensions"] = extensions;
         return j;
     }
 
@@ -173,6 +187,8 @@ struct ClientCapabilities
             c.elicitation = true;
         if ("experimental" in j)
             c.experimental = j["experimental"];
+        if ("extensions" in j)
+            c.extensions = j["extensions"];
         return c;
     }
 }
@@ -235,4 +251,47 @@ unittest  // ClientCapabilities nests roots.listChanged and presence flags
     assert("elicitation" !in j);
     auto back = ClientCapabilities.fromJson(j);
     assert(back.roots && back.rootsListChanged && back.sampling && !back.elicitation);
+}
+
+unittest  // ServerCapabilities advertises and round-trips the draft `extensions` map
+{
+    ServerCapabilities caps;
+    Json ext = Json.emptyObject;
+    ext["io.modelcontextprotocol/tasks"] = Json.emptyObject;
+    caps.extensions = ext;
+    auto j = caps.toJson();
+    assert(j["extensions"].type == Json.Type.object);
+    assert("io.modelcontextprotocol/tasks" in j["extensions"]);
+    // `extensions` is distinct from `experimental`.
+    assert("experimental" !in j);
+    auto back = ServerCapabilities.fromJson(j);
+    assert(back.extensions.type == Json.Type.object);
+    assert("io.modelcontextprotocol/tasks" in back.extensions);
+}
+
+unittest  // ServerCapabilities omits `extensions` when unset
+{
+    ServerCapabilities caps;
+    assert("extensions" !in caps.toJson());
+}
+
+unittest  // ClientCapabilities advertises and round-trips the draft `extensions` map
+{
+    ClientCapabilities caps;
+    Json ext = Json.emptyObject;
+    Json settings = Json.emptyObject;
+    settings["maxConcurrent"] = 4;
+    ext["io.modelcontextprotocol/ui"] = settings;
+    caps.extensions = ext;
+    auto j = caps.toJson();
+    assert(j["extensions"]["io.modelcontextprotocol/ui"]["maxConcurrent"].get!int == 4);
+    assert("experimental" !in j);
+    auto back = ClientCapabilities.fromJson(j);
+    assert(back.extensions["io.modelcontextprotocol/ui"]["maxConcurrent"].get!int == 4);
+}
+
+unittest  // ClientCapabilities omits `extensions` when unset
+{
+    ClientCapabilities caps;
+    assert("extensions" !in caps.toJson());
 }
