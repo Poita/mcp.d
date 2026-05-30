@@ -157,6 +157,15 @@ final class MCPClient
     Json delegate(Json params) @safe onListRoots;
     /// Observer for inbound notifications (progress, message, resource updates).
     void delegate(string method, Json params) @safe onNotification;
+    /// Typed observer for `notifications/progress` (basic/utilities/progress).
+    ///
+    /// When set, an inbound `notifications/progress` is parsed into a
+    /// `ProgressNotification` and delivered here in addition to the generic
+    /// `onNotification`. Correlate `n.progressToken` against the
+    /// `ProgressToken` you attached to the originating request (see the
+    /// `callTool`/`readResource`/`getPrompt` overloads taking a `ProgressToken`)
+    /// to track an individual request's progress.
+    void delegate(ProgressNotification n) @safe onProgress;
 
     this(string url, Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
     {
@@ -1070,6 +1079,10 @@ final class MCPClient
                 return; // unknown or already-completed id -> ignore per spec
             elicitationIds_[eid] = true; // mark completed
         }
+        // Deliver progress updates as a typed value to the dedicated observer,
+        // in addition to the generic catch-all below.
+        if (method == "notifications/progress" && onProgress !is null)
+            onProgress(ProgressNotification.fromJson(params));
         if (onNotification !is null)
             onNotification(method, params);
     }
@@ -2255,6 +2268,45 @@ unittest  // other notifications are forwarded unchanged
 
     c.dispatchNotification("notifications/message", Json.emptyObject);
     assert(forwarded == "notifications/message");
+}
+
+unittest  // notifications/progress is delivered to the typed onProgress observer
+{
+    auto c = new MCPClient("http://localhost");
+    ProgressNotification got;
+    bool called;
+    c.onProgress = (ProgressNotification n) @safe { got = n; called = true; };
+
+    Json p = Json.emptyObject;
+    p["progressToken"] = "job-1";
+    p["progress"] = 3;
+    p["total"] = 4;
+    p["message"] = "working";
+    c.dispatchNotification("notifications/progress", p);
+
+    assert(called);
+    assert(got.progressToken.get!string == "job-1");
+    assert(got.progress == 3);
+    assert(!got.total.isNull && got.total.get == 4);
+    assert(!got.message.isNull && got.message.get == "working");
+}
+
+unittest  // a non-progress notification does not invoke onProgress
+{
+    auto c = new MCPClient("http://localhost");
+    bool called;
+    c.onProgress = (ProgressNotification) @safe { called = true; };
+    c.dispatchNotification("notifications/message", Json.emptyObject);
+    assert(!called);
+}
+
+unittest  // progress is still forwarded to the generic onNotification observer
+{
+    auto c = new MCPClient("http://localhost");
+    string forwarded;
+    c.onNotification = (string method, Json) @safe { forwarded = method; };
+    c.dispatchNotification("notifications/progress", Json.emptyObject);
+    assert(forwarded == "notifications/progress");
 }
 
 unittest  // elicitation/create defaults to form mode when mode is absent

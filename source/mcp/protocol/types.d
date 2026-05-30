@@ -1494,6 +1494,101 @@ struct CompleteResult
     }
 }
 
+/// A typed `notifications/progress` payload, per basic/utilities/progress: the
+/// notification carries `params: {progressToken, progress, total?, message?}`.
+/// `progressToken` correlates the update to the request that supplied it (a
+/// string or integer; see `ProgressToken`), `progress` is the current amount
+/// (which "MUST increase with each notification"), `total` the optional final
+/// amount, and `message` an optional human-readable description. Parsed from an
+/// inbound notification's `params` so clients receive a structured value rather
+/// than hand-parsing raw JSON.
+struct ProgressNotification
+{
+    /// The progress token from the originating request (string or integer);
+    /// `Json.undefined` if absent. Compare against the `ProgressToken` you sent.
+    Json progressToken = Json.undefined;
+    /// The current progress amount.
+    double progress = 0;
+    /// The optional total amount of work (`null` when the server omits it).
+    Nullable!double total;
+    /// An optional human-readable progress message.
+    Nullable!string message;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["progressToken"] = progressToken;
+        j["progress"] = progress;
+        if (!total.isNull)
+            j["total"] = total.get;
+        if (!message.isNull)
+            j["message"] = message.get;
+        return j;
+    }
+
+    /// Parse the `params` object of a `notifications/progress` message. Tolerant
+    /// of a missing/ill-typed payload (returns a default-valued struct), and
+    /// accepts `progress`/`total` as either integer or floating-point JSON.
+    static ProgressNotification fromJson(Json params) @safe
+    {
+        ProgressNotification n;
+        if (params.type != Json.Type.object)
+            return n;
+        if ("progressToken" in params)
+            n.progressToken = params["progressToken"];
+        if ("progress" in params)
+            n.progress = toDouble(params["progress"]);
+        if ("total" in params && (params["total"].type == Json.Type.int_
+                || params["total"].type == Json.Type.float_))
+            n.total = toDouble(params["total"]);
+        if ("message" in params && params["message"].type == Json.Type.string)
+            n.message = params["message"].get!string;
+        return n;
+    }
+
+    private static double toDouble(Json v) @safe
+    {
+        if (v.type == Json.Type.float_)
+            return v.get!double;
+        if (v.type == Json.Type.int_)
+            return cast(double) v.get!long;
+        return 0;
+    }
+}
+
+unittest  // ProgressNotification parses token, progress, total and message
+{
+    Json p = Json.emptyObject;
+    p["progressToken"] = "tok-1";
+    p["progress"] = 5;
+    p["total"] = 10;
+    p["message"] = "halfway";
+    auto n = ProgressNotification.fromJson(p);
+    assert(n.progressToken.get!string == "tok-1");
+    assert(n.progress == 5);
+    assert(!n.total.isNull && n.total.get == 10);
+    assert(!n.message.isNull && n.message.get == "halfway");
+}
+
+unittest  // ProgressNotification accepts a floating-point progress and integer token
+{
+    Json p = Json.emptyObject;
+    p["progressToken"] = 7;
+    p["progress"] = 0.25;
+    auto n = ProgressNotification.fromJson(p);
+    assert(n.progressToken.get!long == 7);
+    assert(n.progress == 0.25);
+    assert(n.total.isNull);
+    assert(n.message.isNull);
+}
+
+unittest  // ProgressNotification tolerates a non-object payload
+{
+    auto n = ProgressNotification.fromJson(Json("not an object"));
+    assert(n.progress == 0);
+    assert(n.progressToken.type == Json.Type.undefined);
+}
+
 unittest  // Resource serializes required + optional fields
 {
     Resource r = {uri: "test://x", name: "x", description: nullable("d")};
