@@ -830,8 +830,15 @@ final class MCPServer
 
     private Json doSetLevel(Json params) @safe
     {
-        if ("level" in params && params["level"].type == Json.Type.string)
-            logLevel = params["level"].get!string;
+        if (!("level" in params) || params["level"].type != Json.Type.string)
+            throw invalidParams("logging/setLevel requires a string 'level'");
+        const level = params["level"].get!string;
+        // The spec mandates -32602 for an unrecognised log level. Valid levels
+        // are the eight RFC 5424 syslog severities (logLevelRank returns -1 for
+        // anything else).
+        if (logLevelRank(level) < 0)
+            throw invalidParams("Invalid log level: " ~ level);
+        logLevel = level;
         return Json.emptyObject;
     }
 
@@ -1439,6 +1446,27 @@ unittest  // logging/setLevel stores the level and returns an empty object
     auto resp = s.handle(req(1, "logging/setLevel", p)).get;
     assert(resp["result"].type == Json.Type.object && resp["result"].length == 0);
     assert(s.currentLogLevel == "debug");
+}
+
+unittest  // logging/setLevel rejects an unrecognised level with -32602
+{
+    auto s = new MCPServer("t", "1");
+    s.enableLogging();
+    Json p = Json.emptyObject;
+    p["level"] = "verbose";
+    auto resp = s.handle(req(1, "logging/setLevel", p)).get;
+    assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+    // The invalid level must not have been stored.
+    assert(s.currentLogLevel == "info");
+}
+
+unittest  // logging/setLevel requires a string 'level' param
+{
+    auto s = new MCPServer("t", "1");
+    s.enableLogging();
+    Json p = Json.emptyObject;
+    auto resp = s.handle(req(1, "logging/setLevel", p)).get;
+    assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
 unittest  // after setLevel(error), a handler's sub-error logs are dropped
