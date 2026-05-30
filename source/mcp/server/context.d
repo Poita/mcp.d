@@ -95,6 +95,9 @@ interface RequestContext
     /// `requestedSchema` must be a JSON Schema object. Throws on a stateless
     /// (MRTR) request — use `ToolResponse.inputRequired` instead — or if the
     /// client does not support elicitation.
+    ///
+    /// This is form-mode elicitation; per spec the `mode` field is omitted and
+    /// defaults to `"form"`. For URL-mode elicitation use `elicitUrl`.
     final Json elicit(string message, Json requestedSchema) @safe
     {
         if (isStateless)
@@ -105,6 +108,36 @@ interface RequestContext
         Json params = Json.emptyObject;
         params["message"] = message;
         params["requestedSchema"] = requestedSchema;
+        return sendRequest("elicitation/create", params);
+    }
+
+    /// Request URL-mode elicitation from the client (`elicitation/create` with
+    /// `mode: "url"`, introduced in 2025-11-25). Directs the user to complete an
+    /// out-of-band interaction (e.g. an OAuth consent or a web form) at `url`;
+    /// `elicitationId` correlates the request with the outcome the client reports
+    /// back. Per spec a URL-mode request MUST specify `mode: "url"`, a `message`,
+    /// `url`, and `elicitationId`.
+    ///
+    /// Returns the client's `{action}` response (typically `accept`/`decline`/
+    /// `cancel`). Throws on a stateless (MRTR) request — use
+    /// `ToolResponse.inputRequired` instead — or if the client does not support
+    /// elicitation, or if `url`/`elicitationId` are empty.
+    final Json elicitUrl(string message, string url, string elicitationId) @safe
+    {
+        if (isStateless)
+            throw invalidRequest(
+                    "elicitUrl() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
+        if (!clientSupports("elicitation"))
+            throw invalidRequest("Client does not support elicitation");
+        if (url.length == 0)
+            throw invalidParams("URL-mode elicitation requires a non-empty url");
+        if (elicitationId.length == 0)
+            throw invalidParams("URL-mode elicitation requires a non-empty elicitationId");
+        Json params = Json.emptyObject;
+        params["mode"] = "url";
+        params["message"] = message;
+        params["url"] = url;
+        params["elicitationId"] = elicitationId;
         return sendRequest("elicitation/create", params);
     }
 
@@ -314,6 +347,112 @@ version (unittest) private final class RootsProbe : RequestContext
     {
         return TokenInfo.invalid();
     }
+}
+
+version (unittest) private final class ElicitProbe : RequestContext
+{
+    string lastMethod;
+    Json lastParams;
+    bool supportsElicitation = true;
+    bool stateless = false;
+
+    void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
+    {
+    }
+
+    void log(string, Json, string = null) @safe
+    {
+    }
+
+    Json sendRequest(string method, Json params) @safe
+    {
+        lastMethod = method;
+        lastParams = params;
+        Json r = Json.emptyObject;
+        r["action"] = "accept";
+        return r;
+    }
+
+    bool clientSupports(string capability) @safe
+    {
+        return capability == "elicitation" && supportsElicitation;
+    }
+
+    bool isStateless() @safe
+    {
+        return stateless;
+    }
+
+    Json[string] inputResponses() @safe
+    {
+        Json[string] empty;
+        return empty;
+    }
+
+    TokenInfo auth() @safe
+    {
+        return TokenInfo.invalid();
+    }
+}
+
+unittest  // elicitUrl() emits mode:"url" with message, url, and elicitationId
+{
+    auto probe = new ElicitProbe;
+    auto result = probe.elicitUrl("Authorize access", "https://example.com/consent", "elic-123");
+
+    assert(probe.lastMethod == "elicitation/create");
+    assert(probe.lastParams["mode"].get!string == "url");
+    assert(probe.lastParams["message"].get!string == "Authorize access");
+    assert(probe.lastParams["url"].get!string == "https://example.com/consent");
+    assert(probe.lastParams["elicitationId"].get!string == "elic-123");
+    assert(result["action"].get!string == "accept");
+}
+
+unittest  // form-mode elicit() does not set a mode field
+{
+    auto probe = new ElicitProbe;
+    probe.elicit("Pick one", Json.emptyObject);
+
+    assert(probe.lastParams["mode"].type == Json.Type.undefined);
+    assert(probe.lastParams["message"].get!string == "Pick one");
+}
+
+unittest  // elicitUrl() rejects an empty url
+{
+    import std.exception : assertThrown;
+    import mcp.protocol.errors : McpException;
+
+    auto probe = new ElicitProbe;
+    assertThrown!McpException(probe.elicitUrl("msg", "", "elic-1"));
+}
+
+unittest  // elicitUrl() rejects an empty elicitationId
+{
+    import std.exception : assertThrown;
+    import mcp.protocol.errors : McpException;
+
+    auto probe = new ElicitProbe;
+    assertThrown!McpException(probe.elicitUrl("msg", "https://example.com", ""));
+}
+
+unittest  // elicitUrl() throws when the client does not support elicitation
+{
+    import std.exception : assertThrown;
+    import mcp.protocol.errors : McpException;
+
+    auto probe = new ElicitProbe;
+    probe.supportsElicitation = false;
+    assertThrown!McpException(probe.elicitUrl("msg", "https://example.com", "elic-1"));
+}
+
+unittest  // elicitUrl() is rejected on a stateless (MRTR) request
+{
+    import std.exception : assertThrown;
+    import mcp.protocol.errors : McpException;
+
+    auto probe = new ElicitProbe;
+    probe.stateless = true;
+    assertThrown!McpException(probe.elicitUrl("msg", "https://example.com", "elic-1"));
 }
 
 unittest  // listRoots() sends roots/list and parses the typed result

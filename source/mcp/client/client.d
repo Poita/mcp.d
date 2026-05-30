@@ -77,6 +77,13 @@ final class MCPClient
     /// Handler for `sampling/createMessage`; returns the result. Null => unsupported.
     Json delegate(Json params) @safe onSampling;
     /// Handler for `elicitation/create`; returns `{action, content?}`. Null => unsupported.
+    ///
+    /// `params` carries the full request. Form-mode requests (the default, when
+    /// `mode` is absent or `"form"`) include `message` and `requestedSchema`;
+    /// the handler collects input and returns `{action, content}`. URL-mode
+    /// requests (2025-11-25+) set `mode: "url"` and include `url` and
+    /// `elicitationId` instead of a schema — the handler should present the URL
+    /// for the user to complete out-of-band and return `{action}` (no content).
     Json delegate(Json params) @safe onElicitation;
     /// Handler for `roots/list`; returns `{roots: [...]}`. Null => unsupported.
     Json delegate(Json params) @safe onListRoots;
