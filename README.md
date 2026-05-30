@@ -19,15 +19,16 @@ Active development.
   tools with every content type, resources + templates + subscribe, prompts, completion,
   logging, progress/logging streaming, sampling, elicitation (incl. SEP-1034/1330),
   DNS-rebinding protection.
-- ✅ Client conformance: `initialize`, `tools_call`.
+- ✅ Client conformance: **276/287 checks** including the full **OAuth 2.1** suite — token-endpoint auth (none/basic/post), metadata discovery (all variants + 2025-03-26 backcompat + endpoint fallback), scope selection + step-up + retry-limit, offline-access, Dynamic Client Registration, pre-registration, and resource-mismatch. (Remaining: JWT client-assertion / token-exchange flows, SSE retry, and a long-lived GET-stream elicitation timing case.)
 - ✅ **FastMCP-style UDA API** — `@tool` / `@resource` / `@prompt` with auto JSON-Schema.
 - ✅ **DRAFT (2026-07-28)** — stateless per-request `_meta`, `server/discover`,
   `subscriptions/listen`, `CacheableResult` (`ttlMs`/`cacheScope`), MRTR types, the standard
   request headers (`Mcp-Method`/`Mcp-Name`/`MCP-Protocol-Version`) with `HeaderMismatch`
   validation, and `x-mcp-header` mirroring — on both client and server.
 
-In progress: OAuth 2.1 (auth conformance suite), MRTR end-to-end flow, long-lived
-`subscriptions/listen` delivery, stdio transport.
+Remaining edge cases: JWT client-assertion (`private_key_jwt`) + cross-app token-exchange
+auth flows, SSE `retry`/`Last-Event-ID` resumption, a long-lived GET-stream elicitation
+timing case, and MRTR end-to-end retry.
 
 ## Build & test
 
