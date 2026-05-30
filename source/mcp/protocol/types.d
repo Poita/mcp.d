@@ -152,6 +152,44 @@ struct Content
     }
 }
 
+/// An icon for display in user interfaces. Used by `Tool` (and other
+/// definitions) per the MCP spec's icon shape: a required `src` and optional
+/// `mimeType` and `sizes`.
+struct Icon
+{
+    string src; /// URI or data: URL of the icon
+    Nullable!string mimeType; /// optional MIME type, e.g. "image/png"
+    string[] sizes; /// optional size strings, e.g. ["48x48", "96x96"]
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["src"] = src;
+        if (!mimeType.isNull)
+            j["mimeType"] = mimeType.get;
+        if (sizes.length)
+        {
+            Json arr = Json.emptyArray;
+            foreach (s; sizes)
+                arr ~= Json(s);
+            j["sizes"] = arr;
+        }
+        return j;
+    }
+
+    static Icon fromJson(Json j) @safe
+    {
+        Icon icon;
+        icon.src = ("src" in j) ? j["src"].get!string : "";
+        if ("mimeType" in j && j["mimeType"].type == Json.Type.string)
+            icon.mimeType = j["mimeType"].get!string;
+        if ("sizes" in j && j["sizes"].type == Json.Type.array)
+            foreach (i; 0 .. j["sizes"].length)
+                icon.sizes ~= j["sizes"][i].get!string;
+        return icon;
+    }
+}
+
 /// A tool the server exposes for the model to call.
 struct Tool
 {
@@ -161,6 +199,7 @@ struct Tool
     Json inputSchema = Json.undefined; /// JSON Schema (object); defaults to empty object schema
     Json outputSchema = Json.undefined; /// optional JSON Schema for structured results
     Json annotations = Json.undefined; /// optional ToolAnnotations
+    Icon[] icons; /// optional icons for display in user interfaces
 
     Json toJson() const @safe
     {
@@ -175,6 +214,13 @@ struct Tool
             j["outputSchema"] = outputSchema;
         if (annotations.type == Json.Type.object)
             j["annotations"] = annotations;
+        if (icons.length)
+        {
+            Json arr = Json.emptyArray;
+            foreach (icon; icons)
+                arr ~= icon.toJson();
+            j["icons"] = arr;
+        }
         return j;
     }
 
@@ -192,6 +238,9 @@ struct Tool
             t.outputSchema = j["outputSchema"];
         if ("annotations" in j)
             t.annotations = j["annotations"];
+        if ("icons" in j && j["icons"].type == Json.Type.array)
+            foreach (i; 0 .. j["icons"].length)
+                t.icons ~= Icon.fromJson(j["icons"][i]);
         return t;
     }
 }
@@ -397,6 +446,46 @@ unittest  // Tool preserves provided schema and description
     assert(back.name == "add");
     assert(back.description.get == "adds");
     assert(back.inputSchema["properties"]["a"]["type"].get!string == "integer");
+}
+
+unittest  // Tool emits icons array when present
+{
+    Tool t = {name: "draw"};
+    t.icons = [
+        Icon("https://example.com/draw.png", nullable("image/png"), ["48x48"])
+    ];
+    auto j = t.toJson();
+    assert(j["icons"].type == Json.Type.array);
+    assert(j["icons"].length == 1);
+    assert(j["icons"][0]["src"].get!string == "https://example.com/draw.png");
+    assert(j["icons"][0]["mimeType"].get!string == "image/png");
+    assert(j["icons"][0]["sizes"][0].get!string == "48x48");
+}
+
+unittest  // Tool omits icons when empty
+{
+    Tool t = {name: "noicons"};
+    auto j = t.toJson();
+    assert("icons" !in j);
+}
+
+unittest  // Tool icons round-trip through fromJson, including optional fields
+{
+    Tool t = {name: "img"};
+    t.icons = [
+        Icon("https://example.com/a.svg"),
+        Icon("https://example.com/b.png", nullable("image/png"), [
+            "16x16", "32x32"
+        ])
+    ];
+    auto back = Tool.fromJson(t.toJson());
+    assert(back.icons.length == 2);
+    assert(back.icons[0].src == "https://example.com/a.svg");
+    assert(back.icons[0].mimeType.isNull);
+    assert(back.icons[0].sizes.length == 0);
+    assert(back.icons[1].src == "https://example.com/b.png");
+    assert(back.icons[1].mimeType.get == "image/png");
+    assert(back.icons[1].sizes == ["16x16", "32x32"]);
 }
 
 unittest  // CallToolResult serializes content array and isError
