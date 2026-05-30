@@ -2,7 +2,9 @@
 	"name": "mcp",
 	"description": "Production-grade Model Context Protocol SDK for D",
 	"license": "MIT",
-	"authors": ["Peter Alexander"],
+	"authors": [
+		"Peter Alexander"
+	],
 	"targetType": "library",
 	"dependencies": {
 		"vibe-d:data": "~>0.9.8",
@@ -18,16 +20,36 @@
 			"targetType": "executable",
 			"targetName": "conformance-server",
 			"mainSourceFile": "conformance/server.d",
-			"sourcePaths": ["source"],
-			"importPaths": ["source"]
+			"sourcePaths": [
+				"source"
+			],
+			"importPaths": [
+				"source"
+			]
 		},
 		{
 			"name": "conformance-client",
 			"targetType": "executable",
 			"targetName": "conformance-client",
 			"mainSourceFile": "conformance/client.d",
-			"sourcePaths": ["source"],
-			"importPaths": ["source"]
+			"sourcePaths": [
+				"source"
+			],
+			"importPaths": [
+				"source"
+			]
+		},
+		{
+			"name": "example-calculator",
+			"targetType": "executable",
+			"targetName": "calculator",
+			"mainSourceFile": "examples/calculator/app.d",
+			"sourcePaths": [
+				"source"
+			],
+			"importPaths": [
+				"source"
+			]
 		}
 	]
 }
