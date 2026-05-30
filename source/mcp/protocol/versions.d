@@ -36,7 +36,7 @@ string toWire(ProtocolVersion v) pure nothrow
     case ProtocolVersion.v2025_11_25:
         return "2025-11-25";
     case ProtocolVersion.draft:
-        return "draft";
+        return "2026-07-28"; // the current draft revision
     }
 }
 
@@ -52,6 +52,12 @@ ProtocolVersion parseVersion(string s) pure
 /// Parse a wire string; returns false (without throwing) if unknown.
 bool tryParseVersion(string s, out ProtocolVersion v) pure nothrow
 {
+    // Accept the literal "draft" as an alias for the current draft revision.
+    if (s == "draft")
+    {
+        v = ProtocolVersion.draft;
+        return true;
+    }
     foreach (candidate; supportedVersions)
     {
         if (candidate.toWire == s)
@@ -77,14 +83,47 @@ bool supportsElicitation(ProtocolVersion v) pure nothrow
     return v >= ProtocolVersion.v2025_06_18;
 }
 
+/// The draft (2026-07-28) redesign: stateless HTTP, per-request `_meta`,
+/// `server/discover`, MRTR, `subscriptions/listen`, cacheable results, and the
+/// standard request headers. Gated behind this single predicate so older
+/// versions keep their session/handshake-based behavior.
+bool isDraft(ProtocolVersion v) pure nothrow
+{
+    return v >= ProtocolVersion.draft;
+}
+
+/// Draft+ uses per-request `_meta` (protocolVersion/clientInfo/clientCapabilities)
+/// instead of an `initialize` handshake.
+alias usesPerRequestMeta = isDraft;
+
+/// Draft+ implements `server/discover`.
+alias supportsDiscover = isDraft;
+
+/// Draft+ uses Multi Round-Trip Requests instead of server-initiated requests.
+alias usesMRTR = isDraft;
+
+/// Draft+ uses `subscriptions/listen` instead of GET stream + resources/subscribe.
+alias usesSubscriptionsListen = isDraft;
+
+/// Draft+ returns `ttlMs`/`cacheScope` on cacheable results.
+alias cacheableResults = isDraft;
+
+/// The JSON-RPC error code for "resource not found": draft aligns it to
+/// invalidParams (-32602); earlier versions used the MCP-specific -32002.
+int resourceNotFoundCode(ProtocolVersion v) pure nothrow
+{
+    return v.isDraft ? -32602 : -32002;
+}
+
 unittest  // wire string round-trips for every version
 {
     import std.exception : assertThrown;
 
     assert(ProtocolVersion.v2024_11_05.toWire == "2024-11-05");
-    assert(ProtocolVersion.draft.toWire == "draft");
+    assert(ProtocolVersion.draft.toWire == "2026-07-28");
     assert("2025-06-18".parseVersion == ProtocolVersion.v2025_06_18);
     assert("draft".parseVersion == ProtocolVersion.draft);
+    assert("2026-07-28".parseVersion == ProtocolVersion.draft);
     assertThrown("1999-01-01".parseVersion);
 }
 
@@ -112,4 +151,16 @@ unittest  // feature gating: elicitation introduced in 2025-06-18
     assert(!ProtocolVersion.v2025_03_26.supportsElicitation);
     assert(ProtocolVersion.v2025_06_18.supportsElicitation);
     assert(ProtocolVersion.draft.supportsElicitation);
+}
+
+unittest  // draft feature gates and resource-not-found code
+{
+    assert(ProtocolVersion.draft.isDraft);
+    assert(!ProtocolVersion.v2025_11_25.isDraft);
+    assert(ProtocolVersion.draft.supportsDiscover);
+    assert(ProtocolVersion.draft.usesMRTR);
+    assert(ProtocolVersion.draft.usesSubscriptionsListen);
+    assert(ProtocolVersion.draft.cacheableResults);
+    assert(ProtocolVersion.draft.resourceNotFoundCode == -32602);
+    assert(ProtocolVersion.v2025_11_25.resourceNotFoundCode == -32002);
 }

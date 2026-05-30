@@ -8,6 +8,7 @@ import mcp.protocol.errors;
 import mcp.protocol.jsonrpc;
 import mcp.protocol.capabilities;
 import mcp.protocol.types;
+import mcp.protocol.draft;
 import mcp.server.context;
 
 @safe:
@@ -64,8 +65,12 @@ final class MCPServer
     private bool resourceSubscriptionsEnabled;
     private bool[string] subscriptions;
     private ProtocolVersion negotiated = latestStable;
+    private ProtocolVersion effectiveVersion = latestStable;
     private ClientCapabilities clientCaps;
     private bool initialized;
+    private long cacheTtlMs;
+    private CacheScope cacheScope_ = CacheScope.public_;
+    private bool[string] listenFilters;
 
     this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
     {
@@ -230,6 +235,26 @@ final class MCPServer
 
     private Json handleRequest(Message msg, RequestContext ctx) @safe
     {
+        // Determine the version in effect for THIS request. Draft+ is stateless:
+        // each request carries its protocol version, client identity, and
+        // capabilities in `params._meta` rather than relying on `initialize`.
+        effectiveVersion = negotiated;
+        auto meta = RequestMeta.fromParams(msg.params);
+        if (meta.protocolVersion.length)
+        {
+            ProtocolVersion mv;
+            if (tryParseVersion(meta.protocolVersion, mv))
+            {
+                effectiveVersion = mv;
+                if (mv.isDraft)
+                {
+                    clientCaps = meta.clientCapabilities;
+                    if (!meta.logLevel.isNull)
+                        logLevel = meta.logLevel.get;
+                }
+            }
+        }
+
         try
         {
             auto result = route(msg.method, msg.params, ctx);
@@ -239,6 +264,23 @@ final class MCPServer
             return makeErrorResponse(msg.id, e);
         catch (Exception e)
             return makeErrorResponse(msg.id, internalError(e.msg));
+    }
+
+    /// Configure the `CacheableResult` freshness hint (`ttlMs`/`cacheScope`)
+    /// added to list/read results when speaking the draft protocol.
+    void setCacheHint(long ttlMs, CacheScope scope_ = CacheScope.public_) @safe
+    {
+        cacheTtlMs = ttlMs;
+        cacheScope_ = scope_;
+    }
+
+    /// Apply the draft cacheable-result fields when the effective version is
+    /// draft+. A no-op for earlier versions.
+    private Json maybeCache(Json result) @safe
+    {
+        if (effectiveVersion.cacheableResults)
+            return withCache(result, cacheTtlMs, cacheScope_);
+        return result;
     }
 
     private void handleNotification(Message msg) @safe
@@ -259,6 +301,10 @@ final class MCPServer
         {
         case "initialize":
             return doInitialize(params);
+        case "server/discover":
+            return doDiscover();
+        case "subscriptions/listen":
+            return doSubscribeListen(params);
         case "ping":
             return Json.emptyObject;
         case "tools/list":
@@ -288,6 +334,44 @@ final class MCPServer
         }
     }
 
+    /// `server/discover` (draft): advertise supported versions, capabilities,
+    /// and identity for stateless, up-front version selection.
+    private Json doDiscover() @safe
+    {
+        DiscoverResult d;
+        foreach (v; supportedVersions)
+            d.protocolVersions ~= v.toWire;
+        d.capabilities = capabilities();
+        d.serverInfo = Implementation(serverName, serverVersion);
+        d.instructions = instructions;
+        return d.toJson();
+    }
+
+    /// `subscriptions/listen` (draft): record the opted-in change-notification
+    /// types and acknowledge. The long-lived delivery stream is provided by the
+    /// transport; this records the filter and returns the acknowledgement.
+    private Json doSubscribeListen(Json params) @safe
+    {
+        static immutable known = [
+            "toolsListChanged", "promptsListChanged", "resourcesListChanged",
+            "resourceSubscriptions"
+        ];
+        foreach (k; known)
+            if (params.type == Json.Type.object && k in params
+                    && params[k].type == Json.Type.bool_ && params[k].get!bool)
+                listenFilters[k] = true;
+        Json j = Json.emptyObject;
+        j["acknowledged"] = true;
+        return j;
+    }
+
+    /// Whether the client opted in to a given change-notification type via
+    /// `subscriptions/listen`.
+    bool listensFor(string changeType) const @safe
+    {
+        return (changeType in listenFilters) !is null;
+    }
+
     private Json doListResources(Json /* params */ ) @safe
     {
         import std.algorithm : sort;
@@ -297,7 +381,7 @@ final class MCPServer
         sort(uris);
         foreach (uri; uris)
             result.resources ~= resources[uri].descriptor;
-        return result.toJson();
+        return maybeCache(result.toJson());
     }
 
     private Json doListResourceTemplates(Json /* params */ ) @safe
@@ -305,7 +389,7 @@ final class MCPServer
         ListResourceTemplatesResult result;
         foreach (t; templates)
             result.resourceTemplates ~= t.descriptor;
-        return result.toJson();
+        return maybeCache(result.toJson());
     }
 
     private Json doReadResource(Json params) @safe
@@ -318,7 +402,7 @@ final class MCPServer
         {
             ReadResourceResult result;
             result.contents = [direct.reader()];
-            return result.toJson();
+            return maybeCache(result.toJson());
         }
 
         foreach (t; templates)
@@ -328,10 +412,11 @@ final class MCPServer
             {
                 ReadResourceResult result;
                 result.contents = [t.reader(uri, captured)];
-                return result.toJson();
+                return maybeCache(result.toJson());
             }
         }
-        throw resourceNotFound(uri);
+        // Draft aligns the code to invalidParams (-32602); older versions -32002.
+        throw new McpException(effectiveVersion.resourceNotFoundCode, "Resource not found: " ~ uri);
     }
 
     private Json doSubscribe(Json params) @safe
@@ -359,7 +444,7 @@ final class MCPServer
         sort(names);
         foreach (name; names)
             result.prompts ~= prompts[name].descriptor;
-        return result.toJson();
+        return maybeCache(result.toJson());
     }
 
     private Json doGetPrompt(Json params) @safe
@@ -410,7 +495,7 @@ final class MCPServer
         ListToolsResult result;
         foreach (name; sortedToolNames())
             result.tools ~= tools[name].descriptor;
-        return result.toJson();
+        return maybeCache(result.toJson());
     }
 
     private Json doCallTool(Json params, RequestContext ctx) @safe
@@ -802,4 +887,87 @@ unittest  // subscribe capability is advertised only when enabled
     assert(!s.capabilities().resources.get.subscribe);
     s.enableResourceSubscriptions();
     assert(s.capabilities().resources.get.subscribe);
+}
+
+version (unittest)
+{
+    // A request carrying draft per-request _meta (protocolVersion 2026-07-28).
+    private Message draftReq(long id, string method, Json params = Json.emptyObject) @safe
+    {
+        Json meta = Json.emptyObject;
+        meta[MetaKey.protocolVersion] = "2026-07-28";
+        meta[MetaKey.clientInfo] = Json([
+            "name": Json("c"),
+            "version": Json("1")
+        ]);
+        meta[MetaKey.clientCapabilities] = Json.emptyObject;
+        params["_meta"] = meta;
+        return Message(makeRequest(Json(id), method, params));
+    }
+}
+
+unittest  // server/discover advertises all supported versions + identity
+{
+    auto s = makeTestServer();
+    auto resp = s.handle(draftReq(1, "server/discover")).get;
+    auto pv = resp["result"]["protocolVersions"];
+    bool hasDraft, hasFirst;
+    foreach (i; 0 .. pv.length)
+    {
+        if (pv[i].get!string == "2026-07-28")
+            hasDraft = true;
+        if (pv[i].get!string == "2024-11-05")
+            hasFirst = true;
+    }
+    assert(hasDraft && hasFirst);
+    assert(resp["result"]["serverInfo"]["name"].get!string == "test-srv");
+}
+
+unittest  // draft tools/list carries CacheableResult fields
+{
+    auto s = makeTestServer();
+    s.setCacheHint(5000, CacheScope.private_);
+    auto resp = s.handle(draftReq(2, "tools/list")).get;
+    assert(resp["result"]["ttlMs"].get!long == 5000);
+    assert(resp["result"]["cacheScope"].get!string == "private");
+}
+
+unittest  // pre-draft tools/list has no cache fields
+{
+    auto s = makeTestServer();
+    s.setCacheHint(5000);
+    auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestStable
+    assert("ttlMs" !in resp["result"]);
+}
+
+unittest  // draft resources/read unknown uri uses invalidParams (-32602)
+{
+    auto s = new MCPServer("t", "1");
+    Json p = Json.emptyObject;
+    p["uri"] = "test://missing";
+    auto resp = s.handle(draftReq(3, "resources/read", p)).get;
+    assert(resp["error"]["code"].get!int == -32602);
+}
+
+unittest  // subscriptions/listen records the opted-in filter and acknowledges
+{
+    auto s = makeTestServer();
+    Json p = Json.emptyObject;
+    p["toolsListChanged"] = true;
+    p["resourceSubscriptions"] = true;
+    auto resp = s.handle(draftReq(4, "subscriptions/listen", p)).get;
+    assert(resp["result"]["acknowledged"].get!bool);
+    assert(s.listensFor("toolsListChanged"));
+    assert(s.listensFor("resourceSubscriptions"));
+    assert(!s.listensFor("promptsListChanged"));
+}
+
+unittest  // draft is stateless: tools/call works without a prior initialize
+{
+    auto s = makeTestServer();
+    Json p = Json.emptyObject;
+    p["name"] = "add";
+    p["arguments"] = Json(["a": Json(20), "b": Json(22)]);
+    auto resp = s.handle(draftReq(5, "tools/call", p)).get;
+    assert(resp["result"]["structuredContent"]["result"].get!int == 42);
 }
