@@ -15,3 +15,4 @@ public import mcp.server.context;
 public import mcp.server.server;
 public import mcp.transport.sse_context;
 public import mcp.transport.streamable_http;
+public import mcp.client.client;

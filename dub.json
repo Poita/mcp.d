@@ -20,6 +20,14 @@
 			"mainSourceFile": "conformance/server.d",
 			"sourcePaths": ["source"],
 			"importPaths": ["source"]
+		},
+		{
+			"name": "conformance-client",
+			"targetType": "executable",
+			"targetName": "conformance-client",
+			"mainSourceFile": "conformance/client.d",
+			"sourcePaths": ["source"],
+			"importPaths": ["source"]
 		}
 	]
 }

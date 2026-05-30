@@ -562,6 +562,22 @@ struct ResourceContents
             j["text"] = text;
         return j;
     }
+
+    static ResourceContents fromJson(Json j) @safe
+    {
+        ResourceContents c;
+        c.uri = ("uri" in j) ? j["uri"].get!string : "";
+        if ("mimeType" in j && j["mimeType"].type == Json.Type.string)
+            c.mimeType = j["mimeType"].get!string;
+        if ("blob" in j && j["blob"].type == Json.Type.string)
+        {
+            c.isBlob = true;
+            c.blob = j["blob"].get!string;
+        }
+        else if ("text" in j && j["text"].type == Json.Type.string)
+            c.text = j["text"].get!string;
+        return c;
+    }
 }
 
 /// Result of `resources/list`.
@@ -580,6 +596,20 @@ struct ListResourcesResult
         if (!nextCursor.isNull)
             j["nextCursor"] = nextCursor.get;
         return j;
+    }
+
+    static ListResourcesResult fromJson(Json j) @safe
+    {
+        ListResourcesResult r;
+        if ("resources" in j && j["resources"].type == Json.Type.array)
+        {
+            auto arr = j["resources"];
+            foreach (i; 0 .. arr.length)
+                r.resources ~= Resource.fromJson(arr[i]);
+        }
+        if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
+            r.nextCursor = j["nextCursor"].get!string;
+        return r;
     }
 }
 
@@ -616,6 +646,18 @@ struct ReadResourceResult
         j["contents"] = arr;
         return j;
     }
+
+    static ReadResourceResult fromJson(Json j) @safe
+    {
+        ReadResourceResult r;
+        if ("contents" in j && j["contents"].type == Json.Type.array)
+        {
+            auto arr = j["contents"];
+            foreach (i; 0 .. arr.length)
+                r.contents ~= ResourceContents.fromJson(arr[i]);
+        }
+        return r;
+    }
 }
 
 // ===========================================================================
@@ -638,6 +680,17 @@ struct PromptArgument
         if (required)
             j["required"] = true;
         return j;
+    }
+
+    static PromptArgument fromJson(Json j) @safe
+    {
+        PromptArgument a;
+        a.name = ("name" in j) ? j["name"].get!string : "";
+        if ("description" in j && j["description"].type == Json.Type.string)
+            a.description = j["description"].get!string;
+        if ("required" in j && j["required"].type == Json.Type.bool_)
+            a.required = j["required"].get!bool;
+        return a;
     }
 }
 
@@ -663,6 +716,21 @@ struct Prompt
         }
         return j;
     }
+
+    static Prompt fromJson(Json j) @safe
+    {
+        Prompt p;
+        p.name = ("name" in j) ? j["name"].get!string : "";
+        if ("description" in j && j["description"].type == Json.Type.string)
+            p.description = j["description"].get!string;
+        if ("arguments" in j && j["arguments"].type == Json.Type.array)
+        {
+            auto arr = j["arguments"];
+            foreach (i; 0 .. arr.length)
+                p.arguments ~= PromptArgument.fromJson(arr[i]);
+        }
+        return p;
+    }
 }
 
 /// A single message in a prompt result.
@@ -677,6 +745,15 @@ struct PromptMessage
         j["role"] = role;
         j["content"] = content.toJson();
         return j;
+    }
+
+    static PromptMessage fromJson(Json j) @safe
+    {
+        PromptMessage m;
+        m.role = ("role" in j) ? j["role"].get!string : "";
+        if ("content" in j)
+            m.content = Content.fromJson(j["content"]);
+        return m;
     }
 }
 
@@ -697,6 +774,20 @@ struct ListPromptsResult
             j["nextCursor"] = nextCursor.get;
         return j;
     }
+
+    static ListPromptsResult fromJson(Json j) @safe
+    {
+        ListPromptsResult r;
+        if ("prompts" in j && j["prompts"].type == Json.Type.array)
+        {
+            auto arr = j["prompts"];
+            foreach (i; 0 .. arr.length)
+                r.prompts ~= Prompt.fromJson(arr[i]);
+        }
+        if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
+            r.nextCursor = j["nextCursor"].get!string;
+        return r;
+    }
 }
 
 /// Result of `prompts/get`.
@@ -715,6 +806,20 @@ struct GetPromptResult
             arr ~= m.toJson();
         j["messages"] = arr;
         return j;
+    }
+
+    static GetPromptResult fromJson(Json j) @safe
+    {
+        GetPromptResult r;
+        if ("description" in j && j["description"].type == Json.Type.string)
+            r.description = j["description"].get!string;
+        if ("messages" in j && j["messages"].type == Json.Type.array)
+        {
+            auto arr = j["messages"];
+            foreach (i; 0 .. arr.length)
+                r.messages ~= PromptMessage.fromJson(arr[i]);
+        }
+        return r;
     }
 }
 
@@ -798,4 +903,44 @@ unittest  // CompleteResult nests values under completion with hasMore
     assert(j["completion"]["values"].length == 2);
     assert(j["completion"]["total"].get!int == 150);
     assert(j["completion"]["hasMore"].get!bool == false);
+}
+
+unittest  // Resource/ResourceContents/Prompt/GetPrompt fromJson round-trips
+{
+    Resource r = {
+        uri: "u", name: "n", description: nullable("d"), mimeType: nullable("text/plain")
+    };
+    auto rb = Resource.fromJson(r.toJson());
+    assert(rb.uri == "u" && rb.name == "n" && rb.mimeType.get == "text/plain");
+
+    auto cb = ResourceContents.fromJson(ResourceContents.makeBlob("u",
+            "image/png", "QQ==").toJson());
+    assert(cb.isBlob && cb.blob == "QQ==");
+
+    ListResourcesResult lr;
+    lr.resources = [r];
+    lr.nextCursor = "c";
+    auto lrb = ListResourcesResult.fromJson(lr.toJson());
+    assert(lrb.resources.length == 1 && lrb.nextCursor.get == "c");
+
+    ReadResourceResult rr;
+    rr.contents = [ResourceContents.makeText("u", "text/plain", "hi")];
+    assert(ReadResourceResult.fromJson(rr.toJson()).contents[0].text == "hi");
+}
+
+unittest  // Prompt + GetPromptResult fromJson round-trips
+{
+    Prompt p = {name: "greet", description: nullable("g")};
+    p.arguments = [PromptArgument("who", nullable("name"), true)];
+    auto pb = Prompt.fromJson(p.toJson());
+    assert(pb.name == "greet" && pb.arguments.length == 1 && pb.arguments[0].required);
+
+    ListPromptsResult lp;
+    lp.prompts = [p];
+    assert(ListPromptsResult.fromJson(lp.toJson()).prompts[0].name == "greet");
+
+    GetPromptResult gp;
+    gp.messages = [PromptMessage("user", Content.makeText("hi"))];
+    auto gpb = GetPromptResult.fromJson(gp.toJson());
+    assert(gpb.messages.length == 1 && gpb.messages[0].content.text == "hi");
 }
