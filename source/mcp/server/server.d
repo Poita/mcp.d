@@ -123,6 +123,7 @@ final class MCPServer
     private CacheScope cacheScope_ = CacheScope.public_;
     private bool[string] listenFilters;
     private ServerPushChannel pushChannel;
+    private bool toolListChangedEnabled;
 
     this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
     {
@@ -161,6 +162,41 @@ final class MCPServer
     void registerTool(Tool descriptor, MrtrToolHandler handler) @safe
     {
         tools[descriptor.name] = RegisteredTool(descriptor, handler);
+    }
+
+    /// Unregister a previously registered tool by name. Returns `true` if a tool
+    /// was removed, `false` if no tool with that name was registered. Pair with
+    /// `notifyToolsListChanged` to inform connected clients that the tool list
+    /// changed.
+    bool removeTool(string name) @safe
+    {
+        if ((name in tools) is null)
+            return false;
+        tools.remove(name);
+        return true;
+    }
+
+    /// Advertise the tools `listChanged` capability so `capabilities()` emits
+    /// `tools: { listChanged: true }`. Declare this (before `initialize` /
+    /// `server/discover`) when the server may add or remove tools at runtime and
+    /// will emit `notifications/tools/list_changed` via `notifyToolsListChanged`.
+    void enableToolListChanged() @safe
+    {
+        toolListChangedEnabled = true;
+    }
+
+    /// Broadcast a `notifications/tools/list_changed` to every client listening
+    /// on the standalone GET SSE stream, informing them the set of available
+    /// tools changed (per the server/tools List Changed Notification). Returns
+    /// the number of listeners reached; `0` when no GET stream is open. Call
+    /// after a runtime `registerTool` / `removeTool`. For the draft protocol,
+    /// the notification is suppressed unless a client opted in via
+    /// `subscriptions/listen` with `toolsListChanged:true`.
+    size_t notifyToolsListChanged() @safe
+    {
+        if (effectiveVersion.isDraft && !listensFor("toolsListChanged"))
+            return 0;
+        return notify("notifications/tools/list_changed");
     }
 
     /// The capabilities advertised by the connected client (valid after
@@ -314,7 +350,7 @@ final class MCPServer
     {
         ServerCapabilities caps;
         if (tools.length > 0)
-            caps.tools = ListChangedCapability(false);
+            caps.tools = ListChangedCapability(toolListChangedEnabled);
         if (resources.length > 0 || templates.length > 0)
             caps.resources = ResourcesCapability(resourceSubscriptionsEnabled, false);
         if (prompts.length > 0)
@@ -1478,4 +1514,58 @@ unittest  // notify delivers unsolicited notifications to GET-stream listeners
     import std.algorithm : canFind;
 
     assert(received[0].canFind("notifications/resources/updated"));
+}
+
+unittest  // tools listChanged is not advertised by default
+{
+    auto s = new MCPServer("t", "1");
+    Tool add = {name: "add"};
+    s.registerTool(add, (Json) @safe { return CallToolResult(); });
+    auto caps = s.capabilities();
+    assert(!caps.tools.isNull);
+    assert(!caps.tools.get.listChanged);
+}
+
+unittest  // enableToolListChanged advertises listChanged:true for tools
+{
+    auto s = new MCPServer("t", "1");
+    Tool add = {name: "add"};
+    s.registerTool(add, (Json) @safe { return CallToolResult(); });
+    s.enableToolListChanged();
+    auto caps = s.capabilities();
+    assert(!caps.tools.isNull);
+    assert(caps.tools.get.listChanged);
+    assert(caps.toJson()["tools"]["listChanged"].get!bool);
+}
+
+unittest  // removeTool unregisters a previously registered tool
+{
+    auto s = new MCPServer("t", "1");
+    Tool add = {name: "add"};
+    s.registerTool(add, (Json) @safe { return CallToolResult(); });
+    assert(s.removeTool("add"));
+    auto resp = s.handle(req(1, "tools/list")).get;
+    assert(resp["result"]["tools"].length == 0);
+    assert(!s.removeTool("add")); // already gone
+}
+
+unittest  // notifyToolsListChanged broadcasts notifications/tools/list_changed
+{
+    auto s = new MCPServer("t", "1");
+    auto coord = new StreamCoordinator;
+    auto ch = s.serverPushChannel(coord);
+    string[] received;
+    ch.addListener((string f) @safe { received ~= f; });
+    const n = s.notifyToolsListChanged();
+    assert(n == 1);
+    import std.algorithm : canFind;
+
+    assert(received.length == 1);
+    assert(received[0].canFind("notifications/tools/list_changed"));
+}
+
+unittest  // notifyToolsListChanged is a no-op before a push channel exists
+{
+    auto s = new MCPServer("t", "1");
+    assert(s.notifyToolsListChanged() == 0);
 }
