@@ -469,6 +469,44 @@ final class MCPClient
         });
     }
 
+    /// Extract complete SSE events (terminated by a blank line) from `acc`,
+    /// dispatch each as an inbound message, and return the unconsumed remainder.
+    private string drainSseEvents(string acc) @safe
+    {
+        import std.array : replace;
+        import std.string : indexOf, splitLines, startsWith;
+
+        acc = acc.replace("\r\n", "\n");
+        for (;;)
+        {
+            const b = acc.indexOf("\n\n");
+            if (b < 0)
+                break;
+            auto event = acc[0 .. b];
+            acc = acc[b + 2 .. $];
+            string data;
+            foreach (line; event.splitLines())
+            {
+                if (line.startsWith("data:"))
+                {
+                    auto d = line["data:".length .. $];
+                    if (d.startsWith(" "))
+                        d = d[1 .. $];
+                    data ~= (data.length ? "\n" : "") ~ d;
+                }
+            }
+            if (data.length)
+            {
+                try
+                    dispatchInbound(Message(parseJsonString(data)));
+                catch (Exception)
+                {
+                }
+            }
+        }
+        return acc;
+    }
+
     private void runServerStream() @safe
     {
         () @trusted {
@@ -485,37 +523,35 @@ final class MCPClient
                     res.dropBody();
                     return;
                 }
-                string dataBuf;
+                import vibe.core.stream : IOMode;
+
+                // Read by blocking on leastSize (which waits for data on an idle
+                // long-lived stream and returns 0 only at EOF), accumulating SSE
+                // events separated by blank lines.
+                ubyte[4096] buf;
+                string acc;
                 for (;;)
                 {
-                    string line;
+                    size_t n;
                     bool eof;
                     try
-                        line = cast(string) readLine(res.bodyReader, size_t.max, "\n").idup;
+                    {
+                        const avail = res.bodyReader.leastSize;
+                        if (avail == 0)
+                            eof = true;
+                        else
+                        {
+                            const toRead = avail > buf.length ? buf.length : cast(size_t) avail;
+                            res.bodyReader.read(buf[0 .. toRead], IOMode.once);
+                            n = toRead;
+                        }
+                    }
                     catch (Exception)
                         eof = true;
                     if (eof)
                         break;
-                    if (line.length && line[$ - 1] == '\r')
-                        line = line[0 .. $ - 1];
-                    if (line.length == 0)
-                    {
-                        if (dataBuf.length)
-                        {
-                            try
-                                dispatchInbound(Message(parseJsonString(dataBuf)));
-                            catch (Exception e)
-                                dataBuf = null;
-                        }
-                        continue;
-                    }
-                    if (line.startsWith("data:"))
-                    {
-                        auto d = line["data:".length .. $];
-                        if (d.startsWith(" "))
-                            d = d[1 .. $];
-                        dataBuf ~= (dataBuf.length ? "\n" : "") ~ d;
-                    }
+                    acc ~= cast(string) buf[0 .. n].idup;
+                    acc = drainSseEvents(acc);
                 }
             });
         }();
