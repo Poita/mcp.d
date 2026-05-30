@@ -221,6 +221,9 @@ struct AuthorizationServerMetadata
     string[] scopesSupported;
     string[] grantTypesSupported;
     string[] tokenEndpointAuthMethodsSupported;
+    /// RFC 9207: whether the AS includes the `iss` parameter in authorization
+    /// responses. When true, clients MUST require and validate `iss`.
+    bool authorizationResponseIssParameterSupported;
 
     /// PKCE S256 support is mandatory for MCP; clients MUST refuse otherwise.
     bool supportsS256() const @safe
@@ -242,6 +245,8 @@ struct AuthorizationServerMetadata
         m.grantTypesSupported = stringArray(j, "grant_types_supported");
         m.tokenEndpointAuthMethodsSupported = stringArray(j,
                 "token_endpoint_auth_methods_supported");
+        m.authorizationResponseIssParameterSupported = boolField(j,
+                "authorization_response_iss_parameter_supported");
         return m;
     }
 }
@@ -249,6 +254,11 @@ struct AuthorizationServerMetadata
 private string strField(Json j, string key) @safe
 {
     return (key in j && j[key].type == Json.Type.string) ? j[key].get!string : null;
+}
+
+private bool boolField(Json j, string key) @safe
+{
+    return (key in j && j[key].type == Json.Type.bool_) ? j[key].get!bool : false;
 }
 
 private string[] stringArray(Json j, string key) @safe
@@ -732,4 +742,78 @@ unittest  // extractQueryParam pulls and decodes a parameter
     assert(extractQueryParam("http://x/cb?code=a%20b", "code") == "a b");
     assert(extractQueryParam("http://x/cb?state=xyz", "code") == "");
     assert(extractQueryParam("http://x/cb", "code") == "");
+}
+
+/// Validate the RFC 9207 `iss` authorization-response parameter against the
+/// recorded issuer of the selected authorization server, per RFC 9207
+/// Section 2.4 (the MCP 2025-11-25 / draft "Authorization Response Validation"
+/// requirement, mitigating authorization-server mix-up attacks).
+///
+/// `responseIss` is the raw `iss` value extracted from the authorization
+/// redirect (empty when absent); `recordedIssuer` is the `issuer` value from the
+/// selected AS's validated metadata; `issParameterSupported` reflects the AS's
+/// `authorization_response_iss_parameter_supported` metadata.
+///
+/// The comparison is a simple string comparison with no normalization. Returns
+/// `true` when the response is acceptable; `false` when it MUST be rejected
+/// (without acting on the authorization code or any error parameters):
+///   - iss present and != recordedIssuer  -> reject (mismatch)
+///   - iss absent but issParameterSupported -> reject (required but missing)
+///   - iss present and == recordedIssuer  -> accept
+///   - iss absent and not supported       -> accept (nothing to validate)
+bool validateAuthorizationResponseIss(string responseIss, string recordedIssuer,
+        bool issParameterSupported) @safe pure nothrow @nogc
+{
+    if (responseIss.length)
+        return responseIss == recordedIssuer;
+    // iss absent: only acceptable when the AS does not advertise iss support.
+    return !issParameterSupported;
+}
+
+unittest  // iss present and matching the recorded issuer is accepted
+{
+    assert(validateAuthorizationResponseIss("https://as.example.com",
+            "https://as.example.com", true));
+}
+
+unittest  // iss present but mismatched is rejected (mix-up protection)
+{
+    assert(!validateAuthorizationResponseIss("https://evil.example.com",
+            "https://as.example.com", true));
+}
+
+unittest  // iss comparison is raw string comparison with no normalization
+{
+    // Trailing slash difference must NOT be normalized away.
+    assert(!validateAuthorizationResponseIss("https://as.example.com/",
+            "https://as.example.com", false));
+}
+
+unittest  // iss absent but advertised as supported is rejected
+{
+    assert(!validateAuthorizationResponseIss("", "https://as.example.com", true));
+}
+
+unittest  // iss absent and not advertised is accepted (nothing to validate)
+{
+    assert(validateAuthorizationResponseIss("", "https://as.example.com", false));
+}
+
+unittest  // metadata parses authorization_response_iss_parameter_supported
+{
+    import vibe.data.json : parseJsonString;
+
+    auto j = parseJsonString(
+            `{"issuer":"https://as.example.com","authorization_response_iss_parameter_supported":true}`);
+    auto m = AuthorizationServerMetadata.fromJson(j);
+    assert(m.authorizationResponseIssParameterSupported);
+}
+
+unittest  // metadata defaults iss-parameter-supported to false when absent
+{
+    import vibe.data.json : parseJsonString;
+
+    auto j = parseJsonString(`{"issuer":"https://as.example.com"}`);
+    auto m = AuthorizationServerMetadata.fromJson(j);
+    assert(!m.authorizationResponseIssParameterSupported);
 }
