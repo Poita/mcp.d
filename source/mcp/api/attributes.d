@@ -49,10 +49,14 @@ struct toolAnnotations
 
 /// UDA marking a method as an MCP prompt. The method returns the prompt's
 /// messages (a `PromptMessage[]`, a `GetPromptResult`, or a `string`).
+///
+/// An optional human-readable `title` may be supplied for display purposes; it
+/// is independent of the programmatic `name`.
 struct prompt
 {
     string name;
     string description;
+    string title; /// optional human-readable display name (empty = unset)
 }
 
 /// UDA marking a method as a static MCP resource. The method takes no arguments

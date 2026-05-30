@@ -228,6 +228,8 @@ private void registerPromptMethod(T, string memberName, alias overload)(
 {
     Prompt descriptor;
     descriptor.name = attr.name;
+    if (attr.title.length)
+        descriptor.title = nullable(attr.title);
     if (attr.description.length)
         descriptor.description = nullable(attr.description);
     alias names = ParameterIdentifierTuple!overload;
@@ -392,6 +394,12 @@ version (unittest)
         {
             return "Tell me about " ~ topic;
         }
+
+        @prompt("summary", "Summary prompt", "Summarize Text")
+        string summary(string topic) @safe
+        {
+            return "Summarize " ~ topic;
+        }
     }
 }
 
@@ -517,6 +525,35 @@ unittest  // @resource and @prompt reflection register and dispatch
     pp["arguments"] = Json(["topic": Json("MCP")]);
     auto pr = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
     assert(pr["result"]["messages"][0]["content"]["text"].get!string == "Tell me about MCP");
+}
+
+unittest  // @prompt reflection: optional title is emitted in prompts/list
+{
+    import mcp.protocol.jsonrpc : Message, makeRequest;
+
+    auto s = new MCPServer("t", "1");
+    registerHandlers(s, new DemoApi);
+
+    auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
+            Json.emptyObject))).get["result"]["prompts"];
+
+    bool foundIntro, foundSummary;
+    foreach (i; 0 .. prompts.length)
+    {
+        auto name = prompts[i]["name"].get!string;
+        if (name == "intro")
+        {
+            foundIntro = true;
+            // A prompt without a title carries none on the wire.
+            assert("title" !in prompts[i]);
+        }
+        else if (name == "summary")
+        {
+            foundSummary = true;
+            assert(prompts[i]["title"].get!string == "Summarize Text");
+        }
+    }
+    assert(foundIntro && foundSummary);
 }
 
 unittest  // @resourceAnnotations reflection: annotations appear in resources/list
