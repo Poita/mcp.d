@@ -124,6 +124,7 @@ final class MCPServer
     private bool[string] listenFilters;
     private ServerPushChannel pushChannel;
     private bool toolListChangedEnabled;
+    private bool resourcesListChangedEnabled;
     private bool validateOutputSchema_;
 
     this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
@@ -214,6 +215,21 @@ final class MCPServer
         return notify("notifications/tools/list_changed");
     }
 
+    /// Broadcast a `notifications/resources/list_changed` to every client
+    /// listening on the standalone GET SSE stream, informing them the set of
+    /// available resources changed (per the server/resources List Changed
+    /// Notification). Returns the number of listeners reached; `0` when no GET
+    /// stream is open. Call after a runtime `registerResource` /
+    /// `registerResourceTemplate` (or a removal). For the draft protocol, the
+    /// notification is suppressed unless a client opted in via
+    /// `subscriptions/listen` with `resourcesListChanged:true`.
+    size_t notifyResourcesListChanged() @safe
+    {
+        if (effectiveVersion.isDraft && !listensFor("resourcesListChanged"))
+            return 0;
+        return notify("notifications/resources/list_changed");
+    }
+
     /// Notify subscribers that a watched resource changed by emitting a
     /// `notifications/resources/updated` on the standalone GET SSE stream (per
     /// server/resources Subscriptions: "Server delivers
@@ -293,6 +309,16 @@ final class MCPServer
     void enableResourceSubscriptions() @safe
     {
         resourceSubscriptionsEnabled = true;
+    }
+
+    /// Advertise the resources `listChanged` capability so `capabilities()`
+    /// emits `resources: { listChanged: true }`. Declare this (before
+    /// `initialize` / `server/discover`) when the server may add or remove
+    /// resources or resource templates at runtime and will emit
+    /// `notifications/resources/list_changed` via `notifyResourcesListChanged`.
+    void enableResourcesListChanged() @safe
+    {
+        resourcesListChangedEnabled = true;
     }
 
     /// Advertise the 2025-11-25 `tasks` capability (support for task-augmented
@@ -391,7 +417,8 @@ final class MCPServer
         if (tools.length > 0)
             caps.tools = ListChangedCapability(toolListChangedEnabled);
         if (resources.length > 0 || templates.length > 0)
-            caps.resources = ResourcesCapability(resourceSubscriptionsEnabled, false);
+            caps.resources = ResourcesCapability(resourceSubscriptionsEnabled,
+                    resourcesListChangedEnabled);
         if (prompts.length > 0)
             caps.prompts = ListChangedCapability(false);
         if (completionHandler !is null)
@@ -1782,4 +1809,47 @@ unittest  // notifyToolsListChanged is a no-op before a push channel exists
 {
     auto s = new MCPServer("t", "1");
     assert(s.notifyToolsListChanged() == 0);
+}
+
+unittest  // resources listChanged is not advertised by default
+{
+    auto s = new MCPServer("t", "1");
+    Resource r = {uri: "test://r", name: "r"};
+    s.registerResource(r, () @safe => ResourceContents.makeText("test://r", "text/plain", "x"));
+    auto caps = s.capabilities();
+    assert(!caps.resources.isNull);
+    assert(!caps.resources.get.listChanged);
+}
+
+unittest  // enableResourcesListChanged advertises listChanged:true for resources
+{
+    auto s = new MCPServer("t", "1");
+    Resource r = {uri: "test://r", name: "r"};
+    s.registerResource(r, () @safe => ResourceContents.makeText("test://r", "text/plain", "x"));
+    s.enableResourcesListChanged();
+    auto caps = s.capabilities();
+    assert(!caps.resources.isNull);
+    assert(caps.resources.get.listChanged);
+    assert(caps.toJson()["resources"]["listChanged"].get!bool);
+}
+
+unittest  // notifyResourcesListChanged broadcasts notifications/resources/list_changed
+{
+    auto s = new MCPServer("t", "1");
+    auto coord = new StreamCoordinator;
+    auto ch = s.serverPushChannel(coord);
+    string[] received;
+    ch.addListener((string f) @safe { received ~= f; });
+    const n = s.notifyResourcesListChanged();
+    assert(n == 1);
+    import std.algorithm : canFind;
+
+    assert(received.length == 1);
+    assert(received[0].canFind("notifications/resources/list_changed"));
+}
+
+unittest  // notifyResourcesListChanged is a no-op before a push channel exists
+{
+    auto s = new MCPServer("t", "1");
+    assert(s.notifyResourcesListChanged() == 0);
 }
