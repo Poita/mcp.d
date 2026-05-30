@@ -1370,6 +1370,30 @@ final class MCPClient
         case "elicitation/create":
             if (onElicitation is null)
                 throw methodNotFound(method);
+            // Per client/elicitation §Error Handling (2025-11-25): reject a
+            // request whose `mode` was not declared in client capabilities with
+            // -32602 (Invalid params). `mode` defaults to "form" when absent.
+            // A bare `elicitation` declaration is equivalent to form-mode only,
+            // so `elicitation` alone satisfies the form case.
+            {
+                const mode = ("mode" in params && params["mode"].type == Json.Type.string) ? params["mode"]
+                    .get!string : "form";
+                bool supported;
+                switch (mode)
+                {
+                case "form":
+                    supported = capabilities.elicitationForm || capabilities.elicitation;
+                    break;
+                case "url":
+                    supported = capabilities.elicitationUrl;
+                    break;
+                default:
+                    supported = false;
+                    break;
+                }
+                if (!supported)
+                    throw invalidParams("Unsupported elicitation mode: " ~ mode);
+            }
             return onElicitation(params);
         case "roots/list":
             if (onListRoots is null)
@@ -1790,5 +1814,104 @@ unittest  // sampling dispatch forwards a valid request to the delegate
     params["messages"] = Json([m]);
 
     c.dispatchServerMethod("sampling/createMessage", params);
+    assert(delegateCalled);
+}
+
+unittest  // elicitation/create rejects a mode the client did not advertise (-32602)
+{
+    auto c = new MCPClient("http://localhost");
+    // Advertise form mode only (the default bare elicitation declaration).
+    c.capabilities.elicitation = true;
+    c.capabilities.elicitationForm = true;
+
+    bool delegateCalled;
+    c.onElicitation = (Json params) @safe {
+        delegateCalled = true;
+        return Json.emptyObject;
+    };
+
+    Json params = Json.emptyObject;
+    params["mode"] = "url"; // not advertised
+    params["url"] = "https://example.com/elicit";
+    params["elicitationId"] = "e1";
+
+    bool threw;
+    try
+        c.dispatchServerMethod("elicitation/create", params);
+    catch (McpException e)
+    {
+        threw = true;
+        assert(e.code == ErrorCode.invalidParams);
+    }
+    assert(threw);
+    assert(!delegateCalled); // validation runs before the delegate
+}
+
+unittest  // elicitation/create rejects an unknown mode (-32602)
+{
+    auto c = new MCPClient("http://localhost");
+    c.capabilities.elicitation = true;
+    c.capabilities.elicitationForm = true;
+
+    bool delegateCalled;
+    c.onElicitation = (Json params) @safe {
+        delegateCalled = true;
+        return Json.emptyObject;
+    };
+
+    Json params = Json.emptyObject;
+    params["mode"] = "telepathy"; // not a known mode
+
+    bool threw;
+    try
+        c.dispatchServerMethod("elicitation/create", params);
+    catch (McpException e)
+    {
+        threw = true;
+        assert(e.code == ErrorCode.invalidParams);
+    }
+    assert(threw);
+    assert(!delegateCalled);
+}
+
+unittest  // elicitation/create forwards an advertised mode to the delegate
+{
+    auto c = new MCPClient("http://localhost");
+    c.capabilities.elicitation = true;
+    c.capabilities.elicitationForm = true;
+    c.capabilities.elicitationUrl = true;
+
+    bool delegateCalled;
+    c.onElicitation = (Json params) @safe {
+        delegateCalled = true;
+        return Json.emptyObject;
+    };
+
+    Json params = Json.emptyObject;
+    params["mode"] = "url";
+    params["url"] = "https://example.com/elicit";
+    params["elicitationId"] = "e1";
+
+    c.dispatchServerMethod("elicitation/create", params);
+    assert(delegateCalled);
+}
+
+unittest  // elicitation/create defaults to form mode when mode is absent
+{
+    auto c = new MCPClient("http://localhost");
+    c.capabilities.elicitation = true;
+    c.capabilities.elicitationForm = true;
+
+    bool delegateCalled;
+    c.onElicitation = (Json params) @safe {
+        delegateCalled = true;
+        return Json.emptyObject;
+    };
+
+    Json params = Json.emptyObject;
+    params["message"] = "Please fill this in";
+    params["requestedSchema"] = Json.emptyObject;
+
+    c.dispatchServerMethod("elicitation/create", params);
     assert(delegateCalled);
 }
