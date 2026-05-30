@@ -57,7 +57,10 @@ final class MCPServer
     private CompleteResult delegate(Json params) @safe completionHandler;
     private bool loggingEnabled;
     private string logLevel = "info";
+    private bool resourceSubscriptionsEnabled;
+    private bool[string] subscriptions;
     private ProtocolVersion negotiated = latestStable;
+    private ClientCapabilities clientCaps;
     private bool initialized;
 
     this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
@@ -112,6 +115,19 @@ final class MCPServer
         loggingEnabled = true;
     }
 
+    /// Advertise the resources `subscribe` capability and accept
+    /// `resources/subscribe` + `resources/unsubscribe`.
+    void enableResourceSubscriptions() @safe
+    {
+        resourceSubscriptionsEnabled = true;
+    }
+
+    /// Whether a client is currently subscribed to updates for `uri`.
+    bool isSubscribed(string uri) const @safe
+    {
+        return (uri in subscriptions) !is null;
+    }
+
     /// The most recently set log level (default "info").
     string currentLogLevel() const @safe
     {
@@ -125,7 +141,7 @@ final class MCPServer
         if (tools.length > 0)
             caps.tools = ListChangedCapability(false);
         if (resources.length > 0 || templates.length > 0)
-            caps.resources = ResourcesCapability(false, false);
+            caps.resources = ResourcesCapability(resourceSubscriptionsEnabled, false);
         if (prompts.length > 0)
             caps.prompts = ListChangedCapability(false);
         if (completionHandler !is null)
@@ -228,6 +244,10 @@ final class MCPServer
             return doListResourceTemplates(params);
         case "resources/read":
             return doReadResource(params);
+        case "resources/subscribe":
+            return doSubscribe(params);
+        case "resources/unsubscribe":
+            return doUnsubscribe(params);
         case "prompts/list":
             return doListPrompts(params);
         case "prompts/get":
@@ -287,6 +307,22 @@ final class MCPServer
         throw resourceNotFound(uri);
     }
 
+    private Json doSubscribe(Json params) @safe
+    {
+        if ("uri" !in params || params["uri"].type != Json.Type.string)
+            throw invalidParams("resources/subscribe requires a string 'uri'");
+        subscriptions[params["uri"].get!string] = true;
+        return Json.emptyObject;
+    }
+
+    private Json doUnsubscribe(Json params) @safe
+    {
+        if ("uri" !in params || params["uri"].type != Json.Type.string)
+            throw invalidParams("resources/unsubscribe requires a string 'uri'");
+        subscriptions.remove(params["uri"].get!string);
+        return Json.emptyObject;
+    }
+
     private Json doListPrompts(Json /* params */ ) @safe
     {
         import std.algorithm : sort;
@@ -332,6 +368,7 @@ final class MCPServer
     {
         auto p = InitializeParams.fromJson(params);
         negotiated = negotiate(p.protocolVersion);
+        clientCaps = p.capabilities;
 
         InitializeResult result;
         result.protocolVersion = negotiated.toWire;
@@ -713,4 +750,29 @@ unittest  // capabilities reflect registered features
     assert(!caps.resources.isNull);
     assert(caps.logging);
     assert(caps.prompts.isNull);
+}
+
+unittest  // resources/subscribe and unsubscribe track URIs and return {}
+{
+    auto s = new MCPServer("t", "1");
+    s.enableResourceSubscriptions();
+    Json p = Json.emptyObject;
+    p["uri"] = "test://w";
+    auto sub = s.handle(req(1, "resources/subscribe", p)).get;
+    assert(sub["result"].type == Json.Type.object && sub["result"].length == 0);
+    assert(s.isSubscribed("test://w"));
+
+    auto unsub = s.handle(req(2, "resources/unsubscribe", p)).get;
+    assert(unsub["result"].length == 0);
+    assert(!s.isSubscribed("test://w"));
+}
+
+unittest  // subscribe capability is advertised only when enabled
+{
+    auto s = new MCPServer("t", "1");
+    Resource r = {uri: "u", name: "u"};
+    s.registerResource(r, () @safe => ResourceContents.makeText("u", "text/plain", "x"));
+    assert(!s.capabilities().resources.get.subscribe);
+    s.enableResourceSubscriptions();
+    assert(s.capabilities().resources.get.subscribe);
 }

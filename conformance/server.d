@@ -34,6 +34,7 @@ void main(string[] args)
     registerResourceFixtures(server);
     registerPromptFixtures(server);
     server.enableLogging();
+    server.enableResourceSubscriptions();
     server.setCompletionHandler((Json params) @safe {
         CompleteResult r;
         r.values = ["paris", "park", "party"];
