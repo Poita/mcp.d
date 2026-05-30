@@ -65,6 +65,8 @@ final class MCPClient
     private Json legacyResult;
     private bool legacyGot;
     private McpException legacyErr;
+    // Opt-in: validate tool results against the tool's outputSchema (client side).
+    private bool validateOutputSchema_;
 
     /// Capabilities this client advertises at initialize.
     ClientCapabilities capabilities;
@@ -243,6 +245,53 @@ final class MCPClient
         p["name"] = name;
         p["arguments"] = arguments;
         return CallToolResult.fromJson(rpc("tools/call", p));
+    }
+
+    /// `tools/call` for a tool whose descriptor (and therefore `outputSchema`) is
+    /// known — typically one returned by `listTools`. When the client has output-
+    /// schema validation enabled (see `enableOutputSchemaValidation`) and `tool`
+    /// carries an `outputSchema`, the returned `structuredContent` is validated
+    /// against it: per the spec, "Clients SHOULD validate structured results
+    /// against this schema." A non-conforming result raises a clear
+    /// `McpException` rather than being accepted silently.
+    CallToolResult callTool(const Tool tool, Json arguments = Json.emptyObject) @safe
+    {
+        auto result = callTool(tool.name, arguments);
+        if (validateOutputSchema_)
+        {
+            const msg = validateOutput(tool, result);
+            if (msg.length)
+                throw new McpException(ErrorCode.invalidParams,
+                        "Tool '" ~ tool.name
+                        ~ "' returned structuredContent that does not conform to its outputSchema: "
+                        ~ msg);
+        }
+        return result;
+    }
+
+    /// Opt in to validating tool results against the tool's `outputSchema` when
+    /// calling `callTool(Tool, ...)`. Off by default; existing call sites are
+    /// unaffected.
+    void enableOutputSchemaValidation() @safe
+    {
+        validateOutputSchema_ = true;
+    }
+
+    /// Validate a `CallToolResult`'s `structuredContent` against `tool`'s
+    /// `outputSchema`, independent of the opt-in flag. Returns an empty string
+    /// when it conforms (including when the tool has no output schema or the
+    /// result has no structured content), otherwise a description of the first
+    /// violation. Exposed so callers can validate explicitly without enabling
+    /// automatic validation.
+    static string validateOutput(const Tool tool, const CallToolResult result) @safe
+    {
+        import mcp.api.schema : validateAgainstSchema;
+
+        if (tool.outputSchema.type != Json.Type.object)
+            return "";
+        if (result.structuredContent.type == Json.Type.undefined)
+            return "";
+        return validateAgainstSchema(result.structuredContent, tool.outputSchema);
     }
 
     /// `resources/list`, auto-paginated.
@@ -1519,4 +1568,56 @@ unittest  // resolveEndpointUri resolves a relative path against the base direct
 {
     assert(resolveEndpointUri("http://host:8080/api/sse",
             "messages") == "http://host:8080/api/messages");
+}
+
+unittest  // validateOutput passes a conforming structured result
+{
+    import mcp.api.schema : jsonSchemaOf;
+
+    struct AddResult
+    {
+        int result;
+    }
+
+    Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+    CallToolResult r;
+    r.structuredContent = Json(["result": Json(5)]);
+    assert(MCPClient.validateOutput(t, r) == "");
+}
+
+unittest  // validateOutput rejects a non-conforming structured result
+{
+    import mcp.api.schema : jsonSchemaOf;
+
+    struct AddResult
+    {
+        int result;
+    }
+
+    Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+    CallToolResult r;
+    r.structuredContent = Json(["result": Json("oops")]);
+    assert(MCPClient.validateOutput(t, r).length > 0);
+}
+
+unittest  // validateOutput is a no-op when the tool has no output schema
+{
+    Tool t = {name: "noschema"};
+    CallToolResult r;
+    r.structuredContent = Json(["anything": Json(1)]);
+    assert(MCPClient.validateOutput(t, r) == "");
+}
+
+unittest  // validateOutput is a no-op when there is no structured content
+{
+    import mcp.api.schema : jsonSchemaOf;
+
+    struct AddResult
+    {
+        int result;
+    }
+
+    Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+    CallToolResult r; // structuredContent stays undefined
+    assert(MCPClient.validateOutput(t, r) == "");
 }

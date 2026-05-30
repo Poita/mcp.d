@@ -124,6 +124,7 @@ final class MCPServer
     private bool[string] listenFilters;
     private ServerPushChannel pushChannel;
     private bool toolListChangedEnabled;
+    private bool validateOutputSchema_;
 
     this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
     {
@@ -183,6 +184,20 @@ final class MCPServer
     void enableToolListChanged() @safe
     {
         toolListChangedEnabled = true;
+    }
+
+    /// Opt in to validating each tool's `structuredContent` against its
+    /// registered `outputSchema` before the result is sent. Per the spec,
+    /// "If an output schema is provided: Servers MUST provide structured results
+    /// that conform to this schema." With validation enabled, a handler that
+    /// emits non-conforming `structuredContent` surfaces a clear internal error
+    /// (so the bug is caught at the server) rather than silently shipping bad
+    /// output. Tools without an `outputSchema`, and results without
+    /// `structuredContent`, are unaffected. Off by default to preserve existing
+    /// behaviour.
+    void enableOutputSchemaValidation() @safe
+    {
+        validateOutputSchema_ = true;
     }
 
     /// Broadcast a `notifications/tools/list_changed` to every client listening
@@ -727,7 +742,13 @@ final class MCPServer
 
         Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
         try
-            return entry.handler(args, ctx).toJson(); // CallToolResult or InputRequiredResult
+        {
+            // CallToolResult or InputRequiredResult.
+            auto result = entry.handler(args, ctx).toJson();
+            if (validateOutputSchema_)
+                checkOutputSchema(entry.descriptor, result);
+            return result;
+        }
         catch (McpException e)
             throw e; // protocol-level errors propagate as JSON-RPC errors
         catch (Exception e)
@@ -739,6 +760,25 @@ final class MCPServer
             err.isError = true;
             return err.toJson();
         }
+    }
+
+    /// When output-schema validation is enabled, verify that a tool result's
+    /// `structuredContent` conforms to the tool's registered `outputSchema`.
+    /// No-op when the tool has no output schema or the result carries no
+    /// structured content. Throws an internal `McpException` on a violation.
+    private static void checkOutputSchema(ref const Tool descriptor, Json result) @safe
+    {
+        import mcp.api.schema : validateAgainstSchema;
+
+        if (descriptor.outputSchema.type != Json.Type.object)
+            return;
+        if (result.type != Json.Type.object || "structuredContent" !in result)
+            return;
+        const msg = validateAgainstSchema(result["structuredContent"], descriptor.outputSchema);
+        if (msg.length)
+            throw new McpException(ErrorCode.internalError, "Tool '" ~ descriptor.name
+                    ~ "' produced structuredContent that does not conform to its outputSchema: "
+                    ~ msg);
     }
 
     private string[] sortedToolNames() const @safe
@@ -917,6 +957,89 @@ unittest  // tools/call with unknown tool is an invalid-params protocol error
     params["name"] = "missing";
     auto resp = s.handle(req(5, "tools/call", params)).get;
     assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // output-schema validation: conforming structuredContent passes
+{
+    import mcp.api.schema : jsonSchemaOf;
+
+    auto s = new MCPServer("vsrv", "0.1.0");
+    struct AddResult
+    {
+        int result;
+    }
+
+    Tool add = {
+        name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
+    };
+    s.registerTool(add, (Json args) @safe {
+        CallToolResult r;
+        r.content = [Content.makeText("sum")];
+        r.structuredContent = Json(["result": Json(5)]);
+        return r;
+    });
+    s.enableOutputSchemaValidation();
+
+    Json params = Json.emptyObject;
+    params["name"] = "add";
+    auto resp = s.handle(req(7, "tools/call", params)).get;
+    assert(resp["result"]["structuredContent"]["result"].get!int == 5);
+    assert("error" !in resp);
+}
+
+unittest  // output-schema validation: non-conforming structuredContent errors
+{
+    import mcp.api.schema : jsonSchemaOf;
+
+    auto s = new MCPServer("vsrv", "0.1.0");
+    struct AddResult
+    {
+        int result;
+    }
+
+    Tool add = {
+        name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
+    };
+    s.registerTool(add, (Json args) @safe {
+        CallToolResult r;
+        r.content = [Content.makeText("sum")];
+        // Wrong type: result should be an integer.
+        r.structuredContent = Json(["result": Json("oops")]);
+        return r;
+    });
+    s.enableOutputSchemaValidation();
+
+    Json params = Json.emptyObject;
+    params["name"] = "add";
+    auto resp = s.handle(req(8, "tools/call", params)).get;
+    assert(resp["error"]["code"].get!int == ErrorCode.internalError);
+}
+
+unittest  // output-schema validation is off by default: bad output still ships
+{
+    import mcp.api.schema : jsonSchemaOf;
+
+    auto s = new MCPServer("vsrv", "0.1.0");
+    struct AddResult
+    {
+        int result;
+    }
+
+    Tool add = {
+        name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
+    };
+    s.registerTool(add, (Json args) @safe {
+        CallToolResult r;
+        r.content = [Content.makeText("sum")];
+        r.structuredContent = Json(["result": Json("oops")]);
+        return r;
+    });
+
+    Json params = Json.emptyObject;
+    params["name"] = "add";
+    auto resp = s.handle(req(9, "tools/call", params)).get;
+    assert("error" !in resp);
+    assert(resp["result"]["structuredContent"]["result"].get!string == "oops");
 }
 
 unittest  // a tool handler that throws becomes an isError result, not a protocol error
