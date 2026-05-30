@@ -103,3 +103,23 @@ struct describe
     string parameter;
     string description;
 }
+
+/// UDA marking a `@tool` parameter as mirrored into an HTTP request header.
+///
+/// Per the MCP draft (`server/tools` #x-mcp-header), a server MAY designate tool
+/// parameters to be mirrored into headers via an `x-mcp-header` extension
+/// property in the parameter's `inputSchema`. Apply this UDA directly to the
+/// parameter; the reflection layer emits the corresponding `x-mcp-header`
+/// property (carrying `name`) into the generated input schema, so that the
+/// streamable-HTTP transport can validate the `Mcp-Param-<name>` header against
+/// the argument value.
+///
+/// Example:
+/// ---
+/// @tool("query", "Query a region")
+/// string query(@mcpHeader("Region") string region) { ... }
+/// ---
+struct mcpHeader
+{
+    string name; /// the header suffix, e.g. "Region" -> `Mcp-Param-Region`
+}

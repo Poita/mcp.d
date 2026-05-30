@@ -54,7 +54,16 @@ private Json parametersSchema(alias func)() @safe
     {
         static if (!is(P : RequestContext))
         {
-            props[names[i]] = jsonSchemaOf!P;
+            {
+                Json ps = jsonSchemaOf!P;
+                // Draft x-mcp-header: a parameter tagged @mcpHeader is mirrored
+                // into an `Mcp-Param-<name>` request header; emit the extension
+                // property so the transport can validate it (see draft.paramHeaderMap).
+                static foreach (attr; __traits(getAttributes, types[i .. i + 1]))
+                    static if (is(typeof(attr) == mcpHeader))
+                        ps["x-mcp-header"] = attr.name;
+                props[names[i]] = ps;
+            }
             static if (!isInstanceOf!(Nullable, P))
                 required ~= Json(names[i]);
         }
@@ -389,6 +398,12 @@ version (unittest)
             return "readme body";
         }
 
+        @tool("query", "Query a region")
+        string query(@mcpHeader("Region") string region, int limit) @safe
+        {
+            return region;
+        }
+
         @prompt("intro", "Intro prompt")
         string intro(string topic) @safe
         {
@@ -412,7 +427,7 @@ unittest  // @tool reflection: schema derivation + typed dispatch
 
     Json lp = Json.emptyObject;
     auto list = s.handle(Message(makeRequest(Json(1), "tools/list", lp))).get;
-    assert(list["result"]["tools"].length == 5);
+    assert(list["result"]["tools"].length == 6);
 
     // add -> scalar return wrapped under `result`, with an inferred outputSchema.
     Json p = Json.emptyObject;
@@ -631,6 +646,33 @@ unittest  // @toolAnnotations reflection: hints are serialized into annotations
 
     // A tool without @toolAnnotations carries no annotations object.
     assert("annotations" !in addTool);
+}
+
+unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schema
+{
+    import mcp.protocol.jsonrpc : Message, makeRequest;
+    import mcp.protocol.draft : paramHeaderMap;
+
+    auto s = new MCPServer("t", "1");
+    registerHandlers(s, new DemoApi);
+    auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+            Json.emptyObject))).get["result"]["tools"];
+
+    Json queryTool;
+    foreach (i; 0 .. tools.length)
+        if (tools[i]["name"].get!string == "query")
+            queryTool = tools[i];
+    assert(queryTool.type == Json.Type.object);
+
+    auto schema = queryTool["inputSchema"];
+    // The annotated parameter carries the x-mcp-header property.
+    assert(schema["properties"]["region"]["x-mcp-header"].get!string == "Region");
+    // The non-annotated parameter does not.
+    assert("x-mcp-header" !in schema["properties"]["limit"]);
+
+    // The consumer side (draft.paramHeaderMap) now reads it from the UDA-driven schema.
+    auto m = paramHeaderMap(schema);
+    assert(m["region"] == "Mcp-Param-Region");
 }
 
 unittest  // ToolAnnotations: typed struct round-trips through JSON
