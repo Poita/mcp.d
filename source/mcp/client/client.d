@@ -98,9 +98,11 @@ final class MCPClient
 
         auto result = rpc("initialize", params.toJson());
         auto init = InitializeResult.fromJson(result);
-        ProtocolVersion v;
-        if (tryParseVersion(init.protocolVersion, v))
-            negotiated = v;
+        // Per the Lifecycle / Version Negotiation rules: if the client does not
+        // support the version in the server's response it SHOULD disconnect.
+        // Validate before completing the handshake so we never silently proceed
+        // under a version the server did not agree to.
+        negotiated = resolveNegotiatedVersion(init.protocolVersion);
         didInitialize = true;
         notify("notifications/initialized", Json.emptyObject);
         return init;
@@ -1016,6 +1018,48 @@ bool selectMutualVersion(const string[] serverVersions, out ProtocolVersion chos
         }
     }
     return false;
+}
+
+/// Validate the protocol version the server returned in its `initialize`
+/// response and return the version to operate under. Per the Lifecycle /
+/// Version Negotiation requirement ("If the client does not support the version
+/// in the server's response, it SHOULD disconnect"), throws an
+/// `UnsupportedProtocolVersionError` `McpException` when the server's version is
+/// unparseable or not in `supportedVersions`, rather than silently proceeding
+/// under a stale negotiated version.
+ProtocolVersion resolveNegotiatedVersion(string serverVersion) @safe
+{
+    ProtocolVersion v;
+    if (!tryParseVersion(serverVersion, v))
+        throw new McpException(ErrorCode.unsupportedProtocolVersion,
+                "Server returned unsupported protocol version: " ~ serverVersion);
+    return v;
+}
+
+unittest  // resolveNegotiatedVersion accepts a supported server version
+{
+    assert(resolveNegotiatedVersion("2025-06-18") == ProtocolVersion.v2025_06_18);
+    assert(resolveNegotiatedVersion("2026-07-28") == ProtocolVersion.draft);
+}
+
+unittest  // resolveNegotiatedVersion throws on an unparseable server version
+{
+    import std.exception : assertThrown;
+
+    assertThrown!McpException(resolveNegotiatedVersion("1999-01-01"));
+}
+
+unittest  // resolveNegotiatedVersion throws with the unsupported-version error code
+{
+    bool threw;
+    try
+        resolveNegotiatedVersion("not-a-version");
+    catch (McpException e)
+    {
+        threw = true;
+        assert(e.code == ErrorCode.unsupportedProtocolVersion);
+    }
+    assert(threw);
 }
 
 unittest  // selectMutualVersion prefers the newest mutually-supported version
