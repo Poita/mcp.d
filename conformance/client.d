@@ -204,9 +204,12 @@ private int runAuthScenario(string url, string scenario) @safe
     {
     }
 
-    // resource-mismatch: the PRM `resource` MUST match the server we are talking
-    // to; if it does not, refuse to proceed with authorization (RFC 9728).
-    if (havePrm && prm.resource.length && canonicalResourceUri(prm.resource) != oauth.resource)
+    // resource-mismatch: the PRM `resource` MUST cover the server we are talking
+    // to (equal to, or a prefix of, the canonical server URL); otherwise refuse
+    // to proceed with authorization (RFC 9728).
+    const prmResource = canonicalResourceUri(prm.resource);
+    if (havePrm && prm.resource.length && oauth.resource != prmResource
+            && !oauth.resource.startsWith(prmResource))
     {
         () @trusted {
             import std.stdio : stderr;
