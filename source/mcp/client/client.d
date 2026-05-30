@@ -361,6 +361,43 @@ final class MCPClient
         return GetPromptResult.fromJson(rpc("prompts/get", p));
     }
 
+    /// `completion/complete` — request autocompletion suggestions for an
+    /// argument of a prompt or resource template, per server/utilities/completion
+    /// §"Requesting Completions". `reference` identifies what is being completed
+    /// (use `CompletionReference.forPrompt` / `forResource`); `argumentName` and
+    /// `argumentValue` are the argument being filled in and its partial value.
+    /// `context`, when non-null, supplies previously-resolved argument values
+    /// (`{name: value}`) so the server can give context-aware completions.
+    CompleteResult complete(CompletionReference reference, string argumentName,
+            string argumentValue, string[string] context = null) @safe
+    {
+        return CompleteResult.fromJson(rpc("completion/complete",
+                buildCompleteParams(reference, argumentName, argumentValue, context)));
+    }
+
+    /// Build the `completion/complete` request params. Separated from `complete`
+    /// so the param shaping can be unit-tested without a live server.
+    package static Json buildCompleteParams(CompletionReference reference,
+            string argumentName, string argumentValue, string[string] context) @safe
+    {
+        Json p = Json.emptyObject;
+        p["ref"] = reference.toJson();
+        Json arg = Json.emptyObject;
+        arg["name"] = argumentName;
+        arg["value"] = argumentValue;
+        p["argument"] = arg;
+        if (context.length)
+        {
+            Json args = Json.emptyObject;
+            foreach (k, v; context)
+                args[k] = v;
+            Json ctx = Json.emptyObject;
+            ctx["arguments"] = args;
+            p["context"] = ctx;
+        }
+        return p;
+    }
+
     /// `resources/subscribe` / `resources/unsubscribe`.
     void subscribe(string uri) @safe
     {
@@ -2014,4 +2051,31 @@ unittest  // elicitation/create defaults to form mode when mode is absent
 
     c.dispatchServerMethod("elicitation/create", params);
     assert(delegateCalled);
+}
+
+unittest  // buildCompleteParams shapes a prompt completion request
+{
+    auto p = MCPClient.buildCompleteParams(CompletionReference.forPrompt("greet"),
+            "name", "pa", null);
+    assert(p["ref"]["type"].get!string == "ref/prompt");
+    assert(p["ref"]["name"].get!string == "greet");
+    assert(p["argument"]["name"].get!string == "name");
+    assert(p["argument"]["value"].get!string == "pa");
+    assert("context" !in p);
+}
+
+unittest  // buildCompleteParams shapes a resource completion request
+{
+    auto p = MCPClient.buildCompleteParams(
+            CompletionReference.forResource("file:///{path}"), "path", "/ho", null);
+    assert(p["ref"]["type"].get!string == "ref/resource");
+    assert(p["ref"]["uri"].get!string == "file:///{path}");
+    assert(p["argument"]["value"].get!string == "/ho");
+}
+
+unittest  // buildCompleteParams includes the resolved-argument context when given
+{
+    string[string] ctx = ["owner": "octocat"];
+    auto p = MCPClient.buildCompleteParams(CompletionReference.forPrompt("pr"), "repo", "m", ctx);
+    assert(p["context"]["arguments"]["owner"].get!string == "octocat");
 }
