@@ -147,6 +147,22 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
             res.writeBody(makeErrorResponse(msg.id, hdrErr).toString(), "application/json");
             return;
         }
+        // Draft x-mcp-header: validate Mcp-Param-* headers against the tool's
+        // declared header parameters and the body arguments.
+        if (msg.method == "tools/call" && tryDraft(req.headers.get(HttpHeader.protocolVersion, "")))
+        {
+            const tname = ("name" in msg.params && msg.params["name"].type == Json.Type.string) ? msg
+                .params["name"].get!string : "";
+            auto schema = server.toolInputSchema(tname);
+            auto args = ("arguments" in msg.params) ? msg.params["arguments"] : Json.emptyObject;
+            auto perr = validateParamHeaders(schema, args, (string h) => req.headers.get(h, ""));
+            if (perr !is null)
+            {
+                res.statusCode = HTTPStatus.badRequest;
+                res.writeBody(makeErrorResponse(msg.id, perr).toString(), "application/json");
+                return;
+            }
+        }
         auto ctx = new HttpStreamContext(res, coord, server.clientCapabilities,
                 extractProgressToken(msg.params));
         auto resp = server.handle(msg, ctx);
@@ -358,4 +374,114 @@ unittest  // draft resources/read mirrors uri into Mcp-Name
     auto m = draftMsg("resources/read", p);
     assert(validateDraftHeaders("2026-07-28", "resources/read", "test://x", m) is null);
     assert(validateDraftHeaders("2026-07-28", "resources/read", "test://y", m) !is null);
+}
+
+/// True if the protocol-version header denotes a draft+ request.
+private bool tryDraft(string protoHeader) @safe
+{
+    ProtocolVersion pv;
+    return tryParseVersion(protoHeader, pv) && pv.isDraft;
+}
+
+/// Render a JSON scalar the way the draft requires for `Mcp-Param-*` header
+/// comparison: strings as-is, integers as decimal, booleans as "true"/"false".
+private string jsonScalarToString(Json v) @safe
+{
+    import std.conv : to;
+
+    switch (v.type)
+    {
+    case Json.Type.string:
+        return v.get!string;
+    case Json.Type.int_:
+        return v.get!long
+            .to!string;
+    case Json.Type.bool_:
+        return v.get!bool ? "true" : "false";
+    default:
+        return v.toString();
+    }
+}
+
+/// Validate draft `x-mcp-header` mirroring: every parameter annotated with
+/// `x-mcp-header` whose value is present in `args` MUST have a matching
+/// (decoded) `Mcp-Param-*` header; absent parameters MUST NOT carry the header.
+/// Returns a `HeaderMismatch` exception on violation, else null.
+McpException validateParamHeaders(Json inputSchema, Json args,
+        scope string delegate(string) @safe headerGet) @safe
+{
+    auto map = paramHeaderMap(inputSchema);
+    foreach (param, headerName; map)
+    {
+        const hv = headerGet(headerName);
+        const present = args.type == Json.Type.object && param in args
+            && args[param].type != Json.Type.null_ && args[param].type != Json.Type.undefined;
+        if (!present)
+        {
+            if (hv.length)
+                return new McpException(ErrorCode.headerMismatch,
+                        "Header " ~ headerName ~ " present but parameter '" ~ param ~ "' absent");
+            continue;
+        }
+        if (hv.length == 0)
+            return new McpException(ErrorCode.headerMismatch,
+                    "Missing required header " ~ headerName ~ " for parameter '" ~ param ~ "'");
+        if (decodeHeaderValue(hv) != jsonScalarToString(args[param]))
+            return new McpException(ErrorCode.headerMismatch,
+                    "Header " ~ headerName ~ " does not match parameter '" ~ param ~ "'");
+    }
+    return null;
+}
+
+version (unittest)
+{
+    private Json schemaWithHeaderParam() @safe
+    {
+        Json schema = Json.emptyObject;
+        schema["type"] = "object";
+        Json props = Json.emptyObject;
+        props["region"] = Json([
+            "type": Json("string"),
+            "x-mcp-header": Json("Region")
+        ]);
+        props["query"] = Json(["type": Json("string")]);
+        schema["properties"] = props;
+        return schema;
+    }
+}
+
+unittest  // x-mcp-header: matching header passes
+{
+    auto schema = schemaWithHeaderParam();
+    Json args = Json(["region": Json("us-west1"), "query": Json("SELECT 1")]);
+    auto e = validateParamHeaders(schema, args,
+            (string h) => h == "Mcp-Param-Region" ? "us-west1" : "");
+    assert(e is null);
+}
+
+unittest  // x-mcp-header: mismatched header is a HeaderMismatch
+{
+    auto schema = schemaWithHeaderParam();
+    Json args = Json(["region": Json("us-west1")]);
+    auto e = validateParamHeaders(schema, args, (string h) => "us-east1");
+    assert(e !is null && e.code == ErrorCode.headerMismatch);
+}
+
+unittest  // x-mcp-header: present param but missing header fails
+{
+    auto schema = schemaWithHeaderParam();
+    Json args = Json(["region": Json("us-west1")]);
+    auto e = validateParamHeaders(schema, args, (string h) => "");
+    assert(e !is null && e.code == ErrorCode.headerMismatch);
+}
+
+unittest  // x-mcp-header: non-ASCII value matched via base64-encoded header
+{
+    import mcp.protocol.draft : encodeHeaderValue;
+
+    auto schema = schemaWithHeaderParam();
+    Json args = Json(["region": Json("Zürich")]);
+    const enc = encodeHeaderValue("Zürich");
+    auto e = validateParamHeaders(schema, args, (string h) => h == "Mcp-Param-Region" ? enc : "");
+    assert(e is null);
 }
