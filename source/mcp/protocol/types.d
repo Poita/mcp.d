@@ -205,6 +205,58 @@ struct Icon
     }
 }
 
+/// Optional properties describing a tool's behavior, per the MCP spec's
+/// `ToolAnnotations`. All hints are advisory and optional; a hint that is left
+/// `null` is omitted from the serialized form (and clients SHOULD treat its
+/// absence as "unspecified" rather than a particular default).
+struct ToolAnnotations
+{
+    Nullable!string title; /// human-readable title for display
+    Nullable!bool readOnlyHint; /// if true, the tool does not modify its environment
+    Nullable!bool destructiveHint; /// if true, the tool may perform destructive updates
+    Nullable!bool idempotentHint; /// if true, repeated calls with the same args have no additional effect
+    Nullable!bool openWorldHint; /// if true, the tool interacts with an "open world" of external entities
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        if (!title.isNull)
+            j["title"] = title.get;
+        if (!readOnlyHint.isNull)
+            j["readOnlyHint"] = readOnlyHint.get;
+        if (!destructiveHint.isNull)
+            j["destructiveHint"] = destructiveHint.get;
+        if (!idempotentHint.isNull)
+            j["idempotentHint"] = idempotentHint.get;
+        if (!openWorldHint.isNull)
+            j["openWorldHint"] = openWorldHint.get;
+        return j;
+    }
+
+    static ToolAnnotations fromJson(Json j) @safe
+    {
+        ToolAnnotations a;
+        if ("title" in j && j["title"].type == Json.Type.string)
+            a.title = j["title"].get!string;
+        if ("readOnlyHint" in j && j["readOnlyHint"].type == Json.Type.bool_)
+            a.readOnlyHint = j["readOnlyHint"].get!bool;
+        if ("destructiveHint" in j && j["destructiveHint"].type == Json.Type.bool_)
+            a.destructiveHint = j["destructiveHint"].get!bool;
+        if ("idempotentHint" in j && j["idempotentHint"].type == Json.Type.bool_)
+            a.idempotentHint = j["idempotentHint"].get!bool;
+        if ("openWorldHint" in j && j["openWorldHint"].type == Json.Type.bool_)
+            a.openWorldHint = j["openWorldHint"].get!bool;
+        return a;
+    }
+
+    /// True if no hint is set (serializes to an empty object).
+    bool empty() const @safe
+    {
+        return title.isNull && readOnlyHint.isNull && destructiveHint.isNull
+            && idempotentHint.isNull && openWorldHint.isNull;
+    }
+}
+
 /// A tool the server exposes for the model to call.
 struct Tool
 {
