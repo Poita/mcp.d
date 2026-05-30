@@ -1,0 +1,11 @@
+.dub/
+docs/superpowers/plans/*.html
+*.o
+*.obj
+*.a
+*.lib
+/mcp
+mcp-test-library
+__test__*__
+dub.selections.json
+conformance-results/

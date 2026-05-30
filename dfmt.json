@@ -1,0 +1,8 @@
+{
+	"dfmt_brace_style": "allman",
+	"dfmt_indent_style": "tab",
+	"end_of_line": "lf",
+	"max_line_length": 100,
+	"dfmt_soft_max_line_length": 90,
+	"dfmt_split_operator_at_line_end": false
+}

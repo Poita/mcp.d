@@ -1,0 +1,17 @@
+{
+	"name": "mcp",
+	"description": "Production-grade Model Context Protocol SDK for D",
+	"license": "MIT",
+	"authors": ["Peter Alexander"],
+	"targetType": "library",
+	"dependencies": {
+		"vibe-d:data": "~>0.9.8",
+		"vibe-d:http": "~>0.9.8"
+	},
+	"configurations": [
+		{
+			"name": "library",
+			"targetType": "library"
+		}
+	]
+}
