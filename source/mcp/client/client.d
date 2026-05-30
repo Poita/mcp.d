@@ -13,6 +13,7 @@ import mcp.protocol.errors;
 import mcp.protocol.versions;
 import mcp.protocol.capabilities;
 import mcp.protocol.types;
+import mcp.protocol.draft;
 
 /// A Model Context Protocol client over the Streamable HTTP transport.
 ///
@@ -27,6 +28,7 @@ final class MCPClient
     private string sessionId;
     private ProtocolVersion negotiated = latestStable;
     private bool didInitialize;
+    private bool useDraft;
     private long nextId = 1;
 
     /// Capabilities this client advertises at initialize.
@@ -53,6 +55,24 @@ final class MCPClient
     ProtocolVersion protocolVersion() const @safe
     {
         return negotiated;
+    }
+
+    /// Switch to the stateless draft (2026-07-28) protocol: no `initialize`
+    /// handshake; every request carries `_meta` (protocolVersion / clientInfo /
+    /// clientCapabilities) and the standard `Mcp-Method` / `Mcp-Name` /
+    /// `MCP-Protocol-Version` headers. Call `discover()` for up-front version
+    /// selection, or just issue requests.
+    void enableDraft() @safe
+    {
+        useDraft = true;
+        negotiated = ProtocolVersion.draft;
+    }
+
+    /// `server/discover` (draft): fetch the server's supported versions,
+    /// capabilities, and identity.
+    DiscoverResult discover() @safe
+    {
+        return DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject));
     }
 
     /// Perform the initialize handshake and send `notifications/initialized`.
@@ -188,7 +208,24 @@ final class MCPClient
     private Json rpc(string method, Json params) @safe
     {
         const id = nextId++;
+        if (useDraft)
+            params = injectDraftMeta(params);
         return postAndAwait(makeRequest(Json(id), method, params), id);
+    }
+
+    /// Add the draft per-request `_meta` (protocol version, client identity,
+    /// capabilities) to a request's params.
+    private Json injectDraftMeta(Json params) @safe
+    {
+        if (params.type != Json.Type.object)
+            params = Json.emptyObject;
+        Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"]
+            : Json.emptyObject;
+        meta[MetaKey.protocolVersion] = negotiated.toWire;
+        meta[MetaKey.clientInfo] = clientInfo.toJson();
+        meta[MetaKey.clientCapabilities] = capabilities.toJson();
+        params["_meta"] = meta;
+        return params;
     }
 
     /// Send a notification (no reply expected).
@@ -264,9 +301,37 @@ final class MCPClient
         req.contentType = "application/json";
         if (sessionId.length)
             req.headers["Mcp-Session-Id"] = sessionId;
-        if (didInitialize)
+        if (useDraft)
+            addDraftHeaders(req, message);
+        else if (didInitialize)
             req.headers["MCP-Protocol-Version"] = negotiated.toWire;
         req.writeBody(cast(const(ubyte)[]) message.toString());
+    }
+
+    /// Add the draft standard request headers (`MCP-Protocol-Version`,
+    /// `Mcp-Method`, and `Mcp-Name` for tools/call, resources/read, prompts/get)
+    /// derived from the outgoing message.
+    private void addDraftHeaders(scope HTTPClientRequest req, Json message) @safe
+    {
+        req.headers[HttpHeader.protocolVersion] = negotiated.toWire;
+        if ("method" !in message)
+            return; // a response to a server-initiated input request
+        const method = message["method"].get!string;
+        req.headers[HttpHeader.method] = method;
+        auto params = ("params" in message) ? message["params"] : Json.emptyObject;
+        string name;
+        if (method == "tools/call" || method == "prompts/get")
+        {
+            if ("name" in params && params["name"].type == Json.Type.string)
+                name = params["name"].get!string;
+        }
+        else if (method == "resources/read")
+        {
+            if ("uri" in params && params["uri"].type == Json.Type.string)
+                name = params["uri"].get!string;
+        }
+        if (name.length)
+            req.headers[HttpHeader.name] = name;
     }
 
     private void captureSession(scope HTTPClientResponse res) @safe

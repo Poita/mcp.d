@@ -48,12 +48,44 @@ int main(string[] args)
     return rc;
 }
 
+private bool draftRequested() @trusted
+{
+    import std.process : environment;
+
+    return environment.get("MCP_DRAFT", "").length > 0;
+}
+
 private int runScenario(string url, string scenario) @safe
 {
     auto client = new MCPClient(url);
     client.capabilities.sampling = true;
     client.capabilities.elicitation = true;
     client.capabilities.roots = true;
+
+    // Draft mode (stateless): MCP_DRAFT=1 exercises server/discover + per-request
+    // _meta + standard headers against a draft-capable server.
+    if (draftRequested())
+    {
+        client.enableDraft();
+        auto d = client.discover();
+        () @trusted {
+            import std.stdio : stderr;
+
+            stderr.writefln("draft discover: versions=%s server=%s",
+                    d.protocolVersions, d.serverInfo.name);
+        }();
+        auto tools = client.listTools();
+        // Exercise a plain request/response tool (the streaming/sampling tools use
+        // the older server-initiated mechanism, not draft MRTR).
+        foreach (t; tools)
+            if (t.name == "test_simple_text")
+                client.callTool(t.name, Json.emptyObject);
+        () @trusted { import std.stdio : stderr;
+
+        stderr.writeln("draft flow OK"); }();
+        return 0;
+    }
+
     client.onSampling = (Json params) @safe => handleSampling(params);
     client.onElicitation = (Json params) @safe => handleElicitation(params);
     client.onListRoots = (Json params) @safe {
