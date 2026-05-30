@@ -555,6 +555,14 @@ final class MCPServer
         // capabilities in `params._meta` rather than relying on `initialize`.
         effectiveVersion = negotiated;
         auto meta = RequestMeta.fromParams(msg.params);
+        // On stateful (2025-era) protocols logging is governed once-per-session by
+        // `logging/setLevel`, so emission is always permitted (and filtered by the
+        // stored minimum). The draft is stateless: the server MUST NOT emit
+        // `notifications/message` for a request that did not carry
+        // `_meta["io.modelcontextprotocol/logLevel"]`, and a request whose level is
+        // unrecognised SHOULD be rejected with -32602.
+        bool loggingRequested = true;
+        string requestLogLevel = logLevel;
         if (meta.protocolVersion.length)
         {
             ProtocolVersion mv;
@@ -564,8 +572,19 @@ final class MCPServer
                 if (mv.isDraft)
                 {
                     clientCaps = meta.clientCapabilities;
-                    if (!meta.logLevel.isNull)
-                        logLevel = meta.logLevel.get;
+                    if (meta.logLevel.isNull)
+                    {
+                        // No logLevel field -> the client did not request logging.
+                        loggingRequested = false;
+                    }
+                    else
+                    {
+                        const lvl = meta.logLevel.get;
+                        if (logLevelRank(lvl) < 0)
+                            return makeErrorResponse(msg.id,
+                                    invalidParams("Invalid log level: " ~ lvl));
+                        requestLogLevel = lvl;
+                    }
                 }
             }
             else
@@ -581,7 +600,7 @@ final class MCPServer
         // (MRTR vs blocking) and the input responses carried on a retried draft
         // request, regardless of which transport supplied the base context.
         auto scoped = new RequestScope(ctx, effectiveVersion.usesMRTR,
-                readInputResponses(msg.params), logLevel);
+                readInputResponses(msg.params), requestLogLevel, loggingRequested);
 
         try
         {
@@ -1542,6 +1561,120 @@ unittest  // after setLevel(error), a handler's sub-error logs are dropped
     assert(ctx.emitted == ["error", "emergency"]);
 }
 
+version (unittest) private final class DraftLogCtx : RequestContext
+{
+    string[] emitted;
+    void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
+    {
+    }
+
+    void log(string level, Json, string = null) @safe
+    {
+        emitted ~= level;
+    }
+
+    Json sendRequest(string, Json) @safe
+    {
+        return Json.undefined;
+    }
+
+    bool clientSupports(string) @safe
+    {
+        return false;
+    }
+
+    bool isStateless() @safe
+    {
+        return false;
+    }
+
+    Json[string] inputResponses() @safe
+    {
+        Json[string] e;
+        return e;
+    }
+
+    import mcp.auth.resource_server : TokenInfo;
+
+    TokenInfo auth() @safe
+    {
+        return TokenInfo.invalid();
+    }
+}
+
+version (unittest) private MCPServer makeNoisyLogServer() @safe
+{
+    auto s = new MCPServer("t", "1");
+    s.enableLogging();
+    Tool t = {name: "noisy"};
+    s.registerTool(t, (Json args, RequestContext ctx) @safe {
+        ctx.log("debug", Json("d"));
+        ctx.log("warning", Json("w"));
+        ctx.log("error", Json("e"));
+        ctx.log("emergency", Json("x"));
+        CallToolResult r;
+        r.content = [Content.makeText("ok")];
+        return r;
+    });
+    return s;
+}
+
+unittest  // draft request WITHOUT logLevel emits no notifications/message at all
+{
+    auto s = makeNoisyLogServer();
+    auto ctx = new DraftLogCtx;
+    Json callP = Json.emptyObject;
+    callP["name"] = "noisy";
+    // draftReq with no logLevel argument => no io.modelcontextprotocol/logLevel.
+    s.handle(draftReq(2, "tools/call", callP), ctx);
+
+    // The MUST-NOT-emit-without-the-field requirement: nothing was emitted.
+    assert(ctx.emitted.length == 0);
+}
+
+unittest  // draft request WITH logLevel emits only at or above that level
+{
+    auto s = makeNoisyLogServer();
+    auto ctx = new DraftLogCtx;
+    Json callP = Json.emptyObject;
+    callP["name"] = "noisy";
+    s.handle(draftReq(2, "tools/call", callP, "error"), ctx);
+
+    assert(ctx.emitted == ["error", "emergency"]);
+}
+
+unittest  // draft request with an unrecognised logLevel is rejected with -32602
+{
+    auto s = makeNoisyLogServer();
+    auto ctx = new DraftLogCtx;
+    Json callP = Json.emptyObject;
+    callP["name"] = "noisy";
+    auto resp = s.handle(draftReq(2, "tools/call", callP, "verbose"), ctx).get;
+
+    assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+    // The handler must not have run / emitted anything.
+    assert(ctx.emitted.length == 0);
+}
+
+unittest  // a draft request's logLevel does not leak into a later request
+{
+    auto s = makeNoisyLogServer();
+    // First, a draft request that requests debug-level logging.
+    auto ctx1 = new DraftLogCtx;
+    Json call1 = Json.emptyObject;
+    call1["name"] = "noisy";
+    s.handle(draftReq(1, "tools/call", call1, "debug"), ctx1);
+    assert(ctx1.emitted == ["debug", "warning", "error", "emergency"]);
+
+    // A subsequent draft request without a logLevel must emit nothing — the
+    // previous request's level must not have been stored as shared state.
+    auto ctx2 = new DraftLogCtx;
+    Json call2 = Json.emptyObject;
+    call2["name"] = "noisy";
+    s.handle(draftReq(2, "tools/call", call2), ctx2);
+    assert(ctx2.emitted.length == 0);
+}
+
 unittest  // capabilities reflect registered features
 {
     auto s = new MCPServer("t", "1");
@@ -1651,7 +1784,8 @@ unittest  // subscribe capability is advertised only when enabled
 version (unittest)
 {
     // A request carrying draft per-request _meta (protocolVersion 2026-07-28).
-    private Message draftReq(long id, string method, Json params = Json.emptyObject) @safe
+    private Message draftReq(long id, string method,
+            Json params = Json.emptyObject, string logLevel = null) @safe
     {
         Json meta = Json.emptyObject;
         meta[MetaKey.protocolVersion] = "2026-07-28";
@@ -1660,6 +1794,8 @@ version (unittest)
             "version": Json("1")
         ]);
         meta[MetaKey.clientCapabilities] = Json.emptyObject;
+        if (logLevel.length)
+            meta[MetaKey.logLevel] = logLevel;
         params["_meta"] = meta;
         return Message(makeRequest(Json(id), method, params));
     }

@@ -284,13 +284,16 @@ final class RequestScope : RequestContext
     private bool stateless;
     private Json[string] responses;
     private string minLevel;
+    private bool loggingRequested;
 
-    this(RequestContext inner, bool stateless, Json[string] responses, string minLevel = "info") @safe
+    this(RequestContext inner, bool stateless, Json[string] responses,
+            string minLevel = "info", bool loggingRequested = true) @safe
     {
         this.inner = inner;
         this.stateless = stateless;
         this.responses = responses;
         this.minLevel = minLevel;
+        this.loggingRequested = loggingRequested;
     }
 
     void reportProgress(double progress,
@@ -302,8 +305,16 @@ final class RequestScope : RequestContext
     /// Emit a logging notification, but drop it when its severity is below the
     /// client-configured minimum (`logging/setLevel`) per the RFC 5424 ordering.
     /// This is where the server honours "Only sends error level and above".
+    ///
+    /// On the draft (stateless) protocol the server MUST NOT emit
+    /// `notifications/message` for a request that did not carry
+    /// `_meta["io.modelcontextprotocol/logLevel"]`; the server signals that by
+    /// constructing this scope with `loggingRequested = false`, in which case
+    /// every log is dropped regardless of severity.
     void log(string level, Json data, string logger = null) @safe
     {
+        if (!loggingRequested)
+            return;
         if (!shouldLog(level, minLevel))
             return;
         inner.log(level, data, logger);
