@@ -11,6 +11,7 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.capabilities;
 import mcp.server.context;
+import mcp.auth.resource_server : TokenInfo;
 
 /// Correlates outbound server->client requests with the client's responses,
 /// which arrive on a *separate* POST. One instance is shared across all
@@ -271,15 +272,17 @@ final class HttpStreamContext : RequestContext
     private bool streaming_;
     private long streamId;
     private long eventSeq;
+    private TokenInfo authInfo;
 
-    this(HTTPServerResponse res, StreamCoordinator coord,
-            ClientCapabilities caps, Json progressToken) @safe
+    this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps,
+            Json progressToken, TokenInfo auth = TokenInfo.invalid()) @safe
     {
         this.res = res;
         this.coord = coord;
         this.clientCaps = caps;
         this.progressTok = progressToken;
         this.streamId = coord.allocStream();
+        this.authInfo = auth;
     }
 
     /// The globally-unique id this stream will assign to its next SSE event.
@@ -377,6 +380,11 @@ final class HttpStreamContext : RequestContext
     {
         Json[string] empty;
         return empty;
+    }
+
+    TokenInfo auth() @safe
+    {
+        return authInfo;
     }
 
     /// Write the final JSON-RPC response as the terminating SSE event.

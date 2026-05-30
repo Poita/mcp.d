@@ -117,6 +117,34 @@ Prefer dynamic registration (e.g. tools known only at runtime)? The lower-level
 `server.registerTool(Tool, delegate)` / `registerResource` / `registerPrompt`
 API is available too — `registerHandlers` is built on top of it.
 
+### Protecting an HTTP server (OAuth 2.1 Resource Server)
+
+Set a `ResourceServerConfig` on `StreamableHttpOptions.auth` to turn the
+Streamable HTTP transport into an OAuth 2.1 protected resource (RFC 6750 / 8707 /
+9728). Every request must then present a valid `Authorization: Bearer` token; the
+transport validates it (and its RFC 8707 audience), returns `401` with a
+`WWW-Authenticate: Bearer` header pointing at the metadata document on failure,
+`403 insufficient_scope` when a required scope is missing, and serves the RFC 9728
+Protected Resource Metadata at `/.well-known/oauth-protected-resource`. The
+validated token is available to handlers via `ctx.auth` (a `TokenInfo`).
+
+```d
+StreamableHttpOptions opts;
+opts.auth.resource = "https://mcp.example.com/mcp";
+opts.auth.authorizationServers = ["https://auth.example.com"];
+opts.auth.scopesSupported = ["mcp:read", "mcp:write"];
+opts.auth.requiredScope = "mcp:read";          // optional scope gate
+opts.auth.validator = (string token) @safe {   // your verification (e.g. JWT)
+    TokenInfo ti;
+    ti.valid = verify(token);                   // returns false -> 401
+    ti.subject = "...";
+    ti.scopes = ["mcp:read"];
+    ti.audience = ["https://mcp.example.com/mcp"];
+    return ti;
+};
+runStreamableHttp(server, 3000, opts);
+```
+
 A runnable version of this server (stdio + HTTP) lives in
 [`examples/calculator`](examples/calculator/app.d):
 

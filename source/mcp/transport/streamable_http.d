@@ -12,6 +12,7 @@ import mcp.protocol.versions;
 import mcp.protocol.draft;
 import mcp.transport.sse_context;
 import mcp.transport.session;
+import mcp.auth.resource_server;
 
 /// The HTTP header carrying the session id (basic/transports §Session Management).
 enum SessionHeader = "Mcp-Session-Id";
@@ -38,7 +39,22 @@ struct StreamableHttpOptions
     /// (HTTP 404 for an unknown session). When false (the default) the transport
     /// is stateless and never issues or checks a session id.
     bool enableSessions = false;
+
+    /// OAuth 2.1 Resource Server enforcement (basic/authorization). When
+    /// `auth.validator` is set, every MCP request must present a valid
+    /// `Authorization: Bearer` token: the transport validates it (and its RFC 8707
+    /// audience), returns `401` with a `WWW-Authenticate: Bearer` header carrying
+    /// the `resource_metadata` URL on failure, returns `403 insufficient_scope`
+    /// when a required scope is missing, and serves the RFC 9728 Protected
+    /// Resource Metadata document at `/.well-known/oauth-protected-resource`.
+    /// Validated token info is surfaced to handlers via `RequestContext.auth`.
+    /// When unset (the default) the transport performs no token checks.
+    ResourceServerConfig auth;
 }
+
+/// The well-known path (RFC 9728 §3) at which a protected resource server
+/// publishes its OAuth 2.0 Protected Resource Metadata document.
+enum ProtectedResourceMetadataPath = "/.well-known/oauth-protected-resource";
 
 /// Mount an `MCPServer` onto a vibe.d `URLRouter` at the configured path,
 /// implementing the modern Streamable HTTP transport (single endpoint):
@@ -54,20 +70,41 @@ void mountMcp(URLRouter router, MCPServer server,
     auto coord = new StreamCoordinator;
     auto sessions = opts.enableSessions ? new SessionManager : null;
 
+    // basic/authorization (RFC 9728 §3): publish the Protected Resource Metadata
+    // document so clients can discover the authorization server(s). Served
+    // unauthenticated (it is the discovery hook the 401 points clients to).
+    if (opts.auth.enabled)
+    {
+        router.get(ProtectedResourceMetadataPath, (HTTPServerRequest req,
+                HTTPServerResponse res) @safe {
+            res.statusCode = HTTPStatus.ok;
+            res.writeJsonBody(opts.auth.metadata().toJson());
+        });
+    }
+
     router.post(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
         if (!guardOrigin(req, res, opts))
             return;
-        handlePost(server, coord, sessions, req, res);
+        TokenInfo token;
+        if (!guardAuth(req, res, opts, token))
+            return;
+        handlePost(server, coord, sessions, token, req, res);
     });
     auto push = server.serverPushChannel(coord);
     router.get(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
         if (!guardOrigin(req, res, opts))
+            return;
+        TokenInfo token;
+        if (!guardAuth(req, res, opts, token))
             return;
         handleGet(server, push, req, res);
     });
     router.match(HTTPMethod.DELETE, opts.path, (HTTPServerRequest req,
             HTTPServerResponse res) @safe {
         if (!guardOrigin(req, res, opts))
+            return;
+        TokenInfo token;
+        if (!guardAuth(req, res, opts, token))
             return;
         if (sessions !is null)
         {
@@ -124,6 +161,74 @@ private bool guardOrigin(scope HTTPServerRequest req, scope HTTPServerResponse r
         return false;
     }
     return true;
+}
+
+/// Enforce OAuth 2.1 Resource Server authorization (basic/authorization). When
+/// `opts.auth` is enabled, validate the request's `Authorization: Bearer` token
+/// and, on failure, write the spec-mandated response: `401` with a
+/// `WWW-Authenticate: Bearer` header carrying the `resource_metadata` URL for a
+/// missing/invalid token, or `403` with `error="insufficient_scope"` when a
+/// required scope is absent. Returns true (with `token` populated) when the
+/// request may proceed; false when a failure response was written.
+private bool guardAuth(scope HTTPServerRequest req, scope HTTPServerResponse res,
+        StreamableHttpOptions opts, out TokenInfo token) @safe
+{
+    if (!opts.auth.enabled)
+        return true;
+
+    const failure = authorize(opts.auth, req.headers.get("Authorization", ""), token);
+    if (failure == AuthFailure.none)
+        return true;
+
+    const metaUrl = resourceMetadataUrl(req, opts);
+    res.headers["WWW-Authenticate"] = wwwAuthenticate(failure, metaUrl, opts.auth.requiredScope);
+    if (failure == AuthFailure.insufficientScope)
+    {
+        res.statusCode = HTTPStatus.forbidden;
+        res.writeBody("Forbidden: insufficient scope", "text/plain");
+    }
+    else
+    {
+        res.statusCode = HTTPStatus.unauthorized;
+        res.writeBody("Unauthorized", "text/plain");
+    }
+    return false;
+}
+
+/// The absolute URL of this server's Protected Resource Metadata document. Built
+/// from the request's scheme + Host so clients reach the same origin they called;
+/// falls back to the configured `resource` origin when the Host header is absent.
+private string resourceMetadataUrl(scope HTTPServerRequest req, StreamableHttpOptions opts) @safe
+{
+    import std.string : startsWith;
+
+    const host = req.headers.get("Host", "");
+    if (host.length)
+    {
+        const scheme = req.headers.get("X-Forwarded-Proto",
+                isLoopbackHostname(stripPort(host)) ? "http" : "https");
+        return scheme ~ "://" ~ host ~ ProtectedResourceMetadataPath;
+    }
+    // No Host header: derive the origin from the configured resource identifier.
+    auto r = opts.auth.resource;
+    if (r.length)
+    {
+        const sep = () @safe {
+            import std.string : indexOf;
+
+            return r.indexOf("://");
+        }();
+        if (sep >= 0)
+        {
+            import std.string : indexOf;
+
+            auto rest = r[sep + 3 .. $];
+            const slash = rest.indexOf('/');
+            const origin = slash >= 0 ? r[0 .. sep + 3 + slash] : r;
+            return origin ~ ProtectedResourceMetadataPath;
+        }
+    }
+    return ProtectedResourceMetadataPath;
 }
 
 /// Decide how to answer an HTTP GET to the MCP endpoint
@@ -197,7 +302,7 @@ private void handleGet(MCPServer server, ServerPushChannel push,
 }
 
 private void handlePost(MCPServer server, StreamCoordinator coord,
-        SessionManager sessions, HTTPServerRequest req, HTTPServerResponse res) @safe
+        SessionManager sessions, TokenInfo token, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
     const payload = req.bodyReader.readAllUTF8();
 
@@ -311,7 +416,7 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
             }
         }
         auto ctx = new HttpStreamContext(res, coord, server.clientCapabilities,
-                extractProgressToken(msg.params));
+                extractProgressToken(msg.params), token);
         auto resp = server.handle(msg, ctx);
         if (ctx.streaming)
             ctx.finishWith(resp.get);
