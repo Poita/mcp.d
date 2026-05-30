@@ -2809,6 +2809,29 @@ unittest  // an invalid pagination cursor yields invalidParams (-32602)
     assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
+unittest  // a stale cursor pointing past the end of the list yields invalidParams (-32602)
+{
+    import std.string : representation;
+    import mcp.auth.oauth : base64UrlNoPad;
+
+    auto s = new MCPServer("t", "1");
+    Tool tool = {name: "only"};
+    s.registerTool(tool, (Json) @safe {
+        CallToolResult r;
+        r.content = [Content.makeText("ok")];
+        return r;
+    });
+    s.setPageSize(1);
+    // A well-formed cursor encoding an offset far beyond the single registered
+    // tool: the client may be replaying a stale cursor from a longer, earlier
+    // result set. This MUST be rejected with -32602 rather than silently
+    // returning an empty final page.
+    Json p = Json.emptyObject;
+    p["cursor"] = base64UrlNoPad("999".representation);
+    auto resp = s.handle(req(1, "tools/list", p)).get;
+    assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
 unittest  // a full roundtrip through cursor-following pagination yields every tool exactly once
 {
     import std.algorithm : sort, uniq;
