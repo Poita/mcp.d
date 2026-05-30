@@ -163,6 +163,37 @@ void main()
 `readResource`, `getPrompt`, `setBearerToken` for OAuth, and `enableDraft()` for the
 stateless draft protocol.
 
+### Connecting over stdio (launching a server as a subprocess)
+
+To act as an MCP host over the **stdio** transport — launching the server as a
+child process and speaking newline-delimited JSON-RPC over its stdin/stdout —
+use `spawnStdioClient`:
+
+```d
+import mcp;
+
+void main()
+{
+    auto proc = spawnStdioClient(["dub", "run", ":calculator"]);
+    scope (exit) proc.close();   // close child's stdin and wait for exit
+
+    auto client = proc.client;   // a StdioClient with the same feature methods
+    client.initialize();
+
+    auto tools = client.listTools();
+    auto result = client.callTool("add", Json(["a": Json(2), "b": Json(40)]));
+    // ...
+}
+```
+
+`StdioClient` exposes the same `initialize` / `listTools` / `callTool` /
+`listResources` / `readResource` / `listPrompts` / `getPrompt` / `subscribe` /
+`setLogLevel` API as `MCPClient`. It is transport-pure (constructed from a
+`readLine`/`writeLine` pair), so you can also drive a server over any custom
+byte channel; `spawnStdioClient` is the convenience wrapper around
+`std.process.pipeProcess`. The server side is `runStdio(server)` /
+`serveStdio` in `mcp.transport.stdio`.
+
 ## Running the conformance suite
 
 ```bash
