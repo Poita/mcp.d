@@ -12,6 +12,14 @@
 		{
 			"name": "library",
 			"targetType": "library"
+		},
+		{
+			"name": "conformance-server",
+			"targetType": "executable",
+			"targetName": "conformance-server",
+			"mainSourceFile": "conformance/server.d",
+			"sourcePaths": ["source"],
+			"importPaths": ["source"]
 		}
 	]
 }

@@ -12,3 +12,4 @@ public import mcp.protocol.jsonrpc;
 public import mcp.protocol.capabilities;
 public import mcp.protocol.types;
 public import mcp.server.server;
+public import mcp.transport.streamable_http;
