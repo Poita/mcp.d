@@ -27,11 +27,22 @@ final class StreamCoordinator
 
     private long counter = 1;
     private Waiter[long] waiters;
+    private long streamCounter = 0;
 
     /// Allocate a fresh outbound request id.
     long alloc() @safe
     {
         return counter++;
+    }
+
+    /// Allocate a fresh stream ordinal. Combined with a per-stream monotonic
+    /// event sequence, this yields globally-unique SSE event ids across every
+    /// stream served by this mount, as the Resumability/Redelivery requirement
+    /// demands ("If present, the ID MUST be globally unique ... within ... the
+    /// session").
+    long allocStream() @safe
+    {
+        return streamCounter++;
     }
 
     /// Begin tracking a pending outbound request.
@@ -99,6 +110,8 @@ final class HttpStreamContext : RequestContext
     private ClientCapabilities clientCaps;
     private Json progressTok;
     private bool streaming_;
+    private long streamId;
+    private long eventSeq;
 
     this(HTTPServerResponse res, StreamCoordinator coord,
             ClientCapabilities caps, Json progressToken) @safe
@@ -107,6 +120,17 @@ final class HttpStreamContext : RequestContext
         this.coord = coord;
         this.clientCaps = caps;
         this.progressTok = progressToken;
+        this.streamId = coord.allocStream();
+    }
+
+    /// The globally-unique id this stream will assign to its next SSE event.
+    /// Exposed for resumability tooling and tests; the format is opaque but
+    /// stable and unique across all streams of the owning mount.
+    string nextEventId() @safe
+    {
+        import std.conv : to;
+
+        return streamId.to!string ~ "-" ~ eventSeq.to!string;
     }
 
     /// Whether the response has been upgraded to an SSE stream.
@@ -127,9 +151,10 @@ final class HttpStreamContext : RequestContext
     private void writeEvent(Json msg) @safe
     {
         beginStream();
+        const frame = formatSseEvent(nextEventId(), msg);
+        eventSeq++;
         () @trusted {
-            auto data = "data: " ~ msg.toString() ~ "\n\n";
-            res.bodyWriter.write(cast(const(ubyte)[]) data);
+            res.bodyWriter.write(cast(const(ubyte)[]) frame);
             res.bodyWriter.flush();
         }();
     }
@@ -200,6 +225,45 @@ final class HttpStreamContext : RequestContext
     {
         writeEvent(response);
     }
+}
+
+/// Frame a JSON-RPC message as a Server-Sent Events block. Per the transport
+/// Resumability/Redelivery section, the server attaches an `id:` line so a
+/// client can reconnect with `Last-Event-ID`; the id MUST be globally unique
+/// within the session, which the caller guarantees via a per-stream ordinal
+/// plus a monotonic event sequence. An empty `id` omits the line.
+string formatSseEvent(string id, Json msg) @safe
+{
+    auto block = id.length ? ("id: " ~ id ~ "\n") : "";
+    return block ~ "data: " ~ msg.toString() ~ "\n\n";
+}
+
+unittest  // formatSseEvent emits an id: line followed by the data: line
+{
+    auto j = makeNotification("notifications/message", Json.emptyObject);
+    const frame = formatSseEvent("0-3", j);
+    import std.string : startsWith, endsWith, indexOf;
+
+    assert(frame.startsWith("id: 0-3\n"));
+    assert(frame.indexOf("\ndata: ") >= 0);
+    assert(frame.endsWith("\n\n"));
+}
+
+unittest  // formatSseEvent omits the id: line when id is empty
+{
+    auto j = makeNotification("notifications/message", Json.emptyObject);
+    const frame = formatSseEvent("", j);
+    import std.string : startsWith;
+
+    assert(frame.startsWith("data: "));
+}
+
+unittest  // each stream gets a distinct ordinal, so event ids are globally unique
+{
+    auto c = new StreamCoordinator;
+    const a = c.allocStream();
+    const b = c.allocStream();
+    assert(a != b);
 }
 
 /// Extract `_meta.progressToken` from a request's params, or `Json.undefined`.
