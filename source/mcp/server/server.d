@@ -745,6 +745,18 @@ final class MCPServer
         if (entry is null)
             throw invalidParams("Unknown prompt: " ~ name);
         Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
+        // Validate declared required arguments before invoking the handler so a
+        // missing required argument yields -32602 instead of a default-valued
+        // prompt (spec: server/prompts § Error Handling / Implementation
+        // Considerations).
+        foreach (arg; entry.descriptor.arguments)
+        {
+            if (!arg.required)
+                continue;
+            if (args.type != Json.Type.object || arg.name !in args)
+                throw invalidParams("Missing required argument '" ~ arg.name
+                        ~ "' for prompt: " ~ name);
+        }
         return entry.handler(args).toJson();
     }
 
@@ -1233,6 +1245,53 @@ unittest  // prompts/list and prompts/get with arguments
     p["arguments"] = Json(["who": Json("Sam")]);
     auto get = s.handle(req(2, "prompts/get", p)).get;
     assert(get["result"]["messages"][0]["content"]["text"].get!string == "Hi Sam");
+}
+
+unittest  // prompts/get returns -32602 when a required argument is missing
+{
+    auto s = new MCPServer("t", "1");
+    Prompt pr = {name: "greet", description: nullable("greets")};
+    pr.arguments = [PromptArgument("who", nullable("name"), true)];
+    s.registerPrompt(pr, (Json args) @safe {
+        const who = ("who" in args) ? args["who"].get!string : "";
+        GetPromptResult r;
+        r.messages = [PromptMessage("user", Content.makeText("Hi " ~ who))];
+        return r;
+    });
+
+    // No "arguments" at all -> required "who" is missing.
+    Json p = Json.emptyObject;
+    p["name"] = "greet";
+    auto resp = s.handle(req(2, "prompts/get", p)).get;
+    assert("error" in resp, "expected an error for missing required argument");
+    assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+
+    // Empty "arguments" object -> still missing.
+    Json p2 = Json.emptyObject;
+    p2["name"] = "greet";
+    p2["arguments"] = Json.emptyObject;
+    auto resp2 = s.handle(req(3, "prompts/get", p2)).get;
+    assert("error" in resp2);
+    assert(resp2["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // prompts/get allows a missing optional argument
+{
+    auto s = new MCPServer("t", "1");
+    Prompt pr = {name: "greet", description: nullable("greets")};
+    pr.arguments = [PromptArgument("who", nullable("name"), false)];
+    s.registerPrompt(pr, (Json args) @safe {
+        const who = ("who" in args) ? args["who"].get!string : "world";
+        GetPromptResult r;
+        r.messages = [PromptMessage("user", Content.makeText("Hi " ~ who))];
+        return r;
+    });
+
+    Json p = Json.emptyObject;
+    p["name"] = "greet";
+    auto resp = s.handle(req(2, "prompts/get", p)).get;
+    assert("result" in resp);
+    assert(resp["result"]["messages"][0]["content"]["text"].get!string == "Hi world");
 }
 
 unittest  // completion/complete uses the registered handler
