@@ -922,6 +922,73 @@ struct ListResourceTemplatesResult
     }
 }
 
+/// A filesystem root exposed by the client (client/roots §Data Types).
+///
+/// `uri` MUST be a `file://` URI identifying the root directory; `name` is an
+/// optional human-readable label. `_meta` carries optional implementation
+/// metadata per the draft schema.
+struct Root
+{
+    string uri; /// MUST be a `file://` URI
+    Nullable!string name; /// optional human-readable name
+    Json meta; /// optional `_meta` object
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["uri"] = uri;
+        if (!name.isNull)
+            j["name"] = name.get;
+        if (meta.type == Json.Type.object)
+            j["_meta"] = meta;
+        return j;
+    }
+
+    static Root fromJson(Json j) @safe
+    {
+        Root r;
+        r.uri = ("uri" in j) ? j["uri"].get!string : "";
+        if ("name" in j && j["name"].type == Json.Type.string)
+            r.name = j["name"].get!string;
+        if ("_meta" in j && j["_meta"].type == Json.Type.object)
+            r.meta = j["_meta"];
+        return r;
+    }
+}
+
+/// Result of the `roots/list` request (client/roots).
+struct ListRootsResult
+{
+    Root[] roots;
+    Json meta; /// optional `_meta` object
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        Json arr = Json.emptyArray;
+        foreach (r; roots)
+            arr ~= r.toJson();
+        j["roots"] = arr;
+        if (meta.type == Json.Type.object)
+            j["_meta"] = meta;
+        return j;
+    }
+
+    static ListRootsResult fromJson(Json j) @safe
+    {
+        ListRootsResult r;
+        if ("roots" in j && j["roots"].type == Json.Type.array)
+        {
+            auto arr = j["roots"];
+            foreach (i; 0 .. arr.length)
+                r.roots ~= Root.fromJson(arr[i]);
+        }
+        if ("_meta" in j && j["_meta"].type == Json.Type.object)
+            r.meta = j["_meta"];
+        return r;
+    }
+}
+
 unittest  // Resource omits annotations/size/icons when unset
 {
     Resource r = {uri: "test://x", name: "x"};
@@ -929,6 +996,60 @@ unittest  // Resource omits annotations/size/icons when unset
     assert("annotations" !in j);
     assert("size" !in j);
     assert("icons" !in j);
+}
+
+unittest  // Root serializes uri and optional name
+{
+    Root r = {uri: "file:///home/user/project", name: nullable("My Project")};
+    auto j = r.toJson();
+    assert(j["uri"].get!string == "file:///home/user/project");
+    assert(j["name"].get!string == "My Project");
+}
+
+unittest  // Root omits name when unset
+{
+    Root r = {uri: "file:///tmp"};
+    auto j = r.toJson();
+    assert("name" !in j);
+}
+
+unittest  // Root round-trips through fromJson including name
+{
+    Root r = {uri: "file:///a", name: nullable("a")};
+    auto back = Root.fromJson(r.toJson());
+    assert(back.uri == "file:///a");
+    assert(!back.name.isNull && back.name.get == "a");
+}
+
+unittest  // Root preserves _meta
+{
+    Root r = {uri: "file:///a"};
+    r.meta = Json.emptyObject;
+    r.meta["k"] = "v";
+    auto back = Root.fromJson(r.toJson());
+    assert(back.meta["k"].get!string == "v");
+}
+
+unittest  // ListRootsResult serializes roots envelope
+{
+    ListRootsResult res;
+    res.roots = [Root("file:///a", nullable("a")), Root("file:///b")];
+    auto j = res.toJson();
+    assert(j["roots"].type == Json.Type.array);
+    assert(j["roots"].length == 2);
+    assert(j["roots"][0]["uri"].get!string == "file:///a");
+    assert(j["roots"][0]["name"].get!string == "a");
+    assert("name" !in j["roots"][1]);
+}
+
+unittest  // ListRootsResult round-trips through fromJson
+{
+    ListRootsResult res;
+    res.roots = [Root("file:///x", nullable("x"))];
+    auto back = ListRootsResult.fromJson(res.toJson());
+    assert(back.roots.length == 1);
+    assert(back.roots[0].uri == "file:///x");
+    assert(back.roots[0].name.get == "x");
 }
 
 unittest  // Resource emits annotations (audience/priority/lastModified)
