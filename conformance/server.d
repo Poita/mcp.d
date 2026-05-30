@@ -113,4 +113,68 @@ private void registerConformanceFixtures(MCPServer server) @safe
         r.isError = true;
         return r;
     });
+
+    // tools-call-image: a minimal 1x1 PNG.
+    Tool imageTool = {
+        name: "test_image_content", description: nullable("Returns image content")
+    };
+    server.registerTool(imageTool, (Json args) @safe {
+        CallToolResult r;
+        r.content = [Content.makeImage(onePixelPng, "image/png")];
+        return r;
+    });
+
+    // tools-call-audio: a minimal silent WAV.
+    Tool audioTool = {
+        name: "test_audio_content", description: nullable("Returns audio content")
+    };
+    server.registerTool(audioTool, (Json args) @safe {
+        CallToolResult r;
+        r.content = [Content.makeAudio(minimalWav, "audio/wav")];
+        return r;
+    });
+
+    // tools-call-embedded-resource: an embedded text resource.
+    Tool embeddedTool = {
+        name: "test_embedded_resource", description: nullable("Returns an embedded resource")
+    };
+    server.registerTool(embeddedTool, (Json args) @safe {
+        CallToolResult r;
+        r.content = [
+            Content.makeEmbeddedText("test://embedded-resource", "text/plain",
+                "This is an embedded resource content.")
+        ];
+        return r;
+    });
+
+    // tools-call-mixed-content: text + image + embedded resource.
+    Tool mixedTool = {
+        name: "test_multiple_content_types", description: nullable("Returns multiple content types")
+    };
+    server.registerTool(mixedTool, (Json args) @safe {
+        CallToolResult r;
+        r.content = [
+            Content.makeText("Multiple content types test:"),
+            Content.makeImage(onePixelPng, "image/png"),
+            Content.makeEmbeddedText("test://mixed-content-resource",
+                "application/json", `{"test":"data","value":123}`)
+        ];
+        return r;
+    });
+}
+
+/// A base64-encoded 1x1 PNG (used by image/mixed-content fixtures).
+private enum onePixelPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/// A base64-encoded minimal 44-byte PCM WAV header (no samples), computed once.
+private string minimalWav() @safe
+{
+    import std.base64 : Base64;
+
+    immutable ubyte[] wav = [
+        'R', 'I', 'F', 'F', 36, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't',
+        ' ', 16, 0, 0, 0, 1, 0, 1, 0, 0x40, 0x1f, 0, 0, 0x40, 0x1f, 0, 0, 1,
+        0, 8, 0, 'd', 'a', 't', 'a', 0, 0, 0, 0
+    ];
+    return Base64.encode(wav);
 }

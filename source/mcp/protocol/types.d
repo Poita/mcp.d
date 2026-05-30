@@ -56,6 +56,29 @@ struct Content
         return c;
     }
 
+    static Content makeResourceLink(string uri, string name, string mime = "") @safe
+    {
+        Content c;
+        c.kind = ContentKind.resourceLink;
+        c.uri = uri;
+        c.name = name;
+        c.mimeType = mime;
+        return c;
+    }
+
+    static Content makeEmbeddedText(string uri, string mime, string text) @safe
+    {
+        Content c;
+        c.kind = ContentKind.embeddedResource;
+        Json r = Json.emptyObject;
+        r["uri"] = uri;
+        if (mime.length)
+            r["mimeType"] = mime;
+        r["text"] = text;
+        c.resource = r;
+        return c;
+    }
+
     Json toJson() const @safe
     {
         Json j = Json.emptyObject;
@@ -320,6 +343,26 @@ unittest  // text content round-trips
     assert(j["type"].get!string == "text");
     assert(j["text"].get!string == "hello");
     assert(Content.fromJson(j).text == "hello");
+}
+
+unittest  // embedded text resource carries uri/mimeType/text
+{
+    auto c = Content.makeEmbeddedText("test://x", "text/plain", "hi");
+    auto j = c.toJson();
+    assert(j["type"].get!string == "resource");
+    assert(j["resource"]["uri"].get!string == "test://x");
+    assert(j["resource"]["mimeType"].get!string == "text/plain");
+    assert(j["resource"]["text"].get!string == "hi");
+    assert(Content.fromJson(j).kind == ContentKind.embeddedResource);
+}
+
+unittest  // resource link carries uri and name
+{
+    auto c = Content.makeResourceLink("file:///a", "a", "text/plain");
+    auto j = c.toJson();
+    assert(j["type"].get!string == "resource_link");
+    assert(j["uri"].get!string == "file:///a");
+    assert(j["name"].get!string == "a");
 }
 
 unittest  // image content uses data + mimeType

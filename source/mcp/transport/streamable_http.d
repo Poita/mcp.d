@@ -40,9 +40,8 @@ void mountMcp(URLRouter router, MCPServer server,
 
 private void handlePost(MCPServer server, scope HTTPServerRequest req, scope HTTPServerResponse res) @safe
 {
-    const 
-    body = req.bodyReader.readAllUTF8();
-    const responseText = server.handleRaw(body);
+    const payload = req.bodyReader.readAllUTF8();
+    const responseText = server.handleRaw(payload);
     if (responseText.length == 0)
     {
         // Notifications/responses only: nothing to return.
