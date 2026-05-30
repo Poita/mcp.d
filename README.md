@@ -125,6 +125,44 @@ dub run :calculator                 # stdio (for Claude Desktop)
 dub run :calculator -- --http 3000  # Streamable HTTP on port 3000
 ```
 
+## Example: a client calling that server
+
+With the calculator server running over HTTP (`dub run :calculator -- --http 3000`),
+a client can connect and call the `add` tool:
+
+```d
+import mcp;
+import std.stdio : writeln;
+import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+import vibe.data.json : Json;
+
+void main()
+{
+    // MCPClient uses vibe.d async I/O, so drive it from a task on the event loop.
+    runTask(() nothrow {
+        scope (exit) exitEventLoop();
+        try
+        {
+            auto client = new MCPClient("http://127.0.0.1:3000/mcp");
+            client.initialize();
+
+            auto result = client.callTool("add", Json(["a": Json(2), "b": Json(40)]));
+            writeln(result.content[0].text);                       // text view: "42"
+            writeln(result.structuredContent["result"].get!long);  // structured: 42
+        }
+        catch (Exception e)
+        {
+            // handle connection / tool errors
+        }
+    });
+    runEventLoop();
+}
+```
+
+`MCPClient` also offers `listTools` / `listResources` / `listPrompts` (auto-paginated),
+`readResource`, `getPrompt`, `setBearerToken` for OAuth, and `enableDraft()` for the
+stateless draft protocol.
+
 ## Running the conformance suite
 
 ```bash
@@ -132,24 +170,6 @@ dub build -c conformance-server
 ./conformance-server --port 3000 &
 npx @modelcontextprotocol/conformance server --url http://127.0.0.1:3000/mcp
 ```
-
-## Architecture
-
-```
-source/mcp/
-  protocol/   versions  jsonrpc  errors  capabilities  types  draft
-  transport/  stdio  streamable_http  sse_context   (both transports + SSE streaming)
-  server/     server  context        (transport-agnostic dispatch + per-request Context)
-  client/     client                 (MCPClient, auto-pagination, SSE + resumption)
-  api/        attributes  schema  reflection   (@tool/@resource/@prompt UDA layer)
-  auth/       oauth  client  jwt      (OAuth 2.1: PKCE, DCR, JWT assertions, token exchange)
-```
-
-`MCPServer` is a transport-agnostic JSON-RPC dispatch core (`handle` / `handleRaw`);
-transports (stdio + Streamable HTTP) are thin drivers over it. All wire types serialize
-through presence-aware `toJson`/`fromJson` so optional fields are omitted, not nulled.
-
-See `docs/superpowers/specs` and `docs/superpowers/plans` for the design and staged plans.
 
 ## License
 

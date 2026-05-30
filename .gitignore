@@ -1,5 +1,4 @@
 .dub/
-docs/superpowers/plans/*.html
 *.o
 *.obj
 *.a
