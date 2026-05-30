@@ -252,6 +252,35 @@ string authorizationServerMetadataUrl(string issuer) @safe
     return origin ~ "/.well-known/oauth-authorization-server" ~ path;
 }
 
+/// The ordered list of authorization-server metadata URLs to try for an issuer,
+/// covering RFC 8414 (`oauth-authorization-server`) and OpenID Connect Discovery
+/// (`openid-configuration`), in both path-aware and path-append forms.
+string[] authServerMetadataCandidates(string issuer) @safe
+{
+    import std.string : endsWith, indexOf;
+
+    auto iss = issuer;
+    if (iss.endsWith("/"))
+        iss = iss[0 .. $ - 1];
+    auto schemeEnd = iss.indexOf("://");
+    if (schemeEnd < 0)
+        return [iss ~ "/.well-known/oauth-authorization-server"];
+    const afterScheme = schemeEnd + 3;
+    const slash = iss[afterScheme .. $].indexOf('/');
+    if (slash < 0)
+        return [
+        iss ~ "/.well-known/oauth-authorization-server",
+        iss ~ "/.well-known/openid-configuration"
+    ];
+    const origin = iss[0 .. afterScheme + slash];
+    const path = iss[afterScheme + slash .. $];
+    return [
+        origin ~ "/.well-known/oauth-authorization-server" ~ path,
+        origin ~ "/.well-known/openid-configuration" ~ path,
+        iss ~ "/.well-known/openid-configuration"
+    ];
+}
+
 /// Select the OAuth scopes to request: prefer the scopes named in the
 /// `WWW-Authenticate` challenge; otherwise fall back to the resource metadata's
 /// `scopes_supported`; otherwise none.

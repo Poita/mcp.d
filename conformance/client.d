@@ -191,8 +191,13 @@ private int runAuthScenario(string url, string scenario) @safe
     oauth.redirectUri = "http://localhost:8765/callback";
 
     const www = oauth.probeUnauthorized(url);
-    auto prm = oauth.discoverProtectedResource(url, www);
-    const issuer = prm.authorizationServers.length ? prm.authorizationServers[0] : oauth.resource;
+    ProtectedResourceMetadata prm;
+    try
+        prm = oauth.discoverProtectedResource(url, www);
+    catch (Exception)
+    {
+    }
+    const issuer = oauth.resolveIssuer(url, www);
     auto as_ = oauth.discoverAuthServer(issuer);
 
     // Pick the token-endpoint auth method the AS advertises (prefer none).

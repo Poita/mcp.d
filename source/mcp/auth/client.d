@@ -51,16 +51,62 @@ final class OAuthClient
         throw internalError("Could not discover protected-resource metadata");
     }
 
-    /// Discover authorization-server metadata for an issuer (RFC 8414).
+    /// Discover authorization-server metadata for an issuer, trying the RFC 8414
+    /// and OpenID Connect Discovery well-known locations in order.
     AuthorizationServerMetadata discoverAuthServer(string issuer) @safe
     {
-        Json j;
-        if (!tryGetJson(authorizationServerMetadataUrl(issuer), j))
-            throw internalError("Could not discover authorization-server metadata: " ~ issuer);
-        auto m = AuthorizationServerMetadata.fromJson(j);
-        if (!m.supportsS256)
-            throw internalError("Authorization server does not advertise PKCE S256 support");
+        foreach (u; authServerMetadataCandidates(issuer))
+        {
+            Json j;
+            if (tryGetJson(u, j))
+            {
+                auto m = AuthorizationServerMetadata.fromJson(j);
+                if (m.issuer.length == 0)
+                    m.issuer = issuer;
+                return m;
+            }
+        }
+        // 2025-03-26 fallback: no metadata document — use default endpoints
+        // derived from the issuer.
+        import std.string : endsWith;
+
+        auto base = issuer.endsWith("/") ? issuer[0 .. $ - 1] : issuer;
+        AuthorizationServerMetadata m;
+        m.issuer = issuer;
+        m.authorizationEndpoint = base ~ "/authorize";
+        m.tokenEndpoint = base ~ "/token";
+        m.registrationEndpoint = base ~ "/register";
         return m;
+    }
+
+    /// Discover protected-resource metadata, falling back to treating the MCP
+    /// server's origin as the issuer when no PRM document exists (the pre-RFC-9728
+    /// 2025-03-26 behavior). Returns the issuer to use for AS discovery.
+    string resolveIssuer(string mcpEndpoint, string wwwAuthenticateHeader = "") @safe
+    {
+        try
+        {
+            auto prm = discoverProtectedResource(mcpEndpoint, wwwAuthenticateHeader);
+            if (prm.authorizationServers.length)
+                return prm.authorizationServers[0];
+        }
+        catch (Exception)
+        {
+        }
+        // Backcompat: no PRM -> the MCP server origin is the authorization server.
+        return originOf(mcpEndpoint);
+    }
+
+    private static string originOf(string url) @safe
+    {
+        import std.string : indexOf;
+
+        const schemeEnd = url.indexOf("://");
+        if (schemeEnd < 0)
+            return url;
+        const afterScheme = schemeEnd + 3;
+        const slash = url[afterScheme .. $].indexOf('/');
+        return (slash < 0) ? url : url[0 .. afterScheme + slash];
     }
 
     /// Register a client dynamically (RFC 7591) at the AS registration endpoint.
