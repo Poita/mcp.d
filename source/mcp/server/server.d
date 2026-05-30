@@ -16,11 +16,59 @@ import mcp.server.context;
 /// A tool handler receiving the parsed arguments and the per-request context.
 alias ToolHandler = CallToolResult delegate(Json arguments, RequestContext ctx) @safe;
 
-/// A registered tool: its descriptor plus the handler that executes it.
+/// A tool handler that may, on a stateless (MRTR) request, ask the client for
+/// more input instead of returning a final result. See `ToolResponse`.
+alias MrtrToolHandler = ToolResponse delegate(Json arguments, RequestContext ctx) @safe;
+
+/// The outcome of a tool call: either the final `CallToolResult`, or — on a
+/// stateless (MRTR) request — a set of `InputRequest`s the client must satisfy
+/// and resubmit. There is no suspension or shared state: `inputRequired` simply
+/// ends this request, and the client opens a fresh one carrying the answers.
+struct ToolResponse
+{
+    private bool needsInput_;
+    private CallToolResult result_;
+    private InputRequiredResult required_;
+
+    /// The handler is done; `r` is the final result.
+    static ToolResponse complete(CallToolResult r) @safe
+    {
+        ToolResponse t;
+        t.result_ = r;
+        return t;
+    }
+
+    /// The handler needs input; the client must gather it and resubmit with the
+    /// matching `inputResponses`.
+    static ToolResponse inputRequired(InputRequest[] requests) @safe
+    {
+        ToolResponse t;
+        t.needsInput_ = true;
+        t.required_.inputRequests = requests;
+        return t;
+    }
+
+    /// Whether this outcome asks the client for more input.
+    bool needsInput() const @safe
+    {
+        return needsInput_;
+    }
+
+    /// The JSON-RPC `result` payload (a `CallToolResult` or an
+    /// `InputRequiredResult`).
+    Json toJson() const @safe
+    {
+        return needsInput_ ? required_.toJson() : result_.toJson();
+    }
+}
+
+/// A registered tool: its descriptor plus the handler that executes it. The
+/// handler always returns a `ToolResponse`; the `CallToolResult`-returning
+/// registration overloads are adapted to one that always `complete`s.
 struct RegisteredTool
 {
     Tool descriptor;
-    ToolHandler handler;
+    MrtrToolHandler handler;
 }
 
 /// A registered direct resource: descriptor + reader producing its contents.
@@ -89,14 +137,26 @@ final class MCPServer
     /// sampling / elicitation available via `ctx`).
     void registerTool(Tool descriptor, ToolHandler handler) @safe
     {
-        tools[descriptor.name] = RegisteredTool(descriptor, handler);
+        tools[descriptor.name] = RegisteredTool(descriptor, (Json args,
+                RequestContext ctx) => ToolResponse.complete(handler(args, ctx)));
     }
 
     /// Register a tool with a simple handler that ignores the request context.
     void registerTool(Tool descriptor, CallToolResult delegate(Json) @safe handler) @safe
     {
         tools[descriptor.name] = RegisteredTool(descriptor, (Json args,
-                RequestContext) => handler(args));
+                RequestContext) => ToolResponse.complete(handler(args)));
+    }
+
+    /// Register a tool whose handler may ask the client for more input on a
+    /// stateless (MRTR) request. The handler branches on `ctx.isStateless`:
+    /// when stateless it reads `ctx.inputResponses` and returns either
+    /// `ToolResponse.complete` or `ToolResponse.inputRequired`; otherwise it may
+    /// call the blocking `ctx.elicit`/`ctx.sample`. A server that wants to serve
+    /// both protocol eras handles both branches here.
+    void registerTool(Tool descriptor, MrtrToolHandler handler) @safe
+    {
+        tools[descriptor.name] = RegisteredTool(descriptor, handler);
     }
 
     /// The capabilities advertised by the connected client (valid after
@@ -272,9 +332,15 @@ final class MCPServer
             }
         }
 
+        // Install the per-request scope so handlers see the right statelessness
+        // (MRTR vs blocking) and the input responses carried on a retried draft
+        // request, regardless of which transport supplied the base context.
+        auto scoped = new RequestScope(ctx, effectiveVersion.usesMRTR,
+                readInputResponses(msg.params));
+
         try
         {
-            auto result = route(msg.method, msg.params, ctx);
+            auto result = route(msg.method, msg.params, scoped);
             return makeResponse(msg.id, result);
         }
         catch (McpException e)
@@ -540,7 +606,7 @@ final class MCPServer
 
         Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
         try
-            return entry.handler(args, ctx).toJson();
+            return entry.handler(args, ctx).toJson(); // CallToolResult or InputRequiredResult
         catch (McpException e)
             throw e; // protocol-level errors propagate as JSON-RPC errors
         catch (Exception e)
@@ -1044,4 +1110,185 @@ unittest  // requests without a per-request version are unaffected (legacy path)
     auto s = makeTestServer();
     auto resp = s.handle(req(3, "tools/list")).get;
     assert("error" !in resp);
+}
+
+// ---------------------------------------------------------------------------
+// MRTR (draft) tool handling: the handler branches on ctx.isStateless and either
+// returns ToolResponse.inputRequired(...) (stateless) or calls ctx.elicit()
+// (2025-era). No framework version-dispatch and no replay.
+// ---------------------------------------------------------------------------
+
+unittest  // ToolResponse.complete serializes to the tool result
+{
+    CallToolResult r;
+    r.content = [Content.makeText("hi")];
+    auto tr = ToolResponse.complete(r);
+    assert(!tr.needsInput);
+    assert(tr.toJson()["content"][0]["text"].get!string == "hi");
+}
+
+unittest  // ToolResponse.inputRequired serializes the input requests
+{
+    auto tr = ToolResponse.inputRequired([
+        InputRequest("q1", "elicitation", Json.emptyObject)
+    ]);
+    assert(tr.needsInput);
+    auto j = tr.toJson();
+    assert(j["inputRequests"][0]["id"].get!string == "q1");
+    assert(j["inputRequests"][0]["type"].get!string == "elicitation");
+}
+
+version (unittest)
+{
+    // A fake transport context: server->client requests return a canned answer.
+    private final class FakeCtx : RequestContext
+    {
+        void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
+        {
+        }
+
+        void log(string, Json, string = null) @safe
+        {
+        }
+
+        Json sendRequest(string, Json) @safe
+        {
+            return Json([
+                "action": Json("accept"),
+                "content": Json(["day": Json("tuesday")])
+            ]);
+        }
+
+        bool clientSupports(string) @safe
+        {
+            return true;
+        }
+
+        bool isStateless() @safe
+        {
+            return false;
+        }
+
+        Json[string] inputResponses() @safe
+        {
+            Json[string] empty;
+            return empty;
+        }
+    }
+
+    // Register a tool that books a flight, asking for the date either via MRTR
+    // (stateless) or a blocking elicit() (2025-era).
+    private void registerBookTool(MCPServer s) @safe
+    {
+        Tool book = {name: "book"};
+        s.registerTool(book, (Json args, RequestContext ctx) @safe {
+            if (ctx.isStateless)
+            {
+                auto answers = ctx.inputResponses();
+                if ("date" !in answers)
+                {
+                    Json ep = Json.emptyObject;
+                    ep["message"] = "When?";
+                    return ToolResponse.inputRequired([
+                        InputRequest("date", "elicitation", ep)
+                    ]);
+                }
+                CallToolResult r;
+                r.content = [
+                    Content.makeText("booked " ~ answers["date"]["content"]["day"].get!string)
+                ];
+                return ToolResponse.complete(r);
+            }
+            else
+            {
+                auto answer = ctx.elicit("When?", Json.emptyObject);
+                CallToolResult r;
+                r.content = [
+                    Content.makeText("booked " ~ answer["content"]["day"].get!string)
+                ];
+                return ToolResponse.complete(r);
+            }
+        });
+    }
+
+    // A draft tools/call whose _meta also carries the given input responses.
+    private Message draftCall(long id, string tool, InputResponse[] responses) @safe
+    {
+        Json meta = Json.emptyObject;
+        meta[MetaKey.protocolVersion] = "2026-07-28";
+        meta[MetaKey.clientInfo] = Json([
+            "name": Json("c"),
+            "version": Json("1")
+        ]);
+        meta[MetaKey.clientCapabilities] = Json.emptyObject;
+        if (responses.length)
+        {
+            Json arr = Json.emptyArray;
+            foreach (resp; responses)
+                arr ~= resp.toJson();
+            meta[MetaKey.inputResponses] = arr;
+        }
+        Json params = Json.emptyObject;
+        params["name"] = tool;
+        params["arguments"] = Json.emptyObject;
+        params["_meta"] = meta;
+        return Message(makeRequest(Json(id), "tools/call", params));
+    }
+}
+
+unittest  // draft (stateless) first round: handler returns an InputRequiredResult
+{
+    auto s = new MCPServer("t", "1");
+    registerBookTool(s);
+    auto resp = s.handle(draftCall(1, "book", [])).get;
+    assert("error" !in resp);
+    assert(resp["result"]["inputRequests"][0]["type"].get!string == "elicitation");
+    assert(resp["result"]["inputRequests"][0]["id"].get!string == "date");
+}
+
+unittest  // draft (stateless) retry with input responses: handler completes
+{
+    auto s = new MCPServer("t", "1");
+    registerBookTool(s);
+    auto answer = InputResponse("date", Json([
+            "content": Json(["day": Json("monday")])
+    ]));
+    auto resp = s.handle(draftCall(2, "book", [answer])).get;
+    assert("inputRequests" !in resp["result"]);
+    assert(resp["result"]["content"][0]["text"].get!string == "booked monday");
+}
+
+unittest  // elicit() is rejected on a stateless (draft) request
+{
+    auto s = new MCPServer("t", "1");
+    Tool bad = {name: "bad"};
+    s.registerTool(bad, (Json args, RequestContext ctx) @safe {
+        ctx.elicit("x", Json.emptyObject); // illegal under MRTR
+        CallToolResult r;
+        return ToolResponse.complete(r);
+    });
+    Json p = Json.emptyObject;
+    auto resp = s.handle(draftReq(3, "tools/call", buildName(p, "bad"))).get;
+    assert("error" in resp);
+    assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // 2025-era request: ctx.elicit() blocks and the handler completes
+{
+    auto s = new MCPServer("t", "1");
+    registerBookTool(s);
+    Json p = Json.emptyObject;
+    auto resp = s.handle(req(4, "tools/call", buildName(p, "book")), new FakeCtx).get;
+    assert("error" !in resp);
+    assert(resp["result"]["content"][0]["text"].get!string == "booked tuesday");
+}
+
+version (unittest)
+{
+    private Json buildName(Json p, string tool) @safe
+    {
+        p["name"] = tool;
+        p["arguments"] = Json.emptyObject;
+        return p;
+    }
 }

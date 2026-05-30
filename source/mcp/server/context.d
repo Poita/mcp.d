@@ -33,20 +33,40 @@ interface RequestContext
     /// ("sampling", "elicitation", "roots").
     bool clientSupports(string capability) @safe;
 
+    /// True when this request is on a stateless (MRTR) protocol — the draft
+    /// revision, where there is no server->client channel. On such requests a
+    /// tool handler must NOT call `elicit`/`sample` (they throw); instead it
+    /// returns `ToolResponse.inputRequired(...)` and reads the client's answers
+    /// from `inputResponses` on the retried request. False on 2025-era requests.
+    bool isStateless() @safe;
+
+    /// The input responses the client attached when resubmitting an MRTR
+    /// request, keyed by the `InputRequest.id` the server issued on the prior
+    /// round. Empty on the first call and on non-stateless requests.
+    Json[string] inputResponses() @safe;
+
     /// Request an LLM completion from the client (`sampling/createMessage`).
-    /// Throws if the client does not support sampling.
+    /// Throws on a stateless (MRTR) request — use `ToolResponse.inputRequired`
+    /// instead — or if the client does not support sampling.
     final Json sample(Json params) @safe
     {
+        if (isStateless)
+            throw invalidRequest(
+                    "sample() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
         if (!clientSupports("sampling"))
             throw invalidRequest("Client does not support sampling");
         return sendRequest("sampling/createMessage", params);
     }
 
     /// Request structured user input from the client (`elicitation/create`).
-    /// `requestedSchema` must be a JSON Schema object. Throws if the client does
-    /// not support elicitation.
+    /// `requestedSchema` must be a JSON Schema object. Throws on a stateless
+    /// (MRTR) request — use `ToolResponse.inputRequired` instead — or if the
+    /// client does not support elicitation.
     final Json elicit(string message, Json requestedSchema) @safe
     {
+        if (isStateless)
+            throw invalidRequest(
+                    "elicit() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
         if (!clientSupports("elicitation"))
             throw invalidRequest("Client does not support elicitation");
         Json params = Json.emptyObject;
@@ -77,5 +97,68 @@ final class NullContext : RequestContext
     bool clientSupports(string) @safe
     {
         return false;
+    }
+
+    bool isStateless() @safe
+    {
+        return false;
+    }
+
+    Json[string] inputResponses() @safe
+    {
+        Json[string] empty;
+        return empty;
+    }
+}
+
+/// Wraps a transport-supplied `RequestContext` with the per-request protocol
+/// state the server determines only after parsing the message: whether the
+/// request is stateless (MRTR), and the input responses the client attached.
+/// The server installs this around the transport context before dispatching, so
+/// handlers observe correct `isStateless`/`inputResponses` and `elicit`/`sample`
+/// fail fast on stateless requests. Notifications and server->client requests
+/// delegate to the wrapped context unchanged.
+final class RequestScope : RequestContext
+{
+    private RequestContext inner;
+    private bool stateless;
+    private Json[string] responses;
+
+    this(RequestContext inner, bool stateless, Json[string] responses) @safe
+    {
+        this.inner = inner;
+        this.stateless = stateless;
+        this.responses = responses;
+    }
+
+    void reportProgress(double progress,
+            Nullable!double total = Nullable!double.init, string message = null) @safe
+    {
+        inner.reportProgress(progress, total, message);
+    }
+
+    void log(string level, Json data, string logger = null) @safe
+    {
+        inner.log(level, data, logger);
+    }
+
+    Json sendRequest(string method, Json params) @safe
+    {
+        return inner.sendRequest(method, params);
+    }
+
+    bool clientSupports(string capability) @safe
+    {
+        return inner.clientSupports(capability);
+    }
+
+    bool isStateless() @safe
+    {
+        return stateless;
+    }
+
+    Json[string] inputResponses() @safe
+    {
+        return responses;
     }
 }

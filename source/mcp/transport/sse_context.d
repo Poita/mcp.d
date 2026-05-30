@@ -182,6 +182,19 @@ final class HttpStreamContext : RequestContext
         }
     }
 
+    // Per-request protocol state (statelessness, input responses) is supplied by
+    // the server's RequestScope wrapper, not the transport; default here.
+    bool isStateless() @safe
+    {
+        return false;
+    }
+
+    Json[string] inputResponses() @safe
+    {
+        Json[string] empty;
+        return empty;
+    }
+
     /// Write the final JSON-RPC response as the terminating SSE event.
     void finishWith(Json response) @safe
     {
