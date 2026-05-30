@@ -212,7 +212,7 @@ unittest  // builders produce spec-shaped objects
     assert(req["params"]["cursor"].get!string == "c1");
 
     auto note = makeNotification("notifications/cancelled", Json([
-            "requestId": Json(7)
+        "requestId": Json(7)
     ]));
     assert("id" !in note);
     assert(note["method"].get!string == "notifications/cancelled");

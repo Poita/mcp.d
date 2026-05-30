@@ -99,7 +99,7 @@ unittest  // toErrorJson produces a JSON-RPC error object
 unittest  // toErrorJson includes data when present
 {
     auto e = new McpException(ErrorCode.invalidParams, "bad", Json([
-            "field": Json("name")
+        "field": Json("name")
     ]));
     auto j = e.toErrorJson();
     assert(j["data"]["field"].get!string == "name");

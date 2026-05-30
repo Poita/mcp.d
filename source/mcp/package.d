@@ -9,3 +9,5 @@ module mcp;
 public import mcp.protocol.versions;
 public import mcp.protocol.errors;
 public import mcp.protocol.jsonrpc;
+public import mcp.protocol.capabilities;
+public import mcp.protocol.types;
