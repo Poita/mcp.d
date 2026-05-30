@@ -581,7 +581,7 @@ final class MCPServer
         // (MRTR vs blocking) and the input responses carried on a retried draft
         // request, regardless of which transport supplied the base context.
         auto scoped = new RequestScope(ctx, effectiveVersion.usesMRTR,
-                readInputResponses(msg.params));
+                readInputResponses(msg.params), logLevel);
 
         try
         {
@@ -1439,6 +1439,79 @@ unittest  // logging/setLevel stores the level and returns an empty object
     auto resp = s.handle(req(1, "logging/setLevel", p)).get;
     assert(resp["result"].type == Json.Type.object && resp["result"].length == 0);
     assert(s.currentLogLevel == "debug");
+}
+
+unittest  // after setLevel(error), a handler's sub-error logs are dropped
+{
+    // A context that records every log notification its handler emits.
+    static final class RecordingCtx : RequestContext
+    {
+        string[] emitted;
+        void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
+        {
+        }
+
+        void log(string level, Json, string = null) @safe
+        {
+            emitted ~= level;
+        }
+
+        Json sendRequest(string, Json) @safe
+        {
+            return Json.undefined;
+        }
+
+        bool clientSupports(string) @safe
+        {
+            return false;
+        }
+
+        bool isStateless() @safe
+        {
+            return false;
+        }
+
+        Json[string] inputResponses() @safe
+        {
+            Json[string] e;
+            return e;
+        }
+
+        import mcp.auth.resource_server : TokenInfo;
+
+        TokenInfo auth() @safe
+        {
+            return TokenInfo.invalid();
+        }
+    }
+
+    auto s = new MCPServer("t", "1");
+    s.enableLogging();
+
+    // A tool that emits a log at every severity.
+    Tool t = {name: "noisy"};
+    s.registerTool(t, (Json args, RequestContext ctx) @safe {
+        ctx.log("debug", Json("d"));
+        ctx.log("warning", Json("w"));
+        ctx.log("error", Json("e"));
+        ctx.log("emergency", Json("x"));
+        CallToolResult r;
+        r.content = [Content.makeText("ok")];
+        return r;
+    });
+
+    // Raise the client-set minimum to "error".
+    Json p = Json.emptyObject;
+    p["level"] = "error";
+    s.handle(req(1, "logging/setLevel", p));
+
+    auto ctx = new RecordingCtx;
+    Json callP = Json.emptyObject;
+    callP["name"] = "noisy";
+    s.handle(req(2, "tools/call", callP), ctx);
+
+    // Only error and above reached the transport context.
+    assert(ctx.emitted == ["error", "emergency"]);
 }
 
 unittest  // capabilities reflect registered features
