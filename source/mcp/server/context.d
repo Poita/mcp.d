@@ -88,6 +88,31 @@ unittest  // shouldLog fails open on unrecognised level names
     assert(shouldLog("debug", "bogus"));
 }
 
+/// A shared, mutable cancellation flag for one in-flight request. The server
+/// hands the same token to the request's `RequestContext` (so the handler can
+/// poll `ctx.isCancelled`) and to its in-flight registry (so an inbound
+/// `notifications/cancelled` for the matching request id can flip it). It is a
+/// class so the flag is observed across the two tasks that a Streamable HTTP
+/// transport runs the request and its cancellation on. See
+/// basic/utilities/cancellation: a receiver "SHOULD: Stop processing the
+/// cancelled request, Free associated resources, Not send a response".
+final class CancellationToken
+{
+    private bool cancelled_;
+
+    /// Whether a cancellation has been requested for this token's request.
+    bool cancelled() const @safe nothrow @nogc
+    {
+        return cancelled_;
+    }
+
+    /// Mark the request cancelled. Idempotent.
+    void cancel() @safe nothrow @nogc
+    {
+        cancelled_ = true;
+    }
+}
+
 /// Per-request context handed to tool handlers. It is the channel through which
 /// a handler emits server->client traffic while a request is in flight:
 /// progress + logging notifications, and (blocking) sampling / elicitation
@@ -96,6 +121,14 @@ unittest  // shouldLog fails open on unrecognised level names
 /// requests are unsupported).
 interface RequestContext
 {
+    /// Whether the client has sent a `notifications/cancelled` for this request
+    /// (basic/utilities/cancellation). A long-running handler SHOULD poll this
+    /// and, when true, stop work and free resources promptly; the server
+    /// suppresses the late response for a cancelled request regardless. Always
+    /// false on transports that cannot deliver an out-of-band cancellation while
+    /// a request is in flight (e.g. the in-process / stdio `NullContext`).
+    bool isCancelled() @safe;
+
     /// Emit a `notifications/progress`. No-op if the originating request carried
     /// no `_meta.progressToken`.
     void reportProgress(double progress,
@@ -236,6 +269,11 @@ interface RequestContext
 /// support streaming, and as the default when none is supplied.
 final class NullContext : RequestContext
 {
+    bool isCancelled() @safe
+    {
+        return false;
+    }
+
     void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
     {
     }
@@ -285,15 +323,27 @@ final class RequestScope : RequestContext
     private Json[string] responses;
     private string minLevel;
     private bool loggingRequested;
+    private CancellationToken cancellation;
 
-    this(RequestContext inner, bool stateless, Json[string] responses,
-            string minLevel = "info", bool loggingRequested = true) @safe
+    this(RequestContext inner, bool stateless, Json[string] responses, string minLevel = "info",
+            bool loggingRequested = true, CancellationToken cancellation = null) @safe
     {
         this.inner = inner;
         this.stateless = stateless;
         this.responses = responses;
         this.minLevel = minLevel;
         this.loggingRequested = loggingRequested;
+        this.cancellation = cancellation;
+    }
+
+    /// True once the client has cancelled this request via
+    /// `notifications/cancelled`. Reads the shared token the server installed for
+    /// this request; if none was installed it delegates to the wrapped context.
+    bool isCancelled() @safe
+    {
+        if (cancellation !is null && cancellation.cancelled)
+            return true;
+        return inner.isCancelled();
     }
 
     void reportProgress(double progress,
@@ -350,6 +400,11 @@ version (unittest) private final class SamplingProbe : RequestContext
 {
     Json lastParams;
 
+    bool isCancelled() @safe
+    {
+        return false;
+    }
+
     void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
     {
     }
@@ -401,6 +456,11 @@ version (unittest) private final class RootsProbe : RequestContext
     Json lastParams;
     bool supportsRoots = true;
 
+    bool isCancelled() @safe
+    {
+        return false;
+    }
+
     void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
     {
     }
@@ -451,6 +511,11 @@ version (unittest) private final class ElicitProbe : RequestContext
     Json lastParams;
     bool supportsElicitation = true;
     bool stateless = false;
+
+    bool isCancelled() @safe
+    {
+        return false;
+    }
 
     void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
     {
@@ -598,6 +663,11 @@ version (unittest) private final class LogProbe : RequestContext
 {
     string[] emittedLevels;
 
+    bool isCancelled() @safe
+    {
+        return false;
+    }
+
     void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
     {
     }
@@ -660,4 +730,32 @@ unittest  // RequestScope with the default "info" minimum drops only debug
     scope_.log("warning", Json("w"));
 
     assert(probe.emittedLevels == ["info", "warning"]);
+}
+
+unittest  // RequestScope exposes the shared cancellation token via isCancelled
+{
+    Json[string] empty;
+    auto probe = new LogProbe;
+    auto token = new CancellationToken;
+    auto scope_ = new RequestScope(probe, false, empty, "info", true, token);
+
+    assert(!scope_.isCancelled);
+    token.cancel();
+    assert(scope_.isCancelled);
+}
+
+unittest  // a CancellationToken starts uncancelled and cancel() is idempotent
+{
+    auto token = new CancellationToken;
+    assert(!token.cancelled);
+    token.cancel();
+    assert(token.cancelled);
+    token.cancel();
+    assert(token.cancelled);
+}
+
+unittest  // NullContext reports never-cancelled (no out-of-band channel)
+{
+    auto ctx = new NullContext;
+    assert(!ctx.isCancelled);
 }

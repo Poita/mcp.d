@@ -128,6 +128,11 @@ final class MCPServer
     private bool resourcesListChangedEnabled;
     private bool promptsListChangedEnabled;
     private bool validateOutputSchema_;
+    // In-flight requests, keyed by their JSON-RPC id (string form), each holding
+    // a shared cancellation token. Populated for the duration of a request so an
+    // inbound `notifications/cancelled` can flip the matching token and the
+    // request's response can be suppressed (basic/utilities/cancellation).
+    private CancellationToken[string] inFlight;
 
     this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
     {
@@ -499,7 +504,7 @@ final class MCPServer
         final switch (msg.kind)
         {
         case MessageKind.request:
-            return nullable(handleRequest(msg, ctx));
+            return handleRequest(msg, ctx);
         case MessageKind.notification:
             handleNotification(msg);
             return Nullable!Json.init;
@@ -548,7 +553,7 @@ final class MCPServer
         return responses.length == 0 ? "" : responses.toString();
     }
 
-    private Json handleRequest(Message msg, RequestContext ctx) @safe
+    private Nullable!Json handleRequest(Message msg, RequestContext ctx) @safe
     {
         // Determine the version in effect for THIS request. Draft+ is stateless:
         // each request carries its protocol version, client identity, and
@@ -581,8 +586,8 @@ final class MCPServer
                     {
                         const lvl = meta.logLevel.get;
                         if (logLevelRank(lvl) < 0)
-                            return makeErrorResponse(msg.id,
-                                    invalidParams("Invalid log level: " ~ lvl));
+                            return nullable(makeErrorResponse(msg.id,
+                                    invalidParams("Invalid log level: " ~ lvl)));
                         requestLogLevel = lvl;
                     }
                 }
@@ -592,25 +597,74 @@ final class MCPServer
                 // Per-request protocol-version negotiation (draft): the client
                 // declared a version we do not support -> reject with the list of
                 // versions we do support so it can retry with a compatible one.
-                return makeErrorResponse(msg.id, unsupportedVersionError(meta.protocolVersion));
+                return nullable(makeErrorResponse(msg.id,
+                        unsupportedVersionError(meta.protocolVersion)));
             }
         }
 
+        // Register a cancellation token for this request keyed by its id, so an
+        // inbound `notifications/cancelled` can flip it while the handler runs
+        // (basic/utilities/cancellation). `initialize` MUST NOT be cancelled, so
+        // it is never registered. Deregister on the way out regardless of outcome.
+        auto token = new CancellationToken;
+        const idKey = cancellationKey(msg.id);
+        const trackable = idKey.length && msg.method != "initialize";
+        if (trackable)
+            inFlight[idKey] = token;
+        scope (exit)
+            if (trackable)
+                inFlight.remove(idKey);
+
         // Install the per-request scope so handlers see the right statelessness
-        // (MRTR vs blocking) and the input responses carried on a retried draft
-        // request, regardless of which transport supplied the base context.
+        // (MRTR vs blocking), the input responses carried on a retried draft
+        // request, and the cancellation token, regardless of which transport
+        // supplied the base context.
         auto scoped = new RequestScope(ctx, effectiveVersion.usesMRTR,
-                readInputResponses(msg.params), requestLogLevel, loggingRequested);
+                readInputResponses(msg.params), requestLogLevel, loggingRequested, token);
 
         try
         {
             auto result = route(msg.method, msg.params, scoped);
-            return makeResponse(msg.id, result);
+            // Per spec, a receiver of a cancellation "SHOULD NOT send a response
+            // for the cancelled request" — suppress it if cancelled meanwhile.
+            if (token.cancelled)
+                return Nullable!Json.init;
+            return nullable(makeResponse(msg.id, result));
         }
         catch (McpException e)
-            return makeErrorResponse(msg.id, e);
+        {
+            if (token.cancelled)
+                return Nullable!Json.init;
+            return nullable(makeErrorResponse(msg.id, e));
+        }
         catch (Exception e)
-            return makeErrorResponse(msg.id, internalError(e.msg));
+        {
+            if (token.cancelled)
+                return Nullable!Json.init;
+            return nullable(makeErrorResponse(msg.id, internalError(e.msg)));
+        }
+    }
+
+    /// The registry key for a request id. JSON-RPC ids are strings or numbers;
+    /// `notifications/cancelled` carries the same id under `requestId`, so both
+    /// sides normalise to the same string form. Returns an empty string for an
+    /// absent/null id (a notification has none and is never tracked).
+    private static string cancellationKey(Json id) @safe
+    {
+        import std.conv : to;
+
+        switch (id.type)
+        {
+        case Json.Type.string:
+            return "s:" ~ id.get!string;
+        case Json.Type.int_:
+            return "i:" ~ id.get!long
+                .to!string;
+        case Json.Type.bigInt:
+            return "i:" ~ id.toString();
+        default:
+            return "";
+        }
     }
 
     /// Configure the `CacheableResult` freshness hint (`ttlMs`/`cacheScope`)
@@ -651,9 +705,28 @@ final class MCPServer
         case "notifications/initialized":
             initialized = true;
             break;
+        case "notifications/cancelled":
+            handleCancelled(msg.params);
+            break;
         default:
             break; // unknown notifications are ignored per JSON-RPC
         }
+    }
+
+    /// Honour an inbound `notifications/cancelled` (basic/utilities/cancellation):
+    /// flip the cancellation token of the named in-flight request so its handler
+    /// can stop and its response is suppressed. A cancellation for a request that
+    /// is unknown or already completed is ignored, per "This notification
+    /// indicates ... the request ... should be terminated" being best-effort.
+    private void handleCancelled(Json params) @safe
+    {
+        if (params.type != Json.Type.object || "requestId" !in params)
+            return;
+        const key = cancellationKey(params["requestId"]);
+        if (key.length == 0)
+            return;
+        if (auto token = key in inFlight)
+            token.cancel();
     }
 
     private Json route(string method, Json params, RequestContext ctx) @safe
@@ -1217,6 +1290,81 @@ unittest  // an unknown method yields method-not-found
     assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
+unittest  // notifications/cancelled mid-handler: ctx.isCancelled flips and the response is suppressed
+{
+    // A handler that, while running, simulates a concurrent cancellation arriving
+    // for its own request, then observes ctx.isCancelled and returns. The server
+    // MUST NOT send a response for the cancelled request.
+    auto s = new MCPServer("t", "1");
+    bool sawCancelled;
+    Tool slow = {name: "slow"};
+    s.registerTool(slow, (Json args, RequestContext ctx) @safe {
+        assert(!ctx.isCancelled);
+        // Concurrent cancellation for request id 42 (same as the call below).
+        Json p = Json.emptyObject;
+        p["requestId"] = 42;
+        s.handle(Message(makeNotification("notifications/cancelled", p)));
+        sawCancelled = ctx.isCancelled;
+        CallToolResult r;
+        r.content = [Content.makeText("done")];
+        return r;
+    });
+
+    Json callP = Json.emptyObject;
+    callP["name"] = "slow";
+    auto resp = s.handle(req(42, "tools/call", callP));
+
+    assert(sawCancelled, "handler should observe ctx.isCancelled after cancellation");
+    assert(resp.isNull, "no response should be sent for a cancelled request");
+}
+
+unittest  // notifications/cancelled for an unknown/completed request id is ignored
+{
+    auto s = makeTestServer();
+    // No request id 999 is in flight: a cancellation for it is a silent no-op.
+    Json p = Json.emptyObject;
+    p["requestId"] = 999;
+    auto out_ = s.handle(Message(makeNotification("notifications/cancelled", p)));
+    assert(out_.isNull);
+
+    // A normal subsequent request still completes and replies as usual.
+    auto resp = s.handle(req(1, "ping")).get;
+    assert(resp["result"].type == Json.Type.object);
+}
+
+unittest  // an uncancelled request still receives its normal response
+{
+    auto s = makeTestServer();
+    Json callP = Json.emptyObject;
+    callP["name"] = "add";
+    callP["arguments"] = Json(["a": Json(1), "b": Json(2)]);
+    auto resp = s.handle(req(5, "tools/call", callP));
+    assert(!resp.isNull);
+    assert(resp.get["result"]["structuredContent"]["result"].get!int == 3);
+}
+
+unittest  // cancellation matches string-id requests too
+{
+    auto s = new MCPServer("t", "1");
+    bool sawCancelled;
+    Tool slow = {name: "slow"};
+    s.registerTool(slow, (Json args, RequestContext ctx) @safe {
+        Json p = Json.emptyObject;
+        p["requestId"] = "req-abc";
+        s.handle(Message(makeNotification("notifications/cancelled", p)));
+        sawCancelled = ctx.isCancelled;
+        CallToolResult r;
+        r.content = [Content.makeText("done")];
+        return r;
+    });
+
+    Json callP = Json.emptyObject;
+    callP["name"] = "slow";
+    auto resp = s.handle(Message(makeRequest(Json("req-abc"), "tools/call", callP)));
+    assert(sawCancelled);
+    assert(resp.isNull);
+}
+
 unittest  // handleRaw returns response text for a request
 {
     import vibe.data.json : parseJsonString;
@@ -1494,6 +1642,11 @@ unittest  // after setLevel(error), a handler's sub-error logs are dropped
     static final class RecordingCtx : RequestContext
     {
         string[] emitted;
+        bool isCancelled() @safe
+        {
+            return false;
+        }
+
         void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
         {
         }
@@ -1564,6 +1717,11 @@ unittest  // after setLevel(error), a handler's sub-error logs are dropped
 version (unittest) private final class DraftLogCtx : RequestContext
 {
     string[] emitted;
+    bool isCancelled() @safe
+    {
+        return false;
+    }
+
     void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
     {
     }
@@ -1941,6 +2099,11 @@ version (unittest)
     // A fake transport context: server->client requests return a canned answer.
     private final class FakeCtx : RequestContext
     {
+        bool isCancelled() @safe
+        {
+            return false;
+        }
+
         void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
         {
         }
