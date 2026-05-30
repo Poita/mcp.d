@@ -14,7 +14,9 @@ enum ErrorCode : int
     internalError = -32603,
     // MCP-specific
     resourceNotFound = -32002,
-    requestCancelled = -32800
+    requestCancelled = -32800,
+    // draft Streamable HTTP: header/body validation failure
+    headerMismatch = -32001
 }
 
 /// An error that maps onto a JSON-RPC error object.

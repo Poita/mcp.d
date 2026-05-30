@@ -8,6 +8,8 @@ import vibe.data.json : Json;
 import mcp.server.server;
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
+import mcp.protocol.versions;
+import mcp.protocol.draft;
 import mcp.transport.sse_context;
 
 /// Configuration for the Streamable HTTP server transport.
@@ -135,8 +137,18 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
         res.writeBody("", "text/plain");
         return;
     case MessageKind.request:
-        auto ctx = new HttpStreamContext(res, coord,
-                server.clientCapabilities, extractProgressToken(msg.params));
+        // Draft: validate the standard request headers against the body.
+        auto hdrErr = validateDraftHeaders(req.headers.get(
+                HttpHeader.protocolVersion, ""), req.headers.get(HttpHeader.method,
+                ""), req.headers.get(HttpHeader.name, ""), msg);
+        if (hdrErr !is null)
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            res.writeBody(makeErrorResponse(msg.id, hdrErr).toString(), "application/json");
+            return;
+        }
+        auto ctx = new HttpStreamContext(res, coord, server.clientCapabilities,
+                extractProgressToken(msg.params));
         auto resp = server.handle(msg, ctx);
         if (ctx.streaming)
             ctx.finishWith(resp.get);
@@ -144,6 +156,55 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
             res.writeBody(resp.get.toString(), "application/json");
         return;
     }
+}
+
+/// Validate the draft Streamable HTTP request headers against the JSON-RPC body.
+/// Returns a `HeaderMismatch` (-32001) exception on failure, or null when the
+/// request is valid — or when the protocol version is pre-draft (older versions
+/// did not define these headers, so they are not enforced).
+McpException validateDraftHeaders(string protoHeader, string methodHeader,
+        string nameHeader, Message msg) @safe
+{
+    ProtocolVersion pv;
+    if (!tryParseVersion(protoHeader, pv) || !pv.isDraft)
+        return null; // not a draft request: do not enforce draft headers
+
+    if (methodHeader.length == 0)
+        return new McpException(ErrorCode.headerMismatch, "Missing Mcp-Method header");
+    if (methodHeader != msg.method)
+        return new McpException(ErrorCode.headerMismatch,
+                "Mcp-Method header '" ~ methodHeader
+                ~ "' does not match body method '" ~ msg.method ~ "'");
+
+    // Header protocol version must match the body's _meta protocol version.
+    auto bodyMeta = RequestMeta.fromParams(msg.params);
+    if (bodyMeta.protocolVersion.length && bodyMeta.protocolVersion != protoHeader)
+        return new McpException(ErrorCode.headerMismatch,
+                "MCP-Protocol-Version header does not match body _meta");
+
+    // Mcp-Name mirrors params.name (tools/call, prompts/get) or params.uri
+    // (resources/read).
+    string bodyName;
+    switch (msg.method)
+    {
+    case "tools/call":
+    case "prompts/get":
+        if ("name" in msg.params && msg.params["name"].type == Json.Type.string)
+            bodyName = msg.params["name"].get!string;
+        break;
+    case "resources/read":
+        if ("uri" in msg.params && msg.params["uri"].type == Json.Type.string)
+            bodyName = msg.params["uri"].get!string;
+        break;
+    default:
+        return null; // no Mcp-Name requirement for other methods
+    }
+    if (nameHeader.length == 0)
+        return new McpException(ErrorCode.headerMismatch, "Missing Mcp-Name header");
+    if (nameHeader != bodyName)
+        return new McpException(ErrorCode.headerMismatch,
+                "Mcp-Name header '" ~ nameHeader ~ "' does not match body value '" ~ bodyName ~ "'");
+    return null;
 }
 
 /// Whether a `Host` header value (e.g. "127.0.0.1:3000") is localhost or listed.
@@ -237,4 +298,64 @@ unittest  // localhost origins are accepted, foreign origins rejected
     assert(originAllowed("https://127.0.0.1", []));
     assert(!originAllowed("http://evil.example.com", []));
     assert(originAllowed("http://app.example.com", ["http://app.example.com"]));
+}
+
+version (unittest)
+{
+    private Message draftMsg(string method, Json params) @safe
+    {
+        Json meta = Json.emptyObject;
+        meta[MetaKey.protocolVersion] = "2026-07-28";
+        params["_meta"] = meta;
+        return Message(makeRequest(Json(1), method, params));
+    }
+}
+
+unittest  // pre-draft requests skip draft header enforcement
+{
+    auto m = Message(makeRequest(Json(1), "tools/list", Json.emptyObject));
+    // protocol header empty / older -> no enforcement
+    assert(validateDraftHeaders("", "", "", m) is null);
+    assert(validateDraftHeaders("2025-11-25", "", "", m) is null);
+}
+
+unittest  // draft request missing Mcp-Method is a header mismatch
+{
+    auto m = draftMsg("tools/list", Json.emptyObject);
+    auto e = validateDraftHeaders("2026-07-28", "", "", m);
+    assert(e !is null && e.code == ErrorCode.headerMismatch);
+}
+
+unittest  // draft request with mismatched Mcp-Method fails
+{
+    auto m = draftMsg("tools/list", Json.emptyObject);
+    auto e = validateDraftHeaders("2026-07-28", "tools/call", "", m);
+    assert(e !is null && e.code == ErrorCode.headerMismatch);
+}
+
+unittest  // draft tools/list with correct headers passes
+{
+    auto m = draftMsg("tools/list", Json.emptyObject);
+    assert(validateDraftHeaders("2026-07-28", "tools/list", "", m) is null);
+}
+
+unittest  // draft tools/call requires matching Mcp-Name
+{
+    Json p = Json.emptyObject;
+    p["name"] = "add";
+    auto m = draftMsg("tools/call", p);
+    assert(validateDraftHeaders("2026-07-28", "tools/call", "add", m) is null);
+    auto e = validateDraftHeaders("2026-07-28", "tools/call", "wrong", m);
+    assert(e !is null && e.code == ErrorCode.headerMismatch);
+    auto e2 = validateDraftHeaders("2026-07-28", "tools/call", "", m);
+    assert(e2 !is null); // missing name
+}
+
+unittest  // draft resources/read mirrors uri into Mcp-Name
+{
+    Json p = Json.emptyObject;
+    p["uri"] = "test://x";
+    auto m = draftMsg("resources/read", p);
+    assert(validateDraftHeaders("2026-07-28", "resources/read", "test://x", m) is null);
+    assert(validateDraftHeaders("2026-07-28", "resources/read", "test://y", m) !is null);
 }
