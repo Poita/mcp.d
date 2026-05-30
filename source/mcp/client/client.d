@@ -31,6 +31,11 @@ final class MCPClient
     private bool useDraft;
     private string bearerToken;
     private long nextId = 1;
+    // SSE resumability: the most recent `id:`/`retry:` seen on a response stream,
+    // and the Last-Event-ID to send when retrying after a premature stream close.
+    private string sseLastEventId;
+    private long sseRetryMs;
+    private string pendingLastEventId;
 
     /// Capabilities this client advertises at initialize.
     ClientCapabilities capabilities;
@@ -256,12 +261,20 @@ final class MCPClient
     }
 
     /// POST a request and await the response with id `expectId`, processing any
-    /// SSE notifications and server->client requests in between.
+    /// SSE notifications and server->client requests in between. If the response
+    /// SSE stream closes before the final response and carried an SSE `retry:`
+    /// hint, wait that long and reconnect (resuming with `Last-Event-ID`), per
+    /// the Streamable HTTP resumability rules.
     private Json postAndAwait(Json message, long expectId) @safe
     {
+        import core.time : msecs;
+        import vibe.core.core : sleep;
+
         Json result = Json.undefined;
         bool got;
         McpException err;
+        sseRetryMs = 0;
+        sseLastEventId = null;
 
         () @trusted {
             requestHTTP(url, (scope HTTPClientRequest req) {
@@ -290,9 +303,171 @@ final class MCPClient
 
         if (err !is null)
             throw err;
-        if (!got)
-            throw internalError("No response received for request " ~ method2(expectId));
-        return result;
+        if (got)
+            return result;
+
+        // Premature stream close with an SSE `retry:` hint: wait the prescribed
+        // delay, then RESUME the stream with a GET carrying `Last-Event-ID`
+        // (per Streamable HTTP resumability — not a re-POST of the request).
+        if (sseRetryMs > 0)
+        {
+            sleep(sseRetryMs.msecs);
+            resumeViaGet(expectId, sseLastEventId, result, got, err);
+            if (err !is null)
+                throw err;
+            if (got)
+                return result;
+        }
+        throw internalError("No response received for request " ~ method2(expectId));
+    }
+
+    /// Resume a closed response stream via `GET` with `Last-Event-ID`, reading
+    /// the resumed SSE stream until the awaited response (`expectId`) arrives.
+    private void resumeViaGet(long expectId, string lastEventId, ref Json result,
+            ref bool got, ref McpException err) @safe
+    {
+        import vibe.core.net : connectTCP;
+        import vibe.stream.operations : readLine;
+        import vibe.core.stream : IOMode;
+        import std.string : indexOf, startsWith, strip, toLower;
+        import std.conv : to, parse;
+
+        auto rest = url;
+        const sep = rest.indexOf("://");
+        if (sep >= 0)
+            rest = rest[sep + 3 .. $];
+        const slash = rest.indexOf('/');
+        const hostPort = (slash < 0) ? rest : rest[0 .. slash];
+        const path = (slash < 0) ? "/" : rest[slash .. $];
+        const colon = hostPort.indexOf(':');
+        const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
+        const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
+
+        () @trusted {
+            try
+            {
+                auto conn = connectTCP(host, port);
+                scope (exit)
+                    conn.close();
+                string req = "GET " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
+                    ~ "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n";
+                if (sessionId.length)
+                    req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
+                if (didInitialize)
+                    req ~= "MCP-Protocol-Version: " ~ negotiated.toWire ~ "\r\n";
+                if (lastEventId.length)
+                    req ~= "Last-Event-ID: " ~ lastEventId ~ "\r\n";
+                req ~= "\r\n";
+                conn.write(cast(const(ubyte)[]) req);
+
+                auto statusLine = cast(string) readLine(conn).idup;
+                if (statusLine.indexOf(" 200") < 0)
+                    return;
+                bool chunked;
+                for (;;)
+                {
+                    auto h = cast(string) readLine(conn).idup;
+                    if (h.length && h[$ - 1] == '\r')
+                        h = h[0 .. $ - 1];
+                    if (h.toLower.indexOf("transfer-encoding:") == 0
+                            && h.toLower.indexOf("chunked") >= 0)
+                        chunked = true;
+                    if (h.length == 0)
+                        break;
+                }
+
+                string acc, data;
+                bool done;
+                void parseSse()
+                {
+                    for (;;)
+                    {
+                        const nl = acc.indexOf('\n');
+                        if (nl < 0)
+                            break;
+                        auto line = acc[0 .. nl];
+                        acc = acc[nl + 1 .. $];
+                        if (line.length && line[$ - 1] == '\r')
+                            line = line[0 .. $ - 1];
+                        if (line.length == 0)
+                        {
+                            if (data.length)
+                            {
+                                try
+                                {
+                                    auto m = Message(parseJsonString(data));
+                                    if ((m.kind == MessageKind.response
+                                            || m.kind == MessageKind.errorResponse)
+                                            && m.id.type == Json.Type.int_
+                                            && m.id.get!long == expectId)
+                                    {
+                                        if (m.kind == MessageKind.errorResponse)
+                                            err = errorFrom(m.error);
+                                        else
+                                        {
+                                            result = m.result;
+                                            got = true;
+                                        }
+                                        done = true;
+                                    }
+                                    else
+                                        dispatchInbound(m);
+                                }
+                                catch (Exception)
+                                {
+                                }
+                                data = null;
+                            }
+                        }
+                        else if (line.startsWith("data:"))
+                        {
+                            auto d = line["data:".length .. $];
+                            if (d.startsWith(" "))
+                                d = d[1 .. $];
+                            data ~= (data.length ? "\n" : "") ~ d;
+                        }
+                    }
+                }
+
+                for (;;)
+                {
+                    if (done)
+                        break;
+                    if (chunked)
+                    {
+                        auto sizeLine = (cast(string) readLine(conn).idup).strip;
+                        if (sizeLine.length == 0)
+                            continue;
+                        uint sz;
+                        try
+                            sz = parse!uint(sizeLine, 16);
+                        catch (Exception)
+                            break;
+                        if (sz == 0)
+                            break;
+                        auto chunk = new ubyte[sz];
+                        conn.read(chunk, IOMode.all);
+                        acc ~= cast(string) chunk.idup;
+                        readLine(conn);
+                        parseSse();
+                    }
+                    else
+                    {
+                        const avail = conn.leastSize;
+                        if (avail == 0)
+                            break;
+                        const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
+                        auto buf = new ubyte[toRead];
+                        conn.read(buf, IOMode.once);
+                        acc ~= cast(string) buf.idup;
+                        parseSse();
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }();
     }
 
     private static string method2(long id) @safe
@@ -315,6 +490,8 @@ final class MCPClient
             addDraftHeaders(req, message);
         else if (didInitialize)
             req.headers["MCP-Protocol-Version"] = negotiated.toWire;
+        if (pendingLastEventId.length)
+            req.headers["Last-Event-ID"] = pendingLastEventId;
         req.writeBody(cast(const(ubyte)[]) message.toString());
     }
 
@@ -374,17 +551,6 @@ final class MCPClient
                 break;
             if (line.length && line[$ - 1] == '\r')
                 line = line[0 .. $ - 1];
-            () @trusted {
-                import std.stdio : stderr;
-                import std.process : environment;
-
-                if (environment.get("MCP_CLIENT_DEBUG", "").length)
-                    try
-                        stderr.writeln("[c] POST line: ", line);
-                    catch (Exception)
-                    {
-                    }
-            }();
 
             if (line.length == 0)
             {
@@ -404,7 +570,23 @@ final class MCPClient
                     d = d[1 .. $];
                 dataBuf ~= (dataBuf.length ? "\n" : "") ~ d;
             }
-            // `event:`, `id:`, `retry:` lines are ignored for now.
+            else if (line.startsWith("id:"))
+            {
+                import std.string : strip;
+
+                sseLastEventId = line["id:".length .. $].strip;
+            }
+            else if (line.startsWith("retry:"))
+            {
+                import std.string : strip;
+                import std.conv : to;
+
+                try
+                    sseRetryMs = line["retry:".length .. $].strip.to!long;
+                catch (Exception)
+                {
+                }
+            }
         }
         // Flush a trailing event with no terminating blank line.
         if (dataBuf.length && !got && err is null)
@@ -545,7 +727,7 @@ final class MCPClient
 
         string lastEventId;
         long retryMs = 0;
-        foreach (attempt; 0 .. 4)
+        foreach (attempt; 0 .. 2)
         {
             bool sawData;
             () @trusted {
