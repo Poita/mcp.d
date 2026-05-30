@@ -13,25 +13,28 @@ the D programming language — client and server, built on [vibe-d](https://vibe
 
 ## Status
 
-Active development. **22 of 30** official server conformance scenarios pass today
-(lifecycle, tools with every content type, resources, resource templates, prompts,
-completion, logging, and DNS-rebinding protection). See the roadmap below.
+Active development.
 
-```
-✓ server-initialize        ✓ tools-call-image          ✓ resources-list
-✓ ping                     ✓ tools-call-audio          ✓ resources-read-text
-✓ tools-list               ✓ tools-call-embedded-…     ✓ resources-read-binary
-✓ tools-call-simple-text   ✓ tools-call-mixed-content  ✓ resources-templates-read
-✓ tools-call-error         ✓ completion-complete       ✓ prompts-list / get (×4)
-✓ logging-set-level        ✓ dns-rebinding-protection
-```
+- ✅ **All 30 official server conformance scenarios pass** (38/38 checks): lifecycle,
+  tools with every content type, resources + templates + subscribe, prompts, completion,
+  logging, progress/logging streaming, sampling, elicitation (incl. SEP-1034/1330),
+  DNS-rebinding protection.
+- ✅ Client conformance: `initialize`, `tools_call`.
+- ✅ **FastMCP-style UDA API** — `@tool` / `@resource` / `@prompt` with auto JSON-Schema.
+- ✅ **DRAFT (2026-07-28)** — stateless per-request `_meta`, `server/discover`,
+  `subscriptions/listen`, `CacheableResult` (`ttlMs`/`cacheScope`), MRTR types, the standard
+  request headers (`Mcp-Method`/`Mcp-Name`/`MCP-Protocol-Version`) with `HeaderMismatch`
+  validation, and `x-mcp-header` mirroring — on both client and server.
+
+In progress: OAuth 2.1 (auth conformance suite), MRTR end-to-end flow, long-lived
+`subscriptions/listen` delivery, stdio transport.
 
 ## Build & test
 
 ```bash
 ulimit -n 65536        # required: dub misbehaves under ghostty's `ulimit -n unlimited`
 dub build              # build the library
-dub test               # run all unit tests (7 modules)
+dub test               # run all unit tests (11 modules, ~120 tests)
 ```
 
 Formatting and linting:

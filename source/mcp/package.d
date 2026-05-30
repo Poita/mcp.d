@@ -19,4 +19,5 @@ public import mcp.api.schema;
 public import mcp.api.reflection;
 public import mcp.transport.sse_context;
 public import mcp.transport.streamable_http;
+public import mcp.transport.stdio;
 public import mcp.client.client;
