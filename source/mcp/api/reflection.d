@@ -164,10 +164,28 @@ private void registerToolMethod(T, string memberName, alias overload)(
     descriptor.name = attr.name;
     if (attr.description.length)
         descriptor.description = nullable(attr.description);
+    if (attr.title.length)
+        descriptor.title = nullable(attr.title);
     descriptor.inputSchema = parametersSchema!overload();
     auto outSchema = outputSchemaOf!(ReturnType!overload)();
     if (outSchema.type == Json.Type.object)
         descriptor.outputSchema = outSchema;
+
+    // Fold any @toolAnnotations UDA on the same method into typed
+    // ToolAnnotations, then serialize into the descriptor's annotations field.
+    ToolAnnotations anns;
+    static foreach (a; __traits(getAttributes, overload))
+    {
+        static if (is(typeof(a) == toolAnnotations))
+        {
+            anns.readOnlyHint = a.readOnlyHint;
+            anns.destructiveHint = a.destructiveHint;
+            anns.idempotentHint = a.idempotentHint;
+            anns.openWorldHint = a.openWorldHint;
+        }
+    }
+    if (!anns.empty)
+        descriptor.annotations = anns.toJson();
 
     server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
         alias names = ParameterIdentifierTuple!overload;
@@ -327,6 +345,13 @@ version (unittest)
             return note.isNull ? "p" : "n";
         }
 
+        @tool("erase", "Erase a record", "Erase Record")
+        @toolAnnotations(destructiveHint : true.nullable, idempotentHint:
+                true.nullable) string erase(string id) @safe
+        {
+            return "erased " ~ id;
+        }
+
         @resource("test://doc", "Doc", "text/plain")
         string doc() @safe
         {
@@ -350,7 +375,7 @@ unittest  // @tool reflection: schema derivation + typed dispatch
 
     Json lp = Json.emptyObject;
     auto list = s.handle(Message(makeRequest(Json(1), "tools/list", lp))).get;
-    assert(list["result"]["tools"].length == 4);
+    assert(list["result"]["tools"].length == 5);
 
     // add -> scalar return wrapped under `result`, with an inferred outputSchema.
     Json p = Json.emptyObject;
@@ -463,6 +488,74 @@ unittest  // @resource and @prompt reflection register and dispatch
     pp["arguments"] = Json(["topic": Json("MCP")]);
     auto pr = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
     assert(pr["result"]["messages"][0]["content"]["text"].get!string == "Tell me about MCP");
+}
+
+unittest  // @tool reflection: optional title is emitted in tools/list
+{
+    import mcp.protocol.jsonrpc : Message, makeRequest;
+
+    auto s = new MCPServer("t", "1");
+    registerHandlers(s, new DemoApi);
+    auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+            Json.emptyObject))).get["result"]["tools"];
+
+    Json eraseTool;
+    foreach (i; 0 .. tools.length)
+        if (tools[i]["name"].get!string == "erase")
+            eraseTool = tools[i];
+    assert(eraseTool.type == Json.Type.object);
+    assert(eraseTool["title"].get!string == "Erase Record");
+}
+
+unittest  // @toolAnnotations reflection: hints are serialized into annotations
+{
+    import mcp.protocol.jsonrpc : Message, makeRequest;
+
+    auto s = new MCPServer("t", "1");
+    registerHandlers(s, new DemoApi);
+    auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+            Json.emptyObject))).get["result"]["tools"];
+
+    Json eraseTool, addTool;
+    foreach (i; 0 .. tools.length)
+    {
+        const name = tools[i]["name"].get!string;
+        if (name == "erase")
+            eraseTool = tools[i];
+        else if (name == "add")
+            addTool = tools[i];
+    }
+
+    auto anns = eraseTool["annotations"];
+    assert(anns["destructiveHint"].get!bool == true);
+    assert(anns["idempotentHint"].get!bool == true);
+    // Unset hints are omitted entirely.
+    assert("readOnlyHint" !in anns);
+    assert("openWorldHint" !in anns);
+
+    // A tool without @toolAnnotations carries no annotations object.
+    assert("annotations" !in addTool);
+}
+
+unittest  // ToolAnnotations: typed struct round-trips through JSON
+{
+    ToolAnnotations a;
+    a.title = "Display";
+    a.readOnlyHint = true;
+    a.openWorldHint = false;
+    auto j = a.toJson();
+    auto b = ToolAnnotations.fromJson(j);
+    assert(b.title.get == "Display");
+    assert(b.readOnlyHint.get == true);
+    assert(b.openWorldHint.get == false);
+    assert(b.destructiveHint.isNull);
+}
+
+unittest  // ToolAnnotations: empty struct produces an empty object
+{
+    ToolAnnotations a;
+    assert(a.empty);
+    assert(a.toJson().length == 0);
 }
 
 version (unittest) private auto MakeListMessage()

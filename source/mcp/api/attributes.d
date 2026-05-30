@@ -1,5 +1,7 @@
 module mcp.api.attributes;
 
+import std.typecons : Nullable;
+
 @safe:
 
 /// UDA marking a method as an MCP tool. Apply to a member function; the input
@@ -14,10 +16,35 @@ module mcp.api.attributes;
 ///     int add(int a, int b) { return a + b; }
 /// }
 /// ---
+///
+/// An optional human-readable `title` may be supplied for display purposes; it
+/// is independent of the programmatic `name`. To declare behavioral hints
+/// (readOnlyHint, destructiveHint, ...), attach a `@toolAnnotations` UDA to the
+/// same method.
 struct tool
 {
     string name;
     string description;
+    string title; /// optional human-readable display name (empty = unset)
+}
+
+/// UDA declaring optional behavioral hints (the MCP spec's `ToolAnnotations`)
+/// for a `@tool`-annotated method. Attach alongside `@tool`; each hint defaults
+/// to "unset" and is omitted from the wire form unless assigned.
+///
+/// Example:
+/// ---
+/// import std.typecons : nullable;
+/// @tool("erase", "Erase a record")
+/// @toolAnnotations(destructiveHint: true.nullable, idempotentHint: true.nullable)
+/// void erase(string id) { ... }
+/// ---
+struct toolAnnotations
+{
+    Nullable!bool readOnlyHint;
+    Nullable!bool destructiveHint;
+    Nullable!bool idempotentHint;
+    Nullable!bool openWorldHint;
 }
 
 /// UDA marking a method as an MCP prompt. The method returns the prompt's
