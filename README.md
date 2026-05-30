@@ -50,41 +50,76 @@ dub run dfmt -- --inplace source/
 dub run dscanner -- --styleCheck source/
 ```
 
-## Example: a Streamable HTTP server
+## Example: a server with the ergonomic UDA API
+
+Write plain typed D methods and annotate them — the JSON Schema is derived from
+the parameter types and the arguments are marshalled for you (FastMCP-style):
 
 ```d
 import mcp;
-import std.typecons : nullable;
-import vibe.data.json : Json;
+import std.typecons : Nullable;
+
+/// Each annotated method becomes an MCP feature. The input schema is generated
+/// from the parameter types; `Nullable!T` parameters are optional.
+final class MyServer
+{
+    @tool("add", "Add two integers")
+    long add(long a, long b) @safe
+    {
+        return a + b;
+    }
+
+    @tool("greet", "Greet someone, optionally loudly")
+    string greet(string name, Nullable!bool loud) @safe
+    {
+        auto msg = "Hello, " ~ name ~ "!";
+        return (!loud.isNull && loud.get) ? msg ~ "!!!" : msg;
+    }
+
+    @resource("file:///readme", "README", "text/plain")
+    string readme() @safe
+    {
+        return "Hello!";
+    }
+
+    @prompt("greet_prompt", "Greeting prompt")
+    string greetPrompt(string topic) @safe
+    {
+        return "Say hello about " ~ topic;
+    }
+}
 
 void main()
 {
     auto server = new MCPServer("my-server", "1.0.0");
-
-    // A tool.
-    Tool add = {name: "add", description: nullable("Add two integers")};
-    server.registerTool(add, (Json args) @safe {
-        CallToolResult r;
-        r.content = [Content.makeText("sum computed")];
-        r.structuredContent = Json(["result": Json(args["a"].get!int + args["b"].get!int)]);
-        return r;
-    });
-
-    // A resource.
-    Resource readme = {uri: "file:///readme", name: "README", mimeType: nullable("text/plain")};
-    server.registerResource(readme,
-        () @safe => ResourceContents.makeText("file:///readme", "text/plain", "Hello!"));
-
-    // A prompt.
-    Prompt greet = {name: "greet", description: nullable("Greeting prompt")};
-    server.registerPrompt(greet, (Json args) @safe {
-        GetPromptResult res;
-        res.messages = [PromptMessage("user", Content.makeText("Say hello"))];
-        return res;
-    });
-
-    runStreamableHttp(server, 3000);   // serves POST/GET/DELETE at /mcp
+    registerHandlers(server, new MyServer);   // reflects the UDAs at compile time
+    runStreamableHttp(server, 3000);          // or: runStdio(server);
 }
+```
+
+A tool/prompt handler may also take a `RequestContext` parameter to report
+progress, log, or request sampling/elicitation from the client:
+
+```d
+@tool("crunch", "Process items, reporting progress")
+string crunch(int count, RequestContext ctx) @safe
+{
+    foreach (i; 0 .. count)
+        ctx.reportProgress(i + 1, nullable(cast(double) count));
+    return "done";
+}
+```
+
+Prefer dynamic registration (e.g. tools known only at runtime)? The lower-level
+`server.registerTool(Tool, delegate)` / `registerResource` / `registerPrompt`
+API is available too — `registerHandlers` is built on top of it.
+
+A runnable version of this server (stdio + HTTP) lives in
+[`examples/calculator`](examples/calculator/app.d):
+
+```bash
+dub run :calculator                 # stdio (for Claude Desktop)
+dub run :calculator -- --http 3000  # Streamable HTTP on port 3000
 ```
 
 ## Running the conformance suite
