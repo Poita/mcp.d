@@ -30,6 +30,59 @@ private final class LegacyFallbackException : Exception
     }
 }
 
+/// A progress token attached to an outgoing request so the server may emit
+/// `notifications/progress` for it. Per basic/utilities/progress, "Progress
+/// tokens MUST be a string or integer value" and "MUST be unique across all
+/// active requests". Construct one from either a `string` or a `long`; an
+/// unset token is omitted from the request.
+struct ProgressToken
+{
+    private Json value_ = Json.undefined;
+
+    /// A string-valued progress token.
+    this(string token) @safe nothrow
+    {
+        value_ = Json(token);
+    }
+
+    /// An integer-valued progress token.
+    this(long token) @safe nothrow
+    {
+        value_ = Json(token);
+    }
+
+    /// Whether a token has been set (false for a default-constructed token).
+    bool isSet() const @safe nothrow
+    {
+        return value_.type != Json.Type.undefined;
+    }
+
+    /// The token as JSON (a string or integer), or `Json.undefined` when unset.
+    Json toJson() const @safe nothrow
+    {
+        return value_;
+    }
+}
+
+/// Merge `progressToken` into a request's `params._meta.progressToken`, per
+/// basic/utilities/progress ("a party ... includes a progressToken in the
+/// request metadata", at `params._meta.progressToken`). Returns `params`
+/// unchanged when the token is unset. Any existing `_meta` keys are preserved.
+/// Exposed so callers can attach a progress token to a hand-built params object
+/// (e.g. for request methods without a dedicated progress-token overload).
+Json withProgressToken(Json params, ProgressToken token) @safe
+{
+    if (!token.isSet)
+        return params;
+    if (params.type != Json.Type.object)
+        params = Json.emptyObject;
+    Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"]
+        : Json.emptyObject;
+    meta["progressToken"] = token.toJson();
+    params["_meta"] = meta;
+    return params;
+}
+
 /// A Model Context Protocol client over the Streamable HTTP transport.
 ///
 /// Drives the lifecycle (`initialize` + `notifications/initialized`) and the
@@ -267,10 +320,30 @@ final class MCPClient
     /// `tools/call`.
     CallToolResult callTool(string name, Json arguments = Json.emptyObject) @safe
     {
+        return CallToolResult.fromJson(rpc("tools/call",
+                buildToolCallParams(name, arguments, ProgressToken.init)));
+    }
+
+    /// `tools/call`, requesting progress updates for the call. The server may
+    /// then emit `notifications/progress` carrying `progressToken`, observable
+    /// via `onNotification`. Per basic/utilities/progress, the token is sent in
+    /// `params._meta.progressToken`.
+    CallToolResult callTool(string name, Json arguments, ProgressToken progressToken) @safe
+    {
+        return CallToolResult.fromJson(rpc("tools/call",
+                buildToolCallParams(name, arguments, progressToken)));
+    }
+
+    /// Build the `tools/call` params, optionally attaching a progress token.
+    /// Separated so the param shaping (including `_meta.progressToken`) can be
+    /// unit-tested without a live server.
+    package static Json buildToolCallParams(string name, Json arguments,
+            ProgressToken progressToken) @safe
+    {
         Json p = Json.emptyObject;
         p["name"] = name;
         p["arguments"] = arguments;
-        return CallToolResult.fromJson(rpc("tools/call", p));
+        return withProgressToken(p, progressToken);
     }
 
     /// `tools/call` for a tool whose descriptor (and therefore `outputSchema`) is
@@ -341,9 +414,24 @@ final class MCPClient
     /// `resources/read`.
     ReadResourceResult readResource(string uri) @safe
     {
+        return ReadResourceResult.fromJson(rpc("resources/read",
+                buildReadResourceParams(uri, ProgressToken.init)));
+    }
+
+    /// `resources/read`, requesting progress updates for the read (see
+    /// `callTool` with a `ProgressToken`).
+    ReadResourceResult readResource(string uri, ProgressToken progressToken) @safe
+    {
+        return ReadResourceResult.fromJson(rpc("resources/read",
+                buildReadResourceParams(uri, progressToken)));
+    }
+
+    /// Build the `resources/read` params, optionally attaching a progress token.
+    package static Json buildReadResourceParams(string uri, ProgressToken progressToken) @safe
+    {
         Json p = Json.emptyObject;
         p["uri"] = uri;
-        return ReadResourceResult.fromJson(rpc("resources/read", p));
+        return withProgressToken(p, progressToken);
     }
 
     /// `prompts/list`, auto-paginated.
@@ -367,10 +455,26 @@ final class MCPClient
     /// `prompts/get`.
     GetPromptResult getPrompt(string name, Json arguments = Json.emptyObject) @safe
     {
+        return GetPromptResult.fromJson(rpc("prompts/get",
+                buildGetPromptParams(name, arguments, ProgressToken.init)));
+    }
+
+    /// `prompts/get`, requesting progress updates for the request (see
+    /// `callTool` with a `ProgressToken`).
+    GetPromptResult getPrompt(string name, Json arguments, ProgressToken progressToken) @safe
+    {
+        return GetPromptResult.fromJson(rpc("prompts/get",
+                buildGetPromptParams(name, arguments, progressToken)));
+    }
+
+    /// Build the `prompts/get` params, optionally attaching a progress token.
+    package static Json buildGetPromptParams(string name, Json arguments,
+            ProgressToken progressToken) @safe
+    {
         Json p = Json.emptyObject;
         p["name"] = name;
         p["arguments"] = arguments;
-        return GetPromptResult.fromJson(rpc("prompts/get", p));
+        return withProgressToken(p, progressToken);
     }
 
     /// `completion/complete` — request autocompletion suggestions for an
@@ -2198,4 +2302,82 @@ unittest  // buildCompleteParams includes the resolved-argument context when giv
     string[string] ctx = ["owner": "octocat"];
     auto p = MCPClient.buildCompleteParams(CompletionReference.forPrompt("pr"), "repo", "m", ctx);
     assert(p["context"]["arguments"]["owner"].get!string == "octocat");
+}
+
+unittest  // a string progress token serialises as a string under _meta
+{
+    auto t = ProgressToken("tok-1");
+    assert(t.isSet);
+    assert(t.toJson().type == Json.Type.string);
+    assert(t.toJson().get!string == "tok-1");
+}
+
+unittest  // an integer progress token serialises as an integer
+{
+    auto t = ProgressToken(42L);
+    assert(t.isSet);
+    assert(t.toJson().type == Json.Type.int_);
+    assert(t.toJson().get!long == 42);
+}
+
+unittest  // a default-constructed progress token is unset
+{
+    ProgressToken t;
+    assert(!t.isSet);
+    assert(t.toJson().type == Json.Type.undefined);
+}
+
+unittest  // withProgressToken merges the token into params._meta
+{
+    Json p = Json.emptyObject;
+    p["name"] = "x";
+    auto out_ = withProgressToken(p, ProgressToken("abc"));
+    assert(out_["_meta"]["progressToken"].get!string == "abc");
+    assert(out_["name"].get!string == "x"); // domain fields preserved
+}
+
+unittest  // withProgressToken preserves existing _meta keys
+{
+    Json meta = Json.emptyObject;
+    meta["existing"] = "keep";
+    Json p = Json.emptyObject;
+    p["_meta"] = meta;
+    auto out_ = withProgressToken(p, ProgressToken(7L));
+    assert(out_["_meta"]["existing"].get!string == "keep");
+    assert(out_["_meta"]["progressToken"].get!long == 7);
+}
+
+unittest  // withProgressToken leaves params untouched when the token is unset
+{
+    Json p = Json.emptyObject;
+    p["name"] = "x";
+    auto out_ = withProgressToken(p, ProgressToken.init);
+    assert("_meta" !in out_);
+}
+
+unittest  // buildToolCallParams attaches a progressToken under _meta
+{
+    auto p = MCPClient.buildToolCallParams("add", Json(["a": Json(1)]), ProgressToken("p1"));
+    assert(p["name"].get!string == "add");
+    assert(p["_meta"]["progressToken"].get!string == "p1");
+}
+
+unittest  // buildToolCallParams omits _meta when no progress token is requested
+{
+    auto p = MCPClient.buildToolCallParams("add", Json.emptyObject, ProgressToken.init);
+    assert("_meta" !in p);
+}
+
+unittest  // buildReadResourceParams attaches a progressToken under _meta
+{
+    auto p = MCPClient.buildReadResourceParams("file:///x", ProgressToken(99L));
+    assert(p["uri"].get!string == "file:///x");
+    assert(p["_meta"]["progressToken"].get!long == 99);
+}
+
+unittest  // buildGetPromptParams attaches a progressToken under _meta
+{
+    auto p = MCPClient.buildGetPromptParams("greet", Json.emptyObject, ProgressToken("g1"));
+    assert(p["name"].get!string == "greet");
+    assert(p["_meta"]["progressToken"].get!string == "g1");
 }
