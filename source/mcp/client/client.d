@@ -507,54 +507,116 @@ final class MCPClient
         return acc;
     }
 
+    /// Open the standalone server->client SSE stream over a raw TCP connection
+    /// (vibe's pooled `requestHTTP` does not reliably surface a long-lived,
+    /// idle-then-active SSE body). Honors the SSE `retry:` field and resumes with
+    /// `Last-Event-ID` on reconnect, up to a few attempts.
     private void runServerStream() @safe
     {
-        () @trusted {
-            requestHTTP(url, (scope HTTPClientRequest req) {
-                req.method = HTTPMethod.GET;
-                req.headers["Accept"] = "text/event-stream";
-                if (sessionId.length)
-                    req.headers["Mcp-Session-Id"] = sessionId;
-                if (didInitialize)
-                    req.headers["MCP-Protocol-Version"] = negotiated.toWire;
-            }, (scope HTTPClientResponse res) {
-                if (res.statusCode != 200)
-                {
-                    res.dropBody();
-                    return;
-                }
-                import vibe.core.stream : IOMode;
+        import vibe.core.net : connectTCP;
+        import vibe.stream.operations : readLine;
+        import std.string : indexOf, startsWith, strip;
+        import std.conv : to;
+        import core.time : msecs;
+        import vibe.core.core : sleep;
 
-                // Read by blocking on leastSize (which waits for data on an idle
-                // long-lived stream and returns 0 only at EOF), accumulating SSE
-                // events separated by blank lines.
-                ubyte[4096] buf;
-                string acc;
-                for (;;)
+        // Parse scheme://host[:port]/path.
+        auto rest = url;
+        const sep = rest.indexOf("://");
+        if (sep >= 0)
+            rest = rest[sep + 3 .. $];
+        const slash = rest.indexOf('/');
+        const hostPort = (slash < 0) ? rest : rest[0 .. slash];
+        const path = (slash < 0) ? "/" : rest[slash .. $];
+        const colon = hostPort.indexOf(':');
+        const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
+        const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
+
+        string lastEventId;
+        long retryMs = 0;
+        foreach (attempt; 0 .. 4)
+        {
+            bool sawData;
+            () @trusted {
+                try
                 {
-                    size_t n;
-                    bool eof;
-                    try
+                    auto conn = connectTCP(host, port);
+                    scope (exit)
+                        conn.close();
+
+                    string req = "GET " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
+                        ~ "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n";
+                    if (sessionId.length)
+                        req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
+                    if (didInitialize)
+                        req ~= "MCP-Protocol-Version: " ~ negotiated.toWire ~ "\r\n";
+                    if (lastEventId.length)
+                        req ~= "Last-Event-ID: " ~ lastEventId ~ "\r\n";
+                    req ~= "\r\n";
+                    conn.write(cast(const(ubyte)[]) req);
+
+                    // Status line + headers (consume through the blank line).
+                    auto statusLine = cast(string) readLine(conn).idup;
+                    if (statusLine.indexOf(" 200") < 0)
+                        return;
+                    for (;;)
                     {
-                        const avail = res.bodyReader.leastSize;
-                        if (avail == 0)
-                            eof = true;
-                        else
+                        auto h = cast(string) readLine(conn).idup;
+                        if (h.length == 0)
+                            break;
+                    }
+
+                    // SSE event loop.
+                    string data;
+                    for (;;)
+                    {
+                        auto line = cast(string) readLine(conn).idup;
+                        if (line.length && line[$ - 1] == '\r')
+                            line = line[0 .. $ - 1];
+                        if (line.length == 0)
                         {
-                            const toRead = avail > buf.length ? buf.length : cast(size_t) avail;
-                            res.bodyReader.read(buf[0 .. toRead], IOMode.once);
-                            n = toRead;
+                            if (data.length)
+                            {
+                                sawData = true;
+                                try
+                                    dispatchInbound(Message(parseJsonString(data)));
+                                catch (Exception)
+                                {
+                                }
+                                data = null;
+                            }
+                            continue;
+                        }
+                        if (line.startsWith("data:"))
+                        {
+                            auto d = line["data:".length .. $];
+                            if (d.startsWith(" "))
+                                d = d[1 .. $];
+                            data ~= (data.length ? "\n" : "") ~ d;
+                        }
+                        else if (line.startsWith("id:"))
+                            lastEventId = line["id:".length .. $].strip;
+                        else if (line.startsWith("retry:"))
+                        {
+                            try
+                                retryMs = line["retry:".length .. $].strip.to!long;
+                            catch (Exception)
+                            {
+                            }
                         }
                     }
-                    catch (Exception)
-                        eof = true;
-                    if (eof)
-                        break;
-                    acc ~= cast(string) buf[0 .. n].idup;
-                    acc = drainSseEvents(acc);
                 }
-            });
-        }();
+                catch (Exception)
+                {
+                }
+            }();
+
+            // Reconnect honoring the server-provided retry delay (SSE `retry:`).
+            if (retryMs > 0)
+                sleep(retryMs.msecs);
+            else if (!sawData)
+                break; // stream unavailable and no retry hint: stop
+        }
     }
 
     /// Answer a server->client request by dispatching to the matching handler
