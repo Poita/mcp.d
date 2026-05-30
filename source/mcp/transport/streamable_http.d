@@ -31,8 +31,8 @@ struct StreamableHttpOptions
 /// implementing the modern Streamable HTTP transport (single endpoint):
 ///   - POST: a JSON-RPC message/batch; returns `application/json` for requests,
 ///     or `202 Accepted` with no body when the payload needs no reply.
-///   - GET:  reserved for the server->client SSE stream (not yet offered -> 405).
-///   - DELETE: session teardown (accepted as a no-op for the stateless core).
+///   - GET:  the draft drops the standalone server->client SSE stream -> 405.
+///   - DELETE: the draft has no protocol-level sessions to tear down -> 405.
 void mountMcp(URLRouter router, MCPServer server,
         StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
@@ -46,17 +46,23 @@ void mountMcp(URLRouter router, MCPServer server,
     router.get(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
         if (!guardOrigin(req, res, opts))
             return;
-        // No standalone server-initiated SSE stream yet; server->client traffic
-        // flows on the SSE response to the relevant POST.
+        // The draft transport drops the standalone GET SSE stream entirely;
+        // server->client traffic flows on the SSE response to the relevant POST.
+        // Per draft backward-compatibility, GET to the endpoint -> 405.
         res.statusCode = HTTPStatus.methodNotAllowed;
-        res.headers["Allow"] = "POST, DELETE";
+        res.headers["Allow"] = "POST";
         res.writeBody("", "text/plain");
     });
     router.match(HTTPMethod.DELETE, opts.path, (HTTPServerRequest req,
             HTTPServerResponse res) @safe {
         if (!guardOrigin(req, res, opts))
             return;
-        res.statusCode = HTTPStatus.noContent;
+        // The draft has no protocol-level sessions, so there is nothing to tear
+        // down: per the backward-compatibility rules, DELETE -> 405. (Also
+        // conformant for 2025-11-25, where the server simply does not allow
+        // client-driven session termination.)
+        res.statusCode = HTTPStatus.methodNotAllowed;
+        res.headers["Allow"] = "POST";
         res.writeBody("", "text/plain");
     });
 }
@@ -170,16 +176,41 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
             ctx.finishWith(resp.get);
         else
         {
-            // Draft: an UnsupportedProtocolVersionError is surfaced as 400.
+            // Map reserved JSON-RPC errors onto their required HTTP statuses
+            // (400 for unsupported-version/header-mismatch, draft 404 for
+            // method-not-found); everything else rides on 200.
             auto j = resp.get;
-            if ("error" in j && j["error"].type == Json.Type.object
-                    && "code" in j["error"]
-                    && j["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion)
-                res.statusCode = HTTPStatus.badRequest;
+            const isDraft = tryDraft(req.headers.get(HttpHeader.protocolVersion, ""))
+                || tryDraft(RequestMeta.fromParams(msg.params).protocolVersion);
+            res.statusCode = httpStatusForResponse(j, isDraft);
             res.writeBody(j.toString(), "application/json");
         }
         return;
     }
+}
+
+/// Map a JSON-RPC response to the HTTP status the Streamable HTTP transport must
+/// surface. Successful results and ordinary application errors ride on `200`.
+/// The draft reserves specific statuses so intermediaries — and clients probing
+/// modern-vs-legacy servers — can act without parsing the body:
+///   - `UnsupportedProtocolVersionError` (-32004) -> `400` (all modern versions),
+///   - `HeaderMismatch` (-32001) -> `400`,
+///   - `Method not found` (-32601) -> `404` on draft requests, which lets a client
+///     tell a modern MCP endpoint apart from a legacy HTTP+SSE `404`. Pre-draft
+///     versions keep the legacy JSON-RPC-error-over-`200` shape.
+int httpStatusForResponse(Json resp, bool isDraft) @safe
+{
+    if ("error" !in resp || resp["error"].type != Json.Type.object)
+        return 200;
+    auto err = resp["error"];
+    if ("code" !in err || err["code"].type != Json.Type.int_)
+        return 200;
+    const code = err["code"].get!int;
+    if (code == ErrorCode.unsupportedProtocolVersion || code == ErrorCode.headerMismatch)
+        return 400;
+    if (isDraft && code == ErrorCode.methodNotFound)
+        return 404;
+    return 200;
 }
 
 /// Validate the draft Streamable HTTP request headers against the JSON-RPC body.
@@ -492,4 +523,61 @@ unittest  // x-mcp-header: non-ASCII value matched via base64-encoded header
     const enc = encodeHeaderValue("Zürich");
     auto e = validateParamHeaders(schema, args, (string h) => h == "Mcp-Param-Region" ? enc : "");
     assert(e is null);
+}
+
+version (unittest)
+{
+    private Json errResponse(int code) @safe
+    {
+        Json r = Json.emptyObject;
+        r["jsonrpc"] = "2.0";
+        r["id"] = 1;
+        Json err = Json.emptyObject;
+        err["code"] = code;
+        err["message"] = "x";
+        r["error"] = err;
+        return r;
+    }
+}
+
+unittest  // a successful (non-error) response always rides on HTTP 200
+{
+    Json ok = Json.emptyObject;
+    ok["jsonrpc"] = "2.0";
+    ok["id"] = 1;
+    ok["result"] = Json.emptyObject;
+    assert(httpStatusForResponse(ok, true) == 200);
+    assert(httpStatusForResponse(ok, false) == 200);
+}
+
+unittest  // UnsupportedProtocolVersionError maps to HTTP 400 on any modern version
+{
+    auto r = errResponse(ErrorCode.unsupportedProtocolVersion);
+    assert(httpStatusForResponse(r, true) == 400);
+    assert(httpStatusForResponse(r, false) == 400);
+}
+
+unittest  // HeaderMismatch maps to HTTP 400
+{
+    auto r = errResponse(ErrorCode.headerMismatch);
+    assert(httpStatusForResponse(r, true) == 400);
+}
+
+unittest  // draft Method-not-found maps to HTTP 404 (distinguishes modern endpoint from legacy)
+{
+    auto r = errResponse(ErrorCode.methodNotFound);
+    assert(httpStatusForResponse(r, true) == 404);
+}
+
+unittest  // pre-draft Method-not-found stays on HTTP 200 (legacy JSON-RPC-over-200 shape)
+{
+    auto r = errResponse(ErrorCode.methodNotFound);
+    assert(httpStatusForResponse(r, false) == 200);
+}
+
+unittest  // ordinary application errors (e.g. invalidParams) ride on HTTP 200
+{
+    auto r = errResponse(ErrorCode.invalidParams);
+    assert(httpStatusForResponse(r, true) == 200);
+    assert(httpStatusForResponse(r, false) == 200);
 }
