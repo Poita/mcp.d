@@ -1,7 +1,7 @@
 module mcp.protocol.types;
 
 import std.typecons : Nullable, nullable;
-import vibe.data.json : Json;
+import vibe.data.json : Json, parseJsonString;
 import mcp.protocol.capabilities;
 
 @safe:
@@ -1342,6 +1342,44 @@ struct GetPromptResult
 // Completion
 // ===========================================================================
 
+/// A `completion/complete` reference: the thing being completed. Per
+/// server/utilities/completion §"Requesting Completions", a client specifies
+/// either a prompt (`ref/prompt`, identified by `name`) or a resource template
+/// (`ref/resource`, identified by `uri`). Use `forPrompt` / `forResource` to
+/// construct one.
+struct CompletionReference
+{
+    /// Either `"ref/prompt"` or `"ref/resource"`.
+    string type;
+    /// Prompt name (for `ref/prompt`).
+    string name;
+    /// Resource (template) URI (for `ref/resource`).
+    string uri;
+
+    /// Build a reference to a prompt argument.
+    static CompletionReference forPrompt(string name) @safe
+    {
+        return CompletionReference("ref/prompt", name, null);
+    }
+
+    /// Build a reference to a resource template URI.
+    static CompletionReference forResource(string uri) @safe
+    {
+        return CompletionReference("ref/resource", null, uri);
+    }
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["type"] = type;
+        if (type == "ref/resource")
+            j["uri"] = uri;
+        else
+            j["name"] = name;
+        return j;
+    }
+}
+
 /// Result of `completion/complete`.
 struct CompleteResult
 {
@@ -1362,6 +1400,29 @@ struct CompleteResult
         Json j = Json.emptyObject;
         j["completion"] = completion;
         return j;
+    }
+
+    /// Parse a `completion/complete` result envelope (`{completion: {values,
+    /// total?, hasMore?}}`) as returned by a server.
+    static CompleteResult fromJson(Json j) @safe
+    {
+        CompleteResult r;
+        if (j.type != Json.Type.object || "completion" !in j
+                || j["completion"].type != Json.Type.object)
+            return r;
+        auto c = j["completion"];
+        if ("values" in c && c["values"].type == Json.Type.array)
+        {
+            auto arr = c["values"];
+            foreach (i; 0 .. arr.length)
+                if (arr[i].type == Json.Type.string)
+                    r.values ~= arr[i].get!string;
+        }
+        if ("total" in c && c["total"].type == Json.Type.int_)
+            r.total = cast(size_t) c["total"].get!long;
+        if ("hasMore" in c && c["hasMore"].type == Json.Type.bool_)
+            r.hasMore = c["hasMore"].get!bool;
+        return r;
     }
 }
 
@@ -1477,6 +1538,40 @@ unittest  // CompleteResult nests values under completion with hasMore
     assert(j["completion"]["values"].length == 2);
     assert(j["completion"]["total"].get!int == 150);
     assert(j["completion"]["hasMore"].get!bool == false);
+}
+
+unittest  // CompleteResult.fromJson parses the completion envelope
+{
+    auto j = `{"completion":{"values":["paris","park"],"total":150,"hasMore":true}}`
+        .parseJsonString;
+    auto r = CompleteResult.fromJson(j);
+    assert(r.values == ["paris", "park"]);
+    assert(!r.total.isNull && r.total.get == 150);
+    assert(r.hasMore);
+}
+
+unittest  // CompleteResult.fromJson tolerates a missing completion envelope
+{
+    auto r = CompleteResult.fromJson(Json.emptyObject);
+    assert(r.values.length == 0);
+    assert(r.total.isNull);
+    assert(!r.hasMore);
+}
+
+unittest  // CompletionReference.forPrompt builds a ref/prompt with a name
+{
+    auto j = CompletionReference.forPrompt("greet").toJson();
+    assert(j["type"].get!string == "ref/prompt");
+    assert(j["name"].get!string == "greet");
+    assert("uri" !in j);
+}
+
+unittest  // CompletionReference.forResource builds a ref/resource with a uri
+{
+    auto j = CompletionReference.forResource("file:///{path}").toJson();
+    assert(j["type"].get!string == "ref/resource");
+    assert(j["uri"].get!string == "file:///{path}");
+    assert("name" !in j);
 }
 
 unittest  // Resource/ResourceContents/Prompt/GetPrompt fromJson round-trips
