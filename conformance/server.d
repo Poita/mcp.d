@@ -31,6 +31,15 @@ void main(string[] args)
     registerEchoTool(server);
     registerAddTool(server);
     registerConformanceFixtures(server);
+    registerResourceFixtures(server);
+    registerPromptFixtures(server);
+    server.enableLogging();
+    server.setCompletionHandler((Json params) @safe {
+        CompleteResult r;
+        r.values = ["paris", "park", "party"];
+        r.total = 150;
+        return r;
+    });
 
     StreamableHttpOptions opts;
     opts.bindAddresses = [host];
@@ -177,4 +186,97 @@ private string minimalWav() @safe
         0, 8, 0, 'd', 'a', 't', 'a', 0, 0, 0, 0
     ];
     return Base64.encode(wav);
+}
+
+/// Resource + resource-template fixtures matching the conformance harness.
+private void registerResourceFixtures(MCPServer server) @safe
+{
+    Resource staticText = {
+        uri: "test://static-text", name: "Static Text", description: nullable(
+                "A static text resource"), mimeType: nullable("text/plain")
+    };
+    server.registerResource(staticText, () @safe => ResourceContents.makeText("test://static-text",
+            "text/plain", "This is the content of the static text resource."));
+
+    Resource staticBinary = {
+        uri: "test://static-binary", name: "Static Binary", description: nullable(
+                "A static binary resource"), mimeType: nullable("image/png")
+    };
+    server.registerResource(staticBinary, () @safe => ResourceContents.makeBlob(
+            "test://static-binary", "image/png", onePixelPng));
+
+    ResourceTemplate tpl = {
+        uriTemplate: "test://template/{id}/data", name: "Template Data", description: nullable(
+                "Parameterized data resource"), mimeType: nullable("application/json")
+    };
+    server.registerResourceTemplate(tpl, (string uri, string[string] params) @safe {
+        const id = ("id" in params) ? params["id"] : "";
+        const 
+        body = `{"id":"` ~ id ~ `","templateTest":true,"data":"Data for ID: ` ~ id ~ `"}`;
+        return ResourceContents.makeText(uri, "application/json", body);
+    });
+}
+
+/// Prompt fixtures matching the conformance harness.
+private void registerPromptFixtures(MCPServer server) @safe
+{
+    Prompt simple = {
+        name: "test_simple_prompt", description: nullable("A simple test prompt")
+    };
+    server.registerPrompt(simple, (Json args) @safe {
+        GetPromptResult r;
+        r.messages = [
+            PromptMessage("user", Content.makeText("This is a simple prompt for testing."))
+        ];
+        return r;
+    });
+
+    Prompt withArgs = {
+        name: "test_prompt_with_arguments", description: nullable("A prompt that takes arguments")
+    };
+    withArgs.arguments = [
+        PromptArgument("arg1", nullable("First test argument"), true),
+        PromptArgument("arg2", nullable("Second test argument"), true)
+    ];
+    server.registerPrompt(withArgs, (Json args) @safe {
+        const a1 = ("arg1" in args) ? args["arg1"].get!string : "";
+        const a2 = ("arg2" in args) ? args["arg2"].get!string : "";
+        GetPromptResult r;
+        r.messages = [
+            PromptMessage("user",
+                Content.makeText("Prompt with arguments: arg1='" ~ a1 ~ "', arg2='" ~ a2 ~ "'"))
+        ];
+        return r;
+    });
+
+    Prompt withEmbedded = {
+        name: "test_prompt_with_embedded_resource", description: nullable(
+                "A prompt with an embedded resource")
+    };
+    withEmbedded.arguments = [
+        PromptArgument("resourceUri", nullable("URI of the resource to embed"), true)
+    ];
+    server.registerPrompt(withEmbedded, (Json args) @safe {
+        const uri = ("resourceUri" in args) ? args["resourceUri"].get!string : "";
+        GetPromptResult r;
+        r.messages = [
+            PromptMessage("user", Content.makeEmbeddedText(uri, "text/plain",
+                "Embedded resource content for testing.")),
+            PromptMessage("user",
+                Content.makeText("Please process the embedded resource above."))
+        ];
+        return r;
+    });
+
+    Prompt withImage = {
+        name: "test_prompt_with_image", description: nullable("A prompt that includes an image")
+    };
+    server.registerPrompt(withImage, (Json args) @safe {
+        GetPromptResult r;
+        r.messages = [
+            PromptMessage("user", Content.makeImage(onePixelPng, "image/png")),
+            PromptMessage("user", Content.makeText("Please analyze the image above."))
+        ];
+        return r;
+    });
 }

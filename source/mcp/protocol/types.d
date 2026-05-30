@@ -455,3 +455,347 @@ unittest  // InitializeResult round-trips capabilities and server info
     assert(!back.capabilities.tools.isNull);
     assert(back.instructions.get == "be nice");
 }
+
+// ===========================================================================
+// Resources
+// ===========================================================================
+
+/// A direct resource the server exposes.
+struct Resource
+{
+    string uri;
+    string name;
+    Nullable!string description;
+    Nullable!string mimeType;
+    Nullable!string title;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["uri"] = uri;
+        j["name"] = name;
+        if (!title.isNull)
+            j["title"] = title.get;
+        if (!description.isNull)
+            j["description"] = description.get;
+        if (!mimeType.isNull)
+            j["mimeType"] = mimeType.get;
+        return j;
+    }
+
+    static Resource fromJson(Json j) @safe
+    {
+        Resource r;
+        r.uri = ("uri" in j) ? j["uri"].get!string : "";
+        r.name = ("name" in j) ? j["name"].get!string : "";
+        if ("title" in j && j["title"].type == Json.Type.string)
+            r.title = j["title"].get!string;
+        if ("description" in j && j["description"].type == Json.Type.string)
+            r.description = j["description"].get!string;
+        if ("mimeType" in j && j["mimeType"].type == Json.Type.string)
+            r.mimeType = j["mimeType"].get!string;
+        return r;
+    }
+}
+
+/// A parameterized resource template (RFC 6570-style `{var}` placeholders).
+struct ResourceTemplate
+{
+    string uriTemplate;
+    string name;
+    Nullable!string description;
+    Nullable!string mimeType;
+    Nullable!string title;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["uriTemplate"] = uriTemplate;
+        j["name"] = name;
+        if (!title.isNull)
+            j["title"] = title.get;
+        if (!description.isNull)
+            j["description"] = description.get;
+        if (!mimeType.isNull)
+            j["mimeType"] = mimeType.get;
+        return j;
+    }
+}
+
+/// The contents of a resource read: either UTF-8 text or base64 blob.
+struct ResourceContents
+{
+    string uri;
+    string mimeType;
+    bool isBlob;
+    string text;
+    string blob;
+
+    static ResourceContents makeText(string uri, string mime, string text) @safe
+    {
+        ResourceContents c;
+        c.uri = uri;
+        c.mimeType = mime;
+        c.text = text;
+        return c;
+    }
+
+    static ResourceContents makeBlob(string uri, string mime, string base64) @safe
+    {
+        ResourceContents c;
+        c.uri = uri;
+        c.mimeType = mime;
+        c.isBlob = true;
+        c.blob = base64;
+        return c;
+    }
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["uri"] = uri;
+        if (mimeType.length)
+            j["mimeType"] = mimeType;
+        if (isBlob)
+            j["blob"] = blob;
+        else
+            j["text"] = text;
+        return j;
+    }
+}
+
+/// Result of `resources/list`.
+struct ListResourcesResult
+{
+    Resource[] resources;
+    Nullable!string nextCursor;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        Json arr = Json.emptyArray;
+        foreach (r; resources)
+            arr ~= r.toJson();
+        j["resources"] = arr;
+        if (!nextCursor.isNull)
+            j["nextCursor"] = nextCursor.get;
+        return j;
+    }
+}
+
+/// Result of `resources/templates/list`.
+struct ListResourceTemplatesResult
+{
+    ResourceTemplate[] resourceTemplates;
+    Nullable!string nextCursor;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        Json arr = Json.emptyArray;
+        foreach (t; resourceTemplates)
+            arr ~= t.toJson();
+        j["resourceTemplates"] = arr;
+        if (!nextCursor.isNull)
+            j["nextCursor"] = nextCursor.get;
+        return j;
+    }
+}
+
+/// Result of `resources/read`.
+struct ReadResourceResult
+{
+    ResourceContents[] contents;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        Json arr = Json.emptyArray;
+        foreach (c; contents)
+            arr ~= c.toJson();
+        j["contents"] = arr;
+        return j;
+    }
+}
+
+// ===========================================================================
+// Prompts
+// ===========================================================================
+
+/// A declared prompt argument.
+struct PromptArgument
+{
+    string name;
+    Nullable!string description;
+    bool required;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["name"] = name;
+        if (!description.isNull)
+            j["description"] = description.get;
+        if (required)
+            j["required"] = true;
+        return j;
+    }
+}
+
+/// A prompt the server exposes.
+struct Prompt
+{
+    string name;
+    Nullable!string description;
+    PromptArgument[] arguments;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["name"] = name;
+        if (!description.isNull)
+            j["description"] = description.get;
+        if (arguments.length)
+        {
+            Json arr = Json.emptyArray;
+            foreach (a; arguments)
+                arr ~= a.toJson();
+            j["arguments"] = arr;
+        }
+        return j;
+    }
+}
+
+/// A single message in a prompt result.
+struct PromptMessage
+{
+    string role; /// "user" or "assistant"
+    Content content;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["role"] = role;
+        j["content"] = content.toJson();
+        return j;
+    }
+}
+
+/// Result of `prompts/list`.
+struct ListPromptsResult
+{
+    Prompt[] prompts;
+    Nullable!string nextCursor;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        Json arr = Json.emptyArray;
+        foreach (p; prompts)
+            arr ~= p.toJson();
+        j["prompts"] = arr;
+        if (!nextCursor.isNull)
+            j["nextCursor"] = nextCursor.get;
+        return j;
+    }
+}
+
+/// Result of `prompts/get`.
+struct GetPromptResult
+{
+    Nullable!string description;
+    PromptMessage[] messages;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        if (!description.isNull)
+            j["description"] = description.get;
+        Json arr = Json.emptyArray;
+        foreach (m; messages)
+            arr ~= m.toJson();
+        j["messages"] = arr;
+        return j;
+    }
+}
+
+// ===========================================================================
+// Completion
+// ===========================================================================
+
+/// Result of `completion/complete`.
+struct CompleteResult
+{
+    string[] values;
+    Nullable!size_t total;
+    bool hasMore;
+
+    Json toJson() const @safe
+    {
+        Json completion = Json.emptyObject;
+        Json arr = Json.emptyArray;
+        foreach (v; values)
+            arr ~= Json(v);
+        completion["values"] = arr;
+        if (!total.isNull)
+            completion["total"] = total.get;
+        completion["hasMore"] = hasMore;
+        Json j = Json.emptyObject;
+        j["completion"] = completion;
+        return j;
+    }
+}
+
+unittest  // Resource serializes required + optional fields
+{
+    Resource r = {uri: "test://x", name: "x", description: nullable("d")};
+    auto j = r.toJson();
+    assert(j["uri"].get!string == "test://x");
+    assert(j["name"].get!string == "x");
+    assert(j["description"].get!string == "d");
+    assert("mimeType" !in j);
+}
+
+unittest  // ResourceContents text vs blob are mutually exclusive
+{
+    auto t = ResourceContents.makeText("u", "text/plain", "hi");
+    assert("text" in t.toJson() && "blob" !in t.toJson());
+    auto b = ResourceContents.makeBlob("u", "image/png", "QUJD");
+    assert("blob" in b.toJson() && "text" !in b.toJson());
+}
+
+unittest  // ReadResourceResult wraps contents array
+{
+    ReadResourceResult r;
+    r.contents = [ResourceContents.makeText("u", "text/plain", "hi")];
+    assert(r.toJson()["contents"][0]["text"].get!string == "hi");
+}
+
+unittest  // Prompt with arguments serializes the argument list
+{
+    Prompt p = {name: "greet", description: nullable("greets")};
+    p.arguments = [PromptArgument("who", nullable("name"), true)];
+    auto j = p.toJson();
+    assert(j["name"].get!string == "greet");
+    assert(j["arguments"][0]["name"].get!string == "who");
+    assert(j["arguments"][0]["required"].get!bool);
+}
+
+unittest  // GetPromptResult serializes messages with object content
+{
+    GetPromptResult r;
+    r.messages = [PromptMessage("user", Content.makeText("hi"))];
+    auto j = r.toJson();
+    assert(j["messages"][0]["role"].get!string == "user");
+    assert(j["messages"][0]["content"]["type"].get!string == "text");
+}
+
+unittest  // CompleteResult nests values under completion with hasMore
+{
+    CompleteResult r;
+    r.values = ["paris", "park"];
+    r.total = 150;
+    auto j = r.toJson();
+    assert(j["completion"]["values"].length == 2);
+    assert(j["completion"]["total"].get!int == 150);
+    assert(j["completion"]["hasMore"].get!bool == false);
+}
