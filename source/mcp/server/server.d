@@ -112,6 +112,7 @@ final class MCPServer
     private string logLevel = "info";
     private bool resourceSubscriptionsEnabled;
     private bool[string] subscriptions;
+    private Nullable!TasksCapability tasksCapability;
     private Json extensions = Json.undefined;
     private ProtocolVersion negotiated = latestStable;
     private ProtocolVersion effectiveVersion = latestStable;
@@ -217,6 +218,28 @@ final class MCPServer
         resourceSubscriptionsEnabled = true;
     }
 
+    /// Advertise the 2025-11-25 `tasks` capability (support for task-augmented
+    /// requests). `list`/`cancel` indicate support for `tasks/list` and
+    /// `tasks/cancel`; `requests` is a map of request method names (e.g.
+    /// "tools/call") to per-request settings objects. The capability appears in
+    /// the `tasks` field of the server capabilities sent during `initialize` /
+    /// `server/discover`.
+    void enableTasks(bool list = true, bool cancel = true, Json requests = Json.undefined) @safe
+    {
+        TasksCapability t;
+        t.list = list;
+        t.cancel = cancel;
+        t.requests = requests;
+        tasksCapability = t;
+    }
+
+    /// The `tasks` capability the connected client advertised (valid after
+    /// `initialize`). Null if the client advertised none.
+    Nullable!TasksCapability clientTasks() const @safe
+    {
+        return clientCaps.tasks;
+    }
+
     /// Advertise a draft protocol extension (e.g. "io.modelcontextprotocol/tasks")
     /// with an optional per-extension settings object. The identifier and its
     /// settings appear in the `extensions` field of the server capabilities sent
@@ -262,6 +285,8 @@ final class MCPServer
             caps.completions = true;
         if (loggingEnabled)
             caps.logging = true;
+        if (!tasksCapability.isNull)
+            caps.tasks = tasksCapability;
         if (extensions.type == Json.Type.object && extensions.length > 0)
             caps.extensions = extensions;
         return caps;
@@ -996,6 +1021,42 @@ unittest  // advertised extensions appear in initialize capabilities
     auto ext = resp["result"]["capabilities"]["extensions"];
     assert(ext.type == Json.Type.object);
     assert(ext["io.modelcontextprotocol/tasks"]["maxConcurrent"].get!int == 4);
+}
+
+unittest  // enableTasks advertises the `tasks` capability at initialize
+{
+    auto s = new MCPServer("t", "1");
+    Json reqs = Json.emptyObject;
+    reqs["tools/call"] = Json.emptyObject;
+    s.enableTasks(true, true, reqs);
+
+    Json params = Json.emptyObject;
+    params["protocolVersion"] = "2025-11-25";
+    auto resp = s.handle(req(1, "initialize", params)).get;
+    auto t = resp["result"]["capabilities"]["tasks"];
+    assert(t.type == Json.Type.object);
+    assert(t["list"].type == Json.Type.object);
+    assert(t["cancel"].type == Json.Type.object);
+    assert("tools/call" in t["requests"]);
+}
+
+unittest  // server reads the `tasks` capability a client advertises at initialize
+{
+    auto s = new MCPServer("t", "1");
+    Json caps = Json.emptyObject;
+    Json t = Json.emptyObject;
+    Json reqs = Json.emptyObject;
+    reqs["sampling/createMessage"] = Json.emptyObject;
+    t["requests"] = reqs;
+    caps["tasks"] = t;
+
+    Json params = Json.emptyObject;
+    params["protocolVersion"] = "2025-11-25";
+    params["capabilities"] = caps;
+    s.handle(req(1, "initialize", params));
+
+    assert(!s.clientTasks.isNull);
+    assert("sampling/createMessage" in s.clientTasks.get.requests);
 }
 
 unittest  // server reads the extensions a client advertises at initialize
