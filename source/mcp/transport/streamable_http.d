@@ -44,7 +44,9 @@ struct StreamableHttpOptions
 /// implementing the modern Streamable HTTP transport (single endpoint):
 ///   - POST: a JSON-RPC message/batch; returns `application/json` for requests,
 ///     or `202 Accepted` with no body when the payload needs no reply.
-///   - GET:  the draft drops the standalone server->client SSE stream -> 405.
+///   - GET:  on the stable revisions, opens a standalone server->client SSE
+///     stream wired to the server-push channel (`MCPServer.notify`); on the
+///     draft, which drops the standalone stream, GET -> 405.
 ///   - DELETE: the draft has no protocol-level sessions to tear down -> 405.
 void mountMcp(URLRouter router, MCPServer server,
         StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
@@ -57,15 +59,11 @@ void mountMcp(URLRouter router, MCPServer server,
             return;
         handlePost(server, coord, sessions, req, res);
     });
+    auto push = server.serverPushChannel(coord);
     router.get(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
         if (!guardOrigin(req, res, opts))
             return;
-        // The draft transport drops the standalone GET SSE stream entirely;
-        // server->client traffic flows on the SSE response to the relevant POST.
-        // Per draft backward-compatibility, GET to the endpoint -> 405.
-        res.statusCode = HTTPStatus.methodNotAllowed;
-        res.headers["Allow"] = "POST";
-        res.writeBody("", "text/plain");
+        handleGet(server, push, req, res);
     });
     router.match(HTTPMethod.DELETE, opts.path, (HTTPServerRequest req,
             HTTPServerResponse res) @safe {
@@ -126,6 +124,76 @@ private bool guardOrigin(scope HTTPServerRequest req, scope HTTPServerResponse r
         return false;
     }
     return true;
+}
+
+/// Decide how to answer an HTTP GET to the MCP endpoint
+/// (basic/transports §Listening for Messages from the Server): the server "MUST
+/// either return Content-Type: text/event-stream in response to this HTTP GET,
+/// or else return HTTP 405 Method Not Allowed".
+///
+/// Returns true when the GET should open a standalone server->client SSE stream,
+/// false when it must be answered with 405. The standalone stream is offered for
+/// the stable revisions (2025-03-26 / 2025-06-18 / 2025-11-25); on the draft,
+/// which drops the standalone GET stream in favour of POST-response SSE, GET ->
+/// 405 is the correct answer.
+bool getOpensSseStream(ProtocolVersion negotiated) @safe
+{
+    return !negotiated.isDraft;
+}
+
+unittest  // stable revisions open the GET SSE stream; the draft does not
+{
+    assert(getOpensSseStream(ProtocolVersion.v2025_11_25));
+    assert(getOpensSseStream(ProtocolVersion.v2025_06_18));
+    assert(getOpensSseStream(ProtocolVersion.v2025_03_26));
+    assert(!getOpensSseStream(ProtocolVersion.draft));
+}
+
+private void handleGet(MCPServer server, ServerPushChannel push,
+        HTTPServerRequest req, HTTPServerResponse res) @safe
+{
+    // Per the transport: the server MUST either open a text/event-stream or
+    // answer 405. The draft drops the standalone GET stream (server->client
+    // traffic rides the POST-response SSE), so it keeps the 405 alternative.
+    if (!getOpensSseStream(server.negotiatedVersion))
+    {
+        res.statusCode = HTTPStatus.methodNotAllowed;
+        res.headers["Allow"] = "POST";
+        res.writeBody("", "text/plain");
+        return;
+    }
+
+    // Open a long-lived SSE stream wired to the server-push channel, so the
+    // server can deliver unsolicited notifications/requests outside any POST.
+    import vibe.core.core : sleep;
+    import core.time : seconds;
+
+    res.contentType = "text/event-stream";
+    res.headers["Cache-Control"] = "no-cache";
+
+    const listenerId = push.addListener((string frame) @safe {
+        () @trusted {
+            res.bodyWriter.write(cast(const(ubyte)[]) frame);
+            res.bodyWriter.flush();
+        }();
+    });
+    // Drop the listener when the stream ends so the channel self-heals.
+    scope (exit)
+        push.removeListener(listenerId);
+
+    // Hold the connection open, emitting an SSE comment heartbeat so a write
+    // failure (client disconnect) is observed and the loop terminates.
+    while (true)
+    {
+        sleep(15.seconds);
+        try
+            () @trusted {
+            res.bodyWriter.write(cast(const(ubyte)[]) ": ping\n\n");
+            res.bodyWriter.flush();
+        }();
+        catch (Exception)
+            break;
+    }
 }
 
 private void handlePost(MCPServer server, StreamCoordinator coord,
