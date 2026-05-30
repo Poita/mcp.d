@@ -82,6 +82,45 @@ struct ResourcesCapability
     }
 }
 
+/// Tasks capability (2025-11-25): support for task-augmented requests.
+///
+/// Server form may carry presence-only `list`/`cancel` sub-capabilities and a
+/// `requests` map of request method names to per-request settings objects.
+/// Client form carries only the `requests` map. Each struct preserves the
+/// distinction by only emitting the fields relevant to its role.
+struct TasksCapability
+{
+    bool list; /// server: presence-only ({} when set); supports tasks/list
+    bool cancel; /// server: presence-only ({} when set); supports tasks/cancel
+    /// Map of request method names (e.g. "tools/call") to per-request settings
+    /// objects describing which requests may be task-augmented.
+    Json requests = Json.undefined;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        if (list)
+            j["list"] = Json.emptyObject;
+        if (cancel)
+            j["cancel"] = Json.emptyObject;
+        if (requests.type == Json.Type.object)
+            j["requests"] = requests;
+        return j;
+    }
+
+    static TasksCapability fromJson(Json j) @safe
+    {
+        TasksCapability c;
+        if ("list" in j)
+            c.list = true;
+        if ("cancel" in j)
+            c.cancel = true;
+        if ("requests" in j && j["requests"].type == Json.Type.object)
+            c.requests = j["requests"];
+        return c;
+    }
+}
+
 /// Capabilities a server advertises during initialization.
 struct ServerCapabilities
 {
@@ -90,6 +129,7 @@ struct ServerCapabilities
     Nullable!ListChangedCapability prompts;
     bool logging; /// presence-only ({} when set)
     bool completions; /// presence-only ({} when set)
+    Nullable!TasksCapability tasks; /// task-augmented requests (>= 2025-11-25)
     Json experimental = Json.undefined;
     /// draft Extension Negotiation: map of extension identifiers (e.g.
     /// "io.modelcontextprotocol/tasks") to per-extension settings objects.
@@ -109,6 +149,8 @@ struct ServerCapabilities
             j["logging"] = Json.emptyObject;
         if (completions)
             j["completions"] = Json.emptyObject;
+        if (!tasks.isNull)
+            j["tasks"] = tasks.get.toJson();
         if (experimental.type == Json.Type.object)
             j["experimental"] = experimental;
         if (extensions.type == Json.Type.object)
@@ -129,6 +171,8 @@ struct ServerCapabilities
             c.logging = true;
         if ("completions" in j)
             c.completions = true;
+        if ("tasks" in j && j["tasks"].type == Json.Type.object)
+            c.tasks = TasksCapability.fromJson(j["tasks"]);
         if ("experimental" in j)
             c.experimental = j["experimental"];
         if ("extensions" in j)
@@ -144,6 +188,9 @@ struct ClientCapabilities
     bool rootsListChanged;
     bool sampling; /// presence-only
     bool elicitation; /// presence-only (>= 2025-06-18)
+    /// task-augmented requests (>= 2025-11-25); client form carries only the
+    /// `requests` map (its `list`/`cancel` fields are server-only).
+    Nullable!TasksCapability tasks;
     Json experimental = Json.undefined;
     /// draft Extension Negotiation: map of extension identifiers (e.g.
     /// "io.modelcontextprotocol/ui") to per-extension settings objects.
@@ -164,6 +211,8 @@ struct ClientCapabilities
             j["sampling"] = Json.emptyObject;
         if (elicitation)
             j["elicitation"] = Json.emptyObject;
+        if (!tasks.isNull)
+            j["tasks"] = tasks.get.toJson();
         if (experimental.type == Json.Type.object)
             j["experimental"] = experimental;
         if (extensions.type == Json.Type.object)
@@ -185,6 +234,8 @@ struct ClientCapabilities
             c.sampling = true;
         if ("elicitation" in j)
             c.elicitation = true;
+        if ("tasks" in j && j["tasks"].type == Json.Type.object)
+            c.tasks = TasksCapability.fromJson(j["tasks"]);
         if ("experimental" in j)
             c.experimental = j["experimental"];
         if ("extensions" in j)
@@ -294,4 +345,87 @@ unittest  // ClientCapabilities omits `extensions` when unset
 {
     ClientCapabilities caps;
     assert("extensions" !in caps.toJson());
+}
+
+unittest  // ServerCapabilities advertises the 2025-11-25 `tasks` capability
+{
+    ServerCapabilities caps;
+    TasksCapability t;
+    t.list = true;
+    t.cancel = true;
+    Json reqs = Json.emptyObject;
+    reqs["tools/call"] = Json.emptyObject;
+    t.requests = reqs;
+    caps.tasks = t;
+    auto j = caps.toJson();
+    assert(j["tasks"]["list"].type == Json.Type.object && j["tasks"]["list"].length == 0);
+    assert(j["tasks"]["cancel"].type == Json.Type.object);
+    assert("tools/call" in j["tasks"]["requests"]);
+}
+
+unittest  // ServerCapabilities round-trips the `tasks` capability
+{
+    ServerCapabilities caps;
+    TasksCapability t;
+    t.list = true;
+    Json reqs = Json.emptyObject;
+    reqs["tools/call"] = Json.emptyObject;
+    t.requests = reqs;
+    caps.tasks = t;
+    auto back = ServerCapabilities.fromJson(caps.toJson());
+    assert(!back.tasks.isNull);
+    assert(back.tasks.get.list);
+    assert(!back.tasks.get.cancel);
+    assert("tools/call" in back.tasks.get.requests);
+}
+
+unittest  // ServerCapabilities omits `tasks` when unset
+{
+    ServerCapabilities caps;
+    assert("tasks" !in caps.toJson());
+}
+
+unittest  // ClientCapabilities advertises the 2025-11-25 `tasks` capability
+{
+    ClientCapabilities caps;
+    TasksCapability t;
+    Json reqs = Json.emptyObject;
+    reqs["sampling/createMessage"] = Json.emptyObject;
+    t.requests = reqs;
+    caps.tasks = t;
+    auto j = caps.toJson();
+    assert("sampling/createMessage" in j["tasks"]["requests"]);
+    // Client form carries only `requests` (no server-only list/cancel keys).
+    assert("list" !in j["tasks"]);
+    assert("cancel" !in j["tasks"]);
+}
+
+unittest  // ClientCapabilities round-trips the `tasks` capability
+{
+    ClientCapabilities caps;
+    TasksCapability t;
+    Json reqs = Json.emptyObject;
+    reqs["sampling/createMessage"] = Json.emptyObject;
+    t.requests = reqs;
+    caps.tasks = t;
+    auto back = ClientCapabilities.fromJson(caps.toJson());
+    assert(!back.tasks.isNull);
+    assert("sampling/createMessage" in back.tasks.get.requests);
+}
+
+unittest  // ClientCapabilities omits `tasks` when unset
+{
+    ClientCapabilities caps;
+    assert("tasks" !in caps.toJson());
+}
+
+unittest  // TasksCapability with empty `requests` map still round-trips presence
+{
+    TasksCapability t;
+    t.list = true;
+    auto j = t.toJson();
+    assert("requests" !in j);
+    auto back = TasksCapability.fromJson(j);
+    assert(back.list && !back.cancel);
+    assert(back.requests.type != Json.Type.object);
 }
