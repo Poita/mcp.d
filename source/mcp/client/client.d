@@ -83,6 +83,59 @@ Json withProgressToken(Json params, ProgressToken token) @safe
     return params;
 }
 
+/// The set of change-notification types a draft client opts into when opening a
+/// `subscriptions/listen` stream (draft basic/utilities/subscriptions). The three
+/// list-changed booleans request `notifications/tools|prompts|resources/list_changed`;
+/// `resourceSubscriptions` lists the resource URIs the client wants
+/// `notifications/resources/updated` for. This is serialised under
+/// `params.notifications` (a `SubscriptionFilter`) by `subscriptionsListen`.
+struct SubscriptionFilter
+{
+    /// Opt into `notifications/tools/list_changed`.
+    bool toolsListChanged;
+    /// Opt into `notifications/prompts/list_changed`.
+    bool promptsListChanged;
+    /// Opt into `notifications/resources/list_changed`.
+    bool resourcesListChanged;
+    /// Resource URIs to receive `notifications/resources/updated` for.
+    string[] resourceSubscriptions;
+}
+
+/// A handle to an open `subscriptions/listen` stream. The stream runs on a
+/// background task, dispatching the leading
+/// `notifications/subscriptions/acknowledged` and every subsequent opted-in
+/// change notification to the client's `onNotification` (and `onProgress`).
+/// Call `cancel()` (alias `close()`) to stop listening; the background task then
+/// closes the connection and terminates.
+final class SubscriptionStream
+{
+    private shared(bool)* cancelled_;
+
+    private this(shared(bool)* cancelled) @safe nothrow @nogc
+    {
+        cancelled_ = cancelled;
+    }
+
+    /// Request that the stream stop and its background task terminate. Idempotent.
+    void cancel() @safe nothrow @nogc
+    {
+        if (cancelled_ !is null)
+            *cancelled_ = true;
+    }
+
+    /// Alias for `cancel()`.
+    void close() @safe nothrow @nogc
+    {
+        cancel();
+    }
+
+    /// Whether `cancel()`/`close()` has been called.
+    bool cancelled() const @safe nothrow @nogc
+    {
+        return cancelled_ !is null && *cancelled_;
+    }
+}
+
 /// A Model Context Protocol client over the Streamable HTTP transport.
 ///
 /// Drives the lifecycle (`initialize` + `notifications/initialized`) and the
@@ -536,6 +589,67 @@ final class MCPClient
         Json p = Json.emptyObject;
         p["uri"] = uri;
         rpc("resources/unsubscribe", p);
+    }
+
+    /// Open a draft `subscriptions/listen` notification stream (draft
+    /// basic/utilities/subscriptions). This replaces the removed
+    /// `resources/subscribe` RPC and the standalone HTTP GET notification
+    /// endpoint: it POSTs `subscriptions/listen` with a `{notifications:{...}}`
+    /// filter (built from `filter`), the server upgrades the response to a
+    /// long-lived `text/event-stream`, and this client reads it on a background
+    /// task — delivering the leading `notifications/subscriptions/acknowledged`
+    /// and every subsequent opted-in change notification to `onNotification`
+    /// (and `onProgress` for progress). Returns a `SubscriptionStream` handle;
+    /// call its `cancel()`/`close()` to stop listening and close the stream.
+    ///
+    /// Only meaningful for draft servers (call `enableDraft`/`connect` first);
+    /// pre-draft servers do not implement `subscriptions/listen`.
+    SubscriptionStream subscriptionsListen(SubscriptionFilter filter) @safe
+    {
+        import vibe.core.core : runTask;
+
+        const id = nextId++;
+        Json params = buildSubscriptionsListenParams(filter);
+        if (useDraft)
+            params = injectDraftMeta(params);
+        auto message = makeRequest(Json(id), "subscriptions/listen", params);
+
+        auto cancelled = () @trusted { return new shared bool(false); }();
+        auto stream = new SubscriptionStream(cancelled);
+        runTask(() nothrow{
+            try
+                runListenStream(message, cancelled);
+            catch (Exception)
+            {
+            }
+        });
+        return stream;
+    }
+
+    /// Build the `subscriptions/listen` params, nesting the filter under
+    /// `params.notifications` exactly as the draft spec's `SubscriptionFilter`
+    /// requires (boolean list-changed flags emitted only when set;
+    /// `resourceSubscriptions` as a string array of URIs). Separated so the param
+    /// shaping can be unit-tested without a live server.
+    package static Json buildSubscriptionsListenParams(SubscriptionFilter filter) @safe
+    {
+        Json notifications = Json.emptyObject;
+        if (filter.toolsListChanged)
+            notifications["toolsListChanged"] = true;
+        if (filter.promptsListChanged)
+            notifications["promptsListChanged"] = true;
+        if (filter.resourcesListChanged)
+            notifications["resourcesListChanged"] = true;
+        if (filter.resourceSubscriptions.length)
+        {
+            Json uris = Json.emptyArray;
+            foreach (uri; filter.resourceSubscriptions)
+                uris ~= Json(uri);
+            notifications["resourceSubscriptions"] = uris;
+        }
+        Json p = Json.emptyObject;
+        p["notifications"] = notifications;
+        return p;
     }
 
     /// `logging/setLevel`.
@@ -1326,6 +1440,150 @@ final class MCPClient
             else if (!sawData)
                 break; // stream unavailable and no retry hint: stop
         }
+    }
+
+    /// Drive a `subscriptions/listen` stream over a raw TCP connection: POST the
+    /// listen request, read the server's long-lived `text/event-stream` response,
+    /// and dispatch every inbound message (the leading
+    /// `notifications/subscriptions/acknowledged` and subsequent change
+    /// notifications) via `dispatchInbound`. The loop checks `*cancelled` between
+    /// reads and on each SSE event, closing the connection promptly once the
+    /// caller cancels. A raw TCP POST is used (rather than vibe's pooled
+    /// `requestHTTP`) for the same reason as `runServerStream`: a long-lived,
+    /// idle-then-active SSE body is not reliably surfaced by the pooled client.
+    private void runListenStream(Json message, shared(bool)* cancelled) @safe
+    {
+        import vibe.core.net : connectTCP;
+        import vibe.stream.operations : readLine;
+        import vibe.core.stream : IOMode;
+        import std.string : indexOf, startsWith, strip, toLower;
+        import std.conv : to, parse;
+
+        auto rest = url;
+        const sep = rest.indexOf("://");
+        if (sep >= 0)
+            rest = rest[sep + 3 .. $];
+        const slash = rest.indexOf('/');
+        const hostPort = (slash < 0) ? rest : rest[0 .. slash];
+        const path = (slash < 0) ? "/" : rest[slash .. $];
+        const colon = hostPort.indexOf(':');
+        const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
+        const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
+
+        const 
+        body = message.toString();
+        () @trusted {
+            auto conn = connectTCP(host, port);
+            scope (exit)
+                conn.close();
+
+            string req = "POST " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
+                ~ "\r\nAccept: text/event-stream\r\nContent-Type: application/json\r\n"
+                ~ "Connection: keep-alive\r\n";
+            if (bearerToken.length)
+                req ~= "Authorization: Bearer " ~ bearerToken ~ "\r\n";
+            if (sessionId.length)
+                req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
+            req ~= "MCP-Protocol-Version: " ~ negotiated.toWire ~ "\r\n";
+            if (useDraft)
+            {
+                req ~= HttpHeader.protocolVersion ~ ": " ~ negotiated.toWire ~ "\r\n";
+                req ~= HttpHeader.method ~ ": subscriptions/listen\r\n";
+            }
+            import std.conv : to;
+
+            req ~= "Content-Length: " ~ body.length.to!string ~ "\r\n\r\n";
+            req ~= body;
+            conn.write(cast(const(ubyte)[]) req);
+
+            auto statusLine = cast(string) readLine(conn).idup;
+            if (statusLine.indexOf(" 200") < 0)
+                return;
+            bool chunked;
+            for (;;)
+            {
+                auto h = cast(string) readLine(conn).idup;
+                if (h.length && h[$ - 1] == '\r')
+                    h = h[0 .. $ - 1];
+                if (h.toLower.indexOf("transfer-encoding:") == 0 && h.toLower.indexOf(
+                        "chunked") >= 0)
+                    chunked = true;
+                if (h.length == 0)
+                    break;
+            }
+
+            string acc, data;
+            void parseSse()
+            {
+                for (;;)
+                {
+                    const nl = acc.indexOf('\n');
+                    if (nl < 0)
+                        break;
+                    auto line = acc[0 .. nl];
+                    acc = acc[nl + 1 .. $];
+                    if (line.length && line[$ - 1] == '\r')
+                        line = line[0 .. $ - 1];
+                    if (line.length == 0)
+                    {
+                        if (data.length)
+                        {
+                            try
+                                dispatchInbound(Message(parseJsonString(data)));
+                            catch (Exception)
+                            {
+                            }
+                            data = null;
+                        }
+                    }
+                    else if (line.startsWith("data:"))
+                    {
+                        auto d = line["data:".length .. $];
+                        if (d.startsWith(" "))
+                            d = d[1 .. $];
+                        data ~= (data.length ? "\n" : "") ~ d;
+                    }
+                }
+            }
+
+            for (;;)
+            {
+                if (*cancelled)
+                    break;
+                if (chunked)
+                {
+                    auto sizeLine = (cast(string) readLine(conn).idup).strip;
+                    if (sizeLine.length == 0)
+                        continue;
+                    uint sz;
+                    try
+                    {
+                        auto sl = sizeLine;
+                        sz = parse!uint(sl, 16);
+                    }
+                    catch (Exception)
+                        break;
+                    if (sz == 0)
+                        break; // last chunk
+                    auto chunk = new ubyte[sz];
+                    conn.read(chunk, IOMode.all);
+                    acc ~= cast(string) chunk.idup;
+                    readLine(conn); // trailing CRLF after the chunk data
+                    parseSse();
+                }
+                else
+                {
+                    const avail = conn.leastSize;
+                    if (avail == 0)
+                        break;
+                    const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
+                    auto buf = new ubyte[toRead];
+                    conn.read(buf, IOMode.once);
+                    acc ~= cast(string) buf.idup;
+                    parseSse();
+                }
+            }
+        }();
     }
 
     /// Establish the legacy HTTP+SSE (2024-11-05) two-endpoint transport:
@@ -2425,6 +2683,69 @@ unittest  // buildReadResourceParams attaches a progressToken under _meta
     auto p = MCPClient.buildReadResourceParams("file:///x", ProgressToken(99L));
     assert(p["uri"].get!string == "file:///x");
     assert(p["_meta"]["progressToken"].get!long == 99);
+}
+
+unittest  // buildSubscriptionsListenParams nests the boolean list-changed flags under notifications
+{
+    SubscriptionFilter f;
+    f.toolsListChanged = true;
+    f.resourcesListChanged = true;
+    auto p = MCPClient.buildSubscriptionsListenParams(f);
+    assert(p["notifications"]["toolsListChanged"].get!bool == true);
+    assert(p["notifications"]["resourcesListChanged"].get!bool == true);
+    // Flags left false are omitted (not sent as false) per the spec filter shape.
+    assert("promptsListChanged" !in p["notifications"]);
+}
+
+unittest  // buildSubscriptionsListenParams nests resourceSubscriptions URIs as a string array
+{
+    SubscriptionFilter f;
+    f.resourceSubscriptions = ["file:///a", "file:///b"];
+    auto p = MCPClient.buildSubscriptionsListenParams(f);
+    auto rs = p["notifications"]["resourceSubscriptions"];
+    assert(rs.type == Json.Type.array);
+    assert(rs.length == 2);
+    assert(rs[0].get!string == "file:///a");
+    assert(rs[1].get!string == "file:///b");
+}
+
+unittest  // buildSubscriptionsListenParams emits an empty notifications filter for an empty subscription
+{
+    SubscriptionFilter f;
+    auto p = MCPClient.buildSubscriptionsListenParams(f);
+    assert(p["notifications"].type == Json.Type.object);
+    assert(p["notifications"].length == 0);
+}
+
+unittest  // a subscriptions/listen stream delivers the acknowledgement + change notifications to onNotification
+{
+    // Exercise the delivery path the listen stream uses (dispatchInbound):
+    // the leading subscriptions/acknowledged event and a subsequent list-changed
+    // notification must both reach onNotification.
+    auto c = new MCPClient("http://localhost");
+    string[] seen;
+    c.onNotification = (string method, Json params) @safe { seen ~= method; };
+
+    c.dispatchInbound(Message(parseJsonString(
+            `{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"toolsListChanged":true}}`)));
+    c.dispatchInbound(Message(parseJsonString(
+            `{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`)));
+
+    assert(seen.length == 2);
+    assert(seen[0] == "notifications/subscriptions/acknowledged");
+    assert(seen[1] == "notifications/tools/list_changed");
+}
+
+unittest  // a SubscriptionStream handle reports and toggles its cancelled state
+{
+    auto cancelled = () @trusted { return new shared bool(false); }();
+    auto s = new SubscriptionStream(cancelled);
+    assert(!s.cancelled);
+    s.cancel();
+    assert(s.cancelled);
+    assert(*cancelled);
+    s.close(); // idempotent
+    assert(s.cancelled);
 }
 
 unittest  // buildGetPromptParams attaches a progressToken under _meta
