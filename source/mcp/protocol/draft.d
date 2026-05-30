@@ -120,6 +120,70 @@ Json withCache(Json result, long ttlMs, CacheScope scope_ = CacheScope.public_) 
 }
 
 // ===========================================================================
+// x-mcp-header: mirroring tool parameters into HTTP headers
+// ===========================================================================
+
+/// Encode a tool-parameter value for transmission in an `Mcp-Param-*` header.
+/// Plain-ASCII values pass through; anything else (non-ASCII, control chars,
+/// surrounding whitespace, or a value that looks like the sentinel) is wrapped
+/// as `=?base64?<base64-of-utf8>?=`.
+string encodeHeaderValue(string value) @safe
+{
+    import std.base64 : Base64;
+
+    if (value.length == 0)
+        return value;
+    bool needsEncoding = false;
+    if (value[0] == ' ' || value[$ - 1] == ' ')
+        needsEncoding = true;
+    foreach (char c; value)
+        if (c < 0x20 || c > 0x7E)
+            needsEncoding = true;
+    if (value.length >= 9 && value[0 .. 9] == "=?base64?")
+        needsEncoding = true;
+
+    if (!needsEncoding)
+        return value;
+    return "=?base64?" ~ () @trusted {
+        return cast(string) Base64.encode(cast(const(ubyte)[]) value);
+    }() ~ "?=";
+}
+
+/// Decode an `Mcp-Param-*` header value produced by `encodeHeaderValue`.
+string decodeHeaderValue(string headerValue) @safe
+{
+    import std.base64 : Base64;
+
+    if (headerValue.length >= 11 && headerValue[0 .. 9] == "=?base64?"
+            && headerValue[$ - 2 .. $] == "?=")
+    {
+        const inner = headerValue[9 .. $ - 2];
+        return () @trusted { return cast(string) Base64.decode(inner); }();
+    }
+    return headerValue;
+}
+
+/// Extract the `x-mcp-header` annotations from a tool `inputSchema`, returning a
+/// map of parameter name -> header name (`Mcp-Param-{value}`). Only top-level
+/// properties are inspected here.
+string[string] paramHeaderMap(Json inputSchema) @safe
+{
+    string[string] map;
+    if (inputSchema.type != Json.Type.object || "properties" !in inputSchema)
+        return map;
+    auto props = inputSchema["properties"];
+    if (props.type != Json.Type.object)
+        return map;
+    () @trusted {
+        foreach (string name, Json prop; props)
+            if (prop.type == Json.Type.object && "x-mcp-header" in prop
+                    && prop["x-mcp-header"].type == Json.Type.string)
+                map[name] = HttpHeader.paramPrefix ~ prop["x-mcp-header"].get!string;
+    }();
+    return map;
+}
+
+// ===========================================================================
 // Multi Round-Trip Requests (MRTR) — SEP-2322
 // ===========================================================================
 
@@ -286,4 +350,38 @@ unittest  // MRTR InputRequiredResult round-trips and input responses parse
     auto resps = readInputResponses(params);
     assert("r1" in resps);
     assert(resps["r1"]["action"].get!string == "accept");
+}
+
+unittest  // header value codec: plain ASCII passes through; others base64
+{
+    assert(encodeHeaderValue("us-west1") == "us-west1");
+    assert(decodeHeaderValue("us-west1") == "us-west1");
+
+    // non-ASCII -> base64 sentinel, round-trips
+    auto enc = encodeHeaderValue("Hello, 世界");
+    assert(enc.length > 9 && enc[0 .. 9] == "=?base64?");
+    assert(decodeHeaderValue(enc) == "Hello, 世界");
+
+    // leading/trailing space and sentinel-looking values are encoded
+    assert(encodeHeaderValue(" padded ")[0 .. 9] == "=?base64?");
+    assert(decodeHeaderValue(encodeHeaderValue(" padded ")) == " padded ");
+    assert(decodeHeaderValue(encodeHeaderValue("=?base64?x?=")) == "=?base64?x?=");
+}
+
+unittest  // paramHeaderMap reads x-mcp-header annotations
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["region"] = Json([
+        "type": Json("string"),
+        "x-mcp-header": Json("Region")
+    ]);
+    props["query"] = Json(["type": Json("string")]);
+    schema["properties"] = props;
+
+    auto m = paramHeaderMap(schema);
+    assert("region" in m);
+    assert(m["region"] == "Mcp-Param-Region");
+    assert("query" !in m);
 }
