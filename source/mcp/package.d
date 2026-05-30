@@ -18,6 +18,7 @@ public import mcp.api.attributes;
 public import mcp.api.schema;
 public import mcp.api.reflection;
 public import mcp.auth.oauth;
+public import mcp.auth.client;
 public import mcp.transport.sse_context;
 public import mcp.transport.streamable_http;
 public import mcp.transport.stdio;
