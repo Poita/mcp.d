@@ -196,6 +196,37 @@ final class ServerPushChannel
     {
         return emit(makeNotification(method, params));
     }
+
+    /// Frame `msg` and write it to a single listener (identified by `listenerId`),
+    /// rather than broadcasting to all. Used to deliver a per-stream leading event
+    /// — e.g. the `notifications/subscriptions/acknowledged` the draft
+    /// `subscriptions/listen` stream sends only to its own client. Returns true if
+    /// the listener received it; false if the id is unknown or its write failed
+    /// (in which case the listener is dropped).
+    bool emitTo(long listenerId, Json msg) @safe
+    {
+        import std.conv : to;
+
+        foreach (ref l; listeners)
+        {
+            if (l.id != listenerId)
+                continue;
+            const eid = streamOf[l.id].to!string ~ "-" ~ seqOf[l.id].to!string;
+            const frame = formatSseEvent(eid, msg);
+            try
+            {
+                l.write(frame);
+                seqOf[l.id]++;
+                return true;
+            }
+            catch (Exception)
+            {
+                removeListener(l.id);
+                return false;
+            }
+        }
+        return false;
+    }
 }
 
 unittest  // a listener receives framed events, with monotonic per-listener ids
@@ -239,6 +270,25 @@ unittest  // emit fans out to every listener and self-heals broken ones
     assert(delivered == 1); // only the healthy listener received it
     assert(aCount == 1);
     assert(ch.listenerCount == 1); // the broken listener was dropped
+}
+
+unittest  // emitTo delivers only to the named listener, not the others
+{
+    auto coord = new StreamCoordinator;
+    auto ch = new ServerPushChannel(coord);
+    string aFrame, bFrame;
+    const a = ch.addListener((string f) @safe { aFrame = f; });
+    ch.addListener((string f) @safe { bFrame = f; });
+
+    assert(ch.emitTo(a, makeNotification("notifications/subscriptions/acknowledged",
+            Json(["toolsListChanged": Json(true)]))));
+    import std.algorithm : canFind;
+
+    assert(aFrame.canFind("notifications/subscriptions/acknowledged"));
+    assert(bFrame.length == 0); // the other listener got nothing
+
+    // An unknown listener id is a no-op returning false.
+    assert(!ch.emitTo(9999, makeNotification("notifications/message")));
 }
 
 unittest  // distinct listeners get distinct stream ordinals, so ids stay unique

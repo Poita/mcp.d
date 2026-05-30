@@ -892,6 +892,20 @@ final class MCPServer
         return (changeType in listenFilters) !is null;
     }
 
+    /// The agreed-upon subset of change-notification types the server will deliver
+    /// on the `subscriptions/listen` stream (draft basic/utilities/subscriptions).
+    /// Each opted-in type recorded by `subscriptions/listen` appears as
+    /// `{ "<type>": true }`; an empty object when the client opted into nothing.
+    /// This is the payload the transport sends in the leading
+    /// `notifications/subscriptions/acknowledged` event when it opens the stream.
+    Json acknowledgedListenSubset() const @safe
+    {
+        Json subset = Json.emptyObject;
+        foreach (k, v; listenFilters)
+            subset[k] = v;
+        return subset;
+    }
+
     private Json doListResources(Json params) @safe
     {
         import std.algorithm : sort;
@@ -2153,6 +2167,25 @@ unittest  // subscriptions/listen records the opted-in filter and acknowledges
     assert(s.listensFor("toolsListChanged"));
     assert(s.listensFor("resourceSubscriptions"));
     assert(!s.listensFor("promptsListChanged"));
+}
+
+unittest  // acknowledgedListenSubset reflects exactly the opted-in change types
+{
+    auto s = makeTestServer();
+    // Nothing opted in yet -> empty object.
+    assert(s.acknowledgedListenSubset().type == Json.Type.object);
+    assert(s.acknowledgedListenSubset().length == 0);
+
+    Json p = Json.emptyObject;
+    p["toolsListChanged"] = true;
+    p["resourceSubscriptions"] = true;
+    p["promptsListChanged"] = false; // explicitly not opted in
+    s.handle(draftReq(7, "subscriptions/listen", p));
+
+    auto subset = s.acknowledgedListenSubset();
+    assert(subset["toolsListChanged"].get!bool);
+    assert(subset["resourceSubscriptions"].get!bool);
+    assert("promptsListChanged" !in subset);
 }
 
 unittest  // draft is stateless: tools/call works without a prior initialize
