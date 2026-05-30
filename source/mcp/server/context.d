@@ -10,6 +10,84 @@ import mcp.auth.resource_server : TokenInfo;
 
 @safe:
 
+/// The RFC 5424 severity ordering used by `notifications/message` logging
+/// (server/utilities/logging). Lower index == less severe; a message is emitted
+/// only when its severity is at or above the client's configured minimum (set
+/// via `logging/setLevel`). Returns `-1` for an unrecognised level name.
+int logLevelRank(string level) @safe pure nothrow @nogc
+{
+    switch (level)
+    {
+    case "debug":
+        return 0;
+    case "info":
+        return 1;
+    case "notice":
+        return 2;
+    case "warning":
+        return 3;
+    case "error":
+        return 4;
+    case "critical":
+        return 5;
+    case "alert":
+        return 6;
+    case "emergency":
+        return 7;
+    default:
+        return -1;
+    }
+}
+
+/// Whether a log message at `level` should be emitted when the client's
+/// configured minimum is `minLevel` (RFC 5424 ordering). After
+/// `logging/setLevel(error)` only `error` and above pass. An unrecognised
+/// `level` is treated as always emitted (fail-open, so custom levels are not
+/// silently dropped); an unrecognised `minLevel` admits everything.
+bool shouldLog(string level, string minLevel) @safe pure nothrow @nogc
+{
+    const lvl = logLevelRank(level);
+    const min = logLevelRank(minLevel);
+    if (lvl < 0 || min < 0)
+        return true;
+    return lvl >= min;
+}
+
+unittest  // RFC 5424 ordering: debug < info < ... < emergency
+{
+    assert(logLevelRank("debug") < logLevelRank("info"));
+    assert(logLevelRank("info") < logLevelRank("notice"));
+    assert(logLevelRank("notice") < logLevelRank("warning"));
+    assert(logLevelRank("warning") < logLevelRank("error"));
+    assert(logLevelRank("error") < logLevelRank("critical"));
+    assert(logLevelRank("critical") < logLevelRank("alert"));
+    assert(logLevelRank("alert") < logLevelRank("emergency"));
+    assert(logLevelRank("bogus") == -1);
+}
+
+unittest  // shouldLog gates by the configured minimum level
+{
+    // minLevel "error": only error and above pass.
+    assert(!shouldLog("debug", "error"));
+    assert(!shouldLog("warning", "error"));
+    assert(shouldLog("error", "error"));
+    assert(shouldLog("critical", "error"));
+    assert(shouldLog("emergency", "error"));
+}
+
+unittest  // shouldLog with the default minimum "info" drops only debug
+{
+    assert(!shouldLog("debug", "info"));
+    assert(shouldLog("info", "info"));
+    assert(shouldLog("warning", "info"));
+}
+
+unittest  // shouldLog fails open on unrecognised level names
+{
+    assert(shouldLog("custom", "error"));
+    assert(shouldLog("debug", "bogus"));
+}
+
 /// Per-request context handed to tool handlers. It is the channel through which
 /// a handler emits server->client traffic while a request is in flight:
 /// progress + logging notifications, and (blocking) sampling / elicitation
@@ -205,12 +283,14 @@ final class RequestScope : RequestContext
     private RequestContext inner;
     private bool stateless;
     private Json[string] responses;
+    private string minLevel;
 
-    this(RequestContext inner, bool stateless, Json[string] responses) @safe
+    this(RequestContext inner, bool stateless, Json[string] responses, string minLevel = "info") @safe
     {
         this.inner = inner;
         this.stateless = stateless;
         this.responses = responses;
+        this.minLevel = minLevel;
     }
 
     void reportProgress(double progress,
@@ -219,8 +299,13 @@ final class RequestScope : RequestContext
         inner.reportProgress(progress, total, message);
     }
 
+    /// Emit a logging notification, but drop it when its severity is below the
+    /// client-configured minimum (`logging/setLevel`) per the RFC 5424 ordering.
+    /// This is where the server honours "Only sends error level and above".
     void log(string level, Json data, string logger = null) @safe
     {
+        if (!shouldLog(level, minLevel))
+            return;
         inner.log(level, data, logger);
     }
 
@@ -496,4 +581,72 @@ unittest  // typed sample() builds params and parses the typed result
     assert(result.content.text == "echoed");
     assert(result.model == "test-model");
     assert(result.stopReasonEnum.get == StopReason.endTurn);
+}
+
+version (unittest) private final class LogProbe : RequestContext
+{
+    string[] emittedLevels;
+
+    void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
+    {
+    }
+
+    void log(string level, Json, string = null) @safe
+    {
+        emittedLevels ~= level;
+    }
+
+    Json sendRequest(string, Json) @safe
+    {
+        return Json.undefined;
+    }
+
+    bool clientSupports(string) @safe
+    {
+        return false;
+    }
+
+    bool isStateless() @safe
+    {
+        return false;
+    }
+
+    Json[string] inputResponses() @safe
+    {
+        Json[string] empty;
+        return empty;
+    }
+
+    TokenInfo auth() @safe
+    {
+        return TokenInfo.invalid();
+    }
+}
+
+unittest  // RequestScope drops log messages below the configured minimum level
+{
+    Json[string] empty;
+    auto probe = new LogProbe;
+    auto scope_ = new RequestScope(probe, false, empty, "error");
+
+    scope_.log("debug", Json("d"));
+    scope_.log("warning", Json("w"));
+    scope_.log("error", Json("e"));
+    scope_.log("critical", Json("c"));
+
+    // Only error and above passed through to the inner transport context.
+    assert(probe.emittedLevels == ["error", "critical"]);
+}
+
+unittest  // RequestScope with the default "info" minimum drops only debug
+{
+    Json[string] empty;
+    auto probe = new LogProbe;
+    auto scope_ = new RequestScope(probe, false, empty);
+
+    scope_.log("debug", Json("d"));
+    scope_.log("info", Json("i"));
+    scope_.log("warning", Json("w"));
+
+    assert(probe.emittedLevels == ["info", "warning"]);
 }
