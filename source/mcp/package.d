@@ -19,6 +19,7 @@ public import mcp.api.schema;
 public import mcp.api.reflection;
 public import mcp.auth.oauth;
 public import mcp.auth.client;
+public import mcp.auth.login;
 public import mcp.auth.resource_server;
 public import mcp.auth.jwt;
 public import mcp.auth.jwt_verifier;
