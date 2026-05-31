@@ -151,6 +151,18 @@ final class MCPServer
 	// inbound `notifications/cancelled` can flip the matching token and the
 	// request's response can be suppressed (basic/utilities/cancellation).
 	private CancellationToken[string] inFlight;
+	// Observer for inbound client-originated notifications (e.g.
+	// `notifications/roots/list_changed`). Invoked from `handleNotification`
+	// for any notification the server does not itself consume, giving the
+	// application a public surface to react to client notifications. Mirrors
+	// the client's `onNotification` hook. Set via
+	// `setClientNotificationHandler`.
+	private void delegate(string method, Json params) @safe onClientNotification_;
+	// Convenience observer for `notifications/roots/list_changed`: when the
+	// client signals its root list changed, the application can re-call
+	// `ctx.listRoots()` to refresh. Invoked in addition to
+	// `onClientNotification_`. Set via `setRootsListChangedHandler`.
+	private void delegate() @safe onRootsListChanged_;
 
 	this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
 	{
@@ -383,6 +395,30 @@ final class MCPServer
 	void setCompletionRequestHandler(CompleteResult delegate(CompleteRequest request) @safe handler) @safe
 	{
 		typedCompletionHandler = handler;
+	}
+
+	/// Observe inbound client-originated notifications.
+	///
+	/// The server consumes `notifications/initialized` and
+	/// `notifications/cancelled` itself; every other inbound notification
+	/// (notably `notifications/roots/list_changed`) is delivered here so the
+	/// application can react — for example, re-calling `ctx.listRoots()` after
+	/// the client signals its root list changed (client/roots: "Servers SHOULD
+	/// ... handle root list changes gracefully"). Mirrors the client-side
+	/// `onNotification` observer. Purely an application-facing callback; it does
+	/// not affect the JSON-RPC wire output for any protocol version.
+	void setClientNotificationHandler(void delegate(string method, Json params) @safe handler) @safe
+	{
+		onClientNotification_ = handler;
+	}
+
+	/// Convenience observer fired specifically on
+	/// `notifications/roots/list_changed`. Invoked in addition to any handler
+	/// registered via `setClientNotificationHandler`. Set to react to client
+	/// root-list changes without inspecting the method string yourself.
+	void setRootsListChangedHandler(void delegate() @safe handler) @safe
+	{
+		onRootsListChanged_ = handler;
 	}
 
 	/// Advertise the logging capability and accept `logging/setLevel`.
@@ -869,8 +905,18 @@ final class MCPServer
 		case "notifications/cancelled":
 			handleCancelled(msg.params);
 			break;
+		case "notifications/roots/list_changed":
+			if (onRootsListChanged_ !is null)
+				onRootsListChanged_();
+			if (onClientNotification_ !is null)
+				onClientNotification_(msg.method, msg.params);
+			break;
 		default:
-			break; // unknown notifications are ignored per JSON-RPC
+			// Unconsumed client notifications are surfaced to the application
+			// observer (if any) and otherwise ignored, per JSON-RPC.
+			if (onClientNotification_ !is null)
+				onClientNotification_(msg.method, msg.params);
+			break;
 		}
 	}
 
@@ -1836,6 +1882,59 @@ unittest  // cancellation matches string-id requests too
 	auto resp = s.handle(Message(makeRequest(Json("req-abc"), "tools/call", callP)));
 	assert(sawCancelled);
 	assert(resp.isNull);
+}
+
+unittest  // notifications/roots/list_changed fires the dedicated server hook
+{
+	auto s = new MCPServer("t", "1");
+	bool sawRootsChanged;
+	s.setRootsListChangedHandler(() @safe { sawRootsChanged = true; });
+
+	auto out_ = s.handle(Message(makeNotification("notifications/roots/list_changed")));
+	assert(out_.isNull, "a notification produces no response");
+	assert(sawRootsChanged, "server should observe notifications/roots/list_changed");
+}
+
+unittest  // notifications/roots/list_changed also reaches the generic client-notification observer
+{
+	auto s = new MCPServer("t", "1");
+	string seenMethod;
+	s.setClientNotificationHandler((string method, Json params) @safe {
+		seenMethod = method;
+	});
+
+	s.handle(Message(makeNotification("notifications/roots/list_changed")));
+	assert(seenMethod == "notifications/roots/list_changed");
+}
+
+unittest  // unrecognised client notifications are surfaced to the generic observer
+{
+	auto s = new MCPServer("t", "1");
+	string seenMethod;
+	s.setClientNotificationHandler((string method, Json params) @safe {
+		seenMethod = method;
+	});
+
+	auto out_ = s.handle(Message(makeNotification("notifications/something/unknown")));
+	assert(out_.isNull);
+	assert(seenMethod == "notifications/something/unknown");
+}
+
+unittest  // server-consumed notifications do NOT reach the generic client observer
+{
+	// notifications/initialized and notifications/cancelled are handled by the
+	// server itself and must not be forwarded to the application observer.
+	auto s = new MCPServer("t", "1");
+	bool observed;
+	s.setClientNotificationHandler((string method, Json params) @safe {
+		observed = true;
+	});
+
+	s.handle(Message(makeNotification("notifications/initialized")));
+	Json p = Json.emptyObject;
+	p["requestId"] = 7;
+	s.handle(Message(makeNotification("notifications/cancelled", p)));
+	assert(!observed, "initialized/cancelled are consumed internally, not observed");
 }
 
 unittest  // handleRaw returns response text for a request
