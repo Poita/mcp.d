@@ -28,14 +28,16 @@ struct TokenInfo
         return scopes.canFind(scope_);
     }
 
-    /// Whether the token lists the given resource among its audiences. An empty
-    /// audience list is treated as "unscoped" and accepted, so validators that do
-    /// not populate `audience` are not forced into RFC 8707 enforcement.
+    /// Whether the token lists the given resource among its audiences (RFC 8707).
+    /// The spec (basic/authorization §Access Token Privilege Restriction) requires
+    /// servers to "reject tokens that do not include them in the audience claim",
+    /// so an empty audience does NOT satisfy the binding: a token must explicitly
+    /// name `resource` to be treated as issued for this server.
     bool hasAudience(string resource) const @safe
     {
         import std.algorithm : canFind;
 
-        return audience.length == 0 || audience.canFind(resource);
+        return audience.canFind(resource);
     }
 
     /// A convenience constructor for a rejected token.
@@ -278,6 +280,34 @@ unittest  // RFC 8707: a token whose audience includes the resource is accepted
         ti.audience = ["https://mcp.example.com/mcp"];
         return ti;
     };
+    TokenInfo info;
+    assert(authorize(cfg, "Bearer good", info) == AuthFailure.none);
+}
+
+unittest  // RFC 8707: an empty audience is rejected when a resource is configured
+{
+    // The spec (basic/authorization, Access Token Privilege Restriction) says
+    // servers MUST reject tokens that do not include them in the audience claim.
+    // When the operator has opted into RFC 8707 binding by setting cfg.resource,
+    // a validated token with no audience MUST fail closed.
+    ResourceServerConfig cfg;
+    cfg.resource = "https://mcp.example.com/mcp";
+    cfg.validator = (string t) {
+        TokenInfo ti;
+        ti.valid = true;
+        // validator forgot to populate audience
+        return ti;
+    };
+    TokenInfo info;
+    assert(authorize(cfg, "Bearer good", info) == AuthFailure.invalidToken);
+}
+
+unittest  // RFC 8707: an empty audience is accepted when no resource is configured
+{
+    // Without cfg.resource the operator has not opted into binding, so an
+    // unscoped token remains acceptable (back-compatible default).
+    ResourceServerConfig cfg;
+    cfg.validator = (string t) { TokenInfo ti; ti.valid = true; return ti; };
     TokenInfo info;
     assert(authorize(cfg, "Bearer good", info) == AuthFailure.none);
 }
