@@ -177,6 +177,11 @@ struct CreateMessageRequest
 		foreach (m; messages)
 			arr ~= m.toJson();
 		j["messages"] = arr;
+		// `maxTokens` is REQUIRED by CreateMessageRequestParams in every spec
+		// version (schema.ts: `maxTokens: number;`, no `?`). Refuse to serialize a
+		// request that would omit it rather than silently emit spec-invalid params.
+		if (maxTokens.isNull)
+			throw invalidParams("CreateMessageRequest.maxTokens is required and must be set");
 		if (!modelPreferences.empty)
 			j["modelPreferences"] = modelPreferences.toJson();
 		if (!systemPrompt.isNull)
@@ -543,10 +548,42 @@ unittest  // CreateMessageRequest serializes all set params and omits unset
 	assert("metadata" !in j);
 }
 
+unittest  // CreateMessageRequest.toJson throws when the REQUIRED maxTokens is unset
+{
+	import mcp.protocol.errors : ErrorCode;
+
+	// maxTokens is required by CreateMessageRequestParams in every spec version
+	// (schema.ts: `maxTokens: number;`). A request that never sets it must not
+	// silently serialize to spec-invalid params; toJson must reject it.
+	CreateMessageRequest req;
+	req.messages = [SamplingMessage("user", Content.makeText("hi"))];
+	assert(req.maxTokens.isNull);
+
+	bool threw;
+	try
+		cast(void) req.toJson();
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.invalidParams);
+	}
+	assert(threw, "toJson must throw invalidParams when maxTokens is unset");
+}
+
+unittest  // CreateMessageRequest.toJson emits maxTokens once it is set
+{
+	CreateMessageRequest req;
+	req.messages = [SamplingMessage("user", Content.makeText("hi"))];
+	req.maxTokens = 256;
+	auto j = req.toJson();
+	assert(j["maxTokens"].get!long == 256);
+}
+
 unittest  // CreateMessageRequest with modelPreferences round-trips
 {
 	CreateMessageRequest req;
 	req.messages = [SamplingMessage("user", Content.makeText("hi"))];
+	req.maxTokens = 100; // required field
 	req.modelPreferences.hints = [ModelHint("claude")];
 	req.modelPreferences.intelligencePriority = 0.8;
 	auto back = CreateMessageRequest.fromJson(req.toJson());
@@ -582,6 +619,7 @@ unittest  // CreateMessageRequest emits tools and toolChoice; omits when unset
 {
 	CreateMessageRequest req;
 	req.messages = [SamplingMessage("user", Content.makeText("weather?"))];
+	req.maxTokens = 100; // required field
 	auto bare = req.toJson();
 	assert("tools" !in bare);
 	assert("toolChoice" !in bare);
@@ -601,6 +639,7 @@ unittest  // CreateMessageRequest with tools/toolChoice round-trips
 {
 	CreateMessageRequest req;
 	req.messages = [SamplingMessage("user", Content.makeText("hi"))];
+	req.maxTokens = 100; // required field
 	Tool t;
 	t.name = "calc";
 	req.tools = [t];
