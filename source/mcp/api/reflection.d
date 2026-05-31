@@ -85,6 +85,9 @@ void registerModules(mods...)(MCPServer server) @safe
 /// parameters, skipping any `RequestContext` parameter.
 private Json parametersSchema(alias func)() @safe
 {
+    import mcp.protocol.draft : validateHeaderName;
+    import std.traits : isFloatingPoint;
+
     alias names = ParameterIdentifierTuple!func;
     alias types = Parameters!func;
 
@@ -98,10 +101,23 @@ private Json parametersSchema(alias func)() @safe
                 Json ps = jsonSchemaOf!P;
                 // Draft x-mcp-header: a parameter tagged @mcpHeader is mirrored
                 // into an `Mcp-Param-<name>` request header; emit the extension
-                // property so the transport can validate it (see draft.paramHeaderMap).
+                // property so the transport can validate it (see draft.paramHeaders).
+                // The header name and parameter type are checked against the draft
+                // `x-mcp-header` constraints at compile time: the value MUST be a
+                // valid HTTP token (non-empty, 1*tchar, no CR/LF) and the parameter
+                // MUST be a primitive type (string/integral/bool); `number`
+                // (floating point) is NOT permitted.
                 static foreach (attr; __traits(getAttributes, types[i .. i + 1]))
                     static if (is(typeof(attr) == mcpHeader))
+                        {
+                        static assert(validateHeaderName(attr.name) is null,
+                                "@mcpHeader(\"" ~ attr.name ~ "\") is not a valid x-mcp-header value: " ~ validateHeaderName(
+                                    attr.name));
+                        static assert(!isFloatingPoint!P,
+                                "@mcpHeader cannot be applied to a floating-point ('number') parameter '"
+                                ~ names[i] ~ "'; x-mcp-header permits only integer/string/boolean");
                         ps["x-mcp-header"] = attr.name;
+                    }
                 props[names[i]] = ps;
             }
             static if (!isInstanceOf!(Nullable, P))

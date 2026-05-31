@@ -450,23 +450,182 @@ string decodeHeaderValue(string headerValue) @safe
     return headerValue;
 }
 
+/// Whether a JSON Schema `type` value is one the draft permits an `x-mcp-header`
+/// annotation to be applied to. Per `server/tools` #x-mcp-header, only the
+/// primitive types `integer`, `string`, and `boolean` are allowed; `number` is
+/// explicitly NOT permitted (its value may not round-trip through a header).
+bool isPrimitiveHeaderType(string jsonSchemaType) @safe pure nothrow
+{
+    return jsonSchemaType == "integer" || jsonSchemaType == "string" || jsonSchemaType == "boolean";
+}
+
+/// Validate a single `x-mcp-header` value (the name portion of the resulting
+/// `Mcp-Param-{name}` header) against the draft constraints, returning a
+/// human-readable reason on violation or `null` when valid.
+///
+/// Per `server/tools` #x-mcp-header an `x-mcp-header` value:
+/// * MUST NOT be empty;
+/// * MUST match HTTP field-name token syntax (`1*tchar`, RFC 9110 §5.1);
+/// * MUST NOT contain control characters, including CR (`\r`) or LF (`\n`).
+///
+/// Case-insensitive uniqueness across the whole schema is enforced separately by
+/// `validateInputSchemaHeaders` (it is not a property of a value in isolation).
+string validateHeaderName(string value) @safe pure nothrow
+{
+    if (value.length == 0)
+        return "x-mcp-header value MUST NOT be empty";
+    foreach (char c; value)
+    {
+        // RFC 9110 §5.1 tchar: "!#$%&'*+-.^_`|~" / DIGIT / ALPHA.
+        // This excludes control characters (incl. CR/LF), spaces, and ':'.
+        const bool isTchar = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '!' || c == '#' || c == '$' || c == '%'
+            || c == '&' || c == '\'' || c == '*' || c == '+' || c == '-' || c == '.'
+            || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+        if (!isTchar)
+            return "x-mcp-header value '" ~ value
+                ~ "' is not a valid HTTP field-name token (1*tchar)";
+    }
+    return null;
+}
+
+/// ASCII-lowercase a string for case-insensitive comparison of header names.
+private string asciiLowerName(string s) @safe pure nothrow
+{
+    char[] buf = new char[s.length];
+    foreach (i, char c; s)
+        buf[i] = (c >= 'A' && c <= 'Z') ? cast(char)(c + 32) : c;
+    return () @trusted { return cast(string) buf; }();
+}
+
+/// A single `x-mcp-header` annotation discovered in a tool `inputSchema`,
+/// together with the path of property keys to reach the annotated value.
+struct ParamHeader
+{
+    string[] path; /// property keys from the root `inputSchema` to the annotated value
+    string header; /// the resolved header name, e.g. `Mcp-Param-Region`
+    string name; /// the raw `x-mcp-header` value (header suffix), e.g. `Region`
+}
+
+/// Collect every valid `x-mcp-header` annotation in a tool `inputSchema`,
+/// recursing into nested `object` properties and `array` `items` schemas — the
+/// draft permits the annotation "at any nesting depth within the inputSchema,
+/// not only top-level properties". Annotations on non-primitive
+/// (`number`/object/array) properties, or with an invalid value, are skipped
+/// here; use `validateInputSchemaHeaders` to reject such schemas up front.
+ParamHeader[] paramHeaders(Json inputSchema) @safe
+{
+    ParamHeader[] result;
+    void walk(Json node, string[] path) @safe
+    {
+        if (node.type != Json.Type.object)
+            return;
+        if ("properties" in node && node["properties"].type == Json.Type.object)
+        {
+            () @trusted {
+                foreach (string name, Json prop; node["properties"])
+                {
+                    if (prop.type != Json.Type.object)
+                        continue;
+                    auto childPath = path ~ name;
+                    if ("x-mcp-header" in prop && prop["x-mcp-header"].type == Json.Type.string)
+                    {
+                        const hv = prop["x-mcp-header"].get!string;
+                        const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
+                            .get!string : "";
+                        if (validateHeaderName(hv) is null && isPrimitiveHeaderType(ptype))
+                            result ~= ParamHeader(childPath, HttpHeader.paramPrefix ~ hv, hv);
+                    }
+                    walk(prop, childPath);
+                }
+            }();
+        }
+        if ("items" in node && node["items"].type == Json.Type.object)
+            walk(node["items"], path);
+    }
+
+    walk(inputSchema, []);
+    return result;
+}
+
+/// Validate every `x-mcp-header` annotation in a tool `inputSchema` against the
+/// draft constraints (`server/tools` #x-mcp-header): non-empty, HTTP token
+/// syntax, no CR/LF, primitive-only (`number` forbidden), and case-insensitive
+/// uniqueness across the whole schema. Returns a human-readable reason on the
+/// first violation, or `null` when every annotation is valid. Recurses to any
+/// nesting depth.
+string validateInputSchemaHeaders(Json inputSchema) @safe
+{
+    string err;
+    bool[string] seen; // ASCII-lowercased header values already encountered
+    void walk(Json node) @safe
+    {
+        if (err !is null || node.type != Json.Type.object)
+            return;
+        if ("properties" in node && node["properties"].type == Json.Type.object)
+        {
+            () @trusted {
+                foreach (string name, Json prop; node["properties"])
+                {
+                    if (err !is null)
+                        return;
+                    if (prop.type != Json.Type.object)
+                        continue;
+                    if ("x-mcp-header" in prop)
+                    {
+                        if (prop["x-mcp-header"].type != Json.Type.string)
+                        {
+                            err = "x-mcp-header value on '" ~ name ~ "' MUST be a string";
+                            return;
+                        }
+                        const hv = prop["x-mcp-header"].get!string;
+                        auto nameErr = validateHeaderName(hv);
+                        if (nameErr !is null)
+                        {
+                            err = nameErr;
+                            return;
+                        }
+                        const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
+                            .get!string : "";
+                        if (!isPrimitiveHeaderType(ptype))
+                        {
+                            err = "x-mcp-header '" ~ hv ~ "' on '" ~ name ~ "' may only be applied to primitive types"
+                                ~ " (integer/string/boolean); type '" ~ ptype ~ "' is not permitted";
+                            return;
+                        }
+                        const lc = asciiLowerName(hv);
+                        if (lc in seen)
+                        {
+                            err = "x-mcp-header value '" ~ hv
+                                ~ "' is not case-insensitively unique within the inputSchema";
+                            return;
+                        }
+                        seen[lc] = true;
+                    }
+                    walk(prop);
+                }
+            }();
+        }
+        if (err is null && "items" in node && node["items"].type == Json.Type.object)
+            walk(node["items"]);
+    }
+
+    walk(inputSchema);
+    return err;
+}
+
 /// Extract the `x-mcp-header` annotations from a tool `inputSchema`, returning a
-/// map of parameter name -> header name (`Mcp-Param-{value}`). Only top-level
-/// properties are inspected here.
+/// map of (top-level) parameter name -> header name (`Mcp-Param-{name}`).
+///
+/// Retained for backward compatibility; only top-level, primitive-typed, valid
+/// annotations appear. Prefer `paramHeaders` (path-aware, any nesting depth) for
+/// new code.
 string[string] paramHeaderMap(Json inputSchema) @safe
 {
     string[string] map;
-    if (inputSchema.type != Json.Type.object || "properties" !in inputSchema)
-        return map;
-    auto props = inputSchema["properties"];
-    if (props.type != Json.Type.object)
-        return map;
-    () @trusted {
-        foreach (string name, Json prop; props)
-            if (prop.type == Json.Type.object && "x-mcp-header" in prop
-                    && prop["x-mcp-header"].type == Json.Type.string)
-                map[name] = HttpHeader.paramPrefix ~ prop["x-mcp-header"].get!string;
-    }();
+    foreach (ph; paramHeaders(inputSchema))
+        if (ph.path.length == 1)
+            map[ph.path[0]] = ph.header;
     return map;
 }
 
@@ -1084,4 +1243,181 @@ unittest  // paramHeaderMap reads x-mcp-header annotations
     assert("region" in m);
     assert(m["region"] == "Mcp-Param-Region");
     assert("query" !in m);
+}
+
+unittest  // validateHeaderName: empty value rejected (draft x-mcp-header MUST NOT be empty)
+{
+    assert(validateHeaderName("") !is null);
+}
+
+unittest  // validateHeaderName: valid token passes
+{
+    assert(validateHeaderName("Region") is null);
+    assert(validateHeaderName("X-Trace-Id_v2.1") is null);
+}
+
+unittest  // validateHeaderName: CR/LF and control chars rejected (no header injection)
+{
+    assert(validateHeaderName("Re\rgion") !is null);
+    assert(validateHeaderName("Re\ngion") !is null);
+    assert(validateHeaderName("Re\x01gion") !is null);
+}
+
+unittest  // validateHeaderName: space and colon are not tchar
+{
+    assert(validateHeaderName("My Region") !is null);
+    assert(validateHeaderName("Region:") !is null);
+}
+
+unittest  // isPrimitiveHeaderType: integer/string/boolean allowed, number/object/array not
+{
+    assert(isPrimitiveHeaderType("integer"));
+    assert(isPrimitiveHeaderType("string"));
+    assert(isPrimitiveHeaderType("boolean"));
+    assert(!isPrimitiveHeaderType("number"));
+    assert(!isPrimitiveHeaderType("object"));
+    assert(!isPrimitiveHeaderType("array"));
+}
+
+unittest  // validateInputSchemaHeaders: a valid primitive annotation passes
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["region"] = Json([
+        "type": Json("string"),
+        "x-mcp-header": Json("Region")
+    ]);
+    props["limit"] = Json([
+        "type": Json("integer"),
+        "x-mcp-header": Json("Limit")
+    ]);
+    schema["properties"] = props;
+    assert(validateInputSchemaHeaders(schema) is null);
+}
+
+unittest  // validateInputSchemaHeaders: number-typed annotation is rejected (number NOT permitted)
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["amount"] = Json([
+        "type": Json("number"),
+        "x-mcp-header": Json("Amount")
+    ]);
+    schema["properties"] = props;
+    assert(validateInputSchemaHeaders(schema) !is null);
+}
+
+unittest  // validateInputSchemaHeaders: empty x-mcp-header value rejected
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["region"] = Json(["type": Json("string"), "x-mcp-header": Json("")]);
+    schema["properties"] = props;
+    assert(validateInputSchemaHeaders(schema) !is null);
+}
+
+unittest  // validateInputSchemaHeaders: CR/LF in value rejected
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["region"] = Json([
+        "type": Json("string"),
+        "x-mcp-header": Json("Re\r\ngion")
+    ]);
+    schema["properties"] = props;
+    assert(validateInputSchemaHeaders(schema) !is null);
+}
+
+unittest  // validateInputSchemaHeaders: case-insensitively duplicate values rejected
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["a"] = Json(["type": Json("string"), "x-mcp-header": Json("Region")]);
+    props["b"] = Json(["type": Json("string"), "x-mcp-header": Json("region")]);
+    schema["properties"] = props;
+    assert(validateInputSchemaHeaders(schema) !is null);
+}
+
+unittest  // validateInputSchemaHeaders: detects duplicate across nesting depths
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json nestedProps = Json.emptyObject;
+    nestedProps["region"] = Json([
+        "type": Json("string"),
+        "x-mcp-header": Json("Region")
+    ]);
+    Json nested = Json.emptyObject;
+    nested["type"] = "object";
+    nested["properties"] = nestedProps;
+    Json props = Json.emptyObject;
+    props["top"] = Json(["type": Json("string"), "x-mcp-header": Json("REGION")]);
+    props["obj"] = nested;
+    schema["properties"] = props;
+    assert(validateInputSchemaHeaders(schema) !is null);
+}
+
+unittest  // paramHeaders: recurses into nested object properties (any nesting depth)
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json nestedProps = Json.emptyObject;
+    nestedProps["region"] = Json([
+        "type": Json("string"),
+        "x-mcp-header": Json("Region")
+    ]);
+    Json nested = Json.emptyObject;
+    nested["type"] = "object";
+    nested["properties"] = nestedProps;
+    Json props = Json.emptyObject;
+    props["filters"] = nested;
+    schema["properties"] = props;
+
+    auto phs = paramHeaders(schema);
+    assert(phs.length == 1);
+    assert(phs[0].path == ["filters", "region"]);
+    assert(phs[0].header == "Mcp-Param-Region");
+}
+
+unittest  // paramHeaders: recurses into array items schemas
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json itemProps = Json.emptyObject;
+    itemProps["tag"] = Json([
+        "type": Json("string"),
+        "x-mcp-header": Json("Tag")
+    ]);
+    Json items = Json.emptyObject;
+    items["type"] = "object";
+    items["properties"] = itemProps;
+    Json arr = Json.emptyObject;
+    arr["type"] = "array";
+    arr["items"] = items;
+    Json props = Json.emptyObject;
+    props["entries"] = arr;
+    schema["properties"] = props;
+
+    auto phs = paramHeaders(schema);
+    assert(phs.length == 1);
+    assert(phs[0].path == ["entries", "tag"]);
+    assert(phs[0].header == "Mcp-Param-Tag");
+}
+
+unittest  // paramHeaders: number-typed annotations are skipped (not collected)
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["amount"] = Json([
+        "type": Json("number"),
+        "x-mcp-header": Json("Amount")
+    ]);
+    schema["properties"] = props;
+    assert(paramHeaders(schema).length == 0);
 }
