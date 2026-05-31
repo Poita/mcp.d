@@ -102,7 +102,7 @@ jobs:
       # Works on private repos when CODECOV_TOKEN is set in repo secrets.
       # fail_ci_if_error stays false so a transient Codecov outage never blocks CI.
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v6
         with:
           files: ./*.lst
           token: ${{ secrets.CODECOV_TOKEN }}
