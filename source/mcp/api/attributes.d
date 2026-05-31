@@ -1,6 +1,7 @@
 module mcp.api.attributes;
 
 import std.typecons : Nullable;
+import vibe.data.json : Json;
 
 @safe:
 
@@ -45,6 +46,7 @@ struct toolAnnotations
 	Nullable!bool destructiveHint;
 	Nullable!bool idempotentHint;
 	Nullable!bool openWorldHint;
+	string title; /// optional annotation-level display title (ToolAnnotations.title), distinct from tool.title
 }
 
 /// UDA declaring a `@tool`-annotated method's per-tool task-augmented execution
@@ -138,4 +140,60 @@ struct describe
 struct mcpHeader
 {
 	string name; /// the header suffix, e.g. "Region" -> `Mcp-Param-Region`
+}
+
+/// UDA declaring a display icon for a `@tool`, `@resource`, or
+/// `@resourceTemplate`-annotated method (the MCP `Icons` mixin: `Tool.icons`,
+/// `Resource.icons`). Attach one or more `@icon` UDAs to the same method; each
+/// becomes an entry in the descriptor's `icons` array. `src` is required;
+/// `mimeType` and `sizes` are optional.
+///
+/// Example:
+/// ---
+/// @tool("draw", "Draw something")
+/// @icon("https://example.com/draw.png", "image/png", ["48x48"])
+/// string draw(string spec) { ... }
+/// ---
+struct icon
+{
+	string src; /// URI or data: URL of the icon (required)
+	string mimeType; /// optional MIME type, e.g. "image/png" (empty = unset)
+	string[] sizes; /// optional size strings, e.g. ["48x48", "96x96"]
+}
+
+/// UDA attaching a descriptor-level `_meta` object to a `@tool`, `@resource`,
+/// or `@resourceTemplate`-annotated method (the MCP `_meta` field on `Tool`,
+/// `Resource`, `ResourceTemplate`). The supplied JSON must be an object; it is
+/// emitted verbatim as the descriptor's `_meta`.
+///
+/// Example:
+/// ---
+/// import vibe.data.json : parseJsonString;
+/// @tool("x", "X")
+/// @meta(parseJsonString(`{"category":"math"}`))
+/// int x() { ... }
+/// ---
+struct meta
+{
+	Json value; /// the `_meta` object (must be a JSON object to be emitted)
+}
+
+/// UDA declaring a per-resource / per-template draft `CacheableResult` freshness
+/// hint for a `@resource`- or `@resourceTemplate`-annotated method. The reflection
+/// layer plumbs it through to the matching low-level registration so a draft
+/// `resources/read` carries `ttlMs` / `cacheScope`. Has no effect on pre-draft
+/// protocol versions (the server only emits cache fields when negotiated to draft).
+///
+/// `scope_` is `"public"` (the default) or `"private"`.
+///
+/// Example:
+/// ---
+/// @resource("file:///data", "Data", "application/json")
+/// @cache(5000, "private")
+/// string data() { ... }
+/// ---
+struct cache
+{
+	long ttlMs; /// how long the result may be cached, in milliseconds
+	string scope_ = "public"; /// "public" (default) | "private"
 }
