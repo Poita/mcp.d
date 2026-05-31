@@ -894,6 +894,11 @@ struct ListToolsResult
 	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
 	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
 	Nullable!CacheHint cache;
+	/// Optional result-level `_meta` object. Reserved by MCP on every `Result`
+	/// (the base interface all paginated list results extend), so it round-trips
+	/// on every protocol version: `toJson` emits it only when set and `fromJson`
+	/// parses it. Unset by default, so pre-existing wire output is unchanged.
+	Json meta;
 
 	Json toJson() const @safe
 	{
@@ -906,6 +911,8 @@ struct ListToolsResult
 			j["nextCursor"] = nextCursor.get;
 		if (!cache.isNull)
 			j = withCache(j, cache.get);
+		if (meta.type == Json.Type.object)
+			j["_meta"] = meta;
 		return j;
 	}
 
@@ -921,6 +928,8 @@ struct ListToolsResult
 		if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
 			r.nextCursor = j["nextCursor"].get!string;
 		r.cache = parseCacheHint(j);
+		if ("_meta" in j && j["_meta"].type == Json.Type.object)
+			r.meta = j["_meta"];
 		return r;
 	}
 }
@@ -944,6 +953,83 @@ unittest  // ListToolsResult: an unset cache hint emits no ttlMs/cacheScope
 	assert("ttlMs" !in j);
 	assert("cacheScope" !in j);
 	assert(ListToolsResult.fromJson(j).cache.isNull);
+}
+
+unittest  // ListToolsResult: result-level `_meta` round-trips through toJson/fromJson
+{
+	ListToolsResult r;
+	Json m = Json.emptyObject;
+	m["progressToken"] = "abc";
+	r.meta = m;
+	auto j = r.toJson();
+	assert(j["_meta"]["progressToken"].get!string == "abc");
+	auto back = ListToolsResult.fromJson(j);
+	assert(back.meta.type == Json.Type.object);
+	assert(back.meta["progressToken"].get!string == "abc");
+}
+
+unittest  // ListToolsResult: an unset `_meta` emits no `_meta` key
+{
+	ListToolsResult r;
+	auto j = r.toJson();
+	assert("_meta" !in j);
+}
+
+unittest  // ListResourcesResult: result-level `_meta` round-trips through toJson/fromJson
+{
+	ListResourcesResult r;
+	Json m = Json.emptyObject;
+	m["k"] = "v";
+	r.meta = m;
+	auto j = r.toJson();
+	assert(j["_meta"]["k"].get!string == "v");
+	auto back = ListResourcesResult.fromJson(j);
+	assert(back.meta.type == Json.Type.object);
+	assert(back.meta["k"].get!string == "v");
+}
+
+unittest  // ListResourcesResult: an unset `_meta` emits no `_meta` key
+{
+	ListResourcesResult r;
+	assert("_meta" !in r.toJson());
+}
+
+unittest  // ListResourceTemplatesResult: result-level `_meta` round-trips through toJson/fromJson
+{
+	ListResourceTemplatesResult r;
+	Json m = Json.emptyObject;
+	m["k"] = "v";
+	r.meta = m;
+	auto j = r.toJson();
+	assert(j["_meta"]["k"].get!string == "v");
+	auto back = ListResourceTemplatesResult.fromJson(j);
+	assert(back.meta.type == Json.Type.object);
+	assert(back.meta["k"].get!string == "v");
+}
+
+unittest  // ListResourceTemplatesResult: an unset `_meta` emits no `_meta` key
+{
+	ListResourceTemplatesResult r;
+	assert("_meta" !in r.toJson());
+}
+
+unittest  // ListPromptsResult: result-level `_meta` round-trips through toJson/fromJson
+{
+	ListPromptsResult r;
+	Json m = Json.emptyObject;
+	m["k"] = "v";
+	r.meta = m;
+	auto j = r.toJson();
+	assert(j["_meta"]["k"].get!string == "v");
+	auto back = ListPromptsResult.fromJson(j);
+	assert(back.meta.type == Json.Type.object);
+	assert(back.meta["k"].get!string == "v");
+}
+
+unittest  // ListPromptsResult: an unset `_meta` emits no `_meta` key
+{
+	ListPromptsResult r;
+	assert("_meta" !in r.toJson());
 }
 
 /// Parameters of the `initialize` request.
@@ -1878,6 +1964,11 @@ struct ListResourcesResult
 	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
 	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
 	Nullable!CacheHint cache;
+	/// Optional result-level `_meta` object. Reserved by MCP on every `Result`
+	/// (the base interface all paginated list results extend), so it round-trips
+	/// on every protocol version: `toJson` emits it only when set and `fromJson`
+	/// parses it. Unset by default, so pre-existing wire output is unchanged.
+	Json meta;
 
 	Json toJson() const @safe
 	{
@@ -1890,6 +1981,8 @@ struct ListResourcesResult
 			j["nextCursor"] = nextCursor.get;
 		if (!cache.isNull)
 			j = withCache(j, cache.get);
+		if (meta.type == Json.Type.object)
+			j["_meta"] = meta;
 		return j;
 	}
 
@@ -1905,6 +1998,8 @@ struct ListResourcesResult
 		if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
 			r.nextCursor = j["nextCursor"].get!string;
 		r.cache = parseCacheHint(j);
+		if ("_meta" in j && j["_meta"].type == Json.Type.object)
+			r.meta = j["_meta"];
 		return r;
 	}
 }
@@ -1918,6 +2013,11 @@ struct ListResourceTemplatesResult
 	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
 	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
 	Nullable!CacheHint cache;
+	/// Optional result-level `_meta` object. Reserved by MCP on every `Result`
+	/// (the base interface all paginated list results extend), so it round-trips
+	/// on every protocol version: `toJson` emits it only when set and `fromJson`
+	/// parses it. Unset by default, so pre-existing wire output is unchanged.
+	Json meta;
 
 	Json toJson() const @safe
 	{
@@ -1930,6 +2030,8 @@ struct ListResourceTemplatesResult
 			j["nextCursor"] = nextCursor.get;
 		if (!cache.isNull)
 			j = withCache(j, cache.get);
+		if (meta.type == Json.Type.object)
+			j["_meta"] = meta;
 		return j;
 	}
 
@@ -1945,6 +2047,8 @@ struct ListResourceTemplatesResult
 		if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
 			r.nextCursor = j["nextCursor"].get!string;
 		r.cache = parseCacheHint(j);
+		if ("_meta" in j && j["_meta"].type == Json.Type.object)
+			r.meta = j["_meta"];
 		return r;
 	}
 }
@@ -2607,6 +2711,11 @@ struct ListPromptsResult
 	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
 	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
 	Nullable!CacheHint cache;
+	/// Optional result-level `_meta` object. Reserved by MCP on every `Result`
+	/// (the base interface all paginated list results extend), so it round-trips
+	/// on every protocol version: `toJson` emits it only when set and `fromJson`
+	/// parses it. Unset by default, so pre-existing wire output is unchanged.
+	Json meta;
 
 	Json toJson() const @safe
 	{
@@ -2619,6 +2728,8 @@ struct ListPromptsResult
 			j["nextCursor"] = nextCursor.get;
 		if (!cache.isNull)
 			j = withCache(j, cache.get);
+		if (meta.type == Json.Type.object)
+			j["_meta"] = meta;
 		return j;
 	}
 
@@ -2634,6 +2745,8 @@ struct ListPromptsResult
 		if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
 			r.nextCursor = j["nextCursor"].get!string;
 		r.cache = parseCacheHint(j);
+		if ("_meta" in j && j["_meta"].type == Json.Type.object)
+			r.meta = j["_meta"];
 		return r;
 	}
 }
