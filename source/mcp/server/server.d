@@ -2171,7 +2171,8 @@ unittest  // server/discover advertises all supported versions + identity
 {
     auto s = makeTestServer();
     auto resp = s.handle(draftReq(1, "server/discover")).get;
-    auto pv = resp["result"]["protocolVersions"];
+    assert(resp["result"]["resultType"].get!string == "complete");
+    auto pv = resp["result"]["supportedVersions"];
     bool hasDraft, hasFirst;
     foreach (i; 0 .. pv.length)
     {

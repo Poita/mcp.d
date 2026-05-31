@@ -278,10 +278,15 @@ struct DiscoverResult
     Json toJson() const @safe
     {
         Json j = Json.emptyObject;
+        // Base draft Result mandates a `resultType` discriminator on every
+        // result; a complete discover response uses "complete".
+        j["resultType"] = "complete";
         Json pv = Json.emptyArray;
         foreach (v; protocolVersions)
             pv ~= Json(v);
-        j["protocolVersions"] = pv;
+        // Spec wire field name is `supportedVersions` (draft server/discover
+        // Response Fields table), even though the D member is `protocolVersions`.
+        j["supportedVersions"] = pv;
         j["capabilities"] = capabilities.toJson();
         j["serverInfo"] = serverInfo.toJson();
         if (!instructions.isNull)
@@ -292,9 +297,12 @@ struct DiscoverResult
     static DiscoverResult fromJson(Json j) @safe
     {
         DiscoverResult r;
-        if ("protocolVersions" in j && j["protocolVersions"].type == Json.Type.array)
+        // Spec wire field is `supportedVersions`; accept the legacy
+        // `protocolVersions` name as a fallback for older peers.
+        auto verKey = ("supportedVersions" in j) ? "supportedVersions" : "protocolVersions";
+        if (verKey in j && j[verKey].type == Json.Type.array)
         {
-            auto arr = j["protocolVersions"];
+            auto arr = j[verKey];
             foreach (i; 0 .. arr.length)
                 r.protocolVersions ~= arr[i].get!string;
         }
@@ -528,6 +536,44 @@ unittest  // DiscoverResult round-trips
     assert(back.protocolVersions.length == 2);
     assert(back.serverInfo.name == "srv");
     assert(back.capabilities.logging);
+}
+
+unittest  // DiscoverResult.toJson emits the spec wire field `supportedVersions`
+{
+    DiscoverResult d;
+    d.protocolVersions = ["2026-07-28", "2025-11-25"];
+    d.serverInfo = Implementation("srv", "1.0");
+    auto j = d.toJson();
+    // draft server/discover Response Fields table requires `supportedVersions`,
+    // not the internal name `protocolVersions`.
+    assert("supportedVersions" in j);
+    assert("protocolVersions" !in j);
+    assert(j["supportedVersions"].length == 2);
+    assert(j["supportedVersions"][0].get!string == "2026-07-28");
+}
+
+unittest  // DiscoverResult.toJson carries the required resultType discriminator
+{
+    DiscoverResult d;
+    d.protocolVersions = ["2026-07-28"];
+    auto j = d.toJson();
+    // Base draft Result mandates a resultType discriminator on every result;
+    // a complete discover response uses "complete".
+    assert("resultType" in j);
+    assert(j["resultType"].get!string == "complete");
+}
+
+unittest  // DiscoverResult.fromJson reads the spec wire field `supportedVersions`
+{
+    Json j = Json.emptyObject;
+    Json sv = Json.emptyArray;
+    sv ~= Json("2026-07-28");
+    sv ~= Json("2025-11-25");
+    j["resultType"] = Json("complete");
+    j["supportedVersions"] = sv;
+    auto r = DiscoverResult.fromJson(j);
+    assert(r.protocolVersions.length == 2);
+    assert(r.protocolVersions[0] == "2026-07-28");
 }
 
 unittest  // withCache attaches ttlMs and cacheScope
