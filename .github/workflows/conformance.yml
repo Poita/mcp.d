@@ -31,7 +31,7 @@ jobs:
       - name: Install Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       # Build the two harness targets defined in dub.json. These are plain
       # executables that link the SDK; a build failure here is a real failure.
