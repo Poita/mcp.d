@@ -1073,8 +1073,10 @@ final class MCPServer
             return typedCompletionHandler(CompleteRequest.fromJson(params)).toJson();
         if (completionHandler !is null)
             return completionHandler(params).toJson();
-        CompleteResult empty;
-        return empty.toJson();
+        // No handler registered => the `completions` capability is not advertised.
+        // The spec directs servers to answer with -32601 (Capability not
+        // supported) rather than a success result in this case.
+        throw methodNotFound("completion/complete");
     }
 
     private Json doSetLevel(Json params) @safe
@@ -1720,6 +1722,16 @@ unittest  // prompts/get allows a missing optional argument
     auto resp = s.handle(req(2, "prompts/get", p)).get;
     assert("result" in resp);
     assert(resp["result"]["messages"][0]["content"]["text"].get!string == "Hi world");
+}
+
+unittest  // completion/complete returns -32601 when no completions capability is declared
+{
+    auto s = new MCPServer("t", "1");
+    // No completion handler registered => completions capability not advertised.
+    auto resp = s.handle(req(1, "completion/complete", Json.emptyObject)).get;
+    assert("error" in resp);
+    assert("result" !in resp);
+    assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
 unittest  // completion/complete uses the registered handler
