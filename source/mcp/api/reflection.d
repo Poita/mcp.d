@@ -236,6 +236,17 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
     if (!anns.empty)
         descriptor.annotations = anns.toJson();
 
+    // Fold any @toolExecution UDA into the descriptor's `execution` field
+    // (2025-11-25 per-tool task-augmented execution negotiation).
+    static foreach (a; __traits(getAttributes, overload))
+    {
+        static if (is(typeof(a) == toolExecution))
+        {
+            if (a.taskSupport.length)
+                descriptor.execution = ToolExecution(nullable(a.taskSupport));
+        }
+    }
+
     server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
         alias names = ParameterIdentifierTuple!overload;
         Tuple!(Parameters!overload) argv;
@@ -426,6 +437,12 @@ version (unittest)
             return "erased " ~ id;
         }
 
+        @tool("render", "Render a long report")
+        @toolExecution("optional") string render(string spec) @safe
+        {
+            return "rendered " ~ spec;
+        }
+
         @resource("test://doc", "Doc", "text/plain")
         string doc() @safe
         {
@@ -468,7 +485,7 @@ unittest  // @tool reflection: schema derivation + typed dispatch
 
     Json lp = Json.emptyObject;
     auto list = s.handle(Message(makeRequest(Json(1), "tools/list", lp))).get;
-    assert(list["result"]["tools"].length == 6);
+    assert(list["result"]["tools"].length == 7);
 
     // add -> scalar return wrapped under `result`, with an inferred outputSchema.
     Json p = Json.emptyObject;
@@ -687,6 +704,31 @@ unittest  // @toolAnnotations reflection: hints are serialized into annotations
 
     // A tool without @toolAnnotations carries no annotations object.
     assert("annotations" !in addTool);
+}
+
+unittest  // @toolExecution reflection: execution.taskSupport appears in tools/list
+{
+    import mcp.protocol.jsonrpc : Message, makeRequest;
+
+    auto s = new MCPServer("t", "1");
+    registerHandlers(s, new DemoApi);
+    auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+            Json.emptyObject))).get["result"]["tools"];
+
+    Json renderTool, addTool;
+    foreach (i; 0 .. tools.length)
+    {
+        const name = tools[i]["name"].get!string;
+        if (name == "render")
+            renderTool = tools[i];
+        else if (name == "add")
+            addTool = tools[i];
+    }
+
+    assert(renderTool.type == Json.Type.object);
+    assert(renderTool["execution"]["taskSupport"].get!string == "optional");
+    // A tool without @toolExecution carries no execution object.
+    assert("execution" !in addTool);
 }
 
 unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schema

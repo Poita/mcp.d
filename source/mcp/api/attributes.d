@@ -47,6 +47,22 @@ struct toolAnnotations
     Nullable!bool openWorldHint;
 }
 
+/// UDA declaring a `@tool`-annotated method's per-tool task-augmented execution
+/// support (the MCP 2025-11-25 `Tool.execution` descriptor). Attach alongside
+/// `@tool`; `taskSupport` must be one of `"forbidden"` (the default when this
+/// UDA is absent), `"optional"`, or `"required"`.
+///
+/// Example:
+/// ---
+/// @tool("render", "Render a long report")
+/// @toolExecution("optional")
+/// string render(string spec) { ... }
+/// ---
+struct toolExecution
+{
+    string taskSupport; /// "forbidden" | "optional" | "required"
+}
+
 /// UDA marking a method as an MCP prompt. The method returns the prompt's
 /// messages (a `PromptMessage[]`, a `GetPromptResult`, or a `string`).
 ///
