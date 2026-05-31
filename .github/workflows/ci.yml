@@ -52,6 +52,11 @@ jobs:
       matrix:
         compiler: [ldc-latest, dmd-latest]
         os: [ubuntu-latest, macos-latest]
+        # DMD ships no macOS/arm64 build and macos-latest is Apple Silicon,
+        # so dmd-latest cannot install there; LDC covers macOS instead.
+        exclude:
+          - compiler: dmd-latest
+            os: macos-latest
 
     steps:
       - name: Checkout
