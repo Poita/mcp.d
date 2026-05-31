@@ -97,7 +97,7 @@ void mountMcp(URLRouter router, MCPServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		handleGet(server, push, req, res);
+		handleGet(server, push, sessions, req, res);
 	});
 	router.match(HTTPMethod.DELETE, opts.path, (HTTPServerRequest req,
 			HTTPServerResponse res) @safe {
@@ -255,7 +255,7 @@ unittest  // stable revisions open the GET SSE stream; the draft does not
 }
 
 private void handleGet(MCPServer server, ServerPushChannel push,
-		HTTPServerRequest req, HTTPServerResponse res) @safe
+		SessionManager sessions, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 	// Per the transport: the server MUST either open a text/event-stream or
 	// answer 405. The draft drops the standalone GET stream (server->client
@@ -266,6 +266,26 @@ private void handleGet(MCPServer server, ServerPushChannel push,
 		res.headers["Allow"] = "POST";
 		res.writeBody("", "text/plain");
 		return;
+	}
+
+	// Session Management (basic/transports §Session Management): the GET that
+	// opens the standalone server->client stream is a "subsequent HTTP request",
+	// so when sessions are enabled the client MUST present its Mcp-Session-Id.
+	// Mirror the POST/DELETE branches: a missing header SHOULD be 400, an
+	// unknown/terminated session MUST be 404 — never open the 200 stream without
+	// a valid id.
+	if (sessions !is null)
+	{
+		const sid = req.headers.get(SessionHeader, "");
+		const status = sessionStatus(sessions, sid);
+		if (status != 0)
+		{
+			res.statusCode = cast(HTTPStatus) status;
+			res.writeBody(status == 400
+					? "Missing Mcp-Session-Id header" : "Unknown or terminated session",
+					"text/plain");
+			return;
+		}
 	}
 
 	// Open a long-lived SSE stream wired to the server-push channel, so the
@@ -591,6 +611,28 @@ unittest  // missing session id -> 400, unknown -> 404, active -> 0
 	assert(sessionStatus(mgr, "") == 400);
 	assert(sessionStatus(mgr, "bogus") == 404);
 	assert(sessionStatus(mgr, id) == 0);
+	mgr.terminate(id);
+	assert(sessionStatus(mgr, id) == 404);
+}
+
+unittest  // the standalone GET SSE stream uses the same session gate as POST/DELETE
+{
+	// basic/transports §Session Management: a GET to open the standalone
+	// server->client stream is a "subsequent HTTP request". With sessions
+	// enabled the transport MUST gate it via sessionStatus — opening the 200
+	// text/event-stream only for an active id, answering 400 when the header is
+	// absent and 404 for an unknown/terminated session (mirroring the POST and
+	// DELETE branches). Before the fix, handleGet took no SessionManager and so
+	// always returned 200 regardless of the id.
+	auto mgr = new SessionManager;
+	const id = mgr.create();
+	// absent header -> 400 (SHOULD): do not open the stream
+	assert(sessionStatus(mgr, "") == 400);
+	// unknown id -> 404 (MUST)
+	assert(sessionStatus(mgr, "no-such-session") == 404);
+	// active id -> 0: the GET may open the stream
+	assert(sessionStatus(mgr, id) == 0);
+	// after termination the same id MUST become 404, not a 200 stream
 	mgr.terminate(id);
 	assert(sessionStatus(mgr, id) == 404);
 }
