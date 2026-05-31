@@ -228,6 +228,14 @@ struct AuthorizationServerMetadata
 	/// HTTPS-URL `client_id` that points at a hosted client metadata document).
 	/// When true, a client SHOULD prefer this over Dynamic Client Registration.
 	bool clientIdMetadataDocumentSupported;
+	/// Whether this metadata was parsed from an actual authorization-server
+	/// metadata document discovered via RFC 8414 / OpenID Connect Discovery
+	/// (true), as opposed to synthesized from default endpoints for the
+	/// 2025-03-26 no-document endpoint fallback (false). The MCP authorization
+	/// spec ("Authorization Code Protection") requires clients to refuse when a
+	/// *discovered* document omits `code_challenge_methods_supported`; the
+	/// no-document fallback case is treated separately. Set by `fromJson`.
+	bool metadataDocumentDiscovered;
 
 	/// PKCE S256 support is mandatory for MCP; clients MUST refuse otherwise.
 	bool supportsS256() const @safe
@@ -252,6 +260,10 @@ struct AuthorizationServerMetadata
 		m.authorizationResponseIssParameterSupported = boolField(j,
 				"authorization_response_iss_parameter_supported");
 		m.clientIdMetadataDocumentSupported = boolField(j, "client_id_metadata_document_supported");
+		// This metadata came from a discovered RFC 8414 / OIDC document, so the
+		// spec's "refuse when code_challenge_methods_supported is absent" rule
+		// applies (see OAuthClient.requirePkceSupport).
+		m.metadataDocumentDiscovered = true;
 		return m;
 	}
 }

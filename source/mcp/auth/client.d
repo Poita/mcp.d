@@ -250,16 +250,29 @@ final class OAuthClient
 	}
 
 	/// Enforce the MCP authorization MUST around PKCE support. Per the spec
-	/// ("Authorization Code Protection"), if the authorization server *advertises*
-	/// `code_challenge_methods_supported` but it does not include "S256", the
-	/// server does not support the required PKCE method and MCP clients MUST refuse
-	/// to proceed. When the field is absent/empty (e.g. an older AS in the
-	/// 2025-03-26 endpoint-fallback flow), the client proceeds and uses S256
-	/// regardless — absence is not a signal that PKCE is unsupported. This guards
-	/// the public authorization path (`authorizationUrl`/`exchangeCode`) against
-	/// silently downgrading to an explicitly non-S256 method.
+	/// ("Authorization Code Protection"): MCP clients MUST verify PKCE support
+	/// before proceeding with authorization, relying on authorization-server
+	/// metadata. "If `code_challenge_methods_supported` is absent, the
+	/// authorization server does not support PKCE and MCP clients MUST refuse to
+	/// proceed" (and the OIDC variant mandates the same). Therefore, when the AS
+	/// metadata was discovered from a real RFC 8414 / OpenID Connect Discovery
+	/// document (`metadataDocumentDiscovered`), the client refuses unless that
+	/// document advertises S256 — covering both the absent-field case and the
+	/// present-but-non-S256 case.
+	///
+	/// The sole exception is the 2025-03-26 endpoint-fallback flow, where NO
+	/// metadata document was discovered at all and `discoverAuthServer`
+	/// synthesizes default endpoints; there `metadataDocumentDiscovered` is false
+	/// and absence is not a signal that PKCE is unsupported, so the client
+	/// proceeds and uses S256 regardless. This guards the public authorization
+	/// path (`authorizationUrl`/`exchangeCode`) against both proceeding past a
+	/// discovered document that lacks PKCE support and silently downgrading to an
+	/// explicitly non-S256 method.
 	private static void requirePkceSupport(AuthorizationServerMetadata as_) @safe
 	{
+		if (as_.metadataDocumentDiscovered && !as_.supportsS256())
+			throw invalidRequest("Authorization server metadata does not advertise S256 PKCE "
+					~ "support (code_challenge_methods_supported); MCP clients MUST refuse to proceed");
 		if (as_.codeChallengeMethodsSupported.length && !as_.supportsS256())
 			throw invalidRequest("Authorization server advertises PKCE methods without S256 "
 					~ "(code_challenge_methods_supported); MCP clients MUST refuse to proceed");
@@ -601,5 +614,65 @@ unittest  // discoverAuthServer no-metadata fallback proceeds (absence allows S2
 	assert(!as_.supportsS256());
 	auto pkce = makePkce(new ubyte[32]);
 	auto url = c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "", "");
+	assert(url.canFind("code_challenge_method=S256"));
+}
+
+unittest  // discovered AS document missing code_challenge_methods_supported -> refuse (authorizationUrl)
+{
+	import std.exception : assertThrown;
+
+	// 2025-11-25 "Authorization Code Protection": when a real RFC 8414 / OIDC
+	// metadata document was discovered but omits code_challenge_methods_supported,
+	// the AS does not support PKCE and MCP clients MUST refuse to proceed.
+	auto c = new OAuthClient();
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "https://as.example.com/authorize";
+	as_.metadataDocumentDiscovered = true; // came from a discovered document
+	// codeChallengeMethodsSupported intentionally absent.
+	auto pkce = makePkce(new ubyte[32]);
+	assertThrown(c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st"));
+}
+
+unittest  // discovered AS document missing code_challenge_methods_supported -> refuse (exchangeCode)
+{
+	import std.exception : assertThrown;
+
+	auto c = new OAuthClient();
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = "https://as.example.com/token";
+	as_.metadataDocumentDiscovered = true;
+	// codeChallengeMethodsSupported intentionally absent.
+	assertThrown(c.exchangeCode(as_, RegisteredClient("cid", ""), "code", "verifier"));
+}
+
+unittest  // AuthorizationServerMetadata.fromJson on a document lacking PKCE -> refuse
+{
+	import std.exception : assertThrown;
+	import vibe.data.json : parseJsonString;
+
+	// A genuine discovered document that omits code_challenge_methods_supported
+	// must be rejected: fromJson marks it discovered, so requirePkceSupport throws.
+	auto c = new OAuthClient();
+	auto j = parseJsonString(`{"issuer":"https://as.example.com","authorization_endpoint":"https://as.example.com/authorize"}`);
+	auto as_ = AuthorizationServerMetadata.fromJson(j);
+	assert(as_.metadataDocumentDiscovered);
+	assert(!as_.supportsS256());
+	auto pkce = makePkce(new ubyte[32]);
+	assertThrown(c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st"));
+}
+
+unittest  // discovered AS document advertising S256 -> proceeds
+{
+	import std.algorithm : canFind;
+	import vibe.data.json : parseJsonString;
+
+	auto c = new OAuthClient();
+	auto j = parseJsonString(`{"issuer":"https://as.example.com",`
+			~ `"authorization_endpoint":"https://as.example.com/authorize",`
+			~ `"code_challenge_methods_supported":["S256"]}`);
+	auto as_ = AuthorizationServerMetadata.fromJson(j);
+	assert(as_.metadataDocumentDiscovered);
+	auto pkce = makePkce(new ubyte[32]);
+	auto url = c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st");
 	assert(url.canFind("code_challenge_method=S256"));
 }
