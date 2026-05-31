@@ -1,0 +1,21 @@
+# Dependabot configuration.
+#
+# Keeps GitHub Actions versions current. Dependabot has no native dub
+# ecosystem support, so dub dependencies remain manual (periodic
+# `dub upgrade`).
+#
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "tooling"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
