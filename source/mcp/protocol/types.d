@@ -2951,6 +2951,131 @@ struct Prompt
 			p.meta = j["_meta"];
 		return p;
 	}
+
+	/// Return a copy of this `Prompt` with any fields newer than the negotiated
+	/// protocol version stripped, so the wire output stays valid for the peer's
+	/// version. `BaseMetadata.title` was introduced by 2025-06-18 (absent from
+	/// 2025-03-26 and 2024-11-05); `Prompt.icons` was introduced by 2025-11-25
+	/// (absent from every earlier version, present in draft which is
+	/// >= 2025-11-25). Mirrors `Tool.forVersion`.
+	Prompt forVersion(ProtocolVersion v) const @safe
+	{
+		Prompt projected;
+		projected.name = name;
+		projected.description = description;
+		foreach (a; arguments)
+			projected.arguments ~= a;
+		projected.meta = meta;
+		if (v >= ProtocolVersion.v2025_06_18)
+			projected.title = title;
+		if (v >= ProtocolVersion.v2025_11_25)
+		{
+			foreach (icon; icons)
+			{
+				Icon copy;
+				copy.src = icon.src;
+				copy.mimeType = icon.mimeType;
+				copy.sizes = icon.sizes.dup;
+				copy.theme = icon.theme;
+				projected.icons ~= copy;
+			}
+		}
+		return projected;
+	}
+}
+
+unittest  // Prompt.forVersion strips title for 2024-11-05 (BaseMetadata.title introduced 2025-06-18)
+{
+	Prompt p = {name: "greet"};
+	p.title = "Greeting";
+	auto j = p.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("title" !in j);
+}
+
+unittest  // Prompt.forVersion strips title for 2025-03-26 (BaseMetadata.title introduced 2025-06-18)
+{
+	Prompt p = {name: "greet"};
+	p.title = "Greeting";
+	auto j = p.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("title" !in j);
+}
+
+unittest  // Prompt.forVersion keeps title for 2025-06-18 (title introduced here)
+{
+	Prompt p = {name: "greet"};
+	p.title = "Greeting";
+	auto j = p.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert(j["title"].get!string == "Greeting");
+}
+
+unittest  // Prompt.forVersion keeps title for 2025-11-25
+{
+	Prompt p = {name: "greet"};
+	p.title = "Greeting";
+	auto j = p.forVersion(ProtocolVersion.v2025_11_25).toJson();
+	assert(j["title"].get!string == "Greeting");
+}
+
+unittest  // Prompt.forVersion keeps title for draft
+{
+	Prompt p = {name: "greet"};
+	p.title = "Greeting";
+	auto j = p.forVersion(ProtocolVersion.draft).toJson();
+	assert(j["title"].get!string == "Greeting");
+}
+
+unittest  // Prompt.forVersion strips icons for 2024-11-05 (Prompt.icons introduced 2025-11-25)
+{
+	Prompt p = {name: "greet"};
+	p.icons = [Icon("https://e/p.png", nullable("image/png"), ["16x16"])];
+	auto j = p.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("icons" !in j);
+}
+
+unittest  // Prompt.forVersion strips icons for 2025-06-18 (Prompt.icons introduced 2025-11-25)
+{
+	Prompt p = {name: "greet"};
+	p.icons = [Icon("https://e/p.png", nullable("image/png"), ["16x16"])];
+	auto j = p.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("icons" !in j);
+}
+
+unittest  // Prompt.forVersion keeps icons for 2025-11-25 (Prompt.icons introduced here)
+{
+	Prompt p = {name: "greet"};
+	p.icons = [Icon("https://e/p.png", nullable("image/png"), ["16x16"])];
+	auto j = p.forVersion(ProtocolVersion.v2025_11_25).toJson();
+	assert(j["icons"].type == Json.Type.array);
+	assert(j["icons"][0]["src"].get!string == "https://e/p.png");
+}
+
+unittest  // Prompt.forVersion keeps icons for draft (draft >= 2025-11-25)
+{
+	Prompt p = {name: "greet"};
+	p.icons = [Icon("https://e/p.png", nullable("image/png"), ["16x16"])];
+	auto j = p.forVersion(ProtocolVersion.draft).toJson();
+	assert(j["icons"].type == Json.Type.array);
+}
+
+unittest  // Prompt.forVersion preserves non-version-gated fields (name/description/arguments) intact
+{
+	Prompt p = {name: "greet", description: nullable("desc")};
+	p.arguments ~= PromptArgument("arg1");
+	auto pj = p.forVersion(ProtocolVersion.v2024_11_05);
+	assert(pj.name == "greet");
+	assert(pj.description.get == "desc");
+	assert(pj.arguments.length == 1);
+	assert(pj.arguments[0].name == "arg1");
+}
+
+unittest  // Prompt.forVersion leaves the original unmodified (returns a projected copy)
+{
+	Prompt p = {name: "greet"};
+	p.title = "Greeting";
+	p.icons = [Icon("https://e/p.png", nullable("image/png"), [])];
+	cast(void) p.forVersion(ProtocolVersion.v2024_11_05);
+	assert(!p.title.isNull);
+	assert(p.icons.length == 1);
 }
 
 /// A single message in a prompt result.
