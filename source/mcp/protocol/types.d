@@ -1648,6 +1648,168 @@ struct Root
 	}
 }
 
+/// Params of the `elicitation/create` request (client/elicitation).
+///
+/// The schema models the params as a union of a form variant and a URL variant
+/// (`ElicitRequestParams = ElicitRequestFormParams | ElicitRequestURLParams`).
+/// This struct holds the union of both shapes: `mode` is `"form"` (the default,
+/// when absent) or `"url"`. Form-mode requests carry `message` and a
+/// `requestedSchema` (a restricted JSON Schema object the handler fills in);
+/// URL-mode requests (2025-11-25+) carry `message`, `url`, and `elicitationId`
+/// for an out-of-band interaction and leave `requestedSchema` undefined. The
+/// raw request `Json` is preserved in `raw` so a handler can inspect any field
+/// the typed view does not surface.
+struct ElicitParams
+{
+	string mode = "form"; /// "form" (default) or "url"
+	string message; /// human-readable prompt shown to the user
+	Json requestedSchema = Json.undefined; /// form mode: the restricted JSON Schema
+	string url; /// url mode: the URL the user completes out-of-band
+	string elicitationId; /// url mode: correlates the request with its outcome
+	Json raw = Json.undefined; /// the full request params as received
+
+	/// True for a URL-mode request (`mode == "url"`).
+	bool isUrl() const @safe nothrow
+	{
+		return mode == "url";
+	}
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		// `mode` is omitted for the form default, exactly as the wire form
+		// expects; emitted only for the url variant (or a non-default mode).
+		if (mode.length && mode != "form")
+			j["mode"] = mode;
+		j["message"] = message;
+		if (requestedSchema.type == Json.Type.object)
+			j["requestedSchema"] = requestedSchema;
+		if (url.length)
+			j["url"] = url;
+		if (elicitationId.length)
+			j["elicitationId"] = elicitationId;
+		return j;
+	}
+
+	static ElicitParams fromJson(Json j) @safe
+	{
+		ElicitParams p;
+		p.raw = j;
+		if (j.type != Json.Type.object)
+			return p;
+		if ("mode" in j && j["mode"].type == Json.Type.string)
+			p.mode = j["mode"].get!string;
+		if ("message" in j && j["message"].type == Json.Type.string)
+			p.message = j["message"].get!string;
+		if ("requestedSchema" in j && j["requestedSchema"].type == Json.Type.object)
+			p.requestedSchema = j["requestedSchema"];
+		if ("url" in j && j["url"].type == Json.Type.string)
+			p.url = j["url"].get!string;
+		if ("elicitationId" in j && j["elicitationId"].type == Json.Type.string)
+			p.elicitationId = j["elicitationId"].get!string;
+		return p;
+	}
+}
+
+/// The user's decision on an elicitation request.
+enum ElicitAction
+{
+	accept, /// the user submitted the requested input
+	decline, /// the user explicitly declined
+	cancel, /// the user dismissed without choosing
+}
+
+/// Result of the `elicitation/create` request (client/elicitation).
+///
+/// `action` is the user's decision (`accept` / `decline` / `cancel`). For an
+/// `accept`, `content` carries the collected values keyed by schema property
+/// name (each a string, number, boolean, or string array per the schema); it is
+/// omitted for `decline`/`cancel`.
+struct ElicitResult
+{
+	ElicitAction action; /// the user's decision
+	Json content = Json.undefined; /// accept: the collected `{name: value}` map
+	Json meta = Json.undefined; /// optional `_meta` object
+
+	/// Convenience constructor for an `accept` carrying collected `content`.
+	static ElicitResult accept(Json content) @safe
+	{
+		ElicitResult r;
+		r.action = ElicitAction.accept;
+		r.content = content;
+		return r;
+	}
+
+	/// Convenience constructor for a `decline` (no content).
+	static ElicitResult decline() @safe
+	{
+		ElicitResult r;
+		r.action = ElicitAction.decline;
+		return r;
+	}
+
+	/// Convenience constructor for a `cancel` (no content).
+	static ElicitResult cancel() @safe
+	{
+		ElicitResult r;
+		r.action = ElicitAction.cancel;
+		return r;
+	}
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		final switch (action)
+		{
+		case ElicitAction.accept:
+			j["action"] = "accept";
+			break;
+		case ElicitAction.decline:
+			j["action"] = "decline";
+			break;
+		case ElicitAction.cancel:
+			j["action"] = "cancel";
+			break;
+		}
+		// Per the schema `content` is only meaningful for `accept`; emit it only
+		// when present so decline/cancel stay `{action}`-only on the wire.
+		if (action == ElicitAction.accept && content.type == Json.Type.object)
+			j["content"] = content;
+		if (meta.type == Json.Type.object)
+			j["_meta"] = meta;
+		return j;
+	}
+
+	static ElicitResult fromJson(Json j) @safe
+	{
+		ElicitResult r;
+		if (j.type != Json.Type.object)
+			return r;
+		if ("action" in j && j["action"].type == Json.Type.string)
+		{
+			switch (j["action"].get!string)
+			{
+			case "accept":
+				r.action = ElicitAction.accept;
+				break;
+			case "decline":
+				r.action = ElicitAction.decline;
+				break;
+			case "cancel":
+				r.action = ElicitAction.cancel;
+				break;
+			default:
+				break;
+			}
+		}
+		if ("content" in j && j["content"].type == Json.Type.object)
+			r.content = j["content"];
+		if ("_meta" in j && j["_meta"].type == Json.Type.object)
+			r.meta = j["_meta"];
+		return r;
+	}
+}
+
 /// Result of the `roots/list` request (client/roots).
 struct ListRootsResult
 {
@@ -1742,6 +1904,95 @@ unittest  // ListRootsResult round-trips through fromJson
 	assert(back.roots.length == 1);
 	assert(back.roots[0].uri == "file:///x");
 	assert(back.roots[0].name.get == "x");
+}
+
+unittest  // ElicitParams parses a form-mode request (mode defaults to form)
+{
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json p = Json.emptyObject;
+	p["message"] = "Your name?";
+	p["requestedSchema"] = schema;
+	auto parsed = ElicitParams.fromJson(p);
+	assert(parsed.mode == "form");
+	assert(!parsed.isUrl);
+	assert(parsed.message == "Your name?");
+	assert(parsed.requestedSchema.type == Json.Type.object);
+	assert(parsed.url.length == 0);
+}
+
+unittest  // ElicitParams parses a url-mode request and preserves raw
+{
+	Json p = Json.emptyObject;
+	p["mode"] = "url";
+	p["message"] = "Approve";
+	p["url"] = "https://example.com/consent";
+	p["elicitationId"] = "e1";
+	auto parsed = ElicitParams.fromJson(p);
+	assert(parsed.isUrl);
+	assert(parsed.url == "https://example.com/consent");
+	assert(parsed.elicitationId == "e1");
+	assert("requestedSchema" !in parsed.raw); // raw is the original params
+}
+
+unittest  // ElicitParams.toJson omits mode for the form default
+{
+	ElicitParams p;
+	p.message = "Pick one";
+	auto j = p.toJson();
+	assert("mode" !in j);
+	assert(j["message"].get!string == "Pick one");
+}
+
+unittest  // ElicitParams.toJson emits mode for url variant
+{
+	ElicitParams p;
+	p.mode = "url";
+	p.message = "Approve";
+	p.url = "https://example.com";
+	p.elicitationId = "e1";
+	auto j = p.toJson();
+	assert(j["mode"].get!string == "url");
+	assert(j["url"].get!string == "https://example.com");
+	assert(j["elicitationId"].get!string == "e1");
+}
+
+unittest  // ElicitResult.accept emits {action, content}
+{
+	auto r = ElicitResult.accept(Json(["name": Json("Ada")]));
+	auto j = r.toJson();
+	assert(j["action"].get!string == "accept");
+	assert(j["content"]["name"].get!string == "Ada");
+}
+
+unittest  // ElicitResult.decline emits only the action (no content)
+{
+	auto j = ElicitResult.decline().toJson();
+	assert(j["action"].get!string == "decline");
+	assert("content" !in j);
+}
+
+unittest  // ElicitResult.cancel emits only the action (no content)
+{
+	auto j = ElicitResult.cancel().toJson();
+	assert(j["action"].get!string == "cancel");
+	assert("content" !in j);
+}
+
+unittest  // ElicitResult round-trips an accept through fromJson
+{
+	auto r = ElicitResult.accept(Json(["age": Json(30)]));
+	auto back = ElicitResult.fromJson(r.toJson());
+	assert(back.action == ElicitAction.accept);
+	assert(back.content["age"].get!int == 30);
+}
+
+unittest  // ElicitResult.fromJson parses decline
+{
+	Json j = Json.emptyObject;
+	j["action"] = "decline";
+	auto r = ElicitResult.fromJson(j);
+	assert(r.action == ElicitAction.decline);
 }
 
 unittest  // Resource emits annotations (audience/priority/lastModified)
