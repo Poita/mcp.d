@@ -117,6 +117,7 @@ final class MCPServer
 {
 	private string serverName;
 	private string serverVersion;
+	private Implementation serverInfo_;
 	private Nullable!string instructions;
 	private RegisteredTool[string] tools;
 	private RegisteredResource[string] resources;
@@ -160,8 +161,21 @@ final class MCPServer
 
 	this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
 	{
-		this.serverName = name;
-		this.serverVersion = version_;
+		this(Implementation(name, version_), instructions);
+	}
+
+	/// Construct a server from a fully-populated `Implementation`, letting the
+	/// author advertise a display `title` (>= 2025-06-18) plus `description`,
+	/// `websiteUrl`, and `icons` (>= 2025-11-25) in the `initialize` /
+	/// `server/discover` `serverInfo`. Fields newer than the negotiated protocol
+	/// version are stripped from the wire response (see `Implementation.forVersion`),
+	/// so older peers see only what they understand. Mirrors the client's full
+	/// `Implementation clientInfo` support.
+	this(Implementation serverInfo, Nullable!string instructions = Nullable!string.init) @safe
+	{
+		this.serverInfo_ = serverInfo;
+		this.serverName = serverInfo.name;
+		this.serverVersion = serverInfo.version_;
 		this.instructions = instructions;
 	}
 
@@ -975,7 +989,7 @@ final class MCPServer
 		foreach (v; supportedVersions)
 			d.protocolVersions ~= v.toWire;
 		d.capabilities = capabilities();
-		d.serverInfo = Implementation(serverName, serverVersion);
+		d.serverInfo = serverInfo_.forVersion(ProtocolVersion.draft);
 		d.instructions = instructions;
 		return d.toJson();
 	}
@@ -1247,7 +1261,7 @@ final class MCPServer
 		InitializeResult result;
 		result.protocolVersion = negotiated.toWire;
 		result.capabilities = capabilities();
-		result.serverInfo = Implementation(serverName, serverVersion);
+		result.serverInfo = serverInfo_.forVersion(negotiated);
 		result.instructions = instructions;
 		return result.toJson();
 	}
@@ -1463,6 +1477,106 @@ unittest  // initialize negotiates the requested version and reports server info
 	assert(resp["result"]["protocolVersion"].get!string == "2025-06-18");
 	assert(resp["result"]["serverInfo"]["name"].get!string == "test-srv");
 	assert(resp["result"]["capabilities"]["tools"].type == Json.Type.object);
+}
+
+unittest  // Implementation constructor advertises full serverInfo on 2025-11-25
+{
+	Implementation info = {
+		name: "rich-srv", version_: "2.0", title: nullable("Rich Server"),
+		description: nullable("a helpful server"),
+		websiteUrl: nullable("https://example.com"), icons: [
+				Icon("https://example.com/i.png")
+		]
+	};
+	auto s = new MCPServer(info);
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-11-25";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+
+	auto resp = s.handle(req(1, "initialize", params)).get;
+	auto si = resp["result"]["serverInfo"];
+	assert(si["name"].get!string == "rich-srv");
+	assert(si["version"].get!string == "2.0");
+	assert(si["title"].get!string == "Rich Server");
+	assert(si["description"].get!string == "a helpful server");
+	assert(si["websiteUrl"].get!string == "https://example.com");
+	assert(si["icons"].length == 1);
+}
+
+unittest  // serverInfo strips 2025-11-25-only fields when negotiating 2025-06-18
+{
+	Implementation info = {
+		name: "rich-srv", version_: "2.0", title: nullable("Rich Server"),
+		description: nullable("a helpful server"),
+		websiteUrl: nullable("https://example.com"), icons: [
+				Icon("https://example.com/i.png")
+		]
+	};
+	auto s = new MCPServer(info);
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-06-18";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+
+	auto resp = s.handle(req(1, "initialize", params)).get;
+	auto si = resp["result"]["serverInfo"];
+	assert(si["title"].get!string == "Rich Server");
+	assert("description" !in si);
+	assert("websiteUrl" !in si);
+	assert("icons" !in si);
+}
+
+unittest  // serverInfo strips title when negotiating 2025-03-26 (pre-BaseMetadata.title)
+{
+	Implementation info = {
+		name: "rich-srv", version_: "2.0", title: nullable("Rich Server")
+	};
+	auto s = new MCPServer(info);
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-03-26";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+
+	auto resp = s.handle(req(1, "initialize", params)).get;
+	auto si = resp["result"]["serverInfo"];
+	assert(si["name"].get!string == "rich-srv");
+	assert("title" !in si);
+}
+
+unittest  // legacy (name, version) constructor still emits a minimal serverInfo
+{
+	auto s = new MCPServer("plain-srv", "1.0");
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-11-25";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+
+	auto resp = s.handle(req(1, "initialize", params)).get;
+	auto si = resp["result"]["serverInfo"];
+	assert(si["name"].get!string == "plain-srv");
+	assert(si["version"].get!string == "1.0");
+	assert("title" !in si);
+	assert("description" !in si);
+}
+
+unittest  // server/discover (draft) emits the full stored serverInfo
+{
+	Implementation info = {
+		name: "rich-srv", version_: "2.0", title: nullable("Rich Server"),
+		description: nullable("a helpful server"),
+		websiteUrl: nullable("https://example.com"), icons: [
+				Icon("https://example.com/i.png")
+		]
+	};
+	auto s = new MCPServer(info);
+	auto resp = s.handle(req(1, "server/discover")).get;
+	auto si = resp["result"]["serverInfo"];
+	assert(si["name"].get!string == "rich-srv");
+	assert(si["title"].get!string == "Rich Server");
+	assert(si["description"].get!string == "a helpful server");
+	assert(si["websiteUrl"].get!string == "https://example.com");
+	assert(si["icons"].length == 1);
 }
 
 unittest  // initialize falls back to latest stable for an unknown version
