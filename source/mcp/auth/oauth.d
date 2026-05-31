@@ -850,8 +850,8 @@ string buildAuthorizationUrl(string authorizationEndpoint, string clientId,
 /// Build the `application/x-www-form-urlencoded` body for the authorization-code
 /// token request. `clientSecret` is included only for the `client_secret_post`
 /// auth method (pass empty otherwise).
-string buildAuthCodeTokenForm(string code, string redirectUri, string codeVerifier,
-		string clientId, string resource, string clientSecretForPost = "") @safe
+package string buildAuthCodeTokenForm(string code, string redirectUri,
+		string codeVerifier, string clientId, string resource, string clientSecretForPost = "") @safe
 {
 	auto body_ = "grant_type=authorization_code";
 	body_ ~= "&code=" ~ enc(code);
@@ -866,7 +866,7 @@ string buildAuthCodeTokenForm(string code, string redirectUri, string codeVerifi
 }
 
 /// Build the token-request body for the `client_credentials` grant.
-string buildClientCredentialsForm(string clientId, string scopeStr,
+package string buildClientCredentialsForm(string clientId, string scopeStr,
 		string resource, string clientSecretForPost = "") @safe
 {
 	auto body_ = "grant_type=client_credentials";
@@ -882,7 +882,7 @@ string buildClientCredentialsForm(string clientId, string scopeStr,
 
 /// Build an RFC 8693 token-exchange request body (used by the cross-app /
 /// identity-assertion grant to swap an IdP id_token for an ID-JAG assertion).
-string buildTokenExchangeForm(string subjectToken, string subjectTokenType,
+package string buildTokenExchangeForm(string subjectToken, string subjectTokenType,
 		string requestedTokenType, string audience, string resource, string clientId) @safe
 {
 	auto body_ = "grant_type=" ~ enc("urn:ietf:params:oauth:grant-type:token-exchange");
@@ -901,7 +901,8 @@ string buildTokenExchangeForm(string subjectToken, string subjectTokenType,
 
 /// Build an RFC 7523 JWT-bearer grant request body (exchange an assertion JWT
 /// for an access token).
-string buildJwtBearerForm(string assertion, string scopeStr, string resource, string clientId) @safe
+package string buildJwtBearerForm(string assertion, string scopeStr,
+		string resource, string clientId) @safe
 {
 	auto body_ = "grant_type=" ~ enc("urn:ietf:params:oauth:grant-type:jwt-bearer");
 	body_ ~= "&assertion=" ~ enc(assertion);
@@ -915,7 +916,7 @@ string buildJwtBearerForm(string assertion, string scopeStr, string resource, st
 }
 
 /// Build the token-request body for refreshing an access token.
-string buildRefreshTokenForm(string refreshToken, string clientId, string resource) @safe
+package string buildRefreshTokenForm(string refreshToken, string clientId, string resource) @safe
 {
 	auto body_ = "grant_type=refresh_token";
 	body_ ~= "&refresh_token=" ~ enc(refreshToken);
@@ -995,7 +996,7 @@ unittest  // basic auth header is base64(client:secret)
 }
 
 /// Extract a query-string parameter value from a URL (URL-decoded), or "".
-string extractQueryParam(string url, string key) @safe
+package string extractQueryParam(string url, string key) @safe
 {
 	import std.string : indexOf;
 	import std.uri : decodeComponent;

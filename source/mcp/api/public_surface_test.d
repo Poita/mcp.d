@@ -27,6 +27,25 @@ version (unittest)
 
 			mixin("alias _ = " ~ sym ~ ";");
 		});
+
+	// Helper: is the fully-qualified module member `fqn` reachable by name from
+	// this module (`mcp.api.public_surface_test`, in package `mcp.api`)? A
+	// symbol demoted to plain `package` visibility lives in package `mcp.auth`
+	// and therefore must NOT resolve here, even though the importing module is
+	// itself under the `mcp` tree (issue #303).
+	private enum reachableHere(string fqn) = __traits(compiles, {
+			mixin("import " ~ moduleOf(fqn) ~ ";");
+			mixin("alias _ = " ~ fqn ~ ";");
+		});
+
+	private string moduleOf(string fqn)
+	{
+		size_t idx = 0;
+		foreach (i, c; fqn)
+			if (c == '.')
+				idx = i;
+		return fqn[0 .. idx];
+	}
 }
 
 // The curated top-level surface stays reachable from `import mcp;`.
@@ -100,4 +119,54 @@ unittest
 {
 	static assert(visibleFromAuth!"jwtVerifier");
 	static assert(visibleFromAuth!"introspectionVerifier");
+}
+
+// jwt_verifier internals are package-private: not reachable from another
+// sub-package of the mcp tree (issue #303). Only jwtVerifier / JwtVerifierConfig
+// / TokenInfo are documented entry points.
+unittest
+{
+	static assert(!reachableHere!"mcp.auth.jwt_verifier.verifyJws");
+	static assert(!reachableHere!"mcp.auth.jwt_verifier.jwkToPem");
+	static assert(!reachableHere!"mcp.auth.jwt_verifier.parseJwks");
+	static assert(!reachableHere!"mcp.auth.jwt_verifier.base64UrlDecode");
+	static assert(!reachableHere!"mcp.auth.jwt_verifier.validateClaims");
+}
+
+// The JWT verifier's key-source machinery is internal too (issue #303).
+unittest
+{
+	static assert(!reachableHere!"mcp.auth.jwt_verifier.Jwk");
+	static assert(!reachableHere!"mcp.auth.jwt_verifier.KeySource");
+	static assert(!reachableHere!"mcp.auth.jwt_verifier.JwksCache");
+	static assert(!reachableHere!"mcp.auth.jwt_verifier.verifyToken");
+}
+
+// The documented JWT entry points stay public (issue #303).
+unittest
+{
+	static assert(reachableHere!"mcp.auth.jwt_verifier.jwtVerifier");
+	static assert(reachableHere!"mcp.auth.jwt_verifier.JwtVerifierConfig");
+}
+
+// OAuth request-form builders + query-param extraction are internal helpers,
+// not part of the documented public surface (issue #303).
+unittest
+{
+	static assert(!reachableHere!"mcp.auth.oauth.buildAuthCodeTokenForm");
+	static assert(!reachableHere!"mcp.auth.oauth.buildClientCredentialsForm");
+	static assert(!reachableHere!"mcp.auth.oauth.buildTokenExchangeForm");
+	static assert(!reachableHere!"mcp.auth.oauth.buildJwtBearerForm");
+	static assert(!reachableHere!"mcp.auth.oauth.buildRefreshTokenForm");
+	static assert(!reachableHere!"mcp.auth.oauth.extractQueryParam");
+}
+
+// MCPServer.toolInputSchema is a core->transport hook, not external API: its
+// visibility is `package` (package(mcp)), not `public` (issue #303).
+unittest
+{
+	import mcp.server.server : McpServer;
+
+	static assert(__traits(getProtection, __traits(getMember, McpServer,
+			"toolInputSchema")) == "package");
 }
