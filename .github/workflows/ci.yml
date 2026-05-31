@@ -80,3 +80,30 @@ jobs:
 
       - name: Test
         run: dub test
+
+  coverage:
+    name: coverage to Codecov
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install D compiler
+        uses: dlang-community/setup-dlang@v1
+        with:
+          compiler: ldc-latest
+
+      # `dub test --coverage` builds the unittest binary with code coverage
+      # instrumentation and runs it, emitting one `.lst` file per module in the
+      # repo root. Codecov's uploader parses D's `.lst` coverage format directly.
+      - name: Test with coverage
+        run: dub test --coverage
+
+      # Works on private repos when CODECOV_TOKEN is set in repo secrets.
+      # fail_ci_if_error stays false so a transient Codecov outage never blocks CI.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./*.lst
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
