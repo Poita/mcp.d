@@ -23,9 +23,9 @@ import std.typecons : Nullable;
 /// same method.
 struct tool
 {
-    string name;
-    string description;
-    string title; /// optional human-readable display name (empty = unset)
+	string name;
+	string description;
+	string title; /// optional human-readable display name (empty = unset)
 }
 
 /// UDA declaring optional behavioral hints (the MCP spec's `ToolAnnotations`)
@@ -41,10 +41,10 @@ struct tool
 /// ---
 struct toolAnnotations
 {
-    Nullable!bool readOnlyHint;
-    Nullable!bool destructiveHint;
-    Nullable!bool idempotentHint;
-    Nullable!bool openWorldHint;
+	Nullable!bool readOnlyHint;
+	Nullable!bool destructiveHint;
+	Nullable!bool idempotentHint;
+	Nullable!bool openWorldHint;
 }
 
 /// UDA declaring a `@tool`-annotated method's per-tool task-augmented execution
@@ -60,7 +60,7 @@ struct toolAnnotations
 /// ---
 struct toolExecution
 {
-    string taskSupport; /// "forbidden" | "optional" | "required"
+	string taskSupport; /// "forbidden" | "optional" | "required"
 }
 
 /// UDA marking a method as an MCP prompt. The method returns the prompt's
@@ -70,27 +70,27 @@ struct toolExecution
 /// is independent of the programmatic `name`.
 struct prompt
 {
-    string name;
-    string description;
-    string title; /// optional human-readable display name (empty = unset)
+	string name;
+	string description;
+	string title; /// optional human-readable display name (empty = unset)
 }
 
 /// UDA marking a method as a static MCP resource. The method takes no arguments
 /// and returns the resource contents (`string`, or a `ResourceContents`).
 struct resource
 {
-    string uri;
-    string name;
-    string mimeType;
+	string uri;
+	string name;
+	string mimeType;
 }
 
 /// UDA marking a method as a resource template (URI contains `{var}`
 /// placeholders). The method receives the captured parameters as its arguments.
 struct resourceTemplate
 {
-    string uriTemplate;
-    string name;
-    string mimeType;
+	string uriTemplate;
+	string name;
+	string mimeType;
 }
 
 /// UDA declaring optional MCP `Annotations` (audience / priority /
@@ -107,17 +107,17 @@ struct resourceTemplate
 /// ---
 struct resourceAnnotations
 {
-    string[] audience; /// intended audience, e.g. ["user", "assistant"]
-    Nullable!double priority; /// importance 0.0..1.0
-    Nullable!string lastModified; /// ISO 8601 last-modified timestamp
+	string[] audience; /// intended audience, e.g. ["user", "assistant"]
+	Nullable!double priority; /// importance 0.0..1.0
+	Nullable!string lastModified; /// ISO 8601 last-modified timestamp
 }
 
 /// Optional per-parameter description, attached to a function parameter or used
 /// alongside `@tool` to document a named argument.
 struct describe
 {
-    string parameter;
-    string description;
+	string parameter;
+	string description;
 }
 
 /// UDA marking a `@tool` parameter as mirrored into an HTTP request header.
@@ -137,5 +137,5 @@ struct describe
 /// ---
 struct mcpHeader
 {
-    string name; /// the header suffix, e.g. "Region" -> `Mcp-Param-Region`
+	string name; /// the header suffix, e.g. "Region" -> `Mcp-Param-Region`
 }

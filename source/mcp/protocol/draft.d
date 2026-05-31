@@ -11,12 +11,11 @@ import mcp.protocol.versions : ProtocolVersion;
 /// Reserved `_meta` keys defined by the draft (2026-07-28) revision.
 enum MetaKey : string
 {
-    protocolVersion = "io.modelcontextprotocol/protocolVersion",
-    clientInfo = "io.modelcontextprotocol/clientInfo",
-    clientCapabilities
-        = "io.modelcontextprotocol/clientCapabilities",
-    logLevel = "io.modelcontextprotocol/logLevel",
-    subscriptionId = "io.modelcontextprotocol/subscriptionId",
+	protocolVersion = "io.modelcontextprotocol/protocolVersion",
+	clientInfo = "io.modelcontextprotocol/clientInfo",
+	clientCapabilities = "io.modelcontextprotocol/clientCapabilities",
+	logLevel = "io.modelcontextprotocol/logLevel",
+	subscriptionId = "io.modelcontextprotocol/subscriptionId",
 }
 
 // ===========================================================================
@@ -33,29 +32,29 @@ enum MetaKey : string
 /// for MCP use (see `isReservedMetaPrefix`).
 bool isValidMetaKey(string key) @safe pure nothrow
 {
-    if (key.length == 0)
-        return false;
+	if (key.length == 0)
+		return false;
 
-    string prefix;
-    string name;
-    // The prefix, if present, is everything up to and including the final '/'.
-    ptrdiff_t slash = -1;
-    foreach (i, char c; key)
-        if (c == '/')
-            slash = i;
-    if (slash >= 0)
-    {
-        prefix = key[0 .. slash]; // labels without the trailing slash
-        name = key[slash + 1 .. $];
-    }
-    else
-    {
-        name = key;
-    }
+	string prefix;
+	string name;
+	// The prefix, if present, is everything up to and including the final '/'.
+	ptrdiff_t slash = -1;
+	foreach (i, char c; key)
+		if (c == '/')
+			slash = i;
+	if (slash >= 0)
+	{
+		prefix = key[0 .. slash]; // labels without the trailing slash
+		name = key[slash + 1 .. $];
+	}
+	else
+	{
+		name = key;
+	}
 
-    if (slash >= 0 && !isValidMetaPrefixLabels(prefix))
-        return false;
-    return isValidMetaName(name);
+	if (slash >= 0 && !isValidMetaPrefixLabels(prefix))
+		return false;
+	return isValidMetaName(name);
 }
 
 /// Validate the label portion of a prefix (everything before the trailing `/`).
@@ -63,59 +62,59 @@ bool isValidMetaKey(string key) @safe pure nothrow
 /// or digit, and may contain hyphens in the interior.
 private bool isValidMetaPrefixLabels(string labels) @safe pure nothrow
 {
-    if (labels.length == 0)
-        return false; // a bare "/name" has an empty prefix, which is invalid
-    size_t start = 0;
-    bool any = false;
-    for (size_t i = 0; i <= labels.length; i++)
-    {
-        if (i == labels.length || labels[i] == '.')
-        {
-            if (!isValidMetaLabel(labels[start .. i]))
-                return false;
-            any = true;
-            start = i + 1;
-        }
-    }
-    return any;
+	if (labels.length == 0)
+		return false; // a bare "/name" has an empty prefix, which is invalid
+	size_t start = 0;
+	bool any = false;
+	for (size_t i = 0; i <= labels.length; i++)
+	{
+		if (i == labels.length || labels[i] == '.')
+		{
+			if (!isValidMetaLabel(labels[start .. i]))
+				return false;
+			any = true;
+			start = i + 1;
+		}
+	}
+	return any;
 }
 
 private bool isValidMetaLabel(string label) @safe pure nothrow
 {
-    if (label.length == 0)
-        return false;
-    if (!isAlpha(label[0]))
-        return false;
-    if (!isAlphaNum(label[$ - 1]))
-        return false;
-    foreach (char c; label)
-        if (!isAlphaNum(c) && c != '-')
-            return false;
-    return true;
+	if (label.length == 0)
+		return false;
+	if (!isAlpha(label[0]))
+		return false;
+	if (!isAlphaNum(label[$ - 1]))
+		return false;
+	foreach (char c; label)
+		if (!isAlphaNum(c) && c != '-')
+			return false;
+	return true;
 }
 
 private bool isValidMetaName(string name) @safe pure nothrow
 {
-    // Per the spec's Name rule ("Unless empty, MUST begin and end with an
-    // alphanumeric character"), an empty name segment is valid.
-    if (name.length == 0)
-        return true;
-    if (!isAlphaNum(name[0]) || !isAlphaNum(name[$ - 1]))
-        return false;
-    foreach (char c; name)
-        if (!isAlphaNum(c) && c != '-' && c != '_' && c != '.')
-            return false;
-    return true;
+	// Per the spec's Name rule ("Unless empty, MUST begin and end with an
+	// alphanumeric character"), an empty name segment is valid.
+	if (name.length == 0)
+		return true;
+	if (!isAlphaNum(name[0]) || !isAlphaNum(name[$ - 1]))
+		return false;
+	foreach (char c; name)
+		if (!isAlphaNum(c) && c != '-' && c != '_' && c != '.')
+			return false;
+	return true;
 }
 
 private bool isAlpha(char c) @safe pure nothrow
 {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
 private bool isAlphaNum(char c) @safe pure nothrow
 {
-    return isAlpha(c) || (c >= '0' && c <= '9');
+	return isAlpha(c) || (c >= '0' && c <= '9');
 }
 
 /// Whether a `_meta` key's prefix is reserved for MCP use, applying the rule for
@@ -129,36 +128,36 @@ private bool isAlphaNum(char c) @safe pure nothrow
 /// known, since 2025-06-18 uses a broader rule (see below).
 bool isReservedMetaPrefix(string key) @safe pure nothrow
 {
-    ptrdiff_t slash = -1;
-    foreach (i, char c; key)
-        if (c == '/')
-            slash = i;
-    if (slash < 0)
-        return false;
-    auto labels = key[0 .. slash];
+	ptrdiff_t slash = -1;
+	foreach (i, char c; key)
+		if (c == '/')
+			slash = i;
+	if (slash < 0)
+		return false;
+	auto labels = key[0 .. slash];
 
-    // Collect the second dot-separated label, if any.
-    size_t start = 0;
-    size_t idx = 0;
-    string second;
-    bool haveSecond = false;
-    for (size_t i = 0; i <= labels.length; i++)
-    {
-        if (i == labels.length || labels[i] == '.')
-        {
-            if (idx == 1)
-            {
-                second = labels[start .. i];
-                haveSecond = true;
-                break;
-            }
-            idx++;
-            start = i + 1;
-        }
-    }
-    if (!haveSecond)
-        return false;
-    return second == "modelcontextprotocol" || second == "mcp";
+	// Collect the second dot-separated label, if any.
+	size_t start = 0;
+	size_t idx = 0;
+	string second;
+	bool haveSecond = false;
+	for (size_t i = 0; i <= labels.length; i++)
+	{
+		if (i == labels.length || labels[i] == '.')
+		{
+			if (idx == 1)
+			{
+				second = labels[start .. i];
+				haveSecond = true;
+				break;
+			}
+			idx++;
+			start = i + 1;
+		}
+	}
+	if (!haveSecond)
+		return false;
+	return second == "modelcontextprotocol" || second == "mcp";
 }
 
 /// Whether a `_meta` key's prefix is reserved for MCP use under the effective
@@ -176,41 +175,41 @@ bool isReservedMetaPrefix(string key) @safe pure nothrow
 ///   single-argument overload), where `com.example.mcp/` is NOT reserved.
 bool isReservedMetaPrefix(string key, ProtocolVersion v) @safe pure nothrow
 {
-    // 2025-11-25 and the draft use the narrower "second label" rule.
-    if (v >= ProtocolVersion.v2025_11_25)
-        return isReservedMetaPrefix(key);
+	// 2025-11-25 and the draft use the narrower "second label" rule.
+	if (v >= ProtocolVersion.v2025_11_25)
+		return isReservedMetaPrefix(key);
 
-    // 2025-06-18 (and earlier, as a safe superset): an mcp-token in any label
-    // position that is followed by at least one further label reserves the prefix.
-    ptrdiff_t slash = -1;
-    foreach (i, char c; key)
-        if (c == '/')
-            slash = i;
-    if (slash < 0)
-        return false;
-    auto labels = key[0 .. slash];
+	// 2025-06-18 (and earlier, as a safe superset): an mcp-token in any label
+	// position that is followed by at least one further label reserves the prefix.
+	ptrdiff_t slash = -1;
+	foreach (i, char c; key)
+		if (c == '/')
+			slash = i;
+	if (slash < 0)
+		return false;
+	auto labels = key[0 .. slash];
 
-    size_t start = 0;
-    size_t labelIndex = 0;
-    size_t labelCount = 0;
-    // First count the labels so we can tell whether an mcp-token has a trailing label.
-    for (size_t i = 0; i <= labels.length; i++)
-        if (i == labels.length || labels[i] == '.')
-            labelCount++;
+	size_t start = 0;
+	size_t labelIndex = 0;
+	size_t labelCount = 0;
+	// First count the labels so we can tell whether an mcp-token has a trailing label.
+	for (size_t i = 0; i <= labels.length; i++)
+		if (i == labels.length || labels[i] == '.')
+			labelCount++;
 
-    for (size_t i = 0; i <= labels.length; i++)
-    {
-        if (i == labels.length || labels[i] == '.')
-        {
-            auto label = labels[start .. i];
-            // Reserved only if this mcp-token is followed by at least one more label.
-            if ((label == "modelcontextprotocol" || label == "mcp") && labelIndex + 1 < labelCount)
-                return true;
-            labelIndex++;
-            start = i + 1;
-        }
-    }
-    return false;
+	for (size_t i = 0; i <= labels.length; i++)
+	{
+		if (i == labels.length || labels[i] == '.')
+		{
+			auto label = labels[start .. i];
+			// Reserved only if this mcp-token is followed by at least one more label.
+			if ((label == "modelcontextprotocol" || label == "mcp") && labelIndex + 1 < labelCount)
+				return true;
+			labelIndex++;
+			start = i + 1;
+		}
+	}
+	return false;
 }
 
 /// Validate a user-supplied `_meta` key for attachment: it MUST be a
@@ -220,7 +219,7 @@ bool isReservedMetaPrefix(string key, ProtocolVersion v) @safe pure nothrow
 /// `ProtocolVersion` to apply the rule for a specific connection.
 bool isUserMetaKeyAllowed(string key) @safe pure nothrow
 {
-    return isValidMetaKey(key) && !isReservedMetaPrefix(key);
+	return isValidMetaKey(key) && !isReservedMetaPrefix(key);
 }
 
 /// Validate a user-supplied `_meta` key for attachment under the effective
@@ -228,7 +227,7 @@ bool isUserMetaKeyAllowed(string key) @safe pure nothrow
 /// MCP-reserved for that version.
 bool isUserMetaKeyAllowed(string key, ProtocolVersion v) @safe pure nothrow
 {
-    return isValidMetaKey(key) && !isReservedMetaPrefix(key, v);
+	return isValidMetaKey(key) && !isReservedMetaPrefix(key, v);
 }
 
 /// Stamp the draft `io.modelcontextprotocol/subscriptionId` (`MetaKey.subscriptionId`)
@@ -243,155 +242,155 @@ bool isUserMetaKeyAllowed(string key, ProtocolVersion v) @safe pure nothrow
 /// `params`, so the key is nested as `params._meta.<subscriptionId>`.
 Json withSubscriptionId(Json notification, string subscriptionId) @safe
 {
-    if (subscriptionId.length == 0)
-        return notification;
+	if (subscriptionId.length == 0)
+		return notification;
 
-    Json n = notification.clone();
-    Json params = ("params" in n && n["params"].type == Json.Type.object) ? n["params"]
-        : Json.emptyObject;
-    Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"]
-        : Json.emptyObject;
-    meta[MetaKey.subscriptionId] = subscriptionId;
-    params["_meta"] = meta;
-    n["params"] = params;
-    return n;
+	Json n = notification.clone();
+	Json params = ("params" in n && n["params"].type == Json.Type.object) ? n["params"]
+		: Json.emptyObject;
+	Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"]
+		: Json.emptyObject;
+	meta[MetaKey.subscriptionId] = subscriptionId;
+	params["_meta"] = meta;
+	n["params"] = params;
+	return n;
 }
 
 unittest  // withSubscriptionId stamps the listen request id into params._meta
 {
-    auto n = Json([
-        "jsonrpc": Json("2.0"),
-        "method": Json("notifications/tools/list_changed")
-    ]);
-    auto stamped = withSubscriptionId(n, "listen-7");
-    assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "listen-7");
-    // The original is left untouched.
-    assert("params" !in n);
+	auto n = Json([
+		"jsonrpc": Json("2.0"),
+		"method": Json("notifications/tools/list_changed")
+	]);
+	auto stamped = withSubscriptionId(n, "listen-7");
+	assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "listen-7");
+	// The original is left untouched.
+	assert("params" !in n);
 }
 
 unittest  // withSubscriptionId preserves an existing params payload and _meta entries
 {
-    Json params = Json.emptyObject;
-    params["uri"] = "file:///x";
-    Json meta = Json.emptyObject;
-    meta["other.vendor/flag"] = true;
-    params["_meta"] = meta;
-    auto n = Json([
-        "jsonrpc": Json("2.0"),
-        "method": Json("notifications/resources/updated"),
-        "params": params
-    ]);
-    auto stamped = withSubscriptionId(n, "id-42");
-    assert(stamped["params"]["uri"].get!string == "file:///x");
-    assert(stamped["params"]["_meta"]["other.vendor/flag"].get!bool);
-    assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "id-42");
+	Json params = Json.emptyObject;
+	params["uri"] = "file:///x";
+	Json meta = Json.emptyObject;
+	meta["other.vendor/flag"] = true;
+	params["_meta"] = meta;
+	auto n = Json([
+		"jsonrpc": Json("2.0"),
+		"method": Json("notifications/resources/updated"),
+		"params": params
+	]);
+	auto stamped = withSubscriptionId(n, "id-42");
+	assert(stamped["params"]["uri"].get!string == "file:///x");
+	assert(stamped["params"]["_meta"]["other.vendor/flag"].get!bool);
+	assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "id-42");
 }
 
 unittest  // withSubscriptionId with an empty id is a no-op
 {
-    auto n = Json([
-        "jsonrpc": Json("2.0"),
-        "method": Json("notifications/message")
-    ]);
-    auto same = withSubscriptionId(n, "");
-    assert("params" !in same);
+	auto n = Json([
+		"jsonrpc": Json("2.0"),
+		"method": Json("notifications/message")
+	]);
+	auto same = withSubscriptionId(n, "");
+	assert("params" !in same);
 }
 
 /// Standard Streamable HTTP request headers introduced by the draft.
 enum HttpHeader : string
 {
-    protocolVersion = "MCP-Protocol-Version",
-    method = "Mcp-Method",
-    name = "Mcp-Name",
-    paramPrefix = "Mcp-Param-",
+	protocolVersion = "MCP-Protocol-Version",
+	method = "Mcp-Method",
+	name = "Mcp-Name",
+	paramPrefix = "Mcp-Param-",
 }
 
 /// Per-request metadata that the draft carries in `params._meta` instead of a
 /// once-per-connection `initialize` handshake.
 struct RequestMeta
 {
-    string protocolVersion;
-    Implementation clientInfo;
-    ClientCapabilities clientCapabilities;
-    Nullable!string logLevel;
+	string protocolVersion;
+	Implementation clientInfo;
+	ClientCapabilities clientCapabilities;
+	Nullable!string logLevel;
 
-    /// Extract request metadata from a request's `params` object.
-    static RequestMeta fromParams(Json params) @safe
-    {
-        RequestMeta m;
-        if (params.type != Json.Type.object || "_meta" !in params)
-            return m;
-        auto meta = params["_meta"];
-        if (meta.type != Json.Type.object)
-            return m;
-        if (MetaKey.protocolVersion in meta && meta[MetaKey.protocolVersion].type
-                == Json.Type.string)
-            m.protocolVersion = meta[MetaKey.protocolVersion].get!string;
-        if (MetaKey.clientInfo in meta)
-            m.clientInfo = Implementation.fromJson(meta[MetaKey.clientInfo]);
-        if (MetaKey.clientCapabilities in meta)
-            m.clientCapabilities = ClientCapabilities.fromJson(meta[MetaKey.clientCapabilities]);
-        if (MetaKey.logLevel in meta && meta[MetaKey.logLevel].type == Json.Type.string)
-            m.logLevel = meta[MetaKey.logLevel].get!string;
-        return m;
-    }
+	/// Extract request metadata from a request's `params` object.
+	static RequestMeta fromParams(Json params) @safe
+	{
+		RequestMeta m;
+		if (params.type != Json.Type.object || "_meta" !in params)
+			return m;
+		auto meta = params["_meta"];
+		if (meta.type != Json.Type.object)
+			return m;
+		if (MetaKey.protocolVersion in meta && meta[MetaKey.protocolVersion].type
+				== Json.Type.string)
+			m.protocolVersion = meta[MetaKey.protocolVersion].get!string;
+		if (MetaKey.clientInfo in meta)
+			m.clientInfo = Implementation.fromJson(meta[MetaKey.clientInfo]);
+		if (MetaKey.clientCapabilities in meta)
+			m.clientCapabilities = ClientCapabilities.fromJson(meta[MetaKey.clientCapabilities]);
+		if (MetaKey.logLevel in meta && meta[MetaKey.logLevel].type == Json.Type.string)
+			m.logLevel = meta[MetaKey.logLevel].get!string;
+		return m;
+	}
 }
 
 /// Result of `server/discover`: advertises supported versions, capabilities,
 /// and identity so a client can select a version up front (stateless lifecycle).
 struct DiscoverResult
 {
-    string[] protocolVersions;
-    ServerCapabilities capabilities;
-    Implementation serverInfo;
-    Nullable!string instructions;
+	string[] protocolVersions;
+	ServerCapabilities capabilities;
+	Implementation serverInfo;
+	Nullable!string instructions;
 
-    Json toJson() const @safe
-    {
-        Json j = Json.emptyObject;
-        // Base draft Result mandates a `resultType` discriminator on every
-        // result; a complete discover response uses "complete".
-        j["resultType"] = "complete";
-        Json pv = Json.emptyArray;
-        foreach (v; protocolVersions)
-            pv ~= Json(v);
-        // Spec wire field name is `supportedVersions` (draft server/discover
-        // Response Fields table), even though the D member is `protocolVersions`.
-        j["supportedVersions"] = pv;
-        j["capabilities"] = capabilities.toJson();
-        j["serverInfo"] = serverInfo.toJson();
-        if (!instructions.isNull)
-            j["instructions"] = instructions.get;
-        return j;
-    }
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		// Base draft Result mandates a `resultType` discriminator on every
+		// result; a complete discover response uses "complete".
+		j["resultType"] = "complete";
+		Json pv = Json.emptyArray;
+		foreach (v; protocolVersions)
+			pv ~= Json(v);
+		// Spec wire field name is `supportedVersions` (draft server/discover
+		// Response Fields table), even though the D member is `protocolVersions`.
+		j["supportedVersions"] = pv;
+		j["capabilities"] = capabilities.toJson();
+		j["serverInfo"] = serverInfo.toJson();
+		if (!instructions.isNull)
+			j["instructions"] = instructions.get;
+		return j;
+	}
 
-    static DiscoverResult fromJson(Json j) @safe
-    {
-        DiscoverResult r;
-        // Spec wire field is `supportedVersions`; accept the legacy
-        // `protocolVersions` name as a fallback for older peers.
-        auto verKey = ("supportedVersions" in j) ? "supportedVersions" : "protocolVersions";
-        if (verKey in j && j[verKey].type == Json.Type.array)
-        {
-            auto arr = j[verKey];
-            foreach (i; 0 .. arr.length)
-                r.protocolVersions ~= arr[i].get!string;
-        }
-        if ("capabilities" in j)
-            r.capabilities = ServerCapabilities.fromJson(j["capabilities"]);
-        if ("serverInfo" in j)
-            r.serverInfo = Implementation.fromJson(j["serverInfo"]);
-        if ("instructions" in j && j["instructions"].type == Json.Type.string)
-            r.instructions = j["instructions"].get!string;
-        return r;
-    }
+	static DiscoverResult fromJson(Json j) @safe
+	{
+		DiscoverResult r;
+		// Spec wire field is `supportedVersions`; accept the legacy
+		// `protocolVersions` name as a fallback for older peers.
+		auto verKey = ("supportedVersions" in j) ? "supportedVersions" : "protocolVersions";
+		if (verKey in j && j[verKey].type == Json.Type.array)
+		{
+			auto arr = j[verKey];
+			foreach (i; 0 .. arr.length)
+				r.protocolVersions ~= arr[i].get!string;
+		}
+		if ("capabilities" in j)
+			r.capabilities = ServerCapabilities.fromJson(j["capabilities"]);
+		if ("serverInfo" in j)
+			r.serverInfo = Implementation.fromJson(j["serverInfo"]);
+		if ("instructions" in j && j["instructions"].type == Json.Type.string)
+			r.instructions = j["instructions"].get!string;
+		return r;
+	}
 }
 
 /// Whether a shared (public) or per-client (private) cache may hold a result.
 enum CacheScope : string
 {
-    public_ = "public",
-    private_ = "private",
+	public_ = "public",
+	private_ = "private",
 }
 
 /// Attach the draft `CacheableResult` fields (`ttlMs`, `cacheScope`) to a result
@@ -399,11 +398,11 @@ enum CacheScope : string
 /// `listChanged` notifications.
 Json withCache(Json result, long ttlMs, CacheScope scope_ = CacheScope.public_) @safe
 {
-    if (result.type != Json.Type.object)
-        return result;
-    result["ttlMs"] = ttlMs;
-    result["cacheScope"] = cast(string) scope_;
-    return result;
+	if (result.type != Json.Type.object)
+		return result;
+	result["ttlMs"] = ttlMs;
+	result["cacheScope"] = cast(string) scope_;
+	return result;
 }
 
 // ===========================================================================
@@ -416,38 +415,38 @@ Json withCache(Json result, long ttlMs, CacheScope scope_ = CacheScope.public_) 
 /// as `=?base64?<base64-of-utf8>?=`.
 string encodeHeaderValue(string value) @safe
 {
-    import std.base64 : Base64;
+	import std.base64 : Base64;
 
-    if (value.length == 0)
-        return value;
-    bool needsEncoding = false;
-    if (value[0] == ' ' || value[$ - 1] == ' ')
-        needsEncoding = true;
-    foreach (char c; value)
-        if (c < 0x20 || c > 0x7E)
-            needsEncoding = true;
-    if (value.length >= 9 && value[0 .. 9] == "=?base64?")
-        needsEncoding = true;
+	if (value.length == 0)
+		return value;
+	bool needsEncoding = false;
+	if (value[0] == ' ' || value[$ - 1] == ' ')
+		needsEncoding = true;
+	foreach (char c; value)
+		if (c < 0x20 || c > 0x7E)
+			needsEncoding = true;
+	if (value.length >= 9 && value[0 .. 9] == "=?base64?")
+		needsEncoding = true;
 
-    if (!needsEncoding)
-        return value;
-    return "=?base64?" ~ () @trusted {
-        return cast(string) Base64.encode(cast(const(ubyte)[]) value);
-    }() ~ "?=";
+	if (!needsEncoding)
+		return value;
+	return "=?base64?" ~ () @trusted {
+		return cast(string) Base64.encode(cast(const(ubyte)[]) value);
+	}() ~ "?=";
 }
 
 /// Decode an `Mcp-Param-*` header value produced by `encodeHeaderValue`.
 string decodeHeaderValue(string headerValue) @safe
 {
-    import std.base64 : Base64;
+	import std.base64 : Base64;
 
-    if (headerValue.length >= 11 && headerValue[0 .. 9] == "=?base64?"
-            && headerValue[$ - 2 .. $] == "?=")
-    {
-        const inner = headerValue[9 .. $ - 2];
-        return () @trusted { return cast(string) Base64.decode(inner); }();
-    }
-    return headerValue;
+	if (headerValue.length >= 11 && headerValue[0 .. 9] == "=?base64?"
+			&& headerValue[$ - 2 .. $] == "?=")
+	{
+		const inner = headerValue[9 .. $ - 2];
+		return () @trusted { return cast(string) Base64.decode(inner); }();
+	}
+	return headerValue;
 }
 
 /// Whether a JSON Schema `type` value is one the draft permits an `x-mcp-header`
@@ -456,7 +455,7 @@ string decodeHeaderValue(string headerValue) @safe
 /// explicitly NOT permitted (its value may not round-trip through a header).
 bool isPrimitiveHeaderType(string jsonSchemaType) @safe pure nothrow
 {
-    return jsonSchemaType == "integer" || jsonSchemaType == "string" || jsonSchemaType == "boolean";
+	return jsonSchemaType == "integer" || jsonSchemaType == "string" || jsonSchemaType == "boolean";
 }
 
 /// Validate a single `x-mcp-header` value (the name portion of the resulting
@@ -472,39 +471,39 @@ bool isPrimitiveHeaderType(string jsonSchemaType) @safe pure nothrow
 /// `validateInputSchemaHeaders` (it is not a property of a value in isolation).
 string validateHeaderName(string value) @safe pure nothrow
 {
-    if (value.length == 0)
-        return "x-mcp-header value MUST NOT be empty";
-    foreach (char c; value)
-    {
-        // RFC 9110 §5.1 tchar: "!#$%&'*+-.^_`|~" / DIGIT / ALPHA.
-        // This excludes control characters (incl. CR/LF), spaces, and ':'.
-        const bool isTchar = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-            || (c >= '0' && c <= '9') || c == '!' || c == '#' || c == '$' || c == '%'
-            || c == '&' || c == '\'' || c == '*' || c == '+' || c == '-' || c == '.'
-            || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
-        if (!isTchar)
-            return "x-mcp-header value '" ~ value
-                ~ "' is not a valid HTTP field-name token (1*tchar)";
-    }
-    return null;
+	if (value.length == 0)
+		return "x-mcp-header value MUST NOT be empty";
+	foreach (char c; value)
+	{
+		// RFC 9110 §5.1 tchar: "!#$%&'*+-.^_`|~" / DIGIT / ALPHA.
+		// This excludes control characters (incl. CR/LF), spaces, and ':'.
+		const bool isTchar = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+			|| (c >= '0' && c <= '9') || c == '!' || c == '#' || c == '$' || c == '%'
+			|| c == '&' || c == '\'' || c == '*' || c == '+' || c == '-' || c == '.'
+			|| c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+		if (!isTchar)
+			return "x-mcp-header value '" ~ value
+				~ "' is not a valid HTTP field-name token (1*tchar)";
+	}
+	return null;
 }
 
 /// ASCII-lowercase a string for case-insensitive comparison of header names.
 private string asciiLowerName(string s) @safe pure nothrow
 {
-    char[] buf = new char[s.length];
-    foreach (i, char c; s)
-        buf[i] = (c >= 'A' && c <= 'Z') ? cast(char)(c + 32) : c;
-    return () @trusted { return cast(string) buf; }();
+	char[] buf = new char[s.length];
+	foreach (i, char c; s)
+		buf[i] = (c >= 'A' && c <= 'Z') ? cast(char)(c + 32) : c;
+	return () @trusted { return cast(string) buf; }();
 }
 
 /// A single `x-mcp-header` annotation discovered in a tool `inputSchema`,
 /// together with the path of property keys to reach the annotated value.
 struct ParamHeader
 {
-    string[] path; /// property keys from the root `inputSchema` to the annotated value
-    string header; /// the resolved header name, e.g. `Mcp-Param-Region`
-    string name; /// the raw `x-mcp-header` value (header suffix), e.g. `Region`
+	string[] path; /// property keys from the root `inputSchema` to the annotated value
+	string header; /// the resolved header name, e.g. `Mcp-Param-Region`
+	string name; /// the raw `x-mcp-header` value (header suffix), e.g. `Region`
 }
 
 /// Collect every valid `x-mcp-header` annotation in a tool `inputSchema`,
@@ -515,37 +514,37 @@ struct ParamHeader
 /// here; use `validateInputSchemaHeaders` to reject such schemas up front.
 ParamHeader[] paramHeaders(Json inputSchema) @safe
 {
-    ParamHeader[] result;
-    void walk(Json node, string[] path) @safe
-    {
-        if (node.type != Json.Type.object)
-            return;
-        if ("properties" in node && node["properties"].type == Json.Type.object)
-        {
-            () @trusted {
-                foreach (string name, Json prop; node["properties"])
-                {
-                    if (prop.type != Json.Type.object)
-                        continue;
-                    auto childPath = path ~ name;
-                    if ("x-mcp-header" in prop && prop["x-mcp-header"].type == Json.Type.string)
-                    {
-                        const hv = prop["x-mcp-header"].get!string;
-                        const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
-                            .get!string : "";
-                        if (validateHeaderName(hv) is null && isPrimitiveHeaderType(ptype))
-                            result ~= ParamHeader(childPath, HttpHeader.paramPrefix ~ hv, hv);
-                    }
-                    walk(prop, childPath);
-                }
-            }();
-        }
-        if ("items" in node && node["items"].type == Json.Type.object)
-            walk(node["items"], path);
-    }
+	ParamHeader[] result;
+	void walk(Json node, string[] path) @safe
+	{
+		if (node.type != Json.Type.object)
+			return;
+		if ("properties" in node && node["properties"].type == Json.Type.object)
+		{
+			() @trusted {
+				foreach (string name, Json prop; node["properties"])
+				{
+					if (prop.type != Json.Type.object)
+						continue;
+					auto childPath = path ~ name;
+					if ("x-mcp-header" in prop && prop["x-mcp-header"].type == Json.Type.string)
+					{
+						const hv = prop["x-mcp-header"].get!string;
+						const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
+							.get!string : "";
+						if (validateHeaderName(hv) is null && isPrimitiveHeaderType(ptype))
+							result ~= ParamHeader(childPath, HttpHeader.paramPrefix ~ hv, hv);
+					}
+					walk(prop, childPath);
+				}
+			}();
+		}
+		if ("items" in node && node["items"].type == Json.Type.object)
+			walk(node["items"], path);
+	}
 
-    walk(inputSchema, []);
-    return result;
+	walk(inputSchema, []);
+	return result;
 }
 
 /// Validate every `x-mcp-header` annotation in a tool `inputSchema` against the
@@ -556,62 +555,63 @@ ParamHeader[] paramHeaders(Json inputSchema) @safe
 /// nesting depth.
 string validateInputSchemaHeaders(Json inputSchema) @safe
 {
-    string err;
-    bool[string] seen; // ASCII-lowercased header values already encountered
-    void walk(Json node) @safe
-    {
-        if (err !is null || node.type != Json.Type.object)
-            return;
-        if ("properties" in node && node["properties"].type == Json.Type.object)
-        {
-            () @trusted {
-                foreach (string name, Json prop; node["properties"])
-                {
-                    if (err !is null)
-                        return;
-                    if (prop.type != Json.Type.object)
-                        continue;
-                    if ("x-mcp-header" in prop)
-                    {
-                        if (prop["x-mcp-header"].type != Json.Type.string)
-                        {
-                            err = "x-mcp-header value on '" ~ name ~ "' MUST be a string";
-                            return;
-                        }
-                        const hv = prop["x-mcp-header"].get!string;
-                        auto nameErr = validateHeaderName(hv);
-                        if (nameErr !is null)
-                        {
-                            err = nameErr;
-                            return;
-                        }
-                        const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
-                            .get!string : "";
-                        if (!isPrimitiveHeaderType(ptype))
-                        {
-                            err = "x-mcp-header '" ~ hv ~ "' on '" ~ name ~ "' may only be applied to primitive types"
-                                ~ " (integer/string/boolean); type '" ~ ptype ~ "' is not permitted";
-                            return;
-                        }
-                        const lc = asciiLowerName(hv);
-                        if (lc in seen)
-                        {
-                            err = "x-mcp-header value '" ~ hv
-                                ~ "' is not case-insensitively unique within the inputSchema";
-                            return;
-                        }
-                        seen[lc] = true;
-                    }
-                    walk(prop);
-                }
-            }();
-        }
-        if (err is null && "items" in node && node["items"].type == Json.Type.object)
-            walk(node["items"]);
-    }
+	string err;
+	bool[string] seen; // ASCII-lowercased header values already encountered
+	void walk(Json node) @safe
+	{
+		if (err !is null || node.type != Json.Type.object)
+			return;
+		if ("properties" in node && node["properties"].type == Json.Type.object)
+		{
+			() @trusted {
+				foreach (string name, Json prop; node["properties"])
+				{
+					if (err !is null)
+						return;
+					if (prop.type != Json.Type.object)
+						continue;
+					if ("x-mcp-header" in prop)
+					{
+						if (prop["x-mcp-header"].type != Json.Type.string)
+						{
+							err = "x-mcp-header value on '" ~ name ~ "' MUST be a string";
+							return;
+						}
+						const hv = prop["x-mcp-header"].get!string;
+						auto nameErr = validateHeaderName(hv);
+						if (nameErr !is null)
+						{
+							err = nameErr;
+							return;
+						}
+						const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
+							.get!string : "";
+						if (!isPrimitiveHeaderType(ptype))
+						{
+							err = "x-mcp-header '" ~ hv ~ "' on '" ~ name
+								~ "' may only be applied to primitive types"
+								~ " (integer/string/boolean); type '" ~ ptype ~ "' is not permitted";
+							return;
+						}
+						const lc = asciiLowerName(hv);
+						if (lc in seen)
+						{
+							err = "x-mcp-header value '" ~ hv
+								~ "' is not case-insensitively unique within the inputSchema";
+							return;
+						}
+						seen[lc] = true;
+					}
+					walk(prop);
+				}
+			}();
+		}
+		if (err is null && "items" in node && node["items"].type == Json.Type.object)
+			walk(node["items"]);
+	}
 
-    walk(inputSchema);
-    return err;
+	walk(inputSchema);
+	return err;
 }
 
 /// Extract the `x-mcp-header` annotations from a tool `inputSchema`, returning a
@@ -622,11 +622,11 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 /// new code.
 string[string] paramHeaderMap(Json inputSchema) @safe
 {
-    string[string] map;
-    foreach (ph; paramHeaders(inputSchema))
-        if (ph.path.length == 1)
-            map[ph.path[0]] = ph.header;
-    return map;
+	string[string] map;
+	foreach (ph; paramHeaders(inputSchema))
+		if (ph.path.length == 1)
+			map[ph.path[0]] = ph.header;
+	return map;
 }
 
 // ===========================================================================
@@ -638,109 +638,109 @@ string[string] paramHeaderMap(Json inputSchema) @safe
 /// `roots/list` request).
 struct InputRequest
 {
-    string id; /// correlation id chosen by the server (the `InputRequests` map key)
-    string type; /// "sampling" | "elicitation" | "roots"
-    Json params = Json.emptyObject; /// the would-be request params
+	string id; /// correlation id chosen by the server (the `InputRequests` map key)
+	string type; /// "sampling" | "elicitation" | "roots"
+	Json params = Json.emptyObject; /// the would-be request params
 
-    /// The spec wire `method` for this request's `type`: an `InputRequests` value
-    /// is a request object whose `method` is the full JSON-RPC method name
-    /// (`elicitation/create`, `sampling/createMessage`, `roots/list`) — not the
-    /// short internal discriminator.
-    static string methodForType(string type) @safe pure nothrow
-    {
-        switch (type)
-        {
-        case "elicitation":
-            return "elicitation/create";
-        case "sampling":
-            return "sampling/createMessage";
-        case "roots":
-            return "roots/list";
-        default:
-            return type;
-        }
-    }
+	/// The spec wire `method` for this request's `type`: an `InputRequests` value
+	/// is a request object whose `method` is the full JSON-RPC method name
+	/// (`elicitation/create`, `sampling/createMessage`, `roots/list`) — not the
+	/// short internal discriminator.
+	static string methodForType(string type) @safe pure nothrow
+	{
+		switch (type)
+		{
+		case "elicitation":
+			return "elicitation/create";
+		case "sampling":
+			return "sampling/createMessage";
+		case "roots":
+			return "roots/list";
+		default:
+			return type;
+		}
+	}
 
-    /// Inverse of `methodForType`: recover the short internal discriminator from
-    /// the spec wire `method`.
-    static string typeForMethod(string method) @safe pure nothrow
-    {
-        switch (method)
-        {
-        case "elicitation/create":
-            return "elicitation";
-        case "sampling/createMessage":
-            return "sampling";
-        case "roots/list":
-            return "roots";
-        default:
-            return method;
-        }
-    }
+	/// Inverse of `methodForType`: recover the short internal discriminator from
+	/// the spec wire `method`.
+	static string typeForMethod(string method) @safe pure nothrow
+	{
+		switch (method)
+		{
+		case "elicitation/create":
+			return "elicitation";
+		case "sampling/createMessage":
+			return "sampling";
+		case "roots/list":
+			return "roots";
+		default:
+			return method;
+		}
+	}
 
-    /// Serialize this request as an `InputRequests` *value* (the request object):
-    /// a `{ method, params }` object. The `id` is the surrounding map key and is
-    /// therefore not part of the value (see `InputRequiredResult.toJson`).
-    Json toJson() const @safe
-    {
-        Json j = Json.emptyObject;
-        j["method"] = methodForType(type);
-        j["params"] = params;
-        return j;
-    }
+	/// Serialize this request as an `InputRequests` *value* (the request object):
+	/// a `{ method, params }` object. The `id` is the surrounding map key and is
+	/// therefore not part of the value (see `InputRequiredResult.toJson`).
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		j["method"] = methodForType(type);
+		j["params"] = params;
+		return j;
+	}
 
-    /// Parse an `InputRequests` value (request object) given its map `key` (the
-    /// server-assigned id).
-    static InputRequest fromJson(string key, Json j) @safe
-    {
-        InputRequest r;
-        r.id = key;
-        r.type = ("method" in j) ? typeForMethod(j["method"].get!string) : "";
-        if ("params" in j)
-            r.params = j["params"];
-        return r;
-    }
+	/// Parse an `InputRequests` value (request object) given its map `key` (the
+	/// server-assigned id).
+	static InputRequest fromJson(string key, Json j) @safe
+	{
+		InputRequest r;
+		r.id = key;
+		r.type = ("method" in j) ? typeForMethod(j["method"].get!string) : "";
+		if ("params" in j)
+			r.params = j["params"];
+		return r;
+	}
 }
 
 /// A result that asks the client to gather input and retry the original request
 /// with matching `inputResponses`.
 struct InputRequiredResult
 {
-    InputRequest[] inputRequests;
-    /// SEP-2322 `requestState`: an opaque, server-owned string that lets a
-    /// stateless server reconstruct its in-progress work on the retry. When
-    /// non-empty it is emitted as a top-level `requestState` field; the client
-    /// MUST echo it back verbatim (and MUST NOT inspect or modify it).
-    string requestState;
+	InputRequest[] inputRequests;
+	/// SEP-2322 `requestState`: an opaque, server-owned string that lets a
+	/// stateless server reconstruct its in-progress work on the retry. When
+	/// non-empty it is emitted as a top-level `requestState` field; the client
+	/// MUST echo it back verbatim (and MUST NOT inspect or modify it).
+	string requestState;
 
-    Json toJson() const @safe
-    {
-        Json j = Json.emptyObject;
-        // Base draft Result mandates a `resultType` discriminator on every
-        // result; an InputRequiredResult declares "input_required" so the
-        // client knows to gather input and retry rather than treat this as a
-        // completed response.
-        j["resultType"] = "input_required";
-        // SEP-2322: `inputRequests` is an `InputRequests` object — a map whose
-        // keys are the server-assigned ids and whose values are request objects
-        // (`{ method, params }`), not an array.
-        j["inputRequests"] = inputRequestsToJson(inputRequests);
-        // SEP-2322: `requestState` is an optional top-level field; omit it when
-        // empty so the client knows not to echo one back.
-        if (requestState.length)
-            j["requestState"] = requestState;
-        return j;
-    }
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		// Base draft Result mandates a `resultType` discriminator on every
+		// result; an InputRequiredResult declares "input_required" so the
+		// client knows to gather input and retry rather than treat this as a
+		// completed response.
+		j["resultType"] = "input_required";
+		// SEP-2322: `inputRequests` is an `InputRequests` object — a map whose
+		// keys are the server-assigned ids and whose values are request objects
+		// (`{ method, params }`), not an array.
+		j["inputRequests"] = inputRequestsToJson(inputRequests);
+		// SEP-2322: `requestState` is an optional top-level field; omit it when
+		// empty so the client knows not to echo one back.
+		if (requestState.length)
+			j["requestState"] = requestState;
+		return j;
+	}
 
-    static InputRequiredResult fromJson(Json j) @safe
-    {
-        InputRequiredResult r;
-        if ("inputRequests" in j)
-            r.inputRequests = inputRequestsFromJson(j["inputRequests"]);
-        if ("requestState" in j && j["requestState"].type == Json.Type.string)
-            r.requestState = j["requestState"].get!string;
-        return r;
-    }
+	static InputRequiredResult fromJson(Json j) @safe
+	{
+		InputRequiredResult r;
+		if ("inputRequests" in j)
+			r.inputRequests = inputRequestsFromJson(j["inputRequests"]);
+		if ("requestState" in j && j["requestState"].type == Json.Type.string)
+			r.requestState = j["requestState"].get!string;
+		return r;
+	}
 }
 
 /// Serialize a list of `InputRequest`s as a spec `InputRequests` object: a map
@@ -748,34 +748,34 @@ struct InputRequiredResult
 /// request objects as values (SEP-2322, draft basic/utilities/mrtr).
 Json inputRequestsToJson(const(InputRequest)[] requests) @safe
 {
-    Json obj = Json.emptyObject;
-    foreach (r; requests)
-        obj[r.id] = r.toJson();
-    return obj;
+	Json obj = Json.emptyObject;
+	foreach (r; requests)
+		obj[r.id] = r.toJson();
+	return obj;
 }
 
 /// Parse a spec `InputRequests` object (map keyed by id) back into the internal
 /// `InputRequest` list. A non-object value yields no requests.
 InputRequest[] inputRequestsFromJson(Json j) @safe
 {
-    InputRequest[] requests;
-    if (j.type == Json.Type.object)
-    {
-        // `Json.opApply` is `@system`; iterating a plain object is safe here.
-        () @trusted {
-            foreach (string key, Json value; j)
-                requests ~= InputRequest.fromJson(key, value);
-        }();
-    }
-    return requests;
+	InputRequest[] requests;
+	if (j.type == Json.Type.object)
+	{
+		// `Json.opApply` is `@system`; iterating a plain object is safe here.
+		() @trusted {
+			foreach (string key, Json value; j)
+				requests ~= InputRequest.fromJson(key, value);
+		}();
+	}
+	return requests;
 }
 
 /// A client's answer to one `InputRequest`, supplied on the retried request as
 /// a value of the top-level `params.inputResponses` map (SEP-2322).
 struct InputResponse
 {
-    string id; /// the originating `InputRequest.id` (the `InputResponses` map key)
-    Json result = Json.emptyObject; /// the bare client result (the map value)
+	string id; /// the originating `InputRequest.id` (the `InputResponses` map key)
+	Json result = Json.emptyObject; /// the bare client result (the map value)
 }
 
 /// Serialize a list of `InputResponse`s as a spec `InputResponses` object: a map
@@ -785,10 +785,10 @@ struct InputResponse
 /// JSON array (SEP-2322, draft basic/utilities/mrtr).
 Json inputResponsesToJson(const(InputResponse)[] responses) @safe
 {
-    Json obj = Json.emptyObject;
-    foreach (resp; responses)
-        obj[resp.id] = resp.result;
-    return obj;
+	Json obj = Json.emptyObject;
+	foreach (resp; responses)
+		obj[resp.id] = resp.result;
+	return obj;
 }
 
 /// Read the input responses a client attached to a retried request, keyed by
@@ -797,18 +797,18 @@ Json inputResponsesToJson(const(InputResponse)[] responses) @safe
 /// client result) — NOT `_meta`.
 Json[string] readInputResponses(Json params) @safe
 {
-    Json[string] out_;
-    if (params.type != Json.Type.object || "inputResponses" !in params)
-        return out_;
-    auto map = params["inputResponses"];
-    if (map.type != Json.Type.object)
-        return out_;
-    // `Json.opApply` is `@system`; iterating a plain object is safe here.
-    () @trusted {
-        foreach (string key, Json value; map)
-            out_[key] = value;
-    }();
-    return out_;
+	Json[string] out_;
+	if (params.type != Json.Type.object || "inputResponses" !in params)
+		return out_;
+	auto map = params["inputResponses"];
+	if (map.type != Json.Type.object)
+		return out_;
+	// `Json.opApply` is `@system`; iterating a plain object is safe here.
+	() @trusted {
+		foreach (string key, Json value; map)
+			out_[key] = value;
+	}();
+	return out_;
 }
 
 /// Read the opaque SEP-2322 `requestState` the client echoed back on a retried
@@ -817,607 +817,607 @@ Json[string] readInputResponses(Json params) @safe
 /// as opaque), so servers MUST validate it as untrusted input.
 string readRequestState(Json params) @safe
 {
-    if (params.type != Json.Type.object || "requestState" !in params)
-        return "";
-    auto rs = params["requestState"];
-    if (rs.type != Json.Type.string)
-        return "";
-    return rs.get!string;
+	if (params.type != Json.Type.object || "requestState" !in params)
+		return "";
+	auto rs = params["requestState"];
+	if (rs.type != Json.Type.string)
+		return "";
+	return rs.get!string;
 }
 
 unittest  // RequestMeta parses per-request _meta
 {
-    Json meta = Json.emptyObject;
-    meta[MetaKey.protocolVersion] = "2026-07-28";
-    meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
-    meta[MetaKey.logLevel] = "debug";
-    Json caps = Json.emptyObject;
-    caps["sampling"] = Json.emptyObject;
-    meta[MetaKey.clientCapabilities] = caps;
-    Json params = Json.emptyObject;
-    params["_meta"] = meta;
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	meta[MetaKey.logLevel] = "debug";
+	Json caps = Json.emptyObject;
+	caps["sampling"] = Json.emptyObject;
+	meta[MetaKey.clientCapabilities] = caps;
+	Json params = Json.emptyObject;
+	params["_meta"] = meta;
 
-    auto m = RequestMeta.fromParams(params);
-    assert(m.protocolVersion == "2026-07-28");
-    assert(m.clientInfo.name == "c");
-    assert(m.clientCapabilities.sampling);
-    assert(m.logLevel.get == "debug");
+	auto m = RequestMeta.fromParams(params);
+	assert(m.protocolVersion == "2026-07-28");
+	assert(m.clientInfo.name == "c");
+	assert(m.clientCapabilities.sampling);
+	assert(m.logLevel.get == "debug");
 }
 
 unittest  // DiscoverResult round-trips
 {
-    DiscoverResult d;
-    d.protocolVersions = ["2026-07-28", "2025-11-25"];
-    d.serverInfo = Implementation("srv", "1.0");
-    d.capabilities.logging = true;
-    auto back = DiscoverResult.fromJson(d.toJson());
-    assert(back.protocolVersions.length == 2);
-    assert(back.serverInfo.name == "srv");
-    assert(back.capabilities.logging);
+	DiscoverResult d;
+	d.protocolVersions = ["2026-07-28", "2025-11-25"];
+	d.serverInfo = Implementation("srv", "1.0");
+	d.capabilities.logging = true;
+	auto back = DiscoverResult.fromJson(d.toJson());
+	assert(back.protocolVersions.length == 2);
+	assert(back.serverInfo.name == "srv");
+	assert(back.capabilities.logging);
 }
 
 unittest  // DiscoverResult.toJson emits the spec wire field `supportedVersions`
 {
-    DiscoverResult d;
-    d.protocolVersions = ["2026-07-28", "2025-11-25"];
-    d.serverInfo = Implementation("srv", "1.0");
-    auto j = d.toJson();
-    // draft server/discover Response Fields table requires `supportedVersions`,
-    // not the internal name `protocolVersions`.
-    assert("supportedVersions" in j);
-    assert("protocolVersions" !in j);
-    assert(j["supportedVersions"].length == 2);
-    assert(j["supportedVersions"][0].get!string == "2026-07-28");
+	DiscoverResult d;
+	d.protocolVersions = ["2026-07-28", "2025-11-25"];
+	d.serverInfo = Implementation("srv", "1.0");
+	auto j = d.toJson();
+	// draft server/discover Response Fields table requires `supportedVersions`,
+	// not the internal name `protocolVersions`.
+	assert("supportedVersions" in j);
+	assert("protocolVersions" !in j);
+	assert(j["supportedVersions"].length == 2);
+	assert(j["supportedVersions"][0].get!string == "2026-07-28");
 }
 
 unittest  // InputRequiredResult.toJson carries resultType:"input_required"
 {
-    InputRequiredResult r;
-    r.inputRequests = [InputRequest("date", "elicitation", Json.emptyObject)];
-    auto j = r.toJson();
-    // Base draft Result mandates a resultType discriminator on every result;
-    // an InputRequiredResult uses "input_required".
-    assert("resultType" in j);
-    assert(j["resultType"].get!string == "input_required");
-    assert("inputRequests" in j);
+	InputRequiredResult r;
+	r.inputRequests = [InputRequest("date", "elicitation", Json.emptyObject)];
+	auto j = r.toJson();
+	// Base draft Result mandates a resultType discriminator on every result;
+	// an InputRequiredResult uses "input_required".
+	assert("resultType" in j);
+	assert(j["resultType"].get!string == "input_required");
+	assert("inputRequests" in j);
 }
 
 unittest  // SEP-2322: inputRequests serializes as a map keyed by id, value {method, params}
 {
-    InputRequiredResult r;
-    r.inputRequests = [
-        InputRequest("github_login", "elicitation", Json(["message": Json("hi")]))
-    ];
-    auto j = r.toJson();
-    // The `InputRequests` field MUST be a JSON object (map), not an array.
-    assert(j["inputRequests"].type == Json.Type.object);
-    // Keyed by the server-assigned id.
-    assert("github_login" in j["inputRequests"]);
-    auto value = j["inputRequests"]["github_login"];
-    // Value is a request object with the full JSON-RPC `method`, no `id`/`type`.
-    assert(value["method"].get!string == "elicitation/create");
-    assert("id" !in value);
-    assert("type" !in value);
-    assert(value["params"]["message"].get!string == "hi");
+	InputRequiredResult r;
+	r.inputRequests = [
+		InputRequest("github_login", "elicitation", Json(["message": Json("hi")]))
+	];
+	auto j = r.toJson();
+	// The `InputRequests` field MUST be a JSON object (map), not an array.
+	assert(j["inputRequests"].type == Json.Type.object);
+	// Keyed by the server-assigned id.
+	assert("github_login" in j["inputRequests"]);
+	auto value = j["inputRequests"]["github_login"];
+	// Value is a request object with the full JSON-RPC `method`, no `id`/`type`.
+	assert(value["method"].get!string == "elicitation/create");
+	assert("id" !in value);
+	assert("type" !in value);
+	assert(value["params"]["message"].get!string == "hi");
 }
 
 unittest  // SEP-2322: sampling/roots methods map to their full JSON-RPC names
 {
-    InputRequiredResult r;
-    r.inputRequests = [
-        InputRequest("s1", "sampling", Json.emptyObject),
-        InputRequest("r1", "roots", Json.emptyObject)
-    ];
-    auto j = r.toJson();
-    assert(j["inputRequests"]["s1"]["method"].get!string == "sampling/createMessage");
-    assert(j["inputRequests"]["r1"]["method"].get!string == "roots/list");
+	InputRequiredResult r;
+	r.inputRequests = [
+		InputRequest("s1", "sampling", Json.emptyObject),
+		InputRequest("r1", "roots", Json.emptyObject)
+	];
+	auto j = r.toJson();
+	assert(j["inputRequests"]["s1"]["method"].get!string == "sampling/createMessage");
+	assert(j["inputRequests"]["r1"]["method"].get!string == "roots/list");
 }
 
 unittest  // DiscoverResult.toJson carries the required resultType discriminator
 {
-    DiscoverResult d;
-    d.protocolVersions = ["2026-07-28"];
-    auto j = d.toJson();
-    // Base draft Result mandates a resultType discriminator on every result;
-    // a complete discover response uses "complete".
-    assert("resultType" in j);
-    assert(j["resultType"].get!string == "complete");
+	DiscoverResult d;
+	d.protocolVersions = ["2026-07-28"];
+	auto j = d.toJson();
+	// Base draft Result mandates a resultType discriminator on every result;
+	// a complete discover response uses "complete".
+	assert("resultType" in j);
+	assert(j["resultType"].get!string == "complete");
 }
 
 unittest  // DiscoverResult.fromJson reads the spec wire field `supportedVersions`
 {
-    Json j = Json.emptyObject;
-    Json sv = Json.emptyArray;
-    sv ~= Json("2026-07-28");
-    sv ~= Json("2025-11-25");
-    j["resultType"] = Json("complete");
-    j["supportedVersions"] = sv;
-    auto r = DiscoverResult.fromJson(j);
-    assert(r.protocolVersions.length == 2);
-    assert(r.protocolVersions[0] == "2026-07-28");
+	Json j = Json.emptyObject;
+	Json sv = Json.emptyArray;
+	sv ~= Json("2026-07-28");
+	sv ~= Json("2025-11-25");
+	j["resultType"] = Json("complete");
+	j["supportedVersions"] = sv;
+	auto r = DiscoverResult.fromJson(j);
+	assert(r.protocolVersions.length == 2);
+	assert(r.protocolVersions[0] == "2026-07-28");
 }
 
 unittest  // withCache attaches ttlMs and cacheScope
 {
-    Json r = Json.emptyObject;
-    r["tools"] = Json.emptyArray;
-    auto c = withCache(r, 5000, CacheScope.private_);
-    assert(c["ttlMs"].get!long == 5000);
-    assert(c["cacheScope"].get!string == "private");
+	Json r = Json.emptyObject;
+	r["tools"] = Json.emptyArray;
+	auto c = withCache(r, 5000, CacheScope.private_);
+	assert(c["ttlMs"].get!long == 5000);
+	assert(c["cacheScope"].get!string == "private");
 }
 
 unittest  // MRTR InputRequiredResult round-trips and input responses parse
 {
-    InputRequiredResult ir;
-    ir.inputRequests = [
-        InputRequest("r1", "elicitation", Json(["message": Json("hi")]))
-    ];
-    auto back = InputRequiredResult.fromJson(ir.toJson());
-    assert(back.inputRequests.length == 1);
-    assert(back.inputRequests[0].id == "r1");
-    assert(back.inputRequests[0].type == "elicitation");
-    assert(back.inputRequests[0].params["message"].get!string == "hi");
+	InputRequiredResult ir;
+	ir.inputRequests = [
+		InputRequest("r1", "elicitation", Json(["message": Json("hi")]))
+	];
+	auto back = InputRequiredResult.fromJson(ir.toJson());
+	assert(back.inputRequests.length == 1);
+	assert(back.inputRequests[0].id == "r1");
+	assert(back.inputRequests[0].type == "elicitation");
+	assert(back.inputRequests[0].params["message"].get!string == "hi");
 
-    Json params = Json.emptyObject;
-    params["inputResponses"] = inputResponsesToJson([
-        InputResponse("r1", Json(["action": Json("accept")]))
-    ]);
-    auto resps = readInputResponses(params);
-    assert("r1" in resps);
-    assert(resps["r1"]["action"].get!string == "accept");
+	Json params = Json.emptyObject;
+	params["inputResponses"] = inputResponsesToJson([
+		InputResponse("r1", Json(["action": Json("accept")]))
+	]);
+	auto resps = readInputResponses(params);
+	assert("r1" in resps);
+	assert(resps["r1"]["action"].get!string == "accept");
 }
 
 unittest  // SEP-2322: inputResponses is a map keyed by id with bare result values
 {
-    // The spec `InputResponses` field is a JSON object whose keys are the
-    // server-assigned `InputRequest` ids and whose values are the *bare* client
-    // results (e.g. `{action, content}`) — not `{id, result}` wrapper objects,
-    // and not a JSON array.
-    auto obj = inputResponsesToJson([
-        InputResponse("github_login", Json([
-            "action": Json("accept"),
-            "content": Json(["name": Json("octocat")])
-        ]))
-    ]);
-    assert(obj.type == Json.Type.object);
-    assert("github_login" in obj);
-    auto value = obj["github_login"];
-    // The value is the bare result, with no `id`/`result` wrapper.
-    assert("id" !in value);
-    assert("result" !in value);
-    assert(value["action"].get!string == "accept");
-    assert(value["content"]["name"].get!string == "octocat");
+	// The spec `InputResponses` field is a JSON object whose keys are the
+	// server-assigned `InputRequest` ids and whose values are the *bare* client
+	// results (e.g. `{action, content}`) — not `{id, result}` wrapper objects,
+	// and not a JSON array.
+	auto obj = inputResponsesToJson([
+		InputResponse("github_login", Json([
+			"action": Json("accept"),
+			"content": Json(["name": Json("octocat")])
+		]))
+	]);
+	assert(obj.type == Json.Type.object);
+	assert("github_login" in obj);
+	auto value = obj["github_login"];
+	// The value is the bare result, with no `id`/`result` wrapper.
+	assert("id" !in value);
+	assert("result" !in value);
+	assert(value["action"].get!string == "accept");
+	assert(value["content"]["name"].get!string == "octocat");
 }
 
 unittest  // SEP-2322: readInputResponses parses the spec map shape keyed by id
 {
-    Json responses = Json.emptyObject;
-    responses["date"] = Json(["action": Json("accept")]);
-    Json params = Json.emptyObject;
-    // SEP-2322: inputResponses is a top-level params field, not under _meta.
-    params["inputResponses"] = responses;
+	Json responses = Json.emptyObject;
+	responses["date"] = Json(["action": Json("accept")]);
+	Json params = Json.emptyObject;
+	// SEP-2322: inputResponses is a top-level params field, not under _meta.
+	params["inputResponses"] = responses;
 
-    auto parsed = readInputResponses(params);
-    assert("date" in parsed);
-    // The parsed value is the bare result the client supplied.
-    assert(parsed["date"]["action"].get!string == "accept");
-    // Nothing under _meta is consulted.
-    assert("_meta" !in params);
+	auto parsed = readInputResponses(params);
+	assert("date" in parsed);
+	// The parsed value is the bare result the client supplied.
+	assert(parsed["date"]["action"].get!string == "accept");
+	// Nothing under _meta is consulted.
+	assert("_meta" !in params);
 }
 
 unittest  // SEP-2322: inputResponses lives in params, NOT under params._meta
 {
-    // Regression guard for the wire location. A spec server reads
-    // `params.inputResponses`; the invented reserved `_meta` key must not exist.
-    Json responses = Json.emptyObject;
-    responses["github_login"] = Json([
-        "action": Json("accept"),
-        "content": Json(["name": Json("octocat")])
-    ]);
+	// Regression guard for the wire location. A spec server reads
+	// `params.inputResponses`; the invented reserved `_meta` key must not exist.
+	Json responses = Json.emptyObject;
+	responses["github_login"] = Json([
+		"action": Json("accept"),
+		"content": Json(["name": Json("octocat")])
+	]);
 
-    // Placed at top level: parsed.
-    Json good = Json.emptyObject;
-    good["name"] = "get_weather";
-    good["inputResponses"] = responses;
-    auto parsed = readInputResponses(good);
-    assert("github_login" in parsed);
-    assert(parsed["github_login"]["content"]["name"].get!string == "octocat");
+	// Placed at top level: parsed.
+	Json good = Json.emptyObject;
+	good["name"] = "get_weather";
+	good["inputResponses"] = responses;
+	auto parsed = readInputResponses(good);
+	assert("github_login" in parsed);
+	assert(parsed["github_login"]["content"]["name"].get!string == "octocat");
 
-    // Placed under _meta (the old, invented shape): ignored.
-    Json bad = Json.emptyObject;
-    Json meta = Json.emptyObject;
-    meta["io.modelcontextprotocol/inputResponses"] = responses;
-    bad["_meta"] = meta;
-    assert(readInputResponses(bad).length == 0);
+	// Placed under _meta (the old, invented shape): ignored.
+	Json bad = Json.emptyObject;
+	Json meta = Json.emptyObject;
+	meta["io.modelcontextprotocol/inputResponses"] = responses;
+	bad["_meta"] = meta;
+	assert(readInputResponses(bad).length == 0);
 }
 
 unittest  // SEP-2322: InputRequiredResult carries the opaque requestState round-trip
 {
-    InputRequiredResult ir;
-    ir.inputRequests = [
-        InputRequest("github_login", "elicitation", Json.emptyObject)
-    ];
-    ir.requestState = "foo";
-    auto j = ir.toJson();
-    // requestState is a top-level field on the result, alongside inputRequests.
-    assert(j["requestState"].get!string == "foo");
-    auto back = InputRequiredResult.fromJson(j);
-    assert(back.requestState == "foo");
+	InputRequiredResult ir;
+	ir.inputRequests = [
+		InputRequest("github_login", "elicitation", Json.emptyObject)
+	];
+	ir.requestState = "foo";
+	auto j = ir.toJson();
+	// requestState is a top-level field on the result, alongside inputRequests.
+	assert(j["requestState"].get!string == "foo");
+	auto back = InputRequiredResult.fromJson(j);
+	assert(back.requestState == "foo");
 }
 
 unittest  // SEP-2322: an empty requestState is omitted from the wire result
 {
-    InputRequiredResult ir;
-    ir.inputRequests = [InputRequest("r1", "elicitation", Json.emptyObject)];
-    auto j = ir.toJson();
-    // The client MUST NOT echo a requestState the server never sent.
-    assert("requestState" !in j);
+	InputRequiredResult ir;
+	ir.inputRequests = [InputRequest("r1", "elicitation", Json.emptyObject)];
+	auto j = ir.toJson();
+	// The client MUST NOT echo a requestState the server never sent.
+	assert("requestState" !in j);
 }
 
 unittest  // SEP-2322: readRequestState reads the opaque top-level params.requestState
 {
-    Json params = Json.emptyObject;
-    params["name"] = "get_weather";
-    params["requestState"] = "eyJyZXNvbHV0aW9uIjoiRHVwbGljYXRlIn0";
-    assert(readRequestState(params) == "eyJyZXNvbHV0aW9uIjoiRHVwbGljYXRlIn0");
+	Json params = Json.emptyObject;
+	params["name"] = "get_weather";
+	params["requestState"] = "eyJyZXNvbHV0aW9uIjoiRHVwbGljYXRlIn0";
+	assert(readRequestState(params) == "eyJyZXNvbHV0aW9uIjoiRHVwbGljYXRlIn0");
 
-    // Absent / wrong type -> empty.
-    assert(readRequestState(Json.emptyObject) == "");
-    Json wrong = Json.emptyObject;
-    wrong["requestState"] = 7;
-    assert(readRequestState(wrong) == "");
+	// Absent / wrong type -> empty.
+	assert(readRequestState(Json.emptyObject) == "");
+	Json wrong = Json.emptyObject;
+	wrong["requestState"] = 7;
+	assert(readRequestState(wrong) == "");
 }
 
 unittest  // header value codec: plain ASCII passes through; others base64
 {
-    assert(encodeHeaderValue("us-west1") == "us-west1");
-    assert(decodeHeaderValue("us-west1") == "us-west1");
+	assert(encodeHeaderValue("us-west1") == "us-west1");
+	assert(decodeHeaderValue("us-west1") == "us-west1");
 
-    // non-ASCII -> base64 sentinel, round-trips
-    auto enc = encodeHeaderValue("Hello, 世界");
-    assert(enc.length > 9 && enc[0 .. 9] == "=?base64?");
-    assert(decodeHeaderValue(enc) == "Hello, 世界");
+	// non-ASCII -> base64 sentinel, round-trips
+	auto enc = encodeHeaderValue("Hello, 世界");
+	assert(enc.length > 9 && enc[0 .. 9] == "=?base64?");
+	assert(decodeHeaderValue(enc) == "Hello, 世界");
 
-    // leading/trailing space and sentinel-looking values are encoded
-    assert(encodeHeaderValue(" padded ")[0 .. 9] == "=?base64?");
-    assert(decodeHeaderValue(encodeHeaderValue(" padded ")) == " padded ");
-    assert(decodeHeaderValue(encodeHeaderValue("=?base64?x?=")) == "=?base64?x?=");
+	// leading/trailing space and sentinel-looking values are encoded
+	assert(encodeHeaderValue(" padded ")[0 .. 9] == "=?base64?");
+	assert(decodeHeaderValue(encodeHeaderValue(" padded ")) == " padded ");
+	assert(decodeHeaderValue(encodeHeaderValue("=?base64?x?=")) == "=?base64?x?=");
 }
 
 unittest  // isValidMetaKey: plain names without prefix
 {
-    assert(isValidMetaKey("progress"));
-    assert(isValidMetaKey("a"));
-    assert(isValidMetaKey("a-b_c.d"));
-    assert(isValidMetaKey("trace2"));
+	assert(isValidMetaKey("progress"));
+	assert(isValidMetaKey("a"));
+	assert(isValidMetaKey("a-b_c.d"));
+	assert(isValidMetaKey("trace2"));
 
-    assert(!isValidMetaKey(""));
-    assert(!isValidMetaKey("-bad")); // must start alphanumeric
-    assert(!isValidMetaKey("bad-")); // must end alphanumeric
-    assert(!isValidMetaKey("_bad")); // must start alphanumeric
-    assert(!isValidMetaKey("has space"));
+	assert(!isValidMetaKey(""));
+	assert(!isValidMetaKey("-bad")); // must start alphanumeric
+	assert(!isValidMetaKey("bad-")); // must end alphanumeric
+	assert(!isValidMetaKey("_bad")); // must start alphanumeric
+	assert(!isValidMetaKey("has space"));
 }
 
 unittest  // isValidMetaKey: prefixed keys
 {
-    assert(isValidMetaKey("io.modelcontextprotocol/protocolVersion"));
-    assert(isValidMetaKey("com.example/myKey"));
-    assert(isValidMetaKey("a/b"));
-    assert(isValidMetaKey("my-org.tools-v2/data.point"));
+	assert(isValidMetaKey("io.modelcontextprotocol/protocolVersion"));
+	assert(isValidMetaKey("com.example/myKey"));
+	assert(isValidMetaKey("a/b"));
+	assert(isValidMetaKey("my-org.tools-v2/data.point"));
 
-    assert(!isValidMetaKey("/name")); // empty prefix
-    assert(!isValidMetaKey("1bad.example/name")); // label must start with letter
-    assert(!isValidMetaKey("bad-.example/name")); // label must end alphanumeric
-    assert(!isValidMetaKey("io..example/name")); // empty interior label
-    assert(!isValidMetaKey("io.example/-x")); // name must start alphanumeric
+	assert(!isValidMetaKey("/name")); // empty prefix
+	assert(!isValidMetaKey("1bad.example/name")); // label must start with letter
+	assert(!isValidMetaKey("bad-.example/name")); // label must end alphanumeric
+	assert(!isValidMetaKey("io..example/name")); // empty interior label
+	assert(!isValidMetaKey("io.example/-x")); // name must start alphanumeric
 }
 
 unittest  // isValidMetaKey: prefix-only keys (empty name segment is valid)
 {
-    // The spec's Name rule is "Unless empty, MUST begin and end with an
-    // alphanumeric character", so a valid prefix followed by an empty name
-    // segment is a valid `_meta` key.
-    assert(isValidMetaKey("io.example/"));
-    assert(isValidMetaKey("com.example/"));
-    assert(isValidMetaKey("io.modelcontextprotocol/"));
-    assert(isValidMetaKey("a/"));
+	// The spec's Name rule is "Unless empty, MUST begin and end with an
+	// alphanumeric character", so a valid prefix followed by an empty name
+	// segment is a valid `_meta` key.
+	assert(isValidMetaKey("io.example/"));
+	assert(isValidMetaKey("com.example/"));
+	assert(isValidMetaKey("io.modelcontextprotocol/"));
+	assert(isValidMetaKey("a/"));
 
-    // An empty prefix with an empty name is still invalid.
-    assert(!isValidMetaKey("/"));
+	// An empty prefix with an empty name is still invalid.
+	assert(!isValidMetaKey("/"));
 }
 
 unittest  // isReservedMetaPrefix: second label modelcontextprotocol or mcp
 {
-    assert(isReservedMetaPrefix("io.modelcontextprotocol/protocolVersion"));
-    assert(isReservedMetaPrefix("com.mcp/whatever"));
+	assert(isReservedMetaPrefix("io.modelcontextprotocol/protocolVersion"));
+	assert(isReservedMetaPrefix("com.mcp/whatever"));
 
-    assert(!isReservedMetaPrefix("io.example/key"));
-    assert(!isReservedMetaPrefix("modelcontextprotocol/key")); // only one label, no second
-    assert(!isReservedMetaPrefix("plainkey")); // no prefix at all
-    assert(!isReservedMetaPrefix("a.b.mcp/key")); // mcp is third label, not second
+	assert(!isReservedMetaPrefix("io.example/key"));
+	assert(!isReservedMetaPrefix("modelcontextprotocol/key")); // only one label, no second
+	assert(!isReservedMetaPrefix("plainkey")); // no prefix at all
+	assert(!isReservedMetaPrefix("a.b.mcp/key")); // mcp is third label, not second
 }
 
 unittest  // isReservedMetaPrefix(2025-06-18): mcp-token in first position + trailing label
 {
-    import mcp.protocol.versions : ProtocolVersion;
+	import mcp.protocol.versions : ProtocolVersion;
 
-    // Per 2025-06-18 basic/index, a prefix beginning with `modelcontextprotocol`
-    // or `mcp` followed by ANY valid label is reserved.
-    assert(isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_06_18));
-    assert(isReservedMetaPrefix("mcp.dev/key", ProtocolVersion.v2025_06_18));
-    assert(isReservedMetaPrefix("tools.mcp.com/key", ProtocolVersion.v2025_06_18));
-    assert(isReservedMetaPrefix("api.modelcontextprotocol.org/key", ProtocolVersion.v2025_06_18));
-    // Reserved when the token is the second label AND a trailing label follows.
-    assert(isReservedMetaPrefix("io.modelcontextprotocol.v2/key", ProtocolVersion.v2025_06_18));
+	// Per 2025-06-18 basic/index, a prefix beginning with `modelcontextprotocol`
+	// or `mcp` followed by ANY valid label is reserved.
+	assert(isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_06_18));
+	assert(isReservedMetaPrefix("mcp.dev/key", ProtocolVersion.v2025_06_18));
+	assert(isReservedMetaPrefix("tools.mcp.com/key", ProtocolVersion.v2025_06_18));
+	assert(isReservedMetaPrefix("api.modelcontextprotocol.org/key", ProtocolVersion.v2025_06_18));
+	// Reserved when the token is the second label AND a trailing label follows.
+	assert(isReservedMetaPrefix("io.modelcontextprotocol.v2/key", ProtocolVersion.v2025_06_18));
 }
 
 unittest  // isReservedMetaPrefix(2025-06-18): not reserved without a trailing label or token
 {
-    import mcp.protocol.versions : ProtocolVersion;
+	import mcp.protocol.versions : ProtocolVersion;
 
-    // No following label after the mcp-token -> not reserved.
-    assert(!isReservedMetaPrefix("modelcontextprotocol/key", ProtocolVersion.v2025_06_18));
-    assert(!isReservedMetaPrefix("mcp/key", ProtocolVersion.v2025_06_18));
-    // No mcp-token at all.
-    assert(!isReservedMetaPrefix("io.example/key", ProtocolVersion.v2025_06_18));
-    // No prefix at all.
-    assert(!isReservedMetaPrefix("plainkey", ProtocolVersion.v2025_06_18));
+	// No following label after the mcp-token -> not reserved.
+	assert(!isReservedMetaPrefix("modelcontextprotocol/key", ProtocolVersion.v2025_06_18));
+	assert(!isReservedMetaPrefix("mcp/key", ProtocolVersion.v2025_06_18));
+	// No mcp-token at all.
+	assert(!isReservedMetaPrefix("io.example/key", ProtocolVersion.v2025_06_18));
+	// No prefix at all.
+	assert(!isReservedMetaPrefix("plainkey", ProtocolVersion.v2025_06_18));
 }
 
 unittest  // isReservedMetaPrefix(2025-11-25/draft): keeps the narrower second-label rule
 {
-    import mcp.protocol.versions : ProtocolVersion;
+	import mcp.protocol.versions : ProtocolVersion;
 
-    // First-position token is NOT reserved under 2025-11-25/draft (only the
-    // second label counts), so the draft/2025-11-25 wire behaviour is unchanged.
-    assert(!isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
-    assert(!isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.draft));
-    // `com.example.mcp/` has `mcp` as its THIRD label, so it is NOT reserved under
-    // the second-label rule (the 2025-11-25 spec's own counter-example).
-    assert(!isReservedMetaPrefix("com.example.mcp/key", ProtocolVersion.v2025_11_25));
-    assert(!isReservedMetaPrefix("com.example.mcp/key", ProtocolVersion.draft));
-    // Second-label token IS reserved under both.
-    assert(isReservedMetaPrefix("io.modelcontextprotocol/key", ProtocolVersion.v2025_11_25));
-    assert(isReservedMetaPrefix("com.mcp/key", ProtocolVersion.draft));
-    // The clean divergence: `modelcontextprotocol.io/` is reserved under 2025-06-18
-    // (first-position token + trailing label) but NOT under 2025-11-25 (second
-    // label is `io`).
-    assert(isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_06_18)
-            && !isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
-    // The version-agnostic overload must match the 2025-11-25/draft rule exactly.
-    assert(isReservedMetaPrefix("io.modelcontextprotocol/key",
-            ProtocolVersion.v2025_11_25) == isReservedMetaPrefix("io.modelcontextprotocol/key"));
-    assert(isReservedMetaPrefix("modelcontextprotocol.io/key",
-            ProtocolVersion.draft) == isReservedMetaPrefix("modelcontextprotocol.io/key"));
+	// First-position token is NOT reserved under 2025-11-25/draft (only the
+	// second label counts), so the draft/2025-11-25 wire behaviour is unchanged.
+	assert(!isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
+	assert(!isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.draft));
+	// `com.example.mcp/` has `mcp` as its THIRD label, so it is NOT reserved under
+	// the second-label rule (the 2025-11-25 spec's own counter-example).
+	assert(!isReservedMetaPrefix("com.example.mcp/key", ProtocolVersion.v2025_11_25));
+	assert(!isReservedMetaPrefix("com.example.mcp/key", ProtocolVersion.draft));
+	// Second-label token IS reserved under both.
+	assert(isReservedMetaPrefix("io.modelcontextprotocol/key", ProtocolVersion.v2025_11_25));
+	assert(isReservedMetaPrefix("com.mcp/key", ProtocolVersion.draft));
+	// The clean divergence: `modelcontextprotocol.io/` is reserved under 2025-06-18
+	// (first-position token + trailing label) but NOT under 2025-11-25 (second
+	// label is `io`).
+	assert(isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_06_18)
+			&& !isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
+	// The version-agnostic overload must match the 2025-11-25/draft rule exactly.
+	assert(isReservedMetaPrefix("io.modelcontextprotocol/key",
+			ProtocolVersion.v2025_11_25) == isReservedMetaPrefix("io.modelcontextprotocol/key"));
+	assert(isReservedMetaPrefix("modelcontextprotocol.io/key",
+			ProtocolVersion.draft) == isReservedMetaPrefix("modelcontextprotocol.io/key"));
 }
 
 unittest  // isUserMetaKeyAllowed(2025-06-18) rejects first-position mcp-token prefixes
 {
-    import mcp.protocol.versions : ProtocolVersion;
+	import mcp.protocol.versions : ProtocolVersion;
 
-    // Reserved under 2025-06-18 (first-position token + trailing label, second
-    // label not an mcp-token) -> disallowed on a 2025-06-18 connection.
-    assert(!isUserMetaKeyAllowed("modelcontextprotocol.io/key", ProtocolVersion.v2025_06_18));
-    assert(!isUserMetaKeyAllowed("mcp.dev/key", ProtocolVersion.v2025_06_18));
-    // But allowed under 2025-11-25/draft, where those prefixes are not reserved
-    // (their second label is `io` / `dev`, not an mcp-token).
-    assert(isUserMetaKeyAllowed("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
-    assert(isUserMetaKeyAllowed("mcp.dev/key", ProtocolVersion.draft));
-    // A genuine vendor key is allowed on every version.
-    assert(isUserMetaKeyAllowed("com.example/myKey", ProtocolVersion.v2025_06_18));
-    assert(isUserMetaKeyAllowed("com.example/myKey", ProtocolVersion.v2025_11_25));
+	// Reserved under 2025-06-18 (first-position token + trailing label, second
+	// label not an mcp-token) -> disallowed on a 2025-06-18 connection.
+	assert(!isUserMetaKeyAllowed("modelcontextprotocol.io/key", ProtocolVersion.v2025_06_18));
+	assert(!isUserMetaKeyAllowed("mcp.dev/key", ProtocolVersion.v2025_06_18));
+	// But allowed under 2025-11-25/draft, where those prefixes are not reserved
+	// (their second label is `io` / `dev`, not an mcp-token).
+	assert(isUserMetaKeyAllowed("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
+	assert(isUserMetaKeyAllowed("mcp.dev/key", ProtocolVersion.draft));
+	// A genuine vendor key is allowed on every version.
+	assert(isUserMetaKeyAllowed("com.example/myKey", ProtocolVersion.v2025_06_18));
+	assert(isUserMetaKeyAllowed("com.example/myKey", ProtocolVersion.v2025_11_25));
 }
 
 unittest  // isUserMetaKeyAllowed: valid and not reserved
 {
-    assert(isUserMetaKeyAllowed("com.example/myKey"));
-    assert(isUserMetaKeyAllowed("progress"));
+	assert(isUserMetaKeyAllowed("com.example/myKey"));
+	assert(isUserMetaKeyAllowed("progress"));
 
-    assert(!isUserMetaKeyAllowed("io.modelcontextprotocol/x")); // reserved
-    assert(!isUserMetaKeyAllowed("com.mcp/x")); // reserved
-    assert(!isUserMetaKeyAllowed("bad space")); // invalid format
-    assert(!isUserMetaKeyAllowed("/x")); // invalid format
+	assert(!isUserMetaKeyAllowed("io.modelcontextprotocol/x")); // reserved
+	assert(!isUserMetaKeyAllowed("com.mcp/x")); // reserved
+	assert(!isUserMetaKeyAllowed("bad space")); // invalid format
+	assert(!isUserMetaKeyAllowed("/x")); // invalid format
 }
 
 unittest  // MetaKey enum values are all valid keys (spec-compliant by construction)
 {
-    import std.traits : EnumMembers;
+	import std.traits : EnumMembers;
 
-    static foreach (k; EnumMembers!MetaKey)
-        assert(isValidMetaKey(cast(string) k));
+	static foreach (k; EnumMembers!MetaKey)
+		assert(isValidMetaKey(cast(string) k));
 }
 
 unittest  // paramHeaderMap reads x-mcp-header annotations
 {
-    Json schema = Json.emptyObject;
-    schema["type"] = "object";
-    Json props = Json.emptyObject;
-    props["region"] = Json([
-        "type": Json("string"),
-        "x-mcp-header": Json("Region")
-    ]);
-    props["query"] = Json(["type": Json("string")]);
-    schema["properties"] = props;
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json props = Json.emptyObject;
+	props["region"] = Json([
+		"type": Json("string"),
+		"x-mcp-header": Json("Region")
+	]);
+	props["query"] = Json(["type": Json("string")]);
+	schema["properties"] = props;
 
-    auto m = paramHeaderMap(schema);
-    assert("region" in m);
-    assert(m["region"] == "Mcp-Param-Region");
-    assert("query" !in m);
+	auto m = paramHeaderMap(schema);
+	assert("region" in m);
+	assert(m["region"] == "Mcp-Param-Region");
+	assert("query" !in m);
 }
 
 unittest  // validateHeaderName: empty value rejected (draft x-mcp-header MUST NOT be empty)
 {
-    assert(validateHeaderName("") !is null);
+	assert(validateHeaderName("") !is null);
 }
 
 unittest  // validateHeaderName: valid token passes
 {
-    assert(validateHeaderName("Region") is null);
-    assert(validateHeaderName("X-Trace-Id_v2.1") is null);
+	assert(validateHeaderName("Region") is null);
+	assert(validateHeaderName("X-Trace-Id_v2.1") is null);
 }
 
 unittest  // validateHeaderName: CR/LF and control chars rejected (no header injection)
 {
-    assert(validateHeaderName("Re\rgion") !is null);
-    assert(validateHeaderName("Re\ngion") !is null);
-    assert(validateHeaderName("Re\x01gion") !is null);
+	assert(validateHeaderName("Re\rgion") !is null);
+	assert(validateHeaderName("Re\ngion") !is null);
+	assert(validateHeaderName("Re\x01gion") !is null);
 }
 
 unittest  // validateHeaderName: space and colon are not tchar
 {
-    assert(validateHeaderName("My Region") !is null);
-    assert(validateHeaderName("Region:") !is null);
+	assert(validateHeaderName("My Region") !is null);
+	assert(validateHeaderName("Region:") !is null);
 }
 
 unittest  // isPrimitiveHeaderType: integer/string/boolean allowed, number/object/array not
 {
-    assert(isPrimitiveHeaderType("integer"));
-    assert(isPrimitiveHeaderType("string"));
-    assert(isPrimitiveHeaderType("boolean"));
-    assert(!isPrimitiveHeaderType("number"));
-    assert(!isPrimitiveHeaderType("object"));
-    assert(!isPrimitiveHeaderType("array"));
+	assert(isPrimitiveHeaderType("integer"));
+	assert(isPrimitiveHeaderType("string"));
+	assert(isPrimitiveHeaderType("boolean"));
+	assert(!isPrimitiveHeaderType("number"));
+	assert(!isPrimitiveHeaderType("object"));
+	assert(!isPrimitiveHeaderType("array"));
 }
 
 unittest  // validateInputSchemaHeaders: a valid primitive annotation passes
 {
-    Json schema = Json.emptyObject;
-    schema["type"] = "object";
-    Json props = Json.emptyObject;
-    props["region"] = Json([
-        "type": Json("string"),
-        "x-mcp-header": Json("Region")
-    ]);
-    props["limit"] = Json([
-        "type": Json("integer"),
-        "x-mcp-header": Json("Limit")
-    ]);
-    schema["properties"] = props;
-    assert(validateInputSchemaHeaders(schema) is null);
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json props = Json.emptyObject;
+	props["region"] = Json([
+		"type": Json("string"),
+		"x-mcp-header": Json("Region")
+	]);
+	props["limit"] = Json([
+		"type": Json("integer"),
+		"x-mcp-header": Json("Limit")
+	]);
+	schema["properties"] = props;
+	assert(validateInputSchemaHeaders(schema) is null);
 }
 
 unittest  // validateInputSchemaHeaders: number-typed annotation is rejected (number NOT permitted)
 {
-    Json schema = Json.emptyObject;
-    schema["type"] = "object";
-    Json props = Json.emptyObject;
-    props["amount"] = Json([
-        "type": Json("number"),
-        "x-mcp-header": Json("Amount")
-    ]);
-    schema["properties"] = props;
-    assert(validateInputSchemaHeaders(schema) !is null);
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json props = Json.emptyObject;
+	props["amount"] = Json([
+		"type": Json("number"),
+		"x-mcp-header": Json("Amount")
+	]);
+	schema["properties"] = props;
+	assert(validateInputSchemaHeaders(schema) !is null);
 }
 
 unittest  // validateInputSchemaHeaders: empty x-mcp-header value rejected
 {
-    Json schema = Json.emptyObject;
-    schema["type"] = "object";
-    Json props = Json.emptyObject;
-    props["region"] = Json(["type": Json("string"), "x-mcp-header": Json("")]);
-    schema["properties"] = props;
-    assert(validateInputSchemaHeaders(schema) !is null);
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json props = Json.emptyObject;
+	props["region"] = Json(["type": Json("string"), "x-mcp-header": Json("")]);
+	schema["properties"] = props;
+	assert(validateInputSchemaHeaders(schema) !is null);
 }
 
 unittest  // validateInputSchemaHeaders: CR/LF in value rejected
 {
-    Json schema = Json.emptyObject;
-    schema["type"] = "object";
-    Json props = Json.emptyObject;
-    props["region"] = Json([
-        "type": Json("string"),
-        "x-mcp-header": Json("Re\r\ngion")
-    ]);
-    schema["properties"] = props;
-    assert(validateInputSchemaHeaders(schema) !is null);
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json props = Json.emptyObject;
+	props["region"] = Json([
+		"type": Json("string"),
+		"x-mcp-header": Json("Re\r\ngion")
+	]);
+	schema["properties"] = props;
+	assert(validateInputSchemaHeaders(schema) !is null);
 }
 
 unittest  // validateInputSchemaHeaders: case-insensitively duplicate values rejected
 {
-    Json schema = Json.emptyObject;
-    schema["type"] = "object";
-    Json props = Json.emptyObject;
-    props["a"] = Json(["type": Json("string"), "x-mcp-header": Json("Region")]);
-    props["b"] = Json(["type": Json("string"), "x-mcp-header": Json("region")]);
-    schema["properties"] = props;
-    assert(validateInputSchemaHeaders(schema) !is null);
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json props = Json.emptyObject;
+	props["a"] = Json(["type": Json("string"), "x-mcp-header": Json("Region")]);
+	props["b"] = Json(["type": Json("string"), "x-mcp-header": Json("region")]);
+	schema["properties"] = props;
+	assert(validateInputSchemaHeaders(schema) !is null);
 }
 
 unittest  // validateInputSchemaHeaders: detects duplicate across nesting depths
 {
-    Json schema = Json.emptyObject;
-    schema["type"] = "object";
-    Json nestedProps = Json.emptyObject;
-    nestedProps["region"] = Json([
-        "type": Json("string"),
-        "x-mcp-header": Json("Region")
-    ]);
-    Json nested = Json.emptyObject;
-    nested["type"] = "object";
-    nested["properties"] = nestedProps;
-    Json props = Json.emptyObject;
-    props["top"] = Json(["type": Json("string"), "x-mcp-header": Json("REGION")]);
-    props["obj"] = nested;
-    schema["properties"] = props;
-    assert(validateInputSchemaHeaders(schema) !is null);
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json nestedProps = Json.emptyObject;
+	nestedProps["region"] = Json([
+		"type": Json("string"),
+		"x-mcp-header": Json("Region")
+	]);
+	Json nested = Json.emptyObject;
+	nested["type"] = "object";
+	nested["properties"] = nestedProps;
+	Json props = Json.emptyObject;
+	props["top"] = Json(["type": Json("string"), "x-mcp-header": Json("REGION")]);
+	props["obj"] = nested;
+	schema["properties"] = props;
+	assert(validateInputSchemaHeaders(schema) !is null);
 }
 
 unittest  // paramHeaders: recurses into nested object properties (any nesting depth)
 {
-    Json schema = Json.emptyObject;
-    schema["type"] = "object";
-    Json nestedProps = Json.emptyObject;
-    nestedProps["region"] = Json([
-        "type": Json("string"),
-        "x-mcp-header": Json("Region")
-    ]);
-    Json nested = Json.emptyObject;
-    nested["type"] = "object";
-    nested["properties"] = nestedProps;
-    Json props = Json.emptyObject;
-    props["filters"] = nested;
-    schema["properties"] = props;
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json nestedProps = Json.emptyObject;
+	nestedProps["region"] = Json([
+		"type": Json("string"),
+		"x-mcp-header": Json("Region")
+	]);
+	Json nested = Json.emptyObject;
+	nested["type"] = "object";
+	nested["properties"] = nestedProps;
+	Json props = Json.emptyObject;
+	props["filters"] = nested;
+	schema["properties"] = props;
 
-    auto phs = paramHeaders(schema);
-    assert(phs.length == 1);
-    assert(phs[0].path == ["filters", "region"]);
-    assert(phs[0].header == "Mcp-Param-Region");
+	auto phs = paramHeaders(schema);
+	assert(phs.length == 1);
+	assert(phs[0].path == ["filters", "region"]);
+	assert(phs[0].header == "Mcp-Param-Region");
 }
 
 unittest  // paramHeaders: recurses into array items schemas
 {
-    Json schema = Json.emptyObject;
-    schema["type"] = "object";
-    Json itemProps = Json.emptyObject;
-    itemProps["tag"] = Json([
-        "type": Json("string"),
-        "x-mcp-header": Json("Tag")
-    ]);
-    Json items = Json.emptyObject;
-    items["type"] = "object";
-    items["properties"] = itemProps;
-    Json arr = Json.emptyObject;
-    arr["type"] = "array";
-    arr["items"] = items;
-    Json props = Json.emptyObject;
-    props["entries"] = arr;
-    schema["properties"] = props;
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json itemProps = Json.emptyObject;
+	itemProps["tag"] = Json([
+		"type": Json("string"),
+		"x-mcp-header": Json("Tag")
+	]);
+	Json items = Json.emptyObject;
+	items["type"] = "object";
+	items["properties"] = itemProps;
+	Json arr = Json.emptyObject;
+	arr["type"] = "array";
+	arr["items"] = items;
+	Json props = Json.emptyObject;
+	props["entries"] = arr;
+	schema["properties"] = props;
 
-    auto phs = paramHeaders(schema);
-    assert(phs.length == 1);
-    assert(phs[0].path == ["entries", "tag"]);
-    assert(phs[0].header == "Mcp-Param-Tag");
+	auto phs = paramHeaders(schema);
+	assert(phs.length == 1);
+	assert(phs[0].path == ["entries", "tag"]);
+	assert(phs[0].header == "Mcp-Param-Tag");
 }
 
 unittest  // paramHeaders: number-typed annotations are skipped (not collected)
 {
-    Json schema = Json.emptyObject;
-    schema["type"] = "object";
-    Json props = Json.emptyObject;
-    props["amount"] = Json([
-        "type": Json("number"),
-        "x-mcp-header": Json("Amount")
-    ]);
-    schema["properties"] = props;
-    assert(paramHeaders(schema).length == 0);
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json props = Json.emptyObject;
+	props["amount"] = Json([
+		"type": Json("number"),
+		"x-mcp-header": Json("Amount")
+	]);
+	schema["properties"] = props;
+	assert(paramHeaders(schema).length == 0);
 }
