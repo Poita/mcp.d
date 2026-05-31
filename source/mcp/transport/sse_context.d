@@ -111,13 +111,18 @@ final class StreamCoordinator
 /// A long-lived server->client SSE channel for *unsolicited* traffic — the
 /// stream a client opens with an HTTP GET to the MCP endpoint (basic/transports
 /// §Listening for Messages from the Server). Unlike `HttpStreamContext`, which
-/// is bound to one in-flight POST, this channel fans a single notification (or
-/// server->client request) out to every currently-connected GET listener.
+/// is bound to one in-flight POST, this channel delivers a notification (or
+/// server->client request) on a single one of the currently-connected GET
+/// listeners.
 ///
 /// A handler is registered per accepted GET; `emit` frames the JSON-RPC message
 /// as an SSE event with a globally-unique id (via the shared `StreamCoordinator`
-/// ordinal scheme) and writes it to every live listener. Listeners that fail to
-/// write (a disconnected client) are dropped so the channel self-heals.
+/// ordinal scheme) and writes it to exactly ONE live listener. This honours the
+/// transport's Multiple Connections rule: "The server MUST send each of its
+/// JSON-RPC messages on only one of the connected streams; that is, it MUST NOT
+/// broadcast the same message across multiple streams." Listeners that fail to
+/// write (a disconnected client) are skipped and dropped so the channel
+/// self-heals and the message still lands on a live stream.
 ///
 /// One instance is shared across a server mount. Thread-safety is the caller's
 /// responsibility on multi-threaded vibe.d setups; the default single-fiber
@@ -179,25 +184,31 @@ final class ServerPushChannel
         return listeners.length;
     }
 
-    /// Frame `msg` as an SSE event (with a per-listener globally-unique id) and
-    /// write it to every connected listener. A listener whose write throws (a
-    /// disconnected client) is removed. Returns the number of listeners the
-    /// message was delivered to.
+    /// Frame `msg` as an SSE event (with a per-stream globally-unique id) and
+    /// deliver it on exactly ONE connected stream, honouring the transport's
+    /// Multiple Connections rule that the server "MUST send each of its JSON-RPC
+    /// messages on only one of the connected streams ... it MUST NOT broadcast the
+    /// same message across multiple streams." Listeners are tried in registration
+    /// order; one whose write throws (a disconnected client) is dropped and the
+    /// next live listener is tried, so the message still lands on a healthy stream
+    /// and the channel self-heals. Returns 1 if the message was delivered, or 0
+    /// when no live listener could receive it.
     size_t emit(Json msg) @safe
     {
+        import std.conv : to;
+
         long[] dead;
         size_t delivered;
         foreach (ref l; listeners)
         {
-            import std.conv : to;
-
             const eid = streamOf[l.id].to!string ~ "-" ~ seqOf[l.id].to!string;
             const frame = formatSseEvent(eid, withSubscriptionId(msg, l.subscriptionId));
             try
             {
                 l.write(frame);
                 seqOf[l.id]++;
-                delivered++;
+                delivered = 1;
+                break; // single-stream delivery: do not fan out to other streams
             }
             catch (Exception)
             {
@@ -220,8 +231,8 @@ final class ServerPushChannel
     /// and tracked by the shared `StreamCoordinator`, so the client's reply --
     /// which arrives on a *separate* POST to the MCP endpoint and is routed
     /// through `StreamCoordinator.resolve` -- wakes this call. The request frame
-    /// is broadcast to every connected listener; the first matching response
-    /// resolves the waiter (later duplicates for the same id are ignored).
+    /// is delivered on a single connected listener; the matching response
+    /// resolves the waiter.
     /// Returns the client's result, or throws `McpException` on a client error
     /// or timeout. Throws `internalError` if no GET listener is connected (there
     /// is nobody to answer). This is the request/response counterpart to
@@ -312,20 +323,39 @@ unittest  // a listener receives framed events, with monotonic per-listener ids
     assert(ch.listenerCount == 0);
 }
 
-unittest  // emit fans out to every listener and self-heals broken ones
+unittest  // emit delivers to exactly ONE stream, never broadcasting to all
+{
+    // basic/transports §Multiple Connections: "The server MUST send each of its
+    // JSON-RPC messages on only one of the connected streams; that is, it MUST
+    // NOT broadcast the same message across multiple streams." With two open GET
+    // streams, a single emit must reach exactly one of them.
+    auto coord = new StreamCoordinator;
+    auto ch = new ServerPushChannel(coord);
+    int aCount, bCount;
+    ch.addListener((string) @safe { aCount++; });
+    ch.addListener((string) @safe { bCount++; });
+    assert(ch.listenerCount == 2);
+
+    const delivered = ch.notify("notifications/message");
+    assert(delivered == 1); // exactly one stream, not both
+    assert(aCount + bCount == 1); // the message landed on a single stream only
+    assert(ch.listenerCount == 2); // both streams remain open
+}
+
+unittest  // emit self-heals: it skips a broken stream and delivers on a live one
 {
     auto coord = new StreamCoordinator;
     auto ch = new ServerPushChannel(coord);
     int aCount;
-    ch.addListener((string) @safe { aCount++; });
-    // A listener that always throws simulates a disconnected client.
+    // The first listener always throws (a disconnected client); the second is healthy.
     ch.addListener((string) @safe { throw new Exception("closed"); });
+    ch.addListener((string) @safe { aCount++; });
     assert(ch.listenerCount == 2);
 
     const delivered = ch.notify("notifications/message");
-    assert(delivered == 1); // only the healthy listener received it
+    assert(delivered == 1); // the healthy stream received it
     assert(aCount == 1);
-    assert(ch.listenerCount == 1); // the broken listener was dropped
+    assert(ch.listenerCount == 1); // the broken stream was dropped
 }
 
 unittest  // emitTo delivers only to the named listener, not the others
@@ -347,24 +377,36 @@ unittest  // emitTo delivers only to the named listener, not the others
     assert(!ch.emitTo(9999, makeNotification("notifications/message")));
 }
 
-unittest  // a subscriptions/listen listener stamps subscriptionId on broadcast notifications
+unittest  // a notification delivered on a listen stream is stamped with its subscriptionId
 {
     import std.algorithm : canFind;
     import mcp.protocol.draft : MetaKey;
 
     auto coord = new StreamCoordinator;
     auto ch = new ServerPushChannel(coord);
-    string listenFrame, plainFrame;
-    // A listen stream (subscriptionId set) and a plain GET stream (none).
+    string listenFrame;
+    // A single listen stream: the chosen delivery target carries its subscriptionId.
     ch.addListener((string f) @safe { listenFrame = f; }, "listen-9");
-    ch.addListener((string f) @safe { plainFrame = f; });
 
-    ch.notify("notifications/tools/list_changed");
+    const delivered = ch.notify("notifications/tools/list_changed");
+    assert(delivered == 1);
 
-    // The listen stream's notification carries the subscriptionId in _meta;
-    // the plain GET stream's does not.
     assert(listenFrame.canFind(cast(string) MetaKey.subscriptionId));
     assert(listenFrame.canFind("listen-9"));
+}
+
+unittest  // a notification delivered on a plain GET stream carries no subscriptionId
+{
+    import std.algorithm : canFind;
+    import mcp.protocol.draft : MetaKey;
+
+    auto coord = new StreamCoordinator;
+    auto ch = new ServerPushChannel(coord);
+    string plainFrame;
+    ch.addListener((string f) @safe { plainFrame = f; });
+
+    const delivered = ch.notify("notifications/tools/list_changed");
+    assert(delivered == 1);
     assert(!plainFrame.canFind(cast(string) MetaKey.subscriptionId));
 }
 
@@ -390,9 +432,12 @@ unittest  // distinct listeners get distinct stream ordinals, so ids stay unique
     auto coord = new StreamCoordinator;
     auto ch = new ServerPushChannel(coord);
     string aFrame, bFrame;
-    ch.addListener((string f) @safe { aFrame = f; });
-    ch.addListener((string f) @safe { bFrame = f; });
-    ch.notify("notifications/message");
+    const a = ch.addListener((string f) @safe { aFrame = f; });
+    const b = ch.addListener((string f) @safe { bFrame = f; });
+    // Deliver one event to each stream individually (emit picks a single stream,
+    // so target each explicitly here to compare their independent event ids).
+    ch.emitTo(a, makeNotification("notifications/message"));
+    ch.emitTo(b, makeNotification("notifications/message"));
     assert(aFrame.length && bFrame.length);
     // The first line ("id: <stream>-<seq>") differs because the stream ordinal
     // differs between the two listeners.
