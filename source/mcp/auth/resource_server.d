@@ -80,7 +80,19 @@ struct ResourceServerConfig
 	/// The canonical resource identifier for this server (RFC 8707). When set,
 	/// the transport enforces that a validated token's audience includes it, and
 	/// publishes it as `resource` in the metadata document.
+	///
+	/// REQUIRED for spec compliance: basic/authorization §Access Token Privilege
+	/// Restriction says MCP servers MUST reject tokens that do not name them in the
+	/// audience claim. When this is empty `authorize()` fails closed (rejecting
+	/// every token) unless `allowAnyAudience` is set.
 	string resource;
+
+	/// Opt out of mandatory RFC 8707 audience binding when `resource` is empty.
+	/// Default false, so a validator with no `resource` fails closed per the spec
+	/// MUST. Set true only when the audience is asserted elsewhere (e.g. the
+	/// validator itself rejects wrong-audience tokens) or for local dev/tests —
+	/// it disables the SDK's audience check and is NOT spec compliant on its own.
+	bool allowAnyAudience;
 
 	/// The authorization server issuer URLs advertised in the metadata document
 	/// and (first entry) ignored by validation — they are informational for
@@ -176,9 +188,20 @@ AuthFailure authorize(ResourceServerConfig cfg, string authHeader, out TokenInfo
 	if (!ti.valid)
 		return AuthFailure.invalidToken;
 
-	// RFC 8707: the token MUST have been issued for this resource.
-	if (cfg.resource.length && !ti.hasAudience(cfg.resource))
+	// RFC 8707 / basic/authorization §Access Token Privilege Restriction: the token
+	// MUST have been issued for this resource. When a concrete `resource` is set we
+	// require the audience to include it. When `resource` is empty the SDK cannot
+	// verify the audience, so it fails closed (rejecting the token) unless the
+	// operator has explicitly opted out via `allowAnyAudience`.
+	if (cfg.resource.length)
+	{
+		if (!ti.hasAudience(cfg.resource))
+			return AuthFailure.invalidToken;
+	}
+	else if (!cfg.allowAnyAudience)
+	{
 		return AuthFailure.invalidToken;
+	}
 
 	// Scope enforcement comes after authentication (RFC 6750 §3.1).
 	if (cfg.requiredScope.length && !ti.hasScope(cfg.requiredScope))
@@ -266,6 +289,9 @@ unittest  // a validator that throws yields invalidToken (not a crash)
 unittest  // a valid token authorizes and surfaces TokenInfo
 {
 	ResourceServerConfig cfg;
+	// This test exercises subject/scope surfacing, not audience binding, so it
+	// opts out of the mandatory RFC 8707 check (issue #388).
+	cfg.allowAnyAudience = true;
 	cfg.validator = (string t) {
 		TokenInfo ti;
 		ti.valid = true;
@@ -325,12 +351,25 @@ unittest  // RFC 8707: an empty audience is rejected when a resource is configur
 	assert(authorize(cfg, "Bearer good", info) == AuthFailure.invalidToken);
 }
 
-unittest  // RFC 8707: an empty audience is accepted when no resource is configured
+unittest  // RFC 8707: with no resource configured, audience binding fails closed by default
 {
-	// Without cfg.resource the operator has not opted into binding, so an
-	// unscoped token remains acceptable (back-compatible default).
+	// basic/authorization §Access Token Privilege Restriction: MCP servers MUST
+	// reject tokens that do not include them in the audience claim. A validator
+	// without a configured `resource` cannot perform that check, so authorize()
+	// MUST fail closed rather than accept any validated token (issue #388).
 	ResourceServerConfig cfg;
 	cfg.validator = (string t) { TokenInfo ti; ti.valid = true; return ti; };
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer good", info) == AuthFailure.invalidToken);
+}
+
+unittest  // allowAnyAudience opts out of mandatory binding (dev/test escape hatch)
+{
+	// The spec MUST is enforced by default; an operator who knowingly accepts the
+	// risk (local dev, or a validator that asserts audience itself) can opt out.
+	ResourceServerConfig cfg;
+	cfg.validator = (string t) { TokenInfo ti; ti.valid = true; return ti; };
+	cfg.allowAnyAudience = true;
 	TokenInfo info;
 	assert(authorize(cfg, "Bearer good", info) == AuthFailure.none);
 }
@@ -339,6 +378,9 @@ unittest  // a token lacking the required scope yields insufficientScope
 {
 	ResourceServerConfig cfg;
 	cfg.requiredScope = "mcp:write";
+	// Audience binding passes first (no resource configured -> opt out) so the
+	// scope check is what rejects the request (issue #388).
+	cfg.allowAnyAudience = true;
 	cfg.validator = (string t) {
 		TokenInfo ti;
 		ti.valid = true;

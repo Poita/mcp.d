@@ -111,9 +111,13 @@ unittest  // the result plugs into authorize() as a TokenValidator
 	TokenInfo alice;
 	alice.subject = "alice";
 	alice.scopes = ["mcp:read"];
+	alice.audience = ["https://mcp.example.com/mcp"];
 
 	ResourceServerConfig cfg;
 	cfg.validator = staticVerifier(["tok-alice": alice]);
+	// RFC 8707 audience binding is mandatory by default (issue #388); bind the
+	// resource so the validated token's audience is enforced.
+	cfg.resource = "https://mcp.example.com/mcp";
 
 	TokenInfo info;
 	assert(authorize(cfg, "Bearer tok-alice", info) == AuthFailure.none);
