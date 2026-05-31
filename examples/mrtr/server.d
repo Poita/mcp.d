@@ -9,6 +9,15 @@
  * `params.inputResponses`, echoing back the opaque `requestState` the server
  * attached. There is no suspension and no shared session state on the server.
  *
+ * This is written in the SDK's ergonomic UDA style: `book_meeting` is a plain
+ * annotated method that takes a typed `topic` argument (its input JSON Schema is
+ * inferred) and an auto-injected `RequestContext`, and returns a `ToolResponse`
+ * so it can answer either `inputRequired` (round 1) or `complete` (round 2).
+ * `registerHandlers` wires it onto the server -- no hand-built `Json` args,
+ * descriptors, or registration calls. The only raw `Json` that remains is the
+ * genuinely-protocol payload the UDA layer does not abstract: the MRTR
+ * `InputRequest` requested-schema / sampling messages, and the structured result.
+ *
  * The `book_meeting` tool below shows both round-trips in one call:
  *   round 1: client calls `book_meeting {topic}`     -> server asks for input
  *            (an `elicitation` for the date + a `sampling` for an agenda),
@@ -46,7 +55,9 @@ void main(string[] args)
 
 	auto server = new McpServer("mrtr-example", "0.1.0",
 			nullable("MRTR (multi round-trip) demo server."));
-	registerBookMeeting(server);
+	// Register every @tool method of the API class in one call; the tool's input
+	// schema and argument marshalling are derived from the method signature.
+	registerHandlers(server, new MrtrApi);
 
 	StreamableHttpOptions opts;
 	opts.bindAddresses = [host];
@@ -56,33 +67,26 @@ void main(string[] args)
 	runStreamableHttp(server, port, opts);
 }
 
-/// Register the `book_meeting` tool: a stateless MRTR handler that asks for a
-/// date (elicitation) and an agenda (sampling) before confirming the booking.
-void registerBookMeeting(McpServer server) @safe
+/// The `book_meeting` MRTR tool, expressed as an annotated typed method: a
+/// stateless MRTR handler that asks for a date (elicitation) and an agenda
+/// (sampling) before confirming the booking.
+final class MrtrApi
 {
-	Json schema = Json.emptyObject;
-	schema["type"] = "object";
-	Json props = Json.emptyObject;
-	props["topic"] = Json(["type": Json("string")]);
-	schema["properties"] = props;
-	schema["required"] = Json([Json("topic")]);
-
-	Tool descriptor = {
-		name: "book_meeting",
-		description: nullable(
-			"Book a meeting; needs a date (elicitation) and an agenda (sampling)."),
-		inputSchema: schema
-	};
-
 	// The server-assigned correlation ids for the two input requests. The client
 	// echoes these back as the keys of `inputResponses`, so the handler reads its
 	// answers by the same ids on the retry.
-	enum dateId = "meeting_date";
-	enum agendaId = "meeting_agenda";
+	private enum dateId = "meeting_date";
+	private enum agendaId = "meeting_agenda";
 
-	server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
-		const topic = ("topic" in args) ? args["topic"].get!string : "";
-
+	/// Book a meeting. The `topic` argument is typed (so the tool's inputSchema is
+	/// inferred and the value is marshalled for us); `ctx` is auto-injected and
+	/// omitted from the schema, used to read `inputResponses` / `requestState`.
+	/// Returning a `ToolResponse` lets the method answer either `inputRequired`
+	/// (round 1) or `complete` (round 2).
+	@tool("book_meeting",
+			"Book a meeting; needs a date (elicitation) and an agenda (sampling).")
+	ToolResponse bookMeeting(string topic, RequestContext ctx) @safe
+	{
 		auto answers = ctx.inputResponses();
 		const haveAnswers = (dateId in answers) !is null && (agendaId in answers) !is null;
 
@@ -152,5 +156,5 @@ void registerBookMeeting(McpServer server) @safe
 		structured["rounds"] = Json(2);
 		r.structuredContent = structured;
 		return ToolResponse.complete(r);
-	});
+	}
 }
