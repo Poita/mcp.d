@@ -50,6 +50,19 @@ struct ToolResponse
         return t;
     }
 
+    /// As `inputRequired`, but also attaches an opaque `requestState`
+    /// (SEP-2322): a stateless draft server encodes whatever context it needs
+    /// to resume the call into this blob, which the client echoes verbatim on
+    /// the retry and the handler reads back via `RequestContext.requestState`.
+    static ToolResponse inputRequired(InputRequest[] requests, string requestState) @safe
+    {
+        ToolResponse t;
+        t.needsInput_ = true;
+        t.required_.inputRequests = requests;
+        t.required_.requestState = requestState;
+        return t;
+    }
+
     /// Whether this outcome asks the client for more input.
     bool needsInput() const @safe
     {
@@ -2801,6 +2814,54 @@ unittest  // draft (stateless) retry with input responses: handler completes
     auto resp = s.handle(draftCall(2, "book", [answer])).get;
     assert("inputRequests" !in resp["result"]);
     assert(resp["result"]["content"][0]["text"].get!string == "booked monday");
+}
+
+unittest  // SEP-2322: a stateless server emits requestState and reads it back on retry
+{
+    auto s = new MCPServer("t", "1");
+    // A tool that stashes its progress entirely in the opaque requestState: on
+    // the first round it asks for a date and attaches state "awaiting-date";
+    // on retry it reads ctx.requestState() to know how to finish.
+    Tool book = {name: "statebook"};
+    s.registerTool(book, (Json args, RequestContext ctx) @safe {
+        if (ctx.requestState() == "awaiting-date")
+        {
+            auto answers = ctx.inputResponses();
+            CallToolResult r;
+            r.content = [
+                Content.makeText("resumed:" ~ ctx.requestState() ~ " day:"
+                    ~ answers["date"]["content"]["day"].get!string)
+            ];
+            return ToolResponse.complete(r);
+        }
+        Json ep = Json.emptyObject;
+        ep["message"] = "When?";
+        return ToolResponse.inputRequired([
+            InputRequest("date", "elicitation", ep)
+        ], "awaiting-date");
+    });
+
+    // First round: the server attaches requestState onto the InputRequiredResult.
+    auto first = s.handle(draftCall(10, "statebook", [])).get;
+    assert(first["result"]["requestState"].get!string == "awaiting-date");
+
+    // Retry: client echoes both the input responses and the opaque requestState.
+    auto answer = InputResponse("date", Json([
+            "content": Json(["day": Json("friday")])
+    ]));
+    Json meta = Json.emptyObject;
+    meta[MetaKey.protocolVersion] = "2026-07-28";
+    meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+    meta[MetaKey.clientCapabilities] = Json.emptyObject;
+    Json params = Json.emptyObject;
+    params["name"] = "statebook";
+    params["arguments"] = Json.emptyObject;
+    params["requestState"] = "awaiting-date";
+    params["inputResponses"] = inputResponsesToJson([answer]);
+    params["_meta"] = meta;
+    auto retry = s.handle(Message(makeRequest(Json(11), "tools/call", params))).get;
+    assert("inputRequests" !in retry["result"]);
+    assert(retry["result"]["content"][0]["text"].get!string == "resumed:awaiting-date day:friday");
 }
 
 unittest  // elicit() is rejected on a stateless (draft) request
