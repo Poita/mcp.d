@@ -272,12 +272,13 @@ final class MCPServer
 	/// Opt in to validating each tool call's `arguments` against the tool's
 	/// registered `inputSchema` before the handler is invoked. Per the spec
 	/// (server/tools § Security Considerations, all versions), "Servers MUST:
-	/// Validate all tool inputs"; § Error Handling classifies invalid
-	/// arguments as a *protocol* error. With validation enabled, a `tools/call`
-	/// whose arguments are missing a required property or have the wrong type
-	/// is rejected with a JSON-RPC -32602 (Invalid params) error before the
-	/// handler runs, mirroring the existing required-argument check for prompts.
-	/// Tools without an `inputSchema` are unaffected. Off by default to
+	/// Validate all tool inputs". § Error Handling classifies an inputSchema
+	/// violation (missing required property or wrong type) as an
+	/// *input-validation* error, i.e. a Tool Execution Error: with validation
+	/// enabled, a `tools/call` whose arguments do not conform yields a
+	/// `CallToolResult` with `isError:true` and a descriptive text content
+	/// block (so the model can self-correct), NOT a JSON-RPC -32602 protocol
+	/// error. Tools without an `inputSchema` are unaffected. Off by default to
 	/// preserve existing behaviour.
 	void enableInputSchemaValidation() @safe
 	{
@@ -1413,13 +1414,26 @@ final class MCPServer
 		Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
 		// Validate the supplied arguments against the tool's declared inputSchema
 		// before dispatch (spec: server/tools § Security Considerations,
-		// "Servers MUST: Validate all tool inputs"). A structural violation
-		// (missing required property or wrong type) is an invalid-argument
-		// *protocol* error per § Error Handling, so it surfaces as -32602
-		// rather than an isError result. Gated behind the same opt-in style as
-		// output-schema validation to preserve existing behaviour.
+		// "Servers MUST: Validate all tool inputs"). Per § Error Handling, an
+		// argument that violates the tool's own inputSchema (missing required
+		// property or wrong type) is an *input-validation* error, classified as
+		// a Tool Execution Error: it is reported as a CallToolResult with
+		// `isError:true`, NOT a JSON-RPC -32602 protocol error. The
+		// CallToolRequest schema only constrains `name`/`arguments`, so such a
+		// failure does not make the request malformed. Gated behind the same
+		// opt-in style as output-schema validation to preserve existing
+		// behaviour.
 		if (validateInputSchema_)
-			checkInputSchema(entry.descriptor, args);
+		{
+			const schemaMsg = checkInputSchema(entry.descriptor, args);
+			if (schemaMsg.length)
+			{
+				CallToolResult err;
+				err.content = [Content.makeText(schemaMsg)];
+				err.isError = true;
+				return err.toJson();
+			}
+		}
 		try
 		{
 			// CallToolResult or InputRequiredResult.
@@ -1442,19 +1456,23 @@ final class MCPServer
 	}
 
 	/// When input-schema validation is enabled, verify that a tool call's
-	/// `arguments` conform to the tool's registered `inputSchema`. No-op when
-	/// the tool has no input schema. Throws an `McpException` with -32602
-	/// (Invalid params) on a violation, since invalid arguments are a protocol
-	/// error per the spec's tools Error Handling section.
-	private static void checkInputSchema(ref const Tool descriptor, Json args) @safe
+	/// `arguments` conform to the tool's registered `inputSchema`. Returns an
+	/// empty string when the arguments conform (or the tool has no input
+	/// schema), otherwise a human-readable description of the violation.
+	/// Per the spec's tools § Error Handling, an inputSchema violation is an
+	/// input-validation error reported as a tool-execution result with
+	/// `isError:true`, NOT a JSON-RPC protocol error, so the caller turns the
+	/// returned message into a `CallToolResult` rather than throwing.
+	private static string checkInputSchema(ref const Tool descriptor, Json args) @safe
 	{
 		import mcp.api.schema : validateAgainstSchema;
 
 		if (descriptor.inputSchema.type != Json.Type.object)
-			return;
+			return null;
 		const msg = validateAgainstSchema(args, descriptor.inputSchema);
 		if (msg.length)
-			throw invalidParams("Invalid arguments for tool '" ~ descriptor.name ~ "': " ~ msg);
+			return "Invalid arguments for tool '" ~ descriptor.name ~ "': " ~ msg;
+		return null;
 	}
 
 	/// When output-schema validation is enabled, verify that a tool result's
@@ -1925,7 +1943,7 @@ unittest  // output-schema validation is off by default: bad output still ships
 	assert(resp["result"]["structuredContent"]["result"].get!string == "oops");
 }
 
-unittest  // input-schema validation: a missing required argument yields -32602
+unittest  // input-schema validation: a missing required argument yields an isError result
 {
 	import mcp.api.schema : jsonSchemaOf;
 
@@ -1950,10 +1968,15 @@ unittest  // input-schema validation: a missing required argument yields -32602
 	params["name"] = "add";
 	params["arguments"] = Json(["a": Json(1)]); // missing required 'b'
 	auto resp = s.handle(req(20, "tools/call", params)).get;
-	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	// Spec: server/tools § Error Handling lists input-validation failures
+	// (missing required property) under Tool Execution Errors, returned as a
+	// CallToolResult with isError:true, NOT a JSON-RPC protocol error.
+	assert("error" !in resp);
+	assert(resp["result"]["isError"].get!bool);
+	assert(resp["result"]["content"][0]["text"].get!string.length > 0);
 }
 
-unittest  // input-schema validation: a wrong-typed argument yields -32602
+unittest  // input-schema validation: a wrong-typed argument yields an isError result
 {
 	import mcp.api.schema : jsonSchemaOf;
 
@@ -1977,7 +2000,11 @@ unittest  // input-schema validation: a wrong-typed argument yields -32602
 	params["name"] = "add";
 	params["arguments"] = Json(["a": Json("not-an-int")]);
 	auto resp = s.handle(req(21, "tools/call", params)).get;
-	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	// Spec: a wrong-typed tool argument is an input-validation error, reported
+	// as isError:true in the result (Tool Execution Error), not -32602.
+	assert("error" !in resp);
+	assert(resp["result"]["isError"].get!bool);
+	assert(resp["result"]["content"][0]["text"].get!string.length > 0);
 }
 
 unittest  // input-schema validation: conforming arguments dispatch normally
@@ -2035,6 +2062,35 @@ unittest  // input-schema validation is off by default: missing argument still d
 	auto resp = s.handle(req(23, "tools/call", params)).get;
 	assert("error" !in resp);
 	assert(resp["result"]["content"][0]["text"].get!string == "ok");
+}
+
+unittest  // a genuinely malformed CallToolRequest (non-string name) is still -32602
+{
+	import mcp.api.schema : jsonSchemaOf;
+
+	// The spec reserves protocol errors for requests that fail the
+	// CallToolRequest schema itself (name/arguments), so a non-string `name`
+	// must remain a JSON-RPC -32602 error even with input-schema validation on.
+	auto s = new MCPServer("vsrv", "0.1.0");
+	struct AddArgs
+	{
+		int a;
+	}
+
+	Tool add = {
+		name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!AddArgs
+	};
+	s.registerTool(add, (Json args) @safe {
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+	s.enableInputSchemaValidation();
+
+	Json params = Json.emptyObject;
+	params["name"] = Json(123); // not a string => malformed CallToolRequest
+	auto resp = s.handle(req(24, "tools/call", params)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
 unittest  // a tool handler that throws becomes an isError result, not a protocol error
