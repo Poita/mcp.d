@@ -10,7 +10,7 @@ import mcp.protocol.errors;
 import mcp.protocol.versions;
 import mcp.protocol.capabilities;
 import mcp.protocol.types;
-import mcp.protocol.sampling : validateSamplingMessages;
+import mcp.protocol.sampling : validateSamplingMessages, CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.draft;
 import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.http_transport : HttpClientTransport, LegacyFallbackException;
@@ -116,19 +116,27 @@ final class McpClient : ClientProtocol
 	/// This client's identity.
 	Implementation clientInfo;
 
-	/// Handler for `sampling/createMessage`; returns the result. Null => unsupported.
-	Json delegate(Json params) @safe onSampling;
-	/// Handler for `elicitation/create`; returns `{action, content?}`. Null => unsupported.
+	/// Handler for `sampling/createMessage`; receives the typed
+	/// `CreateMessageRequest` params and returns the typed `CreateMessageResult`.
+	/// Null => unsupported (the client answers `roots/list`-style with
+	/// `Method not found`). The SDK validates the request's tool-result message
+	/// constraints (client/sampling §Error Handling) before invoking this.
+	CreateMessageResult delegate(CreateMessageRequest request) @safe onSampling;
+	/// Handler for `elicitation/create`; receives the typed `ElicitParams` and
+	/// returns the typed `ElicitResult`. Null => unsupported.
 	///
-	/// `params` carries the full request. Form-mode requests (the default, when
-	/// `mode` is absent or `"form"`) include `message` and `requestedSchema`;
-	/// the handler collects input and returns `{action, content}`. URL-mode
-	/// requests (2025-11-25+) set `mode: "url"` and include `url` and
-	/// `elicitationId` instead of a schema — the handler should present the URL
-	/// for the user to complete out-of-band and return `{action}` (no content).
-	Json delegate(Json params) @safe onElicitation;
-	/// Handler for `roots/list`; returns `{roots: [...]}`. Null => unsupported.
-	Json delegate(Json params) @safe onListRoots;
+	/// Form-mode requests (the default, when `mode` is absent or `"form"`)
+	/// populate `message` and `requestedSchema`; collect the input and return
+	/// `ElicitResult.accept(content)` (or `decline()`/`cancel()`). URL-mode
+	/// requests (2025-11-25+) set `mode == "url"` and carry `url` and
+	/// `elicitationId` instead of a schema — present the URL for the user to
+	/// complete out-of-band and return an action (no content). The SDK enforces
+	/// the advertised-mode capability check before invoking this.
+	ElicitResult delegate(ElicitParams params) @safe onElicitation;
+	/// Handler for `roots/list`; returns the typed `ListRootsResult`. Null =>
+	/// unsupported. (`roots/list` carries no meaningful params, so the handler
+	/// takes none; prefer `setRoots` for the common static-roots case.)
+	ListRootsResult delegate() @safe onListRoots;
 	/// Observer for inbound notifications (progress, message, resource updates).
 	void delegate(string method, Json params) @safe onNotification;
 	/// Typed observer for `notifications/progress` (basic/utilities/progress).
@@ -472,17 +480,17 @@ final class McpClient : ClientProtocol
 			if (onSampling is null)
 				return false;
 			validateSamplingMessages(req.params);
-			result = onSampling(req.params);
+			result = onSampling(CreateMessageRequest.fromJson(req.params)).toJson();
 			break;
 		case "elicitation":
 			if (onElicitation is null)
 				return false;
-			result = onElicitation(req.params);
+			result = onElicitation(ElicitParams.fromJson(req.params)).toJson();
 			break;
 		case "roots":
 			if (onListRoots is null)
 				return false;
-			result = onListRoots(req.params);
+			result = onListRoots().toJson();
 			break;
 		default:
 			return false;
@@ -935,10 +943,10 @@ final class McpClient : ClientProtocol
 	void setRoots(Root[] roots) @safe
 	{
 		auto rs = roots.dup;
-		onListRoots = (Json params) @safe {
+		onListRoots = () @safe {
 			ListRootsResult result;
 			result.roots = rs;
-			return result.toJson();
+			return result;
 		};
 	}
 
@@ -1157,7 +1165,7 @@ final class McpClient : ClientProtocol
 			// must be answered by a matching tool_result. Violations surface
 			// as -32602 (Invalid params) per client/sampling §Error Handling.
 			validateSamplingMessages(params);
-			return onSampling(params);
+			return onSampling(CreateMessageRequest.fromJson(params)).toJson();
 		case "elicitation/create":
 			if (onElicitation is null)
 				throw methodNotFound(method);
@@ -1201,11 +1209,11 @@ final class McpClient : ClientProtocol
 						elicitationIds_[eid] = false; // tracked, not yet completed
 				}
 			}
-			return onElicitation(params);
+			return onElicitation(ElicitParams.fromJson(params)).toJson();
 		case "roots/list":
 			if (onListRoots is null)
 				throw methodNotFound(method);
-			return onListRoots(params);
+			return onListRoots().toJson();
 		case "ping":
 			return Json.emptyObject;
 		default:
@@ -1389,9 +1397,9 @@ unittest  // sampling dispatch rejects an unbalanced tool_use with -32602
 {
 	auto c = McpClient.http("http://localhost");
 	bool delegateCalled;
-	c.onSampling = (Json params) @safe {
+	c.onSampling = (CreateMessageRequest request) @safe {
 		delegateCalled = true;
-		return Json.emptyObject;
+		return CreateMessageResult.init;
 	};
 
 	// assistant tool_use with no following tool_result user message.
@@ -1442,16 +1450,14 @@ unittest  // setRoots answers roots/list with the typed envelope
 	]);
 
 	assert(c.onListRoots !is null);
-	auto result = c.onListRoots(Json.emptyObject);
+	auto parsed = c.onListRoots();
+	auto result = parsed.toJson();
 	assert(result["roots"].type == Json.Type.array);
 	assert(result["roots"].length == 2);
 	assert(result["roots"][0]["uri"].get!string == "file:///home/user/project");
 	assert(result["roots"][0]["name"].get!string == "My Project");
 	assert(result["roots"][1]["uri"].get!string == "file:///tmp");
 	assert("name" !in result["roots"][1]);
-
-	// The typed result parses back into a ListRootsResult.
-	auto parsed = ListRootsResult.fromJson(result);
 	assert(parsed.roots.length == 2);
 	assert(parsed.roots[0].name.get == "My Project");
 }
@@ -1533,22 +1539,29 @@ unittest  // sampling dispatch forwards a valid request to the delegate
 {
 	auto c = McpClient.http("http://localhost");
 	bool delegateCalled;
-	c.onSampling = (Json params) @safe {
+	string seenText;
+	c.onSampling = (CreateMessageRequest request) @safe {
 		delegateCalled = true;
-		return Json.emptyObject;
+		// The handler now receives the typed request, parsed from the wire.
+		if (request.messages.length)
+			seenText = request.messages[0].content.text;
+		return CreateMessageResult.init;
 	};
 
+	// A SamplingMessage's content is a single content block (object) per the
+	// schema, not an array.
 	Json b = Json.emptyObject;
 	b["type"] = "text";
 	b["text"] = "hi";
 	Json m = Json.emptyObject;
 	m["role"] = "user";
-	m["content"] = Json([b]);
+	m["content"] = b;
 	Json params = Json.emptyObject;
 	params["messages"] = Json([m]);
 
 	c.dispatchServerMethod("sampling/createMessage", params);
 	assert(delegateCalled);
+	assert(seenText == "hi");
 }
 
 unittest  // elicitation/create rejects a mode the client did not advertise (-32602)
@@ -1559,9 +1572,9 @@ unittest  // elicitation/create rejects a mode the client did not advertise (-32
 	c.capabilities.elicitationForm = true;
 
 	bool delegateCalled;
-	c.onElicitation = (Json params) @safe {
+	c.onElicitation = (ElicitParams params) @safe {
 		delegateCalled = true;
-		return Json.emptyObject;
+		return ElicitResult.init;
 	};
 
 	Json params = Json.emptyObject;
@@ -1588,9 +1601,9 @@ unittest  // elicitation/create rejects an unknown mode (-32602)
 	c.capabilities.elicitationForm = true;
 
 	bool delegateCalled;
-	c.onElicitation = (Json params) @safe {
+	c.onElicitation = (ElicitParams params) @safe {
 		delegateCalled = true;
-		return Json.emptyObject;
+		return ElicitResult.init;
 	};
 
 	Json params = Json.emptyObject;
@@ -1616,9 +1629,9 @@ unittest  // elicitation/create forwards an advertised mode to the delegate
 	c.capabilities.elicitationUrl = true;
 
 	bool delegateCalled;
-	c.onElicitation = (Json params) @safe {
+	c.onElicitation = (ElicitParams params) @safe {
 		delegateCalled = true;
-		return Json.emptyObject;
+		return ElicitResult.init;
 	};
 
 	Json params = Json.emptyObject;
@@ -1639,9 +1652,9 @@ unittest  // url-only client rejects a form-mode elicitation/create (-32602)
 	c.capabilities.elicitationUrl = true;
 
 	bool delegateCalled;
-	c.onElicitation = (Json params) @safe {
+	c.onElicitation = (ElicitParams params) @safe {
 		delegateCalled = true;
-		return Json.emptyObject;
+		return ElicitResult.init;
 	};
 
 	Json params = Json.emptyObject;
@@ -1667,9 +1680,9 @@ unittest  // url-only client rejects a mode-absent (defaults to form) elicitatio
 	c.capabilities.elicitationUrl = true;
 
 	bool delegateCalled;
-	c.onElicitation = (Json params) @safe {
+	c.onElicitation = (ElicitParams params) @safe {
 		delegateCalled = true;
-		return Json.emptyObject;
+		return ElicitResult.init;
 	};
 
 	// No `mode` field => defaults to "form", which the url-only client did not advertise.
@@ -1697,9 +1710,9 @@ unittest  // bare elicitation declaration still accepts form-mode requests
 	c.capabilities.elicitationForm = true;
 
 	bool delegateCalled;
-	c.onElicitation = (Json params) @safe {
+	c.onElicitation = (ElicitParams params) @safe {
 		delegateCalled = true;
-		return Json.emptyObject;
+		return ElicitResult.init;
 	};
 
 	Json params = Json.emptyObject;
@@ -1715,7 +1728,7 @@ unittest  // elicitation/complete for a known id is forwarded once, then ignored
 	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 	c.capabilities.elicitationUrl = true;
-	c.onElicitation = (Json) @safe { return Json.emptyObject; };
+	c.onElicitation = (ElicitParams) @safe { return ElicitResult.init; };
 
 	// The server issues a URL-mode request; the client records the id.
 	Json create = Json.emptyObject;
@@ -1853,9 +1866,9 @@ unittest  // elicitation/create defaults to form mode when mode is absent
 	c.capabilities.elicitationForm = true;
 
 	bool delegateCalled;
-	c.onElicitation = (Json params) @safe {
+	c.onElicitation = (ElicitParams params) @safe {
 		delegateCalled = true;
-		return Json.emptyObject;
+		return ElicitResult.init;
 	};
 
 	Json params = Json.emptyObject;
@@ -2194,20 +2207,17 @@ unittest  // MRTR: an empty requestState is never echoed (client MUST NOT invent
 unittest  // MRTR: resolveInputRequest routes an elicitation request to onElicitation
 {
 	auto c = McpClient.http("http://localhost/mcp");
-	Json seen = Json.undefined;
-	c.onElicitation = (Json params) @safe {
-		seen = params;
-		return Json([
-			"action": Json("accept"),
-			"content": Json(["day": Json("tuesday")])
-		]);
+	string seenMessage;
+	c.onElicitation = (ElicitParams params) @safe {
+		seenMessage = params.message;
+		return ElicitResult.accept(Json(["day": Json("tuesday")]));
 	};
 	Json ep = Json.emptyObject;
 	ep["message"] = "When?";
 	InputResponse answer;
 	const ok = c.resolveInputRequest(InputRequest("date", "elicitation", ep), answer);
 	assert(ok);
-	assert(seen["message"].get!string == "When?");
+	assert(seenMessage == "When?");
 	assert(answer.id == "date");
 	assert(answer.result["content"]["day"].get!string == "tuesday");
 }
@@ -2215,8 +2225,10 @@ unittest  // MRTR: resolveInputRequest routes an elicitation request to onElicit
 unittest  // MRTR: resolveInputRequest routes a sampling request to onSampling
 {
 	auto c = McpClient.http("http://localhost/mcp");
-	c.onSampling = (Json params) @safe {
-		return Json(["role": Json("assistant")]);
+	c.onSampling = (CreateMessageRequest request) @safe {
+		CreateMessageResult r;
+		r.role = "assistant";
+		return r;
 	};
 	InputResponse answer;
 	const ok = c.resolveInputRequest(InputRequest("s1", "sampling", Json.emptyObject), answer);
@@ -2228,9 +2240,7 @@ unittest  // MRTR: resolveInputRequest routes a sampling request to onSampling
 unittest  // MRTR: resolveInputRequest routes a roots request to onListRoots
 {
 	auto c = McpClient.http("http://localhost/mcp");
-	c.onListRoots = (Json params) @safe {
-		return Json(["roots": Json.emptyArray]);
-	};
+	c.onListRoots = () @safe { return ListRootsResult.init; };
 	InputResponse answer;
 	const ok = c.resolveInputRequest(InputRequest("r1", "roots", Json.emptyObject), answer);
 	assert(ok);
@@ -2251,7 +2261,7 @@ unittest  // MRTR: resolveInputRequest fails (no answer) when no handler is regi
 unittest  // MRTR: resolveInputRequest fails for an unknown input type
 {
 	auto c = McpClient.http("http://localhost/mcp");
-	c.onElicitation = (Json) @safe { return Json.emptyObject; };
+	c.onElicitation = (ElicitParams) @safe { return ElicitResult.init; };
 	InputResponse answer;
 	const ok = c.resolveInputRequest(InputRequest("x", "bogus", Json.emptyObject), answer);
 	assert(!ok);

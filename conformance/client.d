@@ -10,6 +10,7 @@ module conformance_client;
 
 import std.algorithm : canFind, startsWith;
 import std.process : environment;
+import std.typecons : nullable;
 import std.stdio : stderr;
 
 import vibe.core.core : runTask, runEventLoop, exitEventLoop;
@@ -89,15 +90,12 @@ private int runScenario(string url, string scenario) @safe
 		return 0;
 	}
 
-	client.onSampling = (Json params) @safe => handleSampling(params);
-	client.onElicitation = (Json params) @safe => handleElicitation(params);
-	client.onListRoots = (Json params) @safe {
-		Json roots = Json.emptyArray;
-		roots ~= Json([
-			"uri": Json("file:///workspace"),
-			"name": Json("Workspace")
-		]);
-		return Json(["roots": roots]);
+	client.onSampling = (CreateMessageRequest request) @safe => handleSampling(request);
+	client.onElicitation = (ElicitParams params) @safe => handleElicitation(params);
+	client.onListRoots = () @safe {
+		ListRootsResult result;
+		result.roots = [Root("file:///workspace", nullable("Workspace"))];
+		return result;
 	};
 
 	client.initialize();
@@ -142,40 +140,31 @@ private Json defaultArgs(Tool tool) @safe
 }
 
 /// Answer a `sampling/createMessage` request with a canned assistant reply.
-private Json handleSampling(Json params) @safe
+private CreateMessageResult handleSampling(CreateMessageRequest request) @safe
 {
-	Json result = Json.emptyObject;
-	result["role"] = "assistant";
-	result["content"] = Json([
-		"type": Json("text"),
-		"text": Json("Sampled response")
-	]);
-	result["model"] = "dlang-mcp-test-model";
-	result["stopReason"] = "endTurn";
+	CreateMessageResult result;
+	result.role = "assistant";
+	result.content = Content.makeText("Sampled response");
+	result.model = "dlang-mcp-test-model";
+	result.stopReason = "endTurn";
 	return result;
 }
 
 /// Answer an `elicitation/create` request: accept, applying schema defaults.
-private Json handleElicitation(Json params) @safe
+private ElicitResult handleElicitation(ElicitParams params) @safe
 {
 	Json content = Json.emptyObject;
-	if ("requestedSchema" in params)
+	auto schema = params.requestedSchema;
+	if (schema.type == Json.Type.object && "properties" in schema)
 	{
-		auto schema = params["requestedSchema"];
-		if (schema.type == Json.Type.object && "properties" in schema)
-		{
-			auto props = schema["properties"];
-			() @trusted {
-				foreach (string key, Json prop; props)
-					if ("default" in prop)
-						content[key] = prop["default"];
-			}();
-		}
+		auto props = schema["properties"];
+		() @trusted {
+			foreach (string key, Json prop; props)
+				if ("default" in prop)
+					content[key] = prop["default"];
+		}();
 	}
-	Json result = Json.emptyObject;
-	result["action"] = "accept";
-	result["content"] = content;
-	return result;
+	return ElicitResult.accept(content);
 }
 
 /// Drive the OAuth 2.1 authorization flow for `auth/*` conformance scenarios:
