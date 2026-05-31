@@ -915,14 +915,20 @@ package string buildJwtBearerForm(string assertion, string scopeStr,
 	return body_;
 }
 
-/// Build the token-request body for refreshing an access token.
-package string buildRefreshTokenForm(string refreshToken, string clientId, string resource) @safe
+/// Build the token-request body for refreshing an access token. When
+/// `clientSecretForPost` is non-empty it is appended (for `client_secret_post`
+/// upstream authentication); leave it empty for public/PKCE clients or when the
+/// secret is carried via the HTTP Basic `Authorization` header instead.
+package string buildRefreshTokenForm(string refreshToken, string clientId,
+		string resource, string clientSecretForPost = "") @safe
 {
 	auto body_ = "grant_type=refresh_token";
 	body_ ~= "&refresh_token=" ~ enc(refreshToken);
 	body_ ~= "&client_id=" ~ enc(clientId);
 	if (resource.length)
 		body_ ~= "&resource=" ~ enc(resource);
+	if (clientSecretForPost.length)
+		body_ ~= "&client_secret=" ~ enc(clientSecretForPost);
 	return body_;
 }
 
@@ -987,6 +993,20 @@ unittest  // token request forms carry the right grant + params
 
 	auto rf = buildRefreshTokenForm("RT", "client1", "");
 	assert(rf.canFind("grant_type=refresh_token") && rf.canFind("refresh_token=RT"));
+}
+
+unittest  // refresh-token form appends the post-secret only when supplied
+{
+	import std.algorithm : canFind;
+
+	auto pub = buildRefreshTokenForm("RT", "client1", "https://mcp.example.com/mcp");
+	assert(pub.canFind("grant_type=refresh_token"));
+	assert(pub.canFind("refresh_token=RT"));
+	assert(pub.canFind("resource=https%3A%2F%2Fmcp.example.com%2Fmcp"));
+	assert(!pub.canFind("client_secret="));
+
+	auto conf = buildRefreshTokenForm("RT", "client1", "", "sekret");
+	assert(conf.canFind("client_secret=sekret"));
 }
 
 unittest  // basic auth header is base64(client:secret)
