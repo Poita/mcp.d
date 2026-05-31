@@ -76,12 +76,39 @@ final class StdioClientTransport : ClientTransport
 	{
 	}
 
-	/// Unsupported over stdio: the draft `subscriptions/listen` long-lived stream
-	/// is an HTTP-transport feature. Returns an inert, already-usable handle.
+	/// Open a draft `subscriptions/listen` stream over stdio. Unlike Streamable
+	/// HTTP — where the listen stream is a separate long-lived SSE response — stdio
+	/// shares one channel, so opening a subscription is just writing the
+	/// `subscriptions/listen` request line; the server delivers the leading
+	/// `notifications/subscriptions/acknowledged` and every subsequent change
+	/// notification on the same stdout channel, each stamped with
+	/// `io.modelcontextprotocol/subscriptionId` (the listen request id), and they
+	/// reach the client's inbound dispatcher through the normal `await` read loop
+	/// (draft basic/utilities/subscriptions: "On stdio ... clients MUST use this
+	/// field to correlate notifications"). The returned handle's `cancel()`/`close()`
+	/// ends the subscription by sending `notifications/cancelled` referencing the
+	/// listen request id, per the draft stdio cancellation rule.
 	SubscriptionStream openListen(Json message) @safe
 	{
+		// Write the real listen request on the single channel (the previous no-op
+		// dropped it, so a stdio client could never subscribe).
+		send(message);
+
+		// The listen request id is the subscriptionId; cancel() references it.
+		Json listenId = ("id" in message) ? message["id"] : Json(null);
 		auto cancelled = () @trusted { return new shared bool(false); }();
-		return new SubscriptionStream(cancelled);
+		void delegate() @safe nothrow onCancel = () @safe nothrow{
+			try
+			{
+				Json params = Json.emptyObject;
+				params["requestId"] = listenId;
+				sendOneway(makeNotification("notifications/cancelled", params));
+			}
+			catch (Exception)
+			{
+			}
+		};
+		return new SubscriptionStream(cancelled, onCancel);
 	}
 
 	/// Send a request and return its result (or throw `McpException`). Inbound
@@ -299,6 +326,62 @@ version (unittest)
 	import mcp.server.server : McpServer;
 	import mcp.client.client : McpClient;
 	import mcp.protocol.types : Tool, Content, CallToolResult;
+	import mcp.client.subscription : SubscriptionFilter;
+}
+
+unittest  // stdio openListen writes the subscriptions/listen request to the server (draft)
+{
+	// Per draft basic/utilities/subscriptions, a stdio client opens a subscription
+	// by sending a real `subscriptions/listen` request on the single stdin channel.
+	// The previous no-op dropped it silently; it MUST now be written.
+	string[] toServer;
+
+	auto client = McpClient.stdio(() @safe { return cast(string) null; }, (string s) @safe {
+		toServer ~= s;
+	});
+	client.enableDraft();
+
+	SubscriptionFilter filter = {toolsListChanged: true};
+	client.subscriptionsListen(filter);
+
+	assert(toServer.length == 1, "listen request must be written to the server");
+	auto m = parseJsonString(toServer[0]);
+	assert(m["method"].get!string == "subscriptions/listen");
+	assert("id" in m, "listen is a request and MUST carry an id");
+	assert(m["params"]["notifications"]["toolsListChanged"].get!bool == true);
+}
+
+unittest  // stdio listen cancel() emits notifications/cancelled referencing the listen request id
+{
+	// draft basic/utilities/subscriptions Cancellation (stdio): "send
+	// notifications/cancelled referencing the listen request ID (stdio)".
+	string[] toServer;
+
+	auto client = McpClient.stdio(() @safe { return cast(string) null; }, (string s) @safe {
+		toServer ~= s;
+	});
+	client.enableDraft();
+
+	SubscriptionFilter filter = {resourcesListChanged: true};
+	auto stream = client.subscriptionsListen(filter);
+
+	// The listen request id is the subscriptionId; cancel must reference it.
+	auto listenMsg = parseJsonString(toServer[0]);
+	auto listenId = listenMsg["id"].get!long;
+
+	toServer = null;
+	stream.cancel();
+
+	assert(toServer.length == 1, "cancel() must write notifications/cancelled");
+	auto c = parseJsonString(toServer[0]);
+	assert(c["method"].get!string == "notifications/cancelled");
+	assert(c["params"]["requestId"].get!long == listenId);
+	assert("id" !in c, "a notification MUST NOT carry an id");
+	assert(stream.cancelled);
+
+	// Idempotent: a second cancel must not emit another notification.
+	stream.cancel();
+	assert(toServer.length == 1);
 }
 
 unittest  // McpClient over a stdio transport drives an in-process server (initialize + tools)

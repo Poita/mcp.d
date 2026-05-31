@@ -27,23 +27,37 @@ struct SubscriptionFilter
 final class SubscriptionStream
 {
 	private shared(bool)* cancelled_;
+	// Optional transport-supplied action run exactly once on the first cancel().
+	// The stdio transport uses it to emit `notifications/cancelled` referencing
+	// the listen request id (draft basic/utilities/subscriptions Cancellation,
+	// stdio); transports that tear down by closing a stream (HTTP) leave it null.
+	private void delegate() @safe nothrow onCancel_;
 
 	/// Construct a handle wrapping a shared cancellation flag. Created by a
-	/// `ClientTransport` when it opens the listen stream.
-	package this(shared(bool)* cancelled) @safe nothrow @nogc
+	/// `ClientTransport` when it opens the listen stream. `onCancel`, when
+	/// supplied, is invoked exactly once on the first `cancel()` (after the flag
+	/// is set) so a single-channel transport can emit its stdio
+	/// `notifications/cancelled` for the listen request id.
+	package this(shared(bool)* cancelled, void delegate() @safe nothrow onCancel = null) @safe nothrow @nogc
 	{
 		cancelled_ = cancelled;
+		onCancel_ = onCancel;
 	}
 
-	/// Request that the stream stop and its background task terminate. Idempotent.
-	void cancel() @safe nothrow @nogc
+	/// Request that the stream stop and its background task terminate. Idempotent:
+	/// the transport-supplied `onCancel` (if any) runs only on the first call.
+	void cancel() @safe nothrow
 	{
-		if (cancelled_ !is null)
+		if (cancelled_ !is null && !*cancelled_)
+		{
 			*cancelled_ = true;
+			if (onCancel_ !is null)
+				onCancel_();
+		}
 	}
 
 	/// Alias for `cancel()`.
-	void close() @safe nothrow @nogc
+	void close() @safe nothrow
 	{
 		cancel();
 	}
