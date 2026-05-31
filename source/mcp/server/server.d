@@ -258,14 +258,17 @@ final class MCPServer
     /// `notifications/resources/updated` on the standalone GET SSE stream (per
     /// server/resources Subscriptions: "Server delivers
     /// notifications/resources/updated ... whenever a watched resource
-    /// changes"). The notification carries `{ "uri": ... }`, plus an optional
-    /// `title` (2025-11-25). It is delivered only when a client is currently
+    /// changes"). Per `ResourceUpdatedNotificationParams` in every spec version
+    /// (2024-11-05 .. 2025-11-25 .. draft) the params carry exactly `{ "uri": ... }`
+    /// (plus the inherited optional `_meta`); there is no `title` field on this
+    /// notification (a resource's title lives on the `Resource` object in
+    /// `resources/list`). It is delivered only when a client is currently
     /// subscribed to `uri` (via `resources/subscribe`); for an unsubscribed URI
     /// it is a no-op returning `0`. For the draft protocol the notification is
     /// additionally suppressed unless a client opted in via `subscriptions/listen`
     /// with `resourceSubscriptions:true`. Returns the number of GET-stream
     /// listeners reached; `0` when no GET stream is open.
-    size_t notifyResourceUpdated(string uri, Nullable!string title = Nullable!string.init) @safe
+    size_t notifyResourceUpdated(string uri) @safe
     {
         if (!isSubscribed(uri))
             return 0;
@@ -273,8 +276,6 @@ final class MCPServer
             return 0;
         Json params = Json.emptyObject;
         params["uri"] = uri;
-        if (!title.isNull)
-            params["title"] = title.get;
         return notify("notifications/resources/updated", params);
     }
 
@@ -2581,8 +2582,10 @@ unittest  // notifyResourceUpdated is a no-op for a uri nobody subscribed to
     assert(received.length == 0);
 }
 
-unittest  // notifyResourceUpdated includes the optional title param when given
+unittest  // notifyResourceUpdated emits params that are exactly { uri } (no non-spec title)
 {
+    import std.algorithm : canFind;
+
     auto s = new MCPServer("t", "1");
     s.enableResourceSubscriptions();
     auto coord = new StreamCoordinator;
@@ -2594,12 +2597,23 @@ unittest  // notifyResourceUpdated includes the optional title param when given
     p["uri"] = "test://w";
     s.handle(req(1, "resources/subscribe", p));
 
-    const n = s.notifyResourceUpdated("test://w", nullable("My Resource"));
+    const n = s.notifyResourceUpdated("test://w");
     assert(n == 1);
-    import std.algorithm : canFind;
 
-    assert(received[0].canFind("\"title\""));
-    assert(received[0].canFind("My Resource"));
+    // No MCP spec version defines a `title` field on
+    // ResourceUpdatedNotificationParams; params must be exactly { uri }.
+    assert(received[0].canFind("test://w"));
+    assert(!received[0].canFind("\"title\""));
+}
+
+unittest  // notifyResourceUpdated has no title overload (title is not a spec param)
+{
+    auto s = new MCPServer("t", "1");
+    // The single-argument (uri only) form must exist.
+    static assert(__traits(compiles, s.notifyResourceUpdated("test://w")));
+    // A `title` argument is NOT part of any spec version, so the two-argument
+    // overload must NOT exist.
+    static assert(!__traits(compiles, s.notifyResourceUpdated("test://w", nullable("X"))));
 }
 
 unittest  // notifyResourceUpdated is a no-op before a push channel exists
