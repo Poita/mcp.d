@@ -15,7 +15,7 @@ import mcp.client.subscription : SubscriptionStream;
 
 /// Internal signal that the modern single-endpoint POST returned an HTTP
 /// 400/404/405, the trigger for the legacy HTTP+SSE (2024-11-05) fallback.
-/// Surfaced to `MCPClient.connect` so it can drive the fallback.
+/// Surfaced to `McpClient.connect` so it can drive the fallback.
 final class LegacyFallbackException : Exception
 {
 	int status;
@@ -34,7 +34,7 @@ final class LegacyFallbackException : Exception
 /// the standalone server->client GET SSE stream, the `subscriptions/listen`
 /// stream, session-id capture, the OAuth bearer token, and the legacy
 /// 2024-11-05 HTTP+SSE two-endpoint fallback (`legacyMode`). The owning
-/// `MCPClient` supplies the protocol-derived request headers (version / draft
+/// `McpClient` supplies the protocol-derived request headers (version / draft
 /// method+name / `Mcp-Param-*`) via the `customHeaders` callback, so this
 /// transport never needs the tool inputSchema cache or draft state.
 final class HttpClientTransport : ClientTransport
@@ -63,11 +63,11 @@ final class HttpClientTransport : ClientTransport
 	private bool legacyGot;
 	private McpException legacyErr;
 
-	/// Inbound dispatcher installed by `MCPClient` (its `dispatchInbound`),
+	/// Inbound dispatcher installed by `McpClient` (its `dispatchInbound`),
 	/// invoked for notifications and server->client requests on any stream.
 	private void delegate(Message) @safe inbound;
 	/// Protocol-derived headers for an outgoing message, supplied by the owning
-	/// `MCPClient`. Called with the request/notification message to obtain the
+	/// `McpClient`. Called with the request/notification message to obtain the
 	/// version / draft method+name / `Mcp-Param-*` headers, or with
 	/// `Json.undefined` (no message, e.g. the GET stream) to obtain just the
 	/// version header. Never includes Accept / Content-Type / Authorization /
@@ -75,7 +75,7 @@ final class HttpClientTransport : ClientTransport
 	private string[string]delegate(Json message) @safe customHeaders;
 	/// Whether a response with the given JSON-RPC id belongs to a request the
 	/// client has cancelled (basic/utilities/cancellation): such a response is
-	/// dropped rather than returned. Supplied by the owning `MCPClient`.
+	/// dropped rather than returned. Supplied by the owning `McpClient`.
 	private bool delegate(long id) @safe responseCancelled;
 
 	this(string url) @safe
@@ -89,7 +89,7 @@ final class HttpClientTransport : ClientTransport
 	}
 
 	/// Install the callback that yields the protocol-derived request headers for
-	/// an outgoing message (see `customHeaders`). `MCPClient` sets this so the
+	/// an outgoing message (see `customHeaders`). `McpClient` sets this so the
 	/// draft header/schema logic stays in the client.
 	void setCustomHeaders(string[string]delegate(Json message) @safe headers) @safe
 	{
@@ -891,7 +891,7 @@ final class HttpClientTransport : ClientTransport
 	/// event to learn the message-POST URI, then keep the stream open in a
 	/// background task to receive JSON-RPC responses and server notifications.
 	/// Throws if the `endpoint` event is not received. Called by
-	/// `MCPClient.connect` once a modern POST has been rejected with 400/404/405.
+	/// `McpClient.connect` once a modern POST has been rejected with 400/404/405.
 	void startLegacyHttpSse() @safe
 	{
 		import vibe.core.core : runTask, sleep;

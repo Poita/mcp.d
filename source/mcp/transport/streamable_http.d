@@ -56,15 +56,15 @@ struct StreamableHttpOptions
 /// publishes its OAuth 2.0 Protected Resource Metadata document.
 enum ProtectedResourceMetadataPath = "/.well-known/oauth-protected-resource";
 
-/// Mount an `MCPServer` onto a vibe.d `URLRouter` at the configured path,
+/// Mount an `McpServer` onto a vibe.d `URLRouter` at the configured path,
 /// implementing the modern Streamable HTTP transport (single endpoint):
 ///   - POST: a JSON-RPC message/batch; returns `application/json` for requests,
 ///     or `202 Accepted` with no body when the payload needs no reply.
 ///   - GET:  on the stable revisions, opens a standalone server->client SSE
-///     stream wired to the server-push channel (`MCPServer.notify`); on the
+///     stream wired to the server-push channel (`McpServer.notify`); on the
 ///     draft, which drops the standalone stream, GET -> 405.
 ///   - DELETE: the draft has no protocol-level sessions to tear down -> 405.
-void mountMcp(URLRouter router, MCPServer server,
+void mountMcp(URLRouter router, McpServer server,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
 	auto coord = new StreamCoordinator;
@@ -282,7 +282,7 @@ unittest  // stable revisions terminate sessions on DELETE; the draft answers 40
 	assert(!deleteTerminatesSession(ProtocolVersion.draft));
 }
 
-private void handleGet(MCPServer server, ServerPushChannel push,
+private void handleGet(McpServer server, ServerPushChannel push,
 		SessionManager sessions, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 	// Per the transport: the server MUST either open a text/event-stream or
@@ -365,7 +365,7 @@ private void handleGet(MCPServer server, ServerPushChannel push,
 /// existing `notify*` / `notifyResourceUpdated` APIs deliver opted-in change
 /// notifications onto it. The connection is held open (with SSE comment
 /// heartbeats) until the client disconnects.
-private void handleListenStream(MCPServer server, StreamCoordinator coord,
+private void handleListenStream(McpServer server, StreamCoordinator coord,
 		Message msg, HTTPServerResponse res) @safe
 {
 	import vibe.core.core : sleep;
@@ -420,7 +420,7 @@ private void handleListenStream(MCPServer server, StreamCoordinator coord,
 	}
 }
 
-private void handlePost(MCPServer server, StreamCoordinator coord,
+private void handlePost(McpServer server, StreamCoordinator coord,
 		SessionManager sessions, TokenInfo token, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 	const payload = req.bodyReader.readAllUTF8();
@@ -838,7 +838,7 @@ private bool isLoopbackHostname(string h) @safe
 
 /// Start a standalone Streamable HTTP server for `server` on `port` and run the
 /// vibe.d event loop. Blocks until the application exits.
-void runStreamableHttp(MCPServer server, ushort port,
+void runStreamableHttp(McpServer server, ushort port,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
 	import vibe.core.core : runEventLoop, lowerPrivileges;
@@ -1125,7 +1125,7 @@ unittest  // only a draft subscriptions/listen opens the long-lived stream
 /// `subscriptions/listen` stream: a `notifications/subscriptions/acknowledged`
 /// notification carrying the agreed-upon subset of change-notification types the
 /// server will deliver on the stream (draft basic/utilities/subscriptions). The
-/// `subset` is what `MCPServer.acknowledgedListenSubset` reported.
+/// `subset` is what `McpServer.acknowledgedListenSubset` reported.
 ///
 /// Per the draft spec the agreed subset is nested under `params.notifications`
 /// (mirroring the `notifications` filter the client sent in the listen request);
@@ -1435,7 +1435,7 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
 	import mcp.protocol.draft : MetaKey;
 	import std.algorithm : canFind;
 
-	auto server = new MCPServer("t", "1");
+	auto server = new McpServer("t", "1");
 
 	// Drive the server onto the draft via a draft subscriptions/listen request,
 	// mirroring what handleListenStream does: record the opted-in filters.

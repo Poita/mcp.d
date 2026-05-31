@@ -73,13 +73,13 @@ Json withProgressToken(Json params, ProgressToken token) @safe
 /// A Model Context Protocol client, transport-agnostic.
 ///
 /// Speaks pure JSON-RPC + protocol logic over a `ClientTransport` (Streamable
-/// HTTP via `MCPClient.http`/`MCPClient.spawn`, or stdio via `MCPClient.stdio`).
+/// HTTP via `McpClient.http`/`McpClient.spawn`, or stdio via `McpClient.stdio`).
 /// Drives the lifecycle (`initialize` + `notifications/initialized`) and the
 /// server features (tools, resources, prompts, completion, logging,
 /// subscriptions) with auto-pagination. Server->client requests received on an
 /// inbound stream (sampling / elicitation / roots) are dispatched to the
 /// user-supplied handlers and answered via the transport.
-final class MCPClient
+final class McpClient
 {
 	// The byte transport (HTTP/stdio). All JSON-RPC I/O routes through it.
 	private ClientTransport transport;
@@ -169,10 +169,10 @@ final class MCPClient
 	}
 
 	/// Build a client over the Streamable HTTP transport at `url`.
-	static MCPClient http(string url,
+	static McpClient http(string url,
 			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
 	{
-		return new MCPClient(new HttpClientTransport(url), clientInfo);
+		return new McpClient(new HttpClientTransport(url), clientInfo);
 	}
 
 	/// Build a client over the stdio transport, exchanging newline-delimited
@@ -180,10 +180,10 @@ final class MCPClient
 	/// `mcp.transport.stdio.serveStdio`). `readLine` returns the next server line
 	/// (without its terminator) or `null` at end-of-input; `writeLine` emits one
 	/// message line (the sink appends the terminator).
-	static MCPClient stdio(string delegate() @safe readLine, void delegate(string) @safe writeLine,
+	static McpClient stdio(string delegate() @safe readLine, void delegate(string) @safe writeLine,
 			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
 	{
-		return new MCPClient(new StdioClientTransport(readLine, writeLine), clientInfo);
+		return new McpClient(new StdioClientTransport(readLine, writeLine), clientInfo);
 	}
 
 	/// Launch an MCP server as a subprocess and build a client over its
@@ -191,10 +191,10 @@ final class MCPClient
 	/// (`command[0]` is the executable). The returned client is NOT yet
 	/// initialized — call `initialize()` (or `ping()` for a stateless probe).
 	/// `close()` runs the MCP stdio shutdown sequence on the subprocess.
-	static MCPClient spawn(string[] command,
+	static McpClient spawn(string[] command,
 			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
 	{
-		return new MCPClient(spawnStdioTransport(command), clientInfo);
+		return new McpClient(spawnStdioTransport(command), clientInfo);
 	}
 
 	/// Release the underlying transport (stdio terminates the subprocess; HTTP
@@ -1242,7 +1242,7 @@ final class MCPClient
 /// Pick the newest protocol version both this SDK and the server support, given
 /// the server's advertised wire-string list (from `server/discover` or the
 /// `supported` field of an `UnsupportedProtocolVersionError`). Returns false
-/// when there is no overlap. Used by `MCPClient.connect` for modern-vs-legacy
+/// when there is no overlap. Used by `McpClient.connect` for modern-vs-legacy
 /// server detection per the transport backward-compatibility rules.
 bool selectMutualVersion(const string[] serverVersions, out ProtocolVersion chosen) @safe
 {
@@ -1277,6 +1277,15 @@ ProtocolVersion resolveNegotiatedVersion(string serverVersion) @safe
 		throw new McpException(ErrorCode.unsupportedProtocolVersion,
 				"Server returned unsupported protocol version: " ~ serverVersion);
 	return v;
+}
+
+unittest  // public flagship type uses single-cap Mcp* casing (issue #304)
+{
+	// The client class must be reachable under the consistent `McpClient`
+	// name (matching McpServer, McpException, etc.), not `MCPClient`.
+	static assert(is(McpClient == class));
+	auto c = McpClient.http("http://localhost");
+	assert(c !is null);
 }
 
 unittest  // resolveNegotiatedVersion accepts a supported server version
@@ -1331,7 +1340,7 @@ unittest  // validateOutput passes a conforming structured result
 	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
 	CallToolResult r;
 	r.structuredContent = Json(["result": Json(5)]);
-	assert(MCPClient.validateOutput(t, r) == "");
+	assert(McpClient.validateOutput(t, r) == "");
 }
 
 unittest  // validateOutput rejects a non-conforming structured result
@@ -1346,7 +1355,7 @@ unittest  // validateOutput rejects a non-conforming structured result
 	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
 	CallToolResult r;
 	r.structuredContent = Json(["result": Json("oops")]);
-	assert(MCPClient.validateOutput(t, r).length > 0);
+	assert(McpClient.validateOutput(t, r).length > 0);
 }
 
 unittest  // validateOutput is a no-op when the tool has no output schema
@@ -1354,7 +1363,7 @@ unittest  // validateOutput is a no-op when the tool has no output schema
 	Tool t = {name: "noschema"};
 	CallToolResult r;
 	r.structuredContent = Json(["anything": Json(1)]);
-	assert(MCPClient.validateOutput(t, r) == "");
+	assert(McpClient.validateOutput(t, r) == "");
 }
 
 unittest  // validateOutput is a no-op when there is no structured content
@@ -1368,12 +1377,12 @@ unittest  // validateOutput is a no-op when there is no structured content
 
 	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
 	CallToolResult r; // structuredContent stays undefined
-	assert(MCPClient.validateOutput(t, r) == "");
+	assert(McpClient.validateOutput(t, r) == "");
 }
 
 unittest  // sampling dispatch rejects an unbalanced tool_use with -32602
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	bool delegateCalled;
 	c.onSampling = (Json params) @safe {
 		delegateCalled = true;
@@ -1407,7 +1416,7 @@ unittest  // sampling dispatch rejects an unbalanced tool_use with -32602
 
 unittest  // notifyRootsListChanged emits the spec notification method
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	Json sent = Json.undefined;
 	c.onNotifyForTest = (Json message) @safe { sent = message; };
 
@@ -1421,7 +1430,7 @@ unittest  // notifyRootsListChanged emits the spec notification method
 
 unittest  // setRoots answers roots/list with the typed envelope
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	c.setRoots([
 		Root("file:///home/user/project", nullable("My Project")),
 		Root("file:///tmp")
@@ -1444,7 +1453,7 @@ unittest  // setRoots answers roots/list with the typed envelope
 
 unittest  // sendNotification sends an arbitrary client-originated notification
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	Json sent = Json.undefined;
 	c.onNotifyForTest = (Json message) @safe { sent = message; };
 
@@ -1462,7 +1471,7 @@ unittest  // sendNotification sends an arbitrary client-originated notification
 
 unittest  // cancel() emits notifications/cancelled with the requestId and reason
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	Json sent = Json.undefined;
 	c.onNotifyForTest = (Json message) @safe { sent = message; };
 
@@ -1478,7 +1487,7 @@ unittest  // cancel() emits notifications/cancelled with the requestId and reaso
 
 unittest  // cancel() without a reason omits the reason field
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	Json sent = Json.undefined;
 	c.onNotifyForTest = (Json message) @safe { sent = message; };
 
@@ -1490,7 +1499,7 @@ unittest  // cancel() without a reason omits the reason field
 
 unittest  // after cancel(), a response for that id is treated as cancelled (ignored)
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	c.onNotifyForTest = (Json message) @safe {};
 
 	assert(!c.isResponseCancelled(11));
@@ -1505,7 +1514,7 @@ unittest  // cancel() refuses to cancel the initialize request per spec
 	import std.exception : assertThrown;
 	import mcp.protocol.errors : McpException;
 
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	c.onNotifyForTest = (Json message) @safe {};
 	// Simulate that the initialize request used id 5.
 	c.setInitializeRequestIdForTest(5);
@@ -1517,7 +1526,7 @@ unittest  // cancel() refuses to cancel the initialize request per spec
 
 unittest  // sampling dispatch forwards a valid request to the delegate
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	bool delegateCalled;
 	c.onSampling = (Json params) @safe {
 		delegateCalled = true;
@@ -1539,7 +1548,7 @@ unittest  // sampling dispatch forwards a valid request to the delegate
 
 unittest  // elicitation/create rejects a mode the client did not advertise (-32602)
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	// Advertise form mode only (the default bare elicitation declaration).
 	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
@@ -1569,7 +1578,7 @@ unittest  // elicitation/create rejects a mode the client did not advertise (-32
 
 unittest  // elicitation/create rejects an unknown mode (-32602)
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 
@@ -1596,7 +1605,7 @@ unittest  // elicitation/create rejects an unknown mode (-32602)
 
 unittest  // elicitation/create forwards an advertised mode to the delegate
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 	c.capabilities.elicitationUrl = true;
@@ -1618,7 +1627,7 @@ unittest  // elicitation/create forwards an advertised mode to the delegate
 
 unittest  // url-only client rejects a form-mode elicitation/create (-32602)
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	// A url-only client is the canonical shape parsed from `{"url":{}}`:
 	// elicitation present + url submode, but no form submode.
 	c.capabilities.elicitation = true;
@@ -1648,7 +1657,7 @@ unittest  // url-only client rejects a form-mode elicitation/create (-32602)
 
 unittest  // url-only client rejects a mode-absent (defaults to form) elicitation/create (-32602)
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	c.capabilities.elicitation = true;
 	c.capabilities.elicitationUrl = true;
 
@@ -1676,7 +1685,7 @@ unittest  // url-only client rejects a mode-absent (defaults to form) elicitatio
 
 unittest  // bare elicitation declaration still accepts form-mode requests
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	// A bare `{}` declaration is parsed as elicitationForm=true; ensure the
 	// tightened check does not regress that case.
 	c.capabilities.elicitation = true;
@@ -1697,7 +1706,7 @@ unittest  // bare elicitation declaration still accepts form-mode requests
 
 unittest  // elicitation/complete for a known id is forwarded once, then ignored
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 	c.capabilities.elicitationUrl = true;
@@ -1725,7 +1734,7 @@ unittest  // elicitation/complete for a known id is forwarded once, then ignored
 
 unittest  // elicitation/complete for an unknown id is ignored
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	bool forwarded;
 	c.onNotification = (string, Json) @safe { forwarded = true; };
 
@@ -1737,7 +1746,7 @@ unittest  // elicitation/complete for an unknown id is ignored
 
 unittest  // elicitation/complete without an elicitationId is ignored
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	bool forwarded;
 	c.onNotification = (string, Json) @safe { forwarded = true; };
 
@@ -1747,7 +1756,7 @@ unittest  // elicitation/complete without an elicitationId is ignored
 
 unittest  // other notifications are forwarded unchanged
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	string forwarded;
 	c.onNotification = (string method, Json) @safe { forwarded = method; };
 
@@ -1757,7 +1766,7 @@ unittest  // other notifications are forwarded unchanged
 
 unittest  // notifications/progress is delivered to the typed onProgress observer
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	ProgressNotification got;
 	bool called;
 	c.onProgress = (ProgressNotification n) @safe { got = n; called = true; };
@@ -1778,7 +1787,7 @@ unittest  // notifications/progress is delivered to the typed onProgress observe
 
 unittest  // a non-progress notification does not invoke onProgress
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	bool called;
 	c.onProgress = (ProgressNotification) @safe { called = true; };
 	c.dispatchNotification("notifications/message", Json.emptyObject);
@@ -1787,7 +1796,7 @@ unittest  // a non-progress notification does not invoke onProgress
 
 unittest  // progress is still forwarded to the generic onNotification observer
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	string forwarded;
 	c.onNotification = (string method, Json) @safe { forwarded = method; };
 	c.dispatchNotification("notifications/progress", Json.emptyObject);
@@ -1796,7 +1805,7 @@ unittest  // progress is still forwarded to the generic onNotification observer
 
 unittest  // notifications/message is delivered to the typed onLogMessage observer
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	LogMessageNotification got;
 	bool called;
 	c.onLogMessage = (LogMessageNotification n) @safe { got = n; called = true; };
@@ -1816,7 +1825,7 @@ unittest  // notifications/message is delivered to the typed onLogMessage observ
 
 unittest  // a non-message notification does not invoke onLogMessage
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	bool called;
 	c.onLogMessage = (LogMessageNotification) @safe { called = true; };
 	c.dispatchNotification("notifications/progress", Json.emptyObject);
@@ -1825,7 +1834,7 @@ unittest  // a non-message notification does not invoke onLogMessage
 
 unittest  // a log message is still forwarded to the generic onNotification observer
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	string forwarded;
 	c.onNotification = (string method, Json) @safe { forwarded = method; };
 	c.dispatchNotification("notifications/message", Json.emptyObject);
@@ -1834,7 +1843,7 @@ unittest  // a log message is still forwarded to the generic onNotification obse
 
 unittest  // elicitation/create defaults to form mode when mode is absent
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 
@@ -1854,7 +1863,7 @@ unittest  // elicitation/create defaults to form mode when mode is absent
 
 unittest  // buildCompleteParams shapes a prompt completion request
 {
-	auto p = MCPClient.buildCompleteParams(CompletionReference.forPrompt("greet"),
+	auto p = McpClient.buildCompleteParams(CompletionReference.forPrompt("greet"),
 			"name", "pa", null);
 	assert(p["ref"]["type"].get!string == "ref/prompt");
 	assert(p["ref"]["name"].get!string == "greet");
@@ -1865,7 +1874,7 @@ unittest  // buildCompleteParams shapes a prompt completion request
 
 unittest  // buildCompleteParams shapes a resource completion request
 {
-	auto p = MCPClient.buildCompleteParams(
+	auto p = McpClient.buildCompleteParams(
 			CompletionReference.forResource("file:///{path}"), "path", "/ho", null);
 	assert(p["ref"]["type"].get!string == "ref/resource");
 	assert(p["ref"]["uri"].get!string == "file:///{path}");
@@ -1875,7 +1884,7 @@ unittest  // buildCompleteParams shapes a resource completion request
 unittest  // buildCompleteParams includes the resolved-argument context when given
 {
 	string[string] ctx = ["owner": "octocat"];
-	auto p = MCPClient.buildCompleteParams(CompletionReference.forPrompt("pr"), "repo", "m", ctx);
+	auto p = McpClient.buildCompleteParams(CompletionReference.forPrompt("pr"), "repo", "m", ctx);
 	assert(p["context"]["arguments"]["owner"].get!string == "octocat");
 }
 
@@ -1932,20 +1941,20 @@ unittest  // withProgressToken leaves params untouched when the token is unset
 
 unittest  // buildToolCallParams attaches a progressToken under _meta
 {
-	auto p = MCPClient.buildToolCallParams("add", Json(["a": Json(1)]), ProgressToken("p1"));
+	auto p = McpClient.buildToolCallParams("add", Json(["a": Json(1)]), ProgressToken("p1"));
 	assert(p["name"].get!string == "add");
 	assert(p["_meta"]["progressToken"].get!string == "p1");
 }
 
 unittest  // buildToolCallParams omits _meta when no progress token is requested
 {
-	auto p = MCPClient.buildToolCallParams("add", Json.emptyObject, ProgressToken.init);
+	auto p = McpClient.buildToolCallParams("add", Json.emptyObject, ProgressToken.init);
 	assert("_meta" !in p);
 }
 
 unittest  // buildReadResourceParams attaches a progressToken under _meta
 {
-	auto p = MCPClient.buildReadResourceParams("file:///x", ProgressToken(99L));
+	auto p = McpClient.buildReadResourceParams("file:///x", ProgressToken(99L));
 	assert(p["uri"].get!string == "file:///x");
 	assert(p["_meta"]["progressToken"].get!long == 99);
 }
@@ -1955,7 +1964,7 @@ unittest  // buildSubscriptionsListenParams nests the boolean list-changed flags
 	SubscriptionFilter f;
 	f.toolsListChanged = true;
 	f.resourcesListChanged = true;
-	auto p = MCPClient.buildSubscriptionsListenParams(f);
+	auto p = McpClient.buildSubscriptionsListenParams(f);
 	assert(p["notifications"]["toolsListChanged"].get!bool == true);
 	assert(p["notifications"]["resourcesListChanged"].get!bool == true);
 	// Flags left false are omitted (not sent as false) per the spec filter shape.
@@ -1966,7 +1975,7 @@ unittest  // buildSubscriptionsListenParams nests resourceSubscriptions URIs as 
 {
 	SubscriptionFilter f;
 	f.resourceSubscriptions = ["file:///a", "file:///b"];
-	auto p = MCPClient.buildSubscriptionsListenParams(f);
+	auto p = McpClient.buildSubscriptionsListenParams(f);
 	auto rs = p["notifications"]["resourceSubscriptions"];
 	assert(rs.type == Json.Type.array);
 	assert(rs.length == 2);
@@ -1977,7 +1986,7 @@ unittest  // buildSubscriptionsListenParams nests resourceSubscriptions URIs as 
 unittest  // buildSubscriptionsListenParams emits an empty notifications filter for an empty subscription
 {
 	SubscriptionFilter f;
-	auto p = MCPClient.buildSubscriptionsListenParams(f);
+	auto p = McpClient.buildSubscriptionsListenParams(f);
 	assert(p["notifications"].type == Json.Type.object);
 	assert(p["notifications"].length == 0);
 }
@@ -1987,7 +1996,7 @@ unittest  // a subscriptions/listen stream delivers the acknowledgement + change
 	// Exercise the delivery path the listen stream uses (dispatchInbound):
 	// the leading subscriptions/acknowledged event and a subsequent list-changed
 	// notification must both reach onNotification.
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	string[] seen;
 	c.onNotification = (string method, Json params) @safe { seen ~= method; };
 
@@ -2002,7 +2011,7 @@ unittest  // a subscriptions/listen stream delivers the acknowledgement + change
 
 unittest  // buildGetPromptParams attaches a progressToken under _meta
 {
-	auto p = MCPClient.buildGetPromptParams("greet", Json.emptyObject, ProgressToken("g1"));
+	auto p = McpClient.buildGetPromptParams("greet", Json.emptyObject, ProgressToken("g1"));
 	assert(p["name"].get!string == "greet");
 	assert(p["_meta"]["progressToken"].get!string == "g1");
 }
@@ -2023,7 +2032,7 @@ unittest  // paramHeaders mirrors an x-mcp-header-annotated argument into Mcp-Pa
 	args["region"] = "us-west1";
 	args["query"] = "weather";
 
-	auto headers = MCPClient.paramHeaders(schema, args);
+	auto headers = McpClient.paramHeaders(schema, args);
 	assert("Mcp-Param-Region" in headers);
 	assert(headers["Mcp-Param-Region"] == "us-west1");
 	// A non-annotated argument never becomes a header.
@@ -2046,7 +2055,7 @@ unittest  // paramHeaders omits headers for absent or null annotated arguments
 	args["zone"] = null; // explicit null -> no header
 	// region absent entirely -> no header
 
-	auto headers = MCPClient.paramHeaders(schema, args);
+	auto headers = McpClient.paramHeaders(schema, args);
 	assert("Mcp-Param-Region" !in headers);
 	assert("Mcp-Param-Zone" !in headers);
 }
@@ -2067,7 +2076,7 @@ unittest  // paramHeaders base64-encodes a non-ASCII annotated value
 	Json args = Json.emptyObject;
 	args["label"] = "Hello, 世界";
 
-	auto headers = MCPClient.paramHeaders(schema, args);
+	auto headers = McpClient.paramHeaders(schema, args);
 	assert("Mcp-Param-Label" in headers);
 	assert(headers["Mcp-Param-Label"][0 .. 9] == "=?base64?");
 	assert(decodeHeaderValue(headers["Mcp-Param-Label"]) == "Hello, 世界");
@@ -2087,7 +2096,7 @@ unittest  // paramHeaders stringifies a non-string scalar annotated value
 	Json args = Json.emptyObject;
 	args["limit"] = 42;
 
-	auto headers = MCPClient.paramHeaders(schema, args);
+	auto headers = McpClient.paramHeaders(schema, args);
 	assert(headers["Mcp-Param-Limit"] == "42");
 }
 
@@ -2102,13 +2111,13 @@ unittest  // paramHeaders yields nothing when the schema has no x-mcp-header ann
 	Json args = Json.emptyObject;
 	args["query"] = "x";
 
-	auto headers = MCPClient.paramHeaders(schema, args);
+	auto headers = McpClient.paramHeaders(schema, args);
 	assert(headers.length == 0);
 }
 
 unittest  // cacheToolSchema records a schema and ignores a non-object one
 {
-	auto c = MCPClient.http("http://localhost/mcp");
+	auto c = McpClient.http("http://localhost/mcp");
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
 	c.cacheToolSchema("search", schema);
@@ -2123,7 +2132,7 @@ unittest  // MRTR: withInputResponses attaches answers in top-level params.input
 	auto resp = InputResponse("date", Json([
 			"content": Json(["day": Json("monday")])
 	]));
-	auto params = MCPClient.buildToolCallParams("book", Json.emptyObject,
+	auto params = McpClient.buildToolCallParams("book", Json.emptyObject,
 			ProgressToken.init, [resp]);
 	// SEP-2322: a top-level map keyed by the InputRequest id, value is the bare
 	// result — NOT under _meta and NOT an array of {id, result} wrappers.
@@ -2138,7 +2147,7 @@ unittest  // MRTR: withInputResponses attaches answers in top-level params.input
 
 unittest  // MRTR: withInputResponses with no answers leaves params untouched
 {
-	auto params = MCPClient.buildToolCallParams("book", Json.emptyObject, ProgressToken.init, [
+	auto params = McpClient.buildToolCallParams("book", Json.emptyObject, ProgressToken.init, [
 	]);
 	assert("inputResponses" !in params);
 	assert("_meta" !in params);
@@ -2152,7 +2161,7 @@ unittest  // MRTR: withInputResponses preserves an existing params payload
 	meta["progressToken"] = "p1";
 	p["_meta"] = meta;
 	auto resp = InputResponse("q1", Json(["action": Json("accept")]));
-	auto out_ = MCPClient.withInputResponses(p, [resp]);
+	auto out_ = McpClient.withInputResponses(p, [resp]);
 	// Existing fields are preserved; inputResponses is added at the top level.
 	assert(out_["name"].get!string == "book");
 	assert(out_["_meta"]["progressToken"].get!string == "p1");
@@ -2163,7 +2172,7 @@ unittest  // MRTR: withInputResponses preserves an existing params payload
 unittest  // MRTR: withRequestState echoes the opaque requestState at the top level
 {
 	auto resp = InputResponse("date", Json(["action": Json("accept")]));
-	auto params = MCPClient.buildToolCallParams("book", Json.emptyObject,
+	auto params = McpClient.buildToolCallParams("book", Json.emptyObject,
 			ProgressToken.init, [resp], "eyJyIjoiRHVwIn0");
 	// SEP-2322: requestState is echoed verbatim as a top-level params field.
 	assert(params["requestState"].get!string == "eyJyIjoiRHVwIn0");
@@ -2172,14 +2181,14 @@ unittest  // MRTR: withRequestState echoes the opaque requestState at the top le
 unittest  // MRTR: an empty requestState is never echoed (client MUST NOT invent one)
 {
 	auto resp = InputResponse("date", Json(["action": Json("accept")]));
-	auto params = MCPClient.buildToolCallParams("book", Json.emptyObject,
+	auto params = McpClient.buildToolCallParams("book", Json.emptyObject,
 			ProgressToken.init, [resp]);
 	assert("requestState" !in params);
 }
 
 unittest  // MRTR: resolveInputRequest routes an elicitation request to onElicitation
 {
-	auto c = MCPClient.http("http://localhost/mcp");
+	auto c = McpClient.http("http://localhost/mcp");
 	Json seen = Json.undefined;
 	c.onElicitation = (Json params) @safe {
 		seen = params;
@@ -2200,7 +2209,7 @@ unittest  // MRTR: resolveInputRequest routes an elicitation request to onElicit
 
 unittest  // MRTR: resolveInputRequest routes a sampling request to onSampling
 {
-	auto c = MCPClient.http("http://localhost/mcp");
+	auto c = McpClient.http("http://localhost/mcp");
 	c.onSampling = (Json params) @safe {
 		return Json(["role": Json("assistant")]);
 	};
@@ -2213,7 +2222,7 @@ unittest  // MRTR: resolveInputRequest routes a sampling request to onSampling
 
 unittest  // MRTR: resolveInputRequest routes a roots request to onListRoots
 {
-	auto c = MCPClient.http("http://localhost/mcp");
+	auto c = McpClient.http("http://localhost/mcp");
 	c.onListRoots = (Json params) @safe {
 		return Json(["roots": Json.emptyArray]);
 	};
@@ -2226,7 +2235,7 @@ unittest  // MRTR: resolveInputRequest routes a roots request to onListRoots
 
 unittest  // MRTR: resolveInputRequest fails (no answer) when no handler is registered
 {
-	auto c = MCPClient.http("http://localhost/mcp");
+	auto c = McpClient.http("http://localhost/mcp");
 	InputResponse answer;
 	// onElicitation is null by default -> cannot satisfy the request.
 	const ok = c.resolveInputRequest(InputRequest("x", "elicitation", Json.emptyObject), answer);
@@ -2236,7 +2245,7 @@ unittest  // MRTR: resolveInputRequest fails (no answer) when no handler is regi
 
 unittest  // MRTR: resolveInputRequest fails for an unknown input type
 {
-	auto c = MCPClient.http("http://localhost/mcp");
+	auto c = McpClient.http("http://localhost/mcp");
 	c.onElicitation = (Json) @safe { return Json.emptyObject; };
 	InputResponse answer;
 	const ok = c.resolveInputRequest(InputRequest("x", "bogus", Json.emptyObject), answer);
@@ -2245,7 +2254,7 @@ unittest  // MRTR: resolveInputRequest fails for an unknown input type
 
 unittest  // listResourceTemplates calls resources/templates/list and auto-paginates
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	string[] methods;
 	int call;
 	c.onRpcForTest = (string method, Json params) @safe {
@@ -2285,7 +2294,7 @@ unittest  // listResourceTemplates calls resources/templates/list and auto-pagin
 
 unittest  // readResource exposes the parsed CacheableResult freshness hint as .cache
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	c.onRpcForTest = (string method, Json params) @safe {
 		Json r = Json.emptyObject;
 		Json arr = Json.emptyArray;
@@ -2303,7 +2312,7 @@ unittest  // readResource exposes the parsed CacheableResult freshness hint as .
 
 unittest  // a list result exposes .cache from the first page's freshness hint
 {
-	auto c = MCPClient.http("http://localhost");
+	auto c = McpClient.http("http://localhost");
 	c.onRpcForTest = (string method, Json params) @safe {
 		Json r = Json.emptyObject;
 		r["tools"] = Json.emptyArray;

@@ -134,7 +134,7 @@ final class MyServer
 
 void main()
 {
-    auto server = new MCPServer("my-server", "1.0.0");
+    auto server = new McpServer("my-server", "1.0.0");
     registerHandlers(server, new MyServer);   // reflects the UDAs at compile time
     runStreamableHttp(server, 3000);          // or: runStdio(server);
 }
@@ -159,7 +159,7 @@ string greetPrompt(string topic) @safe { return "Say hello about " ~ topic; }
 
 void main()
 {
-    auto server = new MCPServer("my-server", "1.0.0");
+    auto server = new McpServer("my-server", "1.0.0");
     registerModule!(__traits(parent, add))(server);  // or registerModule!(my.module)(server)
     // registerModules!(modA, modB)(server);          // variadic convenience
     runStdio(server);
@@ -274,12 +274,12 @@ import vibe.data.json : Json;
 
 void main()
 {
-    // MCPClient uses vibe.d async I/O, so drive it from a task on the event loop.
+    // McpClient uses vibe.d async I/O, so drive it from a task on the event loop.
     runTask(() nothrow {
         scope (exit) exitEventLoop();
         try
         {
-            auto client = MCPClient.http("http://127.0.0.1:3000/mcp");
+            auto client = McpClient.http("http://127.0.0.1:3000/mcp");
             client.initialize();
 
             auto result = client.callTool("add", Json(["a": Json(2), "b": Json(40)]));
@@ -295,7 +295,7 @@ void main()
 }
 ```
 
-`MCPClient` also offers `listTools` / `listResources` / `listResourceTemplates` /
+`McpClient` also offers `listTools` / `listResources` / `listResourceTemplates` /
 `listPrompts` (auto-paginated), `readResource`, `getPrompt`, `setBearerToken` for OAuth,
 and `enableDraft()` for the stateless draft protocol.
 
@@ -310,24 +310,24 @@ supply the hint per result: pass a `CacheHint` to `registerResource` /
 `registerResourceTemplate`, or call `setListCacheHint("tools/list", CacheHint(...))`
 for a `*/list` method (hints are draft-gated and never alter 2025-11-25 output).
 
-`MCPClient` is transport-agnostic: it speaks pure JSON-RPC over a
-`ClientTransport`. `MCPClient.http(url)` builds one over Streamable HTTP;
-`MCPClient.stdio(readLine, writeLine)` and `MCPClient.spawn(command)` build one
-over stdio (see below). You can also construct `new MCPClient(transport)` with a
+`McpClient` is transport-agnostic: it speaks pure JSON-RPC over a
+`ClientTransport`. `McpClient.http(url)` builds one over Streamable HTTP;
+`McpClient.stdio(readLine, writeLine)` and `McpClient.spawn(command)` build one
+over stdio (see below). You can also construct `new McpClient(transport)` with a
 custom `ClientTransport` directly.
 
 ### Connecting over stdio (launching a server as a subprocess)
 
 To act as an MCP host over the **stdio** transport — launching the server as a
 child process and speaking newline-delimited JSON-RPC over its stdin/stdout —
-use `MCPClient.spawn`:
+use `McpClient.spawn`:
 
 ```d
 import mcp;
 
 void main()
 {
-    auto client = MCPClient.spawn(["dub", "run", ":calculator"]);
+    auto client = McpClient.spawn(["dub", "run", ":calculator"]);
     scope (exit) client.close();   // close child's stdin and wait for exit
 
     client.initialize();
@@ -338,11 +338,11 @@ void main()
 }
 ```
 
-The same `MCPClient` API (`initialize` / `listTools` / `callTool` /
+The same `McpClient` API (`initialize` / `listTools` / `callTool` /
 `listResources` / `readResource` / `listPrompts` / `getPrompt` / `subscribe` /
 `setLogLevel`) works over every transport. For a custom byte channel, use
-`MCPClient.stdio(readLine, writeLine)` with your own `readLine`/`writeLine`
-pair; `MCPClient.spawn` is the convenience wrapper around
+`McpClient.stdio(readLine, writeLine)` with your own `readLine`/`writeLine`
+pair; `McpClient.spawn` is the convenience wrapper around
 `std.process.pipeProcess`. The server side is `runStdio(server)` /
 `serveStdio` in `mcp.transport.stdio`.
 

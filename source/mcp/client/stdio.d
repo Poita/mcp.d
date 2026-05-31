@@ -21,10 +21,10 @@ import mcp.client.subscription : SubscriptionStream;
 ///
 /// This class is transport-pure: it is constructed with a `readLine`/`writeLine`
 /// pair (symmetric to `mcp.transport.stdio.serveStdio` on the server side) and
-/// carries the bytes for an owning `MCPClient`. There is no standalone
+/// carries the bytes for an owning `McpClient`. There is no standalone
 /// server->client stream and no bearer token over stdio, so `startServerStream`
 /// and `setBearerToken` are no-ops. `close()` terminates the subprocess when one
-/// was spawned (see `MCPClient.spawn`).
+/// was spawned (see `McpClient.spawn`).
 final class StdioClientTransport : ClientTransport
 {
 	import std.process : ProcessPipes;
@@ -33,7 +33,7 @@ final class StdioClientTransport : ClientTransport
 	private string delegate() @safe readLine;
 	private void delegate(string) @safe writeLine;
 	private void delegate(Message) @safe inbound;
-	// When spawned via `MCPClient.spawn`, the owned subprocess pipes so `close()`
+	// When spawned via `McpClient.spawn`, the owned subprocess pipes so `close()`
 	// can run the MCP stdio shutdown sequence (close stdin -> SIGTERM -> SIGKILL).
 	private Nullable!ProcessPipes pipes;
 
@@ -146,14 +146,14 @@ final class StdioClientTransport : ClientTransport
 	}
 
 	/// Attach owned subprocess pipes so `close()` runs the stdio shutdown
-	/// sequence. Set by `MCPClient.spawn`.
+	/// sequence. Set by `McpClient.spawn`.
 	package void attachProcess(ProcessPipes pipes) @safe
 	{
 		this.pipes = pipes;
 	}
 
 	/// Release transport resources. When this transport owns a spawned
-	/// subprocess (`MCPClient.spawn`), run the MCP stdio Shutdown sequence
+	/// subprocess (`McpClient.spawn`), run the MCP stdio Shutdown sequence
 	/// (basic/lifecycle §Shutdown -> stdio): close the child's stdin, escalate to
 	/// `SIGTERM`, then `SIGKILL` if it does not exit within the grace periods.
 	/// A no-op when there is no owned subprocess (a custom `readLine`/`writeLine`
@@ -245,7 +245,7 @@ final class StdioClientTransport : ClientTransport
 /// newline-delimited JSON-RPC requests are written to the child's stdin and
 /// responses are read from its stdout; the child's stderr is inherited for
 /// logging. The returned transport owns the subprocess: its `close()` runs the
-/// stdio shutdown sequence. Used by `MCPClient.spawn`.
+/// stdio shutdown sequence. Used by `McpClient.spawn`.
 StdioClientTransport spawnStdioTransport(string[] args) @safe
 {
 	import std.process : pipeProcess, Redirect;
@@ -272,17 +272,17 @@ StdioClientTransport spawnStdioTransport(string[] args) @safe
 
 version (unittest)
 {
-	import mcp.server.server : MCPServer;
-	import mcp.client.client : MCPClient;
+	import mcp.server.server : McpServer;
+	import mcp.client.client : McpClient;
 	import mcp.protocol.types : Tool, Content, CallToolResult;
 }
 
-unittest  // MCPClient over a stdio transport drives an in-process server (initialize + tools)
+unittest  // McpClient over a stdio transport drives an in-process server (initialize + tools)
 {
-	// Wire a stdio-transport MCPClient to an MCPServer through two queues, pumping
+	// Wire a stdio-transport McpClient to an McpServer through two queues, pumping
 	// the server synchronously: every request the client writes is handled
 	// immediately and its response queued for the client to read back.
-	auto server = new MCPServer("stdio-client-srv", "1.0");
+	auto server = new McpServer("stdio-client-srv", "1.0");
 	Tool echo = {name: "echo"};
 	server.registerTool(echo, (Json args) @safe {
 		CallToolResult r;
@@ -293,7 +293,7 @@ unittest  // MCPClient over a stdio transport drives an in-process server (initi
 	string[] toServer; // lines written by the client, awaiting the server
 	string[] toClient; // response lines queued for the client to read
 
-	auto client = MCPClient.stdio(() @safe {
+	auto client = McpClient.stdio(() @safe {
 		// Drain pending server work so a response is available before we read.
 		while (toClient.length == 0 && toServer.length)
 		{
@@ -329,7 +329,7 @@ unittest  // stdio transport surfaces a correlated server error response as an M
 		`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}`,
 	];
 
-	auto client = MCPClient.stdio(() @safe {
+	auto client = McpClient.stdio(() @safe {
 		if (toClient.length == 0)
 			return cast(string) null;
 		auto line = toClient[0];
@@ -352,7 +352,7 @@ unittest  // stdio transport surfaces a correlated server error response as an M
 
 unittest  // stdio transport throws when the server closes stdout before responding
 {
-	auto client = MCPClient.stdio(() @safe { return cast(string) null; }, (string) @safe {
+	auto client = McpClient.stdio(() @safe { return cast(string) null; }, (string) @safe {
 	});
 	bool threw;
 	try
@@ -370,7 +370,7 @@ unittest  // stdio transport dispatches inbound notifications while awaiting a r
 	];
 	string[] gotMethods;
 
-	auto client = MCPClient.stdio(() @safe {
+	auto client = McpClient.stdio(() @safe {
 		if (toClient.length == 0)
 			return cast(string) null;
 		auto line = toClient[0];
@@ -395,7 +395,7 @@ unittest  // stdio transport answers a server-initiated ping while awaiting its 
 		`{"jsonrpc":"2.0","id":1,"result":{}}`, // then answers our request
 	];
 
-	auto client = MCPClient.stdio(() @safe {
+	auto client = McpClient.stdio(() @safe {
 		if (toClient.length == 0)
 			return cast(string) null;
 		auto line = toClient[0];

@@ -114,10 +114,10 @@ struct RegisteredPrompt
 
 /// The transport-agnostic core of an MCP server.
 ///
-/// `MCPServer` owns registration and JSON-RPC dispatch. It has no I/O: feed it
+/// `McpServer` owns registration and JSON-RPC dispatch. It has no I/O: feed it
 /// parsed messages via `handle` (or raw text via `handleRaw`) and it returns the
 /// response to write back. Transports (stdio, HTTP) are thin drivers over this.
-final class MCPServer
+final class McpServer
 {
 	private string serverName;
 	private string serverVersion;
@@ -722,7 +722,7 @@ final class MCPServer
 	/// and block until a connected client acknowledges with the spec-mandated
 	/// empty result (basic/utilities/ping: "Either the client or server can
 	/// initiate a ping by sending a `ping` request"). This is the server-side
-	/// counterpart to `MCPClient.ping()`, exposing the SHOULD-periodic
+	/// counterpart to `McpClient.ping()`, exposing the SHOULD-periodic
 	/// connection-health probe the spec describes for either party. The probe
 	/// rides the same push channel `notify` uses, and the client's reply is
 	/// correlated via the shared `StreamCoordinator` when it POSTs the response.
@@ -984,7 +984,7 @@ final class MCPServer
 	/// `resources/list`, `resources/templates/list` and `prompts/list` return at
 	/// most `size` items per response and emit an opaque `nextCursor` whenever
 	/// more results remain; the client passes that cursor back as `params.cursor`
-	/// to fetch the next page (the bundled `MCPClient` list helpers follow these
+	/// to fetch the next page (the bundled `McpClient` list helpers follow these
 	/// cursors automatically). A `size` of `0` (the default) disables pagination:
 	/// each list returns its full contents in a single response with no cursor.
 	void setPageSize(size_t size) @safe
@@ -1712,9 +1712,9 @@ unittest  // template matching captures a trailing parameter
 
 version (unittest)
 {
-	private MCPServer makeTestServer() @safe
+	private McpServer makeTestServer() @safe
 	{
-		auto s = new MCPServer("test-srv", "0.1.0");
+		auto s = new McpServer("test-srv", "0.1.0");
 		Tool add = {name: "add", description: nullable("Add two integers")};
 		s.registerTool(add, (Json args) @safe {
 			const a = args["a"].get!int;
@@ -1731,6 +1731,15 @@ version (unittest)
 	{
 		return Message(makeRequest(Json(id), method, params));
 	}
+}
+
+unittest  // public flagship type uses single-cap Mcp* casing (issue #304)
+{
+	// The server class must be reachable under the consistent `McpServer`
+	// name (matching McpException, MrtrToolHandler, etc.), not `MCPServer`.
+	static assert(is(McpServer == class));
+	auto s = new McpServer("casing-srv", "0.1.0");
+	assert(s !is null);
 }
 
 unittest  // initialize negotiates the requested version and reports server info
@@ -1756,7 +1765,7 @@ unittest  // Implementation constructor advertises full serverInfo on 2025-11-25
 				Icon("https://example.com/i.png")
 		]
 	};
-	auto s = new MCPServer(info);
+	auto s = new McpServer(info);
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = "2025-11-25";
 	params["capabilities"] = Json.emptyObject;
@@ -1781,7 +1790,7 @@ unittest  // serverInfo strips 2025-11-25-only fields when negotiating 2025-06-1
 				Icon("https://example.com/i.png")
 		]
 	};
-	auto s = new MCPServer(info);
+	auto s = new McpServer(info);
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = "2025-06-18";
 	params["capabilities"] = Json.emptyObject;
@@ -1800,7 +1809,7 @@ unittest  // serverInfo strips title when negotiating 2025-03-26 (pre-BaseMetada
 	Implementation info = {
 		name: "rich-srv", version_: "2.0", title: nullable("Rich Server")
 	};
-	auto s = new MCPServer(info);
+	auto s = new McpServer(info);
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = "2025-03-26";
 	params["capabilities"] = Json.emptyObject;
@@ -1814,7 +1823,7 @@ unittest  // serverInfo strips title when negotiating 2025-03-26 (pre-BaseMetada
 
 unittest  // legacy (name, version) constructor still emits a minimal serverInfo
 {
-	auto s = new MCPServer("plain-srv", "1.0");
+	auto s = new McpServer("plain-srv", "1.0");
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = "2025-11-25";
 	params["capabilities"] = Json.emptyObject;
@@ -1837,7 +1846,7 @@ unittest  // server/discover (draft) emits the full stored serverInfo
 				Icon("https://example.com/i.png")
 		]
 	};
-	auto s = new MCPServer(info);
+	auto s = new McpServer(info);
 	auto resp = s.handle(req(1, "server/discover")).get;
 	auto si = resp["result"]["serverInfo"];
 	assert(si["name"].get!string == "rich-srv");
@@ -1949,7 +1958,7 @@ unittest  // tools/call invokes the handler and returns its result
 
 unittest  // tools/list emits a tool descriptor's _meta
 {
-	auto s = new MCPServer("meta-srv", "0.1.0");
+	auto s = new McpServer("meta-srv", "0.1.0");
 	Tool t = {name: "tagged"};
 	Json m = Json.emptyObject;
 	m["x.example/group"] = "demo";
@@ -1966,7 +1975,7 @@ unittest  // tools/list emits a tool descriptor's _meta
 
 unittest  // tools/call propagates a handler's result-level _meta to the wire
 {
-	auto s = new MCPServer("meta-srv", "0.1.0");
+	auto s = new McpServer("meta-srv", "0.1.0");
 	Tool t = {name: "withmeta"};
 	s.registerTool(t, (Json args) @safe {
 		Json m = Json.emptyObject;
@@ -1993,7 +2002,7 @@ unittest  // output-schema validation: conforming structuredContent passes
 {
 	import mcp.api.schema : jsonSchemaOf;
 
-	auto s = new MCPServer("vsrv", "0.1.0");
+	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
 	{
 		int result;
@@ -2021,7 +2030,7 @@ unittest  // output-schema validation: non-conforming structuredContent errors
 {
 	import mcp.api.schema : jsonSchemaOf;
 
-	auto s = new MCPServer("vsrv", "0.1.0");
+	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
 	{
 		int result;
@@ -2049,7 +2058,7 @@ unittest  // output-schema validation is off by default: bad output still ships
 {
 	import mcp.api.schema : jsonSchemaOf;
 
-	auto s = new MCPServer("vsrv", "0.1.0");
+	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
 	{
 		int result;
@@ -2076,7 +2085,7 @@ unittest  // input-schema validation: a missing required argument yields an isEr
 {
 	import mcp.api.schema : jsonSchemaOf;
 
-	auto s = new MCPServer("vsrv", "0.1.0");
+	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddArgs
 	{
 		int a;
@@ -2109,7 +2118,7 @@ unittest  // input-schema validation: a wrong-typed argument yields an isError r
 {
 	import mcp.api.schema : jsonSchemaOf;
 
-	auto s = new MCPServer("vsrv", "0.1.0");
+	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddArgs
 	{
 		int a;
@@ -2140,7 +2149,7 @@ unittest  // input-schema validation: conforming arguments dispatch normally
 {
 	import mcp.api.schema : jsonSchemaOf;
 
-	auto s = new MCPServer("vsrv", "0.1.0");
+	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddArgs
 	{
 		int a;
@@ -2169,7 +2178,7 @@ unittest  // input-schema validation is off by default: missing argument still d
 {
 	import mcp.api.schema : jsonSchemaOf;
 
-	auto s = new MCPServer("vsrv", "0.1.0");
+	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddArgs
 	{
 		int a;
@@ -2200,7 +2209,7 @@ unittest  // a genuinely malformed CallToolRequest (non-string name) is still -3
 	// The spec reserves protocol errors for requests that fail the
 	// CallToolRequest schema itself (name/arguments), so a non-string `name`
 	// must remain a JSON-RPC -32602 error even with input-schema validation on.
-	auto s = new MCPServer("vsrv", "0.1.0");
+	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddArgs
 	{
 		int a;
@@ -2224,7 +2233,7 @@ unittest  // a genuinely malformed CallToolRequest (non-string name) is still -3
 
 unittest  // a tool handler that throws becomes an isError result, not a protocol error
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Tool boom = {name: "boom"};
 	CallToolResult delegate(Json) @safe handler = (Json) {
 		throw new Exception("kaboom");
@@ -2250,7 +2259,7 @@ unittest  // notifications/cancelled mid-handler: ctx.isCancelled flips and the 
 	// A handler that, while running, simulates a concurrent cancellation arriving
 	// for its own request, then observes ctx.isCancelled and returns. The server
 	// MUST NOT send a response for the cancelled request.
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	bool sawCancelled;
 	Tool slow = {name: "slow"};
 	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
@@ -2300,7 +2309,7 @@ unittest  // an uncancelled request still receives its normal response
 
 unittest  // cancellation matches string-id requests too
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	bool sawCancelled;
 	Tool slow = {name: "slow"};
 	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
@@ -2322,7 +2331,7 @@ unittest  // cancellation matches string-id requests too
 
 unittest  // notifications/roots/list_changed fires the dedicated server hook
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	bool sawRootsChanged;
 	s.setRootsListChangedHandler(() @safe { sawRootsChanged = true; });
 
@@ -2333,7 +2342,7 @@ unittest  // notifications/roots/list_changed fires the dedicated server hook
 
 unittest  // notifications/roots/list_changed also reaches the generic client-notification observer
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	string seenMethod;
 	s.setClientNotificationHandler((string method, Json params) @safe {
 		seenMethod = method;
@@ -2345,7 +2354,7 @@ unittest  // notifications/roots/list_changed also reaches the generic client-no
 
 unittest  // unrecognised client notifications are surfaced to the generic observer
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	string seenMethod;
 	s.setClientNotificationHandler((string method, Json params) @safe {
 		seenMethod = method;
@@ -2360,7 +2369,7 @@ unittest  // server-consumed notifications do NOT reach the generic client obser
 {
 	// notifications/initialized and notifications/cancelled are handled by the
 	// server itself and must not be forwarded to the application observer.
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	bool observed;
 	s.setClientNotificationHandler((string method, Json params) @safe {
 		observed = true;
@@ -2417,7 +2426,7 @@ unittest  // handleRaw on a batch returns only the responses (notifications drop
 
 unittest  // resources/list and resources/read for a direct resource
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Resource r = {uri: "test://x", name: "x", mimeType: nullable("text/plain")};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
 
@@ -2432,7 +2441,7 @@ unittest  // resources/list and resources/read for a direct resource
 
 unittest  // resources/read for an unknown uri is resourceNotFound
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Json p = Json.emptyObject;
 	p["uri"] = "test://missing";
 	auto resp = s.handle(req(1, "resources/read", p)).get;
@@ -2441,7 +2450,7 @@ unittest  // resources/read for an unknown uri is resourceNotFound
 
 unittest  // resources/read not-found carries structured data.uri (spec example shape)
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Json p = Json.emptyObject;
 	p["uri"] = "test://missing";
 	auto resp = s.handle(req(1, "resources/read", p)).get;
@@ -2450,7 +2459,7 @@ unittest  // resources/read not-found carries structured data.uri (spec example 
 
 unittest  // resource templates resolve and read with captured params
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	ResourceTemplate t = {uriTemplate: "test://tpl/{id}/data", name: "tpl"};
 	s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
 		return ResourceContents.makeText(uri, "application/json", "id=" ~ params["id"]);
@@ -2467,7 +2476,7 @@ unittest  // resource templates resolve and read with captured params
 
 unittest  // prompts/list and prompts/get with arguments
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet", description: nullable("greets")};
 	pr.arguments = [PromptArgument("who", nullable("name"), true)];
 	s.registerPrompt(pr, (Json args) @safe {
@@ -2489,7 +2498,7 @@ unittest  // prompts/list and prompts/get with arguments
 
 unittest  // prompts/get returns -32602 when a required argument is missing
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet", description: nullable("greets")};
 	pr.arguments = [PromptArgument("who", nullable("name"), true)];
 	s.registerPrompt(pr, (Json args) @safe {
@@ -2517,7 +2526,7 @@ unittest  // prompts/get returns -32602 when a required argument is missing
 
 unittest  // prompts/get allows a missing optional argument
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet", description: nullable("greets")};
 	pr.arguments = [PromptArgument("who", nullable("name"), false)];
 	s.registerPrompt(pr, (Json args) @safe {
@@ -2536,7 +2545,7 @@ unittest  // prompts/get allows a missing optional argument
 
 unittest  // completion/complete returns -32601 when no completions capability is declared
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	// No completion handler registered => completions capability not advertised.
 	auto resp = s.handle(req(1, "completion/complete", Json.emptyObject)).get;
 	assert("error" in resp);
@@ -2546,7 +2555,7 @@ unittest  // completion/complete returns -32601 when no completions capability i
 
 unittest  // completion/complete uses the registered handler
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.setCompletionHandler((Json) @safe {
 		CompleteResult r;
 		r.values = ["paris", "park"];
@@ -2558,7 +2567,7 @@ unittest  // completion/complete uses the registered handler
 
 unittest  // typed completion handler receives a parsed CompleteRequest
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	string seenName;
 	string seenArg;
 	bool wasPrompt;
@@ -2585,7 +2594,7 @@ unittest  // typed completion handler receives a parsed CompleteRequest
 
 unittest  // typed completion handler receives the resolved context.arguments
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	string[string] seenContext;
 	s.setCompletionRequestHandler((CompleteRequest r) @safe {
 		seenContext = r.context;
@@ -2613,7 +2622,7 @@ unittest  // typed completion handler receives the resolved context.arguments
 
 unittest  // typed completion handler advertises the completions capability
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.setCompletionRequestHandler((CompleteRequest) @safe {
 		CompleteResult res;
 		return res;
@@ -2624,7 +2633,7 @@ unittest  // typed completion handler advertises the completions capability
 
 unittest  // logging/setLevel stores the level and returns an empty object
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enableLogging();
 	Json p = Json.emptyObject;
 	p["level"] = "debug";
@@ -2635,7 +2644,7 @@ unittest  // logging/setLevel stores the level and returns an empty object
 
 unittest  // logging/setLevel rejects an unrecognised level with -32602
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enableLogging();
 	Json p = Json.emptyObject;
 	p["level"] = "verbose";
@@ -2647,7 +2656,7 @@ unittest  // logging/setLevel rejects an unrecognised level with -32602
 
 unittest  // logging/setLevel requires a string 'level' param
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enableLogging();
 	Json p = Json.emptyObject;
 	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
@@ -2660,7 +2669,7 @@ unittest  // logging/setLevel is rejected when the logging capability was never 
 	// `logging` capability. A server that never called enableLogging() advertises
 	// no logging capability, so logging/setLevel MUST NOT be handled: it returns
 	// -32601 (Capability not supported), matching completion/complete's gating.
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Json p = Json.emptyObject;
 	p["level"] = "debug";
 	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
@@ -2738,7 +2747,7 @@ unittest  // after setLevel(error), a handler's sub-error logs are dropped
 		}
 	}
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enableLogging();
 
 	// A tool that emits a log at every severity.
@@ -2818,9 +2827,9 @@ version (unittest) private final class DraftLogCtx : RequestContext
 	}
 }
 
-version (unittest) private MCPServer makeNoisyLogServer() @safe
+version (unittest) private McpServer makeNoisyLogServer() @safe
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enableLogging();
 	Tool t = {name: "noisy"};
 	s.registerTool(t, (Json args, RequestContext ctx) @safe {
@@ -2893,7 +2902,7 @@ unittest  // a draft request's logLevel does not leak into a later request
 
 unittest  // capabilities reflect registered features
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Resource r = {uri: "u", name: "u"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("u", "text/plain", "x"));
 	s.enableLogging();
@@ -2905,7 +2914,7 @@ unittest  // capabilities reflect registered features
 
 unittest  // advertised extensions appear in initialize capabilities
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Json settings = Json.emptyObject;
 	settings["maxConcurrent"] = 4;
 	s.advertiseExtension("io.modelcontextprotocol/tasks", settings);
@@ -2920,7 +2929,7 @@ unittest  // advertised extensions appear in initialize capabilities
 
 unittest  // enableTasks advertises the `tasks` capability at initialize
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	// Spec 2025-11-25: nested-by-category `requests`, i.e. {"tools": {"call": {}}}.
 	s.enableTasks(true, true, TaskRequests().tool().toJson());
 
@@ -2937,7 +2946,7 @@ unittest  // enableTasks advertises the `tasks` capability at initialize
 
 unittest  // server reads the `tasks` capability a client advertises at initialize
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Json caps = Json.emptyObject;
 	Json t = Json.emptyObject;
 	// Client advertises nested-by-category requests per spec 2025-11-25.
@@ -2955,7 +2964,7 @@ unittest  // server reads the `tasks` capability a client advertises at initiali
 
 unittest  // server reads the extensions a client advertises at initialize
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Json caps = Json.emptyObject;
 	Json ext = Json.emptyObject;
 	ext["io.modelcontextprotocol/ui"] = Json.emptyObject;
@@ -2973,7 +2982,7 @@ unittest  // server reads the extensions a client advertises at initialize
 
 unittest  // resources/subscribe and unsubscribe track URIs and return {}
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enableResourceSubscriptions();
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
@@ -2988,7 +2997,7 @@ unittest  // resources/subscribe and unsubscribe track URIs and return {}
 
 unittest  // subscribe capability is advertised only when enabled
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Resource r = {uri: "u", name: "u"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("u", "text/plain", "x"));
 	assert(!s.capabilities().resources.get.subscribe);
@@ -3062,7 +3071,7 @@ unittest  // per-list hint only emits on the matching list, not on others
 
 unittest  // per-resource registerResource hint emits ttlMs/cacheScope on a draft resources/read
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://r",
 			"text/plain", "x"), nullable(CacheHint(9000, CacheScope.private_)));
@@ -3075,7 +3084,7 @@ unittest  // per-resource registerResource hint emits ttlMs/cacheScope on a draf
 
 unittest  // per-resource hint is NOT emitted on a non-draft (2025-11-25) resources/read
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://r",
 			"text/plain", "x"), nullable(CacheHint(9000, CacheScope.private_)));
@@ -3087,7 +3096,7 @@ unittest  // per-resource hint is NOT emitted on a non-draft (2025-11-25) resour
 
 unittest  // per-template registerResourceTemplate hint emits on a matching draft resources/read
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	ResourceTemplate t = {uriTemplate: "test://{id}", name: "tmpl"};
 	s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
 		return ResourceContents.makeText(uri, "text/plain", "y");
@@ -3118,7 +3127,7 @@ unittest  // pre-draft results never emit resultType (wire output unchanged)
 
 unittest  // draft InputRequiredResult is stamped resultType:"input_required", not "complete"
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerBookTool(s);
 	auto resp = s.handle(draftCall(1, "book", [])).get;
 	assert("error" !in resp);
@@ -3127,7 +3136,7 @@ unittest  // draft InputRequiredResult is stamped resultType:"input_required", n
 
 unittest  // draft resources/read unknown uri uses invalidParams (-32602)
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Json p = Json.emptyObject;
 	p["uri"] = "test://missing";
 	auto resp = s.handle(draftReq(3, "resources/read", p)).get;
@@ -3356,7 +3365,7 @@ version (unittest)
 
 	// Register a tool that books a flight, asking for the date either via MRTR
 	// (stateless) or a blocking elicit() (2025-era).
-	private void registerBookTool(MCPServer s) @safe
+	private void registerBookTool(McpServer s) @safe
 	{
 		Tool book = {name: "book"};
 		s.registerTool(book, (Json args, RequestContext ctx) @safe {
@@ -3414,7 +3423,7 @@ version (unittest)
 
 unittest  // draft (stateless) first round: handler returns an InputRequiredResult
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerBookTool(s);
 	auto resp = s.handle(draftCall(1, "book", [])).get;
 	assert("error" !in resp);
@@ -3426,7 +3435,7 @@ unittest  // draft (stateless) first round: handler returns an InputRequiredResu
 
 unittest  // draft (stateless) retry with input responses: handler completes
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerBookTool(s);
 	auto answer = InputResponse("date", Json([
 			"content": Json(["day": Json("monday")])
@@ -3438,7 +3447,7 @@ unittest  // draft (stateless) retry with input responses: handler completes
 
 unittest  // SEP-2322: a stateless server emits requestState and reads it back on retry
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	// A tool that stashes its progress entirely in the opaque requestState: on
 	// the first round it asks for a date and attaches state "awaiting-date";
 	// on retry it reads ctx.requestState() to know how to finish.
@@ -3486,7 +3495,7 @@ unittest  // SEP-2322: a stateless server emits requestState and reads it back o
 
 unittest  // elicit() is rejected on a stateless (draft) request
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Tool bad = {name: "bad"};
 	s.registerTool(bad, (Json args, RequestContext ctx) @safe {
 		ctx.elicit("x", Json.emptyObject); // illegal under MRTR
@@ -3501,7 +3510,7 @@ unittest  // elicit() is rejected on a stateless (draft) request
 
 unittest  // 2025-era request: ctx.elicit() blocks and the handler completes
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerBookTool(s);
 	Json p = Json.emptyObject;
 	auto resp = s.handle(req(4, "tools/call", buildName(p, "book")), new FakeCtx).get;
@@ -3521,14 +3530,14 @@ version (unittest)
 
 unittest  // notify is a no-op (returns 0) before a push channel exists
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	assert(s.serverPushChannel() is null);
 	assert(s.notify("notifications/message") == 0);
 }
 
 unittest  // notify delivers unsolicited notifications to GET-stream listeners
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
 	assert(s.serverPushChannel() is ch); // same instance returned thereafter
@@ -3547,7 +3556,7 @@ unittest  // notify delivers unsolicited notifications to GET-stream listeners
 
 unittest  // notifyResourceUpdated emits resources/updated for a subscribed uri
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
@@ -3569,7 +3578,7 @@ unittest  // notifyResourceUpdated emits resources/updated for a subscribed uri
 
 unittest  // notifyResourceUpdated is a no-op for a uri nobody subscribed to
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
@@ -3585,7 +3594,7 @@ unittest  // notifyResourceUpdated emits params that are exactly { uri } (no non
 {
 	import std.algorithm : canFind;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
@@ -3607,7 +3616,7 @@ unittest  // notifyResourceUpdated emits params that are exactly { uri } (no non
 
 unittest  // notifyResourceUpdated has no title overload (title is not a spec param)
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	// The single-argument (uri only) form must exist.
 	static assert(__traits(compiles, s.notifyResourceUpdated("test://w")));
 	// A `title` argument is NOT part of any spec version, so the two-argument
@@ -3617,7 +3626,7 @@ unittest  // notifyResourceUpdated has no title overload (title is not a spec pa
 
 unittest  // notifyResourceUpdated is a no-op before a push channel exists
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enableResourceSubscriptions();
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
@@ -3627,7 +3636,7 @@ unittest  // notifyResourceUpdated is a no-op before a push channel exists
 
 unittest  // notifyElicitationComplete emits notifications/elicitation/complete with the id
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
 	string[] received;
@@ -3645,7 +3654,7 @@ unittest  // notifyElicitationComplete emits notifications/elicitation/complete 
 
 unittest  // notifyElicitationComplete is a no-op before a push channel exists
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	assert(s.notifyElicitationComplete("elic-1") == 0);
 }
 
@@ -3653,13 +3662,13 @@ unittest  // notifyElicitationComplete rejects an empty elicitationId
 {
 	import std.exception : assertThrown;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	assertThrown!McpException(s.notifyElicitationComplete(""));
 }
 
 unittest  // tools listChanged is not advertised by default
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Tool add = {name: "add"};
 	s.registerTool(add, (Json) @safe { return CallToolResult(); });
 	auto caps = s.capabilities();
@@ -3669,7 +3678,7 @@ unittest  // tools listChanged is not advertised by default
 
 unittest  // enableToolListChanged advertises listChanged:true for tools
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Tool add = {name: "add"};
 	s.registerTool(add, (Json) @safe { return CallToolResult(); });
 	s.enableToolListChanged();
@@ -3685,7 +3694,7 @@ unittest  // enableToolListChanged advertises tools capability with zero tools r
 	// before any tool is registered. Per 2025-11-25 tools §Capabilities, it MUST
 	// still advertise the tools capability so clients call tools/list and expect
 	// notifications/tools/list_changed.
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enableToolListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.tools.isNull);
@@ -3695,7 +3704,7 @@ unittest  // enableToolListChanged advertises tools capability with zero tools r
 
 unittest  // removeTool unregisters a previously registered tool
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Tool add = {name: "add"};
 	s.registerTool(add, (Json) @safe { return CallToolResult(); });
 	assert(s.removeTool("add"));
@@ -3706,7 +3715,7 @@ unittest  // removeTool unregisters a previously registered tool
 
 unittest  // notifyToolsListChanged broadcasts notifications/tools/list_changed
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
 	string[] received;
@@ -3721,13 +3730,13 @@ unittest  // notifyToolsListChanged broadcasts notifications/tools/list_changed
 
 unittest  // notifyToolsListChanged is a no-op before a push channel exists
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	assert(s.notifyToolsListChanged() == 0);
 }
 
 unittest  // resources listChanged is not advertised by default
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Resource r = {uri: "test://r", name: "r"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://r", "text/plain", "x"));
 	auto caps = s.capabilities();
@@ -3737,7 +3746,7 @@ unittest  // resources listChanged is not advertised by default
 
 unittest  // enableResourcesListChanged advertises listChanged:true for resources
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Resource r = {uri: "test://r", name: "r"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://r", "text/plain", "x"));
 	s.enableResourcesListChanged();
@@ -3753,7 +3762,7 @@ unittest  // enableResourcesListChanged advertises resources capability with zer
 	// before any resource is registered. Per 2025-11-25 resources §Capabilities, it
 	// MUST still advertise the resources capability so clients call resources/list and
 	// expect notifications/resources/list_changed.
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enableResourcesListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.resources.isNull);
@@ -3766,7 +3775,7 @@ unittest  // enableResourceSubscriptions advertises resources capability with ze
 	// A server that supports resource update subscriptions declares
 	// enableResourceSubscriptions() so clients learn they may resources/subscribe,
 	// even before any resource is registered (per 2025-11-25 resources §Capabilities).
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enableResourceSubscriptions();
 	auto caps = s.capabilities();
 	assert(!caps.resources.isNull);
@@ -3776,7 +3785,7 @@ unittest  // enableResourceSubscriptions advertises resources capability with ze
 
 unittest  // notifyResourcesListChanged broadcasts notifications/resources/list_changed
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
 	string[] received;
@@ -3791,13 +3800,13 @@ unittest  // notifyResourcesListChanged broadcasts notifications/resources/list_
 
 unittest  // notifyResourcesListChanged is a no-op before a push channel exists
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	assert(s.notifyResourcesListChanged() == 0);
 }
 
 unittest  // prompts listChanged is not advertised by default
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet"};
 	s.registerPrompt(pr, (Json) @safe { return GetPromptResult(); });
 	auto caps = s.capabilities();
@@ -3811,7 +3820,7 @@ unittest  // enablePromptListChanged advertises prompts capability with zero pro
 	// before any prompt is registered. Per 2025-11-25 prompts §Capabilities, it
 	// MUST still advertise the prompts capability so clients call prompts/list and
 	// expect notifications/prompts/list_changed.
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.enablePromptListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.prompts.isNull);
@@ -3821,7 +3830,7 @@ unittest  // enablePromptListChanged advertises prompts capability with zero pro
 
 unittest  // enablePromptListChanged advertises listChanged:true for prompts
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet"};
 	s.registerPrompt(pr, (Json) @safe { return GetPromptResult(); });
 	s.enablePromptListChanged();
@@ -3833,7 +3842,7 @@ unittest  // enablePromptListChanged advertises listChanged:true for prompts
 
 unittest  // notifyPromptsListChanged broadcasts notifications/prompts/list_changed
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
 	string[] received;
@@ -3848,7 +3857,7 @@ unittest  // notifyPromptsListChanged broadcasts notifications/prompts/list_chan
 
 unittest  // notifyPromptsListChanged is a no-op before a push channel exists
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	assert(s.notifyPromptsListChanged() == 0);
 }
 
@@ -3902,7 +3911,7 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 
 unittest  // draft: notifyPromptsListChanged suppressed unless client opted in
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	s.effectiveVersion = ProtocolVersion.draft;
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
@@ -3934,7 +3943,7 @@ unittest  // setPageSize paginates tools/list across cursor-following pages
 {
 	import std.conv : to;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	foreach (i; 0 .. 5)
 	{
 		Tool tool = {name: "tool" ~ i.to!string};
@@ -3972,7 +3981,7 @@ unittest  // without setPageSize, tools/list returns everything in one page (no 
 {
 	import std.conv : to;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	foreach (i; 0 .. 5)
 	{
 		Tool tool = {name: "tool" ~ i.to!string};
@@ -3991,7 +4000,7 @@ unittest  // setPageSize paginates resources/list
 {
 	import std.conv : to;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	foreach (i; 0 .. 3)
 	{
 		Resource r = {uri: "test://r" ~ i.to!string, name: "r"};
@@ -4014,7 +4023,7 @@ unittest  // setPageSize paginates prompts/list
 {
 	import std.conv : to;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	foreach (i; 0 .. 3)
 	{
 		Prompt pr = {name: "p" ~ i.to!string};
@@ -4037,7 +4046,7 @@ unittest  // setPageSize paginates resources/templates/list
 {
 	import std.conv : to;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	foreach (i; 0 .. 3)
 	{
 		ResourceTemplate t = {
@@ -4062,7 +4071,7 @@ unittest  // setPageSize paginates resources/templates/list
 
 unittest  // an invalid pagination cursor yields invalidParams (-32602)
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Tool tool = {name: "only"};
 	s.registerTool(tool, (Json) @safe {
 		CallToolResult r;
@@ -4081,7 +4090,7 @@ unittest  // a stale cursor pointing past the end of the list yields invalidPara
 	import std.string : representation;
 	import mcp.auth.oauth : base64UrlNoPad;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	Tool tool = {name: "only"};
 	s.registerTool(tool, (Json) @safe {
 		CallToolResult r;
@@ -4105,7 +4114,7 @@ unittest  // a full roundtrip through cursor-following pagination yields every t
 	import std.array : array;
 	import std.conv : to;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	foreach (i; 0 .. 7)
 	{
 		Tool tool = {name: "tool" ~ i.to!string};

@@ -6,12 +6,12 @@ import mcp.protocol.jsonrpc : Message;
 
 public import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 
-/// The transport seam under `MCPClient`. The client speaks pure JSON-RPC and
+/// The transport seam under `McpClient`. The client speaks pure JSON-RPC and
 /// protocol logic; a `ClientTransport` carries the bytes — over Streamable HTTP
 /// (`HttpClientTransport`) or stdio (`StdioClientTransport`).
 ///
 /// The client installs its inbound dispatcher via `setInboundHandler` (it passes
-/// `MCPClient.dispatchInbound`); the transport invokes that handler for every
+/// `McpClient.dispatchInbound`); the transport invokes that handler for every
 /// interleaved notification and server->client request it reads on any stream.
 /// A response to a server->client request, and any client-originated
 /// notification, are sent with `sendOneway`. Per-request work goes through
@@ -39,7 +39,7 @@ interface ClientTransport
 	/// handle whose `cancel()`/`close()` stops the stream.
 	SubscriptionStream openListen(Json listenMessage) @safe;
 
-	/// Install the client's inbound dispatcher (`MCPClient.dispatchInbound`),
+	/// Install the client's inbound dispatcher (`McpClient.dispatchInbound`),
 	/// invoked for notifications and server->client requests on any stream.
 	void setInboundHandler(void delegate(Message) @safe handler) @safe;
 

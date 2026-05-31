@@ -25,7 +25,7 @@ import vibe.data.json : Json, parseJsonString;
 import mcp.protocol.errors;
 import mcp.auth.oauth;
 import mcp.auth.client;
-import mcp.client.client : MCPClient;
+import mcp.client.client : McpClient;
 
 @safe:
 
@@ -550,7 +550,7 @@ void openSystemBrowser(string url) @safe
 ///
 /// Returns the live `OAuthSession` so callers can refresh on later requests via
 /// `session.bearerForRequest(now)`.
-OAuthSession useOAuth(MCPClient client, string mcpEndpoint, OAuthLogin opts) @safe
+OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @safe
 {
 	import std.datetime.systime : Clock;
 

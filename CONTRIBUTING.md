@@ -115,7 +115,7 @@ These conventions are enforced by review (and some by CI). Please follow them:
   `2025-06-18`, …). Don't regress the conformance baseline (**server 38/38**,
   **client 287/287**).
 - **Keep new public API reachable.** Anything new and public should be exported
-  via `source/mcp/package.d` and usable from `MCPServer` / `MCPClient` /
+  via `source/mcp/package.d` and usable from `McpServer` / `McpClient` /
   `RequestContext` (or the UDA layer), with a runnable path for callers.
 - **Use `std.getopt`** for any command-line argument parsing.
 

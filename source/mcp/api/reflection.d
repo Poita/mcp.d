@@ -17,7 +17,7 @@ import mcp.api.schema;
 /// Register every `@tool` / `@prompt` / `@resource` / `@resourceTemplate`
 /// annotated method of `obj` on `server`, deriving JSON schemas and argument
 /// marshalling from the method signatures (FastMCP-style ergonomics).
-void registerHandlers(T)(MCPServer server, T obj) @safe
+void registerHandlers(T)(McpServer server, T obj) @safe
 {
 	static foreach (memberName; __traits(allMembers, T))
 	{
@@ -49,7 +49,7 @@ void registerHandlers(T)(MCPServer server, T obj) @safe
 /// Free functions cannot receive a `RequestContext` via `this`, so a context
 /// must be taken as an explicit parameter (exactly as opt-in methods do).
 /// Non-function members and functions without a recognized UDA are skipped.
-void registerModule(alias mod)(MCPServer server) @safe
+void registerModule(alias mod)(McpServer server) @safe
 {
 	static foreach (memberName; __traits(allMembers, mod))
 	{
@@ -75,7 +75,7 @@ void registerModule(alias mod)(MCPServer server) @safe
 
 /// Convenience variadic form of `registerModule`: register the annotated free
 /// functions of several modules in one call.
-void registerModules(mods...)(MCPServer server) @safe
+void registerModules(mods...)(McpServer server) @safe
 {
 	static foreach (mod; mods)
 		registerModule!mod(server);
@@ -219,7 +219,7 @@ private CallToolResult toToolResult(R)(R ret) @safe
 }
 
 private void registerToolMethod(string memberName, alias overload, alias parent)(
-		MCPServer server, tool attr) @safe
+		McpServer server, tool attr) @safe
 {
 	import std.traits : ReturnType;
 
@@ -298,7 +298,7 @@ private GetPromptResult toPromptResult(R)(R ret) @safe
 }
 
 private void registerPromptMethod(string memberName, alias overload, alias parent)(
-		MCPServer server, prompt attr) @safe
+		McpServer server, prompt attr) @safe
 {
 	Prompt descriptor;
 	descriptor.name = attr.name;
@@ -338,7 +338,7 @@ private ResourceContents toResourceContents(R)(R ret, string uri, string mimeTyp
 }
 
 private void registerResourceMethod(string memberName, alias overload, alias parent)(
-		MCPServer server, resource attr) @safe
+		McpServer server, resource attr) @safe
 {
 	Resource descriptor;
 	descriptor.uri = attr.uri;
@@ -364,7 +364,7 @@ private void registerResourceMethod(string memberName, alias overload, alias par
 }
 
 private void registerTemplateMethod(string memberName, alias overload, alias parent)(
-		MCPServer server, resourceTemplate attr) @safe
+		McpServer server, resourceTemplate attr) @safe
 {
 	ResourceTemplate descriptor;
 	descriptor.uriTemplate = attr.uriTemplate;
@@ -494,7 +494,7 @@ unittest  // @tool reflection: schema derivation + typed dispatch
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
 
 	Json lp = Json.emptyObject;
@@ -513,7 +513,7 @@ unittest  // @tool reflection: outputSchema is inferred from the return type
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -547,7 +547,7 @@ unittest  // @tool reflection: struct return produces matching structuredContent
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
 	Json p = Json.emptyObject;
 	p["name"] = "stats";
@@ -564,7 +564,7 @@ unittest  // @tool reflection: string return becomes text content
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
 	Json p = Json.emptyObject;
 	p["name"] = "greet";
@@ -575,7 +575,7 @@ unittest  // @tool reflection: string return becomes text content
 
 unittest  // @tool reflection: enum param schema + optional Nullable param
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
 	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
 	// find classify
@@ -599,7 +599,7 @@ unittest  // @resource and @prompt reflection register and dispatch
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
 
 	Json rp = Json.emptyObject;
@@ -618,7 +618,7 @@ unittest  // @prompt reflection: optional title is emitted in prompts/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
 
 	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
@@ -647,7 +647,7 @@ unittest  // @resourceAnnotations reflection: annotations appear in resources/li
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
 
 	auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
@@ -677,7 +677,7 @@ unittest  // @tool reflection: optional title is emitted in tools/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -694,7 +694,7 @@ unittest  // @toolAnnotations reflection: hints are serialized into annotations
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -724,7 +724,7 @@ unittest  // @toolExecution reflection: execution.taskSupport appears in tools/l
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -750,7 +750,7 @@ unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schem
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.draft : paramHeaderMap;
 
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
