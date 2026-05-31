@@ -25,12 +25,15 @@ struct SamplingMessage
 {
 	string role; /// "user" or "assistant"
 	Content content;
+	Json meta = Json.undefined; /// optional message-level `_meta` object (schema.ts: SamplingMessage._meta)
 
 	Json toJson() const @safe
 	{
 		Json j = Json.emptyObject;
 		j["role"] = role;
 		j["content"] = content.toJson();
+		if (meta.type == Json.Type.object)
+			j["_meta"] = meta;
 		return j;
 	}
 
@@ -40,6 +43,8 @@ struct SamplingMessage
 		m.role = ("role" in j) ? j["role"].get!string : "";
 		if ("content" in j)
 			m.content = Content.fromJson(j["content"]);
+		if ("_meta" in j && j["_meta"].type == Json.Type.object)
+			m.meta = j["_meta"];
 		return m;
 	}
 }
@@ -420,6 +425,7 @@ struct CreateMessageResult
 	Content[] contentBlocks;
 	string model; /// the model identifier the client actually used
 	string stopReason; /// raw stop-reason wire string (may be empty)
+	Json meta = Json.undefined; /// optional message-level `_meta` object (CreateMessageResult extends SamplingMessage)
 
 	/// The first (or only) content block, for the common single-block reply.
 	/// Returns an empty text block when there are no blocks. For tool-use
@@ -454,6 +460,8 @@ struct CreateMessageResult
 		j["model"] = model;
 		if (stopReason.length)
 			j["stopReason"] = stopReason;
+		if (meta.type == Json.Type.object)
+			j["_meta"] = meta;
 		return j;
 	}
 
@@ -475,6 +483,8 @@ struct CreateMessageResult
 		r.model = ("model" in j) ? j["model"].get!string : "";
 		if ("stopReason" in j && j["stopReason"].type == Json.Type.string)
 			r.stopReason = j["stopReason"].get!string;
+		if ("_meta" in j && j["_meta"].type == Json.Type.object)
+			r.meta = j["_meta"];
 		return r;
 	}
 
@@ -497,6 +507,25 @@ unittest  // SamplingMessage round-trips role and content
 	auto back = SamplingMessage.fromJson(j);
 	assert(back.role == "user");
 	assert(back.content.text == "hello");
+}
+
+unittest  // SamplingMessage emits and parses _meta (spec: SamplingMessage._meta)
+{
+	// schema.ts: `interface SamplingMessage { role; content; _meta?: MetaObject; }`
+	auto m = SamplingMessage("user", Content.makeText("hi"));
+	Json meta = Json.emptyObject;
+	meta["x.example/k"] = "v";
+	m.meta = meta;
+	auto j = m.toJson();
+	assert(j["_meta"]["x.example/k"].get!string == "v");
+	auto back = SamplingMessage.fromJson(j);
+	assert(back.meta["x.example/k"].get!string == "v");
+}
+
+unittest  // SamplingMessage omits _meta when none is set (no wire change)
+{
+	auto m = SamplingMessage("user", Content.makeText("hi"));
+	assert("_meta" !in m.toJson());
 }
 
 unittest  // ModelPreferences emits hints and priorities; empty omits all
@@ -670,6 +699,25 @@ unittest  // CreateMessageResult round-trips through toJson
 	auto back = CreateMessageResult.fromJson(r.toJson());
 	assert(back.role == "assistant" && back.content.text == "hi");
 	assert(back.model == "m" && back.stopReasonEnum.get == StopReason.maxTokens);
+}
+
+unittest  // CreateMessageResult emits and parses _meta (extends SamplingMessage._meta)
+{
+	// CreateMessageResult extends SamplingMessage, so it may carry `_meta`.
+	auto r = CreateMessageResult("assistant", [Content.makeText("hi")], "m", "endTurn");
+	Json meta = Json.emptyObject;
+	meta["x.example/k"] = "v";
+	r.meta = meta;
+	auto j = r.toJson();
+	assert(j["_meta"]["x.example/k"].get!string == "v");
+	auto back = CreateMessageResult.fromJson(j);
+	assert(back.meta["x.example/k"].get!string == "v");
+}
+
+unittest  // CreateMessageResult omits _meta when none is set (no wire change)
+{
+	auto r = CreateMessageResult("assistant", [Content.makeText("hi")], "m", "endTurn");
+	assert("_meta" !in r.toJson());
 }
 
 unittest  // single-content reply keeps the single-object wire shape (no regress)
