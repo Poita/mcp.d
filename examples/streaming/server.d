@@ -2,7 +2,10 @@
  * examples/streaming — server.d
  *
  * Demonstrates the SERVER side of "Progress / logging / cancellation" over the
- * Streamable HTTP transport (issue #357).
+ * Streamable HTTP transport (issue #357), written in the ergonomic UDA style:
+ * the tools are annotated typed methods on a class, registered in one call with
+ * `registerHandlers`. Typed args are marshalled and the structured result is
+ * inferred from the struct return — no hand-built `Json` schemas or args.
  *
  * Two tools:
  *
@@ -36,6 +39,8 @@ import vibe.core.core : sleep;
 import vibe.data.json : Json;
 
 import mcp;
+import mcp.api.attributes : tool, describe;
+import mcp.api.reflection : registerHandlers;
 import mcp.transport : StreamableHttpOptions, runStreamableHttp;
 
 enum ushort defaultPort = 9357;
@@ -53,11 +58,9 @@ void main(string[] args)
 	// the released (2025-*) protocols.
 	server.enableLogging();
 
-	// A server-side counter of how many countdown runs observed a cancellation.
-	// Captured by both handlers so `cancel_stats` can report what `countdown` saw.
-	auto state = new CancelState;
-	registerCountdown(server, state);
-	registerCancelStats(server, state);
+	// Register every @tool method on the API object. The shared cancellation
+	// tally lives on the instance, so `cancel_stats` reports what `countdown` saw.
+	registerHandlers(server, new StreamingApi);
 
 	StreamableHttpOptions opts;
 	opts.bindAddresses = [host];
@@ -67,60 +70,42 @@ void main(string[] args)
 	runStreamableHttp(server, port, opts);
 }
 
-/// Shared, mutable cancellation tally for the running server instance.
-final class CancelState
+/// The `countdown` structured result: `{completed, total, cancelled}`. Returned
+/// from the `@tool` method, so the SDK infers the output JSON Schema (integers
+/// for `completed`/`total`, boolean for `cancelled`) and emits it as
+/// `structuredContent`.
+struct CountdownResult
 {
-	private int cancelled_;
-	void recordCancelled() @safe nothrow @nogc
-	{
-		cancelled_++;
-	}
-
-	int cancelled() const @safe nothrow @nogc
-	{
-		return cancelled_;
-	}
+	int completed;
+	int total;
+	bool cancelled;
 }
 
-/// Register `countdown`: a deliberately slow, observable task.
-///
-/// Arguments (object): `steps` (int, default 5) and `delayMs` (int, default 40).
-/// For each step `i` in `1..=steps` it sleeps `delayMs`, checks `ctx.isCancelled`
-/// (returning early with `cancelled:true` and bumping the server counter), then
-/// reports progress `i/steps` and logs an info line. The final structured result
-/// is `{ completed:<int>, total:<int>, cancelled:<bool> }`.
-void registerCountdown(McpServer server, CancelState state) @safe
+/// The `cancel_stats` structured result: `{cancelled}`.
+struct CancelStats
 {
-	Json schema = Json.emptyObject;
-	schema["type"] = "object";
-	Json props = Json.emptyObject;
-	props["steps"] = Json(["type": Json("integer"), "minimum": Json(1)]);
-	props["delayMs"] = Json(["type": Json("integer"), "minimum": Json(0)]);
-	schema["properties"] = props;
+	int cancelled;
+}
 
-	Json outSchema = Json.emptyObject;
-	outSchema["type"] = "object";
-	Json outProps = Json.emptyObject;
-	outProps["completed"] = Json(["type": Json("integer")]);
-	outProps["total"] = Json(["type": Json("integer")]);
-	outProps["cancelled"] = Json(["type": Json("boolean")]);
-	outSchema["properties"] = outProps;
-	outSchema["required"] = Json([Json("completed"), Json("total"), Json("cancelled")]);
+/// The annotated MCP tool surface for this example. The mutable cancellation
+/// tally lives on the instance so `countdown` can record what it saw and
+/// `cancel_stats` can report it.
+final class StreamingApi
+{
+	private int cancelled_;
 
-	Tool countdown = {
-		name: "countdown",
-		description: nullable(
-			"Run a multi-step task, reporting progress + logging each step and honoring cancellation."),
-		inputSchema: schema,
-		outputSchema: outSchema
-	};
-
-	server.registerDynamicTool(countdown, (Json args, RequestContext ctx) @safe {
-		const steps = ("steps" in args && args["steps"].type == Json.Type.int_)
-			? cast(int) args["steps"].get!long : 5;
-		const delayMs = ("delayMs" in args && args["delayMs"].type == Json.Type.int_)
-			? cast(int) args["delayMs"].get!long : 40;
-
+	/// `countdown`: a deliberately slow, observable task.
+	///
+	/// For each step `i` in `1..=steps` it sleeps `delayMs`, checks
+	/// `ctx.isCancelled` (returning early with `cancelled:true` and bumping the
+	/// server counter), then reports progress `i/steps` and logs an info line.
+	@tool("countdown",
+			"Run a multi-step task, reporting progress + logging each step and honoring cancellation.")
+	CountdownResult countdown(
+			@describe("number of steps to run") int steps,
+			@describe("delay between steps, in milliseconds") int delayMs,
+			RequestContext ctx) @safe
+	{
 		bool cancelled = false;
 		int completed = 0;
 		foreach (i; 1 .. steps + 1)
@@ -159,44 +144,16 @@ void registerCountdown(McpServer server, CancelState state) @safe
 			completed = i;
 		}
 		if (cancelled)
-			state.recordCancelled();
+			cancelled_++;
 
-		Json structured = Json.emptyObject;
-		structured["completed"] = completed;
-		structured["total"] = steps;
-		structured["cancelled"] = cancelled;
+		return CountdownResult(completed, steps, cancelled);
+	}
 
-		CallToolResult r;
-		r.content = [Content.makeText(cancelled
-				? ("cancelled after " ~ completed.to!string ~ "/" ~ steps.to!string ~ " steps")
-				: ("completed all " ~ steps.to!string ~ " steps"))];
-		r.structuredContent = structured;
-		return r;
-	});
+	/// `cancel_stats`: returns `{cancelled:<int>}`, how many countdown runs have
+	/// observed a cancellation since the server started.
+	@tool("cancel_stats", "Number of countdown runs that observed a cancellation.")
+	CancelStats cancelStats() @safe
+	{
+		return CancelStats(cancelled_);
+	}
 }
-
-/// Register `cancel_stats`: returns `{cancelled:<int>}`, how many countdown runs
-/// have observed a cancellation since the server started.
-void registerCancelStats(McpServer server, CancelState state) @safe
-{
-	Json outSchema = Json.emptyObject;
-	outSchema["type"] = "object";
-	outSchema["properties"] = Json(["cancelled": Json(["type": Json("integer")])]);
-	outSchema["required"] = Json([Json("cancelled")]);
-
-	Tool stats = {
-		name: "cancel_stats",
-		description: nullable("Number of countdown runs that observed a cancellation."),
-		outputSchema: outSchema
-	};
-
-	server.registerDynamicTool(stats, (Json args, RequestContext ctx) @safe {
-		Json structured = Json.emptyObject;
-		structured["cancelled"] = state.cancelled();
-		CallToolResult r;
-		r.content = [Content.makeText("cancelled=" ~ state.cancelled().to!string)];
-		r.structuredContent = structured;
-		return r;
-	});
-}
-
