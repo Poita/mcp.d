@@ -321,6 +321,31 @@ struct ServerCapabilities
 		return j;
 	}
 
+	/// Return a copy of these capabilities with any field newer than the
+	/// negotiated protocol version stripped, so the wire output only advertises
+	/// capabilities that existed in (and were negotiated for) the peer's
+	/// version. Mirrors `Implementation.forVersion`. The basic/lifecycle rule
+	/// "Only use capabilities that were successfully negotiated" requires this:
+	/// `completions` was introduced by 2025-03-26, `tasks` by 2025-11-25, and
+	/// the `extensions` negotiation map is draft-only. `tools`/`resources`/
+	/// `prompts`/`logging`/`experimental` exist in every supported version.
+	ServerCapabilities forVersion(ProtocolVersion v) const @safe
+	{
+		ServerCapabilities projected;
+		projected.tools = tools;
+		projected.resources = resources;
+		projected.prompts = prompts;
+		projected.logging = logging;
+		projected.experimental = experimental;
+		if (v >= ProtocolVersion.v2025_03_26)
+			projected.completions = completions;
+		if (v >= ProtocolVersion.v2025_11_25)
+			projected.tasks = tasks;
+		if (v >= ProtocolVersion.draft)
+			projected.extensions = extensions;
+		return projected;
+	}
+
 	static ServerCapabilities fromJson(Json j) @safe
 	{
 		ServerCapabilities c;
@@ -527,6 +552,80 @@ unittest  // forVersion keeps every field for 2025-11-25 and draft
 		assert(j["websiteUrl"].get!string == "https://example.com");
 		assert(j["icons"].length == 1);
 	}
+}
+
+unittest  // ServerCapabilities.forVersion strips completions before 2025-03-26
+{
+	ServerCapabilities caps;
+	caps.completions = true;
+	auto j = caps.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("completions" !in j);
+}
+
+unittest  // ServerCapabilities.forVersion keeps completions from 2025-03-26
+{
+	ServerCapabilities caps;
+	caps.completions = true;
+	foreach (v; [
+		ProtocolVersion.v2025_03_26, ProtocolVersion.v2025_06_18,
+		ProtocolVersion.v2025_11_25, ProtocolVersion.draft
+	])
+		assert("completions" in caps.forVersion(v).toJson());
+}
+
+unittest  // ServerCapabilities.forVersion strips tasks before 2025-11-25
+{
+	ServerCapabilities caps;
+	caps.tasks = TasksCapability(true, true);
+	foreach (v; [
+		ProtocolVersion.v2024_11_05, ProtocolVersion.v2025_03_26,
+		ProtocolVersion.v2025_06_18
+	])
+		assert("tasks" !in caps.forVersion(v).toJson());
+}
+
+unittest  // ServerCapabilities.forVersion keeps tasks from 2025-11-25
+{
+	ServerCapabilities caps;
+	caps.tasks = TasksCapability(true, true);
+	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.draft])
+		assert("tasks" in caps.forVersion(v).toJson());
+}
+
+unittest  // ServerCapabilities.forVersion strips extensions for non-draft
+{
+	ServerCapabilities caps;
+	Json ext = Json.emptyObject;
+	ext["io.modelcontextprotocol/tasks"] = Json.emptyObject;
+	caps.extensions = ext;
+	foreach (v; [
+		ProtocolVersion.v2024_11_05, ProtocolVersion.v2025_03_26,
+		ProtocolVersion.v2025_06_18, ProtocolVersion.v2025_11_25
+	])
+		assert("extensions" !in caps.forVersion(v).toJson());
+}
+
+unittest  // ServerCapabilities.forVersion keeps extensions for draft
+{
+	ServerCapabilities caps;
+	Json ext = Json.emptyObject;
+	ext["io.modelcontextprotocol/tasks"] = Json.emptyObject;
+	caps.extensions = ext;
+	assert("extensions" in caps.forVersion(ProtocolVersion.draft).toJson());
+}
+
+unittest  // ServerCapabilities.forVersion always keeps base capabilities
+{
+	ServerCapabilities caps;
+	caps.tools = ListChangedCapability(true);
+	caps.resources = ResourcesCapability(true, true);
+	caps.prompts = ListChangedCapability(false);
+	caps.logging = true;
+	auto j = caps.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("tools" in j);
+	assert("resources" in j);
+	assert("prompts" in j);
+	assert("logging" in j);
 }
 
 unittest  // ServerCapabilities emits only set capabilities, presence-aware
