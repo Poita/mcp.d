@@ -1360,8 +1360,18 @@ final class McpServer
 		case "resources/read":
 			return doReadResource(params, ver);
 		case "resources/subscribe":
+			// The draft removed the resources/subscribe RPC in favour of
+			// subscriptions/listen (the SubscriptionFilter "Replaces the former
+			// resources/subscribe RPC"). On the draft the method does not exist,
+			// so it MUST return -32601 rather than an empty-success result,
+			// mirroring the logging/setLevel draft removal. Stable (<= 2025-11-25)
+			// versions still honour the RPC, so 2025-era wire output is unchanged.
+			if (ver.isDraft)
+				throw methodNotFound(method);
 			return doSubscribe(params);
 		case "resources/unsubscribe":
+			if (ver.isDraft)
+				throw methodNotFound(method);
 			return doUnsubscribe(params);
 		case "prompts/list":
 			return doListPrompts(params, ver);
@@ -3676,6 +3686,22 @@ unittest  // resources/subscribe is rejected with -32601 when capability not adv
 	assert(!s.isSubscribed("test://w"));
 }
 
+unittest  // draft: resources/subscribe is method-not-found (removed for subscriptions/listen)
+{
+	// The draft removed the resources/subscribe RPC in favour of
+	// subscriptions/listen with a resourceSubscriptions string[] (the draft
+	// SubscriptionFilter "Replaces the former resources/subscribe RPC"). On the
+	// draft the method does not exist, so it MUST be answered with -32601 even
+	// when subscriptions are enabled, and MUST NOT record the URI.
+	auto s = new McpServer("t", "1");
+	s.enableResourceSubscriptions();
+	Json p = Json.emptyObject;
+	p["uri"] = "test://w";
+	auto resp = s.handle(draftReq(1, "resources/subscribe", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+	assert(!s.isSubscribed("test://w"));
+}
+
 unittest  // resources/unsubscribe is rejected with -32601 when capability not advertised
 {
 	auto s = new McpServer("t", "1");
@@ -3683,6 +3709,16 @@ unittest  // resources/unsubscribe is rejected with -32601 when capability not a
 	p["uri"] = "test://w";
 	auto resp = s.handle(req(1, "resources/unsubscribe", p)).get;
 	assert("error" in resp);
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+}
+
+unittest  // draft: resources/unsubscribe is method-not-found (removed for subscriptions/listen)
+{
+	auto s = new McpServer("t", "1");
+	s.enableResourceSubscriptions();
+	Json p = Json.emptyObject;
+	p["uri"] = "test://w";
+	auto resp = s.handle(draftReq(2, "resources/unsubscribe", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
