@@ -1356,6 +1356,7 @@ struct ResourceContents
     bool isBlob;
     string text;
     string blob;
+    Json meta; /// optional per-content `_meta` object
 
     static ResourceContents makeText(string uri, string mime, string text) @safe
     {
@@ -1386,6 +1387,8 @@ struct ResourceContents
             j["blob"] = blob;
         else
             j["text"] = text;
+        if (meta.type == Json.Type.object)
+            j["_meta"] = meta;
         return j;
     }
 
@@ -1402,8 +1405,69 @@ struct ResourceContents
         }
         else if ("text" in j && j["text"].type == Json.Type.string)
             c.text = j["text"].get!string;
+        if ("_meta" in j && j["_meta"].type == Json.Type.object)
+            c.meta = j["_meta"];
         return c;
     }
+}
+
+unittest  // ResourceContents emits per-content _meta when set
+{
+    auto c = ResourceContents.makeText("file://x", "text/plain", "hi");
+    assert("_meta" !in c.toJson());
+
+    Json m = Json.emptyObject;
+    m["io.modelcontextprotocol/audience"] = "user";
+    c.meta = m;
+    auto j = c.toJson();
+    assert(j["_meta"]["io.modelcontextprotocol/audience"].get!string == "user");
+    assert(j["uri"].get!string == "file://x");
+    assert(j["text"].get!string == "hi");
+}
+
+unittest  // ResourceContents omits _meta when unset (no wire change)
+{
+    auto c = ResourceContents.makeBlob("file://b", "application/octet-stream", "AAAA");
+    auto j = c.toJson();
+    assert("_meta" !in j);
+    assert(j["blob"].get!string == "AAAA");
+}
+
+unittest  // ResourceContents parses inbound per-content _meta
+{
+    Json j = Json.emptyObject;
+    j["uri"] = "file://y";
+    j["text"] = "data";
+    Json m = Json.emptyObject;
+    m["k"] = 7;
+    j["_meta"] = m;
+    auto c = ResourceContents.fromJson(j);
+    assert(c.uri == "file://y");
+    assert(c.text == "data");
+    assert(c.meta.type == Json.Type.object);
+    assert(c.meta["k"].get!long == 7);
+}
+
+unittest  // ResourceContents per-content _meta round-trips through JSON
+{
+    auto c = ResourceContents.makeText("file://z", "text/plain", "round");
+    Json m = Json.emptyObject;
+    m["nested"] = Json.emptyObject;
+    m["nested"]["a"] = true;
+    c.meta = m;
+    auto back = ResourceContents.fromJson(c.toJson());
+    assert(back.meta["nested"]["a"].get!bool);
+    assert(back.text == "round");
+}
+
+unittest  // ResourceContents drops non-object _meta on parse
+{
+    Json j = Json.emptyObject;
+    j["uri"] = "file://w";
+    j["text"] = "x";
+    j["_meta"] = "not-an-object";
+    auto c = ResourceContents.fromJson(j);
+    assert(c.meta.type != Json.Type.object);
 }
 
 /// Result of `resources/list`.
