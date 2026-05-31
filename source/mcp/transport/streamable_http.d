@@ -409,9 +409,35 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
         }
     }
 
-    // Batches take the non-streaming path (no in-flight server->client traffic).
+    // JSON-RPC batching (an array body) was introduced in 2025-03-26 and removed
+    // in every later revision: 2025-06-18 / 2025-11-25 / draft all require the
+    // POST body to be a SINGLE request, notification, or response
+    // (basic/transports §Sending Messages). The MCP-Protocol-Version header is
+    // first validated by postProtocolVersionGate (so an invalid/unsupported
+    // version on a batch is still rejected with 400), then the effective version
+    // decides batch acceptance: only 2025-03-26 keeps the legacy batch path.
     if (input.isBatch)
     {
+        if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
+            return;
+        }
+        const ver = effectivePostVersion(req.headers.get(HttpHeader.protocolVersion,
+                ""), server.negotiatedVersion);
+        if (!streamableBatchAllowed(ver))
+        {
+            // Single-message-only: reject the array body with -32600 on HTTP 400.
+            res.statusCode = HTTPStatus.badRequest;
+            res.writeBody(makeErrorResponse(Json(null),
+                    invalidRequest("JSON-RPC batching is not supported on protocol version "
+                    ~ ver.toWire ~ "; the POST body must be a single message"))
+                    .toString(), "application/json");
+            return;
+        }
+        // 2025-03-26 back-compat: the non-streaming batch path (no in-flight
+        // server->client traffic).
         const txt = server.handleRaw(payload);
         if (txt.length == 0)
         {
@@ -923,6 +949,75 @@ private bool tryDraft(string protoHeader) @safe
 {
     ProtocolVersion pv;
     return tryParseVersion(protoHeader, pv) && pv.isDraft;
+}
+
+/// The effective protocol version for a POST that decides whether a JSON-RPC
+/// array body (a batch) may be accepted. The header wins when present and
+/// parseable; otherwise we fall back to the version negotiated at `initialize`
+/// (basic/transports §Protocol Version Header: "if the server does not receive
+/// an MCP-Protocol-Version header ... it SHOULD assume protocol version
+/// 2025-03-26", but a negotiated session gives us a sharper answer).
+private ProtocolVersion effectivePostVersion(string protoHeader, ProtocolVersion negotiated) @safe
+{
+    ProtocolVersion pv;
+    return tryParseVersion(protoHeader, pv) ? pv : negotiated;
+}
+
+/// Whether a JSON-RPC batch (array body) is permitted on the Streamable HTTP
+/// POST endpoint for the given effective protocol version.
+///
+/// JSON-RPC batching was introduced in 2025-03-26 and REMOVED thereafter:
+/// 2025-06-18 / 2025-11-25 / draft all state "The body of the POST request MUST
+/// be a single JSON-RPC request, notification, or response" (basic/transports
+/// §Sending Messages), and their `JSONRPCMessage` schema no longer includes the
+/// batch union members. So batches are accepted ONLY for 2025-03-26 back-compat;
+/// every newer version MUST reject an array body with 400 Bad Request.
+bool streamableBatchAllowed(ProtocolVersion v) @safe pure nothrow
+{
+    return v == ProtocolVersion.v2025_03_26;
+}
+
+unittest  // batches are accepted only on 2025-03-26, rejected on every newer version
+{
+    // basic/transports §Sending Messages: the POST body MUST be a single
+    // message on 2025-06-18 and later (JSON-RPC batching was removed after
+    // 2025-03-26).
+    assert(streamableBatchAllowed(ProtocolVersion.v2025_03_26));
+    assert(!streamableBatchAllowed(ProtocolVersion.v2025_06_18));
+    assert(!streamableBatchAllowed(ProtocolVersion.v2025_11_25));
+    assert(!streamableBatchAllowed(ProtocolVersion.draft));
+}
+
+unittest  // a 2024-11-05 fallback (no batching in HTTP+SSE era) also rejects arrays
+{
+    assert(!streamableBatchAllowed(ProtocolVersion.v2024_11_05));
+}
+
+unittest  // effective version: header present and parseable wins over negotiated
+{
+    assert(effectivePostVersion("2025-06-18",
+            ProtocolVersion.v2025_03_26) == ProtocolVersion.v2025_06_18);
+}
+
+unittest  // effective version: absent/unparseable header falls back to negotiated
+{
+    assert(effectivePostVersion("", ProtocolVersion.v2025_11_25) == ProtocolVersion.v2025_11_25);
+    assert(effectivePostVersion("garbage",
+            ProtocolVersion.v2025_11_25) == ProtocolVersion.v2025_11_25);
+}
+
+unittest  // a batch on a modern version is rejected with an invalidRequest 400
+{
+    // The transport must surface a -32600 invalidRequest on HTTP 400 (not the
+    // old "errors-ride-on-200" handleRaw path) when an array body arrives on a
+    // version that forbids batching.
+    auto v = effectivePostVersion("2025-11-25", ProtocolVersion.v2025_11_25);
+    assert(!streamableBatchAllowed(v));
+    auto e = invalidRequest(
+            "JSON-RPC batching is not supported on protocol version 2025-06-18 and later");
+    assert(e.code == ErrorCode.invalidRequest);
+    auto j = makeErrorResponse(Json(null), e);
+    assert(j["error"]["code"].get!int == ErrorCode.invalidRequest);
 }
 
 /// Decide whether a request must be answered with a long-lived `text/event-stream`
