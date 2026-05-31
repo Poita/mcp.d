@@ -31,6 +31,10 @@ struct Content
     string name; /// resourceLink
     Json resource = Json.undefined; /// embeddedResource: the resource contents object
     Json annotations = Json.undefined; /// optional annotations (audience/priority/lastModified)
+    Nullable!string description; /// resourceLink: optional human-readable description
+    Nullable!string title; /// resourceLink: optional human-readable display name
+    Nullable!long size; /// resourceLink: optional size in bytes of the linked resource
+    Json meta = Json.undefined; /// resourceLink: optional `_meta` object
 
     /// Attach optional annotations (audience/priority/lastModified) to this
     /// content block. Returns a copy so calls can be chained, e.g.
@@ -39,6 +43,43 @@ struct Content
     {
         Content c = this;
         c.annotations = a;
+        return c;
+    }
+
+    /// Attach an optional `description` to a `resource_link` content block, per
+    /// the MCP `ResourceLink` shape (it extends `Resource`). Returns a copy so
+    /// calls can be chained. Only serialized for the `resourceLink` kind.
+    Content withDescription(string d) const @safe
+    {
+        Content c = this;
+        c.description = d;
+        return c;
+    }
+
+    /// Attach an optional human-readable `title` to a `resource_link` content
+    /// block (`ResourceLink` extends `Resource`/`BaseMetadata`). Returns a copy.
+    Content withTitle(string t) const @safe
+    {
+        Content c = this;
+        c.title = t;
+        return c;
+    }
+
+    /// Attach an optional `size` (bytes) to a `resource_link` content block, per
+    /// the MCP `ResourceLink` shape. Returns a copy.
+    Content withSize(long s) const @safe
+    {
+        Content c = this;
+        c.size = s;
+        return c;
+    }
+
+    /// Attach an optional `_meta` object to a `resource_link` content block.
+    /// Returns a copy.
+    Content withContentMeta(Json m) const @safe
+    {
+        Content c = this;
+        c.meta = m;
         return c;
     }
 
@@ -115,8 +156,16 @@ struct Content
             j["uri"] = uri;
             if (name.length)
                 j["name"] = name;
+            if (!title.isNull)
+                j["title"] = title.get;
+            if (!description.isNull)
+                j["description"] = description.get;
             if (mimeType.length)
                 j["mimeType"] = mimeType;
+            if (!size.isNull)
+                j["size"] = size.get;
+            if (meta.type == Json.Type.object)
+                j["_meta"] = meta;
             break;
         case ContentKind.embeddedResource:
             j["type"] = "resource";
@@ -153,6 +202,14 @@ struct Content
             c.uri = ("uri" in j) ? j["uri"].get!string : "";
             c.name = ("name" in j) ? j["name"].get!string : "";
             c.mimeType = ("mimeType" in j) ? j["mimeType"].get!string : "";
+            if ("title" in j && j["title"].type == Json.Type.string)
+                c.title = j["title"].get!string;
+            if ("description" in j && j["description"].type == Json.Type.string)
+                c.description = j["description"].get!string;
+            if ("size" in j && j["size"].type == Json.Type.int_)
+                c.size = j["size"].get!long;
+            if ("_meta" in j && j["_meta"].type == Json.Type.object)
+                c.meta = j["_meta"];
             break;
         case "resource":
             c.kind = ContentKind.embeddedResource;
@@ -584,6 +641,69 @@ unittest  // resource link carries uri and name
     assert(j["type"].get!string == "resource_link");
     assert(j["uri"].get!string == "file:///a");
     assert(j["name"].get!string == "a");
+}
+
+unittest  // resource link omits description/title/size when unset
+{
+    auto c = Content.makeResourceLink("file:///a", "a");
+    auto j = c.toJson();
+    assert("description" !in j);
+    assert("title" !in j);
+    assert("size" !in j);
+}
+
+unittest  // resource link emits description (matches spec tools example)
+{
+    auto c = Content.makeResourceLink("file:///project/src/main.rs", "main.rs",
+            "text/x-rust").withDescription("Primary application entry point");
+    auto j = c.toJson();
+    assert(j["type"].get!string == "resource_link");
+    assert(j["uri"].get!string == "file:///project/src/main.rs");
+    assert(j["name"].get!string == "main.rs");
+    assert(j["mimeType"].get!string == "text/x-rust");
+    assert(j["description"].get!string == "Primary application entry point");
+}
+
+unittest  // resource link emits title and size
+{
+    auto c = Content.makeResourceLink("file:///a", "a").withTitle("Display A").withSize(4096L);
+    auto j = c.toJson();
+    assert(j["title"].get!string == "Display A");
+    assert(j["size"].get!long == 4096);
+}
+
+unittest  // resource link round-trips description/title/size through fromJson
+{
+    auto c = Content.makeResourceLink("file:///a", "a", "text/plain")
+        .withDescription("d").withTitle("t").withSize(7L);
+    auto back = Content.fromJson(c.toJson());
+    assert(back.kind == ContentKind.resourceLink);
+    assert(back.uri == "file:///a");
+    assert(back.name == "a");
+    assert(back.mimeType == "text/plain");
+    assert(!back.description.isNull && back.description.get == "d");
+    assert(!back.title.isNull && back.title.get == "t");
+    assert(!back.size.isNull && back.size.get == 7);
+}
+
+unittest  // resource link emits and parses _meta
+{
+    Json m = Json.emptyObject;
+    m["x.example/k"] = "v";
+    auto c = Content.makeResourceLink("file:///a", "a").withContentMeta(m);
+    auto j = c.toJson();
+    assert(j["_meta"]["x.example/k"].get!string == "v");
+    auto back = Content.fromJson(j);
+    assert(back.meta["x.example/k"].get!string == "v");
+}
+
+unittest  // description/title/size only serialize for resourceLink kind
+{
+    auto c = Content.makeText("hi").withDescription("ignored").withSize(5L);
+    auto j = c.toJson();
+    assert(j["type"].get!string == "text");
+    assert("description" !in j);
+    assert("size" !in j);
 }
 
 unittest  // image content uses data + mimeType
