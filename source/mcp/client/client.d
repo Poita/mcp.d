@@ -415,9 +415,10 @@ final class MCPClient
     /// Multi Round-Trip Request: if the server answers with an
     /// `InputRequiredResult` (the result carries `inputRequests`), each request is
     /// dispatched to the matching `onSampling` / `onElicitation` / `onListRoots`
-    /// handler and the original `tools/call` is resubmitted with the answers
-    /// attached under `_meta["io.modelcontextprotocol/inputResponses"]`, looping
-    /// until the server returns a completed `CallToolResult`. The loop only
+    /// handler and the original `tools/call` is resubmitted with the answers in
+    /// the top-level `params.inputResponses` map (and the server's opaque
+    /// `requestState` echoed back), looping until the server returns a completed
+    /// `CallToolResult`. The loop only
     /// engages when draft mode is enabled (see `enableDraft`/`connect`); other
     /// protocol versions never see `inputRequests`.
     CallToolResult callTool(string name, Json arguments = Json.emptyObject) @safe
@@ -448,9 +449,13 @@ final class MCPClient
     {
         enum maxRounds = 16;
         InputResponse[] responses;
+        // SEP-2322: the opaque requestState the server attached on the prior
+        // round, which the client MUST echo back verbatim on the retry.
+        string requestState;
         foreach (round; 0 .. maxRounds)
         {
-            auto params = buildToolCallParams(name, arguments, progressToken, responses);
+            auto params = buildToolCallParams(name, arguments, progressToken,
+                    responses, requestState);
             auto result = CallToolResult.fromJson(rpc("tools/call", params));
             if (!result.isInputRequired)
                 return result;
@@ -466,11 +471,14 @@ final class MCPClient
                 answers ~= answer;
             }
             responses = answers;
+            // Echo the server's opaque requestState on the next retry (empty
+            // when the server sent none).
+            requestState = result.requestState;
         }
         // Bound exceeded: return whatever the last round produced (still an
         // inputRequired result) rather than looping forever.
-        return CallToolResult.fromJson(rpc("tools/call",
-                buildToolCallParams(name, arguments, progressToken, responses)));
+        return CallToolResult.fromJson(rpc("tools/call", buildToolCallParams(name,
+                arguments, progressToken, responses, requestState)));
     }
 
     /// Satisfy one MRTR `InputRequest` by dispatching it to the matching client
@@ -521,22 +529,23 @@ final class MCPClient
     }
 
     /// Build the `tools/call` params with any gathered MRTR (SEP-2322) input
-    /// responses attached under `_meta["io.modelcontextprotocol/inputResponses"]`
-    /// (`MetaKey.inputResponses`), the reserved key a draft server reads via
-    /// `readInputResponses`. With no responses this is identical to the plain
-    /// `buildToolCallParams`. Separated as a package static so the resubmission
-    /// param shaping can be unit-tested without a live server.
+    /// responses attached as the top-level `params.inputResponses` map, and the
+    /// opaque `requestState` echoed back as `params.requestState`. Per SEP-2322
+    /// these are RequestParams fields, NOT `_meta` entries. With no responses
+    /// and no requestState this is identical to the plain `buildToolCallParams`.
+    /// Separated as a package static so the resubmission param shaping can be
+    /// unit-tested without a live server.
     package static Json buildToolCallParams(string name, Json arguments,
-            ProgressToken progressToken, InputResponse[] responses) @safe
+            ProgressToken progressToken, InputResponse[] responses, string requestState = "") @safe
     {
         Json p = buildToolCallParams(name, arguments, progressToken);
-        return withInputResponses(p, responses);
+        p = withInputResponses(p, responses);
+        return withRequestState(p, requestState);
     }
 
-    /// Attach MRTR (SEP-2322) input responses to a request's
-    /// `params._meta["io.modelcontextprotocol/inputResponses"]`
-    /// (`MetaKey.inputResponses`), preserving any existing `_meta` entries. An
-    /// empty `responses` list returns `params` unchanged. Exposed so callers can
+    /// Attach MRTR (SEP-2322) input responses to a request as the top-level
+    /// `params.inputResponses` map (id -> bare client result). An empty
+    /// `responses` list returns `params` unchanged. Exposed so callers can
     /// attach answers to a hand-built params object.
     static Json withInputResponses(Json params, InputResponse[] responses) @safe
     {
@@ -544,13 +553,24 @@ final class MCPClient
             return params;
         if (params.type != Json.Type.object)
             params = Json.emptyObject;
-        Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"]
-            : Json.emptyObject;
-        // SEP-2322: `inputResponses` is an `InputResponses` object — a map keyed
-        // by the originating `InputRequest.id` whose values are the bare client
-        // results, not an array of `{id, result}` wrappers.
-        meta[MetaKey.inputResponses] = inputResponsesToJson(responses);
-        params["_meta"] = meta;
+        // SEP-2322: `inputResponses` is a top-level RequestParams field — an
+        // `InputResponses` object keyed by the originating `InputRequest.id`
+        // whose values are the bare client results — NOT a `_meta` entry.
+        params["inputResponses"] = inputResponsesToJson(responses);
+        return params;
+    }
+
+    /// Echo the server's opaque MRTR (SEP-2322) `requestState` back on a retried
+    /// request as the top-level `params.requestState` field. The client MUST NOT
+    /// inspect or modify the value, and MUST NOT include one when the server sent
+    /// none — so an empty `requestState` returns `params` unchanged.
+    static Json withRequestState(Json params, string requestState) @safe
+    {
+        if (requestState.length == 0)
+            return params;
+        if (params.type != Json.Type.object)
+            params = Json.emptyObject;
+        params["requestState"] = requestState;
         return params;
     }
 
@@ -3143,39 +3163,63 @@ unittest  // cacheToolSchema records a schema and ignores a non-object one
     assert("bad" !in c.toolInputSchemas_);
 }
 
-unittest  // MRTR: withInputResponses attaches answers under the reserved _meta key
+unittest  // MRTR: withInputResponses attaches answers in top-level params.inputResponses
 {
     auto resp = InputResponse("date", Json([
             "content": Json(["day": Json("monday")])
     ]));
     auto params = MCPClient.buildToolCallParams("book", Json.emptyObject,
             ProgressToken.init, [resp]);
-    auto map = params["_meta"][MetaKey.inputResponses];
-    // SEP-2322: a map keyed by the InputRequest id, value is the bare result.
+    // SEP-2322: a top-level map keyed by the InputRequest id, value is the bare
+    // result — NOT under _meta and NOT an array of {id, result} wrappers.
+    auto map = params["inputResponses"];
     assert(map.type == Json.Type.object);
     assert("date" in map);
     assert("id" !in map["date"]);
     assert(map["date"]["content"]["day"].get!string == "monday");
+    // The invented reserved _meta key must not be produced.
+    assert("_meta" !in params || "io.modelcontextprotocol/inputResponses" !in params["_meta"]);
 }
 
 unittest  // MRTR: withInputResponses with no answers leaves params untouched
 {
     auto params = MCPClient.buildToolCallParams("book", Json.emptyObject, ProgressToken.init, [
     ]);
+    assert("inputResponses" !in params);
     assert("_meta" !in params);
 }
 
-unittest  // MRTR: withInputResponses preserves existing _meta entries
+unittest  // MRTR: withInputResponses preserves an existing params payload
 {
     Json p = Json.emptyObject;
+    p["name"] = "book";
     Json meta = Json.emptyObject;
     meta["progressToken"] = "p1";
     p["_meta"] = meta;
     auto resp = InputResponse("q1", Json(["action": Json("accept")]));
     auto out_ = MCPClient.withInputResponses(p, [resp]);
+    // Existing fields are preserved; inputResponses is added at the top level.
+    assert(out_["name"].get!string == "book");
     assert(out_["_meta"]["progressToken"].get!string == "p1");
-    assert(out_["_meta"][MetaKey.inputResponses].type == Json.Type.object);
-    assert("q1" in out_["_meta"][MetaKey.inputResponses]);
+    assert(out_["inputResponses"].type == Json.Type.object);
+    assert("q1" in out_["inputResponses"]);
+}
+
+unittest  // MRTR: withRequestState echoes the opaque requestState at the top level
+{
+    auto resp = InputResponse("date", Json(["action": Json("accept")]));
+    auto params = MCPClient.buildToolCallParams("book", Json.emptyObject,
+            ProgressToken.init, [resp], "eyJyIjoiRHVwIn0");
+    // SEP-2322: requestState is echoed verbatim as a top-level params field.
+    assert(params["requestState"].get!string == "eyJyIjoiRHVwIn0");
+}
+
+unittest  // MRTR: an empty requestState is never echoed (client MUST NOT invent one)
+{
+    auto resp = InputResponse("date", Json(["action": Json("accept")]));
+    auto params = MCPClient.buildToolCallParams("book", Json.emptyObject,
+            ProgressToken.init, [resp]);
+    assert("requestState" !in params);
 }
 
 unittest  // MRTR: resolveInputRequest routes an elicitation request to onElicitation

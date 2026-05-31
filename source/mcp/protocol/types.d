@@ -565,6 +565,10 @@ struct CallToolResult
     /// the caller should gather input and retry the request with matching
     /// `inputResponses`. See `isInputRequired`.
     InputRequest[] inputRequests;
+    /// MRTR (SEP-2322): the opaque, server-owned `requestState` carried on an
+    /// `InputRequiredResult`. The client MUST echo it back verbatim (and MUST
+    /// NOT inspect it) when retrying. Empty when the server sent none.
+    string requestState;
 
     Json toJson() const @safe
     {
@@ -577,6 +581,10 @@ struct CallToolResult
             // by the server-assigned id with `{ method, params }` values), not
             // an array.
             j["inputRequests"] = inputRequestsToJson(inputRequests);
+            // SEP-2322: `requestState` is an optional top-level field on the
+            // result; omit it when empty.
+            if (requestState.length)
+                j["requestState"] = requestState;
             return j;
         }
         Json arr = Json.emptyArray;
@@ -611,6 +619,10 @@ struct CallToolResult
         // `inputRequests` is a map keyed by the server-assigned id.
         if ("inputRequests" in j && j["inputRequests"].type == Json.Type.object)
             r.inputRequests = inputRequestsFromJson(j["inputRequests"]);
+        // SEP-2322: capture the opaque requestState so the client can echo it
+        // back verbatim on the retry.
+        if ("requestState" in j && j["requestState"].type == Json.Type.string)
+            r.requestState = j["requestState"].get!string;
         return r;
     }
 
