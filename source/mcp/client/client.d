@@ -224,6 +224,14 @@ final class MCPClient
     /// `callTool`/`readResource`/`getPrompt` overloads taking a `ProgressToken`)
     /// to track an individual request's progress.
     void delegate(ProgressNotification n) @safe onProgress;
+    /// Typed observer for `notifications/message` (server/utilities/logging).
+    ///
+    /// When set, an inbound `notifications/message` is parsed into a
+    /// `LogMessageNotification` and delivered here in addition to the generic
+    /// `onNotification`. Inspect `n.level` (a `LogLevel`), the optional
+    /// `n.logger`, and the arbitrary `n.data` payload to present log output in
+    /// the UI / display severity visually.
+    void delegate(LogMessageNotification n) @safe onLogMessage;
 
     this(string url, Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
     {
@@ -1425,6 +1433,10 @@ final class MCPClient
         // in addition to the generic catch-all below.
         if (method == "notifications/progress" && onProgress !is null)
             onProgress(ProgressNotification.fromJson(params));
+        // Deliver log messages as a typed value to the dedicated observer,
+        // in addition to the generic catch-all below.
+        if (method == "notifications/message" && onLogMessage !is null)
+            onLogMessage(LogMessageNotification.fromJson(params));
         if (onNotification !is null)
             onNotification(method, params);
     }
@@ -2793,6 +2805,44 @@ unittest  // progress is still forwarded to the generic onNotification observer
     c.onNotification = (string method, Json) @safe { forwarded = method; };
     c.dispatchNotification("notifications/progress", Json.emptyObject);
     assert(forwarded == "notifications/progress");
+}
+
+unittest  // notifications/message is delivered to the typed onLogMessage observer
+{
+    auto c = new MCPClient("http://localhost");
+    LogMessageNotification got;
+    bool called;
+    c.onLogMessage = (LogMessageNotification n) @safe { got = n; called = true; };
+
+    Json p = Json.emptyObject;
+    p["level"] = "warning";
+    p["logger"] = "db";
+    p["data"] = "disk almost full";
+    c.dispatchNotification("notifications/message", p);
+
+    assert(called);
+    assert(got.level == "warning");
+    assert(got.level == LogLevel.warning);
+    assert(!got.logger.isNull && got.logger.get == "db");
+    assert(got.data.get!string == "disk almost full");
+}
+
+unittest  // a non-message notification does not invoke onLogMessage
+{
+    auto c = new MCPClient("http://localhost");
+    bool called;
+    c.onLogMessage = (LogMessageNotification) @safe { called = true; };
+    c.dispatchNotification("notifications/progress", Json.emptyObject);
+    assert(!called);
+}
+
+unittest  // a log message is still forwarded to the generic onNotification observer
+{
+    auto c = new MCPClient("http://localhost");
+    string forwarded;
+    c.onNotification = (string method, Json) @safe { forwarded = method; };
+    c.dispatchNotification("notifications/message", Json.emptyObject);
+    assert(forwarded == "notifications/message");
 }
 
 unittest  // elicitation/create defaults to form mode when mode is absent
