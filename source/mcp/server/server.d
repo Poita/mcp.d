@@ -654,18 +654,36 @@ final class MCPServer
 	/// unchanged. Returns the number of streams reached (0 or 1).
 	private size_t notifyChange(string method, Json params, string uri) @safe
 	{
-		if (pushChannel is null)
-			return 0;
-		if (effectiveVersion.isDraft)
+		size_t delivered;
+		// Stdio `subscriptions/listen` channel (draft): the single stdout channel
+		// carries change notifications too, stamped with the listen subscriptionId.
+		// Per-stream filtering still applies — deliver only when this listen
+		// stream's recorded filter opted in for the method (mirroring the GET-stream
+		// eligibility below). Without this branch a stdio listener receives nothing,
+		// since there is no `pushChannel` on the stdio transport.
+		if (stdioListenSink !is null && effectiveVersion.isDraft && globalListensForMethod(method))
 		{
-			// Per-stream filtering: an active `subscriptions/listen` stream receives a
-			// type only if its own filter opted in. A plain GET listener (inactive
-			// filter, no per-stream opt-in) falls back to the global opt-in, preserving
-			// the legacy single-stream draft path while isolating concurrent streams.
-			const plainEligible = globalListensForMethod(method);
-			return pushChannel.emitFiltered(method, params, uri, plainEligible);
+			auto note = withSubscriptionId(makeNotification(method, params),
+					stdioListenSubscriptionId);
+			stdioListenSink(note.toString());
+			delivered++;
 		}
-		return pushChannel.notify(method, params);
+		if (pushChannel !is null)
+		{
+			if (effectiveVersion.isDraft)
+			{
+				// Per-stream filtering: an active `subscriptions/listen` stream receives
+				// a type only if its own filter opted in. A plain GET listener (inactive
+				// filter, no per-stream opt-in) falls back to the global opt-in,
+				// preserving the legacy single-stream draft path while isolating
+				// concurrent streams.
+				const plainEligible = globalListensForMethod(method);
+				delivered += pushChannel.emitFiltered(method, params, uri, plainEligible);
+			}
+			else
+				delivered += pushChannel.notify(method, params);
+		}
+		return delivered;
 	}
 
 	/// Whether the server's *global* `subscriptions/listen` opt-in covers a given
