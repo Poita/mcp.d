@@ -546,10 +546,10 @@ final class MCPClient
             params = Json.emptyObject;
         Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"]
             : Json.emptyObject;
-        Json arr = Json.emptyArray;
-        foreach (resp; responses)
-            arr ~= resp.toJson();
-        meta[MetaKey.inputResponses] = arr;
+        // SEP-2322: `inputResponses` is an `InputResponses` object — a map keyed
+        // by the originating `InputRequest.id` whose values are the bare client
+        // results, not an array of `{id, result}` wrappers.
+        meta[MetaKey.inputResponses] = inputResponsesToJson(responses);
         params["_meta"] = meta;
         return params;
     }
@@ -3150,11 +3150,12 @@ unittest  // MRTR: withInputResponses attaches answers under the reserved _meta 
     ]));
     auto params = MCPClient.buildToolCallParams("book", Json.emptyObject,
             ProgressToken.init, [resp]);
-    auto arr = params["_meta"][MetaKey.inputResponses];
-    assert(arr.type == Json.Type.array);
-    assert(arr.length == 1);
-    assert(arr[0]["id"].get!string == "date");
-    assert(arr[0]["result"]["content"]["day"].get!string == "monday");
+    auto map = params["_meta"][MetaKey.inputResponses];
+    // SEP-2322: a map keyed by the InputRequest id, value is the bare result.
+    assert(map.type == Json.Type.object);
+    assert("date" in map);
+    assert("id" !in map["date"]);
+    assert(map["date"]["content"]["day"].get!string == "monday");
 }
 
 unittest  // MRTR: withInputResponses with no answers leaves params untouched
@@ -3173,7 +3174,8 @@ unittest  // MRTR: withInputResponses preserves existing _meta entries
     auto resp = InputResponse("q1", Json(["action": Json("accept")]));
     auto out_ = MCPClient.withInputResponses(p, [resp]);
     assert(out_["_meta"]["progressToken"].get!string == "p1");
-    assert(out_["_meta"][MetaKey.inputResponses].length == 1);
+    assert(out_["_meta"][MetaKey.inputResponses].type == Json.Type.object);
+    assert("q1" in out_["_meta"][MetaKey.inputResponses]);
 }
 
 unittest  // MRTR: resolveInputRequest routes an elicitation request to onElicitation

@@ -604,20 +604,26 @@ InputRequest[] inputRequestsFromJson(Json j) @safe
 /// `params._meta["io.modelcontextprotocol/inputResponses"]`.
 struct InputResponse
 {
-    string id;
-    Json result = Json.emptyObject;
+    string id; /// the originating `InputRequest.id` (the `InputResponses` map key)
+    Json result = Json.emptyObject; /// the bare client result (the map value)
+}
 
-    Json toJson() const @safe
-    {
-        Json j = Json.emptyObject;
-        j["id"] = id;
-        j["result"] = result;
-        return j;
-    }
+/// Serialize a list of `InputResponse`s as a spec `InputResponses` object: a map
+/// whose keys are the originating `InputRequest.id`s and whose values are the
+/// *bare* client results (e.g. `{action, content}` or
+/// `{role, content, model, stopReason}`) — not `{id, result}` wrappers and not a
+/// JSON array (SEP-2322, draft basic/utilities/mrtr).
+Json inputResponsesToJson(const(InputResponse)[] responses) @safe
+{
+    Json obj = Json.emptyObject;
+    foreach (resp; responses)
+        obj[resp.id] = resp.result;
+    return obj;
 }
 
 /// Read the input responses a client attached to a retried request, keyed by
-/// the originating `InputRequest.id`.
+/// the originating `InputRequest.id`. The wire shape is the spec `InputResponses`
+/// map (id -> bare result).
 Json[string] readInputResponses(Json params) @safe
 {
     Json[string] out_;
@@ -626,24 +632,15 @@ Json[string] readInputResponses(Json params) @safe
     auto meta = params["_meta"];
     if (meta.type != Json.Type.object || MetaKey.inputResponses !in meta)
         return out_;
-    auto arr = meta[MetaKey.inputResponses];
-    if (arr.type != Json.Type.array)
+    auto map = meta[MetaKey.inputResponses];
+    if (map.type != Json.Type.object)
         return out_;
-    foreach (i; 0 .. arr.length)
-    {
-        auto resp = fromJson2(arr[i]);
-        out_[resp.id] = resp.result;
-    }
+    // `Json.opApply` is `@system`; iterating a plain object is safe here.
+    () @trusted {
+        foreach (string key, Json value; map)
+            out_[key] = value;
+    }();
     return out_;
-}
-
-private InputResponse fromJson2(Json j) @safe
-{
-    InputResponse r;
-    r.id = ("id" in j) ? j["id"].get!string : "";
-    if ("result" in j)
-        r.result = j["result"];
-    return r;
 }
 
 unittest  // RequestMeta parses per-request _meta
@@ -780,14 +777,51 @@ unittest  // MRTR InputRequiredResult round-trips and input responses parse
     assert(back.inputRequests[0].params["message"].get!string == "hi");
 
     Json meta = Json.emptyObject;
-    Json arr = Json.emptyArray;
-    arr ~= InputResponse("r1", Json(["action": Json("accept")])).toJson();
-    meta[MetaKey.inputResponses] = arr;
+    meta[MetaKey.inputResponses] = inputResponsesToJson([
+        InputResponse("r1", Json(["action": Json("accept")]))
+    ]);
     Json params = Json.emptyObject;
     params["_meta"] = meta;
     auto resps = readInputResponses(params);
     assert("r1" in resps);
     assert(resps["r1"]["action"].get!string == "accept");
+}
+
+unittest  // SEP-2322: inputResponses is a map keyed by id with bare result values
+{
+    // The spec `InputResponses` field is a JSON object whose keys are the
+    // server-assigned `InputRequest` ids and whose values are the *bare* client
+    // results (e.g. `{action, content}`) — not `{id, result}` wrapper objects,
+    // and not a JSON array.
+    auto obj = inputResponsesToJson([
+        InputResponse("github_login", Json([
+            "action": Json("accept"),
+            "content": Json(["name": Json("octocat")])
+        ]))
+    ]);
+    assert(obj.type == Json.Type.object);
+    assert("github_login" in obj);
+    auto value = obj["github_login"];
+    // The value is the bare result, with no `id`/`result` wrapper.
+    assert("id" !in value);
+    assert("result" !in value);
+    assert(value["action"].get!string == "accept");
+    assert(value["content"]["name"].get!string == "octocat");
+}
+
+unittest  // SEP-2322: readInputResponses parses the spec map shape keyed by id
+{
+    Json responses = Json.emptyObject;
+    responses["date"] = Json(["action": Json("accept")]);
+    Json meta = Json.emptyObject;
+    meta[MetaKey.inputResponses] = responses;
+    Json params = Json.emptyObject;
+    params["_meta"] = meta;
+
+    auto parsed = readInputResponses(params);
+    assert("date" in parsed);
+    // The parsed value is the bare result the client supplied.
+    assert(parsed["date"]["action"].get!string == "accept");
 }
 
 unittest  // header value codec: plain ASCII passes through; others base64
