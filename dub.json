@@ -2,7 +2,7 @@
 	"name": "mcp",
 	"description": "Production-grade Model Context Protocol SDK for D",
 	"homepage": "https://github.com/Poita/mcp.d",
-	"license": "MIT",
+	"license": "Apache-2.0",
 	"copyright": "Copyright © 2026 Peter Alexander",
 	"authors": [
 		"Peter Alexander"
