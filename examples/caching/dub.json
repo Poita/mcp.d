@@ -1,0 +1,22 @@
+{
+	"name": "caching",
+	"description": "Caching (CacheableResult) example for the D MCP SDK — Streamable HTTP server + self-verifying client e2e.",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp": { "path": "../.." }
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "caching-server",
+			"mainSourceFile": "server.d"
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "caching-client",
+			"mainSourceFile": "client.d"
+		}
+	]
+}
