@@ -4,7 +4,7 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json, parseJsonString;
 import mcp.protocol.capabilities;
 import mcp.protocol.draft : InputRequest, inputRequestsToJson,
-	inputRequestsFromJson, CacheHint, parseCacheHint;
+	inputRequestsFromJson, CacheHint, parseCacheHint, withCache;
 
 @safe:
 
@@ -649,8 +649,9 @@ struct ListToolsResult
 {
 	Tool[] tools;
 	Nullable!string nextCursor;
-	/// Draft `CacheableResult` freshness hint parsed from the wire, exposed for
-	/// client consumers. Never re-emitted by `toJson` (the server attaches it).
+	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
+	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
+	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
 	Nullable!CacheHint cache;
 
 	Json toJson() const @safe
@@ -662,6 +663,8 @@ struct ListToolsResult
 		j["tools"] = arr;
 		if (!nextCursor.isNull)
 			j["nextCursor"] = nextCursor.get;
+		if (!cache.isNull)
+			j = withCache(j, cache.get);
 		return j;
 	}
 
@@ -679,6 +682,27 @@ struct ListToolsResult
 		r.cache = parseCacheHint(j);
 		return r;
 	}
+}
+
+unittest  // ListToolsResult: a set cache hint round-trips through toJson/fromJson
+{
+	import mcp.protocol.draft : CacheScope;
+
+	ListToolsResult r;
+	r.cache = CacheHint(5000, CacheScope.private_);
+	auto back = ListToolsResult.fromJson(r.toJson());
+	assert(!back.cache.isNull);
+	assert(back.cache.get.ttlMs == 5000);
+	assert(back.cache.get.cacheScope == CacheScope.private_);
+}
+
+unittest  // ListToolsResult: an unset cache hint emits no ttlMs/cacheScope
+{
+	ListToolsResult r;
+	auto j = r.toJson();
+	assert("ttlMs" !in j);
+	assert("cacheScope" !in j);
+	assert(ListToolsResult.fromJson(j).cache.isNull);
 }
 
 /// Parameters of the `initialize` request.
@@ -1545,8 +1569,9 @@ struct ListResourcesResult
 {
 	Resource[] resources;
 	Nullable!string nextCursor;
-	/// Draft `CacheableResult` freshness hint parsed from the wire, exposed for
-	/// client consumers. Never re-emitted by `toJson` (the server attaches it).
+	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
+	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
+	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
 	Nullable!CacheHint cache;
 
 	Json toJson() const @safe
@@ -1558,6 +1583,8 @@ struct ListResourcesResult
 		j["resources"] = arr;
 		if (!nextCursor.isNull)
 			j["nextCursor"] = nextCursor.get;
+		if (!cache.isNull)
+			j = withCache(j, cache.get);
 		return j;
 	}
 
@@ -1582,8 +1609,9 @@ struct ListResourceTemplatesResult
 {
 	ResourceTemplate[] resourceTemplates;
 	Nullable!string nextCursor;
-	/// Draft `CacheableResult` freshness hint parsed from the wire, exposed for
-	/// client consumers. Never re-emitted by `toJson` (the server attaches it).
+	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
+	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
+	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
 	Nullable!CacheHint cache;
 
 	Json toJson() const @safe
@@ -1595,6 +1623,8 @@ struct ListResourceTemplatesResult
 		j["resourceTemplates"] = arr;
 		if (!nextCursor.isNull)
 			j["nextCursor"] = nextCursor.get;
+		if (!cache.isNull)
+			j = withCache(j, cache.get);
 		return j;
 	}
 
@@ -2098,8 +2128,9 @@ struct ReadResourceResult
 {
 	ResourceContents[] contents;
 	Json meta; /// optional result-level `_meta` object
-	/// Draft `CacheableResult` freshness hint parsed from the wire, exposed for
-	/// client consumers. Never re-emitted by `toJson` (the server attaches it).
+	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
+	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
+	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
 	Nullable!CacheHint cache;
 
 	Json toJson() const @safe
@@ -2111,6 +2142,8 @@ struct ReadResourceResult
 		j["contents"] = arr;
 		if (meta.type == Json.Type.object)
 			j["_meta"] = meta;
+		if (!cache.isNull)
+			j = withCache(j, cache.get);
 		return j;
 	}
 
@@ -2265,8 +2298,9 @@ struct ListPromptsResult
 {
 	Prompt[] prompts;
 	Nullable!string nextCursor;
-	/// Draft `CacheableResult` freshness hint parsed from the wire, exposed for
-	/// client consumers. Never re-emitted by `toJson` (the server attaches it).
+	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
+	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
+	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
 	Nullable!CacheHint cache;
 
 	Json toJson() const @safe
@@ -2278,6 +2312,8 @@ struct ListPromptsResult
 		j["prompts"] = arr;
 		if (!nextCursor.isNull)
 			j["nextCursor"] = nextCursor.get;
+		if (!cache.isNull)
+			j = withCache(j, cache.get);
 		return j;
 	}
 
