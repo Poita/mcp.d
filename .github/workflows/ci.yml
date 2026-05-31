@@ -7,6 +7,25 @@ on:
     branches: [main]
 
 jobs:
+  format-check:
+    name: dfmt format check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install D compiler
+        uses: dlang-community/setup-dlang@v1
+        with:
+          compiler: ldc-latest
+
+      # dfmt has no `--check` flag, so the idiom is format-in-place then fail
+      # if the working tree changed. The dfmt config lives in dfmt.json.
+      - name: Check formatting (dfmt)
+        run: |
+          dub run dfmt -- --inplace source/ conformance/
+          git diff --exit-code
+
   build-and-test:
     name: ${{ matrix.compiler }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
