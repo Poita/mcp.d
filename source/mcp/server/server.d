@@ -591,6 +591,18 @@ final class MCPServer
 	/// become JSON-RPC error responses with a null id.
 	string handleRaw(string text) @safe
 	{
+		return handleRaw(text, null);
+	}
+
+	/// As `handleRaw`, but with a server->client write `sink` for transports (such
+	/// as stdio) that can deliver out-of-band frames on the same channel. Each
+	/// message is dispatched with a `StdioContext` bound to `sink`, so a handler's
+	/// `ctx.log()` / `ctx.reportProgress()` are serialised and pushed to `sink` as
+	/// they happen — before the request's reply, which is still returned as the
+	/// string result. When `sink` is `null` a `NullContext` is used (no streaming),
+	/// preserving the in-process behaviour of the no-argument overload.
+	string handleRaw(string text, scope void delegate(string) @safe sink) @safe
+	{
 		import vibe.data.json : parseJsonString;
 
 		ParsedInput input;
@@ -601,20 +613,39 @@ final class MCPServer
 		catch (Exception e)
 			return makeErrorResponse(Json(null), parseError(e.msg)).toString();
 
+		auto dispatch = (Message m) @safe {
+			if (sink is null)
+				return handle(m);
+			return handle(m, new StdioContext(sink, readProgressToken(m.params)));
+		};
+
 		if (!input.isBatch)
 		{
-			auto resp = handle(input.messages[0]);
+			auto resp = dispatch(input.messages[0]);
 			return resp.isNull ? "" : resp.get.toString();
 		}
 
 		Json responses = Json.emptyArray;
 		foreach (m; input.messages)
 		{
-			auto resp = handle(m);
+			auto resp = dispatch(m);
 			if (!resp.isNull)
 				responses ~= resp.get;
 		}
 		return responses.length == 0 ? "" : responses.toString();
+	}
+
+	/// Extract `_meta.progressToken` from a request's params, or `Json.undefined`
+	/// when the request carried none.
+	private static Json readProgressToken(Json params) @safe
+	{
+		if (params.type == Json.Type.object && "_meta" in params)
+		{
+			auto meta = params["_meta"];
+			if (meta.type == Json.Type.object && "progressToken" in meta)
+				return meta["progressToken"];
+		}
+		return Json.undefined;
 	}
 
 	private Nullable!Json handleRequest(Message msg, RequestContext ctx) @safe
