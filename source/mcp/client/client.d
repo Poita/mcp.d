@@ -111,8 +111,21 @@ final class McpClient : ClientProtocol
 	// which the HTTP transport calls to obtain the per-message headers.
 	private Json[string] toolInputSchemas_;
 
-	/// Capabilities this client advertises at initialize.
+	/// Capabilities this client advertises at initialize. Treated as a baseline:
+	/// unless `autoAdvertiseCapabilities` is disabled, the capabilities actually
+	/// sent are this value augmented from the installed handlers (see
+	/// `effectiveCapabilities`), so installing `onSampling`/`onElicitation`/
+	/// `onListRoots` auto-advertises `sampling`/`elicitation`/`roots`.
 	ClientCapabilities capabilities;
+	/// When true (the default), the capabilities advertised at `initialize`
+	/// (and in every draft per-request `_meta`) are derived from which handlers
+	/// are installed: `onSampling` implies `sampling`, `onElicitation` implies
+	/// `elicitation` (form submode), `onListRoots` implies `roots`. Anything
+	/// already set on `capabilities` is preserved (e.g. submodes, `listChanged`,
+	/// `tasks`), so this only ever adds the presence flags a handler implies and
+	/// never clears an explicit advertisement. Set to false to advertise exactly
+	/// `capabilities` and nothing more (the explicit-override escape hatch).
+	bool autoAdvertiseCapabilities = true;
 	/// This client's identity.
 	Implementation clientInfo;
 
@@ -247,7 +260,7 @@ final class McpClient : ClientProtocol
 	{
 		InitializeParams params;
 		params.protocolVersion = requestedVersion;
-		params.capabilities = capabilities;
+		params.capabilities = effectiveCapabilities();
 		params.clientInfo = clientInfo;
 
 		// Record the id the initialize request will use so cancel() can refuse
@@ -861,6 +874,34 @@ final class McpClient : ClientProtocol
 		return transport.deliver(message, id);
 	}
 
+	/// The capabilities actually advertised on the wire: `capabilities` augmented
+	/// from the installed handlers when `autoAdvertiseCapabilities` is true.
+	/// Installing `onSampling` advertises `sampling`, `onElicitation` advertises
+	/// `elicitation` (defaulting to the form submode unless a submode is already
+	/// declared), and `onListRoots` advertises `roots`. Explicit flags already set
+	/// on `capabilities` are never cleared. When `autoAdvertiseCapabilities` is
+	/// false, `capabilities` is returned verbatim. Drives both the `initialize`
+	/// handshake and the draft per-request `_meta`.
+	ClientCapabilities effectiveCapabilities() const @safe
+	{
+		ClientCapabilities caps = capabilities;
+		if (!autoAdvertiseCapabilities)
+			return caps;
+		if (onSampling !is null)
+			caps.sampling = true;
+		if (onElicitation !is null)
+		{
+			caps.elicitation = true;
+			// A bare `elicitation` object means form mode only; declare the form
+			// submode unless the caller has already advertised a submode explicitly.
+			if (!caps.elicitationForm && !caps.elicitationUrl)
+				caps.elicitationForm = true;
+		}
+		if (onListRoots !is null)
+			caps.roots = true;
+		return caps;
+	}
+
 	/// Add the draft per-request `_meta` (protocol version, client identity,
 	/// capabilities) to a request's params.
 	private Json injectDraftMeta(Json params) @safe
@@ -871,7 +912,7 @@ final class McpClient : ClientProtocol
 			.emptyObject;
 		meta[MetaKey.protocolVersion] = negotiated.toWire;
 		meta[MetaKey.clientInfo] = clientInfo.toJson();
-		meta[MetaKey.clientCapabilities] = capabilities.toJson();
+		meta[MetaKey.clientCapabilities] = effectiveCapabilities().toJson();
 		params["_meta"] = meta;
 		return params;
 	}
@@ -1460,6 +1501,92 @@ unittest  // setRoots answers roots/list with the typed envelope
 	assert("name" !in result["roots"][1]);
 	assert(parsed.roots.length == 2);
 	assert(parsed.roots[0].name.get == "My Project");
+}
+
+unittest  // installing onSampling auto-advertises the sampling capability
+{
+	auto c = McpClient.http("http://localhost");
+	assert(!c.effectiveCapabilities().sampling); // nothing installed yet
+	c.onSampling = (CreateMessageRequest request) @safe {
+		return CreateMessageResult.init;
+	};
+	auto caps = c.effectiveCapabilities();
+	assert(caps.sampling);
+	assert("sampling" in caps.toJson());
+}
+
+unittest  // installing onElicitation auto-advertises elicitation (form submode)
+{
+	auto c = McpClient.http("http://localhost");
+	assert(!c.effectiveCapabilities().elicitation);
+	c.onElicitation = (ElicitParams params) @safe { return ElicitResult.init; };
+	auto caps = c.effectiveCapabilities();
+	assert(caps.elicitation);
+	assert(caps.elicitationForm); // a bare handler means form mode only
+	auto j = caps.toJson();
+	assert(j["elicitation"].type == Json.Type.object);
+	assert("form" in j["elicitation"]);
+}
+
+unittest  // installing onListRoots auto-advertises the roots capability
+{
+	auto c = McpClient.http("http://localhost");
+	assert(!c.effectiveCapabilities().roots);
+	c.setRoots([Root("file:///tmp")]); // installs onListRoots
+	auto caps = c.effectiveCapabilities();
+	assert(caps.roots);
+	assert("roots" in caps.toJson());
+}
+
+unittest  // auto-advertise preserves explicitly declared submodes (url)
+{
+	auto c = McpClient.http("http://localhost");
+	c.capabilities.elicitation = true;
+	c.capabilities.elicitationUrl = true; // explicit url-only advertisement
+	c.onElicitation = (ElicitParams params) @safe { return ElicitResult.init; };
+	auto caps = c.effectiveCapabilities();
+	assert(caps.elicitationUrl);
+	assert(!caps.elicitationForm); // not forced to form when a submode is set
+}
+
+unittest  // disabling autoAdvertiseCapabilities is the explicit override escape hatch
+{
+	auto c = McpClient.http("http://localhost");
+	c.autoAdvertiseCapabilities = false;
+	c.onSampling = (CreateMessageRequest request) @safe {
+		return CreateMessageResult.init;
+	};
+	auto caps = c.effectiveCapabilities();
+	assert(!caps.sampling); // handler is installed but not advertised
+	assert("sampling" !in caps.toJson());
+}
+
+unittest  // initialize advertises capabilities derived from installed handlers
+{
+	auto c = McpClient.http("http://localhost");
+	c.onSampling = (CreateMessageRequest request) @safe {
+		return CreateMessageResult.init;
+	};
+	Json initParams = Json.undefined;
+	c.onNotifyForTest = (Json message) @safe {}; // swallow notifications/initialized
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "initialize")
+			initParams = params;
+		// Minimal initialize result so the handshake completes.
+		Json res = Json.emptyObject;
+		res["protocolVersion"] = latestStable.toWire;
+		res["capabilities"] = Json.emptyObject;
+		Json info = Json.emptyObject;
+		info["name"] = "srv";
+		info["version"] = "1.0";
+		res["serverInfo"] = info;
+		return res;
+	};
+	c.initialize();
+	assert(initParams.type == Json.Type.object);
+	auto advertised = initParams["capabilities"];
+	assert(advertised.type == Json.Type.object);
+	assert("sampling" in advertised); // auto-derived from onSampling
 }
 
 unittest  // sendNotification sends an arbitrary client-originated notification
