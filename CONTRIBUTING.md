@@ -54,6 +54,21 @@ dub run dscanner -- --styleCheck source/ # static analysis / style lint
 ./scripts/dscanner-lint.sh               # the exact lint gate CI runs (with documented filters)
 ```
 
+If you have [`just`](https://just.systems) installed, the repo's `justfile`
+wraps these (and the conformance suites) as one-word recipes — each sets the
+`ulimit -n 65536` for you:
+
+```bash
+just            # list all recipes
+just build      # dub build
+just test       # dub test
+just fmt        # dub run dfmt -- --inplace source/ conformance/
+just lint       # ./scripts/dscanner-lint.sh
+just conformance-server   # build + run the server conformance suite
+just conformance-client   # build + run the client conformance suite
+just conformance          # both suites
+```
+
 CI (`.github/workflows/ci.yml`) runs three gates on every push and PR, and your
 change must pass all of them:
 
