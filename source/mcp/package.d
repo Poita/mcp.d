@@ -24,6 +24,7 @@ public import mcp.auth.jwt;
 public import mcp.auth.jwt_verifier;
 public import mcp.auth.introspection_verifier;
 public import mcp.auth.static_verifier;
+public import mcp.auth.oauth_proxy;
 public import mcp.transport.session;
 public import mcp.transport.sse_context;
 public import mcp.transport.streamable_http;
