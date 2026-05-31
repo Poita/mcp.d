@@ -1,0 +1,22 @@
+{
+	"name": "tools",
+	"description": "MCP Tools example (server + self-verifying client e2e) for mcp.d (#348)",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp": { "path": "../.." }
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "tools-server",
+			"mainSourceFile": "server.d"
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "tools-client",
+			"mainSourceFile": "client.d"
+		}
+	]
+}
