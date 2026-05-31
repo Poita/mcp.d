@@ -41,3 +41,11 @@ public import mcp.client.subscription;
 public import mcp.api.attributes;
 public import mcp.api.schema;
 public import mcp.api.reflection;
+
+// --- User-facing draft (next-version) result/hint types ---
+// These are referenced by members already on the lean public surface:
+// `McpServer.setListCacheHint(string, CacheHint)` and `McpClient.discover()`
+// returning `DiscoverResult`. Re-export the user-facing result/hint types
+// (but not the transport/wire plumbing that also lives in
+// `mcp.protocol.draft`) so they are usable with `import mcp;` alone (#399).
+public import mcp.protocol.draft : DiscoverResult, CacheHint, CacheScope, RequestMeta;
