@@ -1,0 +1,22 @@
+{
+	"name": "stateless-draft",
+	"description": "Stateless (draft) MCP protocol over Streamable HTTP: server/discover, per-request _meta, enableDraft()/connect(), CacheableResult freshness hints",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp": { "path": "../.." }
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "stateless-draft-server",
+			"mainSourceFile": "server.d"
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "stateless-draft-client",
+			"mainSourceFile": "client.d"
+		}
+	]
+}
