@@ -1,5 +1,6 @@
 module mcp.server.server;
 
+import core.time : Duration, seconds;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
@@ -478,6 +479,27 @@ final class MCPServer
         if (pushChannel is null)
             return 0;
         return pushChannel.notify(method, params);
+    }
+
+    /// Initiate a server->client `ping` on the standalone GET SSE push channel
+    /// and block until a connected client acknowledges with the spec-mandated
+    /// empty result (basic/utilities/ping: "Either the client or server can
+    /// initiate a ping by sending a `ping` request"). This is the server-side
+    /// counterpart to `MCPClient.ping()`, exposing the SHOULD-periodic
+    /// connection-health probe the spec describes for either party. The probe
+    /// rides the same push channel `notify` uses, and the client's reply is
+    /// correlated via the shared `StreamCoordinator` when it POSTs the response.
+    ///
+    /// Throws `internalError` when the server is not mounted on a Streamable HTTP
+    /// transport (no push channel) or no client is listening on a GET stream, or
+    /// on a client error / timeout (treat a timeout as a stale connection per the
+    /// spec). The request carries no params, exactly as the spec requires.
+    void pingClient(Duration timeout = 60.seconds) @safe
+    {
+        if (pushChannel is null)
+            throw internalError(
+                    "No server->client push channel; the server is not mounted on a Streamable HTTP transport");
+        pushChannel.ping(timeout);
     }
 
     /// Capabilities this server advertises, derived from what is registered.
@@ -1342,6 +1364,61 @@ unittest  // ping returns an empty result object
     auto resp = s.handle(req(2, "ping")).get;
     assert(resp["result"].type == Json.Type.object);
     assert(resp["result"].length == 0);
+}
+
+unittest  // pingClient throws when there is no server->client push channel
+{
+    import mcp.protocol.errors : McpException, ErrorCode;
+
+    auto s = makeTestServer();
+    bool threw;
+    try
+        s.pingClient();
+    catch (McpException e)
+    {
+        threw = true;
+        assert(e.code == ErrorCode.internalError);
+    }
+    assert(threw);
+}
+
+unittest  // pingClient drives a ping on the push channel and awaits the empty reply
+{
+    import std.algorithm : canFind;
+    import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+
+    auto srv = makeTestServer();
+    auto coord = new StreamCoordinator;
+    auto ch = srv.serverPushChannel(coord); // create + attach the GET push channel
+    string frame;
+    ch.addListener((string f) @safe { frame = f; });
+
+    bool pinged;
+    void delegate() @safe nothrow initiator = () @safe nothrow{
+        try
+            srv.pingClient(); // blocks until the simulated client resolves the request
+        catch (Exception)
+            assert(false, "pingClient threw");
+        pinged = true;
+        exitEventLoop();
+    };
+    void delegate() @safe nothrow responder = () @safe nothrow{
+        // The server emitted a JSON-RPC `ping` request on the GET stream.
+        assert(frame.canFind("\"method\":\"ping\""));
+        assert(frame.canFind("\"id\":1"));
+        // Client answers id 1 with the empty result object, via the coordinator.
+        bool matched;
+        try
+            matched = coord.resolve(Json(1), Json.emptyObject, Json.undefined);
+        catch (Exception)
+            assert(false, "resolve threw");
+        assert(matched);
+    };
+    runTask(initiator);
+    runTask(responder);
+    runEventLoop();
+
+    assert(pinged);
 }
 
 unittest  // notifications produce no response

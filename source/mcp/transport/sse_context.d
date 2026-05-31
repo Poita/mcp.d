@@ -80,6 +80,15 @@ final class StreamCoordinator
         return w.result;
     }
 
+    /// Drop a registered-but-unawaited request id (e.g. when delivery failed so
+    /// the request will never get a response). Idempotent; unknown ids are
+    /// ignored. Keeps the waiter table from leaking when `register` is not
+    /// followed by `await`.
+    void cancel(long id) @safe
+    {
+        waiters.remove(id);
+    }
+
     /// Deliver a client response/errorResponse. Returns true if it matched a
     /// pending outbound request.
     bool resolve(Json idJson, Json result, Json error) @safe
@@ -204,6 +213,44 @@ final class ServerPushChannel
     size_t notify(string method, Json params = Json.undefined) @safe
     {
         return emit(makeNotification(method, params));
+    }
+
+    /// Send a server->client JSON-RPC *request* on the standalone GET SSE push
+    /// channel and block until a client responds. The request id is allocated
+    /// and tracked by the shared `StreamCoordinator`, so the client's reply --
+    /// which arrives on a *separate* POST to the MCP endpoint and is routed
+    /// through `StreamCoordinator.resolve` -- wakes this call. The request frame
+    /// is broadcast to every connected listener; the first matching response
+    /// resolves the waiter (later duplicates for the same id are ignored).
+    /// Returns the client's result, or throws `McpException` on a client error
+    /// or timeout. Throws `internalError` if no GET listener is connected (there
+    /// is nobody to answer). This is the request/response counterpart to
+    /// `notify`, and the foundation for server-initiated `ping`.
+    Json sendRequest(string method, Json params = Json.emptyObject, Duration timeout = 60.seconds) @safe
+    {
+        const id = coord.alloc();
+        coord.register(id);
+        const delivered = emit(makeRequest(Json(id), method, params));
+        if (delivered == 0)
+        {
+            coord.cancel(id);
+            throw internalError(
+                    "No GET SSE listener connected to receive the server->client request");
+        }
+        return coord.await(id, timeout);
+    }
+
+    /// Initiate a `ping` toward the connected client(s) on the GET SSE push
+    /// channel and block until one acknowledges with the spec-mandated empty
+    /// result (basic/utilities/ping). This is the server-side counterpart to the
+    /// client's `ping()`: it lets a server perform the SHOULD-periodic
+    /// connection-health check the spec describes for either party. Throws on a
+    /// client error, a timeout (treat as a stale connection), or when no GET
+    /// listener is connected. The `ping` request carries no params, exactly as
+    /// the spec requires.
+    void ping(Duration timeout = 60.seconds) @safe
+    {
+        sendRequest("ping", Json.emptyObject, timeout);
     }
 
     /// Frame `msg` and write it to a single listener (identified by `listenerId`),
@@ -579,4 +626,94 @@ unittest  // coordinator resolves a pending request across "connections"
     assert(c.resolve(Json(id), Json(["ok": Json(true)]), Json.undefined));
     // An unknown id does not match any pending request.
     assert(!c.resolve(Json(9999), Json.emptyObject, Json.undefined));
+}
+
+unittest  // cancel() drops a registered-but-unawaited request id
+{
+    auto c = new StreamCoordinator;
+    const id = c.alloc();
+    c.register(id);
+    c.cancel(id);
+    // After cancel the id is no longer pending, so a late response does not match.
+    assert(!c.resolve(Json(id), Json.emptyObject, Json.undefined));
+    // cancel is idempotent and tolerates unknown ids.
+    c.cancel(id);
+    c.cancel(9999);
+}
+
+unittest  // push-channel sendRequest with no listener throws (nobody to answer)
+{
+    import mcp.protocol.errors : McpException, ErrorCode;
+
+    auto coord = new StreamCoordinator;
+    auto ch = new ServerPushChannel(coord);
+    bool threw;
+    try
+        ch.sendRequest("ping");
+    catch (McpException e)
+    {
+        threw = true;
+        assert(e.code == ErrorCode.internalError);
+    }
+    assert(threw);
+}
+
+unittest  // push-channel ping() with no listener throws
+{
+    import mcp.protocol.errors : McpException;
+
+    auto coord = new StreamCoordinator;
+    auto ch = new ServerPushChannel(coord);
+    bool threw;
+    try
+        ch.ping();
+    catch (McpException)
+        threw = true;
+    assert(threw);
+}
+
+unittest  // push-channel ping round-trips: request frame out, empty result back
+{
+    import std.algorithm : canFind;
+    import std.string : startsWith;
+    import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+
+    auto coord = new StreamCoordinator;
+    auto ch = new ServerPushChannel(coord);
+    string frame;
+    // A connected GET listener captures the server->client request frame.
+    ch.addListener((string f) @safe { frame = f; });
+
+    bool pinged;
+    void delegate() @safe nothrow initiator = () @safe nothrow{
+        // The server initiates a ping on the push channel; this blocks until the
+        // simulated client resolves the request id via the coordinator.
+        try
+            ch.ping();
+        catch (Exception)
+            assert(false, "ping() threw");
+        pinged = true;
+        exitEventLoop();
+    };
+    // Play the client: once the request frame has been emitted, resolve the
+    // in-flight id (1) with the spec-mandated empty result, exactly as a client
+    // POST would via StreamCoordinator.resolve.
+    void delegate() @safe nothrow responder = () @safe nothrow{
+        // The emitted frame is a JSON-RPC `ping` request with an id.
+        assert(frame.startsWith("id: "));
+        assert(frame.canFind("\"method\":\"ping\""));
+        assert(frame.canFind("\"jsonrpc\":\"2.0\""));
+        assert(frame.canFind("\"id\":1"));
+        bool matched;
+        try
+            matched = coord.resolve(Json(1), Json.emptyObject, Json.undefined);
+        catch (Exception)
+            assert(false, "resolve threw");
+        assert(matched);
+    };
+    runTask(initiator);
+    runTask(responder);
+    runEventLoop();
+
+    assert(pinged); // ping() returned without throwing -> client acknowledged
 }
