@@ -210,6 +210,48 @@ opts.auth.validator = (string token) @safe {   // your verification (e.g. JWT)
 runStreamableHttp(server, 3000, opts);
 ```
 
+#### Identity-provider presets
+
+Rather than hand-wiring each IdP's issuer / JWKS URI / endpoints, use the
+turnkey presets in `mcp.auth.providers`. Each is a one-liner over `jwtVerifier`
+(#179) or `OAuthProxy` (#183).
+
+**JWT/JWKS providers** return a ready `ResourceServerConfig` (issuer + JWKS URI +
+audience pinned):
+
+```d
+opts.auth = entraId("<tenant-id>", "api://my-mcp-server", ["mcp.read"]);
+opts.auth = auth0("my-tenant.us.auth0.com", "https://api.example.com");
+opts.auth = workosAuthKit("https://your-app.authkit.app", "client-id");
+opts.auth = descope("<project-id>", "my-audience");
+opts.auth = scalekit("https://your-env.scalekit.dev", "audience");
+```
+
+| Preset | Issuer | JWKS URI |
+| --- | --- | --- |
+| `entraId(tenant, …)` | `https://login.microsoftonline.com/{tenant}/v2.0` | `…/discovery/v2.0/keys` |
+| `auth0(domain, …)` | `https://{domain}/` | `https://{domain}/.well-known/jwks.json` |
+| `workosAuthKit(issuer, …)` | the AuthKit domain | `{issuer}/oauth2/jwks` |
+| `descope(projectId, …)` | `https://api.descope.com/{projectId}` | `…/.well-known/jwks.json` |
+| `scalekit(envUrl, …)` | the environment URL | `{envUrl}/keys` |
+
+**Non-DCR / opaque-token providers** (GitHub, Google) return an
+`OAuthProxyConfig` you finish with your proxy `baseUrl`/`resource` and a
+`tokenVerifier`, then mount via an `OAuthProxy`:
+
+```d
+auto cfg = github("<client-id>", "<client-secret>", ["read:user"]);
+cfg.baseUrl = "https://mcp.example.com";
+cfg.resource = "https://mcp.example.com/mcp";
+cfg.tokenVerifier = (string t) @safe { /* map GitHub /user -> TokenInfo */ };
+auto proxy = new OAuthProxy(cfg);   // publishes DCR + AS metadata to clients
+
+auto g = google("<client-id>", "<client-secret>", ["openid", "email"]);
+```
+
+`github` pins `https://github.com/login/oauth/{authorize,access_token}`; `google`
+pins `https://accounts.google.com/o/oauth2/v2/auth` + `https://oauth2.googleapis.com/token`.
+
 A runnable version of this server (stdio + HTTP) lives in
 [`examples/calculator`](examples/calculator/app.d):
 
