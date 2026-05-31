@@ -860,13 +860,14 @@ final class McpClient : ClientProtocol
 	/// returns the delegate's `result` payload instead of POSTing to a server,
 	/// so paginating request methods can be exercised without a live server.
 	/// Production code never sets this.
-	package Json delegate(string method, Json params) @safe onRpcForTest;
+	version (unittest) package Json delegate(string method, Json params) @safe onRpcForTest;
 
 	/// Send a request and return its result (or throw `McpException`).
 	private Json rpc(string method, Json params) @safe
 	{
-		if (onRpcForTest !is null)
-			return onRpcForTest(method, params);
+		version (unittest)
+			if (onRpcForTest !is null)
+				return onRpcForTest(method, params);
 		const id = nextId++;
 		if (useDraft)
 			params = injectDraftMeta(params);
@@ -920,17 +921,18 @@ final class McpClient : ClientProtocol
 	/// Test seam: when set, `notify` routes the built notification message here
 	/// instead of POSTing it, so the public notification API can be exercised
 	/// without a live server. Production code never sets this.
-	package void delegate(Json message) @safe onNotifyForTest;
+	version (unittest) package void delegate(Json message) @safe onNotifyForTest;
 
 	/// Send a notification (no reply expected).
 	private void notify(string method, Json params) @safe
 	{
 		auto message = makeNotification(method, params);
-		if (onNotifyForTest !is null)
-		{
-			onNotifyForTest(message);
-			return;
-		}
+		version (unittest)
+			if (onNotifyForTest !is null)
+			{
+				onNotifyForTest(message);
+				return;
+			}
 		transport.sendOneway(message);
 	}
 
@@ -1294,7 +1296,7 @@ final class McpClient : ClientProtocol
 
 	/// Test seam: set the id `cancel()` treats as the (uncancellable) initialize
 	/// request, without driving the live `initialize` handshake.
-	package void setInitializeRequestIdForTest(long id) @safe nothrow @nogc
+	version (unittest) package void setInitializeRequestIdForTest(long id) @safe nothrow @nogc
 	{
 		initializeRequestId = id;
 	}
@@ -2604,4 +2606,45 @@ unittest  // connect() routes a legacy HTTP+SSE fallback through the transport s
 	};
 	c.connect();
 	assert(transport.legacyFallbackCalled);
+}
+
+unittest  // test-only RPC/notify hooks are guarded behind version(unittest)
+{
+	// The test seams `onRpcForTest`, `onNotifyForTest`, and
+	// `setInitializeRequestIdForTest` must not ship in non-unittest builds and
+	// must not add a runtime branch to `rpc`/`notify` in release. Verify each is
+	// declared inside a `version (unittest)` block in this source file.
+	import std.file : readText;
+
+	const src = readText(__FILE__);
+
+	static struct Hook
+	{
+		string name;
+		string decl;
+	}
+
+	immutable Hook[3] hooks = [
+		Hook("onRpcForTest", "delegate(string method, Json params) @safe onRpcForTest;"),
+		Hook("onNotifyForTest", "delegate(Json message) @safe onNotifyForTest;"),
+		Hook("setInitializeRequestIdForTest", "void setInitializeRequestIdForTest("),
+	];
+
+	import std.string : indexOf, lastIndexOf;
+
+	foreach (h; hooks)
+	{
+		const declPos = src.indexOf(h.decl);
+		assert(declPos >= 0, "declaration not found for " ~ h.name);
+		// The nearest `version (unittest)` before the declaration must be the
+		// guard introducing it (same line / immediately preceding).
+		const guardPos = src[0 .. declPos].lastIndexOf("version (unittest)");
+		assert(guardPos >= 0, h.name ~ " is not behind version (unittest)");
+		// No intervening unguarded class member: the guard must sit on the
+		// declaration's own line or the line just above it.
+		const between = src[guardPos .. declPos];
+		import std.algorithm : count;
+
+		assert(between.count('\n') <= 1, h.name ~ " is not directly guarded by version (unittest)");
+	}
 }
