@@ -406,7 +406,7 @@ final class McpServer
 	/// The effective input schema of a registered tool (the default empty-object
 	/// schema if none was provided), or `Json.undefined` if the tool is unknown.
 	/// Used by the transport for draft `x-mcp-header` validation.
-	Json toolInputSchema(string name) @safe
+	package(mcp) Json toolInputSchema(string name) @safe
 	{
 		if (auto t = name in tools)
 			return t.descriptor.toJson()["inputSchema"];

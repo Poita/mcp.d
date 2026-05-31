@@ -87,7 +87,7 @@ TokenValidator jwtVerifier(JwtVerifierConfig cfg) @safe
 /// A source of candidate verification keys. `keysFor(kid)` returns the PEM
 /// public keys to try for a token bearing the given `kid` (empty `kid` means the
 /// header had none).
-interface KeySource
+package interface KeySource
 {
 	string[] keysFor(string kid) @safe;
 }
@@ -95,7 +95,7 @@ interface KeySource
 /// Verify `token` against `cfg` at wall-clock time `now` (unix seconds), drawing
 /// JWKS keys from `keys`. Separated from clock/HTTP so tests can drive it
 /// deterministically.
-TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource keys, long now) @safe
+package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource keys, long now) @safe
 {
 	auto parts = token.split('.');
 	if (parts.length != 3)
@@ -136,7 +136,7 @@ TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource keys, long 
 }
 
 /// Validate the registered claims of an already-signature-verified payload.
-TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) @safe
+package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) @safe
 {
 	const skew = cast(long) cfg.clockSkew.total!"seconds";
 
@@ -175,7 +175,8 @@ TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) @safe
 /// Verify a JWS signature over `signingInput` for the given `alg` using the PEM
 /// public key. For ES256 the signature is the raw 64-byte R||S form (RFC 7518
 /// §3.4), converted to DER before handing to OpenSSL.
-bool verifyJws(string alg, const(ubyte)[] signingInput, const(ubyte)[] sig, string publicKeyPem) @trusted
+package bool verifyJws(string alg, const(ubyte)[] signingInput,
+		const(ubyte)[] sig, string publicKeyPem) @trusted
 {
 	auto pkey = parsePublicKeyPem(publicKeyPem);
 	if (pkey is null)
@@ -264,7 +265,7 @@ private extern (C) void CRYPTO_free(void* ptr) @nogc nothrow;
 // ===========================================================================
 
 /// A parsed JWK relevant to verification.
-struct Jwk
+package struct Jwk
 {
 	string kty; /// "RSA" or "EC"
 	string kid;
@@ -280,7 +281,7 @@ struct Jwk
 
 /// Parse a JWKS document (`{"keys":[...]}`) into JWKs. Tolerant of unknown
 /// fields and missing optional members.
-Jwk[] parseJwks(string jwksJson) @safe
+package Jwk[] parseJwks(string jwksJson) @safe
 {
 	Jwk[] result;
 	auto root = parseJsonString(jwksJson);
@@ -309,7 +310,7 @@ Jwk[] parseJwks(string jwksJson) @safe
 
 /// Convert a JWK to a PEM SubjectPublicKeyInfo public key. Supports RSA (n/e)
 /// and EC P-256 (crv=P-256, x/y). Returns null for unsupported keys.
-string jwkToPem(Jwk jwk) @trusted
+package string jwkToPem(Jwk jwk) @trusted
 {
 	if (jwk.kty == "RSA")
 		return rsaJwkToPem(jwk);
@@ -423,7 +424,7 @@ private string pkeyToPem(EVP_PKEY* pkey) @trusted
 
 /// A TTL cache for a JWKS document, refetched on demand. Selects keys by `kid`;
 /// when a token's `kid` is unknown, every JWKS key is offered as a candidate.
-final class JwksCache : KeySource
+package final class JwksCache : KeySource
 {
 	private string uri;
 	private Duration ttl;
@@ -520,7 +521,7 @@ private long currentUnixTime() @safe
 }
 
 /// base64url-decode a JWS segment (no padding), returning the raw bytes.
-ubyte[] base64UrlDecode(string seg) @safe
+package ubyte[] base64UrlDecode(string seg) @safe
 {
 	import std.base64 : Base64URLNoPadding;
 
