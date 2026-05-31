@@ -1,0 +1,22 @@
+{
+	"name": "mrtr",
+	"description": "MRTR (multi round-trip) example: stateless inputRequired/inputResponses over Streamable HTTP.",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp": { "path": "../.." }
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "mrtr-server",
+			"mainSourceFile": "server.d"
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "mrtr-client",
+			"mainSourceFile": "client.d"
+		}
+	]
+}
