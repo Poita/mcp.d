@@ -929,6 +929,30 @@ struct CallToolResult
 		meta = m;
 		return this;
 	}
+
+	/// Return a copy of this `CallToolResult` with any fields newer than the
+	/// negotiated protocol version stripped, so the wire output stays valid for
+	/// the peer's version. `structuredContent` was introduced by 2025-06-18: the
+	/// 2025-03-26 and 2024-11-05 tool-result shapes are `content[]` + `isError`
+	/// only, with no `structuredContent`. It is therefore emitted only when the
+	/// negotiated version is >= 2025-06-18 and dropped for every earlier version.
+	/// The `content` text mirror (which the reflection layer populates alongside
+	/// `structuredContent`) is valid in all versions and is preserved. Mirrors
+	/// `Tool.forVersion`.
+	CallToolResult forVersion(ProtocolVersion v) const @safe
+	{
+		CallToolResult projected;
+		projected.content = content.dup;
+		projected.isError = isError;
+		projected.meta = meta;
+		projected.inputRequests = inputRequests.dup;
+		projected.requestState = requestState;
+		// `structuredContent` is a 2025-06-18+ field: absent from 2025-03-26 and
+		// 2024-11-05, so omit it for those versions.
+		if (v >= ProtocolVersion.v2025_06_18)
+			projected.structuredContent = structuredContent;
+		return projected;
+	}
 }
 
 /// Result of `tools/list` (paginated).
@@ -1786,6 +1810,89 @@ unittest  // CallToolResult.withMeta is a fluent setter
 	m["x.example/k"] = "v";
 	auto r = CallToolResult([Content.makeText("ok")]).withMeta(m);
 	assert(r.meta["x.example/k"].get!string == "v");
+}
+
+unittest  // CallToolResult.forVersion drops structuredContent on 2024-11-05 (introduced 2025-06-18)
+{
+	CallToolResult r;
+	r.content = [Content.makeText("ok")];
+	Json sc = Json.emptyObject;
+	sc["result"] = 42;
+	r.structuredContent = sc;
+	auto j = r.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("structuredContent" !in j);
+	assert(j["content"].length == 1);
+}
+
+unittest  // CallToolResult.forVersion drops structuredContent on 2025-03-26 (introduced 2025-06-18)
+{
+	CallToolResult r;
+	r.content = [Content.makeText("ok")];
+	Json sc = Json.emptyObject;
+	sc["result"] = 42;
+	r.structuredContent = sc;
+	auto j = r.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("structuredContent" !in j);
+}
+
+unittest  // CallToolResult.forVersion keeps structuredContent on 2025-06-18 (introduced here)
+{
+	CallToolResult r;
+	r.content = [Content.makeText("ok")];
+	Json sc = Json.emptyObject;
+	sc["result"] = 42;
+	r.structuredContent = sc;
+	auto j = r.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("structuredContent" in j);
+	assert(j["structuredContent"]["result"].get!int == 42);
+}
+
+unittest  // CallToolResult.forVersion keeps structuredContent on 2025-11-25
+{
+	CallToolResult r;
+	Json sc = Json.emptyObject;
+	sc["result"] = 7;
+	r.structuredContent = sc;
+	auto j = r.forVersion(ProtocolVersion.v2025_11_25).toJson();
+	assert("structuredContent" in j);
+}
+
+unittest  // CallToolResult.forVersion keeps structuredContent on draft
+{
+	CallToolResult r;
+	Json sc = Json.emptyObject;
+	sc["result"] = 7;
+	r.structuredContent = sc;
+	auto j = r.forVersion(ProtocolVersion.draft).toJson();
+	assert("structuredContent" in j);
+}
+
+unittest  // CallToolResult.forVersion preserves content/isError/_meta on the old version
+{
+	CallToolResult r;
+	r.content = [Content.makeText("boom")];
+	r.isError = true;
+	Json m = Json.emptyObject;
+	m["x.example/k"] = "v";
+	r.meta = m;
+	Json sc = Json.emptyObject;
+	sc["result"] = 1;
+	r.structuredContent = sc;
+	auto j = r.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert(j["content"].length == 1);
+	assert(j["isError"].get!bool == true);
+	assert(j["_meta"]["x.example/k"].get!string == "v");
+	assert("structuredContent" !in j);
+}
+
+unittest  // CallToolResult.forVersion leaves the original unmodified (returns a projected copy)
+{
+	CallToolResult r;
+	Json sc = Json.emptyObject;
+	sc["result"] = 1;
+	r.structuredContent = sc;
+	r.forVersion(ProtocolVersion.v2024_11_05);
+	assert(r.structuredContent.type == Json.Type.object);
 }
 
 unittest  // CallToolResult.fromJson detects an MRTR InputRequiredResult

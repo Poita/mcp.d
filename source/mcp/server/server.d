@@ -75,6 +75,18 @@ struct ToolResponse
 	{
 		return needsInput_ ? required_.toJson() : result_.toJson();
 	}
+
+	/// Project the final `CallToolResult` to the negotiated protocol version so
+	/// version-gated fields are not emitted to peers that don't understand them.
+	/// `CallToolResult.structuredContent` is a 2025-06-18+ field and is stripped
+	/// for 2024-11-05 / 2025-03-26. An `InputRequiredResult` is draft-only (MRTR)
+	/// and carries no version-gated fields, so it is returned unchanged.
+	ToolResponse forVersion(ProtocolVersion v) const @safe
+	{
+		if (needsInput_)
+			return ToolResponse.inputRequired(required_.inputRequests.dup, required_.requestState);
+		return ToolResponse.complete(result_.forVersion(v));
+	}
 }
 
 /// A registered tool: its descriptor plus the handler that executes it. The
@@ -1759,10 +1771,17 @@ final class McpServer
 		try
 		{
 			// CallToolResult or InputRequiredResult.
-			auto result = entry.handler(args, ctx).toJson();
+			auto response = entry.handler(args, ctx);
+			// Validate the handler's (un-projected) output against the tool's
+			// declared outputSchema before version-shaping, so validation always
+			// sees the full structuredContent regardless of the negotiated version.
 			if (validateOutputSchema_)
-				checkOutputSchema(entry.descriptor, result);
-			return result;
+				checkOutputSchema(entry.descriptor, response.toJson());
+			// Project the result to the negotiated protocol version so version-
+			// gated fields are not emitted to peers that don't understand them.
+			// `CallToolResult.structuredContent` is a 2025-06-18+ field; forVersion
+			// strips it for 2024-11-05 / 2025-03-26 (which the SDK negotiates).
+			return response.forVersion(ver).toJson();
 		}
 		catch (McpException e)
 			throw e; // protocol-level errors propagate as JSON-RPC errors
@@ -2198,6 +2217,69 @@ unittest  // tools/call invokes the handler and returns its result
 	auto resp = s.handle(req(4, "tools/call", params)).get;
 	assert(resp["result"]["structuredContent"]["result"].get!int == 5);
 	assert("isError" !in resp["result"]);
+}
+
+unittest  // tools/call strips structuredContent for a 2025-03-26 client (#390)
+{
+	auto s = makeTestServer();
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2025-03-26";
+	s.handle(req(1, "initialize", initP)).get;
+
+	Json params = Json.emptyObject;
+	params["name"] = "add";
+	params["arguments"] = Json(["a": Json(2), "b": Json(3)]);
+	auto resp = s.handle(req(4, "tools/call", params)).get;
+	// structuredContent was introduced in 2025-06-18; it must not leak to a
+	// 2025-03-26 client whose result shape is content[] + isError only.
+	assert("structuredContent" !in resp["result"],
+			"structuredContent must NOT be emitted to a 2025-03-26 client");
+	assert(resp["result"]["content"].length >= 1);
+}
+
+unittest  // tools/call strips structuredContent for a 2024-11-05 client (#390)
+{
+	auto s = makeTestServer();
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2024-11-05";
+	s.handle(req(1, "initialize", initP)).get;
+
+	Json params = Json.emptyObject;
+	params["name"] = "add";
+	params["arguments"] = Json(["a": Json(2), "b": Json(3)]);
+	auto resp = s.handle(req(4, "tools/call", params)).get;
+	assert("structuredContent" !in resp["result"],
+			"structuredContent must NOT be emitted to a 2024-11-05 client");
+}
+
+unittest  // tools/call keeps structuredContent for a 2025-06-18 client (#390)
+{
+	auto s = makeTestServer();
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2025-06-18";
+	s.handle(req(1, "initialize", initP)).get;
+
+	Json params = Json.emptyObject;
+	params["name"] = "add";
+	params["arguments"] = Json(["a": Json(2), "b": Json(3)]);
+	auto resp = s.handle(req(4, "tools/call", params)).get;
+	assert("structuredContent" in resp["result"],
+			"structuredContent is valid from 2025-06-18 onward");
+	assert(resp["result"]["structuredContent"]["result"].get!int == 5);
+}
+
+unittest  // tools/call keeps structuredContent for a 2025-11-25 client (#390)
+{
+	auto s = makeTestServer();
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2025-11-25";
+	s.handle(req(1, "initialize", initP)).get;
+
+	Json params = Json.emptyObject;
+	params["name"] = "add";
+	params["arguments"] = Json(["a": Json(2), "b": Json(3)]);
+	auto resp = s.handle(req(4, "tools/call", params)).get;
+	assert("structuredContent" in resp["result"]);
 }
 
 unittest  // tools/list emits a tool descriptor's _meta
