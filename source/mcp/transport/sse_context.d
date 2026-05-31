@@ -127,6 +127,105 @@ final class StreamCoordinator
 /// One instance is shared across a server mount. Thread-safety is the caller's
 /// responsibility on multi-threaded vibe.d setups; the default single-fiber
 /// dispatch needs none.
+/// The per-stream opt-in a client expressed when it opened a draft
+/// `subscriptions/listen` stream (draft basic/utilities/subscriptions §Notification
+/// Filter). It records exactly which change-notification types this one stream asked
+/// for, so the server can honour the MUST NOT: "The server MUST NOT send notification
+/// types the client has not explicitly requested." With Multiple Concurrent
+/// Subscriptions each listen stream carries its own filter (keyed by its listen
+/// request id), so a notification is delivered only to streams that opted into it —
+/// never to a concurrent stream that requested a different type.
+///
+/// `active` distinguishes a real listen-stream filter (an opted-in draft stream) from
+/// the zero value used for plain GET streams that did not go through `subscriptions/
+/// listen`; an inactive filter accepts everything (the legacy GET-stream behaviour and
+/// the transport's Multiple Connections rule are unchanged).
+struct SubscriptionFilter
+{
+	bool active; /// true once this is a real `subscriptions/listen` filter
+	bool toolsListChanged;
+	bool promptsListChanged;
+	bool resourcesListChanged;
+	bool resourceSubscriptions; /// opted into `notifications/resources/updated`
+	string[] resourceUris; /// the exact URIs opted into for `notifications/resources/updated`
+
+	/// Whether a notification with this JSON-RPC `method` (and, for
+	/// `notifications/resources/updated`, this resource `uri`) is one this stream
+	/// explicitly requested. An inactive filter (a plain GET stream) accepts every
+	/// notification; an active filter accepts only its opted-in types. Notification
+	/// methods that are not subscription-gated (progress, logging, elicitation
+	/// completion, server->client requests, etc.) are always accepted — the draft
+	/// filter governs only the four list/subscription change types.
+	bool accepts(string method, string uri = "") const @safe
+	{
+		if (!active)
+			return true;
+		switch (method)
+		{
+		case "notifications/tools/list_changed":
+			return toolsListChanged;
+		case "notifications/prompts/list_changed":
+			return promptsListChanged;
+		case "notifications/resources/list_changed":
+			return resourcesListChanged;
+		case "notifications/resources/updated":
+			import std.algorithm : canFind;
+
+			if (!resourceSubscriptions)
+				return false;
+			// A blanket opt-in (legacy boolean, no per-URI list) accepts any URI;
+			// otherwise only the explicitly named URIs are accepted.
+			return resourceUris.length == 0 || uri.length == 0 || resourceUris.canFind(uri);
+		default:
+			// Not a subscription-gated change notification: always deliverable.
+			return true;
+		}
+	}
+}
+
+unittest  // an inactive filter (plain GET stream) accepts every notification type
+{
+	SubscriptionFilter f;
+	assert(f.accepts("notifications/tools/list_changed"));
+	assert(f.accepts("notifications/resources/updated", "file:///x"));
+	assert(f.accepts("notifications/message"));
+}
+
+unittest  // an active filter accepts only the change types it opted into
+{
+	SubscriptionFilter f;
+	f.active = true;
+	f.toolsListChanged = true;
+	assert(f.accepts("notifications/tools/list_changed"));
+	assert(!f.accepts("notifications/prompts/list_changed"));
+	assert(!f.accepts("notifications/resources/list_changed"));
+	assert(!f.accepts("notifications/resources/updated", "file:///x"));
+	// Non-gated notifications still flow regardless of opt-in.
+	assert(f.accepts("notifications/message"));
+	assert(f.accepts("notifications/progress"));
+}
+
+unittest  // resourceSubscriptions matches only the opted-in URIs
+{
+	SubscriptionFilter f;
+	f.active = true;
+	f.resourceSubscriptions = true;
+	f.resourceUris = ["file:///project/config.json"];
+	assert(f.accepts("notifications/resources/updated", "file:///project/config.json"));
+	assert(!f.accepts("notifications/resources/updated", "file:///other"));
+
+	// A blanket boolean opt-in (no per-URI list) accepts any resource URI.
+	SubscriptionFilter blanket;
+	blanket.active = true;
+	blanket.resourceSubscriptions = true;
+	assert(blanket.accepts("notifications/resources/updated", "file:///x"));
+
+	// Without resourceSubscriptions opt-in, resources/updated is rejected.
+	SubscriptionFilter none;
+	none.active = true;
+	assert(!none.accepts("notifications/resources/updated", "file:///x"));
+}
+
 final class ServerPushChannel
 {
 	/// A connected GET listener: an opaque id plus the writer that delivers a
@@ -135,12 +234,16 @@ final class ServerPushChannel
 	/// every notification delivered to the listener is stamped with it in
 	/// `params._meta["io.modelcontextprotocol/subscriptionId"]` so the client can
 	/// correlate notifications with the listen request (draft basic/utilities/
-	/// subscriptions).
+	/// subscriptions). `filter` is the per-stream opt-in (draft §Notification
+	/// Filter): an active filter receives only the change-notification types this
+	/// stream explicitly requested, so a notification is never delivered to a
+	/// concurrent stream that did not request it.
 	private struct Listener
 	{
 		long id;
 		void delegate(string frame) @safe write;
 		string subscriptionId;
+		SubscriptionFilter filter;
 	}
 
 	private StreamCoordinator coord;
@@ -159,10 +262,11 @@ final class ServerPushChannel
 	/// mount/session. When `subscriptionId` is non-empty (a `subscriptions/listen`
 	/// stream), every notification delivered to this listener is stamped with it
 	/// in `params._meta["io.modelcontextprotocol/subscriptionId"]`.
-	long addListener(void delegate(string frame) @safe write, string subscriptionId = "") @safe
+	long addListener(void delegate(string frame) @safe write,
+			string subscriptionId = "", SubscriptionFilter filter = SubscriptionFilter.init) @safe
 	{
 		const id = nextListenerId++;
-		listeners ~= Listener(id, write, subscriptionId);
+		listeners ~= Listener(id, write, subscriptionId, filter);
 		streamOf[id] = coord.allocStream();
 		seqOf[id] = 0;
 		return id;
@@ -195,12 +299,50 @@ final class ServerPushChannel
 	/// when no live listener could receive it.
 	size_t emit(Json msg) @safe
 	{
+		return deliver(msg, (ref const Listener) @safe => true);
+	}
+
+	/// Frame `msg` and deliver it on exactly ONE connected stream whose per-stream
+	/// `SubscriptionFilter` accepts a notification with this `method` (and, for
+	/// `notifications/resources/updated`, this resource `uri`). This honours the draft
+	/// basic/utilities/subscriptions MUST NOT — "The server MUST NOT send notification
+	/// types the client has not explicitly requested" — under Multiple Concurrent
+	/// Subscriptions: with two listen streams (A opting into one type, B into another),
+	/// a change notification reaches only a stream that requested it, never the other.
+	///
+	/// A listener whose filter is *active* (a real `subscriptions/listen` stream) is
+	/// eligible only if its own filter accepts the notification. A listener with an
+	/// *inactive* filter (a plain GET stream that did not go through `subscriptions/
+	/// listen`) falls back to `plainEligible`: the server passes its global opt-in
+	/// decision there, so the legacy single-stream draft path — where a client opts in
+	/// globally and a plain GET listener receives the notification — is preserved,
+	/// while concurrent active listen streams are still isolated to their own opt-in.
+	/// Returns 1 if the message was delivered to an eligible live stream, else 0.
+	size_t emitFiltered(string method, Json params, string uri = "", bool plainEligible = true) @safe
+	{
+		auto msg = makeNotification(method, params);
+		return deliver(msg, (ref const Listener l) @safe {
+			if (l.filter.active)
+				return l.filter.accepts(method, uri);
+			return plainEligible;
+		});
+	}
+
+	/// Shared single-stream delivery: try eligible listeners (those for which
+	/// `eligible` is true) in registration order, writing `msg` to the first live one
+	/// and stopping there (the Multiple Connections rule: never broadcast the same
+	/// message across multiple streams). Listeners whose write throws are dropped so
+	/// the channel self-heals. Returns 1 on delivery, else 0.
+	private size_t deliver(Json msg, scope bool delegate(ref const Listener) @safe eligible) @safe
+	{
 		import std.conv : to;
 
 		long[] dead;
 		size_t delivered;
 		foreach (ref l; listeners)
 		{
+			if (!eligible(l))
+				continue;
 			const eid = streamOf[l.id].to!string ~ "-" ~ seqOf[l.id].to!string;
 			const frame = formatSseEvent(eid, withSubscriptionId(msg, l.subscriptionId));
 			try
@@ -340,6 +482,91 @@ unittest  // emit delivers to exactly ONE stream, never broadcasting to all
 	assert(delivered == 1); // exactly one stream, not both
 	assert(aCount + bCount == 1); // the message landed on a single stream only
 	assert(ch.listenerCount == 2); // both streams remain open
+}
+
+unittest  // emitFiltered delivers a change notification ONLY to a stream that opted in
+{
+	// draft basic/utilities/subscriptions: "The server MUST NOT send notification
+	// types the client has not explicitly requested." Two concurrent listen streams:
+	// A opted into toolsListChanged only, B into resourceSubscriptions only. A
+	// tools/list_changed must reach A and never B, regardless of registration order.
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string aFrame, bFrame;
+	SubscriptionFilter fa;
+	fa.active = true;
+	fa.toolsListChanged = true;
+	SubscriptionFilter fb;
+	fb.active = true;
+	fb.resourceSubscriptions = true;
+	// B registers FIRST so the old first-live-listener logic would have mis-delivered
+	// the tools notification to B.
+	ch.addListener((string f) @safe { bFrame = f; }, "listen-B", fb);
+	ch.addListener((string f) @safe { aFrame = f; }, "listen-A", fa);
+
+	const delivered = ch.emitFiltered("notifications/tools/list_changed", Json.undefined);
+	assert(delivered == 1);
+	import std.algorithm : canFind;
+
+	assert(aFrame.canFind("notifications/tools/list_changed")); // A requested it
+	assert(aFrame.canFind("listen-A"));
+	assert(bFrame.length == 0); // B never requested toolsListChanged
+}
+
+unittest  // emitFiltered for resources/updated targets only the stream with that URI
+{
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string aFrame, bFrame;
+	SubscriptionFilter fa;
+	fa.active = true;
+	fa.resourceSubscriptions = true;
+	fa.resourceUris = ["file:///a"];
+	SubscriptionFilter fb;
+	fb.active = true;
+	fb.resourceSubscriptions = true;
+	fb.resourceUris = ["file:///b"];
+	ch.addListener((string f) @safe { aFrame = f; }, "A", fa);
+	ch.addListener((string f) @safe { bFrame = f; }, "B", fb);
+
+	Json p = Json.emptyObject;
+	p["uri"] = "file:///b";
+	const delivered = ch.emitFiltered("notifications/resources/updated", p, "file:///b");
+	assert(delivered == 1);
+	import std.algorithm : canFind;
+
+	assert(bFrame.canFind("file:///b")); // B opted into file:///b
+	assert(aFrame.length == 0); // A opted into a different URI only
+}
+
+unittest  // emitFiltered: no eligible stream means no delivery (returns 0)
+{
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string frame;
+	SubscriptionFilter f;
+	f.active = true;
+	f.toolsListChanged = true; // opted into tools only
+	ch.addListener((string fr) @safe { frame = fr; }, "only", f);
+
+	// promptsListChanged was never requested by the only stream.
+	const delivered = ch.emitFiltered("notifications/prompts/list_changed", Json.undefined);
+	assert(delivered == 0);
+	assert(frame.length == 0);
+}
+
+unittest  // emitFiltered still reaches a plain GET stream (inactive filter accepts all)
+{
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string frame;
+	ch.addListener((string f) @safe { frame = f; }); // plain GET stream, no opt-in
+
+	const delivered = ch.emitFiltered("notifications/tools/list_changed", Json.undefined);
+	assert(delivered == 1);
+	import std.algorithm : canFind;
+
+	assert(frame.canFind("notifications/tools/list_changed"));
 }
 
 unittest  // emit self-heals: it skips a broken stream and delivers on a live one

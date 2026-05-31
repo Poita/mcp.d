@@ -345,7 +345,7 @@ private void handleListenStream(MCPServer server, StreamCoordinator coord,
 			res.bodyWriter.write(cast(const(ubyte)[]) frame);
 			res.bodyWriter.flush();
 		}();
-	}, rpcIdString(msg.id));
+	}, rpcIdString(msg.id), server.lastListenFilter());
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
