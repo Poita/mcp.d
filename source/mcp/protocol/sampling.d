@@ -14,7 +14,7 @@ module mcp.protocol.sampling;
 
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
-import mcp.protocol.types : Content;
+import mcp.protocol.types : Content, Tool;
 import mcp.protocol.errors : McpException, invalidParams;
 
 @safe:
@@ -122,6 +122,39 @@ struct ModelPreferences
     }
 }
 
+/// Controls the tool-use ability of the model during tool-enabled sampling.
+/// `mode` is one of "auto" (model decides, the default), "required" (model MUST
+/// use at least one tool before completing), or "none" (model MUST NOT use any
+/// tools). Added by the 2025-11-25 / draft revisions; see client/sampling
+/// Tool Choice Modes.
+struct ToolChoice
+{
+    Nullable!string mode; /// "auto" | "required" | "none"
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        if (!mode.isNull)
+            j["mode"] = mode.get;
+        return j;
+    }
+
+    static ToolChoice fromJson(Json j) @safe
+    {
+        ToolChoice c;
+        if (j.type == Json.Type.object && "mode" in j && j["mode"].type == Json.Type.string)
+            c.mode = j["mode"].get!string;
+        return c;
+    }
+
+    /// True when no mode is set (so `CreateMessageRequest.toJson` can decide
+    /// whether to emit a `toolChoice` object at all).
+    bool empty() const @safe
+    {
+        return mode.isNull;
+    }
+}
+
 /// Parameters of a `sampling/createMessage` request the server sends to the
 /// client. Build one, call `toJson`, and pass it to `RequestContext.sample`.
 struct CreateMessageRequest
@@ -134,6 +167,8 @@ struct CreateMessageRequest
     Nullable!long maxTokens;
     string[] stopSequences;
     Json metadata = Json.undefined; /// opaque provider-specific metadata
+    Tool[] tools; /// tools the model may call during sampling (2025-11-25 / draft)
+    ToolChoice toolChoice; /// optional tool-choice mode; omitted when unset
 
     Json toJson() const @safe
     {
@@ -161,6 +196,15 @@ struct CreateMessageRequest
         }
         if (metadata.type != Json.Type.undefined)
             j["metadata"] = metadata;
+        if (tools.length)
+        {
+            Json t = Json.emptyArray;
+            foreach (tool; tools)
+                t ~= tool.toJson();
+            j["tools"] = t;
+        }
+        if (!toolChoice.empty)
+            j["toolChoice"] = toolChoice.toJson();
         return j;
     }
 
@@ -184,6 +228,11 @@ struct CreateMessageRequest
         if ("stopSequences" in j && j["stopSequences"].type == Json.Type.array)
             foreach (i; 0 .. j["stopSequences"].length)
                 r.stopSequences ~= j["stopSequences"][i].get!string;
+        if ("tools" in j && j["tools"].type == Json.Type.array)
+            foreach (i; 0 .. j["tools"].length)
+                r.tools ~= Tool.fromJson(j["tools"][i]);
+        if ("toolChoice" in j && j["toolChoice"].type == Json.Type.object)
+            r.toolChoice = ToolChoice.fromJson(j["toolChoice"]);
         if ("metadata" in j)
             r.metadata = j["metadata"];
         return r;
@@ -464,6 +513,61 @@ unittest  // CreateMessageRequest with modelPreferences round-trips
     assert(back.messages.length == 1 && back.messages[0].content.text == "hi");
     assert(back.modelPreferences.hints[0].name == "claude");
     assert(back.modelPreferences.intelligencePriority.get == 0.8);
+}
+
+unittest  // ToolChoice serializes mode and omits when unset
+{
+    ToolChoice c;
+    assert(c.empty);
+    assert(c.toJson().length == 0);
+
+    c.mode = "required";
+    auto j = c.toJson();
+    assert(j["mode"].get!string == "required");
+    auto back = ToolChoice.fromJson(j);
+    assert(back.mode.get == "required");
+}
+
+unittest  // ToolChoice accepts each spec mode (auto/required/none)
+{
+    foreach (m; ["auto", "required", "none"])
+    {
+        ToolChoice c;
+        c.mode = m;
+        assert(ToolChoice.fromJson(c.toJson()).mode.get == m);
+    }
+}
+
+unittest  // CreateMessageRequest emits tools and toolChoice; omits when unset
+{
+    CreateMessageRequest req;
+    req.messages = [SamplingMessage("user", Content.makeText("weather?"))];
+    auto bare = req.toJson();
+    assert("tools" !in bare);
+    assert("toolChoice" !in bare);
+
+    Tool t;
+    t.name = "get_weather";
+    t.description = "Get the weather";
+    req.tools = [t];
+    req.toolChoice.mode = "auto";
+    auto j = req.toJson();
+    assert(j["tools"].length == 1);
+    assert(j["tools"][0]["name"].get!string == "get_weather");
+    assert(j["toolChoice"]["mode"].get!string == "auto");
+}
+
+unittest  // CreateMessageRequest with tools/toolChoice round-trips
+{
+    CreateMessageRequest req;
+    req.messages = [SamplingMessage("user", Content.makeText("hi"))];
+    Tool t;
+    t.name = "calc";
+    req.tools = [t];
+    req.toolChoice.mode = "required";
+    auto back = CreateMessageRequest.fromJson(req.toJson());
+    assert(back.tools.length == 1 && back.tools[0].name == "calc");
+    assert(back.toolChoice.mode.get == "required");
 }
 
 unittest  // CreateMessageResult parses role/content/model/stopReason
