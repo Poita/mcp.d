@@ -83,6 +83,39 @@ void registerModules(mods...)(McpServer server) @safe
 		registerModule!mod(server);
 }
 
+/// Resolve the documentation string for parameter `i` (named `pname`) of `func`
+/// from the `@describe` UDA layer, or `""` when none applies.
+///
+/// Two spellings are honored:
+///  * parameter-level `@describe(...)` attached directly to the parameter. The
+///    single-string form `@describe("text")` (which fills the struct's first
+///    field, `parameter`) is treated as the description; the explicit
+///    `@describe(name, text)` form on a parameter uses `description`.
+///  * method-level `@describe(name, text)` whose `parameter` matches `pname`,
+///    documenting an argument from the function's own UDA list.
+private string describeFor(alias func, size_t i, string pname)() @safe
+{
+	alias types = Parameters!func;
+	string desc;
+	// Parameter-level @describe.
+	static foreach (attr; __traits(getAttributes, types[i .. i + 1]))
+		static if (is(typeof(attr) == describe))
+			{
+			if (attr.description.length)
+				desc = attr.description;
+			else if (attr.parameter.length)
+				desc = attr.parameter;
+		}
+	// Method-level @describe(name, text) naming this parameter.
+	static foreach (attr; __traits(getAttributes, func))
+		static if (is(typeof(attr) == describe))
+			{
+			if (attr.parameter == pname && attr.description.length)
+				desc = attr.description;
+		}
+	return desc;
+}
+
 /// Build the `{type:object, properties, required}` schema for a method's
 /// parameters, skipping any `RequestContext` parameter.
 private Json parametersSchema(alias func)() @safe
@@ -118,6 +151,14 @@ private Json parametersSchema(alias func)() @safe
 						static assert(!isFloatingPoint!P, "@mcpHeader cannot be applied to a floating-point ('number') parameter '" ~ names[i] ~ "'; x-mcp-header permits only integer/string/boolean");
 						ps["x-mcp-header"] = attr.name;
 					}
+				// #293: fold the @describe UDA into the property's JSON Schema
+				// `description` (a standard annotation keyword, valid in every
+				// protocol version).
+				{
+					enum d = describeFor!(func, i, names[i]);
+					static if (d.length)
+						ps["description"] = d;
+				}
 				props[names[i]] = ps;
 			}
 			static if (!isInstanceOf!(Nullable, P))
@@ -406,8 +447,12 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 	static foreach (i, P; Parameters!overload)
 	{
 		static if (!is(P : RequestContext))
-			descriptor.arguments ~= PromptArgument(names[i],
-					Nullable!string.init, !isInstanceOf!(Nullable, P));
+		{
+			// #293: populate PromptArgument.description from the @describe UDA.
+			enum d = describeFor!(overload, i, names[i]);
+			descriptor.arguments ~= PromptArgument(names[i], d.length
+					? nullable(d) : Nullable!string.init, !isInstanceOf!(Nullable, P));
+		}
 	}
 
 	server.registerDynamicPrompt(descriptor, (Json args) @safe {
@@ -590,6 +635,19 @@ version (unittest)
 			return region;
 		}
 
+		@tool("annotate", "Tool with described parameters")
+		string annotate(@describe("the document id") string id,
+				@describe("count", "how many copies") int count)@safe
+		{
+			return id;
+		}
+
+		@prompt("describedPrompt", "Prompt with a described argument")
+		string describedPrompt(@describe("the subject to write about") string topic)@safe
+		{
+			return "Tell me about " ~ topic;
+		}
+
 		@prompt("intro", "Intro prompt")
 		string intro(string topic) @safe
 		{
@@ -651,7 +709,7 @@ unittest  // @tool reflection: schema derivation + typed dispatch
 
 	Json lp = Json.emptyObject;
 	auto list = s.handle(Message(makeRequest(Json(1), "tools/list", lp))).get;
-	assert(list["result"]["tools"].length == 7);
+	assert(list["result"]["tools"].length == 8);
 
 	// add -> scalar return wrapped under `result`, with an inferred outputSchema.
 	Json p = Json.emptyObject;
@@ -989,6 +1047,56 @@ unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schem
 	// The consumer side (draft.paramHeaderMap) now reads it from the UDA-driven schema.
 	auto m = paramHeaderMap(schema);
 	assert(m["region"] == "Mcp-Param-Region");
+}
+
+unittest  // #293 @describe UDA: parameter descriptions appear in tool inputSchema
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DemoApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+
+	Json annotateTool;
+	foreach (i; 0 .. tools.length)
+		if (tools[i]["name"].get!string == "annotate")
+			annotateTool = tools[i];
+	assert(annotateTool.type == Json.Type.object);
+
+	auto props = annotateTool["inputSchema"]["properties"];
+	// Parameter-level @describe with a single argument documents the property.
+	assert(props["id"]["description"].get!string == "the document id");
+	// Parameter-level @describe naming itself documents the property.
+	assert(props["count"]["description"].get!string == "how many copies");
+}
+
+unittest  // #293 @describe UDA: prompt argument descriptions appear in prompts/list
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DemoApi);
+	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
+			Json.emptyObject))).get["result"]["prompts"];
+
+	Json described;
+	foreach (i; 0 .. prompts.length)
+		if (prompts[i]["name"].get!string == "describedPrompt")
+			described = prompts[i];
+	assert(described.type == Json.Type.object);
+
+	auto args = described["arguments"];
+	assert(args.length == 1);
+	assert(args[0]["name"].get!string == "topic");
+	assert(args[0]["description"].get!string == "the subject to write about");
+
+	// A prompt argument without @describe carries no description on the wire.
+	Json intro;
+	foreach (i; 0 .. prompts.length)
+		if (prompts[i]["name"].get!string == "intro")
+			intro = prompts[i];
+	assert("description" !in intro["arguments"][0]);
 }
 
 unittest  // ToolAnnotations: typed struct round-trips through JSON
