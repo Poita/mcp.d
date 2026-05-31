@@ -314,10 +314,25 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 	// token response back to the client.
 	router.post(tokenPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const form = readFormString(req);
-		const code = formField(form, "code");
-		const verifier = formField(form, "code_verifier");
-
-		const upstreamBody = proxy.tokenForm(code, verifier);
+		// Branch on the OAuth grant the client requests. The proxy advertises both
+		// `authorization_code` and `refresh_token` in its AS metadata, so the /token
+		// endpoint MUST honour either: an authorization_code exchange (default, also
+		// when grant_type is omitted, for backward compatibility) and a
+		// refresh_token exchange (OAuth 2.1 §4.3), relaying the refresh token to the
+		// upstream token endpoint with the fixed upstream credentials.
+		const grantType = formField(form, "grant_type");
+		string upstreamBody;
+		if (grantType == "refresh_token")
+		{
+			const refreshToken = formField(form, "refresh_token");
+			upstreamBody = proxy.refreshTokenForm(refreshToken);
+		}
+		else
+		{
+			const code = formField(form, "code");
+			const verifier = formField(form, "code_verifier");
+			upstreamBody = proxy.tokenForm(code, verifier);
+		}
 		const authHeader = proxy.tokenAuthHeader();
 		string responseBody;
 		int status;
@@ -471,6 +486,17 @@ unittest  // formField URL-decodes a value and returns "" for an absent field
 	assert(formField("grant_type=authorization_code&code=ab%20cd&code_verifier=V",
 			"code") == "ab cd");
 	assert(formField("grant_type=authorization_code&code=X", "code_verifier") == "");
+}
+
+unittest  // the /token dispatch reads grant_type + refresh_token from a refresh request body
+{
+	// A client following the advertised refresh_token grant POSTs this body. The
+	// mount handler keys off grant_type and forwards refresh_token upstream.
+	const form = "grant_type=refresh_token&refresh_token=RT%2D123&resource=https%3A%2F%2Fmcp.example.com%2Fmcp";
+	assert(formField(form, "grant_type") == "refresh_token");
+	assert(formField(form, "refresh_token") == "RT-123");
+	// authorization_code-only fields are absent on a refresh request.
+	assert(formField(form, "code") == "");
 }
 
 unittest  // pathOf strips scheme+host, leaving the path the routes register on

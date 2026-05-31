@@ -35,8 +35,9 @@ import std.string : endsWith, startsWith;
 
 import vibe.data.json : Json;
 
-import mcp.auth.oauth : AuthorizationServerMetadata, ProtectedResourceMetadata, RegisteredClient,
-	TokenEndpointAuthMethod, basicAuthHeader, buildAuthCodeTokenForm, buildAuthorizationUrl;
+import mcp.auth.oauth : AuthorizationServerMetadata, ProtectedResourceMetadata,
+	RegisteredClient, TokenEndpointAuthMethod,
+	basicAuthHeader, buildAuthCodeTokenForm, buildAuthorizationUrl, buildRefreshTokenForm;
 import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidator;
 
 @safe:
@@ -305,6 +306,19 @@ string proxyTokenForm(const OAuthProxyConfig cfg, string code, string codeVerifi
 			cfg.upstreamClientId, cfg.resource, secretForPost);
 }
 
+/// Build the `application/x-www-form-urlencoded` body for an upstream
+/// refresh-token exchange (OAuth 2.1 §4.3 / RFC 6749 §6). Carries
+/// `grant_type=refresh_token`, the client-relayed `refresh_token`, the proxy's
+/// fixed upstream `client_id`, and (RFC 8707) `resource`. For
+/// `client_secret_post` the upstream secret is appended to the body; for
+/// `client_secret_basic` it is sent via `proxyTokenAuthHeader` instead.
+string proxyRefreshTokenForm(const OAuthProxyConfig cfg, string refreshToken) @safe
+{
+	const secretForPost = cfg.tokenEndpointAuthMethod
+		== TokenEndpointAuthMethod.clientSecretPost ? cfg.upstreamClientSecret : "";
+	return buildRefreshTokenForm(refreshToken, cfg.upstreamClientId, cfg.resource, secretForPost);
+}
+
 /// The HTTP `Authorization` header value to use for the upstream token request,
 /// or null when no Basic auth applies (i.e. the method is not
 /// `client_secret_basic`, or no secret is configured).
@@ -486,6 +500,17 @@ final class OAuthProxy
 		return proxyTokenForm(cfg, code, codeVerifier);
 	}
 
+	/// Build the upstream refresh-token-exchange form for a proxied `/token`
+	/// request carrying `grant_type=refresh_token`. Relays the client-supplied
+	/// `refresh_token` to the upstream token endpoint with the fixed upstream
+	/// credentials and (RFC 8707) resource, so a client that obtained a refresh
+	/// token via the proxy can refresh through it — matching the
+	/// `refresh_token` grant the proxy advertises in its AS metadata.
+	string refreshTokenForm(string refreshToken) const @safe
+	{
+		return proxyRefreshTokenForm(cfg, refreshToken);
+	}
+
 	/// The optional Basic-auth header for the upstream token request.
 	string tokenAuthHeader() const @safe
 	{
@@ -630,6 +655,47 @@ unittest  // proxied /token exchanges the code upstream with fixed creds (client
 	assert(form.canFind("redirect_uri=https%3A%2F%2Fmcp.example.com%2Fauth%2Fcallback"));
 	assert(form.canFind("client_secret=upstream-secret"));
 	assert(proxyTokenAuthHeader(cfg) is null);
+}
+
+unittest  // proxied /token relays a refresh-token grant upstream with fixed creds (client_secret_post)
+{
+	import std.algorithm : canFind;
+
+	auto cfg = sampleConfig();
+	cfg.tokenEndpointAuthMethod = TokenEndpointAuthMethod.clientSecretPost;
+	auto form = proxyRefreshTokenForm(cfg, "REFRESH-TOKEN");
+	assert(form.canFind("grant_type=refresh_token"));
+	assert(form.canFind("refresh_token=REFRESH-TOKEN"));
+	assert(form.canFind("client_id=Iv1.upstream"));
+	assert(form.canFind("resource=https%3A%2F%2Fmcp.example.com%2Fmcp"));
+	assert(form.canFind("client_secret=upstream-secret"));
+	assert(!form.canFind("grant_type=authorization_code"));
+	assert(proxyTokenAuthHeader(cfg) is null);
+}
+
+unittest  // refresh-token grant: for client_secret_basic the secret goes in the header, not the body
+{
+	import std.algorithm : canFind;
+
+	auto cfg = sampleConfig();
+	cfg.tokenEndpointAuthMethod = TokenEndpointAuthMethod.clientSecretBasic;
+	auto form = proxyRefreshTokenForm(cfg, "REFRESH-TOKEN");
+	assert(form.canFind("grant_type=refresh_token"));
+	assert(!form.canFind("client_secret="));
+	auto hdr = proxyTokenAuthHeader(cfg);
+	assert(hdr !is null && hdr.startsWith("Basic "));
+}
+
+unittest  // the OAuthProxy class exposes refreshTokenForm so the mount can handle grant_type=refresh_token
+{
+	import std.algorithm : canFind;
+
+	auto cfg = sampleConfig();
+	auto proxy = new OAuthProxy(cfg);
+	auto form = proxy.refreshTokenForm("RT-123");
+	assert(form.canFind("grant_type=refresh_token"));
+	assert(form.canFind("refresh_token=RT-123"));
+	assert(form.canFind("client_id=Iv1.upstream"));
 }
 
 unittest  // for client_secret_basic the secret goes in the header, not the body
