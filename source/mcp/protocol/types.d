@@ -1362,11 +1362,14 @@ struct PromptArgument
     string name;
     Nullable!string description;
     bool required;
+    Nullable!string title; /// optional human-readable display name (BaseMetadata)
 
     Json toJson() const @safe
     {
         Json j = Json.emptyObject;
         j["name"] = name;
+        if (!title.isNull)
+            j["title"] = title.get;
         if (!description.isNull)
             j["description"] = description.get;
         if (required)
@@ -1378,6 +1381,8 @@ struct PromptArgument
     {
         PromptArgument a;
         a.name = ("name" in j) ? j["name"].get!string : "";
+        if ("title" in j && j["title"].type == Json.Type.string)
+            a.title = j["title"].get!string;
         if ("description" in j && j["description"].type == Json.Type.string)
             a.description = j["description"].get!string;
         if ("required" in j && j["required"].type == Json.Type.bool_)
@@ -1837,6 +1842,35 @@ unittest  // Prompt with arguments serializes the argument list
     assert(j["name"].get!string == "greet");
     assert(j["arguments"][0]["name"].get!string == "who");
     assert(j["arguments"][0]["required"].get!bool);
+}
+
+unittest  // PromptArgument emits an optional title when set
+{
+    PromptArgument a;
+    a.name = "who";
+    a.title = nullable("Recipient");
+    auto j = a.toJson();
+    assert(j["name"].get!string == "who");
+    assert(j["title"].get!string == "Recipient");
+}
+
+unittest  // PromptArgument omits title when unset
+{
+    PromptArgument a;
+    a.name = "who";
+    auto j = a.toJson();
+    assert("title" !in j);
+}
+
+unittest  // PromptArgument parses the optional title from JSON
+{
+    Json j = Json.emptyObject;
+    j["name"] = "who";
+    j["title"] = "Recipient";
+    auto a = PromptArgument.fromJson(j);
+    assert(a.name == "who");
+    assert(!a.title.isNull);
+    assert(a.title.get == "Recipient");
 }
 
 unittest  // Prompt emits an optional title and round-trips it
