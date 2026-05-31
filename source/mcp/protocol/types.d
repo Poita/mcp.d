@@ -331,43 +331,10 @@ struct Content
     }
 }
 
-/// An icon for display in user interfaces. Used by `Tool` (and other
-/// definitions) per the MCP spec's icon shape: a required `src` and optional
-/// `mimeType` and `sizes`.
-struct Icon
-{
-    string src; /// URI or data: URL of the icon
-    Nullable!string mimeType; /// optional MIME type, e.g. "image/png"
-    string[] sizes; /// optional size strings, e.g. ["48x48", "96x96"]
-
-    Json toJson() const @safe
-    {
-        Json j = Json.emptyObject;
-        j["src"] = src;
-        if (!mimeType.isNull)
-            j["mimeType"] = mimeType.get;
-        if (sizes.length)
-        {
-            Json arr = Json.emptyArray;
-            foreach (s; sizes)
-                arr ~= Json(s);
-            j["sizes"] = arr;
-        }
-        return j;
-    }
-
-    static Icon fromJson(Json j) @safe
-    {
-        Icon icon;
-        icon.src = ("src" in j) ? j["src"].get!string : "";
-        if ("mimeType" in j && j["mimeType"].type == Json.Type.string)
-            icon.mimeType = j["mimeType"].get!string;
-        if ("sizes" in j && j["sizes"].type == Json.Type.array)
-            foreach (i; 0 .. j["sizes"].length)
-                icon.sizes ~= j["sizes"][i].get!string;
-        return icon;
-    }
-}
+// `Icon` is defined in mcp.protocol.capabilities (a shared BaseMetadata building
+// block used by `Implementation` there and by `Tool`/`Resource`/etc. here) and
+// re-exported below so existing `Icon` references in this module resolve.
+public import mcp.protocol.capabilities : Icon;
 
 /// Optional annotations attached to resources, resource templates, and content
 /// blocks, per the MCP spec's `Annotations` shape. All fields are optional and

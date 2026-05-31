@@ -5,12 +5,59 @@ import vibe.data.json : Json;
 
 @safe:
 
+/// An icon for display in user interfaces. Used by `Implementation`,
+/// `Tool` (and other definitions) per the MCP spec's icon shape: a required
+/// `src` and optional `mimeType` and `sizes`.
+struct Icon
+{
+    string src; /// URI or data: URL of the icon
+    Nullable!string mimeType; /// optional MIME type, e.g. "image/png"
+    string[] sizes; /// optional size strings, e.g. ["48x48", "96x96"]
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["src"] = src;
+        if (!mimeType.isNull)
+            j["mimeType"] = mimeType.get;
+        if (sizes.length)
+        {
+            Json arr = Json.emptyArray;
+            foreach (s; sizes)
+                arr ~= Json(s);
+            j["sizes"] = arr;
+        }
+        return j;
+    }
+
+    static Icon fromJson(Json j) @safe
+    {
+        Icon icon;
+        icon.src = ("src" in j) ? j["src"].get!string : "";
+        if ("mimeType" in j && j["mimeType"].type == Json.Type.string)
+            icon.mimeType = j["mimeType"].get!string;
+        if ("sizes" in j && j["sizes"].type == Json.Type.array)
+            foreach (i; 0 .. j["sizes"].length)
+                icon.sizes ~= j["sizes"][i].get!string;
+        return icon;
+    }
+}
+
 /// Identifies an MCP implementation (client or server).
+///
+/// Per the schema `Implementation` extends `BaseMetadata` (`name`/`title`) and
+/// the `Icons` mixin, adding `version` plus the optional `description`,
+/// `websiteUrl`, and `icons` fields (`description`/`icons`/`websiteUrl` were
+/// added by 2025-11-25). All optional fields are omitted from `toJson` when
+/// unset, so wire output for older protocol versions is unchanged.
 struct Implementation
 {
     string name;
     string version_; /// serialized as "version"
     Nullable!string title; /// human-friendly display name (>= 2025-06-18)
+    Nullable!string description; /// optional human-readable description (>= 2025-11-25)
+    Nullable!string websiteUrl; /// optional website URL (>= 2025-11-25)
+    Icon[] icons; /// optional icons for display in user interfaces (>= 2025-11-25)
 
     Json toJson() const @safe
     {
@@ -19,6 +66,17 @@ struct Implementation
         j["version"] = version_;
         if (!title.isNull)
             j["title"] = title.get;
+        if (!description.isNull)
+            j["description"] = description.get;
+        if (!websiteUrl.isNull)
+            j["websiteUrl"] = websiteUrl.get;
+        if (icons.length)
+        {
+            Json arr = Json.emptyArray;
+            foreach (icon; icons)
+                arr ~= icon.toJson();
+            j["icons"] = arr;
+        }
         return j;
     }
 
@@ -29,6 +87,13 @@ struct Implementation
         impl.version_ = ("version" in j) ? j["version"].get!string : "";
         if ("title" in j && j["title"].type == Json.Type.string)
             impl.title = j["title"].get!string;
+        if ("description" in j && j["description"].type == Json.Type.string)
+            impl.description = j["description"].get!string;
+        if ("websiteUrl" in j && j["websiteUrl"].type == Json.Type.string)
+            impl.websiteUrl = j["websiteUrl"].get!string;
+        if ("icons" in j && j["icons"].type == Json.Type.array)
+            foreach (i; 0 .. j["icons"].length)
+                impl.icons ~= Icon.fromJson(j["icons"][i]);
         return impl;
     }
 }
@@ -735,4 +800,54 @@ unittest  // TasksCapability with empty `requests` map still round-trips presenc
     auto back = TasksCapability.fromJson(j);
     assert(back.list && !back.cancel);
     assert(back.requests.type != Json.Type.object);
+}
+
+unittest  // Implementation emits 2025-11-25 description/websiteUrl/icons when set
+{
+    Implementation impl;
+    impl.name = "srv";
+    impl.version_ = "1.0";
+    impl.description = "A demo server";
+    impl.websiteUrl = "https://example.com";
+    impl.icons = [
+        Icon("https://example.com/i.png", nullable("image/png"), ["48x48"])
+    ];
+    auto j = impl.toJson();
+    assert(j["description"].get!string == "A demo server");
+    assert(j["websiteUrl"].get!string == "https://example.com");
+    assert(j["icons"].type == Json.Type.array);
+    assert(j["icons"].length == 1);
+    assert(j["icons"][0]["src"].get!string == "https://example.com/i.png");
+    assert(j["icons"][0]["mimeType"].get!string == "image/png");
+    assert(j["icons"][0]["sizes"][0].get!string == "48x48");
+}
+
+unittest  // Implementation omits the optional BaseMetadata fields when unset
+{
+    Implementation impl;
+    impl.name = "srv";
+    impl.version_ = "1.0";
+    auto j = impl.toJson();
+    assert("description" !in j);
+    assert("websiteUrl" !in j);
+    assert("icons" !in j);
+}
+
+unittest  // Implementation round-trips description/websiteUrl/icons from a peer payload
+{
+    Json j = Json.emptyObject;
+    j["name"] = "cli";
+    j["version"] = "0.1";
+    j["description"] = "client";
+    j["websiteUrl"] = "https://client.example";
+    Json arr = Json.emptyArray;
+    Json ic = Json.emptyObject;
+    ic["src"] = "https://client.example/logo.svg";
+    arr ~= ic;
+    j["icons"] = arr;
+    auto impl = Implementation.fromJson(j);
+    assert(impl.description.get == "client");
+    assert(impl.websiteUrl.get == "https://client.example");
+    assert(impl.icons.length == 1);
+    assert(impl.icons[0].src == "https://client.example/logo.svg");
 }
