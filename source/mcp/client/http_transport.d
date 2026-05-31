@@ -126,6 +126,16 @@ final class HttpClientTransport : ClientTransport
 		post(message);
 	}
 
+	/// False: a reply to a server->client request travels on a *different* HTTP
+	/// request than the one whose inbound stream delivered it, and a nested
+	/// synchronous POST from inside an awaiting read loop could deadlock the
+	/// connection. `McpClient` therefore defers the reply to a background task
+	/// (which the HTTP transport already runs under an event loop).
+	bool repliesSynchronously() @safe
+	{
+		return false;
+	}
+
 	// --- POST helpers --------------------------------------------------------
 
 	/// POST a message that expects no correlated reply (notification/response).

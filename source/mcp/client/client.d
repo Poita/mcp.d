@@ -1163,12 +1163,20 @@ final class McpClient : ClientProtocol
 		transport.startServerStream();
 	}
 
-	/// Answer a server->client request by dispatching to the matching handler
-	/// and sending the response on a *separate* task. Sending on its own task is
-	/// essential: we are currently inside the transport's inbound-read callback of
-	/// the original request, and the server will not send that request's final
-	/// response until it receives this one — a synchronous nested send here would
-	/// deadlock.
+	/// Answer a server->client request by dispatching to the matching handler and
+	/// sending the response. We are currently inside the transport's inbound-read
+	/// callback of an in-flight request, and the server will not send that
+	/// request's final response until it receives this reply, so *how* we send it
+	/// depends on the transport (`transport.repliesSynchronously`):
+	///   - synchronous transports (stdio): the inbound-read loop is not the
+	///     coroutine holding the awaited response and the reply is just another
+	///     line written to the child's stdin, so we send it inline. This works with
+	///     no event loop, which is what makes the documented synchronous
+	///     `McpClient.spawn` model able to answer ping / sampling / elicitation /
+	///     roots requests.
+	///   - other transports (HTTP): a nested synchronous send here could deadlock
+	///     (the reply travels on a different request), so we defer it to a separate
+	///     task (the HTTP transport already runs under an event loop).
 	private void handleServerRequest(Message msg) @safe
 	{
 		import vibe.core.core : runTask;
@@ -1183,6 +1191,12 @@ final class McpClient : ClientProtocol
 			response = makeErrorResponse(msg.id, e);
 		catch (Exception e)
 			response = makeErrorResponse(msg.id, internalError(e.msg));
+
+		if (transport.repliesSynchronously())
+		{
+			transport.sendOneway(response);
+			return;
+		}
 
 		runTask((Json r) nothrow{
 			try
@@ -2517,6 +2531,11 @@ version (unittest)
 
 		void sendOneway(Json message) @safe
 		{
+		}
+
+		bool repliesSynchronously() @safe
+		{
+			return false;
 		}
 
 		void close() @safe

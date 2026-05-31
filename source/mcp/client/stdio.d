@@ -100,6 +100,16 @@ final class StdioClientTransport : ClientTransport
 		send(message);
 	}
 
+	/// True: the stdio inbound-read loop (`await`) is not the coroutine holding the
+	/// awaited response, so a reply to a server->client request is just another
+	/// line written to the child's stdin and can be sent inline without an event
+	/// loop. This is what makes the synchronous `McpClient.spawn` model able to
+	/// answer server-initiated ping / sampling / elicitation / roots requests.
+	bool repliesSynchronously() @safe
+	{
+		return true;
+	}
+
 	/// Serialize a single message and write it as one newline-delimited line.
 	/// `Json.toString` never emits a raw newline, so the line framing holds and
 	/// only a valid MCP message is written to the server's stdin.
@@ -438,6 +448,42 @@ unittest  // stdio transport answers a server-initiated ping while awaiting its 
 
 	// We should have replied to the server's ping (id 100) in addition to
 	// sending our own request (id 1).
+	assert(toServer.length == 2);
+	bool repliedToPing;
+	foreach (line; toServer)
+	{
+		auto m = parseJsonString(line);
+		if ("id" in m && m["id"].get!int == 100 && "result" in m)
+			repliedToPing = true;
+	}
+	assert(repliedToPing);
+}
+
+unittest  // stdio answers a server-initiated ping synchronously, with NO event loop running
+{
+	// This is the documented synchronous `spawn` model: no runTask / runEventLoop.
+	// A server->client request (ping, id 100) arrives while the client awaits its
+	// own request's response (id 1). The reply MUST be sent inline by the time the
+	// client's call returns -- if it were deferred to a background task, that task
+	// would never be pumped here and the reply would be lost.
+	string[] toServer;
+	string[] toClient = [
+		`{"jsonrpc":"2.0","id":100,"method":"ping"}`, // server pings us first
+		`{"jsonrpc":"2.0","id":1,"result":{}}`, // then answers our request
+	];
+
+	auto client = McpClient.stdio(() @safe {
+		if (toClient.length == 0)
+			return cast(string) null;
+		auto line = toClient[0];
+		toClient = toClient[1 .. $];
+		return line;
+	}, (string s) @safe { toServer ~= s; });
+
+	client.ping(); // id 1; the server pings us (id 100) before answering
+
+	// Both our request (id 1) and our reply to the server's ping (id 100) must
+	// have been written by the time the synchronous call returned.
 	assert(toServer.length == 2);
 	bool repliedToPing;
 	foreach (line; toServer)
