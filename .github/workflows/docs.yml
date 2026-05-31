@@ -1,0 +1,77 @@
+name: Docs
+
+# Generate browsable API documentation from ddoc comments.
+#
+# - Always builds the docs on every push/PR so doc generation can never silently
+#   break (the "docs generate in CI" acceptance criterion).
+# - Optionally publishes to GitHub Pages on pushes to main. Publishing is gated:
+#   it only runs when Pages is enabled for the repository (public repo or a plan
+#   that allows private Pages). If Pages is not available the publish step is
+#   skipped and the build job still succeeds.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-docs:
+    name: Build API docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install D compiler
+        uses: dlang-community/setup-dlang@v1
+        with:
+          compiler: ldc-latest
+
+      - name: Build and install adrdox
+        run: |
+          git clone --depth 1 https://github.com/adamdruppe/adrdox.git /tmp/adrdox
+          make -C /tmp/adrdox
+          echo "/tmp/adrdox" >> "$GITHUB_PATH"
+
+      - name: Generate docs
+        run: GENERATOR=adrdox OUTDIR=docs scripts/gen-docs.sh
+
+      - name: Upload docs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-docs
+          path: docs/
+
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/
+
+  publish-pages:
+    name: Publish to GitHub Pages
+    needs: build-docs
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    # Publishing is best-effort: if Pages is not enabled for the repo the
+    # deploy step fails softly without failing the workflow.
+    continue-on-error: true
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

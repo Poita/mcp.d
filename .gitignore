@@ -13,3 +13,9 @@ conformance-results/
 conformance-server
 conformance-client
 calculator
+
+# generated API documentation (see scripts/gen-docs.sh)
+/docs/
+/site/
+docs.json
+__dummy.html

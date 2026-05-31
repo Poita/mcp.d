@@ -50,6 +50,32 @@ dub run dfmt -- --inplace source/
 dub run dscanner -- --styleCheck source/
 ```
 
+## API documentation
+
+Browsable HTML API docs are generated from the ddoc comments in `source/mcp`:
+
+```bash
+scripts/gen-docs.sh        # auto: adrdox if available, else ddox -> docs/
+```
+
+The script prefers [adrdox](https://github.com/adamdruppe/adrdox) (the best D
+documentation generator) and falls back to dub's built-in ddox build when adrdox
+is not on `PATH`:
+
+```bash
+GENERATOR=adrdox scripts/gen-docs.sh   # require adrdox
+GENERATOR=ddox   scripts/gen-docs.sh   # force the ddox fallback (dub build -b ddox)
+OUTDIR=site      scripts/gen-docs.sh   # write to ./site instead of ./docs
+```
+
+Open `docs/index.html` in a browser when it finishes. The generated `docs/`
+directory is a build artifact and is git-ignored.
+
+CI builds the docs on every push/PR (`.github/workflows/docs.yml`) so doc
+generation can never silently break, and publishes them to GitHub Pages on
+pushes to `main` (best-effort: the publish step is skipped if Pages is not
+enabled for the repository).
+
 ## Example: a server with the ergonomic UDA API
 
 Write plain typed D methods and annotate them — both the **input schema** (from

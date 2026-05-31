@@ -388,11 +388,12 @@ final class MCPServer
         promptsListChangedEnabled = true;
     }
 
-    /// Advertise the 2025-11-25 `tasks` capability (support for task-augmented
-    /// requests). `list`/`cancel` indicate support for `tasks/list` and
-    /// `tasks/cancel`; `requests` is the nested-by-category object describing
-    /// which requests may be task-augmented (spec shape `{"tools": {"call":
-    /// {}}}`, NOT a flat `"tools/call"` key). Build it with `TaskRequests`, e.g.
+    /// Advertise the 2025-11-25 `tasks` capability, i.e. support for
+    /// task-augmented requests. `list`/`cancel` indicate support for
+    /// `tasks/list` and `tasks/cancel`; `requests` is the nested-by-category
+    /// object describing which requests may be task-augmented. Its spec shape is
+    /// the nested form `{"tools": {"call": {}}}`, NOT a flat `"tools/call"` key.
+    /// Build it with `TaskRequests`, for example
     /// `enableTasks(true, true, TaskRequests().tool().toJson())`. The capability
     /// appears in the `tasks` field of the server capabilities sent during
     /// `initialize` / `server/discover`.
