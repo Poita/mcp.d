@@ -323,19 +323,29 @@ final class OAuthClient
 
     /// GET an authorization URL (without following redirects) and extract the
     /// `code` query parameter from the `Location` response header.
-    string authorizeAndGetCode(string authzUrl) @safe
+    ///
+    /// When `expectedState` is non-empty, the `state` parameter returned in the
+    /// redirect is verified against it (MCP authorization "Open Redirection":
+    /// "MCP clients SHOULD use and verify state parameters in the authorization
+    /// code flow and discard any results that do not include or have a mismatch
+    /// with the original state"). The authorization code is NOT returned (empty
+    /// string) when the returned state is missing or does not match. Passing an
+    /// empty `expectedState` (the default) skips state verification.
+    string authorizeAndGetCode(string authzUrl, string expectedState = "") @safe
     {
-        string code, iss;
+        string code, state;
         () @trusted {
             requestHTTP(authzUrl, (scope HTTPClientRequest req) {
                 req.method = HTTPMethod.GET;
             }, (scope HTTPClientResponse res) {
                 const loc = res.headers.get("Location", "");
                 code = extractQueryParam(loc, "code");
-                iss = extractQueryParam(loc, "iss");
+                state = extractQueryParam(loc, "state");
                 res.dropBody();
             });
         }();
+        if (!validateAuthorizationResponseState(state, expectedState))
+            return "";
         return code;
     }
 
@@ -347,9 +357,16 @@ final class OAuthClient
     /// `authorization_response_iss_parameter_supported` is true, or when it does
     /// not match the recorded issuer (simple string comparison, no
     /// normalization). The authorization code is NOT returned on rejection.
-    string authorizeAndGetCode(AuthorizationServerMetadata as_, string authzUrl) @safe
+    /// When `expectedState` is non-empty, the redirect `state` parameter is also
+    /// verified against it and the authorization code is discarded (a throw)
+    /// when it is missing or mismatched, per the MCP "Open Redirection" guidance
+    /// ("MCP clients SHOULD use and verify state parameters ... and discard any
+    /// results that do not include or have a mismatch with the original state").
+    /// Passing an empty `expectedState` (the default) skips state verification.
+    string authorizeAndGetCode(AuthorizationServerMetadata as_, string authzUrl,
+            string expectedState = "") @safe
     {
-        string code, iss;
+        string code, iss, state;
         () @trusted {
             requestHTTP(authzUrl, (scope HTTPClientRequest req) {
                 req.method = HTTPMethod.GET;
@@ -357,6 +374,7 @@ final class OAuthClient
                 const loc = res.headers.get("Location", "");
                 code = extractQueryParam(loc, "code");
                 iss = extractQueryParam(loc, "iss");
+                state = extractQueryParam(loc, "state");
                 res.dropBody();
             });
         }();
@@ -364,6 +382,9 @@ final class OAuthClient
                 as_.authorizationResponseIssParameterSupported))
             throw invalidRequest(
                     "Authorization response failed RFC 9207 'iss' validation (possible mix-up attack)");
+        if (!validateAuthorizationResponseState(state, expectedState))
+            throw invalidRequest(
+                    "Authorization response failed 'state' validation (missing or mismatched state)");
         return code;
     }
 
