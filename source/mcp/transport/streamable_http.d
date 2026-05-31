@@ -1842,6 +1842,9 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
 	import std.algorithm : canFind;
 
 	auto server = new McpServer("t", "1");
+	// The server must advertise the tools list-changed capability for the
+	// toolsListChanged opt-in to be honored (draft basic/utilities/subscriptions).
+	server.enableToolsListChanged();
 
 	// Drive the server onto the draft via a draft subscriptions/listen request,
 	// mirroring what handleListenStream does: record the opted-in filters.
