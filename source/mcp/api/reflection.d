@@ -293,19 +293,26 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 	if (outSchema.type == Json.Type.object)
 		descriptor.outputSchema = outSchema;
 
-	// Fold any @toolAnnotations UDA on the same method into typed
+	// Fold the marker hint UDAs (@readOnly / @destructive / @idempotent /
+	// @openWorld) and the @hintTitle value UDA on the same method into typed
 	// ToolAnnotations, then serialize into the descriptor's annotations field.
+	// A marker's presence sets the corresponding hint to true; absence leaves it
+	// unset (omitted from the wire form).
 	ToolAnnotations anns;
 	static foreach (a; __traits(getAttributes, overload))
 	{
-		static if (is(typeof(a) == toolAnnotations))
+		static if (__traits(isSame, a, readOnly))
+			anns.readOnlyHint = true;
+		else static if (__traits(isSame, a, destructive))
+			anns.destructiveHint = true;
+		else static if (__traits(isSame, a, idempotent))
+			anns.idempotentHint = true;
+		else static if (__traits(isSame, a, openWorld))
+			anns.openWorldHint = true;
+		else static if (is(typeof(a) == hintTitle))
 		{
-			anns.readOnlyHint = a.readOnlyHint;
-			anns.destructiveHint = a.destructiveHint;
-			anns.idempotentHint = a.idempotentHint;
-			anns.openWorldHint = a.openWorldHint;
-			if (a.title.length)
-				anns.title = a.title;
+			if (a.value.length)
+				anns.title = a.value;
 		}
 	}
 	if (!anns.empty)
@@ -435,15 +442,17 @@ private void registerResourceMethod(string memberName, alias overload, alias par
 	if (attr.mimeType.length)
 		descriptor.mimeType = nullable(attr.mimeType);
 
-	// Fold any @resourceAnnotations UDA on the same method into the descriptor.
+	// Fold the positional value UDAs (@audience / @priority / @lastModified) on
+	// the same method into the descriptor's annotations. Absent UDAs leave the
+	// corresponding field unset (omitted from the wire form).
 	static foreach (a; __traits(getAttributes, overload))
 	{
-		static if (is(typeof(a) == resourceAnnotations))
-		{
-			descriptor.annotations.audience = a.audience;
-			descriptor.annotations.priority = a.priority;
-			descriptor.annotations.lastModified = a.lastModified;
-		}
+		static if (is(typeof(a) == audience))
+			descriptor.annotations.audience = a.roles;
+		else static if (is(typeof(a) == priority))
+			descriptor.annotations.priority = a.value;
+		else static if (is(typeof(a) == lastModified))
+			descriptor.annotations.lastModified = a.value;
 	}
 
 	// @icon UDAs -> descriptor.icons; @meta UDA -> descriptor._meta.
@@ -469,15 +478,17 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 	if (attr.mimeType.length)
 		descriptor.mimeType = nullable(attr.mimeType);
 
-	// Fold any @resourceAnnotations UDA on the same method into the descriptor.
+	// Fold the positional value UDAs (@audience / @priority / @lastModified) on
+	// the same method into the descriptor's annotations. Absent UDAs leave the
+	// corresponding field unset (omitted from the wire form).
 	static foreach (a; __traits(getAttributes, overload))
 	{
-		static if (is(typeof(a) == resourceAnnotations))
-		{
-			descriptor.annotations.audience = a.audience;
-			descriptor.annotations.priority = a.priority;
-			descriptor.annotations.lastModified = a.lastModified;
-		}
+		static if (is(typeof(a) == audience))
+			descriptor.annotations.audience = a.roles;
+		else static if (is(typeof(a) == priority))
+			descriptor.annotations.priority = a.value;
+		else static if (is(typeof(a) == lastModified))
+			descriptor.annotations.lastModified = a.value;
 	}
 
 	// @icon UDAs -> descriptor.icons; @meta UDA -> descriptor._meta.
@@ -550,8 +561,7 @@ version (unittest)
 		}
 
 		@tool("erase", "Erase a record", "Erase Record")
-		@toolAnnotations(destructiveHint : true.nullable, idempotentHint:
-				true.nullable) string erase(string id) @safe
+		@destructive @idempotent string erase(string id) @safe
 		{
 			return "erased " ~ id;
 		}
@@ -568,9 +578,8 @@ version (unittest)
 			return "document body";
 		}
 
-		@resource("test://readme", "Readme", "text/markdown") @resourceAnnotations(audience
-				: ["user"], priority:
-				0.9.nullable) string readme() @safe
+		@resource("test://readme", "Readme", "text/markdown")
+		@priority(0.9) @audience("user") string readme() @safe
 		{
 			return "readme body";
 		}
@@ -605,8 +614,7 @@ version (unittest)
 		@tool("draw", "Draw something")
 		@icon("https://example.com/draw.png", "image/png", ["48x48"])
 		@meta(parseJsonString(`{"category":"art"}`))
-		@toolAnnotations(readOnlyHint : true.nullable, title:
-				"Draw Tool") string draw(string spec) @safe
+		@readOnly @hintTitle("Draw Tool") string draw(string spec) @safe
 		{
 			return "drew " ~ spec;
 		}
@@ -787,7 +795,7 @@ unittest  // @prompt reflection: optional title is emitted in prompts/list
 	assert(foundIntro && foundSummary);
 }
 
-unittest  // @resourceAnnotations reflection: annotations appear in resources/list
+unittest  // @audience/@priority value UDAs: annotations appear in resources/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -810,11 +818,44 @@ unittest  // @resourceAnnotations reflection: annotations appear in resources/li
 		else if (uri == "test://doc")
 		{
 			foundDoc = true;
-			// A resource without @resourceAnnotations carries no annotations.
+			// A resource without annotation UDAs carries no annotations.
 			assert("annotations" !in res[i]);
 		}
 	}
 	assert(foundReadme && foundDoc);
+}
+
+unittest  // #300 @audience value UDA: multiple roles round-trip into annotations
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class MultiAudienceApi
+	{
+		@resource("test://both", "Both", "text/plain")
+		@audience("user", "assistant") @priority(0.5)
+		string both() @safe
+		{
+			return "both";
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new MultiAudienceApi);
+	auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
+			Json.emptyObject))).get["result"]["resources"];
+
+	Json bothRes;
+	foreach (i; 0 .. res.length)
+		if (res[i]["uri"].get!string == "test://both")
+			bothRes = res[i];
+	assert(bothRes.type == Json.Type.object);
+	auto anns = bothRes["annotations"];
+	assert(anns["audience"].length == 2);
+	assert(anns["audience"][0].get!string == "user");
+	assert(anns["audience"][1].get!string == "assistant");
+	assert(anns["priority"].get!double == 0.5);
+	// lastModified was not set, so it is omitted.
+	assert("lastModified" !in anns);
 }
 
 unittest  // @tool reflection: optional title is emitted in tools/list
@@ -834,7 +875,7 @@ unittest  // @tool reflection: optional title is emitted in tools/list
 	assert(eraseTool["title"].get!string == "Erase Record");
 }
 
-unittest  // @toolAnnotations reflection: hints are serialized into annotations
+unittest  // marker hint UDAs: hints are serialized into annotations
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -860,8 +901,42 @@ unittest  // @toolAnnotations reflection: hints are serialized into annotations
 	assert("readOnlyHint" !in anns);
 	assert("openWorldHint" !in anns);
 
-	// A tool without @toolAnnotations carries no annotations object.
+	// A tool without any hint UDA carries no annotations object.
 	assert("annotations" !in addTool);
+}
+
+unittest  // #300 marker-UDA hints: @readOnly + @hintTitle produce the wire shape
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class ReadOnlyApi
+	{
+		@tool("peek", "Read-only peek")
+		@readOnly @hintTitle("Peek")
+		string peek() @safe
+		{
+			return "peek";
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ReadOnlyApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+
+	Json peekTool;
+	foreach (i; 0 .. tools.length)
+		if (tools[i]["name"].get!string == "peek")
+			peekTool = tools[i];
+	assert(peekTool.type == Json.Type.object);
+	auto anns = peekTool["annotations"];
+	// The @readOnly marker sets readOnlyHint=true; @hintTitle sets the title.
+	assert(anns["readOnlyHint"].get!bool == true);
+	assert(anns["title"].get!string == "Peek");
+	// The unset markers are omitted entirely.
+	assert("destructiveHint" !in anns);
+	assert("idempotentHint" !in anns);
+	assert("openWorldHint" !in anns);
 }
 
 unittest  // @toolExecution reflection: execution.taskSupport appears in tools/list
@@ -980,7 +1055,7 @@ unittest  // #295 @meta UDA: tool descriptor `_meta` appears in tools/list
 	assert(drawTool["_meta"]["category"].get!string == "art");
 }
 
-unittest  // #295 @toolAnnotations title: annotation-level title appears in annotations
+unittest  // #295 @hintTitle: annotation-level title appears in annotations
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
