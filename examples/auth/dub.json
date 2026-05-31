@@ -1,0 +1,24 @@
+{
+	"name": "auth",
+	"description": "OAuth 2.1 (Authorization) MCP example: protected Streamable HTTP server + self-verifying client e2e",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp": { "path": "../.." }
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "auth-server",
+			"mainSourceFile": "server.d",
+			"sourceFiles": ["server.d"]
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "auth-client",
+			"mainSourceFile": "client.d",
+			"sourceFiles": ["client.d"]
+		}
+	]
+}
