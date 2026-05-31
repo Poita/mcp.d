@@ -309,6 +309,11 @@ Both suites run automatically in CI on every push and pull request via the
 version pinned for reproducibility. The job fails on any scenario failure,
 keeping the **server 38/38** and **client 287/287** baseline honest.
 
+## Contributing
+
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup,
+the build/test/lint commands, project conventions, and the PR flow.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
