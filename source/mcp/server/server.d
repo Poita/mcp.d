@@ -488,7 +488,7 @@ final class MCPServer
         if (resources.length > 0 || templates.length > 0)
             caps.resources = ResourcesCapability(resourceSubscriptionsEnabled,
                     resourcesListChangedEnabled);
-        if (prompts.length > 0)
+        if (prompts.length > 0 || promptsListChangedEnabled)
             caps.prompts = ListChangedCapability(promptsListChangedEnabled);
         if (completionHandler !is null || typedCompletionHandler !is null)
             caps.completions = true;
@@ -2833,6 +2833,20 @@ unittest  // prompts listChanged is not advertised by default
     auto caps = s.capabilities();
     assert(!caps.prompts.isNull);
     assert(!caps.prompts.get.listChanged);
+}
+
+unittest  // enablePromptListChanged advertises prompts capability with zero prompts registered
+{
+    // A server that will add prompts at runtime declares enablePromptListChanged()
+    // before any prompt is registered. Per 2025-11-25 prompts §Capabilities, it
+    // MUST still advertise the prompts capability so clients call prompts/list and
+    // expect notifications/prompts/list_changed.
+    auto s = new MCPServer("t", "1");
+    s.enablePromptListChanged();
+    auto caps = s.capabilities();
+    assert(!caps.prompts.isNull);
+    assert(caps.prompts.get.listChanged);
+    assert(caps.toJson()["prompts"]["listChanged"].get!bool);
 }
 
 unittest  // enablePromptListChanged advertises listChanged:true for prompts
