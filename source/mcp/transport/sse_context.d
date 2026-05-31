@@ -879,7 +879,9 @@ final class HttpStreamContext : RequestContext
 		p["level"] = level;
 		if (logger.length)
 			p["logger"] = logger;
-		p["data"] = data;
+		// `data` is REQUIRED by server/utilities/logging; emit explicit JSON
+		// null for an undefined payload so vibe does not drop the key.
+		p["data"] = data.type == Json.Type.undefined ? Json(null) : data;
 		writeEvent(makeNotification("notifications/message", p));
 	}
 
