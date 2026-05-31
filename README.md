@@ -338,6 +338,25 @@ void main()
 }
 ```
 
+Over stdio this synchronous style is fully supported: there is no event loop and
+no background tasks, yet the client still answers server-initiated requests
+(`ping`, `sampling/createMessage`, `elicitation/create`, `roots/list`) that arrive
+while one of your calls is in flight — the reply is written inline to the server's
+stdin from the same read loop. Wire your `onSampling` / `onElicitation` /
+`onListRoots` handlers before the first call and they are invoked synchronously.
+
+### The event-loop model
+
+`McpClient` speaks vibe.d async I/O, and there is one rule: **call every
+`McpClient` method from inside the vibe event loop.** Over HTTP that is required —
+the reply to a server→client request travels on a separate HTTP request and is
+sent from a background task, which only runs while `runEventLoop()` is pumping (see
+the HTTP client example above, which wraps its calls in `runTask` /
+`runEventLoop`). Over stdio the requirement is relaxed: the read loop is the only
+channel, so replies are sent inline and the synchronous `spawn` example above needs
+no event loop. If you prefer one uniform model, drive the stdio client from a
+`runTask` under `runEventLoop()` exactly like the HTTP example — both work.
+
 The same `McpClient` API (`initialize` / `listTools` / `callTool` /
 `listResources` / `readResource` / `listPrompts` / `getPrompt` / `subscribe` /
 `setLogLevel`) works over every transport. For a custom byte channel, use
