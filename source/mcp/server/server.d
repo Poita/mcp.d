@@ -1354,12 +1354,20 @@ final class MCPServer
 
 	private Json doSetLevel(Json params) @safe
 	{
-		// The logging feature is gated on the declared `logging` capability
-		// (server/utilities/logging: "Servers that emit log message notifications
-		// MUST declare the `logging` capability"). A server that never called
-		// enableLogging() advertises no logging capability, so this request is
-		// answered with -32601 (Capability not supported) rather than being
-		// handled, matching completion/complete's capability gating.
+		// The draft (2026-07-28) removed the `logging/setLevel` RPC: log level is
+		// now configured purely per-request via `_meta["io.modelcontextprotocol/
+		// logLevel"]` (SEP-2575/2577). The method does not exist on the draft, so
+		// it MUST be answered with -32601 (method not found) rather than accepted,
+		// regardless of whether the logging capability is enabled.
+		if (effectiveVersion.isDraft)
+			throw methodNotFound("logging/setLevel");
+		// On stable (<= 2025-11-25) versions the logging feature is gated on the
+		// declared `logging` capability (server/utilities/logging: "Servers that
+		// emit log message notifications MUST declare the `logging` capability").
+		// A server that never called enableLogging() advertises no logging
+		// capability, so this request is answered with -32601 (Capability not
+		// supported) rather than being handled, matching completion/complete's
+		// capability gating.
 		if (!loggingEnabled)
 			throw methodNotFound("logging/setLevel");
 		if (!("level" in params) || params["level"].type != Json.Type.string)
@@ -2537,6 +2545,21 @@ unittest  // logging/setLevel is rejected when the logging capability was never 
 	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 	// The level must not have been mutated by the rejected request.
+	assert(s.currentLogLevel == "info");
+}
+
+unittest  // draft: logging/setLevel is method-not-found (removed in 2026-07-28)
+{
+	// The draft (2026-07-28) removed the logging/setLevel RPC in favour of the
+	// per-request `_meta["io.modelcontextprotocol/logLevel"]` field (SEP-2575/2577).
+	// On the draft the method does not exist, so it MUST return -32601 even when
+	// the logging capability is enabled, and MUST NOT mutate session state.
+	auto s = makeTestServer();
+	s.enableLogging();
+	Json p = Json.emptyObject;
+	p["level"] = "debug";
+	auto resp = s.handle(draftReq(1, "logging/setLevel", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 	assert(s.currentLogLevel == "info");
 }
 
