@@ -1,10 +1,17 @@
 {
 	"name": "mcp",
 	"description": "Production-grade Model Context Protocol SDK for D",
+	"homepage": "https://github.com/Poita/mcp.d",
 	"license": "MIT",
+	"copyright": "Copyright © 2026 Peter Alexander",
 	"authors": [
 		"Peter Alexander"
 	],
+	"toolchainRequirements": {
+		"frontend": ">=2.100.0",
+		"dmd": ">=2.100.0",
+		"ldc": ">=1.30.0"
+	},
 	"targetType": "library",
 	"dependencies": {
 		"vibe-d:data": "~>0.9.8",
