@@ -136,7 +136,15 @@ final class McpServer
 	private Nullable!TasksCapability tasksCapability;
 	private Json extensions = Json.undefined;
 	private ProtocolVersion negotiated = latestStable;
-	private ProtocolVersion effectiveVersion = latestStable;
+	// The protocol version pinned for this CONNECTION's server-initiated push
+	// traffic (the standalone GET SSE stream / stdio listen channel). Set at
+	// `initialize` (to the negotiated version) and when a draft stdio
+	// `subscriptions/listen` session opens. It governs draft notification
+	// suppression/filtering on the unsolicited push path, which fires outside any
+	// request, so it cannot be a per-request value. Per-request dispatch no longer
+	// touches this field (issue #288): each request's effective version lives on
+	// its RequestScope.
+	private ProtocolVersion connectionVersion = latestStable;
 	private ClientCapabilities clientCaps;
 	private bool initialized;
 	// Per-list draft `CacheableResult` freshness hints, keyed by the list method
@@ -353,7 +361,7 @@ final class McpServer
 	{
 		if (!isSubscribed(uri))
 			return 0;
-		if (effectiveVersion.isDraft && !listensFor("resourceSubscriptions"))
+		if (connectionVersion.isDraft && !listensFor("resourceSubscriptions"))
 			return 0;
 		Json params = Json.emptyObject;
 		params["uri"] = uri;
@@ -631,7 +639,7 @@ final class McpServer
 
 		// Pin the effective version so notify-suppression gating (listensFor) and
 		// any subscriptionId stamping behave as draft for this listen session.
-		effectiveVersion = mv;
+		connectionVersion = mv;
 		clientCaps = meta.clientCapabilities;
 		// Record the opted-in filters; the one-shot {acknowledged:true} result is
 		// discarded (the spec defines no such Result — the ack is a notification).
@@ -671,7 +679,7 @@ final class McpServer
 		// stream's recorded filter opted in for the method (mirroring the GET-stream
 		// eligibility below). Without this branch a stdio listener receives nothing,
 		// since there is no `pushChannel` on the stdio transport.
-		if (stdioListenSink !is null && effectiveVersion.isDraft && globalListensForMethod(method))
+		if (stdioListenSink !is null && connectionVersion.isDraft && globalListensForMethod(method))
 		{
 			auto note = withSubscriptionId(makeNotification(method, params),
 					stdioListenSubscriptionId);
@@ -680,7 +688,7 @@ final class McpServer
 		}
 		if (pushChannel !is null)
 		{
-			if (effectiveVersion.isDraft)
+			if (connectionVersion.isDraft)
 			{
 				// Per-stream filtering: an active `subscriptions/listen` stream receives
 				// a type only if its own filter opted in. A plain GET listener (inactive
@@ -855,7 +863,11 @@ final class McpServer
 		// Determine the version in effect for THIS request. Draft+ is stateless:
 		// each request carries its protocol version, client identity, and
 		// capabilities in `params._meta` rather than relying on `initialize`.
-		effectiveVersion = negotiated;
+		// Computed into a request-local (and the per-request RequestScope) rather
+		// than a mutable field on the shared server instance, so a handler that
+		// yields mid-flight cannot have its effective version flipped by another
+		// concurrently-dispatched request (issue #288).
+		ProtocolVersion effective = negotiated;
 		auto meta = RequestMeta.fromParams(msg.params);
 		// On stateful (2025-era) protocols logging is governed once-per-session by
 		// `logging/setLevel`, so emission is always permitted (and filtered by the
@@ -870,10 +882,11 @@ final class McpServer
 			ProtocolVersion mv;
 			if (tryParseVersion(meta.protocolVersion, mv))
 			{
-				effectiveVersion = mv;
+				effective = mv;
 				if (mv.isDraft)
 				{
-					clientCaps = meta.clientCapabilities;
+					// Per-request client capabilities (draft, stateless): not stored on the
+					// shared instance. clientCapabilities() reflects the negotiated session.
 					if (meta.logLevel.isNull)
 					{
 						// No logLevel field -> the client did not request logging.
@@ -916,18 +929,17 @@ final class McpServer
 		// (MRTR vs blocking), the input responses carried on a retried draft
 		// request, and the cancellation token, regardless of which transport
 		// supplied the base context.
-		auto scoped = new RequestScope(ctx, effectiveVersion.usesMRTR,
-				readInputResponses(msg.params),
-				requestLogLevel, loggingRequested, token, readRequestState(msg.params));
+		auto scoped = new RequestScope(ctx, effective.usesMRTR, readInputResponses(msg.params),
+				requestLogLevel, loggingRequested, token, readRequestState(msg.params), effective);
 
 		try
 		{
-			auto result = route(msg.method, msg.params, scoped);
+			auto result = route(msg.method, msg.params, scoped, effective);
 			// Per spec, a receiver of a cancellation "SHOULD NOT send a response
 			// for the cancelled request" — suppress it if cancelled meanwhile.
 			if (token.cancelled)
 				return Nullable!Json.init;
-			return nullable(makeResponse(msg.id, stampResultType(result)));
+			return nullable(makeResponse(msg.id, stampResultType(result, effective)));
 		}
 		catch (McpException e)
 		{
@@ -1001,9 +1013,9 @@ final class McpServer
 	/// Apply a per-result draft cacheable-result hint when the effective version is
 	/// draft+ AND a hint was supplied for this result. A no-op for earlier versions
 	/// or when no hint is set, keeping 2025-11-25 wire output unchanged.
-	private Json maybeCache(Json result, Nullable!CacheHint hint) @safe
+	private Json maybeCache(Json result, Nullable!CacheHint hint, ProtocolVersion ver) @safe
 	{
-		if (effectiveVersion.cacheableResults && !hint.isNull)
+		if (ver.cacheableResults && !hint.isNull)
 			return withCache(result, hint.get);
 		return result;
 	}
@@ -1017,9 +1029,9 @@ final class McpServer
 	/// declare one — so an `InputRequiredResult` ("input_required") and
 	/// `DiscoverResult` (which set their own) are left untouched. A no-op for
 	/// pre-draft versions, keeping the 2025-era wire output unchanged.
-	private Json stampResultType(Json result) @safe
+	private Json stampResultType(Json result, ProtocolVersion ver) @safe
 	{
-		if (!effectiveVersion.isDraft)
+		if (!ver.isDraft)
 			return result;
 		if (result.type != Json.Type.object)
 			return result;
@@ -1147,7 +1159,7 @@ final class McpServer
 			token.cancel();
 	}
 
-	private Json route(string method, Json params, RequestContext ctx) @safe
+	private Json route(string method, Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
 		switch (method)
 		{
@@ -1156,31 +1168,36 @@ final class McpServer
 		case "server/discover":
 			return doDiscover();
 		case "subscriptions/listen":
+			// A draft subscriptions/listen opens a draft server->client push session;
+			// pin the connection's push-path version so later notify* gate as draft
+			// (issue #288: the per-request path no longer mutates this).
+			if (ver.isDraft)
+				connectionVersion = ver;
 			return doSubscribeListen(params);
 		case "ping":
 			return Json.emptyObject;
 		case "tools/list":
-			return doListTools(params);
+			return doListTools(params, ver);
 		case "tools/call":
 			return doCallTool(params, ctx);
 		case "resources/list":
-			return doListResources(params);
+			return doListResources(params, ver);
 		case "resources/templates/list":
-			return doListResourceTemplates(params);
+			return doListResourceTemplates(params, ver);
 		case "resources/read":
-			return doReadResource(params);
+			return doReadResource(params, ver);
 		case "resources/subscribe":
 			return doSubscribe(params);
 		case "resources/unsubscribe":
 			return doUnsubscribe(params);
 		case "prompts/list":
-			return doListPrompts(params);
+			return doListPrompts(params, ver);
 		case "prompts/get":
 			return doGetPrompt(params);
 		case "completion/complete":
 			return doComplete(params);
 		case "logging/setLevel":
-			return doSetLevel(params);
+			return doSetLevel(params, ver);
 		default:
 			throw methodNotFound(method);
 		}
@@ -1334,7 +1351,7 @@ final class McpServer
 		return lastListenFilter_;
 	}
 
-	private Json doListResources(Json params) @safe
+	private Json doListResources(Json params, ProtocolVersion ver) @safe
 	{
 		import std.algorithm : sort;
 
@@ -1348,10 +1365,10 @@ final class McpServer
 		foreach (uri; uris[begin .. end])
 			result.resources ~= resources[uri].descriptor;
 		result.nextCursor = next;
-		return maybeCache(result.toJson(), listHint("resources/list"));
+		return maybeCache(result.toJson(), listHint("resources/list"), ver);
 	}
 
-	private Json doListResourceTemplates(Json params) @safe
+	private Json doListResourceTemplates(Json params, ProtocolVersion ver) @safe
 	{
 		size_t begin, end;
 		Nullable!string next;
@@ -1361,10 +1378,10 @@ final class McpServer
 		foreach (t; templates[begin .. end])
 			result.resourceTemplates ~= t.descriptor;
 		result.nextCursor = next;
-		return maybeCache(result.toJson(), listHint("resources/templates/list"));
+		return maybeCache(result.toJson(), listHint("resources/templates/list"), ver);
 	}
 
-	private Json doReadResource(Json params) @safe
+	private Json doReadResource(Json params, ProtocolVersion ver) @safe
 	{
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/read requires a string 'uri'");
@@ -1374,7 +1391,7 @@ final class McpServer
 		{
 			ReadResourceResult result;
 			result.contents = [direct.reader()];
-			return maybeCache(result.toJson(), direct.cache);
+			return maybeCache(result.toJson(), direct.cache, ver);
 		}
 
 		foreach (t; templates)
@@ -1384,7 +1401,7 @@ final class McpServer
 			{
 				ReadResourceResult result;
 				result.contents = [t.reader(uri, captured)];
-				return maybeCache(result.toJson(), t.cache);
+				return maybeCache(result.toJson(), t.cache, ver);
 			}
 		}
 		// Draft aligns the code to invalidParams (-32602); older versions -32002.
@@ -1392,8 +1409,7 @@ final class McpServer
 		// clients can read the offending URI without parsing the message string.
 		Json data = Json.emptyObject;
 		data["uri"] = uri;
-		throw new McpException(effectiveVersion.resourceNotFoundCode,
-				"Resource not found: " ~ uri, data);
+		throw new McpException(ver.resourceNotFoundCode, "Resource not found: " ~ uri, data);
 	}
 
 	private Json doSubscribe(Json params) @safe
@@ -1412,7 +1428,7 @@ final class McpServer
 		return Json.emptyObject;
 	}
 
-	private Json doListPrompts(Json params) @safe
+	private Json doListPrompts(Json params, ProtocolVersion ver) @safe
 	{
 		import std.algorithm : sort;
 
@@ -1426,7 +1442,7 @@ final class McpServer
 		foreach (name; names[begin .. end])
 			result.prompts ~= prompts[name].descriptor;
 		result.nextCursor = next;
-		return maybeCache(result.toJson(), listHint("prompts/list"));
+		return maybeCache(result.toJson(), listHint("prompts/list"), ver);
 	}
 
 	/// The per-list draft cache hint configured for `listMethod`, or null if none.
@@ -1473,14 +1489,14 @@ final class McpServer
 		throw methodNotFound("completion/complete");
 	}
 
-	private Json doSetLevel(Json params) @safe
+	private Json doSetLevel(Json params, ProtocolVersion ver) @safe
 	{
 		// The draft (2026-07-28) removed the `logging/setLevel` RPC: log level is
 		// now configured purely per-request via `_meta["io.modelcontextprotocol/
 		// logLevel"]` (SEP-2575/2577). The method does not exist on the draft, so
 		// it MUST be answered with -32601 (method not found) rather than accepted,
 		// regardless of whether the logging capability is enabled.
-		if (effectiveVersion.isDraft)
+		if (ver.isDraft)
 			throw methodNotFound("logging/setLevel");
 		// On stable (<= 2025-11-25) versions the logging feature is gated on the
 		// declared `logging` capability (server/utilities/logging: "Servers that
@@ -1508,6 +1524,9 @@ final class McpServer
 		auto p = InitializeParams.fromJson(params);
 		negotiated = negotiate(p.protocolVersion);
 		clientCaps = p.capabilities;
+		// Pin the connection's push-path version so unsolicited server->client
+		// notifications gate correctly on draft after initialize (issue #288).
+		connectionVersion = negotiated;
 
 		InitializeResult result;
 		result.protocolVersion = negotiated.toWire;
@@ -1517,7 +1536,7 @@ final class McpServer
 		return result.toJson();
 	}
 
-	private Json doListTools(Json params) @safe
+	private Json doListTools(Json params, ProtocolVersion ver) @safe
 	{
 		auto names = sortedToolNames();
 		size_t begin, end;
@@ -1528,7 +1547,7 @@ final class McpServer
 		foreach (name; names[begin .. end])
 			result.tools ~= tools[name].descriptor;
 		result.nextCursor = next;
-		return maybeCache(result.toJson(), listHint("tools/list"));
+		return maybeCache(result.toJson(), listHint("tools/list"), ver);
 	}
 
 	private Json doCallTool(Json params, RequestContext ctx) @safe
@@ -3108,6 +3127,37 @@ unittest  // per-template registerResourceTemplate hint emits on a matching draf
 	assert(resp["result"]["cacheScope"].get!string == "public");
 }
 
+// issue #288: a concurrent (reentrant) request must not corrupt the effective
+// protocol version of an in-flight request. A draft tools/call whose handler
+// dispatches a pre-draft request mid-flight (standing in for a handler that
+// yields while another request is dispatched on the shared server) must still
+// have ITS result stamped per the draft (resultType:"complete"), and the
+// reentrant pre-draft request must stay unstamped. Before the fix both shared a
+// single mutable effectiveVersion field, so the inner pre-draft request flipped
+// it and the outer draft response lost its resultType.
+unittest
+{
+	auto s = new McpServer("t", "1");
+	Json innerResp = Json.undefined;
+	Tool yielder = {name: "yielder", description: nullable("reentrant")};
+	s.registerTool(yielder, (Json args, RequestContext ctx) @safe {
+		// Mid-handle: dispatch a DIFFERENT-version request on the same server.
+		// This is the interleave a yielding handler would expose under concurrency.
+		innerResp = s.handle(req(99, "tools/list")).get; // pre-draft (latestStable)
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+	// Outer request is on the draft protocol (per-request _meta).
+	auto outer = s.handle(draftCall(1, "yielder", [])).get;
+	assert("error" !in outer);
+	// The outer draft response keeps its own effective version: resultType present.
+	assert(outer["result"]["resultType"].get!string == "complete");
+	// The reentrant pre-draft response is independent: no draft stamping leaked in.
+	assert("error" !in innerResp);
+	assert("resultType" !in innerResp["result"]);
+}
+
 unittest  // draft results carry the mandatory resultType:"complete" discriminator
 {
 	auto s = makeTestServer();
@@ -3912,7 +3962,7 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 unittest  // draft: notifyPromptsListChanged suppressed unless client opted in
 {
 	auto s = new McpServer("t", "1");
-	s.effectiveVersion = ProtocolVersion.draft;
+	s.connectionVersion = ProtocolVersion.draft;
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
 	string[] received;

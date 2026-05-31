@@ -8,6 +8,7 @@ import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.types : ListRootsResult;
 import mcp.auth.resource_server : TokenInfo;
 import mcp.protocol.jsonrpc : makeNotification;
+import mcp.protocol.versions : ProtocolVersion, latestStable;
 
 @safe:
 
@@ -441,10 +442,11 @@ final class RequestScope : RequestContext
 	private string minLevel;
 	private bool loggingRequested;
 	private CancellationToken cancellation;
+	private ProtocolVersion effectiveVersion_;
 
 	this(RequestContext inner, bool stateless, Json[string] responses, string minLevel = "info",
 			bool loggingRequested = true, CancellationToken cancellation = null,
-			string requestState = "") @safe
+			string requestState = "", ProtocolVersion effectiveVersion = latestStable) @safe
 	{
 		this.inner = inner;
 		this.stateless = stateless;
@@ -453,6 +455,18 @@ final class RequestScope : RequestContext
 		this.minLevel = minLevel;
 		this.loggingRequested = loggingRequested;
 		this.cancellation = cancellation;
+		this.effectiveVersion_ = effectiveVersion;
+	}
+
+	/// The protocol version in effect for THIS request (negotiated version on the
+	/// stateful 2025-era protocols; the per-request `_meta.protocolVersion` on the
+	/// stateless draft). Request-scoped so a concurrent request that yields mid-
+	/// handle cannot have its effective version flipped by another in-flight
+	/// request: the dispatcher reads it from here, not from a mutable field on the
+	/// shared server instance.
+	ProtocolVersion effectiveVersion() @safe
+	{
+		return effectiveVersion_;
 	}
 
 	/// True once the client has cancelled this request via
