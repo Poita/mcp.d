@@ -4,6 +4,7 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
 import mcp.protocol.capabilities;
+import mcp.protocol.versions : ProtocolVersion;
 
 @safe:
 
@@ -117,9 +118,15 @@ private bool isAlphaNum(char c) @safe pure nothrow
     return isAlpha(c) || (c >= '0' && c <= '9');
 }
 
-/// Whether a `_meta` key's prefix is reserved for MCP use: the second label of
-/// the prefix is `modelcontextprotocol` or `mcp` (e.g. `io.modelcontextprotocol/`,
-/// `com.mcp/`). Such prefixes MUST NOT be used by non-protocol code.
+/// Whether a `_meta` key's prefix is reserved for MCP use, applying the rule for
+/// the 2025-11-25 / draft revisions: the SECOND dot-separated label of the prefix
+/// is `modelcontextprotocol` or `mcp` (e.g. `io.modelcontextprotocol/`, `com.mcp/`).
+/// `com.example.mcp/` is NOT reserved. Such prefixes MUST NOT be used by
+/// non-protocol code.
+///
+/// This version-agnostic overload preserves the 2025-11-25 / draft semantics. Use
+/// the `(string, ProtocolVersion)` overload when an effective protocol version is
+/// known, since 2025-06-18 uses a broader rule (see below).
 bool isReservedMetaPrefix(string key) @safe pure nothrow
 {
     ptrdiff_t slash = -1;
@@ -154,12 +161,74 @@ bool isReservedMetaPrefix(string key) @safe pure nothrow
     return second == "modelcontextprotocol" || second == "mcp";
 }
 
+/// Whether a `_meta` key's prefix is reserved for MCP use under the effective
+/// protocol version `v`. The two revisions differ:
+///
+/// - 2025-06-18 (basic/index): "Any prefix beginning with zero or more valid
+///   labels, followed by `modelcontextprotocol` or `mcp`, followed by any valid
+///   label, is reserved." So the mcp-token may appear in ANY position as long as
+///   at least one more label follows it — e.g. `modelcontextprotocol.io/`,
+///   `mcp.dev/`, `api.modelcontextprotocol.org/`, and `tools.mcp.com/` are all
+///   reserved. Earlier versions (2024-11-05, 2025-03-26) had no formal `_meta`
+///   reserved-prefix rule; this same any-position rule is applied to them as a
+///   safe superset.
+/// - 2025-11-25 / draft: the narrower "second label" rule (see the
+///   single-argument overload), where `com.example.mcp/` is NOT reserved.
+bool isReservedMetaPrefix(string key, ProtocolVersion v) @safe pure nothrow
+{
+    // 2025-11-25 and the draft use the narrower "second label" rule.
+    if (v >= ProtocolVersion.v2025_11_25)
+        return isReservedMetaPrefix(key);
+
+    // 2025-06-18 (and earlier, as a safe superset): an mcp-token in any label
+    // position that is followed by at least one further label reserves the prefix.
+    ptrdiff_t slash = -1;
+    foreach (i, char c; key)
+        if (c == '/')
+            slash = i;
+    if (slash < 0)
+        return false;
+    auto labels = key[0 .. slash];
+
+    size_t start = 0;
+    size_t labelIndex = 0;
+    size_t labelCount = 0;
+    // First count the labels so we can tell whether an mcp-token has a trailing label.
+    for (size_t i = 0; i <= labels.length; i++)
+        if (i == labels.length || labels[i] == '.')
+            labelCount++;
+
+    for (size_t i = 0; i <= labels.length; i++)
+    {
+        if (i == labels.length || labels[i] == '.')
+        {
+            auto label = labels[start .. i];
+            // Reserved only if this mcp-token is followed by at least one more label.
+            if ((label == "modelcontextprotocol" || label == "mcp") && labelIndex + 1 < labelCount)
+                return true;
+            labelIndex++;
+            start = i + 1;
+        }
+    }
+    return false;
+}
+
 /// Validate a user-supplied `_meta` key for attachment: it MUST be a
 /// well-formed key (`isValidMetaKey`) and MUST NOT use an MCP-reserved prefix
-/// (`isReservedMetaPrefix`). Returns `true` if the key is safe to use.
+/// (`isReservedMetaPrefix`). Returns `true` if the key is safe to use. Uses the
+/// 2025-11-25 / draft "second label" reserved-prefix rule; pass a
+/// `ProtocolVersion` to apply the rule for a specific connection.
 bool isUserMetaKeyAllowed(string key) @safe pure nothrow
 {
     return isValidMetaKey(key) && !isReservedMetaPrefix(key);
+}
+
+/// Validate a user-supplied `_meta` key for attachment under the effective
+/// protocol version `v`: it MUST be well-formed and MUST NOT use a prefix that is
+/// MCP-reserved for that version.
+bool isUserMetaKeyAllowed(string key, ProtocolVersion v) @safe pure nothrow
+{
+    return isValidMetaKey(key) && !isReservedMetaPrefix(key, v);
 }
 
 /// Stamp the draft `io.modelcontextprotocol/subscriptionId` (`MetaKey.subscriptionId`)
@@ -788,6 +857,77 @@ unittest  // isReservedMetaPrefix: second label modelcontextprotocol or mcp
     assert(!isReservedMetaPrefix("modelcontextprotocol/key")); // only one label, no second
     assert(!isReservedMetaPrefix("plainkey")); // no prefix at all
     assert(!isReservedMetaPrefix("a.b.mcp/key")); // mcp is third label, not second
+}
+
+unittest  // isReservedMetaPrefix(2025-06-18): mcp-token in first position + trailing label
+{
+    import mcp.protocol.versions : ProtocolVersion;
+
+    // Per 2025-06-18 basic/index, a prefix beginning with `modelcontextprotocol`
+    // or `mcp` followed by ANY valid label is reserved.
+    assert(isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_06_18));
+    assert(isReservedMetaPrefix("mcp.dev/key", ProtocolVersion.v2025_06_18));
+    assert(isReservedMetaPrefix("tools.mcp.com/key", ProtocolVersion.v2025_06_18));
+    assert(isReservedMetaPrefix("api.modelcontextprotocol.org/key", ProtocolVersion.v2025_06_18));
+    // Reserved when the token is the second label AND a trailing label follows.
+    assert(isReservedMetaPrefix("io.modelcontextprotocol.v2/key", ProtocolVersion.v2025_06_18));
+}
+
+unittest  // isReservedMetaPrefix(2025-06-18): not reserved without a trailing label or token
+{
+    import mcp.protocol.versions : ProtocolVersion;
+
+    // No following label after the mcp-token -> not reserved.
+    assert(!isReservedMetaPrefix("modelcontextprotocol/key", ProtocolVersion.v2025_06_18));
+    assert(!isReservedMetaPrefix("mcp/key", ProtocolVersion.v2025_06_18));
+    // No mcp-token at all.
+    assert(!isReservedMetaPrefix("io.example/key", ProtocolVersion.v2025_06_18));
+    // No prefix at all.
+    assert(!isReservedMetaPrefix("plainkey", ProtocolVersion.v2025_06_18));
+}
+
+unittest  // isReservedMetaPrefix(2025-11-25/draft): keeps the narrower second-label rule
+{
+    import mcp.protocol.versions : ProtocolVersion;
+
+    // First-position token is NOT reserved under 2025-11-25/draft (only the
+    // second label counts), so the draft/2025-11-25 wire behaviour is unchanged.
+    assert(!isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
+    assert(!isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.draft));
+    // `com.example.mcp/` has `mcp` as its THIRD label, so it is NOT reserved under
+    // the second-label rule (the 2025-11-25 spec's own counter-example).
+    assert(!isReservedMetaPrefix("com.example.mcp/key", ProtocolVersion.v2025_11_25));
+    assert(!isReservedMetaPrefix("com.example.mcp/key", ProtocolVersion.draft));
+    // Second-label token IS reserved under both.
+    assert(isReservedMetaPrefix("io.modelcontextprotocol/key", ProtocolVersion.v2025_11_25));
+    assert(isReservedMetaPrefix("com.mcp/key", ProtocolVersion.draft));
+    // The clean divergence: `modelcontextprotocol.io/` is reserved under 2025-06-18
+    // (first-position token + trailing label) but NOT under 2025-11-25 (second
+    // label is `io`).
+    assert(isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_06_18)
+            && !isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
+    // The version-agnostic overload must match the 2025-11-25/draft rule exactly.
+    assert(isReservedMetaPrefix("io.modelcontextprotocol/key",
+            ProtocolVersion.v2025_11_25) == isReservedMetaPrefix("io.modelcontextprotocol/key"));
+    assert(isReservedMetaPrefix("modelcontextprotocol.io/key",
+            ProtocolVersion.draft) == isReservedMetaPrefix("modelcontextprotocol.io/key"));
+}
+
+unittest  // isUserMetaKeyAllowed(2025-06-18) rejects first-position mcp-token prefixes
+{
+    import mcp.protocol.versions : ProtocolVersion;
+
+    // Reserved under 2025-06-18 (first-position token + trailing label, second
+    // label not an mcp-token) -> disallowed on a 2025-06-18 connection.
+    assert(!isUserMetaKeyAllowed("modelcontextprotocol.io/key", ProtocolVersion.v2025_06_18));
+    assert(!isUserMetaKeyAllowed("mcp.dev/key", ProtocolVersion.v2025_06_18));
+    // But allowed under 2025-11-25/draft, where those prefixes are not reserved
+    // (their second label is `io` / `dev`, not an mcp-token).
+    assert(isUserMetaKeyAllowed("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
+    assert(isUserMetaKeyAllowed("mcp.dev/key", ProtocolVersion.draft));
+    // A genuine vendor key is allowed on every version.
+    assert(isUserMetaKeyAllowed("com.example/myKey", ProtocolVersion.v2025_06_18));
+    assert(isUserMetaKeyAllowed("com.example/myKey", ProtocolVersion.v2025_11_25));
 }
 
 unittest  // isUserMetaKeyAllowed: valid and not reserved
