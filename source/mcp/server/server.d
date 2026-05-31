@@ -632,7 +632,7 @@ final class MCPServer
             // for the cancelled request" — suppress it if cancelled meanwhile.
             if (token.cancelled)
                 return Nullable!Json.init;
-            return nullable(makeResponse(msg.id, result));
+            return nullable(makeResponse(msg.id, stampResultType(result)));
         }
         catch (McpException e)
         {
@@ -703,6 +703,26 @@ final class MCPServer
     {
         if (effectiveVersion.cacheableResults)
             return withCache(result, cacheTtlMs, cacheScope_);
+        return result;
+    }
+
+    /// Stamp the mandatory draft `resultType` discriminator onto a result.
+    ///
+    /// The draft base `Result` requires a `resultType` field on every result
+    /// ("complete" for a finished response, "input_required" for an
+    /// `InputRequiredResult`). We add `resultType:"complete"` here, centralized
+    /// in the dispatch path, for any object result that does not already
+    /// declare one — so an `InputRequiredResult` ("input_required") and
+    /// `DiscoverResult` (which set their own) are left untouched. A no-op for
+    /// pre-draft versions, keeping the 2025-era wire output unchanged.
+    private Json stampResultType(Json result) @safe
+    {
+        if (!effectiveVersion.isDraft)
+            return result;
+        if (result.type != Json.Type.object)
+            return result;
+        if ("resultType" !in result)
+            result["resultType"] = "complete";
         return result;
     }
 
@@ -2200,6 +2220,32 @@ unittest  // pre-draft tools/list has no cache fields
     s.setCacheHint(5000);
     auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestStable
     assert("ttlMs" !in resp["result"]);
+}
+
+unittest  // draft results carry the mandatory resultType:"complete" discriminator
+{
+    auto s = makeTestServer();
+    // A representative success result built through the central dispatch path.
+    auto resp = s.handle(draftReq(2, "tools/list")).get;
+    assert("error" !in resp);
+    assert(resp["result"]["resultType"].get!string == "complete");
+}
+
+unittest  // pre-draft results never emit resultType (wire output unchanged)
+{
+    auto s = makeTestServer();
+    auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestStable
+    assert("error" !in resp);
+    assert("resultType" !in resp["result"]);
+}
+
+unittest  // draft InputRequiredResult is stamped resultType:"input_required", not "complete"
+{
+    auto s = new MCPServer("t", "1");
+    registerBookTool(s);
+    auto resp = s.handle(draftCall(1, "book", [])).get;
+    assert("error" !in resp);
+    assert(resp["result"]["resultType"].get!string == "input_required");
 }
 
 unittest  // draft resources/read unknown uri uses invalidParams (-32602)
