@@ -289,11 +289,25 @@ byte channel; `spawnStdioClient` is the convenience wrapper around
 
 ## Running the conformance suite
 
+Server suite:
+
 ```bash
 dub build -c conformance-server
 ./conformance-server --port 3000 &
-npx @modelcontextprotocol/conformance server --url http://127.0.0.1:3000/mcp
+npx @modelcontextprotocol/conformance@0.1.16 server --url http://127.0.0.1:3000/mcp
 ```
+
+Client suite:
+
+```bash
+dub build -c conformance-client
+npx @modelcontextprotocol/conformance@0.1.16 client --command ./conformance-client --suite all
+```
+
+Both suites run automatically in CI on every push and pull request via the
+[`Conformance`](.github/workflows/conformance.yml) workflow, with the harness
+version pinned for reproducibility. The job fails on any scenario failure,
+keeping the **server 38/38** and **client 287/287** baseline honest.
 
 ## License
 
