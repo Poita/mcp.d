@@ -1938,6 +1938,114 @@ unittest  // ProgressNotification tolerates a non-object payload
     assert(n.progressToken.type == Json.Type.undefined);
 }
 
+/// The severity of a `notifications/message`, per server/utilities/logging. The
+/// eight levels follow the syslog severities (RFC 5424); ordered most verbose
+/// (`debug`) to most severe (`emergency`).
+enum LogLevel : string
+{
+    debug_ = "debug",
+    info = "info",
+    notice = "notice",
+    warning = "warning",
+    error = "error",
+    critical = "critical",
+    alert = "alert",
+    emergency = "emergency"
+}
+
+/// A typed `notifications/message` payload, per server/utilities/logging: the
+/// notification carries `params: {level, logger?, data}`. `level` is one of the
+/// eight `LogLevel` severities, `logger` an optional name of the emitting
+/// component, and `data` an arbitrary JSON value (commonly a string or object).
+/// Parsed from an inbound notification's `params` so clients receive a
+/// structured value rather than hand-parsing raw JSON.
+struct LogMessageNotification
+{
+    /// The severity level (raw string, as on the wire). Compare against
+    /// `LogLevel` values; an unrecognised level is preserved verbatim.
+    string level;
+    /// The optional name of the logger/component that emitted the message
+    /// (`null` when the server omits it).
+    Nullable!string logger;
+    /// The log payload — any JSON value; `Json.undefined` if absent.
+    Json data = Json.undefined;
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        j["level"] = level;
+        if (!logger.isNull)
+            j["logger"] = logger.get;
+        j["data"] = data;
+        return j;
+    }
+
+    /// Parse the `params` object of a `notifications/message`. Tolerant of a
+    /// missing/ill-typed payload (returns a default-valued struct).
+    static LogMessageNotification fromJson(Json params) @safe
+    {
+        LogMessageNotification n;
+        if (params.type != Json.Type.object)
+            return n;
+        if ("level" in params && params["level"].type == Json.Type.string)
+            n.level = params["level"].get!string;
+        if ("logger" in params && params["logger"].type == Json.Type.string)
+            n.logger = params["logger"].get!string;
+        if ("data" in params)
+            n.data = params["data"];
+        return n;
+    }
+}
+
+unittest  // LogMessageNotification parses level, logger and data
+{
+    Json p = Json.emptyObject;
+    p["level"] = "warning";
+    p["logger"] = "db";
+    p["data"] = "disk almost full";
+    auto n = LogMessageNotification.fromJson(p);
+    assert(n.level == "warning");
+    assert(n.level == LogLevel.warning);
+    assert(!n.logger.isNull && n.logger.get == "db");
+    assert(n.data.get!string == "disk almost full");
+}
+
+unittest  // LogMessageNotification keeps logger null when absent and accepts structured data
+{
+    Json p = Json.emptyObject;
+    p["level"] = "info";
+    Json d = Json.emptyObject;
+    d["count"] = 3;
+    p["data"] = d;
+    auto n = LogMessageNotification.fromJson(p);
+    assert(n.level == "info");
+    assert(n.logger.isNull);
+    assert(n.data["count"].get!long == 3);
+}
+
+unittest  // LogMessageNotification tolerates a non-object payload
+{
+    auto n = LogMessageNotification.fromJson(Json("not an object"));
+    assert(n.level == "");
+    assert(n.logger.isNull);
+    assert(n.data.type == Json.Type.undefined);
+}
+
+unittest  // LogMessageNotification.toJson round-trips through fromJson
+{
+    LogMessageNotification n;
+    n.level = LogLevel.error;
+    n.logger = "net";
+    n.data = Json("timeout");
+    auto j = n.toJson();
+    assert(j["level"].get!string == "error");
+    assert(j["logger"].get!string == "net");
+    auto back = LogMessageNotification.fromJson(j);
+    assert(back.level == "error");
+    assert(back.logger.get == "net");
+    assert(back.data.get!string == "timeout");
+}
+
 unittest  // Resource serializes required + optional fields
 {
     Resource r = {uri: "test://x", name: "x", description: nullable("d")};
