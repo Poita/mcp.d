@@ -24,14 +24,62 @@ import mcp.protocol.errors : McpException, invalidParams;
 struct SamplingMessage
 {
 	string role; /// "user" or "assistant"
-	Content content;
+	/// All content blocks of the message. The spec models a sampling message's
+	/// `content` as a single block OR an array of blocks
+	/// (`SamplingMessageContentBlock | SamplingMessageContentBlock[]`, schema.ts).
+	/// A tool-loop follow-up request carries multiple blocks: an assistant
+	/// message with several `tool_use` blocks and a user message with several
+	/// `tool_result` blocks. This field holds every block so none is dropped.
+	/// For the common single-block message, use the `content` accessor.
+	Content[] contentBlocks;
 	Json meta = Json.undefined; /// optional message-level `_meta` object (schema.ts: SamplingMessage._meta)
+
+	/// Construct a single-block message (back-compat convenience).
+	this(string role, Content c, Json meta = Json.undefined) @safe
+	{
+		this.role = role;
+		this.contentBlocks = [c];
+		this.meta = meta;
+	}
+
+	/// Construct a multi-block message (e.g. parallel `tool_use`/`tool_result`).
+	this(string role, Content[] blocks, Json meta = Json.undefined) @safe
+	{
+		this.role = role;
+		this.contentBlocks = blocks;
+		this.meta = meta;
+	}
+
+	/// The first (or only) content block, for the common single-block message.
+	/// Returns an empty text block when there are no blocks. For tool-loop
+	/// messages (which carry several blocks) iterate `contentBlocks`.
+	Content content() const @safe
+	{
+		return contentBlocks.length ? contentBlocks[0].dupSelf() : Content.makeText("");
+	}
+
+	/// Set the message to a single content block (back-compat convenience).
+	void content(Content c) @safe
+	{
+		contentBlocks = [c];
+	}
 
 	Json toJson() const @safe
 	{
 		Json j = Json.emptyObject;
 		j["role"] = role;
-		j["content"] = content.toJson();
+		// Preserve the single-object wire shape for the common one-block message
+		// (no change to existing output); emit an array only for multi-block
+		// (tool-loop) messages, both of which the spec accepts.
+		if (contentBlocks.length == 1)
+			j["content"] = contentBlocks[0].toJson();
+		else
+		{
+			Json arr = Json.emptyArray;
+			foreach (b; contentBlocks)
+				arr ~= b.toJson();
+			j["content"] = arr;
+		}
 		if (meta.type == Json.Type.object)
 			j["_meta"] = meta;
 		return j;
@@ -41,8 +89,18 @@ struct SamplingMessage
 	{
 		SamplingMessage m;
 		m.role = ("role" in j) ? j["role"].get!string : "";
+		// `content` may be a single block (object) or an array of blocks; accept
+		// both so a tool-loop follow-up (array of tool_use/tool_result blocks)
+		// round-trips without dropping any block.
 		if ("content" in j)
-			m.content = Content.fromJson(j["content"]);
+		{
+			auto c = j["content"];
+			if (c.type == Json.Type.array)
+				foreach (i; 0 .. c.length)
+					m.contentBlocks ~= Content.fromJson(c[i]);
+			else
+				m.contentBlocks ~= Content.fromJson(c);
+		}
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			m.meta = j["_meta"];
 		return m;
@@ -526,6 +584,82 @@ unittest  // SamplingMessage omits _meta when none is set (no wire change)
 {
 	auto m = SamplingMessage("user", Content.makeText("hi"));
 	assert("_meta" !in m.toJson());
+}
+
+unittest  // single-block SamplingMessage keeps the single-object wire shape (no regress)
+{
+	// A one-block message must serialize `content` as a single object exactly as
+	// before this change, so 2025-11-25/2025-06-18 wire output is unchanged.
+	auto m = SamplingMessage("user", Content.makeText("hi"));
+	auto j = m.toJson();
+	assert(j["content"].type == Json.Type.object);
+	assert(j["content"]["type"].get!string == "text");
+}
+
+unittest  // SamplingMessage holds multiple blocks and emits a content array
+{
+	// schema.ts SamplingMessage: `content: SamplingMessageContentBlock | SamplingMessageContentBlock[]`.
+	auto m = SamplingMessage("assistant", [
+		Content.makeToolUse("call_1", "get_weather"),
+		Content.makeToolUse("call_2", "get_time")
+	]);
+	auto j = m.toJson();
+	assert(j["content"].type == Json.Type.array);
+	assert(j["content"].length == 2);
+	assert(j["content"][0]["type"].get!string == "tool_use");
+	assert(j["content"][1]["id"].get!string == "call_2");
+}
+
+unittest  // SamplingMessage.fromJson parses an array of blocks without dropping any
+{
+	// The old single-Content field silently dropped every block of an array
+	// (Content.fromJson fell through to an empty TextContent). Parse all blocks.
+	Json arr = Json.emptyArray;
+	arr ~= Content.makeToolResult("call_1", [Content.makeText("18C")]).toJson();
+	arr ~= Content.makeToolResult("call_2", [Content.makeText("noon")]).toJson();
+	Json msg = Json.emptyObject;
+	msg["role"] = "user";
+	msg["content"] = arr;
+	auto m = SamplingMessage.fromJson(msg);
+	assert(m.role == "user");
+	assert(m.contentBlocks.length == 2);
+	assert(m.contentBlocks[0].kind == ContentKind.toolResult);
+	assert(m.contentBlocks[0].toolUseId == "call_1");
+	assert(m.contentBlocks[1].toolUseId == "call_2");
+}
+
+unittest  // spec Multi-turn Tool Loop follow-up request round-trips intact
+{
+	// 2025-11-25 "Multi-turn Tool Loop" follow-up request: an assistant message
+	// of parallel tool_use blocks followed by a user message of parallel
+	// tool_result blocks ("Tool Use and Result Balance"). Every block must
+	// survive a toJson -> fromJson round trip.
+	Json weatherInput = Json.emptyObject;
+	weatherInput["location"] = "Paris";
+	auto assistant = SamplingMessage("assistant", [
+		Content.makeToolUse("call_1", "get_weather", weatherInput),
+		Content.makeToolUse("call_2", "get_time")
+	]);
+	auto user = SamplingMessage("user", [
+		Content.makeToolResult("call_1", [Content.makeText("18C and sunny")]),
+		Content.makeToolResult("call_2", [Content.makeText("12:00")])
+	]);
+
+	auto a2 = SamplingMessage.fromJson(assistant.toJson());
+	assert(a2.role == "assistant");
+	assert(a2.contentBlocks.length == 2);
+	assert(a2.contentBlocks[0].kind == ContentKind.toolUse);
+	assert(a2.contentBlocks[0].id == "call_1");
+	assert(a2.contentBlocks[0].name == "get_weather");
+	assert(a2.contentBlocks[0].input["location"].get!string == "Paris");
+	assert(a2.contentBlocks[1].id == "call_2");
+
+	auto u2 = SamplingMessage.fromJson(user.toJson());
+	assert(u2.role == "user");
+	assert(u2.contentBlocks.length == 2);
+	assert(u2.contentBlocks[0].kind == ContentKind.toolResult);
+	assert(u2.contentBlocks[0].toolUseId == "call_1");
+	assert(u2.contentBlocks[1].toolUseId == "call_2");
 }
 
 unittest  // ModelPreferences emits hints and priorities; empty omits all
