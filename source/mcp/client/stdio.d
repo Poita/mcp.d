@@ -298,7 +298,7 @@ unittest  // McpClient over a stdio transport drives an in-process server (initi
 	// immediately and its response queued for the client to read back.
 	auto server = new McpServer("stdio-client-srv", "1.0");
 	Tool echo = {name: "echo"};
-	server.registerTool(echo, (Json args) @safe {
+	server.registerDynamicTool(echo, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;

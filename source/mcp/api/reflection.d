@@ -334,7 +334,7 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 	{
 		// MRTR-capable tool: the method itself returns a ToolResponse, so it may
 		// answer `inputRequired` (stateless elicitation) as well as `complete`.
-		server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
 			alias names = ParameterIdentifierTuple!overload;
 			Tuple!(Parameters!overload) argv;
 			static foreach (i, P; Parameters!overload)
@@ -349,7 +349,7 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 	}
 	else
 	{
-		server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
 			alias names = ParameterIdentifierTuple!overload;
 			Tuple!(Parameters!overload) argv;
 			static foreach (i, P; Parameters!overload)
@@ -403,7 +403,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 					Nullable!string.init, !isInstanceOf!(Nullable, P));
 	}
 
-	server.registerPrompt(descriptor, (Json args) @safe {
+	server.registerDynamicPrompt(descriptor, (Json args) @safe {
 		Tuple!(Parameters!overload) argv;
 		static foreach (i, P; Parameters!overload)
 		{

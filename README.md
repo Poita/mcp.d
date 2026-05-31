@@ -180,8 +180,10 @@ string crunch(int count, RequestContext ctx) @safe
 ```
 
 Prefer dynamic registration (e.g. tools known only at runtime)? The lower-level
-`server.registerTool(Tool, delegate)` / `registerResource` / `registerPrompt`
-API is available too — `registerHandlers` is built on top of it.
+`server.registerDynamicTool(Tool, delegate)` / `registerResource` /
+`registerDynamicPrompt` API is the explicit escape hatch for runtime-defined
+tools/prompts whose schema has no compile-time D type — the handler receives the
+raw `Json` arguments. `registerHandlers` is built on top of it.
 
 ### Protecting an HTTP server (OAuth 2.1 Resource Server)
 
