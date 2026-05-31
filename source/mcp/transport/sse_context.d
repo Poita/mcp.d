@@ -954,6 +954,61 @@ unittest  // the priming event is sent ONLY on 2025-11-25
 	assert(!sendsPrimingEvent(ProtocolVersion.draft));
 }
 
+/// Whether the server SHOULD emit an SSE `retry:` field before closing a
+/// connection that it is *not* terminating (so the client knows how long to
+/// wait before reconnecting). This is a 2025-11-25-only SHOULD
+/// (basic/transports §Sending Messages item 6 / §Listening for Messages item 4):
+/// "If the server does close the connection prior to terminating the SSE stream,
+/// it SHOULD send an SSE event with a standard `retry` field before closing the
+/// connection." It builds on the 2025-11-25 connection/stream split (reconnect
+/// via Last-Event-ID), which does not exist in 2025-03-26 / 2025-06-18, and the
+/// draft dropped Last-Event-ID resumability — so this MUST NOT alter those
+/// versions' wire output. Gated here as a single pure predicate so the version
+/// boundary is directly testable.
+bool sendsRetryOnClose(ProtocolVersion v) @safe pure nothrow
+{
+	return v == ProtocolVersion.v2025_11_25;
+}
+
+unittest  // the retry-on-close hint is sent ONLY on 2025-11-25
+{
+	assert(sendsRetryOnClose(ProtocolVersion.v2025_11_25));
+	assert(!sendsRetryOnClose(ProtocolVersion.v2025_06_18));
+	assert(!sendsRetryOnClose(ProtocolVersion.v2025_03_26));
+	assert(!sendsRetryOnClose(ProtocolVersion.v2024_11_05));
+	// The draft drops Last-Event-ID resumability, so no reconnect hint there.
+	assert(!sendsRetryOnClose(ProtocolVersion.draft));
+}
+
+/// Frame a standalone Server-Sent Events `retry:` event carrying the
+/// reconnection time in milliseconds (per the SSE standard's `retry` field:
+/// https://html.spec.whatwg.org/multipage/server-sent-events.html). The server
+/// SHOULD send this before closing a connection it is not terminating; the
+/// client MUST then wait the given number of milliseconds before reconnecting
+/// (basic/transports §Sending Messages item 6). A bare `retry:` event carries no
+/// `data:` line, so it updates the client's reconnection time without dispatching
+/// any JSON-RPC payload.
+string formatRetryEvent(uint ms) @safe
+{
+	import std.conv : to;
+
+	return "retry: " ~ ms.to!string ~ "\n\n";
+}
+
+unittest  // a retry event is a bare `retry:` line with the delay in ms
+{
+	assert(formatRetryEvent(3000) == "retry: 3000\n\n");
+}
+
+unittest  // the retry event carries no data: line (no JSON-RPC payload)
+{
+	import std.string : indexOf;
+
+	const frame = formatRetryEvent(1500);
+	assert(frame.indexOf("data:") < 0);
+	assert(frame.indexOf("retry: 1500") == 0);
+}
+
 /// Frame the 2025-11-25 leading "priming" SSE event: an `id:` line carrying the
 /// stream's next event id followed by an empty `data:` field (basic/transports
 /// §Sending Messages item 6 — "an SSE event consisting of an event ID and an
