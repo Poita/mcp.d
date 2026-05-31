@@ -1939,6 +1939,12 @@ struct CompletionReference
     string name;
     /// Resource (template) URI (for `ref/resource`).
     string uri;
+    /// Optional human-readable display title for the prompt (`ref/prompt`
+    /// only). `PromptReference extends BaseMetadata`, so a prompt reference may
+    /// carry BaseMetadata's optional `title`. Has no meaning for `ref/resource`
+    /// (`ResourceTemplateReference` does not extend BaseMetadata) and is never
+    /// serialized in that case.
+    Nullable!string title;
 
     /// Build a reference to a prompt argument.
     static CompletionReference forPrompt(string name) @safe
@@ -1957,9 +1963,17 @@ struct CompletionReference
         Json j = Json.emptyObject;
         j["type"] = type;
         if (type == "ref/resource")
+        {
             j["uri"] = uri;
+        }
         else
+        {
             j["name"] = name;
+            // PromptReference extends BaseMetadata, so emit the optional
+            // display title when present (prompt references only).
+            if (!title.isNull)
+                j["title"] = title.get;
+        }
         return j;
     }
 }
@@ -2006,6 +2020,8 @@ struct CompleteRequest
                 r.reference.type = refJson["type"].get!string;
             if ("name" in refJson && refJson["name"].type == Json.Type.string)
                 r.reference.name = refJson["name"].get!string;
+            if ("title" in refJson && refJson["title"].type == Json.Type.string)
+                r.reference.title = nullable(refJson["title"].get!string);
             if ("uri" in refJson && refJson["uri"].type == Json.Type.string)
                 r.reference.uri = refJson["uri"].get!string;
         }
@@ -2508,6 +2524,54 @@ unittest  // CompletionReference.forResource builds a ref/resource with a uri
     assert(j["type"].get!string == "ref/resource");
     assert(j["uri"].get!string == "file:///{path}");
     assert("name" !in j);
+}
+
+unittest  // CompletionReference omits title for ref/prompt when unset
+{
+    // PromptReference extends BaseMetadata: `title` is optional and MUST be
+    // absent on the wire when not provided.
+    auto j = CompletionReference.forPrompt("greet").toJson();
+    assert("title" !in j);
+}
+
+unittest  // CompletionReference emits title for ref/prompt when set
+{
+    // PromptReference extends BaseMetadata, so a `ref/prompt` reference may
+    // carry the optional human-readable `title` alongside `name`.
+    auto refr = CompletionReference.forPrompt("greet");
+    refr.title = nullable("Greeting");
+    auto j = refr.toJson();
+    assert(j["type"].get!string == "ref/prompt");
+    assert(j["name"].get!string == "greet");
+    assert(j["title"].get!string == "Greeting");
+}
+
+unittest  // CompletionReference never emits title for ref/resource
+{
+    // ResourceTemplateReference does NOT extend BaseMetadata; it has only
+    // `type` and `uri`, so `title` must never appear even if set.
+    auto refr = CompletionReference.forResource("file:///{path}");
+    refr.title = nullable("ignored");
+    auto j = refr.toJson();
+    assert("title" !in j);
+    assert("name" !in j);
+    assert(j["uri"].get!string == "file:///{path}");
+}
+
+unittest  // CompleteRequest.fromJson parses the optional ref/prompt title
+{
+    auto refr = CompletionReference.forPrompt("greet");
+    refr.title = nullable("Greeting");
+    Json p = Json.emptyObject;
+    p["ref"] = refr.toJson();
+    Json arg = Json.emptyObject;
+    arg["name"] = "who";
+    arg["value"] = "al";
+    p["argument"] = arg;
+    auto r = CompleteRequest.fromJson(p);
+    assert(r.reference.name == "greet");
+    assert(!r.reference.title.isNull);
+    assert(r.reference.title.get == "Greeting");
 }
 
 unittest  // CompleteRequest.fromJson parses a prompt reference
