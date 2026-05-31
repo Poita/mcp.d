@@ -92,6 +92,60 @@ McpException resourceNotFound(string uri, Json data = Json.undefined) @safe pure
     return new McpException(ErrorCode.resourceNotFound, "Resource not found: " ~ uri, data);
 }
 
+/// True if `url` is a valid absolute URI suitable for a URL-mode elicitation.
+///
+/// Per client/elicitation §"URL Mode Elicitation Requests" (2025-11-25) the
+/// `url` parameter MUST contain a valid URL, and its schema marks the field
+/// `format: uri`. This requires an absolute URI: a non-empty scheme (a letter
+/// followed by letters/digits/`+`/`-`/`.`) followed by `:` and a hierarchical
+/// `//authority` with a non-empty host. Relative references, bare strings such
+/// as `"not a url"`, and `scheme:`-only values are rejected. Validation is
+/// permissive about the path/query/fragment so any real `https://…` consent or
+/// OAuth URL passes.
+bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
+{
+    import std.ascii : isAlpha, isAlphaNum;
+
+    if (url.length == 0)
+        return false;
+
+    // Scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":" (RFC 3986 §3.1)
+    if (!isAlpha(url[0]))
+        return false;
+    size_t i = 1;
+    while (i < url.length)
+    {
+        const c = url[i];
+        if (isAlphaNum(c) || c == '+' || c == '-' || c == '.')
+            i++;
+        else
+            break;
+    }
+    if (i >= url.length || url[i] != ':')
+        return false;
+    i++; // consume ':'
+
+    // Require a hierarchical authority ("//host…"). URL-mode elicitation always
+    // points at a navigable web location, so opaque (authority-less) URIs such
+    // as `mailto:` or `urn:` are not accepted.
+    if (i + 2 > url.length || url[i] != '/' || url[i + 1] != '/')
+        return false;
+    i += 2; // consume "//"
+
+    // Authority must contain a non-empty host (terminated by '/', '?' or '#').
+    // Strip any "userinfo@" prefix before checking the host is non-empty.
+    size_t authEnd = i;
+    while (authEnd < url.length && url[authEnd] != '/' && url[authEnd] != '?' && url[authEnd] != '#')
+        authEnd++;
+    auto authority = url[i .. authEnd];
+    foreach (j, c; authority)
+    {
+        if (c == '@')
+            authority = authority[j + 1 .. $]; // host is whatever follows last '@'
+    }
+    return authority.length > 0;
+}
+
 /// A single URL-mode elicitation entry carried by a `-32042`
 /// `URLElicitationRequiredError` (2025-11-25 elicitation §"URL Elicitation
 /// Required Error"). Each entry directs the user to complete an out-of-band
@@ -123,7 +177,8 @@ struct UrlElicitation
 /// `{mode:"url", elicitationId, url, message}`.
 ///
 /// At least one elicitation is required, and every entry MUST have a non-empty
-/// `elicitationId` and `url`; otherwise this throws.
+/// `elicitationId` and a `url` that is a valid absolute URI (per the spec's
+/// `format: uri` / "MUST contain a valid URL"); otherwise this throws.
 McpException urlElicitationRequired(const UrlElicitation[] elicitations,
         string message = "URL elicitation required") @safe
 {
@@ -135,7 +190,8 @@ McpException urlElicitationRequired(const UrlElicitation[] elicitations,
     foreach (const ref e; elicitations)
     {
         enforce(e.elicitationId.length > 0, "URL elicitation requires a non-empty elicitationId");
-        enforce(e.url.length > 0, "URL elicitation requires a non-empty url");
+        enforce(isValidElicitationUrl(e.url),
+                "URL elicitation requires a valid url (absolute URI): " ~ e.url);
         arr ~= e.toJson();
     }
     Json data = Json.emptyObject;
@@ -317,4 +373,41 @@ unittest  // missingRequiredClientCapability accepts a custom message
     auto e = missingRequiredClientCapability(req, "needs sampling");
     assert(e.code == ErrorCode.missingRequiredClientCapability);
     assert(e.msg == "needs sampling");
+}
+
+unittest  // isValidElicitationUrl accepts ordinary https/http URLs
+{
+    assert(isValidElicitationUrl("https://example.com/consent"));
+    assert(isValidElicitationUrl("http://example.com"));
+    assert(isValidElicitationUrl("https://mcp.example.com/connect?elicitationId=abc#frag"));
+    assert(isValidElicitationUrl("https://user@host.example/path"));
+}
+
+unittest  // isValidElicitationUrl rejects malformed / non-absolute values
+{
+    assert(!isValidElicitationUrl(""));
+    assert(!isValidElicitationUrl("not a url"));
+    assert(!isValidElicitationUrl("example.com"));
+    assert(!isValidElicitationUrl("/relative/path"));
+    assert(!isValidElicitationUrl("https://")); // no host
+    assert(!isValidElicitationUrl("https:///path")); // empty authority
+    assert(!isValidElicitationUrl("mailto:user@example.com")); // no //authority
+    assert(!isValidElicitationUrl("://example.com")); // no scheme
+}
+
+unittest  // urlElicitationRequired throws on a malformed url
+{
+    import std.exception : assertThrown;
+
+    auto bad = [UrlElicitation("elic-1", "not a url", "msg")];
+    assertThrown(urlElicitationRequired(bad));
+}
+
+unittest  // urlElicitationRequired accepts a valid absolute url
+{
+    auto ok = [UrlElicitation("elic-1", "https://example.com/connect", "msg")];
+    auto e = urlElicitationRequired(ok);
+    assert(e.code == ErrorCode.urlElicitationRequired);
+    assert(e.data["elicitations"].length == 1);
+    assert(e.data["elicitations"][0]["url"].get!string == "https://example.com/connect");
 }
