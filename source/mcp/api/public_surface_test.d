@@ -74,6 +74,33 @@ unittest
 	static assert(visibleFromMcp!"RequestContext");
 }
 
+// User-facing draft result/hint types referenced by lean-surface members
+// (`McpServer.setListCacheHint(string, CacheHint)` and `McpClient.discover()`
+// returning `DiscoverResult`) must be usable with `import mcp;` alone (#399).
+unittest
+{
+	static assert(visibleFromMcp!"DiscoverResult");
+	static assert(visibleFromMcp!"CacheHint");
+	static assert(visibleFromMcp!"CacheScope");
+	static assert(visibleFromMcp!"RequestMeta");
+}
+
+// A user with only `import mcp;` can construct a CacheHint to call
+// setListCacheHint and name DiscoverResult to hold discover()'s return (#399).
+unittest
+{
+	import mcp;
+
+	CacheHint hint = CacheHint(5000, CacheScope.private_);
+	assert(hint.ttlMs == 5000);
+	assert(hint.cacheScope == CacheScope.private_);
+
+	DiscoverResult r;
+	r.protocolVersions = ["2025-11-25"];
+	// Spec wire field is `supportedVersions` (draft DiscoverResult).
+	assert(r.toJson()["supportedVersions"][0].get!string == "2025-11-25");
+}
+
 // Auth verifier internals are NOT dumped at the top level (#301).
 unittest
 {
