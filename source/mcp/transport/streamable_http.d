@@ -861,20 +861,37 @@ unittest  // only a draft subscriptions/listen opens the long-lived stream
 /// notification carrying the agreed-upon subset of change-notification types the
 /// server will deliver on the stream (draft basic/utilities/subscriptions). The
 /// `subset` is what `MCPServer.acknowledgedListenSubset` reported.
+///
+/// Per the draft spec the agreed subset is nested under `params.notifications`
+/// (mirroring the `notifications` filter the client sent in the listen request);
+/// the matching `io.modelcontextprotocol/subscriptionId` is stamped into
+/// `params._meta` by the push channel when the event is delivered to the stream.
 Json subscriptionsAcknowledgedNotification(Json subset) @safe
 {
-    return makeNotification("notifications/subscriptions/acknowledged", subset);
+    Json params = Json.emptyObject;
+    params["notifications"] = subset;
+    return makeNotification("notifications/subscriptions/acknowledged", params);
 }
 
-unittest  // the acknowledgement carries the agreed subset as its params
+unittest  // the acknowledgement nests the agreed subset under params.notifications
 {
     Json subset = Json.emptyObject;
     subset["toolsListChanged"] = true;
     auto n = subscriptionsAcknowledgedNotification(subset);
     assert(n["method"].get!string == "notifications/subscriptions/acknowledged");
-    assert(n["params"]["toolsListChanged"].get!bool);
+    // draft basic/utilities/subscriptions: the agreed subset is wrapped under
+    // `params.notifications`, not placed at the top level of params.
+    assert(n["params"]["notifications"]["toolsListChanged"].get!bool);
+    assert("toolsListChanged" !in n["params"]);
     // It is a notification: no id.
     assert("id" !in n);
+}
+
+unittest  // an empty agreed subset still produces an empty params.notifications object
+{
+    auto n = subscriptionsAcknowledgedNotification(Json.emptyObject);
+    assert(n["params"]["notifications"].type == Json.Type.object);
+    assert(n["params"]["notifications"].length == 0);
 }
 
 /// Render a JSON scalar the way the draft requires for `Mcp-Param-*` header
@@ -1063,6 +1080,8 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
     push.emitTo(lid, subscriptionsAcknowledgedNotification(server.acknowledgedListenSubset()));
     assert(frames.length == 1);
     assert(frames[0].canFind("notifications/subscriptions/acknowledged"));
+    // The agreed subset is nested under params.notifications (draft spec shape).
+    assert(frames[0].canFind("\"notifications\""));
     assert(frames[0].canFind("toolsListChanged"));
     // The ack is the FIRST message and carries the subscriptionId (the listen id).
     assert(frames[0].canFind(cast(string) MetaKey.subscriptionId));
