@@ -132,6 +132,7 @@ final class MCPServer
     private bool resourcesListChangedEnabled;
     private bool promptsListChangedEnabled;
     private bool validateOutputSchema_;
+    private bool validateInputSchema_;
     // In-flight requests, keyed by their JSON-RPC id (string form), each holding
     // a shared cancellation token. Populated for the duration of a request so an
     // inbound `notifications/cancelled` can flip the matching token and the
@@ -210,6 +211,21 @@ final class MCPServer
     void enableOutputSchemaValidation() @safe
     {
         validateOutputSchema_ = true;
+    }
+
+    /// Opt in to validating each tool call's `arguments` against the tool's
+    /// registered `inputSchema` before the handler is invoked. Per the spec
+    /// (server/tools § Security Considerations, all versions), "Servers MUST:
+    /// Validate all tool inputs"; § Error Handling classifies invalid
+    /// arguments as a *protocol* error. With validation enabled, a `tools/call`
+    /// whose arguments are missing a required property or have the wrong type
+    /// is rejected with a JSON-RPC -32602 (Invalid params) error before the
+    /// handler runs, mirroring the existing required-argument check for prompts.
+    /// Tools without an `inputSchema` are unaffected. Off by default to
+    /// preserve existing behaviour.
+    void enableInputSchemaValidation() @safe
+    {
+        validateInputSchema_ = true;
     }
 
     /// Broadcast a `notifications/tools/list_changed` to every client listening
@@ -1185,6 +1201,15 @@ final class MCPServer
             throw invalidParams("Unknown tool: " ~ name);
 
         Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
+        // Validate the supplied arguments against the tool's declared inputSchema
+        // before dispatch (spec: server/tools § Security Considerations,
+        // "Servers MUST: Validate all tool inputs"). A structural violation
+        // (missing required property or wrong type) is an invalid-argument
+        // *protocol* error per § Error Handling, so it surfaces as -32602
+        // rather than an isError result. Gated behind the same opt-in style as
+        // output-schema validation to preserve existing behaviour.
+        if (validateInputSchema_)
+            checkInputSchema(entry.descriptor, args);
         try
         {
             // CallToolResult or InputRequiredResult.
@@ -1204,6 +1229,22 @@ final class MCPServer
             err.isError = true;
             return err.toJson();
         }
+    }
+
+    /// When input-schema validation is enabled, verify that a tool call's
+    /// `arguments` conform to the tool's registered `inputSchema`. No-op when
+    /// the tool has no input schema. Throws an `McpException` with -32602
+    /// (Invalid params) on a violation, since invalid arguments are a protocol
+    /// error per the spec's tools Error Handling section.
+    private static void checkInputSchema(ref const Tool descriptor, Json args) @safe
+    {
+        import mcp.api.schema : validateAgainstSchema;
+
+        if (descriptor.inputSchema.type != Json.Type.object)
+            return;
+        const msg = validateAgainstSchema(args, descriptor.inputSchema);
+        if (msg.length)
+            throw invalidParams("Invalid arguments for tool '" ~ descriptor.name ~ "': " ~ msg);
     }
 
     /// When output-schema validation is enabled, verify that a tool result's
@@ -1572,6 +1613,118 @@ unittest  // output-schema validation is off by default: bad output still ships
     auto resp = s.handle(req(9, "tools/call", params)).get;
     assert("error" !in resp);
     assert(resp["result"]["structuredContent"]["result"].get!string == "oops");
+}
+
+unittest  // input-schema validation: a missing required argument yields -32602
+{
+    import mcp.api.schema : jsonSchemaOf;
+
+    auto s = new MCPServer("vsrv", "0.1.0");
+    struct AddArgs
+    {
+        int a;
+        int b;
+    }
+
+    Tool add = {
+        name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!AddArgs
+    };
+    s.registerTool(add, (Json args) @safe {
+        CallToolResult r;
+        r.content = [Content.makeText("ok")];
+        return r;
+    });
+    s.enableInputSchemaValidation();
+
+    Json params = Json.emptyObject;
+    params["name"] = "add";
+    params["arguments"] = Json(["a": Json(1)]); // missing required 'b'
+    auto resp = s.handle(req(20, "tools/call", params)).get;
+    assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // input-schema validation: a wrong-typed argument yields -32602
+{
+    import mcp.api.schema : jsonSchemaOf;
+
+    auto s = new MCPServer("vsrv", "0.1.0");
+    struct AddArgs
+    {
+        int a;
+    }
+
+    Tool add = {
+        name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!AddArgs
+    };
+    s.registerTool(add, (Json args) @safe {
+        CallToolResult r;
+        r.content = [Content.makeText("ok")];
+        return r;
+    });
+    s.enableInputSchemaValidation();
+
+    Json params = Json.emptyObject;
+    params["name"] = "add";
+    params["arguments"] = Json(["a": Json("not-an-int")]);
+    auto resp = s.handle(req(21, "tools/call", params)).get;
+    assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // input-schema validation: conforming arguments dispatch normally
+{
+    import mcp.api.schema : jsonSchemaOf;
+
+    auto s = new MCPServer("vsrv", "0.1.0");
+    struct AddArgs
+    {
+        int a;
+        int b;
+    }
+
+    Tool add = {
+        name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!AddArgs
+    };
+    s.registerTool(add, (Json args) @safe {
+        CallToolResult r;
+        r.content = [Content.makeText("ok")];
+        return r;
+    });
+    s.enableInputSchemaValidation();
+
+    Json params = Json.emptyObject;
+    params["name"] = "add";
+    params["arguments"] = Json(["a": Json(1), "b": Json(2)]);
+    auto resp = s.handle(req(22, "tools/call", params)).get;
+    assert("error" !in resp);
+    assert(resp["result"]["content"][0]["text"].get!string == "ok");
+}
+
+unittest  // input-schema validation is off by default: missing argument still dispatches
+{
+    import mcp.api.schema : jsonSchemaOf;
+
+    auto s = new MCPServer("vsrv", "0.1.0");
+    struct AddArgs
+    {
+        int a;
+        int b;
+    }
+
+    Tool add = {
+        name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!AddArgs
+    };
+    s.registerTool(add, (Json args) @safe {
+        CallToolResult r;
+        r.content = [Content.makeText("ok")];
+        return r;
+    });
+
+    Json params = Json.emptyObject;
+    params["name"] = "add";
+    params["arguments"] = Json(["a": Json(1)]); // missing 'b', but validation is off
+    auto resp = s.handle(req(23, "tools/call", params)).get;
+    assert("error" !in resp);
+    assert(resp["result"]["content"][0]["text"].get!string == "ok");
 }
 
 unittest  // a tool handler that throws becomes an isError result, not a protocol error
