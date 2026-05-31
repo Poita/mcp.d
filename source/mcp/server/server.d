@@ -399,15 +399,18 @@ final class McpServer
 		enableToolsListChanged();
 	}
 
-	/// Opt in to validating each tool's `structuredContent` against its
-	/// registered `outputSchema` before the result is sent. Per the spec,
-	/// "If an output schema is provided: Servers MUST provide structured results
-	/// that conform to this schema." With validation enabled, a handler that
-	/// emits non-conforming `structuredContent` surfaces a clear internal error
-	/// (so the bug is caught at the server) rather than silently shipping bad
-	/// output. Tools without an `outputSchema`, and results without
-	/// `structuredContent`, are unaffected. Off by default to preserve existing
-	/// behaviour.
+	/// Opt in to enforcing each tool's declared `outputSchema` before the
+	/// result is sent. Per the spec, "If an output schema is provided: Servers
+	/// MUST provide structured results that conform to this schema." With
+	/// validation enabled, both halves of that MUST are enforced: a successful
+	/// result for a tool that declares an `outputSchema` must (a) carry
+	/// `structuredContent` and (b) have it conform to the schema. A handler that
+	/// omits `structuredContent` or emits non-conforming `structuredContent`
+	/// surfaces a clear internal error (so the bug is caught at the server)
+	/// rather than silently shipping bad output. Tools without an `outputSchema`
+	/// are unaffected; tool-execution errors (`isError:true`) and MRTR
+	/// `InputRequiredResult`s are exempt (the MUST governs successful structured
+	/// results). Off by default to preserve existing behaviour.
 	void enableOutputSchemaValidation() @safe
 	{
 		validateOutputSchema_ = true;
@@ -1828,18 +1831,41 @@ final class McpServer
 		return null;
 	}
 
-	/// When output-schema validation is enabled, verify that a tool result's
-	/// `structuredContent` conforms to the tool's registered `outputSchema`.
-	/// No-op when the tool has no output schema or the result carries no
-	/// structured content. Throws an internal `McpException` on a violation.
+	/// When output-schema validation is enabled, enforce the spec's Output Schema
+	/// contract (2025-06-18+ server/tools): "If an output schema is provided:
+	/// Servers MUST provide structured results that conform to this schema."
+	/// This has two halves, both enforced here:
+	///   1. Presence — a successful result MUST carry `structuredContent`.
+	///   2. Conformance — that `structuredContent` MUST validate against the
+	///      tool's `outputSchema`.
+	/// No-op when the tool declares no output schema. A tool *execution* error
+	/// (`isError:true`) and an `InputRequiredResult` (MRTR — `inputRequests`
+	/// only, no `content`) are exempt: the MUST governs successful structured
+	/// results, not error reports or input-gathering round trips. Throws an
+	/// internal `McpException` on a violation.
 	private static void checkOutputSchema(ref const Tool descriptor, Json result) @safe
 	{
 		import mcp.api.schema : validateAgainstSchema;
 
 		if (descriptor.outputSchema.type != Json.Type.object)
 			return;
-		if (result.type != Json.Type.object || "structuredContent" !in result)
+		if (result.type != Json.Type.object)
 			return;
+		// A tool-execution error reports failure via `isError:true` with text
+		// content (no structuredContent); the MUST does not apply to it.
+		if ("isError" in result && result["isError"].type == Json.Type.bool_
+				&& result["isError"].get!bool)
+			return;
+		// An InputRequiredResult is a distinct result shape (only `inputRequests`,
+		// no `content`); it is not a structured tool output.
+		if ("inputRequests" in result && "content" !in result)
+			return;
+		// Presence half of the MUST: a successful result with a declared
+		// outputSchema must provide structuredContent.
+		if ("structuredContent" !in result)
+			throw new McpException(ErrorCode.internalError, "Tool '" ~ descriptor.name
+					~ "' declares an outputSchema but produced no structuredContent; "
+					~ "the spec requires servers to provide structured results that conform to the schema");
 		const msg = validateAgainstSchema(result["structuredContent"], descriptor.outputSchema);
 		if (msg.length)
 			throw new McpException(ErrorCode.internalError, "Tool '" ~ descriptor.name
@@ -2479,6 +2505,94 @@ unittest  // output-schema validation is off by default: bad output still ships
 	auto resp = s.handle(req(9, "tools/call", params)).get;
 	assert("error" !in resp);
 	assert(resp["result"]["structuredContent"]["result"].get!string == "oops");
+}
+
+unittest  // output-schema validation: missing structuredContent is a violation (#391)
+{
+	import mcp.api.schema : jsonSchemaOf;
+
+	auto s = new McpServer("vsrv", "0.1.0");
+	struct AddResult
+	{
+		int result;
+	}
+
+	Tool add = {
+		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
+	};
+	// Tool declares an outputSchema but returns only bare text, no structuredContent.
+	// Spec (2025-06-18 server/tools, Output Schema): "If an output schema is
+	// provided: Servers MUST provide structured results that conform to this
+	// schema." A missing structuredContent must therefore be flagged.
+	s.registerDynamicTool(add, (Json args) @safe {
+		CallToolResult r;
+		r.content = [Content.makeText("sum")];
+		return r;
+	});
+	s.enableOutputSchemaValidation();
+
+	Json params = Json.emptyObject;
+	params["name"] = "add";
+	auto resp = s.handle(req(91, "tools/call", params)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.internalError);
+}
+
+unittest  // output-schema validation: an isError result is exempt from the structuredContent MUST (#391)
+{
+	import mcp.api.schema : jsonSchemaOf;
+
+	auto s = new McpServer("vsrv", "0.1.0");
+	struct AddResult
+	{
+		int result;
+	}
+
+	Tool add = {
+		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
+	};
+	// A tool *execution* error reports failure via isError:true with text
+	// content and no structuredContent. The "MUST provide structured results"
+	// rule applies to successful results, so an isError result must not be
+	// turned into an internal protocol error.
+	s.registerDynamicTool(add, (Json args) @safe {
+		CallToolResult r;
+		r.content = [Content.makeText("boom")];
+		r.isError = true;
+		return r;
+	});
+	s.enableOutputSchemaValidation();
+
+	Json params = Json.emptyObject;
+	params["name"] = "add";
+	auto resp = s.handle(req(92, "tools/call", params)).get;
+	assert("error" !in resp);
+	assert(resp["result"]["isError"].get!bool == true);
+}
+
+unittest  // output-schema validation off: missing structuredContent still ships (#391)
+{
+	import mcp.api.schema : jsonSchemaOf;
+
+	auto s = new McpServer("vsrv", "0.1.0");
+	struct AddResult
+	{
+		int result;
+	}
+
+	Tool add = {
+		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
+	};
+	s.registerDynamicTool(add, (Json args) @safe {
+		CallToolResult r;
+		r.content = [Content.makeText("sum")];
+		return r;
+	});
+
+	Json params = Json.emptyObject;
+	params["name"] = "add";
+	auto resp = s.handle(req(93, "tools/call", params)).get;
+	assert("error" !in resp);
+	assert("structuredContent" !in resp["result"]);
 }
 
 unittest  // input-schema validation: a missing required argument yields an isError result
