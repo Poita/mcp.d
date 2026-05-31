@@ -1671,16 +1671,25 @@ struct CompleteResult
     bool hasMore;
     Json meta; /// optional result-level `_meta` object
 
+    /// The spec hard-caps `completion.values` at 100 items
+    /// (schema `@maxItems 100`: "Must not exceed 100 items.").
+    enum size_t maxValues = 100;
+
     Json toJson() const @safe
     {
         Json completion = Json.emptyObject;
         Json arr = Json.emptyArray;
-        foreach (v; values)
+        // Cap at the spec's max of 100 so the SDK can never emit a
+        // schema-violating completion result.
+        immutable truncated = values.length > maxValues;
+        foreach (v; values[0 .. truncated ? maxValues : values.length])
             arr ~= Json(v);
         completion["values"] = arr;
         if (!total.isNull)
             completion["total"] = total.get;
-        completion["hasMore"] = hasMore;
+        // When values are truncated there are necessarily more options
+        // available, so report hasMore even if the caller did not.
+        completion["hasMore"] = hasMore || truncated;
         Json j = Json.emptyObject;
         j["completion"] = completion;
         if (meta.type == Json.Type.object)
@@ -1968,6 +1977,44 @@ unittest  // CompleteResult.fromJson tolerates a missing completion envelope
     assert(r.values.length == 0);
     assert(r.total.isNull);
     assert(!r.hasMore);
+}
+
+unittest  // CompleteResult caps serialized values at the spec's max of 100
+{
+    CompleteResult r;
+    foreach (i; 0 .. 150)
+        r.values ~= "v";
+    auto j = r.toJson();
+    assert(j["completion"]["values"].length == 100);
+}
+
+unittest  // CompleteResult sets hasMore when values are truncated to 100
+{
+    CompleteResult r;
+    foreach (i; 0 .. 101)
+        r.values ~= "v";
+    auto j = r.toJson();
+    assert(j["completion"]["hasMore"].get!bool == true);
+}
+
+unittest  // CompleteResult preserves a caller-supplied total when truncating
+{
+    CompleteResult r;
+    foreach (i; 0 .. 150)
+        r.values ~= "v";
+    r.total = 150;
+    auto j = r.toJson();
+    assert(j["completion"]["total"].get!int == 150);
+    assert(j["completion"]["values"].length == 100);
+}
+
+unittest  // CompleteResult leaves <=100 values untouched and hasMore unchanged
+{
+    CompleteResult r;
+    r.values = ["a", "b", "c"];
+    auto j = r.toJson();
+    assert(j["completion"]["values"].length == 3);
+    assert(j["completion"]["hasMore"].get!bool == false);
 }
 
 unittest  // CompletionReference.forPrompt builds a ref/prompt with a name
