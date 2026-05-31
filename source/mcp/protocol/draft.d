@@ -410,24 +410,64 @@ string[string] paramHeaderMap(Json inputSchema) @safe
 /// `roots/list` request).
 struct InputRequest
 {
-    string id; /// correlation id chosen by the server
+    string id; /// correlation id chosen by the server (the `InputRequests` map key)
     string type; /// "sampling" | "elicitation" | "roots"
     Json params = Json.emptyObject; /// the would-be request params
 
+    /// The spec wire `method` for this request's `type`: an `InputRequests` value
+    /// is a request object whose `method` is the full JSON-RPC method name
+    /// (`elicitation/create`, `sampling/createMessage`, `roots/list`) — not the
+    /// short internal discriminator.
+    static string methodForType(string type) @safe pure nothrow
+    {
+        switch (type)
+        {
+        case "elicitation":
+            return "elicitation/create";
+        case "sampling":
+            return "sampling/createMessage";
+        case "roots":
+            return "roots/list";
+        default:
+            return type;
+        }
+    }
+
+    /// Inverse of `methodForType`: recover the short internal discriminator from
+    /// the spec wire `method`.
+    static string typeForMethod(string method) @safe pure nothrow
+    {
+        switch (method)
+        {
+        case "elicitation/create":
+            return "elicitation";
+        case "sampling/createMessage":
+            return "sampling";
+        case "roots/list":
+            return "roots";
+        default:
+            return method;
+        }
+    }
+
+    /// Serialize this request as an `InputRequests` *value* (the request object):
+    /// a `{ method, params }` object. The `id` is the surrounding map key and is
+    /// therefore not part of the value (see `InputRequiredResult.toJson`).
     Json toJson() const @safe
     {
         Json j = Json.emptyObject;
-        j["id"] = id;
-        j["type"] = type;
+        j["method"] = methodForType(type);
         j["params"] = params;
         return j;
     }
 
-    static InputRequest fromJson(Json j) @safe
+    /// Parse an `InputRequests` value (request object) given its map `key` (the
+    /// server-assigned id).
+    static InputRequest fromJson(string key, Json j) @safe
     {
         InputRequest r;
-        r.id = ("id" in j) ? j["id"].get!string : "";
-        r.type = ("type" in j) ? j["type"].get!string : "";
+        r.id = key;
+        r.type = ("method" in j) ? typeForMethod(j["method"].get!string) : "";
         if ("params" in j)
             r.params = j["params"];
         return r;
@@ -442,30 +482,53 @@ struct InputRequiredResult
 
     Json toJson() const @safe
     {
-        Json arr = Json.emptyArray;
-        foreach (r; inputRequests)
-            arr ~= r.toJson();
         Json j = Json.emptyObject;
         // Base draft Result mandates a `resultType` discriminator on every
         // result; an InputRequiredResult declares "input_required" so the
         // client knows to gather input and retry rather than treat this as a
         // completed response.
         j["resultType"] = "input_required";
-        j["inputRequests"] = arr;
+        // SEP-2322: `inputRequests` is an `InputRequests` object — a map whose
+        // keys are the server-assigned ids and whose values are request objects
+        // (`{ method, params }`), not an array.
+        j["inputRequests"] = inputRequestsToJson(inputRequests);
         return j;
     }
 
     static InputRequiredResult fromJson(Json j) @safe
     {
         InputRequiredResult r;
-        if ("inputRequests" in j && j["inputRequests"].type == Json.Type.array)
-        {
-            auto arr = j["inputRequests"];
-            foreach (i; 0 .. arr.length)
-                r.inputRequests ~= InputRequest.fromJson(arr[i]);
-        }
+        if ("inputRequests" in j)
+            r.inputRequests = inputRequestsFromJson(j["inputRequests"]);
         return r;
     }
+}
+
+/// Serialize a list of `InputRequest`s as a spec `InputRequests` object: a map
+/// keyed by each request's server-assigned `id`, with `{ method, params }`
+/// request objects as values (SEP-2322, draft basic/utilities/mrtr).
+Json inputRequestsToJson(const(InputRequest)[] requests) @safe
+{
+    Json obj = Json.emptyObject;
+    foreach (r; requests)
+        obj[r.id] = r.toJson();
+    return obj;
+}
+
+/// Parse a spec `InputRequests` object (map keyed by id) back into the internal
+/// `InputRequest` list. A non-object value yields no requests.
+InputRequest[] inputRequestsFromJson(Json j) @safe
+{
+    InputRequest[] requests;
+    if (j.type == Json.Type.object)
+    {
+        // `Json.opApply` is `@system`; iterating a plain object is safe here.
+        () @trusted {
+            foreach (string key, Json value; j)
+                requests ~= InputRequest.fromJson(key, value);
+        }();
+    }
+    return requests;
 }
 
 /// A client's answer to one `InputRequest`, supplied on the retried request via
@@ -571,6 +634,37 @@ unittest  // InputRequiredResult.toJson carries resultType:"input_required"
     assert("inputRequests" in j);
 }
 
+unittest  // SEP-2322: inputRequests serializes as a map keyed by id, value {method, params}
+{
+    InputRequiredResult r;
+    r.inputRequests = [
+        InputRequest("github_login", "elicitation", Json(["message": Json("hi")]))
+    ];
+    auto j = r.toJson();
+    // The `InputRequests` field MUST be a JSON object (map), not an array.
+    assert(j["inputRequests"].type == Json.Type.object);
+    // Keyed by the server-assigned id.
+    assert("github_login" in j["inputRequests"]);
+    auto value = j["inputRequests"]["github_login"];
+    // Value is a request object with the full JSON-RPC `method`, no `id`/`type`.
+    assert(value["method"].get!string == "elicitation/create");
+    assert("id" !in value);
+    assert("type" !in value);
+    assert(value["params"]["message"].get!string == "hi");
+}
+
+unittest  // SEP-2322: sampling/roots methods map to their full JSON-RPC names
+{
+    InputRequiredResult r;
+    r.inputRequests = [
+        InputRequest("s1", "sampling", Json.emptyObject),
+        InputRequest("r1", "roots", Json.emptyObject)
+    ];
+    auto j = r.toJson();
+    assert(j["inputRequests"]["s1"]["method"].get!string == "sampling/createMessage");
+    assert(j["inputRequests"]["r1"]["method"].get!string == "roots/list");
+}
+
 unittest  // DiscoverResult.toJson carries the required resultType discriminator
 {
     DiscoverResult d;
@@ -612,7 +706,9 @@ unittest  // MRTR InputRequiredResult round-trips and input responses parse
     ];
     auto back = InputRequiredResult.fromJson(ir.toJson());
     assert(back.inputRequests.length == 1);
+    assert(back.inputRequests[0].id == "r1");
     assert(back.inputRequests[0].type == "elicitation");
+    assert(back.inputRequests[0].params["message"].get!string == "hi");
 
     Json meta = Json.emptyObject;
     Json arr = Json.emptyArray;
