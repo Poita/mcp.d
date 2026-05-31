@@ -1,0 +1,959 @@
+module mcp.auth.login;
+
+/**
+ * Turnkey interactive OAuth login for MCP clients.
+ *
+ * Wraps the lower-level `OAuthClient` primitives (`mcp.auth.client`) into a
+ * single call -- `useOAuth(client, endpoint, opts)` -- that performs
+ * protected-resource / authorization-server discovery, selects a
+ * client-registration approach (pre-registered / Client ID Metadata Document /
+ * Dynamic Client Registration), runs the OAuth 2.1 authorization-code + PKCE
+ * flow by opening the system browser and capturing the redirect on a localhost
+ * loopback HTTP listener, persists the resulting tokens through a pluggable
+ * `TokenStore` (default: file-backed), and transparently refreshes the access
+ * token on expiry before each request.
+ *
+ * Loopback redirect URIs (`http://localhost:<port>/callback`) are explicitly
+ * permitted by the MCP authorization spec: "All redirect URIs MUST be either
+ * `localhost` or use HTTPS." PKCE S256 is enforced by the underlying
+ * `OAuthClient`, and the RFC 8707 `resource` parameter is sent on both the
+ * authorization and token requests.
+ */
+
+import vibe.data.json : Json, parseJsonString;
+
+import mcp.protocol.errors;
+import mcp.auth.oauth;
+import mcp.auth.client;
+import mcp.client.client : MCPClient;
+
+@safe:
+
+// ===========================================================================
+// Token storage
+// ===========================================================================
+
+/// A persisted OAuth token set for a single resource (MCP server). `expiresAt`
+/// is an absolute Unix timestamp (seconds) at which the access token expires; 0
+/// means "no known expiry" (treated as never auto-refreshed on a timer).
+struct StoredToken
+{
+    string accessToken;
+    string tokenType = "Bearer";
+    long expiresAt; // absolute unix seconds; 0 == unknown / no expiry
+    string refreshToken;
+    string scope_;
+    string resource;
+
+    /// Whether this record holds a usable access token.
+    bool hasToken() const @safe pure nothrow @nogc
+    {
+        return accessToken.length > 0;
+    }
+
+    /// Build a `StoredToken` from a freshly issued `TokenSet`, computing the
+    /// absolute expiry from `now + expiresIn` (only when `expiresIn` is
+    /// positive). A `TokenSet` from a refresh that omits `refresh_token` keeps
+    /// `prevRefresh` (RFC 6749 allows the AS to reissue or retain it).
+    static StoredToken fromTokenSet(TokenSet ts, string resource, long now, string prevRefresh = "") @safe pure nothrow
+    {
+        StoredToken s;
+        s.accessToken = ts.accessToken;
+        s.tokenType = ts.tokenType.length ? ts.tokenType : "Bearer";
+        s.expiresAt = ts.expiresIn > 0 ? now + ts.expiresIn : 0;
+        s.refreshToken = ts.refreshToken.length ? ts.refreshToken : prevRefresh;
+        s.scope_ = ts.scope_;
+        s.resource = resource;
+        return s;
+    }
+
+    Json toJson() const @safe
+    {
+        auto j = Json.emptyObject;
+        j["access_token"] = accessToken;
+        j["token_type"] = tokenType;
+        j["expires_at"] = Json(expiresAt);
+        j["refresh_token"] = refreshToken;
+        j["scope"] = scope_;
+        j["resource"] = resource;
+        return j;
+    }
+
+    static StoredToken fromJson(Json j) @safe
+    {
+        StoredToken s;
+        if (j.type != Json.Type.object)
+            return s;
+        if (auto p = "access_token" in j)
+            s.accessToken = p.type == Json.Type.string ? p.get!string : "";
+        if (auto p = "token_type" in j)
+            s.tokenType = p.type == Json.Type.string ? p.get!string : "Bearer";
+        if (auto p = "expires_at" in j)
+            s.expiresAt = p.type == Json.Type.int_ ? p.get!long : 0;
+        if (auto p = "refresh_token" in j)
+            s.refreshToken = p.type == Json.Type.string ? p.get!string : "";
+        if (auto p = "scope" in j)
+            s.scope_ = p.type == Json.Type.string ? p.get!string : "";
+        if (auto p = "resource" in j)
+            s.resource = p.type == Json.Type.string ? p.get!string : "";
+        return s;
+    }
+}
+
+/// Pluggable persistence for OAuth tokens, keyed by the canonical resource
+/// (MCP server) URI. Implementations may encrypt at rest; the default
+/// `FileTokenStore` documents an encryption hook.
+interface TokenStore
+{
+    /// Load the stored token for `resource`, or a default-constructed
+    /// `StoredToken` (`hasToken == false`) when none is stored.
+    StoredToken load(string resource) @safe;
+
+    /// Persist `token` for `resource`, replacing any previous value.
+    void save(string resource, StoredToken token) @safe;
+}
+
+/// An in-memory `TokenStore` (no persistence across processes). Useful for
+/// tests and ephemeral sessions.
+final class MemoryTokenStore : TokenStore
+{
+    private StoredToken[string] tokens_;
+
+    override StoredToken load(string resource) @safe
+    {
+        if (auto p = resource in tokens_)
+            return *p;
+        return StoredToken.init;
+    }
+
+    override void save(string resource, StoredToken token) @safe
+    {
+        tokens_[resource] = token;
+    }
+}
+
+/// A file-backed `TokenStore`. Tokens for all resources are stored as a single
+/// JSON object (`{ "<resource>": { ... } }`) at `path`.
+///
+/// Encryption hook: subclass and override `serialize`/`deserialize` to encrypt
+/// the JSON blob at rest (e.g. with a key from the OS keychain). The plaintext
+/// implementation writes the file with owner-only (`0600`) permissions on
+/// POSIX.
+class FileTokenStore : TokenStore
+{
+    /// The on-disk path of the token file.
+    string path;
+
+    this(string path) @safe
+    {
+        this.path = path;
+    }
+
+    /// Serialize the full token map to bytes for writing. Override to encrypt.
+    protected const(ubyte)[] serialize(Json all) @safe
+    {
+        return cast(const(ubyte)[]) all.toString();
+    }
+
+    /// Deserialize bytes read from disk into the token map. Override to decrypt.
+    protected Json deserialize(const(ubyte)[] data) @safe
+    {
+        if (data.length == 0)
+            return Json.emptyObject;
+        return parseJsonString(cast(string) data.idup);
+    }
+
+    private Json readAll() @safe
+    {
+        import std.file : exists, read;
+
+        if (!path.length || !path.exists)
+            return Json.emptyObject;
+        try
+        {
+            auto data = () @trusted { return cast(const(ubyte)[]) read(path); }();
+            auto j = deserialize(data);
+            return j.type == Json.Type.object ? j : Json.emptyObject;
+        }
+        catch (Exception)
+            return Json.emptyObject;
+    }
+
+    override StoredToken load(string resource) @safe
+    {
+        auto all = readAll();
+        if (auto p = resource in all)
+            return StoredToken.fromJson(*p);
+        return StoredToken.init;
+    }
+
+    override void save(string resource, StoredToken token) @safe
+    {
+        import std.file : write, mkdirRecurse;
+        import std.path : dirName;
+
+        auto dir = dirName(path);
+        if (dir.length)
+        {
+            try
+                () @trusted { mkdirRecurse(dir); }();
+            catch (Exception)
+            {
+            }
+        }
+        auto all = readAll();
+        all[resource] = token.toJson();
+        auto bytes = serialize(all);
+        () @trusted { write(path, bytes); }();
+        restrictPermissions();
+    }
+
+    /// Restrict the token file to owner-only access (POSIX `0600`). No-op on
+    /// platforms without POSIX permissions.
+    private void restrictPermissions() @safe
+    {
+        version (Posix)
+        {
+            import std.file : setAttributes, exists;
+            import core.sys.posix.sys.stat : S_IRUSR, S_IWUSR;
+
+            if (path.exists)
+            {
+                try
+                    () @trusted { setAttributes(path, S_IRUSR | S_IWUSR); }();
+                catch (Exception)
+                {
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Refresh-on-expiry helpers
+// ===========================================================================
+
+/// The default clock skew (seconds) treated as "about to expire": a token is
+/// refreshed this many seconds *before* its nominal expiry to avoid using a
+/// token that expires mid-flight.
+enum long defaultExpirySkewSeconds = 30;
+
+/// Whether the stored access token must be refreshed before use at time `now`
+/// (Unix seconds). A token with `expiresAt == 0` (unknown expiry) is never
+/// considered expired here. A record with no access token always needs
+/// (re)acquisition and returns true.
+bool needsRefresh(const StoredToken token, long now, long skew = defaultExpirySkewSeconds) @safe pure nothrow @nogc
+{
+    if (!token.hasToken)
+        return true;
+    if (token.expiresAt == 0)
+        return false;
+    return now + skew >= token.expiresAt;
+}
+
+// ===========================================================================
+// Loopback redirect capture
+// ===========================================================================
+
+/// The outcome of parsing a loopback redirect request target: the captured
+/// authorization `code` and `state`, or an `error` (the OAuth `error`
+/// parameter) when the authorization server reported a failure.
+struct LoopbackCapture
+{
+    string code;
+    string state;
+    string error;
+    string errorDescription;
+
+    /// Whether a usable authorization code was captured.
+    bool ok() const @safe pure nothrow @nogc
+    {
+        return code.length > 0 && error.length == 0;
+    }
+}
+
+/// Parse the path+query of an inbound loopback HTTP request (e.g.
+/// `/callback?code=abc&state=xyz`) and extract the OAuth authorization response
+/// parameters. When `expectedState` is non-empty, a missing or mismatched
+/// `state` clears the captured `code` and records an error (MCP "Open
+/// Redirection": clients SHOULD verify the state parameter and discard
+/// mismatched results).
+LoopbackCapture parseLoopbackCallback(string requestTarget, string expectedState = "") @safe
+{
+    LoopbackCapture c;
+    c.code = extractQueryParam(requestTarget, "code");
+    c.state = extractQueryParam(requestTarget, "state");
+    c.error = extractQueryParam(requestTarget, "error");
+    c.errorDescription = extractQueryParam(requestTarget, "error_description");
+
+    if (expectedState.length)
+    {
+        if (!validateAuthorizationResponseState(c.state, expectedState))
+        {
+            c.code = "";
+            if (c.error.length == 0)
+            {
+                c.error = "state_mismatch";
+                c.errorDescription = "authorization response state missing or mismatched";
+            }
+        }
+    }
+    return c;
+}
+
+/// The HTML body shown in the user's browser after the loopback listener
+/// captures the redirect, so the user knows to return to the application.
+string loopbackResponseHtml(bool success) @safe pure nothrow
+{
+    return success ? "<!doctype html><html><body><h2>Authorization complete</h2>"
+        ~ "<p>You may close this window and return to the application.</p></body></html>"
+        : "<!doctype html><html><body><h2>Authorization failed</h2>"
+        ~ "<p>You may close this window and return to the application.</p></body></html>";
+}
+
+// ===========================================================================
+// Configuration
+// ===========================================================================
+
+/// Configuration for `useOAuth`: the requested scopes, the loopback callback
+/// port (0 = an ephemeral OS-assigned loopback port), the token store
+/// (defaults to a `FileTokenStore` under the user's config dir), and the
+/// client-registration inputs.
+struct OAuthLogin
+{
+    /// OAuth scopes to request (space-joined into the `scope` parameter).
+    string[] scopes;
+    /// Loopback listener port for the redirect. 0 selects an ephemeral port.
+    ushort callbackPort = 0;
+    /// The loopback path the authorization server redirects to.
+    string callbackPath = "/callback";
+    /// Pluggable token persistence. Null => a default `FileTokenStore`.
+    TokenStore store;
+    /// The human-readable client name used for Dynamic Client Registration.
+    string clientName = "dlang-mcp-client";
+    /// A pre-registered `client_id` (skips DCR/CIMD when set).
+    string clientId;
+    /// A pre-registered `client_secret` (for confidential clients).
+    string clientSecret;
+    /// SEP-991 OAuth Client ID Metadata Document URL (used as `client_id`
+    /// when the AS advertises `client_id_metadata_document_supported`).
+    string clientIdMetadataUrl;
+    /// How to authenticate at the token endpoint.
+    TokenEndpointAuthMethod authMethod = TokenEndpointAuthMethod.none;
+    /// Opener for the system browser. Null => the platform default opener.
+    /// Supplied explicitly in tests to avoid launching a browser.
+    void delegate(string url) @safe openBrowser;
+
+    /// The scopes joined into a single space-delimited OAuth `scope` string.
+    string scopeString() const @safe pure nothrow
+    {
+        string s;
+        foreach (i, sc; scopes)
+            s ~= (i ? " " : "") ~ sc;
+        return s;
+    }
+}
+
+/// The default loopback redirect URI for a given port and path.
+string loopbackRedirectUri(ushort port, string path = "/callback") @safe pure
+{
+    import std.conv : to;
+
+    auto p = path.length ? path : "/callback";
+    if (p[0] != '/')
+        p = "/" ~ p;
+    return "http://localhost:" ~ port.to!string ~ p;
+}
+
+/// The default token-store path under the user's config directory:
+/// `$XDG_CONFIG_HOME/dlang-mcp/tokens.json` (or `~/.config/...`), falling back
+/// to `./.dlang-mcp-tokens.json` when no home directory is known.
+string defaultTokenStorePath() @safe
+{
+    import std.process : environment;
+    import std.path : buildPath;
+
+    string base;
+    try
+    {
+        base = environment.get("XDG_CONFIG_HOME", "");
+        if (base.length == 0)
+        {
+            auto home = environment.get("HOME", "");
+            if (home.length)
+                base = buildPath(home, ".config");
+        }
+    }
+    catch (Exception)
+    {
+    }
+    if (base.length == 0)
+        return ".dlang-mcp-tokens.json";
+    return buildPath(base, "dlang-mcp", "tokens.json");
+}
+
+/// The canonical resource URI for `mcpEndpoint` (drops a trailing slash and any
+/// fragment), per the MCP authorization "Canonical Server URI" rules.
+string canonicalResource(string mcpEndpoint) @safe pure nothrow
+{
+    import std.string : indexOf;
+
+    auto s = mcpEndpoint;
+    const hash = s.indexOf('#');
+    if (hash >= 0)
+        s = s[0 .. hash];
+    if (s.length > 1 && s[$ - 1] == '/')
+        s = s[0 .. $ - 1];
+    return s;
+}
+
+/// Generate a random `state` value (base64url, 16 bytes of randomness) for the
+/// authorization request (MCP "Open Redirection" mitigation).
+string generateLoginState() @safe
+{
+    import std.random : uniform;
+
+    ubyte[16] buf;
+    foreach (ref b; buf)
+        b = cast(ubyte) uniform(0, 256);
+    return base64UrlNoPad(buf[]);
+}
+
+// ===========================================================================
+// Session: bearer + auto-refresh
+// ===========================================================================
+
+/// A live OAuth session bound to one MCP server. Holds the discovered
+/// authorization-server metadata and the registered client so it can refresh
+/// the access token automatically when it nears expiry. Created by `useOAuth`;
+/// also constructible directly for advanced/test use.
+final class OAuthSession
+{
+    private OAuthClient oauth_;
+    private AuthorizationServerMetadata as_;
+    private RegisteredClient client_;
+    private TokenStore store_;
+    private string resource_;
+    private StoredToken token_;
+    private long skew_ = defaultExpirySkewSeconds;
+    // The refresh-token grant. Defaults to the live `OAuthClient.refresh`;
+    // overridable (see the secondary constructor) so the refresh-on-expiry path
+    // is unit-testable without network access.
+    private TokenSet delegate(string refreshToken) @safe refreshFn_;
+
+    /// `oauth` must already carry the canonical `resource`. `token` is the
+    /// initial (possibly empty) stored token for `resource`.
+    this(OAuthClient oauth, AuthorizationServerMetadata as_,
+            RegisteredClient client, TokenStore store, string resource, StoredToken token) @safe
+    {
+        this.oauth_ = oauth;
+        this.as_ = as_;
+        this.client_ = client;
+        this.store_ = store;
+        this.resource_ = resource;
+        this.token_ = token;
+        this.refreshFn_ = (string rt) @safe => oauth.refresh(as_, client, rt);
+    }
+
+    /// Test/advanced constructor: inject a refresh function (the
+    /// refresh-token-grant call) directly, bypassing the live HTTP client.
+    this(string resource, StoredToken token, TokenStore store,
+            TokenSet delegate(string refreshToken) @safe refreshFn) @safe
+    {
+        this.resource_ = resource;
+        this.token_ = token;
+        this.store_ = store;
+        this.refreshFn_ = refreshFn;
+    }
+
+    /// The current stored token (for inspection / persistence).
+    StoredToken token() const @safe nothrow
+    {
+        return token_;
+    }
+
+    /// Return a valid bearer access token for use at `now` (Unix seconds),
+    /// refreshing via the refresh-token grant first when the current token has
+    /// expired (or is within the skew window). The refreshed token is persisted
+    /// through the `TokenStore`. Throws when no valid token can be produced
+    /// (e.g. expired with no refresh token).
+    string bearerForRequest(long now) @safe
+    {
+        if (needsRefresh(token_, now, skew_))
+        {
+            if (token_.refreshToken.length == 0)
+            {
+                if (token_.hasToken && token_.expiresAt == 0)
+                    return token_.accessToken; // no expiry known, no refresh possible
+                throw internalError(
+                        "OAuth access token expired and no refresh token is available; "
+                        ~ "re-authentication required");
+            }
+            auto ts = refreshFn_(token_.refreshToken);
+            if (ts.accessToken.length == 0)
+                throw internalError("OAuth token refresh returned no access token");
+            token_ = StoredToken.fromTokenSet(ts, resource_, now, token_.refreshToken);
+            if (store_ !is null)
+                store_.save(resource_, token_);
+        }
+        return token_.accessToken;
+    }
+}
+
+// ===========================================================================
+// Browser opener
+// ===========================================================================
+
+/// Open `url` in the user's default browser using the platform launcher
+/// (`open` on macOS, `xdg-open` on Linux/BSD, `cmd /c start` on Windows).
+void openSystemBrowser(string url) @safe
+{
+    import std.process : spawnProcess;
+
+    string[] cmd;
+    version (OSX)
+        cmd = ["open", url];
+    else version (Windows)
+        cmd = ["cmd", "/c", "start", "", url];
+    else
+        cmd = ["xdg-open", url];
+
+    () @trusted {
+        try
+        {
+            auto pid = spawnProcess(cmd);
+            cast(void) pid; // detach; do not wait for the launcher
+        }
+        catch (Exception)
+        {
+        }
+    }();
+}
+
+// ===========================================================================
+// The one-call flow
+// ===========================================================================
+
+/// Perform the full interactive OAuth login for `client` and attach the
+/// resulting bearer token, refreshing automatically thereafter.
+///
+/// Steps:
+/// 1. Discover protected-resource + authorization-server metadata.
+/// 2. If a cached, non-expired token exists in the store, use it (refreshing
+///    via the refresh grant when expired). Otherwise:
+/// 3. Select a registration approach (pre-registered / CIMD / DCR).
+/// 4. Run the authorization-code + PKCE flow: open the browser at the
+///    authorization URL and capture the redirect `code` on a localhost loopback
+///    listener; verify `state`.
+/// 5. Exchange the code for tokens, persist them, and set the bearer on the
+///    client.
+///
+/// Returns the live `OAuthSession` so callers can refresh on later requests via
+/// `session.bearerForRequest(now)`.
+OAuthSession useOAuth(MCPClient client, string mcpEndpoint, OAuthLogin opts) @safe
+{
+    import std.datetime.systime : Clock;
+
+    auto store = opts.store !is null ? opts.store : new FileTokenStore(defaultTokenStorePath());
+
+    auto oauth = new OAuthClient();
+    oauth.resource = canonicalResource(mcpEndpoint);
+    oauth.authMethod = opts.authMethod;
+    oauth.clientIdMetadataUrl = opts.clientIdMetadataUrl;
+
+    const long now = () @trusted { return Clock.currTime().toUnixTime(); }();
+
+    // Discover the issuer and AS metadata.
+    const issuer = oauth.resolveIssuer(mcpEndpoint);
+    auto as_ = oauth.discoverAuthServer(issuer);
+
+    // Reuse a cached, still-valid token when present.
+    auto cached = store.load(oauth.resource);
+    if (cached.hasToken && !needsRefresh(cached, now))
+    {
+        client.setBearerToken(cached.accessToken);
+        return new OAuthSession(oauth, as_, RegisteredClient(opts.clientId,
+                opts.clientSecret), store, oauth.resource, cached);
+    }
+
+    // Select / obtain a client registration.
+    RegisteredClient rc;
+    const havePre = opts.clientId.length > 0;
+    const approach = oauth.registrationApproach(as_, havePre);
+    final switch (approach)
+    {
+    case ClientRegistrationApproach.preRegistered:
+        rc = RegisteredClient(opts.clientId, opts.clientSecret);
+        break;
+    case ClientRegistrationApproach.clientIdMetadataDocument:
+        rc = oauth.clientIdMetadataClient(as_);
+        break;
+    case ClientRegistrationApproach.dynamicClientRegistration:
+        rc = oauth.register(as_, opts.clientName, opts.scopeString());
+        break;
+    case ClientRegistrationApproach.promptUser:
+        throw internalError(
+                "Authorization server requires manual client registration; supply OAuthLogin.clientId");
+    }
+
+    // If we have a cached refresh token (but no usable access token), try the
+    // refresh grant before falling back to the full browser flow.
+    if (cached.refreshToken.length)
+    {
+        try
+        {
+            auto ts = oauth.refresh(as_, rc, cached.refreshToken);
+            if (ts.accessToken.length)
+            {
+                auto refreshed = StoredToken.fromTokenSet(ts, oauth.resource,
+                        now, cached.refreshToken);
+                store.save(oauth.resource, refreshed);
+                client.setBearerToken(refreshed.accessToken);
+                return new OAuthSession(oauth, as_, rc, store, oauth.resource, refreshed);
+            }
+        }
+        catch (Exception)
+        {
+            // Fall through to the interactive flow.
+        }
+    }
+
+    // Run the interactive authorization-code + PKCE flow on a loopback listener.
+    auto pkce = generatePkce();
+    const state = generateLoginState();
+    const captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, state);
+    if (!captured.ok)
+        throw internalError("OAuth loopback capture failed: " ~ (captured.error.length
+                ? captured.error : "no authorization code received"));
+
+    auto ts = oauth.exchangeCode(as_, rc, captured.code, pkce.verifier);
+    if (ts.accessToken.length == 0)
+        throw internalError("OAuth token exchange returned no access token");
+    auto stored = StoredToken.fromTokenSet(ts, oauth.resource, now);
+    store.save(oauth.resource, stored);
+    client.setBearerToken(stored.accessToken);
+    return new OAuthSession(oauth, as_, rc, store, oauth.resource, stored);
+}
+
+/// Open the browser at the authorization URL and run a localhost loopback HTTP
+/// listener to capture the redirect. Blocks (on the vibe event loop) until the
+/// redirect arrives, then returns the captured authorization response.
+private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationServerMetadata as_,
+        RegisteredClient rc, PkcePair pkce, OAuthLogin opts, string state) @safe
+{
+    import vibe.http.server : HTTPServerSettings, HTTPServerRequest,
+        HTTPServerResponse, listenHTTP;
+    import vibe.core.core : runEventLoop, exitEventLoop;
+
+    // Bind the loopback listener. Port 0 lets the OS pick an ephemeral port,
+    // which we then read back to form the exact redirect URI.
+    auto settings = new HTTPServerSettings;
+    settings.bindAddresses = ["127.0.0.1"];
+    settings.port = opts.callbackPort;
+
+    LoopbackCapture result;
+    bool done;
+
+    void handle(scope HTTPServerRequest req, scope HTTPServerResponse res) @safe
+    {
+        auto cap = parseLoopbackCallback(req.requestURI, state);
+        if (!done)
+        {
+            result = cap;
+            done = true;
+        }
+        res.contentType = "text/html; charset=utf-8";
+        res.writeBody(loopbackResponseHtml(cap.ok));
+        () @trusted { exitEventLoop(); }();
+    }
+
+    ushort boundPort;
+    () @trusted {
+        auto listener = listenHTTP(settings, &handle);
+        boundPort = listener.bindAddresses[0].port;
+    }();
+
+    oauth.redirectUri = loopbackRedirectUri(boundPort, opts.callbackPath);
+    const authzUrl = oauth.authorizationUrl(as_, rc, pkce, opts.scopeString(), state);
+
+    void delegate(string) @safe opener = opts.openBrowser;
+    if (opener is null)
+        opener = (string u) @safe { openSystemBrowser(u); };
+    opener(authzUrl);
+
+    () @trusted { runEventLoop(); }();
+    return result;
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+unittest  // loopback capture extracts code and state from the redirect target
+{
+    auto c = parseLoopbackCallback("/callback?code=abc123&state=xyz");
+    assert(c.code == "abc123");
+    assert(c.state == "xyz");
+    assert(c.ok);
+}
+
+unittest  // loopback capture URL-decodes the code parameter
+{
+    auto c = parseLoopbackCallback("/callback?code=a%20b&state=s");
+    assert(c.code == "a b");
+}
+
+unittest  // loopback capture rejects a mismatched state (discards the code)
+{
+    auto c = parseLoopbackCallback("/callback?code=abc&state=wrong", "expected");
+    assert(c.code == "");
+    assert(!c.ok);
+    assert(c.error == "state_mismatch");
+}
+
+unittest  // loopback capture accepts a matching state
+{
+    auto c = parseLoopbackCallback("/callback?code=abc&state=expected", "expected");
+    assert(c.code == "abc");
+    assert(c.ok);
+}
+
+unittest  // loopback capture surfaces an authorization-server error
+{
+    auto c = parseLoopbackCallback("/callback?error=access_denied&error_description=nope");
+    assert(c.error == "access_denied");
+    assert(c.errorDescription == "nope");
+    assert(!c.ok);
+}
+
+unittest  // a fresh token (future expiry) does not need refreshing
+{
+    StoredToken t;
+    t.accessToken = "tok";
+    t.expiresAt = 1000;
+    assert(!needsRefresh(t, 900)); // 900 + 30 skew < 1000
+}
+
+unittest  // a token within the skew window needs refreshing
+{
+    StoredToken t;
+    t.accessToken = "tok";
+    t.expiresAt = 1000;
+    assert(needsRefresh(t, 980)); // 980 + 30 skew >= 1000
+}
+
+unittest  // an expired token needs refreshing
+{
+    StoredToken t;
+    t.accessToken = "tok";
+    t.expiresAt = 1000;
+    assert(needsRefresh(t, 2000));
+}
+
+unittest  // a token with unknown expiry (0) is never auto-refreshed
+{
+    StoredToken t;
+    t.accessToken = "tok";
+    t.expiresAt = 0;
+    assert(!needsRefresh(t, long.max - 100));
+}
+
+unittest  // a record with no access token always needs (re)acquisition
+{
+    StoredToken t;
+    assert(needsRefresh(t, 0));
+}
+
+unittest  // fromTokenSet computes the absolute expiry from now + expires_in
+{
+    TokenSet ts;
+    ts.accessToken = "a";
+    ts.tokenType = "Bearer";
+    ts.expiresIn = 3600;
+    ts.refreshToken = "r";
+    auto s = StoredToken.fromTokenSet(ts, "https://mcp.example.com", 1000);
+    assert(s.expiresAt == 4600);
+    assert(s.refreshToken == "r");
+    assert(s.resource == "https://mcp.example.com");
+}
+
+unittest  // fromTokenSet keeps the previous refresh token when the AS omits one
+{
+    TokenSet ts;
+    ts.accessToken = "a2";
+    ts.expiresIn = 60;
+    // ts.refreshToken left empty (refresh response without a new RT)
+    auto s = StoredToken.fromTokenSet(ts, "https://mcp.example.com", 0, "old-refresh");
+    assert(s.refreshToken == "old-refresh");
+}
+
+unittest  // StoredToken JSON round-trips
+{
+    StoredToken t;
+    t.accessToken = "tok";
+    t.tokenType = "Bearer";
+    t.expiresAt = 4600;
+    t.refreshToken = "r";
+    t.scope_ = "mcp:read";
+    t.resource = "https://mcp.example.com";
+    auto back = StoredToken.fromJson(t.toJson());
+    assert(back == t);
+}
+
+unittest  // MemoryTokenStore persists and loads per resource
+{
+    auto store = new MemoryTokenStore();
+    assert(!store.load("https://a").hasToken);
+    StoredToken t;
+    t.accessToken = "tok";
+    t.resource = "https://a";
+    store.save("https://a", t);
+    assert(store.load("https://a").accessToken == "tok");
+    assert(!store.load("https://b").hasToken);
+}
+
+unittest  // loopbackRedirectUri formats a localhost URI for the bound port
+{
+    assert(loopbackRedirectUri(8765) == "http://localhost:8765/callback");
+    assert(loopbackRedirectUri(1234, "/cb") == "http://localhost:1234/cb");
+    assert(loopbackRedirectUri(1234, "cb") == "http://localhost:1234/cb");
+}
+
+unittest  // canonicalResource drops a trailing slash and any fragment
+{
+    assert(canonicalResource("https://mcp.example.com/") == "https://mcp.example.com");
+    assert(canonicalResource("https://mcp.example.com/mcp") == "https://mcp.example.com/mcp");
+    assert(canonicalResource("https://mcp.example.com#frag") == "https://mcp.example.com");
+}
+
+unittest  // scopeString space-joins the requested scopes
+{
+    OAuthLogin o;
+    o.scopes = ["mcp:read", "mcp:write"];
+    assert(o.scopeString() == "mcp:read mcp:write");
+    OAuthLogin empty;
+    assert(empty.scopeString() == "");
+}
+
+unittest  // OAuthSession returns the cached token without refreshing when valid
+{
+    auto store = new MemoryTokenStore();
+    AuthorizationServerMetadata as_;
+    auto rc = RegisteredClient("cid", "");
+    StoredToken t;
+    t.accessToken = "valid-token";
+    t.expiresAt = 10_000;
+    auto sess = new OAuthSession(new OAuthClient(), as_, rc, store, "https://mcp.example.com", t);
+    assert(sess.bearerForRequest(100) == "valid-token");
+}
+
+unittest  // OAuthSession throws when the token is expired and no refresh token exists
+{
+    import std.exception : assertThrown;
+
+    auto store = new MemoryTokenStore();
+    AuthorizationServerMetadata as_;
+    auto rc = RegisteredClient("cid", "");
+    StoredToken t;
+    t.accessToken = "stale";
+    t.expiresAt = 1000; // expired relative to the request time below
+    auto sess = new OAuthSession(new OAuthClient(), as_, rc, store, "https://mcp.example.com", t);
+    assertThrown(sess.bearerForRequest(5000));
+}
+
+unittest  // OAuthSession returns an unknown-expiry token even with no refresh token
+{
+    auto store = new MemoryTokenStore();
+    AuthorizationServerMetadata as_;
+    auto rc = RegisteredClient("cid", "");
+    StoredToken t;
+    t.accessToken = "no-expiry-token";
+    t.expiresAt = 0;
+    auto sess = new OAuthSession(new OAuthClient(), as_, rc, store, "https://mcp.example.com", t);
+    assert(sess.bearerForRequest(long.max - 100) == "no-expiry-token");
+}
+
+unittest  // loopbackResponseHtml differs for success and failure
+{
+    import std.algorithm : canFind;
+
+    assert(loopbackResponseHtml(true).canFind("complete"));
+    assert(loopbackResponseHtml(false).canFind("failed"));
+}
+
+unittest  // generateLoginState produces a non-empty base64url value
+{
+    auto s = generateLoginState();
+    assert(s.length > 0);
+}
+
+unittest  // OAuthSession refreshes an expired token via the injected refresh fn
+{
+    auto store = new MemoryTokenStore();
+    StoredToken t;
+    t.accessToken = "old-access";
+    t.refreshToken = "the-refresh";
+    t.expiresAt = 1000; // expired relative to the request time below
+
+    string seenRefresh;
+    TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+        seenRefresh = rt;
+        TokenSet ts;
+        ts.accessToken = "new-access";
+        ts.tokenType = "Bearer";
+        ts.expiresIn = 3600;
+        ts.refreshToken = "rotated-refresh";
+        return ts;
+    };
+
+    auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+    auto bearer = sess.bearerForRequest(5000);
+
+    // The expired token was refreshed using the stored refresh token.
+    assert(seenRefresh == "the-refresh");
+    assert(bearer == "new-access");
+    // The new token (with its rotated refresh token and recomputed expiry) was
+    // persisted through the store.
+    auto saved = store.load("https://mcp.example.com");
+    assert(saved.accessToken == "new-access");
+    assert(saved.refreshToken == "rotated-refresh");
+    assert(saved.expiresAt == 5000 + 3600);
+}
+
+unittest  // OAuthSession does not refresh when the cached token is still valid
+{
+    auto store = new MemoryTokenStore();
+    StoredToken t;
+    t.accessToken = "still-good";
+    t.refreshToken = "rt";
+    t.expiresAt = 1_000_000;
+
+    bool refreshed;
+    TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+        refreshed = true;
+        TokenSet ts;
+        ts.accessToken = "should-not-be-used";
+        return ts;
+    };
+
+    auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+    assert(sess.bearerForRequest(100) == "still-good");
+    assert(!refreshed);
+}
+
+unittest  // a refresh that returns no access token is an error
+{
+    import std.exception : assertThrown;
+
+    auto store = new MemoryTokenStore();
+    StoredToken t;
+    t.accessToken = "old";
+    t.refreshToken = "rt";
+    t.expiresAt = 1000;
+
+    TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+        return TokenSet.init;
+    };
+    auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+    assertThrown(sess.bearerForRequest(5000));
+}
