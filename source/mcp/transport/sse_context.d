@@ -446,6 +446,51 @@ unittest  // distinct listeners get distinct stream ordinals, so ids stay unique
     assert(aFrame.splitLines()[0] != bFrame.splitLines()[0]);
 }
 
+/// The HTTP response headers a server sets when it upgrades a response to a
+/// Server-Sent Events stream (`Content-Type: text/event-stream`).
+///
+/// `Cache-Control: no-cache` applies on every protocol version.
+///
+/// `isDraft` adds the draft-only `X-Accel-Buffering: no` header. The draft
+/// basic/transports §Receiving Messages rule states: "When initiating an SSE
+/// stream, servers SHOULD include the `X-Accel-Buffering: no` header in the HTTP
+/// response" (it instructs reverse proxies such as nginx to disable response
+/// buffering so events are flushed immediately). This SHOULD was introduced in
+/// the draft (2026-07-28) and does NOT exist in 2025-03-26 / 2025-06-18 /
+/// 2025-11-25, so it must NOT be emitted on those versions — the stable wire
+/// output is unchanged.
+string[string] sseStreamHeaders(bool isDraft) @safe
+{
+    string[string] h;
+    h["Cache-Control"] = "no-cache";
+    if (isDraft)
+        h["X-Accel-Buffering"] = "no";
+    return h;
+}
+
+unittest  // stable SSE streams: no-cache only, never X-Accel-Buffering
+{
+    auto h = sseStreamHeaders(false);
+    assert(h["Cache-Control"] == "no-cache");
+    assert("X-Accel-Buffering" !in h);
+}
+
+unittest  // draft SSE streams add X-Accel-Buffering: no (draft SHOULD)
+{
+    auto h = sseStreamHeaders(true);
+    assert(h["Cache-Control"] == "no-cache");
+    assert(h["X-Accel-Buffering"] == "no");
+}
+
+/// Set the SSE upgrade headers (see `sseStreamHeaders`) on a response, leaving
+/// the caller to set `contentType`. Applies the draft-only `X-Accel-Buffering`
+/// header only when `isDraft` is true.
+void applySseStreamHeaders(HTTPServerResponse res, bool isDraft) @safe
+{
+    foreach (k, v; sseStreamHeaders(isDraft))
+        res.headers[k] = v;
+}
+
 /// A `RequestContext` backed by an HTTP response that is (lazily) upgraded to a
 /// Server-Sent Events stream the first time the handler emits server->client
 /// traffic. Progress/logging become SSE notification events; sampling/
@@ -462,9 +507,13 @@ final class HttpStreamContext : RequestContext
     private long streamId;
     private long eventSeq;
     private TokenInfo authInfo;
+    // When true, an SSE upgrade emits the draft-only `X-Accel-Buffering: no`
+    // header (draft basic/transports §Receiving Messages SHOULD). Defaults to
+    // false so 2025-03-26 / 2025-06-18 / 2025-11-25 wire output is unchanged.
+    private bool isDraft_;
 
     this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps,
-            Json progressToken, TokenInfo auth = TokenInfo.invalid()) @safe
+            Json progressToken, TokenInfo auth = TokenInfo.invalid(), bool isDraft = false) @safe
     {
         this.res = res;
         this.coord = coord;
@@ -472,6 +521,7 @@ final class HttpStreamContext : RequestContext
         this.progressTok = progressToken;
         this.streamId = coord.allocStream();
         this.authInfo = auth;
+        this.isDraft_ = isDraft;
     }
 
     /// The globally-unique id this stream will assign to its next SSE event.
@@ -504,7 +554,9 @@ final class HttpStreamContext : RequestContext
         if (streaming_)
             return;
         res.contentType = "text/event-stream";
-        res.headers["Cache-Control"] = "no-cache";
+        // Cache-Control: no-cache on every version; X-Accel-Buffering: no only
+        // on the draft (basic/transports §Receiving Messages SHOULD).
+        applySseStreamHeaders(res, isDraft_);
         streaming_ = true;
     }
 

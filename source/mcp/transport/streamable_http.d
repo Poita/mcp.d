@@ -274,7 +274,10 @@ private void handleGet(MCPServer server, ServerPushChannel push,
     import core.time : seconds;
 
     res.contentType = "text/event-stream";
-    res.headers["Cache-Control"] = "no-cache";
+    // The standalone GET stream is offered only on the stable revisions
+    // (getOpensSseStream gated above); the X-Accel-Buffering: no SHOULD is a
+    // draft-only rule, so it is not emitted here.
+    applySseStreamHeaders(res, false);
 
     const listenerId = push.addListener((string frame) @safe {
         () @trusted {
@@ -326,7 +329,10 @@ private void handleListenStream(MCPServer server, StreamCoordinator coord,
     server.handle(msg);
 
     res.contentType = "text/event-stream";
-    res.headers["Cache-Control"] = "no-cache";
+    // subscriptions/listen is a draft-only stream; emit the draft SHOULD header
+    // X-Accel-Buffering: no alongside Cache-Control (basic/transports
+    // §Receiving Messages).
+    applySseStreamHeaders(res, true);
 
     auto push = server.serverPushChannel(coord);
     // The listen request's id becomes the stream's subscriptionId: every
@@ -542,7 +548,7 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
             return;
         }
         auto ctx = new HttpStreamContext(res, coord, server.clientCapabilities,
-                extractProgressToken(msg.params), token);
+                extractProgressToken(msg.params), token, isDraftReq);
         auto resp = server.handle(msg, ctx);
         if (ctx.streaming)
             ctx.finishWith(resp.get);
