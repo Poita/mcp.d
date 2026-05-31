@@ -6,14 +6,12 @@ import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
-import mcp.protocol.versions;
-import mcp.protocol.capabilities;
-import mcp.protocol.types;
-import mcp.client.client : resolveNegotiatedVersion;
+import mcp.client.transport : ClientTransport;
+import mcp.client.subscription : SubscriptionStream;
 
 @safe:
 
-/// A Model Context Protocol client over the **stdio** transport.
+/// A `ClientTransport` over the MCP **stdio** transport.
 ///
 /// Per the MCP stdio transport, the host launches the MCP server as a
 /// subprocess and exchanges newline-delimited JSON-RPC messages over its
@@ -23,188 +21,69 @@ import mcp.client.client : resolveNegotiatedVersion;
 ///
 /// This class is transport-pure: it is constructed with a `readLine`/`writeLine`
 /// pair (symmetric to `mcp.transport.stdio.serveStdio` on the server side) and
-/// drives the lifecycle (`initialize` + `notifications/initialized`) and the
-/// server features (tools, resources, prompts, logging, subscriptions) with
-/// auto-pagination. Use `spawnStdioClient` for the common case of launching a
-/// child process and wiring this to its pipes.
-final class StdioClient
+/// carries the bytes for an owning `MCPClient`. There is no standalone
+/// server->client stream and no bearer token over stdio, so `startServerStream`
+/// and `setBearerToken` are no-ops. `close()` terminates the subprocess when one
+/// was spawned (see `MCPClient.spawn`).
+final class StdioClientTransport : ClientTransport
 {
+	import std.process : ProcessPipes;
+	import core.time : Duration, seconds, msecs;
+
 	private string delegate() @safe readLine;
 	private void delegate(string) @safe writeLine;
-	private ProtocolVersion negotiated = latestStable;
-	private bool didInitialize;
-	private long nextId = 1;
-
-	/// Capabilities this client advertises at initialize.
-	ClientCapabilities capabilities;
-	/// This client's identity.
-	Implementation clientInfo;
-
-	/// Observer for inbound notifications received while awaiting a response
-	/// (progress, message, resource updates).
-	void delegate(string method, Json params) @safe onNotification;
+	private void delegate(Message) @safe inbound;
+	// When spawned via `MCPClient.spawn`, the owned subprocess pipes so `close()`
+	// can run the MCP stdio shutdown sequence (close stdin -> SIGTERM -> SIGKILL).
+	private Nullable!ProcessPipes pipes;
 
 	/// Construct over a newline-delimited JSON-RPC channel. `readLine` returns
 	/// the next line from the server (without its terminator) or `null` at
 	/// end-of-input; `writeLine` emits one request/notification line to the
 	/// server (the sink appends the terminator).
-	this(string delegate() @safe readLine, void delegate(string) @safe writeLine,
-			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
+	this(string delegate() @safe readLine, void delegate(string) @safe writeLine) @safe
 	{
 		this.readLine = readLine;
 		this.writeLine = writeLine;
-		this.clientInfo = clientInfo;
 	}
 
-	/// The protocol version negotiated with the server (valid after initialize).
-	ProtocolVersion protocolVersion() const @safe
+	void setInboundHandler(void delegate(Message) @safe handler) @safe
 	{
-		return negotiated;
+		inbound = handler;
 	}
 
-	/// Perform the initialize handshake and send `notifications/initialized`.
-	InitializeResult initialize(string requestedVersion = latestStable.toWire) @safe
+	/// No-op: there is no OAuth bearer token over stdio.
+	void setBearerToken(string token) @safe
 	{
-		InitializeParams params;
-		params.protocolVersion = requestedVersion;
-		params.capabilities = capabilities;
-		params.clientInfo = clientInfo;
-
-		auto result = rpc("initialize", params.toJson());
-		auto init = InitializeResult.fromJson(result);
-		// Per the Lifecycle / Version Negotiation rules: if the client does not
-		// support the version in the server's response it SHOULD disconnect.
-		negotiated = resolveNegotiatedVersion(init.protocolVersion);
-		didInitialize = true;
-		notify("notifications/initialized", Json.emptyObject);
-		return init;
 	}
 
-	/// `ping` — returns when the server acknowledges.
-	void ping() @safe
+	/// No-op: there is no standalone server->client stream over stdio.
+	void startServerStream() @safe
 	{
-		rpc("ping", Json.emptyObject);
 	}
 
-	/// `tools/list`, following pagination cursors to completion.
-	Tool[] listTools() @safe
+	/// Unsupported over stdio: the draft `subscriptions/listen` long-lived stream
+	/// is an HTTP-transport feature. Returns an inert, already-usable handle.
+	SubscriptionStream openListen(Json message) @safe
 	{
-		Tool[] all;
-		Nullable!string cursor;
-		do
-		{
-			Json p = Json.emptyObject;
-			if (!cursor.isNull)
-				p["cursor"] = cursor.get;
-			auto res = ListToolsResult.fromJson(rpc("tools/list", p));
-			all ~= res.tools;
-			cursor = res.nextCursor;
-		}
-		while (!cursor.isNull);
-		return all;
+		auto cancelled = () @trusted { return new shared bool(false); }();
+		return new SubscriptionStream(cancelled);
 	}
-
-	/// `tools/call`.
-	CallToolResult callTool(string name, Json arguments = Json.emptyObject) @safe
-	{
-		Json p = Json.emptyObject;
-		p["name"] = name;
-		p["arguments"] = arguments;
-		return CallToolResult.fromJson(rpc("tools/call", p));
-	}
-
-	/// `resources/list`, auto-paginated.
-	Resource[] listResources() @safe
-	{
-		Resource[] all;
-		Nullable!string cursor;
-		do
-		{
-			Json p = Json.emptyObject;
-			if (!cursor.isNull)
-				p["cursor"] = cursor.get;
-			auto res = ListResourcesResult.fromJson(rpc("resources/list", p));
-			all ~= res.resources;
-			cursor = res.nextCursor;
-		}
-		while (!cursor.isNull);
-		return all;
-	}
-
-	/// `resources/read`.
-	ReadResourceResult readResource(string uri) @safe
-	{
-		Json p = Json.emptyObject;
-		p["uri"] = uri;
-		return ReadResourceResult.fromJson(rpc("resources/read", p));
-	}
-
-	/// `prompts/list`, auto-paginated.
-	Prompt[] listPrompts() @safe
-	{
-		Prompt[] all;
-		Nullable!string cursor;
-		do
-		{
-			Json p = Json.emptyObject;
-			if (!cursor.isNull)
-				p["cursor"] = cursor.get;
-			auto res = ListPromptsResult.fromJson(rpc("prompts/list", p));
-			all ~= res.prompts;
-			cursor = res.nextCursor;
-		}
-		while (!cursor.isNull);
-		return all;
-	}
-
-	/// `prompts/get`.
-	GetPromptResult getPrompt(string name, Json arguments = Json.emptyObject) @safe
-	{
-		Json p = Json.emptyObject;
-		p["name"] = name;
-		p["arguments"] = arguments;
-		return GetPromptResult.fromJson(rpc("prompts/get", p));
-	}
-
-	/// `resources/subscribe` / `resources/unsubscribe`.
-	void subscribe(string uri) @safe
-	{
-		Json p = Json.emptyObject;
-		p["uri"] = uri;
-		rpc("resources/subscribe", p);
-	}
-
-	void unsubscribe(string uri) @safe
-	{
-		Json p = Json.emptyObject;
-		p["uri"] = uri;
-		rpc("resources/unsubscribe", p);
-	}
-
-	/// `logging/setLevel`.
-	void setLogLevel(string level) @safe
-	{
-		Json p = Json.emptyObject;
-		p["level"] = level;
-		rpc("logging/setLevel", p);
-	}
-
-	// --- transport internals -------------------------------------------------
 
 	/// Send a request and return its result (or throw `McpException`). Inbound
 	/// notifications and server->client requests received while waiting are
-	/// dispatched until the correlated response (`id`) arrives.
-	private Json rpc(string method, Json params) @safe
+	/// dispatched until the correlated response (`expectId`) arrives.
+	Json deliver(Json message, long expectId) @safe
 	{
-		const id = nextId++;
-		send(makeRequest(Json(id), method, params));
-		return await(id);
+		send(message);
+		return await(expectId);
 	}
 
-	/// Send a notification (no reply expected).
-	private void notify(string method, Json params) @safe
+	/// Send a message that expects no correlated reply (notification, or a
+	/// response to a server->client request).
+	void sendOneway(Json message) @safe
 	{
-		send(makeNotification(method, params));
+		send(message);
 	}
 
 	/// Serialize a single message and write it as one newline-delimited line.
@@ -248,29 +127,102 @@ final class StdioClient
 					throw errorFrom(msg.error);
 				break;
 			case MessageKind.notification:
-				if (onNotification !is null)
-					onNotification(msg.method, msg.params);
+				dispatch(msg);
 				break;
 			case MessageKind.request:
-				// The server initiated a request (e.g. ping). Reply to a `ping`
-				// so the channel stays healthy; refuse anything else.
-				replyToServerRequest(msg);
+				// The server initiated a request (e.g. ping). Hand it to the
+				// client's inbound dispatcher, which replies via sendOneway.
+				dispatch(msg);
 				break;
 			}
 		}
 	}
 
-	/// Answer a server->client request. Only `ping` is supported out of the box
-	/// (sampling / elicitation / roots over stdio would need a richer host loop);
-	/// anything else gets a `Method not found` error response.
-	private void replyToServerRequest(Message msg) @safe
+	/// Hand an inbound message to the client's dispatcher.
+	private void dispatch(Message msg) @safe
 	{
-		Json response;
-		if (msg.method == "ping")
-			response = makeResponse(msg.id, Json.emptyObject);
+		if (inbound !is null)
+			inbound(msg);
+	}
+
+	/// Attach owned subprocess pipes so `close()` runs the stdio shutdown
+	/// sequence. Set by `MCPClient.spawn`.
+	package void attachProcess(ProcessPipes pipes) @safe
+	{
+		this.pipes = pipes;
+	}
+
+	/// Release transport resources. When this transport owns a spawned
+	/// subprocess (`MCPClient.spawn`), run the MCP stdio Shutdown sequence
+	/// (basic/lifecycle §Shutdown -> stdio): close the child's stdin, escalate to
+	/// `SIGTERM`, then `SIGKILL` if it does not exit within the grace periods.
+	/// A no-op when there is no owned subprocess (a custom `readLine`/`writeLine`
+	/// channel).
+	void close() @safe
+	{
+		if (!pipes.isNull)
+			closeProcess(5.seconds, 5.seconds);
+	}
+
+	/// Shut the owned child down per the MCP stdio Shutdown sequence and return
+	/// its exit status (a process killed by signal reports a negative status per
+	/// `std.process.wait`). Safe to call once.
+	package int closeProcess(Duration termGrace, Duration killGrace) @safe
+	{
+		auto p = pipes.get;
+		() @trusted { p.stdin.close(); }();
+
+		// Step 1+2: wait for a clean exit, escalating to SIGTERM on timeout.
+		auto status = waitUntil(termGrace);
+		if (!status.isNull)
+			return status.get;
+
+		version (Posix)
+		{
+			import std.process : kill;
+			import core.sys.posix.signal : SIGTERM, SIGKILL;
+
+			() @trusted { kill(p.pid, SIGTERM); }();
+			status = waitUntil(killGrace);
+			if (!status.isNull)
+				return status.get;
+
+			// Step 3: still alive after SIGTERM -- force kill and reap.
+			() @trusted { kill(p.pid, SIGKILL); }();
+		}
 		else
-			response = makeErrorResponse(msg.id, methodNotFound(msg.method));
-		send(response);
+		{
+			import std.process : kill;
+
+			// On Windows there is no SIGTERM/SIGKILL distinction; TerminateProcess
+			// is the forceful equivalent of SIGKILL.
+			() @trusted { kill(p.pid); }();
+		}
+
+		import std.process : wait;
+
+		return () @trusted { return wait(p.pid); }();
+	}
+
+	/// Poll `tryWait` until the child exits or `grace` elapses. Returns the exit
+	/// status if it exited within the deadline, or null if it is still running.
+	private Nullable!int waitUntil(Duration grace) @safe
+	{
+		import std.process : tryWait;
+		import std.datetime.stopwatch : StopWatch, AutoStart;
+		import core.thread : Thread;
+
+		auto p = pipes.get;
+		auto sw = StopWatch(AutoStart.yes);
+		for (;;)
+		{
+			auto r = () @trusted { return tryWait(p.pid); }();
+			if (r.terminated)
+				return Nullable!int(r.status);
+			if (sw.peek >= grace)
+				return Nullable!int.init;
+			() @trusted { Thread.sleep(10.msecs); }();
+		}
 	}
 
 	private static McpException errorFrom(Json error) @safe
@@ -288,106 +240,15 @@ final class StdioClient
 	}
 }
 
-/// Owns a spawned MCP server subprocess and the `StdioClient` driving it over
-/// the child's `stdin`/`stdout`. The child's `stderr` is left attached to this
-/// process's `stderr` for logging, per the MCP stdio transport.
-///
-/// Call `close()` (or rely on `scope(exit)`) to perform the MCP stdio shutdown
-/// sequence: close the child's stdin, then escalate to `SIGTERM` and finally
-/// `SIGKILL` if the server does not exit within the grace periods.
-final class StdioClientProcess
+/// Launch an MCP server as a subprocess and wire a `StdioClientTransport` to its
+/// stdin/stdout. `args` is the command line (`args[0]` is the executable);
+/// newline-delimited JSON-RPC requests are written to the child's stdin and
+/// responses are read from its stdout; the child's stderr is inherited for
+/// logging. The returned transport owns the subprocess: its `close()` runs the
+/// stdio shutdown sequence. Used by `MCPClient.spawn`.
+StdioClientTransport spawnStdioTransport(string[] args) @safe
 {
-	import std.process : ProcessPipes;
-	import core.time : Duration, seconds, msecs;
-
-	private ProcessPipes pipes;
-	/// The MCP client speaking to the subprocess.
-	StdioClient client;
-
-	private this(ProcessPipes pipes, StdioClient client) @safe
-	{
-		this.pipes = pipes;
-		this.client = client;
-	}
-
-	/// Shut the child down per the MCP stdio Shutdown sequence
-	/// (basic/lifecycle §Shutdown -> stdio):
-	///
-	/// 1. close the child's stdin (signal end-of-input),
-	/// 2. wait up to `termGrace` for the server to exit, then send `SIGTERM`,
-	/// 3. wait up to `killGrace` for the server to exit, then send `SIGKILL`.
-	///
-	/// Returns the child's exit status (a process killed by signal reports a
-	/// negative status per `std.process.wait`). Safe to call once.
-	int close(Duration termGrace = 5.seconds, Duration killGrace = 5.seconds) @safe
-	{
-		() @trusted { pipes.stdin.close(); }();
-
-		// Step 1+2: wait for a clean exit, escalating to SIGTERM on timeout.
-		auto status = waitUntil(termGrace);
-		if (!status.isNull)
-			return status.get;
-
-		version (Posix)
-		{
-			import std.process : kill;
-			import core.sys.posix.signal : SIGTERM, SIGKILL;
-
-			() @trusted { kill(pipes.pid, SIGTERM); }();
-			status = waitUntil(killGrace);
-			if (!status.isNull)
-				return status.get;
-
-			// Step 3: still alive after SIGTERM -- force kill and reap.
-			() @trusted { kill(pipes.pid, SIGKILL); }();
-		}
-		else
-		{
-			import std.process : kill;
-
-			// On Windows there is no SIGTERM/SIGKILL distinction; TerminateProcess
-			// is the forceful equivalent of SIGKILL.
-			() @trusted { kill(pipes.pid); }();
-		}
-
-		import std.process : wait;
-
-		return () @trusted { return wait(pipes.pid); }();
-	}
-
-	/// Poll `tryWait` until the child exits or `grace` elapses. Returns the exit
-	/// status if it exited within the deadline, or null if it is still running.
-	private Nullable!int waitUntil(Duration grace) @safe
-	{
-		import std.process : tryWait;
-		import std.datetime.stopwatch : StopWatch, AutoStart;
-		import core.thread : Thread;
-
-		auto sw = StopWatch(AutoStart.yes);
-		for (;;)
-		{
-			auto r = () @trusted { return tryWait(pipes.pid); }();
-			if (r.terminated)
-				return Nullable!int(r.status);
-			if (sw.peek >= grace)
-				return Nullable!int.init;
-			() @trusted { Thread.sleep(10.msecs); }();
-		}
-	}
-}
-
-/// Launch an MCP server as a subprocess and return a `StdioClientProcess` whose
-/// `.client` speaks JSON-RPC over the child's stdin/stdout.
-///
-/// `args` is the command line (`args[0]` is the executable). Newline-delimited
-/// JSON-RPC requests are written to the child's stdin and responses are read
-/// from its stdout; the child's stderr is inherited for logging. The returned
-/// `StdioClient` is NOT yet initialized — call `.client.initialize()` (or
-/// `.client.ping()` for a stateless probe) yourself.
-StdioClientProcess spawnStdioClient(string[] args,
-		Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
-{
-	import std.process : pipeProcess, Redirect, Config;
+	import std.process : pipeProcess, Redirect;
 	import std.string : stripRight;
 
 	// Redirect stdin and stdout (frame the JSON-RPC channel); leave stderr
@@ -396,7 +257,7 @@ StdioClientProcess spawnStdioClient(string[] args,
 		return pipeProcess(args, Redirect.stdin | Redirect.stdout);
 	}();
 
-	auto client = new StdioClient(() @trusted {
+	auto transport = new StdioClientTransport(() @trusted {
 		auto f = pipes.stdout;
 		if (f.eof)
 			return cast(string) null;
@@ -404,21 +265,23 @@ StdioClientProcess spawnStdioClient(string[] args,
 		if (ln.length == 0 && f.eof)
 			return cast(string) null;
 		return ln.stripRight("\r\n");
-	}, (string s) @trusted { pipes.stdin.writeln(s); pipes.stdin.flush(); }, clientInfo);
-
-	return new StdioClientProcess(pipes, client);
+	}, (string s) @trusted { pipes.stdin.writeln(s); pipes.stdin.flush(); });
+	transport.attachProcess(pipes);
+	return transport;
 }
 
 version (unittest)
 {
 	import mcp.server.server : MCPServer;
+	import mcp.client.client : MCPClient;
+	import mcp.protocol.types : Tool, Content, CallToolResult;
 }
 
-unittest  // StdioClient drives an in-process server over a paired channel (initialize + tools)
+unittest  // MCPClient over a stdio transport drives an in-process server (initialize + tools)
 {
-	// Wire a StdioClient to an MCPServer through two queues, pumping the server
-	// synchronously: every request the client writes is handled immediately and
-	// its response queued for the client to read back.
+	// Wire a stdio-transport MCPClient to an MCPServer through two queues, pumping
+	// the server synchronously: every request the client writes is handled
+	// immediately and its response queued for the client to read back.
 	auto server = new MCPServer("stdio-client-srv", "1.0");
 	Tool echo = {name: "echo"};
 	server.registerTool(echo, (Json args) @safe {
@@ -430,7 +293,7 @@ unittest  // StdioClient drives an in-process server over a paired channel (init
 	string[] toServer; // lines written by the client, awaiting the server
 	string[] toClient; // response lines queued for the client to read
 
-	auto client = new StdioClient(() @safe {
+	auto client = MCPClient.stdio(() @safe {
 		// Drain pending server work so a response is available before we read.
 		while (toClient.length == 0 && toServer.length)
 		{
@@ -458,7 +321,7 @@ unittest  // StdioClient drives an in-process server over a paired channel (init
 	assert(res.content[0].text == "ok");
 }
 
-unittest  // StdioClient surfaces a correlated server error response as an McpException
+unittest  // stdio transport surfaces a correlated server error response as an McpException
 {
 	// The server answers our request (id 1) with a JSON-RPC error carrying the
 	// matching id; the client must raise it as an McpException with that code.
@@ -466,7 +329,7 @@ unittest  // StdioClient surfaces a correlated server error response as an McpEx
 		`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}`,
 	];
 
-	auto client = new StdioClient(() @safe {
+	auto client = MCPClient.stdio(() @safe {
 		if (toClient.length == 0)
 			return cast(string) null;
 		auto line = toClient[0];
@@ -487,9 +350,9 @@ unittest  // StdioClient surfaces a correlated server error response as an McpEx
 	assert(code == ErrorCode.methodNotFound);
 }
 
-unittest  // StdioClient throws when the server closes stdout before responding
+unittest  // stdio transport throws when the server closes stdout before responding
 {
-	auto client = new StdioClient(() @safe { return cast(string) null; }, (string) @safe {
+	auto client = MCPClient.stdio(() @safe { return cast(string) null; }, (string) @safe {
 	});
 	bool threw;
 	try
@@ -499,7 +362,7 @@ unittest  // StdioClient throws when the server closes stdout before responding
 	assert(threw);
 }
 
-unittest  // StdioClient dispatches inbound notifications while awaiting a response
+unittest  // stdio transport dispatches inbound notifications while awaiting a response
 {
 	string[] toClient = [
 		`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}`,
@@ -507,7 +370,7 @@ unittest  // StdioClient dispatches inbound notifications while awaiting a respo
 	];
 	string[] gotMethods;
 
-	auto client = new StdioClient(() @safe {
+	auto client = MCPClient.stdio(() @safe {
 		if (toClient.length == 0)
 			return cast(string) null;
 		auto line = toClient[0];
@@ -522,15 +385,17 @@ unittest  // StdioClient dispatches inbound notifications while awaiting a respo
 	assert(gotMethods == ["notifications/message"]);
 }
 
-unittest  // StdioClient answers a server-initiated ping while awaiting its own response
+unittest  // stdio transport answers a server-initiated ping while awaiting its own response
 {
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+
 	string[] toServer;
 	string[] toClient = [
 		`{"jsonrpc":"2.0","id":100,"method":"ping"}`, // server pings us first
 		`{"jsonrpc":"2.0","id":1,"result":{}}`, // then answers our request
 	];
 
-	auto client = new StdioClient(() @safe {
+	auto client = MCPClient.stdio(() @safe {
 		if (toClient.length == 0)
 			return cast(string) null;
 		auto line = toClient[0];
@@ -538,7 +403,25 @@ unittest  // StdioClient answers a server-initiated ping while awaiting its own 
 		return line;
 	}, (string s) @safe { toServer ~= s; });
 
-	client.ping();
+	// The reply to a server->client request is sent on a separate task, so drive
+	// the client under the event loop and let pending tasks flush.
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			client.ping();
+			import vibe.core.core : yield;
+
+			foreach (_; 0 .. 4)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+
 	// We should have replied to the server's ping (id 100) in addition to
 	// sending our own request (id 1).
 	assert(toServer.length == 2);
@@ -554,20 +437,17 @@ unittest  // StdioClient answers a server-initiated ping while awaiting its own 
 
 version (Posix) unittest  // close() escalates to SIGTERM when the child ignores stdin EOF
 {
-	import std.process : pipeProcess, Redirect, wait;
+	import std.process : pipeProcess, Redirect;
 	import std.datetime.stopwatch : StopWatch, AutoStart;
 	import core.time : seconds, msecs;
 	import core.sys.posix.signal : SIGTERM;
 
 	// `sleep 30` does not exit when its stdin is closed, so closing stdin alone
 	// would hang forever; the escalating shutdown must SIGTERM it.
-	auto pipes = () @trusted {
-		return pipeProcess(["sh", "-c", "sleep 30"], Redirect.stdin | Redirect.stdout);
-	}();
-	auto proc = new StdioClientProcess(pipes, null);
+	auto transport = spawnStdioTransport(["sh", "-c", "sleep 30"]);
 
 	auto sw = StopWatch(AutoStart.yes);
-	auto status = proc.close(200.msecs, 2.seconds);
+	auto status = transport.closeProcess(200.msecs, 2.seconds);
 	// Must return well before the 30s sleep would have finished.
 	assert(sw.peek < 5.seconds);
 	// Killed by SIGTERM => negative status reporting the signal.
@@ -576,19 +456,15 @@ version (Posix) unittest  // close() escalates to SIGTERM when the child ignores
 
 version (Posix) unittest  // close() escalates to SIGKILL when the child also ignores SIGTERM
 {
-	import std.process : pipeProcess, Redirect;
 	import std.datetime.stopwatch : StopWatch, AutoStart;
 	import core.time : seconds, msecs;
 	import core.sys.posix.signal : SIGKILL;
 
 	// Trap (ignore) SIGTERM, then sleep; only SIGKILL can stop this child.
-	auto pipes = () @trusted {
-		return pipeProcess(["sh", "-c", "trap '' TERM; sleep 30"], Redirect.stdin | Redirect.stdout);
-	}();
-	auto proc = new StdioClientProcess(pipes, null);
+	auto transport = spawnStdioTransport(["sh", "-c", "trap '' TERM; sleep 30"]);
 
 	auto sw = StopWatch(AutoStart.yes);
-	auto status = proc.close(200.msecs, 200.msecs);
+	auto status = transport.closeProcess(200.msecs, 200.msecs);
 	assert(sw.peek < 5.seconds);
 	// SIGTERM was ignored, so the kill must have come from SIGKILL.
 	assert(status == -SIGKILL);
@@ -596,15 +472,11 @@ version (Posix) unittest  // close() escalates to SIGKILL when the child also ig
 
 version (Posix) unittest  // close() returns the child's clean exit status when it exits on stdin EOF
 {
-	import std.process : pipeProcess, Redirect;
 	import core.time : seconds;
 
 	// `cat` exits 0 once its stdin reaches EOF, so step 1 (close stdin) suffices.
-	auto pipes = () @trusted {
-		return pipeProcess(["cat"], Redirect.stdin | Redirect.stdout);
-	}();
-	auto proc = new StdioClientProcess(pipes, null);
+	auto transport = spawnStdioTransport(["cat"]);
 
-	auto status = proc.close(5.seconds, 5.seconds);
+	auto status = transport.closeProcess(5.seconds, 5.seconds);
 	assert(status == 0);
 }

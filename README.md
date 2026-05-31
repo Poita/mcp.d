@@ -279,7 +279,7 @@ void main()
         scope (exit) exitEventLoop();
         try
         {
-            auto client = new MCPClient("http://127.0.0.1:3000/mcp");
+            auto client = MCPClient.http("http://127.0.0.1:3000/mcp");
             client.initialize();
 
             auto result = client.callTool("add", Json(["a": Json(2), "b": Json(40)]));
@@ -299,21 +299,26 @@ void main()
 `readResource`, `getPrompt`, `setBearerToken` for OAuth, and `enableDraft()` for the
 stateless draft protocol.
 
+`MCPClient` is transport-agnostic: it speaks pure JSON-RPC over a
+`ClientTransport`. `MCPClient.http(url)` builds one over Streamable HTTP;
+`MCPClient.stdio(readLine, writeLine)` and `MCPClient.spawn(command)` build one
+over stdio (see below). You can also construct `new MCPClient(transport)` with a
+custom `ClientTransport` directly.
+
 ### Connecting over stdio (launching a server as a subprocess)
 
 To act as an MCP host over the **stdio** transport — launching the server as a
 child process and speaking newline-delimited JSON-RPC over its stdin/stdout —
-use `spawnStdioClient`:
+use `MCPClient.spawn`:
 
 ```d
 import mcp;
 
 void main()
 {
-    auto proc = spawnStdioClient(["dub", "run", ":calculator"]);
-    scope (exit) proc.close();   // close child's stdin and wait for exit
+    auto client = MCPClient.spawn(["dub", "run", ":calculator"]);
+    scope (exit) client.close();   // close child's stdin and wait for exit
 
-    auto client = proc.client;   // a StdioClient with the same feature methods
     client.initialize();
 
     auto tools = client.listTools();
@@ -322,11 +327,11 @@ void main()
 }
 ```
 
-`StdioClient` exposes the same `initialize` / `listTools` / `callTool` /
+The same `MCPClient` API (`initialize` / `listTools` / `callTool` /
 `listResources` / `readResource` / `listPrompts` / `getPrompt` / `subscribe` /
-`setLogLevel` API as `MCPClient`. It is transport-pure (constructed from a
-`readLine`/`writeLine` pair), so you can also drive a server over any custom
-byte channel; `spawnStdioClient` is the convenience wrapper around
+`setLogLevel`) works over every transport. For a custom byte channel, use
+`MCPClient.stdio(readLine, writeLine)` with your own `readLine`/`writeLine`
+pair; `MCPClient.spawn` is the convenience wrapper around
 `std.process.pipeProcess`. The server side is `runStdio(server)` /
 `serveStdio` in `mcp.transport.stdio`.
 

@@ -60,7 +60,7 @@ private int runScenario(string url, string scenario) @safe
 	if (scenario.startsWith("auth/"))
 		return runAuthScenario(url, scenario);
 
-	auto client = new MCPClient(url);
+	auto client = MCPClient.http(url);
 	client.capabilities.sampling = true;
 	client.capabilities.elicitation = true;
 	client.capabilities.roots = true;
@@ -291,7 +291,7 @@ private int runAuthScenario(string url, string scenario) @safe
 
 	if (tokens.accessToken.length)
 	{
-		auto mcp = new MCPClient(url);
+		auto mcp = MCPClient.http(url);
 		mcp.setBearerToken(tokens.accessToken);
 		try
 			mcp.initialize();

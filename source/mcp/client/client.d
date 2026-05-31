@@ -4,9 +4,6 @@ import std.algorithm : canFind, startsWith;
 import std.typecons : Nullable, nullable;
 
 import vibe.data.json : Json, parseJsonString;
-import vibe.http.client : requestHTTP, HTTPClientRequest, HTTPClientResponse;
-import vibe.http.common : HTTPMethod;
-import vibe.stream.operations : readAllUTF8, readLine;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
@@ -15,20 +12,10 @@ import mcp.protocol.capabilities;
 import mcp.protocol.types;
 import mcp.protocol.sampling : validateSamplingMessages;
 import mcp.protocol.draft;
-
-/// Internal signal that the modern single-endpoint POST returned an HTTP
-/// 400/404/405, the trigger for the legacy HTTP+SSE (2024-11-05) fallback.
-private final class LegacyFallbackException : Exception
-{
-	int status;
-	this(int status) @safe
-	{
-		import std.conv : to;
-
-		super("legacy HTTP+SSE fallback (HTTP " ~ status.to!string ~ ")");
-		this.status = status;
-	}
-}
+import mcp.client.transport : ClientTransport;
+import mcp.client.http_transport : HttpClientTransport, LegacyFallbackException;
+import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
+import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 
 /// A progress token attached to an outgoing request so the server may emit
 /// `notifications/progress` for it. Per basic/utilities/progress, "Progress
@@ -83,95 +70,23 @@ Json withProgressToken(Json params, ProgressToken token) @safe
 	return params;
 }
 
-/// The set of change-notification types a draft client opts into when opening a
-/// `subscriptions/listen` stream (draft basic/utilities/subscriptions). The three
-/// list-changed booleans request `notifications/tools|prompts|resources/list_changed`;
-/// `resourceSubscriptions` lists the resource URIs the client wants
-/// `notifications/resources/updated` for. This is serialised under
-/// `params.notifications` (a `SubscriptionFilter`) by `subscriptionsListen`.
-struct SubscriptionFilter
-{
-	/// Opt into `notifications/tools/list_changed`.
-	bool toolsListChanged;
-	/// Opt into `notifications/prompts/list_changed`.
-	bool promptsListChanged;
-	/// Opt into `notifications/resources/list_changed`.
-	bool resourcesListChanged;
-	/// Resource URIs to receive `notifications/resources/updated` for.
-	string[] resourceSubscriptions;
-}
-
-/// A handle to an open `subscriptions/listen` stream. The stream runs on a
-/// background task, dispatching the leading
-/// `notifications/subscriptions/acknowledged` and every subsequent opted-in
-/// change notification to the client's `onNotification` (and `onProgress`).
-/// Call `cancel()` (alias `close()`) to stop listening; the background task then
-/// closes the connection and terminates.
-final class SubscriptionStream
-{
-	private shared(bool)* cancelled_;
-
-	private this(shared(bool)* cancelled) @safe nothrow @nogc
-	{
-		cancelled_ = cancelled;
-	}
-
-	/// Request that the stream stop and its background task terminate. Idempotent.
-	void cancel() @safe nothrow @nogc
-	{
-		if (cancelled_ !is null)
-			*cancelled_ = true;
-	}
-
-	/// Alias for `cancel()`.
-	void close() @safe nothrow @nogc
-	{
-		cancel();
-	}
-
-	/// Whether `cancel()`/`close()` has been called.
-	bool cancelled() const @safe nothrow @nogc
-	{
-		return cancelled_ !is null && *cancelled_;
-	}
-}
-
-/// A Model Context Protocol client over the Streamable HTTP transport.
+/// A Model Context Protocol client, transport-agnostic.
 ///
+/// Speaks pure JSON-RPC + protocol logic over a `ClientTransport` (Streamable
+/// HTTP via `MCPClient.http`/`MCPClient.spawn`, or stdio via `MCPClient.stdio`).
 /// Drives the lifecycle (`initialize` + `notifications/initialized`) and the
 /// server features (tools, resources, prompts, completion, logging,
-/// subscriptions) with auto-pagination. Server->client requests received on a
-/// POST's SSE stream (sampling / elicitation / roots) are dispatched to the
-/// user-supplied handlers and answered on a fresh POST.
+/// subscriptions) with auto-pagination. Server->client requests received on an
+/// inbound stream (sampling / elicitation / roots) are dispatched to the
+/// user-supplied handlers and answered via the transport.
 final class MCPClient
 {
-	private string url;
-	private string sessionId;
+	// The byte transport (HTTP/stdio). All JSON-RPC I/O routes through it.
+	private ClientTransport transport;
 	private ProtocolVersion negotiated = latestStable;
 	private bool didInitialize;
 	private bool useDraft;
-	private string bearerToken;
 	private long nextId = 1;
-	// SSE resumability: the most recent `id:`/`retry:` seen on a response stream,
-	// and the Last-Event-ID to send when retrying after a premature stream close.
-	private string sseLastEventId;
-	private long sseRetryMs;
-	private string pendingLastEventId;
-	// Legacy HTTP+SSE (2024-11-05) transport state. When `legacyMode` is set,
-	// JSON-RPC messages are POSTed to `legacyEndpoint` (discovered from the GET
-	// stream's `endpoint` event) and responses arrive on the standalone GET SSE
-	// stream rather than on the POST response.
-	private bool legacyMode;
-	private string legacyEndpoint;
-	// The most recent HTTP status seen on a POST, so the lifecycle code can
-	// detect the 400/404/405 backward-compatibility trigger.
-	private int lastPostStatus;
-	// When awaiting a legacy response on the GET stream, the id we expect and
-	// the slot the GET-stream reader fills in.
-	private long legacyExpectId;
-	private Json legacyResult;
-	private bool legacyGot;
-	private McpException legacyErr;
 	// Opt-in: validate tool results against the tool's outputSchema (client side).
 	private bool validateOutputSchema_;
 	// URL-mode elicitation correlation: ids the server asked us to complete via
@@ -192,7 +107,8 @@ final class MCPClient
 	// Tool inputSchemas seen via tools/list, keyed by tool name. Used by the
 	// draft client to mirror x-mcp-header-annotated tool-call arguments into
 	// Mcp-Param-{Name} headers (draft basic/transports, "Custom Headers from
-	// Tool Parameters"). Populated by listTools; consumed by addDraftHeaders.
+	// Tool Parameters"). Populated by listTools; consumed by `customHeadersFor`,
+	// which the HTTP transport calls to obtain the per-message headers.
 	private Json[string] toolInputSchemas_;
 
 	/// Capabilities this client advertises at initialize.
@@ -233,10 +149,59 @@ final class MCPClient
 	/// the UI / display severity visually.
 	void delegate(LogMessageNotification n) @safe onLogMessage;
 
-	this(string url, Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
+	/// Construct over an explicit `ClientTransport`. The client installs its
+	/// inbound dispatcher (and, for the HTTP transport, the per-message header /
+	/// cancelled-response callbacks) on the transport.
+	this(ClientTransport transport,
+			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
 	{
-		this.url = url;
+		this.transport = transport;
 		this.clientInfo = clientInfo;
+		transport.setInboundHandler(&dispatchInbound);
+		// The HTTP transport delegates the protocol-derived request headers and
+		// the cancelled-response check back to the client, so the draft-header /
+		// schema-cache logic and the cancellation set stay here.
+		if (auto http = cast(HttpClientTransport) transport)
+		{
+			http.setCustomHeaders(&customHeadersFor);
+			http.setResponseCancelledPredicate(&isResponseCancelled);
+		}
+	}
+
+	/// Build a client over the Streamable HTTP transport at `url`.
+	static MCPClient http(string url,
+			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
+	{
+		return new MCPClient(new HttpClientTransport(url), clientInfo);
+	}
+
+	/// Build a client over the stdio transport, exchanging newline-delimited
+	/// JSON-RPC over the supplied `readLine`/`writeLine` channel (symmetric to
+	/// `mcp.transport.stdio.serveStdio`). `readLine` returns the next server line
+	/// (without its terminator) or `null` at end-of-input; `writeLine` emits one
+	/// message line (the sink appends the terminator).
+	static MCPClient stdio(string delegate() @safe readLine, void delegate(string) @safe writeLine,
+			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
+	{
+		return new MCPClient(new StdioClientTransport(readLine, writeLine), clientInfo);
+	}
+
+	/// Launch an MCP server as a subprocess and build a client over its
+	/// stdin/stdout (stderr inherited for logging). `command` is the command line
+	/// (`command[0]` is the executable). The returned client is NOT yet
+	/// initialized — call `initialize()` (or `ping()` for a stateless probe).
+	/// `close()` runs the MCP stdio shutdown sequence on the subprocess.
+	static MCPClient spawn(string[] command,
+			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
+	{
+		return new MCPClient(spawnStdioTransport(command), clientInfo);
+	}
+
+	/// Release the underlying transport (stdio terminates the subprocess; HTTP
+	/// stops any background streams).
+	void close() @safe
+	{
+		transport.close();
 	}
 
 	/// The protocol version negotiated with the server (valid after initialize).
@@ -264,10 +229,11 @@ final class MCPClient
 	}
 
 	/// Attach an OAuth bearer access token, sent as `Authorization: Bearer
-	/// <token>` on every subsequent request. Pass an empty string to clear it.
+	/// <token>` on every subsequent request (HTTP transport). Pass an empty
+	/// string to clear it; a no-op over stdio.
 	void setBearerToken(string token) @safe
 	{
-		bearerToken = token;
+		transport.setBearerToken(token);
 	}
 
 	/// Perform the initialize handshake and send `notifications/initialized`.
@@ -315,8 +281,10 @@ final class MCPClient
 		{
 			// Modern POST rejected with 400/404/405: this is (or may be) an old
 			// HTTP+SSE server. Open the GET SSE stream, read its `endpoint`
-			// event, and drive the two-endpoint legacy transport.
-			startLegacyHttpSse();
+			// event, and drive the two-endpoint legacy transport. This fallback
+			// is an HTTP-transport concern.
+			if (auto http = cast(HttpClientTransport) transport)
+				http.startLegacyHttpSse();
 			initialize(ProtocolVersion.v2024_11_05.toWire);
 			return negotiated;
 		}
@@ -790,24 +758,12 @@ final class MCPClient
 	/// pre-draft servers do not implement `subscriptions/listen`.
 	SubscriptionStream subscriptionsListen(SubscriptionFilter filter) @safe
 	{
-		import vibe.core.core : runTask;
-
 		const id = nextId++;
 		Json params = buildSubscriptionsListenParams(filter);
 		if (useDraft)
 			params = injectDraftMeta(params);
 		auto message = makeRequest(Json(id), "subscriptions/listen", params);
-
-		auto cancelled = () @trusted { return new shared bool(false); }();
-		auto stream = new SubscriptionStream(cancelled);
-		runTask(() nothrow{
-			try
-				runListenStream(message, cancelled);
-			catch (Exception)
-			{
-			}
-		});
-		return stream;
+		return transport.openListen(message);
 	}
 
 	/// Build the `subscriptions/listen` params, nesting the filter under
@@ -861,9 +817,7 @@ final class MCPClient
 		if (useDraft)
 			params = injectDraftMeta(params);
 		auto message = makeRequest(Json(id), method, params);
-		if (legacyMode)
-			return legacyRpc(message, id);
-		return postAndAwait(message, id);
+		return transport.deliver(message, id);
 	}
 
 	/// Add the draft per-request `_meta` (protocol version, client identity,
@@ -895,7 +849,7 @@ final class MCPClient
 			onNotifyForTest(message);
 			return;
 		}
-		post(message);
+		transport.sendOneway(message);
 	}
 
 	/// Send an arbitrary client-originated JSON-RPC notification to the server
@@ -965,320 +919,58 @@ final class MCPClient
 		notify("notifications/roots/list_changed", Json.emptyObject);
 	}
 
-	/// POST a message that expects no correlated reply (notification/response).
-	/// In legacy HTTP+SSE mode, messages go to the server-supplied endpoint URI.
-	private void post(Json message) @safe
+	/// Compute the protocol-derived request headers for an outgoing `message`,
+	/// supplied to the HTTP transport via `setCustomHeaders`. For a draft client,
+	/// this is the `MCP-Protocol-Version` header plus the standard `Mcp-Method` /
+	/// `Mcp-Name` headers and any `Mcp-Param-*` mirrored tool arguments (draft
+	/// basic/transports). For a stable client it is just `MCP-Protocol-Version`
+	/// after initialize. Called with `Json.undefined` (no message — e.g. the GET
+	/// server stream) it returns only the version header. Keeps the draft-header
+	/// logic and the tool inputSchema cache in the client rather than the
+	/// transport.
+	private string[string] customHeadersFor(Json message) @safe
 	{
-		const target = legacyMode ? legacyEndpoint : url;
-		() @trusted {
-			requestHTTP(target, (scope HTTPClientRequest req) {
-				setupRequest(req, message);
-			}, (scope HTTPClientResponse res) {
-				captureSession(res);
-				res.dropBody();
-			});
-		}();
-	}
-
-	/// POST a request and await the response with id `expectId`, processing any
-	/// SSE notifications and server->client requests in between. If the response
-	/// SSE stream closes before the final response and carried an SSE `retry:`
-	/// hint, wait that long and reconnect (resuming with `Last-Event-ID`), per
-	/// the Streamable HTTP resumability rules.
-	private Json postAndAwait(Json message, long expectId) @safe
-	{
-		import core.time : msecs;
-		import vibe.core.core : sleep;
-
-		Json result = Json.undefined;
-		bool got;
-		McpException err;
-		sseRetryMs = 0;
-		sseLastEventId = null;
-
-		() @trusted {
-			requestHTTP(url, (scope HTTPClientRequest req) {
-				setupRequest(req, message);
-			}, (scope HTTPClientResponse res) {
-				captureSession(res);
-				lastPostStatus = res.statusCode;
-				if (isLegacyFallbackStatus(res.statusCode))
-				{
-					// Per draft basic/transports §Backward Compatibility, a 400/404/405
-					// may carry a modern JSON-RPC error proving the peer is NOT a legacy
-					// HTTP+SSE server. Read the body and surface a recognized modern
-					// error as a typed McpException (so `connect` takes the
-					// discover/version-negotiation paths) instead of falling back. Only
-					// an empty/unrecognized body triggers the legacy fallback below.
-					string body4xx;
-					try
-						body4xx = res.bodyReader.readAllUTF8();
-					catch (Exception)
-						body4xx = null;
-					McpException modernErr;
-					if (modernErrorFromBody(body4xx, modernErr))
-						err = modernErr;
-					return; // signalled below via lastPostStatus / err
-				}
-				const ct = res.headers.get("Content-Type", "");
-				if (ct.canFind("text/event-stream"))
-				{
-					readSse(res, expectId, result, got, err);
-				}
-				else
-				{
-					auto body = res.bodyReader.readAllUTF8();
-					auto msg = parseMessage(body);
-					if (msg.kind == MessageKind.errorResponse)
-						err = errorFrom(msg.error);
-					else
-					{
-						result = msg.result;
-						got = true;
-					}
-				}
-			});
-		}();
-
-		// An HTTP 400/404/405 on the modern single endpoint is the signal to try
-		// the legacy HTTP+SSE (2024-11-05) transport. Surface it as a typed
-		// exception so the lifecycle code (`connect`) can drive the fallback.
-		if (isLegacyFallbackStatus(lastPostStatus) && !got && err is null)
-			throw new LegacyFallbackException(lastPostStatus);
-
-		if (err !is null)
-			throw err;
-		if (got)
-			return result;
-
-		// Premature stream close with an SSE `retry:` hint: wait the prescribed
-		// delay, then RESUME the stream with a GET carrying `Last-Event-ID`
-		// (per Streamable HTTP resumability — not a re-POST of the request).
-		if (sseRetryMs > 0)
-		{
-			sleep(sseRetryMs.msecs);
-			resumeViaGet(expectId, sseLastEventId, result, got, err);
-			if (err !is null)
-				throw err;
-			if (got)
-				return result;
-		}
-		throw internalError("No response received for request " ~ method2(expectId));
-	}
-
-	/// Resume a closed response stream via `GET` with `Last-Event-ID`, reading
-	/// the resumed SSE stream until the awaited response (`expectId`) arrives.
-	private void resumeViaGet(long expectId, string lastEventId, ref Json result,
-			ref bool got, ref McpException err) @safe
-	{
-		import vibe.core.net : connectTCP;
-		import vibe.stream.operations : readLine;
-		import vibe.core.stream : IOMode;
-		import std.string : indexOf, startsWith, strip, toLower;
-		import std.conv : to, parse;
-
-		auto rest = url;
-		const sep = rest.indexOf("://");
-		if (sep >= 0)
-			rest = rest[sep + 3 .. $];
-		const slash = rest.indexOf('/');
-		const hostPort = (slash < 0) ? rest : rest[0 .. slash];
-		const path = (slash < 0) ? "/" : rest[slash .. $];
-		const colon = hostPort.indexOf(':');
-		const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
-		const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
-
-		() @trusted {
-			try
-			{
-				auto conn = connectTCP(host, port);
-				scope (exit)
-					conn.close();
-				string req = "GET " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
-					~ "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n";
-				if (sessionId.length)
-					req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
-				if (didInitialize)
-					req ~= "MCP-Protocol-Version: " ~ negotiated.toWire ~ "\r\n";
-				if (lastEventId.length)
-					req ~= "Last-Event-ID: " ~ lastEventId ~ "\r\n";
-				req ~= "\r\n";
-				conn.write(cast(const(ubyte)[]) req);
-
-				auto statusLine = cast(string) readLine(conn).idup;
-				if (statusLine.indexOf(" 200") < 0)
-					return;
-				bool chunked;
-				for (;;)
-				{
-					auto h = cast(string) readLine(conn).idup;
-					if (h.length && h[$ - 1] == '\r')
-						h = h[0 .. $ - 1];
-					if (h.toLower.indexOf("transfer-encoding:") == 0
-							&& h.toLower.indexOf("chunked") >= 0)
-						chunked = true;
-					if (h.length == 0)
-						break;
-				}
-
-				string acc, data;
-				bool done;
-				void parseSse()
-				{
-					for (;;)
-					{
-						const nl = acc.indexOf('\n');
-						if (nl < 0)
-							break;
-						auto line = acc[0 .. nl];
-						acc = acc[nl + 1 .. $];
-						if (line.length && line[$ - 1] == '\r')
-							line = line[0 .. $ - 1];
-						if (line.length == 0)
-						{
-							if (data.length)
-							{
-								try
-								{
-									auto m = Message(parseJsonString(data));
-									if ((m.kind == MessageKind.response
-											|| m.kind == MessageKind.errorResponse)
-											&& m.id.type == Json.Type.int_
-											&& m.id.get!long == expectId)
-									{
-										if (m.kind == MessageKind.errorResponse)
-											err = errorFrom(m.error);
-										else
-										{
-											result = m.result;
-											got = true;
-										}
-										done = true;
-									}
-									else
-										dispatchInbound(m);
-								}
-								catch (Exception)
-								{
-								}
-								data = null;
-							}
-						}
-						else if (line.startsWith("data:"))
-						{
-							auto d = line["data:".length .. $];
-							if (d.startsWith(" "))
-								d = d[1 .. $];
-							data ~= (data.length ? "\n" : "") ~ d;
-						}
-					}
-				}
-
-				for (;;)
-				{
-					if (done)
-						break;
-					if (chunked)
-					{
-						auto sizeLine = (cast(string) readLine(conn).idup).strip;
-						if (sizeLine.length == 0)
-							continue;
-						uint sz;
-						try
-							sz = parse!uint(sizeLine, 16);
-						catch (Exception)
-							break;
-						if (sz == 0)
-							break;
-						auto chunk = new ubyte[sz];
-						conn.read(chunk, IOMode.all);
-						acc ~= cast(string) chunk.idup;
-						readLine(conn);
-						parseSse();
-					}
-					else
-					{
-						const avail = conn.leastSize;
-						if (avail == 0)
-							break;
-						const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
-						auto buf = new ubyte[toRead];
-						conn.read(buf, IOMode.once);
-						acc ~= cast(string) buf.idup;
-						parseSse();
-					}
-				}
-			}
-			catch (Exception)
-			{
-			}
-		}();
-	}
-
-	private static string method2(long id) @safe
-	{
-		import std.conv : to;
-
-		return id.to!string;
-	}
-
-	private void setupRequest(scope HTTPClientRequest req, Json message) @safe
-	{
-		req.method = HTTPMethod.POST;
-		req.headers["Accept"] = "application/json, text/event-stream";
-		req.contentType = "application/json";
-		if (bearerToken.length)
-			req.headers["Authorization"] = "Bearer " ~ bearerToken;
-		if (sessionId.length)
-			req.headers["Mcp-Session-Id"] = sessionId;
+		string[string] headers;
 		if (useDraft)
-			addDraftHeaders(req, message);
-		else if (didInitialize)
-			req.headers["MCP-Protocol-Version"] = negotiated.toWire;
-		if (pendingLastEventId.length)
-			req.headers["Last-Event-ID"] = pendingLastEventId;
-		req.writeBody(cast(const(ubyte)[]) message.toString());
-	}
-
-	/// Add the draft standard request headers (`MCP-Protocol-Version`,
-	/// `Mcp-Method`, and `Mcp-Name` for tools/call, resources/read, prompts/get)
-	/// derived from the outgoing message.
-	private void addDraftHeaders(scope HTTPClientRequest req, Json message) @safe
-	{
-		req.headers[HttpHeader.protocolVersion] = negotiated.toWire;
-		if ("method" !in message)
-			return; // a response to a server-initiated input request
-		const method = message["method"].get!string;
-		req.headers[HttpHeader.method] = method;
-		auto params = ("params" in message) ? message["params"] : Json.emptyObject;
-		string name;
-		if (method == "tools/call" || method == "prompts/get")
 		{
-			if ("name" in params && params["name"].type == Json.Type.string)
-				name = params["name"].get!string;
-		}
-		else if (method == "resources/read")
-		{
-			if ("uri" in params && params["uri"].type == Json.Type.string)
-				name = params["uri"].get!string;
-		}
-		if (name.length)
-			req.headers[HttpHeader.name] = name;
-
-		// Mirror x-mcp-header-annotated tool arguments into Mcp-Param-{Name}
-		// headers (draft basic/transports, "Custom Headers from Tool
-		// Parameters"): clients MUST inspect the tool's inputSchema and append a
-		// header for each annotated argument that is present and non-null.
-		if (method == "tools/call" && name.length)
-		{
-			auto schema = name in toolInputSchemas_;
-			if (schema !is null)
+			headers[HttpHeader.protocolVersion] = negotiated.toWire;
+			if (message.type != Json.Type.object || "method" !in message)
+				return headers; // no message (GET stream) or a response: version only
+			const method = message["method"].get!string;
+			headers[HttpHeader.method] = method;
+			auto params = ("params" in message) ? message["params"] : Json.emptyObject;
+			string name;
+			if (method == "tools/call" || method == "prompts/get")
 			{
-				auto args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
-				foreach (header, value; paramHeaders(*schema, args))
-					req.headers[header] = value;
+				if ("name" in params && params["name"].type == Json.Type.string)
+					name = params["name"].get!string;
+			}
+			else if (method == "resources/read")
+			{
+				if ("uri" in params && params["uri"].type == Json.Type.string)
+					name = params["uri"].get!string;
+			}
+			if (name.length)
+				headers[HttpHeader.name] = name;
+
+			// Mirror x-mcp-header-annotated tool arguments into Mcp-Param-{Name}
+			// headers (draft basic/transports, "Custom Headers from Tool
+			// Parameters"): clients MUST inspect the tool's inputSchema and append a
+			// header for each annotated argument that is present and non-null.
+			if (method == "tools/call" && name.length)
+			{
+				auto schema = name in toolInputSchemas_;
+				if (schema !is null)
+				{
+					auto args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
+					foreach (header, value; paramHeaders(*schema, args))
+						headers[header] = value;
+				}
 			}
 		}
+		else if (didInitialize)
+			headers["MCP-Protocol-Version"] = negotiated.toWire;
+		return headers;
 	}
 
 	/// Compute the `Mcp-Param-*` headers to emit for a `tools/call`, given the
@@ -1328,116 +1020,6 @@ final class MCPClient
 		return headers;
 	}
 
-	private void captureSession(scope HTTPClientResponse res) @safe
-	{
-		if ("Mcp-Session-Id" in res.headers)
-			sessionId = res.headers["Mcp-Session-Id"];
-	}
-
-	/// Read an SSE stream, dispatching messages until the awaited response.
-	///
-	/// Blocks on `readLine` rather than polling `empty`: an SSE stream may stay
-	/// open and idle between events (e.g. while the server awaits our reply to a
-	/// server->client request), and `empty` can spuriously report end-of-stream
-	/// in that window. A read exception signals the stream has closed.
-	private void readSse(scope HTTPClientResponse res, long expectId,
-			ref Json result, ref bool got, ref McpException err) @safe
-	{
-		string dataBuf;
-		for (;;)
-		{
-			string line;
-			bool eof;
-			() @trusted {
-				try
-					line = cast(string) readLine(res.bodyReader, size_t.max, "\n").idup;
-				catch (Exception)
-					eof = true;
-			}();
-			if (eof)
-				break;
-			if (line.length && line[$ - 1] == '\r')
-				line = line[0 .. $ - 1];
-
-			if (line.length == 0)
-			{
-				if (dataBuf.length)
-				{
-					dispatchSse(dataBuf, expectId, result, got, err);
-					dataBuf = null;
-					if (got || err !is null)
-						return;
-				}
-				continue;
-			}
-			if (line.startsWith("data:"))
-			{
-				auto d = line["data:".length .. $];
-				if (d.startsWith(" "))
-					d = d[1 .. $];
-				dataBuf ~= (dataBuf.length ? "\n" : "") ~ d;
-			}
-			else if (line.startsWith("id:"))
-			{
-				import std.string : strip;
-
-				sseLastEventId = line["id:".length .. $].strip;
-			}
-			else if (line.startsWith("retry:"))
-			{
-				import std.string : strip;
-				import std.conv : to;
-
-				try
-					sseRetryMs = line["retry:".length .. $].strip.to!long;
-				catch (Exception)
-				{
-				}
-			}
-		}
-		// Flush a trailing event with no terminating blank line.
-		if (dataBuf.length && !got && err is null)
-			dispatchSse(dataBuf, expectId, result, got, err);
-	}
-
-	private void dispatchSse(string data, long expectId, ref Json result,
-			ref bool got, ref McpException err) @safe
-	{
-		Message msg;
-		try
-			msg = Message(parseJsonString(data));
-		catch (Exception)
-			return; // ignore non-JSON SSE comments/heartbeats
-
-		// A response for a request we have cancelled is ignored per spec, even if
-		// it matches the id we are awaiting.
-		if ((msg.kind == MessageKind.response || msg.kind == MessageKind.errorResponse)
-				&& msg.id.type == Json.Type.int_ && isResponseCancelled(msg.id.get!long))
-			return;
-
-		final switch (msg.kind)
-		{
-		case MessageKind.response:
-			if (msg.id.type == Json.Type.int_ && msg.id.get!long == expectId)
-			{
-				result = msg.result;
-				got = true;
-			}
-			break;
-		case MessageKind.errorResponse:
-			if (msg.id.type == Json.Type.int_
-					&& msg.id.get!long == expectId)
-				err = errorFrom(msg.error);
-			break;
-		case MessageKind.request:
-			handleServerRequest(msg);
-			break;
-		case MessageKind.notification:
-			dispatchNotification(msg.method, msg.params);
-			break;
-		}
-	}
-
 	/// Forward an inbound notification to `onNotification`, applying the protocol
 	/// rules for notifications the SDK understands. Currently this enforces the
 	/// URL-mode elicitation rule (basic/utilities/elicitation §"Completion
@@ -1472,7 +1054,7 @@ final class MCPClient
 			onNotification(method, params);
 	}
 
-	/// Dispatch a message arriving on the standalone GET SSE stream: server->
+	/// Dispatch an inbound message handed up by the transport: server->
 	/// client requests and notifications (never an awaited response).
 	private void dispatchInbound(Message msg) @safe
 	{
@@ -1490,608 +1072,21 @@ final class MCPClient
 		}
 	}
 
-	/// Open the standalone server->client SSE stream (`GET /mcp`) in a background
-	/// task, so the server can deliver sampling / elicitation / roots requests
-	/// and notifications outside of any POST response. A server that does not
-	/// offer this stream (e.g. responds 405) is tolerated as a no-op.
+	/// Open the standalone server->client stream (HTTP GET SSE), so the server
+	/// can deliver sampling / elicitation / roots requests and notifications
+	/// outside of any request response. A no-op on stdio (and tolerated as a
+	/// no-op when an HTTP server does not offer the stream).
 	void startServerStream() @safe
 	{
-		import vibe.core.core : runTask;
-
-		runTask(() nothrow{
-			try
-				runServerStream();
-			catch (Exception)
-			{
-			}
-		});
-	}
-
-	/// Extract complete SSE events (terminated by a blank line) from `acc`,
-	/// dispatch each as an inbound message, and return the unconsumed remainder.
-	private string drainSseEvents(string acc) @safe
-	{
-		import std.array : replace;
-		import std.string : indexOf, splitLines, startsWith;
-
-		acc = acc.replace("\r\n", "\n");
-		for (;;)
-		{
-			const b = acc.indexOf("\n\n");
-			if (b < 0)
-				break;
-			auto event = acc[0 .. b];
-			acc = acc[b + 2 .. $];
-			string data;
-			foreach (line; event.splitLines())
-			{
-				if (line.startsWith("data:"))
-				{
-					auto d = line["data:".length .. $];
-					if (d.startsWith(" "))
-						d = d[1 .. $];
-					data ~= (data.length ? "\n" : "") ~ d;
-				}
-			}
-			if (data.length)
-			{
-				try
-					dispatchInbound(Message(parseJsonString(data)));
-				catch (Exception)
-				{
-				}
-			}
-		}
-		return acc;
-	}
-
-	/// Open the standalone server->client SSE stream over a raw TCP connection
-	/// (vibe's pooled `requestHTTP` does not reliably surface a long-lived,
-	/// idle-then-active SSE body). Honors the SSE `retry:` field and resumes with
-	/// `Last-Event-ID` on reconnect, up to a few attempts.
-	private void runServerStream() @safe
-	{
-		import vibe.core.net : connectTCP;
-		import vibe.stream.operations : readLine;
-		import std.string : indexOf, startsWith, strip;
-		import std.conv : to;
-		import core.time : msecs;
-		import vibe.core.core : sleep;
-
-		// Parse scheme://host[:port]/path.
-		auto rest = url;
-		const sep = rest.indexOf("://");
-		if (sep >= 0)
-			rest = rest[sep + 3 .. $];
-		const slash = rest.indexOf('/');
-		const hostPort = (slash < 0) ? rest : rest[0 .. slash];
-		const path = (slash < 0) ? "/" : rest[slash .. $];
-		const colon = hostPort.indexOf(':');
-		const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
-		const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
-
-		string lastEventId;
-		long retryMs = 0;
-		foreach (attempt; 0 .. 2)
-		{
-			bool sawData;
-			() @trusted {
-				try
-				{
-					auto conn = connectTCP(host, port);
-					scope (exit)
-						conn.close();
-
-					string req = "GET " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
-						~ "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n";
-					if (sessionId.length)
-						req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
-					if (didInitialize)
-						req ~= "MCP-Protocol-Version: " ~ negotiated.toWire ~ "\r\n";
-					if (lastEventId.length)
-						req ~= "Last-Event-ID: " ~ lastEventId ~ "\r\n";
-					req ~= "\r\n";
-					conn.write(cast(const(ubyte)[]) req);
-
-					import vibe.core.stream : IOMode;
-					import std.conv : parse;
-
-					// Status line + headers (note chunked transfer-encoding).
-					auto statusLine = cast(string) readLine(conn).idup;
-					if (statusLine.indexOf(" 200") < 0)
-						return;
-					bool chunked;
-					for (;;)
-					{
-						auto h = cast(string) readLine(conn).idup;
-						if (h.length && h[$ - 1] == '\r')
-							h = h[0 .. $ - 1];
-						import std.string : toLower;
-
-						if (h.toLower.indexOf("transfer-encoding:") == 0
-								&& h.toLower.indexOf("chunked") >= 0)
-							chunked = true;
-						if (h.length == 0)
-							break;
-					}
-
-					// SSE parser shared across chunk boundaries.
-					string acc, data;
-					void parseSse()
-					{
-						for (;;)
-						{
-							const nl = acc.indexOf('\n');
-							if (nl < 0)
-								break;
-							auto line = acc[0 .. nl];
-							acc = acc[nl + 1 .. $];
-							if (line.length && line[$ - 1] == '\r')
-								line = line[0 .. $ - 1];
-							if (line.length == 0)
-							{
-								if (data.length)
-								{
-									sawData = true;
-									try
-										dispatchInbound(Message(parseJsonString(data)));
-									catch (Exception)
-									{
-									}
-									data = null;
-								}
-							}
-							else if (line.startsWith("data:"))
-							{
-								auto d = line["data:".length .. $];
-								if (d.startsWith(" "))
-									d = d[1 .. $];
-								data ~= (data.length ? "\n" : "") ~ d;
-							}
-							else if (line.startsWith("id:"))
-								lastEventId = line["id:".length .. $].strip;
-							else if (line.startsWith("retry:"))
-							{
-								try
-									retryMs = line["retry:".length .. $].strip.to!long;
-								catch (Exception)
-								{
-								}
-							}
-						}
-					}
-
-					// Body loop: decode chunked transfer-encoding (each chunk is a
-					// hex size line, that many bytes, then CRLF), feeding the SSE
-					// parser; or read raw to EOF when not chunked.
-					for (;;)
-					{
-						if (chunked)
-						{
-							auto sizeLine = (cast(string) readLine(conn).idup).strip;
-							if (sizeLine.length == 0)
-								continue;
-							uint sz;
-							try
-							{
-								auto sl = sizeLine;
-								sz = parse!uint(sl, 16);
-							}
-							catch (Exception)
-								break;
-							if (sz == 0)
-								break; // last chunk
-							auto chunk = new ubyte[sz];
-							conn.read(chunk, IOMode.all);
-							acc ~= cast(string) chunk.idup;
-							readLine(conn); // trailing CRLF after the chunk data
-							parseSse();
-						}
-						else
-						{
-							const avail = conn.leastSize;
-							if (avail == 0)
-								break;
-							const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
-							auto buf = new ubyte[toRead];
-							conn.read(buf, IOMode.once);
-							acc ~= cast(string) buf.idup;
-							parseSse();
-						}
-					}
-				}
-				catch (Exception)
-				{
-				}
-			}();
-
-			// Reconnect honoring the server-provided retry delay (SSE `retry:`).
-			if (retryMs > 0)
-				sleep(retryMs.msecs);
-			else if (!sawData)
-				break; // stream unavailable and no retry hint: stop
-		}
-	}
-
-	/// Drive a `subscriptions/listen` stream over a raw TCP connection: POST the
-	/// listen request, read the server's long-lived `text/event-stream` response,
-	/// and dispatch every inbound message (the leading
-	/// `notifications/subscriptions/acknowledged` and subsequent change
-	/// notifications) via `dispatchInbound`. The loop checks `*cancelled` between
-	/// reads and on each SSE event, closing the connection promptly once the
-	/// caller cancels. A raw TCP POST is used (rather than vibe's pooled
-	/// `requestHTTP`) for the same reason as `runServerStream`: a long-lived,
-	/// idle-then-active SSE body is not reliably surfaced by the pooled client.
-	private void runListenStream(Json message, shared(bool)* cancelled) @safe
-	{
-		import vibe.core.net : connectTCP;
-		import vibe.stream.operations : readLine;
-		import vibe.core.stream : IOMode;
-		import std.string : indexOf, startsWith, strip, toLower;
-		import std.conv : to, parse;
-
-		auto rest = url;
-		const sep = rest.indexOf("://");
-		if (sep >= 0)
-			rest = rest[sep + 3 .. $];
-		const slash = rest.indexOf('/');
-		const hostPort = (slash < 0) ? rest : rest[0 .. slash];
-		const path = (slash < 0) ? "/" : rest[slash .. $];
-		const colon = hostPort.indexOf(':');
-		const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
-		const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
-
-		const 
-		body = message.toString();
-		() @trusted {
-			auto conn = connectTCP(host, port);
-			scope (exit)
-				conn.close();
-
-			string req = "POST " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
-				~ "\r\nAccept: text/event-stream\r\nContent-Type: application/json\r\n"
-				~ "Connection: keep-alive\r\n";
-			if (bearerToken.length)
-				req ~= "Authorization: Bearer " ~ bearerToken ~ "\r\n";
-			if (sessionId.length)
-				req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
-			req ~= "MCP-Protocol-Version: " ~ negotiated.toWire ~ "\r\n";
-			if (useDraft)
-			{
-				req ~= HttpHeader.protocolVersion ~ ": " ~ negotiated.toWire ~ "\r\n";
-				req ~= HttpHeader.method ~ ": subscriptions/listen\r\n";
-			}
-			import std.conv : to;
-
-			req ~= "Content-Length: " ~ body.length.to!string ~ "\r\n\r\n";
-			req ~= body;
-			conn.write(cast(const(ubyte)[]) req);
-
-			auto statusLine = cast(string) readLine(conn).idup;
-			if (statusLine.indexOf(" 200") < 0)
-				return;
-			bool chunked;
-			for (;;)
-			{
-				auto h = cast(string) readLine(conn).idup;
-				if (h.length && h[$ - 1] == '\r')
-					h = h[0 .. $ - 1];
-				if (h.toLower.indexOf("transfer-encoding:") == 0 && h.toLower.indexOf(
-						"chunked") >= 0)
-					chunked = true;
-				if (h.length == 0)
-					break;
-			}
-
-			string acc, data;
-			void parseSse()
-			{
-				for (;;)
-				{
-					const nl = acc.indexOf('\n');
-					if (nl < 0)
-						break;
-					auto line = acc[0 .. nl];
-					acc = acc[nl + 1 .. $];
-					if (line.length && line[$ - 1] == '\r')
-						line = line[0 .. $ - 1];
-					if (line.length == 0)
-					{
-						if (data.length)
-						{
-							try
-								dispatchInbound(Message(parseJsonString(data)));
-							catch (Exception)
-							{
-							}
-							data = null;
-						}
-					}
-					else if (line.startsWith("data:"))
-					{
-						auto d = line["data:".length .. $];
-						if (d.startsWith(" "))
-							d = d[1 .. $];
-						data ~= (data.length ? "\n" : "") ~ d;
-					}
-				}
-			}
-
-			for (;;)
-			{
-				if (*cancelled)
-					break;
-				if (chunked)
-				{
-					auto sizeLine = (cast(string) readLine(conn).idup).strip;
-					if (sizeLine.length == 0)
-						continue;
-					uint sz;
-					try
-					{
-						auto sl = sizeLine;
-						sz = parse!uint(sl, 16);
-					}
-					catch (Exception)
-						break;
-					if (sz == 0)
-						break; // last chunk
-					auto chunk = new ubyte[sz];
-					conn.read(chunk, IOMode.all);
-					acc ~= cast(string) chunk.idup;
-					readLine(conn); // trailing CRLF after the chunk data
-					parseSse();
-				}
-				else
-				{
-					const avail = conn.leastSize;
-					if (avail == 0)
-						break;
-					const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
-					auto buf = new ubyte[toRead];
-					conn.read(buf, IOMode.once);
-					acc ~= cast(string) buf.idup;
-					parseSse();
-				}
-			}
-		}();
-	}
-
-	/// Establish the legacy HTTP+SSE (2024-11-05) two-endpoint transport:
-	/// open the GET SSE stream at the server URL, read the first `endpoint`
-	/// event to learn the message-POST URI, then keep the stream open in a
-	/// background task to receive JSON-RPC responses and server notifications.
-	/// Throws if the `endpoint` event is not received.
-	private void startLegacyHttpSse() @safe
-	{
-		import vibe.core.core : runTask, sleep;
-		import core.time : msecs;
-
-		legacyMode = true;
-		legacyEndpoint = null;
-
-		// The GET SSE stream is long-lived: run its reader on a background task
-		// so this method can return once the `endpoint` event has arrived.
-		runTask(() nothrow{
-			try
-				runLegacyStream();
-			catch (Exception)
-			{
-			}
-		});
-
-		// Wait (bounded) for the background task to discover the endpoint URI.
-		foreach (_; 0 .. 200) // up to ~10s at 50ms granularity
-		{
-			if (legacyEndpoint.length)
-				break;
-			() @trusted { sleep(50.msecs); }();
-		}
-		if (legacyEndpoint.length == 0)
-		{
-			legacyMode = false;
-			throw internalError(
-					"legacy HTTP+SSE server did not send an `endpoint` event on the GET stream");
-		}
-	}
-
-	/// Send a JSON-RPC request over the legacy transport: POST it to the
-	/// server-supplied endpoint URI, then await the correlated response, which
-	/// arrives asynchronously on the standalone GET SSE stream.
-	private Json legacyRpc(Json message, long expectId) @safe
-	{
-		import vibe.core.core : sleep;
-		import core.time : msecs;
-
-		legacyExpectId = expectId;
-		legacyResult = Json.undefined;
-		legacyGot = false;
-		legacyErr = null;
-
-		post(message); // POST to legacyEndpoint; server replies on the GET stream
-
-		foreach (_; 0 .. 1200) // up to ~60s at 50ms granularity
-		{
-			if (legacyGot || legacyErr !is null)
-				break;
-			() @trusted { sleep(50.msecs); }();
-		}
-		legacyExpectId = 0;
-		if (legacyErr !is null)
-			throw legacyErr;
-		if (legacyGot)
-			return legacyResult;
-		throw internalError("No legacy HTTP+SSE response for request " ~ method2(expectId));
-	}
-
-	/// Read the legacy GET SSE stream over a raw TCP connection, dispatching
-	/// each event by type: an `endpoint` event sets the message-POST URI; a
-	/// `message` (or default) event is a JSON-RPC message routed to the awaited
-	/// response slot or to the inbound dispatcher.
-	private void runLegacyStream() @safe
-	{
-		import vibe.core.net : connectTCP;
-		import vibe.stream.operations : readLine;
-		import vibe.core.stream : IOMode;
-		import std.string : indexOf, startsWith, strip, toLower;
-		import std.conv : to, parse;
-
-		auto rest = url;
-		const sep = rest.indexOf("://");
-		if (sep >= 0)
-			rest = rest[sep + 3 .. $];
-		const slash = rest.indexOf('/');
-		const hostPort = (slash < 0) ? rest : rest[0 .. slash];
-		const path = (slash < 0) ? "/" : rest[slash .. $];
-		const colon = hostPort.indexOf(':');
-		const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
-		const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
-
-		() @trusted {
-			try
-			{
-				auto conn = connectTCP(host, port);
-				scope (exit)
-					conn.close();
-
-				string req = "GET " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
-					~ "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n";
-				if (bearerToken.length)
-					req ~= "Authorization: Bearer " ~ bearerToken ~ "\r\n";
-				if (sessionId.length)
-					req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
-				req ~= "\r\n";
-				conn.write(cast(const(ubyte)[]) req);
-
-				auto statusLine = cast(string) readLine(conn).idup;
-				if (statusLine.indexOf(" 200") < 0)
-					return;
-				bool chunked;
-				for (;;)
-				{
-					auto h = cast(string) readLine(conn).idup;
-					if (h.length && h[$ - 1] == '\r')
-						h = h[0 .. $ - 1];
-					if (h.toLower.indexOf("transfer-encoding:") == 0
-							&& h.toLower.indexOf("chunked") >= 0)
-						chunked = true;
-					if (h.length == 0)
-						break;
-				}
-
-				string acc, data, eventType;
-				void handleEvent()
-				{
-					scope (exit)
-					{
-						data = null;
-						eventType = null;
-					}
-					if (data.length == 0)
-						return;
-					if (eventType == "endpoint")
-					{
-						legacyEndpoint = resolveEndpointUri(url, data.strip);
-						return;
-					}
-					// `message` event (or untyped): a JSON-RPC message.
-					try
-					{
-						auto m = Message(parseJsonString(data));
-						if ((m.kind == MessageKind.response
-								|| m.kind == MessageKind.errorResponse)
-								&& m.id.type == Json.Type.int_ && m.id.get!long == legacyExpectId)
-						{
-							if (m.kind == MessageKind.errorResponse)
-								legacyErr = errorFrom(m.error);
-							else
-							{
-								legacyResult = m.result;
-								legacyGot = true;
-							}
-						}
-						else
-							dispatchInbound(m);
-					}
-					catch (Exception)
-					{
-					}
-				}
-
-				void parseSse()
-				{
-					for (;;)
-					{
-						const nl = acc.indexOf('\n');
-						if (nl < 0)
-							break;
-						auto line = acc[0 .. nl];
-						acc = acc[nl + 1 .. $];
-						if (line.length && line[$ - 1] == '\r')
-							line = line[0 .. $ - 1];
-						if (line.length == 0)
-							handleEvent();
-						else if (line.startsWith("event:"))
-						{
-							auto v = line["event:".length .. $];
-							if (v.startsWith(" "))
-								v = v[1 .. $];
-							eventType = v;
-						}
-						else if (line.startsWith("data:"))
-						{
-							auto d = line["data:".length .. $];
-							if (d.startsWith(" "))
-								d = d[1 .. $];
-							data ~= (data.length ? "\n" : "") ~ d;
-						}
-					}
-				}
-
-				for (;;)
-				{
-					if (chunked)
-					{
-						auto sizeLine = (cast(string) readLine(conn).idup).strip;
-						if (sizeLine.length == 0)
-							continue;
-						uint sz;
-						try
-							sz = parse!uint(sizeLine, 16);
-						catch (Exception)
-							break;
-						if (sz == 0)
-							break;
-						auto chunk = new ubyte[sz];
-						conn.read(chunk, IOMode.all);
-						acc ~= cast(string) chunk.idup;
-						readLine(conn);
-						parseSse();
-					}
-					else
-					{
-						const avail = conn.leastSize;
-						if (avail == 0)
-							break;
-						const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
-						auto buf = new ubyte[toRead];
-						conn.read(buf, IOMode.once);
-						acc ~= cast(string) buf.idup;
-						parseSse();
-					}
-				}
-			}
-			catch (Exception)
-			{
-			}
-		}();
+		transport.startServerStream();
 	}
 
 	/// Answer a server->client request by dispatching to the matching handler
-	/// and POSTing the response on a *separate* task. Posting on its own task is
-	/// essential: we are currently inside the SSE-read callback of the original
-	/// request, and the server will not send that request's final response until
-	/// it receives this one — a synchronous nested POST here would deadlock.
+	/// and sending the response on a *separate* task. Sending on its own task is
+	/// essential: we are currently inside the transport's inbound-read callback of
+	/// the original request, and the server will not send that request's final
+	/// response until it receives this one — a synchronous nested send here would
+	/// deadlock.
 	private void handleServerRequest(Message msg) @safe
 	{
 		import vibe.core.core : runTask;
@@ -2109,7 +1104,7 @@ final class MCPClient
 
 		runTask((Json r) nothrow{
 			try
-				post(r);
+				transport.sendOneway(r);
 			catch (Exception)
 			{
 			}
@@ -2232,156 +1227,6 @@ bool selectMutualVersion(const string[] serverVersions, out ProtocolVersion chos
 	return false;
 }
 
-/// Whether an HTTP status from the initial modern POST should trigger the
-/// legacy HTTP+SSE (2024-11-05) backward-compatibility fallback. Per
-/// basic/transports §Backwards Compatibility, a client probing a single modern
-/// endpoint should fall back when the POST fails with 400 Bad Request, 404 Not
-/// Found, or 405 Method Not Allowed.
-bool isLegacyFallbackStatus(int status) pure nothrow @safe @nogc
-{
-	return status == 400 || status == 404 || status == 405;
-}
-
-/// Whether a JSON-RPC error `code` carried in a 400/404/405 response body
-/// proves the peer speaks a *modern* MCP version (so the client should retry /
-/// correct rather than fall back to the legacy HTTP+SSE transport). Per draft
-/// basic/transports §Backward Compatibility the disambiguating modern errors a
-/// 4xx body may carry are `UnsupportedProtocolVersionError` (-32004),
-/// `HeaderMismatch` (-32001, header-validation failure),
-/// `MissingRequiredClientCapabilityError` (-32003), and — for a 404 to an
-/// unimplemented modern method — `Method not found` (-32601). These mirror the
-/// codes the SDK's own server emits via `httpStatusForResponse`.
-bool isModernRpcErrorCode(int code) pure nothrow @safe @nogc
-{
-	return code == ErrorCode.unsupportedProtocolVersion || code == ErrorCode.headerMismatch
-		|| code == ErrorCode.missingRequiredClientCapability || code == ErrorCode.methodNotFound;
-}
-
-/// Inspect a 400/404/405 response `body` for a recognized modern JSON-RPC
-/// error before deciding whether to fall back to legacy HTTP+SSE. Per draft
-/// basic/transports §Backward Compatibility: "If the body contains a recognized
-/// modern JSON-RPC error, the server speaks a modern version of MCP — retry ...
-/// rather than falling back. If the body is empty or is not a recognized modern
-/// JSON-RPC error, fall back to initialize." Returns true and sets `err` to a
-/// typed `McpException` only when the body parses as a JSON-RPC error response
-/// whose code passes `isModernRpcErrorCode`; otherwise returns false (legacy
-/// fallback) and leaves `err` null. Never throws — a malformed/empty body is a
-/// legacy signal, not an error.
-bool modernErrorFromBody(string body, out McpException err) @safe nothrow
-{
-	import std.string : strip;
-
-	err = null;
-	try
-	{
-		if (body.strip.length == 0)
-			return false;
-		auto msg = parseMessage(body);
-		if (msg.kind != MessageKind.errorResponse)
-			return false;
-		auto e = msg.error;
-		if (e.type != Json.Type.object || "code" !in e || e["code"].type != Json.Type.int_)
-			return false;
-		const code = e["code"].get!int;
-		if (!isModernRpcErrorCode(code))
-			return false;
-		const m = ("message" in e && e["message"].type == Json.Type.string) ? e["message"]
-			.get!string : "server error";
-		err = new McpException(code, m, e);
-		return true;
-	}
-	catch (Exception)
-	{
-		// Malformed body: not a recognized modern error → legacy fallback.
-		err = null;
-		return false;
-	}
-}
-
-/// Parse a legacy HTTP+SSE event stream looking for the first `endpoint` event,
-/// returning its `data:` payload (the message-POST URI) in `uri`. Returns false
-/// if no `endpoint` event is found in the supplied buffer. Handles CRLF and LF
-/// line endings and the optional single leading space after `data:`.
-bool parseEndpointEvent(string sse, out string uri) @safe
-{
-	import std.string : startsWith, splitLines;
-
-	string eventType;
-	string data;
-	bool haveData;
-
-	bool flush()
-	{
-		if (eventType == "endpoint" && haveData)
-		{
-			uri = data;
-			return true;
-		}
-		eventType = null;
-		data = null;
-		haveData = false;
-		return false;
-	}
-
-	foreach (raw; sse.splitLines())
-	{
-		auto line = raw;
-		if (line.length && line[$ - 1] == '\r')
-			line = line[0 .. $ - 1];
-		if (line.length == 0)
-		{
-			if (flush())
-				return true;
-			continue;
-		}
-		if (line.startsWith("event:"))
-		{
-			auto v = line["event:".length .. $];
-			if (v.startsWith(" "))
-				v = v[1 .. $];
-			eventType = v;
-		}
-		else if (line.startsWith("data:"))
-		{
-			auto d = line["data:".length .. $];
-			if (d.startsWith(" "))
-				d = d[1 .. $];
-			data ~= (haveData ? "\n" : "") ~ d;
-			haveData = true;
-		}
-	}
-	// A trailing event without a terminating blank line.
-	return flush();
-}
-
-/// Resolve a legacy `endpoint` event URI (which may be absolute, root-relative,
-/// or document-relative) against the GET-SSE base URL, yielding the absolute URL
-/// to POST subsequent JSON-RPC messages to.
-string resolveEndpointUri(string baseUrl, string endpoint) @safe
-{
-	import std.string : indexOf, startsWith, lastIndexOf;
-
-	if (endpoint.startsWith("http://") || endpoint.startsWith("https://"))
-		return endpoint;
-
-	// Split base into scheme://authority and path.
-	const sep = baseUrl.indexOf("://");
-	if (sep < 0)
-		return endpoint;
-	const afterScheme = sep + 3;
-	const slash = baseUrl[afterScheme .. $].indexOf('/');
-	string origin = (slash < 0) ? baseUrl : baseUrl[0 .. afterScheme + slash];
-	string basePath = (slash < 0) ? "/" : baseUrl[afterScheme + slash .. $];
-
-	if (endpoint.startsWith("/"))
-		return origin ~ endpoint;
-
-	// Document-relative: replace the last path segment of the base.
-	const lastSlash = basePath.lastIndexOf('/');
-	string dir = (lastSlash < 0) ? "/" : basePath[0 .. lastSlash + 1];
-	return origin ~ dir ~ endpoint;
-}
-
 /// Validate the protocol version the server returned in its `initialize`
 /// response and return the version to operate under. Per the Lifecycle /
 /// Version Negotiation requirement ("If the client does not support the version
@@ -2438,137 +1283,6 @@ unittest  // selectMutualVersion reports no overlap
 	assert(!selectMutualVersion([], v));
 }
 
-unittest  // isLegacyFallbackStatus recognises the spec's 400/404/405 triggers
-{
-	assert(isLegacyFallbackStatus(400));
-	assert(isLegacyFallbackStatus(404));
-	assert(isLegacyFallbackStatus(405));
-}
-
-unittest  // isLegacyFallbackStatus ignores success and other errors
-{
-	assert(!isLegacyFallbackStatus(200));
-	assert(!isLegacyFallbackStatus(202));
-	assert(!isLegacyFallbackStatus(401));
-	assert(!isLegacyFallbackStatus(500));
-}
-
-unittest  // isModernRpcErrorCode recognises the modern-vs-legacy disambiguators
-{
-	// Per draft basic/transports §Backward Compatibility, these are the
-	// JSON-RPC error codes a 400/404/405 body may carry to prove the server
-	// speaks a modern MCP version rather than being a legacy HTTP+SSE server.
-	assert(isModernRpcErrorCode(ErrorCode.unsupportedProtocolVersion)); // -32004
-	assert(isModernRpcErrorCode(ErrorCode.headerMismatch)); // -32001
-	assert(isModernRpcErrorCode(ErrorCode.methodNotFound)); // -32601
-	assert(isModernRpcErrorCode(ErrorCode.missingRequiredClientCapability)); // -32003
-}
-
-unittest  // isModernRpcErrorCode rejects unrelated codes
-{
-	assert(!isModernRpcErrorCode(ErrorCode.internalError));
-	assert(!isModernRpcErrorCode(ErrorCode.invalidParams));
-	assert(!isModernRpcErrorCode(0));
-}
-
-unittest  // modernErrorFromBody surfaces a recognized modern JSON-RPC error
-{
-	// 400 + UnsupportedProtocolVersionError body → typed McpException, NOT legacy.
-	McpException err;
-	assert(modernErrorFromBody(`{"jsonrpc":"2.0","id":1,"error":{"code":-32004,"message":"bad version","data":{"supported":["2025-11-25"]}}}`,
-			err));
-	assert(err !is null);
-	assert(err.code == ErrorCode.unsupportedProtocolVersion);
-}
-
-unittest  // modernErrorFromBody surfaces a 404 method-not-found body
-{
-	McpException err;
-	assert(modernErrorFromBody(
-			`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}`, err));
-	assert(err !is null);
-	assert(err.code == ErrorCode.methodNotFound);
-}
-
-unittest  // modernErrorFromBody ignores an empty body (legacy fallback path)
-{
-	McpException err;
-	assert(!modernErrorFromBody("", err));
-	assert(err is null);
-	assert(!modernErrorFromBody("   ", err));
-	assert(err is null);
-}
-
-unittest  // modernErrorFromBody ignores non-JSON / non-error bodies
-{
-	McpException err;
-	assert(!modernErrorFromBody("not json at all", err));
-	assert(err is null);
-	// A well-formed JSON-RPC result is not an error body.
-	assert(!modernErrorFromBody(`{"jsonrpc":"2.0","id":1,"result":{}}`, err));
-	assert(err is null);
-}
-
-unittest  // modernErrorFromBody ignores an error whose code is not a modern disambiguator
-{
-	// e.g. a generic internalError in a 400 body is NOT a modern-MCP signal.
-	McpException err;
-	assert(!modernErrorFromBody(
-			`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"boom"}}`, err));
-	assert(err is null);
-}
-
-unittest  // parseEndpointEvent extracts the message URI from a legacy SSE endpoint event
-{
-	// A real 2024-11-05 HTTP+SSE server's first event on the GET stream.
-	string sse = "event: endpoint\ndata: /messages?sessionId=abc123\n\n";
-	string uri;
-	assert(parseEndpointEvent(sse, uri));
-	assert(uri == "/messages?sessionId=abc123");
-}
-
-unittest  // parseEndpointEvent handles CRLF line endings and leading data space
-{
-	string sse = "event: endpoint\r\ndata:/messages\r\n\r\n";
-	string uri;
-	assert(parseEndpointEvent(sse, uri));
-	assert(uri == "/messages");
-}
-
-unittest  // parseEndpointEvent ignores a message event and finds a later endpoint event
-{
-	string sse = "event: message\ndata: {\"jsonrpc\":\"2.0\"}\n\n"
-		~ "event: endpoint\ndata: /post\n\n";
-	string uri;
-	assert(parseEndpointEvent(sse, uri));
-	assert(uri == "/post");
-}
-
-unittest  // parseEndpointEvent returns false when no endpoint event is present
-{
-	string sse = "event: message\ndata: {}\n\n";
-	string uri;
-	assert(!parseEndpointEvent(sse, uri));
-}
-
-unittest  // resolveEndpointUri keeps an absolute URI unchanged
-{
-	assert(resolveEndpointUri("http://host:8080/mcp",
-			"http://other:9000/messages") == "http://other:9000/messages");
-}
-
-unittest  // resolveEndpointUri resolves a root-relative path against the server origin
-{
-	assert(resolveEndpointUri("http://host:8080/sse",
-			"/messages?sessionId=abc") == "http://host:8080/messages?sessionId=abc");
-}
-
-unittest  // resolveEndpointUri resolves a relative path against the base directory
-{
-	assert(resolveEndpointUri("http://host:8080/api/sse",
-			"messages") == "http://host:8080/api/messages");
-}
-
 unittest  // validateOutput passes a conforming structured result
 {
 	import mcp.api.schema : jsonSchemaOf;
@@ -2623,7 +1337,7 @@ unittest  // validateOutput is a no-op when there is no structured content
 
 unittest  // sampling dispatch rejects an unbalanced tool_use with -32602
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	bool delegateCalled;
 	c.onSampling = (Json params) @safe {
 		delegateCalled = true;
@@ -2657,7 +1371,7 @@ unittest  // sampling dispatch rejects an unbalanced tool_use with -32602
 
 unittest  // notifyRootsListChanged emits the spec notification method
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	Json sent = Json.undefined;
 	c.onNotifyForTest = (Json message) @safe { sent = message; };
 
@@ -2671,7 +1385,7 @@ unittest  // notifyRootsListChanged emits the spec notification method
 
 unittest  // setRoots answers roots/list with the typed envelope
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	c.setRoots([
 		Root("file:///home/user/project", nullable("My Project")),
 		Root("file:///tmp")
@@ -2694,7 +1408,7 @@ unittest  // setRoots answers roots/list with the typed envelope
 
 unittest  // sendNotification sends an arbitrary client-originated notification
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	Json sent = Json.undefined;
 	c.onNotifyForTest = (Json message) @safe { sent = message; };
 
@@ -2712,7 +1426,7 @@ unittest  // sendNotification sends an arbitrary client-originated notification
 
 unittest  // cancel() emits notifications/cancelled with the requestId and reason
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	Json sent = Json.undefined;
 	c.onNotifyForTest = (Json message) @safe { sent = message; };
 
@@ -2728,7 +1442,7 @@ unittest  // cancel() emits notifications/cancelled with the requestId and reaso
 
 unittest  // cancel() without a reason omits the reason field
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	Json sent = Json.undefined;
 	c.onNotifyForTest = (Json message) @safe { sent = message; };
 
@@ -2740,7 +1454,7 @@ unittest  // cancel() without a reason omits the reason field
 
 unittest  // after cancel(), a response for that id is treated as cancelled (ignored)
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	c.onNotifyForTest = (Json message) @safe {};
 
 	assert(!c.isResponseCancelled(11));
@@ -2755,7 +1469,7 @@ unittest  // cancel() refuses to cancel the initialize request per spec
 	import std.exception : assertThrown;
 	import mcp.protocol.errors : McpException;
 
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	c.onNotifyForTest = (Json message) @safe {};
 	// Simulate that the initialize request used id 5.
 	c.setInitializeRequestIdForTest(5);
@@ -2767,7 +1481,7 @@ unittest  // cancel() refuses to cancel the initialize request per spec
 
 unittest  // sampling dispatch forwards a valid request to the delegate
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	bool delegateCalled;
 	c.onSampling = (Json params) @safe {
 		delegateCalled = true;
@@ -2789,7 +1503,7 @@ unittest  // sampling dispatch forwards a valid request to the delegate
 
 unittest  // elicitation/create rejects a mode the client did not advertise (-32602)
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	// Advertise form mode only (the default bare elicitation declaration).
 	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
@@ -2819,7 +1533,7 @@ unittest  // elicitation/create rejects a mode the client did not advertise (-32
 
 unittest  // elicitation/create rejects an unknown mode (-32602)
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 
@@ -2846,7 +1560,7 @@ unittest  // elicitation/create rejects an unknown mode (-32602)
 
 unittest  // elicitation/create forwards an advertised mode to the delegate
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 	c.capabilities.elicitationUrl = true;
@@ -2868,7 +1582,7 @@ unittest  // elicitation/create forwards an advertised mode to the delegate
 
 unittest  // url-only client rejects a form-mode elicitation/create (-32602)
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	// A url-only client is the canonical shape parsed from `{"url":{}}`:
 	// elicitation present + url submode, but no form submode.
 	c.capabilities.elicitation = true;
@@ -2898,7 +1612,7 @@ unittest  // url-only client rejects a form-mode elicitation/create (-32602)
 
 unittest  // url-only client rejects a mode-absent (defaults to form) elicitation/create (-32602)
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	c.capabilities.elicitation = true;
 	c.capabilities.elicitationUrl = true;
 
@@ -2926,7 +1640,7 @@ unittest  // url-only client rejects a mode-absent (defaults to form) elicitatio
 
 unittest  // bare elicitation declaration still accepts form-mode requests
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	// A bare `{}` declaration is parsed as elicitationForm=true; ensure the
 	// tightened check does not regress that case.
 	c.capabilities.elicitation = true;
@@ -2947,7 +1661,7 @@ unittest  // bare elicitation declaration still accepts form-mode requests
 
 unittest  // elicitation/complete for a known id is forwarded once, then ignored
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 	c.capabilities.elicitationUrl = true;
@@ -2975,7 +1689,7 @@ unittest  // elicitation/complete for a known id is forwarded once, then ignored
 
 unittest  // elicitation/complete for an unknown id is ignored
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	bool forwarded;
 	c.onNotification = (string, Json) @safe { forwarded = true; };
 
@@ -2987,7 +1701,7 @@ unittest  // elicitation/complete for an unknown id is ignored
 
 unittest  // elicitation/complete without an elicitationId is ignored
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	bool forwarded;
 	c.onNotification = (string, Json) @safe { forwarded = true; };
 
@@ -2997,7 +1711,7 @@ unittest  // elicitation/complete without an elicitationId is ignored
 
 unittest  // other notifications are forwarded unchanged
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	string forwarded;
 	c.onNotification = (string method, Json) @safe { forwarded = method; };
 
@@ -3007,7 +1721,7 @@ unittest  // other notifications are forwarded unchanged
 
 unittest  // notifications/progress is delivered to the typed onProgress observer
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	ProgressNotification got;
 	bool called;
 	c.onProgress = (ProgressNotification n) @safe { got = n; called = true; };
@@ -3028,7 +1742,7 @@ unittest  // notifications/progress is delivered to the typed onProgress observe
 
 unittest  // a non-progress notification does not invoke onProgress
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	bool called;
 	c.onProgress = (ProgressNotification) @safe { called = true; };
 	c.dispatchNotification("notifications/message", Json.emptyObject);
@@ -3037,7 +1751,7 @@ unittest  // a non-progress notification does not invoke onProgress
 
 unittest  // progress is still forwarded to the generic onNotification observer
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	string forwarded;
 	c.onNotification = (string method, Json) @safe { forwarded = method; };
 	c.dispatchNotification("notifications/progress", Json.emptyObject);
@@ -3046,7 +1760,7 @@ unittest  // progress is still forwarded to the generic onNotification observer
 
 unittest  // notifications/message is delivered to the typed onLogMessage observer
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	LogMessageNotification got;
 	bool called;
 	c.onLogMessage = (LogMessageNotification n) @safe { got = n; called = true; };
@@ -3066,7 +1780,7 @@ unittest  // notifications/message is delivered to the typed onLogMessage observ
 
 unittest  // a non-message notification does not invoke onLogMessage
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	bool called;
 	c.onLogMessage = (LogMessageNotification) @safe { called = true; };
 	c.dispatchNotification("notifications/progress", Json.emptyObject);
@@ -3075,7 +1789,7 @@ unittest  // a non-message notification does not invoke onLogMessage
 
 unittest  // a log message is still forwarded to the generic onNotification observer
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	string forwarded;
 	c.onNotification = (string method, Json) @safe { forwarded = method; };
 	c.dispatchNotification("notifications/message", Json.emptyObject);
@@ -3084,7 +1798,7 @@ unittest  // a log message is still forwarded to the generic onNotification obse
 
 unittest  // elicitation/create defaults to form mode when mode is absent
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 
@@ -3237,7 +1951,7 @@ unittest  // a subscriptions/listen stream delivers the acknowledgement + change
 	// Exercise the delivery path the listen stream uses (dispatchInbound):
 	// the leading subscriptions/acknowledged event and a subsequent list-changed
 	// notification must both reach onNotification.
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	string[] seen;
 	c.onNotification = (string method, Json params) @safe { seen ~= method; };
 
@@ -3248,18 +1962,6 @@ unittest  // a subscriptions/listen stream delivers the acknowledgement + change
 	assert(seen.length == 2);
 	assert(seen[0] == "notifications/subscriptions/acknowledged");
 	assert(seen[1] == "notifications/tools/list_changed");
-}
-
-unittest  // a SubscriptionStream handle reports and toggles its cancelled state
-{
-	auto cancelled = () @trusted { return new shared bool(false); }();
-	auto s = new SubscriptionStream(cancelled);
-	assert(!s.cancelled);
-	s.cancel();
-	assert(s.cancelled);
-	assert(*cancelled);
-	s.close(); // idempotent
-	assert(s.cancelled);
 }
 
 unittest  // buildGetPromptParams attaches a progressToken under _meta
@@ -3370,7 +2072,7 @@ unittest  // paramHeaders yields nothing when the schema has no x-mcp-header ann
 
 unittest  // cacheToolSchema records a schema and ignores a non-object one
 {
-	auto c = new MCPClient("http://localhost/mcp");
+	auto c = MCPClient.http("http://localhost/mcp");
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
 	c.cacheToolSchema("search", schema);
@@ -3441,7 +2143,7 @@ unittest  // MRTR: an empty requestState is never echoed (client MUST NOT invent
 
 unittest  // MRTR: resolveInputRequest routes an elicitation request to onElicitation
 {
-	auto c = new MCPClient("http://localhost/mcp");
+	auto c = MCPClient.http("http://localhost/mcp");
 	Json seen = Json.undefined;
 	c.onElicitation = (Json params) @safe {
 		seen = params;
@@ -3462,7 +2164,7 @@ unittest  // MRTR: resolveInputRequest routes an elicitation request to onElicit
 
 unittest  // MRTR: resolveInputRequest routes a sampling request to onSampling
 {
-	auto c = new MCPClient("http://localhost/mcp");
+	auto c = MCPClient.http("http://localhost/mcp");
 	c.onSampling = (Json params) @safe {
 		return Json(["role": Json("assistant")]);
 	};
@@ -3475,7 +2177,7 @@ unittest  // MRTR: resolveInputRequest routes a sampling request to onSampling
 
 unittest  // MRTR: resolveInputRequest routes a roots request to onListRoots
 {
-	auto c = new MCPClient("http://localhost/mcp");
+	auto c = MCPClient.http("http://localhost/mcp");
 	c.onListRoots = (Json params) @safe {
 		return Json(["roots": Json.emptyArray]);
 	};
@@ -3488,7 +2190,7 @@ unittest  // MRTR: resolveInputRequest routes a roots request to onListRoots
 
 unittest  // MRTR: resolveInputRequest fails (no answer) when no handler is registered
 {
-	auto c = new MCPClient("http://localhost/mcp");
+	auto c = MCPClient.http("http://localhost/mcp");
 	InputResponse answer;
 	// onElicitation is null by default -> cannot satisfy the request.
 	const ok = c.resolveInputRequest(InputRequest("x", "elicitation", Json.emptyObject), answer);
@@ -3498,7 +2200,7 @@ unittest  // MRTR: resolveInputRequest fails (no answer) when no handler is regi
 
 unittest  // MRTR: resolveInputRequest fails for an unknown input type
 {
-	auto c = new MCPClient("http://localhost/mcp");
+	auto c = MCPClient.http("http://localhost/mcp");
 	c.onElicitation = (Json) @safe { return Json.emptyObject; };
 	InputResponse answer;
 	const ok = c.resolveInputRequest(InputRequest("x", "bogus", Json.emptyObject), answer);
@@ -3507,7 +2209,7 @@ unittest  // MRTR: resolveInputRequest fails for an unknown input type
 
 unittest  // listResourceTemplates calls resources/templates/list and auto-paginates
 {
-	auto c = new MCPClient("http://localhost");
+	auto c = MCPClient.http("http://localhost");
 	string[] methods;
 	int call;
 	c.onRpcForTest = (string method, Json params) @safe {
