@@ -1078,12 +1078,16 @@ unittest  // an empty agreed subset still produces an empty params.notifications
     assert(n["params"]["notifications"].length == 0);
 }
 
-/// Render a JSON scalar the way the draft requires for `Mcp-Param-*` header
-/// comparison: strings as-is, integers as decimal, booleans as "true"/"false".
-private string jsonScalarToString(Json v) @safe
+/// Render a primitive JSON value as its `Mcp-Param-*` header string. Per the
+/// draft `x-mcp-header` constraints, only `integer`, `string`, and `boolean` are
+/// permitted; `number` (float) and any other type are NOT mirror-able and are
+/// reported via `ok = false` so the caller can reject the request rather than
+/// silently stringify them.
+private string jsonScalarToString(Json v, out bool ok) @safe
 {
     import std.conv : to;
 
+    ok = true;
     switch (v.type)
     {
     case Json.Type.string:
@@ -1094,36 +1098,73 @@ private string jsonScalarToString(Json v) @safe
     case Json.Type.bool_:
         return v.get!bool ? "true" : "false";
     default:
-        return v.toString();
+        // number/float, object, array, null — not a permitted x-mcp-header type.
+        ok = false;
+        return "";
     }
 }
 
+/// Resolve the value at `path` (a sequence of property keys) within `args`,
+/// returning the leaf `Json` and whether every step was present.
+private Json resolveArgPath(Json args, const(string)[] path, out bool present) @safe
+{
+    Json cur = args;
+    foreach (key; path)
+    {
+        if (cur.type != Json.Type.object || key !in cur)
+        {
+            present = false;
+            return Json(null);
+        }
+        cur = cur[key];
+    }
+    present = cur.type != Json.Type.null_ && cur.type != Json.Type.undefined;
+    return cur;
+}
+
 /// Validate draft `x-mcp-header` mirroring: every parameter annotated with
-/// `x-mcp-header` whose value is present in `args` MUST have a matching
-/// (decoded) `Mcp-Param-*` header; absent parameters MUST NOT carry the header.
-/// Returns a `HeaderMismatch` exception on violation, else null.
+/// `x-mcp-header` (at any nesting depth) whose value is present in `args` MUST
+/// have a matching (decoded) `Mcp-Param-*` header; absent parameters MUST NOT
+/// carry the header. The annotation set itself is also validated against the
+/// draft value constraints (non-empty, HTTP token syntax, no CR/LF, primitive
+/// types only with `number` forbidden, case-insensitive uniqueness). Returns a
+/// `HeaderMismatch` exception on violation, else null.
 McpException validateParamHeaders(Json inputSchema, Json args,
         scope string delegate(string) @safe headerGet) @safe
 {
-    auto map = paramHeaderMap(inputSchema);
-    foreach (param, headerName; map)
+    import std.array : join;
+
+    // Reject malformed x-mcp-header annotations up front per the draft.
+    auto schemaErr = validateInputSchemaHeaders(inputSchema);
+    if (schemaErr !is null)
+        return new McpException(ErrorCode.headerMismatch, schemaErr);
+
+    foreach (ph; paramHeaders(inputSchema))
     {
+        const headerName = ph.header;
         const hv = headerGet(headerName);
-        const present = args.type == Json.Type.object && param in args
-            && args[param].type != Json.Type.null_ && args[param].type != Json.Type.undefined;
+        bool present;
+        const leaf = resolveArgPath(args, ph.path, present);
+        const pathStr = ph.path.join(".");
         if (!present)
         {
             if (hv.length)
                 return new McpException(ErrorCode.headerMismatch,
-                        "Header " ~ headerName ~ " present but parameter '" ~ param ~ "' absent");
+                        "Header " ~ headerName ~ " present but parameter '" ~ pathStr ~ "' absent");
             continue;
         }
+        bool ok;
+        const expected = jsonScalarToString(leaf, ok);
+        if (!ok)
+            return new McpException(ErrorCode.headerMismatch,
+                    "Parameter '" ~ pathStr ~ "' for header " ~ headerName
+                    ~ " is not a permitted x-mcp-header type (integer/string/boolean)");
         if (hv.length == 0)
             return new McpException(ErrorCode.headerMismatch,
-                    "Missing required header " ~ headerName ~ " for parameter '" ~ param ~ "'");
-        if (decodeHeaderValue(hv) != jsonScalarToString(args[param]))
+                    "Missing required header " ~ headerName ~ " for parameter '" ~ pathStr ~ "'");
+        if (decodeHeaderValue(hv) != expected)
             return new McpException(ErrorCode.headerMismatch,
-                    "Header " ~ headerName ~ " does not match parameter '" ~ param ~ "'");
+                    "Header " ~ headerName ~ " does not match parameter '" ~ pathStr ~ "'");
     }
     return null;
 }
@@ -1179,6 +1220,75 @@ unittest  // x-mcp-header: non-ASCII value matched via base64-encoded header
     const enc = encodeHeaderValue("Zürich");
     auto e = validateParamHeaders(schema, args, (string h) => h == "Mcp-Param-Region" ? enc : "");
     assert(e is null);
+}
+
+unittest  // x-mcp-header: nested object property is validated against header (any depth)
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json nestedProps = Json.emptyObject;
+    nestedProps["region"] = Json([
+        "type": Json("string"),
+        "x-mcp-header": Json("Region")
+    ]);
+    Json nested = Json.emptyObject;
+    nested["type"] = "object";
+    nested["properties"] = nestedProps;
+    Json props = Json.emptyObject;
+    props["filters"] = nested;
+    schema["properties"] = props;
+
+    Json args = Json(["filters": Json(["region": Json("us-west1")])]);
+    // matching nested header passes
+    auto ok = validateParamHeaders(schema, args,
+            (string h) => h == "Mcp-Param-Region" ? "us-west1" : "");
+    assert(ok is null);
+    // mismatched nested header fails
+    auto bad = validateParamHeaders(schema, args, (string h) => "eu-west1");
+    assert(bad !is null && bad.code == ErrorCode.headerMismatch);
+}
+
+unittest  // x-mcp-header: number-typed annotation is rejected as a malformed schema
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["amount"] = Json([
+        "type": Json("number"),
+        "x-mcp-header": Json("Amount")
+    ]);
+    schema["properties"] = props;
+    Json args = Json(["amount": Json(5)]);
+    auto e = validateParamHeaders(schema, args, (string h) => "5");
+    assert(e !is null && e.code == ErrorCode.headerMismatch);
+}
+
+unittest  // x-mcp-header: duplicate (case-insensitive) values rejected as malformed schema
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["a"] = Json(["type": Json("string"), "x-mcp-header": Json("Region")]);
+    props["b"] = Json(["type": Json("string"), "x-mcp-header": Json("region")]);
+    schema["properties"] = props;
+    Json args = Json(["a": Json("x"), "b": Json("y")]);
+    auto e = validateParamHeaders(schema, args, (string h) => "");
+    assert(e !is null && e.code == ErrorCode.headerMismatch);
+}
+
+unittest  // x-mcp-header: CR/LF injection in annotation value rejected
+{
+    Json schema = Json.emptyObject;
+    schema["type"] = "object";
+    Json props = Json.emptyObject;
+    props["region"] = Json([
+        "type": Json("string"),
+        "x-mcp-header": Json("Reg\r\nion")
+    ]);
+    schema["properties"] = props;
+    Json args = Json(["region": Json("us-west1")]);
+    auto e = validateParamHeaders(schema, args, (string h) => "");
+    assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
 version (unittest)
