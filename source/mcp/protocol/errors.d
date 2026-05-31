@@ -1,6 +1,7 @@
 module mcp.protocol.errors;
 
 import vibe.data.json : Json;
+import mcp.protocol.capabilities : ClientCapabilities;
 
 @safe:
 
@@ -22,6 +23,12 @@ enum ErrorCode : int
     // 2025-11-25 (elicitation §"URL Elicitation Required Error"): a request
     // cannot be processed until a URL-mode elicitation is completed. The error
     // MUST carry a `data.elicitations` list of URL-mode elicitations.
+    // draft basic/lifecycle (draft/schema MissingRequiredClientCapabilityError):
+    // returned when processing a request requires a capability the client did
+    // NOT declare in its `clientCapabilities`. HTTP transports MUST map this to
+    // a 400 response. The error carries `data.requiredCapabilities` (a
+    // ClientCapabilities object describing the capabilities the request needs).
+    missingRequiredClientCapability = -32003,
     urlElicitationRequired = -32042,
     // sampling (client/sampling §Error Handling): the user declined the
     // server's `sampling/createMessage` request. Not a JSON-RPC reserved code;
@@ -145,6 +152,20 @@ McpException userRejected(string message = "User rejected sampling request",
     return new McpException(ErrorCode.userRejected, message, data);
 }
 
+/// Build the `-32003` `MissingRequiredClientCapabilityError` a server returns
+/// when processing a request requires a client capability that was not declared
+/// in the peer's `clientCapabilities` (draft basic/lifecycle,
+/// draft/schema MissingRequiredClientCapabilityError). HTTP transports MUST map
+/// this onto a `400 Bad Request`. The error's `data.requiredCapabilities` carries
+/// a ClientCapabilities object describing the capabilities the request needs.
+McpException missingRequiredClientCapability(const ClientCapabilities requiredCapabilities,
+        string message = "Missing required client capability") @safe
+{
+    Json data = Json.emptyObject;
+    data["requiredCapabilities"] = requiredCapabilities.toJson();
+    return new McpException(ErrorCode.missingRequiredClientCapability, message, data);
+}
+
 unittest  // McpException carries code and message
 {
     auto e = new McpException(ErrorCode.invalidParams, "bad arg");
@@ -250,4 +271,50 @@ unittest  // urlElicitationRequired rejects an entry missing url
     assertThrown!Exception(urlElicitationRequired([
         UrlElicitation("id", "", "msg")
     ]));
+}
+
+unittest  // missingRequiredClientCapability uses the -32003 code
+{
+    ClientCapabilities req;
+    req.sampling = true;
+    auto e = missingRequiredClientCapability(req);
+    assert(e.code == -32003);
+    assert(e.code == ErrorCode.missingRequiredClientCapability);
+}
+
+unittest  // missingRequiredClientCapability carries data.requiredCapabilities
+{
+    ClientCapabilities req;
+    req.sampling = true;
+    auto e = missingRequiredClientCapability(req);
+    auto j = e.toErrorJson();
+    assert("requiredCapabilities" in j["data"]);
+    assert(j["data"]["requiredCapabilities"]["sampling"].type == Json.Type.object);
+}
+
+unittest  // missingRequiredClientCapability requiredCapabilities matches ClientCapabilities.toJson
+{
+    ClientCapabilities req;
+    req.elicitation = true;
+    req.elicitationUrl = true;
+    auto e = missingRequiredClientCapability(req);
+    auto j = e.toErrorJson();
+    assert(j["data"]["requiredCapabilities"] == req.toJson());
+}
+
+unittest  // missingRequiredClientCapability has a default message
+{
+    ClientCapabilities req;
+    req.roots = true;
+    auto e = missingRequiredClientCapability(req);
+    assert(e.msg.length > 0);
+}
+
+unittest  // missingRequiredClientCapability accepts a custom message
+{
+    ClientCapabilities req;
+    req.sampling = true;
+    auto e = missingRequiredClientCapability(req, "needs sampling");
+    assert(e.code == ErrorCode.missingRequiredClientCapability);
+    assert(e.msg == "needs sampling");
 }
