@@ -444,6 +444,11 @@ struct InputRequiredResult
         foreach (r; inputRequests)
             arr ~= r.toJson();
         Json j = Json.emptyObject;
+        // Base draft Result mandates a `resultType` discriminator on every
+        // result; an InputRequiredResult declares "input_required" so the
+        // client knows to gather input and retry rather than treat this as a
+        // completed response.
+        j["resultType"] = "input_required";
         j["inputRequests"] = arr;
         return j;
     }
@@ -550,6 +555,18 @@ unittest  // DiscoverResult.toJson emits the spec wire field `supportedVersions`
     assert("protocolVersions" !in j);
     assert(j["supportedVersions"].length == 2);
     assert(j["supportedVersions"][0].get!string == "2026-07-28");
+}
+
+unittest  // InputRequiredResult.toJson carries resultType:"input_required"
+{
+    InputRequiredResult r;
+    r.inputRequests = [InputRequest("date", "elicitation", Json.emptyObject)];
+    auto j = r.toJson();
+    // Base draft Result mandates a resultType discriminator on every result;
+    // an InputRequiredResult uses "input_required".
+    assert("resultType" in j);
+    assert(j["resultType"].get!string == "input_required");
+    assert("inputRequests" in j);
 }
 
 unittest  // DiscoverResult.toJson carries the required resultType discriminator
