@@ -1,0 +1,53 @@
+name: Spec gap
+description: Report a divergence between the SDK and the authoritative MCP specification.
+title: "[spec]: "
+labels: ["spec-gap"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template when the SDK's wire output, field names, JSON shapes,
+        or error codes do not match the authoritative MCP schema for a given
+        protocol version.
+  - type: input
+    id: protocol-version
+    attributes:
+      label: Protocol version
+      description: Which version the gap applies to (e.g. 2025-11-25, 2025-06-18, draft).
+      placeholder: "2025-11-25"
+    validations:
+      required: true
+  - type: input
+    id: spec-reference
+    attributes:
+      label: Spec reference
+      description: Link to the authoritative schema/section (schema.ts line, or modelcontextprotocol.io page).
+      placeholder: "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/schema/2025-11-25/schema.ts#L..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected (per spec)
+      description: The exact field names / JSON shape / error code the spec requires.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual (current SDK behavior)
+      description: What the SDK currently produces or accepts, with file:line if known.
+      render: json
+    validations:
+      required: true
+  - type: checkboxes
+    id: draft-only
+    attributes:
+      label: Draft-only consideration
+      description: Draft-only requirements must NOT change released-version wire output.
+      options:
+        - label: This gap (and any fix) applies only when the negotiated version is `draft`.
+          required: false
+        - label: This gap applies to a released version (2025-11-25 / 2025-06-18).
+          required: false

@@ -1,0 +1,55 @@
+name: Bug report
+description: Report incorrect behavior in the SDK (server, client, transport, or codec).
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please fill in the sections below so we can
+        reproduce and fix it quickly. For security vulnerabilities, follow
+        [SECURITY.md](https://github.com/Poita/mcp.d/blob/main/SECURITY.md)
+        instead of opening a public issue.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected to happen instead.
+      placeholder: When I call X, the server returns Y, but the spec/expected behavior is Z.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal D code and/or commands that reproduce the problem.
+      render: d
+    validations:
+      required: true
+  - type: input
+    id: protocol-version
+    attributes:
+      label: MCP protocol version
+      description: The negotiated protocol version (e.g. 2025-11-25, 2025-06-18, draft).
+      placeholder: "2025-11-25"
+    validations:
+      required: false
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: SDK version/commit, D compiler and version (DMD/LDC), and OS.
+      placeholder: |
+        - mcp.d: commit abc1234
+        - Compiler: LDC 1.40 (DMD frontend 2.110)
+        - OS: macOS 15 / Ubuntu 24.04
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or output
+      description: Error messages, stack traces, or wire-level JSON-RPC if relevant.
+      render: shell
+    validations:
+      required: false
