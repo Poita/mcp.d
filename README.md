@@ -35,6 +35,16 @@ Optional follow-ups (not required for conformance): Client-ID-Metadata-Document 
 (currently uses DCR, a passing SHOULD warning), MRTR end-to-end client retry helper, and a
 built-in loopback redirect listener for the interactive auth-code flow.
 
+## Requirements
+
+- A D toolchain with frontend **2.100+** (DMD 2.100+, or LDC 1.30+).
+- **OpenSSL 3.x** must be installed on the system. The `openssl` / vibe-d:tls
+  dependency links against it for TLS (HTTPS transport, OAuth 2.1).
+  - **Ubuntu/Debian:** ships with OpenSSL 3.x (`apt install libssl-dev` if headers
+    are missing).
+  - **macOS:** `brew install openssl@3`, then export
+    `PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"` so dub can find it.
+
 ## Build & test
 
 ```bash
