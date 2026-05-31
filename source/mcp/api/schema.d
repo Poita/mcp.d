@@ -520,8 +520,7 @@ private template hasFieldDefault(T, size_t i)
 
 		unittest  // unsupported types fail to compile (no silent string fallback)
 		{
-			int* ptr;
-			assert(!__traits(compiles, jsonSchemaOf!(typeof(ptr))));
+			assert(!__traits(compiles, jsonSchemaOf!(int*)));
 			assert(!__traits(compiles, jsonSchemaOf!(void delegate())));
 			// non-string AA key is rejected
 			assert(!__traits(compiles, jsonSchemaOf!(string[int])));

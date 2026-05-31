@@ -2553,6 +2553,7 @@ unittest  // McpClient installs its ClientProtocol collaborator on an arbitrary 
 	// and the cancelled-response predicate.
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
+	assert(c !is null);
 	assert(transport.protocol !is null);
 	// Default (non-draft, pre-initialize) headers are empty for an arbitrary
 	// outgoing message — the same logic the HTTP transport reads.
