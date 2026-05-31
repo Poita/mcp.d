@@ -2145,7 +2145,13 @@ final class MCPClient
 				switch (mode)
 				{
 				case "form":
-					supported = capabilities.elicitationForm || capabilities.elicitation;
+					// A bare `elicitation` declaration is parsed as form-capable
+					// (elicitationForm=true). An explicit url-only declaration
+					// (`{"url":{}}` => elicitation=true, elicitationUrl=true,
+					// elicitationForm=false) does NOT declare form mode, so it must
+					// not satisfy the form case.
+					supported = capabilities.elicitationForm
+						|| (capabilities.elicitation && !capabilities.elicitationUrl);
 					break;
 				case "url":
 					supported = capabilities.elicitationUrl;
@@ -2855,6 +2861,85 @@ unittest  // elicitation/create forwards an advertised mode to the delegate
 	params["mode"] = "url";
 	params["url"] = "https://example.com/elicit";
 	params["elicitationId"] = "e1";
+
+	c.dispatchServerMethod("elicitation/create", params);
+	assert(delegateCalled);
+}
+
+unittest  // url-only client rejects a form-mode elicitation/create (-32602)
+{
+	auto c = new MCPClient("http://localhost");
+	// A url-only client is the canonical shape parsed from `{"url":{}}`:
+	// elicitation present + url submode, but no form submode.
+	c.capabilities.elicitation = true;
+	c.capabilities.elicitationUrl = true;
+
+	bool delegateCalled;
+	c.onElicitation = (Json params) @safe {
+		delegateCalled = true;
+		return Json.emptyObject;
+	};
+
+	Json params = Json.emptyObject;
+	params["mode"] = "form"; // not advertised by a url-only client
+	params["requestedSchema"] = Json.emptyObject;
+
+	bool threw;
+	try
+		c.dispatchServerMethod("elicitation/create", params);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.invalidParams);
+	}
+	assert(threw);
+	assert(!delegateCalled); // validation runs before the delegate
+}
+
+unittest  // url-only client rejects a mode-absent (defaults to form) elicitation/create (-32602)
+{
+	auto c = new MCPClient("http://localhost");
+	c.capabilities.elicitation = true;
+	c.capabilities.elicitationUrl = true;
+
+	bool delegateCalled;
+	c.onElicitation = (Json params) @safe {
+		delegateCalled = true;
+		return Json.emptyObject;
+	};
+
+	// No `mode` field => defaults to "form", which the url-only client did not advertise.
+	Json params = Json.emptyObject;
+	params["requestedSchema"] = Json.emptyObject;
+
+	bool threw;
+	try
+		c.dispatchServerMethod("elicitation/create", params);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.invalidParams);
+	}
+	assert(threw);
+	assert(!delegateCalled);
+}
+
+unittest  // bare elicitation declaration still accepts form-mode requests
+{
+	auto c = new MCPClient("http://localhost");
+	// A bare `{}` declaration is parsed as elicitationForm=true; ensure the
+	// tightened check does not regress that case.
+	c.capabilities.elicitation = true;
+	c.capabilities.elicitationForm = true;
+
+	bool delegateCalled;
+	c.onElicitation = (Json params) @safe {
+		delegateCalled = true;
+		return Json.emptyObject;
+	};
+
+	Json params = Json.emptyObject;
+	params["requestedSchema"] = Json.emptyObject; // mode absent => form
 
 	c.dispatchServerMethod("elicitation/create", params);
 	assert(delegateCalled);
