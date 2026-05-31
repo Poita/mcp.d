@@ -111,11 +111,75 @@ struct RegisteredTemplate
 	Nullable!CacheHint cache;
 }
 
-/// A registered prompt: descriptor + handler producing its messages.
+/// The outcome of a `prompts/get` call: either the final `GetPromptResult`, or
+/// — on a stateless (MRTR) draft request — a set of `InputRequest`s the client
+/// must satisfy and resubmit. This mirrors `ToolResponse` for the prompts path:
+/// the draft schema types `GetPromptResultResponse.result` as
+/// `GetPromptResult | InputRequiredResult`, so a prompt handler that needs more
+/// input ends the request with `inputRequired(...)` and the client opens a fresh
+/// `prompts/get` carrying the matching `inputResponses` (and any `requestState`).
+struct PromptResponse
+{
+	private bool needsInput_;
+	private GetPromptResult result_;
+	private InputRequiredResult required_;
+
+	/// The handler is done; `r` is the final prompt result.
+	static PromptResponse complete(GetPromptResult r) @safe
+	{
+		PromptResponse p;
+		p.result_ = r;
+		return p;
+	}
+
+	/// The handler needs input; the client must gather it and resubmit with the
+	/// matching `inputResponses`.
+	static PromptResponse inputRequired(InputRequest[] requests) @safe
+	{
+		PromptResponse p;
+		p.needsInput_ = true;
+		p.required_.inputRequests = requests;
+		return p;
+	}
+
+	/// As `inputRequired`, but also attaches an opaque `requestState`
+	/// (SEP-2322): a stateless draft server encodes whatever context it needs to
+	/// resume the prompt into this blob, which the client echoes verbatim on the
+	/// retry and the handler reads back via `RequestContext.requestState`.
+	static PromptResponse inputRequired(InputRequest[] requests, string requestState) @safe
+	{
+		PromptResponse p;
+		p.needsInput_ = true;
+		p.required_.inputRequests = requests;
+		p.required_.requestState = requestState;
+		return p;
+	}
+
+	/// Whether this outcome asks the client for more input.
+	bool needsInput() const @safe
+	{
+		return needsInput_;
+	}
+
+	/// The JSON-RPC `result` payload (a `GetPromptResult` or an
+	/// `InputRequiredResult`).
+	Json toJson() const @safe
+	{
+		return needsInput_ ? required_.toJson() : result_.toJson();
+	}
+}
+
+/// A prompt handler that may, on a stateless (MRTR) draft request, ask the client
+/// for more input instead of returning a final result. See `PromptResponse`.
+alias MrtrPromptHandler = PromptResponse delegate(Json arguments, RequestContext ctx) @safe;
+
+/// A registered prompt: descriptor + handler producing its messages. The handler
+/// always returns a `PromptResponse`; the `GetPromptResult`-returning
+/// registration overload is adapted to one that always `complete`s.
 struct RegisteredPrompt
 {
 	Prompt descriptor;
-	GetPromptResult delegate(Json arguments) @safe handler;
+	MrtrPromptHandler handler;
 }
 
 /// The transport-agnostic core of an MCP server.
@@ -487,6 +551,29 @@ final class McpServer
 	/// (`@prompt`-annotated methods registered via `registerPrompts`), which
 	/// marshals typed parameters and dispatches through this same dynamic path.
 	void registerDynamicPrompt(Prompt descriptor, GetPromptResult delegate(Json) @safe handler) @safe
+	{
+		// Adapt the simple handler — which always produces a final result — to the
+		// `PromptResponse`-returning form, ignoring the per-request context. Prompts
+		// registered this way never emit an `InputRequiredResult`.
+		prompts[descriptor.name] = RegisteredPrompt(descriptor, (Json args,
+				RequestContext ctx) => PromptResponse.complete(handler(args)));
+	}
+
+	/// Register a *dynamic* prompt whose handler may, on a stateless (MRTR) draft
+	/// request, ask the client for more input instead of returning a final result.
+	///
+	/// This is the prompts counterpart of the MRTR `registerDynamicTool` overload:
+	/// the handler receives the raw `Json arguments` and the per-request
+	/// `RequestContext`, and returns a `PromptResponse` — either
+	/// `PromptResponse.complete(result)` or, when it needs the client to gather
+	/// more input, `PromptResponse.inputRequired(requests)` (optionally with an
+	/// opaque `requestState`). On the draft protocol the handler reads the client's
+	/// answers from `ctx.inputResponses()` and the echoed `ctx.requestState()` when
+	/// the request is resubmitted. The draft schema types
+	/// `GetPromptResultResponse.result` as `GetPromptResult | InputRequiredResult`,
+	/// which this enables; on the 2025-era protocols a handler simply always
+	/// `complete`s, so wire output is unchanged.
+	void registerDynamicPrompt(Prompt descriptor, MrtrPromptHandler handler) @safe
 	{
 		prompts[descriptor.name] = RegisteredPrompt(descriptor, handler);
 	}
@@ -1256,7 +1343,7 @@ final class McpServer
 		case "prompts/list":
 			return doListPrompts(params, ver);
 		case "prompts/get":
-			return doGetPrompt(params);
+			return doGetPrompt(params, ctx);
 		case "completion/complete":
 			return doComplete(params);
 		case "logging/setLevel":
@@ -1516,7 +1603,7 @@ final class McpServer
 		return Nullable!CacheHint.init;
 	}
 
-	private Json doGetPrompt(Json params) @safe
+	private Json doGetPrompt(Json params, RequestContext ctx) @safe
 	{
 		if ("name" !in params || params["name"].type != Json.Type.string)
 			throw invalidParams("prompts/get requires a string 'name'");
@@ -1537,7 +1624,14 @@ final class McpServer
 				throw invalidParams("Missing required argument '" ~ arg.name
 						~ "' for prompt: " ~ name);
 		}
-		return entry.handler(args).toJson();
+		// The handler returns a `PromptResponse`: either a final `GetPromptResult`
+		// or — on a stateless (MRTR) draft request — an `InputRequiredResult`
+		// asking the client to gather input and resubmit. `ctx.inputResponses()`
+		// and `ctx.requestState()` already carry any answers/echoed state the
+		// client attached to this (retried) request. The `resultType`
+		// discriminator (and statelessness) is draft-gated by the dispatch path,
+		// so 2025-era wire output is unchanged.
+		return entry.handler(args, ctx).toJson();
 	}
 
 	private Json doComplete(Json params) @safe
@@ -3925,6 +4019,140 @@ unittest  // 2025-era request: ctx.elicit() blocks and the handler completes
 	auto resp = s.handle(req(4, "tools/call", buildName(p, "book")), new FakeCtx).get;
 	assert("error" !in resp);
 	assert(resp["result"]["content"][0]["text"].get!string == "booked tuesday");
+}
+
+version (unittest)
+{
+	// A draft prompts/get carrying the given input responses in the top-level
+	// params.inputResponses map (SEP-2322), plus the per-request _meta stateless
+	// handshake fields. `requestState` is echoed when non-empty.
+	private Message draftGetPrompt(long id, string prompt,
+			InputResponse[] responses, string requestState = "") @safe
+	{
+		Json meta = Json.emptyObject;
+		meta[MetaKey.protocolVersion] = "2026-07-28";
+		meta[MetaKey.clientInfo] = Json([
+			"name": Json("c"),
+			"version": Json("1")
+		]);
+		meta[MetaKey.clientCapabilities] = Json.emptyObject;
+		Json params = Json.emptyObject;
+		params["name"] = prompt;
+		params["arguments"] = Json.emptyObject;
+		params["_meta"] = meta;
+		if (requestState.length)
+			params["requestState"] = requestState;
+		if (responses.length)
+			params["inputResponses"] = inputResponsesToJson(responses);
+		return Message(makeRequest(Json(id), "prompts/get", params));
+	}
+
+	// Register a prompt that needs a "topic" before it can build its messages:
+	// on a stateless first round it asks via MRTR, on retry it reads the answer.
+	private void registerTopicPrompt(McpServer s) @safe
+	{
+		Prompt descriptor = {name: "draftprompt"};
+		s.registerDynamicPrompt(descriptor, (Json args, RequestContext ctx) @safe {
+			auto answers = ctx.inputResponses();
+			if ("topic" !in answers)
+			{
+				Json ep = Json.emptyObject;
+				ep["message"] = "Which topic?";
+				return PromptResponse.inputRequired([
+					InputRequest("topic", "elicitation", ep)
+				]);
+			}
+			GetPromptResult r;
+			r.messages = [
+				PromptMessage("user",
+					Content.makeText("about " ~ answers["topic"]["content"]["t"].get!string))
+			];
+			return PromptResponse.complete(r);
+		});
+	}
+}
+
+unittest  // #340 draft prompts/get: handler can return an InputRequiredResult
+{
+	auto s = new McpServer("t", "1");
+	registerTopicPrompt(s);
+	auto resp = s.handle(draftGetPrompt(1, "draftprompt", [])).get;
+	assert("error" !in resp);
+	// The draft GetPromptResultResponse.result is GetPromptResult | InputRequiredResult;
+	// here it is the input_required variant with an InputRequests map (SEP-2322).
+	assert(resp["result"]["resultType"].get!string == "input_required");
+	assert(resp["result"]["inputRequests"].type == Json.Type.object);
+	assert("topic" in resp["result"]["inputRequests"]);
+	assert(resp["result"]["inputRequests"]["topic"]["method"].get!string == "elicitation/create");
+	assert("messages" !in resp["result"]);
+}
+
+unittest  // #340 draft prompts/get retry with input responses: handler completes
+{
+	auto s = new McpServer("t", "1");
+	registerTopicPrompt(s);
+	auto answer = InputResponse("topic", Json([
+			"content": Json(["t": Json("birds")])
+	]));
+	auto resp = s.handle(draftGetPrompt(2, "draftprompt", [answer])).get;
+	assert("error" !in resp);
+	assert("inputRequests" !in resp["result"]);
+	// A completed draft result is stamped resultType:"complete", not "input_required".
+	assert(resp["result"]["resultType"].get!string == "complete");
+	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "about birds");
+}
+
+unittest  // #340 draft prompts/get reads back the echoed opaque requestState (SEP-2322)
+{
+	auto s = new McpServer("t", "1");
+	Prompt descriptor = {name: "stateprompt"};
+	s.registerDynamicPrompt(descriptor, (Json args, RequestContext ctx) @safe {
+		if (ctx.requestState() == "awaiting-topic")
+		{
+			GetPromptResult r;
+			r.messages = [
+				PromptMessage("user", Content.makeText("resumed:" ~ ctx.requestState()))
+			];
+			return PromptResponse.complete(r);
+		}
+		Json ep = Json.emptyObject;
+		ep["message"] = "Which topic?";
+		return PromptResponse.inputRequired([
+			InputRequest("topic", "elicitation", ep)
+		], "awaiting-topic");
+	});
+
+	// First round: the server attaches requestState onto the InputRequiredResult.
+	auto first = s.handle(draftGetPrompt(10, "stateprompt", [])).get;
+	assert(first["result"]["requestState"].get!string == "awaiting-topic");
+
+	// Retry: client echoes the opaque requestState; the handler reads it back.
+	auto answer = InputResponse("topic", Json([
+			"content": Json(["t": Json("x")])
+	]));
+	auto retry = s.handle(draftGetPrompt(11, "stateprompt", [answer], "awaiting-topic")).get;
+	assert("inputRequests" !in retry["result"]);
+	assert(retry["result"]["messages"][0]["content"]["text"].get!string == "resumed:awaiting-topic");
+}
+
+unittest  // #340 non-draft prompts/get is unaffected: no resultType, plain GetPromptResult
+{
+	auto s = new McpServer("t", "1");
+	Prompt descriptor = {name: "plainprompt"};
+	s.registerDynamicPrompt(descriptor, (Json args, RequestContext ctx) @safe {
+		GetPromptResult r;
+		r.messages = [PromptMessage("user", Content.makeText("hi"))];
+		return PromptResponse.complete(r);
+	});
+	// A 2025-era prompts/get (no draft _meta) must keep its exact wire shape: a
+	// GetPromptResult with no draft-only resultType/inputRequests fields.
+	Json params = Json.emptyObject;
+	params["name"] = "plainprompt";
+	auto resp = s.handle(Message(makeRequest(Json(1), "prompts/get", params))).get;
+	assert("error" !in resp);
+	assert("resultType" !in resp["result"]);
+	assert("inputRequests" !in resp["result"]);
+	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "hi");
 }
 
 version (unittest)
