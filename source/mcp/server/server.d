@@ -1015,14 +1015,16 @@ final class McpServer
 		return pageSize_;
 	}
 
-	/// Apply a per-result draft cacheable-result hint when the effective version is
-	/// draft+ AND a hint was supplied for this result. A no-op for earlier versions
-	/// or when no hint is set, keeping 2025-11-25 wire output unchanged.
-	private Json maybeCache(Json result, Nullable!CacheHint hint, ProtocolVersion ver) @safe
+	/// Set a per-result draft cacheable-result hint on the typed result, then
+	/// serialize via the single symmetric `toJson` emission path. The hint is set
+	/// only when the effective version is draft+ AND a hint was supplied, so the
+	/// result's `cache` stays null for earlier versions and 2025-11-25 wire output
+	/// is unchanged. `toJson` emits `ttlMs`/`cacheScope`, `fromJson` parses them.
+	private Json maybeCache(R)(R result, Nullable!CacheHint hint, ProtocolVersion ver) @safe
 	{
 		if (ver.cacheableResults && !hint.isNull)
-			return withCache(result, hint.get);
-		return result;
+			result.cache = hint;
+		return result.toJson();
 	}
 
 	/// Stamp the mandatory draft `resultType` discriminator onto a result.
@@ -1370,7 +1372,7 @@ final class McpServer
 		foreach (uri; uris[begin .. end])
 			result.resources ~= resources[uri].descriptor;
 		result.nextCursor = next;
-		return maybeCache(result.toJson(), listHint("resources/list"), ver);
+		return maybeCache(result, listHint("resources/list"), ver);
 	}
 
 	private Json doListResourceTemplates(Json params, ProtocolVersion ver) @safe
@@ -1383,7 +1385,7 @@ final class McpServer
 		foreach (t; templates[begin .. end])
 			result.resourceTemplates ~= t.descriptor;
 		result.nextCursor = next;
-		return maybeCache(result.toJson(), listHint("resources/templates/list"), ver);
+		return maybeCache(result, listHint("resources/templates/list"), ver);
 	}
 
 	private Json doReadResource(Json params, ProtocolVersion ver) @safe
@@ -1396,7 +1398,7 @@ final class McpServer
 		{
 			ReadResourceResult result;
 			result.contents = [direct.reader()];
-			return maybeCache(result.toJson(), direct.cache, ver);
+			return maybeCache(result, direct.cache, ver);
 		}
 
 		foreach (t; templates)
@@ -1406,7 +1408,7 @@ final class McpServer
 			{
 				ReadResourceResult result;
 				result.contents = [t.reader(uri, captured)];
-				return maybeCache(result.toJson(), t.cache, ver);
+				return maybeCache(result, t.cache, ver);
 			}
 		}
 		// Draft aligns the code to invalidParams (-32602); older versions -32002.
@@ -1447,7 +1449,7 @@ final class McpServer
 		foreach (name; names[begin .. end])
 			result.prompts ~= prompts[name].descriptor;
 		result.nextCursor = next;
-		return maybeCache(result.toJson(), listHint("prompts/list"), ver);
+		return maybeCache(result, listHint("prompts/list"), ver);
 	}
 
 	/// The per-list draft cache hint configured for `listMethod`, or null if none.
@@ -1550,7 +1552,7 @@ final class McpServer
 		foreach (name; names[begin .. end])
 			result.tools ~= tools[name].descriptor;
 		result.nextCursor = next;
-		return maybeCache(result.toJson(), listHint("tools/list"), ver);
+		return maybeCache(result, listHint("tools/list"), ver);
 	}
 
 	private Json doCallTool(Json params, RequestContext ctx) @safe
