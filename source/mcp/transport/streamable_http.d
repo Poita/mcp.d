@@ -64,6 +64,27 @@ struct StreamableHttpOptions
 	/// revision defines, so it never alters 2025-06-18 / 2025-03-26 / 2024-11-05
 	/// or draft wire output. When zero (the default) no `retry:` hint is sent.
 	uint reconnectDelayMs = 0;
+
+	/// Opt-in backwards compatibility with the deprecated 2024-11-05 HTTP+SSE
+	/// two-endpoint transport (basic/transports §HTTP with SSE; and the
+	/// 2025-06-18 / 2025-11-25 / draft §Backwards Compatibility guidance:
+	/// "Servers wanting to support older clients should: Continue to host both the
+	/// SSE and POST endpoints of the old transport, alongside the new MCP
+	/// endpoint"). This is a SHOULD, so it is off by default. When enabled,
+	/// `mountMcp` ALSO mounts the two legacy endpoints alongside the modern MCP
+	/// endpoint:
+	///   - GET `legacySsePath`: opens a `text/event-stream`, immediately emits an
+	///     `endpoint` event whose data is `legacyMessagePath` (the URI the client
+	///     must POST to), then holds the stream open delivering server messages as
+	///     SSE `message` events;
+	///   - POST `legacyMessagePath`: accepts a single JSON-RPC message, processes
+	///     it, replies `202 Accepted` with no body, and pushes any JSON-RPC
+	///     response back onto the open GET stream as a `message` event.
+	/// A 2024-11-05-only client can then negotiate the legacy transport against a D
+	/// MCP server. The modern Streamable HTTP endpoint is unchanged.
+	bool legacyHttpSse = false;
+	string legacySsePath = "/sse"; /// legacy GET SSE endpoint path
+	string legacyMessagePath = "/message"; /// legacy POST message endpoint path
 }
 
 /// The well-known path (RFC 9728 §3) at which a protected resource server
@@ -156,6 +177,197 @@ void mountMcp(URLRouter router, McpServer server,
 		res.headers["Allow"] = allowedMethodsHeader(server.negotiatedVersion);
 		res.writeBody("", "text/plain");
 	});
+
+	// Opt-in backwards compatibility: also host the deprecated 2024-11-05
+	// HTTP+SSE two-endpoint transport alongside the modern MCP endpoint
+	// (basic/transports §Backwards Compatibility — a SHOULD, hence opt-in).
+	if (opts.legacyHttpSse)
+		mountLegacyHttpSse(router, server, opts);
+}
+
+/// Mount the deprecated 2024-11-05 HTTP+SSE two-endpoint transport
+/// (basic/transports §HTTP with SSE) onto `router`, so a legacy-only client can
+/// still negotiate it against a D MCP server. Called by `mountMcp` when
+/// `opts.legacyHttpSse` is set, but also usable directly to host ONLY the legacy
+/// transport. It mounts:
+///   - GET `opts.legacySsePath`: opens a `text/event-stream`; the FIRST event is
+///     the `endpoint` event whose data is `opts.legacyMessagePath` ("When a
+///     client connects, the server MUST send an `endpoint` event containing a URI
+///     for the client to use for sending messages"); the stream is then held open
+///     and every server message is delivered as an SSE `message` event;
+///   - POST `opts.legacyMessagePath`: accepts a single JSON-RPC message, replies
+///     `202 Accepted` with no body, and pushes any JSON-RPC response back onto the
+///     open GET stream as a `message` event ("Server messages are sent as SSE
+///     `message` events, with the message content encoded as JSON in the event
+///     data"). Origin/auth guards mirror the modern endpoint.
+void mountLegacyHttpSse(URLRouter router, McpServer server,
+		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
+{
+	auto channel = new LegacySseChannel(opts.legacyMessagePath);
+
+	router.get(opts.legacySsePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		if (!guardOrigin(req, res, opts))
+			return;
+		TokenInfo token;
+		if (!guardAuth(req, res, opts, token))
+			return;
+		handleLegacyGet(channel, res);
+	});
+
+	router.post(opts.legacyMessagePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		if (!guardOrigin(req, res, opts))
+			return;
+		TokenInfo token;
+		if (!guardAuth(req, res, opts, token))
+			return;
+		const payload = req.bodyReader.readAllUTF8();
+		handleLegacyPostBody(server, channel, payload);
+		// All subsequent client messages are POSTed here; the response (if any)
+		// is delivered on the GET SSE stream, so the POST itself just acknowledges
+		// receipt with 202 Accepted and no body.
+		res.statusCode = HTTPStatus.accepted;
+		res.writeBody("", "text/plain");
+	});
+}
+
+/// The legacy 2024-11-05 HTTP+SSE server->client channel. It manages the open GET
+/// SSE listeners and routes JSON-RPC server messages onto them as SSE `message`
+/// events. On registration a listener immediately receives the `endpoint` event
+/// (its data being the message-POST path), as the transport requires before any
+/// other traffic. Unlike the modern `ServerPushChannel`, the legacy transport is
+/// a single bidirectional pair, so a delivered message is broadcast to every open
+/// legacy stream (there is normally just one).
+final class LegacySseChannel
+{
+	private struct Listener
+	{
+		long id;
+		void delegate(string frame) @safe write;
+	}
+
+	private string endpointPath;
+	private Listener[] listeners;
+	private long nextId = 1;
+
+	this(string endpointPath) @safe
+	{
+		this.endpointPath = endpointPath;
+	}
+
+	/// Register an open GET SSE stream. The listener immediately receives the
+	/// leading `endpoint` event (basic/transports §HTTP with SSE: the server MUST
+	/// send it "When a client connects"). Returns the listener id.
+	long addListener(void delegate(string frame) @safe write) @safe
+	{
+		const id = nextId++;
+		listeners ~= Listener(id, write);
+		write(formatLegacyEndpointEvent(endpointPath));
+		return id;
+	}
+
+	/// Drop a listener (its GET stream closed).
+	void removeListener(long id) @safe
+	{
+		import std.algorithm : remove;
+
+		listeners = listeners.remove!(l => l.id == id);
+	}
+
+	/// Number of currently-open legacy streams.
+	size_t listenerCount() const @safe
+	{
+		return listeners.length;
+	}
+
+	/// Deliver a raw JSON-RPC payload to every open legacy stream as an SSE
+	/// `message` event. A listener whose write throws (a disconnected client) is
+	/// dropped so the channel self-heals. An empty payload is a no-op (a
+	/// notification/response produced nothing to send back).
+	void deliver(string jsonText) @safe
+	{
+		if (jsonText.length == 0)
+			return;
+		const frame = formatLegacyMessageEventRaw(jsonText);
+		long[] dead;
+		foreach (ref l; listeners)
+		{
+			try
+				l.write(frame);
+			catch (Exception)
+				dead ~= l.id;
+		}
+		foreach (id; dead)
+			removeListener(id);
+	}
+}
+
+/// Open a legacy GET SSE stream: register it on `channel` (which emits the
+/// leading `endpoint` event), then hold the connection open with SSE comment
+/// heartbeats so a client disconnect terminates the loop and drops the listener.
+private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @safe
+{
+	import vibe.core.core : sleep;
+	import core.time : seconds;
+
+	res.contentType = "text/event-stream";
+	applySseStreamHeaders(res, false);
+
+	const listenerId = channel.addListener((string frame) @safe {
+		() @trusted {
+			res.bodyWriter.write(cast(const(ubyte)[]) frame);
+			res.bodyWriter.flush();
+		}();
+	});
+	scope (exit)
+		channel.removeListener(listenerId);
+
+	while (true)
+	{
+		sleep(15.seconds);
+		try
+			() @trusted {
+			res.bodyWriter.write(cast(const(ubyte)[]) ": ping\n\n");
+			res.bodyWriter.flush();
+		}();
+		catch (Exception)
+			break;
+	}
+}
+
+/// Process a single JSON-RPC message POSTed to the legacy message endpoint and
+/// route any response back onto the legacy GET SSE stream as a `message` event.
+/// Returns true (the server accepts every well-formed POST on this transport; a
+/// parse failure still yields a JSON-RPC error response delivered on the stream).
+/// A notification produces no response, so nothing is delivered. Exposed
+/// (package-level) so the two-endpoint flow can be exercised without a live
+/// socket.
+bool handleLegacyPostBody(McpServer server, LegacySseChannel channel, string payload) @safe
+{
+	const responseText = server.handleRaw(payload);
+	channel.deliver(responseText);
+	return true;
+}
+
+/// Frame the legacy `endpoint` SSE event (2024-11-05 basic/transports §HTTP with
+/// SSE): a typed `endpoint` event whose data is the URI the client must POST
+/// subsequent messages to.
+string formatLegacyEndpointEvent(string uri) @safe
+{
+	return "event: endpoint\ndata: " ~ uri ~ "\n\n";
+}
+
+/// Frame a legacy server `message` SSE event from a JSON-RPC value (2024-11-05
+/// basic/transports §HTTP with SSE: "Server messages are sent as SSE `message`
+/// events, with the message content encoded as JSON in the event data").
+string formatLegacyMessageEvent(Json msg) @safe
+{
+	return formatLegacyMessageEventRaw(msg.toString());
+}
+
+/// As `formatLegacyMessageEvent` but from already-serialised JSON text.
+string formatLegacyMessageEventRaw(string jsonText) @safe
+{
+	return "event: message\ndata: " ~ jsonText ~ "\n\n";
 }
 
 /// Enforce DNS-rebinding protection. Returns true if the request may proceed;
@@ -958,6 +1170,90 @@ void runStreamableHttp(McpServer server, ushort port,
 
 	lowerPrivileges();
 	runEventLoop();
+}
+
+unittest  // legacy endpoint event: `event: endpoint` carrying the message-POST URI
+{
+	// 2024-11-05 basic/transports §HTTP with SSE: "When a client connects, the
+	// server MUST send an `endpoint` event containing a URI for the client to use
+	// for sending messages." The frame is a typed SSE `endpoint` event whose data
+	// is that URI.
+	const frame = formatLegacyEndpointEvent("/message");
+	assert(frame == "event: endpoint\ndata: /message\n\n");
+}
+
+unittest  // legacy server messages are SSE `message` events with JSON data
+{
+	// 2024-11-05 basic/transports §HTTP with SSE: "Server messages are sent as SSE
+	// `message` events, with the message content encoded as JSON in the event
+	// data." The frame is a typed SSE `message` event carrying the JSON-RPC payload.
+	import std.string : startsWith, endsWith;
+	import std.algorithm : canFind;
+
+	auto j = makeNotification("notifications/message", Json.emptyObject);
+	const frame = formatLegacyMessageEvent(j);
+	assert(frame.startsWith("event: message\ndata: "));
+	assert(frame.canFind("\"method\":\"notifications/message\""));
+	assert(frame.endsWith("\n\n"));
+}
+
+unittest  // legacy channel: GET stream first receives the endpoint event, then messages
+{
+	// The legacy SSE GET stream MUST emit the `endpoint` event first (so the
+	// client learns where to POST), then deliver each subsequent server message as
+	// a `message` event on the open stream.
+	import std.string : startsWith;
+	import std.algorithm : canFind;
+
+	auto ch = new LegacySseChannel("/message");
+	string[] frames;
+	const id = ch.addListener((string f) @safe { frames ~= f; });
+	// On connect the channel emits the endpoint event naming the POST path.
+	assert(frames.length == 1);
+	assert(frames[0] == "event: endpoint\ndata: /message\n\n");
+
+	// A server response routed onto the stream arrives as a `message` event.
+	ch.deliver(`{"jsonrpc":"2.0","id":1,"result":{}}`);
+	assert(frames.length == 2);
+	assert(frames[1].startsWith("event: message\ndata: "));
+	assert(frames[1].canFind("\"id\":1"));
+	ch.removeListener(id);
+	assert(ch.listenerCount == 0);
+}
+
+unittest  // legacy POST: a request is processed and its response pushed onto the SSE stream
+{
+	// The legacy two-endpoint transport: the client POSTs a JSON-RPC request to
+	// the message endpoint; the server processes it and delivers the response back
+	// over the open GET SSE stream (not in the POST response body). A notification
+	// produces no response frame.
+	import std.algorithm : canFind;
+
+	auto server = new McpServer("t", "1");
+	auto ch = new LegacySseChannel("/message");
+	string[] frames;
+	ch.addListener((string f) @safe { frames ~= f; });
+	assert(frames.length == 1); // the endpoint event
+
+	// A request: the response is pushed onto the stream as a `message` event.
+	const accepted = handleLegacyPostBody(server, ch, `{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+	assert(accepted); // the server accepted the message
+	assert(frames.length == 2);
+	assert(frames[1].canFind("\"id\":1"));
+
+	// A notification: accepted, but nothing is pushed back.
+	const accepted2 = handleLegacyPostBody(server, ch,
+			`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+	assert(accepted2);
+	assert(frames.length == 2); // no new frame
+}
+
+unittest  // legacy support is opt-in: off by default
+{
+	StreamableHttpOptions opts;
+	assert(!opts.legacyHttpSse);
+	assert(opts.legacySsePath == "/sse");
+	assert(opts.legacyMessagePath == "/message");
 }
 
 unittest  // localhost hosts are accepted, foreign hosts rejected
