@@ -534,9 +534,10 @@ final class MCPServer
 	ServerCapabilities capabilities() const @safe
 	{
 		ServerCapabilities caps;
-		if (tools.length > 0)
+		if (tools.length > 0 || toolListChangedEnabled)
 			caps.tools = ListChangedCapability(toolListChangedEnabled);
-		if (resources.length > 0 || templates.length > 0)
+		if (resources.length > 0 || templates.length > 0
+				|| resourceSubscriptionsEnabled || resourcesListChangedEnabled)
 			caps.resources = ResourcesCapability(resourceSubscriptionsEnabled,
 					resourcesListChangedEnabled);
 		if (prompts.length > 0 || promptsListChangedEnabled)
@@ -3059,6 +3060,20 @@ unittest  // enableToolListChanged advertises listChanged:true for tools
 	assert(caps.toJson()["tools"]["listChanged"].get!bool);
 }
 
+unittest  // enableToolListChanged advertises tools capability with zero tools registered
+{
+	// A server that will add tools at runtime declares enableToolListChanged()
+	// before any tool is registered. Per 2025-11-25 tools §Capabilities, it MUST
+	// still advertise the tools capability so clients call tools/list and expect
+	// notifications/tools/list_changed.
+	auto s = new MCPServer("t", "1");
+	s.enableToolListChanged();
+	auto caps = s.capabilities();
+	assert(!caps.tools.isNull);
+	assert(caps.tools.get.listChanged);
+	assert(caps.toJson()["tools"]["listChanged"].get!bool);
+}
+
 unittest  // removeTool unregisters a previously registered tool
 {
 	auto s = new MCPServer("t", "1");
@@ -3111,6 +3126,33 @@ unittest  // enableResourcesListChanged advertises listChanged:true for resource
 	assert(!caps.resources.isNull);
 	assert(caps.resources.get.listChanged);
 	assert(caps.toJson()["resources"]["listChanged"].get!bool);
+}
+
+unittest  // enableResourcesListChanged advertises resources capability with zero resources registered
+{
+	// A server that will add resources at runtime declares enableResourcesListChanged()
+	// before any resource is registered. Per 2025-11-25 resources §Capabilities, it
+	// MUST still advertise the resources capability so clients call resources/list and
+	// expect notifications/resources/list_changed.
+	auto s = new MCPServer("t", "1");
+	s.enableResourcesListChanged();
+	auto caps = s.capabilities();
+	assert(!caps.resources.isNull);
+	assert(caps.resources.get.listChanged);
+	assert(caps.toJson()["resources"]["listChanged"].get!bool);
+}
+
+unittest  // enableResourceSubscriptions advertises resources capability with zero resources registered
+{
+	// A server that supports resource update subscriptions declares
+	// enableResourceSubscriptions() so clients learn they may resources/subscribe,
+	// even before any resource is registered (per 2025-11-25 resources §Capabilities).
+	auto s = new MCPServer("t", "1");
+	s.enableResourceSubscriptions();
+	auto caps = s.capabilities();
+	assert(!caps.resources.isNull);
+	assert(caps.resources.get.subscribe);
+	assert(caps.toJson()["resources"]["subscribe"].get!bool);
 }
 
 unittest  // notifyResourcesListChanged broadcasts notifications/resources/list_changed
