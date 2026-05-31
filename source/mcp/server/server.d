@@ -1609,8 +1609,12 @@ final class McpServer
 		pageBounds(params, names.length, begin, end, next);
 
 		ListPromptsResult result;
+		// Project each prompt to the negotiated protocol version so version-
+		// gated fields are not emitted to peers that don't understand them.
+		// `BaseMetadata.title` was introduced by 2025-06-18 and `Prompt.icons`
+		// by 2025-11-25; forVersion strips each on older versions.
 		foreach (name; names[begin .. end])
-			result.prompts ~= prompts[name].descriptor;
+			result.prompts ~= prompts[name].descriptor.forVersion(ver);
 		result.nextCursor = next;
 		return maybeCache(result, listHint("prompts/list"), ver);
 	}
