@@ -1364,6 +1364,7 @@ struct ResourceTemplate
 	Nullable!string title;
 	Annotations annotations; /// optional audience/priority/lastModified annotations
 	Icon[] icons; /// optional icons for display in user interfaces
+	Json meta; /// optional descriptor-level `_meta` object
 
 	Json toJson() const @safe
 	{
@@ -1385,6 +1386,8 @@ struct ResourceTemplate
 				arr ~= icon.toJson();
 			j["icons"] = arr;
 		}
+		if (meta.type == Json.Type.object)
+			j["_meta"] = meta;
 		return j;
 	}
 
@@ -1404,6 +1407,8 @@ struct ResourceTemplate
 		if ("icons" in j && j["icons"].type == Json.Type.array)
 			foreach (i; 0 .. j["icons"].length)
 				t.icons ~= Icon.fromJson(j["icons"][i]);
+		if ("_meta" in j && j["_meta"].type == Json.Type.object)
+			t.meta = j["_meta"];
 		return t;
 	}
 }
@@ -1795,6 +1800,25 @@ unittest  // ResourceTemplate round-trips annotations/icons through fromJson
 	assert(back.annotations.lastModified.get == "2025-06-01T00:00:00Z");
 	assert(back.icons.length == 1);
 	assert(back.icons[0].src == "https://e/t.png");
+}
+
+unittest  // ResourceTemplate emits and round-trips the optional _meta field
+{
+	ResourceTemplate t = {uriTemplate: "test://{id}", name: "t"};
+	t.meta = Json.emptyObject;
+	t.meta["foo"] = "bar";
+	auto j = t.toJson();
+	assert(j["_meta"]["foo"].get!string == "bar");
+	auto back = ResourceTemplate.fromJson(j);
+	assert(back.meta.type == Json.Type.object);
+	assert(back.meta["foo"].get!string == "bar");
+}
+
+unittest  // ResourceTemplate omits _meta when unset
+{
+	ResourceTemplate t = {uriTemplate: "test://{id}", name: "t"};
+	auto j = t.toJson();
+	assert("_meta" !in j);
 }
 
 unittest  // Annotations.empty reflects whether any field is set
