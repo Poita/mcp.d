@@ -1,0 +1,23 @@
+{
+	"name": "resources",
+	"description": "MCP Resources example (server + self-verifying e2e client) over Streamable HTTP.",
+	"dependencies": {
+		"mcp": { "path": "../.." }
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "resources-server",
+			"mainSourceFile": "server.d",
+			"excludedSourceFiles": ["client.d"]
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "resources-client",
+			"mainSourceFile": "client.d",
+			"excludedSourceFiles": ["server.d"]
+		}
+	]
+}
