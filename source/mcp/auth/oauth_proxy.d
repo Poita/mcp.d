@@ -79,6 +79,12 @@ struct OAuthProxyConfig
 	/// redirect URI. Defaults to `/auth/callback`.
 	string redirectPath = "/auth/callback";
 
+	/// The path on the proxy at which the user-consent screen is served and the
+	/// consent-approval action is handled (confused-deputy mitigation). A
+	/// dynamically-registered client is not forwarded to the upstream until the
+	/// user approves it here. Defaults to `/consent`.
+	string consentPath = "/consent";
+
 	/// The scopes advertised in the metadata documents the proxy publishes.
 	string[] scopesSupported;
 
@@ -121,6 +127,16 @@ struct OAuthProxyConfig
 	string registrationEndpoint() const @safe
 	{
 		return joinUrl(baseUrl, "/register");
+	}
+
+	/// The proxy's own consent endpoint (the confused-deputy consent screen +
+	/// approval action). Not advertised in OAuth metadata; used by the HTTP mount.
+	string consentEndpoint() const @safe
+	{
+		string cp = consentPath;
+		if (cp.length && !cp.startsWith("/"))
+			cp = "/" ~ cp;
+		return joinUrl(baseUrl, cp);
 	}
 }
 
