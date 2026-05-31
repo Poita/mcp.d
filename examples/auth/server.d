@@ -16,6 +16,12 @@
  *   - surfaces the validated `TokenInfo` to tool handlers via
  *     `RequestContext.auth`, which a tool uses for finer-grained scope checks.
  *
+ * The two tools are declared in the ergonomic UDA style (`@tool` methods on an
+ * `AuthApi` class, registered in one call via `registerHandlers`). Each takes a
+ * `RequestContext ctx` (auto-injected, omitted from the input schema) to read
+ * `ctx.auth()` and returns a `CallToolResult` so the example can shape its exact
+ * text content and structured payload.
+ *
  * In a real deployment the verification key comes from your authorization
  * server's JWKS (`JwtVerifierConfig.jwksUri`). To keep this example
  * self-contained and offline, we pin the AS's public key directly via
@@ -52,6 +58,60 @@ enum PublicKeyPem = "-----BEGIN PUBLIC KEY-----\n"
 	~ "Uyb2/iyjmioDCWYWx8Cp3defXx7Hl89WmW/0G66IVaqXTpmRM0AW36yqeg==\n"
 	~ "-----END PUBLIC KEY-----\n";
 
+/// The tools, declared in the ergonomic UDA style. Each `@tool` method takes a
+/// `RequestContext ctx` (auto-injected by the reflection layer and omitted from
+/// the inferred input schema) and reads the validated token via `ctx.auth()`.
+final class AuthApi
+{
+@safe:
+
+	/// `whoami` — returns the authenticated principal and the granted scopes, read
+	/// straight from the validated token via `ctx.auth()`. Requires only the
+	/// server-wide `mcp:read` scope. Returns a `CallToolResult` so the human-
+	/// readable text line and the structured payload are shaped exactly.
+	@tool("whoami", "Return the authenticated subject and granted scopes")
+	CallToolResult whoami(RequestContext ctx)
+	{
+		import std.array : join;
+
+		auto info = ctx.auth();
+		Json structured = Json.emptyObject;
+		structured["subject"] = info.subject;
+		Json scopes = Json.emptyArray;
+		foreach (s; info.scopes)
+			scopes ~= Json(s);
+		structured["scopes"] = scopes;
+
+		CallToolResult r;
+		r.content = [
+			Content.makeText("subject=" ~ info.subject ~ " scopes=" ~ info.scopes.join(" "))
+		];
+		r.structuredContent = structured;
+		return r;
+	}
+
+	/// `secret_note` — a privileged tool guarded by a FINER-GRAINED, per-tool scope
+	/// check (`mcp:write`) on top of the server-wide `mcp:read`. The handler reads
+	/// `ctx.auth().hasScope` and returns a tool error when the caller lacks the
+	/// write scope, demonstrating in-handler authorization decisions.
+	@tool("secret_note", "Return a secret note; requires the mcp:write scope")
+	CallToolResult secretNote(RequestContext ctx)
+	{
+		auto info = ctx.auth();
+		CallToolResult r;
+		if (!info.hasScope("mcp:write"))
+		{
+			r.content = [
+				Content.makeText("forbidden: this tool requires the mcp:write scope")
+			];
+			r.isError = true;
+			return r;
+		}
+		r.content = [Content.makeText("the launch code is 0000-MCP")];
+		return r;
+	}
+}
+
 void main(string[] args)
 {
 	ushort port = 8742;
@@ -62,8 +122,8 @@ void main(string[] args)
 	auto server = new McpServer("auth-example", "1.0.0",
 			nullable("OAuth 2.1 protected MCP server (Streamable HTTP)."));
 
-	registerWhoami(server);
-	registerSecretNote(server);
+	// Register every @tool method of AuthApi (whoami, secret_note) in one call.
+	registerHandlers(server, new AuthApi);
 
 	// --- The single auth entry point: a JWT verifier feeding the resource
 	// server config. Set the issuer/audience/required-scope here; the transport
@@ -89,59 +149,4 @@ void main(string[] args)
 		stderr.writefln("  PRM: http://%s:%d/.well-known/oauth-protected-resource", host, port);
 	}();
 	runStreamableHttp(server, port, opts);
-}
-
-/// `whoami` — returns the authenticated principal and the granted scopes, read
-/// straight from the validated token via `ctx.auth()`. Requires only the
-/// server-wide `mcp:read` scope.
-private void registerWhoami(McpServer server) @safe
-{
-	Tool whoami = {
-		name: "whoami",
-		description: nullable("Return the authenticated subject and granted scopes")
-	};
-	server.registerDynamicTool(whoami, (Json args, RequestContext ctx) @safe {
-		import std.array : join;
-
-		auto info = ctx.auth();
-		Json structured = Json.emptyObject;
-		structured["subject"] = info.subject;
-		Json scopes = Json.emptyArray;
-		foreach (s; info.scopes)
-			scopes ~= Json(s);
-		structured["scopes"] = scopes;
-
-		CallToolResult r;
-		r.content = [
-			Content.makeText("subject=" ~ info.subject ~ " scopes=" ~ info.scopes.join(" "))
-		];
-		r.structuredContent = structured;
-		return r;
-	});
-}
-
-/// `secret_note` — a privileged tool guarded by a FINER-GRAINED, per-tool scope
-/// check (`mcp:write`) on top of the server-wide `mcp:read`. The handler reads
-/// `ctx.auth().hasScope` and returns a tool error when the caller lacks the
-/// write scope, demonstrating in-handler authorization decisions.
-private void registerSecretNote(McpServer server) @safe
-{
-	Tool secret = {
-		name: "secret_note",
-		description: nullable("Return a secret note; requires the mcp:write scope")
-	};
-	server.registerDynamicTool(secret, (Json args, RequestContext ctx) @safe {
-		auto info = ctx.auth();
-		CallToolResult r;
-		if (!info.hasScope("mcp:write"))
-		{
-			r.content = [
-				Content.makeText("forbidden: this tool requires the mcp:write scope")
-			];
-			r.isError = true;
-			return r;
-		}
-		r.content = [Content.makeText("the launch code is 0000-MCP")];
-		return r;
-	});
 }
