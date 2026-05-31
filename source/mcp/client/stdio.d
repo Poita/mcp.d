@@ -292,11 +292,13 @@ final class StdioClient
 /// the child's `stdin`/`stdout`. The child's `stderr` is left attached to this
 /// process's `stderr` for logging, per the MCP stdio transport.
 ///
-/// Call `close()` (or rely on `scope(exit)`) to close the child's stdin and
-/// wait for it to exit.
+/// Call `close()` (or rely on `scope(exit)`) to perform the MCP stdio shutdown
+/// sequence: close the child's stdin, then escalate to `SIGTERM` and finally
+/// `SIGKILL` if the server does not exit within the grace periods.
 final class StdioClientProcess
 {
     import std.process : ProcessPipes;
+    import core.time : Duration, seconds, msecs;
 
     private ProcessPipes pipes;
     /// The MCP client speaking to the subprocess.
@@ -308,14 +310,69 @@ final class StdioClientProcess
         this.client = client;
     }
 
-    /// Close the child's stdin (signaling end-of-input) and wait for it to exit.
-    /// Returns the child's exit status. Idempotent-safe to call once.
-    int close() @safe
+    /// Shut the child down per the MCP stdio Shutdown sequence
+    /// (basic/lifecycle §Shutdown -> stdio):
+    ///
+    /// 1. close the child's stdin (signal end-of-input),
+    /// 2. wait up to `termGrace` for the server to exit, then send `SIGTERM`,
+    /// 3. wait up to `killGrace` for the server to exit, then send `SIGKILL`.
+    ///
+    /// Returns the child's exit status (a process killed by signal reports a
+    /// negative status per `std.process.wait`). Safe to call once.
+    int close(Duration termGrace = 5.seconds, Duration killGrace = 5.seconds) @safe
     {
+        () @trusted { pipes.stdin.close(); }();
+
+        // Step 1+2: wait for a clean exit, escalating to SIGTERM on timeout.
+        auto status = waitUntil(termGrace);
+        if (!status.isNull)
+            return status.get;
+
+        version (Posix)
+        {
+            import std.process : kill;
+            import core.sys.posix.signal : SIGTERM, SIGKILL;
+
+            () @trusted { kill(pipes.pid, SIGTERM); }();
+            status = waitUntil(killGrace);
+            if (!status.isNull)
+                return status.get;
+
+            // Step 3: still alive after SIGTERM -- force kill and reap.
+            () @trusted { kill(pipes.pid, SIGKILL); }();
+        }
+        else
+        {
+            import std.process : kill;
+
+            // On Windows there is no SIGTERM/SIGKILL distinction; TerminateProcess
+            // is the forceful equivalent of SIGKILL.
+            () @trusted { kill(pipes.pid); }();
+        }
+
         import std.process : wait;
 
-        () @trusted { pipes.stdin.close(); }();
         return () @trusted { return wait(pipes.pid); }();
+    }
+
+    /// Poll `tryWait` until the child exits or `grace` elapses. Returns the exit
+    /// status if it exited within the deadline, or null if it is still running.
+    private Nullable!int waitUntil(Duration grace) @safe
+    {
+        import std.process : tryWait;
+        import std.datetime.stopwatch : StopWatch, AutoStart;
+        import core.thread : Thread;
+
+        auto sw = StopWatch(AutoStart.yes);
+        for (;;)
+        {
+            auto r = () @trusted { return tryWait(pipes.pid); }();
+            if (r.terminated)
+                return Nullable!int(r.status);
+            if (sw.peek >= grace)
+                return Nullable!int.init;
+            () @trusted { Thread.sleep(10.msecs); }();
+        }
     }
 }
 
@@ -493,4 +550,61 @@ unittest  // StdioClient answers a server-initiated ping while awaiting its own 
             repliedToPing = true;
     }
     assert(repliedToPing);
+}
+
+version (Posix) unittest  // close() escalates to SIGTERM when the child ignores stdin EOF
+{
+    import std.process : pipeProcess, Redirect, wait;
+    import std.datetime.stopwatch : StopWatch, AutoStart;
+    import core.time : seconds, msecs;
+    import core.sys.posix.signal : SIGTERM;
+
+    // `sleep 30` does not exit when its stdin is closed, so closing stdin alone
+    // would hang forever; the escalating shutdown must SIGTERM it.
+    auto pipes = () @trusted {
+        return pipeProcess(["sh", "-c", "sleep 30"], Redirect.stdin | Redirect.stdout);
+    }();
+    auto proc = new StdioClientProcess(pipes, null);
+
+    auto sw = StopWatch(AutoStart.yes);
+    auto status = proc.close(200.msecs, 2.seconds);
+    // Must return well before the 30s sleep would have finished.
+    assert(sw.peek < 5.seconds);
+    // Killed by SIGTERM => negative status reporting the signal.
+    assert(status == -SIGTERM);
+}
+
+version (Posix) unittest  // close() escalates to SIGKILL when the child also ignores SIGTERM
+{
+    import std.process : pipeProcess, Redirect;
+    import std.datetime.stopwatch : StopWatch, AutoStart;
+    import core.time : seconds, msecs;
+    import core.sys.posix.signal : SIGKILL;
+
+    // Trap (ignore) SIGTERM, then sleep; only SIGKILL can stop this child.
+    auto pipes = () @trusted {
+        return pipeProcess(["sh", "-c", "trap '' TERM; sleep 30"], Redirect.stdin | Redirect.stdout);
+    }();
+    auto proc = new StdioClientProcess(pipes, null);
+
+    auto sw = StopWatch(AutoStart.yes);
+    auto status = proc.close(200.msecs, 200.msecs);
+    assert(sw.peek < 5.seconds);
+    // SIGTERM was ignored, so the kill must have come from SIGKILL.
+    assert(status == -SIGKILL);
+}
+
+version (Posix) unittest  // close() returns the child's clean exit status when it exits on stdin EOF
+{
+    import std.process : pipeProcess, Redirect;
+    import core.time : seconds;
+
+    // `cat` exits 0 once its stdin reaches EOF, so step 1 (close stdin) suffices.
+    auto pipes = () @trusted {
+        return pipeProcess(["cat"], Redirect.stdin | Redirect.stdout);
+    }();
+    auto proc = new StdioClientProcess(pipes, null);
+
+    auto status = proc.close(5.seconds, 5.seconds);
+    assert(status == 0);
 }
