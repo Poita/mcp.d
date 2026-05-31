@@ -185,7 +185,7 @@ private bool guardAuth(scope HTTPServerRequest req, scope HTTPServerResponse res
 		return true;
 
 	const metaUrl = resourceMetadataUrl(req, opts);
-	res.headers["WWW-Authenticate"] = wwwAuthenticate(failure, metaUrl, opts.auth.requiredScope);
+	res.headers["WWW-Authenticate"] = wwwAuthenticate(failure, metaUrl, opts.auth.scopeHint());
 	if (failure == AuthFailure.insufficientScope)
 	{
 		res.statusCode = HTTPStatus.forbidden;
