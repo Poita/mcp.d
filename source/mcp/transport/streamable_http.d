@@ -134,9 +134,12 @@ void mountMcp(URLRouter router, McpServer server,
 		}
 		// No protocol-level session to tear down (stateless mode, or a
 		// draft-negotiated session which removed sessions entirely): per the
-		// backward-compatibility rules, DELETE -> 405.
+		// backward-compatibility rules, DELETE -> 405. The Allow header MUST list
+		// every method the endpoint actually supports (RFC 9110 §10.2.1): on the
+		// stable revisions that is GET (the standalone SSE stream) and POST, while
+		// the draft drops the GET stream so only POST remains.
 		res.statusCode = HTTPStatus.methodNotAllowed;
-		res.headers["Allow"] = "POST";
+		res.headers["Allow"] = allowedMethodsHeader(server.negotiatedVersion);
 		res.writeBody("", "text/plain");
 	});
 }
@@ -280,6 +283,32 @@ unittest  // stable revisions terminate sessions on DELETE; the draft answers 40
 	assert(deleteTerminatesSession(ProtocolVersion.v2025_06_18));
 	assert(deleteTerminatesSession(ProtocolVersion.v2025_03_26));
 	assert(!deleteTerminatesSession(ProtocolVersion.draft));
+}
+
+/// The value of the `Allow` header a 405 Method Not Allowed response must carry
+/// at the MCP endpoint. Per RFC 9110 §10.2.1 the `Allow` header MUST enumerate
+/// the set of methods the resource actually supports. On the stable revisions
+/// (2025-03-26 / 2025-06-18 / 2025-11-25) the single MCP endpoint "supports both
+/// POST and GET methods" (basic/transports §Streamable HTTP) — the standalone
+/// server->client SSE stream is mounted on GET (getOpensSseStream is true) — so a
+/// 405 (e.g. to a DELETE the server does not honour) MUST advertise `GET, POST`.
+/// On the draft the standalone GET stream and protocol-level DELETE are both
+/// dropped, leaving POST as the only supported method, so the header is `POST`.
+string allowedMethodsHeader(ProtocolVersion negotiated) @safe
+{
+	return getOpensSseStream(negotiated) ? "GET, POST" : "POST";
+}
+
+unittest  // 405 Allow header enumerates every supported method (RFC 9110 §10.2.1)
+{
+	// Stable revisions mount both GET (standalone SSE stream) and POST on the MCP
+	// endpoint, so a 405 there MUST advertise both — not just POST.
+	assert(allowedMethodsHeader(ProtocolVersion.v2025_11_25) == "GET, POST");
+	assert(allowedMethodsHeader(ProtocolVersion.v2025_06_18) == "GET, POST");
+	assert(allowedMethodsHeader(ProtocolVersion.v2025_03_26) == "GET, POST");
+	// The draft drops the standalone GET stream and protocol-level DELETE, so POST
+	// is the only supported method and the 405 advertises only POST.
+	assert(allowedMethodsHeader(ProtocolVersion.draft) == "POST");
 }
 
 private void handleGet(McpServer server, ServerPushChannel push,
