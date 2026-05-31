@@ -384,7 +384,9 @@ final class StdioContext : RequestContext
 		p["level"] = level;
 		if (logger.length)
 			p["logger"] = logger;
-		p["data"] = data;
+		// `data` is REQUIRED by server/utilities/logging; emit explicit JSON
+		// null for an undefined payload so vibe does not drop the key.
+		p["data"] = data.type == Json.Type.undefined ? Json(null) : data;
 		emit(makeNotification("notifications/message", p));
 	}
 
@@ -1023,6 +1025,20 @@ unittest  // StdioContext.log omits the optional logger field when none is given
 	ctx.log("info", Json("plain"));
 	auto j = parseJsonString(frames[0]);
 	assert("logger" !in j["params"]);
+}
+
+unittest  // StdioContext.log always emits the REQUIRED data field, even for an undefined payload
+{
+	import vibe.data.json : parseJsonString;
+
+	string[] frames;
+	auto ctx = new StdioContext((string s) @safe { frames ~= s; });
+	ctx.log("info", Json.undefined);
+	auto j = parseJsonString(frames[0]);
+	// `data` is required by server/utilities/logging; an undefined payload
+	// must serialise as an explicit JSON null rather than being dropped.
+	assert("data" in j["params"]);
+	assert(j["params"]["data"].type == Json.Type.null_);
 }
 
 unittest  // StdioContext.reportProgress emits a frame only with a progress token

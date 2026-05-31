@@ -3209,7 +3209,10 @@ struct LogMessageNotification
 		j["level"] = level;
 		if (!logger.isNull)
 			j["logger"] = logger.get;
-		j["data"] = data;
+		// `data` is REQUIRED by server/utilities/logging. vibe.data.json drops
+		// a key whose value is Json.undefined, so substitute an explicit JSON
+		// null to guarantee the wire frame always carries the `data` field.
+		j["data"] = data.type == Json.Type.undefined ? Json(null) : data;
 		return j;
 	}
 
@@ -3277,6 +3280,19 @@ unittest  // LogMessageNotification.toJson round-trips through fromJson
 	assert(back.level == "error");
 	assert(back.logger.get == "net");
 	assert(back.data.get!string == "timeout");
+}
+
+unittest  // LogMessageNotification.toJson always emits the REQUIRED data field
+{
+	// server/utilities/logging types `data` as required (`data: unknown`, no
+	// `?`). A level-only struct whose `data` was never assigned must still
+	// serialise the `data` key (as explicit JSON null), not drop it — vibe
+	// omits keys whose value is Json.undefined.
+	LogMessageNotification n;
+	n.level = LogLevel.info;
+	auto j = n.toJson();
+	assert("data" in j);
+	assert(j["data"].type == Json.Type.null_);
 }
 
 unittest  // Resource serializes required + optional fields
