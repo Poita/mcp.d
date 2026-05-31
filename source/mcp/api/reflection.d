@@ -7,7 +7,9 @@ import std.meta : AliasSeq;
 import vibe.data.json : Json, serializeToJson, deserializeJson;
 
 import mcp.protocol.types;
-import mcp.server.server;
+import mcp.protocol.capabilities : Icon;
+import mcp.protocol.draft : CacheHint, CacheScope;
+import mcp.server.server : McpServer, ToolResponse;
 import mcp.server.context;
 import mcp.api.attributes;
 import mcp.api.schema;
@@ -172,7 +174,7 @@ private P marshalScalar(P)(Json v) @safe
 /// wrapped under a `result` property so `structuredContent` is always an object.
 private Json outputSchemaOf(R)() @safe
 {
-	static if (is(R == CallToolResult) || isSomeString!R || is(R == void))
+	static if (is(R == CallToolResult) || is(R == ToolResponse) || isSomeString!R || is(R == void))
 		return Json.undefined;
 	else static if (is(R == struct))
 		return jsonSchemaOf!R;
@@ -218,6 +220,63 @@ private CallToolResult toToolResult(R)(R ret) @safe
 	}
 }
 
+/// Collect every `@icon` UDA on a method into the descriptor `Icon[]` shape.
+private Icon[] collectIcons(alias overload)() @safe
+{
+	Icon[] icons;
+	static foreach (a; __traits(getAttributes, overload))
+	{
+		static if (is(typeof(a) == icon))
+		{
+			{
+				Icon ic;
+				ic.src = a.src;
+				if (a.mimeType.length)
+					ic.mimeType = nullable(a.mimeType);
+				ic.sizes = a.sizes;
+				icons ~= ic;
+			}
+		}
+	}
+	return icons;
+}
+
+/// Collect a `@meta` UDA's object into a descriptor `_meta` Json (undefined when
+/// absent or when the supplied value is not an object).
+private Json collectMeta(alias overload)() @safe
+{
+	Json m = Json.undefined;
+	static foreach (a; __traits(getAttributes, overload))
+	{
+		static if (is(typeof(a) == meta))
+		{
+			if (a.value.type == Json.Type.object)
+				m = a.value;
+		}
+	}
+	return m;
+}
+
+/// Collect a `@cache` UDA into a `Nullable!CacheHint` for resource/template
+/// registration; null when absent.
+private Nullable!CacheHint collectCache(alias overload)() @safe
+{
+	Nullable!CacheHint hint;
+	static foreach (a; __traits(getAttributes, overload))
+	{
+		static if (is(typeof(a) == cache))
+		{
+			{
+				CacheHint h;
+				h.ttlMs = a.ttlMs;
+				h.cacheScope = (a.scope_ == "private") ? CacheScope.private_ : CacheScope.public_;
+				hint = h;
+			}
+		}
+	}
+	return hint;
+}
+
 private void registerToolMethod(string memberName, alias overload, alias parent)(
 		McpServer server, tool attr) @safe
 {
@@ -245,6 +304,8 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 			anns.destructiveHint = a.destructiveHint;
 			anns.idempotentHint = a.idempotentHint;
 			anns.openWorldHint = a.openWorldHint;
+			if (a.title.length)
+				anns.title = a.title;
 		}
 	}
 	if (!anns.empty)
@@ -261,18 +322,46 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		}
 	}
 
-	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
-		alias names = ParameterIdentifierTuple!overload;
-		Tuple!(Parameters!overload) argv;
-		static foreach (i, P; Parameters!overload)
-		{
-			static if (is(P : RequestContext))
-				argv[i] = ctx;
-			else
-				argv[i] = marshalArg!P(args, names[i]);
-		}
-		return toToolResult(__traits(getMember, parent, memberName)(argv.expand));
-	});
+	// @icon UDAs -> descriptor.icons; @meta UDA -> descriptor._meta.
+	descriptor.icons = collectIcons!overload();
+	{
+		auto m = collectMeta!overload();
+		if (m.type == Json.Type.object)
+			descriptor.meta = m;
+	}
+
+	static if (is(ReturnType!overload == ToolResponse))
+	{
+		// MRTR-capable tool: the method itself returns a ToolResponse, so it may
+		// answer `inputRequired` (stateless elicitation) as well as `complete`.
+		server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+			alias names = ParameterIdentifierTuple!overload;
+			Tuple!(Parameters!overload) argv;
+			static foreach (i, P; Parameters!overload)
+			{
+				static if (is(P : RequestContext))
+					argv[i] = ctx;
+				else
+					argv[i] = marshalArg!P(args, names[i]);
+			}
+			return __traits(getMember, parent, memberName)(argv.expand);
+		});
+	}
+	else
+	{
+		server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+			alias names = ParameterIdentifierTuple!overload;
+			Tuple!(Parameters!overload) argv;
+			static foreach (i, P; Parameters!overload)
+			{
+				static if (is(P : RequestContext))
+					argv[i] = ctx;
+				else
+					argv[i] = marshalArg!P(args, names[i]);
+			}
+			return toToolResult(__traits(getMember, parent, memberName)(argv.expand));
+		});
+	}
 }
 
 /// Wrap a prompt method's return value into a `GetPromptResult`.
@@ -357,10 +446,18 @@ private void registerResourceMethod(string memberName, alias overload, alias par
 		}
 	}
 
+	// @icon UDAs -> descriptor.icons; @meta UDA -> descriptor._meta.
+	descriptor.icons = collectIcons!overload();
+	{
+		auto m = collectMeta!overload();
+		if (m.type == Json.Type.object)
+			descriptor.meta = m;
+	}
+
 	server.registerResource(descriptor, () @safe {
 		return toResourceContents(__traits(getMember, parent, memberName)(),
 			attr.uri, attr.mimeType);
-	});
+	}, collectCache!overload());
 }
 
 private void registerTemplateMethod(string memberName, alias overload, alias parent)(
@@ -383,6 +480,14 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 		}
 	}
 
+	// @icon UDAs -> descriptor.icons; @meta UDA -> descriptor._meta.
+	descriptor.icons = collectIcons!overload();
+	{
+		auto m = collectMeta!overload();
+		if (m.type == Json.Type.object)
+			descriptor.meta = m;
+	}
+
 	server.registerResourceTemplate(descriptor, (string uri, string[string] params) @safe {
 		alias names = ParameterIdentifierTuple!overload;
 		Tuple!(Parameters!overload) argv;
@@ -395,7 +500,7 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 		}
 		auto ret = __traits(getMember, parent, memberName)(argv.expand);
 		return toResourceContents(ret, uri, attr.mimeType);
-	});
+	}, collectCache!overload());
 }
 
 version (unittest)
@@ -486,6 +591,45 @@ version (unittest)
 		string summary(string topic) @safe
 		{
 			return "Summarize " ~ topic;
+		}
+	}
+
+	import vibe.data.json : parseJsonString;
+	import mcp.server.server : ToolResponse;
+	import mcp.protocol.draft : InputRequest;
+
+	// Separate fixture exercising the UDAs added for issue #295: icons, _meta,
+	// annotation title, per-resource cache hint, and MRTR (ToolResponse) tools.
+	private final class ExtApi
+	{
+		@tool("draw", "Draw something")
+		@icon("https://example.com/draw.png", "image/png", ["48x48"])
+		@meta(parseJsonString(`{"category":"art"}`))
+		@toolAnnotations(readOnlyHint : true.nullable, title:
+				"Draw Tool") string draw(string spec) @safe
+		{
+			return "drew " ~ spec;
+		}
+
+		@tool("ask", "MRTR tool that may ask for more input")
+		ToolResponse ask(string seed) @safe
+		{
+			if (seed.length == 0)
+				return ToolResponse.inputRequired([
+				InputRequest("req1", "elicitation", Json.emptyObject)
+			]);
+			CallToolResult r;
+			r.content = [Content.makeText("seeded " ~ seed)];
+			return ToolResponse.complete(r);
+		}
+
+		@resource("ext://cached", "Cached", "application/json")
+		@icon("https://example.com/res.svg")
+		@meta(parseJsonString(`{"origin":"db"}`))
+		@cache(5000, "private")
+		string cached() @safe
+		{
+			return "{}";
 		}
 	}
 }
@@ -798,4 +942,147 @@ version (unittest) private auto MakeListMessage()
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	return Message(makeRequest(Json(99), "tools/list", Json.emptyObject));
+}
+
+unittest  // #295 @icon UDA: tool icons appear in tools/list
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ExtApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+
+	Json drawTool;
+	foreach (i; 0 .. tools.length)
+		if (tools[i]["name"].get!string == "draw")
+			drawTool = tools[i];
+	assert(drawTool.type == Json.Type.object);
+	assert(drawTool["icons"].length == 1);
+	assert(drawTool["icons"][0]["src"].get!string == "https://example.com/draw.png");
+	assert(drawTool["icons"][0]["mimeType"].get!string == "image/png");
+	assert(drawTool["icons"][0]["sizes"][0].get!string == "48x48");
+}
+
+unittest  // #295 @meta UDA: tool descriptor `_meta` appears in tools/list
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ExtApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+
+	Json drawTool;
+	foreach (i; 0 .. tools.length)
+		if (tools[i]["name"].get!string == "draw")
+			drawTool = tools[i];
+	assert(drawTool["_meta"]["category"].get!string == "art");
+}
+
+unittest  // #295 @toolAnnotations title: annotation-level title appears in annotations
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ExtApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+
+	Json drawTool;
+	foreach (i; 0 .. tools.length)
+		if (tools[i]["name"].get!string == "draw")
+			drawTool = tools[i];
+	// The annotation-level title is distinct from tool.title and lives under annotations.
+	assert(drawTool["annotations"]["title"].get!string == "Draw Tool");
+	assert(drawTool["annotations"]["readOnlyHint"].get!bool == true);
+}
+
+unittest  // #295 MRTR UDA tool: returning ToolResponse.inputRequired surfaces inputRequests
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ExtApi);
+
+	// Empty seed -> the tool asks for more input (MRTR InputRequiredResult).
+	Json p = Json.emptyObject;
+	p["name"] = "ask";
+	p["arguments"] = Json(["seed": Json("")]);
+	auto r = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
+	// An InputRequiredResult carries `inputRequests` (a map keyed by id), not content.
+	assert(r["result"]["inputRequests"].type == Json.Type.object);
+	assert(r["result"]["inputRequests"]["req1"]["method"].get!string == "elicitation/create");
+}
+
+unittest  // #295 MRTR UDA tool: returning ToolResponse.complete produces a normal result
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ExtApi);
+
+	Json p = Json.emptyObject;
+	p["name"] = "ask";
+	p["arguments"] = Json(["seed": Json("X")]);
+	auto r = s.handle(Message(makeRequest(Json(3), "tools/call", p))).get;
+	assert("inputRequests" !in r["result"]);
+	assert(r["result"]["content"][0]["text"].get!string == "seeded X");
+}
+
+unittest  // #295 @icon / @meta UDA on a resource: appear in resources/list
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ExtApi);
+	auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
+			Json.emptyObject))).get["result"]["resources"];
+
+	Json cachedRes;
+	foreach (i; 0 .. res.length)
+		if (res[i]["uri"].get!string == "ext://cached")
+			cachedRes = res[i];
+	assert(cachedRes.type == Json.Type.object);
+	assert(cachedRes["icons"][0]["src"].get!string == "https://example.com/res.svg");
+	assert(cachedRes["_meta"]["origin"].get!string == "db");
+}
+
+version (unittest) private auto draftRead(string uri) @safe
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.draft : MetaKey;
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["uri"] = uri;
+	params["_meta"] = meta;
+	return Message(makeRequest(Json(1), "resources/read", params));
+}
+
+unittest  // #295 @cache UDA on a resource: draft resources/read carries CacheableResult fields
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ExtApi);
+	// A draft request (carrying the protocol-version _meta) gets cache fields.
+	auto rr = s.handle(draftRead("ext://cached")).get;
+	assert(rr["result"]["ttlMs"].get!long == 5000);
+	assert(rr["result"]["cacheScope"].get!string == "private");
+}
+
+unittest  // #295 @cache UDA: pre-draft resources/read has NO cache fields (no wire regression)
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ExtApi);
+	// A plain (non-draft) request must NOT carry any cache fields.
+	Json rp = Json.emptyObject;
+	rp["uri"] = "ext://cached";
+	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	assert("ttlMs" !in rr["result"]);
+	assert("cacheScope" !in rr["result"]);
 }
