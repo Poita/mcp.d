@@ -455,6 +455,14 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 		}
 	}
 
+	// @icon UDAs -> descriptor.icons; @meta UDA -> descriptor._meta.
+	descriptor.icons = collectIcons!overload();
+	{
+		auto m = collectMeta!overload();
+		if (m.type == Json.Type.object)
+			descriptor.meta = m;
+	}
+
 	server.registerDynamicPrompt(descriptor, (Json args) @safe {
 		Tuple!(Parameters!overload) argv;
 		static foreach (i, P; Parameters!overload)
@@ -696,6 +704,14 @@ version (unittest)
 		string cached() @safe
 		{
 			return "{}";
+		}
+
+		@prompt("greeting", "A greeting prompt")
+		@icon("https://example.com/prompt.png", "image/png", ["32x32"])
+		@meta(parseJsonString(`{"audience":"all"}`))
+		string greeting() @safe
+		{
+			return "hello";
 		}
 	}
 }
@@ -1229,6 +1245,43 @@ unittest  // #295 @icon / @meta UDA on a resource: appear in resources/list
 	assert(cachedRes.type == Json.Type.object);
 	assert(cachedRes["icons"][0]["src"].get!string == "https://example.com/res.svg");
 	assert(cachedRes["_meta"]["origin"].get!string == "db");
+}
+
+unittest  // #339 @icon UDA on a @prompt: icons appear in prompts/list
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ExtApi);
+	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
+			Json.emptyObject))).get["result"]["prompts"];
+
+	Json greeting;
+	foreach (i; 0 .. prompts.length)
+		if (prompts[i]["name"].get!string == "greeting")
+			greeting = prompts[i];
+	assert(greeting.type == Json.Type.object);
+	assert(greeting["icons"].length == 1);
+	assert(greeting["icons"][0]["src"].get!string == "https://example.com/prompt.png");
+	assert(greeting["icons"][0]["mimeType"].get!string == "image/png");
+	assert(greeting["icons"][0]["sizes"][0].get!string == "32x32");
+}
+
+unittest  // #339 @meta UDA on a @prompt: descriptor `_meta` appears in prompts/list
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ExtApi);
+	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
+			Json.emptyObject))).get["result"]["prompts"];
+
+	Json greeting;
+	foreach (i; 0 .. prompts.length)
+		if (prompts[i]["name"].get!string == "greeting")
+			greeting = prompts[i];
+	assert(greeting.type == Json.Type.object);
+	assert(greeting["_meta"]["audience"].get!string == "all");
 }
 
 version (unittest) private auto draftRead(string uri) @safe
