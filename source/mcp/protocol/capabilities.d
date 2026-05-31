@@ -2,6 +2,7 @@ module mcp.protocol.capabilities;
 
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
+import mcp.protocol.versions : ProtocolVersion;
 
 @safe:
 
@@ -95,6 +96,35 @@ struct Implementation
 			foreach (i; 0 .. j["icons"].length)
 				impl.icons ~= Icon.fromJson(j["icons"][i]);
 		return impl;
+	}
+
+	/// Return a copy of this `Implementation` with any fields newer than the
+	/// negotiated protocol version stripped, so the wire output stays valid for
+	/// the peer's version. `title` was introduced by 2025-06-18 (`BaseMetadata`);
+	/// `description`, `websiteUrl`, and `icons` were introduced by 2025-11-25.
+	/// `name`/`version` are always present. This lets a server (or client) hold a
+	/// fully-populated identity while emitting only the fields its peer understands.
+	Implementation forVersion(ProtocolVersion v) const @safe
+	{
+		Implementation projected;
+		projected.name = name;
+		projected.version_ = version_;
+		if (v >= ProtocolVersion.v2025_06_18)
+			projected.title = title;
+		if (v >= ProtocolVersion.v2025_11_25)
+		{
+			projected.description = description;
+			projected.websiteUrl = websiteUrl;
+			foreach (icon; icons)
+			{
+				Icon copy;
+				copy.src = icon.src;
+				copy.mimeType = icon.mimeType;
+				copy.sizes = icon.sizes.dup;
+				projected.icons ~= copy;
+			}
+		}
+		return projected;
 	}
 }
 
@@ -452,6 +482,51 @@ unittest  // Implementation includes title when present
 	auto j = impl.toJson();
 	assert(j["title"].get!string == "My Server");
 	assert(Implementation.fromJson(j).title.get == "My Server");
+}
+
+unittest  // forVersion strips title for versions older than 2025-06-18
+{
+	Implementation impl = {
+		name: "srv", version_: "1", title: nullable("My Server")
+	};
+	auto p1 = impl.forVersion(ProtocolVersion.v2025_03_26);
+	assert(p1.title.isNull);
+	assert("title" !in p1.toJson());
+	assert(p1.name == "srv" && p1.version_ == "1");
+}
+
+unittest  // forVersion keeps title from 2025-06-18 but strips 2025-11-25 fields
+{
+	Implementation impl = {
+		name: "srv", version_: "1", title: nullable("My Server"), description: nullable("does things"), websiteUrl: nullable(
+				"https://example.com"), icons: [
+			Icon("https://example.com/i.png")
+		]
+	};
+	auto p1 = impl.forVersion(ProtocolVersion.v2025_06_18);
+	auto j = p1.toJson();
+	assert(j["title"].get!string == "My Server");
+	assert("description" !in j);
+	assert("websiteUrl" !in j);
+	assert("icons" !in j);
+}
+
+unittest  // forVersion keeps every field for 2025-11-25 and draft
+{
+	Implementation impl = {
+		name: "srv", version_: "1", title: nullable("My Server"), description: nullable("does things"), websiteUrl: nullable(
+				"https://example.com"), icons: [
+			Icon("https://example.com/i.png")
+		]
+	};
+	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.draft])
+	{
+		auto j = impl.forVersion(v).toJson();
+		assert(j["title"].get!string == "My Server");
+		assert(j["description"].get!string == "does things");
+		assert(j["websiteUrl"].get!string == "https://example.com");
+		assert(j["icons"].length == 1);
+	}
 }
 
 unittest  // ServerCapabilities emits only set capabilities, presence-aware
