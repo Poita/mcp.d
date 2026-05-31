@@ -1221,6 +1221,20 @@ struct ListResourceTemplatesResult
             j["nextCursor"] = nextCursor.get;
         return j;
     }
+
+    static ListResourceTemplatesResult fromJson(Json j) @safe
+    {
+        ListResourceTemplatesResult r;
+        if ("resourceTemplates" in j && j["resourceTemplates"].type == Json.Type.array)
+        {
+            auto arr = j["resourceTemplates"];
+            foreach (i; 0 .. arr.length)
+                r.resourceTemplates ~= ResourceTemplate.fromJson(arr[i]);
+        }
+        if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
+            r.nextCursor = j["nextCursor"].get!string;
+        return r;
+    }
 }
 
 /// A filesystem root exposed by the client (client/roots §Data Types).
@@ -2250,4 +2264,31 @@ unittest  // Prompt + GetPromptResult fromJson round-trips
     gp.messages = [PromptMessage("user", Content.makeText("hi"))];
     auto gpb = GetPromptResult.fromJson(gp.toJson());
     assert(gpb.messages.length == 1 && gpb.messages[0].content.text == "hi");
+}
+
+unittest  // ListResourceTemplatesResult.fromJson round-trips templates + cursor
+{
+    ResourceTemplate t;
+    t.uriTemplate = "file:///logs/{name}";
+    t.name = "log";
+    t.title = nullable("Log file");
+    t.mimeType = nullable("text/plain");
+
+    ListResourceTemplatesResult res;
+    res.resourceTemplates = [t];
+    res.nextCursor = "page2";
+
+    auto back = ListResourceTemplatesResult.fromJson(res.toJson());
+    assert(back.resourceTemplates.length == 1);
+    assert(back.resourceTemplates[0].uriTemplate == "file:///logs/{name}");
+    assert(back.resourceTemplates[0].name == "log");
+    assert(back.resourceTemplates[0].title.get == "Log file");
+    assert(!back.nextCursor.isNull && back.nextCursor.get == "page2");
+}
+
+unittest  // ListResourceTemplatesResult.fromJson tolerates a missing array
+{
+    ListResourceTemplatesResult back = ListResourceTemplatesResult.fromJson(Json.emptyObject);
+    assert(back.resourceTemplates.length == 0);
+    assert(back.nextCursor.isNull);
 }

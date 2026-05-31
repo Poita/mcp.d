@@ -611,6 +611,26 @@ final class MCPClient
         return all;
     }
 
+    /// `resources/templates/list`, auto-paginated. Returns the resource
+    /// templates exposed by the server (URI templates clients can expand and
+    /// `resources/read`). Mirrors `listResources`.
+    ResourceTemplate[] listResourceTemplates() @safe
+    {
+        ResourceTemplate[] all;
+        Nullable!string cursor;
+        do
+        {
+            Json p = Json.emptyObject;
+            if (!cursor.isNull)
+                p["cursor"] = cursor.get;
+            auto res = ListResourceTemplatesResult.fromJson(rpc("resources/templates/list", p));
+            all ~= res.resourceTemplates;
+            cursor = res.nextCursor;
+        }
+        while (!cursor.isNull);
+        return all;
+    }
+
     /// `resources/read`.
     ReadResourceResult readResource(string uri) @safe
     {
@@ -800,9 +820,17 @@ final class MCPClient
 
     // --- transport internals -------------------------------------------------
 
+    /// Test seam: when set, `rpc` routes the (method, params) pair here and
+    /// returns the delegate's `result` payload instead of POSTing to a server,
+    /// so paginating request methods can be exercised without a live server.
+    /// Production code never sets this.
+    package Json delegate(string method, Json params) @safe onRpcForTest;
+
     /// Send a request and return its result (or throw `McpException`).
     private Json rpc(string method, Json params) @safe
     {
+        if (onRpcForTest !is null)
+            return onRpcForTest(method, params);
         const id = nextId++;
         if (useDraft)
             params = injectDraftMeta(params);
@@ -3162,4 +3190,44 @@ unittest  // MRTR: resolveInputRequest fails for an unknown input type
     InputResponse answer;
     const ok = c.resolveInputRequest(InputRequest("x", "bogus", Json.emptyObject), answer);
     assert(!ok);
+}
+
+unittest  // listResourceTemplates calls resources/templates/list and auto-paginates
+{
+    auto c = new MCPClient("http://localhost");
+    string[] methods;
+    int call;
+    c.onRpcForTest = (string method, Json params) @safe {
+        methods ~= method;
+        Json r = Json.emptyObject;
+        Json arr = Json.emptyArray;
+        if (call == 0)
+        {
+            ResourceTemplate t;
+            t.uriTemplate = "file:///a/{x}";
+            t.name = "a";
+            arr ~= t.toJson();
+            r["resourceTemplates"] = arr;
+            r["nextCursor"] = "p2";
+        }
+        else
+        {
+            assert("cursor" in params && params["cursor"].get!string == "p2");
+            ResourceTemplate t;
+            t.uriTemplate = "file:///b/{y}";
+            t.name = "b";
+            arr ~= t.toJson();
+            r["resourceTemplates"] = arr;
+        }
+        call++;
+        return r;
+    };
+
+    auto templates = c.listResourceTemplates();
+    assert(methods.length == 2);
+    assert(methods[0] == "resources/templates/list");
+    assert(methods[1] == "resources/templates/list");
+    assert(templates.length == 2);
+    assert(templates[0].uriTemplate == "file:///a/{x}");
+    assert(templates[1].name == "b");
 }
