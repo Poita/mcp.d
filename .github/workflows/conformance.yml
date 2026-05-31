@@ -1,0 +1,101 @@
+name: Conformance
+
+# Gates spec conformance on every push/PR so regressions in the official
+# `@modelcontextprotocol/conformance` suite cannot land silently. This is what
+# keeps the "server 38/38 + client 287/287" claim in the README honest.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Pin the conformance harness for reproducibility. Bump deliberately (never
+# `@latest`) so a harness change is a reviewed, intentional commit.
+env:
+  CONFORMANCE_VERSION: "0.1.16"
+
+jobs:
+  conformance:
+    name: MCP conformance suite (server + client)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install D compiler
+        uses: dlang-community/setup-dlang@v1
+        with:
+          compiler: ldc-latest
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Build the two harness targets defined in dub.json. These are plain
+      # executables that link the SDK; a build failure here is a real failure.
+      - name: Build conformance harness targets
+        run: |
+          dub build -c conformance-server
+          dub build -c conformance-client
+
+      # The harness drives our Streamable HTTP server. It exits non-zero on any
+      # scenario failure, which fails the job. We additionally assert there are
+      # no reported failures in the captured summary so a "green" run that
+      # silently skipped scenarios is still caught.
+      - name: Server conformance suite
+        run: |
+          ./conformance-server --port 3000 &
+          SERVER_PID=$!
+          # Give the server a moment to bind the port.
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null "http://127.0.0.1:3000/mcp" \
+              -H 'Accept: application/json, text/event-stream' \
+              -H 'Content-Type: application/json' \
+              -X POST -d '{}'; then break; fi
+            sleep 1
+          done
+          set +e
+          npx --yes "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" \
+            server --url http://127.0.0.1:3000/mcp | tee server-conformance.log
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          kill "$SERVER_PID" 2>/dev/null || true
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::Server conformance scenarios failed"
+            exit "$STATUS"
+          fi
+          if grep -Eiq '[1-9][0-9]* failed' server-conformance.log; then
+            echo "::error::Server conformance reported failures"
+            exit 1
+          fi
+
+      # Client mode: the harness spins up its own reference server and launches
+      # our client binary per scenario (URL appended, scenario in env). It exits
+      # non-zero on any failure; we also assert no reported failures.
+      - name: Client conformance suite
+        run: |
+          set +e
+          npx --yes "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" \
+            client --command ./conformance-client --suite all | tee client-conformance.log
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::Client conformance scenarios failed"
+            exit "$STATUS"
+          fi
+          if grep -Eiq '[1-9][0-9]* failed' client-conformance.log; then
+            echo "::error::Client conformance reported failures"
+            exit 1
+          fi
+
+      - name: Upload conformance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-logs
+          path: |
+            server-conformance.log
+            client-conformance.log
+          if-no-files-found: ignore
