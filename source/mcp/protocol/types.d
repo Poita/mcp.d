@@ -3,7 +3,8 @@ module mcp.protocol.types;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json, parseJsonString;
 import mcp.protocol.capabilities;
-import mcp.protocol.draft : InputRequest, inputRequestsToJson, inputRequestsFromJson;
+import mcp.protocol.draft : InputRequest, inputRequestsToJson,
+	inputRequestsFromJson, CacheHint, parseCacheHint;
 
 @safe:
 
@@ -648,6 +649,9 @@ struct ListToolsResult
 {
 	Tool[] tools;
 	Nullable!string nextCursor;
+	/// Draft `CacheableResult` freshness hint parsed from the wire, exposed for
+	/// client consumers. Never re-emitted by `toJson` (the server attaches it).
+	Nullable!CacheHint cache;
 
 	Json toJson() const @safe
 	{
@@ -672,6 +676,7 @@ struct ListToolsResult
 		}
 		if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
 			r.nextCursor = j["nextCursor"].get!string;
+		r.cache = parseCacheHint(j);
 		return r;
 	}
 }
@@ -1540,6 +1545,9 @@ struct ListResourcesResult
 {
 	Resource[] resources;
 	Nullable!string nextCursor;
+	/// Draft `CacheableResult` freshness hint parsed from the wire, exposed for
+	/// client consumers. Never re-emitted by `toJson` (the server attaches it).
+	Nullable!CacheHint cache;
 
 	Json toJson() const @safe
 	{
@@ -1564,6 +1572,7 @@ struct ListResourcesResult
 		}
 		if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
 			r.nextCursor = j["nextCursor"].get!string;
+		r.cache = parseCacheHint(j);
 		return r;
 	}
 }
@@ -1573,6 +1582,9 @@ struct ListResourceTemplatesResult
 {
 	ResourceTemplate[] resourceTemplates;
 	Nullable!string nextCursor;
+	/// Draft `CacheableResult` freshness hint parsed from the wire, exposed for
+	/// client consumers. Never re-emitted by `toJson` (the server attaches it).
+	Nullable!CacheHint cache;
 
 	Json toJson() const @safe
 	{
@@ -1597,6 +1609,7 @@ struct ListResourceTemplatesResult
 		}
 		if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
 			r.nextCursor = j["nextCursor"].get!string;
+		r.cache = parseCacheHint(j);
 		return r;
 	}
 }
@@ -1834,6 +1847,9 @@ struct ReadResourceResult
 {
 	ResourceContents[] contents;
 	Json meta; /// optional result-level `_meta` object
+	/// Draft `CacheableResult` freshness hint parsed from the wire, exposed for
+	/// client consumers. Never re-emitted by `toJson` (the server attaches it).
+	Nullable!CacheHint cache;
 
 	Json toJson() const @safe
 	{
@@ -1858,6 +1874,7 @@ struct ReadResourceResult
 		}
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			r.meta = j["_meta"];
+		r.cache = parseCacheHint(j);
 		return r;
 	}
 
@@ -1997,6 +2014,9 @@ struct ListPromptsResult
 {
 	Prompt[] prompts;
 	Nullable!string nextCursor;
+	/// Draft `CacheableResult` freshness hint parsed from the wire, exposed for
+	/// client consumers. Never re-emitted by `toJson` (the server attaches it).
+	Nullable!CacheHint cache;
 
 	Json toJson() const @safe
 	{
@@ -2021,6 +2041,7 @@ struct ListPromptsResult
 		}
 		if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
 			r.nextCursor = j["nextCursor"].get!string;
+		r.cache = parseCacheHint(j);
 		return r;
 	}
 }

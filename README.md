@@ -295,9 +295,20 @@ void main()
 }
 ```
 
-`MCPClient` also offers `listTools` / `listResources` / `listPrompts` (auto-paginated),
-`readResource`, `getPrompt`, `setBearerToken` for OAuth, and `enableDraft()` for the
-stateless draft protocol.
+`MCPClient` also offers `listTools` / `listResources` / `listResourceTemplates` /
+`listPrompts` (auto-paginated), `readResource`, `getPrompt`, `setBearerToken` for OAuth,
+and `enableDraft()` for the stateless draft protocol.
+
+The auto-paginated list helpers return their result object (`ListToolsResult`,
+`ListResourcesResult`, `ListResourceTemplatesResult`, `ListPromptsResult`) with every
+page's items aggregated into the items field (`.tools`, `.resources`,
+`.resourceTemplates`, `.prompts`) and `nextCursor` drained to null. Each result —
+along with `readResource`'s `ReadResourceResult` — also exposes the draft
+`CacheableResult` freshness hint as `.cache` (a `Nullable!CacheHint` with `ttlMs` and
+`cacheScope`), populated from the first page when the server sends one. On the server,
+supply the hint per result: pass a `CacheHint` to `registerResource` /
+`registerResourceTemplate`, or call `setListCacheHint("tools/list", CacheHint(...))`
+for a `*/list` method (hints are draft-gated and never alter 2025-11-25 output).
 
 `MCPClient` is transport-agnostic: it speaks pure JSON-RPC over a
 `ClientTransport`. `MCPClient.http(url)` builds one over Streamable HTTP;
@@ -321,7 +332,7 @@ void main()
 
     client.initialize();
 
-    auto tools = client.listTools();
+    auto tools = client.listTools().tools;
     auto result = client.callTool("add", Json(["a": Json(2), "b": Json(40)]));
     // ...
 }

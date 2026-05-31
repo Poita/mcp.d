@@ -393,16 +393,49 @@ enum CacheScope : string
 	private_ = "private",
 }
 
+/// A per-result freshness hint (draft `CacheableResult`): how long a result may
+/// be cached (`ttlMs`) and by whom (`cacheScope`). Supplied per result by the
+/// user and surfaced to client consumers.
+struct CacheHint
+{
+	long ttlMs;
+	CacheScope cacheScope = CacheScope.public_;
+}
+
 /// Attach the draft `CacheableResult` fields (`ttlMs`, `cacheScope`) to a result
-/// object. A freshness hint for clients/intermediaries that complements
-/// `listChanged` notifications.
-Json withCache(Json result, long ttlMs, CacheScope scope_ = CacheScope.public_) @safe
+/// object from a `CacheHint`. A freshness hint for clients/intermediaries that
+/// complements `listChanged` notifications.
+Json withCache(Json result, CacheHint hint) @safe
 {
 	if (result.type != Json.Type.object)
 		return result;
-	result["ttlMs"] = ttlMs;
-	result["cacheScope"] = cast(string) scope_;
+	result["ttlMs"] = hint.ttlMs;
+	result["cacheScope"] = cast(string) hint.cacheScope;
 	return result;
+}
+
+/// Parse a draft `CacheableResult` freshness hint from a result object. Reads
+/// `ttlMs` (accepting an integer or a float) and `cacheScope` (a string mapped to
+/// the `CacheScope` enum, defaulting to `public`). Returns null when no `ttlMs`
+/// field is present.
+Nullable!CacheHint parseCacheHint(Json result) @safe
+{
+	if (result.type != Json.Type.object || "ttlMs" !in result)
+		return Nullable!CacheHint.init;
+	auto ttl = result["ttlMs"];
+	CacheHint hint;
+	if (ttl.type == Json.Type.int_)
+		hint.ttlMs = ttl.get!long;
+	else if (ttl.type == Json.Type.float_)
+		hint.ttlMs = cast(long) ttl.get!double;
+	else
+		return Nullable!CacheHint.init;
+	if ("cacheScope" in result && result["cacheScope"].type == Json.Type.string)
+	{
+		const s = result["cacheScope"].get!string;
+		hint.cacheScope = (s == "private") ? CacheScope.private_ : CacheScope.public_;
+	}
+	return nullable(hint);
 }
 
 // ===========================================================================
@@ -937,13 +970,41 @@ unittest  // DiscoverResult.fromJson reads the spec wire field `supportedVersion
 	assert(r.protocolVersions[0] == "2026-07-28");
 }
 
-unittest  // withCache attaches ttlMs and cacheScope
+unittest  // withCache attaches ttlMs and cacheScope from a CacheHint
 {
 	Json r = Json.emptyObject;
 	r["tools"] = Json.emptyArray;
-	auto c = withCache(r, 5000, CacheScope.private_);
+	auto c = withCache(r, CacheHint(5000, CacheScope.private_));
 	assert(c["ttlMs"].get!long == 5000);
 	assert(c["cacheScope"].get!string == "private");
+}
+
+unittest  // parseCacheHint reads an integer ttlMs and a cacheScope string
+{
+	Json r = Json.emptyObject;
+	r["ttlMs"] = 5000;
+	r["cacheScope"] = "private";
+	auto h = parseCacheHint(r);
+	assert(!h.isNull);
+	assert(h.get.ttlMs == 5000);
+	assert(h.get.cacheScope == CacheScope.private_);
+}
+
+unittest  // parseCacheHint accepts a float ttlMs and defaults cacheScope to public
+{
+	Json r = Json.emptyObject;
+	r["ttlMs"] = 1500.0;
+	auto h = parseCacheHint(r);
+	assert(!h.isNull);
+	assert(h.get.ttlMs == 1500);
+	assert(h.get.cacheScope == CacheScope.public_);
+}
+
+unittest  // parseCacheHint returns null when ttlMs is absent
+{
+	Json r = Json.emptyObject;
+	r["tools"] = Json.emptyArray;
+	assert(parseCacheHint(r).isNull);
 }
 
 unittest  // MRTR InputRequiredResult round-trips and input responses parse

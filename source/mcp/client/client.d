@@ -342,27 +342,37 @@ final class MCPClient
 		rpc("ping", Json.emptyObject);
 	}
 
-	/// `tools/list`, following pagination cursors to completion.
-	Tool[] listTools() @safe
+	/// `tools/list`, following pagination cursors to completion. Returns the
+	/// drained `ListToolsResult`: `tools` aggregates every page's items,
+	/// `nextCursor` is null, and `cache` carries the first page's parsed draft
+	/// `CacheableResult` freshness hint (if any).
+	ListToolsResult listTools() @safe
 	{
-		Tool[] all;
+		ListToolsResult acc;
 		Nullable!string cursor;
+		bool first = true;
 		do
 		{
 			Json p = Json.emptyObject;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
 			auto res = ListToolsResult.fromJson(rpc("tools/list", p));
-			all ~= res.tools;
+			acc.tools ~= res.tools;
+			if (first)
+			{
+				acc.cache = res.cache;
+				first = false;
+			}
 			cursor = res.nextCursor;
 		}
 		while (!cursor.isNull);
+		acc.nextCursor = Nullable!string.init;
 		// Cache each tool's inputSchema so a subsequent tools/call can mirror any
 		// x-mcp-header-annotated arguments into Mcp-Param-{Name} headers (draft
 		// basic/transports, "Custom Headers from Tool Parameters").
-		foreach (t; all)
+		foreach (t; acc.tools)
 			cacheToolSchema(t.name, t.inputSchema);
-		return all;
+		return acc;
 	}
 
 	/// Record a tool's `inputSchema` (keyed by tool name) so the draft client can
@@ -587,42 +597,59 @@ final class MCPClient
 		return validateAgainstSchema(result.structuredContent, tool.outputSchema);
 	}
 
-	/// `resources/list`, auto-paginated.
-	Resource[] listResources() @safe
+	/// `resources/list`, auto-paginated. Returns the drained
+	/// `ListResourcesResult`: `resources` aggregates every page, `nextCursor` is
+	/// null, and `cache` carries the first page's parsed freshness hint.
+	ListResourcesResult listResources() @safe
 	{
-		Resource[] all;
+		ListResourcesResult acc;
 		Nullable!string cursor;
+		bool first = true;
 		do
 		{
 			Json p = Json.emptyObject;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
 			auto res = ListResourcesResult.fromJson(rpc("resources/list", p));
-			all ~= res.resources;
+			acc.resources ~= res.resources;
+			if (first)
+			{
+				acc.cache = res.cache;
+				first = false;
+			}
 			cursor = res.nextCursor;
 		}
 		while (!cursor.isNull);
-		return all;
+		acc.nextCursor = Nullable!string.init;
+		return acc;
 	}
 
-	/// `resources/templates/list`, auto-paginated. Returns the resource
-	/// templates exposed by the server (URI templates clients can expand and
-	/// `resources/read`). Mirrors `listResources`.
-	ResourceTemplate[] listResourceTemplates() @safe
+	/// `resources/templates/list`, auto-paginated. Returns the drained
+	/// `ListResourceTemplatesResult` (URI templates clients can expand and
+	/// `resources/read`). `resourceTemplates` aggregates every page, `nextCursor`
+	/// is null, and `cache` carries the first page's parsed freshness hint.
+	ListResourceTemplatesResult listResourceTemplates() @safe
 	{
-		ResourceTemplate[] all;
+		ListResourceTemplatesResult acc;
 		Nullable!string cursor;
+		bool first = true;
 		do
 		{
 			Json p = Json.emptyObject;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
 			auto res = ListResourceTemplatesResult.fromJson(rpc("resources/templates/list", p));
-			all ~= res.resourceTemplates;
+			acc.resourceTemplates ~= res.resourceTemplates;
+			if (first)
+			{
+				acc.cache = res.cache;
+				first = false;
+			}
 			cursor = res.nextCursor;
 		}
 		while (!cursor.isNull);
-		return all;
+		acc.nextCursor = Nullable!string.init;
+		return acc;
 	}
 
 	/// `resources/read`.
@@ -648,22 +675,31 @@ final class MCPClient
 		return withProgressToken(p, progressToken);
 	}
 
-	/// `prompts/list`, auto-paginated.
-	Prompt[] listPrompts() @safe
+	/// `prompts/list`, auto-paginated. Returns the drained `ListPromptsResult`:
+	/// `prompts` aggregates every page, `nextCursor` is null, and `cache` carries
+	/// the first page's parsed freshness hint.
+	ListPromptsResult listPrompts() @safe
 	{
-		Prompt[] all;
+		ListPromptsResult acc;
 		Nullable!string cursor;
+		bool first = true;
 		do
 		{
 			Json p = Json.emptyObject;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
 			auto res = ListPromptsResult.fromJson(rpc("prompts/list", p));
-			all ~= res.prompts;
+			acc.prompts ~= res.prompts;
+			if (first)
+			{
+				acc.cache = res.cache;
+				first = false;
+			}
 			cursor = res.nextCursor;
 		}
 		while (!cursor.isNull);
-		return all;
+		acc.nextCursor = Nullable!string.init;
+		return acc;
 	}
 
 	/// `prompts/get`.
@@ -2238,11 +2274,45 @@ unittest  // listResourceTemplates calls resources/templates/list and auto-pagin
 		return r;
 	};
 
-	auto templates = c.listResourceTemplates();
+	auto templates = c.listResourceTemplates().resourceTemplates;
 	assert(methods.length == 2);
 	assert(methods[0] == "resources/templates/list");
 	assert(methods[1] == "resources/templates/list");
 	assert(templates.length == 2);
 	assert(templates[0].uriTemplate == "file:///a/{x}");
 	assert(templates[1].name == "b");
+}
+
+unittest  // readResource exposes the parsed CacheableResult freshness hint as .cache
+{
+	auto c = MCPClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		Json arr = Json.emptyArray;
+		arr ~= ResourceContents.makeText("test://x", "text/plain", "hi").toJson();
+		r["contents"] = arr;
+		r["ttlMs"] = 6000;
+		r["cacheScope"] = "private";
+		return r;
+	};
+	auto res = c.readResource("test://x");
+	assert(!res.cache.isNull);
+	assert(res.cache.get.ttlMs == 6000);
+	assert(res.cache.get.cacheScope == CacheScope.private_);
+}
+
+unittest  // a list result exposes .cache from the first page's freshness hint
+{
+	auto c = MCPClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		r["tools"] = Json.emptyArray;
+		r["ttlMs"] = 5000;
+		r["cacheScope"] = "public";
+		return r;
+	};
+	auto res = c.listTools();
+	assert(!res.cache.isNull);
+	assert(res.cache.get.ttlMs == 5000);
+	assert(res.cache.get.cacheScope == CacheScope.public_);
 }

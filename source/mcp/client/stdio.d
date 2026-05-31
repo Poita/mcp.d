@@ -313,7 +313,7 @@ unittest  // MCPClient over a stdio transport drives an in-process server (initi
 	auto init = client.initialize();
 	assert(init.serverInfo.name == "stdio-client-srv");
 
-	auto tools = client.listTools();
+	auto tools = client.listTools().tools;
 	assert(tools.length == 1);
 	assert(tools[0].name == "echo");
 

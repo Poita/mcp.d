@@ -77,7 +77,7 @@ private int runScenario(string url, string scenario) @safe
 			stderr.writefln("draft discover: versions=%s server=%s",
 					d.protocolVersions, d.serverInfo.name);
 		}();
-		auto tools = client.listTools();
+		auto tools = client.listTools().tools;
 		// Exercise a plain request/response tool (the streaming/sampling tools use
 		// the older server-initiated mechanism, not draft MRTR).
 		foreach (t; tools)
@@ -113,7 +113,7 @@ private int runScenario(string url, string scenario) @safe
 
 		client.startServerStream();
 		sleep(150.msecs); // let the GET stream connect before driving tools
-		auto tools = client.listTools();
+		auto tools = client.listTools().tools;
 		foreach (t; tools)
 			client.callTool(t.name, defaultArgs(t));
 	}

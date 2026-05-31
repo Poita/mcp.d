@@ -91,6 +91,8 @@ struct RegisteredResource
 {
 	Resource descriptor;
 	ResourceContents delegate() @safe reader;
+	/// Per-resource draft `CacheableResult` freshness hint for `resources/read`.
+	Nullable!CacheHint cache;
 }
 
 /// A registered resource template: descriptor + reader receiving the concrete
@@ -99,6 +101,8 @@ struct RegisteredTemplate
 {
 	ResourceTemplate descriptor;
 	ResourceContents delegate(string uri, string[string] params) @safe reader;
+	/// Per-template draft `CacheableResult` freshness hint for `resources/read`.
+	Nullable!CacheHint cache;
 }
 
 /// A registered prompt: descriptor + handler producing its messages.
@@ -135,8 +139,10 @@ final class MCPServer
 	private ProtocolVersion effectiveVersion = latestStable;
 	private ClientCapabilities clientCaps;
 	private bool initialized;
-	private long cacheTtlMs;
-	private CacheScope cacheScope_ = CacheScope.public_;
+	// Per-list draft `CacheableResult` freshness hints, keyed by the list method
+	// ("tools/list", "resources/list", "resources/templates/list", "prompts/list").
+	// Set via `setListCacheHint`; applied by the matching `do*` handler.
+	private Nullable!CacheHint[string] listCacheHints;
 	// Maximum number of items returned per `*/list` page. 0 (the default) means
 	// unbounded: the full list is returned in a single response with no cursor.
 	private size_t pageSize_;
@@ -391,18 +397,22 @@ final class MCPServer
 		return Json.undefined;
 	}
 
-	/// Register a direct resource with a reader for its contents.
-	void registerResource(Resource descriptor, ResourceContents delegate() @safe reader) @safe
+	/// Register a direct resource with a reader for its contents. An optional
+	/// per-resource draft `CacheableResult` freshness hint is emitted on this
+	/// resource's `resources/read` response (draft protocol only).
+	void registerResource(Resource descriptor, ResourceContents delegate() @safe reader,
+			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
-		resources[descriptor.uri] = RegisteredResource(descriptor, reader);
+		resources[descriptor.uri] = RegisteredResource(descriptor, reader, cache);
 	}
 
 	/// Register a resource template with a reader receiving the matched URI and
-	/// captured `{var}` parameters.
-	void registerResourceTemplate(ResourceTemplate descriptor,
-			ResourceContents delegate(string uri, string[string] params) @safe reader) @safe
+	/// captured `{var}` parameters. An optional per-template draft `CacheableResult`
+	/// freshness hint is emitted on a matching `resources/read` (draft only).
+	void registerResourceTemplate(ResourceTemplate descriptor, ResourceContents delegate(string uri,
+			string[string] params) @safe reader, Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
-		templates ~= RegisteredTemplate(descriptor, reader);
+		templates ~= RegisteredTemplate(descriptor, reader, cache);
 	}
 
 	/// Register a prompt with the handler that produces its messages.
@@ -955,12 +965,18 @@ final class MCPServer
 		}
 	}
 
-	/// Configure the `CacheableResult` freshness hint (`ttlMs`/`cacheScope`)
-	/// added to list/read results when speaking the draft protocol.
-	void setCacheHint(long ttlMs, CacheScope scope_ = CacheScope.public_) @safe
+	/// Configure the per-list draft `CacheableResult` freshness hint
+	/// (`ttlMs`/`cacheScope`) emitted on a specific `*/list` result when speaking
+	/// the draft protocol. `listMethod` MUST be one of `tools/list`,
+	/// `resources/list`, `resources/templates/list`, or `prompts/list`. Per-resource
+	/// and per-template hints are supplied at registration time instead.
+	void setListCacheHint(string listMethod, CacheHint hint) @safe
 	{
-		cacheTtlMs = ttlMs;
-		cacheScope_ = scope_;
+		assert(listMethod == "tools/list" || listMethod == "resources/list"
+				|| listMethod == "resources/templates/list"
+				|| listMethod == "prompts/list",
+				"setListCacheHint: unknown list method '" ~ listMethod ~ "'");
+		listCacheHints[listMethod] = nullable(hint);
 	}
 
 	/// Set the maximum number of items returned per `*/list` page
@@ -982,12 +998,13 @@ final class MCPServer
 		return pageSize_;
 	}
 
-	/// Apply the draft cacheable-result fields when the effective version is
-	/// draft+. A no-op for earlier versions.
-	private Json maybeCache(Json result) @safe
+	/// Apply a per-result draft cacheable-result hint when the effective version is
+	/// draft+ AND a hint was supplied for this result. A no-op for earlier versions
+	/// or when no hint is set, keeping 2025-11-25 wire output unchanged.
+	private Json maybeCache(Json result, Nullable!CacheHint hint) @safe
 	{
-		if (effectiveVersion.cacheableResults)
-			return withCache(result, cacheTtlMs, cacheScope_);
+		if (effectiveVersion.cacheableResults && !hint.isNull)
+			return withCache(result, hint.get);
 		return result;
 	}
 
@@ -1331,7 +1348,7 @@ final class MCPServer
 		foreach (uri; uris[begin .. end])
 			result.resources ~= resources[uri].descriptor;
 		result.nextCursor = next;
-		return maybeCache(result.toJson());
+		return maybeCache(result.toJson(), listHint("resources/list"));
 	}
 
 	private Json doListResourceTemplates(Json params) @safe
@@ -1344,7 +1361,7 @@ final class MCPServer
 		foreach (t; templates[begin .. end])
 			result.resourceTemplates ~= t.descriptor;
 		result.nextCursor = next;
-		return maybeCache(result.toJson());
+		return maybeCache(result.toJson(), listHint("resources/templates/list"));
 	}
 
 	private Json doReadResource(Json params) @safe
@@ -1357,7 +1374,7 @@ final class MCPServer
 		{
 			ReadResourceResult result;
 			result.contents = [direct.reader()];
-			return maybeCache(result.toJson());
+			return maybeCache(result.toJson(), direct.cache);
 		}
 
 		foreach (t; templates)
@@ -1367,7 +1384,7 @@ final class MCPServer
 			{
 				ReadResourceResult result;
 				result.contents = [t.reader(uri, captured)];
-				return maybeCache(result.toJson());
+				return maybeCache(result.toJson(), t.cache);
 			}
 		}
 		// Draft aligns the code to invalidParams (-32602); older versions -32002.
@@ -1409,7 +1426,15 @@ final class MCPServer
 		foreach (name; names[begin .. end])
 			result.prompts ~= prompts[name].descriptor;
 		result.nextCursor = next;
-		return maybeCache(result.toJson());
+		return maybeCache(result.toJson(), listHint("prompts/list"));
+	}
+
+	/// The per-list draft cache hint configured for `listMethod`, or null if none.
+	private Nullable!CacheHint listHint(string listMethod) @safe
+	{
+		if (auto h = listMethod in listCacheHints)
+			return *h;
+		return Nullable!CacheHint.init;
 	}
 
 	private Json doGetPrompt(Json params) @safe
@@ -1503,7 +1528,7 @@ final class MCPServer
 		foreach (name; names[begin .. end])
 			result.tools ~= tools[name].descriptor;
 		result.nextCursor = next;
-		return maybeCache(result.toJson());
+		return maybeCache(result.toJson(), listHint("tools/list"));
 	}
 
 	private Json doCallTool(Json params, RequestContext ctx) @safe
@@ -3009,21 +3034,69 @@ unittest  // server/discover advertises all supported versions + identity
 	assert(resp["result"]["serverInfo"]["name"].get!string == "test-srv");
 }
 
-unittest  // draft tools/list carries CacheableResult fields
+unittest  // per-list setListCacheHint: draft tools/list carries CacheableResult fields
 {
 	auto s = makeTestServer();
-	s.setCacheHint(5000, CacheScope.private_);
+	s.setListCacheHint("tools/list", CacheHint(5000, CacheScope.private_));
 	auto resp = s.handle(draftReq(2, "tools/list")).get;
 	assert(resp["result"]["ttlMs"].get!long == 5000);
 	assert(resp["result"]["cacheScope"].get!string == "private");
 }
 
-unittest  // pre-draft tools/list has no cache fields
+unittest  // per-list setListCacheHint: pre-draft tools/list has no cache fields
 {
 	auto s = makeTestServer();
-	s.setCacheHint(5000);
+	s.setListCacheHint("tools/list", CacheHint(5000));
 	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestStable
 	assert("ttlMs" !in resp["result"]);
+}
+
+unittest  // per-list hint only emits on the matching list, not on others
+{
+	auto s = makeTestServer();
+	s.setListCacheHint("resources/list", CacheHint(7000));
+	// tools/list has no hint configured, so no cache fields appear.
+	auto tools = s.handle(draftReq(2, "tools/list")).get;
+	assert("ttlMs" !in tools["result"]);
+}
+
+unittest  // per-resource registerResource hint emits ttlMs/cacheScope on a draft resources/read
+{
+	auto s = new MCPServer("t", "1");
+	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
+	s.registerResource(r, () @safe => ResourceContents.makeText("test://r",
+			"text/plain", "x"), nullable(CacheHint(9000, CacheScope.private_)));
+	Json p = Json.emptyObject;
+	p["uri"] = "test://r";
+	auto resp = s.handle(draftReq(2, "resources/read", p)).get;
+	assert(resp["result"]["ttlMs"].get!long == 9000);
+	assert(resp["result"]["cacheScope"].get!string == "private");
+}
+
+unittest  // per-resource hint is NOT emitted on a non-draft (2025-11-25) resources/read
+{
+	auto s = new MCPServer("t", "1");
+	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
+	s.registerResource(r, () @safe => ResourceContents.makeText("test://r",
+			"text/plain", "x"), nullable(CacheHint(9000, CacheScope.private_)));
+	Json p = Json.emptyObject;
+	p["uri"] = "test://r";
+	auto resp = s.handle(req(2, "resources/read", p)).get; // no draft _meta -> latestStable
+	assert("ttlMs" !in resp["result"]);
+}
+
+unittest  // per-template registerResourceTemplate hint emits on a matching draft resources/read
+{
+	auto s = new MCPServer("t", "1");
+	ResourceTemplate t = {uriTemplate: "test://{id}", name: "tmpl"};
+	s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
+		return ResourceContents.makeText(uri, "text/plain", "y");
+	}, nullable(CacheHint(4200)));
+	Json p = Json.emptyObject;
+	p["uri"] = "test://abc";
+	auto resp = s.handle(draftReq(2, "resources/read", p)).get;
+	assert(resp["result"]["ttlMs"].get!long == 4200);
+	assert(resp["result"]["cacheScope"].get!string == "public");
 }
 
 unittest  // draft results carry the mandatory resultType:"complete" discriminator
