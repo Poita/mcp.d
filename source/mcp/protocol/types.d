@@ -34,7 +34,7 @@ struct Content
     Nullable!string description; /// resourceLink: optional human-readable description
     Nullable!string title; /// resourceLink: optional human-readable display name
     Nullable!long size; /// resourceLink: optional size in bytes of the linked resource
-    Json meta = Json.undefined; /// resourceLink: optional `_meta` object
+    Json meta = Json.undefined; /// optional `_meta` object (any content kind)
 
     /// Attach optional annotations (audience/priority/lastModified) to this
     /// content block. Returns a copy so calls can be chained, e.g.
@@ -74,8 +74,9 @@ struct Content
         return c;
     }
 
-    /// Attach an optional `_meta` object to a `resource_link` content block.
-    /// Returns a copy.
+    /// Attach an optional `_meta` object to this content block. Per the MCP
+    /// schema every content kind (TextContent/ImageContent/AudioContent/
+    /// EmbeddedResource/ResourceLink) may carry `_meta`. Returns a copy.
     Content withContentMeta(Json m) const @safe
     {
         Content c = this;
@@ -164,8 +165,6 @@ struct Content
                 j["mimeType"] = mimeType;
             if (!size.isNull)
                 j["size"] = size.get;
-            if (meta.type == Json.Type.object)
-                j["_meta"] = meta;
             break;
         case ContentKind.embeddedResource:
             j["type"] = "resource";
@@ -174,6 +173,8 @@ struct Content
         }
         if (annotations.type != Json.Type.undefined)
             j["annotations"] = annotations;
+        if (meta.type == Json.Type.object)
+            j["_meta"] = meta;
         return j;
     }
 
@@ -208,8 +209,6 @@ struct Content
                 c.description = j["description"].get!string;
             if ("size" in j && j["size"].type == Json.Type.int_)
                 c.size = j["size"].get!long;
-            if ("_meta" in j && j["_meta"].type == Json.Type.object)
-                c.meta = j["_meta"];
             break;
         case "resource":
             c.kind = ContentKind.embeddedResource;
@@ -221,6 +220,8 @@ struct Content
         }
         if ("annotations" in j)
             c.annotations = j["annotations"];
+        if ("_meta" in j && j["_meta"].type == Json.Type.object)
+            c.meta = j["_meta"];
         return c;
     }
 }
@@ -692,6 +693,56 @@ unittest  // resource link emits and parses _meta
     assert(j["_meta"]["x.example/k"].get!string == "v");
     auto back = Content.fromJson(j);
     assert(back.meta["x.example/k"].get!string == "v");
+}
+
+unittest  // text content emits and parses _meta (spec: TextContent._meta)
+{
+    Json m = Json.emptyObject;
+    m["x.example/k"] = "v";
+    auto c = Content.makeText("hello").withContentMeta(m);
+    auto j = c.toJson();
+    assert(j["_meta"]["x.example/k"].get!string == "v");
+    auto back = Content.fromJson(j);
+    assert(back.meta["x.example/k"].get!string == "v");
+}
+
+unittest  // image content emits and parses _meta (spec: ImageContent._meta)
+{
+    Json m = Json.emptyObject;
+    m["x.example/k"] = "v";
+    auto c = Content.makeImage("YWJj", "image/png").withContentMeta(m);
+    auto j = c.toJson();
+    assert(j["_meta"]["x.example/k"].get!string == "v");
+    auto back = Content.fromJson(j);
+    assert(back.meta["x.example/k"].get!string == "v");
+}
+
+unittest  // audio content emits and parses _meta (spec: AudioContent._meta)
+{
+    Json m = Json.emptyObject;
+    m["x.example/k"] = "v";
+    auto c = Content.makeAudio("YWJj", "audio/wav").withContentMeta(m);
+    auto j = c.toJson();
+    assert(j["_meta"]["x.example/k"].get!string == "v");
+    auto back = Content.fromJson(j);
+    assert(back.meta["x.example/k"].get!string == "v");
+}
+
+unittest  // embedded resource emits and parses _meta (spec: EmbeddedResource._meta)
+{
+    Json m = Json.emptyObject;
+    m["x.example/k"] = "v";
+    auto c = Content.makeEmbeddedText("test://x", "text/plain", "hi").withContentMeta(m);
+    auto j = c.toJson();
+    assert(j["_meta"]["x.example/k"].get!string == "v");
+    auto back = Content.fromJson(j);
+    assert(back.meta["x.example/k"].get!string == "v");
+}
+
+unittest  // content omits _meta when none is set
+{
+    auto j = Content.makeText("hello").toJson();
+    assert("_meta" !in j);
 }
 
 unittest  // description/title/size only serialize for resourceLink kind
