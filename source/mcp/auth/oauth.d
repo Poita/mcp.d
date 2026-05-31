@@ -1038,6 +1038,59 @@ unittest  // iss absent and not advertised is accepted (nothing to validate)
     assert(validateAuthorizationResponseIss("", "https://as.example.com", false));
 }
 
+/// Validate the `state` parameter returned in an authorization redirect against
+/// the `state` value the client sent in the authorization request.
+///
+/// Per the MCP authorization spec (basic/authorization, "Open Redirection",
+/// 2025-06-18 / 2025-11-25 / draft): "MCP clients SHOULD use and verify state
+/// parameters in the authorization code flow and discard any results that do
+/// not include or have a mismatch with the original state."
+///
+/// `responseState` is the raw `state` value extracted from the authorization
+/// redirect (empty when absent); `expectedState` is the value the client
+/// originally sent (empty when the client did not use a state parameter, in
+/// which case there is nothing to verify and the response is accepted).
+///
+/// The comparison is a simple string comparison with no normalization. Returns
+/// `true` when the response is acceptable; `false` when it MUST be discarded:
+///   - expectedState empty                       -> accept (nothing to verify)
+///   - expectedState set, responseState empty    -> reject (missing)
+///   - expectedState set, responseState mismatch -> reject (mismatch)
+///   - expectedState set, responseState matches  -> accept
+bool validateAuthorizationResponseState(string responseState, string expectedState) @safe pure nothrow @nogc
+{
+    // No expected state -> the client did not use one; nothing to verify.
+    if (expectedState.length == 0)
+        return true;
+    // Expected state set: the response MUST include a matching state.
+    return responseState == expectedState;
+}
+
+unittest  // state matching the expected value is accepted
+{
+    assert(validateAuthorizationResponseState("xyz", "xyz"));
+}
+
+unittest  // state present but mismatched is rejected (discard result)
+{
+    assert(!validateAuthorizationResponseState("evil", "xyz"));
+}
+
+unittest  // expected state set but response state missing is rejected
+{
+    assert(!validateAuthorizationResponseState("", "xyz"));
+}
+
+unittest  // no expected state means nothing to verify (accept)
+{
+    assert(validateAuthorizationResponseState("anything", ""));
+}
+
+unittest  // state comparison is raw string comparison with no normalization
+{
+    assert(!validateAuthorizationResponseState("XYZ", "xyz"));
+}
+
 unittest  // metadata parses authorization_response_iss_parameter_supported
 {
     import vibe.data.json : parseJsonString;
