@@ -17,6 +17,7 @@ public import mcp.server.server;
 public import mcp.api.attributes;
 public import mcp.api.schema;
 public import mcp.api.reflection;
+public import mcp.auth.csprng;
 public import mcp.auth.oauth;
 public import mcp.auth.client;
 public import mcp.auth.login;
