@@ -169,49 +169,20 @@ final class HttpClientTransport : ClientTransport
 		sseRetryMs = 0;
 		sseLastEventId = null;
 
-		() @trusted {
-			requestHTTP(url, (scope HTTPClientRequest req) {
-				setupRequest(req, message);
-			}, (scope HTTPClientResponse res) {
-				captureSession(res);
-				lastPostStatus = res.statusCode;
-				if (isLegacyFallbackStatus(res.statusCode))
-				{
-					// Per draft basic/transports §Backward Compatibility, a 400/404/405
-					// may carry a modern JSON-RPC error proving the peer is NOT a legacy
-					// HTTP+SSE server. Read the body and surface a recognized modern
-					// error as a typed McpException (so `connect` takes the
-					// discover/version-negotiation paths) instead of falling back. Only
-					// an empty/unrecognized body triggers the legacy fallback below.
-					string body4xx;
-					try
-						body4xx = res.bodyReader.readAllUTF8();
-					catch (Exception)
-						body4xx = null;
-					McpException modernErr;
-					if (modernErrorFromBody(body4xx, modernErr))
-						err = modernErr;
-					return; // signalled below via lastPostStatus / err
-				}
-				const ct = res.headers.get("Content-Type", "");
-				if (ct.canFind("text/event-stream"))
-				{
-					readSse(res, expectId, result, got, err);
-				}
-				else
-				{
-					auto body = res.bodyReader.readAllUTF8();
-					auto msg = parseMessage(body);
-					if (msg.kind == MessageKind.errorResponse)
-						err = errorFrom(msg.error);
-					else
-					{
-						result = msg.result;
-						got = true;
-					}
-				}
-			});
-		}();
+		// The modern single-endpoint POST is sent over a DEDICATED, raw TCP
+		// connection (`postAndAwaitRaw`) rather than vibe's pooled `requestHTTP`.
+		// When a tool handler on the server opens a server->client request
+		// (sampling / elicitation / roots) it writes that request as an SSE event
+		// on THIS POST's response stream and then blocks awaiting our reply. The
+		// reply must be sent on a SEPARATE POST while we are still reading this
+		// stream. vibe's pooled chunked HTTP-client reader does NOT surface a
+		// freshly-flushed SSE event's terminating blank line until the next chunk
+		// arrives, so the in-flight request was never dispatched and both peers
+		// deadlocked until the server's 60s timeout (issue #377). A raw connection
+		// (the same approach `runServerStream`/`resumeViaGet` already use for
+		// long-lived SSE) delivers each event immediately, so the client can reply
+		// and the round-trip completes.
+		postAndAwaitRaw(message, expectId, result, got, err);
 
 		// An HTTP 400/404/405 on the modern single endpoint is the signal to try
 		// the legacy HTTP+SSE (2024-11-05) transport. Surface it as a typed
@@ -237,6 +208,280 @@ final class HttpClientTransport : ClientTransport
 				return result;
 		}
 		throw internalError("No response received for request " ~ idStr(expectId));
+	}
+
+	/// POST `message` over a fresh TCP connection and read the response, awaiting
+	/// the JSON-RPC response with id `expectId`. The response is either a single
+	/// JSON body or a `text/event-stream`; for an SSE response, notifications and
+	/// server->client requests that arrive BEFORE the final response are
+	/// dispatched (via `dispatchSse`) as soon as each complete event is received —
+	/// the key property the pooled `requestHTTP` reader lacked (see `postAndAwait`).
+	/// Mirrors the chunked-decode SSE parser of `runServerStream`/`resumeViaGet`.
+	private void postAndAwaitRaw(Json message, long expectId, ref Json result,
+			ref bool got, ref McpException err) @safe
+	{
+		import vibe.core.net : connectTCP;
+		import vibe.stream.operations : readLine;
+		import vibe.core.stream : IOMode;
+		import std.string : indexOf, startsWith, strip, toLower;
+		import std.conv : to, parse;
+
+		auto rest = url;
+		const sep = rest.indexOf("://");
+		if (sep >= 0)
+			rest = rest[sep + 3 .. $];
+		const slash = rest.indexOf('/');
+		const hostPort = (slash < 0) ? rest : rest[0 .. slash];
+		const path = (slash < 0) ? "/" : rest[slash .. $];
+		const colon = hostPort.indexOf(':');
+		const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
+		const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
+
+		const payload = message.toString();
+		auto hdrs = requestHeaders(message);
+
+		() @trusted {
+			try
+			{
+				auto conn = connectTCP(host, port);
+				scope (exit)
+					conn.close();
+
+				string req = "POST " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
+					~ "\r\nAccept: application/json, text/event-stream\r\n"
+					~ "Content-Type: application/json\r\nConnection: close\r\n";
+				if (bearerToken.length)
+					req ~= "Authorization: Bearer " ~ bearerToken ~ "\r\n";
+				if (sessionId.length)
+					req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
+				foreach (k, v; hdrs)
+					req ~= k ~ ": " ~ v ~ "\r\n";
+				if (pendingLastEventId.length)
+					req ~= "Last-Event-ID: " ~ pendingLastEventId ~ "\r\n";
+				req ~= "Content-Length: " ~ payload.length.to!string ~ "\r\n\r\n";
+				req ~= payload;
+				conn.write(cast(const(ubyte)[]) req);
+
+				// Status line + response headers.
+				auto statusLine = cast(string) readLine(conn).idup;
+				lastPostStatus = parseHttpStatus(statusLine);
+				bool chunked;
+				bool sse;
+				foreach (h; readHeaderLines(conn))
+				{
+					const lower = h.toLower;
+					if (lower.startsWith("transfer-encoding:") && lower.indexOf("chunked") >= 0)
+						chunked = true;
+					if (lower.startsWith("content-type:") && lower.indexOf("text/event-stream") >= 0)
+						sse = true;
+					const c = h.indexOf(':');
+					if (c > 0 && h[0 .. c].toLower == "mcp-session-id")
+						sessionId = h[c + 1 .. $].strip;
+				}
+
+				// A 400/404/405 is the legacy-fallback signal: read the (small) body
+				// and surface a recognised modern JSON-RPC error if present.
+				if (isLegacyFallbackStatus(lastPostStatus))
+				{
+					const b = readRemaining(conn, chunked);
+					McpException modernErr;
+					if (modernErrorFromBody(b, modernErr))
+						err = modernErr;
+					return;
+				}
+
+				if (!sse)
+				{
+					// A single JSON body (the common non-streaming response).
+					const b = readRemaining(conn, chunked);
+					auto m = parseMessage(b);
+					if (m.kind == MessageKind.errorResponse)
+						err = errorFrom(m.error);
+					else
+					{
+						result = m.result;
+						got = true;
+					}
+					return;
+				}
+
+				// SSE body: decode chunked transfer-encoding (or raw to EOF),
+				// feeding an accumulator parser that dispatches each COMPLETE event
+				// immediately. This is what lets a mid-stream server->client request
+				// be answered while we keep reading for the final response.
+				string acc, data;
+				void parseSse()
+				{
+					for (;;)
+					{
+						const nl = acc.indexOf('\n');
+						if (nl < 0)
+							break;
+						auto line = acc[0 .. nl];
+						acc = acc[nl + 1 .. $];
+						if (line.length && line[$ - 1] == '\r')
+							line = line[0 .. $ - 1];
+						if (line.length == 0)
+						{
+							if (data.length)
+							{
+								dispatchSse(data, expectId, result, got, err);
+								data = null;
+							}
+						}
+						else if (line.startsWith("data:"))
+						{
+							auto d = line["data:".length .. $];
+							if (d.startsWith(" "))
+								d = d[1 .. $];
+							data ~= (data.length ? "\n" : "") ~ d;
+						}
+						else if (line.startsWith("id:"))
+							sseLastEventId = line["id:".length .. $].strip;
+						else if (line.startsWith("retry:"))
+						{
+							try
+								sseRetryMs = line["retry:".length .. $].strip.to!long;
+							catch (Exception)
+							{
+							}
+						}
+					}
+				}
+
+				for (;;)
+				{
+					if (got || err !is null)
+						break;
+					if (chunked)
+					{
+						auto sizeLine = (cast(string) readLine(conn).idup).strip;
+						if (sizeLine.length == 0)
+							continue;
+						uint sz;
+						try
+						{
+							auto sl = sizeLine;
+							sz = parse!uint(sl, 16);
+						}
+						catch (Exception)
+							break;
+						if (sz == 0)
+							break; // last chunk
+						auto chunk = new ubyte[sz];
+						conn.read(chunk, IOMode.all);
+						acc ~= cast(string) chunk.idup;
+						parseSse();
+					}
+					else
+					{
+						ubyte[4096] buf;
+						size_t n;
+						try
+							n = conn.read(buf, IOMode.once);
+						catch (Exception)
+							break;
+						if (n == 0)
+							break;
+						acc ~= cast(string) buf[0 .. n].idup;
+						parseSse();
+					}
+				}
+			}
+			catch (Exception e)
+			{
+				if (err is null && !got)
+					err = internalError(e.msg);
+			}
+		}();
+	}
+
+	/// Parse the numeric status code out of an HTTP status line
+	/// (`HTTP/1.1 200 OK` -> 200). Returns 0 when it cannot be parsed.
+	private static int parseHttpStatus(string statusLine) @trusted
+	{
+		import std.string : split, strip;
+		import std.conv : to;
+
+		if (statusLine.length && statusLine[$ - 1] == '\r')
+			statusLine = statusLine[0 .. $ - 1];
+		auto parts = statusLine.strip.split(" ");
+		if (parts.length < 2)
+			return 0;
+		try
+			return parts[1].to!int;
+		catch (Exception)
+			return 0;
+	}
+
+	/// Read the response header block from `conn` (up to the blank line),
+	/// returning each header line with its trailing CR stripped.
+	private static string[] readHeaderLines(Conn)(Conn conn) @trusted
+	{
+		import vibe.stream.operations : readLine;
+
+		string[] headers;
+		for (;;)
+		{
+			auto h = cast(string) readLine(conn).idup;
+			if (h.length && h[$ - 1] == '\r')
+				h = h[0 .. $ - 1];
+			if (h.length == 0)
+				break;
+			headers ~= h;
+		}
+		return headers;
+	}
+
+	/// Read the remaining response body from `conn` to end-of-stream, decoding
+	/// chunked transfer-encoding when `chunked` is true. Used for the small
+	/// non-streaming JSON body and the 4xx legacy-fallback body.
+	private static string readRemaining(Conn)(Conn conn, bool chunked) @trusted
+	{
+		import vibe.stream.operations : readLine;
+		import vibe.core.stream : IOMode;
+		import std.string : strip;
+		import std.conv : parse;
+
+		string acc;
+		if (chunked)
+		{
+			for (;;)
+			{
+				auto sizeLine = (cast(string) readLine(conn).idup).strip;
+				if (sizeLine.length == 0)
+					continue;
+				uint sz;
+				try
+				{
+					auto sl = sizeLine;
+					sz = parse!uint(sl, 16);
+				}
+				catch (Exception)
+					break;
+				if (sz == 0)
+					break;
+				auto chunk = new ubyte[sz];
+				conn.read(chunk, IOMode.all);
+				acc ~= cast(string) chunk.idup;
+			}
+		}
+		else
+		{
+			for (;;)
+			{
+				ubyte[4096] buf;
+				size_t n;
+				try
+					n = conn.read(buf, IOMode.once);
+				catch (Exception)
+					break;
+				if (n == 0)
+					break;
+				acc ~= cast(string) buf[0 .. n].idup;
+			}
+		}
+		return acc;
 	}
 
 	/// Resume a closed response stream via `GET` with `Last-Event-ID`, reading
@@ -1272,6 +1517,16 @@ string resolveEndpointUri(string baseUrl, string endpoint) @safe
 	const lastSlash = basePath.lastIndexOf('/');
 	string dir = (lastSlash < 0) ? "/" : basePath[0 .. lastSlash + 1];
 	return origin ~ dir ~ endpoint;
+}
+
+unittest  // parseHttpStatus reads the code out of an HTTP status line
+{
+	assert(HttpClientTransport.parseHttpStatus("HTTP/1.1 200 OK") == 200);
+	assert(HttpClientTransport.parseHttpStatus("HTTP/1.1 202 Accepted\r") == 202);
+	assert(HttpClientTransport.parseHttpStatus("HTTP/1.1 404 Not Found") == 404);
+	// Unparseable lines yield 0 (treated as no status).
+	assert(HttpClientTransport.parseHttpStatus("garbage") == 0);
+	assert(HttpClientTransport.parseHttpStatus("") == 0);
 }
 
 unittest  // isLegacyFallbackStatus recognises the spec's 400/404/405 triggers
