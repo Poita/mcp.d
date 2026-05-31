@@ -8,13 +8,20 @@ import mcp.protocol.draft : InputRequest, inputRequestsToJson, inputRequestsFrom
 @safe:
 
 /// The kind of a content block.
+///
+/// `toolUse`/`toolResult` are the sampling content blocks added by the
+/// 2025-11-25 / draft tool-enabled sampling revisions (`ToolUseContent` /
+/// `ToolResultContent` in the schema); they appear inside
+/// `sampling/createMessage` messages and results, not in tool/prompt content.
 enum ContentKind
 {
     text,
     image,
     audio,
     resourceLink,
-    embeddedResource
+    embeddedResource,
+    toolUse,
+    toolResult
 }
 
 /// A content block as used in tool results, prompt messages, and sampling.
@@ -35,13 +42,47 @@ struct Content
     Nullable!string title; /// resourceLink: optional human-readable display name
     Nullable!long size; /// resourceLink: optional size in bytes of the linked resource
     Json meta = Json.undefined; /// optional `_meta` object (any content kind)
+    string id; /// toolUse: the tool-call id the model assigned
+    Json input = Json.undefined; /// toolUse: the tool-call arguments object
+    string toolUseId; /// toolResult: the `id` of the tool_use this answers
+    Content[] toolContent; /// toolResult: nested content blocks of the result
+    Json structuredContent = Json.undefined; /// toolResult: optional structured result
+    Nullable!bool isError; /// toolResult: optional error flag
+
+    /// A mutable deep copy of this content block. Needed because `Content` now
+    /// holds a `Content[]` (`toolContent`), so a plain `Content c = this;` on a
+    /// `const` block no longer converts implicitly; this rebuilds the value.
+    Content dupSelf() const @safe
+    {
+        Content c;
+        c.kind = kind;
+        c.text = text;
+        c.data = data;
+        c.mimeType = mimeType;
+        c.uri = uri;
+        c.name = name;
+        c.resource = resource;
+        c.annotations = annotations;
+        c.description = description;
+        c.title = title;
+        c.size = size;
+        c.meta = meta;
+        c.id = id;
+        c.input = input;
+        c.toolUseId = toolUseId;
+        foreach (b; toolContent)
+            c.toolContent ~= b.dupSelf();
+        c.structuredContent = structuredContent;
+        c.isError = isError;
+        return c;
+    }
 
     /// Attach optional annotations (audience/priority/lastModified) to this
     /// content block. Returns a copy so calls can be chained, e.g.
     /// `Content.makeText("hi").withAnnotations(a)`.
     Content withAnnotations(Json a) const @safe
     {
-        Content c = this;
+        Content c = dupSelf();
         c.annotations = a;
         return c;
     }
@@ -51,7 +92,7 @@ struct Content
     /// calls can be chained. Only serialized for the `resourceLink` kind.
     Content withDescription(string d) const @safe
     {
-        Content c = this;
+        Content c = dupSelf();
         c.description = d;
         return c;
     }
@@ -60,7 +101,7 @@ struct Content
     /// block (`ResourceLink` extends `Resource`/`BaseMetadata`). Returns a copy.
     Content withTitle(string t) const @safe
     {
-        Content c = this;
+        Content c = dupSelf();
         c.title = t;
         return c;
     }
@@ -69,7 +110,7 @@ struct Content
     /// the MCP `ResourceLink` shape. Returns a copy.
     Content withSize(long s) const @safe
     {
-        Content c = this;
+        Content c = dupSelf();
         c.size = s;
         return c;
     }
@@ -79,7 +120,7 @@ struct Content
     /// EmbeddedResource/ResourceLink) may carry `_meta`. Returns a copy.
     Content withContentMeta(Json m) const @safe
     {
-        Content c = this;
+        Content c = dupSelf();
         c.meta = m;
         return c;
     }
@@ -133,6 +174,33 @@ struct Content
         return c;
     }
 
+    /// A `tool_use` content block (sampling): the model's request to call a
+    /// tool. `id` is the model-assigned call id, `name` the tool name, and
+    /// `input` the arguments object. Per `ToolUseContent` in the 2025-11-25 /
+    /// draft schema.
+    static Content makeToolUse(string id, string name, Json input = Json.emptyObject) @safe
+    {
+        Content c;
+        c.kind = ContentKind.toolUse;
+        c.id = id;
+        c.name = name;
+        c.input = input;
+        return c;
+    }
+
+    /// A `tool_result` content block (sampling): the result of a tool call,
+    /// answering the `tool_use` whose id is `toolUseId`. `content` is the nested
+    /// result content blocks. Per `ToolResultContent` in the 2025-11-25 / draft
+    /// schema.
+    static Content makeToolResult(string toolUseId, Content[] content = null) @safe
+    {
+        Content c;
+        c.kind = ContentKind.toolResult;
+        c.toolUseId = toolUseId;
+        c.toolContent = content;
+        return c;
+    }
+
     Json toJson() const @safe
     {
         Json j = Json.emptyObject;
@@ -169,6 +237,24 @@ struct Content
         case ContentKind.embeddedResource:
             j["type"] = "resource";
             j["resource"] = resource;
+            break;
+        case ContentKind.toolUse:
+            j["type"] = "tool_use";
+            j["id"] = id;
+            j["name"] = name;
+            j["input"] = (input.type == Json.Type.object) ? input : Json.emptyObject;
+            break;
+        case ContentKind.toolResult:
+            j["type"] = "tool_result";
+            j["toolUseId"] = toolUseId;
+            Json tc = Json.emptyArray;
+            foreach (b; toolContent)
+                tc ~= b.toJson();
+            j["content"] = tc;
+            if (structuredContent.type != Json.Type.undefined)
+                j["structuredContent"] = structuredContent;
+            if (!isError.isNull)
+                j["isError"] = isError.get;
             break;
         }
         if (annotations.type != Json.Type.undefined)
@@ -213,6 +299,25 @@ struct Content
         case "resource":
             c.kind = ContentKind.embeddedResource;
             c.resource = ("resource" in j) ? j["resource"] : Json.emptyObject;
+            break;
+        case "tool_use":
+            c.kind = ContentKind.toolUse;
+            c.id = ("id" in j && j["id"].type == Json.Type.string) ? j["id"].get!string : "";
+            c.name = ("name" in j && j["name"].type == Json.Type.string) ? j["name"].get!string
+                : "";
+            c.input = ("input" in j) ? j["input"] : Json.emptyObject;
+            break;
+        case "tool_result":
+            c.kind = ContentKind.toolResult;
+            c.toolUseId = ("toolUseId" in j && j["toolUseId"].type == Json.Type.string)
+                ? j["toolUseId"].get!string : "";
+            if ("content" in j && j["content"].type == Json.Type.array)
+                foreach (i; 0 .. j["content"].length)
+                    c.toolContent ~= Content.fromJson(j["content"][i]);
+            if ("structuredContent" in j)
+                c.structuredContent = j["structuredContent"];
+            if ("isError" in j && j["isError"].type == Json.Type.bool_)
+                c.isError = j["isError"].get!bool;
             break;
         default:
             c.kind = ContentKind.text;
@@ -781,6 +886,67 @@ unittest  // content emits annotations when present
     auto j = c.toJson();
     assert(j["annotations"]["audience"][0].get!string == "user");
     assert(j["annotations"]["priority"].get!double == 0.9);
+}
+
+unittest  // tool_use content carries id/name/input (ToolUseContent shape)
+{
+    Json input = Json.emptyObject;
+    input["location"] = "Paris";
+    auto c = Content.makeToolUse("call_1", "get_weather", input);
+    auto j = c.toJson();
+    assert(j["type"].get!string == "tool_use");
+    assert(j["id"].get!string == "call_1");
+    assert(j["name"].get!string == "get_weather");
+    assert(j["input"]["location"].get!string == "Paris");
+}
+
+unittest  // tool_use content round-trips id/name/input through fromJson
+{
+    Json input = Json.emptyObject;
+    input["q"] = 42;
+    auto back = Content.fromJson(Content.makeToolUse("c1", "calc", input).toJson());
+    assert(back.kind == ContentKind.toolUse);
+    assert(back.id == "c1");
+    assert(back.name == "calc");
+    assert(back.input["q"].get!long == 42);
+}
+
+unittest  // tool_use input defaults to an empty object when omitted
+{
+    auto c = Content.makeToolUse("c", "noargs");
+    auto j = c.toJson();
+    assert(j["input"].type == Json.Type.object);
+    assert(j["input"].length == 0);
+}
+
+unittest  // tool_result content carries toolUseId and nested content array
+{
+    auto c = Content.makeToolResult("call_1", [
+        Content.makeText("18C and sunny")
+    ]);
+    auto j = c.toJson();
+    assert(j["type"].get!string == "tool_result");
+    assert(j["toolUseId"].get!string == "call_1");
+    assert(j["content"].type == Json.Type.array);
+    assert(j["content"][0]["type"].get!string == "text");
+    assert(j["content"][0]["text"].get!string == "18C and sunny");
+    assert("isError" !in j);
+    assert("structuredContent" !in j);
+}
+
+unittest  // tool_result content round-trips nested content/isError/structured
+{
+    auto c = Content.makeToolResult("call_2", [Content.makeText("boom")]);
+    c.isError = true;
+    Json sc = Json.emptyObject;
+    sc["code"] = 500;
+    c.structuredContent = sc;
+    auto back = Content.fromJson(c.toJson());
+    assert(back.kind == ContentKind.toolResult);
+    assert(back.toolUseId == "call_2");
+    assert(back.toolContent.length == 1 && back.toolContent[0].text == "boom");
+    assert(!back.isError.isNull && back.isError.get == true);
+    assert(back.structuredContent["code"].get!long == 500);
 }
 
 unittest  // inbound content annotations are preserved on fromJson
