@@ -249,17 +249,19 @@ final class OAuthClient
                 redirectUri, pkce.challenge, scopeStr, resource, state);
     }
 
-    /// Enforce the MCP authorization MUST: clients MUST verify PKCE support
-    /// before proceeding with authorization. Per the spec ("Authorization Code
-    /// Protection"), if `code_challenge_methods_supported` is absent (or does
-    /// not advertise S256), the authorization server does not support PKCE and
-    /// MCP clients MUST refuse to proceed. This guards the public authorization
-    /// path (`authorizationUrl`/`exchangeCode`) so a host using the obvious API
-    /// cannot silently fall back to a non-PKCE authorization-code flow.
+    /// Enforce the MCP authorization MUST around PKCE support. Per the spec
+    /// ("Authorization Code Protection"), if the authorization server *advertises*
+    /// `code_challenge_methods_supported` but it does not include "S256", the
+    /// server does not support the required PKCE method and MCP clients MUST refuse
+    /// to proceed. When the field is absent/empty (e.g. an older AS in the
+    /// 2025-03-26 endpoint-fallback flow), the client proceeds and uses S256
+    /// regardless — absence is not a signal that PKCE is unsupported. This guards
+    /// the public authorization path (`authorizationUrl`/`exchangeCode`) against
+    /// silently downgrading to an explicitly non-S256 method.
     private static void requirePkceSupport(AuthorizationServerMetadata as_) @safe
     {
-        if (!as_.supportsS256())
-            throw invalidRequest("Authorization server does not advertise PKCE S256 support "
+        if (as_.codeChallengeMethodsSupported.length && !as_.supportsS256())
+            throw invalidRequest("Authorization server advertises PKCE methods without S256 "
                     ~ "(code_challenge_methods_supported); MCP clients MUST refuse to proceed");
     }
 
@@ -532,16 +534,20 @@ unittest  // clientIdMetadataDocument builds a hostable document for the URL
     assert(j["client_id"].get!string == "https://app.example.com/oauth/client.json");
 }
 
-unittest  // authorizationUrl refuses when the AS advertises no PKCE support
+unittest  // authorizationUrl proceeds when the AS advertises no PKCE methods (absent)
 {
-    import std.exception : assertThrown;
+    import std.algorithm : canFind;
 
+    // 2025-03-26 endpoint-fallback: an older AS advertises no
+    // code_challenge_methods_supported at all. Absence is NOT a signal that PKCE
+    // is unsupported, so the client proceeds and uses S256 regardless.
     auto c = new OAuthClient();
     AuthorizationServerMetadata as_;
     as_.authorizationEndpoint = "https://as.example.com/authorize";
-    // No code_challenge_methods_supported -> AS does not support PKCE.
+    // No code_challenge_methods_supported advertised.
     auto pkce = makePkce(new ubyte[32]);
-    assertThrown(c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st"));
+    auto url = c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st");
+    assert(url.canFind("code_challenge_method=S256"));
 }
 
 unittest  // authorizationUrl refuses when only non-S256 PKCE methods are advertised
@@ -569,23 +575,24 @@ unittest  // authorizationUrl proceeds when the AS advertises S256 PKCE support
     assert(url.canFind("code_challenge_method=S256"));
 }
 
-unittest  // exchangeCode refuses when the AS advertises no PKCE support
+unittest  // exchangeCode refuses when the AS advertises non-S256 PKCE methods only
 {
     import std.exception : assertThrown;
 
     auto c = new OAuthClient();
     AuthorizationServerMetadata as_;
     as_.tokenEndpoint = "https://as.example.com/token";
-    // No code_challenge_methods_supported -> MUST refuse to proceed.
+    as_.codeChallengeMethodsSupported = ["plain"]; // S256 not offered -> MUST refuse.
     assertThrown(c.exchangeCode(as_, RegisteredClient("cid", ""), "code", "verifier"));
 }
 
-unittest  // discoverAuthServer no-metadata fallback fails the PKCE guard closed
+unittest  // discoverAuthServer no-metadata fallback proceeds (absence allows S256)
 {
-    import std.exception : assertThrown;
+    import std.algorithm : canFind;
 
-    // The 2025-03-26 fallback fabricates default endpoints but advertises no
-    // PKCE methods, so the public authorization path MUST refuse to proceed.
+    // The 2025-03-26 fallback fabricates default endpoints and advertises no
+    // PKCE methods. Absence must NOT block the public authorization path; the
+    // client proceeds and uses S256, matching the endpoint-fallback scenario.
     auto c = new OAuthClient();
     AuthorizationServerMetadata as_;
     as_.issuer = "https://as.example.com";
@@ -593,5 +600,6 @@ unittest  // discoverAuthServer no-metadata fallback fails the PKCE guard closed
     // codeChallengeMethodsSupported left empty, mirroring the fallback.
     assert(!as_.supportsS256());
     auto pkce = makePkce(new ubyte[32]);
-    assertThrown(c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "", ""));
+    auto url = c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "", "");
+    assert(url.canFind("code_challenge_method=S256"));
 }
