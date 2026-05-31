@@ -1,6 +1,5 @@
 module mcp.api.attributes;
 
-import std.typecons : Nullable;
 import vibe.data.json : Json;
 
 @safe:
@@ -20,8 +19,9 @@ import vibe.data.json : Json;
 ///
 /// An optional human-readable `title` may be supplied for display purposes; it
 /// is independent of the programmatic `name`. To declare behavioral hints
-/// (readOnlyHint, destructiveHint, ...), attach a `@toolAnnotations` UDA to the
-/// same method.
+/// (readOnlyHint, destructiveHint, ...), attach the marker UDAs `@readOnly`,
+/// `@destructive`, `@idempotent`, `@openWorld` (and `@hintTitle(...)` for the
+/// annotation-level title) to the same method.
 struct tool
 {
 	string name;
@@ -29,24 +29,43 @@ struct tool
 	string title; /// optional human-readable display name (empty = unset)
 }
 
-/// UDA declaring optional behavioral hints (the MCP spec's `ToolAnnotations`)
-/// for a `@tool`-annotated method. Attach alongside `@tool`; each hint defaults
-/// to "unset" and is omitted from the wire form unless assigned.
+/// Marker UDA declaring the `readOnlyHint` behavioral hint (the MCP spec's
+/// `ToolAnnotations.readOnlyHint`). Attach alongside `@tool`; presence sets the
+/// hint to `true`, absence leaves it unset (omitted from the wire form).
 ///
 /// Example:
 /// ---
-/// import std.typecons : nullable;
+/// @tool("search", "Search records")
+/// @readOnly
+/// string[] search(string q) { ... }
+/// ---
+enum readOnly;
+
+/// Marker UDA declaring the `destructiveHint` behavioral hint
+/// (`ToolAnnotations.destructiveHint`). Presence = `true`; absence = unset.
+enum destructive;
+
+/// Marker UDA declaring the `idempotentHint` behavioral hint
+/// (`ToolAnnotations.idempotentHint`). Presence = `true`; absence = unset.
+enum idempotent;
+
+/// Marker UDA declaring the `openWorldHint` behavioral hint
+/// (`ToolAnnotations.openWorldHint`). Presence = `true`; absence = unset.
+enum openWorld;
+
+/// Positional value UDA setting the annotation-level display title
+/// (`ToolAnnotations.title`), distinct from `@tool`'s 3rd argument
+/// (`Tool.title`). Attach alongside `@tool`.
+///
+/// Example:
+/// ---
 /// @tool("erase", "Erase a record")
-/// @toolAnnotations(destructiveHint: true.nullable, idempotentHint: true.nullable)
+/// @destructive @idempotent @hintTitle("Erase Record")
 /// void erase(string id) { ... }
 /// ---
-struct toolAnnotations
+struct hintTitle
 {
-	Nullable!bool readOnlyHint;
-	Nullable!bool destructiveHint;
-	Nullable!bool idempotentHint;
-	Nullable!bool openWorldHint;
-	string title; /// optional annotation-level display title (ToolAnnotations.title), distinct from tool.title
+	string value; /// the annotation-level display title (ToolAnnotations.title)
 }
 
 /// UDA declaring a `@tool`-annotated method's per-tool task-augmented execution
@@ -95,23 +114,41 @@ struct resourceTemplate
 	string mimeType;
 }
 
-/// UDA declaring optional MCP `Annotations` (audience / priority /
-/// lastModified) for a `@resource`- or `@resourceTemplate`-annotated method.
-/// Attach alongside the resource UDA; each field defaults to "unset" and is
-/// omitted from the wire form unless assigned.
+/// Positional value UDA declaring the intended `audience` for a `@resource`- or
+/// `@resourceTemplate`-annotated method (the MCP `Annotations.audience` field).
+/// Pass one or more roles, e.g. `@audience("user")` or
+/// `@audience("user", "assistant")`. Absence leaves the audience unset.
 ///
 /// Example:
 /// ---
-/// import std.typecons : nullable;
 /// @resource("file:///readme", "Readme", "text/markdown")
-/// @resourceAnnotations(audience: ["user"], priority: 0.9.nullable)
+/// @priority(0.9) @audience("user")
 /// string readme() { return "..."; }
 /// ---
-struct resourceAnnotations
+struct audience
 {
-	string[] audience; /// intended audience, e.g. ["user", "assistant"]
-	Nullable!double priority; /// importance 0.0..1.0
-	Nullable!string lastModified; /// ISO 8601 last-modified timestamp
+	string[] roles; /// intended audience, e.g. ["user", "assistant"]
+
+	this(string[] roles...) @safe pure nothrow
+	{
+		this.roles = roles.dup;
+	}
+}
+
+/// Positional value UDA declaring the importance `priority` (0.0..1.0) for a
+/// `@resource`- or `@resourceTemplate`-annotated method (the MCP
+/// `Annotations.priority` field). Absence leaves the priority unset.
+struct priority
+{
+	double value; /// importance 0.0 (least) .. 1.0 (most)
+}
+
+/// Positional value UDA declaring the ISO 8601 `lastModified` timestamp for a
+/// `@resource`- or `@resourceTemplate`-annotated method (the MCP
+/// `Annotations.lastModified` field). Absence leaves it unset.
+struct lastModified
+{
+	string value; /// ISO 8601 last-modified timestamp
 }
 
 /// Optional per-parameter description, attached to a function parameter or used
