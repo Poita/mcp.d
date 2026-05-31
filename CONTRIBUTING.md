@@ -173,4 +173,4 @@ The conformance entry points live in `conformance/server.d` and
 ## License
 
 By contributing you agree that your contributions are licensed under the project's
-[MIT License](LICENSE).
+[Apache License 2.0](LICENSE).
