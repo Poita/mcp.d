@@ -1,0 +1,22 @@
+{
+	"name": "streaming",
+	"description": "MCP example: progress, logging and cancellation over Streamable HTTP (server + self-verifying client e2e). Issue #357.",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp": { "path": "../.." }
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "streaming-server",
+			"mainSourceFile": "server.d"
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "streaming-client",
+			"mainSourceFile": "client.d"
+		}
+	]
+}
