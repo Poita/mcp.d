@@ -27,6 +27,16 @@ void serveStdio(MCPServer server, scope string delegate() @safe readLine,
 			break; // end of input
 		if (line.length == 0)
 			continue;
+		// Draft `subscriptions/listen` shares the single stdout channel here, so
+		// it is not a one-shot request/reply: the server records the opted-in
+		// filters and writes a `notifications/subscriptions/acknowledged`
+		// notification (the spec's leading message, stamped with the listen id as
+		// the subscriptionId) instead of the non-spec `{ acknowledged: true }`
+		// JSON-RPC result. Subsequent `notify*` output is then routed to
+		// `writeLine`, stamped with the same subscriptionId. A non-listen line (or
+		// a pre-draft listen) falls through to the normal request/reply path.
+		if (tryServeStdioListen(server, line, writeLine))
+			continue;
 		// `writeLine` is the server->client channel: handlers' notifications are
 		// emitted through it as they happen, and the request's reply (if any)
 		// follows.
@@ -34,6 +44,29 @@ void serveStdio(MCPServer server, scope string delegate() @safe readLine,
 		if (response.length)
 			writeLine(response);
 	}
+}
+
+/// Transport-side shim: parse a single stdio line and, if it is a draft
+/// `subscriptions/listen` request, serve it on the shared stdout channel via
+/// `MCPServer.tryServeStdioListen` (writing the leading
+/// `notifications/subscriptions/acknowledged` notification instead of a
+/// non-spec `{ acknowledged: true }` result). Returns `true` when the line was
+/// consumed as a listen request; `false` (including on a parse failure or a
+/// batch) so the caller dispatches it through the normal request/reply path.
+private bool tryServeStdioListen(MCPServer server, string line,
+		void delegate(string) @safe writeLine) @safe
+{
+	import mcp.protocol.jsonrpc : parseAny;
+
+	try
+	{
+		auto input = parseAny(line);
+		if (input.isBatch || input.messages.length != 1)
+			return false;
+		return server.tryServeStdioListen(input.messages[0], writeLine);
+	}
+	catch (Exception)
+		return false; // let handleRaw produce the proper parse-error response
 }
 
 /// Serve `server` over the process's standard input/output: read JSON-RPC
@@ -220,4 +253,125 @@ unittest  // reportProgress without a progressToken emits nothing over stdio
 	assert(outputs.length == 1);
 	auto resp = parseJsonString(outputs[0]);
 	assert(resp["id"].get!int == 1);
+}
+
+version (unittest)
+{
+	import mcp.protocol.draft : MetaKey;
+
+	// A draft `subscriptions/listen` request line carrying per-request _meta
+	// (protocolVersion draft) and a nested `notifications` SubscriptionFilter.
+	private string draftListenLine(long id, Json filter) @safe
+	{
+		import mcp.protocol.jsonrpc : makeRequest;
+
+		Json meta = Json.emptyObject;
+		meta[MetaKey.protocolVersion] = "2026-07-28";
+		meta[MetaKey.clientCapabilities] = Json.emptyObject;
+		Json params = Json.emptyObject;
+		params["notifications"] = filter;
+		params["_meta"] = meta;
+		return makeRequest(Json(id), "subscriptions/listen", params).toString();
+	}
+}
+
+unittest  // draft subscriptions/listen over stdio sends the acknowledged notification, not a {acknowledged:true} result
+{
+	auto s = new MCPServer("listen-srv", "1.0");
+	s.enableToolListChanged();
+
+	Json filter = Json.emptyObject;
+	filter["toolsListChanged"] = true;
+
+	string[] inputs = [draftListenLine(7, filter)];
+	size_t i;
+	string[] outputs;
+	serveStdio(s, () @safe { return i < inputs.length ? inputs[i++] : null; }, (string line) @safe {
+		outputs ~= line;
+	});
+
+	// Exactly one message: the leading acknowledgement notification.
+	assert(outputs.length == 1);
+	auto ack = parseJsonString(outputs[0]);
+	// It is a notification (no id), with the spec method, NOT a JSON-RPC result.
+	assert(ack["method"].get!string == "notifications/subscriptions/acknowledged");
+	assert("id" !in ack);
+	assert("result" !in ack);
+	// The invented {acknowledged:true} result must never appear over stdio.
+	assert(ack["params"]["notifications"].type == Json.Type.object);
+	assert("acknowledged" !in ack["params"]);
+	// The agreed subset echoes the opted-in toolsListChanged.
+	assert(ack["params"]["notifications"]["toolsListChanged"].get!bool);
+}
+
+unittest  // the stdio acknowledged notification is stamped with the listen id as the subscriptionId
+{
+	auto s = new MCPServer("listen-srv", "1.0");
+	s.enableToolListChanged();
+
+	Json filter = Json.emptyObject;
+	filter["toolsListChanged"] = true;
+
+	string[] inputs = [draftListenLine(42, filter)];
+	size_t i;
+	string[] outputs;
+	serveStdio(s, () @safe { return i < inputs.length ? inputs[i++] : null; }, (string line) @safe {
+		outputs ~= line;
+	});
+
+	assert(outputs.length == 1);
+	auto ack = parseJsonString(outputs[0]);
+	assert(ack["params"]["_meta"][MetaKey.subscriptionId].get!string == "42");
+}
+
+unittest  // after a stdio subscriptions/listen, notify* change notifications flow on stdout, stamped with the subscriptionId
+{
+	auto s = new MCPServer("listen-srv", "1.0");
+	s.enableToolListChanged();
+
+	Json filter = Json.emptyObject;
+	filter["toolsListChanged"] = true;
+
+	string[] inputs = [draftListenLine(5, filter)];
+	size_t i;
+	string[] outputs;
+	serveStdio(s, () @safe { return i < inputs.length ? inputs[i++] : null; }, (string line) @safe {
+		outputs ~= line;
+	});
+
+	// The ack arrived first.
+	assert(outputs.length == 1);
+
+	// A runtime change now emits tools/list_changed onto the same stdout channel,
+	// stamped with the subscriptionId. (Before the fix, pushChannel was null over
+	// stdio so this delivered nothing.)
+	const delivered = s.notifyToolsListChanged();
+	assert(delivered == 1);
+	assert(outputs.length == 2);
+	auto note = parseJsonString(outputs[1]);
+	assert(note["method"].get!string == "notifications/tools/list_changed");
+	assert("id" !in note);
+	assert(note["params"]["_meta"][MetaKey.subscriptionId].get!string == "5");
+}
+
+unittest  // a pre-draft (no protocolVersion) subscriptions/listen still takes the normal request/reply path over stdio
+{
+	auto s = new MCPServer("listen-srv", "1.0");
+	s.enableToolListChanged();
+
+	// No draft _meta: opensListenStream is false, so this is dispatched normally.
+	string[] inputs = [
+		`{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen","params":{"notifications":{"toolsListChanged":true}}}`,
+	];
+	size_t i;
+	string[] outputs;
+	serveStdio(s, () @safe { return i < inputs.length ? inputs[i++] : null; }, (string line) @safe {
+		outputs ~= line;
+	});
+
+	// One ordinary JSON-RPC response with the legacy {acknowledged:true} result.
+	assert(outputs.length == 1);
+	auto resp = parseJsonString(outputs[0]);
+	assert(resp["id"].get!int == 1);
+	assert(resp["result"]["acknowledged"].get!bool);
 }

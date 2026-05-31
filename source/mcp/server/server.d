@@ -148,6 +148,17 @@ final class MCPServer
 	// holds `resources/subscribe` URIs) so the two cannot be confused.
 	private string[] listenResourceUris;
 	private ServerPushChannel pushChannel;
+	// The stdio `subscriptions/listen` delivery channel (draft only). On the
+	// stdio transport every message shares the single stdout channel, so there
+	// is no separate SSE push stream: when a draft `subscriptions/listen`
+	// arrives, the transport installs a raw-JSON-line sink here and the listen
+	// request's id becomes the stream's subscriptionId. `notify` then writes
+	// each opted-in change notification (stamped with that subscriptionId in
+	// `params._meta`, per draft basic/utilities/subscriptions) onto stdout in
+	// addition to any HTTP push channel. Null when no stdio listen is active,
+	// keeping the HTTP-only behaviour unchanged.
+	private void delegate(string) @safe stdioListenSink;
+	private string stdioListenSubscriptionId;
 	private bool toolListChangedEnabled;
 	private bool resourcesListChangedEnabled;
 	private bool promptsListChangedEnabled;
@@ -558,12 +569,76 @@ final class MCPServer
 	/// `notifications/resources/updated` for a subscribed resource, or a
 	/// `notifications/tools/list_changed`. Returns the number of listeners the
 	/// notification was delivered to; `0` when no GET stream is open (or the
-	/// server is not on a Streamable HTTP transport).
+	/// server is not on a Streamable HTTP transport). On a stdio server with an
+	/// active draft `subscriptions/listen` it is additionally written to stdout
+	/// (stamped with the listen subscriptionId), since that transport shares one
+	/// channel for all server->client traffic.
 	size_t notify(string method, Json params = Json.undefined) @safe
 	{
-		if (pushChannel is null)
-			return 0;
-		return pushChannel.notify(method, params);
+		size_t delivered;
+		// Stdio `subscriptions/listen` channel (draft): the single stdout channel
+		// carries notifications too, stamped with the listen request's id as the
+		// subscriptionId so the client can correlate them (draft basic/utilities/
+		// subscriptions). This is in addition to any HTTP push channel below.
+		if (stdioListenSink !is null)
+		{
+			auto note = withSubscriptionId(makeNotification(method, params),
+					stdioListenSubscriptionId);
+			stdioListenSink(note.toString());
+			delivered++;
+		}
+		if (pushChannel !is null)
+			delivered += pushChannel.notify(method, params);
+		return delivered;
+	}
+
+	/// If `msg` is a draft `subscriptions/listen` request, serve it on the stdio
+	/// transport's single channel and return `true`; otherwise return `false`
+	/// (the caller dispatches it normally). On the stdio transport every message
+	/// shares one stdout channel, so — unlike Streamable HTTP — there is no
+	/// separate SSE stream to open. Per the draft, a `subscriptions/listen`
+	/// reply is NOT a `{ acknowledged: true }` JSON-RPC result (the schema defines
+	/// no such Result); the acknowledgement is a
+	/// `notifications/subscriptions/acknowledged` notification that MUST be the
+	/// first message on the stream. This records the opted-in change-notification
+	/// filters, installs `writeLine` as the delivery sink (so subsequent
+	/// `notify*`/`notifyResourceUpdated` are written to stdout, each stamped with
+	/// the listen id as `io.modelcontextprotocol/subscriptionId`), and writes the
+	/// stamped acknowledgement as that leading message. Pre-draft versions never
+	/// defined `subscriptions/listen`, so they take the normal path (returns
+	/// `false`) and the request is answered conventionally.
+	bool tryServeStdioListen(Message msg, void delegate(string) @safe writeLine) @safe
+	{
+		if (msg.kind != MessageKind.request || msg.method != "subscriptions/listen")
+			return false;
+		auto meta = RequestMeta.fromParams(msg.params);
+		ProtocolVersion mv;
+		if (!meta.protocolVersion.length
+				|| !tryParseVersion(meta.protocolVersion, mv) || !mv.isDraft)
+			return false;
+
+		// Pin the effective version so notify-suppression gating (listensFor) and
+		// any subscriptionId stamping behave as draft for this listen session.
+		effectiveVersion = mv;
+		clientCaps = meta.clientCapabilities;
+		// Record the opted-in filters; the one-shot {acknowledged:true} result is
+		// discarded (the spec defines no such Result — the ack is a notification).
+		doSubscribeListen(msg.params);
+
+		// The listen request's id is the stream's subscriptionId; every
+		// notification on this channel (starting with the acknowledgement) is
+		// stamped with it in `params._meta`.
+		stdioListenSubscriptionId = rpcIdString(msg.id);
+		stdioListenSink = writeLine;
+
+		// First message on the stream: the acknowledgement carrying the agreed-upon
+		// subset, stamped with the subscriptionId.
+		Json ackParams = Json.emptyObject;
+		ackParams["notifications"] = acknowledgedListenSubset();
+		auto ack = withSubscriptionId(makeNotification("notifications/subscriptions/acknowledged",
+				ackParams), stdioListenSubscriptionId);
+		writeLine(ack.toString());
+		return true;
 	}
 
 	/// Initiate a server->client `ping` on the standalone GET SSE push channel
