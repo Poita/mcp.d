@@ -107,3 +107,22 @@ jobs:
           files: ./*.lst
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
+
+  examples:
+    name: examples (build + e2e)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install D compiler
+        uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-latest
+
+      # Each examples/<name>/ is its own dub package (path-dependency on the root
+      # mcp). The runner builds both the server and client configs and runs the
+      # client as a self-verifying e2e test (stdio: client spawns the server;
+      # http: start the server, run the client against it, check the exit code).
+      - name: Build + run all examples
+        run: ./scripts/run-examples.sh
