@@ -2599,12 +2599,7 @@ version (unittest)
         ]);
         meta[MetaKey.clientCapabilities] = Json.emptyObject;
         if (responses.length)
-        {
-            Json arr = Json.emptyArray;
-            foreach (resp; responses)
-                arr ~= resp.toJson();
-            meta[MetaKey.inputResponses] = arr;
-        }
+            meta[MetaKey.inputResponses] = inputResponsesToJson(responses);
         Json params = Json.emptyObject;
         params["name"] = tool;
         params["arguments"] = Json.emptyObject;
