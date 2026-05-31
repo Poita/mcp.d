@@ -1246,7 +1246,7 @@ final class McpServer
 		DiscoverResult d;
 		foreach (v; supportedVersions)
 			d.protocolVersions ~= v.toWire;
-		d.capabilities = capabilities();
+		d.capabilities = capabilities().forVersion(ProtocolVersion.draft);
 		d.serverInfo = serverInfo_.forVersion(ProtocolVersion.draft);
 		d.instructions = instructions;
 		return d.toJson();
@@ -1564,7 +1564,7 @@ final class McpServer
 
 		InitializeResult result;
 		result.protocolVersion = negotiated.toWire;
-		result.capabilities = capabilities();
+		result.capabilities = capabilities().forVersion(negotiated);
 		result.serverInfo = serverInfo_.forVersion(negotiated);
 		result.instructions = instructions;
 		return result.toJson();
@@ -2998,19 +2998,76 @@ unittest  // capabilities reflect registered features
 	assert(caps.prompts.isNull);
 }
 
-unittest  // advertised extensions appear in initialize capabilities
+unittest  // advertised extensions appear in initialize capabilities under draft
 {
 	auto s = new McpServer("t", "1");
 	Json settings = Json.emptyObject;
 	settings["maxConcurrent"] = 4;
 	s.advertiseExtension("io.modelcontextprotocol/tasks", settings);
 
+	// The `extensions` negotiation map is draft-only; advertise under draft.
 	Json params = Json.emptyObject;
-	params["protocolVersion"] = "2025-06-18";
+	params["protocolVersion"] = "draft";
 	auto resp = s.handle(req(1, "initialize", params)).get;
 	auto ext = resp["result"]["capabilities"]["extensions"];
 	assert(ext.type == Json.Type.object);
 	assert(ext["io.modelcontextprotocol/tasks"]["maxConcurrent"].get!int == 4);
+}
+
+unittest  // extensions are NOT advertised for pre-draft negotiated versions (#331)
+{
+	auto s = new McpServer("t", "1");
+	s.advertiseExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
+
+	foreach (ver; ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"])
+	{
+		Json params = Json.emptyObject;
+		params["protocolVersion"] = ver;
+		auto resp = s.handle(req(1, "initialize", params)).get;
+		assert("extensions" !in resp["result"]["capabilities"],
+				"extensions leaked into negotiated version " ~ ver);
+	}
+}
+
+unittest  // completions are NOT advertised when negotiating 2024-11-05 (#331)
+{
+	auto s = new McpServer("t", "1");
+	s.setCompletionRequestHandler((CompleteRequest r) @safe => CompleteResult([]));
+
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2024-11-05";
+	auto resp = s.handle(req(1, "initialize", params)).get;
+	assert("completions" !in resp["result"]["capabilities"]);
+}
+
+unittest  // completions ARE advertised from 2025-03-26 onward (#331)
+{
+	auto s = new McpServer("t", "1");
+	s.setCompletionRequestHandler((CompleteRequest r) @safe => CompleteResult([]));
+
+	foreach (ver; ["2025-03-26", "2025-06-18", "2025-11-25"])
+	{
+		Json params = Json.emptyObject;
+		params["protocolVersion"] = ver;
+		auto resp = s.handle(req(1, "initialize", params)).get;
+		assert("completions" in resp["result"]["capabilities"],
+				"completions missing for negotiated version " ~ ver);
+	}
+}
+
+unittest  // tasks are NOT advertised before 2025-11-25 (#331)
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+
+	foreach (ver; ["2024-11-05", "2025-03-26", "2025-06-18"])
+	{
+		Json params = Json.emptyObject;
+		params["protocolVersion"] = ver;
+		auto resp = s.handle(req(1, "initialize", params)).get;
+		assert("tasks" !in resp["result"]["capabilities"],
+				"tasks leaked into negotiated version " ~ ver);
+	}
 }
 
 unittest  // enableTasks advertises the `tasks` capability at initialize
