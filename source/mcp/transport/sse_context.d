@@ -543,6 +543,11 @@ final class HttpStreamContext : RequestContext
         return empty;
     }
 
+    string requestState() @safe
+    {
+        return "";
+    }
+
     TokenInfo auth() @safe
     {
         return authInfo;

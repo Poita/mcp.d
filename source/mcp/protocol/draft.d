@@ -13,10 +13,10 @@ enum MetaKey : string
 {
     protocolVersion = "io.modelcontextprotocol/protocolVersion",
     clientInfo = "io.modelcontextprotocol/clientInfo",
-    clientCapabilities = "io.modelcontextprotocol/clientCapabilities",
+    clientCapabilities
+        = "io.modelcontextprotocol/clientCapabilities",
     logLevel = "io.modelcontextprotocol/logLevel",
     subscriptionId = "io.modelcontextprotocol/subscriptionId",
-    inputResponses = "io.modelcontextprotocol/inputResponses",
 }
 
 // ===========================================================================
@@ -548,6 +548,11 @@ struct InputRequest
 struct InputRequiredResult
 {
     InputRequest[] inputRequests;
+    /// SEP-2322 `requestState`: an opaque, server-owned string that lets a
+    /// stateless server reconstruct its in-progress work on the retry. When
+    /// non-empty it is emitted as a top-level `requestState` field; the client
+    /// MUST echo it back verbatim (and MUST NOT inspect or modify it).
+    string requestState;
 
     Json toJson() const @safe
     {
@@ -561,6 +566,10 @@ struct InputRequiredResult
         // keys are the server-assigned ids and whose values are request objects
         // (`{ method, params }`), not an array.
         j["inputRequests"] = inputRequestsToJson(inputRequests);
+        // SEP-2322: `requestState` is an optional top-level field; omit it when
+        // empty so the client knows not to echo one back.
+        if (requestState.length)
+            j["requestState"] = requestState;
         return j;
     }
 
@@ -569,6 +578,8 @@ struct InputRequiredResult
         InputRequiredResult r;
         if ("inputRequests" in j)
             r.inputRequests = inputRequestsFromJson(j["inputRequests"]);
+        if ("requestState" in j && j["requestState"].type == Json.Type.string)
+            r.requestState = j["requestState"].get!string;
         return r;
     }
 }
@@ -600,8 +611,8 @@ InputRequest[] inputRequestsFromJson(Json j) @safe
     return requests;
 }
 
-/// A client's answer to one `InputRequest`, supplied on the retried request via
-/// `params._meta["io.modelcontextprotocol/inputResponses"]`.
+/// A client's answer to one `InputRequest`, supplied on the retried request as
+/// a value of the top-level `params.inputResponses` map (SEP-2322).
 struct InputResponse
 {
     string id; /// the originating `InputRequest.id` (the `InputResponses` map key)
@@ -622,17 +633,15 @@ Json inputResponsesToJson(const(InputResponse)[] responses) @safe
 }
 
 /// Read the input responses a client attached to a retried request, keyed by
-/// the originating `InputRequest.id`. The wire shape is the spec `InputResponses`
-/// map (id -> bare result).
+/// the originating `InputRequest.id`. Per SEP-2322 the wire location is the
+/// top-level `params.inputResponses` field (an `InputResponses` map, id -> bare
+/// client result) — NOT `_meta`.
 Json[string] readInputResponses(Json params) @safe
 {
     Json[string] out_;
-    if (params.type != Json.Type.object || "_meta" !in params)
+    if (params.type != Json.Type.object || "inputResponses" !in params)
         return out_;
-    auto meta = params["_meta"];
-    if (meta.type != Json.Type.object || MetaKey.inputResponses !in meta)
-        return out_;
-    auto map = meta[MetaKey.inputResponses];
+    auto map = params["inputResponses"];
     if (map.type != Json.Type.object)
         return out_;
     // `Json.opApply` is `@system`; iterating a plain object is safe here.
@@ -641,6 +650,20 @@ Json[string] readInputResponses(Json params) @safe
             out_[key] = value;
     }();
     return out_;
+}
+
+/// Read the opaque SEP-2322 `requestState` the client echoed back on a retried
+/// request. It lives in the top-level `params.requestState` field. Returns an
+/// empty string when absent. The server owns this value (the client treats it
+/// as opaque), so servers MUST validate it as untrusted input.
+string readRequestState(Json params) @safe
+{
+    if (params.type != Json.Type.object || "requestState" !in params)
+        return "";
+    auto rs = params["requestState"];
+    if (rs.type != Json.Type.string)
+        return "";
+    return rs.get!string;
 }
 
 unittest  // RequestMeta parses per-request _meta
@@ -776,12 +799,10 @@ unittest  // MRTR InputRequiredResult round-trips and input responses parse
     assert(back.inputRequests[0].type == "elicitation");
     assert(back.inputRequests[0].params["message"].get!string == "hi");
 
-    Json meta = Json.emptyObject;
-    meta[MetaKey.inputResponses] = inputResponsesToJson([
+    Json params = Json.emptyObject;
+    params["inputResponses"] = inputResponsesToJson([
         InputResponse("r1", Json(["action": Json("accept")]))
     ]);
-    Json params = Json.emptyObject;
-    params["_meta"] = meta;
     auto resps = readInputResponses(params);
     assert("r1" in resps);
     assert(resps["r1"]["action"].get!string == "accept");
@@ -813,15 +834,79 @@ unittest  // SEP-2322: readInputResponses parses the spec map shape keyed by id
 {
     Json responses = Json.emptyObject;
     responses["date"] = Json(["action": Json("accept")]);
-    Json meta = Json.emptyObject;
-    meta[MetaKey.inputResponses] = responses;
     Json params = Json.emptyObject;
-    params["_meta"] = meta;
+    // SEP-2322: inputResponses is a top-level params field, not under _meta.
+    params["inputResponses"] = responses;
 
     auto parsed = readInputResponses(params);
     assert("date" in parsed);
     // The parsed value is the bare result the client supplied.
     assert(parsed["date"]["action"].get!string == "accept");
+    // Nothing under _meta is consulted.
+    assert("_meta" !in params);
+}
+
+unittest  // SEP-2322: inputResponses lives in params, NOT under params._meta
+{
+    // Regression guard for the wire location. A spec server reads
+    // `params.inputResponses`; the invented reserved `_meta` key must not exist.
+    Json responses = Json.emptyObject;
+    responses["github_login"] = Json([
+        "action": Json("accept"),
+        "content": Json(["name": Json("octocat")])
+    ]);
+
+    // Placed at top level: parsed.
+    Json good = Json.emptyObject;
+    good["name"] = "get_weather";
+    good["inputResponses"] = responses;
+    auto parsed = readInputResponses(good);
+    assert("github_login" in parsed);
+    assert(parsed["github_login"]["content"]["name"].get!string == "octocat");
+
+    // Placed under _meta (the old, invented shape): ignored.
+    Json bad = Json.emptyObject;
+    Json meta = Json.emptyObject;
+    meta["io.modelcontextprotocol/inputResponses"] = responses;
+    bad["_meta"] = meta;
+    assert(readInputResponses(bad).length == 0);
+}
+
+unittest  // SEP-2322: InputRequiredResult carries the opaque requestState round-trip
+{
+    InputRequiredResult ir;
+    ir.inputRequests = [
+        InputRequest("github_login", "elicitation", Json.emptyObject)
+    ];
+    ir.requestState = "foo";
+    auto j = ir.toJson();
+    // requestState is a top-level field on the result, alongside inputRequests.
+    assert(j["requestState"].get!string == "foo");
+    auto back = InputRequiredResult.fromJson(j);
+    assert(back.requestState == "foo");
+}
+
+unittest  // SEP-2322: an empty requestState is omitted from the wire result
+{
+    InputRequiredResult ir;
+    ir.inputRequests = [InputRequest("r1", "elicitation", Json.emptyObject)];
+    auto j = ir.toJson();
+    // The client MUST NOT echo a requestState the server never sent.
+    assert("requestState" !in j);
+}
+
+unittest  // SEP-2322: readRequestState reads the opaque top-level params.requestState
+{
+    Json params = Json.emptyObject;
+    params["name"] = "get_weather";
+    params["requestState"] = "eyJyZXNvbHV0aW9uIjoiRHVwbGljYXRlIn0";
+    assert(readRequestState(params) == "eyJyZXNvbHV0aW9uIjoiRHVwbGljYXRlIn0");
+
+    // Absent / wrong type -> empty.
+    assert(readRequestState(Json.emptyObject) == "");
+    Json wrong = Json.emptyObject;
+    wrong["requestState"] = 7;
+    assert(readRequestState(wrong) == "");
 }
 
 unittest  // header value codec: plain ASCII passes through; others base64

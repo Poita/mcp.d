@@ -159,6 +159,13 @@ interface RequestContext
     /// round. Empty on the first call and on non-stateless requests.
     Json[string] inputResponses() @safe;
 
+    /// The opaque MRTR (SEP-2322) `requestState` the client echoed back from the
+    /// server's prior `InputRequiredResult` (`params.requestState`). Empty on the
+    /// first call and when the server sent no state. The server owns this value
+    /// (the client treats it as opaque), so handlers MUST validate it as
+    /// untrusted input.
+    string requestState() @safe;
+
     /// The validated OAuth 2.1 access-token info for this request, when the
     /// transport enforces authorization (Streamable HTTP with a configured
     /// `ResourceServerConfig`). `TokenInfo.valid` is false on transports without
@@ -314,6 +321,11 @@ final class NullContext : RequestContext
         return empty;
     }
 
+    string requestState() @safe
+    {
+        return "";
+    }
+
     TokenInfo auth() @safe
     {
         return TokenInfo.invalid();
@@ -332,16 +344,19 @@ final class RequestScope : RequestContext
     private RequestContext inner;
     private bool stateless;
     private Json[string] responses;
+    private string requestState_;
     private string minLevel;
     private bool loggingRequested;
     private CancellationToken cancellation;
 
     this(RequestContext inner, bool stateless, Json[string] responses, string minLevel = "info",
-            bool loggingRequested = true, CancellationToken cancellation = null) @safe
+            bool loggingRequested = true, CancellationToken cancellation = null,
+            string requestState = "") @safe
     {
         this.inner = inner;
         this.stateless = stateless;
         this.responses = responses;
+        this.requestState_ = requestState;
         this.minLevel = minLevel;
         this.loggingRequested = loggingRequested;
         this.cancellation = cancellation;
@@ -401,6 +416,11 @@ final class RequestScope : RequestContext
         return responses;
     }
 
+    string requestState() @safe
+    {
+        return requestState_;
+    }
+
     TokenInfo auth() @safe
     {
         return inner.auth();
@@ -453,6 +473,11 @@ version (unittest) private final class SamplingProbe : RequestContext
     {
         Json[string] empty;
         return empty;
+    }
+
+    string requestState() @safe
+    {
+        return "";
     }
 
     TokenInfo auth() @safe
@@ -508,6 +533,11 @@ version (unittest) private final class RootsProbe : RequestContext
     {
         Json[string] empty;
         return empty;
+    }
+
+    string requestState() @safe
+    {
+        return "";
     }
 
     TokenInfo auth() @safe
@@ -574,6 +604,11 @@ version (unittest) private final class ElicitProbe : RequestContext
     {
         Json[string] empty;
         return empty;
+    }
+
+    string requestState() @safe
+    {
+        return "";
     }
 
     TokenInfo auth() @safe
@@ -786,6 +821,11 @@ version (unittest) private final class LogProbe : RequestContext
     {
         Json[string] empty;
         return empty;
+    }
+
+    string requestState() @safe
+    {
+        return "";
     }
 
     TokenInfo auth() @safe

@@ -648,8 +648,8 @@ final class MCPServer
         // (MRTR vs blocking), the input responses carried on a retried draft
         // request, and the cancellation token, regardless of which transport
         // supplied the base context.
-        auto scoped = new RequestScope(ctx, effectiveVersion.usesMRTR,
-                readInputResponses(msg.params), requestLogLevel, loggingRequested, token);
+        auto scoped = new RequestScope(ctx, effectiveVersion.usesMRTR, readInputResponses(msg.params),
+                requestLogLevel, loggingRequested, token, readRequestState(msg.params));
 
         try
         {
@@ -2009,6 +2009,11 @@ unittest  // after setLevel(error), a handler's sub-error logs are dropped
             return e;
         }
 
+        string requestState() @safe
+        {
+            return "";
+        }
+
         import mcp.auth.resource_server : TokenInfo;
 
         TokenInfo auth() @safe
@@ -2082,6 +2087,11 @@ version (unittest) private final class DraftLogCtx : RequestContext
     {
         Json[string] e;
         return e;
+    }
+
+    string requestState() @safe
+    {
+        return "";
     }
 
     import mcp.auth.resource_server : TokenInfo;
@@ -2545,6 +2555,11 @@ version (unittest)
             return empty;
         }
 
+        string requestState() @safe
+        {
+            return "";
+        }
+
         import mcp.auth.resource_server : TokenInfo;
 
         TokenInfo auth() @safe
@@ -2588,7 +2603,9 @@ version (unittest)
         });
     }
 
-    // A draft tools/call whose _meta also carries the given input responses.
+    // A draft tools/call carrying the given input responses in the top-level
+    // params.inputResponses map (SEP-2322), with per-request _meta for the
+    // stateless handshake fields.
     private Message draftCall(long id, string tool, InputResponse[] responses) @safe
     {
         Json meta = Json.emptyObject;
@@ -2598,12 +2615,13 @@ version (unittest)
             "version": Json("1")
         ]);
         meta[MetaKey.clientCapabilities] = Json.emptyObject;
-        if (responses.length)
-            meta[MetaKey.inputResponses] = inputResponsesToJson(responses);
         Json params = Json.emptyObject;
         params["name"] = tool;
         params["arguments"] = Json.emptyObject;
         params["_meta"] = meta;
+        // SEP-2322: input responses are a top-level params field, not in _meta.
+        if (responses.length)
+            params["inputResponses"] = inputResponsesToJson(responses);
         return Message(makeRequest(Json(id), "tools/call", params));
     }
 }
