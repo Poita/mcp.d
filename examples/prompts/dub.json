@@ -1,0 +1,27 @@
+{
+	"name": "prompts",
+	"description": "MCP Prompts + completion example (server + self-verifying client e2e)",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp": { "path": "../.." }
+	},
+	"targetType": "executable",
+	"sourcePaths": [],
+	"importPaths": [],
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "prompts-server",
+			"sourceFiles": ["server.d"],
+			"mainSourceFile": "server.d"
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "prompts-client",
+			"sourceFiles": ["client.d"],
+			"mainSourceFile": "client.d"
+		}
+	]
+}
