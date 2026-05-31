@@ -2246,8 +2246,14 @@ struct CompleteResult
 				if (arr[i].type == Json.Type.string)
 					r.values ~= arr[i].get!string;
 		}
+		// The spec types completion.total as `number`, which covers both
+		// integral and fractional JSON encodings (e.g. `10` or `10.0`).
+		// Accept either so a float-encoded total is preserved rather than
+		// dropped (mirrors ProgressNotification.fromJson).
 		if ("total" in c && c["total"].type == Json.Type.int_)
 			r.total = cast(size_t) c["total"].get!long;
+		else if ("total" in c && c["total"].type == Json.Type.float_)
+			r.total = cast(size_t)(c["total"].get!double + 0.5);
 		if ("hasMore" in c && c["hasMore"].type == Json.Type.bool_)
 			r.hasMore = c["hasMore"].get!bool;
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
@@ -2610,6 +2616,18 @@ unittest  // CompleteResult.fromJson parses the completion envelope
 	assert(r.values == ["paris", "park"]);
 	assert(!r.total.isNull && r.total.get == 150);
 	assert(r.hasMore);
+}
+
+unittest  // CompleteResult.fromJson preserves a total encoded as a JSON float
+{
+	// The spec types completion.total as `number`, which covers float
+	// encodings (e.g. `10.0`). A conformant server may emit it as a float;
+	// the field must be preserved, not dropped.
+	auto j = `{"completion":{"values":["paris"],"total":10.0,"hasMore":false}}`.parseJsonString;
+	auto r = CompleteResult.fromJson(j);
+	assert(r.values == ["paris"]);
+	assert(!r.total.isNull && r.total.get == 10);
+	assert(!r.hasMore);
 }
 
 unittest  // CompleteResult.fromJson tolerates a missing completion envelope
