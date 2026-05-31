@@ -101,7 +101,7 @@ unittest  // serveStdio processes newline-delimited requests and writes response
 {
 	auto s = new McpServer("stdio-srv", "1.0");
 	Tool echo = {name: "echo"};
-	s.registerTool(echo, (Json args) @safe {
+	s.registerDynamicTool(echo, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -141,7 +141,7 @@ unittest  // a tool handler's ctx.log() is delivered as a notifications/message 
 	auto s = new McpServer("logsrv", "1.0");
 	s.enableLogging();
 	Tool logger = {name: "logit"};
-	s.registerTool(logger, (Json args, RequestContext ctx) @safe {
+	s.registerDynamicTool(logger, (Json args, RequestContext ctx) @safe {
 		ctx.log("error", Json("boom"), "mylogger");
 		CallToolResult r;
 		r.content = [Content.makeText("done")];
@@ -175,7 +175,7 @@ unittest  // logging below the configured minimum level is dropped over stdio
 	auto s = new McpServer("logsrv", "1.0");
 	s.enableLogging();
 	Tool logger = {name: "logit"};
-	s.registerTool(logger, (Json args, RequestContext ctx) @safe {
+	s.registerDynamicTool(logger, (Json args, RequestContext ctx) @safe {
 		ctx.log("debug", Json("noise")); // below minimum -> dropped
 		CallToolResult r;
 		r.content = [Content.makeText("done")];
@@ -205,7 +205,7 @@ unittest  // reportProgress is delivered over stdio when the request carries a p
 {
 	auto s = new McpServer("progsrv", "1.0");
 	Tool worker = {name: "work"};
-	s.registerTool(worker, (Json args, RequestContext ctx) @safe {
+	s.registerDynamicTool(worker, (Json args, RequestContext ctx) @safe {
 		ctx.reportProgress(0.5, nullable(1.0), "halfway");
 		CallToolResult r;
 		r.content = [Content.makeText("done")];
@@ -234,7 +234,7 @@ unittest  // reportProgress without a progressToken emits nothing over stdio
 {
 	auto s = new McpServer("progsrv", "1.0");
 	Tool worker = {name: "work"};
-	s.registerTool(worker, (Json args, RequestContext ctx) @safe {
+	s.registerDynamicTool(worker, (Json args, RequestContext ctx) @safe {
 		ctx.reportProgress(0.5); // no token on the request -> dropped
 		CallToolResult r;
 		r.content = [Content.makeText("done")];
