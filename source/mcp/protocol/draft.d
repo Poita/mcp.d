@@ -24,9 +24,9 @@ enum MetaKey : string
 
 /// A `_meta` key is `[<prefix>]<name>`. The optional `<prefix>` is a series of
 /// dot-separated labels followed by a `/`. Each label MUST start with a letter
-/// and end with a letter or digit (interior may contain hyphens). The `<name>`
-/// MUST start and end with an alphanumeric character; the interior may also
-/// contain `-`, `_`, and `.`.
+/// and end with a letter or digit (interior may contain hyphens). Unless empty,
+/// the `<name>` MUST start and end with an alphanumeric character; the interior
+/// may also contain `-`, `_`, and `.`.
 ///
 /// Prefixes whose second label is `modelcontextprotocol` or `mcp` are reserved
 /// for MCP use (see `isReservedMetaPrefix`).
@@ -95,8 +95,10 @@ private bool isValidMetaLabel(string label) @safe pure nothrow
 
 private bool isValidMetaName(string name) @safe pure nothrow
 {
+    // Per the spec's Name rule ("Unless empty, MUST begin and end with an
+    // alphanumeric character"), an empty name segment is valid.
     if (name.length == 0)
-        return false;
+        return true;
     if (!isAlphaNum(name[0]) || !isAlphaNum(name[$ - 1]))
         return false;
     foreach (char c; name)
@@ -647,8 +649,21 @@ unittest  // isValidMetaKey: prefixed keys
     assert(!isValidMetaKey("1bad.example/name")); // label must start with letter
     assert(!isValidMetaKey("bad-.example/name")); // label must end alphanumeric
     assert(!isValidMetaKey("io..example/name")); // empty interior label
-    assert(!isValidMetaKey("io.example/")); // empty name
     assert(!isValidMetaKey("io.example/-x")); // name must start alphanumeric
+}
+
+unittest  // isValidMetaKey: prefix-only keys (empty name segment is valid)
+{
+    // The spec's Name rule is "Unless empty, MUST begin and end with an
+    // alphanumeric character", so a valid prefix followed by an empty name
+    // segment is a valid `_meta` key.
+    assert(isValidMetaKey("io.example/"));
+    assert(isValidMetaKey("com.example/"));
+    assert(isValidMetaKey("io.modelcontextprotocol/"));
+    assert(isValidMetaKey("a/"));
+
+    // An empty prefix with an empty name is still invalid.
+    assert(!isValidMetaKey("/"));
 }
 
 unittest  // isReservedMetaPrefix: second label modelcontextprotocol or mcp
