@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question / discussion
+    url: https://github.com/Poita/mcp.d/discussions
+    about: Ask a usage question or start a discussion. Please do not open issues for general questions.
+  - name: Security vulnerability
+    url: https://github.com/Poita/mcp.d/security/policy
+    about: Report a security vulnerability privately. See SECURITY.md — do not file a public issue.
