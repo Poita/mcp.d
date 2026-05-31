@@ -100,6 +100,32 @@ void main()
 }
 ```
 
+Prefer decorating **module-level free functions** (FastMCP-style) instead of a
+class? Use `registerModule` — it reflects every annotated free function in a
+module and registers it. (A `RequestContext` must be an explicit parameter, since
+free functions have no `this`.)
+
+```d
+import mcp;
+
+@tool("add", "Add two integers")
+long add(long a, long b) @safe { return a + b; }
+
+@resource("file:///readme", "README", "text/plain")
+string readme() @safe { return "Hello!"; }
+
+@prompt("greet_prompt", "Greeting prompt")
+string greetPrompt(string topic) @safe { return "Say hello about " ~ topic; }
+
+void main()
+{
+    auto server = new MCPServer("my-server", "1.0.0");
+    registerModule!(__traits(parent, add))(server);  // or registerModule!(my.module)(server)
+    // registerModules!(modA, modB)(server);          // variadic convenience
+    runStdio(server);
+}
+```
+
 A tool/prompt handler may also take a `RequestContext` parameter to report
 progress, log, or request sampling/elicitation from the client:
 

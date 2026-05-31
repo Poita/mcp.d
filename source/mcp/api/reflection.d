@@ -28,17 +28,57 @@ void registerHandlers(T)(MCPServer server, T obj) @safe
                 static foreach (attr; __traits(getAttributes, overload))
                 {
                     static if (is(typeof(attr) == tool))
-                        registerToolMethod!(T, memberName, overload)(server, obj, attr);
+                        registerToolMethod!(memberName, overload, obj)(server, attr);
                     else static if (is(typeof(attr) == prompt))
-                        registerPromptMethod!(T, memberName, overload)(server, obj, attr);
+                        registerPromptMethod!(memberName, overload, obj)(server, attr);
                     else static if (is(typeof(attr) == resource))
-                        registerResourceMethod!(T, memberName, overload)(server, obj, attr);
+                        registerResourceMethod!(memberName, overload, obj)(server, attr);
                     else static if (is(typeof(attr) == resourceTemplate))
-                        registerTemplateMethod!(T, memberName, overload)(server, obj, attr);
+                        registerTemplateMethod!(memberName, overload, obj)(server, attr);
                 }
             }
         }
     }
+}
+
+/// Register every `@tool` / `@prompt` / `@resource` / `@resourceTemplate`
+/// annotated **free function** in module `mod` on `server`, mirroring
+/// `registerHandlers` but targeting module-scope symbols rather than the
+/// methods of an instance (FastMCP-style module decoration).
+///
+/// Free functions cannot receive a `RequestContext` via `this`, so a context
+/// must be taken as an explicit parameter (exactly as opt-in methods do).
+/// Non-function members and functions without a recognized UDA are skipped.
+void registerModule(alias mod)(MCPServer server) @safe
+{
+    static foreach (memberName; __traits(allMembers, mod))
+    {
+        static if (__traits(compiles, __traits(getOverloads, mod, memberName)))
+        {
+            static foreach (overload; __traits(getOverloads, mod, memberName))
+            {
+                static foreach (attr; __traits(getAttributes, overload))
+                {
+                    static if (is(typeof(attr) == tool))
+                        registerToolMethod!(memberName, overload, mod)(server, attr);
+                    else static if (is(typeof(attr) == prompt))
+                        registerPromptMethod!(memberName, overload, mod)(server, attr);
+                    else static if (is(typeof(attr) == resource))
+                        registerResourceMethod!(memberName, overload, mod)(server, attr);
+                    else static if (is(typeof(attr) == resourceTemplate))
+                        registerTemplateMethod!(memberName, overload, mod)(server, attr);
+                }
+            }
+        }
+    }
+}
+
+/// Convenience variadic form of `registerModule`: register the annotated free
+/// functions of several modules in one call.
+void registerModules(mods...)(MCPServer server) @safe
+{
+    static foreach (mod; mods)
+        registerModule!mod(server);
 }
 
 /// Build the `{type:object, properties, required}` schema for a method's
@@ -164,8 +204,8 @@ private CallToolResult toToolResult(R)(R ret) @safe
     }
 }
 
-private void registerToolMethod(T, string memberName, alias overload)(
-        MCPServer server, T obj, tool attr) @safe
+private void registerToolMethod(string memberName, alias overload, alias parent)(
+        MCPServer server, tool attr) @safe
 {
     import std.traits : ReturnType;
 
@@ -206,7 +246,7 @@ private void registerToolMethod(T, string memberName, alias overload)(
             else
                 argv[i] = marshalArg!P(args, names[i]);
         }
-        return toToolResult(__traits(getMember, obj, memberName)(argv.expand));
+        return toToolResult(__traits(getMember, parent, memberName)(argv.expand));
     });
 }
 
@@ -232,8 +272,8 @@ private GetPromptResult toPromptResult(R)(R ret) @safe
                 "@prompt method must return GetPromptResult, PromptMessage[], or string");
 }
 
-private void registerPromptMethod(T, string memberName, alias overload)(
-        MCPServer server, T obj, prompt attr) @safe
+private void registerPromptMethod(string memberName, alias overload, alias parent)(
+        MCPServer server, prompt attr) @safe
 {
     Prompt descriptor;
     descriptor.name = attr.name;
@@ -258,7 +298,7 @@ private void registerPromptMethod(T, string memberName, alias overload)(
             else
                 argv[i] = marshalArg!P(args, names[i]);
         }
-        return toPromptResult(__traits(getMember, obj, memberName)(argv.expand));
+        return toPromptResult(__traits(getMember, parent, memberName)(argv.expand));
     });
 }
 
@@ -272,8 +312,8 @@ private ResourceContents toResourceContents(R)(R ret, string uri, string mimeTyp
         static assert(false, "@resource method must return ResourceContents or string");
 }
 
-private void registerResourceMethod(T, string memberName, alias overload)(
-        MCPServer server, T obj, resource attr) @safe
+private void registerResourceMethod(string memberName, alias overload, alias parent)(
+        MCPServer server, resource attr) @safe
 {
     Resource descriptor;
     descriptor.uri = attr.uri;
@@ -293,12 +333,13 @@ private void registerResourceMethod(T, string memberName, alias overload)(
     }
 
     server.registerResource(descriptor, () @safe {
-        return toResourceContents(__traits(getMember, obj, memberName)(), attr.uri, attr.mimeType);
+        return toResourceContents(__traits(getMember, parent, memberName)(),
+            attr.uri, attr.mimeType);
     });
 }
 
-private void registerTemplateMethod(T, string memberName, alias overload)(
-        MCPServer server, T obj, resourceTemplate attr) @safe
+private void registerTemplateMethod(string memberName, alias overload, alias parent)(
+        MCPServer server, resourceTemplate attr) @safe
 {
     ResourceTemplate descriptor;
     descriptor.uriTemplate = attr.uriTemplate;
@@ -327,7 +368,7 @@ private void registerTemplateMethod(T, string memberName, alias overload)(
             else
                 argv[i] = P.init;
         }
-        auto ret = __traits(getMember, obj, memberName)(argv.expand);
+        auto ret = __traits(getMember, parent, memberName)(argv.expand);
         return toResourceContents(ret, uri, attr.mimeType);
     });
 }
@@ -399,7 +440,7 @@ version (unittest)
         }
 
         @tool("query", "Query a region")
-        string query(@mcpHeader("Region") string region, int limit) @safe
+        string query(@mcpHeader("Region") string region, int limit)@safe
         {
             return region;
         }
