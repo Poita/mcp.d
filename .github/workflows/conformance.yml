@@ -62,11 +62,14 @@ jobs:
           STATUS=${PIPESTATUS[0]}
           set -e
           kill "$SERVER_PID" 2>/dev/null || true
-          if [ "$STATUS" -ne 0 ]; then
-            echo "::error::Server conformance scenarios failed"
-            exit "$STATUS"
+          # The harness also exits non-zero on advisory SHOULD warnings, so a
+          # non-zero exit alone is not a failure. Fail only if the suite did not
+          # complete (no summary line) or reported >=1 failed scenario.
+          if ! grep -q "Total:" server-conformance.log; then
+            echo "::error::Server conformance did not complete (exit $STATUS)"
+            exit 1
           fi
-          if grep -Eiq '[1-9][0-9]* failed' server-conformance.log; then
+          if grep -Eiq 'Total:.*[1-9][0-9]* failed' server-conformance.log; then
             echo "::error::Server conformance reported failures"
             exit 1
           fi
@@ -81,11 +84,14 @@ jobs:
             client --command ./conformance-client --suite all | tee client-conformance.log
           STATUS=${PIPESTATUS[0]}
           set -e
-          if [ "$STATUS" -ne 0 ]; then
-            echo "::error::Client conformance scenarios failed"
-            exit "$STATUS"
+          # The harness also exits non-zero on advisory SHOULD warnings, so a
+          # non-zero exit alone is not a failure. Fail only if the suite did not
+          # complete (no summary line) or reported >=1 failed scenario.
+          if ! grep -q "Total:" client-conformance.log; then
+            echo "::error::Client conformance did not complete (exit $STATUS)"
+            exit 1
           fi
-          if grep -Eiq '[1-9][0-9]* failed' client-conformance.log; then
+          if grep -Eiq 'Total:.*[1-9][0-9]* failed' client-conformance.log; then
             echo "::error::Client conformance reported failures"
             exit 1
           fi
