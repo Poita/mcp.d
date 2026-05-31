@@ -424,6 +424,22 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
     }
 
     auto msg = input.messages[0];
+
+    // Spec (2025-06-18 / 2025-11-25 Transports §Protocol Version Header): an
+    // invalid or unsupported MCP-Protocol-Version header MUST be rejected with
+    // 400 on EVERY POST to the MCP endpoint, including notification/response
+    // bodies (which otherwise take the 202 path below). Run the gate before the
+    // per-kind switch so all branches are covered. A notification/response error
+    // body carries no id (basic/transports: "a JSON-RPC error response that has
+    // no id"); a request error echoes the request id.
+    if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
+    {
+        const errId = (msg.kind == MessageKind.request) ? msg.id : Json(null);
+        res.statusCode = HTTPStatus.badRequest;
+        res.writeBody(makeErrorResponse(errId, verErr).toString(), "application/json");
+        return;
+    }
+
     final switch (msg.kind)
     {
     case MessageKind.response:
@@ -444,16 +460,8 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
         if (sessions !is null
                 && msg.method == "initialize")
             res.headers[SessionHeader] = sessions.create();
-        // Spec (2025-06-18 / 2025-11-25 Transports): an invalid or unsupported
-        // MCP-Protocol-Version header MUST be rejected with 400, independent of
-        // the negotiated/draft state.
-        auto verErr = validateProtocolVersionHeader(req.headers.get(HttpHeader.protocolVersion, ""));
-        if (verErr !is null)
-        {
-            res.statusCode = HTTPStatus.badRequest;
-            res.writeBody(makeErrorResponse(msg.id, verErr).toString(), "application/json");
-            return;
-        }
+        // The MCP-Protocol-Version header was already validated by
+        // postProtocolVersionGate above (it gates every POST kind).
         // Draft: validate the standard request headers against the body.
         auto hdrErr = validateDraftHeaders(req.headers.get(HttpHeader.protocolVersion,
                 ""), req.headers.get(HttpHeader.method, ""),
@@ -637,6 +645,19 @@ McpException validateProtocolVersionHeader(string protoHeader) @safe
     data["requested"] = Json(protoHeader);
     return new McpException(ErrorCode.unsupportedProtocolVersion,
             "Unsupported MCP-Protocol-Version header: " ~ protoHeader, data);
+}
+
+/// The transport-level MCP-Protocol-Version check that gates EVERY POST to the
+/// MCP endpoint, irrespective of whether the body is a request, notification, or
+/// response. basic/transports §Protocol Version Header (2025-06-18 /
+/// 2025-11-25): "If the server receives a request with an invalid or unsupported
+/// MCP-Protocol-Version, it MUST respond with 400 Bad Request." Returns the
+/// rejecting McpException (mapped to HTTP 400) or null when the header is absent
+/// or names a supported version. This is just `validateProtocolVersionHeader`,
+/// named to make explicit that it runs before the per-kind routing switch.
+McpException postProtocolVersionGate(string protoHeader) @safe
+{
+    return validateProtocolVersionHeader(protoHeader);
 }
 
 /// Whether a `Host` header value (e.g. "127.0.0.1:3000") is localhost or listed.
@@ -827,6 +848,23 @@ unittest  // an unsupported/invalid MCP-Protocol-Version header is rejected with
 unittest  // a garbage MCP-Protocol-Version header is rejected
 {
     assert(validateProtocolVersionHeader("not-a-version") !is null);
+}
+
+unittest  // the version gate applies to EVERY POST kind, not just requests
+{
+    // basic/transports §Protocol Version Header (2025-06-18 / 2025-11-25): a
+    // POST carrying an invalid/unsupported MCP-Protocol-Version MUST be rejected
+    // with 400 regardless of whether the body is a request, notification, or
+    // response. Previously the gate ran only on the request branch, so a
+    // notification/response POST with a bad header was wrongly accepted (202).
+    auto bad = postProtocolVersionGate("1.0.0");
+    assert(bad !is null, "bad header must be rejected for all POST kinds");
+    assert(bad.code == ErrorCode.unsupportedProtocolVersion);
+    auto j = makeErrorResponse(Json(null), bad);
+    assert(httpStatusForResponse(j, false) == 400);
+    // a supported / absent header is fine for every kind
+    assert(postProtocolVersionGate("2025-11-25") is null);
+    assert(postProtocolVersionGate("") is null);
 }
 
 /// True if the protocol-version header denotes a draft+ request.
