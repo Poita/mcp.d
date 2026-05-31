@@ -625,7 +625,7 @@ unittest  // replay never crosses streams (MUST NOT replay a different stream)
 	string[] bFrames;
 	const b = ch.addListener((string f) @safe { bFrames ~= f; });
 	ch.emitTo(b, makeNotification("notifications/message", Json([
-				"s": Json("B1")
+		"s": Json("B1")
 	])));
 	assert(bFrames.length == 1);
 

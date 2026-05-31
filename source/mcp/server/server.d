@@ -1587,6 +1587,13 @@ final class McpServer
 
 	private Json doSubscribe(Json params) @safe
 	{
+		// `subscribe` is an optional resources capability (server/resources:
+		// "whether the client can subscribe to be notified of changes to individual
+		// resources"); a server advertises it only after enableResourceSubscriptions().
+		// A server that never advertised it MUST answer with -32601 rather than
+		// silently accepting, matching logging/setLevel's capability gating.
+		if (!resourceSubscriptionsEnabled)
+			throw methodNotFound("resources/subscribe");
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/subscribe requires a string 'uri'");
 		subscriptions[params["uri"].get!string] = true;
@@ -1595,6 +1602,11 @@ final class McpServer
 
 	private Json doUnsubscribe(Json params) @safe
 	{
+		// Gated on the same optional `subscribe` capability as doSubscribe: a server
+		// that never advertised it MUST answer with -32601 rather than silently
+		// accepting an unsubscribe for a subscription it could never have created.
+		if (!resourceSubscriptionsEnabled)
+			throw methodNotFound("resources/unsubscribe");
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/unsubscribe requires a string 'uri'");
 		subscriptions.remove(params["uri"].get!string);
@@ -3648,6 +3660,30 @@ unittest  // resources/subscribe and unsubscribe track URIs and return {}
 	auto unsub = s.handle(req(2, "resources/unsubscribe", p)).get;
 	assert(unsub["result"].length == 0);
 	assert(!s.isSubscribed("test://w"));
+}
+
+unittest  // resources/subscribe is rejected with -32601 when capability not advertised
+{
+	// The `subscribe` resources capability is optional and only advertised when
+	// enableResourceSubscriptions() was called. A server that never advertised it
+	// MUST reject resources/subscribe with -32601 rather than silently accepting.
+	auto s = new McpServer("t", "1");
+	Json p = Json.emptyObject;
+	p["uri"] = "test://w";
+	auto resp = s.handle(req(1, "resources/subscribe", p)).get;
+	assert("error" in resp);
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+	assert(!s.isSubscribed("test://w"));
+}
+
+unittest  // resources/unsubscribe is rejected with -32601 when capability not advertised
+{
+	auto s = new McpServer("t", "1");
+	Json p = Json.emptyObject;
+	p["uri"] = "test://w";
+	auto resp = s.handle(req(1, "resources/unsubscribe", p)).get;
+	assert("error" in resp);
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
 unittest  // subscribe capability is advertised only when enabled
