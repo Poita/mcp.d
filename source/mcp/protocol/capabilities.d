@@ -8,12 +8,13 @@ import mcp.protocol.versions : ProtocolVersion;
 
 /// An icon for display in user interfaces. Used by `Implementation`,
 /// `Tool` (and other definitions) per the MCP spec's icon shape: a required
-/// `src` and optional `mimeType` and `sizes`.
+/// `src` and optional `mimeType`, `sizes`, and `theme` ("light"|"dark").
 struct Icon
 {
 	string src; /// URI or data: URL of the icon
 	Nullable!string mimeType; /// optional MIME type, e.g. "image/png"
 	string[] sizes; /// optional size strings, e.g. ["48x48", "96x96"]
+	Nullable!string theme; /// optional theme preference, "light" or "dark"
 
 	Json toJson() const @safe
 	{
@@ -28,6 +29,8 @@ struct Icon
 				arr ~= Json(s);
 			j["sizes"] = arr;
 		}
+		if (!theme.isNull)
+			j["theme"] = theme.get;
 		return j;
 	}
 
@@ -40,6 +43,8 @@ struct Icon
 		if ("sizes" in j && j["sizes"].type == Json.Type.array)
 			foreach (i; 0 .. j["sizes"].length)
 				icon.sizes ~= j["sizes"][i].get!string;
+		if ("theme" in j && j["theme"].type == Json.Type.string)
+			icon.theme = j["theme"].get!string;
 		return icon;
 	}
 }
@@ -121,6 +126,7 @@ struct Implementation
 				copy.src = icon.src;
 				copy.mimeType = icon.mimeType;
 				copy.sizes = icon.sizes.dup;
+				copy.theme = icon.theme;
 				projected.icons ~= copy;
 			}
 		}
@@ -703,6 +709,48 @@ unittest  // forVersion keeps every field for 2025-11-25 and draft
 		assert(j["description"].get!string == "does things");
 		assert(j["websiteUrl"].get!string == "https://example.com");
 		assert(j["icons"].length == 1);
+	}
+}
+
+unittest  // Icon emits theme when set and omits it when unset
+{
+	Icon i = {src: "https://example.com/i.png", theme: nullable("dark")};
+	auto j = i.toJson();
+	assert(j["src"].get!string == "https://example.com/i.png");
+	assert(j["theme"].get!string == "dark");
+
+	Icon bare = {src: "https://example.com/i.png"};
+	assert("theme" !in bare.toJson());
+}
+
+unittest  // Icon round-trips theme through fromJson (light)
+{
+	Icon i = {src: "s", theme: nullable("light")};
+	auto back = Icon.fromJson(i.toJson());
+	assert(back.theme.get == "light");
+}
+
+unittest  // Icon.fromJson leaves theme null when absent
+{
+	auto j = Icon("s").toJson();
+	auto back = Icon.fromJson(j);
+	assert(back.theme.isNull);
+	assert("theme" !in back.toJson());
+}
+
+unittest  // Implementation.forVersion carries icon theme for 2025-11-25 and draft
+{
+	Implementation impl = {
+		name: "srv", version_: "1", icons: [
+			Icon("https://example.com/i.png", Nullable!string.init, [], nullable("dark"))
+		]
+	};
+	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.draft])
+	{
+		auto projected = impl.forVersion(v);
+		assert(projected.icons.length == 1);
+		assert(projected.icons[0].theme.get == "dark");
+		assert(projected.toJson()["icons"][0]["theme"].get!string == "dark");
 	}
 }
 
