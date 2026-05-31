@@ -106,12 +106,15 @@ void mountMcp(URLRouter router, MCPServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		if (sessions !is null)
+		if (sessions !is null && deleteTerminatesSession(server.negotiatedVersion))
 		{
 			// Session Management: a client signals it no longer needs the
 			// session via DELETE with the Mcp-Session-Id header. Terminate it
 			// and reply 204; an absent header is 400, an unknown/already-
-			// terminated session is 404.
+			// terminated session is 404. The draft removed protocol-level
+			// sessions, so this branch is version-gated: a draft-negotiated
+			// server falls through to the 405 below even when sessions are
+			// enabled (mirroring the GET getOpensSseStream gate).
 			const sid = req.headers.get(SessionHeader, "");
 			if (sid.length == 0)
 			{
@@ -129,8 +132,9 @@ void mountMcp(URLRouter router, MCPServer server,
 			res.writeBody("", "text/plain");
 			return;
 		}
-		// Stateless mode has no protocol-level sessions, so there is nothing to
-		// tear down: per the backward-compatibility rules, DELETE -> 405.
+		// No protocol-level session to tear down (stateless mode, or a
+		// draft-negotiated session which removed sessions entirely): per the
+		// backward-compatibility rules, DELETE -> 405.
 		res.statusCode = HTTPStatus.methodNotAllowed;
 		res.headers["Allow"] = "POST";
 		res.writeBody("", "text/plain");
@@ -252,6 +256,30 @@ unittest  // stable revisions open the GET SSE stream; the draft does not
 	assert(getOpensSseStream(ProtocolVersion.v2025_06_18));
 	assert(getOpensSseStream(ProtocolVersion.v2025_03_26));
 	assert(!getOpensSseStream(ProtocolVersion.draft));
+}
+
+/// Decide how to answer an HTTP DELETE to the MCP endpoint
+/// (basic/transports §Session Management / §Backward Compatibility). The stable
+/// revisions (2025-03-26 / 2025-06-18 / 2025-11-25) carry protocol-level sessions
+/// a client tears down via DELETE + `Mcp-Session-Id`. The draft removed
+/// protocol-level sessions ("Removal of protocol-level sessions"), so there is
+/// nothing to terminate: a draft-negotiated server "SHOULD respond as follows:
+/// HTTP GET or DELETE to the MCP endpoint: respond with 405 Method Not Allowed."
+///
+/// Returns true when DELETE should drive session termination (stable revisions),
+/// false when it must be answered with 405 (the draft) — mirroring the version
+/// gate `getOpensSseStream` already applies to GET.
+bool deleteTerminatesSession(ProtocolVersion negotiated) @safe
+{
+	return !negotiated.isDraft;
+}
+
+unittest  // stable revisions terminate sessions on DELETE; the draft answers 405
+{
+	assert(deleteTerminatesSession(ProtocolVersion.v2025_11_25));
+	assert(deleteTerminatesSession(ProtocolVersion.v2025_06_18));
+	assert(deleteTerminatesSession(ProtocolVersion.v2025_03_26));
+	assert(!deleteTerminatesSession(ProtocolVersion.draft));
 }
 
 private void handleGet(MCPServer server, ServerPushChannel push,
