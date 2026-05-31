@@ -1081,6 +1081,14 @@ final class MCPServer
 
     private Json doSetLevel(Json params) @safe
     {
+        // The logging feature is gated on the declared `logging` capability
+        // (server/utilities/logging: "Servers that emit log message notifications
+        // MUST declare the `logging` capability"). A server that never called
+        // enableLogging() advertises no logging capability, so this request is
+        // answered with -32601 (Capability not supported) rather than being
+        // handled, matching completion/complete's capability gating.
+        if (!loggingEnabled)
+            throw methodNotFound("logging/setLevel");
         if (!("level" in params) || params["level"].type != Json.Type.string)
             throw invalidParams("logging/setLevel requires a string 'level'");
         const level = params["level"].get!string;
@@ -1842,6 +1850,21 @@ unittest  // logging/setLevel requires a string 'level' param
     Json p = Json.emptyObject;
     auto resp = s.handle(req(1, "logging/setLevel", p)).get;
     assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // logging/setLevel is rejected when the logging capability was never declared
+{
+    // Per server/utilities/logging, the logging feature is gated on the declared
+    // `logging` capability. A server that never called enableLogging() advertises
+    // no logging capability, so logging/setLevel MUST NOT be handled: it returns
+    // -32601 (Capability not supported), matching completion/complete's gating.
+    auto s = new MCPServer("t", "1");
+    Json p = Json.emptyObject;
+    p["level"] = "debug";
+    auto resp = s.handle(req(1, "logging/setLevel", p)).get;
+    assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+    // The level must not have been mutated by the rejected request.
+    assert(s.currentLogLevel == "info");
 }
 
 unittest  // after setLevel(error), a handler's sub-error logs are dropped
