@@ -283,6 +283,72 @@ string proxyTokenAuthHeader(const OAuthProxyConfig cfg) @safe
 }
 
 // ===========================================================================
+// Consent gate (confused-deputy mitigation)
+// ===========================================================================
+
+/// Records that a user has approved a particular dynamically-registered client
+/// to be forwarded to the upstream identity provider, and answers whether a
+/// given client has already been approved.
+///
+/// Because the proxy hands every DCR client the SAME fixed upstream
+/// `client_id`, the upstream IdP can see only one client and may auto-skip its
+/// own consent screen for that already-trusted application. The MCP
+/// authorization spec (2025-06-18 / 2025-11-25 §Security Considerations >
+/// Confused Deputy Problem) therefore requires:
+///
+///   "MCP proxy servers using static client IDs MUST obtain user consent for
+///    each dynamically registered client before forwarding to third-party
+///    authorization servers (which may require additional consent)."
+///
+/// The proxy distinguishes dynamically-registered clients by their
+/// client-supplied `redirect_uri` (the only per-client identity it holds, since
+/// the `client_id` is shared). An integrator records consent for a
+/// `redirect_uri` once the user has approved that client on the proxy's own
+/// consent screen; `OAuthProxy.authorize` then refuses to build the upstream
+/// redirect until consent for that `redirect_uri` is present.
+interface ConsentStore
+{
+	bool hasConsent(string clientRedirectUri) @safe;
+
+	void grantConsent(string clientRedirectUri) @safe;
+}
+
+/// A simple in-memory `ConsentStore`. Suitable for a single-process proxy; for
+/// a multi-process deployment back it with shared storage instead.
+final class InMemoryConsentStore : ConsentStore
+{
+	private bool[string] approved;
+
+	override bool hasConsent(string clientRedirectUri) @safe
+	{
+		return (clientRedirectUri in approved) !is null;
+	}
+
+	override void grantConsent(string clientRedirectUri) @safe
+	{
+		approved[clientRedirectUri] = true;
+	}
+}
+
+/// Thrown by `OAuthProxy.authorize` when the dynamically-registered client
+/// (identified by its `redirect_uri`) has not yet been granted user consent.
+/// The integrator must present a consent screen, record approval via
+/// `OAuthProxy.grantConsent`, and only then build the upstream redirect. This
+/// enforces the confused-deputy MUST: consent is obtained for each dynamically
+/// registered client before forwarding to the upstream authorization server.
+class ConsentRequiredException : Exception
+{
+	string clientRedirectUri;
+
+	this(string clientRedirectUri, string file = __FILE__, size_t line = __LINE__) @safe
+	{
+		super("user consent required before forwarding client '" ~ clientRedirectUri
+				~ "' to the upstream authorization server (confused-deputy mitigation)", file, line);
+		this.clientRedirectUri = clientRedirectUri;
+	}
+}
+
+// ===========================================================================
 // The proxy provider
 // ===========================================================================
 
@@ -292,10 +358,22 @@ string proxyTokenAuthHeader(const OAuthProxyConfig cfg) @safe
 final class OAuthProxy
 {
 	private OAuthProxyConfig cfg;
+	private ConsentStore consentStore;
 
 	this(OAuthProxyConfig cfg) @safe
 	{
+		this(cfg, new InMemoryConsentStore());
+	}
+
+	/// Construct with an explicit `ConsentStore` (e.g. a shared-storage backed
+	/// store for a multi-process deployment). The store records which
+	/// dynamically-registered clients (keyed by their `redirect_uri`) the user
+	/// has approved, so `authorize` can enforce the confused-deputy consent MUST.
+	this(OAuthProxyConfig cfg, ConsentStore consentStore) @safe
+	in (consentStore !is null)
+	{
 		this.cfg = cfg;
+		this.consentStore = consentStore;
 	}
 
 	/// The proxy's configuration.
@@ -323,7 +401,46 @@ final class OAuthProxy
 		return registrationResponseJson(cfg, requestedRedirectUris);
 	}
 
-	/// Build the upstream authorization redirect for a proxied `/authorize`.
+	/// Whether the dynamically-registered client identified by its
+	/// `clientRedirectUri` has already been granted user consent to be forwarded
+	/// to the upstream identity provider.
+	bool hasConsent(string clientRedirectUri) @safe
+	{
+		return consentStore.hasConsent(clientRedirectUri);
+	}
+
+	/// Record that the user has approved the dynamically-registered client
+	/// identified by its `clientRedirectUri`. Call this once the user approves on
+	/// the proxy's own consent screen; subsequent `authorize` calls for that
+	/// client will then be allowed to forward to the upstream IdP.
+	void grantConsent(string clientRedirectUri) @safe
+	{
+		consentStore.grantConsent(clientRedirectUri);
+	}
+
+	/// Build the upstream authorization redirect for a proxied `/authorize`,
+	/// gated on per-client user consent (confused-deputy mitigation).
+	///
+	/// The MCP authorization spec requires that a proxy using a static upstream
+	/// `client_id` obtain user consent for EACH dynamically-registered client
+	/// before forwarding it to the third-party authorization server. This
+	/// overload enforces that: it throws `ConsentRequiredException` unless the
+	/// client (identified by its `clientRedirectUri`, the per-client identity the
+	/// proxy holds since the `client_id` is shared) has been approved via
+	/// `grantConsent`. The integrator presents a consent screen, records approval,
+	/// then retries.
+	string authorize(string clientRedirectUri, string codeChallenge, string scopeStr, string state) @safe
+	{
+		if (!consentStore.hasConsent(clientRedirectUri))
+			throw new ConsentRequiredException(clientRedirectUri);
+		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
+	}
+
+	/// Build the upstream authorization redirect WITHOUT a per-client consent
+	/// gate. Provided for flows that do their own consent enforcement (or a
+	/// fixed, non-DCR client). For dynamically-registered clients prefer the
+	/// four-argument `authorize` overload, which enforces the confused-deputy
+	/// consent MUST.
 	string authorize(string codeChallenge, string scopeStr, string state) const @safe
 	{
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
@@ -550,4 +667,76 @@ unittest  // the OAuthProxy class exposes the full client-facing surface end to 
 
 	auto form = proxy.tokenForm("CODE", "VER");
 	assert(form.canFind("client_id=Iv1.upstream"));
+}
+
+unittest  // CONFUSED DEPUTY: gated authorize refuses to forward an un-consented client
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	auto proxy = new OAuthProxy(cfg);
+	// No consent recorded yet for this dynamically-registered client.
+	assertThrown!ConsentRequiredException(
+			proxy.authorize("http://localhost:5000/callback", "CH", "read:user", "S"));
+}
+
+unittest  // CONFUSED DEPUTY: after grantConsent the gated authorize forwards upstream
+{
+	import std.algorithm : canFind;
+
+	auto cfg = sampleConfig();
+	auto proxy = new OAuthProxy(cfg);
+	proxy.grantConsent("http://localhost:5000/callback");
+	auto url = proxy.authorize("http://localhost:5000/callback", "CH", "read:user", "S");
+	assert(url.startsWith("https://github.com/login/oauth/authorize?"));
+	assert(url.canFind("client_id=Iv1.upstream"));
+}
+
+unittest  // CONFUSED DEPUTY: consent is per-client (one approval does not cover another)
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	auto proxy = new OAuthProxy(cfg);
+	proxy.grantConsent("http://localhost:5000/callback");
+	assert(proxy.hasConsent("http://localhost:5000/callback"));
+	assert(!proxy.hasConsent("http://localhost:6000/callback"));
+	assertThrown!ConsentRequiredException(
+			proxy.authorize("http://localhost:6000/callback", "CH", "read:user", "S"));
+}
+
+unittest  // CONFUSED DEPUTY: the exception names the client redirect_uri needing consent
+{
+	auto cfg = sampleConfig();
+	auto proxy = new OAuthProxy(cfg);
+	bool threw = false;
+	try
+		proxy.authorize("http://localhost:7000/cb", "CH", "s", "S");
+	catch (ConsentRequiredException e)
+	{
+		threw = true;
+		assert(e.clientRedirectUri == "http://localhost:7000/cb");
+	}
+	assert(threw);
+}
+
+unittest  // InMemoryConsentStore records and reports per-redirect-uri consent
+{
+	ConsentStore store = new InMemoryConsentStore();
+	assert(!store.hasConsent("http://a/cb"));
+	store.grantConsent("http://a/cb");
+	assert(store.hasConsent("http://a/cb"));
+	assert(!store.hasConsent("http://b/cb"));
+}
+
+unittest  // a custom ConsentStore can be injected and is consulted by authorize
+{
+	import std.algorithm : canFind;
+
+	auto cfg = sampleConfig();
+	auto store = new InMemoryConsentStore();
+	store.grantConsent("http://localhost:9000/cb");
+	auto proxy = new OAuthProxy(cfg, store);
+	auto url = proxy.authorize("http://localhost:9000/cb", "CH", "read:user", "S");
+	assert(url.canFind("client_id=Iv1.upstream"));
 }
