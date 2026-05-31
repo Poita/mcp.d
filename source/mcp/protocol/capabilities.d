@@ -486,6 +486,158 @@ struct ClientCapabilities
 			c.extensions = j["extensions"];
 		return c;
 	}
+
+	/// Compute the capabilities this object requires that are NOT present in
+	/// `declared`. Used by a server to build the `data.requiredCapabilities`
+	/// payload of a `-32003 MissingRequiredClientCapabilityError`: `this` is the
+	/// set a request needs, `declared` is what the client actually advertised,
+	/// and the result is a `ClientCapabilities` containing exactly the missing
+	/// ones. A capability is satisfied when the client declared at least the same
+	/// presence flag (sub-capability flags imply their parent presence here, in
+	/// line with `toJson`). The boolean `anyMissing` out-param is `true` iff the
+	/// returned object carries at least one unmet requirement. The `experimental`
+	/// and `extensions` Json maps are compared by required-key presence: any
+	/// required key absent from `declared` is reported.
+	ClientCapabilities missingFrom(const ClientCapabilities declared, out bool anyMissing) const @safe
+	{
+		ClientCapabilities missing;
+		const declSampling = declared.sampling || declared.samplingTools || declared
+			.samplingContext;
+		const declElicit = declared.elicitation || declared.elicitationForm
+			|| declared.elicitationUrl;
+
+		if (roots && !declared.roots)
+		{
+			missing.roots = true;
+			anyMissing = true;
+		}
+		if (rootsListChanged && !declared.rootsListChanged)
+		{
+			missing.roots = true;
+			missing.rootsListChanged = true;
+			anyMissing = true;
+		}
+		if (sampling && !declSampling)
+		{
+			missing.sampling = true;
+			anyMissing = true;
+		}
+		if (samplingTools && !declared.samplingTools)
+		{
+			missing.samplingTools = true;
+			anyMissing = true;
+		}
+		if (samplingContext && !declared.samplingContext)
+		{
+			missing.samplingContext = true;
+			anyMissing = true;
+		}
+		if (elicitation && !declElicit)
+		{
+			missing.elicitation = true;
+			anyMissing = true;
+		}
+		if (elicitationForm && !(declared.elicitationForm || declElicit))
+		{
+			missing.elicitationForm = true;
+			anyMissing = true;
+		}
+		if (elicitationUrl && !declared.elicitationUrl)
+		{
+			missing.elicitationUrl = true;
+			anyMissing = true;
+		}
+		if (!tasks.isNull && declared.tasks.isNull)
+		{
+			missing.tasks = tasks;
+			anyMissing = true;
+		}
+		if (experimental.type == Json.Type.object)
+		{
+			Json missingExp = Json.emptyObject;
+			bool anyExp;
+			// `Json.opApply` is `@system` and non-`const`; we only read, so cast
+			// away `const` inside the trusted block to iterate the object.
+			() @trusted {
+				foreach (string k, Json v; cast() experimental)
+					if (declared.experimental.type != Json.Type.object || k !in declared
+							.experimental)
+					{
+						missingExp[k] = v;
+						anyExp = true;
+					}
+			}();
+			if (anyExp)
+			{
+				missing.experimental = missingExp;
+				anyMissing = true;
+			}
+		}
+		if (extensions.type == Json.Type.object)
+		{
+			Json missingExt = Json.emptyObject;
+			bool anyExt;
+			// `Json.opApply` is `@system` and non-`const`; we only read, so cast
+			// away `const` inside the trusted block to iterate the object.
+			() @trusted {
+				foreach (string k, Json v; cast() extensions)
+					if (declared.extensions.type != Json.Type.object || k !in declared.extensions)
+					{
+						missingExt[k] = v;
+						anyExt = true;
+					}
+			}();
+			if (anyExt)
+			{
+				missing.extensions = missingExt;
+				anyMissing = true;
+			}
+		}
+		return missing;
+	}
+}
+
+unittest  // missingFrom: an unmet sampling requirement is reported
+{
+	ClientCapabilities required = {sampling: true};
+	ClientCapabilities declared; // nothing advertised
+	bool any;
+	auto missing = required.missingFrom(declared, any);
+	assert(any);
+	assert(missing.sampling);
+	assert("sampling" in missing.toJson());
+}
+
+unittest  // missingFrom: a satisfied requirement reports nothing
+{
+	ClientCapabilities required = {sampling: true};
+	ClientCapabilities declared = {sampling: true};
+	bool any;
+	auto missing = required.missingFrom(declared, any);
+	assert(!any);
+	assert(!missing.sampling);
+	assert(missing.toJson().length == 0);
+}
+
+unittest  // missingFrom: elicitation url submode unmet by a form-only client
+{
+	ClientCapabilities required = {elicitationUrl: true};
+	ClientCapabilities declared = {elicitationForm: true};
+	bool any;
+	auto missing = required.missingFrom(declared, any);
+	assert(any);
+	assert(missing.elicitationUrl);
+}
+
+unittest  // missingFrom: a required experimental key absent from the client
+{
+	ClientCapabilities required;
+	required.experimental = Json(["io.example/x": Json.emptyObject]);
+	ClientCapabilities declared;
+	bool any;
+	auto missing = required.missingFrom(declared, any);
+	assert(any);
+	assert("io.example/x" in missing.experimental);
 }
 
 unittest  // Implementation round-trips with optional title omitted

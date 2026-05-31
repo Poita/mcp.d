@@ -84,6 +84,12 @@ struct RegisteredTool
 {
 	Tool descriptor;
 	MrtrToolHandler handler;
+	/// Client capabilities this tool's handler requires to run. On the draft
+	/// protocol, `tools/call` rejects with a `-32003`
+	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
+	/// lists the unmet ones) when the request's declared client capabilities do
+	/// not cover these. Empty (the default) means no gating.
+	ClientCapabilities requiredClientCapabilities;
 }
 
 /// A registered direct resource: descriptor + reader producing its contents.
@@ -265,6 +271,27 @@ final class McpServer
 	void registerDynamicTool(Tool descriptor, MrtrToolHandler handler) @safe
 	{
 		tools[descriptor.name] = RegisteredTool(descriptor, handler);
+	}
+
+	/// Declare the client capabilities a registered tool's handler requires.
+	///
+	/// On the draft protocol (which carries the caller's `clientCapabilities`
+	/// per-request in `_meta`), a `tools/call` for this tool is rejected up front
+	/// with a `-32003` `MissingRequiredClientCapabilityError` — whose
+	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
+	/// exactly the unmet capabilities — when the request's declared capabilities
+	/// do not cover `caps` (draft basic/lifecycle: "A server MUST NOT rely on
+	/// capabilities the client has not declared"). On the stateful 2025-era
+	/// protocols the gate uses the session capabilities negotiated at
+	/// `initialize`. Passing a default-constructed `ClientCapabilities` clears the
+	/// requirement. Returns `false` if no tool with `name` is registered.
+	bool setToolRequiredClientCapabilities(string name, ClientCapabilities caps) @safe
+	{
+		auto entry = name in tools;
+		if (entry is null)
+			return false;
+		entry.requiredClientCapabilities = caps;
+		return true;
 	}
 
 	/// Unregister a previously registered tool by name. Returns `true` if a tool
@@ -1215,7 +1242,7 @@ final class McpServer
 		case "tools/list":
 			return doListTools(params, ver);
 		case "tools/call":
-			return doCallTool(params, ctx);
+			return doCallTool(params, ctx, ver);
 		case "resources/list":
 			return doListResources(params, ver);
 		case "resources/templates/list":
@@ -1584,7 +1611,7 @@ final class McpServer
 		return maybeCache(result, listHint("tools/list"), ver);
 	}
 
-	private Json doCallTool(Json params, RequestContext ctx) @safe
+	private Json doCallTool(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
 		if ("name" !in params || params["name"].type != Json.Type.string)
 			throw invalidParams("tools/call requires a string 'name'");
@@ -1592,6 +1619,21 @@ final class McpServer
 		auto entry = name in tools;
 		if (entry is null)
 			throw invalidParams("Unknown tool: " ~ name);
+
+		// Capability gating (draft basic/lifecycle): a server MUST NOT rely on a
+		// capability the client did not declare. When this tool declares required
+		// client capabilities, reject the call with a `-32003`
+		// `MissingRequiredClientCapabilityError` listing the unmet ones in
+		// `data.requiredCapabilities`. The set the client actually declared is
+		// taken from this request's `_meta.clientCapabilities` on the stateless
+		// draft protocol, or from the session capabilities negotiated at
+		// `initialize` on the stateful 2025-era protocols.
+		const ClientCapabilities declared = ver.isDraft
+			? RequestMeta.fromParams(params).clientCapabilities : clientCaps;
+		bool anyMissing;
+		const missing = entry.requiredClientCapabilities.missingFrom(declared, anyMissing);
+		if (anyMissing)
+			throw missingRequiredClientCapability(missing);
 
 		Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
 		// Validate the supplied arguments against the tool's declared inputSchema
@@ -3166,6 +3208,82 @@ version (unittest)
 		params["_meta"] = meta;
 		return Message(makeRequest(Json(id), method, params));
 	}
+}
+
+unittest  // draft tools/call rejects with -32003 when a required client cap is undeclared
+{
+	auto s = makeTestServer();
+	// The "add" tool now requires the client to support sampling.
+	ClientCapabilities req;
+	req.sampling = true;
+	assert(s.setToolRequiredClientCapabilities("add", req));
+	// draftReq declares empty clientCapabilities -> sampling is missing.
+	Json p = Json(["name": Json("add"), "arguments": Json.emptyObject]);
+	auto resp = s.handle(draftReq(7, "tools/call", p)).get;
+	assert(resp["error"]["code"].get!long == -32003);
+	assert("requiredCapabilities" in resp["error"]["data"]);
+	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
+}
+
+unittest  // draft tools/call proceeds when the client declared the required cap
+{
+	auto s = makeTestServer();
+	ClientCapabilities reqCap;
+	reqCap.sampling = true;
+	assert(s.setToolRequiredClientCapabilities("add", reqCap));
+	// Build a draft request whose _meta declares sampling.
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	meta[MetaKey.clientCapabilities] = Json(["sampling": Json.emptyObject]);
+	Json p = Json([
+		"name": Json("add"),
+		"arguments": Json(["a": Json(2), "b": Json(3)])
+	]);
+	p["_meta"] = meta;
+	auto resp = s.handle(req(8, "tools/call", p)).get;
+	assert("error" !in resp);
+	assert(resp["result"]["structuredContent"]["result"].get!int == 5);
+}
+
+unittest  // a tool without a declared requirement is never gated on draft
+{
+	auto s = makeTestServer();
+	Json p = Json([
+		"name": Json("add"),
+		"arguments": Json(["a": Json(1), "b": Json(1)])
+	]);
+	auto resp = s.handle(draftReq(9, "tools/call", p)).get;
+	assert("error" !in resp);
+	assert(resp["result"]["structuredContent"]["result"].get!int == 2);
+}
+
+unittest  // setToolRequiredClientCapabilities returns false for an unknown tool
+{
+	auto s = makeTestServer();
+	ClientCapabilities req;
+	req.sampling = true;
+	assert(!s.setToolRequiredClientCapabilities("nope", req));
+}
+
+unittest  // stateful (2025-era) tools/call gates on negotiated session capabilities
+{
+	auto s = makeTestServer();
+	ClientCapabilities reqCap;
+	reqCap.sampling = true;
+	assert(s.setToolRequiredClientCapabilities("add", reqCap));
+	// Initialize on a stateful version declaring NO sampling capability.
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2025-06-18";
+	initP["capabilities"] = Json.emptyObject;
+	initP["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", initP));
+	Json p = Json([
+		"name": Json("add"),
+		"arguments": Json(["a": Json(1), "b": Json(1)])
+	]);
+	auto resp = s.handle(req(2, "tools/call", p)).get;
+	assert(resp["error"]["code"].get!long == -32003);
 }
 
 unittest  // server/discover advertises all supported versions + identity
