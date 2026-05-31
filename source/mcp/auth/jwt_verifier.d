@@ -140,8 +140,13 @@ package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) 
 {
 	const skew = cast(long) cfg.clockSkew.total!"seconds";
 
+	// A JWT access token without an integer `exp` cannot be validated as
+	// unexpired, so it MUST be rejected (OAuth 2.1 §5.2 token validation,
+	// RFC 9068 §2.2/§4). An absent or non-integer `exp` is treated as invalid.
+	if (payload["exp"].type != Json.Type.int_)
+		return TokenInfo.invalid();
 	const e = jsonLong(payload, "exp");
-	if (e != 0 && now > e + skew)
+	if (now > e + skew)
 		return TokenInfo.invalid();
 	const nbf = jsonLong(payload, "nbf");
 	if (nbf != 0 && now + skew < nbf)
@@ -548,8 +553,9 @@ private string jsonStr(Json j, string key) @safe
 	return null;
 }
 
-/// Read an integer claim, returning 0 when absent (callers treat 0 as "unset"
-/// for exp/nbf, which is correct as no real token carries epoch 0).
+/// Read an integer claim, returning 0 when absent or not an integer. Callers
+/// that require presence (e.g. `exp`) must check the JSON type separately;
+/// `nbf` is genuinely optional so a 0 result correctly disables the check.
 private long jsonLong(Json j, string key) @safe
 {
 	auto v = j[key];
@@ -692,6 +698,33 @@ unittest  // an expired token is rejected (beyond clock skew)
 
 	// exp is 1700003600; evaluate well past it + skew.
 	auto ti = verifyToken(cfg, testRs256Jwt, cache, 1_700_010_000);
+	assert(!ti.valid);
+}
+
+unittest  // a token with no exp claim is rejected (cannot be validated as unexpired)
+{
+	JwtVerifierConfig cfg;
+	// A signature-verified payload with every other claim present but no exp.
+	auto payload = parseJsonString(`{"iss":"https://as.example.com","sub":"ec-user","scope":"mcp:read","iat":1700000000,"nbf":1700000000}`);
+	auto ti = validateClaims(cfg, payload, 1_700_001_000);
+	assert(!ti.valid);
+}
+
+unittest  // a token with a present exp claim still validates (regression guard)
+{
+	JwtVerifierConfig cfg;
+	auto payload = parseJsonString(
+			`{"sub":"ec-user","iat":1700000000,"exp":1700003600,"nbf":1700000000}`);
+	auto ti = validateClaims(cfg, payload, 1_700_001_000);
+	assert(ti.valid);
+	assert(ti.subject == "ec-user");
+}
+
+unittest  // a non-integer exp claim is rejected (cannot be validated as unexpired)
+{
+	JwtVerifierConfig cfg;
+	auto payload = parseJsonString(`{"sub":"ec-user","exp":"not-a-number"}`);
+	auto ti = validateClaims(cfg, payload, 1_700_001_000);
 	assert(!ti.valid);
 }
 
