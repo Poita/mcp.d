@@ -14,7 +14,7 @@ module mcp.protocol.sampling;
 
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
-import mcp.protocol.types : Content, Tool;
+import mcp.protocol.types : Content, ContentKind, Tool;
 import mcp.protocol.errors : McpException, invalidParams;
 
 @safe:
@@ -406,15 +406,46 @@ Nullable!StopReason stopReasonFromString(string s) @safe
 struct CreateMessageResult
 {
     string role; /// "user" or "assistant" (typically "assistant")
-    Content content;
+    /// All content blocks of the reply. The spec models `content` as a single
+    /// block OR an array of blocks (`SamplingMessageContentBlock |
+    /// SamplingMessageContentBlock[]`); a tool-use reply (`stopReason:"toolUse"`)
+    /// returns an array of `tool_use` blocks. This field holds every block so no
+    /// `tool_use` id/name/input is dropped. For the common single-block reply,
+    /// use the `content` accessor.
+    Content[] contentBlocks;
     string model; /// the model identifier the client actually used
     string stopReason; /// raw stop-reason wire string (may be empty)
+
+    /// The first (or only) content block, for the common single-block reply.
+    /// Returns an empty text block when there are no blocks. For tool-use
+    /// replies (which carry several `tool_use` blocks) iterate `contentBlocks`.
+    Content content() const @safe
+    {
+        return contentBlocks.length ? contentBlocks[0].dupSelf() : Content.makeText("");
+    }
+
+    /// Set the result to a single content block (back-compat convenience).
+    void content(Content c) @safe
+    {
+        contentBlocks = [c];
+    }
 
     Json toJson() const @safe
     {
         Json j = Json.emptyObject;
         j["role"] = role;
-        j["content"] = content.toJson();
+        // Preserve the single-object wire shape for the common one-block reply
+        // (no change to existing output); emit an array only for multi-block
+        // (tool-use) replies, both of which the spec accepts.
+        if (contentBlocks.length == 1)
+            j["content"] = contentBlocks[0].toJson();
+        else
+        {
+            Json arr = Json.emptyArray;
+            foreach (b; contentBlocks)
+                arr ~= b.toJson();
+            j["content"] = arr;
+        }
         j["model"] = model;
         if (stopReason.length)
             j["stopReason"] = stopReason;
@@ -425,8 +456,17 @@ struct CreateMessageResult
     {
         CreateMessageResult r;
         r.role = ("role" in j) ? j["role"].get!string : "";
+        // `content` may be a single block (object) or an array of blocks; accept
+        // both so a tool-use reply (array of tool_use blocks) round-trips.
         if ("content" in j)
-            r.content = Content.fromJson(j["content"]);
+        {
+            auto c = j["content"];
+            if (c.type == Json.Type.array)
+                foreach (i; 0 .. c.length)
+                    r.contentBlocks ~= Content.fromJson(c[i]);
+            else
+                r.contentBlocks ~= Content.fromJson(c);
+        }
         r.model = ("model" in j) ? j["model"].get!string : "";
         if ("stopReason" in j && j["stopReason"].type == Json.Type.string)
             r.stopReason = j["stopReason"].get!string;
@@ -587,10 +627,83 @@ unittest  // CreateMessageResult parses role/content/model/stopReason
 
 unittest  // CreateMessageResult round-trips through toJson
 {
-    auto r = CreateMessageResult("assistant", Content.makeText("hi"), "m", "maxTokens");
+    auto r = CreateMessageResult("assistant", [Content.makeText("hi")], "m", "maxTokens");
     auto back = CreateMessageResult.fromJson(r.toJson());
     assert(back.role == "assistant" && back.content.text == "hi");
     assert(back.model == "m" && back.stopReasonEnum.get == StopReason.maxTokens);
+}
+
+unittest  // single-content reply keeps the single-object wire shape (no regress)
+{
+    auto r = CreateMessageResult("assistant", [Content.makeText("hi")], "m", "endTurn");
+    auto j = r.toJson();
+    // content must be a single object, exactly as before this change.
+    assert(j["content"].type == Json.Type.object);
+    assert(j["content"]["type"].get!string == "text");
+    assert(j["content"]["text"].get!string == "hi");
+}
+
+unittest  // a tool_use reply (content array, stopReason toolUse) round-trips
+{
+    // The spec's "Sampling with Tools" response: content is an ARRAY of
+    // tool_use blocks with stopReason "toolUse".
+    Json input = Json.emptyObject;
+    input["location"] = "Paris";
+    Json b1 = Json.emptyObject;
+    b1["type"] = "tool_use";
+    b1["id"] = "call_1";
+    b1["name"] = "get_weather";
+    b1["input"] = input;
+    Json b2 = Json.emptyObject;
+    b2["type"] = "tool_use";
+    b2["id"] = "call_2";
+    b2["name"] = "get_time";
+    b2["input"] = Json.emptyObject;
+
+    Json j = Json.emptyObject;
+    j["role"] = "assistant";
+    j["content"] = Json([b1, b2]);
+    j["model"] = "claude";
+    j["stopReason"] = "toolUse";
+
+    auto r = CreateMessageResult.fromJson(j);
+    assert(r.stopReasonEnum.get == StopReason.toolUse);
+    assert(r.contentBlocks.length == 2);
+    assert(r.contentBlocks[0].kind == ContentKind.toolUse);
+    assert(r.contentBlocks[0].id == "call_1");
+    assert(r.contentBlocks[0].name == "get_weather");
+    assert(r.contentBlocks[0].input["location"].get!string == "Paris");
+    assert(r.contentBlocks[1].id == "call_2");
+    assert(r.contentBlocks[1].name == "get_time");
+
+    // Re-serializing a multi-block reply emits an array of tool_use blocks.
+    auto back = r.toJson();
+    assert(back["content"].type == Json.Type.array);
+    assert(back["content"].length == 2);
+    assert(back["content"][0]["name"].get!string == "get_weather");
+}
+
+unittest  // a single tool_use block reply preserves id/name/input
+{
+    Json input = Json.emptyObject;
+    input["q"] = "x";
+    Json b = Json.emptyObject;
+    b["type"] = "tool_use";
+    b["id"] = "c1";
+    b["name"] = "search";
+    b["input"] = input;
+    Json j = Json.emptyObject;
+    j["role"] = "assistant";
+    j["content"] = b; // single object, not an array
+    j["model"] = "m";
+    j["stopReason"] = "toolUse";
+
+    auto r = CreateMessageResult.fromJson(j);
+    assert(r.contentBlocks.length == 1);
+    assert(r.content.kind == ContentKind.toolUse);
+    assert(r.content.id == "c1");
+    assert(r.content.name == "search");
+    assert(r.content.input["q"].get!string == "x");
 }
 
 unittest  // StopReason wire mapping is exact and reversible
