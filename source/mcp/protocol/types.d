@@ -25,154 +25,457 @@ enum ContentKind
 	toolResult
 }
 
+/// Shared optional fields carried by every content kind in the MCP schema:
+/// an `_meta` object and `annotations` (audience/priority/lastModified). Mixed
+/// into each per-kind content struct so the fields live exactly once, with no
+/// per-kind duplication or "meaningless on this kind" footgun.
+mixin template ContentMetaFields()
+{
+	Json annotations = Json.undefined; /// optional annotations (audience/priority/lastModified)
+	Json meta = Json.undefined; /// optional `_meta` object
+
+	private void emitMeta(ref Json j) const @safe
+	{
+		if (annotations.type != Json.Type.undefined)
+			j["annotations"] = annotations;
+		if (meta.type == Json.Type.object)
+			j["_meta"] = meta;
+	}
+
+	private void parseMeta(Json j) @safe
+	{
+		if ("annotations" in j)
+			annotations = j["annotations"];
+		if ("_meta" in j && j["_meta"].type == Json.Type.object)
+			meta = j["_meta"];
+	}
+}
+
+/// `text` content block (`TextContent`).
+struct TextContent
+{
+	string text;
+	mixin ContentMetaFields;
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		j["type"] = "text";
+		j["text"] = text;
+		emitMeta(j);
+		return j;
+	}
+}
+
+/// `image` content block (`ImageContent`): base64 `data` + `mimeType`.
+struct ImageContent
+{
+	string data;
+	string mimeType;
+	mixin ContentMetaFields;
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		j["type"] = "image";
+		j["data"] = data;
+		j["mimeType"] = mimeType;
+		emitMeta(j);
+		return j;
+	}
+}
+
+/// `audio` content block (`AudioContent`): base64 `data` + `mimeType`.
+struct AudioContent
+{
+	string data;
+	string mimeType;
+	mixin ContentMetaFields;
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		j["type"] = "audio";
+		j["data"] = data;
+		j["mimeType"] = mimeType;
+		emitMeta(j);
+		return j;
+	}
+}
+
+/// `resource_link` content block (`ResourceLink`, extends `Resource`).
+struct ResourceLink
+{
+	string uri;
+	string name;
+	string mimeType;
+	Nullable!string description; /// optional human-readable description
+	Nullable!string title; /// optional human-readable display name
+	Nullable!long size; /// optional size in bytes of the linked resource
+	mixin ContentMetaFields;
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		j["type"] = "resource_link";
+		j["uri"] = uri;
+		if (name.length)
+			j["name"] = name;
+		if (!title.isNull)
+			j["title"] = title.get;
+		if (!description.isNull)
+			j["description"] = description.get;
+		if (mimeType.length)
+			j["mimeType"] = mimeType;
+		if (!size.isNull)
+			j["size"] = size.get;
+		emitMeta(j);
+		return j;
+	}
+}
+
+/// `resource` content block (`EmbeddedResource`): wraps a resource contents
+/// object under `resource`.
+struct EmbeddedResource
+{
+	Json resource = Json.undefined;
+	mixin ContentMetaFields;
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		j["type"] = "resource";
+		j["resource"] = resource;
+		emitMeta(j);
+		return j;
+	}
+}
+
+/// `tool_use` content block (`ToolUseContent`, sampling only): the model's
+/// request to call a tool.
+struct ToolUseContent
+{
+	string id; /// the tool-call id the model assigned
+	string name; /// the tool name
+	Json input = Json.undefined; /// the tool-call arguments object
+	mixin ContentMetaFields;
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		j["type"] = "tool_use";
+		j["id"] = id;
+		j["name"] = name;
+		j["input"] = (input.type == Json.Type.object) ? input : Json.emptyObject;
+		emitMeta(j);
+		return j;
+	}
+}
+
+/// `tool_result` content block (`ToolResultContent`, sampling only): the result
+/// of a tool call, answering the `tool_use` whose id is `toolUseId`.
+struct ToolResultContent
+{
+	string toolUseId; /// the `id` of the tool_use this answers
+	Content[] content; /// nested content blocks of the result
+	Json structuredContent = Json.undefined; /// optional structured result
+	Nullable!bool isError; /// optional error flag
+	mixin ContentMetaFields;
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		j["type"] = "tool_result";
+		j["toolUseId"] = toolUseId;
+		Json tc = Json.emptyArray;
+		foreach (b; content)
+			tc ~= b.toJson();
+		j["content"] = tc;
+		if (structuredContent.type != Json.Type.undefined)
+			j["structuredContent"] = structuredContent;
+		if (!isError.isNull)
+			j["isError"] = isError.get;
+		emitMeta(j);
+		return j;
+	}
+}
+
 /// A content block as used in tool results, prompt messages, and sampling.
 ///
-/// Only the fields relevant to `kind` are meaningful; `toJson` emits the
-/// spec-correct shape for each kind.
+/// Modeled as a tagged union over the per-kind content structs above
+/// (`TextContent`, `ImageContent`, `AudioContent`, `ResourceLink`,
+/// `EmbeddedResource`, `ToolUseContent`, `ToolResultContent`). Each kind stores
+/// only the fields that are meaningful for it, so there are no
+/// meaningless-per-kind fields. Construct via the `make*` factories; the
+/// chainable `with*` setters apply only on the kinds where the field is valid.
 struct Content
 {
-	ContentKind kind;
-	string text; /// text
-	string data; /// image/audio: base64 payload
-	string mimeType; /// image/audio/resource
-	string uri; /// resourceLink/embeddedResource
-	string name; /// resourceLink
-	Json resource = Json.undefined; /// embeddedResource: the resource contents object
-	Json annotations = Json.undefined; /// optional annotations (audience/priority/lastModified)
-	Nullable!string description; /// resourceLink: optional human-readable description
-	Nullable!string title; /// resourceLink: optional human-readable display name
-	Nullable!long size; /// resourceLink: optional size in bytes of the linked resource
-	Json meta = Json.undefined; /// optional `_meta` object (any content kind)
-	string id; /// toolUse: the tool-call id the model assigned
-	Json input = Json.undefined; /// toolUse: the tool-call arguments object
-	string toolUseId; /// toolResult: the `id` of the tool_use this answers
-	Content[] toolContent; /// toolResult: nested content blocks of the result
-	Json structuredContent = Json.undefined; /// toolResult: optional structured result
-	Nullable!bool isError; /// toolResult: optional error flag
+	import std.sumtype : SumType, match;
 
-	/// A mutable deep copy of this content block. Needed because `Content` now
-	/// holds a `Content[]` (`toolContent`), so a plain `Content c = this;` on a
-	/// `const` block no longer converts implicitly; this rebuilds the value.
+	/// The underlying tagged union. Public so callers that prefer
+	/// `std.sumtype.match` can pattern-match directly over the per-kind structs.
+	alias Payload = SumType!(TextContent, ImageContent, AudioContent,
+			ResourceLink, EmbeddedResource, ToolUseContent, ToolResultContent);
+
+	Payload payload = Payload(TextContent.init);
+
+	this(P)(P p) @safe
+			if (is(P : TextContent) || is(P : ImageContent) || is(P
+				: AudioContent) || is(P : ResourceLink) || is(P : EmbeddedResource)
+				|| is(P : ToolUseContent) || is(P : ToolResultContent))
+	{
+		payload = Payload(p);
+	}
+
+	// SumType's generated `opAssign` is inferred `@system` (vibe-d `Json` fields
+	// make the compiler-injected safety check `@system`), which would poison
+	// every `@safe` `c = other;` site. The payload assignment is genuinely
+	// memory-safe, so route assignment through an explicit `@trusted` shim.
+	ref Content opAssign(return scope Content other) @trusted
+	{
+		this.payload = other.payload;
+		return this;
+	}
+
+	/// Which content kind this block holds.
+	ContentKind kind() const @safe
+	{
+		return payload.match!((const ref TextContent _) => ContentKind.text,
+				(const ref ImageContent _) => ContentKind.image,
+				(const ref AudioContent _) => ContentKind.audio,
+				(const ref ResourceLink _) => ContentKind.resourceLink,
+				(const ref EmbeddedResource _) => ContentKind.embeddedResource,
+				(const ref ToolUseContent _) => ContentKind.toolUse,
+				(const ref ToolResultContent _) => ContentKind.toolResult);
+	}
+
+	// --- Convenience accessors: read the field if this kind has it, else a
+	// neutral default. They let callers read common fields without an explicit
+	// match and never expose a field on a kind that lacks it.
+
+	string text() const @safe
+	{
+		return payload.match!((const ref TextContent c) => c.text, _ => "");
+	}
+
+	string data() const @safe
+	{
+		return payload.match!((const ref ImageContent c) => c.data,
+				(const ref AudioContent c) => c.data, _ => "");
+	}
+
+	string mimeType() const @safe
+	{
+		return payload.match!((const ref ImageContent c) => c.mimeType,
+				(const ref AudioContent c) => c.mimeType,
+				(const ref ResourceLink c) => c.mimeType, _ => "");
+	}
+
+	string uri() const @safe
+	{
+		return payload.match!((const ref ResourceLink c) => c.uri, _ => "");
+	}
+
+	string name() const @safe
+	{
+		return payload.match!((const ref ResourceLink c) => c.name,
+				(const ref ToolUseContent c) => c.name, _ => "");
+	}
+
+	Json resource() const @safe
+	{
+		return payload.match!((const ref EmbeddedResource c) => c.resource, _ => Json.undefined);
+	}
+
+	Nullable!string description() const @safe
+	{
+		return payload.match!((const ref ResourceLink c) => c.description,
+				_ => Nullable!string.init);
+	}
+
+	Nullable!string title() const @safe
+	{
+		return payload.match!((const ref ResourceLink c) => c.title, _ => Nullable!string.init);
+	}
+
+	Nullable!long size() const @safe
+	{
+		return payload.match!((const ref ResourceLink c) => c.size, _ => Nullable!long.init);
+	}
+
+	string id() const @safe
+	{
+		return payload.match!((const ref ToolUseContent c) => c.id, _ => "");
+	}
+
+	Json input() const @safe
+	{
+		return payload.match!((const ref ToolUseContent c) => c.input, _ => Json.undefined);
+	}
+
+	string toolUseId() const @safe
+	{
+		return payload.match!((const ref ToolResultContent c) => c.toolUseId, _ => "");
+	}
+
+	Content[] toolContent() const @safe
+	{
+		return payload.match!((const ref ToolResultContent c) {
+			Content[] dup;
+			foreach (b; c.content)
+				dup ~= b.dupSelf();
+			return dup;
+		}, _ => Content[].init);
+	}
+
+	Json structuredContent() const @safe
+	{
+		return payload.match!((const ref ToolResultContent c) => c.structuredContent,
+				_ => Json.undefined);
+	}
+
+	Nullable!bool isError() const @safe
+	{
+		return payload.match!((const ref ToolResultContent c) => c.isError, _ => Nullable!bool.init);
+	}
+
+	/// The shared `annotations` value (any kind may carry it).
+	Json annotations() const @safe
+	{
+		return payload.match!(c => c.annotations);
+	}
+
+	/// The shared `_meta` value (any kind may carry it).
+	Json meta() const @safe
+	{
+		return payload.match!(c => c.meta);
+	}
+
+	/// A deep copy of this content block.
 	Content dupSelf() const @safe
 	{
-		Content c;
-		c.kind = kind;
-		c.text = text;
-		c.data = data;
-		c.mimeType = mimeType;
-		c.uri = uri;
-		c.name = name;
-		c.resource = resource;
-		c.annotations = annotations;
-		c.description = description;
-		c.title = title;
-		c.size = size;
-		c.meta = meta;
-		c.id = id;
-		c.input = input;
-		c.toolUseId = toolUseId;
-		foreach (b; toolContent)
-			c.toolContent ~= b.dupSelf();
-		c.structuredContent = structuredContent;
-		c.isError = isError;
-		return c;
+		return payload.match!((const ref ToolResultContent c) {
+			ToolResultContent t;
+			t.toolUseId = c.toolUseId;
+			foreach (b; c.content)
+				t.content ~= b.dupSelf();
+			t.structuredContent = c.structuredContent;
+			t.isError = c.isError;
+			t.annotations = c.annotations;
+			t.meta = c.meta;
+			return Content(t);
+		}, (const ref c) => Content(c));
 	}
 
 	/// Attach optional annotations (audience/priority/lastModified) to this
 	/// content block. Returns a copy so calls can be chained, e.g.
-	/// `Content.makeText("hi").withAnnotations(a)`.
+	/// `Content.makeText("hi").withAnnotations(a)`. Valid on every kind.
 	Content withAnnotations(Json a) const @safe
 	{
 		Content c = dupSelf();
-		c.annotations = a;
+		c.payload.match!((ref x) { x.annotations = a; });
 		return c;
 	}
 
 	/// Attach an optional `description` to a `resource_link` content block, per
 	/// the MCP `ResourceLink` shape (it extends `Resource`). Returns a copy so
-	/// calls can be chained. Only serialized for the `resourceLink` kind.
+	/// calls can be chained. Only valid for the `resourceLink` kind.
 	Content withDescription(string d) const @safe
 	{
 		Content c = dupSelf();
-		c.description = d;
+		c.payload.match!((ref ResourceLink x) { x.description = d; }, (ref _) {
+			assert(false, "withDescription is only valid on resource_link content");
+		});
 		return c;
 	}
 
 	/// Attach an optional human-readable `title` to a `resource_link` content
 	/// block (`ResourceLink` extends `Resource`/`BaseMetadata`). Returns a copy.
+	/// Only valid for the `resourceLink` kind.
 	Content withTitle(string t) const @safe
 	{
 		Content c = dupSelf();
-		c.title = t;
+		c.payload.match!((ref ResourceLink x) { x.title = t; }, (ref _) {
+			assert(false, "withTitle is only valid on resource_link content");
+		});
 		return c;
 	}
 
 	/// Attach an optional `size` (bytes) to a `resource_link` content block, per
-	/// the MCP `ResourceLink` shape. Returns a copy.
+	/// the MCP `ResourceLink` shape. Returns a copy. Only valid for the
+	/// `resourceLink` kind.
 	Content withSize(long s) const @safe
 	{
 		Content c = dupSelf();
-		c.size = s;
+		c.payload.match!((ref ResourceLink x) { x.size = s; }, (ref _) {
+			assert(false, "withSize is only valid on resource_link content");
+		});
 		return c;
 	}
 
 	/// Attach an optional `_meta` object to this content block. Per the MCP
-	/// schema every content kind (TextContent/ImageContent/AudioContent/
-	/// EmbeddedResource/ResourceLink) may carry `_meta`. Returns a copy.
+	/// schema every content kind may carry `_meta`. Returns a copy.
 	Content withContentMeta(Json m) const @safe
 	{
 		Content c = dupSelf();
-		c.meta = m;
+		c.payload.match!((ref x) { x.meta = m; });
+		return c;
+	}
+
+	/// Mark a `tool_result` content block as an error (sampling). Returns a
+	/// copy. Only valid for the `toolResult` kind.
+	Content withIsError(bool e) const @safe
+	{
+		Content c = dupSelf();
+		c.payload.match!((ref ToolResultContent x) { x.isError = e; }, (ref _) {
+			assert(false, "withIsError is only valid on tool_result content");
+		});
+		return c;
+	}
+
+	/// Attach an optional `structuredContent` object to a `tool_result` content
+	/// block (sampling). Returns a copy. Only valid for the `toolResult` kind.
+	Content withStructuredContent(Json sc) const @safe
+	{
+		Content c = dupSelf();
+		c.payload.match!((ref ToolResultContent x) { x.structuredContent = sc; }, (ref _) {
+			assert(false, "withStructuredContent is only valid on tool_result content");
+		});
 		return c;
 	}
 
 	static Content makeText(string t) @safe
 	{
-		Content c;
-		c.kind = ContentKind.text;
-		c.text = t;
-		return c;
+		return Content(TextContent(t));
 	}
 
 	static Content makeImage(string base64, string mime) @safe
 	{
-		Content c;
-		c.kind = ContentKind.image;
-		c.data = base64;
-		c.mimeType = mime;
-		return c;
+		return Content(ImageContent(base64, mime));
 	}
 
 	static Content makeAudio(string base64, string mime) @safe
 	{
-		Content c;
-		c.kind = ContentKind.audio;
-		c.data = base64;
-		c.mimeType = mime;
-		return c;
+		return Content(AudioContent(base64, mime));
 	}
 
 	static Content makeResourceLink(string uri, string name, string mime = "") @safe
 	{
-		Content c;
-		c.kind = ContentKind.resourceLink;
-		c.uri = uri;
-		c.name = name;
-		c.mimeType = mime;
-		return c;
+		ResourceLink r;
+		r.uri = uri;
+		r.name = name;
+		r.mimeType = mime;
+		return Content(r);
 	}
 
 	static Content makeEmbeddedText(string uri, string mime, string text) @safe
 	{
-		Content c;
-		c.kind = ContentKind.embeddedResource;
 		Json r = Json.emptyObject;
 		r["uri"] = uri;
 		if (mime.length)
 			r["mimeType"] = mime;
 		r["text"] = text;
-		c.resource = r;
-		return c;
+		return Content(EmbeddedResource(r));
 	}
 
 	/// A `tool_use` content block (sampling): the model's request to call a
@@ -181,12 +484,7 @@ struct Content
 	/// draft schema.
 	static Content makeToolUse(string id, string name, Json input = Json.emptyObject) @safe
 	{
-		Content c;
-		c.kind = ContentKind.toolUse;
-		c.id = id;
-		c.name = name;
-		c.input = input;
-		return c;
+		return Content(ToolUseContent(id, name, input));
 	}
 
 	/// A `tool_result` content block (sampling): the result of a tool call,
@@ -195,98 +493,41 @@ struct Content
 	/// schema.
 	static Content makeToolResult(string toolUseId, Content[] content = null) @safe
 	{
-		Content c;
-		c.kind = ContentKind.toolResult;
-		c.toolUseId = toolUseId;
-		c.toolContent = content;
-		return c;
+		ToolResultContent t;
+		t.toolUseId = toolUseId;
+		t.content = content;
+		return Content(t);
 	}
 
 	Json toJson() const @safe
 	{
-		Json j = Json.emptyObject;
-		final switch (kind)
-		{
-		case ContentKind.text:
-			j["type"] = "text";
-			j["text"] = text;
-			break;
-		case ContentKind.image:
-			j["type"] = "image";
-			j["data"] = data;
-			j["mimeType"] = mimeType;
-			break;
-		case ContentKind.audio:
-			j["type"] = "audio";
-			j["data"] = data;
-			j["mimeType"] = mimeType;
-			break;
-		case ContentKind.resourceLink:
-			j["type"] = "resource_link";
-			j["uri"] = uri;
-			if (name.length)
-				j["name"] = name;
-			if (!title.isNull)
-				j["title"] = title.get;
-			if (!description.isNull)
-				j["description"] = description.get;
-			if (mimeType.length)
-				j["mimeType"] = mimeType;
-			if (!size.isNull)
-				j["size"] = size.get;
-			break;
-		case ContentKind.embeddedResource:
-			j["type"] = "resource";
-			j["resource"] = resource;
-			break;
-		case ContentKind.toolUse:
-			j["type"] = "tool_use";
-			j["id"] = id;
-			j["name"] = name;
-			j["input"] = (input.type == Json.Type.object) ? input : Json.emptyObject;
-			break;
-		case ContentKind.toolResult:
-			j["type"] = "tool_result";
-			j["toolUseId"] = toolUseId;
-			Json tc = Json.emptyArray;
-			foreach (b; toolContent)
-				tc ~= b.toJson();
-			j["content"] = tc;
-			if (structuredContent.type != Json.Type.undefined)
-				j["structuredContent"] = structuredContent;
-			if (!isError.isNull)
-				j["isError"] = isError.get;
-			break;
-		}
-		if (annotations.type != Json.Type.undefined)
-			j["annotations"] = annotations;
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
-		return j;
+		return payload.match!(c => c.toJson());
 	}
 
 	static Content fromJson(Json j) @safe
 	{
-		Content c;
 		const t = ("type" in j) ? j["type"].get!string : "text";
 		switch (t)
 		{
 		case "text":
-			c.kind = ContentKind.text;
+			TextContent c;
 			c.text = ("text" in j) ? j["text"].get!string : "";
-			break;
+			c.parseMeta(j);
+			return Content(c);
 		case "image":
-			c.kind = ContentKind.image;
+			ImageContent c;
 			c.data = ("data" in j) ? j["data"].get!string : "";
 			c.mimeType = ("mimeType" in j) ? j["mimeType"].get!string : "";
-			break;
+			c.parseMeta(j);
+			return Content(c);
 		case "audio":
-			c.kind = ContentKind.audio;
+			AudioContent c;
 			c.data = ("data" in j) ? j["data"].get!string : "";
 			c.mimeType = ("mimeType" in j) ? j["mimeType"].get!string : "";
-			break;
+			c.parseMeta(j);
+			return Content(c);
 		case "resource_link":
-			c.kind = ContentKind.resourceLink;
+			ResourceLink c;
 			c.uri = ("uri" in j) ? j["uri"].get!string : "";
 			c.name = ("name" in j) ? j["name"].get!string : "";
 			c.mimeType = ("mimeType" in j) ? j["mimeType"].get!string : "";
@@ -296,39 +537,39 @@ struct Content
 				c.description = j["description"].get!string;
 			if ("size" in j && j["size"].type == Json.Type.int_)
 				c.size = j["size"].get!long;
-			break;
+			c.parseMeta(j);
+			return Content(c);
 		case "resource":
-			c.kind = ContentKind.embeddedResource;
+			EmbeddedResource c;
 			c.resource = ("resource" in j) ? j["resource"] : Json.emptyObject;
-			break;
+			c.parseMeta(j);
+			return Content(c);
 		case "tool_use":
-			c.kind = ContentKind.toolUse;
+			ToolUseContent c;
 			c.id = ("id" in j && j["id"].type == Json.Type.string) ? j["id"].get!string : "";
 			c.name = ("name" in j && j["name"].type == Json.Type.string) ? j["name"].get!string
 				: "";
 			c.input = ("input" in j) ? j["input"] : Json.emptyObject;
-			break;
+			c.parseMeta(j);
+			return Content(c);
 		case "tool_result":
-			c.kind = ContentKind.toolResult;
+			ToolResultContent c;
 			c.toolUseId = ("toolUseId" in j && j["toolUseId"].type == Json.Type.string)
 				? j["toolUseId"].get!string : "";
 			if ("content" in j && j["content"].type == Json.Type.array)
 				foreach (i; 0 .. j["content"].length)
-					c.toolContent ~= Content.fromJson(j["content"][i]);
+					c.content ~= Content.fromJson(j["content"][i]);
 			if ("structuredContent" in j)
 				c.structuredContent = j["structuredContent"];
 			if ("isError" in j && j["isError"].type == Json.Type.bool_)
 				c.isError = j["isError"].get!bool;
-			break;
+			c.parseMeta(j);
+			return Content(c);
 		default:
-			c.kind = ContentKind.text;
-			break;
+			TextContent c;
+			c.parseMeta(j);
+			return Content(c);
 		}
-		if ("annotations" in j)
-			c.annotations = j["annotations"];
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			c.meta = j["_meta"];
-		return c;
 	}
 }
 
@@ -899,13 +1140,30 @@ unittest  // content omits _meta when none is set
 	assert("_meta" !in j);
 }
 
-unittest  // description/title/size only serialize for resourceLink kind
+unittest  // withDescription/withTitle/withSize reject non-resourceLink kinds
 {
-	auto c = Content.makeText("hi").withDescription("ignored").withSize(5L);
-	auto j = c.toJson();
-	assert(j["type"].get!string == "text");
-	assert("description" !in j);
-	assert("size" !in j);
+	// They are valid only on resource_link content. Applying them to another
+	// kind is a programming error (no silent no-op), so it must fail loudly.
+	import core.exception : AssertError;
+
+	static bool throwsAssert(scope void delegate() @safe dg) @trusted
+	{
+		try
+			dg();
+		catch (AssertError)
+			return true;
+		return false;
+	}
+
+	assert(throwsAssert(() {
+			cast(void) Content.makeText("hi").withDescription("x");
+		}));
+	assert(throwsAssert(() {
+			cast(void) Content.makeImage("d", "image/png").withTitle("t");
+		}));
+	assert(throwsAssert(() {
+			cast(void) Content.makeAudio("d", "audio/wav").withSize(5L);
+		}));
 }
 
 unittest  // image content uses data + mimeType
@@ -985,11 +1243,10 @@ unittest  // tool_result content carries toolUseId and nested content array
 
 unittest  // tool_result content round-trips nested content/isError/structured
 {
-	auto c = Content.makeToolResult("call_2", [Content.makeText("boom")]);
-	c.isError = true;
 	Json sc = Json.emptyObject;
 	sc["code"] = 500;
-	c.structuredContent = sc;
+	auto c = Content.makeToolResult("call_2", [Content.makeText("boom")])
+		.withIsError(true).withStructuredContent(sc);
 	auto back = Content.fromJson(c.toJson());
 	assert(back.kind == ContentKind.toolResult);
 	assert(back.toolUseId == "call_2");
@@ -1008,6 +1265,54 @@ unittest  // inbound content annotations are preserved on fromJson
 	assert(back.annotations.type == Json.Type.object);
 	assert(back.annotations["audience"][0].get!string == "assistant");
 	assert(back.annotations["lastModified"].get!string == "2025-01-01T00:00:00Z");
+}
+
+unittest  // Content is a SumType over per-kind structs (issue #305)
+{
+	import std.sumtype : SumType;
+
+	static assert(is(Content.Payload == SumType!(TextContent, ImageContent,
+			AudioContent, ResourceLink, EmbeddedResource, ToolUseContent, ToolResultContent)));
+}
+
+unittest  // per-kind structs serialize the spec-correct wire shape directly
+{
+	assert(TextContent("hi").toJson()["type"].get!string == "text");
+	assert(ImageContent("d", "image/png").toJson()["type"].get!string == "image");
+	assert(AudioContent("d", "audio/wav").toJson()["type"].get!string == "audio");
+}
+
+unittest  // a Content can be constructed directly from a per-kind struct
+{
+	auto c = Content(ResourceLink("file:///a", "a"));
+	assert(c.kind == ContentKind.resourceLink);
+	assert(c.uri == "file:///a" && c.name == "a");
+}
+
+unittest  // withDescription/withTitle/withSize succeed on resource_link content
+{
+	auto c = Content.makeResourceLink("file:///a", "a").withDescription("d")
+		.withTitle("t").withSize(9L);
+	auto j = c.toJson();
+	assert(j["description"].get!string == "d");
+	assert(j["title"].get!string == "t");
+	assert(j["size"].get!long == 9);
+}
+
+unittest  // tool_result nested content deep-copies through dupSelf (no aliasing)
+{
+	auto inner = Content.makeText("inner");
+	auto tr = Content.makeToolResult("call_1", [inner]);
+	auto copy = tr.dupSelf();
+	assert(copy.kind == ContentKind.toolResult);
+	assert(copy.toolContent.length == 1);
+	assert(copy.toolContent[0].text == "inner");
+}
+
+unittest  // text content round-trips through the SumType-backed Content
+{
+	auto back = Content.fromJson(Content.makeText("hello").toJson());
+	assert(back.kind == ContentKind.text && back.text == "hello");
 }
 
 unittest  // Tool defaults to an empty object input schema
