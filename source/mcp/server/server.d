@@ -183,7 +183,11 @@ final class McpServer
 	private bool resourcesListChangedEnabled;
 	private bool promptsListChangedEnabled;
 	private bool validateOutputSchema_;
-	private bool validateInputSchema_;
+	// Per server/tools § Security Considerations ("Servers MUST: Validate all
+	// tool inputs"), input-schema validation is ON by default. It only activates
+	// for tools that declared an inputSchema, so the blast radius is small. Opt
+	// out with disableInputSchemaValidation().
+	private bool validateInputSchema_ = true;
 	// In-flight requests, keyed by their JSON-RPC id (string form), each holding
 	// a shared cancellation token. Populated for the duration of a request so an
 	// inbound `notifications/cancelled` can flip the matching token and the
@@ -279,9 +283,17 @@ final class McpServer
 	/// `tools: { listChanged: true }`. Declare this (before `initialize` /
 	/// `server/discover`) when the server may add or remove tools at runtime and
 	/// will emit `notifications/tools/list_changed` via `notifyToolsListChanged`.
-	void enableToolListChanged() @safe
+	void enableToolsListChanged() @safe
 	{
 		toolListChangedEnabled = true;
+	}
+
+	/// Deprecated alias for `enableToolsListChanged` (the consistent, pluralised
+	/// name matching the `tools` capability key). Retained for source
+	/// compatibility.
+	deprecated("Use enableToolsListChanged instead") void enableToolListChanged() @safe
+	{
+		enableToolsListChanged();
 	}
 
 	/// Opt in to validating each tool's `structuredContent` against its
@@ -298,20 +310,29 @@ final class McpServer
 		validateOutputSchema_ = true;
 	}
 
-	/// Opt in to validating each tool call's `arguments` against the tool's
-	/// registered `inputSchema` before the handler is invoked. Per the spec
-	/// (server/tools § Security Considerations, all versions), "Servers MUST:
-	/// Validate all tool inputs". § Error Handling classifies an inputSchema
-	/// violation (missing required property or wrong type) as an
-	/// *input-validation* error, i.e. a Tool Execution Error: with validation
-	/// enabled, a `tools/call` whose arguments do not conform yields a
-	/// `CallToolResult` with `isError:true` and a descriptive text content
-	/// block (so the model can self-correct), NOT a JSON-RPC -32602 protocol
-	/// error. Tools without an `inputSchema` are unaffected. Off by default to
-	/// preserve existing behaviour.
+	/// Validate each tool call's `arguments` against the tool's registered
+	/// `inputSchema` before the handler is invoked. Per the spec (server/tools §
+	/// Security Considerations, all versions), "Servers MUST: Validate all tool
+	/// inputs", so this is **on by default**. § Error Handling classifies an
+	/// inputSchema violation (missing required property or wrong type) as an
+	/// *input-validation* error, i.e. a Tool Execution Error: a `tools/call`
+	/// whose arguments do not conform yields a `CallToolResult` with
+	/// `isError:true` and a descriptive text content block (so the model can
+	/// self-correct), NOT a JSON-RPC -32602 protocol error. Tools without an
+	/// `inputSchema` are unaffected. This method is retained for explicitness and
+	/// to re-enable validation after `disableInputSchemaValidation`.
 	void enableInputSchemaValidation() @safe
 	{
 		validateInputSchema_ = true;
+	}
+
+	/// Opt out of the default input-schema validation, so tool `arguments` are
+	/// passed to handlers unchecked. Discouraged — the spec says servers MUST
+	/// validate tool inputs — but available for handlers that perform their own
+	/// validation or intentionally accept arbitrary arguments.
+	void disableInputSchemaValidation() @safe
+	{
+		validateInputSchema_ = false;
 	}
 
 	/// Broadcast a `notifications/tools/list_changed` to every client listening
@@ -505,9 +526,17 @@ final class McpServer
 	/// `server/discover`) when the server may add or remove prompts at runtime
 	/// and will emit `notifications/prompts/list_changed` via
 	/// `notifyPromptsListChanged`.
-	void enablePromptListChanged() @safe
+	void enablePromptsListChanged() @safe
 	{
 		promptsListChangedEnabled = true;
+	}
+
+	/// Deprecated alias for `enablePromptsListChanged` (the consistent,
+	/// pluralised name matching the `prompts` capability key). Retained for
+	/// source compatibility.
+	deprecated("Use enablePromptsListChanged instead") void enablePromptListChanged() @safe
+	{
+		enablePromptsListChanged();
 	}
 
 	/// Advertise the 2025-11-25 `tasks` capability, i.e. support for
@@ -2198,7 +2227,39 @@ unittest  // input-schema validation: conforming arguments dispatch normally
 	assert(resp["result"]["content"][0]["text"].get!string == "ok");
 }
 
-unittest  // input-schema validation is off by default: missing argument still dispatches
+unittest  // input-schema validation is ON by default: a missing required argument is rejected
+{
+	import mcp.api.schema : jsonSchemaOf;
+
+	// Spec: server/tools § Security Considerations — "Servers MUST: Validate all
+	// tool inputs". The SDK validates tool arguments against the declared
+	// inputSchema by default; no explicit opt-in is required.
+	auto s = new McpServer("vsrv", "0.1.0");
+	struct AddArgs
+	{
+		int a;
+		int b;
+	}
+
+	Tool add = {
+		name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!AddArgs
+	};
+	s.registerDynamicTool(add, (Json args) @safe {
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+
+	Json params = Json.emptyObject;
+	params["name"] = "add";
+	params["arguments"] = Json(["a": Json(1)]); // missing required 'b'
+	auto resp = s.handle(req(23, "tools/call", params)).get;
+	assert("error" !in resp);
+	assert(resp["result"]["isError"].get!bool);
+	assert(resp["result"]["content"][0]["text"].get!string.length > 0);
+}
+
+unittest  // input-schema validation default can be turned off via disableInputSchemaValidation
 {
 	import mcp.api.schema : jsonSchemaOf;
 
@@ -2217,6 +2278,7 @@ unittest  // input-schema validation is off by default: missing argument still d
 		r.content = [Content.makeText("ok")];
 		return r;
 	});
+	s.disableInputSchemaValidation();
 
 	Json params = Json.emptyObject;
 	params["name"] = "add";
@@ -3736,7 +3798,7 @@ unittest  // enableToolListChanged advertises listChanged:true for tools
 	auto s = new McpServer("t", "1");
 	Tool add = {name: "add"};
 	s.registerDynamicTool(add, (Json) @safe { return CallToolResult(); });
-	s.enableToolListChanged();
+	s.enableToolsListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.tools.isNull);
 	assert(caps.tools.get.listChanged);
@@ -3750,7 +3812,7 @@ unittest  // enableToolListChanged advertises tools capability with zero tools r
 	// still advertise the tools capability so clients call tools/list and expect
 	// notifications/tools/list_changed.
 	auto s = new McpServer("t", "1");
-	s.enableToolListChanged();
+	s.enableToolsListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.tools.isNull);
 	assert(caps.tools.get.listChanged);
@@ -3876,7 +3938,7 @@ unittest  // enablePromptListChanged advertises prompts capability with zero pro
 	// MUST still advertise the prompts capability so clients call prompts/list and
 	// expect notifications/prompts/list_changed.
 	auto s = new McpServer("t", "1");
-	s.enablePromptListChanged();
+	s.enablePromptsListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.prompts.isNull);
 	assert(caps.prompts.get.listChanged);
@@ -3888,7 +3950,7 @@ unittest  // enablePromptListChanged advertises listChanged:true for prompts
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet"};
 	s.registerDynamicPrompt(pr, (Json) @safe { return GetPromptResult(); });
-	s.enablePromptListChanged();
+	s.enablePromptsListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.prompts.isNull);
 	assert(caps.prompts.get.listChanged);
@@ -3914,6 +3976,29 @@ unittest  // notifyPromptsListChanged is a no-op before a push channel exists
 {
 	auto s = new McpServer("t", "1");
 	assert(s.notifyPromptsListChanged() == 0);
+}
+
+unittest  // enablePromptsListChanged is the consistent name and advertises listChanged:true
+{
+	// The pluralised enablePromptsListChanged matches the `prompts` capability
+	// key and the other enable*ListChanged toggles. Per 2025-11-25 prompts
+	// §Capabilities it advertises prompts: { listChanged: true }.
+	auto s = new McpServer("t", "1");
+	s.enablePromptsListChanged();
+	auto caps = s.capabilities();
+	assert(!caps.prompts.isNull);
+	assert(caps.prompts.get.listChanged);
+	assert(caps.toJson()["prompts"]["listChanged"].get!bool);
+}
+
+unittest  // enableToolsListChanged is the consistent name and advertises listChanged:true
+{
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	auto caps = s.capabilities();
+	assert(!caps.tools.isNull);
+	assert(caps.tools.get.listChanged);
+	assert(caps.toJson()["tools"]["listChanged"].get!bool);
 }
 
 unittest  // draft: concurrent listen streams only receive the type each opted into

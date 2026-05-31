@@ -278,7 +278,7 @@ version (unittest)
 unittest  // draft subscriptions/listen over stdio sends the acknowledged notification, not a {acknowledged:true} result
 {
 	auto s = new McpServer("listen-srv", "1.0");
-	s.enableToolListChanged();
+	s.enableToolsListChanged();
 
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
@@ -307,7 +307,7 @@ unittest  // draft subscriptions/listen over stdio sends the acknowledged notifi
 unittest  // the stdio acknowledged notification is stamped with the listen id as the subscriptionId
 {
 	auto s = new McpServer("listen-srv", "1.0");
-	s.enableToolListChanged();
+	s.enableToolsListChanged();
 
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
@@ -327,7 +327,7 @@ unittest  // the stdio acknowledged notification is stamped with the listen id a
 unittest  // after a stdio subscriptions/listen, notify* change notifications flow on stdout, stamped with the subscriptionId
 {
 	auto s = new McpServer("listen-srv", "1.0");
-	s.enableToolListChanged();
+	s.enableToolsListChanged();
 
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
@@ -357,7 +357,7 @@ unittest  // after a stdio subscriptions/listen, notify* change notifications fl
 unittest  // a pre-draft (no protocolVersion) subscriptions/listen still takes the normal request/reply path over stdio
 {
 	auto s = new McpServer("listen-srv", "1.0");
-	s.enableToolListChanged();
+	s.enableToolsListChanged();
 
 	// No draft _meta: opensListenStream is false, so this is dispatched normally.
 	string[] inputs = [
