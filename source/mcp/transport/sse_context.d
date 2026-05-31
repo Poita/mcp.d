@@ -253,6 +253,24 @@ final class ServerPushChannel
 	private long[long] seqOf; /// listener id -> its monotonic event sequence
 	private long nextListenerId = 1;
 
+	/// Per-stream replay history for Last-Event-ID resumability
+	/// (basic/transports §Resumability and Redelivery): for each stream ordinal,
+	/// the already-framed SSE blocks emitted on it, paired with their event
+	/// sequence, kept so a reconnecting GET carrying `Last-Event-ID` can have the
+	/// messages emitted *after* that id replayed on the very stream that was
+	/// disconnected. Bounded per stream (oldest evicted first) so the buffer cannot
+	/// grow without limit. The spec rule is a MAY; this is opt-in via a non-empty
+	/// `resumeFrom` on `addListener`, so a normal GET (no `Last-Event-ID`) keeps the
+	/// existing fresh-ordinal behaviour and unchanged wire output.
+	private struct HistoryEntry
+	{
+		long seq;
+		string frame;
+	}
+
+	private HistoryEntry[][long] history; /// stream ordinal -> ring of recent events
+	private size_t maxHistoryPerStream = 256;
+
 	this(StreamCoordinator coord) @safe
 	{
 		this.coord = coord;
@@ -263,13 +281,47 @@ final class ServerPushChannel
 	/// mount/session. When `subscriptionId` is non-empty (a `subscriptions/listen`
 	/// stream), every notification delivered to this listener is stamped with it
 	/// in `params._meta["io.modelcontextprotocol/subscriptionId"]`.
-	long addListener(void delegate(string frame) @safe write,
-			string subscriptionId = "", SubscriptionFilter filter = SubscriptionFilter.init) @safe
+	///
+	/// `resumeFrom` carries the client's `Last-Event-ID` (basic/transports
+	/// §Resumability and Redelivery). When it parses to `<ordinal>-<seq>` for a
+	/// stream ordinal this channel still has buffered history for, the listener
+	/// resumes *that* stream rather than allocating a fresh ordinal: the events with
+	/// a higher sequence are replayed onto the new writer in order, and subsequent
+	/// events continue the same ordinal from where it left off. This is the
+	/// server-side half of resumability — the "server MAY use this header to replay
+	/// messages that would have been sent after the last event ID, on the stream
+	/// that was disconnected". An empty or unrecognized `resumeFrom` falls back to a
+	/// fresh ordinal (the prior behaviour), so a normal GET is unaffected. The
+	/// MUST NOT — "replay messages that would have been delivered on a different
+	/// stream" — is honoured because replay is keyed strictly on the id's ordinal.
+	long addListener(void delegate(string frame) @safe write, string subscriptionId = "",
+			SubscriptionFilter filter = SubscriptionFilter.init, string resumeFrom = "") @safe
 	{
 		const id = nextListenerId++;
 		listeners ~= Listener(id, write, subscriptionId, filter);
-		streamOf[id] = coord.allocStream();
-		seqOf[id] = 0;
+
+		long resumeOrdinal, resumeSeq;
+		if (parseEventId(resumeFrom, resumeOrdinal, resumeSeq) && resumeOrdinal in history)
+		{
+			// Resume the disconnected stream: keep its ordinal, replay every buffered
+			// event after the cursor in sequence order, and continue from the next seq.
+			streamOf[id] = resumeOrdinal;
+			long maxSeq = resumeSeq;
+			foreach (ref e; history[resumeOrdinal])
+			{
+				if (e.seq <= resumeSeq)
+					continue;
+				write(e.frame);
+				if (e.seq > maxSeq)
+					maxSeq = e.seq;
+			}
+			seqOf[id] = maxSeq + 1;
+		}
+		else
+		{
+			streamOf[id] = coord.allocStream();
+			seqOf[id] = 0;
+		}
 		return id;
 	}
 
@@ -344,11 +396,13 @@ final class ServerPushChannel
 		{
 			if (!eligible(l))
 				continue;
-			const eid = streamOf[l.id].to!string ~ "-" ~ seqOf[l.id].to!string;
+			const seq = seqOf[l.id];
+			const eid = streamOf[l.id].to!string ~ "-" ~ seq.to!string;
 			const frame = formatSseEvent(eid, withSubscriptionId(msg, l.subscriptionId));
 			try
 			{
 				l.write(frame);
+				recordHistory(streamOf[l.id], seq, frame);
 				seqOf[l.id]++;
 				delivered = 1;
 				break; // single-stream delivery: do not fan out to other streams
@@ -361,6 +415,24 @@ final class ServerPushChannel
 		foreach (id; dead)
 			removeListener(id);
 		return delivered;
+	}
+
+	/// Append an emitted frame to a stream's replay history (basic/transports
+	/// §Resumability and Redelivery), evicting the oldest entry once the per-stream
+	/// bound is reached so the buffer stays bounded. Only frames that were actually
+	/// written are recorded, so the cursor a client reports via `Last-Event-ID`
+	/// always lands inside (or just before) the retained window.
+	private void recordHistory(long ordinal, long seq, string frame) @safe
+	{
+		auto entries = ordinal in history;
+		if (entries is null)
+		{
+			history[ordinal] = [HistoryEntry(seq, frame)];
+			return;
+		}
+		*entries ~= HistoryEntry(seq, frame);
+		if (maxHistoryPerStream > 0 && entries.length > maxHistoryPerStream)
+			*entries = (*entries)[$ - maxHistoryPerStream .. $];
 	}
 
 	/// Convenience: broadcast a JSON-RPC notification to every listener.
@@ -421,11 +493,13 @@ final class ServerPushChannel
 		{
 			if (l.id != listenerId)
 				continue;
-			const eid = streamOf[l.id].to!string ~ "-" ~ seqOf[l.id].to!string;
+			const seq = seqOf[l.id];
+			const eid = streamOf[l.id].to!string ~ "-" ~ seq.to!string;
 			const frame = formatSseEvent(eid, withSubscriptionId(msg, l.subscriptionId));
 			try
 			{
 				l.write(frame);
+				recordHistory(streamOf[l.id], seq, frame);
 				seqOf[l.id]++;
 				return true;
 			}
@@ -464,6 +538,106 @@ unittest  // a listener receives framed events, with monotonic per-listener ids
 	assert(received[0] != received[1]);
 	ch.removeListener(id);
 	assert(ch.listenerCount == 0);
+}
+
+unittest  // a GET carrying Last-Event-ID replays events emitted after that cursor
+{
+	// basic/transports §Resumability and Redelivery: "The server MAY use this
+	// header to replay messages that would have been sent after the last event ID,
+	// on the stream that was disconnected, and to resume the stream from that
+	// point." Emit two events on a stream, capture the first event's id, drop the
+	// listener (simulating a broken connection), then reconnect with that id as
+	// Last-Event-ID: only the SECOND event must be replayed, framed with its
+	// original id, and a new event continues the SAME stream ordinal.
+	import std.string : indexOf, startsWith;
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+
+	string[] first;
+	const a = ch.addListener((string f) @safe { first ~= f; });
+	ch.notify("notifications/message", Json(["n": Json(1)]));
+	ch.notify("notifications/message", Json(["n": Json(2)]));
+	assert(first.length == 2);
+
+	// Extract the id of the FIRST event (the last one the client "received").
+	const idLine = first[0]["id: ".length .. first[0].indexOf("\n")];
+	ch.removeListener(a); // connection breaks
+
+	string[] resumed;
+	ch.addListener((string f) @safe { resumed ~= f; }, "", SubscriptionFilter.init, idLine);
+
+	// Exactly the second event is replayed, with its ORIGINAL id (same ordinal).
+	assert(resumed.length == 1);
+	assert(resumed[0].canFind("\"n\":2"));
+	assert(!resumed[0].canFind("\"n\":1"));
+	assert(resumed[0].startsWith("id: " ~ idLine[0 .. idLine.indexOf("-")] ~ "-"));
+
+	// A further event continues the resumed stream's ordinal, not a fresh one.
+	ch.notify("notifications/message", Json(["n": Json(3)]));
+	assert(resumed.length == 2);
+	assert(resumed[1].canFind("\"n\":3"));
+	assert(resumed[1].startsWith("id: " ~ idLine[0 .. idLine.indexOf("-")] ~ "-"));
+}
+
+unittest  // an unknown / empty Last-Event-ID falls back to a fresh stream ordinal
+{
+	// basic/transports §Resumability and Redelivery: replay is a MAY keyed on a
+	// known stream. A blank header (a normal GET) or an id whose ordinal this
+	// channel never issued must NOT replay anything — it opens a brand-new stream.
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+
+	string[] plain;
+	ch.addListener((string f) @safe { plain ~= f; }); // no Last-Event-ID
+	assert(plain.length == 0); // nothing replayed onto a fresh stream
+
+	string[] bogus;
+	ch.addListener((string f) @safe { bogus ~= f; }, "", SubscriptionFilter.init, "999-5");
+	assert(bogus.length == 0); // unknown ordinal -> no replay
+}
+
+unittest  // replay never crosses streams (MUST NOT replay a different stream)
+{
+	// basic/transports §Resumability and Redelivery: "The server MUST NOT replay
+	// messages that would have been delivered on a different stream." Two streams
+	// each get their own event; resuming stream A's cursor must replay only A's
+	// later events, never B's.
+	import std.string : indexOf;
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+
+	// Stream A receives event 1 (single-stream delivery picks the first listener).
+	string[] aFrames;
+	const a = ch.addListener((string f) @safe { aFrames ~= f; });
+	ch.notify("notifications/message", Json(["s": Json("A1")]));
+	ch.notify("notifications/message", Json(["s": Json("A2")]));
+	assert(aFrames.length == 2);
+	const aId0 = aFrames[0]["id: ".length .. aFrames[0].indexOf("\n")];
+	const aOrdinal = aId0[0 .. aId0.indexOf("-")];
+
+	// A second independent stream B (registered while A is still live) gets its own
+	// ordinal; force a delivery onto it by removing A first is avoided — instead use
+	// emitTo to target B directly so B's history is distinct from A's.
+	string[] bFrames;
+	const b = ch.addListener((string f) @safe { bFrames ~= f; });
+	ch.emitTo(b, makeNotification("notifications/message", Json([
+				"s": Json("B1")
+	])));
+	assert(bFrames.length == 1);
+
+	ch.removeListener(a);
+
+	// Resume A: only A2 replays; B1 must never appear.
+	string[] resumed;
+	ch.addListener((string f) @safe { resumed ~= f; }, "", SubscriptionFilter.init, aId0);
+	assert(resumed.length == 1);
+	assert(resumed[0].canFind("A2"));
+	assert(!resumed[0].canFind("B1"));
+	assert(!resumed[0].canFind("A1"));
 }
 
 unittest  // emit delivers to exactly ONE stream, never broadcasting to all
@@ -955,6 +1129,43 @@ string formatSseEvent(string id, Json msg) @safe
 {
 	auto block = id.length ? ("id: " ~ id ~ "\n") : "";
 	return block ~ "data: " ~ msg.toString() ~ "\n\n";
+}
+
+/// Parse an SSE event id of the form `<ordinal>-<seq>` (the per-stream cursor
+/// `ServerPushChannel` stamps on every event) back into its components. Returns
+/// true with `ordinal`/`seq` populated on success, false for any malformed input
+/// (empty, no dash, non-numeric, negative). Used to interpret a reconnecting
+/// client's `Last-Event-ID` so the server can replay events after that cursor on
+/// the stream it identifies (basic/transports §Resumability and Redelivery).
+bool parseEventId(string id, out long ordinal, out long seq) @safe pure nothrow
+{
+	import std.string : indexOf;
+	import std.conv : to;
+
+	const dash = id.indexOf('-');
+	if (dash <= 0 || dash + 1 >= id.length)
+		return false;
+	try
+	{
+		ordinal = id[0 .. dash].to!long;
+		seq = id[dash + 1 .. $].to!long;
+	}
+	catch (Exception)
+		return false;
+	return ordinal >= 0 && seq >= 0;
+}
+
+unittest  // parseEventId round-trips a well-formed cursor and rejects junk
+{
+	long o, q;
+	assert(parseEventId("3-7", o, q) && o == 3 && q == 7);
+	assert(parseEventId("0-0", o, q) && o == 0 && q == 0);
+	assert(!parseEventId("", o, q));
+	assert(!parseEventId("3", o, q));
+	assert(!parseEventId("-5", o, q));
+	assert(!parseEventId("3-", o, q));
+	assert(!parseEventId("x-1", o, q));
+	assert(!parseEventId("3-y", o, q));
 }
 
 /// Whether a POST-initiated SSE stream must lead with the priming event (an

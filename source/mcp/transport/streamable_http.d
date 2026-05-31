@@ -582,12 +582,19 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// draft-only rule, so it is not emitted here.
 	applySseStreamHeaders(res, false);
 
+	// Resumability and Redelivery (basic/transports §Resumability and Redelivery):
+	// if the reconnecting client supplied the `Last-Event-ID` header, hand it to
+	// the channel so it resumes the disconnected stream — replaying the events
+	// emitted after that id on the same stream ordinal — instead of opening a fresh
+	// one. The header is honoured only on the stable revisions that mount the GET
+	// stream (gated by getOpensSseStream above); the draft never reaches here.
+	const lastEventId = req.headers.get("Last-Event-ID", "");
 	const listenerId = push.addListener((string frame) @safe {
 		() @trusted {
 			res.bodyWriter.write(cast(const(ubyte)[]) frame);
 			res.bodyWriter.flush();
 		}();
-	});
+	}, "", SubscriptionFilter.init, lastEventId);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
