@@ -1023,7 +1023,15 @@ final class McpServer
 		// `notifications/message` for a request that did not carry
 		// `_meta["io.modelcontextprotocol/logLevel"]`, and a request whose level is
 		// unrecognised SHOULD be rejected with -32602.
-		bool loggingRequested = true;
+		// server/utilities/logging: a server that never declared the `logging`
+		// capability (enableLogging() not called -> capabilities().logging false)
+		// MUST NOT emit notifications/message. Seed loggingRequested from
+		// loggingEnabled so the per-request scope drops every log on such a server,
+		// on BOTH the stateful protocols and the draft (where the per-request
+		// io.modelcontextprotocol/logLevel must not re-enable emission). When
+		// logging IS enabled this is the previous default (true), so the wire
+		// output for compliant servers is unchanged. (#396)
+		bool loggingRequested = loggingEnabled;
 		string requestLogLevel = logLevel;
 		if (meta.protocolVersion.length)
 		{
@@ -3237,6 +3245,57 @@ unittest  // a draft request's logLevel does not leak into a later request
 	call2["name"] = "noisy";
 	s.handle(draftReq(2, "tools/call", call2), ctx2);
 	assert(ctx2.emitted.length == 0);
+}
+
+version (unittest) private McpServer makeNoisyLogServerNoLogging() @safe
+{
+	// Same noisy tool as makeNoisyLogServer, but enableLogging() is NEVER called,
+	// so the server advertises no `logging` capability in initialize.
+	auto s = new McpServer("t", "1");
+	Tool t = {name: "noisy"};
+	s.registerDynamicTool(t, (Json args, RequestContext ctx) @safe {
+		ctx.log("debug", Json("d"));
+		ctx.log("warning", Json("w"));
+		ctx.log("error", Json("e"));
+		ctx.log("emergency", Json("x"));
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+	return s;
+}
+
+unittest  // stateful: no notifications/message when the logging capability was never declared (#396)
+{
+	// server/utilities/logging: "Servers that emit log message notifications MUST
+	// declare the `logging` capability." A server that never called enableLogging()
+	// advertises no logging capability, so the emission path MUST drop every log a
+	// handler tries to emit -- even though the client did not change the level.
+	auto s = makeNoisyLogServerNoLogging();
+	assert(!s.capabilities().logging);
+
+	auto ctx = new DraftLogCtx; // recording context (reused; records every log level)
+	Json callP = Json.emptyObject;
+	callP["name"] = "noisy";
+	s.handle(req(2, "tools/call", callP), ctx);
+
+	assert(ctx.emitted.length == 0);
+}
+
+unittest  // draft: no notifications/message when the logging capability was never declared (#396)
+{
+	// The same MUST applies on the draft. Even a draft request that carries
+	// `_meta["io.modelcontextprotocol/logLevel"]` MUST NOT trigger emission when
+	// the server never declared the (deprecated-but-required) logging capability.
+	auto s = makeNoisyLogServerNoLogging();
+	assert(!s.capabilities().logging);
+
+	auto ctx = new DraftLogCtx;
+	Json callP = Json.emptyObject;
+	callP["name"] = "noisy";
+	s.handle(draftReq(2, "tools/call", callP, "debug"), ctx);
+
+	assert(ctx.emitted.length == 0);
 }
 
 unittest  // capabilities reflect registered features
