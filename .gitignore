@@ -19,3 +19,6 @@ calculator
 /site/
 docs.json
 __dummy.html
+
+# code coverage output (dub test --coverage)
+*.lst
