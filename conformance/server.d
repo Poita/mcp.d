@@ -17,6 +17,7 @@ import std.typecons : nullable;
 import vibe.data.json : Json;
 
 import mcp;
+import mcp.transport : StreamableHttpOptions, runStreamableHttp;
 
 void main(string[] args)
 {

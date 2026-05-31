@@ -17,6 +17,7 @@ import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 import vibe.data.json : Json;
 
 import mcp;
+import mcp.auth;
 
 int main(string[] args)
 {
