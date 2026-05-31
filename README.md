@@ -1,5 +1,8 @@
 # dlang-mcp-sdk
 
+[![CI](https://github.com/Poita/mcp.d/actions/workflows/ci.yml/badge.svg)](https://github.com/Poita/mcp.d/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A production-grade [Model Context Protocol](https://modelcontextprotocol.io) (MCP) SDK for
 the D programming language — client and server, built on [vibe-d](https://vibed.org).
 
