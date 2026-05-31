@@ -2926,8 +2926,7 @@ unittest  // a subscriptions/listen stream delivers the acknowledgement + change
     string[] seen;
     c.onNotification = (string method, Json params) @safe { seen ~= method; };
 
-    c.dispatchInbound(Message(parseJsonString(
-            `{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"toolsListChanged":true}}`)));
+    c.dispatchInbound(Message(parseJsonString(`{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"1"},"notifications":{"toolsListChanged":true}}}`)));
     c.dispatchInbound(Message(parseJsonString(
             `{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`)));
 
