@@ -208,14 +208,19 @@ interface RequestContext
     /// client does not support elicitation.
     ///
     /// This is form-mode elicitation; per spec the `mode` field is omitted and
-    /// defaults to `"form"`. For URL-mode elicitation use `elicitUrl`.
+    /// defaults to `"form"`. For URL-mode elicitation use `elicitUrl`. Throws
+    /// when the client did not declare the `elicitation.form` submode (a bare
+    /// `elicitation:{}` is treated as form-only for 2025-06-18 compatibility).
     final Json elicit(string message, Json requestedSchema) @safe
     {
         if (isStateless)
             throw invalidRequest(
                     "elicit() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
-        if (!clientSupports("elicitation"))
-            throw invalidRequest("Client does not support elicitation");
+        // Per client/elicitation: servers MUST NOT send elicitation requests
+        // with modes the client does not support. A bare `elicitation:{}` is
+        // form-only, so a generic declaration already sets the form submode.
+        if (!clientSupports("elicitation.form"))
+            throw invalidRequest("Client does not support form-mode elicitation");
         Json params = Json.emptyObject;
         params["message"] = message;
         params["requestedSchema"] = requestedSchema;
@@ -227,7 +232,8 @@ interface RequestContext
     /// out-of-band interaction (e.g. an OAuth consent or a web form) at `url`;
     /// `elicitationId` correlates the request with the outcome the client reports
     /// back. Per spec a URL-mode request MUST specify `mode: "url"`, a `message`,
-    /// `url`, and `elicitationId`.
+    /// `url`, and `elicitationId`. Throws when the client did not declare the
+    /// `elicitation.url` submode.
     ///
     /// Returns the client's `{action}` response (typically `accept`/`decline`/
     /// `cancel`). Throws on a stateless (MRTR) request — use
@@ -238,8 +244,10 @@ interface RequestContext
         if (isStateless)
             throw invalidRequest(
                     "elicitUrl() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
-        if (!clientSupports("elicitation"))
-            throw invalidRequest("Client does not support elicitation");
+        // Per client/elicitation: servers MUST NOT send a url-mode request to a
+        // client that only declared form mode (e.g. a bare `elicitation:{}`).
+        if (!clientSupports("elicitation.url"))
+            throw invalidRequest("Client does not support url-mode elicitation");
         if (url.length == 0)
             throw invalidParams("URL-mode elicitation requires a non-empty url");
         if (elicitationId.length == 0)
@@ -510,6 +518,11 @@ version (unittest) private final class ElicitProbe : RequestContext
     string lastMethod;
     Json lastParams;
     bool supportsElicitation = true;
+    /// Per-mode submodes. When `supportsElicitation` is true these default to
+    /// true so a bare elicitation declaration behaves like form+url; tests set
+    /// them individually to model form-only / url-only clients.
+    bool supportsForm = true;
+    bool supportsUrl = true;
     bool stateless = false;
 
     bool isCancelled() @safe
@@ -536,7 +549,17 @@ version (unittest) private final class ElicitProbe : RequestContext
 
     bool clientSupports(string capability) @safe
     {
-        return capability == "elicitation" && supportsElicitation;
+        switch (capability)
+        {
+        case "elicitation":
+            return supportsElicitation;
+        case "elicitation.form":
+            return supportsElicitation && supportsForm;
+        case "elicitation.url":
+            return supportsElicitation && supportsUrl;
+        default:
+            return false;
+        }
     }
 
     bool isStateless() @safe
@@ -614,6 +637,52 @@ unittest  // elicitUrl() is rejected on a stateless (MRTR) request
     auto probe = new ElicitProbe;
     probe.stateless = true;
     assertThrown!McpException(probe.elicitUrl("msg", "https://example.com", "elic-1"));
+}
+
+unittest  // form-mode elicit() throws when the client supports url mode only
+{
+    import std.exception : assertThrown;
+    import mcp.protocol.errors : McpException;
+
+    // Per client/elicitation: "Servers MUST NOT send elicitation requests with
+    // modes that are not supported by the client." A url-only client
+    // (elicitation:{url:{}}) must not be sent a form-mode request.
+    auto probe = new ElicitProbe;
+    probe.supportsForm = false;
+    probe.supportsUrl = true;
+    assertThrown!McpException(probe.elicit("Pick one", Json.emptyObject));
+}
+
+unittest  // url-mode elicitUrl() throws when the client supports form mode only
+{
+    import std.exception : assertThrown;
+    import mcp.protocol.errors : McpException;
+
+    // A form-only client (elicitation:{} or {form:{}}) must not be sent a
+    // url-mode request.
+    auto probe = new ElicitProbe;
+    probe.supportsForm = true;
+    probe.supportsUrl = false;
+    assertThrown!McpException(probe.elicitUrl("msg", "https://example.com", "elic-1"));
+}
+
+unittest  // form-mode elicit() succeeds when the client supports form mode
+{
+    auto probe = new ElicitProbe;
+    probe.supportsForm = true;
+    probe.supportsUrl = false;
+    probe.elicit("Pick one", Json.emptyObject);
+    assert(probe.lastMethod == "elicitation/create");
+}
+
+unittest  // url-mode elicitUrl() succeeds when the client supports url mode
+{
+    auto probe = new ElicitProbe;
+    probe.supportsForm = false;
+    probe.supportsUrl = true;
+    auto r = probe.elicitUrl("msg", "https://example.com", "elic-1");
+    assert(probe.lastParams["mode"].get!string == "url");
+    assert(r["action"].get!string == "accept");
 }
 
 unittest  // listRoots() sends roots/list and parses the typed result
