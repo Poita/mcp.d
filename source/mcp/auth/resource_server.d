@@ -100,6 +100,20 @@ struct ResourceServerConfig
 		return validator !is null;
 	}
 
+	/// The scope hint to surface in a `WWW-Authenticate` challenge so clients know
+	/// which scopes to request (basic/authorization §Protected Resource Metadata
+	/// Discovery Requirements / §Scope Selection Strategy). Prefers the concrete
+	/// `requiredScope`; otherwise falls back to the space-joined `scopesSupported`.
+	/// Empty when the operator configured neither.
+	string scopeHint() const @safe
+	{
+		import std.array : join;
+
+		if (requiredScope.length)
+			return requiredScope;
+		return scopesSupported.join(" ");
+	}
+
 	/// The RFC 9728 metadata document this server publishes.
 	ProtectedResourceMetadata metadata() const @safe
 	{
@@ -189,10 +203,19 @@ string wwwAuthenticate(AuthFailure failure, string resourceMetadataUrl, string s
 	final switch (failure)
 	{
 	case AuthFailure.none:
+		break;
 	case AuthFailure.missingToken:
+		// First-contact 401: the spec (basic/authorization §Protected Resource
+		// Metadata Discovery Requirements) says servers SHOULD include a `scope`
+		// hint so the client knows what to request during authorization. RFC 6750
+		// §3 permits `scope` on the bare challenge.
+		if (scope_.length)
+			parts ~= `scope="` ~ scope_ ~ `"`;
 		break;
 	case AuthFailure.invalidToken:
 		parts ~= `error="invalid_token"`;
+		if (scope_.length)
+			parts ~= `scope="` ~ scope_ ~ `"`;
 		break;
 	case AuthFailure.insufficientScope:
 		parts ~= `error="insufficient_scope"`;
@@ -326,7 +349,7 @@ unittest  // a token lacking the required scope yields insufficientScope
 	assert(authorize(cfg, "Bearer good", info) == AuthFailure.insufficientScope);
 }
 
-unittest  // WWW-Authenticate for a missing token carries only resource_metadata
+unittest  // WWW-Authenticate for a missing token with no scope hint carries only resource_metadata
 {
 	const v = wwwAuthenticate(AuthFailure.missingToken,
 			"https://mcp.example.com/.well-known/oauth-protected-resource", "");
@@ -334,10 +357,30 @@ unittest  // WWW-Authenticate for a missing token carries only resource_metadata
 			== `Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"`);
 }
 
-unittest  // WWW-Authenticate for an invalid token carries error=invalid_token
+unittest  // WWW-Authenticate for a missing token (first-contact 401) carries the scope hint
+{
+	// basic/authorization §Protected Resource Metadata Discovery Requirements:
+	// servers SHOULD include a `scope` parameter in the WWW-Authenticate header on
+	// the first-contact 401 so clients know what to request. The spec example is a
+	// 401 carrying `Bearer resource_metadata="...", scope="files:read"`.
+	const v = wwwAuthenticate(AuthFailure.missingToken,
+			"https://mcp.example.com/.well-known/oauth-protected-resource", "files:read");
+	assert(v == `Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource", scope="files:read"`);
+}
+
+unittest  // WWW-Authenticate for an invalid token with no scope hint carries error only
 {
 	const v = wwwAuthenticate(AuthFailure.invalidToken, "https://x/meta", "");
 	assert(v == `Bearer resource_metadata="https://x/meta", error="invalid_token"`);
+}
+
+unittest  // WWW-Authenticate for an invalid token (401) carries error + scope hint
+{
+	// The 401 invalid_token challenge SHOULD also surface scope guidance so the
+	// client can request the right scopes during step-up authorization.
+	const v = wwwAuthenticate(AuthFailure.invalidToken, "https://x/meta", "mcp:write");
+	assert(
+			v == `Bearer resource_metadata="https://x/meta", error="invalid_token", scope="mcp:write"`);
 }
 
 unittest  // WWW-Authenticate for insufficient scope carries error + scope
@@ -345,6 +388,27 @@ unittest  // WWW-Authenticate for insufficient scope carries error + scope
 	const v = wwwAuthenticate(AuthFailure.insufficientScope, "https://x/meta", "mcp:write");
 	assert(v
 			== `Bearer resource_metadata="https://x/meta", error="insufficient_scope", scope="mcp:write"`);
+}
+
+unittest  // scopeHint prefers requiredScope when set
+{
+	ResourceServerConfig cfg;
+	cfg.requiredScope = "mcp:write";
+	cfg.scopesSupported = ["mcp:read", "mcp:write"];
+	assert(cfg.scopeHint() == "mcp:write");
+}
+
+unittest  // scopeHint falls back to space-joined scopesSupported
+{
+	ResourceServerConfig cfg;
+	cfg.scopesSupported = ["files:read", "files:write"];
+	assert(cfg.scopeHint() == "files:read files:write");
+}
+
+unittest  // scopeHint is empty when neither field is configured
+{
+	ResourceServerConfig cfg;
+	assert(cfg.scopeHint() == "");
 }
 
 unittest  // ResourceServerConfig.metadata mirrors the configured fields
