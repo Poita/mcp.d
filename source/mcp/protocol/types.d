@@ -3,7 +3,7 @@ module mcp.protocol.types;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json, parseJsonString;
 import mcp.protocol.capabilities;
-import mcp.protocol.draft : InputRequest;
+import mcp.protocol.draft : InputRequest, inputRequestsToJson, inputRequestsFromJson;
 
 @safe:
 
@@ -459,10 +459,10 @@ struct CallToolResult
         // not a `CallToolResult` with content — serialise it as such.
         if (inputRequests.length)
         {
-            Json reqs = Json.emptyArray;
-            foreach (req; inputRequests)
-                reqs ~= req.toJson();
-            j["inputRequests"] = reqs;
+            // SEP-2322: `inputRequests` is an `InputRequests` object (map keyed
+            // by the server-assigned id with `{ method, params }` values), not
+            // an array.
+            j["inputRequests"] = inputRequestsToJson(inputRequests);
             return j;
         }
         Json arr = Json.emptyArray;
@@ -494,12 +494,9 @@ struct CallToolResult
         if ("_meta" in j && j["_meta"].type == Json.Type.object)
             r.meta = j["_meta"];
         // MRTR: detect an `InputRequiredResult` (the server asks for more input).
-        if ("inputRequests" in j && j["inputRequests"].type == Json.Type.array)
-        {
-            auto arr = j["inputRequests"];
-            foreach (i; 0 .. arr.length)
-                r.inputRequests ~= InputRequest.fromJson(arr[i]);
-        }
+        // `inputRequests` is a map keyed by the server-assigned id.
+        if ("inputRequests" in j && j["inputRequests"].type == Json.Type.object)
+            r.inputRequests = inputRequestsFromJson(j["inputRequests"]);
         return r;
     }
 
@@ -928,12 +925,15 @@ unittest  // CallToolResult.withMeta is a fluent setter
 
 unittest  // CallToolResult.fromJson detects an MRTR InputRequiredResult
 {
-    Json req = Json.emptyObject;
-    req["id"] = "date";
-    req["type"] = "elicitation";
-    req["params"] = Json(["message": Json("When?")]);
+    // SEP-2322: a real draft server emits `inputRequests` as a map keyed by the
+    // server-assigned id, with `{ method, params }` request-object values.
+    Json reqObj = Json.emptyObject;
+    reqObj["method"] = "elicitation/create";
+    reqObj["params"] = Json(["message": Json("When?")]);
+    Json reqs = Json.emptyObject;
+    reqs["date"] = reqObj;
     Json j = Json.emptyObject;
-    j["inputRequests"] = Json([req]);
+    j["inputRequests"] = reqs;
 
     auto r = CallToolResult.fromJson(j);
     assert(r.isInputRequired());
@@ -941,6 +941,24 @@ unittest  // CallToolResult.fromJson detects an MRTR InputRequiredResult
     assert(r.inputRequests[0].id == "date");
     assert(r.inputRequests[0].type == "elicitation");
     assert(r.inputRequests[0].params["message"].get!string == "When?");
+}
+
+unittest  // CallToolResult.toJson serializes inputRequests as a map keyed by id
+{
+    CallToolResult r;
+    r.inputRequests = [
+        InputRequest("date", "elicitation", Json(["message": Json("When?")]))
+    ];
+    auto j = r.toJson();
+    assert(j["inputRequests"].type == Json.Type.object);
+    assert("date" in j["inputRequests"]);
+    assert(j["inputRequests"]["date"]["method"].get!string == "elicitation/create");
+    assert("content" !in j);
+    // Round-trips back to the same internal request.
+    auto back = CallToolResult.fromJson(j);
+    assert(back.isInputRequired());
+    assert(back.inputRequests[0].id == "date");
+    assert(back.inputRequests[0].type == "elicitation");
 }
 
 unittest  // a completed CallToolResult is not an InputRequiredResult

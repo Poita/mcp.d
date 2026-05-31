@@ -2497,8 +2497,10 @@ unittest  // ToolResponse.inputRequired serializes the input requests
     ]);
     assert(tr.needsInput);
     auto j = tr.toJson();
-    assert(j["inputRequests"][0]["id"].get!string == "q1");
-    assert(j["inputRequests"][0]["type"].get!string == "elicitation");
+    // SEP-2322 map shape: keyed by id, value is a `{ method, params }` object.
+    assert(j["inputRequests"].type == Json.Type.object);
+    assert("q1" in j["inputRequests"]);
+    assert(j["inputRequests"]["q1"]["method"].get!string == "elicitation/create");
 }
 
 version (unittest)
@@ -2617,8 +2619,10 @@ unittest  // draft (stateless) first round: handler returns an InputRequiredResu
     registerBookTool(s);
     auto resp = s.handle(draftCall(1, "book", [])).get;
     assert("error" !in resp);
-    assert(resp["result"]["inputRequests"][0]["type"].get!string == "elicitation");
-    assert(resp["result"]["inputRequests"][0]["id"].get!string == "date");
+    // The MRTR `inputRequests` payload is a map keyed by the server id.
+    assert(resp["result"]["inputRequests"].type == Json.Type.object);
+    assert("date" in resp["result"]["inputRequests"]);
+    assert(resp["result"]["inputRequests"]["date"]["method"].get!string == "elicitation/create");
 }
 
 unittest  // draft (stateless) retry with input responses: handler completes
