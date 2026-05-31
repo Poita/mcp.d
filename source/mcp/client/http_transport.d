@@ -10,7 +10,7 @@ import vibe.stream.operations : readAllUTF8, readLine;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
-import mcp.client.transport : ClientTransport;
+import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.subscription : SubscriptionStream;
 
 /// Internal signal that the modern single-endpoint POST returned an HTTP
@@ -35,8 +35,9 @@ final class LegacyFallbackException : Exception
 /// stream, session-id capture, the OAuth bearer token, and the legacy
 /// 2024-11-05 HTTP+SSE two-endpoint fallback (`legacyMode`). The owning
 /// `McpClient` supplies the protocol-derived request headers (version / draft
-/// method+name / `Mcp-Param-*`) via the `customHeaders` callback, so this
-/// transport never needs the tool inputSchema cache or draft state.
+/// method+name / `Mcp-Param-*`) and the cancelled-response predicate through the
+/// `ClientProtocol` it installs via `setProtocol`, so this transport never needs
+/// the tool inputSchema cache or draft state.
 final class HttpClientTransport : ClientTransport
 {
 	private string url;
@@ -66,17 +67,11 @@ final class HttpClientTransport : ClientTransport
 	/// Inbound dispatcher installed by `McpClient` (its `dispatchInbound`),
 	/// invoked for notifications and server->client requests on any stream.
 	private void delegate(Message) @safe inbound;
-	/// Protocol-derived headers for an outgoing message, supplied by the owning
-	/// `McpClient`. Called with the request/notification message to obtain the
-	/// version / draft method+name / `Mcp-Param-*` headers, or with
-	/// `Json.undefined` (no message, e.g. the GET stream) to obtain just the
-	/// version header. Never includes Accept / Content-Type / Authorization /
-	/// Mcp-Session-Id / Last-Event-ID — those are this transport's own.
-	private string[string]delegate(Json message) @safe customHeaders;
-	/// Whether a response with the given JSON-RPC id belongs to a request the
-	/// client has cancelled (basic/utilities/cancellation): such a response is
-	/// dropped rather than returned. Supplied by the owning `McpClient`.
-	private bool delegate(long id) @safe responseCancelled;
+	/// The owning client's `ClientProtocol`, installed via `setProtocol`. Supplies
+	/// the protocol-derived request headers (`headersFor`) and the
+	/// cancelled-response predicate (`isCancelled`), so this transport never needs
+	/// the tool inputSchema cache or draft state.
+	private ClientProtocol protocol;
 
 	this(string url) @safe
 	{
@@ -88,19 +83,13 @@ final class HttpClientTransport : ClientTransport
 		inbound = handler;
 	}
 
-	/// Install the callback that yields the protocol-derived request headers for
-	/// an outgoing message (see `customHeaders`). `McpClient` sets this so the
-	/// draft header/schema logic stays in the client.
-	void setCustomHeaders(string[string]delegate(Json message) @safe headers) @safe
+	/// Install the owning client's `ClientProtocol`, through which this transport
+	/// obtains the protocol-derived request headers and the cancelled-response
+	/// predicate, so the draft header/schema logic and the cancellation set stay in
+	/// the client.
+	void setProtocol(ClientProtocol p) @safe
 	{
-		customHeaders = headers;
-	}
-
-	/// Install the predicate that reports whether a response id has been
-	/// cancelled, so a late response for a cancelled request is dropped.
-	void setResponseCancelledPredicate(bool delegate(long id) @safe pred) @safe
-	{
-		responseCancelled = pred;
+		protocol = p;
 	}
 
 	void setBearerToken(string token) @safe
@@ -120,9 +109,9 @@ final class HttpClientTransport : ClientTransport
 		// owned subprocess to terminate. Nothing to release here.
 	}
 
-	private string[string] headersFor(Json message) @safe
+	private string[string] requestHeaders(Json message) @safe
 	{
-		return customHeaders is null ? null : customHeaders(message);
+		return protocol is null ? null : protocol.headersFor(message);
 	}
 
 	Json deliver(Json message, long expectId) @safe
@@ -263,7 +252,7 @@ final class HttpClientTransport : ClientTransport
 		const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
 
 		// Protocol-version header for the GET stream (set after initialize).
-		auto verHeaders = headersFor(Json.undefined);
+		auto verHeaders = requestHeaders(Json.undefined);
 
 		() @trusted {
 			try
@@ -408,7 +397,7 @@ final class HttpClientTransport : ClientTransport
 			req.headers["Authorization"] = "Bearer " ~ bearerToken;
 		if (sessionId.length)
 			req.headers["Mcp-Session-Id"] = sessionId;
-		foreach (k, v; headersFor(message))
+		foreach (k, v; requestHeaders(message))
 			req.headers[k] = v;
 		if (pendingLastEventId.length)
 			req.headers["Last-Event-ID"] = pendingLastEventId;
@@ -499,8 +488,8 @@ final class HttpClientTransport : ClientTransport
 		// A response for a request we have cancelled is ignored per spec, even if
 		// it matches the id we are awaiting.
 		if ((msg.kind == MessageKind.response || msg.kind == MessageKind.errorResponse)
-				&& msg.id.type == Json.Type.int_ && responseCancelled !is null
-				&& responseCancelled(msg.id.get!long))
+				&& msg.id.type == Json.Type.int_ && protocol !is null
+				&& protocol.isCancelled(msg.id.get!long))
 			return;
 
 		final switch (msg.kind)
@@ -578,7 +567,7 @@ final class HttpClientTransport : ClientTransport
 		const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
 
 		// Protocol-version header for the GET stream (set after initialize).
-		auto verHeaders = headersFor(Json.undefined);
+		auto verHeaders = requestHeaders(Json.undefined);
 
 		string lastEventId;
 		long retryMs = 0;
@@ -770,7 +759,7 @@ final class HttpClientTransport : ClientTransport
 		const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
 
 		// Protocol-derived headers (version + draft method) for this POST.
-		auto reqHeaders = headersFor(message);
+		auto reqHeaders = requestHeaders(message);
 
 		const 
 		body = message.toString();
@@ -892,7 +881,7 @@ final class HttpClientTransport : ClientTransport
 	/// background task to receive JSON-RPC responses and server notifications.
 	/// Throws if the `endpoint` event is not received. Called by
 	/// `McpClient.connect` once a modern POST has been rejected with 400/404/405.
-	void startLegacyHttpSse() @safe
+	void startLegacyFallback() @safe
 	{
 		import vibe.core.core : runTask, sleep;
 		import core.time : msecs;

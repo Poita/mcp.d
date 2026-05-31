@@ -12,7 +12,7 @@ import mcp.protocol.capabilities;
 import mcp.protocol.types;
 import mcp.protocol.sampling : validateSamplingMessages;
 import mcp.protocol.draft;
-import mcp.client.transport : ClientTransport;
+import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.http_transport : HttpClientTransport, LegacyFallbackException;
 import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
 import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
@@ -79,7 +79,7 @@ Json withProgressToken(Json params, ProgressToken token) @safe
 /// subscriptions) with auto-pagination. Server->client requests received on an
 /// inbound stream (sampling / elicitation / roots) are dispatched to the
 /// user-supplied handlers and answered via the transport.
-final class McpClient
+final class McpClient : ClientProtocol
 {
 	// The byte transport (HTTP/stdio). All JSON-RPC I/O routes through it.
 	private ClientTransport transport;
@@ -107,7 +107,7 @@ final class McpClient
 	// Tool inputSchemas seen via tools/list, keyed by tool name. Used by the
 	// draft client to mirror x-mcp-header-annotated tool-call arguments into
 	// Mcp-Param-{Name} headers (draft basic/transports, "Custom Headers from
-	// Tool Parameters"). Populated by listTools; consumed by `customHeadersFor`,
+	// Tool Parameters"). Populated by listTools; consumed by `headersFor`,
 	// which the HTTP transport calls to obtain the per-message headers.
 	private Json[string] toolInputSchemas_;
 
@@ -158,14 +158,12 @@ final class McpClient
 		this.transport = transport;
 		this.clientInfo = clientInfo;
 		transport.setInboundHandler(&dispatchInbound);
-		// The HTTP transport delegates the protocol-derived request headers and
-		// the cancelled-response check back to the client, so the draft-header /
-		// schema-cache logic and the cancellation set stay here.
-		if (auto http = cast(HttpClientTransport) transport)
-		{
-			http.setCustomHeaders(&customHeadersFor);
-			http.setResponseCancelledPredicate(&isResponseCancelled);
-		}
+		// Hand the transport this client as its `ClientProtocol`: it pulls the
+		// protocol-derived request headers (`headersFor`) and the cancelled-response
+		// predicate (`isCancelled`) through that single seam, so the draft-header /
+		// schema-cache logic and the cancellation set stay here and no transport has
+		// to be a concrete type the client downcasts to.
+		transport.setProtocol(this);
 	}
 
 	/// Build a client over the Streamable HTTP transport at `url`.
@@ -280,11 +278,10 @@ final class McpClient
 		catch (LegacyFallbackException)
 		{
 			// Modern POST rejected with 400/404/405: this is (or may be) an old
-			// HTTP+SSE server. Open the GET SSE stream, read its `endpoint`
-			// event, and drive the two-endpoint legacy transport. This fallback
-			// is an HTTP-transport concern.
-			if (auto http = cast(HttpClientTransport) transport)
-				http.startLegacyHttpSse();
+			// HTTP+SSE server. Ask the transport to open its backward-compatibility
+			// fallback (HTTP: the legacy two-endpoint GET-SSE transport; a no-op on
+			// transports without one), then run the legacy initialize handshake.
+			transport.startLegacyFallback();
 			initialize(ProtocolVersion.v2024_11_05.toWire);
 			return negotiated;
 		}
@@ -955,16 +952,16 @@ final class McpClient
 		notify("notifications/roots/list_changed", Json.emptyObject);
 	}
 
-	/// Compute the protocol-derived request headers for an outgoing `message`,
-	/// supplied to the HTTP transport via `setCustomHeaders`. For a draft client,
-	/// this is the `MCP-Protocol-Version` header plus the standard `Mcp-Method` /
-	/// `Mcp-Name` headers and any `Mcp-Param-*` mirrored tool arguments (draft
-	/// basic/transports). For a stable client it is just `MCP-Protocol-Version`
-	/// after initialize. Called with `Json.undefined` (no message — e.g. the GET
-	/// server stream) it returns only the version header. Keeps the draft-header
-	/// logic and the tool inputSchema cache in the client rather than the
-	/// transport.
-	private string[string] customHeadersFor(Json message) @safe
+	/// `ClientProtocol.headersFor`: compute the protocol-derived request headers
+	/// for an outgoing `message`, which the transport pulls through the
+	/// `ClientProtocol` seam. For a draft client this is the `MCP-Protocol-Version`
+	/// header plus the standard `Mcp-Method` / `Mcp-Name` headers and any
+	/// `Mcp-Param-*` mirrored tool arguments (draft basic/transports). For a stable
+	/// client it is just `MCP-Protocol-Version` after initialize. Called with
+	/// `Json.undefined` (no message — e.g. the GET server stream) it returns only
+	/// the version header. Keeps the draft-header logic and the tool inputSchema
+	/// cache in the client rather than the transport.
+	string[string] headersFor(Json message) @safe
 	{
 		string[string] headers;
 		if (useDraft)
@@ -1222,6 +1219,14 @@ final class McpClient
 	package bool isResponseCancelled(long id) const @safe nothrow
 	{
 		return (id in cancelledRequests_) !is null;
+	}
+
+	/// `ClientProtocol.isCancelled`: the transport consults this through the
+	/// `ClientProtocol` seam to drop a late response for a request the client has
+	/// cancelled (basic/utilities/cancellation).
+	bool isCancelled(long id) @safe
+	{
+		return isResponseCancelled(id);
 	}
 
 	/// Test seam: set the id `cancel()` treats as the (uncancellable) initialize
@@ -2324,4 +2329,123 @@ unittest  // a list result exposes .cache from the first page's freshness hint
 	assert(!res.cache.isNull);
 	assert(res.cache.get.ttlMs == 5000);
 	assert(res.cache.get.cacheScope == CacheScope.public_);
+}
+
+version (unittest)
+{
+	// A minimal, HTTP-free `ClientTransport` used to prove that `McpClient`
+	// drives an arbitrary transport through the `ClientProtocol` seam alone — it
+	// installs no HTTP-specific hooks (no `setCustomHeaders` /
+	// `setResponseCancelledPredicate` / `startLegacyHttpSse` downcast). The
+	// transport records the protocol collaborator the client hands it and pumps a
+	// canned response.
+	private final class RecordingClientTransport : ClientTransport
+	{
+		ClientProtocol protocol; // installed by McpClient via setProtocol
+		bool legacyFallbackCalled;
+		Json delegate(Json message, long expectId) @safe responder;
+
+		void setProtocol(ClientProtocol p) @safe
+		{
+			protocol = p;
+		}
+
+		void setInboundHandler(void delegate(Message) @safe handler) @safe
+		{
+		}
+
+		void setBearerToken(string token) @safe
+		{
+		}
+
+		void startServerStream() @safe
+		{
+		}
+
+		void startLegacyFallback() @safe
+		{
+			legacyFallbackCalled = true;
+		}
+
+		SubscriptionStream openListen(Json message) @safe
+		{
+			auto cancelled = () @trusted { return new shared bool(false); }();
+			return new SubscriptionStream(cancelled);
+		}
+
+		Json deliver(Json message, long expectId) @safe
+		{
+			return responder is null ? Json.emptyObject : responder(message, expectId);
+		}
+
+		void sendOneway(Json message) @safe
+		{
+		}
+
+		void close() @safe
+		{
+		}
+	}
+}
+
+unittest  // McpClient installs its ClientProtocol collaborator on an arbitrary transport
+{
+	// No HTTP downcast: the client must hand the transport a single collaborator
+	// at construction, through which the transport reads protocol-derived headers
+	// and the cancelled-response predicate.
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	assert(transport.protocol !is null);
+	// Default (non-draft, pre-initialize) headers are empty for an arbitrary
+	// outgoing message — the same logic the HTTP transport reads.
+	assert(transport.protocol.headersFor(Json.undefined).length == 0);
+}
+
+unittest  // a custom transport reads cancellation state through ClientProtocol
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	assert(!transport.protocol.isCancelled(7));
+	c.cancel(7);
+	assert(transport.protocol.isCancelled(7));
+}
+
+unittest  // a draft client's ClientProtocol yields the MCP-Protocol-Version header
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	c.enableDraft();
+	auto headers = transport.protocol.headersFor(Json.undefined);
+	assert(headers["MCP-Protocol-Version"] == ProtocolVersion.draft.toWire);
+}
+
+unittest  // connect() routes a legacy HTTP+SSE fallback through the transport seam, not a downcast
+{
+	// When discover() raises LegacyFallbackException, the client must initiate the
+	// fallback via ClientTransport.startLegacyFallback(), with no cast to
+	// HttpClientTransport. A custom transport observes the call and then answers
+	// the subsequent legacy initialize handshake.
+	import mcp.client.http_transport : LegacyFallbackException;
+
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	bool firstCall = true;
+	transport.responder = (Json message, long expectId) @safe {
+		if (firstCall)
+		{
+			firstCall = false;
+			throw new LegacyFallbackException(404);
+		}
+		// The legacy initialize handshake: echo a minimal initialize result.
+		Json r = Json.emptyObject;
+		r["protocolVersion"] = ProtocolVersion.v2024_11_05.toWire;
+		r["capabilities"] = Json.emptyObject;
+		Json info = Json.emptyObject;
+		info["name"] = "legacy-srv";
+		info["version"] = "1.0";
+		r["serverInfo"] = info;
+		return r;
+	};
+	c.connect();
+	assert(transport.legacyFallbackCalled);
 }

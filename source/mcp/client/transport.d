@@ -18,6 +18,30 @@ public import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 /// `deliver`, which sends the request and returns its correlated result (or
 /// throws `McpException` on an error response), dispatching anything else it sees
 /// in the meantime to the inbound handler.
+/// The protocol-side collaborator an `McpClient` hands to its transport at
+/// construction (`ClientTransport.setProtocol`). It lets the transport pull the
+/// protocol-derived request headers and consult the cancelled-request set
+/// without knowing anything about the client's draft state, tool inputSchema
+/// cache, or cancellation bookkeeping — and without the transport having to be a
+/// concrete `HttpClientTransport` the client downcasts to. `McpClient`
+/// implements this interface.
+interface ClientProtocol
+{
+	/// The protocol-derived headers for an outgoing `message`: the
+	/// `MCP-Protocol-Version` header plus, for a draft client, the standard
+	/// `Mcp-Method` / `Mcp-Name` headers and any `Mcp-Param-*` mirrored tool
+	/// arguments. Called with `Json.undefined` (no message — e.g. the GET server
+	/// stream) it returns only the version header. Never includes Accept /
+	/// Content-Type / Authorization / Mcp-Session-Id / Last-Event-ID — those are
+	/// the transport's own.
+	string[string] headersFor(Json message) @safe;
+
+	/// Whether a response with the given JSON-RPC `id` belongs to a request the
+	/// client has cancelled (basic/utilities/cancellation): such a response is
+	/// dropped rather than returned.
+	bool isCancelled(long id) @safe;
+}
+
 interface ClientTransport
 {
 	/// Send a JSON-RPC request `requestMessage` and return its result `Json`
@@ -42,6 +66,21 @@ interface ClientTransport
 	/// Install the client's inbound dispatcher (`McpClient.dispatchInbound`),
 	/// invoked for notifications and server->client requests on any stream.
 	void setInboundHandler(void delegate(Message) @safe handler) @safe;
+
+	/// Install the client's `ClientProtocol` collaborator, through which the
+	/// transport obtains the protocol-derived request headers (`headersFor`) and
+	/// the cancelled-response predicate (`isCancelled`). A transport that needs
+	/// neither (e.g. stdio) may keep it but ignore it. `McpClient` calls this once
+	/// at construction.
+	void setProtocol(ClientProtocol protocol) @safe;
+
+	/// Initiate the transport's backward-compatibility fallback after a modern
+	/// request was rejected in a way that signals an older server (HTTP: a
+	/// 400/404/405 POST -> open the legacy HTTP+SSE GET stream and switch to the
+	/// two-endpoint transport). A no-op on transports without a fallback path
+	/// (stdio), symmetric with `startServerStream`/`setBearerToken`. The client
+	/// follows this with the legacy `initialize` handshake.
+	void startLegacyFallback() @safe;
 
 	/// Attach an OAuth bearer access token (HTTP `Authorization: Bearer`); a
 	/// no-op on stdio. An empty string clears it.

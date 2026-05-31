@@ -6,7 +6,7 @@ import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
-import mcp.client.transport : ClientTransport;
+import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.subscription : SubscriptionStream;
 
 @safe:
@@ -22,9 +22,10 @@ import mcp.client.subscription : SubscriptionStream;
 /// This class is transport-pure: it is constructed with a `readLine`/`writeLine`
 /// pair (symmetric to `mcp.transport.stdio.serveStdio` on the server side) and
 /// carries the bytes for an owning `McpClient`. There is no standalone
-/// server->client stream and no bearer token over stdio, so `startServerStream`
-/// and `setBearerToken` are no-ops. `close()` terminates the subprocess when one
-/// was spawned (see `McpClient.spawn`).
+/// server->client stream, no bearer token, and no backward-compatibility
+/// fallback over stdio, so `startServerStream`, `setBearerToken`, and
+/// `startLegacyFallback` are no-ops. `close()` terminates the subprocess when
+/// one was spawned (see `McpClient.spawn`).
 final class StdioClientTransport : ClientTransport
 {
 	import std.process : ProcessPipes;
@@ -50,6 +51,19 @@ final class StdioClientTransport : ClientTransport
 	void setInboundHandler(void delegate(Message) @safe handler) @safe
 	{
 		inbound = handler;
+	}
+
+	/// The stdio transport needs neither protocol-derived headers nor the
+	/// cancelled-response predicate (it has no HTTP headers and correlates
+	/// responses by id on a single channel), so it ignores the installed
+	/// `ClientProtocol`.
+	void setProtocol(ClientProtocol protocol) @safe
+	{
+	}
+
+	/// No-op: there is no HTTP+SSE backward-compatibility fallback over stdio.
+	void startLegacyFallback() @safe
+	{
 	}
 
 	/// No-op: there is no OAuth bearer token over stdio.
