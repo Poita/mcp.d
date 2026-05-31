@@ -547,8 +547,13 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
 			handleListenStream(server, coord, msg, res);
 			return;
 		}
+		// The effective version for this POST decides whether a server-initiated
+		// SSE stream must lead with the 2025-11-25 priming event (event id + empty
+		// data field; basic/transports §Sending Messages item 6).
+		const effVersion = effectivePostVersion(req.headers.get(HttpHeader.protocolVersion,
+				""), server.negotiatedVersion);
 		auto ctx = new HttpStreamContext(res, coord, server.clientCapabilities,
-				extractProgressToken(msg.params), token, isDraftReq);
+				extractProgressToken(msg.params), token, isDraftReq, effVersion);
 		auto resp = server.handle(msg, ctx);
 		if (ctx.streaming)
 			ctx.finishWith(resp.get);

@@ -11,6 +11,7 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.capabilities;
 import mcp.protocol.draft : withSubscriptionId;
+import mcp.protocol.versions : ProtocolVersion, latestStable;
 import mcp.server.context;
 import mcp.auth.resource_server : TokenInfo;
 
@@ -511,9 +512,17 @@ final class HttpStreamContext : RequestContext
 	// header (draft basic/transports §Receiving Messages SHOULD). Defaults to
 	// false so 2025-03-26 / 2025-06-18 / 2025-11-25 wire output is unchanged.
 	private bool isDraft_;
+	// The effective protocol version negotiated for this request. Drives the
+	// 2025-11-25-only priming event (see `beginStream`). Defaults to the latest
+	// stable version.
+	private ProtocolVersion version_;
+	// Set once the leading priming event has been written, so it is emitted at
+	// most once per stream.
+	private bool primed_;
 
-	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps,
-			Json progressToken, TokenInfo auth = TokenInfo.invalid(), bool isDraft = false) @safe
+	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
+			TokenInfo auth = TokenInfo.invalid(),
+			bool isDraft = false, ProtocolVersion negotiated = latestStable) @safe
 	{
 		this.res = res;
 		this.coord = coord;
@@ -522,6 +531,7 @@ final class HttpStreamContext : RequestContext
 		this.streamId = coord.allocStream();
 		this.authInfo = auth;
 		this.isDraft_ = isDraft;
+		this.version_ = negotiated;
 	}
 
 	/// The globally-unique id this stream will assign to its next SSE event.
@@ -558,6 +568,33 @@ final class HttpStreamContext : RequestContext
 		// on the draft (basic/transports §Receiving Messages SHOULD).
 		applySseStreamHeaders(res, isDraft_);
 		streaming_ = true;
+		// 2025-11-25 basic/transports §Sending Messages item 6: "If the server
+		// initiates an SSE stream: the server SHOULD immediately send an SSE event
+		// consisting of an event ID and an empty data field in order to prime the
+		// client to reconnect (using that event ID as Last-Event-ID)." This SHOULD
+		// is unique to 2025-11-25 — 2025-03-26 / 2025-06-18 never defined it and the
+		// draft drops Last-Event-ID resumability entirely — so the priming event is
+		// emitted ONLY when the effective version is exactly 2025-11-25, leaving
+		// every other version's wire output unchanged.
+		writePrimingEventIfNeeded();
+	}
+
+	/// Emit the leading priming event (an event id + empty `data` field) on a
+	/// freshly-opened POST-initiated SSE stream when, and only when, the negotiated
+	/// version is 2025-11-25 (basic/transports §Sending Messages item 6). Consumes
+	/// the next event id so subsequent frames advance from it, exactly as the SSE
+	/// `Last-Event-ID` cursor requires. Emitted at most once per stream.
+	private void writePrimingEventIfNeeded() @safe
+	{
+		if (primed_ || !sendsPrimingEvent(version_))
+			return;
+		primed_ = true;
+		const frame = formatPrimingEvent(nextEventId());
+		eventSeq++;
+		() @trusted {
+			res.bodyWriter.write(cast(const(ubyte)[]) frame);
+			res.bodyWriter.flush();
+		}();
 	}
 
 	private void writeEvent(Json msg) @safe
@@ -666,6 +703,51 @@ string formatSseEvent(string id, Json msg) @safe
 {
 	auto block = id.length ? ("id: " ~ id ~ "\n") : "";
 	return block ~ "data: " ~ msg.toString() ~ "\n\n";
+}
+
+/// Whether a POST-initiated SSE stream must lead with the priming event (an
+/// event id + empty `data` field) for the given negotiated version. This is a
+/// 2025-11-25-only SHOULD (basic/transports §Sending Messages item 6): it did
+/// not exist in 2025-03-26 / 2025-06-18, and the draft removed Last-Event-ID
+/// resumability altogether, so the priming event must NOT alter those versions'
+/// wire output. Gated here as a single pure predicate so the version boundary is
+/// directly testable.
+bool sendsPrimingEvent(ProtocolVersion v) @safe pure nothrow
+{
+	return v == ProtocolVersion.v2025_11_25;
+}
+
+unittest  // the priming event is sent ONLY on 2025-11-25
+{
+	assert(sendsPrimingEvent(ProtocolVersion.v2025_11_25));
+	assert(!sendsPrimingEvent(ProtocolVersion.v2025_06_18));
+	assert(!sendsPrimingEvent(ProtocolVersion.v2025_03_26));
+	assert(!sendsPrimingEvent(ProtocolVersion.v2024_11_05));
+	// The draft drops Last-Event-ID resumability, so no priming event there.
+	assert(!sendsPrimingEvent(ProtocolVersion.draft));
+}
+
+/// Frame the 2025-11-25 leading "priming" SSE event: an `id:` line carrying the
+/// stream's next event id followed by an empty `data:` field (basic/transports
+/// §Sending Messages item 6 — "an SSE event consisting of an event ID and an
+/// empty data field in order to prime the client to reconnect"). The empty data
+/// line is required so it parses as a real SSE event (and thus updates the
+/// client's last event id), while carrying no JSON-RPC payload.
+string formatPrimingEvent(string id) @safe
+{
+	return "id: " ~ id ~ "\ndata: \n\n";
+}
+
+unittest  // the priming event is an id: line plus an empty data: field
+{
+	import std.string : splitLines;
+
+	const frame = formatPrimingEvent("0-0");
+	// Exactly: an event id, an empty data field, terminated by a blank line.
+	assert(frame == "id: 0-0\ndata: \n\n");
+	auto lines = frame.splitLines();
+	assert(lines[0] == "id: 0-0");
+	assert(lines[1] == "data: "); // empty data field, no JSON payload
 }
 
 unittest  // formatSseEvent emits an id: line followed by the data: line
