@@ -3599,6 +3599,34 @@ unittest  // enableTasks advertises the `tasks` capability at initialize
 	assert("tools/call" !in t["requests"]);
 }
 
+unittest  // enableTasks: draft initialize folds tasks into extensions, no top-level (#384)
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "draft";
+	auto resp = s.handle(req(1, "initialize", params)).get;
+	auto caps = resp["result"]["capabilities"];
+	// draft schema defines no top-level `tasks` capability.
+	assert("tasks" !in caps, "tasks leaked as a top-level capability under draft");
+	// Task support is carried via the extensions negotiation map.
+	assert("extensions" in caps);
+	assert("io.modelcontextprotocol/tasks" in caps["extensions"]);
+	auto folded = caps["extensions"]["io.modelcontextprotocol/tasks"];
+	assert(folded["requests"]["tools"]["call"].type == Json.Type.object);
+}
+
+unittest  // enableTasks: draft server/discover folds tasks into extensions (#384)
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+	auto resp = s.handle(draftReq(1, "server/discover")).get;
+	auto caps = resp["result"]["capabilities"];
+	assert("tasks" !in caps);
+	assert("io.modelcontextprotocol/tasks" in caps["extensions"]);
+}
+
 unittest  // server reads the `tasks` capability a client advertises at initialize
 {
 	auto s = new McpServer("t", "1");
