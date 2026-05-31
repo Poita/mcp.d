@@ -1736,9 +1736,17 @@ final class McpServer
 /// Match a concrete `uri` against an RFC 6570-style template containing
 /// `{var}` placeholders (each capturing a non-empty run up to the next literal).
 /// On success, fills `params` with the captured values and returns true.
+///
+/// Captured values are percent-decoded per RFC 3986 (RFC 6570 expansion
+/// percent-encodes reserved characters during URI construction, so the reverse
+/// is required to recover the original variable value); a URI carrying a
+/// malformed percent escape does not match. A single leading RFC 6570 operator
+/// (`+`, `#`, `.`, `/`, `;`, `?`, `&`) on a placeholder is recognised and
+/// stripped, so `{+path}` binds the variable `path`.
 bool matchUriTemplate(string tmpl, string uri, out string[string] params) @safe
 {
 	import std.string : indexOf;
+	import std.uri : decodeComponent, URIException;
 
 	size_t ti = 0, ui = 0;
 	while (ti < tmpl.length)
@@ -1748,7 +1756,11 @@ bool matchUriTemplate(string tmpl, string uri, out string[string] params) @safe
 			const close = tmpl[ti .. $].indexOf('}');
 			if (close < 0)
 				return false;
-			const varName = tmpl[ti + 1 .. ti + close];
+			auto varName = tmpl[ti + 1 .. ti + close];
+			// RFC 6570 operator prefix (e.g. {+path}, {#frag}, {?query}); the
+			// operator only affects expansion semantics, not the variable name.
+			if (varName.length && indexOf("+#./;?&", varName[0]) >= 0)
+				varName = varName[1 .. $];
 			ti += close + 1;
 
 			const litStart = ti;
@@ -1772,7 +1784,14 @@ bool matchUriTemplate(string tmpl, string uri, out string[string] params) @safe
 			}
 			if (captured.length == 0)
 				return false;
-			params[varName] = captured;
+			// Reverse RFC 6570/3986 percent-encoding to recover the original
+			// variable value; a malformed escape means the URI does not match.
+			string decoded;
+			try
+				decoded = decodeComponent(captured);
+			catch (URIException)
+				return false;
+			params[varName] = decoded;
 		}
 		else
 		{
@@ -1807,6 +1826,38 @@ unittest  // template matching captures a trailing parameter
 	string[string] params;
 	assert(matchUriTemplate("file:///{path}", "file:///a/b/c", params));
 	assert(params["path"] == "a/b/c");
+}
+
+unittest  // captured variables are RFC 6570/3986 percent-decoded (issue #338)
+{
+	// RFC 6570 simple-string expansion percent-encodes reserved characters
+	// during URI construction; the matcher must reverse that so the reader
+	// delegate receives the original value, not the still-encoded form.
+	string[string] params;
+	assert(matchUriTemplate("file:///{path}", "file:///a%20b%2Fc", params));
+	assert(params["path"] == "a b/c");
+}
+
+unittest  // a delimited captured variable is percent-decoded (issue #338)
+{
+	string[string] params;
+	assert(matchUriTemplate("test://template/{id}/data", "test://template/a%2Bb/data", params));
+	assert(params["id"] == "a+b");
+}
+
+unittest  // the RFC 6570 reserved-expansion operator {+var} is supported (issue #338)
+{
+	// `{+path}` is the operator commonly used for path-bearing templates;
+	// the leading `+` selects the variable name `path`, not `+path`.
+	string[string] params;
+	assert(matchUriTemplate("file:///{+path}", "file:///a/b/c", params));
+	assert(params["path"] == "a/b/c");
+}
+
+unittest  // a malformed percent escape in the URI does not match (issue #338)
+{
+	string[string] params;
+	assert(!matchUriTemplate("file:///{path}", "file:///a%2", params));
 }
 
 version (unittest)
