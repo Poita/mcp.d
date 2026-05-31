@@ -1605,8 +1605,12 @@ final class McpServer
 		pageBounds(params, names.length, begin, end, next);
 
 		ListToolsResult result;
-		foreach (name; names[begin .. end])
-			result.tools ~= tools[name].descriptor;
+		foreach (name; names[begin .. end]) // Project each tool to the negotiated protocol version so version-
+			// gated fields are not emitted to peers that don't understand them.
+			// `Tool.execution` (ToolExecution.taskSupport) is a 2025-11-25-only
+			// field (absent pre-2025-11-25, dropped from draft); forVersion emits
+			// it only when `ver` is exactly 2025-11-25.
+			result.tools ~= tools[name].descriptor.forVersion(ver);
 		result.nextCursor = next;
 		return maybeCache(result, listHint("tools/list"), ver);
 	}
@@ -2066,6 +2070,68 @@ unittest  // tools/list emits a tool descriptor's _meta
 
 	auto resp = s.handle(req(1, "tools/list")).get;
 	assert(resp["result"]["tools"][0]["_meta"]["x.example/group"].get!string == "demo");
+}
+
+unittest  // tools/list gates Tool.execution to a 2025-11-25-negotiated client (#337)
+{
+	auto s = new McpServer("exec-srv", "0.1.0");
+	Tool t = {name: "longjob"};
+	t.execution = ToolExecution(nullable("optional"));
+	s.registerDynamicTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2025-11-25";
+	s.handle(req(1, "initialize", initP)).get;
+
+	auto resp = s.handle(req(2, "tools/list")).get;
+	auto tool = resp["result"]["tools"][0];
+	assert("execution" in tool, "execution must be emitted to a 2025-11-25 client");
+	assert(tool["execution"]["taskSupport"].get!string == "optional");
+}
+
+unittest  // tools/list omits Tool.execution for a draft-negotiated client (#337)
+{
+	auto s = new McpServer("exec-srv", "0.1.0");
+	Tool t = {name: "longjob"};
+	t.execution = ToolExecution(nullable("optional"));
+	s.registerDynamicTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "draft";
+	s.handle(req(1, "initialize", initP)).get;
+
+	auto resp = s.handle(req(2, "tools/list")).get;
+	auto tool = resp["result"]["tools"][0];
+	assert("execution" !in tool,
+			"execution must NOT be emitted to a draft client (dropped from draft schema)");
+}
+
+unittest  // tools/list omits Tool.execution for a 2025-06-18-negotiated client (#337)
+{
+	auto s = new McpServer("exec-srv", "0.1.0");
+	Tool t = {name: "longjob"};
+	t.execution = ToolExecution(nullable("required"));
+	s.registerDynamicTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2025-06-18";
+	s.handle(req(1, "initialize", initP)).get;
+
+	auto resp = s.handle(req(2, "tools/list")).get;
+	auto tool = resp["result"]["tools"][0];
+	assert("execution" !in tool, "execution did not exist before 2025-11-25");
 }
 
 unittest  // tools/call propagates a handler's result-level _meta to the wire

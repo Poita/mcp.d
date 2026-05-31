@@ -3,6 +3,7 @@ module mcp.protocol.types;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json, parseJsonString;
 import mcp.protocol.capabilities;
+import mcp.protocol.versions : ProtocolVersion;
 import mcp.protocol.draft : InputRequest, inputRequestsToJson,
 	inputRequestsFromJson, CacheHint, parseCacheHint, withCache;
 
@@ -782,6 +783,41 @@ struct Tool
 			t.meta = j["_meta"];
 		return t;
 	}
+
+	/// Return a copy of this `Tool` with any fields newer than (or absent from)
+	/// the negotiated protocol version stripped, so the wire output stays valid
+	/// for the peer's version. `Tool.execution` (`ToolExecution.taskSupport`)
+	/// exists ONLY in the 2025-11-25 schema: it was never present before
+	/// 2025-11-25 and was dropped again in the draft schema. It is therefore
+	/// emitted only when the negotiated version is exactly 2025-11-25, and
+	/// omitted for every other version (including `draft`). Mirrors
+	/// `Implementation.forVersion`.
+	Tool forVersion(ProtocolVersion v) const @safe
+	{
+		Tool projected;
+		projected.name = name;
+		projected.title = title;
+		projected.description = description;
+		projected.inputSchema = inputSchema;
+		projected.outputSchema = outputSchema;
+		projected.annotations = annotations;
+		foreach (icon; icons)
+		{
+			Icon copy;
+			copy.src = icon.src;
+			copy.mimeType = icon.mimeType;
+			copy.sizes = icon.sizes.dup;
+			copy.theme = icon.theme;
+			projected.icons ~= copy;
+		}
+		projected.meta = meta;
+		// `Tool.execution` is a 2025-11-25-only field: emit it solely when the
+		// negotiated version is exactly 2025-11-25 (absent pre-2025-11-25,
+		// dropped from draft).
+		if (v == ProtocolVersion.v2025_11_25)
+			projected.execution = execution;
+		return projected;
+	}
 }
 
 /// An empty JSON Schema object: `{"type":"object"}`.
@@ -1416,6 +1452,58 @@ unittest  // ToolExecution serializes only when taskSupport present
 	assert("taskSupport" !in e.toJson());
 	e.taskSupport = "forbidden";
 	assert(e.toJson()["taskSupport"].get!string == "forbidden");
+}
+
+unittest  // Tool.forVersion keeps execution on 2025-11-25 (the only version with it)
+{
+	Tool t = {name: "longjob"};
+	t.execution = ToolExecution(nullable("optional"));
+	auto j = t.forVersion(ProtocolVersion.v2025_11_25).toJson();
+	assert("execution" in j);
+	assert(j["execution"]["taskSupport"].get!string == "optional");
+}
+
+unittest  // Tool.forVersion strips execution on draft (field was dropped from draft schema)
+{
+	Tool t = {name: "longjob"};
+	t.execution = ToolExecution(nullable("optional"));
+	auto j = t.forVersion(ProtocolVersion.draft).toJson();
+	assert("execution" !in j);
+}
+
+unittest  // Tool.forVersion strips execution on 2025-06-18 (field never existed pre-2025-11-25)
+{
+	Tool t = {name: "longjob"};
+	t.execution = ToolExecution(nullable("required"));
+	auto j = t.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("execution" !in j);
+}
+
+unittest  // Tool.forVersion strips execution on 2024-11-05
+{
+	Tool t = {name: "longjob"};
+	t.execution = ToolExecution(nullable("required"));
+	auto j = t.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("execution" !in j);
+}
+
+unittest  // Tool.forVersion leaves the original Tool unmodified (returns a projected copy)
+{
+	Tool t = {name: "longjob"};
+	t.execution = ToolExecution(nullable("optional"));
+	cast(void) t.forVersion(ProtocolVersion.draft);
+	assert(!t.execution.isNull);
+	assert(t.execution.get.taskSupport.get == "optional");
+}
+
+unittest  // Tool.forVersion preserves non-version-gated fields (name/description) intact
+{
+	Tool t = {name: "longjob", description: nullable("does a long job")};
+	t.execution = ToolExecution(nullable("optional"));
+	auto pj = t.forVersion(ProtocolVersion.v2025_06_18);
+	assert(pj.name == "longjob");
+	assert(pj.description.get == "does a long job");
+	assert(pj.execution.isNull);
 }
 
 unittest  // CallToolResult serializes content array and isError
