@@ -474,6 +474,42 @@ struct ToolAnnotations
     }
 }
 
+/// Per-tool task-augmented execution descriptor (`Tool.execution`), introduced
+/// in MCP 2025-11-25. Lets a tool declare whether it supports the `tasks`
+/// augmentation when invoked via `tools/call`.
+///
+/// `taskSupport` is one of `"forbidden"` (default when absent — the tool does
+/// not support task-augmented execution), `"optional"` (the client may request
+/// it), or `"required"` (the tool must be invoked as a task). The field is
+/// omitted from the serialized form when unset, which the spec treats as
+/// `"forbidden"`.
+struct ToolExecution
+{
+    Nullable!string taskSupport; /// "forbidden" (default) | "optional" | "required"
+
+    Json toJson() const @safe
+    {
+        Json j = Json.emptyObject;
+        if (!taskSupport.isNull)
+            j["taskSupport"] = taskSupport.get;
+        return j;
+    }
+
+    static ToolExecution fromJson(Json j) @safe
+    {
+        ToolExecution e;
+        if ("taskSupport" in j && j["taskSupport"].type == Json.Type.string)
+            e.taskSupport = j["taskSupport"].get!string;
+        return e;
+    }
+
+    /// True when no field is set (serializes to an empty object).
+    bool empty() const @safe
+    {
+        return taskSupport.isNull;
+    }
+}
+
 /// A tool the server exposes for the model to call.
 struct Tool
 {
@@ -482,6 +518,7 @@ struct Tool
     Nullable!string description;
     Json inputSchema = Json.undefined; /// JSON Schema (object); defaults to empty object schema
     Json outputSchema = Json.undefined; /// optional JSON Schema for structured results
+    Nullable!ToolExecution execution; /// optional per-tool task-augmented execution descriptor (2025-11-25)
     Json annotations = Json.undefined; /// optional ToolAnnotations
     Icon[] icons; /// optional icons for display in user interfaces
     Json meta; /// optional descriptor-level `_meta` object
@@ -497,6 +534,8 @@ struct Tool
         j["inputSchema"] = (inputSchema.type == Json.Type.object) ? inputSchema : emptyObjectSchema();
         if (outputSchema.type == Json.Type.object)
             j["outputSchema"] = outputSchema;
+        if (!execution.isNull && !execution.get.empty)
+            j["execution"] = execution.get.toJson();
         if (annotations.type == Json.Type.object)
             j["annotations"] = annotations;
         if (icons.length)
@@ -523,6 +562,8 @@ struct Tool
             t.inputSchema = j["inputSchema"];
         if ("outputSchema" in j)
             t.outputSchema = j["outputSchema"];
+        if ("execution" in j && j["execution"].type == Json.Type.object)
+            t.execution = ToolExecution.fromJson(j["execution"]);
         if ("annotations" in j)
             t.annotations = j["annotations"];
         if ("icons" in j && j["icons"].type == Json.Type.array)
@@ -1022,6 +1063,46 @@ unittest  // Tool icons round-trip through fromJson, including optional fields
     assert(back.icons[1].src == "https://example.com/b.png");
     assert(back.icons[1].mimeType.get == "image/png");
     assert(back.icons[1].sizes == ["16x16", "32x32"]);
+}
+
+unittest  // Tool emits execution.taskSupport when set (2025-11-25 ToolExecution)
+{
+    Tool t = {name: "longjob"};
+    t.execution = ToolExecution(nullable("optional"));
+    auto j = t.toJson();
+    assert(j["execution"].type == Json.Type.object);
+    assert(j["execution"]["taskSupport"].get!string == "optional");
+}
+
+unittest  // Tool omits execution when taskSupport unset (forbidden default)
+{
+    Tool t = {name: "plain"};
+    auto j = t.toJson();
+    assert("execution" !in j);
+}
+
+unittest  // Tool execution round-trips taskSupport through fromJson
+{
+    Tool t = {name: "task", execution: ToolExecution(nullable("required"))};
+    auto back = Tool.fromJson(t.toJson());
+    assert(!back.execution.isNull);
+    assert(back.execution.get.taskSupport.get == "required");
+}
+
+unittest  // Tool.fromJson leaves execution null when absent
+{
+    Json j = Json.emptyObject;
+    j["name"] = "noexec";
+    auto t = Tool.fromJson(j);
+    assert(t.execution.isNull);
+}
+
+unittest  // ToolExecution serializes only when taskSupport present
+{
+    ToolExecution e;
+    assert("taskSupport" !in e.toJson());
+    e.taskSupport = "forbidden";
+    assert(e.toJson()["taskSupport"].get!string == "forbidden");
 }
 
 unittest  // CallToolResult serializes content array and isError
