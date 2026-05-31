@@ -666,6 +666,16 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		auto ctx = new HttpStreamContext(res, coord, server.clientCapabilities,
 				extractProgressToken(msg.params), token, isDraftReq, effVersion);
 		auto resp = server.handle(msg, ctx);
+		// Draft basic/utilities/cancellation §Transport-Specific Cancellation: on
+		// Streamable HTTP "Closing the SSE response stream is the cancellation
+		// signal. The server MUST treat a client disconnect as cancellation of that
+		// request. No notifications/cancelled message is required or expected." If the
+		// client dropped the connection while the handler ran, honour it as a
+		// cancellation: emit no response, exactly as `notifications/cancelled` would
+		// suppress it. Released versions (2025-*) keep their behaviour: a dropped
+		// connection still completes the write, which is a harmless no-op there.
+		if (suppressOnDisconnect(isDraftReq, res.connected))
+			return;
 		if (ctx.streaming)
 			ctx.finishWith(resp.get);
 		else
@@ -755,6 +765,36 @@ int httpStatusForResponse(Json resp, bool isDraft) @safe
 	if (isDraft && code == ErrorCode.methodNotFound)
 		return 404;
 	return 200;
+}
+
+/// Decide whether a finished POST response must be suppressed because the client
+/// disconnected mid-request. On the draft Streamable HTTP transport a client
+/// disconnect IS the cancellation signal (draft basic/utilities/cancellation
+/// §Transport-Specific Cancellation: "Closing the SSE response stream is the
+/// cancellation signal. The server MUST treat a client disconnect as cancellation
+/// of that request. No notifications/cancelled message is required or expected.").
+/// So when the connection has dropped on a draft request, the response is
+/// suppressed. Released versions (2025-*) never suppress on this basis: that MUST
+/// is draft-only, so their wire behaviour is unchanged.
+bool suppressOnDisconnect(bool isDraft, bool connected) @safe pure nothrow @nogc
+{
+	return isDraft && !connected;
+}
+
+unittest  // draft: a disconnected client cancels the request -> response suppressed
+{
+	assert(suppressOnDisconnect(true, false));
+}
+
+unittest  // draft: a still-connected client gets its response (no suppression)
+{
+	assert(!suppressOnDisconnect(true, true));
+}
+
+unittest  // released versions never suppress on disconnect (draft-only MUST)
+{
+	assert(!suppressOnDisconnect(false, false));
+	assert(!suppressOnDisconnect(false, true));
 }
 
 /// Validate the draft Streamable HTTP request headers against the JSON-RPC body.

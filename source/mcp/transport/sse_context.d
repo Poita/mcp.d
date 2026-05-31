@@ -746,6 +746,13 @@ final class HttpStreamContext : RequestContext
 	// Set once the leading priming event has been written, so it is emitted at
 	// most once per stream.
 	private bool primed_;
+	// Connection-liveness probe. On the draft Streamable HTTP transport a client
+	// disconnect IS the cancellation signal (draft basic/utilities/cancellation
+	// §Transport-Specific Cancellation: "Closing the SSE response stream is the
+	// cancellation signal. The server MUST treat a client disconnect as
+	// cancellation of that request"). Defaults to the live HTTP connection state;
+	// overridable via `setConnectionProbe` so tests can simulate a disconnect.
+	private bool delegate() @safe connAlive_;
 
 	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
 			TokenInfo auth = TokenInfo.invalid(),
@@ -759,6 +766,15 @@ final class HttpStreamContext : RequestContext
 		this.authInfo = auth;
 		this.isDraft_ = isDraft;
 		this.version_ = negotiated;
+		this.connAlive_ = () @safe => res.connected;
+	}
+
+	/// Override the connection-liveness probe used by `isCancelled` on the draft
+	/// transport. Lets the transport or tests supply a disconnect signal in place
+	/// of the live `HTTPServerResponse.connected` reading.
+	void setConnectionProbe(bool delegate() @safe alive) @safe
+	{
+		this.connAlive_ = alive;
 	}
 
 	/// The globally-unique id this stream will assign to its next SSE event.
@@ -777,12 +793,19 @@ final class HttpStreamContext : RequestContext
 		return streaming_;
 	}
 
-	/// Cancellation for this request is tracked by the server's `RequestScope`
-	/// (which holds the shared token flipped by `notifications/cancelled`), so the
-	/// transport context itself reports never-cancelled. The wrapping
-	/// `RequestScope.isCancelled` consults its token before delegating here.
+	/// Cancellation for this request. On released protocol versions
+	/// (2025-03-26 / 2025-06-18 / 2025-11-25) cancellation is tracked solely by the
+	/// server's `RequestScope` (the shared token flipped by `notifications/
+	/// cancelled`), so the transport context itself reports never-cancelled. On the
+	/// draft Streamable HTTP transport a client disconnect IS the cancellation
+	/// signal (draft basic/utilities/cancellation §Transport-Specific
+	/// Cancellation: "The server MUST treat a client disconnect as cancellation of
+	/// that request"), so a dropped connection reports cancelled and the wrapping
+	/// `RequestScope.isCancelled` surfaces it to a polling handler.
 	bool isCancelled() @safe
 	{
+		if (isDraft_ && connAlive_ !is null)
+			return !connAlive_();
 		return false;
 	}
 
@@ -1182,4 +1205,45 @@ unittest  // push-channel ping round-trips: request frame out, empty result back
 	runEventLoop();
 
 	assert(pinged); // ping() returned without throwing -> client acknowledged
+}
+
+unittest  // draft HttpStreamContext: a disconnected client reports cancelled
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.versions : ProtocolVersion;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
+			TokenInfo.invalid(), true, ProtocolVersion.draft);
+
+	// Connection alive -> not cancelled.
+	ctx.setConnectionProbe(() @safe => true);
+	assert(!ctx.isCancelled);
+
+	// Client closed the SSE stream -> the draft transport treats it as
+	// cancellation of the in-flight request (draft basic/utilities/cancellation
+	// §Transport-Specific Cancellation).
+	ctx.setConnectionProbe(() @safe => false);
+	assert(ctx.isCancelled);
+}
+
+unittest  // released versions: a disconnect never reports cancelled (draft-only MUST)
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	ClientCapabilities caps;
+	// isDraft = false (default): the 2025-* transports track cancellation solely
+	// via notifications/cancelled, so the context itself stays never-cancelled
+	// even when the connection has dropped.
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined);
+	ctx.setConnectionProbe(() @safe => false);
+	assert(!ctx.isCancelled);
 }
