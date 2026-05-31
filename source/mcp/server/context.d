@@ -7,6 +7,7 @@ import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.types : ListRootsResult;
 import mcp.auth.resource_server : TokenInfo;
+import mcp.protocol.jsonrpc : makeNotification;
 
 @safe:
 
@@ -300,6 +301,101 @@ final class NullContext : RequestContext
 	Json sendRequest(string, Json) @safe
 	{
 		throw invalidRequest("This transport has no server-to-client channel");
+	}
+
+	bool clientSupports(string) @safe
+	{
+		return false;
+	}
+
+	bool isStateless() @safe
+	{
+		return false;
+	}
+
+	Json[string] inputResponses() @safe
+	{
+		Json[string] empty;
+		return empty;
+	}
+
+	string requestState() @safe
+	{
+		return "";
+	}
+
+	TokenInfo auth() @safe
+	{
+		return TokenInfo.invalid();
+	}
+}
+
+/// A `RequestContext` for the stdio transport. The stdio transport is a single
+/// newline-delimited byte stream, and the MCP stdio spec permits the server to
+/// write any valid MCP message to stdout at any time — so server->client
+/// notifications (`notifications/message` logging and `notifications/progress`)
+/// are serialised and pushed to the transport's write sink as the handler emits
+/// them, out-of-band of the request's eventual reply.
+///
+/// There is no out-of-band path for the client to answer a server->client
+/// *request* while a stdio request is in flight (replies arrive on the same
+/// stdin the server is blocked reading), so `sendRequest` is unsupported and
+/// `clientSupports` reports false, exactly like `NullContext`. Severity gating
+/// for logging and the `progressToken` gate for progress are applied by the
+/// server's per-request `RequestScope` and the token captured here.
+final class StdioContext : RequestContext
+{
+	private void delegate(string) @safe sink;
+	private Json progressTok;
+
+	/// `sink` receives one serialised JSON-RPC frame per call (the transport
+	/// adds the newline terminator). `progressToken` is the originating request's
+	/// `_meta.progressToken`, or `Json.undefined` when it carried none.
+	this(void delegate(string) @safe sink, Json progressToken = Json.undefined) @safe
+	{
+		this.sink = sink;
+		this.progressTok = progressToken;
+	}
+
+	bool isCancelled() @safe
+	{
+		return false;
+	}
+
+	void reportProgress(double progress,
+			Nullable!double total = Nullable!double.init, string message = null) @safe
+	{
+		if (progressTok.type == Json.Type.undefined)
+			return;
+		Json p = Json.emptyObject;
+		p["progressToken"] = progressTok;
+		p["progress"] = progress;
+		if (!total.isNull)
+			p["total"] = total.get;
+		if (message.length)
+			p["message"] = message;
+		emit(makeNotification("notifications/progress", p));
+	}
+
+	void log(string level, Json data, string logger = null) @safe
+	{
+		Json p = Json.emptyObject;
+		p["level"] = level;
+		if (logger.length)
+			p["logger"] = logger;
+		p["data"] = data;
+		emit(makeNotification("notifications/message", p));
+	}
+
+	private void emit(Json frame) @safe
+	{
+		if (sink !is null)
+			sink(frame.toString());
+	}
+
+	Json sendRequest(string, Json) @safe
+	{
+		throw invalidRequest("The stdio transport has no server-to-client request channel");
 	}
 
 	bool clientSupports(string) @safe
@@ -885,4 +981,77 @@ unittest  // NullContext reports never-cancelled (no out-of-band channel)
 {
 	auto ctx = new NullContext;
 	assert(!ctx.isCancelled);
+}
+
+unittest  // StdioContext.log serialises a notifications/message frame to the sink
+{
+	import vibe.data.json : parseJsonString;
+
+	string[] frames;
+	auto ctx = new StdioContext((string s) @safe { frames ~= s; });
+	ctx.log("warning", Json("hi"), "lg");
+	assert(frames.length == 1);
+	auto j = parseJsonString(frames[0]);
+	assert(j["jsonrpc"].get!string == "2.0");
+	assert(j["method"].get!string == "notifications/message");
+	assert(j["params"]["level"].get!string == "warning");
+	assert(j["params"]["logger"].get!string == "lg");
+	assert(j["params"]["data"].get!string == "hi");
+	assert("id" !in j);
+}
+
+unittest  // StdioContext.log omits the optional logger field when none is given
+{
+	import vibe.data.json : parseJsonString;
+
+	string[] frames;
+	auto ctx = new StdioContext((string s) @safe { frames ~= s; });
+	ctx.log("info", Json("plain"));
+	auto j = parseJsonString(frames[0]);
+	assert("logger" !in j["params"]);
+}
+
+unittest  // StdioContext.reportProgress emits a frame only with a progress token
+{
+	import vibe.data.json : parseJsonString;
+
+	string[] frames;
+	auto withTok = new StdioContext((string s) @safe { frames ~= s; }, Json("tok"));
+	withTok.reportProgress(0.25, nullableProgress(0.5), "quarter");
+	assert(frames.length == 1);
+	auto j = parseJsonString(frames[0]);
+	assert(j["method"].get!string == "notifications/progress");
+	assert(j["params"]["progressToken"].get!string == "tok");
+	assert(j["params"]["progress"].get!double == 0.25);
+	assert(j["params"]["total"].get!double == 0.5);
+	assert(j["params"]["message"].get!string == "quarter");
+}
+
+unittest  // StdioContext.reportProgress is a no-op without a progress token
+{
+	string[] frames;
+	auto noTok = new StdioContext((string s) @safe { frames ~= s; });
+	noTok.reportProgress(0.9);
+	assert(frames.length == 0);
+}
+
+unittest  // StdioContext has no server->client request channel
+{
+	import mcp.protocol.errors : McpException;
+
+	auto ctx = new StdioContext((string) @safe {});
+	assert(!ctx.clientSupports("sampling"));
+	assert(!ctx.isCancelled);
+	bool threw;
+	try
+		ctx.sendRequest("sampling/createMessage", Json.emptyObject);
+	catch (McpException)
+		threw = true;
+	assert(threw);
+}
+
+version (unittest) private Nullable!double nullableProgress(double v) @safe
+{
+	Nullable!double n = v;
+	return n;
 }
