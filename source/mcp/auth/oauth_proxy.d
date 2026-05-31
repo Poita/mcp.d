@@ -37,7 +37,7 @@ import vibe.data.json : Json;
 
 import mcp.auth.oauth : AuthorizationServerMetadata, ProtectedResourceMetadata, RegisteredClient,
 	TokenEndpointAuthMethod, basicAuthHeader, buildAuthCodeTokenForm, buildAuthorizationUrl;
-import mcp.auth.resource_server : TokenInfo, TokenValidator;
+import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidator;
 
 @safe:
 
@@ -137,6 +137,24 @@ struct OAuthProxyConfig
 		if (cp.length && !cp.startsWith("/"))
 			cp = "/" ~ cp;
 		return joinUrl(baseUrl, cp);
+	}
+
+	/// Collapse this proxy config into the single `auth` object the transport
+	/// accepts (`StreamableHttpOptions.auth` / `mountMcp`), so an `OAuthProxy`
+	/// preset flows through the same one entry point as `jwtResourceServer` and
+	/// the JWKS presets — no re-typing of resource/scopes. The `validator` is the
+	/// configured `tokenVerifier` (fails closed when none is set); the proxy's own
+	/// `baseUrl` is advertised as the sole authorization server (it fronts the
+	/// upstream IdP), and `resource`/`scopesSupported` are mirrored.
+	ResourceServerConfig toResourceServer() const @safe
+	{
+		ResourceServerConfig rs;
+		rs.validator = tokenVerifier !is null ? tokenVerifier : (string t) => TokenInfo.invalid();
+		rs.resource = resource;
+		if (baseUrl.length)
+			rs.authorizationServers = [stripTrailingSlash(baseUrl)];
+		rs.scopesSupported = scopesSupported.dup;
+		return rs;
 	}
 }
 
@@ -755,4 +773,37 @@ unittest  // a custom ConsentStore can be injected and is consulted by authorize
 	auto proxy = new OAuthProxy(cfg, store);
 	auto url = proxy.authorize("http://localhost:9000/cb", "CH", "read:user", "S");
 	assert(url.canFind("client_id=Iv1.upstream"));
+}
+
+unittest  // OAuthProxyConfig.toResourceServer flows the proxy through the single auth entry
+{
+	OAuthProxyConfig cfg;
+	cfg.baseUrl = "https://mcp.example.com/";
+	cfg.resource = "https://mcp.example.com/mcp";
+	cfg.scopesSupported = ["read:user"];
+	cfg.tokenVerifier = (string t) {
+		TokenInfo ti;
+		ti.valid = t == "good";
+		ti.audience = ["https://mcp.example.com/mcp"];
+		return ti;
+	};
+
+	auto rs = cfg.toResourceServer();
+	assert(rs.enabled);
+	assert(rs.resource == "https://mcp.example.com/mcp");
+	assert(rs.authorizationServers == ["https://mcp.example.com"]); // trailing slash stripped
+	assert(rs.scopesSupported == ["read:user"]);
+	assert(rs.validator("good").valid);
+	assert(!rs.validator("bad").valid);
+}
+
+unittest  // toResourceServer fails closed when the proxy has no tokenVerifier
+{
+	OAuthProxyConfig cfg;
+	cfg.baseUrl = "https://mcp.example.com";
+	cfg.resource = "https://mcp.example.com/mcp";
+
+	auto rs = cfg.toResourceServer();
+	assert(rs.enabled); // validator is non-null (rejects everything)
+	assert(!rs.validator("anything").valid);
 }
