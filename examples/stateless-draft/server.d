@@ -9,6 +9,11 @@
  * draft-only freshness hints below — which are simply ignored on the wire for
  * pre-draft peers.
  *
+ * The tool and resource are declared in the ergonomic UDA style: a `@tool`
+ * method with typed arguments (the input schema is inferred), and a `@resource`
+ * method carrying its draft freshness hint via `@cache`. `registerHandlers`
+ * wires both onto the server.
+ *
  * Run:
  *   dub run -c server            # listens on http://127.0.0.1:8431/mcp
  *
@@ -19,6 +24,7 @@ module stateless_draft_server;
 
 import std.getopt : getopt;
 import std.typecons : nullable;
+import std.conv : to;
 import std.stdio : stderr;
 
 import vibe.data.json : Json;
@@ -30,6 +36,42 @@ import mcp.protocol.draft : CacheHint, CacheScope;
 enum string defaultHost = "127.0.0.1";
 enum ushort defaultPort = 8431;
 
+/// The server's tool + resource surface, declared in UDA style.
+final class StatelessDraftApi
+{
+	/// A plain `add` tool. On a draft (stateless) request the transport carries
+	/// the per-request `_meta`; the handler itself is protocol-agnostic.
+	///
+	/// The argument schema (`a`, `b` as integers, both required) is inferred from
+	/// the typed parameters. The result is hand-built as a `CallToolResult` so it
+	/// carries both the human-readable `"sum = N"` text and a `structuredContent`
+	/// object keyed `sum` — a shape the default struct-return marshalling does not
+	/// reproduce verbatim (a struct return would emit the JSON itself as the text).
+	@tool("add", "Add two integers and return the sum.")
+	CallToolResult add(long a, long b) @safe
+	{
+		const sum = a + b;
+		Json sc = Json.emptyObject;
+		sc["sum"] = sum;
+
+		CallToolResult r;
+		r.content = [Content.makeText("sum = " ~ sum.to!string)];
+		r.structuredContent = sc;
+		return r;
+	}
+
+	/// A static greeting resource. The draft-only per-resource `CacheableResult`
+	/// freshness hint is declared via `@cache`; a draft client's
+	/// `readResource("demo://greeting").cache` will carry exactly these values
+	/// (ttlMs=9000, scope=private). Pre-draft peers see no cache fields.
+	@resource("demo://greeting", "greeting", "text/plain")
+	@cache(9000, "private")
+	string greeting() @safe
+	{
+		return "hello from the stateless draft server";
+	}
+}
+
 int main(string[] args)
 {
 	ushort port = defaultPort;
@@ -38,12 +80,15 @@ int main(string[] args)
 	auto server = new McpServer("stateless-draft-server", "1.0.0",
 			nullable("A stateless (draft) demo server: server/discover + per-request _meta."));
 
-	registerTools(server);
-	registerResources(server);
+	// Register every @tool / @resource annotated method in one call; input
+	// schema, argument marshalling, and the resource's @cache freshness hint are
+	// all derived from the annotations and signatures.
+	registerHandlers(server, new StatelessDraftApi);
 
 	// Draft-only per-list freshness hint: a draft client's `listTools().cache`
 	// will carry these `ttlMs` / `cacheScope` values. Pre-draft wire output is
-	// unchanged (no cache fields emitted).
+	// unchanged (no cache fields emitted). This is a server-level list hint, not
+	// a per-tool one, so it stays a direct server call.
 	server.setListCacheHint("tools/list", CacheHint(5000, CacheScope.public_));
 
 	StreamableHttpOptions opts;
@@ -54,60 +99,4 @@ int main(string[] args)
 	stderr.writefln("stateless-draft-server listening on http://%s:%d/mcp", defaultHost, port);
 	runStreamableHttp(server, port, opts);
 	return 0;
-}
-
-private void registerTools(McpServer server) @safe
-{
-	// A plain `add` tool. On a draft (stateless) request the transport carries
-	// the per-request `_meta`; the handler itself is protocol-agnostic.
-	Tool add = {
-		name: "add",
-		description: nullable("Add two integers and return the sum."),
-	};
-	Json schema = Json.emptyObject;
-	schema["type"] = "object";
-	Json props = Json.emptyObject;
-	Json aProp = Json.emptyObject;
-	aProp["type"] = "integer";
-	Json bProp = Json.emptyObject;
-	bProp["type"] = "integer";
-	props["a"] = aProp;
-	props["b"] = bProp;
-	schema["properties"] = props;
-	Json req = Json.emptyArray;
-	req ~= Json("a");
-	req ~= Json("b");
-	schema["required"] = req;
-	add.inputSchema = schema;
-
-	server.registerDynamicTool(add, (Json args) @safe {
-		const a = args["a"].get!long;
-		const b = args["b"].get!long;
-		const sum = a + b;
-		Json sc = Json.emptyObject;
-		sc["sum"] = sum;
-		import std.conv : to;
-
-		CallToolResult r;
-		r.content = [Content.makeText("sum = " ~ sum.to!string)];
-		r.structuredContent = sc;
-		return r;
-	});
-}
-
-private void registerResources(McpServer server) @safe
-{
-	Resource greeting = {
-		uri: "demo://greeting",
-		name: "greeting",
-		description: nullable("A static greeting resource with a draft cache hint."),
-		mimeType: nullable("text/plain"),
-	};
-
-	// Draft-only per-resource `CacheableResult` freshness hint. A draft client's
-	// `readResource("demo://greeting").cache` will carry exactly these values.
-	server.registerResource(greeting,
-			() @safe => ResourceContents.makeText("demo://greeting", "text/plain",
-				"hello from the stateless draft server"),
-			nullable(CacheHint(9000, CacheScope.private_)));
 }
