@@ -408,14 +408,15 @@ string canonicalResource(string mcpEndpoint) @safe pure nothrow
 }
 
 /// Generate a random `state` value (base64url, 16 bytes of randomness) for the
-/// authorization request (MCP "Open Redirection" mitigation).
+/// authorization request (MCP "Open Redirection" mitigation). The bytes come
+/// from the OS CSPRNG -- `state` is the CSRF / mix-up defense and MUST be
+/// unpredictable. Throws `CsprngException` if the OS CSPRNG is unavailable.
 string generateLoginState() @safe
 {
-	import std.random : uniform;
+	import mcp.auth.csprng : cryptoRandomFill;
 
 	ubyte[16] buf;
-	foreach (ref b; buf)
-		b = cast(ubyte) uniform(0, 256);
+	cryptoRandomFill(buf[]);
 	return base64UrlNoPad(buf[]);
 }
 
@@ -885,6 +886,29 @@ unittest  // generateLoginState produces a non-empty base64url value
 {
 	auto s = generateLoginState();
 	assert(s.length > 0);
+}
+
+unittest  // generateLoginState yields unique, unpredictable values from the OS CSPRNG
+{
+	// Independent draws from a CSPRNG must not collide.
+	assert(generateLoginState() != generateLoginState());
+}
+
+unittest  // generateLoginState's entropy source is the OS CSPRNG, not the default rndGen
+{
+	// Reproduce the predictable sequence the old default-seeded std.random
+	// implementation would have produced for the 16 state bytes, and assert the
+	// real generator does not reproduce it (guards against a regression back to
+	// rndGen).
+	import std.random : rndGen, uniform;
+
+	auto gen = rndGen;
+	ubyte[16] predictable;
+	foreach (ref x; predictable)
+		x = cast(ubyte) uniform(0, 256, gen);
+	const predictableState = base64UrlNoPad(predictable[]);
+
+	assert(generateLoginState() != predictableState);
 }
 
 unittest  // OAuthSession refreshes an expired token via the injected refresh fn

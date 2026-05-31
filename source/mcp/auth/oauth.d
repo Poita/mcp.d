@@ -39,14 +39,15 @@ PkcePair makePkce(const(ubyte)[] verifierBytes) @safe
 	return p;
 }
 
-/// Generate a PKCE pair from cryptographic randomness.
+/// Generate a PKCE pair from cryptographically secure OS randomness (RFC 7636
+/// recommends a high-entropy verifier). Throws `CsprngException` if the OS
+/// CSPRNG is unavailable.
 PkcePair generatePkce() @safe
 {
-	import std.random : rndGen, uniform;
+	import mcp.auth.csprng : cryptoRandomFill;
 
 	ubyte[32] buf;
-	foreach (ref b; buf)
-		b = cast(ubyte) uniform(0, 256);
+	cryptoRandomFill(buf[]);
 	return makePkce(buf[]);
 }
 
@@ -408,6 +409,34 @@ unittest  // PKCE: known verifier bytes produce a stable S256 challenge
 	import std.algorithm : canFind;
 
 	assert(!p.challenge.canFind('=') && !p.challenge.canFind('+') && !p.challenge.canFind('/'));
+}
+
+unittest  // generatePkce produces a valid, unique pair from the OS CSPRNG
+{
+	auto a = generatePkce();
+	auto b = generatePkce();
+	// 32 random bytes -> 43-char base64url verifier; valid S256 challenge.
+	assert(a.verifier.length == 43);
+	assert(a.challenge.length == 43);
+	// Two independent draws from a CSPRNG must not collide.
+	assert(a.verifier != b.verifier);
+}
+
+unittest  // generatePkce's entropy source is the OS CSPRNG, not the default rndGen
+{
+	// The old implementation drew verifier bytes from a default-seeded
+	// std.random Mersenne Twister. Reproduce that exact predictable sequence and
+	// assert the real generator does not reproduce it (it would, with
+	// overwhelming probability, if it had regressed to rndGen).
+	import std.random : rndGen, uniform;
+
+	auto gen = rndGen;
+	ubyte[32] predictable;
+	foreach (ref x; predictable)
+		x = cast(ubyte) uniform(0, 256, gen);
+	const predictablePair = makePkce(predictable[]);
+
+	assert(generatePkce().verifier != predictablePair.verifier);
 }
 
 unittest  // WWW-Authenticate parsing extracts resource_metadata and scope
