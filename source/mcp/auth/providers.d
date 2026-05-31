@@ -36,23 +36,37 @@ private string stripTrailingSlash(string s) @safe
 	return s.endsWith("/") ? s[0 .. $ - 1] : s;
 }
 
-/// Build a `ResourceServerConfig` for a JWT/JWKS IdP: pins `issuer` + `jwksUri`
-/// + `audience` + `requiredScopes` on a `jwtVerifier`, and mirrors the public
-/// metadata fields (`resource`, `authorizationServers`, `scopesSupported`).
-private ResourceServerConfig jwtResourceServer(string issuer, string jwksUri,
-		string audience, string[] scopes) @safe
+/// Build a `ResourceServerConfig` for a JWT/JWKS IdP in one call: pins `issuer` +
+/// `jwksUri` + `audience` + `requiredScopes` on a `jwtVerifier`, and mirrors the
+/// public metadata fields (`resource`, `authorizationServers`, `scopesSupported`)
+/// so the audience/resource/scopes are never re-typed. The result is the single
+/// `auth` object the transport accepts (`StreamableHttpOptions.auth` /
+/// `mountMcp`), the D analogue of FastMCP's `auth=JWTVerifier(...)`.
+ResourceServerConfig jwtResourceServer(string issuer, string jwksUri,
+		string audience, string[] scopes = []) @safe
 {
 	JwtVerifierConfig vc;
 	vc.issuer = issuer;
 	vc.jwksUri = jwksUri;
 	vc.audience = audience;
 	vc.requiredScopes = scopes.dup;
+	return resourceServer(vc);
+}
 
+/// Build a `ResourceServerConfig` directly from a `JwtVerifierConfig`, so a
+/// hand-tuned verifier (custom clock skew, pinned PEM keys, extra scopes) flows
+/// through the single `auth` entry without re-typing its `audience`/`issuer`/
+/// `requiredScopes` as the resource-server metadata. Derives `resource` from
+/// `vc.audience`, `authorizationServers` from `vc.issuer`, and `scopesSupported`
+/// from `vc.requiredScopes`.
+ResourceServerConfig resourceServer(JwtVerifierConfig vc) @safe
+{
 	ResourceServerConfig cfg;
 	cfg.validator = jwtVerifier(vc);
-	cfg.resource = audience;
-	cfg.authorizationServers = [issuer];
-	cfg.scopesSupported = scopes.dup;
+	cfg.resource = vc.audience;
+	if (vc.issuer.length)
+		cfg.authorizationServers = [vc.issuer];
+	cfg.scopesSupported = vc.requiredScopes.dup;
 	return cfg;
 }
 
@@ -236,4 +250,44 @@ unittest  // a JWT preset wires a working validator that rejects garbage tokens
 	auto cfg = entraId("tenant", "api://x");
 	assert(cfg.validator !is null);
 	assert(!cfg.validator("not-a-jwt").valid);
+}
+
+unittest  // resourceServer(JwtVerifierConfig) bundles validator + metadata in one place
+{
+	JwtVerifierConfig vc;
+	vc.issuer = "https://as.example.com";
+	vc.jwksUri = "https://as.example.com/jwks";
+	vc.audience = "https://mcp.example.com/mcp";
+	vc.requiredScopes = ["mcp:read", "mcp:write"];
+
+	auto cfg = resourceServer(vc);
+	assert(cfg.enabled);
+	assert(cfg.resource == "https://mcp.example.com/mcp");
+	assert(cfg.authorizationServers == ["https://as.example.com"]);
+	assert(cfg.scopesSupported == ["mcp:read", "mcp:write"]);
+	// validator is live and fails closed on junk.
+	assert(!cfg.validator("not-a-jwt").valid);
+}
+
+unittest  // resourceServer omits authorizationServers when no issuer is pinned
+{
+	JwtVerifierConfig vc;
+	vc.audience = "api://x";
+	auto cfg = resourceServer(vc);
+	assert(cfg.enabled);
+	assert(cfg.resource == "api://x");
+	assert(cfg.authorizationServers.length == 0);
+}
+
+unittest  // the public jwtResourceServer one-liner produces a protected config
+{
+	auto cfg = jwtResourceServer("https://issuer.example",
+			"https://issuer.example/jwks", "https://mcp.example.com/mcp", [
+				"mcp:read"
+	]);
+	assert(cfg.enabled);
+	assert(cfg.resource == "https://mcp.example.com/mcp");
+	assert(cfg.authorizationServers == ["https://issuer.example"]);
+	assert(cfg.scopesSupported == ["mcp:read"]);
+	assert(cfg.validator !is null);
 }
