@@ -4,7 +4,7 @@ import mcp.server.server;
 
 @safe:
 
-/// Drive an `MCPServer` over a newline-delimited JSON-RPC channel.
+/// Drive an `McpServer` over a newline-delimited JSON-RPC channel.
 ///
 /// `readLine` returns the next line (without its terminator), or `null` at
 /// end-of-input. `writeLine` emits one response line (a terminator is added by
@@ -17,7 +17,7 @@ import mcp.server.server;
 /// its `RequestContext` therefore has those frames written to `writeLine`
 /// out-of-band, before the originating request's response — so a server that
 /// advertises the `logging` capability over stdio can actually deliver it.
-void serveStdio(MCPServer server, scope string delegate() @safe readLine,
+void serveStdio(McpServer server, scope string delegate() @safe readLine,
 		scope void delegate(string) @safe writeLine)
 {
 	for (;;)
@@ -48,12 +48,12 @@ void serveStdio(MCPServer server, scope string delegate() @safe readLine,
 
 /// Transport-side shim: parse a single stdio line and, if it is a draft
 /// `subscriptions/listen` request, serve it on the shared stdout channel via
-/// `MCPServer.tryServeStdioListen` (writing the leading
+/// `McpServer.tryServeStdioListen` (writing the leading
 /// `notifications/subscriptions/acknowledged` notification instead of a
 /// non-spec `{ acknowledged: true }` result). Returns `true` when the line was
 /// consumed as a listen request; `false` (including on a parse failure or a
 /// batch) so the caller dispatches it through the normal request/reply path.
-private bool tryServeStdioListen(MCPServer server, string line,
+private bool tryServeStdioListen(McpServer server, string line,
 		void delegate(string) @safe writeLine) @safe
 {
 	import mcp.protocol.jsonrpc : parseAny;
@@ -73,7 +73,7 @@ private bool tryServeStdioListen(MCPServer server, string line,
 /// messages from stdin (one per line) and write responses to stdout. Per the
 /// MCP stdio transport, only valid MCP messages are written to stdout; use
 /// stderr for logging. Blocks until stdin reaches end-of-file.
-void runStdio(MCPServer server)
+void runStdio(McpServer server)
 {
 	() @trusted {
 		import std.stdio : stdin, stdout;
@@ -99,7 +99,7 @@ version (unittest)
 
 unittest  // serveStdio processes newline-delimited requests and writes responses
 {
-	auto s = new MCPServer("stdio-srv", "1.0");
+	auto s = new McpServer("stdio-srv", "1.0");
 	Tool echo = {name: "echo"};
 	s.registerTool(echo, (Json args) @safe {
 		CallToolResult r;
@@ -129,7 +129,7 @@ unittest  // serveStdio processes newline-delimited requests and writes response
 
 unittest  // serveStdio stops at end-of-input (null line)
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	size_t calls;
 	serveStdio(s, () @safe { calls++; return cast(string) null; }, (string) @safe {
 	});
@@ -138,7 +138,7 @@ unittest  // serveStdio stops at end-of-input (null line)
 
 unittest  // a tool handler's ctx.log() is delivered as a notifications/message frame over stdio
 {
-	auto s = new MCPServer("logsrv", "1.0");
+	auto s = new McpServer("logsrv", "1.0");
 	s.enableLogging();
 	Tool logger = {name: "logit"};
 	s.registerTool(logger, (Json args, RequestContext ctx) @safe {
@@ -172,7 +172,7 @@ unittest  // a tool handler's ctx.log() is delivered as a notifications/message 
 
 unittest  // logging below the configured minimum level is dropped over stdio
 {
-	auto s = new MCPServer("logsrv", "1.0");
+	auto s = new McpServer("logsrv", "1.0");
 	s.enableLogging();
 	Tool logger = {name: "logit"};
 	s.registerTool(logger, (Json args, RequestContext ctx) @safe {
@@ -203,7 +203,7 @@ unittest  // logging below the configured minimum level is dropped over stdio
 
 unittest  // reportProgress is delivered over stdio when the request carries a progressToken
 {
-	auto s = new MCPServer("progsrv", "1.0");
+	auto s = new McpServer("progsrv", "1.0");
 	Tool worker = {name: "work"};
 	s.registerTool(worker, (Json args, RequestContext ctx) @safe {
 		ctx.reportProgress(0.5, nullable(1.0), "halfway");
@@ -232,7 +232,7 @@ unittest  // reportProgress is delivered over stdio when the request carries a p
 
 unittest  // reportProgress without a progressToken emits nothing over stdio
 {
-	auto s = new MCPServer("progsrv", "1.0");
+	auto s = new McpServer("progsrv", "1.0");
 	Tool worker = {name: "work"};
 	s.registerTool(worker, (Json args, RequestContext ctx) @safe {
 		ctx.reportProgress(0.5); // no token on the request -> dropped
@@ -277,7 +277,7 @@ version (unittest)
 
 unittest  // draft subscriptions/listen over stdio sends the acknowledged notification, not a {acknowledged:true} result
 {
-	auto s = new MCPServer("listen-srv", "1.0");
+	auto s = new McpServer("listen-srv", "1.0");
 	s.enableToolListChanged();
 
 	Json filter = Json.emptyObject;
@@ -306,7 +306,7 @@ unittest  // draft subscriptions/listen over stdio sends the acknowledged notifi
 
 unittest  // the stdio acknowledged notification is stamped with the listen id as the subscriptionId
 {
-	auto s = new MCPServer("listen-srv", "1.0");
+	auto s = new McpServer("listen-srv", "1.0");
 	s.enableToolListChanged();
 
 	Json filter = Json.emptyObject;
@@ -326,7 +326,7 @@ unittest  // the stdio acknowledged notification is stamped with the listen id a
 
 unittest  // after a stdio subscriptions/listen, notify* change notifications flow on stdout, stamped with the subscriptionId
 {
-	auto s = new MCPServer("listen-srv", "1.0");
+	auto s = new McpServer("listen-srv", "1.0");
 	s.enableToolListChanged();
 
 	Json filter = Json.emptyObject;
@@ -356,7 +356,7 @@ unittest  // after a stdio subscriptions/listen, notify* change notifications fl
 
 unittest  // a pre-draft (no protocolVersion) subscriptions/listen still takes the normal request/reply path over stdio
 {
-	auto s = new MCPServer("listen-srv", "1.0");
+	auto s = new McpServer("listen-srv", "1.0");
 	s.enableToolListChanged();
 
 	// No draft _meta: opensListenStream is false, so this is dispatched normally.

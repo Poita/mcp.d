@@ -25,7 +25,7 @@ void main(string[] args)
 	getopt(args, "port|p", "Port to listen on (default 3000)", &port,
 			"host|h", "Address to bind (default 127.0.0.1)", &host);
 
-	auto server = new MCPServer("dlang-mcp-conformance", "0.1.0",
+	auto server = new McpServer("dlang-mcp-conformance", "0.1.0",
 			nullable("Conformance test server for dlang-mcp-sdk."));
 
 	registerEchoTool(server);
@@ -53,7 +53,7 @@ void main(string[] args)
 }
 
 /// A tool that echoes its `text` argument back as text content.
-private void registerEchoTool(MCPServer server) @safe
+private void registerEchoTool(McpServer server) @safe
 {
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
@@ -74,7 +74,7 @@ private void registerEchoTool(MCPServer server) @safe
 }
 
 /// A tool that adds two integers and returns the sum as text.
-private void registerAddTool(MCPServer server) @safe
+private void registerAddTool(McpServer server) @safe
 {
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
@@ -99,7 +99,7 @@ private void registerAddTool(MCPServer server) @safe
 }
 
 /// Tools whose names and outputs match the conformance harness fixtures.
-private void registerConformanceFixtures(MCPServer server) @safe
+private void registerConformanceFixtures(McpServer server) @safe
 {
 	// tools-call-simple-text: no args -> a fixed text content block.
 	Tool simpleText = {
@@ -192,7 +192,7 @@ private string minimalWav() @safe
 }
 
 /// Resource + resource-template fixtures matching the conformance harness.
-private void registerResourceFixtures(MCPServer server) @safe
+private void registerResourceFixtures(McpServer server) @safe
 {
 	Resource staticText = {
 		uri: "test://static-text", name: "Static Text", description: nullable(
@@ -221,7 +221,7 @@ private void registerResourceFixtures(MCPServer server) @safe
 }
 
 /// Prompt fixtures matching the conformance harness.
-private void registerPromptFixtures(MCPServer server) @safe
+private void registerPromptFixtures(McpServer server) @safe
 {
 	Prompt simple = {
 		name: "test_simple_prompt", description: nullable("A simple test prompt")
@@ -285,7 +285,7 @@ private void registerPromptFixtures(MCPServer server) @safe
 }
 
 /// Streaming fixtures: progress, logging, sampling, elicitation.
-private void registerStreamingFixtures(MCPServer server) @safe
+private void registerStreamingFixtures(McpServer server) @safe
 {
 	import core.time : msecs;
 	import vibe.core.core : sleep;
@@ -374,7 +374,7 @@ private void registerStreamingFixtures(MCPServer server) @safe
 }
 
 /// SEP-1034 (defaults) and SEP-1330 (enum variants) elicitation fixtures.
-private void registerElicitationSepFixtures(MCPServer server) @safe
+private void registerElicitationSepFixtures(McpServer server) @safe
 {
 	import std.typecons : nullable;
 

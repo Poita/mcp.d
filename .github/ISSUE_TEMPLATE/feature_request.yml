@@ -19,7 +19,7 @@ body:
     id: proposal
     attributes:
       label: Proposed solution
-      description: Describe the API or behavior you'd like. Sketch the public surface (MCPServer / MCPClient / RequestContext / UDA) if relevant.
+      description: Describe the API or behavior you'd like. Sketch the public surface (McpServer / McpClient / RequestContext / UDA) if relevant.
       render: d
     validations:
       required: true

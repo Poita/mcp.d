@@ -46,7 +46,7 @@ version (unittest)
 
 unittest  // registerModule: a module-level @tool is registered and dispatches
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerModule!(mcp.api.module_reflection_test)(s);
 
 	Json p = Json.emptyObject;
@@ -58,7 +58,7 @@ unittest  // registerModule: a module-level @tool is registered and dispatches
 
 unittest  // registerModule: a module-level @resource is registered and dispatches
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerModule!(mcp.api.module_reflection_test)(s);
 
 	Json rp = Json.emptyObject;
@@ -69,7 +69,7 @@ unittest  // registerModule: a module-level @resource is registered and dispatch
 
 unittest  // registerModule: a module-level @prompt is registered and dispatches
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerModule!(mcp.api.module_reflection_test)(s);
 
 	Json pp = Json.emptyObject;
@@ -81,7 +81,7 @@ unittest  // registerModule: a module-level @prompt is registered and dispatches
 
 unittest  // registerModule: a free-function @tool taking RequestContext still works
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerModule!(mcp.api.module_reflection_test)(s);
 
 	// The context parameter is omitted from the public input schema.
@@ -105,7 +105,7 @@ unittest  // registerModule: a free-function @tool taking RequestContext still w
 
 unittest  // registerModules: variadic form registers across modules
 {
-	auto s = new MCPServer("t", "1");
+	auto s = new McpServer("t", "1");
 	registerModules!(mcp.api.module_reflection_test)(s);
 
 	auto tools = s.handle(Message(makeRequest(Json(6), "tools/list",

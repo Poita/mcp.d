@@ -18,5 +18,5 @@ Closes #
 - [ ] **`dscanner` clean** — ran `./scripts/dscanner-lint.sh`.
 - [ ] **Conformance unaffected** — server **38/38** and client **287/287** baseline not regressed.
 - [ ] **Draft-only behavior gated** — any draft-only change does NOT alter `2025-11-25` / `2025-06-18` wire output.
-- [ ] **Public API reachable** — new public API is exported via `source/mcp/package.d` and usable from `MCPServer` / `MCPClient` / `RequestContext` (or the UDA layer).
+- [ ] **Public API reachable** — new public API is exported via `source/mcp/package.d` and usable from `McpServer` / `McpClient` / `RequestContext` (or the UDA layer).
 - [ ] **`CHANGELOG.md` updated** under `## [Unreleased]` if the change is user-visible.
