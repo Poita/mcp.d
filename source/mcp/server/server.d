@@ -140,6 +140,12 @@ final class MCPServer
 	// unbounded: the full list is returned in a single response with no cursor.
 	private size_t pageSize_;
 	private bool[string] listenFilters;
+	// The exact resource URIs the client opted into via `subscriptions/listen`
+	// (the `resourceSubscriptions` string[] of a draft `SubscriptionFilter`),
+	// preserved in request order so the acknowledgement can echo the agreed
+	// list. Kept separate from the legacy flat `subscriptions` map (which also
+	// holds `resources/subscribe` URIs) so the two cannot be confused.
+	private string[] listenResourceUris;
 	private ServerPushChannel pushChannel;
 	private bool toolListChangedEnabled;
 	private bool resourcesListChangedEnabled;
@@ -982,7 +988,15 @@ final class MCPServer
 					foreach (i; 0 .. rs.length)
 						if (rs[i].type == Json.Type.string)
 						{
-							subscriptions[rs[i].get!string] = true;
+							const u = rs[i].get!string;
+							subscriptions[u] = true;
+							// Preserve the agreed URI list so the acknowledgement
+							// can echo `resourceSubscriptions` as the spec's
+							// string[] (deduplicated, request order kept).
+							import std.algorithm : canFind;
+
+							if (!listenResourceUris.canFind(u))
+								listenResourceUris ~= u;
 							any = true;
 						}
 					if (any)
@@ -1011,15 +1025,31 @@ final class MCPServer
 
 	/// The agreed-upon subset of change-notification types the server will deliver
 	/// on the `subscriptions/listen` stream (draft basic/utilities/subscriptions).
-	/// Each opted-in type recorded by `subscriptions/listen` appears as
-	/// `{ "<type>": true }`; an empty object when the client opted into nothing.
+	/// The three list-changed types appear as booleans (`{ "<type>": true }`)
+	/// while `resourceSubscriptions` appears as the agreed `string[]` of URIs (a
+	/// `SubscriptionFilter`); an empty object when the client opted into nothing.
 	/// This is the payload the transport sends in the leading
 	/// `notifications/subscriptions/acknowledged` event when it opens the stream.
 	Json acknowledgedListenSubset() const @safe
 	{
 		Json subset = Json.emptyObject;
 		foreach (k, v; listenFilters)
-			subset[k] = v;
+		{
+			// `resourceSubscriptions` is a `string[]` of URIs in a
+			// `SubscriptionFilter`, not a boolean: echo the agreed URI list the
+			// client asked to be notified about (draft basic/utilities/
+			// subscriptions Acknowledgment). The three list-changed keys stay
+			// booleans.
+			if (k == "resourceSubscriptions")
+			{
+				Json uris = Json.emptyArray;
+				foreach (u; listenResourceUris)
+					uris ~= Json(u);
+				subset[k] = uris;
+			}
+			else
+				subset[k] = v;
+		}
 		return subset;
 	}
 
@@ -2594,8 +2624,30 @@ unittest  // acknowledgedListenSubset reflects exactly the opted-in change types
 
 	auto subset = s.acknowledgedListenSubset();
 	assert(subset["toolsListChanged"].get!bool);
-	assert(subset["resourceSubscriptions"].get!bool);
+	// `resourceSubscriptions` is the agreed string[] of URIs (a SubscriptionFilter),
+	// not a boolean (draft basic/utilities/subscriptions Acknowledgment).
+	assert(subset["resourceSubscriptions"].type == Json.Type.array);
+	assert(subset["resourceSubscriptions"].length == 1);
+	assert(subset["resourceSubscriptions"][0].get!string == "file:///project/config.json");
 	assert("promptsListChanged" !in subset);
+}
+
+unittest  // ack echoes every opted-in resourceSubscriptions URI in request order
+{
+	auto s = makeTestServer();
+	Json filter = Json.emptyObject;
+	filter["resourceSubscriptions"] = Json([
+		Json("file:///a.txt"), Json("file:///b.txt")
+	]);
+	Json p = Json.emptyObject;
+	p["notifications"] = filter;
+	s.handle(draftReq(8, "subscriptions/listen", p));
+
+	auto subset = s.acknowledgedListenSubset();
+	assert(subset["resourceSubscriptions"].type == Json.Type.array);
+	assert(subset["resourceSubscriptions"].length == 2);
+	assert(subset["resourceSubscriptions"][0].get!string == "file:///a.txt");
+	assert(subset["resourceSubscriptions"][1].get!string == "file:///b.txt");
 }
 
 unittest  // draft is stateless: tools/call works without a prior initialize
