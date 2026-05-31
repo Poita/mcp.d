@@ -30,6 +30,7 @@ public import mcp.auth.providers;
 public import mcp.transport.session;
 public import mcp.transport.sse_context;
 public import mcp.transport.streamable_http;
+public import mcp.transport.oauth_proxy_mount;
 public import mcp.transport.stdio;
 public import mcp.client.client;
 public import mcp.client.stdio;
