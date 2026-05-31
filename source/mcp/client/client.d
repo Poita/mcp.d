@@ -1004,8 +1004,21 @@ final class MCPClient
 				lastPostStatus = res.statusCode;
 				if (isLegacyFallbackStatus(res.statusCode))
 				{
-					res.dropBody();
-					return; // signalled below via lastPostStatus
+					// Per draft basic/transports §Backward Compatibility, a 400/404/405
+					// may carry a modern JSON-RPC error proving the peer is NOT a legacy
+					// HTTP+SSE server. Read the body and surface a recognized modern
+					// error as a typed McpException (so `connect` takes the
+					// discover/version-negotiation paths) instead of falling back. Only
+					// an empty/unrecognized body triggers the legacy fallback below.
+					string body4xx;
+					try
+						body4xx = res.bodyReader.readAllUTF8();
+					catch (Exception)
+						body4xx = null;
+					McpException modernErr;
+					if (modernErrorFromBody(body4xx, modernErr))
+						err = modernErr;
+					return; // signalled below via lastPostStatus / err
 				}
 				const ct = res.headers.get("Content-Type", "");
 				if (ct.canFind("text/event-stream"))
@@ -2223,6 +2236,62 @@ bool isLegacyFallbackStatus(int status) pure nothrow @safe @nogc
 	return status == 400 || status == 404 || status == 405;
 }
 
+/// Whether a JSON-RPC error `code` carried in a 400/404/405 response body
+/// proves the peer speaks a *modern* MCP version (so the client should retry /
+/// correct rather than fall back to the legacy HTTP+SSE transport). Per draft
+/// basic/transports §Backward Compatibility the disambiguating modern errors a
+/// 4xx body may carry are `UnsupportedProtocolVersionError` (-32004),
+/// `HeaderMismatch` (-32001, header-validation failure),
+/// `MissingRequiredClientCapabilityError` (-32003), and — for a 404 to an
+/// unimplemented modern method — `Method not found` (-32601). These mirror the
+/// codes the SDK's own server emits via `httpStatusForResponse`.
+bool isModernRpcErrorCode(int code) pure nothrow @safe @nogc
+{
+	return code == ErrorCode.unsupportedProtocolVersion || code == ErrorCode.headerMismatch
+		|| code == ErrorCode.missingRequiredClientCapability || code == ErrorCode.methodNotFound;
+}
+
+/// Inspect a 400/404/405 response `body` for a recognized modern JSON-RPC
+/// error before deciding whether to fall back to legacy HTTP+SSE. Per draft
+/// basic/transports §Backward Compatibility: "If the body contains a recognized
+/// modern JSON-RPC error, the server speaks a modern version of MCP — retry ...
+/// rather than falling back. If the body is empty or is not a recognized modern
+/// JSON-RPC error, fall back to initialize." Returns true and sets `err` to a
+/// typed `McpException` only when the body parses as a JSON-RPC error response
+/// whose code passes `isModernRpcErrorCode`; otherwise returns false (legacy
+/// fallback) and leaves `err` null. Never throws — a malformed/empty body is a
+/// legacy signal, not an error.
+bool modernErrorFromBody(string body, out McpException err) @safe nothrow
+{
+	import std.string : strip;
+
+	err = null;
+	try
+	{
+		if (body.strip.length == 0)
+			return false;
+		auto msg = parseMessage(body);
+		if (msg.kind != MessageKind.errorResponse)
+			return false;
+		auto e = msg.error;
+		if (e.type != Json.Type.object || "code" !in e || e["code"].type != Json.Type.int_)
+			return false;
+		const code = e["code"].get!int;
+		if (!isModernRpcErrorCode(code))
+			return false;
+		const m = ("message" in e && e["message"].type == Json.Type.string) ? e["message"]
+			.get!string : "server error";
+		err = new McpException(code, m, e);
+		return true;
+	}
+	catch (Exception)
+	{
+		// Malformed body: not a recognized modern error → legacy fallback.
+		err = null;
+		return false;
+	}
+}
+
 /// Parse a legacy HTTP+SSE event stream looking for the first `endpoint` event,
 /// returning its `data:` payload (the message-POST URI) in `uri`. Returns false
 /// if no `endpoint` event is found in the supplied buffer. Handles CRLF and LF
@@ -2376,6 +2445,71 @@ unittest  // isLegacyFallbackStatus ignores success and other errors
 	assert(!isLegacyFallbackStatus(202));
 	assert(!isLegacyFallbackStatus(401));
 	assert(!isLegacyFallbackStatus(500));
+}
+
+unittest  // isModernRpcErrorCode recognises the modern-vs-legacy disambiguators
+{
+	// Per draft basic/transports §Backward Compatibility, these are the
+	// JSON-RPC error codes a 400/404/405 body may carry to prove the server
+	// speaks a modern MCP version rather than being a legacy HTTP+SSE server.
+	assert(isModernRpcErrorCode(ErrorCode.unsupportedProtocolVersion)); // -32004
+	assert(isModernRpcErrorCode(ErrorCode.headerMismatch)); // -32001
+	assert(isModernRpcErrorCode(ErrorCode.methodNotFound)); // -32601
+	assert(isModernRpcErrorCode(ErrorCode.missingRequiredClientCapability)); // -32003
+}
+
+unittest  // isModernRpcErrorCode rejects unrelated codes
+{
+	assert(!isModernRpcErrorCode(ErrorCode.internalError));
+	assert(!isModernRpcErrorCode(ErrorCode.invalidParams));
+	assert(!isModernRpcErrorCode(0));
+}
+
+unittest  // modernErrorFromBody surfaces a recognized modern JSON-RPC error
+{
+	// 400 + UnsupportedProtocolVersionError body → typed McpException, NOT legacy.
+	McpException err;
+	assert(modernErrorFromBody(`{"jsonrpc":"2.0","id":1,"error":{"code":-32004,"message":"bad version","data":{"supported":["2025-11-25"]}}}`,
+			err));
+	assert(err !is null);
+	assert(err.code == ErrorCode.unsupportedProtocolVersion);
+}
+
+unittest  // modernErrorFromBody surfaces a 404 method-not-found body
+{
+	McpException err;
+	assert(modernErrorFromBody(
+			`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}`, err));
+	assert(err !is null);
+	assert(err.code == ErrorCode.methodNotFound);
+}
+
+unittest  // modernErrorFromBody ignores an empty body (legacy fallback path)
+{
+	McpException err;
+	assert(!modernErrorFromBody("", err));
+	assert(err is null);
+	assert(!modernErrorFromBody("   ", err));
+	assert(err is null);
+}
+
+unittest  // modernErrorFromBody ignores non-JSON / non-error bodies
+{
+	McpException err;
+	assert(!modernErrorFromBody("not json at all", err));
+	assert(err is null);
+	// A well-formed JSON-RPC result is not an error body.
+	assert(!modernErrorFromBody(`{"jsonrpc":"2.0","id":1,"result":{}}`, err));
+	assert(err is null);
+}
+
+unittest  // modernErrorFromBody ignores an error whose code is not a modern disambiguator
+{
+	// e.g. a generic internalError in a 400 body is NOT a modern-MCP signal.
+	McpException err;
+	assert(!modernErrorFromBody(
+			`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"boom"}}`, err));
+	assert(err is null);
 }
 
 unittest  // parseEndpointEvent extracts the message URI from a legacy SSE endpoint event
