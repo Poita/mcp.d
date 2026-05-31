@@ -50,6 +50,20 @@ struct StreamableHttpOptions
 	/// Validated token info is surfaced to handlers via `RequestContext.auth`.
 	/// When unset (the default) the transport performs no token checks.
 	ResourceServerConfig auth;
+
+	/// Reconnect-delay hint (milliseconds) for the standalone server->client SSE
+	/// stream on the 2025-11-25 revision. When non-zero, the GET stream emits a
+	/// standard SSE `retry:` event right after opening, so that if the server
+	/// later closes the connection without terminating the stream (e.g. to avoid
+	/// holding a long-lived socket), the client already knows how long to wait
+	/// before reconnecting (basic/transports §Sending Messages item 6 /
+	/// §Listening for Messages item 4: "it SHOULD send an SSE event with a
+	/// standard `retry` field before closing the connection. The client MUST
+	/// respect the `retry` field"). This is a 2025-11-25-only SHOULD: it is built
+	/// on the connection/stream split and Last-Event-ID reconnect that only that
+	/// revision defines, so it never alters 2025-06-18 / 2025-03-26 / 2024-11-05
+	/// or draft wire output. When zero (the default) no `retry:` hint is sent.
+	uint reconnectDelayMs = 0;
 }
 
 /// The well-known path (RFC 9728 §3) at which a protected resource server
@@ -97,7 +111,7 @@ void mountMcp(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		handleGet(server, push, sessions, req, res);
+		handleGet(server, push, sessions, opts.reconnectDelayMs, req, res);
 	});
 	router.match(HTTPMethod.DELETE, opts.path, (HTTPServerRequest req,
 			HTTPServerResponse res) @safe {
@@ -311,8 +325,8 @@ unittest  // 405 Allow header enumerates every supported method (RFC 9110 §10.2
 	assert(allowedMethodsHeader(ProtocolVersion.draft) == "POST");
 }
 
-private void handleGet(McpServer server, ServerPushChannel push,
-		SessionManager sessions, HTTPServerRequest req, HTTPServerResponse res) @safe
+private void handleGet(McpServer server, ServerPushChannel push, SessionManager sessions,
+		uint reconnectDelayMs, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 	// Per the transport: the server MUST either open a text/event-stream or
 	// answer 405. The draft drops the standalone GET stream (server->client
@@ -365,6 +379,26 @@ private void handleGet(McpServer server, ServerPushChannel push,
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
+
+	// 2025-11-25 basic/transports §Listening for Messages item 4 / §Sending
+	// Messages item 6: if the server closes the connection without terminating
+	// the stream, it SHOULD send a standard SSE `retry:` field first so the
+	// client knows how long to wait before reconnecting. Emit it up-front (right
+	// after opening) when configured, so the client has cached the reconnect
+	// delay before any server-initiated close. Version-gated to 2025-11-25 only,
+	// so other revisions' wire output is unchanged.
+	if (reconnectDelayMs > 0 && sendsRetryOnClose(server.negotiatedVersion))
+	{
+		const retry = formatRetryEvent(reconnectDelayMs);
+		try
+			() @trusted {
+			res.bodyWriter.write(cast(const(ubyte)[]) retry);
+			res.bodyWriter.flush();
+		}();
+		catch (Exception)
+		{
+		}
+	}
 
 	// Hold the connection open, emitting an SSE comment heartbeat so a write
 	// failure (client disconnect) is observed and the loop terminates.
