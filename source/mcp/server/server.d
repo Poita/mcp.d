@@ -11,7 +11,7 @@ import mcp.protocol.capabilities;
 import mcp.protocol.types;
 import mcp.protocol.draft;
 import mcp.server.context;
-import mcp.transport.sse_context : ServerPushChannel, StreamCoordinator;
+import mcp.transport.sse_context : ServerPushChannel, StreamCoordinator, SubscriptionFilter;
 
 @safe:
 
@@ -147,6 +147,13 @@ final class MCPServer
 	// list. Kept separate from the legacy flat `subscriptions` map (which also
 	// holds `resources/subscribe` URIs) so the two cannot be confused.
 	private string[] listenResourceUris;
+	// The per-stream `SubscriptionFilter` parsed from the most recent
+	// `subscriptions/listen` request. The transport reads it right after routing the
+	// listen request so it can attach the exact opt-in to that one stream's push
+	// listener (draft basic/utilities/subscriptions §Notification Filter / Multiple
+	// Concurrent Subscriptions). Kept separate from the global `listenFilters` (which
+	// still drives the acknowledgement echo) so concurrent streams do not blur.
+	private SubscriptionFilter lastListenFilter_;
 	private ServerPushChannel pushChannel;
 	// The stdio `subscriptions/listen` delivery channel (draft only). On the
 	// stdio transport every message shares the single stdout channel, so there
@@ -294,9 +301,7 @@ final class MCPServer
 	/// `subscriptions/listen` with `toolsListChanged:true`.
 	size_t notifyToolsListChanged() @safe
 	{
-		if (effectiveVersion.isDraft && !listensFor("toolsListChanged"))
-			return 0;
-		return notify("notifications/tools/list_changed");
+		return notifyChange("notifications/tools/list_changed", Json.undefined, "");
 	}
 
 	/// Broadcast a `notifications/resources/list_changed` to every client
@@ -309,9 +314,7 @@ final class MCPServer
 	/// `subscriptions/listen` with `resourcesListChanged:true`.
 	size_t notifyResourcesListChanged() @safe
 	{
-		if (effectiveVersion.isDraft && !listensFor("resourcesListChanged"))
-			return 0;
-		return notify("notifications/resources/list_changed");
+		return notifyChange("notifications/resources/list_changed", Json.undefined, "");
 	}
 
 	/// Broadcast a `notifications/prompts/list_changed` to every client listening
@@ -323,9 +326,7 @@ final class MCPServer
 	/// `subscriptions/listen` with `promptsListChanged:true`.
 	size_t notifyPromptsListChanged() @safe
 	{
-		if (effectiveVersion.isDraft && !listensFor("promptsListChanged"))
-			return 0;
-		return notify("notifications/prompts/list_changed");
+		return notifyChange("notifications/prompts/list_changed", Json.undefined, "");
 	}
 
 	/// Notify subscribers that a watched resource changed by emitting a
@@ -350,7 +351,7 @@ final class MCPServer
 			return 0;
 		Json params = Json.emptyObject;
 		params["uri"] = uri;
-		return notify("notifications/resources/updated", params);
+		return notifyChange("notifications/resources/updated", params, uri);
 	}
 
 	/// Emit a `notifications/elicitation/complete` for a URL-mode elicitation,
@@ -640,6 +641,53 @@ final class MCPServer
 				ackParams), stdioListenSubscriptionId);
 		writeLine(ack.toString());
 		return true;
+	}
+
+	/// Deliver a change notification on the standalone GET / `subscriptions/listen`
+	/// push channel. On the draft, delivery is per-stream filtered: the notification
+	/// reaches only a stream whose `subscriptions/listen` filter explicitly requested
+	/// this type (and, for `notifications/resources/updated`, this `uri`), honouring
+	/// draft basic/utilities/subscriptions "The server MUST NOT send notification
+	/// types the client has not explicitly requested" under Multiple Concurrent
+	/// Subscriptions. On 2025-11-25 / 2025-06-18 / 2025-03-26 (no `subscriptions/
+	/// listen`) it is an ordinary single-stream `notify`, so the stable wire output is
+	/// unchanged. Returns the number of streams reached (0 or 1).
+	private size_t notifyChange(string method, Json params, string uri) @safe
+	{
+		if (pushChannel is null)
+			return 0;
+		if (effectiveVersion.isDraft)
+		{
+			// Per-stream filtering: an active `subscriptions/listen` stream receives a
+			// type only if its own filter opted in. A plain GET listener (inactive
+			// filter, no per-stream opt-in) falls back to the global opt-in, preserving
+			// the legacy single-stream draft path while isolating concurrent streams.
+			const plainEligible = globalListensForMethod(method);
+			return pushChannel.emitFiltered(method, params, uri, plainEligible);
+		}
+		return pushChannel.notify(method, params);
+	}
+
+	/// Whether the server's *global* `subscriptions/listen` opt-in covers a given
+	/// change-notification `method`. Used only as the fallback eligibility for plain
+	/// GET listeners on the draft (active per-stream filters decide their own
+	/// eligibility); the four list/subscription change methods map to their filter
+	/// keys, and any other method is ungated.
+	private bool globalListensForMethod(string method) @safe
+	{
+		switch (method)
+		{
+		case "notifications/tools/list_changed":
+			return listensFor("toolsListChanged");
+		case "notifications/prompts/list_changed":
+			return listensFor("promptsListChanged");
+		case "notifications/resources/list_changed":
+			return listensFor("resourcesListChanged");
+		case "notifications/resources/updated":
+			return listensFor("resourceSubscriptions");
+		default:
+			return true;
+		}
 	}
 
 	/// Initiate a server->client `ping` on the standalone GET SSE push channel
@@ -1138,6 +1186,10 @@ final class MCPServer
 		else
 			filter = params; // tolerate the legacy flat shape
 
+		// Reset the per-stream filter; it captures exactly THIS listen request's
+		// opt-in so the transport can attach it to this one stream's listener.
+		SubscriptionFilter perStream;
+		perStream.active = true;
 		if (filter.type == Json.Type.object)
 		{
 			static immutable boolKeys = [
@@ -1145,7 +1197,15 @@ final class MCPServer
 			];
 			foreach (k; boolKeys)
 				if (k in filter && filter[k].type == Json.Type.bool_ && filter[k].get!bool)
+				{
 					listenFilters[k] = true;
+					if (k == "toolsListChanged")
+						perStream.toolsListChanged = true;
+					else if (k == "promptsListChanged")
+						perStream.promptsListChanged = true;
+					else if (k == "resourcesListChanged")
+						perStream.resourcesListChanged = true;
+				}
 
 			if ("resourceSubscriptions" in filter)
 			{
@@ -1165,19 +1225,26 @@ final class MCPServer
 
 							if (!listenResourceUris.canFind(u))
 								listenResourceUris ~= u;
+							if (!perStream.resourceUris.canFind(u))
+								perStream.resourceUris ~= u;
 							any = true;
 						}
 					if (any)
+					{
 						listenFilters["resourceSubscriptions"] = true;
+						perStream.resourceSubscriptions = true;
+					}
 				}
 				else if (rs.type == Json.Type.bool_ && rs.get!bool)
 				{
 					// Legacy boolean opt-in (pre-spec): blanket interest in
 					// resource-update notifications without per-URI URIs.
 					listenFilters["resourceSubscriptions"] = true;
+					perStream.resourceSubscriptions = true;
 				}
 			}
 		}
+		lastListenFilter_ = perStream;
 
 		Json j = Json.emptyObject;
 		j["acknowledged"] = true;
@@ -1219,6 +1286,17 @@ final class MCPServer
 				subset[k] = v;
 		}
 		return subset;
+	}
+
+	/// The per-stream `SubscriptionFilter` parsed from the most recent
+	/// `subscriptions/listen` request handled by this server. The transport reads it
+	/// immediately after routing a listen request so it can attach the exact opt-in to
+	/// that stream's push-channel listener (draft basic/utilities/subscriptions
+	/// §Notification Filter), ensuring a notification is delivered only to a stream
+	/// that explicitly requested its type.
+	SubscriptionFilter lastListenFilter() @safe
+	{
+		return lastListenFilter_;
 	}
 
 	private Json doListResources(Json params) @safe
@@ -3681,6 +3759,54 @@ unittest  // notifyPromptsListChanged is a no-op before a push channel exists
 {
 	auto s = new MCPServer("t", "1");
 	assert(s.notifyPromptsListChanged() == 0);
+}
+
+unittest  // draft: concurrent listen streams only receive the type each opted into
+{
+	// Regression for per-stream notification filtering (draft basic/utilities/
+	// subscriptions): "The server MUST NOT send notification types the client has not
+	// explicitly requested." Two concurrent subscriptions/listen streams: A opted into
+	// toolsListChanged only, B into resourceSubscriptions only. notifyToolsListChanged
+	// MUST reach A and never B, even though B registered first.
+	import std.algorithm : canFind;
+
+	auto s = makeTestServer();
+	auto coord = new StreamCoordinator;
+	auto push = s.serverPushChannel(coord);
+
+	// Stream B (resourceSubscriptions only) opens FIRST.
+	Json nb = Json.emptyObject;
+	nb["resourceSubscriptions"] = Json([Json("file:///b")]);
+	Json pb = Json.emptyObject;
+	pb["notifications"] = nb;
+	s.handle(draftReq(10, "subscriptions/listen", pb));
+	string bFrame;
+	push.addListener((string f) @safe { bFrame = f; }, "10", s.lastListenFilter());
+
+	// Stream A (toolsListChanged only) opens second.
+	Json na = Json.emptyObject;
+	na["toolsListChanged"] = true;
+	Json pa = Json.emptyObject;
+	pa["notifications"] = na;
+	s.handle(draftReq(11, "subscriptions/listen", pa));
+	string aFrame;
+	push.addListener((string f) @safe { aFrame = f; }, "11", s.lastListenFilter());
+
+	// A tools/list_changed must land on A (which requested it), not B.
+	const n = s.notifyToolsListChanged();
+	assert(n == 1);
+	assert(aFrame.canFind("notifications/tools/list_changed"));
+	assert(aFrame.canFind("11")); // stamped with A's subscriptionId
+	assert(bFrame.length == 0); // B never requested toolsListChanged
+
+	// And a resources/updated for file:///b must land on B, not A.
+	aFrame = null;
+	bFrame = null;
+	const r = s.notifyResourceUpdated("file:///b");
+	assert(r == 1);
+	assert(bFrame.canFind("notifications/resources/updated"));
+	assert(bFrame.canFind("file:///b"));
+	assert(aFrame.length == 0); // A did not subscribe to resources
 }
 
 unittest  // draft: notifyPromptsListChanged suppressed unless client opted in
