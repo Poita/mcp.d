@@ -450,6 +450,20 @@ private void handlePost(MCPServer server, StreamCoordinator coord,
         res.writeBody("", "text/plain");
         return;
     case MessageKind.notification:
+        // Draft basic/transports Standard Request Headers: Mcp-Method is
+        // REQUIRED for "All requests and notifications". A draft client POSTing
+        // a notification (e.g. notifications/initialized, notifications/cancelled)
+        // with a missing or mismatched Mcp-Method MUST be rejected with 400 and a
+        // -32001 HeaderMismatch error. The error body carries no id (a
+        // notification has none). Pre-draft versions skip this (header undefined).
+        if (auto noteErr = validateDraftHeaders(req.headers.get(HttpHeader.protocolVersion,
+                ""), req.headers.get(HttpHeader.method, ""),
+                req.headers.get(HttpHeader.name, ""), msg))
+        {
+            res.statusCode = HTTPStatus.badRequest;
+            res.writeBody(makeErrorResponse(Json(null), noteErr).toString(), "application/json");
+            return;
+        }
         server.handle(msg);
         res.statusCode = HTTPStatus.accepted;
         res.writeBody("", "text/plain");
@@ -762,6 +776,14 @@ version (unittest)
         params["_meta"] = meta;
         return Message(makeRequest(Json(1), method, params));
     }
+
+    private Message draftNote(string method, Json params) @safe
+    {
+        Json meta = Json.emptyObject;
+        meta[MetaKey.protocolVersion] = "2026-07-28";
+        params["_meta"] = meta;
+        return Message(makeNotification(method, params));
+    }
 }
 
 unittest  // pre-draft requests skip draft header enforcement
@@ -811,6 +833,35 @@ unittest  // draft resources/read mirrors uri into Mcp-Name
     auto m = draftMsg("resources/read", p);
     assert(validateDraftHeaders("2026-07-28", "resources/read", "test://x", m) is null);
     assert(validateDraftHeaders("2026-07-28", "resources/read", "test://y", m) !is null);
+}
+
+unittest  // draft notification with correct Mcp-Method passes (no Mcp-Name required)
+{
+    // draft basic/transports Standard Request Headers: Mcp-Method is REQUIRED
+    // for "All requests and notifications"; Mcp-Name applies only to
+    // tools/call, resources/read, prompts/get requests.
+    auto m = draftNote("notifications/initialized", Json.emptyObject);
+    assert(validateDraftHeaders("2026-07-28", "notifications/initialized", "", m) is null);
+}
+
+unittest  // draft notification missing Mcp-Method is a header mismatch
+{
+    auto m = draftNote("notifications/initialized", Json.emptyObject);
+    auto e = validateDraftHeaders("2026-07-28", "", "", m);
+    assert(e !is null && e.code == ErrorCode.headerMismatch);
+}
+
+unittest  // draft notification with mismatched Mcp-Method fails
+{
+    auto m = draftNote("notifications/cancelled", Json.emptyObject);
+    auto e = validateDraftHeaders("2026-07-28", "notifications/initialized", "", m);
+    assert(e !is null && e.code == ErrorCode.headerMismatch);
+}
+
+unittest  // pre-draft notification skips draft header enforcement
+{
+    auto m = Message(makeNotification("notifications/initialized", Json.emptyObject));
+    assert(validateDraftHeaders("2025-11-25", "", "", m) is null);
 }
 
 unittest  // absent MCP-Protocol-Version header is permitted (falls back to negotiated)
