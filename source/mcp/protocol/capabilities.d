@@ -85,15 +85,20 @@ struct ResourcesCapability
 /// Tasks capability (2025-11-25): support for task-augmented requests.
 ///
 /// Server form may carry presence-only `list`/`cancel` sub-capabilities and a
-/// `requests` map of request method names to per-request settings objects.
-/// Client form carries only the `requests` map. Each struct preserves the
-/// distinction by only emitting the fields relevant to its role.
+/// `requests` object structured by request category (e.g. `tools.call`).
+/// Client form carries only the `requests` object. Each struct preserves the
+/// distinction by only emitting the fields relevant to its role. Build the
+/// nested `requests` shape with `TaskRequests`.
 struct TasksCapability
 {
     bool list; /// server: presence-only ({} when set); supports tasks/list
     bool cancel; /// server: presence-only ({} when set); supports tasks/cancel
-    /// Map of request method names (e.g. "tools/call") to per-request settings
-    /// objects describing which requests may be task-augmented.
+    /// Which request types may be task-augmented, structured by request
+    /// category with presence-only sub-objects (spec 2025-11-25). Server form:
+    /// `{"tools": {"call": {}}}`; client form:
+    /// `{"sampling": {"createMessage": {}}, "elicitation": {"create": {}}}`.
+    /// Use `TaskRequests` to build this shape rather than flat slash-delimited
+    /// method names like `"tools/call"`.
     Json requests = Json.undefined;
 
     Json toJson() const @safe
@@ -118,6 +123,69 @@ struct TasksCapability
         if ("requests" in j && j["requests"].type == Json.Type.object)
             c.requests = j["requests"];
         return c;
+    }
+}
+
+/// Builder for the nested `tasks.requests` capability object (spec 2025-11-25).
+///
+/// The spec structures `tasks.requests` by request category with presence-only
+/// sub-objects rather than flat slash-delimited method names. For example, a
+/// server advertises task-augmented `tools/call` as
+/// `{"tools": {"call": {}}}` (capability key `tasks.requests.tools.call`), and
+/// a client advertises task-augmented `sampling/createMessage` and
+/// `elicitation/create` as
+/// `{"sampling": {"createMessage": {}}, "elicitation": {"create": {}}}`.
+///
+/// Chain the convenience methods (or `add`) and call `toJson` to obtain the
+/// object to assign to `TasksCapability.requests`:
+/// ---
+/// TasksCapability t;
+/// t.requests = TaskRequests().tool().toJson();        // server
+/// t.requests = TaskRequests()
+///     .samplingCreateMessage()
+///     .elicitationCreate()
+///     .toJson();                                       // client
+/// ---
+struct TaskRequests
+{
+    private Json obj = Json.emptyObject;
+
+    /// Mark `category.operation` (e.g. `tools.call`) as task-augmentable.
+    ref TaskRequests add(string category, string operation) return @safe
+    {
+        if (obj.type != Json.Type.object)
+            obj = Json.emptyObject;
+        if (category !in obj || obj[category].type != Json.Type.object)
+            obj[category] = Json.emptyObject;
+        obj[category][operation] = Json.emptyObject;
+        return this;
+    }
+
+    /// Server: task-augmented `tools/call` (`tasks.requests.tools.call`).
+    ref TaskRequests tool() return @safe
+    {
+        return add("tools", "call");
+    }
+
+    /// Client: task-augmented `sampling/createMessage`
+    /// (`tasks.requests.sampling.createMessage`).
+    ref TaskRequests samplingCreateMessage() return @safe
+    {
+        return add("sampling", "createMessage");
+    }
+
+    /// Client: task-augmented `elicitation/create`
+    /// (`tasks.requests.elicitation.create`).
+    ref TaskRequests elicitationCreate() return @safe
+    {
+        return add("elicitation", "create");
+    }
+
+    /// The accumulated nested `requests` object. Returns an empty object when
+    /// nothing was added.
+    Json toJson() const @safe
+    {
+        return obj;
     }
 }
 
@@ -409,14 +477,16 @@ unittest  // ServerCapabilities advertises the 2025-11-25 `tasks` capability
     TasksCapability t;
     t.list = true;
     t.cancel = true;
-    Json reqs = Json.emptyObject;
-    reqs["tools/call"] = Json.emptyObject;
-    t.requests = reqs;
+    // Spec 2025-11-25: `requests` is structured by request category with boolean
+    // (presence) properties, e.g. {"tools": {"call": {}}} -- NOT a flat
+    // "tools/call" key.
+    t.requests = TaskRequests().tool().toJson();
     caps.tasks = t;
     auto j = caps.toJson();
     assert(j["tasks"]["list"].type == Json.Type.object && j["tasks"]["list"].length == 0);
     assert(j["tasks"]["cancel"].type == Json.Type.object);
-    assert("tools/call" in j["tasks"]["requests"]);
+    assert(j["tasks"]["requests"]["tools"]["call"].type == Json.Type.object);
+    assert("tools/call" !in j["tasks"]["requests"]);
 }
 
 unittest  // ServerCapabilities round-trips the `tasks` capability
@@ -424,15 +494,13 @@ unittest  // ServerCapabilities round-trips the `tasks` capability
     ServerCapabilities caps;
     TasksCapability t;
     t.list = true;
-    Json reqs = Json.emptyObject;
-    reqs["tools/call"] = Json.emptyObject;
-    t.requests = reqs;
+    t.requests = TaskRequests().tool().toJson();
     caps.tasks = t;
     auto back = ServerCapabilities.fromJson(caps.toJson());
     assert(!back.tasks.isNull);
     assert(back.tasks.get.list);
     assert(!back.tasks.get.cancel);
-    assert("tools/call" in back.tasks.get.requests);
+    assert(back.tasks.get.requests["tools"]["call"].type == Json.Type.object);
 }
 
 unittest  // ServerCapabilities omits `tasks` when unset
@@ -445,12 +513,15 @@ unittest  // ClientCapabilities advertises the 2025-11-25 `tasks` capability
 {
     ClientCapabilities caps;
     TasksCapability t;
-    Json reqs = Json.emptyObject;
-    reqs["sampling/createMessage"] = Json.emptyObject;
-    t.requests = reqs;
+    // Spec 2025-11-25 client form: {"sampling": {"createMessage": {}},
+    // "elicitation": {"create": {}}} -- nested by category, not flat
+    // "sampling/createMessage".
+    t.requests = TaskRequests().samplingCreateMessage().elicitationCreate().toJson();
     caps.tasks = t;
     auto j = caps.toJson();
-    assert("sampling/createMessage" in j["tasks"]["requests"]);
+    assert(j["tasks"]["requests"]["sampling"]["createMessage"].type == Json.Type.object);
+    assert(j["tasks"]["requests"]["elicitation"]["create"].type == Json.Type.object);
+    assert("sampling/createMessage" !in j["tasks"]["requests"]);
     // Client form carries only `requests` (no server-only list/cancel keys).
     assert("list" !in j["tasks"]);
     assert("cancel" !in j["tasks"]);
@@ -460,19 +531,64 @@ unittest  // ClientCapabilities round-trips the `tasks` capability
 {
     ClientCapabilities caps;
     TasksCapability t;
-    Json reqs = Json.emptyObject;
-    reqs["sampling/createMessage"] = Json.emptyObject;
-    t.requests = reqs;
+    t.requests = TaskRequests().samplingCreateMessage().toJson();
     caps.tasks = t;
     auto back = ClientCapabilities.fromJson(caps.toJson());
     assert(!back.tasks.isNull);
-    assert("sampling/createMessage" in back.tasks.get.requests);
+    assert(back.tasks.get.requests["sampling"]["createMessage"].type == Json.Type.object);
 }
 
 unittest  // ClientCapabilities omits `tasks` when unset
 {
     ClientCapabilities caps;
     assert("tasks" !in caps.toJson());
+}
+
+unittest  // TaskRequests builds the spec server shape {"tools": {"call": {}}}
+{
+    auto j = TaskRequests().tool().toJson();
+    assert(j.type == Json.Type.object);
+    assert(j["tools"].type == Json.Type.object);
+    assert(j["tools"]["call"].type == Json.Type.object && j["tools"]["call"].length == 0);
+    assert("tools/call" !in j);
+}
+
+unittest  // TaskRequests builds the spec client shape with nested categories
+{
+    auto j = TaskRequests().samplingCreateMessage().elicitationCreate().toJson();
+    assert(j["sampling"]["createMessage"].type == Json.Type.object);
+    assert(j["elicitation"]["create"].type == Json.Type.object);
+    assert("sampling/createMessage" !in j);
+    assert("elicitation/create" !in j);
+}
+
+unittest  // TaskRequests.add nests arbitrary category/operation pairs
+{
+    auto j = TaskRequests().add("tools", "call").add("sampling", "createMessage").toJson();
+    assert(j["tools"]["call"].type == Json.Type.object);
+    assert(j["sampling"]["createMessage"].type == Json.Type.object);
+}
+
+unittest  // TaskRequests.add groups multiple operations under one category
+{
+    auto j = TaskRequests().add("tools", "call").add("tools", "list").toJson();
+    assert(j["tools"]["call"].type == Json.Type.object);
+    assert(j["tools"]["list"].type == Json.Type.object);
+}
+
+unittest  // TaskRequests with nothing added yields an empty object
+{
+    auto j = TaskRequests().toJson();
+    assert(j.type == Json.Type.object && j.length == 0);
+}
+
+unittest  // TaskRequests output assigned to TasksCapability round-trips nested keys
+{
+    TasksCapability t;
+    t.list = true;
+    t.requests = TaskRequests().tool().toJson();
+    auto back = TasksCapability.fromJson(t.toJson());
+    assert(back.requests["tools"]["call"].type == Json.Type.object);
 }
 
 unittest  // ClientCapabilities advertises sampling.tools sub-capability (2025-11-25)

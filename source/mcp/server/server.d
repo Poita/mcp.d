@@ -390,10 +390,12 @@ final class MCPServer
 
     /// Advertise the 2025-11-25 `tasks` capability (support for task-augmented
     /// requests). `list`/`cancel` indicate support for `tasks/list` and
-    /// `tasks/cancel`; `requests` is a map of request method names (e.g.
-    /// "tools/call") to per-request settings objects. The capability appears in
-    /// the `tasks` field of the server capabilities sent during `initialize` /
-    /// `server/discover`.
+    /// `tasks/cancel`; `requests` is the nested-by-category object describing
+    /// which requests may be task-augmented (spec shape `{"tools": {"call":
+    /// {}}}`, NOT a flat `"tools/call"` key). Build it with `TaskRequests`, e.g.
+    /// `enableTasks(true, true, TaskRequests().tool().toJson())`. The capability
+    /// appears in the `tasks` field of the server capabilities sent during
+    /// `initialize` / `server/discover`.
     void enableTasks(bool list = true, bool cancel = true, Json requests = Json.undefined) @safe
     {
         TasksCapability t;
@@ -2092,9 +2094,8 @@ unittest  // advertised extensions appear in initialize capabilities
 unittest  // enableTasks advertises the `tasks` capability at initialize
 {
     auto s = new MCPServer("t", "1");
-    Json reqs = Json.emptyObject;
-    reqs["tools/call"] = Json.emptyObject;
-    s.enableTasks(true, true, reqs);
+    // Spec 2025-11-25: nested-by-category `requests`, i.e. {"tools": {"call": {}}}.
+    s.enableTasks(true, true, TaskRequests().tool().toJson());
 
     Json params = Json.emptyObject;
     params["protocolVersion"] = "2025-11-25";
@@ -2103,7 +2104,8 @@ unittest  // enableTasks advertises the `tasks` capability at initialize
     assert(t.type == Json.Type.object);
     assert(t["list"].type == Json.Type.object);
     assert(t["cancel"].type == Json.Type.object);
-    assert("tools/call" in t["requests"]);
+    assert(t["requests"]["tools"]["call"].type == Json.Type.object);
+    assert("tools/call" !in t["requests"]);
 }
 
 unittest  // server reads the `tasks` capability a client advertises at initialize
@@ -2111,9 +2113,8 @@ unittest  // server reads the `tasks` capability a client advertises at initiali
     auto s = new MCPServer("t", "1");
     Json caps = Json.emptyObject;
     Json t = Json.emptyObject;
-    Json reqs = Json.emptyObject;
-    reqs["sampling/createMessage"] = Json.emptyObject;
-    t["requests"] = reqs;
+    // Client advertises nested-by-category requests per spec 2025-11-25.
+    t["requests"] = TaskRequests().samplingCreateMessage().toJson();
     caps["tasks"] = t;
 
     Json params = Json.emptyObject;
@@ -2122,7 +2123,7 @@ unittest  // server reads the `tasks` capability a client advertises at initiali
     s.handle(req(1, "initialize", params));
 
     assert(!s.clientTasks.isNull);
-    assert("sampling/createMessage" in s.clientTasks.get.requests);
+    assert(s.clientTasks.get.requests["sampling"]["createMessage"].type == Json.Type.object);
 }
 
 unittest  // server reads the extensions a client advertises at initialize
