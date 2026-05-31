@@ -796,21 +796,31 @@ struct Tool
 	{
 		Tool projected;
 		projected.name = name;
-		projected.title = title;
 		projected.description = description;
 		projected.inputSchema = inputSchema;
-		projected.outputSchema = outputSchema;
 		projected.annotations = annotations;
-		foreach (icon; icons)
-		{
-			Icon copy;
-			copy.src = icon.src;
-			copy.mimeType = icon.mimeType;
-			copy.sizes = icon.sizes.dup;
-			copy.theme = icon.theme;
-			projected.icons ~= copy;
-		}
 		projected.meta = meta;
+		// `BaseMetadata.title` and `Tool.outputSchema` were introduced by
+		// 2025-06-18; they are absent from 2025-03-26 and 2024-11-05.
+		if (v >= ProtocolVersion.v2025_06_18)
+		{
+			projected.title = title;
+			projected.outputSchema = outputSchema;
+		}
+		// `Tool.icons` was introduced by 2025-11-25; absent from every earlier
+		// version (and present in draft, which is >= 2025-11-25).
+		if (v >= ProtocolVersion.v2025_11_25)
+		{
+			foreach (icon; icons)
+			{
+				Icon copy;
+				copy.src = icon.src;
+				copy.mimeType = icon.mimeType;
+				copy.sizes = icon.sizes.dup;
+				copy.theme = icon.theme;
+				projected.icons ~= copy;
+			}
+		}
 		// `Tool.execution` is a 2025-11-25-only field: emit it solely when the
 		// negotiated version is exactly 2025-11-25 (absent pre-2025-11-25,
 		// dropped from draft).
@@ -1590,6 +1600,76 @@ unittest  // Tool.forVersion preserves non-version-gated fields (name/descriptio
 	assert(pj.name == "longjob");
 	assert(pj.description.get == "does a long job");
 	assert(pj.execution.isNull);
+}
+
+unittest  // Tool.forVersion strips title for 2024-11-05 (BaseMetadata.title introduced 2025-06-18)
+{
+	Tool t = {name: "t", title: nullable("Nice Title")};
+	auto j = t.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("title" !in j);
+}
+
+unittest  // Tool.forVersion strips title for 2025-03-26 (BaseMetadata.title introduced 2025-06-18)
+{
+	Tool t = {name: "t", title: nullable("Nice Title")};
+	auto j = t.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("title" !in j);
+}
+
+unittest  // Tool.forVersion keeps title for 2025-06-18 (title introduced here)
+{
+	Tool t = {name: "t", title: nullable("Nice Title")};
+	auto j = t.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert(j["title"].get!string == "Nice Title");
+}
+
+unittest  // Tool.forVersion strips outputSchema for 2024-11-05 (introduced 2025-06-18)
+{
+	Tool t = {name: "t"};
+	t.outputSchema = emptyObjectSchema();
+	auto j = t.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("outputSchema" !in j);
+}
+
+unittest  // Tool.forVersion strips outputSchema for 2025-03-26 (introduced 2025-06-18)
+{
+	Tool t = {name: "t"};
+	t.outputSchema = emptyObjectSchema();
+	auto j = t.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("outputSchema" !in j);
+}
+
+unittest  // Tool.forVersion keeps outputSchema for 2025-06-18 (introduced here)
+{
+	Tool t = {name: "t"};
+	t.outputSchema = emptyObjectSchema();
+	auto j = t.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("outputSchema" in j);
+}
+
+unittest  // Tool.forVersion strips icons for 2025-06-18 (Tool.icons introduced 2025-11-25)
+{
+	Tool t = {name: "t"};
+	t.icons ~= Icon("https://example.com/i.png");
+	auto j = t.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("icons" !in j);
+}
+
+unittest  // Tool.forVersion strips icons for 2025-03-26 (Tool.icons introduced 2025-11-25)
+{
+	Tool t = {name: "t"};
+	t.icons ~= Icon("https://example.com/i.png");
+	auto j = t.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("icons" !in j);
+}
+
+unittest  // Tool.forVersion keeps icons for 2025-11-25 (Tool.icons introduced here)
+{
+	Tool t = {name: "t"};
+	t.icons ~= Icon("https://example.com/i.png");
+	auto j = t.forVersion(ProtocolVersion.v2025_11_25).toJson();
+	assert("icons" in j);
+	assert(j["icons"].length == 1);
 }
 
 unittest  // CallToolResult serializes content array and isError
