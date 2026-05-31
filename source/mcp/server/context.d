@@ -238,7 +238,8 @@ interface RequestContext
     /// Returns the client's `{action}` response (typically `accept`/`decline`/
     /// `cancel`). Throws on a stateless (MRTR) request — use
     /// `ToolResponse.inputRequired` instead — or if the client does not support
-    /// elicitation, or if `url`/`elicitationId` are empty.
+    /// elicitation, if `url`/`elicitationId` are empty, or if `url` is not a
+    /// valid absolute URI (the spec requires `url` to contain a valid URL).
     final Json elicitUrl(string message, string url, string elicitationId) @safe
     {
         if (isStateless)
@@ -250,6 +251,8 @@ interface RequestContext
             throw invalidRequest("Client does not support url-mode elicitation");
         if (url.length == 0)
             throw invalidParams("URL-mode elicitation requires a non-empty url");
+        if (!isValidElicitationUrl(url))
+            throw invalidParams("URL-mode elicitation requires a valid url (absolute URI): " ~ url);
         if (elicitationId.length == 0)
             throw invalidParams("URL-mode elicitation requires a non-empty elicitationId");
         Json params = Json.emptyObject;
@@ -617,6 +620,24 @@ unittest  // elicitUrl() rejects an empty elicitationId
 
     auto probe = new ElicitProbe;
     assertThrown!McpException(probe.elicitUrl("msg", "https://example.com", ""));
+}
+
+unittest  // elicitUrl() rejects a malformed (non-URI) url
+{
+    import std.exception : assertThrown;
+    import mcp.protocol.errors : McpException;
+
+    auto probe = new ElicitProbe;
+    assertThrown!McpException(probe.elicitUrl("msg", "not a url", "elic-1"));
+}
+
+unittest  // elicitUrl() rejects a relative url without a scheme/authority
+{
+    import std.exception : assertThrown;
+    import mcp.protocol.errors : McpException;
+
+    auto probe = new ElicitProbe;
+    assertThrown!McpException(probe.elicitUrl("msg", "example.com/path", "elic-1"));
 }
 
 unittest  // elicitUrl() throws when the client does not support elicitation
