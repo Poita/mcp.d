@@ -416,32 +416,17 @@ final class NullContext : RequestContext
 /// are serialised and pushed to the transport's write sink as the handler emits
 /// them, out-of-band of the request's eventual reply.
 ///
-/// Optional capability for a `RequestContext` whose transport does NOT deliver
-/// inbound messages concurrently with an in-flight request (the synchronous
-/// stdio loop). `drainPending` reads and dispatches any inbound messages that
-/// are pending right now, without blocking, so a handler's poll points
-/// (`isCancelled`/`reportProgress`) can observe an out-of-band
-/// `notifications/cancelled` (draft Transport-Specific Cancellation requires
-/// stdio cancellation to ride a `notifications/cancelled`). Transports that
-/// already deliver concurrently (Streamable HTTP) do not implement this.
-interface InboundPump
-{
-	void drainPending() @safe;
-}
-
-/// The MCP stdio transport is bidirectional, so a server->client *request* is
-/// possible: `sendRequest` writes the request frame to the stdout sink and the
-/// transport (`serveStdio`) pumps stdin for the matching reply while the handler
-/// blocks (see the `serverRequest` channel below). When no channel is wired
-/// (`serverRequest is null`) `sendRequest` throws and `clientSupports` reports
-/// false, exactly like `NullContext`. Severity gating for logging and the
-/// `progressToken` gate for progress are applied by the server's per-request
-/// `RequestScope` and the token captured here.
-final class StdioContext : RequestContext, InboundPump
+/// The stdio transport now runs each request handler in its own cooperative vibe
+/// task while the channel's read loop keeps demultiplexing inbound lines, so an
+/// out-of-band `notifications/cancelled` is dispatched (flipping the matching
+/// in-flight `CancellationToken`) *concurrently* with a running handler — the
+/// handler's `ctx.isCancelled()` simply observes the flipped token. There is no
+/// cooperative-drain hack any more (the previous synchronous loop could not read
+/// stdin until the handler returned).
+final class StdioContext : RequestContext
 {
 	private void delegate(string) @safe sink;
 	private Json delegate(string, Json) @safe serverRequestFn;
-	private void delegate() @safe drainFn;
 	private ClientCapabilities clientCaps;
 	private Json progressTok;
 	private ProtocolVersion version_;
@@ -463,30 +448,19 @@ final class StdioContext : RequestContext, InboundPump
 	}
 
 	/// As above, plus a server->client request channel: `serverRequest(method,
-	/// params)` writes the request and blocks until the client's reply (the
-	/// transport pumps stdin), returning the `result` or throwing on error.
-	/// `drainPending` (may be null) non-blockingly reads + dispatches any pending
-	/// inbound messages so a handler poll point can observe an out-of-band
-	/// `notifications/cancelled`. `clientCaps` are the capabilities the client
+	/// params)` writes the request and blocks the current task until the client's
+	/// reply (the `DuplexChannel` correlates it on its read loop), returning the
+	/// `result` or throwing on error. `clientCaps` are the capabilities the client
 	/// declared at `initialize`, so `clientSupports` can gate `sample`/`elicit`.
 	this(void delegate(string) @safe sink, Json delegate(string, Json) @safe serverRequest,
-			void delegate() @safe drainPending, ClientCapabilities clientCaps,
-			Json progressToken = Json.undefined, ProtocolVersion negotiated = latestStable) @safe
+			ClientCapabilities clientCaps, Json progressToken = Json.undefined,
+			ProtocolVersion negotiated = latestStable) @safe
 	{
 		this.sink = sink;
 		this.serverRequestFn = serverRequest;
-		this.drainFn = drainPending;
 		this.clientCaps = clientCaps;
 		this.progressTok = progressToken;
 		this.version_ = negotiated;
-	}
-
-	/// `InboundPump`: drain + dispatch any inbound messages pending right now
-	/// (no-op when the transport wired no drain channel).
-	void drainPending() @safe
-	{
-		if (drainFn !is null)
-			drainFn();
 	}
 
 	bool isCancelled() @safe
@@ -633,11 +607,11 @@ final class RequestScope : RequestContext
 	/// this request; if none was installed it delegates to the wrapped context.
 	bool isCancelled() @safe
 	{
-		// On a transport that cannot deliver inbound concurrently (stdio), drain
-		// any pending messages first so an out-of-band notifications/cancelled is
-		// dispatched and flips this request's token before we read it.
-		if (auto pump = cast(InboundPump) inner)
-			pump.drainPending();
+		// Every transport now delivers inbound concurrently with an in-flight
+		// handler (stdio runs handlers in their own task while the channel's read
+		// loop dispatches an inbound notifications/cancelled, flipping this shared
+		// token; Streamable HTTP delivers the cancellation on a separate request).
+		// So there is no cooperative drain: just observe the token.
 		if (cancellation !is null && cancellation.cancelled)
 			return true;
 		return inner.isCancelled();
@@ -646,8 +620,6 @@ final class RequestScope : RequestContext
 	void reportProgress(double progress,
 			Nullable!double total = Nullable!double.init, string message = null) @safe
 	{
-		if (auto pump = cast(InboundPump) inner)
-			pump.drainPending();
 		inner.reportProgress(progress, total, message);
 	}
 
