@@ -1273,6 +1273,29 @@ void runStreamableHttp(McpServer server, ushort port,
 	runEventLoop();
 }
 
+/// Convenience: start a Streamable HTTP server for `server` on `port`, bound to
+/// a single `host`. Sets `StreamableHttpOptions.bindAddresses = [host]` and
+/// forwards to `runStreamableHttp(server, port, opts)`. Blocks until exit.
+void runStreamableHttp(McpServer server, ushort port, string host) @safe
+{
+	StreamableHttpOptions opts;
+	opts.bindAddresses = [host];
+	runStreamableHttp(server, port, opts);
+}
+
+unittest  // runStreamableHttp(server, port, host) overload exists and forwards
+{
+	// Compile-only: a full run blocks on the event loop and isn't unit-testable.
+	// Assert the single-host overload is callable (and that the existing
+	// options overload still is, so we didn't shadow it).
+	static assert(__traits(compiles, (McpServer s) {
+			runStreamableHttp(s, cast(ushort) 8080, "0.0.0.0");
+		}));
+	static assert(__traits(compiles, (McpServer s) {
+			runStreamableHttp(s, cast(ushort) 8080, StreamableHttpOptions.init);
+		}));
+}
+
 unittest  // legacy endpoint event: `event: endpoint` carrying the message-POST URI
 {
 	// 2024-11-05 basic/transports §HTTP with SSE: "When a client connects, the
