@@ -291,8 +291,12 @@ struct CreateMessageRequest
 		if ("temperature" in j && j["temperature"].type != Json.Type.undefined
 				&& j["temperature"].type != Json.Type.null_)
 			r.temperature = j["temperature"].to!double;
-		if ("maxTokens" in j && j["maxTokens"].type == Json.Type.int_)
-			r.maxTokens = j["maxTokens"].get!long;
+		// `maxTokens` is a spec `number` (schema.ts: `maxTokens: number;`), so accept
+		// any non-null numeric representation (int, bigInt, or float) and not just an
+		// integer literal: a conformant sender may emit e.g. 100.0 (Json.Type.float_).
+		if ("maxTokens" in j && j["maxTokens"].type != Json.Type.undefined
+				&& j["maxTokens"].type != Json.Type.null_)
+			r.maxTokens = j["maxTokens"].to!long;
 		if ("stopSequences" in j && j["stopSequences"].type == Json.Type.array)
 			foreach (i; 0 .. j["stopSequences"].length)
 				r.stopSequences ~= j["stopSequences"][i].get!string;
@@ -776,6 +780,33 @@ unittest  // ToolChoice accepts each spec mode (auto/required/none)
 		c.mode = m;
 		assert(ToolChoice.fromJson(c.toJson()).mode.get == m);
 	}
+}
+
+unittest  // CreateMessageRequest.fromJson accepts a float-valued maxTokens (spec type is number)
+{
+	// schema.ts: `maxTokens: number;` (required). A conformant sender may emit a
+	// JSON float such as 100.0; vibe.data.json represents that as Json.Type.float_.
+	// The required value MUST NOT be dropped just because it is not an integer literal.
+	Json j = Json.emptyObject;
+	Json arr = Json.emptyArray;
+	arr ~= SamplingMessage("user", Content.makeText("hi")).toJson();
+	j["messages"] = arr;
+	j["maxTokens"] = Json(100.0); // float number, not int literal
+	auto r = CreateMessageRequest.fromJson(j);
+	assert(!r.maxTokens.isNull, "float-valued maxTokens must not be dropped");
+	assert(r.maxTokens.get == 100);
+}
+
+unittest  // CreateMessageRequest.fromJson still accepts an integer-valued maxTokens
+{
+	Json j = Json.emptyObject;
+	Json arr = Json.emptyArray;
+	arr ~= SamplingMessage("user", Content.makeText("hi")).toJson();
+	j["messages"] = arr;
+	j["maxTokens"] = Json(256L);
+	auto r = CreateMessageRequest.fromJson(j);
+	assert(!r.maxTokens.isNull);
+	assert(r.maxTokens.get == 256);
 }
 
 unittest  // CreateMessageRequest emits tools and toolChoice; omits when unset
