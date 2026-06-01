@@ -19,14 +19,19 @@
  * The two tools are declared in the ergonomic UDA style (`@tool` methods on an
  * `AuthApi` class, registered in one call via `registerHandlers`). Each takes a
  * `RequestContext ctx` (auto-injected, omitted from the input schema) to read
- * `ctx.auth()` and returns a `CallToolResult` so the example can shape its exact
- * text content and structured payload.
+ * `ctx.auth()`. The TYPED APIs are used throughout:
+ *   - `whoami` returns a typed `WhoamiResult` struct, so the reflection layer
+ *     INFERS both the tool's output schema (via `jsonSchemaOf`) and the
+ *     `structuredContent` of the result — no hand-built `Json`.
+ *   - `secret_note` returns a `CallToolResult` (it must set `isError` on the
+ *     per-tool scope-denied path) whose content is built with the typed
+ *     `Content.makeText` helper rather than hand-assembled `Json`.
  *
- * In a real deployment the verification key comes from your authorization
- * server's JWKS (`JwtVerifierConfig.jwksUri`). To keep this example
- * self-contained and offline, we pin the AS's public key directly via
- * `staticPublicKeysPem` — the client mints a token with the matching private
- * key, simulating what the AS would issue.
+ * TRANSPORT: this example is HTTP-only and stays on `runStreamableHttp`. OAuth
+ * 2.1 resource-server protection (401 challenges, the RFC 9728 PRM document, RFC
+ * 8707 audience binding) is inherently an HTTP concern, so there is no stdio mode
+ * here — adding one would have nothing to demonstrate. The getopt surface is just
+ * `--port` / `--host`; the client connects with `--url`.
  *
  *   dub build -c server
  *   ./auth-server --port 8742        # then run the client against it
@@ -36,8 +41,6 @@ module auth_example_server;
 import std.getopt : getopt;
 import std.stdio : stderr, writefln;
 import std.typecons : nullable;
-
-import vibe.data.json : Json;
 
 import mcp;
 import mcp.transport : StreamableHttpOptions, runStreamableHttp;
@@ -58,6 +61,17 @@ enum PublicKeyPem = "-----BEGIN PUBLIC KEY-----\n"
 	~ "Uyb2/iyjmioDCWYWx8Cp3defXx7Hl89WmW/0G66IVaqXTpmRM0AW36yqeg==\n"
 	~ "-----END PUBLIC KEY-----\n";
 
+/// The typed structured result of the `whoami` tool. Returning this struct from
+/// the `@tool` method lets the reflection layer derive the tool's output schema
+/// and populate `structuredContent` automatically — no hand-built `Json`.
+struct WhoamiResult
+{
+	/// The authenticated principal (the token `sub`).
+	string subject;
+	/// The scopes granted by the validated token.
+	string[] scopes;
+}
+
 /// The tools, declared in the ergonomic UDA style. Each `@tool` method takes a
 /// `RequestContext ctx` (auto-injected by the reflection layer and omitted from
 /// the inferred input schema) and reads the validated token via `ctx.auth()`.
@@ -67,33 +81,21 @@ final class AuthApi
 
 	/// `whoami` — returns the authenticated principal and the granted scopes, read
 	/// straight from the validated token via `ctx.auth()`. Requires only the
-	/// server-wide `mcp:read` scope. Returns a `CallToolResult` so the human-
-	/// readable text line and the structured payload are shaped exactly.
+	/// server-wide `mcp:read` scope. Returns a TYPED `WhoamiResult`, so the
+	/// reflection layer fills in `structuredContent` (and the output schema) for
+	/// us — we never touch `Json`.
 	@tool("whoami", "Return the authenticated subject and granted scopes")
-	CallToolResult whoami(RequestContext ctx)
+	WhoamiResult whoami(RequestContext ctx)
 	{
-		import std.array : join;
-
 		auto info = ctx.auth();
-		Json structured = Json.emptyObject;
-		structured["subject"] = info.subject;
-		Json scopes = Json.emptyArray;
-		foreach (s; info.scopes)
-			scopes ~= Json(s);
-		structured["scopes"] = scopes;
-
-		CallToolResult r;
-		r.content = [
-			Content.makeText("subject=" ~ info.subject ~ " scopes=" ~ info.scopes.join(" "))
-		];
-		r.structuredContent = structured;
-		return r;
+		return WhoamiResult(info.subject, info.scopes.dup);
 	}
 
 	/// `secret_note` — a privileged tool guarded by a FINER-GRAINED, per-tool scope
 	/// check (`mcp:write`) on top of the server-wide `mcp:read`. The handler reads
 	/// `ctx.auth().hasScope` and returns a tool error when the caller lacks the
-	/// write scope, demonstrating in-handler authorization decisions.
+	/// write scope, demonstrating in-handler authorization decisions. Returns a
+	/// `CallToolResult` (needed for `isError`); content uses `Content.makeText`.
 	@tool("secret_note", "Return a secret note; requires the mcp:write scope")
 	CallToolResult secretNote(RequestContext ctx)
 	{
