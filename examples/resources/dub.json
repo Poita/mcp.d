@@ -1,6 +1,6 @@
 {
 	"name": "resources",
-	"description": "MCP Resources example (server + self-verifying e2e client) over Streamable HTTP.",
+	"description": "MCP Resources example (server + self-verifying e2e client) over BOTH stdio and Streamable HTTP.",
 	"dependencies": {
 		"mcp": { "path": "../.." }
 	},
