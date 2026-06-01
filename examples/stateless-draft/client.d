@@ -2,16 +2,18 @@
  * Stateless (draft) protocol — client side AND the example's e2e test.
  * DUAL TRANSPORT: the SAME assertions run over BOTH stdio and HTTP.
  *
- *   dub run -c client                                   # stdio: spawns the server
+ *   dub run -c client                                       # stdio: spawns the server
  *   dub run -c client -- --http http://127.0.0.1:8431/mcp   # HTTP
  *
- * When `--http <url>` is given the client connects with `McpClient.http(url)`;
- * otherwise it spawns the built `stateless-draft-server` binary (no `--http`)
- * via `McpClient.spawn`, which launches the subprocess and talks
- * newline-delimited JSON-RPC over its stdin/stdout. The draft (2026-07-28)
- * stateless model is engaged the same way on either channel — `enableDraft()` +
- * per-request `_meta` — so a single transport-agnostic assertion body verifies
- * both.
+ * Transport selection and event-loop wiring are delegated to the shared
+ * `examples_common` scaffold: `connectFromArgs(args, "stateless-draft-server")`
+ * returns an `McpClient.http(url)` when `--http <url>` (or `--url <url>`) is
+ * given, otherwise `McpClient.spawnSibling("stateless-draft-server")` — which
+ * launches the built server binary next to this client and talks
+ * newline-delimited JSON-RPC over its stdin/stdout. `runClient(scenario)` drives
+ * the vibe event loop uniformly so the IDENTICAL assertion body works over both
+ * channels. The draft (2026-07-28) stateless model is engaged the same way on
+ * either channel — `enableDraft()` + per-request `_meta`.
  *
  * It ASSERTS the consumer's-eye view:
  *
@@ -28,32 +30,22 @@
  *     cache hint (`ttlMs` / `cacheScope`);
  *   - a bad `tools/call` returns the expected JSON-RPC error code.
  *
- * On success it prints an "OK:" summary and exits 0; on any mismatch it prints
- * what differed and exits non-zero.
+ * On success it prints an "OK:" summary and the scenario returns 0; on any
+ * mismatch the shared `check`/`checkEq` print a `FAIL:` line and throw, so
+ * `runClient` returns a non-zero exit code.
  */
 module stateless_draft_client;
 
 import std.algorithm : canFind, map;
 import std.array : array;
 import std.conv : to;
-import std.getopt : getopt;
 
 import vibe.data.json : Json;
 
 import mcp;
 import mcp.protocol.draft : CacheScope;
 
-/// `stderr.writeln` is `@system`; wrap it so the `@safe` e2e body can report.
-private void logLine(string s) @trusted nothrow
-{
-	import std.stdio : stderr;
-
-	try
-		stderr.writeln(s);
-	catch (Exception)
-	{
-	}
-}
+import examples_common : check, checkEq, runClient, connectFromArgs;
 
 private void printLine(string s) @trusted nothrow
 {
@@ -64,16 +56,6 @@ private void printLine(string s) @trusted nothrow
 	catch (Exception)
 	{
 	}
-}
-
-/// Absolute path to the `stateless-draft-server` binary, resolved next to this
-/// client binary (dub writes both into the package root).
-private string serverBinaryPath() @safe
-{
-	import std.file : thisExePath;
-	import std.path : dirName, buildPath;
-
-	return buildPath(dirName(thisExePath()), "stateless-draft-server");
 }
 
 /// Typed arguments for the `add` tool. Passing this struct to the typed
@@ -94,121 +76,65 @@ struct SumResult
 	long sum;
 }
 
-int main(string[] args)
+int main(string[] args) @safe
 {
-	string httpUrl;
-	getopt(args, "http",
-			"Connect over Streamable HTTP to this URL (default: spawn server over stdio)",
-			&httpUrl);
-
-	// Build the client over the selected transport BEFORE entering the event
-	// loop, so the stdio subprocess outlives the e2e body. `McpClient.spawn`
-	// launches the server and owns its pipes; `client.close()` runs the stdio
-	// shutdown sequence (SIGTERM->SIGKILL) on exit. HTTP `close()` is also correct.
-	McpClient client;
-	bool overHttp = httpUrl.length != 0;
-	if (overHttp)
-		client = McpClient.http(httpUrl);
-	else
-		client = McpClient.spawn([serverBinaryPath()]);
-	scope (exit)
-		client.close();
-
-	int rc;
-	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
-
-	runTask(() nothrow{
+	// The transport label is purely cosmetic (for the OK: summary); the scaffold
+	// derives the actual transport from the same flags.
+	immutable overHttp = args.canFind("--http") || args.canFind("--url");
+	return runClient(() @safe {
+		// connectFromArgs picks HTTP (`--http <url>`/`--url <url>`) or spawns the
+		// sibling `stateless-draft-server` over stdio. The client is not yet
+		// initialized; the draft path uses enableDraft()/connect() below.
+		auto client = connectFromArgs(args, "stateless-draft-server");
 		scope (exit)
-			exitEventLoop();
-		try
-			rc = runE2E(client, overHttp);
-		catch (Exception e)
-		{
-			logLine("FAIL: unexpected exception: " ~ e.msg);
-			rc = 1;
-		}
+			client.close();
+		return runE2E(client, overHttp);
 	});
-	runEventLoop();
-	return rc;
-}
-
-/// A tiny assertion helper that records the first failure rather than throwing,
-/// so the e2e prints exactly what differed and returns a non-zero code.
-private struct Checker
-{
-	bool ok = true;
-
-	void check(bool cond, lazy string what) @safe
-	{
-		if (!cond)
-		{
-			ok = false;
-			logLine("FAIL: " ~ what);
-		}
-	}
-
-	void eq(T)(T actual, T expected, string label) @safe
-	{
-		check(actual == expected,
-				label ~ ": expected " ~ expected.to!string ~ ", got " ~ actual.to!string);
-	}
 }
 
 private int runE2E(McpClient client, bool overHttp) @safe
 {
-	Checker c;
-
 	// --- 1. server/discover (stateless, up-front version negotiation) ---------
 	client.enableDraft();
 	auto disc = client.discover();
-	c.check(disc.protocolVersions.canFind("2026-07-28"),
+	check(disc.protocolVersions.canFind("2026-07-28"),
 			"discover.supportedVersions should contain the draft 2026-07-28; got "
 			~ disc.protocolVersions.to!string);
-	c.eq(disc.serverInfo.name, "stateless-draft-server", "discover.serverInfo.name");
+	checkEq(disc.serverInfo.name, "stateless-draft-server", "discover.serverInfo.name");
 
 	// --- 2. connect() selects the stateless draft -----------------------------
 	auto negotiated = client.connect();
-	c.eq(negotiated, ProtocolVersion.draft, "connect() negotiated version");
-	c.eq(client.protocolVersion(), ProtocolVersion.draft, "client.protocolVersion()");
+	checkEq(negotiated, ProtocolVersion.draft, "connect() negotiated version");
+	checkEq(client.protocolVersion(), ProtocolVersion.draft, "client.protocolVersion()");
 
 	// --- 3. listTools + per-list draft CacheableResult hint -------------------
 	auto tools = client.listTools();
 	auto names = tools.tools.map!(t => t.name).array;
-	c.check(names.canFind("add"), "listTools should contain 'add'; got " ~ names.to!string);
-	c.check(!tools.cache.isNull, "listTools result should carry a draft cache hint");
-	if (!tools.cache.isNull)
-	{
-		c.eq(tools.cache.get.ttlMs, 5000L, "tools/list cache.ttlMs");
-		c.eq(tools.cache.get.cacheScope, CacheScope.public_, "tools/list cache.cacheScope");
-	}
+	check(names.canFind("add"), "listTools should contain 'add'; got " ~ names.to!string);
+	check(!tools.cache.isNull, "listTools result should carry a draft cache hint");
+	checkEq(tools.cache.get.ttlMs, 5000L, "tools/list cache.ttlMs");
+	checkEq(tools.cache.get.cacheScope, CacheScope.public_, "tools/list cache.cacheScope");
 
 	// --- 4. tools/call: typed-struct-derived structuredContent + text mirror --
 	// Pass typed args (the SDK marshals the `arguments` object from the struct).
 	auto res = client.callTool("add", AddArgs(2, 40));
-	c.check(!res.isError, "add tool call should not be an error result");
+	check(!res.isError, "add tool call should not be an error result");
 	// The @tool returns a SumResult struct; the SDK mirrors it into a single
 	// JSON text content block and into structuredContent.
-	c.check(res.content.length == 1, "add result should have one content block; got "
-			~ res.content.length.to!string);
-	if (res.content.length == 1)
-		c.eq(res.content[0].text, `{"sum":42}`, "add result text (struct JSON mirror)");
+	checkEq(res.content.length, 1UL, "add result content block count");
+	checkEq(res.content[0].text, `{"sum":42}`, "add result text (struct JSON mirror)");
 	// Decode structuredContent into the typed struct instead of reading raw Json.
 	auto sum = res.structuredContentAs!SumResult;
-	c.eq(sum.sum, 42L, "add structuredContent.sum (typed)");
+	checkEq(sum.sum, 42L, "add structuredContent.sum (typed)");
 
 	// --- 5. readResource + per-resource draft cache hint ----------------------
 	auto rr = client.readResource("demo://greeting");
-	c.check(rr.contents.length == 1, "greeting should have one content block; got "
-			~ rr.contents.length.to!string);
-	if (rr.contents.length == 1)
-		c.eq(rr.contents[0].text, "hello from the stateless draft server",
-				"greeting resource text");
-	c.check(!rr.cache.isNull, "greeting resources/read should carry a draft cache hint");
-	if (!rr.cache.isNull)
-	{
-		c.eq(rr.cache.get.ttlMs, 9000L, "resources/read cache.ttlMs");
-		c.eq(rr.cache.get.cacheScope, CacheScope.private_, "resources/read cache.cacheScope");
-	}
+	checkEq(rr.contents.length, 1UL, "greeting content block count");
+	checkEq(rr.contents[0].text, "hello from the stateless draft server",
+			"greeting resource text");
+	check(!rr.cache.isNull, "greeting resources/read should carry a draft cache hint");
+	checkEq(rr.cache.get.ttlMs, 9000L, "resources/read cache.ttlMs");
+	checkEq(rr.cache.get.cacheScope, CacheScope.private_, "resources/read cache.cacheScope");
 
 	// --- 6. error path: unknown tool -> invalidParams (-32602) ----------------
 	bool threw = false;
@@ -220,18 +146,11 @@ private int runE2E(McpClient client, bool overHttp) @safe
 		threw = true;
 		gotCode = e.code;
 	}
-	c.check(threw, "calling an unknown tool should throw an McpException");
-	if (threw)
-		c.eq(gotCode, cast(int) ErrorCode.invalidParams, "unknown-tool error code");
+	check(threw, "calling an unknown tool should throw an McpException");
+	checkEq(gotCode, cast(int) ErrorCode.invalidParams, "unknown-tool error code");
 
-	// Transport teardown is owned by `main`'s `scope(exit) client.close()` (the
-	// stdio shutdown sequence on the spawned subprocess), so don't close here.
-
-	if (!c.ok)
-	{
-		logLine("FAIL: one or more assertions did not match the expected stateless-draft behavior.");
-		return 1;
-	}
+	// Transport teardown is owned by main's scope(exit) client.close() (the stdio
+	// shutdown sequence on the spawned subprocess), so don't close here.
 
 	immutable transport = overHttp ? "http" : "stdio";
 	printLine("OK: stateless-draft e2e passed over " ~ transport

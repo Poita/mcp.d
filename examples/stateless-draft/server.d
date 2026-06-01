@@ -19,19 +19,19 @@
  * and a `@resource` method carrying its draft freshness hint via `@cache`.
  * `registerHandlers` wires both onto the server. There is no hand-built
  * request/response Json anywhere in this file.
+ *
+ * Transport selection is delegated to the shared `examples_common` scaffold:
+ * `runServerFromArgs(server, args, 8431)` parses `--http`/`--port`/`--host` and
+ * serves Streamable HTTP or stdio accordingly.
  */
 module stateless_draft_server;
 
-import std.getopt : getopt;
 import std.typecons : nullable;
-import std.stdio : stderr;
 
 import mcp;
-import mcp.transport : StreamableHttpOptions, runStreamableHttp, runStdio;
 import mcp.protocol.draft : CacheHint, CacheScope;
 
-enum string defaultHost = "127.0.0.1";
-enum ushort defaultPort = 8431;
+import examples_common : runServerFromArgs;
 
 /// Typed result of the `add` tool. Returning a struct from a `@tool` method lets
 /// the reflection layer DERIVE both the output schema (`jsonSchemaOf!SumResult`)
@@ -70,16 +70,8 @@ final class StatelessDraftApi
 	}
 }
 
-int main(string[] args)
+void main(string[] args) @safe
 {
-	bool http;
-	ushort port = defaultPort;
-	string host = defaultHost;
-	getopt(args,
-			"http", "Serve over Streamable HTTP instead of stdio", &http,
-			"port|p", "HTTP port to listen on (default 8431)", &port,
-			"host|h", "HTTP address to bind (default 127.0.0.1)", &host);
-
 	auto server = new McpServer("stateless-draft-server", "1.0.0",
 			nullable("A stateless (draft) demo server: server/discover + per-request _meta."));
 
@@ -95,20 +87,8 @@ int main(string[] args)
 	// a per-tool one, so it stays a direct server call.
 	server.setListCacheHint("tools/list", CacheHint(5000, CacheScope.public_));
 
-	if (http)
-	{
-		StreamableHttpOptions opts;
-		// Bind loopback only; the transport's Origin guard already restricts to
-		// localhost, which is exactly what this local demo wants.
-		opts.bindAddresses = [host];
-		stderr.writefln("stateless-draft-server listening on http://%s:%d/mcp", host, port);
-		runStreamableHttp(server, port, opts);
-	}
-	else
-	{
-		// stdio: a single newline-delimited JSON-RPC stream on stdin/stdout. The
-		// draft stateless model rides on per-request `_meta` exactly as over HTTP.
-		runStdio(server);
-	}
-	return 0;
+	// Transport selection (stdio default; `--http` + `--port`/`--host` for
+	// Streamable HTTP) comes from the shared scaffold. The draft stateless model
+	// rides identically over either channel.
+	runServerFromArgs(server, args, 8431);
 }
