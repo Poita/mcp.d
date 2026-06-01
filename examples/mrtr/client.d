@@ -17,8 +17,17 @@
  * Transport selection (the SAME assertions verify both):
  *   - default (no --http): STDIO. The client SPAWNS the built `mrtr-server`
  *     binary (with no --http) and speaks newline-delimited JSON-RPC over the pipe
- *     via `McpClient.stdio` (the pattern from examples/tools/client.d).
+ *     via `McpClient.stdio`.
  *   - `--http <url>`: connect to a running HTTP server via `McpClient.http(url)`.
+ *
+ * Typed/ergonomic SDK APIs adopted here (the args/handlers/result decode are all
+ * typed; no hand-built Json on those paths):
+ *   - typed `callTool(name, BookMeetingArgs)` (#468) replaces the hand-built
+ *     arguments `Json`;
+ *   - `ElicitResult.accept!MeetingDate` (#466) and `CreateMessageResult.text`
+ *     (#467) replace the hand-assembled elicitation/sampling reply structs;
+ *   - `CallToolResult.structuredContentAs!Booking` (#464) replaces the
+ *     field-by-field raw-`Json` reads of the structured result.
  *
  * On success it prints "OK: ..." and exits 0; any failed assertion prints what
  * differed and exits NON-ZERO.
@@ -42,6 +51,33 @@ import vibe.data.json : Json;
 import mcp;
 
 enum string defaultHttpUrl = "http://127.0.0.1:8765/mcp";
+
+/// Typed view of the `book_meeting` arguments. Passing this struct to the typed
+/// `callTool(name, T)` overload (#468) serializes the wire `{topic}` object for
+/// us — no hand-built `Json`.
+struct BookMeetingArgs
+{
+	string topic;
+}
+
+/// Typed view of the elicitation answer. `ElicitResult.accept!MeetingDate(...)`
+/// (#466) serializes this into the elicitation content map, mirroring the
+/// server's `MeetingDate` form struct.
+struct MeetingDate
+{
+	string date;
+}
+
+/// Typed view of the server's structured `Booking` result, decoded in one shot
+/// with `CallToolResult.structuredContentAs!Booking` (#464) instead of
+/// field-by-field raw-`Json` reads.
+struct Booking
+{
+	string topic;
+	string date;
+	string agenda;
+	int rounds;
+}
 
 /// Owns the server subprocess and exposes the newline-delimited JSON-RPC channel
 /// expected by `McpClient.stdio`. Holding `ProcessPipes` in a class field keeps
@@ -186,8 +222,8 @@ private int runE2E(McpClient client) @safe
 			found = true;
 	check(found, "listTools did not contain 'book_meeting'");
 
-	Json topicArg = Json.emptyObject;
-	topicArg["topic"] = Json("Q3 roadmap");
+	// Typed arguments (#468): pass a struct rather than hand-building a Json object.
+	auto topicArg = BookMeetingArgs("Q3 roadmap");
 
 	// ---- Round-trip view #1: no handlers -> the server's InputRequiredResult is
 	// surfaced so we can assert the raw MRTR shape. ----
@@ -234,20 +270,16 @@ private int runE2E(McpClient client) @safe
 		"requestState mismatch: '" ~ raw.requestState ~ "'");
 
 	// ---- Round-trip view #2: install mock handlers; the SDK completes the loop. ----
-	// The elicitation handler returns the meeting date; the sampling handler
-	// returns the agenda. These mocked values must flow through to the result.
+	// Installing onElicitation/onSampling alone auto-advertises the matching
+	// capabilities (effectiveCapabilities), so no raw flag-setting is needed.
+	// The elicitation handler returns the meeting date via the typed accept!T
+	// builder; the sampling handler returns the agenda via CreateMessageResult.text.
+	// These mocked values must flow through to the result.
 	client.onElicitation = (ElicitParams p) @safe {
-		Json content = Json.emptyObject;
-		content["date"] = Json("2026-06-15");
-		return ElicitResult.accept(content);
+		return ElicitResult.accept(MeetingDate("2026-06-15"));
 	};
 	client.onSampling = (CreateMessageRequest req) @safe {
-		CreateMessageResult r;
-		r.role = "assistant";
-		r.content = Content.makeText("Review Q3 milestones and assign owners.");
-		r.model = "mock-llm";
-		r.stopReason = "endTurn";
-		return r;
+		return CreateMessageResult.text("mock-llm", "Review Q3 milestones and assign owners.");
 	};
 
 	auto done = client.callTool("book_meeting", topicArg);
@@ -263,18 +295,17 @@ private int runE2E(McpClient client) @safe
 	check(text == expectedText,
 		"final text mismatch.\n  expected: " ~ expectedText ~ "\n  got:      " ~ text);
 
-	// Structured content carries the same values plus the round count (serialized
-	// from the server's typed Booking struct).
-	auto sc = done.structuredContent;
-	check(sc.type == Json.Type.object, "expected structuredContent object");
-	check(sc["topic"].get!string == "Q3 roadmap",
-		"structured topic mismatch: '" ~ sc["topic"].get!string ~ "'");
-	check(sc["date"].get!string == "2026-06-15",
-		"structured date mismatch: '" ~ sc["date"].get!string ~ "'");
-	check(sc["agenda"].get!string == "Review Q3 milestones and assign owners.",
-		"structured agenda mismatch: '" ~ sc["agenda"].get!string ~ "'");
-	check(sc["rounds"].get!int == 2,
-		"structured rounds mismatch: " ~ itoa(sc["rounds"].get!int));
+	// Structured content carries the same values plus the round count. Decode it
+	// in one shot into the typed Booking struct (#464) and assert on the fields.
+	auto booking = done.structuredContentAs!Booking;
+	check(booking.topic == "Q3 roadmap",
+		"structured topic mismatch: '" ~ booking.topic ~ "'");
+	check(booking.date == "2026-06-15",
+		"structured date mismatch: '" ~ booking.date ~ "'");
+	check(booking.agenda == "Review Q3 milestones and assign owners.",
+		"structured agenda mismatch: '" ~ booking.agenda ~ "'");
+	check(booking.rounds == 2,
+		"structured rounds mismatch: " ~ itoa(booking.rounds));
 
 	client.close();
 	() @trusted {

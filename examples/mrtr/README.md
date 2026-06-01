@@ -57,11 +57,27 @@ MRTR `Json`** — it uses the typed builders and decoders throughout:
 - **`Content.makeText`** for the final content and a typed **`Booking`** struct
   serialized into `structuredContent`.
 
-Client APIs: `McpClient.http` / `McpClient.stdio`, `enableDraft`, `discover`,
-`listTools`, `callTool` (which transparently drives the MRTR loop),
-`onElicitation`, `onSampling`, `CallToolResult.isInputRequired` /
-`inputRequests` / `requestState`. (Client tool **arguments** stay `Json` — the
-client is dynamic, which is acceptable.)
+The **client** likewise adopts the typed/ergonomic SDK APIs on every path that
+has a clean one — no hand-built `Json` on the args, handler replies, or the
+structured result:
+
+- **typed `callTool("book_meeting", BookMeetingArgs("Q3 roadmap"))`** (#468) —
+  the wire `{topic}` object is serialized from a struct.
+- **`ElicitResult.accept(MeetingDate("2026-06-15"))`** (#466) and
+  **`CreateMessageResult.text("mock-llm", "...")`** (#467) — the mock
+  `onElicitation` / `onSampling` replies are built from the typed convenience
+  constructors instead of assembling the result structs field by field.
+- **`CallToolResult.structuredContentAs!Booking`** (#464) — the structured
+  result is decoded in one shot into a typed `Booking` struct, replacing the
+  field-by-field raw-`Json` reads.
+
+Installing `onElicitation` / `onSampling` alone now auto-advertises the matching
+capabilities (`effectiveCapabilities`), so no raw capability-flag setting is
+needed.
+
+Other client APIs: `McpClient.http` / `McpClient.stdio`, `enableDraft`,
+`discover`, `listTools`, `callTool` (which transparently drives the MRTR loop),
+`CallToolResult.isInputRequired` / `inputRequests` / `requestState`.
 
 ## Running it — BOTH transports
 
