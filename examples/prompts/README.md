@@ -1,32 +1,43 @@
-# Prompts + completion example
+# Prompts + completion example (dual-transport: stdio + HTTP)
 
 A self-contained, runnable example demonstrating the MCP **prompts** surface of
 the D MCP SDK from **both sides** — a server that exposes prompts, and a client
-that drives it *and doubles as an end-to-end regression test*.
+that drives it *and doubles as an end-to-end regression test* — over **both**
+the stdio and Streamable HTTP transports.
 
 This directory is its own dub package (it depends on the root `mcp` library via
 a path dependency); it does not modify the root `dub.json`.
 
 ## What it teaches
 
-Server (`server.d`):
+Server (`server.d`) — one binary, either transport:
 
 - **`@prompt` with typed arguments.** Prompt methods are plain D methods
   annotated with `@prompt(...)`; their parameters become the prompt's typed
   arguments, and `@describe(...)` documents each one. The reflection layer
   (`registerHandlers`) derives the `prompts/list` descriptors and the typed
   dispatch for `prompts/get` automatically.
-- **Embedded-resource content in a message.** The `code_review` prompt returns a
-  `GetPromptResult` whose second message is an *embedded resource* content block
-  (`Content.makeEmbeddedText(uri, mimeType, text)`) — the snippet travels as a
-  resource (uri + mimeType + text), not just inline prose.
+- **Typed content, no hand-built Json.** The `code_review` prompt returns a
+  `GetPromptResult` whose messages are built with the SDK's typed content
+  helpers `Content.makeText(...)` and `Content.makeEmbeddedText(uri, mimeType,
+  text)` — the snippet travels as an *embedded resource* (uri + mimeType +
+  text), not just inline prose.
 - **`completion/complete` for prompt-argument autocompletion.** A completion
   handler (`setCompletionRequestHandler`) prefix-matches the partial value of the
   `language` argument against a known-language list. Registering a handler makes
   the server advertise the `completions` capability.
+- **Transport selection via `std.getopt`.** Default is **stdio**
+  (`runStdio`); passing `--http` runs the *same* configured server over
+  **Streamable HTTP** (`runStreamableHttp`) on `--port` (default `8533`) /
+  `--host` (default `127.0.0.1`). The prompt + completion surface is identical
+  on both.
 
-Client (`client.d`) — a **self-verifying e2e test**:
+Client (`client.d`) — a **self-verifying e2e test** over both transports:
 
+- selects its transport via `std.getopt`: with `--http <url>` it connects via
+  `McpClient.http(url)`; without it, it spawns the built `prompts-server` binary
+  (no `--http`) and drives it over stdio via `McpClient.stdio`. The assertions
+  are transport-agnostic, so the **same** checks verify both runs.
 - asserts `prompts/list` contains exactly `greet` and `code_review`, with their
   titles and typed-argument descriptors;
 - asserts `prompts/get greet` renders the typed `name` argument into the message
@@ -37,30 +48,56 @@ Client (`client.d`) — a **self-verifying e2e test**:
   `[python]`, `` `` → all 9 languages);
 - asserts an unknown prompt name raises a JSON-RPC `invalidParams` (-32602).
 
-On success it prints `OK: ...` and exits 0; on any failed assertion it prints
-what differed and exits non-zero.
+On success it prints `OK [stdio]: ...` / `OK [http]: ...` and exits 0; on any
+failed assertion it prints what differed and exits non-zero, so CI can run the
+client directly as a regression test on either transport.
 
 ## How to run
 
-This is a **STDIO** example: the client spawns the built server binary, so
-running the client is the whole end-to-end test.
+Build both binaries once:
 
 ```sh
 # from this directory (examples/prompts/)
 dub build -c server      # builds the prompts-server binary
-dub run   -c client      # spawns the server, runs all assertions, exits 0 on OK
+dub build -c client      # builds the prompts-client binary
 ```
 
-`dub run -c client` builds `client` if needed, then runs it. The client locates
-the `prompts-server` binary next to itself (dub places sibling-config target
-binaries in the package directory), spawns it over STDIO, and drives the whole
-handshake + prompts + completion flow through an `McpClient`.
+### STDIO (default)
 
-Expected output on success:
+The client spawns the built server binary, so running the client is the whole
+end-to-end test:
 
-```
-OK: prompts/list (2), greet typed-arg render, code_review embedded resource, ...
+```sh
+dub run -c client        # spawns prompts-server over stdio, runs all assertions, exits 0 on OK
 ```
 
-The process exit code is `0` on success and non-zero on any assertion failure,
-so CI can run the client directly as a regression test.
+### HTTP (Streamable HTTP)
+
+Start the server with `--http` (optionally choose a port), then point the client
+at its `/mcp` endpoint:
+
+```sh
+# terminal 1 — start the HTTP server (default port 8533)
+dub run -c server -- --http --port 8533
+
+# terminal 2 — drive it over HTTP
+dub run -c client -- --http http://127.0.0.1:8533/mcp
+```
+
+Expected output on success (either transport):
+
+```
+OK [stdio]: prompts/list (2), greet typed-arg render, code_review embedded resource, ...
+OK [http]:  prompts/list (2), greet typed-arg render, code_review embedded resource, ...
+```
+
+The process exit code is `0` on success and non-zero on any assertion failure.
+
+## A note on authentication
+
+This example does not configure auth. If you need to add it, do so over **HTTP
+only**: MCP authorization is defined as OAuth 2.x bearer tokens carried in HTTP
+`Authorization` headers, which is meaningful only for the HTTP transport. The
+stdio transport is a local, parent-spawned subprocess with no HTTP request
+surface, so there is no transport-level place to attach a bearer token —
+`McpClient.setBearerToken` is a no-op over stdio.

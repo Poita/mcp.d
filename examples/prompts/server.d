@@ -1,25 +1,33 @@
-/// Prompts + completion example — SERVER.
+/// Prompts + completion example — SERVER (dual-transport: stdio OR HTTP).
 ///
-/// Demonstrates the MCP "prompts" surface of the D SDK from the server side:
+/// Demonstrates the MCP "prompts" surface of the D SDK from the server side,
+/// using the ergonomic UDA / reflection layer and the SDK's typed content API:
 ///
 ///   * `@prompt`-annotated methods with *typed*, described arguments (registered
-///     via the reflection layer `registerHandlers`), each producing a
-///     `GetPromptResult` (or a string the SDK wraps into one).
-///   * a prompt message carrying an *embedded resource* content block
-///     (`Content.makeEmbeddedText`) alongside ordinary text.
+///     via `registerHandlers`), each producing a `GetPromptResult` (or a string
+///     the SDK wraps into one).
+///   * a prompt message carrying an *embedded resource* content block built with
+///     the typed `Content.makeEmbeddedText` (uri + mimeType + text) and ordinary
+///     text built with `Content.makeText` — no hand-built content Json.
 ///   * `completion/complete` for prompt-argument autocompletion
 ///     (`setCompletionRequestHandler`), prefix-matching a known-language list.
 ///
-/// Run shape: STDIO. The client (client.d) spawns this built binary and drives
-/// it; see README.md.
+/// Run shape: ONE binary, EITHER transport.
+///   * default                        -> STDIO (the client spawns this binary and drives it)
+///   * `--http [--port N] [--host H]`  -> Streamable HTTP on http://H:N/mcp
+/// See README.md.
 module prompts_server;
 
 import std.algorithm : startsWith, filter;
 import std.array : array;
+import std.getopt : getopt;
+import std.stdio : stderr;
 import std.string : toLower;
+import std.typecons : nullable;
 
 import mcp.server.server : McpServer;
 import mcp.transport.stdio : runStdio;
+import mcp.transport : StreamableHttpOptions, runStreamableHttp;
 import mcp.api.reflection : registerHandlers;
 import mcp.api.attributes : prompt, describe;
 import mcp.protocol.types : GetPromptResult, PromptMessage, Content,
@@ -85,8 +93,9 @@ final class PromptApp
 	}
 
 	/// A richer prompt that embeds a resource content block into the message
-	/// list, demonstrating `Content.makeEmbeddedText`. The `language` argument is
-	/// completed via the completion handler below.
+	/// list, built with the typed `Content.makeText` / `Content.makeEmbeddedText`
+	/// helpers (no hand-built content Json). The `language` argument is completed
+	/// via the completion handler below.
 	@prompt("code_review", "Ask the model to review a code snippet", "Code Review")
 	GetPromptResult codeReview(
 		@describe("programming language to review a sample of") string language) @safe
@@ -114,9 +123,12 @@ final class PromptApp
 private immutable string[] knownLanguages =
 	["c", "cpp", "d", "go", "java", "javascript", "python", "rust", "typescript"];
 
-void main()
+/// Build the fully-configured server. Shared by both transports so the surface
+/// (prompts + completion capability) is identical regardless of how it is run.
+private McpServer buildServer() @safe
 {
-	auto server = new McpServer("prompts-example-server", "1.0.0");
+	auto server = new McpServer("prompts-example-server", "1.0.0",
+		nullable("Prompts + completion example (dual-transport stdio/http)."));
 
 	// Register the @prompt methods (typed dispatch + descriptors) by reflection.
 	registerHandlers(server, new PromptApp);
@@ -140,5 +152,32 @@ void main()
 		return result;
 	});
 
-	runStdio(server);
+	return server;
+}
+
+void main(string[] args)
+{
+	bool http;
+	ushort port = 8533;
+	string host = "127.0.0.1";
+	getopt(args,
+		"http", "Serve over Streamable HTTP instead of stdio", &http,
+		"port|p", "HTTP port to listen on (default 8533)", &port,
+		"host|h", "HTTP address to bind (default 127.0.0.1)", &host);
+
+	auto server = buildServer();
+
+	if (http)
+	{
+		StreamableHttpOptions opts;
+		opts.bindAddresses = [host];
+		() @trusted {
+			stderr.writefln("prompts-server listening on http://%s:%d/mcp", host, port);
+		}();
+		runStreamableHttp(server, port, opts);
+	}
+	else
+	{
+		runStdio(server);
+	}
 }
