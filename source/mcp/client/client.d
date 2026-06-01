@@ -869,16 +869,64 @@ final class McpClient : ClientProtocol
 	version (unittest) package Json delegate(string method, Json params) @safe onRpcForTest;
 
 	/// Send a request and return its result (or throw `McpException`).
+	///
+	/// When the server answers with a `URLElicitationRequiredError`
+	/// (`-32042`, client/elicitation Â§"URL Elicitation Required Error",
+	/// 2025-11-25 / draft), its `data.elicitations[]` carries URL-mode
+	/// elicitations the server has begun out-of-band. Per SEP-1036 the client
+	/// MUST treat such an error as equivalent to an `elicitation/create` request,
+	/// so we register every announced `elicitationId` before rethrowing. This is
+	/// what later lets a `notifications/elicitation/complete` for one of those ids
+	/// correlate (in `dispatchNotification`) and be forwarded to the application
+	/// rather than dropped as "unknown".
 	private Json rpc(string method, Json params) @safe
 	{
-		version (unittest)
-			if (onRpcForTest !is null)
-				return onRpcForTest(method, params);
-		const id = nextId++;
-		if (useDraft)
-			params = injectDraftMeta(params);
-		auto message = makeRequest(Json(id), method, params);
-		return transport.deliver(message, id);
+		try
+		{
+			version (unittest)
+				if (onRpcForTest !is null)
+					return onRpcForTest(method, params);
+			const id = nextId++;
+			if (useDraft)
+				params = injectDraftMeta(params);
+			auto message = makeRequest(Json(id), method, params);
+			return transport.deliver(message, id);
+		}
+		catch (McpException e)
+		{
+			if (e.code == ErrorCode.urlElicitationRequired)
+				registerUrlElicitations(e.data);
+			throw e;
+		}
+	}
+
+	/// Register the `elicitationId`s announced by a `URLElicitationRequiredError`
+	/// (`-32042`) so a subsequent `notifications/elicitation/complete` correlates
+	/// and is forwarded. `error` is the JSON-RPC error object; the URL-mode
+	/// elicitations live under `error.data.elicitations[]`, each an
+	/// `ElicitRequestURLParams` carrying an `elicitationId` (2025-11-25 / draft
+	/// schema `URLElicitationRequiredError`). Ids already tracked are left as-is so
+	/// an in-flight completion state is not reset; malformed entries are skipped.
+	package void registerUrlElicitations(Json error) @safe
+	{
+		if (error.type != Json.Type.object || "data" !in error)
+			return;
+		auto data = error["data"];
+		if (data.type != Json.Type.object || "elicitations" !in data)
+			return;
+		auto elicitations = data["elicitations"];
+		if (elicitations.type != Json.Type.array)
+			return;
+		foreach (i; 0 .. elicitations.length)
+		{
+			auto e = elicitations[i];
+			if (e.type != Json.Type.object || "elicitationId" !in e
+					|| e["elicitationId"].type != Json.Type.string)
+				continue;
+			const eid = e["elicitationId"].get!string;
+			if (eid.length && eid !in elicitationIds_)
+				elicitationIds_[eid] = false; // tracked, not yet completed
+		}
 	}
 
 	/// The capabilities actually advertised on the wire: `capabilities` augmented
@@ -1909,6 +1957,96 @@ unittest  // elicitation/complete for an unknown id is ignored
 
 	Json note = Json.emptyObject;
 	note["elicitationId"] = "never-issued";
+	c.dispatchNotification("notifications/elicitation/complete", note);
+	assert(!forwarded);
+}
+
+unittest  // -32042 URLElicitationRequiredError registers its elicitationIds (client/elicitation, 2025-11-25/draft)
+{
+	auto c = McpClient.http("http://localhost");
+
+	// Build the error object exactly as `errorFrom` would hand it to rpc():
+	// {code: -32042, message, data: {elicitations: [ElicitRequestURLParams...]}}.
+	Json e0 = Json.emptyObject;
+	e0["mode"] = "url";
+	e0["url"] = "https://example.com/elicit/a";
+	e0["elicitationId"] = "e-from-error";
+	Json data = Json.emptyObject;
+	data["elicitations"] = Json([e0]);
+	Json error = Json.emptyObject;
+	error["code"] = cast(int) ErrorCode.urlElicitationRequired;
+	error["message"] = "URL elicitation required";
+	error["data"] = data;
+
+	// rpc() must surface the error AND, as a side effect, register the id so a
+	// later completion correlates. Drive it through the real rpc() path via the
+	// test seam, which throws the McpException `errorFrom` would build.
+	c.onRpcForTest = (string, Json) @safe {
+		throw new McpException(cast(int) ErrorCode.urlElicitationRequired,
+				"URL elicitation required", error);
+	};
+
+	bool threw;
+	try
+		cast(void) c.callTool("any");
+	catch (McpException ex)
+		threw = (ex.code == ErrorCode.urlElicitationRequired);
+	assert(threw);
+
+	// The completion notification for the error-announced id must now be
+	// forwarded (it would have been dropped as "unknown" before the fix).
+	string forwardedMethod;
+	c.onNotification = (string method, Json) @safe { forwardedMethod = method; };
+	Json note = Json.emptyObject;
+	note["elicitationId"] = "e-from-error";
+	c.dispatchNotification("notifications/elicitation/complete", note);
+	assert(forwardedMethod == "notifications/elicitation/complete");
+}
+
+unittest  // registerUrlElicitations records every announced id; a non-32042 error registers nothing
+{
+	auto c = McpClient.http("http://localhost");
+
+	Json e0 = Json.emptyObject;
+	e0["elicitationId"] = "id-1";
+	Json e1 = Json.emptyObject;
+	e1["elicitationId"] = "id-2";
+	Json data = Json.emptyObject;
+	data["elicitations"] = Json([e0, e1]);
+	Json error = Json.emptyObject;
+	error["data"] = data;
+
+	c.registerUrlElicitations(error);
+
+	string[] seen;
+	c.onNotification = (string method, Json) @safe { seen ~= method; };
+	foreach (id; ["id-1", "id-2"])
+	{
+		Json note = Json.emptyObject;
+		note["elicitationId"] = id;
+		c.dispatchNotification("notifications/elicitation/complete", note);
+	}
+	assert(seen.length == 2); // both ids correlated and forwarded
+}
+
+unittest  // registerUrlElicitations tolerates a malformed/absent elicitations payload
+{
+	auto c = McpClient.http("http://localhost");
+	c.registerUrlElicitations(Json.emptyObject); // no data
+	Json missingArray = Json.emptyObject;
+	missingArray["data"] = Json.emptyObject; // data present, elicitations absent
+	c.registerUrlElicitations(missingArray);
+	Json badEntries = Json.emptyObject;
+	Json d = Json.emptyObject;
+	d["elicitations"] = Json([Json("not-an-object"), Json.emptyObject]);
+	badEntries["data"] = d;
+	c.registerUrlElicitations(badEntries); // entries without a string id are skipped
+
+	// None of the above should have registered a correlatable id.
+	bool forwarded;
+	c.onNotification = (string, Json) @safe { forwarded = true; };
+	Json note = Json.emptyObject;
+	note["elicitationId"] = "not-an-object";
 	c.dispatchNotification("notifications/elicitation/complete", note);
 	assert(!forwarded);
 }
