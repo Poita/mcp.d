@@ -1,11 +1,12 @@
 module mcp.protocol.types;
 
 import std.typecons : Nullable, nullable;
-import vibe.data.json : Json, parseJsonString, deserializeJson;
+import vibe.data.json : Json, parseJsonString, deserializeJson, serializeToJson;
 import mcp.protocol.capabilities;
 import mcp.protocol.versions : ProtocolVersion;
 import mcp.protocol.draft : InputRequest, inputRequestsToJson,
 	inputRequestsFromJson, CacheHint, parseCacheHint, withCache;
+import mcp.client.client : ProgressToken;
 
 @safe:
 
@@ -832,6 +833,18 @@ struct Tool
 			projected.execution = execution;
 		return projected;
 	}
+
+	/// Parse the raw `annotations` Json into a typed `ToolAnnotations` on demand.
+	/// The struct stores annotations as untyped `Json` (so unknown hint keys
+	/// survive a round-trip); this accessor lazily decodes the known hints via
+	/// `ToolAnnotations.fromJson`, returning a default (all-null) `ToolAnnotations`
+	/// when `annotations` is not an object.
+	ToolAnnotations toolAnnotations() const @safe
+	{
+		if (annotations.type != Json.Type.object)
+			return ToolAnnotations.init;
+		return ToolAnnotations.fromJson(annotations);
+	}
 }
 
 /// An empty JSON Schema object: `{"type":"object"}`.
@@ -840,6 +853,36 @@ Json emptyObjectSchema() @safe
 	Json s = Json.emptyObject;
 	s["type"] = "object";
 	return s;
+}
+
+/// Read a JSON number as a `double`, widening an integer-encoded value. vibe.d
+/// serializes a whole-valued `double` (e.g. `5.0`) as a JSON integer, so a value
+/// the producer intended as a number can arrive as `Json.Type.int_`; clients that
+/// expect a `double` would otherwise have to re-derive this widening themselves.
+/// Returns `j.get!double` for a float, `cast(double) j.get!long` for an integer,
+/// and throws for any non-numeric `Json`.
+double asNumber(Json j) @safe
+{
+	if (j.type == Json.Type.int_)
+		return cast(double) j.get!long;
+	return j.get!double;
+}
+
+unittest  // asNumber reads a float-encoded JSON number
+{
+	assert(asNumber(Json(0.25)) == 0.25);
+}
+
+unittest  // asNumber widens an integer-encoded JSON number to double
+{
+	assert(asNumber(Json(5)) == 5.0);
+}
+
+unittest  // asNumber throws on a non-numeric JSON value
+{
+	import std.exception : assertThrown;
+
+	assertThrown(asNumber(Json("not a number")));
 }
 
 /// Result of `tools/call`.
@@ -956,6 +999,18 @@ struct CallToolResult
 		if (v >= ProtocolVersion.v2025_06_18)
 			projected.structuredContent = structuredContent;
 		return projected;
+	}
+
+	/// Decode `structuredContent` into a typed struct `T`. Mirrors
+	/// `ElicitResult.contentAs!T`: returns `T.init` when `structuredContent` is not
+	/// an object (e.g. unset, or a content-only tool result), so callers that opted
+	/// into a typed output schema can read the result without re-deserializing by
+	/// hand.
+	T structuredContentAs(T)() const @safe
+	{
+		if (structuredContent.type != Json.Type.object)
+			return T.init;
+		return () @trusted { return deserializeJson!T(structuredContent); }();
 	}
 }
 
@@ -1552,6 +1607,26 @@ unittest  // Tool omits execution when taskSupport unset (forbidden default)
 	Tool t = {name: "plain"};
 	auto j = t.toJson();
 	assert("execution" !in j);
+}
+
+unittest  // Tool.toolAnnotations parses the raw annotations Json into a typed struct
+{
+	ToolAnnotations a;
+	a.title = "Delete file";
+	a.readOnlyHint = false;
+	a.destructiveHint = true;
+	Tool t;
+	t.name = "rm";
+	t.annotations = a.toJson();
+
+	auto back = t.toolAnnotations();
+	assert(!back.title.isNull && back.title.get == "Delete file");
+	assert(!back.readOnlyHint.isNull && back.readOnlyHint.get == false);
+	assert(!back.destructiveHint.isNull && back.destructiveHint.get == true);
+
+	Tool bare;
+	bare.name = "noop";
+	assert(bare.toolAnnotations().empty);
 }
 
 unittest  // Tool execution round-trips taskSupport through fromJson
@@ -2718,6 +2793,18 @@ struct ElicitResult
 		return r;
 	}
 
+	/// Convenience constructor for an `accept` whose collected `content` is built
+	/// by serializing a typed struct `T` (symmetric with `contentAs!T`). The struct
+	/// fields become the `{name: value}` content map, so `accept!T(v).contentAs!T`
+	/// round-trips.
+	static ElicitResult accept(T)(T value) @safe
+	{
+		ElicitResult r;
+		r.action = ElicitAction.accept;
+		r.content = () @trusted { return serializeToJson(value); }();
+		return r;
+	}
+
 	/// Convenience constructor for a `decline` (no content).
 	static ElicitResult decline() @safe
 	{
@@ -3004,6 +3091,56 @@ unittest  // ElicitResult.contentAs!T decodes the accept content into a typed st
 	assert(b.date == "2026-07-01");
 	assert(b.travelers == 3);
 	assert(b.insurance == true);
+}
+
+unittest  // ElicitResult.accept!T serializes a struct and contentAs!T round-trips
+{
+	static struct Booking
+	{
+		string date;
+		int travelers;
+		bool insurance;
+	}
+
+	auto orig = Booking("2026-07-01", 3, true);
+	auto r = ElicitResult.accept(orig);
+	assert(r.action == ElicitAction.accept);
+	auto back = r.contentAs!Booking;
+	assert(back == orig);
+}
+
+unittest  // CallToolResult.structuredContentAs!T decodes structuredContent into a struct
+{
+	static struct Weather
+	{
+		string city;
+		double tempC;
+	}
+
+	Json sc = Json.emptyObject;
+	sc["city"] = Json("Sydney");
+	sc["tempC"] = Json(19.5);
+	CallToolResult r;
+	r.structuredContent = sc;
+	auto w = r.structuredContentAs!Weather;
+	assert(w.city == "Sydney");
+	assert(w.tempC == 19.5);
+}
+
+unittest  // CallToolResult.structuredContentAs!T returns T.init when structuredContent is unset
+{
+	static struct Weather
+	{
+		string city;
+		double tempC;
+	}
+
+	import std.math : isNaN;
+
+	CallToolResult r;
+	auto w = r.structuredContentAs!Weather;
+	assert(w.city == "");
+	assert(isNaN(w.tempC));
 }
 
 unittest  // Resource emits annotations (audience/priority/lastModified)
@@ -3831,6 +3968,25 @@ struct ProgressNotification
 			return cast(double) v.get!long;
 		return 0;
 	}
+
+	/// The progress token rendered as a string, or `""` when it is absent or not a
+	/// string-typed token. Convenience for callers that keyed their in-flight
+	/// requests by a string token; for an integer token prefer `matches`.
+	string progressTokenString() const @safe
+	{
+		if (progressToken.type != Json.Type.string)
+			return "";
+		return progressToken.get!string;
+	}
+
+	/// Whether this notification's `progressToken` is the one carried by `tok`
+	/// (compares against `tok.toJson()`), so a client can match an incoming
+	/// `notifications/progress` to the originating request regardless of whether the
+	/// token is a string or an integer.
+	bool matches(ProgressToken tok) const @safe
+	{
+		return progressToken == tok.toJson();
+	}
 }
 
 unittest  // ProgressNotification parses token, progress, total and message
@@ -3864,6 +4020,42 @@ unittest  // ProgressNotification tolerates a non-object payload
 	auto n = ProgressNotification.fromJson(Json("not an object"));
 	assert(n.progress == 0);
 	assert(n.progressToken.type == Json.Type.undefined);
+}
+
+unittest  // ProgressNotification.progressTokenString returns a string token, else ""
+{
+	ProgressNotification n;
+	n.progressToken = Json("tok-1");
+	assert(n.progressTokenString == "tok-1");
+
+	ProgressNotification m;
+	m.progressToken = Json(7);
+	assert(m.progressTokenString == "");
+
+	ProgressNotification e;
+	assert(e.progressTokenString == "");
+}
+
+unittest  // ProgressNotification.matches a string ProgressToken
+{
+	import mcp.client.client : ProgressToken;
+
+	ProgressNotification n;
+	n.progressToken = Json("abc");
+	assert(n.matches(ProgressToken("abc")));
+	assert(!n.matches(ProgressToken("def")));
+	assert(!n.matches(ProgressToken(1)));
+}
+
+unittest  // ProgressNotification.matches an integer ProgressToken
+{
+	import mcp.client.client : ProgressToken;
+
+	ProgressNotification n;
+	n.progressToken = Json(42);
+	assert(n.matches(ProgressToken(42)));
+	assert(!n.matches(ProgressToken(7)));
+	assert(!n.matches(ProgressToken("42")));
 }
 
 /// The severity of a `notifications/message`, per server/utilities/logging. The
