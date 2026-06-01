@@ -26,7 +26,8 @@
  *   - the tool returns a `TripPlan` struct so the SDK infers the output schema
  *     and emits `structuredContent`.
  *
- * Dual transport — ONE binary, either transport:
+ * Transport selection is delegated to the shared `examples/common` scaffold's
+ * `runServerFromArgs` (#505): one binary, either transport —
  *   stdio (default):  ./elicitation-server                       # JSON-RPC on stdio
  *   http:             ./elicitation-server --http --port 9355     # http://127.0.0.1:9355/mcp
  *
@@ -37,50 +38,32 @@
 module elicitation_server;
 
 import std.conv : to;
-import std.getopt : getopt;
-import std.stdio : stderr;
 import std.typecons : nullable;
 
 import mcp;
+import examples_common : runServerFromArgs;
 import vibe.data.serialization : optional;
 
 import mcp.api.attributes : minimum, maximum, title, schemaDefault;
-import mcp.transport : StreamableHttpOptions, runStreamableHttp, runStdio;
 
 /// The fixed HTTP port the example binds, kept in one place so server.d,
 /// client.d (and the README) agree.
 enum ushort defaultPort = 9355;
 
-void main(string[] args)
+void main(string[] args) @safe
 {
-	bool http;
-	ushort port = defaultPort;
-	string host = "127.0.0.1";
-	getopt(args, "http", "Serve over Streamable HTTP instead of stdio", &http, "port|p",
-			"HTTP port to listen on (default 9355)",
-			&port, "host|h", "HTTP address to bind (default 127.0.0.1)", &host);
-
 	auto server = new McpServer("elicitation-example", "1.0.0",
 			nullable("2025-era blocking elicitation demo (stdio + Streamable HTTP)."));
 	// Register every @tool method on the API object in one call; each tool's
 	// input schema and argument marshalling are derived from the method signature.
 	registerHandlers(server, new TripApi);
 
-	if (http)
-	{
-		StreamableHttpOptions opts;
-		opts.bindAddresses = [host];
-		() @trusted {
-			stderr.writefln("elicitation-server listening on http://%s:%d/mcp", host, port);
-		}();
-		runStreamableHttp(server, port, opts);
-	}
-	else
-	{
-		// stdio (default): a tool that calls ctx.elicit is answered inline on the
-		// same stdio channel (#448/#449), so the blocking round-trip completes.
-		runStdio(server);
-	}
+	// The scaffold picks the transport from argv: `--http` (+ `--port`/`--host`)
+	// serves Streamable HTTP, otherwise stdio (the default). Over stdio a tool
+	// that calls ctx.elicit is answered inline on the same channel (#448/#449),
+	// so the blocking round-trip completes; over HTTP the reply rides the SSE
+	// channel (deadlock fixed in #377).
+	runServerFromArgs(server, args, defaultPort);
 }
 
 /// The flat elicitation form the server gathers from the client. Its scalar

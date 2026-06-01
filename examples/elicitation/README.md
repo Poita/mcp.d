@@ -52,9 +52,15 @@ Json, on both sides of the wire:
 - `plan_trip` returns a `TripPlan` struct, so the SDK infers the output schema
   and emits `structuredContent` the client decodes with
   `result.structuredContentAs!TripPlan` (#464);
-- the **client** spawns the stdio server with `McpClient.spawn([serverBinaryPath()])`
-  + `scope(exit) client.close()` (#470) — no hand-rolled `ProcessPipes`
-  plumbing — passes tool arguments as the typed `PlanArgs(destination)` struct
+- the server's transport selection (stdio vs. `--http`/`--port`/`--host`) and
+  the client's transport selection + event-loop wiring are delegated to the
+  shared `examples/common` scaffold (#505): the server calls
+  `runServerFromArgs(server, args, 9355)`, while the client connects with
+  `connectFromArgs(args, "elicitation-server")` (stdio spawns the sibling server
+  binary via `McpClient.spawnSibling` + `scope(exit) client.close()`, #470 — no
+  hand-rolled `ProcessPipes` plumbing) and runs its self-verifying body inside
+  `runClient(...)`. Its assertions use the scaffold's `check`/`checkEq` helpers;
+- the client passes tool arguments as the typed `PlanArgs(destination)` struct
   (#468), and answers `accept` with `ElicitResult.accept(AcceptForm(3))` (#466).
   Installing `onElicitation` alone advertises form elicitation (the inbound gate
   honours `effectiveCapabilities()`, #463), so no raw capability flags are set.
@@ -78,7 +84,8 @@ fixed in #377; over stdio the reply is answered inline on the same channel,
 
 ## Files
 
-- `dub.json` — package with `server` and `client` configurations.
+- `dub.json` — package with `server` and `client` configurations; depends on
+  the root `mcp` package and the shared `examples-common` scaffold (`../common`).
 - `server.d` — the `elicitation-server`; one binary, stdio (default) or HTTP.
 - `client.d` — the `elicitation-client`; a self-verifying e2e test over either
   transport.
