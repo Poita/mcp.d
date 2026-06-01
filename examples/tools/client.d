@@ -1,7 +1,14 @@
-/// MCP Tools example client + self-verifying e2e test (#348).
+/// MCP Tools example client + self-verifying e2e test (#348) — dual-transport.
 ///
-/// Spawns the built `tools-server` binary over stdio, initializes, then asserts
-/// the server's tool surface and behavior:
+/// Drives the `tools-example` server over EITHER transport, with the SAME
+/// transport-agnostic assertions:
+///   - STDIO (default): spawns the built `tools-server` binary (without --http)
+///     and speaks newline-delimited JSON-RPC over its stdin/stdout via
+///     `McpClient.stdio`;
+///   - HTTP (`--http <url>`): connects to a running server's Streamable HTTP
+///     endpoint via `McpClient.http(url)`.
+///
+/// It then asserts the server's tool surface and behavior:
 ///   - `tools/list` contains the expected tool names;
 ///   - inferred input schemas carry the typed args (enum members, the optional
 ///     Nullable arg is NOT required, the struct arg is an object sub-schema);
@@ -11,12 +18,16 @@
 ///   - the optional `round` arg flows through;
 ///   - a scalar-returning tool wraps its value under `result`;
 ///   - a string tool returns plain text content (no structuredContent);
+///   - a tool returning a typed `CallToolResult` yields the expected text +
+///     resource-link content blocks (typed `Content.make*` factories);
 ///   - a bad call (unknown tool) raises the expected JSON-RPC error code.
 ///
 /// Prints "OK: ..." and exits 0 on success; on ANY mismatch it prints what
-/// differed and exits non-zero. This makes the example double as a CI e2e test.
+/// differed and exits non-zero. This makes the example double as a CI e2e test
+/// over every supported transport.
 module tools_client;
 
+import std.getopt : getopt;
 import std.math : isClose;
 import std.process : ProcessPipes, pipeProcess, Redirect, wait;
 import std.string : stripRight;
@@ -25,7 +36,7 @@ import vibe.data.json : Json;
 
 import mcp.client.client : McpClient;
 import mcp.protocol.errors : ErrorCode, McpException;
-import mcp.protocol.types : CallToolResult, Tool, ToolAnnotations;
+import mcp.protocol.types : CallToolResult, ContentKind, Tool, ToolAnnotations;
 
 private int failures;
 
@@ -106,15 +117,41 @@ private double asDouble(Json j) @safe
 	return j.get!double;
 }
 
+/// Parse the `--http <url>` option. `getopt` takes `&httpUrl`, which the
+/// compiler infers `@system`, so it lives in a `@trusted` shim to keep `main`
+/// `@safe`.
+private string parseHttpUrl(ref string[] args) @trusted
+{
+	string httpUrl;
+	getopt(args, "http", "Connect to a running Streamable HTTP server at <url> "
+		~ "(e.g. http://127.0.0.1:8530/mcp); default spawns the stdio server", &httpUrl);
+	return httpUrl;
+}
+
 int main(string[] args) @safe
 {
-	// Resolve the server binary next to this client binary (dub writes both into
-	// the package root), independent of the current working directory.
-	auto proc = new ServerProcess([serverBinaryPath()]);
-	scope (exit)
-		proc.shutdown();
+	// Transport selection: --http <url> connects to a running HTTP server;
+	// absent, we spawn the built server binary and speak stdio. The assertions
+	// below are identical for both — the SAME client verifies every transport.
+	string httpUrl = parseHttpUrl(args);
 
-	auto client = McpClient.stdio(&proc.readLine, &proc.writeLine);
+	McpClient client;
+	ServerProcess proc; // kept alive for the stdio channel's lifetime
+	scope (exit)
+		if (proc !is null)
+			proc.shutdown();
+
+	if (httpUrl.length)
+	{
+		client = McpClient.http(httpUrl);
+	}
+	else
+	{
+		// Resolve the server binary next to this client binary (dub writes both
+		// into the package root), independent of the current working directory.
+		proc = new ServerProcess([serverBinaryPath()]);
+		client = McpClient.stdio(&proc.readLine, &proc.writeLine);
+	}
 
 	auto init = client.initialize();
 	check(init.serverInfo.name == "tools-example",
@@ -126,7 +163,7 @@ int main(string[] args) @safe
 	import std.array : array;
 
 	auto names = tools.map!(t => t.name).array;
-	foreach (want; ["calc", "magnitude", "greet", "erase"])
+	foreach (want; ["calc", "magnitude", "greet", "erase", "describe_doc"])
 		check(names.canFind(want), "tools/list missing tool: " ~ want);
 
 	// --- input schema of `calc` --------------------------------------------
@@ -221,6 +258,25 @@ int main(string[] args) @safe
 			"greet should not have structuredContent");
 	}
 
+	// --- typed CallToolResult: text + resource-link content blocks ---------
+	{
+		Json a = Json.emptyObject;
+		a["id"] = "42";
+		auto r = client.callTool("describe_doc", a);
+		check(!r.isError, "describe_doc should not be an error");
+		check(r.content.length == 2,
+			"describe_doc should return 2 content blocks (text + resource link)");
+		if (r.content.length == 2)
+		{
+			check(r.content[0].kind == ContentKind.text
+				&& r.content[0].text == "Document 42 is available.",
+				"describe_doc block 0 should be the expected text");
+			check(r.content[1].kind == ContentKind.resourceLink
+				&& r.content[1].uri == "doc://42",
+				"describe_doc block 1 should be a resource_link to doc://42");
+		}
+	}
+
 	// --- bad call: unknown tool raises invalidParams (-32602) --------------
 	{
 		int code;
@@ -244,9 +300,11 @@ int main(string[] args) @safe
 		logFail(failuresMsg());
 		return 1;
 	}
-	writeln("OK: tools example e2e passed — listTools names, enum/struct/optional schemas, ",
-		"readOnly/destructive/idempotent annotations, struct+scalar+string results, and ",
-		"unknown-tool error code all verified.");
+	auto transport = httpUrl.length ? "http" : "stdio";
+	writeln("OK: tools example e2e passed over ", transport,
+		" — listTools names, enum/struct/optional schemas, ",
+		"readOnly/destructive/idempotent annotations, struct+scalar+string results, ",
+		"typed Content.make* (text+resource_link), and unknown-tool error code all verified.");
 	return 0;
 }
 

@@ -1,13 +1,19 @@
-# Tools example (server + client e2e)
+# Tools example (server + client e2e), dual-transport
 
 A focused, self-contained example demonstrating **Tools** in the D MCP SDK
 ([mcp.d](https://github.com/Poita/mcp.d)) from both sides. It is its own dub
 package with a path dependency on the root `mcp` library, so it never touches
 the root `dub.json`.
 
+The single server binary speaks MCP over **either stdio or Streamable HTTP**,
+selected at runtime, and the single client binary is a **self-verifying e2e
+test** that drives the server over **both** transports with the same
+transport-agnostic assertions.
+
 ## What it teaches
 
-**Server side (`server.d`)** — declaring tools with the `@tool` reflection API:
+**Server side (`server.d`)** — declaring tools with the `@tool` reflection API
+(ergonomic UDA style; no low-level raw-Json registration):
 
 - **Typed arguments** mapped into an inferred JSON Schema:
   - scalars (`double a, double b`),
@@ -18,20 +24,22 @@ the root `dub.json`.
 - **Inferred output schema + `structuredContent`** from a `struct` return
   (`CalcResult`); scalar returns are wrapped under a `result` key; `string`
   returns become plain text content with no `structuredContent`.
+- **Typed `Content.make*` factories**: the `describe_doc` tool returns a typed
+  `CallToolResult` whose blocks are built with `Content.makeText` and
+  `Content.makeResourceLink` — no hand-built content Json.
 - **Behavioral marker UDAs** that populate `ToolAnnotations`:
   `@readOnly` → `readOnlyHint`, `@destructive` → `destructiveHint`,
   `@idempotent` → `idempotentHint`, and `@hintTitle("...")` → annotation title.
 - **`@describe`** to document individual arguments.
 - **`registerModule!(thisModule)(server)`** to register every module-level
   `@tool` free function in one call (no class instance required).
+- **Transport selection** via `std.getopt`: `--http` switches the same server
+  from `runStdio` to `runStreamableHttp` (with `--port`/`--host`).
 
-The server speaks MCP over **stdio** (`runStdio`) — the deployable shape.
+**Client side (`client.d`)** — a **self-verifying end-to-end test** that works
+over either transport. It asserts concrete expected values:
 
-**Client side (`client.d`)** — a **self-verifying end-to-end test**. It spawns
-the built server binary, drives it over stdio, and asserts concrete expected
-values:
-
-- `tools/list` contains `calc`, `magnitude`, `greet`, `erase`;
+- `tools/list` contains `calc`, `magnitude`, `greet`, `erase`, `describe_doc`;
 - `calc`'s input schema exposes the enum members and keeps the optional `round`
   arg out of `required`; `magnitude`'s `v` arg is an object sub-schema;
 - the marker UDAs surface as the right `ToolAnnotations` hints (incl. the
@@ -41,30 +49,55 @@ values:
 - the optional `round` arg flows through (`mul(1/3, 1)` rounded to 2dp = 0.33);
 - the scalar-returning `magnitude(3,4)` wraps its `5` under `result`;
 - `greet("Ada")` returns the text `Hello, Ada!` with no `structuredContent`;
+- `describe_doc("42")` returns two content blocks — a `text` block and a
+  `resource_link` block to `doc://42`;
 - calling an unknown tool raises an `McpException` with code
   `invalidParams` (-32602).
 
 On success it prints `OK: ...` and exits `0`; on **any** failed assertion it
 prints what differed and exits **non-zero**, so the example doubles as a CI
-regression test.
+regression test over every supported transport.
 
 ## Running it
 
-This is a stdio example: the client spawns the server, so running the client is
-the whole demo. Build both configurations first (the client looks for the
-`tools-server` binary next to its own executable), then run the client:
+Build both configurations first (the client looks for the `tools-server` binary
+next to its own executable when running over stdio):
 
 ```sh
 # from this directory (examples/tools)
 dub build -c server      # produces ./tools-server
 dub build -c client      # produces ./tools-client
-dub run   -c client      # spawns the server and runs the e2e (exit 0 == pass)
 ```
 
-Or run the built binary directly:
+### Over stdio (default)
+
+The client spawns the server, so running the client is the whole demo:
 
 ```sh
-./tools-client; echo "exit=$?"
+dub run -c client        # spawns ./tools-server and runs the e2e (exit 0 == pass)
 ```
 
-A non-zero exit code means a behavioral assertion failed.
+### Over Streamable HTTP
+
+Start the server with `--http` in one terminal, then point the client at its
+`/mcp` endpoint in another:
+
+```sh
+# terminal 1 — start the HTTP server (default port 8530)
+dub run -c server -- --http --port 8530
+
+# terminal 2 — run the same e2e against it
+dub run -c client -- --http http://127.0.0.1:8530/mcp
+```
+
+A non-zero exit code from the client means a behavioral assertion failed.
+
+## A note on auth
+
+This example does not enable authentication. OAuth 2.1 Resource Server
+enforcement in this SDK is an **HTTP-only** feature: it relies on the
+`Authorization: Bearer` request header and the RFC 9728 Protected Resource
+Metadata document served over HTTP (`StreamableHttpOptions.auth`). The stdio
+transport has no request headers and no HTTP surface, so there is nowhere to
+carry or challenge a bearer token. If you need auth, run the HTTP transport and
+configure `StreamableHttpOptions.auth` (see the dedicated auth example).
