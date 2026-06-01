@@ -139,17 +139,17 @@ final class TripApi
 
 		// BLOCKING server->client elicitation. Returns once the client's
 		// onElicitation answers (this is the round-trip fixed for HTTP in #377).
-		auto raw = ctx.elicit("Please provide trip details for " ~ destination, schema);
-		auto result = ElicitResult.fromJson(raw);
+		// `ctx.elicit` returns a typed `ElicitResult` (#436).
+		auto result = ctx.elicit("Please provide trip details for " ~ destination, schema);
 
 		final switch (result.action)
 		{
 		case ElicitAction.decline:
-			return TripPlan("declined", destination, 0, "", false,
-					"User declined to provide trip details for " ~ destination ~ ".");
+			return TripPlan("declined", destination, 0, "",
+					false, "User declined to provide trip details for " ~ destination ~ ".");
 		case ElicitAction.cancel:
-			return TripPlan("cancelled", destination, 0, "", false,
-					"Trip planning for " ~ destination ~ " was cancelled.");
+			return TripPlan("cancelled", destination, 0,
+					"", false, "Trip planning for " ~ destination ~ " was cancelled.");
 		case ElicitAction.accept:
 			break;
 		}
@@ -172,9 +172,8 @@ final class TripApi
 			wantsInsurance = content["insurance"].get!bool;
 
 		const summary = "Booked " ~ destination ~ " for " ~ travelersN.to!string
-			~ " traveler(s) in " ~ cabinClass ~ " class"
-			~ (wantsInsurance ? " with insurance." : " without insurance.");
-		return TripPlan("booked", destination, travelersN, cabinClass,
-				wantsInsurance, summary);
+			~ " traveler(s) in " ~ cabinClass ~ " class" ~ (wantsInsurance
+					? " with insurance." : " without insurance.");
+		return TripPlan("booked", destination, travelersN, cabinClass, wantsInsurance, summary);
 	}
 }

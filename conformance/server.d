@@ -363,7 +363,7 @@ private void registerStreamingFixtures(McpServer server) @safe
 		schema["properties"] = props;
 		schema["required"] = Json([Json("username"), Json("email")]);
 
-		auto result = ctx.elicit(message, schema);
+		auto result = ctx.elicit(message, schema).toJson();
 		const action = ("action" in result) ? result["action"].get!string : "";
 		const content = ("content" in result) ? result["content"] : Json.emptyObject;
 		CallToolResult r;
@@ -407,7 +407,7 @@ private void registerElicitationSepFixtures(McpServer server) @safe
 		schema["type"] = "object";
 		schema["properties"] = props;
 
-		auto result = ctx.elicit("Please provide your details", schema);
+		auto result = ctx.elicit("Please provide your details", schema).toJson();
 		return elicitationResultText(result);
 	});
 
@@ -466,7 +466,7 @@ private void registerElicitationSepFixtures(McpServer server) @safe
 		schema["type"] = "object";
 		schema["properties"] = props;
 
-		auto result = ctx.elicit("Please make your selections", schema);
+		auto result = ctx.elicit("Please make your selections", schema).toJson();
 		return elicitationResultText(result);
 	});
 }
