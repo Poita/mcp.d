@@ -34,6 +34,12 @@ port_for() {
 for d in examples/*/; do
   n=$(basename "$d")
   [ -f "${d}dub.json" ] || continue
+  # Skip shared library packages (e.g. examples/common) — they are helper
+  # libraries with no server/client configurations, not runnable examples.
+  if grep -q '"targetType"[[:space:]]*:[[:space:]]*"library"' "${d}dub.json"; then
+    echo "skipping library package ${n}"
+    continue
+  fi
   echo "::group::example ${n}"
 
   if ! ( cd "$d" && dub build -c server && dub build -c client ); then
