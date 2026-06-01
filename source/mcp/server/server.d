@@ -1197,11 +1197,19 @@ final class McpServer
 	///
 	/// The draft base `Result` requires a `resultType` field on every result
 	/// ("complete" for a finished response, "input_required" for an
-	/// `InputRequiredResult`). We add `resultType:"complete"` here, centralized
-	/// in the dispatch path, for any object result that does not already
-	/// declare one — so an `InputRequiredResult` ("input_required") and
-	/// `DiscoverResult` (which set their own) are left untouched. A no-op for
-	/// pre-draft versions, keeping the 2025-era wire output unchanged.
+	/// `InputRequiredResult`). We add the discriminator here, centralized in
+	/// the dispatch path, for any object result that does not already declare
+	/// one — so an `InputRequiredResult` ("input_required") and `DiscoverResult`
+	/// (which set their own) are left untouched.
+	///
+	/// An `InputRequiredResult` is shaped `{ inputRequests, requestState }`
+	/// (schema: at least one of `inputRequests`/`requestState` is present, and
+	/// it carries no `content`). A raw `CallToolResult` populated with
+	/// `inputRequests` directly (rather than via `ToolResponse.inputRequired`)
+	/// serialises to that same shape but reaches here without a `resultType`,
+	/// so we discriminate it as "input_required" rather than the default
+	/// "complete". A no-op for pre-draft versions, keeping the 2025-era wire
+	/// output unchanged.
 	private Json stampResultType(Json result, ProtocolVersion ver) @safe
 	{
 		if (!ver.isDraft)
@@ -1209,7 +1217,13 @@ final class McpServer
 		if (result.type != Json.Type.object)
 			return result;
 		if ("resultType" !in result)
-			result["resultType"] = "complete";
+		{
+			// Discriminate an input-required result by its shape: it carries
+			// `inputRequests`/`requestState` and no `content`.
+			const bool inputRequired = ("inputRequests" in result || "requestState" in result)
+				&& "content" !in result;
+			result["resultType"] = inputRequired ? "input_required" : "complete";
+		}
 		return result;
 	}
 
@@ -4072,6 +4086,33 @@ unittest  // draft InputRequiredResult is stamped resultType:"input_required", n
 	auto resp = s.handle(draftCall(1, "book", [])).get;
 	assert("error" !in resp);
 	assert(resp["result"]["resultType"].get!string == "input_required");
+}
+
+unittest  // #422 draft: a raw CallToolResult carrying inputRequests is stamped "input_required"
+{
+	import mcp.protocol.draft : InputRequest;
+
+	// Register via the CallToolResult-returning overload and populate the public
+	// `inputRequests` field DIRECTLY (not via ToolResponse.inputRequired). This
+	// is the non-idiomatic-but-reachable path: the result serialises to an
+	// InputRequiredResult shape but reaches stampResultType without a resultType.
+	auto s = new McpServer("t", "1");
+	Tool t = {name: "raw"};
+	s.registerDynamicTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.inputRequests = [
+			InputRequest("date", "elicitation", Json(["message": Json("When?")]))
+		];
+		return r;
+	});
+	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
+	auto resp = s.handle(draftReq(1, "tools/call", p)).get;
+	assert("error" !in resp);
+	// The draft base Result discriminator MUST be "input_required" for an
+	// InputRequiredResult-shaped body, not the default "complete".
+	assert(resp["result"]["resultType"].get!string == "input_required");
+	assert("inputRequests" in resp["result"]);
+	assert("content" !in resp["result"]);
 }
 
 unittest  // draft resources/read unknown uri uses invalidParams (-32602)
