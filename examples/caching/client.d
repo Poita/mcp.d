@@ -13,8 +13,8 @@
  *
  * Transport selection (same assertions either way):
  *   - default (no --http): spawn the built `caching-server` binary over stdio
- *     and drive it via McpClient.stdio(&proc.readLine, &proc.writeLine)
- *     (exactly the pattern in examples/tools/client.d).
+ *     with McpClient.spawn([serverBinaryPath()]) — the SDK owns the subprocess
+ *     and reaps it (close stdin -> SIGTERM -> SIGKILL) on client.close().
  *   - `--http <url>`: connect to a running HTTP server via McpClient.http(url).
  *
  * On success it prints "OK: ..." and exits 0. On ANY mismatch it prints what
@@ -35,8 +35,6 @@ import std.stdio : writeln, stderr;
 import std.algorithm : map, canFind;
 import std.array : array;
 import std.format : format;
-import std.process : ProcessPipes, pipeProcess, Redirect, wait;
-import std.string : stripRight;
 
 import mcp;
 import mcp.client.client : McpClient;
@@ -45,46 +43,6 @@ import mcp.protocol.draft : CacheScope;
 // Expected contract — must match the enums/values in server.d.
 enum long ExpectConfigTtlMs = 60_000;
 enum long ExpectListTtlMs = 5_000;
-
-/// Owns the server subprocess and exposes the newline-delimited JSON-RPC channel
-/// expected by `McpClient.stdio`. Holding `ProcessPipes` in a class field keeps
-/// the stdin/stdout `File` handles alive for the lifetime of the client (a stack
-/// value would be destructed when the spawning helper returns).
-final class ServerProcess
-{
-	private ProcessPipes pipes;
-
-	this(string[] command) @trusted
-	{
-		pipes = pipeProcess(command, Redirect.stdin | Redirect.stdout);
-	}
-
-	/// Read one response line (terminator stripped), or null at EOF.
-	string readLine() @trusted
-	{
-		auto f = pipes.stdout;
-		if (f.eof)
-			return null;
-		auto ln = f.readln();
-		if (ln.length == 0 && f.eof)
-			return null;
-		return ln.stripRight("\r\n");
-	}
-
-	/// Write one request line (the channel appends the terminator).
-	void writeLine(string s) @trusted
-	{
-		pipes.stdin.writeln(s);
-		pipes.stdin.flush();
-	}
-
-	/// Close stdin and reap the child.
-	void shutdown() @trusted
-	{
-		pipes.stdin.close();
-		wait(pipes.pid);
-	}
-}
 
 /// Absolute path to the `caching-server` binary, resolved next to this client
 /// binary (dub writes both into the package root), independent of cwd.
@@ -110,21 +68,15 @@ int main(string[] args)
 	}
 
 	// --- transport selection ------------------------------------------------
-	McpClient client;
-	ServerProcess proc;
+	// stdio: McpClient.spawn launches the built server binary and OWNS the
+	// subprocess — client.close() runs the MCP stdio shutdown sequence
+	// (close stdin -> SIGTERM -> SIGKILL), so there is no hand-rolled process
+	// plumbing to maintain. HTTP: connect to an already-running endpoint.
+	auto client = url.length
+		? McpClient.http(url)
+		: McpClient.spawn([serverBinaryPath()]);
 	scope (exit)
-		if (proc !is null)
-			proc.shutdown();
-
-	if (url.length)
-	{
-		client = McpClient.http(url);
-	}
-	else
-	{
-		proc = new ServerProcess([serverBinaryPath()]);
-		client = McpClient.stdio(&proc.readLine, &proc.writeLine);
-	}
+		client.close();
 
 	// Cache hints are a draft-only feature: speak the stateless draft protocol.
 	// Transport-agnostic — the same call works over stdio and HTTP.

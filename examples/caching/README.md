@@ -43,8 +43,14 @@ The server stays in the ergonomic UDA style (`@resource` + `@cache` +
 `registerHandlers`) — no low-level raw-Json registration. Cache hints are passed
 as typed `CacheHint` / `CacheScope` values, and the client consumes typed
 `listResources()` / `readResource()` results whose `.cache` field is a typed
-`Nullable!CacheHint`. (This example has no tool/elicitation/sampling surface, so
-the typed elicitation / MRTR-builder / Content APIs do not apply here.)
+`Nullable!CacheHint`.
+
+Over stdio the client spawns the server with `McpClient.spawn([serverBinaryPath()])`
+and reaps it with `client.close()` (the SDK owns the subprocess and runs the MCP
+stdio shutdown sequence: close stdin → `SIGTERM` → `SIGKILL`) — there is no
+hand-rolled `ProcessPipes` plumbing. (This example has no tool/elicitation/sampling
+surface, so the typed callTool / `structuredContentAs!T` / elicitation /
+MRTR-builder APIs do not apply here.)
 
 ## Dual transport — one binary each
 
