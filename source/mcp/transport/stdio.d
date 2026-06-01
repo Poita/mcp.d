@@ -17,13 +17,26 @@ import mcp.server.server;
 /// its `RequestContext` therefore has those frames written to `writeLine`
 /// out-of-band, before the originating request's response — so a server that
 /// advertises the `logging` capability over stdio can actually deliver it.
+/// `tryReadLine` (optional) is a NON-blocking read: it returns the next pending
+/// line if one is already available, or `null` when nothing is buffered right
+/// now (distinct from `readLine`, which blocks). When supplied, it powers the
+/// cooperative drain that lets an in-flight handler observe an out-of-band
+/// `notifications/cancelled` over stdio (draft Transport-Specific Cancellation),
+/// which the otherwise-synchronous loop could not read until the handler
+/// returned. When `null`, behaviour is unchanged.
 void serveStdio(McpServer server, scope string delegate() @safe readLine,
-		scope void delegate(string) @safe writeLine)
+		scope void delegate(string) @safe writeLine, scope string delegate() @safe tryReadLine = null)
 {
 	import vibe.data.json : Json, parseJsonString;
 	import mcp.protocol.errors : McpException, internalError, ErrorCode;
 
 	long serverReqId = 0;
+
+	// Forward-declared so the two mutually-recursive channel closures
+	// (serverRequest pumps for a reply; drainPending dispatches pending input)
+	// can each reference the other; assigned once both are defined, below.
+	Json delegate(string, Json) @safe serverRequestDg;
+	void delegate() @safe drainPendingDg;
 
 	// True when `idJson` is the integer id we assigned to an outstanding
 	// server->client request.
@@ -79,11 +92,35 @@ void serveStdio(McpServer server, scope string delegate() @safe readLine,
 				return ("result" in j) ? j["result"] : Json.emptyObject;
 			}
 			// An interleaved inbound message (not our reply): dispatch it normally.
-			const inner = server.handleRaw(resp, writeLine, &serverRequest);
+			const inner = server.handleRaw(resp, writeLine, serverRequestDg, drainPendingDg);
 			if (inner.length)
 				writeLine(inner);
 		}
 	}
+
+	// Cooperative drain (draft Transport-Specific Cancellation over stdio): when
+	// a handler hits a poll point (ctx.isCancelled / reportProgress), dispatch any
+	// inbound messages that are pending right now WITHOUT blocking, so an
+	// out-of-band notifications/cancelled flips this request's in-flight token.
+	void drainPending() @safe
+	{
+		if (tryReadLine is null)
+			return;
+		for (;;)
+		{
+			auto pending = tryReadLine();
+			if (pending is null)
+				break; // nothing buffered right now
+			if (pending.length == 0)
+				continue;
+			const inner = server.handleRaw(pending, writeLine, serverRequestDg, drainPendingDg);
+			if (inner.length)
+				writeLine(inner);
+		}
+	}
+
+	serverRequestDg = &serverRequest;
+	drainPendingDg = &drainPending;
 
 	for (;;)
 	{
@@ -105,8 +142,9 @@ void serveStdio(McpServer server, scope string delegate() @safe readLine,
 		// `writeLine` is the server->client channel: handlers' notifications are
 		// emitted through it as they happen, and the request's reply (if any)
 		// follows. `serverRequest` lets a handler issue a blocking server->client
-		// request (sampling/elicitation) that the client answers on stdin.
-		const response = server.handleRaw(line, writeLine, &serverRequest);
+		// request (sampling/elicitation) the client answers on stdin; `drainPending`
+		// lets a handler poll point observe an out-of-band notifications/cancelled.
+		const response = server.handleRaw(line, writeLine, serverRequestDg, drainPendingDg);
 		if (response.length)
 			writeLine(response);
 	}
@@ -139,19 +177,83 @@ private bool tryServeStdioListen(McpServer server, string line,
 /// messages from stdin (one per line) and write responses to stdout. Per the
 /// MCP stdio transport, only valid MCP messages are written to stdout; use
 /// stderr for logging. Blocks until stdin reaches end-of-file.
+///
+/// A dedicated reader thread assembles complete lines from stdin into a queue,
+/// so the main loop gets both a blocking `readLine` (await the next message) and
+/// a non-blocking `tryReadLine` (pop a line only if one is already buffered).
+/// The latter powers the cooperative drain that lets an in-flight handler
+/// observe an out-of-band `notifications/cancelled` over stdio (draft
+/// Transport-Specific Cancellation) — which a single buffered reader could not
+/// see until the handler returned. The thread (not raw fd polling) avoids
+/// FILE*-buffering and partial-line hazards.
 void runStdio(McpServer server)
 {
 	() @trusted {
 		import std.stdio : stdin, stdout;
+		import std.string : stripRight;
+		import core.thread : Thread;
+		import core.sync.mutex : Mutex;
+		import core.sync.condition : Condition;
 
-		serveStdio(server, () @trusted {
-			auto ln = stdin.readln();
-			if (ln.length == 0 && stdin.eof)
-				return null;
-			import std.string : stripRight;
+		string[] queue;
+		bool eofReached;
+		auto mtx = new Mutex;
+		auto cond = new Condition(mtx);
 
-			return ln.stripRight("\r\n");
-		}, (string s) @trusted { stdout.writeln(s); stdout.flush(); });
+		auto reader = new Thread({
+			for (;;)
+			{
+				auto ln = stdin.readln();
+				if (ln.length == 0 && stdin.eof)
+				{
+					synchronized (mtx)
+					{
+						eofReached = true;
+						cond.notifyAll();
+					}
+					break;
+				}
+				auto line = ln.stripRight("\r\n");
+				synchronized (mtx)
+				{
+					queue ~= line;
+					cond.notifyAll();
+				}
+			}
+		});
+		reader.isDaemon = true;
+		reader.start();
+
+		string readLine() @trusted
+		{
+			synchronized (mtx)
+			{
+				while (queue.length == 0 && !eofReached)
+					cond.wait();
+				if (queue.length == 0)
+					return null; // end of input
+				auto l = queue[0];
+				queue = queue[1 .. $];
+				return l;
+			}
+		}
+
+		string tryReadLine() @trusted
+		{
+			synchronized (mtx)
+			{
+				if (queue.length == 0)
+					return null; // nothing buffered right now (or at eof)
+				auto l = queue[0];
+				queue = queue[1 .. $];
+				return l;
+			}
+		}
+
+		serveStdio(server, &readLine, (string s) @trusted {
+			stdout.writeln(s);
+			stdout.flush();
+		}, &tryReadLine);
 	}();
 }
 
@@ -247,6 +349,54 @@ unittest  // stdio: a tool calling ctx.elicit is answered over the same stdio ch
 		}
 	}
 	assert(sawResult, "tools/call reply with the elicited value was never produced");
+}
+
+unittest  // stdio: notifications/cancelled is delivered mid-handler via cooperative drain
+{
+	auto s = new McpServer("stdio-cancel", "1.0");
+	bool observedCancel;
+	Tool slow = {name: "slow"};
+	s.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+		// A cancellable handler polls ctx.isCancelled; over stdio that poll must
+		// drain any pending notifications/cancelled (draft Transport-Specific
+		// Cancellation) and flip this request's token.
+		foreach (i; 0 .. 1000)
+		{
+			if (ctx.isCancelled)
+			{
+				observedCancel = true;
+				break;
+			}
+		}
+		CallToolResult r;
+		r.content = [Content.makeText("done")];
+		return r;
+	});
+
+	string[] inputs = [
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow"}}`,
+	];
+	// A notifications/cancelled for request 2 is "pending" on the non-blocking
+	// channel, so the handler's first ctx.isCancelled() poll drains + dispatches
+	// it mid-flight.
+	string[] pending = [
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`,
+	];
+	size_t i, pi;
+	string[] outputs;
+	serveStdio(s, () @safe { return i < inputs.length ? inputs[i++] : null; }, (string line) @safe {
+		outputs ~= line;
+	}, () @safe { return pi < pending.length ? pending[pi++] : null; });
+
+	assert(observedCancel,
+			"handler should observe ctx.isCancelled after a mid-flight notifications/cancelled");
+	// Spec: "Not send a response for the cancelled request."
+	foreach (o; outputs)
+	{
+		auto j = parseJsonString(o);
+		if (j.type == Json.Type.object && "id" in j && j["id"].get!int == 2)
+			assert("result" !in j, "no response should be sent for the cancelled request");
+	}
 }
 
 unittest  // serveStdio stops at end-of-input (null line)
