@@ -1,54 +1,123 @@
 /**
  * MRTR (Multi Round-Trip Requests, SEP-2322) example client — and self-verifying
- * end-to-end test.
+ * end-to-end test, over BOTH transports.
  *
- * Connects to the `mrtr-server` (Streamable HTTP) in stateless draft mode and
- * exercises the `book_meeting` tool, which needs two pieces of input. The client
+ * Exercises the `book_meeting` tool, which needs two pieces of input. The client
  * shows both the raw round-trip and the SDK's transparent completion:
  *
  *   1. First it calls `book_meeting` with NO input handlers installed, so the
  *      server's `InputRequiredResult` is surfaced verbatim. It asserts the
- *      `inputRequests` shape (ids, types, the elicitation message) and the opaque
- *      `requestState`.
+ *      `inputRequests` shape (ids, types, the elicitation message + the schema
+ *      derived from the server's flat struct) and the opaque `requestState`.
  *   2. Then it installs mock `onElicitation` + `onSampling` handlers and calls
  *      again. The SDK's `callTool` MRTR loop satisfies each request, resubmits
  *      with `inputResponses` + the echoed `requestState`, and returns the FINAL
  *      `CallToolResult`. The client asserts the mocked values flowed through.
  *
- * On success it prints "OK: ..." and exits 0; any failed assertion prints what
- * differed and exits NON-ZERO. CI starts server.d in the background, then runs
- * this against it and checks the exit code.
+ * Transport selection (the SAME assertions verify both):
+ *   - default (no --http): STDIO. The client SPAWNS the built `mrtr-server`
+ *     binary (with no --http) and speaks newline-delimited JSON-RPC over the pipe
+ *     via `McpClient.stdio` (the pattern from examples/tools/client.d).
+ *   - `--http <url>`: connect to a running HTTP server via `McpClient.http(url)`.
  *
- *   dub build -c client
- *   ./mrtr-server --port 8765 &        # (built from -c server)
- *   ./mrtr-client http://127.0.0.1:8765/mcp
+ * On success it prints "OK: ..." and exits 0; any failed assertion prints what
+ * differed and exits NON-ZERO.
+ *
+ *   dub build -c server && dub build -c client
+ *   # stdio:
+ *   ./mrtr-client
+ *   # http:
+ *   ./mrtr-server --http --port 8765 &
+ *   ./mrtr-client --http http://127.0.0.1:8765/mcp
  */
 module mrtr_client;
 
-import std.algorithm : startsWith;
+import std.getopt : getopt;
+import std.process : ProcessPipes, pipeProcess, Redirect, wait;
 import std.stdio : stderr, writeln;
-import std.string : indexOf;
+import std.string : stripRight;
 
-import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 import vibe.data.json : Json;
 
 import mcp;
 
-enum string defaultUrl = "http://127.0.0.1:8765/mcp";
+enum string defaultHttpUrl = "http://127.0.0.1:8765/mcp";
+
+/// Owns the server subprocess and exposes the newline-delimited JSON-RPC channel
+/// expected by `McpClient.stdio`. Holding `ProcessPipes` in a class field keeps
+/// the stdin/stdout `File` handles alive for the lifetime of the client (a stack
+/// value would be destructed when the spawning helper returns).
+final class ServerProcess
+{
+	private ProcessPipes pipes;
+
+	this(string[] command) @trusted
+	{
+		pipes = pipeProcess(command, Redirect.stdin | Redirect.stdout);
+	}
+
+	/// Read one response line (terminator stripped), or null at EOF.
+	string readLine() @trusted
+	{
+		auto f = pipes.stdout;
+		if (f.eof)
+			return null;
+		auto ln = f.readln();
+		if (ln.length == 0 && f.eof)
+			return null;
+		return ln.stripRight("\r\n");
+	}
+
+	/// Write one request line (the channel appends the terminator).
+	void writeLine(string s) @trusted
+	{
+		pipes.stdin.writeln(s);
+		pipes.stdin.flush();
+	}
+
+	/// Close stdin and reap the child.
+	void shutdown() @trusted
+	{
+		pipes.stdin.close();
+		wait(pipes.pid);
+	}
+}
+
+/// Absolute path to the `mrtr-server` binary, resolved next to this executable
+/// (dub writes both binaries into the package root).
+private string serverBinaryPath() @safe
+{
+	import std.file : thisExePath;
+	import std.path : dirName, buildPath;
+
+	return buildPath(dirName(thisExePath()), "mrtr-server");
+}
 
 int main(string[] args)
 {
-	string url = defaultUrl;
-	foreach (a; args[1 .. $])
-		if (a.startsWith("http://") || a.startsWith("https://"))
-			url = a;
+	string url;
+	getopt(args, "http", "Connect over Streamable HTTP at this URL instead of spawning the server over stdio", &url);
+
+	if (url.length)
+		return runHttp(url);
+	return runStdio();
+}
+
+/// HTTP transport: connect to an already-running server, then run the shared
+/// assertions inside vibe's event loop (the HTTP client requires it).
+private int runHttp(string url)
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 
 	int rc;
 	runTask(() nothrow{
 		scope (exit)
 			exitEventLoop();
 		try
-			rc = runE2E(url);
+		{
+			auto client = McpClient.http(url);
+			rc = runE2E(client);
+		}
 		catch (Throwable e)
 		{
 			try
@@ -63,19 +132,45 @@ int main(string[] args)
 	return rc;
 }
 
-/// A tiny assert helper that throws (caught in main -> exit 1) with a clear
-/// message describing what differed.
+/// STDIO transport: spawn the built server binary (no --http) and drive it over
+/// the pipe. No event loop is needed for the stdio client.
+private int runStdio()
+{
+	auto proc = new ServerProcess([serverBinaryPath()]);
+	scope (exit)
+		proc.shutdown();
+
+	try
+	{
+		auto client = McpClient.stdio(&proc.readLine, &proc.writeLine);
+		return runE2E(client);
+	}
+	catch (Throwable e)
+	{
+		try
+			stderr.writeln("FAIL: ", e.msg);
+		catch (Exception)
+		{
+		}
+		return 1;
+	}
+}
+
+/// A tiny assert helper that throws (caught by the transport driver -> exit 1)
+/// with a clear message describing what differed.
 private void check(bool cond, lazy string msg) @safe
 {
 	if (!cond)
 		throw new Exception(msg);
 }
 
-private int runE2E(string url) @safe
+/// The transport-agnostic e2e body: given a connected `McpClient`, exercise the
+/// MRTR `book_meeting` tool end-to-end and assert every expected value. The same
+/// function runs over stdio and HTTP.
+private int runE2E(McpClient client) @safe
 {
-	auto client = McpClient.http(url);
-	// Stateless draft (2026-07-28): no initialize handshake; MRTR is the input
-	// mechanism. Every request carries per-request `_meta`.
+	// Stateless draft (2026-07-28): MRTR is the input mechanism. Every request
+	// carries per-request `_meta`.
 	client.enableDraft();
 
 	// ---- discovery: the server advertises the draft version + its identity ----
@@ -112,12 +207,23 @@ private int runE2E(string url) @safe
 				"meeting_date type: expected 'elicitation', got '" ~ req.type ~ "'");
 			check(req.params["message"].get!string == "On what date should we meet?",
 				"meeting_date message mismatch: '" ~ req.params["message"].get!string ~ "'");
+			// The schema was DERIVED from the server's flat MeetingDate struct via
+			// InputRequest.elicitation!T, so it must expose a `date` string property.
+			auto schema = req.params["requestedSchema"];
+			check(schema.type == Json.Type.object,
+				"meeting_date requestedSchema should be an object");
+			check(("date" in schema["properties"]) !is null,
+				"meeting_date requestedSchema should expose a 'date' property");
 		}
 		else if (req.id == "meeting_agenda")
 		{
 			sawAgenda = true;
 			check(req.type == "sampling",
 				"meeting_agenda type: expected 'sampling', got '" ~ req.type ~ "'");
+			// The sampling request was built from a typed CreateMessageRequest:
+			// it must carry the maxTokens and the user message we set.
+			check(req.params["maxTokens"].get!int == 64,
+				"meeting_agenda maxTokens: expected 64, got " ~ itoa(req.params["maxTokens"].get!int));
 		}
 	}
 	check(sawDate, "missing 'meeting_date' input request");
@@ -157,7 +263,8 @@ private int runE2E(string url) @safe
 	check(text == expectedText,
 		"final text mismatch.\n  expected: " ~ expectedText ~ "\n  got:      " ~ text);
 
-	// Structured content carries the same values plus the round count.
+	// Structured content carries the same values plus the round count (serialized
+	// from the server's typed Booking struct).
 	auto sc = done.structuredContent;
 	check(sc.type == Json.Type.object, "expected structuredContent object");
 	check(sc["topic"].get!string == "Q3 roadmap",
@@ -171,8 +278,9 @@ private int runE2E(string url) @safe
 
 	client.close();
 	() @trusted {
-		writeln("OK: MRTR e2e — 2 input requests resolved, requestState echoed, ",
-			"mocked elicitation+sampling flowed through, server completed in 2 rounds.");
+		writeln("OK: MRTR e2e — 2 input requests resolved (schema derived from struct), ",
+			"requestState echoed, mocked elicitation+sampling flowed through, ",
+			"server completed in 2 rounds.");
 	}();
 	return 0;
 }
