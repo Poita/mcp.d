@@ -8,7 +8,7 @@ import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.types : ListRootsResult;
 import mcp.auth.resource_server : TokenInfo;
 import mcp.protocol.jsonrpc : makeNotification;
-import mcp.protocol.versions : ProtocolVersion, latestStable;
+import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
 
 @safe:
 
@@ -348,14 +348,21 @@ final class StdioContext : RequestContext
 {
 	private void delegate(string) @safe sink;
 	private Json progressTok;
+	private ProtocolVersion version_;
 
 	/// `sink` receives one serialised JSON-RPC frame per call (the transport
 	/// adds the newline terminator). `progressToken` is the originating request's
 	/// `_meta.progressToken`, or `Json.undefined` when it carried none.
-	this(void delegate(string) @safe sink, Json progressToken = Json.undefined) @safe
+	/// `negotiated` is the protocol version agreed for this connection; it gates
+	/// version-specific wire fields on the notifications this context emits (e.g.
+	/// the `message` field on `notifications/progress`, which only exists from
+	/// 2025-03-26 onward).
+	this(void delegate(string) @safe sink, Json progressToken = Json.undefined,
+			ProtocolVersion negotiated = latestStable) @safe
 	{
 		this.sink = sink;
 		this.progressTok = progressToken;
+		this.version_ = negotiated;
 	}
 
 	bool isCancelled() @safe
@@ -373,7 +380,9 @@ final class StdioContext : RequestContext
 		p["progress"] = progress;
 		if (!total.isNull)
 			p["total"] = total.get;
-		if (message.length)
+		// `message` was introduced in 2025-03-26; suppress it for a 2024-11-05
+		// peer whose ProgressNotification schema has no such field.
+		if (message.length && version_.supportsProgressMessage)
 			p["message"] = message;
 		emit(makeNotification("notifications/progress", p));
 	}
@@ -1054,6 +1063,37 @@ unittest  // StdioContext.reportProgress emits a frame only with a progress toke
 	assert(j["params"]["progressToken"].get!string == "tok");
 	assert(j["params"]["progress"].get!double == 0.25);
 	assert(j["params"]["total"].get!double == 0.5);
+	assert(j["params"]["message"].get!string == "quarter");
+}
+
+unittest  // StdioContext.reportProgress omits `message` on a 2024-11-05 peer
+{
+	import vibe.data.json : parseJsonString;
+
+	string[] frames;
+	auto ctx = new StdioContext((string s) @safe { frames ~= s; }, Json("tok"),
+			ProtocolVersion.v2024_11_05);
+	ctx.reportProgress(0.25, nullableProgress(0.5), "quarter");
+	assert(frames.length == 1);
+	auto j = parseJsonString(frames[0]);
+	assert(j["params"]["progressToken"].get!string == "tok");
+	assert(j["params"]["progress"].get!double == 0.25);
+	assert(j["params"]["total"].get!double == 0.5);
+	// 2024-11-05 ProgressNotification params are {progressToken, progress, total?}
+	// with NO `message`; the field must be absent.
+	assert("message" !in j["params"]);
+}
+
+unittest  // StdioContext.reportProgress keeps `message` from 2025-03-26 onward
+{
+	import vibe.data.json : parseJsonString;
+
+	string[] frames;
+	auto ctx = new StdioContext((string s) @safe { frames ~= s; }, Json("tok"),
+			ProtocolVersion.v2025_03_26);
+	ctx.reportProgress(0.25, Nullable!double.init, "quarter");
+	assert(frames.length == 1);
+	auto j = parseJsonString(frames[0]);
 	assert(j["params"]["message"].get!string == "quarter");
 }
 

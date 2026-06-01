@@ -992,7 +992,7 @@ final class McpServer
 		auto dispatch = (Message m) @safe {
 			if (sink is null)
 				return handle(m);
-			return handle(m, new StdioContext(sink, readProgressToken(m.params)));
+			return handle(m, new StdioContext(sink, readProgressToken(m.params), negotiated));
 		};
 
 		if (!input.isBatch)

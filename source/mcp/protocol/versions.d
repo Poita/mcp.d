@@ -83,6 +83,16 @@ bool supportsElicitation(ProtocolVersion v) pure nothrow
 	return v >= ProtocolVersion.v2025_06_18;
 }
 
+/// Whether `notifications/progress` may carry the optional `message` field.
+/// The 2024-11-05 ProgressNotification params are {progressToken, progress,
+/// total?} with NO `message`; `message` was introduced in 2025-03-26 and is
+/// retained in every later version. Emitting it to a 2024-11-05 peer would
+/// inject an out-of-schema key, so the server gates it on this predicate.
+bool supportsProgressMessage(ProtocolVersion v) pure nothrow
+{
+	return v >= ProtocolVersion.v2025_03_26;
+}
+
 /// The draft (2026-07-28) redesign: stateless HTTP, per-request `_meta`,
 /// `server/discover`, MRTR, `subscriptions/listen`, cacheable results, and the
 /// standard request headers. Gated behind this single predicate so older
