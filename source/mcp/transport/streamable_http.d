@@ -742,6 +742,12 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	// JSON result is discarded: on this path the acknowledgement is delivered as
 	// the first SSE event instead.
 	server.handle(msg);
+	// Capture THIS request's parsed filter once, immediately after routing, so both
+	// the per-stream listener and its acknowledgement reflect exactly this listen
+	// request's opt-in (draft basic/utilities/subscriptions §Multiple Concurrent
+	// Subscriptions: each subscription is independent). Reading it once also avoids a
+	// later concurrent listen on the shared McpServer overwriting lastListenFilter_.
+	auto streamFilter = server.lastListenFilter();
 
 	res.contentType = "text/event-stream";
 	// subscriptions/listen is a draft-only stream; emit the draft SHOULD header
@@ -760,17 +766,20 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 			res.bodyWriter.write(cast(const(ubyte)[]) frame);
 			res.bodyWriter.flush();
 		}();
-	}, rpcIdString(msg.id), server.lastListenFilter());
+	}, rpcIdString(msg.id), streamFilter);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
 
-	// First event: acknowledge with the agreed-upon subset, delivered only to
-	// this stream (not broadcast to any other open listen stream). It is stamped
-	// with the subscriptionId by the push channel, so it carries the listen id in
-	// `_meta` like every subsequent notification on the stream.
+	// First event: acknowledge with the agreed-upon subset for THIS request only,
+	// delivered only to this stream (not broadcast to any other open listen stream).
+	// Built from this stream's filter — not the server-wide accumulator — so a
+	// concurrent (or already-closed) stream's opt-in cannot leak into this ack
+	// (draft basic/utilities/subscriptions Acknowledgment). It is stamped with the
+	// subscriptionId by the push channel, so it carries the listen id in `_meta`
+	// like every subsequent notification on the stream.
 	push.emitTo(listenerId,
-			subscriptionsAcknowledgedNotification(server.acknowledgedListenSubset()));
+			subscriptionsAcknowledgedNotification(server.acknowledgedSubsetFor(streamFilter)));
 
 	// Hold the connection open, emitting an SSE comment heartbeat so a write
 	// failure (client disconnect) is observed and the loop terminates.
@@ -1616,7 +1625,9 @@ unittest  // only a draft subscriptions/listen opens the long-lived stream
 /// `subscriptions/listen` stream: a `notifications/subscriptions/acknowledged`
 /// notification carrying the agreed-upon subset of change-notification types the
 /// server will deliver on the stream (draft basic/utilities/subscriptions). The
-/// `subset` is what `McpServer.acknowledgedListenSubset` reported.
+/// `subset` is what `McpServer.acknowledgedSubsetFor` reported for that one
+/// stream's filter (each subscription is independent — §Multiple Concurrent
+/// Subscriptions).
 ///
 /// Per the draft spec the agreed subset is nested under `params.notifications`
 /// (mirroring the `notifications` filter the client sent in the listen request);
@@ -1946,7 +1957,8 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
 	auto push = server.serverPushChannel(coord);
 	string[] frames;
 	const lid = push.addListener((string f) @safe { frames ~= f; }, rpcIdString(m.id));
-	push.emitTo(lid, subscriptionsAcknowledgedNotification(server.acknowledgedListenSubset()));
+	push.emitTo(lid, subscriptionsAcknowledgedNotification(
+			server.acknowledgedSubsetFor(server.lastListenFilter())));
 	assert(frames.length == 1);
 	assert(frames[0].canFind("notifications/subscriptions/acknowledged"));
 	// The agreed subset is nested under params.notifications (draft spec shape).

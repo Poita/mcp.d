@@ -815,9 +815,12 @@ final class McpServer
 		stdioListenSink = writeLine;
 
 		// First message on the stream: the acknowledgement carrying the agreed-upon
-		// subset, stamped with the subscriptionId.
+		// subset for THIS listen request only (draft basic/utilities/subscriptions
+		// §Multiple Concurrent Subscriptions: each subscription is independent), built
+		// from the just-parsed per-stream filter so concurrent (or already-closed)
+		// streams' opt-ins do not leak into this ack. Stamped with the subscriptionId.
 		Json ackParams = Json.emptyObject;
-		ackParams["notifications"] = acknowledgedListenSubset();
+		ackParams["notifications"] = acknowledgedSubsetFor(lastListenFilter_);
 		auto ack = withSubscriptionId(makeNotification("notifications/subscriptions/acknowledged",
 				ackParams), stdioListenSubscriptionId);
 		writeLine(ack.toString());
@@ -1571,6 +1574,34 @@ final class McpServer
 	SubscriptionFilter lastListenFilter() @safe
 	{
 		return lastListenFilter_;
+	}
+
+	/// The acknowledged subset for a single `subscriptions/listen` request's filter,
+	/// built from exactly that one stream's opt-in (draft basic/utilities/subscriptions
+	/// Acknowledgment). Each subscription is independent — identified by its own listen
+	/// request id (§Multiple Concurrent Subscriptions) — so the ack a transport sends as
+	/// the first event on a stream MUST reflect only THAT request's opt-in, never the
+	/// server-wide accumulation across other (or already-closed) concurrent streams.
+	/// The three list-changed types appear as booleans (`{ "<type>": true }`) and
+	/// `resourceSubscriptions` as the agreed `string[]` of URIs; an empty object when
+	/// the filter opted into nothing.
+	Json acknowledgedSubsetFor(SubscriptionFilter f) const @safe
+	{
+		Json subset = Json.emptyObject;
+		if (f.toolsListChanged)
+			subset["toolsListChanged"] = true;
+		if (f.promptsListChanged)
+			subset["promptsListChanged"] = true;
+		if (f.resourcesListChanged)
+			subset["resourcesListChanged"] = true;
+		if (f.resourceSubscriptions)
+		{
+			Json uris = Json.emptyArray;
+			foreach (u; f.resourceUris)
+				uris ~= Json(u);
+			subset["resourceSubscriptions"] = uris;
+		}
+		return subset;
 	}
 
 	private Json doListResources(Json params, ProtocolVersion ver) @safe
@@ -4215,6 +4246,84 @@ unittest  // ack echoes every opted-in resourceSubscriptions URI in request orde
 	assert(subset["resourceSubscriptions"].length == 2);
 	assert(subset["resourceSubscriptions"][0].get!string == "file:///a.txt");
 	assert(subset["resourceSubscriptions"][1].get!string == "file:///b.txt");
+}
+
+unittest  // acknowledgedSubsetFor serialises exactly one filter's opt-in (#430)
+{
+	// The ack the transport emits on a stream MUST reflect only THAT request's
+	// filter (draft basic/utilities/subscriptions Acknowledgment), not the global
+	// accumulator. Build the subset straight from a per-stream SubscriptionFilter.
+	auto s = makeTestServer();
+	SubscriptionFilter f;
+	f.active = true;
+	f.toolsListChanged = true;
+	auto subset = s.acknowledgedSubsetFor(f);
+	assert(subset.type == Json.Type.object);
+	assert(subset["toolsListChanged"].get!bool);
+	assert("promptsListChanged" !in subset);
+	assert("resourcesListChanged" !in subset);
+	assert("resourceSubscriptions" !in subset);
+}
+
+unittest  // acknowledgedSubsetFor echoes resourceSubscriptions as the filter's URI string[] (#430)
+{
+	auto s = makeTestServer();
+	SubscriptionFilter f;
+	f.active = true;
+	f.resourceSubscriptions = true;
+	f.resourceUris = ["file:///project/config.json"];
+	auto subset = s.acknowledgedSubsetFor(f);
+	assert(subset["resourceSubscriptions"].type == Json.Type.array);
+	assert(subset["resourceSubscriptions"].length == 1);
+	assert(subset["resourceSubscriptions"][0].get!string == "file:///project/config.json");
+	assert("toolsListChanged" !in subset);
+}
+
+unittest  // acknowledgedSubsetFor of an empty filter is an empty object (#430)
+{
+	auto s = makeTestServer();
+	SubscriptionFilter f;
+	f.active = true;
+	auto subset = s.acknowledgedSubsetFor(f);
+	assert(subset.type == Json.Type.object);
+	assert(subset.length == 0);
+}
+
+unittest  // per-stream ack does not leak a concurrent stream's opt-in (#430)
+{
+	// Regression for the cross-subscription leak: one shared McpServer handles two
+	// concurrent subscriptions/listen requests. Stream A opts into toolsListChanged
+	// only; stream B opts into resourceSubscriptions only. Per draft §Multiple
+	// Concurrent Subscriptions each subscription is independent, so B's ack must NOT
+	// report toolsListChanged (and A's must NOT report resourceSubscriptions). The
+	// fix builds each ack from the per-stream filter the transport captured right
+	// after routing that listen request — never the server-wide accumulator.
+	auto s = makeTestServer();
+	s.enableToolsListChanged();
+	s.enableResourceSubscriptions();
+
+	Json fa = Json.emptyObject;
+	fa["toolsListChanged"] = true;
+	Json pa = Json.emptyObject;
+	pa["notifications"] = fa;
+	s.handle(draftReq(1, "subscriptions/listen", pa));
+	auto ackA = s.acknowledgedSubsetFor(s.lastListenFilter());
+	assert(ackA["toolsListChanged"].get!bool);
+	assert("resourceSubscriptions" !in ackA);
+
+	Json fb = Json.emptyObject;
+	fb["resourceSubscriptions"] = Json([Json("file:///b.txt")]);
+	Json pb = Json.emptyObject;
+	pb["notifications"] = fb;
+	s.handle(draftReq(2, "subscriptions/listen", pb));
+	auto ackB = s.acknowledgedSubsetFor(s.lastListenFilter());
+	// B requested resourceSubscriptions ONLY — its ack must not carry A's tools opt-in.
+	assert("toolsListChanged" !in ackB);
+	assert(ackB["resourceSubscriptions"].type == Json.Type.array);
+	assert(ackB["resourceSubscriptions"].length == 1);
+	assert(ackB["resourceSubscriptions"][0].get!string == "file:///b.txt");
+	// And B's URI list must not include A's (A had none, but guard against the leak).
+	assert(ackB["resourceSubscriptions"].length == 1);
 }
 
 unittest  // draft is stateless: tools/call works without a prior initialize
