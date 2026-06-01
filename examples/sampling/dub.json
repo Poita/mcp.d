@@ -1,0 +1,22 @@
+{
+	"name": "sampling",
+	"description": "MCP Sampling example (server + self-verifying client e2e) over Streamable HTTP for mcp.d (#354)",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp": { "path": "../.." }
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "sampling-server",
+			"mainSourceFile": "server.d"
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "sampling-client",
+			"mainSourceFile": "client.d"
+		}
+	]
+}
