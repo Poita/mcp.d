@@ -1,36 +1,36 @@
 /**
- * examples/elicitation — server.d
+ * examples/elicitation — server.d (dual-transport, typed APIs)
  *
  * Demonstrates the SERVER side of **2025-era blocking elicitation** (issue #355)
- * over the Streamable HTTP transport, written in the ergonomic UDA style: the
- * tool is an annotated typed method on a class, registered in one call with
- * `registerHandlers`.
+ * written in the ergonomic UDA style: the tool is an annotated typed method on a
+ * class, registered in one call with `registerHandlers`.
  *
  * The `plan_trip` tool needs more information than its single `destination`
  * argument carries, so mid-handler it opens a server->client
  * `elicitation/create` request via the BLOCKING `ctx.elicit(message, schema)`.
- * It hands the client a rich `requestedSchema` exercising the
- * SEP-1034/1330 surface:
- *   - a `string` field (`travelers` -> actually an integer; see below),
- *   - an `integer` field with `minimum`/`maximum`,
- *   - an `enum` field (`cabin`) with a `default`, and
- *   - a `boolean` field with a `default`.
  * The call BLOCKS until the client's `onElicitation` handler answers; the SDK
- * delivers the answer back as the `ctx.elicit` return value (an `ElicitResult`
- * as JSON). The handler then branches on the user's `action`
- * (accept / decline / cancel) and returns a structured result the client can
- * assert against.
+ * delivers the answer back as a typed `ElicitResult` (issue #436). The handler
+ * branches on the user's `action` (accept / decline / cancel) and returns a
+ * structured result the client can assert against.
  *
- * Contrast with MRTR (examples/mrtr): MRTR is the *stateless draft* input flow
- * where the tool ENDS the call with `ToolResponse.inputRequired(...)` and the
- * client resubmits a fresh `tools/call`. Here, on the 2025 released protocol,
- * the elicitation is a genuine blocking server->client round-trip inside one
- * `tools/call` — no resubmission, no opaque `requestState`. The server->client
- * blocking deadlock over Streamable HTTP was fixed in #377, so this completes.
+ * Typed-API adoption (closes the example half of #436/#437):
+ *   - the requestedSchema is DERIVED from the flat struct `TripDetails` via
+ *     `jsonSchemaOf!TripDetails` (then enriched with the rich facets — integer
+ *     bounds, an enum default, a boolean default — that `jsonSchemaOf` cannot
+ *     express on its own; SEP-1034/1330 permits them);
+ *   - `ctx.elicit` returns a typed `ElicitResult`; on `accept` the collected
+ *     values are decoded with `result.contentAs!TripDetails` instead of
+ *     hand-reading the `content` Json;
+ *   - the tool returns a `TripPlan` struct so the SDK infers the output schema
+ *     and emits `structuredContent`.
  *
- * Run standalone:
- *   dub build -c server
- *   ./elicitation-server --port 9355        # serves http://127.0.0.1:9355/mcp
+ * Dual transport — ONE binary, either transport:
+ *   stdio (default):  ./elicitation-server                       # JSON-RPC on stdio
+ *   http:             ./elicitation-server --http --port 9355     # http://127.0.0.1:9355/mcp
+ *
+ * The blocking server->client elicitation completes over BOTH transports: stdio
+ * answers the request inline on the same channel; the Streamable HTTP deadlock
+ * was fixed in #377.
  */
 module elicitation_server;
 
@@ -40,33 +40,67 @@ import std.stdio : stderr;
 import std.typecons : nullable;
 
 import vibe.data.json : Json;
+import vibe.data.serialization : optional;
 
 import mcp;
-import mcp.transport : StreamableHttpOptions, runStreamableHttp;
+import mcp.api.schema : jsonSchemaOf;
+import mcp.transport : StreamableHttpOptions, runStreamableHttp, runStdio;
 
-/// The fixed port the example binds, kept in one place so server.d, client.d
-/// (and the README) agree.
+/// The fixed HTTP port the example binds, kept in one place so server.d,
+/// client.d (and the README) agree.
 enum ushort defaultPort = 9355;
 
 void main(string[] args)
 {
+	bool http;
 	ushort port = defaultPort;
 	string host = "127.0.0.1";
-	getopt(args, "port|p", "Port to listen on (default 9355)", &port,
-			"host|h", "Address to bind (default 127.0.0.1)", &host);
+	getopt(args, "http", "Serve over Streamable HTTP instead of stdio", &http, "port|p",
+			"HTTP port to listen on (default 9355)",
+			&port, "host|h", "HTTP address to bind (default 127.0.0.1)", &host);
 
 	auto server = new McpServer("elicitation-example", "1.0.0",
-			nullable("2025-era blocking elicitation demo over Streamable HTTP."));
+			nullable("2025-era blocking elicitation demo (stdio + Streamable HTTP)."));
 	// Register every @tool method on the API object in one call; each tool's
 	// input schema and argument marshalling are derived from the method signature.
 	registerHandlers(server, new TripApi);
 
-	StreamableHttpOptions opts;
-	opts.bindAddresses = [host];
-	() @trusted {
-		stderr.writefln("elicitation-server listening on http://%s:%d/mcp", host, port);
-	}();
-	runStreamableHttp(server, port, opts);
+	if (http)
+	{
+		StreamableHttpOptions opts;
+		opts.bindAddresses = [host];
+		() @trusted {
+			stderr.writefln("elicitation-server listening on http://%s:%d/mcp", host, port);
+		}();
+		runStreamableHttp(server, port, opts);
+	}
+	else
+	{
+		// stdio (default): a tool that calls ctx.elicit is answered inline on the
+		// same stdio channel (#448/#449), so the blocking round-trip completes.
+		runStdio(server);
+	}
+}
+
+/// The flat elicitation form the server gathers from the client. Its scalar
+/// fields satisfy the elicitation schema restriction (SEP-1034/1330), so
+/// `jsonSchemaOf!TripDetails` derives the base `requestedSchema` and
+/// `ElicitResult.contentAs!TripDetails` decodes the accepted answer. The field
+/// defaults double as the values applied when the user omits an optional field.
+/// Cabin class — a D `enum`, so jsonSchemaOf derives the three enum members
+/// (["economy","premium","business"]) into the requestedSchema automatically.
+enum Cabin
+{
+	economy,
+	premium,
+	business,
+}
+
+struct TripDetails
+{
+	int travelers; /// required: number of travelers (bounds added to the schema)
+	@optional Cabin cabin = Cabin.economy; /// enum (members derived) + a default (added to the schema)
+	@optional bool insurance = false; /// boolean with a default (added to the schema)
 }
 
 /// The structured result `plan_trip` returns. Its fields become the tool's
@@ -97,50 +131,37 @@ final class TripApi
 	@describe("the destination city")
 	TripPlan planTrip(string destination, RequestContext ctx) @safe
 	{
-		// Build the restricted requestedSchema (SEP-1034/1330): only flat objects
-		// of primitive fields, optionally with enum / default / min / max.
-		Json schema = Json.emptyObject;
-		schema["type"] = "object";
+		// Start from the schema DERIVED from the TripDetails struct via
+		// jsonSchemaOf (object type + required + the cabin enum members), then
+		// enrich it with the rich facets jsonSchemaOf cannot express: titles,
+		// integer bounds, an enum default and a boolean default (all permitted by
+		// the SEP-1034/1330 restricted schema).
+		Json schema = jsonSchemaOf!TripDetails;
+		Json props = schema["properties"];
 
-		Json props = Json.emptyObject;
+		props["travelers"]["title"] = "Number of travelers";
+		props["travelers"]["minimum"] = 1;
+		props["travelers"]["maximum"] = 9;
 
-		// integer field with bounds.
-		Json travelers = Json.emptyObject;
-		travelers["type"] = "integer";
-		travelers["title"] = "Number of travelers";
-		travelers["minimum"] = 1;
-		travelers["maximum"] = 9;
-		props["travelers"] = travelers;
+		props["cabin"]["title"] = "Cabin class";
+		props["cabin"]["default"] = "economy";
 
-		// enum field with a default.
-		Json cabin = Json.emptyObject;
-		cabin["type"] = "string";
-		cabin["title"] = "Cabin class";
-		Json cabinEnum = Json.emptyArray;
-		cabinEnum ~= Json("economy");
-		cabinEnum ~= Json("premium");
-		cabinEnum ~= Json("business");
-		cabin["enum"] = cabinEnum;
-		cabin["default"] = "economy";
-		props["cabin"] = cabin;
+		props["insurance"]["title"] = "Add travel insurance";
+		props["insurance"]["default"] = false;
 
-		// boolean field with a default.
-		Json insurance = Json.emptyObject;
-		insurance["type"] = "boolean";
-		insurance["title"] = "Add travel insurance";
-		insurance["default"] = false;
-		props["insurance"] = insurance;
-
-		schema["properties"] = props;
-
+		// Only `travelers` is required; `cabin` and `insurance` are optional and
+		// fall back to the defaults above when the user omits them. (jsonSchemaOf
+		// cannot tell a `false` boolean default from bool.init, so set this
+		// explicitly to keep the requestedSchema consistent with the demo.)
 		Json required = Json.emptyArray;
 		required ~= Json("travelers");
 		schema["required"] = required;
 
 		// BLOCKING server->client elicitation. Returns once the client's
-		// onElicitation answers (this is the round-trip fixed for HTTP in #377).
-		// `ctx.elicit` returns a typed `ElicitResult` (#436).
-		auto result = ctx.elicit("Please provide trip details for " ~ destination, schema);
+		// onElicitation answers (the round-trip fixed for HTTP in #377, and
+		// inline-answered over stdio). `ctx.elicit` returns a typed `ElicitResult`
+		// (#436).
+		ElicitResult result = ctx.elicit("Please provide trip details for " ~ destination, schema);
 
 		final switch (result.action)
 		{
@@ -154,26 +175,16 @@ final class TripApi
 			break;
 		}
 
-		// action == accept: read the collected values, applying the schema's
-		// defaults for any optional field the user left out.
-		auto content = result.content;
-		int travelersN = 1;
-		if (content.type == Json.Type.object && "travelers" in content)
-			travelersN = content["travelers"].get!int;
+		// action == accept: decode the collected values into the typed struct.
+		// Fields the user omitted keep TripDetails' defaults ("economy" / false),
+		// which mirror the schema defaults.
+		TripDetails details = result.contentAs!TripDetails;
+		const cabinName = details.cabin.to!string;
 
-		string cabinClass = "economy";
-		if (content.type == Json.Type.object && "cabin" in content
-				&& content["cabin"].type == Json.Type.string)
-			cabinClass = content["cabin"].get!string;
-
-		bool wantsInsurance = false;
-		if (content.type == Json.Type.object && "insurance" in content
-				&& content["insurance"].type == Json.Type.bool_)
-			wantsInsurance = content["insurance"].get!bool;
-
-		const summary = "Booked " ~ destination ~ " for " ~ travelersN.to!string
-			~ " traveler(s) in " ~ cabinClass ~ " class" ~ (wantsInsurance
+		const summary = "Booked " ~ destination ~ " for " ~ details.travelers.to!string
+			~ " traveler(s) in " ~ cabinName ~ " class" ~ (details.insurance
 					? " with insurance." : " without insurance.");
-		return TripPlan("booked", destination, travelersN, cabinClass, wantsInsurance, summary);
+		return TripPlan("booked", destination, details.travelers, cabinName,
+				details.insurance, summary);
 	}
 }
