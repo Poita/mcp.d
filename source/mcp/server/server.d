@@ -1752,6 +1752,17 @@ final class McpServer
 	{
 		auto p = InitializeParams.fromJson(params);
 		negotiated = negotiate(p.protocolVersion);
+		// The draft revision defines NO `initialize`/`InitializeResult`: draft
+		// peers establish the session via `server/discover` plus per-request
+		// `_meta`, never the stateful `initialize` handshake. So the `initialize`
+		// channel does not actually "support" draft. Per the Version Negotiation
+		// rule ("if the server supports the requested version it MUST respond with
+		// the same version, otherwise it MUST respond with another version it
+		// supports — SHOULD be the latest"), clamp a draft negotiation down to the
+		// latest stable rather than emitting an InitializeResult that claims a
+		// version with no initialize semantics (issue #419).
+		if (negotiated.isDraft)
+			negotiated = latestStable;
 		clientCaps = p.capabilities;
 		// Pin the connection's push-path version so unsolicited server->client
 		// notifications gate correctly on draft after initialize (issue #288).
@@ -2213,6 +2224,51 @@ unittest  // initialize falls back to latest stable for an unknown version
 	assert(resp["result"]["protocolVersion"].get!string == latestStable.toWire);
 }
 
+unittest  // initialize MUST NOT negotiate draft: it has no InitializeResult (#419)
+{
+	// The draft schema (2026-07-28) defines server/discover + per-request _meta,
+	// NOT an initialize/InitializeResult handshake. A (non-conformant) client
+	// that sends the draft wire version over `initialize` must receive a version
+	// the `initialize` channel actually supports — the latest stable — per the
+	// Version Negotiation rule ("the server MUST respond with another protocol
+	// version it supports"), never the draft version.
+	auto s = makeTestServer();
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = ProtocolVersion.draft.toWire; // "2026-07-28"
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	auto resp = s.handle(req(1, "initialize", params)).get;
+	assert("result" in resp);
+	assert(resp["result"]["protocolVersion"].get!string == latestStable.toWire);
+	assert(resp["result"]["protocolVersion"].get!string != ProtocolVersion.draft.toWire);
+}
+
+unittest  // initialize MUST NOT negotiate draft via the "draft" alias (#419)
+{
+	auto s = makeTestServer();
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "draft";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	auto resp = s.handle(req(1, "initialize", params)).get;
+	assert(resp["result"]["protocolVersion"].get!string == latestStable.toWire);
+}
+
+unittest  // initialize draft clamp does not pin the connection to draft (#419)
+{
+	// Clamping must also fix the negotiated/connection version so subsequent
+	// unsolicited server->client gating and serverInfo projection behave as the
+	// stable version, not draft.
+	auto s = makeTestServer();
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "draft";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", params));
+	assert(s.negotiatedVersion == latestStable);
+	assert(!s.negotiatedVersion.isDraft);
+}
+
 unittest  // ping returns an empty result object
 {
 	auto s = makeTestServer();
@@ -2405,7 +2461,7 @@ unittest  // tools/list gates Tool.execution to a 2025-11-25-negotiated client (
 	assert(tool["execution"]["taskSupport"].get!string == "optional");
 }
 
-unittest  // tools/list omits Tool.execution for a draft-negotiated client (#337)
+unittest  // tools/list omits Tool.execution for a draft client (#337)
 {
 	auto s = new McpServer("exec-srv", "0.1.0");
 	Tool t = {name: "longjob"};
@@ -2416,11 +2472,9 @@ unittest  // tools/list omits Tool.execution for a draft-negotiated client (#337
 		return r;
 	});
 
-	Json initP = Json.emptyObject;
-	initP["protocolVersion"] = "draft";
-	s.handle(req(1, "initialize", initP)).get;
-
-	auto resp = s.handle(req(2, "tools/list")).get;
+	// A draft client establishes the draft protocol via per-request `_meta`,
+	// NOT the `initialize` handshake (which has no draft semantics; see #419).
+	auto resp = s.handle(draftReq(2, "tools/list")).get;
 	auto tool = resp["result"]["tools"][0];
 	assert("execution" !in tool,
 			"execution must NOT be emitted to a draft client (dropped from draft schema)");
@@ -3557,17 +3611,16 @@ unittest  // capabilities reflect registered features
 	assert(caps.prompts.isNull);
 }
 
-unittest  // advertised extensions appear in initialize capabilities under draft
+unittest  // advertised extensions appear in server/discover capabilities under draft
 {
 	auto s = new McpServer("t", "1");
 	Json settings = Json.emptyObject;
 	settings["maxConcurrent"] = 4;
 	s.advertiseExtension("io.modelcontextprotocol/tasks", settings);
 
-	// The `extensions` negotiation map is draft-only; advertise under draft.
-	Json params = Json.emptyObject;
-	params["protocolVersion"] = "draft";
-	auto resp = s.handle(req(1, "initialize", params)).get;
+	// The `extensions` negotiation map is draft-only; a draft client discovers it
+	// via `server/discover`, not the `initialize` handshake (see #419).
+	auto resp = s.handle(draftReq(1, "server/discover")).get;
 	auto ext = resp["result"]["capabilities"]["extensions"];
 	assert(ext.type == Json.Type.object);
 	assert(ext["io.modelcontextprotocol/tasks"]["maxConcurrent"].get!int == 4);
@@ -3646,14 +3699,14 @@ unittest  // enableTasks advertises the `tasks` capability at initialize
 	assert("tools/call" !in t["requests"]);
 }
 
-unittest  // enableTasks: draft initialize folds tasks into extensions, no top-level (#384)
+unittest  // enableTasks: draft server/discover folds tasks into extensions, no top-level (#384)
 {
 	auto s = new McpServer("t", "1");
 	s.enableTasks(true, true, TaskRequests().tool().toJson());
 
-	Json params = Json.emptyObject;
-	params["protocolVersion"] = "draft";
-	auto resp = s.handle(req(1, "initialize", params)).get;
+	// Draft clients discover capabilities via `server/discover`, not `initialize`
+	// (which has no draft semantics; see #419).
+	auto resp = s.handle(draftReq(1, "server/discover")).get;
 	auto caps = resp["result"]["capabilities"];
 	// draft schema defines no top-level `tasks` capability.
 	assert("tasks" !in caps, "tasks leaked as a top-level capability under draft");
