@@ -29,59 +29,38 @@
  * DUAL-TRANSPORT: one binary, EITHER transport. The MCP stdio transport is
  * bidirectional, so the server→client sampling hop works over stdio just as it
  * does over Streamable HTTP (the HTTP keep-alive deadlock that used to bite this
- * path was fixed in #377):
+ * path was fixed in #377). Transport selection is delegated to the shared
+ * `examples/common` scaffold's `runServerFromArgs` (`--http` + `--port`/`--host`,
+ * otherwise stdio):
  *
  *   dub build -c server
  *   ./sampling-server                      # default: stdio (JSON-RPC on stdin/stdout)
  *   ./sampling-server --http --port 9354   # Streamable HTTP on http://127.0.0.1:9354/mcp
  *
  * The bundled client.d drives this binary over EITHER transport: with no flags
- * it spawns this server over stdio; with `--http <url>` it connects to a running
- * `--http` instance. The same assertions verify the sampling hop both ways.
+ * it spawns this server over stdio (`McpClient.spawnSibling`); with `--http <url>`
+ * it connects to a running `--http` instance. The same assertions verify the
+ * sampling hop both ways.
  */
 module sampling_server;
 
-import std.getopt : getopt;
-import std.stdio : stderr;
 import std.typecons : nullable;
 
 import mcp;
-import mcp.transport : StreamableHttpOptions, runStreamableHttp;
-import mcp.transport.stdio : runStdio;
+import examples_common : runServerFromArgs;
 
 enum ushort defaultPort = 9354;
 
-void main(string[] args)
+void main(string[] args) @safe
 {
-	bool http;
-	ushort port = defaultPort;
-	string host = "127.0.0.1";
-	getopt(args,
-			"http", "Serve over Streamable HTTP instead of stdio", &http,
-			"port|p", "Port to listen on when --http (default 9354)", &port,
-			"host|h", "Address to bind when --http (default 127.0.0.1)", &host);
-
 	auto server = new McpServer("sampling-example", "1.0.0",
 			nullable("Server-initiated LLM sampling demo (stdio or Streamable HTTP)."));
 
 	// Register every @tool method on the API object in one call.
 	registerHandlers(server, new SamplingApi);
 
-	if (http)
-	{
-		StreamableHttpOptions opts;
-		opts.bindAddresses = [host];
-		() @trusted {
-			stderr.writefln("sampling-server listening on http://%s:%d/mcp", host, port);
-		}();
-		runStreamableHttp(server, port, opts);
-	}
-	else
-	{
-		// Default: stdio. The matching client.d spawns this very binary and drives
-		// it end-to-end over the bidirectional stdio channel.
-		runStdio(server);
-	}
+	// Scaffold helper: `--http` -> Streamable HTTP on `--port`/`--host`, else stdio.
+	runServerFromArgs(server, args, defaultPort);
 }
 
 /// `summarize` structured result: the model's `summary`, the `model` identifier
@@ -111,17 +90,15 @@ final class SamplingApi
 	/// to be terse + one user message carrying the text via `Content.makeText`),
 	/// sends it with `ctx.sample`, and surfaces the reply's first text block as
 	/// `summary` alongside the `model`/`stopReason` the client reported.
-	@tool("summarize", "Summarize a block of text by asking the client's LLM (sampling/createMessage).")
-	SummaryResult summarize(
-			@describe("the text to summarize") string text,
-			RequestContext ctx) @safe
+	@tool("summarize",
+			"Summarize a block of text by asking the client's LLM (sampling/createMessage).")
+	SummaryResult summarize(@describe("the text to summarize") string text, RequestContext ctx)@safe
 	{
 		CreateMessageRequest req;
 		req.systemPrompt = nullable(
 				"You are a terse summarizer. Reply with a single short sentence.");
 		req.messages = [
-			SamplingMessage("user",
-				Content.makeText("Summarize the following text:\n\n" ~ text))
+			SamplingMessage("user", Content.makeText("Summarize the following text:\n\n" ~ text))
 		];
 		req.maxTokens = nullable(200L);
 		req.temperature = nullable(0.0);
