@@ -7,17 +7,18 @@
  * and the process exits NON-ZERO on any mismatch, so CI can run it as an
  * end-to-end regression test on either transport.
  *
- * Transport selection (transport-agnostic assertions — the SAME `run` verifies
- * both):
- *   STDIO (default): no `--http` -> `McpClient.spawn([serverBinaryPath()])`
- *     launches the built `elicitation-server` binary (without --http) and owns
- *     its stdin/stdout JSON-RPC channel; `client.close()` runs the stdio
- *     shutdown sequence (SIGTERM -> SIGKILL) on the subprocess (#470). The
- *     blocking elicitation is answered inline on the same channel, so this needs
- *     no event loop.
- *   HTTP: `--http <url>` -> `McpClient.http(url)`. The blocking server->client
- *     elicitation rides the Streamable HTTP SSE channel, which requires a vibe
- *     event loop, so the HTTP run is wrapped in `runTask`/`runEventLoop`.
+ * Transport selection + event-loop wiring are delegated to the shared
+ * `examples/common` scaffold (#505):
+ *   - `connectFromArgs(args, "elicitation-server")` picks the transport from
+ *     argv: `--http <url>` -> `McpClient.http(url)`, otherwise
+ *     `McpClient.spawnSibling("elicitation-server")` which launches the built
+ *     server binary next to this client and owns its stdio JSON-RPC channel
+ *     (`client.close()` runs the shutdown sequence, #470);
+ *   - `runClient(scenario)` drives the vibe event loop uniformly so the SAME
+ *     scenario body completes over BOTH the synchronous stdio transport and the
+ *     HTTP transport (whose blocking server->client elicitation rides the
+ *     Streamable HTTP SSE channel and needs a loop), mapping any thrown failure
+ *     to a non-zero exit.
  *
  * Two-step run (see README):
  *   stdio:  dub run -c client                                   # spawns the server
@@ -25,8 +26,9 @@
  *           dub run -c client -- --http http://127.0.0.1:9355/mcp  (term 2)
  *
  * Typed-API adoption (#466 / #464 / #468 / #470):
- *   - stdio spawns the server with `McpClient.spawn` + `scope(exit) close()`,
- *     replacing the hand-rolled ServerProcess / ProcessPipes plumbing (#470);
+ *   - stdio spawns the server via the scaffold's `spawnSibling` +
+ *     `scope(exit) close()`, replacing the hand-rolled ServerProcess /
+ *     ProcessPipes plumbing (#470);
  *   - the `accept` handler returns `ElicitResult.accept(AcceptForm(3))` — the
  *     struct's fields become the collected `{name: value}` content map (#466) —
  *     instead of hand-building a Json object;
@@ -61,14 +63,14 @@
  */
 module elicitation_client;
 
-import std.algorithm : startsWith, canFind, map;
+import std.algorithm : canFind, map;
 import std.array : array;
-import std.getopt : getopt;
-import std.stdio : stderr, writeln;
+import std.stdio : writeln;
 
 import vibe.data.json : Json;
 
 import mcp;
+import examples_common : check, checkEq, runClient, connectFromArgs;
 import mcp.protocol.errors : McpException;
 import mcp.protocol.types : asNumber;
 
@@ -101,89 +103,22 @@ struct TripPlan
 	string summary;
 }
 
-/// Absolute path to the `elicitation-server` binary, resolved next to this
-/// client binary (dub writes both into the package root), independent of cwd.
-private string serverBinaryPath() @safe
+int main(string[] args) @safe
 {
-	import std.file : thisExePath;
-	import std.path : dirName, buildPath;
-
-	return buildPath(dirName(thisExePath()), "elicitation-server");
-}
-
-int main(string[] args)
-{
-	string url;
-	getopt(args, "http", "Connect over Streamable HTTP to this MCP URL (otherwise stdio)", &url);
-	// Tolerate a bare positional URL too (e.g. `-- http://...`), matching the
-	// older invocation style.
-	if (url.length == 0)
-		foreach (a; args[1 .. $])
-			if (a.startsWith("http://") || a.startsWith("https://"))
-				url = a;
-
-	const useHttp = url.length != 0;
-
-	// A fresh client per scenario: stdio spawns a new server subprocess (owned by
-	// the returned client, terminated by its close()); HTTP opens a new connection
-	// to the same URL. Returning a transport-agnostic `McpClient` keeps the
-	// assertion body identical for both transports.
-	McpClient makeClient() @safe
-	{
-		if (useHttp)
-			return McpClient.http(url);
-		return McpClient.spawn([serverBinaryPath()]);
-	}
-
-	int rc;
-	if (useHttp)
-	{
-		// HTTP: the blocking elicitation rides the SSE channel and needs an event
-		// loop, so drive the whole scenario from inside one vibe task.
-		import vibe.core.core : runTask, runEventLoop, exitEventLoop;
-
-		runTask(() nothrow{
-			scope (exit)
-				exitEventLoop();
-			try
-				rc = run(&makeClient);
-			catch (Throwable t) // AssertError + exceptions both fail the e2e
-			{
-				try
-					stderr.writeln("FAIL: ", t.msg);
-				catch (Exception)
-				{
-				}
-				rc = 1;
-			}
-		});
-		runEventLoop();
-	}
-	else
-	{
-		// stdio: synchronous; the elicitation reply is written inline to the
-		// child's stdin, so no event loop is required.
-		try
-			rc = run(&makeClient);
-		catch (Throwable t)
+	// `runClient` drives the vibe loop uniformly for both transports and maps any
+	// thrown assertion to a non-zero exit. A fresh client per scenario: stdio
+	// spawns a new sibling server subprocess (owned by the returned client,
+	// terminated by its close()); HTTP opens a new connection to the same URL.
+	// Returning a transport-agnostic `McpClient` keeps the assertion body
+	// identical for both transports.
+	return runClient(() @safe {
+		McpClient makeClient() @safe
 		{
-			try
-				stderr.writeln("FAIL: ", t.msg);
-			catch (Exception)
-			{
-			}
-			rc = 1;
+			return connectFromArgs(args, "elicitation-server");
 		}
-	}
-	return rc;
-}
 
-/// A tiny assert helper that throws (caught in main -> exit 1) with a clear
-/// message describing what differed.
-private void check(bool cond, lazy string msg) @safe
-{
-	if (!cond)
-		throw new Exception(msg);
+		return run(&makeClient);
+	});
 }
 
 /// The transport-agnostic e2e body. `makeClient` yields a fresh connected-but-
@@ -198,8 +133,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		scope (exit)
 			client.close();
 		auto init = client.initialize();
-		check(init.serverInfo.name == "elicitation-example",
-				"server name: expected 'elicitation-example', got '" ~ init.serverInfo.name ~ "'");
+		checkEq(init.serverInfo.name, "elicitation-example", "server name");
 
 		auto tools = client.listTools().tools;
 		auto names = tools.map!(t => t.name).array;
@@ -253,23 +187,23 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		// enum + default on `cabin` (enum members derived from the struct,
 		// default declared via @schemaDefault).
 		auto cabin = sprops["cabin"];
-		check(cabin["enum"].length == 3, "cabin enum should have 3 members");
-		check(cabin["default"].get!string == "economy", "cabin default should be 'economy'");
+		checkEq(cabin["enum"].length, 3UL, "cabin enum member count");
+		checkEq(cabin["default"].get!string, "economy", "cabin default");
 		// bounds on `travelers` (declared via @minimum/@maximum).
 		auto travelers = sprops["travelers"];
 		check(asNumber(travelers["minimum"]) == 1 && asNumber(travelers["maximum"]) == 9,
 				"travelers should have minimum 1 / maximum 9");
 		// default on `insurance` (declared via @schemaDefault(false)).
-		check(sprops["insurance"]["default"].get!bool == false, "insurance default should be false");
+		checkEq(sprops["insurance"]["default"].get!bool, false, "insurance default");
 
 		// The accepted value + applied defaults appear in the structured result,
 		// decoded once into the typed TripPlan (#464).
 		auto plan = r.structuredContentAs!TripPlan;
-		check(plan.status == "booked", "accept status should be 'booked', got: " ~ plan.status);
-		check(plan.destination == "Kyoto", "destination should be 'Kyoto'");
-		check(plan.travelers == 3, "travelers should be 3 (the accepted value)");
-		check(plan.cabin == "economy", "cabin should default to 'economy' when omitted");
-		check(plan.insurance == false, "insurance should default to false when omitted");
+		checkEq(plan.status, "booked", "accept status");
+		checkEq(plan.destination, "Kyoto", "destination");
+		checkEq(plan.travelers, 3, "travelers (the accepted value)");
+		checkEq(plan.cabin, "economy", "cabin should default when omitted");
+		checkEq(plan.insurance, false, "insurance should default when omitted");
 	}
 
 	// ---- C. DECLINE -------------------------------------------------------
@@ -285,7 +219,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		auto r = client.callTool("plan_trip", PlanArgs("Oslo"));
 		check(!r.isError, "plan_trip (decline) should not be a tool error");
 		auto plan = r.structuredContentAs!TripPlan;
-		check(plan.status == "declined", "decline status should be 'declined', got: " ~ plan.status);
+		checkEq(plan.status, "declined", "decline status");
 	}
 
 	// ---- D. CANCEL --------------------------------------------------------
@@ -301,8 +235,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		auto r = client.callTool("plan_trip", PlanArgs("Lima"));
 		check(!r.isError, "plan_trip (cancel) should not be a tool error");
 		auto plan = r.structuredContentAs!TripPlan;
-		check(plan.status == "cancelled", "cancel status should be 'cancelled', got: " ~ plan
-				.status);
+		checkEq(plan.status, "cancelled", "cancel status");
 	}
 
 	// ---- E. UNSUPPORTED (no onElicitation -> server refuses to elicit) ----
