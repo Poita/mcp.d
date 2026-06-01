@@ -1,0 +1,11 @@
+{
+	"name": "examples-common",
+	"description": "Shared example-support helpers for the mcp.d example servers/clients (#505)",
+	"license": "Apache-2.0",
+	"targetType": "library",
+	"sourcePaths": ["source"],
+	"importPaths": ["source"],
+	"dependencies": {
+		"mcp": { "path": "../.." }
+	}
+}
