@@ -1,10 +1,17 @@
 /**
  * Authorization (OAuth 2.1) example — CLIENT side + self-verifying E2E test.
  *
- * Connects to the protected server (see server.d) and exercises every facet of
- * the authorization flow from the consumer's eye, ASSERTING concrete expected
- * values at each step. On any mismatch it prints what differed and exits
- * NON-ZERO, so this doubles as an end-to-end regression test.
+ * Connects to the protected server (see server.d) over Streamable HTTP and
+ * exercises every facet of the authorization flow from the consumer's eye,
+ * ASSERTING concrete expected values at each step. On any mismatch it prints
+ * what differed and exits NON-ZERO, so this doubles as an end-to-end regression
+ * test.
+ *
+ * TRANSPORT: HTTP only. OAuth 2.1 resource-server protection (401 challenges,
+ * the RFC 9728 PRM document, RFC 8707 audience binding) is inherently an HTTP
+ * concern, so there is no stdio mode. The endpoint is selected with `--url`
+ * (default http://127.0.0.1:8742/mcp); `--port` / `--host` remain as a
+ * convenience to build the default URL.
  *
  * What it verifies:
  *   1. First-contact (no token): HTTP 401 with a `WWW-Authenticate: Bearer`
@@ -13,7 +20,9 @@
  *      `resource`, `authorization_servers`, `scopes_supported`.
  *   3. Happy path: a JWT with `mcp:read mcp:write` -> initialize succeeds,
  *      tools/list contains `whoami` + `secret_note`, `whoami` returns the
- *      token's subject, `secret_note` returns the privileged payload.
+ *      token's subject + scopes in its TYPED structuredContent (inferred from
+ *      the server's `WhoamiResult` struct), `secret_note` returns the
+ *      privileged payload.
  *   4. Insufficient per-tool scope: a token with only `mcp:read` passes the
  *      server-wide gate but `secret_note` returns an isError tool result.
  *   5. Wrong audience (RFC 8707): a token for another resource -> request
@@ -27,7 +36,7 @@
  * Run (two-step, mirrors CI):
  *   dub build -c server && dub build -c client
  *   ./auth-server --port 8742 &        # background
- *   sleep 1 ; ./auth-client ; echo "exit=$?"
+ *   sleep 1 ; ./auth-client --url http://127.0.0.1:8742/mcp ; echo "exit=$?"
  */
 module auth_example_client;
 
@@ -65,9 +74,28 @@ void main(string[] args)
 {
 	ushort port = 8742;
 	string host = "127.0.0.1";
-	getopt(args, "port|p", &port, "host|h", &host);
-	baseOrigin = "http://" ~ host ~ ":" ~ port.to!string;
-	serverUrl = baseOrigin ~ "/mcp";
+	string url;
+	getopt(args,
+			"url|u", "Server MCP endpoint (default http://127.0.0.1:8742/mcp)", &url,
+			"port|p", "Port (used to build the default URL)", &port,
+			"host|h", "Host (used to build the default URL)", &host);
+
+	if (url.length)
+	{
+		serverUrl = url;
+		// The PRM probe and raw 401/403 checks hit the origin (no /mcp path),
+		// so derive it by trimming a trailing "/mcp" if present.
+		baseOrigin = url;
+		const mcpSuffix = "/mcp";
+		if (baseOrigin.length >= mcpSuffix.length
+				&& baseOrigin[$ - mcpSuffix.length .. $] == mcpSuffix)
+			baseOrigin = baseOrigin[0 .. $ - mcpSuffix.length];
+	}
+	else
+	{
+		baseOrigin = "http://" ~ host ~ ":" ~ port.to!string;
+		serverUrl = baseOrigin ~ "/mcp";
+	}
 
 	int rc = 1;
 	runTask(() nothrow{
@@ -184,11 +212,19 @@ int run()
 
 		auto who = client.callTool("whoami", Json.emptyObject);
 		check(!isToolError(who), "whoami should not be a tool error");
-		check(who.content.length == 1 && who.content[0].text.indexOf("subject=user-42") >= 0,
-				"whoami text should name the subject, got: "
-				~ (who.content.length ? who.content[0].text : "<none>"));
+		// `whoami` returns the typed WhoamiResult struct on the server, so the
+		// SDK infers structuredContent {subject, scopes} for us — assert it.
 		check(who.structuredContent["subject"].get!string == "user-42",
 				"whoami structuredContent.subject mismatch");
+		auto sc = who.structuredContent["scopes"];
+		check(sc.length == 2 && sc[0].get!string == "mcp:read"
+				&& sc[1].get!string == "mcp:write",
+				"whoami structuredContent.scopes mismatch: " ~ sc.toString());
+		// The reflection layer also mirrors the struct as a JSON text block.
+		check(who.content.length == 1
+				&& who.content[0].text.indexOf(`"subject":"user-42"`) >= 0,
+				"whoami text should mirror the structured subject, got: "
+				~ (who.content.length ? who.content[0].text : "<none>"));
 
 		auto secret = client.callTool("secret_note", Json.emptyObject);
 		check(!isToolError(secret), "secret_note with mcp:write should succeed");
@@ -206,6 +242,8 @@ int run()
 
 		auto who = client.callTool("whoami", Json.emptyObject);
 		check(!isToolError(who), "whoami should still work for a read-only token");
+		check(who.structuredContent["subject"].get!string == "reader",
+				"whoami structuredContent.subject should be the read-only subject");
 
 		auto secret = client.callTool("secret_note", Json.emptyObject);
 		check(isToolError(secret),
@@ -252,9 +290,9 @@ int run()
 				"403 challenge should carry insufficient_scope: " ~ wwwAuth);
 	}
 
-	writeln("OK: 401+WWW-Authenticate, PRM doc, full-scope tools (whoami/secret_note), "
-			~ "per-tool scope enforcement, RFC 8707 audience binding, and 403 insufficient_scope "
-			~ "all verified.");
+	writeln("OK: 401+WWW-Authenticate, PRM doc, full-scope tools (typed whoami structuredContent "
+			~ "+ secret_note), per-tool scope enforcement, RFC 8707 audience binding, and 403 "
+			~ "insufficient_scope all verified.");
 	return 0;
 }
 

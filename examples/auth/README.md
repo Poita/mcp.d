@@ -7,6 +7,16 @@ token and **doubles as an end-to-end regression test**.
 It is its own dub package with a path dependency on the root `mcp` SDK; it does
 not modify the root `dub.json`.
 
+## Transport: HTTP only (and why)
+
+This example is **HTTP only** — there is no stdio mode. OAuth 2.1
+resource-server protection is inherently an HTTP concern: the `401` +
+`WWW-Authenticate` challenge, the RFC 9728 Protected Resource Metadata document
+served at a well-known URL, and RFC 8707 audience binding all live in the HTTP
+layer. A stdio variant would have nothing to demonstrate. The server therefore
+stays on `runStreamableHttp`; its getopt surface is just `--port` / `--host`,
+and the client connects with `--url`.
+
 ## What it teaches
 
 The single server-side auth entry point is **`jwtVerifier`**, plugged into
@@ -28,6 +38,21 @@ everything else automatically:
   and the `secret_note` tool uses for a **finer-grained per-tool `mcp:write`
   check**.
 
+### Typed APIs
+
+The tools are declared in the ergonomic **UDA style** (`@tool` methods on an
+`AuthApi` class, registered in one call via `registerHandlers`) and lean on the
+SDK's typed APIs rather than hand-built `Json`:
+
+- **`whoami` returns a typed `WhoamiResult` struct.** The reflection layer
+  derives the tool's output schema (via `jsonSchemaOf`) and fills in the
+  `structuredContent` of the result automatically — the handler never touches
+  `Json`. The client asserts the inferred `structuredContent.subject` /
+  `.scopes`.
+- **`secret_note` returns a `CallToolResult`** because it must set `isError` on
+  the per-tool scope-denied path; its content is built with the typed
+  `Content.makeText` helper.
+
 ### Tokens / keys
 
 In production the verifier fetches the authorization server's keys from a JWKS
@@ -47,8 +72,11 @@ dub build -c client
 ./auth-server --port 8742
 
 # terminal 2 — run the client e2e against it
-./auth-client --port 8742 ; echo "exit=$?"
+./auth-client --url http://127.0.0.1:8742/mcp ; echo "exit=$?"
 ```
+
+(`--port` / `--host` on the client are a convenience to build the default URL
+`http://127.0.0.1:8742/mcp`; prefer `--url` to point at any endpoint.)
 
 The client prints `OK: …` and exits `0` when every assertion passes; on any
 mismatch it prints what differed and exits non-zero. This is exactly how CI runs
@@ -63,10 +91,12 @@ code.
    match what the server configured.
 3. **Full-scope token** (`mcp:read mcp:write`) → `initialize` succeeds,
    `tools/list` contains `whoami` + `secret_note`, `whoami` reports the token
-   subject (`user-42`) in both text and `structuredContent`, and `secret_note`
+   subject (`user-42`) and granted scopes in its **typed `structuredContent`**
+   (inferred from the server's `WhoamiResult` struct), and `secret_note`
    returns the privileged payload.
-4. **Read-only token** (`mcp:read`) → `whoami` still works, but `secret_note`
-   returns an `isError` tool result naming the missing `mcp:write` scope.
+4. **Read-only token** (`mcp:read`) → `whoami` still works (subject `reader`),
+   but `secret_note` returns an `isError` tool result naming the missing
+   `mcp:write` scope.
 5. **Wrong audience** (RFC 8707) → a token issued for another resource is
    rejected.
 6. **Missing required scope** → a token without `mcp:read` gets HTTP `403`
