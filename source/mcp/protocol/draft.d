@@ -5,6 +5,8 @@ import vibe.data.json : Json;
 
 import mcp.protocol.capabilities;
 import mcp.protocol.versions : ProtocolVersion;
+import mcp.protocol.sampling : CreateMessageRequest;
+import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
 
 @safe:
 
@@ -669,11 +671,72 @@ string[string] paramHeaderMap(Json inputSchema) @safe
 /// One unit of input the server needs from the client to continue (replacing a
 /// server-initiated `sampling/createMessage`, `elicitation/create`, or
 /// `roots/list` request).
+/// The kind of server->client request an MRTR `InputRequest` stands in for.
+/// Maps to the wire `type` discriminator (`"sampling"`/`"elicitation"`/`"roots"`).
+enum InputKind
+{
+	sampling,
+	elicitation,
+	roots,
+}
+
 struct InputRequest
 {
 	string id; /// correlation id chosen by the server (the `InputRequests` map key)
 	string type; /// "sampling" | "elicitation" | "roots"
 	Json params = Json.emptyObject; /// the would-be request params
+
+	/// The typed `InputKind` for this request's wire `type`, or null when the
+	/// `type` is not one of the three recognised kinds.
+	Nullable!InputKind kind() const @safe
+	{
+		switch (type)
+		{
+		case "sampling":
+			return Nullable!InputKind(InputKind.sampling);
+		case "elicitation":
+			return Nullable!InputKind(InputKind.elicitation);
+		case "roots":
+			return Nullable!InputKind(InputKind.roots);
+		default:
+			return Nullable!InputKind.init;
+		}
+	}
+
+	/// Build a `sampling` input-request from a typed `CreateMessageRequest` — no
+	/// hand-built params `Json`.
+	static InputRequest sampling(string id, CreateMessageRequest req) @safe
+	{
+		return InputRequest(id, "sampling", req.toJson());
+	}
+
+	/// Build a form-`elicitation` input-request from a message and an optional
+	/// JSON Schema (`requestedSchema`).
+	static InputRequest elicitation(string id, string message, Json requestedSchema = Json
+			.undefined) @safe
+	{
+		Json p = Json.emptyObject;
+		p["message"] = message;
+		if (requestedSchema.type == Json.Type.object)
+			p["requestedSchema"] = requestedSchema;
+		return InputRequest(id, "elicitation", p);
+	}
+
+	/// Build a form-`elicitation` input-request whose `requestedSchema` is
+	/// derived from the flat struct `T` via `jsonSchemaOf!T` (same compile-time
+	/// flat-struct restriction as `RequestContext.elicit!T`).
+	static InputRequest elicitation(T)(string id, string message) @safe
+	{
+		static assert(isFlatElicitationStruct!T, "elicitation!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
+				.stringof ~ " has a nested or non-scalar field");
+		return elicitation(id, message, jsonSchemaOf!T);
+	}
+
+	/// Build a `roots` input-request (no params).
+	static InputRequest roots(string id) @safe
+	{
+		return InputRequest(id, "roots", Json.emptyObject);
+	}
 
 	/// The spec wire `method` for this request's `type`: an `InputRequests` value
 	/// is a request object whose `method` is the full JSON-RPC method name
@@ -944,6 +1007,76 @@ unittest  // SEP-2322: sampling/roots methods map to their full JSON-RPC names
 	auto j = r.toJson();
 	assert(j["inputRequests"]["s1"]["method"].get!string == "sampling/createMessage");
 	assert(j["inputRequests"]["r1"]["method"].get!string == "roots/list");
+}
+
+unittest  // InputRequest.sampling builder sets the sampling type + request params
+{
+	import mcp.protocol.sampling : CreateMessageRequest, SamplingMessage;
+	import mcp.protocol.types : Content;
+
+	CreateMessageRequest req;
+	req.messages = [SamplingMessage("user", Content.makeText("hi"))];
+	req.maxTokens = 32;
+	auto ir = InputRequest.sampling("s1", req);
+	assert(ir.id == "s1");
+	assert(ir.type == "sampling");
+	assert(ir.params == req.toJson());
+	assert(ir.kind.get == InputKind.sampling);
+}
+
+unittest  // InputRequest.elicitation builder sets message + requestedSchema
+{
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	auto ir = InputRequest.elicitation("e1", "Your name?", schema);
+	assert(ir.type == "elicitation");
+	assert(ir.params["message"].get!string == "Your name?");
+	assert(ir.params["requestedSchema"] == schema);
+	assert(ir.kind.get == InputKind.elicitation);
+}
+
+unittest  // InputRequest.elicitation!T derives requestedSchema from a flat struct
+{
+	import mcp.api.schema : jsonSchemaOf;
+
+	static struct Details
+	{
+		int travelers;
+		bool insurance;
+	}
+
+	auto ir = InputRequest.elicitation!Details("e2", "Details?");
+	assert(ir.type == "elicitation");
+	assert(ir.params["message"].get!string == "Details?");
+	assert(ir.params["requestedSchema"] == jsonSchemaOf!Details);
+}
+
+unittest  // InputRequest.elicitation!T rejects a non-flat struct at compile time
+{
+	static struct Inner
+	{
+		int x;
+	}
+
+	static struct Nested
+	{
+		Inner inner;
+	}
+
+	static assert(!__traits(compiles, InputRequest.elicitation!Nested("e", "m")));
+}
+
+unittest  // InputRequest.roots builder sets the roots type with empty params
+{
+	auto ir = InputRequest.roots("r1");
+	assert(ir.type == "roots");
+	assert(ir.kind.get == InputKind.roots);
+}
+
+unittest  // InputRequest.kind returns null for an unrecognised type
+{
+	auto ir = InputRequest("x", "bogus", Json.emptyObject);
+	assert(ir.kind.isNull);
 }
 
 unittest  // DiscoverResult.toJson carries the required resultType discriminator
