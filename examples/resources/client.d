@@ -27,8 +27,9 @@
  *   7. after subscriptions/listen, calling `set_note` delivers a
  *      notifications/resources/updated for the subscribed URI AND a
  *      notifications/resources/list_changed for the newly-created note resource;
- *      the new note then reads back its pushed body. The tool's typed
- *      `structuredContent` (uri + created) is asserted too.
+ *      the new note then reads back its pushed body. The tool is invoked with a
+ *      typed args struct and its typed `structuredContent` is decoded with
+ *      `structuredContentAs!SetNoteResult` (uri + created) before asserting.
  *
  * On success it prints a single "OK: ..." line and exits 0; on ANY mismatch it
  * prints what differed and exits non-zero, so CI can run it as a regression test.
@@ -60,6 +61,24 @@ import mcp.protocol.errors : ErrorCode, McpException;
 // Expected contract — must match server.d.
 enum string expectedConfig = `{"name":"resources-example","featureFlags":["resources","subscribe"]}`;
 enum long expectedTtlMs = 60_000;
+
+/// Typed arguments for the `set_note` tool. Passing this struct to the typed
+/// `callTool(name, T args)` overload lets the SDK serialize the wire arguments,
+/// so the client no longer hand-builds a `Json` object for a fixed-shape call.
+struct SetNoteArgs
+{
+	string id;
+	string body;
+}
+
+/// Mirrors the server's typed `SetNoteResult`. Decoding the tool's
+/// `structuredContent` with `structuredContentAs!SetNoteResult` yields these
+/// fields directly, so the client asserts on typed values instead of raw Json.
+struct SetNoteResult
+{
+	string uri;
+	bool created;
+}
 
 private int failures;
 
@@ -262,14 +281,15 @@ int run(string httpUrl) @safe
 
 	// Mutate the subscribed note via the tool; the server pushes
 	// resources/updated (subscribed) + resources/list_changed (new resource).
-	Json toolArgs = Json.emptyObject;
-	toolArgs["id"] = "e2e";
-	toolArgs["body"] = "pushed body";
-	auto callRes = client.callTool("set_note", toolArgs);
+	// The args have a fixed shape, so pass a typed struct to the typed callTool
+	// overload rather than hand-building a Json object.
+	auto callRes = client.callTool("set_note", SetNoteArgs("e2e", "pushed body"));
 	check(!callRes.isError, "set_note should not be an error");
-	check(callRes.structuredContent["uri"].get!string == targetUri,
-			"set_note structuredContent.uri mismatch");
-	check(callRes.structuredContent["created"].get!bool == true,
+	// Decode the tool's typed structuredContent in one step instead of reading
+	// raw Json fields, then assert on the typed values.
+	auto setResult = callRes.structuredContentAs!SetNoteResult;
+	check(setResult.uri == targetUri, "set_note structuredContent.uri mismatch");
+	check(setResult.created == true,
 			"set_note should report created=true for a new note");
 
 	// Wait for the notifications. Over stdio they interleave on the single
