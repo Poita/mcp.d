@@ -238,6 +238,12 @@ final class McpClient : ClientProtocol
 	/// `mcp.transport.stdio.serveStdio`). `readLine` returns the next server line
 	/// (without its terminator) or `null` at end-of-input; `writeLine` emits one
 	/// message line (the sink appends the terminator).
+	///
+	/// The stdio transport runs a background reader thread + demux task so multiple
+	/// requests can be in flight at once over the single channel (correlated by id),
+	/// so the resulting client MUST be driven from inside a running vibe event loop
+	/// (`runTask`/`runEventLoop`) — `readLine` is called on the reader thread and
+	/// the responses are awaited on tasks.
 	static McpClient stdio(string delegate() @safe readLine, void delegate(string) @safe writeLine,
 			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
 	{
@@ -249,6 +255,10 @@ final class McpClient : ClientProtocol
 	/// (`command[0]` is the executable). The returned client is NOT yet
 	/// initialized — call `initialize()` (or `ping()` for a stateless probe).
 	/// `close()` runs the MCP stdio shutdown sequence on the subprocess.
+	///
+	/// As with `McpClient.stdio`, the stdio transport demultiplexes responses on a
+	/// background task, so drive the returned client from inside a running vibe event
+	/// loop (`runTask`/`runEventLoop`).
 	static McpClient spawn(string[] command,
 			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
 	{
@@ -1460,12 +1470,12 @@ final class McpClient : ClientProtocol
 	/// callback of an in-flight request, and the server will not send that
 	/// request's final response until it receives this reply, so *how* we send it
 	/// depends on the transport (`transport.repliesSynchronously`):
-	///   - synchronous transports (stdio): the inbound-read loop is not the
-	///     coroutine holding the awaited response and the reply is just another
-	///     line written to the child's stdin, so we send it inline. This works with
-	///     no event loop, which is what makes the documented synchronous
-	///     `McpClient.spawn` model able to answer ping / sampling / elicitation /
-	///     roots requests.
+	///   - synchronous transports (stdio): the dispatch runs on the transport's
+	///     demux task — not the task parked in `await` — and the reply is just
+	///     another line written to the child's stdin, so we send it inline (the
+	///     write is serialized by the transport's write mutex). This is what lets a
+	///     stdio client answer server-initiated ping / sampling / elicitation /
+	///     roots requests while one of its own requests is in flight.
 	///   - other transports (HTTP): a nested synchronous send here could deadlock
 	///     (the reply travels on a different request), so we defer it to a separate
 	///     task (the HTTP transport already runs under an event loop).

@@ -55,16 +55,15 @@ interface ClientTransport
 	void sendOneway(Json message) @safe;
 
 	/// Whether a reply to a server->client request may be written *inline* from
-	/// the inbound-read callback (synchronously) rather than deferred to a
-	/// background task. True for a single-channel transport whose inbound-read
-	/// loop is not the coroutine holding the awaited response (stdio: the reply is
-	/// just another line written to the child's stdin, which never blocks the read
-	/// of the next line). False for a transport where a nested synchronous send
-	/// inside the awaiting read loop could deadlock (HTTP: the reply travels on a
-	/// different request and must be deferred). When false, `McpClient` defers the
-	/// reply with `runTask`, which requires a running event loop; when true the
-	/// reply is sent without any event loop, so the documented synchronous stdio
-	/// (`spawn`) model can answer ping / sampling / elicitation / roots requests.
+	/// the inbound dispatch (synchronously) rather than deferred to a separate
+	/// background task. True for a single-channel transport whose inbound dispatch
+	/// is not the coroutine holding the awaited response (stdio: the dispatch runs
+	/// on the demux task and the reply is just another line written to the child's
+	/// stdin, which never blocks the read of the next line). False for a transport
+	/// where a nested synchronous send inside the awaiting read loop could deadlock
+	/// (HTTP: the reply travels on a different request and must be deferred). When
+	/// false, `McpClient` defers the reply with `runTask`. Either way a running
+	/// event loop is in play; this only governs whether an extra task is spawned.
 	bool repliesSynchronously() @safe;
 
 	/// Open the standalone server->client stream, if the transport has one

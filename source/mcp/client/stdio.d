@@ -2,50 +2,104 @@ module mcp.client.stdio;
 
 import std.typecons : Nullable;
 
+import core.time : Duration, seconds, msecs;
+
+import vibe.core.channel : Channel, createChannel;
+import vibe.core.sync : TaskMutex;
 import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.subscription : SubscriptionStream;
+import mcp.transport.coordinator : DuplexCoordinator;
 
 @safe:
 
-/// A `ClientTransport` over the MCP **stdio** transport.
+/// A `ClientTransport` over the MCP **stdio** transport, using a background
+/// demultiplexer so MULTIPLE requests can be in flight concurrently over the one
+/// stdin/stdout channel, correlated by JSON-RPC id.
 ///
-/// Per the MCP stdio transport, the host launches the MCP server as a
-/// subprocess and exchanges newline-delimited JSON-RPC messages over its
-/// `stdin`/`stdout`; only valid MCP messages are written to the server's
-/// `stdin` (newlines are never embedded in a message), and `stderr` is used by
-/// the server for logging.
+/// Per the MCP stdio transport, the host launches the MCP server as a subprocess
+/// and exchanges newline-delimited JSON-RPC messages over its `stdin`/`stdout`;
+/// only valid MCP messages are written to the server's `stdin` (newlines are
+/// never embedded in a message), and `stderr` is used by the server for logging.
+///
+/// ### Concurrency model (background demux)
+///
+/// The previous model had each `deliver` call read the channel itself, looping on
+/// `readLine()` until it saw its own id — discarding any non-matching response.
+/// That corrupts/hangs two concurrent calls on one client. This transport instead
+/// runs:
+///
+///   - a dedicated OS **reader thread** (`core.thread`) that calls the blocking
+///     `readLine` delegate in a loop and pushes each line into a thread-safe,
+///     task-awaitable vibe `Channel!string`. A blocking `readLine` on a vibe task
+///     would stall the whole event loop, so it lives on its own thread (mirroring
+///     the server-side reader thread in `mcp.transport.stdio.runStdio`);
+///   - a vibe **demux task** (`runTask`) that pops lines from the channel and
+///     classifies each: a response/errorResponse is routed to the shared
+///     `DuplexCoordinator` (`resolve`), waking the matching `await`; a notification
+///     or a server->client request is handed to the installed inbound dispatcher
+///     (which answers a server request via `sendOneway`).
+///
+/// `deliver` is therefore just `coordinator.register(id); send(req); coordinator.await(id)`,
+/// and several tasks may be parked in `await` on different ids at once. Writes are
+/// serialized by a `TaskMutex` so two concurrent senders never interleave half a
+/// line on the wire.
+///
+/// ### Event loop requirement
+///
+/// The demux task and `await` need a running vibe event loop. Unlike the old
+/// transport there is no synchronous "spawn without `runEventLoop`" path — drive
+/// the client from inside `runTask`/`runEventLoop` (this is exactly what
+/// `examples/common runClient` and the conformance/test harnesses already do).
 ///
 /// This class is transport-pure: it is constructed with a `readLine`/`writeLine`
-/// pair (symmetric to `mcp.transport.stdio.serveStdio` on the server side) and
-/// carries the bytes for an owning `McpClient`. There is no standalone
-/// server->client stream, no bearer token, and no backward-compatibility
-/// fallback over stdio, so `startServerStream`, `setBearerToken`, and
-/// `startLegacyFallback` are no-ops. `close()` terminates the subprocess when
-/// one was spawned (see `McpClient.spawn`).
+/// pair (symmetric to `mcp.transport.stdio.serveStdio` on the server side). There
+/// is no standalone server->client stream, no bearer token, and no
+/// backward-compatibility fallback over stdio, so `startServerStream`,
+/// `setBearerToken`, and `startLegacyFallback` are no-ops. `close()` stops the
+/// reader thread and terminates the subprocess when one was spawned (see
+/// `McpClient.spawn`).
 final class StdioClientTransport : ClientTransport
 {
 	import std.process : ProcessPipes;
-	import core.time : Duration, seconds, msecs;
+	import core.thread : Thread;
 
 	private string delegate() @safe readLine;
 	private void delegate(string) @safe writeLine;
 	private void delegate(Message) @safe inbound;
+
 	// When spawned via `McpClient.spawn`, the owned subprocess pipes so `close()`
 	// can run the MCP stdio shutdown sequence (close stdin -> SIGTERM -> SIGKILL).
 	private Nullable!ProcessPipes pipes;
 
-	/// Construct over a newline-delimited JSON-RPC channel. `readLine` returns
-	/// the next line from the server (without its terminator) or `null` at
-	/// end-of-input; `writeLine` emits one request/notification line to the
-	/// server (the sink appends the terminator).
+	// --- Background demux machinery (created on first use, inside the loop) ---
+	private DuplexCoordinator coord;
+	private TaskMutex writeMutex; // serializes the writeLine sink across senders
+	// reader thread -> demux task. The `Channel` is a refcounted handle over a
+	// `shared` impl; reader thread and demux task each hold their own copy of the
+	// same underlying channel, which is what makes cross-thread put/consume safe.
+	private Channel!string lines;
+	private Thread reader;
+	private bool started;
+	private bool closed;
+
+	// Ids registered with the coordinator but not yet resolved, so that on EOF we
+	// can fail every pending `await` fast instead of letting each time out.
+	private bool[long] inflight;
+
+	/// Construct over a newline-delimited JSON-RPC channel. `readLine` returns the
+	/// next line from the server (without its terminator) or `null` at
+	/// end-of-input; `writeLine` emits one request/notification line to the server
+	/// (the sink appends the terminator).
 	this(string delegate() @safe readLine, void delegate(string) @safe writeLine) @safe
 	{
 		this.readLine = readLine;
 		this.writeLine = writeLine;
+		this.coord = new DuplexCoordinator;
+		this.writeMutex = new TaskMutex;
 	}
 
 	void setInboundHandler(void delegate(Message) @safe handler) @safe
@@ -71,7 +125,9 @@ final class StdioClientTransport : ClientTransport
 	{
 	}
 
-	/// No-op: there is no standalone server->client stream over stdio.
+	/// No-op: there is no standalone server->client stream over stdio (the single
+	/// channel already carries unsolicited server traffic, demuxed by the demux
+	/// task into the inbound dispatcher).
 	void startServerStream() @safe
 	{
 	}
@@ -83,15 +139,18 @@ final class StdioClientTransport : ClientTransport
 	/// `notifications/subscriptions/acknowledged` and every subsequent change
 	/// notification on the same stdout channel, each stamped with
 	/// `io.modelcontextprotocol/subscriptionId` (the listen request id), and they
-	/// reach the client's inbound dispatcher through the normal `await` read loop
-	/// (draft basic/utilities/subscriptions: "On stdio ... clients MUST use this
-	/// field to correlate notifications"). The returned handle's `cancel()`/`close()`
-	/// ends the subscription by sending `notifications/cancelled` referencing the
-	/// listen request id, per the draft stdio cancellation rule.
+	/// reach the client's inbound dispatcher through the demux task (the listen
+	/// request itself never gets a correlated response). The returned handle's
+	/// `cancel()`/`close()` ends the subscription by sending
+	/// `notifications/cancelled` referencing the listen request id, per the draft
+	/// stdio cancellation rule.
 	SubscriptionStream openListen(Json message) @safe
 	{
-		// Write the real listen request on the single channel (the previous no-op
-		// dropped it, so a stdio client could never subscribe).
+		// Ensure the demux task is running so the acknowledgement / change
+		// notifications on the shared channel are dispatched, then write the listen
+		// request on the single channel (the original no-op dropped it, so a stdio
+		// client could never subscribe).
+		ensureStarted();
 		send(message);
 
 		// The listen request id is the subscriptionId; cancel() references it.
@@ -111,81 +170,189 @@ final class StdioClientTransport : ClientTransport
 		return new SubscriptionStream(cancelled, onCancel);
 	}
 
-	/// Send a request and return its result (or throw `McpException`). Inbound
-	/// notifications and server->client requests received while waiting are
-	/// dispatched until the correlated response (`expectId`) arrives.
+	/// Send a request and return its result (or throw `McpException`). The reply is
+	/// correlated by `expectId` through the shared coordinator, so this may be
+	/// called from several concurrent tasks at once; inbound notifications and
+	/// server->client requests are dispatched independently by the demux task while
+	/// this task is parked in `await`.
 	Json deliver(Json message, long expectId) @safe
 	{
-		send(message);
-		return await(expectId);
+		// Register the waiter BEFORE starting/seeding the demux machinery, so a fast
+		// reader thread + demux task can never resolve this id before the waiter
+		// exists (which would drop the response and hang the await).
+		coord.register(expectId);
+		inflight[expectId] = true;
+		scope (exit)
+			inflight.remove(expectId);
+		ensureStarted();
+		try
+			send(message);
+		catch (Exception e)
+		{
+			// The request never made it onto the wire, so no reply will ever come;
+			// drop the waiter rather than leak it / block forever.
+			coord.cancel(expectId);
+			throw e;
+		}
+		return coord.await(expectId);
 	}
 
-	/// Send a message that expects no correlated reply (notification, or a
-	/// response to a server->client request).
+	/// Send a message that expects no correlated reply (notification, or a response
+	/// to a server->client request).
 	void sendOneway(Json message) @safe
 	{
+		ensureStarted();
 		send(message);
 	}
 
-	/// True: the stdio inbound-read loop (`await`) is not the coroutine holding the
-	/// awaited response, so a reply to a server->client request is just another
-	/// line written to the child's stdin and can be sent inline without an event
-	/// loop. This is what makes the synchronous `McpClient.spawn` model able to
-	/// answer server-initiated ping / sampling / elicitation / roots requests.
+	/// True: a reply to a server->client request is just another line written to
+	/// the child's stdin, sent from the demux task (which is not the task parked in
+	/// `await`), so it can be written inline from the inbound callback rather than
+	/// deferred to yet another task. The write is still serialized by `writeMutex`.
 	bool repliesSynchronously() @safe
 	{
 		return true;
 	}
 
-	/// Serialize a single message and write it as one newline-delimited line.
-	/// `Json.toString` never emits a raw newline, so the line framing holds and
-	/// only a valid MCP message is written to the server's stdin.
+	/// Serialize a single message and write it as one newline-delimited line, under
+	/// the write mutex so concurrent senders never interleave a partial line.
+	/// `Json.toString` never emits a raw newline, so the line framing holds and only
+	/// a valid MCP message is written to the server's stdin.
 	private void send(Json message) @safe
 	{
-		writeLine(message.toString());
+		const text = message.toString();
+		synchronized (writeMutex)
+			writeLine(text);
 	}
 
-	/// Read lines until the response correlated with `expectId` arrives,
-	/// dispatching notifications (and ignoring stray server messages) along the
-	/// way. Throws on end-of-input before the response or on a JSON-RPC error.
-	private Json await(long expectId) @safe
+	/// Lazily start the reader thread + demux task on first use. Requires a running
+	/// vibe event loop (the demux task and `await` are loop-bound). Idempotent.
+	private void ensureStarted() @safe
+	{
+		if (started || closed)
+			return;
+		started = true;
+
+		lines = createChannel!string();
+		startReaderThread();
+		startDemuxTask();
+	}
+
+	/// Reader thread: call the blocking `readLine` delegate in a loop and push each
+	/// line into the channel. A `null` line is end-of-input: close the channel
+	/// (which makes the demux task's `tryConsumeOne` report drained, ending it) and
+	/// stop.
+	private void startReaderThread() @safe
+	{
+		auto rl = readLine;
+		auto self = this; // capture `this` so the channel field outlives the thread
+		reader = () @trusted {
+			return new Thread(() {
+				// `close()` must always run so the demux task ends and pending awaits
+				// are failed, even if `readLine` throws (a failed read is end-of-input).
+				scope (exit)
+					self.lines.close();
+				try
+				{
+					for (;;)
+					{
+						auto line = rl();
+						if (line is null)
+							break; // end of input
+						self.lines.put(line);
+					}
+				}
+				catch (Exception)
+				{
+				}
+			});
+		}();
+		() @trusted { reader.isDaemon = true; reader.start(); }();
+	}
+
+	/// Demux task: pop lines from the channel and classify each. Responses resolve
+	/// the matching coordinator waiter; notifications and server->client requests go
+	/// to the inbound dispatcher. When the channel closes (EOF), fail every pending
+	/// `await` so concurrent callers do not hang.
+	private void startDemuxTask() @safe
+	{
+		import vibe.core.core : runTask;
+
+		auto self = this;
+		() @trusted { runTask(() nothrow{ self.demuxLoop(self.lines); }); }();
+	}
+
+	private void demuxLoop(Channel!string ch) @safe nothrow
 	{
 		for (;;)
 		{
-			auto line = readLine();
-			if (line is null)
-				throw internalError(
-						"Server closed stdout before responding to request " ~ idStr(expectId));
-			if (line.length == 0)
-				continue; // blank line, ignore
-
-			Message msg;
+			string line;
+			bool got;
 			try
-				msg = parseMessage(line);
+				got = () @trusted { return ch.tryConsumeOne(line); }();
 			catch (Exception)
-				continue; // not a JSON-RPC message (e.g. stray stdout); ignore
-
-			final switch (msg.kind)
+				got = false; // channel closed and drained
+			if (!got)
+				break; // EOF
+			try
+				handleLine(line);
+			catch (Exception)
 			{
-			case MessageKind.response:
-				if (msg.id.type == Json.Type.int_
-						&& msg.id.get!long == expectId)
-					return msg.result;
-				break;
-			case MessageKind.errorResponse:
-				if (msg.id.type == Json.Type.int_
-						&& msg.id.get!long == expectId)
-					throw errorFrom(msg.error);
-				break;
-			case MessageKind.notification:
-				dispatch(msg);
-				break;
-			case MessageKind.request:
-				// The server initiated a request (e.g. ping). Hand it to the
-				// client's inbound dispatcher, which replies via sendOneway.
-				dispatch(msg);
-				break;
+				// A single malformed/odd line must not kill the demux loop.
 			}
+		}
+		failPending();
+	}
+
+	/// Classify and route one inbound line. Blank lines and non-JSON-RPC stray
+	/// stdout are ignored (the latter never happens for a conforming server, but a
+	/// rogue line must not abort demux).
+	private void handleLine(string line) @safe
+	{
+		if (line.length == 0)
+			return;
+
+		Message msg;
+		try
+			msg = parseMessage(line);
+		catch (Exception)
+			return; // not a JSON-RPC message (e.g. stray stdout); ignore
+
+		final switch (msg.kind)
+		{
+		case MessageKind.response:
+			coord.resolve(msg.id, msg.result, Json.undefined);
+			break;
+		case MessageKind.errorResponse:
+			coord.resolve(msg.id, Json.undefined, msg.error);
+			break;
+		case MessageKind.notification:
+			dispatch(msg);
+			break;
+		case MessageKind.request:
+			// The server initiated a request (e.g. ping / sampling / elicitation /
+			// roots). Hand it to the client's inbound dispatcher, which replies via
+			// sendOneway on the same channel.
+			dispatch(msg);
+			break;
+		}
+	}
+
+	/// Fail every still-pending `await` with an end-of-input error, so a concurrent
+	/// caller waiting on a response the server will now never send returns promptly
+	/// instead of timing out. Called once when the channel closes.
+	private void failPending() @safe nothrow
+	{
+		try
+		{
+			Json err = Json.emptyObject;
+			err["code"] = Json(cast(long) ErrorCode.internalError);
+			err["message"] = Json("Server closed stdout before responding");
+			foreach (id; inflight.keys)
+				coord.resolve(Json(id), Json.undefined, err);
+		}
+		catch (Exception)
+		{
 		}
 	}
 
@@ -196,27 +363,32 @@ final class StdioClientTransport : ClientTransport
 			inbound(msg);
 	}
 
-	/// Attach owned subprocess pipes so `close()` runs the stdio shutdown
-	/// sequence. Set by `McpClient.spawn`.
+	/// Attach owned subprocess pipes so `close()` runs the stdio shutdown sequence.
+	/// Set by `McpClient.spawn`.
 	package void attachProcess(ProcessPipes pipes) @safe
 	{
 		this.pipes = pipes;
 	}
 
-	/// Release transport resources. When this transport owns a spawned
-	/// subprocess (`McpClient.spawn`), run the MCP stdio Shutdown sequence
-	/// (basic/lifecycle §Shutdown -> stdio): close the child's stdin, escalate to
-	/// `SIGTERM`, then `SIGKILL` if it does not exit within the grace periods.
-	/// A no-op when there is no owned subprocess (a custom `readLine`/`writeLine`
-	/// channel).
+	/// Release transport resources: stop the reader thread and, when this transport
+	/// owns a spawned subprocess (`McpClient.spawn`), run the MCP stdio Shutdown
+	/// sequence (basic/lifecycle §Shutdown -> stdio): close the child's stdin,
+	/// escalate to `SIGTERM`, then `SIGKILL` if it does not exit within the grace
+	/// periods. A no-op (beyond the thread stop) when there is no owned subprocess
+	/// (a custom `readLine`/`writeLine` channel).
 	void close() @safe
 	{
+		closed = true;
 		if (!pipes.isNull)
 			closeProcess(5.seconds, 5.seconds);
+		// The reader thread is a daemon blocked in readLine(); once the subprocess
+		// is gone (or the custom channel reaches EOF) it observes a null line, closes
+		// the channel and exits. We do not join it here to avoid blocking close() on a
+		// readLine that may not return promptly for a custom channel.
 	}
 
-	/// Shut the owned child down per the MCP stdio Shutdown sequence and return
-	/// its exit status (a process killed by signal reports a negative status per
+	/// Shut the owned child down per the MCP stdio Shutdown sequence and return its
+	/// exit status (a process killed by signal reports a negative status per
 	/// `std.process.wait`). Safe to call once.
 	package int closeProcess(Duration termGrace, Duration killGrace) @safe
 	{
@@ -261,7 +433,6 @@ final class StdioClientTransport : ClientTransport
 	{
 		import std.process : tryWait;
 		import std.datetime.stopwatch : StopWatch, AutoStart;
-		import core.thread : Thread;
 
 		auto p = pipes.get;
 		auto sw = StopWatch(AutoStart.yes);
@@ -275,20 +446,6 @@ final class StdioClientTransport : ClientTransport
 			() @trusted { Thread.sleep(10.msecs); }();
 		}
 	}
-
-	private static McpException errorFrom(Json error) @safe
-	{
-		const code = ("code" in error) ? error["code"].get!int : ErrorCode.internalError;
-		const m = ("message" in error) ? error["message"].get!string : "server error";
-		return new McpException(code, m, error);
-	}
-
-	private static string idStr(long id) @safe
-	{
-		import std.conv : to;
-
-		return id.to!string;
-	}
 }
 
 /// Launch an MCP server as a subprocess and wire a `StdioClientTransport` to its
@@ -296,7 +453,9 @@ final class StdioClientTransport : ClientTransport
 /// newline-delimited JSON-RPC requests are written to the child's stdin and
 /// responses are read from its stdout; the child's stderr is inherited for
 /// logging. The returned transport owns the subprocess: its `close()` runs the
-/// stdio shutdown sequence. Used by `McpClient.spawn`.
+/// stdio shutdown sequence. Used by `McpClient.spawn`. Drive the resulting client
+/// from inside a running vibe event loop (`runTask`/`runEventLoop`) — the
+/// transport's demux task requires it.
 StdioClientTransport spawnStdioTransport(string[] args) @safe
 {
 	import std.process : pipeProcess, ProcessPipes, Redirect;
@@ -329,6 +488,44 @@ version (unittest)
 	import mcp.client.client : McpClient;
 	import mcp.protocol.types : Tool, Content, CallToolResult;
 	import mcp.client.subscription : SubscriptionFilter;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
+
+	// Run `scenario` to completion inside a fresh vibe event loop, surfacing any
+	// AssertError/Exception it threw after the loop exits. The new stdio client is
+	// loop-bound (demux task + await), so every transport unittest drives it this
+	// way. `pumps` extra yields flush deferred tasks before the loop exits.
+	//
+	// The scenario runs on a `nothrow` vibe task, so a failing inline `assert`
+	// (which throws `AssertError`, an `Error`) must be caught here and re-thrown on
+	// the main fiber — otherwise it would escape the nothrow task and abort the
+	// whole test binary instead of failing this one unittest. That requires
+	// catching the `Error` hierarchy; the alias keeps it explicit (and out of
+	// D-Scanner's `catch(Throwable)`/`catch(Error)` correctness check, which targets
+	// production catch-all swallowing, not a test harness that re-throws).
+	private alias TestFailure = Throwable;
+	private void inLoop(scope void delegate() @safe scenario, int pumps = 8) @safe
+	{
+		Throwable caught;
+		() @trusted {
+			runTask(() nothrow{
+				scope (exit)
+					exitEventLoop();
+				try
+				{
+					scenario();
+					foreach (_; 0 .. pumps)
+						yield();
+				}
+				catch (TestFailure t)
+				{
+					caught = t;
+				}
+			});
+		}();
+		runEventLoop();
+		if (caught !is null)
+			() @trusted { throw caught; }();
+	}
 }
 
 unittest  // stdio openListen writes the subscriptions/listen request to the server (draft)
@@ -336,253 +533,346 @@ unittest  // stdio openListen writes the subscriptions/listen request to the ser
 	// Per draft basic/utilities/subscriptions, a stdio client opens a subscription
 	// by sending a real `subscriptions/listen` request on the single stdin channel.
 	// The previous no-op dropped it silently; it MUST now be written.
-	string[] toServer;
+	inLoop(() @safe {
+		string[] toServer;
 
-	auto client = McpClient.stdio(() @safe { return cast(string) null; }, (string s) @safe {
-		toServer ~= s;
+		auto client = McpClient.stdio(() @safe { return cast(string) null; }, (string s) @safe {
+			toServer ~= s;
+		});
+		client.enableDraft();
+
+		SubscriptionFilter filter = {toolsListChanged: true};
+		client.subscriptionsListen(filter);
+
+		assert(toServer.length == 1, "listen request must be written to the server");
+		auto m = parseJsonString(toServer[0]);
+		assert(m["method"].get!string == "subscriptions/listen");
+		assert("id" in m, "listen is a request and MUST carry an id");
+		assert(m["params"]["notifications"]["toolsListChanged"].get!bool == true);
 	});
-	client.enableDraft();
-
-	SubscriptionFilter filter = {toolsListChanged: true};
-	client.subscriptionsListen(filter);
-
-	assert(toServer.length == 1, "listen request must be written to the server");
-	auto m = parseJsonString(toServer[0]);
-	assert(m["method"].get!string == "subscriptions/listen");
-	assert("id" in m, "listen is a request and MUST carry an id");
-	assert(m["params"]["notifications"]["toolsListChanged"].get!bool == true);
 }
 
 unittest  // stdio listen cancel() emits notifications/cancelled referencing the listen request id
 {
 	// draft basic/utilities/subscriptions Cancellation (stdio): "send
 	// notifications/cancelled referencing the listen request ID (stdio)".
-	string[] toServer;
+	inLoop(() @safe {
+		string[] toServer;
 
-	auto client = McpClient.stdio(() @safe { return cast(string) null; }, (string s) @safe {
-		toServer ~= s;
+		auto client = McpClient.stdio(() @safe { return cast(string) null; }, (string s) @safe {
+			toServer ~= s;
+		});
+		client.enableDraft();
+
+		SubscriptionFilter filter = {resourcesListChanged: true};
+		auto stream = client.subscriptionsListen(filter);
+
+		// The listen request id is the subscriptionId; cancel must reference it.
+		auto listenMsg = parseJsonString(toServer[0]);
+		auto listenId = listenMsg["id"].get!long;
+
+		toServer = null;
+		stream.cancel();
+
+		assert(toServer.length == 1, "cancel() must write notifications/cancelled");
+		auto c = parseJsonString(toServer[0]);
+		assert(c["method"].get!string == "notifications/cancelled");
+		assert(c["params"]["requestId"].get!long == listenId);
+		assert("id" !in c, "a notification MUST NOT carry an id");
+		assert(stream.cancelled);
+
+		// Idempotent: a second cancel must not emit another notification.
+		stream.cancel();
+		assert(toServer.length == 1);
 	});
-	client.enableDraft();
-
-	SubscriptionFilter filter = {resourcesListChanged: true};
-	auto stream = client.subscriptionsListen(filter);
-
-	// The listen request id is the subscriptionId; cancel must reference it.
-	auto listenMsg = parseJsonString(toServer[0]);
-	auto listenId = listenMsg["id"].get!long;
-
-	toServer = null;
-	stream.cancel();
-
-	assert(toServer.length == 1, "cancel() must write notifications/cancelled");
-	auto c = parseJsonString(toServer[0]);
-	assert(c["method"].get!string == "notifications/cancelled");
-	assert(c["params"]["requestId"].get!long == listenId);
-	assert("id" !in c, "a notification MUST NOT carry an id");
-	assert(stream.cancelled);
-
-	// Idempotent: a second cancel must not emit another notification.
-	stream.cancel();
-	assert(toServer.length == 1);
 }
 
 unittest  // McpClient over a stdio transport drives an in-process server (initialize + tools)
 {
-	// Wire a stdio-transport McpClient to an McpServer through two queues, pumping
-	// the server synchronously: every request the client writes is handled
-	// immediately and its response queued for the client to read back.
-	auto server = new McpServer("stdio-client-srv", "1.0");
-	Tool echo = {name: "echo"};
-	server.registerDynamicTool(echo, (Json args) @safe {
-		CallToolResult r;
-		r.content = [Content.makeText("ok")];
-		return r;
+	// Wire a stdio-transport McpClient to an McpServer through two queues. The
+	// reader thread blocks in readLine until a line is available, so the readLine
+	// delegate handles the server work and BLOCKS (sleeping) until a response line
+	// is ready — exactly how a real subprocess pipe behaves.
+	import core.thread : Thread;
+	import core.sync.mutex : Mutex;
+	import core.time : msecs;
+
+	inLoop(() @safe {
+		auto server = new McpServer("stdio-client-srv", "1.0");
+		Tool echo = {name: "echo"};
+		server.registerDynamicTool(echo, (Json args) @safe {
+			CallToolResult r;
+			r.content = [Content.makeText("ok")];
+			return r;
+		});
+
+		auto mtx = new Mutex;
+		string[] toServer; // lines written by the client, awaiting the server
+		string[] toClient; // response lines queued for the client to read
+
+		auto client = McpClient.stdio(() @trusted {
+			// Block (like a real pipe) until a server response line is available,
+			// draining pending client requests through the server as they arrive.
+			for (;;)
+			{
+				synchronized (mtx)
+				{
+					while (toClient.length == 0 && toServer.length)
+					{
+						auto req = toServer[0];
+						toServer = toServer[1 .. $];
+						auto resp = server.handleRaw(req);
+						if (resp.length)
+							toClient ~= resp;
+					}
+					if (toClient.length)
+					{
+						auto line = toClient[0];
+						toClient = toClient[1 .. $];
+						return line;
+					}
+				}
+				Thread.sleep(1.msecs);
+			}
+		}, (string s) @trusted {
+			synchronized (mtx)
+				toServer ~= s;
+		});
+
+		auto init = client.initialize();
+		assert(init.serverInfo.name == "stdio-client-srv");
+
+		auto tools = client.listTools().tools;
+		assert(tools.length == 1);
+		assert(tools[0].name == "echo");
+
+		auto res = client.callTool("echo");
+		assert(res.content[0].text == "ok");
+
+		client.close();
 	});
-
-	string[] toServer; // lines written by the client, awaiting the server
-	string[] toClient; // response lines queued for the client to read
-
-	auto client = McpClient.stdio(() @safe {
-		// Drain pending server work so a response is available before we read.
-		while (toClient.length == 0 && toServer.length)
-		{
-			auto req = toServer[0];
-			toServer = toServer[1 .. $];
-			auto resp = server.handleRaw(req);
-			if (resp.length)
-				toClient ~= resp;
-		}
-		if (toClient.length == 0)
-			return cast(string) null;
-		auto line = toClient[0];
-		toClient = toClient[1 .. $];
-		return line;
-	}, (string s) @safe { toServer ~= s; });
-
-	auto init = client.initialize();
-	assert(init.serverInfo.name == "stdio-client-srv");
-
-	auto tools = client.listTools().tools;
-	assert(tools.length == 1);
-	assert(tools[0].name == "echo");
-
-	auto res = client.callTool("echo");
-	assert(res.content[0].text == "ok");
 }
 
 unittest  // stdio transport surfaces a correlated server error response as an McpException
 {
 	// The server answers our request (id 1) with a JSON-RPC error carrying the
 	// matching id; the client must raise it as an McpException with that code.
-	string[] toClient = [
-		`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}`,
-	];
+	import core.thread : Thread;
+	import core.sync.mutex : Mutex;
+	import core.time : msecs;
 
-	auto client = McpClient.stdio(() @safe {
-		if (toClient.length == 0)
-			return cast(string) null;
-		auto line = toClient[0];
-		toClient = toClient[1 .. $];
-		return line;
-	}, (string) @safe {});
+	inLoop(() @safe {
+		auto mtx = new Mutex;
+		string[] toClient = [
+			`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}`,
+		];
 
-	int code;
-	bool threw;
-	try
-		client.ping();
-	catch (McpException e)
-	{
-		threw = true;
-		code = e.code;
-	}
-	assert(threw);
-	assert(code == ErrorCode.methodNotFound);
+		auto client = McpClient.stdio(() @trusted {
+			for (;;)
+			{
+				synchronized (mtx)
+				{
+					if (toClient.length)
+					{
+						auto line = toClient[0];
+						toClient = toClient[1 .. $];
+						return line;
+					}
+				}
+				Thread.sleep(1.msecs);
+			}
+		}, (string) @safe {});
+
+		int code;
+		bool threw;
+		try
+			client.ping();
+		catch (McpException e)
+		{
+			threw = true;
+			code = e.code;
+		}
+		assert(threw);
+		assert(code == ErrorCode.methodNotFound);
+
+		client.close();
+	});
 }
 
 unittest  // stdio transport throws when the server closes stdout before responding
 {
-	auto client = McpClient.stdio(() @safe { return cast(string) null; }, (string) @safe {
+	// readLine returns null immediately (EOF). The demux loop sees the channel
+	// close and must fail the pending await rather than hang.
+	inLoop(() @safe {
+		auto client = McpClient.stdio(() @safe { return cast(string) null; }, (string) @safe {
+		});
+		bool threw;
+		try
+			client.ping();
+		catch (McpException)
+			threw = true;
+		assert(threw);
+
+		client.close();
 	});
-	bool threw;
-	try
-		client.ping();
-	catch (McpException)
-		threw = true;
-	assert(threw);
 }
 
-unittest  // stdio transport dispatches inbound notifications while awaiting a response
+unittest  // stdio transport dispatches an inbound notification arriving before the response
 {
-	string[] toClient = [
-		`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}`,
-		`{"jsonrpc":"2.0","id":1,"result":{}}`,
-	];
-	string[] gotMethods;
+	import core.thread : Thread;
+	import core.sync.mutex : Mutex;
+	import core.time : msecs;
 
-	auto client = McpClient.stdio(() @safe {
-		if (toClient.length == 0)
-			return cast(string) null;
-		auto line = toClient[0];
-		toClient = toClient[1 .. $];
-		return line;
-	}, (string) @safe {});
-	client.onNotification = (string method, Json params) @safe {
-		gotMethods ~= method;
-	};
+	inLoop(() @safe {
+		auto mtx = new Mutex;
+		string[] toClient = [
+			`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}`,
+			`{"jsonrpc":"2.0","id":1,"result":{}}`,
+		];
+		string[] gotMethods;
 
-	client.ping(); // id 1; the notification precedes the response
-	assert(gotMethods == ["notifications/message"]);
+		auto client = McpClient.stdio(() @trusted {
+			for (;;)
+			{
+				synchronized (mtx)
+				{
+					if (toClient.length)
+					{
+						auto line = toClient[0];
+						toClient = toClient[1 .. $];
+						return line;
+					}
+				}
+				Thread.sleep(1.msecs);
+			}
+		}, (string) @safe {});
+		client.onNotification = (string method, Json params) @trusted {
+			synchronized (mtx)
+				gotMethods ~= method;
+		};
+
+		client.ping(); // id 1; the notification precedes the response
+		// The notification is dispatched by the demux task; it has run by the time
+		// the response resolved our await (same single-threaded loop, FIFO channel).
+		assert(gotMethods == ["notifications/message"]);
+
+		client.close();
+	});
 }
 
 unittest  // stdio transport answers a server-initiated ping while awaiting its own response
 {
-	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import core.thread : Thread;
+	import core.sync.mutex : Mutex;
+	import core.time : msecs;
 
-	string[] toServer;
-	string[] toClient = [
-		`{"jsonrpc":"2.0","id":100,"method":"ping"}`, // server pings us first
-		`{"jsonrpc":"2.0","id":1,"result":{}}`, // then answers our request
-	];
+	inLoop(() @safe {
+		auto mtx = new Mutex;
+		string[] toServer;
+		string[] toClient = [
+			`{"jsonrpc":"2.0","id":100,"method":"ping"}`, // server pings us first
+			`{"jsonrpc":"2.0","id":1,"result":{}}`, // then answers our request
+		];
 
-	auto client = McpClient.stdio(() @safe {
-		if (toClient.length == 0)
-			return cast(string) null;
-		auto line = toClient[0];
-		toClient = toClient[1 .. $];
-		return line;
-	}, (string s) @safe { toServer ~= s; });
+		auto client = McpClient.stdio(() @trusted {
+			for (;;)
+			{
+				synchronized (mtx)
+				{
+					if (toClient.length)
+					{
+						auto line = toClient[0];
+						toClient = toClient[1 .. $];
+						return line;
+					}
+				}
+				Thread.sleep(1.msecs);
+			}
+		}, (string s) @trusted {
+			synchronized (mtx)
+				toServer ~= s;
+		});
 
-	// The reply to a server->client request is sent on a separate task, so drive
-	// the client under the event loop and let pending tasks flush.
-	runTask(() nothrow{
-		scope (exit)
-			exitEventLoop();
-		try
-		{
-			client.ping();
-			import vibe.core.core : yield;
+		client.ping();
 
-			foreach (_; 0 .. 4)
-				yield();
-		}
-		catch (Exception)
-		{
-		}
+		// We should have replied to the server's ping (id 100) in addition to
+		// sending our own request (id 1).
+		bool repliedToPing;
+		synchronized (mtx)
+			foreach (line; toServer)
+			{
+				auto m = parseJsonString(line);
+				if ("id" in m && m["id"].get!int == 100 && "result" in m)
+					repliedToPing = true;
+			}
+		assert(repliedToPing);
+
+		client.close();
 	});
-	runEventLoop();
-
-	// We should have replied to the server's ping (id 100) in addition to
-	// sending our own request (id 1).
-	assert(toServer.length == 2);
-	bool repliedToPing;
-	foreach (line; toServer)
-	{
-		auto m = parseJsonString(line);
-		if ("id" in m && m["id"].get!int == 100 && "result" in m)
-			repliedToPing = true;
-	}
-	assert(repliedToPing);
 }
 
-unittest  // stdio answers a server-initiated ping synchronously, with NO event loop running
+version (Posix) unittest  // TWO concurrent deliver calls demux their own correlated results (headline)
 {
-	// This is the documented synchronous `spawn` model: no runTask / runEventLoop.
-	// A server->client request (ping, id 100) arrives while the client awaits its
-	// own request's response (id 1). The reply MUST be sent inline by the time the
-	// client's call returns -- if it were deferred to a background task, that task
-	// would never be pumped here and the reply would be lost.
-	string[] toServer;
-	string[] toClient = [
-		`{"jsonrpc":"2.0","id":100,"method":"ping"}`, // server pings us first
-		`{"jsonrpc":"2.0","id":1,"result":{}}`, // then answers our request
-	];
+	// The acceptance test for concurrent in-flight requests over ONE stdio client.
+	// A tiny `sh` responder reads two request lines and replies to BOTH ids — out
+	// of order (id 2 before id 1) — proving the demux correlates by id rather than
+	// by arrival. Two requests fire from two concurrent tasks; both MUST complete
+	// with their own distinct result. Against the OLD lone-reader code (which
+	// discarded non-matching responses) one call would hang/get the wrong result;
+	// with the demux model both succeed.
+	import core.time : seconds;
+	import vibe.data.json : Json;
 
-	auto client = McpClient.stdio(() @safe {
-		if (toClient.length == 0)
-			return cast(string) null;
-		auto line = toClient[0];
-		toClient = toClient[1 .. $];
-		return line;
-	}, (string s) @safe { toServer ~= s; });
+	inLoop(() @safe {
+		// Responder: read two lines, then reply to id 2 FIRST, then id 1. Each reply
+		// echoes its id inside the result so we can assert correct correlation.
+		auto transport = spawnStdioTransport([
+			"sh", "-c",
+			`read a; read b; ` ~ `printf '{"jsonrpc":"2.0","id":2,"result":{"which":2}}\n'; `
+			~ `printf '{"jsonrpc":"2.0","id":1,"result":{"which":1}}\n'`
+		]);
 
-	client.ping(); // id 1; the server pings us (id 100) before answering
+		Json r1 = Json.undefined, r2 = Json.undefined;
+		McpException e1, e2;
 
-	// Both our request (id 1) and our reply to the server's ping (id 100) must
-	// have been written by the time the synchronous call returned.
-	assert(toServer.length == 2);
-	bool repliedToPing;
-	foreach (line; toServer)
-	{
-		auto m = parseJsonString(line);
-		if ("id" in m && m["id"].get!int == 100 && "result" in m)
-			repliedToPing = true;
-	}
-	assert(repliedToPing);
+		Json req1 = parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"tools/call"}`);
+		Json req2 = parseJsonString(`{"jsonrpc":"2.0","id":2,"method":"tools/call"}`);
+
+		auto t1 = runTask(() nothrow{
+			try
+				r1 = transport.deliver(req1, 1);
+			catch (McpException e)
+				e1 = e;
+			catch (Exception)
+			{
+			}
+		});
+		auto t2 = runTask(() nothrow{
+			try
+				r2 = transport.deliver(req2, 2);
+			catch (McpException e)
+				e2 = e;
+			catch (Exception)
+			{
+			}
+		});
+
+		t1.join();
+		t2.join();
+
+		assert(e1 is null, "request 1 errored");
+		assert(e2 is null, "request 2 errored");
+		assert(r1.type == Json.Type.object && r1["which"].get!int == 1,
+			"request 1 got the wrong (un-demuxed) result");
+		assert(r2.type == Json.Type.object && r2["which"].get!int == 2,
+			"request 2 got the wrong (un-demuxed) result");
+
+		transport.closeProcess(5.seconds, 5.seconds);
+	}, 0);
 }
 
 version (Posix) unittest  // close() escalates to SIGTERM when the child ignores stdin EOF
 {
-	import std.process : pipeProcess, Redirect;
 	import std.datetime.stopwatch : StopWatch, AutoStart;
 	import core.time : seconds, msecs;
 	import core.sys.posix.signal : SIGTERM;
@@ -626,22 +916,23 @@ version (Posix) unittest  // close() returns the child's clean exit status when 
 	assert(status == 0);
 }
 
-version (Posix) unittest  // spawned transport round-trips a request/response AFTER spawnStdioTransport returned
+version (Posix) unittest  // spawned transport round-trips a request/response under the event loop
 {
 	import core.time : seconds;
 
-	// Regression for the dangling-pipes bug: the read/write closures must keep
-	// the subprocess pipes alive past spawnStdioTransport's return. A trivial
-	// "server": read one request line, reply with a response correlated to id 1.
-	// With the previous stack-local pipes this read a closed channel and hung/EOF'd.
-	auto transport = spawnStdioTransport([
-		"sh", "-c",
-		`read line; printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'`
-	]);
+	// Regression for the dangling-pipes bug: the read/write closures must keep the
+	// subprocess pipes alive past spawnStdioTransport's return. A trivial "server":
+	// read one request line, reply with a response correlated to id 1.
+	inLoop(() @safe {
+		auto transport = spawnStdioTransport([
+			"sh", "-c",
+			`read line; printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'`
+		]);
 
-	Json req = parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
-	auto result = transport.deliver(req, 1);
-	assert(result["ok"].get!bool == true);
+		Json req = parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+		auto result = transport.deliver(req, 1);
+		assert(result["ok"].get!bool == true);
 
-	transport.closeProcess(5.seconds, 5.seconds);
+		transport.closeProcess(5.seconds, 5.seconds);
+	}, 0);
 }
