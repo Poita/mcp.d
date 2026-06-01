@@ -91,6 +91,58 @@ struct StreamableHttpOptions
 /// publishes its OAuth 2.0 Protected Resource Metadata document.
 enum ProtectedResourceMetadataPath = "/.well-known/oauth-protected-resource";
 
+/// Validate that an auth-enabled `ResourceServerConfig` can publish a
+/// spec-compliant Protected Resource Metadata document before the transport
+/// starts serving it. basic/authorization §Authorization Server Location (all
+/// of 2025-06-18 / 2025-11-25 / draft) makes RFC 9728 a MUST: "The Protected
+/// Resource Metadata document returned by the MCP server MUST include the
+/// `authorization_servers` field containing at least one authorization server."
+/// An operator who sets `auth.validator` but forgets `auth.authorizationServers`
+/// would otherwise publish `"authorization_servers": []`, a silent MUST
+/// violation. We fail loudly here (at mount time) rather than serve it.
+///
+/// Throws: `Exception` when `cfg.enabled` and `cfg.authorizationServers` is empty.
+void validateAuthConfig(ResourceServerConfig cfg) @safe
+{
+	if (cfg.enabled && cfg.authorizationServers.length == 0)
+		throw new Exception("ResourceServerConfig enables auth but has no authorizationServers; "
+				~ "RFC 9728 / basic/authorization §Authorization Server Location requires the "
+				~ "published Protected Resource Metadata document to list at least one "
+				~ "authorization server. Set auth.authorizationServers (or use an IdP preset "
+				~ "that pins an issuer).");
+}
+
+unittest  // an auth-enabled config with no authorizationServers is rejected at mount
+{
+	import std.exception : assertThrown;
+
+	ResourceServerConfig cfg;
+	cfg.validator = (string t) => TokenInfo.invalid();
+	cfg.resource = "https://mcp.example.com/mcp";
+	// authorizationServers left empty -> spec-violating PRM document.
+	assertThrown!Exception(validateAuthConfig(cfg));
+}
+
+unittest  // an auth-enabled config with at least one authorizationServer passes
+{
+	import std.exception : assertNotThrown;
+
+	ResourceServerConfig cfg;
+	cfg.validator = (string t) => TokenInfo.invalid();
+	cfg.resource = "https://mcp.example.com/mcp";
+	cfg.authorizationServers = ["https://auth.example.com"];
+	assertNotThrown!Exception(validateAuthConfig(cfg));
+}
+
+unittest  // a disabled (no-validator) config is never rejected, even with no AS
+{
+	import std.exception : assertNotThrown;
+
+	ResourceServerConfig cfg;
+	// validator null -> auth off -> no PRM document is published, nothing to validate.
+	assertNotThrown!Exception(validateAuthConfig(cfg));
+}
+
 /// Mount an `McpServer` onto a vibe.d `URLRouter` at the configured path,
 /// implementing the modern Streamable HTTP transport (single endpoint):
 ///   - POST: a JSON-RPC message/batch; returns `application/json` for requests,
@@ -104,6 +156,12 @@ void mountMcp(URLRouter router, McpServer server,
 {
 	auto coord = new StreamCoordinator;
 	auto sessions = opts.enableSessions ? new SessionManager : null;
+
+	// basic/authorization §Authorization Server Location (RFC 9728): refuse to start
+	// serving a Protected Resource Metadata document that would violate the MUST to
+	// list at least one authorization server. Fail loudly rather than publish an empty
+	// authorization_servers array.
+	validateAuthConfig(opts.auth);
 
 	// basic/authorization (RFC 9728 §3): publish the Protected Resource Metadata
 	// document so clients can discover the authorization server(s). Served
