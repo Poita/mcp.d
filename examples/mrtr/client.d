@@ -17,7 +17,7 @@
  * Transport selection (the SAME assertions verify both):
  *   - default (no --http): STDIO. The client SPAWNS the built `mrtr-server`
  *     binary (with no --http) and speaks newline-delimited JSON-RPC over the pipe
- *     via `McpClient.stdio`.
+ *     via `McpClient.spawn`, which owns the subprocess and shuts it down on close().
  *   - `--http <url>`: connect to a running HTTP server via `McpClient.http(url)`.
  *
  * Typed/ergonomic SDK APIs adopted here (the args/handlers/result decode are all
@@ -42,9 +42,7 @@
 module mrtr_client;
 
 import std.getopt : getopt;
-import std.process : ProcessPipes, pipeProcess, Redirect, wait;
 import std.stdio : stderr, writeln;
-import std.string : stripRight;
 
 import vibe.data.json : Json;
 
@@ -77,46 +75,6 @@ struct Booking
 	string date;
 	string agenda;
 	int rounds;
-}
-
-/// Owns the server subprocess and exposes the newline-delimited JSON-RPC channel
-/// expected by `McpClient.stdio`. Holding `ProcessPipes` in a class field keeps
-/// the stdin/stdout `File` handles alive for the lifetime of the client (a stack
-/// value would be destructed when the spawning helper returns).
-final class ServerProcess
-{
-	private ProcessPipes pipes;
-
-	this(string[] command) @trusted
-	{
-		pipes = pipeProcess(command, Redirect.stdin | Redirect.stdout);
-	}
-
-	/// Read one response line (terminator stripped), or null at EOF.
-	string readLine() @trusted
-	{
-		auto f = pipes.stdout;
-		if (f.eof)
-			return null;
-		auto ln = f.readln();
-		if (ln.length == 0 && f.eof)
-			return null;
-		return ln.stripRight("\r\n");
-	}
-
-	/// Write one request line (the channel appends the terminator).
-	void writeLine(string s) @trusted
-	{
-		pipes.stdin.writeln(s);
-		pipes.stdin.flush();
-	}
-
-	/// Close stdin and reap the child.
-	void shutdown() @trusted
-	{
-		pipes.stdin.close();
-		wait(pipes.pid);
-	}
 }
 
 /// Absolute path to the `mrtr-server` binary, resolved next to this executable
@@ -152,6 +110,8 @@ private int runHttp(string url)
 		try
 		{
 			auto client = McpClient.http(url);
+			scope (exit)
+				client.close();
 			rc = runE2E(client);
 		}
 		catch (Throwable e)
@@ -169,16 +129,16 @@ private int runHttp(string url)
 }
 
 /// STDIO transport: spawn the built server binary (no --http) and drive it over
-/// the pipe. No event loop is needed for the stdio client.
+/// the pipe. `McpClient.spawn` owns the subprocess; its `close()` runs the MCP
+/// stdio Shutdown sequence (SIGTERM -> SIGKILL), so a `scope(exit)` guarantees the
+/// child is reaped even if an assertion throws. No event loop is needed here.
 private int runStdio()
 {
-	auto proc = new ServerProcess([serverBinaryPath()]);
-	scope (exit)
-		proc.shutdown();
-
 	try
 	{
-		auto client = McpClient.stdio(&proc.readLine, &proc.writeLine);
+		auto client = McpClient.spawn([serverBinaryPath()]);
+		scope (exit)
+			client.close();
 		return runE2E(client);
 	}
 	catch (Throwable e)
@@ -307,7 +267,6 @@ private int runE2E(McpClient client) @safe
 	check(booking.rounds == 2,
 		"structured rounds mismatch: " ~ itoa(booking.rounds));
 
-	client.close();
 	() @trusted {
 		writeln("OK: MRTR e2e — 2 input requests resolved (schema derived from struct), ",
 			"requestState echoed, mocked elicitation+sampling flowed through, ",
