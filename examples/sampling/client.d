@@ -1,22 +1,30 @@
 /**
- * examples/sampling — client.d (self-verifying e2e test)
+ * examples/sampling — client.d (self-verifying e2e test, dual-transport)
  *
- * Connects to `sampling-server` over Streamable HTTP and exercises MCP
- * **Sampling** from the consumer's eye view. It is NOT just a demo: every
- * observation is asserted against the value the mock model produced, and the
- * process exits NON-ZERO on any mismatch, so CI can run it as an end-to-end
- * regression test.
+ * Exercises MCP **Sampling** from the consumer's eye view over EITHER transport:
+ *
+ *   - STDIO (default): spawns the built `sampling-server` binary (no `--http`)
+ *     and drives it over the bidirectional stdio channel, exactly like
+ *     examples/tools/client.d (ProcessPipes + `McpClient.stdio`).
+ *   - HTTP (`--http <url>`): connects to a running `sampling-server --http`
+ *     instance via `McpClient.http(url)`.
+ *
+ * It is NOT just a demo: every observation is asserted against the value the
+ * mock model produced, and the process exits NON-ZERO on any mismatch, so CI can
+ * run it as an end-to-end regression test over each transport.
  *
  * The client installs an `onSampling` handler — a DETERMINISTIC mock "model".
  * When the server calls `ctx.sample(...)` the SDK routes the
  * `sampling/createMessage` request back to this handler; its reply travels back
  * to the server and surfaces in the tool's structured result. Because the mock
  * is deterministic, the client knows exactly what the server's result must be
- * and asserts it precisely — proving the value flowed server→client→server.
+ * and asserts it precisely — proving the value flowed server→client→server. The
+ * assertions are transport-agnostic, so the SAME run() verifies both transports.
  *
- * Two-step run (see README):
- *   terminal 1:  dub run -c server
- *   terminal 2:  dub run -c client          # exits 0 on OK, non-zero on mismatch
+ * Run (see README):
+ *   STDIO:  dub run -c client                                   # spawns the server
+ *   HTTP:   dub run -c server -- --http --port 9354 &           # in another shell
+ *           dub run -c client -- --http http://127.0.0.1:9354/mcp
  *
  * What it verifies, in order:
  *   - `listTools()` contains `summarize` and `model_name`.
@@ -28,52 +36,112 @@
  */
 module sampling_client;
 
-import std.algorithm : startsWith, canFind, map;
+import std.algorithm : canFind, map;
 import std.array : array;
 import std.conv : to;
+import std.getopt : getopt;
+import std.process : ProcessPipes, pipeProcess, Redirect, wait;
 import std.stdio : stderr, writeln;
+import std.string : stripRight;
 
-import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 import vibe.data.json : Json;
 
 import mcp;
-
-enum string defaultUrl = "http://127.0.0.1:9354/mcp";
 
 /// The fixed identifier our mock "model" reports. The server echoes this back in
 /// its structured result, so the client can assert it round-tripped.
 enum string mockModelId = "mock-summarizer-v1";
 
-int main(string[] args)
-{
-	string url = defaultUrl;
-	foreach (a; args[1 .. $])
-		if (a.startsWith("http://") || a.startsWith("https://"))
-			url = a;
+/// The mock model's deterministic completion. Captured by the server in the
+/// `summarize` structured result.
+enum string fixedSummary = "A terse one-line summary.";
 
-	int rc;
-	runTask(() nothrow{
-		scope (exit)
-			exitEventLoop();
-		try
-			rc = run(url);
-		catch (Throwable t) // AssertError and exceptions both fail the e2e
-		{
-			try
-				stderr.writeln("FAIL: ", t.msg);
-			catch (Exception)
-			{
-			}
-			rc = 1;
-		}
-	});
-	runEventLoop();
-	return rc;
+/// Owns the server subprocess and exposes the newline-delimited JSON-RPC channel
+/// expected by `McpClient.stdio`. Holding `ProcessPipes` in a class field keeps
+/// the stdin/stdout `File` handles alive for the lifetime of the client.
+final class ServerProcess
+{
+	private ProcessPipes pipes;
+
+	this(string[] command) @trusted
+	{
+		pipes = pipeProcess(command, Redirect.stdin | Redirect.stdout);
+	}
+
+	/// Read one response line (terminator stripped), or null at EOF.
+	string readLine() @trusted
+	{
+		auto f = pipes.stdout;
+		if (f.eof)
+			return null;
+		auto ln = f.readln();
+		if (ln.length == 0 && f.eof)
+			return null;
+		return ln.stripRight("\r\n");
+	}
+
+	/// Write one request line (the channel appends the terminator).
+	void writeLine(string s) @trusted
+	{
+		pipes.stdin.writeln(s);
+		pipes.stdin.flush();
+	}
+
+	/// Close stdin and reap the child.
+	void shutdown() @trusted
+	{
+		pipes.stdin.close();
+		wait(pipes.pid);
+	}
 }
 
-private int run(string url) @safe
+int main(string[] args)
 {
-	auto client = McpClient.http(url);
+	string url; // empty => stdio
+	getopt(args, "http", "Connect over Streamable HTTP to this URL instead of spawning over stdio", &url);
+
+	if (url.length)
+	{
+		// HTTP: sampling is a server->client request mid-tool-call, so the client
+		// must run an event loop to dispatch the inbound sampling/createMessage.
+		import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+
+		int rc;
+		runTask(() nothrow{
+			scope (exit)
+				exitEventLoop();
+			try
+				rc = run(McpClient.http(url), null);
+			catch (Throwable t) // AssertError + exceptions both fail the e2e
+			{
+				logFail(t.msg);
+				rc = 1;
+			}
+		});
+		runEventLoop();
+		return rc;
+	}
+
+	// STDIO: spawn the built server binary (no --http) and drive it synchronously.
+	// Server->client sampling replies are written inline on the same channel, so
+	// no event loop is required (same model as examples/tools/client.d).
+	auto proc = new ServerProcess([serverBinaryPath()]);
+	scope (exit)
+		proc.shutdown();
+	try
+		return run(McpClient.stdio(&proc.readLine, &proc.writeLine), proc);
+	catch (Throwable t)
+	{
+		logFail(t.msg);
+		return 1;
+	}
+}
+
+/// Transport-agnostic e2e: drives `client` and asserts the mocked sampling value
+/// flows server→client→server. `proc` is non-null only for stdio (so we can keep
+/// it referenced); the assertions never look at the transport.
+private int run(McpClient client, Object proc) @safe
+{
 	scope (exit)
 		client.close();
 
@@ -83,7 +151,6 @@ private int run(string url) @safe
 	bool handlerInvoked;
 	string seenSystemPrompt;
 	string seenUserText;
-	const string fixedSummary = "A terse one-line summary.";
 
 	client.onSampling = (CreateMessageRequest request) @safe {
 		handlerInvoked = true;
@@ -146,11 +213,9 @@ private int run(string url) @safe
 			"model_name.model should be '" ~ mockModelId ~ "', got '"
 			~ mres.structuredContent["model"].to!string ~ "'");
 
-	() @trusted {
-		writeln("OK: sampling example e2e passed — server reached back via ctx.sample, ",
-				"onSampling mock answered (system prompt + user text observed), and the ",
-				"mocked summary/model/stopReason flowed through summarize + model_name.");
-	}();
+	logOk("sampling example e2e passed — server reached back via ctx.sample, "
+			~ "onSampling mock answered (system prompt + user text observed), and the "
+			~ "mocked summary/model/stopReason flowed through summarize + model_name.");
 	return 0;
 }
 
@@ -160,4 +225,28 @@ private void check(bool cond, lazy string msg) @safe
 {
 	if (!cond)
 		throw new Exception(msg);
+}
+
+/// Absolute path to the `sampling-server` binary, resolved next to this client
+/// binary (dub writes both into the package root), independent of cwd.
+private string serverBinaryPath() @safe
+{
+	import std.file : thisExePath;
+	import std.path : dirName, buildPath;
+
+	return buildPath(dirName(thisExePath()), "sampling-server");
+}
+
+private void logOk(string msg) @trusted
+{
+	writeln("OK: ", msg);
+}
+
+private void logFail(string msg) @trusted nothrow
+{
+	try
+		stderr.writeln("FAIL: ", msg);
+	catch (Exception)
+	{
+	}
 }
