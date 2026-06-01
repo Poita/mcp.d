@@ -77,10 +77,28 @@ ergonomic API and the protocol bytes.
 
 In production the verifier fetches the authorization server's keys from a JWKS
 endpoint (`JwtVerifierConfig.jwksUri`). To keep this example offline, the
-server **pins the AS public key** (`staticPublicKeysPem`) and the client mints
-its own ES256 JWTs with the matching private key — standing in for the AS. The
-keypair here is a throwaway used only for this demo; never ship a private key in
-a real client.
+server **pins the AS public key** (`staticPublicKeysPem`) and the client stands
+in for the authorization server with the matching private key.
+
+For the happy path the client drives the SDK's real **token-acquisition
+surface** (#504): it stands up a tiny in-process AS **token endpoint** that
+mints the ES256 JWT, then calls **`OAuthClient.clientCredentials`** against it —
+the cleanest automated grant — and feeds the returned `TokenSet.accessToken` to
+`setBearerToken`, instead of ONLY hand-minting the JWT inline. The discovery and
+wire-shape assertions are kept. The negative-path tokens (read-only,
+wrong-audience, missing-scope) are still hand-minted directly, since each needs
+a bespoke claim set. The keypair here is a throwaway used only for this demo;
+never ship a private key in a real client.
+
+## Scaffold (examples/common)
+
+The client uses the shared **`examples_common`** scaffold (#505): `runClient`
+drives the vibe event loop and maps a thrown assertion to a non-zero exit,
+`check` / `checkEq` are the assertion primitives, and `connectFromArgs` selects
+the HTTP transport from `--url`. The server keeps its own
+`runStreamableHttp(server, port, opts)` call because the OAuth resource-server
+protection lives in `StreamableHttpOptions.auth`, which the scaffold's
+transport helper does not carry (this example is HTTP-only with no stdio mode).
 
 ## Run it (two terminals / CI two-step)
 
@@ -113,11 +131,12 @@ code.
    match what the server configured. Verified through the typed
    `OAuthClient.discoverProtectedResource` API and against the raw well-known
    JSON.
-3. **Full-scope token** (`mcp:read mcp:write`) → `initialize` succeeds,
-   `tools/list` contains `whoami` + `secret_note`, `whoami` reports the token
-   subject (`user-42`) and granted scopes, decoded with
-   `structuredContentAs!WhoamiResult`, and `secret_note` returns the privileged
-   payload.
+3. **Full-scope token** (`mcp:read mcp:write`), **acquired via the SDK OAuth
+   client-credentials surface** (`OAuthClient.clientCredentials`, #504) →
+   `initialize` succeeds, `tools/list` contains `whoami` + `secret_note`,
+   `whoami` reports the token subject (`user-42`) and granted scopes, decoded
+   with `structuredContentAs!WhoamiResult`, and `secret_note` returns the
+   privileged payload.
 4. **Read-only token** (`mcp:read`) → `whoami` still works (subject `reader`),
    but `secret_note` returns an `isError` tool result naming the missing
    `mcp:write` scope.
