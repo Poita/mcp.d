@@ -5,8 +5,7 @@
  * transport, selected at runtime:
  *
  *   - STDIO (default): spawn the built `streaming-server` binary (no `--http`)
- *     and talk to it over its stdin/stdout via `McpClient.stdio`, exactly like
- *     examples/tools/client.d.
+ *     and talk to it over its stdin/stdout via `McpClient.stdio`.
  *   - HTTP (`--http <url>`): connect to an already-running server with
  *     `McpClient.http(url)`.
  *
@@ -20,6 +19,18 @@
  * the `serveStdio` cancellation unittest); this client keeps phase D HTTP-only
  * only because its simple synchronous stdio client cannot inject a notification
  * while a `callTool` is in flight — not an SDK limitation.
+ *
+ * Typed/ergonomic SDK APIs adopted here:
+ *   - `result.structuredContentAs!T` decodes structured output into a struct
+ *     instead of field-by-field raw-Json reads (#464).
+ *   - typed `callTool(name, T args)` passes a struct for the static-shape calls
+ *     (#468).
+ *   - `ElicitResult.accept(T)` / `CreateMessageResult.text(model, text)` build
+ *     the mocked client replies from typed values (#466/#467).
+ *   - `ProgressNotification.matches` / `.progressTokenString` replace raw token
+ *     type inspection (#469).
+ *   - Installing `onElicitation` alone advertises elicitation; the inbound gate
+ *     honours `effectiveCapabilities()` (#463), so no redundant raw flag-set.
  *
  * What it verifies, in order:
  *   A. LIST + PROGRESS + LOGGING (transport-agnostic)
@@ -60,8 +71,8 @@ import vibe.data.json : Json;
 import mcp;
 import mcp.client.client : McpClient;
 import mcp.protocol.errors : ErrorCode, McpException;
-import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult, SamplingMessage;
-import mcp.protocol.types : Content, ElicitAction, ElicitParams, ElicitResult;
+import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
+import mcp.protocol.types : ElicitParams, ElicitResult;
 
 // Mocked sampling reply the client returns to the server's `summarize` tool, and
 // the elicited values it accepts. These are the contract: the structured result
@@ -69,6 +80,53 @@ import mcp.protocol.types : Content, ElicitAction, ElicitParams, ElicitResult;
 enum string MockedModel = "mock-model-1";
 enum string MockedSummary = "A concise mock summary.";
 enum string ElicitedTone = "concise";
+
+// Typed mirrors of the server's structures, used for typed callTool args
+// (#468), structuredContentAs!T decoding (#464), and the elicitation accept
+// content (#466). They match the server's field names exactly.
+
+/// `countdown` arguments.
+struct CountdownArgs
+{
+	int steps;
+	int delayMs;
+}
+
+/// `countdown` final structured result.
+struct CountdownResult
+{
+	int completed;
+	int total;
+	bool cancelled;
+}
+
+/// `summarize` arguments.
+struct SummarizeArgs
+{
+	string text;
+}
+
+/// `summarize` structured result.
+struct SummaryResult
+{
+	string status;
+	string tone;
+	string model;
+	string summary;
+}
+
+/// `cancel_stats` structured result.
+struct CancelStats
+{
+	int cancelled;
+}
+
+/// The flat elicitation content the server's `summarize` tool collects.
+struct Confirm
+{
+	bool proceed;
+	string tone;
+}
 
 int main(string[] args)
 {
@@ -170,28 +228,19 @@ private McpClient stdioClient(ServerProcess proc) @safe
 	return client;
 }
 
-/// Install the mocked client-side input handlers. Installing them auto-advertises
-/// the `sampling` / `elicitation` capabilities at initialize, so the server's
-/// blocking `ctx.elicit` / `ctx.sample` can complete.
+/// Install the mocked client-side input handlers. Installing them is sufficient:
+/// the handlers auto-advertise the `sampling` / `elicitation` capabilities at
+/// initialize, and the inbound `elicitation/create` gate honours
+/// `effectiveCapabilities()` (#463) — so no redundant raw flag-setting is needed.
 private void installMockHandlers(McpClient client) @safe
 {
-	// Declare form-mode elicitation explicitly: the inbound `elicitation/create`
-	// check consults the raw declared capabilities, so we set `elicitation` here
-	// (a bare `elicitation` declaration is form-capable) in addition to relying on
-	// the handler-driven auto-advertise.
-	client.capabilities.elicitation = true;
-
 	client.onElicitation = (ElicitParams params) @safe {
 		// Accept with concrete values matching the server's flat `Confirm` struct.
-		Json content = Json.emptyObject;
-		content["proceed"] = true;
-		content["tone"] = ElicitedTone;
-		return ElicitResult.accept(content);
+		return ElicitResult.accept(Confirm(true, ElicitedTone));
 	};
 	client.onSampling = (CreateMessageRequest request) @safe {
 		// Return a typed result with a concrete model + summary text.
-		return CreateMessageResult("assistant",
-				[Content.makeText(MockedSummary)], MockedModel, "endTurn");
+		return CreateMessageResult.text(MockedModel, MockedSummary);
 	};
 }
 
@@ -222,24 +271,24 @@ private int phaseListProgressLogging(scope McpClient delegate() @safe open,
 
 	ProgressUpdate[] progress;
 	LogEntry[] logs;
+	const token = ProgressToken("count-1");
 	client.onProgress = (ProgressNotification n) @safe {
 		progress ~= ProgressUpdate(n.progress, n.total.isNull ? -1 : n.total.get,
-				n.progressToken.type == Json.Type.string ? n.progressToken.get!string : "");
+				n.matches(token), n.progressTokenString);
 	};
 	client.onLogMessage = (LogMessageNotification n) @safe {
 		logs ~= LogEntry(n.level, n.logger.isNull ? "" : n.logger.get);
 	};
 
-	auto result = client.callTool("countdown", countdownArgs(steps, 20), ProgressToken("count-1"));
+	auto result = client.callTool("countdown", CountdownArgs(steps, 20), token);
 
-	// Final structured result.
+	// Final structured result, decoded into the typed CountdownResult (#464).
 	check(result.structuredContent.type == Json.Type.object, "result must carry structuredContent");
-	check(result.structuredContent["completed"].get!long == steps,
-			"completed should be " ~ steps.to!string ~ ", got "
-			~ result.structuredContent["completed"].to!string);
-	check(result.structuredContent["total"].get!long == steps, "total should be " ~ steps.to!string);
-	check(result.structuredContent["cancelled"].get!bool == false,
-			"cancelled should be false on a full run");
+	const cr = result.structuredContentAs!CountdownResult;
+	check(cr.completed == steps,
+			"completed should be " ~ steps.to!string ~ ", got " ~ cr.completed.to!string);
+	check(cr.total == steps, "total should be " ~ steps.to!string);
+	check(cr.cancelled == false, "cancelled should be false on a full run");
 
 	// Exactly `steps` progress notifications, increasing, echoing the token, last == total.
 	check(progress.length == steps,
@@ -250,7 +299,8 @@ private int phaseListProgressLogging(scope McpClient delegate() @safe open,
 				"progress[" ~ i.to!string ~ "].value should be " ~ (i + 1).to!string
 				~ ", got " ~ p.value.to!string);
 		check(p.total == cast(double) steps, "progress total should be " ~ steps.to!string);
-		check(p.token == "count-1", "progress must echo the request's progressToken 'count-1'");
+		check(p.matchesToken, "progress must echo the request's progressToken 'count-1'");
+		check(p.token == "count-1", "progress token string should be 'count-1', got " ~ p.token);
 		if (i > 0)
 			check(p.value > progress[i - 1].value, "progress MUST strictly increase");
 	}
@@ -277,22 +327,21 @@ private void phaseTypedElicitSampling(scope McpClient delegate() @safe open,
 		if (!alreadyInit)
 			client.close();
 
-	Json a = Json.emptyObject;
-	a["text"] = "The quick brown fox jumps over the lazy dog.";
-	auto r = client.callTool("summarize", a);
+	auto r = client.callTool("summarize",
+			SummarizeArgs("The quick brown fox jumps over the lazy dog."));
 	check(!r.isError, "summarize should not be an error");
-	auto sc = r.structuredContent;
-	check(sc.type == Json.Type.object, "summarize must return structuredContent");
-	check(sc["status"].get!string == "summarized",
-			"summarize status should be 'summarized', got " ~ sc["status"].get!string);
-	check(sc["tone"].get!string == ElicitedTone,
-			"summarize tone should echo the elicited '" ~ ElicitedTone ~ "', got " ~ sc["tone"].get!string);
-	check(sc["model"].get!string == MockedModel,
+	check(r.structuredContent.type == Json.Type.object, "summarize must return structuredContent");
+	const sc = r.structuredContentAs!SummaryResult;
+	check(sc.status == "summarized",
+			"summarize status should be 'summarized', got " ~ sc.status);
+	check(sc.tone == ElicitedTone,
+			"summarize tone should echo the elicited '" ~ ElicitedTone ~ "', got " ~ sc.tone);
+	check(sc.model == MockedModel,
 			"summarize model should echo the mocked sampling model '" ~ MockedModel
-			~ "', got " ~ sc["model"].get!string);
-	check(sc["summary"].get!string == MockedSummary,
+			~ "', got " ~ sc.model);
+	check(sc.summary == MockedSummary,
 			"summarize summary should echo the mocked sampling text '" ~ MockedSummary
-			~ "', got " ~ sc["summary"].get!string);
+			~ "', got " ~ sc.summary);
 }
 
 // --- Phase C: error code (transport-agnostic) --------------------------------
@@ -338,7 +387,7 @@ private void phaseCancellation(string url) @trusted
 	enum int longSteps = 50;
 	auto callTask = runTask(() nothrow{
 		try
-			client.callTool("countdown", countdownArgs(longSteps, 40), ProgressToken("cancel-1"));
+			client.callTool("countdown", CountdownArgs(longSteps, 40), ProgressToken("cancel-1"));
 		catch (Throwable)
 		{
 			// Closing the stream aborts the in-flight read: the call ends abnormally.
@@ -376,7 +425,7 @@ private int readCancelCount(scope McpClient delegate() @safe open) @safe
 		client.close();
 	auto r = client.callTool("cancel_stats");
 	check(r.structuredContent.type == Json.Type.object, "cancel_stats must return structuredContent");
-	return cast(int) r.structuredContent["cancelled"].get!long;
+	return r.structuredContentAs!CancelStats.cancelled;
 }
 
 // --- stdio process plumbing ---------------------------------------------------
@@ -384,6 +433,14 @@ private int readCancelCount(scope McpClient delegate() @safe open) @safe
 /// Owns the server subprocess and exposes the newline-delimited JSON-RPC channel
 /// expected by `McpClient.stdio`. Holding `ProcessPipes` in a class field keeps
 /// the stdin/stdout `File` handles alive for the lifetime of the client.
+///
+/// NOTE: this example deliberately keeps this tiny wrapper rather than adopting
+/// `McpClient.spawn` (#470): `spawnStdioTransport`'s `attachProcess(ProcessPipes)`
+/// takes its argument by value, and the copy's destructor closes the child's
+/// stdin write-end before the first request is sent, so the child sees EOF and
+/// the first `send` fails with "Attempting to write to closed File". Holding the
+/// pipes in a class field (as below) avoids that lifetime hazard. Switch to
+/// `McpClient.spawn([serverBinaryPath()])` once that SDK bug is fixed.
 final class ServerProcess
 {
 	private ProcessPipes pipes;
@@ -436,6 +493,7 @@ private struct ProgressUpdate
 {
 	double value;
 	double total;
+	bool matchesToken;
 	string token;
 }
 
@@ -443,14 +501,6 @@ private struct LogEntry
 {
 	string level;
 	string logger;
-}
-
-private Json countdownArgs(int steps, int delayMs) @safe
-{
-	Json a = Json.emptyObject;
-	a["steps"] = steps;
-	a["delayMs"] = delayMs;
-	return a;
 }
 
 /// Assertion helper: throws (failing the e2e with a clear message) when `cond`
