@@ -6,6 +6,26 @@ import mcp.protocol.versions : ProtocolVersion;
 
 @safe:
 
+/// The draft Extension Negotiation identifier under which task support is
+/// declared. In the draft schema, `ServerCapabilities`/`ClientCapabilities`
+/// have NO top-level `tasks` field; task support is carried in the `extensions`
+/// map keyed by this identifier. (2025-11-25 keeps `tasks` as a first-class
+/// capability instead.)
+enum string tasksExtensionKey = "io.modelcontextprotocol/tasks";
+
+/// Fold a (possibly null) first-class `tasks` capability into a copy of the
+/// draft `extensions` map under `tasksExtensionKey`. Used by `forVersion` to
+/// project task support to the draft wire shape, where `tasks` is not a
+/// top-level field. An explicit `extensions[tasksExtensionKey]` entry already
+/// present in `ext` is preserved (the caller's explicit advertisement wins).
+private Json foldTasksIntoExtensions(Json ext, const Nullable!TasksCapability tasks) @safe
+{
+	Json merged = (ext.type == Json.Type.object) ? ext.clone() : Json.emptyObject;
+	if (!tasks.isNull && tasksExtensionKey !in merged)
+		merged[tasksExtensionKey] = tasks.get.toJson();
+	return (merged.length > 0) ? merged : Json.undefined;
+}
+
 /// An icon for display in user interfaces. Used by `Implementation`,
 /// `Tool` (and other definitions) per the MCP spec's icon shape: a required
 /// `src` and optional `mimeType`, `sizes`, and `theme` ("light"|"dark").
@@ -345,10 +365,15 @@ struct ServerCapabilities
 		projected.experimental = experimental;
 		if (v >= ProtocolVersion.v2025_03_26)
 			projected.completions = completions;
-		if (v >= ProtocolVersion.v2025_11_25)
+		// `tasks` is a first-class capability ONLY in the 2025-11-25 era. The draft
+		// schema has no top-level `tasks`; task support there is negotiated via the
+		// `extensions` map keyed by `tasksExtensionKey`. Since the version enum
+		// orders `draft` ABOVE 2025-11-25, gate to exactly 2025-11-25 here so draft
+		// never emits a top-level `tasks`.
+		if (v == ProtocolVersion.v2025_11_25)
 			projected.tasks = tasks;
-		if (v >= ProtocolVersion.draft)
-			projected.extensions = extensions;
+		else if (v >= ProtocolVersion.draft)
+			projected.extensions = foldTasksIntoExtensions(extensions, tasks);
 		return projected;
 	}
 
@@ -444,6 +469,33 @@ struct ClientCapabilities
 		if (extensions.type == Json.Type.object)
 			j["extensions"] = extensions;
 		return j;
+	}
+
+	/// Project these capabilities to the wire shape for protocol version `v`,
+	/// stripping any field newer than `v` and migrating `tasks` to the draft
+	/// `extensions` map. `tasks` is a first-class client capability ONLY in the
+	/// 2025-11-25 era; the draft schema has no top-level client `tasks`, so for
+	/// draft it is folded into `extensions[tasksExtensionKey]`. The `extensions`
+	/// negotiation map itself is draft-only. Base capabilities
+	/// (`roots`/`sampling`/`elicitation`/`experimental`) exist in every supported
+	/// version and are passed through unchanged.
+	ClientCapabilities forVersion(ProtocolVersion v) const @safe
+	{
+		ClientCapabilities projected;
+		projected.roots = roots;
+		projected.rootsListChanged = rootsListChanged;
+		projected.sampling = sampling;
+		projected.samplingTools = samplingTools;
+		projected.samplingContext = samplingContext;
+		projected.elicitation = elicitation;
+		projected.elicitationForm = elicitationForm;
+		projected.elicitationUrl = elicitationUrl;
+		projected.experimental = experimental;
+		if (v == ProtocolVersion.v2025_11_25)
+			projected.tasks = tasks;
+		else if (v >= ProtocolVersion.draft)
+			projected.extensions = foldTasksIntoExtensions(extensions, tasks);
+		return projected;
 	}
 
 	static ClientCapabilities fromJson(Json j) @safe
@@ -784,12 +836,84 @@ unittest  // ServerCapabilities.forVersion strips tasks before 2025-11-25
 		assert("tasks" !in caps.forVersion(v).toJson());
 }
 
-unittest  // ServerCapabilities.forVersion keeps tasks from 2025-11-25
+unittest  // ServerCapabilities.forVersion keeps top-level tasks only for 2025-11-25
 {
 	ServerCapabilities caps;
 	caps.tasks = TasksCapability(true, true);
-	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.draft])
-		assert("tasks" in caps.forVersion(v).toJson());
+	assert("tasks" in caps.forVersion(ProtocolVersion.v2025_11_25).toJson());
+}
+
+unittest  // ServerCapabilities.forVersion: draft has no top-level tasks capability
+{
+	ServerCapabilities caps;
+	caps.tasks = TasksCapability(true, true);
+	auto j = caps.forVersion(ProtocolVersion.draft).toJson();
+	assert("tasks" !in j);
+}
+
+unittest  // ServerCapabilities.forVersion folds tasks into extensions for draft
+{
+	ServerCapabilities caps;
+	caps.tasks = TasksCapability(true, true);
+	auto j = caps.forVersion(ProtocolVersion.draft).toJson();
+	assert("extensions" in j);
+	assert("io.modelcontextprotocol/tasks" in j["extensions"]);
+	// The per-extension settings object carries the negotiated tasks shape.
+	assert("list" in j["extensions"]["io.modelcontextprotocol/tasks"]);
+	assert("cancel" in j["extensions"]["io.modelcontextprotocol/tasks"]);
+}
+
+unittest  // ServerCapabilities.forVersion: explicit tasks extension wins over folded tasks
+{
+	ServerCapabilities caps;
+	caps.tasks = TasksCapability(true, true);
+	Json ext = Json.emptyObject;
+	Json settings = Json.emptyObject;
+	settings["maxConcurrent"] = 4;
+	ext["io.modelcontextprotocol/tasks"] = settings;
+	caps.extensions = ext;
+	auto j = caps.forVersion(ProtocolVersion.draft).toJson();
+	// The caller's explicit advertisement is preserved, not overwritten by fold.
+	assert(j["extensions"]["io.modelcontextprotocol/tasks"]["maxConcurrent"].get!int == 4);
+}
+
+unittest  // ClientCapabilities.forVersion keeps top-level tasks only for 2025-11-25
+{
+	ClientCapabilities caps;
+	caps.tasks = TasksCapability(false, false);
+	assert("tasks" in caps.forVersion(ProtocolVersion.v2025_11_25).toJson());
+}
+
+unittest  // ClientCapabilities.forVersion: draft has no top-level tasks capability
+{
+	ClientCapabilities caps;
+	caps.tasks = TasksCapability(false, false);
+	auto j = caps.forVersion(ProtocolVersion.draft).toJson();
+	assert("tasks" !in j);
+}
+
+unittest  // ClientCapabilities.forVersion folds tasks into extensions for draft
+{
+	ClientCapabilities caps;
+	caps.tasks = TasksCapability(false, false);
+	auto j = caps.forVersion(ProtocolVersion.draft).toJson();
+	assert("extensions" in j);
+	assert("io.modelcontextprotocol/tasks" in j["extensions"]);
+}
+
+unittest  // ClientCapabilities.forVersion strips top-level tasks before 2025-11-25
+{
+	ClientCapabilities caps;
+	caps.tasks = TasksCapability(false, false);
+	foreach (v; [
+		ProtocolVersion.v2024_11_05, ProtocolVersion.v2025_03_26,
+		ProtocolVersion.v2025_06_18
+	])
+	{
+		auto j = caps.forVersion(v).toJson();
+		assert("tasks" !in j);
+		assert("extensions" !in j);
+	}
 }
 
 unittest  // ServerCapabilities.forVersion strips extensions for non-draft

@@ -260,7 +260,13 @@ final class McpClient : ClientProtocol
 	{
 		InitializeParams params;
 		params.protocolVersion = requestedVersion;
-		params.capabilities = effectiveCapabilities();
+		// Advertise capabilities in the wire shape for the requested version:
+		// e.g. for draft, `tasks` is folded into the `extensions` map rather than
+		// emitted as a top-level capability the draft schema does not define.
+		ProtocolVersion reqVer;
+		if (!tryParseVersion(requestedVersion, reqVer))
+			reqVer = latestStable;
+		params.capabilities = effectiveCapabilities().forVersion(reqVer);
 		params.clientInfo = clientInfo;
 
 		// Record the id the initialize request will use so cancel() can refuse
@@ -913,7 +919,9 @@ final class McpClient : ClientProtocol
 			.emptyObject;
 		meta[MetaKey.protocolVersion] = negotiated.toWire;
 		meta[MetaKey.clientInfo] = clientInfo.toJson();
-		meta[MetaKey.clientCapabilities] = effectiveCapabilities().toJson();
+		// Project to the negotiated (draft) wire shape: draft has no top-level
+		// client `tasks` capability, so it is folded into the `extensions` map.
+		meta[MetaKey.clientCapabilities] = effectiveCapabilities().forVersion(negotiated).toJson();
 		params["_meta"] = meta;
 		return params;
 	}
