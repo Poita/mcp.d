@@ -25,7 +25,7 @@ version (unittest)
 	import mcp.client.client : McpClient;
 	import mcp.protocol.types : CallToolResult, Content, Tool;
 	import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
-	import mcp.protocol.types : ElicitParams, ElicitResult;
+	import mcp.protocol.types : ElicitParams, ElicitResult, ElicitAction;
 	import mcp.transport.streamable_http : mountMcp, StreamableHttpOptions;
 }
 
@@ -127,8 +127,8 @@ unittest
 		Json schema = Json.emptyObject;
 		schema["type"] = "object";
 		auto reply = ctx.elicit("What is your name?", schema); // server->client request
-		auto name = (reply["action"].get!string == "accept") ? reply["content"]["name"]
-			.get!string : "(declined)";
+		auto name = (reply.action == ElicitAction.accept) ? reply.content["name"].get!string
+			: "(declined)";
 		return CallToolResult([Content.makeText("hello:" ~ name)]);
 	});
 
