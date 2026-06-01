@@ -14,16 +14,21 @@
  *      with `inputResponses` + the echoed `requestState`, and returns the FINAL
  *      `CallToolResult`. The client asserts the mocked values flowed through.
  *
- * Transport selection (the SAME assertions verify both):
- *   - default (no --http): STDIO. The client SPAWNS the built `mrtr-server`
- *     binary (with no --http) and speaks newline-delimited JSON-RPC over the pipe
- *     via `McpClient.spawn`, which owns the subprocess and shuts it down on close().
- *   - `--http <url>`: connect to a running HTTP server via `McpClient.http(url)`.
+ * Transport selection is delegated to the shared `examples_common` scaffold:
+ *   - `connectFromArgs(args, "mrtr-server")` returns an HTTP client when
+ *     `--http <url>` is given, else spawns the sibling `mrtr-server` binary over
+ *     stdio (`McpClient.spawnSibling`). The SAME assertions verify both.
+ *   - `runClient(scenario)` drives the vibe event loop uniformly so the identical
+ *     scenario body works over stdio and HTTP, mapping any thrown assertion to a
+ *     non-zero exit code.
  *
  * Typed/ergonomic SDK APIs adopted here (the args/handlers/result decode are all
  * typed; no hand-built Json on those paths):
  *   - typed `callTool(name, BookMeetingArgs)` (#468) replaces the hand-built
  *     arguments `Json`;
+ *   - the inbound `InputRequest`s are read with the typed readers (#503)
+ *     `req.elicitationMessage()` / `req.requestedSchema()` / `req.asSampling()`
+ *     instead of raw `req.params[...]` indexing;
  *   - `ElicitResult.accept!MeetingDate` (#466) and `CreateMessageResult.text`
  *     (#467) replace the hand-assembled elicitation/sampling reply structs;
  *   - `CallToolResult.structuredContentAs!Booking` (#464) replaces the
@@ -34,21 +39,21 @@
  *
  *   dub build -c server && dub build -c client
  *   # stdio:
- *   ./mrtr-client
+ *   dub run -c client
  *   # http:
- *   ./mrtr-server --http --port 8765 &
- *   ./mrtr-client --http http://127.0.0.1:8765/mcp
+ *   dub run -c server -- --http --port 8765 &
+ *   dub run -c client -- --http http://127.0.0.1:8765/mcp
  */
 module mrtr_client;
 
-import std.getopt : getopt;
-import std.stdio : stderr, writeln;
+import std.conv : to;
+import std.stdio : writeln;
 
 import vibe.data.json : Json;
 
 import mcp;
 
-enum string defaultHttpUrl = "http://127.0.0.1:8765/mcp";
+import examples_common : check, runClient, connectFromArgs;
 
 /// Typed view of the `book_meeting` arguments. Passing this struct to the typed
 /// `callTool(name, T)` overload (#468) serializes the wire `{topic}` object for
@@ -77,87 +82,16 @@ struct Booking
 	int rounds;
 }
 
-/// Absolute path to the `mrtr-server` binary, resolved next to this executable
-/// (dub writes both binaries into the package root).
-private string serverBinaryPath() @safe
+int main(string[] args) @safe
 {
-	import std.file : thisExePath;
-	import std.path : dirName, buildPath;
-
-	return buildPath(dirName(thisExePath()), "mrtr-server");
-}
-
-int main(string[] args)
-{
-	string url;
-	getopt(args, "http", "Connect over Streamable HTTP at this URL instead of spawning the server over stdio", &url);
-
-	if (url.length)
-		return runHttp(url);
-	return runStdio();
-}
-
-/// HTTP transport: connect to an already-running server, then run the shared
-/// assertions inside vibe's event loop (the HTTP client requires it).
-private int runHttp(string url)
-{
-	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
-
-	int rc;
-	runTask(() nothrow{
-		scope (exit)
-			exitEventLoop();
-		try
-		{
-			auto client = McpClient.http(url);
-			scope (exit)
-				client.close();
-			rc = runE2E(client);
-		}
-		catch (Throwable e)
-		{
-			try
-				stderr.writeln("FAIL: ", e.msg);
-			catch (Exception)
-			{
-			}
-			rc = 1;
-		}
-	});
-	runEventLoop();
-	return rc;
-}
-
-/// STDIO transport: spawn the built server binary (no --http) and drive it over
-/// the pipe. `McpClient.spawn` owns the subprocess; its `close()` runs the MCP
-/// stdio Shutdown sequence (SIGTERM -> SIGKILL), so a `scope(exit)` guarantees the
-/// child is reaped even if an assertion throws. No event loop is needed here.
-private int runStdio()
-{
-	try
-	{
-		auto client = McpClient.spawn([serverBinaryPath()]);
+	// The scaffold drives the event loop and maps any thrown assertion to rc 1;
+	// `connectFromArgs` picks HTTP (`--http <url>`) or a spawned sibling server.
+	return runClient(() @safe {
+		auto client = connectFromArgs(args, "mrtr-server");
 		scope (exit)
 			client.close();
 		return runE2E(client);
-	}
-	catch (Throwable e)
-	{
-		try
-			stderr.writeln("FAIL: ", e.msg);
-		catch (Exception)
-		{
-		}
-		return 1;
-	}
-}
-
-/// A tiny assert helper that throws (caught by the transport driver -> exit 1)
-/// with a clear message describing what differed.
-private void check(bool cond, lazy string msg) @safe
-{
-	if (!cond)
-		throw new Exception(msg);
+	});
 }
 
 /// The transport-agnostic e2e body: given a connected `McpClient`, exercise the
@@ -172,7 +106,7 @@ private int runE2E(McpClient client) @safe
 	// ---- discovery: the server advertises the draft version + its identity ----
 	auto disc = client.discover();
 	check(disc.serverInfo.name == "mrtr-example",
-		"server name: expected 'mrtr-example', got '" ~ disc.serverInfo.name ~ "'");
+			"server name: expected 'mrtr-example', got '" ~ disc.serverInfo.name ~ "'");
 
 	// ---- the tool is listed with the expected name + required arg ----
 	auto tools = client.listTools().tools;
@@ -189,9 +123,9 @@ private int runE2E(McpClient client) @safe
 	// surfaced so we can assert the raw MRTR shape. ----
 	auto raw = client.callTool("book_meeting", topicArg);
 	check(raw.isInputRequired,
-		"expected an inputRequired result on the first call with no handlers");
+			"expected an inputRequired result on the first call with no handlers");
 	check(raw.inputRequests.length == 2,
-		"expected 2 input requests, got " ~ itoa(raw.inputRequests.length));
+			"expected 2 input requests, got " ~ to!string(raw.inputRequests.length));
 
 	bool sawDate, sawAgenda;
 	foreach (req; raw.inputRequests)
@@ -200,34 +134,43 @@ private int runE2E(McpClient client) @safe
 		{
 			sawDate = true;
 			check(req.type == "elicitation",
-				"meeting_date type: expected 'elicitation', got '" ~ req.type ~ "'");
-			check(req.params["message"].get!string == "On what date should we meet?",
-				"meeting_date message mismatch: '" ~ req.params["message"].get!string ~ "'");
+					"meeting_date type: expected 'elicitation', got '" ~ req.type ~ "'");
+			// Typed reader (#503): read the elicitation message + requestedSchema via
+			// req.elicitationMessage() / req.requestedSchema() rather than raw
+			// req.params[...] indexing.
+			check(req.elicitationMessage() == "On what date should we meet?",
+					"meeting_date message mismatch: '" ~ req.elicitationMessage() ~ "'");
 			// The schema was DERIVED from the server's flat MeetingDate struct via
 			// InputRequest.elicitation!T, so it must expose a `date` string property.
-			auto schema = req.params["requestedSchema"];
+			auto schema = req.requestedSchema();
 			check(schema.type == Json.Type.object,
-				"meeting_date requestedSchema should be an object");
+					"meeting_date requestedSchema should be an object");
 			check(("date" in schema["properties"]) !is null,
-				"meeting_date requestedSchema should expose a 'date' property");
+					"meeting_date requestedSchema should expose a 'date' property");
 		}
 		else if (req.id == "meeting_agenda")
 		{
 			sawAgenda = true;
 			check(req.type == "sampling",
-				"meeting_agenda type: expected 'sampling', got '" ~ req.type ~ "'");
-			// The sampling request was built from a typed CreateMessageRequest:
-			// it must carry the maxTokens and the user message we set.
-			check(req.params["maxTokens"].get!int == 64,
-				"meeting_agenda maxTokens: expected 64, got " ~ itoa(req.params["maxTokens"].get!int));
+					"meeting_agenda type: expected 'sampling', got '" ~ req.type ~ "'");
+			// Typed reader (#503): decode the sampling request back into a typed
+			// CreateMessageRequest via req.asSampling() rather than raw
+			// req.params[...] indexing. It must carry the maxTokens and user message
+			// the server set.
+			auto sreq = req.asSampling();
+			check(!sreq.maxTokens.isNull && sreq.maxTokens.get == 64,
+					"meeting_agenda maxTokens: expected 64");
+			check(sreq.messages.length == 1 && sreq.messages[0].role == "user",
+					"meeting_agenda should carry one user sampling message");
 		}
 	}
 	check(sawDate, "missing 'meeting_date' input request");
 	check(sawAgenda, "missing 'meeting_agenda' input request");
 
-	// SEP-2322: the opaque requestState the server stashed (it encoded the topic).
-	check(raw.requestState == "topic=Q3 roadmap",
-		"requestState mismatch: '" ~ raw.requestState ~ "'");
+	// SEP-2322: the opaque requestState the server stashed (it encoded the topic
+	// as a typed RequestState struct, i.e. a JSON object `{"topic":"Q3 roadmap"}`).
+	check(parseRequestStateTopic(raw.requestState) == "Q3 roadmap",
+			"requestState topic mismatch: '" ~ raw.requestState ~ "'");
 
 	// ---- Round-trip view #2: install mock handlers; the SDK completes the loop. ----
 	// Installing onElicitation/onSampling alone auto-advertises the matching
@@ -243,43 +186,45 @@ private int runE2E(McpClient client) @safe
 	};
 
 	auto done = client.callTool("book_meeting", topicArg);
-	check(!done.isInputRequired,
-		"second call should have completed, but still wants input");
+	check(!done.isInputRequired, "second call should have completed, but still wants input");
 	check(!done.isError, "completed result unexpectedly flagged isError");
 	check(done.content.length == 1,
-		"expected 1 content block, got " ~ itoa(done.content.length));
+			"expected 1 content block, got " ~ to!string(done.content.length));
 
 	const text = done.content[0].text();
-	const expectedText =
-		"Booked 'Q3 roadmap' on 2026-06-15. Agenda: Review Q3 milestones and assign owners.";
+	const expectedText = "Booked 'Q3 roadmap' on 2026-06-15. Agenda: Review Q3 milestones and assign owners.";
 	check(text == expectedText,
-		"final text mismatch.\n  expected: " ~ expectedText ~ "\n  got:      " ~ text);
+			"final text mismatch.\n  expected: " ~ expectedText ~ "\n  got:      " ~ text);
 
 	// Structured content carries the same values plus the round count. Decode it
 	// in one shot into the typed Booking struct (#464) and assert on the fields.
 	auto booking = done.structuredContentAs!Booking;
-	check(booking.topic == "Q3 roadmap",
-		"structured topic mismatch: '" ~ booking.topic ~ "'");
-	check(booking.date == "2026-06-15",
-		"structured date mismatch: '" ~ booking.date ~ "'");
+	check(booking.topic == "Q3 roadmap", "structured topic mismatch: '" ~ booking.topic ~ "'");
+	check(booking.date == "2026-06-15", "structured date mismatch: '" ~ booking.date ~ "'");
 	check(booking.agenda == "Review Q3 milestones and assign owners.",
-		"structured agenda mismatch: '" ~ booking.agenda ~ "'");
-	check(booking.rounds == 2,
-		"structured rounds mismatch: " ~ itoa(booking.rounds));
+			"structured agenda mismatch: '" ~ booking.agenda ~ "'");
+	check(booking.rounds == 2, "structured rounds mismatch: " ~ to!string(booking.rounds));
 
 	() @trusted {
 		writeln("OK: MRTR e2e — 2 input requests resolved (schema derived from struct), ",
-			"requestState echoed, mocked elicitation+sampling flowed through, ",
-			"server completed in 2 rounds.");
+				"requestState echoed, mocked elicitation+sampling flowed through, ",
+				"server completed in 2 rounds.");
 	}();
 	return 0;
 }
 
-/// Minimal integer-to-string for assertion messages (avoids pulling std.conv
-/// into @safe error paths).
-private string itoa(long n) @safe
+/// Read the `topic` out of the server's opaque `requestState`. The server now
+/// encodes a typed `RequestState` struct, so the blob is a JSON object
+/// `{"topic":"..."}`; this is the client's view of that contract for the
+/// round-trip-shape assertion.
+private string parseRequestStateTopic(string requestState) @safe
 {
-	import std.conv : to;
+	import vibe.data.json : parseJsonString;
 
-	return n.to!string;
+	if (requestState.length == 0)
+		return "";
+	auto j = () @trusted { return parseJsonString(requestState); }();
+	if (j.type == Json.Type.object && "topic" in j)
+		return j["topic"].get!string;
+	return "";
 }
