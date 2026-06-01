@@ -7,10 +7,11 @@
  *
  * When `--http <url>` is given the client connects with `McpClient.http(url)`;
  * otherwise it spawns the built `stateless-draft-server` binary (no `--http`)
- * and talks newline-delimited JSON-RPC over its stdin/stdout via
- * `McpClient.stdio`. The draft (2026-07-28) stateless model is engaged the same
- * way on either channel — `enableDraft()` + per-request `_meta` — so a single
- * transport-agnostic assertion body verifies both.
+ * via `McpClient.spawn`, which launches the subprocess and talks
+ * newline-delimited JSON-RPC over its stdin/stdout. The draft (2026-07-28)
+ * stateless model is engaged the same way on either channel — `enableDraft()` +
+ * per-request `_meta` — so a single transport-agnostic assertion body verifies
+ * both.
  *
  * It ASSERTS the consumer's-eye view:
  *
@@ -36,8 +37,6 @@ import std.algorithm : canFind, map;
 import std.array : array;
 import std.conv : to;
 import std.getopt : getopt;
-import std.process : ProcessPipes, pipeProcess, Redirect, wait;
-import std.string : stripRight;
 
 import vibe.data.json : Json;
 
@@ -64,51 +63,6 @@ private void printLine(string s) @trusted nothrow
 		writeln(s);
 	catch (Exception)
 	{
-	}
-}
-
-/// Owns the server subprocess and exposes the newline-delimited JSON-RPC channel
-/// expected by `McpClient.stdio`. Holding `ProcessPipes` in a class field keeps
-/// the stdin/stdout `File` handles alive for the lifetime of the client.
-///
-/// (The SDK's `McpClient.spawn` would replace this boilerplate, but its
-/// `spawnStdioTransport` currently lets the subprocess pipes' `File` handles be
-/// refcounted to zero when the spawn helper returns — the next write fails with
-/// "Attempting to write to closed File". Until that is fixed upstream this
-/// example keeps the explicit, working `ProcessPipes` owner.)
-final class ServerProcess
-{
-	private ProcessPipes pipes;
-
-	this(string[] command) @trusted
-	{
-		pipes = pipeProcess(command, Redirect.stdin | Redirect.stdout);
-	}
-
-	/// Read one response line (terminator stripped), or null at EOF.
-	string readLine() @trusted
-	{
-		auto f = pipes.stdout;
-		if (f.eof)
-			return null;
-		auto ln = f.readln();
-		if (ln.length == 0 && f.eof)
-			return null;
-		return ln.stripRight("\r\n");
-	}
-
-	/// Write one request line (the channel appends the terminator).
-	void writeLine(string s) @trusted
-	{
-		pipes.stdin.writeln(s);
-		pipes.stdin.flush();
-	}
-
-	/// Close stdin and reap the child.
-	void shutdown() @trusted
-	{
-		pipes.stdin.close();
-		wait(pipes.pid);
 	}
 }
 
@@ -148,22 +102,17 @@ int main(string[] args)
 			&httpUrl);
 
 	// Build the client over the selected transport BEFORE entering the event
-	// loop, so the stdio subprocess (and its pipes) outlive the e2e body.
-	ServerProcess proc;
+	// loop, so the stdio subprocess outlives the e2e body. `McpClient.spawn`
+	// launches the server and owns its pipes; `client.close()` runs the stdio
+	// shutdown sequence (SIGTERM->SIGKILL) on exit. HTTP `close()` is also correct.
 	McpClient client;
 	bool overHttp = httpUrl.length != 0;
 	if (overHttp)
-	{
 		client = McpClient.http(httpUrl);
-	}
 	else
-	{
-		proc = new ServerProcess([serverBinaryPath()]);
-		client = McpClient.stdio(&proc.readLine, &proc.writeLine);
-	}
+		client = McpClient.spawn([serverBinaryPath()]);
 	scope (exit)
-		if (proc !is null)
-			proc.shutdown();
+		client.close();
 
 	int rc;
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
@@ -275,7 +224,8 @@ private int runE2E(McpClient client, bool overHttp) @safe
 	if (threw)
 		c.eq(gotCode, cast(int) ErrorCode.invalidParams, "unknown-tool error code");
 
-	client.close();
+	// Transport teardown is owned by `main`'s `scope(exit) client.close()` (the
+	// stdio shutdown sequence on the spawned subprocess), so don't close here.
 
 	if (!c.ok)
 	{
