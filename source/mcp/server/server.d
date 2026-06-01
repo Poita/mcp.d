@@ -40,6 +40,23 @@ struct ToolResponse
 		return t;
 	}
 
+	/// Convenience: build a final result from a typed `value`. Serialises `value`
+	/// to JSON and uses it as the result's `structuredContent`, defaulting the
+	/// human-readable `content` to a single text block holding that same JSON.
+	/// The serialisation is done inline here (independent of any
+	/// `CallToolResult.structured!T` helper) so this overload stays compilable on
+	/// its own.
+	static ToolResponse complete(T)(T value) @safe if (!is(T : CallToolResult))
+	{
+		import vibe.data.json : serializeToJson;
+
+		Json sc = serializeToJson(value);
+		CallToolResult r;
+		r.structuredContent = sc;
+		r.content = [Content.makeText(sc.toString())];
+		return ToolResponse.complete(r);
+	}
+
 	/// The handler needs input; the client must gather it and resubmit with the
 	/// matching `inputResponses`.
 	static ToolResponse inputRequired(InputRequest[] requests) @safe
@@ -61,6 +78,20 @@ struct ToolResponse
 		t.required_.inputRequests = requests;
 		t.required_.requestState = requestState;
 		return t;
+	}
+
+	/// As `inputRequired`, but encodes a typed `state` as the opaque
+	/// `requestState`. Serialises `state` to JSON and stores its string form.
+	/// ENCODING CONTRACT: the stored value is `serializeToJson(state).toString()`,
+	/// which `RequestContext.requestStateAs!T()` decodes via
+	/// `deserializeJson!T(parseJsonString(state))`. Constrained off `string` so it
+	/// does not collide with the verbatim-string overload above.
+	static ToolResponse inputRequired(T)(InputRequest[] requests, T state) @safe
+			if (!is(T : string))
+	{
+		import vibe.data.json : serializeToJson;
+
+		return ToolResponse.inputRequired(requests, serializeToJson(state).toString());
 	}
 
 	/// Whether this outcome asks the client for more input.
@@ -5571,4 +5602,64 @@ unittest  // the only completion entry point is the typed CompleteRequest one
 				CompleteResult r;
 				return r;
 			})));
+}
+
+unittest  // ToolResponse.complete!T serialises a struct into structuredContent
+{
+	static struct Weather
+	{
+		string city;
+		int temperature;
+	}
+
+	auto resp = ToolResponse.complete(Weather("Sydney", 21));
+	assert(!resp.needsInput);
+	auto j = resp.toJson();
+	assert(j["structuredContent"]["city"].get!string == "Sydney");
+	assert(j["structuredContent"]["temperature"].get!long == 21);
+}
+
+unittest  // ToolResponse.complete!T defaults content to a single text block of the JSON
+{
+	import vibe.data.json : parseJsonString;
+
+	static struct Box
+	{
+		int n;
+	}
+
+	auto resp = ToolResponse.complete(Box(7));
+	auto j = resp.toJson();
+	assert(j["content"].length == 1);
+	assert(j["content"][0]["type"].get!string == "text");
+	auto echoed = parseJsonString(j["content"][0]["text"].get!string);
+	assert(echoed["n"].get!long == 7);
+}
+
+unittest  // inputRequired(reqs, T) stores requestState as the JSON of the struct
+{
+	import vibe.data.json : parseJsonString, deserializeJson;
+
+	static struct ResumeState
+	{
+		string step;
+		int attempt;
+	}
+
+	auto resp = ToolResponse.inputRequired(cast(InputRequest[]) null, ResumeState("verify", 2));
+	assert(resp.needsInput);
+	auto j = resp.toJson();
+	auto back = () @trusted {
+		return deserializeJson!ResumeState(parseJsonString(j["requestState"].get!string));
+	}();
+	assert(back.step == "verify");
+	assert(back.attempt == 2);
+}
+
+unittest  // inputRequired(reqs, T) does not collide with the string overload
+{
+	// A string state still routes to the verbatim-string overload.
+	auto resp = ToolResponse.inputRequired(cast(InputRequest[]) null, "raw-blob");
+	auto j = resp.toJson();
+	assert(j["requestState"].get!string == "raw-blob");
 }
