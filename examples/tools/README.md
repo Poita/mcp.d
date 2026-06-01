@@ -43,7 +43,7 @@ over either transport. It asserts concrete expected values:
 - `calc`'s input schema exposes the enum members and keeps the optional `round`
   arg out of `required`; `magnitude`'s `v` arg is an object sub-schema;
 - the marker UDAs surface as the right `ToolAnnotations` hints (incl. the
-  `@hintTitle`);
+  `@hintTitle`), read via the ergonomic `tool.toolAnnotations()` accessor;
 - `calc(add, 3, 4)` returns `structuredContent` `{op: 0, result: 7}` (the enum
   field serializes as its ordinal);
 - the optional `round` arg flows through (`mul(1/3, 1)` rounded to 2dp = 0.33);
@@ -53,6 +53,13 @@ over either transport. It asserts concrete expected values:
   `resource_link` block to `doc://42`;
 - calling an unknown tool raises an `McpException` with code
   `invalidParams` (-32602).
+
+The client exercises the SDK's typed client ergonomics rather than hand-built
+Json wherever the call is static: it passes typed parameter structs to
+`client.callTool(name, T args)` (e.g. `callTool("calc", CalcArgs("add", 3, 4))`)
+and decodes structured output with `result.structuredContentAs!T` into small
+result structs (`CalcOutput`, `ScalarOutput`); a dynamic Json arguments object is
+kept only for the genuinely optional `round` argument.
 
 On success it prints `OK: ...` and exits `0`; on **any** failed assertion it
 prints what differed and exits **non-zero**, so the example doubles as a CI
