@@ -11,7 +11,7 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.capabilities;
 import mcp.protocol.draft : withSubscriptionId;
-import mcp.protocol.versions : ProtocolVersion, latestStable;
+import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
 import mcp.server.context;
 import mcp.auth.resource_server : TokenInfo;
 
@@ -1041,7 +1041,9 @@ final class HttpStreamContext : RequestContext
 		p["progress"] = progress;
 		if (!total.isNull)
 			p["total"] = total.get;
-		if (message.length)
+		// `message` was introduced in 2025-03-26; suppress it for a 2024-11-05
+		// peer whose ProgressNotification schema has no such field.
+		if (message.length && version_.supportsProgressMessage)
 			p["message"] = message;
 		writeEvent(makeNotification("notifications/progress", p));
 	}
