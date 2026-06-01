@@ -1,5 +1,5 @@
 /**
- * MRTR (Multi Round-Trip Requests, SEP-2322) example server.
+ * MRTR (Multi Round-Trip Requests, SEP-2322) example server — dual transport.
  *
  * Demonstrates the *stateless* draft input flow: instead of opening a
  * server->client `elicitation/create` or `sampling/createMessage` request (which
@@ -14,9 +14,17 @@
  * inferred) and an auto-injected `RequestContext`, and returns a `ToolResponse`
  * so it can answer either `inputRequired` (round 1) or `complete` (round 2).
  * `registerHandlers` wires it onto the server -- no hand-built `Json` args,
- * descriptors, or registration calls. The only raw `Json` that remains is the
- * genuinely-protocol payload the UDA layer does not abstract: the MRTR
- * `InputRequest` requested-schema / sampling messages, and the structured result.
+ * descriptors, or registration calls.
+ *
+ * Typed APIs (SEP-2322 builders) replace every hand-built MRTR `Json`:
+ *   - the elicitation `InputRequest` is built with `InputRequest.elicitation!T`,
+ *     which DERIVES its `requestedSchema` from the flat struct `MeetingDate`;
+ *   - the sampling `InputRequest` is built with `InputRequest.sampling(id, req)`
+ *     from a typed `CreateMessageRequest` (typed `SamplingMessage` + `Content`);
+ *   - on the resubmit round the answers are decoded with `ctx.inputResponseAs!T`
+ *     (an `ElicitResult` for the date, a `CreateMessageResult` for the agenda);
+ *   - the final content uses `Content.makeText` and the structured result is
+ *     serialized from a typed `Booking` struct.
  *
  * The `book_meeting` tool below shows both round-trips in one call:
  *   round 1: client calls `book_meeting {topic}`     -> server asks for input
@@ -25,33 +33,37 @@
  *   round 2: client resubmits with `inputResponses`  -> server reads the answers
  *            + the echoed `requestState` and returns the final confirmation.
  *
- * Run it standalone over Streamable HTTP:
- *   dub build -c server
- *   ./mrtr-server --port 8765
- * then point the client at http://127.0.0.1:8765/mcp (see client.d / README).
+ * One binary, either transport:
+ *   stdio (default):  ./mrtr-server
+ *   Streamable HTTP:  ./mrtr-server --http --port 8765
+ * The client (client.d / README) drives either.
  */
 module mrtr_server;
 
 import std.getopt : getopt;
 import std.stdio : stderr;
-import std.typecons : nullable;
+import std.typecons : nullable, Nullable;
 
-import vibe.data.json : Json;
+import vibe.data.json : Json, serializeToJson;
 
 import mcp;
 import mcp.protocol.draft : InputRequest;
-import mcp.transport : StreamableHttpOptions, runStreamableHttp;
+import mcp.protocol.sampling : CreateMessageRequest, SamplingMessage;
+import mcp.transport : StreamableHttpOptions, runStreamableHttp, runStdio;
 
-/// The fixed port the example binds, kept in one place so server.d and client.d
-/// (and the README) agree.
+/// The fixed port the example binds for HTTP, kept in one place so server.d and
+/// client.d (and the README) agree.
 enum ushort defaultPort = 8765;
 
 void main(string[] args)
 {
+	bool http;
 	ushort port = defaultPort;
 	string host = "127.0.0.1";
-	getopt(args, "port|p", "Port to listen on", &port,
-			"host|h", "Address to bind", &host);
+	getopt(args,
+			"http", "Serve over Streamable HTTP instead of stdio", &http,
+			"port|p", "Port to listen on when --http (default 8765)", &port,
+			"host|h", "Address to bind when --http (default 127.0.0.1)", &host);
 
 	auto server = new McpServer("mrtr-example", "0.1.0",
 			nullable("MRTR (multi round-trip) demo server."));
@@ -59,12 +71,40 @@ void main(string[] args)
 	// schema and argument marshalling are derived from the method signature.
 	registerHandlers(server, new MrtrApi);
 
-	StreamableHttpOptions opts;
-	opts.bindAddresses = [host];
-	() @trusted {
-		stderr.writefln("mrtr-server listening on http://%s:%d/mcp", host, port);
-	}();
-	runStreamableHttp(server, port, opts);
+	if (http)
+	{
+		StreamableHttpOptions opts;
+		opts.bindAddresses = [host];
+		() @trusted {
+			stderr.writefln("mrtr-server listening on http://%s:%d/mcp", host, port);
+		}();
+		runStreamableHttp(server, port, opts);
+	}
+	else
+	{
+		// stdio: the client spawns this process and speaks newline-delimited
+		// JSON-RPC over the pipe. Keep stdout clean for the protocol.
+		runStdio(server);
+	}
+}
+
+/// A flat struct describing the date elicitation form. `InputRequest.elicitation!T`
+/// derives its `requestedSchema` from this via `jsonSchemaOf!T`, and the client's
+/// answer decodes back into it through `ElicitResult.contentAs!MeetingDate`.
+struct MeetingDate
+{
+	string date;
+}
+
+/// The typed structured result of a completed booking. Serialized into the
+/// `CallToolResult.structuredContent` so the structured payload is inferred from
+/// a struct rather than hand-built field by field.
+struct Booking
+{
+	string topic;
+	string date;
+	string agenda;
+	int rounds;
 }
 
 /// The `book_meeting` MRTR tool, expressed as an annotated typed method: a
@@ -94,31 +134,20 @@ final class MrtrApi
 		// `topic` into the opaque requestState so we can recover it on the retry.
 		if (!haveAnswers)
 		{
-			InputRequest dateReq;
-			dateReq.id = dateId;
-			dateReq.type = "elicitation";
-			Json dateParams = Json.emptyObject;
-			dateParams["message"] = Json("On what date should we meet?");
-			Json dateSchema = Json.emptyObject;
-			dateSchema["type"] = "object";
-			Json dateSchemaProps = Json.emptyObject;
-			dateSchemaProps["date"] = Json(["type": Json("string")]);
-			dateSchema["properties"] = dateSchemaProps;
-			dateParams["requestedSchema"] = dateSchema;
-			dateReq.params = dateParams;
+			// Typed elicitation builder: the `requestedSchema` is derived from the
+			// flat `MeetingDate` struct via jsonSchemaOf!T — no hand-built schema.
+			auto dateReq = InputRequest.elicitation!MeetingDate(
+				dateId, "On what date should we meet?");
 
-			InputRequest agendaReq;
-			agendaReq.id = agendaId;
-			agendaReq.type = "sampling";
-			Json agendaParams = Json.emptyObject;
-			Json messages = Json.emptyArray;
-			Json m = Json.emptyObject;
-			m["role"] = Json("user");
-			m["content"] = Content.makeText("Draft a one-line agenda for: " ~ topic).toJson();
-			messages ~= m;
-			agendaParams["messages"] = messages;
-			agendaParams["maxTokens"] = Json(64);
-			agendaReq.params = agendaParams;
+			// Typed sampling builder: build a CreateMessageRequest from a typed
+			// SamplingMessage + Content, then hand it to InputRequest.sampling.
+			CreateMessageRequest sreq;
+			sreq.messages = [
+				SamplingMessage("user",
+					Content.makeText("Draft a one-line agenda for: " ~ topic))
+			];
+			sreq.maxTokens = Nullable!long(64);
+			auto agendaReq = InputRequest.sampling(agendaId, sreq);
 
 			// SEP-2322: the opaque, server-owned requestState. The client echoes it
 			// verbatim; we recover `topic` from it on the retry instead of trusting
@@ -134,27 +163,30 @@ final class MrtrApi
 		if (echoed.length > "topic=".length && echoed[0 .. "topic=".length] == "topic=")
 			recoveredTopic = echoed["topic=".length .. $];
 
-		// The elicitation answer is a bare ElicitResult: {action, content:{date}}.
-		auto elicit = ElicitResult.fromJson(answers[dateId]);
+		// Decode the elicitation answer as a typed ElicitResult; branch on .action
+		// and read the date through the typed MeetingDate view of its content.
+		auto elicit = ctx.inputResponseAs!ElicitResult(dateId);
 		string date = "unspecified";
-		if (elicit.content.type == Json.Type.object && "date" in elicit.content)
-			date = elicit.content["date"].get!string;
+		if (elicit.action == ElicitAction.accept)
+			date = elicit.contentAs!MeetingDate().date;
 
-		// The sampling answer is a bare CreateMessageResult: {role, content, ...}.
-		auto sample = CreateMessageResult.fromJson(answers[agendaId]);
+		// Decode the sampling answer as a typed CreateMessageResult.
+		auto sample = ctx.inputResponseAs!CreateMessageResult(agendaId);
 		const agenda = sample.content().text();
+
+		// Build the final result with typed Content + a typed structured struct.
+		Booking booking;
+		booking.topic = recoveredTopic;
+		booking.date = date;
+		booking.agenda = agenda;
+		booking.rounds = 2;
 
 		CallToolResult r;
 		r.content = [
 			Content.makeText(
 				"Booked '" ~ recoveredTopic ~ "' on " ~ date ~ ". Agenda: " ~ agenda)
 		];
-		Json structured = Json.emptyObject;
-		structured["topic"] = Json(recoveredTopic);
-		structured["date"] = Json(date);
-		structured["agenda"] = Json(agenda);
-		structured["rounds"] = Json(2);
-		r.structuredContent = structured;
+		r.structuredContent = () @trusted { return serializeToJson(booking); }();
 		return ToolResponse.complete(r);
 	}
 }

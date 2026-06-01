@@ -1,8 +1,9 @@
 # MRTR — Multi Round-Trip Requests (SEP-2322)
 
-A self-contained example of the **stateless draft input flow** in the D MCP SDK.
-It is its own dub package (a `path` dependency on the root `mcp`), so it builds
-and runs independently of the SDK's root build.
+A self-contained example of the **stateless draft input flow** in the D MCP SDK,
+running and e2e-tested over **both stdio and Streamable HTTP**. It is its own dub
+package (a `path` dependency on the root `mcp`), so it builds and runs
+independently of the SDK's root build.
 
 ## What MRTR is (and what it teaches)
 
@@ -38,51 +39,92 @@ Round 1 returns both requests and stashes the topic into `requestState`. Round 2
 reads the answers + the echoed topic and returns the confirmation (text +
 structured content).
 
-### APIs exercised
+### Typed APIs exercised (SEP-2322 / #436 / #437)
 
-- Server: `McpServer.registerDynamicTool(Tool, MrtrToolHandler)`,
-  `ToolResponse.inputRequired(requests, requestState)`,
-  `ToolResponse.complete(...)`, `RequestContext.inputResponses()`,
-  `RequestContext.requestState()`, `runStreamableHttp`.
-- Client: `McpClient.http`, `enableDraft`, `discover`, `listTools`, `callTool`
-  (which transparently drives the MRTR loop), `onElicitation`, `onSampling`,
-  `CallToolResult.isInputRequired` / `inputRequests` / `requestState`.
+The server is UDA style (`@tool` + `registerHandlers`) and builds **no hand-built
+MRTR `Json`** — it uses the typed builders and decoders throughout:
 
-## Running it (Streamable HTTP — two terminals)
+- **`InputRequest.elicitation!MeetingDate(id, message)`** — derives the
+  elicitation `requestedSchema` from the flat `MeetingDate` struct via
+  `jsonSchemaOf!T` (no hand-built schema `Json`).
+- **`InputRequest.sampling(id, CreateMessageRequest)`** — builds the sampling
+  request from a typed `CreateMessageRequest` (typed `SamplingMessage` +
+  `Content.makeText`), not a hand-built params object.
+- **`ctx.inputResponseAs!ElicitResult(id)`** and
+  **`ctx.inputResponseAs!CreateMessageResult(id)`** — decode the round-2 answers
+  as typed results; the date is read via `ElicitResult.contentAs!MeetingDate`
+  after branching on `.action`.
+- **`Content.makeText`** for the final content and a typed **`Booking`** struct
+  serialized into `structuredContent`.
 
-The transport is HTTP, so the server runs as its own process and the client
-connects to its URL.
+Client APIs: `McpClient.http` / `McpClient.stdio`, `enableDraft`, `discover`,
+`listTools`, `callTool` (which transparently drives the MRTR loop),
+`onElicitation`, `onSampling`, `CallToolResult.isInputRequired` /
+`inputRequests` / `requestState`. (Client tool **arguments** stay `Json` — the
+client is dynamic, which is acceptable.)
+
+## Running it — BOTH transports
+
+One server binary serves either transport; the same client binary drives either.
 
 ```sh
 # build both sides
 dub build -c server
 dub build -c client
+```
 
-# terminal 1: start the server (binds 127.0.0.1:8765/mcp)
-./mrtr-server --port 8765
+### stdio (default)
+
+The client spawns the built `mrtr-server` binary (with no `--http`) and speaks
+newline-delimited JSON-RPC over the pipe — no port, no second terminal:
+
+```sh
+dub run -c client            # spawns ./mrtr-server, runs the e2e; exits 0 on OK
+```
+
+### Streamable HTTP
+
+Start the server with `--http` (binds `127.0.0.1:8765/mcp` by default), then run
+the client against its URL:
+
+```sh
+# terminal 1: start the HTTP server
+dub run -c server -- --http --port 8765
 
 # terminal 2: run the client against it
-./mrtr-client http://127.0.0.1:8765/mcp
+dub run -c client -- --http http://127.0.0.1:8765/mcp ; echo "exit=$?"
 ```
 
 Or in one shell:
 
 ```sh
 dub build -c server && dub build -c client
-./mrtr-server --port 8765 &
+./mrtr-server --http --port 8765 &
 sleep 1
-./mrtr-client http://127.0.0.1:8765/mcp ; echo "exit=$?"
+./mrtr-client --http http://127.0.0.1:8765/mcp ; echo "exit=$?"
 kill %1
 ```
 
-## The client is a self-verifying e2e test
+## Auth (HTTP only)
+
+This example does not enable auth, but note that **OAuth-style authorization is an
+HTTP-only concern in MCP**: it rides on HTTP request headers / the
+`WWW-Authenticate` 401 challenge of the Streamable HTTP transport. The stdio
+transport has no such channel — a stdio server trusts its parent process — so
+there is nothing to authenticate over stdio. If you add auth to a server like
+this, gate it behind `--http`.
+
+## The client is a self-verifying e2e test (over every transport)
 
 `client.d` asserts concrete expected values and **exits non-zero on any
-mismatch**, so CI can run it as an end-to-end regression test:
+mismatch**, so CI can run it as an end-to-end regression test over both stdio and
+HTTP with the SAME assertions:
 
 - the first `book_meeting` call (no handlers) surfaces the raw
   `InputRequiredResult`; the client asserts the two `InputRequest` ids/types, the
-  elicitation message, and the opaque `requestState` (`topic=Q3 roadmap`);
+  elicitation message, the `requestedSchema` **derived from the server struct**
+  (a `date` property), the sampling `maxTokens`, and the opaque `requestState`
+  (`topic=Q3 roadmap`);
 - after installing mock `onElicitation` (returns `date=2026-06-15`) and
   `onSampling` (returns the agenda text), the second call drives the MRTR loop to
   completion; the client asserts the final text, the structured content

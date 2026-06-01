@@ -1,9 +1,11 @@
 {
 	"name": "mrtr",
-	"description": "MRTR (multi round-trip) example: stateless inputRequired/inputResponses over Streamable HTTP.",
+	"description": "MRTR (multi round-trip) example: stateless inputRequired/inputResponses over BOTH stdio and Streamable HTTP, using the typed SEP-2322 builders.",
 	"license": "Apache-2.0",
 	"dependencies": {
-		"mcp": { "path": "../.." }
+		"mcp": {
+			"path": "../.."
+		}
 	},
 	"configurations": [
 		{
