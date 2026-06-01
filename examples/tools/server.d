@@ -14,24 +14,23 @@
 ///   - `registerModule` to register module-level `@tool` free functions in one
 ///     call (no class instance required).
 ///
-/// The SAME binary speaks MCP over EITHER transport, selected at runtime:
-///   - `runStdio(server)`              (default — the deployable stdio shape);
-///   - `runStreamableHttp(server, …)`  (with `--http`, for the HTTP shape).
+/// The SAME binary speaks MCP over EITHER transport, selected at runtime by the
+/// shared `runServerFromArgs` scaffold helper (examples/common): stdio by
+/// default (the deployable shape) or Streamable HTTP under `--http` (with
+/// `--port`/`--host`).
 ///
 /// The matching `client.d` is a self-verifying e2e that drives this server over
 /// BOTH transports with the same transport-agnostic assertions.
 module tools_server;
 
-import std.getopt : getopt;
-import std.stdio : stderr;
 import std.typecons : Nullable, nullable;
+
+import examples_common : runServerFromArgs;
 
 import mcp.api.attributes;
 import mcp.api.reflection : registerModule;
 import mcp.protocol.types : CallToolResult, Content;
 import mcp.server.server : McpServer;
-import mcp.transport.stdio : runStdio;
-import mcp.transport : StreamableHttpOptions, runStreamableHttp;
 
 /// The example's default HTTP port. The client uses the same default URL, and
 /// the README documents starting the server with `--http --port 8530`.
@@ -65,14 +64,10 @@ struct CalcResult
 /// Returns a struct, so the SDK infers an outputSchema and emits
 /// `structuredContent`.
 @tool("calc", "Apply an arithmetic operation to two numbers")
-@readOnly
-@idempotent
-@hintTitle("Calculator")
-CalcResult calc(
-	@describe("the operation to apply") Op op,
-	@describe("left operand") double a,
-	@describe("right operand") double b,
-	@describe("optional rounding to N decimals") Nullable!int round) @safe
+@readOnly @idempotent @hintTitle("Calculator")
+CalcResult calc(@describe("the operation to apply") Op op, @describe("left operand") double a,
+		@describe("right operand") double b,
+		@describe("optional rounding to N decimals") Nullable!int round)@safe
 {
 	double r;
 	final switch (op)
@@ -100,8 +95,7 @@ CalcResult calc(
 /// A tool taking a struct argument and returning a scalar. Scalar returns are
 /// wrapped under a `result` key in structuredContent.
 @tool("magnitude", "Euclidean length of a 2D vector")
-@readOnly
-double magnitude(@describe("the vector") Vec2 v) @safe
+@readOnly double magnitude(@describe("the vector") Vec2 v)@safe
 {
 	import std.math : sqrt;
 
@@ -110,8 +104,7 @@ double magnitude(@describe("the vector") Vec2 v) @safe
 
 /// A string-returning tool — produces plain text content, no structuredContent.
 @tool("greet", "Greet someone by name")
-@readOnly
-string greet(@describe("who to greet") string name) @safe
+@readOnly string greet(@describe("who to greet") string name)@safe
 {
 	return "Hello, " ~ name ~ "!";
 }
@@ -119,8 +112,7 @@ string greet(@describe("who to greet") string name) @safe
 /// A `@destructive` tool — its presence sets `destructiveHint:true`. The body is
 /// a no-op stand-in for a real side effect; it just confirms the request.
 @tool("erase", "Erase a record by id (destructive)")
-@destructive
-string erase(@describe("record id") string id) @safe
+@destructive string erase(@describe("record id") string id)@safe
 {
 	return "erased " ~ id;
 }
@@ -130,8 +122,7 @@ string erase(@describe("record id") string id) @safe
 /// `Content.makeResourceLink` for a pointer to a related resource. This shows
 /// building multi-block tool content WITHOUT hand-writing any content Json.
 @tool("describe_doc", "Return a text note plus a resource link for a document id")
-@readOnly
-CallToolResult describeDoc(@describe("document id") string id) @safe
+@readOnly CallToolResult describeDoc(@describe("document id") string id)@safe
 {
 	CallToolResult r;
 	r.content = [
@@ -141,33 +132,13 @@ CallToolResult describeDoc(@describe("document id") string id) @safe
 	return r;
 }
 
-void main(string[] args)
+void main(string[] args) @safe
 {
-	bool http;
-	ushort port = DefaultPort;
-	string host = "127.0.0.1";
-	getopt(args,
-		"http", "Serve over Streamable HTTP instead of stdio", &http,
-		"port|p", "HTTP port to listen on (default 8530)", &port,
-		"host|h", "HTTP address to bind (default 127.0.0.1)", &host);
-
 	auto server = new McpServer("tools-example", "1.0.0");
 	// Register every @tool free function in this module in one call.
 	registerModule!(tools_server)(server);
 
-	if (http)
-	{
-		StreamableHttpOptions opts;
-		opts.bindAddresses = [host];
-		() @trusted {
-			stderr.writefln("tools-server listening on http://%s:%d/mcp", host, port);
-		}();
-		runStreamableHttp(server, port, opts);
-	}
-	else
-	{
-		// stdio is the default deployable shape; the client spawns this binary
-		// without --http and drives it over stdin/stdout.
-		runStdio(server);
-	}
+	// The shared scaffold picks the transport from argv: stdio by default, or
+	// Streamable HTTP under `--http` on `--port`/`--host` (default 8530).
+	runServerFromArgs(server, args, DefaultPort);
 }

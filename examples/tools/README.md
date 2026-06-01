@@ -10,6 +10,8 @@ selected at runtime, and the single client binary is a **self-verifying e2e
 test** that drives the server over **both** transports with the same
 transport-agnostic assertions.
 
+Both sides build on the shared **examples/common** scaffold (`examples-common`): the server's transport selection is the scaffold's `runServerFromArgs`, and the client uses `runClient` + `connectFromArgs` (which spawns the sibling `tools-server` over stdio via `McpClient.spawnSibling`, or connects to `--http <url>`) plus the shared `check`/`checkEq` assertion helpers.
+
 ## What it teaches
 
 **Server side (`server.d`)** — declaring tools with the `@tool` reflection API
@@ -33,8 +35,9 @@ transport-agnostic assertions.
 - **`@describe`** to document individual arguments.
 - **`registerModule!(thisModule)(server)`** to register every module-level
   `@tool` free function in one call (no class instance required).
-- **Transport selection** via `std.getopt`: `--http` switches the same server
-  from `runStdio` to `runStreamableHttp` (with `--port`/`--host`).
+- **Transport selection** via the shared `runServerFromArgs` scaffold helper:
+  `--http` switches the same server from `runStdio` to `runStreamableHttp`
+  (with `--port`/`--host`).
 
 **Client side (`client.d`)** — a **self-verifying end-to-end test** that works
 over either transport. It asserts concrete expected values:
@@ -67,8 +70,8 @@ regression test over every supported transport.
 
 ## Running it
 
-Build both configurations first (the client looks for the `tools-server` binary
-next to its own executable when running over stdio):
+Build both configurations first (over stdio the client spawns the sibling
+`tools-server` binary next to its own executable via `McpClient.spawnSibling`):
 
 ```sh
 # from this directory (examples/tools)
