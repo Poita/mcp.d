@@ -1,16 +1,20 @@
 /**
  * examples/sampling — client.d (self-verifying e2e test, dual-transport)
  *
- * Exercises MCP **Sampling** from the consumer's eye view over EITHER transport:
+ * Exercises MCP **Sampling** from the consumer's eye view over EITHER transport,
+ * selected by the shared `examples/common` scaffold's `connectFromArgs`:
  *
- *   - STDIO (default): spawns the built `sampling-server` binary (no `--http`)
- *     and drives it over the bidirectional stdio channel.
+ *   - STDIO (default): spawns the sibling `sampling-server` binary (no `--http`)
+ *     via `McpClient.spawnSibling` and drives it over the bidirectional stdio
+ *     channel.
  *   - HTTP (`--http <url>`): connects to a running `sampling-server --http`
  *     instance via `McpClient.http(url)`.
  *
- * It is NOT just a demo: every observation is asserted against the value the
- * mock model produced, and the process exits NON-ZERO on any mismatch, so CI can
- * run it as an end-to-end regression test over each transport.
+ * It is NOT just a demo: every observation is asserted (with the scaffold's
+ * `check`) against the value the mock model produced, and the process exits
+ * NON-ZERO on any mismatch, so CI can run it as an end-to-end regression test
+ * over each transport. The event-loop wiring that lets the SAME scenario work
+ * over both transports is provided by the scaffold's `runClient`.
  *
  * The client installs an `onSampling` handler — a DETERMINISTIC mock "model".
  * When the server calls `ctx.sample(...)` the SDK routes the
@@ -37,10 +41,9 @@ module sampling_client;
 
 import std.algorithm : canFind, map;
 import std.array : array;
-import std.getopt : getopt;
-import std.stdio : stderr, writeln;
 
 import mcp;
+import examples_common : check, runClient, connectFromArgs;
 
 /// The fixed identifier our mock "model" reports. The server echoes this back in
 /// its structured result, so the client can assert it round-tripped.
@@ -75,56 +78,27 @@ struct ModelResult
 	string model;
 }
 
-int main(string[] args)
+int main(string[] args) @safe
 {
-	string url; // empty => stdio
-	getopt(args, "http", "Connect over Streamable HTTP to this URL instead of spawning over stdio", &url);
-
-	if (url.length)
-	{
-		// HTTP: sampling is a server->client request mid-tool-call, so the client
-		// must run an event loop to dispatch the inbound sampling/createMessage.
-		import vibe.core.core : runTask, runEventLoop, exitEventLoop;
-
-		int rc;
-		runTask(() nothrow{
-			scope (exit)
-				exitEventLoop();
-			try
-				rc = run(McpClient.http(url));
-			catch (Throwable t) // AssertError + exceptions both fail the e2e
-			{
-				logFail(t.msg);
-				rc = 1;
-			}
-		});
-		runEventLoop();
-		return rc;
-	}
-
-	// STDIO: spawn the built server binary (no --http) and drive it synchronously.
-	// `McpClient.spawn` owns the subprocess pipes and its `close()` runs the MCP
-	// stdio shutdown sequence (SIGTERM->SIGKILL). Server->client sampling replies
-	// are written inline on the same channel, so no event loop is required (same
-	// model as examples/tools/client.d).
-	try
-		return run(McpClient.spawn([serverBinaryPath()]));
-	catch (Throwable t)
-	{
-		logFail(t.msg);
-		return 1;
-	}
+	// Scaffold `runClient` drives the vibe event loop uniformly so the SAME
+	// scenario body works over BOTH a spawned-sibling stdio transport and an HTTP
+	// transport (sampling is a server->client request mid-tool-call, so even the
+	// stdio path needs the loop to dispatch the inbound sampling/createMessage).
+	return runClient(() @safe {
+		// Transport from argv: `--http <url>` -> HTTP, else spawn the sibling
+		// `sampling-server` binary over stdio. Returned client is not initialized.
+		auto client = connectFromArgs(args, "sampling-server");
+		scope (exit)
+			client.close();
+		return run(client);
+	});
 }
 
 /// Transport-agnostic e2e: drives `client` and asserts the mocked sampling value
 /// flows server→client→server. The assertions never look at the transport, so the
-/// SAME run() verifies both. For stdio, `client.close()` runs the MCP stdio
-/// shutdown sequence on the spawned subprocess; for HTTP it stops background streams.
+/// SAME run() verifies both.
 private int run(McpClient client) @safe
 {
-	scope (exit)
-		client.close();
-
 	// --- the mock model -----------------------------------------------------
 	// Records what it was asked and answers deterministically. Captured by
 	// reference so post-call assertions can inspect what the server requested.
@@ -168,9 +142,8 @@ private int run(McpClient client) @safe
 	// Typed structured output (#464): decode the whole result in one step instead
 	// of reading `structuredContent["x"].get!...` field by field.
 	auto summary = sres.structuredContentAs!SummaryResult;
-	check(summary.summary == fixedSummary,
-			"summarize.summary should be the mock model's reply '" ~ fixedSummary
-			~ "', got '" ~ summary.summary ~ "'");
+	check(summary.summary == fixedSummary, "summarize.summary should be the mock model's reply '"
+			~ fixedSummary ~ "', got '" ~ summary.summary ~ "'");
 	check(summary.model == mockModelId,
 			"summarize.model should be '" ~ mockModelId ~ "', got '" ~ summary.model ~ "'");
 	check(summary.stopReason == "endTurn",
@@ -195,34 +168,9 @@ private int run(McpClient client) @safe
 	return 0;
 }
 
-/// Assertion helper: throws (failing the e2e with a clear message) when `cond`
-/// is false.
-private void check(bool cond, lazy string msg) @safe
-{
-	if (!cond)
-		throw new Exception(msg);
-}
-
-/// Absolute path to the `sampling-server` binary, resolved next to this client
-/// binary (dub writes both into the package root), independent of cwd.
-private string serverBinaryPath() @safe
-{
-	import std.file : thisExePath;
-	import std.path : dirName, buildPath;
-
-	return buildPath(dirName(thisExePath()), "sampling-server");
-}
-
 private void logOk(string msg) @trusted
 {
-	writeln("OK: ", msg);
-}
+	import std.stdio : writeln;
 
-private void logFail(string msg) @trusted nothrow
-{
-	try
-		stderr.writeln("FAIL: ", msg);
-	catch (Exception)
-	{
-	}
+	writeln("OK: ", msg);
 }
