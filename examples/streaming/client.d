@@ -2,12 +2,17 @@
  * examples/streaming — client.d (self-verifying e2e test, dual-transport)
  *
  * One self-verifying client that exercises the streaming server over EITHER
- * transport, selected at runtime:
+ * transport, selected at runtime by the shared `examples/common` scaffold:
  *
- *   - STDIO (default): spawn the built `streaming-server` binary (no `--http`)
- *     via `McpClient.spawn`, talking to it over its stdin/stdout.
- *   - HTTP (`--http <url>`): connect to an already-running server with
- *     `McpClient.http(url)`.
+ *   - STDIO (default): `connectFromArgs` spawns the sibling `streaming-server`
+ *     binary (no `--http`) via `McpClient.spawnSibling`, talking to it over its
+ *     stdin/stdout.
+ *   - HTTP (`--http <url>` / `--url <url>`): connect to an already-running server
+ *     with `McpClient.http(url)`.
+ *
+ * The event-loop wiring (runTask / runEventLoop / catch->rc) is provided by the
+ * scaffold's `runClient`, and the assertion helper `check` is the scaffold's —
+ * this file no longer hand-rolls either.
  *
  * Every observation is asserted against the value the server promises; the
  * process exits NON-ZERO on any mismatch, so CI can run it as an e2e regression
@@ -21,14 +26,15 @@
  * while a `callTool` is in flight — not an SDK limitation.
  *
  * Typed/ergonomic SDK APIs adopted here:
+ *   - per-call progress sink: `callTool(name, args, onProgress)` (#494) delivers
+ *     THIS call's progress to a local callback, replacing a global
+ *     `client.onProgress` + manual token correlation.
  *   - `result.structuredContentAs!T` decodes structured output into a struct
  *     instead of field-by-field raw-Json reads (#464).
  *   - typed `callTool(name, T args)` passes a struct for the static-shape calls
  *     (#468).
  *   - `ElicitResult.accept(T)` / `CreateMessageResult.text(model, text)` build
  *     the mocked client replies from typed values (#466/#467).
- *   - `ProgressNotification.matches` / `.progressTokenString` replace raw token
- *     type inspection (#469).
  *   - Installing `onElicitation` alone advertises elicitation; the inbound gate
  *     honours `effectiveCapabilities()` (#463), so no redundant raw flag-set.
  *
@@ -36,10 +42,10 @@
  *   A. LIST + PROGRESS + LOGGING (transport-agnostic)
  *      - `listTools()` contains `countdown`, `summarize`, `cancel_stats`, and
  *        `countdown` declares its output schema.
- *      - A `countdown` call carrying a progressToken streams EXACTLY N
- *        `notifications/progress` (monotonically increasing, echoing the token,
- *        last == total) AND N `notifications/message` (level=info, logger=
- *        "countdown") BEFORE the final result `{completed:N, total:N,
+ *      - A `countdown` call with a per-call progress sink streams EXACTLY N
+ *        `notifications/progress` (monotonically increasing, last == total,
+ *        carrying a progress token) AND N `notifications/message` (level=info,
+ *        logger="countdown") BEFORE the final result `{completed:N, total:N,
  *        cancelled:false}`.
  *   B. TYPED ELICITATION + SAMPLING round-trip (transport-agnostic)
  *      - `summarize` opens a blocking server->client elicitation; the client's
@@ -61,9 +67,8 @@ import std.algorithm : map, canFind;
 import std.array : array;
 import std.conv : to;
 import std.getopt : getopt;
-import std.stdio : stderr, writeln;
 
-import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+import vibe.core.core : runTask, sleep;
 import vibe.data.json : Json;
 
 import mcp;
@@ -71,6 +76,8 @@ import mcp.client.client : McpClient;
 import mcp.protocol.errors : ErrorCode, McpException;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.types : ElicitParams, ElicitResult;
+
+import examples_common : check, runClient, connectFromArgs;
 
 // Mocked sampling reply the client returns to the server's `summarize` tool, and
 // the elicited values it accepts. These are the contract: the structured result
@@ -126,99 +133,75 @@ struct Confirm
 	string tone;
 }
 
-int main(string[] args)
+int main(string[] args) @safe
 {
+	// Detect the HTTP URL (if any) up front: phase D (mid-flight cancellation) is
+	// HTTP-only and needs to open its OWN draft-mode client to the same URL. The
+	// transport for phases A/B/C is chosen by the scaffold's `connectFromArgs`.
 	string httpUrl;
-	getopt(args, "http", "Connect over Streamable HTTP to this MCP endpoint "
-			~ "(e.g. http://127.0.0.1:9357/mcp); omit to spawn the server over stdio", &httpUrl);
+	(() @trusted {
+		getopt(args, "http", "Connect over Streamable HTTP to this MCP endpoint.",
+			&httpUrl, "url", "Alias for --http.", &httpUrl);
+	})();
 	const bool useHttp = httpUrl.length != 0;
 
-	int rc;
-	runTask(() nothrow{
-		scope (exit)
-			exitEventLoop();
-		try
-			rc = run(useHttp, httpUrl);
-		catch (Throwable t) // AssertError and exceptions both fail the e2e
-		{
-			try
-				stderr.writeln("FAIL: ", t.msg);
-			catch (Exception)
-			{
-			}
-			rc = 1;
-		}
-	});
-	runEventLoop();
-	return rc;
+	// `runClient` drives the vibe event loop so the same scenario body works over
+	// both the synchronous stdio (spawnSibling) transport and the HTTP transport.
+	return runClient(() @safe => run(args, useHttp, httpUrl));
 }
 
-private int run(bool useHttp, string url) @safe
+private int run(string[] args, bool useHttp, string httpUrl) @safe
 {
 	enum int steps = 5;
 
-	if (useHttp)
-	{
-		// HTTP: each phase opens a fresh client to the running server's URL.
-		const int progressSeen = phaseListProgressLogging(() => httpClient(url), steps);
-		phaseTypedElicitSampling(() => httpClient(url));
-		phaseErrorCode(() => httpClient(url));
-
-		// Phase D — mid-flight cancellation, HTTP-only.
-		const int cancelledBefore = readCancelCount(() => httpClient(url));
-		phaseCancellation(url);
-		const int cancelledAfter = readCancelCount(() => httpClient(url));
-		check(cancelledAfter >= cancelledBefore + 1,
-				"server's cancel_stats must increase after a mid-flight cancellation (before="
-				~ cancelledBefore.to!string ~ ", after=" ~ cancelledAfter.to!string ~ ")");
-
-		() @trusted {
-			writeln("OK [http]: countdown streamed ", progressSeen, " progress + ", progressSeen,
-					" log msgs; typed elicit+sample round-trip verified; unknown-tool error code; ",
-					"mid-flight cancel honored (cancel_stats ", cancelledBefore, " -> ",
-					cancelledAfter, ").");
-		}();
-		return 0;
-	}
-
-	// STDIO: spawn ONE server process and reuse ONE initialized client across the
-	// transport-agnostic phases (the stdio server serves a single connection).
-	// `McpClient.spawn` owns the subprocess; its `close()` runs the SIGTERM->SIGKILL
-	// stdio shutdown sequence. Handlers are installed BEFORE initialize so the
+	// One connection for the transport-agnostic phases. `connectFromArgs` picks
+	// HTTP (when --http/--url is given) or spawns the sibling `streaming-server`
+	// over stdio. Handlers are installed BEFORE initialize so the
 	// `sampling`/`elicitation` capabilities are advertised at the handshake.
-	auto client = McpClient.spawn([serverBinaryPath()]);
+	auto client = connectFromArgs(args, "streaming-server");
 	scope (exit)
 		client.close();
 	installMockHandlers(client);
 	client.initialize();
 	client.setLogLevel("debug");
 
-	const int progressSeen = phaseListProgressLogging(() => client, steps, /*alreadyInit=*/ true);
-	phaseTypedElicitSampling(() => client, /*alreadyInit=*/ true);
-	phaseErrorCode(() => client, /*alreadyInit=*/ true);
+	const int progressSeen = phaseListProgressLogging(client, steps);
+	phaseTypedElicitSampling(client);
+	phaseErrorCode(client);
 
-	() @trusted {
-		writeln("OK [stdio]: countdown streamed ", progressSeen, " progress + ", progressSeen,
-				" log msgs; typed elicit+sample round-trip verified; unknown-tool error code. ",
-				"(phase D not run here: this client cannot inject notifications/cancelled "
-				~ "mid-callTool; the SDK server honours it over stdio — see serveStdio's unittest.)");
-	}();
+	if (useHttp)
+	{
+		// Phase D — mid-flight cancellation, HTTP-only (disconnect is the signal).
+		const int cancelledBefore = readCancelCount(httpUrl);
+		phaseCancellation(httpUrl);
+		const int cancelledAfter = readCancelCount(httpUrl);
+		check(cancelledAfter >= cancelledBefore + 1,
+				"server's cancel_stats must increase after a mid-flight cancellation (before="
+				~ cancelledBefore.to!string ~ ", after=" ~ cancelledAfter.to!string ~ ")");
+
+		report("OK [http]: countdown streamed " ~ progressSeen.to!string ~ " progress + "
+				~ progressSeen.to!string ~ " log msgs; typed elicit+sample round-trip verified; "
+				~ "unknown-tool error code; mid-flight cancel honored (cancel_stats "
+				~ cancelledBefore.to!string ~ " -> " ~ cancelledAfter.to!string ~ ").");
+		return 0;
+	}
+
+	report("OK [stdio]: countdown streamed " ~ progressSeen.to!string ~ " progress + "
+			~ progressSeen.to!string ~ " log msgs; typed elicit+sample round-trip verified; "
+			~ "unknown-tool error code. (phase D not run here: this client cannot inject "
+			~ "notifications/cancelled mid-callTool; the SDK server honours it over stdio "
+			~ "— see serveStdio's unittest.)");
 	return 0;
 }
 
-// --- transport factories -----------------------------------------------------
-
-/// An HTTP client pinned to the released protocol (progress + logging + blocking
-/// elicitation are all available there), with the mocked input handlers wired
-/// BEFORE initialize so `sampling`/`elicitation` are advertised at the handshake.
-private McpClient httpClient(string url) @safe
+private void report(string msg) @trusted
 {
-	auto client = McpClient.http(url);
-	installMockHandlers(client);
-	client.initialize();
-	client.setLogLevel("debug");
-	return client;
+	import std.stdio : writeln;
+
+	writeln(msg);
 }
+
+// --- mocked client-side input handlers ---------------------------------------
 
 /// Install the mocked client-side input handlers. Installing them is sufficient:
 /// the handlers auto-advertise the `sampling` / `elicitation` capabilities at
@@ -238,14 +221,8 @@ private void installMockHandlers(McpClient client) @safe
 
 // --- Phase A: list + progress + logging (transport-agnostic) -----------------
 
-private int phaseListProgressLogging(scope McpClient delegate() @safe open,
-		int steps, bool alreadyInit = false) @safe
+private int phaseListProgressLogging(McpClient client, int steps) @safe
 {
-	auto client = open();
-	scope (exit)
-		if (!alreadyInit)
-			client.close();
-
 	auto tools = client.listTools().tools;
 	auto names = tools.map!(t => t.name).array;
 	foreach (want; ["countdown", "summarize", "cancel_stats"])
@@ -263,16 +240,18 @@ private int phaseListProgressLogging(scope McpClient delegate() @safe open,
 
 	ProgressUpdate[] progress;
 	LogEntry[] logs;
-	const token = ProgressToken("count-1");
-	client.onProgress = (ProgressNotification n) @safe {
-		progress ~= ProgressUpdate(n.progress, n.total.isNull ? -1 : n.total.get,
-				n.matches(token), n.progressTokenString);
-	};
 	client.onLogMessage = (LogMessageNotification n) @safe {
 		logs ~= LogEntry(n.level, n.logger.isNull ? "" : n.logger.get);
 	};
 
-	auto result = client.callTool("countdown", CountdownArgs(steps, 20), token);
+	// Per-call progress sink (#494): the SDK mints a unique progressToken for THIS
+	// call and routes only its progress notifications to this callback for the
+	// duration of the call — no global client.onProgress + manual token matching.
+	auto result = client.callTool("countdown", CountdownArgs(steps, 20),
+			(ProgressNotification n) @safe {
+		progress ~= ProgressUpdate(n.progress, n.total.isNull
+			? -1 : n.total.get, n.progressTokenString);
+	});
 
 	// Final structured result, decoded into the typed CountdownResult (#464).
 	check(result.structuredContent.type == Json.Type.object, "result must carry structuredContent");
@@ -282,17 +261,19 @@ private int phaseListProgressLogging(scope McpClient delegate() @safe open,
 	check(cr.total == steps, "total should be " ~ steps.to!string);
 	check(cr.cancelled == false, "cancelled should be false on a full run");
 
-	// Exactly `steps` progress notifications, increasing, echoing the token, last == total.
+	// Exactly `steps` progress notifications, increasing, last == total. The
+	// per-call sink only ever sees THIS call's progress, so a non-empty token
+	// string is enough to prove each notification carried the minted token.
 	check(progress.length == steps,
-			"expected " ~ steps.to!string ~ " progress notifications, got " ~ progress.length.to!string);
+			"expected " ~ steps.to!string ~ " progress notifications, got "
+			~ progress.length.to!string);
 	foreach (i, p; progress)
 	{
 		check(p.value == cast(double)(i + 1),
-				"progress[" ~ i.to!string ~ "].value should be " ~ (i + 1).to!string
-				~ ", got " ~ p.value.to!string);
+				"progress[" ~ i.to!string ~ "].value should be " ~ (i + 1)
+					.to!string ~ ", got " ~ p.value.to!string);
 		check(p.total == cast(double) steps, "progress total should be " ~ steps.to!string);
-		check(p.matchesToken, "progress must echo the request's progressToken 'count-1'");
-		check(p.token == "count-1", "progress token string should be 'count-1', got " ~ p.token);
+		check(p.token.length != 0, "progress must carry the call's progressToken");
 		if (i > 0)
 			check(p.value > progress[i - 1].value, "progress MUST strictly increase");
 	}
@@ -311,41 +292,27 @@ private int phaseListProgressLogging(scope McpClient delegate() @safe open,
 
 // --- Phase B: typed elicitation + sampling round-trip (transport-agnostic) ----
 
-private void phaseTypedElicitSampling(scope McpClient delegate() @safe open,
-		bool alreadyInit = false) @safe
+private void phaseTypedElicitSampling(McpClient client) @safe
 {
-	auto client = open();
-	scope (exit)
-		if (!alreadyInit)
-			client.close();
-
 	auto r = client.callTool("summarize",
 			SummarizeArgs("The quick brown fox jumps over the lazy dog."));
 	check(!r.isError, "summarize should not be an error");
 	check(r.structuredContent.type == Json.Type.object, "summarize must return structuredContent");
 	const sc = r.structuredContentAs!SummaryResult;
-	check(sc.status == "summarized",
-			"summarize status should be 'summarized', got " ~ sc.status);
+	check(sc.status == "summarized", "summarize status should be 'summarized', got " ~ sc.status);
 	check(sc.tone == ElicitedTone,
 			"summarize tone should echo the elicited '" ~ ElicitedTone ~ "', got " ~ sc.tone);
 	check(sc.model == MockedModel,
-			"summarize model should echo the mocked sampling model '" ~ MockedModel
-			~ "', got " ~ sc.model);
-	check(sc.summary == MockedSummary,
-			"summarize summary should echo the mocked sampling text '" ~ MockedSummary
-			~ "', got " ~ sc.summary);
+			"summarize model should echo the mocked sampling model '"
+			~ MockedModel ~ "', got " ~ sc.model);
+	check(sc.summary == MockedSummary, "summarize summary should echo the mocked sampling text '"
+			~ MockedSummary ~ "', got " ~ sc.summary);
 }
 
 // --- Phase C: error code (transport-agnostic) --------------------------------
 
-private void phaseErrorCode(scope McpClient delegate() @safe open,
-		bool alreadyInit = false) @safe
+private void phaseErrorCode(McpClient client) @safe
 {
-	auto client = open();
-	scope (exit)
-		if (!alreadyInit)
-			client.close();
-
 	int code;
 	bool threw;
 	try
@@ -373,13 +340,14 @@ private void phaseCancellation(string url) @trusted
 
 	bool sawFirstProgress = false;
 	bool callEnded = false;
-	client.onProgress = (ProgressNotification) @safe { sawFirstProgress = true; };
 
-	// Run the long call on its own task; we will close the stream from here.
+	// Run the long call on its own task; we will close the stream from here. The
+	// per-call progress sink (#494) signals when the call is in flight.
 	enum int longSteps = 50;
 	auto callTask = runTask(() nothrow{
 		try
-			client.callTool("countdown", CountdownArgs(longSteps, 40), ProgressToken("cancel-1"));
+			client.callTool("countdown", CountdownArgs(longSteps, 40),
+				(ProgressNotification) @safe { sawFirstProgress = true; });
 		catch (Throwable)
 		{
 			// Closing the stream aborts the in-flight read: the call ends abnormally.
@@ -410,35 +378,24 @@ private void phaseCancellation(string url) @trusted
 
 // --- Phase C/D helpers: read the server-side cancel counter -------------------
 
-private int readCancelCount(scope McpClient delegate() @safe open) @safe
+private int readCancelCount(string url) @safe
 {
-	auto client = open();
+	auto client = McpClient.http(url);
 	scope (exit)
 		client.close();
+	client.initialize();
 	auto r = client.callTool("cancel_stats");
-	check(r.structuredContent.type == Json.Type.object, "cancel_stats must return structuredContent");
+	check(r.structuredContent.type == Json.Type.object,
+			"cancel_stats must return structuredContent");
 	return r.structuredContentAs!CancelStats.cancelled;
 }
 
-// --- server binary resolution ------------------------------------------------
-
-/// Absolute path to the `streaming-server` binary, resolved next to this client
-/// binary (dub writes both into the package root).
-private string serverBinaryPath() @safe
-{
-	import std.file : thisExePath;
-	import std.path : dirName, buildPath;
-
-	return buildPath(dirName(thisExePath()), "streaming-server");
-}
-
-// --- small value types + helpers ---------------------------------------------
+// --- small value types --------------------------------------------------------
 
 private struct ProgressUpdate
 {
 	double value;
 	double total;
-	bool matchesToken;
 	string token;
 }
 
@@ -446,12 +403,4 @@ private struct LogEntry
 {
 	string level;
 	string logger;
-}
-
-/// Assertion helper: throws (failing the e2e with a clear message) when `cond`
-/// is false.
-private void check(bool cond, string msg) @safe
-{
-	if (!cond)
-		throw new Exception(msg);
 }
