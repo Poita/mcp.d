@@ -299,25 +299,27 @@ final class StdioClientTransport : ClientTransport
 /// stdio shutdown sequence. Used by `McpClient.spawn`.
 StdioClientTransport spawnStdioTransport(string[] args) @safe
 {
-	import std.process : pipeProcess, Redirect;
+	import std.process : pipeProcess, ProcessPipes, Redirect;
 	import std.string : stripRight;
 
-	// Redirect stdin and stdout (frame the JSON-RPC channel); leave stderr
-	// attached to ours so the server's logging is visible.
-	auto pipes = () @trusted {
-		return pipeProcess(args, Redirect.stdin | Redirect.stdout);
-	}();
+	// Heap-box the pipes so the read/write closures capture a stable, long-lived
+	// handle. A stack-local `ProcessPipes` would be destructed when this function
+	// returns — refcounting its `File` members to zero and CLOSING the underlying
+	// stdin/stdout — leaving the closures reading a dead channel (the subprocess
+	// would appear to hang or EOF immediately). `attachProcess` keeps its own copy
+	// for the shutdown sequence; both share the same FD via File refcounting.
+	auto pipes = () @trusted { return new ProcessPipes; }();
+	() @trusted { *pipes = pipeProcess(args, Redirect.stdin | Redirect.stdout); }();
 
 	auto transport = new StdioClientTransport(() @trusted {
-		auto f = pipes.stdout;
-		if (f.eof)
+		if (pipes.stdout.eof)
 			return cast(string) null;
-		auto ln = f.readln();
-		if (ln.length == 0 && f.eof)
+		auto ln = pipes.stdout.readln();
+		if (ln.length == 0 && pipes.stdout.eof)
 			return cast(string) null;
 		return ln.stripRight("\r\n");
 	}, (string s) @trusted { pipes.stdin.writeln(s); pipes.stdin.flush(); });
-	transport.attachProcess(pipes);
+	transport.attachProcess(*pipes);
 	return transport;
 }
 
@@ -622,4 +624,24 @@ version (Posix) unittest  // close() returns the child's clean exit status when 
 
 	auto status = transport.closeProcess(5.seconds, 5.seconds);
 	assert(status == 0);
+}
+
+version (Posix) unittest  // spawned transport round-trips a request/response AFTER spawnStdioTransport returned
+{
+	import core.time : seconds;
+
+	// Regression for the dangling-pipes bug: the read/write closures must keep
+	// the subprocess pipes alive past spawnStdioTransport's return. A trivial
+	// "server": read one request line, reply with a response correlated to id 1.
+	// With the previous stack-local pipes this read a closed channel and hung/EOF'd.
+	auto transport = spawnStdioTransport([
+		"sh", "-c",
+		`read line; printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'`
+	]);
+
+	Json req = parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+	auto result = transport.deliver(req, 1);
+	assert(result["ok"].get!bool == true);
+
+	transport.closeProcess(5.seconds, 5.seconds);
 }
