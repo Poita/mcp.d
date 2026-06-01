@@ -55,7 +55,8 @@ import vibe.http.common : HTTPMethod;
 import vibe.stream.operations : readAllUTF8;
 
 import mcp;
-import mcp.auth : signEs256, base64UrlNoPad;
+import mcp.auth : signEs256, base64UrlNoPad, parseWwwAuthenticate, WwwAuthenticate,
+	OAuthClient, ProtectedResourceMetadata;
 
 /// The PKCS#8 EC P-256 private key matching server.d's pinned PublicKeyPem.
 /// In a real system this lives in the authorization server, never the client.
@@ -66,6 +67,16 @@ enum PrivateKeyPem = "-----BEGIN PRIVATE KEY-----\n"
 	~ "-----END PRIVATE KEY-----\n";
 
 enum Issuer = "https://auth.example.com";
+
+/// Mirrors the server's `WhoamiResult` structured output. Decoding the
+/// `whoami` tool result with `CallToolResult.structuredContentAs!WhoamiResult`
+/// (SDK #464) yields this typed value, so the client asserts on real fields
+/// instead of poking at raw `structuredContent["..."]` Json.
+struct WhoamiResult
+{
+	string subject;
+	string[] scopes;
+}
 
 string serverUrl;
 string baseOrigin;
@@ -145,6 +156,26 @@ void check(bool cond, string what) @safe
 int run()
 {
 	// ---- 1. First contact with no token: 401 + WWW-Authenticate challenge ----
+	//
+	// HIGH-LEVEL PASS (SDK #471): drive first contact through the real OAuth
+	// client surface. `OAuthClient.probeUnauthorized` POSTs an unauthenticated
+	// initialize and hands back the `WWW-Authenticate` header; `parseWwwAuthenticate`
+	// turns it into a typed `WwwAuthenticate{scheme, resourceMetadata, scope_}`.
+	{
+		auto oauth = new OAuthClient;
+		oauth.resource = serverUrl;
+		const wwwAuth = oauth.probeUnauthorized(serverUrl);
+		check(wwwAuth.length > 0, "probeUnauthorized should surface a challenge header");
+		const WwwAuthenticate w = parseWwwAuthenticate(wwwAuth);
+		check(w.scheme == "Bearer", "challenge scheme should be Bearer, got " ~ w.scheme);
+		check(w.resourceMetadata.length > 0,
+				"challenge should carry resource_metadata: " ~ wwwAuth);
+		check(w.scope_ == "mcp:read",
+				"challenge scope hint should be mcp:read, got " ~ w.scope_);
+	}
+
+	// LOW-LEVEL PASS: assert the wire shape of the 401 challenge directly, so the
+	// example still pins the exact header substrings the transport emits.
 	{
 		int status;
 		string wwwAuth;
@@ -168,6 +199,26 @@ int run()
 	}
 
 	// ---- 2. The Protected Resource Metadata document (RFC 9728) ----
+	//
+	// HIGH-LEVEL PASS (SDK #471): `OAuthClient.discoverProtectedResource` follows
+	// the `resource_metadata` URL from the challenge (or the well-known fallbacks)
+	// and returns a typed `ProtectedResourceMetadata`, so we assert on its fields
+	// rather than re-parsing the JSON document by hand.
+	{
+		auto oauth = new OAuthClient;
+		oauth.resource = serverUrl;
+		const wwwAuth = oauth.probeUnauthorized(serverUrl);
+		const ProtectedResourceMetadata prm =
+			oauth.discoverProtectedResource(serverUrl, wwwAuth);
+		check(prm.resource == serverUrl, "PRM resource mismatch: " ~ prm.resource);
+		check(prm.authorizationServers.length >= 1 && prm.authorizationServers[0] == Issuer,
+				"PRM authorization_servers mismatch");
+		check(prm.scopesSupported == ["mcp:read", "mcp:write"],
+				"PRM scopes_supported mismatch");
+	}
+
+	// LOW-LEVEL PASS: fetch the well-known document directly and assert its raw
+	// wire shape, pinning what the transport publishes at the PRM URL.
 	{
 		int status;
 		string body_;
@@ -212,14 +263,14 @@ int run()
 
 		auto who = client.callTool("whoami", Json.emptyObject);
 		check(!isToolError(who), "whoami should not be a tool error");
-		// `whoami` returns the typed WhoamiResult struct on the server, so the
-		// SDK infers structuredContent {subject, scopes} for us — assert it.
-		check(who.structuredContent["subject"].get!string == "user-42",
-				"whoami structuredContent.subject mismatch");
-		auto sc = who.structuredContent["scopes"];
-		check(sc.length == 2 && sc[0].get!string == "mcp:read"
-				&& sc[1].get!string == "mcp:write",
-				"whoami structuredContent.scopes mismatch: " ~ sc.toString());
+		// `whoami` returns the typed WhoamiResult struct on the server, so the SDK
+		// infers structuredContent for us. Decode it back into a typed struct with
+		// `structuredContentAs!WhoamiResult` (SDK #464) and assert on real fields
+		// instead of reading raw structuredContent["..."] Json.
+		const WhoamiResult info = who.structuredContentAs!WhoamiResult;
+		check(info.subject == "user-42", "whoami subject mismatch: " ~ info.subject);
+		check(info.scopes == ["mcp:read", "mcp:write"],
+				"whoami scopes mismatch: " ~ info.scopes.to!string);
 		// The reflection layer also mirrors the struct as a JSON text block.
 		check(who.content.length == 1
 				&& who.content[0].text.indexOf(`"subject":"user-42"`) >= 0,
@@ -242,8 +293,11 @@ int run()
 
 		auto who = client.callTool("whoami", Json.emptyObject);
 		check(!isToolError(who), "whoami should still work for a read-only token");
-		check(who.structuredContent["subject"].get!string == "reader",
-				"whoami structuredContent.subject should be the read-only subject");
+		const WhoamiResult info = who.structuredContentAs!WhoamiResult;
+		check(info.subject == "reader",
+				"whoami subject should be the read-only subject, got " ~ info.subject);
+		check(info.scopes == ["mcp:read"],
+				"whoami scopes should be read-only, got " ~ info.scopes.to!string);
 
 		auto secret = client.callTool("secret_note", Json.emptyObject);
 		check(isToolError(secret),

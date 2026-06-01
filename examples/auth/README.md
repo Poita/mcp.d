@@ -47,11 +47,31 @@ SDK's typed APIs rather than hand-built `Json`:
 - **`whoami` returns a typed `WhoamiResult` struct.** The reflection layer
   derives the tool's output schema (via `jsonSchemaOf`) and fills in the
   `structuredContent` of the result automatically — the handler never touches
-  `Json`. The client asserts the inferred `structuredContent.subject` /
-  `.scopes`.
+  `Json`. On the client side the result is decoded straight back into a typed
+  struct with **`CallToolResult.structuredContentAs!WhoamiResult`** (SDK #464),
+  so the assertions read real `.subject` / `.scopes` fields instead of poking at
+  raw `structuredContent["..."]` Json.
 - **`secret_note` returns a `CallToolResult`** because it must set `isError` on
   the per-tool scope-denied path; its content is built with the typed
   `Content.makeText` helper.
+
+### High-level OAuth client surface
+
+The client also demonstrates the SDK's real OAuth consumer API (SDK #471)
+alongside the low-level wire checks:
+
+- **`OAuthClient.probeUnauthorized(endpoint)`** POSTs an unauthenticated
+  `initialize` and returns the `WWW-Authenticate` header.
+- **`parseWwwAuthenticate(header)`** turns that header into a typed
+  `WwwAuthenticate{scheme, resourceMetadata, scope_}`.
+- **`OAuthClient.discoverProtectedResource(endpoint, header)`** follows the
+  challenge's `resource_metadata` URL (or the RFC 9728 well-known fallbacks) and
+  returns a typed `ProtectedResourceMetadata{resource, authorizationServers,
+  scopesSupported}`.
+
+Each high-level pass is paired with a low-level pass that asserts the exact wire
+shape (raw 401 header substrings, raw PRM JSON), so the example pins both the
+ergonomic API and the protocol bytes.
 
 ### Tokens / keys
 
@@ -86,14 +106,18 @@ code.
 ## What the client asserts
 
 1. **First contact (no token)** → HTTP `401` with a `Bearer` challenge carrying
-   `resource_metadata` and `scope="mcp:read"`.
+   `resource_metadata` and `scope="mcp:read"`. Verified twice: once through the
+   high-level `OAuthClient.probeUnauthorized` + `parseWwwAuthenticate` typed
+   surface, and once against the raw header substrings.
 2. **PRM document** → `resource`, `authorization_servers`, `scopes_supported`
-   match what the server configured.
+   match what the server configured. Verified through the typed
+   `OAuthClient.discoverProtectedResource` API and against the raw well-known
+   JSON.
 3. **Full-scope token** (`mcp:read mcp:write`) → `initialize` succeeds,
    `tools/list` contains `whoami` + `secret_note`, `whoami` reports the token
-   subject (`user-42`) and granted scopes in its **typed `structuredContent`**
-   (inferred from the server's `WhoamiResult` struct), and `secret_note`
-   returns the privileged payload.
+   subject (`user-42`) and granted scopes, decoded with
+   `structuredContentAs!WhoamiResult`, and `secret_note` returns the privileged
+   payload.
 4. **Read-only token** (`mcp:read`) → `whoami` still works (subject `reader`),
    but `secret_note` returns an `isError` tool result naming the missing
    `mcp:write` scope.
