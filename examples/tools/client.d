@@ -36,8 +36,6 @@ module tools_client;
 
 import std.getopt : getopt;
 import std.math : isClose;
-import std.process : ProcessPipes, pipeProcess, Redirect, wait;
-import std.string : stripRight;
 
 import vibe.data.json : Json;
 
@@ -73,46 +71,6 @@ private Tool find(Tool[] tools, string name) @safe
 	failures++;
 	logFail("tool not found in tools/list: " ~ name);
 	return Tool.init;
-}
-
-/// Owns the server subprocess and exposes the newline-delimited JSON-RPC channel
-/// expected by `McpClient.stdio`. Holding `ProcessPipes` in a class field keeps
-/// the stdin/stdout `File` handles alive for the lifetime of the client (a stack
-/// value would be destructed when the spawning helper returns).
-final class ServerProcess
-{
-	private ProcessPipes pipes;
-
-	this(string[] command) @trusted
-	{
-		pipes = pipeProcess(command, Redirect.stdin | Redirect.stdout);
-	}
-
-	/// Read one response line (terminator stripped), or null at EOF.
-	string readLine() @trusted
-	{
-		auto f = pipes.stdout;
-		if (f.eof)
-			return null;
-		auto ln = f.readln();
-		if (ln.length == 0 && f.eof)
-			return null;
-		return ln.stripRight("\r\n");
-	}
-
-	/// Write one request line (the channel appends the terminator).
-	void writeLine(string s) @trusted
-	{
-		pipes.stdin.writeln(s);
-		pipes.stdin.flush();
-	}
-
-	/// Close stdin and reap the child.
-	void shutdown() @trusted
-	{
-		pipes.stdin.close();
-		wait(pipes.pid);
-	}
 }
 
 /// Typed `calc` arguments — passed straight to `client.callTool("calc", CalcArgs(...))`
@@ -172,11 +130,6 @@ int main(string[] args) @safe
 	string httpUrl = parseHttpUrl(args);
 
 	McpClient client;
-	ServerProcess proc; // kept alive for the stdio channel's lifetime
-	scope (exit)
-		if (proc !is null)
-			proc.shutdown();
-
 	if (httpUrl.length)
 	{
 		client = McpClient.http(httpUrl);
@@ -184,10 +137,14 @@ int main(string[] args) @safe
 	else
 	{
 		// Resolve the server binary next to this client binary (dub writes both
-		// into the package root), independent of the current working directory.
-		proc = new ServerProcess([serverBinaryPath()]);
-		client = McpClient.stdio(&proc.readLine, &proc.writeLine);
+		// into the package root), independent of the current working directory,
+		// and let `McpClient.spawn` own the subprocess + its stdio channel.
+		client = McpClient.spawn([serverBinaryPath()]);
 	}
+	// Both transports release the same way: stdio runs the SIGTERM->SIGKILL
+	// subprocess shutdown, HTTP stops any background streams.
+	scope (exit)
+		client.close();
 
 	auto init = client.initialize();
 	check(init.serverInfo.name == "tools-example",
