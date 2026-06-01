@@ -798,8 +798,12 @@ struct Tool
 		projected.name = name;
 		projected.description = description;
 		projected.inputSchema = inputSchema;
-		projected.annotations = annotations;
 		projected.meta = meta;
+		// `Tool.annotations` (ToolAnnotations) was introduced by 2025-03-26; it
+		// is absent from the 2024-11-05 'Tool' type (name/description/inputSchema
+		// only). Strip it for any version older than 2025-03-26.
+		if (v >= ProtocolVersion.v2025_03_26)
+			projected.annotations = annotations;
 		// `BaseMetadata.title` and `Tool.outputSchema` were introduced by
 		// 2025-06-18; they are absent from 2025-03-26 and 2024-11-05.
 		if (v >= ProtocolVersion.v2025_06_18)
@@ -1694,6 +1698,35 @@ unittest  // Tool.forVersion keeps icons for 2025-11-25 (Tool.icons introduced h
 	auto j = t.forVersion(ProtocolVersion.v2025_11_25).toJson();
 	assert("icons" in j);
 	assert(j["icons"].length == 1);
+}
+
+unittest  // Tool.forVersion strips annotations for 2024-11-05 (ToolAnnotations introduced 2025-03-26)
+{
+	Tool t = {name: "t"};
+	t.annotations = Json.emptyObject;
+	t.annotations["readOnlyHint"] = true;
+	auto j = t.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("annotations" !in j);
+}
+
+unittest  // Tool.forVersion keeps annotations for 2025-03-26 (ToolAnnotations introduced here)
+{
+	Tool t = {name: "t"};
+	t.annotations = Json.emptyObject;
+	t.annotations["readOnlyHint"] = true;
+	auto j = t.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("annotations" in j);
+	assert(j["annotations"]["readOnlyHint"].get!bool);
+}
+
+unittest  // Tool.forVersion keeps annotations for 2025-11-25 (still present in later versions)
+{
+	Tool t = {name: "t"};
+	t.annotations = Json.emptyObject;
+	t.annotations["destructiveHint"] = true;
+	auto j = t.forVersion(ProtocolVersion.v2025_11_25).toJson();
+	assert("annotations" in j);
+	assert(j["annotations"]["destructiveHint"].get!bool);
 }
 
 unittest  // CallToolResult serializes content array and isError
