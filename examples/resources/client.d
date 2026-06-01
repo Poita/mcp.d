@@ -46,8 +46,6 @@ import std.stdio : writeln, stderr;
 import std.format : format;
 import std.path : dirName, buildPath;
 import std.file : exists, thisExePath;
-import std.process : pipeProcess, ProcessPipes, Redirect, wait;
-import std.string : stripRight;
 import core.time : msecs, MonoTime;
 
 import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep, yield;
@@ -143,8 +141,6 @@ int run(string httpUrl) @safe
 
 	// --- connect over the selected transport --------------------------------
 	McpClient client;
-	// stdio only: the spawned server subprocess pipes, kept alive for the run.
-	ProcessPipes* pipes;
 
 	if (overHttp)
 	{
@@ -159,30 +155,15 @@ int run(string httpUrl) @safe
 					~ " — build it first: dub build -c server");
 			return 2;
 		}
-		// Heap-box the ProcessPipes so the read/write closures and the cleanup
-		// path share one long-lived handle (a stack-local would have its File
-		// handles refcounted to zero when this helper returns).
-		pipes = () @trusted { return new ProcessPipes; }();
-		() @trusted { *pipes = pipeProcess([serverBin], Redirect.stdin | Redirect.stdout); }();
-		client = McpClient.stdio(() @trusted {
-			if (pipes.stdout.eof)
-				return cast(string) null;
-			auto ln = pipes.stdout.readln();
-			if (ln.length == 0 && pipes.stdout.eof)
-				return cast(string) null;
-			return ln.stripRight("\r\n");
-		}, (string s) @trusted { pipes.stdin.writeln(s); pipes.stdin.flush(); });
+		// Spawn the built server as a subprocess and drive it over its
+		// stdin/stdout. McpClient.spawn heap-boxes the pipes internally, and its
+		// close() runs the SIGTERM->SIGKILL stdio shutdown sequence.
+		client = McpClient.spawn([serverBin]);
 	}
+	// Both transports release cleanly via close() (stdio terminates the
+	// subprocess; http stops any background streams).
 	scope (exit)
-		if (pipes !is null)
-			() @trusted {
-				try
-					pipes.stdin.close();
-				catch (Exception)
-				{
-				}
-				wait(pipes.pid);
-			}();
+		client.close();
 
 	// Speak the stateless draft: cache hints ride inline on resources/read, and
 	// subscriptions/listen is the cross-transport push mechanism.
