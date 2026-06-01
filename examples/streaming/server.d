@@ -8,17 +8,21 @@
  * result is inferred from the struct return — no hand-built `Json` schemas or
  * args.
  *
- * ONE binary, EITHER transport:
- *   - default (no flag): `runStdio(server)` — newline-delimited JSON-RPC on
- *     stdin/stdout, the transport the bundled client spawns for its stdio e2e.
- *   - `--http` (+ `--port`/`--host`): `runStreamableHttp(server, port, opts)`.
+ * Transport selection is delegated to the shared `examples/common` scaffold:
+ * `runServerFromArgs(server, args, 9357)` serves stdio by default and
+ * Streamable HTTP on `--http` (+ `--port`/`--host`) — the SAME single binary,
+ * EITHER transport — so this file no longer hand-rolls the getopt + transport
+ * branch.
  *
  * Three tools:
  *
  *   `countdown` — a long-running task. On every step it:
- *       - emits a `notifications/progress` via `ctx.reportProgress(done, total, msg)`
- *         (delivered to the client only when the call carried a `_meta.progressToken`),
- *       - emits a `notifications/message` (logging) via `ctx.log("info", ...)`, and
+ *       - emits a `notifications/progress` via the integer-step convenience
+ *         `ctx.reportProgress(done, total, msg)` (#501) — delivered to the
+ *         client only when the call carried a `_meta.progressToken`,
+ *       - emits a `notifications/message` (logging) via the typed
+ *         `ctx.log(LogLevel.info, message, logger)` convenience (#501) — a plain
+ *         string payload, no hand-built `Json`, and
  *       - polls `ctx.isCancelled` and stops promptly when the client cancels.
  *     Its structured result records `{completed, total, cancelled}` so the client
  *     can assert concrete values. When a run is cancelled it bumps a server-side
@@ -48,32 +52,20 @@ module streaming_server;
 
 import core.time : msecs;
 import std.conv : to;
-import std.getopt : getopt;
-import std.stdio : stderr;
 import std.typecons : nullable;
 
 import vibe.core.core : sleep;
-import vibe.data.json : Json;
 
 import mcp;
 import mcp.api.attributes : tool, describe;
 import mcp.api.reflection : registerHandlers;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult, SamplingMessage;
-import mcp.protocol.types : Content, ElicitAction;
-import mcp.transport : StreamableHttpOptions, runStreamableHttp, runStdio;
+import mcp.protocol.types : Content, ElicitAction, LogLevel;
 
-enum ushort defaultPort = 9357;
+import examples_common : runServerFromArgs;
 
-void main(string[] args)
+void main(string[] args) @safe
 {
-	bool http = false;
-	ushort port = defaultPort;
-	string host = "127.0.0.1";
-	getopt(args,
-			"http", "Serve over Streamable HTTP instead of stdio (default: stdio)", &http,
-			"port|p", "HTTP port to listen on (default 9357)", &port,
-			"host|h", "HTTP address to bind (default 127.0.0.1)", &host);
-
 	auto server = new McpServer("streaming-example", "1.0.0",
 			nullable("Progress / logging / cancellation demo over stdio AND Streamable HTTP."));
 	// Advertise the `logging` capability so `ctx.log` notifications are emitted on
@@ -84,21 +76,9 @@ void main(string[] args)
 	// tally lives on the instance, so `cancel_stats` reports what `countdown` saw.
 	registerHandlers(server, new StreamingApi);
 
-	if (http)
-	{
-		StreamableHttpOptions opts;
-		opts.bindAddresses = [host];
-		() @trusted {
-			stderr.writefln("streaming-server listening on http://%s:%d/mcp", host, port);
-		}();
-		runStreamableHttp(server, port, opts);
-	}
-	else
-	{
-		// stdio: only valid MCP frames go to stdout; diagnostics go to stderr.
-		() @trusted { stderr.writeln("streaming-server serving over stdio"); }();
-		runStdio(server);
-	}
+	// Transport selection (stdio default; --http + --port/--host) comes from the
+	// shared examples/common scaffold (#505), default port 9357.
+	runServerFromArgs(server, args, 9357);
 }
 
 /// The `countdown` structured result: `{completed, total, cancelled}`. Returned
@@ -151,10 +131,8 @@ final class StreamingApi
 	/// server counter), then reports progress `i/steps` and logs an info line.
 	@tool("countdown",
 			"Run a multi-step task, reporting progress + logging each step and honoring cancellation.")
-	CountdownResult countdown(
-			@describe("number of steps to run") int steps,
-			@describe("delay between steps, in milliseconds") int delayMs,
-			RequestContext ctx) @safe
+	CountdownResult countdown(@describe("number of steps to run") int steps,
+			@describe("delay between steps, in milliseconds") int delayMs, RequestContext ctx)@safe
 	{
 		bool cancelled = false;
 		int completed = 0;
@@ -179,14 +157,14 @@ final class StreamingApi
 			// cancellation: stop the work and record it.
 			try
 			{
-				ctx.reportProgress(cast(double) i, nullable(cast(double) steps),
+				// Integer-step progress convenience (#501): done/total as longs, no
+				// cast(double) + Nullable wrapping at the call site.
+				ctx.reportProgress(cast(long) i, cast(long) steps,
 						"step " ~ i.to!string ~ "/" ~ steps.to!string);
-				// Logging `data` is a free-form payload (no typed surface): build it
-				// as Json by design.
-				Json logData = Json.emptyObject;
-				logData["message"] = "processing step " ~ i.to!string ~ " of " ~ steps.to!string;
-				logData["step"] = i;
-				ctx.log("info", logData, "countdown");
+				// Typed log convenience (#501): a LogLevel + a plain string message,
+				// no hand-built Json `data` payload.
+				ctx.log(LogLevel.info,
+						"processing step " ~ i.to!string ~ " of " ~ steps.to!string, "countdown");
 			}
 			catch (Exception)
 			{
@@ -213,9 +191,7 @@ final class StreamingApi
 	///     `CreateMessageResult` reply (reading `.model` and `.content.text`).
 	@tool("summarize",
 			"Summarize text after confirming tone via a typed elicitation, using typed sampling.")
-	SummaryResult summarize(
-			@describe("the text to summarize") string text,
-			RequestContext ctx) @safe
+	SummaryResult summarize(@describe("the text to summarize") string text, RequestContext ctx)@safe
 	{
 		// Typed elicitation: requestedSchema is DERIVED from `Confirm` (#436).
 		auto elicited = ctx.elicit!Confirm("Confirm summarization preferences");
@@ -231,8 +207,8 @@ final class StreamingApi
 		CreateMessageRequest req;
 		req.messages = [
 			SamplingMessage("user",
-					Content.makeText("Summarize the following in a " ~ confirm.tone
-						~ " tone:\n" ~ text))
+					Content.makeText(
+						"Summarize the following in a " ~ confirm.tone ~ " tone:\n" ~ text))
 		];
 		req.maxTokens = nullable(256L);
 		req.systemPrompt = nullable("You are a careful summarizer.");

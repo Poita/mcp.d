@@ -5,10 +5,12 @@ and the **client** consumes MCP's in-flight channels, plus the **typed**
 server→client round-trip APIs — over **BOTH transports**: stdio and Streamable
 HTTP. One server binary serves either transport; one client verifies both.
 
-- **Progress** — `ctx.reportProgress(done, total, message)` →
-  `notifications/progress`, observed via `McpClient.onProgress`.
-- **Logging** — `ctx.log(level, data, logger)` → `notifications/message`,
-  observed via `McpClient.onLogMessage`.
+- **Progress** — `ctx.reportProgress(done, total, message)` (integer-step
+  convenience, #501) → `notifications/progress`, observed via a per-call
+  progress sink, `callTool(name, args, onProgress)` (#494).
+- **Logging** — `ctx.log(LogLevel.info, message, logger)` (typed-level, plain
+  string payload, #501) → `notifications/message`, observed via
+  `McpClient.onLogMessage`.
 - **Cancellation** — a long-running handler polls `ctx.isCancelled` and stops
   early; on Streamable HTTP the cancellation signal is the client closing its
   response stream (basic/utilities/cancellation §Transport-Specific
@@ -47,10 +49,11 @@ exposes three tools:
 The client (`client.d`) verifies, in order:
 
 1. **List + progress + logging** (transport-agnostic): `listTools()` contains
-   `countdown` / `summarize` / `cancel_stats`; a `countdown` call carrying a
-   `progressToken` streams exactly N progress notifications (monotonically
-   increasing, echoing the token, last == total) and N `info` log messages from
-   the `countdown` logger before the final result.
+   `countdown` / `summarize` / `cancel_stats`; a `countdown` call made with a
+   per-call progress sink (`callTool(name, args, onProgress)`) streams exactly N
+   progress notifications (monotonically increasing, each carrying the call's
+   minted token, last == total) and N `info` log messages from the `countdown`
+   logger before the final result.
 2. **Typed elicitation + sampling** (transport-agnostic): the client's mocked
    `onElicitation` accepts with concrete values and its mocked `onSampling`
    returns a concrete model + text; the structured result echoes them exactly.
@@ -64,8 +67,9 @@ The client (`client.d`) verifies, in order:
 
 ### stdio (default)
 
-The client spawns the server binary itself and talks to it over stdin/stdout —
-a single command, no ports.
+The client spawns the sibling `streaming-server` binary itself (via the
+scaffold's `connectFromArgs` -> `McpClient.spawnSibling`) and talks to it over
+stdin/stdout — a single command, no ports.
 
 ```sh
 dub build -c server && dub build -c client
@@ -124,5 +128,9 @@ A non-zero client exit code means a behavioral regression — the client prints
   handshake, the authorization-server flow) is defined over HTTP request
   headers; the stdio transport has no header channel, so authentication is not
   applicable to the stdio path. See `examples/auth` for the HTTP auth example.
-- The example is its own dub package with a path dependency on the root `mcp`
-  SDK (`"mcp": { "path": "../.." }`). It does not modify the root `dub.json`.
+- The example is its own dub package with path dependencies on the root `mcp`
+  SDK (`"mcp": { "path": "../.." }`) and on the shared `examples/common` scaffold
+  (`"examples-common": { "path": "../common" }`), which supplies the `check`
+  assertion helper, the `runClient` event-loop driver, and the
+  `connectFromArgs` / `runServerFromArgs` transport pickers. It does not modify
+  the root `dub.json`.
