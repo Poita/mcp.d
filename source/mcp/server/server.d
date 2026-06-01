@@ -979,6 +979,18 @@ final class McpServer
 	/// preserving the in-process behaviour of the no-argument overload.
 	string handleRaw(string text, scope void delegate(string) @safe sink) @safe
 	{
+		return handleRaw(text, sink, null);
+	}
+
+	/// As `handleRaw(text, sink)`, but with a server->client request channel:
+	/// when a handler calls `ctx.sendRequest` (e.g. via `ctx.sample`/`ctx.elicit`)
+	/// `serverRequest(method, params)` is invoked to write the request and block
+	/// for the client's reply. The stdio transport supplies a `serverRequest` that
+	/// pumps stdin for the matching response; `null` reproduces the no-channel
+	/// behaviour (server->client requests throw).
+	string handleRaw(string text, scope void delegate(string) @safe sink,
+			scope Json delegate(string, Json) @safe serverRequest) @safe
+	{
 		import vibe.data.json : parseJsonString;
 
 		ParsedInput input;
@@ -992,7 +1004,10 @@ final class McpServer
 		auto dispatch = (Message m) @safe {
 			if (sink is null)
 				return handle(m);
-			return handle(m, new StdioContext(sink, readProgressToken(m.params), negotiated));
+			if (serverRequest is null)
+				return handle(m, new StdioContext(sink, readProgressToken(m.params), negotiated));
+			return handle(m, new StdioContext(sink, serverRequest, clientCaps,
+					readProgressToken(m.params), negotiated));
 		};
 
 		if (!input.isBatch)

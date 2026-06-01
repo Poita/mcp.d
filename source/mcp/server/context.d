@@ -6,6 +6,7 @@ import vibe.data.json : Json;
 import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction;
+import mcp.protocol.capabilities : ClientCapabilities;
 import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
 import mcp.protocol.jsonrpc : makeNotification;
@@ -369,15 +370,19 @@ final class NullContext : RequestContext
 /// are serialised and pushed to the transport's write sink as the handler emits
 /// them, out-of-band of the request's eventual reply.
 ///
-/// There is no out-of-band path for the client to answer a server->client
-/// *request* while a stdio request is in flight (replies arrive on the same
-/// stdin the server is blocked reading), so `sendRequest` is unsupported and
-/// `clientSupports` reports false, exactly like `NullContext`. Severity gating
-/// for logging and the `progressToken` gate for progress are applied by the
-/// server's per-request `RequestScope` and the token captured here.
+/// The MCP stdio transport is bidirectional, so a server->client *request* is
+/// possible: `sendRequest` writes the request frame to the stdout sink and the
+/// transport (`serveStdio`) pumps stdin for the matching reply while the handler
+/// blocks (see the `serverRequest` channel below). When no channel is wired
+/// (`serverRequest is null`) `sendRequest` throws and `clientSupports` reports
+/// false, exactly like `NullContext`. Severity gating for logging and the
+/// `progressToken` gate for progress are applied by the server's per-request
+/// `RequestScope` and the token captured here.
 final class StdioContext : RequestContext
 {
 	private void delegate(string) @safe sink;
+	private Json delegate(string, Json) @safe serverRequestFn;
+	private ClientCapabilities clientCaps;
 	private Json progressTok;
 	private ProtocolVersion version_;
 
@@ -387,11 +392,28 @@ final class StdioContext : RequestContext
 	/// `negotiated` is the protocol version agreed for this connection; it gates
 	/// version-specific wire fields on the notifications this context emits (e.g.
 	/// the `message` field on `notifications/progress`, which only exists from
-	/// 2025-03-26 onward).
+	/// 2025-03-26 onward). This overload wires no server->client request channel
+	/// (`sendRequest` throws, `clientSupports` is false).
 	this(void delegate(string) @safe sink, Json progressToken = Json.undefined,
 			ProtocolVersion negotiated = latestStable) @safe
 	{
 		this.sink = sink;
+		this.progressTok = progressToken;
+		this.version_ = negotiated;
+	}
+
+	/// As above, plus a server->client request channel: `serverRequest(method,
+	/// params)` writes the request and blocks until the client's reply (the
+	/// transport pumps stdin), returning the `result` or throwing on error.
+	/// `clientCaps` are the capabilities the client declared at `initialize`, so
+	/// `clientSupports` can gate `sample`/`elicit` correctly.
+	this(void delegate(string) @safe sink, Json delegate(string, Json) @safe serverRequest,
+			ClientCapabilities clientCaps, Json progressToken = Json.undefined,
+			ProtocolVersion negotiated = latestStable) @safe
+	{
+		this.sink = sink;
+		this.serverRequestFn = serverRequest;
+		this.clientCaps = clientCaps;
 		this.progressTok = progressToken;
 		this.version_ = negotiated;
 	}
@@ -436,14 +458,38 @@ final class StdioContext : RequestContext
 			sink(frame.toString());
 	}
 
-	Json sendRequest(string, Json) @safe
+	Json sendRequest(string method, Json params) @safe
 	{
-		throw invalidRequest("The stdio transport has no server-to-client request channel");
+		if (serverRequestFn is null)
+			throw invalidRequest("The stdio transport has no server-to-client request channel");
+		return serverRequestFn(method, params);
 	}
 
-	bool clientSupports(string) @safe
+	bool clientSupports(string capability) @safe
 	{
-		return false;
+		// No channel wired -> report false (cannot satisfy a server->client
+		// request), preserving the prior no-channel behaviour.
+		if (serverRequestFn is null)
+			return false;
+		switch (capability)
+		{
+		case "sampling":
+			return clientCaps.sampling;
+		case "sampling.tools":
+			return clientCaps.samplingTools;
+		case "sampling.context":
+			return clientCaps.samplingContext;
+		case "elicitation":
+			return clientCaps.elicitation;
+		case "elicitation.form":
+			return clientCaps.elicitationForm;
+		case "elicitation.url":
+			return clientCaps.elicitationUrl;
+		case "roots":
+			return clientCaps.roots;
+		default:
+			return false;
+		}
 	}
 
 	bool isStateless() @safe
