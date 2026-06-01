@@ -289,6 +289,17 @@ struct Content
 		return payload.match!((const ref EmbeddedResource c) => c.resource, _ => Json.undefined);
 	}
 
+	/// Decode an `embedded resource` content block's `resource` payload into a
+	/// typed `ResourceContents`. For the `embeddedResource` kind this is
+	/// `ResourceContents.fromJson` of the raw `resource()` object (giving typed
+	/// `uri`/`mimeType`/`text`/`blob` access instead of the untyped `Json`); for
+	/// any other kind it returns a default `ResourceContents`.
+	ResourceContents embeddedResource() const @safe
+	{
+		return payload.match!((const ref EmbeddedResource c) => ResourceContents.fromJson(c.resource),
+				_ => ResourceContents.init);
+	}
+
 	Nullable!string description() const @safe
 	{
 		return payload.match!((const ref ResourceLink c) => c.description,
@@ -1012,6 +1023,82 @@ struct CallToolResult
 			return T.init;
 		return () @trusted { return deserializeJson!T(structuredContent); }();
 	}
+
+	/// Build a `CallToolResult` whose `structuredContent` is `value` serialized via
+	/// vibe's `serializeToJson`. When `content` is null it defaults to a single
+	/// text block carrying the JSON string of `value`, mirroring the reflection
+	/// layer's `toToolResult` behaviour so a structured result also has a
+	/// human-readable content fallback for clients that ignore `structuredContent`.
+	static CallToolResult structured(T)(T value, Content[] content = null) @safe
+	{
+		CallToolResult r;
+		auto sc = () @trusted { return serializeToJson(value); }();
+		r.structuredContent = sc;
+		r.content = content !is null ? content : [
+			Content.makeText(sc.toString())
+		];
+		return r;
+	}
+}
+
+unittest  // CallToolResult.structured!T serializes a struct into structuredContent
+{
+	struct Weather
+	{
+		string city;
+		int tempC;
+	}
+
+	auto r = CallToolResult.structured(Weather("Paris", 18));
+	assert(r.structuredContent.type == Json.Type.object);
+	assert(r.structuredContent["city"].get!string == "Paris");
+	assert(r.structuredContent["tempC"].get!int == 18);
+}
+
+unittest  // CallToolResult.structured!T round-trips via structuredContentAs!T
+{
+	struct Weather
+	{
+		string city;
+		int tempC;
+	}
+
+	auto r = CallToolResult.structured(Weather("Paris", 18));
+	auto back = r.structuredContentAs!Weather;
+	assert(back.city == "Paris");
+	assert(back.tempC == 18);
+}
+
+unittest  // CallToolResult.structured!T defaults content to a JSON text block
+{
+	struct Weather
+	{
+		string city;
+		int tempC;
+	}
+
+	auto r = CallToolResult.structured(Weather("Paris", 18));
+	assert(r.content.length == 1);
+	assert(r.content[0].kind == ContentKind.text);
+	auto echoed = parseJsonString(r.content[0].text);
+	assert(echoed["city"].get!string == "Paris");
+	assert(echoed["tempC"].get!int == 18);
+}
+
+unittest  // CallToolResult.structured!T honours an explicit content override
+{
+	struct Weather
+	{
+		string city;
+		int tempC;
+	}
+
+	auto r = CallToolResult.structured(Weather("Paris", 18), [
+		Content.makeText("18C in Paris")
+	]);
+	assert(r.content.length == 1);
+	assert(r.content[0].text == "18C in Paris");
+	assert(r.structuredContent["city"].get!string == "Paris");
 }
 
 /// Result of `tools/list` (paginated).
@@ -1240,6 +1327,15 @@ unittest  // embedded text resource carries uri/mimeType/text
 	assert(j["resource"]["mimeType"].get!string == "text/plain");
 	assert(j["resource"]["text"].get!string == "hi");
 	assert(Content.fromJson(j).kind == ContentKind.embeddedResource);
+}
+
+unittest  // embeddedResource() decodes the resource payload into ResourceContents
+{
+	auto c = Content.makeEmbeddedText("test://x", "text/plain", "hi");
+	auto rc = c.embeddedResource();
+	assert(rc.uri == "test://x");
+	assert(rc.mimeType == "text/plain");
+	assert(rc.text == "hi");
 }
 
 unittest  // resource link carries uri and name
@@ -3906,6 +4002,66 @@ struct CompleteResult
 			r.meta = j["_meta"];
 		return r;
 	}
+}
+
+/// A typed `notifications/resources/updated` payload, per
+/// server/resources/subscribe: when a client has subscribed to a resource, the
+/// server sends this notification with `params: {uri, _meta?}` so the client
+/// knows the resource at `uri` has changed and can re-read it. Parsed from an
+/// inbound notification's `params` so clients receive a structured value rather
+/// than hand-parsing raw JSON, mirroring `ProgressNotification.fromJson`.
+struct ResourceUpdatedNotification
+{
+	/// The URI of the resource that changed.
+	string uri;
+	/// The optional `_meta` object carried on the notification; `Json.undefined`
+	/// when absent.
+	Json meta = Json.undefined;
+
+	/// The JSON-RPC method name of this notification.
+	enum methodName = "notifications/resources/updated";
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		j["uri"] = uri;
+		if (meta.type == Json.Type.object)
+			j["_meta"] = meta;
+		return j;
+	}
+
+	/// Parse the `params` object of a `notifications/resources/updated` message.
+	/// Tolerant of a missing/ill-typed payload (returns a default-valued struct).
+	static ResourceUpdatedNotification fromJson(Json params) @safe
+	{
+		ResourceUpdatedNotification n;
+		if (params.type != Json.Type.object)
+			return n;
+		if ("uri" in params && params["uri"].type == Json.Type.string)
+			n.uri = params["uri"].get!string;
+		if ("_meta" in params && params["_meta"].type == Json.Type.object)
+			n.meta = params["_meta"];
+		return n;
+	}
+}
+
+unittest  // ResourceUpdatedNotification.fromJson extracts the uri
+{
+	Json p = Json.emptyObject;
+	p["uri"] = "file:///watched.txt";
+	auto n = ResourceUpdatedNotification.fromJson(p);
+	assert(n.uri == "file:///watched.txt");
+}
+
+unittest  // ResourceUpdatedNotification.fromJson tolerates a non-object params
+{
+	auto n = ResourceUpdatedNotification.fromJson(Json("nope"));
+	assert(n.uri == "");
+}
+
+unittest  // ResourceUpdatedNotification carries the method-name constant
+{
+	assert(ResourceUpdatedNotification.methodName == "notifications/resources/updated");
 }
 
 /// A typed `notifications/progress` payload, per basic/utilities/progress: the
