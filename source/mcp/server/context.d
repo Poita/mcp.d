@@ -6,40 +6,12 @@ import vibe.data.json : Json;
 import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction;
-import mcp.api.schema : jsonSchemaOf;
+import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
 import mcp.protocol.jsonrpc : makeNotification;
 import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
 
 @safe:
-
-/// A field type permitted in an elicitation form schema: a scalar (string /
-/// number / integer / boolean / enum), optionally wrapped in `Nullable`. The
-/// elicitation `requestedSchema` (SEP-1034/1330) is a flat object of such
-/// primitives — no nested objects or arrays.
-private template isElicitScalar(F)
-{
-	import std.traits : isIntegral, isFloatingPoint, isSomeString, isInstanceOf;
-	import std.typecons : Nullable;
-
-	static if (isInstanceOf!(Nullable, F))
-		enum isElicitScalar = isElicitScalar!(typeof(F.init.get()));
-	else
-		enum isElicitScalar = is(F == bool) || isIntegral!F
-			|| isFloatingPoint!F || isSomeString!F || is(F == enum);
-}
-
-/// True when `T` is a flat struct whose every field is an `isElicitScalar`,
-/// i.e. a valid type to derive an elicitation form `requestedSchema` from.
-package template isFlatElicitationStruct(T)
-{
-	import std.meta : allSatisfy;
-
-	static if (is(T == struct))
-		enum isFlatElicitationStruct = allSatisfy!(isElicitScalar, typeof(T.tupleof));
-	else
-		enum isFlatElicitationStruct = false;
-}
 
 /// The RFC 5424 severity ordering used by `notifications/message` logging
 /// (server/utilities/logging). Lower index == less severe; a message is emitted
@@ -324,6 +296,19 @@ interface RequestContext
 		if (!clientSupports("roots"))
 			throw invalidRequest("Client does not support roots");
 		return ListRootsResult.fromJson(sendRequest("roots/list", Json.emptyObject));
+	}
+
+	/// Typed convenience over `inputResponses`: decode the MRTR answer the client
+	/// attached for `id` into `T` via `T.fromJson` (e.g. `ElicitResult`,
+	/// `CreateMessageResult`, `ListRootsResult` — matching the `InputRequest`
+	/// kind the server issued). Returns `T.fromJson(Json.emptyObject)` when no
+	/// answer is present for `id`.
+	T inputResponseAs(T)(string id) @safe
+	{
+		auto m = inputResponses();
+		if (auto p = id in m)
+			return T.fromJson(*p);
+		return T.fromJson(Json.emptyObject);
 	}
 }
 
@@ -721,6 +706,8 @@ version (unittest) private final class ElicitProbe : RequestContext
 	bool supportsForm = true;
 	bool supportsUrl = true;
 	bool stateless = false;
+	/// MRTR round-2 answers a test can populate to exercise `inputResponseAs!T`.
+	Json[string] responses;
 
 	bool isCancelled() @safe
 	{
@@ -766,8 +753,7 @@ version (unittest) private final class ElicitProbe : RequestContext
 
 	Json[string] inputResponses() @safe
 	{
-		Json[string] empty;
-		return empty;
+		return responses;
 	}
 
 	string requestState() @safe
@@ -944,6 +930,18 @@ unittest  // elicit!T rejects a non-flat (nested) struct at compile time
 
 	auto probe = new ElicitProbe;
 	static assert(!__traits(compiles, probe.elicit!Nested("nope")));
+}
+
+unittest  // inputResponseAs!T decodes a typed answer from the MRTR inputResponses map
+{
+	auto probe = new ElicitProbe;
+	Json c = Json.emptyObject;
+	c["name"] = "Ada";
+	probe.responses["q1"] = ElicitResult.accept(c).toJson();
+
+	auto r = probe.inputResponseAs!ElicitResult("q1");
+	assert(r.action == ElicitAction.accept);
+	assert(r.content["name"].get!string == "Ada");
 }
 
 unittest  // listRoots() sends roots/list and parses the typed result

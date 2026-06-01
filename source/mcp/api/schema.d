@@ -129,6 +129,33 @@ Json jsonSchemaOf(T)() @safe
 	return s;
 }
 
+/// A field type permitted in an elicitation form schema: a scalar (string /
+/// number / integer / boolean / enum), optionally wrapped in `Nullable`. The
+/// elicitation `requestedSchema` (SEP-1034/1330) is a flat object of such
+/// primitives — no nested objects or arrays.
+template isElicitScalar(F)
+{
+	static if (isInstanceOf!(Nullable, F))
+		enum isElicitScalar = isElicitScalar!(typeof(F.init.get()));
+	else
+		enum isElicitScalar = is(F == bool) || isIntegral!F
+			|| isFloatingPoint!F || isSomeString!F || is(F == enum);
+}
+
+/// True when `T` is a flat struct whose every field is an `isElicitScalar`,
+/// i.e. a valid type to derive an elicitation form `requestedSchema` from (via
+/// `jsonSchemaOf!T`). Used by `RequestContext.elicit!T` and
+/// `InputRequest.elicitation!T` to reject nested/array structs at compile time.
+template isFlatElicitationStruct(T)
+{
+	import std.meta : allSatisfy;
+
+	static if (is(T == struct))
+		enum isFlatElicitationStruct = allSatisfy!(isElicitScalar, typeof(T.tupleof));
+	else
+		enum isFlatElicitationStruct = false;
+}
+
 /// True when field `i` of struct `T` declares an explicit non-`.init` default
 /// initialiser, so it may be omitted from a JSON payload and is therefore not
 /// listed in `required`.
