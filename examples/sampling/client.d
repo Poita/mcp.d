@@ -4,8 +4,7 @@
  * Exercises MCP **Sampling** from the consumer's eye view over EITHER transport:
  *
  *   - STDIO (default): spawns the built `sampling-server` binary (no `--http`)
- *     and drives it over the bidirectional stdio channel, exactly like
- *     examples/tools/client.d (ProcessPipes + `McpClient.stdio`).
+ *     and drives it over the bidirectional stdio channel.
  *   - HTTP (`--http <url>`): connects to a running `sampling-server --http`
  *     instance via `McpClient.http(url)`.
  *
@@ -31,20 +30,17 @@
  *   - The `onSampling` handler is actually INVOKED (the server reached back).
  *   - The handler received a system prompt and the user text the server sent.
  *   - `summarize` returns `{summary, model, stopReason}` exactly matching the
- *     mock model's reply — i.e. the mocked sampling value flowed through.
+ *     mock model's reply — read via the typed `structuredContentAs!T`.
  *   - `model_name` returns the mock model's `model` identifier.
  */
 module sampling_client;
 
 import std.algorithm : canFind, map;
 import std.array : array;
-import std.conv : to;
 import std.getopt : getopt;
 import std.process : ProcessPipes, pipeProcess, Redirect, wait;
 import std.stdio : stderr, writeln;
 import std.string : stripRight;
-
-import vibe.data.json : Json;
 
 import mcp;
 
@@ -55,6 +51,31 @@ enum string mockModelId = "mock-summarizer-v1";
 /// The mock model's deterministic completion. Captured by the server in the
 /// `summarize` structured result.
 enum string fixedSummary = "A terse one-line summary.";
+
+/// Typed arguments for the `summarize` tool — passed to the typed
+/// `callTool(name, T)` overload (#468) so the SDK serializes them (no hand-built
+/// Json argument object).
+struct SummarizeArgs
+{
+	string text;
+}
+
+/// Mirror of the server's `summarize` structured output, decoded with
+/// `CallToolResult.structuredContentAs!T` (#464) instead of reading raw Json
+/// fields one by one.
+struct SummaryResult
+{
+	string summary;
+	string model;
+	string stopReason;
+}
+
+/// Mirror of the server's `model_name` structured output (read via
+/// `structuredContentAs!T`).
+struct ModelResult
+{
+	string model;
+}
 
 /// Owns the server subprocess and exposes the newline-delimited JSON-RPC channel
 /// expected by `McpClient.stdio`. Holding `ProcessPipes` in a class field keeps
@@ -160,12 +181,10 @@ private int run(McpClient client, Object proc) @safe
 		if (request.messages.length)
 			seenUserText = request.messages[0].content.text;
 
-		CreateMessageResult r;
-		r.role = "assistant";
-		r.content = Content.makeText(fixedSummary);
-		r.model = mockModelId;
-		r.stopReason = "endTurn";
-		return r;
+		// One-line assistant reply with our mock model id — built with the
+		// `CreateMessageResult.text` helper (#467) instead of setting
+		// role/content/model/stopReason by hand (stopReason defaults to "endTurn").
+		return CreateMessageResult.text(mockModelId, fixedSummary);
 	};
 
 	// Pin a stable (2025-era) version so the BLOCKING sampling path is exercised.
@@ -182,21 +201,21 @@ private int run(McpClient client, Object proc) @safe
 	// --- summarize: the mocked sampling value must flow through -------------
 	const longText = "MCP sampling lets a server borrow the client's LLM. "
 		~ "The server sends sampling/createMessage; the client answers with a completion.";
-	Json sArgs = Json.emptyObject;
-	sArgs["text"] = longText;
-	auto sres = client.callTool("summarize", sArgs);
+	// Typed args (#468): pass a struct; the SDK serializes it to the arguments
+	// object, so the example no longer hand-builds Json here.
+	auto sres = client.callTool("summarize", SummarizeArgs(longText));
 
 	check(!sres.isError, "summarize must not be an error");
-	check(sres.structuredContent.type == Json.Type.object,
-			"summarize must return structuredContent");
-	check(sres.structuredContent["summary"].get!string == fixedSummary,
+	// Typed structured output (#464): decode the whole result in one step instead
+	// of reading `structuredContent["x"].get!...` field by field.
+	auto summary = sres.structuredContentAs!SummaryResult;
+	check(summary.summary == fixedSummary,
 			"summarize.summary should be the mock model's reply '" ~ fixedSummary
-			~ "', got '" ~ sres.structuredContent["summary"].to!string ~ "'");
-	check(sres.structuredContent["model"].get!string == mockModelId,
-			"summarize.model should be '" ~ mockModelId ~ "', got '"
-			~ sres.structuredContent["model"].to!string ~ "'");
-	check(sres.structuredContent["stopReason"].get!string == "endTurn",
-			"summarize.stopReason should be 'endTurn'");
+			~ "', got '" ~ summary.summary ~ "'");
+	check(summary.model == mockModelId,
+			"summarize.model should be '" ~ mockModelId ~ "', got '" ~ summary.model ~ "'");
+	check(summary.stopReason == "endTurn",
+			"summarize.stopReason should be 'endTurn', got '" ~ summary.stopReason ~ "'");
 
 	// The server must actually have reached back into our handler...
 	check(handlerInvoked, "onSampling handler was never invoked (server did not call ctx.sample)");
@@ -207,11 +226,9 @@ private int run(McpClient client, Object proc) @safe
 
 	// --- model_name: the client's model id flows back to the server ---------
 	auto mres = client.callTool("model_name");
-	check(mres.structuredContent.type == Json.Type.object,
-			"model_name must return structuredContent");
-	check(mres.structuredContent["model"].get!string == mockModelId,
-			"model_name.model should be '" ~ mockModelId ~ "', got '"
-			~ mres.structuredContent["model"].to!string ~ "'");
+	auto modelName = mres.structuredContentAs!ModelResult;
+	check(modelName.model == mockModelId,
+			"model_name.model should be '" ~ mockModelId ~ "', got '" ~ modelName.model ~ "'");
 
 	logOk("sampling example e2e passed — server reached back via ctx.sample, "
 			~ "onSampling mock answered (system prompt + user text observed), and the "
