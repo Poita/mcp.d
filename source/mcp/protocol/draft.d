@@ -738,6 +738,34 @@ struct InputRequest
 		return InputRequest(id, "roots", Json.emptyObject);
 	}
 
+	/// Parse this request's `params` as a typed `CreateMessageRequest` — the typed
+	/// reader counterpart to the `sampling` builder. Only meaningful when
+	/// `kind == InputKind.sampling`.
+	CreateMessageRequest asSampling() @safe
+	{
+		return CreateMessageRequest.fromJson(params);
+	}
+
+	/// Read `params["message"]` as a string (`""` when absent) — the reader
+	/// counterpart to the `elicitation` builder, for `kind == InputKind.elicitation`.
+	string elicitationMessage() @safe
+	{
+		if (params.type == Json.Type.object && "message" in params
+				&& params["message"].type == Json.Type.string)
+			return params["message"].get!string;
+		return "";
+	}
+
+	/// Read `params["requestedSchema"]` (`Json.undefined` when absent) — the
+	/// reader counterpart to the `elicitation` builder, for
+	/// `kind == InputKind.elicitation`.
+	Json requestedSchema() @safe
+	{
+		if (params.type == Json.Type.object && "requestedSchema" in params)
+			return params["requestedSchema"];
+		return Json.undefined;
+	}
+
 	/// The spec wire `method` for this request's `type`: an `InputRequests` value
 	/// is a request object whose `method` is the full JSON-RPC method name
 	/// (`elicitation/create`, `sampling/createMessage`, `roots/list`) — not the
@@ -1077,6 +1105,52 @@ unittest  // InputRequest.kind returns null for an unrecognised type
 {
 	auto ir = InputRequest("x", "bogus", Json.emptyObject);
 	assert(ir.kind.isNull);
+}
+
+unittest  // InputRequest.asSampling reads back the CreateMessageRequest builder input
+{
+	import mcp.protocol.sampling : CreateMessageRequest, SamplingMessage;
+	import mcp.protocol.types : Content;
+
+	CreateMessageRequest req;
+	req.messages = [SamplingMessage("user", Content.makeText("hi"))];
+	req.maxTokens = 64;
+	req.systemPrompt = "be terse";
+	auto ir = InputRequest.sampling("s1", req);
+
+	auto back = ir.asSampling();
+	assert(back.messages.length == 1);
+	assert(back.messages[0].content.text == "hi");
+	assert(back.maxTokens.get == 64);
+	assert(back.systemPrompt.get == "be terse");
+}
+
+unittest  // InputRequest.elicitationMessage reads back the elicitation builder message
+{
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	auto ir = InputRequest.elicitation("e1", "Your name?", schema);
+	assert(ir.elicitationMessage() == "Your name?");
+}
+
+unittest  // InputRequest.elicitationMessage is empty when no message is present
+{
+	auto ir = InputRequest.roots("r1");
+	assert(ir.elicitationMessage() == "");
+}
+
+unittest  // InputRequest.requestedSchema reads back the elicitation builder schema
+{
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	auto ir = InputRequest.elicitation("e1", "Your name?", schema);
+	assert(ir.requestedSchema() == schema);
+}
+
+unittest  // InputRequest.requestedSchema is undefined when no schema is present
+{
+	auto ir = InputRequest.elicitation("e1", "Just a message");
+	assert(ir.requestedSchema().type == Json.Type.undefined);
 }
 
 unittest  // DiscoverResult.toJson carries the required resultType discriminator

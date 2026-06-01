@@ -503,6 +503,22 @@ struct CreateMessageResult
 		contentBlocks = [c];
 	}
 
+	/// Build a single-text-block reply, the common `onSampling` case: an
+	/// assistant message whose `content` is one `Content.makeText(text)` block.
+	/// Parity with `Content.makeText` / `ElicitResult.accept` — saves a handler
+	/// from assembling the struct by hand. `stopReason` defaults to "endTurn" and
+	/// `role` to "assistant".
+	static CreateMessageResult text(string model, string text,
+			string stopReason = "endTurn", string role = "assistant") @safe
+	{
+		CreateMessageResult r;
+		r.role = role;
+		r.contentBlocks = [Content.makeText(text)];
+		r.model = model;
+		r.stopReason = stopReason;
+		return r;
+	}
+
 	Json toJson() const @safe
 	{
 		Json j = Json.emptyObject;
@@ -956,6 +972,35 @@ unittest  // a single tool_use block reply preserves id/name/input
 	assert(r.content.id == "c1");
 	assert(r.content.name == "search");
 	assert(r.content.input["q"].get!string == "x");
+}
+
+unittest  // CreateMessageResult.text builds a single-text-block assistant reply
+{
+	auto r = CreateMessageResult.text("claude-3-5-sonnet", "the answer");
+	assert(r.role == "assistant");
+	assert(r.model == "claude-3-5-sonnet");
+	assert(r.stopReason == "endTurn");
+	assert(r.contentBlocks.length == 1);
+	assert(r.content.kind == ContentKind.text);
+	assert(r.content.text == "the answer");
+}
+
+unittest  // CreateMessageResult.text matches fields a handler would set by hand
+{
+	// Parity: the factory must yield the exact same struct an onSampling handler
+	// would build manually via Content.makeText.
+	auto byHand = CreateMessageResult("assistant", [Content.makeText("hi")], "m", "endTurn");
+	auto byFactory = CreateMessageResult.text("m", "hi");
+	assert(byFactory.toJson() == byHand.toJson());
+}
+
+unittest  // CreateMessageResult.text honours custom stopReason and role
+{
+	auto r = CreateMessageResult.text("m", "tok limit", "maxTokens", "assistant");
+	assert(r.stopReason == "maxTokens");
+	assert(r.stopReasonEnum.get == StopReason.maxTokens);
+	auto u = CreateMessageResult.text("m", "echo", "endTurn", "user");
+	assert(u.role == "user");
 }
 
 unittest  // StopReason wire mapping is exact and reversible
