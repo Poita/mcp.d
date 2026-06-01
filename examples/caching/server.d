@@ -15,7 +15,8 @@
  * Both are draft-gated: the server only emits the `ttlMs` / `cacheScope`
  * fields when the negotiated protocol is the stateless draft (2026-07-28).
  *
- * ONE BINARY, EITHER TRANSPORT. The transport is selected by flags:
+ * ONE BINARY, EITHER TRANSPORT. The transport is selected by flags via the
+ * shared `runServerFromArgs` scaffold helper:
  *   - default (no flags)  -> stdio   (runStdio)            — deployable shape
  *   - `--http`            -> Streamable HTTP (runStreamableHttp) on `--port`
  *
@@ -33,15 +34,12 @@
  */
 module caching_server;
 
-import std.getopt : getopt;
-import std.stdio : stderr;
-
 import mcp;
 import mcp.api.attributes : resource, cache;
 import mcp.api.reflection : registerHandlers;
 import mcp.protocol.draft : CacheHint, CacheScope;
-import mcp.transport : StreamableHttpOptions, runStreamableHttp;
-import mcp.transport.stdio : runStdio;
+
+import examples_common : runServerFromArgs;
 
 import std.typecons : nullable;
 
@@ -74,16 +72,8 @@ final class CachingApi
 	}
 }
 
-void main(string[] args)
+void main(string[] args) @safe
 {
-	bool http;
-	ushort port = 8531;
-	string host = "127.0.0.1";
-	getopt(args,
-			"http", "Serve over Streamable HTTP instead of stdio", &http,
-			"port|p", "HTTP port to listen on (default 8531)", &port,
-			"host|h", "HTTP address to bind (default 127.0.0.1)", &host);
-
 	auto server = new McpServer("caching-example", "1.0.0",
 			nullable("Demonstrates draft CacheableResult freshness hints."));
 
@@ -94,19 +84,7 @@ void main(string[] args)
 	// and may be cached publicly for 5s.
 	server.setListCacheHint("resources/list", CacheHint(ListTtlMs, CacheScope.public_));
 
-	if (http)
-	{
-		StreamableHttpOptions opts;
-		opts.bindAddresses = [host];
-		() @trusted {
-			stderr.writefln("caching-server listening on http://%s:%d/mcp", host, port);
-		}();
-		runStreamableHttp(server, port, opts);
-	}
-	else
-	{
-		// stdio: the deployable shape; the matching client.d spawns this binary
-		// and drives it end-to-end over its stdin/stdout.
-		runStdio(server);
-	}
+	// Transport selected by argv via the shared scaffold helper:
+	//   (no flags) -> runStdio ; --http [--port N] [--host H] -> runStreamableHttp.
+	runServerFromArgs(server, args, 8531);
 }
