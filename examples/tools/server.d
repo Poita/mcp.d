@@ -1,4 +1,4 @@
-/// MCP Tools example server (#348).
+/// MCP Tools example server (#348) — dual-transport (stdio + Streamable HTTP).
 ///
 /// Demonstrates, from the server side, the `@tool` reflection surface of the D
 /// MCP SDK:
@@ -8,19 +8,34 @@
 ///   - the behavioral marker UDAs `@readOnly` and `@destructive`
 ///     (plus `@idempotent`) that populate `ToolAnnotations`;
 ///   - `@describe` argument documentation;
+///   - returning a typed `CallToolResult` built with the typed `Content.make*`
+///     factories (`Content.makeText`, `Content.makeResourceLink`) — no
+///     hand-built content Json;
 ///   - `registerModule` to register module-level `@tool` free functions in one
 ///     call (no class instance required).
 ///
-/// The server speaks MCP over stdio (`runStdio`), which is the deployable shape:
-/// the matching `client.d` spawns this very binary and drives it end-to-end.
+/// The SAME binary speaks MCP over EITHER transport, selected at runtime:
+///   - `runStdio(server)`              (default — the deployable stdio shape);
+///   - `runStreamableHttp(server, …)`  (with `--http`, for the HTTP shape).
+///
+/// The matching `client.d` is a self-verifying e2e that drives this server over
+/// BOTH transports with the same transport-agnostic assertions.
 module tools_server;
 
+import std.getopt : getopt;
+import std.stdio : stderr;
 import std.typecons : Nullable, nullable;
 
 import mcp.api.attributes;
 import mcp.api.reflection : registerModule;
+import mcp.protocol.types : CallToolResult, Content;
 import mcp.server.server : McpServer;
 import mcp.transport.stdio : runStdio;
+import mcp.transport : StreamableHttpOptions, runStreamableHttp;
+
+/// The example's default HTTP port. The client uses the same default URL, and
+/// the README documents starting the server with `--http --port 8530`.
+enum ushort DefaultPort = 8530;
 
 /// An enum argument — the SDK emits a JSON Schema `enum` of its members.
 enum Op
@@ -110,10 +125,49 @@ string erase(@describe("record id") string id) @safe
 	return "erased " ~ id;
 }
 
-void main() @safe
+/// A tool that returns a typed `CallToolResult` assembled with the typed
+/// `Content.make*` factories — `Content.makeText` for a human-readable line and
+/// `Content.makeResourceLink` for a pointer to a related resource. This shows
+/// building multi-block tool content WITHOUT hand-writing any content Json.
+@tool("describe_doc", "Return a text note plus a resource link for a document id")
+@readOnly
+CallToolResult describeDoc(@describe("document id") string id) @safe
 {
+	CallToolResult r;
+	r.content = [
+		Content.makeText("Document " ~ id ~ " is available."),
+		Content.makeResourceLink("doc://" ~ id, "Document " ~ id, "text/plain"),
+	];
+	return r;
+}
+
+void main(string[] args)
+{
+	bool http;
+	ushort port = DefaultPort;
+	string host = "127.0.0.1";
+	getopt(args,
+		"http", "Serve over Streamable HTTP instead of stdio", &http,
+		"port|p", "HTTP port to listen on (default 8530)", &port,
+		"host|h", "HTTP address to bind (default 127.0.0.1)", &host);
+
 	auto server = new McpServer("tools-example", "1.0.0");
 	// Register every @tool free function in this module in one call.
 	registerModule!(tools_server)(server);
-	runStdio(server);
+
+	if (http)
+	{
+		StreamableHttpOptions opts;
+		opts.bindAddresses = [host];
+		() @trusted {
+			stderr.writefln("tools-server listening on http://%s:%d/mcp", host, port);
+		}();
+		runStreamableHttp(server, port, opts);
+	}
+	else
+	{
+		// stdio is the default deployable shape; the client spawns this binary
+		// without --http and drives it over stdin/stdout.
+		runStdio(server);
+	}
 }
