@@ -1,9 +1,10 @@
-# Caching (`CacheableResult`) example
+# Caching (`CacheableResult`) example — dual transport
 
 A focused, self-contained example showing the draft MCP **`CacheableResult`**
 freshness hints (`ttlMs` / `cacheScope`) from *both* sides — a server that
-attaches them and a client that reads them — over the **Streamable HTTP**
-transport.
+attaches them (in ergonomic **UDA style**) and a client that reads them — over
+**both** the **stdio** and **Streamable HTTP** transports from a single binary
+each.
 
 It is its own dub package (depends on the root `mcp` via a path dependency) and
 does **not** modify the root `dub.json`.
@@ -13,14 +14,16 @@ does **not** modify the root `dub.json`.
 Cache hints let a server tell clients and intermediaries how long a result may
 be reused and by whom (`public` shared cache vs `private` per-client cache).
 They are **draft-only** (protocol `2026-07-28`): the server only emits the
-fields when the negotiated protocol is the stateless draft.
+fields when the negotiated protocol is the stateless draft, and the client must
+opt in with `client.enableDraft()`.
 
-- **Per-resource hint** — `server.d` passes a `CacheHint` as the optional third
-  argument of `registerResource(descriptor, reader, cacheHint)`. It rides on
-  that resource's `resources/read` result.
+- **Per-resource hint** — `server.d` declares it with the `@cache(ttlMs, scope)`
+  UDA on a `@resource` method; `registerHandlers` plumbs it onto that resource's
+  `resources/read` result.
   ```d
-  server.registerResource(config, &readConfig,
-      nullable(CacheHint(60_000, CacheScope.private_)));
+  @resource("config://app", "Application configuration", "application/json")
+  @cache(60_000, "private")
+  string config() @safe { return `{"theme":"dark","retries":3}`; }
   ```
 - **Per-list hint** — `server.d` calls
   `server.setListCacheHint("resources/list", CacheHint(5_000, CacheScope.public_))`.
@@ -34,10 +37,31 @@ A third resource (`status://live`) is registered with **no** hint, and the
 client asserts that its read carries **no** cache hint — proving the absence is
 reported faithfully.
 
+## Typed APIs used
+
+The server stays in the ergonomic UDA style (`@resource` + `@cache` +
+`registerHandlers`) — no low-level raw-Json registration. Cache hints are passed
+as typed `CacheHint` / `CacheScope` values, and the client consumes typed
+`listResources()` / `readResource()` results whose `.cache` field is a typed
+`Nullable!CacheHint`. (This example has no tool/elicitation/sampling surface, so
+the typed elicitation / MRTR-builder / Content APIs do not apply here.)
+
+## Dual transport — one binary each
+
+Both `server.d` and `client.d` pick their transport from flags:
+
+| Side   | stdio (default)              | HTTP                                       |
+| ------ | ---------------------------- | ------------------------------------------ |
+| server | (no flags) → `runStdio`      | `--http [--port N] [--host H]` → `runStreamableHttp` |
+| client | (no flags) → spawns server   | `--http http://127.0.0.1:N/mcp` → `McpClient.http` |
+
+The client's assertions are transport-agnostic, so the SAME client verifies both
+transports.
+
 ## Self-verifying e2e test
 
-`client.d` is also an end-to-end regression test. It asserts the concrete
-values that `server.d` set:
+`client.d` is also an end-to-end regression test. It asserts the concrete values
+that `server.d` set:
 
 | Surface                       | `ttlMs` | `cacheScope` |
 | ----------------------------- | ------- | ------------ |
@@ -50,30 +74,52 @@ differed and exits non-zero.
 
 ## Running it
 
-This is an HTTP example, so it runs in two steps (two terminals, or background
-the server). Start the server, then run the client against it:
+### stdio (simplest — the client spawns the server)
 
 ```sh
-# terminal 1 — start the server (serves http://127.0.0.1:8531/mcp)
-dub run -c server
-
-# terminal 2 — run the self-verifying client
+dub build -c server && dub build -c client
 dub run -c client
 echo "exit code: $?"   # 0 = all assertions passed
 ```
 
-One-shot equivalent (what CI does):
+The client locates the built `caching-server` binary next to itself, spawns it
+over stdio (no `--http`), drives it, and reaps it on exit.
+
+### HTTP (two steps)
 
 ```sh
 dub build -c server && dub build -c client
-./caching-server &        # background the server
+
+# terminal 1 — start the HTTP server (serves http://127.0.0.1:8531/mcp)
+dub run -c server -- --http --port 8531
+
+# terminal 2 — run the self-verifying client against it
+dub run -c client -- --http http://127.0.0.1:8531/mcp
+echo "exit code: $?"   # 0 = all assertions passed
+```
+
+One-shot HTTP equivalent (what CI does):
+
+```sh
+dub build -c server && dub build -c client
+./caching-server --http --port 8531 &
 SERVER_PID=$!
-sleep 2
-./caching-client          # exits 0 on success, non-zero on any mismatch
+sleep 3
+./caching-client --http http://127.0.0.1:8531/mcp
 RESULT=$?
 kill $SERVER_PID
 exit $RESULT
 ```
 
-The server port can be changed with `--port`; point the client at it with
-`--url http://127.0.0.1:<port>/mcp`.
+The HTTP port can be changed with `--port`; point the client at it with
+`--http http://127.0.0.1:<port>/mcp`.
+
+## Auth
+
+Authentication (OAuth bearer tokens) is an **HTTP-only** concern in MCP: the
+OAuth flows and the `Authorization: Bearer <token>` header live on the HTTP
+transport. There is no stdio equivalent (stdio is a local, trusted pipe between
+parent and child process), so `client.setBearerToken(...)` is a no-op over
+stdio. This caching example does not require auth; if you fronted the HTTP server
+with an OAuth-protected deployment, you would attach the token on the HTTP
+client only.
