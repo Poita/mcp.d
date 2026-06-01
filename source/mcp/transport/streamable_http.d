@@ -511,6 +511,33 @@ unittest  // stable revisions terminate sessions on DELETE; the draft answers 40
 	assert(!deleteTerminatesSession(ProtocolVersion.draft));
 }
 
+/// Decide whether protocol-level sessions apply to a POST request
+/// (basic/transports §Backward Compatibility / §Earlier Streamable HTTP
+/// Revisions). The stable revisions (2025-03-26 / 2025-06-18 / 2025-11-25) carry
+/// protocol-level sessions: the server mints an `Mcp-Session-Id` on the
+/// `InitializeResult` and requires the client to echo it on every later request.
+/// The draft removed protocol-level sessions (revision 2026-07-28: "Removal of
+/// protocol-level sessions"), so a draft-only server "SHOULD respond as follows:
+/// ... An `Mcp-Session-Id` header on a request: ignore it, and do not mint or echo
+/// session IDs."
+///
+/// Returns true when POST session minting/requiring applies (stable revisions),
+/// false when the server must neither mint nor require a session id (the draft) —
+/// mirroring the version gates `getOpensSseStream` (GET) and
+/// `deleteTerminatesSession` (DELETE) already apply.
+bool sessionsApply(ProtocolVersion negotiated) @safe
+{
+	return !negotiated.isDraft;
+}
+
+unittest  // stable revisions mint/require Mcp-Session-Id on POST; the draft does not
+{
+	assert(sessionsApply(ProtocolVersion.v2025_11_25));
+	assert(sessionsApply(ProtocolVersion.v2025_06_18));
+	assert(sessionsApply(ProtocolVersion.v2025_03_26));
+	assert(!sessionsApply(ProtocolVersion.draft));
+}
+
 /// The value of the `Allow` header a 405 Method Not Allowed response must carry
 /// at the MCP endpoint. Per RFC 9110 §10.2.1 the `Allow` header MUST enumerate
 /// the set of methods the resource actually supports. On the stable revisions
@@ -726,7 +753,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 	// `initialize` (which receives a freshly-minted Mcp-Session-Id); every
 	// later request MUST carry that id (400 when absent, 404 when unknown or
 	// terminated). The id is also issued for the InitializeResult below.
-	if (sessions !is null)
+	if (sessions !is null && sessionsApply(server.negotiatedVersion))
 	{
 		const isInit = !input.isBatch && input.messages.length == 1
 			&& input.messages[0].method == "initialize";
@@ -833,7 +860,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 	case MessageKind.request:
 		// Session Management: assign a session id on the InitializeResult so the
 		// client can echo it on subsequent requests. Set before writing the body.
-		if (sessions !is null
+		if (sessions !is null && sessionsApply(server.negotiatedVersion)
 				&& msg.method == "initialize")
 			res.headers[SessionHeader] = sessions.create();
 		// The MCP-Protocol-Version header was already validated by
