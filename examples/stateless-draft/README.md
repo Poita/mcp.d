@@ -39,8 +39,24 @@ hand-built request/response Json on the server:
 - The `@resource` `greeting` method's draft freshness hint is declared with the
   `@cache(ttlMs, scope)` UDA, and `registerHandlers` wires everything up.
 
-(Client tool *arguments* stay dynamic `Json` — that is fine; the client is a
-generic consumer.)
+The client side likewise uses the SDK's typed surface where it cleanly applies:
+
+- It calls `add` with a typed **`callTool("add", AddArgs(2, 40))`** instead of
+  hand-building an `arguments` Json object.
+- It reads the result's `structuredContent` back as a typed struct via
+  **`res.structuredContentAs!SumResult`**, asserting on `sum.sum` rather than
+  indexing raw `Json`.
+
+(The *error-path* call still passes a dynamic `Json.emptyObject`, since it is a
+deliberately malformed call to an unknown tool.)
+
+The client still owns the spawned stdio server via an explicit `ServerProcess`
+(`ProcessPipes`) helper rather than `McpClient.spawn`: in this revision of the
+SDK `spawnStdioTransport` lets the subprocess pipes' `File` handles be
+refcounted to zero when the spawn helper returns, so the first write fails with
+"Attempting to write to closed File". Once that lifetime bug is fixed upstream
+the `ServerProcess` boilerplate can be replaced with
+`McpClient.spawn([serverBinaryPath()])` + `client.close()`.
 
 ## Files
 

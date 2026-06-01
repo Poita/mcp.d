@@ -21,7 +21,8 @@
  *     freshness hint (`cache.ttlMs` / `cache.cacheScope`) matches the server's
  *     per-list hint;
  *   - a `tools/call` returns the expected (typed-struct-derived)
- *     `structuredContent` and JSON text mirror;
+ *     `structuredContent` — read back via `structuredContentAs!SumResult` — and
+ *     the JSON text mirror;
  *   - `readResource()` returns the expected text and the per-resource draft
  *     cache hint (`ttlMs` / `cacheScope`);
  *   - a bad `tools/call` returns the expected JSON-RPC error code.
@@ -69,6 +70,12 @@ private void printLine(string s) @trusted nothrow
 /// Owns the server subprocess and exposes the newline-delimited JSON-RPC channel
 /// expected by `McpClient.stdio`. Holding `ProcessPipes` in a class field keeps
 /// the stdin/stdout `File` handles alive for the lifetime of the client.
+///
+/// (The SDK's `McpClient.spawn` would replace this boilerplate, but its
+/// `spawnStdioTransport` currently lets the subprocess pipes' `File` handles be
+/// refcounted to zero when the spawn helper returns — the next write fails with
+/// "Attempting to write to closed File". Until that is fixed upstream this
+/// example keeps the explicit, working `ProcessPipes` owner.)
 final class ServerProcess
 {
 	private ProcessPipes pipes;
@@ -113,6 +120,24 @@ private string serverBinaryPath() @safe
 	import std.path : dirName, buildPath;
 
 	return buildPath(dirName(thisExePath()), "stateless-draft-server");
+}
+
+/// Typed arguments for the `add` tool. Passing this struct to the typed
+/// `callTool` overload lets the SDK marshal the JSON-RPC `arguments` object from
+/// the struct shape — no hand-built `Json` for a statically-known call.
+struct AddArgs
+{
+	long a;
+	long b;
+}
+
+/// Typed view of the `add` tool's `structuredContent`, mirroring the server's
+/// `SumResult`. `structuredContentAs!SumResult` decodes the result's
+/// `structuredContent` object into this struct, so the e2e asserts on a typed
+/// field instead of reaching into raw `Json`.
+struct SumResult
+{
+	long sum;
 }
 
 int main(string[] args)
@@ -209,10 +234,8 @@ private int runE2E(McpClient client, bool overHttp) @safe
 	}
 
 	// --- 4. tools/call: typed-struct-derived structuredContent + text mirror --
-	Json addArgs = Json.emptyObject;
-	addArgs["a"] = 2;
-	addArgs["b"] = 40;
-	auto res = client.callTool("add", addArgs);
+	// Pass typed args (the SDK marshals the `arguments` object from the struct).
+	auto res = client.callTool("add", AddArgs(2, 40));
 	c.check(!res.isError, "add tool call should not be an error result");
 	// The @tool returns a SumResult struct; the SDK mirrors it into a single
 	// JSON text content block and into structuredContent.
@@ -220,11 +243,9 @@ private int runE2E(McpClient client, bool overHttp) @safe
 			~ res.content.length.to!string);
 	if (res.content.length == 1)
 		c.eq(res.content[0].text, `{"sum":42}`, "add result text (struct JSON mirror)");
-	c.check(res.structuredContent.type == Json.Type.object
-			&& "sum" in res.structuredContent,
-			"add result should carry structuredContent.sum");
-	if (res.structuredContent.type == Json.Type.object && "sum" in res.structuredContent)
-		c.eq(res.structuredContent["sum"].get!long, 42L, "add structuredContent.sum");
+	// Decode structuredContent into the typed struct instead of reading raw Json.
+	auto sum = res.structuredContentAs!SumResult;
+	c.eq(sum.sum, 42L, "add structuredContent.sum (typed)");
 
 	// --- 5. readResource + per-resource draft cache hint ----------------------
 	auto rr = client.readResource("demo://greeting");
