@@ -1,0 +1,4 @@
+*.a
+*.lib
+.dub/
+dub.selections.json
