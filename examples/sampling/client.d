@@ -38,9 +38,7 @@ module sampling_client;
 import std.algorithm : canFind, map;
 import std.array : array;
 import std.getopt : getopt;
-import std.process : ProcessPipes, pipeProcess, Redirect, wait;
 import std.stdio : stderr, writeln;
-import std.string : stripRight;
 
 import mcp;
 
@@ -77,45 +75,6 @@ struct ModelResult
 	string model;
 }
 
-/// Owns the server subprocess and exposes the newline-delimited JSON-RPC channel
-/// expected by `McpClient.stdio`. Holding `ProcessPipes` in a class field keeps
-/// the stdin/stdout `File` handles alive for the lifetime of the client.
-final class ServerProcess
-{
-	private ProcessPipes pipes;
-
-	this(string[] command) @trusted
-	{
-		pipes = pipeProcess(command, Redirect.stdin | Redirect.stdout);
-	}
-
-	/// Read one response line (terminator stripped), or null at EOF.
-	string readLine() @trusted
-	{
-		auto f = pipes.stdout;
-		if (f.eof)
-			return null;
-		auto ln = f.readln();
-		if (ln.length == 0 && f.eof)
-			return null;
-		return ln.stripRight("\r\n");
-	}
-
-	/// Write one request line (the channel appends the terminator).
-	void writeLine(string s) @trusted
-	{
-		pipes.stdin.writeln(s);
-		pipes.stdin.flush();
-	}
-
-	/// Close stdin and reap the child.
-	void shutdown() @trusted
-	{
-		pipes.stdin.close();
-		wait(pipes.pid);
-	}
-}
-
 int main(string[] args)
 {
 	string url; // empty => stdio
@@ -132,7 +91,7 @@ int main(string[] args)
 			scope (exit)
 				exitEventLoop();
 			try
-				rc = run(McpClient.http(url), null);
+				rc = run(McpClient.http(url));
 			catch (Throwable t) // AssertError + exceptions both fail the e2e
 			{
 				logFail(t.msg);
@@ -144,13 +103,12 @@ int main(string[] args)
 	}
 
 	// STDIO: spawn the built server binary (no --http) and drive it synchronously.
-	// Server->client sampling replies are written inline on the same channel, so
-	// no event loop is required (same model as examples/tools/client.d).
-	auto proc = new ServerProcess([serverBinaryPath()]);
-	scope (exit)
-		proc.shutdown();
+	// `McpClient.spawn` owns the subprocess pipes and its `close()` runs the MCP
+	// stdio shutdown sequence (SIGTERM->SIGKILL). Server->client sampling replies
+	// are written inline on the same channel, so no event loop is required (same
+	// model as examples/tools/client.d).
 	try
-		return run(McpClient.stdio(&proc.readLine, &proc.writeLine), proc);
+		return run(McpClient.spawn([serverBinaryPath()]));
 	catch (Throwable t)
 	{
 		logFail(t.msg);
@@ -159,9 +117,10 @@ int main(string[] args)
 }
 
 /// Transport-agnostic e2e: drives `client` and asserts the mocked sampling value
-/// flows server→client→server. `proc` is non-null only for stdio (so we can keep
-/// it referenced); the assertions never look at the transport.
-private int run(McpClient client, Object proc) @safe
+/// flows server→client→server. The assertions never look at the transport, so the
+/// SAME run() verifies both. For stdio, `client.close()` runs the MCP stdio
+/// shutdown sequence on the spawned subprocess; for HTTP it stops background streams.
+private int run(McpClient client) @safe
 {
 	scope (exit)
 		client.close();
