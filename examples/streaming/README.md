@@ -1,8 +1,9 @@
-# examples/streaming — Progress / logging / cancellation
+# examples/streaming — Progress / logging / cancellation + typed elicitation & sampling
 
 A self-contained example (its own dub package) showing how the **server** emits
-and the **client** consumes the three "in-flight" channels of MCP over the
-**Streamable HTTP** transport:
+and the **client** consumes MCP's in-flight channels, plus the **typed**
+server→client round-trip APIs — over **BOTH transports**: stdio and Streamable
+HTTP. One server binary serves either transport; one client verifies both.
 
 - **Progress** — `ctx.reportProgress(done, total, message)` →
   `notifications/progress`, observed via `McpClient.onProgress`.
@@ -12,68 +13,93 @@ and the **client** consumes the three "in-flight" channels of MCP over the
   early; on Streamable HTTP the cancellation signal is the client closing its
   response stream (basic/utilities/cancellation §Transport-Specific
   Cancellation), which the handler also detects as a failed send.
+- **Typed elicitation** — `ctx.elicit!Confirm(message)` derives the
+  `requestedSchema` from a flat struct via `jsonSchemaOf!T` and returns a typed
+  `ElicitResult` (branch on `.action`, decode with `.contentAs!Confirm`) — no
+  hand-built schema Json (#436).
+- **Typed sampling** — `ctx.sample(CreateMessageRequest)` builds the request
+  from typed `SamplingMessage` + `Content.makeText` and parses the typed
+  `CreateMessageResult` reply (#437).
 
 The `client.d` is **not just a demo — it is a self-verifying end-to-end test**.
 Every observation is asserted against the value the server promised; on any
 mismatch it prints what differed and exits non-zero. On success it prints a
-one-line `OK:` summary and exits 0. CI runs the client to catch behavioral
-regressions.
+one-line `OK [stdio]:` / `OK [http]:` summary and exits 0.
 
 ## What it teaches
 
-The server (`server.d`) exposes:
+The server (`server.d`, ergonomic UDA style — `@tool` + `registerHandlers`)
+exposes three tools:
 
 - `countdown(steps, delayMs)` — walks `steps` units of work. Each step sleeps,
   reports progress `i/steps`, and logs an `info` line tagged with the logger
   name `countdown`. It honors cancellation and returns structured output
-  `{ completed, total, cancelled }`.
+  `{ completed, total, cancelled }` (inferred from the struct return).
+- `summarize(text)` — mid-handler it **blocks** on the typed server→client
+  round-trip: a typed elicitation (schema derived from the flat `Confirm`
+  struct) confirms the tone, then typed sampling produces a summary. Returns
+  `{ status, tone, model, summary }`. These round-trips work over **both**
+  transports.
 - `cancel_stats()` — returns `{ cancelled }`, the number of `countdown` runs
   that observed a cancellation. Used by the client to confirm, out of band, that
   a mid-flight cancellation was actually honored.
 
 The client (`client.d`) verifies, in order:
 
-1. **Progress + logging** (pinned to the released protocol 2025-11-25, where
-   `logging/setLevel` and full notification streaming are available):
-   `listTools()` contains `countdown`; a call carrying a `progressToken` streams
-   exactly N progress notifications (monotonically increasing, echoing the
-   token, last == total) and N `info` log messages from the `countdown` logger
-   *before* the final result `{completed:N, total:N, cancelled:false}`.
-2. **Cancellation** (draft protocol): a long `countdown` is started on its own
-   task; once the first progress proves it is in flight, the client tears down
-   its stream. The server stops the work early.
-3. **Verify + health**: a fresh client reads `cancel_stats` and asserts the
-   counter increased (concrete proof the cancellation was honored), then runs
-   another `countdown` to confirm the server is still healthy.
+1. **List + progress + logging** (transport-agnostic): `listTools()` contains
+   `countdown` / `summarize` / `cancel_stats`; a `countdown` call carrying a
+   `progressToken` streams exactly N progress notifications (monotonically
+   increasing, echoing the token, last == total) and N `info` log messages from
+   the `countdown` logger before the final result.
+2. **Typed elicitation + sampling** (transport-agnostic): the client's mocked
+   `onElicitation` accepts with concrete values and its mocked `onSampling`
+   returns a concrete model + text; the structured result echoes them exactly.
+3. **Error code** (transport-agnostic): an unknown tool raises `McpException`
+   with `invalidParams` (-32602).
+4. **Cancellation** (HTTP only): a long `countdown` is started on its own task;
+   once the first progress proves it is in flight, the client tears down its
+   stream and a fresh `cancel_stats` read confirms the counter increased.
 
-## Run it (two terminals)
+## Run it
 
-Streamable HTTP, so the server runs in one terminal and the client connects to
-its URL in another.
+### stdio (default)
 
-```sh
-# terminal 1 — start the server (serves http://127.0.0.1:9357/mcp)
-dub run -c server
-
-# terminal 2 — run the self-verifying client; exits 0 on OK, non-zero on mismatch
-dub run -c client
-```
-
-Override the address if needed:
-
-```sh
-dub run -c server -- --port 9999 --host 127.0.0.1
-dub run -c client -- http://127.0.0.1:9999/mcp
-```
-
-### One-shot (what CI does)
+The client spawns the server binary itself and talks to it over stdin/stdout —
+a single command, no ports.
 
 ```sh
 dub build -c server && dub build -c client
-./streaming-server &                 # background
+dub run -c client            # spawns ./streaming-server (stdio); exits 0 on OK
+```
+
+### Streamable HTTP
+
+Start the server with `--http` in one terminal, then point the client at its
+URL in another.
+
+```sh
+# terminal 1 — start the HTTP server (serves http://127.0.0.1:9357/mcp)
+dub run -c server -- --http --port 9357
+
+# terminal 2 — run the self-verifying client against that URL
+dub run -c client -- --http http://127.0.0.1:9357/mcp
+```
+
+Override the bind address/port if needed:
+
+```sh
+dub run -c server -- --http --port 9999 --host 127.0.0.1
+dub run -c client -- --http http://127.0.0.1:9999/mcp
+```
+
+### One-shot (what CI does for HTTP)
+
+```sh
+dub build -c server && dub build -c client
+./streaming-server --http --port 9357 &   # background
 SERVER=$!
-sleep 1
-./streaming-client                   # the e2e; check the exit code
+sleep 3
+./streaming-client --http http://127.0.0.1:9357/mcp   # the e2e; check the exit code
 RC=$?
 kill $SERVER
 exit $RC
@@ -84,9 +110,16 @@ A non-zero client exit code means a behavioral regression — the client prints
 
 ## Notes
 
+- **Why cancellation is HTTP-only.** Mid-flight cancellation here relies on the
+  client dropping its per-request SSE response stream — the Streamable HTTP
+  cancellation signal. The stdio transport serves one request to completion
+  before reading the next line, so there is no in-flight stream to drop; the
+  client therefore skips phase 4 over stdio. Progress, logging, structured
+  results, and the typed elicitation/sampling round-trips all run over both
+  transports.
+- **Auth is HTTP only.** OAuth (bearer tokens, the protected-resource metadata
+  handshake, the authorization-server flow) is defined over HTTP request
+  headers; the stdio transport has no header channel, so authentication is not
+  applicable to the stdio path. See `examples/auth` for the HTTP auth example.
 - The example is its own dub package with a path dependency on the root `mcp`
   SDK (`"mcp": { "path": "../.." }`). It does not modify the root `dub.json`.
-- The progress/logging assertions pin protocol 2025-11-25 so logs and
-  `logging/setLevel` behave deterministically; the cancellation phase uses the
-  draft revision, whose Streamable HTTP cancellation is the dropped response
-  stream.
