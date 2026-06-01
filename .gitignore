@@ -22,3 +22,8 @@ __dummy.html
 
 # code coverage output (dub test --coverage)
 *.lst
+
+# built example binaries (each examples/<name>/ is its own dub package whose
+# server/client configs build <name>-server / <name>-client)
+examples/*/*-server
+examples/*/*-client

@@ -1,5 +1,0 @@
-resources-server
-resources-client
-*.o
-.dub/
-dub.selections.json

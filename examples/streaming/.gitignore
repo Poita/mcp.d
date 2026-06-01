@@ -1,5 +1,0 @@
-streaming-server
-streaming-client
-*.o
-.dub/
-dub.selections.json
