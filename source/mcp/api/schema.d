@@ -110,10 +110,14 @@ Json jsonSchemaOf(T)() @safe
 		Json required = Json.emptyArray;
 		static foreach (i, field; FieldNameTuple!T)
 		{
-			props[field] = jsonSchemaOf!(typeof(__traits(getMember, T, field)));
-			static if (!isInstanceOf!(Nullable, typeof(__traits(getMember, T,
-					field))) && !hasFieldDefault!(T, i))
-				required ~= Json(field);
+			{
+				alias FT = typeof(__traits(getMember, T, field));
+				Json prop = jsonSchemaOf!FT;
+				applyFieldFacets!(T, field)(prop);
+				props[field] = prop;
+				static if (!isInstanceOf!(Nullable, FT) && !hasFieldDefault!(T, i))
+					required ~= Json(field);
+			}
 		}
 		s["properties"] = props;
 		if (required.length > 0)
@@ -127,6 +131,53 @@ Json jsonSchemaOf(T)() @safe
 				~ " SumType are supported)");
 	}
 	return s;
+}
+
+/// Emit the field-level facet UDAs (`@minimum`, `@maximum`, `@title`,
+/// `@schemaDefault`) declared on `T.field` onto its property schema `prop`.
+/// Fields without these UDAs are left untouched, preserving existing behaviour.
+private void applyFieldFacets(T, string field)(ref Json prop) @safe
+{
+	import mcp.api.attributes : minimum, maximum, title, SchemaDefault;
+	import std.traits : getUDAs, hasUDA;
+
+	alias member = __traits(getMember, T, field);
+
+	static if (hasUDA!(member, minimum))
+		prop["minimum"] = Json(getUDAs!(member, minimum)[0].value);
+	static if (hasUDA!(member, maximum))
+		prop["maximum"] = Json(getUDAs!(member, maximum)[0].value);
+	static if (hasUDA!(member, title))
+		prop["title"] = Json(getUDAs!(member, title)[0].value);
+
+	static foreach (uda; getUDAs!(member, SchemaDefault))
+		prop["default"] = schemaDefaultJson(uda.value);
+}
+
+/// Serialize a `@schemaDefault` value into its JSON wire form. An `enum` value
+/// becomes its member name (matching the enum's `{type:"string", enum:[…]}`
+/// schema); all other supported scalars serialize directly.
+private Json schemaDefaultJson(V)(V value) @safe
+{
+	static if (is(V == enum))
+	{
+		import std.conv : to;
+
+		return Json(to!string(value));
+	}
+	else static if (is(V == bool))
+		return Json(value);
+	else static if (isIntegral!V)
+		return Json(cast(long) value);
+	else static if (isFloatingPoint!V)
+		return Json(cast(double) value);
+	else static if (isSomeString!V)
+		return Json(value);
+	else
+	{
+		static assert(false,
+				"schemaDefaultJson: unsupported @schemaDefault value type " ~ V.stringof);
+	}
 }
 
 /// A field type permitted in an elicitation form schema: a scalar (string /
@@ -560,4 +611,95 @@ private template hasFieldDefault(T, size_t i)
 			good["a"] = 1;
 			good["b"] = 2;
 			assert(validateAgainstSchema(good, schema) == "");
+		}
+
+		unittest  // @minimum / @maximum emit numeric bounds on the property schema
+		{
+			import mcp.api.attributes : minimum, maximum;
+
+			struct Form
+			{
+				@minimum(1) @maximum(100) int count;
+			}
+
+			auto s = jsonSchemaOf!Form;
+			auto count = s["properties"]["count"];
+			assert(count["type"].get!string == "integer");
+			assert(count["minimum"].get!double == 1.0);
+			assert(count["maximum"].get!double == 100.0);
+		}
+
+		unittest  // @title emits the display title on the property schema
+		{
+			import mcp.api.attributes : title;
+
+			struct Form
+			{
+				@title("Item count") int count;
+			}
+
+			auto s = jsonSchemaOf!Form;
+			assert(s["properties"]["count"]["title"].get!string == "Item count");
+		}
+
+		unittest  // @schemaDefault emits an integer default
+		{
+			import mcp.api.attributes : schemaDefault;
+
+			struct Form
+			{
+				@schemaDefault(10) int limit;
+			}
+
+			auto s = jsonSchemaOf!Form;
+			assert(s["properties"]["limit"]["default"].get!long == 10);
+		}
+
+		unittest  // @schemaDefault emits a bool false default
+		{
+			import mcp.api.attributes : schemaDefault;
+
+			struct Form
+			{
+				@schemaDefault(false) bool verbose;
+			}
+
+			auto s = jsonSchemaOf!Form;
+			assert("default" in s["properties"]["verbose"]);
+			assert(s["properties"]["verbose"]["default"].get!bool == false);
+		}
+
+		unittest  // @schemaDefault on an enum field emits the enum's wire value
+		{
+			import mcp.api.attributes : schemaDefault;
+
+			enum Mode
+				{
+				fast,
+				slow
+			}
+
+			struct Form
+			{
+				@schemaDefault(Mode.slow) Mode mode;
+			}
+
+			auto s = jsonSchemaOf!Form;
+			assert(s["properties"]["mode"]["default"].get!string == "slow");
+		}
+
+		unittest  // a field with no facet UDAs is unchanged
+		{
+			struct Form
+			{
+				int count;
+			}
+
+			auto s = jsonSchemaOf!Form;
+			auto count = s["properties"]["count"];
+			assert(count["type"].get!string == "integer");
+			assert("minimum" !in count);
+			assert("maximum" !in count);
+			assert("title" !in count);
+			assert("default" !in count);
 		}
