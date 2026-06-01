@@ -1,0 +1,25 @@
+# Codecov configuration.
+# Coverage is produced by `dub test --coverage` (dmd-style .lst files) and
+# converted to lcov.info by scripts/cov-to-lcov.sh, then uploaded by the CI
+# `coverage` job (.github/workflows/ci.yml).
+coverage:
+  precision: 1
+  round: down
+  status:
+    project:
+      default:
+        # Report coverage but never fail CI on a coverage delta — CI gates on
+        # tests/lint/conformance, not a coverage threshold.
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# Exclude non-library code so the percentage reflects the shipped SDK only.
+ignore:
+  - "source/**/*_test.d"   # in-repo test-only modules (reflection/public-surface/peer-roundtrip)
+  - "conformance/**"       # conformance harness
+  - "examples/**"          # example programs
+
+# No PR comment spam; the badge + the Codecov UI are enough.
+comment: false
