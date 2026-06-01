@@ -4573,7 +4573,7 @@ version (unittest)
 				auto answer = ctx.elicit("When?", Json.emptyObject);
 				CallToolResult r;
 				r.content = [
-					Content.makeText("booked " ~ answer["content"]["day"].get!string)
+					Content.makeText("booked " ~ answer.content["day"].get!string)
 				];
 				return ToolResponse.complete(r);
 			}

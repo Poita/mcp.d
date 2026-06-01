@@ -1,7 +1,7 @@
 module mcp.protocol.types;
 
 import std.typecons : Nullable, nullable;
-import vibe.data.json : Json, parseJsonString;
+import vibe.data.json : Json, parseJsonString, deserializeJson;
 import mcp.protocol.capabilities;
 import mcp.protocol.versions : ProtocolVersion;
 import mcp.protocol.draft : InputRequest, inputRequestsToJson,
@@ -2786,6 +2786,18 @@ struct ElicitResult
 			r.meta = j["_meta"];
 		return r;
 	}
+
+	/// Decode the `accept` `content` map (values keyed by schema property name)
+	/// into a typed struct `T`. Pairs with `RequestContext.elicit!T`, whose
+	/// `requestedSchema` is derived from the same `T`. Only meaningful for an
+	/// `accept`; on a `decline`/`cancel` (no content) this returns `T.init`, so
+	/// callers should branch on `action` first.
+	T contentAs(T)() const @safe
+	{
+		if (content.type != Json.Type.object)
+			return T.init;
+		return () @trusted { return deserializeJson!T(content); }();
+	}
 }
 
 /// Result of the `roots/list` request (client/roots).
@@ -2971,6 +2983,27 @@ unittest  // ElicitResult.fromJson parses decline
 	j["action"] = "decline";
 	auto r = ElicitResult.fromJson(j);
 	assert(r.action == ElicitAction.decline);
+}
+
+unittest  // ElicitResult.contentAs!T decodes the accept content into a typed struct
+{
+	static struct Booking
+	{
+		string date;
+		int travelers;
+		bool insurance;
+	}
+
+	Json c = Json.emptyObject;
+	c["date"] = Json("2026-07-01");
+	c["travelers"] = Json(3);
+	c["insurance"] = Json(true);
+	auto r = ElicitResult.accept(c);
+
+	auto b = r.contentAs!Booking;
+	assert(b.date == "2026-07-01");
+	assert(b.travelers == 3);
+	assert(b.insurance == true);
 }
 
 unittest  // Resource emits annotations (audience/priority/lastModified)

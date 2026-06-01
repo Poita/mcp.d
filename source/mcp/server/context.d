@@ -5,12 +5,41 @@ import vibe.data.json : Json;
 
 import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
-import mcp.protocol.types : ListRootsResult;
+import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction;
+import mcp.api.schema : jsonSchemaOf;
 import mcp.auth.resource_server : TokenInfo;
 import mcp.protocol.jsonrpc : makeNotification;
 import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
 
 @safe:
+
+/// A field type permitted in an elicitation form schema: a scalar (string /
+/// number / integer / boolean / enum), optionally wrapped in `Nullable`. The
+/// elicitation `requestedSchema` (SEP-1034/1330) is a flat object of such
+/// primitives — no nested objects or arrays.
+private template isElicitScalar(F)
+{
+	import std.traits : isIntegral, isFloatingPoint, isSomeString, isInstanceOf;
+	import std.typecons : Nullable;
+
+	static if (isInstanceOf!(Nullable, F))
+		enum isElicitScalar = isElicitScalar!(typeof(F.init.get()));
+	else
+		enum isElicitScalar = is(F == bool) || isIntegral!F
+			|| isFloatingPoint!F || isSomeString!F || is(F == enum);
+}
+
+/// True when `T` is a flat struct whose every field is an `isElicitScalar`,
+/// i.e. a valid type to derive an elicitation form `requestedSchema` from.
+package template isFlatElicitationStruct(T)
+{
+	import std.meta : allSatisfy;
+
+	static if (is(T == struct))
+		enum isFlatElicitationStruct = allSatisfy!(isElicitScalar, typeof(T.tupleof));
+	else
+		enum isFlatElicitationStruct = false;
+}
 
 /// The RFC 5424 severity ordering used by `notifications/message` logging
 /// (server/utilities/logging). Lower index == less severe; a message is emitted
@@ -219,7 +248,9 @@ interface RequestContext
 	/// defaults to `"form"`. For URL-mode elicitation use `elicitUrl`. Throws
 	/// when the client did not declare the `elicitation.form` submode (a bare
 	/// `elicitation:{}` is treated as form-only for 2025-06-18 compatibility).
-	final Json elicit(string message, Json requestedSchema) @safe
+	/// Returns the client's reply parsed into a typed `ElicitResult` (branch on
+	/// `.action`; read collected values via `.content` or `.contentAs!T`).
+	final ElicitResult elicit(string message, Json requestedSchema) @safe
 	{
 		if (isStateless)
 			throw invalidRequest("elicit() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
@@ -231,7 +262,21 @@ interface RequestContext
 		Json params = Json.emptyObject;
 		params["message"] = message;
 		params["requestedSchema"] = requestedSchema;
-		return sendRequest("elicitation/create", params);
+		return ElicitResult.fromJson(sendRequest("elicitation/create", params));
+	}
+
+	/// Typed convenience over `elicit(string, Json)`: derive the form
+	/// `requestedSchema` from the flat struct `T` via `jsonSchemaOf!T`, send the
+	/// elicitation, and return the typed `ElicitResult`. On an `accept`, decode
+	/// the collected values with `result.contentAs!T`. `T` must be a flat struct
+	/// of scalar fields (string / number / integer / boolean / enum, optionally
+	/// `Nullable`) — the elicitation schema restriction (SEP-1034/1330) forbids
+	/// nested objects and arrays, enforced here at compile time.
+	ElicitResult elicit(T)(string message) @safe
+	{
+		static assert(isFlatElicitationStruct!T, "elicit!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
+				.stringof ~ " has a nested or non-scalar field");
+		return elicit(message, jsonSchemaOf!T);
 	}
 
 	/// Request URL-mode elicitation from the client (`elicitation/create` with
@@ -242,12 +287,13 @@ interface RequestContext
 	/// `url`, and `elicitationId`. Throws when the client did not declare the
 	/// `elicitation.url` submode.
 	///
-	/// Returns the client's `{action}` response (typically `accept`/`decline`/
-	/// `cancel`). Throws on a stateless (MRTR) request — use
-	/// `ToolResponse.inputRequired` instead — or if the client does not support
-	/// elicitation, if `url`/`elicitationId` are empty, or if `url` is not a
-	/// valid absolute URI (the spec requires `url` to contain a valid URL).
-	final Json elicitUrl(string message, string url, string elicitationId) @safe
+	/// Returns the client's response parsed into a typed `ElicitResult` (the
+	/// `action` is typically `accept`/`decline`/`cancel`). Throws on a stateless
+	/// (MRTR) request — use `ToolResponse.inputRequired` instead — or if the
+	/// client does not support elicitation, if `url`/`elicitationId` are empty,
+	/// or if `url` is not a valid absolute URI (the spec requires `url` to
+	/// contain a valid URL).
+	final ElicitResult elicitUrl(string message, string url, string elicitationId) @safe
 	{
 		if (isStateless)
 			throw invalidRequest("elicitUrl() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
@@ -266,7 +312,7 @@ interface RequestContext
 		params["message"] = message;
 		params["url"] = url;
 		params["elicitationId"] = elicitationId;
-		return sendRequest("elicitation/create", params);
+		return ElicitResult.fromJson(sendRequest("elicitation/create", params));
 	}
 
 	/// List the client's filesystem roots (`roots/list`). Per client/roots
@@ -745,7 +791,7 @@ unittest  // elicitUrl() emits mode:"url" with message, url, and elicitationId
 	assert(probe.lastParams["message"].get!string == "Authorize access");
 	assert(probe.lastParams["url"].get!string == "https://example.com/consent");
 	assert(probe.lastParams["elicitationId"].get!string == "elic-123");
-	assert(result["action"].get!string == "accept");
+	assert(result.action == ElicitAction.accept);
 }
 
 unittest  // form-mode elicit() does not set a mode field
@@ -856,7 +902,48 @@ unittest  // url-mode elicitUrl() succeeds when the client supports url mode
 	probe.supportsUrl = true;
 	auto r = probe.elicitUrl("msg", "https://example.com", "elic-1");
 	assert(probe.lastParams["mode"].get!string == "url");
-	assert(r["action"].get!string == "accept");
+	assert(r.action == ElicitAction.accept);
+}
+
+unittest  // form-mode elicit() returns a typed ElicitResult with the parsed action
+{
+	auto probe = new ElicitProbe;
+	ElicitResult r = probe.elicit("Pick one", Json.emptyObject);
+	assert(r.action == ElicitAction.accept);
+}
+
+unittest  // elicit!T derives requestedSchema from the struct via jsonSchemaOf
+{
+	import mcp.api.schema : jsonSchemaOf;
+
+	static struct TripDetails
+	{
+		int travelers;
+		bool insurance;
+	}
+
+	auto probe = new ElicitProbe;
+	ElicitResult r = probe.elicit!TripDetails("Trip details?");
+	assert(probe.lastMethod == "elicitation/create");
+	assert(probe.lastParams["message"].get!string == "Trip details?");
+	assert(probe.lastParams["requestedSchema"] == jsonSchemaOf!TripDetails);
+	assert(r.action == ElicitAction.accept);
+}
+
+unittest  // elicit!T rejects a non-flat (nested) struct at compile time
+{
+	static struct Inner
+	{
+		int x;
+	}
+
+	static struct Nested
+	{
+		Inner inner;
+	}
+
+	auto probe = new ElicitProbe;
+	static assert(!__traits(compiles, probe.elicit!Nested("nope")));
 }
 
 unittest  // listRoots() sends roots/list and parses the typed result
