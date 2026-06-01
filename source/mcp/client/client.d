@@ -3,7 +3,7 @@ module mcp.client.client;
 import std.algorithm : canFind, startsWith;
 import std.typecons : Nullable, nullable;
 
-import vibe.data.json : Json, parseJsonString;
+import vibe.data.json : Json, parseJsonString, serializeToJson;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
@@ -482,6 +482,25 @@ final class McpClient : ClientProtocol
 			ProgressToken progressToken, string logLevel) @safe
 	{
 		return callToolLoop(name, arguments, progressToken, logLevel);
+	}
+
+	/// Typed-arguments convenience: serialize the struct `args` to its JSON wire
+	/// shape via vibe's `serializeToJson` and forward to the `Json`-arguments
+	/// `callTool`. Lets callers pass a strongly typed parameter struct instead of
+	/// hand-building a `Json` object (#468). Equivalent to
+	/// `callTool(name, serializeToJson(args))`.
+	CallToolResult callTool(T)(string name, T args) @safe if (!is(T : Json))
+	{
+		return callTool(name, serializeToJson(args));
+	}
+
+	/// Typed-arguments convenience requesting progress updates: serialize the
+	/// struct `args` and forward to the `ProgressToken` `Json`-arguments overload
+	/// (see `callTool` with a `ProgressToken`) (#468).
+	CallToolResult callTool(T)(string name, T args, ProgressToken progressToken) @safe
+			if (!is(T : Json))
+	{
+		return callTool(name, serializeToJson(args), progressToken);
 	}
 
 	/// Issue `tools/call` and, against a draft server, complete any MRTR
@@ -1390,6 +1409,12 @@ final class McpClient : ClientProtocol
 			// A bare `elicitation` declaration is equivalent to form-mode only,
 			// so `elicitation` alone satisfies the form case.
 			{
+				// Gate on the capabilities actually advertised at the handshake
+				// (`effectiveCapabilities`), not the raw `capabilities` field:
+				// installing `onElicitation` alone auto-advertises the form submode
+				// on the wire (#463), so an inbound form request must be accepted
+				// even when no manual capability flags were set.
+				const advertised = effectiveCapabilities();
 				const mode = ("mode" in params && params["mode"].type == Json.Type.string) ? params["mode"]
 					.get!string : "form";
 				bool supported;
@@ -1401,11 +1426,11 @@ final class McpClient : ClientProtocol
 					// (`{"url":{}}` => elicitation=true, elicitationUrl=true,
 					// elicitationForm=false) does NOT declare form mode, so it must
 					// not satisfy the form case.
-					supported = capabilities.elicitationForm
-						|| (capabilities.elicitation && !capabilities.elicitationUrl);
+					supported = advertised.elicitationForm
+						|| (advertised.elicitation && !advertised.elicitationUrl);
 					break;
 				case "url":
-					supported = capabilities.elicitationUrl;
+					supported = advertised.elicitationUrl;
 					break;
 				default:
 					supported = false;
@@ -2169,6 +2194,28 @@ unittest  // bare elicitation declaration still accepts form-mode requests
 	assert(delegateCalled);
 }
 
+unittest  // #463: installing onElicitation alone accepts an inbound form elicitation/create
+{
+	auto c = McpClient.http("http://localhost");
+	// Install ONLY the handler; set NO manual capability flags. The documented
+	// auto-advertise contract sends the form submode via effectiveCapabilities()
+	// at the handshake, so an inbound form request must be accepted (not -32602).
+	assert(!c.capabilities.elicitation);
+	assert(!c.capabilities.elicitationForm);
+
+	bool delegateCalled;
+	c.onElicitation = (ElicitParams params) @safe {
+		delegateCalled = true;
+		return ElicitResult.init;
+	};
+
+	Json params = Json.emptyObject;
+	params["requestedSchema"] = Json.emptyObject; // mode absent => form
+
+	c.dispatchServerMethod("elicitation/create", params);
+	assert(delegateCalled);
+}
+
 unittest  // elicitation/complete for a known id is forwarded once, then ignored
 {
 	auto c = McpClient.http("http://localhost");
@@ -2505,6 +2552,30 @@ unittest  // buildToolCallParams omits _meta when no progress token is requested
 {
 	auto p = McpClient.buildToolCallParams("add", Json.emptyObject, ProgressToken.init);
 	assert("_meta" !in p);
+}
+
+unittest  // #468: typed callTool args serialize to the same wire object as hand-built Json
+{
+	import vibe.data.json : serializeToJson;
+
+	static struct AddArgs
+	{
+		int a;
+		int b;
+	}
+
+	// The typed overload forwards `serializeToJson(args)` to the Json overload,
+	// so the wire arguments object must match a hand-built Json exactly.
+	auto typed = serializeToJson(AddArgs(2, 3));
+	Json hand = Json.emptyObject;
+	hand["a"] = 2;
+	hand["b"] = 3;
+
+	auto fromTyped = McpClient.buildToolCallParams("add", typed, ProgressToken.init);
+	auto fromHand = McpClient.buildToolCallParams("add", hand, ProgressToken.init);
+	assert(fromTyped == fromHand);
+	assert(fromTyped["arguments"]["a"].get!int == 2);
+	assert(fromTyped["arguments"]["b"].get!int == 3);
 }
 
 unittest  // buildReadResourceParams attaches a progressToken under _meta
