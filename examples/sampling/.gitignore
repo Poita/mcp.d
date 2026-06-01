@@ -1,5 +1,0 @@
-sampling-server
-sampling-client
-*.o
-.dub/
-dub.selections.json
