@@ -1010,20 +1010,17 @@ final class McpServer
 	/// preserving the in-process behaviour of the no-argument overload.
 	string handleRaw(string text, scope void delegate(string) @safe sink) @safe
 	{
-		return handleRaw(text, sink, null, null);
+		return handleRaw(text, sink, null);
 	}
 
-	/// As `handleRaw(text, sink)`, but with the stdio server->client channels:
-	/// when a handler calls `ctx.sendRequest` (e.g. via `ctx.sample`/`ctx.elicit`)
-	/// `serverRequest(method, params)` is invoked to write the request and block
-	/// for the client's reply. `drainPending` (may be null) non-blockingly reads +
-	/// dispatches any pending inbound messages so a handler poll point can observe
-	/// an out-of-band `notifications/cancelled` (draft Transport-Specific
-	/// Cancellation over stdio). `null` for both reproduces the no-channel
-	/// behaviour (server->client requests throw, no cooperative drain).
+	/// As `handleRaw(text, sink)`, but with the stdio server->client request
+	/// channel: when a handler calls `ctx.sendRequest` (e.g. via
+	/// `ctx.sample`/`ctx.elicit`) `serverRequest(method, params)` is invoked to
+	/// write the request and block the current task for the client's reply (the
+	/// `DuplexChannel` correlates it on its read loop). `null` reproduces the
+	/// no-channel behaviour (server->client requests throw).
 	string handleRaw(string text, scope void delegate(string) @safe sink,
-			scope Json delegate(string, Json) @safe serverRequest,
-			scope void delegate() @safe drainPending = null) @safe
+			scope Json delegate(string, Json) @safe serverRequest) @safe
 	{
 		import vibe.data.json : parseJsonString;
 
@@ -1040,8 +1037,8 @@ final class McpServer
 				return handle(m);
 			if (serverRequest is null)
 				return handle(m, new StdioContext(sink, readProgressToken(m.params), negotiated));
-			return handle(m, new StdioContext(sink, serverRequest, drainPending,
-					clientCaps, readProgressToken(m.params), negotiated));
+			return handle(m, new StdioContext(sink, serverRequest, clientCaps,
+					readProgressToken(m.params), negotiated));
 		};
 
 		if (!input.isBatch)
