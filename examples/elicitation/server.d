@@ -7,18 +7,20 @@
  *
  * The `plan_trip` tool needs more information than its single `destination`
  * argument carries, so mid-handler it opens a server->client
- * `elicitation/create` request via the BLOCKING `ctx.elicit(message, schema)`.
+ * `elicitation/create` request via the BLOCKING typed `ctx.elicit!TripDetails(message)`.
  * The call BLOCKS until the client's `onElicitation` handler answers; the SDK
  * delivers the answer back as a typed `ElicitResult` (issue #436). The handler
  * branches on the user's `action` (accept / decline / cancel) and returns a
  * structured result the client can assert against.
  *
- * Typed-API adoption (closes the example half of #436/#437):
- *   - the requestedSchema is DERIVED from the flat struct `TripDetails` via
- *     `jsonSchemaOf!TripDetails` (then enriched with the rich facets — integer
- *     bounds, an enum default, a boolean default — that `jsonSchemaOf` cannot
- *     express on its own; SEP-1034/1330 permits them);
- *   - `ctx.elicit` returns a typed `ElicitResult`; on `accept` the collected
+ * Typed-API adoption (closes the example half of #436/#437, plus #465):
+ *   - the requestedSchema is DERIVED ENTIRELY from the flat struct `TripDetails`:
+ *     the rich facets (integer bounds, field titles, the enum/boolean defaults)
+ *     live as field UDAs (`@minimum`/`@maximum`/`@title`/`@schemaDefault`, #465)
+ *     that `jsonSchemaOf!TripDetails` now emits, so the typed
+ *     `ctx.elicit!TripDetails(message)` (#436) sends the whole SEP-1034/1330
+ *     restricted schema with NO hand-built Json;
+ *   - `ctx.elicit!T` returns a typed `ElicitResult`; on `accept` the collected
  *     values are decoded with `result.contentAs!TripDetails` instead of
  *     hand-reading the `content` Json;
  *   - the tool returns a `TripPlan` struct so the SDK infers the output schema
@@ -39,11 +41,10 @@ import std.getopt : getopt;
 import std.stdio : stderr;
 import std.typecons : nullable;
 
-import vibe.data.json : Json;
+import mcp;
 import vibe.data.serialization : optional;
 
-import mcp;
-import mcp.api.schema : jsonSchemaOf;
+import mcp.api.attributes : minimum, maximum, title, schemaDefault;
 import mcp.transport : StreamableHttpOptions, runStreamableHttp, runStdio;
 
 /// The fixed HTTP port the example binds, kept in one place so server.d,
@@ -83,10 +84,15 @@ void main(string[] args)
 }
 
 /// The flat elicitation form the server gathers from the client. Its scalar
-/// fields satisfy the elicitation schema restriction (SEP-1034/1330), so
-/// `jsonSchemaOf!TripDetails` derives the base `requestedSchema` and
-/// `ElicitResult.contentAs!TripDetails` decodes the accepted answer. The field
-/// defaults double as the values applied when the user omits an optional field.
+/// fields satisfy the elicitation schema restriction (SEP-1034/1330), and the
+/// rich facets the demo wants the client to see — field titles, the `travelers`
+/// integer bounds, and the `cabin`/`insurance` defaults — are declared inline as
+/// field UDAs (`@title`/`@minimum`/`@maximum`/`@schemaDefault`, #465). That lets
+/// `ctx.elicit!TripDetails(message)` derive the ENTIRE `requestedSchema` from
+/// this one struct (object type, the `required` set, the `cabin` enum members,
+/// and every facet) with no hand-built Json, and `result.contentAs!TripDetails`
+/// decodes the accepted answer. The D field initializers double as the values
+/// applied when the user omits an optional field.
 /// Cabin class — a D `enum`, so jsonSchemaOf derives the three enum members
 /// (["economy","premium","business"]) into the requestedSchema automatically.
 enum Cabin
@@ -98,14 +104,18 @@ enum Cabin
 
 struct TripDetails
 {
-	int travelers; /// required: number of travelers (bounds added to the schema)
-	@optional Cabin cabin = Cabin.economy; /// enum (members derived) + a default (added to the schema)
-	@optional bool insurance = false; /// boolean with a default (added to the schema)
+	/// required: number of travelers, with display title + integer bounds.
+	@title("Number of travelers") @minimum(1) @maximum(9) int travelers;
+	/// enum (members derived) + display title + an "economy" default; the field
+	/// initializer keeps it out of `required` and is the applied fallback.
+	@optional @title("Cabin class") @schemaDefault(Cabin.economy) Cabin cabin = Cabin.economy;
+	/// boolean with a display title + a `false` default (and matching fallback).
+	@optional @title("Add travel insurance") @schemaDefault(false) bool insurance = false;
 }
 
 /// The structured result `plan_trip` returns. Its fields become the tool's
 /// inferred output JSON Schema + `structuredContent`, so the client can assert
-/// concrete values.
+/// concrete values (decoded via `result.structuredContentAs!TripPlan`).
 struct TripPlan
 {
 	string status; /// "booked" | "declined" | "cancelled"
@@ -119,9 +129,11 @@ struct TripPlan
 /// The annotated MCP tool surface for this example.
 final class TripApi
 {
-	/// `plan_trip`: takes only a `destination`, then BLOCKS on `ctx.elicit` to
-	/// gather the remaining trip details with a rich requestedSchema (an integer
-	/// with bounds, an enum with a default, and a boolean with a default).
+	/// `plan_trip`: takes only a `destination`, then BLOCKS on the typed
+	/// `ctx.elicit!TripDetails` to gather the remaining trip details. The whole
+	/// rich requestedSchema (an integer with bounds, an enum with a default, and a
+	/// boolean with a default) is derived from `TripDetails`' field UDAs — no
+	/// hand-built schema Json.
 	///
 	/// `ctx` is auto-injected and omitted from the tool's inputSchema. The method
 	/// returns a `TripPlan` struct so the SDK infers the output schema and emits
@@ -131,37 +143,14 @@ final class TripApi
 	@describe("the destination city")
 	TripPlan planTrip(string destination, RequestContext ctx) @safe
 	{
-		// Start from the schema DERIVED from the TripDetails struct via
-		// jsonSchemaOf (object type + required + the cabin enum members), then
-		// enrich it with the rich facets jsonSchemaOf cannot express: titles,
-		// integer bounds, an enum default and a boolean default (all permitted by
-		// the SEP-1034/1330 restricted schema).
-		Json schema = jsonSchemaOf!TripDetails;
-		Json props = schema["properties"];
-
-		props["travelers"]["title"] = "Number of travelers";
-		props["travelers"]["minimum"] = 1;
-		props["travelers"]["maximum"] = 9;
-
-		props["cabin"]["title"] = "Cabin class";
-		props["cabin"]["default"] = "economy";
-
-		props["insurance"]["title"] = "Add travel insurance";
-		props["insurance"]["default"] = false;
-
-		// Only `travelers` is required; `cabin` and `insurance` are optional and
-		// fall back to the defaults above when the user omits them. (jsonSchemaOf
-		// cannot tell a `false` boolean default from bool.init, so set this
-		// explicitly to keep the requestedSchema consistent with the demo.)
-		Json required = Json.emptyArray;
-		required ~= Json("travelers");
-		schema["required"] = required;
-
-		// BLOCKING server->client elicitation. Returns once the client's
+		// BLOCKING server->client elicitation. The requestedSchema is derived
+		// wholesale from `TripDetails` (object type + required + the cabin enum
+		// members + the @title/@minimum/@maximum/@schemaDefault facets), so this is
+		// a single typed call with no hand-built Json. Returns once the client's
 		// onElicitation answers (the round-trip fixed for HTTP in #377, and
-		// inline-answered over stdio). `ctx.elicit` returns a typed `ElicitResult`
-		// (#436).
-		ElicitResult result = ctx.elicit("Please provide trip details for " ~ destination, schema);
+		// inline-answered over stdio). Yields a typed `ElicitResult` (#436).
+		ElicitResult result = ctx.elicit!TripDetails(
+				"Please provide trip details for " ~ destination);
 
 		final switch (result.action)
 		{
@@ -177,7 +166,7 @@ final class TripApi
 
 		// action == accept: decode the collected values into the typed struct.
 		// Fields the user omitted keep TripDetails' defaults ("economy" / false),
-		// which mirror the schema defaults.
+		// which mirror the schema defaults declared via @schemaDefault.
 		TripDetails details = result.contentAs!TripDetails;
 		const cabinName = details.cabin.to!string;
 

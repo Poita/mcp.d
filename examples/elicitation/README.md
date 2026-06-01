@@ -15,16 +15,16 @@ server can pause mid-handler and ask the connected client for structured input
 with a genuine server->client request:
 
 ```d
-ElicitResult result = ctx.elicit("Please provide trip details for " ~ destination, schema);
+ElicitResult result = ctx.elicit!TripDetails("Please provide trip details for " ~ destination);
 final switch (result.action) { /* accept / decline / cancel */ }
 TripDetails details = result.contentAs!TripDetails; // decode the accepted form
 ```
 
-`ctx.elicit(message, requestedSchema)` **blocks** until the client's
-`onElicitation` handler answers, then returns a typed `ElicitResult`. The
-`requestedSchema` is the SEP-1034/1330 restricted schema — a flat object of
-primitive fields, optionally with `enum`, `default`, `minimum`/`maximum`. This
-example sends:
+`ctx.elicit!TripDetails(message)` **blocks** until the client's `onElicitation`
+handler answers, then returns a typed `ElicitResult`. The `requestedSchema` is
+derived wholesale from the `TripDetails` struct — the SEP-1034/1330 restricted
+schema is a flat object of primitive fields, optionally with `enum`, `default`,
+`minimum`/`maximum`. This example sends:
 
 - `travelers` — `integer` with `minimum: 1`, `maximum: 9` (required),
 - `cabin` — `string` `enum` `["economy","premium","business"]` with
@@ -34,22 +34,30 @@ example sends:
 The handler branches on the user's decision (`accept` / `decline` / `cancel`)
 and, on `accept`, applies the schema defaults for any field the user omitted.
 
-### Typed-API adoption (#436 / #437)
+### Typed-API adoption (#436 / #437 / #464 / #465 / #466 / #468 / #470)
 
 This example uses the SDK's **typed elicitation APIs** rather than hand-built
-Json:
+Json, on both sides of the wire:
 
-- the `requestedSchema` is **derived** from the flat struct `TripDetails` via
-  `jsonSchemaOf!TripDetails` — the object type, the `required` set and the
-  `cabin` enum members all come from the struct. The server then enriches that
-  base schema with the rich facets `jsonSchemaOf` cannot express on its own
-  (field titles, the `travelers` integer bounds, the `cabin` enum default, the
-  `insurance` boolean default), which SEP-1034/1330 permits;
-- `ctx.elicit` returns a typed `ElicitResult`; the handler branches on
+- the `requestedSchema` is **derived wholesale** from the flat struct
+  `TripDetails` by `ctx.elicit!TripDetails(message)`: the object type, the
+  `required` set and the `cabin` enum members come from reflection, while the
+  rich facets (field titles, the `travelers` integer bounds, the `cabin` enum
+  default, the `insurance` boolean default) are declared as field UDAs
+  (`@title`/`@minimum`/`@maximum`/`@schemaDefault`, #465) that `jsonSchemaOf`
+  now emits — so the server builds **no schema Json by hand** (SEP-1034/1330);
+- `ctx.elicit!T` returns a typed `ElicitResult`; the handler branches on
   `.action` and, on `accept`, decodes the collected values with
   `result.contentAs!TripDetails` instead of hand-reading the `content` Json;
 - `plan_trip` returns a `TripPlan` struct, so the SDK infers the output schema
-  and emits `structuredContent` the client can assert against.
+  and emits `structuredContent` the client decodes with
+  `result.structuredContentAs!TripPlan` (#464);
+- the **client** spawns the stdio server with `McpClient.spawn([serverBinaryPath()])`
+  + `scope(exit) client.close()` (#470) — no hand-rolled `ProcessPipes`
+  plumbing — passes tool arguments as the typed `PlanArgs(destination)` struct
+  (#468), and answers `accept` with `ElicitResult.accept(AcceptForm(3))` (#466).
+  Installing `onElicitation` alone advertises form elicitation (the inbound gate
+  honours `effectiveCapabilities()`, #463), so no raw capability flags are set.
 
 The server is written in the SDK's ergonomic **UDA style**: `plan_trip` is an
 annotated typed method on `TripApi`, wired up with a single `registerHandlers`

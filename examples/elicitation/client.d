@@ -9,11 +9,12 @@
  *
  * Transport selection (transport-agnostic assertions — the SAME `run` verifies
  * both):
- *   STDIO (default): no `--http` -> spawn the built `elicitation-server` binary
- *     (without --http) and talk to it over its stdin/stdout via
- *     `McpClient.stdio(&proc.readLine, &proc.writeLine)`. The blocking
- *     elicitation is answered inline on the same channel, so this needs no event
- *     loop.
+ *   STDIO (default): no `--http` -> `McpClient.spawn([serverBinaryPath()])`
+ *     launches the built `elicitation-server` binary (without --http) and owns
+ *     its stdin/stdout JSON-RPC channel; `client.close()` runs the stdio
+ *     shutdown sequence (SIGTERM -> SIGKILL) on the subprocess (#470). The
+ *     blocking elicitation is answered inline on the same channel, so this needs
+ *     no event loop.
  *   HTTP: `--http <url>` -> `McpClient.http(url)`. The blocking server->client
  *     elicitation rides the Streamable HTTP SSE channel, which requires a vibe
  *     event loop, so the HTTP run is wrapped in `runTask`/`runEventLoop`.
@@ -23,15 +24,29 @@
  *   http:   dub run -c server -- --http --port 9355   (term 1)
  *           dub run -c client -- --http http://127.0.0.1:9355/mcp  (term 2)
  *
+ * Typed-API adoption (#466 / #464 / #468 / #470):
+ *   - stdio spawns the server with `McpClient.spawn` + `scope(exit) close()`,
+ *     replacing the hand-rolled ServerProcess / ProcessPipes plumbing (#470);
+ *   - the `accept` handler returns `ElicitResult.accept(AcceptForm(3))` — the
+ *     struct's fields become the collected `{name: value}` content map (#466) —
+ *     instead of hand-building a Json object;
+ *   - the `plan_trip` arguments are passed as the typed `PlanArgs(destination)`
+ *     struct (#468), not a hand-built Json;
+ *   - the structured result is decoded once with `result.structuredContentAs!
+ *     TripPlan` (#464) and the assertions read its typed fields;
+ *   - installing `onElicitation` alone advertises form elicitation — the inbound
+ *     gate now honours effectiveCapabilities() (#463), so the redundant raw
+ *     `client.capabilities.elicitation*` flag-setting is gone.
+ *
  * What it verifies, in order, on whichever transport is selected:
  *   A. DISCOVERY — `listTools()` contains `plan_trip` (with `destination` as a
  *      required arg and the injected `ctx` correctly omitted from the schema).
  *   B. ACCEPT (with defaults) — a client whose `onElicitation` returns
- *      `accept{travelers:3}` (omitting cabin + insurance) drives a `plan_trip`
+ *      `accept(AcceptForm(3))` (omitting cabin + insurance) drives a `plan_trip`
  *      call. The client asserts the elicitation request carried the rich
  *      requestedSchema (the `cabin` enum with 3 members + its `"economy"`
  *      default, the `travelers` integer bounds, the `insurance` boolean default),
- *      and that the final structuredContent is
+ *      and that the final TripPlan is
  *      `{status:"booked", travelers:3, cabin:"economy", insurance:false}` —
  *      proving the server applied the schema defaults for the omitted fields and
  *      the accepted value flowed through the blocking round-trip.
@@ -49,57 +64,41 @@ module elicitation_client;
 import std.algorithm : startsWith, canFind, map;
 import std.array : array;
 import std.getopt : getopt;
-import std.process : ProcessPipes, pipeProcess, Redirect, wait;
 import std.stdio : stderr, writeln;
-import std.string : stripRight;
 
 import vibe.data.json : Json;
 
 import mcp;
 import mcp.protocol.errors : McpException;
+import mcp.protocol.types : asNumber;
 
-/// Owns one server subprocess and exposes the newline-delimited JSON-RPC channel
-/// `McpClient.stdio` expects. Holding `ProcessPipes` in a class field keeps the
-/// stdin/stdout `File` handles alive for the client's lifetime (mirrors the
-/// pattern in examples/tools/client.d).
-final class ServerProcess
+/// Typed arguments for the `plan_trip` tool (#468): passed to `callTool` as a
+/// struct so the client never hand-builds the arguments Json.
+struct PlanArgs
 {
-	private ProcessPipes pipes;
+	string destination;
+}
 
-	this(string[] command) @trusted
-	{
-		pipes = pipeProcess(command, Redirect.stdin | Redirect.stdout);
-	}
+/// The `accept` form the client submits (#466): only `travelers` is supplied, so
+/// `ElicitResult.accept(AcceptForm(3))` produces the `{travelers: 3}` content
+/// map and the server applies its schema defaults for the omitted cabin +
+/// insurance fields.
+struct AcceptForm
+{
+	int travelers;
+}
 
-	/// Read one response line (terminator stripped), or null at EOF.
-	string readLine() @trusted
-	{
-		auto f = pipes.stdout;
-		if (f.eof)
-			return null;
-		auto ln = f.readln();
-		if (ln.length == 0 && f.eof)
-			return null;
-		return ln.stripRight("\r\n");
-	}
-
-	/// Write one request line (the channel appends the terminator).
-	void writeLine(string s) @trusted
-	{
-		pipes.stdin.writeln(s);
-		pipes.stdin.flush();
-	}
-
-	/// Close stdin and reap the child.
-	void shutdown() @trusted
-	{
-		try
-			pipes.stdin.close();
-		catch (Exception)
-		{
-		}
-		wait(pipes.pid);
-	}
+/// Mirrors the server's `TripPlan` structured output so the client can decode it
+/// with `result.structuredContentAs!TripPlan` (#464) and assert typed fields
+/// instead of hand-reading raw `structuredContent` Json.
+struct TripPlan
+{
+	string status;
+	string destination;
+	int travelers;
+	string cabin;
+	bool insurance;
+	string summary;
 }
 
 /// Absolute path to the `elicitation-server` binary, resolved next to this
@@ -125,23 +124,15 @@ int main(string[] args)
 
 	const useHttp = url.length != 0;
 
-	// Track every spawned stdio server so we can reap them on exit. For HTTP the
-	// list stays empty.
-	ServerProcess[] procs;
-	scope (exit)
-		foreach (p; procs)
-			p.shutdown();
-
-	// A fresh client per scenario: stdio spawns a new server subprocess; HTTP
-	// opens a new connection to the same URL. Returning a transport-agnostic
-	// `McpClient` keeps the assertion body identical for both transports.
-	McpClient makeClient() @trusted
+	// A fresh client per scenario: stdio spawns a new server subprocess (owned by
+	// the returned client, terminated by its close()); HTTP opens a new connection
+	// to the same URL. Returning a transport-agnostic `McpClient` keeps the
+	// assertion body identical for both transports.
+	McpClient makeClient() @safe
 	{
 		if (useHttp)
 			return McpClient.http(url);
-		auto proc = new ServerProcess([serverBinaryPath()]);
-		procs ~= proc;
-		return McpClient.stdio(&proc.readLine, &proc.writeLine);
+		return McpClient.spawn([serverBinaryPath()]);
 	}
 
 	int rc;
@@ -195,22 +186,17 @@ private void check(bool cond, lazy string msg) @safe
 		throw new Exception(msg);
 }
 
-/// Read a JSON number as an int, tolerating either integral or double encoding.
-private int asInt(Json j) @safe
-{
-	if (j.type == Json.Type.float_)
-		return cast(int) j.get!double;
-	return j.get!int;
-}
-
 /// The transport-agnostic e2e body. `makeClient` yields a fresh connected-but-
-/// not-yet-initialized client each call (a new stdio subprocess or a new HTTP
-/// connection); every assertion is identical across transports.
+/// not-yet-initialized client each call (a new spawned stdio subprocess or a new
+/// HTTP connection); every assertion is identical across transports. Each client
+/// is closed on scope exit so a spawned stdio server is reaped (#470).
 private int run(McpClient delegate() @safe makeClient) @safe
 {
 	// ---- A. DISCOVERY -----------------------------------------------------
 	{
 		auto client = makeClient();
+		scope (exit)
+			client.close();
 		auto init = client.initialize();
 		check(init.serverInfo.name == "elicitation-example",
 				"server name: expected 'elicitation-example', got '" ~ init.serverInfo.name ~ "'");
@@ -236,25 +222,22 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		bool sawElicit;
 
 		auto client = makeClient();
-		// Declare form-mode elicitation explicitly so the inbound dispatcher accepts
-		// the server's `elicitation/create` (the inbound check reads the raw
-		// `capabilities`, not the auto-advertised set).
-		client.capabilities.elicitation = true;
-		client.capabilities.elicitationForm = true;
+		scope (exit)
+			client.close();
+		// Installing onElicitation alone advertises form elicitation; the inbound
+		// gate now honours effectiveCapabilities() (#463), so no raw capability
+		// flags are needed.
 		client.onElicitation = (ElicitParams p) @safe {
 			seen = p;
 			sawElicit = true;
-			// Accept, supplying only `travelers`; leave cabin + insurance to the
-			// server's schema defaults ("economy" / false).
-			Json content = Json.emptyObject;
-			content["travelers"] = 3;
-			return ElicitResult.accept(content);
+			// Accept, supplying only `travelers` via the typed AcceptForm (#466);
+			// leave cabin + insurance to the server's schema defaults
+			// ("economy" / false).
+			return ElicitResult.accept(AcceptForm(3));
 		};
 		client.initialize();
 
-		Json a = Json.emptyObject;
-		a["destination"] = "Kyoto";
-		auto r = client.callTool("plan_trip", a);
+		auto r = client.callTool("plan_trip", PlanArgs("Kyoto"));
 
 		check(!r.isError, "plan_trip (accept) should not be an error");
 		check(sawElicit, "client should have received an elicitation/create request");
@@ -268,79 +251,74 @@ private int run(McpClient delegate() @safe makeClient) @safe
 				"elicitation requestedSchema should be an object");
 		auto sprops = seen.requestedSchema["properties"];
 		// enum + default on `cabin` (enum members derived from the struct,
-		// default added by the server).
+		// default declared via @schemaDefault).
 		auto cabin = sprops["cabin"];
 		check(cabin["enum"].length == 3, "cabin enum should have 3 members");
 		check(cabin["default"].get!string == "economy", "cabin default should be 'economy'");
-		// bounds on `travelers`.
+		// bounds on `travelers` (declared via @minimum/@maximum).
 		auto travelers = sprops["travelers"];
-		check(asInt(travelers["minimum"]) == 1 && asInt(travelers["maximum"]) == 9,
+		check(asNumber(travelers["minimum"]) == 1 && asNumber(travelers["maximum"]) == 9,
 				"travelers should have minimum 1 / maximum 9");
-		// default on `insurance`.
+		// default on `insurance` (declared via @schemaDefault(false)).
 		check(sprops["insurance"]["default"].get!bool == false, "insurance default should be false");
 
-		// The accepted value + applied defaults appear in the structured result.
-		auto sc = r.structuredContent;
-		check(sc["status"].get!string == "booked",
-				"accept status should be 'booked', got: " ~ sc["status"].get!string);
-		check(sc["destination"].get!string == "Kyoto", "destination should be 'Kyoto'");
-		check(asInt(sc["travelers"]) == 3, "travelers should be 3 (the accepted value)");
-		check(sc["cabin"].get!string == "economy", "cabin should default to 'economy' when omitted");
-		check(sc["insurance"].get!bool == false, "insurance should default to false when omitted");
+		// The accepted value + applied defaults appear in the structured result,
+		// decoded once into the typed TripPlan (#464).
+		auto plan = r.structuredContentAs!TripPlan;
+		check(plan.status == "booked", "accept status should be 'booked', got: " ~ plan.status);
+		check(plan.destination == "Kyoto", "destination should be 'Kyoto'");
+		check(plan.travelers == 3, "travelers should be 3 (the accepted value)");
+		check(plan.cabin == "economy", "cabin should default to 'economy' when omitted");
+		check(plan.insurance == false, "insurance should default to false when omitted");
 	}
 
 	// ---- C. DECLINE -------------------------------------------------------
 	{
 		auto client = makeClient();
-		client.capabilities.elicitation = true;
-		client.capabilities.elicitationForm = true;
+		scope (exit)
+			client.close();
 		client.onElicitation = (ElicitParams p) @safe {
 			return ElicitResult.decline();
 		};
 		client.initialize();
 
-		Json a = Json.emptyObject;
-		a["destination"] = "Oslo";
-		auto r = client.callTool("plan_trip", a);
+		auto r = client.callTool("plan_trip", PlanArgs("Oslo"));
 		check(!r.isError, "plan_trip (decline) should not be a tool error");
-		check(r.structuredContent["status"].get!string == "declined",
-				"decline status should be 'declined', got: "
-				~ r.structuredContent["status"].get!string);
+		auto plan = r.structuredContentAs!TripPlan;
+		check(plan.status == "declined", "decline status should be 'declined', got: " ~ plan.status);
 	}
 
 	// ---- D. CANCEL --------------------------------------------------------
 	{
 		auto client = makeClient();
-		client.capabilities.elicitation = true;
-		client.capabilities.elicitationForm = true;
+		scope (exit)
+			client.close();
 		client.onElicitation = (ElicitParams p) @safe {
 			return ElicitResult.cancel();
 		};
 		client.initialize();
 
-		Json a = Json.emptyObject;
-		a["destination"] = "Lima";
-		auto r = client.callTool("plan_trip", a);
+		auto r = client.callTool("plan_trip", PlanArgs("Lima"));
 		check(!r.isError, "plan_trip (cancel) should not be a tool error");
-		check(r.structuredContent["status"].get!string == "cancelled",
-				"cancel status should be 'cancelled', got: "
-				~ r.structuredContent["status"].get!string);
+		auto plan = r.structuredContentAs!TripPlan;
+		check(plan.status == "cancelled", "cancel status should be 'cancelled', got: " ~ plan
+				.status);
 	}
 
 	// ---- E. UNSUPPORTED (no onElicitation -> server refuses to elicit) ----
 	{
 		auto client = makeClient();
+		scope (exit)
+			client.close();
 		// Deliberately install NO onElicitation handler, so this client does not
 		// advertise the elicitation capability. The server's ctx.elicit then
 		// refuses to send to a non-elicitation client, and the tool fails.
 		client.initialize();
 
-		Json a = Json.emptyObject;
-		a["destination"] = "Cairo";
 		bool failed;
 		try
 		{
-			auto r = client.callTool("plan_trip", a);
+			auto r = client.callTool("plan_trip", PlanArgs("Cairo"));
 			// Over some transports the refusal surfaces as a tool error result
 			// rather than a JSON-RPC error; accept either as the expected failure.
 			failed = r.isError;
@@ -351,9 +329,9 @@ private int run(McpClient delegate() @safe makeClient) @safe
 				~ "does not support elicitation");
 	}
 
-	writeln("OK: elicitation example e2e passed — blocking ctx.elicit, ",
+	writeln("OK: elicitation example e2e passed — blocking ctx.elicit!T, ",
 			"rich requestedSchema (enum+default, integer bounds, boolean default) seen by ",
-			"the client, accept applies server defaults (decoded via contentAs!T), ",
+			"the client, accept applies server defaults (decoded via structuredContentAs!T), ",
 			"decline/cancel branch, and a non-elicitation client makes the tool error.");
 	return 0;
 }
