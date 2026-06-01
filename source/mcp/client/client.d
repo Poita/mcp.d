@@ -70,6 +70,29 @@ Json withProgressToken(Json params, ProgressToken token) @safe
 	return params;
 }
 
+/// Merge a per-request log level into a request's
+/// `params._meta["io.modelcontextprotocol/logLevel"]` (`MetaKey.logLevel`), per
+/// the draft (2026-07-28) server/utilities/logging rule that "Clients control
+/// logging verbosity per-request via `_meta`" (SEP-2575/2577, which removed the
+/// `logging/setLevel` RPC). A conformant draft server MUST NOT emit
+/// `notifications/message` for a request that omits this field, so attaching it
+/// is the only way a draft client can opt in to log messages for the request.
+/// An empty `level` leaves `params` unchanged. Any existing `_meta` keys are
+/// preserved. Exposed so callers can attach a log level to a hand-built params
+/// object; only meaningful on a draft-negotiated session.
+Json withRequestLogLevel(Json params, string level) @safe
+{
+	if (level.length == 0)
+		return params;
+	if (params.type != Json.Type.object)
+		params = Json.emptyObject;
+	Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"]
+		: Json.emptyObject;
+	meta[MetaKey.logLevel] = level;
+	params["_meta"] = meta;
+	return params;
+}
+
 /// A Model Context Protocol client, transport-agnostic.
 ///
 /// Speaks pure JSON-RPC + protocol logic over a `ClientTransport` (Streamable
@@ -110,6 +133,16 @@ final class McpClient : ClientProtocol
 	// Tool Parameters"). Populated by listTools; consumed by `headersFor`,
 	// which the HTTP transport calls to obtain the per-message headers.
 	private Json[string] toolInputSchemas_;
+	// Draft (2026-07-28) per-request logging opt-in. The draft removed the
+	// `logging/setLevel` RPC; a client instead controls verbosity by stamping
+	// `_meta["io.modelcontextprotocol/logLevel"]` on each request, and a
+	// conformant server emits no `notifications/message` for a request that
+	// omits it (server/utilities/logging, SEP-2575/2577). This is the sticky
+	// default level applied to every draft request by `injectDraftMeta`; empty
+	// means "no opt-in" (no field stamped). Set via `setLogLevel` on a draft
+	// session. Per-request overrides go through the request-method overloads /
+	// `withRequestLogLevel` and are NOT stored here.
+	private string requestLogLevel_;
 
 	/// Capabilities this client advertises at initialize. Treated as a baseline:
 	/// unless `autoAdvertiseCapabilities` is disabled, the capabilities actually
@@ -438,6 +471,19 @@ final class McpClient : ClientProtocol
 		return callToolLoop(name, arguments, progressToken);
 	}
 
+	/// `tools/call`, opting in to per-request log messages on the draft protocol.
+	/// `logLevel` is the minimum `LogLevel` severity (e.g. `"debug"`) the server
+	/// should emit `notifications/message` at for this call; it is carried in
+	/// `params._meta["io.modelcontextprotocol/logLevel"]` (draft
+	/// server/utilities/logging, SEP-2575/2577). On a released protocol the field
+	/// is ignored by the server (use `setLogLevel`). An empty `logLevel` attaches
+	/// nothing. Drives the same MRTR loop as the other overloads.
+	CallToolResult callTool(string name, Json arguments,
+			ProgressToken progressToken, string logLevel) @safe
+	{
+		return callToolLoop(name, arguments, progressToken, logLevel);
+	}
+
 	/// Issue `tools/call` and, against a draft server, complete any MRTR
 	/// (SEP-2322) round-trips by satisfying each `InputRequest` and resubmitting
 	/// the request with the answers. Returns the first completed `CallToolResult`.
@@ -447,7 +493,8 @@ final class McpClient : ClientProtocol
 	/// input type is missing, or the loop bound is exceeded, the (still
 	/// `inputRequired`) result is returned so the caller can inspect it via
 	/// `CallToolResult.isInputRequired`.
-	private CallToolResult callToolLoop(string name, Json arguments, ProgressToken progressToken) @safe
+	private CallToolResult callToolLoop(string name, Json arguments,
+			ProgressToken progressToken, string logLevel = "") @safe
 	{
 		enum maxRounds = 16;
 		InputResponse[] responses;
@@ -458,6 +505,10 @@ final class McpClient : ClientProtocol
 		{
 			auto params = buildToolCallParams(name, arguments, progressToken,
 					responses, requestState);
+			// Per-request draft logging opt-in: stamp the explicit level so
+			// `injectDraftMeta` carries it (and leaves it to win over any sticky
+			// `setLogLevel` default). Empty -> no field.
+			params = withRequestLogLevel(params, logLevel);
 			auto result = CallToolResult.fromJson(rpc("tools/call", params));
 			if (!result.isInputRequired)
 				return result;
@@ -479,8 +530,9 @@ final class McpClient : ClientProtocol
 		}
 		// Bound exceeded: return whatever the last round produced (still an
 		// inputRequired result) rather than looping forever.
-		return CallToolResult.fromJson(rpc("tools/call", buildToolCallParams(name,
-				arguments, progressToken, responses, requestState)));
+		return CallToolResult.fromJson(rpc("tools/call",
+				withRequestLogLevel(buildToolCallParams(name,
+				arguments, progressToken, responses, requestState), logLevel)));
 	}
 
 	/// Satisfy one MRTR `InputRequest` by dispatching it to the matching client
@@ -691,6 +743,15 @@ final class McpClient : ClientProtocol
 				buildReadResourceParams(uri, progressToken)));
 	}
 
+	/// `resources/read`, opting in to per-request log messages on the draft
+	/// protocol (see `callTool` with a `logLevel`). `logLevel` is carried in
+	/// `params._meta["io.modelcontextprotocol/logLevel"]`; empty attaches nothing.
+	ReadResourceResult readResource(string uri, ProgressToken progressToken, string logLevel) @safe
+	{
+		return ReadResourceResult.fromJson(rpc("resources/read",
+				withRequestLogLevel(buildReadResourceParams(uri, progressToken), logLevel)));
+	}
+
 	/// Build the `resources/read` params, optionally attaching a progress token.
 	package static Json buildReadResourceParams(string uri, ProgressToken progressToken) @safe
 	{
@@ -739,6 +800,16 @@ final class McpClient : ClientProtocol
 	{
 		return GetPromptResult.fromJson(rpc("prompts/get",
 				buildGetPromptParams(name, arguments, progressToken)));
+	}
+
+	/// `prompts/get`, opting in to per-request log messages on the draft protocol
+	/// (see `callTool` with a `logLevel`). `logLevel` is carried in
+	/// `params._meta["io.modelcontextprotocol/logLevel"]`; empty attaches nothing.
+	GetPromptResult getPrompt(string name, Json arguments,
+			ProgressToken progressToken, string logLevel) @safe
+	{
+		return GetPromptResult.fromJson(rpc("prompts/get",
+				withRequestLogLevel(buildGetPromptParams(name, arguments, progressToken), logLevel)));
 	}
 
 	/// Build the `prompts/get` params, optionally attaching a progress token.
@@ -852,9 +923,26 @@ final class McpClient : ClientProtocol
 		return p;
 	}
 
-	/// `logging/setLevel`.
+	/// Set the minimum severity of `notifications/message` the server should
+	/// emit to this client.
+	///
+	/// On a released protocol (<= 2025-11-25) this sends the `logging/setLevel`
+	/// RPC. The draft (2026-07-28) REMOVED that RPC (SEP-2575/2577): a conformant
+	/// draft server answers `logging/setLevel` with -32601 and emits no
+	/// `notifications/message` for any request that does not carry
+	/// `_meta["io.modelcontextprotocol/logLevel"]`. So on a draft-negotiated
+	/// session this does NOT send the removed RPC; instead it records `level` as
+	/// the sticky per-request opt-in that `injectDraftMeta` stamps onto every
+	/// subsequent request's `_meta` (see `withRequestLogLevel` and the
+	/// request-method log-level overloads for a single-request override). Passing
+	/// an empty `level` clears the draft opt-in.
 	void setLogLevel(string level) @safe
 	{
+		if (useDraft)
+		{
+			requestLogLevel_ = level;
+			return;
+		}
 		Json p = Json.emptyObject;
 		p["level"] = level;
 		rpc("logging/setLevel", p);
@@ -970,8 +1058,22 @@ final class McpClient : ClientProtocol
 		// Project to the negotiated (draft) wire shape: draft has no top-level
 		// client `tasks` capability, so it is folded into the `extensions` map.
 		meta[MetaKey.clientCapabilities] = effectiveCapabilities().forVersion(negotiated).toJson();
+		// Draft per-request logging opt-in: stamp the sticky default level (set via
+		// `setLogLevel`) unless this request already carries an explicit
+		// `MetaKey.logLevel` (a per-request override via `withRequestLogLevel` / an
+		// overload), which must win. server/utilities/logging (SEP-2575/2577).
+		if (requestLogLevel_.length && MetaKey.logLevel !in meta)
+			meta[MetaKey.logLevel] = requestLogLevel_;
 		params["_meta"] = meta;
 		return params;
+	}
+
+	/// Test seam: run `injectDraftMeta` from a unittest so the per-request draft
+	/// `_meta` (including the logging opt-in) can be asserted without a live
+	/// server. Production code never calls this.
+	version (unittest) package Json injectDraftMetaForTest(Json params) @safe
+	{
+		return injectDraftMeta(params);
 	}
 
 	/// Test seam: when set, `notify` routes the built notification message here
@@ -1452,6 +1554,152 @@ unittest  // selectMutualVersion reports no overlap
 	ProtocolVersion v;
 	assert(!selectMutualVersion(["1999-01-01"], v));
 	assert(!selectMutualVersion([], v));
+}
+
+unittest  // withRequestLogLevel stamps the draft per-request logLevel meta key
+{
+	// draft server/utilities/logging (SEP-2575/2577): the per-request opt-in is
+	// `_meta["io.modelcontextprotocol/logLevel"]`.
+	Json p = Json.emptyObject;
+	p["name"] = "tool";
+	auto stamped = withRequestLogLevel(p, "debug");
+	assert(stamped["_meta"][MetaKey.logLevel].get!string == "debug");
+	assert(stamped["name"].get!string == "tool"); // existing fields preserved
+}
+
+unittest  // withRequestLogLevel with an empty level is a no-op
+{
+	Json p = Json.emptyObject;
+	p["name"] = "tool";
+	auto same = withRequestLogLevel(p, "");
+	assert("_meta" !in same);
+}
+
+unittest  // withRequestLogLevel preserves existing _meta entries
+{
+	Json p = Json.emptyObject;
+	Json meta = Json.emptyObject;
+	meta["progressToken"] = "tok-1";
+	p["_meta"] = meta;
+	auto stamped = withRequestLogLevel(p, "warning");
+	assert(stamped["_meta"]["progressToken"].get!string == "tok-1");
+	assert(stamped["_meta"][MetaKey.logLevel].get!string == "warning");
+}
+
+unittest  // draft setLogLevel does NOT send the removed logging/setLevel RPC
+{
+	// The draft (2026-07-28) removed logging/setLevel (SEP-2575/2577); a conformant
+	// draft server answers it with -32601. So on a draft session setLogLevel must
+	// NOT POST that RPC — it records the sticky per-request opt-in instead.
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	bool sentRpc;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "logging/setLevel")
+			sentRpc = true;
+		return Json.emptyObject;
+	};
+	c.setLogLevel("debug");
+	assert(!sentRpc);
+}
+
+unittest  // draft setLogLevel makes injectDraftMeta stamp the per-request logLevel
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	c.setLogLevel("info");
+	auto meta = c.injectDraftMetaForTest(Json.emptyObject);
+	// Every subsequent draft request carries the opt-in field the server needs
+	// before it may emit notifications/message.
+	assert(meta["_meta"][MetaKey.logLevel].get!string == "info");
+}
+
+unittest  // injectDraftMeta omits logLevel when no opt-in level has been set
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	auto meta = c.injectDraftMetaForTest(Json.emptyObject);
+	// No setLogLevel/per-request level -> the server emits no notifications/message.
+	assert(MetaKey.logLevel !in meta["_meta"]);
+}
+
+unittest  // an explicit per-request logLevel wins over the sticky setLogLevel default
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	c.setLogLevel("error"); // sticky default
+	Json p = Json.emptyObject;
+	p = withRequestLogLevel(p, "debug"); // explicit per-request override
+	auto meta = c.injectDraftMetaForTest(p);
+	assert(meta["_meta"][MetaKey.logLevel].get!string == "debug");
+}
+
+unittest  // released-protocol setLogLevel still sends logging/setLevel
+{
+	// On a non-draft session the RPC still exists; setLogLevel must POST it.
+	auto c = McpClient.http("http://localhost");
+	string sentMethod;
+	Json sentParams = Json.undefined;
+	c.onRpcForTest = (string method, Json params) @safe {
+		sentMethod = method;
+		sentParams = params;
+		return Json.emptyObject;
+	};
+	c.setLogLevel("warning");
+	assert(sentMethod == "logging/setLevel");
+	assert(sentParams["level"].get!string == "warning");
+}
+
+unittest  // callTool logLevel overload attaches the draft per-request opt-in
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	Json seen = Json.undefined;
+	c.onNotifyForTest = (Json) @safe {};
+	c.onRpcForTest = (string method, Json params) @safe {
+		// onRpcForTest runs before injectDraftMeta, so the explicit per-request
+		// level pre-stamped by the overload is already present here.
+		if (method == "tools/call")
+			seen = params;
+		Json res = Json.emptyObject;
+		res["content"] = Json.emptyArray;
+		return res;
+	};
+	c.callTool("countdown", Json.emptyObject, ProgressToken.init, "debug");
+	assert(seen.type == Json.Type.object);
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
+}
+
+unittest  // readResource logLevel overload attaches the draft per-request opt-in
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	Json seen = Json.undefined;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "resources/read")
+			seen = params;
+		Json res = Json.emptyObject;
+		res["contents"] = Json.emptyArray;
+		return res;
+	};
+	c.readResource("file:///x", ProgressToken.init, "notice");
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "notice");
+}
+
+unittest  // getPrompt logLevel overload attaches the draft per-request opt-in
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	Json seen = Json.undefined;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "prompts/get")
+			seen = params;
+		Json res = Json.emptyObject;
+		res["messages"] = Json.emptyArray;
+		return res;
+	};
+	c.getPrompt("greet", Json.emptyObject, ProgressToken.init, "warning");
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "warning");
 }
 
 unittest  // validateOutput passes a conforming structured result
