@@ -1,8 +1,9 @@
 /**
- * Caching (CacheableResult) example — client side AND self-verifying e2e test.
+ * Caching (CacheableResult) example — client side AND self-verifying e2e test,
+ * over BOTH stdio and Streamable HTTP.
  *
- * Connects to the caching server over Streamable HTTP (draft / stateless), then
- * asserts the server's cache behavior matches exactly what server.d set:
+ * Connects to the caching server (draft / stateless), then asserts the server's
+ * cache behavior matches exactly what server.d set:
  *
  *   1. resources/list carries the PER-LIST hint (ttlMs=5000, scope=public)
  *      and lists both registered resources.
@@ -10,12 +11,22 @@
  *      (ttlMs=60000, scope=private) and the expected body.
  *   3. reading status://live (no hint) carries NO cache hint.
  *
- * On success it prints "OK: ..." and exits 0. On ANY mismatch it prints what
- * differed and exits non-zero, so CI can run it as a behavioral regression
- * test.
+ * Transport selection (same assertions either way):
+ *   - default (no --http): spawn the built `caching-server` binary over stdio
+ *     and drive it via McpClient.stdio(&proc.readLine, &proc.writeLine)
+ *     (exactly the pattern in examples/tools/client.d).
+ *   - `--http <url>`: connect to a running HTTP server via McpClient.http(url).
  *
- * Run: start server.d first (dub run -c server), then `dub run -c client`.
- * The server URL/port may be overridden with --url.
+ * On success it prints "OK: ..." and exits 0. On ANY mismatch it prints what
+ * differed and exits non-zero, so CI can run it as a behavioral regression test.
+ *
+ * Run:
+ *   # stdio: the client spawns the server for you
+ *   dub run -c client
+ *
+ *   # http: start the server first, then point the client at it
+ *   dub run -c server -- --http --port 8531
+ *   dub run -c client -- --http http://127.0.0.1:8531/mcp
  */
 module caching_client;
 
@@ -24,18 +35,72 @@ import std.stdio : writeln, stderr;
 import std.algorithm : map, canFind;
 import std.array : array;
 import std.format : format;
+import std.process : ProcessPipes, pipeProcess, Redirect, wait;
+import std.string : stripRight;
 
 import mcp;
+import mcp.client.client : McpClient;
 import mcp.protocol.draft : CacheScope;
 
 // Expected contract — must match the enums/values in server.d.
 enum long ExpectConfigTtlMs = 60_000;
 enum long ExpectListTtlMs = 5_000;
 
+/// Owns the server subprocess and exposes the newline-delimited JSON-RPC channel
+/// expected by `McpClient.stdio`. Holding `ProcessPipes` in a class field keeps
+/// the stdin/stdout `File` handles alive for the lifetime of the client (a stack
+/// value would be destructed when the spawning helper returns).
+final class ServerProcess
+{
+	private ProcessPipes pipes;
+
+	this(string[] command) @trusted
+	{
+		pipes = pipeProcess(command, Redirect.stdin | Redirect.stdout);
+	}
+
+	/// Read one response line (terminator stripped), or null at EOF.
+	string readLine() @trusted
+	{
+		auto f = pipes.stdout;
+		if (f.eof)
+			return null;
+		auto ln = f.readln();
+		if (ln.length == 0 && f.eof)
+			return null;
+		return ln.stripRight("\r\n");
+	}
+
+	/// Write one request line (the channel appends the terminator).
+	void writeLine(string s) @trusted
+	{
+		pipes.stdin.writeln(s);
+		pipes.stdin.flush();
+	}
+
+	/// Close stdin and reap the child.
+	void shutdown() @trusted
+	{
+		pipes.stdin.close();
+		wait(pipes.pid);
+	}
+}
+
+/// Absolute path to the `caching-server` binary, resolved next to this client
+/// binary (dub writes both into the package root), independent of cwd.
+private string serverBinaryPath() @safe
+{
+	import std.file : thisExePath;
+	import std.path : dirName, buildPath;
+
+	return buildPath(dirName(thisExePath()), "caching-server");
+}
+
 int main(string[] args)
 {
-	string url = "http://127.0.0.1:8531/mcp";
-	getopt(args, "url|u", "Server MCP endpoint (default http://127.0.0.1:8531/mcp)", &url);
+	string url; // empty -> stdio (spawn the server); set -> HTTP
+	getopt(args, "http", "Connect to a running HTTP server at this MCP endpoint "
+			~ "(e.g. http://127.0.0.1:8531/mcp); omit for stdio", &url);
 
 	string[] failures;
 	void check(bool cond, lazy string msg) @safe
@@ -44,8 +109,25 @@ int main(string[] args)
 			failures ~= msg;
 	}
 
-	auto client = McpClient.http(url);
+	// --- transport selection ------------------------------------------------
+	McpClient client;
+	ServerProcess proc;
+	scope (exit)
+		if (proc !is null)
+			proc.shutdown();
+
+	if (url.length)
+	{
+		client = McpClient.http(url);
+	}
+	else
+	{
+		proc = new ServerProcess([serverBinaryPath()]);
+		client = McpClient.stdio(&proc.readLine, &proc.writeLine);
+	}
+
 	// Cache hints are a draft-only feature: speak the stateless draft protocol.
+	// Transport-agnostic — the same call works over stdio and HTTP.
 	client.enableDraft();
 
 	// --- 1. resources/list carries the per-list cache hint --------------------
@@ -101,7 +183,7 @@ int main(string[] args)
 	}
 
 	writeln(format(
-		"OK: list hint ttlMs=%d/public, config://app hint ttlMs=%d/private, status://live uncached",
-		ExpectListTtlMs, ExpectConfigTtlMs));
+		"OK: [%s] list hint ttlMs=%d/public, config://app hint ttlMs=%d/private, status://live uncached",
+		url.length ? "http" : "stdio", ExpectListTtlMs, ExpectConfigTtlMs));
 	return 0;
 }

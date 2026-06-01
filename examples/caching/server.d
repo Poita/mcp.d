@@ -1,9 +1,9 @@
 /**
- * Caching (CacheableResult) example — server side, UDA style.
+ * Caching (CacheableResult) example — server side, UDA style, DUAL TRANSPORT.
  *
  * Demonstrates the draft `CacheableResult` freshness hints from the server's
- * point of view, over the Streamable HTTP transport, using the ergonomic UDA
- * API (`@resource` + `@cache` + `registerHandlers`):
+ * point of view, using the ergonomic UDA API (`@resource` + `@cache` +
+ * `registerHandlers`):
  *
  *   - a PER-RESOURCE hint, declared with the `@cache(ttlMs, "public"|"private")`
  *     UDA on a `@resource` method. The reflection layer plumbs it through so it
@@ -14,12 +14,22 @@
  *
  * Both are draft-gated: the server only emits the `ttlMs` / `cacheScope`
  * fields when the negotiated protocol is the stateless draft (2026-07-28).
- * The bundled client (client.d) speaks draft and asserts the exact values
- * set here, so the two files together are an end-to-end regression test.
  *
- * Run (two terminals):
- *   dub run -c server   # this file — serves http://127.0.0.1:8531/mcp
- *   dub run -c client   # connects and verifies the cache hints
+ * ONE BINARY, EITHER TRANSPORT. The transport is selected by flags:
+ *   - default (no flags)  -> stdio   (runStdio)            — deployable shape
+ *   - `--http`            -> Streamable HTTP (runStreamableHttp) on `--port`
+ *
+ * The bundled client (client.d) is transport-agnostic: it spawns this binary
+ * over stdio (no `--http`), or connects to it over HTTP (`--http` server +
+ * `--http <url>` client), and asserts the exact values set here either way.
+ *
+ * Run:
+ *   # stdio (the client spawns this binary for you):
+ *   dub run -c client
+ *
+ *   # http (two steps):
+ *   dub run -c server -- --http --port 8531   # serves http://127.0.0.1:8531/mcp
+ *   dub run -c client -- --http http://127.0.0.1:8531/mcp
  */
 module caching_server;
 
@@ -31,6 +41,7 @@ import mcp.api.attributes : resource, cache;
 import mcp.api.reflection : registerHandlers;
 import mcp.protocol.draft : CacheHint, CacheScope;
 import mcp.transport : StreamableHttpOptions, runStreamableHttp;
+import mcp.transport.stdio : runStdio;
 
 import std.typecons : nullable;
 
@@ -65,10 +76,13 @@ final class CachingApi
 
 void main(string[] args)
 {
+	bool http;
 	ushort port = 8531;
 	string host = "127.0.0.1";
-	getopt(args, "port|p", "Port to listen on (default 8531)", &port,
-			"host|h", "Address to bind (default 127.0.0.1)", &host);
+	getopt(args,
+			"http", "Serve over Streamable HTTP instead of stdio", &http,
+			"port|p", "HTTP port to listen on (default 8531)", &port,
+			"host|h", "HTTP address to bind (default 127.0.0.1)", &host);
 
 	auto server = new McpServer("caching-example", "1.0.0",
 			nullable("Demonstrates draft CacheableResult freshness hints."));
@@ -80,10 +94,19 @@ void main(string[] args)
 	// and may be cached publicly for 5s.
 	server.setListCacheHint("resources/list", CacheHint(ListTtlMs, CacheScope.public_));
 
-	StreamableHttpOptions opts;
-	opts.bindAddresses = [host];
-	() @trusted {
-		stderr.writefln("caching-server listening on http://%s:%d/mcp", host, port);
-	}();
-	runStreamableHttp(server, port, opts);
+	if (http)
+	{
+		StreamableHttpOptions opts;
+		opts.bindAddresses = [host];
+		() @trusted {
+			stderr.writefln("caching-server listening on http://%s:%d/mcp", host, port);
+		}();
+		runStreamableHttp(server, port, opts);
+	}
+	else
+	{
+		// stdio: the deployable shape; the matching client.d spawns this binary
+		// and drives it end-to-end over its stdin/stdout.
+		runStdio(server);
+	}
 }
