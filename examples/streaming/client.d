@@ -5,7 +5,7 @@
  * transport, selected at runtime:
  *
  *   - STDIO (default): spawn the built `streaming-server` binary (no `--http`)
- *     and talk to it over its stdin/stdout via `McpClient.stdio`.
+ *     via `McpClient.spawn`, talking to it over its stdin/stdout.
  *   - HTTP (`--http <url>`): connect to an already-running server with
  *     `McpClient.http(url)`.
  *
@@ -61,9 +61,7 @@ import std.algorithm : map, canFind;
 import std.array : array;
 import std.conv : to;
 import std.getopt : getopt;
-import std.process : ProcessPipes, pipeProcess, Redirect, wait;
 import std.stdio : stderr, writeln;
-import std.string : stripRight;
 
 import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
 import vibe.data.json : Json;
@@ -185,10 +183,13 @@ private int run(bool useHttp, string url) @safe
 
 	// STDIO: spawn ONE server process and reuse ONE initialized client across the
 	// transport-agnostic phases (the stdio server serves a single connection).
-	auto proc = new ServerProcess([serverBinaryPath()]);
+	// `McpClient.spawn` owns the subprocess; its `close()` runs the SIGTERM->SIGKILL
+	// stdio shutdown sequence. Handlers are installed BEFORE initialize so the
+	// `sampling`/`elicitation` capabilities are advertised at the handshake.
+	auto client = McpClient.spawn([serverBinaryPath()]);
 	scope (exit)
-		proc.shutdown();
-	auto client = stdioClient(proc);
+		client.close();
+	installMockHandlers(client);
 	client.initialize();
 	client.setLogLevel("debug");
 
@@ -216,15 +217,6 @@ private McpClient httpClient(string url) @safe
 	installMockHandlers(client);
 	client.initialize();
 	client.setLogLevel("debug");
-	return client;
-}
-
-/// A stdio client over the spawned server process. Handlers are installed before
-/// the caller initializes.
-private McpClient stdioClient(ServerProcess proc) @safe
-{
-	auto client = McpClient.stdio(&proc.readLine, &proc.writeLine);
-	installMockHandlers(client);
 	return client;
 }
 
@@ -428,54 +420,7 @@ private int readCancelCount(scope McpClient delegate() @safe open) @safe
 	return r.structuredContentAs!CancelStats.cancelled;
 }
 
-// --- stdio process plumbing ---------------------------------------------------
-
-/// Owns the server subprocess and exposes the newline-delimited JSON-RPC channel
-/// expected by `McpClient.stdio`. Holding `ProcessPipes` in a class field keeps
-/// the stdin/stdout `File` handles alive for the lifetime of the client.
-///
-/// NOTE: this example deliberately keeps this tiny wrapper rather than adopting
-/// `McpClient.spawn` (#470): `spawnStdioTransport`'s `attachProcess(ProcessPipes)`
-/// takes its argument by value, and the copy's destructor closes the child's
-/// stdin write-end before the first request is sent, so the child sees EOF and
-/// the first `send` fails with "Attempting to write to closed File". Holding the
-/// pipes in a class field (as below) avoids that lifetime hazard. Switch to
-/// `McpClient.spawn([serverBinaryPath()])` once that SDK bug is fixed.
-final class ServerProcess
-{
-	private ProcessPipes pipes;
-
-	this(string[] command) @trusted
-	{
-		pipes = pipeProcess(command, Redirect.stdin | Redirect.stdout);
-	}
-
-	/// Read one response line (terminator stripped), or null at EOF.
-	string readLine() @trusted
-	{
-		auto f = pipes.stdout;
-		if (f.eof)
-			return null;
-		auto ln = f.readln();
-		if (ln.length == 0 && f.eof)
-			return null;
-		return ln.stripRight("\r\n");
-	}
-
-	/// Write one request line (the channel appends the terminator).
-	void writeLine(string s) @trusted
-	{
-		pipes.stdin.writeln(s);
-		pipes.stdin.flush();
-	}
-
-	/// Close stdin and reap the child.
-	void shutdown() @trusted
-	{
-		pipes.stdin.close();
-		wait(pipes.pid);
-	}
-}
+// --- server binary resolution ------------------------------------------------
 
 /// Absolute path to the `streaming-server` binary, resolved next to this client
 /// binary (dub writes both into the package root).
