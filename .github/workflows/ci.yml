@@ -94,17 +94,25 @@ jobs:
           compiler: ldc-latest
 
       # `dub test --coverage` builds the unittest binary with code coverage
-      # instrumentation and runs it, emitting one `.lst` file per module in the
-      # repo root. Codecov's uploader parses D's `.lst` coverage format directly.
+      # instrumentation and runs it, emitting one dmd-style `.lst` file per module
+      # in the repo root.
       - name: Test with coverage
         run: dub test --coverage
 
-      # Works on private repos when CODECOV_TOKEN is set in repo secrets.
-      # fail_ci_if_error stays false so a transient Codecov outage never blocks CI.
+      # Convert the `.lst` files to a single lcov report. lcov is ingested
+      # reliably by Codecov, unlike D's `.lst` format + dub's dash-mangled
+      # filenames. Prints the overall hit ratio to the log.
+      - name: Convert coverage to lcov
+        run: bash scripts/cov-to-lcov.sh lcov.info
+
+      # On a PRIVATE repo this needs CODECOV_TOKEN in repo secrets AND the repo
+      # activated on codecov.io; on a PUBLIC repo it uploads tokenlessly.
+      # fail_ci_if_error stays false so a missing token / transient outage never
+      # blocks CI.
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
         with:
-          files: ./*.lst
+          files: ./lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 

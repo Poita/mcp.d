@@ -20,8 +20,9 @@ calculator
 docs.json
 __dummy.html
 
-# code coverage output (dub test --coverage)
+# code coverage output (dub test --coverage) + lcov conversion
 *.lst
+lcov.info
 
 # built example binaries (each examples/<name>/ is its own dub package whose
 # server/client configs build <name>-server / <name>-client)
