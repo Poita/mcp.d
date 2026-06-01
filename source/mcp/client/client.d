@@ -143,6 +143,12 @@ final class McpClient : ClientProtocol
 	// session. Per-request overrides go through the request-method overloads /
 	// `withRequestLogLevel` and are NOT stored here.
 	private string requestLogLevel_;
+	// Monotonic counter behind `mintProgressToken`, which mints a unique string
+	// progress token for the per-call-progress `callTool` overload (#494). A
+	// distinct counter (not `nextId`) keeps the minted token stable regardless of
+	// how many requests the call's MRTR loop issues, and unique across calls per
+	// basic/utilities/progress ("MUST be unique across all active requests").
+	private long nextProgressToken_ = 1;
 
 	/// Capabilities this client advertises at initialize. Treated as a baseline:
 	/// unless `autoAdvertiseCapabilities` is disabled, the capabilities actually
@@ -247,6 +253,39 @@ final class McpClient : ClientProtocol
 			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
 	{
 		return new McpClient(spawnStdioTransport(command), clientInfo);
+	}
+
+	/// Launch an MCP server binary that ships *next to this executable* and build a
+	/// client over its stdin/stdout. Resolves `exeName` against the running
+	/// program's own directory (`dirName(thisExePath())`) — the common case of a
+	/// host bundling a sibling helper server — then `spawn`s
+	/// `[resolvedPath] ~ extraArgs`. On Windows (or whenever the bare resolved path
+	/// does not exist) a `.exe` suffix is tried as a fallback. As with `spawn`, the
+	/// returned client is NOT yet initialized — call `initialize()` (or `ping()`).
+	static McpClient spawnSibling(string exeName, string[] extraArgs = null,
+			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
+	{
+		return spawn([resolveSiblingPath(exeName)] ~ extraArgs, clientInfo);
+	}
+
+	/// Resolve `exeName` to an absolute path next to the running executable
+	/// (`buildPath(dirName(thisExePath()), exeName)`). When that path does not
+	/// exist but a `.exe`-suffixed sibling does, the suffixed path is returned (the
+	/// Windows / bare-name fallback). Separated from `spawnSibling` so the
+	/// path-resolution can be unit-tested without actually spawning a subprocess.
+	package static string resolveSiblingPath(string exeName) @safe
+	{
+		import std.file : thisExePath, exists;
+		import std.path : dirName, buildPath;
+
+		const dir = dirName(thisExePath());
+		const bare = buildPath(dir, exeName);
+		if (exists(bare))
+			return bare;
+		const withExe = bare ~ ".exe";
+		if (exists(withExe))
+			return withExe;
+		return bare;
 	}
 
 	/// Release the underlying transport (stdio terminates the subprocess; HTTP
@@ -503,6 +542,32 @@ final class McpClient : ClientProtocol
 		return callTool(name, serializeToJson(args), progressToken);
 	}
 
+	/// `tools/call`, routing this call's progress to a per-call callback. Mints a
+	/// unique `ProgressToken` for the request, attaches it (so the server may emit
+	/// `notifications/progress` for it), and for the duration of the call delivers
+	/// every inbound progress notification correlated to that token to `onProgress`
+	/// (basic/utilities/progress). The prior global `this.onProgress` is restored
+	/// when the call returns (even on throw), and progress for *other* tokens still
+	/// flows to it. A null `onProgress` is treated as "no per-call sink" and behaves
+	/// like the plain `callTool`. Drives the same MRTR loop as the other overloads.
+	CallToolResult callTool(string name, Json arguments,
+			scope void delegate(ProgressNotification) @safe onProgress) @safe
+	{
+		auto token = mintProgressToken();
+		return withPerCallProgress(token, onProgress,
+				() @safe => callToolLoop(name, arguments, token));
+	}
+
+	/// Typed-arguments convenience for the per-call progress overload: serialize
+	/// the struct `args` and forward to the `Json`-arguments per-call-progress
+	/// `callTool` (#494).
+	CallToolResult callTool(T)(string name, T args,
+			scope void delegate(ProgressNotification) @safe onProgress) @safe
+			if (!is(T : Json))
+	{
+		return callTool(name, serializeToJson(args), onProgress);
+	}
+
 	/// Issue `tools/call` and, against a draft server, complete any MRTR
 	/// (SEP-2322) round-trips by satisfying each `InputRequest` and resubmitting
 	/// the request with the answers. Returns the first completed `CallToolResult`.
@@ -552,6 +617,44 @@ final class McpClient : ClientProtocol
 		return CallToolResult.fromJson(rpc("tools/call",
 				withRequestLogLevel(buildToolCallParams(name,
 				arguments, progressToken, responses, requestState), logLevel)));
+	}
+
+	/// Mint a process-unique string `ProgressToken` for a per-call progress sink.
+	/// Combines a per-client monotonic counter with the client's identity-derived
+	/// hash so tokens minted by different clients/instances do not collide, per
+	/// basic/utilities/progress ("MUST be unique across all active requests").
+	private ProgressToken mintProgressToken() @safe
+	{
+		import std.conv : to;
+
+		const n = nextProgressToken_++;
+		return ProgressToken("mcp-progress-" ~ (cast(size_t)(cast(void*) this))
+				.to!string ~ "-" ~ n.to!string);
+	}
+
+	/// Run `body_` with a per-call progress sink installed: while it executes,
+	/// inbound progress correlated to `token` is delivered to `onProgress`, and
+	/// progress for any other token still reaches the previously-installed global
+	/// `this.onProgress`. The prior global handler is restored on return (including
+	/// on throw). A null `onProgress` installs no per-call routing. Centralises the
+	/// save/wrap/restore so the request-method overloads share one implementation
+	/// and the global field is never left swapped out (#494).
+	private CallToolResult withPerCallProgress(ProgressToken token,
+			scope void delegate(ProgressNotification) @safe onProgress,
+			scope CallToolResult delegate() @safe body_) @safe
+	{
+		if (onProgress is null)
+			return body_();
+		auto prior = this.onProgress;
+		scope (exit)
+			this.onProgress = prior;
+		this.onProgress = (ProgressNotification n) @safe {
+			if (n.matches(token))
+				onProgress(n);
+			else if (prior !is null)
+				prior(n);
+		};
+		return body_();
 	}
 
 	/// Satisfy one MRTR `InputRequest` by dispatching it to the matching client
@@ -829,6 +932,16 @@ final class McpClient : ClientProtocol
 	{
 		return GetPromptResult.fromJson(rpc("prompts/get",
 				withRequestLogLevel(buildGetPromptParams(name, arguments, progressToken), logLevel)));
+	}
+
+	/// Typed-arguments convenience: serialize the struct `args` to its JSON wire
+	/// shape via vibe's `serializeToJson` and forward to the `Json`-arguments
+	/// `getPrompt`. Mirrors the typed `callTool(T)` (#468) so callers can pass a
+	/// strongly typed prompt-argument struct instead of hand-building a `Json`
+	/// object (#496). Equivalent to `getPrompt(name, serializeToJson(args))`.
+	GetPromptResult getPrompt(T)(string name, T args) @safe if (!is(T : Json))
+	{
+		return getPrompt(name, serializeToJson(args));
 	}
 
 	/// Build the `prompts/get` params, optionally attaching a progress token.
@@ -2576,6 +2689,94 @@ unittest  // #468: typed callTool args serialize to the same wire object as hand
 	assert(fromTyped == fromHand);
 	assert(fromTyped["arguments"]["a"].get!int == 2);
 	assert(fromTyped["arguments"]["b"].get!int == 3);
+}
+
+unittest  // #494: callTool with a per-call progress callback receives that call's progress
+{
+	auto c = McpClient.http("http://localhost");
+
+	// The server side: read the minted progress token from the request and emit
+	// a correlated notifications/progress for it (delivered via dispatchInbound,
+	// the same path a live transport uses) before returning the tool result.
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "tools/call");
+		auto tok = params["_meta"]["progressToken"];
+		Json pn = Json.emptyObject;
+		pn["progressToken"] = tok;
+		pn["progress"] = 0.5;
+		c.dispatchInbound(Message(makeNotification("notifications/progress", pn)));
+		Json r = Json.emptyObject;
+		r["content"] = Json.emptyArray;
+		return r;
+	};
+
+	ProgressNotification[] received;
+	c.callTool("work", Json.emptyObject, (ProgressNotification n) @safe {
+		received ~= n;
+	});
+
+	assert(received.length == 1);
+	assert(received[0].progress == 0.5);
+}
+
+unittest  // #494: a per-call progress callback restores the prior global onProgress
+{
+	auto c = McpClient.http("http://localhost");
+	ProgressNotification[] global;
+	c.onProgress = (ProgressNotification n) @safe { global ~= n; };
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		r["content"] = Json.emptyArray;
+		return r;
+	};
+
+	c.callTool("work", Json.emptyObject, (ProgressNotification n) @safe {});
+
+	// After the call the global onProgress field must be restored, and a later
+	// progress notification reaches it.
+	assert(c.onProgress !is null);
+	Json pn = Json.emptyObject;
+	pn["progressToken"] = "after";
+	pn["progress"] = 1.0;
+	c.dispatchInbound(Message(makeNotification("notifications/progress", pn)));
+	assert(global.length == 1);
+}
+
+unittest  // #496: typed getPrompt produces the same wire args as the Json form
+{
+	static struct GreetArgs
+	{
+		string who;
+	}
+
+	Json[] sentArgs;
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "prompts/get");
+		sentArgs ~= params["arguments"];
+		Json r = Json.emptyObject;
+		r["messages"] = Json.emptyArray;
+		return r;
+	};
+
+	c.getPrompt("greet", GreetArgs("world"));
+	Json hand = Json.emptyObject;
+	hand["who"] = "world";
+	c.getPrompt("greet", hand);
+
+	assert(sentArgs.length == 2);
+	assert(sentArgs[0] == sentArgs[1]);
+	assert(sentArgs[0]["who"].get!string == "world");
+}
+
+unittest  // #502: spawnSibling resolves a binary next to the running executable
+{
+	import std.file : thisExePath;
+	import std.path : dirName, buildPath;
+
+	// The path-resolution helper places the sibling name next to thisExePath.
+	auto resolved = McpClient.resolveSiblingPath("peer-server");
+	assert(resolved == buildPath(dirName(thisExePath()), "peer-server"));
 }
 
 unittest  // buildReadResourceParams attaches a progressToken under _meta
