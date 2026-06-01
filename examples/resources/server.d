@@ -1,5 +1,5 @@
 /**
- * MCP Resources example — SERVER (Streamable HTTP).
+ * MCP Resources example — SERVER (dual transport: stdio AND Streamable HTTP).
  *
  * Demonstrates the server side of MCP Resources, written in the ergonomic
  * UDA style (`@resource` / `@resourceTemplate` / `@tool` annotated methods
@@ -8,7 +8,7 @@
  *     `CacheableResult` freshness hint declared via `@cache(ttlMs, scope)`,
  *   - a `@resourceTemplate` (`note:///{id}`) whose reader receives the matched
  *     `{id}` as a typed argument,
- *   - `resources/subscribe` + push `notifications/resources/updated` (via
+ *   - `subscriptions/listen` + push `notifications/resources/updated` (via
  *     `notifyResourceUpdated`) when a watched resource changes, and
  *   - `notifications/resources/list_changed` when the available set changes.
  *
@@ -16,21 +16,42 @@
  * resource-updated notification for that note's URI and (b) registers a brand
  * new note resource the first time an id is seen, emitting a list-changed
  * notification. This gives the client something concrete to subscribe to and
- * assert on.
+ * assert on. The tool returns typed content (`Content.makeText`) plus a typed
+ * structured result (`setStructuredContent`), so no `structuredContent` Json is
+ * hand-built.
  *
- * Run:  dub run -c server      (serves on http://127.0.0.1:8349/mcp)
+ * One binary, either transport:
+ *   stdio (default): dub run -c server
+ *   http:            dub run -c server -- --http --port 8349
  */
 module server;
 
+import std.getopt : getopt;
+import std.stdio : stderr;
+
 import mcp;
-import mcp.transport.streamable_http : runStreamableHttp;
+import mcp.transport.stdio : runStdio;
+import mcp.transport.streamable_http : runStreamableHttp, StreamableHttpOptions;
 import mcp.api.attributes;
 import mcp.api.reflection : registerHandlers;
 
 import std.typecons : nullable;
-import vibe.data.json : Json;
 
-enum ushort port = 8349;
+/// Default HTTP port (kept from the original HTTP-only example). The client's
+/// HTTP mode connects to `http://127.0.0.1:<port>/mcp`.
+enum ushort defaultPort = 8349;
+
+/// Typed result of the `set_note` tool. Returning this struct from the `@tool`
+/// method keeps the example on the typed APIs: the reflection layer derives the
+/// `structuredContent` Json (and the tool's `outputSchema`) from these fields
+/// rather than hand-building any Json. The client asserts these exact fields.
+struct SetNoteResult
+{
+	/// The URI of the note that was set (e.g. `note:///e2e`).
+	string uri;
+	/// True iff this id was seen for the first time (a new resource appeared).
+	bool created;
+}
 
 /// The annotated resources/tool surface for this example. The class holds the
 /// note store and the server reference so the `set_note` tool can push
@@ -70,9 +91,12 @@ final class ResourcesApi
 	/// (or creates) a note. On update it emits notifications/resources/updated
 	/// for the note's URI (delivered only to subscribers). The first time an id
 	/// is created it also registers a direct resource for that note and emits
-	/// notifications/resources/list_changed.
+	/// notifications/resources/list_changed. It returns the typed `SetNoteResult`
+	/// struct directly: the reflection layer derives both the tool's
+	/// `outputSchema` and the per-call `structuredContent` from the struct fields,
+	/// so there is no hand-built result Json anywhere.
 	@tool("set_note", "Set a note's body; pushes resources/updated to subscribers.")
-	CallToolResult setNote(string id, string body) @safe
+	SetNoteResult setNote(string id, string body) @safe
 	{
 		const uri = "note:///" ~ id;
 		const isNew = (id !in notes);
@@ -91,25 +115,41 @@ final class ResourcesApi
 		// The watched resource changed -> tell subscribers.
 		server.notifyResourceUpdated(uri);
 
-		Json structured = Json.emptyObject;
-		structured["uri"] = uri;
-		structured["created"] = isNew;
-		auto result = CallToolResult([Content.makeText("updated " ~ uri)]);
-		result.structuredContent = structured;
-		return result;
+		return SetNoteResult(uri, isNew);
 	}
 }
 
-void main() @safe
+void main(string[] args)
 {
+	bool http;
+	ushort port = defaultPort;
+	string host = "127.0.0.1";
+	getopt(args,
+			"http", "Serve over Streamable HTTP instead of stdio", &http,
+			"port|p", "HTTP port to listen on (default 8349)", &port,
+			"host|h", "HTTP address to bind (default 127.0.0.1)", &host);
+
 	auto server = new McpServer("resources-example", "1.0.0");
 
 	registerHandlers(server, new ResourcesApi(server));
 
 	// Advertise the resources subscribe + listChanged capabilities so the
-	// client may `resources/subscribe` and receive push notifications.
+	// client may open a `subscriptions/listen` stream and receive push
+	// notifications over either transport.
 	server.enableResourceSubscriptions();
 	server.enableResourcesListChanged();
 
-	runStreamableHttp(server, port);
+	if (http)
+	{
+		StreamableHttpOptions opts;
+		opts.bindAddresses = [host];
+		() @trusted {
+			stderr.writefln("resources-server listening on http://%s:%d/mcp", host, port);
+		}();
+		runStreamableHttp(server, port, opts);
+	}
+	else
+	{
+		runStdio(server);
+	}
 }
