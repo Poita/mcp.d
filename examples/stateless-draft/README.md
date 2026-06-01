@@ -50,13 +50,22 @@ The client side likewise uses the SDK's typed surface where it cleanly applies:
 (The *error-path* call still passes a dynamic `Json.emptyObject`, since it is a
 deliberately malformed call to an unknown tool.)
 
-The client still owns the spawned stdio server via an explicit `ServerProcess`
-(`ProcessPipes`) helper rather than `McpClient.spawn`: in this revision of the
-SDK `spawnStdioTransport` lets the subprocess pipes' `File` handles be
-refcounted to zero when the spawn helper returns, so the first write fails with
-"Attempting to write to closed File". Once that lifetime bug is fixed upstream
-the `ServerProcess` boilerplate can be replaced with
-`McpClient.spawn([serverBinaryPath()])` + `client.close()`.
+## Shared scaffold
+
+Transport selection, the event-loop wiring, and the assertion primitives come
+from the shared **`examples_common`** package (`examples/common`), so this
+example contains no transport boilerplate of its own:
+
+- the server's `main` calls **`runServerFromArgs(server, args, 8431)`**, which
+  parses `--http` / `--port` / `--host` and serves Streamable HTTP or stdio;
+- the client's `main` calls **`runClient(...)`** (drives the vibe event loop
+  uniformly for both transports) around
+  **`connectFromArgs(args, "stateless-draft-server")`**, which connects over
+  HTTP for `--http <url>` (alias `--url <url>`) or otherwise spawns the sibling
+  `stateless-draft-server` binary over stdio via `McpClient.spawnSibling`;
+- the e2e assertions use the shared **`check`** / **`checkEq`** helpers, which
+  print a `FAIL:` line and throw on mismatch so `runClient` returns a non-zero
+  exit code.
 
 ## Files
 
