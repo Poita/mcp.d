@@ -6,8 +6,9 @@
 /// test — and the SAME assertions run over BOTH transports:
 ///
 ///   * STDIO (default): spawns the built `prompts-server` binary (WITHOUT --http)
-///     and drives it over its stdin/stdout via `McpClient.stdio`, exactly like
-///     examples/tools/client.d.
+///     with `McpClient.spawn([serverBinaryPath()])`, which owns the subprocess and
+///     drives it over its stdin/stdout; `client.close()` runs the stdio shutdown
+///     sequence (SIGTERM -> SIGKILL).
 ///   * HTTP (`--http <url>`): connects to an already-running server over
 ///     Streamable HTTP via `McpClient.http(url)`.
 ///
@@ -27,9 +28,7 @@ import std.array : array;
 import std.format : format;
 import std.getopt : getopt;
 import std.path : dirName, buildPath;
-import std.process : pipeProcess, ProcessPipes, Redirect, wait;
 import std.stdio : writeln, stderr;
-import std.string : stripRight;
 import std.file : exists, thisExePath;
 
 import mcp.client.client : McpClient;
@@ -75,21 +74,19 @@ int main(string[] args)
 			&httpUrl);
 
 	// --- Build the transport-specific client; everything after is identical. ---
+	//   * HTTP: connect to an already-running `prompts-server --http`.
+	//   * STDIO: `McpClient.spawn` launches the built server binary (WITHOUT
+	//     --http), owns the subprocess, and drives it over stdin/stdout. There is
+	//     no hand-rolled ProcessPipes/readLine/writeLine plumbing: `client.close()`
+	//     runs the MCP stdio shutdown sequence (SIGTERM -> SIGKILL) for us.
 	McpClient client;
-	ProcessPipes* pipes; // non-null only on the stdio path (owns the subprocess)
 
 	if (httpUrl.length)
 	{
-		// HTTP: connect to an already-running `prompts-server --http`.
 		client = McpClient.http(httpUrl);
 	}
 	else
 	{
-		// STDIO: spawn the built server binary (WITHOUT --http) and drive it,
-		// exactly like examples/tools/client.d. We heap-box the ProcessPipes so the
-		// read/write closures and the cleanup path share one long-lived handle (a
-		// stack-local ProcessPipes whose closures outlive its scope would have its
-		// File handles refcounted to zero and closed).
 		const serverBin = serverBinaryPath();
 		if (!exists(serverBin))
 		{
@@ -99,32 +96,11 @@ int main(string[] args)
 			}();
 			return 2;
 		}
-		pipes = new ProcessPipes;
-		() @trusted {
-			*pipes = pipeProcess([serverBin], Redirect.stdin | Redirect.stdout);
-		}();
-		client = McpClient.stdio(() @trusted {
-			if (pipes.stdout.eof)
-				return cast(string) null;
-			auto ln = pipes.stdout.readln();
-			if (ln.length == 0 && pipes.stdout.eof)
-				return cast(string) null;
-			return ln.stripRight("\r\n");
-		}, (string s) @trusted { pipes.stdin.writeln(s); pipes.stdin.flush(); });
+		client = McpClient.spawn([serverBin]);
 	}
 
 	scope (exit)
-		() @trusted {
-			if (pipes !is null)
-			{
-				try
-					pipes.stdin.close();
-				catch (Exception) {}
-				wait(pipes.pid);
-			}
-			else
-				client.close();
-		}();
+		client.close();
 
 	try
 	{

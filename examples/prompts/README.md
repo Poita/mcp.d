@@ -36,7 +36,9 @@ Client (`client.d`) — a **self-verifying e2e test** over both transports:
 
 - selects its transport via `std.getopt`: with `--http <url>` it connects via
   `McpClient.http(url)`; without it, it spawns the built `prompts-server` binary
-  (no `--http`) and drives it over stdio via `McpClient.stdio`. The assertions
+  (no `--http`) via `McpClient.spawn([serverBinaryPath()])`, which owns the
+  subprocess and drives it over stdio (`client.close()` runs the MCP stdio
+  shutdown sequence). The assertions
   are transport-agnostic, so the **same** checks verify both runs.
 - asserts `prompts/list` contains exactly `greet` and `code_review`, with their
   titles and typed-argument descriptors;
