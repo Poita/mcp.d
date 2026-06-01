@@ -1431,7 +1431,8 @@ final class McpServer
 				"toolsListChanged", "promptsListChanged", "resourcesListChanged"
 			];
 			foreach (k; boolKeys)
-				if (k in filter && filter[k].type == Json.Type.bool_ && filter[k].get!bool)
+				if (k in filter && filter[k].type == Json.Type.bool_
+						&& filter[k].get!bool && supportsListenType(k))
 				{
 					listenFilters[k] = true;
 					if (k == "toolsListChanged")
@@ -1442,7 +1443,7 @@ final class McpServer
 						perStream.resourcesListChanged = true;
 				}
 
-			if ("resourceSubscriptions" in filter)
+			if ("resourceSubscriptions" in filter && supportsListenType("resourceSubscriptions"))
 			{
 				auto rs = filter["resourceSubscriptions"];
 				if (rs.type == Json.Type.array)
@@ -1484,6 +1485,30 @@ final class McpServer
 		Json j = Json.emptyObject;
 		j["acknowledged"] = true;
 		return j;
+	}
+
+	/// Whether the server actually supports (advertises) a given
+	/// `subscriptions/listen` notification type, per its declared capabilities.
+	/// Per draft basic/utilities/subscriptions Acknowledgment, notification types
+	/// the server does not support are omitted from the recorded filter and the
+	/// acknowledged subset. The list-changed types map to the corresponding
+	/// `listChanged` capability flags; `resourceSubscriptions` maps to the
+	/// resources `subscribe` capability.
+	private bool supportsListenType(string changeType) const @safe
+	{
+		switch (changeType)
+		{
+		case "toolsListChanged":
+			return toolListChangedEnabled;
+		case "promptsListChanged":
+			return promptsListChangedEnabled;
+		case "resourcesListChanged":
+			return resourcesListChangedEnabled;
+		case "resourceSubscriptions":
+			return resourceSubscriptionsEnabled;
+		default:
+			return false;
+		}
 	}
 
 	/// Whether the client opted in to a given change-notification type via
@@ -3980,6 +4005,10 @@ unittest  // draft resources/read unknown uri uses invalidParams (-32602)
 unittest  // subscriptions/listen reads the spec-shaped filter nested under params.notifications
 {
 	auto s = makeTestServer();
+	// The server must support the requested notification types for them to be
+	// recorded/acknowledged (draft basic/utilities/subscriptions Acknowledgment).
+	s.enableToolsListChanged();
+	s.enableResourceSubscriptions();
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
 	filter["resourceSubscriptions"] = Json([Json("file:///project/config.json")]);
@@ -3997,6 +4026,8 @@ unittest  // subscriptions/listen reads the spec-shaped filter nested under para
 unittest  // subscriptions/listen still accepts the legacy flat (top-level) filter shape
 {
 	auto s = makeTestServer();
+	s.enableToolsListChanged();
+	s.enableResourceSubscriptions();
 	Json p = Json.emptyObject;
 	p["toolsListChanged"] = true;
 	p["resourceSubscriptions"] = true;
@@ -4021,6 +4052,8 @@ unittest  // subscriptions/listen with an empty resourceSubscriptions array does
 unittest  // acknowledgedListenSubset reflects exactly the opted-in change types
 {
 	auto s = makeTestServer();
+	s.enableToolsListChanged();
+	s.enableResourceSubscriptions();
 	// Nothing opted in yet -> empty object.
 	assert(s.acknowledgedListenSubset().type == Json.Type.object);
 	assert(s.acknowledgedListenSubset().length == 0);
@@ -4046,6 +4079,7 @@ unittest  // acknowledgedListenSubset reflects exactly the opted-in change types
 unittest  // ack echoes every opted-in resourceSubscriptions URI in request order
 {
 	auto s = makeTestServer();
+	s.enableResourceSubscriptions();
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json([
 		Json("file:///a.txt"), Json("file:///b.txt")
@@ -4069,6 +4103,89 @@ unittest  // draft is stateless: tools/call works without a prior initialize
 	p["arguments"] = Json(["a": Json(20), "b": Json(22)]);
 	auto resp = s.handle(draftReq(5, "tools/call", p)).get;
 	assert(resp["result"]["structuredContent"]["result"].get!int == 42);
+}
+
+unittest  // subscriptions/listen ack omits a list-changed type the server does not support (#398)
+{
+	// Server has NOT declared the tools list-changed capability, so per draft
+	// basic/utilities/subscriptions Acknowledgment ("notification types the
+	// server does not support are omitted") a toolsListChanged opt-in must be
+	// dropped from both the recorded filter and the acknowledged subset.
+	auto s = new McpServer("t", "1");
+	Json filter = Json.emptyObject;
+	filter["toolsListChanged"] = true;
+	Json p = Json.emptyObject;
+	p["notifications"] = filter;
+	auto resp = s.handle(draftReq(4, "subscriptions/listen", p)).get;
+	assert(resp["result"]["acknowledged"].get!bool);
+	assert(!s.listensFor("toolsListChanged"));
+	assert("toolsListChanged" !in s.acknowledgedListenSubset());
+}
+
+unittest  // subscriptions/listen ack keeps a list-changed type once the server enables it (#398)
+{
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	Json filter = Json.emptyObject;
+	filter["toolsListChanged"] = true;
+	Json p = Json.emptyObject;
+	p["notifications"] = filter;
+	s.handle(draftReq(4, "subscriptions/listen", p));
+	assert(s.listensFor("toolsListChanged"));
+	assert(s.acknowledgedListenSubset()["toolsListChanged"].get!bool);
+}
+
+unittest  // subscriptions/listen ack omits promptsListChanged when unsupported (#398)
+{
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged(); // a different cap is on; prompts stays off
+	Json filter = Json.emptyObject;
+	filter["promptsListChanged"] = true;
+	Json p = Json.emptyObject;
+	p["notifications"] = filter;
+	s.handle(draftReq(4, "subscriptions/listen", p));
+	assert(!s.listensFor("promptsListChanged"));
+	assert("promptsListChanged" !in s.acknowledgedListenSubset());
+}
+
+unittest  // subscriptions/listen ack omits resourcesListChanged when unsupported (#398)
+{
+	auto s = new McpServer("t", "1");
+	Json filter = Json.emptyObject;
+	filter["resourcesListChanged"] = true;
+	Json p = Json.emptyObject;
+	p["notifications"] = filter;
+	s.handle(draftReq(4, "subscriptions/listen", p));
+	assert(!s.listensFor("resourcesListChanged"));
+	assert("resourcesListChanged" !in s.acknowledgedListenSubset());
+}
+
+unittest  // subscriptions/listen ack omits resourceSubscriptions when subscriptions disabled (#398)
+{
+	// resource subscriptions not enabled -> the agreed subset must omit the URIs.
+	auto s = new McpServer("t", "1");
+	Json filter = Json.emptyObject;
+	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
+	Json p = Json.emptyObject;
+	p["notifications"] = filter;
+	s.handle(draftReq(4, "subscriptions/listen", p));
+	assert(!s.listensFor("resourceSubscriptions"));
+	assert("resourceSubscriptions" !in s.acknowledgedListenSubset());
+	assert(!s.isSubscribed("file:///x"));
+}
+
+unittest  // subscriptions/listen ack keeps resourceSubscriptions once enabled (#398)
+{
+	auto s = new McpServer("t", "1");
+	s.enableResourceSubscriptions();
+	Json filter = Json.emptyObject;
+	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
+	Json p = Json.emptyObject;
+	p["notifications"] = filter;
+	s.handle(draftReq(4, "subscriptions/listen", p));
+	assert(s.listensFor("resourceSubscriptions"));
+	assert(s.acknowledgedListenSubset()["resourceSubscriptions"].length == 1);
+	assert(s.isSubscribed("file:///x"));
 }
 
 version (unittest)
@@ -4862,6 +4979,8 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	import std.algorithm : canFind;
 
 	auto s = makeTestServer();
+	s.enableToolsListChanged();
+	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
 	auto push = s.serverPushChannel(coord);
 
@@ -4903,6 +5022,7 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 unittest  // draft: notifyPromptsListChanged suppressed unless client opted in
 {
 	auto s = new McpServer("t", "1");
+	s.enablePromptsListChanged();
 	s.connectionVersion = ProtocolVersion.draft;
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
