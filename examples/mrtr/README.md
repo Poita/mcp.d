@@ -50,6 +50,12 @@ MRTR `Json`** — it uses the typed builders and decoders throughout:
 - **`InputRequest.sampling(id, CreateMessageRequest)`** — builds the sampling
   request from a typed `CreateMessageRequest` (typed `SamplingMessage` +
   `Content.makeText`), not a hand-built params object.
+- **`ToolResponse.inputRequired(reqs, RequestState)`** + **`ctx.requestStateAs!RequestState`**
+  — the opaque `requestState` is a typed `RequestState` struct (serialized on the
+  way out, decoded on the retry) rather than a `"topic="`-prefixed string parsed
+  by hand.
+- **`ctx.isResubmit()` / `ctx.hasInputResponse(id)`** — detect the resubmit round
+  instead of open-coding `(id in ctx.inputResponses())` membership checks.
 - **`ctx.inputResponseAs!ElicitResult(id)`** and
   **`ctx.inputResponseAs!CreateMessageResult(id)`** — decode the round-2 answers
   as typed results; the date is read via `ElicitResult.contentAs!MeetingDate`
@@ -63,6 +69,10 @@ structured result:
 
 - **typed `callTool("book_meeting", BookMeetingArgs("Q3 roadmap"))`** (#468) —
   the wire `{topic}` object is serialized from a struct.
+- **typed inbound `InputRequest` readers** (#503) — the surfaced requests are read
+  via `req.elicitationMessage()` / `req.requestedSchema()` (the elicitation) and
+  `req.asSampling()` (the sampling, decoded back into a typed
+  `CreateMessageRequest`) instead of raw `req.params[...]` indexing.
 - **`ElicitResult.accept(MeetingDate("2026-06-15"))`** (#466) and
   **`CreateMessageResult.text("mock-llm", "...")`** (#467) — the mock
   `onElicitation` / `onSampling` replies are built from the typed convenience
@@ -75,9 +85,22 @@ Installing `onElicitation` / `onSampling` alone now auto-advertises the matching
 capabilities (`effectiveCapabilities`), so no raw capability-flag setting is
 needed.
 
-Other client APIs: `McpClient.http` / `McpClient.stdio`, `enableDraft`,
-`discover`, `listTools`, `callTool` (which transparently drives the MRTR loop),
-`CallToolResult.isInputRequired` / `inputRequests` / `requestState`.
+### Shared `examples/common` scaffold
+
+Both sides use the shared `examples_common` scaffold (`dub` package
+`examples-common`, a `path` dependency on `../common`) for their boilerplate:
+
+- the server's transport selection is **`runServerFromArgs(server, args, 8765)`**
+  (`--http` / `--port` / `--host` -> Streamable HTTP, else stdio);
+- the client's transport selection is **`connectFromArgs(args, "mrtr-server")`**
+  (`--http <url>` -> `McpClient.http`, else `McpClient.spawnSibling("mrtr-server")`
+  over stdio), driven inside **`runClient(scenario)`** which runs the vibe event
+  loop uniformly and maps any thrown assertion to a non-zero exit;
+- the e2e assertions use the scaffold's shared **`check`** helper.
+
+Other client APIs: `enableDraft`, `discover`, `listTools`, `callTool` (which
+transparently drives the MRTR loop), `CallToolResult.isInputRequired` /
+`inputRequests` / `requestState`.
 
 ## Running it — BOTH transports
 
