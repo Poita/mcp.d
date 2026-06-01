@@ -1791,6 +1791,161 @@ unittest  // Resource round-trips _meta
 	assert(back.meta["x.example/tag"].get!long == 7);
 }
 
+unittest  // Resource.forVersion strips icons for 2025-06-18 (Resource.icons introduced 2025-11-25)
+{
+	Resource r = {uri: "test://x", name: "x"};
+	r.icons ~= Icon("https://example.com/i.png");
+	auto j = r.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("icons" !in j);
+}
+
+unittest  // Resource.forVersion strips icons for 2025-03-26
+{
+	Resource r = {uri: "test://x", name: "x"};
+	r.icons ~= Icon("https://example.com/i.png");
+	auto j = r.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("icons" !in j);
+}
+
+unittest  // Resource.forVersion strips icons for 2024-11-05
+{
+	Resource r = {uri: "test://x", name: "x"};
+	r.icons ~= Icon("https://example.com/i.png");
+	auto j = r.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("icons" !in j);
+}
+
+unittest  // Resource.forVersion keeps icons for 2025-11-25 (introduced here)
+{
+	Resource r = {uri: "test://x", name: "x"};
+	r.icons ~= Icon("https://example.com/i.png");
+	auto j = r.forVersion(ProtocolVersion.v2025_11_25).toJson();
+	assert("icons" in j && j["icons"].length == 1);
+}
+
+unittest  // Resource.forVersion keeps icons for draft (>= 2025-11-25)
+{
+	Resource r = {uri: "test://x", name: "x"};
+	r.icons ~= Icon("https://example.com/i.png");
+	auto j = r.forVersion(ProtocolVersion.draft).toJson();
+	assert("icons" in j && j["icons"].length == 1);
+}
+
+unittest  // Resource.forVersion strips title for 2025-03-26 (BaseMetadata.title introduced 2025-06-18)
+{
+	Resource r = {uri: "test://x", name: "x"};
+	r.title = "Display X";
+	auto j = r.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("title" !in j);
+}
+
+unittest  // Resource.forVersion strips title for 2024-11-05
+{
+	Resource r = {uri: "test://x", name: "x"};
+	r.title = "Display X";
+	auto j = r.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("title" !in j);
+}
+
+unittest  // Resource.forVersion keeps title for 2025-06-18 (introduced here)
+{
+	Resource r = {uri: "test://x", name: "x"};
+	r.title = "Display X";
+	auto j = r.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert(j["title"].get!string == "Display X");
+}
+
+unittest  // Resource.forVersion preserves non-gated fields (uri/name/description/mimeType/size)
+{
+	Resource r = {uri: "test://x", name: "x"};
+	r.description = "desc";
+	r.mimeType = "text/plain";
+	r.size = 42;
+	auto j = r.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert(j["uri"].get!string == "test://x");
+	assert(j["name"].get!string == "x");
+	assert(j["description"].get!string == "desc");
+	assert(j["mimeType"].get!string == "text/plain");
+	assert(j["size"].get!long == 42);
+}
+
+unittest  // Resource.forVersion leaves the original Resource unmodified (returns a projected copy)
+{
+	Resource r = {uri: "test://x", name: "x"};
+	r.title = "Display X";
+	r.icons ~= Icon("https://example.com/i.png");
+	cast(void) r.forVersion(ProtocolVersion.v2024_11_05);
+	assert(!r.title.isNull && r.icons.length == 1);
+}
+
+unittest  // ResourceTemplate.forVersion strips icons for 2025-06-18 (introduced 2025-11-25)
+{
+	ResourceTemplate t = {uriTemplate: "test://{id}", name: "x"};
+	t.icons ~= Icon("https://example.com/i.png");
+	auto j = t.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("icons" !in j);
+}
+
+unittest  // ResourceTemplate.forVersion strips icons for 2024-11-05
+{
+	ResourceTemplate t = {uriTemplate: "test://{id}", name: "x"};
+	t.icons ~= Icon("https://example.com/i.png");
+	auto j = t.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("icons" !in j);
+}
+
+unittest  // ResourceTemplate.forVersion keeps icons for 2025-11-25 (introduced here)
+{
+	ResourceTemplate t = {uriTemplate: "test://{id}", name: "x"};
+	t.icons ~= Icon("https://example.com/i.png");
+	auto j = t.forVersion(ProtocolVersion.v2025_11_25).toJson();
+	assert("icons" in j && j["icons"].length == 1);
+}
+
+unittest  // ResourceTemplate.forVersion keeps icons for draft (>= 2025-11-25)
+{
+	ResourceTemplate t = {uriTemplate: "test://{id}", name: "x"};
+	t.icons ~= Icon("https://example.com/i.png");
+	auto j = t.forVersion(ProtocolVersion.draft).toJson();
+	assert("icons" in j && j["icons"].length == 1);
+}
+
+unittest  // ResourceTemplate.forVersion strips title for 2025-03-26 (title introduced 2025-06-18)
+{
+	ResourceTemplate t = {uriTemplate: "test://{id}", name: "x"};
+	t.title = "Display X";
+	auto j = t.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("title" !in j);
+}
+
+unittest  // ResourceTemplate.forVersion strips title for 2024-11-05
+{
+	ResourceTemplate t = {uriTemplate: "test://{id}", name: "x"};
+	t.title = "Display X";
+	auto j = t.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("title" !in j);
+}
+
+unittest  // ResourceTemplate.forVersion keeps title for 2025-06-18 (introduced here)
+{
+	ResourceTemplate t = {uriTemplate: "test://{id}", name: "x"};
+	t.title = "Display X";
+	auto j = t.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert(j["title"].get!string == "Display X");
+}
+
+unittest  // ResourceTemplate.forVersion preserves non-gated fields (uriTemplate/name/description/mimeType)
+{
+	ResourceTemplate t = {uriTemplate: "test://{id}", name: "x"};
+	t.description = "desc";
+	t.mimeType = "text/plain";
+	auto j = t.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert(j["uriTemplate"].get!string == "test://{id}");
+	assert(j["name"].get!string == "x");
+	assert(j["description"].get!string == "desc");
+	assert(j["mimeType"].get!string == "text/plain");
+}
+
 unittest  // Prompt round-trips _meta
 {
 	Prompt p = {name: "p"};
@@ -2080,6 +2235,45 @@ struct Resource
 			r.meta = j["_meta"];
 		return r;
 	}
+
+	/// Return a copy of this `Resource` with any fields newer than the
+	/// negotiated protocol version stripped, so the wire output stays valid
+	/// for the peer's version. `BaseMetadata.title` was introduced by
+	/// 2025-06-18 (absent from 2025-03-26 and 2024-11-05); `Resource.icons`
+	/// was introduced by 2025-11-25 (absent from every earlier version,
+	/// present in draft which is >= 2025-11-25). `uri`/`name`/`description`/
+	/// `mimeType`/`annotations`/`size`/`_meta` all existed in 2024-11-05 and
+	/// are preserved unchanged. Mirrors `Tool.forVersion` / `Prompt.forVersion`.
+	Resource forVersion(ProtocolVersion v) const @safe
+	{
+		Resource projected;
+		projected.uri = uri;
+		projected.name = name;
+		projected.description = description;
+		projected.mimeType = mimeType;
+		projected.annotations.audience = annotations.audience.dup;
+		projected.annotations.priority = annotations.priority;
+		projected.annotations.lastModified = annotations.lastModified;
+		projected.size = size;
+		projected.meta = meta;
+		// `BaseMetadata.title` was introduced by 2025-06-18.
+		if (v >= ProtocolVersion.v2025_06_18)
+			projected.title = title;
+		// `Resource.icons` was introduced by 2025-11-25.
+		if (v >= ProtocolVersion.v2025_11_25)
+		{
+			foreach (icon; icons)
+			{
+				Icon copy;
+				copy.src = icon.src;
+				copy.mimeType = icon.mimeType;
+				copy.sizes = icon.sizes.dup;
+				copy.theme = icon.theme;
+				projected.icons ~= copy;
+			}
+		}
+		return projected;
+	}
 }
 
 /// A parameterized resource template (RFC 6570-style `{var}` placeholders).
@@ -2138,6 +2332,43 @@ struct ResourceTemplate
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			t.meta = j["_meta"];
 		return t;
+	}
+
+	/// Return a copy of this `ResourceTemplate` with any fields newer than the
+	/// negotiated protocol version stripped. `BaseMetadata.title` was
+	/// introduced by 2025-06-18; `ResourceTemplate.icons` was introduced by
+	/// 2025-11-25 (present in draft which is >= 2025-11-25).
+	/// `uriTemplate`/`name`/`description`/`mimeType`/`annotations`/`_meta` all
+	/// existed in 2024-11-05 and are preserved unchanged. Mirrors
+	/// `Tool.forVersion` / `Prompt.forVersion`.
+	ResourceTemplate forVersion(ProtocolVersion v) const @safe
+	{
+		ResourceTemplate projected;
+		projected.uriTemplate = uriTemplate;
+		projected.name = name;
+		projected.description = description;
+		projected.mimeType = mimeType;
+		projected.annotations.audience = annotations.audience.dup;
+		projected.annotations.priority = annotations.priority;
+		projected.annotations.lastModified = annotations.lastModified;
+		projected.meta = meta;
+		// `BaseMetadata.title` was introduced by 2025-06-18.
+		if (v >= ProtocolVersion.v2025_06_18)
+			projected.title = title;
+		// `ResourceTemplate.icons` was introduced by 2025-11-25.
+		if (v >= ProtocolVersion.v2025_11_25)
+		{
+			foreach (icon; icons)
+			{
+				Icon copy;
+				copy.src = icon.src;
+				copy.mimeType = icon.mimeType;
+				copy.sizes = icon.sizes.dup;
+				copy.theme = icon.theme;
+				projected.icons ~= copy;
+			}
+		}
+		return projected;
 	}
 }
 

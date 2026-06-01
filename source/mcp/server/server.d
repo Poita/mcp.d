@@ -1571,7 +1571,7 @@ final class McpServer
 
 		ListResourcesResult result;
 		foreach (uri; uris[begin .. end])
-			result.resources ~= resources[uri].descriptor;
+			result.resources ~= resources[uri].descriptor.forVersion(ver);
 		result.nextCursor = next;
 		return maybeCache(result, listHint("resources/list"), ver);
 	}
@@ -1584,7 +1584,7 @@ final class McpServer
 
 		ListResourceTemplatesResult result;
 		foreach (t; templates[begin .. end])
-			result.resourceTemplates ~= t.descriptor;
+			result.resourceTemplates ~= t.descriptor.forVersion(ver);
 		result.nextCursor = next;
 		return maybeCache(result, listHint("resources/templates/list"), ver);
 	}
