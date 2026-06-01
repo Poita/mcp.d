@@ -617,7 +617,6 @@ unittest  // replay never crosses streams (MUST NOT replay a different stream)
 	ch.notify("notifications/message", Json(["s": Json("A2")]));
 	assert(aFrames.length == 2);
 	const aId0 = aFrames[0]["id: ".length .. aFrames[0].indexOf("\n")];
-	const aOrdinal = aId0[0 .. aId0.indexOf("-")];
 
 	// A second independent stream B (registered while A is still live) gets its own
 	// ordinal; force a delivery onto it by removing A first is avoided — instead use

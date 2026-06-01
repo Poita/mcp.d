@@ -221,7 +221,7 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		if (!guardAuth(req, res, opts, token))
 			return;
 		const payload = req.bodyReader.readAllUTF8();
-		handleLegacyPostBody(server, channel, payload);
+		cast(void) handleLegacyPostBody(server, channel, payload);
 		// All subsequent client messages are POSTed here; the response (if any)
 		// is delivered on the GET SSE stream, so the POST itself just acknowledges
 		// receipt with 202 Accepted and no body.
