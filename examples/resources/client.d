@@ -2,12 +2,13 @@
  * MCP Resources example — CLIENT + self-verifying E2E test (dual transport).
  *
  * The SAME client verifies the resources server over BOTH transports; the
- * assertions are transport-agnostic:
+ * assertions are transport-agnostic. Transport selection and event-loop wiring
+ * are delegated to the shared `examples_common` scaffold:
  *
- *   - stdio (default): spawn the built `resources-server` binary (no `--http`)
- *     and drive it over its stdin/stdout via `McpClient.stdio`, exactly like
- *     examples/tools/client.d.
- *   - http (`--http <url>`): connect with `McpClient.http(url)`.
+ *   - stdio (default): `connectFromArgs` spawns the sibling `resources-server`
+ *     binary (resolved next to this client) over stdio.
+ *   - http (`--http <url>` / `--url <url>`): `connectFromArgs` connects with
+ *     `McpClient.http(url)`.
  *
  * It speaks the stateless draft protocol (`enableDraft`) for two reasons: the
  * `CacheableResult` freshness hint rides inline on every `resources/read`, and a
@@ -29,10 +30,12 @@
  *      notifications/resources/list_changed for the newly-created note resource;
  *      the new note then reads back its pushed body. The tool is invoked with a
  *      typed args struct and its typed `structuredContent` is decoded with
- *      `structuredContentAs!SetNoteResult` (uri + created) before asserting.
+ *      `structuredContentAs!SetNoteResult` (uri + created) before asserting. The
+ *      resources/updated notification is parsed with
+ *      `ResourceUpdatedNotification.fromJson` rather than raw `params["uri"]`.
  *
  * On success it prints a single "OK: ..." line and exits 0; on ANY mismatch it
- * prints what differed and exits non-zero, so CI can run it as a regression test.
+ * throws (via the shared `check`) so `runClient` maps it to a non-zero exit.
  *
  * Run:
  *   stdio: dub run -c client                         # spawns the server itself
@@ -41,20 +44,20 @@
  */
 module client;
 
-import std.getopt : getopt;
-import std.stdio : writeln, stderr;
+import std.stdio : writeln;
 import std.format : format;
-import std.path : dirName, buildPath;
-import std.file : exists, thisExePath;
 import core.time : msecs, MonoTime;
 
-import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep, yield;
+import vibe.core.core : sleep, yield;
 import vibe.data.json : Json;
 
 import mcp.client.client : McpClient;
 import mcp.client.subscription : SubscriptionFilter, SubscriptionStream;
 import mcp.protocol.draft : CacheScope;
 import mcp.protocol.errors : ErrorCode, McpException;
+import mcp.protocol.types : ResourceUpdatedNotification;
+
+import examples_common;
 
 // Expected contract — must match server.d.
 enum string expectedConfig = `{"name":"resources-example","featureFlags":["resources","subscribe"]}`;
@@ -78,88 +81,15 @@ struct SetNoteResult
 	bool created;
 }
 
-private int failures;
-
-private void fail(string msg) @trusted
+int main(string[] args) @safe
 {
-	stderr.writeln("FAIL: ", msg);
-	failures++;
+	return runClient(() @safe { return run(args); });
 }
 
-private void check(bool cond, lazy string msg) @safe
+int run(string[] args) @safe
 {
-	if (!cond)
-		fail(msg);
-}
-
-/// Locate the built server binary next to this client binary (dub writes both
-/// into the package root), independent of the current working directory.
-private string serverBinaryPath() @safe
-{
-	const dir = dirName(thisExePath);
-	foreach (name; ["resources-server", "resources-server.exe"])
-	{
-		const p = buildPath(dir, name);
-		if (exists(p))
-			return p;
-	}
-	return buildPath(dir, "resources-server");
-}
-
-int main(string[] args)
-{
-	string httpUrl;
-	getopt(args, "http", "Connect over Streamable HTTP to this MCP URL "
-			~ "(e.g. http://127.0.0.1:8349/mcp); omit for stdio", &httpUrl);
-
-	int rc;
-	// The SDK transport does its I/O on the vibe event loop, so run the e2e
-	// inside a runTask and exit the loop when done. This also lets the HTTP
-	// `subscriptions/listen` background stream task be pumped.
-	runTask(() nothrow {
-		scope (exit)
-			exitEventLoop();
-		try
-			rc = run(httpUrl);
-		catch (Exception e)
-		{
-			try
-				stderr.writeln("FAIL (exception): ", e.msg);
-			catch (Exception)
-			{
-			}
-			rc = 1;
-		}
-	});
-	runEventLoop();
-	return rc;
-}
-
-int run(string httpUrl) @safe
-{
-	const overHttp = httpUrl.length != 0;
-
-	// --- connect over the selected transport --------------------------------
-	McpClient client;
-
-	if (overHttp)
-	{
-		client = McpClient.http(httpUrl);
-	}
-	else
-	{
-		const serverBin = serverBinaryPath();
-		if (!exists(serverBin))
-		{
-			fail("server binary not found at " ~ serverBin
-					~ " — build it first: dub build -c server");
-			return 2;
-		}
-		// Spawn the built server as a subprocess and drive it over its
-		// stdin/stdout. McpClient.spawn heap-boxes the pipes internally, and its
-		// close() runs the SIGTERM->SIGKILL stdio shutdown sequence.
-		client = McpClient.spawn([serverBin]);
-	}
+	// --- connect over the selected transport (stdio sibling / http url) -----
+	auto client = connectFromArgs(args, "resources-server");
 	// Both transports release cleanly via close() (stdio terminates the
 	// subprocess; http stops any background streams).
 	scope (exit)
@@ -169,9 +99,7 @@ int run(string httpUrl) @safe
 	// subscriptions/listen is the cross-transport push mechanism.
 	client.enableDraft();
 	auto disc = client.discover();
-	check(disc.serverInfo.name == "resources-example",
-			format("discover serverInfo.name = %s (want resources-example)",
-				disc.serverInfo.name));
+	checkEq(disc.serverInfo.name, "resources-example", "discover serverInfo.name");
 
 	// (1) resources/list contains the static resource.
 	auto list = client.listResources();
@@ -191,23 +119,22 @@ int run(string httpUrl) @safe
 
 	// (3) read the static resource.
 	auto cfg = client.readResource("config://app");
-	check(cfg.contents.length == 1, "config read: expected 1 content block");
+	checkEq(cfg.contents.length, cast(size_t) 1, "config read: content block count");
 	const cfgText = cfg.contents.length ? cfg.contents[0].text : "";
-	check(cfgText == expectedConfig, format("config text mismatch: got %s", cfgText));
+	checkEq(cfgText, expectedConfig, "config text");
 
 	// (6) draft read surfaces the CacheableResult freshness hint (inline).
 	check(!cfg.cache.isNull, "draft read: expected a cache hint on config://app");
 	if (!cfg.cache.isNull)
 	{
-		check(cfg.cache.get.ttlMs == expectedTtlMs,
-				format("cache ttlMs mismatch: got %d", cfg.cache.get.ttlMs));
+		checkEq(cfg.cache.get.ttlMs, expectedTtlMs, "cache ttlMs");
 		check(cfg.cache.get.cacheScope == CacheScope.public_,
 				"cache scope mismatch: expected public");
 	}
 
 	// (4) read a template-expanded resource.
 	auto note = client.readResource("note:///welcome");
-	check(note.contents.length == 1, "note read: expected 1 content block");
+	checkEq(note.contents.length, cast(size_t) 1, "note read: content block count");
 	check(note.contents.length && note.contents[0].text == "Hello from the resources example.",
 			"note:///welcome text mismatch");
 	check(note.contents.length && note.contents[0].mimeType == "text/plain",
@@ -233,12 +160,15 @@ int run(string httpUrl) @safe
 	int updated;
 	int listChanged;
 	string updatedUri;
-	client.onNotification = (string method, Json params) @safe nothrow {
-		if (method == "notifications/resources/updated")
+	client.onNotification = (string method, Json params) @safe nothrow{
+		if (method == ResourceUpdatedNotification.methodName)
 		{
 			updated++;
+			// Parse the typed notification payload instead of reading raw
+			// `params["uri"]`. `fromJson` is `@safe` but not `nothrow`, and the
+			// notification sink must be `nothrow`, so guard it.
 			try
-				updatedUri = params["uri"].get!string;
+				updatedUri = ResourceUpdatedNotification.fromJson(params).uri;
 			catch (Exception)
 			{
 			}
@@ -249,8 +179,7 @@ int run(string httpUrl) @safe
 
 	const targetUri = "note:///e2e";
 	SubscriptionFilter filter = {
-		resourcesListChanged: true,
-		resourceSubscriptions: [targetUri],
+		resourcesListChanged: true, resourceSubscriptions: [targetUri],
 	};
 	auto stream = client.subscriptionsListen(filter);
 	scope (exit)
@@ -269,9 +198,8 @@ int run(string httpUrl) @safe
 	// Decode the tool's typed structuredContent in one step instead of reading
 	// raw Json fields, then assert on the typed values.
 	auto setResult = callRes.structuredContentAs!SetNoteResult;
-	check(setResult.uri == targetUri, "set_note structuredContent.uri mismatch");
-	check(setResult.created == true,
-			"set_note should report created=true for a new note");
+	checkEq(setResult.uri, targetUri, "set_note structuredContent.uri");
+	check(setResult.created == true, "set_note should report created=true for a new note");
 
 	// Wait for the notifications. Over stdio they interleave on the single
 	// channel during the readResource await below; over http they arrive on the
@@ -288,8 +216,7 @@ int run(string httpUrl) @safe
 	}
 
 	check(updated >= 1, "did not receive notifications/resources/updated");
-	check(updatedUri == targetUri,
-			format("updated notification uri mismatch: got %s", updatedUri));
+	checkEq(updatedUri, targetUri, "updated notification uri");
 	check(listChanged >= 1, "did not receive notifications/resources/list_changed");
 
 	// The newly-created note is now a direct resource and reads back.
@@ -297,15 +224,7 @@ int run(string httpUrl) @safe
 	check(pushed.contents.length && pushed.contents[0].text == "pushed body",
 			"new note resource did not read back the pushed body");
 
-	if (failures)
-	{
-		() @trusted {
-			stderr.writeln(format("FAIL: %d assertion(s) failed over %s",
-					failures, overHttp ? "http" : "stdio"));
-		}();
-		return 1;
-	}
-	writeln("OK [", overHttp ? "http" : "stdio", "]: list+templates+read+template-expand"
+	writeln("OK [resources]: list+templates+read+template-expand"
 			~ "+notfound(-32602 draft)+draft-cache(ttl=60000,public)+subscribe/updated+list_changed"
 			~ " verified");
 	return 0;

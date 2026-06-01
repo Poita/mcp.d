@@ -16,9 +16,12 @@
  * resource-updated notification for that note's URI and (b) registers a brand
  * new note resource the first time an id is seen, emitting a list-changed
  * notification. This gives the client something concrete to subscribe to and
- * assert on. The tool returns typed content (`Content.makeText`) plus a typed
- * structured result (`setStructuredContent`), so no `structuredContent` Json is
- * hand-built.
+ * assert on. The tool returns a typed `SetNoteResult` struct directly, so the
+ * reflection layer derives both the `outputSchema` and the per-call
+ * `structuredContent` — no `structuredContent` Json is hand-built.
+ *
+ * Transport selection and the getopt/`runStreamableHttp`-vs-`runStdio` wiring
+ * are delegated to the shared `examples_common` scaffold's `runServerFromArgs`.
  *
  * One binary, either transport:
  *   stdio (default): dub run -c server
@@ -26,16 +29,13 @@
  */
 module server;
 
-import std.getopt : getopt;
-import std.stdio : stderr;
-
 import mcp;
-import mcp.transport.stdio : runStdio;
-import mcp.transport.streamable_http : runStreamableHttp, StreamableHttpOptions;
 import mcp.api.attributes;
 import mcp.api.reflection : registerHandlers;
 
 import std.typecons : nullable;
+
+import examples_common;
 
 /// Default HTTP port (kept from the original HTTP-only example). The client's
 /// HTTP mode connects to `http://127.0.0.1:<port>/mcp`.
@@ -119,16 +119,8 @@ final class ResourcesApi
 	}
 }
 
-void main(string[] args)
+void main(string[] args) @safe
 {
-	bool http;
-	ushort port = defaultPort;
-	string host = "127.0.0.1";
-	getopt(args,
-			"http", "Serve over Streamable HTTP instead of stdio", &http,
-			"port|p", "HTTP port to listen on (default 8349)", &port,
-			"host|h", "HTTP address to bind (default 127.0.0.1)", &host);
-
 	auto server = new McpServer("resources-example", "1.0.0");
 
 	registerHandlers(server, new ResourcesApi(server));
@@ -139,17 +131,7 @@ void main(string[] args)
 	server.enableResourceSubscriptions();
 	server.enableResourcesListChanged();
 
-	if (http)
-	{
-		StreamableHttpOptions opts;
-		opts.bindAddresses = [host];
-		() @trusted {
-			stderr.writefln("resources-server listening on http://%s:%d/mcp", host, port);
-		}();
-		runStreamableHttp(server, port, opts);
-	}
-	else
-	{
-		runStdio(server);
-	}
+	// Transport (stdio default / --http on --port/--host) is handled by the
+	// shared scaffold.
+	runServerFromArgs(server, args, defaultPort);
 }

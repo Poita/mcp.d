@@ -25,7 +25,10 @@ Server side (`server.d`), written in the ergonomic **UDA style**
   layer derives both the tool's `outputSchema` and each call's
   `structuredContent` from the struct fields — no hand-built result Json.
 
-One binary, either transport, selected with `std.getopt`:
+One binary, either transport. Transport selection (and the client's
+spawn-vs-HTTP wiring + the shared `check`/`runClient` harness) is provided
+by the `examples-common` scaffold (`runServerFromArgs` / `connectFromArgs` /
+`runClient`), so this example carries no transport boilerplate of its own:
 
 ```bash
 dub run -c server                       # stdio (default)
