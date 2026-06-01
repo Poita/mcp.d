@@ -1,11 +1,11 @@
 module mcp.server.context;
 
 import std.typecons : Nullable;
-import vibe.data.json : Json;
+import vibe.data.json : Json, deserializeJson, parseJsonString;
 
 import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
-import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction;
+import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction, LogLevel;
 import mcp.protocol.capabilities : ClientCapabilities;
 import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
@@ -310,6 +310,52 @@ interface RequestContext
 		if (auto p = id in m)
 			return T.fromJson(*p);
 		return T.fromJson(Json.emptyObject);
+	}
+
+	/// Decode the opaque MRTR `requestState` as JSON into `T`. The server owns the
+	/// `requestState` value (the encoding contract is the server-side
+	/// `ToolResponse.inputRequired(reqs, state)`, which carries
+	/// `serializeToJson(state).toString()`), so this is the typed inverse: parse
+	/// the echoed string and deserialise it into `T`. Returns `T.init` when the
+	/// client echoed no state (`requestState` empty). The value is untrusted input
+	/// the client round-tripped, so a malformed payload throws.
+	T requestStateAs(T)() @safe
+	{
+		const raw = requestState();
+		if (raw.length == 0)
+			return T.init;
+		return deserializeJson!T(parseJsonString(raw));
+	}
+
+	/// Typed convenience over `log(string, Json, string)`: emit a
+	/// `notifications/message` at the given `LogLevel` with a plain string payload.
+	/// Forwards to the JSON overload with the level's wire string and `Json(message)`.
+	final void log(LogLevel level, string message, string logger = null) @safe
+	{
+		log(cast(string) level, Json(message), logger);
+	}
+
+	/// Integer-step convenience over `reportProgress(double, Nullable!double,
+	/// string)`: a step counter passes `done`/`total` directly without
+	/// `cast(double)` and constructing a `Nullable!double` total.
+	final void reportProgress(long done, long total, string message = null) @safe
+	{
+		reportProgress(cast(double) done, Nullable!double(cast(double) total), message);
+	}
+
+	/// Whether the client attached an MRTR answer for `id` on this (resubmitted)
+	/// request (`id` present in `inputResponses`).
+	final bool hasInputResponse(string id) @safe
+	{
+		return (id in inputResponses()) !is null;
+	}
+
+	/// Whether this is an MRTR resubmission carrying client answers
+	/// (`inputResponses` non-empty). False on the first round and on non-stateless
+	/// requests.
+	final bool isResubmit() @safe
+	{
+		return inputResponses().length > 0;
 	}
 }
 
@@ -1287,4 +1333,141 @@ version (unittest) private Nullable!double nullableProgress(double v) @safe
 {
 	Nullable!double n = v;
 	return n;
+}
+
+version (unittest) private final class StateProbe : RequestContext
+{
+	string state;
+	Json[string] responses;
+
+	bool isCancelled() @safe
+	{
+		return false;
+	}
+
+	void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
+	{
+	}
+
+	void log(string, Json, string = null) @safe
+	{
+	}
+
+	Json sendRequest(string, Json) @safe
+	{
+		return Json.undefined;
+	}
+
+	bool clientSupports(string) @safe
+	{
+		return false;
+	}
+
+	bool isStateless() @safe
+	{
+		return true;
+	}
+
+	Json[string] inputResponses() @safe
+	{
+		return responses;
+	}
+
+	string requestState() @safe
+	{
+		return state;
+	}
+
+	TokenInfo auth() @safe
+	{
+		return TokenInfo.invalid();
+	}
+}
+
+unittest  // requestStateAs!T decodes a JSON-string requestState into a struct
+{
+	import vibe.data.json : serializeToJson;
+
+	static struct Cursor
+	{
+		int step;
+		string phase;
+	}
+
+	auto probe = new StateProbe;
+	// Mirrors the server-side contract: requestState carries
+	// serializeToJson(state).toString().
+	probe.state = serializeToJson(Cursor(3, "review")).toString();
+
+	auto c = probe.requestStateAs!Cursor;
+	assert(c.step == 3);
+	assert(c.phase == "review");
+}
+
+unittest  // requestStateAs!T returns T.init when requestState is empty
+{
+	static struct Cursor
+	{
+		int step;
+		string phase;
+	}
+
+	auto probe = new StateProbe;
+	assert(probe.state.length == 0);
+
+	auto c = probe.requestStateAs!Cursor;
+	assert(c == Cursor.init);
+}
+
+unittest  // typed log(LogLevel, string) emits the same frame as the string/Json form
+{
+	auto probe = new LogProbe;
+	RequestContext ctx = probe;
+	ctx.log(LogLevel.warning, "disk almost full");
+	assert(probe.emittedLevels == ["warning"]);
+}
+
+unittest  // typed log(LogLevel, string) carries the message as a Json string payload to the inner overload
+{
+	import vibe.data.json : parseJsonString;
+
+	string[] frames;
+	RequestContext ctx = new StdioContext((string str) @safe { frames ~= str; });
+	ctx.log(LogLevel.error, "boom", "lg");
+	assert(frames.length == 1);
+	auto j = parseJsonString(frames[0]);
+	assert(j["params"]["level"].get!string == "error");
+	assert(j["params"]["data"].get!string == "boom");
+	assert(j["params"]["logger"].get!string == "lg");
+}
+
+unittest  // reportProgress(long, long) forwards integer steps to the double/Nullable form
+{
+	import vibe.data.json : parseJsonString;
+
+	string[] frames;
+	RequestContext ctx = new StdioContext((string str) @safe { frames ~= str; }, Json("tok"));
+	ctx.reportProgress(3L, 10L, "step 3 of 10");
+	assert(frames.length == 1);
+	auto j = parseJsonString(frames[0]);
+	assert(j["params"]["progress"].to!double == 3.0);
+	assert(j["params"]["total"].to!double == 10.0);
+	assert(j["params"]["message"].get!string == "step 3 of 10");
+}
+
+unittest  // hasInputResponse reports whether the resubmitted request carries an answer for id
+{
+	auto probe = new StateProbe;
+	assert(!probe.hasInputResponse("q1"));
+	probe.responses["q1"] = Json.emptyObject;
+	assert(probe.hasInputResponse("q1"));
+	assert(!probe.hasInputResponse("q2"));
+}
+
+unittest  // isResubmit is true exactly when inputResponses is non-empty
+{
+	auto probe = new StateProbe;
+	assert(!probe.isResubmit);
+	probe.responses["q1"] = Json.emptyObject;
+	assert(probe.isResubmit);
 }
