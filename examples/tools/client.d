@@ -13,14 +13,21 @@
 ///   - inferred input schemas carry the typed args (enum members, the optional
 ///     Nullable arg is NOT required, the struct arg is an object sub-schema);
 ///   - the `@readOnly`/`@destructive`/`@idempotent`/`@hintTitle` marker UDAs are
-///     reflected into each tool's `ToolAnnotations`;
-///   - calling `calc` yields the expected `structuredContent` (struct return);
+///     reflected into each tool's `ToolAnnotations`, read via the ergonomic
+///     `tool.toolAnnotations()` accessor (#469);
+///   - calling `calc` yields the expected `structuredContent` (struct return),
+///     decoded with the typed `result.structuredContentAs!T` (#464);
 ///   - the optional `round` arg flows through;
 ///   - a scalar-returning tool wraps its value under `result`;
 ///   - a string tool returns plain text content (no structuredContent);
 ///   - a tool returning a typed `CallToolResult` yields the expected text +
 ///     resource-link content blocks (typed `Content.make*` factories);
 ///   - a bad call (unknown tool) raises the expected JSON-RPC error code.
+///
+/// Where the call arguments are static, it uses the typed
+/// `client.callTool(name, T args)` overload (#468) instead of hand-building a
+/// Json arguments object; where an argument is genuinely optional/dynamic it
+/// keeps a Json object.
 ///
 /// Prints "OK: ..." and exits 0 on success; on ANY mismatch it prints what
 /// differed and exits non-zero. This makes the example double as a CI e2e test
@@ -108,13 +115,42 @@ final class ServerProcess
 	}
 }
 
-/// Read a JSON number as a double, tolerating integral encodings (vibe encodes a
-/// whole-valued double like 7.0 as an int).
-private double asDouble(Json j) @safe
+/// Typed `calc` arguments — passed straight to `client.callTool("calc", CalcArgs(...))`
+/// (#468), which serializes to the same wire object as a hand-built Json. `op` is
+/// the server's `Op` enum member as a string.
+struct CalcArgs
 {
-	if (j.type == Json.Type.int_)
-		return cast(double) j.get!long;
-	return j.get!double;
+	string op;
+	double a;
+	double b;
+}
+
+/// Typed `magnitude` arguments — a nested `Vec2` struct serialized for the call.
+struct Vec2Arg
+{
+	double x;
+	double y;
+}
+
+struct MagnitudeArgs
+{
+	Vec2Arg v;
+}
+
+/// Typed view of `calc`'s structured output, decoded via `structuredContentAs!T`
+/// (#464). The enum return field serializes as its ordinal, so `op` is an int
+/// (Op.add == 0).
+struct CalcOutput
+{
+	int op;
+	double result;
+}
+
+/// Typed view of a scalar tool's structured output (scalar returns are wrapped
+/// under a `result` key).
+struct ScalarOutput
+{
+	double result;
 }
 
 /// Parse the `--http <url>` option. `getopt` takes `&httpUrl`, which the
@@ -197,33 +233,33 @@ int main(string[] args) @safe
 	}
 
 	// --- behavioral annotations (marker UDAs) ------------------------------
+	// `tool.toolAnnotations()` (#469) decodes the raw annotations Json into the
+	// typed `ToolAnnotations` — no `ToolAnnotations.fromJson(tool.annotations)`.
 	{
-		auto a = ToolAnnotations.fromJson(calc.annotations);
+		auto a = calc.toolAnnotations();
 		check(!a.readOnlyHint.isNull && a.readOnlyHint.get, "calc should be readOnlyHint:true");
 		check(!a.idempotentHint.isNull && a.idempotentHint.get, "calc should be idempotentHint:true");
 		check(!a.title.isNull && a.title.get == "Calculator",
 			"calc hintTitle should be 'Calculator'");
 
-		auto er = ToolAnnotations.fromJson(find(tools, "erase").annotations);
+		auto er = find(tools, "erase").toolAnnotations();
 		check(!er.destructiveHint.isNull && er.destructiveHint.get,
 			"erase should be destructiveHint:true");
 	}
 
 	// --- call `calc` (struct return -> structuredContent) ------------------
+	// Pass typed args (#468) and decode the typed structured output (#464).
 	{
-		Json a = Json.emptyObject;
-		a["op"] = "add";
-		a["a"] = 3.0;
-		a["b"] = 4.0;
-		auto r = client.callTool("calc", a);
+		auto r = client.callTool("calc", CalcArgs("add", 3.0, 4.0));
 		check(!r.isError, "calc add should not be an error");
-		auto sc = r.structuredContent;
+		auto calcOut = r.structuredContentAs!CalcOutput;
 		// The enum return field serializes as its ordinal: Op.add == 0.
-		check(sc["op"].get!int == 0, "calc structuredContent.op should be Op.add (0)");
-		check(isClose(asDouble(sc["result"]), 7.0), "calc 3+4 should be 7");
+		check(calcOut.op == 0, "calc structuredContent.op should be Op.add (0)");
+		check(isClose(calcOut.result, 7.0), "calc 3+4 should be 7");
 	}
 
 	// --- optional `round` argument flows through ---------------------------
+	// `round` is genuinely optional, so keep a dynamic Json arg object here.
 	{
 		Json a = Json.emptyObject;
 		a["op"] = "mul";
@@ -231,19 +267,14 @@ int main(string[] args) @safe
 		a["b"] = 1.0;
 		a["round"] = 2;
 		auto r = client.callTool("calc", a);
-		check(isClose(asDouble(r.structuredContent["result"]), 0.33),
+		check(isClose(r.structuredContentAs!CalcOutput.result, 0.33),
 			"calc (1/3) rounded to 2 dp should be 0.33");
 	}
 
 	// --- scalar return wrapped under `result` ------------------------------
 	{
-		Json a = Json.emptyObject;
-		Json v = Json.emptyObject;
-		v["x"] = 3.0;
-		v["y"] = 4.0;
-		a["v"] = v;
-		auto r = client.callTool("magnitude", a);
-		check(isClose(asDouble(r.structuredContent["result"]), 5.0),
+		auto r = client.callTool("magnitude", MagnitudeArgs(Vec2Arg(3.0, 4.0)));
+		check(isClose(r.structuredContentAs!ScalarOutput.result, 5.0),
 			"magnitude(3,4) should be 5");
 	}
 
