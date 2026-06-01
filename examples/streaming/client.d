@@ -13,10 +13,13 @@
  * Every observation is asserted against the value the server promises; the
  * process exits NON-ZERO on any mismatch, so CI can run it as an e2e regression
  * test. The transport-agnostic phases (A/B/C) run over BOTH transports; the
- * mid-flight cancellation phase (D) is HTTP-only because it relies on tearing
- * down the per-request SSE response stream — the Streamable HTTP cancellation
- * signal. (Over stdio the server processes one request to completion before
- * reading the next line, so there is no in-flight stream to drop.)
+ * mid-flight cancellation phase (D) runs over HTTP, where the cancel signal is
+ * tearing down the per-request SSE response stream (a client disconnect). Over
+ * stdio the cancel signal is instead a `notifications/cancelled` message, which
+ * the SDK server now honours mid-handler via its cooperative input drain (see
+ * the `serveStdio` cancellation unittest); this client keeps phase D HTTP-only
+ * only because its simple synchronous stdio client cannot inject a notification
+ * while a `callTool` is in flight — not an SDK limitation.
  *
  * What it verifies, in order:
  *   A. LIST + PROGRESS + LOGGING (transport-agnostic)
@@ -138,7 +141,8 @@ private int run(bool useHttp, string url) @safe
 	() @trusted {
 		writeln("OK [stdio]: countdown streamed ", progressSeen, " progress + ", progressSeen,
 				" log msgs; typed elicit+sample round-trip verified; unknown-tool error code. ",
-				"(mid-flight cancellation is HTTP-only and skipped over stdio.)");
+				"(phase D not run here: this client cannot inject notifications/cancelled "
+				~ "mid-callTool; the SDK server honours it over stdio — see serveStdio's unittest.)");
 	}();
 	return 0;
 }

@@ -110,13 +110,16 @@ A non-zero client exit code means a behavioral regression — the client prints
 
 ## Notes
 
-- **Why cancellation is HTTP-only.** Mid-flight cancellation here relies on the
-  client dropping its per-request SSE response stream — the Streamable HTTP
-  cancellation signal. The stdio transport serves one request to completion
-  before reading the next line, so there is no in-flight stream to drop; the
-  client therefore skips phase 4 over stdio. Progress, logging, structured
-  results, and the typed elicitation/sampling round-trips all run over both
-  transports.
+- **Why this client only runs cancellation over HTTP.** Over Streamable HTTP the
+  cancellation signal is the client dropping its per-request SSE response stream
+  (a disconnect). Over stdio the signal is a `notifications/cancelled` message,
+  which the **SDK server honours mid-handler** via its cooperative input drain
+  (a handler's `ctx.isCancelled`/`reportProgress` poll dispatches any pending
+  inbound message, flipping the in-flight token; see `serveStdio`'s cancellation
+  unittest). This *client* skips phase 4 over stdio only because its simple
+  synchronous loop cannot inject a notification while a `callTool` is in flight —
+  not an SDK limitation. Progress, logging, structured results, and the typed
+  elicitation/sampling round-trips all run over both transports.
 - **Auth is HTTP only.** OAuth (bearer tokens, the protected-resource metadata
   handshake, the authorization-server flow) is defined over HTTP request
   headers; the stdio transport has no header channel, so authentication is not
