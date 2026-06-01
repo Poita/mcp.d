@@ -20,6 +20,71 @@ import mcp.server.server;
 void serveStdio(McpServer server, scope string delegate() @safe readLine,
 		scope void delegate(string) @safe writeLine)
 {
+	import vibe.data.json : Json, parseJsonString;
+	import mcp.protocol.errors : McpException, internalError, ErrorCode;
+
+	long serverReqId = 0;
+
+	// True when `idJson` is the integer id we assigned to an outstanding
+	// server->client request.
+	static bool idMatches(Json idJson, long want) @safe
+	{
+		return idJson.type == Json.Type.int_ && idJson.get!long == want;
+	}
+
+	// The server->client request channel. The MCP stdio transport is
+	// bidirectional, so a tool handler may issue a request (sampling/elicitation)
+	// mid-flight: write the request frame, then pump stdin until the matching-id
+	// reply arrives, returning its `result` (or throwing on `error`). Any
+	// interleaved inbound client message (a notification such as
+	// `notifications/cancelled`, or another request) read while waiting is
+	// dispatched through the normal path, recursing this same channel so a nested
+	// server->client request also works.
+	Json serverRequest(string method, Json params) @safe
+	{
+		serverReqId++;
+		const myId = serverReqId;
+		Json req = Json.emptyObject;
+		req["jsonrpc"] = "2.0";
+		req["id"] = myId;
+		req["method"] = method;
+		if (params.type != Json.Type.undefined)
+			req["params"] = params;
+		writeLine(req.toString());
+
+		for (;;)
+		{
+			auto resp = readLine();
+			if (resp is null)
+				throw internalError("client closed stdin during a server->client request");
+			if (resp.length == 0)
+				continue;
+			Json j;
+			bool parsed = true;
+			try
+				j = parseJsonString(resp);
+			catch (Exception)
+				parsed = false;
+			if (parsed && j.type == Json.Type.object && "method" !in j && "id" in j
+					&& idMatches(j["id"], myId))
+			{
+				if ("error" in j && j["error"].type == Json.Type.object)
+				{
+					const err = j["error"];
+					const code = ("code" in err) ? err["code"].get!int : cast(
+							int) ErrorCode.internalError;
+					const msg = ("message" in err) ? err["message"].get!string : "client error";
+					throw new McpException(code, msg, err);
+				}
+				return ("result" in j) ? j["result"] : Json.emptyObject;
+			}
+			// An interleaved inbound message (not our reply): dispatch it normally.
+			const inner = server.handleRaw(resp, writeLine, &serverRequest);
+			if (inner.length)
+				writeLine(inner);
+		}
+	}
+
 	for (;;)
 	{
 		auto line = readLine();
@@ -39,8 +104,9 @@ void serveStdio(McpServer server, scope string delegate() @safe readLine,
 			continue;
 		// `writeLine` is the server->client channel: handlers' notifications are
 		// emitted through it as they happen, and the request's reply (if any)
-		// follows.
-		const response = server.handleRaw(line, writeLine);
+		// follows. `serverRequest` lets a handler issue a blocking server->client
+		// request (sampling/elicitation) that the client answers on stdin.
+		const response = server.handleRaw(line, writeLine, &serverRequest);
 		if (response.length)
 			writeLine(response);
 	}
@@ -125,6 +191,62 @@ unittest  // serveStdio processes newline-delimited requests and writes response
 	auto r1 = parseJsonString(outputs[1]);
 	assert(r1["id"].get!int == 2);
 	assert(r1["result"]["tools"][0]["name"].get!string == "echo");
+}
+
+unittest  // stdio: a tool calling ctx.elicit is answered over the same stdio channel
+{
+	import mcp.protocol.types : ElicitAction;
+
+	auto s = new McpServer("stdio-peer", "1.0");
+	Tool ask = {name: "ask"};
+	s.registerDynamicTool(ask, (Json args, RequestContext ctx) @safe {
+		auto schema = Json(["type": Json("object")]);
+		auto reply = ctx.elicit("What is your name?", schema);
+		const name = (reply.action == ElicitAction.accept) ? reply.content["name"].get!string
+			: "(declined)";
+		CallToolResult r;
+		r.content = [Content.makeText("hi:" ~ name)];
+		return r;
+	});
+
+	// The client declares elicitation at initialize, then calls the tool. When
+	// the server emits its server->client elicitation request (server-assigned
+	// id 1), the NEXT input line is the client's reply on the same channel.
+	string[] inputs = [
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}},"clientInfo":{"name":"t","version":"1"}}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask"}}`,
+		`{"jsonrpc":"2.0","id":1,"result":{"action":"accept","content":{"name":"Ada"}}}`,
+	];
+	size_t i;
+	string[] outputs;
+	serveStdio(s, () @safe { return i < inputs.length ? inputs[i++] : null; }, (string line) @safe {
+		outputs ~= line;
+	});
+
+	// The server must have emitted an elicitation/create request frame...
+	bool sawElicitRequest;
+	foreach (o; outputs)
+	{
+		auto j = parseJsonString(o);
+		if (j.type == Json.Type.object && "method" in j
+				&& j["method"].get!string == "elicitation/create")
+			sawElicitRequest = true;
+	}
+	assert(sawElicitRequest, "server never emitted a server->client elicitation/create request");
+
+	// ...and the tools/call (id 2) reply must reflect the elicited value.
+	bool sawResult;
+	foreach (o; outputs)
+	{
+		auto j = parseJsonString(o);
+		if (j.type == Json.Type.object && "id" in j && j["id"].get!int == 2 && "result" in j)
+		{
+			assert(j["result"]["content"][0]["text"].get!string == "hi:Ada");
+			sawResult = true;
+		}
+	}
+	assert(sawResult, "tools/call reply with the elicited value was never produced");
 }
 
 unittest  // serveStdio stops at end-of-input (null line)
