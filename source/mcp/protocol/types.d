@@ -3155,6 +3155,62 @@ struct PromptArgument
 			a.required = j["required"].get!bool;
 		return a;
 	}
+
+	/// Return a copy of this `PromptArgument` with any fields newer than the
+	/// negotiated protocol version stripped. `PromptArgument` only began
+	/// extending `BaseMetadata` (gaining `title`) in 2025-06-18; in 2024-11-05
+	/// and 2025-03-26 it had only name/description/required.
+	PromptArgument forVersion(ProtocolVersion v) const @safe
+	{
+		PromptArgument projected;
+		projected.name = name;
+		projected.description = description;
+		projected.required = required;
+		if (v >= ProtocolVersion.v2025_06_18)
+			projected.title = title;
+		return projected;
+	}
+}
+
+unittest  // PromptArgument.forVersion strips title for 2024-11-05 (title introduced 2025-06-18)
+{
+	PromptArgument a = {name: "arg"};
+	a.title = "Arg";
+	auto j = a.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("title" !in j);
+}
+
+unittest  // PromptArgument.forVersion strips title for 2025-03-26 (title introduced 2025-06-18)
+{
+	PromptArgument a = {name: "arg"};
+	a.title = "Arg";
+	auto j = a.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("title" !in j);
+}
+
+unittest  // PromptArgument.forVersion keeps title for 2025-06-18 (title introduced here)
+{
+	PromptArgument a = {name: "arg"};
+	a.title = "Arg";
+	auto j = a.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert(j["title"].get!string == "Arg");
+}
+
+unittest  // PromptArgument.forVersion keeps title for draft
+{
+	PromptArgument a = {name: "arg"};
+	a.title = "Arg";
+	auto j = a.forVersion(ProtocolVersion.draft).toJson();
+	assert(j["title"].get!string == "Arg");
+}
+
+unittest  // PromptArgument.forVersion preserves non-gated fields (name/description/required)
+{
+	PromptArgument a = {name: "arg", description: nullable("d"), required: true};
+	auto p = a.forVersion(ProtocolVersion.v2024_11_05);
+	assert(p.name == "arg");
+	assert(p.description.get == "d");
+	assert(p.required);
 }
 
 /// A prompt the server exposes.
@@ -3228,7 +3284,7 @@ struct Prompt
 		projected.name = name;
 		projected.description = description;
 		foreach (a; arguments)
-			projected.arguments ~= a;
+			projected.arguments ~= a.forVersion(v);
 		projected.meta = meta;
 		if (v >= ProtocolVersion.v2025_06_18)
 			projected.title = title;
@@ -3340,6 +3396,36 @@ unittest  // Prompt.forVersion leaves the original unmodified (returns a project
 	cast(void) p.forVersion(ProtocolVersion.v2024_11_05);
 	assert(!p.title.isNull);
 	assert(p.icons.length == 1);
+}
+
+unittest  // Prompt.forVersion strips PromptArgument.title for 2024-11-05 (arg.title introduced 2025-06-18)
+{
+	Prompt p = {name: "greet"};
+	PromptArgument arg = {name: "who"};
+	arg.title = "Recipient";
+	p.arguments ~= arg;
+	auto j = p.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("title" !in j["arguments"][0]);
+}
+
+unittest  // Prompt.forVersion strips PromptArgument.title for 2025-03-26 (arg.title introduced 2025-06-18)
+{
+	Prompt p = {name: "greet"};
+	PromptArgument arg = {name: "who"};
+	arg.title = "Recipient";
+	p.arguments ~= arg;
+	auto j = p.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("title" !in j["arguments"][0]);
+}
+
+unittest  // Prompt.forVersion keeps PromptArgument.title for 2025-06-18 (arg.title introduced here)
+{
+	Prompt p = {name: "greet"};
+	PromptArgument arg = {name: "who"};
+	arg.title = "Recipient";
+	p.arguments ~= arg;
+	auto j = p.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert(j["arguments"][0]["title"].get!string == "Recipient");
 }
 
 /// A single message in a prompt result.
