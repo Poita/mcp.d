@@ -138,7 +138,8 @@ Json jsonSchemaOf(T)() @safe
 /// Fields without these UDAs are left untouched, preserving existing behaviour.
 private void applyFieldFacets(T, string field)(ref Json prop) @safe
 {
-	import mcp.api.attributes : minimum, maximum, title, SchemaDefault;
+	import mcp.api.attributes : minimum, maximum, title, SchemaDefault, format,
+		minLength, maxLength, pattern, minItems, maxItems;
 	import std.traits : getUDAs, hasUDA;
 
 	alias member = __traits(getMember, T, field);
@@ -149,6 +150,21 @@ private void applyFieldFacets(T, string field)(ref Json prop) @safe
 		prop["maximum"] = Json(getUDAs!(member, maximum)[0].value);
 	static if (hasUDA!(member, title))
 		prop["title"] = Json(getUDAs!(member, title)[0].value);
+
+	// #55: string facets (format / minLength / maxLength / pattern) and array
+	// facets (minItems / maxItems) for richer elicitation form schemas.
+	static if (hasUDA!(member, format))
+		prop["format"] = Json(getUDAs!(member, format)[0].value);
+	static if (hasUDA!(member, minLength))
+		prop["minLength"] = Json(cast(long) getUDAs!(member, minLength)[0].value);
+	static if (hasUDA!(member, maxLength))
+		prop["maxLength"] = Json(cast(long) getUDAs!(member, maxLength)[0].value);
+	static if (hasUDA!(member, pattern))
+		prop["pattern"] = Json(getUDAs!(member, pattern)[0].value);
+	static if (hasUDA!(member, minItems))
+		prop["minItems"] = Json(cast(long) getUDAs!(member, minItems)[0].value);
+	static if (hasUDA!(member, maxItems))
+		prop["maxItems"] = Json(cast(long) getUDAs!(member, maxItems)[0].value);
 
 	static foreach (uda; getUDAs!(member, SchemaDefault))
 		prop["default"] = schemaDefaultJson(uda.value);
@@ -188,6 +204,9 @@ template isElicitScalar(F)
 {
 	static if (isInstanceOf!(Nullable, F))
 		enum isElicitScalar = isElicitScalar!(typeof(F.init.get()));
+	else static if (isArray!F && !isSomeString!F) // #55: a multi-select array of enum members (a flat array of a primitive
+		// enum), e.g. `Color[]`, is a permitted form field (array items enum).
+		enum isElicitScalar = is(typeof(F.init[0]) == enum);
 	else
 		enum isElicitScalar = is(F == bool) || isIntegral!F
 			|| isFloatingPoint!F || isSomeString!F || is(F == enum);
@@ -226,7 +245,8 @@ private template hasFieldDefault(T, size_t i)
 		/// description of the first violation found. The supported keyword subset
 		/// matches what this SDK emits and is the same subset used for tool input and
 		/// output schemas: `type` (object/array/string/integer/number/boolean), nested
-		/// `properties` with `required`, array `items`, and `enum`. Unknown keywords are
+		/// `properties` with `required`, object `additionalProperties`, array `items`,
+		/// and `enum`. Unknown keywords are
 		/// ignored (treated as satisfied), so a richer hand-written schema never reports
 		/// a spurious failure.
 		string validateAgainstSchema(Json value, Json schema) @safe
@@ -276,6 +296,27 @@ private template hasFieldDefault(T, size_t i)
 						if (msg.length)
 							return msg;
 					}
+			}
+
+			// additionalProperties: validate each object member whose key is not
+			// already covered by an explicit `properties` entry against the
+			// additionalProperties value schema (#46). SDK-emitted AA schemas have
+			// no `properties`, so every member is validated; for combined schemas
+			// this stays correct by only validating the residual keys.
+			if (value.type == Json.Type.object && "additionalProperties" in schema
+				&& schema["additionalProperties"].type == Json.Type.object)
+				{
+				auto ap = schema["additionalProperties"];
+				const hasProps = "properties" in schema
+					&& schema["properties"].type == Json.Type.object;
+				foreach (string key, member; value.byKeyValue)
+					{
+					if (hasProps && key in schema["properties"])
+						continue;
+					auto msg = validateAt(member, ap, path.length ? path ~ "." ~ key : key);
+					if (msg.length)
+						return msg;
+				}
 			}
 
 			if (value.type == Json.Type.object && "required" in schema
@@ -702,4 +743,93 @@ private template hasFieldDefault(T, size_t i)
 			assert("maximum" !in count);
 			assert("title" !in count);
 			assert("default" !in count);
+		}
+
+		unittest  // #46 validateAgainstSchema validates AA values via additionalProperties
+		{
+			auto schema = jsonSchemaOf!(int[string]);
+			Json bad = Json.emptyObject;
+			bad["a"] = "not-an-int";
+			auto msg = validateAgainstSchema(bad, schema);
+			assert(msg.length > 0);
+		}
+
+		unittest  // #46 additionalProperties: a conforming AA value passes
+		{
+			auto schema = jsonSchemaOf!(int[string]);
+			Json good = Json.emptyObject;
+			good["a"] = 1;
+			good["b"] = 2;
+			assert(validateAgainstSchema(good, schema) == "");
+		}
+
+		unittest  // #46 additionalProperties recurses into struct value schemas
+		{
+			struct Item
+			{
+				int qty;
+			}
+
+			auto schema = jsonSchemaOf!(Item[string]);
+			Json bad = Json.emptyObject;
+			Json inner = Json.emptyObject;
+			inner["qty"] = "oops";
+			bad["x"] = inner;
+			assert(validateAgainstSchema(bad, schema).length > 0);
+		}
+
+		unittest  // #55 string facets emit format/minLength/maxLength/pattern
+		{
+			import mcp.api.attributes : format, minLength, maxLength, pattern;
+
+			struct Form
+			{
+				@format("email") @minLength(3) @maxLength(64) @pattern("^.+@.+$") string addr;
+			}
+
+			auto s = jsonSchemaOf!Form;
+			auto a = s["properties"]["addr"];
+			assert(a["format"].get!string == "email");
+			assert(a["minLength"].get!long == 3);
+			assert(a["maxLength"].get!long == 64);
+			assert(a["pattern"].get!string == "^.+@.+$");
+		}
+
+		unittest  // #55 array facets emit minItems/maxItems
+		{
+			import mcp.api.attributes : minItems, maxItems;
+
+			struct Form
+			{
+				@minItems(1) @maxItems(5) int[] picks;
+			}
+
+			auto s = jsonSchemaOf!Form;
+			auto p = s["properties"]["picks"];
+			assert(p["type"].get!string == "array");
+			assert(p["minItems"].get!long == 1);
+			assert(p["maxItems"].get!long == 5);
+		}
+
+		unittest  // #55 a multi-select enum array is a valid elicitation field
+		{
+			enum Color
+				{
+				red,
+				green,
+				blue
+			}
+
+			struct Form
+			{
+				Color[] selected;
+			}
+
+			static assert(isElicitScalar!(Color[]));
+			static assert(isFlatElicitationStruct!Form);
+			auto s = jsonSchemaOf!Form;
+			auto sel = s["properties"]["selected"];
+			assert(sel["type"].get!string == "array");
+			assert(sel["items"]["type"].get!string == "string");
+			assert(sel["items"]["enum"].length == 3);
 		}
