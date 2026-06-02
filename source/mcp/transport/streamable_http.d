@@ -347,7 +347,10 @@ final class LegacySseChannel
 			return;
 		const frame = formatLegacyMessageEventRaw(jsonText);
 		long[] dead;
-		foreach (ref l; listeners)
+		// Iterate a snapshot so a self-healing removal (or any concurrent listener
+		// mutation across the async `l.write`) cannot dangle the loop reference
+		// (audit finding #75). The dup is a shallow copy of the small Listener[].
+		foreach (l; listeners.dup)
 		{
 			try
 				l.write(frame);
@@ -667,6 +670,26 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// draft-only rule, so it is not emitted here.
 	applySseStreamHeaders(res, false);
 
+	// Serialize every write to THIS response's bodyWriter through one per-stream
+	// TaskMutex (mirroring duplex.d): the push-channel listener callback, the
+	// up-front retry: event, and the heartbeat loop all share this connection, and
+	// without the lock two fibers could interleave the bytes of different SSE
+	// frames (audit finding #28). The channel's own mutex guards only its state,
+	// not a foreign heartbeat writer, so the serialization must live here.
+	import vibe.core.sync : TaskMutex;
+
+	auto writeMtx = new TaskMutex;
+	void writeFrame(string frame) @safe
+	{
+		() @trusted {
+			synchronized (writeMtx)
+			{
+				res.bodyWriter.write(cast(const(ubyte)[]) frame);
+				res.bodyWriter.flush();
+			}
+		}();
+	}
+
 	// Resumability and Redelivery (basic/transports §Resumability and Redelivery):
 	// if the reconnecting client supplied the `Last-Event-ID` header, hand it to
 	// the channel so it resumes the disconnected stream — replaying the events
@@ -675,10 +698,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// stream (gated by getOpensSseStream above); the draft never reaches here.
 	const lastEventId = req.headers.get("Last-Event-ID", "");
 	const listenerId = push.addListener((string frame) @safe {
-		() @trusted {
-			res.bodyWriter.write(cast(const(ubyte)[]) frame);
-			res.bodyWriter.flush();
-		}();
+		writeFrame(frame);
 	}, "", SubscriptionFilter.init, lastEventId);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
@@ -693,12 +713,8 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// so other revisions' wire output is unchanged.
 	if (reconnectDelayMs > 0 && sendsRetryOnClose(server.negotiatedVersion))
 	{
-		const retry = formatRetryEvent(reconnectDelayMs);
 		try
-			() @trusted {
-			res.bodyWriter.write(cast(const(ubyte)[]) retry);
-			res.bodyWriter.flush();
-		}();
+			writeFrame(formatRetryEvent(reconnectDelayMs));
 		catch (Exception)
 		{
 		}
@@ -710,10 +726,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	{
 		sleep(15.seconds);
 		try
-			() @trusted {
-			res.bodyWriter.write(cast(const(ubyte)[]) ": ping\n\n");
-			res.bodyWriter.flush();
-		}();
+			writeFrame(": ping\n\n");
 		catch (Exception)
 			break;
 	}
@@ -755,6 +768,25 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	// §Receiving Messages).
 	applySseStreamHeaders(res, true);
 
+	// Serialize every write to THIS response's bodyWriter through one per-stream
+	// TaskMutex: the push-channel listener callback (the leading ack and every
+	// subsequent notification) and the heartbeat loop share this connection, so
+	// without the lock two fibers could interleave the bytes of different SSE
+	// frames (audit finding #28).
+	import vibe.core.sync : TaskMutex;
+
+	auto writeMtx = new TaskMutex;
+	void writeFrame(string frame) @safe
+	{
+		() @trusted {
+			synchronized (writeMtx)
+			{
+				res.bodyWriter.write(cast(const(ubyte)[]) frame);
+				res.bodyWriter.flush();
+			}
+		}();
+	}
+
 	auto push = server.serverPushChannel(coord);
 	// The listen request's id becomes the stream's subscriptionId: every
 	// notification delivered to this listener (including the leading
@@ -762,10 +794,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	// `params._meta["io.modelcontextprotocol/subscriptionId"]` (draft
 	// basic/utilities/subscriptions).
 	const listenerId = push.addListener((string frame) @safe {
-		() @trusted {
-			res.bodyWriter.write(cast(const(ubyte)[]) frame);
-			res.bodyWriter.flush();
-		}();
+		writeFrame(frame);
 	}, rpcIdString(msg.id), streamFilter);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
@@ -787,10 +816,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	{
 		sleep(15.seconds);
 		try
-			() @trusted {
-			res.bodyWriter.write(cast(const(ubyte)[]) ": ping\n\n");
-			res.bodyWriter.flush();
-		}();
+			writeFrame(": ping\n\n");
 		catch (Exception)
 			break;
 	}

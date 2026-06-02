@@ -3,7 +3,7 @@ module mcp.transport.sse_context;
 import core.time : Duration, seconds;
 import std.typecons : Nullable;
 
-import vibe.core.sync : LocalManualEvent, createManualEvent;
+import vibe.core.sync : LocalManualEvent, createManualEvent, TaskMutex;
 import vibe.data.json : Json;
 import vibe.http.server : HTTPServerResponse;
 
@@ -107,6 +107,32 @@ final class StreamCoordinator
 		}
 		return false;
 	}
+
+	/// Fail a single still-pending outbound request with `error` and wake its
+	/// awaiting task immediately (mirrors `DuplexCoordinator.failPending`, but
+	/// targeted at one id). Used when the GET SSE listener a server->client request
+	/// was delivered on disconnects before the client could respond: rather than
+	/// letting the awaiter block for the full timeout, it is released promptly with
+	/// an `McpException` (audit finding #26). Unknown ids are ignored.
+	void failPending(long id, McpException error) @safe
+	{
+		if (auto w = id in waiters)
+		{
+			Json err = Json.emptyObject;
+			err["code"] = error.code;
+			err["message"] = error.msg;
+			w.error = err;
+			w.done = true;
+			w.evt.emit();
+		}
+	}
+
+	/// Fail several pending outbound requests at once (see `failPending`).
+	void failPendingForIds(long[] ids, McpException error) @safe
+	{
+		foreach (id; ids)
+			failPending(id, error);
+	}
 }
 
 /// A long-lived server->client SSE channel for *unsolicited* traffic — the
@@ -125,9 +151,17 @@ final class StreamCoordinator
 /// write (a disconnected client) are skipped and dropped so the channel
 /// self-heals and the message still lands on a live stream.
 ///
-/// One instance is shared across a server mount. Thread-safety is the caller's
-/// responsibility on multi-threaded vibe.d setups; the default single-fiber
-/// dispatch needs none.
+/// One instance is shared across a server mount. The channel serializes delivery
+/// and listener-list mutation internally with a vibe `TaskMutex`, so concurrent
+/// fibers cannot interleave the bytes of two SSE frames, reuse an event id, or
+/// dangle the listener list across an async write. Callers that ALSO write to the
+/// same underlying `HTTPServerResponse.bodyWriter` outside the channel (e.g. a
+/// heartbeat loop or an up-front `retry:` event on the GET/listen stream) MUST
+/// serialize those writes against the channel's listener write callback through a
+/// shared per-stream lock, since the channel's mutex guards only its own state and
+/// its own writes — not a foreign writer on the same connection. Like the rest of
+/// the SDK, this assumes vibe.d's default single-threaded event loop; running the
+/// router with `HTTPServerOption.distribute` or worker threads is unsupported.
 /// The per-stream opt-in a client expressed when it opened a draft
 /// `subscriptions/listen` stream (draft basic/utilities/subscriptions §Notification
 /// Filter). It records exactly which change-notification types this one stream asked
@@ -253,6 +287,30 @@ final class ServerPushChannel
 	private long[long] seqOf; /// listener id -> its monotonic event sequence
 	private long nextListenerId = 1;
 
+	/// Serializes delivery (`deliver`/`emitTo`) and listener-list mutation
+	/// (`addListener`/`removeListener`) so that no second emit and no list mutation
+	/// can interleave with an in-progress `l.write` await (audit findings #74/#75).
+	/// Held across the whole body, including the socket write, so the
+	/// "deliver to exactly one stream" decision plus its event-id reservation and
+	/// the list iteration are atomic against any concurrent fiber.
+	private TaskMutex mtx;
+
+	/// In-flight server->client request id -> the listener id it was delivered on
+	/// (audit finding #26). When that listener disconnects (`removeListener`) the
+	/// bound requests are failed immediately so their awaiters do not hang for the
+	/// full timeout. Cleared as requests complete or their listener drops.
+	private long[long] requestListener;
+
+	/// LRU order of stream ordinals that currently hold replay history, oldest
+	/// first. Bounds total retained memory across the mount's lifetime to
+	/// `maxHistoryStreams * maxHistoryPerStream` frames regardless of how many
+	/// short-lived GET streams connect and disconnect (audit finding #25): a
+	/// reconnecting client still finds a recently-disconnected stream's buffer for
+	/// Last-Event-ID replay, but a stream not touched for `maxHistoryStreams` newer
+	/// streams is evicted.
+	private long[] historyOrder;
+	private size_t maxHistoryStreams = 64;
+
 	/// Per-stream replay history for Last-Event-ID resumability
 	/// (basic/transports §Resumability and Redelivery): for each stream ordinal,
 	/// the already-framed SSE blocks emitted on it, paired with their event
@@ -274,6 +332,7 @@ final class ServerPushChannel
 	this(StreamCoordinator coord) @safe
 	{
 		this.coord = coord;
+		this.mtx = new TaskMutex;
 	}
 
 	/// Register a connected GET listener and return its id. Each listener gets a
@@ -297,48 +356,93 @@ final class ServerPushChannel
 	long addListener(void delegate(string frame) @safe write, string subscriptionId = "",
 			SubscriptionFilter filter = SubscriptionFilter.init, string resumeFrom = "") @safe
 	{
-		const id = nextListenerId++;
-		listeners ~= Listener(id, write, subscriptionId, filter);
-
-		long resumeOrdinal, resumeSeq;
-		if (parseEventId(resumeFrom, resumeOrdinal, resumeSeq) && resumeOrdinal in history)
-		{
-			// Resume the disconnected stream: keep its ordinal, replay every buffered
-			// event after the cursor in sequence order, and continue from the next seq.
-			streamOf[id] = resumeOrdinal;
-			long maxSeq = resumeSeq;
-			foreach (ref e; history[resumeOrdinal])
+		return () @trusted {
+			synchronized (mtx)
 			{
-				if (e.seq <= resumeSeq)
-					continue;
-				write(e.frame);
-				if (e.seq > maxSeq)
-					maxSeq = e.seq;
+				const id = nextListenerId++;
+				listeners ~= Listener(id, write, subscriptionId, filter);
+
+				long resumeOrdinal, resumeSeq;
+				if (parseEventId(resumeFrom, resumeOrdinal, resumeSeq) && resumeOrdinal in history)
+				{
+					// Resume the disconnected stream: keep its ordinal, replay every
+					// buffered event after the cursor in sequence order, and continue
+					// from the next seq. Touch the ordinal so its history is treated as
+					// most-recently used (audit finding #25).
+					streamOf[id] = resumeOrdinal;
+					touchHistory(resumeOrdinal);
+					long maxSeq = resumeSeq;
+					foreach (ref e; history[resumeOrdinal])
+					{
+						if (e.seq <= resumeSeq)
+							continue;
+						write(e.frame);
+						if (e.seq > maxSeq)
+							maxSeq = e.seq;
+					}
+					seqOf[id] = maxSeq + 1;
+				}
+				else
+				{
+					streamOf[id] = coord.allocStream();
+					seqOf[id] = 0;
+				}
+				return id;
 			}
-			seqOf[id] = maxSeq + 1;
-		}
-		else
-		{
-			streamOf[id] = coord.allocStream();
-			seqOf[id] = 0;
-		}
-		return id;
+		}();
 	}
 
-	/// Drop a listener (e.g. when its GET stream is closed).
+	/// Drop a listener (e.g. when its GET stream is closed). Any in-flight
+	/// server->client request that was delivered on this listener is failed
+	/// immediately so its awaiter wakes with an `McpException` instead of hanging
+	/// for the full timeout (audit finding #26). Acquires the delivery mutex so it
+	/// cannot interleave with an in-progress write or another list mutation.
 	void removeListener(long id) @safe
+	{
+		() @trusted {
+			synchronized (mtx)
+				removeListenerLocked(id);
+		}();
+	}
+
+	/// List-mutation half of `removeListener`, assuming the delivery mutex is
+	/// already held (so it can be called from inside `deliver`/`emitTo` dead-stream
+	/// cleanup without re-acquiring the non-recursive mutex). Fails the in-flight
+	/// requests bound to this listener (audit finding #26).
+	private void removeListenerLocked(long id) @safe
 	{
 		import std.algorithm : remove;
 
 		listeners = listeners.remove!(l => l.id == id);
 		streamOf.remove(id);
 		seqOf.remove(id);
+
+		// Fail exactly the in-flight server->client requests bound to this listener
+		// (not every pending waiter): other requests may be bound to surviving
+		// listeners (audit finding #26).
+		long[] orphaned;
+		foreach (reqId, lid; requestListener)
+			if (lid == id)
+				orphaned ~= reqId;
+		foreach (reqId; orphaned)
+			requestListener.remove(reqId);
+		if (orphaned.length)
+			coord.failPendingForIds(orphaned,
+					internalError("GET SSE listener disconnected before the client responded"));
 	}
 
 	/// Number of currently-connected listeners.
 	size_t listenerCount() const @safe
 	{
 		return listeners.length;
+	}
+
+	/// Number of stream ordinals currently retaining replay history. Exposed for
+	/// tests/diagnostics to verify the LRU bound (audit finding #25); the value is
+	/// at most `maxHistoryStreams`.
+	size_t retainedHistoryStreams() const @safe
+	{
+		return history.length;
 	}
 
 	/// Frame `msg` as an SSE event (with a per-stream globally-unique id) and
@@ -352,7 +456,7 @@ final class ServerPushChannel
 	/// when no live listener could receive it.
 	size_t emit(Json msg) @safe
 	{
-		return deliver(msg, (ref const Listener) @safe => true);
+		return deliver(msg, (ref const Listener) @safe => true) >= 0 ? 1 : 0;
 	}
 
 	/// Frame `msg` and deliver it on exactly ONE connected stream whose per-stream
@@ -378,33 +482,60 @@ final class ServerPushChannel
 			if (l.filter.active)
 				return l.filter.accepts(method, uri);
 			return plainEligible;
-		});
+		}) >= 0 ? 1 : 0;
 	}
 
 	/// Shared single-stream delivery: try eligible listeners (those for which
 	/// `eligible` is true) in registration order, writing `msg` to the first live one
 	/// and stopping there (the Multiple Connections rule: never broadcast the same
 	/// message across multiple streams). Listeners whose write throws are dropped so
-	/// the channel self-heals. Returns 1 on delivery, else 0.
-	private size_t deliver(Json msg, scope bool delegate(ref const Listener) @safe eligible) @safe
+	/// the channel self-heals. Returns the listener id the message landed on, or -1
+	/// when no live eligible listener could receive it.
+	///
+	/// The whole body — the eligibility scan, the event-id reservation, the
+	/// `l.write` await and the post-write sequence bump — runs under the delivery
+	/// mutex, so two concurrent emits cannot both pick the same listener, reuse a
+	/// seq, or mutate `listeners` across each other's write (audit finding #74).
+	/// Iteration is over a snapshot (`listeners.dup`) so a self-healing removal of a
+	/// dead stream cannot dangle the loop reference (audit findings #74/#75).
+	private long deliver(Json msg, scope bool delegate(ref const Listener) @safe eligible) @safe
+	{
+		return () @trusted {
+			synchronized (mtx)
+				return deliverLocked(msg, eligible);
+		}();
+	}
+
+	/// Delivery body, assuming the mutex is already held.
+	private long deliverLocked(Json msg, scope bool delegate(ref const Listener) @safe eligible) @safe
 	{
 		import std.conv : to;
 
 		long[] dead;
-		size_t delivered;
-		foreach (ref l; listeners)
+		long deliveredTo = -1;
+		foreach (l; listeners.dup)
 		{
 			if (!eligible(l))
 				continue;
+			if (l.id !in seqOf)
+				continue; // removed by a concurrent path before we reached it
 			const seq = seqOf[l.id];
 			const eid = streamOf[l.id].to!string ~ "-" ~ seq.to!string;
 			const frame = formatSseEvent(eid, withSubscriptionId(msg, l.subscriptionId));
 			try
 			{
 				l.write(frame);
+				// Re-check the listener still exists after the write before recording
+				// any further per-listener state, so a stream removed during the write
+				// is not resurrected (audit finding #74).
+				if (l.id !in seqOf)
+				{
+					deliveredTo = l.id;
+					break;
+				}
 				recordHistory(streamOf[l.id], seq, frame);
 				seqOf[l.id]++;
-				delivered = 1;
+				deliveredTo = l.id;
 				break; // single-stream delivery: do not fan out to other streams
 			}
 			catch (Exception)
@@ -413,8 +544,8 @@ final class ServerPushChannel
 			}
 		}
 		foreach (id; dead)
-			removeListener(id);
-		return delivered;
+			removeListenerLocked(id);
+		return deliveredTo;
 	}
 
 	/// Append an emitted frame to a stream's replay history (basic/transports
@@ -428,11 +559,43 @@ final class ServerPushChannel
 		if (entries is null)
 		{
 			history[ordinal] = [HistoryEntry(seq, frame)];
+			touchHistory(ordinal);
+			evictOldHistory();
 			return;
 		}
+		touchHistory(ordinal);
 		*entries ~= HistoryEntry(seq, frame);
 		if (maxHistoryPerStream > 0 && entries.length > maxHistoryPerStream)
 			*entries = (*entries)[$ - maxHistoryPerStream .. $];
+	}
+
+	/// Mark `ordinal` as most-recently used in the history LRU order (audit
+	/// finding #25): move it to the back of `historyOrder` so the oldest untouched
+	/// ordinal is the one evicted when the cap is exceeded.
+	private void touchHistory(long ordinal) @safe
+	{
+		import std.algorithm : remove, countUntil;
+
+		const i = historyOrder.countUntil(ordinal);
+		if (i >= 0)
+			historyOrder = historyOrder.remove(i);
+		historyOrder ~= ordinal;
+	}
+
+	/// Evict the oldest history ordinals once more than `maxHistoryStreams` are
+	/// retained, giving an absolute upper bound of
+	/// `maxHistoryStreams * maxHistoryPerStream` buffered frames over the mount's
+	/// lifetime regardless of how many short-lived GET streams come and go (audit
+	/// finding #25). A still-connected listener's ordinal can be evicted too, which
+	/// only forgoes resume-replay for that stream — never a correctness issue.
+	private void evictOldHistory() @safe
+	{
+		while (maxHistoryStreams > 0 && historyOrder.length > maxHistoryStreams)
+		{
+			const victim = historyOrder[0];
+			historyOrder = historyOrder[1 .. $];
+			history.remove(victim);
+		}
 	}
 
 	/// Convenience: broadcast a JSON-RPC notification to every listener.
@@ -456,13 +619,19 @@ final class ServerPushChannel
 	{
 		const id = coord.alloc();
 		coord.register(id);
-		const delivered = emit(makeRequest(Json(id), method, params));
-		if (delivered == 0)
+		// Learn which listener the request frame lands on so a later disconnect of
+		// THAT listener fails this awaiter immediately (audit finding #26).
+		const listenerId = deliver(makeRequest(Json(id), method, params),
+				(ref const Listener) @safe => true);
+		if (listenerId < 0)
 		{
 			coord.cancel(id);
 			throw internalError(
 					"No GET SSE listener connected to receive the server->client request");
 		}
+		requestListener[id] = listenerId;
+		scope (exit)
+			requestListener.remove(id);
 		return coord.await(id, timeout);
 	}
 
@@ -487,25 +656,41 @@ final class ServerPushChannel
 	/// (in which case the listener is dropped).
 	bool emitTo(long listenerId, Json msg) @safe
 	{
+		return () @trusted {
+			synchronized (mtx)
+				return emitToLocked(listenerId, msg);
+		}();
+	}
+
+	/// `emitTo` body, assuming the delivery mutex is held. Held across the write so
+	/// it cannot interleave with a concurrent `deliver`/`emitTo` on the same
+	/// listener (audit finding #74). Iterates a snapshot so self-healing removal is
+	/// safe (#75).
+	private bool emitToLocked(long listenerId, Json msg) @safe
+	{
 		import std.conv : to;
 
-		foreach (ref l; listeners)
+		foreach (l; listeners.dup)
 		{
 			if (l.id != listenerId)
 				continue;
+			if (l.id !in seqOf)
+				return false;
 			const seq = seqOf[l.id];
 			const eid = streamOf[l.id].to!string ~ "-" ~ seq.to!string;
 			const frame = formatSseEvent(eid, withSubscriptionId(msg, l.subscriptionId));
 			try
 			{
 				l.write(frame);
+				if (l.id !in seqOf)
+					return true; // removed during the write; do not resurrect
 				recordHistory(streamOf[l.id], seq, frame);
 				seqOf[l.id]++;
 				return true;
 			}
 			catch (Exception)
 			{
-				removeListener(l.id);
+				removeListenerLocked(l.id);
 				return false;
 			}
 		}
@@ -1419,6 +1604,84 @@ unittest  // push-channel ping round-trips: request frame out, empty result back
 	runEventLoop();
 
 	assert(pinged); // ping() returned without throwing -> client acknowledged
+}
+
+unittest  // #26: failPending wakes a single awaiter promptly with an McpException
+{
+	// Mirrors coordinator.d:221: register a waiter, fail just that id, and confirm
+	// await throws immediately instead of hanging to the 60s timeout.
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto c = new StreamCoordinator;
+	const id = c.alloc();
+	c.register(id);
+	c.failPending(id, internalError("listener disconnected"));
+	bool threw;
+	try
+		c.await(id);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.internalError);
+	}
+	assert(threw);
+}
+
+unittest  // #26: a server->client request fails fast when its bound listener disconnects
+{
+	// sendRequest delivers the request frame on a chosen GET listener and blocks in
+	// await. If THAT listener disconnects (removeListener) before the client
+	// responds, the awaiter must wake promptly with an McpException rather than
+	// hanging for the full timeout.
+	import mcp.protocol.errors : McpException;
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	long lid;
+	lid = ch.addListener((string) @safe {}); // captures the request frame, never replies
+
+	bool failedFast;
+	void delegate() @safe nothrow initiator = () @safe nothrow{
+		try
+			ch.sendRequest("ping");
+		catch (McpException)
+			failedFast = true;
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	};
+	void delegate() @safe nothrow disconnector = () @safe nothrow{
+		// Simulate the GET stream dropping after the request was delivered onto it.
+		try
+			ch.removeListener(lid);
+		catch (Exception)
+			assert(false, "removeListener threw");
+	};
+	runTask(initiator);
+	runTask(disconnector);
+	runEventLoop();
+	assert(failedFast);
+}
+
+unittest  // #25: history retains at most maxHistoryStreams ordinals (bounded memory)
+{
+	// Each plain GET stream that delivers an event records its own ordinal's
+	// history. Over many short-lived streams the total retained ordinals must stay
+	// bounded by the LRU cap, never growing without limit across the mount lifetime.
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+
+	// Drive far more streams than the cap, each emitting one event then dropping.
+	foreach (i; 0 .. 200)
+	{
+		const id = ch.addListener((string) @safe {});
+		ch.notify("notifications/message");
+		ch.removeListener(id);
+	}
+	// The retained history must not grow to one-ordinal-per-stream; it is capped.
+	assert(ch.retainedHistoryStreams() <= 64);
 }
 
 unittest  // draft HttpStreamContext: a disconnected client reports cancelled
