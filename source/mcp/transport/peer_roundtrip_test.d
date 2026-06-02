@@ -78,6 +78,12 @@ unittest
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
 			auto client = McpClient.http(url);
+			scope (exit)
+				try
+					client.close();
+				catch (Exception)
+				{
+				}
 			client.onSampling = (CreateMessageRequest request) @safe {
 				CreateMessageResult r;
 				r.role = "assistant";
@@ -152,6 +158,12 @@ unittest
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
 			auto client = McpClient.http(url);
+			scope (exit)
+				try
+					client.close();
+				catch (Exception)
+				{
+				}
 			// Advertise form-mode elicitation explicitly (the client validates inbound
 			// requests against its declared capabilities, not the auto-derived set).
 			client.capabilities.elicitation = true;
