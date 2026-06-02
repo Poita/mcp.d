@@ -32,15 +32,6 @@ struct StreamableHttpOptions
 	string[] allowedHosts = []; /// extra Host header values to accept
 	string[] allowedOrigins = []; /// extra Origin header values to accept
 
-	/// Enable stateful session management (basic/transports §Session Management).
-	/// When true, the server assigns a cryptographically-secure `Mcp-Session-Id`
-	/// on the response carrying the `InitializeResult`, requires that header on
-	/// every subsequent request (HTTP 400 when absent, HTTP 404 when unknown or
-	/// terminated), and honours client-driven termination via HTTP DELETE
-	/// (HTTP 404 for an unknown session). When false (the default) the transport
-	/// is stateless and never issues or checks a session id.
-	bool enableSessions = false;
-
 	/// OAuth 2.1 Resource Server enforcement (basic/authorization). When
 	/// `auth.validator` is set, every MCP request must present a valid
 	/// `Authorization: Bearer` token: the transport validates it (and its RFC 8707
@@ -156,7 +147,10 @@ void mountMcp(URLRouter router, McpServer server,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
 	auto coord = new StreamCoordinator;
-	auto sessions = opts.enableSessions ? new SessionManager : null;
+	// Session minting is derived from the server's mode (#550): a `stateful`
+	// server mints/tracks an `Mcp-Session-Id`; a `stateless` server never does.
+	// There is no longer a separate `enableSessions` transport knob.
+	auto sessions = server.mode == ServerMode.stateful ? new SessionManager : null;
 
 	// basic/authorization §Authorization Server Location (RFC 9728): refuse to start
 	// serving a Protected Resource Metadata document that would violate the MUST to

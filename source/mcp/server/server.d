@@ -11,6 +11,7 @@ import mcp.protocol.capabilities;
 import mcp.protocol.types;
 import mcp.protocol.draft;
 import mcp.server.context;
+import mcp.server.connection : ConnectionState;
 import mcp.transport.sse_context : ServerPushChannel, StreamCoordinator, SubscriptionFilter;
 
 @safe:
@@ -283,6 +284,25 @@ struct RegisteredPrompt
 	MrtrPromptHandler handler;
 }
 
+/// How a server manages per-connection state (issue #550). The author chooses;
+/// `stateless` is the default. See the README "Statefulness" section for the
+/// full feature-gating matrix.
+enum ServerMode
+{
+	/// No per-connection state is stored across calls. On the draft protocol
+	/// this is "modern stateless" (per-request `_meta`, MRTR, no blocking
+	/// server->client requests); on pre-draft protocols this is "legacy
+	/// stateless" (`initialize`/`notifications/initialized` are no-ops, no
+	/// session id is minted, correlation features error). This is the default.
+	stateless,
+
+	/// Opt-in pre-draft session management: `initialize` mints an
+	/// `Mcp-Session-Id`, per-session state is isolated, and the full feature set
+	/// (elicitation, GET stream, subscriptions, `logging/setLevel`) is available.
+	/// The draft is excluded from negotiation in this mode.
+	stateful
+}
+
 /// The transport-agnostic core of an MCP server.
 ///
 /// `McpServer` owns registration and JSON-RPC dispatch. It has no I/O: feed it
@@ -290,6 +310,11 @@ struct RegisteredPrompt
 /// response to write back. Transports (stdio, HTTP) are thin drivers over this.
 final class McpServer
 {
+	/// The statefulness model this server was constructed with. Immutable after
+	/// construction. Transports derive session minting from this (`stateful` =>
+	/// mint/track an `Mcp-Session-Id`; `stateless` => never).
+	private ServerMode mode_ = ServerMode.stateless;
+
 	private string serverName;
 	private string serverVersion;
 	private Implementation serverInfo_;
@@ -395,6 +420,56 @@ final class McpServer
 		this.serverName = serverInfo.name;
 		this.serverVersion = serverInfo.version_;
 		this.instructions = instructions;
+	}
+
+	/// Construct a `stateless` server (the default mode). On the draft protocol
+	/// this is modern stateless (per-request `_meta`, MRTR); on pre-draft it is
+	/// legacy stateless (no-op `initialize`, no session id, correlation features
+	/// error). No `Mcp-Session-Id` is ever minted. See the README "Statefulness"
+	/// section.
+	static McpServer stateless(string name, string version_,
+			Nullable!string instructions = Nullable!string.init) @safe
+	{
+		auto s = new McpServer(name, version_, instructions);
+		s.mode_ = ServerMode.stateless;
+		return s;
+	}
+
+	/// As `stateless(string, string, ...)`, from a full `Implementation`.
+	static McpServer stateless(Implementation serverInfo,
+			Nullable!string instructions = Nullable!string.init) @safe
+	{
+		auto s = new McpServer(serverInfo, instructions);
+		s.mode_ = ServerMode.stateless;
+		return s;
+	}
+
+	/// Construct a `stateful` server (opt-in, pre-draft only). `initialize` mints
+	/// an `Mcp-Session-Id` and creates per-session state; the draft is excluded
+	/// from negotiation; the full feature set (elicitation, GET stream,
+	/// subscriptions, `logging/setLevel`) is available, all session-isolated.
+	static McpServer stateful(string name, string version_,
+			Nullable!string instructions = Nullable!string.init) @safe
+	{
+		auto s = new McpServer(name, version_, instructions);
+		s.mode_ = ServerMode.stateful;
+		return s;
+	}
+
+	/// As `stateful(string, string, ...)`, from a full `Implementation`.
+	static McpServer stateful(Implementation serverInfo,
+			Nullable!string instructions = Nullable!string.init) @safe
+	{
+		auto s = new McpServer(serverInfo, instructions);
+		s.mode_ = ServerMode.stateful;
+		return s;
+	}
+
+	/// The statefulness model this server was constructed with (default
+	/// `stateless`). Transports derive session minting from this.
+	ServerMode mode() const @safe
+	{
+		return mode_;
 	}
 
 	/// The protocol version negotiated with the client (valid after `initialize`).
@@ -6497,4 +6572,60 @@ unittest  // inputRequired(reqs, T) does not collide with the string overload
 	auto resp = ToolResponse.inputRequired(cast(InputRequest[]) null, "raw-blob");
 	auto j = resp.toJson();
 	assert(j["requestState"].get!string == "raw-blob");
+}
+
+unittest  // #550: the default constructor yields a stateless server
+{
+	auto s = new McpServer("t", "1");
+	assert(s.mode == ServerMode.stateless);
+}
+
+unittest  // #550: stateless() factory builds a stateless server
+{
+	auto s = McpServer.stateless("t", "1");
+	assert(s.mode == ServerMode.stateless);
+}
+
+unittest  // #550: stateful() factory builds a stateful server
+{
+	auto s = McpServer.stateful("t", "1");
+	assert(s.mode == ServerMode.stateful);
+}
+
+unittest  // #550: the Implementation-based factories preserve the requested mode
+{
+	auto a = McpServer.stateless(Implementation("a", "1"));
+	auto b = McpServer.stateful(Implementation("b", "1"));
+	assert(a.mode == ServerMode.stateless);
+	assert(b.mode == ServerMode.stateful);
+}
+
+unittest  // #550: a stateful server negotiates a draft request DOWN to latest stable
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = McpServer.stateful("t", "1");
+	auto init = parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"initialize",`
+			~ `"params":{"protocolVersion":"2026-07-28","capabilities":{},`
+			~ `"clientInfo":{"name":"c","version":"1"}}}`);
+	auto msg = Message(init);
+	auto resp = s.handle(msg);
+	assert(!resp.isNull);
+	const ver = resp.get["result"]["protocolVersion"].get!string;
+	assert(ver != "2026-07-28", "stateful must not negotiate the draft");
+	assert(ver == latestStable.toWire);
+}
+
+unittest  // #550: a stateful server does not serve server/discover (draft-only RPC)
+{
+	import vibe.data.json : parseJsonString;
+
+	// A stateful server's negotiated version is pre-draft, so server/discover —
+	// which is gated on the draft — is unknown (-32601 method not found).
+	auto s = McpServer.stateful("t", "1");
+	auto disc = parseJsonString(`{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}}`);
+	auto resp = s.handle(Message(disc));
+	assert(!resp.isNull);
+	assert("error" in resp.get);
+	assert(resp.get["error"]["code"].get!long == -32601);
 }

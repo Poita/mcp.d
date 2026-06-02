@@ -4,8 +4,9 @@ import mcp.protocol.errors : McpException, internalError;
 
 /// Tracks active Streamable HTTP sessions for a server mount.
 ///
-/// When session management is enabled (see `StreamableHttpOptions.enableSessions`),
-/// the server assigns a cryptographically-secure `Mcp-Session-Id` on the response
+/// When session management is enabled (the server was built with
+/// `McpServer.stateful`, i.e. `server.mode == ServerMode.stateful`), the server
+/// assigns a cryptographically-secure `Mcp-Session-Id` on the response
 /// carrying the `InitializeResult`, requires that id on every subsequent request
 /// (HTTP 400 when absent, HTTP 404 when unknown/terminated), and supports
 /// client-driven termination via HTTP DELETE.

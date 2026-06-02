@@ -90,6 +90,52 @@ generation can never silently break, and publishes them to GitHub Pages on
 pushes to `main` (best-effort: the publish step is skipped if Pages is not
 enabled for the repository).
 
+## Statefulness
+
+A server chooses one of two statefulness models at construction. **Stateless is
+the default.** The author picks the mode via factories; the existing
+`new McpServer(name, version)` constructors keep working and default to
+stateless.
+
+```d
+auto s1 = McpServer.stateless("my-server", "1.0.0"); // default; same as `new McpServer(...)`
+auto s2 = McpServer.stateful("my-server", "1.0.0");   // opt-in session management
+```
+
+The core invariant: **a stateless server stores nothing across calls, and
+`McpServer` holds no mutable per-connection state.** Per-connection state lives
+in a `ConnectionState` object (`mcp.server.connection`) — protocol version,
+client capabilities, log level, resource subscriptions, and the in-flight
+cancellation registry. In stateful mode there is exactly one `ConnectionState`
+per session, owned by the transport keyed by `Mcp-Session-Id`. In stateless mode
+the transport builds a transient `ConnectionState` per request and discards it,
+so two concurrent peers sharing one `McpServer` cannot leak version, capability,
+or cancellation state into one another (issue #550).
+
+### The three effective modes
+
+| | Resolution of per-connection state | Notes |
+|---|---|---|
+| **Modern stateless** (stateless + request >= draft) | Per-request `_meta` (protocolVersion + clientCapabilities + logLevel) | No `initialize` (uses `server/discover`); input via MRTR; subscriptions ride the open stream; **no** blocking server->client elicitation/sampling |
+| **Legacy stateless** (stateless + request < draft) | `MCP-Protocol-Version` header (default `2025-03-26`; stdio assumes `2025-11-25`); client capabilities **unknown** (assumed none) | `initialize`/`notifications/initialized` are no-ops (no session id minted); a `tools/call` may be the first request with no prior `initialize`; correlation features are forbidden |
+| **Stateful** (opt-in, pre-draft only) | `ConnectionState` resolved by `Mcp-Session-Id`, created at `initialize` | The draft is **excluded** from negotiation (clamped down to `<= 2025-11-25`); `server/discover` is not served; DELETE terminates the session |
+
+### Feature-gating matrix
+
+| Feature | Modern stateless | Legacy stateless | Stateful |
+|---|---|---|---|
+| `initialize` handshake | n/a (`server/discover`) | no-op (no session id) | mints `Mcp-Session-Id` |
+| Per-request `_meta` version/caps | yes | n/a (header + empty caps) | n/a (session-negotiated) |
+| GET SSE stream | listen on open stream | forbidden (error) | yes |
+| `resources/subscribe` | n/a (`subscriptions/listen`) | forbidden (error) | yes |
+| Blocking server->client (elicit/sample) | forbidden (MRTR instead) | forbidden (error) | yes |
+| `logging/setLevel` | n/a (per-request `_meta`) | per-request / n/a | yes (session-scoped) |
+| Session id minted | never | never | yes |
+
+The Streamable HTTP transport derives session minting purely from
+`server.mode` (`ServerMode.stateful` => mint and require `Mcp-Session-Id`;
+`ServerMode.stateless` => never). There is no separate `enableSessions` option.
+
 ## Example: a server with the ergonomic UDA API
 
 Write plain typed D methods and annotate them — both the **input schema** (from
