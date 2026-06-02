@@ -27,6 +27,12 @@ final class StreamCoordinator
 		Json result = Json.undefined;
 		Json error = Json.undefined;
 		bool done;
+		/// The connection/session token of the peer the outbound request was
+		/// issued to. A client response only resolves this waiter when it arrives
+		/// from the SAME token, so one session cannot satisfy another session's
+		/// pending server->client request. The empty token marks an unscoped
+		/// (stateless / shared) waiter, which any responder may resolve.
+		string ownerToken;
 	}
 
 	private long counter = 1;
@@ -49,11 +55,15 @@ final class StreamCoordinator
 		return streamCounter++;
 	}
 
-	/// Begin tracking a pending outbound request.
-	void register(long id) @safe
+	/// Begin tracking a pending outbound request, bound to the connection/session
+	/// `ownerToken` it was issued to. Only a response arriving from the same token
+	/// may resolve it; an empty token leaves the waiter unscoped (stateless /
+	/// shared mode), resolvable by any responder.
+	void register(long id, string ownerToken = "") @safe
 	{
 		auto w = new Waiter;
 		w.evt = createManualEvent();
+		w.ownerToken = ownerToken;
 		waiters[id] = w;
 	}
 
@@ -91,15 +101,23 @@ final class StreamCoordinator
 		waiters.remove(id);
 	}
 
-	/// Deliver a client response/errorResponse. Returns true if it matched a
-	/// pending outbound request.
-	bool resolve(Json idJson, Json result, Json error) @safe
+	/// Deliver a client response/errorResponse from the peer identified by
+	/// `responderToken`. Returns true if it matched a pending outbound request
+	/// that was issued to the SAME token. A response whose token differs from the
+	/// waiter's owner is rejected (returns false) so one session cannot resolve or
+	/// hijack another session's pending server->client request. A waiter
+	/// registered with an empty owner token (stateless / shared mode) is matched
+	/// regardless of `responderToken`, preserving prior behavior where no session
+	/// attribution exists.
+	bool resolve(Json idJson, Json result, Json error, string responderToken = "") @safe
 	{
 		if (idJson.type != Json.Type.int_)
 			return false;
 		const id = idJson.get!long;
 		if (auto w = id in waiters)
 		{
+			if (w.ownerToken.length != 0 && w.ownerToken != responderToken)
+				return false;
 			w.result = result;
 			w.error = error;
 			w.done = true;
@@ -1358,7 +1376,9 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		if (serverStateless_)
 			throw invalidRequest("server-initiated requests (elicitation/sampling/roots) require a stateful server; construct with McpServer.stateful()");
 		const id = coord.alloc();
-		coord.register(id);
+		// Bind the outbound id to this request's session token so only a response
+		// arriving on the same session can resolve it.
+		coord.register(id, token_);
 		writeEvent(makeRequest(Json(id), method, params));
 		return coord.await(id);
 	}
@@ -1735,6 +1755,59 @@ unittest  // failPending wakes a single awaiter promptly with an McpException
 		assert(e.code == ErrorCode.internalError);
 	}
 	assert(threw);
+}
+
+unittest  // a response from a different session must not resolve another session's pending request
+{
+	// Session A issues a server->client request (id 1) bound to its own token.
+	// A response carrying id 1 but POSTed by session B must NOT resolve A's
+	// waiter: cross-session resolution would let B hijack A's elicitation/sampling.
+	auto c = new StreamCoordinator;
+	const id = c.alloc();
+	c.register(id, "sess-A");
+	const matched = c.resolve(Json(id), Json.emptyObject, Json.undefined, "sess-B");
+	assert(!matched, "a response from session B wrongly resolved session A's request");
+}
+
+unittest  // a response from the owning session resolves the pending request
+{
+	// The owning session's reply (same token) resolves its own waiter.
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+
+	auto c = new StreamCoordinator;
+	const id = c.alloc();
+	c.register(id, "sess-A");
+	bool matched;
+	bool awaited;
+	runTask(() @safe nothrow{
+		Json r;
+		try
+			r = c.await(id);
+		catch (Exception)
+			assert(false, "await threw");
+		awaited = r.type == Json.Type.object;
+		exitEventLoop();
+	});
+	runTask(() @safe nothrow{
+		try
+			matched = c.resolve(Json(id), Json.emptyObject, Json.undefined, "sess-A");
+		catch (Exception)
+			assert(false, "resolve threw");
+	});
+	runEventLoop();
+	assert(matched, "the owning session's response must resolve its own request");
+	assert(awaited);
+}
+
+unittest  // an unscoped (stateless) waiter is resolvable by any responder
+{
+	// A waiter registered with an empty owner token (stateless / shared mode)
+	// preserves prior behavior: any responder token, including empty, matches.
+	auto c = new StreamCoordinator;
+	const id = c.alloc();
+	c.register(id);
+	const matched = c.resolve(Json(id), Json.emptyObject, Json.undefined, "anyone");
+	assert(matched, "an unscoped waiter must remain resolvable regardless of responder token");
 }
 
 unittest  // a server->client request fails fast when its bound listener disconnects
