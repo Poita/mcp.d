@@ -2,7 +2,7 @@
  * examples/streaming — server.d (dual-transport: stdio AND Streamable HTTP)
  *
  * Demonstrates the SERVER side of MCP's three "in-flight" channels —
- * progress, logging and cancellation (issue #357) — written in the ergonomic
+ * progress, logging and cancellation — written in the ergonomic
  * UDA style: tools are annotated typed methods on a class, registered in one
  * call with `registerHandlers`. Typed args are marshalled and the structured
  * result is inferred from the struct return — no hand-built `Json` schemas or
@@ -11,24 +11,24 @@
  * Transport selection is delegated to the shared `examples/common` scaffold:
  * `runServerFromArgs(server, args, 9357)` serves stdio by default and
  * Streamable HTTP on `--http` (+ `--port`/`--host`) — the SAME single binary,
- * EITHER transport — so this file no longer hand-rolls the getopt + transport
- * branch.
+ * EITHER transport — so the getopt + transport branch lives in the scaffold,
+ * not here.
  *
  * Three tools:
  *
  *   `countdown` — a long-running task. On every step it:
  *       - emits a `notifications/progress` via the integer-step convenience
- *         `ctx.reportProgress(done, total, msg)` (#501) — delivered to the
+ *         `ctx.reportProgress(done, total, msg)` — delivered to the
  *         client only when the call carried a `_meta.progressToken`,
  *       - emits a `notifications/message` (logging) via the typed
- *         `ctx.log(LogLevel.info, message, logger)` convenience (#501) — a plain
+ *         `ctx.log(LogLevel.info, message, logger)` convenience — a plain
  *         string payload, no hand-built `Json`, and
  *       - polls `ctx.isCancelled` and stops promptly when the client cancels.
  *     Its structured result records `{completed, total, cancelled}` so the client
  *     can assert concrete values. When a run is cancelled it bumps a server-side
  *     counter so cancellation can be verified out of band.
  *
- *   `summarize` — exercises the TYPED server->client round-trip APIs (#436/#437),
+ *   `summarize` — exercises the TYPED server->client round-trip APIs,
  *     which work over BOTH transports (the SDK pumps the same channel mid-handler):
  *       - `ctx.elicit!Confirm(message)` derives the elicitation `requestedSchema`
  *         from the flat struct `Confirm` via `jsonSchemaOf!T` and returns a typed
@@ -67,7 +67,7 @@ import examples_common : runServerFromArgs;
 void main(string[] args) @safe
 {
 	// This example is STATELESS (the default). Its HTTP path
-	// exercises the draft transport (phase D: client-disconnect cancellation, a
+	// exercises the draft transport (client-disconnect cancellation, a
 	// draft-only feature) which a stateful server cannot serve — the draft is
 	// excluded from stateful negotiation. The `summarize` tool's ctx.elicit +
 	// ctx.sample (server->client requests) therefore run only over STDIO here (a
@@ -86,7 +86,7 @@ void main(string[] args) @safe
 	registerHandlers(server, new StreamingApi);
 
 	// Transport selection (stdio default; --http + --port/--host) comes from the
-	// shared examples/common scaffold (#505), default port 9357.
+	// shared examples/common scaffold, default port 9357.
 	runServerFromArgs(server, args, 9357);
 }
 
@@ -166,11 +166,11 @@ final class StreamingApi
 			// cancellation: stop the work and record it.
 			try
 			{
-				// Integer-step progress convenience (#501): done/total as longs, no
+				// Integer-step progress convenience: done/total as longs, no
 				// cast(double) + Nullable wrapping at the call site.
 				ctx.reportProgress(cast(long) i, cast(long) steps,
 						"step " ~ i.to!string ~ "/" ~ steps.to!string);
-				// Typed log convenience (#501): a LogLevel + a plain string message,
+				// Typed log convenience: a LogLevel + a plain string message,
 				// no hand-built Json `data` payload.
 				ctx.log(LogLevel.info,
 						"processing step " ~ i.to!string ~ " of " ~ steps.to!string, "countdown");
@@ -202,7 +202,7 @@ final class StreamingApi
 			"Summarize text after confirming tone via a typed elicitation, using typed sampling.")
 	SummaryResult summarize(@describe("the text to summarize") string text, RequestContext ctx)@safe
 	{
-		// Typed elicitation: requestedSchema is DERIVED from `Confirm` (#436).
+		// Typed elicitation: requestedSchema is DERIVED from `Confirm`.
 		auto elicited = ctx.elicit!Confirm("Confirm summarization preferences");
 		if (elicited.action != ElicitAction.accept)
 			return SummaryResult("declined", "", "", "User declined to summarize.");
@@ -212,7 +212,7 @@ final class StreamingApi
 			return SummaryResult("declined", confirm.tone, "", "User chose not to proceed.");
 
 		// Typed sampling: build CreateMessageRequest from typed SamplingMessage +
-		// Content.makeText (#437) instead of hand-built content Json.
+		// Content.makeText instead of hand-built content Json.
 		CreateMessageRequest req;
 		req.messages = [
 			SamplingMessage("user",
