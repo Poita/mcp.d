@@ -151,33 +151,88 @@ void runServerFromArgs(McpServer server, string[] args, ushort defaultPort,
 		runStdio(server);
 }
 
-/// Like `runServerFromArgs`, but carries a caller-supplied
-/// `StreamableHttpOptions` (notably `.auth`) so auth-enabled examples can reuse
-/// the scaffold instead of hand-rolling their own transport dispatch (#72).
-/// Parses `--http`/`--port`/`--host` exactly as the 4-arg overload; merges the
-/// parsed host into `opts.bindAddresses` when the caller left it empty; then
-/// dispatches to `runStreamableHttp(server, port, opts)` under `--http`,
-/// otherwise `runStdio(server)`. Blocks until the chosen transport exits.
-void runServerFromArgs(McpServer server, string[] args, ushort defaultPort,
-		StreamableHttpOptions opts, string defaultHost = "127.0.0.1") @safe
+/// Parse the HTTP-only `--port`/`--host` surface from `args`, returning the bind
+/// host/port through `port`/`host`. When the caller left `opts.bindAddresses` at
+/// the SDK default (`["127.0.0.1"]`) or empty, the parsed `--host` is written
+/// into `opts.bindAddresses` so the `--host` flag actually drives the bind; an
+/// explicitly customised `bindAddresses` is left untouched. Split out from
+/// `runHttpServerFromArgs` so it can be unit tested and so a caller that needs the
+/// resolved host/port -- e.g. the auth example deriving its RFC 8707 resource
+/// audience from the actual socket -- can reuse the exact parse the bind will use.
+/// `opts` is taken by `ref` and updated in place.
+void parseHttpServerArgs(string[] args, ushort defaultPort, ref StreamableHttpOptions opts,
+		out ushort port, out string host, string defaultHost = "127.0.0.1") @safe
 {
 	import std.getopt : getopt;
-	import mcp.transport.stdio : runStdio;
-	import mcp.transport.streamable_http : runStreamableHttp;
 
-	bool http;
-	ushort port = defaultPort;
-	string host = defaultHost;
+	port = defaultPort;
+	host = defaultHost;
+	// See `connectFromArgs`: `getopt`'s `&local` arguments force `@system`, so the
+	// parse lives in a `@trusted` shim.
 	(() @trusted {
-		getopt(args, "http", "Serve over Streamable HTTP instead of stdio.", &http, "port",
-			"Streamable HTTP listen port.", &port, "host", "Streamable HTTP bind host.", &host);
+		getopt(args, "port|p", "Streamable HTTP listen port.", &port,
+			"host|h", "Streamable HTTP bind host.", &host);
 	})();
 
-	if (opts.bindAddresses.length == 0)
+	// Honour `--host` unless the caller pinned a non-default bind set: a default or
+	// empty `bindAddresses` is replaced by the parsed host so the flag takes effect.
+	if (opts.bindAddresses.length == 0 || opts.bindAddresses == ["127.0.0.1"])
 		opts.bindAddresses = [host];
+}
 
-	if (http)
-		runStreamableHttp(server, port, opts);
-	else
-		runStdio(server);
+/// Run the example `server` over Streamable HTTP ONLY, with the caller-supplied
+/// `StreamableHttpOptions` (notably `.auth`). Unlike `runServerFromArgs`, this
+/// helper has NO stdio fallback: an OAuth resource server must never silently
+/// degrade to an unauthenticated stdio transport, so HTTP is the only mode.
+/// Parses just `--port`/`--host` (via `parseHttpServerArgs`), lets the parsed
+/// host drive `opts.bindAddresses`, writes the resolved bind host/port back
+/// through `port`/`host` (so the caller can derive its RFC 8707 resource audience
+/// from the actual socket), then calls `runStreamableHttp(server, port, opts)`.
+/// Blocks until the transport exits.
+void runHttpServerFromArgs(McpServer server, string[] args, ushort defaultPort,
+		ref StreamableHttpOptions opts, out ushort port, out string host,
+		string defaultHost = "127.0.0.1") @safe
+{
+	import mcp.transport.streamable_http : runStreamableHttp;
+
+	parseHttpServerArgs(args, defaultPort, opts, port, host, defaultHost);
+	runStreamableHttp(server, port, opts);
+}
+
+@safe unittest
+{
+	// Defaults apply when no flags are present, and the default host is carried
+	// into bindAddresses.
+	StreamableHttpOptions opts;
+	ushort port;
+	string host;
+	parseHttpServerArgs(["prog"], 8742, opts, port, host);
+	assert(port == 8742);
+	assert(host == "127.0.0.1");
+	assert(opts.bindAddresses == ["127.0.0.1"]);
+}
+
+@safe unittest
+{
+	// --port/--host (and their -p/-h aliases) are parsed and the host drives the
+	// bind, replacing the SDK-default bindAddresses.
+	StreamableHttpOptions opts;
+	ushort port;
+	string host;
+	parseHttpServerArgs(["prog", "--port", "9001", "--host", "0.0.0.0"], 8742, opts, port, host);
+	assert(port == 9001);
+	assert(host == "0.0.0.0");
+	assert(opts.bindAddresses == ["0.0.0.0"]);
+}
+
+@safe unittest
+{
+	// An explicitly customised bindAddresses (not the SDK default) is preserved.
+	StreamableHttpOptions opts;
+	opts.bindAddresses = ["10.0.0.5"];
+	ushort port;
+	string host;
+	parseHttpServerArgs(["prog", "--host", "127.0.0.1"], 8742, opts, port, host);
+	assert(host == "127.0.0.1");
+	assert(opts.bindAddresses == ["10.0.0.5"]);
 }

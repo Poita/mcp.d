@@ -38,7 +38,6 @@
  */
 module auth_example_server;
 
-import std.getopt : getopt;
 import std.stdio : stderr, writefln;
 import std.typecons : nullable;
 
@@ -46,7 +45,7 @@ import mcp;
 import mcp.transport : StreamableHttpOptions, runStreamableHttp;
 import mcp.auth : ResourceServerConfig, jwtVerifier, JwtVerifierConfig;
 
-import examples_common : WhoamiResult;
+import examples_common : WhoamiResult, parseHttpServerArgs;
 
 /// The canonical resource identifier (RFC 8707 audience) for the DEFAULT bind
 /// (host 127.0.0.1, port 8742). When `--port`/`--host` change the listening
@@ -111,10 +110,13 @@ void main(string[] args)
 {
 	import std.conv : to;
 
-	ushort port = 8742;
-	string host = "127.0.0.1";
-	getopt(args, "port|p", "Port to listen on (default 8742)", &port,
-			"host|h", "Address to bind (default 127.0.0.1)", &host);
+	// Parse the HTTP-only --port/--host surface via the shared scaffold; it also
+	// folds the parsed host into opts.bindAddresses so the bind and the audience
+	// we derive below stay in lockstep.
+	StreamableHttpOptions opts;
+	ushort port;
+	string host;
+	parseHttpServerArgs(args, 8742, opts, port, host);
 
 	// Derive the resource identifier (RFC 8707 audience / RFC 9728 PRM `resource`)
 	// from the ACTUAL bind host/port so the listening socket and the
@@ -144,8 +146,6 @@ void main(string[] args)
 	auth.scopesSupported = ["mcp:read", "mcp:write"];
 	auth.requiredScope = "mcp:read"; // every request needs at least mcp:read
 
-	StreamableHttpOptions opts;
-	opts.bindAddresses = [host];
 	opts.auth = auth;
 
 	() @trusted {

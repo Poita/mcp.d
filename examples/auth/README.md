@@ -14,8 +14,9 @@ resource-server protection is inherently an HTTP concern: the `401` +
 `WWW-Authenticate` challenge, the RFC 9728 Protected Resource Metadata document
 served at a well-known URL, and RFC 8707 audience binding all live in the HTTP
 layer. A stdio variant would have nothing to demonstrate. The server therefore
-stays on `runStreamableHttp`; its getopt surface is just `--port` / `--host`,
-and the client connects with `--url`.
+parses its `--port` / `--host` surface with the scaffold's HTTP-only
+`parseHttpServerArgs` and always serves over `runStreamableHttp`; the client
+connects with `--url`.
 
 ## What it teaches
 
@@ -95,10 +96,13 @@ never ship a private key in a real client.
 The client uses the shared **`examples_common`** scaffold (#505): `runClient`
 drives the vibe event loop and maps a thrown assertion to a non-zero exit,
 `check` / `checkEq` are the assertion primitives, and `connectFromArgs` selects
-the HTTP transport from `--url`. The server keeps its own
-`runStreamableHttp(server, port, opts)` call because the OAuth resource-server
-protection lives in `StreamableHttpOptions.auth`, which the scaffold's
-transport helper does not carry (this example is HTTP-only with no stdio mode).
+the HTTP transport from `--url`. On the server side the scaffold's HTTP-only
+`parseHttpServerArgs` parses `--port` / `--host` (folding the host into
+`StreamableHttpOptions.bindAddresses`) and hands back the resolved host/port so
+`main` can derive the RFC 8707 resource audience from the actual socket; `main`
+then sets `StreamableHttpOptions.auth` and calls `runStreamableHttp(server,
+port, opts)` directly. There is deliberately no stdio fallback: an OAuth
+resource server must never silently degrade to an unauthenticated transport.
 
 ## Run it (two terminals / CI two-step)
 
