@@ -73,9 +73,9 @@ struct Icon
 ///
 /// Per the schema `Implementation` extends `BaseMetadata` (`name`/`title`) and
 /// the `Icons` mixin, adding `version` plus the optional `description`,
-/// `websiteUrl`, and `icons` fields (`description`/`icons`/`websiteUrl` were
-/// added by 2025-11-25). All optional fields are omitted from `toJson` when
-/// unset, so wire output for older protocol versions is unchanged.
+/// `websiteUrl`, and `icons` fields (`description`/`icons`/`websiteUrl` apply
+/// from 2025-11-25). All optional fields are omitted from `toJson` when unset,
+/// so wire output stays valid for older protocol versions.
 struct Implementation
 {
 	string name;
@@ -125,8 +125,8 @@ struct Implementation
 
 	/// Return a copy of this `Implementation` with any fields newer than the
 	/// negotiated protocol version stripped, so the wire output stays valid for
-	/// the peer's version. `title` was introduced by 2025-06-18 (`BaseMetadata`);
-	/// `description`, `websiteUrl`, and `icons` were introduced by 2025-11-25.
+	/// the peer's version. `title` applies from 2025-06-18 (`BaseMetadata`);
+	/// `description`, `websiteUrl`, and `icons` apply from 2025-11-25.
 	/// `name`/`version` are always present. This lets a server (or client) hold a
 	/// fully-populated identity while emitting only the fields its peer understands.
 	Implementation forVersion(ProtocolVersion v) const @safe
@@ -352,7 +352,7 @@ struct ServerCapabilities
 	/// capabilities that existed in (and were negotiated for) the peer's
 	/// version. Mirrors `Implementation.forVersion`. The basic/lifecycle rule
 	/// "Only use capabilities that were successfully negotiated" requires this:
-	/// `completions` was introduced by 2025-03-26, `tasks` by 2025-11-25, and
+	/// `completions` applies from 2025-03-26, `tasks` from 2025-11-25, and
 	/// the `extensions` negotiation map is draft-only. `tools`/`resources`/
 	/// `prompts`/`logging`/`experimental` exist in every supported version.
 	ServerCapabilities forVersion(ProtocolVersion v) const @safe
@@ -365,17 +365,11 @@ struct ServerCapabilities
 		projected.experimental = experimental;
 		if (v >= ProtocolVersion.v2025_03_26)
 			projected.completions = completions;
-		// `tasks` is a first-class capability ONLY in the 2025-11-25 era. The draft
-		// schema has no top-level `tasks`; task support there is negotiated via the
-		// `extensions` map keyed by `tasksExtensionKey`. Since the version enum
-		// orders `draft` ABOVE 2025-11-25, gate to exactly 2025-11-25 here so draft
-		// never emits a top-level `tasks`.
-		// `tasks` is a first-class capability in the STABLE 2025-11-25 era and any
+		// `tasks` is a first-class capability in the stable 2025-11-25 era and any
 		// future stable (non-draft) revision >= 2025-11-25. The draft schema has no
 		// top-level `tasks`; task support there is negotiated via the `extensions`
-		// map keyed by `tasksExtensionKey`. Use a range + `!isDraft` predicate
-		// (rather than `== v2025_11_25`) so a future stable version inserted before
-		// `draft` still emits top-level `tasks`.
+		// map keyed by `tasksExtensionKey`. The range + `!isDraft` predicate keeps a
+		// future stable version inserted before `draft` emitting top-level `tasks`.
 		if (v >= ProtocolVersion.v2025_11_25 && !v.isDraft)
 			projected.tasks = tasks;
 		else if (v.isDraft)
@@ -481,11 +475,11 @@ struct ClientCapabilities
 	/// stripping any field newer than `v` and migrating `tasks` to the draft
 	/// `extensions` map. `roots`/`rootsListChanged`, a bare `sampling`, and
 	/// `experimental` exist in every supported version and pass through unchanged.
-	/// `elicitation` was introduced by 2025-06-18, so it is gated to
+	/// `elicitation` applies from 2025-06-18, so it is gated to
 	/// `>= 2025-06-18` (a client that set only an elicitation submode still
 	/// projects a bare `elicitation` there). The sampling/elicitation sub-objects
 	/// (`sampling.tools`/`sampling.context`, `elicitation.form`/`elicitation.url`)
-	/// were introduced by 2025-11-25 and are stripped below that. `tasks` is a
+	/// apply from 2025-11-25 and are stripped below that. `tasks` is a
 	/// first-class client capability in the stable 2025-11-25 era (and any future
 	/// stable revision >= 2025-11-25); the draft schema has no top-level client
 	/// `tasks`, so for draft it is folded into `extensions[tasksExtensionKey]`. The
@@ -497,13 +491,13 @@ struct ClientCapabilities
 		projected.rootsListChanged = rootsListChanged;
 		projected.sampling = sampling;
 		projected.experimental = experimental;
-		// elicitation was introduced by 2025-06-18. `toJson` treats a set
+		// elicitation applies from 2025-06-18. `toJson` treats a set
 		// `elicitationForm`/`elicitationUrl` as implying elicitation presence, so a
 		// client that set only a submode must still project a bare `elicitation`
 		// here; the sub-flags themselves are gated to 2025-11-25 below.
 		if (v >= ProtocolVersion.v2025_06_18)
 			projected.elicitation = elicitation || elicitationForm || elicitationUrl;
-		// sampling/elicitation sub-objects were introduced by 2025-11-25.
+		// sampling/elicitation sub-objects apply from 2025-11-25.
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
 			projected.samplingTools = samplingTools;
@@ -1375,7 +1369,7 @@ unittest  // Implementation round-trips description/websiteUrl/icons from a peer
 
 unittest  // ClientCapabilities.forVersion: 2025-03-26 emits a bare sampling and no elicitation
 {
-	// elicitation was introduced 2025-06-18; sampling sub-objects 2025-11-25. A
+	// elicitation applies from 2025-06-18; sampling sub-objects from 2025-11-25. A
 	// client holding the full 2025-11-25 capability set must project to the older
 	// wire shape: a bare `sampling: {}` with no tools/context, and no
 	// `elicitation` at all.
@@ -1454,7 +1448,6 @@ unittest  // ClientCapabilities.forVersion keeps roots/rootsListChanged uncondit
 
 unittest  // ServerCapabilities.forVersion keeps top-level tasks for any stable version >= 2025-11-25
 {
-	// Regression guard for finding #12: the gate must not be `== v2025_11_25`.
 	// Any stable (non-draft) version >= 2025-11-25 must keep top-level tasks; the
 	// draft era folds tasks into `extensions` instead. Today 2025-11-25 is the
 	// only such stable version, but the predicate must be range + draft based so a
