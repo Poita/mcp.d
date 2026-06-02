@@ -44,12 +44,12 @@ final class SessionManager
 	/// (ranging from 0x21 to 0x7E)".
 	///
 	/// Throws: `McpException` (`internalError`) when the host OS CSPRNG is
-	/// unavailable (audit finding #8). This was previously an infallible path; it is
-	/// now fail-closed (see `generateSessionId`/`fillSecureRandom`), so callers on the
-	/// request path (e.g. `streamable_http.handlePost`'s `initialize` branch) must be
-	/// prepared for it to throw rather than always returning an id. vibe.d converts an
-	/// escaping `McpException` to an HTTP 500; `handlePost` additionally maps it to a
-	/// JSON-RPC error response so the wire shape matches every other error path.
+	/// unavailable. This is fail-closed (see `generateSessionId`/`fillSecureRandom`),
+	/// so callers on the request path (e.g. `streamable_http.handlePost`'s
+	/// `initialize` branch) must be prepared for it to throw rather than always
+	/// returning an id. vibe.d converts an escaping `McpException` to an HTTP 500;
+	/// `handlePost` additionally maps it to a JSON-RPC error response so the wire
+	/// shape matches every other error path.
 	string create() @safe
 	{
 		const id = generateSessionId();
@@ -138,9 +138,9 @@ unittest  // terminating a session drops its ConnectionState
 
 /// Produce a cryptographically-secure, hex-encoded 256-bit session id.
 ///
-/// Throws: `McpException` (`internalError`) when no OS CSPRNG can be read (audit
-/// finding #8). There is deliberately no non-cryptographic fallback (#27), so this
-/// is a fallible path; callers must handle the throw.
+/// Throws: `McpException` (`internalError`) when no OS CSPRNG can be read. There is
+/// deliberately no non-cryptographic fallback, so this is a fallible path; callers
+/// must handle the throw.
 string generateSessionId() @safe
 {
 	import std.format : format;
@@ -156,18 +156,18 @@ string generateSessionId() @safe
 /// Fill `dst` with cryptographically-secure random bytes drawn from the host
 /// OS's CSPRNG (`/dev/urandom` on Posix, `BCryptGenRandom` on Windows). There is
 /// deliberately NO `std.random` fallback: a Mersenne-Twister-derived id would be
-/// predictable and would weaken session-hijacking protection (audit finding #27).
-/// If no OS crypto source can be read, this fails closed by throwing rather than
-/// emitting a non-cryptographic id.
+/// predictable and would weaken session-hijacking protection. If no OS crypto
+/// source can be read, this fails closed by throwing rather than emitting a
+/// non-cryptographic id.
 private void fillSecureRandom(ubyte[] dst) @trusted
 {
 	if (dst.length == 0)
 		return;
 
-	// Test seam (audit finding #8): a build configured with this version simulates
-	// an unavailable OS CSPRNG so the fail-closed contract -- create()/
-	// generateSessionId() throw McpException rather than emitting a predictable id --
-	// can be locked in by a regression test. Never defined in normal builds.
+	// Test seam: a build configured with this version simulates an unavailable OS
+	// CSPRNG so the fail-closed contract -- create()/generateSessionId() throw
+	// McpException rather than emitting a predictable id -- can be exercised by a
+	// regression test. Never defined in normal builds.
 	version (McpForceCsprngFailure)
 		throw internalError("forced CSPRNG failure (test seam)");
 
@@ -234,10 +234,9 @@ unittest  // distinct sessions get distinct ids
 
 unittest  // the secure source actually fills the buffer (not all zero) and varies
 {
-	// Audit finding #27: the id MUST come from an OS CSPRNG, never the std.random
-	// Mt19937 fallback (which was removed). Two consecutive 256-bit draws being
-	// distinct, and not all-zero, demonstrates the secure path ran rather than an
-	// untouched/constant buffer.
+	// The id MUST come from an OS CSPRNG, never a std.random Mt19937 fallback. Two
+	// consecutive 256-bit draws being distinct, and not all-zero, demonstrates the
+	// secure path ran rather than an untouched/constant buffer.
 	const a = generateSessionId();
 	const b = generateSessionId();
 	assert(a != b);
@@ -280,12 +279,11 @@ unittest  // terminating an unknown session reports false
 	assert(!mgr.terminate(""));
 }
 
-version (McpForceCsprngFailure) unittest  // #8: create()/generateSessionId fail closed on CSPRNG failure
+version (McpForceCsprngFailure) unittest  // create()/generateSessionId fail closed on CSPRNG failure
 {
-	// Build with `-version=McpForceCsprngFailure` (configured by CI / the fix3
-	// verification step) to exercise the fail-closed contract: when the OS CSPRNG is
-	// unavailable, id generation throws McpException(internalError) instead of
-	// emitting a predictable id. This locks in audit finding #8/#27.
+	// Build with `-version=McpForceCsprngFailure` to exercise the fail-closed
+	// contract: when the OS CSPRNG is unavailable, id generation throws
+	// McpException(internalError) instead of emitting a predictable id.
 	import std.exception : assertThrown;
 
 	assertThrown!McpException(generateSessionId());
