@@ -9,7 +9,9 @@
  *      and lists both registered resources.
  *   2. reading config://app carries the PER-RESOURCE hint
  *      (ttlMs=60000, scope=private) and the expected body.
- *   3. reading status://live (no hint) carries NO cache hint.
+ *   3. reading status://live (no @cache) carries the draft-mandatory do-not-cache
+ *      default hint (ttlMs:0, public) — the draft CacheableResult schema requires
+ *      ttlMs on every cacheable result rather than omitting it (#57).
  *
  * Transport selection (same assertions either way) is handled by the shared
  * scaffold helper `connectFromArgs`:
@@ -77,9 +79,17 @@ int main(string[] args) @safe
 		checkEq(cfg.cache.get.ttlMs, ExpectConfigTtlMs, "config://app ttlMs");
 		checkEq(cfg.cache.get.cacheScope, CacheScope.private_, "config://app cacheScope");
 
-		// --- 3. reading status://live carries NO cache hint -------------------
+		// --- 3. status://live has no @cache UDA, so under the draft protocol it
+		//        still carries the MANDATORY freshness hint as the conservative
+		//        do-not-cache default (ttlMs:0, public scope) — the draft
+		//        CacheableResult schema requires ttlMs on every cacheable result
+		//        rather than omitting it (#57).
 		auto st = client.readResource("status://live");
-		check(st.cache.isNull, "status://live read carried a cache hint, but the server set none");
+		check(!st.cache.isNull,
+				"status://live read should carry the draft do-not-cache default hint (ttlMs:0)");
+		checkEq(st.cache.get.ttlMs, 0, "status://live ttlMs should be 0 (do-not-cache default)");
+		checkEq(st.cache.get.cacheScope, CacheScope.public_,
+				"status://live cacheScope should default to public");
 
 		return 0;
 	});
