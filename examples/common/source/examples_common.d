@@ -18,6 +18,20 @@ module examples_common;
 
 import mcp.client.client : McpClient;
 import mcp.server.server : McpServer;
+import mcp.transport.streamable_http : StreamableHttpOptions;
+
+/// Shared structured result of the auth example's `whoami` tool (#73). Defined
+/// once here so the server (which infers `whoami`'s output schema +
+/// `structuredContent` from the return type) and the client (which decodes the
+/// result with `structuredContentAs!WhoamiResult`) share ONE type — any field
+/// drift becomes a compile error instead of a silent wire mismatch.
+struct WhoamiResult
+{
+	/// The authenticated principal (the token `sub`).
+	string subject;
+	/// The scopes granted by the validated token.
+	string[] scopes;
+}
 
 /// Write `"FAIL: " ~ msg` to stderr. `std.stdio.stderr` access is `@system`
 /// (global state), so this `@trusted` shim lets the assertion helpers stay
@@ -133,6 +147,37 @@ void runServerFromArgs(McpServer server, string[] args, ushort defaultPort,
 
 	if (http)
 		runStreamableHttp(server, port, host);
+	else
+		runStdio(server);
+}
+
+/// Like `runServerFromArgs`, but carries a caller-supplied
+/// `StreamableHttpOptions` (notably `.auth`) so auth-enabled examples can reuse
+/// the scaffold instead of hand-rolling their own transport dispatch (#72).
+/// Parses `--http`/`--port`/`--host` exactly as the 4-arg overload; merges the
+/// parsed host into `opts.bindAddresses` when the caller left it empty; then
+/// dispatches to `runStreamableHttp(server, port, opts)` under `--http`,
+/// otherwise `runStdio(server)`. Blocks until the chosen transport exits.
+void runServerFromArgs(McpServer server, string[] args, ushort defaultPort,
+		StreamableHttpOptions opts, string defaultHost = "127.0.0.1") @safe
+{
+	import std.getopt : getopt;
+	import mcp.transport.stdio : runStdio;
+	import mcp.transport.streamable_http : runStreamableHttp;
+
+	bool http;
+	ushort port = defaultPort;
+	string host = defaultHost;
+	(() @trusted {
+		getopt(args, "http", "Serve over Streamable HTTP instead of stdio.", &http, "port",
+			"Streamable HTTP listen port.", &port, "host", "Streamable HTTP bind host.", &host);
+	})();
+
+	if (opts.bindAddresses.length == 0)
+		opts.bindAddresses = [host];
+
+	if (http)
+		runStreamableHttp(server, port, opts);
 	else
 		runStdio(server);
 }

@@ -128,11 +128,14 @@ private McpServer buildServer() @safe
 	registerHandlers(server, new PromptApp);
 
 	// Prompt-argument autocompletion. Advertising this handler makes the server
-	// declare the `completions` capability. We complete the `language` argument
-	// of the `code_review` prompt by prefix-matching the partial value.
+	// declare the `completions` capability. Completion is keyed on BOTH the prompt
+	// name and the argument name: we only complete the `language` argument of the
+	// `code_review` prompt by prefix-matching the partial value. Any other prompt
+	// or argument falls through to the default empty `CompleteResult`.
 	server.setCompletionRequestHandler((CompleteRequest request) @safe {
 		CompleteResult result;
-		if (request.isPrompt && request.reference.name == "code_review")
+		if (request.isPrompt && request.reference.name == "code_review"
+			&& request.argumentName == "language")
 		{
 			const partial = request.argumentValue.toLower;
 			string[] matches;

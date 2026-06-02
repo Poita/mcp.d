@@ -48,8 +48,6 @@ module mrtr_server;
 
 import std.typecons : nullable, Nullable;
 
-import vibe.data.json : serializeToJson;
-
 import mcp;
 import mcp.protocol.draft : InputRequest;
 import mcp.protocol.sampling : CreateMessageRequest, SamplingMessage;
@@ -169,11 +167,13 @@ final class MrtrApi
 		booking.agenda = agenda;
 		booking.rounds = 2;
 
-		CallToolResult r;
-		r.content = [
-			Content.makeText("Booked '" ~ recoveredTopic ~ "' on " ~ date ~ ". Agenda: " ~ agenda)
-		];
-		r.structuredContent = () @trusted { return serializeToJson(booking); }();
-		return ToolResponse.complete(r);
+		// Typed structured result via the CallToolResult.structured!T helper: it
+		// serialises `booking` into structuredContent and keeps the single asserted
+		// text content block — no hand-built Json, no @trusted serialize lambda.
+		return ToolResponse.complete(CallToolResult.structured(booking,
+				[
+					Content.makeText(
+					"Booked '" ~ recoveredTopic ~ "' on " ~ date ~ ". Agenda: " ~ agenda)
+		]));
 	}
 }

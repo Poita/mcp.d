@@ -81,11 +81,12 @@ struct MagnitudeArgs
 }
 
 /// Typed view of `calc`'s structured output, decoded via `structuredContentAs!T`
-/// (#464). The enum return field serializes as its ordinal, so `op` is an int
-/// (Op.add == 0).
+/// (#464). The server's `Op` enum return field serializes by MEMBER NAME (e.g.
+/// "add") to match the tool's string `enum` outputSchema (#62), so `op` is read
+/// here as a `string` carrying that schema-declared member name.
 struct CalcOutput
 {
-	int op;
+	string op;
 	double result;
 }
 
@@ -139,6 +140,17 @@ int main(string[] args) @safe
 					if (calc.inputSchema["required"][i].get!string == "round")
 						roundRequired = true;
 			check(!roundRequired, "optional 'round' must not be in required[]");
+
+			// outputSchema (#62): the enum return field `op` must be declared as a
+			// STRING enum (member names), matching the by-name structuredContent the
+			// server emits — schema and wire must agree on the type.
+			auto outProps = calc.outputSchema["properties"];
+			check(("op" in outProps) !is null, "calc.outputSchema missing 'op'");
+			checkEq(outProps["op"]["type"].get!string, "string",
+				"calc.outputSchema.op must be declared as a string enum (#62)");
+			auto outOpEnum = outProps["op"]["enum"];
+			check(outOpEnum.type == Json.Type.array && outOpEnum.length == 3,
+				"calc.outputSchema.op enum should list the 3 member names");
 		}
 
 		// --- struct argument schema of `magnitude` -------------------------
@@ -172,8 +184,10 @@ int main(string[] args) @safe
 			auto r = client.callTool("calc", CalcArgs("add", 3.0, 4.0));
 			check(!r.isError, "calc add should not be an error");
 			auto calcOut = r.structuredContentAs!CalcOutput;
-			// The enum return field serializes as its ordinal: Op.add == 0.
-			checkEq(calcOut.op, 0, "calc structuredContent.op should be Op.add");
+			// The enum return field serializes by member name, so `op` is the string
+			// "add" (matching the tool's string `enum` outputSchema), NOT an ordinal.
+			checkEq(calcOut.op, "add",
+				"calc structuredContent.op should be the \"add\" enum member name");
 			check(isClose(calcOut.result, 7.0), "calc 3+4 should be 7");
 		}
 

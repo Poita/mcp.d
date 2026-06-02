@@ -46,8 +46,12 @@ import mcp;
 import mcp.transport : StreamableHttpOptions, runStreamableHttp;
 import mcp.auth : ResourceServerConfig, jwtVerifier, JwtVerifierConfig;
 
-/// The canonical resource identifier (RFC 8707 audience) for this server. The
-/// client must mint tokens whose `aud` names exactly this value.
+import examples_common : WhoamiResult;
+
+/// The canonical resource identifier (RFC 8707 audience) for the DEFAULT bind
+/// (host 127.0.0.1, port 8742). When `--port`/`--host` change the listening
+/// socket, `main` derives the live resource from the actual host/port instead so
+/// the advertised/validated audience can never desync from where we listen.
 enum Resource = "http://127.0.0.1:8742/mcp";
 
 /// The token issuer this server trusts. The client mints tokens with this `iss`.
@@ -60,17 +64,6 @@ enum PublicKeyPem = "-----BEGIN PUBLIC KEY-----\n"
 	~ "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAETc1izuCa0VENxRMLhpxCpo3/A6k6\n"
 	~ "Uyb2/iyjmioDCWYWx8Cp3defXx7Hl89WmW/0G66IVaqXTpmRM0AW36yqeg==\n"
 	~ "-----END PUBLIC KEY-----\n";
-
-/// The typed structured result of the `whoami` tool. Returning this struct from
-/// the `@tool` method lets the reflection layer derive the tool's output schema
-/// and populate `structuredContent` automatically — no hand-built `Json`.
-struct WhoamiResult
-{
-	/// The authenticated principal (the token `sub`).
-	string subject;
-	/// The scopes granted by the validated token.
-	string[] scopes;
-}
 
 /// The tools, declared in the ergonomic UDA style. Each `@tool` method takes a
 /// `RequestContext ctx` (auto-injected by the reflection layer and omitted from
@@ -116,10 +109,19 @@ final class AuthApi
 
 void main(string[] args)
 {
+	import std.conv : to;
+
 	ushort port = 8742;
 	string host = "127.0.0.1";
 	getopt(args, "port|p", "Port to listen on (default 8742)", &port,
 			"host|h", "Address to bind (default 127.0.0.1)", &host);
+
+	// Derive the resource identifier (RFC 8707 audience / RFC 9728 PRM `resource`)
+	// from the ACTUAL bind host/port so the listening socket and the
+	// advertised/validated audience can never diverge. A wildcard bind host is not
+	// routable as an audience, so map it to a canonical loopback hostname.
+	const audienceHost = (host == "0.0.0.0" || host == "::") ? "127.0.0.1" : host;
+	const resource = "http://" ~ audienceHost ~ ":" ~ port.to!string ~ "/mcp";
 
 	auto server = new McpServer("auth-example", "1.0.0",
 			nullable("OAuth 2.1 protected MCP server (Streamable HTTP)."));
@@ -133,11 +135,11 @@ void main(string[] args)
 	JwtVerifierConfig jwt;
 	jwt.staticPublicKeysPem = [PublicKeyPem];
 	jwt.issuer = Issuer;
-	jwt.audience = Resource; // RFC 8707: tokens must be issued for us
+	jwt.audience = resource; // RFC 8707: tokens must be issued for us
 
 	ResourceServerConfig auth;
 	auth.validator = jwtVerifier(jwt);
-	auth.resource = Resource;
+	auth.resource = resource;
 	auth.authorizationServers = [Issuer];
 	auth.scopesSupported = ["mcp:read", "mcp:write"];
 	auth.requiredScope = "mcp:read"; // every request needs at least mcp:read
