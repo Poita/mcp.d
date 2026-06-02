@@ -54,7 +54,7 @@ enum string mockModelId = "mock-summarizer-v1";
 enum string fixedSummary = "A terse one-line summary.";
 
 /// Typed arguments for the `summarize` tool — passed to the typed
-/// `callTool(name, T)` overload (#468) so the SDK serializes them (no hand-built
+/// `callTool(name, T)` overload so the SDK serializes them (no hand-built
 /// Json argument object).
 struct SummarizeArgs
 {
@@ -62,8 +62,7 @@ struct SummarizeArgs
 }
 
 /// Mirror of the server's `summarize` structured output, decoded with
-/// `CallToolResult.structuredContentAs!T` (#464) instead of reading raw Json
-/// fields one by one.
+/// `CallToolResult.structuredContentAs!T`.
 struct SummaryResult
 {
 	string summary;
@@ -115,8 +114,7 @@ private int run(McpClient client) @safe
 			seenUserText = request.messages[0].content.text;
 
 		// One-line assistant reply with our mock model id — built with the
-		// `CreateMessageResult.text` helper (#467) instead of setting
-		// role/content/model/stopReason by hand (stopReason defaults to "endTurn").
+		// `CreateMessageResult.text` helper (stopReason defaults to "endTurn").
 		return CreateMessageResult.text(mockModelId, fixedSummary);
 	};
 
@@ -134,13 +132,11 @@ private int run(McpClient client) @safe
 	// --- summarize: the mocked sampling value must flow through -------------
 	const longText = "MCP sampling lets a server borrow the client's LLM. "
 		~ "The server sends sampling/createMessage; the client answers with a completion.";
-	// Typed args (#468): pass a struct; the SDK serializes it to the arguments
-	// object, so the example no longer hand-builds Json here.
+	// Typed args: pass a struct; the SDK serializes it to the arguments object.
 	auto sres = client.callTool("summarize", SummarizeArgs(longText));
 
 	check(!sres.isError, "summarize must not be an error");
-	// Typed structured output (#464): decode the whole result in one step instead
-	// of reading `structuredContent["x"].get!...` field by field.
+	// Typed structured output: decode the whole result in one step.
 	auto summary = sres.structuredContentAs!SummaryResult;
 	check(summary.summary == fixedSummary, "summarize.summary should be the mock model's reply '"
 			~ fixedSummary ~ "', got '" ~ summary.summary ~ "'");
