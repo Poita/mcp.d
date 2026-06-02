@@ -36,7 +36,7 @@ private __gshared bool _ranStdio;
 ///     in-flight request's `CancellationToken` concurrently with its running
 ///     handler task, which then observes `ctx.isCancelled()` and has its response
 ///     suppressed (basic/utilities/cancellation, draft Transport-Specific
-///     Cancellation over stdio — no cooperative-drain hack needed);
+///     Cancellation over stdio);
 ///   - a draft `subscriptions/listen` request is served on the single channel
 ///     (its acknowledgement and subsequent change notifications go through
 ///     `channel.send`).
@@ -208,8 +208,8 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 
 	// Adopt dup()'d copies of fd 0/1 rather than fd 0/1 themselves. `releaseRef`
 	// close()s the adopted fd on return; by adopting dups we close only the dups,
-	// leaving the process's real stdin/stdout OPEN for any code that runs after
-	// (the primary fix -- adopting fd 0/1 directly would close the real stdin/stdout).
+	// leaving the process's real stdin/stdout OPEN for any code that runs after.
+	// Adopting fd 0/1 directly would close the real stdin/stdout.
 	const in2 = () @trusted { return dup(0); }();
 	const out2 = () @trusted { return dup(1); }();
 	if (in2 == -1 || out2 == -1)
@@ -384,7 +384,7 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 
 unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with its O_NONBLOCK bit unchanged
 {
-	// Mirrors runStdio's fd lifecycle (#10): save the original flags, dup the fd,
+	// Mirrors runStdio's fd lifecycle: save the original flags, dup the fd,
 	// adopt the dup, then on teardown restore the saved flags BEFORE releaseRef.
 	// Because the dup -- not the original -- is what releaseRef close()s, the
 	// original fd must remain OPEN; and because a dup shares its open file
@@ -428,7 +428,7 @@ unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with 
 			"original fd's O_NONBLOCK bit changed across the adopt/releaseRef cycle");
 }
 
-unittest  // runStdio enforces its "at most once per process" invariant via the module guard (#11)
+unittest  // runStdio enforces its "at most once per process" invariant via the module guard
 {
 	// The guard is independent of eventcore fd/refcount state: once _ranStdio is set,
 	// any further call throws synchronously before touching fd 0/1 (so a sequential
@@ -633,7 +633,7 @@ unittest  // stdio: a tool calling ctx.elicit is answered over the same stdio ch
 	assert(sawResult, "tools/call reply with the elicited value was never produced");
 }
 
-unittest  // stdio: notifications/cancelled mid-handler is observed via the in-flight token (no drain hack)
+unittest  // stdio: notifications/cancelled mid-handler is observed via the in-flight token
 {
 	auto s = new McpServer("stdio-cancel", "1.0");
 	auto entered = createManualEvent();
