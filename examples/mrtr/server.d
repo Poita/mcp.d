@@ -16,16 +16,16 @@
  * `registerHandlers` wires it onto the server -- no hand-built `Json` args,
  * descriptors, or registration calls.
  *
- * Typed APIs (SEP-2322 builders) replace every hand-built MRTR `Json`:
+ * Typed SEP-2322 builders drive every MRTR payload:
  *   - the elicitation `InputRequest` is built with `InputRequest.elicitation!T`,
  *     which DERIVES its `requestedSchema` from the flat struct `MeetingDate`;
  *   - the sampling `InputRequest` is built with `InputRequest.sampling(id, req)`
  *     from a typed `CreateMessageRequest` (typed `SamplingMessage` + `Content`);
  *   - the opaque `requestState` is a typed `RequestState` struct, attached via the
  *     typed `ToolResponse.inputRequired(reqs, T)` overload and read back on the
- *     retry via `ctx.requestStateAs!RequestState` — no `"topic="`-prefix string;
+ *     retry via `ctx.requestStateAs!RequestState`;
  *   - the resubmit round is detected with `ctx.isResubmit()` /
- *     `ctx.hasInputResponse(id)` instead of open-coding `(id in inputResponses())`;
+ *     `ctx.hasInputResponse(id)`;
  *   - the answers are decoded with `ctx.inputResponseAs!T` (an `ElicitResult` for
  *     the date, a `CreateMessageResult` for the agenda);
  *   - the final content uses `Content.makeText` and the structured result is
@@ -79,9 +79,8 @@ struct MeetingDate
 }
 
 /// The opaque, server-owned MRTR `requestState` (SEP-2322), expressed as a typed
-/// struct instead of a `"topic="`-prefixed string. The typed
-/// `ToolResponse.inputRequired(reqs, RequestState)` overload serialises it; the
-/// retry recovers it via `ctx.requestStateAs!RequestState`.
+/// struct. The typed `ToolResponse.inputRequired(reqs, RequestState)` overload
+/// serialises it; the retry recovers it via `ctx.requestStateAs!RequestState`.
 struct RequestState
 {
 	string topic;
@@ -89,7 +88,7 @@ struct RequestState
 
 /// The typed structured result of a completed booking. Serialized into the
 /// `CallToolResult.structuredContent` so the structured payload is inferred from
-/// a struct rather than hand-built field by field.
+/// the struct.
 struct Booking
 {
 	string topic;
@@ -119,12 +118,12 @@ final class MrtrApi
 	{
 		// Round 1 (not a resubmit, no answers yet): ask the client for the date +
 		// agenda and stash `topic` into the typed, opaque requestState so we can
-		// recover it on the retry. `isResubmit` / `hasInputResponse` replace the
-		// open-coded `(id in inputResponses())` membership checks.
+		// recover it on the retry. `isResubmit` / `hasInputResponse` report whether
+		// each answer is already present.
 		if (!ctx.isResubmit() || !ctx.hasInputResponse(dateId) || !ctx.hasInputResponse(agendaId))
 		{
 			// Typed elicitation builder: the `requestedSchema` is derived from the
-			// flat `MeetingDate` struct via jsonSchemaOf!T — no hand-built schema.
+			// flat `MeetingDate` struct via jsonSchemaOf!T.
 			auto dateReq = InputRequest.elicitation!MeetingDate(dateId,
 					"On what date should we meet?");
 
@@ -139,7 +138,7 @@ final class MrtrApi
 
 			// SEP-2322: the opaque, server-owned requestState as a typed struct. The
 			// client echoes it verbatim; we recover `topic` from it on the retry via
-			// `requestStateAs!RequestState` instead of trusting resubmitted args.
+			// `requestStateAs!RequestState` rather than from resubmitted args.
 			return ToolResponse.inputRequired([dateReq, agendaReq], RequestState(topic));
 		}
 
@@ -168,8 +167,8 @@ final class MrtrApi
 		booking.rounds = 2;
 
 		// Typed structured result via the CallToolResult.structured!T helper: it
-		// serialises `booking` into structuredContent and keeps the single asserted
-		// text content block — no hand-built Json, no @trusted serialize lambda.
+		// serialises `booking` into structuredContent and keeps the single text
+		// content block.
 		return ToolResponse.complete(CallToolResult.structured(booking,
 				[
 					Content.makeText(
