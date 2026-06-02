@@ -252,11 +252,10 @@ unittest  // bytes are not all zero (the OS CSPRNG actually wrote into the buffe
 unittest  // the source is the OS CSPRNG, not the default-seeded std.random rndGen
 {
 	// A fresh, default-seeded Mersenne Twister produces a fixed, predictable
-	// sequence. The CSPRNG MUST NOT reproduce that sequence -- this guards
-	// against a regression that wires PKCE/state back to rndGen.
+	// sequence. The CSPRNG MUST NOT reproduce that sequence.
 	import std.random : rndGen, uniform;
 
-	auto gen = rndGen; // default-seeded, same as the old generatePkce used
+	auto gen = rndGen; // default-seeded Mersenne Twister
 	ubyte[32] predictable;
 	foreach (ref x; predictable)
 		x = cast(ubyte) uniform(0, 256, gen);
