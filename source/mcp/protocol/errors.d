@@ -2,6 +2,7 @@ module mcp.protocol.errors;
 
 import vibe.data.json : Json;
 import mcp.protocol.capabilities : ClientCapabilities;
+import mcp.protocol.versions : ProtocolVersion, resourceNotFoundCode;
 
 @safe:
 
@@ -87,9 +88,22 @@ McpException internalError(string message, Json data = Json.undefined) @safe pur
 	return new McpException(ErrorCode.internalError, message, data);
 }
 
+/// Build a "resource not found" error using the legacy MCP-specific code
+/// (-32002). Kept for backwards compatibility; this form always emits -32002.
+/// Draft connections should instead use the version-aware overload below, which
+/// selects the version-appropriate code (draft aligns it to invalidParams /
+/// -32602).
 McpException resourceNotFound(string uri, Json data = Json.undefined) @safe pure nothrow
 {
 	return new McpException(ErrorCode.resourceNotFound, "Resource not found: " ~ uri, data);
+}
+
+/// Build a "resource not found" error whose code is selected for the negotiated
+/// protocol version: draft aligns it to invalidParams (-32602), while earlier
+/// versions use the MCP-specific -32002 (see `versions.resourceNotFoundCode`).
+McpException resourceNotFound(string uri, ProtocolVersion v, Json data = Json.undefined) @safe pure nothrow
+{
+	return new McpException(v.resourceNotFoundCode, "Resource not found: " ~ uri, data);
 }
 
 /// True if `url` is a valid absolute URI suitable for a URL-mode elicitation.
@@ -234,6 +248,24 @@ unittest  // convenience constructors set the right code
 	assert(methodNotFound("nope").code == ErrorCode.methodNotFound);
 	assert(invalidParams("x").code == ErrorCode.invalidParams);
 	assert(resourceNotFound("file:///x").code == ErrorCode.resourceNotFound);
+}
+
+unittest  // resourceNotFound (no-version) keeps the legacy -32002 code
+{
+	auto e = resourceNotFound("file:///x");
+	assert(e.code == -32002);
+	assert(e.code == ErrorCode.resourceNotFound);
+	assert(e.msg == "Resource not found: file:///x");
+}
+
+unittest  // resourceNotFound(version) selects -32602 for draft, -32002 otherwise
+{
+	assert(resourceNotFound("file:///x", ProtocolVersion.draft).code == -32602);
+	assert(resourceNotFound("file:///x", ProtocolVersion.v2025_11_25).code == -32002);
+	assert(resourceNotFound("file:///x", ProtocolVersion.v2024_11_05).code == -32002);
+	// message still carries the uri
+	assert(resourceNotFound("file:///x", ProtocolVersion.draft)
+			.msg == "Resource not found: file:///x");
 }
 
 unittest  // toErrorJson produces a JSON-RPC error object
