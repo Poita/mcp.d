@@ -135,7 +135,7 @@ Json jsonSchemaOf(T)() @safe
 
 /// Emit the field-level facet UDAs (`@minimum`, `@maximum`, `@title`,
 /// `@schemaDefault`) declared on `T.field` onto its property schema `prop`.
-/// Fields without these UDAs are left untouched, preserving existing behaviour.
+/// Fields without these UDAs are left untouched.
 private void applyFieldFacets(T, string field)(ref Json prop) @safe
 {
 	import mcp.api.attributes : minimum, maximum, title, SchemaDefault, format,
@@ -151,7 +151,7 @@ private void applyFieldFacets(T, string field)(ref Json prop) @safe
 	static if (hasUDA!(member, title))
 		prop["title"] = Json(getUDAs!(member, title)[0].value);
 
-	// #55: string facets (format / minLength / maxLength / pattern) and array
+	// String facets (format / minLength / maxLength / pattern) and array
 	// facets (minItems / maxItems) for richer elicitation form schemas.
 	static if (hasUDA!(member, format))
 		prop["format"] = Json(getUDAs!(member, format)[0].value);
@@ -204,7 +204,7 @@ template isElicitScalar(F)
 {
 	static if (isInstanceOf!(Nullable, F))
 		enum isElicitScalar = isElicitScalar!(typeof(F.init.get()));
-	else static if (isArray!F && !isSomeString!F) // #55: a multi-select array of enum members (a flat array of a primitive
+	else static if (isArray!F && !isSomeString!F) // a multi-select array of enum members (a flat array of a primitive
 		// enum), e.g. `Color[]`, is a permitted form field (array items enum).
 		enum isElicitScalar = is(typeof(F.init[0]) == enum);
 	else
@@ -302,7 +302,7 @@ private template hasFieldDefault(T, size_t i)
 
 			// additionalProperties: validate each object member whose key is not
 			// already covered by an explicit `properties` entry against the
-			// additionalProperties value schema (#46). SDK-emitted AA schemas have
+			// additionalProperties value schema. SDK-emitted AA schemas have
 			// no `properties`, so every member is validated; for combined schemas
 			// this stays correct by only validating the residual keys.
 			if (value.type == Json.Type.object && "additionalProperties" in schema
@@ -322,7 +322,7 @@ private template hasFieldDefault(T, size_t i)
 			}
 
 			// additionalProperties: false — reject any object member whose key is
-			// not declared in `properties` (#24). This is the boolean sibling of the
+			// not declared in `properties`. This is the boolean sibling of the
 			// object form above; the two are mutually exclusive on a given schema.
 			if (value.type == Json.Type.object && "additionalProperties" in schema
 				&& schema["additionalProperties"].type == Json.Type.bool_
@@ -764,7 +764,7 @@ private template hasFieldDefault(T, size_t i)
 			assert("default" !in count);
 		}
 
-		unittest  // #46 validateAgainstSchema validates AA values via additionalProperties
+		unittest  // validateAgainstSchema validates AA values via additionalProperties
 		{
 			auto schema = jsonSchemaOf!(int[string]);
 			Json bad = Json.emptyObject;
@@ -773,7 +773,7 @@ private template hasFieldDefault(T, size_t i)
 			assert(msg.length > 0);
 		}
 
-		unittest  // #46 additionalProperties: a conforming AA value passes
+		unittest  // additionalProperties: a conforming AA value passes
 		{
 			auto schema = jsonSchemaOf!(int[string]);
 			Json good = Json.emptyObject;
@@ -782,7 +782,7 @@ private template hasFieldDefault(T, size_t i)
 			assert(validateAgainstSchema(good, schema) == "");
 		}
 
-		unittest  // #46 additionalProperties recurses into struct value schemas
+		unittest  // additionalProperties recurses into struct value schemas
 		{
 			struct Item
 			{
@@ -797,7 +797,7 @@ private template hasFieldDefault(T, size_t i)
 			assert(validateAgainstSchema(bad, schema).length > 0);
 		}
 
-		unittest  // #24 additionalProperties:false rejects unknown object keys
+		unittest  // additionalProperties:false rejects unknown object keys
 		{
 			Json schema = Json.emptyObject;
 			schema["type"] = "object";
@@ -820,7 +820,7 @@ private template hasFieldDefault(T, size_t i)
 				"a value with only declared keys must pass");
 		}
 
-		unittest  // #55 string facets emit format/minLength/maxLength/pattern
+		unittest  // string facets emit format/minLength/maxLength/pattern
 		{
 			import mcp.api.attributes : format, minLength, maxLength, pattern;
 
@@ -837,7 +837,7 @@ private template hasFieldDefault(T, size_t i)
 			assert(a["pattern"].get!string == "^.+@.+$");
 		}
 
-		unittest  // #55 array facets emit minItems/maxItems
+		unittest  // array facets emit minItems/maxItems
 		{
 			import mcp.api.attributes : minItems, maxItems;
 
@@ -853,7 +853,7 @@ private template hasFieldDefault(T, size_t i)
 			assert(p["maxItems"].get!long == 5);
 		}
 
-		unittest  // #55 a multi-select enum array is a valid elicitation field
+		unittest  // a multi-select enum array is a valid elicitation field
 		{
 			enum Color
 				{
