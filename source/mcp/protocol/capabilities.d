@@ -2,7 +2,7 @@ module mcp.protocol.capabilities;
 
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
-import mcp.protocol.versions : ProtocolVersion;
+import mcp.protocol.versions : ProtocolVersion, isDraft;
 
 @safe:
 
@@ -370,9 +370,15 @@ struct ServerCapabilities
 		// `extensions` map keyed by `tasksExtensionKey`. Since the version enum
 		// orders `draft` ABOVE 2025-11-25, gate to exactly 2025-11-25 here so draft
 		// never emits a top-level `tasks`.
-		if (v == ProtocolVersion.v2025_11_25)
+		// `tasks` is a first-class capability in the STABLE 2025-11-25 era and any
+		// future stable (non-draft) revision >= 2025-11-25. The draft schema has no
+		// top-level `tasks`; task support there is negotiated via the `extensions`
+		// map keyed by `tasksExtensionKey`. Use a range + `!isDraft` predicate
+		// (rather than `== v2025_11_25`) so a future stable version inserted before
+		// `draft` still emits top-level `tasks`.
+		if (v >= ProtocolVersion.v2025_11_25 && !v.isDraft)
 			projected.tasks = tasks;
-		else if (v >= ProtocolVersion.draft)
+		else if (v.isDraft)
 			projected.extensions = foldTasksIntoExtensions(extensions, tasks);
 		return projected;
 	}
@@ -473,27 +479,44 @@ struct ClientCapabilities
 
 	/// Project these capabilities to the wire shape for protocol version `v`,
 	/// stripping any field newer than `v` and migrating `tasks` to the draft
-	/// `extensions` map. `tasks` is a first-class client capability ONLY in the
-	/// 2025-11-25 era; the draft schema has no top-level client `tasks`, so for
-	/// draft it is folded into `extensions[tasksExtensionKey]`. The `extensions`
-	/// negotiation map itself is draft-only. Base capabilities
-	/// (`roots`/`sampling`/`elicitation`/`experimental`) exist in every supported
-	/// version and are passed through unchanged.
+	/// `extensions` map. `roots`/`rootsListChanged`, a bare `sampling`, and
+	/// `experimental` exist in every supported version and pass through unchanged.
+	/// `elicitation` was introduced by 2025-06-18, so it is gated to
+	/// `>= 2025-06-18` (a client that set only an elicitation submode still
+	/// projects a bare `elicitation` there). The sampling/elicitation sub-objects
+	/// (`sampling.tools`/`sampling.context`, `elicitation.form`/`elicitation.url`)
+	/// were introduced by 2025-11-25 and are stripped below that. `tasks` is a
+	/// first-class client capability in the stable 2025-11-25 era (and any future
+	/// stable revision >= 2025-11-25); the draft schema has no top-level client
+	/// `tasks`, so for draft it is folded into `extensions[tasksExtensionKey]`. The
+	/// `extensions` negotiation map itself is draft-only.
 	ClientCapabilities forVersion(ProtocolVersion v) const @safe
 	{
 		ClientCapabilities projected;
 		projected.roots = roots;
 		projected.rootsListChanged = rootsListChanged;
 		projected.sampling = sampling;
-		projected.samplingTools = samplingTools;
-		projected.samplingContext = samplingContext;
-		projected.elicitation = elicitation;
-		projected.elicitationForm = elicitationForm;
-		projected.elicitationUrl = elicitationUrl;
 		projected.experimental = experimental;
-		if (v == ProtocolVersion.v2025_11_25)
+		// elicitation was introduced by 2025-06-18. `toJson` treats a set
+		// `elicitationForm`/`elicitationUrl` as implying elicitation presence, so a
+		// client that set only a submode must still project a bare `elicitation`
+		// here; the sub-flags themselves are gated to 2025-11-25 below.
+		if (v >= ProtocolVersion.v2025_06_18)
+			projected.elicitation = elicitation || elicitationForm || elicitationUrl;
+		// sampling/elicitation sub-objects were introduced by 2025-11-25.
+		if (v >= ProtocolVersion.v2025_11_25)
+		{
+			projected.samplingTools = samplingTools;
+			projected.samplingContext = samplingContext;
+			projected.elicitationForm = elicitationForm;
+			projected.elicitationUrl = elicitationUrl;
+		}
+		// `tasks` is first-class in the stable 2025-11-25 era and any future stable
+		// (non-draft) revision; the draft era folds it into `extensions`. Mirror the
+		// range + `!isDraft` predicate used by `ServerCapabilities.forVersion`.
+		if (v >= ProtocolVersion.v2025_11_25 && !v.isDraft)
 			projected.tasks = tasks;
-		else if (v >= ProtocolVersion.draft)
+		else if (v.isDraft)
 			projected.extensions = foldTasksIntoExtensions(extensions, tasks);
 		return projected;
 	}
@@ -1348,4 +1371,133 @@ unittest  // Implementation round-trips description/websiteUrl/icons from a peer
 	assert(impl.websiteUrl.get == "https://client.example");
 	assert(impl.icons.length == 1);
 	assert(impl.icons[0].src == "https://client.example/logo.svg");
+}
+
+unittest  // ClientCapabilities.forVersion: 2025-03-26 emits a bare sampling and no elicitation
+{
+	// elicitation was introduced 2025-06-18; sampling sub-objects 2025-11-25. A
+	// client holding the full 2025-11-25 capability set must project to the older
+	// wire shape: a bare `sampling: {}` with no tools/context, and no
+	// `elicitation` at all.
+	ClientCapabilities caps;
+	caps.sampling = true;
+	caps.samplingTools = true;
+	caps.samplingContext = true;
+	caps.elicitation = true;
+	caps.elicitationForm = true;
+	caps.elicitationUrl = true;
+	auto j = caps.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert(j["sampling"].type == Json.Type.object && j["sampling"].length == 0);
+	assert("tools" !in j["sampling"]);
+	assert("context" !in j["sampling"]);
+	assert("elicitation" !in j);
+}
+
+unittest  // ClientCapabilities.forVersion: 2025-06-18 emits bare sampling and bare elicitation, no sub-objects
+{
+	ClientCapabilities caps;
+	caps.sampling = true;
+	caps.samplingTools = true;
+	caps.samplingContext = true;
+	caps.elicitation = true;
+	caps.elicitationForm = true;
+	caps.elicitationUrl = true;
+	auto j = caps.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert(j["sampling"].type == Json.Type.object && j["sampling"].length == 0);
+	assert(j["elicitation"].type == Json.Type.object && j["elicitation"].length == 0);
+	assert("tools" !in j["sampling"]);
+	assert("context" !in j["sampling"]);
+	assert("form" !in j["elicitation"]);
+	assert("url" !in j["elicitation"]);
+}
+
+unittest  // ClientCapabilities.forVersion: 2025-06-18 projects bare elicitation when only a submode was set
+{
+	// toJson treats elicitationForm/elicitationUrl as implying elicitation
+	// presence. A client that set only a submode must still project a bare
+	// `elicitation: {}` for 2025-06-18 (the era with elicitation but no submodes).
+	ClientCapabilities caps;
+	caps.elicitationUrl = true; // submode only, no explicit `elicitation`
+	auto j = caps.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("elicitation" in j);
+	assert(j["elicitation"].type == Json.Type.object && j["elicitation"].length == 0);
+}
+
+unittest  // ClientCapabilities.forVersion: 2025-11-25 preserves all sampling/elicitation sub-objects
+{
+	ClientCapabilities caps;
+	caps.sampling = true;
+	caps.samplingTools = true;
+	caps.samplingContext = true;
+	caps.elicitation = true;
+	caps.elicitationForm = true;
+	caps.elicitationUrl = true;
+	auto j = caps.forVersion(ProtocolVersion.v2025_11_25).toJson();
+	assert("tools" in j["sampling"]);
+	assert("context" in j["sampling"]);
+	assert("form" in j["elicitation"]);
+	assert("url" in j["elicitation"]);
+}
+
+unittest  // ClientCapabilities.forVersion keeps roots/rootsListChanged unconditionally
+{
+	ClientCapabilities caps;
+	caps.roots = true;
+	caps.rootsListChanged = true;
+	foreach (v; [
+		ProtocolVersion.v2024_11_05, ProtocolVersion.v2025_03_26,
+		ProtocolVersion.v2025_06_18, ProtocolVersion.v2025_11_25,
+		ProtocolVersion.draft
+	])
+		assert(caps.forVersion(v).toJson()["roots"]["listChanged"].get!bool);
+}
+
+unittest  // ServerCapabilities.forVersion keeps top-level tasks for any stable version >= 2025-11-25
+{
+	// Regression guard for finding #12: the gate must not be `== v2025_11_25`.
+	// Any stable (non-draft) version >= 2025-11-25 must keep top-level tasks; the
+	// draft era folds tasks into `extensions` instead. Today 2025-11-25 is the
+	// only such stable version, but the predicate must be range + draft based so a
+	// future stable version inserted before `draft` still emits top-level tasks.
+	ServerCapabilities caps;
+	caps.tasks = TasksCapability(true, true);
+	foreach (v; supportedVersionsAtLeast(ProtocolVersion.v2025_11_25))
+	{
+		auto j = caps.forVersion(v).toJson();
+		if (v.isDraft)
+		{
+			assert("tasks" !in j);
+			assert("extensions" in j);
+		}
+		else
+			assert("tasks" in j);
+	}
+}
+
+unittest  // ClientCapabilities.forVersion keeps top-level tasks for any stable version >= 2025-11-25
+{
+	ClientCapabilities caps;
+	caps.tasks = TasksCapability(false, false);
+	foreach (v; supportedVersionsAtLeast(ProtocolVersion.v2025_11_25))
+	{
+		auto j = caps.forVersion(v).toJson();
+		if (v.isDraft)
+		{
+			assert("tasks" !in j);
+			assert("extensions" in j);
+		}
+		else
+			assert("tasks" in j);
+	}
+}
+
+version (unittest) private ProtocolVersion[] supportedVersionsAtLeast(ProtocolVersion min) @safe
+{
+	import mcp.protocol.versions : supportedVersions;
+
+	ProtocolVersion[] result;
+	foreach (v; supportedVersions)
+		if (v >= min)
+			result ~= v;
+	return result;
 }
