@@ -1,4 +1,4 @@
-/// MCP Tools example client + self-verifying e2e test (#348) — dual-transport.
+/// MCP Tools example client + self-verifying e2e test — dual-transport.
 ///
 /// Drives the `tools-example` server over EITHER transport, with the SAME
 /// transport-agnostic assertions, using the shared examples/common scaffold:
@@ -17,9 +17,9 @@
 ///     Nullable arg is NOT required, the struct arg is an object sub-schema);
 ///   - the `@readOnly`/`@destructive`/`@idempotent`/`@hintTitle` marker UDAs are
 ///     reflected into each tool's `ToolAnnotations`, read via the ergonomic
-///     `tool.toolAnnotations()` accessor (#469);
+///     `tool.toolAnnotations()` accessor;
 ///   - calling `calc` yields the expected `structuredContent` (struct return),
-///     decoded with the typed `result.structuredContentAs!T` (#464);
+///     decoded with the typed `result.structuredContentAs!T`;
 ///   - the optional `round` arg flows through;
 ///   - a scalar-returning tool wraps its value under `result`;
 ///   - a string tool returns plain text content (no structuredContent);
@@ -28,7 +28,7 @@
 ///   - a bad call (unknown tool) raises the expected JSON-RPC error code.
 ///
 /// Where the call arguments are static, it uses the typed
-/// `client.callTool(name, T args)` overload (#468) instead of hand-building a
+/// `client.callTool(name, T args)` overload instead of hand-building a
 /// Json arguments object; where an argument is genuinely optional/dynamic it
 /// keeps a Json object.
 ///
@@ -58,8 +58,8 @@ private Tool find(Tool[] tools, string name) @safe
 	return Tool.init;
 }
 
-/// Typed `calc` arguments — passed straight to `client.callTool("calc", CalcArgs(...))`
-/// (#468), which serializes to the same wire object as a hand-built Json. `op` is
+/// Typed `calc` arguments — passed straight to `client.callTool("calc", CalcArgs(...))`,
+/// which serializes to the same wire object as a hand-built Json. `op` is
 /// the server's `Op` enum member as a string.
 struct CalcArgs
 {
@@ -80,9 +80,9 @@ struct MagnitudeArgs
 	Vec2Arg v;
 }
 
-/// Typed view of `calc`'s structured output, decoded via `structuredContentAs!T`
-/// (#464). The server's `Op` enum return field serializes by MEMBER NAME (e.g.
-/// "add") to match the tool's string `enum` outputSchema (#62), so `op` is read
+/// Typed view of `calc`'s structured output, decoded via `structuredContentAs!T`.
+/// The server's `Op` enum return field serializes by MEMBER NAME (e.g.
+/// "add") to match the tool's string `enum` outputSchema, so `op` is read
 /// here as a `string` carrying that schema-declared member name.
 struct CalcOutput
 {
@@ -141,13 +141,13 @@ int main(string[] args) @safe
 						roundRequired = true;
 			check(!roundRequired, "optional 'round' must not be in required[]");
 
-			// outputSchema (#62): the enum return field `op` must be declared as a
+			// outputSchema: the enum return field `op` must be declared as a
 			// STRING enum (member names), matching the by-name structuredContent the
 			// server emits — schema and wire must agree on the type.
 			auto outProps = calc.outputSchema["properties"];
 			check(("op" in outProps) !is null, "calc.outputSchema missing 'op'");
 			checkEq(outProps["op"]["type"].get!string, "string",
-				"calc.outputSchema.op must be declared as a string enum (#62)");
+				"calc.outputSchema.op must be declared as a string enum");
 			auto outOpEnum = outProps["op"]["enum"];
 			check(outOpEnum.type == Json.Type.array && outOpEnum.length == 3,
 				"calc.outputSchema.op enum should list the 3 member names");
@@ -163,8 +163,8 @@ int main(string[] args) @safe
 		}
 
 		// --- behavioral annotations (marker UDAs) --------------------------
-		// `tool.toolAnnotations()` (#469) decodes the raw annotations Json into the
-		// typed `ToolAnnotations` — no `ToolAnnotations.fromJson(tool.annotations)`.
+		// `tool.toolAnnotations()` decodes the raw annotations Json into the
+		// typed `ToolAnnotations`.
 		{
 			auto a = calc.toolAnnotations();
 			check(!a.readOnlyHint.isNull && a.readOnlyHint.get, "calc should be readOnlyHint:true");
@@ -179,7 +179,7 @@ int main(string[] args) @safe
 		}
 
 		// --- call `calc` (struct return -> structuredContent) --------------
-		// Pass typed args (#468) and decode the typed structured output (#464).
+		// Pass typed args and decode the typed structured output.
 		{
 			auto r = client.callTool("calc", CalcArgs("add", 3.0, 4.0));
 			check(!r.isError, "calc add should not be an error");
