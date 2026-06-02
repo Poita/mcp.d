@@ -374,6 +374,12 @@ final class McpServer
 	// keeping the HTTP-only behaviour unchanged.
 	private void delegate(string) @safe stdioListenSink;
 	private string stdioListenSubscriptionId;
+	// The stdio `subscriptions/listen` stream's OWN per-stream/per-URI filter (#550).
+	// stdio is single-connection, so this is the filter recorded by the active stdio
+	// listen; `notifyChange` consults it via `accepts(method, uri)` to deliver only the
+	// types/URIs that stream opted into. `SubscriptionFilter.init` (inactive) until a
+	// stdio listen opens, so an unset sink is also a no-op.
+	private SubscriptionFilter stdioListenFilter_;
 	private bool toolListChangedEnabled;
 	private bool resourcesListChangedEnabled;
 	private bool promptsListChangedEnabled;
@@ -683,10 +689,15 @@ final class McpServer
 	/// listeners reached; `0` when no GET stream is open.
 	size_t notifyResourceUpdated(string uri) @safe
 	{
-		if (!isSubscribed(uri))
-			return 0;
-		if (cs.connectionVersion.isDraft && !listensFor("resourceSubscriptions"))
-			return 0;
+		// Delivery eligibility is driven by the OPEN LISTENERS' own filters, not the
+		// caller's connection state (#550): a draft `subscriptions/listen` stream is a
+		// single self-contained long-lived request whose per-URI `SubscriptionFilter`
+		// decides whether it receives this URI, and it must work even on a stateless
+		// server (where the tool handler that calls this runs against a fresh
+		// per-request state, NOT the listen stream's state nor the stale
+		// `activeConnection`). The legacy 2025-era subscribe-then-deliver-on-GET path
+		// is preserved by `notifyChange`'s plain-GET fallback (`isSubscribed(uri)`), so
+		// no caller-`cs` gate is applied here.
 		Json params = Json.emptyObject;
 		params["uri"] = uri;
 		return notifyChange("notifications/resources/updated", params, uri);
@@ -1028,6 +1039,10 @@ final class McpServer
 		// stamped with it in `params._meta`.
 		stdioListenSubscriptionId = rpcIdString(msg.id);
 		stdioListenSink = writeLine;
+		// Capture THIS listen request's parsed per-stream filter so subsequent
+		// notify*/notifyResourceUpdated deliver only the types/URIs it opted into
+		// (per-URI, #550), independent of any other connection's state.
+		stdioListenFilter_ = lastListenFilter_;
 
 		// First message on the stream: the acknowledgement carrying the agreed-upon
 		// subset for THIS listen request only (draft basic/utilities/subscriptions
@@ -1056,12 +1071,13 @@ final class McpServer
 		size_t delivered;
 		// Stdio `subscriptions/listen` channel (draft): the single stdout channel
 		// carries change notifications too, stamped with the listen subscriptionId.
-		// Per-stream filtering still applies — deliver only when this listen
-		// stream's recorded filter opted in for the method (mirroring the GET-stream
-		// eligibility below). Without this branch a stdio listener receives nothing,
-		// since there is no `pushChannel` on the stdio transport.
-		if (stdioListenSink !is null && cs.connectionVersion.isDraft
-				&& globalListensForMethod(method))
+		// Delivery is driven by the stdio listen stream's OWN recorded filter
+		// (`lastListenFilter_`, the single stdio connection) via `accepts(method, uri)`
+		// — so a stdio listener subscribed to uriA does NOT receive an update for uriB
+		// (per-URI), replacing the type-only `globalListensForMethod` gate (#550).
+		// Without this branch a stdio listener receives nothing, since there is no
+		// `pushChannel` on the stdio transport.
+		if (stdioListenSink !is null && stdioListenFilter_.accepts(method, uri))
 		{
 			auto note = withSubscriptionId(makeNotification(method, params),
 					stdioListenSubscriptionId);
@@ -1070,20 +1086,41 @@ final class McpServer
 		}
 		if (pushChannel !is null)
 		{
-			if (cs.connectionVersion.isDraft)
-			{
-				// Per-stream filtering: an active `subscriptions/listen` stream receives
-				// a type only if its own filter opted in. A plain GET listener (inactive
-				// filter, no per-stream opt-in) falls back to the global opt-in,
-				// preserving the legacy single-stream draft path while isolating
-				// concurrent streams.
-				const plainEligible = globalListensForMethod(method);
-				delivered += pushChannel.emitFiltered(method, params, uri, plainEligible);
-			}
-			else
-				delivered += pushChannel.notify(method, params);
+			// Listener-driven delivery (#550): every open stream decides for itself.
+			// An ACTIVE `subscriptions/listen` stream (HTTP, any server mode incl.
+			// stateless) receives a type only if its own per-stream
+			// `SubscriptionFilter.accepts(method, uri)` opted in — `emitFiltered`
+			// consults that filter directly and ignores `plainEligible`, so the path is
+			// self-contained and never gated on the caller's (possibly stale)
+			// `activeConnection`. A plain GET listener (inactive filter — only the
+			// 2025-era standalone GET stream, never present in stateless/draft) falls
+			// back to `plainEligible`, preserving the legacy non-draft delivery:
+			// list-changed broadcasts unconditionally, while `resources/updated` honours
+			// the 2025-era subscribe-then-deliver gate (`isSubscribed(uri)`). On the
+			// draft single-connection path the global opt-in still gates that fallback.
+			const plainEligible = plainGetEligible(method, uri);
+			delivered += pushChannel.emitFiltered(method, params, uri, plainEligible);
 		}
 		return delivered;
+	}
+
+	/// Eligibility for a plain (2025-era standalone GET) listener whose
+	/// `SubscriptionFilter` is inactive — the fallback `emitFiltered` applies only to
+	/// such listeners (an active `subscriptions/listen` stream decides via its own
+	/// filter and ignores this). This preserves the pre-draft delivery semantics: the
+	/// three list-changed notifications broadcast unconditionally, while
+	/// `notifications/resources/updated` is delivered only for a URI the client
+	/// subscribed to via `resources/subscribe` (`isSubscribed`). On the draft
+	/// single-connection path (a draft GET stream, no per-stream listen filter) the
+	/// global `subscriptions/listen` opt-in gates instead, mirroring the former
+	/// behaviour for that legacy path.
+	private bool plainGetEligible(string method, string uri) @safe
+	{
+		if (cs.connectionVersion.isDraft)
+			return globalListensForMethod(method);
+		if (method == "notifications/resources/updated")
+			return isSubscribed(uri);
+		return true;
 	}
 
 	/// Whether the server's *global* `subscriptions/listen` opt-in covers a given
@@ -1702,6 +1739,7 @@ final class McpServer
 			listenResourceUris = null;
 			listenFilters = null;
 			lastListenFilter_ = SubscriptionFilter.init;
+			stdioListenFilter_ = SubscriptionFilter.init;
 			return;
 		}
 
@@ -6324,6 +6362,114 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	assert(bFrame.canFind("notifications/resources/updated"));
 	assert(bFrame.canFind("file:///b"));
 	assert(aFrame.length == 0); // A did not subscribe to resources
+}
+
+unittest  // #550: STATELESS HTTP subscriptions/listen delivers resources/updated per-URI
+{
+	// The draft subscriptions/listen RPC is a single self-contained long-lived HTTP
+	// request; the draft protocol is stateless-only, so it MUST work on a stateless
+	// server. notifyResourceUpdated is invoked from a tool handler whose per-request
+	// state is NOT the listen stream's state and NOT the stale activeConnection;
+	// delivery eligibility must therefore come from the OPEN LISTENER's own filter,
+	// not the caller's connection state. A listener that opted into note:///a must
+	// receive an update for note:///a (stamped with its subscriptionId) and NOTHING
+	// for note:///b.
+	import std.algorithm : canFind;
+
+	auto s = McpServer.stateless("t", "1");
+	s.enableResourceSubscriptions();
+	auto coord = new StreamCoordinator;
+	auto push = s.serverPushChannel(coord);
+
+	// Simulate handleListenStream attaching the listen stream's own per-URI filter
+	// (note:///a only) on the push channel. The server's activeConnection (what cs()
+	// returns) is the stale default: NOT draft, NOT subscribed to note:///a.
+	SubscriptionFilter f;
+	f.active = true;
+	f.resourceSubscriptions = true;
+	f.resourceUris = ["note:///a"];
+	string frame;
+	push.addListener((string fr) @safe { frame = fr; }, "listen-1", f);
+
+	// Subscribed URI: delivered down THAT stream, stamped with the subscriptionId.
+	const a = s.notifyResourceUpdated("note:///a");
+	assert(a == 1, "stateless listen stream must receive an update for its subscribed URI");
+	assert(frame.canFind("notifications/resources/updated"));
+	assert(frame.canFind("note:///a"));
+	assert(frame.canFind("listen-1"), "the update must be stamped with the subscriptionId");
+
+	// Unsubscribed URI: nothing (per-URI filter).
+	frame = null;
+	const b = s.notifyResourceUpdated("note:///b");
+	assert(b == 0, "stateless listen stream must NOT receive an update for an un-opted URI");
+	assert(frame.length == 0);
+}
+
+unittest  // #550: STATELESS HTTP subscriptions/listen delivers resources/list_changed per opt-in
+{
+	// A list_changed notification reaches a listen stream that opted into
+	// resourcesListChanged and does not reach one that did not — driven by each
+	// listener's own filter on a stateless server.
+	import std.algorithm : canFind;
+
+	auto s = McpServer.stateless("t", "1");
+	s.enableResourcesListChanged();
+	auto coord = new StreamCoordinator;
+	auto push = s.serverPushChannel(coord);
+
+	// Stream A opted into resourcesListChanged; stream B did not (toolsListChanged only).
+	SubscriptionFilter fa;
+	fa.active = true;
+	fa.resourcesListChanged = true;
+	SubscriptionFilter fb;
+	fb.active = true;
+	fb.toolsListChanged = true;
+	string aFrame, bFrame;
+	push.addListener((string fr) @safe { aFrame = fr; }, "A", fa);
+	push.addListener((string fr) @safe { bFrame = fr; }, "B", fb);
+
+	const n = s.notifyResourcesListChanged();
+	assert(n == 1, "exactly the opted-in listen stream receives resources/list_changed");
+	assert(aFrame.canFind("notifications/resources/list_changed"));
+	assert(aFrame.canFind("A"));
+	assert(bFrame.length == 0, "a stream that did not opt into resourcesListChanged gets nothing");
+}
+
+unittest  // #550: stdio listen sink is per-URI filtered (subscribed delivered, other not)
+{
+	// stdio parity: the stdio subscriptions/listen sink must filter resource-update
+	// notifications by the stdio listen stream's OWN recorded filter (per-URI), so a
+	// stdio listener subscribed to uriA does NOT receive an update for uriB.
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.enableResourceSubscriptions();
+
+	string[] sink;
+	// Open a draft stdio listen subscribed to note:///a only.
+	Json na = Json.emptyObject;
+	na["resourceSubscriptions"] = Json([Json("note:///a")]);
+	Json p = Json.emptyObject;
+	p["notifications"] = na;
+	auto served = s.tryServeStdioListen(draftReq(1, "subscriptions/listen", p), (string line) @safe {
+		sink ~= line;
+	});
+	assert(served, "draft subscriptions/listen must be served over stdio");
+	// First sink line is the acknowledgement.
+	assert(sink.length == 1);
+	assert(sink[0].canFind("notifications/subscriptions/acknowledged"));
+
+	// Subscribed URI: delivered on the stdio sink, stamped with the subscriptionId.
+	const a = s.notifyResourceUpdated("note:///a");
+	assert(a == 1, "stdio listen must receive an update for its subscribed URI");
+	assert(sink.length == 2);
+	assert(sink[1].canFind("notifications/resources/updated"));
+	assert(sink[1].canFind("note:///a"));
+
+	// Un-opted URI: nothing more on the sink.
+	const b = s.notifyResourceUpdated("note:///b");
+	assert(b == 0, "stdio listen must NOT receive an update for an un-opted URI");
+	assert(sink.length == 2);
 }
 
 unittest  // draft: notifyPromptsListChanged suppressed unless client opted in

@@ -1137,19 +1137,16 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			|| tryDraft(RequestMeta.fromParams(msg.params).protocolVersion);
 		if (opensListenStream(msg.method, isDraftReq))
 		{
-			// #550 Stage 3: subscriptions/listen opens a long-lived server->client
-			// stream wired to the mount-global push channel — shared state across
-			// HTTP calls. A stateless server keeps no such state, so the draft
-			// listen RPC is NOT available over HTTP in stateless mode: answer
-			// -32601 (method not found) rather than opening the stream. A stateful
-			// server (sessions keyed on Mcp-Session-Id) serves it.
-			if (server.mode != ServerMode.stateful)
-			{
-				res.statusCode = HTTPStatus.ok;
-				res.writeBody(makeErrorResponse(msg.id,
-						methodNotFound("subscriptions/listen")).toString(), "application/json");
-				return;
-			}
+			// #550: subscriptions/listen is a DRAFT RPC and the draft protocol is
+			// stateless-only, so it MUST work on a stateless server too. It is a single
+			// self-contained long-lived HTTP request: this POST opens the SSE response
+			// stream, and notify*/notifyResourceUpdated stream
+			// `notifications/resources/updated` and `.../list_changed` down THAT SAME
+			// stream — exactly like a tool call emitting progress on its own SSE stream.
+			// It needs NO session, NO Mcp-Session-Id, NO inbound correlation; delivery
+			// is driven by this stream's own per-URI `SubscriptionFilter` at the push
+			// channel. (The 2025-era resources/subscribe RPC and the standalone GET
+			// stream stay gated in stateless; only this draft listen path is opened.)
 			handleListenStream(server, coord, msg, res);
 			return;
 		}
