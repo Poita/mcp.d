@@ -259,6 +259,10 @@ final class OAuthClient
 	{
 		requirePkceSupport(as_);
 		requireResource();
+		// SSRF guard at the source: the authorization endpoint comes from discovered
+		// AS metadata; reject a plaintext-http (non-loopback) or internal/link-local
+		// endpoint before constructing a URL any consumer might fetch.
+		requireSecureUrl(as_.authorizationEndpoint);
 		return buildAuthorizationUrl(as_.authorizationEndpoint, client.clientId,
 				redirectUri, pkce.challenge, scopeStr, resource, state);
 	}
@@ -375,6 +379,9 @@ final class OAuthClient
 	/// empty `expectedState` (the default) skips state verification.
 	string authorizeAndGetCode(string authzUrl, string expectedState = "") @safe
 	{
+		// SSRF guard: never issue the outbound GET to a plaintext-http (non-loopback)
+		// or internal/link-local authorization endpoint.
+		requireSecureUrl(authzUrl);
 		string code, state;
 		() @trusted {
 			requestHTTP(authzUrl, (scope HTTPClientRequest req) {
@@ -408,6 +415,9 @@ final class OAuthClient
 	string authorizeAndGetCode(AuthorizationServerMetadata as_, string authzUrl,
 			string expectedState = "") @safe
 	{
+		// SSRF guard: never issue the outbound GET to a plaintext-http (non-loopback)
+		// or internal/link-local authorization endpoint.
+		requireSecureUrl(authzUrl);
 		string code, iss, state;
 		() @trusted {
 			requestHTTP(authzUrl, (scope HTTPClientRequest req) {
@@ -773,6 +783,43 @@ unittest  // clientCredentials refuses when the RFC 8707 resource indicator is u
 	AuthorizationServerMetadata as_;
 	as_.tokenEndpoint = "https://as.example.com/token";
 	assertThrown(c.clientCredentials(as_, RegisteredClient("cid", ""), "scope"));
+}
+
+unittest  // authorizationUrl refuses an internal/plaintext authorization endpoint (SSRF, #13)
+{
+	import std.exception : assertThrown;
+
+	// A metadata-derived authorization_endpoint pointing at the cloud metadata
+	// service must be rejected before a URL is constructed or any GET is issued.
+	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "http://169.254.169.254/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto pkce = makePkce(new ubyte[32]);
+	assertThrown(c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st"));
+
+	// Plaintext http to a non-loopback host is likewise rejected.
+	AuthorizationServerMetadata as2;
+	as2.authorizationEndpoint = "http://as.example.com/authorize";
+	as2.codeChallengeMethodsSupported = ["S256"];
+	assertThrown(c.authorizationUrl(as2, RegisteredClient("cid", ""), pkce, "mcp:read", "st"));
+}
+
+unittest  // authorizeAndGetCode refuses an internal/plaintext authorize URL before GET (SSRF, #13)
+{
+	import std.exception : assertThrown;
+
+	auto c = new OAuthClient();
+	// Both overloads must guard the outbound GET.
+	assertThrown(c.authorizeAndGetCode("http://169.254.169.254/authorize?x=1"));
+	assertThrown(c.authorizeAndGetCode("http://as.example.com/authorize?x=1"));
+	assertThrown(c.authorizeAndGetCode("https://[fd00::1]/authorize?x=1"));
+
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	assertThrown(c.authorizeAndGetCode(as_, "http://169.254.169.254/authorize?x=1"));
+	assertThrown(c.authorizeAndGetCode(as_, "https://[::ffff:10.0.0.1]/authorize?x=1"));
 }
 
 unittest  // discoverProtectedResource ignores a cross-origin resource_metadata URL

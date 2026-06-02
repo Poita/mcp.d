@@ -380,13 +380,19 @@ string selectScope(string wwwAuthScope, const string[] scopesSupported) @safe
 }
 
 /// The canonical resource indicator (RFC 8707) for an MCP server: the endpoint
-/// URL with a lowercased scheme+host and no fragment.
+/// URL with a lowercased scheme+authority, any fragment dropped, and a single
+/// trailing slash stripped. The MCP "Canonical Server URI" rules prefer the
+/// no-trailing-slash form. This MUST agree with `mcp.auth.login.canonicalResource`
+/// (see the cross-check unittest below); both implement the same canonicalization.
 string canonicalResourceUri(string mcpEndpoint) @safe
 {
 	import std.string : indexOf, toLower;
 
 	auto frag = mcpEndpoint.indexOf('#');
 	auto s = (frag < 0) ? mcpEndpoint : mcpEndpoint[0 .. frag];
+	// Strip a single trailing slash (spec prefers the no-trailing-slash form).
+	if (s.length > 1 && s[$ - 1] == '/')
+		s = s[0 .. $ - 1];
 	auto schemeEnd = s.indexOf("://");
 	if (schemeEnd < 0)
 		return s;
@@ -487,10 +493,16 @@ unittest  // scope selection prefers WWW-Authenticate, falls back to scopes_supp
 	assert(selectScope("", []) is null);
 }
 
-unittest  // canonical resource URI lowercases scheme+host, drops fragment
+unittest  // canonical resource URI lowercases scheme+host, drops fragment + trailing slash
 {
 	assert(canonicalResourceUri(
 			"HTTPS://MCP.Example.com/Path#frag") == "https://mcp.example.com/Path");
+	// A single trailing slash is stripped (spec prefers the no-trailing-slash form),
+	// matching mcp.auth.login.canonicalResource.
+	assert(canonicalResourceUri("https://mcp.example.com/") == "https://mcp.example.com");
+	assert(canonicalResourceUri("HTTPS://MCP.Example.com/Mcp/") == "https://mcp.example.com/Mcp");
+	assert(canonicalResourceUri("https://mcp.example.com/mcp") == "https://mcp.example.com/mcp");
+	assert(canonicalResourceUri("https://mcp.example.com:8443/") == "https://mcp.example.com:8443");
 }
 
 version (unittest) private Json parseJson(string s) @safe
@@ -673,11 +685,258 @@ private bool isPrivateIpv4Literal(string host) @safe pure nothrow @nogc
 	return false;
 }
 
+/// Parse an IPv6 literal (the inner text of a bracketed host, with any zone-id
+/// stripped) into 16 bytes, expanding a `::` run. Returns false (fail closed)
+/// on any malformed input. Handles the embedded-IPv4 tail forms
+/// (`::ffff:a.b.c.d`, `::a.b.c.d`) by parsing the dotted-decimal suffix into the
+/// final 4 bytes. `@safe pure nothrow @nogc`.
+private bool parseIpv6Literal(string s, out ubyte[16] outBytes) @safe pure nothrow @nogc
+{
+	import std.string : indexOf;
+
+	// Strip a zone id (e.g. fe80::1%eth0).
+	const pct = s.indexOf('%');
+	if (pct >= 0)
+		s = s[0 .. pct];
+	if (s.length == 0)
+		return false;
+
+	// Detect and parse a trailing embedded IPv4 (dotted-decimal) tail.
+	bool haveV4;
+	ubyte[4] v4;
+	{
+		// Find the last ':' — the IPv4 tail (if any) follows it.
+		ptrdiff_t lastColon = -1;
+		foreach (k, ch; s)
+			if (ch == ':')
+				lastColon = k;
+		auto tail = (lastColon < 0) ? s : s[lastColon + 1 .. $];
+		bool hasDot;
+		foreach (ch; tail)
+			if (ch == '.')
+				hasDot = true;
+		if (hasDot)
+		{
+			uint[4] oct;
+			size_t idx;
+			size_t i;
+			while (i < tail.length)
+			{
+				uint v;
+				size_t digits;
+				while (i < tail.length && tail[i] >= '0' && tail[i] <= '9')
+				{
+					v = v * 10 + cast(uint)(tail[i] - '0');
+					if (v > 255)
+						return false;
+					i++;
+					digits++;
+				}
+				if (digits == 0)
+					return false;
+				if (idx >= 4)
+					return false;
+				oct[idx++] = v;
+				if (i < tail.length)
+				{
+					if (tail[i] != '.')
+						return false;
+					i++;
+				}
+			}
+			if (idx != 4)
+				return false;
+			v4 = [
+				cast(ubyte) oct[0], cast(ubyte) oct[1], cast(ubyte) oct[2],
+				cast(ubyte) oct[3]
+			];
+			haveV4 = true;
+			// Replace the IPv4 tail with the hextet portion for hextet parsing.
+			s = (lastColon < 0) ? "" : s[0 .. lastColon + 1];
+		}
+	}
+
+	// Split on "::" (at most one allowed).
+	ptrdiff_t dbl = -1;
+	for (size_t k = 0; k + 1 < s.length; k++)
+	{
+		if (s[k] == ':' && s[k + 1] == ':')
+		{
+			dbl = k;
+			break;
+		}
+	}
+
+	const v4bytes = haveV4 ? 4 : 0;
+	const totalHextetBytes = 16 - v4bytes;
+
+	if (dbl < 0)
+	{
+		// No "::": must fully fill the hextet area.
+		ubyte[16] tmp;
+		const n = parseHextets(s, tmp[0 .. totalHextetBytes]);
+		if (n != totalHextetBytes)
+			return false;
+		outBytes[0 .. totalHextetBytes] = tmp[0 .. totalHextetBytes];
+	}
+	else
+	{
+		auto left = s[0 .. dbl];
+		auto right = (dbl + 2 <= s.length) ? s[dbl + 2 .. $] : "";
+		// A leading or trailing ':' adjacent to "::" (i.e. ":::") is invalid; left
+		// must not end with ':' and right must not start with ':'.
+		if (left.length && left[$ - 1] == ':')
+			return false;
+		if (right.length && right[0] == ':')
+			return false;
+		ubyte[16] lbuf;
+		ubyte[16] rbuf;
+		const ln = parseHextets(left, lbuf[]);
+		if (ln < 0)
+			return false;
+		const rn = parseHextets(right, rbuf[]);
+		if (rn < 0)
+			return false;
+		if (ln + rn > totalHextetBytes)
+			return false;
+		outBytes[] = 0;
+		outBytes[0 .. ln] = lbuf[0 .. ln];
+		outBytes[totalHextetBytes - rn .. totalHextetBytes] = rbuf[0 .. rn];
+	}
+
+	if (haveV4)
+		outBytes[12 .. 16] = v4[];
+	return true;
+}
+
+/// Parse a colon-separated list of IPv6 hextets into bytes; returns count of
+/// bytes written, or -1 on error. An empty segment yields 0 bytes.
+private ptrdiff_t parseHextets(string seg, ubyte[] dst) @safe pure nothrow @nogc
+{
+	if (seg.length == 0)
+		return 0;
+	size_t written;
+	size_t i;
+	while (i <= seg.length)
+	{
+		// Read one hextet (1-4 hex digits) up to ':' or end.
+		uint v;
+		size_t digits;
+		while (i < seg.length && seg[i] != ':')
+		{
+			const ch = seg[i];
+			uint d;
+			if (ch >= '0' && ch <= '9')
+				d = ch - '0';
+			else if (ch >= 'a' && ch <= 'f')
+				d = ch - 'a' + 10;
+			else if (ch >= 'A' && ch <= 'F')
+				d = ch - 'A' + 10;
+			else
+				return -1;
+			v = (v << 4) | d;
+			digits++;
+			if (digits > 4)
+				return -1;
+			i++;
+		}
+		if (digits == 0)
+			return -1;
+		if (written + 2 > dst.length)
+			return -1;
+		dst[written++] = cast(ubyte)(v >> 8);
+		dst[written++] = cast(ubyte)(v & 0xff);
+		if (i == seg.length)
+			break;
+		i++; // skip ':'
+		if (i == seg.length)
+			return -1; // trailing single ':'
+	}
+	return written;
+}
+
+/// Reject an IPv6 *literal* host (the inner text of a bracketed `[...]` host)
+/// that targets an internal/link-local/loopback/embedded-private address.
+/// Returns true when the literal must be rejected. Unparseable literals fail
+/// closed (rejected). The `loopback` flag is passed so that the explicit
+/// `[::1]` dev case (already permitted over http elsewhere) is not flagged.
+private bool isUnsafeIpv6Literal(string inner, bool loopback) @safe pure nothrow @nogc
+{
+	ubyte[16] b;
+	if (!parseIpv6Literal(inner, b))
+		return true; // fail closed
+
+	// Unspecified "::".
+	bool allZero = true;
+	foreach (x; b)
+		if (x != 0)
+		{
+			allZero = false;
+			break;
+		}
+	if (allZero)
+		return true;
+
+	// Loopback ::1 — permitted only via the loopback dev path.
+	bool isLoopbackV6 = true;
+	foreach (k; 0 .. 15)
+		if (b[k] != 0)
+		{
+			isLoopbackV6 = false;
+			break;
+		}
+	if (isLoopbackV6 && b[15] == 1)
+		return !loopback;
+
+	// ULA fc00::/7 (first byte 0xFC or 0xFD).
+	if (b[0] == 0xFC || b[0] == 0xFD)
+		return true;
+	// Link-local fe80::/10 (0xFE 0x80..0xBF).
+	if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80)
+		return true;
+
+	// IPv4-mapped ::ffff:a.b.c.d/96 and IPv4-compatible ::/96 (first 12 bytes
+	// either 0...0 ffff or all zero) — extract the embedded IPv4 and delegate.
+	bool mapped = true;
+	foreach (k; 0 .. 10)
+		if (b[k] != 0)
+		{
+			mapped = false;
+			break;
+		}
+	if (mapped && ((b[10] == 0xFF && b[11] == 0xFF) || (b[10] == 0 && b[11] == 0)))
+		return isUnsafeIpv4Octets(b[12], b[13], b[14], b[15]);
+
+	return false;
+}
+
+/// Range-check four IPv4 octets for the private/link-local/loopback/this-host
+/// ranges that the SSRF guard rejects. Mirrors `isPrivateIpv4Literal` but also
+/// rejects 127/8 (loopback), since an embedded IPv4 inside an IPv6 literal has
+/// no legitimate dev-loopback meaning. `@safe pure nothrow @nogc`.
+private bool isUnsafeIpv4Octets(ubyte a, ubyte b, ubyte c, ubyte d) @safe pure nothrow @nogc
+{
+	if (a == 127) // 127.0.0.0/8 loopback
+		return true;
+	if (a == 10) // 10.0.0.0/8
+		return true;
+	if (a == 172 && b >= 16 && b <= 31) // 172.16.0.0/12
+		return true;
+	if (a == 192 && b == 168) // 192.168.0.0/16
+		return true;
+	if (a == 169 && b == 254) // 169.254.0.0/16 link-local (incl. metadata 169.254.169.254)
+		return true;
+	if (a == 0) // 0.0.0.0/8 "this host"
+		return true;
+	return false;
+}
+
 /// Whether `url` is safe to fetch for OAuth/discovery: it MUST use the `https`
 /// scheme, OR target an explicit loopback host (`localhost`, `127.0.0.1`,
 /// `[::1]`) over `http` for local development. Plaintext `http` to any other
-/// host is rejected, as are URLs whose host is a private/link-local IPv4
-/// literal (SSRF / DNS-rebinding mitigation, e.g. 169.254.169.254 / RFC 1918).
+/// host is rejected, as are URLs whose host is a private/link-local IPv4 or
+/// IPv6 literal — including IPv4-mapped/compatible IPv6 (SSRF / DNS-rebinding
+/// mitigation, e.g. 169.254.169.254 / RFC 1918, fc00::/7, fe80::/10).
 bool isSecureFetchUrl(string url) @safe pure nothrow @nogc
 {
 	import std.string : indexOf;
@@ -702,6 +961,18 @@ bool isSecureFetchUrl(string url) @safe pure nothrow @nogc
 		return false;
 
 	const loopback = isLoopbackHost(host);
+
+	// Reject internal/link-local IPv6 literals (bracketed host) regardless of
+	// scheme, mirroring the IPv4 path. Permits only the explicit [::1] dev case.
+	if (host[0] == '[')
+	{
+		const close = host.indexOf(']');
+		if (close < 0)
+			return false; // malformed bracketed host -> fail closed
+		auto inner = host[1 .. close];
+		if (isUnsafeIpv6Literal(inner, loopback))
+			return false;
+	}
 	// Reject private/link-local IPv4 literals (non-loopback) regardless of scheme.
 	if (!loopback && isPrivateIpv4Literal(host))
 		return false;
@@ -767,6 +1038,36 @@ unittest  // isSecureFetchUrl rejects private/link-local IPv4 literals (SSRF)
 	assert(!isSecureFetchUrl("https://192.168.1.1/x"));
 	assert(!isSecureFetchUrl("https://172.16.0.1/x"));
 	assert(!isSecureFetchUrl("http://169.254.169.254/x"));
+}
+
+unittest  // isSecureFetchUrl rejects private/ULA/link-local IPv6 literals (SSRF)
+{
+	// ULA fc00::/7 and link-local fe80::/10 must be rejected even over https.
+	assert(!isSecureFetchUrl("https://[fd00::1]/x"));
+	assert(!isSecureFetchUrl("https://[fc00::1]/x"));
+	assert(!isSecureFetchUrl("https://[fe80::1]/x"));
+	// Unspecified.
+	assert(!isSecureFetchUrl("https://[::]/x"));
+	// IPv4-mapped/compatible embedding internal addresses.
+	assert(!isSecureFetchUrl("https://[::ffff:169.254.169.254]/latest/meta-data"));
+	assert(!isSecureFetchUrl("https://[::ffff:10.0.0.5]/x"));
+	assert(!isSecureFetchUrl("https://[::ffff:127.0.0.1]/x"));
+	// IPv4-mapped written as hex hextets (::ffff:0a00:0001 == ::ffff:10.0.0.1).
+	assert(!isSecureFetchUrl("https://[::ffff:0a00:0001]/x"));
+	// IPv6 loopback over https stays dev-only-safe but is harmless; over a
+	// non-loopback scheme path it is permitted (loopback). A malformed bracketed
+	// host fails closed.
+	assert(!isSecureFetchUrl("https://[fe80::1]:443/x"));
+	assert(!isSecureFetchUrl("https://[not-an-ipv6/x"));
+}
+
+unittest  // isSecureFetchUrl accepts a public/global-unicast IPv6 literal
+{
+	// Positive control: a public address (2606:4700::/.. Cloudflare) is allowed.
+	assert(isSecureFetchUrl("https://[2606:4700:4700::1111]/x"));
+	assert(isSecureFetchUrl("https://[2606:4700::1]/x"));
+	// Explicit IPv6 loopback over http is still permitted for dev.
+	assert(isSecureFetchUrl("http://[::1]:9000/jwks"));
 }
 
 unittest  // isSecureFetchUrl rejects schemeless / file / non-loopback http
