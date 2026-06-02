@@ -553,15 +553,37 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 	}
 
 	server.registerDynamicPrompt(descriptor, (Json args) @safe {
+		import mcp.protocol.errors : McpException, invalidParams;
+
 		Tuple!(Parameters!overload) argv;
 		static foreach (i, P; Parameters!overload)
 		{
 			static if (is(P : RequestContext))
 				argv[i] = new NullContext;
 			else static if (is(defs[i] == void))
-				argv[i] = marshalArg!P(args, names[i]);
+			{
+				// A malformed argument (e.g. an out-of-range enum member or a
+				// non-numeric integer) must surface as InvalidParams (-32602)
+				// rather than escaping as an internal error (-32603), mirroring
+				// the resource-template path. Protocol errors thrown by the
+				// marshaller are passed through unchanged so an inner
+				// invalidParams is not double-wrapped (#23).
+				try
+					argv[i] = marshalArg!P(args, names[i]);
+				catch (McpException e)
+					throw e;
+				catch (Exception e)
+					throw invalidParams("argument '" ~ names[i] ~ "': " ~ e.msg);
+			}
 			else
-				argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
+			{
+				try
+					argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
+				catch (McpException e)
+					throw e;
+				catch (Exception e)
+					throw invalidParams("argument '" ~ names[i] ~ "': " ~ e.msg);
+			}
 		}
 		return toPromptResult(__traits(getMember, parent, memberName)(argv.expand));
 	});
@@ -777,6 +799,18 @@ version (unittest)
 		{
 			return "Summarize " ~ topic;
 		}
+
+		@prompt("byPriority", "Prompt taking an enum argument")
+		string byPriority(Priority p) @safe
+		{
+			return "priority " ~ (p == Priority.high ? "high" : "low");
+		}
+
+		@prompt("repeat", "Prompt taking an integer argument")
+		string repeat(int count) @safe
+		{
+			return "count " ~ (count > 0 ? "pos" : "nonpos");
+		}
 	}
 
 	import vibe.data.json : parseJsonString;
@@ -948,6 +982,40 @@ unittest  // @resource and @prompt reflection register and dispatch
 	pp["arguments"] = Json(["topic": Json("MCP")]);
 	auto pr = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
 	assert(pr["result"]["messages"][0]["content"]["text"].get!string == "Tell me about MCP");
+}
+
+unittest  // #23 @prompt enum arg given an invalid member -> InvalidParams (-32602)
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.errors : ErrorCode;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DemoApi);
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "byPriority";
+	pp["arguments"] = Json(["p": Json("urgent")]); // not a Priority member
+	auto resp = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
+	assert("error" in resp, "expected an error for an invalid enum prompt argument");
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams,
+			"invalid enum prompt arg must map to -32602, not -32603");
+}
+
+unittest  // #23 @prompt integer arg given a non-numeric string -> InvalidParams (-32602)
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.errors : ErrorCode;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DemoApi);
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "repeat";
+	pp["arguments"] = Json(["count": Json("abc")]); // not an integer
+	auto resp = s.handle(Message(makeRequest(Json(3), "prompts/get", pp))).get;
+	assert("error" in resp, "expected an error for a non-numeric integer prompt argument");
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams,
+			"non-numeric integer prompt arg must map to -32602, not -32603");
 }
 
 unittest  // @prompt reflection: optional title is emitted in prompts/list

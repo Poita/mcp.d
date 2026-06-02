@@ -245,7 +245,9 @@ private template hasFieldDefault(T, size_t i)
 		/// description of the first violation found. The supported keyword subset
 		/// matches what this SDK emits and is the same subset used for tool input and
 		/// output schemas: `type` (object/array/string/integer/number/boolean), nested
-		/// `properties` with `required`, object `additionalProperties`, array `items`,
+		/// `properties` with `required`, `additionalProperties` (both the object
+		/// value-schema form and the boolean `false` form, which forbids any
+		/// undeclared object key), array `items`,
 		/// and `enum`. Unknown keywords are
 		/// ignored (treated as satisfied), so a richer hand-written schema never reports
 		/// a spurious failure.
@@ -316,6 +318,23 @@ private template hasFieldDefault(T, size_t i)
 					auto msg = validateAt(member, ap, path.length ? path ~ "." ~ key : key);
 					if (msg.length)
 						return msg;
+				}
+			}
+
+			// additionalProperties: false — reject any object member whose key is
+			// not declared in `properties` (#24). This is the boolean sibling of the
+			// object form above; the two are mutually exclusive on a given schema.
+			if (value.type == Json.Type.object && "additionalProperties" in schema
+				&& schema["additionalProperties"].type == Json.Type.bool_
+				&& !schema["additionalProperties"].get!bool)
+				{
+				const hasProps = "properties" in schema
+					&& schema["properties"].type == Json.Type.object;
+				foreach (string key, member; value.byKeyValue)
+					{
+					if (hasProps && key in schema["properties"])
+						continue;
+					return where ~ ": additional property '" ~ key ~ "' is not permitted";
 				}
 			}
 
@@ -776,6 +795,29 @@ private template hasFieldDefault(T, size_t i)
 			inner["qty"] = "oops";
 			bad["x"] = inner;
 			assert(validateAgainstSchema(bad, schema).length > 0);
+		}
+
+		unittest  // #24 additionalProperties:false rejects unknown object keys
+		{
+			Json schema = Json.emptyObject;
+			schema["type"] = "object";
+			Json props = Json.emptyObject;
+			Json aProp = Json.emptyObject;
+			aProp["type"] = "integer";
+			props["a"] = aProp;
+			schema["properties"] = props;
+			schema["additionalProperties"] = Json(false);
+
+			Json withExtra = Json.emptyObject;
+			withExtra["a"] = 1;
+			withExtra["b"] = 2; // not declared in properties
+			assert(validateAgainstSchema(withExtra, schema).length > 0,
+				"an unknown key must be rejected when additionalProperties is false");
+
+			Json onlyDeclared = Json.emptyObject;
+			onlyDeclared["a"] = 1;
+			assert(validateAgainstSchema(onlyDeclared, schema) == "",
+				"a value with only declared keys must pass");
 		}
 
 		unittest  // #55 string facets emit format/minLength/maxLength/pattern
