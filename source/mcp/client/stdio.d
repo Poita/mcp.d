@@ -123,8 +123,7 @@ final class StdioClientTransport : ClientTransport
 	/// request id, per the draft stdio cancellation rule.
 	SubscriptionStream openListen(Json message) @safe
 	{
-		// Write the real listen request on the single channel (the previous no-op
-		// dropped it, so a stdio client could never subscribe).
+		// Write the listen request on the single channel.
 		send(message);
 
 		// The listen request id is the subscriptionId; cancel() references it.
@@ -209,9 +208,8 @@ final class StdioClientTransport : ClientTransport
 	}
 
 	/// Shut the owned child down per the MCP stdio Shutdown sequence and return its
-	/// exit status (a process killed by signal reports a negative status, matching
-	/// the prior `std.process.wait` convention: `-SIGTERM` / `-SIGKILL`). Safe to
-	/// call once.
+	/// exit status (a process killed by signal reports a negative status:
+	/// `-SIGTERM` / `-SIGKILL`). Safe to call once.
 	package int closeProcess(Duration termGrace, Duration killGrace) @safe
 	{
 		import core.sys.posix.signal : SIGTERM, SIGKILL;
@@ -455,7 +453,7 @@ version (Posix) unittest  // spawned transport round-trips a request/response ov
 	});
 }
 
-version (Posix) unittest  // #32: an over-long newline-less stream ends the read loop instead of growing unbounded
+version (Posix) unittest  // an over-long newline-less stream ends the read loop instead of growing unbounded
 {
 	import core.time : seconds, msecs;
 	import std.datetime.stopwatch : StopWatch, AutoStart;
@@ -489,7 +487,7 @@ version (Posix) unittest  // #32: an over-long newline-less stream ends the read
 	});
 }
 
-unittest  // #31: a server->client reply is NOT written inline from the read-loop task
+unittest  // a server->client reply is NOT written inline from the read-loop task
 {
 	// A reply written inline from the single read-loop task can deadlock a spawned
 	// subprocess (the child blocks writing stdout while we block writing the reply
