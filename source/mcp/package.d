@@ -14,7 +14,7 @@
  *
  * Transport wiring and auth plumbing are deliberately kept out of the
  * top-level surface to avoid name collisions and to signal stable-public-API
- * vs internal plumbing (issue #301). Bring them in explicitly when needed:
+ * vs internal plumbing. Bring them in explicitly when needed:
  *
  *   - `import mcp.transport;` — stdio / Streamable HTTP / SSE / session /
  *     OAuth-proxy mount / draft transport helpers,
@@ -47,5 +47,5 @@ public import mcp.api.reflection;
 // `McpServer.setListCacheHint(string, CacheHint)` and `McpClient.discover()`
 // returning `DiscoverResult`. Re-export the user-facing result/hint types
 // (but not the transport/wire plumbing that also lives in
-// `mcp.protocol.draft`) so they are usable with `import mcp;` alone (#399).
+// `mcp.protocol.draft`) so they are usable with `import mcp;` alone.
 public import mcp.protocol.draft : DiscoverResult, CacheHint, CacheScope, RequestMeta;
