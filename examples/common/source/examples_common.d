@@ -1,5 +1,5 @@
-/// Shared example-support helpers for the mcp.d example servers and clients
-/// (#505). The example clients are self-verifying e2e harnesses: they make MCP
+/// Shared example-support helpers for the mcp.d example servers and clients.
+/// The example clients are self-verifying e2e harnesses: they make MCP
 /// calls and assert on the results, exiting non-zero on any mismatch so CI can
 /// gate on them. These helpers factor out the four things every example
 /// server/client pair repeats:
@@ -20,7 +20,7 @@ import mcp.client.client : McpClient;
 import mcp.server.server : McpServer;
 import mcp.transport.streamable_http : StreamableHttpOptions;
 
-/// Shared structured result of the auth example's `whoami` tool (#73). Defined
+/// Shared structured result of the auth example's `whoami` tool. Defined
 /// once here so the server (which infers `whoami`'s output schema +
 /// `structuredContent` from the return type) and the client (which decodes the
 /// result with `structuredContentAs!WhoamiResult`) share ONE type — any field
