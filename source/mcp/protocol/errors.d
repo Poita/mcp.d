@@ -110,10 +110,14 @@ McpException resourceNotFound(string uri, ProtocolVersion v, Json data = Json.un
 ///
 /// Per client/elicitation §"URL Mode Elicitation Requests" (2025-11-25) the
 /// `url` parameter MUST contain a valid URL, and its schema marks the field
-/// `format: uri`. This requires an absolute URI: a non-empty scheme (a letter
-/// followed by letters/digits/`+`/`-`/`.`) followed by `:` and a hierarchical
-/// `//authority` with a non-empty host. Relative references, bare strings such
-/// as `"not a url"`, and `scheme:`-only values are rejected. Validation is
+/// `format: uri`. URL-mode elicitation drives browser navigation, so the scheme
+/// is additionally restricted (case-insensitively) to `http` or `https`: a
+/// non-web scheme such as `file://`, `ftp://` or `ws://` is rejected even when
+/// it carries a `//authority`. (The spec only SHOULDs HTTPS, so plain `http` is
+/// accepted rather than rejected here.) Beyond the scheme this requires an
+/// absolute URI: the scheme is followed by `:` and a hierarchical `//authority`
+/// with a non-empty host. Relative references, bare strings such as
+/// `"not a url"`, and `scheme:`-only values are rejected. Validation is
 /// permissive about the path/query/fragment so any real `https://…` consent or
 /// OAuth URL passes.
 bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
@@ -137,7 +141,14 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 	}
 	if (i >= url.length || url[i] != ':')
 		return false;
+	const scheme = url[0 .. i]; // scheme text, before the ':' delimiter
 	i++; // consume ':'
+
+	// Restrict to web schemes (case-insensitive). URL-mode elicitation drives
+	// browser navigation, so non-web schemes such as `file`, `ftp` or `ws` are
+	// rejected even though they carry a `//authority`. Only `http`/`https` pass.
+	if (!schemeEquals(scheme, "http") && !schemeEquals(scheme, "https"))
+		return false;
 
 	// Require a hierarchical authority ("//host…"). URL-mode elicitation always
 	// points at a navigable web location, so opaque (authority-less) URIs such
@@ -158,6 +169,21 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 			authority = authority[j + 1 .. $]; // host is whatever follows last '@'
 	}
 	return authority.length > 0;
+}
+
+/// ASCII case-insensitive equality for an elicitation URL scheme. Avoids the
+/// allocation/`@nogc` cost of `std.uni.toLower` so `isValidElicitationUrl` can
+/// stay `pure nothrow @nogc`.
+private bool schemeEquals(scope const(char)[] scheme, scope string lower) @safe pure nothrow @nogc
+{
+	import std.ascii : toLower;
+
+	if (scheme.length != lower.length)
+		return false;
+	foreach (i, c; scheme)
+		if (toLower(c) != lower[i])
+			return false;
+	return true;
 }
 
 /// A single URL-mode elicitation entry carried by a `-32042`
@@ -425,6 +451,24 @@ unittest  // isValidElicitationUrl rejects malformed / non-absolute values
 	assert(!isValidElicitationUrl("https:///path")); // empty authority
 	assert(!isValidElicitationUrl("mailto:user@example.com")); // no //authority
 	assert(!isValidElicitationUrl("://example.com")); // no scheme
+}
+
+unittest  // isValidElicitationUrl rejects non-web schemes that still carry a //authority
+{
+	// URL-mode elicitation drives browser navigation, so only http/https are
+	// acceptable even though these all have a hierarchical "//host" authority.
+	assert(!isValidElicitationUrl("file://host/path"));
+	assert(!isValidElicitationUrl("ftp://host/x"));
+	assert(!isValidElicitationUrl("ws://host"));
+	assert(!isValidElicitationUrl("wss://host/socket"));
+}
+
+unittest  // isValidElicitationUrl still accepts http/https (case-insensitive scheme)
+{
+	assert(isValidElicitationUrl("http://example.com"));
+	assert(isValidElicitationUrl("https://example.com/consent"));
+	assert(isValidElicitationUrl("HTTPS://example.com/consent"));
+	assert(isValidElicitationUrl("HtTp://example.com"));
 }
 
 unittest  // urlElicitationRequired throws on a malformed url
