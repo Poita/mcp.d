@@ -584,9 +584,7 @@ struct Content
 	///   `Annotations.lastModified` in 2025-06-18, so for an older peer the
 	///   `_meta` key is dropped and `annotations.lastModified` is stripped.
 	///
-	/// Mirrors the `Tool.forVersion` field-stripping pattern and fixes the whole
-	/// class of leaks (audio + resource_link + tool_use/tool_result + content
-	/// `_meta`/`lastModified`).
+	/// Mirrors the `Tool.forVersion` field-stripping pattern.
 	Content forVersion(ProtocolVersion v) const @safe
 	{
 		// Downgrade a kind newer than the peer's version to a text placeholder.
@@ -1751,7 +1749,7 @@ unittest  // inbound content annotations are preserved on fromJson
 	assert(back.annotations["lastModified"].get!string == "2025-01-01T00:00:00Z");
 }
 
-unittest  // Content is a SumType over per-kind structs (issue #305)
+unittest  // Content is a SumType over per-kind structs
 {
 	import std.sumtype : SumType;
 
