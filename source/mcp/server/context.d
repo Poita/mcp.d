@@ -188,8 +188,11 @@ interface RequestContext
 			throw invalidRequest("Client does not support sampling");
 		// Per spec, servers MUST NOT send tool-enabled sampling requests to
 		// clients that have not declared the `sampling.tools` sub-capability.
-		if (params.type == Json.Type.object && "tools" in params
-				&& !clientSupports("sampling.tools"))
+		// This covers both the `tools` list and a `toolChoice` directive, since
+		// a request that sets `toolChoice` (even `{mode:"none"}`) without any
+		// `tools` still exercises the tool-use sampling surface.
+		if (params.type == Json.Type.object && ("tools" in params
+				|| "toolChoice" in params) && !clientSupports("sampling.tools"))
 			throw invalidRequest("Client does not support tool use in sampling (sampling.tools)");
 		// The soft-deprecated `sampling.context` sub-capability gates the
 		// `includeContext` values `thisServer`/`allServers`.
@@ -1081,6 +1084,21 @@ unittest  // typed sample() builds params and parses the typed result
 	assert(result.content.text == "echoed");
 	assert(result.model == "test-model");
 	assert(result.stopReasonEnum.get == StopReason.endTurn);
+}
+
+unittest  // sample() gates toolChoice (without tools) on the sampling.tools capability
+{
+	import std.exception : assertThrown;
+	import mcp.protocol.sampling : CreateMessageRequest, SamplingMessage, ToolChoice;
+	import mcp.protocol.types : Content;
+
+	// Probe advertises "sampling" but not "sampling.tools".
+	auto probe = new SamplingProbe;
+	CreateMessageRequest req;
+	req.messages = [SamplingMessage("user", Content.makeText("hi"))];
+	req.maxTokens = 50;
+	req.toolChoice = ToolChoice(Nullable!string("none")); // toolChoice set, no tools
+	assertThrown!McpException(probe.sample(req));
 }
 
 version (unittest) private final class LogProbe : RequestContext
