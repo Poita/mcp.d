@@ -254,6 +254,20 @@ struct PromptResponse
 	{
 		return needsInput_ ? required_.toJson() : result_.toJson();
 	}
+
+	/// Project the final `GetPromptResult` to the negotiated protocol version so
+	/// version-gated message content (audio/resource_link/tool_use/tool_result
+	/// plus content-level `_meta`/`lastModified`) is not emitted to peers that do
+	/// not understand it (#1/#20). Mirrors `ToolResponse.forVersion`: an
+	/// `InputRequiredResult` is draft-only (MRTR) and carries no version-gated
+	/// content, so it is returned unchanged.
+	PromptResponse forVersion(ProtocolVersion v) const @safe
+	{
+		if (needsInput_)
+			return PromptResponse.inputRequired(required_.inputRequests.dup,
+					required_.requestState);
+		return PromptResponse.complete(result_.forVersion(v));
+	}
 }
 
 /// A prompt handler that may, on a stateless (MRTR) draft request, ask the client
@@ -1624,6 +1638,13 @@ final class McpServer
 		case "tasks/get":
 			return doTasksGet(params);
 		case "tasks/result":
+			// SEP-2663 removed `tasks/result` from the draft tasks extension, so on
+			// a draft-negotiated session the method does not exist and MUST answer
+			// -32601 (method not found) rather than -32602 (task not found). The
+			// 2025-11-25 family still defines it, where doTasksResult yields -32602
+			// for any (always-unknown) taskId.
+			if (ver.isDraft)
+				throw methodNotFound(method);
 			return doTasksResult(params);
 		case "tasks/cancel":
 			return doTasksCancel(params);
@@ -1636,12 +1657,16 @@ final class McpServer
 	// RPCs. `enableTasks()` advertises support for these, so the server MUST route
 	// them rather than returning -32601 for an advertised operation (#59). This SDK
 	// does not yet drive the two-phase CreateTaskResult flow from `tools/call`, so
-	// no task is ever created: the task store is permanently empty. `tasks/list`
-	// therefore returns an empty page and `tasks/get`/`tasks/result`/`tasks/cancel`
-	// answer with `-32602` (task not found) for any id, per the extension's
-	// "unknown / non-cancellable task" rule. A server that never called
-	// `enableTasks()` does not advertise the capability and MUST NOT serve these
-	// (returns -32601), matching logging/setLevel and resources/subscribe gating.
+	// no task is ever created: the task store is permanently empty. `tasks/get`,
+	// `tasks/result`, and `tasks/cancel` answer with `-32602` (task not found) for
+	// any id under the 2025-11-25 family, per the extension's "unknown /
+	// non-cancellable task" rule, and `tasks/list` returns an empty page. The draft
+	// (`io.modelcontextprotocol/tasks`, SEP-2663) REMOVED `tasks/result`, so on a
+	// draft-negotiated session that method does not exist and is gated in route()
+	// to `-32601` (method not found); `tasks/get`/`tasks/cancel` remain `-32602`.
+	// A server that never called `enableTasks()` does not advertise the capability
+	// and MUST NOT serve these (returns -32601), matching logging/setLevel and
+	// resources/subscribe gating.
 	private void requireTasksAdvertised() @safe
 	{
 		if (tasksCapability.isNull)
@@ -2045,7 +2070,12 @@ final class McpServer
 				response = response.withInputRequests(kept);
 			}
 		}
-		return response.toJson();
+		// Project the final result to the negotiated protocol version so newer
+		// content kinds (audio/resource_link/tool_use/tool_result) and
+		// content-level `_meta`/`lastModified` do not leak to an older peer
+		// (#1/#20). Runs AFTER the MRTR input-request filtering above, mirroring
+		// the tools/call ordering (forVersion last).
+		return response.forVersion(ver).toJson();
 	}
 
 	private Json doComplete(Json params) @safe
@@ -4216,6 +4246,118 @@ unittest  // tasks/* are -32601 when the server never advertised the capability 
 		auto resp = s.handle(req(1, m)).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
 	}
+}
+
+unittest  // draft tasks/result is -32601: SEP-2663 removed it from the draft extension (#5)
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+	Json p = Json.emptyObject;
+	p["taskId"] = "nope";
+	auto resp = s.handle(draftReq(1, "tasks/result", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+}
+
+unittest  // 2025-11-25 tasks/result for an unknown taskId is -32602 (still defined) (#5)
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+	Json p = Json.emptyObject;
+	p["taskId"] = "nope";
+	auto resp = s.handle(req(1, "tasks/result", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // draft tasks/get for an unknown taskId remains -32602 (unchanged by #5)
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+	Json p = Json.emptyObject;
+	p["taskId"] = "nope";
+	auto resp = s.handle(draftReq(1, "tasks/get", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // draft tasks/cancel for an unknown taskId remains -32602 (unchanged by #5)
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+	Json p = Json.emptyObject;
+	p["taskId"] = "nope";
+	auto resp = s.handle(draftReq(1, "tasks/cancel", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // prompts/get downgrades audio content to a text placeholder for a 2024-11-05 peer (#1/#20)
+{
+	// Guards the doGetPrompt wiring of PromptResponse.forVersion: a prompt message
+	// carrying audio content, retrieved by a peer negotiated at 2024-11-05 (where
+	// audio is out-of-schema), must come back as a text placeholder rather than
+	// leaking an `audio` block.
+	auto s = new McpServer("t", "1");
+	Prompt descr = {name: "p"};
+	s.registerDynamicPrompt(descr, (Json) @safe {
+		GetPromptResult r;
+		r.messages = [
+			PromptMessage("user", Content.makeAudio("YWJj", "audio/wav"))
+		];
+		return r;
+	});
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2024-11-05";
+	s.handle(req(1, "initialize", initP)).get;
+
+	Json params = Json.emptyObject;
+	params["name"] = "p";
+	auto resp = s.handle(req(2, "prompts/get", params)).get;
+	assert(resp["result"]["messages"][0]["content"]["type"].get!string == "text");
+}
+
+unittest  // prompts/get downgrades resource_link content for a 2025-03-26 peer (#1/#20)
+{
+	// resource_link is in-schema only from 2025-06-18; a 2025-03-26 peer must see a
+	// text placeholder, exercised through the server dispatch path (not just the
+	// type method).
+	auto s = new McpServer("t", "1");
+	Prompt descr = {name: "p"};
+	s.registerDynamicPrompt(descr, (Json) @safe {
+		GetPromptResult r;
+		r.messages = [
+			PromptMessage("user", Content.makeResourceLink("file:///a", "a"))
+		];
+		return r;
+	});
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2025-03-26";
+	s.handle(req(1, "initialize", initP)).get;
+
+	Json params = Json.emptyObject;
+	params["name"] = "p";
+	auto resp = s.handle(req(2, "prompts/get", params)).get;
+	assert(resp["result"]["messages"][0]["content"]["type"].get!string == "text");
+}
+
+unittest  // prompts/get keeps resource_link content intact for a 2025-06-18 peer (#1/#20)
+{
+	// The projection must NOT over-strip: from 2025-06-18 resource_link is valid,
+	// so it survives the dispatch path unchanged.
+	auto s = new McpServer("t", "1");
+	Prompt descr = {name: "p"};
+	s.registerDynamicPrompt(descr, (Json) @safe {
+		GetPromptResult r;
+		r.messages = [
+			PromptMessage("user", Content.makeResourceLink("file:///a", "a"))
+		];
+		return r;
+	});
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2025-06-18";
+	s.handle(req(1, "initialize", initP)).get;
+
+	Json params = Json.emptyObject;
+	params["name"] = "p";
+	auto resp = s.handle(req(2, "prompts/get", params)).get;
+	assert(resp["result"]["messages"][0]["content"]["type"].get!string == "resource_link");
 }
 
 unittest  // enableTasks: draft server/discover folds tasks into extensions, no top-level (#384)
