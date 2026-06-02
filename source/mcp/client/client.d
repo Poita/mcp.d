@@ -585,6 +585,10 @@ final class McpClient : ClientProtocol
 		// SEP-2322: the opaque requestState the server attached on the prior
 		// round, which the client MUST echo back verbatim on the retry.
 		string requestState;
+		// Hoisted so `maxRounds` is a true cap: after the last bounded round we
+		// return whatever it produced (still an inputRequired result when the
+		// server kept asking) without issuing an extra `tools/call` (#22).
+		CallToolResult result;
 		foreach (round; 0 .. maxRounds)
 		{
 			auto params = buildToolCallParams(name, arguments, progressToken,
@@ -593,7 +597,7 @@ final class McpClient : ClientProtocol
 			// `injectDraftMeta` carries it (and leaves it to win over any sticky
 			// `setLogLevel` default). Empty -> no field.
 			params = withRequestLogLevel(params, logLevel);
-			auto result = CallToolResult.fromJson(rpc("tools/call", params));
+			result = CallToolResult.fromJson(rpc("tools/call", params));
 			if (!result.isInputRequired)
 				return result;
 			// Gather an answer for each requested input. If any cannot be
@@ -612,11 +616,9 @@ final class McpClient : ClientProtocol
 			// when the server sent none).
 			requestState = result.requestState;
 		}
-		// Bound exceeded: return whatever the last round produced (still an
-		// inputRequired result) rather than looping forever.
-		return CallToolResult.fromJson(rpc("tools/call",
-				withRequestLogLevel(buildToolCallParams(name,
-				arguments, progressToken, responses, requestState), logLevel)));
+		// Bound exceeded: return the last bounded round's still-inputRequired
+		// result rather than looping forever (and without an extra round-trip).
+		return result;
 	}
 
 	/// Mint a process-unique string `ProgressToken` for a per-call progress sink.
@@ -966,6 +968,21 @@ final class McpClient : ClientProtocol
 	{
 		return CompleteResult.fromJson(rpc("completion/complete",
 				buildCompleteParams(reference, argumentName, argumentValue, context)));
+	}
+
+	/// `completion/complete`, requesting progress updates for the request. The
+	/// server may then emit `notifications/progress` carrying `progressToken`,
+	/// observable via `onNotification` / `onProgress`. Per
+	/// basic/utilities/progress, the token is sent in `params._meta.progressToken`.
+	/// Mirrors the `ProgressToken` overloads on `callTool` / `readResource` /
+	/// `getPrompt` (#79). `context`, when non-null, supplies previously-resolved
+	/// argument values so the server can give context-aware completions.
+	CompleteResult complete(CompletionReference reference, string argumentName,
+			string argumentValue, ProgressToken progressToken, string[string] context = null) @safe
+	{
+		return CompleteResult.fromJson(rpc("completion/complete",
+				withProgressToken(buildCompleteParams(reference,
+				argumentName, argumentValue, context), progressToken)));
 	}
 
 	/// Build the `completion/complete` request params. Separated from `complete`
@@ -2603,6 +2620,48 @@ unittest  // buildCompleteParams includes the resolved-argument context when giv
 	assert(p["context"]["arguments"]["owner"].get!string == "octocat");
 }
 
+unittest  // #79: complete() ProgressToken overload attaches the token under _meta.progressToken
+{
+	auto c = McpClient.http("http://localhost");
+	Json sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "completion/complete");
+		sent = params;
+		Json r = Json.emptyObject;
+		Json comp = Json.emptyObject;
+		comp["values"] = Json.emptyArray;
+		r["completion"] = comp;
+		return r;
+	};
+
+	c.complete(CompletionReference.forPrompt("greet"), "name", "al", ProgressToken("comp-tok"));
+
+	assert(sent["_meta"]["progressToken"].get!string == "comp-tok");
+	// The base completion params are still shaped as usual.
+	assert(sent["argument"]["name"].get!string == "name");
+	assert(sent["argument"]["value"].get!string == "al");
+}
+
+unittest  // #79: complete() ProgressToken overload still carries the resolved-argument context
+{
+	auto c = McpClient.http("http://localhost");
+	Json sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		sent = params;
+		Json r = Json.emptyObject;
+		Json comp = Json.emptyObject;
+		comp["values"] = Json.emptyArray;
+		r["completion"] = comp;
+		return r;
+	};
+
+	string[string] ctx = ["owner": "octocat"];
+	c.complete(CompletionReference.forPrompt("pr"), "repo", "m", ProgressToken(7L), ctx);
+
+	assert(sent["_meta"]["progressToken"].get!long == 7);
+	assert(sent["context"]["arguments"]["owner"].get!string == "octocat");
+}
+
 unittest  // a string progress token serialises as a string under _meta
 {
 	auto t = ProgressToken("tok-1");
@@ -3074,6 +3133,31 @@ unittest  // MRTR: resolveInputRequest fails for an unknown input type
 	InputResponse answer;
 	const ok = c.resolveInputRequest(InputRequest("x", "bogus", Json.emptyObject), answer);
 	assert(!ok);
+}
+
+unittest  // #22: a server that keeps requesting input stops at exactly maxRounds tools/call requests
+{
+	import mcp.protocol.draft : InputRequiredResult;
+
+	auto c = McpClient.http("http://localhost/mcp");
+	c.onElicitation = (ElicitParams) @safe {
+		return ElicitResult.accept(Json.emptyObject);
+	};
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "tools/call");
+		calls++;
+		// Always answer with an inputRequired result so the loop runs to its bound.
+		InputRequiredResult ir;
+		ir.inputRequests = [InputRequest("q", "elicitation", Json.emptyObject)];
+		return ir.toJson();
+	};
+
+	auto result = c.callTool("work", Json.emptyObject);
+	// The bound (maxRounds == 16) must be a true cap: no extra 17th request after
+	// it is exceeded, and the still-inputRequired result is handed back.
+	assert(calls == 16);
+	assert(result.isInputRequired);
 }
 
 unittest  // listResourceTemplates calls resources/templates/list and auto-paginates
