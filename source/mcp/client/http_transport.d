@@ -75,6 +75,15 @@ final class HttpClientTransport : ClientTransport
 
 	this(string url) @safe
 	{
+		// Audit finding #23: the raw-TCP request paths (postAndAwaitRaw,
+		// resumeViaGet, runServerStream, runListenStream, runLegacyStream) speak
+		// plaintext HTTP/1.1 over a bare `connectTCP` and never negotiate TLS. Until
+		// TLS is wired through every one of those paths, fail fast on a TLS URL
+		// rather than silently downgrading to plaintext on port 80 (which would
+		// break confidentiality AND connectivity for any https:// MCP server).
+		const ep = parseHttpEndpoint(url);
+		if (ep.tls)
+			throw internalError("https URLs are not yet supported by the streaming transport");
 		this.url = url;
 	}
 
@@ -226,16 +235,10 @@ final class HttpClientTransport : ClientTransport
 		import std.string : indexOf, startsWith, strip, toLower;
 		import std.conv : to, parse;
 
-		auto rest = url;
-		const sep = rest.indexOf("://");
-		if (sep >= 0)
-			rest = rest[sep + 3 .. $];
-		const slash = rest.indexOf('/');
-		const hostPort = (slash < 0) ? rest : rest[0 .. slash];
-		const path = (slash < 0) ? "/" : rest[slash .. $];
-		const colon = hostPort.indexOf(':');
-		const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
-		const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
+		const ep = parseHttpEndpoint(url);
+		const host = ep.host;
+		const port = ep.port;
+		const path = ep.path;
 
 		const payload = message.toString();
 		auto hdrs = requestHeaders(message);
@@ -495,16 +498,10 @@ final class HttpClientTransport : ClientTransport
 		import std.string : indexOf, startsWith, strip, toLower;
 		import std.conv : to, parse;
 
-		auto rest = url;
-		const sep = rest.indexOf("://");
-		if (sep >= 0)
-			rest = rest[sep + 3 .. $];
-		const slash = rest.indexOf('/');
-		const hostPort = (slash < 0) ? rest : rest[0 .. slash];
-		const path = (slash < 0) ? "/" : rest[slash .. $];
-		const colon = hostPort.indexOf(':');
-		const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
-		const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
+		const ep = parseHttpEndpoint(url);
+		const host = ep.host;
+		const port = ep.port;
+		const path = ep.path;
 
 		// Protocol-version header for the GET stream (set after initialize).
 		auto verHeaders = requestHeaders(Json.undefined);
@@ -810,16 +807,10 @@ final class HttpClientTransport : ClientTransport
 		import vibe.core.core : sleep;
 
 		// Parse scheme://host[:port]/path.
-		auto rest = url;
-		const sep = rest.indexOf("://");
-		if (sep >= 0)
-			rest = rest[sep + 3 .. $];
-		const slash = rest.indexOf('/');
-		const hostPort = (slash < 0) ? rest : rest[0 .. slash];
-		const path = (slash < 0) ? "/" : rest[slash .. $];
-		const colon = hostPort.indexOf(':');
-		const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
-		const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
+		const ep = parseHttpEndpoint(url);
+		const host = ep.host;
+		const port = ep.port;
+		const path = ep.path;
 
 		// Protocol-version header for the GET stream (set after initialize).
 		auto verHeaders = requestHeaders(Json.undefined);
@@ -1002,16 +993,10 @@ final class HttpClientTransport : ClientTransport
 		import std.string : indexOf, startsWith, strip, toLower;
 		import std.conv : to, parse;
 
-		auto rest = url;
-		const sep = rest.indexOf("://");
-		if (sep >= 0)
-			rest = rest[sep + 3 .. $];
-		const slash = rest.indexOf('/');
-		const hostPort = (slash < 0) ? rest : rest[0 .. slash];
-		const path = (slash < 0) ? "/" : rest[slash .. $];
-		const colon = hostPort.indexOf(':');
-		const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
-		const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
+		const ep = parseHttpEndpoint(url);
+		const host = ep.host;
+		const port = ep.port;
+		const path = ep.path;
 
 		// Protocol-derived headers (version + draft method) for this POST.
 		auto reqHeaders = requestHeaders(message);
@@ -1210,16 +1195,10 @@ final class HttpClientTransport : ClientTransport
 		import std.string : indexOf, startsWith, strip, toLower;
 		import std.conv : to, parse;
 
-		auto rest = url;
-		const sep = rest.indexOf("://");
-		if (sep >= 0)
-			rest = rest[sep + 3 .. $];
-		const slash = rest.indexOf('/');
-		const hostPort = (slash < 0) ? rest : rest[0 .. slash];
-		const path = (slash < 0) ? "/" : rest[slash .. $];
-		const colon = hostPort.indexOf(':');
-		const host = (colon < 0) ? hostPort : hostPort[0 .. colon];
-		const port = (colon < 0) ? 80 : hostPort[colon + 1 .. $].to!ushort;
+		const ep = parseHttpEndpoint(url);
+		const host = ep.host;
+		const port = ep.port;
+		const path = ep.path;
 
 		() @trusted {
 			try
@@ -1367,6 +1346,56 @@ final class HttpClientTransport : ClientTransport
 		const m = ("message" in error) ? error["message"].get!string : "server error";
 		return new McpException(code, m, error);
 	}
+}
+
+/// The parsed components of an MCP endpoint URL, shared by every raw-TCP request
+/// path so host/port/scheme parsing lives in exactly one place (audit finding
+/// #23). `tls` is true for an `https://`/`wss://` scheme; `port` defaults to the
+/// scheme's well-known port (443 when `tls`, else 80) when the URL omits it, so a
+/// TLS URL can never be silently treated as plaintext on port 80.
+struct HttpEndpoint
+{
+	string host;
+	ushort port;
+	string path;
+	bool tls;
+}
+
+/// Parse `scheme://host[:port][/path]` into its components, defaulting the port
+/// to 443 for a TLS scheme (https/wss) and 80 otherwise. An absent path becomes
+/// "/". Tolerates a missing scheme (treated as non-TLS). See `HttpEndpoint`.
+HttpEndpoint parseHttpEndpoint(string url) @safe
+{
+	import std.string : indexOf, toLower;
+	import std.conv : to;
+
+	HttpEndpoint ep;
+	auto rest = url;
+	string scheme;
+	const sep = rest.indexOf("://");
+	if (sep >= 0)
+	{
+		scheme = rest[0 .. sep].toLower;
+		rest = rest[sep + 3 .. $];
+	}
+	ep.tls = scheme == "https" || scheme == "wss";
+
+	const slash = rest.indexOf('/');
+	const hostPort = (slash < 0) ? rest : rest[0 .. slash];
+	ep.path = (slash < 0) ? "/" : rest[slash .. $];
+
+	const colon = hostPort.indexOf(':');
+	ep.host = (colon < 0) ? hostPort : hostPort[0 .. colon];
+	if (colon < 0)
+		ep.port = ep.tls ? cast(ushort) 443 : cast(ushort) 80;
+	else
+	{
+		try
+			ep.port = hostPort[colon + 1 .. $].to!ushort;
+		catch (Exception)
+			ep.port = ep.tls ? cast(ushort) 443 : cast(ushort) 80;
+	}
+	return ep;
 }
 
 /// Whether an HTTP status from the initial modern POST should trigger the
@@ -1517,6 +1546,46 @@ string resolveEndpointUri(string baseUrl, string endpoint) @safe
 	const lastSlash = basePath.lastIndexOf('/');
 	string dir = (lastSlash < 0) ? "/" : basePath[0 .. lastSlash + 1];
 	return origin ~ dir ~ endpoint;
+}
+
+unittest  // #23: parseHttpEndpoint defaults the port per scheme (443 for TLS)
+{
+	// https/wss default to 443; http and a bare host to 80. An explicit port wins.
+	auto h = parseHttpEndpoint("http://host/mcp");
+	assert(!h.tls && h.port == 80 && h.host == "host" && h.path == "/mcp");
+
+	auto s = parseHttpEndpoint("https://host/mcp");
+	assert(s.tls && s.port == 443 && s.host == "host" && s.path == "/mcp");
+
+	auto sp = parseHttpEndpoint("https://host:8443/x");
+	assert(sp.tls && sp.port == 8443);
+
+	auto ws = parseHttpEndpoint("wss://host");
+	assert(ws.tls && ws.port == 443 && ws.path == "/");
+
+	auto bare = parseHttpEndpoint("host:9000/p");
+	assert(!bare.tls && bare.port == 9000 && bare.host == "host" && bare.path == "/p");
+}
+
+unittest  // #23: an https URL fails fast instead of silently downgrading to port 80
+{
+	import mcp.protocol.errors : McpException;
+
+	bool threw;
+	try
+		new HttpClientTransport("https://example.com/mcp");
+	catch (McpException e)
+	{
+		threw = true;
+		import std.algorithm : canFind;
+
+		assert(e.msg.canFind("https"));
+	}
+	assert(threw);
+
+	// A plaintext http URL still constructs fine (the common case is unaffected).
+	auto ok = new HttpClientTransport("http://127.0.0.1:8080/mcp");
+	assert(ok !is null);
 }
 
 unittest  // parseHttpStatus reads the code out of an HTTP status line

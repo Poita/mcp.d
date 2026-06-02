@@ -1,6 +1,6 @@
 module mcp.transport.session;
 
-import core.sync.mutex : Mutex;
+import mcp.protocol.errors : McpException, internalError;
 
 /// Tracks active Streamable HTTP sessions for a server mount.
 ///
@@ -10,16 +10,21 @@ import core.sync.mutex : Mutex;
 /// (HTTP 400 when absent, HTTP 404 when unknown/terminated), and supports
 /// client-driven termination via HTTP DELETE.
 ///
-/// The store is thread-safe: vibe.d may dispatch concurrent requests on different
-/// fibers/threads, and a single coordinator/mount is shared across them.
+/// Concurrency: the SDK ships and is supported only on vibe.d's default
+/// single-threaded event loop, where requests are dispatched cooperatively on
+/// fibers of one thread and `create`/`isActive`/`terminate` are each a single
+/// synchronous associative-array operation with no intervening yield -- so they
+/// are race-free among fibers without locking, matching the single-fiber model
+/// the coordinators document (see `mcp.transport.sse_context`). Running the
+/// router with `HTTPServerOption.distribute` or worker threads is unsupported;
+/// all shared coordinator/session state would then need fiber-and-thread-aware
+/// locking.
 final class SessionManager
 {
-	private Mutex mutex;
 	private bool[string] active;
 
 	this() @safe
 	{
-		mutex = new Mutex;
 	}
 
 	/// Generate a new cryptographically-secure session id, record it as active,
@@ -29,10 +34,7 @@ final class SessionManager
 	string create() @safe
 	{
 		const id = generateSessionId();
-		() @trusted {
-			synchronized (mutex)
-				active[id] = true;
-		}();
+		active[id] = true;
 		return id;
 	}
 
@@ -41,10 +43,7 @@ final class SessionManager
 	{
 		if (id.length == 0)
 			return false;
-		return () @trusted {
-			synchronized (mutex)
-				return (id in active) !is null;
-		}();
+		return (id in active) !is null;
 	}
 
 	/// Terminate `id`. Returns true if the session existed (and was removed),
@@ -53,15 +52,10 @@ final class SessionManager
 	{
 		if (id.length == 0)
 			return false;
-		return () @trusted {
-			synchronized (mutex)
-			{
-				if ((id in active) is null)
-					return false;
-				active.remove(id);
-				return true;
-			}
-		}();
+		if ((id in active) is null)
+			return false;
+		active.remove(id);
+		return true;
 	}
 }
 
@@ -78,10 +72,17 @@ string generateSessionId() @safe
 	return s;
 }
 
-/// Fill `dst` with cryptographically-secure random bytes, falling back to the
-/// std.random PRNG only if the OS source is unavailable.
+/// Fill `dst` with cryptographically-secure random bytes drawn from the host
+/// OS's CSPRNG (`/dev/urandom` on Posix, `BCryptGenRandom` on Windows). There is
+/// deliberately NO `std.random` fallback: a Mersenne-Twister-derived id would be
+/// predictable and would weaken session-hijacking protection (audit finding #27).
+/// If no OS crypto source can be read, this fails closed by throwing rather than
+/// emitting a non-cryptographic id.
 private void fillSecureRandom(ubyte[] dst) @trusted
 {
+	if (dst.length == 0)
+		return;
+
 	version (Posix)
 	{
 		import std.stdio : File;
@@ -96,13 +97,35 @@ private void fillSecureRandom(ubyte[] dst) @trusted
 		catch (Exception)
 		{
 		}
+		throw internalError(
+				"unable to read cryptographically-secure random bytes from /dev/urandom");
 	}
-	// Fallback: still unpredictable enough to avoid collisions; the OS source
-	// above is the primary path on every supported platform.
-	import std.random : rndGen, uniform;
+	else version (Windows)
+	{
+		// BCryptGenRandom with BCRYPT_USE_SYSTEM_PREFERRED_RNG draws from the
+		// system-preferred CSPRNG without needing an algorithm handle. NTSTATUS 0
+		// (STATUS_SUCCESS) indicates success.
+		import core.sys.windows.windows : ULONG, PUCHAR;
 
-	foreach (ref b; dst)
-		b = cast(ubyte) uniform(0, 256);
+		alias NTSTATUS = int;
+		enum ULONG BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002;
+
+		extern (Windows) NTSTATUS BCryptGenRandom(void* hAlgorithm,
+				PUCHAR pbBuffer, ULONG cbBuffer, ULONG dwFlags) nothrow @nogc;
+
+		const status = BCryptGenRandom(null, cast(PUCHAR) dst.ptr,
+				cast(ULONG) dst.length, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+		if (status == 0)
+			return;
+		throw internalError(
+				"BCryptGenRandom failed to provide cryptographically-secure random bytes");
+	}
+	else
+	{
+		// Fail closed on any platform without a known OS CSPRNG rather than
+		// emitting a predictable id.
+		throw internalError("no cryptographically-secure random source available on this platform");
+	}
 }
 
 unittest  // generated ids are visible-ASCII hex of the expected length
@@ -119,6 +142,25 @@ unittest  // distinct sessions get distinct ids
 	const a = mgr.create();
 	const b = mgr.create();
 	assert(a != b);
+}
+
+unittest  // the secure source actually fills the buffer (not all zero) and varies
+{
+	// Audit finding #27: the id MUST come from an OS CSPRNG, never the std.random
+	// Mt19937 fallback (which was removed). Two consecutive 256-bit draws being
+	// distinct, and not all-zero, demonstrates the secure path ran rather than an
+	// untouched/constant buffer.
+	const a = generateSessionId();
+	const b = generateSessionId();
+	assert(a != b);
+	bool allZero = true;
+	foreach (c; a)
+		if (c != '0')
+		{
+			allZero = false;
+			break;
+		}
+	assert(!allZero);
 }
 
 unittest  // a freshly-created session is active
