@@ -1,4 +1,4 @@
-/// Tests that the public API is tiered (issue #301).
+/// Tests that the public API is tiered.
 ///
 /// The bare `import mcp;` must expose a curated, stable surface: protocol
 /// types, `McpServer` / `McpClient`, the UDA / reflection API, and the error
@@ -30,9 +30,9 @@ version (unittest)
 
 	// Helper: is the fully-qualified module member `fqn` reachable by name from
 	// this module (`mcp.api.public_surface_test`, in package `mcp.api`)? A
-	// symbol demoted to plain `package` visibility lives in package `mcp.auth`
-	// and therefore must NOT resolve here, even though the importing module is
-	// itself under the `mcp` tree (issue #303).
+	// symbol with plain `package` visibility lives in package `mcp.auth` and
+	// therefore must NOT resolve here, even though the importing module is
+	// itself under the `mcp` tree.
 	private enum reachableHere(string fqn) = __traits(compiles, {
 			mixin("import " ~ moduleOf(fqn) ~ ";");
 			mixin("alias _ = " ~ fqn ~ ";");
@@ -76,7 +76,7 @@ unittest
 
 // User-facing draft result/hint types referenced by lean-surface members
 // (`McpServer.setListCacheHint(string, CacheHint)` and `McpClient.discover()`
-// returning `DiscoverResult`) must be usable with `import mcp;` alone (#399).
+// returning `DiscoverResult`) must be usable with `import mcp;` alone.
 unittest
 {
 	static assert(visibleFromMcp!"DiscoverResult");
@@ -86,7 +86,7 @@ unittest
 }
 
 // A user with only `import mcp;` can construct a CacheHint to call
-// setListCacheHint and name DiscoverResult to hold discover()'s return (#399).
+// setListCacheHint and name DiscoverResult to hold discover()'s return.
 unittest
 {
 	import mcp;
@@ -101,7 +101,7 @@ unittest
 	assert(r.toJson()["supportedVersions"][0].get!string == "2025-11-25");
 }
 
-// Auth verifier internals are NOT dumped at the top level (#301).
+// Auth verifier internals are NOT dumped at the top level.
 unittest
 {
 	static assert(!visibleFromMcp!"jwtVerifier");
@@ -109,14 +109,14 @@ unittest
 	static assert(!visibleFromMcp!"verifyJws");
 }
 
-// OAuth-proxy plumbing is NOT dumped at the top level (#301).
+// OAuth-proxy plumbing is NOT dumped at the top level.
 unittest
 {
 	static assert(!visibleFromMcp!"mountOAuthProxy");
 	static assert(!visibleFromMcp!"buildClientCallbackRedirect");
 }
 
-// Transport / SSE helpers are NOT dumped at the top level (#301).
+// Transport / SSE helpers are NOT dumped at the top level.
 unittest
 {
 	static assert(!visibleFromMcp!"sseStreamHeaders");
@@ -124,7 +124,7 @@ unittest
 	static assert(!visibleFromMcp!"formatSseEvent");
 }
 
-// draft's internal transport helpers are NOT dumped at the top level (#301).
+// draft's internal transport helpers are NOT dumped at the top level.
 unittest
 {
 	static assert(!visibleFromMcp!"encodeHeaderValue");
@@ -149,8 +149,8 @@ unittest
 }
 
 // jwt_verifier internals are package-private: not reachable from another
-// sub-package of the mcp tree (issue #303). Only jwtVerifier / JwtVerifierConfig
-// / TokenInfo are documented entry points.
+// sub-package of the mcp tree. Only jwtVerifier / JwtVerifierConfig / TokenInfo
+// are documented entry points.
 unittest
 {
 	static assert(!reachableHere!"mcp.auth.jwt_verifier.verifyJws");
@@ -160,7 +160,7 @@ unittest
 	static assert(!reachableHere!"mcp.auth.jwt_verifier.validateClaims");
 }
 
-// The JWT verifier's key-source machinery is internal too (issue #303).
+// The JWT verifier's key-source machinery is internal too.
 unittest
 {
 	static assert(!reachableHere!"mcp.auth.jwt_verifier.Jwk");
@@ -169,7 +169,7 @@ unittest
 	static assert(!reachableHere!"mcp.auth.jwt_verifier.verifyToken");
 }
 
-// The documented JWT entry points stay public (issue #303).
+// The documented JWT entry points stay public.
 unittest
 {
 	static assert(reachableHere!"mcp.auth.jwt_verifier.jwtVerifier");
@@ -177,7 +177,7 @@ unittest
 }
 
 // OAuth request-form builders + query-param extraction are internal helpers,
-// not part of the documented public surface (issue #303).
+// not part of the documented public surface.
 unittest
 {
 	static assert(!reachableHere!"mcp.auth.oauth.buildAuthCodeTokenForm");
@@ -189,7 +189,7 @@ unittest
 }
 
 // MCPServer.toolInputSchema is a core->transport hook, not external API: its
-// visibility is `package` (package(mcp)), not `public` (issue #303).
+// visibility is `package` (package(mcp)), not `public`.
 unittest
 {
 	import mcp.server.server : McpServer;
