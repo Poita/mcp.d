@@ -20,7 +20,12 @@ import mcp.auth.oauth;
 /// `authorizeCallback`; everything else is handled here.
 final class OAuthClient
 {
-	/// The canonical resource indicator (the MCP server URL).
+	/// The canonical resource indicator (the MCP server URL). MANDATORY for the
+	/// MCP authorization/token flows: per RFC 8707 the `resource` indicator MUST
+	/// be sent on the authorization and token requests regardless of whether the
+	/// authorization server advertises support, so `authorizationUrl`,
+	/// `exchangeCode`, `refresh`, and `clientCredentials` reject an empty value.
+	/// `useOAuth` sets this to the canonical MCP server URI automatically.
 	string resource;
 	/// The client's redirect URI for the auth-code flow.
 	string redirectUri = "http://localhost:8765/callback";
@@ -61,7 +66,12 @@ final class OAuthClient
 		if (wwwAuthenticateHeader.length)
 		{
 			const w = parseWwwAuthenticate(wwwAuthenticateHeader);
-			if (w.resourceMetadata.length)
+			// RFC 9728: the attacker-influenced resource_metadata URL from the
+			// WWW-Authenticate challenge must be HTTPS (or loopback for dev), must
+			// not target an internal/link-local address, and its origin MUST match
+			// the MCP endpoint's origin before we fetch it.
+			if (w.resourceMetadata.length && isSecureFetchUrl(w.resourceMetadata)
+					&& originOf(w.resourceMetadata) == originOf(mcpEndpoint))
 				urls ~= w.resourceMetadata;
 		}
 		urls ~= protectedResourceMetadataUrls(mcpEndpoint);
@@ -197,6 +207,7 @@ final class OAuthClient
 			RegisteredClient client, string code, string codeVerifier) @safe
 	{
 		requirePkceSupport(as_);
+		requireResource();
 		const post = authMethod == TokenEndpointAuthMethod.clientSecretPost;
 		auto form = buildAuthCodeTokenForm(code, redirectUri, codeVerifier,
 				client.clientId, resource, post ? client.clientSecret : "") ~ clientAssertionParams(
@@ -208,6 +219,7 @@ final class OAuthClient
 	TokenSet clientCredentials(AuthorizationServerMetadata as_,
 			RegisteredClient client, string scopeStr = "") @safe
 	{
+		requireResource();
 		const post = authMethod == TokenEndpointAuthMethod.clientSecretPost;
 		auto form = buildClientCredentialsForm(client.clientId, scopeStr,
 				resource, post ? client.clientSecret : "") ~ clientAssertionParams(client.clientId,
@@ -236,6 +248,7 @@ final class OAuthClient
 	/// Refresh an access token.
 	TokenSet refresh(AuthorizationServerMetadata as_, RegisteredClient client, string refreshToken) @safe
 	{
+		requireResource();
 		auto form = buildRefreshTokenForm(refreshToken, client.clientId, resource);
 		return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
 	}
@@ -245,8 +258,22 @@ final class OAuthClient
 			RegisteredClient client, PkcePair pkce, string scopeStr, string state) @safe
 	{
 		requirePkceSupport(as_);
+		requireResource();
 		return buildAuthorizationUrl(as_.authorizationEndpoint, client.clientId,
 				redirectUri, pkce.challenge, scopeStr, resource, state);
+	}
+
+	/// Enforce that the RFC 8707 `resource` indicator (the canonical MCP server
+	/// URI) is set before an MCP authorization/token request. The MCP
+	/// authorization spec requires the `resource` parameter be sent regardless of
+	/// whether the AS advertises support, so a missing value is a configuration
+	/// error rather than something to silently omit.
+	private void requireResource() @safe
+	{
+		if (resource.length == 0)
+			throw invalidRequest(
+					"OAuthClient.resource (RFC 8707 resource indicator) must be set to the canonical "
+					~ "MCP server URI before authorization/token requests");
 	}
 
 	/// Enforce the MCP authorization MUST around PKCE support. Per the spec
@@ -407,6 +434,10 @@ final class OAuthClient
 
 	private bool tryGetJson(string url, out Json result) @safe
 	{
+		// Never fetch a discovery URL that is not HTTPS (or loopback for dev) or
+		// that targets an internal/link-local address (SSRF mitigation).
+		if (!isSecureFetchUrl(url))
+			return false;
 		bool ok;
 		Json parsed;
 		() @trusted {
@@ -433,6 +464,7 @@ final class OAuthClient
 
 	private Json postJson(string url, Json payload) @safe
 	{
+		requireSecureUrl(url);
 		Json result;
 		() @trusted {
 			requestHTTP(url, (scope HTTPClientRequest req) {
@@ -450,6 +482,7 @@ final class OAuthClient
 
 	private Json postForm(string url, string form, RegisteredClient client) @safe
 	{
+		requireSecureUrl(url);
 		Json result;
 		const useBasic = authMethod == TokenEndpointAuthMethod.clientSecretBasic
 			&& client.clientSecret.length;
@@ -474,6 +507,7 @@ final class OAuthClient
 unittest  // CIMD client uses the configured HTTPS-URL client_id when advertised
 {
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	c.clientIdMetadataUrl = "https://app.example.com/oauth/client.json";
 	AuthorizationServerMetadata as_;
 	as_.clientIdMetadataDocumentSupported = true;
@@ -487,6 +521,7 @@ unittest  // CIMD client refuses when the AS does not advertise support
 	import std.exception : assertThrown;
 
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	c.clientIdMetadataUrl = "https://app.example.com/oauth/client.json";
 	AuthorizationServerMetadata as_; // clientIdMetadataDocumentSupported == false
 	assertThrown(c.clientIdMetadataClient(as_));
@@ -497,6 +532,7 @@ unittest  // CIMD client refuses an invalid (non-https / pathless) client_id URL
 	import std.exception : assertThrown;
 
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	c.clientIdMetadataUrl = "https://app.example.com"; // no path component
 	AuthorizationServerMetadata as_;
 	as_.clientIdMetadataDocumentSupported = true;
@@ -506,6 +542,7 @@ unittest  // CIMD client refuses an invalid (non-https / pathless) client_id URL
 unittest  // registrationApproach prefers CIMD over DCR when advertised
 {
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	c.clientIdMetadataUrl = "https://app.example.com/oauth/client.json";
 	AuthorizationServerMetadata as_;
 	as_.clientIdMetadataDocumentSupported = true;
@@ -518,6 +555,7 @@ unittest  // registrationApproach prefers CIMD over DCR when advertised
 unittest  // the CIMD authorization URL carries the URL client_id verbatim
 {
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	c.clientIdMetadataUrl = "https://app.example.com/oauth/client.json";
 	c.redirectUri = "http://localhost:8765/callback";
 	AuthorizationServerMetadata as_;
@@ -536,6 +574,7 @@ unittest  // the CIMD authorization URL carries the URL client_id verbatim
 unittest  // clientIdMetadataDocument builds a hostable document for the URL
 {
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	c.clientIdMetadataUrl = "https://app.example.com/oauth/client.json";
 	c.redirectUri = "http://localhost:8765/callback";
 	auto d = c.clientIdMetadataDocument("dlang-mcp", "mcp:read");
@@ -555,6 +594,7 @@ unittest  // authorizationUrl proceeds when the AS advertises no PKCE methods (a
 	// code_challenge_methods_supported at all. Absence is NOT a signal that PKCE
 	// is unsupported, so the client proceeds and uses S256 regardless.
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	AuthorizationServerMetadata as_;
 	as_.authorizationEndpoint = "https://as.example.com/authorize";
 	// No code_challenge_methods_supported advertised.
@@ -568,6 +608,7 @@ unittest  // authorizationUrl refuses when only non-S256 PKCE methods are advert
 	import std.exception : assertThrown;
 
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	AuthorizationServerMetadata as_;
 	as_.authorizationEndpoint = "https://as.example.com/authorize";
 	as_.codeChallengeMethodsSupported = ["plain"]; // S256 not offered
@@ -580,6 +621,7 @@ unittest  // authorizationUrl proceeds when the AS advertises S256 PKCE support
 	import std.algorithm : canFind;
 
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	AuthorizationServerMetadata as_;
 	as_.authorizationEndpoint = "https://as.example.com/authorize";
 	as_.codeChallengeMethodsSupported = ["S256"];
@@ -593,6 +635,7 @@ unittest  // exchangeCode refuses when the AS advertises non-S256 PKCE methods o
 	import std.exception : assertThrown;
 
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	AuthorizationServerMetadata as_;
 	as_.tokenEndpoint = "https://as.example.com/token";
 	as_.codeChallengeMethodsSupported = ["plain"]; // S256 not offered -> MUST refuse.
@@ -607,6 +650,7 @@ unittest  // discoverAuthServer no-metadata fallback proceeds (absence allows S2
 	// PKCE methods. Absence must NOT block the public authorization path; the
 	// client proceeds and uses S256, matching the endpoint-fallback scenario.
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	AuthorizationServerMetadata as_;
 	as_.issuer = "https://as.example.com";
 	as_.authorizationEndpoint = "https://as.example.com/authorize";
@@ -625,6 +669,7 @@ unittest  // discovered AS document missing code_challenge_methods_supported -> 
 	// metadata document was discovered but omits code_challenge_methods_supported,
 	// the AS does not support PKCE and MCP clients MUST refuse to proceed.
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	AuthorizationServerMetadata as_;
 	as_.authorizationEndpoint = "https://as.example.com/authorize";
 	as_.metadataDocumentDiscovered = true; // came from a discovered document
@@ -638,6 +683,7 @@ unittest  // discovered AS document missing code_challenge_methods_supported -> 
 	import std.exception : assertThrown;
 
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	AuthorizationServerMetadata as_;
 	as_.tokenEndpoint = "https://as.example.com/token";
 	as_.metadataDocumentDiscovered = true;
@@ -653,6 +699,7 @@ unittest  // AuthorizationServerMetadata.fromJson on a document lacking PKCE -> 
 	// A genuine discovered document that omits code_challenge_methods_supported
 	// must be rejected: fromJson marks it discovered, so requirePkceSupport throws.
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	auto j = parseJsonString(`{"issuer":"https://as.example.com","authorization_endpoint":"https://as.example.com/authorize"}`);
 	auto as_ = AuthorizationServerMetadata.fromJson(j);
 	assert(as_.metadataDocumentDiscovered);
@@ -667,6 +714,7 @@ unittest  // discovered AS document advertising S256 -> proceeds
 	import vibe.data.json : parseJsonString;
 
 	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
 	auto j = parseJsonString(`{"issuer":"https://as.example.com",`
 			~ `"authorization_endpoint":"https://as.example.com/authorize",`
 			~ `"code_challenge_methods_supported":["S256"]}`);
@@ -675,4 +723,69 @@ unittest  // discovered AS document advertising S256 -> proceeds
 	auto pkce = makePkce(new ubyte[32]);
 	auto url = c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st");
 	assert(url.canFind("code_challenge_method=S256"));
+}
+
+unittest  // authorizationUrl refuses when the RFC 8707 resource indicator is unset
+{
+	import std.exception : assertThrown;
+
+	// The MCP authorization spec requires the `resource` indicator be sent on the
+	// authorization request regardless of AS support; an unset resource is a
+	// configuration error that must be rejected.
+	auto c = new OAuthClient();
+	// c.resource left empty.
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "https://as.example.com/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto pkce = makePkce(new ubyte[32]);
+	assertThrown(c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st"));
+}
+
+unittest  // exchangeCode refuses when the RFC 8707 resource indicator is unset
+{
+	import std.exception : assertThrown;
+
+	auto c = new OAuthClient();
+	// c.resource left empty.
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = "https://as.example.com/token";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	assertThrown(c.exchangeCode(as_, RegisteredClient("cid", ""), "code", "verifier"));
+}
+
+unittest  // refresh refuses when the RFC 8707 resource indicator is unset
+{
+	import std.exception : assertThrown;
+
+	auto c = new OAuthClient();
+	// c.resource left empty.
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = "https://as.example.com/token";
+	assertThrown(c.refresh(as_, RegisteredClient("cid", ""), "rt"));
+}
+
+unittest  // clientCredentials refuses when the RFC 8707 resource indicator is unset
+{
+	import std.exception : assertThrown;
+
+	auto c = new OAuthClient();
+	// c.resource left empty.
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = "https://as.example.com/token";
+	assertThrown(c.clientCredentials(as_, RegisteredClient("cid", ""), "scope"));
+}
+
+unittest  // discoverProtectedResource ignores a cross-origin resource_metadata URL
+{
+	// RFC 9728: a resource_metadata URL from WWW-Authenticate whose origin does
+	// not match the MCP endpoint origin must not be fetched. With no reachable
+	// well-known document either, discovery fails (rather than fetching the
+	// attacker-supplied URL).
+	import std.exception : assertThrown;
+
+	auto c = new OAuthClient();
+	const www = `Bearer resource_metadata="https://evil.example.com/.well-known/oauth-protected-resource"`;
+	// The MCP endpoint origin (loopback) differs from the challenge's origin, and
+	// the loopback well-known URLs are unreachable in the test, so discovery throws.
+	assertThrown(c.discoverProtectedResource("http://127.0.0.1:1/mcp", www));
 }

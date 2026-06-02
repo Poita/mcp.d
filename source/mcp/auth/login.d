@@ -262,6 +262,8 @@ struct LoopbackCapture
 {
 	string code;
 	string state;
+	/// RFC 9207 `iss` authorization-response parameter (empty when absent).
+	string iss;
 	string error;
 	string errorDescription;
 
@@ -283,6 +285,7 @@ LoopbackCapture parseLoopbackCallback(string requestTarget, string expectedState
 	LoopbackCapture c;
 	c.code = extractQueryParam(requestTarget, "code");
 	c.state = extractQueryParam(requestTarget, "state");
+	c.iss = extractQueryParam(requestTarget, "iss");
 	c.error = extractQueryParam(requestTarget, "error");
 	c.errorDescription = extractQueryParam(requestTarget, "error_description");
 
@@ -392,8 +395,11 @@ string defaultTokenStorePath() @safe
 	return buildPath(base, "dlang-mcp", "tokens.json");
 }
 
-/// The canonical resource URI for `mcpEndpoint` (drops a trailing slash and any
-/// fragment), per the MCP authorization "Canonical Server URI" rules.
+/// The canonical resource URI for `mcpEndpoint`, per the MCP authorization
+/// "Canonical Server URI" rules: drop any fragment and a single trailing slash,
+/// and lowercase the scheme + authority (host[:port]) while leaving the path
+/// case untouched (matching `mcp.auth.oauth.canonicalResourceUri`). Kept
+/// `@safe pure nothrow` by lowercasing in place rather than calling `toLower`.
 string canonicalResource(string mcpEndpoint) @safe pure nothrow
 {
 	import std.string : indexOf;
@@ -404,7 +410,25 @@ string canonicalResource(string mcpEndpoint) @safe pure nothrow
 		s = s[0 .. hash];
 	if (s.length > 1 && s[$ - 1] == '/')
 		s = s[0 .. $ - 1];
-	return s;
+
+	// Lowercase the scheme + authority (everything up to the first '/' after
+	// "://"), leaving the path untouched. `toLower` is neither pure nor nothrow,
+	// so fold ASCII case manually to preserve this function's contract.
+	const schemeEnd = s.indexOf("://");
+	if (schemeEnd < 0)
+		return s;
+	const afterScheme = schemeEnd + 3;
+	const slash = s[afterScheme .. $].indexOf('/');
+	const authorityEnd = (slash < 0) ? s.length : afterScheme + slash;
+	char[] buf = new char[s.length];
+	foreach (i, ch; s)
+	{
+		char c = ch;
+		if (i < authorityEnd && c >= 'A' && c <= 'Z')
+			c = cast(char)(c + 32);
+		buf[i] = c;
+	}
+	return () @trusted { return cast(string) buf; }();
 }
 
 /// Generate a random `state` value (base64url, 16 bytes of randomness) for the
@@ -636,6 +660,25 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	return new OAuthSession(oauth, as_, rc, store, oauth.resource, stored);
 }
 
+/// Apply the RFC 9207 `iss` authorization-response validation to a captured
+/// loopback redirect, given the selected authorization server's metadata.
+/// Returns the capture unchanged when `iss` is acceptable; otherwise clears the
+/// authorization `code` and records an `invalid_iss` error so the capture's
+/// `ok` is false and the caller rejects it. The validation runs regardless of
+/// any returned `error`/`error_description`, which are not acted on, mirroring
+/// the two-arg `OAuthClient.authorizeAndGetCode(as_, ...)` overload.
+LoopbackCapture enforceIssOnCapture(LoopbackCapture cap, AuthorizationServerMetadata as_) @safe
+{
+	if (validateAuthorizationResponseIss(cap.iss, as_.issuer,
+			as_.authorizationResponseIssParameterSupported))
+		return cap;
+	cap.code = "";
+	cap.error = "invalid_iss";
+	cap.errorDescription = "authorization response failed RFC 9207 'iss' validation "
+		~ "(possible mix-up attack)";
+	return cap;
+}
+
 /// Open the browser at the authorization URL and run a localhost loopback HTTP
 /// listener to capture the redirect. Blocks (on the vibe event loop) until the
 /// redirect arrives, then returns the captured authorization response.
@@ -658,6 +701,11 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationS
 	void handle(scope HTTPServerRequest req, scope HTTPServerResponse res) @safe
 	{
 		auto cap = parseLoopbackCallback(req.requestURI, state);
+		// RFC 9207 mix-up protection: validate the `iss` authorization-response
+		// parameter against the selected AS's recorded issuer BEFORE the token
+		// exchange (the spec requires this regardless of whether an error param
+		// was returned; the error/error_description are not otherwise acted on).
+		cap = enforceIssOnCapture(cap, as_);
 		if (!done)
 		{
 			result = cap;
@@ -827,6 +875,16 @@ unittest  // canonicalResource drops a trailing slash and any fragment
 	assert(canonicalResource("https://mcp.example.com#frag") == "https://mcp.example.com");
 }
 
+unittest  // canonicalResource lowercases scheme+host but preserves the path case
+{
+	// Per the spec's canonical-server-URI rule (and matching canonicalResourceUri):
+	// the scheme and host are lowercased while the path is left untouched.
+	assert(canonicalResource("https://MCP.Example.com/Mcp") == "https://mcp.example.com/Mcp");
+	assert(canonicalResource("HTTPS://MCP.Example.com/Mcp/") == "https://mcp.example.com/Mcp");
+	assert(canonicalResource(
+			"https://MCP.Example.com:8443/Path#frag") == "https://mcp.example.com:8443/Path");
+}
+
 unittest  // scopeString space-joins the requested scopes
 {
 	OAuthLogin o;
@@ -980,4 +1038,83 @@ unittest  // a refresh that returns no access token is an error
 	};
 	auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
 	assertThrown(sess.bearerForRequest(5000));
+}
+
+unittest  // parseLoopbackCallback extracts the RFC 9207 iss parameter
+{
+	auto c = parseLoopbackCallback("/callback?code=abc&state=s&iss=https%3A%2F%2Fas.example.com");
+	assert(c.iss == "https://as.example.com");
+}
+
+unittest  // enforceIssOnCapture rejects a mismatched iss (mix-up attack)
+{
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.authorizationResponseIssParameterSupported = true;
+
+	LoopbackCapture cap;
+	cap.code = "good-code";
+	cap.iss = "https://evil.example.com";
+	auto checked = enforceIssOnCapture(cap, as_);
+	assert(checked.code == "");
+	assert(!checked.ok);
+	assert(checked.error == "invalid_iss");
+}
+
+unittest  // enforceIssOnCapture rejects an absent iss when the AS advertises support
+{
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.authorizationResponseIssParameterSupported = true;
+
+	LoopbackCapture cap;
+	cap.code = "good-code";
+	// cap.iss intentionally empty.
+	auto checked = enforceIssOnCapture(cap, as_);
+	assert(checked.code == "");
+	assert(!checked.ok);
+}
+
+unittest  // enforceIssOnCapture accepts a matching iss
+{
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.authorizationResponseIssParameterSupported = true;
+
+	LoopbackCapture cap;
+	cap.code = "good-code";
+	cap.iss = "https://as.example.com";
+	auto checked = enforceIssOnCapture(cap, as_);
+	assert(checked.code == "good-code");
+	assert(checked.ok);
+}
+
+unittest  // enforceIssOnCapture accepts an absent iss when the AS does not advertise support
+{
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.authorizationResponseIssParameterSupported = false;
+
+	LoopbackCapture cap;
+	cap.code = "good-code";
+	auto checked = enforceIssOnCapture(cap, as_);
+	assert(checked.ok);
+}
+
+unittest  // enforceIssOnCapture runs even on an error response (does not act on the error)
+{
+	// The iss check must gate before token exchange regardless of a returned
+	// error param: a mismatched iss on an error response is still rejected as an
+	// iss failure (the error/error_description are not surfaced/acted on).
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.authorizationResponseIssParameterSupported = true;
+
+	LoopbackCapture cap;
+	cap.error = "access_denied";
+	cap.errorDescription = "user said no";
+	cap.iss = "https://evil.example.com";
+	auto checked = enforceIssOnCapture(cap, as_);
+	assert(!checked.ok);
+	assert(checked.error == "invalid_iss");
 }

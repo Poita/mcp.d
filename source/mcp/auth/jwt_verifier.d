@@ -501,6 +501,12 @@ private string fetchJwks(string uri) @trusted
 	import vibe.http.client : requestHTTP, HTTPClientRequest, HTTPClientResponse;
 	import vibe.http.common : HTTPMethod;
 	import vibe.stream.operations : readAllUTF8;
+	import mcp.auth.oauth : isSecureFetchUrl;
+
+	// Refuse to fetch a JWKS over an insecure transport (must be https, or http
+	// to a loopback host for dev) or from an internal/link-local address.
+	if (!isSecureFetchUrl(uri))
+		return null;
 
 	string body_;
 	try
@@ -895,4 +901,23 @@ unittest  // jwtVerifier returns a usable TokenValidator that rejects garbage
 	TokenValidator v = jwtVerifier(cfg);
 	assert(!v("not-a-jwt").valid);
 	assert(!v("a.b.c").valid);
+}
+
+unittest  // JwksCache refuses to fetch from an insecure (plaintext http) JWKS URI
+{
+	import core.time : seconds;
+
+	// fetchJwks rejects a plaintext-http, non-loopback URI before any network
+	// call, so no keys are ever loaded (the verifier cannot be tricked into
+	// fetching signing keys over an insecure transport).
+	auto cache = new JwksCache("http://as.example.com/jwks", 60.seconds);
+	assert(cache.keysFor("any-kid").length == 0);
+}
+
+unittest  // JwksCache refuses an internal/link-local JWKS URI (SSRF mitigation)
+{
+	import core.time : seconds;
+
+	auto cache = new JwksCache("https://169.254.169.254/jwks", 60.seconds);
+	assert(cache.keysFor("any-kid").length == 0);
 }
