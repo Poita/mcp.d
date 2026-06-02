@@ -12,6 +12,7 @@ import mcp.protocol.capabilities;
 import mcp.protocol.types;
 import mcp.protocol.sampling : validateSamplingMessages, CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.draft;
+import mcp.server.context : logLevelRank;
 import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.http_transport : HttpClientTransport, LegacyFallbackException;
 import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
@@ -463,12 +464,46 @@ final class McpClient : ClientProtocol
 		}
 		while (!cursor.isNull);
 		acc.nextCursor = Nullable!string.init;
+		// On a draft session over HTTP (the x-mcp-header feature), the client MUST
+		// exclude from tools/list any tool whose inputSchema carries an invalid
+		// `x-mcp-header` annotation (draft server/tools #x-mcp-header). Validate each
+		// tool's schema; drop offenders (and skip caching them), keeping siblings.
+		// stdio / non-draft sessions MAY ignore x-mcp-header, so they are unaffected.
+		if (useDraft)
+			acc.tools = excludeInvalidHeaderTools(acc.tools);
 		// Cache each tool's inputSchema so a subsequent tools/call can mirror any
 		// x-mcp-header-annotated arguments into Mcp-Param-{Name} headers (draft
 		// basic/transports, "Custom Headers from Tool Parameters").
 		foreach (t; acc.tools)
 			cacheToolSchema(t.name, t.inputSchema);
 		return acc;
+	}
+
+	/// Filter out any tool whose `inputSchema` has an invalid `x-mcp-header`
+	/// annotation, per the draft requirement that a client MUST exclude such tools
+	/// from `tools/list` (`server/tools` #x-mcp-header). Each excluded tool is
+	/// reported via `logWarn` (tool name + the validation reason). Valid tools pass
+	/// through unchanged and in order. Separated as a pure static helper so the
+	/// exclusion can be unit-tested without a live server; `listTools` calls it only
+	/// for a draft session (the feature is draft-only and HTTP-transport-specific).
+	package static Tool[] excludeInvalidHeaderTools(Tool[] tools) @safe
+	{
+		import mcp.protocol.draft : validateInputSchemaHeaders;
+		import vibe.core.log : logWarn;
+
+		Tool[] kept;
+		foreach (t; tools)
+		{
+			const reason = validateInputSchemaHeaders(t.inputSchema);
+			if (reason !is null)
+			{
+				logWarn("Excluding tool '%s' from tools/list: invalid x-mcp-header annotation: %s",
+						t.name, reason);
+				continue;
+			}
+			kept ~= t;
+		}
+		return kept;
 	}
 
 	/// Record a tool's `inputSchema` (keyed by tool name) so the draft client can
@@ -1085,8 +1120,25 @@ final class McpClient : ClientProtocol
 	/// subsequent request's `_meta` (see `withRequestLogLevel` and the
 	/// request-method log-level overloads for a single-request override). Passing
 	/// an empty `level` clears the draft opt-in.
+	///
+	/// Typed entry point: pass a `LogLevel` for compile-time safety, so an invalid
+	/// level name can never reach the wire. Forwards to the string overload (whose
+	/// runtime validation always passes for a `LogLevel`).
+	void setLogLevel(LogLevel level) @safe
+	{
+		setLogLevel(cast(string) level);
+	}
+
+	/// an empty `level` clears the draft opt-in.
 	void setLogLevel(string level) @safe
 	{
+		// Reject an unrecognised level locally rather than POSTing it to a server
+		// that will reject it (released protocol) or silently stamping it into
+		// every draft request's `_meta` (draft). The empty string is the documented
+		// draft-opt-in clear and is left to pass through. Mirrors the server-side
+		// guard at server.d:1118.
+		if (level.length && logLevelRank(level) < 0)
+			throw new McpException(ErrorCode.invalidParams, "Invalid log level: " ~ level);
 		if (useDraft)
 		{
 			requestLogLevel_ = level;
@@ -1365,48 +1417,65 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Compute the `Mcp-Param-*` headers to emit for a `tools/call`, given the
-	/// tool's `inputSchema` and the call `arguments`. For each top-level property
-	/// annotated with `x-mcp-header` (see `paramHeaderMap`), the matching argument
-	/// value is encoded with `encodeHeaderValue` and mapped to its
-	/// `Mcp-Param-{Name}` header. Per the draft spec's mirroring table, an
-	/// argument that is absent or `null` produces no header. Non-string scalars
-	/// (numbers, booleans) are stringified; object/array values are emitted as
-	/// their compact JSON. Separated as a pure static helper so the mirroring can
-	/// be unit-tested without a live server.
+	/// tool's `inputSchema` and the call `arguments`. Uses the path-aware
+	/// `mcp.protocol.draft.paramHeaders`, which discovers every valid `x-mcp-header`
+	/// annotation at *any* nesting depth (not only top-level properties), and
+	/// descends each annotation's `path` into the arguments object: for each path
+	/// segment it indexes into the current `Json` object; if any intermediate node
+	/// is absent, `null`, or not an object, the header is skipped (emitting none).
+	/// When the full path resolves to a present, non-null primitive (string / int /
+	/// bigInt / bool — `number`/float is already excluded by header validation), the
+	/// value is encoded with `encodeHeaderValue` and emitted under
+	/// `ParamHeader.header`. This preserves the spec's absent/null omission
+	/// semantics (draft basic/transports mirroring table). Array-item paths (which
+	/// cross an `items` schema) are not mirrored: a single repeated header name
+	/// cannot unambiguously represent per-element values, so they are skipped — only
+	/// the well-defined object-nesting case is handled. Separated as a pure static
+	/// helper so the mirroring can be unit-tested without a live server.
 	package static string[string] paramHeaders(Json inputSchema, Json arguments) @safe
 	{
+		import mcp.protocol.draft : draftParamHeaders = paramHeaders;
+
 		string[string] headers;
-		auto map = paramHeaderMap(inputSchema);
-		if (map.length == 0 || arguments.type != Json.Type.object)
+		if (arguments.type != Json.Type.object)
 			return headers;
-		foreach (param, header; map)
+		foreach (ph; draftParamHeaders(inputSchema))
 		{
-			if (param !in arguments)
-				continue; // absent -> no header
-			auto v = arguments[param];
-			if (v.type == Json.Type.null_ || v.type == Json.Type.undefined)
-				continue; // null -> no header
+			// Descend the path into the arguments object. Any missing / null /
+			// non-object intermediate node means the value is not present -> no header.
+			Json node = arguments;
+			bool resolved = true;
+			foreach (seg; ph.path)
+			{
+				if (node.type != Json.Type.object || seg !in node)
+				{
+					resolved = false;
+					break;
+				}
+				node = node[seg];
+			}
+			if (!resolved)
+				continue;
+			// Absent / null -> no header (mirroring table).
+			if (node.type == Json.Type.null_ || node.type == Json.Type.undefined)
+				continue;
 			string raw;
-			final switch (v.type)
+			switch (node.type)
 			{
 			case Json.Type.string:
-				raw = v.get!string;
+				raw = node.get!string;
 				break;
 			case Json.Type.int_:
 			case Json.Type.bigInt:
-			case Json.Type.float_:
 			case Json.Type.bool_:
-				raw = v.toString();
+				raw = node.toString();
 				break;
-			case Json.Type.object:
-			case Json.Type.array:
-				raw = v.toString();
-				break;
-			case Json.Type.null_:
-			case Json.Type.undefined:
+			default:
+				// float (number) is excluded by header validation; object/array at a
+				// leaf path is not a primitive the spec mirrors -> skip.
 				continue;
 			}
-			headers[header] = encodeHeaderValue(raw);
+			headers[ph.header] = encodeHeaderValue(raw);
 		}
 		return headers;
 	}
@@ -1803,6 +1872,238 @@ unittest  // released-protocol setLogLevel still sends logging/setLevel
 	c.setLogLevel("warning");
 	assert(sentMethod == "logging/setLevel");
 	assert(sentParams["level"].get!string == "warning");
+}
+
+unittest  // #80: setLogLevel rejects an invalid level locally (released protocol)
+{
+	import std.exception : assertThrown;
+
+	// "warn" is not an RFC-5424 level name ("warning" is). On a released session
+	// it must be rejected locally rather than POSTed to a server that will reject it.
+	auto c = McpClient.http("http://localhost");
+	bool sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		sent = true;
+		return Json.emptyObject;
+	};
+	assertThrown!McpException(c.setLogLevel("warn"));
+	assert(!sent, "an invalid level must not reach the wire");
+}
+
+unittest  // #80: setLogLevel rejects an invalid level locally (draft) without storing it
+{
+	import std.exception : assertThrown;
+
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	assertThrown!McpException(c.setLogLevel("verbose"));
+	// The bad level must not be stamped into subsequent draft requests' _meta.
+	auto meta = c.injectDraftMetaForTest(Json.emptyObject);
+	assert(MetaKey.logLevel !in meta["_meta"], "an invalid level must not be stored");
+}
+
+unittest  // #80: the typed LogLevel overload is accepted and forwarded
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	c.setLogLevel(LogLevel.warning);
+	auto meta = c.injectDraftMetaForTest(Json.emptyObject);
+	assert(meta["_meta"][MetaKey.logLevel].get!string == "warning");
+}
+
+unittest  // #80: a valid string level still passes (regression guard)
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	c.setLogLevel("debug");
+	auto meta = c.injectDraftMetaForTest(Json.emptyObject);
+	assert(meta["_meta"][MetaKey.logLevel].get!string == "debug");
+}
+
+unittest  // #80: empty level clears the draft opt-in (documented behaviour preserved)
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	c.setLogLevel("info");
+	c.setLogLevel(""); // clear
+	auto meta = c.injectDraftMetaForTest(Json.emptyObject);
+	assert(MetaKey.logLevel !in meta["_meta"]);
+}
+
+private Tool headerTool(string name, Json[string] props) @safe
+{
+	import std.algorithm : map;
+	import std.array : array;
+
+	Json p = Json.emptyObject;
+	foreach (k, v; props)
+		p[k] = v;
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	schema["properties"] = p;
+	Tool t;
+	t.name = name;
+	t.inputSchema = schema;
+	return t;
+}
+
+unittest  // #20: listTools excludes a tool whose x-mcp-header value is empty (draft)
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	Tool bad = headerTool("bad", [
+		"region": Json(["type": Json("string"), "x-mcp-header": Json("")])
+	]);
+	Tool good = headerTool("good", [
+		"region": Json(["type": Json("string"), "x-mcp-header": Json("Region")])
+	]);
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		Json arr = Json.emptyArray;
+		arr ~= bad.toJson();
+		arr ~= good.toJson();
+		r["tools"] = arr;
+		return r;
+	};
+	auto res = c.listTools();
+	import std.algorithm : canFind, map;
+	import std.array : array;
+
+	auto names = res.tools.map!(t => t.name).array;
+	assert(!names.canFind("bad"), "tool with empty x-mcp-header must be excluded");
+	assert(names.canFind("good"), "sibling valid tool must remain");
+	// The offending tool must not be cached for header mirroring.
+	assert("bad" !in c.toolInputSchemas_);
+	assert("good" in c.toolInputSchemas_);
+}
+
+unittest  // #20: listTools excludes a tool whose x-mcp-header value contains CR/LF
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	Tool bad = headerTool("crlf", [
+		"region": Json([
+			"type": Json("string"),
+			"x-mcp-header": Json("Re\r\ngion")
+		])
+	]);
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		Json arr = Json.emptyArray;
+		arr ~= bad.toJson();
+		r["tools"] = arr;
+		return r;
+	};
+	auto res = c.listTools();
+	assert(res.tools.length == 0, "tool with CR/LF header must be excluded");
+	assert("crlf" !in c.toolInputSchemas_);
+}
+
+unittest  // #20: listTools excludes a tool annotating a number-typed parameter
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	Tool bad = headerTool("num", [
+		"amount": Json(["type": Json("number"), "x-mcp-header": Json("Amount")])
+	]);
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		Json arr = Json.emptyArray;
+		arr ~= bad.toJson();
+		r["tools"] = arr;
+		return r;
+	};
+	auto res = c.listTools();
+	assert(res.tools.length == 0, "number-typed x-mcp-header must be excluded");
+	assert("num" !in c.toolInputSchemas_);
+}
+
+unittest  // #20: listTools excludes a tool with case-insensitively duplicate header values
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+	Tool bad = headerTool("dup", [
+		"a": Json(["type": Json("string"), "x-mcp-header": Json("Region")]),
+		"b": Json(["type": Json("string"), "x-mcp-header": Json("region")])
+	]);
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		Json arr = Json.emptyArray;
+		arr ~= bad.toJson();
+		r["tools"] = arr;
+		return r;
+	};
+	auto res = c.listTools();
+	assert(res.tools.length == 0, "duplicate header values must be excluded");
+	assert("dup" !in c.toolInputSchemas_);
+}
+
+unittest  // #20: a non-draft session does NOT exclude tools (x-mcp-header MAY be ignored)
+{
+	auto c = McpClient.http("http://localhost");
+	// no enableDraft() -> released session
+	Tool bad = headerTool("bad", [
+		"region": Json(["type": Json("string"), "x-mcp-header": Json("")])
+	]);
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		Json arr = Json.emptyArray;
+		arr ~= bad.toJson();
+		r["tools"] = arr;
+		return r;
+	};
+	auto res = c.listTools();
+	assert(res.tools.length == 1, "non-draft session must not exclude on x-mcp-header");
+}
+
+unittest  // #21: paramHeaders mirrors a nested annotated object property
+{
+	// inputSchema: { properties: { filter: { type: object, properties: {
+	//   region: { type: string, x-mcp-header: Region } } } } }
+	Json inner = Json.emptyObject;
+	inner["region"] = Json([
+		"type": Json("string"),
+		"x-mcp-header": Json("Region")
+	]);
+	Json filter = Json.emptyObject;
+	filter["type"] = "object";
+	filter["properties"] = inner;
+	Json props = Json.emptyObject;
+	props["filter"] = filter;
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	schema["properties"] = props;
+
+	Json innerArgs = Json.emptyObject;
+	innerArgs["region"] = "us-west1";
+	Json args = Json.emptyObject;
+	args["filter"] = innerArgs;
+
+	auto headers = McpClient.paramHeaders(schema, args);
+	assert(HttpHeader.paramPrefix ~ "Region" in headers,
+			"nested annotated property must be mirrored to a header");
+	assert(decodeHeaderValue(headers[HttpHeader.paramPrefix ~ "Region"]) == "us-west1");
+}
+
+unittest  // #21: an absent nested intermediate node emits no header
+{
+	Json inner = Json.emptyObject;
+	inner["region"] = Json([
+		"type": Json("string"),
+		"x-mcp-header": Json("Region")
+	]);
+	Json filter = Json.emptyObject;
+	filter["type"] = "object";
+	filter["properties"] = inner;
+	Json props = Json.emptyObject;
+	props["filter"] = filter;
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	schema["properties"] = props;
+
+	// `filter` is absent in the arguments -> no header (absent/null omission).
+	auto headers = McpClient.paramHeaders(schema, Json.emptyObject);
+	assert(HttpHeader.paramPrefix ~ "Region" !in headers);
 }
 
 unittest  // callTool logLevel overload attaches the draft per-request opt-in
