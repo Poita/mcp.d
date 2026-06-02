@@ -279,6 +279,18 @@ final class ServerPushChannel
 		void delegate(string frame) @safe write;
 		string subscriptionId;
 		SubscriptionFilter filter;
+		/// Per-listener serialization point (audit finding #6). The blocking
+		/// `write` to this stream — together with the seq read it is framed with and
+		/// the seq/history commit that follows — runs under THIS mutex, NOT the
+		/// channel-wide `mtx`. Holding `mtx` across the socket write used to couple
+		/// every stream (head-of-line blocking, a liveness regression from the #74
+		/// fix): a slow stream X blocked delivery to stream Y, `notify`,
+		/// `sendRequest`, `addListener`, and `removeListener` mount-wide. Moving the
+		/// write under a per-listener mutex frees `mtx` while still serializing
+		/// concurrent writes to the SAME stream, so seq assignment cannot reorder
+		/// relative to the bytes on the wire — preserving the #74 per-stream-monotonic,
+		/// globally-unique event-id invariant. Allocated per listener in `addListener`.
+		TaskMutex writeMtx;
 	}
 
 	private StreamCoordinator coord;
@@ -287,12 +299,16 @@ final class ServerPushChannel
 	private long[long] seqOf; /// listener id -> its monotonic event sequence
 	private long nextListenerId = 1;
 
-	/// Serializes delivery (`deliver`/`emitTo`) and listener-list mutation
-	/// (`addListener`/`removeListener`) so that no second emit and no list mutation
-	/// can interleave with an in-progress `l.write` await (audit findings #74/#75).
-	/// Held across the whole body, including the socket write, so the
-	/// "deliver to exactly one stream" decision plus its event-id reservation and
-	/// the list iteration are atomic against any concurrent fiber.
+	/// Guards the channel's shared state: the listener list, `streamOf`/`seqOf`,
+	/// `requestListener`, and the replay history. Held only for short,
+	/// non-blocking critical sections — the candidate scan, the seq read, and the
+	/// seq/history commit — and explicitly RELEASED across the blocking `l.write`
+	/// socket write (audit finding #6). The write itself is serialized per stream by
+	/// the target `Listener.writeMtx` instead, so a slow stream no longer blocks
+	/// delivery to other streams / `notify` / `sendRequest` / `addListener` /
+	/// `removeListener` while still keeping each stream's writes — and the seq ids
+	/// they carry — strictly ordered (preserving the #74/#75 invariants: no
+	/// listener-list corruption, per-stream-monotonic globally-unique event ids).
 	private TaskMutex mtx;
 
 	/// In-flight server->client request id -> the listener id it was delivered on
@@ -357,10 +373,18 @@ final class ServerPushChannel
 			SubscriptionFilter filter = SubscriptionFilter.init, string resumeFrom = "") @safe
 	{
 		return () @trusted {
+			auto lWriteMtx = new TaskMutex;
+			long id;
+			string[] replay; // frames to replay, snapshotted under the lock
+
+			// Phase 1 (under mtx): register the listener and decide its stream
+			// ordinal + starting seq. For a resume, SNAPSHOT the frames to replay and
+			// fix the continuation seq up-front, but DEFER the actual writes — the
+			// blocking socket write must not run under the channel mutex (#6).
 			synchronized (mtx)
 			{
-				const id = nextListenerId++;
-				listeners ~= Listener(id, write, subscriptionId, filter);
+				id = nextListenerId++;
+				listeners ~= Listener(id, write, subscriptionId, filter, lWriteMtx);
 
 				long resumeOrdinal, resumeSeq;
 				if (parseEventId(resumeFrom, resumeOrdinal, resumeSeq) && resumeOrdinal in history)
@@ -376,7 +400,7 @@ final class ServerPushChannel
 					{
 						if (e.seq <= resumeSeq)
 							continue;
-						write(e.frame);
+						replay ~= e.frame;
 						if (e.seq > maxSeq)
 							maxSeq = e.seq;
 					}
@@ -387,8 +411,23 @@ final class ServerPushChannel
 					streamOf[id] = coord.allocStream();
 					seqOf[id] = 0;
 				}
-				return id;
 			}
+
+			// Phase 2 (off mtx, under the new listener's writeMtx): replay the
+			// snapshotted frames in order. Holding the per-listener writeMtx means any
+			// concurrent `deliver`/`emitTo` that picks this listener blocks here until
+			// replay completes, so live events strictly follow the replayed ones — the
+			// resumed stream's wire order (and its seq monotonicity) is preserved
+			// without holding the channel mutex across these blocking writes (#6).
+			if (replay.length)
+			{
+				synchronized (lWriteMtx)
+				{
+					foreach (frame; replay)
+						write(frame);
+				}
+			}
+			return id;
 		}();
 	}
 
@@ -492,60 +531,98 @@ final class ServerPushChannel
 	/// the channel self-heals. Returns the listener id the message landed on, or -1
 	/// when no live eligible listener could receive it.
 	///
-	/// The whole body — the eligibility scan, the event-id reservation, the
-	/// `l.write` await and the post-write sequence bump — runs under the delivery
-	/// mutex, so two concurrent emits cannot both pick the same listener, reuse a
-	/// seq, or mutate `listeners` across each other's write (audit finding #74).
-	/// Iteration is over a snapshot (`listeners.dup`) so a self-healing removal of a
-	/// dead stream cannot dangle the loop reference (audit findings #74/#75).
+	/// The channel mutex is held only for short, non-blocking critical sections —
+	/// snapshotting the eligible candidates, reading the seq each frame is stamped
+	/// with, and committing the seq/history afterwards. The blocking `l.write` runs
+	/// OFF the channel mutex, serialized per stream by the target listener's own
+	/// `writeMtx` (audit finding #6), so two concurrent emits to the SAME listener
+	/// are still strictly ordered (the seq read + write + commit all happen under
+	/// that one `writeMtx`, so the frame that reaches the socket first carries the
+	/// lower seq), while a slow stream no longer blocks delivery to others.
+	/// Candidates are tried in registration order; one whose write throws (a
+	/// disconnected client) is dropped and the next live eligible listener is tried,
+	/// so the message still lands on a healthy stream and the channel self-heals
+	/// (the Multiple Connections single-stream rule: stop at the first SUCCESS).
+	/// Returns the listener id the message landed on, or -1 when no live eligible
+	/// listener could receive it.
 	private long deliver(Json msg, scope bool delegate(ref const Listener) @safe eligible) @safe
 	{
-		return () @trusted {
+		// Snapshot the eligible candidates (in registration order) under the lock so
+		// the list cannot mutate under us; the actual writes happen off the lock.
+		Listener[] candidates;
+		() @trusted {
 			synchronized (mtx)
-				return deliverLocked(msg, eligible);
+			{
+				foreach (l; listeners)
+					if (eligible(l) && l.id in seqOf)
+						candidates ~= l;
+			}
 		}();
+
+		foreach (l; candidates)
+		{
+			if (writeToListener(l, msg))
+				return l.id; // single-stream delivery: stop at the first success
+		}
+		return -1;
 	}
 
-	/// Delivery body, assuming the mutex is already held.
-	private long deliverLocked(Json msg, scope bool delegate(ref const Listener) @safe eligible) @safe
+	/// Frame `msg` for one listener and write it, with the channel mutex held only
+	/// for the brief seq read and the post-write seq/history commit — never across
+	/// the blocking `l.write` (audit finding #6). The whole read-write-commit runs
+	/// under `l.writeMtx`, so concurrent writes to the same stream are serialized and
+	/// their seq ids stay monotonic in write order (#74). Returns true if the frame
+	/// was written; false if the listener was concurrently removed or its write threw
+	/// (in which case it is dropped from the channel).
+	private bool writeToListener(Listener l, Json msg) @safe
 	{
 		import std.conv : to;
 
-		long[] dead;
-		long deliveredTo = -1;
-		foreach (l; listeners.dup)
-		{
-			if (!eligible(l))
-				continue;
-			if (l.id !in seqOf)
-				continue; // removed by a concurrent path before we reached it
-			const seq = seqOf[l.id];
-			const eid = streamOf[l.id].to!string ~ "-" ~ seq.to!string;
-			const frame = formatSseEvent(eid, withSubscriptionId(msg, l.subscriptionId));
-			try
+		return () @trusted {
+			synchronized (l.writeMtx)
 			{
-				l.write(frame);
-				// Re-check the listener still exists after the write before recording
-				// any further per-listener state, so a stream removed during the write
-				// is not resurrected (audit finding #74).
-				if (l.id !in seqOf)
+				long seq, ordinal;
+				// Brief lock: confirm the listener still exists and read the seq this
+				// frame will carry. Releasing before the write is what frees the
+				// channel for other streams (#6).
+				bool present;
+				synchronized (mtx)
 				{
-					deliveredTo = l.id;
-					break;
+					if (l.id in seqOf)
+					{
+						present = true;
+						seq = seqOf[l.id];
+						ordinal = streamOf[l.id];
+					}
 				}
-				recordHistory(streamOf[l.id], seq, frame);
-				seqOf[l.id]++;
-				deliveredTo = l.id;
-				break; // single-stream delivery: do not fan out to other streams
+				if (!present)
+					return false; // removed by a concurrent path before we reached it
+
+				const eid = ordinal.to!string ~ "-" ~ seq.to!string;
+				const frame = formatSseEvent(eid, withSubscriptionId(msg, l.subscriptionId));
+				try
+				{
+					l.write(frame);
+				}
+				catch (Exception)
+				{
+					synchronized (mtx)
+						removeListenerLocked(l.id);
+					return false;
+				}
+				// Brief lock: commit. Because this whole body holds l.writeMtx, no
+				// other write to this stream interleaved, so seqOf[l.id] is still the
+				// `seq` we framed with — assign history + bump in write order (#74).
+				synchronized (mtx)
+				{
+					if (l.id !in seqOf)
+						return true; // removed during the write; do not resurrect (#74)
+					recordHistory(ordinal, seq, frame);
+					seqOf[l.id]++;
+				}
+				return true;
 			}
-			catch (Exception)
-			{
-				dead ~= l.id;
-			}
-		}
-		foreach (id; dead)
-			removeListenerLocked(id);
-		return deliveredTo;
+		}();
 	}
 
 	/// Append an emitted frame to a stream's replay history (basic/transports
@@ -656,45 +733,26 @@ final class ServerPushChannel
 	/// (in which case the listener is dropped).
 	bool emitTo(long listenerId, Json msg) @safe
 	{
-		return () @trusted {
+		// Find the target under the lock (brief, non-blocking), then write off the
+		// lock via the per-listener serialization point (audit finding #6), exactly
+		// like `deliver`. Serializing the write on `l.writeMtx` keeps this stream's
+		// seq ids monotonic against a concurrent `deliver`/`emitTo` (#74) without
+		// holding the channel mutex across the blocking write.
+		Nullable!Listener target;
+		() @trusted {
 			synchronized (mtx)
-				return emitToLocked(listenerId, msg);
+			{
+				foreach (l; listeners)
+					if (l.id == listenerId && l.id in seqOf)
+					{
+						target = l;
+						break;
+					}
+			}
 		}();
-	}
-
-	/// `emitTo` body, assuming the delivery mutex is held. Held across the write so
-	/// it cannot interleave with a concurrent `deliver`/`emitTo` on the same
-	/// listener (audit finding #74). Iterates a snapshot so self-healing removal is
-	/// safe (#75).
-	private bool emitToLocked(long listenerId, Json msg) @safe
-	{
-		import std.conv : to;
-
-		foreach (l; listeners.dup)
-		{
-			if (l.id != listenerId)
-				continue;
-			if (l.id !in seqOf)
-				return false;
-			const seq = seqOf[l.id];
-			const eid = streamOf[l.id].to!string ~ "-" ~ seq.to!string;
-			const frame = formatSseEvent(eid, withSubscriptionId(msg, l.subscriptionId));
-			try
-			{
-				l.write(frame);
-				if (l.id !in seqOf)
-					return true; // removed during the write; do not resurrect
-				recordHistory(streamOf[l.id], seq, frame);
-				seqOf[l.id]++;
-				return true;
-			}
-			catch (Exception)
-			{
-				removeListenerLocked(l.id);
-				return false;
-			}
-		}
-		return false;
+		if (target.isNull)
+			return false;
+		return writeToListener(target.get, msg);
 	}
 }
 
@@ -1685,6 +1743,142 @@ unittest  // #26: a server->client request fails fast when its bound listener di
 	runTask(disconnector);
 	runEventLoop();
 	assert(failedFast);
+}
+
+unittest  // #6: a slow stream's write must not block delivery to a different stream
+{
+	// finding #6: ServerPushChannel used to hold the channel-wide delivery mutex
+	// across the blocking SSE socket write, coupling every stream (head-of-line
+	// blocking). With per-listener write serialization off the channel mutex, a slow
+	// write on stream X must NOT delay a concurrent delivery to stream Y. Model two
+	// listeners: X's write yields for a while; Y's write is instant. Deliver to X and
+	// Y concurrently and assert Y finishes BEFORE X (impossible if both serialize on
+	// one channel mutex held across the write).
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import core.time : msecs;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+
+	int order;
+	int slowDoneAt = -1, fastDoneAt = -1;
+	// Slow listener: its write yields for a noticeable interval before completing.
+	const slow = ch.addListener((string) @safe { sleep(40.msecs); });
+	// Fast listener: its write completes immediately.
+	const fast = ch.addListener((string) @safe {});
+
+	runTask(() nothrow{
+		try
+		{
+			auto tSlow = runTask(() nothrow{
+				try
+				{
+					ch.emitTo(slow, makeNotification("notifications/message",
+					Json(["s": Json("slow")])));
+					slowDoneAt = ++order;
+				}
+				catch (Exception)
+				{
+				}
+			});
+			// Give the slow delivery a head start so it is mid-write (yielding) when the
+			// fast delivery is attempted — exactly the head-of-line condition #6 fixes.
+			sleep(5.msecs);
+			auto tFast = runTask(() nothrow{
+				try
+				{
+					ch.emitTo(fast, makeNotification("notifications/message",
+					Json(["s": Json("fast")])));
+					fastDoneAt = ++order;
+				}
+				catch (Exception)
+				{
+				}
+			});
+			tFast.join();
+			tSlow.join();
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(fastDoneAt > 0 && slowDoneAt > 0, "both deliveries must complete");
+	// The fast stream completed first even though the slow stream started first and
+	// was mid-write: the channel mutex is no longer held across the blocking write.
+	assert(fastDoneAt < slowDoneAt,
+			"a slow stream's write blocked a concurrent delivery to a different stream (#6)");
+}
+
+unittest  // #6/#74: concurrent emits to ONE stream keep per-stream seq ids monotonic
+{
+	// finding #6 must preserve the #74 invariant: per-stream event ids are
+	// monotonic and gap-free in WRITE order. With writes moved off the channel
+	// mutex, two concurrent emits to the SAME listener could otherwise reserve seqs
+	// and write out of order. The per-listener write mutex serializes seq read +
+	// write + seq commit, so whichever write reaches the socket first carries the
+	// lower seq. Fire many concurrent emits at one listener and assert the captured
+	// event ids are exactly 0,1,2,... in the order the frames were written.
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import core.time : msecs;
+	import std.string : indexOf, splitLines;
+	import std.conv : to;
+	import std.algorithm : map;
+	import std.array : array;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+
+	string[] frames;
+	// A write that yields mid-frame, so without per-listener serialization a second
+	// emit could interleave its seq assignment and write between the two halves.
+	const lid = ch.addListener((string f) @safe {
+		sleep(2.msecs); // yield while "writing"
+		frames ~= f;
+	});
+
+	enum N = 8;
+	runTask(() nothrow{
+		import vibe.core.task : Task;
+
+		try
+		{
+			Task[] tasks;
+			foreach (i; 0 .. N)
+			{
+				auto t = runTask((int n) nothrow{
+					try
+						ch.emitTo(lid, makeNotification("notifications/message",
+						Json(["n": Json(n)])));
+					catch (Exception)
+					{
+					}
+				}, i);
+				tasks ~= t;
+			}
+			foreach (t; tasks)
+				t.join();
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(frames.length == N, "every emit reached the single stream");
+	// Parse the seq half of each "id: <ordinal>-<seq>" line in write order: it must
+	// be 0,1,2,...,N-1 — strictly monotonic and gap-free (the #74 invariant).
+	auto seqs = frames.map!((f) {
+		const idLine = f[0 .. f.indexOf("\n")];
+		const dash = idLine.indexOf("-");
+		return idLine[dash + 1 .. $].to!long;
+	}).array;
+	foreach (i, s; seqs)
+		assert(s == cast(long) i,
+				"per-stream seq ids reordered under concurrent emits (#6/#74): " ~ seqs.to!string);
 }
 
 unittest  // #25: history retains at most maxHistoryStreams ordinals (bounded memory)
