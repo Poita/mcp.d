@@ -20,6 +20,8 @@ module mcp.auth.login;
  * authorization and token requests.
  */
 
+import core.time : Duration, minutes;
+
 import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.errors;
@@ -343,6 +345,11 @@ struct OAuthLogin
 	string clientIdMetadataUrl;
 	/// How to authenticate at the token endpoint.
 	TokenEndpointAuthMethod authMethod = TokenEndpointAuthMethod.none;
+	/// Maximum time to wait for the authorization-server redirect to arrive on
+	/// the loopback listener before aborting the interactive flow. Bounds the
+	/// wait so an abandoned browser or an absent redirect cannot block the
+	/// caller indefinitely.
+	Duration callbackTimeout = 5.minutes;
 	/// Opener for the system browser. Null => the platform default opener.
 	/// Supplied explicitly in tests to avoid launching a browser.
 	void delegate(string url) @safe openBrowser;
@@ -683,13 +690,17 @@ LoopbackCapture enforceIssOnCapture(LoopbackCapture cap, AuthorizationServerMeta
 
 /// Open the browser at the authorization URL and run a localhost loopback HTTP
 /// listener to capture the redirect. Blocks (on the vibe event loop) until the
-/// redirect arrives, then returns the captured authorization response.
+/// redirect arrives or `opts.callbackTimeout` elapses, then returns the
+/// captured authorization response. On timeout the result carries an
+/// `authorization_timeout` error (so the caller rejects it rather than
+/// hanging). The listener is stopped and the loopback port released on every
+/// exit path.
 private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationServerMetadata as_,
 		RegisteredClient rc, PkcePair pkce, OAuthLogin opts, string state) @safe
 {
 	import vibe.http.server : HTTPServerSettings, HTTPServerRequest,
-		HTTPServerResponse, listenHTTP;
-	import vibe.core.core : runEventLoop, exitEventLoop;
+		HTTPServerResponse, HTTPListener, listenHTTP;
+	import vibe.core.core : runEventLoop, exitEventLoop, setTimer, Timer;
 
 	// Bind the loopback listener. Port 0 lets the OS pick an ephemeral port,
 	// which we then read back to form the exact redirect URI.
@@ -699,6 +710,7 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationS
 
 	LoopbackCapture result;
 	bool done;
+	Timer timeoutTimer;
 
 	void handle(scope HTTPServerRequest req, scope HTTPServerResponse res) @safe
 	{
@@ -712,17 +724,21 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationS
 		{
 			result = cap;
 			done = true;
+			() @trusted { timeoutTimer.stop(); }();
 		}
 		res.contentType = "text/html; charset=utf-8";
 		res.writeBody(loopbackResponseHtml(cap.ok));
 		() @trusted { exitEventLoop(); }();
 	}
 
+	HTTPListener listener;
 	ushort boundPort;
 	() @trusted {
-		auto listener = listenHTTP(settings, &handle);
+		listener = listenHTTP(settings, &handle);
 		boundPort = listener.bindAddresses[0].port;
 	}();
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
 
 	oauth.redirectUri = loopbackRedirectUri(boundPort, opts.callbackPath);
 	const authzUrl = oauth.authorizationUrl(as_, rc, pkce, opts.scopeString(), state);
@@ -732,6 +748,22 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationS
 		opener = (string u) @safe { openSystemBrowser(u); };
 	opener(authzUrl);
 
+	void onTimeout() @safe nothrow
+	{
+		if (!done)
+		{
+			result = LoopbackCapture.init;
+			result.error = "authorization_timeout";
+			result.errorDescription
+				= "no authorization redirect arrived before the callback timeout";
+			done = true;
+		}
+		() @trusted { exitEventLoop(); }();
+	}
+
+	timeoutTimer = () @trusted {
+		return setTimer(opts.callbackTimeout, &onTimeout);
+	}();
 	() @trusted { runEventLoop(); }();
 	return result;
 }
@@ -1131,4 +1163,28 @@ unittest  // enforceIssOnCapture runs even on an error response (does not act on
 	auto checked = enforceIssOnCapture(cap, as_);
 	assert(!checked.ok);
 	assert(checked.error == "invalid_iss");
+}
+
+unittest  // the loopback flow aborts with a timeout error when no redirect arrives
+{
+	import core.time : msecs;
+
+	auto oauth = new OAuthClient();
+	oauth.resource = "https://mcp.example.com/mcp";
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "https://as.example.com/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto rc = RegisteredClient("cid", "");
+	auto pkce = generatePkce();
+
+	OAuthLogin opts;
+	opts.callbackTimeout = 50.msecs;
+	// A no-op opener ensures no redirect is ever delivered, so only the timeout
+	// can end the flow.
+	opts.openBrowser = (string url) @safe {};
+
+	auto captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, "state-xyz");
+
+	assert(!captured.ok);
+	assert(captured.error == "authorization_timeout");
 }
