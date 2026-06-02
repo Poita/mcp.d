@@ -10,9 +10,8 @@
  *   - HTTP (`--http <url>` / `--url <url>`): connect to an already-running server
  *     with `McpClient.http(url)`.
  *
- * The event-loop wiring (runTask / runEventLoop / catch->rc) is provided by the
- * scaffold's `runClient`, and the assertion helper `check` is the scaffold's —
- * this file no longer hand-rolls either.
+ * The event-loop wiring (runTask / runEventLoop / catch->rc) and the assertion
+ * helper `check` are provided by the scaffold's `runClient`.
  *
  * Every observation is asserted against the value the server promises; the
  * process exits NON-ZERO on any mismatch, so CI can run it as an e2e regression
@@ -20,23 +19,20 @@
  * mid-flight cancellation phase (D) runs over HTTP, where the cancel signal is
  * tearing down the per-request SSE response stream (a client disconnect). Over
  * stdio the cancel signal is instead a `notifications/cancelled` message, which
- * the SDK server now honours mid-handler via its cooperative input drain (see
- * the `serveStdio` cancellation unittest); this client keeps phase D HTTP-only
- * only because its simple synchronous stdio client cannot inject a notification
- * while a `callTool` is in flight — not an SDK limitation.
+ * the SDK server honours mid-handler via its cooperative input drain (see the
+ * `serveStdio` cancellation unittest); this client keeps phase D HTTP-only
+ * because its simple synchronous stdio client cannot inject a notification while
+ * a `callTool` is in flight.
  *
- * Typed/ergonomic SDK APIs adopted here:
- *   - per-call progress sink: `callTool(name, args, onProgress)` (#494) delivers
- *     THIS call's progress to a local callback, replacing a global
- *     `client.onProgress` + manual token correlation.
- *   - `result.structuredContentAs!T` decodes structured output into a struct
- *     instead of field-by-field raw-Json reads (#464).
- *   - typed `callTool(name, T args)` passes a struct for the static-shape calls
- *     (#468).
+ * Typed/ergonomic SDK APIs used here:
+ *   - per-call progress sink: `callTool(name, args, onProgress)` delivers THIS
+ *     call's progress to a local callback.
+ *   - `result.structuredContentAs!T` decodes structured output into a struct.
+ *   - typed `callTool(name, T args)` passes a struct for the static-shape calls.
  *   - `ElicitResult.accept(T)` / `CreateMessageResult.text(model, text)` build
- *     the mocked client replies from typed values (#466/#467).
+ *     the mocked client replies from typed values.
  *   - Installing `onElicitation` alone advertises elicitation; the inbound gate
- *     honours `effectiveCapabilities()` (#463), so no redundant raw flag-set.
+ *     honours `effectiveCapabilities()`.
  *
  * What it verifies, in order:
  *   A. LIST + PROGRESS + LOGGING (transport-agnostic)
@@ -86,9 +82,9 @@ enum string MockedModel = "mock-model-1";
 enum string MockedSummary = "A concise mock summary.";
 enum string ElicitedTone = "concise";
 
-// Typed mirrors of the server's structures, used for typed callTool args
-// (#468), structuredContentAs!T decoding (#464), and the elicitation accept
-// content (#466). They match the server's field names exactly.
+// Typed mirrors of the server's structures, used for typed callTool args,
+// structuredContentAs!T decoding, and the elicitation accept content. They
+// match the server's field names exactly.
 
 /// `countdown` arguments.
 struct CountdownArgs
@@ -216,7 +212,7 @@ private void report(string msg) @trusted
 /// Install the mocked client-side input handlers. Installing them is sufficient:
 /// the handlers auto-advertise the `sampling` / `elicitation` capabilities at
 /// initialize, and the inbound `elicitation/create` gate honours
-/// `effectiveCapabilities()` (#463) — so no redundant raw flag-setting is needed.
+/// `effectiveCapabilities()` — so no redundant raw flag-setting is needed.
 private void installMockHandlers(McpClient client) @safe
 {
 	client.onElicitation = (ElicitParams params) @safe {
@@ -254,16 +250,16 @@ private int phaseListProgressLogging(McpClient client, int steps) @safe
 		logs ~= LogEntry(n.level, n.logger.isNull ? "" : n.logger.get);
 	};
 
-	// Per-call progress sink (#494): the SDK mints a unique progressToken for THIS
-	// call and routes only its progress notifications to this callback for the
-	// duration of the call — no global client.onProgress + manual token matching.
+	// Per-call progress sink: the SDK mints a unique progressToken for THIS call
+	// and routes only its progress notifications to this callback for the
+	// duration of the call.
 	auto result = client.callTool("countdown", CountdownArgs(steps, 20),
 			(ProgressNotification n) @safe {
 		progress ~= ProgressUpdate(n.progress, n.total.isNull
 			? -1 : n.total.get, n.progressTokenString);
 	});
 
-	// Final structured result, decoded into the typed CountdownResult (#464).
+	// Final structured result, decoded into the typed CountdownResult.
 	check(result.structuredContent.type == Json.Type.object, "result must carry structuredContent");
 	const cr = result.structuredContentAs!CountdownResult;
 	check(cr.completed == steps,
@@ -351,16 +347,16 @@ private int phaseCancellation(string url, int cancelledBefore) @trusted
 	bool sawFirstProgress = false;
 	bool callEnded = false;
 	// Count progress notifications IN-BAND so we can prove the run was truncated,
-	// not just that the server's counter moved (#67).
+	// not just that the server's counter moved.
 	int progressCount = 0;
 
 	// Run the long call on its own task; we will close the stream from here. The
-	// per-call progress sink (#494) signals when the call is in flight.
+	// per-call progress sink signals when the call is in flight.
 	enum int longSteps = 50;
 	auto callTask = runTask(() {
-		// Narrow the catch to Exception (#65): InterruptException IS an Exception,
-		// so the intended cancel signal is still absorbed, but Errors propagate and
-		// fail the run instead of being silently swallowed.
+		// Catch Exception only: InterruptException IS an Exception, so the intended
+		// cancel signal is absorbed, but Errors propagate and fail the run instead
+		// of being silently swallowed.
 		try
 			client.callTool("countdown", CountdownArgs(longSteps, 40),
 				(ProgressNotification) @safe {
@@ -396,13 +392,13 @@ private int phaseCancellation(string url, int cancelledBefore) @trusted
 	client.close();
 
 	// The run must have been cut short: fewer progress notifications than a full
-	// countdown would emit. This is the in-band proof of truncation (#67).
+	// countdown would emit. This is the in-band proof of truncation.
 	check(progressCount < longSteps, "cancellation phase: run must be cut short — saw "
 			~ progressCount.to!string ~ " of " ~ longSteps.to!string ~ " progress notifications");
 
-	// Condition-driven success criterion (#68): poll the server's cancel counter
-	// until it increments past the pre-cancel baseline, rather than trusting a
-	// fixed wall-clock sleep. Generous deadline so a slow handler is not a flake.
+	// Poll the server's cancel counter until it increments past the pre-cancel
+	// baseline, rather than trusting a fixed wall-clock sleep. Generous deadline
+	// so a slow handler is not a flake.
 	enum int deadlineSpins = 200; // ~10s at 50ms
 	int after = cancelledBefore;
 	foreach (i; 0 .. deadlineSpins)
