@@ -13,7 +13,7 @@
  * It speaks the stateless draft protocol (`enableDraft`) for two reasons: the
  * `CacheableResult` freshness hint rides inline on every `resources/read`, and a
  * `subscriptions/listen` stream is the ONE push mechanism the SDK supports over
- * both transports (the legacy standalone GET SSE stream is HTTP-only).
+ * both transports (the standalone GET SSE stream is HTTP-only).
  *
  * What it verifies (identical over stdio and http):
  *   1. resources/list contains the static `config://app` resource.
@@ -21,8 +21,8 @@
  *   3. resources/read of `config://app` returns the expected JSON text.
  *   4. resources/read of `note:///welcome` (template expansion) returns the
  *      seeded body, with mimeType text/plain.
- *   5. resources/read of an unknown URI fails with an error (the draft aligns
- *      this to invalidParams -32602; stable revisions used -32002).
+ *   5. resources/read of an unknown URI fails with an error (the draft maps
+ *      not-found to invalidParams -32602).
  *   6. the draft read of `config://app` surfaces the server's CacheableResult
  *      freshness hint (ttlMs == 60000, cacheScope == public).
  *   7. after subscriptions/listen, calling `set_note` delivers a
@@ -64,8 +64,8 @@ enum string expectedConfig = `{"name":"resources-example","featureFlags":["resou
 enum long expectedTtlMs = 60_000;
 
 /// Typed arguments for the `set_note` tool. Passing this struct to the typed
-/// `callTool(name, T args)` overload lets the SDK serialize the wire arguments,
-/// so the client no longer hand-builds a `Json` object for a fixed-shape call.
+/// `callTool(name, T args)` overload lets the SDK serialize the wire arguments
+/// for a fixed-shape call.
 struct SetNoteArgs
 {
 	string id;
@@ -148,11 +148,9 @@ int run(string[] args) @safe
 	check(note.contents.length && note.contents[0].mimeType == "text/plain",
 			"note:///welcome mimeType mismatch");
 
-	// (5) unknown resource read raises an error. NOTE: the draft protocol aligns
-	// the resources/read not-found code to invalidParams (-32602); the stable
-	// revisions used resourceNotFound (-32002). We speak draft (for the inline
-	// cache hint above), so we expect -32602. Pick a URI that matches neither the
-	// direct resource nor the note template.
+	// (5) unknown resource read raises an error. The draft protocol maps the
+	// resources/read not-found code to invalidParams (-32602). Pick a URI that
+	// matches neither the direct resource nor the note template.
 	bool threw;
 	try
 		client.readResource("other:///x");
