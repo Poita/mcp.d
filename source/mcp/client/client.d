@@ -145,7 +145,7 @@ final class McpClient : ClientProtocol
 	// `withRequestLogLevel` and are NOT stored here.
 	private string requestLogLevel_;
 	// Monotonic counter behind `mintProgressToken`, which mints a unique string
-	// progress token for the per-call-progress `callTool` overload (#494). A
+	// progress token for the per-call-progress `callTool` overload. A
 	// distinct counter (not `nextId`) keeps the minted token stable regardless of
 	// how many requests the call's MRTR loop issues, and unique across calls per
 	// basic/utilities/progress ("MUST be unique across all active requests").
@@ -561,7 +561,7 @@ final class McpClient : ClientProtocol
 	/// Typed-arguments convenience: serialize the struct `args` to its JSON wire
 	/// shape via vibe's `serializeToJson` and forward to the `Json`-arguments
 	/// `callTool`. Lets callers pass a strongly typed parameter struct instead of
-	/// hand-building a `Json` object (#468). Equivalent to
+	/// hand-building a `Json` object. Equivalent to
 	/// `callTool(name, serializeToJson(args))`.
 	CallToolResult callTool(T)(string name, T args) @safe if (!is(T : Json))
 	{
@@ -570,7 +570,7 @@ final class McpClient : ClientProtocol
 
 	/// Typed-arguments convenience requesting progress updates: serialize the
 	/// struct `args` and forward to the `ProgressToken` `Json`-arguments overload
-	/// (see `callTool` with a `ProgressToken`) (#468).
+	/// (see `callTool` with a `ProgressToken`).
 	CallToolResult callTool(T)(string name, T args, ProgressToken progressToken) @safe
 			if (!is(T : Json))
 	{
@@ -595,7 +595,7 @@ final class McpClient : ClientProtocol
 
 	/// Typed-arguments convenience for the per-call progress overload: serialize
 	/// the struct `args` and forward to the `Json`-arguments per-call-progress
-	/// `callTool` (#494).
+	/// `callTool`.
 	CallToolResult callTool(T)(string name, T args,
 			scope void delegate(ProgressNotification) @safe onProgress) @safe
 			if (!is(T : Json))
@@ -622,7 +622,7 @@ final class McpClient : ClientProtocol
 		string requestState;
 		// Hoisted so `maxRounds` is a true cap: after the last bounded round we
 		// return whatever it produced (still an inputRequired result when the
-		// server kept asking) without issuing an extra `tools/call` (#22).
+		// server kept asking) without issuing an extra `tools/call`.
 		CallToolResult result;
 		foreach (round; 0 .. maxRounds)
 		{
@@ -675,7 +675,7 @@ final class McpClient : ClientProtocol
 	/// `this.onProgress`. The prior global handler is restored on return (including
 	/// on throw). A null `onProgress` installs no per-call routing. Centralises the
 	/// save/wrap/restore so the request-method overloads share one implementation
-	/// and the global field is never left swapped out (#494).
+	/// and the global field is never left swapped out.
 	private CallToolResult withPerCallProgress(ProgressToken token,
 			scope void delegate(ProgressNotification) @safe onProgress,
 			scope CallToolResult delegate() @safe body_) @safe
@@ -973,9 +973,9 @@ final class McpClient : ClientProtocol
 
 	/// Typed-arguments convenience: serialize the struct `args` to its JSON wire
 	/// shape via vibe's `serializeToJson` and forward to the `Json`-arguments
-	/// `getPrompt`. Mirrors the typed `callTool(T)` (#468) so callers can pass a
+	/// `getPrompt`. Mirrors the typed `callTool(T)` so callers can pass a
 	/// strongly typed prompt-argument struct instead of hand-building a `Json`
-	/// object (#496). Equivalent to `getPrompt(name, serializeToJson(args))`.
+	/// object. Equivalent to `getPrompt(name, serializeToJson(args))`.
 	GetPromptResult getPrompt(T)(string name, T args) @safe if (!is(T : Json))
 	{
 		return getPrompt(name, serializeToJson(args));
@@ -1010,7 +1010,7 @@ final class McpClient : ClientProtocol
 	/// observable via `onNotification` / `onProgress`. Per
 	/// basic/utilities/progress, the token is sent in `params._meta.progressToken`.
 	/// Mirrors the `ProgressToken` overloads on `callTool` / `readResource` /
-	/// `getPrompt` (#79). `context`, when non-null, supplies previously-resolved
+	/// `getPrompt`. `context`, when non-null, supplies previously-resolved
 	/// argument values so the server can give context-aware completions.
 	CompleteResult complete(CompletionReference reference, string argumentName,
 			string argumentValue, ProgressToken progressToken, string[string] context = null) @safe
@@ -1340,7 +1340,7 @@ final class McpClient : ClientProtocol
 	/// mirroring the typed result types the SDK provides for tools, resources
 	/// and prompts. This installs an `onListRoots` handler that answers
 	/// `roots/list` with a properly-shaped `{roots: [{uri, name}]}` envelope, so
-	/// callers no longer have to hand-construct the raw JSON. Each `uri` MUST be
+	/// callers need not hand-construct the raw JSON. Each `uri` MUST be
 	/// a `file://` URI per client/roots §Data Types.
 	void setRoots(Root[] roots) @safe
 	{
@@ -1611,7 +1611,7 @@ final class McpClient : ClientProtocol
 				// Gate on the capabilities actually advertised at the handshake
 				// (`effectiveCapabilities`), not the raw `capabilities` field:
 				// installing `onElicitation` alone auto-advertises the form submode
-				// on the wire (#463), so an inbound form request must be accepted
+				// on the wire, so an inbound form request must be accepted
 				// even when no manual capability flags were set.
 				const advertised = effectiveCapabilities();
 				const mode = ("mode" in params && params["mode"].type == Json.Type.string) ? params["mode"]
@@ -1731,7 +1731,7 @@ ProtocolVersion resolveNegotiatedVersion(string serverVersion) @safe
 	return v;
 }
 
-unittest  // public flagship type uses single-cap Mcp* casing (issue #304)
+unittest  // public flagship type uses single-cap Mcp* casing
 {
 	// The client class must be reachable under the consistent `McpClient`
 	// name (matching McpServer, McpException, etc.), not `MCPClient`.
@@ -1874,7 +1874,7 @@ unittest  // released-protocol setLogLevel still sends logging/setLevel
 	assert(sentParams["level"].get!string == "warning");
 }
 
-unittest  // #80: setLogLevel rejects an invalid level locally (released protocol)
+unittest  // setLogLevel rejects an invalid level locally (released protocol)
 {
 	import std.exception : assertThrown;
 
@@ -1890,7 +1890,7 @@ unittest  // #80: setLogLevel rejects an invalid level locally (released protoco
 	assert(!sent, "an invalid level must not reach the wire");
 }
 
-unittest  // #80: setLogLevel rejects an invalid level locally (draft) without storing it
+unittest  // setLogLevel rejects an invalid level locally (draft) without storing it
 {
 	import std.exception : assertThrown;
 
@@ -1902,7 +1902,7 @@ unittest  // #80: setLogLevel rejects an invalid level locally (draft) without s
 	assert(MetaKey.logLevel !in meta["_meta"], "an invalid level must not be stored");
 }
 
-unittest  // #80: the typed LogLevel overload is accepted and forwarded
+unittest  // the typed LogLevel overload is accepted and forwarded
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableDraft();
@@ -1911,7 +1911,7 @@ unittest  // #80: the typed LogLevel overload is accepted and forwarded
 	assert(meta["_meta"][MetaKey.logLevel].get!string == "warning");
 }
 
-unittest  // #80: a valid string level still passes (regression guard)
+unittest  // a valid string level still passes
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableDraft();
@@ -1920,7 +1920,7 @@ unittest  // #80: a valid string level still passes (regression guard)
 	assert(meta["_meta"][MetaKey.logLevel].get!string == "debug");
 }
 
-unittest  // #80: empty level clears the draft opt-in (documented behaviour preserved)
+unittest  // empty level clears the draft opt-in
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableDraft();
@@ -1947,7 +1947,7 @@ private Tool headerTool(string name, Json[string] props) @safe
 	return t;
 }
 
-unittest  // #20: listTools excludes a tool whose x-mcp-header value is empty (draft)
+unittest  // listTools excludes a tool whose x-mcp-header value is empty (draft)
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableDraft();
@@ -1977,7 +1977,7 @@ unittest  // #20: listTools excludes a tool whose x-mcp-header value is empty (d
 	assert("good" in c.toolInputSchemas_);
 }
 
-unittest  // #20: listTools excludes a tool whose x-mcp-header value contains CR/LF
+unittest  // listTools excludes a tool whose x-mcp-header value contains CR/LF
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableDraft();
@@ -1999,7 +1999,7 @@ unittest  // #20: listTools excludes a tool whose x-mcp-header value contains CR
 	assert("crlf" !in c.toolInputSchemas_);
 }
 
-unittest  // #20: listTools excludes a tool annotating a number-typed parameter
+unittest  // listTools excludes a tool annotating a number-typed parameter
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableDraft();
@@ -2018,7 +2018,7 @@ unittest  // #20: listTools excludes a tool annotating a number-typed parameter
 	assert("num" !in c.toolInputSchemas_);
 }
 
-unittest  // #20: listTools excludes a tool with case-insensitively duplicate header values
+unittest  // listTools excludes a tool with case-insensitively duplicate header values
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableDraft();
@@ -2038,7 +2038,7 @@ unittest  // #20: listTools excludes a tool with case-insensitively duplicate he
 	assert("dup" !in c.toolInputSchemas_);
 }
 
-unittest  // #20: a non-draft session does NOT exclude tools (x-mcp-header MAY be ignored)
+unittest  // a non-draft session does NOT exclude tools (x-mcp-header MAY be ignored)
 {
 	auto c = McpClient.http("http://localhost");
 	// no enableDraft() -> released session
@@ -2056,7 +2056,7 @@ unittest  // #20: a non-draft session does NOT exclude tools (x-mcp-header MAY b
 	assert(res.tools.length == 1, "non-draft session must not exclude on x-mcp-header");
 }
 
-unittest  // #21: paramHeaders mirrors a nested annotated object property
+unittest  // paramHeaders mirrors a nested annotated object property
 {
 	// inputSchema: { properties: { filter: { type: object, properties: {
 	//   region: { type: string, x-mcp-header: Region } } } } }
@@ -2085,7 +2085,7 @@ unittest  // #21: paramHeaders mirrors a nested annotated object property
 	assert(decodeHeaderValue(headers[HttpHeader.paramPrefix ~ "Region"]) == "us-west1");
 }
 
-unittest  // #21: an absent nested intermediate node emits no header
+unittest  // an absent nested intermediate node emits no header
 {
 	Json inner = Json.emptyObject;
 	inner["region"] = Json([
@@ -2625,7 +2625,7 @@ unittest  // bare elicitation declaration still accepts form-mode requests
 	assert(delegateCalled);
 }
 
-unittest  // #463: installing onElicitation alone accepts an inbound form elicitation/create
+unittest  // installing onElicitation alone accepts an inbound form elicitation/create
 {
 	auto c = McpClient.http("http://localhost");
 	// Install ONLY the handler; set NO manual capability flags. The documented
@@ -2719,8 +2719,8 @@ unittest  // -32042 URLElicitationRequiredError registers its elicitationIds (cl
 		threw = (ex.code == ErrorCode.urlElicitationRequired);
 	assert(threw);
 
-	// The completion notification for the error-announced id must now be
-	// forwarded (it would have been dropped as "unknown" before the fix).
+	// The completion notification for the error-announced id is forwarded
+	// (an unregistered id would be dropped as "unknown").
 	string forwardedMethod;
 	c.onNotification = (string method, Json) @safe { forwardedMethod = method; };
 	Json note = Json.emptyObject;
@@ -2921,7 +2921,7 @@ unittest  // buildCompleteParams includes the resolved-argument context when giv
 	assert(p["context"]["arguments"]["owner"].get!string == "octocat");
 }
 
-unittest  // #79: complete() ProgressToken overload attaches the token under _meta.progressToken
+unittest  // complete() ProgressToken overload attaches the token under _meta.progressToken
 {
 	auto c = McpClient.http("http://localhost");
 	Json sent;
@@ -2943,7 +2943,7 @@ unittest  // #79: complete() ProgressToken overload attaches the token under _me
 	assert(sent["argument"]["value"].get!string == "al");
 }
 
-unittest  // #79: complete() ProgressToken overload still carries the resolved-argument context
+unittest  // complete() ProgressToken overload still carries the resolved-argument context
 {
 	auto c = McpClient.http("http://localhost");
 	Json sent;
@@ -3027,7 +3027,7 @@ unittest  // buildToolCallParams omits _meta when no progress token is requested
 	assert("_meta" !in p);
 }
 
-unittest  // #468: typed callTool args serialize to the same wire object as hand-built Json
+unittest  // typed callTool args serialize to the same wire object as hand-built Json
 {
 	import vibe.data.json : serializeToJson;
 
@@ -3051,7 +3051,7 @@ unittest  // #468: typed callTool args serialize to the same wire object as hand
 	assert(fromTyped["arguments"]["b"].get!int == 3);
 }
 
-unittest  // #494: callTool with a per-call progress callback receives that call's progress
+unittest  // callTool with a per-call progress callback receives that call's progress
 {
 	auto c = McpClient.http("http://localhost");
 
@@ -3079,7 +3079,7 @@ unittest  // #494: callTool with a per-call progress callback receives that call
 	assert(received[0].progress == 0.5);
 }
 
-unittest  // #494: a per-call progress callback restores the prior global onProgress
+unittest  // a per-call progress callback restores the prior global onProgress
 {
 	auto c = McpClient.http("http://localhost");
 	ProgressNotification[] global;
@@ -3102,7 +3102,7 @@ unittest  // #494: a per-call progress callback restores the prior global onProg
 	assert(global.length == 1);
 }
 
-unittest  // #496: typed getPrompt produces the same wire args as the Json form
+unittest  // typed getPrompt produces the same wire args as the Json form
 {
 	static struct GreetArgs
 	{
@@ -3129,7 +3129,7 @@ unittest  // #496: typed getPrompt produces the same wire args as the Json form
 	assert(sentArgs[0]["who"].get!string == "world");
 }
 
-unittest  // #502: spawnSibling resolves a binary next to the running executable
+unittest  // spawnSibling resolves a binary next to the running executable
 {
 	import std.file : thisExePath;
 	import std.path : dirName, buildPath;
@@ -3436,7 +3436,7 @@ unittest  // MRTR: resolveInputRequest fails for an unknown input type
 	assert(!ok);
 }
 
-unittest  // #22: a server that keeps requesting input stops at exactly maxRounds tools/call requests
+unittest  // a server that keeps requesting input stops at exactly maxRounds tools/call requests
 {
 	import mcp.protocol.draft : InputRequiredResult;
 
