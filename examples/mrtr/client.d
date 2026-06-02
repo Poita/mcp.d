@@ -22,17 +22,14 @@
  *     scenario body works over stdio and HTTP, mapping any thrown assertion to a
  *     non-zero exit code.
  *
- * Typed/ergonomic SDK APIs adopted here (the args/handlers/result decode are all
+ * Typed/ergonomic SDK APIs used here (args, handlers, and result decode are all
  * typed; no hand-built Json on those paths):
- *   - typed `callTool(name, BookMeetingArgs)` (#468) replaces the hand-built
- *     arguments `Json`;
- *   - the inbound `InputRequest`s are read with the typed readers (#503)
- *     `req.elicitationMessage()` / `req.requestedSchema()` / `req.asSampling()`
- *     instead of raw `req.params[...]` indexing;
- *   - `ElicitResult.accept!MeetingDate` (#466) and `CreateMessageResult.text`
- *     (#467) replace the hand-assembled elicitation/sampling reply structs;
- *   - `CallToolResult.structuredContentAs!Booking` (#464) replaces the
- *     field-by-field raw-`Json` reads of the structured result.
+ *   - typed `callTool(name, BookMeetingArgs)` serializes the arguments;
+ *   - the inbound `InputRequest`s are read with the typed readers
+ *     `req.elicitationMessage()` / `req.requestedSchema()` / `req.asSampling()`;
+ *   - `ElicitResult.accept!MeetingDate` and `CreateMessageResult.text` build the
+ *     elicitation/sampling replies;
+ *   - `CallToolResult.structuredContentAs!Booking` decodes the structured result.
  *
  * On success it prints "OK: ..." and exits 0; any failed assertion prints what
  * differed and exits NON-ZERO.
@@ -55,25 +52,23 @@ import mcp;
 
 import examples_common : check, runClient, connectFromArgs;
 
-/// Typed view of the `book_meeting` arguments. Passing this struct to the typed
-/// `callTool(name, T)` overload (#468) serializes the wire `{topic}` object for
-/// us — no hand-built `Json`.
+/// Typed view of the `book_meeting` arguments. The typed `callTool(name, T)`
+/// overload serializes this into the wire `{topic}` object.
 struct BookMeetingArgs
 {
 	string topic;
 }
 
 /// Typed view of the elicitation answer. `ElicitResult.accept!MeetingDate(...)`
-/// (#466) serializes this into the elicitation content map, mirroring the
-/// server's `MeetingDate` form struct.
+/// serializes this into the elicitation content map, mirroring the server's
+/// `MeetingDate` form struct.
 struct MeetingDate
 {
 	string date;
 }
 
 /// Typed view of the server's structured `Booking` result, decoded in one shot
-/// with `CallToolResult.structuredContentAs!Booking` (#464) instead of
-/// field-by-field raw-`Json` reads.
+/// with `CallToolResult.structuredContentAs!Booking`.
 struct Booking
 {
 	string topic;
@@ -103,12 +98,12 @@ private int runE2E(McpClient client) @safe
 	// carries per-request `_meta`.
 	client.enableDraft();
 
-	// Advertise the input capabilities this client can satisfy. Since #60 the
-	// server only includes an InputRequest the client declared support for, so we
-	// must advertise elicitation + sampling for the raw-inspection call below
-	// (which deliberately installs NO handlers). The no-handler call still
-	// surfaces the InputRequiredResult verbatim — advertising a capability is
-	// distinct from installing a handler to auto-resolve it.
+	// Advertise the input capabilities this client can satisfy. The server only
+	// includes an InputRequest the client declared support for, so we must
+	// advertise elicitation + sampling for the raw-inspection call below (which
+	// deliberately installs NO handlers). The no-handler call still surfaces the
+	// InputRequiredResult verbatim — advertising a capability is distinct from
+	// installing a handler to auto-resolve it.
 	client.capabilities.elicitation = true;
 	client.capabilities.elicitationForm = true;
 	client.capabilities.sampling = true;
@@ -126,11 +121,11 @@ private int runE2E(McpClient client) @safe
 			found = true;
 	check(found, "listTools did not contain 'book_meeting'");
 
-	// Typed arguments (#468): pass a struct rather than hand-building a Json object.
+	// Typed arguments: pass a struct rather than hand-building a Json object.
 	auto topicArg = BookMeetingArgs("Q3 roadmap");
 
-	// ---- Round-trip view #1: no handlers -> the server's InputRequiredResult is
-	// surfaced so we can assert the raw MRTR shape. ----
+	// ---- First round-trip view: no handlers -> the server's InputRequiredResult
+	// is surfaced so we can assert the raw MRTR shape. ----
 	auto raw = client.callTool("book_meeting", topicArg);
 	check(raw.isInputRequired,
 			"expected an inputRequired result on the first call with no handlers");
@@ -145,9 +140,8 @@ private int runE2E(McpClient client) @safe
 			sawDate = true;
 			check(req.type == "elicitation",
 					"meeting_date type: expected 'elicitation', got '" ~ req.type ~ "'");
-			// Typed reader (#503): read the elicitation message + requestedSchema via
-			// req.elicitationMessage() / req.requestedSchema() rather than raw
-			// req.params[...] indexing.
+			// Typed reader: read the elicitation message + requestedSchema via
+			// req.elicitationMessage() / req.requestedSchema().
 			check(req.elicitationMessage() == "On what date should we meet?",
 					"meeting_date message mismatch: '" ~ req.elicitationMessage() ~ "'");
 			// The schema was DERIVED from the server's flat MeetingDate struct via
@@ -163,10 +157,9 @@ private int runE2E(McpClient client) @safe
 			sawAgenda = true;
 			check(req.type == "sampling",
 					"meeting_agenda type: expected 'sampling', got '" ~ req.type ~ "'");
-			// Typed reader (#503): decode the sampling request back into a typed
-			// CreateMessageRequest via req.asSampling() rather than raw
-			// req.params[...] indexing. It must carry the maxTokens and user message
-			// the server set.
+			// Typed reader: decode the sampling request back into a typed
+			// CreateMessageRequest via req.asSampling(). It must carry the maxTokens
+			// and user message the server set.
 			auto sreq = req.asSampling();
 			check(!sreq.maxTokens.isNull && sreq.maxTokens.get == 64,
 					"meeting_agenda maxTokens: expected 64");
@@ -182,7 +175,7 @@ private int runE2E(McpClient client) @safe
 	check(parseRequestStateTopic(raw.requestState) == "Q3 roadmap",
 			"requestState topic mismatch: '" ~ raw.requestState ~ "'");
 
-	// ---- Round-trip view #2: install mock handlers; the SDK completes the loop. ----
+	// ---- Second round-trip view: install mock handlers; the SDK completes the loop. ----
 	// Installing onElicitation/onSampling alone auto-advertises the matching
 	// capabilities (effectiveCapabilities), so no raw flag-setting is needed.
 	// The elicitation handler returns the meeting date via the typed accept!T
@@ -207,7 +200,7 @@ private int runE2E(McpClient client) @safe
 			"final text mismatch.\n  expected: " ~ expectedText ~ "\n  got:      " ~ text);
 
 	// Structured content carries the same values plus the round count. Decode it
-	// in one shot into the typed Booking struct (#464) and assert on the fields.
+	// in one shot into the typed Booking struct and assert on the fields.
 	auto booking = done.structuredContentAs!Booking;
 	check(booking.topic == "Q3 roadmap", "structured topic mismatch: '" ~ booking.topic ~ "'");
 	check(booking.date == "2026-06-15", "structured date mismatch: '" ~ booking.date ~ "'");
@@ -223,7 +216,7 @@ private int runE2E(McpClient client) @safe
 	return 0;
 }
 
-/// Read the `topic` out of the server's opaque `requestState`. The server now
+/// Read the `topic` out of the server's opaque `requestState`. The server
 /// encodes a typed `RequestState` struct, so the blob is a JSON object
 /// `{"topic":"..."}`; this is the client's view of that contract for the
 /// round-trip-shape assertion.
