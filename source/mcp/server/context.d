@@ -11,6 +11,7 @@ import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
 import mcp.protocol.jsonrpc : makeNotification;
 import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
+import mcp.server.connection : ConnectionState;
 
 @safe:
 
@@ -142,6 +143,15 @@ interface ConnectionScoped
 {
 	/// A stable, non-empty identifier for this request's connection / session.
 	string connectionToken() @safe;
+
+	/// The per-connection / per-session `ConnectionState` this request is bound to.
+	/// A transport that scopes state per peer returns the state it
+	/// resolved for THIS request: the `SessionManager`-owned state looked up by
+	/// `Mcp-Session-Id` (stateful HTTP), or a fresh per-request state built from the
+	/// request's effective version + `_meta` (stateless HTTP). Returns `null` when
+	/// the context carries no such state, in which case the server core falls back
+	/// to its single bound `activeConnection` (stdio / bare-`handle`).
+	ConnectionState connectionState() @safe;
 }
 
 /// Resolve the connection token for a context: the context's own token when it
@@ -153,6 +163,20 @@ string connectionTokenOf(RequestContext ctx) @safe
 	if (auto c = cast(ConnectionScoped) ctx)
 		return c.connectionToken();
 	return "";
+}
+
+/// Resolve the `ConnectionState` a context carries: the context's own state when
+/// it implements `ConnectionScoped` and resolved one, otherwise `null`.
+/// Centralised here (mirroring `connectionTokenOf`) so the server core has one
+/// place to decide per-session/per-request state vs. the single bound
+/// `activeConnection` fallback. A `null` result means "this
+/// context carries no scoped state" — the dispatcher then uses
+/// `activeConnection`.
+ConnectionState connectionStateOf(RequestContext ctx) @safe
+{
+	if (auto c = cast(ConnectionScoped) ctx)
+		return c.connectionState();
+	return null;
 }
 
 /// Per-request context handed to tool handlers. It is the channel through which
@@ -650,6 +674,16 @@ final class RequestScope : RequestContext, ConnectionScoped
 	string connectionToken() @safe
 	{
 		return connectionTokenOf(inner);
+	}
+
+	/// Delegate the per-session/per-request `ConnectionState` to the wrapped
+	/// transport context: the `RequestScope` is a per-request
+	/// decorator, so the scoped state is whatever the underlying transport
+	/// resolved for this request (null when the transport carries none, e.g. stdio
+	/// / in-process, where the server falls back to its single `activeConnection`).
+	ConnectionState connectionState() @safe
+	{
+		return connectionStateOf(inner);
 	}
 
 	/// True once the client has cancelled this request via

@@ -13,6 +13,7 @@ import mcp.protocol.capabilities;
 import mcp.protocol.draft : withSubscriptionId;
 import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
 import mcp.server.context;
+import mcp.server.connection : ConnectionState;
 import mcp.auth.resource_server : TokenInfo;
 
 /// Correlates outbound server->client requests with the client's responses,
@@ -1156,6 +1157,13 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// shared across the two POSTs, so the empty (shared) token is kept and
 	// cancellation is unscoped (documented on the transport).
 	private string token_;
+	// The per-session (stateful) / per-request (stateless) ConnectionState this
+	// request is bound to. The transport resolves it — looked up by
+	// `Mcp-Session-Id` for stateful, freshly built per request for stateless — and
+	// hands it here so the server core dispatches against THIS request's state
+	// rather than the single bound `activeConnection`. Null when the transport did
+	// not resolve one (the server then falls back to `activeConnection`).
+	private ConnectionState connState_;
 	private bool streaming_;
 	private long streamId;
 	private long eventSeq;
@@ -1178,11 +1186,21 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// cancellation of that request"). Defaults to the live HTTP connection state;
 	// overridable via `setConnectionProbe` so tests can simulate a disconnect.
 	private bool delegate() @safe connAlive_;
+	// When true, this context belongs to a `stateless` server over
+	// the HTTP transport, so server->client requests (elicitation / sampling /
+	// roots / any `sendRequest`) are STRUCTURALLY FORBIDDEN. They would have to
+	// ride the mount-global `StreamCoordinator`/GET-push channel, which correlates
+	// more than one HTTP call and is exactly the shared state a stateless server
+	// must not keep. `sendRequest` therefore throws a clear `McpException` rather
+	// than silently dropping. stdio uses a different context (`StdioContext`), so
+	// server->client over stdio is unaffected by this gate in any mode.
+	private bool serverStateless_;
 
 	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
 			TokenInfo auth = TokenInfo.invalid(),
 			bool isDraft = false, ProtocolVersion negotiated = latestStable,
-			string connectionToken = "") @safe
+			string connectionToken = "",
+			ConnectionState connState = null, bool serverStateless = false) @safe
 	{
 		this.res = res;
 		this.coord = coord;
@@ -1193,6 +1211,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		this.isDraft_ = isDraft;
 		this.version_ = negotiated;
 		this.token_ = connectionToken;
+		this.connState_ = connState;
+		this.serverStateless_ = serverStateless;
 		this.connAlive_ = () @safe => res.connected;
 	}
 
@@ -1205,6 +1225,15 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	string connectionToken() @safe
 	{
 		return token_;
+	}
+
+	/// The per-session/per-request `ConnectionState` the transport resolved for
+	/// this request: the `SessionManager`-owned state for stateful
+	/// HTTP, or the fresh transient state for stateless HTTP. Null when none was
+	/// supplied, in which case the server core falls back to `activeConnection`.
+	ConnectionState connectionState() @safe
+	{
+		return connState_;
 	}
 
 	/// Override the connection-liveness probe used by `isCancelled` on the draft
@@ -1327,6 +1356,16 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 
 	Json sendRequest(string method, Json params) @safe
 	{
+		// A stateless server has NO shared state across HTTP calls.
+		// A server->client request (elicitation / sampling / roots / any
+		// sendRequest) would block on the mount-global StreamCoordinator and ride
+		// the GET-push channel — both shared across HTTP calls — so it is
+		// structurally forbidden in stateless mode. Fail loudly rather than hang or
+		// silently drop. Use McpServer.stateful() to enable it (keys all per-peer
+		// state on Mcp-Session-Id). stdio is a single implicit connection and is
+		// unaffected (it uses StdioContext, not this class).
+		if (serverStateless_)
+			throw invalidRequest("server-initiated requests (elicitation/sampling/roots) require a stateful server; construct with McpServer.stateful()");
 		const id = coord.alloc();
 		coord.register(id);
 		writeEvent(makeRequest(Json(id), method, params));
@@ -2014,4 +2053,109 @@ unittest  // #3/#22: a cancellation scoped to session B must not suppress sessio
 	auto resp = s.handle(Message(makeRequest(Json(1), "tools/call", callP)), ctxA);
 	// A's response is delivered (not suppressed): cancellation matched only B.
 	assert(!resp.isNull);
+}
+
+unittest  // a stateless HttpStreamContext FORBIDS server->client requests
+{
+	// A stateless server keeps no shared state across HTTP calls, so a handler
+	// calling ctx.elicit/ctx.sample (any sendRequest) over the HTTP transport must
+	// ERROR with the stateless message rather than block on the mount-global
+	// coordinator. The tool-call returns an error result (not a hang).
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.server.server : McpServer;
+	import mcp.protocol.jsonrpc : makeRequest;
+	import mcp.protocol.types : Tool, CallToolResult, Content;
+	import mcp.protocol.errors : McpException;
+	import std.algorithm : canFind;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	ClientCapabilities caps;
+	caps.elicitation = true;
+	caps.elicitationForm = true; // client supports form-mode (so the gate is the only block)
+
+	auto s = McpServer.stateless("t", "1");
+	bool sawStatelessError;
+	Tool ask = {name: "ask"};
+	s.registerDynamicTool(ask, (Json args, RequestContext ctx) @safe {
+		try
+		{
+			ctx.elicit("hi", Json.emptyObject);
+			assert(false, "elicit() must throw on a stateless HTTP server");
+		}
+		catch (McpException e)
+		{
+			sawStatelessError = true;
+			assert(e.msg.canFind("stateful"),
+				"the stateless gate message must point at McpServer.stateful(): " ~ e.msg);
+			CallToolResult r;
+			r.content = [Content.makeText("blocked: " ~ e.msg)];
+			r.isError = true;
+			return r;
+		}
+	});
+
+	// Construct the context exactly as the stateless HTTP transport does: serverStateless = true.
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
+			TokenInfo.invalid(), false, latestStable, "", null, true);
+	Json callP = Json.emptyObject;
+	callP["name"] = "ask";
+	auto resp = s.handle(Message(makeRequest(Json(1), "tools/call", callP)), ctx);
+	assert(sawStatelessError, "the handler's elicit() did not hit the stateless gate");
+	assert(!resp.isNull);
+	// The tool-call returns an error result rather than hanging.
+	assert(resp.get["result"]["isError"].get!bool);
+}
+
+unittest  // a stateful HttpStreamContext does NOT gate sendRequest
+{
+	// The counterpart to the stateless gate: a stateful server (serverStateless =
+	// false) leaves sendRequest enabled, so the elicit reaches the coordinator and
+	// blocks awaiting the client's reply (it does NOT throw the stateless message).
+	// We confirm it is not the stateless gate by checking the elicit does not throw
+	// invalidRequest with the stateful-pointer message before any client response.
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+	import mcp.protocol.errors : McpException, ErrorCode;
+	import std.algorithm : canFind;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	ClientCapabilities caps;
+	// serverStateless = false (default): the gate is OFF.
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined);
+
+	bool gated;
+	void delegate() @safe nothrow initiator = () @safe nothrow{
+		try
+			ctx.sendRequest("elicitation/create", Json.emptyObject);
+		catch (McpException e)
+		{
+			// A stateful context never throws the stateless-pointer message. It may
+			// (here) eventually time out awaiting a reply, which is a DIFFERENT error.
+			if (e.msg.canFind("require a stateful server"))
+				gated = true;
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	};
+	// Resolve the in-flight request id quickly so the initiator does not block for
+	// the full timeout (the request frame was written to the SSE stream).
+	void delegate() @safe nothrow responder = () @safe nothrow{
+		try
+			coord.resolve(Json(1), Json.emptyObject, Json.undefined);
+		catch (Exception)
+		{
+		}
+	};
+	runTask(initiator);
+	runTask(responder);
+	runEventLoop();
+	assert(!gated, "a stateful HttpStreamContext must NOT apply the stateless server->client gate");
 }

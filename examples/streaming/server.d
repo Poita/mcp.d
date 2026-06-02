@@ -66,6 +66,15 @@ import examples_common : runServerFromArgs;
 
 void main(string[] args) @safe
 {
+	// This example is STATELESS (the default). Its HTTP path
+	// exercises the draft transport (phase D: client-disconnect cancellation, a
+	// draft-only feature) which a stateful server cannot serve — the draft is
+	// excluded from stateful negotiation. The `summarize` tool's ctx.elicit +
+	// ctx.sample (server->client requests) therefore run only over STDIO here (a
+	// single implicit connection where server->client is allowed in any mode); the
+	// client skips them over HTTP, where a stateless server correctly forbids
+	// server->client requests. The dedicated elicitation/ and sampling/ examples
+	// cover those features over HTTP (they are stateful).
 	auto server = new McpServer("streaming-example", "1.0.0",
 			nullable("Progress / logging / cancellation demo over stdio AND Streamable HTTP."));
 	// Advertise the `logging` capability so `ctx.log` notifications are emitted on

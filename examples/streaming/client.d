@@ -166,7 +166,15 @@ private int run(string[] args, bool useHttp, string httpUrl) @safe
 	client.setLogLevel("debug");
 
 	const int progressSeen = phaseListProgressLogging(client, steps);
-	phaseTypedElicitSampling(client);
+	// Typed elicit+sample are server->client requests. They run only
+	// over STDIO (a single implicit connection — server->client is allowed in any
+	// mode). The streaming server is STATELESS (its HTTP phase D needs the draft
+	// transport, which a stateful server cannot serve), and a stateless server
+	// correctly FORBIDS server->client requests over HTTP — so the client skips
+	// this phase over HTTP. The dedicated elicitation/ and sampling/ examples cover
+	// these features over HTTP against stateful servers.
+	if (!useHttp)
+		phaseTypedElicitSampling(client);
 	phaseErrorCode(client);
 
 	if (useHttp)
@@ -181,9 +189,10 @@ private int run(string[] args, bool useHttp, string httpUrl) @safe
 				~ cancelledBefore.to!string ~ ", after=" ~ cancelledAfter.to!string ~ ")");
 
 		report("OK [http]: countdown streamed " ~ progressSeen.to!string ~ " progress + "
-				~ progressSeen.to!string ~ " log msgs; typed elicit+sample round-trip verified; "
-				~ "unknown-tool error code; mid-flight cancel honored (cancel_stats "
-				~ cancelledBefore.to!string ~ " -> " ~ cancelledAfter.to!string ~ ").");
+				~ progressSeen.to!string ~ " log msgs; unknown-tool error code; "
+				~ "mid-flight cancel honored (cancel_stats "
+				~ cancelledBefore.to!string ~ " -> " ~ cancelledAfter.to!string ~ "). "
+				~ "(elicit+sample skipped over HTTP: stateless server forbids server->client.)");
 		return 0;
 	}
 

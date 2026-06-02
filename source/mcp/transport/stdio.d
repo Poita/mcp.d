@@ -49,6 +49,14 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	import vibe.core.core : runTask;
 	import vibe.data.json : Json;
 	import mcp.protocol.jsonrpc : Message, MessageKind;
+	import mcp.server.connection : ConnectionState;
+
+	// stdio is single-connection (one implicit peer per process), so this
+	// transport owns exactly one `ConnectionState`, which the server core threads
+	// through dispatch and reads back for the notify path. Binding it here (before
+	// the read loop starts) makes it the state for every request on this process;
+	// HTTP instead resolves per-session state per request.
+	server.bindConnection(new ConnectionState);
 
 	DuplexChannel channel;
 

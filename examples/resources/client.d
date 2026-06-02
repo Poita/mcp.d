@@ -88,6 +88,14 @@ int main(string[] args) @safe
 
 int run(string[] args) @safe
 {
+	// The push phase (subscriptions/listen + notifications/resources/updated)
+	// runs over BOTH transports. subscriptions/listen is a DRAFT RPC and the draft is
+	// stateless-only, so it works on this STATELESS server: the POST opens one
+	// long-lived SSE stream and set_note -> notifyResourceUpdated streams
+	// notifications/resources/updated (+ resources/list_changed) down THAT same
+	// stream, in-process — no session, no second correlated HTTP call. stdio behaves
+	// identically (the only difference being the subscriptionId tagging).
+
 	// --- connect over the selected transport (stdio sibling / http url) -----
 	auto client = connectFromArgs(args, "resources-server");
 	// Both transports release cleanly via close() (stdio terminates the
@@ -157,6 +165,10 @@ int run(string[] args) @safe
 	check(threw, "unknown resource read did not raise an error");
 
 	// (7) subscribe via subscriptions/listen + observe push notifications.
+	// This runs over BOTH transports. subscriptions/listen opens a single
+	// self-contained long-lived stream; set_note -> notifyResourceUpdated streams
+	// resources/updated (subscribed URI) + resources/list_changed (new resource) down
+	// THAT stream — in-process on this stateless server, no second correlated call.
 	int updated;
 	int listChanged;
 	string updatedUri;
@@ -184,9 +196,8 @@ int run(string[] args) @safe
 	auto stream = client.subscriptionsListen(filter);
 	scope (exit)
 		stream.close();
-	// Let the listen stream attach (HTTP opens a background SSE task; stdio
-	// shares the single channel and needs no settle time, but a couple of yields
-	// are harmless).
+	// Let the listen stream attach (stdio shares the single channel and needs no
+	// settle time, but a couple of yields are harmless).
 	sleep(200.msecs);
 
 	// Mutate the subscribed note via the tool; the server pushes
@@ -202,8 +213,7 @@ int run(string[] args) @safe
 	check(setResult.created == true, "set_note should report created=true for a new note");
 
 	// Wait for the notifications. Over stdio they interleave on the single
-	// channel during the readResource await below; over http they arrive on the
-	// background listen task. Yield + poll covers both.
+	// channel during the readResource await below. Yield + poll covers it.
 	const deadline = MonoTime.currTime + 5000.msecs;
 	while (MonoTime.currTime < deadline && (updated == 0 || listChanged == 0))
 	{

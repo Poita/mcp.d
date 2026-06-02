@@ -1,11 +1,24 @@
-# dlang-mcp-sdk
+# mcp.d
 
 [![CI](https://github.com/Poita/mcp.d/actions/workflows/ci.yml/badge.svg)](https://github.com/Poita/mcp.d/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/Poita/mcp.d/branch/main/graph/badge.svg)](https://codecov.io/gh/Poita/mcp.d)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A production-grade [Model Context Protocol](https://modelcontextprotocol.io) (MCP) SDK for
+A feature-complete [Model Context Protocol](https://modelcontextprotocol.io) (MCP) SDK for
 the D programming language — client and server, built on [vibe-d](https://vibed.org).
+
+```d
+import mcp;
+
+@tool("add", "Add two integers")
+long add(long a, long b) @safe { return a + b; }
+void main()
+{
+    auto server = new McpServer("demo", "1.0.0");
+    registerModule!(__traits(parent, add))(server);
+    runStdio(server);
+}
+```
 
 ## Goals
 
@@ -17,7 +30,7 @@ the D programming language — client and server, built on [vibe-d](https://vibe
 
 ## Status
 
-**All official conformance tests pass** (0 failures): **server 38/38**, **client 287/287**
+**All official conformance tests pass** (0 failures): **server 39/39**, **client 287/287**
 (one advisory `SHOULD` warning on the optional Client-ID-Metadata-Document flow).
 
 - ✅ **All 30 server scenarios**: lifecycle, tools with every content type, resources +
@@ -90,282 +103,137 @@ generation can never silently break, and publishes them to GitHub Pages on
 pushes to `main` (best-effort: the publish step is skipped if Pages is not
 enabled for the repository).
 
-## Example: a server with the ergonomic UDA API
+## Statefulness
 
-Write plain typed D methods and annotate them — both the **input schema** (from
-the parameter types) and the **output schema** (from the return type) are derived
-automatically, and arguments/results are marshalled for you (FastMCP-style):
-
-```d
-import mcp;
-import std.typecons : Nullable;
-
-/// Each annotated method becomes an MCP feature. The `inputSchema` is generated
-/// from the parameter types (`Nullable!T` params are optional); the `outputSchema`
-/// is generated from the return type (a struct → its object schema; a scalar/
-/// array → wrapped under `result`; a plain `string` → unstructured text content).
-final class MyServer
-{
-    @tool("add", "Add two integers")
-    long add(long a, long b) @safe
-    {
-        return a + b;
-    }
-
-    @tool("greet", "Greet someone, optionally loudly")
-    string greet(string name, Nullable!bool loud) @safe
-    {
-        auto msg = "Hello, " ~ name ~ "!";
-        return (!loud.isNull && loud.get) ? msg ~ "!!!" : msg;
-    }
-
-    @resource("file:///readme", "README", "text/plain")
-    string readme() @safe
-    {
-        return "Hello!";
-    }
-
-    @prompt("greet_prompt", "Greeting prompt")
-    string greetPrompt(string topic) @safe
-    {
-        return "Say hello about " ~ topic;
-    }
-}
-
-void main()
-{
-    auto server = new McpServer("my-server", "1.0.0");
-    registerHandlers(server, new MyServer);   // reflects the UDAs at compile time
-    runStreamableHttp(server, 3000);          // or: runStdio(server);
-}
-```
-
-Prefer decorating **module-level free functions** (FastMCP-style) instead of a
-class? Use `registerModule` — it reflects every annotated free function in a
-module and registers it. (A `RequestContext` must be an explicit parameter, since
-free functions have no `this`.)
+A server chooses one of two statefulness models at construction. **Stateless is
+the default.** The author picks the mode via factories; the existing
+`new McpServer(name, version)` constructors keep working and default to
+stateless.
 
 ```d
-import mcp;
-
-@tool("add", "Add two integers")
-long add(long a, long b) @safe { return a + b; }
-
-@resource("file:///readme", "README", "text/plain")
-string readme() @safe { return "Hello!"; }
-
-@prompt("greet_prompt", "Greeting prompt")
-string greetPrompt(string topic) @safe { return "Say hello about " ~ topic; }
-
-void main()
-{
-    auto server = new McpServer("my-server", "1.0.0");
-    registerModule!(__traits(parent, add))(server);  // or registerModule!(my.module)(server)
-    // registerModules!(modA, modB)(server);          // variadic convenience
-    runStdio(server);
-}
+auto s1 = McpServer.stateless("my-server", "1.0.0"); // default; same as `new McpServer(...)`
+auto s2 = McpServer.stateful("my-server", "1.0.0");   // opt-in session management
 ```
 
-A tool/prompt handler may also take a `RequestContext` parameter to report
-progress, log, or request sampling/elicitation from the client:
+The core invariant: **a stateless server has NO shared state across HTTP calls.**
+`McpServer` holds no mutable per-connection state; per-connection state lives in a
+`ConnectionState` object (`mcp.server.connection`) — protocol version, client
+capabilities, log level, resource subscriptions, and the in-flight cancellation
+registry. In **stateful** mode the SDK keys everything on `Mcp-Session-Id`: there
+is exactly one `ConnectionState` per session, owned by the transport's
+`SessionManager`. In **stateless** mode the transport builds a transient
+`ConnectionState` per request and discards it, so two concurrent peers sharing one
+`McpServer` cannot leak version, capability, subscription, or cancellation state
+into one another.
 
-```d
-@tool("crunch", "Process items, reporting progress")
-string crunch(int count, RequestContext ctx) @safe
-{
-    foreach (i; 0 .. count)
-        ctx.reportProgress(i + 1, nullable(cast(double) count));
-    return "done";
-}
-```
+Because a stateless server keeps nothing across HTTP calls, **anything that has to
+correlate a request with a *separate* later HTTP call is forbidden over HTTP in
+stateless mode and errors rather than silently dropping**: server-initiated
+`elicit`/`sample`/`roots` (a server->client request whose reply arrives on a
+different POST), `resources/subscribe`/`resources/unsubscribe` (whose updates would
+be delivered on the separate standalone GET stream), and the standalone GET SSE
+stream itself. Each would have to ride mount-global state (the `StreamCoordinator` /
+GET-push channel / per-session subscription set), which is exactly the shared state
+a stateless server must not keep. The gating depends only on `server.mode`
+(`ServerMode.stateless`), **not** on the negotiated protocol version.
 
-Prefer dynamic registration (e.g. tools known only at runtime)? The lower-level
-`server.registerDynamicTool(Tool, delegate)` / `registerResource` /
-`registerDynamicPrompt` API is the explicit escape hatch for runtime-defined
-tools/prompts whose schema has no compile-time D type — the handler receives the
-raw `Json` arguments. `registerHandlers` is built on top of it.
+A *self-contained* long-lived stream is fine, because it never correlates a second
+HTTP call: the draft `subscriptions/listen` works in stateless mode. Its POST opens
+an SSE response and the server streams `notifications/resources/updated` /
+`list_changed` down that same response, filtered by the stream's own subscription
+set — exactly like a tool call emitting progress on its own SSE stream. (Whether a
+mutation originating on another node reaches the stream is the deployment's
+out-of-band concern, not the SDK's.)
 
-### Protecting an HTTP server (OAuth 2.1 Resource Server)
+> **Guidance:** if your tools initiate elicitation/sampling/roots, or use the
+> 2025-era `resources/subscribe` push over HTTP, construct the server with
+> `McpServer.stateful()`. Stateless is correct for plain request/response tools,
+> resources, prompts, progress, the draft `subscriptions/listen` stream, and the
+> draft MRTR (more-requests-then-respond) input flow.
 
-Set a `ResourceServerConfig` on `StreamableHttpOptions.auth` to turn the
-Streamable HTTP transport into an OAuth 2.1 protected resource (RFC 6750 / 8707 /
-9728). Every request must then present a valid `Authorization: Bearer` token; the
-transport validates it (and its RFC 8707 audience), returns `401` with a
-`WWW-Authenticate: Bearer` header pointing at the metadata document on failure,
-`403 insufficient_scope` when a required scope is missing, and serves the RFC 9728
-Protected Resource Metadata at `/.well-known/oauth-protected-resource`. The
-validated token is available to handlers via `ctx.auth` (a `TokenInfo`).
+**stdio note:** stdio is a single implicit connection for the life of the process
+(it assumes protocol `2025-11-25`), so server->client requests (`elicit`/`sample`/
+`roots`) work over stdio **in any mode** — the gating above applies only to the
+HTTP transport. A stateless server is therefore fully usable over stdio even for
+elicitation/sampling.
 
-```d
-StreamableHttpOptions opts;
-opts.auth.resource = "https://mcp.example.com/mcp";
-opts.auth.authorizationServers = ["https://auth.example.com"];
-opts.auth.scopesSupported = ["mcp:read", "mcp:write"];
-opts.auth.requiredScope = "mcp:read";          // optional scope gate
-opts.auth.validator = (string token) @safe {   // your verification (e.g. JWT)
-    TokenInfo ti;
-    ti.valid = verify(token);                   // returns false -> 401
-    ti.subject = "...";
-    ti.scopes = ["mcp:read"];
-    ti.audience = ["https://mcp.example.com/mcp"];
-    return ti;
-};
-runStreamableHttp(server, 3000, opts);
-```
+### The three effective modes
 
-#### Identity-provider presets
+| | Resolution of per-connection state | Notes |
+|---|---|---|
+| **Modern stateless** (stateless + request >= draft) | Per-request `_meta` (protocolVersion + clientCapabilities + logLevel) | No `initialize` (uses `server/discover`); input via MRTR; `subscriptions/listen` is supported (a self-contained stream); **no** blocking server->client elicitation/sampling over HTTP (see the feature-gating matrix) |
+| **Legacy stateless** (stateless + request < draft) | `MCP-Protocol-Version` header (default `2025-03-26`; stdio assumes `2025-11-25`); client capabilities **unknown** (assumed none) | `initialize`/`notifications/initialized` are no-ops (no session id minted); a `tools/call` may be the first request with no prior `initialize`; correlation features are forbidden |
+| **Stateful** (opt-in, pre-draft only) | `ConnectionState` resolved by `Mcp-Session-Id`, created at `initialize` | The draft is **excluded** from negotiation (clamped down to `<= 2025-11-25`); `server/discover` is not served; DELETE terminates the session |
 
-Rather than hand-wiring each IdP's issuer / JWKS URI / endpoints, use the
-turnkey presets in `mcp.auth.providers`. Each is a one-liner over `jwtVerifier`
-(#179) or `OAuthProxy` (#183).
+### Feature-gating matrix
 
-**JWT/JWKS providers** return a ready `ResourceServerConfig` (issuer + JWKS URI +
-audience pinned):
+The gating is keyed on `server.mode`, not the protocol version, so the two
+stateless eras (modern-draft and legacy) forbid the same correlation features over
+HTTP — they differ only in how each request's `ConnectionState` is resolved.
 
-```d
-opts.auth = entraId("<tenant-id>", "api://my-mcp-server", ["mcp.read"]);
-opts.auth = auth0("my-tenant.us.auth0.com", "https://api.example.com");
-opts.auth = workosAuthKit("https://your-app.authkit.app", "client-id");
-opts.auth = descope("<project-id>", "my-audience");
-opts.auth = scalekit("https://your-env.scalekit.dev", "audience");
-```
+| Feature (over HTTP) | Modern stateless | Legacy stateless | Stateful |
+|---|---|---|---|
+| `initialize` handshake | n/a (`server/discover`) | no-op (no session id) | mints `Mcp-Session-Id` |
+| Per-request `_meta` version/caps | yes | n/a (header + empty caps) | n/a (session-negotiated) |
+| Standalone GET SSE stream | forbidden (405) | forbidden (405) | yes |
+| `resources/subscribe` / `unsubscribe` | forbidden (-32601) | forbidden (-32601) | yes |
+| `subscriptions/listen` (draft) | yes (self-contained stream) | n/a (draft-only) | yes |
+| Server->client `elicit`/`sample`/`roots` | forbidden (error; MRTR instead) | forbidden (error) | yes |
+| `logging/setLevel` | n/a (per-request `_meta`) | per-request / n/a | yes (session-scoped) |
+| Session id minted | never | never | yes |
 
-| Preset | Issuer | JWKS URI |
-| --- | --- | --- |
-| `entraId(tenant, …)` | `https://login.microsoftonline.com/{tenant}/v2.0` | `…/discovery/v2.0/keys` |
-| `auth0(domain, …)` | `https://{domain}/` | `https://{domain}/.well-known/jwks.json` |
-| `workosAuthKit(issuer, …)` | the AuthKit domain | `{issuer}/oauth2/jwks` |
-| `descope(projectId, …)` | `https://api.descope.com/{projectId}` | `…/.well-known/jwks.json` |
-| `scalekit(envUrl, …)` | the environment URL | `{envUrl}/keys` |
+The `subscribe` capability advertisement follows the same rule: a stateless server
+does **not** advertise the resources `subscribe` capability even after
+`enableResourceSubscriptions()` (the opt-in is inert in stateless mode), so a
+client never expects per-resource update push it could not receive. The
+server->client (elicit/sample/roots) gating is bypassed on **stdio** (a single
+implicit connection — see the stdio note above).
 
-**Non-DCR / opaque-token providers** (GitHub, Google) return an
-`OAuthProxyConfig` you finish with your proxy `baseUrl`/`resource` and a
-`tokenVerifier`, then mount via an `OAuthProxy`:
+The Streamable HTTP transport derives session minting purely from
+`server.mode` (`ServerMode.stateful` => mint and require `Mcp-Session-Id`;
+`ServerMode.stateless` => never). There is no separate `enableSessions` option.
 
-```d
-auto cfg = github("<client-id>", "<client-secret>", ["read:user"]);
-cfg.baseUrl = "https://mcp.example.com";
-cfg.resource = "https://mcp.example.com/mcp";
-cfg.tokenVerifier = (string t) @safe { /* map GitHub /user -> TokenInfo */ };
-auto proxy = new OAuthProxy(cfg);   // publishes DCR + AS metadata to clients
+## Examples
 
-auto g = google("<client-id>", "<client-secret>", ["openid", "email"]);
-```
+The repository ships ten runnable, self-verifying server/client pairs in
+[`examples/`](examples/). Each `client.d` is an end-to-end test that asserts the
+matching server's behaviour, and CI runs every pair over **both** stdio and
+Streamable HTTP.
 
-`github` pins `https://github.com/login/oauth/{authorize,access_token}`; `google`
-pins `https://accounts.google.com/o/oauth2/v2/auth` + `https://oauth2.googleapis.com/token`.
+| Example | What it shows | Server | Client |
+| --- | --- | --- | --- |
+| Tools | `@tool` handlers with typed args/results | [server](examples/tools/server.d) | [client](examples/tools/client.d) |
+| Prompts | `@prompt` templates | [server](examples/prompts/server.d) | [client](examples/prompts/client.d) |
+| Resources | resources + templates + `subscriptions/listen` push | [server](examples/resources/server.d) | [client](examples/resources/client.d) |
+| Caching | draft `CacheableResult` hints (`ttlMs`/`cacheScope`) | [server](examples/caching/server.d) | [client](examples/caching/client.d) |
+| Stateless draft | the stateless draft protocol (`server/discover`, per-request `_meta`) | [server](examples/stateless-draft/server.d) | [client](examples/stateless-draft/client.d) |
+| Streaming | progress notifications from a long-running tool | [server](examples/streaming/server.d) | [client](examples/streaming/client.d) |
+| MRTR | multi-round-trip tool input (carried in the result) | [server](examples/mrtr/server.d) | [client](examples/mrtr/client.d) |
+| Sampling | server-initiated LLM sampling (`ctx.sample`) | [server](examples/sampling/server.d) | [client](examples/sampling/client.d) |
+| Elicitation | server-initiated, typed user input (`ctx.elicit!T`) | [server](examples/elicitation/server.d) | [client](examples/elicitation/client.d) |
+| Auth | OAuth 2.1 protected HTTP resource server (HTTP only) | [server](examples/auth/server.d) | [client](examples/auth/client.d) |
 
-A runnable version of this server (stdio + HTTP) lives in
-[`examples/calculator`](examples/calculator/app.d):
+Annotate plain typed D functions with `@tool` / `@resource` / `@prompt` and register
+a whole module with `registerModule!(my.module)(server)` — the input schema (from
+the parameter types) and output schema (from the return type) are derived at
+compile time, and arguments/results are marshalled for you. A handler may take a
+trailing `RequestContext` parameter to report progress, log, or call back to the
+client (sampling/elicitation). For tools whose schema is only known at runtime,
+drop to `server.registerDynamicTool(Tool, delegate)` / `registerResource` /
+`registerDynamicPrompt`, which receive the raw `Json`.
 
-```bash
-dub run :calculator                 # stdio (for Claude Desktop)
-dub run :calculator -- --http 3000  # Streamable HTTP on port 3000
-```
+## Event-loop model
 
-## Example: a client calling that server
+`McpClient` speaks vibe.d async I/O: call every `McpClient` method from inside the
+vibe event loop — wrap your calls in a `runTask` under `runEventLoop()` (the
+examples' shared scaffold does this for you). The same API (`initialize` /
+`listTools` / `callTool` / `listResources` / `readResource` / `listPrompts` /
+`getPrompt` / `subscribe` / `setLogLevel`, plus the auto-paginated list helpers and
+`enableDraft()`) works over every transport. `McpClient.http(url)` builds a client
+over Streamable HTTP; `McpClient.spawn(command)` / `McpClient.stdio(readLine,
+writeLine)` build one over stdio. The server side is `runStreamableHttp(server,
+port)` or `runStdio(server)`.
 
-With the calculator server running over HTTP (`dub run :calculator -- --http 3000`),
-a client can connect and call the `add` tool:
-
-```d
-import mcp;
-import std.stdio : writeln;
-import vibe.core.core : runTask, runEventLoop, exitEventLoop;
-import vibe.data.json : Json;
-
-void main()
-{
-    // McpClient uses vibe.d async I/O, so drive it from a task on the event loop.
-    runTask(() nothrow {
-        scope (exit) exitEventLoop();
-        try
-        {
-            auto client = McpClient.http("http://127.0.0.1:3000/mcp");
-            client.initialize();
-
-            auto result = client.callTool("add", Json(["a": Json(2), "b": Json(40)]));
-            writeln(result.content[0].text);                       // text view: "42"
-            writeln(result.structuredContent["result"].get!long);  // structured: 42
-        }
-        catch (Exception e)
-        {
-            // handle connection / tool errors
-        }
-    });
-    runEventLoop();
-}
-```
-
-`McpClient` also offers `listTools` / `listResources` / `listResourceTemplates` /
-`listPrompts` (auto-paginated), `readResource`, `getPrompt`, `setBearerToken` for OAuth,
-and `enableDraft()` for the stateless draft protocol.
-
-The auto-paginated list helpers return their result object (`ListToolsResult`,
-`ListResourcesResult`, `ListResourceTemplatesResult`, `ListPromptsResult`) with every
-page's items aggregated into the items field (`.tools`, `.resources`,
-`.resourceTemplates`, `.prompts`) and `nextCursor` drained to null. Each result —
-along with `readResource`'s `ReadResourceResult` — also exposes the draft
-`CacheableResult` freshness hint as `.cache` (a `Nullable!CacheHint` with `ttlMs` and
-`cacheScope`), populated from the first page when the server sends one. On the server,
-supply the hint per result: pass a `CacheHint` to `registerResource` /
-`registerResourceTemplate`, or call `setListCacheHint("tools/list", CacheHint(...))`
-for a `*/list` method (hints are draft-gated and never alter 2025-11-25 output).
-
-`McpClient` is transport-agnostic: it speaks pure JSON-RPC over a
-`ClientTransport`. `McpClient.http(url)` builds one over Streamable HTTP;
-`McpClient.stdio(readLine, writeLine)` and `McpClient.spawn(command)` build one
-over stdio (see below). You can also construct `new McpClient(transport)` with a
-custom `ClientTransport` directly.
-
-### Connecting over stdio (launching a server as a subprocess)
-
-To act as an MCP host over the **stdio** transport — launching the server as a
-child process and speaking newline-delimited JSON-RPC over its stdin/stdout —
-use `McpClient.spawn`:
-
-```d
-import mcp;
-
-void main()
-{
-    auto client = McpClient.spawn(["dub", "run", ":calculator"]);
-    scope (exit) client.close();   // close child's stdin and wait for exit
-
-    client.initialize();
-
-    auto tools = client.listTools().tools;
-    auto result = client.callTool("add", Json(["a": Json(2), "b": Json(40)]));
-    // ...
-}
-```
-
-Over stdio this synchronous style is fully supported: there is no event loop and
-no background tasks, yet the client still answers server-initiated requests
-(`ping`, `sampling/createMessage`, `elicitation/create`, `roots/list`) that arrive
-while one of your calls is in flight — the reply is written inline to the server's
-stdin from the same read loop. Wire your `onSampling` / `onElicitation` /
-`onListRoots` handlers before the first call and they are invoked synchronously.
-
-### The event-loop model
-
-`McpClient` speaks vibe.d async I/O, and there is one rule: **call every
-`McpClient` method from inside the vibe event loop.** Over HTTP that is required —
-the reply to a server→client request travels on a separate HTTP request and is
-sent from a background task, which only runs while `runEventLoop()` is pumping (see
-the HTTP client example above, which wraps its calls in `runTask` /
-`runEventLoop`). Over stdio the requirement is relaxed: the read loop is the only
-channel, so replies are sent inline and the synchronous `spawn` example above needs
-no event loop. If you prefer one uniform model, drive the stdio client from a
-`runTask` under `runEventLoop()` exactly like the HTTP example — both work.
-
-The same `McpClient` API (`initialize` / `listTools` / `callTool` /
-`listResources` / `readResource` / `listPrompts` / `getPrompt` / `subscribe` /
-`setLogLevel`) works over every transport. For a custom byte channel, use
-`McpClient.stdio(readLine, writeLine)` with your own `readLine`/`writeLine`
-pair; `McpClient.spawn` is the convenience wrapper around
-`std.process.pipeProcess`. The server side is `runStdio(server)` /
-`serveStdio` in `mcp.transport.stdio`.
 
 ## Running the conformance suite
 
@@ -387,7 +255,7 @@ npx @modelcontextprotocol/conformance@0.1.16 client --command ./conformance-clie
 Both suites run automatically in CI on every push and pull request via the
 [`Conformance`](.github/workflows/conformance.yml) workflow, with the harness
 version pinned for reproducibility. The job fails on any scenario failure,
-keeping the **server 38/38** and **client 287/287** baseline honest.
+keeping the **server 39/39** and **client 287/287** baseline honest.
 
 ## Contributing
 

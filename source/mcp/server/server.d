@@ -11,6 +11,7 @@ import mcp.protocol.capabilities;
 import mcp.protocol.types;
 import mcp.protocol.draft;
 import mcp.server.context;
+import mcp.server.connection : ConnectionState;
 import mcp.transport.sse_context : ServerPushChannel, StreamCoordinator, SubscriptionFilter;
 
 @safe:
@@ -283,6 +284,25 @@ struct RegisteredPrompt
 	MrtrPromptHandler handler;
 }
 
+/// How a server manages per-connection state. The author chooses;
+/// `stateless` is the default. See the README "Statefulness" section for the
+/// full feature-gating matrix.
+enum ServerMode
+{
+	/// No per-connection state is stored across calls. On the draft protocol
+	/// this is "modern stateless" (per-request `_meta`, MRTR, no blocking
+	/// server->client requests); on pre-draft protocols this is "legacy
+	/// stateless" (`initialize`/`notifications/initialized` are no-ops, no
+	/// session id is minted, correlation features error). This is the default.
+	stateless,
+
+	/// Opt-in pre-draft session management: `initialize` mints an
+	/// `Mcp-Session-Id`, per-session state is isolated, and the full feature set
+	/// (elicitation, GET stream, subscriptions, `logging/setLevel`) is available.
+	/// The draft is excluded from negotiation in this mode.
+	stateful
+}
+
 /// The transport-agnostic core of an MCP server.
 ///
 /// `McpServer` owns registration and JSON-RPC dispatch. It has no I/O: feed it
@@ -290,6 +310,11 @@ struct RegisteredPrompt
 /// response to write back. Transports (stdio, HTTP) are thin drivers over this.
 final class McpServer
 {
+	/// The statefulness model this server was constructed with. Immutable after
+	/// construction. Transports derive session minting from this (`stateful` =>
+	/// mint/track an `Mcp-Session-Id`; `stateless` => never).
+	private ServerMode mode_ = ServerMode.stateless;
+
 	private string serverName;
 	private string serverVersion;
 	private Implementation serverInfo_;
@@ -300,23 +325,18 @@ final class McpServer
 	private RegisteredPrompt[string] prompts;
 	private CompleteResult delegate(CompleteRequest request) @safe typedCompletionHandler;
 	private bool loggingEnabled;
-	private string logLevel = "info";
 	private bool resourceSubscriptionsEnabled;
-	private bool[string] subscriptions;
 	private Nullable!TasksCapability tasksCapability;
 	private Json extensions = Json.undefined;
-	private ProtocolVersion negotiated = latestStable;
-	// The protocol version pinned for this CONNECTION's server-initiated push
-	// traffic (the standalone GET SSE stream / stdio listen channel). Set at
-	// `initialize` (to the negotiated version) and when a draft stdio
-	// `subscriptions/listen` session opens. It governs draft notification
-	// suppression/filtering on the unsolicited push path, which fires outside any
-	// request, so it cannot be a per-request value. Per-request dispatch no longer
-	// touches this field (issue #288): each request's effective version lives on
-	// its RequestScope.
-	private ProtocolVersion connectionVersion = latestStable;
-	private ClientCapabilities clientCaps;
-	private bool initialized;
+	// Per-connection mutable state — negotiated protocol version, client
+	// capabilities, log level, subscriptions, and the `inFlight` cancellation
+	// registry — lives on a single `ConnectionState`, threaded through dispatch
+	// (`handle`/`route`/`do*`) and read back by the notify/push path. This field
+	// is the fallback `ConnectionState` used when a request carries none (stdio,
+	// or a bare `handle(msg)` call): it is created at construction and re-pointed
+	// by transports at wire-up via `bindConnection`. HTTP requests instead carry
+	// their own per-session `ConnectionState` resolved per `Mcp-Session-Id`.
+	private ConnectionState activeConnection;
 	// Per-list draft `CacheableResult` freshness hints, keyed by the list method
 	// ("tools/list", "resources/list", "resources/templates/list", "prompts/list").
 	// Set via `setListCacheHint`; applied by the matching `do*` handler.
@@ -350,6 +370,12 @@ final class McpServer
 	// keeping the HTTP-only behaviour unchanged.
 	private void delegate(string) @safe stdioListenSink;
 	private string stdioListenSubscriptionId;
+	// The stdio `subscriptions/listen` stream's OWN per-stream/per-URI filter.
+	// stdio is single-connection, so this is the filter recorded by the active stdio
+	// listen; `notifyChange` consults it via `accepts(method, uri)` to deliver only the
+	// types/URIs that stream opted into. `SubscriptionFilter.init` (inactive) until a
+	// stdio listen opens, so an unset sink is also a no-op.
+	private SubscriptionFilter stdioListenFilter_;
 	private bool toolListChangedEnabled;
 	private bool resourcesListChangedEnabled;
 	private bool promptsListChangedEnabled;
@@ -359,11 +385,9 @@ final class McpServer
 	// for tools that declared an inputSchema, so the blast radius is small. Opt
 	// out with disableInputSchemaValidation().
 	private bool validateInputSchema_ = true;
-	// In-flight requests, keyed by their JSON-RPC id (string form), each holding
-	// a shared cancellation token. Populated for the duration of a request so an
-	// inbound `notifications/cancelled` can flip the matching token and the
-	// request's response can be suppressed (basic/utilities/cancellation).
-	private CancellationToken[string] inFlight;
+	// In-flight requests (keyed by their JSON-RPC id, scoped by connection token)
+	// live on the threaded `ConnectionState.inFlight` registry; see the
+	// `activeConnection` field above.
 	// Observer for inbound client-originated notifications (e.g.
 	// `notifications/roots/list_changed`). Invoked from `handleNotification`
 	// for any notification the server does not itself consume, giving the
@@ -395,12 +419,86 @@ final class McpServer
 		this.serverName = serverInfo.name;
 		this.serverVersion = serverInfo.version_;
 		this.instructions = instructions;
+		// The fallback `ConnectionState` for requests that carry none (stdio, bare
+		// handle). HTTP requests resolve their own per-session state. See
+		// `activeConnection`.
+		this.activeConnection = new ConnectionState;
+	}
+
+	/// Resolve the fallback `ConnectionState` for the connection currently being
+	/// served when a request does not carry its own. This returns the single
+	/// `activeConnection`; HTTP requests resolve their own per-session state keyed
+	/// by `Mcp-Session-Id` and pass it through the dispatch context instead.
+	private ConnectionState cs() @safe
+	{
+		return activeConnection;
+	}
+
+	/// Let a transport point this server at the `ConnectionState` it owns for a
+	/// mount/connection at wire-up (`mountMcp` / `runStdio` / `serveStdio`). Used
+	/// by the notify/push path, which fires OUTSIDE any request and therefore
+	/// cannot receive the state as a dispatch argument. This sets the fallback
+	/// `activeConnection`; HTTP requests still resolve their own per-session state.
+	package(mcp) void bindConnection(ConnectionState conn) @safe
+	{
+		if (conn !is null)
+			activeConnection = conn;
+	}
+
+	/// Construct a `stateless` server (the default mode). On the draft protocol
+	/// this is modern stateless (per-request `_meta`, MRTR); on pre-draft it is
+	/// legacy stateless (no-op `initialize`, no session id, correlation features
+	/// error). No `Mcp-Session-Id` is ever minted. See the README "Statefulness"
+	/// section.
+	static McpServer stateless(string name, string version_,
+			Nullable!string instructions = Nullable!string.init) @safe
+	{
+		auto s = new McpServer(name, version_, instructions);
+		s.mode_ = ServerMode.stateless;
+		return s;
+	}
+
+	/// As `stateless(string, string, ...)`, from a full `Implementation`.
+	static McpServer stateless(Implementation serverInfo,
+			Nullable!string instructions = Nullable!string.init) @safe
+	{
+		auto s = new McpServer(serverInfo, instructions);
+		s.mode_ = ServerMode.stateless;
+		return s;
+	}
+
+	/// Construct a `stateful` server (opt-in, pre-draft only). `initialize` mints
+	/// an `Mcp-Session-Id` and creates per-session state; the draft is excluded
+	/// from negotiation; the full feature set (elicitation, GET stream,
+	/// subscriptions, `logging/setLevel`) is available, all session-isolated.
+	static McpServer stateful(string name, string version_,
+			Nullable!string instructions = Nullable!string.init) @safe
+	{
+		auto s = new McpServer(name, version_, instructions);
+		s.mode_ = ServerMode.stateful;
+		return s;
+	}
+
+	/// As `stateful(string, string, ...)`, from a full `Implementation`.
+	static McpServer stateful(Implementation serverInfo,
+			Nullable!string instructions = Nullable!string.init) @safe
+	{
+		auto s = new McpServer(serverInfo, instructions);
+		s.mode_ = ServerMode.stateful;
+		return s;
+	}
+
+	/// The statefulness model this server was constructed with (default
+	/// `stateless`). Transports derive session minting from this.
+	ServerMode mode() const @safe
+	{
+		return mode_;
 	}
 
 	/// The protocol version negotiated with the client (valid after `initialize`).
 	ProtocolVersion negotiatedVersion() const @safe
 	{
-		return negotiated;
+		return activeConnection.negotiated;
 	}
 
 	/// Register a *dynamic* tool with a context-aware handler (progress /
@@ -583,10 +681,15 @@ final class McpServer
 	/// listeners reached; `0` when no GET stream is open.
 	size_t notifyResourceUpdated(string uri) @safe
 	{
-		if (!isSubscribed(uri))
-			return 0;
-		if (connectionVersion.isDraft && !listensFor("resourceSubscriptions"))
-			return 0;
+		// Delivery eligibility is driven by the OPEN LISTENERS' own filters, not the
+		// caller's connection state: a draft `subscriptions/listen` stream is a
+		// single self-contained long-lived request whose per-URI `SubscriptionFilter`
+		// decides whether it receives this URI, and it must work even on a stateless
+		// server (where the tool handler that calls this runs against a fresh
+		// per-request state, NOT the listen stream's state nor the stale
+		// `activeConnection`). The legacy 2025-era subscribe-then-deliver-on-GET path
+		// is preserved by `notifyChange`'s plain-GET fallback (`isSubscribed(uri)`), so
+		// no caller-`cs` gate is applied here.
 		Json params = Json.emptyObject;
 		params["uri"] = uri;
 		return notifyChange("notifications/resources/updated", params, uri);
@@ -616,7 +719,7 @@ final class McpServer
 	/// `initialize`).
 	ClientCapabilities clientCapabilities() const @safe
 	{
-		return clientCaps;
+		return activeConnection.clientCaps;
 	}
 
 	/// The effective input schema of a registered tool (the default empty-object
@@ -724,9 +827,29 @@ final class McpServer
 
 	/// Advertise the resources `subscribe` capability and accept
 	/// `resources/subscribe` + `resources/unsubscribe`.
+	///
+	/// `resources/subscribe` correlates more than one HTTP call (a
+	/// subscription set up on one call is honoured by a `notifications/resources/
+	/// updated` pushed on another), so it is per-peer state a `stateless` server
+	/// must not keep. In stateless mode this opt-in is therefore INERT: the
+	/// `subscribe` capability is not advertised and `resources/subscribe` /
+	/// `resources/unsubscribe` answer `-32601` (method not found). Construct the
+	/// server with `McpServer.stateful()` to actually enable subscriptions (keyed
+	/// on `Mcp-Session-Id`). See `effectiveResourceSubscriptions`.
 	void enableResourceSubscriptions() @safe
 	{
 		resourceSubscriptionsEnabled = true;
+	}
+
+	/// Whether resource subscriptions are effectively active: the author called
+	/// `enableResourceSubscriptions()` AND the server is `stateful`. A `stateless`
+	/// server keeps no per-peer state across HTTP calls, so the `subscribe`
+	/// capability is neither advertised nor honoured even if opted in. Gated on
+	/// the server MODE, not the protocol version, so modern-draft and
+	/// legacy stateless are treated identically.
+	private bool effectiveResourceSubscriptions() const @safe
+	{
+		return resourceSubscriptionsEnabled && mode_ == ServerMode.stateful;
 	}
 
 	/// Advertise the resources `listChanged` capability so `capabilities()`
@@ -779,7 +902,7 @@ final class McpServer
 	/// `initialize`). Null if the client advertised none.
 	Nullable!TasksCapability clientTasks() const @safe
 	{
-		return clientCaps.tasks;
+		return activeConnection.clientCaps.tasks;
 	}
 
 	/// Advertise a draft protocol extension (e.g. "io.modelcontextprotocol/tasks")
@@ -798,19 +921,19 @@ final class McpServer
 	/// (valid after `initialize`). `Json.undefined` if the client advertised none.
 	Json clientExtensions() const @safe
 	{
-		return clientCaps.extensions;
+		return activeConnection.clientCaps.extensions;
 	}
 
 	/// Whether a client is currently subscribed to updates for `uri`.
 	bool isSubscribed(string uri) const @safe
 	{
-		return (uri in subscriptions) !is null;
+		return (uri in activeConnection.subscriptions) !is null;
 	}
 
 	/// The most recently set log level (default "info").
 	string currentLogLevel() const @safe
 	{
-		return logLevel;
+		return activeConnection.logLevel;
 	}
 
 	/// The server->client push channel for *unsolicited* traffic — the messages
@@ -889,25 +1012,25 @@ final class McpServer
 				|| !tryParseVersion(meta.protocolVersion, mv) || !mv.isDraft)
 			return false;
 
-		// Pin the effective version so notify-suppression gating (listensFor) and
-		// any subscriptionId stamping behave as draft for this listen session.
-		// (#288: connectionVersion mirrors the sanctioned draft-listen path and is
-		// needed for notify-suppression/listensFor gating; it does not destroy
-		// negotiated session capabilities.) Do NOT overwrite the shared session
-		// `clientCaps` here (#77): the draft listen request's _meta capabilities are
-		// per-request and the draft `tools/call` gate already reads them from
-		// RequestMeta.fromParams(params); clobbering the field would wipe the
-		// capabilities a prior/concurrent stateful initialize negotiated.
-		connectionVersion = mv;
+		// Do NOT overwrite the shared session `clientCaps` here: the draft
+		// listen request's _meta capabilities are per-request and the draft
+		// `tools/call` gate already reads them from RequestMeta.fromParams(params);
+		// clobbering the field would wipe the capabilities a prior/concurrent
+		// stateful initialize negotiated. (Delivery on this stream is governed by
+		// the per-stream filter captured below, not a connection-level version.)
 		// Record the opted-in filters; the one-shot {acknowledged:true} result is
 		// discarded (the spec defines no such Result — the ack is a notification).
-		doSubscribeListen(msg.params);
+		doSubscribeListen(msg.params, cs());
 
 		// The listen request's id is the stream's subscriptionId; every
 		// notification on this channel (starting with the acknowledgement) is
 		// stamped with it in `params._meta`.
 		stdioListenSubscriptionId = rpcIdString(msg.id);
 		stdioListenSink = writeLine;
+		// Capture THIS listen request's parsed per-stream filter so subsequent
+		// notify*/notifyResourceUpdated deliver only the types/URIs it opted into
+		// (per-URI), independent of any other connection's state.
+		stdioListenFilter_ = lastListenFilter_;
 
 		// First message on the stream: the acknowledgement carrying the agreed-upon
 		// subset for THIS listen request only (draft basic/utilities/subscriptions
@@ -936,11 +1059,13 @@ final class McpServer
 		size_t delivered;
 		// Stdio `subscriptions/listen` channel (draft): the single stdout channel
 		// carries change notifications too, stamped with the listen subscriptionId.
-		// Per-stream filtering still applies — deliver only when this listen
-		// stream's recorded filter opted in for the method (mirroring the GET-stream
-		// eligibility below). Without this branch a stdio listener receives nothing,
-		// since there is no `pushChannel` on the stdio transport.
-		if (stdioListenSink !is null && connectionVersion.isDraft && globalListensForMethod(method))
+		// Delivery is driven by the stdio listen stream's OWN recorded filter
+		// (`lastListenFilter_`, the single stdio connection) via `accepts(method, uri)`
+		// — so a stdio listener subscribed to uriA does NOT receive an update for uriB
+		// (per-URI), via the per-stream `SubscriptionFilter`.
+		// Without this branch a stdio listener receives nothing, since there is no
+		// `pushChannel` on the stdio transport.
+		if (stdioListenSink !is null && stdioListenFilter_.accepts(method, uri))
 		{
 			auto note = withSubscriptionId(makeNotification(method, params),
 					stdioListenSubscriptionId);
@@ -949,42 +1074,39 @@ final class McpServer
 		}
 		if (pushChannel !is null)
 		{
-			if (connectionVersion.isDraft)
-			{
-				// Per-stream filtering: an active `subscriptions/listen` stream receives
-				// a type only if its own filter opted in. A plain GET listener (inactive
-				// filter, no per-stream opt-in) falls back to the global opt-in,
-				// preserving the legacy single-stream draft path while isolating
-				// concurrent streams.
-				const plainEligible = globalListensForMethod(method);
-				delivered += pushChannel.emitFiltered(method, params, uri, plainEligible);
-			}
-			else
-				delivered += pushChannel.notify(method, params);
+			// Listener-driven delivery: every open stream decides for itself.
+			// An ACTIVE `subscriptions/listen` stream (HTTP, any server mode incl.
+			// stateless) receives a type only if its own per-stream
+			// `SubscriptionFilter.accepts(method, uri)` opted in — `emitFiltered`
+			// consults that filter directly and ignores `plainEligible`, so the path is
+			// self-contained and never gated on the caller's (possibly stale)
+			// `activeConnection`. A plain GET listener (inactive filter — only the
+			// 2025-era standalone GET stream, never present in stateless/draft) falls
+			// back to `plainEligible`, preserving the legacy non-draft delivery:
+			// list-changed broadcasts unconditionally, while `resources/updated` honours
+			// the 2025-era subscribe-then-deliver gate (`isSubscribed(uri)`). On the
+			// draft single-connection path the global opt-in still gates that fallback.
+			const plainEligible = plainGetEligible(method, uri);
+			delivered += pushChannel.emitFiltered(method, params, uri, plainEligible);
 		}
 		return delivered;
 	}
 
-	/// Whether the server's *global* `subscriptions/listen` opt-in covers a given
-	/// change-notification `method`. Used only as the fallback eligibility for plain
-	/// GET listeners on the draft (active per-stream filters decide their own
-	/// eligibility); the four list/subscription change methods map to their filter
-	/// keys, and any other method is ungated.
-	private bool globalListensForMethod(string method) @safe
+	/// Eligibility for a plain (2025-era standalone GET) listener whose
+	/// `SubscriptionFilter` is inactive — the fallback `emitFiltered` applies only to
+	/// such listeners (an active `subscriptions/listen` stream decides via its own
+	/// filter and ignores this). This preserves the pre-draft delivery semantics: the
+	/// three list-changed notifications broadcast unconditionally, while
+	/// `notifications/resources/updated` is delivered only for a URI the client
+	/// subscribed to via `resources/subscribe` (`isSubscribed`). A plain GET stream
+	/// only exists on a non-draft connection (the draft answers GET with 405), so
+	/// there is no draft branch here — draft delivery is entirely per-stream-filter
+	/// driven.
+	private bool plainGetEligible(string method, string uri) @safe
 	{
-		switch (method)
-		{
-		case "notifications/tools/list_changed":
-			return listensFor("toolsListChanged");
-		case "notifications/prompts/list_changed":
-			return listensFor("promptsListChanged");
-		case "notifications/resources/list_changed":
-			return listensFor("resourcesListChanged");
-		case "notifications/resources/updated":
-			return listensFor("resourceSubscriptions");
-		default:
-			return true;
-		}
+		if (method == "notifications/resources/updated")
+			return isSubscribed(uri);
+		return true;
 	}
 
 	/// Initiate a server->client `ping` on the standalone GET SSE push channel
@@ -1014,8 +1136,8 @@ final class McpServer
 		if (tools.length > 0 || toolListChangedEnabled)
 			caps.tools = ListChangedCapability(toolListChangedEnabled);
 		if (resources.length > 0 || templates.length > 0
-				|| resourceSubscriptionsEnabled || resourcesListChangedEnabled)
-			caps.resources = ResourcesCapability(resourceSubscriptionsEnabled,
+				|| effectiveResourceSubscriptions() || resourcesListChangedEnabled)
+			caps.resources = ResourcesCapability(effectiveResourceSubscriptions(),
 					resourcesListChangedEnabled);
 		if (prompts.length > 0 || promptsListChangedEnabled)
 			caps.prompts = ListChangedCapability(promptsListChangedEnabled);
@@ -1103,9 +1225,10 @@ final class McpServer
 			if (sink is null)
 				return handle(m);
 			if (serverRequest is null)
-				return handle(m, new StdioContext(sink, readProgressToken(m.params), negotiated));
-			return handle(m, new StdioContext(sink, serverRequest, clientCaps,
-					readProgressToken(m.params), negotiated));
+				return handle(m, new StdioContext(sink,
+						readProgressToken(m.params), cs.negotiated));
+			return handle(m, new StdioContext(sink, serverRequest,
+					cs.clientCaps, readProgressToken(m.params), cs.negotiated));
 		};
 
 		if (!input.isBatch)
@@ -1146,7 +1269,18 @@ final class McpServer
 		// than a mutable field on the shared server instance, so a handler that
 		// yields mid-flight cannot have its effective version flipped by another
 		// concurrently-dispatched request (issue #288).
-		ProtocolVersion effective = negotiated;
+		// Resolve the connection state for THIS request from
+		// the context when it carries one (stateful HTTP: the SessionManager-owned
+		// state for its `Mcp-Session-Id`; stateless HTTP: a fresh per-request state
+		// built from the effective version + `_meta`), else fall back to the single
+		// bound `activeConnection` (stdio / bare-`handle`). The state is threaded
+		// through dispatch (`route`/`do*`) so two sessions sharing one McpServer can
+		// never observe each other's negotiated version / caps / subscriptions /
+		// in-flight ids.
+		auto conn = connectionStateOf(ctx);
+		if (conn is null)
+			conn = activeConnection;
+		ProtocolVersion effective = conn.negotiated;
 		auto meta = RequestMeta.fromParams(msg.params);
 		// On stateful (2025-era) protocols logging is governed once-per-session by
 		// `logging/setLevel`, so emission is always permitted (and filtered by the
@@ -1163,7 +1297,7 @@ final class McpServer
 		// logging IS enabled this is the previous default (true), so the wire
 		// output for compliant servers is unchanged. (#396)
 		bool loggingRequested = loggingEnabled;
-		string requestLogLevel = logLevel;
+		string requestLogLevel = conn.logLevel;
 		if (meta.protocolVersion.length)
 		{
 			ProtocolVersion mv;
@@ -1212,10 +1346,10 @@ final class McpServer
 		const idKey = inFlightKey(connectionTokenOf(ctx), msg.id);
 		const trackable = idKey.length && msg.method != "initialize";
 		if (trackable)
-			inFlight[idKey] = token;
+			conn.inFlight[idKey] = token;
 		scope (exit)
 			if (trackable)
-				inFlight.remove(idKey);
+				conn.inFlight.remove(idKey);
 
 		// Install the per-request scope so handlers see the right statelessness
 		// (MRTR vs blocking), the input responses carried on a retried draft
@@ -1226,7 +1360,7 @@ final class McpServer
 
 		try
 		{
-			auto result = route(msg.method, msg.params, scoped, effective);
+			auto result = route(msg.method, msg.params, scoped, effective, conn);
 			// Per spec, a receiver of a cancellation "SHOULD NOT send a response
 			// for the cancelled request" — suppress it if cancelled meanwhile.
 			if (token.cancelled)
@@ -1498,16 +1632,25 @@ final class McpServer
 
 	private void handleNotification(Message msg, RequestContext ctx) @safe
 	{
+		// Resolve the per-session/per-request state from the context
+		// (stateful HTTP -> the SessionManager-owned state for this session id) and
+		// fall back to the single bound `activeConnection` otherwise, mirroring
+		// `handleRequest`. A `notifications/initialized` then flips the right
+		// session's flag and a `notifications/cancelled` matches the right session's
+		// in-flight registry.
+		auto conn = connectionStateOf(ctx);
+		if (conn is null)
+			conn = activeConnection;
 		switch (msg.method)
 		{
 		case "notifications/initialized":
-			initialized = true;
+			conn.initialized = true;
 			break;
 		case "notifications/cancelled":
 			// Resolve the cancellation against the connection it arrived on (#13):
 			// a `notifications/cancelled` on connection B must only match in-flight
 			// keys connection B registered.
-			handleCancelled(msg.params, connectionTokenOf(ctx));
+			handleCancelled(msg.params, connectionTokenOf(ctx), conn);
 			break;
 		case "notifications/roots/list_changed":
 			if (onRootsListChanged_ !is null)
@@ -1529,7 +1672,7 @@ final class McpServer
 	/// can stop and its response is suppressed. A cancellation for a request that
 	/// is unknown or already completed is ignored, per "This notification
 	/// indicates ... the request ... should be terminated" being best-effort.
-	private void handleCancelled(Json params, string connToken) @safe
+	private void handleCancelled(Json params, string connToken, ConnectionState conn) @safe
 	{
 		if (params.type != Json.Type.object || "requestId" !in params)
 			return;
@@ -1542,8 +1685,8 @@ final class McpServer
 		// using the same normalization `rpcIdString` produced the stored id with, so
 		// a numeric cancellation requestId matches a numeric (or string) listen id.
 		// On a match, drop the delivery sink and clear the recorded per-stream
-		// filter so `globalListensForMethod` reports nothing and any subsequent
-		// notify*/notifyResourceUpdated writes nothing.
+		// filter so the listener-driven notify path matches nothing and any
+		// subsequent notify*/notifyResourceUpdated writes nothing.
 		if (stdioListenSink !is null && stdioListenSubscriptionId.length
 				&& rpcIdString(params["requestId"]) == stdioListenSubscriptionId)
 		{
@@ -1551,31 +1694,34 @@ final class McpServer
 			stdioListenSubscriptionId = null;
 			// Drop every piece of listen state this single stdio stream recorded so
 			// a later notify*/notifyResourceUpdated writes nothing: the global
-			// `listenFilters` (which `globalListensForMethod` reads via `listensFor`),
-			// the per-URI resource `subscriptions` and their recorded URI list, and
-			// the per-stream `lastListenFilter_`. Stdio is single-connection, so the
-			// caller is the only listener and clearing all of it is correct.
+			// `listenFilters` (read by `listensFor`), the per-URI resource
+			// `subscriptions` and their recorded URI list, the per-stream
+			// `lastListenFilter_`, and the stdio delivery filter `stdioListenFilter_`.
+			// Stdio is single-connection, so the caller is the only listener and
+			// clearing all of it is correct.
 			foreach (u; listenResourceUris)
-				subscriptions.remove(u);
+				conn.subscriptions.remove(u);
 			listenResourceUris = null;
 			listenFilters = null;
 			lastListenFilter_ = SubscriptionFilter.init;
+			stdioListenFilter_ = SubscriptionFilter.init;
 			return;
 		}
 
 		const key = inFlightKey(connToken, params["requestId"]);
 		if (key.length == 0)
 			return;
-		if (auto token = key in inFlight)
+		if (auto token = key in conn.inFlight)
 			token.cancel();
 	}
 
-	private Json route(string method, Json params, RequestContext ctx, ProtocolVersion ver) @safe
+	private Json route(string method, Json params, RequestContext ctx,
+			ProtocolVersion ver, ConnectionState conn) @safe
 	{
 		switch (method)
 		{
 		case "initialize":
-			return doInitialize(params);
+			return doInitialize(params, conn);
 		case "server/discover":
 			// `server/discover` is a draft-only RPC (the stable handshake uses
 			// `initialize`). On a non-draft negotiated session it MUST be reported
@@ -1585,26 +1731,21 @@ final class McpServer
 				throw methodNotFound(method);
 			return doDiscover();
 		case "subscriptions/listen":
-			// A draft subscriptions/listen opens a draft server->client push session;
-			// pin the connection's push-path version so later notify* gate as draft
-			// (issue #288: the per-request path no longer mutates this).
-			//
-			// NOTE (#51): subscriptions/listen is conceptually a draft-only RPC, but
-			// the stdio transport intentionally accepts a pre-draft (no _meta version)
-			// listen on the normal request/reply path (see the stdio transport test
-			// "a pre-draft subscriptions/listen still takes the normal request/reply
-			// path"). Hard-gating on usesSubscriptionsListen here would regress that
-			// supported fallback, so the version pin stays guarded by isDraft rather
-			// than rejecting non-draft callers.
-			if (ver.isDraft)
-				connectionVersion = ver;
-			return doSubscribeListen(params);
+			// subscriptions/listen is an ordinary request — it records the opted-in
+			// per-stream filter (consulted later by the listener-driven notify path)
+			// and is NOT special-cased for the push version. It is
+			// conceptually a draft-only RPC, but the stdio transport intentionally
+			// accepts a pre-draft (no _meta version) listen on the normal
+			// request/reply path (see the stdio transport test "a pre-draft
+			// subscriptions/listen still takes the normal request/reply path"), so it
+			// is not hard-gated on the version here.
+			return doSubscribeListen(params, conn);
 		case "ping":
 			return Json.emptyObject;
 		case "tools/list":
 			return doListTools(params, ver);
 		case "tools/call":
-			return doCallTool(params, ctx, ver);
+			return doCallTool(params, ctx, ver, conn);
 		case "resources/list":
 			return doListResources(params, ver);
 		case "resources/templates/list":
@@ -1620,11 +1761,11 @@ final class McpServer
 			// versions still honour the RPC, so 2025-era wire output is unchanged.
 			if (ver.isDraft)
 				throw methodNotFound(method);
-			return doSubscribe(params);
+			return doSubscribe(params, conn);
 		case "resources/unsubscribe":
 			if (ver.isDraft)
 				throw methodNotFound(method);
-			return doUnsubscribe(params);
+			return doUnsubscribe(params, conn);
 		case "prompts/list":
 			return doListPrompts(params, ver);
 		case "prompts/get":
@@ -1632,7 +1773,7 @@ final class McpServer
 		case "completion/complete":
 			return doComplete(params);
 		case "logging/setLevel":
-			return doSetLevel(params, ver);
+			return doSetLevel(params, ver, conn);
 		case "tasks/list":
 			return doTasksList(params);
 		case "tasks/get":
@@ -1733,7 +1874,7 @@ final class McpServer
 	/// the `resourceSubscriptions` opt-in is flagged when the array is non-empty.
 	/// For backward compatibility a flat top-level filter (the pre-spec shape) is
 	/// still accepted when no `notifications` object is present.
-	private Json doSubscribeListen(Json params) @safe
+	private Json doSubscribeListen(Json params, ConnectionState conn) @safe
 	{
 		Json filter = Json.undefined;
 		if (params.type == Json.Type.object && "notifications" in params
@@ -1774,7 +1915,7 @@ final class McpServer
 						if (rs[i].type == Json.Type.string)
 						{
 							const u = rs[i].get!string;
-							subscriptions[u] = true;
+							conn.subscriptions[u] = true;
 							// Preserve the agreed URI list so the acknowledgement
 							// can echo `resourceSubscriptions` as the spec's
 							// string[] (deduplicated, request order kept).
@@ -1826,6 +1967,15 @@ final class McpServer
 		case "resourcesListChanged":
 			return resourcesListChangedEnabled;
 		case "resourceSubscriptions":
+			// Capability-based, NOT mode-gated. The stateless HTTP
+			// transport refuses subscriptions/listen BEFORE it reaches the server core
+			// (handlePost -> -32601), so this is only consulted on the stdio listen
+			// path, where there is a single implicit connection and resource-update
+			// push is allowed in any mode (the requirement's stdio carve-out). Gating
+			// it on the server MODE here would wrongly break stdio listen for a
+			// stateless server; the HTTP no-shared-state guarantee is enforced at the
+			// transport, and the `subscribe` CAPABILITY advertisement is mode-gated in
+			// `capabilities()` / `effectiveResourceSubscriptions`.
 			return resourceSubscriptionsEnabled;
 		default:
 			return false;
@@ -1969,31 +2119,36 @@ final class McpServer
 		throw new McpException(ver.resourceNotFoundCode, "Resource not found: " ~ uri, data);
 	}
 
-	private Json doSubscribe(Json params) @safe
+	private Json doSubscribe(Json params, ConnectionState conn) @safe
 	{
 		// `subscribe` is an optional resources capability (server/resources:
 		// "whether the client can subscribe to be notified of changes to individual
 		// resources"); a server advertises it only after enableResourceSubscriptions().
 		// A server that never advertised it MUST answer with -32601 rather than
 		// silently accepting, matching logging/setLevel's capability gating.
-		if (!resourceSubscriptionsEnabled)
+		// A stateless server keeps no per-peer subscription state across
+		// HTTP calls, so effectiveResourceSubscriptions() is false in stateless
+		// mode even when enableResourceSubscriptions() was called — yielding -32601.
+		if (!effectiveResourceSubscriptions())
 			throw methodNotFound("resources/subscribe");
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/subscribe requires a string 'uri'");
-		subscriptions[params["uri"].get!string] = true;
+		conn.subscriptions[params["uri"].get!string] = true;
 		return Json.emptyObject;
 	}
 
-	private Json doUnsubscribe(Json params) @safe
+	private Json doUnsubscribe(Json params, ConnectionState conn) @safe
 	{
 		// Gated on the same optional `subscribe` capability as doSubscribe: a server
 		// that never advertised it MUST answer with -32601 rather than silently
 		// accepting an unsubscribe for a subscription it could never have created.
-		if (!resourceSubscriptionsEnabled)
+		// Also -32601 in stateless mode (no per-peer state across
+		// HTTP calls), via effectiveResourceSubscriptions().
+		if (!effectiveResourceSubscriptions())
 			throw methodNotFound("resources/unsubscribe");
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/unsubscribe requires a string 'uri'");
-		subscriptions.remove(params["uri"].get!string);
+		conn.subscriptions.remove(params["uri"].get!string);
 		return Json.emptyObject;
 	}
 
@@ -2088,7 +2243,7 @@ final class McpServer
 		throw methodNotFound("completion/complete");
 	}
 
-	private Json doSetLevel(Json params, ProtocolVersion ver) @safe
+	private Json doSetLevel(Json params, ProtocolVersion ver, ConnectionState conn) @safe
 	{
 		// The draft (2026-07-28) removed the `logging/setLevel` RPC: log level is
 		// now configured purely per-request via `_meta["io.modelcontextprotocol/
@@ -2114,14 +2269,14 @@ final class McpServer
 		// anything else).
 		if (logLevelRank(level) < 0)
 			throw invalidParams("Invalid log level: " ~ level);
-		logLevel = level;
+		conn.logLevel = level;
 		return Json.emptyObject;
 	}
 
-	private Json doInitialize(Json params) @safe
+	private Json doInitialize(Json params, ConnectionState conn) @safe
 	{
 		auto p = InitializeParams.fromJson(params);
-		negotiated = negotiate(p.protocolVersion);
+		conn.negotiated = negotiate(p.protocolVersion);
 		// The draft revision defines NO `initialize`/`InitializeResult`: draft
 		// peers establish the session via `server/discover` plus per-request
 		// `_meta`, never the stateful `initialize` handshake. So the `initialize`
@@ -2131,17 +2286,14 @@ final class McpServer
 		// supports — SHOULD be the latest"), clamp a draft negotiation down to the
 		// latest stable rather than emitting an InitializeResult that claims a
 		// version with no initialize semantics (issue #419).
-		if (negotiated.isDraft)
-			negotiated = latestStable;
-		clientCaps = p.capabilities;
-		// Pin the connection's push-path version so unsolicited server->client
-		// notifications gate correctly on draft after initialize (issue #288).
-		connectionVersion = negotiated;
+		if (conn.negotiated.isDraft)
+			conn.negotiated = latestStable;
+		conn.clientCaps = p.capabilities;
 
 		InitializeResult result;
-		result.protocolVersion = negotiated.toWire;
-		result.capabilities = capabilities().forVersion(negotiated);
-		result.serverInfo = serverInfo_.forVersion(negotiated);
+		result.protocolVersion = conn.negotiated.toWire;
+		result.capabilities = capabilities().forVersion(conn.negotiated);
+		result.serverInfo = serverInfo_.forVersion(conn.negotiated);
 		result.instructions = instructions;
 		return result.toJson();
 	}
@@ -2164,7 +2316,8 @@ final class McpServer
 		return maybeCache(result, listHint("tools/list"), ver);
 	}
 
-	private Json doCallTool(Json params, RequestContext ctx, ProtocolVersion ver) @safe
+	private Json doCallTool(Json params, RequestContext ctx,
+			ProtocolVersion ver, ConnectionState conn) @safe
 	{
 		if ("name" !in params || params["name"].type != Json.Type.string)
 			throw invalidParams("tools/call requires a string 'name'");
@@ -2182,7 +2335,7 @@ final class McpServer
 		// draft protocol, or from the session capabilities negotiated at
 		// `initialize` on the stateful 2025-era protocols.
 		const ClientCapabilities declared = ver.isDraft
-			? RequestMeta.fromParams(params).clientCapabilities : clientCaps;
+			? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
 		bool anyMissing;
 		const missing = entry.requiredClientCapabilities.missingFrom(declared, anyMissing);
 		if (anyMissing)
@@ -2463,6 +2616,22 @@ version (unittest)
 	private McpServer makeTestServer() @safe
 	{
 		auto s = new McpServer("test-srv", "0.1.0");
+		registerAddTool(s);
+		return s;
+	}
+
+	// A stateful variant for tests that exercise correlation
+	// features (resources/subscribe, subscriptions/listen resourceSubscriptions,
+	// notifyResourceUpdated) — these are only available on a stateful server.
+	private McpServer makeStatefulTestServer() @safe
+	{
+		auto s = McpServer.stateful("test-srv", "0.1.0");
+		registerAddTool(s);
+		return s;
+	}
+
+	private void registerAddTool(McpServer s) @safe
+	{
 		Tool add = {name: "add", description: nullable("Add two integers")};
 		s.registerDynamicTool(add, (Json args) @safe {
 			const a = args["a"].get!int;
@@ -2472,7 +2641,6 @@ version (unittest)
 			r.structuredContent = Json(["result": Json(a + b)]);
 			return r;
 		});
-		return s;
 	}
 
 	private Message req(long id, string method, Json params = Json.emptyObject) @safe
@@ -3374,14 +3542,21 @@ version (unittest) private final class ConnCtx : RequestContext, ConnectionScope
 	import mcp.auth.resource_server : TokenInfo;
 
 	private string token_;
-	this(string token) @safe
+	private ConnectionState connState_;
+	this(string token, ConnectionState connState = null) @safe
 	{
 		this.token_ = token;
+		this.connState_ = connState;
 	}
 
 	string connectionToken() @safe
 	{
 		return token_;
+	}
+
+	ConnectionState connectionState() @safe
+	{
+		return connState_;
 	}
 
 	bool isCancelled() @safe
@@ -4426,7 +4601,9 @@ unittest  // server reads the extensions a client advertises at initialize
 
 unittest  // resources/subscribe and unsubscribe track URIs and return {}
 {
-	auto s = new McpServer("t", "1");
+	// resources/subscribe correlates more than one HTTP call, so it is
+	// only available on a STATEFUL server (a stateless server answers -32601).
+	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
@@ -4622,9 +4799,11 @@ unittest  // stdio subscriptions/listen does not wipe negotiated session clientC
 			"stdio subscriptions/listen wiped the negotiated session clientCaps");
 }
 
-unittest  // subscribe capability is advertised only when enabled
+unittest  // subscribe capability is advertised only when enabled (on a stateful server)
 {
-	auto s = new McpServer("t", "1");
+	// subscribe is only advertised by a STATEFUL server (a stateless
+	// server keeps the opt-in inert — see effectiveResourceSubscriptions).
+	auto s = McpServer.stateful("t", "1");
 	Resource r = {uri: "u", name: "u"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("u", "text/plain", "x"));
 	assert(!s.capabilities().resources.get.subscribe);
@@ -4950,7 +5129,8 @@ unittest  // draft resources/read unknown uri uses invalidParams (-32602)
 
 unittest  // subscriptions/listen reads the spec-shaped filter nested under params.notifications
 {
-	auto s = makeTestServer();
+	// resourceSubscriptions opt-in requires a stateful server.
+	auto s = makeStatefulTestServer();
 	// The server must support the requested notification types for them to be
 	// recorded/acknowledged (draft basic/utilities/subscriptions Acknowledgment).
 	s.enableToolsListChanged();
@@ -4971,7 +5151,8 @@ unittest  // subscriptions/listen reads the spec-shaped filter nested under para
 
 unittest  // subscriptions/listen still accepts the legacy flat (top-level) filter shape
 {
-	auto s = makeTestServer();
+	// resourceSubscriptions opt-in requires a stateful server.
+	auto s = makeStatefulTestServer();
 	s.enableToolsListChanged();
 	s.enableResourceSubscriptions();
 	Json p = Json.emptyObject;
@@ -4997,7 +5178,8 @@ unittest  // subscriptions/listen with an empty resourceSubscriptions array does
 
 unittest  // acknowledgedListenSubset reflects exactly the opted-in change types
 {
-	auto s = makeTestServer();
+	// resourceSubscriptions opt-in requires a stateful server.
+	auto s = makeStatefulTestServer();
 	s.enableToolsListChanged();
 	s.enableResourceSubscriptions();
 	// Nothing opted in yet -> empty object.
@@ -5024,7 +5206,8 @@ unittest  // acknowledgedListenSubset reflects exactly the opted-in change types
 
 unittest  // ack echoes every opted-in resourceSubscriptions URI in request order
 {
-	auto s = makeTestServer();
+	// resourceSubscriptions opt-in requires a stateful server.
+	auto s = makeStatefulTestServer();
 	s.enableResourceSubscriptions();
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json([
@@ -5091,7 +5274,8 @@ unittest  // per-stream ack does not leak a concurrent stream's opt-in (#430)
 	// report toolsListChanged (and A's must NOT report resourceSubscriptions). The
 	// fix builds each ack from the per-stream filter the transport captured right
 	// after routing that listen request — never the server-wide accumulator.
-	auto s = makeTestServer();
+	// resourceSubscriptions opt-in requires a stateful server.
+	auto s = makeStatefulTestServer();
 	s.enableToolsListChanged();
 	s.enableResourceSubscriptions();
 
@@ -5200,7 +5384,8 @@ unittest  // subscriptions/listen ack omits resourceSubscriptions when subscript
 
 unittest  // subscriptions/listen ack keeps resourceSubscriptions once enabled (#398)
 {
-	auto s = new McpServer("t", "1");
+	// resourceSubscriptions opt-in requires a stateful server.
+	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
@@ -5754,7 +5939,8 @@ unittest  // notify delivers unsolicited notifications to GET-stream listeners
 
 unittest  // notifyResourceUpdated emits resources/updated for a subscribed uri
 {
-	auto s = new McpServer("t", "1");
+	// resources/subscribe + notifyResourceUpdated require a stateful server.
+	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
@@ -5792,7 +5978,8 @@ unittest  // notifyResourceUpdated emits params that are exactly { uri } (no non
 {
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	// resources/subscribe + notifyResourceUpdated require a stateful server.
+	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
@@ -5973,7 +6160,8 @@ unittest  // enableResourceSubscriptions advertises resources capability with ze
 	// A server that supports resource update subscriptions declares
 	// enableResourceSubscriptions() so clients learn they may resources/subscribe,
 	// even before any resource is registered (per 2025-11-25 resources §Capabilities).
-	auto s = new McpServer("t", "1");
+	// subscribe is advertised only by a STATEFUL server.
+	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	auto caps = s.capabilities();
 	assert(!caps.resources.isNull);
@@ -6091,7 +6279,8 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	// MUST reach A and never B, even though B registered first.
 	import std.algorithm : canFind;
 
-	auto s = makeTestServer();
+	// resourceSubscriptions opt-in requires a stateful server.
+	auto s = makeStatefulTestServer();
 	s.enableToolsListChanged();
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
@@ -6132,25 +6321,143 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	assert(aFrame.length == 0); // A did not subscribe to resources
 }
 
-unittest  // draft: notifyPromptsListChanged suppressed unless client opted in
+unittest  // STATELESS HTTP subscriptions/listen delivers resources/updated per-URI
 {
+	// The draft subscriptions/listen RPC is a single self-contained long-lived HTTP
+	// request; the draft protocol is stateless-only, so it MUST work on a stateless
+	// server. notifyResourceUpdated is invoked from a tool handler whose per-request
+	// state is NOT the listen stream's state and NOT the stale activeConnection;
+	// delivery eligibility must therefore come from the OPEN LISTENER's own filter,
+	// not the caller's connection state. A listener that opted into note:///a must
+	// receive an update for note:///a (stamped with its subscriptionId) and NOTHING
+	// for note:///b.
+	import std.algorithm : canFind;
+
+	auto s = McpServer.stateless("t", "1");
+	s.enableResourceSubscriptions();
+	auto coord = new StreamCoordinator;
+	auto push = s.serverPushChannel(coord);
+
+	// Simulate handleListenStream attaching the listen stream's own per-URI filter
+	// (note:///a only) on the push channel. The server's activeConnection (what cs()
+	// returns) is the stale default: NOT draft, NOT subscribed to note:///a.
+	SubscriptionFilter f;
+	f.active = true;
+	f.resourceSubscriptions = true;
+	f.resourceUris = ["note:///a"];
+	string frame;
+	push.addListener((string fr) @safe { frame = fr; }, "listen-1", f);
+
+	// Subscribed URI: delivered down THAT stream, stamped with the subscriptionId.
+	const a = s.notifyResourceUpdated("note:///a");
+	assert(a == 1, "stateless listen stream must receive an update for its subscribed URI");
+	assert(frame.canFind("notifications/resources/updated"));
+	assert(frame.canFind("note:///a"));
+	assert(frame.canFind("listen-1"), "the update must be stamped with the subscriptionId");
+
+	// Unsubscribed URI: nothing (per-URI filter).
+	frame = null;
+	const b = s.notifyResourceUpdated("note:///b");
+	assert(b == 0, "stateless listen stream must NOT receive an update for an un-opted URI");
+	assert(frame.length == 0);
+}
+
+unittest  // STATELESS HTTP subscriptions/listen delivers resources/list_changed per opt-in
+{
+	// A list_changed notification reaches a listen stream that opted into
+	// resourcesListChanged and does not reach one that did not — driven by each
+	// listener's own filter on a stateless server.
+	import std.algorithm : canFind;
+
+	auto s = McpServer.stateless("t", "1");
+	s.enableResourcesListChanged();
+	auto coord = new StreamCoordinator;
+	auto push = s.serverPushChannel(coord);
+
+	// Stream A opted into resourcesListChanged; stream B did not (toolsListChanged only).
+	SubscriptionFilter fa;
+	fa.active = true;
+	fa.resourcesListChanged = true;
+	SubscriptionFilter fb;
+	fb.active = true;
+	fb.toolsListChanged = true;
+	string aFrame, bFrame;
+	push.addListener((string fr) @safe { aFrame = fr; }, "A", fa);
+	push.addListener((string fr) @safe { bFrame = fr; }, "B", fb);
+
+	const n = s.notifyResourcesListChanged();
+	assert(n == 1, "exactly the opted-in listen stream receives resources/list_changed");
+	assert(aFrame.canFind("notifications/resources/list_changed"));
+	assert(aFrame.canFind("A"));
+	assert(bFrame.length == 0, "a stream that did not opt into resourcesListChanged gets nothing");
+}
+
+unittest  // stdio listen sink is per-URI filtered (subscribed delivered, other not)
+{
+	// stdio parity: the stdio subscriptions/listen sink must filter resource-update
+	// notifications by the stdio listen stream's OWN recorded filter (per-URI), so a
+	// stdio listener subscribed to uriA does NOT receive an update for uriB.
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.enableResourceSubscriptions();
+
+	string[] sink;
+	// Open a draft stdio listen subscribed to note:///a only.
+	Json na = Json.emptyObject;
+	na["resourceSubscriptions"] = Json([Json("note:///a")]);
+	Json p = Json.emptyObject;
+	p["notifications"] = na;
+	auto served = s.tryServeStdioListen(draftReq(1, "subscriptions/listen", p), (string line) @safe {
+		sink ~= line;
+	});
+	assert(served, "draft subscriptions/listen must be served over stdio");
+	// First sink line is the acknowledgement.
+	assert(sink.length == 1);
+	assert(sink[0].canFind("notifications/subscriptions/acknowledged"));
+
+	// Subscribed URI: delivered on the stdio sink, stamped with the subscriptionId.
+	const a = s.notifyResourceUpdated("note:///a");
+	assert(a == 1, "stdio listen must receive an update for its subscribed URI");
+	assert(sink.length == 2);
+	assert(sink[1].canFind("notifications/resources/updated"));
+	assert(sink[1].canFind("note:///a"));
+
+	// Un-opted URI: nothing more on the sink.
+	const b = s.notifyResourceUpdated("note:///b");
+	assert(b == 0, "stdio listen must NOT receive an update for an un-opted URI");
+	assert(sink.length == 2);
+}
+
+unittest  // draft subscriptions/listen: a stream gets list_changed only if its own filter opted in
+{
+	// Delivery is listener-driven: an active `subscriptions/listen` stream receives
+	// `notifications/prompts/list_changed` only when its OWN per-stream
+	// `SubscriptionFilter` opted into promptsListChanged — no connection-level
+	// version is consulted, since a draft connection never has a plain GET stream.
 	auto s = new McpServer("t", "1");
 	s.enablePromptsListChanged();
-	s.connectionVersion = ProtocolVersion.draft;
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
-	string[] received;
-	ch.addListener((string f) @safe { received ~= f; });
-	// No subscriptions/listen opt-in: suppressed.
+
+	// A listen stream whose active filter did NOT opt into promptsListChanged: suppressed.
+	string[] a;
+	SubscriptionFilter noPrompts;
+	noPrompts.active = true;
+	noPrompts.toolsListChanged = true;
+	const idA = ch.addListener((string f) @safe { a ~= f; }, "listen-a", noPrompts);
 	assert(s.notifyPromptsListChanged() == 0);
-	assert(received.length == 0);
-	// After opting in via subscriptions/listen, it is delivered. The listen RPC is
-	// draft-only (#51), so it must be dispatched as a draft request for the opt-in
-	// to be recorded.
-	Json p = Json.emptyObject;
-	p["promptsListChanged"] = true;
-	s.handle(draftReq(1, "subscriptions/listen", p));
+	assert(a.length == 0);
+	ch.removeListener(idA);
+
+	// A listen stream that DID opt into promptsListChanged: delivered.
+	string[] b;
+	SubscriptionFilter withPrompts;
+	withPrompts.active = true;
+	withPrompts.promptsListChanged = true;
+	ch.addListener((string f) @safe { b ~= f; }, "listen-b", withPrompts);
 	assert(s.notifyPromptsListChanged() == 1);
+	assert(b.length == 1);
 }
 
 version (unittest)
@@ -6497,4 +6804,273 @@ unittest  // inputRequired(reqs, T) does not collide with the string overload
 	auto resp = ToolResponse.inputRequired(cast(InputRequest[]) null, "raw-blob");
 	auto j = resp.toJson();
 	assert(j["requestState"].get!string == "raw-blob");
+}
+
+unittest  // the default constructor yields a stateless server
+{
+	auto s = new McpServer("t", "1");
+	assert(s.mode == ServerMode.stateless);
+}
+
+unittest  // stateless() factory builds a stateless server
+{
+	auto s = McpServer.stateless("t", "1");
+	assert(s.mode == ServerMode.stateless);
+}
+
+unittest  // stateful() factory builds a stateful server
+{
+	auto s = McpServer.stateful("t", "1");
+	assert(s.mode == ServerMode.stateful);
+}
+
+unittest  // the Implementation-based factories preserve the requested mode
+{
+	auto a = McpServer.stateless(Implementation("a", "1"));
+	auto b = McpServer.stateful(Implementation("b", "1"));
+	assert(a.mode == ServerMode.stateless);
+	assert(b.mode == ServerMode.stateful);
+}
+
+unittest  // a stateful server negotiates a draft request DOWN to latest stable
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = McpServer.stateful("t", "1");
+	auto init = parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"initialize",`
+			~ `"params":{"protocolVersion":"2026-07-28","capabilities":{},`
+			~ `"clientInfo":{"name":"c","version":"1"}}}`);
+	auto msg = Message(init);
+	auto resp = s.handle(msg);
+	assert(!resp.isNull);
+	const ver = resp.get["result"]["protocolVersion"].get!string;
+	assert(ver != "2026-07-28", "stateful must not negotiate the draft");
+	assert(ver == latestStable.toWire);
+}
+
+unittest  // a stateful server does not serve server/discover (draft-only RPC)
+{
+	import vibe.data.json : parseJsonString;
+
+	// A stateful server's negotiated version is pre-draft, so server/discover —
+	// which is gated on the draft — is unknown (-32601 method not found).
+	auto s = McpServer.stateful("t", "1");
+	auto disc = parseJsonString(`{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}}`);
+	auto resp = s.handle(Message(disc));
+	assert(!resp.isNull);
+	assert("error" in resp.get);
+	assert(resp.get["error"]["code"].get!long == -32601);
+}
+
+unittest  // dispatch resolves the ConnectionState carried by the context
+{
+	import mcp.server.connection : ConnectionState;
+	import vibe.data.json : parseJsonString;
+
+	// A context carrying its own ConnectionState makes the server dispatch against
+	// THAT state, never the single bound activeConnection. logging/setLevel must
+	// land on the carried state and leave activeConnection untouched.
+	auto s = new McpServer("t", "1");
+	s.enableLogging();
+	auto state = new ConnectionState;
+	auto ctx = new ConnCtx("sess-X", state);
+	auto set = parseJsonString(
+			`{"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"error"}}`);
+	s.handle(Message(set), ctx);
+	assert(state.logLevel == "error", "setLevel must mutate the context's ConnectionState");
+	assert(s.activeConnection.logLevel == "info",
+			"setLevel must NOT touch the bound activeConnection when the ctx carries state");
+}
+
+unittest  // cross-talk: two contexts on ONE server keep independent state
+{
+	import mcp.server.connection : ConnectionState;
+	import vibe.data.json : parseJsonString;
+
+	// Two sessions (A and B) share one McpServer, each with its own ConnectionState
+	// (as the SessionManager would hand the transport). Mutating A's log level and
+	// a subscription via dispatch must be invisible to B's state.
+	// resources/subscribe requires a stateful server.
+	auto s = McpServer.stateful("t", "1");
+	s.enableLogging();
+	s.enableResourceSubscriptions();
+	auto stateA = new ConnectionState;
+	auto stateB = new ConnectionState;
+
+	auto setA = parseJsonString(
+			`{"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"error"}}`);
+	s.handle(Message(setA), new ConnCtx("A", stateA));
+	auto subA = parseJsonString(
+			`{"jsonrpc":"2.0","id":2,"method":"resources/subscribe","params":{"uri":"res://a"}}`);
+	s.handle(Message(subA), new ConnCtx("A", stateA));
+
+	assert(stateA.logLevel == "error");
+	assert(("res://a" in stateA.subscriptions) !is null);
+	assert(stateB.logLevel == "info", "session B saw session A's log level (cross-talk)");
+	assert(("res://a" in stateB.subscriptions) is null,
+			"session B saw session A's subscription (cross-talk)");
+}
+
+unittest  // notifications/initialized flips only the carried state
+{
+	import mcp.server.connection : ConnectionState;
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	auto state = new ConnectionState;
+	auto note = parseJsonString(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+	s.handle(Message(note), new ConnCtx("sess", state));
+	assert(state.initialized, "initialized must be recorded on the carried state");
+	assert(!s.activeConnection.initialized,
+			"initialized must NOT touch the bound activeConnection when the ctx carries state");
+}
+
+unittest  // bare handle(msg) uses the single bound activeConnection
+{
+	import vibe.data.json : parseJsonString;
+
+	// A NullContext carries no ConnectionState, so the server falls back to its
+	// single bound activeConnection — the stdio / in-process single-peer model.
+	auto s = new McpServer("t", "1");
+	s.enableLogging();
+	auto set = parseJsonString(
+			`{"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"error"}}`);
+	s.handle(Message(set));
+	assert(s.activeConnection.logLevel == "error", "bare handle must fall back to activeConnection");
+}
+
+unittest  // a stateless server does NOT advertise the subscribe capability
+{
+	// resources/subscribe correlates more than one HTTP call, so a stateless
+	// server (the default) keeps it inert: even after enableResourceSubscriptions()
+	// the `subscribe` resources capability is NOT advertised.
+	auto s = McpServer.stateless("t", "1");
+	s.registerResource(Resource("res://x", "x"), () @safe {
+		ResourceContents c;
+		return c;
+	});
+	s.enableResourceSubscriptions();
+	auto caps = s.capabilities();
+	assert(!caps.resources.isNull);
+	assert(!caps.resources.get.subscribe,
+			"a stateless server must NOT advertise the resources subscribe capability");
+}
+
+unittest  // resources/subscribe on a stateless server -> -32601
+{
+	// Even with enableResourceSubscriptions() called, a stateless server answers
+	// resources/subscribe AND resources/unsubscribe with method-not-found (-32601):
+	// there is no per-peer subscription state across HTTP calls.
+	auto s = McpServer.stateless("t", "1");
+	s.enableResourceSubscriptions();
+
+	Json sub = Json.emptyObject;
+	sub["uri"] = "res://x";
+	auto resp = s.handle(req(1, "resources/subscribe", sub)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound,
+			"stateless resources/subscribe must be -32601");
+
+	auto resp2 = s.handle(req(2, "resources/unsubscribe", sub)).get;
+	assert(resp2["error"]["code"].get!int == ErrorCode.methodNotFound,
+			"stateless resources/unsubscribe must be -32601");
+}
+
+unittest  // a STATEFUL server advertises + honours subscribe
+{
+	// The stateful counterpart: enableResourceSubscriptions() is effective, so the
+	// capability is advertised and resources/subscribe succeeds end to end.
+	auto s = McpServer.stateful("t", "1");
+	s.registerResource(Resource("res://x", "x"), () @safe {
+		ResourceContents c;
+		return c;
+	});
+	s.enableResourceSubscriptions();
+	assert(s.capabilities().resources.get.subscribe,
+			"a stateful server MUST advertise the subscribe capability");
+
+	Json sub = Json.emptyObject;
+	sub["uri"] = "res://x";
+	auto resp = s.handle(req(1, "resources/subscribe", sub)).get;
+	assert("error" !in resp, "stateful resources/subscribe must succeed");
+	assert(s.isSubscribed("res://x"), "stateful subscribe must record the subscription");
+
+	auto resp2 = s.handle(req(2, "resources/unsubscribe", sub)).get;
+	assert("error" !in resp2, "stateful resources/unsubscribe must succeed");
+	assert(!s.isSubscribed("res://x"), "stateful unsubscribe must drop the subscription");
+}
+
+unittest  // stateless requests get INDEPENDENT ConnectionState; the server keeps no reference
+{
+	// Two requests bound to two distinct (transient) ConnectionStates — as the
+	// stateless HTTP transport builds per request — must not bleed into each other,
+	// and dispatching against one must not retain it on the server. Drive via two
+	// ConnCtx carrying separate ConnectionStates.
+	auto s = McpServer.stateless("t", "1");
+	s.enableLogging();
+
+	auto a = new ConnectionState;
+	auto b = new ConnectionState;
+	a.negotiated = ProtocolVersion.v2025_06_18;
+	b.negotiated = ProtocolVersion.v2025_11_25;
+
+	// A logging/setLevel routed against A's state must mutate ONLY A's state.
+	Json lvl = Json.emptyObject;
+	lvl["level"] = "error";
+	s.handle(req(1, "logging/setLevel", lvl), new ConnCtx("", a));
+	assert(a.logLevel == "error", "request A's state must record its own log level");
+	assert(b.logLevel == "info", "request B's independent state must be untouched");
+	// The server retains no reference to the per-request state between calls: its
+	// bound activeConnection is neither A nor B.
+	assert(s.activeConnection !is a && s.activeConnection !is b,
+			"a stateless server must not retain a reference to a per-request ConnectionState");
+}
+
+unittest  // two stateful sessions on ONE server cannot observe each other's state
+{
+	// Drive via SessionManager.stateFor + two contexts, exactly as the stateful HTTP
+	// transport resolves per-session state. A's negotiated version / logLevel /
+	// subscription / in-flight id must be invisible to B.
+	import mcp.transport.session : SessionManager;
+	import mcp.server.context : CancellationToken;
+
+	auto s = McpServer.stateful("t", "1");
+	s.enableLogging();
+	s.enableResourceSubscriptions();
+
+	auto mgr = new SessionManager;
+	const idA = mgr.create();
+	const idB = mgr.create();
+	auto csA = mgr.stateFor(idA);
+	auto csB = mgr.stateFor(idB);
+	assert(csA !is csB);
+
+	auto ctxA = new ConnCtx(idA, csA);
+	auto ctxB = new ConnCtx(idB, csB);
+
+	// Mutate session A via real dispatch: set a log level and a subscription.
+	Json lvl = Json.emptyObject;
+	lvl["level"] = "error";
+	s.handle(req(1, "logging/setLevel", lvl), ctxA);
+	Json sub = Json.emptyObject;
+	sub["uri"] = "res://a";
+	s.handle(req(2, "resources/subscribe", sub), ctxA);
+	csA.negotiated = ProtocolVersion.v2025_03_26;
+	csA.inFlight["i:1"] = new CancellationToken;
+
+	// Session B does its OWN dispatch (a different log level + its own subscription)
+	// via ctxB, so the two sessions are exercised concurrently on the one server.
+	Json lvlB = Json.emptyObject;
+	lvlB["level"] = "warning";
+	s.handle(req(3, "logging/setLevel", lvlB), ctxB);
+	Json subB = Json.emptyObject;
+	subB["uri"] = "res://b";
+	s.handle(req(4, "resources/subscribe", subB), ctxB);
+
+	// NONE of A's state may be visible through B's, and vice versa.
+	assert(csB.logLevel == "warning", "session B must keep its own log level");
+	assert(csA.logLevel == "error", "session A must keep its own log level");
+	assert(("res://a" in csB.subscriptions) is null, "session B saw session A's subscription");
+	assert(("res://b" in csA.subscriptions) is null, "session A saw session B's subscription");
+	assert(csB.negotiated != ProtocolVersion.v2025_03_26, "session B saw session A's version");
+	assert(("i:1" in csB.inFlight) is null, "session B saw session A's in-flight id");
 }

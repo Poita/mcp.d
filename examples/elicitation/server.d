@@ -52,7 +52,10 @@ enum ushort defaultPort = 9355;
 
 void main(string[] args) @safe
 {
-	auto server = new McpServer("elicitation-example", "1.0.0",
+	// This tool calls ctx.elicit (a server->client request). Over
+	// HTTP that requires a session, so the server runs in STATEFUL mode (works
+	// over stdio too — single implicit session).
+	auto server = McpServer.stateful("elicitation-example", "1.0.0",
 			nullable("2025-era blocking elicitation demo (stdio + Streamable HTTP)."));
 	// Register every @tool method on the API object in one call; each tool's
 	// input schema and argument marshalling are derived from the method signature.

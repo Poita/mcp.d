@@ -121,6 +121,15 @@ final class ResourcesApi
 
 void main(string[] args) @safe
 {
+	// This example is STATELESS (the default) because its client
+	// speaks the draft (inline resources/read cache hints + the draft
+	// subscriptions/listen push mechanism), and a stateful server excludes the
+	// draft from negotiation. Its push flow (subscriptions/listen + push
+	// notifications/resources/updated) correlates more than one HTTP call, so it is
+	// available only over STDIO here (a single implicit connection). Over HTTP a
+	// stateless server correctly forbids subscriptions/listen, so the client skips
+	// the push phase there. (For HTTP resource-update push, use a stateful server
+	// with resources/subscribe + the standalone GET SSE stream.)
 	auto server = new McpServer("resources-example", "1.0.0");
 
 	registerHandlers(server, new ResourcesApi(server));
