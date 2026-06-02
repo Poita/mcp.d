@@ -152,7 +152,7 @@ private Json parametersSchema(alias func)() @safe
 	alias names = ParameterIdentifierTuple!func;
 	alias types = Parameters!func;
 	// ParameterDefaultValueTuple yields `void` for a parameter with no declared
-	// D-level default and the default value's type otherwise (#43).
+	// D-level default and the default value's type otherwise.
 	alias defs = ParameterDefaultValueTuple!func;
 
 	Json props = Json.emptyObject;
@@ -180,7 +180,7 @@ private Json parametersSchema(alias func)() @safe
 						static assert(!isFloatingPoint!P, "@mcpHeader cannot be applied to a floating-point ('number') parameter '" ~ names[i] ~ "'; x-mcp-header permits only integer/string/boolean");
 						ps["x-mcp-header"] = attr.name;
 					}
-				// #293: fold the @describe UDA into the property's JSON Schema
+				// Fold the @describe UDA into the property's JSON Schema
 				// `description` (a standard annotation keyword, valid in every
 				// protocol version).
 				{
@@ -191,7 +191,7 @@ private Json parametersSchema(alias func)() @safe
 				props[names[i]] = ps;
 			}
 			// A parameter is required only when it is neither Nullable nor carries a
-			// declared D-level default value (#43). ParameterDefaultValueTuple gives
+			// declared D-level default value. ParameterDefaultValueTuple gives
 			// `void` for params without a default.
 			static if (!isInstanceOf!(Nullable, P) && is(defs[i] == void))
 				required ~= Json(names[i]);
@@ -206,8 +206,8 @@ private Json parametersSchema(alias func)() @safe
 }
 
 /// Convert one JSON argument value into the parameter type `P`, falling back to
-/// the parameter's declared D-level default `def` when the argument is absent
-/// (#43). `def` is the value from `ParameterDefaultValueTuple` for this slot.
+/// the parameter's declared D-level default `def` when the argument is absent.
+/// `def` is the value from `ParameterDefaultValueTuple` for this slot.
 private P marshalArgDefault(P, alias def)(Json args, string name) @safe
 {
 	static if (is(P : RequestContext))
@@ -273,7 +273,7 @@ private P marshalScalar(P)(Json v) @safe
 	// Deserialize through EnumByNamePolicy so any enum — whether `P` itself or
 	// an enum field nested inside a struct/array — is read from its schema-
 	// declared string member name rather than vibe's default integer base
-	// value (#42). Non-enum types are unaffected by the policy.
+	// value. Non-enum types are unaffected by the policy.
 	return () @trusted {
 		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, P)(v);
 	}();
@@ -321,8 +321,7 @@ private CallToolResult toToolResult(R)(R ret) @safe
 		CallToolResult r;
 		// Serialize through EnumByNamePolicy so enum leaves (the value itself, or
 		// enums nested in structs/arrays) emit their schema-declared string member
-		// name, matching the tool's outputSchema instead of an integer base value
-		// (#41).
+		// name, matching the tool's outputSchema instead of an integer base value.
 		static if (is(R == struct))
 			auto structured = () @trusted {
 				return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(ret);
@@ -534,10 +533,10 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 	{
 		static if (!is(P : RequestContext))
 		{
-			// #293: populate PromptArgument.description from the @describe UDA.
+			// Populate PromptArgument.description from the @describe UDA.
 			enum d = describeFor!(overload, i, names[i]);
 			// A prompt argument is required only when it is neither Nullable nor
-			// carries a declared D-level default (#43), matching the tool path.
+			// carries a declared D-level default, matching the tool path.
 			descriptor.arguments ~= PromptArgument(names[i], d.length
 					? nullable(d) : Nullable!string.init,
 					!isInstanceOf!(Nullable, P) && is(defs[i] == void));
@@ -567,7 +566,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 				// rather than escaping as an internal error (-32603), mirroring
 				// the resource-template path. Protocol errors thrown by the
 				// marshaller are passed through unchanged so an inner
-				// invalidParams is not double-wrapped (#23).
+				// invalidParams is not double-wrapped.
 				try
 					argv[i] = marshalArg!P(args, names[i]);
 				catch (McpException e)
@@ -680,7 +679,7 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 			{
 				// A captured URI variable is always a string; convert it into the
 				// declared parameter type instead of silently defaulting it to
-				// `P.init` (#45). Surface a conversion failure as InvalidParams
+				// `P.init`. Surface a conversion failure as InvalidParams
 				// rather than throwing a raw exception.
 				if (auto pv = names[i] in params)
 				{
@@ -817,8 +816,8 @@ version (unittest)
 	import mcp.server.server : ToolResponse;
 	import mcp.protocol.draft : InputRequest;
 
-	// Separate fixture exercising the UDAs added for issue #295: icons, _meta,
-	// annotation title, per-resource cache hint, and MRTR (ToolResponse) tools.
+	// Fixture exercising icons, _meta, annotation title, per-resource cache
+	// hint, and MRTR (ToolResponse) tools.
 	private final class ExtApi
 	{
 		@tool("draw", "Draw something")
@@ -984,7 +983,7 @@ unittest  // @resource and @prompt reflection register and dispatch
 	assert(pr["result"]["messages"][0]["content"]["text"].get!string == "Tell me about MCP");
 }
 
-unittest  // #23 @prompt enum arg given an invalid member -> InvalidParams (-32602)
+unittest  // @prompt enum arg given an invalid member -> InvalidParams (-32602)
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.errors : ErrorCode;
@@ -1001,7 +1000,7 @@ unittest  // #23 @prompt enum arg given an invalid member -> InvalidParams (-326
 			"invalid enum prompt arg must map to -32602, not -32603");
 }
 
-unittest  // #23 @prompt integer arg given a non-numeric string -> InvalidParams (-32602)
+unittest  // @prompt integer arg given a non-numeric string -> InvalidParams (-32602)
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.errors : ErrorCode;
@@ -1077,7 +1076,7 @@ unittest  // @audience/@priority value UDAs: annotations appear in resources/lis
 	assert(foundReadme && foundDoc);
 }
 
-unittest  // #300 @audience value UDA: multiple roles round-trip into annotations
+unittest  // @audience value UDA: multiple roles round-trip into annotations
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1157,7 +1156,7 @@ unittest  // marker hint UDAs: hints are serialized into annotations
 	assert("annotations" !in addTool);
 }
 
-unittest  // #300 marker-UDA hints: @readOnly + @hintTitle produce the wire shape
+unittest  // marker-UDA hints: @readOnly + @hintTitle produce the wire shape
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1243,7 +1242,7 @@ unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schem
 	assert(m["region"] == "Mcp-Param-Region");
 }
 
-unittest  // #293 @describe UDA: parameter descriptions appear in tool inputSchema
+unittest  // @describe UDA: parameter descriptions appear in tool inputSchema
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1265,7 +1264,7 @@ unittest  // #293 @describe UDA: parameter descriptions appear in tool inputSche
 	assert(props["count"]["description"].get!string == "how many copies");
 }
 
-unittest  // #293 @describe UDA: prompt argument descriptions appear in prompts/list
+unittest  // @describe UDA: prompt argument descriptions appear in prompts/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1321,7 +1320,7 @@ version (unittest) private auto MakeListMessage()
 	return Message(makeRequest(Json(99), "tools/list", Json.emptyObject));
 }
 
-unittest  // #295 @icon UDA: tool icons appear in tools/list
+unittest  // @icon UDA: tool icons appear in tools/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1341,7 +1340,7 @@ unittest  // #295 @icon UDA: tool icons appear in tools/list
 	assert(drawTool["icons"][0]["sizes"][0].get!string == "48x48");
 }
 
-unittest  // #295 @meta UDA: tool descriptor `_meta` appears in tools/list
+unittest  // @meta UDA: tool descriptor `_meta` appears in tools/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1357,7 +1356,7 @@ unittest  // #295 @meta UDA: tool descriptor `_meta` appears in tools/list
 	assert(drawTool["_meta"]["category"].get!string == "art");
 }
 
-unittest  // #295 @hintTitle: annotation-level title appears in annotations
+unittest  // @hintTitle: annotation-level title appears in annotations
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1375,7 +1374,7 @@ unittest  // #295 @hintTitle: annotation-level title appears in annotations
 	assert(drawTool["annotations"]["readOnlyHint"].get!bool == true);
 }
 
-unittest  // #295 MRTR UDA tool: returning ToolResponse.inputRequired surfaces inputRequests
+unittest  // MRTR UDA tool: returning ToolResponse.inputRequired surfaces inputRequests
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1392,7 +1391,7 @@ unittest  // #295 MRTR UDA tool: returning ToolResponse.inputRequired surfaces i
 	assert(r["result"]["inputRequests"]["req1"]["method"].get!string == "elicitation/create");
 }
 
-unittest  // #295 MRTR UDA tool: returning ToolResponse.complete produces a normal result
+unittest  // MRTR UDA tool: returning ToolResponse.complete produces a normal result
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1407,7 +1406,7 @@ unittest  // #295 MRTR UDA tool: returning ToolResponse.complete produces a norm
 	assert(r["result"]["content"][0]["text"].get!string == "seeded X");
 }
 
-unittest  // #295 @icon / @meta UDA on a resource: appear in resources/list
+unittest  // @icon / @meta UDA on a resource: appear in resources/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1425,7 +1424,7 @@ unittest  // #295 @icon / @meta UDA on a resource: appear in resources/list
 	assert(cachedRes["_meta"]["origin"].get!string == "db");
 }
 
-unittest  // #339 @icon UDA on a @prompt: icons appear in prompts/list
+unittest  // @icon UDA on a @prompt: icons appear in prompts/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1445,7 +1444,7 @@ unittest  // #339 @icon UDA on a @prompt: icons appear in prompts/list
 	assert(greeting["icons"][0]["sizes"][0].get!string == "32x32");
 }
 
-unittest  // #339 @meta UDA on a @prompt: descriptor `_meta` appears in prompts/list
+unittest  // @meta UDA on a @prompt: descriptor `_meta` appears in prompts/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1477,7 +1476,7 @@ version (unittest) private auto draftRead(string uri) @safe
 	return Message(makeRequest(Json(1), "resources/read", params));
 }
 
-unittest  // #295 @cache UDA on a resource: draft resources/read carries CacheableResult fields
+unittest  // @cache UDA on a resource: draft resources/read carries CacheableResult fields
 {
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new ExtApi);
@@ -1487,7 +1486,7 @@ unittest  // #295 @cache UDA on a resource: draft resources/read carries Cacheab
 	assert(rr["result"]["cacheScope"].get!string == "private");
 }
 
-unittest  // #295 @cache UDA: pre-draft resources/read has NO cache fields (no wire regression)
+unittest  // @cache UDA: pre-draft resources/read has NO cache fields (no wire regression)
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1520,32 +1519,32 @@ version (unittest)
 		Color[] colors;
 	}
 
-	// Fixtures for the enum (de)serialization (#41/#42) and default-value (#43)
-	// and resource-template typed-parameter (#45) audit fixes.
+	// Fixtures for enum (de)serialization, default values, and resource-template
+	// typed parameters.
 	private final class EnumApi
 	{
-		// #41: returning a struct holding an enum must emit the enum's string name.
+		// Returning a struct holding an enum must emit the enum's string name.
 		@tool("box", "Return a struct holding a color")
 		ColorBox box(Color c) @safe
 		{
 			return ColorBox(c);
 		}
 
-		// #41: bare enum return is wrapped under `result` as a string.
+		// Bare enum return is wrapped under `result` as a string.
 		@tool("pick", "Return a bare color")
 		Color pick() @safe
 		{
 			return Color.blue;
 		}
 
-		// #41: array of enums nested in a struct.
+		// Array of enums nested in a struct.
 		@tool("palette", "Return a palette")
 		Palette palette() @safe
 		{
 			return Palette([Color.red, Color.green]);
 		}
 
-		// #42: a struct param containing an enum supplied by name.
+		// A struct param containing an enum supplied by name.
 		@tool("name", "Name the color in a box")
 		string name(ColorBox b) @safe
 		{
@@ -1554,7 +1553,7 @@ version (unittest)
 			return b.e.to!string;
 		}
 
-		// #43: a parameter with a D-level default.
+		// A parameter with a D-level default.
 		@tool("limited", "Tool with a defaulted parameter")
 		int limited(int n, int limit = 7) @safe
 		{
@@ -1579,7 +1578,7 @@ version (unittest)
 	}
 }
 
-unittest  // #41 enum field in a returned struct serializes by member name
+unittest  // enum field in a returned struct serializes by member name
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1592,7 +1591,7 @@ unittest  // #41 enum field in a returned struct serializes by member name
 	assert(r["result"]["structuredContent"]["e"].get!string == "green");
 }
 
-unittest  // #41 bare enum return is wrapped under `result` as its string name
+unittest  // bare enum return is wrapped under `result` as its string name
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1605,7 +1604,7 @@ unittest  // #41 bare enum return is wrapped under `result` as its string name
 	assert(r["result"]["structuredContent"]["result"].get!string == "blue");
 }
 
-unittest  // #41 array of enums inside a struct serializes by name
+unittest  // array of enums inside a struct serializes by name
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1620,7 +1619,7 @@ unittest  // #41 array of enums inside a struct serializes by name
 	assert(colors[1].get!string == "green");
 }
 
-unittest  // #41 enum output passes the tool's own outputSchema validation
+unittest  // enum output passes the tool's own outputSchema validation
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1636,7 +1635,7 @@ unittest  // #41 enum output passes the tool's own outputSchema validation
 	assert(r["result"]["structuredContent"]["e"].get!string == "red");
 }
 
-unittest  // #42 enum nested in a struct param is supplied as its schema string
+unittest  // enum nested in a struct param is supplied as its schema string
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1651,7 +1650,7 @@ unittest  // #42 enum nested in a struct param is supplied as its schema string
 	assert(r["result"]["content"][0]["text"].get!string == "blue");
 }
 
-unittest  // #43 a defaulted parameter is absent from inputSchema required
+unittest  // a defaulted parameter is absent from inputSchema required
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1679,7 +1678,7 @@ unittest  // #43 a defaulted parameter is absent from inputSchema required
 	assert(hasN);
 }
 
-unittest  // #43 omitting a defaulted arg passes the declared default, not P.init
+unittest  // omitting a defaulted arg passes the declared default, not P.init
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1693,7 +1692,7 @@ unittest  // #43 omitting a defaulted arg passes the declared default, not P.ini
 	assert(r["result"]["structuredContent"]["result"].get!int == 10);
 }
 
-unittest  // #45 resource-template int param receives the captured value, not T.init
+unittest  // resource-template int param receives the captured value, not T.init
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1705,7 +1704,7 @@ unittest  // #45 resource-template int param receives the captured value, not T.
 	assert(rr["result"]["contents"][0]["text"].get!string == "widget-42");
 }
 
-unittest  // #45 resource-template enum param is parsed by member name
+unittest  // resource-template enum param is parsed by member name
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1717,7 +1716,7 @@ unittest  // #45 resource-template enum param is parsed by member name
 	assert(rr["result"]["contents"][0]["text"].get!string == "hue-green");
 }
 
-unittest  // #45 resource-template invalid scalar yields an InvalidParams error
+unittest  // resource-template invalid scalar yields an InvalidParams error
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
