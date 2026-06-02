@@ -833,8 +833,14 @@ final class McpServer
 
 		// Pin the effective version so notify-suppression gating (listensFor) and
 		// any subscriptionId stamping behave as draft for this listen session.
+		// (#288: connectionVersion mirrors the sanctioned draft-listen path and is
+		// needed for notify-suppression/listensFor gating; it does not destroy
+		// negotiated session capabilities.) Do NOT overwrite the shared session
+		// `clientCaps` here (#77): the draft listen request's _meta capabilities are
+		// per-request and the draft `tools/call` gate already reads them from
+		// RequestMeta.fromParams(params); clobbering the field would wipe the
+		// capabilities a prior/concurrent stateful initialize negotiated.
 		connectionVersion = mv;
-		clientCaps = meta.clientCapabilities;
 		// Record the opted-in filters; the one-shot {acknowledged:true} result is
 		// discarded (the spec defines no such Result — the ack is a notification).
 		doSubscribeListen(msg.params);
@@ -1237,8 +1243,15 @@ final class McpServer
 	/// is unchanged. `toJson` emits `ttlMs`/`cacheScope`, `fromJson` parses them.
 	private Json maybeCache(R)(R result, Nullable!CacheHint hint, ProtocolVersion ver) @safe
 	{
-		if (ver.cacheableResults && !hint.isNull)
-			result.cache = hint;
+		// The draft `CacheableResult` schema makes the freshness hint mandatory on
+		// the cacheable list/read results: a draft client must always be told how
+		// long a result may be cached. When the application configured no explicit
+		// per-list/per-resource hint, emit a conservative default of `ttlMs:0`
+		// (do-not-cache, public scope) rather than omitting the field (#57). On the
+		// pre-draft (2025-era) protocols `cacheableResults` is false, so the field
+		// is never written and the stable wire output is unchanged.
+		if (ver.cacheableResults)
+			result.cache = hint.isNull ? nullable(CacheHint(0)) : hint;
 		return result.toJson();
 	}
 
@@ -1388,6 +1401,36 @@ final class McpServer
 	{
 		if (params.type != Json.Type.object || "requestId" !in params)
 			return;
+
+		// Stdio `subscriptions/listen` teardown (#56): the listen request returns no
+		// JSON-RPC response (its "result" is the long-lived notification stream), so
+		// it is never registered in `inFlight` and cannot be cancelled via the
+		// token path. Per basic/utilities/cancellation a client cancels the listen
+		// by `notifications/cancelled` referencing the listen request id. Compare
+		// using the same normalization `rpcIdString` produced the stored id with, so
+		// a numeric cancellation requestId matches a numeric (or string) listen id.
+		// On a match, drop the delivery sink and clear the recorded per-stream
+		// filter so `globalListensForMethod` reports nothing and any subsequent
+		// notify*/notifyResourceUpdated writes nothing.
+		if (stdioListenSink !is null && stdioListenSubscriptionId.length
+				&& rpcIdString(params["requestId"]) == stdioListenSubscriptionId)
+		{
+			stdioListenSink = null;
+			stdioListenSubscriptionId = null;
+			// Drop every piece of listen state this single stdio stream recorded so
+			// a later notify*/notifyResourceUpdated writes nothing: the global
+			// `listenFilters` (which `globalListensForMethod` reads via `listensFor`),
+			// the per-URI resource `subscriptions` and their recorded URI list, and
+			// the per-stream `lastListenFilter_`. Stdio is single-connection, so the
+			// caller is the only listener and clearing all of it is correct.
+			foreach (u; listenResourceUris)
+				subscriptions.remove(u);
+			listenResourceUris = null;
+			listenFilters = null;
+			lastListenFilter_ = SubscriptionFilter.init;
+			return;
+		}
+
 		const key = cancellationKey(params["requestId"]);
 		if (key.length == 0)
 			return;
@@ -1402,11 +1445,25 @@ final class McpServer
 		case "initialize":
 			return doInitialize(params);
 		case "server/discover":
+			// `server/discover` is a draft-only RPC (the stable handshake uses
+			// `initialize`). On a non-draft negotiated session it MUST be reported
+			// as unknown rather than served, mirroring the resources/subscribe and
+			// logging/setLevel draft gating (issue #51).
+			if (!ver.supportsDiscover)
+				throw methodNotFound(method);
 			return doDiscover();
 		case "subscriptions/listen":
 			// A draft subscriptions/listen opens a draft server->client push session;
 			// pin the connection's push-path version so later notify* gate as draft
 			// (issue #288: the per-request path no longer mutates this).
+			//
+			// NOTE (#51): subscriptions/listen is conceptually a draft-only RPC, but
+			// the stdio transport intentionally accepts a pre-draft (no _meta version)
+			// listen on the normal request/reply path (see the stdio transport test
+			// "a pre-draft subscriptions/listen still takes the normal request/reply
+			// path"). Hard-gating on usesSubscriptionsListen here would regress that
+			// supported fallback, so the version pin stays guarded by isDraft rather
+			// than rejecting non-draft callers.
 			if (ver.isDraft)
 				connectionVersion = ver;
 			return doSubscribeListen(params);
@@ -1444,9 +1501,67 @@ final class McpServer
 			return doComplete(params);
 		case "logging/setLevel":
 			return doSetLevel(params, ver);
+		case "tasks/list":
+			return doTasksList(params);
+		case "tasks/get":
+			return doTasksGet(params);
+		case "tasks/result":
+			return doTasksResult(params);
+		case "tasks/cancel":
+			return doTasksCancel(params);
 		default:
 			throw methodNotFound(method);
 		}
+	}
+
+	// The `tasks` extension (2025-11-25 / draft `io.modelcontextprotocol/tasks`)
+	// RPCs. `enableTasks()` advertises support for these, so the server MUST route
+	// them rather than returning -32601 for an advertised operation (#59). This SDK
+	// does not yet drive the two-phase CreateTaskResult flow from `tools/call`, so
+	// no task is ever created: the task store is permanently empty. `tasks/list`
+	// therefore returns an empty page and `tasks/get`/`tasks/result`/`tasks/cancel`
+	// answer with `-32602` (task not found) for any id, per the extension's
+	// "unknown / non-cancellable task" rule. A server that never called
+	// `enableTasks()` does not advertise the capability and MUST NOT serve these
+	// (returns -32601), matching logging/setLevel and resources/subscribe gating.
+	private void requireTasksAdvertised() @safe
+	{
+		if (tasksCapability.isNull)
+			throw methodNotFound("tasks");
+	}
+
+	private Json doTasksList(Json params) @safe
+	{
+		requireTasksAdvertised();
+		Json result = Json.emptyObject;
+		result["tasks"] = Json.emptyArray;
+		return result;
+	}
+
+	private Json taskNotFound(Json params) @safe
+	{
+		Json data = Json.emptyObject;
+		if (params.type == Json.Type.object && "taskId" in params)
+			data["taskId"] = params["taskId"];
+		throw new McpException(ErrorCode.invalidParams, "Task not found", data);
+	}
+
+	private Json doTasksGet(Json params) @safe
+	{
+		requireTasksAdvertised();
+		return taskNotFound(params);
+	}
+
+	private Json doTasksResult(Json params) @safe
+	{
+		requireTasksAdvertised();
+		return taskNotFound(params);
+	}
+
+	private Json doTasksCancel(Json params) @safe
+	{
+		requireTasksAdvertised();
+		return taskNotFound(params);
 	}
 
 	/// `server/discover` (draft): advertise supported versions, capabilities,
@@ -2297,7 +2412,8 @@ unittest  // server/discover (draft) emits the full stored serverInfo
 		]
 	};
 	auto s = new McpServer(info);
-	auto resp = s.handle(req(1, "server/discover")).get;
+	// server/discover is a draft-only RPC (#51): dispatch it as a draft request.
+	auto resp = s.handle(draftReq(1, "server/discover")).get;
 	auto si = resp["result"]["serverInfo"];
 	assert(si["name"].get!string == "rich-srv");
 	assert(si["title"].get!string == "Rich Server");
@@ -3790,6 +3906,46 @@ unittest  // enableTasks advertises the `tasks` capability at initialize
 	assert("tools/call" !in t["requests"]);
 }
 
+unittest  // enableTasks routes tasks/list rather than returning -32601 (#59)
+{
+	// The server advertises tasks support, so it MUST serve the tasks/* RPCs it
+	// advertises. tasks/list returns an (empty) task page, never method-not-found.
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+	auto resp = s.handle(req(1, "tasks/list")).get;
+	assert("error" !in resp, "tasks/list returned an error on a task-enabled server");
+	assert(resp["result"]["tasks"].type == Json.Type.array);
+	assert(resp["result"]["tasks"].length == 0);
+}
+
+unittest  // enableTasks routes tasks/get|result|cancel as task-not-found, not -32601 (#59)
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+	foreach (m; ["tasks/get", "tasks/result", "tasks/cancel"])
+	{
+		Json p = Json.emptyObject;
+		p["taskId"] = "nope";
+		auto resp = s.handle(req(1, m, p)).get;
+		// Advertised but no such task: -32602 (not the -32601 unknown-method code).
+		assert(resp["error"]["code"].get!int == ErrorCode.invalidParams, m);
+		assert(resp["error"]["code"].get!int != ErrorCode.methodNotFound, m);
+	}
+}
+
+unittest  // tasks/* are -32601 when the server never advertised the capability (#59)
+{
+	// A server that did not call enableTasks() advertises no tasks capability, so
+	// it MUST NOT serve the tasks/* RPCs (returns -32601), mirroring the gating of
+	// logging/setLevel and resources/subscribe.
+	auto s = new McpServer("t", "1");
+	foreach (m; ["tasks/list", "tasks/get", "tasks/result", "tasks/cancel"])
+	{
+		auto resp = s.handle(req(1, m)).get;
+		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+	}
+}
+
 unittest  // enableTasks: draft server/discover folds tasks into extensions, no top-level (#384)
 {
 	auto s = new McpServer("t", "1");
@@ -3917,6 +4073,139 @@ unittest  // draft: resources/unsubscribe is method-not-found (removed for subsc
 	p["uri"] = "test://w";
 	auto resp = s.handle(draftReq(2, "resources/unsubscribe", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+}
+
+unittest  // server/discover is draft-only: a non-draft session gets -32601 (#51)
+{
+	// `server/discover` is a draft RPC (stable peers handshake via `initialize`).
+	// A request whose effective version is the default stable negotiated version
+	// MUST be answered with -32601 rather than being served the discover result.
+	auto s = new McpServer("t", "1");
+	auto resp = s.handle(req(1, "server/discover")).get;
+	assert("error" in resp);
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+}
+
+unittest  // server/discover under draft still serves the discover result (#51)
+{
+	// The gate added for #51 must not regress the supported draft discover path.
+	auto s = new McpServer("disc-srv", "1.0");
+	auto resp = s.handle(draftReq(1, "server/discover")).get;
+	assert("error" !in resp);
+	assert(resp["result"]["serverInfo"]["name"].get!string == "disc-srv");
+}
+
+unittest  // stdio subscriptions/listen is cancellable via notifications/cancelled (#56)
+{
+	import std.algorithm : canFind;
+
+	// Open a stdio draft `subscriptions/listen` stream opting into toolsListChanged.
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	Json filter = Json.emptyObject;
+	filter["toolsListChanged"] = true;
+	Json params = Json.emptyObject;
+	params["notifications"] = filter;
+	params["_meta"] = meta;
+	auto listen = Message(makeRequest(Json(42), "subscriptions/listen", params));
+	assert(s.tryServeStdioListen(listen, &sink));
+	// The leading acknowledgement was written.
+	assert(frames.length == 1);
+	assert(frames[0].canFind("acknowledged"));
+
+	// A change before cancellation is delivered on the stdio stream.
+	assert(s.notifyToolsListChanged() == 1);
+	assert(frames.length == 2);
+
+	// Cancel the listen by referencing its request id. Numeric id 42 must match
+	// the stored subscriptionId regardless of numeric-vs-string normalization.
+	Json cp = Json.emptyObject;
+	cp["requestId"] = 42;
+	s.handle(Message(makeNotification("notifications/cancelled", cp)));
+
+	// A subsequent change writes nothing — the stream was torn down.
+	const before = frames.length;
+	assert(s.notifyToolsListChanged() == 0);
+	assert(frames.length == before, "notify wrote to a cancelled stdio listen stream");
+}
+
+unittest  // stdio subscriptions/listen cancellation matches a string requestId too (#56)
+{
+	// rpcIdString normalizes numeric and string ids identically, so a cancellation
+	// carrying a string "42" tears down a listen whose id was the number 42.
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	Json filter = Json.emptyObject;
+	filter["toolsListChanged"] = true;
+	Json params = Json.emptyObject;
+	params["notifications"] = filter;
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(42),
+			"subscriptions/listen", params)), &sink));
+
+	Json cp = Json.emptyObject;
+	cp["requestId"] = "42";
+	s.handle(Message(makeNotification("notifications/cancelled", cp)));
+	const before = frames.length;
+	assert(s.notifyToolsListChanged() == 0);
+	assert(frames.length == before);
+}
+
+unittest  // stdio subscriptions/listen does not wipe negotiated session clientCaps (#77)
+{
+	// A stateful initialize negotiates sampling for the session. A subsequent stdio
+	// draft `subscriptions/listen` carries its own (empty) _meta capabilities; it
+	// must NOT clobber the shared negotiated clientCaps a concurrent/subsequent
+	// stateful request would observe. The draft per-request gate already reads the
+	// listen request's own _meta, so dropping the overwrite is free.
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+
+	Json initParams = Json.emptyObject;
+	initParams["protocolVersion"] = "2025-11-25";
+	Json caps = Json.emptyObject;
+	caps["sampling"] = Json.emptyObject;
+	initParams["capabilities"] = caps;
+	initParams["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", initParams));
+	assert(s.clientCapabilities().sampling);
+
+	// Draft listen with empty clientCapabilities in _meta.
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json filter = Json.emptyObject;
+	filter["toolsListChanged"] = true;
+	Json lp = Json.emptyObject;
+	lp["notifications"] = filter;
+	lp["_meta"] = meta;
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(7), "subscriptions/listen", lp)), &sink));
+
+	// The negotiated session sampling capability survives the listen.
+	assert(s.clientCapabilities().sampling,
+			"stdio subscriptions/listen wiped the negotiated session clientCaps");
 }
 
 unittest  // subscribe capability is advertised only when enabled
@@ -4064,9 +4353,12 @@ unittest  // per-list hint only emits on the matching list, not on others
 {
 	auto s = makeTestServer();
 	s.setListCacheHint("resources/list", CacheHint(7000));
-	// tools/list has no hint configured, so no cache fields appear.
+	// tools/list has no explicit hint, so it carries the mandatory draft default
+	// (ttlMs:0) rather than the resources/list value (#57): the per-list hint does
+	// not leak across methods.
 	auto tools = s.handle(draftReq(2, "tools/list")).get;
-	assert("ttlMs" !in tools["result"]);
+	assert(tools["result"]["ttlMs"].get!long == 0);
+	assert(tools["result"]["ttlMs"].get!long != 7000);
 }
 
 unittest  // per-resource registerResource hint emits ttlMs/cacheScope on a draft resources/read
@@ -4106,6 +4398,47 @@ unittest  // per-template registerResourceTemplate hint emits on a matching draf
 	auto resp = s.handle(draftReq(2, "resources/read", p)).get;
 	assert(resp["result"]["ttlMs"].get!long == 4200);
 	assert(resp["result"]["cacheScope"].get!string == "public");
+}
+
+unittest  // draft tools/list defaults to the mandatory ttlMs:0 cache hint (#57)
+{
+	// The draft CacheableResult schema requires a freshness hint on the cacheable
+	// list results. With no explicit hint configured, the server MUST still emit a
+	// conservative default (ttlMs:0, public scope) rather than omitting it.
+	auto s = makeTestServer();
+	auto resp = s.handle(draftReq(2, "tools/list")).get;
+	assert(resp["result"]["ttlMs"].get!long == 0);
+	assert(resp["result"]["cacheScope"].get!string == "public");
+}
+
+unittest  // draft resources/list, templates/list, prompts/list default to ttlMs:0 (#57)
+{
+	auto s = makeTestServer();
+	foreach (m; ["resources/list", "resources/templates/list", "prompts/list"])
+	{
+		auto resp = s.handle(draftReq(2, m)).get;
+		assert("error" !in resp, m);
+		assert(resp["result"]["ttlMs"].get!long == 0, m);
+	}
+}
+
+unittest  // draft resources/read defaults to ttlMs:0 when the resource has no hint (#57)
+{
+	auto s = new McpServer("t", "1");
+	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
+	s.registerResource(r, () @safe => ResourceContents.makeText("test://r", "text/plain", "x")); // no explicit CacheHint
+	Json p = Json.emptyObject;
+	p["uri"] = "test://r";
+	auto resp = s.handle(draftReq(2, "resources/read", p)).get;
+	assert(resp["result"]["ttlMs"].get!long == 0);
+	assert(resp["result"]["cacheScope"].get!string == "public");
+}
+
+unittest  // pre-draft list/read never emit the default cache hint (wire unchanged) (#57)
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestStable
+	assert("ttlMs" !in resp["result"]);
 }
 
 // issue #288: a concurrent (reentrant) request must not corrupt the effective
@@ -5308,10 +5641,12 @@ unittest  // draft: notifyPromptsListChanged suppressed unless client opted in
 	// No subscriptions/listen opt-in: suppressed.
 	assert(s.notifyPromptsListChanged() == 0);
 	assert(received.length == 0);
-	// After opting in via subscriptions/listen, it is delivered.
+	// After opting in via subscriptions/listen, it is delivered. The listen RPC is
+	// draft-only (#51), so it must be dispatched as a draft request for the opt-in
+	// to be recorded.
 	Json p = Json.emptyObject;
 	p["promptsListChanged"] = true;
-	s.handle(req(1, "subscriptions/listen", p));
+	s.handle(draftReq(1, "subscriptions/listen", p));
 	assert(s.notifyPromptsListChanged() == 1);
 }
 
