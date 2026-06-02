@@ -887,7 +887,7 @@ unittest  // canonicalResource lowercases scheme+host but preserves the path cas
 			"https://MCP.Example.com:8443/Path#frag") == "https://mcp.example.com:8443/Path");
 }
 
-unittest  // canonicalResource agrees with oauth.canonicalResourceUri (#14 convergence)
+unittest  // canonicalResource agrees with oauth.canonicalResourceUri
 {
 	import mcp.auth.oauth : canonicalResourceUri;
 
@@ -970,10 +970,8 @@ unittest  // generateLoginState yields unique, unpredictable values from the OS 
 
 unittest  // generateLoginState's entropy source is the OS CSPRNG, not the default rndGen
 {
-	// Reproduce the predictable sequence the old default-seeded std.random
-	// implementation would have produced for the 16 state bytes, and assert the
-	// real generator does not reproduce it (guards against a regression back to
-	// rndGen).
+	// Build the predictable sequence a default-seeded std.random would produce
+	// for the 16 state bytes, and assert the real generator does not match it.
 	import std.random : rndGen, uniform;
 
 	auto gen = rndGen;
