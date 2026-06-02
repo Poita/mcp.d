@@ -3,7 +3,7 @@ module mcp.protocol.types;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json, parseJsonString, deserializeJson, serializeToJson;
 import mcp.protocol.capabilities;
-import mcp.protocol.versions : ProtocolVersion;
+import mcp.protocol.versions : ProtocolVersion, toWire;
 import mcp.protocol.draft : InputRequest, inputRequestsToJson,
 	inputRequestsFromJson, CacheHint, parseCacheHint, withCache;
 import mcp.client.client : ProgressToken;
@@ -24,7 +24,11 @@ enum ContentKind
 	resourceLink,
 	embeddedResource,
 	toolUse,
-	toolResult
+	toolResult,
+	/// A content block whose `type` is not one this SDK models (e.g. a future
+	/// or vendor-specific kind). Stored verbatim so it round-trips losslessly
+	/// instead of being coerced into empty text.
+	unknown
 }
 
 /// Shared optional fields carried by every content kind in the MCP schema:
@@ -168,7 +172,10 @@ struct ToolUseContent
 		j["type"] = "tool_use";
 		j["id"] = id;
 		j["name"] = name;
-		j["input"] = (input.type == Json.Type.object) ? input : Json.emptyObject;
+		// Emit `input` verbatim when present (any non-undefined JSON), so a
+		// non-object input is not silently blanked into an empty object; only
+		// substitute an empty object when no input was supplied at all.
+		j["input"] = (input.type != Json.Type.undefined) ? input : Json.emptyObject;
 		emitMeta(j);
 		return j;
 	}
@@ -202,6 +209,29 @@ struct ToolResultContent
 	}
 }
 
+/// A content block whose `type` is not one this SDK models — a future or
+/// vendor-specific kind. The entire inbound block (including its original
+/// `type`) is stored verbatim so it round-trips losslessly through
+/// `toJson`/`fromJson` instead of being silently coerced into empty text.
+struct UnknownContent
+{
+	Json raw = Json.emptyObject; /// the original inbound content block, verbatim
+	mixin ContentMetaFields;
+
+	Json toJson() const @safe
+	{
+		// Emit the original block verbatim. The shared `annotations`/`_meta`
+		// fields (mutated via `withAnnotations`/`withContentMeta`) are overlaid so
+		// those setters still take effect on an unknown block; otherwise the raw
+		// block already carries whatever it was parsed with.
+		Json j = raw.clone;
+		if (j.type != Json.Type.object)
+			return raw;
+		emitMeta(j);
+		return j;
+	}
+}
+
 /// A content block as used in tool results, prompt messages, and sampling.
 ///
 /// Modeled as a tagged union over the per-kind content structs above
@@ -216,15 +246,15 @@ struct Content
 
 	/// The underlying tagged union. Public so callers that prefer
 	/// `std.sumtype.match` can pattern-match directly over the per-kind structs.
-	alias Payload = SumType!(TextContent, ImageContent, AudioContent,
-			ResourceLink, EmbeddedResource, ToolUseContent, ToolResultContent);
+	alias Payload = SumType!(TextContent, ImageContent, AudioContent, ResourceLink,
+			EmbeddedResource, ToolUseContent, ToolResultContent, UnknownContent);
 
 	Payload payload = Payload(TextContent.init);
 
 	this(P)(P p) @safe
 			if (is(P : TextContent) || is(P : ImageContent) || is(P
 				: AudioContent) || is(P : ResourceLink) || is(P : EmbeddedResource)
-				|| is(P : ToolUseContent) || is(P : ToolResultContent))
+				|| is(P : ToolUseContent) || is(P : ToolResultContent) || is(P : UnknownContent))
 	{
 		payload = Payload(p);
 	}
@@ -248,7 +278,8 @@ struct Content
 				(const ref ResourceLink _) => ContentKind.resourceLink,
 				(const ref EmbeddedResource _) => ContentKind.embeddedResource,
 				(const ref ToolUseContent _) => ContentKind.toolUse,
-				(const ref ToolResultContent _) => ContentKind.toolResult);
+				(const ref ToolResultContent _) => ContentKind.toolResult,
+				(const ref UnknownContent _) => ContentKind.unknown);
 	}
 
 	// --- Convenience accessors: read the field if this kind has it, else a
@@ -517,6 +548,113 @@ struct Content
 		return payload.match!(c => c.toJson());
 	}
 
+	/// The protocol version that first introduced this content block's kind.
+	/// Blocks whose kind postdates the negotiated version must be downgraded so
+	/// the wire output stays in-schema for the peer.
+	private ProtocolVersion introducedIn() const @safe
+	{
+		final switch (kind)
+		{
+		case ContentKind.text:
+		case ContentKind.image:
+		case ContentKind.embeddedResource:
+			return ProtocolVersion.v2024_11_05;
+		case ContentKind.audio:
+			return ProtocolVersion.v2025_03_26;
+		case ContentKind.resourceLink:
+			return ProtocolVersion.v2025_06_18;
+		case ContentKind.toolUse:
+		case ContentKind.toolResult:
+			return ProtocolVersion.v2025_11_25;
+		case ContentKind.unknown:
+			// An unmodeled kind: leave it to the producer (cannot reason about it).
+			return ProtocolVersion.v2024_11_05;
+		}
+	}
+
+	/// Return a copy of this content block projected for the negotiated protocol
+	/// version so the wire output stays in-schema for the peer. Two things are
+	/// projected:
+	///
+	/// - Block KIND: a kind whose schema postdates the negotiated version (audio
+	///   is 2025-03-26+, resource_link is 2025-06-18+, tool_use/tool_result are
+	///   2025-11-25+) is downgraded to a `TextContent` placeholder describing the
+	///   dropped block, rather than leaking an out-of-schema content type.
+	/// - Shared FIELDS: content-level `_meta` was introduced post-2024-11-05 and
+	///   `Annotations.lastModified` in 2025-06-18, so for an older peer the
+	///   `_meta` key is dropped and `annotations.lastModified` is stripped.
+	///
+	/// Mirrors the `Tool.forVersion` field-stripping pattern and fixes the whole
+	/// class of leaks (audio + resource_link + tool_use/tool_result + content
+	/// `_meta`/`lastModified`).
+	Content forVersion(ProtocolVersion v) const @safe
+	{
+		// Downgrade a kind newer than the peer's version to a text placeholder.
+		if (v < introducedIn())
+		{
+			auto placeholder = TextContent("[unsupported content of kind '" ~ kindWire()
+					~ "' omitted for protocol version " ~ v.toWire ~ "]");
+			placeholder.annotations = projectAnnotations(annotations, v);
+			if (v >= ProtocolVersion.v2025_06_18)
+				placeholder.meta = meta;
+			return Content(placeholder);
+		}
+		// In-schema kind: copy, then strip shared fields the peer cannot accept.
+		Content c = dupSelf();
+		auto projAnn = projectAnnotations(c.annotations, v);
+		c.payload.match!((ref x) {
+			x.annotations = projAnn;
+			// Content-level `_meta` is post-2024-11-05; drop it for the oldest peer.
+			if (v < ProtocolVersion.v2025_06_18)
+				x.meta = Json.undefined;
+		});
+		return c;
+	}
+
+	/// The wire `type` string for this block's kind (for placeholder messages).
+	private string kindWire() const @safe
+	{
+		final switch (kind)
+		{
+		case ContentKind.text:
+			return "text";
+		case ContentKind.image:
+			return "image";
+		case ContentKind.audio:
+			return "audio";
+		case ContentKind.resourceLink:
+			return "resource_link";
+		case ContentKind.embeddedResource:
+			return "resource";
+		case ContentKind.toolUse:
+			return "tool_use";
+		case ContentKind.toolResult:
+			return "tool_result";
+		case ContentKind.unknown:
+			return ("type" in resourceOrRaw())
+				? resourceOrRaw()["type"].get!string : "unknown";
+		}
+	}
+
+	private Json resourceOrRaw() const @safe
+	{
+		return payload.match!((const ref UnknownContent c) => c.raw, _ => Json.emptyObject);
+	}
+
+	/// Strip `Annotations.lastModified` (2025-06-18+) from a raw annotations Json
+	/// when projecting for an older peer; leave audience/priority untouched.
+	private static Json projectAnnotations(Json ann, ProtocolVersion v) @safe
+	{
+		if (ann.type != Json.Type.object)
+			return ann;
+		if (v >= ProtocolVersion.v2025_06_18)
+			return ann;
+		Json copy = ann.clone;
+		if ("lastModified" in copy)
+			copy.remove("lastModified");
+		return copy;
+	}
+
 	static Content fromJson(Json j) @safe
 	{
 		const t = ("type" in j) ? j["type"].get!string : "text";
@@ -579,8 +717,12 @@ struct Content
 			c.parseMeta(j);
 			return Content(c);
 		default:
-			TextContent c;
-			c.parseMeta(j);
+			// An unmodeled (future / vendor-specific) content `type`. Preserve the
+			// whole inbound block verbatim so it round-trips losslessly instead of
+			// being silently coerced into empty `TextContent` (which would drop the
+			// original `type` and all of its fields).
+			UnknownContent c;
+			c.raw = j;
 			return Content(c);
 		}
 	}
@@ -641,6 +783,20 @@ struct Annotations
 	bool empty() const @safe
 	{
 		return audience.length == 0 && priority.isNull && lastModified.isNull;
+	}
+
+	/// Return a copy projected for the negotiated protocol version. `audience` and
+	/// `priority` existed in 2024-11-05, so they are kept for every version;
+	/// `Annotations.lastModified` was introduced in 2025-06-18, so it is stripped
+	/// for any earlier peer to keep the wire output in-schema.
+	Annotations forVersion(ProtocolVersion v) const @safe
+	{
+		Annotations a;
+		a.audience = audience.dup;
+		a.priority = priority;
+		if (v >= ProtocolVersion.v2025_06_18)
+			a.lastModified = lastModified;
+		return a;
 	}
 }
 
@@ -856,6 +1012,19 @@ struct Tool
 			return ToolAnnotations.init;
 		return ToolAnnotations.fromJson(annotations);
 	}
+
+	/// Fluent typed setter mirroring `toolAnnotations()`: encodes a typed
+	/// `ToolAnnotations` into the raw `annotations` Json so callers never have to
+	/// hand-build the `.toJson()` themselves (symmetric with the typed
+	/// `Resource`/`ResourceTemplate.annotations` write path). An empty
+	/// `ToolAnnotations` clears the field (leaves it `Json.undefined`), so it is
+	/// omitted from the serialized form. The raw-Json storage is unchanged, so
+	/// unknown annotation keys set via `annotations` directly still round-trip.
+	ref Tool withToolAnnotations(ToolAnnotations a) return @safe
+	{
+		annotations = a.empty ? Json.undefined : a.toJson();
+		return this;
+	}
 }
 
 /// An empty JSON Schema object: `{"type":"object"}`.
@@ -1000,7 +1169,11 @@ struct CallToolResult
 	CallToolResult forVersion(ProtocolVersion v) const @safe
 	{
 		CallToolResult projected;
-		projected.content = content.dup;
+		// Project each content block so kinds newer than the peer's version
+		// (audio/resource_link/...) and post-2024-11-05 content `_meta` /
+		// `Annotations.lastModified` do not leak to an older peer.
+		foreach (c; content)
+			projected.content ~= c.forVersion(v);
 		projected.isError = isError;
 		projected.meta = meta;
 		projected.inputRequests = inputRequests.dup;
@@ -1582,8 +1755,40 @@ unittest  // Content is a SumType over per-kind structs (issue #305)
 {
 	import std.sumtype : SumType;
 
-	static assert(is(Content.Payload == SumType!(TextContent, ImageContent,
-			AudioContent, ResourceLink, EmbeddedResource, ToolUseContent, ToolResultContent)));
+	static assert(is(Content.Payload == SumType!(TextContent, ImageContent, AudioContent,
+			ResourceLink, EmbeddedResource, ToolUseContent, ToolResultContent, UnknownContent)));
+}
+
+unittest  // Content.fromJson preserves an unknown content type losslessly (no data loss)
+{
+	auto j = `{"type":"video","url":"https://example.com/v.mp4","duration":42}`.parseJsonString;
+	auto c = Content.fromJson(j);
+	assert(c.kind == ContentKind.unknown);
+	auto back = c.toJson();
+	// The original type and all fields survive the round-trip.
+	assert(back["type"].get!string == "video");
+	assert(back["url"].get!string == "https://example.com/v.mp4");
+	assert(back["duration"].get!long == 42);
+}
+
+unittest  // ToolUseContent.toJson emits a non-object input verbatim (not blanked)
+{
+	// A model that supplied a non-object input (e.g. a JSON string) must not have
+	// it silently replaced by an empty object.
+	auto c = Content.makeToolUse("c1", "calc", Json("raw-args"));
+	auto j = c.toJson();
+	assert(j["input"].type == Json.Type.string);
+	assert(j["input"].get!string == "raw-args");
+}
+
+unittest  // ToolUseContent.toJson emits an empty object only when input is unset
+{
+	ToolUseContent c;
+	c.id = "c1";
+	c.name = "calc"; // input left Json.undefined
+	auto j = c.toJson();
+	assert(j["input"].type == Json.Type.object);
+	assert(j["input"].length == 0);
 }
 
 unittest  // per-kind structs serialize the spec-correct wire shape directly
@@ -1723,6 +1928,30 @@ unittest  // Tool.toolAnnotations parses the raw annotations Json into a typed s
 	Tool bare;
 	bare.name = "noop";
 	assert(bare.toolAnnotations().empty);
+}
+
+unittest  // Tool.withToolAnnotations sets the typed annotations and round-trips
+{
+	ToolAnnotations a;
+	a.title = "Delete file";
+	a.destructiveHint = true;
+	Tool t;
+	t.name = "rm";
+	t.withToolAnnotations(a);
+	auto back = t.toolAnnotations();
+	assert(!back.title.isNull && back.title.get == "Delete file");
+	assert(!back.destructiveHint.isNull && back.destructiveHint.get == true);
+	// stored as the typed annotations' Json (no hand-encoding by the caller)
+	assert(t.annotations == a.toJson());
+}
+
+unittest  // Tool.withToolAnnotations with an empty struct clears the field (omitted from wire)
+{
+	Tool t;
+	t.name = "noop";
+	t.withToolAnnotations(ToolAnnotations.init);
+	assert(t.annotations.type == Json.Type.undefined);
+	assert("annotations" !in t.toJson());
 }
 
 unittest  // Tool execution round-trips taskSupport through fromJson
@@ -2026,18 +2255,53 @@ unittest  // Resource.forVersion keeps title for 2025-06-18 (introduced here)
 	assert(j["title"].get!string == "Display X");
 }
 
-unittest  // Resource.forVersion preserves non-gated fields (uri/name/description/mimeType/size)
+unittest  // Resource.forVersion preserves non-gated fields (uri/name/description/mimeType)
 {
 	Resource r = {uri: "test://x", name: "x"};
 	r.description = "desc";
 	r.mimeType = "text/plain";
-	r.size = 42;
 	auto j = r.forVersion(ProtocolVersion.v2024_11_05).toJson();
 	assert(j["uri"].get!string == "test://x");
 	assert(j["name"].get!string == "x");
 	assert(j["description"].get!string == "desc");
 	assert(j["mimeType"].get!string == "text/plain");
-	assert(j["size"].get!long == 42);
+}
+
+unittest  // Resource.forVersion strips size for 2024-11-05 (Resource.size introduced 2025-03-26)
+{
+	Resource r = {uri: "test://x", name: "x"};
+	r.size = 42;
+	auto j = r.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("size" !in j);
+}
+
+unittest  // Resource.forVersion keeps size for 2025-03-26 (Resource.size introduced here)
+{
+	Resource r = {uri: "test://x", name: "x"};
+	r.size = 42;
+	auto j = r.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("size" in j && j["size"].get!long == 42);
+}
+
+unittest  // Resource.forVersion strips Annotations.lastModified pre-2025-06-18, keeps audience/priority
+{
+	Resource r = {uri: "test://x", name: "x"};
+	r.annotations.audience = ["user"];
+	r.annotations.priority = 0.5;
+	r.annotations.lastModified = "2025-01-01T00:00:00Z";
+
+	auto j0 = r.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("annotations" in j0);
+	assert("lastModified" !in j0["annotations"]);
+	assert("audience" in j0["annotations"]);
+	assert("priority" in j0["annotations"]);
+
+	auto j1 = r.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("lastModified" !in j1["annotations"]);
+
+	auto j2 = r.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("lastModified" in j2["annotations"]);
+	assert(j2["annotations"]["lastModified"].get!string == "2025-01-01T00:00:00Z");
 }
 
 unittest  // Resource.forVersion leaves the original Resource unmodified (returns a projected copy)
@@ -2408,13 +2672,17 @@ struct Resource
 	}
 
 	/// Return a copy of this `Resource` with any fields newer than the
-	/// negotiated protocol version stripped, so the wire output stays valid
-	/// for the peer's version. `BaseMetadata.title` was introduced by
-	/// 2025-06-18 (absent from 2025-03-26 and 2024-11-05); `Resource.icons`
-	/// was introduced by 2025-11-25 (absent from every earlier version,
-	/// present in draft which is >= 2025-11-25). `uri`/`name`/`description`/
-	/// `mimeType`/`annotations`/`size`/`_meta` all existed in 2024-11-05 and
-	/// are preserved unchanged. Mirrors `Tool.forVersion` / `Prompt.forVersion`.
+	/// negotiated protocol version stripped, so the wire output stays valid for
+	/// the peer's version. The 2024-11-05 `Resource` type carried only
+	/// `uri`/`name`/`description`/`mimeType`/`annotations`/`_meta`. Later fields
+	/// are version-gated: `BaseMetadata.title` and `Resource.size` were introduced
+	/// by 2025-06-18 / 2025-03-26 respectively (both absent from 2024-11-05), and
+	/// `Resource.icons` by 2025-11-25 (absent from every earlier version, present
+	/// in draft which is >= 2025-11-25). Annotation sub-fields are themselves
+	/// version-gated: `audience`/`priority` existed in 2024-11-05 but
+	/// `Annotations.lastModified` was introduced in 2025-06-18, so annotations are
+	/// projected via `Annotations.forVersion`. Mirrors `Tool.forVersion` /
+	/// `Prompt.forVersion`.
 	Resource forVersion(ProtocolVersion v) const @safe
 	{
 		Resource projected;
@@ -2422,11 +2690,13 @@ struct Resource
 		projected.name = name;
 		projected.description = description;
 		projected.mimeType = mimeType;
-		projected.annotations.audience = annotations.audience.dup;
-		projected.annotations.priority = annotations.priority;
-		projected.annotations.lastModified = annotations.lastModified;
-		projected.size = size;
+		// Annotation sub-fields are themselves version-gated (lastModified is
+		// 2025-06-18+), so project them rather than copying verbatim.
+		projected.annotations = annotations.forVersion(v);
 		projected.meta = meta;
+		// `Resource.size` was introduced by 2025-03-26 (absent from 2024-11-05).
+		if (v >= ProtocolVersion.v2025_03_26)
+			projected.size = size;
 		// `BaseMetadata.title` was introduced by 2025-06-18.
 		if (v >= ProtocolVersion.v2025_06_18)
 			projected.title = title;
@@ -2944,6 +3214,11 @@ struct ElicitResult
 	static ElicitResult fromJson(Json j) @safe
 	{
 		ElicitResult r;
+		// Fail closed: default to `cancel` so a missing/non-string/unknown
+		// `action` is never treated as an `accept` (which would consume input
+		// the user never agreed to). Only an explicit, recognized action string
+		// changes this.
+		r.action = ElicitAction.cancel;
 		if (j.type != Json.Type.object)
 			return r;
 		if ("action" in j && j["action"].type == Json.Type.string)
@@ -2960,10 +3235,15 @@ struct ElicitResult
 				r.action = ElicitAction.cancel;
 				break;
 			default:
+				// Unknown/non-conforming action -> treat as cancel (fail closed).
+				r.action = ElicitAction.cancel;
 				break;
 			}
 		}
-		if ("content" in j && j["content"].type == Json.Type.object)
+		// `content` is only meaningful on `accept`; never carry consumed input on
+		// a decline/cancel outcome.
+		if (r.action == ElicitAction.accept && "content" in j
+				&& j["content"].type == Json.Type.object)
 			r.content = j["content"];
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			r.meta = j["_meta"];
@@ -3166,6 +3446,31 @@ unittest  // ElicitResult.fromJson parses decline
 	j["action"] = "decline";
 	auto r = ElicitResult.fromJson(j);
 	assert(r.action == ElicitAction.decline);
+}
+
+unittest  // ElicitResult.fromJson treats an unknown action as cancel (fail closed)
+{
+	auto r = ElicitResult.fromJson(`{"action":"approve"}`.parseJsonString);
+	assert(r.action == ElicitAction.cancel);
+}
+
+unittest  // ElicitResult.fromJson treats a missing action field as cancel
+{
+	auto r = ElicitResult.fromJson(Json.emptyObject);
+	assert(r.action == ElicitAction.cancel);
+}
+
+unittest  // ElicitResult.fromJson does not carry content on a non-accept outcome
+{
+	// A decline/cancel response that nonetheless carries a content object must
+	// not surface that content (it was never consented to).
+	auto r = ElicitResult.fromJson(`{"action":"decline","content":{"name":"x"}}`.parseJsonString);
+	assert(r.action == ElicitAction.decline);
+	assert(r.content.type == Json.Type.undefined);
+
+	auto u = ElicitResult.fromJson(`{"action":"approve","content":{"name":"x"}}`.parseJsonString);
+	assert(u.action == ElicitAction.cancel);
+	assert(u.content.type == Json.Type.undefined);
 }
 
 unittest  // ElicitResult.contentAs!T decodes the accept content into a typed struct
@@ -3716,6 +4021,17 @@ struct PromptMessage
 			m.content = Content.fromJson(j["content"]);
 		return m;
 	}
+
+	/// Return a copy with its content block projected for the negotiated protocol
+	/// version (see `Content.forVersion`), so newer content kinds / shared fields
+	/// do not leak to an older peer. `role` is unchanged.
+	PromptMessage forVersion(ProtocolVersion v) const @safe
+	{
+		PromptMessage m;
+		m.role = role;
+		m.content = content.forVersion(v);
+		return m;
+	}
 }
 
 /// Result of `prompts/list`.
@@ -3810,6 +4126,101 @@ struct GetPromptResult
 		meta = m;
 		return this;
 	}
+
+	/// Return a copy with each message's content projected for the negotiated
+	/// protocol version (see `PromptMessage.forVersion` / `Content.forVersion`),
+	/// so newer content kinds and post-2024-11-05 content `_meta` /
+	/// `Annotations.lastModified` do not leak to an older peer. Mirrors
+	/// `CallToolResult.forVersion`.
+	GetPromptResult forVersion(ProtocolVersion v) const @safe
+	{
+		GetPromptResult r;
+		r.description = description;
+		r.meta = meta;
+		foreach (m; messages)
+			r.messages ~= m.forVersion(v);
+		return r;
+	}
+}
+
+unittest  // Content.forVersion downgrades audio to a text placeholder pre-2025-03-26
+{
+	auto c = Content.makeAudio("AAA", "audio/wav");
+	auto old = c.forVersion(ProtocolVersion.v2024_11_05);
+	assert(old.kind == ContentKind.text); // not leaked as audio
+	auto j = old.toJson();
+	assert(j["type"].get!string == "text");
+	// audio is in-schema from 2025-03-26 onward -> preserved unchanged
+	assert(c.forVersion(ProtocolVersion.v2025_03_26).kind == ContentKind.audio);
+	assert(c.forVersion(ProtocolVersion.draft).kind == ContentKind.audio);
+}
+
+unittest  // Content.forVersion downgrades resource_link to a placeholder pre-2025-06-18
+{
+	auto c = Content.makeResourceLink("file:///a", "a");
+	assert(c.forVersion(ProtocolVersion.v2024_11_05).kind == ContentKind.text);
+	assert(c.forVersion(ProtocolVersion.v2025_03_26).kind == ContentKind.text);
+	// resource_link is in-schema from 2025-06-18 onward
+	assert(c.forVersion(ProtocolVersion.v2025_06_18).kind == ContentKind.resourceLink);
+}
+
+unittest  // Content.forVersion downgrades tool_use/tool_result pre-2025-11-25
+{
+	auto u = Content.makeToolUse("c1", "calc", Json.emptyObject);
+	assert(u.forVersion(ProtocolVersion.v2025_06_18).kind == ContentKind.text);
+	assert(u.forVersion(ProtocolVersion.v2025_11_25).kind == ContentKind.toolUse);
+	auto r = Content.makeToolResult("c1", [Content.makeText("ok")]);
+	assert(r.forVersion(ProtocolVersion.v2025_06_18).kind == ContentKind.text);
+	assert(r.forVersion(ProtocolVersion.v2025_11_25).kind == ContentKind.toolResult);
+}
+
+unittest  // Content.forVersion drops content-level _meta for 2024-11-05, keeps it for 2025-06-18+
+{
+	Json m = Json.emptyObject;
+	m["x.example/k"] = "v";
+	auto c = Content.makeText("hi").withContentMeta(m);
+	assert("_meta" !in c.forVersion(ProtocolVersion.v2024_11_05).toJson());
+	auto keep = c.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("_meta" in keep && keep["_meta"]["x.example/k"].get!string == "v");
+}
+
+unittest  // Content.forVersion strips Annotations.lastModified pre-2025-06-18
+{
+	Json ann = Json.emptyObject;
+	ann["audience"] = Json([Json("user")]);
+	ann["lastModified"] = Json("2025-01-01T00:00:00Z");
+	auto c = Content.makeText("hi").withAnnotations(ann);
+
+	auto old = c.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("annotations" in old);
+	assert("lastModified" !in old["annotations"]);
+	assert("audience" in old["annotations"]); // audience preserved
+
+	auto keep = c.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("lastModified" in keep["annotations"]);
+}
+
+unittest  // CallToolResult.forVersion projects audio content out of a 2024-11-05 result
+{
+	CallToolResult r;
+	r.content = [Content.makeText("ok"), Content.makeAudio("AAA", "audio/wav")];
+	auto j = r.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert(j["content"].length == 2);
+	assert(j["content"][0]["type"].get!string == "text");
+	assert(j["content"][1]["type"].get!string == "text"); // audio downgraded
+}
+
+unittest  // GetPromptResult.forVersion projects message content for the peer version
+{
+	GetPromptResult g;
+	PromptMessage m;
+	m.role = "assistant";
+	m.content = Content.makeAudio("AAA", "audio/wav");
+	g.messages = [m];
+	auto j = g.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert(j["messages"][0]["content"]["type"].get!string == "text");
+	auto keep = g.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert(keep["messages"][0]["content"]["type"].get!string == "audio");
 }
 
 // ===========================================================================
@@ -3992,10 +4403,25 @@ struct CompleteResult
 		// integral and fractional JSON encodings (e.g. `10` or `10.0`).
 		// Accept either so a float-encoded total is preserved rather than
 		// dropped (mirrors ProgressNotification.fromJson).
-		if ("total" in c && c["total"].type == Json.Type.int_)
-			r.total = cast(size_t) c["total"].get!long;
-		else if ("total" in c && c["total"].type == Json.Type.float_)
-			r.total = cast(size_t)(c["total"].get!double + 0.5);
+		// Validate range/sign before casting: a negative or over-range total
+		// would otherwise wrap to a garbage or huge size_t. Reject those
+		// (leaving total null) instead of recording a bogus value.
+		if ("total" in c)
+		{
+			auto t = c["total"];
+			if (t.type == Json.Type.int_)
+			{
+				auto n = t.get!long;
+				if (n >= 0)
+					r.total = cast(size_t) n;
+			}
+			else if (t.type == Json.Type.float_)
+			{
+				auto d = t.get!double;
+				if (d >= 0 && d < cast(double) size_t.max)
+					r.total = cast(size_t)(d + 0.5);
+			}
+		}
 		if ("hasMore" in c && c["hasMore"].type == Json.Type.bool_)
 			r.hasMore = c["hasMore"].get!bool;
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
@@ -4087,7 +4513,12 @@ struct ProgressNotification
 	Json toJson() const @safe
 	{
 		Json j = Json.emptyObject;
-		j["progressToken"] = progressToken;
+		// `progressToken` is REQUIRED by the schema. Guard against a
+		// default-constructed (unset) token so we never silently drop the key
+		// (vibe omits `Json.undefined` values); mirror LogMessageNotification's
+		// data guard. The authoritative emit path (`reportProgress`) always sets
+		// the token, so this only hardens against misuse / parse-side reuse.
+		j["progressToken"] = progressToken.type == Json.Type.undefined ? Json(null) : progressToken;
 		j["progress"] = progress;
 		if (!total.isNull)
 			j["total"] = total.get;
@@ -4212,6 +4643,14 @@ unittest  // ProgressNotification.matches an integer ProgressToken
 	assert(n.matches(ProgressToken(42)));
 	assert(!n.matches(ProgressToken(7)));
 	assert(!n.matches(ProgressToken("42")));
+}
+
+unittest  // ProgressNotification.toJson always emits the REQUIRED progressToken
+{
+	ProgressNotification n; // default-constructed: progressToken is unset
+	auto j = n.toJson();
+	assert("progressToken" in j); // never silently dropped (was Json.undefined)
+	assert(j["progressToken"].type == Json.Type.null_);
 }
 
 /// The severity of a `notifications/message`, per server/utilities/logging. The
@@ -4501,6 +4940,28 @@ unittest  // CompleteResult.fromJson preserves a total encoded as a JSON float
 	assert(r.values == ["paris"]);
 	assert(!r.total.isNull && r.total.get == 10);
 	assert(!r.hasMore);
+}
+
+unittest  // CompleteResult.fromJson rejects a negative integer total (leaves it null)
+{
+	auto j = `{"completion":{"values":["paris"],"total":-1,"hasMore":false}}`.parseJsonString;
+	auto r = CompleteResult.fromJson(j);
+	assert(r.total.isNull); // not wrapped to a huge size_t
+}
+
+unittest  // CompleteResult.fromJson rejects a negative float total (leaves it null)
+{
+	auto j = `{"completion":{"values":["paris"],"total":-2.5,"hasMore":false}}`.parseJsonString;
+	auto r = CompleteResult.fromJson(j);
+	assert(r.total.isNull);
+}
+
+unittest  // CompleteResult.fromJson rejects an over-range float total (leaves it null)
+{
+	// 1e30 is far beyond size_t.max; casting it would yield garbage.
+	auto j = `{"completion":{"values":["paris"],"total":1e30,"hasMore":false}}`.parseJsonString;
+	auto r = CompleteResult.fromJson(j);
+	assert(r.total.isNull);
 }
 
 unittest  // CompleteResult.fromJson tolerates a missing completion envelope
