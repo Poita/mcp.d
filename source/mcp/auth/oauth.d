@@ -584,6 +584,208 @@ bool isValidClientIdMetadataUrl(string clientId) @safe pure nothrow @nogc
 	return slash + 1 < rest.length;
 }
 
+/// The set of explicit loopback hosts permitted over plaintext `http` for
+/// local development (MCP loopback redirect URIs, locally-hosted dev auth
+/// servers). Any other host MUST use `https`.
+private bool isLoopbackHost(string host) @safe pure nothrow @nogc
+{
+	// Strip an optional port suffix (host:port). IPv6 literals are bracketed.
+	import std.string : indexOf;
+
+	if (host.length && host[0] == '[')
+	{
+		const close = host.indexOf(']');
+		if (close > 0)
+			host = host[1 .. close];
+	}
+	else
+	{
+		const colon = host.indexOf(':');
+		if (colon >= 0)
+			host = host[0 .. colon];
+	}
+	return host == "localhost" || host == "127.0.0.1" || host == "::1";
+}
+
+/// Reject a private/link-local IPv4 literal host to close the SSRF /
+/// DNS-rebinding vector the MCP authorization spec calls out (e.g. the cloud
+/// metadata service at 169.254.169.254, RFC 1918 ranges). Returns true when the
+/// host is a private/link-local IPv4 *literal* that is not an explicit loopback
+/// (loopback is handled separately and permitted for dev).
+private bool isPrivateIpv4Literal(string host) @safe pure nothrow @nogc
+{
+	import std.string : indexOf;
+
+	// Strip an optional port suffix.
+	const colon = host.indexOf(':');
+	if (colon >= 0)
+		host = host[0 .. colon];
+
+	// Parse up to four dotted decimal octets; bail (treat as non-literal) on
+	// anything that is not a clean a.b.c.d IPv4 literal.
+	uint[4] oct;
+	size_t idx;
+	size_t i;
+	while (i < host.length)
+	{
+		uint v;
+		size_t digits;
+		while (i < host.length && host[i] >= '0' && host[i] <= '9')
+		{
+			v = v * 10 + cast(uint)(host[i] - '0');
+			if (v > 255)
+				return false;
+			i++;
+			digits++;
+		}
+		if (digits == 0)
+			return false; // not a numeric octet -> not an IPv4 literal
+		if (idx >= 4)
+			return false;
+		oct[idx++] = v;
+		if (i < host.length)
+		{
+			if (host[i] != '.')
+				return false;
+			i++;
+		}
+	}
+	if (idx != 4)
+		return false;
+	// 127.0.0.0/8 loopback (handled/permitted elsewhere) -> not flagged here.
+	if (oct[0] == 127)
+		return false;
+	// 10.0.0.0/8
+	if (oct[0] == 10)
+		return true;
+	// 172.16.0.0/12
+	if (oct[0] == 172 && oct[1] >= 16 && oct[1] <= 31)
+		return true;
+	// 192.168.0.0/16
+	if (oct[0] == 192 && oct[1] == 168)
+		return true;
+	// 169.254.0.0/16 link-local (incl. cloud metadata 169.254.169.254)
+	if (oct[0] == 169 && oct[1] == 254)
+		return true;
+	// 0.0.0.0/8 "this host"
+	if (oct[0] == 0)
+		return true;
+	return false;
+}
+
+/// Whether `url` is safe to fetch for OAuth/discovery: it MUST use the `https`
+/// scheme, OR target an explicit loopback host (`localhost`, `127.0.0.1`,
+/// `[::1]`) over `http` for local development. Plaintext `http` to any other
+/// host is rejected, as are URLs whose host is a private/link-local IPv4
+/// literal (SSRF / DNS-rebinding mitigation, e.g. 169.254.169.254 / RFC 1918).
+bool isSecureFetchUrl(string url) @safe pure nothrow @nogc
+{
+	import std.string : indexOf;
+
+	const schemeEnd = url.indexOf("://");
+	if (schemeEnd < 0)
+		return false;
+	auto scheme = url[0 .. schemeEnd];
+	auto rest = url[schemeEnd + 3 .. $];
+	// Host is everything up to the first '/', '?' or '#'.
+	size_t hostEnd = rest.length;
+	foreach (k, ch; rest)
+	{
+		if (ch == '/' || ch == '?' || ch == '#')
+		{
+			hostEnd = k;
+			break;
+		}
+	}
+	auto host = rest[0 .. hostEnd];
+	if (host.length == 0)
+		return false;
+
+	const loopback = isLoopbackHost(host);
+	// Reject private/link-local IPv4 literals (non-loopback) regardless of scheme.
+	if (!loopback && isPrivateIpv4Literal(host))
+		return false;
+
+	// Case-insensitive scheme compare without allocating.
+	bool eqScheme(string sc)
+	{
+		if (scheme.length != sc.length)
+			return false;
+		foreach (k, ch; scheme)
+		{
+			char c = ch;
+			if (c >= 'A' && c <= 'Z')
+				c = cast(char)(c + 32);
+			if (c != sc[k])
+				return false;
+		}
+		return true;
+	}
+
+	if (eqScheme("https"))
+		return true;
+	if (eqScheme("http") && loopback)
+		return true;
+	return false;
+}
+
+/// Throw `invalidRequest` when `url` is not safe to fetch (see
+/// `isSecureFetchUrl`). Used at the start of every outbound OAuth/discovery
+/// HTTP request so attacker-influenced URLs (e.g. a `resource_metadata` URL
+/// from a `WWW-Authenticate` header) cannot be fetched over plaintext or
+/// pointed at internal/link-local addresses.
+void requireSecureUrl(string url) @safe pure
+{
+	import mcp.protocol.errors : invalidRequest;
+
+	if (!isSecureFetchUrl(url))
+		throw invalidRequest(
+				"Refusing to fetch insecure OAuth/discovery URL (must be https, or http to an "
+				~ "explicit loopback host; private/link-local addresses are rejected): " ~ url);
+}
+
+unittest  // isSecureFetchUrl accepts https and rejects plaintext http to a remote host
+{
+	assert(isSecureFetchUrl("https://as.example.com/.well-known/oauth-authorization-server"));
+	assert(!isSecureFetchUrl("http://as.example.com/.well-known/oauth-authorization-server"));
+}
+
+unittest  // isSecureFetchUrl permits http only to explicit loopback hosts (dev)
+{
+	assert(isSecureFetchUrl("http://localhost:8765/jwks"));
+	assert(isSecureFetchUrl("http://127.0.0.1/jwks"));
+	assert(isSecureFetchUrl("http://[::1]:9000/jwks"));
+	// A non-loopback host over http is rejected.
+	assert(!isSecureFetchUrl("http://internal.local/jwks"));
+}
+
+unittest  // isSecureFetchUrl rejects private/link-local IPv4 literals (SSRF)
+{
+	// Cloud metadata endpoint and RFC 1918 ranges must be rejected even over https.
+	assert(!isSecureFetchUrl("https://169.254.169.254/latest/meta-data"));
+	assert(!isSecureFetchUrl("https://10.0.0.5/x"));
+	assert(!isSecureFetchUrl("https://192.168.1.1/x"));
+	assert(!isSecureFetchUrl("https://172.16.0.1/x"));
+	assert(!isSecureFetchUrl("http://169.254.169.254/x"));
+}
+
+unittest  // isSecureFetchUrl rejects schemeless / file / non-loopback http
+{
+	assert(!isSecureFetchUrl("as.example.com/x"));
+	assert(!isSecureFetchUrl("file:///etc/passwd"));
+	assert(!isSecureFetchUrl(""));
+}
+
+unittest  // requireSecureUrl throws on an insecure URL and passes a secure one
+{
+	import std.exception : assertThrown;
+
+	assertThrown(requireSecureUrl("http://as.example.com/token"));
+	assertThrown(requireSecureUrl("https://169.254.169.254/"));
+	requireSecureUrl("https://as.example.com/token"); // does not throw
+	requireSecureUrl("http://127.0.0.1:8765/callback"); // loopback dev ok
+}
+
 unittest  // valid CIMD client_id: https with a path component
 {
 	assert(isValidClientIdMetadataUrl("https://app.example.com/oauth/client.json"));

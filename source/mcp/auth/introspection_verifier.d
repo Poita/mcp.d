@@ -20,7 +20,7 @@ import std.string : strip;
 
 import vibe.data.json : Json, parseJsonString;
 
-import mcp.auth.oauth : TokenEndpointAuthMethod, basicAuthHeader;
+import mcp.auth.oauth : TokenEndpointAuthMethod, basicAuthHeader, requireSecureUrl;
 import mcp.auth.resource_server : TokenInfo, TokenValidator;
 
 @safe:
@@ -177,6 +177,10 @@ private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
 	import vibe.http.client : requestHTTP, HTTPClientRequest, HTTPClientResponse;
 	import vibe.http.common : HTTPMethod;
 	import vibe.stream.operations : readAllUTF8;
+
+	// Refuse to introspect over an insecure transport (must be https, or http to
+	// a loopback host for dev) or against an internal/link-local address.
+	requireSecureUrl(cfg.introspectionEndpoint);
 
 	const body_ = introspectionBody(cfg, token);
 	string responseBody;
@@ -485,4 +489,26 @@ unittest  // introspectionVerifier yields a usable TokenValidator
 	assert(v !is null);
 	// An empty token is rejected before any network call.
 	assert(!v("").valid);
+}
+
+unittest  // HttpIntrospector refuses an insecure (plaintext http) introspection endpoint
+{
+	import std.exception : assertThrown;
+
+	// A plaintext-http endpoint to a non-loopback host must be rejected before any
+	// HTTP request is issued (no token introspection over an insecure transport).
+	IntrospectionConfig cfg;
+	cfg.introspectionEndpoint = "http://as.example.com/introspect";
+	auto introspector = new HttpIntrospector(cfg);
+	assertThrown(introspector.introspect("some-token"));
+}
+
+unittest  // HttpIntrospector refuses an internal/link-local introspection endpoint (SSRF)
+{
+	import std.exception : assertThrown;
+
+	IntrospectionConfig cfg;
+	cfg.introspectionEndpoint = "https://169.254.169.254/introspect";
+	auto introspector = new HttpIntrospector(cfg);
+	assertThrown(introspector.introspect("some-token"));
 }
