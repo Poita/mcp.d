@@ -785,7 +785,7 @@ unittest  // clientCredentials refuses when the RFC 8707 resource indicator is u
 	assertThrown(c.clientCredentials(as_, RegisteredClient("cid", ""), "scope"));
 }
 
-unittest  // authorizationUrl refuses an internal/plaintext authorization endpoint (SSRF, #13)
+unittest  // authorizationUrl refuses an internal/plaintext authorization endpoint (SSRF)
 {
 	import std.exception : assertThrown;
 
@@ -806,7 +806,7 @@ unittest  // authorizationUrl refuses an internal/plaintext authorization endpoi
 	assertThrown(c.authorizationUrl(as2, RegisteredClient("cid", ""), pkce, "mcp:read", "st"));
 }
 
-unittest  // authorizeAndGetCode refuses an internal/plaintext authorize URL before GET (SSRF, #13)
+unittest  // authorizeAndGetCode refuses an internal/plaintext authorize URL before GET (SSRF)
 {
 	import std.exception : assertThrown;
 
