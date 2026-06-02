@@ -88,6 +88,17 @@ int main(string[] args) @safe
 
 int run(string[] args) @safe
 {
+	// #550 Stage 3: detect the HTTP transport up front. The push phase
+	// (subscriptions/listen + notifications/resources/updated) correlates more than
+	// one HTTP call, so a STATELESS server (this example) forbids it over HTTP and
+	// the client skips it there; over stdio (a single implicit connection) it runs.
+	import std.algorithm : canFind, startsWith;
+
+	bool useHttp;
+	foreach (a; args)
+		if (a == "--http" || a == "--url" || a.startsWith("--http=") || a.startsWith("--url="))
+			useHttp = true;
+
 	// --- connect over the selected transport (stdio sibling / http url) -----
 	auto client = connectFromArgs(args, "resources-server");
 	// Both transports release cleanly via close() (stdio terminates the
@@ -157,75 +168,84 @@ int run(string[] args) @safe
 	check(threw, "unknown resource read did not raise an error");
 
 	// (7) subscribe via subscriptions/listen + observe push notifications.
-	int updated;
-	int listChanged;
-	string updatedUri;
-	client.onNotification = (string method, Json params) @safe nothrow{
-		if (method == ResourceUpdatedNotification.methodName)
-		{
-			updated++;
-			// Parse the typed notification payload instead of reading raw
-			// `params["uri"]`. `fromJson` is `@safe` but not `nothrow`, and the
-			// notification sink must be `nothrow`, so guard it.
-			try
-				updatedUri = ResourceUpdatedNotification.fromJson(params).uri;
-			catch (Exception)
-			{
-			}
-		}
-		else if (method == "notifications/resources/list_changed")
-			listChanged++;
-	};
-
-	const targetUri = "note:///e2e";
-	SubscriptionFilter filter = {
-		resourcesListChanged: true, resourceSubscriptions: [targetUri],
-	};
-	auto stream = client.subscriptionsListen(filter);
-	scope (exit)
-		stream.close();
-	// Let the listen stream attach (HTTP opens a background SSE task; stdio
-	// shares the single channel and needs no settle time, but a couple of yields
-	// are harmless).
-	sleep(200.msecs);
-
-	// Mutate the subscribed note via the tool; the server pushes
-	// resources/updated (subscribed) + resources/list_changed (new resource).
-	// The args have a fixed shape, so pass a typed struct to the typed callTool
-	// overload rather than hand-building a Json object.
-	auto callRes = client.callTool("set_note", SetNoteArgs("e2e", "pushed body"));
-	check(!callRes.isError, "set_note should not be an error");
-	// Decode the tool's typed structuredContent in one step instead of reading
-	// raw Json fields, then assert on the typed values.
-	auto setResult = callRes.structuredContentAs!SetNoteResult;
-	checkEq(setResult.uri, targetUri, "set_note structuredContent.uri");
-	check(setResult.created == true, "set_note should report created=true for a new note");
-
-	// Wait for the notifications. Over stdio they interleave on the single
-	// channel during the readResource await below; over http they arrive on the
-	// background listen task. Yield + poll covers both.
-	const deadline = MonoTime.currTime + 5000.msecs;
-	while (MonoTime.currTime < deadline && (updated == 0 || listChanged == 0))
+	// #550 Stage 3: this push flow correlates more than one HTTP call, so it is
+	// skipped over HTTP against this STATELESS server (where subscriptions/listen
+	// is forbidden). Over stdio (a single implicit connection) it runs in full.
+	if (!useHttp)
 	{
-		() @trusted { yield(); }();
-		sleep(50.msecs);
-		// On stdio, notifications only drain while the client is reading a
-		// response, so issue a cheap request to pump the channel.
-		if (updated == 0 || listChanged == 0)
-			client.ping();
+		int updated;
+		int listChanged;
+		string updatedUri;
+		client.onNotification = (string method, Json params) @safe nothrow{
+			if (method == ResourceUpdatedNotification.methodName)
+			{
+				updated++;
+				// Parse the typed notification payload instead of reading raw
+				// `params["uri"]`. `fromJson` is `@safe` but not `nothrow`, and the
+				// notification sink must be `nothrow`, so guard it.
+				try
+					updatedUri = ResourceUpdatedNotification.fromJson(params).uri;
+				catch (Exception)
+				{
+				}
+			}
+			else if (method == "notifications/resources/list_changed")
+				listChanged++;
+		};
+
+		const targetUri = "note:///e2e";
+		SubscriptionFilter filter = {
+			resourcesListChanged: true, resourceSubscriptions: [targetUri],
+		};
+		auto stream = client.subscriptionsListen(filter);
+		scope (exit)
+			stream.close();
+		// Let the listen stream attach (stdio shares the single channel and needs no
+		// settle time, but a couple of yields are harmless).
+		sleep(200.msecs);
+
+		// Mutate the subscribed note via the tool; the server pushes
+		// resources/updated (subscribed) + resources/list_changed (new resource).
+		// The args have a fixed shape, so pass a typed struct to the typed callTool
+		// overload rather than hand-building a Json object.
+		auto callRes = client.callTool("set_note", SetNoteArgs("e2e", "pushed body"));
+		check(!callRes.isError, "set_note should not be an error");
+		// Decode the tool's typed structuredContent in one step instead of reading
+		// raw Json fields, then assert on the typed values.
+		auto setResult = callRes.structuredContentAs!SetNoteResult;
+		checkEq(setResult.uri, targetUri, "set_note structuredContent.uri");
+		check(setResult.created == true, "set_note should report created=true for a new note");
+
+		// Wait for the notifications. Over stdio they interleave on the single
+		// channel during the readResource await below. Yield + poll covers it.
+		const deadline = MonoTime.currTime + 5000.msecs;
+		while (MonoTime.currTime < deadline && (updated == 0 || listChanged == 0))
+		{
+			() @trusted { yield(); }();
+			sleep(50.msecs);
+			// On stdio, notifications only drain while the client is reading a
+			// response, so issue a cheap request to pump the channel.
+			if (updated == 0 || listChanged == 0)
+				client.ping();
+		}
+
+		check(updated >= 1, "did not receive notifications/resources/updated");
+		checkEq(updatedUri, targetUri, "updated notification uri");
+		check(listChanged >= 1, "did not receive notifications/resources/list_changed");
+
+		// The newly-created note is now a direct resource and reads back.
+		auto pushed = client.readResource(targetUri);
+		check(pushed.contents.length && pushed.contents[0].text == "pushed body",
+				"new note resource did not read back the pushed body");
+
+		writeln("OK [resources]: list+templates+read+template-expand"
+				~ "+notfound(-32602 draft)+draft-cache(ttl=60000,public)+subscribe/updated+list_changed"
+				~ " verified");
+		return 0;
 	}
 
-	check(updated >= 1, "did not receive notifications/resources/updated");
-	checkEq(updatedUri, targetUri, "updated notification uri");
-	check(listChanged >= 1, "did not receive notifications/resources/list_changed");
-
-	// The newly-created note is now a direct resource and reads back.
-	auto pushed = client.readResource(targetUri);
-	check(pushed.contents.length && pushed.contents[0].text == "pushed body",
-			"new note resource did not read back the pushed body");
-
-	writeln("OK [resources]: list+templates+read+template-expand"
-			~ "+notfound(-32602 draft)+draft-cache(ttl=60000,public)+subscribe/updated+list_changed"
-			~ " verified");
+	writeln("OK [resources/http]: list+templates+read+template-expand"
+			~ "+notfound(-32602 draft)+draft-cache(ttl=60000,public) verified"
+			~ " (subscriptions/listen push skipped: stateless server forbids it over HTTP)");
 	return 0;
 }

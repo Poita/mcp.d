@@ -648,10 +648,16 @@ unittest  // 405 Allow header enumerates every supported method (RFC 9110 §10.2
 private void handleGet(McpServer server, ServerPushChannel push, SessionManager sessions,
 		uint reconnectDelayMs, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
+	// #550 Stage 3: the standalone GET SSE stream is an unsolicited server->client
+	// push channel — shared state correlating more than one HTTP call. A stateless
+	// server keeps no such state, so it MUST answer 405 (no unsolicited push
+	// without a session) regardless of the negotiated version. Only a stateful
+	// server (sessions keyed on Mcp-Session-Id) opens the stream.
+	//
 	// Per the transport: the server MUST either open a text/event-stream or
 	// answer 405. The draft drops the standalone GET stream (server->client
 	// traffic rides the POST-response SSE), so it keeps the 405 alternative.
-	if (!getOpensSseStream(server.negotiatedVersion))
+	if (server.mode != ServerMode.stateful || !getOpensSseStream(server.negotiatedVersion))
 	{
 		res.statusCode = HTTPStatus.methodNotAllowed;
 		res.headers["Allow"] = "POST";
@@ -1131,6 +1137,19 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			|| tryDraft(RequestMeta.fromParams(msg.params).protocolVersion);
 		if (opensListenStream(msg.method, isDraftReq))
 		{
+			// #550 Stage 3: subscriptions/listen opens a long-lived server->client
+			// stream wired to the mount-global push channel — shared state across
+			// HTTP calls. A stateless server keeps no such state, so the draft
+			// listen RPC is NOT available over HTTP in stateless mode: answer
+			// -32601 (method not found) rather than opening the stream. A stateful
+			// server (sessions keyed on Mcp-Session-Id) serves it.
+			if (server.mode != ServerMode.stateful)
+			{
+				res.statusCode = HTTPStatus.ok;
+				res.writeBody(makeErrorResponse(msg.id,
+						methodNotFound("subscriptions/listen")).toString(), "application/json");
+				return;
+			}
 			handleListenStream(server, coord, msg, res);
 			return;
 		}
@@ -1148,8 +1167,9 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		ConnectionState reqState = postState(server, sessions, mintedSessionId,
 				connToken, req.headers.get(HttpHeader.protocolVersion, ""), msg.params);
 		auto ctx = new HttpStreamContext(res, coord, clientCapsFor(server, reqState),
-				extractProgressToken(msg.params), token, isDraftReq,
-				effVersion, connToken, reqState);
+				extractProgressToken(msg.params),
+				token, isDraftReq, effVersion, connToken, reqState,
+				server.mode == ServerMode.stateless);
 		auto resp = server.handle(msg, ctx);
 		// Draft basic/utilities/cancellation §Transport-Specific Cancellation: on
 		// Streamable HTTP "Closing the SSE response stream is the cancellation

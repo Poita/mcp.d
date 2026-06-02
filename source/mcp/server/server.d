@@ -824,9 +824,29 @@ final class McpServer
 
 	/// Advertise the resources `subscribe` capability and accept
 	/// `resources/subscribe` + `resources/unsubscribe`.
+	///
+	/// #550 Stage 3: `resources/subscribe` correlates more than one HTTP call (a
+	/// subscription set up on one call is honoured by a `notifications/resources/
+	/// updated` pushed on another), so it is per-peer state a `stateless` server
+	/// must not keep. In stateless mode this opt-in is therefore INERT: the
+	/// `subscribe` capability is not advertised and `resources/subscribe` /
+	/// `resources/unsubscribe` answer `-32601` (method not found). Construct the
+	/// server with `McpServer.stateful()` to actually enable subscriptions (keyed
+	/// on `Mcp-Session-Id`). See `effectiveResourceSubscriptions`.
 	void enableResourceSubscriptions() @safe
 	{
 		resourceSubscriptionsEnabled = true;
+	}
+
+	/// Whether resource subscriptions are effectively active: the author called
+	/// `enableResourceSubscriptions()` AND the server is `stateful`. A `stateless`
+	/// server keeps no per-peer state across HTTP calls, so the `subscribe`
+	/// capability is neither advertised nor honoured even if opted in (#550 Stage
+	/// 3). Gated on the server MODE, not the protocol version, so modern-draft and
+	/// legacy stateless are treated identically.
+	private bool effectiveResourceSubscriptions() const @safe
+	{
+		return resourceSubscriptionsEnabled && mode_ == ServerMode.stateful;
 	}
 
 	/// Advertise the resources `listChanged` capability so `capabilities()`
@@ -1115,8 +1135,8 @@ final class McpServer
 		if (tools.length > 0 || toolListChangedEnabled)
 			caps.tools = ListChangedCapability(toolListChangedEnabled);
 		if (resources.length > 0 || templates.length > 0
-				|| resourceSubscriptionsEnabled || resourcesListChangedEnabled)
-			caps.resources = ResourcesCapability(resourceSubscriptionsEnabled,
+				|| effectiveResourceSubscriptions() || resourcesListChangedEnabled)
+			caps.resources = ResourcesCapability(effectiveResourceSubscriptions(),
 					resourcesListChangedEnabled);
 		if (prompts.length > 0 || promptsListChangedEnabled)
 			caps.prompts = ListChangedCapability(promptsListChangedEnabled);
@@ -1949,6 +1969,15 @@ final class McpServer
 		case "resourcesListChanged":
 			return resourcesListChangedEnabled;
 		case "resourceSubscriptions":
+			// Capability-based, NOT mode-gated. #550 Stage 3: the stateless HTTP
+			// transport refuses subscriptions/listen BEFORE it reaches the server core
+			// (handlePost -> -32601), so this is only consulted on the stdio listen
+			// path, where there is a single implicit connection and resource-update
+			// push is allowed in any mode (the requirement's stdio carve-out). Gating
+			// it on the server MODE here would wrongly break stdio listen for a
+			// stateless server; the HTTP no-shared-state guarantee is enforced at the
+			// transport, and the `subscribe` CAPABILITY advertisement is mode-gated in
+			// `capabilities()` / `effectiveResourceSubscriptions`.
 			return resourceSubscriptionsEnabled;
 		default:
 			return false;
@@ -2098,8 +2127,11 @@ final class McpServer
 		// "whether the client can subscribe to be notified of changes to individual
 		// resources"); a server advertises it only after enableResourceSubscriptions().
 		// A server that never advertised it MUST answer with -32601 rather than
-		// silently accepting, matching logging/setLevel's capability gating.
-		if (!resourceSubscriptionsEnabled)
+		// silently accepting, matching logging/setLevel's capability gating. #550
+		// Stage 3: a stateless server keeps no per-peer subscription state across
+		// HTTP calls, so effectiveResourceSubscriptions() is false in stateless
+		// mode even when enableResourceSubscriptions() was called — yielding -32601.
+		if (!effectiveResourceSubscriptions())
 			throw methodNotFound("resources/subscribe");
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/subscribe requires a string 'uri'");
@@ -2112,7 +2144,9 @@ final class McpServer
 		// Gated on the same optional `subscribe` capability as doSubscribe: a server
 		// that never advertised it MUST answer with -32601 rather than silently
 		// accepting an unsubscribe for a subscription it could never have created.
-		if (!resourceSubscriptionsEnabled)
+		// #550 Stage 3: also -32601 in stateless mode (no per-peer state across
+		// HTTP calls), via effectiveResourceSubscriptions().
+		if (!effectiveResourceSubscriptions())
 			throw methodNotFound("resources/unsubscribe");
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/unsubscribe requires a string 'uri'");
@@ -2587,6 +2621,22 @@ version (unittest)
 	private McpServer makeTestServer() @safe
 	{
 		auto s = new McpServer("test-srv", "0.1.0");
+		registerAddTool(s);
+		return s;
+	}
+
+	// #550 Stage 3: a stateful variant for tests that exercise correlation
+	// features (resources/subscribe, subscriptions/listen resourceSubscriptions,
+	// notifyResourceUpdated) — these are only available on a stateful server.
+	private McpServer makeStatefulTestServer() @safe
+	{
+		auto s = McpServer.stateful("test-srv", "0.1.0");
+		registerAddTool(s);
+		return s;
+	}
+
+	private void registerAddTool(McpServer s) @safe
+	{
 		Tool add = {name: "add", description: nullable("Add two integers")};
 		s.registerDynamicTool(add, (Json args) @safe {
 			const a = args["a"].get!int;
@@ -2596,7 +2646,6 @@ version (unittest)
 			r.structuredContent = Json(["result": Json(a + b)]);
 			return r;
 		});
-		return s;
 	}
 
 	private Message req(long id, string method, Json params = Json.emptyObject) @safe
@@ -4557,7 +4606,9 @@ unittest  // server reads the extensions a client advertises at initialize
 
 unittest  // resources/subscribe and unsubscribe track URIs and return {}
 {
-	auto s = new McpServer("t", "1");
+	// #550 Stage 3: resources/subscribe correlates more than one HTTP call, so it is
+	// only available on a STATEFUL server (a stateless server answers -32601).
+	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
@@ -4753,9 +4804,11 @@ unittest  // stdio subscriptions/listen does not wipe negotiated session clientC
 			"stdio subscriptions/listen wiped the negotiated session clientCaps");
 }
 
-unittest  // subscribe capability is advertised only when enabled
+unittest  // subscribe capability is advertised only when enabled (on a stateful server)
 {
-	auto s = new McpServer("t", "1");
+	// #550 Stage 3: subscribe is only advertised by a STATEFUL server (a stateless
+	// server keeps the opt-in inert — see effectiveResourceSubscriptions).
+	auto s = McpServer.stateful("t", "1");
 	Resource r = {uri: "u", name: "u"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("u", "text/plain", "x"));
 	assert(!s.capabilities().resources.get.subscribe);
@@ -5081,7 +5134,8 @@ unittest  // draft resources/read unknown uri uses invalidParams (-32602)
 
 unittest  // subscriptions/listen reads the spec-shaped filter nested under params.notifications
 {
-	auto s = makeTestServer();
+	// #550 Stage 3: resourceSubscriptions opt-in requires a stateful server.
+	auto s = makeStatefulTestServer();
 	// The server must support the requested notification types for them to be
 	// recorded/acknowledged (draft basic/utilities/subscriptions Acknowledgment).
 	s.enableToolsListChanged();
@@ -5102,7 +5156,8 @@ unittest  // subscriptions/listen reads the spec-shaped filter nested under para
 
 unittest  // subscriptions/listen still accepts the legacy flat (top-level) filter shape
 {
-	auto s = makeTestServer();
+	// #550 Stage 3: resourceSubscriptions opt-in requires a stateful server.
+	auto s = makeStatefulTestServer();
 	s.enableToolsListChanged();
 	s.enableResourceSubscriptions();
 	Json p = Json.emptyObject;
@@ -5128,7 +5183,8 @@ unittest  // subscriptions/listen with an empty resourceSubscriptions array does
 
 unittest  // acknowledgedListenSubset reflects exactly the opted-in change types
 {
-	auto s = makeTestServer();
+	// #550 Stage 3: resourceSubscriptions opt-in requires a stateful server.
+	auto s = makeStatefulTestServer();
 	s.enableToolsListChanged();
 	s.enableResourceSubscriptions();
 	// Nothing opted in yet -> empty object.
@@ -5155,7 +5211,8 @@ unittest  // acknowledgedListenSubset reflects exactly the opted-in change types
 
 unittest  // ack echoes every opted-in resourceSubscriptions URI in request order
 {
-	auto s = makeTestServer();
+	// #550 Stage 3: resourceSubscriptions opt-in requires a stateful server.
+	auto s = makeStatefulTestServer();
 	s.enableResourceSubscriptions();
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json([
@@ -5222,7 +5279,8 @@ unittest  // per-stream ack does not leak a concurrent stream's opt-in (#430)
 	// report toolsListChanged (and A's must NOT report resourceSubscriptions). The
 	// fix builds each ack from the per-stream filter the transport captured right
 	// after routing that listen request — never the server-wide accumulator.
-	auto s = makeTestServer();
+	// #550 Stage 3: resourceSubscriptions opt-in requires a stateful server.
+	auto s = makeStatefulTestServer();
 	s.enableToolsListChanged();
 	s.enableResourceSubscriptions();
 
@@ -5331,7 +5389,8 @@ unittest  // subscriptions/listen ack omits resourceSubscriptions when subscript
 
 unittest  // subscriptions/listen ack keeps resourceSubscriptions once enabled (#398)
 {
-	auto s = new McpServer("t", "1");
+	// #550 Stage 3: resourceSubscriptions opt-in requires a stateful server.
+	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
@@ -5885,7 +5944,8 @@ unittest  // notify delivers unsolicited notifications to GET-stream listeners
 
 unittest  // notifyResourceUpdated emits resources/updated for a subscribed uri
 {
-	auto s = new McpServer("t", "1");
+	// #550 Stage 3: resources/subscribe + notifyResourceUpdated require a stateful server.
+	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
@@ -5923,7 +5983,8 @@ unittest  // notifyResourceUpdated emits params that are exactly { uri } (no non
 {
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	// #550 Stage 3: resources/subscribe + notifyResourceUpdated require a stateful server.
+	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
@@ -6104,7 +6165,8 @@ unittest  // enableResourceSubscriptions advertises resources capability with ze
 	// A server that supports resource update subscriptions declares
 	// enableResourceSubscriptions() so clients learn they may resources/subscribe,
 	// even before any resource is registered (per 2025-11-25 resources §Capabilities).
-	auto s = new McpServer("t", "1");
+	// #550 Stage 3: subscribe is advertised only by a STATEFUL server.
+	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	auto caps = s.capabilities();
 	assert(!caps.resources.isNull);
@@ -6222,7 +6284,8 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	// MUST reach A and never B, even though B registered first.
 	import std.algorithm : canFind;
 
-	auto s = makeTestServer();
+	// #550 Stage 3: resourceSubscriptions opt-in requires a stateful server.
+	auto s = makeStatefulTestServer();
 	s.enableToolsListChanged();
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
@@ -6714,7 +6777,8 @@ unittest  // #550 Stage 2 cross-talk: two contexts on ONE server keep independen
 	// Two sessions (A and B) share one McpServer, each with its own ConnectionState
 	// (as the SessionManager would hand the transport). Mutating A's log level and
 	// a subscription via dispatch must be invisible to B's state.
-	auto s = new McpServer("t", "1");
+	// #550 Stage 3: resources/subscribe requires a stateful server.
+	auto s = McpServer.stateful("t", "1");
 	s.enableLogging();
 	s.enableResourceSubscriptions();
 	auto stateA = new ConnectionState;
@@ -6760,4 +6824,140 @@ unittest  // #550 Stage 2: bare handle(msg) still uses the single bound activeCo
 			`{"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"error"}}`);
 	s.handle(Message(set));
 	assert(s.activeConnection.logLevel == "error", "bare handle must fall back to activeConnection");
+}
+
+unittest  // #550 Stage 3: a stateless server does NOT advertise the subscribe capability
+{
+	// resources/subscribe correlates more than one HTTP call, so a stateless
+	// server (the default) keeps it inert: even after enableResourceSubscriptions()
+	// the `subscribe` resources capability is NOT advertised.
+	auto s = McpServer.stateless("t", "1");
+	s.registerResource(Resource("res://x", "x"), () @safe {
+		ResourceContents c;
+		return c;
+	});
+	s.enableResourceSubscriptions();
+	auto caps = s.capabilities();
+	assert(!caps.resources.isNull);
+	assert(!caps.resources.get.subscribe,
+			"a stateless server must NOT advertise the resources subscribe capability (#550 Stage 3)");
+}
+
+unittest  // #550 Stage 3: resources/subscribe on a stateless server -> -32601
+{
+	// Even with enableResourceSubscriptions() called, a stateless server answers
+	// resources/subscribe AND resources/unsubscribe with method-not-found (-32601):
+	// there is no per-peer subscription state across HTTP calls.
+	auto s = McpServer.stateless("t", "1");
+	s.enableResourceSubscriptions();
+
+	Json sub = Json.emptyObject;
+	sub["uri"] = "res://x";
+	auto resp = s.handle(req(1, "resources/subscribe", sub)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound,
+			"stateless resources/subscribe must be -32601 (#550 Stage 3)");
+
+	auto resp2 = s.handle(req(2, "resources/unsubscribe", sub)).get;
+	assert(resp2["error"]["code"].get!int == ErrorCode.methodNotFound,
+			"stateless resources/unsubscribe must be -32601 (#550 Stage 3)");
+}
+
+unittest  // #550 Stage 3: a STATEFUL server still advertises + honours subscribe (no regression)
+{
+	// The stateful counterpart: enableResourceSubscriptions() is effective, so the
+	// capability is advertised and resources/subscribe succeeds end to end.
+	auto s = McpServer.stateful("t", "1");
+	s.registerResource(Resource("res://x", "x"), () @safe {
+		ResourceContents c;
+		return c;
+	});
+	s.enableResourceSubscriptions();
+	assert(s.capabilities().resources.get.subscribe,
+			"a stateful server MUST advertise the subscribe capability");
+
+	Json sub = Json.emptyObject;
+	sub["uri"] = "res://x";
+	auto resp = s.handle(req(1, "resources/subscribe", sub)).get;
+	assert("error" !in resp, "stateful resources/subscribe must succeed");
+	assert(s.isSubscribed("res://x"), "stateful subscribe must record the subscription");
+
+	auto resp2 = s.handle(req(2, "resources/unsubscribe", sub)).get;
+	assert("error" !in resp2, "stateful resources/unsubscribe must succeed");
+	assert(!s.isSubscribed("res://x"), "stateful unsubscribe must drop the subscription");
+}
+
+unittest  // #550 Stage 3: stateless requests get INDEPENDENT ConnectionState; the server keeps no reference
+{
+	// Two requests bound to two distinct (transient) ConnectionStates — as the
+	// stateless HTTP transport builds per request — must not bleed into each other,
+	// and dispatching against one must not retain it on the server. Drive via two
+	// ConnCtx carrying separate ConnectionStates.
+	auto s = McpServer.stateless("t", "1");
+	s.enableLogging();
+
+	auto a = new ConnectionState;
+	auto b = new ConnectionState;
+	a.negotiated = ProtocolVersion.v2025_06_18;
+	b.negotiated = ProtocolVersion.v2025_11_25;
+
+	// A logging/setLevel routed against A's state must mutate ONLY A's state.
+	Json lvl = Json.emptyObject;
+	lvl["level"] = "error";
+	s.handle(req(1, "logging/setLevel", lvl), new ConnCtx("", a));
+	assert(a.logLevel == "error", "request A's state must record its own log level");
+	assert(b.logLevel == "info", "request B's independent state must be untouched");
+	// The server retains no reference to the per-request state between calls: its
+	// bound activeConnection is neither A nor B.
+	assert(s.activeConnection !is a && s.activeConnection !is b,
+			"a stateless server must not retain a reference to a per-request ConnectionState");
+}
+
+unittest  // #550 Stage 3: two stateful sessions on ONE server cannot observe each other's state
+{
+	// Drive via SessionManager.stateFor + two contexts, exactly as the stateful HTTP
+	// transport resolves per-session state. A's negotiated version / logLevel /
+	// subscription / in-flight id must be invisible to B.
+	import mcp.transport.session : SessionManager;
+	import mcp.server.context : CancellationToken;
+
+	auto s = McpServer.stateful("t", "1");
+	s.enableLogging();
+	s.enableResourceSubscriptions();
+
+	auto mgr = new SessionManager;
+	const idA = mgr.create();
+	const idB = mgr.create();
+	auto csA = mgr.stateFor(idA);
+	auto csB = mgr.stateFor(idB);
+	assert(csA !is csB);
+
+	auto ctxA = new ConnCtx(idA, csA);
+	auto ctxB = new ConnCtx(idB, csB);
+
+	// Mutate session A via real dispatch: set a log level and a subscription.
+	Json lvl = Json.emptyObject;
+	lvl["level"] = "error";
+	s.handle(req(1, "logging/setLevel", lvl), ctxA);
+	Json sub = Json.emptyObject;
+	sub["uri"] = "res://a";
+	s.handle(req(2, "resources/subscribe", sub), ctxA);
+	csA.negotiated = ProtocolVersion.v2025_03_26;
+	csA.inFlight["i:1"] = new CancellationToken;
+
+	// Session B does its OWN dispatch (a different log level + its own subscription)
+	// via ctxB, so the two sessions are exercised concurrently on the one server.
+	Json lvlB = Json.emptyObject;
+	lvlB["level"] = "warning";
+	s.handle(req(3, "logging/setLevel", lvlB), ctxB);
+	Json subB = Json.emptyObject;
+	subB["uri"] = "res://b";
+	s.handle(req(4, "resources/subscribe", subB), ctxB);
+
+	// NONE of A's state may be visible through B's, and vice versa.
+	assert(csB.logLevel == "warning", "session B must keep its own log level");
+	assert(csA.logLevel == "error", "session A must keep its own log level");
+	assert(("res://a" in csB.subscriptions) is null, "session B saw session A's subscription");
+	assert(("res://b" in csA.subscriptions) is null, "session A saw session B's subscription");
+	assert(csB.negotiated != ProtocolVersion.v2025_03_26, "session B saw session A's version");
+	assert(("i:1" in csB.inFlight) is null, "session B saw session A's in-flight id");
 }

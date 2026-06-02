@@ -53,7 +53,10 @@ enum ushort defaultPort = 9354;
 
 void main(string[] args) @safe
 {
-	auto server = new McpServer("sampling-example", "1.0.0",
+	// #550 Stage 3: this tool calls ctx.sample (a server->client request). Over
+	// HTTP that requires a session, so the server runs in STATEFUL mode (works
+	// over stdio too — single implicit session).
+	auto server = McpServer.stateful("sampling-example", "1.0.0",
 			nullable("Server-initiated LLM sampling demo (stdio or Streamable HTTP)."));
 
 	// Register every @tool method on the API object in one call.
