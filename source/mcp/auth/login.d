@@ -398,8 +398,10 @@ string defaultTokenStorePath() @safe
 /// The canonical resource URI for `mcpEndpoint`, per the MCP authorization
 /// "Canonical Server URI" rules: drop any fragment and a single trailing slash,
 /// and lowercase the scheme + authority (host[:port]) while leaving the path
-/// case untouched (matching `mcp.auth.oauth.canonicalResourceUri`). Kept
-/// `@safe pure nothrow` by lowercasing in place rather than calling `toLower`.
+/// case untouched. This MUST agree with `mcp.auth.oauth.canonicalResourceUri`
+/// for all inputs (a cross-check unittest enforces it); both implement the same
+/// canonicalization. Kept `@safe pure nothrow` by lowercasing in place rather
+/// than calling `toLower`.
 string canonicalResource(string mcpEndpoint) @safe pure nothrow
 {
 	import std.string : indexOf;
@@ -883,6 +885,20 @@ unittest  // canonicalResource lowercases scheme+host but preserves the path cas
 	assert(canonicalResource("HTTPS://MCP.Example.com/Mcp/") == "https://mcp.example.com/Mcp");
 	assert(canonicalResource(
 			"https://MCP.Example.com:8443/Path#frag") == "https://mcp.example.com:8443/Path");
+}
+
+unittest  // canonicalResource agrees with oauth.canonicalResourceUri (#14 convergence)
+{
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	foreach (x; [
+		"https://mcp.example.com/", "https://mcp.example.com/mcp",
+		"https://mcp.example.com/mcp/", "HTTPS://MCP.Example.com/Mcp/",
+		"https://MCP.Example.com/Path#frag",
+		"https://MCP.Example.com:8443/Path#frag",
+		"https://mcp.example.com:8443/", "https://mcp.example.com",
+	])
+		assert(canonicalResource(x) == canonicalResourceUri(x), x);
 }
 
 unittest  // scopeString space-joins the requested scopes
