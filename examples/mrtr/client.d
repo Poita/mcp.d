@@ -103,6 +103,16 @@ private int runE2E(McpClient client) @safe
 	// carries per-request `_meta`.
 	client.enableDraft();
 
+	// Advertise the input capabilities this client can satisfy. Since #60 the
+	// server only includes an InputRequest the client declared support for, so we
+	// must advertise elicitation + sampling for the raw-inspection call below
+	// (which deliberately installs NO handlers). The no-handler call still
+	// surfaces the InputRequiredResult verbatim — advertising a capability is
+	// distinct from installing a handler to auto-resolve it.
+	client.capabilities.elicitation = true;
+	client.capabilities.elicitationForm = true;
+	client.capabilities.sampling = true;
+
 	// ---- discovery: the server advertises the draft version + its identity ----
 	auto disc = client.discover();
 	check(disc.serverInfo.name == "mrtr-example",
