@@ -13,6 +13,7 @@ import mcp.protocol.draft;
 import mcp.transport.sse_context;
 import mcp.transport.session;
 import mcp.auth.resource_server;
+import mcp.server.context : RequestContext, ConnectionScoped;
 
 /// The HTTP header carrying the session id (basic/transports §Session Management).
 enum SessionHeader = "Mcp-Session-Id";
@@ -369,15 +370,33 @@ private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @
 {
 	import vibe.core.core : sleep;
 	import core.time : seconds;
+	import vibe.core.sync : TaskMutex;
 
 	res.contentType = "text/event-stream";
 	applySseStreamHeaders(res, false);
 
-	const listenerId = channel.addListener((string frame) @safe {
+	// Serialize every write to THIS response's bodyWriter through one per-stream
+	// TaskMutex (audit finding #9, mirroring handleGet/handleListenStream): the
+	// registered-listener writer (driven by LegacySseChannel.deliver) and the
+	// heartbeat loop share this connection, and LegacySseChannel.deliver itself has
+	// no write serialization, so without this lock two concurrent deliveries -- or a
+	// delivery racing the heartbeat -- could interleave the bytes of different SSE
+	// frames. A channel-level mutex would not help, since it cannot serialize against
+	// this foreign heartbeat writer; the serialization must live here.
+	auto writeMtx = new TaskMutex;
+	void writeFrame(string frame) @safe
+	{
 		() @trusted {
-			res.bodyWriter.write(cast(const(ubyte)[]) frame);
-			res.bodyWriter.flush();
+			synchronized (writeMtx)
+			{
+				res.bodyWriter.write(cast(const(ubyte)[]) frame);
+				res.bodyWriter.flush();
+			}
 		}();
+	}
+
+	const listenerId = channel.addListener((string frame) @safe {
+		writeFrame(frame);
 	});
 	scope (exit)
 		channel.removeListener(listenerId);
@@ -386,10 +405,7 @@ private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @
 	{
 		sleep(15.seconds);
 		try
-			() @trusted {
-			res.bodyWriter.write(cast(const(ubyte)[]) ": ping\n\n");
-			res.bodyWriter.flush();
-		}();
+			writeFrame(": ping\n\n");
 		catch (Exception)
 			break;
 	}
@@ -822,6 +838,74 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	}
 }
 
+/// A minimal connection-scoped `RequestContext` used only to dispatch an inbound
+/// notification (notably `notifications/cancelled`) on the Streamable HTTP
+/// transport while carrying the request's per-connection token (#22 item 2). It
+/// has no server->client channel: the cancellation path only reads the
+/// connection token to scope the in-flight cancellation key, and never emits
+/// progress/logging or server-initiated requests. Mirrors the no-op behaviour of
+/// `NullContext` for every other member.
+private final class HttpNotifyContext : RequestContext, ConnectionScoped
+{
+	import std.typecons : Nullable;
+
+	private string token_;
+
+	this(string token) @safe
+	{
+		this.token_ = token;
+	}
+
+	string connectionToken() @safe
+	{
+		return token_;
+	}
+
+	bool isCancelled() @safe
+	{
+		return false;
+	}
+
+	void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
+	{
+	}
+
+	void log(string, Json, string = null) @safe
+	{
+	}
+
+	Json sendRequest(string, Json) @safe
+	{
+		throw internalError("notification context has no server-to-client channel");
+	}
+
+	bool clientSupports(string) @safe
+	{
+		return false;
+	}
+
+	bool isStateless() @safe
+	{
+		return false;
+	}
+
+	Json[string] inputResponses() @safe
+	{
+		Json[string] empty;
+		return empty;
+	}
+
+	string requestState() @safe
+	{
+		return "";
+	}
+
+	TokenInfo auth() @safe
+	{
+		return TokenInfo.invalid();
+	}
+}
+
 private void handlePost(McpServer server, StreamCoordinator coord,
 		SessionManager sessions, TokenInfo token, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
@@ -864,6 +948,17 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			}
 		}
 	}
+
+	// Per-connection cancellation scope (#3/#13/#22). A request and its later
+	// `notifications/cancelled` arrive on SEPARATE POSTs that share only the
+	// `Mcp-Session-Id` header, so the cancellation registry must be keyed by that
+	// session id for the two to match. The token is therefore the session id when
+	// stateful sessions are enabled and applicable; otherwise the empty (shared)
+	// token, in which case bare-id cancellation is unscoped across connections
+	// (documented in `mcp.transport.session` -- stateful sessions are required for
+	// cross-client cancellation isolation).
+	const connToken = (sessions !is null && sessionsApply(server.negotiatedVersion)) ? req
+		.headers.get(SessionHeader, "") : "";
 
 	// JSON-RPC batching (an array body) was introduced in 2025-03-26 and removed
 	// in every later revision: 2025-06-18 / 2025-11-25 / draft all require the
@@ -946,16 +1041,33 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			res.writeBody(makeErrorResponse(Json(null), noteErr).toString(), "application/json");
 			return;
 		}
-		server.handle(msg);
+		// #22 item 2: route the notification through a connection-scoped context so a
+		// `notifications/cancelled` resolves to the SAME per-session in-flight key the
+		// request side (HttpStreamContext) used. Without this it would go through
+		// NullContext (token ""), never matching the now-scoped in-flight request.
+		server.handle(msg, new HttpNotifyContext(connToken));
 		res.statusCode = HTTPStatus.accepted;
 		res.writeBody("", "text/plain");
 		return;
 	case MessageKind.request:
 		// Session Management: assign a session id on the InitializeResult so the
 		// client can echo it on subsequent requests. Set before writing the body.
-		if (sessions !is null && sessionsApply(server.negotiatedVersion)
-				&& msg.method == "initialize")
-			res.headers[SessionHeader] = sessions.create();
+		// `sessions.create()` is fail-closed (audit finding #8): it throws
+		// McpException when the OS CSPRNG is unavailable. Map that to a JSON-RPC
+		// error response on HTTP 500 -- the same shape as every other error path in
+		// handlePost -- instead of letting it escape to vibe's generic error page.
+		if (sessions !is null
+				&& sessionsApply(server.negotiatedVersion) && msg.method == "initialize")
+		{
+			try
+				res.headers[SessionHeader] = sessions.create();
+			catch (McpException e)
+			{
+				res.statusCode = HTTPStatus.internalServerError;
+				res.writeBody(makeErrorResponse(msg.id, e).toString(), "application/json");
+				return;
+			}
+		}
 		// The MCP-Protocol-Version header was already validated by
 		// postProtocolVersionGate above (it gates every POST kind).
 		// Draft: validate the standard request headers against the body.
@@ -1003,7 +1115,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		const effVersion = effectivePostVersion(req.headers.get(HttpHeader.protocolVersion,
 				""), server.negotiatedVersion);
 		auto ctx = new HttpStreamContext(res, coord, server.clientCapabilities,
-				extractProgressToken(msg.params), token, isDraftReq, effVersion);
+				extractProgressToken(msg.params), token, isDraftReq, effVersion, connToken);
 		auto resp = server.handle(msg, ctx);
 		// Draft basic/utilities/cancellation §Transport-Specific Cancellation: on
 		// Streamable HTTP "Closing the SSE response stream is the cancellation
@@ -1404,6 +1516,67 @@ unittest  // legacy support is opt-in: off by default
 	assert(!opts.legacyHttpSse);
 	assert(opts.legacySsePath == "/sse");
 	assert(opts.legacyMessagePath == "/message");
+}
+
+unittest  // #9: legacy GET write serialization keeps concurrent SSE frames non-interleaved
+{
+	// audit finding #9: LegacySseChannel.deliver has no write serialization, so two
+	// concurrent deliveries to one legacy listener could interleave SSE frame bytes
+	// when the underlying socket write yields. handleLegacyGet routes every write --
+	// the listener writer AND the heartbeat -- through one per-stream TaskMutex
+	// (writeFrame), so a write that yields mid-frame cannot be cut into by another
+	// writer. This test models that writeFrame and proves the mutex prevents
+	// interleaving even when the write yields between its two halves.
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import vibe.core.sync : TaskMutex;
+	import core.time : msecs;
+
+	auto writeMtx = new TaskMutex;
+	string log;
+	// A write that yields between writing the frame's head and tail: without the
+	// lock a second writer would slot its bytes into the gap.
+	void writeFrame(string head, string tail) @safe
+	{
+		() @trusted {
+			synchronized (writeMtx)
+			{
+				log ~= head;
+				sleep(5.msecs); // yield mid-frame
+				log ~= tail;
+			}
+		}();
+	}
+
+	runTask(() nothrow{
+		try
+		{
+			auto t1 = runTask(() nothrow{
+				try
+					writeFrame("[A", "A]");
+				catch (Exception)
+				{
+				}
+			});
+			auto t2 = runTask(() nothrow{
+				try
+					writeFrame("[B", "B]");
+				catch (Exception)
+				{
+				}
+			});
+			t1.join();
+			t2.join();
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+
+	// Each frame's head and tail are adjacent (no foreign bytes between them):
+	// the only valid serializations are "[AA][BB]" or "[BB][AA]".
+	assert(log == "[AA][BB]" || log == "[BB][AA]", "legacy SSE frames interleaved (#9): " ~ log);
 }
 
 unittest  // localhost hosts are accepted, foreign hosts rejected

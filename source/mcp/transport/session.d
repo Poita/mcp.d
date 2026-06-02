@@ -31,6 +31,14 @@ final class SessionManager
 	/// and return it. The id is a 256-bit value rendered as lowercase hex, which
 	/// satisfies the spec requirement that the id "MUST only contain visible
 	/// ASCII characters (ranging from 0x21 to 0x7E)".
+	///
+	/// Throws: `McpException` (`internalError`) when the host OS CSPRNG is
+	/// unavailable (audit finding #8). This was previously an infallible path; it is
+	/// now fail-closed (see `generateSessionId`/`fillSecureRandom`), so callers on the
+	/// request path (e.g. `streamable_http.handlePost`'s `initialize` branch) must be
+	/// prepared for it to throw rather than always returning an id. vibe.d converts an
+	/// escaping `McpException` to an HTTP 500; `handlePost` additionally maps it to a
+	/// JSON-RPC error response so the wire shape matches every other error path.
 	string create() @safe
 	{
 		const id = generateSessionId();
@@ -60,6 +68,10 @@ final class SessionManager
 }
 
 /// Produce a cryptographically-secure, hex-encoded 256-bit session id.
+///
+/// Throws: `McpException` (`internalError`) when no OS CSPRNG can be read (audit
+/// finding #8). There is deliberately no non-cryptographic fallback (#27), so this
+/// is a fallible path; callers must handle the throw.
 string generateSessionId() @safe
 {
 	import std.format : format;
@@ -82,6 +94,13 @@ private void fillSecureRandom(ubyte[] dst) @trusted
 {
 	if (dst.length == 0)
 		return;
+
+	// Test seam (audit finding #8): a build configured with this version simulates
+	// an unavailable OS CSPRNG so the fail-closed contract -- create()/
+	// generateSessionId() throw McpException rather than emitting a predictable id --
+	// can be locked in by a regression test. Never defined in normal builds.
+	version (McpForceCsprngFailure)
+		throw internalError("forced CSPRNG failure (test seam)");
 
 	version (Posix)
 	{
@@ -190,4 +209,18 @@ unittest  // terminating an unknown session reports false
 	auto mgr = new SessionManager;
 	assert(!mgr.terminate("nope"));
 	assert(!mgr.terminate(""));
+}
+
+version (McpForceCsprngFailure) unittest  // #8: create()/generateSessionId fail closed on CSPRNG failure
+{
+	// Build with `-version=McpForceCsprngFailure` (configured by CI / the fix3
+	// verification step) to exercise the fail-closed contract: when the OS CSPRNG is
+	// unavailable, id generation throws McpException(internalError) instead of
+	// emitting a predictable id. This locks in audit finding #8/#27.
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(generateSessionId());
+
+	auto mgr = new SessionManager;
+	assertThrown!McpException(mgr.create());
 }
