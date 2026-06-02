@@ -4,7 +4,7 @@
  * The bare `import mcp;` does not dump the auth layer at the top level. Token
  * verifiers (JWT, introspection, static), the OAuth client / login helpers,
  * the resource-server helpers, and the OAuth proxy are brought in explicitly
- * with `import mcp.auth;` (issue #301).
+ * with `import mcp.auth;`.
  */
 module mcp.auth;
 
