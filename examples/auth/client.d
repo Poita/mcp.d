@@ -7,12 +7,12 @@
  * what differed and exits NON-ZERO, so this doubles as an end-to-end regression
  * test.
  *
- * Scaffold (examples/common, #505): the event-loop plumbing and the assertion
- * primitives come from `examples_common` — `runClient` drives the vibe loop and
- * maps a thrown assertion to a non-zero exit, `check`/`checkEq` print a `FAIL:`
- * line and throw, and `connectFromArgs` selects the transport from argv. This
- * example is HTTP-only, so it is always invoked with `--url` (or the default);
- * there is no stdio/spawn sibling.
+ * Scaffold: the event-loop plumbing and the assertion primitives come from
+ * `examples_common` — `runClient` drives the vibe loop and maps a thrown
+ * assertion to a non-zero exit, `check`/`checkEq` print a `FAIL:` line and
+ * throw, and `connectFromArgs` selects the transport from argv. This example is
+ * HTTP-only, so it is always invoked with `--url` (or the default); there is no
+ * stdio/spawn sibling.
  *
  * TRANSPORT: HTTP only. OAuth 2.1 resource-server protection (401 challenges,
  * the RFC 9728 PRM document, RFC 8707 audience binding) is inherently an HTTP
@@ -26,7 +26,7 @@
  *   2. The advertised Protected Resource Metadata document (RFC 9728):
  *      `resource`, `authorization_servers`, `scopes_supported`.
  *   3. Happy path: a token obtained via the SDK OAuth client-credentials
- *      acquisition surface (#504) -> initialize succeeds, tools/list contains
+ *      acquisition surface -> initialize succeeds, tools/list contains
  *      `whoami` + `secret_note`, `whoami` returns the token's subject + scopes
  *      in its TYPED structuredContent (inferred from the server's WhoamiResult
  *      struct), `secret_note` returns the privileged payload.
@@ -37,7 +37,7 @@
  *   6. Missing server-wide scope: a token without `mcp:read` -> HTTP 403
  *      `insufficient_scope`.
  *
- * Tokens / acquisition (#504): in a real deployment the client would obtain a
+ * Tokens / acquisition: in a real deployment the client would obtain a
  * token from the authorization server the resource server trusts. To keep this
  * example offline and self-contained, it stands up a tiny in-process
  * authorization-server token endpoint that mints ES256 JWTs with the private
@@ -138,8 +138,8 @@ string mintToken(string subject, string scope_, string audience) @safe
 /// return its URL. On any `POST` it mints a `mcp:read mcp:write` token bound to
 /// `audience` (for subject `user-42`) and replies with the RFC 6749 token
 /// response JSON. This stands in for the real AS so the happy path can drive the
-/// SDK's `OAuthClient.clientCredentials` acquisition surface (#504) end to end
-/// while staying offline.
+/// SDK's `OAuthClient.clientCredentials` acquisition surface end to end while
+/// staying offline.
 string startTokenEndpoint(string audience) @trusted
 {
 	auto router = new URLRouter;
@@ -164,8 +164,8 @@ int run() @safe
 {
 	// ---- 1. First contact with no token: 401 + WWW-Authenticate challenge ----
 	//
-	// HIGH-LEVEL PASS (SDK #471): drive first contact through the real OAuth
-	// client surface. `OAuthClient.probeUnauthorized` POSTs an unauthenticated
+	// HIGH-LEVEL PASS: drive first contact through the real OAuth client
+	// surface. `OAuthClient.probeUnauthorized` POSTs an unauthenticated
 	// initialize and hands back the `WWW-Authenticate` header; `parseWwwAuthenticate`
 	// turns it into a typed `WwwAuthenticate{scheme, resourceMetadata, scope_}`.
 	{
@@ -205,7 +205,7 @@ int run() @safe
 
 	// ---- 2. The Protected Resource Metadata document (RFC 9728) ----
 	//
-	// HIGH-LEVEL PASS (SDK #471): `OAuthClient.discoverProtectedResource` follows
+	// HIGH-LEVEL PASS: `OAuthClient.discoverProtectedResource` follows
 	// the `resource_metadata` URL from the challenge (or the well-known fallbacks)
 	// and returns a typed `ProtectedResourceMetadata`, so we assert on its fields
 	// rather than re-parsing the JSON document by hand.
@@ -247,7 +247,7 @@ int run() @safe
 
 	// ---- 3. Happy path: full-scope token, initialize + tools ----
 	//
-	// ACQUISITION (#504): obtain the bearer token through the SDK's OAuth client
+	// ACQUISITION: obtain the bearer token through the SDK's OAuth client
 	// surface rather than hand-minting it inline. A tiny in-process token endpoint
 	// (the throwaway AS) issues a `mcp:read mcp:write` JWT; `clientCredentials` is
 	// the cleanest automated grant, so we POST to it and feed the returned
@@ -285,8 +285,8 @@ int run() @safe
 		check(!who.isError, "whoami should not be a tool error");
 		// `whoami` returns the typed WhoamiResult struct on the server, so the SDK
 		// infers structuredContent for us. Decode it back into a typed struct with
-		// `structuredContentAs!WhoamiResult` (SDK #464) and assert on real fields
-		// instead of reading raw structuredContent["..."] Json.
+		// `structuredContentAs!WhoamiResult` and assert on real fields instead of
+		// reading raw structuredContent["..."] Json.
 		const WhoamiResult info = who.structuredContentAs!WhoamiResult;
 		checkEq(info.subject, "user-42", "whoami subject");
 		checkEq(info.scopes, ["mcp:read", "mcp:write"], "whoami scopes");
