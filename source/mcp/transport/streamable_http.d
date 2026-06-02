@@ -14,6 +14,7 @@ import mcp.transport.sse_context;
 import mcp.transport.session;
 import mcp.auth.resource_server;
 import mcp.server.context : RequestContext, ConnectionScoped;
+import mcp.server.connection : ConnectionState;
 
 /// The HTTP header carrying the session id (basic/transports §Session Management).
 enum SessionHeader = "Mcp-Session-Id";
@@ -151,6 +152,14 @@ void mountMcp(URLRouter router, McpServer server,
 	// server mints/tracks an `Mcp-Session-Id`; a `stateless` server never does.
 	// There is no longer a separate `enableSessions` transport knob.
 	auto sessions = server.mode == ServerMode.stateful ? new SessionManager : null;
+
+	// STAGE-1 TRANSITIONAL SHIM (issue #550): this mount owns a single
+	// `ConnectionState`, which the server core threads through dispatch and reads
+	// back for the notify/push path. Binding it here (before any request is
+	// served) is byte-identical to the old single set of shared `McpServer`
+	// fields. Stage 2 replaces this with a per-`Mcp-Session-Id` lookup, so the
+	// notify/push and dispatch seams already in place do not move.
+	server.bindConnection(new ConnectionState);
 
 	// basic/authorization §Authorization Server Location (RFC 9728): refuse to start
 	// serving a Protected Resource Metadata document that would violate the MUST to

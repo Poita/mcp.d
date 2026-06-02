@@ -325,23 +325,22 @@ final class McpServer
 	private RegisteredPrompt[string] prompts;
 	private CompleteResult delegate(CompleteRequest request) @safe typedCompletionHandler;
 	private bool loggingEnabled;
-	private string logLevel = "info";
 	private bool resourceSubscriptionsEnabled;
-	private bool[string] subscriptions;
 	private Nullable!TasksCapability tasksCapability;
 	private Json extensions = Json.undefined;
-	private ProtocolVersion negotiated = latestStable;
-	// The protocol version pinned for this CONNECTION's server-initiated push
-	// traffic (the standalone GET SSE stream / stdio listen channel). Set at
-	// `initialize` (to the negotiated version) and when a draft stdio
-	// `subscriptions/listen` session opens. It governs draft notification
-	// suppression/filtering on the unsolicited push path, which fires outside any
-	// request, so it cannot be a per-request value. Per-request dispatch no longer
-	// touches this field (issue #288): each request's effective version lives on
-	// its RequestScope.
-	private ProtocolVersion connectionVersion = latestStable;
-	private ClientCapabilities clientCaps;
-	private bool initialized;
+	// STAGE-1 TRANSITIONAL SHIM (issue #550): the per-connection mutable state
+	// that used to be scattered as individual `McpServer` fields —
+	// `negotiated`, `connectionVersion`, `clientCaps`, `logLevel`,
+	// `subscriptions`, and the `inFlight` cancellation registry — now lives on a
+	// single `ConnectionState`, threaded through dispatch (`handle`/`route`/
+	// `do*`) and read back by the notify/push path. Keeping exactly ONE
+	// `ConnectionState` per `McpServer` (created at construction, and re-pointed
+	// by transports at wire-up via `bindConnection`) makes single-client
+	// behaviour byte-identical to the old shared fields. Stage 2 replaces this
+	// single ref with per-session resolution (the same `ConnectionState`, but
+	// looked up per `Mcp-Session-Id`), so the substrate is already threaded
+	// everywhere — only WHERE the `ConnectionState` comes from changes.
+	private ConnectionState activeConnection;
 	// Per-list draft `CacheableResult` freshness hints, keyed by the list method
 	// ("tools/list", "resources/list", "resources/templates/list", "prompts/list").
 	// Set via `setListCacheHint`; applied by the matching `do*` handler.
@@ -384,11 +383,9 @@ final class McpServer
 	// for tools that declared an inputSchema, so the blast radius is small. Opt
 	// out with disableInputSchemaValidation().
 	private bool validateInputSchema_ = true;
-	// In-flight requests, keyed by their JSON-RPC id (string form), each holding
-	// a shared cancellation token. Populated for the duration of a request so an
-	// inbound `notifications/cancelled` can flip the matching token and the
-	// request's response can be suppressed (basic/utilities/cancellation).
-	private CancellationToken[string] inFlight;
+	// In-flight requests (keyed by their JSON-RPC id, scoped by connection token)
+	// now live on the threaded `ConnectionState.inFlight` registry; see the
+	// STAGE-1 shim note above.
 	// Observer for inbound client-originated notifications (e.g.
 	// `notifications/roots/list_changed`). Invoked from `handleNotification`
 	// for any notification the server does not itself consume, giving the
@@ -420,6 +417,34 @@ final class McpServer
 		this.serverName = serverInfo.name;
 		this.serverVersion = serverInfo.version_;
 		this.instructions = instructions;
+		// STAGE-1 (issue #550): one transitional `ConnectionState` per server,
+		// standing in for the formerly-scattered per-connection fields. Stage 2
+		// replaces this with a per-session lookup. See `activeConnection`.
+		this.activeConnection = new ConnectionState;
+	}
+
+	/// STAGE-1 TRANSITIONAL SHIM (issue #550): resolve the `ConnectionState` for
+	/// the connection currently being served. Today this is the single
+	/// `activeConnection`; Stage 2 turns this into a per-session lookup keyed by
+	/// the request's `Mcp-Session-Id`. Routing every per-connection read/write
+	/// through here is the point of Stage 1 — the call sites do not change when
+	/// Stage 2 makes the resolution per-session.
+	private ConnectionState cs() @safe
+	{
+		return activeConnection;
+	}
+
+	/// STAGE-1 TRANSITIONAL SHIM (issue #550): let a transport point this server
+	/// at the `ConnectionState` it owns for a mount/connection at wire-up
+	/// (`mountMcp` / `runStdio` / `serveStdio`). Used by the notify/push path,
+	/// which fires OUTSIDE any request and therefore cannot receive the state as
+	/// a dispatch argument. In Stage 1 every transport shares the single
+	/// connection state (so behaviour is byte-identical to the old shared
+	/// fields); Stage 2 replaces this with per-session ownership.
+	package(mcp) void bindConnection(ConnectionState conn) @safe
+	{
+		if (conn !is null)
+			activeConnection = conn;
 	}
 
 	/// Construct a `stateless` server (the default mode). On the draft protocol
@@ -475,7 +500,7 @@ final class McpServer
 	/// The protocol version negotiated with the client (valid after `initialize`).
 	ProtocolVersion negotiatedVersion() const @safe
 	{
-		return negotiated;
+		return activeConnection.negotiated;
 	}
 
 	/// Register a *dynamic* tool with a context-aware handler (progress /
@@ -660,7 +685,7 @@ final class McpServer
 	{
 		if (!isSubscribed(uri))
 			return 0;
-		if (connectionVersion.isDraft && !listensFor("resourceSubscriptions"))
+		if (cs.connectionVersion.isDraft && !listensFor("resourceSubscriptions"))
 			return 0;
 		Json params = Json.emptyObject;
 		params["uri"] = uri;
@@ -691,7 +716,7 @@ final class McpServer
 	/// `initialize`).
 	ClientCapabilities clientCapabilities() const @safe
 	{
-		return clientCaps;
+		return activeConnection.clientCaps;
 	}
 
 	/// The effective input schema of a registered tool (the default empty-object
@@ -854,7 +879,7 @@ final class McpServer
 	/// `initialize`). Null if the client advertised none.
 	Nullable!TasksCapability clientTasks() const @safe
 	{
-		return clientCaps.tasks;
+		return activeConnection.clientCaps.tasks;
 	}
 
 	/// Advertise a draft protocol extension (e.g. "io.modelcontextprotocol/tasks")
@@ -873,19 +898,19 @@ final class McpServer
 	/// (valid after `initialize`). `Json.undefined` if the client advertised none.
 	Json clientExtensions() const @safe
 	{
-		return clientCaps.extensions;
+		return activeConnection.clientCaps.extensions;
 	}
 
 	/// Whether a client is currently subscribed to updates for `uri`.
 	bool isSubscribed(string uri) const @safe
 	{
-		return (uri in subscriptions) !is null;
+		return (uri in activeConnection.subscriptions) !is null;
 	}
 
 	/// The most recently set log level (default "info").
 	string currentLogLevel() const @safe
 	{
-		return logLevel;
+		return activeConnection.logLevel;
 	}
 
 	/// The server->client push channel for *unsolicited* traffic — the messages
@@ -973,10 +998,10 @@ final class McpServer
 		// per-request and the draft `tools/call` gate already reads them from
 		// RequestMeta.fromParams(params); clobbering the field would wipe the
 		// capabilities a prior/concurrent stateful initialize negotiated.
-		connectionVersion = mv;
+		cs.connectionVersion = mv;
 		// Record the opted-in filters; the one-shot {acknowledged:true} result is
 		// discarded (the spec defines no such Result — the ack is a notification).
-		doSubscribeListen(msg.params);
+		doSubscribeListen(msg.params, cs());
 
 		// The listen request's id is the stream's subscriptionId; every
 		// notification on this channel (starting with the acknowledgement) is
@@ -1015,7 +1040,8 @@ final class McpServer
 		// stream's recorded filter opted in for the method (mirroring the GET-stream
 		// eligibility below). Without this branch a stdio listener receives nothing,
 		// since there is no `pushChannel` on the stdio transport.
-		if (stdioListenSink !is null && connectionVersion.isDraft && globalListensForMethod(method))
+		if (stdioListenSink !is null && cs.connectionVersion.isDraft
+				&& globalListensForMethod(method))
 		{
 			auto note = withSubscriptionId(makeNotification(method, params),
 					stdioListenSubscriptionId);
@@ -1024,7 +1050,7 @@ final class McpServer
 		}
 		if (pushChannel !is null)
 		{
-			if (connectionVersion.isDraft)
+			if (cs.connectionVersion.isDraft)
 			{
 				// Per-stream filtering: an active `subscriptions/listen` stream receives
 				// a type only if its own filter opted in. A plain GET listener (inactive
@@ -1178,9 +1204,10 @@ final class McpServer
 			if (sink is null)
 				return handle(m);
 			if (serverRequest is null)
-				return handle(m, new StdioContext(sink, readProgressToken(m.params), negotiated));
-			return handle(m, new StdioContext(sink, serverRequest, clientCaps,
-					readProgressToken(m.params), negotiated));
+				return handle(m, new StdioContext(sink,
+						readProgressToken(m.params), cs.negotiated));
+			return handle(m, new StdioContext(sink, serverRequest,
+					cs.clientCaps, readProgressToken(m.params), cs.negotiated));
 		};
 
 		if (!input.isBatch)
@@ -1221,7 +1248,10 @@ final class McpServer
 		// than a mutable field on the shared server instance, so a handler that
 		// yields mid-flight cannot have its effective version flipped by another
 		// concurrently-dispatched request (issue #288).
-		ProtocolVersion effective = negotiated;
+		// STAGE-1 (issue #550): resolve the connection state for this request and
+		// thread it through dispatch instead of reading scattered server fields.
+		auto conn = cs();
+		ProtocolVersion effective = conn.negotiated;
 		auto meta = RequestMeta.fromParams(msg.params);
 		// On stateful (2025-era) protocols logging is governed once-per-session by
 		// `logging/setLevel`, so emission is always permitted (and filtered by the
@@ -1238,7 +1268,7 @@ final class McpServer
 		// logging IS enabled this is the previous default (true), so the wire
 		// output for compliant servers is unchanged. (#396)
 		bool loggingRequested = loggingEnabled;
-		string requestLogLevel = logLevel;
+		string requestLogLevel = conn.logLevel;
 		if (meta.protocolVersion.length)
 		{
 			ProtocolVersion mv;
@@ -1287,10 +1317,10 @@ final class McpServer
 		const idKey = inFlightKey(connectionTokenOf(ctx), msg.id);
 		const trackable = idKey.length && msg.method != "initialize";
 		if (trackable)
-			inFlight[idKey] = token;
+			conn.inFlight[idKey] = token;
 		scope (exit)
 			if (trackable)
-				inFlight.remove(idKey);
+				conn.inFlight.remove(idKey);
 
 		// Install the per-request scope so handlers see the right statelessness
 		// (MRTR vs blocking), the input responses carried on a retried draft
@@ -1301,7 +1331,7 @@ final class McpServer
 
 		try
 		{
-			auto result = route(msg.method, msg.params, scoped, effective);
+			auto result = route(msg.method, msg.params, scoped, effective, conn);
 			// Per spec, a receiver of a cancellation "SHOULD NOT send a response
 			// for the cancelled request" — suppress it if cancelled meanwhile.
 			if (token.cancelled)
@@ -1576,7 +1606,7 @@ final class McpServer
 		switch (msg.method)
 		{
 		case "notifications/initialized":
-			initialized = true;
+			cs.initialized = true;
 			break;
 		case "notifications/cancelled":
 			// Resolve the cancellation against the connection it arrived on (#13):
@@ -1631,7 +1661,7 @@ final class McpServer
 			// the per-stream `lastListenFilter_`. Stdio is single-connection, so the
 			// caller is the only listener and clearing all of it is correct.
 			foreach (u; listenResourceUris)
-				subscriptions.remove(u);
+				cs.subscriptions.remove(u);
 			listenResourceUris = null;
 			listenFilters = null;
 			lastListenFilter_ = SubscriptionFilter.init;
@@ -1641,16 +1671,17 @@ final class McpServer
 		const key = inFlightKey(connToken, params["requestId"]);
 		if (key.length == 0)
 			return;
-		if (auto token = key in inFlight)
+		if (auto token = key in cs.inFlight)
 			token.cancel();
 	}
 
-	private Json route(string method, Json params, RequestContext ctx, ProtocolVersion ver) @safe
+	private Json route(string method, Json params, RequestContext ctx,
+			ProtocolVersion ver, ConnectionState conn) @safe
 	{
 		switch (method)
 		{
 		case "initialize":
-			return doInitialize(params);
+			return doInitialize(params, conn);
 		case "server/discover":
 			// `server/discover` is a draft-only RPC (the stable handshake uses
 			// `initialize`). On a non-draft negotiated session it MUST be reported
@@ -1672,14 +1703,14 @@ final class McpServer
 			// supported fallback, so the version pin stays guarded by isDraft rather
 			// than rejecting non-draft callers.
 			if (ver.isDraft)
-				connectionVersion = ver;
-			return doSubscribeListen(params);
+				conn.connectionVersion = ver;
+			return doSubscribeListen(params, conn);
 		case "ping":
 			return Json.emptyObject;
 		case "tools/list":
 			return doListTools(params, ver);
 		case "tools/call":
-			return doCallTool(params, ctx, ver);
+			return doCallTool(params, ctx, ver, conn);
 		case "resources/list":
 			return doListResources(params, ver);
 		case "resources/templates/list":
@@ -1695,11 +1726,11 @@ final class McpServer
 			// versions still honour the RPC, so 2025-era wire output is unchanged.
 			if (ver.isDraft)
 				throw methodNotFound(method);
-			return doSubscribe(params);
+			return doSubscribe(params, conn);
 		case "resources/unsubscribe":
 			if (ver.isDraft)
 				throw methodNotFound(method);
-			return doUnsubscribe(params);
+			return doUnsubscribe(params, conn);
 		case "prompts/list":
 			return doListPrompts(params, ver);
 		case "prompts/get":
@@ -1707,7 +1738,7 @@ final class McpServer
 		case "completion/complete":
 			return doComplete(params);
 		case "logging/setLevel":
-			return doSetLevel(params, ver);
+			return doSetLevel(params, ver, conn);
 		case "tasks/list":
 			return doTasksList(params);
 		case "tasks/get":
@@ -1808,7 +1839,7 @@ final class McpServer
 	/// the `resourceSubscriptions` opt-in is flagged when the array is non-empty.
 	/// For backward compatibility a flat top-level filter (the pre-spec shape) is
 	/// still accepted when no `notifications` object is present.
-	private Json doSubscribeListen(Json params) @safe
+	private Json doSubscribeListen(Json params, ConnectionState conn) @safe
 	{
 		Json filter = Json.undefined;
 		if (params.type == Json.Type.object && "notifications" in params
@@ -1849,7 +1880,7 @@ final class McpServer
 						if (rs[i].type == Json.Type.string)
 						{
 							const u = rs[i].get!string;
-							subscriptions[u] = true;
+							conn.subscriptions[u] = true;
 							// Preserve the agreed URI list so the acknowledgement
 							// can echo `resourceSubscriptions` as the spec's
 							// string[] (deduplicated, request order kept).
@@ -2044,7 +2075,7 @@ final class McpServer
 		throw new McpException(ver.resourceNotFoundCode, "Resource not found: " ~ uri, data);
 	}
 
-	private Json doSubscribe(Json params) @safe
+	private Json doSubscribe(Json params, ConnectionState conn) @safe
 	{
 		// `subscribe` is an optional resources capability (server/resources:
 		// "whether the client can subscribe to be notified of changes to individual
@@ -2055,11 +2086,11 @@ final class McpServer
 			throw methodNotFound("resources/subscribe");
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/subscribe requires a string 'uri'");
-		subscriptions[params["uri"].get!string] = true;
+		conn.subscriptions[params["uri"].get!string] = true;
 		return Json.emptyObject;
 	}
 
-	private Json doUnsubscribe(Json params) @safe
+	private Json doUnsubscribe(Json params, ConnectionState conn) @safe
 	{
 		// Gated on the same optional `subscribe` capability as doSubscribe: a server
 		// that never advertised it MUST answer with -32601 rather than silently
@@ -2068,7 +2099,7 @@ final class McpServer
 			throw methodNotFound("resources/unsubscribe");
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/unsubscribe requires a string 'uri'");
-		subscriptions.remove(params["uri"].get!string);
+		conn.subscriptions.remove(params["uri"].get!string);
 		return Json.emptyObject;
 	}
 
@@ -2163,7 +2194,7 @@ final class McpServer
 		throw methodNotFound("completion/complete");
 	}
 
-	private Json doSetLevel(Json params, ProtocolVersion ver) @safe
+	private Json doSetLevel(Json params, ProtocolVersion ver, ConnectionState conn) @safe
 	{
 		// The draft (2026-07-28) removed the `logging/setLevel` RPC: log level is
 		// now configured purely per-request via `_meta["io.modelcontextprotocol/
@@ -2189,14 +2220,14 @@ final class McpServer
 		// anything else).
 		if (logLevelRank(level) < 0)
 			throw invalidParams("Invalid log level: " ~ level);
-		logLevel = level;
+		conn.logLevel = level;
 		return Json.emptyObject;
 	}
 
-	private Json doInitialize(Json params) @safe
+	private Json doInitialize(Json params, ConnectionState conn) @safe
 	{
 		auto p = InitializeParams.fromJson(params);
-		negotiated = negotiate(p.protocolVersion);
+		conn.negotiated = negotiate(p.protocolVersion);
 		// The draft revision defines NO `initialize`/`InitializeResult`: draft
 		// peers establish the session via `server/discover` plus per-request
 		// `_meta`, never the stateful `initialize` handshake. So the `initialize`
@@ -2206,17 +2237,17 @@ final class McpServer
 		// supports — SHOULD be the latest"), clamp a draft negotiation down to the
 		// latest stable rather than emitting an InitializeResult that claims a
 		// version with no initialize semantics (issue #419).
-		if (negotiated.isDraft)
-			negotiated = latestStable;
-		clientCaps = p.capabilities;
+		if (conn.negotiated.isDraft)
+			conn.negotiated = latestStable;
+		conn.clientCaps = p.capabilities;
 		// Pin the connection's push-path version so unsolicited server->client
 		// notifications gate correctly on draft after initialize (issue #288).
-		connectionVersion = negotiated;
+		conn.connectionVersion = conn.negotiated;
 
 		InitializeResult result;
-		result.protocolVersion = negotiated.toWire;
-		result.capabilities = capabilities().forVersion(negotiated);
-		result.serverInfo = serverInfo_.forVersion(negotiated);
+		result.protocolVersion = conn.negotiated.toWire;
+		result.capabilities = capabilities().forVersion(conn.negotiated);
+		result.serverInfo = serverInfo_.forVersion(conn.negotiated);
 		result.instructions = instructions;
 		return result.toJson();
 	}
@@ -2239,7 +2270,8 @@ final class McpServer
 		return maybeCache(result, listHint("tools/list"), ver);
 	}
 
-	private Json doCallTool(Json params, RequestContext ctx, ProtocolVersion ver) @safe
+	private Json doCallTool(Json params, RequestContext ctx,
+			ProtocolVersion ver, ConnectionState conn) @safe
 	{
 		if ("name" !in params || params["name"].type != Json.Type.string)
 			throw invalidParams("tools/call requires a string 'name'");
@@ -2257,7 +2289,7 @@ final class McpServer
 		// draft protocol, or from the session capabilities negotiated at
 		// `initialize` on the stateful 2025-era protocols.
 		const ClientCapabilities declared = ver.isDraft
-			? RequestMeta.fromParams(params).clientCapabilities : clientCaps;
+			? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
 		bool anyMissing;
 		const missing = entry.requiredClientCapabilities.missingFrom(declared, anyMissing);
 		if (anyMissing)
@@ -6211,7 +6243,7 @@ unittest  // draft: notifyPromptsListChanged suppressed unless client opted in
 {
 	auto s = new McpServer("t", "1");
 	s.enablePromptsListChanged();
-	s.connectionVersion = ProtocolVersion.draft;
+	s.activeConnection.connectionVersion = ProtocolVersion.draft;
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
 	string[] received;
