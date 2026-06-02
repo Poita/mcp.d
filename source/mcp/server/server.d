@@ -103,7 +103,7 @@ struct ToolResponse
 
 	/// The MRTR `inputRequests` this outcome carries (empty unless `needsInput`).
 	/// Read by the dispatch path so it can drop requests whose kind the client
-	/// never declared (#60).
+	/// never declared.
 	const(InputRequest)[] inputRequests() const @safe
 	{
 		return required_.inputRequests;
@@ -117,7 +117,7 @@ struct ToolResponse
 
 	/// Return a copy of this input-required outcome with its `inputRequests`
 	/// replaced by `reqs` (preserving `requestState`). Used by the dispatch path
-	/// after filtering out unsupported request kinds (#60).
+	/// after filtering out unsupported request kinds.
 	ToolResponse withInputRequests(InputRequest[] reqs) const @safe
 	{
 		return ToolResponse.inputRequired(reqs, required_.requestState);
@@ -229,7 +229,7 @@ struct PromptResponse
 
 	/// The MRTR `inputRequests` this outcome carries (empty unless `needsInput`).
 	/// Read by the dispatch path so it can drop requests whose kind the client
-	/// never declared (#60).
+	/// never declared.
 	const(InputRequest)[] inputRequests() const @safe
 	{
 		return required_.inputRequests;
@@ -243,7 +243,7 @@ struct PromptResponse
 
 	/// Return a copy of this input-required outcome with its `inputRequests`
 	/// replaced by `reqs` (preserving `requestState`). Used by the dispatch path
-	/// after filtering out unsupported request kinds (#60).
+	/// after filtering out unsupported request kinds.
 	PromptResponse withInputRequests(InputRequest[] reqs) const @safe
 	{
 		return PromptResponse.inputRequired(reqs, required_.requestState);
@@ -259,7 +259,7 @@ struct PromptResponse
 	/// Project the final `GetPromptResult` to the negotiated protocol version so
 	/// version-gated message content (audio/resource_link/tool_use/tool_result
 	/// plus content-level `_meta`/`lastModified`) is not emitted to peers that do
-	/// not understand it (#1/#20). Mirrors `ToolResponse.forVersion`: an
+	/// not understand it. Mirrors `ToolResponse.forVersion`: an
 	/// `InputRequiredResult` is draft-only (MRTR) and carries no version-gated
 	/// content, so it is returned unchanged.
 	PromptResponse forVersion(ProtocolVersion v) const @safe
@@ -687,8 +687,8 @@ final class McpServer
 		// decides whether it receives this URI, and it must work even on a stateless
 		// server (where the tool handler that calls this runs against a fresh
 		// per-request state, NOT the listen stream's state nor the stale
-		// `activeConnection`). The legacy 2025-era subscribe-then-deliver-on-GET path
-		// is preserved by `notifyChange`'s plain-GET fallback (`isSubscribed(uri)`), so
+		// `activeConnection`). The 2025-era subscribe-then-deliver-on-GET path runs
+		// through `notifyChange`'s plain-GET fallback (`isSubscribed(uri)`), so
 		// no caller-`cs` gate is applied here.
 		Json params = Json.emptyObject;
 		params["uri"] = uri;
@@ -779,7 +779,7 @@ final class McpServer
 	/// the request is resubmitted. The draft schema types
 	/// `GetPromptResultResponse.result` as `GetPromptResult | InputRequiredResult`,
 	/// which this enables; on the 2025-era protocols a handler simply always
-	/// `complete`s, so wire output is unchanged.
+	/// `complete`s, so its wire output carries only a plain `GetPromptResult`.
 	void registerDynamicPrompt(Prompt descriptor, MrtrPromptHandler handler) @safe
 	{
 		prompts[descriptor.name] = RegisteredPrompt(descriptor, handler);
@@ -1052,8 +1052,8 @@ final class McpServer
 	/// draft basic/utilities/subscriptions "The server MUST NOT send notification
 	/// types the client has not explicitly requested" under Multiple Concurrent
 	/// Subscriptions. On 2025-11-25 / 2025-06-18 / 2025-03-26 (no `subscriptions/
-	/// listen`) it is an ordinary single-stream `notify`, so the stable wire output is
-	/// unchanged. Returns the number of streams reached (0 or 1).
+	/// listen`) it is an ordinary single-stream `notify`. Returns the number of
+	/// streams reached (0 or 1).
 	private size_t notifyChange(string method, Json params, string uri) @safe
 	{
 		size_t delivered;
@@ -1082,7 +1082,7 @@ final class McpServer
 			// self-contained and never gated on the caller's (possibly stale)
 			// `activeConnection`. A plain GET listener (inactive filter — only the
 			// 2025-era standalone GET stream, never present in stateless/draft) falls
-			// back to `plainEligible`, preserving the legacy non-draft delivery:
+			// back to `plainEligible` for non-draft delivery:
 			// list-changed broadcasts unconditionally, while `resources/updated` honours
 			// the 2025-era subscribe-then-deliver gate (`isSubscribed(uri)`). On the
 			// draft single-connection path the global opt-in still gates that fallback.
@@ -1165,7 +1165,7 @@ final class McpServer
 		case MessageKind.notification:
 			// Thread the request context into notification handling so an inbound
 			// `notifications/cancelled` resolves the SAME per-connection token the
-			// matching in-flight request was registered under (#13).
+			// matching in-flight request was registered under.
 			handleNotification(msg, ctx);
 			return Nullable!Json.init;
 		case MessageKind.response:
@@ -1268,7 +1268,7 @@ final class McpServer
 		// Computed into a request-local (and the per-request RequestScope) rather
 		// than a mutable field on the shared server instance, so a handler that
 		// yields mid-flight cannot have its effective version flipped by another
-		// concurrently-dispatched request (issue #288).
+		// concurrently-dispatched request.
 		// Resolve the connection state for THIS request from
 		// the context when it carries one (stateful HTTP: the SessionManager-owned
 		// state for its `Mcp-Session-Id`; stateless HTTP: a fresh per-request state
@@ -1294,8 +1294,8 @@ final class McpServer
 		// loggingEnabled so the per-request scope drops every log on such a server,
 		// on BOTH the stateful protocols and the draft (where the per-request
 		// io.modelcontextprotocol/logLevel must not re-enable emission). When
-		// logging IS enabled this is the previous default (true), so the wire
-		// output for compliant servers is unchanged. (#396)
+		// logging IS enabled this defaults to true, so compliant servers emit
+		// their log notifications.
 		bool loggingRequested = loggingEnabled;
 		string requestLogLevel = conn.logLevel;
 		if (meta.protocolVersion.length)
@@ -1340,9 +1340,9 @@ final class McpServer
 		auto token = new CancellationToken;
 		// Scope the registry key by the request's connection/session token so two
 		// concurrent clients sharing one McpServer over Streamable HTTP cannot
-		// collide on an identical bare JSON-RPC id (#13). A non-connection-scoped
-		// context yields an empty token, so the single-connection (stdio /
-		// in-process) key is unchanged.
+		// collide on an identical bare JSON-RPC id. A non-connection-scoped
+		// context yields an empty token, leaving the single-connection (stdio /
+		// in-process) key as the bare id.
 		const idKey = inFlightKey(connectionTokenOf(ctx), msg.id);
 		const trackable = idKey.length && msg.method != "initialize";
 		if (trackable)
@@ -1382,12 +1382,12 @@ final class McpServer
 	}
 
 	/// The in-flight registry key for a request: its connection/session token
-	/// composed with the normalised JSON-RPC id (#13). Keeps cancellations from
+	/// composed with the normalised JSON-RPC id. Keeps cancellations from
 	/// one connection from matching an identically-numbered in-flight request on
 	/// another connection that shares this McpServer. Returns an empty string for
 	/// an absent/null id (a notification has none and is never tracked); the empty
-	/// connection token (the default for non-multiplexing transports) yields the
-	/// historic id-only behaviour because every request then shares one scope.
+	/// connection token (the default for non-multiplexing transports) yields an
+	/// id-only key, so every request on that transport shares one scope.
 	private static string inFlightKey(string connToken, Json id) @safe
 	{
 		const idKey = cancellationKey(id);
@@ -1421,7 +1421,7 @@ final class McpServer
 	}
 
 	/// Whether the client's `declared` capabilities can satisfy a single MRTR
-	/// `InputRequest` (#60). The spec forbids emitting an `InputRequest` whose kind
+	/// `InputRequest`. The spec forbids emitting an `InputRequest` whose kind
 	/// the client never advertised: elicitation requires the matching elicitation
 	/// submode (url-mode -> `elicitation.url`, form-mode -> `elicitation.form`, the
 	/// latter implied by a bare `elicitation:{}`); sampling requires `sampling`
@@ -1452,7 +1452,7 @@ final class McpServer
 		}
 	}
 
-	/// Filter an MRTR `inputRequests` list to those the client can satisfy (#60),
+	/// Filter an MRTR `inputRequests` list to those the client can satisfy,
 	/// dropping any whose kind the client did not declare. The dispatch path calls
 	/// this on a handler's `InputRequiredResult` before serialising, so the server
 	/// never asks a client for input it cannot provide.
@@ -1502,17 +1502,17 @@ final class McpServer
 	/// Set a per-result draft cacheable-result hint on the typed result, then
 	/// serialize via the single symmetric `toJson` emission path. The hint is set
 	/// only when the effective version is draft+ AND a hint was supplied, so the
-	/// result's `cache` stays null for earlier versions and 2025-11-25 wire output
-	/// is unchanged. `toJson` emits `ttlMs`/`cacheScope`, `fromJson` parses them.
+	/// result's `cache` stays null for earlier versions and 2025-11-25, which emit
+	/// no cache hint. `toJson` emits `ttlMs`/`cacheScope`, `fromJson` parses them.
 	private Json maybeCache(R)(R result, Nullable!CacheHint hint, ProtocolVersion ver) @safe
 	{
 		// The draft `CacheableResult` schema makes the freshness hint mandatory on
 		// the cacheable list/read results: a draft client must always be told how
 		// long a result may be cached. When the application configured no explicit
 		// per-list/per-resource hint, emit a conservative default of `ttlMs:0`
-		// (do-not-cache, public scope) rather than omitting the field (#57). On the
+		// (do-not-cache, public scope) rather than omitting the field. On the
 		// pre-draft (2025-era) protocols `cacheableResults` is false, so the field
-		// is never written and the stable wire output is unchanged.
+		// is never written.
 		if (ver.cacheableResults)
 			result.cache = hint.isNull ? nullable(CacheHint(0)) : hint;
 		return result.toJson();
@@ -1533,8 +1533,7 @@ final class McpServer
 	/// `inputRequests` directly (rather than via `ToolResponse.inputRequired`)
 	/// serialises to that same shape but reaches here without a `resultType`,
 	/// so we discriminate it as "input_required" rather than the default
-	/// "complete". A no-op for pre-draft versions, keeping the 2025-era wire
-	/// output unchanged.
+	/// "complete". A no-op for pre-draft versions, which carry no `resultType`.
 	private Json stampResultType(Json result, ProtocolVersion ver) @safe
 	{
 		if (!ver.isDraft)
@@ -1647,7 +1646,7 @@ final class McpServer
 			conn.initialized = true;
 			break;
 		case "notifications/cancelled":
-			// Resolve the cancellation against the connection it arrived on (#13):
+			// Resolve the cancellation against the connection it arrived on:
 			// a `notifications/cancelled` on connection B must only match in-flight
 			// keys connection B registered.
 			handleCancelled(msg.params, connectionTokenOf(ctx), conn);
@@ -1677,7 +1676,7 @@ final class McpServer
 		if (params.type != Json.Type.object || "requestId" !in params)
 			return;
 
-		// Stdio `subscriptions/listen` teardown (#56): the listen request returns no
+		// Stdio `subscriptions/listen` teardown: the listen request returns no
 		// JSON-RPC response (its "result" is the long-lived notification stream), so
 		// it is never registered in `inFlight` and cannot be cancelled via the
 		// token path. Per basic/utilities/cancellation a client cancels the listen
@@ -1726,7 +1725,7 @@ final class McpServer
 			// `server/discover` is a draft-only RPC (the stable handshake uses
 			// `initialize`). On a non-draft negotiated session it MUST be reported
 			// as unknown rather than served, mirroring the resources/subscribe and
-			// logging/setLevel draft gating (issue #51).
+			// logging/setLevel draft gating.
 			if (!ver.supportsDiscover)
 				throw methodNotFound(method);
 			return doDiscover();
@@ -1753,12 +1752,12 @@ final class McpServer
 		case "resources/read":
 			return doReadResource(params, ver);
 		case "resources/subscribe":
-			// The draft removed the resources/subscribe RPC in favour of
-			// subscriptions/listen (the SubscriptionFilter "Replaces the former
+			// The draft has no resources/subscribe RPC; subscriptions/listen takes
+			// its place (the SubscriptionFilter "Replaces the former
 			// resources/subscribe RPC"). On the draft the method does not exist,
 			// so it MUST return -32601 rather than an empty-success result,
-			// mirroring the logging/setLevel draft removal. Stable (<= 2025-11-25)
-			// versions still honour the RPC, so 2025-era wire output is unchanged.
+			// mirroring logging/setLevel. Stable (<= 2025-11-25) versions honour
+			// the RPC.
 			if (ver.isDraft)
 				throw methodNotFound(method);
 			return doSubscribe(params, conn);
@@ -1796,13 +1795,13 @@ final class McpServer
 
 	// The `tasks` extension (2025-11-25 / draft `io.modelcontextprotocol/tasks`)
 	// RPCs. `enableTasks()` advertises support for these, so the server MUST route
-	// them rather than returning -32601 for an advertised operation (#59). This SDK
+	// them rather than returning -32601 for an advertised operation. This SDK
 	// does not yet drive the two-phase CreateTaskResult flow from `tools/call`, so
 	// no task is ever created: the task store is permanently empty. `tasks/get`,
 	// `tasks/result`, and `tasks/cancel` answer with `-32602` (task not found) for
 	// any id under the 2025-11-25 family, per the extension's "unknown /
 	// non-cancellable task" rule, and `tasks/list` returns an empty page. The draft
-	// (`io.modelcontextprotocol/tasks`, SEP-2663) REMOVED `tasks/result`, so on a
+	// (`io.modelcontextprotocol/tasks`, SEP-2663) defines no `tasks/result`, so on a
 	// draft-negotiated session that method does not exist and is gated in route()
 	// to `-32601` (method not found); `tasks/get`/`tasks/cancel` remain `-32602`.
 	// A server that never called `enableTasks()` does not advertise the capability
@@ -1872,8 +1871,8 @@ final class McpServer
 	/// `notifications/resources/updated` for. Those URIs are recorded as per-URI
 	/// subscriptions (so `isSubscribed`/`notifyResourceUpdated` honour them) and
 	/// the `resourceSubscriptions` opt-in is flagged when the array is non-empty.
-	/// For backward compatibility a flat top-level filter (the pre-spec shape) is
-	/// still accepted when no `notifications` object is present.
+	/// A flat top-level filter is also accepted when no `notifications` object is
+	/// present.
 	private Json doSubscribeListen(Json params, ConnectionState conn) @safe
 	{
 		Json filter = Json.undefined;
@@ -1881,7 +1880,7 @@ final class McpServer
 				&& params["notifications"].type == Json.Type.object)
 			filter = params["notifications"];
 		else
-			filter = params; // tolerate the legacy flat shape
+			filter = params; // accept the flat top-level shape
 
 		// Reset the per-stream filter; it captures exactly THIS listen request's
 		// opt-in so the transport can attach it to this one stream's listener.
@@ -1935,8 +1934,8 @@ final class McpServer
 				}
 				else if (rs.type == Json.Type.bool_ && rs.get!bool)
 				{
-					// Legacy boolean opt-in (pre-spec): blanket interest in
-					// resource-update notifications without per-URI URIs.
+					// A boolean opt-in: blanket interest in resource-update
+					// notifications without per-URI URIs.
 					listenFilters["resourceSubscriptions"] = true;
 					perStream.resourceSubscriptions = true;
 				}
@@ -2208,9 +2207,9 @@ final class McpServer
 		// and `ctx.requestState()` already carry any answers/echoed state the
 		// client attached to this (retried) request. The `resultType`
 		// discriminator (and statelessness) is draft-gated by the dispatch path,
-		// so 2025-era wire output is unchanged.
+		// so the 2025-era protocols never see it.
 		auto response = entry.handler(args, ctx);
-		// MRTR (#60): mirror doCallTool — never ask the client for an input kind
+		// MRTR: mirror doCallTool — never ask the client for an input kind
 		// it did not declare. MRTR is draft-only (`usesMRTR`); the declared set is
 		// the request's own `_meta.clientCapabilities`.
 		if (ver.usesMRTR && response.needsInput)
@@ -2227,8 +2226,8 @@ final class McpServer
 		}
 		// Project the final result to the negotiated protocol version so newer
 		// content kinds (audio/resource_link/tool_use/tool_result) and
-		// content-level `_meta`/`lastModified` do not leak to an older peer
-		// (#1/#20). Runs AFTER the MRTR input-request filtering above, mirroring
+		// content-level `_meta`/`lastModified` do not leak to an older peer.
+		// Runs AFTER the MRTR input-request filtering above, mirroring
 		// the tools/call ordering (forVersion last).
 		return response.forVersion(ver).toJson();
 	}
@@ -2285,7 +2284,7 @@ final class McpServer
 		// the same version, otherwise it MUST respond with another version it
 		// supports — SHOULD be the latest"), clamp a draft negotiation down to the
 		// latest stable rather than emitting an InitializeResult that claims a
-		// version with no initialize semantics (issue #419).
+		// version with no initialize semantics.
 		if (conn.negotiated.isDraft)
 			conn.negotiated = latestStable;
 		conn.clientCaps = p.capabilities;
@@ -2368,7 +2367,7 @@ final class McpServer
 		{
 			// CallToolResult or InputRequiredResult.
 			auto response = entry.handler(args, ctx);
-			// MRTR (#60): an InputRequiredResult MUST NOT ask the client for an
+			// MRTR: an InputRequiredResult MUST NOT ask the client for an
 			// input kind it never declared. Drop any unsupported inputRequests
 			// against the same `declared` set used for capability gating above. If
 			// that leaves no requests AND no requestState, the result violates the
@@ -2579,7 +2578,7 @@ unittest  // template matching captures a trailing parameter
 	assert(params["path"] == "a/b/c");
 }
 
-unittest  // captured variables are RFC 6570/3986 percent-decoded (issue #338)
+unittest  // captured variables are RFC 6570/3986 percent-decoded
 {
 	// RFC 6570 simple-string expansion percent-encodes reserved characters
 	// during URI construction; the matcher must reverse that so the reader
@@ -2589,14 +2588,14 @@ unittest  // captured variables are RFC 6570/3986 percent-decoded (issue #338)
 	assert(params["path"] == "a b/c");
 }
 
-unittest  // a delimited captured variable is percent-decoded (issue #338)
+unittest  // a delimited captured variable is percent-decoded
 {
 	string[string] params;
 	assert(matchUriTemplate("test://template/{id}/data", "test://template/a%2Bb/data", params));
 	assert(params["id"] == "a+b");
 }
 
-unittest  // the RFC 6570 reserved-expansion operator {+var} is supported (issue #338)
+unittest  // the RFC 6570 reserved-expansion operator {+var} is supported
 {
 	// `{+path}` is the operator commonly used for path-bearing templates;
 	// the leading `+` selects the variable name `path`, not `+path`.
@@ -2605,7 +2604,7 @@ unittest  // the RFC 6570 reserved-expansion operator {+var} is supported (issue
 	assert(params["path"] == "a/b/c");
 }
 
-unittest  // a malformed percent escape in the URI does not match (issue #338)
+unittest  // a malformed percent escape in the URI does not match
 {
 	string[string] params;
 	assert(!matchUriTemplate("file:///{path}", "file:///a%2", params));
@@ -2649,7 +2648,7 @@ version (unittest)
 	}
 }
 
-unittest  // public flagship type uses single-cap Mcp* casing (issue #304)
+unittest  // public flagship type uses single-cap Mcp* casing
 {
 	// The server class must be reachable under the consistent `McpServer`
 	// name (matching McpException, MrtrToolHandler, etc.), not `MCPServer`.
@@ -2737,7 +2736,7 @@ unittest  // serverInfo strips title when negotiating 2025-03-26 (pre-BaseMetada
 	assert("title" !in si);
 }
 
-unittest  // legacy (name, version) constructor still emits a minimal serverInfo
+unittest  // the (name, version) constructor emits a minimal serverInfo
 {
 	auto s = new McpServer("plain-srv", "1.0");
 	Json params = Json.emptyObject;
@@ -2763,7 +2762,7 @@ unittest  // server/discover (draft) emits the full stored serverInfo
 		]
 	};
 	auto s = new McpServer(info);
-	// server/discover is a draft-only RPC (#51): dispatch it as a draft request.
+	// server/discover is a draft-only RPC: dispatch it as a draft request.
 	auto resp = s.handle(draftReq(1, "server/discover")).get;
 	auto si = resp["result"]["serverInfo"];
 	assert(si["name"].get!string == "rich-srv");
@@ -2782,7 +2781,7 @@ unittest  // initialize falls back to latest stable for an unknown version
 	assert(resp["result"]["protocolVersion"].get!string == latestStable.toWire);
 }
 
-unittest  // initialize MUST NOT negotiate draft: it has no InitializeResult (#419)
+unittest  // initialize MUST NOT negotiate draft: it has no InitializeResult
 {
 	// The draft schema (2026-07-28) defines server/discover + per-request _meta,
 	// NOT an initialize/InitializeResult handshake. A (non-conformant) client
@@ -2801,7 +2800,7 @@ unittest  // initialize MUST NOT negotiate draft: it has no InitializeResult (#4
 	assert(resp["result"]["protocolVersion"].get!string != ProtocolVersion.draft.toWire);
 }
 
-unittest  // initialize MUST NOT negotiate draft via the "draft" alias (#419)
+unittest  // initialize MUST NOT negotiate draft via the "draft" alias
 {
 	auto s = makeTestServer();
 	Json params = Json.emptyObject;
@@ -2812,7 +2811,7 @@ unittest  // initialize MUST NOT negotiate draft via the "draft" alias (#419)
 	assert(resp["result"]["protocolVersion"].get!string == latestStable.toWire);
 }
 
-unittest  // initialize draft clamp does not pin the connection to draft (#419)
+unittest  // initialize draft clamp does not pin the connection to draft
 {
 	// Clamping must also fix the negotiated/connection version so subsequent
 	// unsolicited server->client gating and serverInfo projection behave as the
@@ -2918,7 +2917,7 @@ unittest  // tools/call invokes the handler and returns its result
 	assert("isError" !in resp["result"]);
 }
 
-unittest  // tools/call strips structuredContent for a 2025-03-26 client (#390)
+unittest  // tools/call strips structuredContent for a 2025-03-26 client
 {
 	auto s = makeTestServer();
 	Json initP = Json.emptyObject;
@@ -2936,7 +2935,7 @@ unittest  // tools/call strips structuredContent for a 2025-03-26 client (#390)
 	assert(resp["result"]["content"].length >= 1);
 }
 
-unittest  // tools/call strips structuredContent for a 2024-11-05 client (#390)
+unittest  // tools/call strips structuredContent for a 2024-11-05 client
 {
 	auto s = makeTestServer();
 	Json initP = Json.emptyObject;
@@ -2951,7 +2950,7 @@ unittest  // tools/call strips structuredContent for a 2024-11-05 client (#390)
 			"structuredContent must NOT be emitted to a 2024-11-05 client");
 }
 
-unittest  // tools/call keeps structuredContent for a 2025-06-18 client (#390)
+unittest  // tools/call keeps structuredContent for a 2025-06-18 client
 {
 	auto s = makeTestServer();
 	Json initP = Json.emptyObject;
@@ -2967,7 +2966,7 @@ unittest  // tools/call keeps structuredContent for a 2025-06-18 client (#390)
 	assert(resp["result"]["structuredContent"]["result"].get!int == 5);
 }
 
-unittest  // tools/call keeps structuredContent for a 2025-11-25 client (#390)
+unittest  // tools/call keeps structuredContent for a 2025-11-25 client
 {
 	auto s = makeTestServer();
 	Json initP = Json.emptyObject;
@@ -2998,7 +2997,7 @@ unittest  // tools/list emits a tool descriptor's _meta
 	assert(resp["result"]["tools"][0]["_meta"]["x.example/group"].get!string == "demo");
 }
 
-unittest  // tools/list gates Tool.execution to a 2025-11-25-negotiated client (#337)
+unittest  // tools/list gates Tool.execution to a 2025-11-25-negotiated client
 {
 	auto s = new McpServer("exec-srv", "0.1.0");
 	Tool t = {name: "longjob"};
@@ -3019,7 +3018,7 @@ unittest  // tools/list gates Tool.execution to a 2025-11-25-negotiated client (
 	assert(tool["execution"]["taskSupport"].get!string == "optional");
 }
 
-unittest  // tools/list omits Tool.execution for a draft client (#337)
+unittest  // tools/list omits Tool.execution for a draft client
 {
 	auto s = new McpServer("exec-srv", "0.1.0");
 	Tool t = {name: "longjob"};
@@ -3031,14 +3030,14 @@ unittest  // tools/list omits Tool.execution for a draft client (#337)
 	});
 
 	// A draft client establishes the draft protocol via per-request `_meta`,
-	// NOT the `initialize` handshake (which has no draft semantics; see #419).
+	// NOT the `initialize` handshake (which has no draft semantics).
 	auto resp = s.handle(draftReq(2, "tools/list")).get;
 	auto tool = resp["result"]["tools"][0];
 	assert("execution" !in tool,
 			"execution must NOT be emitted to a draft client (dropped from draft schema)");
 }
 
-unittest  // tools/list omits Tool.execution for a 2025-06-18-negotiated client (#337)
+unittest  // tools/list omits Tool.execution for a 2025-06-18-negotiated client
 {
 	auto s = new McpServer("exec-srv", "0.1.0");
 	Tool t = {name: "longjob"};
@@ -3166,7 +3165,7 @@ unittest  // output-schema validation is off by default: bad output still ships
 	assert(resp["result"]["structuredContent"]["result"].get!string == "oops");
 }
 
-unittest  // output-schema validation: missing structuredContent is a violation (#391)
+unittest  // output-schema validation: missing structuredContent is a violation
 {
 	import mcp.api.schema : jsonSchemaOf;
 
@@ -3196,7 +3195,7 @@ unittest  // output-schema validation: missing structuredContent is a violation 
 	assert(resp["error"]["code"].get!int == ErrorCode.internalError);
 }
 
-unittest  // output-schema validation: an isError result is exempt from the structuredContent MUST (#391)
+unittest  // output-schema validation: an isError result is exempt from the structuredContent MUST
 {
 	import mcp.api.schema : jsonSchemaOf;
 
@@ -3228,7 +3227,7 @@ unittest  // output-schema validation: an isError result is exempt from the stru
 	assert(resp["result"]["isError"].get!bool == true);
 }
 
-unittest  // output-schema validation off: missing structuredContent still ships (#391)
+unittest  // output-schema validation off: missing structuredContent still ships
 {
 	import mcp.api.schema : jsonSchemaOf;
 
@@ -3538,7 +3537,7 @@ unittest  // cancellation matches string-id requests too
 version (unittest) private final class ConnCtx : RequestContext, ConnectionScoped
 {
 	// A RequestContext that reports a fixed per-connection token, modelling two
-	// concurrent Streamable HTTP sessions sharing one McpServer (#13).
+	// concurrent Streamable HTTP sessions sharing one McpServer.
 	import mcp.auth.resource_server : TokenInfo;
 
 	private string token_;
@@ -3604,7 +3603,7 @@ version (unittest) private final class ConnCtx : RequestContext, ConnectionScope
 	}
 }
 
-unittest  // #13: a cancellation on connection B must not suppress connection A's same-id request
+unittest  // a cancellation on connection B must not suppress connection A's same-id request
 {
 	// Two concurrent connections (A and B) share one McpServer. Both have an
 	// in-flight request with the IDENTICAL JSON-RPC id 42. A cancellation that
@@ -3622,8 +3621,7 @@ unittest  // #13: a cancellation on connection B must not suppress connection A'
 		Json p = Json.emptyObject;
 		p["requestId"] = 42;
 		s.handle(Message(makeNotification("notifications/cancelled", p)), ctxB);
-		assert(!ctx.isCancelled,
-			"a cancellation on connection B wrongly cancelled connection A (#13)");
+		assert(!ctx.isCancelled, "a cancellation on connection B wrongly cancelled connection A");
 		CallToolResult r;
 		r.content = [Content.makeText("done")];
 		return r;
@@ -3632,11 +3630,11 @@ unittest  // #13: a cancellation on connection B must not suppress connection A'
 	Json callP = Json.emptyObject;
 	callP["name"] = "slow";
 	auto resp = s.handle(req(42, "tools/call", callP), ctxA);
-	assert(!resp.isNull, "connection A's response must NOT be suppressed (#13)");
+	assert(!resp.isNull, "connection A's response must NOT be suppressed");
 	assert(resp.get["result"]["content"][0]["text"].get!string == "done");
 }
 
-unittest  // #13: a cancellation on the SAME connection still cancels (keying preserves behaviour)
+unittest  // a cancellation on the SAME connection still cancels
 {
 	auto s = new McpServer("t", "1");
 	auto ctxA = new ConnCtx("conn-A");
@@ -3657,8 +3655,8 @@ unittest  // #13: a cancellation on the SAME connection still cancels (keying pr
 	Json callP = Json.emptyObject;
 	callP["name"] = "slow";
 	auto resp = s.handle(req(42, "tools/call", callP), ctxA);
-	assert(sawCancelled, "a cancellation on the same connection must still cancel (#13)");
-	assert(resp.isNull, "the cancelled request's response must be suppressed (#13)");
+	assert(sawCancelled, "a cancellation on the same connection must still cancel");
+	assert(resp.isNull, "the cancelled request's response must be suppressed");
 }
 
 unittest  // notifications/roots/list_changed fires the dedicated server hook
@@ -4250,7 +4248,7 @@ version (unittest) private McpServer makeNoisyLogServerNoLogging() @safe
 	return s;
 }
 
-unittest  // stateful: no notifications/message when the logging capability was never declared (#396)
+unittest  // stateful: no notifications/message when the logging capability was never declared
 {
 	// server/utilities/logging: "Servers that emit log message notifications MUST
 	// declare the `logging` capability." A server that never called enableLogging()
@@ -4267,7 +4265,7 @@ unittest  // stateful: no notifications/message when the logging capability was 
 	assert(ctx.emitted.length == 0);
 }
 
-unittest  // draft: no notifications/message when the logging capability was never declared (#396)
+unittest  // draft: no notifications/message when the logging capability was never declared
 {
 	// The same MUST applies on the draft. Even a draft request that carries
 	// `_meta["io.modelcontextprotocol/logLevel"]` MUST NOT trigger emission when
@@ -4303,14 +4301,14 @@ unittest  // advertised extensions appear in server/discover capabilities under 
 	s.advertiseExtension("io.modelcontextprotocol/tasks", settings);
 
 	// The `extensions` negotiation map is draft-only; a draft client discovers it
-	// via `server/discover`, not the `initialize` handshake (see #419).
+	// via `server/discover`, not the `initialize` handshake.
 	auto resp = s.handle(draftReq(1, "server/discover")).get;
 	auto ext = resp["result"]["capabilities"]["extensions"];
 	assert(ext.type == Json.Type.object);
 	assert(ext["io.modelcontextprotocol/tasks"]["maxConcurrent"].get!int == 4);
 }
 
-unittest  // extensions are NOT advertised for pre-draft negotiated versions (#331)
+unittest  // extensions are NOT advertised for pre-draft negotiated versions
 {
 	auto s = new McpServer("t", "1");
 	s.advertiseExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
@@ -4325,7 +4323,7 @@ unittest  // extensions are NOT advertised for pre-draft negotiated versions (#3
 	}
 }
 
-unittest  // completions are NOT advertised when negotiating 2024-11-05 (#331)
+unittest  // completions are NOT advertised when negotiating 2024-11-05
 {
 	auto s = new McpServer("t", "1");
 	s.setCompletionRequestHandler((CompleteRequest r) @safe => CompleteResult([]));
@@ -4336,7 +4334,7 @@ unittest  // completions are NOT advertised when negotiating 2024-11-05 (#331)
 	assert("completions" !in resp["result"]["capabilities"]);
 }
 
-unittest  // completions ARE advertised from 2025-03-26 onward (#331)
+unittest  // completions ARE advertised from 2025-03-26 onward
 {
 	auto s = new McpServer("t", "1");
 	s.setCompletionRequestHandler((CompleteRequest r) @safe => CompleteResult([]));
@@ -4351,7 +4349,7 @@ unittest  // completions ARE advertised from 2025-03-26 onward (#331)
 	}
 }
 
-unittest  // tasks are NOT advertised before 2025-11-25 (#331)
+unittest  // tasks are NOT advertised before 2025-11-25
 {
 	auto s = new McpServer("t", "1");
 	s.enableTasks(true, true, TaskRequests().tool().toJson());
@@ -4383,7 +4381,7 @@ unittest  // enableTasks advertises the `tasks` capability at initialize
 	assert("tools/call" !in t["requests"]);
 }
 
-unittest  // enableTasks routes tasks/list rather than returning -32601 (#59)
+unittest  // enableTasks routes tasks/list rather than returning -32601
 {
 	// The server advertises tasks support, so it MUST serve the tasks/* RPCs it
 	// advertises. tasks/list returns an (empty) task page, never method-not-found.
@@ -4395,7 +4393,7 @@ unittest  // enableTasks routes tasks/list rather than returning -32601 (#59)
 	assert(resp["result"]["tasks"].length == 0);
 }
 
-unittest  // enableTasks routes tasks/get|result|cancel as task-not-found, not -32601 (#59)
+unittest  // enableTasks routes tasks/get|result|cancel as task-not-found, not -32601
 {
 	auto s = new McpServer("t", "1");
 	s.enableTasks(true, true, TaskRequests().tool().toJson());
@@ -4410,7 +4408,7 @@ unittest  // enableTasks routes tasks/get|result|cancel as task-not-found, not -
 	}
 }
 
-unittest  // tasks/* are -32601 when the server never advertised the capability (#59)
+unittest  // tasks/* are -32601 when the server never advertised the capability
 {
 	// A server that did not call enableTasks() advertises no tasks capability, so
 	// it MUST NOT serve the tasks/* RPCs (returns -32601), mirroring the gating of
@@ -4423,7 +4421,7 @@ unittest  // tasks/* are -32601 when the server never advertised the capability 
 	}
 }
 
-unittest  // draft tasks/result is -32601: SEP-2663 removed it from the draft extension (#5)
+unittest  // draft tasks/result is -32601: SEP-2663 defines no tasks/result in the draft extension
 {
 	auto s = new McpServer("t", "1");
 	s.enableTasks(true, true, TaskRequests().tool().toJson());
@@ -4433,7 +4431,7 @@ unittest  // draft tasks/result is -32601: SEP-2663 removed it from the draft ex
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
-unittest  // 2025-11-25 tasks/result for an unknown taskId is -32602 (still defined) (#5)
+unittest  // 2025-11-25 tasks/result for an unknown taskId is -32602 (still defined)
 {
 	auto s = new McpServer("t", "1");
 	s.enableTasks(true, true, TaskRequests().tool().toJson());
@@ -4443,7 +4441,7 @@ unittest  // 2025-11-25 tasks/result for an unknown taskId is -32602 (still defi
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
-unittest  // draft tasks/get for an unknown taskId remains -32602 (unchanged by #5)
+unittest  // draft tasks/get for an unknown taskId is -32602
 {
 	auto s = new McpServer("t", "1");
 	s.enableTasks(true, true, TaskRequests().tool().toJson());
@@ -4453,7 +4451,7 @@ unittest  // draft tasks/get for an unknown taskId remains -32602 (unchanged by 
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
-unittest  // draft tasks/cancel for an unknown taskId remains -32602 (unchanged by #5)
+unittest  // draft tasks/cancel for an unknown taskId is -32602
 {
 	auto s = new McpServer("t", "1");
 	s.enableTasks(true, true, TaskRequests().tool().toJson());
@@ -4463,7 +4461,7 @@ unittest  // draft tasks/cancel for an unknown taskId remains -32602 (unchanged 
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
-unittest  // prompts/get downgrades audio content to a text placeholder for a 2024-11-05 peer (#1/#20)
+unittest  // prompts/get downgrades audio content to a text placeholder for a 2024-11-05 peer
 {
 	// Guards the doGetPrompt wiring of PromptResponse.forVersion: a prompt message
 	// carrying audio content, retrieved by a peer negotiated at 2024-11-05 (where
@@ -4488,7 +4486,7 @@ unittest  // prompts/get downgrades audio content to a text placeholder for a 20
 	assert(resp["result"]["messages"][0]["content"]["type"].get!string == "text");
 }
 
-unittest  // prompts/get downgrades resource_link content for a 2025-03-26 peer (#1/#20)
+unittest  // prompts/get downgrades resource_link content for a 2025-03-26 peer
 {
 	// resource_link is in-schema only from 2025-06-18; a 2025-03-26 peer must see a
 	// text placeholder, exercised through the server dispatch path (not just the
@@ -4512,7 +4510,7 @@ unittest  // prompts/get downgrades resource_link content for a 2025-03-26 peer 
 	assert(resp["result"]["messages"][0]["content"]["type"].get!string == "text");
 }
 
-unittest  // prompts/get keeps resource_link content intact for a 2025-06-18 peer (#1/#20)
+unittest  // prompts/get keeps resource_link content intact for a 2025-06-18 peer
 {
 	// The projection must NOT over-strip: from 2025-06-18 resource_link is valid,
 	// so it survives the dispatch path unchanged.
@@ -4535,13 +4533,13 @@ unittest  // prompts/get keeps resource_link content intact for a 2025-06-18 pee
 	assert(resp["result"]["messages"][0]["content"]["type"].get!string == "resource_link");
 }
 
-unittest  // enableTasks: draft server/discover folds tasks into extensions, no top-level (#384)
+unittest  // enableTasks: draft server/discover folds tasks into extensions, no top-level
 {
 	auto s = new McpServer("t", "1");
 	s.enableTasks(true, true, TaskRequests().tool().toJson());
 
 	// Draft clients discover capabilities via `server/discover`, not `initialize`
-	// (which has no draft semantics; see #419).
+	// (which has no draft semantics).
 	auto resp = s.handle(draftReq(1, "server/discover")).get;
 	auto caps = resp["result"]["capabilities"];
 	// draft schema defines no top-level `tasks` capability.
@@ -4553,7 +4551,7 @@ unittest  // enableTasks: draft server/discover folds tasks into extensions, no 
 	assert(folded["requests"]["tools"]["call"].type == Json.Type.object);
 }
 
-unittest  // enableTasks: draft server/discover folds tasks into extensions (#384)
+unittest  // enableTasks: draft server/discover folds tasks into extensions
 {
 	auto s = new McpServer("t", "1");
 	s.enableTasks(true, true, TaskRequests().tool().toJson());
@@ -4630,10 +4628,10 @@ unittest  // resources/subscribe is rejected with -32601 when capability not adv
 	assert(!s.isSubscribed("test://w"));
 }
 
-unittest  // draft: resources/subscribe is method-not-found (removed for subscriptions/listen)
+unittest  // draft: resources/subscribe is method-not-found (subscriptions/listen takes its place)
 {
-	// The draft removed the resources/subscribe RPC in favour of
-	// subscriptions/listen with a resourceSubscriptions string[] (the draft
+	// The draft has no resources/subscribe RPC; subscriptions/listen with a
+	// resourceSubscriptions string[] takes its place (the draft
 	// SubscriptionFilter "Replaces the former resources/subscribe RPC"). On the
 	// draft the method does not exist, so it MUST be answered with -32601 even
 	// when subscriptions are enabled, and MUST NOT record the URI.
@@ -4666,7 +4664,7 @@ unittest  // draft: resources/unsubscribe is method-not-found (removed for subsc
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
-unittest  // server/discover is draft-only: a non-draft session gets -32601 (#51)
+unittest  // server/discover is draft-only: a non-draft session gets -32601
 {
 	// `server/discover` is a draft RPC (stable peers handshake via `initialize`).
 	// A request whose effective version is the default stable negotiated version
@@ -4677,16 +4675,15 @@ unittest  // server/discover is draft-only: a non-draft session gets -32601 (#51
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
-unittest  // server/discover under draft still serves the discover result (#51)
+unittest  // server/discover under draft still serves the discover result
 {
-	// The gate added for #51 must not regress the supported draft discover path.
 	auto s = new McpServer("disc-srv", "1.0");
 	auto resp = s.handle(draftReq(1, "server/discover")).get;
 	assert("error" !in resp);
 	assert(resp["result"]["serverInfo"]["name"].get!string == "disc-srv");
 }
 
-unittest  // stdio subscriptions/listen is cancellable via notifications/cancelled (#56)
+unittest  // stdio subscriptions/listen is cancellable via notifications/cancelled
 {
 	import std.algorithm : canFind;
 
@@ -4728,7 +4725,7 @@ unittest  // stdio subscriptions/listen is cancellable via notifications/cancell
 	assert(frames.length == before, "notify wrote to a cancelled stdio listen stream");
 }
 
-unittest  // stdio subscriptions/listen cancellation matches a string requestId too (#56)
+unittest  // stdio subscriptions/listen cancellation matches a string requestId too
 {
 	// rpcIdString normalizes numeric and string ids identically, so a cancellation
 	// carrying a string "42" tears down a listen whose id was the number 42.
@@ -4758,7 +4755,7 @@ unittest  // stdio subscriptions/listen cancellation matches a string requestId 
 	assert(frames.length == before);
 }
 
-unittest  // stdio subscriptions/listen does not wipe negotiated session clientCaps (#77)
+unittest  // stdio subscriptions/listen does not wipe negotiated session clientCaps
 {
 	// A stateful initialize negotiates sampling for the session. A subsequent stdio
 	// draft `subscriptions/listen` carries its own (empty) _meta capabilities; it
@@ -4947,7 +4944,7 @@ unittest  // per-list hint only emits on the matching list, not on others
 	auto s = makeTestServer();
 	s.setListCacheHint("resources/list", CacheHint(7000));
 	// tools/list has no explicit hint, so it carries the mandatory draft default
-	// (ttlMs:0) rather than the resources/list value (#57): the per-list hint does
+	// (ttlMs:0) rather than the resources/list value: the per-list hint does
 	// not leak across methods.
 	auto tools = s.handle(draftReq(2, "tools/list")).get;
 	assert(tools["result"]["ttlMs"].get!long == 0);
@@ -4993,7 +4990,7 @@ unittest  // per-template registerResourceTemplate hint emits on a matching draf
 	assert(resp["result"]["cacheScope"].get!string == "public");
 }
 
-unittest  // draft tools/list defaults to the mandatory ttlMs:0 cache hint (#57)
+unittest  // draft tools/list defaults to the mandatory ttlMs:0 cache hint
 {
 	// The draft CacheableResult schema requires a freshness hint on the cacheable
 	// list results. With no explicit hint configured, the server MUST still emit a
@@ -5004,7 +5001,7 @@ unittest  // draft tools/list defaults to the mandatory ttlMs:0 cache hint (#57)
 	assert(resp["result"]["cacheScope"].get!string == "public");
 }
 
-unittest  // draft resources/list, templates/list, prompts/list default to ttlMs:0 (#57)
+unittest  // draft resources/list, templates/list, prompts/list default to ttlMs:0
 {
 	auto s = makeTestServer();
 	foreach (m; ["resources/list", "resources/templates/list", "prompts/list"])
@@ -5015,7 +5012,7 @@ unittest  // draft resources/list, templates/list, prompts/list default to ttlMs
 	}
 }
 
-unittest  // draft resources/read defaults to ttlMs:0 when the resource has no hint (#57)
+unittest  // draft resources/read defaults to ttlMs:0 when the resource has no hint
 {
 	auto s = new McpServer("t", "1");
 	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
@@ -5027,21 +5024,21 @@ unittest  // draft resources/read defaults to ttlMs:0 when the resource has no h
 	assert(resp["result"]["cacheScope"].get!string == "public");
 }
 
-unittest  // pre-draft list/read never emit the default cache hint (wire unchanged) (#57)
+unittest  // pre-draft list/read never emit the default cache hint
 {
 	auto s = makeTestServer();
 	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestStable
 	assert("ttlMs" !in resp["result"]);
 }
 
-// issue #288: a concurrent (reentrant) request must not corrupt the effective
-// protocol version of an in-flight request. A draft tools/call whose handler
-// dispatches a pre-draft request mid-flight (standing in for a handler that
-// yields while another request is dispatched on the shared server) must still
-// have ITS result stamped per the draft (resultType:"complete"), and the
-// reentrant pre-draft request must stay unstamped. Before the fix both shared a
-// single mutable effectiveVersion field, so the inner pre-draft request flipped
-// it and the outer draft response lost its resultType.
+// A concurrent (reentrant) request must not corrupt the effective protocol
+// version of an in-flight request. A draft tools/call whose handler dispatches
+// a pre-draft request mid-flight (standing in for a handler that yields while
+// another request is dispatched on the shared server) must still have ITS
+// result stamped per the draft (resultType:"complete"), and the reentrant
+// pre-draft request must stay unstamped. The effective version is request-local,
+// so the inner pre-draft request cannot flip the outer draft response's
+// resultType.
 unittest
 {
 	auto s = new McpServer("t", "1");
@@ -5074,7 +5071,7 @@ unittest  // draft results carry the mandatory resultType:"complete" discriminat
 	assert(resp["result"]["resultType"].get!string == "complete");
 }
 
-unittest  // pre-draft results never emit resultType (wire output unchanged)
+unittest  // pre-draft results never emit resultType
 {
 	auto s = makeTestServer();
 	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestStable
@@ -5091,7 +5088,7 @@ unittest  // draft InputRequiredResult is stamped resultType:"input_required", n
 	assert(resp["result"]["resultType"].get!string == "input_required");
 }
 
-unittest  // #422 draft: a raw CallToolResult carrying inputRequests is stamped "input_required"
+unittest  // draft: a raw CallToolResult carrying inputRequests is stamped "input_required"
 {
 	import mcp.protocol.draft : InputRequest;
 
@@ -5149,7 +5146,7 @@ unittest  // subscriptions/listen reads the spec-shaped filter nested under para
 	assert(s.isSubscribed("file:///project/config.json"));
 }
 
-unittest  // subscriptions/listen still accepts the legacy flat (top-level) filter shape
+unittest  // subscriptions/listen accepts the flat (top-level) filter shape
 {
 	// resourceSubscriptions opt-in requires a stateful server.
 	auto s = makeStatefulTestServer();
@@ -5224,7 +5221,7 @@ unittest  // ack echoes every opted-in resourceSubscriptions URI in request orde
 	assert(subset["resourceSubscriptions"][1].get!string == "file:///b.txt");
 }
 
-unittest  // acknowledgedSubsetFor serialises exactly one filter's opt-in (#430)
+unittest  // acknowledgedSubsetFor serialises exactly one filter's opt-in
 {
 	// The ack the transport emits on a stream MUST reflect only THAT request's
 	// filter (draft basic/utilities/subscriptions Acknowledgment), not the global
@@ -5241,7 +5238,7 @@ unittest  // acknowledgedSubsetFor serialises exactly one filter's opt-in (#430)
 	assert("resourceSubscriptions" !in subset);
 }
 
-unittest  // acknowledgedSubsetFor echoes resourceSubscriptions as the filter's URI string[] (#430)
+unittest  // acknowledgedSubsetFor echoes resourceSubscriptions as the filter's URI string[]
 {
 	auto s = makeTestServer();
 	SubscriptionFilter f;
@@ -5255,7 +5252,7 @@ unittest  // acknowledgedSubsetFor echoes resourceSubscriptions as the filter's 
 	assert("toolsListChanged" !in subset);
 }
 
-unittest  // acknowledgedSubsetFor of an empty filter is an empty object (#430)
+unittest  // acknowledgedSubsetFor of an empty filter is an empty object
 {
 	auto s = makeTestServer();
 	SubscriptionFilter f;
@@ -5265,7 +5262,7 @@ unittest  // acknowledgedSubsetFor of an empty filter is an empty object (#430)
 	assert(subset.length == 0);
 }
 
-unittest  // per-stream ack does not leak a concurrent stream's opt-in (#430)
+unittest  // per-stream ack does not leak a concurrent stream's opt-in
 {
 	// Regression for the cross-subscription leak: one shared McpServer handles two
 	// concurrent subscriptions/listen requests. Stream A opts into toolsListChanged
@@ -5313,7 +5310,7 @@ unittest  // draft is stateless: tools/call works without a prior initialize
 	assert(resp["result"]["structuredContent"]["result"].get!int == 42);
 }
 
-unittest  // subscriptions/listen ack omits a list-changed type the server does not support (#398)
+unittest  // subscriptions/listen ack omits a list-changed type the server does not support
 {
 	// Server has NOT declared the tools list-changed capability, so per draft
 	// basic/utilities/subscriptions Acknowledgment ("notification types the
@@ -5330,7 +5327,7 @@ unittest  // subscriptions/listen ack omits a list-changed type the server does 
 	assert("toolsListChanged" !in s.acknowledgedListenSubset());
 }
 
-unittest  // subscriptions/listen ack keeps a list-changed type once the server enables it (#398)
+unittest  // subscriptions/listen ack keeps a list-changed type once the server enables it
 {
 	auto s = new McpServer("t", "1");
 	s.enableToolsListChanged();
@@ -5343,7 +5340,7 @@ unittest  // subscriptions/listen ack keeps a list-changed type once the server 
 	assert(s.acknowledgedListenSubset()["toolsListChanged"].get!bool);
 }
 
-unittest  // subscriptions/listen ack omits promptsListChanged when unsupported (#398)
+unittest  // subscriptions/listen ack omits promptsListChanged when unsupported
 {
 	auto s = new McpServer("t", "1");
 	s.enableToolsListChanged(); // a different cap is on; prompts stays off
@@ -5356,7 +5353,7 @@ unittest  // subscriptions/listen ack omits promptsListChanged when unsupported 
 	assert("promptsListChanged" !in s.acknowledgedListenSubset());
 }
 
-unittest  // subscriptions/listen ack omits resourcesListChanged when unsupported (#398)
+unittest  // subscriptions/listen ack omits resourcesListChanged when unsupported
 {
 	auto s = new McpServer("t", "1");
 	Json filter = Json.emptyObject;
@@ -5368,7 +5365,7 @@ unittest  // subscriptions/listen ack omits resourcesListChanged when unsupporte
 	assert("resourcesListChanged" !in s.acknowledgedListenSubset());
 }
 
-unittest  // subscriptions/listen ack omits resourceSubscriptions when subscriptions disabled (#398)
+unittest  // subscriptions/listen ack omits resourceSubscriptions when subscriptions disabled
 {
 	// resource subscriptions not enabled -> the agreed subset must omit the URIs.
 	auto s = new McpServer("t", "1");
@@ -5382,7 +5379,7 @@ unittest  // subscriptions/listen ack omits resourceSubscriptions when subscript
 	assert(!s.isSubscribed("file:///x"));
 }
 
-unittest  // subscriptions/listen ack keeps resourceSubscriptions once enabled (#398)
+unittest  // subscriptions/listen ack keeps resourceSubscriptions once enabled
 {
 	// resourceSubscriptions opt-in requires a stateful server.
 	auto s = McpServer.stateful("t", "1");
@@ -5433,7 +5430,7 @@ unittest  // draft negotiation: a supported version is accepted (no error)
 	assert(resp["result"]["tools"].length == 1);
 }
 
-unittest  // requests without a per-request version are unaffected (legacy path)
+unittest  // requests without a per-request version use the negotiated session version
 {
 	auto s = makeTestServer();
 	auto resp = s.handle(req(3, "tools/list")).get;
@@ -5570,8 +5567,8 @@ version (unittest)
 			"version": Json("1")
 		]);
 		// These MRTR tools gather input via elicitation, so the client declares the
-		// elicitation capability — without it the server now (correctly, #60) drops
-		// the elicitation inputRequest as unfulfillable.
+		// elicitation capability — without it the server drops the elicitation
+		// inputRequest as unfulfillable.
 		meta[MetaKey.clientCapabilities] = Json([
 			"elicitation": Json.emptyObject
 		]);
@@ -5658,10 +5655,10 @@ unittest  // SEP-2322: a stateless server emits requestState and reads it back o
 	assert(retry["result"]["content"][0]["text"].get!string == "resumed:awaiting-date day:friday");
 }
 
-unittest  // #60: a draft InputRequiredResult drops an elicitation request the client cannot satisfy
+unittest  // a draft InputRequiredResult drops an elicitation request the client cannot satisfy
 {
 	// The handler asks for elicitation, but this draft request's
-	// _meta.clientCapabilities omits elicitation. Per #60 the server MUST NOT
+	// _meta.clientCapabilities omits elicitation. The server MUST NOT
 	// emit an inputRequest whose kind the client never declared. With no other
 	// request and no requestState, the result is a server-side error rather than
 	// an InputRequiredResult that the client could never fulfil.
@@ -5677,14 +5674,14 @@ unittest  // #60: a draft InputRequiredResult drops an elicitation request the c
 	// draftReq declares empty clientCapabilities -> elicitation unsupported.
 	Json p = Json(["name": Json("ask")]);
 	auto resp = s.handle(draftReq(70, "tools/call", p)).get;
-	assert("error" in resp, "an unsatisfiable lone inputRequest must surface a server error (#60)");
+	assert("error" in resp, "an unsatisfiable lone inputRequest must surface a server error");
 	// And crucially, no elicitation/create leaked into a result.
 	assert("result" !in resp || "inputRequests" !in resp["result"]
 			|| "q1" !in resp["result"]["inputRequests"],
-			"elicitation/create must not be emitted to a client that omitted elicitation (#60)");
+			"elicitation/create must not be emitted to a client that omitted elicitation");
 }
 
-unittest  // #60: the same elicitation request IS emitted when the client declared elicitation
+unittest  // the same elicitation request IS emitted when the client declared elicitation
 {
 	auto s = new McpServer("t", "1");
 	Tool ask = {name: "ask"};
@@ -5704,12 +5701,11 @@ unittest  // #60: the same elicitation request IS emitted when the client declar
 	p["_meta"] = meta;
 	auto resp = s.handle(Message(makeRequest(Json(71), "tools/call", p))).get;
 	assert("error" !in resp);
-	assert("q1" in resp["result"]["inputRequests"],
-			"a declared-capability request must be emitted (#60)");
+	assert("q1" in resp["result"]["inputRequests"], "a declared-capability request must be emitted");
 	assert(resp["result"]["inputRequests"]["q1"]["method"].get!string == "elicitation/create");
 }
 
-unittest  // #60: a mixed InputRequiredResult drops only the unsupported kinds
+unittest  // a mixed InputRequiredResult drops only the unsupported kinds
 {
 	// elicitation is declared, roots is not: only the roots request is dropped,
 	// the elicitation request survives so the round trip can still proceed.
@@ -5732,9 +5728,9 @@ unittest  // #60: a mixed InputRequiredResult drops only the unsupported kinds
 	auto resp = s.handle(Message(makeRequest(Json(72), "tools/call", p))).get;
 	assert("error" !in resp);
 	assert("q1" in resp["result"]["inputRequests"],
-			"the supported elicitation request must survive (#60)");
+			"the supported elicitation request must survive");
 	assert("r1" !in resp["result"]["inputRequests"],
-			"the unsupported roots request must be dropped (#60)");
+			"the unsupported roots request must be dropped");
 }
 
 unittest  // elicit() is rejected on a stateless (draft) request
@@ -5777,8 +5773,8 @@ version (unittest)
 			"version": Json("1")
 		]);
 		// The MRTR prompts gather input via elicitation, so the client declares the
-		// elicitation capability (#60: otherwise the server drops the elicitation
-		// inputRequest as unfulfillable).
+		// elicitation capability; otherwise the server drops the elicitation
+		// inputRequest as unfulfillable.
 		meta[MetaKey.clientCapabilities] = Json([
 			"elicitation": Json.emptyObject
 		]);
@@ -5818,7 +5814,7 @@ version (unittest)
 	}
 }
 
-unittest  // #340 draft prompts/get: handler can return an InputRequiredResult
+unittest  // draft prompts/get: handler can return an InputRequiredResult
 {
 	auto s = new McpServer("t", "1");
 	registerTopicPrompt(s);
@@ -5833,7 +5829,7 @@ unittest  // #340 draft prompts/get: handler can return an InputRequiredResult
 	assert("messages" !in resp["result"]);
 }
 
-unittest  // #340 draft prompts/get retry with input responses: handler completes
+unittest  // draft prompts/get retry with input responses: handler completes
 {
 	auto s = new McpServer("t", "1");
 	registerTopicPrompt(s);
@@ -5848,7 +5844,7 @@ unittest  // #340 draft prompts/get retry with input responses: handler complete
 	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "about birds");
 }
 
-unittest  // #340 draft prompts/get reads back the echoed opaque requestState (SEP-2322)
+unittest  // draft prompts/get reads back the echoed opaque requestState (SEP-2322)
 {
 	auto s = new McpServer("t", "1");
 	Prompt descriptor = {name: "stateprompt"};
@@ -5881,7 +5877,7 @@ unittest  // #340 draft prompts/get reads back the echoed opaque requestState (S
 	assert(retry["result"]["messages"][0]["content"]["text"].get!string == "resumed:awaiting-topic");
 }
 
-unittest  // #340 non-draft prompts/get is unaffected: no resultType, plain GetPromptResult
+unittest  // non-draft prompts/get is unaffected: no resultType, plain GetPromptResult
 {
 	auto s = new McpServer("t", "1");
 	Prompt descriptor = {name: "plainprompt"};
@@ -6680,18 +6676,18 @@ unittest  // a full roundtrip through cursor-following pagination yields every t
 	assert(deduped.length == 7);
 }
 
-// --- issue #298: the whole handler surface is typed; raw-Json registration is
+// --- The whole handler surface is typed; raw-Json registration is
 // confined to a single, explicitly-named dynamic escape hatch ----------------
 
-unittest  // the raw-Json register*/completion entry points are gone (no backwards-compat)
+unittest  // there are no raw-Json register*/completion entry points
 {
 	auto s = new McpServer("t", "1");
 	Tool t;
 	t.name = "x";
 	Prompt p;
 	p.name = "x";
-	// The old raw-Json names must no longer compile: the only Json-typed
-	// registration is the explicit dynamic hatch.
+	// Raw-Json names do not compile: the only Json-typed registration is the
+	// explicit dynamic hatch.
 	static assert(!__traits(hasMember, s, "registerTool"));
 	static assert(!__traits(hasMember, s, "registerPrompt"));
 	static assert(!__traits(hasMember, s, "setCompletionHandler"));
