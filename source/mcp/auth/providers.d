@@ -7,11 +7,11 @@
 /// Two buckets:
 ///
 /// $(UL
-///   $(LI JWT-based (JWKS) presets build on `jwtVerifier` (#179): the IdP issues
+///   $(LI JWT-based (JWKS) presets build on `jwtVerifier`: the IdP issues
 ///        JWT access tokens with a published JWKS, and the preset pins the
 ///        issuer, JWKS URI, and audience. Each returns a `ResourceServerConfig`
 ///        whose `validator` is a preconfigured `jwtVerifier`.)
-///   $(LI Non-DCR / opaque-token presets build on `OAuthProxy` (#183): the IdP
+///   $(LI Non-DCR / opaque-token presets build on `OAuthProxy`: the IdP
 ///        lacks Dynamic Client Registration and/or issues opaque tokens, so the
 ///        preset supplies the upstream authorize/token endpoints. Each returns an
 ///        `OAuthProxyConfig`.)
