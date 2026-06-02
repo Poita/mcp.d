@@ -11,7 +11,7 @@
  *      (ttlMs=60000, scope=private) and the expected body.
  *   3. reading status://live (no @cache) carries the draft-mandatory do-not-cache
  *      default hint (ttlMs:0, public) — the draft CacheableResult schema requires
- *      ttlMs on every cacheable result rather than omitting it (#57).
+ *      ttlMs on every cacheable result.
  *
  * Transport selection (same assertions either way) is handled by the shared
  * scaffold helper `connectFromArgs`:
@@ -82,14 +82,13 @@ int main(string[] args) @safe
 		// --- 3. status://live has no @cache UDA, so under the draft protocol it
 		//        still carries the MANDATORY freshness hint as the conservative
 		//        do-not-cache default (ttlMs:0, public scope) — the draft
-		//        CacheableResult schema requires ttlMs on every cacheable result
-		//        rather than omitting it (#57).
+		//        CacheableResult schema requires ttlMs on every cacheable result.
 		auto st = client.readResource("status://live");
 		check(!st.cache.isNull,
-				"status://live read should carry the draft do-not-cache default hint (ttlMs:0)");
+			"status://live read should carry the draft do-not-cache default hint (ttlMs:0)");
 		checkEq(st.cache.get.ttlMs, 0, "status://live ttlMs should be 0 (do-not-cache default)");
 		checkEq(st.cache.get.cacheScope, CacheScope.public_,
-				"status://live cacheScope should default to public");
+			"status://live cacheScope should default to public");
 
 		return 0;
 	});
