@@ -12,6 +12,13 @@ import mcp.transport.coordinator : DuplexCoordinator;
 
 @safe:
 
+/// A generous default upper bound (16 MiB) on a single inbound JSON-RPC line for
+/// the stdio transport, guarding against unbounded line accumulation: a peer that
+/// never sends a newline would otherwise grow the read accumulator without limit
+/// (a memory-exhaustion DoS). `runStdio` and `spawnStdioTransport` accept an
+/// override; pass `size_t.max` to effectively disable the bound.
+enum size_t defaultMaxLineBytes = 16 * 1024 * 1024;
+
 /// The shared full-duplex core of the MCP **stdio** transport, used by BOTH the
 /// client and the server. The stdio transport is a single newline-delimited
 /// JSON-RPC byte stream carrying traffic in both directions at once

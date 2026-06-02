@@ -8,7 +8,7 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.subscription : SubscriptionStream;
-import mcp.transport.duplex : DuplexChannel;
+import mcp.transport.duplex : DuplexChannel, defaultMaxLineBytes;
 
 @safe:
 
@@ -160,14 +160,23 @@ final class StdioClientTransport : ClientTransport
 		send(message);
 	}
 
-	/// True: a reply to a server->client request is just another line written to
-	/// the child's stdin and can be sent inline from the channel's read-loop task —
-	/// a serialized, non-blocking write that never waits on the read of the next
-	/// line, so it cannot deadlock. This lets `McpClient.handleServerRequest` answer
-	/// server-initiated ping / sampling / elicitation / roots inline.
+	/// False: a reply to a server->client request MUST NOT be written inline from
+	/// the channel's read-loop task. Although the write is serialized by the
+	/// channel's `writeMutex`, writing the reply inline blocks the single read-loop
+	/// task until the OS pipe buffer accepts the whole frame. With a spawned
+	/// subprocess that can deadlock: the child may be blocked writing more stdout
+	/// (because we have stopped draining it while writing the reply) while we are
+	/// blocked writing the reply into its stdin (because the child has stopped
+	/// draining its stdin to write that stdout). Returning false makes
+	/// `McpClient.handleServerRequest` dispatch the reply on its own vibe task, so
+	/// the read loop keeps draining the child's stdout and the two directions cannot
+	/// wedge each other. The stdio transport always runs its read loop as a vibe
+	/// task (`DuplexChannel.start` -> `runTask`), so an event loop is always
+	/// available for that deferred task — both in the spawned-subprocess model and
+	/// the custom `McpClient.stdio(readLine, writeLine)` delegate channel.
 	bool repliesSynchronously() @safe
 	{
-		return true;
+		return false;
 	}
 
 	/// Serialize a single message and write it as one newline-delimited line
@@ -245,7 +254,7 @@ final class StdioClientTransport : ClientTransport
 /// (cooperative on the vibe event loop) so the duplex read loop never blocks the
 /// loop. The returned transport owns the subprocess: its `close()` runs the stdio
 /// shutdown sequence. Used by `McpClient.spawn`. REQUIRES a running event loop.
-StdioClientTransport spawnStdioTransport(string[] args) @safe
+StdioClientTransport spawnStdioTransport(string[] args, size_t maxLineBytes = defaultMaxLineBytes) @safe
 {
 	import vibe.core.process : pipeProcess, ProcessPipes, Redirect;
 	import eventcore.driver : IOMode;
@@ -258,7 +267,11 @@ StdioClientTransport spawnStdioTransport(string[] args) @safe
 
 	// Async, cooperative line read over the child's stdout: accumulate bytes until
 	// '\n' (stripping a trailing '\r'); a 0-byte read is EOF -> return null so the
-	// duplex read loop ends.
+	// duplex read loop ends. (The byte source is already buffered by vibe's
+	// PipeInputStream, so single-byte reads here do not hit the OS per byte.) If a
+	// single line exceeds `maxLineBytes` the child is producing an unbounded,
+	// newline-less stream — treat it as a transport error and return null to end the
+	// duplex read loop rather than grow the accumulator without limit.
 	string readLine() @safe
 	{
 		ubyte[1] one;
@@ -272,6 +285,8 @@ StdioClientTransport spawnStdioTransport(string[] args) @safe
 			if (one[0] == '\n')
 				break;
 			acc ~= one[0];
+			if (acc.length > maxLineBytes)
+				return null; // over-long, newline-less frame -> end the read loop
 		}
 		if (acc.length && acc[$ - 1] == '\r')
 			acc = acc[0 .. $ - 1];
@@ -438,4 +453,51 @@ version (Posix) unittest  // spawned transport round-trips a request/response ov
 		assert(result["ok"].get!bool == true);
 		transport.closeProcess(5.seconds, 5.seconds);
 	});
+}
+
+version (Posix) unittest  // #32: an over-long newline-less stream ends the read loop instead of growing unbounded
+{
+	import core.time : seconds, msecs;
+	import std.datetime.stopwatch : StopWatch, AutoStart;
+	import std.algorithm.searching : canFind;
+
+	inLoop(() @safe {
+		// The child floods stdout with newline-less bytes. With a small
+		// maxLineBytes the reader must hit the bound and return null (EOF to the
+		// duplex loop), so the in-flight deliver fails via failPending ("channel
+		// closed") promptly — NOT by accumulating without limit until the 60s
+		// deliver timeout.
+		auto transport = spawnStdioTransport([
+			"sh", "-c", "yes A | tr -d \"\\n\""
+		], 4096);
+
+		string msg;
+		auto sw = StopWatch(AutoStart.yes);
+		try
+		{
+			Json req = parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+			transport.deliver(req, 1);
+		}
+		catch (McpException e)
+			msg = e.msg;
+		// The bound must have closed the channel (failPending), not timed out.
+		assert(msg.canFind("closed"),
+			"over-long newline-less stream must end the read loop via channel close, got: " ~ msg);
+		assert(sw.peek < 30.seconds,
+			"the over-long-line bound must trip promptly, well under the 60s deliver timeout");
+		transport.closeProcess(200.msecs, 200.msecs);
+	});
+}
+
+unittest  // #31: a server->client reply is NOT written inline from the read-loop task
+{
+	// A reply written inline from the single read-loop task can deadlock a spawned
+	// subprocess (the child blocks writing stdout while we block writing the reply
+	// into its stdin). `McpClient.handleServerRequest` only defers the reply to its
+	// own task when the transport reports it does NOT reply synchronously, so the
+	// stdio transport must report false to keep the read loop draining.
+	auto transport = new StdioClientTransport(() @safe { return cast(string) null; },
+			(string) @safe {});
+	assert(!transport.repliesSynchronously(),
+			"stdio reply must be deferred (not inline) so the read loop keeps draining the child");
 }
