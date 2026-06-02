@@ -716,7 +716,7 @@ unittest  // a token with no exp claim is rejected (cannot be validated as unexp
 	assert(!ti.valid);
 }
 
-unittest  // a token with a present exp claim still validates (regression guard)
+unittest  // a token with a present integer exp claim validates
 {
 	JwtVerifierConfig cfg;
 	auto payload = parseJsonString(
