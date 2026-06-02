@@ -173,8 +173,9 @@ private int run(string[] args, bool useHttp, string httpUrl) @safe
 	{
 		// Phase D — mid-flight cancellation, HTTP-only (disconnect is the signal).
 		const int cancelledBefore = readCancelCount(httpUrl);
-		phaseCancellation(httpUrl);
-		const int cancelledAfter = readCancelCount(httpUrl);
+		// phaseCancellation drives the cancel and polls the server counter until it
+		// observes the increment (or surfaces a diagnostic on timeout).
+		const int cancelledAfter = phaseCancellation(httpUrl, cancelledBefore);
 		check(cancelledAfter >= cancelledBefore + 1,
 				"server's cancel_stats must increase after a mid-flight cancellation (before="
 				~ cancelledBefore.to!string ~ ", after=" ~ cancelledAfter.to!string ~ ")");
@@ -329,7 +330,7 @@ private void phaseErrorCode(McpClient client) @safe
 
 // --- Phase D: cancellation via stream disconnect (HTTP only) -----------------
 
-private void phaseCancellation(string url) @trusted
+private int phaseCancellation(string url, int cancelledBefore) @trusted
 {
 	auto client = McpClient.http(url);
 	// Draft mode: on Streamable HTTP the cancellation signal is the client
@@ -340,17 +341,26 @@ private void phaseCancellation(string url) @trusted
 
 	bool sawFirstProgress = false;
 	bool callEnded = false;
+	// Count progress notifications IN-BAND so we can prove the run was truncated,
+	// not just that the server's counter moved (#67).
+	int progressCount = 0;
 
 	// Run the long call on its own task; we will close the stream from here. The
 	// per-call progress sink (#494) signals when the call is in flight.
 	enum int longSteps = 50;
-	auto callTask = runTask(() nothrow{
+	auto callTask = runTask(() {
+		// Narrow the catch to Exception (#65): InterruptException IS an Exception,
+		// so the intended cancel signal is still absorbed, but Errors propagate and
+		// fail the run instead of being silently swallowed.
 		try
 			client.callTool("countdown", CountdownArgs(longSteps, 40),
-				(ProgressNotification) @safe { sawFirstProgress = true; });
-		catch (Throwable)
+				(ProgressNotification) @safe {
+				sawFirstProgress = true;
+				progressCount++;
+			});
+		catch (Exception)
 		{
-			// Closing the stream aborts the in-flight read: the call ends abnormally.
+			// Interrupt/disconnect aborts the in-flight read: the call ends abnormally.
 		}
 		callEnded = true;
 	});
@@ -366,14 +376,38 @@ private void phaseCancellation(string url) @trusted
 	// the underlying TCP connection — the Streamable HTTP cancellation signal.
 	callTask.interrupt();
 
+	spins = 0;
 	while (!callEnded && spins < 1200)
 	{
 		sleep(5.msecs);
 		spins++;
 	}
-	sleep(300.msecs);
+	check(callEnded, "cancellation phase: call task never ended after interrupt");
 	callTask.join();
 	client.close();
+
+	// The run must have been cut short: fewer progress notifications than a full
+	// countdown would emit. This is the in-band proof of truncation (#67).
+	check(progressCount < longSteps, "cancellation phase: run must be cut short — saw "
+			~ progressCount.to!string ~ " of " ~ longSteps.to!string ~ " progress notifications");
+
+	// Condition-driven success criterion (#68): poll the server's cancel counter
+	// until it increments past the pre-cancel baseline, rather than trusting a
+	// fixed wall-clock sleep. Generous deadline so a slow handler is not a flake.
+	enum int deadlineSpins = 200; // ~10s at 50ms
+	int after = cancelledBefore;
+	foreach (i; 0 .. deadlineSpins)
+	{
+		after = readCancelCount(url);
+		if (after > cancelledBefore)
+			break;
+		sleep(50.msecs);
+	}
+	check(after > cancelledBefore,
+			"cancellation phase: cancel issued but server cancel_stats never incremented "
+			~ "within deadline (before=" ~ cancelledBefore.to!string
+			~ ", last=" ~ after.to!string ~ ")");
+	return after;
 }
 
 // --- Phase C/D helpers: read the server-side cancel counter -------------------

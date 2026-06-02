@@ -72,7 +72,7 @@ import mcp;
 import mcp.auth : signEs256, base64UrlNoPad, parseWwwAuthenticate, WwwAuthenticate, OAuthClient,
 	ProtectedResourceMetadata, AuthorizationServerMetadata, RegisteredClient, TokenSet;
 
-import examples_common : check, checkEq, runClient, connectFromArgs;
+import examples_common : check, checkEq, runClient, connectFromArgs, WhoamiResult;
 
 /// The PKCS#8 EC P-256 private key matching server.d's pinned PublicKeyPem.
 /// In a real system this lives in the authorization server, never the client.
@@ -82,16 +82,6 @@ enum PrivateKeyPem = "-----BEGIN PRIVATE KEY-----\n"
 	~ "Jvb+LKOaKgMJZhbHwKnd159fHseXz1aZb/QbrohVqpdOmZEzQBbfrKp6\n" ~ "-----END PRIVATE KEY-----\n";
 
 enum Issuer = "https://auth.example.com";
-
-/// Mirrors the server's `WhoamiResult` structured output. Decoding the
-/// `whoami` tool result with `CallToolResult.structuredContentAs!WhoamiResult`
-/// (SDK #464) yields this typed value, so the client asserts on real fields
-/// instead of poking at raw `structuredContent["..."]` Json.
-struct WhoamiResult
-{
-	string subject;
-	string[] scopes;
-}
 
 string serverUrl;
 string baseOrigin;
