@@ -330,7 +330,7 @@ final class McpServer
 	private Json extensions = Json.undefined;
 	// STAGE-1 TRANSITIONAL SHIM (issue #550): the per-connection mutable state
 	// that used to be scattered as individual `McpServer` fields —
-	// `negotiated`, `connectionVersion`, `clientCaps`, `logLevel`,
+	// `negotiated`, `clientCaps`, `logLevel`,
 	// `subscriptions`, and the `inFlight` cancellation registry — now lives on a
 	// single `ConnectionState`, threaded through dispatch (`handle`/`route`/
 	// `do*`) and read back by the notify/push path. Keeping exactly ONE
@@ -1020,16 +1020,12 @@ final class McpServer
 				|| !tryParseVersion(meta.protocolVersion, mv) || !mv.isDraft)
 			return false;
 
-		// Pin the effective version so notify-suppression gating (listensFor) and
-		// any subscriptionId stamping behave as draft for this listen session.
-		// (#288: connectionVersion mirrors the sanctioned draft-listen path and is
-		// needed for notify-suppression/listensFor gating; it does not destroy
-		// negotiated session capabilities.) Do NOT overwrite the shared session
-		// `clientCaps` here (#77): the draft listen request's _meta capabilities are
-		// per-request and the draft `tools/call` gate already reads them from
-		// RequestMeta.fromParams(params); clobbering the field would wipe the
-		// capabilities a prior/concurrent stateful initialize negotiated.
-		cs.connectionVersion = mv;
+		// Do NOT overwrite the shared session `clientCaps` here (#77): the draft
+		// listen request's _meta capabilities are per-request and the draft
+		// `tools/call` gate already reads them from RequestMeta.fromParams(params);
+		// clobbering the field would wipe the capabilities a prior/concurrent
+		// stateful initialize negotiated. (Delivery on this stream is governed by
+		// the per-stream filter captured below, not a connection-level version.)
 		// Record the opted-in filters; the one-shot {acknowledged:true} result is
 		// discarded (the spec defines no such Result — the ack is a notification).
 		doSubscribeListen(msg.params, cs());
@@ -1110,39 +1106,15 @@ final class McpServer
 	/// filter and ignores this). This preserves the pre-draft delivery semantics: the
 	/// three list-changed notifications broadcast unconditionally, while
 	/// `notifications/resources/updated` is delivered only for a URI the client
-	/// subscribed to via `resources/subscribe` (`isSubscribed`). On the draft
-	/// single-connection path (a draft GET stream, no per-stream listen filter) the
-	/// global `subscriptions/listen` opt-in gates instead, mirroring the former
-	/// behaviour for that legacy path.
+	/// subscribed to via `resources/subscribe` (`isSubscribed`). A plain GET stream
+	/// only exists on a non-draft connection (the draft answers GET with 405), so
+	/// there is no draft branch here — draft delivery is entirely per-stream-filter
+	/// driven (#550).
 	private bool plainGetEligible(string method, string uri) @safe
 	{
-		if (cs.connectionVersion.isDraft)
-			return globalListensForMethod(method);
 		if (method == "notifications/resources/updated")
 			return isSubscribed(uri);
 		return true;
-	}
-
-	/// Whether the server's *global* `subscriptions/listen` opt-in covers a given
-	/// change-notification `method`. Used only as the fallback eligibility for plain
-	/// GET listeners on the draft (active per-stream filters decide their own
-	/// eligibility); the four list/subscription change methods map to their filter
-	/// keys, and any other method is ungated.
-	private bool globalListensForMethod(string method) @safe
-	{
-		switch (method)
-		{
-		case "notifications/tools/list_changed":
-			return listensFor("toolsListChanged");
-		case "notifications/prompts/list_changed":
-			return listensFor("promptsListChanged");
-		case "notifications/resources/list_changed":
-			return listensFor("resourcesListChanged");
-		case "notifications/resources/updated":
-			return listensFor("resourceSubscriptions");
-		default:
-			return true;
-		}
 	}
 
 	/// Initiate a server->client `ping` on the standalone GET SSE push channel
@@ -1721,8 +1693,8 @@ final class McpServer
 		// using the same normalization `rpcIdString` produced the stored id with, so
 		// a numeric cancellation requestId matches a numeric (or string) listen id.
 		// On a match, drop the delivery sink and clear the recorded per-stream
-		// filter so `globalListensForMethod` reports nothing and any subsequent
-		// notify*/notifyResourceUpdated writes nothing.
+		// filter so the listener-driven notify path matches nothing and any
+		// subsequent notify*/notifyResourceUpdated writes nothing.
 		if (stdioListenSink !is null && stdioListenSubscriptionId.length
 				&& rpcIdString(params["requestId"]) == stdioListenSubscriptionId)
 		{
@@ -1730,10 +1702,11 @@ final class McpServer
 			stdioListenSubscriptionId = null;
 			// Drop every piece of listen state this single stdio stream recorded so
 			// a later notify*/notifyResourceUpdated writes nothing: the global
-			// `listenFilters` (which `globalListensForMethod` reads via `listensFor`),
-			// the per-URI resource `subscriptions` and their recorded URI list, and
-			// the per-stream `lastListenFilter_`. Stdio is single-connection, so the
-			// caller is the only listener and clearing all of it is correct.
+			// `listenFilters` (read by `listensFor`), the per-URI resource
+			// `subscriptions` and their recorded URI list, the per-stream
+			// `lastListenFilter_`, and the stdio delivery filter `stdioListenFilter_`.
+			// Stdio is single-connection, so the caller is the only listener and
+			// clearing all of it is correct.
 			foreach (u; listenResourceUris)
 				conn.subscriptions.remove(u);
 			listenResourceUris = null;
@@ -1766,19 +1739,14 @@ final class McpServer
 				throw methodNotFound(method);
 			return doDiscover();
 		case "subscriptions/listen":
-			// A draft subscriptions/listen opens a draft server->client push session;
-			// pin the connection's push-path version so later notify* gate as draft
-			// (issue #288: the per-request path no longer mutates this).
-			//
-			// NOTE (#51): subscriptions/listen is conceptually a draft-only RPC, but
-			// the stdio transport intentionally accepts a pre-draft (no _meta version)
-			// listen on the normal request/reply path (see the stdio transport test
-			// "a pre-draft subscriptions/listen still takes the normal request/reply
-			// path"). Hard-gating on usesSubscriptionsListen here would regress that
-			// supported fallback, so the version pin stays guarded by isDraft rather
-			// than rejecting non-draft callers.
-			if (ver.isDraft)
-				conn.connectionVersion = ver;
+			// subscriptions/listen is an ordinary request — it records the opted-in
+			// per-stream filter (consulted later by the listener-driven notify path)
+			// and is NOT special-cased for the push version (#550). NOTE (#51): it is
+			// conceptually a draft-only RPC, but the stdio transport intentionally
+			// accepts a pre-draft (no _meta version) listen on the normal
+			// request/reply path (see the stdio transport test "a pre-draft
+			// subscriptions/listen still takes the normal request/reply path"), so it
+			// is not hard-gated on the version here.
 			return doSubscribeListen(params, conn);
 		case "ping":
 			return Json.emptyObject;
@@ -2329,9 +2297,6 @@ final class McpServer
 		if (conn.negotiated.isDraft)
 			conn.negotiated = latestStable;
 		conn.clientCaps = p.capabilities;
-		// Pin the connection's push-path version so unsolicited server->client
-		// notifications gate correctly on draft after initialize (issue #288).
-		conn.connectionVersion = conn.negotiated;
 
 		InitializeResult result;
 		result.protocolVersion = conn.negotiated.toWire;
@@ -6472,25 +6437,36 @@ unittest  // #550: stdio listen sink is per-URI filtered (subscribed delivered, 
 	assert(sink.length == 2);
 }
 
-unittest  // draft: notifyPromptsListChanged suppressed unless client opted in
+unittest  // draft subscriptions/listen: a stream gets list_changed only if its own filter opted in (#550)
 {
+	// Delivery is listener-driven: an active `subscriptions/listen` stream receives
+	// `notifications/prompts/list_changed` only when its OWN per-stream
+	// `SubscriptionFilter` opted into promptsListChanged — no connection-level
+	// version is consulted (the former `connectionVersion`/`globalListensForMethod`
+	// path was removed in #550 since a draft connection never has a plain GET stream).
 	auto s = new McpServer("t", "1");
 	s.enablePromptsListChanged();
-	s.activeConnection.connectionVersion = ProtocolVersion.draft;
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
-	string[] received;
-	ch.addListener((string f) @safe { received ~= f; });
-	// No subscriptions/listen opt-in: suppressed.
+
+	// A listen stream whose active filter did NOT opt into promptsListChanged: suppressed.
+	string[] a;
+	SubscriptionFilter noPrompts;
+	noPrompts.active = true;
+	noPrompts.toolsListChanged = true;
+	const idA = ch.addListener((string f) @safe { a ~= f; }, "listen-a", noPrompts);
 	assert(s.notifyPromptsListChanged() == 0);
-	assert(received.length == 0);
-	// After opting in via subscriptions/listen, it is delivered. The listen RPC is
-	// draft-only (#51), so it must be dispatched as a draft request for the opt-in
-	// to be recorded.
-	Json p = Json.emptyObject;
-	p["promptsListChanged"] = true;
-	s.handle(draftReq(1, "subscriptions/listen", p));
+	assert(a.length == 0);
+	ch.removeListener(idA);
+
+	// A listen stream that DID opt into promptsListChanged: delivered.
+	string[] b;
+	SubscriptionFilter withPrompts;
+	withPrompts.active = true;
+	withPrompts.promptsListChanged = true;
+	ch.addListener((string f) @safe { b ~= f; }, "listen-b", withPrompts);
 	assert(s.notifyPromptsListChanged() == 1);
+	assert(b.length == 1);
 }
 
 version (unittest)

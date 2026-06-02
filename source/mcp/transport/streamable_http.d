@@ -1897,7 +1897,6 @@ private ConnectionState freshStatelessState(string protoHeader, Json params,
 		return null;
 	auto conn = new ConnectionState;
 	conn.negotiated = eff;
-	conn.connectionVersion = eff;
 	conn.clientCaps = meta.clientCapabilities;
 	if (!meta.logLevel.isNull)
 		conn.logLevel = meta.logLevel.get;
@@ -2340,7 +2339,7 @@ unittest  // ordinary application errors (e.g. invalidParams) ride on HTTP 200
 
 unittest  // draft subscriptions/listen: ack first, then opted-in change notifications flow
 {
-	import mcp.transport.sse_context : StreamCoordinator, ServerPushChannel;
+	import mcp.transport.sse_context : StreamCoordinator, ServerPushChannel, SubscriptionFilter;
 	import mcp.protocol.draft : MetaKey;
 	import std.algorithm : canFind;
 
@@ -2359,11 +2358,16 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
 	assert(!server.listensFor("resourcesListChanged"));
 
 	// The listen stream registers as a push-channel listener (carrying the listen
-	// request's id as the stream's subscriptionId) and receives the ack.
+	// request's id as the stream's subscriptionId, and its OWN active per-stream
+	// filter — exactly as handleListenStream does) and receives the ack. Delivery
+	// onto the stream is decided by that filter.
 	auto coord = new StreamCoordinator;
 	auto push = server.serverPushChannel(coord);
 	string[] frames;
-	const lid = push.addListener((string f) @safe { frames ~= f; }, rpcIdString(m.id));
+	SubscriptionFilter streamFilter;
+	streamFilter.active = true;
+	streamFilter.toolsListChanged = true;
+	const lid = push.addListener((string f) @safe { frames ~= f; }, rpcIdString(m.id), streamFilter);
 	push.emitTo(lid, subscriptionsAcknowledgedNotification(
 			server.acknowledgedSubsetFor(server.lastListenFilter())));
 	assert(frames.length == 1);

@@ -25,13 +25,12 @@ import mcp.server.context : CancellationToken;
 final class ConnectionState
 {
 	/// The protocol version negotiated for this connection (stateful) or the
-	/// effective version for the current request (stateless).
+	/// effective version for the current request (stateless). This is the single
+	/// version concept: the server->client push/notification path is driven by
+	/// each open listener's own `SubscriptionFilter`, not by a separate
+	/// connection-level version (see #550 — `subscriptions/listen` is an ordinary
+	/// request and is not special-cased).
 	ProtocolVersion negotiated = latestStable;
-
-	/// The version that governs the server->client push/notification path for
-	/// this connection. On stateful sessions it tracks `negotiated`; on a draft
-	/// `subscriptions/listen` it is pinned to the draft.
-	ProtocolVersion connectionVersion = latestStable;
 
 	/// The client capabilities declared at `initialize` (stateful) or carried in
 	/// the request's `_meta` (stateless draft). Empty when unknown (legacy
