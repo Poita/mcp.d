@@ -1083,12 +1083,21 @@ void applySseStreamHeaders(HTTPServerResponse res, bool isDraft) @safe
 /// elicitation send an SSE request event then block (via the coordinator) for
 /// the client's response on a later POST. The final JSON-RPC response is the
 /// terminating SSE event.
-final class HttpStreamContext : RequestContext
+final class HttpStreamContext : RequestContext, ConnectionScoped
 {
 	private HTTPServerResponse res;
 	private StreamCoordinator coord;
 	private ClientCapabilities clientCaps;
 	private Json progressTok;
+	// Per-connection cancellation scope (#3/#13/#22). On the Streamable HTTP
+	// transport a request and its later `notifications/cancelled` arrive on
+	// SEPARATE POSTs that share only the `Mcp-Session-Id` header, so the token
+	// MUST be that session id when sessions are enabled -- a per-request UUID
+	// would never match the cancellation's own context and would break
+	// cancellation entirely. When sessions are disabled there is no identifier
+	// shared across the two POSTs, so the empty (shared) token is kept and
+	// cancellation is unscoped (documented on the transport).
+	private string token_;
 	private bool streaming_;
 	private long streamId;
 	private long eventSeq;
@@ -1114,7 +1123,8 @@ final class HttpStreamContext : RequestContext
 
 	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
 			TokenInfo auth = TokenInfo.invalid(),
-			bool isDraft = false, ProtocolVersion negotiated = latestStable) @safe
+			bool isDraft = false, ProtocolVersion negotiated = latestStable,
+			string connectionToken = "") @safe
 	{
 		this.res = res;
 		this.coord = coord;
@@ -1124,7 +1134,19 @@ final class HttpStreamContext : RequestContext
 		this.authInfo = auth;
 		this.isDraft_ = isDraft;
 		this.version_ = negotiated;
+		this.token_ = connectionToken;
 		this.connAlive_ = () @safe => res.connected;
+	}
+
+	/// The per-connection cancellation scope for this request (#3/#13/#22). This is
+	/// the `Mcp-Session-Id` when stateful sessions are enabled, so a request and its
+	/// later `notifications/cancelled` -- which arrive on SEPARATE POSTs sharing only
+	/// that header -- resolve to the SAME `RequestScope` cancellation key. When
+	/// sessions are disabled there is no shared identifier across the two POSTs, so
+	/// the empty (shared) token is returned and bare-id cancellation is unscoped.
+	string connectionToken() @safe
+	{
+		return token_;
 	}
 
 	/// Override the connection-liveness probe used by `isCancelled` on the draft
@@ -1723,4 +1745,79 @@ unittest  // released versions: a disconnect never reports cancelled (draft-only
 	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined);
 	ctx.setConnectionProbe(() @safe => false);
 	assert(!ctx.isCancelled);
+}
+
+unittest  // #3/#22: HttpStreamContext exposes its per-connection token via ConnectionScoped
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	ClientCapabilities caps;
+
+	// With a session id supplied (stateful HTTP), the context's connectionToken IS
+	// the Mcp-Session-Id, so connectionTokenOf scopes the cancellation registry per
+	// session rather than collapsing every connection onto the shared "" key.
+	auto scoped = new HttpStreamContext(res, coord, caps, Json.undefined,
+			TokenInfo.invalid(), false, latestStable, "sess-XYZ");
+	assert(cast(ConnectionScoped) scoped !is null,
+			"HttpStreamContext must implement ConnectionScoped (#3/#22)");
+	assert(scoped.connectionToken() == "sess-XYZ");
+	assert(connectionTokenOf(scoped) == "sess-XYZ");
+
+	// Stateless (sessions disabled): the empty shared token, documented as unscoped.
+	auto unscoped = new HttpStreamContext(res, coord, caps, Json.undefined);
+	assert(unscoped.connectionToken() == "");
+}
+
+unittest  // #3/#22: a cancellation scoped to session B must not suppress session A's same-id request
+{
+	// This exercises the REAL transport context (HttpStreamContext), not a synthetic
+	// ConnCtx, so it catches the inert-scoping regression the ConnCtx test misses:
+	// two Streamable HTTP sessions A and B share one McpServer and both have an
+	// in-flight request id 1. A `notifications/cancelled` for id 1 carried on a
+	// session-B-scoped context must only flip B's in-flight key -- A's must survive.
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.server.server : McpServer;
+	import mcp.protocol.jsonrpc : makeNotification, makeRequest;
+	import mcp.protocol.types : Tool, CallToolResult, Content;
+
+	auto sinkA = createMemoryOutputStream();
+	auto resA = createTestHTTPServerResponse(sinkA, null, TestHTTPResponseMode.bodyOnly);
+	auto sinkB = createMemoryOutputStream();
+	auto resB = createTestHTTPServerResponse(sinkB, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	ClientCapabilities caps;
+
+	auto s = new McpServer("t", "1");
+	// Build the cancellation context for session B exactly as the transport does:
+	// an HttpStreamContext carrying session B's token.
+	auto ctxB = new HttpStreamContext(resB, coord, caps, Json.undefined,
+			TokenInfo.invalid(), false, latestStable, "sess-B");
+
+	Tool slow = {name: "slow"};
+	s.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+		// While request id 1 runs on session A, a cancellation for id 1 arrives on
+		// session B. With per-connection keying via connectionToken this MUST NOT
+		// flip A's token.
+		Json p = Json.emptyObject;
+		p["requestId"] = 1;
+		s.handle(Message(makeNotification("notifications/cancelled", p)), ctxB);
+		assert(!ctx.isCancelled,
+			"a cancellation on session B wrongly cancelled session A (#3/#22)");
+		CallToolResult r;
+		r.content = [Content.makeText("done")];
+		return r;
+	});
+
+	Json callP = Json.emptyObject;
+	callP["name"] = "slow";
+	auto ctxA = new HttpStreamContext(resA, coord, caps, Json.undefined,
+			TokenInfo.invalid(), false, latestStable, "sess-A");
+	auto resp = s.handle(Message(makeRequest(Json(1), "tools/call", callP)), ctxA);
+	// A's response is delivered (not suppressed): cancellation matched only B.
+	assert(!resp.isNull);
 }
