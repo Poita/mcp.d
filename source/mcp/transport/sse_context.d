@@ -13,6 +13,7 @@ import mcp.protocol.capabilities;
 import mcp.protocol.draft : withSubscriptionId;
 import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
 import mcp.server.context;
+import mcp.server.connection : ConnectionState;
 import mcp.auth.resource_server : TokenInfo;
 
 /// Correlates outbound server->client requests with the client's responses,
@@ -1156,6 +1157,13 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// shared across the two POSTs, so the empty (shared) token is kept and
 	// cancellation is unscoped (documented on the transport).
 	private string token_;
+	// The per-session (stateful) / per-request (stateless) ConnectionState this
+	// request is bound to (#550 Stage 2). The transport resolves it — looked up by
+	// `Mcp-Session-Id` for stateful, freshly built per request for stateless — and
+	// hands it here so the server core dispatches against THIS request's state
+	// rather than the single bound `activeConnection`. Null when the transport did
+	// not resolve one (the server then falls back to `activeConnection`).
+	private ConnectionState connState_;
 	private bool streaming_;
 	private long streamId;
 	private long eventSeq;
@@ -1182,7 +1190,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
 			TokenInfo auth = TokenInfo.invalid(),
 			bool isDraft = false, ProtocolVersion negotiated = latestStable,
-			string connectionToken = "") @safe
+			string connectionToken = "", ConnectionState connState = null) @safe
 	{
 		this.res = res;
 		this.coord = coord;
@@ -1193,6 +1201,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		this.isDraft_ = isDraft;
 		this.version_ = negotiated;
 		this.token_ = connectionToken;
+		this.connState_ = connState;
 		this.connAlive_ = () @safe => res.connected;
 	}
 
@@ -1205,6 +1214,15 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	string connectionToken() @safe
 	{
 		return token_;
+	}
+
+	/// The per-session/per-request `ConnectionState` the transport resolved for
+	/// this request (#550 Stage 2): the `SessionManager`-owned state for stateful
+	/// HTTP, or the fresh transient state for stateless HTTP. Null when none was
+	/// supplied, in which case the server core falls back to `activeConnection`.
+	ConnectionState connectionState() @safe
+	{
+		return connState_;
 	}
 
 	/// Override the connection-liveness probe used by `isCancelled` on the draft

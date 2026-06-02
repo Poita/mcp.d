@@ -1248,9 +1248,17 @@ final class McpServer
 		// than a mutable field on the shared server instance, so a handler that
 		// yields mid-flight cannot have its effective version flipped by another
 		// concurrently-dispatched request (issue #288).
-		// STAGE-1 (issue #550): resolve the connection state for this request and
-		// thread it through dispatch instead of reading scattered server fields.
-		auto conn = cs();
+		// STAGE-2 (issue #550): resolve the connection state for THIS request from
+		// the context when it carries one (stateful HTTP: the SessionManager-owned
+		// state for its `Mcp-Session-Id`; stateless HTTP: a fresh per-request state
+		// built from the effective version + `_meta`), else fall back to the single
+		// bound `activeConnection` (stdio / bare-`handle`). The state is threaded
+		// through dispatch (`route`/`do*`) so two sessions sharing one McpServer can
+		// never observe each other's negotiated version / caps / subscriptions /
+		// in-flight ids.
+		auto conn = connectionStateOf(ctx);
+		if (conn is null)
+			conn = activeConnection;
 		ProtocolVersion effective = conn.negotiated;
 		auto meta = RequestMeta.fromParams(msg.params);
 		// On stateful (2025-era) protocols logging is governed once-per-session by
@@ -1603,16 +1611,25 @@ final class McpServer
 
 	private void handleNotification(Message msg, RequestContext ctx) @safe
 	{
+		// STAGE-2 (#550): resolve the per-session/per-request state from the context
+		// (stateful HTTP -> the SessionManager-owned state for this session id) and
+		// fall back to the single bound `activeConnection` otherwise, mirroring
+		// `handleRequest`. A `notifications/initialized` then flips the right
+		// session's flag and a `notifications/cancelled` matches the right session's
+		// in-flight registry.
+		auto conn = connectionStateOf(ctx);
+		if (conn is null)
+			conn = activeConnection;
 		switch (msg.method)
 		{
 		case "notifications/initialized":
-			cs.initialized = true;
+			conn.initialized = true;
 			break;
 		case "notifications/cancelled":
 			// Resolve the cancellation against the connection it arrived on (#13):
 			// a `notifications/cancelled` on connection B must only match in-flight
 			// keys connection B registered.
-			handleCancelled(msg.params, connectionTokenOf(ctx));
+			handleCancelled(msg.params, connectionTokenOf(ctx), conn);
 			break;
 		case "notifications/roots/list_changed":
 			if (onRootsListChanged_ !is null)
@@ -1634,7 +1651,7 @@ final class McpServer
 	/// can stop and its response is suppressed. A cancellation for a request that
 	/// is unknown or already completed is ignored, per "This notification
 	/// indicates ... the request ... should be terminated" being best-effort.
-	private void handleCancelled(Json params, string connToken) @safe
+	private void handleCancelled(Json params, string connToken, ConnectionState conn) @safe
 	{
 		if (params.type != Json.Type.object || "requestId" !in params)
 			return;
@@ -1661,7 +1678,7 @@ final class McpServer
 			// the per-stream `lastListenFilter_`. Stdio is single-connection, so the
 			// caller is the only listener and clearing all of it is correct.
 			foreach (u; listenResourceUris)
-				cs.subscriptions.remove(u);
+				conn.subscriptions.remove(u);
 			listenResourceUris = null;
 			listenFilters = null;
 			lastListenFilter_ = SubscriptionFilter.init;
@@ -1671,7 +1688,7 @@ final class McpServer
 		const key = inFlightKey(connToken, params["requestId"]);
 		if (key.length == 0)
 			return;
-		if (auto token = key in cs.inFlight)
+		if (auto token = key in conn.inFlight)
 			token.cancel();
 	}
 
@@ -3481,14 +3498,21 @@ version (unittest) private final class ConnCtx : RequestContext, ConnectionScope
 	import mcp.auth.resource_server : TokenInfo;
 
 	private string token_;
-	this(string token) @safe
+	private ConnectionState connState_;
+	this(string token, ConnectionState connState = null) @safe
 	{
 		this.token_ = token;
+		this.connState_ = connState;
 	}
 
 	string connectionToken() @safe
 	{
 		return token_;
+	}
+
+	ConnectionState connectionState() @safe
+	{
+		return connState_;
 	}
 
 	bool isCancelled() @safe
@@ -6660,4 +6684,80 @@ unittest  // #550: a stateful server does not serve server/discover (draft-only 
 	assert(!resp.isNull);
 	assert("error" in resp.get);
 	assert(resp.get["error"]["code"].get!long == -32601);
+}
+
+unittest  // #550 Stage 2: dispatch resolves the ConnectionState carried by the context
+{
+	import mcp.server.connection : ConnectionState;
+	import vibe.data.json : parseJsonString;
+
+	// A context carrying its own ConnectionState makes the server dispatch against
+	// THAT state, never the single bound activeConnection. logging/setLevel must
+	// land on the carried state and leave activeConnection untouched.
+	auto s = new McpServer("t", "1");
+	s.enableLogging();
+	auto state = new ConnectionState;
+	auto ctx = new ConnCtx("sess-X", state);
+	auto set = parseJsonString(
+			`{"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"error"}}`);
+	s.handle(Message(set), ctx);
+	assert(state.logLevel == "error", "setLevel must mutate the context's ConnectionState");
+	assert(s.activeConnection.logLevel == "info",
+			"setLevel must NOT touch the bound activeConnection when the ctx carries state");
+}
+
+unittest  // #550 Stage 2 cross-talk: two contexts on ONE server keep independent state
+{
+	import mcp.server.connection : ConnectionState;
+	import vibe.data.json : parseJsonString;
+
+	// Two sessions (A and B) share one McpServer, each with its own ConnectionState
+	// (as the SessionManager would hand the transport). Mutating A's log level and
+	// a subscription via dispatch must be invisible to B's state.
+	auto s = new McpServer("t", "1");
+	s.enableLogging();
+	s.enableResourceSubscriptions();
+	auto stateA = new ConnectionState;
+	auto stateB = new ConnectionState;
+
+	auto setA = parseJsonString(
+			`{"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"error"}}`);
+	s.handle(Message(setA), new ConnCtx("A", stateA));
+	auto subA = parseJsonString(
+			`{"jsonrpc":"2.0","id":2,"method":"resources/subscribe","params":{"uri":"res://a"}}`);
+	s.handle(Message(subA), new ConnCtx("A", stateA));
+
+	assert(stateA.logLevel == "error");
+	assert(("res://a" in stateA.subscriptions) !is null);
+	assert(stateB.logLevel == "info", "session B saw session A's log level (cross-talk)");
+	assert(("res://a" in stateB.subscriptions) is null,
+			"session B saw session A's subscription (cross-talk)");
+}
+
+unittest  // #550 Stage 2: notifications/initialized flips only the carried state
+{
+	import mcp.server.connection : ConnectionState;
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	auto state = new ConnectionState;
+	auto note = parseJsonString(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+	s.handle(Message(note), new ConnCtx("sess", state));
+	assert(state.initialized, "initialized must be recorded on the carried state");
+	assert(!s.activeConnection.initialized,
+			"initialized must NOT touch the bound activeConnection when the ctx carries state");
+}
+
+unittest  // #550 Stage 2: bare handle(msg) still uses the single bound activeConnection
+{
+	import vibe.data.json : parseJsonString;
+
+	// A NullContext carries no ConnectionState, so the server falls back to its
+	// single bound activeConnection — the stdio / in-process single-peer model.
+	auto s = new McpServer("t", "1");
+	s.enableLogging();
+	auto set = parseJsonString(
+			`{"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"error"}}`);
+	s.handle(Message(set));
+	assert(s.activeConnection.logLevel == "error", "bare handle must fall back to activeConnection");
 }

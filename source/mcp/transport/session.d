@@ -1,6 +1,7 @@
 module mcp.transport.session;
 
 import mcp.protocol.errors : McpException, internalError;
+import mcp.server.connection : ConnectionState;
 
 /// Tracks active Streamable HTTP sessions for a server mount.
 ///
@@ -22,16 +23,25 @@ import mcp.protocol.errors : McpException, internalError;
 /// locking.
 final class SessionManager
 {
-	private bool[string] active;
+	// Stage 2 (#550): the manager now OWNS one `ConnectionState` per active
+	// session, keyed by `Mcp-Session-Id`. Presence in this map is the liveness
+	// signal (replacing the former `bool[string]`): an entry means the session is
+	// active, its absence means unknown/terminated. Storing the per-session state
+	// here is what makes stateful HTTP truly session-isolated — the request path
+	// resolves a request's `ConnectionState` by its session id, so one session's
+	// negotiated version / logLevel / subscriptions / in-flight ids can never be
+	// observed through another's.
+	private ConnectionState[string] states;
 
 	this() @safe
 	{
 	}
 
-	/// Generate a new cryptographically-secure session id, record it as active,
-	/// and return it. The id is a 256-bit value rendered as lowercase hex, which
-	/// satisfies the spec requirement that the id "MUST only contain visible
-	/// ASCII characters (ranging from 0x21 to 0x7E)".
+	/// Generate a new cryptographically-secure session id, create and store the
+	/// per-session `ConnectionState` it owns, record it as active, and return the
+	/// id. The id is a 256-bit value rendered as lowercase hex, which satisfies the
+	/// spec requirement that the id "MUST only contain visible ASCII characters
+	/// (ranging from 0x21 to 0x7E)".
 	///
 	/// Throws: `McpException` (`internalError`) when the host OS CSPRNG is
 	/// unavailable (audit finding #8). This was previously an infallible path; it is
@@ -43,7 +53,7 @@ final class SessionManager
 	string create() @safe
 	{
 		const id = generateSessionId();
-		active[id] = true;
+		states[id] = new ConnectionState;
 		return id;
 	}
 
@@ -52,20 +62,78 @@ final class SessionManager
 	{
 		if (id.length == 0)
 			return false;
-		return (id in active) !is null;
+		return (id in states) !is null;
 	}
 
-	/// Terminate `id`. Returns true if the session existed (and was removed),
-	/// false if it was unknown/already terminated.
+	/// The `ConnectionState` this manager owns for the active session `id`, or
+	/// `null` when the id is empty, unknown, or already terminated. The request
+	/// path puts this on the request context so dispatch reads/writes only this
+	/// session's per-connection state (#550).
+	ConnectionState stateFor(string id) @safe
+	{
+		if (id.length == 0)
+			return null;
+		if (auto p = id in states)
+			return *p;
+		return null;
+	}
+
+	/// Terminate `id`. Returns true if the session existed (and was removed,
+	/// dropping its `ConnectionState`), false if it was unknown/already terminated.
 	bool terminate(string id) @safe
 	{
 		if (id.length == 0)
 			return false;
-		if ((id in active) is null)
+		if ((id in states) is null)
 			return false;
-		active.remove(id);
+		states.remove(id);
 		return true;
 	}
+}
+
+unittest  // #550: a created session owns a non-null ConnectionState
+{
+	auto mgr = new SessionManager;
+	const id = mgr.create();
+	auto cs = mgr.stateFor(id);
+	assert(cs !is null);
+	assert(mgr.stateFor("unknown") is null);
+	assert(mgr.stateFor("") is null);
+}
+
+unittest  // #550: two sessions on one manager get INDEPENDENT ConnectionStates (no cross-talk)
+{
+	import mcp.protocol.versions : ProtocolVersion;
+	import mcp.server.context : CancellationToken;
+
+	auto mgr = new SessionManager;
+	const a = mgr.create();
+	const b = mgr.create();
+	auto csA = mgr.stateFor(a);
+	auto csB = mgr.stateFor(b);
+	assert(csA !is csB, "each session must own a distinct ConnectionState");
+
+	// Mutate session A's negotiated version, log level, a subscription, and an
+	// in-flight id; NONE may be visible through session B's state.
+	csA.negotiated = ProtocolVersion.v2025_03_26;
+	csA.logLevel = "error";
+	csA.subscriptions["res://a"] = true;
+	csA.inFlight["i:1"] = new CancellationToken;
+
+	assert(csB.negotiated != ProtocolVersion.v2025_03_26,
+			"session B saw session A's negotiated version");
+	assert(csB.logLevel != "error", "session B saw session A's log level");
+	assert(("res://a" in csB.subscriptions) is null, "session B saw session A's subscription");
+	assert(("i:1" in csB.inFlight) is null, "session B saw session A's in-flight id");
+}
+
+unittest  // #550: terminating a session drops its ConnectionState
+{
+	auto mgr = new SessionManager;
+	const id = mgr.create();
+	assert(mgr.stateFor(id) !is null);
+	assert(mgr.terminate(id));
+	assert(mgr.stateFor(id) is null);
 }
 
 /// Produce a cryptographically-secure, hex-encoded 256-bit session id.
