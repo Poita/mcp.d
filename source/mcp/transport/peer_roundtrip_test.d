@@ -1,15 +1,11 @@
-/// End-to-end test of the server->client request round-trip between THIS SDK's
+/// End-to-end test of the server->client request round-trip between this SDK's
 /// own `McpServer` and `McpClient`, over a real Streamable HTTP transport.
 ///
-/// This is the gap the conformance suite never exercised (issue #377): the
-/// server suite answers OUR server with the harness client, and the client suite
-/// answers the harness server with OUR client, but neither runs OUR server and
-/// OUR client against each other. A tool that calls `ctx.sample`/`ctx.elicit`
-/// emits a server->client request on its POST's SSE stream and blocks in
-/// `StreamCoordinator.await`; the client must answer it on a SEPARATE POST while
-/// its own fiber is still reading that SSE stream. With vibe.d's keep-alive
-/// connection pool the reply POST would block waiting for the in-flight request's
-/// connection to be released -- a deadlock that timed out the server after 60s.
+/// A tool that calls `ctx.sample`/`ctx.elicit` emits a server->client request on
+/// its POST's SSE stream and blocks in `StreamCoordinator.await`; the client must
+/// answer it on a separate POST while its own fiber is still reading that SSE
+/// stream. With vibe.d's keep-alive connection pool, the reply POST must not block
+/// waiting for the in-flight request's connection to be released.
 module mcp.transport.peer_roundtrip_test;
 
 version (unittest)
@@ -29,17 +25,15 @@ version (unittest)
 	import mcp.transport.streamable_http : mountMcp, StreamableHttpOptions;
 }
 
-// Round-trip: OUR server runs a tool that calls ctx.sample; OUR HTTP client
+// Round-trip: our server runs a tool that calls ctx.sample; our HTTP client
 // answers the sampling request via its onSampling handler. The whole call must
-// complete (no 60s coordinator timeout). Before the fix the client's reply POST
-// deadlocked on the keep-alive connection still held by the in-flight tool-call
-// SSE read, so the server's coord.await never resolved.
+// complete without a coordinator timeout, i.e. the client's reply POST must not
+// deadlock on the keep-alive connection held by the in-flight tool-call SSE read.
 unittest
 {
-	// A server->client request (ctx.sample) over HTTP requires a
-	// session, so this round-trip server is STATEFUL (a stateless server forbids
-	// it). OUR HTTP client captures + echoes Mcp-Session-Id, so the round trip
-	// works end to end.
+	// A server->client request (ctx.sample) over HTTP requires a session, so this
+	// round-trip server is stateful (a stateless server forbids it). Our HTTP
+	// client captures and echoes Mcp-Session-Id, so the round trip works end to end.
 	auto server = McpServer.stateful("peer-e2e", "1.0.0");
 
 	Tool tool;
@@ -119,7 +113,7 @@ unittest
 
 // Round-trip: a tool that calls ctx.elicit must be answered by the client's
 // onElicitation handler over HTTP (the elicitation counterpart of the sampling
-// test above; covers the elicitation half of #377 / example #355).
+// test above).
 unittest
 {
 	// ctx.elicit is a server->client request; over HTTP it requires
