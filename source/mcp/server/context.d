@@ -117,6 +117,44 @@ final class CancellationToken
 	}
 }
 
+/// An optional capability a `RequestContext` may implement to report the
+/// connection / session it arrived on. The server core scopes its per-connection
+/// state (the in-flight cancellation registry) by this token so that two
+/// concurrent clients sharing one `McpServer` over Streamable HTTP cannot collide
+/// on a bare JSON-RPC id (audit #13). A transport that multiplexes many sessions
+/// over one server SHOULD have its `RequestContext` implement this and return a
+/// per-session token (e.g. derived from `Mcp-Session-Id`, or a per-connection
+/// UUID), so a `notifications/cancelled` arriving on connection B only matches
+/// in-flight requests registered by connection B. A context that does not
+/// implement this interface is treated as the single shared connection (empty
+/// token), preserving the historic single-connection behaviour for stdio,
+/// in-process, and any transport that does not yet distinguish connections.
+///
+/// NOTE (#15/#16/#17 deployment model): the McpServer's remaining per-client
+/// state — the negotiated protocol version, the client capabilities, the logging
+/// level, and resource subscriptions — still lives in shared instance fields.
+/// Until the Streamable HTTP transport scopes those per `Mcp-Session-Id`, an
+/// McpServer shared across concurrent stateful-HTTP sessions can cross-talk; the
+/// supported deployment for stateful HTTP is therefore one McpServer per
+/// connection. This `ConnectionScoped` hook is the first step toward full
+/// per-session scoping and already isolates the cancellation registry (#13).
+interface ConnectionScoped
+{
+	/// A stable, non-empty identifier for this request's connection / session.
+	string connectionToken() @safe;
+}
+
+/// Resolve the connection token for a context: the context's own token when it
+/// implements `ConnectionScoped`, otherwise the empty (shared) token. Centralised
+/// here so the server core has one place to derive the cancellation-registry
+/// scope (#13).
+string connectionTokenOf(RequestContext ctx) @safe
+{
+	if (auto c = cast(ConnectionScoped) ctx)
+		return c.connectionToken();
+	return "";
+}
+
 /// Per-request context handed to tool handlers. It is the channel through which
 /// a handler emits server->client traffic while a request is in flight:
 /// progress + logging notifications, and (blocking) sampling / elicitation
@@ -569,7 +607,7 @@ final class StdioContext : RequestContext
 /// handlers observe correct `isStateless`/`inputResponses` and `elicit`/`sample`
 /// fail fast on stateless requests. Notifications and server->client requests
 /// delegate to the wrapped context unchanged.
-final class RequestScope : RequestContext
+final class RequestScope : RequestContext, ConnectionScoped
 {
 	private RequestContext inner;
 	private bool stateless;
@@ -603,6 +641,15 @@ final class RequestScope : RequestContext
 	ProtocolVersion effectiveVersion() @safe
 	{
 		return effectiveVersion_;
+	}
+
+	/// Delegate the connection token to the wrapped transport context (#13): the
+	/// `RequestScope` is a per-request decorator, so the connection identity is
+	/// whatever the underlying transport reported (empty when it is not
+	/// connection-scoped).
+	string connectionToken() @safe
+	{
+		return connectionTokenOf(inner);
 	}
 
 	/// True once the client has cancelled this request via
