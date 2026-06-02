@@ -1,4 +1,4 @@
-/// MCP Tools example server (#348) — dual-transport (stdio + Streamable HTTP).
+/// MCP Tools example server — dual-transport (stdio + Streamable HTTP).
 ///
 /// Demonstrates, from the server side, the `@tool` reflection surface of the D
 /// MCP SDK:
