@@ -1,25 +1,25 @@
 /**
  * examples/elicitation — server.d (dual-transport, typed APIs)
  *
- * Demonstrates the SERVER side of **2025-era blocking elicitation** (issue #355)
- * written in the ergonomic UDA style: the tool is an annotated typed method on a
- * class, registered in one call with `registerHandlers`.
+ * Demonstrates the SERVER side of blocking elicitation in the ergonomic UDA
+ * style: the tool is an annotated typed method on a class, registered in one
+ * call with `registerHandlers`.
  *
  * The `plan_trip` tool needs more information than its single `destination`
  * argument carries, so mid-handler it opens a server->client
- * `elicitation/create` request via the BLOCKING typed `ctx.elicit!TripDetails(message)`.
- * The call BLOCKS until the client's `onElicitation` handler answers; the SDK
- * delivers the answer back as a typed `ElicitResult` (issue #436). The handler
- * branches on the user's `action` (accept / decline / cancel) and returns a
- * structured result the client can assert against.
+ * `elicitation/create` request via the BLOCKING typed
+ * `ctx.elicit!TripDetails(message)`. The call BLOCKS until the client's
+ * `onElicitation` handler answers; the SDK delivers the answer back as a typed
+ * `ElicitResult`. The handler branches on the user's `action` (accept / decline
+ * / cancel) and returns a structured result the client can assert against.
  *
- * Typed-API adoption (closes the example half of #436/#437, plus #465):
+ * Typed-API usage:
  *   - the requestedSchema is DERIVED ENTIRELY from the flat struct `TripDetails`:
  *     the rich facets (integer bounds, field titles, the enum/boolean defaults)
- *     live as field UDAs (`@minimum`/`@maximum`/`@title`/`@schemaDefault`, #465)
- *     that `jsonSchemaOf!TripDetails` now emits, so the typed
- *     `ctx.elicit!TripDetails(message)` (#436) sends the whole SEP-1034/1330
- *     restricted schema with NO hand-built Json;
+ *     live as field UDAs (`@minimum`/`@maximum`/`@title`/`@schemaDefault`) that
+ *     `jsonSchemaOf!TripDetails` emits, so the typed
+ *     `ctx.elicit!TripDetails(message)` sends the whole SEP-1034/1330 restricted
+ *     schema with NO hand-built Json;
  *   - `ctx.elicit!T` returns a typed `ElicitResult`; on `accept` the collected
  *     values are decoded with `result.contentAs!TripDetails` instead of
  *     hand-reading the `content` Json;
@@ -27,13 +27,13 @@
  *     and emits `structuredContent`.
  *
  * Transport selection is delegated to the shared `examples/common` scaffold's
- * `runServerFromArgs` (#505): one binary, either transport —
+ * `runServerFromArgs`: one binary, either transport —
  *   stdio (default):  ./elicitation-server                       # JSON-RPC on stdio
  *   http:             ./elicitation-server --http --port 9355     # http://127.0.0.1:9355/mcp
  *
  * The blocking server->client elicitation completes over BOTH transports: stdio
- * answers the request inline on the same channel; the Streamable HTTP deadlock
- * was fixed in #377.
+ * answers the request inline on the same channel; over Streamable HTTP the reply
+ * rides the SSE channel.
  */
 module elicitation_server;
 
@@ -63,22 +63,11 @@ void main(string[] args) @safe
 
 	// The scaffold picks the transport from argv: `--http` (+ `--port`/`--host`)
 	// serves Streamable HTTP, otherwise stdio (the default). Over stdio a tool
-	// that calls ctx.elicit is answered inline on the same channel (#448/#449),
-	// so the blocking round-trip completes; over HTTP the reply rides the SSE
-	// channel (deadlock fixed in #377).
+	// that calls ctx.elicit is answered inline on the same channel, so the
+	// blocking round-trip completes; over HTTP the reply rides the SSE channel.
 	runServerFromArgs(server, args, defaultPort);
 }
 
-/// The flat elicitation form the server gathers from the client. Its scalar
-/// fields satisfy the elicitation schema restriction (SEP-1034/1330), and the
-/// rich facets the demo wants the client to see — field titles, the `travelers`
-/// integer bounds, and the `cabin`/`insurance` defaults — are declared inline as
-/// field UDAs (`@title`/`@minimum`/`@maximum`/`@schemaDefault`, #465). That lets
-/// `ctx.elicit!TripDetails(message)` derive the ENTIRE `requestedSchema` from
-/// this one struct (object type, the `required` set, the `cabin` enum members,
-/// and every facet) with no hand-built Json, and `result.contentAs!TripDetails`
-/// decodes the accepted answer. The D field initializers double as the values
-/// applied when the user omits an optional field.
 /// Cabin class — a D `enum`, so jsonSchemaOf derives the three enum members
 /// (["economy","premium","business"]) into the requestedSchema automatically.
 enum Cabin
@@ -88,6 +77,16 @@ enum Cabin
 	business,
 }
 
+/// The flat elicitation form the server gathers from the client. Its scalar
+/// fields satisfy the elicitation schema restriction (SEP-1034/1330), and the
+/// rich facets the client sees — field titles, the `travelers` integer bounds,
+/// and the `cabin`/`insurance` defaults — are declared inline as field UDAs
+/// (`@title`/`@minimum`/`@maximum`/`@schemaDefault`). That lets
+/// `ctx.elicit!TripDetails(message)` derive the ENTIRE `requestedSchema` from
+/// this one struct (object type, the `required` set, the `cabin` enum members,
+/// and every facet) with no hand-built Json, and `result.contentAs!TripDetails`
+/// decodes the accepted answer. The D field initializers double as the values
+/// applied when the user omits an optional field.
 struct TripDetails
 {
 	/// required: number of travelers, with display title + integer bounds.
@@ -133,8 +132,7 @@ final class TripApi
 		// wholesale from `TripDetails` (object type + required + the cabin enum
 		// members + the @title/@minimum/@maximum/@schemaDefault facets), so this is
 		// a single typed call with no hand-built Json. Returns once the client's
-		// onElicitation answers (the round-trip fixed for HTTP in #377, and
-		// inline-answered over stdio). Yields a typed `ElicitResult` (#436).
+		// onElicitation answers, yielding a typed `ElicitResult`.
 		ElicitResult result = ctx.elicit!TripDetails(
 				"Please provide trip details for " ~ destination);
 
