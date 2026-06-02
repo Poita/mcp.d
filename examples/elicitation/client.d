@@ -1,19 +1,19 @@
 /**
  * examples/elicitation — client.d (dual-transport, self-verifying e2e test)
  *
- * Exercises the **2025-era blocking elicitation** flow (issue #355) from the
- * consumer's eye view over BOTH transports the example supports. It is NOT just
- * a demo: every observation is asserted against the value the server promises,
- * and the process exits NON-ZERO on any mismatch, so CI can run it as an
- * end-to-end regression test on either transport.
+ * Exercises the blocking elicitation flow from the consumer's eye view over
+ * BOTH transports the example supports. It is NOT just a demo: every
+ * observation is asserted against the value the server promises, and the
+ * process exits NON-ZERO on any mismatch, so CI can run it as an end-to-end
+ * regression test on either transport.
  *
- * Transport selection + event-loop wiring are delegated to the shared
- * `examples/common` scaffold (#505):
+ * Transport selection and event-loop wiring are delegated to the shared
+ * `examples/common` scaffold:
  *   - `connectFromArgs(args, "elicitation-server")` picks the transport from
  *     argv: `--http <url>` -> `McpClient.http(url)`, otherwise
  *     `McpClient.spawnSibling("elicitation-server")` which launches the built
  *     server binary next to this client and owns its stdio JSON-RPC channel
- *     (`client.close()` runs the shutdown sequence, #470);
+ *     (`client.close()` runs the shutdown sequence);
  *   - `runClient(scenario)` drives the vibe event loop uniformly so the SAME
  *     scenario body completes over BOTH the synchronous stdio transport and the
  *     HTTP transport (whose blocking server->client elicitation rides the
@@ -25,20 +25,17 @@
  *   http:   dub run -c server -- --http --port 9355   (term 1)
  *           dub run -c client -- --http http://127.0.0.1:9355/mcp  (term 2)
  *
- * Typed-API adoption (#466 / #464 / #468 / #470):
+ * Typed API:
  *   - stdio spawns the server via the scaffold's `spawnSibling` +
- *     `scope(exit) close()`, replacing the hand-rolled ServerProcess /
- *     ProcessPipes plumbing (#470);
+ *     `scope(exit) close()`;
  *   - the `accept` handler returns `ElicitResult.accept(AcceptForm(3))` — the
- *     struct's fields become the collected `{name: value}` content map (#466) —
- *     instead of hand-building a Json object;
+ *     struct's fields become the collected `{name: value}` content map;
  *   - the `plan_trip` arguments are passed as the typed `PlanArgs(destination)`
- *     struct (#468), not a hand-built Json;
+ *     struct;
  *   - the structured result is decoded once with `result.structuredContentAs!
- *     TripPlan` (#464) and the assertions read its typed fields;
- *   - installing `onElicitation` alone advertises form elicitation — the inbound
- *     gate now honours effectiveCapabilities() (#463), so the redundant raw
- *     `client.capabilities.elicitation*` flag-setting is gone.
+ *     TripPlan` and the assertions read its typed fields;
+ *   - installing `onElicitation` alone advertises form elicitation; the inbound
+ *     gate honours effectiveCapabilities().
  *
  * What it verifies, in order, on whichever transport is selected:
  *   A. DISCOVERY — `listTools()` contains `plan_trip` (with `destination` as a
@@ -74,14 +71,14 @@ import examples_common : check, checkEq, runClient, connectFromArgs;
 import mcp.protocol.errors : McpException;
 import mcp.protocol.types : asNumber;
 
-/// Typed arguments for the `plan_trip` tool (#468): passed to `callTool` as a
-/// struct so the client never hand-builds the arguments Json.
+/// Typed arguments for the `plan_trip` tool: passed to `callTool` as a struct
+/// so the client never hand-builds the arguments Json.
 struct PlanArgs
 {
 	string destination;
 }
 
-/// The `accept` form the client submits (#466): only `travelers` is supplied, so
+/// The `accept` form the client submits: only `travelers` is supplied, so
 /// `ElicitResult.accept(AcceptForm(3))` produces the `{travelers: 3}` content
 /// map and the server applies its schema defaults for the omitted cabin +
 /// insurance fields.
@@ -91,8 +88,8 @@ struct AcceptForm
 }
 
 /// Mirrors the server's `TripPlan` structured output so the client can decode it
-/// with `result.structuredContentAs!TripPlan` (#464) and assert typed fields
-/// instead of hand-reading raw `structuredContent` Json.
+/// with `result.structuredContentAs!TripPlan` and assert typed fields instead of
+/// hand-reading raw `structuredContent` Json.
 struct TripPlan
 {
 	string status;
@@ -124,7 +121,7 @@ int main(string[] args) @safe
 /// The transport-agnostic e2e body. `makeClient` yields a fresh connected-but-
 /// not-yet-initialized client each call (a new spawned stdio subprocess or a new
 /// HTTP connection); every assertion is identical across transports. Each client
-/// is closed on scope exit so a spawned stdio server is reaped (#470).
+/// is closed on scope exit so a spawned stdio server is reaped.
 private int run(McpClient delegate() @safe makeClient) @safe
 {
 	// ---- A. DISCOVERY -----------------------------------------------------
@@ -159,14 +156,14 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		scope (exit)
 			client.close();
 		// Installing onElicitation alone advertises form elicitation; the inbound
-		// gate now honours effectiveCapabilities() (#463), so no raw capability
-		// flags are needed.
+		// gate honours effectiveCapabilities(), so no raw capability flags are
+		// needed.
 		client.onElicitation = (ElicitParams p) @safe {
 			seen = p;
 			sawElicit = true;
-			// Accept, supplying only `travelers` via the typed AcceptForm (#466);
-			// leave cabin + insurance to the server's schema defaults
-			// ("economy" / false).
+			// Accept, supplying only `travelers` via the typed AcceptForm; leave
+			// cabin + insurance to the server's schema defaults ("economy" /
+			// false).
 			return ElicitResult.accept(AcceptForm(3));
 		};
 		client.initialize();
@@ -197,7 +194,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		checkEq(sprops["insurance"]["default"].get!bool, false, "insurance default");
 
 		// The accepted value + applied defaults appear in the structured result,
-		// decoded once into the typed TripPlan (#464).
+		// decoded once into the typed TripPlan.
 		auto plan = r.structuredContentAs!TripPlan;
 		checkEq(plan.status, "booked", "accept status");
 		checkEq(plan.destination, "Kyoto", "destination");
