@@ -149,17 +149,14 @@ void mountMcp(URLRouter router, McpServer server,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
 	auto coord = new StreamCoordinator;
-	// Session minting is derived from the server's mode (#550): a `stateful`
+	// Session minting is derived from the server's mode: a `stateful`
 	// server mints/tracks an `Mcp-Session-Id`; a `stateless` server never does.
-	// There is no longer a separate `enableSessions` transport knob.
 	auto sessions = server.mode == ServerMode.stateful ? new SessionManager : null;
 
-	// STAGE-1 TRANSITIONAL SHIM (issue #550): this mount owns a single
-	// `ConnectionState`, which the server core threads through dispatch and reads
-	// back for the notify/push path. Binding it here (before any request is
-	// served) is byte-identical to the old single set of shared `McpServer`
-	// fields. Stage 2 replaces this with a per-`Mcp-Session-Id` lookup, so the
-	// notify/push and dispatch seams already in place do not move.
+	// This mount owns a single fallback `ConnectionState`, which the server core
+	// threads through dispatch and reads back for the notify/push path. It is the
+	// state used when a request carries none; stateful HTTP requests instead
+	// resolve their own per-`Mcp-Session-Id` state.
 	server.bindConnection(new ConnectionState);
 
 	// basic/authorization §Authorization Server Location (RFC 9728): refuse to start
@@ -648,7 +645,7 @@ unittest  // 405 Allow header enumerates every supported method (RFC 9110 §10.2
 private void handleGet(McpServer server, ServerPushChannel push, SessionManager sessions,
 		uint reconnectDelayMs, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
-	// #550 Stage 3: the standalone GET SSE stream is an unsolicited server->client
+	// The standalone GET SSE stream is an unsolicited server->client
 	// push channel — shared state correlating more than one HTTP call. A stateless
 	// server keeps no such state, so it MUST answer 405 (no unsolicited push
 	// without a session) regardless of the negotiated version. Only a stateful
@@ -860,7 +857,7 @@ private final class HttpNotifyContext : RequestContext, ConnectionScoped
 	import std.typecons : Nullable;
 
 	private string token_;
-	// The session's ConnectionState (#550 Stage 2), so an inbound
+	// The session's ConnectionState, so an inbound
 	// `notifications/cancelled` on this connection flips the cancellation token in
 	// the SAME per-session in-flight registry the request side used. Null in
 	// stateless mode (no session, no cross-POST cancellation correlation).
@@ -1066,7 +1063,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// `notifications/cancelled` resolves to the SAME per-session in-flight key the
 		// request side (HttpStreamContext) used. Without this it would go through
 		// NullContext (token ""), never matching the now-scoped in-flight request.
-		// #550 Stage 2: carry the session's ConnectionState so a
+		// Carry the session's ConnectionState so a
 		// `notifications/cancelled` flips the cancellation token in the SAME
 		// per-session in-flight registry the request side used. Stateful only —
 		// stateless has no cross-POST correlation, so the state is null there.
@@ -1137,7 +1134,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			|| tryDraft(RequestMeta.fromParams(msg.params).protocolVersion);
 		if (opensListenStream(msg.method, isDraftReq))
 		{
-			// #550: subscriptions/listen is a DRAFT RPC and the draft protocol is
+			// subscriptions/listen is a DRAFT RPC and the draft protocol is
 			// stateless-only, so it MUST work on a stateless server too. It is a single
 			// self-contained long-lived HTTP request: this POST opens the SSE response
 			// stream, and notify*/notifyResourceUpdated stream
@@ -1155,7 +1152,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// data field; basic/transports §Sending Messages item 6).
 		const effVersion = effectivePostVersion(req.headers.get(HttpHeader.protocolVersion,
 				""), server.negotiatedVersion);
-		// #550 Stage 2: resolve THIS request's per-connection state and hand it to
+		// Resolve THIS request's per-connection state and hand it to
 		// the context so the server core dispatches against it (never the single
 		// bound `activeConnection`). Stateful HTTP -> the SessionManager-owned state
 		// for this session id (the just-minted id on `initialize`, else the
@@ -1818,7 +1815,7 @@ private ProtocolVersion effectivePostVersion(string protoHeader, ProtocolVersion
 }
 
 /// Resolve the per-connection `ConnectionState` for a Streamable HTTP POST
-/// request (#550 Stage 2). Stateful HTTP returns the `SessionManager`-owned state
+/// request. Stateful HTTP returns the `SessionManager`-owned state
 /// for the request's session id — the just-minted id on `initialize`
 /// (`mintedSessionId`), otherwise the `Mcp-Session-Id` header (`connToken`).
 ///
@@ -1851,7 +1848,7 @@ private ConnectionState postState(McpServer server, SessionManager sessions,
 }
 
 /// The client capabilities a `HttpStreamContext` should advertise for a request,
-/// taken from the request's resolved `ConnectionState` (#550 Stage 2): the
+/// taken from the request's resolved `ConnectionState`: the
 /// session's negotiated caps (stateful) or the per-request `_meta` caps
 /// (modern-stateless draft), so `ctx.clientSupports` reflects THIS connection
 /// rather than a sibling's. Falls back to the server's bound view when no state
@@ -1864,8 +1861,7 @@ private ClientCapabilities clientCapsFor(McpServer server, ConnectionState reqSt
 }
 
 /// Build the FRESH per-request `ConnectionState` for a MODERN-stateless (draft /
-/// MRTR) HTTP POST, or return `null` for a pre-draft stateless request (#550
-/// Stage 2).
+/// MRTR) HTTP POST, or return `null` for a pre-draft stateless request.
 ///
 /// Only the draft (stateless) protocol is fully self-describing — every request
 /// carries its own protocol version, capabilities, and log level in `_meta`, with
@@ -1903,7 +1899,7 @@ private ConnectionState freshStatelessState(string protoHeader, Json params,
 	return conn;
 }
 
-unittest  // #550 Stage 2: a pre-draft stateless request defers to activeConnection (null)
+unittest  // a pre-draft stateless request defers to activeConnection (null)
 {
 	import vibe.data.json : Json;
 
@@ -1915,7 +1911,7 @@ unittest  // #550 Stage 2: a pre-draft stateless request defers to activeConnect
 	assert(freshStatelessState("", Json.emptyObject, ProtocolVersion.v2025_11_25) is null);
 }
 
-unittest  // #550 Stage 2: a modern (draft/MRTR) stateless request gets a FRESH state from _meta
+unittest  // a modern (draft/MRTR) stateless request gets a FRESH state from _meta
 {
 	import vibe.data.json : parseJsonString;
 	import mcp.protocol.draft : MetaKey;
@@ -1932,7 +1928,7 @@ unittest  // #550 Stage 2: a modern (draft/MRTR) stateless request gets a FRESH 
 	assert(conn.logLevel == "warning");
 }
 
-unittest  // #550 Stage 2: two modern-stateless requests resolve to INDEPENDENT states
+unittest  // two modern-stateless requests resolve to INDEPENDENT states
 {
 	import vibe.data.json : parseJsonString;
 

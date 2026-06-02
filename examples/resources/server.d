@@ -121,7 +121,7 @@ final class ResourcesApi
 
 void main(string[] args) @safe
 {
-	// #550 Stage 3: this example stays STATELESS (the default) because its client
+	// This example is STATELESS (the default) because its client
 	// speaks the draft (inline resources/read cache hints + the draft
 	// subscriptions/listen push mechanism), and a stateful server excludes the
 	// draft from negotiation. Its push flow (subscriptions/listen + push

@@ -1158,7 +1158,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// cancellation is unscoped (documented on the transport).
 	private string token_;
 	// The per-session (stateful) / per-request (stateless) ConnectionState this
-	// request is bound to (#550 Stage 2). The transport resolves it — looked up by
+	// request is bound to. The transport resolves it — looked up by
 	// `Mcp-Session-Id` for stateful, freshly built per request for stateless — and
 	// hands it here so the server core dispatches against THIS request's state
 	// rather than the single bound `activeConnection`. Null when the transport did
@@ -1186,7 +1186,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// cancellation of that request"). Defaults to the live HTTP connection state;
 	// overridable via `setConnectionProbe` so tests can simulate a disconnect.
 	private bool delegate() @safe connAlive_;
-	// #550 Stage 3: when true, this context belongs to a `stateless` server over
+	// When true, this context belongs to a `stateless` server over
 	// the HTTP transport, so server->client requests (elicitation / sampling /
 	// roots / any `sendRequest`) are STRUCTURALLY FORBIDDEN. They would have to
 	// ride the mount-global `StreamCoordinator`/GET-push channel, which correlates
@@ -1228,7 +1228,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	}
 
 	/// The per-session/per-request `ConnectionState` the transport resolved for
-	/// this request (#550 Stage 2): the `SessionManager`-owned state for stateful
+	/// this request: the `SessionManager`-owned state for stateful
 	/// HTTP, or the fresh transient state for stateless HTTP. Null when none was
 	/// supplied, in which case the server core falls back to `activeConnection`.
 	ConnectionState connectionState() @safe
@@ -1356,7 +1356,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 
 	Json sendRequest(string method, Json params) @safe
 	{
-		// #550 Stage 3: a stateless server has NO shared state across HTTP calls.
+		// A stateless server has NO shared state across HTTP calls.
 		// A server->client request (elicitation / sampling / roots / any
 		// sendRequest) would block on the mount-global StreamCoordinator and ride
 		// the GET-push channel — both shared across HTTP calls — so it is
@@ -2055,7 +2055,7 @@ unittest  // #3/#22: a cancellation scoped to session B must not suppress sessio
 	assert(!resp.isNull);
 }
 
-unittest  // #550 Stage 3: a stateless HttpStreamContext FORBIDS server->client requests
+unittest  // a stateless HttpStreamContext FORBIDS server->client requests
 {
 	// A stateless server keeps no shared state across HTTP calls, so a handler
 	// calling ctx.elicit/ctx.sample (any sendRequest) over the HTTP transport must
@@ -2109,7 +2109,7 @@ unittest  // #550 Stage 3: a stateless HttpStreamContext FORBIDS server->client 
 	assert(resp.get["result"]["isError"].get!bool);
 }
 
-unittest  // #550 Stage 3: a stateful HttpStreamContext does NOT gate sendRequest
+unittest  // a stateful HttpStreamContext does NOT gate sendRequest
 {
 	// The counterpart to the stateless gate: a stateful server (serverStateless =
 	// false) leaves sendRequest enabled, so the elicit reaches the coordinator and

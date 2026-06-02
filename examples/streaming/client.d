@@ -166,7 +166,7 @@ private int run(string[] args, bool useHttp, string httpUrl) @safe
 	client.setLogLevel("debug");
 
 	const int progressSeen = phaseListProgressLogging(client, steps);
-	// #550 Stage 3: typed elicit+sample are server->client requests. They run only
+	// Typed elicit+sample are server->client requests. They run only
 	// over STDIO (a single implicit connection — server->client is allowed in any
 	// mode). The streaming server is STATELESS (its HTTP phase D needs the draft
 	// transport, which a stateful server cannot serve), and a stateless server

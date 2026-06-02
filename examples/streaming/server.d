@@ -66,7 +66,7 @@ import examples_common : runServerFromArgs;
 
 void main(string[] args) @safe
 {
-	// #550 Stage 3: this example stays STATELESS (the default). Its HTTP path
+	// This example is STATELESS (the default). Its HTTP path
 	// exercises the draft transport (phase D: client-disconnect cancellation, a
 	// draft-only feature) which a stateful server cannot serve — the draft is
 	// excluded from stateful negotiation. The `summarize` tool's ctx.elicit +

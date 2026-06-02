@@ -124,7 +124,7 @@ is exactly one `ConnectionState` per session, owned by the transport's
 `SessionManager`. In **stateless** mode the transport builds a transient
 `ConnectionState` per request and discards it, so two concurrent peers sharing one
 `McpServer` cannot leak version, capability, subscription, or cancellation state
-into one another (issue #550).
+into one another.
 
 Because a stateless server keeps nothing across HTTP calls, **anything that
 correlates more than one HTTP call is forbidden over HTTP in stateless mode and

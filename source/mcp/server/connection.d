@@ -8,9 +8,9 @@ import mcp.server.context : CancellationToken;
 
 /// The per-connection (or per-session) mutable state for a single MCP peer.
 ///
-/// This is the designated home for everything that used to live as a mutable
-/// field on `McpServer` and would otherwise leak across concurrently-served
-/// connections that share one server instance (issue #550). A `McpServer`
+/// This is the designated home for the mutable per-peer state that would
+/// otherwise leak across concurrently-served connections that share one server
+/// instance. A `McpServer`
 /// itself holds only immutable registration data, declared capabilities, the
 /// `serverInfo`, and the chosen `ServerMode`; per-peer state lives here.
 ///
@@ -28,7 +28,7 @@ final class ConnectionState
 	/// effective version for the current request (stateless). This is the single
 	/// version concept: the server->client push/notification path is driven by
 	/// each open listener's own `SubscriptionFilter`, not by a separate
-	/// connection-level version (see #550 — `subscriptions/listen` is an ordinary
+	/// connection-level version (`subscriptions/listen` is an ordinary
 	/// request and is not special-cased).
 	ProtocolVersion negotiated = latestStable;
 
@@ -44,8 +44,8 @@ final class ConnectionState
 	/// The resource URIs this connection has subscribed to (stateful only).
 	bool[string] subscriptions;
 
-	/// In-flight cancellation tokens keyed by this connection's request ids
-	/// (folds issue #13). Scoping the registry to the `ConnectionState` keeps a
+	/// In-flight cancellation tokens keyed by this connection's request ids.
+	/// Scoping the registry to the `ConnectionState` keeps a
 	/// cancellation for one session's request id from touching another session's
 	/// identically-numbered request.
 	CancellationToken[string] inFlight;
@@ -54,7 +54,7 @@ final class ConnectionState
 	bool initialized;
 }
 
-unittest  // #550: two ConnectionStates do not share negotiated version or caps
+unittest  // two ConnectionStates do not share negotiated version or caps
 {
 	import mcp.protocol.versions : ProtocolVersion;
 
@@ -72,7 +72,7 @@ unittest  // #550: two ConnectionStates do not share negotiated version or caps
 	assert(!b.clientCaps.roots, "session B must not see session A's caps");
 }
 
-unittest  // #550: cancellation registries are per-connection (folds #13)
+unittest  // cancellation registries are per-connection
 {
 	auto a = new ConnectionState;
 	auto b = new ConnectionState;
@@ -88,7 +88,7 @@ unittest  // #550: cancellation registries are per-connection (folds #13)
 	assert(!tokB.cancelled, "cross-talk: B's in-flight was cancelled by A");
 }
 
-unittest  // #550: subscriptions are per-connection
+unittest  // subscriptions are per-connection
 {
 	auto a = new ConnectionState;
 	auto b = new ConnectionState;

@@ -144,8 +144,8 @@ interface ConnectionScoped
 	/// A stable, non-empty identifier for this request's connection / session.
 	string connectionToken() @safe;
 
-	/// The per-connection / per-session `ConnectionState` this request is bound to
-	/// (#550 Stage 2). A transport that scopes state per peer returns the state it
+	/// The per-connection / per-session `ConnectionState` this request is bound to.
+	/// A transport that scopes state per peer returns the state it
 	/// resolved for THIS request: the `SessionManager`-owned state looked up by
 	/// `Mcp-Session-Id` (stateful HTTP), or a fresh per-request state built from the
 	/// request's effective version + `_meta` (stateless HTTP). Returns `null` when
@@ -169,7 +169,7 @@ string connectionTokenOf(RequestContext ctx) @safe
 /// it implements `ConnectionScoped` and resolved one, otherwise `null`.
 /// Centralised here (mirroring `connectionTokenOf`) so the server core has one
 /// place to decide per-session/per-request state vs. the single bound
-/// `activeConnection` fallback (#550 Stage 2). A `null` result means "this
+/// `activeConnection` fallback. A `null` result means "this
 /// context carries no scoped state" — the dispatcher then uses
 /// `activeConnection`.
 ConnectionState connectionStateOf(RequestContext ctx) @safe
@@ -677,7 +677,7 @@ final class RequestScope : RequestContext, ConnectionScoped
 	}
 
 	/// Delegate the per-session/per-request `ConnectionState` to the wrapped
-	/// transport context (#550 Stage 2): the `RequestScope` is a per-request
+	/// transport context: the `RequestScope` is a per-request
 	/// decorator, so the scoped state is whatever the underlying transport
 	/// resolved for this request (null when the transport carries none, e.g. stdio
 	/// / in-process, where the server falls back to its single `activeConnection`).

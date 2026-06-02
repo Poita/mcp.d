@@ -88,7 +88,7 @@ int main(string[] args) @safe
 
 int run(string[] args) @safe
 {
-	// #550: the push phase (subscriptions/listen + notifications/resources/updated)
+	// The push phase (subscriptions/listen + notifications/resources/updated)
 	// runs over BOTH transports. subscriptions/listen is a DRAFT RPC and the draft is
 	// stateless-only, so it works on this STATELESS server: the POST opens one
 	// long-lived SSE stream and set_note -> notifyResourceUpdated streams
@@ -165,7 +165,7 @@ int run(string[] args) @safe
 	check(threw, "unknown resource read did not raise an error");
 
 	// (7) subscribe via subscriptions/listen + observe push notifications.
-	// #550: this runs over BOTH transports. subscriptions/listen opens a single
+	// This runs over BOTH transports. subscriptions/listen opens a single
 	// self-contained long-lived stream; set_note -> notifyResourceUpdated streams
 	// resources/updated (subscribed URI) + resources/list_changed (new resource) down
 	// THAT stream — in-process on this stateless server, no second correlated call.

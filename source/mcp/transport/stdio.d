@@ -51,12 +51,11 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	import mcp.protocol.jsonrpc : Message, MessageKind;
 	import mcp.server.connection : ConnectionState;
 
-	// STAGE-1 TRANSITIONAL SHIM (issue #550): stdio is single-connection (one
-	// implicit peer per process), so this transport owns exactly one
-	// `ConnectionState`, which the server core threads through dispatch and reads
-	// back for the notify path. Binding it here (before the read loop starts) is
-	// byte-identical to the old single set of shared `McpServer` fields; Stage 2
-	// keeps this single state for stdio while HTTP gains per-session lookup.
+	// stdio is single-connection (one implicit peer per process), so this
+	// transport owns exactly one `ConnectionState`, which the server core threads
+	// through dispatch and reads back for the notify path. Binding it here (before
+	// the read loop starts) makes it the state for every request on this process;
+	// HTTP instead resolves per-session state per request.
 	server.bindConnection(new ConnectionState);
 
 	DuplexChannel channel;

@@ -36,7 +36,7 @@ version (unittest)
 // SSE read, so the server's coord.await never resolved.
 unittest
 {
-	// #550 Stage 3: a server->client request (ctx.sample) over HTTP requires a
+	// A server->client request (ctx.sample) over HTTP requires a
 	// session, so this round-trip server is STATEFUL (a stateless server forbids
 	// it). OUR HTTP client captures + echoes Mcp-Session-Id, so the round trip
 	// works end to end.
@@ -122,7 +122,7 @@ unittest
 // test above; covers the elicitation half of #377 / example #355).
 unittest
 {
-	// #550 Stage 3: ctx.elicit is a server->client request; over HTTP it requires
+	// ctx.elicit is a server->client request; over HTTP it requires
 	// a session, so this round-trip server is STATEFUL (see the sampling test above).
 	auto server = McpServer.stateful("peer-e2e-elicit", "1.0.0");
 

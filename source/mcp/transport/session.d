@@ -23,9 +23,9 @@ import mcp.server.connection : ConnectionState;
 /// locking.
 final class SessionManager
 {
-	// Stage 2 (#550): the manager now OWNS one `ConnectionState` per active
+	// The manager OWNS one `ConnectionState` per active
 	// session, keyed by `Mcp-Session-Id`. Presence in this map is the liveness
-	// signal (replacing the former `bool[string]`): an entry means the session is
+	// signal: an entry means the session is
 	// active, its absence means unknown/terminated. Storing the per-session state
 	// here is what makes stateful HTTP truly session-isolated — the request path
 	// resolves a request's `ConnectionState` by its session id, so one session's
@@ -68,7 +68,7 @@ final class SessionManager
 	/// The `ConnectionState` this manager owns for the active session `id`, or
 	/// `null` when the id is empty, unknown, or already terminated. The request
 	/// path puts this on the request context so dispatch reads/writes only this
-	/// session's per-connection state (#550).
+	/// session's per-connection state.
 	ConnectionState stateFor(string id) @safe
 	{
 		if (id.length == 0)
@@ -91,7 +91,7 @@ final class SessionManager
 	}
 }
 
-unittest  // #550: a created session owns a non-null ConnectionState
+unittest  // a created session owns a non-null ConnectionState
 {
 	auto mgr = new SessionManager;
 	const id = mgr.create();
@@ -101,7 +101,7 @@ unittest  // #550: a created session owns a non-null ConnectionState
 	assert(mgr.stateFor("") is null);
 }
 
-unittest  // #550: two sessions on one manager get INDEPENDENT ConnectionStates (no cross-talk)
+unittest  // two sessions on one manager get INDEPENDENT ConnectionStates (no cross-talk)
 {
 	import mcp.protocol.versions : ProtocolVersion;
 	import mcp.server.context : CancellationToken;
@@ -127,7 +127,7 @@ unittest  // #550: two sessions on one manager get INDEPENDENT ConnectionStates 
 	assert(("i:1" in csB.inFlight) is null, "session B saw session A's in-flight id");
 }
 
-unittest  // #550: terminating a session drops its ConnectionState
+unittest  // terminating a session drops its ConnectionState
 {
 	auto mgr = new SessionManager;
 	const id = mgr.create();

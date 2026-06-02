@@ -26,7 +26,7 @@ void main(string[] args)
 	getopt(args, "port|p", "Port to listen on (default 3000)", &port,
 			"host|h", "Address to bind (default 127.0.0.1)", &host);
 
-	// #550 Stage 3: the conformance harness is a correlated multi-call client that
+	// The conformance harness is a correlated multi-call client that
 	// exercises subscribe + elicitation + sampling and echoes Mcp-Session-Id, so
 	// the conformance server runs in STATEFUL mode (those features require it).
 	auto server = McpServer.stateful("dlang-mcp-conformance", "0.1.0",
