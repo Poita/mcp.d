@@ -350,8 +350,8 @@ final class LegacySseChannel
 		const frame = formatLegacyMessageEventRaw(jsonText);
 		long[] dead;
 		// Iterate a snapshot so a self-healing removal (or any concurrent listener
-		// mutation across the async `l.write`) cannot dangle the loop reference
-		// (audit finding #75). The dup is a shallow copy of the small Listener[].
+		// mutation across the async `l.write`) cannot dangle the loop reference.
+		// The dup is a shallow copy of the small Listener[].
 		foreach (l; listeners.dup)
 		{
 			try
@@ -377,13 +377,13 @@ private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @
 	applySseStreamHeaders(res, false);
 
 	// Serialize every write to THIS response's bodyWriter through one per-stream
-	// TaskMutex (audit finding #9, mirroring handleGet/handleListenStream): the
-	// registered-listener writer (driven by LegacySseChannel.deliver) and the
-	// heartbeat loop share this connection, and LegacySseChannel.deliver itself has
-	// no write serialization, so without this lock two concurrent deliveries -- or a
-	// delivery racing the heartbeat -- could interleave the bytes of different SSE
-	// frames. A channel-level mutex would not help, since it cannot serialize against
-	// this foreign heartbeat writer; the serialization must live here.
+	// TaskMutex (mirroring handleGet/handleListenStream): the registered-listener
+	// writer (driven by LegacySseChannel.deliver) and the heartbeat loop share this
+	// connection, and LegacySseChannel.deliver itself has no write serialization, so
+	// without this lock two concurrent deliveries -- or a delivery racing the
+	// heartbeat -- could interleave the bytes of different SSE frames. A
+	// channel-level mutex would not help, since it cannot serialize against this
+	// foreign heartbeat writer; the serialization must live here.
 	auto writeMtx = new TaskMutex;
 	void writeFrame(string frame) @safe
 	{
@@ -697,8 +697,8 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// TaskMutex (mirroring duplex.d): the push-channel listener callback, the
 	// up-front retry: event, and the heartbeat loop all share this connection, and
 	// without the lock two fibers could interleave the bytes of different SSE
-	// frames (audit finding #28). The channel's own mutex guards only its state,
-	// not a foreign heartbeat writer, so the serialization must live here.
+	// frames. The channel's own mutex guards only its state, not a foreign
+	// heartbeat writer, so the serialization must live here.
 	import vibe.core.sync : TaskMutex;
 
 	auto writeMtx = new TaskMutex;
@@ -795,7 +795,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	// TaskMutex: the push-channel listener callback (the leading ack and every
 	// subsequent notification) and the heartbeat loop share this connection, so
 	// without the lock two fibers could interleave the bytes of different SSE
-	// frames (audit finding #28).
+	// frames.
 	import vibe.core.sync : TaskMutex;
 
 	auto writeMtx = new TaskMutex;
@@ -847,7 +847,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 
 /// A minimal connection-scoped `RequestContext` used only to dispatch an inbound
 /// notification (notably `notifications/cancelled`) on the Streamable HTTP
-/// transport while carrying the request's per-connection token (#22 item 2). It
+/// transport while carrying the request's per-connection token. It
 /// has no server->client channel: the cancellation path only reads the
 /// connection token to scope the in-flight cancellation key, and never emits
 /// progress/logging or server-initiated requests. Mirrors the no-op behaviour of
@@ -967,7 +967,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		}
 	}
 
-	// Per-connection cancellation scope (#3/#13/#22). A request and its later
+	// Per-connection cancellation scope. A request and its later
 	// `notifications/cancelled` arrive on SEPARATE POSTs that share only the
 	// `Mcp-Session-Id` header, so the cancellation registry must be keyed by that
 	// session id for the two to match. The token is therefore the session id when
@@ -1059,10 +1059,10 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			res.writeBody(makeErrorResponse(Json(null), noteErr).toString(), "application/json");
 			return;
 		}
-		// #22 item 2: route the notification through a connection-scoped context so a
+		// Route the notification through a connection-scoped context so a
 		// `notifications/cancelled` resolves to the SAME per-session in-flight key the
-		// request side (HttpStreamContext) used. Without this it would go through
-		// NullContext (token ""), never matching the now-scoped in-flight request.
+		// request side (HttpStreamContext) uses. Without this it would go through
+		// NullContext (token ""), never matching the scoped in-flight request.
 		// Carry the session's ConnectionState so a
 		// `notifications/cancelled` flips the cancellation token in the SAME
 		// per-session in-flight registry the request side used. Stateful only —
@@ -1076,7 +1076,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 	case MessageKind.request:
 		// Session Management: assign a session id on the InitializeResult so the
 		// client can echo it on subsequent requests. Set before writing the body.
-		// `sessions.create()` is fail-closed (audit finding #8): it throws
+		// `sessions.create()` is fail-closed: it throws
 		// McpException when the OS CSPRNG is unavailable. Map that to a JSON-RPC
 		// error response on HTTP 500 -- the same shape as every other error path in
 		// handlePost -- instead of letting it escape to vibe's generic error page.
@@ -1227,8 +1227,7 @@ unittest  // the standalone GET SSE stream uses the same session gate as POST/DE
 	// enabled the transport MUST gate it via sessionStatus — opening the 200
 	// text/event-stream only for an active id, answering 400 when the header is
 	// absent and 404 for an unknown/terminated session (mirroring the POST and
-	// DELETE branches). Before the fix, handleGet took no SessionManager and so
-	// always returned 200 regardless of the id.
+	// DELETE branches).
 	auto mgr = new SessionManager;
 	const id = mgr.create();
 	// absent header -> 400 (SHOULD): do not open the stream
@@ -1566,9 +1565,9 @@ unittest  // legacy support is opt-in: off by default
 	assert(opts.legacyMessagePath == "/message");
 }
 
-unittest  // #9: legacy GET write serialization keeps concurrent SSE frames non-interleaved
+unittest  // legacy GET write serialization keeps concurrent SSE frames non-interleaved
 {
-	// audit finding #9: LegacySseChannel.deliver has no write serialization, so two
+	// LegacySseChannel.deliver has no write serialization, so two
 	// concurrent deliveries to one legacy listener could interleave SSE frame bytes
 	// when the underlying socket write yields. handleLegacyGet routes every write --
 	// the listener writer AND the heartbeat -- through one per-stream TaskMutex
@@ -1624,7 +1623,7 @@ unittest  // #9: legacy GET write serialization keeps concurrent SSE frames non-
 
 	// Each frame's head and tail are adjacent (no foreign bytes between them):
 	// the only valid serializations are "[AA][BB]" or "[BB][AA]".
-	assert(log == "[AA][BB]" || log == "[BB][AA]", "legacy SSE frames interleaved (#9): " ~ log);
+	assert(log == "[AA][BB]" || log == "[BB][AA]", "legacy SSE frames interleaved: " ~ log);
 }
 
 unittest  // localhost hosts are accepted, foreign hosts rejected
@@ -1783,8 +1782,7 @@ unittest  // the version gate applies to EVERY POST kind, not just requests
 	// basic/transports §Protocol Version Header (2025-06-18 / 2025-11-25): a
 	// POST carrying an invalid/unsupported MCP-Protocol-Version MUST be rejected
 	// with 400 regardless of whether the body is a request, notification, or
-	// response. Previously the gate ran only on the request branch, so a
-	// notification/response POST with a bad header was wrongly accepted (202).
+	// response.
 	auto bad = postProtocolVersionGate("1.0.0");
 	assert(bad !is null, "bad header must be rejected for all POST kinds");
 	assert(bad.code == ErrorCode.unsupportedProtocolVersion);
@@ -1991,9 +1989,9 @@ unittest  // effective version: absent/unparseable header falls back to negotiat
 
 unittest  // a batch on a modern version is rejected with an invalidRequest 400
 {
-	// The transport must surface a -32600 invalidRequest on HTTP 400 (not the
-	// old "errors-ride-on-200" handleRaw path) when an array body arrives on a
-	// version that forbids batching.
+	// The transport must surface a -32600 invalidRequest on HTTP 400 (not an
+	// error riding on HTTP 200) when an array body arrives on a version that
+	// forbids batching.
 	auto v = effectivePostVersion("2025-11-25", ProtocolVersion.v2025_11_25);
 	assert(!streamableBatchAllowed(v));
 	auto e = invalidRequest(
