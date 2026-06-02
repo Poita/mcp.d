@@ -7,6 +7,11 @@ import mcp.transport.duplex : DuplexChannel, defaultMaxLineBytes;
 
 @safe:
 
+// Module-level guard enforcing runStdio's documented "at most once per process"
+// invariant independent of eventcore fd/refcount state (covers both a concurrent
+// and a sequential second call).
+private __gshared bool _ranStdio;
+
 /// Drive an `McpServer` over a newline-delimited JSON-RPC channel using the
 /// shared full-duplex `DuplexChannel`.
 ///
@@ -151,14 +156,17 @@ private Json parseToJson(string line) @safe
 /// stdio transport, only valid MCP messages are written to stdout; use stderr for
 /// logging. Blocks until stdin reaches end-of-file.
 ///
-/// `runStdio` takes EXCLUSIVE ownership of file descriptors 0 (stdin) and 1
-/// (stdout) for the duration of the call and MUST be called at most once per
-/// process: it adopts them as vibe-async pipes (which sets `O_NONBLOCK` on the
-/// underlying open file description), and on return it releases the adopted pipe
-/// handles and restores the original descriptor flags so a caller that keeps
-/// running after `runStdio` returns does not inherit a non-blocking,
-/// already-adopted stdin/stdout. A second concurrent call would find fd 0/1
-/// already adopted and throws.
+/// `runStdio` drives the process's standard input/output and MUST be called at
+/// most once per process (enforced by an explicit module-level guard that throws
+/// on any second call, concurrent or sequential). Rather than adopting fd 0/1
+/// directly -- which would let `releaseRef` `close()` the process's real
+/// stdin/stdout, and which sets `O_NONBLOCK` on their shared open file
+/// description -- it `dup()`s fd 0/1 first and adopts the dups. On return the
+/// saved descriptor flags are restored on fd 0/1 (clearing the O_NONBLOCK that
+/// `adopt` set on the dup's shared open file description) and only then are the
+/// adopted dups released (their fds closed). fd 0/1 themselves are never adopted
+/// and never closed, so a caller that keeps running after `runStdio` returns
+/// inherits an open, blocking stdin/stdout.
 ///
 /// stdin (fd 0) and stdout (fd 1) are adopted as vibe-async pipes
 /// (`eventDriver.pipes.adopt`, the same mechanism `vibe.core.process` uses for a
@@ -177,36 +185,80 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 	import eventcore.core : eventDriver;
 	import eventcore.driver : IOMode, IOStatus, PipeFD, PipeIOCallback;
 	import vibe.internal.async : asyncAwaitUninterruptible;
+	import core.sys.posix.unistd : dup, close;
 	import core.sys.posix.fcntl : fcntl, F_GETFL, F_SETFL;
 
-	// Save the original descriptor flags so the O_NONBLOCK that `adopt` sets on the
-	// shared open file description can be restored on return (fd 0/1 may be a
-	// terminal or a pipe shared with other processes — leaking O_NONBLOCK there
+	// Enforce the documented "at most once per process" invariant explicitly, so it
+	// holds for both a concurrent second call and a sequential one and does not
+	// depend on eventcore's adopt()/refCount side effects.
+	synchronized
+	{
+		if (()@trusted { return _ranStdio; }())
+			throw new Exception("runStdio: must be called at most once per process");
+		() @trusted { _ranStdio = true; }();
+	}
+
+	// Adopt dup()'d copies of fd 0/1 rather than fd 0/1 themselves. `releaseRef`
+	// close()s the adopted fd on return; by adopting dups we close only the dups,
+	// leaving the process's real stdin/stdout OPEN for any code that runs after
+	// (the primary fix -- adopting fd 0/1 directly would close the real stdin/stdout).
+	const in2 = () @trusted { return dup(0); }();
+	const out2 = () @trusted { return dup(1); }();
+	if (in2 == -1 || out2 == -1)
+	{
+		() @trusted {
+			if (in2 != -1)
+				close(in2);
+			if (out2 != -1)
+				close(out2);
+		}();
+		throw new Exception("runStdio: dup(stdin/stdout) failed");
+	}
+
+	// A dup shares its open file description (and thus its O_NONBLOCK bit) with the
+	// original fd, so the O_NONBLOCK that `adopt` sets is visible on fd 0/1 too. Save
+	// the original flags now and restore them BEFORE releasing so fd 0/1 are not left
+	// non-blocking for code that keeps running after runStdio returns (fd 0/1 may be a
+	// terminal or a pipe shared with other processes -- leaking O_NONBLOCK there
 	// breaks blocking readers/writers elsewhere).
 	const inFlags = () @trusted { return fcntl(0, F_GETFL); }();
 	const outFlags = () @trusted { return fcntl(1, F_GETFL); }();
 
-	auto inFD = () @trusted { return eventDriver.pipes.adopt(0); }();
-	auto outFD = () @trusted { return eventDriver.pipes.adopt(1); }();
+	auto inFD = () @trusted { return eventDriver.pipes.adopt(in2); }();
+	auto outFD = () @trusted { return eventDriver.pipes.adopt(out2); }();
 
-	// Fail fast: a second call (or a process whose fd 0/1 were already adopted)
-	// would otherwise silently operate on invalid handles and never read/write.
+	// Fail fast: if adopt rejected a dup (returned an invalid handle), close the
+	// dups we still own and bail rather than silently operating on invalid handles.
 	if (!()@trusted { return eventDriver.pipes.isValid(inFD); }() || !()@trusted {
 			return eventDriver.pipes.isValid(outFD);
 		}())
-		throw new Exception("runStdio: stdin/stdout already adopted; runStdio must be called at most once per process");
+	{
+		() @trusted {
+			if (eventDriver.pipes.isValid(inFD))
+				eventDriver.pipes.releaseRef(inFD);
+			else
+				close(in2);
+			if (eventDriver.pipes.isValid(outFD))
+				eventDriver.pipes.releaseRef(outFD);
+			else
+				close(out2);
+		}();
+		throw new Exception("runStdio: failed to adopt stdin/stdout dups");
+	}
 
-	// Release the adopted handles and restore the saved descriptor flags on return
-	// so fd 0/1 are not left non-blocking (or leaked) for code that runs after.
+	// On return restore the saved flags on fd 0/1 FIRST (clearing the O_NONBLOCK that
+	// adopt set on the shared open file description), THEN release the adopted dups
+	// (which close()s the dup'd fds, never the real fd 0/1). Order matters: restoring
+	// before release operates on still-valid descriptors.
 	scope (exit)
 	{
 		() @trusted {
-			eventDriver.pipes.releaseRef(inFD);
-			eventDriver.pipes.releaseRef(outFD);
 			if (inFlags != -1)
 				fcntl(0, F_SETFL, inFlags);
 			if (outFlags != -1)
 				fcntl(1, F_SETFL, outFlags);
+			eventDriver.pipes.releaseRef(inFD);
+			eventDriver.pipes.releaseRef(outFD);
 		}();
 	}
 
@@ -320,6 +372,72 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 		});
 		runEventLoop();
 	}();
+}
+
+unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with its O_NONBLOCK bit unchanged
+{
+	// Mirrors runStdio's fd lifecycle (#10): save the original flags, dup the fd,
+	// adopt the dup, then on teardown restore the saved flags BEFORE releaseRef.
+	// Because the dup -- not the original -- is what releaseRef close()s, the
+	// original fd must remain OPEN; and because a dup shares its open file
+	// description (and O_NONBLOCK bit) with the original, the restore-before-release
+	// must leave the original fd's O_NONBLOCK bit equal to its pre-adopt value.
+	import eventcore.core : eventDriver;
+	import core.sys.posix.unistd : dup, close, pipe;
+	import core.sys.posix.fcntl : fcntl, F_GETFL, F_SETFL, O_NONBLOCK;
+
+	int[2] fds;
+	assert(() @trusted { return pipe(fds); }() == 0, "pipe() failed");
+	const readEnd = fds[0];
+	const writeEnd = fds[1];
+	scope (exit)
+		() @trusted { close(readEnd); close(writeEnd); }();
+
+	const preFlags = () @trusted { return fcntl(readEnd, F_GETFL); }();
+	assert(preFlags != -1, "pre-adopt fcntl(F_GETFL) failed");
+	const preNonBlock = (preFlags & O_NONBLOCK) != 0;
+
+	// dup-then-adopt, exactly as runStdio does for fd 0/1.
+	const dupFd = () @trusted { return dup(readEnd); }();
+	assert(dupFd != -1, "dup() failed");
+	auto handle = () @trusted { return eventDriver.pipes.adopt(dupFd); }();
+	assert(() @trusted { return eventDriver.pipes.isValid(handle); }(),
+			"adopt() of the dup should yield a valid handle");
+	// Restore the saved flags on the original fd FIRST (clearing the O_NONBLOCK that
+	// adopt set on the shared open file description), THEN release the adopted dup.
+	() @trusted {
+		if (preFlags != -1)
+			fcntl(readEnd, F_SETFL, preFlags);
+		eventDriver.pipes.releaseRef(handle);
+	}();
+
+	// The original fd is still open (releaseRef closed only the dup).
+	const postFlags = () @trusted { return fcntl(readEnd, F_GETFL); }();
+	assert(postFlags != -1, "original fd was closed by the adopt/releaseRef cycle");
+	// And its O_NONBLOCK bit equals the pre-adopt value (restore cleared the leak).
+	const postNonBlock = (postFlags & O_NONBLOCK) != 0;
+	assert(postNonBlock == preNonBlock,
+			"original fd's O_NONBLOCK bit changed across the adopt/releaseRef cycle");
+}
+
+unittest  // runStdio enforces its "at most once per process" invariant via the module guard (#11)
+{
+	// The guard is independent of eventcore fd/refcount state: once _ranStdio is set,
+	// any further call throws synchronously before touching fd 0/1 (so a sequential
+	// second call cannot silently re-adopt fresh dups). Simulate a prior call by
+	// setting the guard, then assert the next runStdio throws immediately.
+	const saved = () @trusted { return _ranStdio; }();
+	scope (exit)
+		() @trusted { _ranStdio = saved; }();
+	() @trusted { _ranStdio = true; }();
+
+	auto s = new McpServer("guard-srv", "1.0");
+	bool threw;
+	try
+		runStdio(s);
+	catch (Exception e)
+		threw = true;
+	assert(threw, "a second runStdio call must throw the at-most-once guard");
 }
 
 version (unittest)
