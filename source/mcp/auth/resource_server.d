@@ -290,7 +290,7 @@ unittest  // a valid token authorizes and surfaces TokenInfo
 {
 	ResourceServerConfig cfg;
 	// This test exercises subject/scope surfacing, not audience binding, so it
-	// opts out of the mandatory RFC 8707 check (issue #388).
+	// opts out of the mandatory RFC 8707 check.
 	cfg.allowAnyAudience = true;
 	cfg.validator = (string t) {
 		TokenInfo ti;
@@ -356,7 +356,7 @@ unittest  // RFC 8707: with no resource configured, audience binding fails close
 	// basic/authorization §Access Token Privilege Restriction: MCP servers MUST
 	// reject tokens that do not include them in the audience claim. A validator
 	// without a configured `resource` cannot perform that check, so authorize()
-	// MUST fail closed rather than accept any validated token (issue #388).
+	// MUST fail closed rather than accept any validated token.
 	ResourceServerConfig cfg;
 	cfg.validator = (string t) { TokenInfo ti; ti.valid = true; return ti; };
 	TokenInfo info;
@@ -379,7 +379,7 @@ unittest  // a token lacking the required scope yields insufficientScope
 	ResourceServerConfig cfg;
 	cfg.requiredScope = "mcp:write";
 	// Audience binding passes first (no resource configured -> opt out) so the
-	// scope check is what rejects the request (issue #388).
+	// scope check is what rejects the request.
 	cfg.allowAnyAudience = true;
 	cfg.validator = (string t) {
 		TokenInfo ti;
