@@ -122,23 +122,20 @@ final class CancellationToken
 /// connection / session it arrived on. The server core scopes its per-connection
 /// state (the in-flight cancellation registry) by this token so that two
 /// concurrent clients sharing one `McpServer` over Streamable HTTP cannot collide
-/// on a bare JSON-RPC id (audit #13). A transport that multiplexes many sessions
-/// over one server SHOULD have its `RequestContext` implement this and return a
+/// on a bare JSON-RPC id. A transport that multiplexes many sessions over one
+/// server SHOULD have its `RequestContext` implement this and return a
 /// per-session token (e.g. derived from `Mcp-Session-Id`, or a per-connection
 /// UUID), so a `notifications/cancelled` arriving on connection B only matches
 /// in-flight requests registered by connection B. A context that does not
 /// implement this interface is treated as the single shared connection (empty
-/// token), preserving the historic single-connection behaviour for stdio,
-/// in-process, and any transport that does not yet distinguish connections.
+/// token), the behaviour for stdio, in-process, and any transport that does not
+/// distinguish connections.
 ///
-/// NOTE (#15/#16/#17 deployment model): the McpServer's remaining per-client
-/// state — the negotiated protocol version, the client capabilities, the logging
-/// level, and resource subscriptions — still lives in shared instance fields.
-/// Until the Streamable HTTP transport scopes those per `Mcp-Session-Id`, an
-/// McpServer shared across concurrent stateful-HTTP sessions can cross-talk; the
-/// supported deployment for stateful HTTP is therefore one McpServer per
-/// connection. This `ConnectionScoped` hook is the first step toward full
-/// per-session scoping and already isolates the cancellation registry (#13).
+/// The McpServer's other per-client state — the negotiated protocol version, the
+/// client capabilities, the logging level, and resource subscriptions — lives in
+/// shared instance fields, so the supported deployment for stateful HTTP is one
+/// McpServer per connection. This `ConnectionScoped` hook isolates the
+/// cancellation registry.
 interface ConnectionScoped
 {
 	/// A stable, non-empty identifier for this request's connection / session.
@@ -157,7 +154,7 @@ interface ConnectionScoped
 /// Resolve the connection token for a context: the context's own token when it
 /// implements `ConnectionScoped`, otherwise the empty (shared) token. Centralised
 /// here so the server core has one place to derive the cancellation-registry
-/// scope (#13).
+/// scope.
 string connectionTokenOf(RequestContext ctx) @safe
 {
 	if (auto c = cast(ConnectionScoped) ctx)
@@ -481,13 +478,11 @@ final class NullContext : RequestContext
 /// are serialised and pushed to the transport's write sink as the handler emits
 /// them, out-of-band of the request's eventual reply.
 ///
-/// The stdio transport now runs each request handler in its own cooperative vibe
+/// The stdio transport runs each request handler in its own cooperative vibe
 /// task while the channel's read loop keeps demultiplexing inbound lines, so an
 /// out-of-band `notifications/cancelled` is dispatched (flipping the matching
 /// in-flight `CancellationToken`) *concurrently* with a running handler — the
-/// handler's `ctx.isCancelled()` simply observes the flipped token. There is no
-/// cooperative-drain hack any more (the previous synchronous loop could not read
-/// stdin until the handler returned).
+/// handler's `ctx.isCancelled()` simply observes the flipped token.
 final class StdioContext : RequestContext
 {
 	private void delegate(string) @safe sink;
@@ -578,7 +573,7 @@ final class StdioContext : RequestContext
 	bool clientSupports(string capability) @safe
 	{
 		// No channel wired -> report false (cannot satisfy a server->client
-		// request), preserving the prior no-channel behaviour.
+		// request).
 		if (serverRequestFn is null)
 			return false;
 		switch (capability)
@@ -667,7 +662,7 @@ final class RequestScope : RequestContext, ConnectionScoped
 		return effectiveVersion_;
 	}
 
-	/// Delegate the connection token to the wrapped transport context (#13): the
+	/// Delegate the connection token to the wrapped transport context: the
 	/// `RequestScope` is a per-request decorator, so the connection identity is
 	/// whatever the underlying transport reported (empty when it is not
 	/// connection-scoped).
@@ -691,11 +686,11 @@ final class RequestScope : RequestContext, ConnectionScoped
 	/// this request; if none was installed it delegates to the wrapped context.
 	bool isCancelled() @safe
 	{
-		// Every transport now delivers inbound concurrently with an in-flight
-		// handler (stdio runs handlers in their own task while the channel's read
-		// loop dispatches an inbound notifications/cancelled, flipping this shared
-		// token; Streamable HTTP delivers the cancellation on a separate request).
-		// So there is no cooperative drain: just observe the token.
+		// Every transport delivers inbound concurrently with an in-flight handler
+		// (stdio runs handlers in their own task while the channel's read loop
+		// dispatches an inbound notifications/cancelled, flipping this shared token;
+		// Streamable HTTP delivers the cancellation on a separate request), so
+		// observe the token directly.
 		if (cancellation !is null && cancellation.cancelled)
 			return true;
 		return inner.isCancelled();
