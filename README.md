@@ -30,7 +30,7 @@ void main()
 
 ## Status
 
-**All official conformance tests pass** (0 failures): **server 38/38**, **client 287/287**
+**All official conformance tests pass** (0 failures): **server 39/39**, **client 287/287**
 (one advisory `SHOULD` warning on the optional Client-ID-Metadata-Document flow).
 
 - ✅ **All 30 server scenarios**: lifecycle, tools with every content type, resources +
@@ -247,7 +247,7 @@ npx @modelcontextprotocol/conformance@0.1.16 client --command ./conformance-clie
 Both suites run automatically in CI on every push and pull request via the
 [`Conformance`](.github/workflows/conformance.yml) workflow, with the harness
 version pinned for reproducibility. The job fails on any scenario failure,
-keeping the **server 38/38** and **client 287/287** baseline honest.
+keeping the **server 39/39** and **client 287/287** baseline honest.
 
 ## Contributing
 
