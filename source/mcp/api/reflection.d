@@ -4,7 +4,8 @@ import std.traits;
 import std.typecons : Tuple, Nullable, nullable;
 import std.meta : AliasSeq;
 
-import vibe.data.json : Json, serializeToJson, deserializeJson;
+import vibe.data.json : Json, serializeToJson, deserializeJson, JsonSerializer;
+import vibe.data.serialization : serializeWithPolicy, deserializeWithPolicy;
 
 import mcp.protocol.types;
 import mcp.protocol.capabilities : Icon;
@@ -15,6 +16,31 @@ import mcp.api.attributes;
 import mcp.api.schema;
 
 @safe:
+
+/// vibe.data serialization policy that maps any `enum` leaf to / from its
+/// member *name* (string), rather than vibe's default numeric base value.
+///
+/// The reflection layer emits enum schemas as `{type:"string", enum:[names…]}`
+/// (see `jsonSchemaOf`), so both directions of marshalling must agree: struct
+/// params/returns and bare-enum values are (de)serialized by-name. The policy
+/// only defines `toRepresentation`/`fromRepresentation` for enums, so vibe's
+/// `isPolicySerializable` is false for every other type and the default
+/// behaviour is preserved (it still recurses into nested struct/array fields,
+/// applying this rule to any enum found at any depth).
+template EnumByNamePolicy(T) if (is(T == enum))
+{
+	import std.conv : to;
+
+	static string toRepresentation(T v) @safe
+	{
+		return v.to!string;
+	}
+
+	static T fromRepresentation(string s) @safe
+	{
+		return s.to!T;
+	}
+}
 
 /// Register every `@tool` / `@prompt` / `@resource` / `@resourceTemplate`
 /// annotated method of `obj` on `server`, deriving JSON schemas and argument
@@ -121,10 +147,13 @@ private string describeFor(alias func, size_t i, string pname)() @safe
 private Json parametersSchema(alias func)() @safe
 {
 	import mcp.protocol.draft : validateHeaderName;
-	import std.traits : isFloatingPoint;
+	import std.traits : isFloatingPoint, ParameterDefaultValueTuple;
 
 	alias names = ParameterIdentifierTuple!func;
 	alias types = Parameters!func;
+	// ParameterDefaultValueTuple yields `void` for a parameter with no declared
+	// D-level default and the default value's type otherwise (#43).
+	alias defs = ParameterDefaultValueTuple!func;
 
 	Json props = Json.emptyObject;
 	Json required = Json.emptyArray;
@@ -161,7 +190,10 @@ private Json parametersSchema(alias func)() @safe
 				}
 				props[names[i]] = ps;
 			}
-			static if (!isInstanceOf!(Nullable, P))
+			// A parameter is required only when it is neither Nullable nor carries a
+			// declared D-level default value (#43). ParameterDefaultValueTuple gives
+			// `void` for params without a default.
+			static if (!isInstanceOf!(Nullable, P) && is(defs[i] == void))
 				required ~= Json(names[i]);
 		}
 	}
@@ -171,6 +203,25 @@ private Json parametersSchema(alias func)() @safe
 	if (required.length > 0)
 		s["required"] = required;
 	return s;
+}
+
+/// Convert one JSON argument value into the parameter type `P`, falling back to
+/// the parameter's declared D-level default `def` when the argument is absent
+/// (#43). `def` is the value from `ParameterDefaultValueTuple` for this slot.
+private P marshalArgDefault(P, alias def)(Json args, string name) @safe
+{
+	static if (is(P : RequestContext))
+	{
+		assert(false, "context parameters are injected, not marshalled");
+	}
+	else
+	{
+		const present = (name in args) !is null
+			&& args[name].type != Json.Type.null_ && args[name].type != Json.Type.undefined;
+		if (!present)
+			return def;
+		return marshalArg!P(args, name);
+	}
 }
 
 /// Convert one JSON argument value into the parameter type `P`.
@@ -196,16 +247,36 @@ private P marshalArg(P)(Json args, string name) @safe
 	}
 }
 
+/// Convert a captured resource-template URI variable (always a string) into the
+/// declared parameter type `P`. Enums are parsed by member name, other scalars
+/// via `std.conv.to`; conversion failure throws (caller maps it to InvalidParams).
+private P marshalTemplateVar(P)(string raw) @safe
+{
+	import std.conv : to;
+
+	static if (is(P == string))
+		return raw;
+	else static if (is(P == enum) || isIntegral!P || isFloatingPoint!P || is(P == bool))
+		return to!P(raw);
+	else
+	{
+		// Aggregate / Nullable etc.: interpret the captured string as a JSON
+		// document and deserialize through the enum-aware policy.
+		import vibe.data.json : parseJsonString;
+
+		return marshalScalar!P(parseJsonString(raw));
+	}
+}
+
 private P marshalScalar(P)(Json v) @safe
 {
-	static if (is(P == enum))
-	{
-		import std.conv : to;
-
-		return to!P(v.get!string);
-	}
-	else
-		return () @trusted { return deserializeJson!P(v); }();
+	// Deserialize through EnumByNamePolicy so any enum — whether `P` itself or
+	// an enum field nested inside a struct/array — is read from its schema-
+	// declared string member name rather than vibe's default integer base
+	// value (#42). Non-enum types are unaffected by the policy.
+	return () @trusted {
+		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, P)(v);
+	}();
 }
 
 /// The JSON Schema describing a tool's structured output, derived from its
@@ -248,12 +319,20 @@ private CallToolResult toToolResult(R)(R ret) @safe
 	else
 	{
 		CallToolResult r;
+		// Serialize through EnumByNamePolicy so enum leaves (the value itself, or
+		// enums nested in structs/arrays) emit their schema-declared string member
+		// name, matching the tool's outputSchema instead of an integer base value
+		// (#41).
 		static if (is(R == struct))
-			auto structured = () @trusted { return serializeToJson(ret); }();
+			auto structured = () @trusted {
+				return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(ret);
+			}();
 		else
 		{
 			Json structured = Json.emptyObject;
-			structured["result"] = () @trusted { return serializeToJson(ret); }();
+			structured["result"] = () @trusted {
+				return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(ret);
+			}();
 		}
 		r.structuredContent = structured;
 		r.content = [Content.makeText(structured.toString())];
@@ -384,13 +463,16 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		// answer `inputRequired` (stateless elicitation) as well as `complete`.
 		server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
 			alias names = ParameterIdentifierTuple!overload;
+			alias defs = ParameterDefaultValueTuple!overload;
 			Tuple!(Parameters!overload) argv;
 			static foreach (i, P; Parameters!overload)
 			{
 				static if (is(P : RequestContext))
 					argv[i] = ctx;
-				else
+				else static if (is(defs[i] == void))
 					argv[i] = marshalArg!P(args, names[i]);
+				else
+					argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
 			}
 			return __traits(getMember, parent, memberName)(argv.expand);
 		});
@@ -399,13 +481,16 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 	{
 		server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
 			alias names = ParameterIdentifierTuple!overload;
+			alias defs = ParameterDefaultValueTuple!overload;
 			Tuple!(Parameters!overload) argv;
 			static foreach (i, P; Parameters!overload)
 			{
 				static if (is(P : RequestContext))
 					argv[i] = ctx;
-				else
+				else static if (is(defs[i] == void))
 					argv[i] = marshalArg!P(args, names[i]);
+				else
+					argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
 			}
 			return toToolResult(__traits(getMember, parent, memberName)(argv.expand));
 		});
@@ -444,14 +529,18 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 	if (attr.description.length)
 		descriptor.description = nullable(attr.description);
 	alias names = ParameterIdentifierTuple!overload;
+	alias defs = ParameterDefaultValueTuple!overload;
 	static foreach (i, P; Parameters!overload)
 	{
 		static if (!is(P : RequestContext))
 		{
 			// #293: populate PromptArgument.description from the @describe UDA.
 			enum d = describeFor!(overload, i, names[i]);
+			// A prompt argument is required only when it is neither Nullable nor
+			// carries a declared D-level default (#43), matching the tool path.
 			descriptor.arguments ~= PromptArgument(names[i], d.length
-					? nullable(d) : Nullable!string.init, !isInstanceOf!(Nullable, P));
+					? nullable(d) : Nullable!string.init,
+					!isInstanceOf!(Nullable, P) && is(defs[i] == void));
 		}
 	}
 
@@ -469,8 +558,10 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 		{
 			static if (is(P : RequestContext))
 				argv[i] = new NullContext;
-			else
+			else static if (is(defs[i] == void))
 				argv[i] = marshalArg!P(args, names[i]);
+			else
+				argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
 		}
 		return toPromptResult(__traits(getMember, parent, memberName)(argv.expand));
 	});
@@ -553,14 +644,33 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 	}
 
 	server.registerResourceTemplate(descriptor, (string uri, string[string] params) @safe {
+		import mcp.protocol.errors : invalidParams;
+
 		alias names = ParameterIdentifierTuple!overload;
 		Tuple!(Parameters!overload) argv;
 		static foreach (i, P; Parameters!overload)
 		{
-			static if (is(P == string))
+			static if (is(P : RequestContext))
+				argv[i] = new NullContext;
+			else static if (is(P == string))
 				argv[i] = (names[i] in params) ? params[names[i]] : "";
 			else
-				argv[i] = P.init;
+			{
+				// A captured URI variable is always a string; convert it into the
+				// declared parameter type instead of silently defaulting it to
+				// `P.init` (#45). Surface a conversion failure as InvalidParams
+				// rather than throwing a raw exception.
+				if (auto pv = names[i] in params)
+				{
+					try
+						argv[i] = marshalTemplateVar!P(*pv);
+					catch (Exception e)
+						throw invalidParams("resource template parameter '" ~ names[i]
+							~ "' could not be parsed as " ~ P.stringof ~ ": " ~ e.msg);
+				}
+				else
+					argv[i] = P.init;
+			}
 		}
 		auto ret = __traits(getMember, parent, memberName)(argv.expand);
 		return toResourceContents(ret, uri, attr.mimeType);
@@ -1321,4 +1431,233 @@ unittest  // #295 @cache UDA: pre-draft resources/read has NO cache fields (no w
 	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
 	assert("ttlMs" !in rr["result"]);
 	assert("cacheScope" !in rr["result"]);
+}
+
+version (unittest)
+{
+	private enum Color
+	{
+		red,
+		green,
+		blue
+	}
+
+	private struct ColorBox
+	{
+		Color e;
+	}
+
+	private struct Palette
+	{
+		Color[] colors;
+	}
+
+	// Fixtures for the enum (de)serialization (#41/#42) and default-value (#43)
+	// and resource-template typed-parameter (#45) audit fixes.
+	private final class EnumApi
+	{
+		// #41: returning a struct holding an enum must emit the enum's string name.
+		@tool("box", "Return a struct holding a color")
+		ColorBox box(Color c) @safe
+		{
+			return ColorBox(c);
+		}
+
+		// #41: bare enum return is wrapped under `result` as a string.
+		@tool("pick", "Return a bare color")
+		Color pick() @safe
+		{
+			return Color.blue;
+		}
+
+		// #41: array of enums nested in a struct.
+		@tool("palette", "Return a palette")
+		Palette palette() @safe
+		{
+			return Palette([Color.red, Color.green]);
+		}
+
+		// #42: a struct param containing an enum supplied by name.
+		@tool("name", "Name the color in a box")
+		string name(ColorBox b) @safe
+		{
+			import std.conv : to;
+
+			return b.e.to!string;
+		}
+
+		// #43: a parameter with a D-level default.
+		@tool("limited", "Tool with a defaulted parameter")
+		int limited(int n, int limit = 7) @safe
+		{
+			return n + limit;
+		}
+
+		@resourceTemplate("widget://{id}", "Widget", "text/plain")
+		string widget(int id) @safe
+		{
+			import std.conv : to;
+
+			return "widget-" ~ id.to!string;
+		}
+
+		@resourceTemplate("hue://{shade}", "Hue", "text/plain")
+		string hue(Color shade) @safe
+		{
+			import std.conv : to;
+
+			return "hue-" ~ shade.to!string;
+		}
+	}
+}
+
+unittest  // #41 enum field in a returned struct serializes by member name
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EnumApi);
+	Json p = Json.emptyObject;
+	p["name"] = "box";
+	p["arguments"] = Json(["c": Json("green")]);
+	auto r = s.handle(Message(makeRequest(Json(1), "tools/call", p))).get;
+	assert(r["result"]["structuredContent"]["e"].get!string == "green");
+}
+
+unittest  // #41 bare enum return is wrapped under `result` as its string name
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EnumApi);
+	Json p = Json.emptyObject;
+	p["name"] = "pick";
+	p["arguments"] = Json.emptyObject;
+	auto r = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
+	assert(r["result"]["structuredContent"]["result"].get!string == "blue");
+}
+
+unittest  // #41 array of enums inside a struct serializes by name
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EnumApi);
+	Json p = Json.emptyObject;
+	p["name"] = "palette";
+	p["arguments"] = Json.emptyObject;
+	auto r = s.handle(Message(makeRequest(Json(3), "tools/call", p))).get;
+	auto colors = r["result"]["structuredContent"]["colors"];
+	assert(colors[0].get!string == "red");
+	assert(colors[1].get!string == "green");
+}
+
+unittest  // #41 enum output passes the tool's own outputSchema validation
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableOutputSchemaValidation();
+	registerHandlers(s, new EnumApi);
+	Json p = Json.emptyObject;
+	p["name"] = "box";
+	p["arguments"] = Json(["c": Json("red")]);
+	auto r = s.handle(Message(makeRequest(Json(4), "tools/call", p))).get;
+	// The server must not reject its own structured output as schema-invalid.
+	assert("error" !in r);
+	assert(r["result"]["structuredContent"]["e"].get!string == "red");
+}
+
+unittest  // #42 enum nested in a struct param is supplied as its schema string
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EnumApi);
+	Json p = Json.emptyObject;
+	p["name"] = "name";
+	Json box = Json.emptyObject;
+	box["e"] = "blue";
+	p["arguments"] = Json(["b": box]);
+	auto r = s.handle(Message(makeRequest(Json(5), "tools/call", p))).get;
+	assert(r["result"]["content"][0]["text"].get!string == "blue");
+}
+
+unittest  // #43 a defaulted parameter is absent from inputSchema required
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EnumApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+
+	Json limited;
+	foreach (i; 0 .. tools.length)
+		if (tools[i]["name"].get!string == "limited")
+			limited = tools[i];
+	assert(limited.type == Json.Type.object);
+	auto req = limited["inputSchema"]["required"];
+	bool hasLimit;
+	foreach (i; 0 .. req.length)
+		if (req[i].get!string == "limit")
+			hasLimit = true;
+	assert(!hasLimit);
+	// `n` (no default) is still required.
+	bool hasN;
+	foreach (i; 0 .. req.length)
+		if (req[i].get!string == "n")
+			hasN = true;
+	assert(hasN);
+}
+
+unittest  // #43 omitting a defaulted arg passes the declared default, not P.init
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EnumApi);
+	Json p = Json.emptyObject;
+	p["name"] = "limited";
+	p["arguments"] = Json(["n": Json(3)]);
+	auto r = s.handle(Message(makeRequest(Json(6), "tools/call", p))).get;
+	// limit defaults to 7, so 3 + 7 = 10 (not 3 + 0 = 3 from int.init).
+	assert(r["result"]["structuredContent"]["result"].get!int == 10);
+}
+
+unittest  // #45 resource-template int param receives the captured value, not T.init
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EnumApi);
+	Json rp = Json.emptyObject;
+	rp["uri"] = "widget://42";
+	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	assert(rr["result"]["contents"][0]["text"].get!string == "widget-42");
+}
+
+unittest  // #45 resource-template enum param is parsed by member name
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EnumApi);
+	Json rp = Json.emptyObject;
+	rp["uri"] = "hue://green";
+	auto rr = s.handle(Message(makeRequest(Json(2), "resources/read", rp))).get;
+	assert(rr["result"]["contents"][0]["text"].get!string == "hue-green");
+}
+
+unittest  // #45 resource-template invalid scalar yields an InvalidParams error
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EnumApi);
+	Json rp = Json.emptyObject;
+	rp["uri"] = "widget://not-a-number";
+	auto rr = s.handle(Message(makeRequest(Json(3), "resources/read", rp))).get;
+	assert("error" in rr);
+	assert(rr["error"]["code"].get!int == -32602);
 }

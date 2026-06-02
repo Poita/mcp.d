@@ -259,6 +259,49 @@ struct title
 	string value; /// the display title emitted as JSON Schema `title`
 }
 
+/// Field-level UDA declaring the JSON Schema string `format` keyword (e.g.
+/// `"email"`, `"uri"`, `"date-time"`) for a struct/elicitation field (#55).
+/// Emitted verbatim onto the property schema by `jsonSchemaOf`.
+struct format
+{
+	string value; /// the JSON Schema `format` token
+}
+
+/// Field-level UDA declaring the JSON Schema `minLength` keyword (minimum string
+/// length) for a struct/elicitation string field (#55).
+struct minLength
+{
+	size_t value; /// inclusive minimum string length
+}
+
+/// Field-level UDA declaring the JSON Schema `maxLength` keyword (maximum string
+/// length) for a struct/elicitation string field (#55).
+struct maxLength
+{
+	size_t value; /// inclusive maximum string length
+}
+
+/// Field-level UDA declaring the JSON Schema `pattern` keyword (an ECMA-262
+/// regular expression a string must match) for a struct/elicitation field (#55).
+struct pattern
+{
+	string value; /// the regular-expression pattern
+}
+
+/// Field-level UDA declaring the JSON Schema `minItems` keyword (minimum array
+/// length) for a struct/elicitation array field (#55).
+struct minItems
+{
+	size_t value; /// inclusive minimum array length
+}
+
+/// Field-level UDA declaring the JSON Schema `maxItems` keyword (maximum array
+/// length) for a struct/elicitation array field (#55).
+struct maxItems
+{
+	size_t value; /// inclusive maximum array length
+}
+
 /// Field-level UDA declaring a default value (the JSON Schema `default`
 /// keyword) for a struct field. Named `@schemaDefault` to avoid clashing with
 /// D's `default` keyword. When `jsonSchemaOf!T` reflects over a struct, a field
