@@ -115,7 +115,7 @@ unittest  // the result plugs into authorize() as a TokenValidator
 
 	ResourceServerConfig cfg;
 	cfg.validator = staticVerifier(["tok-alice": alice]);
-	// RFC 8707 audience binding is mandatory by default (issue #388); bind the
+	// RFC 8707 audience binding is mandatory by default; bind the
 	// resource so the validated token's audience is enforced.
 	cfg.resource = "https://mcp.example.com/mcp";
 
