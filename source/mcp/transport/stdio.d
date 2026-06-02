@@ -3,7 +3,7 @@ module mcp.transport.stdio;
 import vibe.data.json : Json;
 
 import mcp.server.server;
-import mcp.transport.duplex : DuplexChannel;
+import mcp.transport.duplex : DuplexChannel, defaultMaxLineBytes;
 
 @safe:
 
@@ -151,6 +151,15 @@ private Json parseToJson(string line) @safe
 /// stdio transport, only valid MCP messages are written to stdout; use stderr for
 /// logging. Blocks until stdin reaches end-of-file.
 ///
+/// `runStdio` takes EXCLUSIVE ownership of file descriptors 0 (stdin) and 1
+/// (stdout) for the duration of the call and MUST be called at most once per
+/// process: it adopts them as vibe-async pipes (which sets `O_NONBLOCK` on the
+/// underlying open file description), and on return it releases the adopted pipe
+/// handles and restores the original descriptor flags so a caller that keeps
+/// running after `runStdio` returns does not inherit a non-blocking,
+/// already-adopted stdin/stdout. A second concurrent call would find fd 0/1
+/// already adopted and throws.
+///
 /// stdin (fd 0) and stdout (fd 1) are adopted as vibe-async pipes
 /// (`eventDriver.pipes.adopt`, the same mechanism `vibe.core.process` uses for a
 /// spawned child), so the read loop is a plain cooperative vibe task — there is
@@ -158,40 +167,134 @@ private Json parseToJson(string line) @safe
 /// race on. Background notifications (`notifyResourceUpdated`, `notify*ListChanged`)
 /// and concurrent tool handlers work because every write goes through the
 /// channel's serialized writer.
-void runStdio(McpServer server)
+///
+/// `maxLineBytes` bounds a single inbound line; an oversized frame is dropped (its
+/// bytes are skipped up to the next newline) and the loop continues so one
+/// misbehaving frame neither exhausts memory nor kills the server.
+void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 {
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 	import eventcore.core : eventDriver;
 	import eventcore.driver : IOMode, IOStatus, PipeFD, PipeIOCallback;
 	import vibe.internal.async : asyncAwaitUninterruptible;
+	import core.sys.posix.fcntl : fcntl, F_GETFL, F_SETFL;
+
+	// Save the original descriptor flags so the O_NONBLOCK that `adopt` sets on the
+	// shared open file description can be restored on return (fd 0/1 may be a
+	// terminal or a pipe shared with other processes — leaking O_NONBLOCK there
+	// breaks blocking readers/writers elsewhere).
+	const inFlags = () @trusted { return fcntl(0, F_GETFL); }();
+	const outFlags = () @trusted { return fcntl(1, F_GETFL); }();
 
 	auto inFD = () @trusted { return eventDriver.pipes.adopt(0); }();
 	auto outFD = () @trusted { return eventDriver.pipes.adopt(1); }();
 
-	// Async, cooperative line read over stdin: accumulate bytes until '\n'
-	// (stripping a trailing '\r'); a 0-byte read (disconnected) is EOF -> null.
+	// Fail fast: a second call (or a process whose fd 0/1 were already adopted)
+	// would otherwise silently operate on invalid handles and never read/write.
+	if (!()@trusted { return eventDriver.pipes.isValid(inFD); }() || !()@trusted {
+			return eventDriver.pipes.isValid(outFD);
+		}())
+		throw new Exception("runStdio: stdin/stdout already adopted; runStdio must be called at most once per process");
+
+	// Release the adopted handles and restore the saved descriptor flags on return
+	// so fd 0/1 are not left non-blocking (or leaked) for code that runs after.
+	scope (exit)
+	{
+		() @trusted {
+			eventDriver.pipes.releaseRef(inFD);
+			eventDriver.pipes.releaseRef(outFD);
+			if (inFlags != -1)
+				fcntl(0, F_SETFL, inFlags);
+			if (outFlags != -1)
+				fcntl(1, F_SETFL, outFlags);
+		}();
+	}
+
+	// A small persistent buffer so stdin is read in 64 KiB chunks (IOMode.once)
+	// rather than one syscall + fiber suspend/resume per byte: `readLine` scans the
+	// filled region for '\n', returns the line up to it, and retains the bytes
+	// after the newline for the next call.
+	enum size_t chunk = 64 * 1024;
+	ubyte[] buf; // bytes read but not yet consumed
+	size_t bufPos; // index of the next unconsumed byte in `buf`
+
+	// Async, cooperative line read over stdin: return the next line (without its
+	// '\n', stripping a trailing '\r'); a 0-byte read (disconnected) is EOF -> the
+	// partial accumulator if any, else null. An over-long line (> maxLineBytes) is
+	// dropped and reading resumes after the next newline.
 	string readLine() @safe
 	{
-		ubyte[1] one;
 		ubyte[] acc;
+		bool dropping; // true once `acc` exceeded maxLineBytes: skip to next '\n'
 		for (;;)
 		{
-			auto res = () @trusted {
-				return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
-					eventDriver.pipes.read(inFD, one[], IOMode.once, cb);
-				});
-			}();
-			const status = res[1];
-			const nbytes = res[2];
-			if (nbytes == 0 || (status != IOStatus.ok && status != IOStatus.wouldBlock))
-				return acc.length ? () @trusted { return cast(string) acc.idup; }() : null;
-			if (one[0] == '\n')
-				break;
-			acc ~= one[0];
+			if (bufPos >= buf.length)
+			{
+				// Refill from the pipe.
+				if (buf.length < chunk)
+					buf.length = chunk;
+				bufPos = 0;
+				auto res = () @trusted {
+					return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
+						eventDriver.pipes.read(inFD, buf, IOMode.once, cb);
+					});
+				}();
+				const status = res[1];
+				const nbytes = res[2];
+				if (nbytes == 0 || (status != IOStatus.ok && status != IOStatus.wouldBlock))
+				{
+					buf = null;
+					bufPos = 0;
+					if (dropping)
+						return null; // EOF in the middle of an over-long, dropped line
+					return acc.length ? () @trusted {
+						return cast(string) acc.idup;
+					}() : null;
+				}
+				buf = buf[0 .. nbytes];
+			}
+
+			// Scan the filled region for a newline.
+			const rest = buf[bufPos .. $];
+			size_t nl = size_t.max;
+			foreach (i, b; rest)
+				if (b == '\n')
+				{
+					nl = i;
+					break;
+				}
+
+			if (nl == size_t.max)
+			{
+				// No newline yet: accumulate (unless dropping) and refill.
+				if (!dropping)
+				{
+					acc ~= rest;
+					if (acc.length > maxLineBytes)
+					{
+						acc = null;
+						dropping = true;
+					}
+				}
+				bufPos = buf.length;
+				continue;
+			}
+
+			// Found a newline at rest[nl]; consume through it.
+			if (!dropping)
+				acc ~= rest[0 .. nl];
+			bufPos += nl + 1;
+			if (dropping)
+			{
+				// Drop this over-long line and start a fresh one.
+				dropping = false;
+				acc = null;
+				continue;
+			}
+			if (acc.length && acc[$ - 1] == '\r')
+				acc = acc[0 .. $ - 1];
+			return () @trusted { return cast(string) acc.idup; }();
 		}
-		if (acc.length && acc[$ - 1] == '\r')
-			acc = acc[0 .. $ - 1];
-		return () @trusted { return cast(string) acc.idup; }();
 	}
 
 	void writeLine(string s) @safe
