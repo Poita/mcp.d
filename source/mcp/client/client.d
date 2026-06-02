@@ -85,6 +85,11 @@ Json withRequestLogLevel(Json params, string level) @safe
 {
 	if (level.length == 0)
 		return params;
+	// Validate the level the same way `setLogLevel` does, so the per-request
+	// opt-in shared by callTool/readResource/getPrompt cannot stamp an
+	// unvalidated `_meta` log level (mirrors server.d's guard).
+	if (logLevelRank(level) < 0)
+		throw new McpException(ErrorCode.invalidParams, "Invalid log level: " ~ level);
 	if (params.type != Json.Type.object)
 		params = Json.emptyObject;
 	Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"]
@@ -1808,6 +1813,19 @@ unittest  // withRequestLogLevel preserves existing _meta entries
 	auto stamped = withRequestLogLevel(p, "warning");
 	assert(stamped["_meta"]["progressToken"].get!string == "tok-1");
 	assert(stamped["_meta"][MetaKey.logLevel].get!string == "warning");
+}
+
+unittest  // withRequestLogLevel rejects an invalid log level (mirrors setLogLevel)
+{
+	import std.exception : assertThrown, assertNotThrown;
+
+	// An unknown level must be rejected the same way `setLogLevel` rejects it,
+	// so the per-request opt-in shared by callTool/readResource/getPrompt cannot
+	// stamp an unvalidated `_meta` log level.
+	assertThrown!McpException(withRequestLogLevel(Json.emptyObject, "verbose"));
+	// Valid levels and the empty no-op pass through unchanged.
+	assertNotThrown!McpException(withRequestLogLevel(Json.emptyObject, "debug"));
+	assertNotThrown!McpException(withRequestLogLevel(Json.emptyObject, ""));
 }
 
 unittest  // draft setLogLevel does NOT send the removed logging/setLevel RPC
