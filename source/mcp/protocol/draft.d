@@ -7,6 +7,7 @@ import mcp.protocol.capabilities;
 import mcp.protocol.versions : ProtocolVersion;
 import mcp.protocol.sampling : CreateMessageRequest;
 import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
+import mcp.protocol.errors : isValidElicitationUrl, invalidParams;
 
 @safe:
 
@@ -411,7 +412,10 @@ Json withCache(Json result, CacheHint hint) @safe
 {
 	if (result.type != Json.Type.object)
 		return result;
-	result["ttlMs"] = hint.ttlMs;
+	// Spec (`CacheableResult`): servers MUST provide a `ttlMs` value that is
+	// >= 0. Clamp at this single emission chokepoint so a negative value can
+	// never reach the wire, regardless of caller input.
+	result["ttlMs"] = hint.ttlMs < 0 ? 0L : hint.ttlMs;
 	result["cacheScope"] = cast(string) hint.cacheScope;
 	return result;
 }
@@ -432,6 +436,11 @@ Nullable!CacheHint parseCacheHint(Json result) @safe
 		hint.ttlMs = cast(long) ttl.get!double;
 	else
 		return Nullable!CacheHint.init;
+	// Spec (`CacheableResult`): `ttlMs` MUST be >= 0; clamp defensively on read
+	// so values round-tripped through this SDK honour the constraint even if a
+	// non-conforming peer emitted a negative value.
+	if (hint.ttlMs < 0)
+		hint.ttlMs = 0;
 	if ("cacheScope" in result && result["cacheScope"].type == Json.Type.string)
 	{
 		const s = result["cacheScope"].get!string;
@@ -574,8 +583,25 @@ ParamHeader[] paramHeaders(Json inputSchema) @safe
 				}
 			}();
 		}
-		if ("items" in node && node["items"].type == Json.Type.object)
-			walk(node["items"], path);
+		// Object-form `items` (single schema) and array-form `items`/`prefixItems`
+		// (tuple schemas, 2020-12). Path is passed through unchanged — array
+		// element indices are not appended, matching the object-`items` case.
+		foreach (key; ["items", "prefixItems"])
+		{
+			if (key !in node)
+				continue;
+			auto sub = node[key];
+			if (sub.type == Json.Type.object)
+				walk(sub, path);
+			else if (sub.type == Json.Type.array)
+			{
+				() @trusted {
+					foreach (Json elem; sub)
+						if (elem.type == Json.Type.object)
+							walk(elem, path);
+				}();
+			}
+		}
 	}
 
 	walk(inputSchema, []);
@@ -641,8 +667,27 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 				}
 			}();
 		}
-		if (err is null && "items" in node && node["items"].type == Json.Type.object)
-			walk(node["items"]);
+		// Object-form `items` and array-form `items`/`prefixItems` (tuple schemas).
+		foreach (key; ["items", "prefixItems"])
+		{
+			if (err !is null || key !in node)
+				continue;
+			auto sub = node[key];
+			if (sub.type == Json.Type.object)
+				walk(sub);
+			else if (sub.type == Json.Type.array)
+			{
+				() @trusted {
+					foreach (Json elem; sub)
+					{
+						if (err !is null)
+							return;
+						if (elem.type == Json.Type.object)
+							walk(elem);
+					}
+				}();
+			}
+		}
 	}
 
 	walk(inputSchema);
@@ -732,6 +777,27 @@ struct InputRequest
 		return elicitation(id, message, jsonSchemaOf!T);
 	}
 
+	/// Build a url-mode `elicitation` input-request: instead of a `requestedSchema`
+	/// form, the client is directed to a `url` to gather input out-of-band and
+	/// correlate the result via `elicitationId`. Mirrors
+	/// `RequestContext.elicitUrl`'s invariants: `url` MUST be a non-empty valid
+	/// absolute URI and `elicitationId` MUST be non-empty (throws otherwise).
+	static InputRequest elicitationUrl(string id, string message, string url, string elicitationId) @safe
+	{
+		if (url.length == 0)
+			throw invalidParams("URL-mode elicitation requires a non-empty url");
+		if (!isValidElicitationUrl(url))
+			throw invalidParams("URL-mode elicitation requires a valid url (absolute URI): " ~ url);
+		if (elicitationId.length == 0)
+			throw invalidParams("URL-mode elicitation requires a non-empty elicitationId");
+		Json p = Json.emptyObject;
+		p["mode"] = "url";
+		p["message"] = message;
+		p["url"] = url;
+		p["elicitationId"] = elicitationId;
+		return InputRequest(id, "elicitation", p);
+	}
+
 	/// Build a `roots` input-request (no params).
 	static InputRequest roots(string id) @safe
 	{
@@ -764,6 +830,27 @@ struct InputRequest
 		if (params.type == Json.Type.object && "requestedSchema" in params)
 			return params["requestedSchema"];
 		return Json.undefined;
+	}
+
+	/// Read `params["url"]` as a string (`""` when absent) — the reader
+	/// counterpart to the `elicitationUrl` builder. Non-empty only for url-mode
+	/// elicitation requests (`params["mode"] == "url"`).
+	string elicitationUrl() @safe
+	{
+		if (params.type == Json.Type.object && "url" in params
+				&& params["url"].type == Json.Type.string)
+			return params["url"].get!string;
+		return "";
+	}
+
+	/// Read `params["elicitationId"]` as a string (`""` when absent) — the reader
+	/// counterpart to the `elicitationUrl` builder.
+	string elicitationIdField() @safe
+	{
+		if (params.type == Json.Type.object && "elicitationId" in params
+				&& params["elicitationId"].type == Json.Type.string)
+			return params["elicitationId"].get!string;
+		return "";
 	}
 
 	/// The spec wire `method` for this request's `type`: an `InputRequests` value
@@ -1184,6 +1271,32 @@ unittest  // withCache attaches ttlMs and cacheScope from a CacheHint
 	auto c = withCache(r, CacheHint(5000, CacheScope.private_));
 	assert(c["ttlMs"].get!long == 5000);
 	assert(c["cacheScope"].get!string == "private");
+}
+
+unittest  // withCache clamps a negative ttlMs to 0 (spec: ttlMs MUST be >= 0)
+{
+	Json r = Json.emptyObject;
+	r["tools"] = Json.emptyArray;
+	auto c = withCache(r, CacheHint(-5000, CacheScope.public_));
+	assert(c["ttlMs"].get!long == 0);
+}
+
+unittest  // parseCacheHint clamps a negative ttlMs to 0 on read
+{
+	Json r = Json.emptyObject;
+	r["ttlMs"] = -42;
+	auto h = parseCacheHint(r);
+	assert(!h.isNull);
+	assert(h.get.ttlMs == 0);
+}
+
+unittest  // parseCacheHint clamps a negative float ttlMs to 0 on read
+{
+	Json r = Json.emptyObject;
+	r["ttlMs"] = -1500.0;
+	auto h = parseCacheHint(r);
+	assert(!h.isNull);
+	assert(h.get.ttlMs == 0);
 }
 
 unittest  // parseCacheHint reads an integer ttlMs and a cacheScope string
@@ -1688,4 +1801,140 @@ unittest  // paramHeaders: number-typed annotations are skipped (not collected)
 	]);
 	schema["properties"] = props;
 	assert(paramHeaders(schema).length == 0);
+}
+
+unittest  // paramHeaders: collects annotations under array-form (tuple) items
+{
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json elemProps = Json.emptyObject;
+	elemProps["tag"] = Json([
+		"type": Json("string"),
+		"x-mcp-header": Json("Tag")
+	]);
+	Json elem = Json.emptyObject;
+	elem["type"] = "object";
+	elem["properties"] = elemProps;
+	Json arr = Json.emptyObject;
+	arr["type"] = "array";
+	arr["items"] = Json([elem]); // array-form (tuple) items
+	Json props = Json.emptyObject;
+	props["entries"] = arr;
+	schema["properties"] = props;
+
+	auto phs = paramHeaders(schema);
+	assert(phs.length == 1);
+	assert(phs[0].path == ["entries", "tag"]);
+	assert(phs[0].header == "Mcp-Param-Tag");
+}
+
+unittest  // paramHeaders: collects annotations under prefixItems element schemas
+{
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json elemProps = Json.emptyObject;
+	elemProps["region"] = Json([
+		"type": Json("string"),
+		"x-mcp-header": Json("Region")
+	]);
+	Json elem = Json.emptyObject;
+	elem["type"] = "object";
+	elem["properties"] = elemProps;
+	Json arr = Json.emptyObject;
+	arr["type"] = "array";
+	arr["prefixItems"] = Json([elem]);
+	Json props = Json.emptyObject;
+	props["coords"] = arr;
+	schema["properties"] = props;
+
+	auto phs = paramHeaders(schema);
+	assert(phs.length == 1);
+	assert(phs[0].path == ["coords", "region"]);
+	assert(phs[0].header == "Mcp-Param-Region");
+}
+
+unittest  // validateInputSchemaHeaders: rejects CR/LF header on array-form items element
+{
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json elemProps = Json.emptyObject;
+	elemProps["tag"] = Json([
+		"type": Json("string"),
+		"x-mcp-header": Json("Ta\r\ng")
+	]);
+	Json elem = Json.emptyObject;
+	elem["type"] = "object";
+	elem["properties"] = elemProps;
+	Json arr = Json.emptyObject;
+	arr["type"] = "array";
+	arr["items"] = Json([elem]);
+	Json props = Json.emptyObject;
+	props["entries"] = arr;
+	schema["properties"] = props;
+	assert(validateInputSchemaHeaders(schema) !is null);
+}
+
+unittest  // validateInputSchemaHeaders: rejects number-typed header on prefixItems element
+{
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json elemProps = Json.emptyObject;
+	elemProps["amount"] = Json([
+		"type": Json("number"),
+		"x-mcp-header": Json("Amount")
+	]);
+	Json elem = Json.emptyObject;
+	elem["type"] = "object";
+	elem["properties"] = elemProps;
+	Json arr = Json.emptyObject;
+	arr["type"] = "array";
+	arr["prefixItems"] = Json([elem]);
+	Json props = Json.emptyObject;
+	props["coords"] = arr;
+	schema["properties"] = props;
+	assert(validateInputSchemaHeaders(schema) !is null);
+}
+
+unittest  // InputRequest.elicitationUrl builds url-mode params with the four fields
+{
+	auto ir = InputRequest.elicitationUrl("e1", "Authorize access",
+			"https://example.com/consent", "elic-123");
+	assert(ir.type == "elicitation");
+	assert(ir.kind.get == InputKind.elicitation);
+	assert(ir.params["mode"].get!string == "url");
+	assert(ir.params["message"].get!string == "Authorize access");
+	assert(ir.params["url"].get!string == "https://example.com/consent");
+	assert(ir.params["elicitationId"].get!string == "elic-123");
+}
+
+unittest  // InputRequest.elicitationUrl readers round-trip url and elicitationId
+{
+	auto ir = InputRequest.elicitationUrl("e1", "msg", "https://example.com/consent", "elic-123");
+	assert(ir.elicitationUrl() == "https://example.com/consent");
+	assert(ir.elicitationIdField() == "elic-123");
+	assert(ir.elicitationMessage() == "msg");
+}
+
+unittest  // InputRequest.elicitationUrl rejects empty url
+{
+	import std.exception : assertThrown;
+	import mcp.protocol.errors : McpException;
+
+	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "", "elic-1"));
+}
+
+unittest  // InputRequest.elicitationUrl rejects a malformed (non-absolute) url
+{
+	import std.exception : assertThrown;
+	import mcp.protocol.errors : McpException;
+
+	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "not a url", "elic-1"));
+}
+
+unittest  // InputRequest.elicitationUrl rejects empty elicitationId
+{
+	import std.exception : assertThrown;
+	import mcp.protocol.errors : McpException;
+
+	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "https://example.com", ""));
 }
