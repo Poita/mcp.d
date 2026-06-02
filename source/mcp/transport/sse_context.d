@@ -114,7 +114,7 @@ final class StreamCoordinator
 	/// targeted at one id). Used when the GET SSE listener a server->client request
 	/// was delivered on disconnects before the client could respond: rather than
 	/// letting the awaiter block for the full timeout, it is released promptly with
-	/// an `McpException` (audit finding #26). Unknown ids are ignored.
+	/// an `McpException`. Unknown ids are ignored.
 	void failPending(long id, McpException error) @safe
 	{
 		if (auto w = id in waiters)
@@ -174,8 +174,8 @@ final class StreamCoordinator
 ///
 /// `active` distinguishes a real listen-stream filter (an opted-in draft stream) from
 /// the zero value used for plain GET streams that did not go through `subscriptions/
-/// listen`; an inactive filter accepts everything (the legacy GET-stream behaviour and
-/// the transport's Multiple Connections rule are unchanged).
+/// listen`; an inactive filter accepts everything, so the plain GET stream still obeys
+/// only the transport's Multiple Connections rule.
 struct SubscriptionFilter
 {
 	bool active; /// true once this is a real `subscriptions/listen` filter
@@ -209,7 +209,7 @@ struct SubscriptionFilter
 
 			if (!resourceSubscriptions)
 				return false;
-			// A blanket opt-in (legacy boolean, no per-URI list) accepts any URI;
+			// A blanket boolean opt-in (no per-URI list) accepts any URI;
 			// otherwise only the explicitly named URIs are accepted.
 			return resourceUris.length == 0 || uri.length == 0 || resourceUris.canFind(uri);
 		default:
@@ -280,17 +280,15 @@ final class ServerPushChannel
 		void delegate(string frame) @safe write;
 		string subscriptionId;
 		SubscriptionFilter filter;
-		/// Per-listener serialization point (audit finding #6). The blocking
-		/// `write` to this stream — together with the seq read it is framed with and
-		/// the seq/history commit that follows — runs under THIS mutex, NOT the
-		/// channel-wide `mtx`. Holding `mtx` across the socket write used to couple
-		/// every stream (head-of-line blocking, a liveness regression from the #74
-		/// fix): a slow stream X blocked delivery to stream Y, `notify`,
-		/// `sendRequest`, `addListener`, and `removeListener` mount-wide. Moving the
-		/// write under a per-listener mutex frees `mtx` while still serializing
-		/// concurrent writes to the SAME stream, so seq assignment cannot reorder
-		/// relative to the bytes on the wire — preserving the #74 per-stream-monotonic,
-		/// globally-unique event-id invariant. Allocated per listener in `addListener`.
+		/// Per-listener serialization point. The blocking `write` to this stream —
+		/// together with the seq read it is framed with and the seq/history commit
+		/// that follows — runs under THIS mutex, NOT the channel-wide `mtx`. Keeping
+		/// the write off `mtx` means a slow stream X does not block delivery to stream
+		/// Y, `notify`, `sendRequest`, `addListener`, or `removeListener` mount-wide,
+		/// while still serializing concurrent writes to the SAME stream so seq
+		/// assignment cannot reorder relative to the bytes on the wire — every event id
+		/// stays per-stream-monotonic and globally unique. Allocated per listener in
+		/// `addListener`.
 		TaskMutex writeMtx;
 	}
 
@@ -304,27 +302,26 @@ final class ServerPushChannel
 	/// `requestListener`, and the replay history. Held only for short,
 	/// non-blocking critical sections — the candidate scan, the seq read, and the
 	/// seq/history commit — and explicitly RELEASED across the blocking `l.write`
-	/// socket write (audit finding #6). The write itself is serialized per stream by
-	/// the target `Listener.writeMtx` instead, so a slow stream no longer blocks
-	/// delivery to other streams / `notify` / `sendRequest` / `addListener` /
-	/// `removeListener` while still keeping each stream's writes — and the seq ids
-	/// they carry — strictly ordered (preserving the #74/#75 invariants: no
-	/// listener-list corruption, per-stream-monotonic globally-unique event ids).
+	/// socket write. The write itself is serialized per stream by the target
+	/// `Listener.writeMtx` instead, so a slow stream does not block delivery to
+	/// other streams / `notify` / `sendRequest` / `addListener` / `removeListener`
+	/// while still keeping each stream's writes — and the seq ids they carry —
+	/// strictly ordered: the listener list stays consistent and event ids stay
+	/// per-stream-monotonic and globally unique.
 	private TaskMutex mtx;
 
-	/// In-flight server->client request id -> the listener id it was delivered on
-	/// (audit finding #26). When that listener disconnects (`removeListener`) the
-	/// bound requests are failed immediately so their awaiters do not hang for the
-	/// full timeout. Cleared as requests complete or their listener drops.
+	/// In-flight server->client request id -> the listener id it was delivered on.
+	/// When that listener disconnects (`removeListener`) the bound requests are
+	/// failed immediately so their awaiters do not hang for the full timeout.
+	/// Cleared as requests complete or their listener drops.
 	private long[long] requestListener;
 
 	/// LRU order of stream ordinals that currently hold replay history, oldest
 	/// first. Bounds total retained memory across the mount's lifetime to
 	/// `maxHistoryStreams * maxHistoryPerStream` frames regardless of how many
-	/// short-lived GET streams connect and disconnect (audit finding #25): a
-	/// reconnecting client still finds a recently-disconnected stream's buffer for
-	/// Last-Event-ID replay, but a stream not touched for `maxHistoryStreams` newer
-	/// streams is evicted.
+	/// short-lived GET streams connect and disconnect: a reconnecting client still
+	/// finds a recently-disconnected stream's buffer for Last-Event-ID replay, but a
+	/// stream not touched for `maxHistoryStreams` newer streams is evicted.
 	private long[] historyOrder;
 	private size_t maxHistoryStreams = 64;
 
@@ -335,8 +332,8 @@ final class ServerPushChannel
 	/// messages emitted *after* that id replayed on the very stream that was
 	/// disconnected. Bounded per stream (oldest evicted first) so the buffer cannot
 	/// grow without limit. The spec rule is a MAY; this is opt-in via a non-empty
-	/// `resumeFrom` on `addListener`, so a normal GET (no `Last-Event-ID`) keeps the
-	/// existing fresh-ordinal behaviour and unchanged wire output.
+	/// `resumeFrom` on `addListener`, so a normal GET (no `Last-Event-ID`) opens a
+	/// fresh ordinal.
 	private struct HistoryEntry
 	{
 		long seq;
@@ -367,9 +364,9 @@ final class ServerPushChannel
 	/// server-side half of resumability — the "server MAY use this header to replay
 	/// messages that would have been sent after the last event ID, on the stream
 	/// that was disconnected". An empty or unrecognized `resumeFrom` falls back to a
-	/// fresh ordinal (the prior behaviour), so a normal GET is unaffected. The
-	/// MUST NOT — "replay messages that would have been delivered on a different
-	/// stream" — is honoured because replay is keyed strictly on the id's ordinal.
+	/// fresh ordinal, so a normal GET opens a brand-new stream. The MUST NOT —
+	/// "replay messages that would have been delivered on a different stream" — is
+	/// honoured because replay is keyed strictly on the id's ordinal.
 	long addListener(void delegate(string frame) @safe write, string subscriptionId = "",
 			SubscriptionFilter filter = SubscriptionFilter.init, string resumeFrom = "") @safe
 	{
@@ -381,7 +378,7 @@ final class ServerPushChannel
 			// Phase 1 (under mtx): register the listener and decide its stream
 			// ordinal + starting seq. For a resume, SNAPSHOT the frames to replay and
 			// fix the continuation seq up-front, but DEFER the actual writes — the
-			// blocking socket write must not run under the channel mutex (#6).
+			// blocking socket write must not run under the channel mutex.
 			synchronized (mtx)
 			{
 				id = nextListenerId++;
@@ -393,7 +390,7 @@ final class ServerPushChannel
 					// Resume the disconnected stream: keep its ordinal, replay every
 					// buffered event after the cursor in sequence order, and continue
 					// from the next seq. Touch the ordinal so its history is treated as
-					// most-recently used (audit finding #25).
+					// most-recently used.
 					streamOf[id] = resumeOrdinal;
 					touchHistory(resumeOrdinal);
 					long maxSeq = resumeSeq;
@@ -419,7 +416,7 @@ final class ServerPushChannel
 			// concurrent `deliver`/`emitTo` that picks this listener blocks here until
 			// replay completes, so live events strictly follow the replayed ones — the
 			// resumed stream's wire order (and its seq monotonicity) is preserved
-			// without holding the channel mutex across these blocking writes (#6).
+			// without holding the channel mutex across these blocking writes.
 			if (replay.length)
 			{
 				synchronized (lWriteMtx)
@@ -435,8 +432,8 @@ final class ServerPushChannel
 	/// Drop a listener (e.g. when its GET stream is closed). Any in-flight
 	/// server->client request that was delivered on this listener is failed
 	/// immediately so its awaiter wakes with an `McpException` instead of hanging
-	/// for the full timeout (audit finding #26). Acquires the delivery mutex so it
-	/// cannot interleave with an in-progress write or another list mutation.
+	/// for the full timeout. Acquires the delivery mutex so it cannot interleave
+	/// with an in-progress write or another list mutation.
 	void removeListener(long id) @safe
 	{
 		() @trusted {
@@ -448,7 +445,7 @@ final class ServerPushChannel
 	/// List-mutation half of `removeListener`, assuming the delivery mutex is
 	/// already held (so it can be called from inside `deliver`/`emitTo` dead-stream
 	/// cleanup without re-acquiring the non-recursive mutex). Fails the in-flight
-	/// requests bound to this listener (audit finding #26).
+	/// requests bound to this listener.
 	private void removeListenerLocked(long id) @safe
 	{
 		import std.algorithm : remove;
@@ -459,7 +456,7 @@ final class ServerPushChannel
 
 		// Fail exactly the in-flight server->client requests bound to this listener
 		// (not every pending waiter): other requests may be bound to surviving
-		// listeners (audit finding #26).
+		// listeners.
 		long[] orphaned;
 		foreach (reqId, lid; requestListener)
 			if (lid == id)
@@ -478,8 +475,8 @@ final class ServerPushChannel
 	}
 
 	/// Number of stream ordinals currently retaining replay history. Exposed for
-	/// tests/diagnostics to verify the LRU bound (audit finding #25); the value is
-	/// at most `maxHistoryStreams`.
+	/// tests/diagnostics to verify the LRU bound; the value is at most
+	/// `maxHistoryStreams`.
 	size_t retainedHistoryStreams() const @safe
 	{
 		return history.length;
@@ -511,9 +508,9 @@ final class ServerPushChannel
 	/// eligible only if its own filter accepts the notification. A listener with an
 	/// *inactive* filter (a plain GET stream that did not go through `subscriptions/
 	/// listen`) falls back to `plainEligible`: the server passes its global opt-in
-	/// decision there, so the legacy single-stream draft path — where a client opts in
-	/// globally and a plain GET listener receives the notification — is preserved,
-	/// while concurrent active listen streams are still isolated to their own opt-in.
+	/// decision there, so the single-stream draft path — where a client opts in
+	/// globally and a plain GET listener receives the notification — works, while
+	/// concurrent active listen streams are still isolated to their own opt-in.
 	/// Returns 1 if the message was delivered to an eligible live stream, else 0.
 	size_t emitFiltered(string method, Json params, string uri = "", bool plainEligible = true) @safe
 	{
@@ -536,16 +533,10 @@ final class ServerPushChannel
 	/// snapshotting the eligible candidates, reading the seq each frame is stamped
 	/// with, and committing the seq/history afterwards. The blocking `l.write` runs
 	/// OFF the channel mutex, serialized per stream by the target listener's own
-	/// `writeMtx` (audit finding #6), so two concurrent emits to the SAME listener
-	/// are still strictly ordered (the seq read + write + commit all happen under
-	/// that one `writeMtx`, so the frame that reaches the socket first carries the
-	/// lower seq), while a slow stream no longer blocks delivery to others.
-	/// Candidates are tried in registration order; one whose write throws (a
-	/// disconnected client) is dropped and the next live eligible listener is tried,
-	/// so the message still lands on a healthy stream and the channel self-heals
-	/// (the Multiple Connections single-stream rule: stop at the first SUCCESS).
-	/// Returns the listener id the message landed on, or -1 when no live eligible
-	/// listener could receive it.
+	/// `writeMtx`, so two concurrent emits to the SAME listener are still strictly
+	/// ordered (the seq read + write + commit all happen under that one `writeMtx`,
+	/// so the frame that reaches the socket first carries the lower seq), while a
+	/// slow stream does not block delivery to others.
 	private long deliver(Json msg, scope bool delegate(ref const Listener) @safe eligible) @safe
 	{
 		// Snapshot the eligible candidates (in registration order) under the lock so
@@ -570,11 +561,11 @@ final class ServerPushChannel
 
 	/// Frame `msg` for one listener and write it, with the channel mutex held only
 	/// for the brief seq read and the post-write seq/history commit — never across
-	/// the blocking `l.write` (audit finding #6). The whole read-write-commit runs
-	/// under `l.writeMtx`, so concurrent writes to the same stream are serialized and
-	/// their seq ids stay monotonic in write order (#74). Returns true if the frame
-	/// was written; false if the listener was concurrently removed or its write threw
-	/// (in which case it is dropped from the channel).
+	/// the blocking `l.write`. The whole read-write-commit runs under `l.writeMtx`,
+	/// so concurrent writes to the same stream are serialized and their seq ids stay
+	/// monotonic in write order. Returns true if the frame was written; false if the
+	/// listener was concurrently removed or its write threw (in which case it is
+	/// dropped from the channel).
 	private bool writeToListener(Listener l, Json msg) @safe
 	{
 		import std.conv : to;
@@ -585,7 +576,7 @@ final class ServerPushChannel
 				long seq, ordinal;
 				// Brief lock: confirm the listener still exists and read the seq this
 				// frame will carry. Releasing before the write is what frees the
-				// channel for other streams (#6).
+				// channel for other streams.
 				bool present;
 				synchronized (mtx)
 				{
@@ -613,11 +604,11 @@ final class ServerPushChannel
 				}
 				// Brief lock: commit. Because this whole body holds l.writeMtx, no
 				// other write to this stream interleaved, so seqOf[l.id] is still the
-				// `seq` we framed with — assign history + bump in write order (#74).
+				// `seq` we framed with — assign history + bump in write order.
 				synchronized (mtx)
 				{
 					if (l.id !in seqOf)
-						return true; // removed during the write; do not resurrect (#74)
+						return true; // removed during the write; do not resurrect
 					recordHistory(ordinal, seq, frame);
 					seqOf[l.id]++;
 				}
@@ -647,9 +638,9 @@ final class ServerPushChannel
 			*entries = (*entries)[$ - maxHistoryPerStream .. $];
 	}
 
-	/// Mark `ordinal` as most-recently used in the history LRU order (audit
-	/// finding #25): move it to the back of `historyOrder` so the oldest untouched
-	/// ordinal is the one evicted when the cap is exceeded.
+	/// Mark `ordinal` as most-recently used in the history LRU order: move it to the
+	/// back of `historyOrder` so the oldest untouched ordinal is the one evicted when
+	/// the cap is exceeded.
 	private void touchHistory(long ordinal) @safe
 	{
 		import std.algorithm : remove, countUntil;
@@ -663,9 +654,9 @@ final class ServerPushChannel
 	/// Evict the oldest history ordinals once more than `maxHistoryStreams` are
 	/// retained, giving an absolute upper bound of
 	/// `maxHistoryStreams * maxHistoryPerStream` buffered frames over the mount's
-	/// lifetime regardless of how many short-lived GET streams come and go (audit
-	/// finding #25). A still-connected listener's ordinal can be evicted too, which
-	/// only forgoes resume-replay for that stream — never a correctness issue.
+	/// lifetime regardless of how many short-lived GET streams come and go. A
+	/// still-connected listener's ordinal can be evicted too, which only forgoes
+	/// resume-replay for that stream — never a correctness issue.
 	private void evictOldHistory() @safe
 	{
 		while (maxHistoryStreams > 0 && historyOrder.length > maxHistoryStreams)
@@ -698,7 +689,7 @@ final class ServerPushChannel
 		const id = coord.alloc();
 		coord.register(id);
 		// Learn which listener the request frame lands on so a later disconnect of
-		// THAT listener fails this awaiter immediately (audit finding #26).
+		// THAT listener fails this awaiter immediately.
 		const listenerId = deliver(makeRequest(Json(id), method, params),
 				(ref const Listener) @safe => true);
 		if (listenerId < 0)
@@ -735,10 +726,10 @@ final class ServerPushChannel
 	bool emitTo(long listenerId, Json msg) @safe
 	{
 		// Find the target under the lock (brief, non-blocking), then write off the
-		// lock via the per-listener serialization point (audit finding #6), exactly
-		// like `deliver`. Serializing the write on `l.writeMtx` keeps this stream's
-		// seq ids monotonic against a concurrent `deliver`/`emitTo` (#74) without
-		// holding the channel mutex across the blocking write.
+		// lock via the per-listener serialization point, exactly like `deliver`.
+		// Serializing the write on `l.writeMtx` keeps this stream's seq ids monotonic
+		// against a concurrent `deliver`/`emitTo` without holding the channel mutex
+		// across the blocking write.
 		Nullable!Listener target;
 		() @trusted {
 			synchronized (mtx)
@@ -917,8 +908,8 @@ unittest  // emitFiltered delivers a change notification ONLY to a stream that o
 	SubscriptionFilter fb;
 	fb.active = true;
 	fb.resourceSubscriptions = true;
-	// B registers FIRST so the old first-live-listener logic would have mis-delivered
-	// the tools notification to B.
+	// B registers FIRST to confirm delivery follows the per-stream filter, not
+	// registration order.
 	ch.addListener((string f) @safe { bFrame = f; }, "listen-B", fb);
 	ch.addListener((string f) @safe { aFrame = f; }, "listen-A", fa);
 
@@ -1148,7 +1139,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	private StreamCoordinator coord;
 	private ClientCapabilities clientCaps;
 	private Json progressTok;
-	// Per-connection cancellation scope (#3/#13/#22). On the Streamable HTTP
+	// Per-connection cancellation scope. On the Streamable HTTP
 	// transport a request and its later `notifications/cancelled` arrive on
 	// SEPARATE POSTs that share only the `Mcp-Session-Id` header, so the token
 	// MUST be that session id when sessions are enabled -- a per-request UUID
@@ -1216,7 +1207,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		this.connAlive_ = () @safe => res.connected;
 	}
 
-	/// The per-connection cancellation scope for this request (#3/#13/#22). This is
+	/// The per-connection cancellation scope for this request. This is
 	/// the `Mcp-Session-Id` when stateful sessions are enabled, so a request and its
 	/// later `notifications/cancelled` -- which arrive on SEPARATE POSTs sharing only
 	/// that header -- resolve to the SAME `RequestScope` cancellation key. When
@@ -1725,10 +1716,10 @@ unittest  // push-channel ping round-trips: request frame out, empty result back
 	assert(pinged); // ping() returned without throwing -> client acknowledged
 }
 
-unittest  // #26: failPending wakes a single awaiter promptly with an McpException
+unittest  // failPending wakes a single awaiter promptly with an McpException
 {
-	// Mirrors coordinator.d:221: register a waiter, fail just that id, and confirm
-	// await throws immediately instead of hanging to the 60s timeout.
+	// Register a waiter, fail just that id, and confirm await throws immediately
+	// instead of hanging to the 60s timeout.
 	import mcp.protocol.errors : McpException, ErrorCode;
 
 	auto c = new StreamCoordinator;
@@ -1746,7 +1737,7 @@ unittest  // #26: failPending wakes a single awaiter promptly with an McpExcepti
 	assert(threw);
 }
 
-unittest  // #26: a server->client request fails fast when its bound listener disconnects
+unittest  // a server->client request fails fast when its bound listener disconnects
 {
 	// sendRequest delivers the request frame on a chosen GET listener and blocks in
 	// await. If THAT listener disconnects (removeListener) before the client
@@ -1784,14 +1775,12 @@ unittest  // #26: a server->client request fails fast when its bound listener di
 	assert(failedFast);
 }
 
-unittest  // #6: a slow stream's write must not block delivery to a different stream
+unittest  // a slow stream's write must not block delivery to a different stream
 {
-	// finding #6: ServerPushChannel used to hold the channel-wide delivery mutex
-	// across the blocking SSE socket write, coupling every stream (head-of-line
-	// blocking). With per-listener write serialization off the channel mutex, a slow
-	// write on stream X must NOT delay a concurrent delivery to stream Y. Model two
-	// listeners: X's write yields for a while; Y's write is instant. Deliver to X and
-	// Y concurrently and assert Y finishes BEFORE X (impossible if both serialize on
+	// With per-listener write serialization off the channel mutex, a slow write on
+	// stream X must NOT delay a concurrent delivery to stream Y. Model two listeners:
+	// X's write yields for a while; Y's write is instant. Deliver to X and Y
+	// concurrently and assert Y finishes BEFORE X (impossible if both serialize on
 	// one channel mutex held across the write).
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
 	import core.time : msecs;
@@ -1821,7 +1810,7 @@ unittest  // #6: a slow stream's write must not block delivery to a different st
 				}
 			});
 			// Give the slow delivery a head start so it is mid-write (yielding) when the
-			// fast delivery is attempted — exactly the head-of-line condition #6 fixes.
+			// fast delivery is attempted — exactly the head-of-line condition under test.
 			sleep(5.msecs);
 			auto tFast = runTask(() nothrow{
 				try
@@ -1846,20 +1835,20 @@ unittest  // #6: a slow stream's write must not block delivery to a different st
 
 	assert(fastDoneAt > 0 && slowDoneAt > 0, "both deliveries must complete");
 	// The fast stream completed first even though the slow stream started first and
-	// was mid-write: the channel mutex is no longer held across the blocking write.
+	// was mid-write: the channel mutex is not held across the blocking write.
 	assert(fastDoneAt < slowDoneAt,
-			"a slow stream's write blocked a concurrent delivery to a different stream (#6)");
+			"a slow stream's write blocked a concurrent delivery to a different stream");
 }
 
-unittest  // #6/#74: concurrent emits to ONE stream keep per-stream seq ids monotonic
+unittest  // concurrent emits to ONE stream keep per-stream seq ids monotonic
 {
-	// finding #6 must preserve the #74 invariant: per-stream event ids are
-	// monotonic and gap-free in WRITE order. With writes moved off the channel
-	// mutex, two concurrent emits to the SAME listener could otherwise reserve seqs
-	// and write out of order. The per-listener write mutex serializes seq read +
-	// write + seq commit, so whichever write reaches the socket first carries the
-	// lower seq. Fire many concurrent emits at one listener and assert the captured
-	// event ids are exactly 0,1,2,... in the order the frames were written.
+	// Per-stream event ids are monotonic and gap-free in WRITE order. With writes
+	// off the channel mutex, two concurrent emits to the SAME listener could
+	// otherwise reserve seqs and write out of order. The per-listener write mutex
+	// serializes seq read + write + seq commit, so whichever write reaches the
+	// socket first carries the lower seq. Fire many concurrent emits at one listener
+	// and assert the captured event ids are exactly 0,1,2,... in the order the
+	// frames were written.
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
 	import core.time : msecs;
 	import std.string : indexOf, splitLines;
@@ -1909,7 +1898,7 @@ unittest  // #6/#74: concurrent emits to ONE stream keep per-stream seq ids mono
 
 	assert(frames.length == N, "every emit reached the single stream");
 	// Parse the seq half of each "id: <ordinal>-<seq>" line in write order: it must
-	// be 0,1,2,...,N-1 — strictly monotonic and gap-free (the #74 invariant).
+	// be 0,1,2,...,N-1 — strictly monotonic and gap-free.
 	auto seqs = frames.map!((f) {
 		const idLine = f[0 .. f.indexOf("\n")];
 		const dash = idLine.indexOf("-");
@@ -1917,10 +1906,10 @@ unittest  // #6/#74: concurrent emits to ONE stream keep per-stream seq ids mono
 	}).array;
 	foreach (i, s; seqs)
 		assert(s == cast(long) i,
-				"per-stream seq ids reordered under concurrent emits (#6/#74): " ~ seqs.to!string);
+				"per-stream seq ids reordered under concurrent emits: " ~ seqs.to!string);
 }
 
-unittest  // #25: history retains at most maxHistoryStreams ordinals (bounded memory)
+unittest  // history retains at most maxHistoryStreams ordinals (bounded memory)
 {
 	// Each plain GET stream that delivers an event records its own ordinal's
 	// history. Over many short-lived streams the total retained ordinals must stay
@@ -1980,7 +1969,7 @@ unittest  // released versions: a disconnect never reports cancelled (draft-only
 	assert(!ctx.isCancelled);
 }
 
-unittest  // #3/#22: HttpStreamContext exposes its per-connection token via ConnectionScoped
+unittest  // HttpStreamContext exposes its per-connection token via ConnectionScoped
 {
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
 	import vibe.stream.memory : createMemoryOutputStream;
@@ -1996,7 +1985,7 @@ unittest  // #3/#22: HttpStreamContext exposes its per-connection token via Conn
 	auto scoped = new HttpStreamContext(res, coord, caps, Json.undefined,
 			TokenInfo.invalid(), false, latestStable, "sess-XYZ");
 	assert(cast(ConnectionScoped) scoped !is null,
-			"HttpStreamContext must implement ConnectionScoped (#3/#22)");
+			"HttpStreamContext must implement ConnectionScoped");
 	assert(scoped.connectionToken() == "sess-XYZ");
 	assert(connectionTokenOf(scoped) == "sess-XYZ");
 
@@ -2005,13 +1994,12 @@ unittest  // #3/#22: HttpStreamContext exposes its per-connection token via Conn
 	assert(unscoped.connectionToken() == "");
 }
 
-unittest  // #3/#22: a cancellation scoped to session B must not suppress session A's same-id request
+unittest  // a cancellation scoped to session B must not suppress session A's same-id request
 {
-	// This exercises the REAL transport context (HttpStreamContext), not a synthetic
-	// ConnCtx, so it catches the inert-scoping regression the ConnCtx test misses:
-	// two Streamable HTTP sessions A and B share one McpServer and both have an
-	// in-flight request id 1. A `notifications/cancelled` for id 1 carried on a
-	// session-B-scoped context must only flip B's in-flight key -- A's must survive.
+	// This exercises the REAL transport context (HttpStreamContext): two Streamable
+	// HTTP sessions A and B share one McpServer and both have an in-flight request
+	// id 1. A `notifications/cancelled` for id 1 carried on a session-B-scoped
+	// context must only flip B's in-flight key -- A's must survive.
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
 	import vibe.stream.memory : createMemoryOutputStream;
 	import mcp.server.server : McpServer;
@@ -2039,8 +2027,7 @@ unittest  // #3/#22: a cancellation scoped to session B must not suppress sessio
 		Json p = Json.emptyObject;
 		p["requestId"] = 1;
 		s.handle(Message(makeNotification("notifications/cancelled", p)), ctxB);
-		assert(!ctx.isCancelled,
-			"a cancellation on session B wrongly cancelled session A (#3/#22)");
+		assert(!ctx.isCancelled, "a cancellation on session B wrongly cancelled session A");
 		CallToolResult r;
 		r.content = [Content.makeText("done")];
 		return r;
