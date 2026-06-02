@@ -1,7 +1,7 @@
 /**
  * examples/sampling — server.d
  *
- * Demonstrates the SERVER side of MCP **Sampling** (issue #354) in the
+ * Demonstrates the SERVER side of MCP **Sampling** in the
  * ergonomic UDA style. The server exposes annotated `@tool` methods on a class
  * (registered in one `registerHandlers` call); inside a tool it turns around
  * and asks the *client* for an LLM completion via `RequestContext.sample`
@@ -28,8 +28,7 @@
  *
  * DUAL-TRANSPORT: one binary, EITHER transport. The MCP stdio transport is
  * bidirectional, so the server→client sampling hop works over stdio just as it
- * does over Streamable HTTP (the HTTP keep-alive deadlock that used to bite this
- * path was fixed in #377). Transport selection is delegated to the shared
+ * does over Streamable HTTP. Transport selection is delegated to the shared
  * `examples/common` scaffold's `runServerFromArgs` (`--http` + `--port`/`--host`,
  * otherwise stdio):
  *
@@ -107,8 +106,7 @@ final class SamplingApi
 		req.temperature = nullable(0.0);
 
 		// The bidirectional hop: this blocks until the client's onSampling handler
-		// answers. Works over both stdio and Streamable HTTP (#377 fixed the HTTP
-		// keep-alive deadlock).
+		// answers. Works over both stdio and Streamable HTTP.
 		CreateMessageResult reply = ctx.sample(req);
 
 		return SummaryResult(reply.content.text, reply.model, reply.stopReason);
