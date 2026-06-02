@@ -78,13 +78,6 @@ final class HttpClientTransport : ClientTransport
 
 	this(string url) @safe
 	{
-		// Audit findings #7/#19/#23: the raw-TCP request paths (postAndAwaitRaw,
-		// resumeViaGet, runServerStream, runListenStream, runLegacyStream) now wrap
-		// the bare `connectTCP` in a vibe TLS tunnel for an https/wss endpoint via the
-		// shared `openClientStream` helper (TLSContextKind.client, SNI = host,
-		// peer-certificate verification), with the port defaulting to 443 for TLS. So
-		// the prior fail-closed guard on a TLS URL is removed: https/wss is supported,
-		// and a plaintext http/ws endpoint is unchanged.
 		this.url = url;
 	}
 
@@ -185,13 +178,12 @@ final class HttpClientTransport : ClientTransport
 		// (sampling / elicitation / roots) it writes that request as an SSE event
 		// on THIS POST's response stream and then blocks awaiting our reply. The
 		// reply must be sent on a SEPARATE POST while we are still reading this
-		// stream. vibe's pooled chunked HTTP-client reader does NOT surface a
+		// stream. vibe's pooled chunked HTTP-client reader does not surface a
 		// freshly-flushed SSE event's terminating blank line until the next chunk
-		// arrives, so the in-flight request was never dispatched and both peers
-		// deadlocked until the server's 60s timeout (issue #377). A raw connection
-		// (the same approach `runServerStream`/`resumeViaGet` already use for
-		// long-lived SSE) delivers each event immediately, so the client can reply
-		// and the round-trip completes.
+		// arrives, which would deadlock both peers. A raw connection (the same
+		// approach `runServerStream`/`resumeViaGet` use for long-lived SSE)
+		// delivers each event immediately, so the client can reply and the
+		// round-trip completes.
 		postAndAwaitRaw(message, expectId, result, got, err);
 
 		// An HTTP 400/404/405 on the modern single endpoint is the signal to try
@@ -225,8 +217,9 @@ final class HttpClientTransport : ClientTransport
 	/// JSON body or a `text/event-stream`; for an SSE response, notifications and
 	/// server->client requests that arrive BEFORE the final response are
 	/// dispatched (via `dispatchSse`) as soon as each complete event is received —
-	/// the key property the pooled `requestHTTP` reader lacked (see `postAndAwait`).
-	/// Mirrors the chunked-decode SSE parser of `runServerStream`/`resumeViaGet`.
+	/// the key property the pooled `requestHTTP` reader does not provide (see
+	/// `postAndAwait`). Mirrors the chunked-decode SSE parser of
+	/// `runServerStream`/`resumeViaGet`.
 	private void postAndAwaitRaw(Json message, long expectId, ref Json result,
 			ref bool got, ref McpException err) @safe
 	{
@@ -250,7 +243,7 @@ final class HttpClientTransport : ClientTransport
 				auto sock = connectTCP(host, port);
 				scope (exit)
 					sock.close();
-				// Wrap in TLS for https/wss; plaintext is returned unwrapped (#7/#19).
+				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, host);
 
 				string req = "POST " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
@@ -515,7 +508,7 @@ final class HttpClientTransport : ClientTransport
 				auto sock = connectTCP(host, port);
 				scope (exit)
 					sock.close();
-				// Wrap in TLS for https/wss; plaintext is returned unwrapped (#7/#19).
+				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, host);
 				string req = "GET " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
 					~ "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n";
@@ -831,7 +824,7 @@ final class HttpClientTransport : ClientTransport
 					auto sock = connectTCP(host, port);
 					scope (exit)
 						sock.close();
-					// Wrap in TLS for https/wss; plaintext is returned unwrapped (#7/#19).
+					// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 					auto conn = openClientStream(sock, ep.tls, host);
 
 					string req = "GET " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
@@ -1014,7 +1007,7 @@ final class HttpClientTransport : ClientTransport
 			auto sock = connectTCP(host, port);
 			scope (exit)
 				sock.close();
-			// Wrap in TLS for https/wss; plaintext is returned unwrapped (#7/#19).
+			// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 			auto conn = openClientStream(sock, ep.tls, host);
 
 			string req = "POST " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
@@ -1215,7 +1208,7 @@ final class HttpClientTransport : ClientTransport
 				auto sock = connectTCP(host, port);
 				scope (exit)
 					sock.close();
-				// Wrap in TLS for https/wss; plaintext is returned unwrapped (#7/#19).
+				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, host);
 
 				string req = "GET " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
@@ -1360,10 +1353,10 @@ final class HttpClientTransport : ClientTransport
 }
 
 /// The parsed components of an MCP endpoint URL, shared by every raw-TCP request
-/// path so host/port/scheme parsing lives in exactly one place (audit finding
-/// #23). `tls` is true for an `https://`/`wss://` scheme; `port` defaults to the
-/// scheme's well-known port (443 when `tls`, else 80) when the URL omits it, so a
-/// TLS URL can never be silently treated as plaintext on port 80.
+/// path so host/port/scheme parsing lives in exactly one place. `tls` is true for
+/// an `https://`/`wss://` scheme; `port` defaults to the scheme's well-known port
+/// (443 when `tls`, else 80) when the URL omits it, so a TLS URL can never be
+/// silently treated as plaintext on port 80.
 struct HttpEndpoint
 {
 	string host;
@@ -1412,7 +1405,7 @@ HttpEndpoint parseHttpEndpoint(string url) @safe
 /// Open a client byte stream to `ep`, wrapping the raw TCP connection in a vibe
 /// TLS tunnel when `ep.tls` is set (https/wss). Returns a `ProxyStream` so the
 /// five raw-TCP request paths share ONE TLS-handling site and treat the plaintext
-/// and TLS cases uniformly (audit findings #7/#19/#23). The TLS context uses
+/// and TLS cases uniformly. The TLS context uses
 /// `TLSContextKind.client` with peer-certificate verification (`checkPeer`) and
 /// sets the SNI/peer name to `ep.host`, so the server certificate and hostname are
 /// validated; the underlying `conn` must outlive the returned stream (callers keep
@@ -1580,7 +1573,7 @@ string resolveEndpointUri(string baseUrl, string endpoint) @safe
 	return origin ~ dir ~ endpoint;
 }
 
-unittest  // #23: parseHttpEndpoint defaults the port per scheme (443 for TLS)
+unittest  // parseHttpEndpoint defaults the port per scheme (443 for TLS)
 {
 	// https/wss default to 443; http and a bare host to 80. An explicit port wins.
 	auto h = parseHttpEndpoint("http://host/mcp");
@@ -1599,13 +1592,13 @@ unittest  // #23: parseHttpEndpoint defaults the port per scheme (443 for TLS)
 	assert(!bare.tls && bare.port == 9000 && bare.host == "host" && bare.path == "/p");
 }
 
-unittest  // #7/#19/#23: an https URL now constructs (TLS supported, no fail-fast)
+unittest  // an https URL constructs (TLS supported)
 {
-	// Audit findings #7/#19: the streaming HTTP client transport wires real TLS
-	// through every raw-TCP path (openClientStream wraps the connection in a vibe
-	// TLS tunnel with SNI = host and peer-certificate verification, port 443 by
-	// default). So an https/wss URL no longer fails fast -- construction succeeds and
-	// the actual TLS handshake happens on first connect.
+	// The streaming HTTP client transport wires real TLS through every raw-TCP
+	// path (openClientStream wraps the connection in a vibe TLS tunnel with
+	// SNI = host and peer-certificate verification, port 443 by default). An
+	// https/wss URL constructs successfully and the TLS handshake happens on
+	// first connect.
 	auto https = new HttpClientTransport("https://example.com/mcp");
 	assert(https !is null);
 	auto wss = new HttpClientTransport("wss://example.com/mcp");
@@ -1616,7 +1609,7 @@ unittest  // #7/#19/#23: an https URL now constructs (TLS supported, no fail-fas
 	assert(ok !is null);
 }
 
-unittest  // #7/#19: openClientStream returns a usable stream for plaintext (TLS path needs a live peer)
+unittest  // openClientStream returns a usable stream for plaintext (TLS path needs a live peer)
 {
 	// The plaintext branch returns the raw connection boxed in a ProxyStream so the
 	// five request paths share one static stream type. We cannot complete a TLS
