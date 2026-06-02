@@ -100,6 +100,28 @@ struct ToolResponse
 		return needsInput_;
 	}
 
+	/// The MRTR `inputRequests` this outcome carries (empty unless `needsInput`).
+	/// Read by the dispatch path so it can drop requests whose kind the client
+	/// never declared (#60).
+	const(InputRequest)[] inputRequests() const @safe
+	{
+		return required_.inputRequests;
+	}
+
+	/// The opaque MRTR `requestState` this outcome carries (empty unless set).
+	string requestState() const @safe
+	{
+		return required_.requestState;
+	}
+
+	/// Return a copy of this input-required outcome with its `inputRequests`
+	/// replaced by `reqs` (preserving `requestState`). Used by the dispatch path
+	/// after filtering out unsupported request kinds (#60).
+	ToolResponse withInputRequests(InputRequest[] reqs) const @safe
+	{
+		return ToolResponse.inputRequired(reqs, required_.requestState);
+	}
+
 	/// The JSON-RPC `result` payload (a `CallToolResult` or an
 	/// `InputRequiredResult`).
 	Json toJson() const @safe
@@ -202,6 +224,28 @@ struct PromptResponse
 	bool needsInput() const @safe
 	{
 		return needsInput_;
+	}
+
+	/// The MRTR `inputRequests` this outcome carries (empty unless `needsInput`).
+	/// Read by the dispatch path so it can drop requests whose kind the client
+	/// never declared (#60).
+	const(InputRequest)[] inputRequests() const @safe
+	{
+		return required_.inputRequests;
+	}
+
+	/// The opaque MRTR `requestState` this outcome carries (empty unless set).
+	string requestState() const @safe
+	{
+		return required_.requestState;
+	}
+
+	/// Return a copy of this input-required outcome with its `inputRequests`
+	/// replaced by `reqs` (preserving `requestState`). Used by the dispatch path
+	/// after filtering out unsupported request kinds (#60).
+	PromptResponse withInputRequests(InputRequest[] reqs) const @safe
+	{
+		return PromptResponse.inputRequired(reqs, required_.requestState);
 	}
 
 	/// The JSON-RPC `result` payload (a `GetPromptResult` or an
@@ -983,7 +1027,10 @@ final class McpServer
 		case MessageKind.request:
 			return handleRequest(msg, ctx);
 		case MessageKind.notification:
-			handleNotification(msg);
+			// Thread the request context into notification handling so an inbound
+			// `notifications/cancelled` resolves the SAME per-connection token the
+			// matching in-flight request was registered under (#13).
+			handleNotification(msg, ctx);
 			return Nullable!Json.init;
 		case MessageKind.response:
 		case MessageKind.errorResponse:
@@ -1143,7 +1190,12 @@ final class McpServer
 		// (basic/utilities/cancellation). `initialize` MUST NOT be cancelled, so
 		// it is never registered. Deregister on the way out regardless of outcome.
 		auto token = new CancellationToken;
-		const idKey = cancellationKey(msg.id);
+		// Scope the registry key by the request's connection/session token so two
+		// concurrent clients sharing one McpServer over Streamable HTTP cannot
+		// collide on an identical bare JSON-RPC id (#13). A non-connection-scoped
+		// context yields an empty token, so the single-connection (stdio /
+		// in-process) key is unchanged.
+		const idKey = inFlightKey(connectionTokenOf(ctx), msg.id);
 		const trackable = idKey.length && msg.method != "initialize";
 		if (trackable)
 			inFlight[idKey] = token;
@@ -1181,6 +1233,23 @@ final class McpServer
 		}
 	}
 
+	/// The in-flight registry key for a request: its connection/session token
+	/// composed with the normalised JSON-RPC id (#13). Keeps cancellations from
+	/// one connection from matching an identically-numbered in-flight request on
+	/// another connection that shares this McpServer. Returns an empty string for
+	/// an absent/null id (a notification has none and is never tracked); the empty
+	/// connection token (the default for non-multiplexing transports) yields the
+	/// historic id-only behaviour because every request then shares one scope.
+	private static string inFlightKey(string connToken, Json id) @safe
+	{
+		const idKey = cancellationKey(id);
+		if (idKey.length == 0)
+			return "";
+		// `\x1f` (unit separator) cannot appear in the "s:"/"i:" prefixed id key,
+		// so the (token, id) pair is unambiguous.
+		return connToken ~ "\x1f" ~ idKey;
+	}
+
 	/// The registry key for a request id. JSON-RPC ids are strings or numbers;
 	/// `notifications/cancelled` carries the same id under `requestId`, so both
 	/// sides normalise to the same string form. Returns an empty string for an
@@ -1201,6 +1270,52 @@ final class McpServer
 		default:
 			return "";
 		}
+	}
+
+	/// Whether the client's `declared` capabilities can satisfy a single MRTR
+	/// `InputRequest` (#60). The spec forbids emitting an `InputRequest` whose kind
+	/// the client never advertised: elicitation requires the matching elicitation
+	/// submode (url-mode -> `elicitation.url`, form-mode -> `elicitation.form`, the
+	/// latter implied by a bare `elicitation:{}`); sampling requires `sampling`
+	/// (plus `sampling.tools` when the request carries `tools`/`toolChoice`); roots
+	/// requires `roots`. An `InputRequest` of an unrecognised kind is left to the
+	/// caller (kept), since the SDK cannot map it to a capability.
+	private static bool clientCanSatisfy(ref const InputRequest reqst,
+			ref const ClientCapabilities declared) @safe
+	{
+		const k = reqst.kind;
+		if (k.isNull)
+			return true; // unknown kind: do not second-guess
+		final switch (k.get)
+		{
+		case InputKind.elicitation:
+			const isUrl = reqst.params.type == Json.Type.object
+				&& "mode" in reqst.params && reqst.params["mode"].type == Json.Type.string
+				&& reqst.params["mode"].get!string == "url";
+			return isUrl ? declared.elicitationUrl : declared.elicitationForm;
+		case InputKind.sampling:
+			if (!declared.sampling)
+				return false;
+			const usesTools = reqst.params.type == Json.Type.object
+				&& ("tools" in reqst.params || "toolChoice" in reqst.params);
+			return usesTools ? declared.samplingTools : true;
+		case InputKind.roots:
+			return declared.roots;
+		}
+	}
+
+	/// Filter an MRTR `inputRequests` list to those the client can satisfy (#60),
+	/// dropping any whose kind the client did not declare. The dispatch path calls
+	/// this on a handler's `InputRequiredResult` before serialising, so the server
+	/// never asks a client for input it cannot provide.
+	private static InputRequest[] supportedInputRequests(const(InputRequest)[] reqs,
+			ref const ClientCapabilities declared) @safe
+	{
+		InputRequest[] kept;
+		foreach (ref r; reqs)
+			if (clientCanSatisfy(r, declared))
+				kept ~= r;
+		return kept;
 	}
 
 	/// Configure the per-list draft `CacheableResult` freshness hint
@@ -1367,7 +1482,7 @@ final class McpServer
 				"Unsupported protocol version", data);
 	}
 
-	private void handleNotification(Message msg) @safe
+	private void handleNotification(Message msg, RequestContext ctx) @safe
 	{
 		switch (msg.method)
 		{
@@ -1375,7 +1490,10 @@ final class McpServer
 			initialized = true;
 			break;
 		case "notifications/cancelled":
-			handleCancelled(msg.params);
+			// Resolve the cancellation against the connection it arrived on (#13):
+			// a `notifications/cancelled` on connection B must only match in-flight
+			// keys connection B registered.
+			handleCancelled(msg.params, connectionTokenOf(ctx));
 			break;
 		case "notifications/roots/list_changed":
 			if (onRootsListChanged_ !is null)
@@ -1397,7 +1515,7 @@ final class McpServer
 	/// can stop and its response is suppressed. A cancellation for a request that
 	/// is unknown or already completed is ignored, per "This notification
 	/// indicates ... the request ... should be terminated" being best-effort.
-	private void handleCancelled(Json params) @safe
+	private void handleCancelled(Json params, string connToken) @safe
 	{
 		if (params.type != Json.Type.object || "requestId" !in params)
 			return;
@@ -1431,7 +1549,7 @@ final class McpServer
 			return;
 		}
 
-		const key = cancellationKey(params["requestId"]);
+		const key = inFlightKey(connToken, params["requestId"]);
 		if (key.length == 0)
 			return;
 		if (auto token = key in inFlight)
@@ -1496,7 +1614,7 @@ final class McpServer
 		case "prompts/list":
 			return doListPrompts(params, ver);
 		case "prompts/get":
-			return doGetPrompt(params, ctx);
+			return doGetPrompt(params, ctx, ver);
 		case "completion/complete":
 			return doComplete(params);
 		case "logging/setLevel":
@@ -1883,7 +2001,7 @@ final class McpServer
 		return Nullable!CacheHint.init;
 	}
 
-	private Json doGetPrompt(Json params, RequestContext ctx) @safe
+	private Json doGetPrompt(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
 		if ("name" !in params || params["name"].type != Json.Type.string)
 			throw invalidParams("prompts/get requires a string 'name'");
@@ -1911,7 +2029,23 @@ final class McpServer
 		// client attached to this (retried) request. The `resultType`
 		// discriminator (and statelessness) is draft-gated by the dispatch path,
 		// so 2025-era wire output is unchanged.
-		return entry.handler(args, ctx).toJson();
+		auto response = entry.handler(args, ctx);
+		// MRTR (#60): mirror doCallTool — never ask the client for an input kind
+		// it did not declare. MRTR is draft-only (`usesMRTR`); the declared set is
+		// the request's own `_meta.clientCapabilities`.
+		if (ver.usesMRTR && response.needsInput)
+		{
+			const ClientCapabilities declared = RequestMeta.fromParams(params).clientCapabilities;
+			auto kept = supportedInputRequests(response.inputRequests, declared);
+			if (kept.length != response.inputRequests.length)
+			{
+				if (kept.length == 0 && response.requestState.length == 0)
+					throw internalError(
+							"prompts/get handler returned only input requests the client cannot satisfy");
+				response = response.withInputRequests(kept);
+			}
+		}
+		return response.toJson();
 	}
 
 	private Json doComplete(Json params) @safe
@@ -2051,6 +2185,25 @@ final class McpServer
 		{
 			// CallToolResult or InputRequiredResult.
 			auto response = entry.handler(args, ctx);
+			// MRTR (#60): an InputRequiredResult MUST NOT ask the client for an
+			// input kind it never declared. Drop any unsupported inputRequests
+			// against the same `declared` set used for capability gating above. If
+			// that leaves no requests AND no requestState, the result violates the
+			// spec ("at least one of inputRequests/requestState"), so surface it as
+			// an internal error rather than emitting an unfulfillable round trip.
+			// MRTR exists only on the draft (stateless) protocol — `usesMRTR` —
+			// where `declared` is the request's own _meta.clientCapabilities; a
+			// non-draft InputRequiredResult is left untouched.
+			if (ver.usesMRTR && response.needsInput)
+			{
+				auto kept = supportedInputRequests(response.inputRequests, declared);
+				if (kept.length != response.inputRequests.length)
+				{
+					if (kept.length == 0 && response.requestState.length == 0)
+						throw internalError("tools/call handler returned only input requests the client cannot satisfy");
+					response = response.withInputRequests(kept);
+				}
+			}
 			// Validate the handler's (un-projected) output against the tool's
 			// declared outputSchema before version-shaping, so validation always
 			// sees the full structuredContent regardless of the negotiated version.
@@ -3182,6 +3335,125 @@ unittest  // cancellation matches string-id requests too
 	auto resp = s.handle(Message(makeRequest(Json("req-abc"), "tools/call", callP)));
 	assert(sawCancelled);
 	assert(resp.isNull);
+}
+
+version (unittest) private final class ConnCtx : RequestContext, ConnectionScoped
+{
+	// A RequestContext that reports a fixed per-connection token, modelling two
+	// concurrent Streamable HTTP sessions sharing one McpServer (#13).
+	import mcp.auth.resource_server : TokenInfo;
+
+	private string token_;
+	this(string token) @safe
+	{
+		this.token_ = token;
+	}
+
+	string connectionToken() @safe
+	{
+		return token_;
+	}
+
+	bool isCancelled() @safe
+	{
+		return false;
+	}
+
+	void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
+	{
+	}
+
+	void log(string, Json, string = null) @safe
+	{
+	}
+
+	Json sendRequest(string, Json) @safe
+	{
+		throw invalidRequest("no channel");
+	}
+
+	bool clientSupports(string) @safe
+	{
+		return true;
+	}
+
+	bool isStateless() @safe
+	{
+		return false;
+	}
+
+	Json[string] inputResponses() @safe
+	{
+		Json[string] empty;
+		return empty;
+	}
+
+	string requestState() @safe
+	{
+		return "";
+	}
+
+	TokenInfo auth() @safe
+	{
+		return TokenInfo.invalid();
+	}
+}
+
+unittest  // #13: a cancellation on connection B must not suppress connection A's same-id request
+{
+	// Two concurrent connections (A and B) share one McpServer. Both have an
+	// in-flight request with the IDENTICAL JSON-RPC id 42. A cancellation that
+	// arrives on connection B's channel must only match B's in-flight key, never
+	// A's: the registry is keyed by (connectionToken, id), not the bare id.
+	auto s = new McpServer("t", "1");
+	auto ctxA = new ConnCtx("conn-A");
+	auto ctxB = new ConnCtx("conn-B");
+
+	Tool slow = {name: "slow"};
+	s.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+		// While request id 42 runs on connection A, a cancellation for id 42
+		// arrives on connection B. With per-connection keying this must NOT flip
+		// A's token.
+		Json p = Json.emptyObject;
+		p["requestId"] = 42;
+		s.handle(Message(makeNotification("notifications/cancelled", p)), ctxB);
+		assert(!ctx.isCancelled,
+			"a cancellation on connection B wrongly cancelled connection A (#13)");
+		CallToolResult r;
+		r.content = [Content.makeText("done")];
+		return r;
+	});
+
+	Json callP = Json.emptyObject;
+	callP["name"] = "slow";
+	auto resp = s.handle(req(42, "tools/call", callP), ctxA);
+	assert(!resp.isNull, "connection A's response must NOT be suppressed (#13)");
+	assert(resp.get["result"]["content"][0]["text"].get!string == "done");
+}
+
+unittest  // #13: a cancellation on the SAME connection still cancels (keying preserves behaviour)
+{
+	auto s = new McpServer("t", "1");
+	auto ctxA = new ConnCtx("conn-A");
+	bool sawCancelled;
+
+	Tool slow = {name: "slow"};
+	s.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+		Json p = Json.emptyObject;
+		p["requestId"] = 42;
+		// Same connection A as the in-flight request -> must match and cancel.
+		s.handle(Message(makeNotification("notifications/cancelled", p)), ctxA);
+		sawCancelled = ctx.isCancelled;
+		CallToolResult r;
+		r.content = [Content.makeText("done")];
+		return r;
+	});
+
+	Json callP = Json.emptyObject;
+	callP["name"] = "slow";
+	auto resp = s.handle(req(42, "tools/call", callP), ctxA);
+	assert(sawCancelled, "a cancellation on the same connection must still cancel (#13)");
+	assert(resp.isNull, "the cancelled request's response must be suppressed (#13)");
 }
 
 unittest  // notifications/roots/list_changed fires the dedicated server hook
@@ -4970,7 +5242,12 @@ version (unittest)
 			"name": Json("c"),
 			"version": Json("1")
 		]);
-		meta[MetaKey.clientCapabilities] = Json.emptyObject;
+		// These MRTR tools gather input via elicitation, so the client declares the
+		// elicitation capability — without it the server now (correctly, #60) drops
+		// the elicitation inputRequest as unfulfillable.
+		meta[MetaKey.clientCapabilities] = Json([
+			"elicitation": Json.emptyObject
+		]);
 		Json params = Json.emptyObject;
 		params["name"] = tool;
 		params["arguments"] = Json.emptyObject;
@@ -5054,6 +5331,85 @@ unittest  // SEP-2322: a stateless server emits requestState and reads it back o
 	assert(retry["result"]["content"][0]["text"].get!string == "resumed:awaiting-date day:friday");
 }
 
+unittest  // #60: a draft InputRequiredResult drops an elicitation request the client cannot satisfy
+{
+	// The handler asks for elicitation, but this draft request's
+	// _meta.clientCapabilities omits elicitation. Per #60 the server MUST NOT
+	// emit an inputRequest whose kind the client never declared. With no other
+	// request and no requestState, the result is a server-side error rather than
+	// an InputRequiredResult that the client could never fulfil.
+	auto s = new McpServer("t", "1");
+	Tool ask = {name: "ask"};
+	s.registerDynamicTool(ask, (Json args, RequestContext ctx) @safe {
+		Json ep = Json.emptyObject;
+		ep["message"] = "Your name?";
+		return ToolResponse.inputRequired([
+			InputRequest("q1", "elicitation", ep)
+		]);
+	});
+	// draftReq declares empty clientCapabilities -> elicitation unsupported.
+	Json p = Json(["name": Json("ask")]);
+	auto resp = s.handle(draftReq(70, "tools/call", p)).get;
+	assert("error" in resp, "an unsatisfiable lone inputRequest must surface a server error (#60)");
+	// And crucially, no elicitation/create leaked into a result.
+	assert("result" !in resp || "inputRequests" !in resp["result"]
+			|| "q1" !in resp["result"]["inputRequests"],
+			"elicitation/create must not be emitted to a client that omitted elicitation (#60)");
+}
+
+unittest  // #60: the same elicitation request IS emitted when the client declared elicitation
+{
+	auto s = new McpServer("t", "1");
+	Tool ask = {name: "ask"};
+	s.registerDynamicTool(ask, (Json args, RequestContext ctx) @safe {
+		Json ep = Json.emptyObject;
+		ep["message"] = "Your name?";
+		return ToolResponse.inputRequired([
+			InputRequest("q1", "elicitation", ep)
+		]);
+	});
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	meta[MetaKey.clientCapabilities] = Json(["elicitation": Json.emptyObject]);
+	Json p = Json.emptyObject;
+	p["name"] = "ask";
+	p["_meta"] = meta;
+	auto resp = s.handle(Message(makeRequest(Json(71), "tools/call", p))).get;
+	assert("error" !in resp);
+	assert("q1" in resp["result"]["inputRequests"],
+			"a declared-capability request must be emitted (#60)");
+	assert(resp["result"]["inputRequests"]["q1"]["method"].get!string == "elicitation/create");
+}
+
+unittest  // #60: a mixed InputRequiredResult drops only the unsupported kinds
+{
+	// elicitation is declared, roots is not: only the roots request is dropped,
+	// the elicitation request survives so the round trip can still proceed.
+	auto s = new McpServer("t", "1");
+	Tool ask = {name: "ask"};
+	s.registerDynamicTool(ask, (Json args, RequestContext ctx) @safe {
+		Json ep = Json.emptyObject;
+		ep["message"] = "Your name?";
+		return ToolResponse.inputRequired([
+			InputRequest("q1", "elicitation", ep), InputRequest.roots("r1")
+		]);
+	});
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	meta[MetaKey.clientCapabilities] = Json(["elicitation": Json.emptyObject]);
+	Json p = Json.emptyObject;
+	p["name"] = "ask";
+	p["_meta"] = meta;
+	auto resp = s.handle(Message(makeRequest(Json(72), "tools/call", p))).get;
+	assert("error" !in resp);
+	assert("q1" in resp["result"]["inputRequests"],
+			"the supported elicitation request must survive (#60)");
+	assert("r1" !in resp["result"]["inputRequests"],
+			"the unsupported roots request must be dropped (#60)");
+}
+
 unittest  // elicit() is rejected on a stateless (draft) request
 {
 	auto s = new McpServer("t", "1");
@@ -5093,7 +5449,12 @@ version (unittest)
 			"name": Json("c"),
 			"version": Json("1")
 		]);
-		meta[MetaKey.clientCapabilities] = Json.emptyObject;
+		// The MRTR prompts gather input via elicitation, so the client declares the
+		// elicitation capability (#60: otherwise the server drops the elicitation
+		// inputRequest as unfulfillable).
+		meta[MetaKey.clientCapabilities] = Json([
+			"elicitation": Json.emptyObject
+		]);
 		Json params = Json.emptyObject;
 		params["name"] = prompt;
 		params["arguments"] = Json.emptyObject;
