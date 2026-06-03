@@ -493,6 +493,20 @@ string decodeHeaderValue(string headerValue) @safe
 	return headerValue;
 }
 
+/// Whether a header value would corrupt the request line if written verbatim:
+/// an embedded CR or LF lets the value terminate the current header and inject
+/// further headers (or smuggle a request) into the outbound HTTP stream. The raw
+/// socket request paths call this as a last line of defence before concatenating
+/// a value onto the wire, so even a value that bypassed `encodeHeaderValue`
+/// cannot break framing.
+bool isHeaderValueUnsafe(string value) @safe nothrow @nogc
+{
+	foreach (char c; value)
+		if (c == '\r' || c == '\n')
+			return true;
+	return false;
+}
+
 /// Whether a JSON Schema `type` value is one the draft permits an `x-mcp-header`
 /// annotation to be applied to. Per `server/tools` #x-mcp-header, only the
 /// primitive types `integer`, `string`, and `boolean` are allowed; `number` is
@@ -1463,6 +1477,27 @@ unittest  // header value codec: plain ASCII passes through; others base64
 	assert(encodeHeaderValue(" padded ")[0 .. 9] == "=?base64?");
 	assert(decodeHeaderValue(encodeHeaderValue(" padded ")) == " padded ");
 	assert(decodeHeaderValue(encodeHeaderValue("=?base64?x?=")) == "=?base64?x?=");
+}
+
+unittest  // encodeHeaderValue neutralises CR/LF, so an encoded value is wire-safe
+{
+	// A URI carrying CR/LF must not survive as raw control bytes in the output;
+	// it is base64-wrapped and the result carries no CR/LF.
+	const evil = "file:///x\r\nMcp-Injected: 1";
+	const enc = encodeHeaderValue(evil);
+	assert(enc[0 .. 9] == "=?base64?");
+	assert(!isHeaderValueUnsafe(enc));
+	assert(decodeHeaderValue(enc) == evil);
+}
+
+unittest  // isHeaderValueUnsafe flags only embedded CR/LF
+{
+	assert(isHeaderValueUnsafe("a\rb"));
+	assert(isHeaderValueUnsafe("a\nb"));
+	assert(isHeaderValueUnsafe("trailing\r\n"));
+	assert(!isHeaderValueUnsafe("file:///a b"));
+	assert(!isHeaderValueUnsafe("us-west1"));
+	assert(!isHeaderValueUnsafe(""));
 }
 
 unittest  // isValidMetaKey: plain names without prefix

@@ -1394,7 +1394,7 @@ final class McpClient : ClientProtocol
 					name = params["uri"].get!string;
 			}
 			if (name.length)
-				headers[HttpHeader.name] = name;
+				headers[HttpHeader.name] = encodeHeaderValue(name);
 
 			// Mirror x-mcp-header-annotated tool arguments into Mcp-Param-{Name}
 			// headers (draft basic/transports, "Custom Headers from Tool
@@ -3627,6 +3627,52 @@ unittest  // a draft client's ClientProtocol yields the MCP-Protocol-Version hea
 	c.enableDraft();
 	auto headers = transport.protocol.headersFor(Json.undefined);
 	assert(headers["MCP-Protocol-Version"] == ProtocolVersion.draft.toWire);
+}
+
+unittest  // a resources/read URI is encoded in Mcp-Name, never placed raw (no CR/LF injection)
+{
+	import mcp.protocol.draft : decodeHeaderValue;
+
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	c.enableDraft();
+
+	// A server-advertised URI carrying CR/LF must not appear verbatim in the
+	// header value; it round-trips through encodeHeaderValue instead.
+	const evil = "file:///x\r\nMcp-Injected: 1";
+	Json msg = Json.emptyObject;
+	msg["method"] = "resources/read";
+	Json params = Json.emptyObject;
+	params["uri"] = evil;
+	msg["params"] = params;
+
+	auto headers = transport.protocol.headersFor(msg);
+	const wire = headers[HttpHeader.name];
+	import std.algorithm : canFind;
+
+	assert(!wire.canFind('\r') && !wire.canFind('\n'),
+			"Mcp-Name must not carry raw CR/LF onto the wire");
+	assert(decodeHeaderValue(wire) == evil, "encoded Mcp-Name must round-trip to the URI");
+}
+
+unittest  // a benign reserved-character resource URI still survives Mcp-Name encoding
+{
+	import mcp.protocol.draft : decodeHeaderValue;
+
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	c.enableDraft();
+
+	// A space is a non-token byte: it must be encoded rather than corrupt the line.
+	const uri = "file:///a b";
+	Json msg = Json.emptyObject;
+	msg["method"] = "resources/read";
+	Json params = Json.emptyObject;
+	params["uri"] = uri;
+	msg["params"] = params;
+
+	auto headers = transport.protocol.headersFor(msg);
+	assert(decodeHeaderValue(headers[HttpHeader.name]) == uri);
 }
 
 unittest  // connect() routes a legacy HTTP+SSE fallback through the transport seam, not a downcast
