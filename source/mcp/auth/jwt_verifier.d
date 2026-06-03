@@ -507,11 +507,12 @@ private string fetchJwks(string uri) @trusted
 	import vibe.http.client : requestHTTP, HTTPClientRequest, HTTPClientResponse;
 	import vibe.http.common : HTTPMethod;
 	import vibe.stream.operations : readAllUTF8;
-	import mcp.auth.oauth : isSecureFetchUrl;
+	import mcp.auth.oauth : isSecureFetchUrlResolved;
 
 	// Refuse to fetch a JWKS over an insecure transport (must be https, or http
-	// to a loopback host for dev) or from an internal/link-local address.
-	if (!isSecureFetchUrl(uri))
+	// to a loopback host for dev) or from an internal/link-local address —
+	// including a hostname that resolves to one (DNS-rebinding SSRF mitigation).
+	if (!isSecureFetchUrlResolved(uri))
 		return null;
 
 	string body_;

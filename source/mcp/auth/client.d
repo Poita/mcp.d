@@ -481,8 +481,9 @@ final class OAuthClient
 	private bool tryGetJson(string url, out Json result) @safe
 	{
 		// Never fetch a discovery URL that is not HTTPS (or loopback for dev) or
-		// that targets an internal/link-local address (SSRF mitigation).
-		if (!isSecureFetchUrl(url))
+		// that targets an internal/link-local address — including a hostname that
+		// resolves to one (DNS-rebinding SSRF mitigation).
+		if (!isSecureFetchUrlResolved(url))
 			return false;
 		bool ok;
 		Json parsed;
