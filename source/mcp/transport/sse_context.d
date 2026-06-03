@@ -183,6 +183,14 @@ final class StreamCoordinator
 	/// was delivered on disconnects before the client could respond: rather than
 	/// letting the awaiter block for the full timeout, it is released promptly with
 	/// an `McpException`. Unknown ids are ignored.
+	///
+	/// The waiter is left in the table: cleanup is the awaiter's responsibility via
+	/// `await`/`awaitLive`'s `scope (exit) waiters.remove(id)`. Callers MUST only fail
+	/// ids that have (or will have) a live awaiter, which holds for the sole caller
+	/// `removeListenerLocked`: every id it fails was registered in `sendRequest`
+	/// immediately before its `awaitLive`, and an id whose delivery failed is dropped
+	/// via `cancel` rather than reaching this path. A failed waiter that is awaited
+	/// only afterwards still observes `done`/`error` (see the fail-then-await unittest).
 	void failPending(long id, McpException error) @safe
 	{
 		if (auto w = id in waiters)
@@ -327,6 +335,19 @@ struct SubscriptionFilter
 			return true;
 		}
 	}
+}
+
+unittest  // failPending is idempotent and leaves the awaiter to clean the table up
+{
+	// Failing the same id twice must not throw: the second call simply re-marks an
+	// already-failed waiter. The waiter stays in the table (the awaiter removes it),
+	// so the fail-then-await path can still observe and report the error.
+	auto coord = new StreamCoordinator;
+	const id = coord.alloc();
+	coord.register(id);
+
+	coord.failPending(id, internalError("first"));
+	coord.failPending(id, internalError("second")); // idempotent: no throw, no crash
 }
 
 unittest  // an inactive filter (plain GET stream) accepts every notification type
@@ -584,6 +605,22 @@ final class ServerPushChannel
 		return listeners.length;
 	}
 
+	/// Whether a listener with `id` is still connected. Used as the liveness probe
+	/// for `sendRequest`'s `awaitLive`, so a server->client request awaiter is
+	/// released promptly if its target stream drops.
+	private bool isListenerLive(long listenerId) @safe
+	{
+		return () @trusted {
+			synchronized (mtx)
+			{
+				foreach (l; listeners)
+					if (l.id == listenerId)
+						return true;
+				return false;
+			}
+		}();
+	}
+
 	/// Number of stream ordinals currently retaining replay history. Exposed for
 	/// tests/diagnostics to verify the LRU bound; the value is at most
 	/// `maxHistoryStreams`.
@@ -647,7 +684,15 @@ final class ServerPushChannel
 	/// ordered (the seq read + write + commit all happen under that one `writeMtx`,
 	/// so the frame that reaches the socket first carries the lower seq), while a
 	/// slow stream does not block delivery to others.
-	private long deliver(Json msg, scope bool delegate(ref const Listener) @safe eligible) @safe
+	/// When `bindRequestId >= 0`, the message is an in-flight server->client request
+	/// and its id is bound to the chosen listener (`requestListener[bindRequestId] =
+	/// listenerId`) under `mtx` BEFORE the blocking write, atomically with confirming
+	/// the candidate is still live (see `writeToListener`). This closes the disconnect
+	/// race: a `removeListenerLocked` scan that runs while the frame is being written
+	/// already observes the binding and fails the awaiter immediately, rather than the
+	/// binding being recorded only after `deliver` returns.
+	private long deliver(Json msg,
+			scope bool delegate(ref const Listener) @safe eligible, long bindRequestId = -1) @safe
 	{
 		// Snapshot the eligible candidates (in registration order) under the lock so
 		// the list cannot mutate under us; the actual writes happen off the lock.
@@ -663,7 +708,7 @@ final class ServerPushChannel
 
 		foreach (l; candidates)
 		{
-			if (writeToListener(l, msg))
+			if (writeToListener(l, msg, bindRequestId))
 				return l.id; // single-stream delivery: stop at the first success
 		}
 		return -1;
@@ -676,7 +721,7 @@ final class ServerPushChannel
 	/// monotonic in write order. Returns true if the frame was written; false if the
 	/// listener was concurrently removed or its write threw (in which case it is
 	/// dropped from the channel).
-	private bool writeToListener(Listener l, Json msg) @safe
+	private bool writeToListener(Listener l, Json msg, long bindRequestId = -1) @safe
 	{
 		import std.conv : to;
 
@@ -695,6 +740,12 @@ final class ServerPushChannel
 						present = true;
 						seq = seqOf[l.id];
 						ordinal = streamOf[l.id];
+						// Commit the request->listener binding here, under `mtx` and
+						// before the blocking write, so a concurrent disconnect's
+						// `removeListenerLocked` scan observes the in-flight id and
+						// fails its awaiter immediately instead of after the write.
+						if (bindRequestId >= 0)
+							requestListener[bindRequestId] = l.id;
 					}
 				}
 				if (!present)
@@ -709,7 +760,14 @@ final class ServerPushChannel
 				catch (Exception)
 				{
 					synchronized (mtx)
+					{
+						// Drop the binding before dropping the listener so the failed
+						// in-flight request is failed exactly once by the caller, not
+						// orphaned onto a listener that is about to disappear.
+						if (bindRequestId >= 0)
+							requestListener.remove(bindRequestId);
 						removeListenerLocked(l.id);
+					}
 					return false;
 				}
 				// Brief lock: commit. Because this whole body holds l.writeMtx, no
@@ -798,20 +856,29 @@ final class ServerPushChannel
 	{
 		const id = coord.alloc();
 		coord.register(id);
-		// Learn which listener the request frame lands on so a later disconnect of
-		// THAT listener fails this awaiter immediately.
+		// Bind the in-flight request to its target listener under the channel mutex
+		// BEFORE the blocking write (passing `id` into `deliver`), not after it
+		// returns. A listener disconnect that races the write is then seen by
+		// `removeListenerLocked`'s scan, which fails this awaiter immediately rather
+		// than stranding it for the full timeout.
 		const listenerId = deliver(makeRequest(Json(id), method, params),
-				(ref const Listener) @safe => true);
+				(ref const Listener) @safe => true, id);
 		if (listenerId < 0)
 		{
 			coord.cancel(id);
 			throw internalError(
 					"No GET SSE listener connected to receive the server->client request");
 		}
-		requestListener[id] = listenerId;
 		scope (exit)
-			requestListener.remove(id);
-		return coord.await(id, timeout);
+			() @trusted {
+			synchronized (mtx)
+				requestListener.remove(id);
+		}();
+		// Liveness defense-in-depth: even if a disconnect is somehow missed, polling
+		// whether the bound listener is still connected releases the fiber within one
+		// slice instead of the full timeout (mirrors the POST path's `awaitLive`).
+		return coord.awaitLive(id, () @safe => isListenerLive(listenerId),
+				internalError("GET SSE listener disconnected before the client responded"), timeout);
 	}
 
 	/// Initiate a `ping` toward the connected client(s) on the GET SSE push
@@ -1190,6 +1257,45 @@ unittest  // distinct listeners get distinct stream ordinals, so ids stay unique
 	import std.string : splitLines;
 
 	assert(aFrame.splitLines()[0] != bFrame.splitLines()[0]);
+}
+
+unittest  // a disconnect DURING the request write fails the awaiter, not after it
+{
+	// The request->listener binding must be committed before the
+	// blocking write, so a listener that disconnects while the request frame is
+	// being written is associated with the in-flight id and its awaiter is failed
+	// immediately. Simulate the race: the listener's write callback removes the
+	// listener (a mid-write disconnect). With the binding recorded up-front,
+	// removeListenerLocked finds the id and fails the pending request.
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+
+	const id = coord.alloc();
+	coord.register(id);
+
+	long selfId;
+	// The write delegate disconnects this very listener mid-write.
+	selfId = ch.addListener((string) @safe { ch.removeListener(selfId); });
+
+	// Deliver the request frame WITH the binding (as sendRequest now does). The
+	// mid-write removeListener observes the binding and fails the pending id.
+	const landed = ch.deliver(makeRequest(Json(id), "ping", Json.emptyObject),
+			(ref const ServerPushChannel.Listener) @safe => true, id);
+	// The single live candidate was tried; its write tore the connection down.
+	assert(landed == selfId || landed < 0);
+
+	// Because the binding was recorded before the blocking write, the mid-write
+	// removeListenerLocked scan found the in-flight id and failed its waiter. The
+	// waiter is now done+errored, so awaiting it returns immediately with the
+	// disconnect McpException instead of parking for the full timeout.
+	import mcp.protocol.errors : McpException;
+
+	bool threw;
+	try
+		coord.await(id, 1.seconds);
+	catch (McpException)
+		threw = true;
+	assert(threw, "a disconnect during the write must fail the awaiter, not strand it");
 }
 
 /// The HTTP response headers a server sets when it upgrades a response to a
