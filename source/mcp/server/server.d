@@ -1112,9 +1112,34 @@ final class McpServer
 			// the 2025-era subscribe-then-deliver gate (`isSubscribed(uri)`). On the
 			// draft single-connection path the global opt-in still gates that fallback.
 			const plainEligible = plainGetEligible(method, uri);
-			delivered += pushChannel.emitFiltered(method, params, uri, plainEligible);
+			// The three list-changed notifications are genuine broadcasts: every
+			// connected session MUST be told the list changed, not just the first
+			// eligible stream. Fan them out once per distinct session via
+			// `emitFilteredPerOwner` (still one stream per session, honouring Multiple
+			// Connections within a session). `notifications/resources/updated` stays
+			// single-stream and per-session gated via `plainGetEligibleFor`.
+			if (isListChangedBroadcast(method))
+				delivered += pushChannel.emitFilteredPerOwner(method, params, uri, plainEligible);
+			else
+				delivered += pushChannel.emitFiltered(method, params, uri, plainEligible);
 		}
 		return delivered;
+	}
+
+	/// Whether `method` is one of the three list-changed notifications that are
+	/// genuine broadcasts (every connected session must receive them), as opposed to
+	/// the per-session `notifications/resources/updated`.
+	private static bool isListChangedBroadcast(string method) @safe
+	{
+		switch (method)
+		{
+		case "notifications/tools/list_changed":
+		case "notifications/prompts/list_changed":
+		case "notifications/resources/list_changed":
+			return true;
+		default:
+			return false;
+		}
 	}
 
 	/// Eligibility for a plain (2025-era standalone GET) listener whose
@@ -1173,6 +1198,32 @@ final class McpServer
 		if (pushChannel is null)
 			throw internalError("No server->client push channel; the server is not mounted on a Streamable HTTP transport");
 		pushChannel.ping(timeout);
+	}
+
+	/// Initiate a server->client `ping` on the GET SSE stream owned by the session
+	/// `sessionId` (its `Mcp-Session-Id`). On a stateful HTTP server every per-session
+	/// GET stream is registered under its session id as the listener's owner token, so
+	/// the probe must be scoped to that token to reach the right stream — an empty
+	/// token (the no-arg `pingClient`) matches no session-scoped listener and would
+	/// always fail. The waiter is likewise scoped to `sessionId`, so only a response
+	/// POSTed under the same session resolves it. Throws as the no-arg form does, plus
+	/// when no GET stream is connected for that session.
+	void pingClient(string sessionId, Duration timeout = 60.seconds) @safe
+	{
+		if (pushChannel is null)
+			throw internalError("No server->client push channel; the server is not mounted on a Streamable HTTP transport");
+		pushChannel.ping(timeout, sessionId);
+	}
+
+	/// The session tokens (`Mcp-Session-Id`s) that currently have a connected GET SSE
+	/// stream, so a caller can `pingClient(token)` each live session in turn rather
+	/// than guessing. Empty when there is no push channel or no session-scoped GET
+	/// stream is open.
+	string[] connectedSessions() @safe
+	{
+		if (pushChannel is null)
+			return null;
+		return pushChannel.connectedOwnerTokens();
 	}
 
 	/// Capabilities this server advertises, derived from what is registered.
@@ -3212,6 +3263,87 @@ unittest  // pingClient drives a ping on the push channel and awaits the empty r
 	runEventLoop();
 
 	assert(pinged);
+}
+
+unittest  // pingClient(sessionId) reaches a session-scoped GET listener (non-empty owner token)
+{
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+
+	auto srv = makeTestServer();
+	auto coord = new StreamCoordinator;
+	auto ch = srv.serverPushChannel(coord);
+	string frame;
+	// The production registration path: a per-session GET stream owned by its
+	// Mcp-Session-Id (a NON-empty owner token), unlike the empty default.
+	ch.addListener((string f) @safe { frame = f; }, "",
+			SubscriptionFilter.init, "", null, "sess-A");
+
+	bool pinged;
+	void delegate() @safe nothrow initiator = () @safe nothrow{
+		try
+			srv.pingClient("sess-A");
+		catch (Exception)
+			assert(false, "pingClient(sessionId) threw");
+		pinged = true;
+		exitEventLoop();
+	};
+	void delegate() @safe nothrow responder = () @safe nothrow{
+		assert(frame.canFind("\"method\":\"ping\""));
+		bool matched;
+		try
+			matched = coord.resolve(Json(1), Json.emptyObject, Json.undefined, "sess-A");
+		catch (Exception)
+			assert(false, "resolve threw");
+		assert(matched);
+	};
+	runTask(initiator);
+	runTask(responder);
+	runEventLoop();
+
+	assert(pinged);
+}
+
+unittest  // pingClient with an empty/mismatched token cannot reach a session-scoped listener
+{
+	import mcp.protocol.errors : McpException;
+
+	auto srv = makeTestServer();
+	auto coord = new StreamCoordinator;
+	auto ch = srv.serverPushChannel(coord);
+	ch.addListener((string) @safe {}, "", SubscriptionFilter.init, "", null, "sess-A");
+
+	// The empty-token no-arg form matches no session-scoped listener.
+	bool threwEmpty;
+	try
+		srv.pingClient();
+	catch (McpException)
+		threwEmpty = true;
+	assert(threwEmpty, "empty owner token must not reach a session-scoped GET listener");
+
+	// A mismatched session id likewise reaches nobody.
+	bool threwMismatch;
+	try
+		srv.pingClient("sess-B");
+	catch (McpException)
+		threwMismatch = true;
+	assert(threwMismatch, "a mismatched session id must reach no listener");
+}
+
+unittest  // connectedSessions enumerates the live session-scoped GET streams
+{
+	auto srv = makeTestServer();
+	auto coord = new StreamCoordinator;
+	auto ch = srv.serverPushChannel(coord);
+	ch.addListener((string) @safe {}, "", SubscriptionFilter.init, "", null, "sess-A");
+	ch.addListener((string) @safe {}, "", SubscriptionFilter.init, "", null, "sess-B");
+
+	import std.algorithm : canFind, sort;
+
+	auto tokens = srv.connectedSessions();
+	assert(tokens.length == 2);
+	assert(tokens.canFind("sess-A"));
+	assert(tokens.canFind("sess-B"));
 }
 
 unittest  // notifications produce no response
@@ -6636,6 +6768,45 @@ unittest  // notifyToolsListChanged is a no-op before a push channel exists
 {
 	auto s = new McpServer("t", "1");
 	assert(s.notifyToolsListChanged() == 0);
+}
+
+unittest  // notifyToolsListChanged fans out to EVERY connected session, not just one
+{
+	// On a multi-session stateful HTTP server, a list_changed notification is a
+	// genuine broadcast: each connected session's GET stream must receive it. Two
+	// listeners with DISTINCT owner tokens must both be reached by one
+	// notifyToolsListChanged.
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto coord = new StreamCoordinator;
+	auto ch = s.serverPushChannel(coord);
+	string aFrame, bFrame;
+	ch.addListener((string f) @safe { aFrame = f; }, "",
+			SubscriptionFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { bFrame = f; }, "",
+			SubscriptionFilter.init, "", null, "sess-B");
+
+	const n = s.notifyToolsListChanged();
+	assert(n == 2, "both sessions must be reached");
+	assert(aFrame.canFind("notifications/tools/list_changed"));
+	assert(bFrame.canFind("notifications/tools/list_changed"));
+}
+
+unittest  // a list_changed broadcast still delivers only ONE stream within a single session
+{
+	// Multiple Connections rule: within ONE session two open GET streams must not
+	// both receive the same broadcast — only one of the session's streams does.
+	auto s = new McpServer("t", "1");
+	auto coord = new StreamCoordinator;
+	auto ch = s.serverPushChannel(coord);
+	int aCount, bCount;
+	ch.addListener((string) @safe { aCount++; }, "", SubscriptionFilter.init, "", null, "sess-A");
+	ch.addListener((string) @safe { bCount++; }, "", SubscriptionFilter.init, "", null, "sess-A");
+
+	const n = s.notifyToolsListChanged();
+	assert(n == 1, "one session reached once");
+	assert(aCount + bCount == 1, "only one of the session's streams receives the broadcast");
 }
 
 unittest  // resources listChanged is not advertised by default
