@@ -10,6 +10,8 @@ import deimos.openssl.bn;
 
 import mcp.auth.oauth : base64UrlNoPad;
 
+import vibe.data.json : Json;
+
 @safe:
 
 /// Sign `data` with ECDSA P-256 / SHA-256 (the JWS ES256 algorithm) using the
@@ -75,6 +77,15 @@ private void bnToFixed(const(BIGNUM)* bn, ubyte[] dst) @trusted
 	dst[$ - n .. $] = tmp[0 .. n];
 }
 
+/// Whether `s` contains any C0 control character (U+0000..U+001F) or DEL.
+private bool containsControlChar(string s) @safe pure nothrow
+{
+	foreach (char c; s)
+		if (c < 0x20 || c == 0x7F)
+			return true;
+	return false;
+}
+
 /// Build a signed ES256 JWT client assertion (RFC 7523) for OAuth client
 /// authentication: `iss`/`sub` = client id, `aud` = the token endpoint.
 string makeClientAssertion(string clientId, string audience, string privateKeyPem,
@@ -82,11 +93,23 @@ string makeClientAssertion(string clientId, string audience, string privateKeyPe
 {
 	import std.conv : to;
 
-	const header = `{"alg":"ES256","typ":"JWT"}`;
+	if (containsControlChar(clientId))
+		throw new Exception("makeClientAssertion: clientId contains control characters");
+	if (containsControlChar(audience))
+		throw new Exception("makeClientAssertion: audience contains control characters");
+
 	const theJti = jti.length ? jti : ("jti-" ~ now.to!string);
-	const payload = `{"iss":"` ~ clientId ~ `","sub":"` ~ clientId ~ `","aud":"` ~ audience
-		~ `","jti":"` ~ theJti ~ `","iat":` ~ now.to!string ~ `,"exp":` ~ (
-				now + lifetimeSeconds).to!string ~ `}`;
+
+	auto payloadJson = Json.emptyObject;
+	payloadJson["iss"] = clientId;
+	payloadJson["sub"] = clientId;
+	payloadJson["aud"] = audience;
+	payloadJson["jti"] = theJti;
+	payloadJson["iat"] = now;
+	payloadJson["exp"] = now + lifetimeSeconds;
+
+	const header = `{"alg":"ES256","typ":"JWT"}`;
+	const payload = payloadJson.toString();
 	const signingInput = base64UrlNoPad(cast(const(ubyte)[]) header) ~ "."
 		~ base64UrlNoPad(cast(const(ubyte)[]) payload);
 	auto sig = signEs256(privateKeyPem, cast(const(ubyte)[]) signingInput);
@@ -122,4 +145,66 @@ unittest  // ES256 JWT client assertion has 3 parts and a 64-byte (raw) signatur
 	}();
 	assert(payloadJson.indexOf(`"iss":"client-1"`) >= 0);
 	assert(payloadJson.indexOf(`"aud":"https://as.example.com/token"`) >= 0);
+}
+
+unittest  // A clientId containing a quote is JSON-escaped, not injected as raw claims
+{
+	import std.array : split;
+	import std.base64 : Base64URLNoPadding;
+	import vibe.data.json : parseJsonString;
+
+	const pem = "-----BEGIN PRIVATE KEY-----\n"
+		~ "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7K6+stITLYsQjC9o\n"
+		~ "hyL925dgd6gNWRcGOl5RPvIpye+hRANCAATSBYPkHq12VDW5un1kub6zkBc4ieZ9\n"
+		~ "nurGMu+tLzJ6+6syOZsQCGlazcSOGsopLyl1QZMIFh9atUYaDfUjJxMq\n"
+		~ "-----END PRIVATE KEY-----\n";
+	// An attacker-controlled clientId attempting to inject an extra "admin" claim.
+	const evil = `x","admin":"true`;
+	auto jwt = makeClientAssertion(evil, "https://as.example.com/token", pem, 1_700_000_000);
+	auto parts = jwt.split('.');
+	assert(parts.length == 3);
+	auto payloadStr = () @trusted {
+		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
+	}();
+	auto j = parseJsonString(payloadStr);
+	// The literal string is preserved verbatim in iss/sub, not split into claims.
+	assert(j["iss"].get!string == evil);
+	assert(j["sub"].get!string == evil);
+	// No spurious claim was injected.
+	assert(j["admin"].type == Json.Type.undefined);
+}
+
+unittest  // iat/exp are emitted as JSON numbers, not strings
+{
+	import std.array : split;
+	import std.base64 : Base64URLNoPadding;
+	import vibe.data.json : parseJsonString;
+
+	const pem = "-----BEGIN PRIVATE KEY-----\n"
+		~ "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7K6+stITLYsQjC9o\n"
+		~ "hyL925dgd6gNWRcGOl5RPvIpye+hRANCAATSBYPkHq12VDW5un1kub6zkBc4ieZ9\n"
+		~ "nurGMu+tLzJ6+6syOZsQCGlazcSOGsopLyl1QZMIFh9atUYaDfUjJxMq\n"
+		~ "-----END PRIVATE KEY-----\n";
+	auto jwt = makeClientAssertion("client-1", "https://as.example.com/token",
+			pem, 1_700_000_000, 300);
+	auto parts = jwt.split('.');
+	auto payloadStr = () @trusted {
+		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
+	}();
+	auto j = parseJsonString(payloadStr);
+	assert(j["iat"].get!long == 1_700_000_000);
+	assert(j["exp"].get!long == 1_700_000_300);
+}
+
+unittest  // Control characters in clientId or audience fail closed
+{
+	import std.exception : assertThrown;
+
+	const pem = "-----BEGIN PRIVATE KEY-----\n"
+		~ "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7K6+stITLYsQjC9o\n"
+		~ "hyL925dgd6gNWRcGOl5RPvIpye+hRANCAATSBYPkHq12VDW5un1kub6zkBc4ieZ9\n"
+		~ "nurGMu+tLzJ6+6syOZsQCGlazcSOGsopLyl1QZMIFh9atUYaDfUjJxMq\n"
+		~ "-----END PRIVATE KEY-----\n";
+	assertThrown(makeClientAssertion("bad\nid", "https://as.example.com/token", pem, 1));
+	assertThrown(makeClientAssertion("client-1", "https://as.example.com/\ttoken", pem, 1));
 }
