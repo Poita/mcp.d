@@ -966,8 +966,13 @@ unittest  // after a stdio subscriptions/listen, notify* change notifications fl
 	assert(note["params"]["_meta"][MetaKey.subscriptionId].get!string == "5");
 }
 
-unittest  // a pre-draft (no protocolVersion) subscriptions/listen still takes the normal request/reply path over stdio
+unittest  // a pre-draft (no protocolVersion) subscriptions/listen is method-not-found on the normal request/reply path over stdio
 {
+	// `subscriptions/listen` is a draft-only RPC. The genuine draft stdio listen
+	// stream is served before route() by tryServeStdioListen; a request carrying no
+	// (or a non-draft) protocol version is not a draft listen, so it falls through
+	// to the normal request/reply path where the non-draft negotiated session
+	// reports the method as -32601 rather than answering {acknowledged:true}.
 	auto s = new McpServer("listen-srv", "1.0");
 	s.enableToolsListChanged();
 
@@ -982,7 +987,7 @@ unittest  // a pre-draft (no protocolVersion) subscriptions/listen still takes t
 	assert(outputs.length == 1);
 	auto resp = parseJsonString(outputs[0]);
 	assert(resp["id"].get!int == 1);
-	assert(resp["result"]["acknowledged"].get!bool);
+	assert(resp["error"]["code"].get!int == -32601);
 }
 
 unittest  // two tool handlers overlap concurrently over the duplex (barrier proves they are not serialized)

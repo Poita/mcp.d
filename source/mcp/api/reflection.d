@@ -268,6 +268,30 @@ private P marshalTemplateVar(P)(string raw) @safe
 	}
 }
 
+/// Deserialize a dynamic handler's raw wire `arguments` into a typed value `T`.
+///
+/// The UDA-driven registration overloads marshal each argument from the method
+/// signature for you, but the dynamic `registerDynamicTool`/`registerDynamicPrompt`
+/// overloads hand the handler the raw `Json arguments`. This is the inbound
+/// counterpart of the client's `callTool!T`: it deserializes `arguments` through
+/// the same enum-by-name policy the UDA layer uses (so any `enum` leaf is read
+/// from its schema-declared member name, at any nesting depth) and maps a vibe
+/// conversion failure to `invalidParams` (-32602), matching how the reflection
+/// layer reports a malformed argument. A handler can then write
+/// `auto a = argsAs!MyArgs(arguments);` instead of hand-rolling
+/// `arguments["x"].get!int` with manual presence/type checks.
+T argsAs(T)(Json arguments) @safe
+{
+	import mcp.protocol.errors : McpException, invalidParams;
+
+	try
+		return marshalScalar!T(arguments);
+	catch (McpException e)
+		throw e;
+	catch (Exception e)
+		throw invalidParams("arguments: " ~ e.msg);
+}
+
 private P marshalScalar(P)(Json v) @safe
 {
 	// Deserialize through EnumByNamePolicy so any enum — whether `P` itself or
@@ -1408,14 +1432,22 @@ unittest  // @hintTitle: annotation-level title appears in annotations
 unittest  // MRTR UDA tool: returning ToolResponse.inputRequired surfaces inputRequests
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.draft : MetaKey;
 
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new ExtApi);
 
-	// Empty seed -> the tool asks for more input (MRTR InputRequiredResult).
+	// Empty seed -> the tool asks for more input (MRTR InputRequiredResult). MRTR
+	// exists only on the draft (stateless) protocol, so the request must negotiate
+	// the draft version via `_meta`; otherwise the projection layer rejects an
+	// input-required result for a non-MRTR peer.
 	Json p = Json.emptyObject;
 	p["name"] = "ask";
 	p["arguments"] = Json(["seed": Json("")]);
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json(["elicitation": Json.emptyObject]);
+	p["_meta"] = meta;
 	auto r = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
 	// An InputRequiredResult carries `inputRequests` (a map keyed by id), not content.
 	assert(r["result"]["inputRequests"].type == Json.Type.object);
@@ -1435,6 +1467,71 @@ unittest  // MRTR UDA tool: returning ToolResponse.complete produces a normal re
 	auto r = s.handle(Message(makeRequest(Json(3), "tools/call", p))).get;
 	assert("inputRequests" !in r["result"]);
 	assert(r["result"]["content"][0]["text"].get!string == "seeded X");
+}
+
+unittest  // MRTR on a non-draft session: an input-required result is rejected, not emitted off-schema
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.errors : ErrorCode;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ExtApi);
+
+	// No draft `_meta.protocolVersion` -> the session is non-draft (no MRTR). A
+	// handler that nonetheless returns ToolResponse.inputRequired emits the
+	// draft-only `{inputRequests}` shape (no `content`) to a peer whose
+	// CallToolResult schema requires content; the projection layer rejects this
+	// programming error with an internal error rather than letting it reach the wire.
+	Json p = Json.emptyObject;
+	p["name"] = "ask";
+	p["arguments"] = Json(["seed": Json("")]);
+	auto r = s.handle(Message(makeRequest(Json(4), "tools/call", p))).get;
+	assert(r["error"]["code"].get!int == ErrorCode.internalError);
+}
+
+unittest  // argsAs deserializes a typed struct through the enum-by-name policy
+{
+	import vibe.data.json : Json;
+
+	enum Color
+	{
+		red,
+		green
+	}
+
+	struct Args
+	{
+		int n;
+		Color c;
+	}
+
+	Json j = Json(["n": Json(3), "c": Json("green")]);
+	auto a = argsAs!Args(j);
+	assert(a.n == 3);
+	assert(a.c == Color.green);
+}
+
+unittest  // argsAs maps a conversion failure to invalidParams (-32602)
+{
+	import vibe.data.json : Json;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	struct Args
+	{
+		int n;
+	}
+
+	// `n` is a string, not an int -> vibe conversion fails -> invalidParams.
+	Json j = Json(["n": Json("not-a-number")]);
+	bool threw;
+	try
+		cast(void) argsAs!Args(j);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.invalidParams);
+	}
+	assert(threw, "argsAs must surface a conversion failure as invalidParams");
 }
 
 unittest  // @icon / @meta UDA on a resource: appear in resources/list

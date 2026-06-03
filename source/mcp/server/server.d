@@ -133,12 +133,20 @@ struct ToolResponse
 	/// Project the final `CallToolResult` to the negotiated protocol version so
 	/// version-gated fields are not emitted to peers that don't understand them.
 	/// `CallToolResult.structuredContent` is a 2025-06-18+ field and is stripped
-	/// for 2024-11-05 / 2025-03-26. An `InputRequiredResult` is draft-only (MRTR)
-	/// and carries no version-gated fields, so it is returned unchanged.
+	/// for 2024-11-05 / 2025-03-26. An `InputRequiredResult` is draft-only (MRTR):
+	/// its `{inputRequests, [requestState]}` shape carries no `content` and exists
+	/// only on versions whose schema permits it. Emitting it to a non-MRTR peer,
+	/// whose `CallToolResult` requires `content`, is a programming error (a handler
+	/// ignoring the documented stateless contract), so reject it rather than
+	/// projecting an off-schema result onto the wire.
 	ToolResponse forVersion(ProtocolVersion v) const @safe
 	{
 		if (needsInput_)
+		{
+			if (!v.usesMRTR)
+				throw internalError("tools/call handler returned an input-required result on a non-draft session that does not support MRTR");
 			return ToolResponse.inputRequired(required_.inputRequests.dup, required_.requestState);
+		}
 		return ToolResponse.complete(result_.forVersion(v));
 	}
 }
@@ -385,6 +393,13 @@ final class McpServer
 	// for tools that declared an inputSchema, so the blast radius is small. Opt
 	// out with disableInputSchemaValidation().
 	private bool validateInputSchema_ = true;
+	// basic/lifecycle: the server SHOULD NOT respond to non-`ping` requests before
+	// it has received `notifications/initialized`. Because this is a SHOULD (and
+	// real clients send `initialized` immediately) the gate is OFF by default to
+	// preserve lenient behaviour; opt in with requireInitialized(). Only the
+	// stateful (`initialize`) path has an initialized handshake — the draft/
+	// stateless path is always exempt.
+	private bool requireInitialized_;
 	// In-flight requests (keyed by their JSON-RPC id, scoped by connection token)
 	// live on the threaded `ConnectionState.inFlight` registry; see the
 	// `activeConnection` field above.
@@ -641,6 +656,18 @@ final class McpServer
 		validateInputSchema_ = false;
 	}
 
+	/// Enforce the lifecycle rule that the server SHOULD NOT respond to a request
+	/// (other than `ping`) before the client has sent `notifications/initialized`.
+	/// With this enabled, a stateful session that receives e.g. `tools/list` after
+	/// the `initialize` response but before `notifications/initialized` is rejected
+	/// with -32002. `initialize` and `ping` are always allowed; the draft/stateless
+	/// path (which has no `initialized` handshake) is exempt. OFF by default — the
+	/// rule is a SHOULD and well-behaved clients send `initialized` immediately.
+	void requireInitialized() @safe
+	{
+		requireInitialized_ = true;
+	}
+
 	/// Broadcast a `notifications/tools/list_changed` to every client listening
 	/// on the standalone GET SSE stream, informing them the set of available
 	/// tools changed (per the server/tools List Changed Notification). Returns
@@ -830,6 +857,13 @@ final class McpServer
 	/// ... handle root list changes gracefully"). Mirrors the client-side
 	/// `onNotification` observer. Purely an application-facing callback; it does
 	/// not affect the JSON-RPC wire output for any protocol version.
+	///
+	/// The observer itself receives no `RequestContext`: inbound notifications are
+	/// dispatched without one. To issue the `ctx.listRoots()` refresh, capture a
+	/// server->client-capable `RequestContext` from a prior request handler (e.g. a
+	/// `tools/call`) and call it from this observer; on stdio that captured context
+	/// (a `StdioContext` bound to the duplex channel) round-trips the
+	/// `roots/list` request to the client from any task.
 	void setClientNotificationHandler(void delegate(string method, Json params) @safe handler) @safe
 	{
 		onClientNotification_ = handler;
@@ -1373,6 +1407,17 @@ final class McpServer
 			}
 		}
 
+		// basic/lifecycle: a stateful server SHOULD NOT serve a non-`ping` request
+		// before the client has sent `notifications/initialized`. Enforced only when
+		// opted in via requireInitialized(); the draft/stateless path has no
+		// initialized handshake and is exempt, and `initialize`/`ping` are always
+		// allowed (the former establishes the session, the latter is a liveness probe
+		// permitted at any time).
+		if (requireInitialized_ && !effective.isDraft && !conn.initialized
+				&& msg.method != "initialize" && msg.method != "ping")
+			return nullable(makeErrorResponse(msg.id, new McpException(-32002,
+					"Server not initialized")));
+
 		// Register a cancellation token for this request keyed by its id, so an
 		// inbound `notifications/cancelled` can flip it while the handler runs
 		// (basic/utilities/cancellation). `initialize` MUST NOT be cancelled, so
@@ -1389,7 +1434,17 @@ final class McpServer
 			conn.inFlight[idKey] = token;
 		scope (exit)
 			if (trackable)
-				conn.inFlight.remove(idKey);
+			{
+				// Only remove the key when it still maps to THIS request's token.
+				// Two requests that collide on one `idKey` (a client reusing an
+				// in-flight id — itself a JSON-RPC violation) would otherwise have the
+				// first request's `scope(exit)` delete the second's registration,
+				// leaving the live duplicate uncancelable. Comparing identity keeps a
+				// request from evicting another's token.
+				if (auto t = idKey in conn.inFlight)
+					if (*t is token)
+						conn.inFlight.remove(idKey);
+			}
 
 		// Install the per-request scope so handlers see the right statelessness
 		// (MRTR vs blocking), the input responses carried on a retried draft
@@ -1770,14 +1825,17 @@ final class McpServer
 				throw methodNotFound(method);
 			return doDiscover();
 		case "subscriptions/listen":
-			// subscriptions/listen is an ordinary request — it records the opted-in
-			// per-stream filter (consulted later by the listener-driven notify path)
-			// and is NOT special-cased for the push version. It is
-			// conceptually a draft-only RPC, but the stdio transport intentionally
-			// accepts a pre-draft (no _meta version) listen on the normal
-			// request/reply path (see the stdio transport test "a pre-draft
-			// subscriptions/listen still takes the normal request/reply path"), so it
-			// is not hard-gated on the version here.
+			// `subscriptions/listen` is a draft-only RPC (it replaces the former
+			// `resources/subscribe`); on a non-draft negotiated session it does not
+			// exist and MUST be reported as -32601 rather than answered with a
+			// non-spec `{acknowledged:true}` result, mirroring the resources/subscribe
+			// and logging/setLevel draft gating. The genuine draft stdio listen stream
+			// is served before `route()` by `tryServeStdioListen` (which records the
+			// per-stream filter and writes the acknowledgement notification); this
+			// normal-path case only handles a draft listen reaching `route()` directly
+			// (in-process / stateless HTTP), recording its opted-in per-stream filter.
+			if (!ver.usesSubscriptionsListen)
+				throw methodNotFound(method);
 			return doSubscribeListen(params, conn);
 		case "ping":
 			// The draft (2026-07-28) removed `ping` (SEP-2575), so on a
@@ -2343,6 +2401,16 @@ final class McpServer
 
 	private Json doInitialize(Json params, ConnectionState conn) @safe
 	{
+		// The lifecycle spec sends `initialize` exactly once per session. A second
+		// one on an already-initialized stateful session would silently re-negotiate
+		// the protocol version and replace the client capabilities mid-session,
+		// desyncing version-gated projection and the `tools/call` capability gate.
+		// Reject it with -32600, leaving the established `negotiated`/`clientCaps`
+		// untouched. The draft/stateless path never reaches `initialize`, so it is
+		// unaffected.
+		if (conn.initialized)
+			throw invalidRequest("Session already initialized");
+
 		auto p = InitializeParams.fromJson(params);
 		conn.negotiated = negotiate(p.protocolVersion);
 		// The draft revision defines NO `initialize`/`InitializeResult`: draft
@@ -2765,6 +2833,115 @@ unittest  // initialize negotiates the requested version and reports server info
 	assert(resp["result"]["protocolVersion"].get!string == "2025-06-18");
 	assert(resp["result"]["serverInfo"]["name"].get!string == "test-srv");
 	assert(resp["result"]["capabilities"]["tools"].type == Json.Type.object);
+}
+
+unittest  // a second initialize on an already-initialized stateful session is rejected
+{
+	import mcp.protocol.jsonrpc : makeNotification;
+
+	auto s = McpServer.stateful("reinit-srv", "0.1.0");
+
+	Json first = Json.emptyObject;
+	first["protocolVersion"] = "2025-11-25";
+	first["capabilities"] = Json.emptyObject;
+	first["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	auto ir = s.handle(req(1, "initialize", first)).get;
+	assert(ir["result"]["protocolVersion"].get!string == "2025-11-25");
+	s.handle(Message(makeNotification("notifications/initialized", Json.emptyObject)));
+
+	// A second initialize naming a different version must be rejected with -32600
+	// and must NOT re-negotiate the established session version.
+	Json second = Json.emptyObject;
+	second["protocolVersion"] = "2025-03-26";
+	second["capabilities"] = Json.emptyObject;
+	second["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	auto resp = s.handle(req(2, "initialize", second)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
+	assert(s.negotiatedVersion == ProtocolVersion.v2025_11_25,
+			"a rejected re-initialize must leave the negotiated version untouched");
+}
+
+unittest  // requireInitialized: a stateful request before notifications/initialized is rejected
+{
+	auto s = McpServer.stateful("init-gate-srv", "0.1.0");
+	registerAddTool(s);
+	s.requireInitialized();
+
+	Json init = Json.emptyObject;
+	init["protocolVersion"] = "2025-11-25";
+	init["capabilities"] = Json.emptyObject;
+	init["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", init));
+
+	// tools/list before notifications/initialized -> -32002 Server not initialized.
+	auto early = s.handle(req(2, "tools/list")).get;
+	assert(early["error"]["code"].get!int == -32002);
+
+	// ping is always allowed, even before initialized.
+	auto pong = s.handle(req(3, "ping")).get;
+	assert("error" !in pong);
+}
+
+unittest  // requireInitialized: after notifications/initialized requests are served
+{
+	import mcp.protocol.jsonrpc : makeNotification;
+
+	auto s = McpServer.stateful("init-gate-srv", "0.1.0");
+	registerAddTool(s);
+	s.requireInitialized();
+
+	Json init = Json.emptyObject;
+	init["protocolVersion"] = "2025-11-25";
+	init["capabilities"] = Json.emptyObject;
+	init["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", init));
+	s.handle(Message(makeNotification("notifications/initialized", Json.emptyObject)));
+
+	auto resp = s.handle(req(2, "tools/list")).get;
+	assert("error" !in resp);
+	assert(resp["result"]["tools"].type == Json.Type.array);
+}
+
+unittest  // requireInitialized is OFF by default: a pre-initialized request is still served
+{
+	auto s = makeTestServer();
+	// No requireInitialized() call, no initialize handshake.
+	auto resp = s.handle(req(1, "tools/list")).get;
+	assert("error" !in resp, "the initialized gate must be opt-in (lenient by default)");
+}
+
+unittest  // non-draft subscriptions/listen on the normal route path is method-not-found
+{
+	// `subscriptions/listen` is a draft-only RPC; on a non-draft negotiated session
+	// it does not exist and must report -32601 rather than {acknowledged:true}.
+	auto s = makeTestServer();
+	s.enableToolsListChanged();
+	Json p = Json(["notifications": Json(["toolsListChanged": Json(true)])]);
+	auto resp = s.handle(req(1, "subscriptions/listen", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+}
+
+unittest  // duplicate in-flight id: the first request's teardown does not evict the second's token
+{
+	import mcp.server.context : CancellationToken;
+
+	auto conn = new ConnectionState;
+	auto tokA = new CancellationToken;
+	auto tokB = new CancellationToken;
+
+	// Both colliding requests share the bare id key (empty connection token).
+	conn.inFlight["i:1"] = tokA;
+	conn.inFlight["i:1"] = tokB; // B overwrites A's registration.
+
+	// A's scope(exit) must only remove the key when it still maps to A's token;
+	// since B now owns it, the key (and B's token) must survive so a later
+	// cancellation can still reach B.
+	if (auto t = "i:1" in conn.inFlight)
+		if (*t is tokA)
+			conn.inFlight.remove("i:1");
+
+	assert(("i:1" in conn.inFlight) !is null, "B's live token must not be evicted by A's teardown");
+	assert(conn.inFlight["i:1"] is tokB);
 }
 
 unittest  // Implementation constructor advertises full serverInfo on 2025-11-25
