@@ -2500,8 +2500,8 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
 	listenParams["toolsListChanged"] = true;
 	auto m = draftMsg("subscriptions/listen", listenParams);
 	server.handle(m);
-	assert(server.listensFor("toolsListChanged"));
-	assert(!server.listensFor("resourcesListChanged"));
+	assert(server.lastListenFilter().toolsListChanged);
+	assert(!server.lastListenFilter().resourcesListChanged);
 
 	// The listen stream registers as a push-channel listener (carrying the listen
 	// request's id as the stream's subscriptionId, and its OWN active per-stream
