@@ -214,15 +214,57 @@ AuthFailure authorize(ResourceServerConfig cfg, string authHeader, out TokenInfo
 	return AuthFailure.none;
 }
 
+/// Percent-encode any byte that is illegal inside an RFC 7230 quoted-string before
+/// it is interpolated into a `WWW-Authenticate` auth-param value. A double-quote
+/// would close the quoted-string early (letting a client-controlled value such as a
+/// reflected Host header append spurious auth-params), and CR/LF/control bytes have
+/// no legal representation, so every such byte is rendered as `%XX`. This is
+/// defence in depth: callers SHOULD also reject untrusted input upstream, but the
+/// header builder must never emit a value that can break out of its quoted-string.
+string quoteParamValue(string value) @safe
+{
+	import std.format : format;
+
+	string out_;
+	foreach (char c; value)
+	{
+		if (c == '"' || c == '\\' || c < 0x20 || c == 0x7f)
+			out_ ~= format("%%%02X", cast(ubyte) c);
+		else
+			out_ ~= c;
+	}
+	return out_;
+}
+
+unittest  // quoteParamValue passes a clean URL through unchanged
+{
+	assert(quoteParamValue("https://mcp.example.com/.well-known/oauth-protected-resource")
+			== "https://mcp.example.com/.well-known/oauth-protected-resource");
+}
+
+unittest  // quoteParamValue percent-encodes a quote that would break out of the quoted-string
+{
+	// A reflected Host like `x" foo="bar` must not be able to append auth-params.
+	assert(quoteParamValue(`https://x" foo="bar/meta`) == "https://x%22 foo=%22bar/meta");
+}
+
+unittest  // quoteParamValue percent-encodes CR/LF and other control characters
+{
+	assert(quoteParamValue("a\r\nb") == "a%0D%0Ab");
+	assert(quoteParamValue("a\\b") == "a%5Cb");
+}
+
 /// Build the `WWW-Authenticate` header value for an auth failure (RFC 6750 §3 /
 /// RFC 9728 §5.1). Always carries the `resource_metadata` URL when known, plus an
-/// `error`/`scope` for token/scope failures.
+/// `error`/`scope` for token/scope failures. Every interpolated value is passed
+/// through `quoteParamValue` so a client-controlled component (notably a reflected
+/// Host header in the metadata URL) can never break out of its quoted-string.
 string wwwAuthenticate(AuthFailure failure, string resourceMetadataUrl, string scope_) @safe
 {
 	string v = "Bearer";
 	string[] parts;
 	if (resourceMetadataUrl.length)
-		parts ~= `resource_metadata="` ~ resourceMetadataUrl ~ `"`;
+		parts ~= `resource_metadata="` ~ quoteParamValue(resourceMetadataUrl) ~ `"`;
 	final switch (failure)
 	{
 	case AuthFailure.none:
@@ -233,17 +275,17 @@ string wwwAuthenticate(AuthFailure failure, string resourceMetadataUrl, string s
 		// hint so the client knows what to request during authorization. RFC 6750
 		// §3 permits `scope` on the bare challenge.
 		if (scope_.length)
-			parts ~= `scope="` ~ scope_ ~ `"`;
+			parts ~= `scope="` ~ quoteParamValue(scope_) ~ `"`;
 		break;
 	case AuthFailure.invalidToken:
 		parts ~= `error="invalid_token"`;
 		if (scope_.length)
-			parts ~= `scope="` ~ scope_ ~ `"`;
+			parts ~= `scope="` ~ quoteParamValue(scope_) ~ `"`;
 		break;
 	case AuthFailure.insufficientScope:
 		parts ~= `error="insufficient_scope"`;
 		if (scope_.length)
-			parts ~= `scope="` ~ scope_ ~ `"`;
+			parts ~= `scope="` ~ quoteParamValue(scope_) ~ `"`;
 		break;
 	}
 	foreach (i, p; parts)
@@ -430,6 +472,19 @@ unittest  // WWW-Authenticate for insufficient scope carries error + scope
 	const v = wwwAuthenticate(AuthFailure.insufficientScope, "https://x/meta", "mcp:write");
 	assert(v
 			== `Bearer resource_metadata="https://x/meta", error="insufficient_scope", scope="mcp:write"`);
+}
+
+unittest  // WWW-Authenticate never lets a reflected value break out of the quoted-string
+{
+	import std.algorithm : canFind;
+
+	// A metadata URL derived from an attacker-controlled Host like
+	// `Host: x" foo="bar` must not close the resource_metadata quoted-string and
+	// append a spurious auth-param; the quote is percent-encoded.
+	const v = wwwAuthenticate(AuthFailure.invalidToken, `https://x" foo="bar/meta`, "");
+	assert(!v.canFind(`"bar`)); // no broken-out token after the encoded quote
+	assert(v.canFind("%22")); // the quote is percent-encoded inside the value
+	assert(v == `Bearer resource_metadata="https://x%22 foo=%22bar/meta", error="invalid_token"`);
 }
 
 unittest  // scopeHint prefers requiredScope when set

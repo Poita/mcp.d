@@ -292,7 +292,11 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		if (!guardAuth(req, res, opts, token))
 			return;
 		const payload = req.bodyReader.readAllUTF8();
-		cast(void) handleLegacyPostBody(server, channel, payload);
+		// The per-stream session token the client echoes from its `endpoint` event
+		// correlates this POST with the GET stream that should receive the reply, so
+		// a response never leaks onto another client's stream.
+		const sessionId = req.query.get("sessionId", "");
+		cast(void) handleLegacyPostBody(server, channel, sessionId, payload);
 		// All subsequent client messages are POSTed here; the response (if any)
 		// is delivered on the GET SSE stream, so the POST itself just acknowledges
 		// receipt with 202 Accepted and no body.
@@ -303,16 +307,19 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 
 /// The legacy 2024-11-05 HTTP+SSE server->client channel. It manages the open GET
 /// SSE listeners and routes JSON-RPC server messages onto them as SSE `message`
-/// events. On registration a listener immediately receives the `endpoint` event
-/// (its data being the message-POST path), as the transport requires before any
-/// other traffic. Unlike the modern `ServerPushChannel`, the legacy transport is
-/// a single bidirectional pair, so a delivered message is broadcast to every open
-/// legacy stream (there is normally just one).
+/// events. On registration a listener is minted a per-stream session token and
+/// immediately receives the `endpoint` event whose data carries that token as a
+/// `?sessionId=` query parameter on the message-POST path, as the transport
+/// requires before any other traffic. The client echoes the token on every POST,
+/// so a response is routed back ONLY to the originating stream — never broadcast
+/// to other concurrently-connected clients (which would leak one client's results
+/// onto another client's stream).
 final class LegacySseChannel
 {
 	private struct Listener
 	{
 		long id;
+		string sessionId;
 		void delegate(string frame) @safe write;
 	}
 
@@ -325,15 +332,29 @@ final class LegacySseChannel
 		this.endpointPath = endpointPath;
 	}
 
-	/// Register an open GET SSE stream. The listener immediately receives the
-	/// leading `endpoint` event (basic/transports §HTTP with SSE: the server MUST
-	/// send it "When a client connects"). Returns the listener id.
+	/// Register an open GET SSE stream. A fresh per-stream session token is minted
+	/// and the listener immediately receives the leading `endpoint` event
+	/// (basic/transports §HTTP with SSE: the server MUST send it "When a client
+	/// connects") whose URI carries that token, so a later POST can be correlated
+	/// back to exactly this stream. Returns the listener id.
 	long addListener(void delegate(string frame) @safe write) @safe
 	{
 		const id = nextId++;
-		listeners ~= Listener(id, write);
-		write(formatLegacyEndpointEvent(endpointPath));
+		const sessionId = generateSessionId();
+		listeners ~= Listener(id, sessionId, write);
+		write(formatLegacyEndpointEvent(endpointWithSession(endpointPath, sessionId)));
 		return id;
+	}
+
+	/// The per-stream session token minted for the listener `id`, or null when no
+	/// such listener exists. Exposed so the two-endpoint flow (and tests) can
+	/// correlate a POST back to the stream that should receive its reply.
+	string sessionIdFor(long id) @safe
+	{
+		foreach (l; listeners)
+			if (l.id == id)
+				return l.sessionId;
+		return null;
 	}
 
 	/// Drop a listener (its GET stream closed).
@@ -350,13 +371,15 @@ final class LegacySseChannel
 		return listeners.length;
 	}
 
-	/// Deliver a raw JSON-RPC payload to every open legacy stream as an SSE
-	/// `message` event. A listener whose write throws (a disconnected client) is
-	/// dropped so the channel self-heals. An empty payload is a no-op (a
-	/// notification/response produced nothing to send back).
-	void deliver(string jsonText) @safe
+	/// Deliver a raw JSON-RPC payload as an SSE `message` event to the single
+	/// stream whose minted session token is `sessionId`, so a response is routed
+	/// only to the client that issued the corresponding POST and never leaks across
+	/// sessions. A listener whose write throws (a disconnected client) is dropped so
+	/// the channel self-heals. An empty payload, or an unknown/empty token (no
+	/// matching open stream), is a no-op.
+	void deliverTo(string sessionId, string jsonText) @safe
 	{
-		if (jsonText.length == 0)
+		if (jsonText.length == 0 || sessionId.length == 0)
 			return;
 		const frame = formatLegacyMessageEventRaw(jsonText);
 		long[] dead;
@@ -365,6 +388,8 @@ final class LegacySseChannel
 		// The dup is a shallow copy of the small Listener[].
 		foreach (l; listeners.dup)
 		{
+			if (l.sessionId != sessionId)
+				continue;
 			try
 				l.write(frame);
 			catch (Exception)
@@ -373,6 +398,18 @@ final class LegacySseChannel
 		foreach (id; dead)
 			removeListener(id);
 	}
+}
+
+/// Append a per-stream session token to the legacy message-POST URI so the leading
+/// `endpoint` event tells a client where to POST AND which stream its replies
+/// belong to. The token is added as a `sessionId` query parameter, preserving any
+/// existing query string already present on the path.
+string endpointWithSession(string endpointPath, string sessionId) @safe
+{
+	import std.string : indexOf;
+
+	const sep = endpointPath.indexOf('?') >= 0 ? "&" : "?";
+	return endpointPath ~ sep ~ "sessionId=" ~ sessionId;
 }
 
 /// Serialize every write to one response's bodyWriter through a fresh per-stream
@@ -422,7 +459,7 @@ private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @
 	res.contentType = "text/event-stream";
 	applySseStreamHeaders(res, false);
 
-	// LegacySseChannel.deliver itself has no write serialization, so without the
+	// LegacySseChannel.deliverTo itself has no write serialization, so without the
 	// per-stream lock two concurrent deliveries -- or a delivery racing the
 	// heartbeat -- could interleave SSE frames.
 	auto writeFrame = sseFrameWriter(res);
@@ -437,16 +474,19 @@ private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @
 }
 
 /// Process a single JSON-RPC message POSTed to the legacy message endpoint and
-/// route any response back onto the legacy GET SSE stream as a `message` event.
-/// Returns true (the server accepts every well-formed POST on this transport; a
-/// parse failure still yields a JSON-RPC error response delivered on the stream).
-/// A notification produces no response, so nothing is delivered. Exposed
-/// (package-level) so the two-endpoint flow can be exercised without a live
-/// socket.
-bool handleLegacyPostBody(McpServer server, LegacySseChannel channel, string payload) @safe
+/// route any response back onto the originating client's legacy GET SSE stream as a
+/// `message` event. `sessionId` is the per-stream token the client echoed from its
+/// `endpoint` event, so the response is delivered ONLY to the stream that issued
+/// this POST — never broadcast across concurrently-connected clients. Returns true
+/// (the server accepts every well-formed POST on this transport; a parse failure
+/// still yields a JSON-RPC error response delivered on the stream). A notification
+/// produces no response, so nothing is delivered. Exposed (package-level) so the
+/// two-endpoint flow can be exercised without a live socket.
+bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
+		string sessionId, string payload) @safe
 {
 	const responseText = server.handleRaw(payload);
-	channel.deliver(responseText);
+	channel.deliverTo(sessionId, responseText);
 	return true;
 }
 
@@ -529,37 +569,108 @@ private bool guardAuth(scope HTTPServerRequest req, scope HTTPServerResponse res
 /// The absolute URL of this server's Protected Resource Metadata document. Built
 /// from the request's scheme + Host so clients reach the same origin they called;
 /// falls back to the configured `resource` origin when the Host header is absent.
+///
+/// The raw Host header is client-controlled and is reflected verbatim into the
+/// `WWW-Authenticate: ... resource_metadata="..."` challenge, so it is NOT trusted
+/// unconditionally:
+///   - When origin validation is disabled (`validateOrigin == false`, the trusted-
+///     reverse-proxy mode), the configured `resource` origin is preferred as the
+///     primary source so an attacker-supplied Host cannot steer RFC 9728 discovery.
+///   - A Host that does not satisfy the host/port grammar (or, under enabled origin
+///     validation, the allow-list) is rejected before interpolation, so it can never
+///     break out of the quoted-string or redirect discovery.
+/// `wwwAuthenticate` additionally percent-encodes any residual quoted-string-illegal
+/// characters as defence in depth.
 private string resourceMetadataUrl(scope HTTPServerRequest req, StreamableHttpOptions opts) @safe
 {
 	import std.string : startsWith;
 
+	// In unvalidated (reverse-proxy) mode the client-controlled Host is untrusted,
+	// so the operator-configured `resource` origin is the PRIMARY source: prefer it
+	// whenever it is set, falling back to the Host only when no resource is
+	// configured. In validated mode the Host already cleared the allow-list guard,
+	// so the request's own origin is used. Either way a Host that does not satisfy
+	// the host/port grammar (validated mode: the allow-list) is never interpolated.
+	if (!opts.validateOrigin)
+	{
+		if (auto fromResource = resourceOrigin(opts.auth.resource))
+			return fromResource ~ ProtectedResourceMetadataPath;
+	}
+
 	const host = req.headers.get("Host", "");
-	if (host.length)
+	const hostUsable = host.length && (opts.validateOrigin ? hostAllowed(host,
+			opts.allowedHosts) : isAllowedHostGrammar(host));
+	if (hostUsable)
 	{
 		const scheme = req.headers.get("X-Forwarded-Proto",
 				isLoopbackHostname(stripPort(host)) ? "http" : "https");
 		return scheme ~ "://" ~ host ~ ProtectedResourceMetadataPath;
 	}
-	// No Host header: derive the origin from the configured resource identifier.
-	auto r = opts.auth.resource;
-	if (r.length)
-	{
-		const sep = () @safe {
-			import std.string : indexOf;
-
-			return r.indexOf("://");
-		}();
-		if (sep >= 0)
-		{
-			import std.string : indexOf;
-
-			auto rest = r[sep + 3 .. $];
-			const slash = rest.indexOf('/');
-			const origin = slash >= 0 ? r[0 .. sep + 3 + slash] : r;
-			return origin ~ ProtectedResourceMetadataPath;
-		}
-	}
+	// No usable Host header: derive the origin from the configured resource identifier.
+	if (auto fromResource = resourceOrigin(opts.auth.resource))
+		return fromResource ~ ProtectedResourceMetadataPath;
 	return ProtectedResourceMetadataPath;
+}
+
+/// The scheme://host[:port] origin of a configured RFC 8707 `resource` identifier
+/// (its path stripped), or null when `resource` is empty or carries no scheme.
+/// Used as the trustworthy source for the Protected Resource Metadata URL when the
+/// client-controlled Host cannot be trusted.
+private string resourceOrigin(string resource) @safe
+{
+	import std.string : indexOf;
+
+	if (resource.length == 0)
+		return null;
+	const sep = resource.indexOf("://");
+	if (sep < 0)
+		return null;
+	auto rest = resource[sep + 3 .. $];
+	const slash = rest.indexOf('/');
+	return slash >= 0 ? resource[0 .. sep + 3 + slash] : resource;
+}
+
+/// Whether a `Host` header value satisfies the RFC 3986 host[:port] grammar
+/// tightly enough to be safely interpolated into a `WWW-Authenticate`
+/// quoted-string. Permits unreserved host characters, IPv6 bracket literals, and a
+/// trailing `:port`; rejects anything containing a quote, whitespace, control
+/// character, or other byte that would break out of the quoted-string or steer
+/// discovery. This is the grammar gate used in unvalidated (reverse-proxy) mode,
+/// where the allow-list guard is intentionally off but the reflected value must
+/// still be well-formed.
+private bool isAllowedHostGrammar(string host) @safe
+{
+	if (host.length == 0)
+		return false;
+	foreach (char c; host)
+	{
+		const ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0'
+				&& c <= '9') || c == '.' || c == '-' || c == ':' || c == '[' || c == ']' || c == '%';
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
+unittest  // isAllowedHostGrammar accepts well-formed hosts and rejects injection attempts
+{
+	assert(isAllowedHostGrammar("example.com"));
+	assert(isAllowedHostGrammar("example.com:8443"));
+	assert(isAllowedHostGrammar("127.0.0.1:3000"));
+	assert(isAllowedHostGrammar("[::1]:8080"));
+	assert(!isAllowedHostGrammar(""));
+	// A quote would break out of the resource_metadata quoted-string.
+	assert(!isAllowedHostGrammar(`x" foo="bar`));
+	assert(!isAllowedHostGrammar("evil.example.com/path"));
+	assert(!isAllowedHostGrammar("has space"));
+}
+
+unittest  // resourceOrigin strips the path from a configured resource identifier
+{
+	assert(resourceOrigin("https://mcp.example.com/mcp") == "https://mcp.example.com");
+	assert(resourceOrigin("https://mcp.example.com") == "https://mcp.example.com");
+	assert(resourceOrigin("") is null);
+	assert(resourceOrigin("no-scheme") is null);
 }
 
 /// Decide how to answer an HTTP GET to the MCP endpoint
@@ -1580,12 +1691,15 @@ unittest  // legacy channel: GET stream first receives the endpoint event, then 
 	auto ch = new LegacySseChannel("/message");
 	string[] frames;
 	const id = ch.addListener((string f) @safe { frames ~= f; });
-	// On connect the channel emits the endpoint event naming the POST path.
+	// On connect the channel emits the endpoint event naming the POST path, now
+	// carrying the per-stream session token so replies can be correlated back.
 	assert(frames.length == 1);
-	assert(frames[0] == "event: endpoint\ndata: /message\n\n");
+	const sid = ch.sessionIdFor(id);
+	assert(sid.length > 0);
+	assert(frames[0] == "event: endpoint\ndata: /message?sessionId=" ~ sid ~ "\n\n");
 
-	// A server response routed onto the stream arrives as a `message` event.
-	ch.deliver(`{"jsonrpc":"2.0","id":1,"result":{}}`);
+	// A server response routed to this stream's token arrives as a `message` event.
+	ch.deliverTo(sid, `{"jsonrpc":"2.0","id":1,"result":{}}`);
 	assert(frames.length == 2);
 	assert(frames[1].startsWith("event: message\ndata: "));
 	assert(frames[1].canFind("\"id\":1"));
@@ -1604,20 +1718,70 @@ unittest  // legacy POST: a request is processed and its response pushed onto th
 	auto server = new McpServer("t", "1");
 	auto ch = new LegacySseChannel("/message");
 	string[] frames;
-	ch.addListener((string f) @safe { frames ~= f; });
+	const id = ch.addListener((string f) @safe { frames ~= f; });
 	assert(frames.length == 1); // the endpoint event
+	const sid = ch.sessionIdFor(id);
 
-	// A request: the response is pushed onto the stream as a `message` event.
-	const accepted = handleLegacyPostBody(server, ch, `{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+	// A request: the response is pushed onto the originating stream as a `message`
+	// event, routed by the per-stream session token.
+	const accepted = handleLegacyPostBody(server, ch, sid,
+			`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
 	assert(accepted); // the server accepted the message
 	assert(frames.length == 2);
 	assert(frames[1].canFind("\"id\":1"));
 
 	// A notification: accepted, but nothing is pushed back.
-	const accepted2 = handleLegacyPostBody(server, ch,
+	const accepted2 = handleLegacyPostBody(server, ch, sid,
 			`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
 	assert(accepted2);
 	assert(frames.length == 2); // no new frame
+}
+
+unittest  // legacy channel: a response routes only to the originating stream, not all clients
+{
+	// Two concurrent legacy clients each get a distinct per-stream session token in
+	// their `endpoint` event. A response delivered for one client's token MUST reach
+	// only that client's stream — never the other's (a cross-session response leak).
+	import std.algorithm : canFind;
+
+	auto ch = new LegacySseChannel("/message");
+	string[] framesA;
+	string[] framesB;
+	const idA = ch.addListener((string f) @safe { framesA ~= f; });
+	const idB = ch.addListener((string f) @safe { framesB ~= f; });
+	const sidA = ch.sessionIdFor(idA);
+	const sidB = ch.sessionIdFor(idB);
+
+	// Distinct tokens, each advertised on its own endpoint event.
+	assert(sidA.length > 0 && sidB.length > 0 && sidA != sidB);
+	assert(framesA[0].canFind("sessionId=" ~ sidA));
+	assert(framesB[0].canFind("sessionId=" ~ sidB));
+
+	// A response for client A reaches A's stream and ONLY A's stream.
+	ch.deliverTo(sidA, `{"jsonrpc":"2.0","id":1,"result":{"who":"A"}}`);
+	assert(framesA.length == 2);
+	assert(framesA[1].canFind("\"who\":\"A\""));
+	assert(framesB.length == 1); // B saw only its endpoint event, never A's reply
+}
+
+unittest  // legacy channel: an unknown or empty session token delivers nowhere
+{
+	// A POST that carries no (or a stale) session token must not fall back to a
+	// broadcast that would leak the reply onto every open stream.
+	auto ch = new LegacySseChannel("/message");
+	string[] frames;
+	ch.addListener((string f) @safe { frames ~= f; });
+	assert(frames.length == 1); // endpoint event only
+
+	ch.deliverTo("", `{"jsonrpc":"2.0","id":1,"result":{}}`);
+	ch.deliverTo("not-a-real-token", `{"jsonrpc":"2.0","id":2,"result":{}}`);
+	assert(frames.length == 1); // nothing delivered to the open stream
+}
+
+unittest  // endpointWithSession appends the session token, preserving any existing query
+{
+	assert(endpointWithSession("/message", "abc") == "/message?sessionId=abc");
+	assert(endpointWithSession("/message?x=1", "abc") == "/message?x=1&sessionId=abc");
 }
 
 unittest  // legacy support is opt-in: off by default
