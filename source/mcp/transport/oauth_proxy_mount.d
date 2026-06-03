@@ -78,6 +78,27 @@ string buildClientCallbackRedirect(string clientRedirectUri, string code, string
 	return url;
 }
 
+/// Append an RFC 6749 §4.1.2.1 authorization error (and, when present, the
+/// client's original `state`) as query parameters to the client's dynamic
+/// `redirect_uri`, producing the Location the proxy 302s to when the upstream
+/// authorization server redirects back with an `error` instead of a `code`.
+/// `error` is mandatory; `errorDescription` and `errorUri` are appended only
+/// when non-empty. Symmetric to `buildClientCallbackRedirect`.
+string buildClientCallbackError(string clientRedirectUri, string error,
+		string errorDescription, string errorUri, string clientState) @safe
+{
+	auto url = clientRedirectUri;
+	url ~= (clientRedirectUri.indexOf('?') < 0) ? "?" : "&";
+	url ~= "error=" ~ enc(error);
+	if (errorDescription.length)
+		url ~= "&error_description=" ~ enc(errorDescription);
+	if (errorUri.length)
+		url ~= "&error_uri=" ~ enc(errorUri);
+	if (clientState.length)
+		url ~= "&state=" ~ enc(clientState);
+	return url;
+}
+
 /// Build the RFC 6749 §5.2 `invalid_request` error document returned (with HTTP
 /// 400) when a client presents a `redirect_uri` that is not registered or uses a
 /// disallowed scheme. The offending code is never relayed.
@@ -159,15 +180,60 @@ string consentApproveUrl(string consentPath, string proxyState) @safe
 /// A thread-safe in-memory store mapping a proxy `state` to the client's
 /// pending-authorization details. Entries are consumed (single use) on lookup so
 /// a relayed callback cannot be replayed.
+///
+/// The store is bounded so the unauthenticated `/authorize` route cannot grow
+/// process memory without limit: each entry carries an insertion timestamp, and
+/// every `put`/`take` sweeps entries older than the authorization-flow TTL and
+/// caps the live entry count, evicting the oldest by insertion time when the cap
+/// is reached. The clock is injectable so the bounds are unit-testable.
 final class ProxyStateStore
 {
+	import core.time : Duration, MonoTime, minutes;
+
+	/// Lifetime of a pending authorization (authorize -> consent -> callback). An
+	/// abandoned or un-consented flow is swept after this elapses.
+	enum Duration defaultTtl = 10.minutes;
+
+	/// Maximum number of live pending authorizations. When reached on `put`, the
+	/// oldest entries are evicted so a flood cannot exhaust memory inside the TTL.
+	enum size_t defaultMaxEntries = 10_000;
+
 	private ProxyAuthState[string] entries;
+	private MonoTime[string] inserted;
+	private const Duration ttl;
+	private const size_t maxEntries;
+	private MonoTime delegate() @safe clock;
+
+	this() @safe
+	{
+		this(defaultTtl, defaultMaxEntries, null);
+	}
+
+	/// Construct with explicit bounds and an optional injectable clock (used by
+	/// tests to drive TTL expiry deterministically). A null clock uses `MonoTime.currTime`.
+	this(Duration ttl, size_t maxEntries, MonoTime delegate() @safe clock) @safe
+	{
+		this.ttl = ttl;
+		this.maxEntries = maxEntries;
+		this.clock = clock;
+	}
+
+	private MonoTime now() @safe
+	{
+		return clock is null ? MonoTime.currTime : clock();
+	}
 
 	/// Record the client's authorization details under the proxy `state`.
 	void put(string proxyState, ProxyAuthState st) @safe
 	{
 		synchronized (this)
+		{
+			const t = now();
+			sweepExpired(t);
 			entries[proxyState] = st;
+			inserted[proxyState] = t;
+			enforceCap();
+		}
 	}
 
 	/// Consume and return the details for `proxyState`, setting `found`.
@@ -175,16 +241,57 @@ final class ProxyStateStore
 	{
 		synchronized (this)
 		{
+			sweepExpired(now());
 			if (auto p = proxyState in entries)
 			{
 				found = true;
 				auto v = *p;
 				entries.remove(proxyState);
+				inserted.remove(proxyState);
 				return v;
 			}
 		}
 		found = false;
 		return ProxyAuthState.init;
+	}
+
+	/// Number of live pending authorizations (test/diagnostic use).
+	size_t length() @safe
+	{
+		synchronized (this)
+			return entries.length;
+	}
+
+	private void sweepExpired(MonoTime t) @safe
+	{
+		string[] stale;
+		foreach (k, ins; inserted)
+			if (t - ins >= ttl)
+				stale ~= k;
+		foreach (k; stale)
+		{
+			entries.remove(k);
+			inserted.remove(k);
+		}
+	}
+
+	private void enforceCap() @safe
+	{
+		while (entries.length > maxEntries)
+		{
+			string oldestKey;
+			MonoTime oldest;
+			bool first = true;
+			foreach (k, ins; inserted)
+				if (first || ins < oldest)
+				{
+					oldest = ins;
+					oldestKey = k;
+					first = false;
+				}
+			entries.remove(oldestKey);
+			inserted.remove(oldestKey);
+		}
 	}
 }
 
@@ -344,6 +451,7 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 	// state and relay the upstream code straight back to the client.
 	router.get(callbackPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const code = req.query.get("code", "");
+		const upstreamError = req.query.get("error", "");
 		const proxyState = req.query.get("state", "");
 		bool found;
 		auto st = store.take(proxyState, found);
@@ -351,6 +459,18 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 		{
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeBody("Unknown or expired authorization state", "text/plain");
+			return;
+		}
+		// Relay an upstream authorization failure (RFC 6749 §4.1.2.1) to the client
+		// rather than forwarding an empty code. Branch when the upstream sent an
+		// `error`, or defensively when no `code` was returned at all.
+		if (upstreamError.length || code.length == 0)
+		{
+			const error = upstreamError.length ? upstreamError : "access_denied";
+			const location = buildClientCallbackError(st.clientRedirectUri, error,
+				req.query.get("error_description",
+				""), req.query.get("error_uri", ""), st.clientState);
+			res.redirect(location, HTTPStatus.found);
 			return;
 		}
 		const location = buildClientCallbackRedirect(st.clientRedirectUri, code, st.clientState);
@@ -493,6 +613,32 @@ unittest  // the relay redirect uses & when the client redirect_uri already has 
 	assert(!url.canFind("state="));
 }
 
+unittest  // the error relay appends error (+ description/uri/state) to the client redirect_uri
+{
+	import std.algorithm : canFind;
+
+	const url = buildClientCallbackError("http://localhost:5000/cb",
+			"access_denied", "the user said no", "https://err.example", "cs-1");
+	assert(url.startsWith("http://localhost:5000/cb?"));
+	assert(url.canFind("error=access_denied"));
+	assert(url.canFind("error_description=the%20user%20said%20no"));
+	assert(url.canFind("error_uri=https"));
+	assert(url.canFind("state=cs-1"));
+	// No code is relayed on an error.
+	assert(!url.canFind("code="));
+}
+
+unittest  // the error relay omits absent optional params and uses & with an existing query
+{
+	import std.algorithm : canFind;
+
+	const url = buildClientCallbackError("http://localhost/cb?x=1", "server_error", "", "", "");
+	assert(url.canFind("?x=1&error=server_error"));
+	assert(!url.canFind("error_description="));
+	assert(!url.canFind("error_uri="));
+	assert(!url.canFind("state="));
+}
+
 unittest  // redirectUrisFrom pulls the array out of a DCR request body
 {
 	auto body_ = parseJsonString(
@@ -530,6 +676,48 @@ unittest  // an unknown proxy state is not found
 	bool found;
 	store.take("nope", found);
 	assert(!found);
+}
+
+unittest  // the store sweeps entries older than the TTL on the next put/take
+{
+	import core.time : MonoTime, minutes;
+
+	auto clk = MonoTime.currTime;
+	auto store = new ProxyStateStore(10.minutes, 10_000, () @safe => clk);
+	store.put("old", ProxyAuthState("http://localhost/cb", "s"));
+	assert(store.length == 1);
+
+	// Advance past the TTL: the stale entry is swept on the next put.
+	clk += 11.minutes;
+	store.put("fresh", ProxyAuthState("http://localhost/cb2", "s2"));
+	assert(store.length == 1);
+	bool found;
+	store.take("old", found);
+	assert(!found);
+	store.take("fresh", found);
+	assert(found);
+}
+
+unittest  // the store caps live entries, evicting the oldest by insertion time
+{
+	import core.time : MonoTime, minutes, seconds;
+
+	auto clk = MonoTime.currTime;
+	auto store = new ProxyStateStore(10.minutes, 2, () @safe => clk);
+	store.put("a", ProxyAuthState("http://localhost/a", ""));
+	clk += 1.seconds;
+	store.put("b", ProxyAuthState("http://localhost/b", ""));
+	clk += 1.seconds;
+	// Third put exceeds the cap of 2: the oldest ("a") is evicted.
+	store.put("c", ProxyAuthState("http://localhost/c", ""));
+	assert(store.length == 2);
+	bool found;
+	store.take("a", found);
+	assert(!found);
+	store.take("b", found);
+	assert(found);
+	store.take("c", found);
+	assert(found);
 }
 
 unittest  // formField URL-decodes a value and returns "" for an absent field
@@ -730,6 +918,57 @@ unittest  // CONFUSED DEPUTY: after the user approves, /consent records consent 
 	assert(res2.headers["Location"].startsWith("https://github.com/login/oauth/authorize?"));
 	assert(res2.headers["Location"].canFind("client_id=Iv1.upstream"));
 	assert(res2.headers["Location"].canFind("code_challenge=CH"));
+}
+
+unittest  // UPSTREAM ERROR: /callback relays an upstream error to the client, not an empty code
+{
+	import std.algorithm : canFind, startsWith;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com";
+	cfg.resource = "https://mcp.example.com/mcp";
+
+	auto proxy = new OAuthProxy(cfg);
+	proxy.register(["http://localhost:5000/cb"]);
+	proxy.grantConsent("http://localhost:5000/cb");
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	// Drive /authorize to mint a proxy state and stash the pending authorization.
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	assert(res.statusCode == 302);
+
+	// Read the proxy state the proxy forwarded upstream.
+	import std.string : indexOf;
+
+	const loc = res.headers["Location"];
+	const mark = "state=";
+	const si = loc.indexOf(mark);
+	assert(si >= 0);
+	const proxyState = loc[si + mark.length .. $];
+
+	// The upstream redirects back with an error and no code.
+	auto res2 = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
+	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/auth/callback?error=access_denied&error_description=denied&state=" ~ proxyState));
+	router.handleRequest(req2, res2);
+
+	assert(res2.statusCode == 302);
+	const clientLoc = res2.headers["Location"];
+	assert(clientLoc.startsWith("http://localhost:5000/cb?"));
+	assert(clientLoc.canFind("error=access_denied"));
+	assert(clientLoc.canFind("state=cs"));
+	// The client must NOT receive an empty code.
+	assert(!clientLoc.canFind("code="));
 }
 
 unittest  // invalidRequestJson carries the RFC 6749 invalid_request error shape
