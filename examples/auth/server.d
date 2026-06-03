@@ -23,9 +23,9 @@
  *   - `whoami` returns a typed `WhoamiResult` struct, so the reflection layer
  *     INFERS both the tool's output schema (via `jsonSchemaOf`) and the
  *     `structuredContent` of the result — no hand-built `Json`.
- *   - `secret_note` returns a `CallToolResult` (it must set `isError` on the
- *     per-tool scope-denied path) whose content is built with the typed
- *     `Content.makeText` helper rather than hand-assembled `Json`.
+ *   - `secret_note` returns a `CallToolResult` built via the `CallToolResult.text`
+ *     / `CallToolResult.error` factories (the scope-denied path needs `isError`),
+ *     rather than hand-assembled `Json`.
  *
  * TRANSPORT: this example is HTTP-only and stays on `runStreamableHttp`. OAuth
  * 2.1 resource-server protection (401 challenges, the RFC 9728 PRM document, RFC
@@ -87,22 +87,14 @@ final class AuthApi
 	/// check (`mcp:write`) on top of the server-wide `mcp:read`. The handler reads
 	/// `ctx.auth().hasScope` and returns a tool error when the caller lacks the
 	/// write scope, demonstrating in-handler authorization decisions. Returns a
-	/// `CallToolResult` (needed for `isError`); content uses `Content.makeText`.
+	/// `CallToolResult` via the `text`/`error` factories.
 	@tool("secret_note", "Return a secret note; requires the mcp:write scope")
 	CallToolResult secretNote(RequestContext ctx)
 	{
 		auto info = ctx.auth();
-		CallToolResult r;
 		if (!info.hasScope("mcp:write"))
-		{
-			r.content = [
-				Content.makeText("forbidden: this tool requires the mcp:write scope")
-			];
-			r.isError = true;
-			return r;
-		}
-		r.content = [Content.makeText("the launch code is 0000-MCP")];
-		return r;
+			return CallToolResult.error("forbidden: this tool requires the mcp:write scope");
+		return CallToolResult.text("the launch code is 0000-MCP");
 	}
 }
 

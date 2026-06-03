@@ -16,6 +16,7 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 import mcp.protocol.types : Content, ContentKind, Tool;
 import mcp.protocol.errors : McpException, invalidParams;
+import mcp.protocol.jsonhelpers : getOr, tryGet;
 
 @safe:
 
@@ -88,7 +89,7 @@ struct SamplingMessage
 	static SamplingMessage fromJson(Json j) @safe
 	{
 		SamplingMessage m;
-		m.role = ("role" in j) ? j["role"].get!string : "";
+		m.role = j.getOr("role", "");
 		// `content` may be a single block (object) or an array of blocks; accept
 		// both so a tool-loop follow-up (array of tool_use/tool_result blocks)
 		// round-trips without dropping any block.
@@ -124,7 +125,7 @@ struct ModelHint
 	static ModelHint fromJson(Json j) @safe
 	{
 		ModelHint h;
-		h.name = ("name" in j) ? j["name"].get!string : "";
+		h.name = j.getOr("name", "");
 		return h;
 	}
 }
@@ -284,10 +285,8 @@ struct CreateMessageRequest
 				r.messages ~= SamplingMessage.fromJson(j["messages"][i]);
 		if ("modelPreferences" in j && j["modelPreferences"].type == Json.Type.object)
 			r.modelPreferences = ModelPreferences.fromJson(j["modelPreferences"]);
-		if ("systemPrompt" in j && j["systemPrompt"].type == Json.Type.string)
-			r.systemPrompt = j["systemPrompt"].get!string;
-		if ("includeContext" in j && j["includeContext"].type == Json.Type.string)
-			r.includeContext = j["includeContext"].get!string;
+		tryGet(j, "systemPrompt", r.systemPrompt);
+		tryGet(j, "includeContext", r.includeContext);
 		if ("temperature" in j && j["temperature"].type != Json.Type.undefined
 				&& j["temperature"].type != Json.Type.null_)
 			r.temperature = j["temperature"].to!double;
@@ -546,7 +545,7 @@ struct CreateMessageResult
 	static CreateMessageResult fromJson(Json j) @safe
 	{
 		CreateMessageResult r;
-		r.role = ("role" in j) ? j["role"].get!string : "";
+		r.role = j.getOr("role", "");
 		// `content` may be a single block (object) or an array of blocks; accept
 		// both so a tool-use reply (array of tool_use blocks) round-trips.
 		if ("content" in j)
@@ -558,9 +557,8 @@ struct CreateMessageResult
 			else
 				r.contentBlocks ~= Content.fromJson(c);
 		}
-		r.model = ("model" in j) ? j["model"].get!string : "";
-		if ("stopReason" in j && j["stopReason"].type == Json.Type.string)
-			r.stopReason = j["stopReason"].get!string;
+		r.model = j.getOr("model", "");
+		tryGet(j, "stopReason", r.stopReason);
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			r.meta = j["_meta"];
 		return r;
