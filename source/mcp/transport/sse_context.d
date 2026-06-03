@@ -1778,21 +1778,29 @@ unittest  // a server->client request fails fast when its bound listener disconn
 unittest  // a slow stream's write must not block delivery to a different stream
 {
 	// With per-listener write serialization off the channel mutex, a slow write on
-	// stream X must NOT delay a concurrent delivery to stream Y. Model two listeners:
-	// X's write yields for a while; Y's write is instant. Deliver to X and Y
-	// concurrently and assert Y finishes BEFORE X (impossible if both serialize on
-	// one channel mutex held across the write).
-	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
-	import core.time : msecs;
+	// stream X must NOT delay a concurrent delivery to stream Y. Two listeners: X's
+	// write blocks until released; Y's write is instant. Deliver to X and Y
+	// concurrently and assert Y finishes BEFORE X — impossible if both serialized on
+	// one channel mutex held across the write. Synchronization is event-based (no
+	// sleeps), so the head-of-line condition is exercised deterministically.
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.core.sync : createManualEvent;
 
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 
 	int order;
 	int slowDoneAt = -1, fastDoneAt = -1;
-	// Slow listener: its write yields for a noticeable interval before completing.
-	const slow = ch.addListener((string) @safe { sleep(40.msecs); });
-	// Fast listener: its write completes immediately.
+	auto slowStarted = createManualEvent();
+	auto slowRelease = createManualEvent();
+	const startEc = slowStarted.emitCount;
+	const releaseEc = slowRelease.emitCount;
+
+	// Slow listener: announce its write is in progress, then block until released.
+	const slow = ch.addListener((string) @safe {
+		() @trusted { slowStarted.emit(); slowRelease.wait(releaseEc); }();
+	});
+	// Fast listener: completes immediately.
 	const fast = ch.addListener((string) @safe {});
 
 	runTask(() nothrow{
@@ -1809,9 +1817,9 @@ unittest  // a slow stream's write must not block delivery to a different stream
 				{
 				}
 			});
-			// Give the slow delivery a head start so it is mid-write (yielding) when the
-			// fast delivery is attempted — exactly the head-of-line condition under test.
-			sleep(5.msecs);
+			// Wait until the slow write is actually in progress (blocked) — no timing
+			// guesswork.
+			() @trusted { slowStarted.wait(startEc); }();
 			auto tFast = runTask(() nothrow{
 				try
 				{
@@ -1823,7 +1831,10 @@ unittest  // a slow stream's write must not block delivery to a different stream
 				{
 				}
 			});
+			// The fast delivery completed while the slow write is still blocked; now
+			// release the slow write and let it finish.
 			tFast.join();
+			() @trusted { slowRelease.emit(); }();
 			tSlow.join();
 		}
 		catch (Exception)
