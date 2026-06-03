@@ -1035,8 +1035,9 @@ private bool isUnsafeIpv4Octets(ubyte a, ubyte b, ubyte c, ubyte d) @safe pure n
 /// This guard is purely lexical: it inspects the host as written and does not
 /// perform DNS resolution. A registered hostname that resolves to an internal
 /// address (e.g. an attacker-controlled name pointing at 169.254.169.254) is
-/// NOT covered here; mitigating that residual TOCTOU requires resolving and
-/// pinning the address at connect time and is out of this function's scope.
+/// NOT covered here; that residual case is handled by `requireSecureUrl`, which
+/// resolves the host and re-checks every returned A/AAAA address against the
+/// same private/link-local ranges before any request is made.
 bool isSecureFetchUrl(string url) @safe pure nothrow @nogc
 {
 	import std.string : indexOf;
@@ -1105,12 +1106,120 @@ bool isSecureFetchUrl(string url) @safe pure nothrow @nogc
 	return false;
 }
 
-/// Throw `invalidRequest` when `url` is not safe to fetch (see
-/// `isSecureFetchUrl`). Used at the start of every outbound OAuth/discovery
-/// HTTP request so attacker-influenced URLs (e.g. a `resource_metadata` URL
-/// from a `WWW-Authenticate` header) cannot be fetched over plaintext or
-/// pointed at internal/link-local addresses.
-void requireSecureUrl(string url) @safe pure
+/// Extract the bare authority host from a fetch URL: everything after `://` up
+/// to the first `/`, `?` or `#`, with an optional `userinfo@` prefix dropped and
+/// any surrounding brackets/port preserved as written. Returns the empty string
+/// when the URL has no `://` or no host. `@safe pure nothrow @nogc`.
+private string fetchUrlHost(string url) @safe pure nothrow @nogc
+{
+	import std.string : indexOf;
+
+	const schemeEnd = url.indexOf("://");
+	if (schemeEnd < 0)
+		return "";
+	auto rest = url[schemeEnd + 3 .. $];
+	size_t hostEnd = rest.length;
+	foreach (k, ch; rest)
+	{
+		if (ch == '/' || ch == '?' || ch == '#')
+		{
+			hostEnd = k;
+			break;
+		}
+	}
+	auto host = rest[0 .. hostEnd];
+	const at = host.indexOf('@');
+	if (at >= 0)
+		host = host[at + 1 .. $];
+	return host;
+}
+
+/// Whether a resolved address, given as its numeric string form (as produced by
+/// `std.socket.Address.toAddrString`), falls in a private/link-local/loopback/
+/// ULA range that the SSRF guard rejects. Dotted-quad and integer IPv4 forms go
+/// through `isUnsafeIpv4Octets`; bracketless IPv6 forms go through the IPv6
+/// literal classifier (with `loopback=false` so `::1` from a resolved hostname
+/// is treated as unsafe). `@safe pure nothrow @nogc`.
+private bool isUnsafeResolvedAddress(string addr) @safe pure nothrow @nogc
+{
+	import std.string : indexOf;
+
+	// Strip a zone id if the resolver attached one (e.g. fe80::1%en0).
+	const pct = addr.indexOf('%');
+	if (pct >= 0)
+		addr = addr[0 .. pct];
+	if (addr.length == 0)
+		return true; // fail closed
+
+	// IPv6 addresses contain a ':'; IPv4 (dotted or numeric) never does.
+	if (addr.indexOf(':') >= 0)
+		return isUnsafeIpv6Literal(addr, false);
+
+	ubyte[4] oct;
+	if (!canonicalizeNumericIpv4(addr, oct))
+		return true; // unrecognized literal -> fail closed
+	return isUnsafeIpv4Octets(oct[0], oct[1], oct[2], oct[3]);
+}
+
+/// Resolve a registered hostname and report whether it is safe to fetch. Returns
+/// false only when resolution SUCCEEDS and at least one returned A/AAAA address
+/// falls in a private/link-local/loopback/ULA range — the DNS-rebinding case the
+/// lexical guard cannot see. IP literals and loopback hosts are already covered
+/// lexically and are reported safe without resolving. A resolution failure
+/// (NXDOMAIN, timeout, no network) is reported safe so this guard never rejects
+/// a host purely for failing to resolve; the subsequent connect would fail on
+/// its own and no internal address was exposed. `@safe`.
+private bool resolvedHostIsSafe(string host) @safe
+{
+	import std.string : indexOf;
+	import std.socket : getAddressInfo, AddressFamily, SocketException;
+
+	if (host.length == 0)
+		return false;
+
+	// Bracketed IPv6 literals and loopback hosts are handled lexically.
+	if (host[0] == '[')
+		return true;
+	if (isLoopbackHost(host))
+		return true;
+
+	// Strip an optional port suffix to obtain the bare hostname.
+	const colon = host.indexOf(':');
+	if (colon >= 0)
+		host = host[0 .. colon];
+
+	// A numeric IPv4 literal in any encoding is already vetted lexically.
+	ubyte[4] oct;
+	if (canonicalizeNumericIpv4(host, oct))
+		return true;
+
+	try
+	{
+		auto infos = getAddressInfo(host);
+		foreach (info; infos)
+		{
+			if (info.family != AddressFamily.INET && info.family != AddressFamily.INET6)
+				continue;
+			if (isUnsafeResolvedAddress(info.address.toAddrString()))
+				return false;
+		}
+		return true;
+	}
+	catch (SocketException)
+	{
+		return true; // unresolved -> let the connect fail naturally; no internal target exposed
+	}
+}
+
+/// Throw `invalidRequest` when `url` is not safe to fetch. First applies the
+/// lexical `isSecureFetchUrl` guard (scheme + IP-literal ranges), then resolves
+/// the host and rejects the request if any returned A/AAAA address falls in a
+/// private/link-local range — closing the DNS-rebinding gap where an
+/// attacker-controlled hostname points at an internal address (e.g. a
+/// `resource_metadata` URL from a `WWW-Authenticate` header that resolves to
+/// 169.254.169.254). Used at the start of every outbound OAuth/discovery
+/// request.
+void requireSecureUrl(string url) @safe
 {
 	import mcp.protocol.errors : invalidRequest;
 
@@ -1118,6 +1227,10 @@ void requireSecureUrl(string url) @safe pure
 		throw invalidRequest(
 				"Refusing to fetch insecure OAuth/discovery URL (must be https, or http to an "
 				~ "explicit loopback host; private/link-local addresses are rejected): " ~ url);
+
+	if (!resolvedHostIsSafe(fetchUrlHost(url)))
+		throw invalidRequest("Refusing to fetch OAuth/discovery URL whose host resolves to a "
+				~ "private/link-local address (or could not be resolved): " ~ url);
 }
 
 unittest  // isSecureFetchUrl accepts https and rejects plaintext http to a remote host
@@ -1278,14 +1391,95 @@ unittest  // canonicalizeNumericIpv4 decodes the documented inet_aton forms
 	]);
 }
 
-unittest  // requireSecureUrl throws on an insecure URL and passes a secure one
+unittest  // requireSecureUrl throws on an insecure URL and passes a secure loopback one
 {
 	import std.exception : assertThrown;
 
 	assertThrown(requireSecureUrl("http://as.example.com/token"));
 	assertThrown(requireSecureUrl("https://169.254.169.254/"));
-	requireSecureUrl("https://as.example.com/token"); // does not throw
+	// Loopback hosts skip DNS resolution, so these are network-independent.
+	requireSecureUrl("https://127.0.0.1/token"); // does not throw
 	requireSecureUrl("http://127.0.0.1:8765/callback"); // loopback dev ok
+}
+
+unittest  // fetchUrlHost extracts the authority host, dropping userinfo and path
+{
+	assert(fetchUrlHost("https://as.example.com/.well-known/x") == "as.example.com");
+	assert(fetchUrlHost("https://user:pass@as.example.com:8443/token") == "as.example.com:8443");
+	assert(fetchUrlHost("https://[2606:4700::1]:443/x") == "[2606:4700::1]:443");
+	assert(fetchUrlHost("https://h.example?q=1") == "h.example");
+	assert(fetchUrlHost("https://h.example#f") == "h.example");
+	assert(fetchUrlHost("no-scheme") == "");
+}
+
+unittest  // isUnsafeResolvedAddress rejects private/link-local resolved IPv4 results
+{
+	assert(isUnsafeResolvedAddress("169.254.169.254"));
+	assert(isUnsafeResolvedAddress("10.0.0.5"));
+	assert(isUnsafeResolvedAddress("192.168.1.1"));
+	assert(isUnsafeResolvedAddress("172.16.0.1"));
+	assert(isUnsafeResolvedAddress("127.0.0.1"));
+	assert(isUnsafeResolvedAddress("0.0.0.0"));
+}
+
+unittest  // isUnsafeResolvedAddress accepts public resolved IPv4 results
+{
+	assert(!isUnsafeResolvedAddress("8.8.8.8"));
+	assert(!isUnsafeResolvedAddress("1.1.1.1"));
+	assert(!isUnsafeResolvedAddress("93.184.216.34"));
+}
+
+unittest  // isUnsafeResolvedAddress rejects private/link-local resolved IPv6 results
+{
+	assert(isUnsafeResolvedAddress("fd00::1"));
+	assert(isUnsafeResolvedAddress("fe80::1"));
+	assert(isUnsafeResolvedAddress("::1"));
+	assert(isUnsafeResolvedAddress("::ffff:169.254.169.254"));
+	assert(isUnsafeResolvedAddress("fe80::1%en0")); // zone id stripped first
+}
+
+unittest  // isUnsafeResolvedAddress accepts a public global-unicast resolved IPv6 result
+{
+	assert(!isUnsafeResolvedAddress("2606:4700:4700::1111"));
+	assert(!isUnsafeResolvedAddress("2001:4860:4860::8888"));
+}
+
+unittest  // isUnsafeResolvedAddress fails closed on empty / unparseable results
+{
+	assert(isUnsafeResolvedAddress(""));
+	assert(isUnsafeResolvedAddress("not-an-address"));
+}
+
+unittest  // resolvedHostIsSafe short-circuits IP literals and loopback without resolving
+{
+	assert(resolvedHostIsSafe("[2606:4700::1]:443"));
+	assert(resolvedHostIsSafe("localhost"));
+	assert(resolvedHostIsSafe("127.0.0.1"));
+	assert(resolvedHostIsSafe("8.8.8.8")); // numeric literal, vetted lexically
+	assert(!resolvedHostIsSafe("")); // no host -> fail closed
+}
+
+unittest  // the resolver path flags a name whose returned address is internal
+{
+	// Exercise getAddressInfo + toAddrString + the classifier end to end. Any
+	// address the local resolver maps the loopback name to must be classified as
+	// unsafe, which is precisely what makes a hostname resolving to an internal
+	// address get rejected (DNS-rebinding guard).
+	import std.socket : getAddressInfo, AddressFamily, SocketException;
+
+	try
+	{
+		auto infos = getAddressInfo("localhost");
+		foreach (info; infos)
+		{
+			if (info.family != AddressFamily.INET && info.family != AddressFamily.INET6)
+				continue;
+			assert(isUnsafeResolvedAddress(info.address.toAddrString()));
+		}
+	}
+	catch (SocketException)
+	{
+	}
 }
 
 unittest  // valid CIMD client_id: https with a path component
