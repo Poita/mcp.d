@@ -264,6 +264,7 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 	// proxy's own consent screen instead of forwarding.
 	router.get(authorizePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const codeChallenge = req.query.get("code_challenge", "");
+		const codeChallengeMethod = req.query.get("code_challenge_method", "");
 		const scope_ = req.query.get("scope", "");
 		const clientRedirect = req.query.get("redirect_uri", "");
 		const clientState = req.query.get("state", "");
@@ -278,6 +279,23 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 		{
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeJsonBody(invalidRequestJson("invalid redirect_uri"));
+			return;
+		}
+
+		// Enforce PKCE on the proxy->upstream leg. The proxy advertises S256-only
+		// support, so a missing code_challenge — or a code_challenge_method other
+		// than S256 — is refused with RFC 6749 §5.2 invalid_request rather than
+		// forwarding a non-PKCE / malformed-PKCE request upstream.
+		if (codeChallenge.length == 0)
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(invalidRequestJson("code_challenge is required"));
+			return;
+		}
+		if (codeChallengeMethod.length && codeChallengeMethod != "S256")
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(invalidRequestJson("code_challenge_method must be S256"));
 			return;
 		}
 
@@ -782,4 +800,68 @@ unittest  // OPEN REDIRECT: /authorize 400s an http non-loopback redirect_uri ev
 	const body_ = () @trusted { return cast(string) sink.data; }();
 	assert(res.statusCode == 400);
 	assert(body_.canFind("invalid_request"));
+}
+
+unittest  // PKCE: /authorize 400s a request with a missing code_challenge
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com";
+	cfg.resource = "https://mcp.example.com/mcp";
+
+	auto proxy = new OAuthProxy(cfg);
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	assert(res.statusCode == 400);
+	assert(body_.canFind("invalid_request"));
+	assert(body_.canFind("code_challenge"));
+	// The client was never forwarded upstream / asked to consent.
+	assert(!body_.canFind("Authorize application"));
+}
+
+unittest  // PKCE: /authorize 400s a non-S256 code_challenge_method
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com";
+	cfg.resource = "https://mcp.example.com/mcp";
+
+	auto proxy = new OAuthProxy(cfg);
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&code_challenge_method=plain&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	assert(res.statusCode == 400);
+	assert(body_.canFind("invalid_request"));
+	assert(body_.canFind("S256"));
 }
