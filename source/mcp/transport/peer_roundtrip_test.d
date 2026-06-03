@@ -23,6 +23,17 @@ version (unittest)
 	import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
 	import mcp.protocol.types : ElicitParams, ElicitResult, ElicitAction;
 	import mcp.transport.streamable_http : mountMcp, StreamableHttpOptions;
+
+	// Release a client's connections from a nothrow event-loop body without
+	// letting close() throw out of it.
+	void closeQuietly(McpClient c) @safe nothrow
+	{
+		try
+			c.close();
+		catch (Exception)
+		{
+		}
+	}
 }
 
 // Round-trip: our server runs a tool that calls ctx.sample; our HTTP client
@@ -79,11 +90,7 @@ unittest
 
 			auto client = McpClient.http(url);
 			scope (exit)
-				try
-					client.close();
-				catch (Exception)
-				{
-				}
+				closeQuietly(client);
 			client.onSampling = (CreateMessageRequest request) @safe {
 				CreateMessageResult r;
 				r.role = "assistant";
@@ -159,11 +166,7 @@ unittest
 
 			auto client = McpClient.http(url);
 			scope (exit)
-				try
-					client.close();
-				catch (Exception)
-				{
-				}
+				closeQuietly(client);
 			// Advertise form-mode elicitation explicitly (the client validates inbound
 			// requests against its declared capabilities, not the auto-derived set).
 			client.capabilities.elicitation = true;
