@@ -128,7 +128,31 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 		}
 	}
 
-	channel = new DuplexChannel(readLine, writeLine, &onInbound);
+	// An inbound JSON-RPC batch array is dispatched as a whole through the server's
+	// `handleRaw`, so its negotiated-version gate (reject a batch with a null-id
+	// -32600 on 2025-06-18+) and its single JSON-array response framing both apply —
+	// splitting the batch into separate lines would bypass both. The batch runs in
+	// its own task (tracked as in-flight) so a long-running member handler cannot
+	// stall the read loop, and `handleRaw` returns the one aggregated array frame.
+	void onInboundBatch(string raw) @safe
+	{
+		++inflight;
+		runTask((string text) nothrow{
+			try
+			{
+				auto reply = server.handleRaw(text, &sink, &serverRequest);
+				if (reply.length)
+					channel.sendRaw(reply);
+			}
+			catch (Exception)
+			{
+			}
+			finally
+				--inflight;
+		}, raw);
+	}
+
+	channel = new DuplexChannel(readLine, writeLine, &onInbound, &onInboundBatch);
 	channel.runReadLoop();
 
 	// The read loop has ended at stdin EOF. failPending (inside runReadLoop) already
@@ -768,6 +792,83 @@ unittest  // serveStdio processes newline-delimited requests and writes response
 		}
 	}
 	assert(sawId1 && sawId2);
+}
+
+unittest  // stdio: a batch on a negotiated 2025-06-18+ session is rejected with one null-id -32600
+{
+	auto s = new McpServer("stdio-srv", "1.0");
+
+	string[] outputs;
+	withServer(s, (ServerLink link) @safe {
+		// Negotiate a version where JSON-RPC batching was removed.
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":` ~ `{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+		foreach (_; 0 .. 8)
+			yield();
+		// A two-member batch must be rejected as a whole, not silently processed.
+		link.feed(`[{"jsonrpc":"2.0","id":2,"method":"ping"},`
+			~ `{"jsonrpc":"2.0","id":3,"method":"ping"}]`);
+		foreach (_; 0 .. 16)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	// Exactly one extra frame after the initialize reply: a single null-id -32600
+	// error, not two per-member replies (which the split path would have produced).
+	bool sawReject;
+	size_t pingReplies;
+	foreach (o; outputs)
+	{
+		auto j = parseJsonString(o);
+		if ("error" in j && j["error"]["code"].get!int == -32600 && j["id"].type == Json.Type.null_)
+			sawReject = true;
+		if ("id" in j && (j["id"].type == Json.Type.int_)
+				&& (j["id"].get!int == 2 || j["id"].get!int == 3))
+			pingReplies++;
+	}
+	assert(sawReject, "a batch on 2025-06-18+ must be rejected with a null-id -32600");
+	assert(pingReplies == 0, "no batch member may be processed on 2025-06-18+");
+}
+
+unittest  // stdio: a batch on a pre-2025-06-18 session is answered with ONE JSON array frame
+{
+	auto s = new McpServer("stdio-srv", "1.0");
+
+	string[] outputs;
+	withServer(s, (ServerLink link) @safe {
+		// Negotiate 2025-03-26, where batching is legal.
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":` ~ `{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+		foreach (_; 0 .. 8)
+			yield();
+		link.feed(`[{"jsonrpc":"2.0","id":2,"method":"ping"},`
+			~ `{"jsonrpc":"2.0","id":3,"method":"ping"}]`);
+		foreach (_; 0 .. 16)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	// The batch produced exactly one outbound frame, and it is a JSON array carrying
+	// both replies — not two separate newline-delimited response objects.
+	bool sawArrayWithBoth;
+	foreach (o; outputs)
+	{
+		auto j = parseJsonString(o);
+		if (j.type != Json.Type.array)
+			continue;
+		bool id2, id3;
+		foreach (i; 0 .. j.length)
+		{
+			auto e = j[i];
+			if ("id" in e && e["id"].type == Json.Type.int_ && e["id"].get!int == 2)
+				id2 = true;
+			if ("id" in e && e["id"].type == Json.Type.int_ && e["id"].get!int == 3)
+				id3 = true;
+		}
+		if (id2 && id3 && j.length == 2)
+			sawArrayWithBoth = true;
+	}
+	assert(sawArrayWithBoth, "a legal batch must yield one JSON-array frame with both replies");
 }
 
 unittest  // stdio: a tool calling ctx.elicit is answered over the same stdio channel
