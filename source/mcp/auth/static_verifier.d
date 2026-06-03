@@ -7,6 +7,11 @@
 /// intended ONLY for local dev and automated tests. Do NOT use it in production;
 /// use `jwtVerifier` (RFC 7519 / JWKS) or `introspectionVerifier` (RFC 7662)
 /// instead.
+///
+/// The table lookup matches the presented token byte-by-byte and is therefore
+/// not constant-time. Opaque bearer tokens are expected to be high-entropy
+/// secrets (>= 128 bits of randomness), which makes guessing one via a timing
+/// oracle infeasible; this dev-only verifier does not generate or enforce that.
 module mcp.auth.static_verifier;
 
 import mcp.auth.resource_server : TokenInfo, TokenValidator;
