@@ -141,6 +141,10 @@ final class HttpClientTransport : ClientTransport
 	private bool serverStreamSockOpen;
 	private TCPConnection legacyStreamSock;
 	private bool legacyStreamSockOpen;
+	// True while the legacy GET-SSE reader task is running. A `legacyRpc` issued
+	// after the reader has exited fails its waiter at once instead of polling for
+	// the full timeout, since no response can ever arrive on a dead stream.
+	private bool legacyStreamAlive;
 
 	/// Inbound dispatcher installed by `McpClient` (its `dispatchInbound`),
 	/// invoked for notifications and server->client requests on any stream.
@@ -203,6 +207,11 @@ final class HttpClientTransport : ClientTransport
 			legacyStreamSockOpen = false;
 			() @trusted { legacyStreamSock.close(); }();
 		}
+		// Fail any in-flight legacy waiter at once so its `legacyRpc` poll returns
+		// immediately instead of waiting out the timeout on a closing transport.
+		foreach (id, w; legacyWaiters)
+			if (!w.got && w.err is null)
+				w.err = internalError("legacy HTTP+SSE transport closing");
 	}
 
 	private bool closing() @safe
@@ -1327,9 +1336,14 @@ final class HttpClientTransport : ClientTransport
 
 		post(message); // POST to legacyEndpoint; server replies on the GET stream
 
+		// If the reader has already exited, no response can arrive on the stream:
+		// fail fast rather than polling for the full timeout.
+		if (!legacyStreamAlive && !waiter.got && waiter.err is null)
+			throw internalError("legacy HTTP+SSE stream is not active");
+
 		foreach (_; 0 .. 1200) // up to ~60s at 50ms granularity
 		{
-			if (waiter.got || waiter.err !is null)
+			if (waiter.got || waiter.err !is null || closing)
 				break;
 			() @trusted { sleep(50.msecs); }();
 		}
@@ -1337,6 +1351,8 @@ final class HttpClientTransport : ClientTransport
 			throw waiter.err;
 		if (waiter.got)
 			return waiter.result;
+		if (closing)
+			throw internalError("legacy HTTP+SSE transport closing");
 		throw internalError("No legacy HTTP+SSE response for request " ~ idStr(expectId));
 	}
 
@@ -1356,6 +1372,10 @@ final class HttpClientTransport : ClientTransport
 		const host = ep.host;
 		const port = ep.port;
 		const path = ep.path;
+
+		legacyStreamAlive = true;
+		scope (exit)
+			legacyStreamAlive = false;
 
 		() @trusted {
 			try
@@ -1936,4 +1956,33 @@ unittest  // resolveEndpointUri resolves a relative path against the base direct
 {
 	assert(resolveEndpointUri("http://host:8080/api/sse",
 			"messages") == "http://host:8080/api/messages");
+}
+
+unittest  // close() fails every outstanding legacy waiter so an in-flight legacyRpc returns at once
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto waiter = new LegacyWaiter;
+	waiter.result = Json.undefined;
+	t.legacyWaiters[7] = waiter;
+	t.close();
+	assert(waiter.err !is null);
+	assert(!waiter.got);
+}
+
+unittest  // close() leaves an already-resolved legacy waiter untouched
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto waiter = new LegacyWaiter;
+	waiter.got = true;
+	waiter.result = Json(true);
+	t.legacyWaiters[3] = waiter;
+	t.close();
+	assert(waiter.err is null);
+	assert(waiter.got);
+}
+
+unittest  // the legacy reader liveness flag starts false before runLegacyStream runs
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	assert(!t.legacyStreamAlive);
 }
