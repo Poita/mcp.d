@@ -181,10 +181,8 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 {
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 	import eventcore.core : eventDriver;
-	import eventcore.driver : IOMode, IOStatus, PipeFD, PipeIOCallback;
+	import eventcore.driver : IOMode, PipeIOCallback;
 	import vibe.internal.async : asyncAwaitUninterruptible;
-	import core.sys.posix.unistd : dup, close;
-	import core.sys.posix.fcntl : fcntl, F_GETFL, F_SETFL;
 
 	// Enforce the documented "at most once per process" invariant explicitly, so it
 	// holds for both a concurrent second call and a sequential one and does not
@@ -196,60 +194,136 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 		() @trusted { _ranStdio = true; }();
 	}
 
-	// Adopt dup()'d copies of fd 0/1 rather than fd 0/1 themselves. `releaseRef`
-	// close()s the adopted fd on return; by adopting dups we close only the dups,
-	// leaving the process's real stdin/stdout OPEN for any code that runs after.
-	// Adopting fd 0/1 directly would close the real stdin/stdout.
-	const in2 = () @trusted { return dup(0); }();
-	const out2 = () @trusted { return dup(1); }();
-	if (in2 == -1 || out2 == -1)
-	{
-		() @trusted {
-			if (in2 != -1)
-				close(in2);
-			if (out2 != -1)
-				close(out2);
-		}();
-		throw new Exception("runStdio: dup(stdin/stdout) failed");
-	}
-
-	// A dup shares its open file description (and thus its O_NONBLOCK bit) with the
-	// original fd, so the O_NONBLOCK that `adopt` sets is visible on fd 0/1 too. Save
-	// the original flags now and restore them BEFORE releasing so fd 0/1 are not left
-	// non-blocking for code that keeps running after runStdio returns (fd 0/1 may be a
-	// terminal or a pipe shared with other processes -- leaking O_NONBLOCK there
-	// breaks blocking readers/writers elsewhere).
-	const inFlags = () @trusted { return fcntl(0, F_GETFL); }();
-	const outFlags = () @trusted { return fcntl(1, F_GETFL); }();
-
-	auto inFD = () @trusted { return eventDriver.pipes.adopt(in2); }();
-	auto outFD = () @trusted { return eventDriver.pipes.adopt(out2); }();
-
-	// Fail fast: if adopt rejected a dup (returned an invalid handle), close the
-	// dups we still own and bail rather than silently operating on invalid handles.
-	if (!()@trusted { return eventDriver.pipes.isValid(inFD); }() || !()@trusted {
-			return eventDriver.pipes.isValid(outFD);
-		}())
-	{
-		() @trusted {
-			if (eventDriver.pipes.isValid(inFD))
-				eventDriver.pipes.releaseRef(inFD);
-			else
-				close(in2);
-			if (eventDriver.pipes.isValid(outFD))
-				eventDriver.pipes.releaseRef(outFD);
-			else
-				close(out2);
-		}();
-		throw new Exception("runStdio: failed to adopt stdin/stdout dups");
-	}
-
-	// On return restore the saved flags on fd 0/1 FIRST (clearing the O_NONBLOCK that
-	// adopt set on the shared open file description), THEN release the adopted dups
-	// (which close()s the dup'd fds, never the real fd 0/1). Order matters: restoring
-	// before release operates on still-valid descriptors.
+	// dup-then-adopt fd 0/1 and save their flags; restored + released on scope exit.
+	auto adopted = AdoptedStdio.acquire();
 	scope (exit)
+		adopted.release();
+	auto inFD = adopted.inFD;
+	auto outFD = adopted.outFD;
+
+	auto reader = StdinLineReader(inFD, maxLineBytes);
+
+	string readLine() @safe
 	{
+		return reader.next();
+	}
+
+	void writeLine(string s) @safe
+	{
+		auto bytes = cast(const(ubyte)[])(s ~ "\n");
+		// Write the whole frame (IOMode.all loops internally until done). Inspect
+		// the result symmetrically with readLine: a status that is neither ok nor
+		// wouldBlock, or a short write, means the peer closed its read end (EPIPE /
+		// IOStatus.error) and the channel is broken. Throw so DuplexChannel.send
+		// observes the failure instead of producing replies that are silently lost.
+		// On POSIX a broken-pipe write may also raise SIGPIPE; a server using this
+		// transport should ignore SIGPIPE (signal(SIGPIPE, SIG_IGN)) so the failure
+		// surfaces here as IOStatus.error rather than terminating the process.
+		auto res = () @trusted {
+			return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
+				eventDriver.pipes.write(outFD, bytes, IOMode.all, cb);
+			});
+		}();
+		if (writeFailed(res[1], res[2], bytes.length))
+			throw new Exception("runStdio: write to stdout failed (peer closed its read end?)");
+	}
+
+	() @trusted {
+		runTask(() nothrow{
+			scope (exit)
+				exitEventLoop();
+			try
+				serveStdio(server, &readLine, &writeLine);
+			catch (Exception)
+			{
+			}
+		});
+		runEventLoop();
+	}();
+}
+
+/// Owns the dup()'d, vibe-adopted copies of fd 0/1 plus the saved descriptor flags
+/// of the real fd 0/1, encapsulating runStdio's fd lifecycle ceremony.
+///
+/// `acquire` dup()s fd 0/1, saves the originals' flags, and adopts the dups as
+/// vibe-async pipes; `release` restores the saved flags on fd 0/1 and then releases
+/// the adopted dups. The exact ordering runStdio relies on is preserved: restore
+/// the flags BEFORE releasing, so the restore operates on still-valid descriptors.
+private struct AdoptedStdio
+{
+	import eventcore.driver : PipeFD;
+
+	PipeFD inFD;
+	PipeFD outFD;
+	private int inFlags;
+	private int outFlags;
+
+	/// Adopt dup()'d copies of fd 0/1 rather than fd 0/1 themselves. `releaseRef`
+	/// close()s the adopted fd on return; by adopting dups we close only the dups,
+	/// leaving the process's real stdin/stdout OPEN for any code that runs after.
+	/// Adopting fd 0/1 directly would close the real stdin/stdout.
+	static AdoptedStdio acquire() @safe
+	{
+		import eventcore.core : eventDriver;
+		import core.sys.posix.unistd : dup, close;
+		import core.sys.posix.fcntl : fcntl, F_GETFL;
+
+		const in2 = () @trusted { return dup(0); }();
+		const out2 = () @trusted { return dup(1); }();
+		if (in2 == -1 || out2 == -1)
+		{
+			() @trusted {
+				if (in2 != -1)
+					close(in2);
+				if (out2 != -1)
+					close(out2);
+			}();
+			throw new Exception("runStdio: dup(stdin/stdout) failed");
+		}
+
+		// A dup shares its open file description (and thus its O_NONBLOCK bit) with the
+		// original fd, so the O_NONBLOCK that `adopt` sets is visible on fd 0/1 too. Save
+		// the original flags now and restore them BEFORE releasing so fd 0/1 are not left
+		// non-blocking for code that keeps running after runStdio returns (fd 0/1 may be a
+		// terminal or a pipe shared with other processes -- leaking O_NONBLOCK there
+		// breaks blocking readers/writers elsewhere).
+		AdoptedStdio a;
+		a.inFlags = () @trusted { return fcntl(0, F_GETFL); }();
+		a.outFlags = () @trusted { return fcntl(1, F_GETFL); }();
+
+		a.inFD = () @trusted { return eventDriver.pipes.adopt(in2); }();
+		a.outFD = () @trusted { return eventDriver.pipes.adopt(out2); }();
+
+		// Fail fast: if adopt rejected a dup (returned an invalid handle), close the
+		// dups we still own and bail rather than silently operating on invalid handles.
+		if (!()@trusted { return eventDriver.pipes.isValid(a.inFD); }() || !()@trusted {
+				return eventDriver.pipes.isValid(a.outFD);
+			}())
+		{
+			() @trusted {
+				if (eventDriver.pipes.isValid(a.inFD))
+					eventDriver.pipes.releaseRef(a.inFD);
+				else
+					close(in2);
+				if (eventDriver.pipes.isValid(a.outFD))
+					eventDriver.pipes.releaseRef(a.outFD);
+				else
+					close(out2);
+			}();
+			throw new Exception("runStdio: failed to adopt stdin/stdout dups");
+		}
+		return a;
+	}
+
+	/// On return restore the saved flags on fd 0/1 FIRST (clearing the O_NONBLOCK that
+	/// adopt set on the shared open file description), THEN release the adopted dups
+	/// (which close()s the dup'd fds, never the real fd 0/1). Order matters: restoring
+	/// before release operates on still-valid descriptors.
+	void release() @safe
+	{
+		import eventcore.core : eventDriver;
+		import core.sys.posix.fcntl : fcntl, F_SETFL;
+
 		() @trusted {
 			if (inFlags != -1)
 				fcntl(0, F_SETFL, inFlags);
@@ -259,20 +333,74 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 			eventDriver.pipes.releaseRef(outFD);
 		}();
 	}
+}
 
-	// A small persistent buffer so stdin is read in 64 KiB chunks (IOMode.once)
-	// rather than one syscall + fiber suspend/resume per byte: `readLine` scans the
-	// filled region for '\n', returns the line up to it, and retains the bytes
-	// after the newline for the next call.
-	enum size_t chunk = 64 * 1024;
-	ubyte[] buf; // bytes read but not yet consumed
-	size_t bufPos; // index of the next unconsumed byte in `buf`
+/// Buffered, cooperative line reader over a vibe-adopted stdin pipe, extracted from
+/// runStdio so its CR-strip and over-long-drop edge cases are unit-testable.
+///
+/// A small persistent buffer so stdin is read in 64 KiB chunks (IOMode.once) rather
+/// than one syscall + fiber suspend/resume per byte: `next` scans the filled region
+/// for '\n', returns the line up to it, and retains the bytes after the newline for
+/// the next call.
+private struct StdinLineReader
+{
+	import eventcore.driver : PipeFD;
+
+	private PipeFD inFD;
+	private size_t maxLineBytes;
+	private enum size_t chunk = 64 * 1024;
+	private ubyte[] buf; // bytes read but not yet consumed
+	private size_t bufPos; // index of the next unconsumed byte in `buf`
+
+	this(PipeFD inFD, size_t maxLineBytes) @safe
+	{
+		this.inFD = inFD;
+		this.maxLineBytes = maxLineBytes;
+	}
+
+	// Refill `buf` from the pipe (IOMode.once into a chunk-sized buffer): return
+	// false on EOF/error (a 0-byte or non-ok/non-wouldBlock read) with `buf` cleared,
+	// else true with `buf` trimmed to the bytes read and `bufPos` reset to 0.
+	private bool refill() @safe
+	{
+		import eventcore.core : eventDriver;
+		import eventcore.driver : IOMode, IOStatus, PipeIOCallback;
+		import vibe.internal.async : asyncAwaitUninterruptible;
+
+		if (buf.length < chunk)
+			buf.length = chunk;
+		bufPos = 0;
+		auto res = () @trusted {
+			return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
+				eventDriver.pipes.read(inFD, buf, IOMode.once, cb);
+			});
+		}();
+		const status = res[1];
+		const nbytes = res[2];
+		if (nbytes == 0 || (status != IOStatus.ok && status != IOStatus.wouldBlock))
+		{
+			buf = null;
+			bufPos = 0;
+			return false;
+		}
+		buf = buf[0 .. nbytes];
+		return true;
+	}
 
 	// Async, cooperative line read over stdin: return the next line (without its
 	// '\n', stripping a trailing '\r'); a 0-byte read (disconnected) is EOF -> the
 	// partial accumulator if any, else null. An over-long line (> maxLineBytes) is
 	// dropped and reading resumes after the next newline.
-	string readLine() @safe
+	string next() @safe
+	{
+		return nextWith(&refill);
+	}
+
+	// The pure line-assembly state machine, parameterised on the buffer-refill
+	// source so the CR-strip and over-long-drop paths are unit-testable with a fake
+	// refill (no real eventcore pipe I/O). `refillFn` fills `buf`/`bufPos` and
+	// returns false at EOF, exactly as `refill` does.
+	private string nextWith(scope bool delegate() @safe refillFn) @safe
 	{
 		ubyte[] acc;
 		bool dropping; // true once `acc` exceeded maxLineBytes: skip to next '\n'
@@ -281,27 +409,14 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 			if (bufPos >= buf.length)
 			{
 				// Refill from the pipe.
-				if (buf.length < chunk)
-					buf.length = chunk;
-				bufPos = 0;
-				auto res = () @trusted {
-					return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
-						eventDriver.pipes.read(inFD, buf, IOMode.once, cb);
-					});
-				}();
-				const status = res[1];
-				const nbytes = res[2];
-				if (nbytes == 0 || (status != IOStatus.ok && status != IOStatus.wouldBlock))
+				if (!refillFn())
 				{
-					buf = null;
-					bufPos = 0;
 					if (dropping)
 						return null; // EOF in the middle of an over-long, dropped line
 					return acc.length ? () @trusted {
 						return cast(string) acc.idup;
 					}() : null;
 				}
-				buf = buf[0 .. nbytes];
 			}
 
 			// Scan the filled region for a newline.
@@ -346,39 +461,6 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 			return () @trusted { return cast(string) acc.idup; }();
 		}
 	}
-
-	void writeLine(string s) @safe
-	{
-		auto bytes = cast(const(ubyte)[])(s ~ "\n");
-		// Write the whole frame (IOMode.all loops internally until done). Inspect
-		// the result symmetrically with readLine: a status that is neither ok nor
-		// wouldBlock, or a short write, means the peer closed its read end (EPIPE /
-		// IOStatus.error) and the channel is broken. Throw so DuplexChannel.send
-		// observes the failure instead of producing replies that are silently lost.
-		// On POSIX a broken-pipe write may also raise SIGPIPE; a server using this
-		// transport should ignore SIGPIPE (signal(SIGPIPE, SIG_IGN)) so the failure
-		// surfaces here as IOStatus.error rather than terminating the process.
-		auto res = () @trusted {
-			return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
-				eventDriver.pipes.write(outFD, bytes, IOMode.all, cb);
-			});
-		}();
-		if (writeFailed(res[1], res[2], bytes.length))
-			throw new Exception("runStdio: write to stdout failed (peer closed its read end?)");
-	}
-
-	() @trusted {
-		runTask(() nothrow{
-			scope (exit)
-				exitEventLoop();
-			try
-				serveStdio(server, &readLine, &writeLine);
-			catch (Exception)
-			{
-			}
-		});
-		runEventLoop();
-	}();
 }
 
 /// Decide whether a stdout write is a failure the channel must surface. A status
@@ -403,6 +485,76 @@ unittest  // writeFailed flags a non-ok status and a short write, accepts a full
 	assert(writeFailed(IOStatus.error, 10, 10));
 	assert(writeFailed(IOStatus.disconnected, 0, 10));
 	assert(writeFailed(IOStatus.ok, 4, 10));
+}
+
+version (unittest)
+{
+	// Drive StdinLineReader.nextWith over an in-memory byte feed (no real pipe / no
+	// event loop): each refill hands the reader the next pre-chunked slice, and
+	// returns false (EOF) once the chunks are exhausted -- exactly the contract
+	// StdinLineReader.refill has. Lets the line-assembly edge cases be unit-tested.
+	private string[] drainLineReader(size_t maxLineBytes, ubyte[][] chunks) @safe
+	{
+		auto reader = StdinLineReader.init;
+		reader.maxLineBytes = maxLineBytes;
+		size_t ci;
+		bool refill() @safe
+		{
+			if (ci >= chunks.length)
+			{
+				reader.buf = null;
+				reader.bufPos = 0;
+				return false;
+			}
+			reader.buf = chunks[ci++];
+			reader.bufPos = 0;
+			return true;
+		}
+
+		string[] lines;
+		for (;;)
+		{
+			auto s = reader.nextWith(&refill);
+			if (s is null)
+				break;
+			lines ~= s;
+		}
+		return lines;
+	}
+}
+
+unittest  // StdinLineReader strips a trailing CR on a CRLF-terminated line
+{
+	auto lines = drainLineReader(64, [cast(ubyte[]) "ok\r\n".dup]);
+	assert(lines.length == 1);
+	assert(lines[0] == "ok", "trailing CR must be stripped");
+}
+
+unittest  // StdinLineReader drops an over-long line and resumes reading after the next newline
+{
+	// maxLineBytes = 8. The middle line's bytes arrive newline-free across refills so
+	// the accumulator crosses maxLineBytes (the over-long drop path) before its
+	// terminating newline; the surrounding short lines still come through. The drop is
+	// triggered while accumulating without a newline, mirroring a real chunked pipe.
+	auto lines = drainLineReader(8, [
+		cast(ubyte[]) "a\n11111".dup, cast(ubyte[]) "1111".dup,
+		cast(ubyte[]) "1111\ntail\n".dup
+	]);
+	assert(lines == ["a", "tail"], "over-long line dropped, reading resumes after its newline");
+}
+
+unittest  // StdinLineReader reassembles a line split across two refills
+{
+	auto lines = drainLineReader(64, [
+		cast(ubyte[]) "hel".dup, cast(ubyte[]) "lo\nworld\n".dup
+	]);
+	assert(lines == ["hello", "world"], "a line spanning two refills is reassembled");
+}
+
+unittest  // StdinLineReader returns a final unterminated partial line at EOF
+{
+	auto lines = drainLineReader(64, [cast(ubyte[]) "noeol".dup]);
+	assert(lines == ["noeol"], "a trailing line without a newline is returned at EOF");
 }
 
 unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with its O_NONBLOCK bit unchanged
