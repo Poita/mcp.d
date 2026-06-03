@@ -443,6 +443,10 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 	{
 		static if (is(typeof(a) == toolExecution))
 		{
+			static assert(a.taskSupport == "forbidden"
+					|| a.taskSupport == "optional" || a.taskSupport == "required",
+					"@toolExecution requires one of forbidden/optional/required, got \""
+					~ a.taskSupport ~ "\"");
 			if (a.taskSupport.length)
 				descriptor.execution = ToolExecution(nullable(a.taskSupport));
 		}
@@ -1213,6 +1217,33 @@ unittest  // @toolExecution reflection: execution.taskSupport appears in tools/l
 	assert(renderTool["execution"]["taskSupport"].get!string == "optional");
 	// A tool without @toolExecution carries no execution object.
 	assert("execution" !in addTool);
+}
+
+version (unittest) private class ValidExecutionApi
+{
+	@tool("render", "Render")
+	@toolExecution("required")
+	string render(string spec) @safe
+	{
+		return spec;
+	}
+}
+
+version (unittest) private class InvalidExecutionApi
+{
+	@tool("render", "Render")
+	@toolExecution("optionl")
+	string render(string spec) @safe
+	{
+		return spec;
+	}
+}
+
+unittest  // @toolExecution: a valid taskSupport value reflects, an invalid one fails to compile
+{
+	auto s = new McpServer("t", "1");
+	assert(__traits(compiles, registerHandlers(s, new ValidExecutionApi)));
+	assert(!__traits(compiles, registerHandlers(s, new InvalidExecutionApi)));
 }
 
 unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schema
