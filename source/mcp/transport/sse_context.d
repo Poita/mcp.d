@@ -630,6 +630,30 @@ final class ServerPushChannel
 		return listeners.length;
 	}
 
+	/// The distinct, non-empty owner tokens of the currently-connected listeners.
+	/// Each value is a session whose GET stream can receive a session-scoped
+	/// server->client request (e.g. `ping`), so a caller can probe every live
+	/// session in turn rather than blindly forwarding an empty token that matches no
+	/// session-scoped listener. The empty (unscoped / stateless / shared) token is
+	/// excluded, since that path is reached via the no-token `ping`/`sendRequest`.
+	string[] connectedOwnerTokens() @safe
+	{
+		return () @trusted {
+			synchronized (mtx)
+			{
+				bool[string] seen;
+				string[] tokens;
+				foreach (l; listeners)
+					if (l.ownerToken.length != 0 && (l.ownerToken in seen) is null)
+					{
+						seen[l.ownerToken] = true;
+						tokens ~= l.ownerToken;
+					}
+				return tokens;
+			}
+		}();
+	}
+
 	/// Whether a listener with `id` is still connected. Used as the liveness probe
 	/// for `sendRequest`'s `awaitLive`, so a server->client request awaiter is
 	/// released promptly if its target stream drops.
@@ -698,6 +722,61 @@ final class ServerPushChannel
 				return l.plainEligible(method, uri);
 			return plainEligible;
 		}) >= 0 ? 1 : 0;
+	}
+
+	/// Broadcast variant of `emitFiltered` for the genuinely fan-out change
+	/// notifications (`notifications/tools/list_changed`, `prompts/list_changed`,
+	/// `resources/list_changed`): deliver the notification once per distinct
+	/// session, so EVERY connected session's stream is reached rather than only the
+	/// first eligible one. Listeners are grouped by their `ownerToken`, and the
+	/// existing single-stream `deliver` runs once per distinct token — so the
+	/// transport's Multiple Connections rule ("MUST NOT broadcast the same message
+	/// across multiple streams") is still honoured WITHIN a session (only one of a
+	/// session's streams receives it), while distinct sessions each get their own
+	/// copy. Eligibility for each listener is decided exactly as in `emitFiltered`
+	/// (active filter via its own opt-in; inactive filter via the per-listener or
+	/// mount-wide `plainEligible`). Returns the number of distinct sessions reached.
+	size_t emitFilteredPerOwner(string method, Json params, string uri = "",
+			bool plainEligible = true) @safe
+	{
+		auto msg = makeNotification(method, params);
+		scope eligible = (ref const Listener l) @safe {
+			if (l.filter.active)
+				return l.filter.accepts(method, uri);
+			if (l.plainEligible !is null)
+				return l.plainEligible(method, uri);
+			return plainEligible;
+		};
+
+		// Snapshot the distinct owner tokens that currently have at least one
+		// eligible live listener, under the lock, so the listener list cannot mutate
+		// while we enumerate; the actual writes happen off the lock inside `deliver`.
+		string[] owners;
+		() @trusted {
+			synchronized (mtx)
+			{
+				bool[string] seen;
+				foreach (l; listeners)
+					if (l.id in seqOf && (l.ownerToken in seen) is null && eligible(l))
+					{
+						seen[l.ownerToken] = true;
+						owners ~= l.ownerToken;
+					}
+			}
+		}();
+
+		size_t delivered;
+		foreach (owner; owners)
+		{
+			// One single-stream delivery per session: only listeners owned by this
+			// token are candidates, so each distinct session receives exactly one copy.
+			const landed = deliver(msg, (ref const Listener l) @safe {
+				return l.ownerToken == owner && eligible(l);
+			});
+			if (landed >= 0)
+				delivered++;
+		}
+		return delivered;
 	}
 
 	/// Shared single-stream delivery: try eligible listeners (those for which
@@ -1234,6 +1313,81 @@ unittest  // emitFiltered for resources/updated targets only the stream with tha
 
 	assert(bFrame.canFind("file:///b")); // B opted into file:///b
 	assert(aFrame.length == 0); // A opted into a different URI only
+}
+
+unittest  // emitFilteredPerOwner fans out to every distinct session, once each
+{
+	// A list_changed broadcast must reach EVERY connected session, but only one
+	// stream per session. Two sessions (A, B) each with one plain GET stream: a
+	// single emitFilteredPerOwner reaches both.
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string aFrame, bFrame;
+	ch.addListener((string f) @safe { aFrame = f; }, "", SubscriptionFilter.init, "", null, "A");
+	ch.addListener((string f) @safe { bFrame = f; }, "", SubscriptionFilter.init, "", null, "B");
+
+	const delivered = ch.emitFilteredPerOwner("notifications/tools/list_changed", Json.undefined);
+	assert(delivered == 2);
+	assert(aFrame.canFind("notifications/tools/list_changed"));
+	assert(bFrame.canFind("notifications/tools/list_changed"));
+}
+
+unittest  // emitFilteredPerOwner honours Multiple Connections within one session
+{
+	// Two GET streams of the SAME session: the broadcast lands on exactly one of
+	// them (one stream per session), reaching the session once.
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	int aCount, bCount;
+	ch.addListener((string) @safe { aCount++; }, "", SubscriptionFilter.init, "", null, "S");
+	ch.addListener((string) @safe { bCount++; }, "", SubscriptionFilter.init, "", null, "S");
+
+	const delivered = ch.emitFilteredPerOwner("notifications/tools/list_changed", Json.undefined);
+	assert(delivered == 1);
+	assert(aCount + bCount == 1);
+}
+
+unittest  // emitFilteredPerOwner skips a session whose only stream is not eligible
+{
+	// A session whose active filter did not opt into the type must not be reached,
+	// while a session that did is reached.
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string aFrame, bFrame;
+	SubscriptionFilter fa;
+	fa.active = true;
+	fa.toolsListChanged = true;
+	SubscriptionFilter fb;
+	fb.active = true;
+	fb.promptsListChanged = true; // not tools
+	ch.addListener((string f) @safe { aFrame = f; }, "listen-A", fa, "", null, "A");
+	ch.addListener((string f) @safe { bFrame = f; }, "listen-B", fb, "", null, "B");
+
+	const delivered = ch.emitFilteredPerOwner("notifications/tools/list_changed", Json.undefined);
+	assert(delivered == 1);
+	assert(aFrame.canFind("notifications/tools/list_changed"));
+	assert(bFrame.length == 0);
+}
+
+unittest  // connectedOwnerTokens lists distinct non-empty session tokens
+{
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	ch.addListener((string) @safe {}, "", SubscriptionFilter.init, "", null, "A");
+	ch.addListener((string) @safe {}, "", SubscriptionFilter.init, "", null, "A"); // dup token
+	ch.addListener((string) @safe {}, "", SubscriptionFilter.init, "", null, "B");
+	ch.addListener((string) @safe {}); // empty token excluded
+
+	auto tokens = ch.connectedOwnerTokens();
+	assert(tokens.length == 2);
+	assert(tokens.canFind("A"));
+	assert(tokens.canFind("B"));
 }
 
 unittest  // emitFiltered: no eligible stream means no delivery (returns 0)
