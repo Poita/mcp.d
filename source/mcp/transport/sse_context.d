@@ -243,33 +243,6 @@ unittest  // a null liveness probe degrades to a plain resolved await
 	assert(r == Json("done"));
 }
 
-/// A long-lived server->client SSE channel for *unsolicited* traffic — the
-/// stream a client opens with an HTTP GET to the MCP endpoint (basic/transports
-/// §Listening for Messages from the Server). Unlike `HttpStreamContext`, which
-/// is bound to one in-flight POST, this channel delivers a notification (or
-/// server->client request) on a single one of the currently-connected GET
-/// listeners.
-///
-/// A handler is registered per accepted GET; `emit` frames the JSON-RPC message
-/// as an SSE event with a globally-unique id (via the shared `StreamCoordinator`
-/// ordinal scheme) and writes it to exactly ONE live listener. This honours the
-/// transport's Multiple Connections rule: "The server MUST send each of its
-/// JSON-RPC messages on only one of the connected streams; that is, it MUST NOT
-/// broadcast the same message across multiple streams." Listeners that fail to
-/// write (a disconnected client) are skipped and dropped so the channel
-/// self-heals and the message still lands on a live stream.
-///
-/// One instance is shared across a server mount. The channel serializes delivery
-/// and listener-list mutation internally with a vibe `TaskMutex`, so concurrent
-/// fibers cannot interleave the bytes of two SSE frames, reuse an event id, or
-/// dangle the listener list across an async write. Callers that ALSO write to the
-/// same underlying `HTTPServerResponse.bodyWriter` outside the channel (e.g. a
-/// heartbeat loop or an up-front `retry:` event on the GET/listen stream) MUST
-/// serialize those writes against the channel's listener write callback through a
-/// shared per-stream lock, since the channel's mutex guards only its own state and
-/// its own writes — not a foreign writer on the same connection. Like the rest of
-/// the SDK, this assumes vibe.d's default single-threaded event loop; running the
-/// router with `HTTPServerOption.distribute` or worker threads is unsupported.
 /// The per-stream opt-in a client expressed when it opened a draft
 /// `subscriptions/listen` stream (draft basic/utilities/subscriptions §Notification
 /// Filter). It records exactly which change-notification types this one stream asked
@@ -382,6 +355,30 @@ unittest  // resourceSubscriptions matches only the opted-in URIs
 	assert(!none.accepts("notifications/resources/updated", "file:///x"));
 }
 
+/// A long-lived server->client SSE channel for *unsolicited* traffic — the
+/// stream a client opens with an HTTP GET to the MCP endpoint (basic/transports
+/// §Listening for Messages from the Server). One instance is shared across a
+/// server mount. Unlike `HttpStreamContext`, which is bound to one in-flight
+/// POST, `emit` frames the JSON-RPC message as an SSE event with a globally-unique
+/// id (via the shared `StreamCoordinator` ordinal scheme) and writes it to exactly
+/// ONE live GET listener, honouring the transport's Multiple Connections rule:
+/// "The server MUST send each of its JSON-RPC messages on only one of the
+/// connected streams; that is, it MUST NOT broadcast the same message across
+/// multiple streams." A listener that fails to write (a disconnected client) is
+/// skipped and dropped, so the channel self-heals and the message still lands on a
+/// live stream.
+///
+/// The channel serializes delivery and listener-list mutation internally with a
+/// vibe `TaskMutex`, so concurrent fibers cannot interleave the bytes of two SSE
+/// frames, reuse an event id, or dangle the listener list across an async write.
+/// Callers that ALSO write to the same underlying `HTTPServerResponse.bodyWriter`
+/// outside the channel (e.g. a heartbeat loop or an up-front `retry:` event on the
+/// GET/listen stream) MUST serialize those writes against the channel's listener
+/// write callback through a shared per-stream lock, since the channel's mutex
+/// guards only its own state and its own writes — not a foreign writer on the same
+/// connection. Like the rest of the SDK, this assumes vibe.d's default
+/// single-threaded event loop; running the router with `HTTPServerOption.distribute`
+/// or worker threads is unsupported.
 final class ServerPushChannel
 {
 	/// A connected GET listener: an opaque id plus the writer that delivers a
