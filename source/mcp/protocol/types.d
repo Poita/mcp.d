@@ -2952,6 +2952,24 @@ struct ResourceContents
 			c.meta = j["_meta"];
 		return c;
 	}
+
+	/// Return a copy projected to the negotiated protocol version. Per-content
+	/// `_meta` was introduced by 2025-06-18 ("Add _meta to additional interface
+	/// types"), so it is dropped for an older peer. `uri`/`mimeType`/`text`/`blob`
+	/// all existed in 2024-11-05 and are preserved unchanged. Mirrors the
+	/// content-level `_meta` stripping in `Content.forVersion`.
+	ResourceContents forVersion(ProtocolVersion v) const @safe
+	{
+		ResourceContents projected;
+		projected.uri = uri;
+		projected.mimeType = mimeType;
+		projected.isBlob = isBlob;
+		projected.text = text;
+		projected.blob = blob;
+		if (v >= ProtocolVersion.v2025_06_18)
+			projected.meta = meta;
+		return projected;
+	}
 }
 
 unittest  // ResourceContents emits per-content _meta when set
@@ -3011,6 +3029,60 @@ unittest  // ResourceContents drops non-object _meta on parse
 	j["_meta"] = "not-an-object";
 	auto c = ResourceContents.fromJson(j);
 	assert(c.meta.type != Json.Type.object);
+}
+
+unittest  // ResourceContents.forVersion strips _meta for 2024-11-05
+{
+	auto c = ResourceContents.makeText("file://x", "text/plain", "hi");
+	Json m = Json.emptyObject;
+	m["k"] = "v";
+	c.meta = m;
+	auto j = c.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("_meta" !in j);
+	assert(j["text"].get!string == "hi");
+}
+
+unittest  // ResourceContents.forVersion strips _meta for 2025-03-26
+{
+	auto c = ResourceContents.makeText("file://x", "text/plain", "hi");
+	Json m = Json.emptyObject;
+	m["k"] = "v";
+	c.meta = m;
+	auto j = c.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("_meta" !in j);
+}
+
+unittest  // ResourceContents.forVersion keeps _meta for 2025-06-18
+{
+	auto c = ResourceContents.makeText("file://x", "text/plain", "hi");
+	Json m = Json.emptyObject;
+	m["k"] = "v";
+	c.meta = m;
+	auto j = c.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert(j["_meta"]["k"].get!string == "v");
+}
+
+unittest  // ResourceContents.forVersion preserves blob payload intact
+{
+	auto c = ResourceContents.makeBlob("file://b", "application/octet-stream", "AAAA");
+	Json m = Json.emptyObject;
+	m["k"] = "v";
+	c.meta = m;
+	auto p = c.forVersion(ProtocolVersion.v2024_11_05);
+	assert(p.isBlob);
+	assert(p.blob == "AAAA");
+	assert(p.mimeType == "application/octet-stream");
+	assert(p.meta.type != Json.Type.object);
+}
+
+unittest  // ResourceContents.forVersion leaves the original unmodified
+{
+	auto c = ResourceContents.makeText("file://x", "text/plain", "hi");
+	Json m = Json.emptyObject;
+	m["k"] = "v";
+	c.meta = m;
+	cast(void) c.forVersion(ProtocolVersion.v2024_11_05);
+	assert(c.meta["k"].get!string == "v");
 }
 
 /// Result of `resources/list`.
