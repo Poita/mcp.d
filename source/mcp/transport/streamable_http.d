@@ -670,6 +670,71 @@ unittest  // a stateless server (no GET stream) advertises only POST, matching i
 	assert(allowedMethodsHeader(ProtocolVersion.draft, false) == "POST");
 }
 
+/// Whether the given `Accept` request-header value admits a `text/event-stream`
+/// response. The standalone GET stream the MCP endpoint opens is always an SSE
+/// stream, so a client whose `Accept` provably excludes that media type cannot
+/// consume what the server would send. A media type is admitted by an exact
+/// `text/event-stream` token, by the `text/*` subtype wildcard, or by the `*/*`
+/// full wildcard; quality and other parameters after a `;` are ignored. An empty
+/// value (no `Accept` header) is treated permissively as acceptable, since the
+/// transport never required clients to send one. Only a header that names media
+/// types and omits any matching one returns false.
+bool acceptsEventStream(string accept) @safe
+{
+	import std.string : strip, toLower;
+	import std.algorithm : splitter;
+
+	auto trimmed = accept.strip;
+	if (trimmed.length == 0)
+		return true;
+
+	foreach (part; trimmed.splitter(','))
+	{
+		auto mediaType = part;
+		foreach (i, c; part)
+		{
+			if (c == ';')
+			{
+				mediaType = part[0 .. i];
+				break;
+			}
+		}
+		const token = mediaType.strip.toLower;
+		if (token == "text/event-stream" || token == "text/*" || token == "*/*")
+			return true;
+	}
+	return false;
+}
+
+unittest  // an Accept that names text/event-stream (or a wildcard covering it) is admitted
+{
+	assert(acceptsEventStream("text/event-stream"));
+	assert(acceptsEventStream("application/json, text/event-stream"));
+	assert(acceptsEventStream("text/event-stream;q=0.9"));
+	assert(acceptsEventStream("text/*"));
+	assert(acceptsEventStream("*/*"));
+	assert(acceptsEventStream("application/json, */*"));
+}
+
+unittest  // a missing/blank Accept is treated permissively as acceptable
+{
+	assert(acceptsEventStream(""));
+	assert(acceptsEventStream("   "));
+}
+
+unittest  // an Accept that names media types but omits text/event-stream is rejected
+{
+	assert(!acceptsEventStream("application/json"));
+	assert(!acceptsEventStream("application/json, text/plain"));
+	assert(!acceptsEventStream("application/*"));
+}
+
+unittest  // matching is case-insensitive and tolerant of surrounding whitespace
+{
+	assert(acceptsEventStream(" TEXT/Event-Stream "));
+	assert(acceptsEventStream("application/json ,  text/event-stream"));
+}
+
 private void handleGet(McpServer server, ServerPushChannel push, SessionManager sessions,
 		uint reconnectDelayMs, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
@@ -696,6 +761,20 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// answer 405. The draft drops the standalone GET stream (server->client
 	// traffic rides the POST-response SSE), so it keeps the 405 alternative.
 	if (server.mode != ServerMode.stateful || !getOpensSseStream(server.negotiatedVersion))
+	{
+		res.statusCode = HTTPStatus.methodNotAllowed;
+		res.headers["Allow"] = "POST";
+		res.writeBody("", "text/plain");
+		return;
+	}
+
+	// The standalone stream this GET would open is always text/event-stream. A
+	// well-behaved client signals it can consume that via Accept; a client whose
+	// Accept provably excludes text/event-stream could not read the stream, so
+	// answer with the spec-sanctioned GET alternative (405 Allow: POST) rather
+	// than opening a stream it cannot use. A missing Accept is treated
+	// permissively and still opens the stream.
+	if (!acceptsEventStream(req.headers.get("Accept", "")))
 	{
 		res.statusCode = HTTPStatus.methodNotAllowed;
 		res.headers["Allow"] = "POST";
