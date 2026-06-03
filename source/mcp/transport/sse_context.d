@@ -1471,7 +1471,16 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		// Bind the outbound id to this request's session token so only a response
 		// arriving on the same session can resolve it.
 		coord.register(id, token_);
-		writeEvent(makeRequest(Json(id), method, params));
+		// A failed SSE write (broken pipe on the priming-event or request frame)
+		// must deregister the waiter before propagating, otherwise the mount-global
+		// coordinator retains a pending entry for the life of the mount.
+		try
+			writeEvent(makeRequest(Json(id), method, params));
+		catch (Exception e)
+		{
+			coord.cancel(id);
+			throw e;
+		}
 		// Bind the awaiting fiber to this connection's liveness. The response to
 		// this server->client request arrives on a SEPARATE POST, so a disconnect of
 		// the issuing connection would otherwise leave this fiber parked for the
@@ -2327,4 +2336,47 @@ unittest  // a stateful HttpStreamContext does NOT gate sendRequest
 	runTask(responder);
 	runEventLoop();
 	assert(!gated, "a stateful HttpStreamContext must NOT apply the stateless server->client gate");
+}
+
+unittest  // a failed SSE write in sendRequest deregisters the coordinator waiter
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.core.stream : OutputStream, IOMode;
+
+	// A sink whose write/flush always throws, simulating a broken pipe mid-frame.
+	static final class ThrowingSink : OutputStream
+	{
+		size_t write(scope const(ubyte)[], IOMode) @safe
+		{
+			throw new Exception("broken pipe");
+		}
+
+		void flush() @safe
+		{
+			throw new Exception("broken pipe");
+		}
+
+		void finalize() @safe
+		{
+		}
+	}
+
+	auto sink = new ThrowingSink;
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined);
+
+	bool threw;
+	try
+		ctx.sendRequest("elicitation/create", Json.emptyObject);
+	catch (Exception)
+		threw = true;
+	assert(threw, "a broken-pipe SSE write must propagate out of sendRequest");
+
+	// No waiter may survive the failed write: a later resolve for any plausible id
+	// returns false, proving the coordinator table holds no leaked entry.
+	foreach (long id; 1 .. 1000)
+		assert(!coord.resolve(Json(id), Json.emptyObject, Json.undefined),
+				"the waiter registered before the failed write must have been removed");
 }
