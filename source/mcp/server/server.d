@@ -23,15 +23,92 @@ alias ToolHandler = CallToolResult delegate(Json arguments, RequestContext ctx) 
 /// more input instead of returning a final result. See `ToolResponse`.
 alias MrtrToolHandler = ToolResponse delegate(Json arguments, RequestContext ctx) @safe;
 
+/// The MRTR (input-required) machinery shared by `ToolResponse` and
+/// `PromptResponse`: the `needsInput_`/`required_` state, the
+/// `needsInput`/`inputRequests`/`requestState` accessors, the two non-typed
+/// `inputRequired` factories, and `withInputRequests`/`toJson`. Both response
+/// types carry an `InputRequiredResult required_` plus a `result_` final result
+/// of their respective type; `toJson` switches on `needsInput_`. The mixin keeps
+/// these in lockstep so MRTR edits land on both. The genuine divergences —
+/// `forVersion` (throw vs return on a non-MRTR peer) and `ToolResponse`'s typed
+/// `complete(T)`/`inputRequired(T)` helpers — stay per-struct.
+mixin template InputRequiredPart()
+{
+	private bool needsInput_;
+	private InputRequiredResult required_;
+
+	/// The handler needs input; the client must gather it and resubmit with the
+	/// matching `inputResponses`.
+	static typeof(this) inputRequired(InputRequest[] requests) @safe
+	{
+		typeof(this) r;
+		r.needsInput_ = true;
+		r.required_.inputRequests = requests;
+		return r;
+	}
+
+	/// As `inputRequired`, but also attaches an opaque `requestState`
+	/// (SEP-2322): a stateless draft server encodes whatever context it needs
+	/// to resume the call into this blob, which the client echoes verbatim on
+	/// the retry and the handler reads back via `RequestContext.requestState`.
+	static typeof(this) inputRequired(InputRequest[] requests, string requestState) @safe
+	{
+		typeof(this) r;
+		r.needsInput_ = true;
+		r.required_.inputRequests = requests;
+		r.required_.requestState = requestState;
+		return r;
+	}
+
+	/// Whether this outcome asks the client for more input.
+	bool needsInput() const @safe
+	{
+		return needsInput_;
+	}
+
+	/// The MRTR `inputRequests` this outcome carries (empty unless `needsInput`).
+	/// Read by the dispatch path so it can drop requests whose kind the client
+	/// never declared.
+	const(InputRequest)[] inputRequests() const @safe
+	{
+		return required_.inputRequests;
+	}
+
+	/// The opaque MRTR `requestState` this outcome carries (empty unless set).
+	string requestState() const @safe
+	{
+		return required_.requestState;
+	}
+
+	/// Return a copy of this input-required outcome with its `inputRequests`
+	/// replaced by `reqs` (preserving `requestState`). Used by the dispatch path
+	/// after filtering out unsupported request kinds.
+	typeof(this) withInputRequests(InputRequest[] reqs) const @safe
+	{
+		return typeof(this).inputRequired(reqs, required_.requestState);
+	}
+
+	/// The JSON-RPC `result` payload (the final result, or an
+	/// `InputRequiredResult`).
+	Json toJson() const @safe
+	{
+		return needsInput_ ? required_.toJson() : result_.toJson();
+	}
+}
+
 /// The outcome of a tool call: either the final `CallToolResult`, or — on a
 /// stateless (MRTR) request — a set of `InputRequest`s the client must satisfy
 /// and resubmit. There is no suspension or shared state: `inputRequired` simply
 /// ends this request, and the client opens a fresh one carrying the answers.
 struct ToolResponse
 {
-	private bool needsInput_;
 	private CallToolResult result_;
-	private InputRequiredResult required_;
+
+	mixin InputRequiredPart ireq;
+	// Merge the mixed-in non-typed `inputRequired` factories into the same
+	// overload set as the typed `inputRequired(T)` declared below; without this
+	// the local template would hide the mixin's overloads.
+	alias inputRequired = ireq.inputRequired;
 
 	/// The handler is done; `r` is the final result.
 	static ToolResponse complete(CallToolResult r) @safe
@@ -58,29 +135,6 @@ struct ToolResponse
 		return ToolResponse.complete(r);
 	}
 
-	/// The handler needs input; the client must gather it and resubmit with the
-	/// matching `inputResponses`.
-	static ToolResponse inputRequired(InputRequest[] requests) @safe
-	{
-		ToolResponse t;
-		t.needsInput_ = true;
-		t.required_.inputRequests = requests;
-		return t;
-	}
-
-	/// As `inputRequired`, but also attaches an opaque `requestState`
-	/// (SEP-2322): a stateless draft server encodes whatever context it needs
-	/// to resume the call into this blob, which the client echoes verbatim on
-	/// the retry and the handler reads back via `RequestContext.requestState`.
-	static ToolResponse inputRequired(InputRequest[] requests, string requestState) @safe
-	{
-		ToolResponse t;
-		t.needsInput_ = true;
-		t.required_.inputRequests = requests;
-		t.required_.requestState = requestState;
-		return t;
-	}
-
 	/// As `inputRequired`, but encodes a typed `state` as the opaque
 	/// `requestState`. Serialises `state` to JSON and stores its string form.
 	/// ENCODING CONTRACT: the stored value is `serializeToJson(state).toString()`,
@@ -93,41 +147,6 @@ struct ToolResponse
 		import vibe.data.json : serializeToJson;
 
 		return ToolResponse.inputRequired(requests, serializeToJson(state).toString());
-	}
-
-	/// Whether this outcome asks the client for more input.
-	bool needsInput() const @safe
-	{
-		return needsInput_;
-	}
-
-	/// The MRTR `inputRequests` this outcome carries (empty unless `needsInput`).
-	/// Read by the dispatch path so it can drop requests whose kind the client
-	/// never declared.
-	const(InputRequest)[] inputRequests() const @safe
-	{
-		return required_.inputRequests;
-	}
-
-	/// The opaque MRTR `requestState` this outcome carries (empty unless set).
-	string requestState() const @safe
-	{
-		return required_.requestState;
-	}
-
-	/// Return a copy of this input-required outcome with its `inputRequests`
-	/// replaced by `reqs` (preserving `requestState`). Used by the dispatch path
-	/// after filtering out unsupported request kinds.
-	ToolResponse withInputRequests(InputRequest[] reqs) const @safe
-	{
-		return ToolResponse.inputRequired(reqs, required_.requestState);
-	}
-
-	/// The JSON-RPC `result` payload (a `CallToolResult` or an
-	/// `InputRequiredResult`).
-	Json toJson() const @safe
-	{
-		return needsInput_ ? required_.toJson() : result_.toJson();
 	}
 
 	/// Project the final `CallToolResult` to the negotiated protocol version so
@@ -194,9 +213,9 @@ struct RegisteredTemplate
 /// `prompts/get` carrying the matching `inputResponses` (and any `requestState`).
 struct PromptResponse
 {
-	private bool needsInput_;
 	private GetPromptResult result_;
-	private InputRequiredResult required_;
+
+	mixin InputRequiredPart;
 
 	/// The handler is done; `r` is the final prompt result.
 	static PromptResponse complete(GetPromptResult r) @safe
@@ -204,64 +223,6 @@ struct PromptResponse
 		PromptResponse p;
 		p.result_ = r;
 		return p;
-	}
-
-	/// The handler needs input; the client must gather it and resubmit with the
-	/// matching `inputResponses`.
-	static PromptResponse inputRequired(InputRequest[] requests) @safe
-	{
-		PromptResponse p;
-		p.needsInput_ = true;
-		p.required_.inputRequests = requests;
-		return p;
-	}
-
-	/// As `inputRequired`, but also attaches an opaque `requestState`
-	/// (SEP-2322): a stateless draft server encodes whatever context it needs to
-	/// resume the prompt into this blob, which the client echoes verbatim on the
-	/// retry and the handler reads back via `RequestContext.requestState`.
-	static PromptResponse inputRequired(InputRequest[] requests, string requestState) @safe
-	{
-		PromptResponse p;
-		p.needsInput_ = true;
-		p.required_.inputRequests = requests;
-		p.required_.requestState = requestState;
-		return p;
-	}
-
-	/// Whether this outcome asks the client for more input.
-	bool needsInput() const @safe
-	{
-		return needsInput_;
-	}
-
-	/// The MRTR `inputRequests` this outcome carries (empty unless `needsInput`).
-	/// Read by the dispatch path so it can drop requests whose kind the client
-	/// never declared.
-	const(InputRequest)[] inputRequests() const @safe
-	{
-		return required_.inputRequests;
-	}
-
-	/// The opaque MRTR `requestState` this outcome carries (empty unless set).
-	string requestState() const @safe
-	{
-		return required_.requestState;
-	}
-
-	/// Return a copy of this input-required outcome with its `inputRequests`
-	/// replaced by `reqs` (preserving `requestState`). Used by the dispatch path
-	/// after filtering out unsupported request kinds.
-	PromptResponse withInputRequests(InputRequest[] reqs) const @safe
-	{
-		return PromptResponse.inputRequired(reqs, required_.requestState);
-	}
-
-	/// The JSON-RPC `result` payload (a `GetPromptResult` or an
-	/// `InputRequiredResult`).
-	Json toJson() const @safe
-	{
-		return needsInput_ ? required_.toJson() : result_.toJson();
 	}
 
 	/// Project the final `GetPromptResult` to the negotiated protocol version so
@@ -323,8 +284,6 @@ final class McpServer
 	/// mint/track an `Mcp-Session-Id`; `stateless` => never).
 	private ServerMode mode_ = ServerMode.stateless;
 
-	private string serverName;
-	private string serverVersion;
 	private Implementation serverInfo_;
 	private Nullable!string instructions;
 	private RegisteredTool[string] tools;
@@ -352,19 +311,13 @@ final class McpServer
 	// Maximum number of items returned per `*/list` page. 0 (the default) means
 	// unbounded: the full list is returned in a single response with no cursor.
 	private size_t pageSize_;
-	private bool[string] listenFilters;
-	// The exact resource URIs the client opted into via `subscriptions/listen`
-	// (the `resourceSubscriptions` string[] of a draft `SubscriptionFilter`),
-	// preserved in request order so the acknowledgement can echo the agreed
-	// list. Kept separate from the legacy flat `subscriptions` map (which also
-	// holds `resources/subscribe` URIs) so the two cannot be confused.
-	private string[] listenResourceUris;
 	// The per-stream `SubscriptionFilter` parsed from the most recent
 	// `subscriptions/listen` request. The transport reads it right after routing the
 	// listen request so it can attach the exact opt-in to that one stream's push
 	// listener (draft basic/utilities/subscriptions §Notification Filter / Multiple
-	// Concurrent Subscriptions). Kept separate from the global `listenFilters` (which
-	// still drives the acknowledgement echo) so concurrent streams do not blur.
+	// Concurrent Subscriptions). This per-stream filter is the single source of
+	// truth for what a connection is listening for; the acknowledgement echo is
+	// derived from it via `acknowledgedSubsetFor`.
 	private SubscriptionFilter lastListenFilter_;
 	private ServerPushChannel pushChannel;
 	// The stdio `subscriptions/listen` delivery channel (draft only). On the
@@ -431,8 +384,6 @@ final class McpServer
 	this(Implementation serverInfo, Nullable!string instructions = Nullable!string.init) @safe
 	{
 		this.serverInfo_ = serverInfo;
-		this.serverName = serverInfo.name;
-		this.serverVersion = serverInfo.version_;
 		this.instructions = instructions;
 		// The fallback `ConnectionState` for requests that carry none (stdio, bare
 		// handle). HTTP requests resolve their own per-session state. See
@@ -604,14 +555,6 @@ final class McpServer
 	void enableToolsListChanged() @safe
 	{
 		toolListChangedEnabled = true;
-	}
-
-	/// Deprecated alias for `enableToolsListChanged` (the consistent, pluralised
-	/// name matching the `tools` capability key). Retained for source
-	/// compatibility.
-	deprecated("Use enableToolsListChanged instead") void enableToolListChanged() @safe
-	{
-		enableToolsListChanged();
 	}
 
 	/// Opt in to enforcing each tool's declared `outputSchema` before the
@@ -930,14 +873,6 @@ final class McpServer
 	void enablePromptsListChanged() @safe
 	{
 		promptsListChangedEnabled = true;
-	}
-
-	/// Deprecated alias for `enablePromptsListChanged` (the consistent,
-	/// pluralised name matching the `prompts` capability key). Retained for
-	/// source compatibility.
-	deprecated("Use enablePromptsListChanged instead") void enablePromptListChanged() @safe
-	{
-		enablePromptsListChanged();
 	}
 
 	/// Advertise the 2025-11-25 `tasks` capability, i.e. support for
@@ -1567,6 +1502,29 @@ final class McpServer
 		return kept;
 	}
 
+	/// MRTR: never ask the client for an input kind it did not declare. Drop any
+	/// unsupported `inputRequests` against the `declared` capability set; if that
+	/// leaves no requests AND no `requestState`, the result violates the spec
+	/// ("at least one of inputRequests/requestState"), so surface it as an
+	/// internal error rather than emitting an unfulfillable round trip. Shared by
+	/// `doCallTool` (`what` = "tools/call") and `doGetPrompt` ("prompts/get");
+	/// both response types expose `needsInput`/`inputRequests`/`requestState`/
+	/// `withInputRequests`, so the helper is type-safe across them. Callers gate
+	/// on `ver.usesMRTR && response.needsInput` before calling.
+	private static T filterInputRequests(T)(T response,
+			ref const ClientCapabilities declared, string what) @safe
+	{
+		auto kept = supportedInputRequests(response.inputRequests, declared);
+		if (kept.length != response.inputRequests.length)
+		{
+			if (kept.length == 0 && response.requestState.length == 0)
+				throw internalError(
+						what ~ " handler returned only input requests the client cannot satisfy");
+			response = response.withInputRequests(kept);
+		}
+		return response;
+	}
+
 	/// Configure the per-list draft `CacheableResult` freshness hint
 	/// (`ttlMs`/`cacheScope`) emitted on a specific `*/list` result when speaking
 	/// the draft protocol. `listMethod` MUST be one of `tools/list`,
@@ -1710,6 +1668,29 @@ final class McpServer
 		}
 	}
 
+	/// Shared `*/list` tail for `doListResources`/`doListResourceTemplates`/
+	/// `doListPrompts`/`doListTools`. Runs `pageBounds` over `keys` (already in the
+	/// handler's intended order), projects each item in the page via
+	/// `getDesc(key).forVersion(ver)` onto `ResultT`'s `field`, sets `nextCursor`,
+	/// and returns `maybeCache(result, listHint(listMethod), ver)`. Keeping the
+	/// cursor/cache wiring in one place means a change to pagination or cache
+	/// gating lands on all four lists at once. `ResultT` is one of the four
+	/// structurally-identical list-result structs; `field` is its leading
+	/// collection field ("resources", "resourceTemplates", "prompts", "tools").
+	private Json paginatedList(ResultT, string field, K, Desc)(string listMethod,
+			K[] keys, scope Desc delegate(K) @safe getDesc, Json params, ProtocolVersion ver) @safe
+	{
+		size_t begin, end;
+		Nullable!string next;
+		pageBounds(params, keys.length, begin, end, next);
+
+		ResultT result;
+		foreach (key; keys[begin .. end])
+			__traits(getMember, result, field) ~= getDesc(key).forVersion(ver);
+		result.nextCursor = next;
+		return maybeCache(result, listHint(listMethod), ver);
+	}
+
 	/// Build the draft `UnsupportedProtocolVersionError` (-32004) listing the
 	/// versions this server supports and the one the client requested.
 	private McpException unsupportedVersionError(string requested) @safe
@@ -1787,16 +1768,13 @@ final class McpServer
 			stdioListenSink = null;
 			stdioListenSubscriptionId = null;
 			// Drop every piece of listen state this single stdio stream recorded so
-			// a later notify*/notifyResourceUpdated writes nothing: the global
-			// `listenFilters` (read by `listensFor`), the per-URI resource
-			// `subscriptions` and their recorded URI list, the per-stream
-			// `lastListenFilter_`, and the stdio delivery filter `stdioListenFilter_`.
-			// Stdio is single-connection, so the caller is the only listener and
-			// clearing all of it is correct.
-			foreach (u; listenResourceUris)
+			// a later notify*/notifyResourceUpdated writes nothing: the per-URI
+			// resource `subscriptions` (keyed by the URIs the per-stream filter
+			// opted into), the per-stream `lastListenFilter_`, and the stdio
+			// delivery filter `stdioListenFilter_`. Stdio is single-connection, so
+			// the caller is the only listener and clearing all of it is correct.
+			foreach (u; lastListenFilter_.resourceUris)
 				conn.subscriptions.remove(u);
-			listenResourceUris = null;
-			listenFilters = null;
 			lastListenFilter_ = SubscriptionFilter.init;
 			stdioListenFilter_ = SubscriptionFilter.init;
 			return;
@@ -2001,6 +1979,8 @@ final class McpServer
 	/// present.
 	private Json doSubscribeListen(Json params, ConnectionState conn) @safe
 	{
+		import std.algorithm : canFind;
+
 		Json filter = Json.undefined;
 		if (params.type == Json.Type.object && "notifications" in params
 				&& params["notifications"].type == Json.Type.object)
@@ -2021,7 +2001,6 @@ final class McpServer
 				if (k in filter && filter[k].type == Json.Type.bool_
 						&& filter[k].get!bool && supportsListenType(k))
 				{
-					listenFilters[k] = true;
 					if (k == "toolsListChanged")
 						perStream.toolsListChanged = true;
 					else if (k == "promptsListChanged")
@@ -2044,34 +2023,27 @@ final class McpServer
 							// Preserve the agreed URI list so the acknowledgement
 							// can echo `resourceSubscriptions` as the spec's
 							// string[] (deduplicated, request order kept).
-							import std.algorithm : canFind;
-
-							if (!listenResourceUris.canFind(u))
-								listenResourceUris ~= u;
 							if (!perStream.resourceUris.canFind(u))
 								perStream.resourceUris ~= u;
 							any = true;
 						}
 					if (any)
-					{
-						listenFilters["resourceSubscriptions"] = true;
 						perStream.resourceSubscriptions = true;
-					}
 				}
 				else if (rs.type == Json.Type.bool_ && rs.get!bool)
 				{
 					// A boolean opt-in: blanket interest in resource-update
 					// notifications without per-URI URIs.
-					listenFilters["resourceSubscriptions"] = true;
 					perStream.resourceSubscriptions = true;
 				}
 			}
 		}
 		lastListenFilter_ = perStream;
 
-		Json j = Json.emptyObject;
-		j["acknowledged"] = true;
-		return j;
+		// The `{acknowledged:true}` body is discarded by both callers (the stdio
+		// route and the HTTP transport derive the acknowledgement from
+		// `acknowledgedSubsetFor(lastListenFilter_)`), so return an empty object.
+		return Json.emptyObject;
 	}
 
 	/// Whether the server actually supports (advertises) a given
@@ -2105,43 +2077,6 @@ final class McpServer
 		default:
 			return false;
 		}
-	}
-
-	/// Whether the client opted in to a given change-notification type via
-	/// `subscriptions/listen`.
-	bool listensFor(string changeType) const @safe
-	{
-		return (changeType in listenFilters) !is null;
-	}
-
-	/// The agreed-upon subset of change-notification types the server will deliver
-	/// on the `subscriptions/listen` stream (draft basic/utilities/subscriptions).
-	/// The three list-changed types appear as booleans (`{ "<type>": true }`)
-	/// while `resourceSubscriptions` appears as the agreed `string[]` of URIs (a
-	/// `SubscriptionFilter`); an empty object when the client opted into nothing.
-	/// This is the payload the transport sends in the leading
-	/// `notifications/subscriptions/acknowledged` event when it opens the stream.
-	Json acknowledgedListenSubset() const @safe
-	{
-		Json subset = Json.emptyObject;
-		foreach (k, v; listenFilters)
-		{
-			// `resourceSubscriptions` is a `string[]` of URIs in a
-			// `SubscriptionFilter`, not a boolean: echo the agreed URI list the
-			// client asked to be notified about (draft basic/utilities/
-			// subscriptions Acknowledgment). The three list-changed keys stay
-			// booleans.
-			if (k == "resourceSubscriptions")
-			{
-				Json uris = Json.emptyArray;
-				foreach (u; listenResourceUris)
-					uris ~= Json(u);
-				subset[k] = uris;
-			}
-			else
-				subset[k] = v;
-		}
-		return subset;
 	}
 
 	/// The per-stream `SubscriptionFilter` parsed from the most recent
@@ -2189,28 +2124,15 @@ final class McpServer
 
 		auto uris = resources.keys;
 		sort(uris);
-		size_t begin, end;
-		Nullable!string next;
-		pageBounds(params, uris.length, begin, end, next);
-
-		ListResourcesResult result;
-		foreach (uri; uris[begin .. end])
-			result.resources ~= resources[uri].descriptor.forVersion(ver);
-		result.nextCursor = next;
-		return maybeCache(result, listHint("resources/list"), ver);
+		return paginatedList!(ListResourcesResult, "resources")("resources/list",
+				uris, (string uri) => resources[uri].descriptor, params, ver);
 	}
 
 	private Json doListResourceTemplates(Json params, ProtocolVersion ver) @safe
 	{
-		size_t begin, end;
-		Nullable!string next;
-		pageBounds(params, templates.length, begin, end, next);
-
-		ListResourceTemplatesResult result;
-		foreach (t; templates[begin .. end])
-			result.resourceTemplates ~= t.descriptor.forVersion(ver);
-		result.nextCursor = next;
-		return maybeCache(result, listHint("resources/templates/list"), ver);
+		return paginatedList!(ListResourceTemplatesResult, "resourceTemplates")(
+				"resources/templates/list",
+				templates, (RegisteredTemplate t) => t.descriptor, params, ver);
 	}
 
 	private Json doReadResource(Json params, ProtocolVersion ver) @safe
@@ -2283,19 +2205,13 @@ final class McpServer
 
 		auto names = prompts.keys;
 		sort(names);
-		size_t begin, end;
-		Nullable!string next;
-		pageBounds(params, names.length, begin, end, next);
-
-		ListPromptsResult result;
-		// Project each prompt to the negotiated protocol version so version-
-		// gated fields are not emitted to peers that don't understand them.
-		// `BaseMetadata.title` was introduced by 2025-06-18 and `Prompt.icons`
-		// by 2025-11-25; forVersion strips each on older versions.
-		foreach (name; names[begin .. end])
-			result.prompts ~= prompts[name].descriptor.forVersion(ver);
-		result.nextCursor = next;
-		return maybeCache(result, listHint("prompts/list"), ver);
+		// Each prompt is projected to the negotiated protocol version (via
+		// `paginatedList` -> `forVersion`) so version-gated fields are not emitted
+		// to peers that don't understand them. `BaseMetadata.title` was introduced
+		// by 2025-06-18 and `Prompt.icons` by 2025-11-25; forVersion strips each on
+		// older versions.
+		return paginatedList!(ListPromptsResult, "prompts")("prompts/list",
+				names, (string name) => prompts[name].descriptor, params, ver);
 	}
 
 	/// The per-list draft cache hint configured for `listMethod`, or null if none.
@@ -2341,14 +2257,7 @@ final class McpServer
 		if (ver.usesMRTR && response.needsInput)
 		{
 			const ClientCapabilities declared = RequestMeta.fromParams(params).clientCapabilities;
-			auto kept = supportedInputRequests(response.inputRequests, declared);
-			if (kept.length != response.inputRequests.length)
-			{
-				if (kept.length == 0 && response.requestState.length == 0)
-					throw internalError(
-							"prompts/get handler returned only input requests the client cannot satisfy");
-				response = response.withInputRequests(kept);
-			}
+			response = filterInputRequests(response, declared, "prompts/get");
 		}
 		// Project the final result to the negotiated protocol version so newer
 		// content kinds (audio/resource_link/tool_use/tool_result) and
@@ -2443,20 +2352,14 @@ final class McpServer
 
 	private Json doListTools(Json params, ProtocolVersion ver) @safe
 	{
-		auto names = sortedToolNames();
-		size_t begin, end;
-		Nullable!string next;
-		pageBounds(params, names.length, begin, end, next);
-
-		ListToolsResult result;
-		foreach (name; names[begin .. end]) // Project each tool to the negotiated protocol version so version-
-			// gated fields are not emitted to peers that don't understand them.
-			// `Tool.execution` (ToolExecution.taskSupport) is a 2025-11-25-only
-			// field (absent pre-2025-11-25, dropped from draft); forVersion emits
-			// it only when `ver` is exactly 2025-11-25.
-			result.tools ~= tools[name].descriptor.forVersion(ver);
-		result.nextCursor = next;
-		return maybeCache(result, listHint("tools/list"), ver);
+		// Each tool is projected to the negotiated protocol version (via
+		// `paginatedList` -> `forVersion`) so version-gated fields are not emitted
+		// to peers that don't understand them. `Tool.execution`
+		// (ToolExecution.taskSupport) is a 2025-11-25-only field (absent
+		// pre-2025-11-25, dropped from draft); forVersion emits it only when `ver`
+		// is exactly 2025-11-25.
+		return paginatedList!(ListToolsResult, "tools")("tools/list",
+				sortedToolNames(), (string name) => tools[name].descriptor, params, ver);
 	}
 
 	private Json doCallTool(Json params, RequestContext ctx,
@@ -2521,15 +2424,7 @@ final class McpServer
 			// where `declared` is the request's own _meta.clientCapabilities; a
 			// non-draft InputRequiredResult is left untouched.
 			if (ver.usesMRTR && response.needsInput)
-			{
-				auto kept = supportedInputRequests(response.inputRequests, declared);
-				if (kept.length != response.inputRequests.length)
-				{
-					if (kept.length == 0 && response.requestState.length == 0)
-						throw internalError("tools/call handler returned only input requests the client cannot satisfy");
-					response = response.withInputRequests(kept);
-				}
-			}
+				response = filterInputRequests(response, declared, "tools/call");
 			// Validate the handler's (un-projected) output against the tool's
 			// declared outputSchema before version-shaping, so validation always
 			// sees the full structuredContent regardless of the negotiated version.
@@ -5538,11 +5433,11 @@ unittest  // subscriptions/listen reads the spec-shaped filter nested under para
 	filter["resourceSubscriptions"] = Json([Json("file:///project/config.json")]);
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	auto resp = s.handle(draftReq(4, "subscriptions/listen", p)).get;
-	assert(resp["result"]["acknowledged"].get!bool);
-	assert(s.listensFor("toolsListChanged"));
-	assert(s.listensFor("resourceSubscriptions"));
-	assert(!s.listensFor("promptsListChanged"));
+	s.handle(draftReq(4, "subscriptions/listen", p)).get;
+	auto f = s.lastListenFilter();
+	assert(f.toolsListChanged);
+	assert(f.resourceSubscriptions);
+	assert(!f.promptsListChanged);
 	// resourceSubscriptions URIs are tracked as per-URI subscriptions.
 	assert(s.isSubscribed("file:///project/config.json"));
 }
@@ -5556,11 +5451,11 @@ unittest  // subscriptions/listen accepts the flat (top-level) filter shape
 	Json p = Json.emptyObject;
 	p["toolsListChanged"] = true;
 	p["resourceSubscriptions"] = true;
-	auto resp = s.handle(draftReq(4, "subscriptions/listen", p)).get;
-	assert(resp["result"]["acknowledged"].get!bool);
-	assert(s.listensFor("toolsListChanged"));
-	assert(s.listensFor("resourceSubscriptions"));
-	assert(!s.listensFor("promptsListChanged"));
+	s.handle(draftReq(4, "subscriptions/listen", p)).get;
+	auto f = s.lastListenFilter();
+	assert(f.toolsListChanged);
+	assert(f.resourceSubscriptions);
+	assert(!f.promptsListChanged);
 }
 
 unittest  // subscriptions/listen with an empty resourceSubscriptions array does not opt in
@@ -5571,18 +5466,18 @@ unittest  // subscriptions/listen with an empty resourceSubscriptions array does
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p));
-	assert(!s.listensFor("resourceSubscriptions"));
+	assert(!s.lastListenFilter().resourceSubscriptions);
 }
 
-unittest  // acknowledgedListenSubset reflects exactly the opted-in change types
+unittest  // the per-stream ack reflects exactly the opted-in change types
 {
 	// resourceSubscriptions opt-in requires a stateful server.
 	auto s = makeStatefulTestServer();
 	s.enableToolsListChanged();
 	s.enableResourceSubscriptions();
 	// Nothing opted in yet -> empty object.
-	assert(s.acknowledgedListenSubset().type == Json.Type.object);
-	assert(s.acknowledgedListenSubset().length == 0);
+	assert(s.acknowledgedSubsetFor(s.lastListenFilter()).type == Json.Type.object);
+	assert(s.acknowledgedSubsetFor(s.lastListenFilter()).length == 0);
 
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
@@ -5592,7 +5487,7 @@ unittest  // acknowledgedListenSubset reflects exactly the opted-in change types
 	p["notifications"] = filter;
 	s.handle(draftReq(7, "subscriptions/listen", p));
 
-	auto subset = s.acknowledgedListenSubset();
+	auto subset = s.acknowledgedSubsetFor(s.lastListenFilter());
 	assert(subset["toolsListChanged"].get!bool);
 	// `resourceSubscriptions` is the agreed string[] of URIs (a SubscriptionFilter),
 	// not a boolean (draft basic/utilities/subscriptions Acknowledgment).
@@ -5615,7 +5510,7 @@ unittest  // ack echoes every opted-in resourceSubscriptions URI in request orde
 	p["notifications"] = filter;
 	s.handle(draftReq(8, "subscriptions/listen", p));
 
-	auto subset = s.acknowledgedListenSubset();
+	auto subset = s.acknowledgedSubsetFor(s.lastListenFilter());
 	assert(subset["resourceSubscriptions"].type == Json.Type.array);
 	assert(subset["resourceSubscriptions"].length == 2);
 	assert(subset["resourceSubscriptions"][0].get!string == "file:///a.txt");
@@ -5722,10 +5617,9 @@ unittest  // subscriptions/listen ack omits a list-changed type the server does 
 	filter["toolsListChanged"] = true;
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	auto resp = s.handle(draftReq(4, "subscriptions/listen", p)).get;
-	assert(resp["result"]["acknowledged"].get!bool);
-	assert(!s.listensFor("toolsListChanged"));
-	assert("toolsListChanged" !in s.acknowledgedListenSubset());
+	s.handle(draftReq(4, "subscriptions/listen", p)).get;
+	assert(!s.lastListenFilter().toolsListChanged);
+	assert("toolsListChanged" !in s.acknowledgedSubsetFor(s.lastListenFilter()));
 }
 
 unittest  // subscriptions/listen ack keeps a list-changed type once the server enables it
@@ -5737,8 +5631,8 @@ unittest  // subscriptions/listen ack keeps a list-changed type once the server 
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p));
-	assert(s.listensFor("toolsListChanged"));
-	assert(s.acknowledgedListenSubset()["toolsListChanged"].get!bool);
+	assert(s.lastListenFilter().toolsListChanged);
+	assert(s.acknowledgedSubsetFor(s.lastListenFilter())["toolsListChanged"].get!bool);
 }
 
 unittest  // subscriptions/listen ack omits promptsListChanged when unsupported
@@ -5750,8 +5644,8 @@ unittest  // subscriptions/listen ack omits promptsListChanged when unsupported
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p));
-	assert(!s.listensFor("promptsListChanged"));
-	assert("promptsListChanged" !in s.acknowledgedListenSubset());
+	assert(!s.lastListenFilter().promptsListChanged);
+	assert("promptsListChanged" !in s.acknowledgedSubsetFor(s.lastListenFilter()));
 }
 
 unittest  // subscriptions/listen ack omits resourcesListChanged when unsupported
@@ -5762,8 +5656,8 @@ unittest  // subscriptions/listen ack omits resourcesListChanged when unsupporte
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p));
-	assert(!s.listensFor("resourcesListChanged"));
-	assert("resourcesListChanged" !in s.acknowledgedListenSubset());
+	assert(!s.lastListenFilter().resourcesListChanged);
+	assert("resourcesListChanged" !in s.acknowledgedSubsetFor(s.lastListenFilter()));
 }
 
 unittest  // subscriptions/listen ack omits resourceSubscriptions when subscriptions disabled
@@ -5775,8 +5669,8 @@ unittest  // subscriptions/listen ack omits resourceSubscriptions when subscript
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p));
-	assert(!s.listensFor("resourceSubscriptions"));
-	assert("resourceSubscriptions" !in s.acknowledgedListenSubset());
+	assert(!s.lastListenFilter().resourceSubscriptions);
+	assert("resourceSubscriptions" !in s.acknowledgedSubsetFor(s.lastListenFilter()));
 	assert(!s.isSubscribed("file:///x"));
 }
 
@@ -5790,8 +5684,8 @@ unittest  // subscriptions/listen ack keeps resourceSubscriptions once enabled
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p));
-	assert(s.listensFor("resourceSubscriptions"));
-	assert(s.acknowledgedListenSubset()["resourceSubscriptions"].length == 1);
+	assert(s.lastListenFilter().resourceSubscriptions);
+	assert(s.acknowledgedSubsetFor(s.lastListenFilter())["resourceSubscriptions"].length == 1);
 	assert(s.isSubscribed("file:///x"));
 }
 
@@ -6425,7 +6319,7 @@ unittest  // tools listChanged is not advertised by default
 	assert(!caps.tools.get.listChanged);
 }
 
-unittest  // enableToolListChanged advertises listChanged:true for tools
+unittest  // enableToolsListChanged advertises listChanged:true for tools
 {
 	auto s = new McpServer("t", "1");
 	Tool add = {name: "add"};
@@ -6437,9 +6331,9 @@ unittest  // enableToolListChanged advertises listChanged:true for tools
 	assert(caps.toJson()["tools"]["listChanged"].get!bool);
 }
 
-unittest  // enableToolListChanged advertises tools capability with zero tools registered
+unittest  // enableToolsListChanged advertises tools capability with zero tools registered
 {
-	// A server that will add tools at runtime declares enableToolListChanged()
+	// A server that will add tools at runtime declares enableToolsListChanged()
 	// before any tool is registered. Per 2025-11-25 tools §Capabilities, it MUST
 	// still advertise the tools capability so clients call tools/list and expect
 	// notifications/tools/list_changed.
@@ -6565,9 +6459,9 @@ unittest  // prompts listChanged is not advertised by default
 	assert(!caps.prompts.get.listChanged);
 }
 
-unittest  // enablePromptListChanged advertises prompts capability with zero prompts registered
+unittest  // enablePromptsListChanged advertises prompts capability with zero prompts registered
 {
-	// A server that will add prompts at runtime declares enablePromptListChanged()
+	// A server that will add prompts at runtime declares enablePromptsListChanged()
 	// before any prompt is registered. Per 2025-11-25 prompts §Capabilities, it
 	// MUST still advertise the prompts capability so clients call prompts/list and
 	// expect notifications/prompts/list_changed.
@@ -6579,7 +6473,7 @@ unittest  // enablePromptListChanged advertises prompts capability with zero pro
 	assert(caps.toJson()["prompts"]["listChanged"].get!bool);
 }
 
-unittest  // enablePromptListChanged advertises listChanged:true for prompts
+unittest  // enablePromptsListChanged advertises listChanged:true for prompts
 {
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet"};
