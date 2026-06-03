@@ -49,6 +49,7 @@ final class DuplexChannel
 	private string delegate() @safe readLineDg;
 	private void delegate(string) @safe writeLineDg;
 	private void delegate(Message) @safe onInbound;
+	private void delegate(string) @safe onInboundBatch;
 	private DuplexCoordinator coord;
 	private TaskMutex writeMutex;
 	private bool closed_;
@@ -60,9 +61,23 @@ final class DuplexChannel
 	this(string delegate() @safe readLine, void delegate(string) @safe writeLine,
 			void delegate(Message) @safe onInbound) @safe
 	{
+		this(readLine, writeLine, onInbound, null);
+	}
+
+	/// As the three-argument constructor, but with `onInboundBatch`: an optional
+	/// handler for an inbound JSON-RPC batch *array* line, given the line's raw text.
+	/// The SERVER inbound path supplies this so a batch is dispatched as a whole
+	/// through `server.handleRaw` — preserving the protocol-version batch gate and
+	/// the single JSON-array response framing that JSON-RPC 2.0 requires. When it is
+	/// `null` (the CLIENT read path) a batch line is split into its members and each
+	/// is routed individually, so per-id response correlation still works.
+	this(string delegate() @safe readLine, void delegate(string) @safe writeLine,
+			void delegate(Message) @safe onInbound, void delegate(string) @safe onInboundBatch) @safe
+	{
 		this.readLineDg = readLine;
 		this.writeLineDg = writeLine;
 		this.onInbound = onInbound;
+		this.onInboundBatch = onInboundBatch;
 		this.coord = new DuplexCoordinator;
 		this.writeMutex = new TaskMutex;
 	}
@@ -115,10 +130,8 @@ final class DuplexChannel
 
 	private void handleLine(string line) @safe
 	{
-		// One inbound line is either a single JSON-RPC message or a 2025-03-26 batch
-		// array; `parseAny` normalizes both to a list of messages. Each contained
-		// message is routed through the same per-kind dispatch as a single message,
-		// so a batch yields one response per id-bearing request rather than silence.
+		// One inbound line is either a single JSON-RPC message or a 2024-11-05 /
+		// 2025-03-26 batch array; `parseAny` classifies both.
 		ParsedInput input;
 		try
 			input = parseAny(line);
@@ -127,6 +140,16 @@ final class DuplexChannel
 			// A malformed/invalid line has no recoverable id, so reply with a
 			// null-id JSON-RPC error rather than dropping it silently.
 			send(makeErrorResponse(Json(null), e));
+			return;
+		}
+		// A batch array on the server inbound path must be dispatched as a unit so the
+		// negotiated-version batch gate and the single JSON-array response framing
+		// apply; splitting it into members would bypass both. The client read path
+		// (no batch handler) instead routes each member individually, since responses
+		// are correlated one-by-one by id.
+		if (input.isBatch && onInboundBatch !is null)
+		{
+			onInboundBatch(line);
 			return;
 		}
 		foreach (m; input.messages)
@@ -499,6 +522,41 @@ unittest  // an inbound batch array routes every contained request/notification 
 	// Both batched requests and the batched notification were dispatched, not dropped.
 	assert(requests == 2);
 	assert(notifications == 1);
+}
+
+unittest  // when a batch handler is installed (server path) a batch line is routed WHOLE, not split
+{
+	// The server inbound path supplies onInboundBatch so the whole batch reaches
+	// server.handleRaw (version gate + single-array framing) instead of being split
+	// into per-member onInbound calls that would bypass both.
+	auto inbound = new LineLink;
+	int members;
+	string wholeRaw;
+	enum batch = `[{"jsonrpc":"2.0","id":1,"method":"ping"},`
+		~ `{"jsonrpc":"2.0","id":2,"method":"ping"}]`;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+			}, (Message) @safe { members++; }, (string raw) @safe {
+				wholeRaw = raw;
+			});
+			channel.start();
+			inbound.put(batch);
+			inbound.closeEnd();
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	// The per-member dispatcher was never called; the raw batch was handed over whole.
+	assert(members == 0, "a batch must not be split when a batch handler is installed");
+	assert(wholeRaw == batch, "the batch handler must receive the whole raw line");
 }
 
 unittest  // a malformed inbound line is answered with a null-id JSON-RPC error instead of silence
