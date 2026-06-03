@@ -512,6 +512,7 @@ final class McpServer
 	/// typed parameters for you and dispatches through this same dynamic path.
 	void registerDynamicTool(Tool descriptor, ToolHandler handler) @safe
 	{
+		requireToolNameAvailable(descriptor.name);
 		tools[descriptor.name] = RegisteredTool(descriptor, (Json args,
 				RequestContext ctx) => ToolResponse.complete(handler(args, ctx)));
 	}
@@ -521,6 +522,7 @@ final class McpServer
 	/// dynamic path versus the typed UDA layer.
 	void registerDynamicTool(Tool descriptor, CallToolResult delegate(Json) @safe handler) @safe
 	{
+		requireToolNameAvailable(descriptor.name);
 		tools[descriptor.name] = RegisteredTool(descriptor, (Json args,
 				RequestContext) => ToolResponse.complete(handler(args)));
 	}
@@ -533,7 +535,18 @@ final class McpServer
 	/// both protocol eras handles both branches here.
 	void registerDynamicTool(Tool descriptor, MrtrToolHandler handler) @safe
 	{
+		requireToolNameAvailable(descriptor.name);
 		tools[descriptor.name] = RegisteredTool(descriptor, handler);
+	}
+
+	/// Throw when a tool with `name` is already registered. Registration entry
+	/// points reject a name collision rather than silently clobbering the prior
+	/// entry; call `removeTool` first to replace one intentionally.
+	private void requireToolNameAvailable(string name) @safe
+	{
+		if (name in tools)
+			throw new Exception("a tool named '" ~ name
+					~ "' is already registered; call removeTool first to replace it");
 	}
 
 	/// Declare the client capabilities a registered tool's handler requires.
@@ -738,6 +751,8 @@ final class McpServer
 	void registerResource(Resource descriptor, ResourceContents delegate() @safe reader,
 			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
+		if (descriptor.uri in resources)
+			throw new Exception("a resource with uri '" ~ descriptor.uri ~ "' is already registered");
 		resources[descriptor.uri] = RegisteredResource(descriptor, reader, cache);
 	}
 
@@ -762,8 +777,17 @@ final class McpServer
 		// Adapt the simple handler — which always produces a final result — to the
 		// `PromptResponse`-returning form, ignoring the per-request context. Prompts
 		// registered this way never emit an `InputRequiredResult`.
+		requirePromptNameAvailable(descriptor.name);
 		prompts[descriptor.name] = RegisteredPrompt(descriptor, (Json args,
 				RequestContext ctx) => PromptResponse.complete(handler(args)));
+	}
+
+	/// Throw when a prompt with `name` is already registered, mirroring the tool
+	/// registration collision guard.
+	private void requirePromptNameAvailable(string name) @safe
+	{
+		if (name in prompts)
+			throw new Exception("a prompt named '" ~ name ~ "' is already registered");
 	}
 
 	/// Register a *dynamic* prompt whose handler may, on a stateless (MRTR) draft
@@ -782,6 +806,7 @@ final class McpServer
 	/// `complete`s, so its wire output carries only a plain `GetPromptResult`.
 	void registerDynamicPrompt(Prompt descriptor, MrtrPromptHandler handler) @safe
 	{
+		requirePromptNameAvailable(descriptor.name);
 		prompts[descriptor.name] = RegisteredPrompt(descriptor, handler);
 	}
 
@@ -1236,6 +1261,16 @@ final class McpServer
 			auto resp = dispatch(input.messages[0]);
 			return resp.isNull ? "" : resp.get.toString();
 		}
+
+		// JSON-RPC batching was removed in 2025-06-18 and is absent from later
+		// transports; only 2024-11-05 and 2025-03-26 permit it. On a session that
+		// negotiated 2025-06-18 or later, reject a batch with a single
+		// invalidRequest (-32600) error carrying a null id rather than processing
+		// the array.
+		if (cs.negotiated >= ProtocolVersion.v2025_06_18)
+			return makeErrorResponse(Json(null),
+					invalidRequest("JSON-RPC batching is not supported on this protocol version"))
+				.toString();
 
 		Json responses = Json.emptyArray;
 		foreach (m; input.messages)
@@ -1774,9 +1809,9 @@ final class McpServer
 		case "logging/setLevel":
 			return doSetLevel(params, ver, conn);
 		case "tasks/list":
-			return doTasksList(params);
+			return doTasksList(params, ver);
 		case "tasks/get":
-			return doTasksGet(params);
+			return doTasksGet(params, ver);
 		case "tasks/result":
 			// SEP-2663 removed `tasks/result` from the draft tasks extension, so on
 			// a draft-negotiated session the method does not exist and MUST answer
@@ -1785,9 +1820,9 @@ final class McpServer
 			// for any (always-unknown) taskId.
 			if (ver.isDraft)
 				throw methodNotFound(method);
-			return doTasksResult(params);
+			return doTasksResult(params, ver);
 		case "tasks/cancel":
-			return doTasksCancel(params);
+			return doTasksCancel(params, ver);
 		default:
 			throw methodNotFound(method);
 		}
@@ -1807,15 +1842,23 @@ final class McpServer
 	// A server that never called `enableTasks()` does not advertise the capability
 	// and MUST NOT serve these (returns -32601), matching logging/setLevel and
 	// resources/subscribe gating.
-	private void requireTasksAdvertised() @safe
+	private void requireTasksAdvertised(ProtocolVersion ver) @safe
 	{
+		// The tasks capability is advertised only on versions that define it:
+		// 2025-11-25 (and later stable) and the draft (where it is folded into the
+		// `extensions` map). On 2024-11-05 / 2025-03-26 / 2025-06-18 the capability
+		// is never advertised even when `enableTasks()` was called, so these RPCs
+		// MUST report -32601 — matching the version gates on server/discover,
+		// resources/subscribe, and logging/setLevel.
+		if (ver < ProtocolVersion.v2025_11_25 && !ver.isDraft)
+			throw methodNotFound("tasks");
 		if (tasksCapability.isNull)
 			throw methodNotFound("tasks");
 	}
 
-	private Json doTasksList(Json params) @safe
+	private Json doTasksList(Json params, ProtocolVersion ver) @safe
 	{
-		requireTasksAdvertised();
+		requireTasksAdvertised(ver);
 		Json result = Json.emptyObject;
 		result["tasks"] = Json.emptyArray;
 		return result;
@@ -1829,21 +1872,21 @@ final class McpServer
 		throw new McpException(ErrorCode.invalidParams, "Task not found", data);
 	}
 
-	private Json doTasksGet(Json params) @safe
+	private Json doTasksGet(Json params, ProtocolVersion ver) @safe
 	{
-		requireTasksAdvertised();
+		requireTasksAdvertised(ver);
 		return taskNotFound(params);
 	}
 
-	private Json doTasksResult(Json params) @safe
+	private Json doTasksResult(Json params, ProtocolVersion ver) @safe
 	{
-		requireTasksAdvertised();
+		requireTasksAdvertised(ver);
 		return taskNotFound(params);
 	}
 
-	private Json doTasksCancel(Json params) @safe
+	private Json doTasksCancel(Json params, ProtocolVersion ver) @safe
 	{
-		requireTasksAdvertised();
+		requireTasksAdvertised(ver);
 		return taskNotFound(params);
 	}
 
@@ -3744,6 +3787,14 @@ unittest  // handleRaw on a batch returns only the responses (notifications drop
 	import vibe.data.json : parseJsonString;
 
 	auto s = makeTestServer();
+	// Batching was removed in 2025-06-18, so negotiate 2025-03-26 (which still
+	// permits it) before exercising the batch path.
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-03-26";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", params));
+
 	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
 		{"jsonrpc":"2.0","method":"notifications/initialized"},
 		{"jsonrpc":"2.0","id":2,"method":"tools/list"}]`);
@@ -3752,6 +3803,82 @@ unittest  // handleRaw on a batch returns only the responses (notifications drop
 	assert(arr.length == 2);
 	assert(arr[0]["id"].get!int == 1);
 	assert(arr[1]["id"].get!int == 2);
+}
+
+unittest  // handleRaw rejects a batch on a 2025-06-18 session with a single -32600
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = makeTestServer();
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-06-18";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", params));
+
+	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
+		{"jsonrpc":"2.0","id":2,"method":"ping"}]`);
+	auto resp = parseJsonString(outText);
+	assert(resp.type == Json.Type.object);
+	assert(resp["id"].type == Json.Type.null_);
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // handleRaw still processes a batch on a 2025-03-26 session
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = makeTestServer();
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-03-26";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", params));
+
+	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
+		{"jsonrpc":"2.0","id":2,"method":"ping"}]`);
+	auto arr = parseJsonString(outText);
+	assert(arr.type == Json.Type.array);
+	assert(arr.length == 2);
+}
+
+unittest  // registering a tool whose name already exists throws
+{
+	auto s = new McpServer("t", "1");
+	Tool a = {name: "dup"};
+	s.registerDynamicTool(a, (Json) @safe => CallToolResult.init);
+	bool threw;
+	try
+		s.registerDynamicTool(a, (Json) @safe => CallToolResult.init);
+	catch (Exception)
+		threw = true;
+	assert(threw, "duplicate tool registration must throw");
+}
+
+unittest  // registering a resource whose uri already exists throws
+{
+	auto s = new McpServer("t", "1");
+	Resource r = {uri: "test://x", name: "x"};
+	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
+	bool threw;
+	try
+		s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
+	catch (Exception)
+		threw = true;
+	assert(threw, "duplicate resource registration must throw");
+}
+
+unittest  // registering a prompt whose name already exists throws
+{
+	auto s = new McpServer("t", "1");
+	Prompt p = {name: "dup"};
+	s.registerDynamicPrompt(p, (Json) @safe => GetPromptResult.init);
+	bool threw;
+	try
+		s.registerDynamicPrompt(p, (Json) @safe => GetPromptResult.init);
+	catch (Exception)
+		threw = true;
+	assert(threw, "duplicate prompt registration must throw");
 }
 
 unittest  // resources/list and resources/read for a direct resource
@@ -4417,6 +4544,30 @@ unittest  // tasks/* are -32601 when the server never advertised the capability
 	foreach (m; ["tasks/list", "tasks/get", "tasks/result", "tasks/cancel"])
 	{
 		auto resp = s.handle(req(1, m)).get;
+		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+	}
+}
+
+unittest  // tasks/list|get|cancel are -32601 on a pre-2025-11-25 negotiated session
+{
+	// The tasks capability is only advertised on 2025-11-25 and the draft. On a
+	// 2025-06-18 session an enableTasks() server advertises NO tasks capability,
+	// so the three tasks RPCs MUST report -32601 rather than serving an empty
+	// page / task-not-found.
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-06-18";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	auto init = s.handle(req(1, "initialize", params)).get;
+	assert(init["result"]["protocolVersion"].get!string == "2025-06-18");
+	assert("tasks" !in init["result"]["capabilities"]);
+
+	foreach (m; ["tasks/list", "tasks/get", "tasks/cancel"])
+	{
+		auto resp = s.handle(req(2, m)).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
 	}
 }
