@@ -5,6 +5,223 @@ import core.time : Duration, MonoTime, minutes;
 import mcp.protocol.errors : McpException, internalError;
 import mcp.server.connection : ConnectionState;
 
+/// A string-keyed cache of `V` with a per-entry insertion/activity timestamp,
+/// bounded by an idle TTL and a maximum live-entry count. It owns the value map
+/// and the parallel timestamp map together so the "remove from both" invariant
+/// lives in one place, and runs the TTL sweep + LRU cap eviction internally.
+///
+/// `ttl == Duration.zero` disables the sweep; `maxEntries == 0` disables the
+/// cap. `clock` is injectable (`null` => `MonoTime.currTime`) so callers can
+/// drive expiry deterministically in tests. The container does no locking; the
+/// owner serializes access (e.g. `synchronized` on a `synchronized`-using class,
+/// or vibe.d's single-fiber loop).
+struct BoundedExpiringMap(V)
+{
+	private V[string] values;
+	private MonoTime[string] stamps;
+	private Duration ttl;
+	private size_t maxEntries;
+	private MonoTime delegate() @safe clock;
+
+	this(Duration ttl, size_t maxEntries, MonoTime delegate() @safe clock) @safe
+	{
+		this.ttl = ttl;
+		this.maxEntries = maxEntries;
+		this.clock = clock;
+	}
+
+	private MonoTime now() @safe
+	{
+		return clock is null ? MonoTime.currTime : clock();
+	}
+
+	/// Sweep expired entries, evict the oldest if inserting a new key would
+	/// exceed the cap, then store `value` and stamp it as just-active.
+	void put(string key, V value) @safe
+	{
+		const t = now();
+		sweep(t);
+		if (maxEntries != 0 && (key in values) is null)
+			while (values.length >= maxEntries && evictOldest())
+			{
+			}
+		values[key] = value;
+		stamps[key] = t;
+	}
+
+	/// Sweep expired entries, then consume and return the entry for `key`,
+	/// setting `found`. The entry is removed (single use).
+	V take(string key, out bool found) @safe
+	{
+		sweep(now());
+		if (auto p = key in values)
+		{
+			found = true;
+			auto v = *p;
+			drop(key);
+			return v;
+		}
+		found = false;
+		return V.init;
+	}
+
+	/// Pointer to the live value for `key`, or `null` when absent. When `refresh`
+	/// is set, a hit stamps the entry as just-active so it survives the idle sweep.
+	V* get(string key, bool refresh) @safe
+	{
+		if (auto p = key in values)
+		{
+			if (refresh)
+				stamps[key] = now();
+			return p;
+		}
+		return null;
+	}
+
+	/// Whether `key` has a live entry.
+	bool contains(string key) @safe
+	{
+		return (key in values) !is null;
+	}
+
+	/// Remove the entry for `key` from both maps. Returns whether it existed.
+	bool remove(string key) @safe
+	{
+		if ((key in values) is null)
+			return false;
+		drop(key);
+		return true;
+	}
+
+	/// Number of live entries.
+	size_t length() @safe
+	{
+		return values.length;
+	}
+
+	private void drop(string key) @safe
+	{
+		values.remove(key);
+		stamps.remove(key);
+	}
+
+	private void sweep(MonoTime t) @safe
+	{
+		if (ttl <= Duration.zero || values.length == 0)
+			return;
+		string[] expired;
+		foreach (k, ts; stamps)
+			if (t - ts >= ttl)
+				expired ~= k;
+		foreach (k; expired)
+			drop(k);
+	}
+
+	private bool evictOldest() @safe
+	{
+		string oldest;
+		MonoTime oldestTs;
+		bool found;
+		foreach (k, ts; stamps)
+			if (!found || ts < oldestTs)
+			{
+				oldest = k;
+				oldestTs = ts;
+				found = true;
+			}
+		if (!found)
+			return false;
+		drop(oldest);
+		return true;
+	}
+}
+
+unittest  // BoundedExpiringMap put/take round-trips and consumes the entry
+{
+	auto m = BoundedExpiringMap!int(Duration.zero, 0, null);
+	m.put("a", 7);
+	assert(m.length == 1);
+	bool found;
+	assert(m.take("a", found) == 7 && found);
+	// Consumed: a second take misses.
+	m.take("a", found);
+	assert(!found);
+}
+
+unittest  // BoundedExpiringMap sweeps entries older than the TTL on the next put/take
+{
+	import core.time : MonoTime, minutes;
+
+	auto clk = MonoTime.currTime;
+	auto m = BoundedExpiringMap!int(10.minutes, 0, () @safe => clk);
+	m.put("old", 1);
+	clk += 11.minutes;
+	m.put("fresh", 2);
+	assert(m.length == 1);
+	bool found;
+	m.take("old", found);
+	assert(!found);
+	m.take("fresh", found);
+	assert(found);
+}
+
+unittest  // BoundedExpiringMap caps live entries, evicting the oldest by timestamp
+{
+	import core.time : MonoTime, minutes, seconds;
+
+	auto clk = MonoTime.currTime;
+	auto m = BoundedExpiringMap!int(10.minutes, 2, () @safe => clk);
+	m.put("a", 1);
+	clk += 1.seconds;
+	m.put("b", 2);
+	clk += 1.seconds;
+	// Third put exceeds the cap of 2: the oldest ("a") is evicted.
+	m.put("c", 3);
+	assert(m.length == 2);
+	bool found;
+	m.take("a", found);
+	assert(!found);
+	m.take("b", found);
+	assert(found);
+	m.take("c", found);
+	assert(found);
+}
+
+unittest  // BoundedExpiringMap overwriting an existing key does not trigger eviction
+{
+	auto m = BoundedExpiringMap!int(Duration.zero, 1, null);
+	m.put("a", 1);
+	m.put("a", 2);
+	assert(m.length == 1);
+	bool found;
+	assert(m.take("a", found) == 2 && found);
+}
+
+unittest  // BoundedExpiringMap get(refresh) keeps an in-use entry off the eviction block
+{
+	import core.time : MonoTime, minutes, seconds;
+
+	auto clk = MonoTime.currTime;
+	auto m = BoundedExpiringMap!int(Duration.zero, 2, () @safe => clk);
+	m.put("a", 1);
+	clk += 1.seconds;
+	m.put("b", 2);
+	clk += 1.seconds;
+	// Touch "a" so "b" becomes least-recently-active.
+	assert(*m.get("a", true) == 1);
+	m.put("c", 3);
+	assert(m.contains("a") && m.contains("c") && !m.contains("b"));
+}
+
+unittest  // BoundedExpiringMap remove drops the entry and reports prior presence
+{
+	auto m = BoundedExpiringMap!int(Duration.zero, 0, null);
+	m.put("a", 1);
+	assert(m.remove("a"));
+	assert(!m.remove("a"));
+	assert(m.length == 0);
+}
+
 /// Tracks active Streamable HTTP sessions for a server mount.
 ///
 /// When session management is enabled (the server was built with
@@ -25,30 +242,16 @@ import mcp.server.connection : ConnectionState;
 /// locking.
 final class SessionManager
 {
-	// The manager OWNS one `ConnectionState` per active
-	// session, keyed by `Mcp-Session-Id`. Presence in this map is the liveness
-	// signal: an entry means the session is
-	// active, its absence means unknown/terminated. Storing the per-session state
-	// here is what makes stateful HTTP truly session-isolated — the request path
-	// resolves a request's `ConnectionState` by its session id, so one session's
-	// negotiated version / logLevel / subscriptions / in-flight ids can never be
-	// observed through another's.
-	private ConnectionState[string] states;
-
-	/// Last-activity timestamp per session, updated on `create` and on every
-	/// `stateFor` that resolves the session. Drives the idle TTL sweep.
-	private MonoTime[string] lastActivity;
-
-	/// Idle time-to-live: a session not touched (created or resolved via
-	/// `stateFor`) within this window is eligible for eviction by the lazy sweep
-	/// run on `create`. `Duration.zero` disables idle eviction.
-	private Duration idleTtl;
-
-	/// Maximum number of concurrently-active sessions. When a `create` would push
-	/// the table past this, the least-recently-active session is evicted first so
-	/// a never-DELETE client cannot grow the table without bound. `0` disables the
-	/// cap (unbounded, the historical behaviour).
-	private size_t maxActive;
+	// The manager OWNS one `ConnectionState` per active session, keyed by
+	// `Mcp-Session-Id`. Presence is the liveness signal: an entry means the
+	// session is active, its absence means unknown/terminated. Owning the
+	// per-session state here is what makes stateful HTTP truly session-isolated —
+	// the request path resolves a request's `ConnectionState` by its session id,
+	// so one session's negotiated version / logLevel / subscriptions / in-flight
+	// ids can never be observed through another's. The container bounds residency
+	// by idle TTL and active-session cap, evicting least-recently-active sessions
+	// so a never-DELETE client cannot grow the table without bound.
+	private BoundedExpiringMap!ConnectionState sessions;
 
 	/// Default idle TTL applied when none is configured: a stateful session left
 	/// untouched for this long is swept on the next `create`.
@@ -69,8 +272,7 @@ final class SessionManager
 	/// `Duration.zero` disables the idle sweep; `maxActive` `0` disables the cap.
 	this(Duration idleTtl, size_t maxActive) @safe
 	{
-		this.idleTtl = idleTtl;
-		this.maxActive = maxActive;
+		sessions = BoundedExpiringMap!ConnectionState(idleTtl, maxActive, null);
 	}
 
 	/// Generate a new cryptographically-secure session id, create and store the
@@ -93,11 +295,10 @@ final class SessionManager
 	/// shape matches every other error path.
 	string create() @safe
 	{
-		sweepIdle();
-		enforceCap();
 		const id = generateSessionId();
-		states[id] = new ConnectionState;
-		lastActivity[id] = MonoTime.currTime;
+		// put() runs the lazy idle sweep and cap eviction before inserting, so an
+		// abandoned session is reclaimed the next time any client initializes.
+		sessions.put(id, new ConnectionState);
 		return id;
 	}
 
@@ -106,7 +307,7 @@ final class SessionManager
 	{
 		if (id.length == 0)
 			return false;
-		return (id in states) !is null;
+		return sessions.contains(id);
 	}
 
 	/// The `ConnectionState` this manager owns for the active session `id`, or
@@ -118,11 +319,8 @@ final class SessionManager
 	{
 		if (id.length == 0)
 			return null;
-		if (auto p = id in states)
-		{
-			lastActivity[id] = MonoTime.currTime;
+		if (auto p = sessions.get(id, true))
 			return *p;
-		}
 		return null;
 	}
 
@@ -132,66 +330,13 @@ final class SessionManager
 	{
 		if (id.length == 0)
 			return false;
-		if ((id in states) is null)
-			return false;
-		drop(id);
-		return true;
+		return sessions.remove(id);
 	}
 
 	/// Number of currently-active sessions.
 	size_t activeCount() @safe
 	{
-		return states.length;
-	}
-
-	/// Remove a session and its bookkeeping. Shared by `terminate` and the
-	/// eviction paths so the two parallel maps never drift apart.
-	private void drop(string id) @safe
-	{
-		states.remove(id);
-		lastActivity.remove(id);
-	}
-
-	/// Evict every session whose last activity is older than `idleTtl`. A no-op
-	/// when the TTL is disabled. Runs lazily on `create`, so on the single-fiber
-	/// vibe.d loop it needs no timer or locking: an abandoned session is reclaimed
-	/// the next time any client initializes.
-	private void sweepIdle() @safe
-	{
-		if (idleTtl <= Duration.zero || states.length == 0)
-			return;
-		const now = MonoTime.currTime;
-		string[] expired;
-		foreach (id, ts; lastActivity)
-			if (now - ts >= idleTtl)
-				expired ~= id;
-		foreach (id; expired)
-			drop(id);
-	}
-
-	/// Evict least-recently-active sessions until creating one more stays within
-	/// `maxActive`. A no-op when the cap is disabled. This guarantees a never-DELETE
-	/// client cannot grow the table past the cap regardless of the idle sweep.
-	private void enforceCap() @safe
-	{
-		if (maxActive == 0)
-			return;
-		while (states.length >= maxActive)
-		{
-			string oldest;
-			MonoTime oldestTs;
-			bool found;
-			foreach (id, ts; lastActivity)
-				if (!found || ts < oldestTs)
-				{
-					oldest = id;
-					oldestTs = ts;
-					found = true;
-				}
-			if (!found)
-				break;
-			drop(oldest);
-		}
+		return sessions.length;
 	}
 }
 
