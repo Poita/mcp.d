@@ -10,6 +10,7 @@ import vibe.stream.operations : readAllUTF8, readLine;
 import vibe.core.net : TCPConnection;
 import vibe.stream.tls : createTLSContext, createTLSStream, TLSContextKind, TLSPeerValidationMode;
 import vibe.stream.wrapper : ProxyStream, createProxyStream;
+import vibe.core.sync : LocalManualEvent, createManualEvent;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
@@ -141,10 +142,25 @@ final class HttpClientTransport : ClientTransport
 	private bool serverStreamSockOpen;
 	private TCPConnection legacyStreamSock;
 	private bool legacyStreamSockOpen;
+	// Slots for the sockets of in-flight `postAndAwaitRaw` POSTs whose response is
+	// a long-lived SSE stream. Each POST registers a slot before connecting and
+	// removes it on scope exit; `close()` force-closes every registered slot so a
+	// POST parked reading the stream unblocks immediately. `ListenSocketSlot`'s
+	// `attach`/`closeSocket` are order-independent, closing the window where a
+	// `close()` races the `connectTCP` yield.
+	private ListenSocketSlot[] postSockets;
 	// True while the legacy GET-SSE reader task is running. A `legacyRpc` issued
 	// after the reader has exited fails its waiter at once instead of polling for
 	// the full timeout, since no response can ever arrive on a dead stream.
 	private bool legacyStreamAlive;
+	// Event-driven completion for the two legacy-path waits (`startLegacyFallback`
+	// endpoint discovery and `legacyRpc` response arrival), replacing fixed 50ms
+	// busy-poll loops. The background `runLegacyStream` reader emits it after
+	// setting `legacyEndpoint` and after filling a waiter; `close()` emits it so a
+	// blocked waiter wakes at once. Each waiter re-checks its own condition after
+	// every wake and honors a bounded deadline.
+	private LocalManualEvent legacyEvent;
+	private bool legacyEventInit;
 
 	/// Inbound dispatcher installed by `McpClient` (its `dispatchInbound`),
 	/// invoked for notifications and server->client requests on any stream.
@@ -207,11 +223,17 @@ final class HttpClientTransport : ClientTransport
 			legacyStreamSockOpen = false;
 			() @trusted { legacyStreamSock.close(); }();
 		}
-		// Fail any in-flight legacy waiter at once so its `legacyRpc` poll returns
+		// Force-close every in-flight POST socket so a POST parked reading a
+		// long-lived SSE response stream unblocks at once.
+		foreach (slot; postSockets)
+			slot.closeSocket();
+		// Fail any in-flight legacy waiter at once so its `legacyRpc` wait returns
 		// immediately instead of waiting out the timeout on a closing transport.
 		foreach (id, w; legacyWaiters)
 			if (!w.got && w.err is null)
 				w.err = internalError("legacy HTTP+SSE transport closing");
+		// Wake both the per-request waiters and any pending endpoint-discovery wait.
+		notifyLegacy();
 	}
 
 	private bool closing() @safe
@@ -221,6 +243,27 @@ final class HttpClientTransport : ClientTransport
 
 			return atomicLoad(closeRequested);
 		}();
+	}
+
+	/// Lazily create the legacy-path completion event (a `LocalManualEvent` must be
+	/// constructed on the event loop, not at field-init time) and return it.
+	private ref LocalManualEvent legacyCompletionEvent() @safe
+	{
+		if (!legacyEventInit)
+		{
+			legacyEvent = createManualEvent();
+			legacyEventInit = true;
+		}
+		return legacyEvent;
+	}
+
+	/// Wake any legacy-path waiter blocked in `legacyCompletionEvent`. Called by the
+	/// background reader after it makes progress (endpoint discovered / waiter
+	/// filled) and by `close()`.
+	private void notifyLegacy() @safe
+	{
+		if (legacyEventInit)
+			legacyEvent.emit();
 	}
 
 	private string[string] requestHeaders(Json message) @safe
@@ -368,12 +411,27 @@ final class HttpClientTransport : ClientTransport
 		const payload = message.toString();
 		auto hdrs = requestHeaders(message);
 
+		// Register a slot so `close()` can force-close this POST's socket even while
+		// it is parked reading a long-lived SSE response stream.
+		auto slot = new ListenSocketSlot;
+		postSockets ~= slot;
+		scope (exit)
+		{
+			import std.algorithm : remove;
+
+			slot.closeSocket();
+			postSockets = postSockets.remove!(s => s is slot);
+		}
+
 		() @trusted {
 			try
 			{
 				auto sock = connectTCP(host, port);
-				scope (exit)
-					sock.close();
+				// `attach` closes `sock` immediately if a `close()` already ran during
+				// the `connectTCP` yield, so the socket is never leaked or left parked.
+				slot.attach(sock);
+				if (closing)
+					return;
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, host);
 
@@ -482,7 +540,7 @@ final class HttpClientTransport : ClientTransport
 
 				for (;;)
 				{
-					if (got || err !is null)
+					if (got || err !is null || closing)
 						break;
 					if (chunked)
 					{
@@ -794,72 +852,6 @@ final class HttpClientTransport : ClientTransport
 			sessionId = res.headers["Mcp-Session-Id"];
 	}
 
-	/// Read an SSE stream, dispatching messages until the awaited response.
-	///
-	/// Blocks on `readLine` rather than polling `empty`: an SSE stream may stay
-	/// open and idle between events (e.g. while the server awaits our reply to a
-	/// server->client request), and `empty` can spuriously report end-of-stream
-	/// in that window. A read exception signals the stream has closed.
-	private void readSse(scope HTTPClientResponse res, long expectId,
-			ref Json result, ref bool got, ref McpException err) @safe
-	{
-		string dataBuf;
-		for (;;)
-		{
-			string line;
-			bool eof;
-			() @trusted {
-				try
-					line = cast(string) readLine(res.bodyReader, size_t.max, "\n").idup;
-				catch (Exception)
-					eof = true;
-			}();
-			if (eof)
-				break;
-			if (line.length && line[$ - 1] == '\r')
-				line = line[0 .. $ - 1];
-
-			if (line.length == 0)
-			{
-				if (dataBuf.length)
-				{
-					dispatchSse(dataBuf, expectId, result, got, err);
-					dataBuf = null;
-					if (got || err !is null)
-						return;
-				}
-				continue;
-			}
-			if (line.startsWith("data:"))
-			{
-				auto d = line["data:".length .. $];
-				if (d.startsWith(" "))
-					d = d[1 .. $];
-				dataBuf ~= (dataBuf.length ? "\n" : "") ~ d;
-			}
-			else if (line.startsWith("id:"))
-			{
-				import std.string : strip;
-
-				sseLastEventId = line["id:".length .. $].strip;
-			}
-			else if (line.startsWith("retry:"))
-			{
-				import std.string : strip;
-				import std.conv : to;
-
-				try
-					sseRetryMs = line["retry:".length .. $].strip.to!long;
-				catch (Exception)
-				{
-				}
-			}
-		}
-		// Flush a trailing event with no terminating blank line.
-		if (dataBuf.length && !got && err is null)
-			dispatchSse(dataBuf, expectId, result, got, err);
-	}
-
 	private void dispatchSse(string data, long expectId, ref Json result,
 			ref bool got, ref McpException err) @safe
 	{
@@ -958,6 +950,15 @@ final class HttpClientTransport : ClientTransport
 				try
 				{
 					auto sock = connectTCP(host, port);
+					// `connectTCP` yielded; if a `close()` landed during that yield it
+					// saw the socket as not-yet-open and did nothing. Re-check here, in
+					// the same fiber with no intervening yield, so the freshly connected
+					// socket is torn down rather than leaked.
+					if (closing)
+					{
+						sock.close();
+						return;
+					}
 					serverStreamSock = sock;
 					serverStreamSockOpen = true;
 					scope (exit)
@@ -1289,11 +1290,15 @@ final class HttpClientTransport : ClientTransport
 	/// `McpClient.connect` once a modern POST has been rejected with 400/404/405.
 	void startLegacyFallback() @safe
 	{
-		import vibe.core.core : runTask, sleep;
-		import core.time : msecs;
+		import vibe.core.core : runTask;
+		import core.time : msecs, MonoTime;
 
 		legacyMode = true;
 		legacyEndpoint = null;
+
+		// Create the completion event before spawning the reader so an `endpoint`
+		// event the reader discovers immediately cannot be missed.
+		auto ec = legacyCompletionEvent().emitCount;
 
 		// The GET SSE stream is long-lived: run its reader on a background task
 		// so this method can return once the `endpoint` event has arrived.
@@ -1305,12 +1310,15 @@ final class HttpClientTransport : ClientTransport
 			}
 		});
 
-		// Wait (bounded) for the background task to discover the endpoint URI.
-		foreach (_; 0 .. 200) // up to ~10s at 50ms granularity
+		// Wait (bounded, ~10s ceiling) for the background task to discover the
+		// endpoint URI, woken by the reader's `notifyLegacy` rather than polling.
+		const deadline = MonoTime.currTime + 10_000.msecs;
+		while (legacyEndpoint.length == 0)
 		{
-			if (legacyEndpoint.length)
+			const now = MonoTime.currTime;
+			if (now >= deadline)
 				break;
-			() @trusted { sleep(50.msecs); }();
+			ec = legacyCompletionEvent().waitUninterruptible(deadline - now, ec);
 		}
 		if (legacyEndpoint.length == 0)
 		{
@@ -1325,8 +1333,7 @@ final class HttpClientTransport : ClientTransport
 	/// arrives asynchronously on the standalone GET SSE stream.
 	private Json legacyRpc(Json message, long expectId) @safe
 	{
-		import vibe.core.core : sleep;
-		import core.time : msecs;
+		import core.time : msecs, MonoTime;
 
 		auto waiter = new LegacyWaiter;
 		waiter.result = Json.undefined;
@@ -1334,18 +1341,26 @@ final class HttpClientTransport : ClientTransport
 		scope (exit)
 			legacyWaiters.remove(expectId);
 
+		// Snapshot the completion event before the POST so a response the reader
+		// delivers immediately after cannot be missed.
+		auto ec = legacyCompletionEvent().emitCount;
+
 		post(message); // POST to legacyEndpoint; server replies on the GET stream
 
 		// If the reader has already exited, no response can arrive on the stream:
-		// fail fast rather than polling for the full timeout.
+		// fail fast rather than waiting out the timeout.
 		if (!legacyStreamAlive && !waiter.got && waiter.err is null)
 			throw internalError("legacy HTTP+SSE stream is not active");
 
-		foreach (_; 0 .. 1200) // up to ~60s at 50ms granularity
+		// Wait (bounded, ~60s ceiling) for the correlated response, woken by the
+		// reader's `notifyLegacy` (or `close()`) rather than polling on a timer.
+		const deadline = MonoTime.currTime + 60_000.msecs;
+		while (!waiter.got && waiter.err is null && !closing)
 		{
-			if (waiter.got || waiter.err !is null || closing)
+			const now = MonoTime.currTime;
+			if (now >= deadline)
 				break;
-			() @trusted { sleep(50.msecs); }();
+			ec = legacyCompletionEvent().waitUninterruptible(deadline - now, ec);
 		}
 		if (waiter.err !is null)
 			throw waiter.err;
@@ -1383,6 +1398,14 @@ final class HttpClientTransport : ClientTransport
 				if (closing)
 					return;
 				auto sock = connectTCP(host, port);
+				// `connectTCP` yielded; a `close()` during that yield saw the socket as
+				// not-yet-open and did nothing. Re-check here, in the same fiber with no
+				// intervening yield, so the freshly connected socket is not leaked.
+				if (closing)
+				{
+					sock.close();
+					return;
+				}
 				legacyStreamSock = sock;
 				legacyStreamSockOpen = true;
 				scope (exit)
@@ -1431,6 +1454,7 @@ final class HttpClientTransport : ClientTransport
 					if (eventType == "endpoint")
 					{
 						legacyEndpoint = resolveEndpointUri(url, data.strip);
+						notifyLegacy(); // wake `startLegacyFallback`
 						return;
 					}
 					// `message` event (or untyped): a JSON-RPC message. A response
@@ -1454,6 +1478,7 @@ final class HttpClientTransport : ClientTransport
 								(*w).result = m.result;
 								(*w).got = true;
 							}
+							notifyLegacy(); // wake the matching `legacyRpc`
 						}
 						else
 							dispatch(m);
@@ -1534,16 +1559,19 @@ final class HttpClientTransport : ClientTransport
 		}();
 
 		// The stream closed: fail every still-outstanding waiter so its `legacyRpc`
-		// poll returns promptly with a clear error instead of timing out.
+		// wait returns promptly with a clear error instead of waiting out the timeout.
 		foreach (id, w; legacyWaiters)
 			if (!w.got && w.err is null)
 				w.err = internalError("legacy HTTP+SSE stream closed before response");
+		notifyLegacy();
 	}
 
 	private static McpException errorFrom(Json error) @safe
 	{
-		const code = ("code" in error) ? error["code"].get!int : ErrorCode.internalError;
-		const m = ("message" in error) ? error["message"].get!string : "server error";
+		const code = ("code" in error && error["code"].type == Json.Type.int_) ? error["code"]
+			.get!int : ErrorCode.internalError;
+		const m = ("message" in error && error["message"].type == Json.Type.string) ? error["message"]
+			.get!string : "server error";
 		return new McpException(code, m, error);
 	}
 }
@@ -1985,4 +2013,61 @@ unittest  // the legacy reader liveness flag starts false before runLegacyStream
 {
 	auto t = new HttpClientTransport("http://host:8080/mcp");
 	assert(!t.legacyStreamAlive);
+}
+
+unittest  // errorFrom maps a well-formed JSON-RPC error object
+{
+	auto err = HttpClientTransport.errorFrom(
+			parseJsonString(`{"code":-32601,"message":"Method not found"}`));
+	assert(err.code == ErrorCode.methodNotFound);
+	assert(err.msg == "Method not found");
+}
+
+unittest  // errorFrom tolerates a non-integer code without throwing
+{
+	// A hostile body with a string `code` must not throw a vibe type-mismatch.
+	auto err = HttpClientTransport.errorFrom(parseJsonString(`{"code":"x","message":"boom"}`));
+	assert(err.code == ErrorCode.internalError);
+	assert(err.msg == "boom");
+}
+
+unittest  // errorFrom tolerates a non-string message without throwing
+{
+	auto err = HttpClientTransport.errorFrom(parseJsonString(`{"code":-32000,"message":42}`));
+	assert(err.code == -32000);
+	assert(err.msg == "server error");
+}
+
+unittest  // errorFrom falls back to defaults when fields are absent
+{
+	auto err = HttpClientTransport.errorFrom(parseJsonString(`{}`));
+	assert(err.code == ErrorCode.internalError);
+	assert(err.msg == "server error");
+}
+
+unittest  // close() force-closes every registered in-flight POST socket slot
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto slot = new ListenSocketSlot;
+	t.postSockets ~= slot;
+	t.close();
+	// closeSocket() set the slot's `closed` flag, so a socket attached afterward
+	// (the connectTCP-race window) is torn down on arrival rather than leaked.
+	assert(slot.closed);
+}
+
+unittest  // close() sets closing(), which the post-connect re-check in the stream readers observes
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	assert(!t.closing);
+	t.close();
+	assert(t.closing);
+}
+
+unittest  // notifyLegacy is a no-op before the completion event is created
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	assert(!t.legacyEventInit);
+	t.notifyLegacy(); // must not touch an uninitialized LocalManualEvent
+	assert(!t.legacyEventInit);
 }
