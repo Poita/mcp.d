@@ -1,5 +1,7 @@
 module mcp.transport.session;
 
+import core.time : Duration, MonoTime, minutes;
+
 import mcp.protocol.errors : McpException, internalError;
 import mcp.server.connection : ConnectionState;
 
@@ -33,8 +35,42 @@ final class SessionManager
 	// observed through another's.
 	private ConnectionState[string] states;
 
+	/// Last-activity timestamp per session, updated on `create` and on every
+	/// `stateFor` that resolves the session. Drives the idle TTL sweep.
+	private MonoTime[string] lastActivity;
+
+	/// Idle time-to-live: a session not touched (created or resolved via
+	/// `stateFor`) within this window is eligible for eviction by the lazy sweep
+	/// run on `create`. `Duration.zero` disables idle eviction.
+	private Duration idleTtl;
+
+	/// Maximum number of concurrently-active sessions. When a `create` would push
+	/// the table past this, the least-recently-active session is evicted first so
+	/// a never-DELETE client cannot grow the table without bound. `0` disables the
+	/// cap (unbounded, the historical behaviour).
+	private size_t maxActive;
+
+	/// Default idle TTL applied when none is configured: a stateful session left
+	/// untouched for this long is swept on the next `create`.
+	enum Duration defaultIdleTtl = 30.minutes;
+
+	/// Default cap on concurrently-active sessions, bounding worst-case
+	/// `ConnectionState` residency for a server whose clients never issue DELETE.
+	enum size_t defaultMaxActive = 10_000;
+
+	/// Construct a session manager with the default idle TTL and active-session
+	/// cap, both bounding `ConnectionState` residency for abandoned sessions.
 	this() @safe
 	{
+		this(defaultIdleTtl, defaultMaxActive);
+	}
+
+	/// Construct with an explicit idle TTL and active-session cap. `idleTtl`
+	/// `Duration.zero` disables the idle sweep; `maxActive` `0` disables the cap.
+	this(Duration idleTtl, size_t maxActive) @safe
+	{
+		this.idleTtl = idleTtl;
+		this.maxActive = maxActive;
 	}
 
 	/// Generate a new cryptographically-secure session id, create and store the
@@ -42,6 +78,11 @@ final class SessionManager
 	/// id. The id is a 256-bit value rendered as lowercase hex, which satisfies the
 	/// spec requirement that the id "MUST only contain visible ASCII characters
 	/// (ranging from 0x21 to 0x7E)".
+	///
+	/// Before minting the new session the idle TTL sweep runs lazily and, if the
+	/// active-session cap would be exceeded, the least-recently-active session is
+	/// evicted — so a client that connects, initializes, and walks away without
+	/// DELETE cannot grow the table without bound.
 	///
 	/// Throws: `McpException` (`internalError`) when the host OS CSPRNG is
 	/// unavailable. This is fail-closed (see `generateSessionId`/`fillSecureRandom`),
@@ -52,8 +93,11 @@ final class SessionManager
 	/// shape matches every other error path.
 	string create() @safe
 	{
+		sweepIdle();
+		enforceCap();
 		const id = generateSessionId();
 		states[id] = new ConnectionState;
+		lastActivity[id] = MonoTime.currTime;
 		return id;
 	}
 
@@ -68,13 +112,17 @@ final class SessionManager
 	/// The `ConnectionState` this manager owns for the active session `id`, or
 	/// `null` when the id is empty, unknown, or already terminated. The request
 	/// path puts this on the request context so dispatch reads/writes only this
-	/// session's per-connection state.
+	/// session's per-connection state. Resolving a session refreshes its
+	/// last-activity timestamp so an in-use session is never swept as idle.
 	ConnectionState stateFor(string id) @safe
 	{
 		if (id.length == 0)
 			return null;
 		if (auto p = id in states)
+		{
+			lastActivity[id] = MonoTime.currTime;
 			return *p;
+		}
 		return null;
 	}
 
@@ -86,8 +134,64 @@ final class SessionManager
 			return false;
 		if ((id in states) is null)
 			return false;
-		states.remove(id);
+		drop(id);
 		return true;
+	}
+
+	/// Number of currently-active sessions.
+	size_t activeCount() @safe
+	{
+		return states.length;
+	}
+
+	/// Remove a session and its bookkeeping. Shared by `terminate` and the
+	/// eviction paths so the two parallel maps never drift apart.
+	private void drop(string id) @safe
+	{
+		states.remove(id);
+		lastActivity.remove(id);
+	}
+
+	/// Evict every session whose last activity is older than `idleTtl`. A no-op
+	/// when the TTL is disabled. Runs lazily on `create`, so on the single-fiber
+	/// vibe.d loop it needs no timer or locking: an abandoned session is reclaimed
+	/// the next time any client initializes.
+	private void sweepIdle() @safe
+	{
+		if (idleTtl <= Duration.zero || states.length == 0)
+			return;
+		const now = MonoTime.currTime;
+		string[] expired;
+		foreach (id, ts; lastActivity)
+			if (now - ts >= idleTtl)
+				expired ~= id;
+		foreach (id; expired)
+			drop(id);
+	}
+
+	/// Evict least-recently-active sessions until creating one more stays within
+	/// `maxActive`. A no-op when the cap is disabled. This guarantees a never-DELETE
+	/// client cannot grow the table past the cap regardless of the idle sweep.
+	private void enforceCap() @safe
+	{
+		if (maxActive == 0)
+			return;
+		while (states.length >= maxActive)
+		{
+			string oldest;
+			MonoTime oldestTs;
+			bool found;
+			foreach (id, ts; lastActivity)
+				if (!found || ts < oldestTs)
+				{
+					oldest = id;
+					oldestTs = ts;
+					found = true;
+				}
+			if (!found)
+				break;
+			drop(oldest);
+		}
 	}
 }
 
@@ -99,6 +203,75 @@ unittest  // a created session owns a non-null ConnectionState
 	assert(cs !is null);
 	assert(mgr.stateFor("unknown") is null);
 	assert(mgr.stateFor("") is null);
+}
+
+unittest  // create() past the active-session cap evicts the oldest rather than growing unbounded
+{
+	// A never-DELETE client looping initialize cannot grow the table without
+	// bound: once the cap is reached, the least-recently-active session is
+	// evicted so activeCount() stays at the cap.
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	auto mgr = new SessionManager(Duration.zero, 3);
+	const a = mgr.create();
+	Thread.sleep(2.msecs);
+	const b = mgr.create();
+	Thread.sleep(2.msecs);
+	const c = mgr.create();
+	assert(mgr.activeCount() == 3);
+	const d = mgr.create();
+	assert(mgr.activeCount() == 3, "cap must bound the table");
+	assert(!mgr.isActive(a), "least-recently-active session must be evicted past the cap");
+	assert(mgr.isActive(b) && mgr.isActive(c) && mgr.isActive(d));
+}
+
+unittest  // resolving a session via stateFor refreshes its activity so it is not the eviction victim
+{
+	// stateFor updates last-activity, so an in-use session survives a cap-driven
+	// eviction in favour of a genuinely older idle one.
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	auto mgr = new SessionManager(Duration.zero, 2);
+	const a = mgr.create();
+	Thread.sleep(2.msecs);
+	const b = mgr.create();
+	Thread.sleep(2.msecs);
+	// Touch a so b becomes the least-recently-active.
+	assert(mgr.stateFor(a) !is null);
+	const c = mgr.create();
+	assert(mgr.isActive(a), "recently-touched session must survive eviction");
+	assert(!mgr.isActive(b), "least-recently-active session must be evicted");
+	assert(mgr.isActive(c));
+}
+
+unittest  // an idle session past the TTL is swept on the next create()
+{
+	// A short idle TTL plus a real sleep longer than it makes the first session
+	// idle; the lazy sweep on the next create() then reclaims it. A zero cap keeps
+	// the cap path out of the assertion so only the idle sweep is exercised.
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	auto mgr = new SessionManager(5.msecs, 0);
+	const stale = mgr.create();
+	assert(mgr.isActive(stale));
+	Thread.sleep(20.msecs);
+	const fresh = mgr.create();
+	assert(!mgr.isActive(stale), "an idle session past the TTL must be swept");
+	assert(mgr.isActive(fresh));
+}
+
+unittest  // a disabled idle TTL and disabled cap leave sessions resident (historical behaviour)
+{
+	auto mgr = new SessionManager(Duration.zero, 0);
+	string[] ids;
+	foreach (_; 0 .. 5)
+		ids ~= mgr.create();
+	assert(mgr.activeCount() == 5);
+	foreach (id; ids)
+		assert(mgr.isActive(id));
 }
 
 unittest  // two sessions on one manager get INDEPENDENT ConnectionStates (no cross-talk)
