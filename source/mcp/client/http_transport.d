@@ -144,8 +144,13 @@ final class HttpClientTransport : ClientTransport
 	// Live sockets for the spawned server / legacy background streams, closed by
 	// `close()` so a parked `conn.read` unblocks. Guarded for @safe access only on
 	// the owning event loop.
-	private TCPConnection serverStreamSock;
-	private bool serverStreamSockOpen;
+	// Slots for the sockets of the standalone server->client SSE stream. Each
+	// connect attempt in `runServerStream` registers a slot before connecting and
+	// removes it on scope exit; `close()` force-closes every registered slot so a
+	// reader parked on `conn.read` unblocks immediately. Tracking the live sockets
+	// in a slot array (rather than a single shared field) ensures `close()` tears
+	// down every server-stream socket, not only the last one connected.
+	private ListenSocketSlot[] serverStreamSlots;
 	private TCPConnection legacyStreamSock;
 	private bool legacyStreamSockOpen;
 	// Slots for the sockets of in-flight `postAndAwaitRaw` POSTs whose response is
@@ -159,6 +164,11 @@ final class HttpClientTransport : ClientTransport
 	// after the reader has exited fails its waiter at once instead of polling for
 	// the full timeout, since no response can ever arrive on a dead stream.
 	private bool legacyStreamAlive;
+	// True while the standalone server->client SSE reader task is running. Makes
+	// `startServerStream()` idempotent: a second call while a reader is live is a
+	// no-op, so a second standalone stream is never spawned and the live socket
+	// slots are never orphaned.
+	private bool serverStreamAlive;
 	// Event-driven completion for the two legacy-path waits (`startLegacyFallback`
 	// endpoint discovery and `legacyRpc` response arrival), replacing fixed 50ms
 	// busy-poll loops. The background `runLegacyStream` reader emits it after
@@ -213,11 +223,10 @@ final class HttpClientTransport : ClientTransport
 
 			atomicStore(closeRequested, true);
 		}();
-		if (serverStreamSockOpen)
-		{
-			serverStreamSockOpen = false;
-			() @trusted { serverStreamSock.close(); }();
-		}
+		// Force-close every standalone server->client SSE socket so a reader parked
+		// on `conn.read` unblocks at once, rather than only the most recent socket.
+		foreach (slot; serverStreamSlots)
+			slot.closeSocket();
 		if (legacyStreamSockOpen)
 		{
 			legacyStreamSockOpen = false;
@@ -902,6 +911,12 @@ final class HttpClientTransport : ClientTransport
 	{
 		import vibe.core.core : runTask;
 
+		// Idempotent: a reader task is already live, so a second start would spawn a
+		// duplicate standalone stream and orphan the first reader. Set the flag here,
+		// before `runTask` yields, so a re-entrant call observes it.
+		if (serverStreamAlive)
+			return;
+		serverStreamAlive = true;
 		runTask(() nothrow{
 			try
 				runServerStream();
@@ -921,6 +936,11 @@ final class HttpClientTransport : ClientTransport
 		import core.time : msecs;
 		import vibe.core.core : sleep;
 
+		// Clear the liveness flag when the reader task exits, so a later
+		// `startServerStream()` can re-open the stream instead of being suppressed.
+		scope (exit)
+			serverStreamAlive = false;
+
 		// Parse scheme://host[:port]/path.
 		const ep = parseHttpEndpoint(url);
 
@@ -938,26 +958,26 @@ final class HttpClientTransport : ClientTransport
 				break;
 			cursor.retryMs = 0;
 			bool sawData;
+			// Register a slot so `close()` can force-close this connection's socket
+			// even while the reader is parked on a long-lived SSE read.
+			auto slot = new ListenSocketSlot;
+			serverStreamSlots ~= slot;
+			scope (exit)
+			{
+				import std.algorithm : remove;
+
+				slot.closeSocket();
+				serverStreamSlots = serverStreamSlots.remove!(s => s is slot);
+			}
 			() @trusted {
 				try
 				{
 					auto sock = connectTCP(ep.host, ep.port);
-					// `connectTCP` yielded; if a `close()` landed during that yield it
-					// saw the socket as not-yet-open and did nothing. Re-check here, in
-					// the same fiber with no intervening yield, so the freshly connected
-					// socket is torn down rather than leaked.
+					// `attach` closes `sock` immediately if a `close()` already ran during
+					// the `connectTCP` yield, so the socket is never leaked or left parked.
+					slot.attach(sock);
 					if (closing)
-					{
-						sock.close();
 						return;
-					}
-					serverStreamSock = sock;
-					serverStreamSockOpen = true;
-					scope (exit)
-					{
-						serverStreamSockOpen = false;
-						sock.close();
-					}
 					// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 					auto conn = openClientStream(sock, ep.tls, ep.host);
 
@@ -1757,6 +1777,38 @@ unittest  // close() force-closes every registered in-flight POST socket slot
 	// closeSocket() set the slot's `closed` flag, so a socket attached afterward
 	// (the connectTCP-race window) is torn down on arrival rather than leaked.
 	assert(slot.closed);
+}
+
+unittest  // the server-stream reader liveness flag starts false before runServerStream runs
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	assert(!t.serverStreamAlive);
+}
+
+unittest  // startServerStream() is idempotent: a second call while a reader is live is a no-op
+{
+	// Regression: a second start must not spawn a duplicate standalone stream. The
+	// liveness flag is set synchronously before the task is spawned, so simulating
+	// a live reader makes a subsequent start observe it and return early.
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	t.serverStreamAlive = true;
+	const before = t.serverStreamSlots.length;
+	t.startServerStream();
+	assert(t.serverStreamSlots.length == before);
+}
+
+unittest  // close() force-closes every registered server-stream socket slot
+{
+	// Regression: a parked server-stream reader must be torn down by close(). Each
+	// connection registers a slot; close() must force-close every one, not only the
+	// most recent socket.
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto slotA = new ListenSocketSlot;
+	auto slotB = new ListenSocketSlot;
+	t.serverStreamSlots ~= slotA;
+	t.serverStreamSlots ~= slotB;
+	t.close();
+	assert(slotA.closed && slotB.closed);
 }
 
 unittest  // close() sets closing(), which the post-connect re-check in the stream readers observes
