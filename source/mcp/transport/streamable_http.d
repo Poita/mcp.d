@@ -1039,8 +1039,14 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 	{
 	case MessageKind.response:
 	case MessageKind.errorResponse:
-		// A client's reply to a server->client request: route it to the waiter.
-		coord.resolve(msg.id, msg.result, msg.error);
+		// A client's reply to a server->client request: route it to the waiter,
+		// but only when this POST's session owns that pending request. Passing the
+		// connection token lets the coordinator reject a reply whose session
+		// differs from the one the request was issued to, so a session cannot
+		// resolve or hijack another session's pending server->client request. For
+		// the stateless / shared path (empty token) this matches as before.
+		coord.resolve(msg.id,
+				msg.result, msg.error, connToken);
 		res.statusCode = HTTPStatus.accepted;
 		res.writeBody("", "text/plain");
 		return;
