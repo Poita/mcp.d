@@ -911,6 +911,10 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// `notifications/resources/updated` delivery on this stream gates on THIS
 	// session's `resources/subscribe` set rather than the shared fallback state.
 	ConnectionState getConn;
+	// The owning session's `Mcp-Session-Id`, used to scope Last-Event-ID resume to
+	// this session so one client cannot replay another session's buffered stream
+	// history by presenting its event id (cross-session disclosure).
+	string ownerToken;
 	if (sessions !is null)
 	{
 		const sid = req.headers.get(SessionHeader, "");
@@ -924,6 +928,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 			return;
 		}
 		getConn = sessions.stateFor(sid);
+		ownerToken = sid;
 	}
 
 	// Open a long-lived SSE stream wired to the server-push channel, so the
@@ -946,7 +951,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	const listenerId = push.addListener((string frame) @safe {
 		writeFrame(frame);
 	}, "", SubscriptionFilter.init, lastEventId, getConn !is null
-			? server.sessionPushEligibility(getConn) : null);
+			? server.sessionPushEligibility(getConn) : null, ownerToken);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
