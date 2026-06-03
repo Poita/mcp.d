@@ -195,12 +195,6 @@ final class HttpClientTransport : ClientTransport
 		bearerToken = token;
 	}
 
-	/// Whether this transport is in the legacy 2024-11-05 HTTP+SSE mode.
-	bool inLegacyMode() const @safe nothrow @nogc
-	{
-		return legacyMode;
-	}
-
 	/// Stop the transport: signal the background stream readers
 	/// (server->client, legacy GET) to stop between reads and force-close their
 	/// held sockets so any blocked `conn.read` unblocks immediately, terminating
@@ -399,14 +393,10 @@ final class HttpClientTransport : ClientTransport
 	{
 		import vibe.core.net : connectTCP;
 		import vibe.stream.operations : readLine;
-		import vibe.core.stream : IOMode;
 		import std.string : indexOf, startsWith, strip, toLower;
-		import std.conv : to, parse;
+		import std.conv : to;
 
 		const ep = parseHttpEndpoint(url);
-		const host = ep.host;
-		const port = ep.port;
-		const path = ep.path;
 
 		const payload = message.toString();
 		auto hdrs = requestHeaders(message);
@@ -426,29 +416,18 @@ final class HttpClientTransport : ClientTransport
 		() @trusted {
 			try
 			{
-				auto sock = connectTCP(host, port);
+				auto sock = connectTCP(ep.host, ep.port);
 				// `attach` closes `sock` immediately if a `close()` already ran during
 				// the `connectTCP` yield, so the socket is never leaked or left parked.
 				slot.attach(sock);
 				if (closing)
 					return;
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
-				auto conn = openClientStream(sock, ep.tls, host);
+				auto conn = openClientStream(sock, ep.tls, ep.host);
 
-				string req = "POST " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
-					~ "\r\nAccept: application/json, text/event-stream\r\n"
-					~ "Content-Type: application/json\r\nConnection: close\r\n";
-				if (bearerToken.length)
-					req ~= "Authorization: Bearer " ~ bearerToken ~ "\r\n";
-				if (sessionId.length)
-					req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
-				foreach (k, v; hdrs)
-					if (!isHeaderValueUnsafe(v))
-						req ~= k ~ ": " ~ v ~ "\r\n";
-				if (pendingLastEventId.length)
-					req ~= "Last-Event-ID: " ~ pendingLastEventId ~ "\r\n";
-				req ~= "Content-Length: " ~ payload.length.to!string ~ "\r\n\r\n";
-				req ~= payload;
+				const req = buildHttpRequest("POST", ep.path, ep.host,
+						"application/json, text/event-stream",
+						"close", true, hdrs, pendingLastEventId, payload);
 				conn.write(cast(const(ubyte)[]) req);
 
 				// Status line + response headers.
@@ -494,88 +473,14 @@ final class HttpClientTransport : ClientTransport
 					return;
 				}
 
-				// SSE body: decode chunked transfer-encoding (or raw to EOF),
-				// feeding an accumulator parser that dispatches each COMPLETE event
+				// SSE body: decode the stream, dispatching each COMPLETE event
 				// immediately. This is what lets a mid-stream server->client request
-				// be answered while we keep reading for the final response.
-				string acc, data;
-				void parseSse()
-				{
-					for (;;)
-					{
-						const nl = acc.indexOf('\n');
-						if (nl < 0)
-							break;
-						auto line = acc[0 .. nl];
-						acc = acc[nl + 1 .. $];
-						if (line.length && line[$ - 1] == '\r')
-							line = line[0 .. $ - 1];
-						if (line.length == 0)
-						{
-							if (data.length)
-							{
-								dispatchSse(data, expectId, result, got, err);
-								data = null;
-							}
-						}
-						else if (line.startsWith("data:"))
-						{
-							auto d = line["data:".length .. $];
-							if (d.startsWith(" "))
-								d = d[1 .. $];
-							data ~= (data.length ? "\n" : "") ~ d;
-						}
-						else if (line.startsWith("id:"))
-							sseLastEventId = line["id:".length .. $].strip;
-						else if (line.startsWith("retry:"))
-						{
-							try
-								sseRetryMs = line["retry:".length .. $].strip.to!long;
-							catch (Exception)
-							{
-							}
-						}
-					}
-				}
-
-				for (;;)
-				{
-					if (got || err !is null || closing)
-						break;
-					if (chunked)
-					{
-						auto sizeLine = (cast(string) readLine(conn).idup).strip;
-						if (sizeLine.length == 0)
-							continue;
-						uint sz;
-						try
-						{
-							auto sl = sizeLine;
-							sz = parse!uint(sl, 16);
-						}
-						catch (Exception)
-							break;
-						if (sz == 0)
-							break; // last chunk
-						auto chunk = new ubyte[sz];
-						conn.read(chunk, IOMode.all);
-						acc ~= cast(string) chunk.idup;
-						parseSse();
-					}
-					else
-					{
-						ubyte[4096] buf;
-						size_t n;
-						try
-							n = conn.read(buf, IOMode.once);
-						catch (Exception)
-							break;
-						if (n == 0)
-							break;
-						acc ~= cast(string) buf[0 .. n].idup;
-						parseSse();
-					}
-				}
+				// be answered while we keep reading for the final response. Stop once
+				// the awaited response/error arrives or the transport is closing.
+				readSseBody(conn, chunked, () @safe => got || err !is null
+						|| closing, (string eventType, string data) @safe {
+					dispatchSse(data, expectId, result, got, err);
+				});
 			}
 			catch (Exception e)
 			{
@@ -679,15 +584,8 @@ final class HttpClientTransport : ClientTransport
 			ref bool got, ref McpException err) @safe
 	{
 		import vibe.core.net : connectTCP;
-		import vibe.stream.operations : readLine;
-		import vibe.core.stream : IOMode;
-		import std.string : indexOf, startsWith, strip, toLower;
-		import std.conv : to, parse;
 
 		const ep = parseHttpEndpoint(url);
-		const host = ep.host;
-		const port = ep.port;
-		const path = ep.path;
 
 		// Protocol-version header for the GET stream (set after initialize).
 		auto verHeaders = requestHeaders(Json.undefined);
@@ -695,126 +593,44 @@ final class HttpClientTransport : ClientTransport
 		() @trusted {
 			try
 			{
-				auto sock = connectTCP(host, port);
+				auto sock = connectTCP(ep.host, ep.port);
 				scope (exit)
 					sock.close();
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
-				auto conn = openClientStream(sock, ep.tls, host);
-				string req = "GET " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
-					~ "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n";
-				if (sessionId.length)
-					req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
-				foreach (k, v; verHeaders)
-					if (!isHeaderValueUnsafe(v))
-						req ~= k ~ ": " ~ v ~ "\r\n";
-				if (lastEventId.length)
-					req ~= "Last-Event-ID: " ~ lastEventId ~ "\r\n";
-				req ~= "\r\n";
+				auto conn = openClientStream(sock, ep.tls, ep.host);
+				const req = buildHttpRequest("GET", ep.path, ep.host, "text/event-stream",
+						"keep-alive", false, verHeaders, lastEventId, null);
 				conn.write(cast(const(ubyte)[]) req);
 
-				auto statusLine = cast(string) readLine(conn).idup;
-				if (statusLine.indexOf(" 200") < 0)
-					return;
 				bool chunked;
-				for (;;)
-				{
-					auto h = cast(string) readLine(conn).idup;
-					if (h.length && h[$ - 1] == '\r')
-						h = h[0 .. $ - 1];
-					if (h.toLower.indexOf("transfer-encoding:") == 0
-							&& h.toLower.indexOf("chunked") >= 0)
-						chunked = true;
-					if (h.length == 0)
-						break;
-				}
+				if (!readSseResponseHead(conn, chunked))
+					return;
 
-				string acc, data;
 				bool done;
-				void parseSse()
-				{
-					for (;;)
+				readSseBody(conn, chunked, () @safe => done, (string eventType, string data) @safe {
+					try
 					{
-						const nl = acc.indexOf('\n');
-						if (nl < 0)
-							break;
-						auto line = acc[0 .. nl];
-						acc = acc[nl + 1 .. $];
-						if (line.length && line[$ - 1] == '\r')
-							line = line[0 .. $ - 1];
-						if (line.length == 0)
+						auto m = Message(parseJsonString(data));
+						if ((m.kind == MessageKind.response
+							|| m.kind == MessageKind.errorResponse)
+							&& m.id.type == Json.Type.int_ && m.id.get!long == expectId)
 						{
-							if (data.length)
+							if (m.kind == MessageKind.errorResponse)
+								err = errorFrom(m.error);
+							else
 							{
-								try
-								{
-									auto m = Message(parseJsonString(data));
-									if ((m.kind == MessageKind.response
-											|| m.kind == MessageKind.errorResponse)
-											&& m.id.type == Json.Type.int_
-											&& m.id.get!long == expectId)
-									{
-										if (m.kind == MessageKind.errorResponse)
-											err = errorFrom(m.error);
-										else
-										{
-											result = m.result;
-											got = true;
-										}
-										done = true;
-									}
-									else
-										dispatch(m);
-								}
-								catch (Exception)
-								{
-								}
-								data = null;
+								result = m.result;
+								got = true;
 							}
+							done = true;
 						}
-						else if (line.startsWith("data:"))
-						{
-							auto d = line["data:".length .. $];
-							if (d.startsWith(" "))
-								d = d[1 .. $];
-							data ~= (data.length ? "\n" : "") ~ d;
-						}
+						else
+							dispatch(m);
 					}
-				}
-
-				for (;;)
-				{
-					if (done)
-						break;
-					if (chunked)
+					catch (Exception)
 					{
-						auto sizeLine = (cast(string) readLine(conn).idup).strip;
-						if (sizeLine.length == 0)
-							continue;
-						uint sz;
-						try
-							sz = parse!uint(sizeLine, 16);
-						catch (Exception)
-							break;
-						if (sz == 0)
-							break;
-						auto chunk = new ubyte[sz];
-						conn.read(chunk, IOMode.all);
-						acc ~= cast(string) chunk.idup;
-						readLine(conn);
-						parseSse();
 					}
-					else
-					{
-						const avail = conn.leastSize;
-						if (avail == 0)
-							break;
-						const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
-						auto buf = new ubyte[toRead];
-						conn.read(buf, IOMode.once);
-						acc ~= cast(string) buf.idup;
-						parseSse();
-					}
-				}
+				});
 			}
 			catch (Exception)
 			{
@@ -898,6 +714,175 @@ final class HttpClientTransport : ClientTransport
 			inbound(msg);
 	}
 
+	// --- shared raw-HTTP/SSE plumbing -----------------------------------------
+
+	/// Build a raw HTTP/1.1 request for one of the SSE stream methods, collapsing
+	/// the five hand-written header builders into a single, consistent policy.
+	/// `accept` is the `Accept` header value, `connection` the `Connection` value.
+	/// When `includeAuth` is set and a bearer token is present, an
+	/// `Authorization: Bearer` header is emitted; the `Mcp-Session-Id` header
+	/// follows whenever a session id is known. `extraHeaders` (the protocol-derived
+	/// version/draft headers) are appended, skipping any unsafe value. A non-empty
+	/// `lastEventId` adds `Last-Event-ID` for SSE resumption, and a non-empty `body`
+	/// adds `Content-Length` and the payload. The terminating blank line is always
+	/// written.
+	private string buildHttpRequest(string verb, string path, string host,
+			string accept, string connection,
+			bool includeAuth, string[string] extraHeaders, string lastEventId, string body) @safe
+	{
+		import std.conv : to;
+
+		string req = verb ~ " " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
+			~ "\r\nAccept: " ~ accept ~ "\r\n";
+		if (body.length)
+			req ~= "Content-Type: application/json\r\n";
+		req ~= "Connection: " ~ connection ~ "\r\n";
+		if (includeAuth && bearerToken.length)
+			req ~= "Authorization: Bearer " ~ bearerToken ~ "\r\n";
+		if (sessionId.length)
+			req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
+		foreach (k, v; extraHeaders)
+			if (!isHeaderValueUnsafe(v))
+				req ~= k ~ ": " ~ v ~ "\r\n";
+		if (lastEventId.length)
+			req ~= "Last-Event-ID: " ~ lastEventId ~ "\r\n";
+		if (body.length)
+			req ~= "Content-Length: " ~ body.length.to!string ~ "\r\n";
+		req ~= "\r\n";
+		if (body.length)
+			req ~= body;
+		return req;
+	}
+
+	/// Read the status line and header block of an SSE GET/POST response from
+	/// `conn`, the single status gate replacing the four hand-written
+	/// `statusLine.indexOf(" 200") < 0` + chunked-detection loops. Returns true iff
+	/// the status is 200, and sets `chunked` when the response uses chunked
+	/// transfer-encoding. Must run inside a `@trusted` block (raw socket I/O).
+	private static bool readSseResponseHead(Conn)(Conn conn, out bool chunked) @trusted
+	{
+		import vibe.stream.operations : readLine;
+		import std.string : indexOf, toLower;
+
+		auto statusLine = cast(string) readLine(conn).idup;
+		const ok = statusLine.indexOf(" 200") >= 0;
+		foreach (h; readHeaderLines(conn))
+		{
+			const lower = h.toLower;
+			if (lower.indexOf("transfer-encoding:") == 0 && lower.indexOf("chunked") >= 0)
+				chunked = true;
+		}
+		return ok;
+	}
+
+	/// Read and decode an SSE response body from `conn`, the single tested state
+	/// machine that replaces the five hand-duplicated `parseSse()` closures and
+	/// chunked/raw read loops.
+	///
+	/// Frames the body (chunked transfer-encoding when `chunked`, else raw reads to
+	/// EOF via `leastSize`) and runs the SSE line tokenizer over it, accumulating
+	/// `data:` (joined with `\n`, one leading space stripped) and `event:` and
+	/// flushing a complete event to `onEvent(eventType, data)` on each blank line.
+	/// `id:`/`retry:` fields are handled uniformly here — updating the transport's
+	/// `sseLastEventId`/`sseRetryMs` resumption fields — so every caller gets
+	/// `event:`/`id:`/`retry:` support whether or not it consumes them. The loop
+	/// stops between reads (and after each flushed event) once `shouldStop()`
+	/// returns true. Must run inside a `@trusted` block (raw socket I/O).
+	private void readSseBody(Conn)(Conn conn, bool chunked, scope bool delegate() @safe shouldStop,
+			scope void delegate(string eventType, string data) @safe onEvent) @trusted
+	{
+		import vibe.stream.operations : readLine;
+		import vibe.core.stream : IOMode;
+		import std.string : indexOf, startsWith, strip;
+		import std.conv : to, parse;
+
+		string acc, data, eventType;
+		void tokenize()
+		{
+			for (;;)
+			{
+				const nl = acc.indexOf('\n');
+				if (nl < 0)
+					break;
+				auto line = acc[0 .. nl];
+				acc = acc[nl + 1 .. $];
+				if (line.length && line[$ - 1] == '\r')
+					line = line[0 .. $ - 1];
+				if (line.length == 0)
+				{
+					if (data.length)
+						onEvent(eventType, data);
+					data = null;
+					eventType = null;
+				}
+				else if (line.startsWith("event:"))
+				{
+					auto v = line["event:".length .. $];
+					if (v.startsWith(" "))
+						v = v[1 .. $];
+					eventType = v;
+				}
+				else if (line.startsWith("data:"))
+				{
+					auto d = line["data:".length .. $];
+					if (d.startsWith(" "))
+						d = d[1 .. $];
+					data ~= (data.length ? "\n" : "") ~ d;
+				}
+				else if (line.startsWith("id:"))
+					sseLastEventId = line["id:".length .. $].strip;
+				else if (line.startsWith("retry:"))
+				{
+					try
+						sseRetryMs = line["retry:".length .. $].strip.to!long;
+					catch (Exception)
+					{
+					}
+				}
+				if (shouldStop())
+					break;
+			}
+		}
+
+		for (;;)
+		{
+			if (shouldStop())
+				break;
+			if (chunked)
+			{
+				auto sizeLine = (cast(string) readLine(conn).idup).strip;
+				if (sizeLine.length == 0)
+					continue;
+				uint sz;
+				try
+				{
+					auto sl = sizeLine;
+					sz = parse!uint(sl, 16);
+				}
+				catch (Exception)
+					break;
+				if (sz == 0)
+					break; // last chunk
+				auto chunk = new ubyte[sz];
+				conn.read(chunk, IOMode.all);
+				acc ~= cast(string) chunk.idup;
+				readLine(conn); // trailing CRLF after the chunk data
+				tokenize();
+			}
+			else
+			{
+				const avail = conn.leastSize;
+				if (avail == 0)
+					break;
+				const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
+				auto buf = new ubyte[toRead];
+				conn.read(buf, IOMode.once);
+				acc ~= cast(string) buf.idup;
+				tokenize();
+			}
+		}
+	}
+
 	// --- standalone server->client stream ------------------------------------
 
 	/// Open the standalone server->client SSE stream (`GET /mcp`) in a background
@@ -924,32 +909,28 @@ final class HttpClientTransport : ClientTransport
 	private void runServerStream() @safe
 	{
 		import vibe.core.net : connectTCP;
-		import vibe.stream.operations : readLine;
-		import std.string : indexOf, startsWith, strip;
-		import std.conv : to;
 		import core.time : msecs;
 		import vibe.core.core : sleep;
 
 		// Parse scheme://host[:port]/path.
 		const ep = parseHttpEndpoint(url);
-		const host = ep.host;
-		const port = ep.port;
-		const path = ep.path;
 
 		// Protocol-version header for the GET stream (set after initialize).
 		auto verHeaders = requestHeaders(Json.undefined);
 
-		string lastEventId;
-		long retryMs = 0;
+		// `id:`/`retry:` resumption state is tracked in `sseLastEventId`/`sseRetryMs`
+		// by the shared decoder; the reconnect loop reads them between attempts.
+		sseLastEventId = null;
 		foreach (attempt; 0 .. 2)
 		{
 			if (closing)
 				break;
+			sseRetryMs = 0;
 			bool sawData;
 			() @trusted {
 				try
 				{
-					auto sock = connectTCP(host, port);
+					auto sock = connectTCP(ep.host, ep.port);
 					// `connectTCP` yielded; if a `close()` landed during that yield it
 					// saw the socket as not-yet-open and did nothing. Re-check here, in
 					// the same fiber with no intervening yield, so the freshly connected
@@ -967,128 +948,25 @@ final class HttpClientTransport : ClientTransport
 						sock.close();
 					}
 					// Wrap in TLS for https/wss; plaintext is returned unwrapped.
-					auto conn = openClientStream(sock, ep.tls, host);
+					auto conn = openClientStream(sock, ep.tls, ep.host);
 
-					string req = "GET " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
-						~ "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n";
-					if (sessionId.length)
-						req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
-					foreach (k, v; verHeaders)
-						if (!isHeaderValueUnsafe(v))
-							req ~= k ~ ": " ~ v ~ "\r\n";
-					if (lastEventId.length)
-						req ~= "Last-Event-ID: " ~ lastEventId ~ "\r\n";
-					req ~= "\r\n";
+					const req = buildHttpRequest("GET", ep.path, ep.host, "text/event-stream",
+							"keep-alive", false, verHeaders, sseLastEventId, null);
 					conn.write(cast(const(ubyte)[]) req);
 
-					import vibe.core.stream : IOMode;
-					import std.conv : parse;
-
-					// Status line + headers (note chunked transfer-encoding).
-					auto statusLine = cast(string) readLine(conn).idup;
-					if (statusLine.indexOf(" 200") < 0)
-						return;
 					bool chunked;
-					for (;;)
-					{
-						auto h = cast(string) readLine(conn).idup;
-						if (h.length && h[$ - 1] == '\r')
-							h = h[0 .. $ - 1];
-						import std.string : toLower;
+					if (!readSseResponseHead(conn, chunked))
+						return;
 
-						if (h.toLower.indexOf("transfer-encoding:") == 0
-								&& h.toLower.indexOf("chunked") >= 0)
-							chunked = true;
-						if (h.length == 0)
-							break;
-					}
-
-					// SSE parser shared across chunk boundaries.
-					string acc, data;
-					void parseSse()
-					{
-						for (;;)
+					readSseBody(conn, chunked, () @safe => closing,
+							(string eventType, string data) @safe {
+						sawData = true;
+						try
+							dispatch(Message(parseJsonString(data)));
+						catch (Exception)
 						{
-							const nl = acc.indexOf('\n');
-							if (nl < 0)
-								break;
-							auto line = acc[0 .. nl];
-							acc = acc[nl + 1 .. $];
-							if (line.length && line[$ - 1] == '\r')
-								line = line[0 .. $ - 1];
-							if (line.length == 0)
-							{
-								if (data.length)
-								{
-									sawData = true;
-									try
-										dispatch(Message(parseJsonString(data)));
-									catch (Exception)
-									{
-									}
-									data = null;
-								}
-							}
-							else if (line.startsWith("data:"))
-							{
-								auto d = line["data:".length .. $];
-								if (d.startsWith(" "))
-									d = d[1 .. $];
-								data ~= (data.length ? "\n" : "") ~ d;
-							}
-							else if (line.startsWith("id:"))
-								lastEventId = line["id:".length .. $].strip;
-							else if (line.startsWith("retry:"))
-							{
-								try
-									retryMs = line["retry:".length .. $].strip.to!long;
-								catch (Exception)
-								{
-								}
-							}
 						}
-					}
-
-					// Body loop: decode chunked transfer-encoding (each chunk is a
-					// hex size line, that many bytes, then CRLF), feeding the SSE
-					// parser; or read raw to EOF when not chunked.
-					for (;;)
-					{
-						if (closing)
-							break;
-						if (chunked)
-						{
-							auto sizeLine = (cast(string) readLine(conn).idup).strip;
-							if (sizeLine.length == 0)
-								continue;
-							uint sz;
-							try
-							{
-								auto sl = sizeLine;
-								sz = parse!uint(sl, 16);
-							}
-							catch (Exception)
-								break;
-							if (sz == 0)
-								break; // last chunk
-							auto chunk = new ubyte[sz];
-							conn.read(chunk, IOMode.all);
-							acc ~= cast(string) chunk.idup;
-							readLine(conn); // trailing CRLF after the chunk data
-							parseSse();
-						}
-						else
-						{
-							const avail = conn.leastSize;
-							if (avail == 0)
-								break;
-							const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
-							auto buf = new ubyte[toRead];
-							conn.read(buf, IOMode.once);
-							acc ~= cast(string) buf.idup;
-							parseSse();
-						}
-					}
+					});
 				}
 				catch (Exception)
 				{
@@ -1098,8 +976,8 @@ final class HttpClientTransport : ClientTransport
 			if (closing)
 				break;
 			// Reconnect honoring the server-provided retry delay (SSE `retry:`).
-			if (retryMs > 0)
-				sleep(retryMs.msecs);
+			if (sseRetryMs > 0)
+				sleep(sseRetryMs.msecs);
 			else if (!sawData)
 				break; // stream unavailable and no retry hint: stop
 		}
@@ -1146,25 +1024,20 @@ final class HttpClientTransport : ClientTransport
 	private void runListenStream(Json message, shared(bool)* cancelled, ListenSocketSlot slot) @safe
 	{
 		import vibe.core.net : connectTCP;
-		import vibe.stream.operations : readLine;
-		import vibe.core.stream : IOMode;
-		import std.string : indexOf, startsWith, strip, toLower;
-		import std.conv : to, parse;
 
 		const ep = parseHttpEndpoint(url);
-		const host = ep.host;
-		const port = ep.port;
-		const path = ep.path;
 
 		// Protocol-derived headers (version + draft method) for this POST.
 		auto reqHeaders = requestHeaders(message);
-
 		const 
 		body = message.toString();
+
+		auto isCancelled = () @safe => () @trusted { return *cancelled; }();
+
 		() @trusted {
 			if (*cancelled)
 				return;
-			auto sock = connectTCP(host, port);
+			auto sock = connectTCP(ep.host, ep.port);
 			slot.attach(sock);
 			scope (exit)
 				slot.closeSocket();
@@ -1172,111 +1045,23 @@ final class HttpClientTransport : ClientTransport
 			if (*cancelled)
 				return;
 			// Wrap in TLS for https/wss; plaintext is returned unwrapped.
-			auto conn = openClientStream(sock, ep.tls, host);
+			auto conn = openClientStream(sock, ep.tls, ep.host);
 
-			string req = "POST " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
-				~ "\r\nAccept: text/event-stream\r\nContent-Type: application/json\r\n"
-				~ "Connection: keep-alive\r\n";
-			if (bearerToken.length)
-				req ~= "Authorization: Bearer " ~ bearerToken ~ "\r\n";
-			if (sessionId.length)
-				req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
-			foreach (k, v; reqHeaders)
-				if (!isHeaderValueUnsafe(v))
-					req ~= k ~ ": " ~ v ~ "\r\n";
-			import std.conv : to;
-
-			req ~= "Content-Length: " ~ body.length.to!string ~ "\r\n\r\n";
-			req ~= body;
+			const req = buildHttpRequest("POST", ep.path, ep.host,
+					"text/event-stream", "keep-alive", true, reqHeaders, null, body);
 			conn.write(cast(const(ubyte)[]) req);
 
-			auto statusLine = cast(string) readLine(conn).idup;
-			if (statusLine.indexOf(" 200") < 0)
-				return;
 			bool chunked;
-			for (;;)
-			{
-				auto h = cast(string) readLine(conn).idup;
-				if (h.length && h[$ - 1] == '\r')
-					h = h[0 .. $ - 1];
-				if (h.toLower.indexOf("transfer-encoding:") == 0 && h.toLower.indexOf(
-						"chunked") >= 0)
-					chunked = true;
-				if (h.length == 0)
-					break;
-			}
+			if (!readSseResponseHead(conn, chunked))
+				return;
 
-			string acc, data;
-			void parseSse()
-			{
-				for (;;)
+			readSseBody(conn, chunked, isCancelled, (string eventType, string data) @safe {
+				try
+					dispatch(Message(parseJsonString(data)));
+				catch (Exception)
 				{
-					const nl = acc.indexOf('\n');
-					if (nl < 0)
-						break;
-					auto line = acc[0 .. nl];
-					acc = acc[nl + 1 .. $];
-					if (line.length && line[$ - 1] == '\r')
-						line = line[0 .. $ - 1];
-					if (line.length == 0)
-					{
-						if (data.length)
-						{
-							try
-								dispatch(Message(parseJsonString(data)));
-							catch (Exception)
-							{
-							}
-							data = null;
-						}
-					}
-					else if (line.startsWith("data:"))
-					{
-						auto d = line["data:".length .. $];
-						if (d.startsWith(" "))
-							d = d[1 .. $];
-						data ~= (data.length ? "\n" : "") ~ d;
-					}
 				}
-			}
-
-			for (;;)
-			{
-				if (*cancelled)
-					break;
-				if (chunked)
-				{
-					auto sizeLine = (cast(string) readLine(conn).idup).strip;
-					if (sizeLine.length == 0)
-						continue;
-					uint sz;
-					try
-					{
-						auto sl = sizeLine;
-						sz = parse!uint(sl, 16);
-					}
-					catch (Exception)
-						break;
-					if (sz == 0)
-						break; // last chunk
-					auto chunk = new ubyte[sz];
-					conn.read(chunk, IOMode.all);
-					acc ~= cast(string) chunk.idup;
-					readLine(conn); // trailing CRLF after the chunk data
-					parseSse();
-				}
-				else
-				{
-					const avail = conn.leastSize;
-					if (avail == 0)
-						break;
-					const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
-					auto buf = new ubyte[toRead];
-					conn.read(buf, IOMode.once);
-					acc ~= cast(string) buf.idup;
-					parseSse();
-				}
-			}
+			});
 		}();
 	}
 
@@ -1378,15 +1163,9 @@ final class HttpClientTransport : ClientTransport
 	private void runLegacyStream() @safe
 	{
 		import vibe.core.net : connectTCP;
-		import vibe.stream.operations : readLine;
-		import vibe.core.stream : IOMode;
-		import std.string : indexOf, startsWith, strip, toLower;
-		import std.conv : to, parse;
+		import std.string : strip;
 
 		const ep = parseHttpEndpoint(url);
-		const host = ep.host;
-		const port = ep.port;
-		const path = ep.path;
 
 		legacyStreamAlive = true;
 		scope (exit)
@@ -1397,7 +1176,7 @@ final class HttpClientTransport : ClientTransport
 			{
 				if (closing)
 					return;
-				auto sock = connectTCP(host, port);
+				auto sock = connectTCP(ep.host, ep.port);
 				// `connectTCP` yielded; a `close()` during that yield saw the socket as
 				// not-yet-open and did nothing. Re-check here, in the same fiber with no
 				// intervening yield, so the freshly connected socket is not leaked.
@@ -1414,43 +1193,18 @@ final class HttpClientTransport : ClientTransport
 					sock.close();
 				}
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
-				auto conn = openClientStream(sock, ep.tls, host);
+				auto conn = openClientStream(sock, ep.tls, ep.host);
 
-				string req = "GET " ~ path ~ " HTTP/1.1\r\nHost: " ~ host
-					~ "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n";
-				if (bearerToken.length)
-					req ~= "Authorization: Bearer " ~ bearerToken ~ "\r\n";
-				if (sessionId.length)
-					req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
-				req ~= "\r\n";
+				const req = buildHttpRequest("GET", ep.path, ep.host,
+						"text/event-stream", "keep-alive", true, null, null, null);
 				conn.write(cast(const(ubyte)[]) req);
 
-				auto statusLine = cast(string) readLine(conn).idup;
-				if (statusLine.indexOf(" 200") < 0)
-					return;
 				bool chunked;
-				for (;;)
-				{
-					auto h = cast(string) readLine(conn).idup;
-					if (h.length && h[$ - 1] == '\r')
-						h = h[0 .. $ - 1];
-					if (h.toLower.indexOf("transfer-encoding:") == 0
-							&& h.toLower.indexOf("chunked") >= 0)
-						chunked = true;
-					if (h.length == 0)
-						break;
-				}
+				if (!readSseResponseHead(conn, chunked))
+					return;
 
-				string acc, data, eventType;
-				void handleEvent()
-				{
-					scope (exit)
-					{
-						data = null;
-						eventType = null;
-					}
-					if (data.length == 0)
-						return;
+				readSseBody(conn, chunked, () @safe => closing,
+						(string eventType, string data) @safe {
 					if (eventType == "endpoint")
 					{
 						legacyEndpoint = resolveEndpointUri(url, data.strip);
@@ -1467,9 +1221,8 @@ final class HttpClientTransport : ClientTransport
 						auto m = Message(parseJsonString(data));
 						LegacyWaiter** w;
 						if ((m.kind == MessageKind.response
-								|| m.kind == MessageKind.errorResponse)
-								&& m.id.type == Json.Type.int_
-								&& (w = (m.id.get!long  in legacyWaiters)) !is null)
+							|| m.kind == MessageKind.errorResponse) && m.id.type == Json.Type.int_
+							&& (w = (m.id.get!long  in legacyWaiters)) !is null)
 						{
 							if (m.kind == MessageKind.errorResponse)
 								(*w).err = errorFrom(m.error);
@@ -1486,72 +1239,7 @@ final class HttpClientTransport : ClientTransport
 					catch (Exception)
 					{
 					}
-				}
-
-				void parseSse()
-				{
-					for (;;)
-					{
-						const nl = acc.indexOf('\n');
-						if (nl < 0)
-							break;
-						auto line = acc[0 .. nl];
-						acc = acc[nl + 1 .. $];
-						if (line.length && line[$ - 1] == '\r')
-							line = line[0 .. $ - 1];
-						if (line.length == 0)
-							handleEvent();
-						else if (line.startsWith("event:"))
-						{
-							auto v = line["event:".length .. $];
-							if (v.startsWith(" "))
-								v = v[1 .. $];
-							eventType = v;
-						}
-						else if (line.startsWith("data:"))
-						{
-							auto d = line["data:".length .. $];
-							if (d.startsWith(" "))
-								d = d[1 .. $];
-							data ~= (data.length ? "\n" : "") ~ d;
-						}
-					}
-				}
-
-				for (;;)
-				{
-					if (closing)
-						break;
-					if (chunked)
-					{
-						auto sizeLine = (cast(string) readLine(conn).idup).strip;
-						if (sizeLine.length == 0)
-							continue;
-						uint sz;
-						try
-							sz = parse!uint(sizeLine, 16);
-						catch (Exception)
-							break;
-						if (sz == 0)
-							break;
-						auto chunk = new ubyte[sz];
-						conn.read(chunk, IOMode.all);
-						acc ~= cast(string) chunk.idup;
-						readLine(conn);
-						parseSse();
-					}
-					else
-					{
-						const avail = conn.leastSize;
-						if (avail == 0)
-							break;
-						const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
-						auto buf = new ubyte[toRead];
-						conn.read(buf, IOMode.once);
-						acc ~= cast(string) buf.idup;
-						parseSse();
-					}
-				}
+				});
 			}
 			catch (Exception)
 			{
