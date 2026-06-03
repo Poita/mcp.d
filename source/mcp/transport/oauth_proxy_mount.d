@@ -189,12 +189,17 @@ final class ProxyStateStore
 }
 
 /// Mint a fresh, unguessable proxy `state` value (the only `state` sent
-/// upstream).
-private string mintState() @trusted
+/// upstream). The bytes come from the OS CSPRNG -- this `state` is the CSRF /
+/// authorization-response mix-up defense and MUST be unpredictable. Throws
+/// `CsprngException` if the OS CSPRNG is unavailable.
+private string mintState() @safe
 {
-	import std.uuid : randomUUID;
+	import mcp.auth.csprng : cryptoRandomFill;
+	import mcp.auth.oauth : base64UrlNoPad;
 
-	return randomUUID().toString();
+	ubyte[32] buf;
+	cryptoRandomFill(buf[]);
+	return base64UrlNoPad(buf[]);
 }
 
 // ===========================================================================
@@ -424,6 +429,9 @@ private void exchangeUpstream(string endpoint, string body_, string authHeader,
 {
 	import vibe.http.client : requestHTTP, HTTPClientRequest, HTTPClientResponse;
 	import vibe.stream.operations : readAllUTF8;
+	import mcp.auth.oauth : requireSecureUrl;
+
+	requireSecureUrl(endpoint);
 
 	int st = 502;
 	string rb;
@@ -547,6 +555,50 @@ unittest  // mountOAuthProxy registers the full client-facing OAuth surface
 	// Must wire without throwing; the routes are exercised end-to-end by the
 	// transport conformance harness.
 	mountOAuthProxy(router, proxy);
+}
+
+unittest  // mintState yields unique, non-empty values
+{
+	const a = mintState();
+	const b = mintState();
+	assert(a.length > 0);
+	assert(a != b);
+}
+
+unittest  // mintState's entropy source is the OS CSPRNG, not the default rndGen
+{
+	import mcp.auth.oauth : base64UrlNoPad;
+	import std.random : rndGen, uniform;
+
+	auto gen = rndGen;
+	ubyte[32] predictable;
+	foreach (ref x; predictable)
+		x = cast(ubyte) uniform(0, 256, gen);
+	const predictableState = base64UrlNoPad(predictable[]);
+
+	assert(mintState() != predictableState);
+}
+
+unittest  // exchangeUpstream refuses a plaintext (non-loopback) upstream endpoint
+{
+	import std.exception : assertThrown;
+
+	string rb;
+	int st;
+	assertThrown(exchangeUpstream("http://upstream.example.com/token", "grant_type=x", "", rb, st));
+}
+
+unittest  // constructing a proxy with a plaintext upstream endpoint fails closed
+{
+	import std.exception : assertThrown;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "http://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com";
+	cfg.resource = "https://mcp.example.com/mcp";
+	assertThrown(new OAuthProxy(cfg));
 }
 
 unittest  // CONSENT SCREEN: HTML names the client redirect_uri and the approve link

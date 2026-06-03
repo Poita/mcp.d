@@ -37,7 +37,8 @@ import vibe.data.json : Json;
 
 import mcp.auth.oauth : AuthorizationServerMetadata, ProtectedResourceMetadata,
 	RegisteredClient, TokenEndpointAuthMethod,
-	basicAuthHeader, buildAuthCodeTokenForm, buildAuthorizationUrl, buildRefreshTokenForm;
+	basicAuthHeader, buildAuthCodeTokenForm,
+	buildAuthorizationUrl, buildRefreshTokenForm, requireSecureUrl;
 import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidator;
 
 @safe:
@@ -524,6 +525,8 @@ final class OAuthProxy
 	in (consentStore !is null)
 	in (redirectRegistry !is null)
 	{
+		requireSecureUrl(cfg.upstreamAuthorizationEndpoint);
+		requireSecureUrl(cfg.upstreamTokenEndpoint);
 		this.cfg = cfg;
 		this.consentStore = consentStore;
 		this.redirectRegistry = redirectRegistry;
