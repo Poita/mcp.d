@@ -38,6 +38,9 @@ final class DuplexCoordinator
 
 	private long counter = 1;
 	private Waiter[long] waiters;
+	private bool closed_;
+	private string closeMessage;
+	private int closeCode = ErrorCode.internalError;
 
 	/// Allocate a fresh outbound request id. Used by the server peer, which
 	/// originates its own server->client requests; the client peer supplies the id
@@ -48,12 +51,30 @@ final class DuplexCoordinator
 	}
 
 	/// Begin tracking a pending outbound request `id`. Call before sending the
-	/// request frame so a fast reply cannot race ahead of the registration.
+	/// request frame so a fast reply cannot race ahead of the registration. If the
+	/// channel has already closed (`failPending` ran), the waiter is created already
+	/// resolved with the channel-closed error, so a subsequent `await` fails fast
+	/// instead of blocking until its timeout.
 	void register(long id) @safe
 	{
 		auto w = new Waiter;
 		w.evt = createManualEvent();
+		if (closed_)
+		{
+			Json err = Json.emptyObject;
+			err["code"] = closeCode;
+			err["message"] = closeMessage;
+			w.error = err;
+			w.done = true;
+		}
 		waiters[id] = w;
+	}
+
+	/// Whether the channel has closed (`failPending` ran). Once true, any newly
+	/// registered request is failed fast rather than left to time out.
+	bool closed() @safe
+	{
+		return closed_;
 	}
 
 	/// Block the current task until the peer responds to `id` (or `timeout`
@@ -112,9 +133,14 @@ final class DuplexCoordinator
 
 	/// Fail every still-pending request with `error` and wake its awaiting task.
 	/// Called by the read loop at end-of-input so a caller blocked in `await`
-	/// is released with an exception instead of hanging until its timeout.
+	/// is released with an exception instead of hanging until its timeout. Marks
+	/// the coordinator closed so any request registered AFTER this point is failed
+	/// fast (see `register`) rather than left to time out.
 	void failPending(McpException error) @safe
 	{
+		closed_ = true;
+		closeCode = error.code;
+		closeMessage = error.msg;
 		// `await`'s scope(exit) removes each id, so snapshot the keys first.
 		foreach (id; waiters.keys)
 		{
@@ -246,6 +272,40 @@ unittest  // failPending wakes an awaiting task with an error instead of hanging
 	});
 	runEventLoop();
 	assert(threw);
+}
+
+unittest  // a request registered AFTER failPending fails fast instead of blocking until timeout
+{
+	auto coord = new DuplexCoordinator;
+	bool threw;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			coord.failPending(internalError("channel closed"));
+			// Registering after close yields an already-resolved failed waiter, so
+			// await returns promptly (a generous timeout proves it does not block).
+			coord.register(11);
+			try
+				coord.await(11, 30.seconds);
+			catch (McpException)
+				threw = true;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(threw);
+}
+
+unittest  // closed() reflects failPending
+{
+	auto coord = new DuplexCoordinator;
+	assert(!coord.closed());
+	coord.failPending(internalError("channel closed"));
+	assert(coord.closed());
 }
 
 unittest  // resolve returns false for an id no task is awaiting
