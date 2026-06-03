@@ -23,8 +23,7 @@ private template isStdDateTime(T)
 /// Generate a JSON Schema (2020-12) fragment describing the D type `T`.
 ///
 /// The mapping is complete and fully recursive — every type expressible as a
-/// tool parameter or structured result maps to a faithful schema, with no
-/// silent fallback. Mapping:
+/// tool parameter or structured result maps to a faithful schema. Mapping:
 ///
 /// - `bool` -> `{type: "boolean"}`
 /// - integral -> `{type: "integer"}`
@@ -277,34 +276,24 @@ string validateAgainstSchema(Json value, Json schema) @safe
 
 private string validateAt(Json value, Json schema, string path) @safe
 {
-	import std.algorithm : canFind;
-
 	// A non-object schema (e.g. `true`, or absent) imposes no constraint.
 	if (schema.type != Json.Type.object)
 		return "";
 
 	const where = path.length ? path : "(root)";
 
-	if ("enum" in schema && schema["enum"].type == Json.Type.array)
-	{
-		bool found;
-		auto e = schema["enum"];
-		foreach (i; 0 .. e.length)
-			if (e[i] == value)
-			{
-				found = true;
-				break;
-			}
-		if (!found)
-			return where ~ ": value is not one of the permitted enum members";
-	}
-
-	if ("type" in schema && schema["type"].type == Json.Type.string)
-	{
-		const t = schema["type"].get!string;
-		if (!matchesType(value, t))
-			return where ~ ": expected type '" ~ t ~ "'";
-	}
+	// Self-contained keyword groups; each returns "" when its facet is
+	// satisfied (or not present). The recursive cases below stay inline so
+	// they can re-enter validateAt with the right child path.
+	foreach (msg; [
+		checkScalarType(value, schema, where), checkRequired(value, schema, where),
+		checkAdditionalProps(value, schema, where),
+		checkNumericBounds(value, schema, where),
+		checkStringBounds(value, schema, where),
+		checkArrayBounds(value, schema, where),
+	])
+		if (msg.length)
+			return msg;
 
 	if (value.type == Json.Type.object && "properties" in schema
 			&& schema["properties"].type == Json.Type.object)
@@ -319,63 +308,12 @@ private string validateAt(Json value, Json schema, string path) @safe
 			}
 	}
 
-	// additionalProperties: validate each object member whose key is not
-	// already covered by an explicit `properties` entry against the
-	// additionalProperties value schema. SDK-emitted AA schemas have
-	// no `properties`, so every member is validated; for combined schemas
-	// this stays correct by only validating the residual keys.
-	if (value.type == Json.Type.object && "additionalProperties" in schema
-			&& schema["additionalProperties"].type == Json.Type.object)
-	{
-		auto ap = schema["additionalProperties"];
-		const hasProps = "properties" in schema && schema["properties"].type == Json.Type.object;
-		foreach (string key, member; value.byKeyValue)
-		{
-			if (hasProps && key in schema["properties"])
-				continue;
-			auto msg = validateAt(member, ap, path.length ? path ~ "." ~ key : key);
-			if (msg.length)
-				return msg;
-		}
-	}
-
-	// additionalProperties: false — reject any object member whose key is
-	// not declared in `properties`. This is the boolean sibling of the
-	// object form above; the two are mutually exclusive on a given schema.
-	if (value.type == Json.Type.object && "additionalProperties" in schema
-			&& schema["additionalProperties"].type == Json.Type.bool_
-			&& !schema["additionalProperties"].get!bool)
-	{
-		const hasProps = "properties" in schema && schema["properties"].type == Json.Type.object;
-		foreach (string key, member; value.byKeyValue)
-		{
-			if (hasProps && key in schema["properties"])
-				continue;
-			return where ~ ": additional property '" ~ key ~ "' is not permitted";
-		}
-	}
-
-	if (value.type == Json.Type.object && "required" in schema
-			&& schema["required"].type == Json.Type.array)
-	{
-		auto req = schema["required"];
-		foreach (i; 0 .. req.length)
-			if (req[i].type == Json.Type.string)
-			{
-				const field = req[i].get!string;
-				if (field !in value)
-					return where ~ ": missing required property '" ~ field ~ "'";
-			}
-	}
-
 	if (value.type == Json.Type.array && "items" in schema
 			&& schema["items"].type == Json.Type.object)
 	{
 		auto items = schema["items"];
 		foreach (i; 0 .. value.length)
 		{
-			import std.conv : to;
-
 			auto msg = validateAt(value[i], items, path ~ "[" ~ i.to!string ~ "]");
 			if (msg.length)
 				return msg;
@@ -416,56 +354,154 @@ private string validateAt(Json value, Json schema, string path) @safe
 			return where ~ ": value matches more than one mutually-exclusive schema";
 	}
 
-	// Numeric bounds (minimum / maximum) on number and integer values.
-	if (value.type == Json.Type.int_ || value.type == Json.Type.float_
-			|| value.type == Json.Type.bigInt)
+	return "";
+}
+
+// enum + type: the value must be one of the permitted members and match the
+// declared primitive type.
+private string checkScalarType(Json value, Json schema, string where) @safe
+{
+	if ("enum" in schema && schema["enum"].type == Json.Type.array)
 	{
-		const num = jsonNumber(value);
-		if ("minimum" in schema && schema["minimum"].type != Json.Type.undefined)
+		bool found;
+		auto e = schema["enum"];
+		foreach (i; 0 .. e.length)
+			if (e[i] == value)
+			{
+				found = true;
+				break;
+			}
+		if (!found)
+			return where ~ ": value is not one of the permitted enum members";
+	}
+
+	if ("type" in schema && schema["type"].type == Json.Type.string)
+	{
+		const t = schema["type"].get!string;
+		if (!matchesType(value, t))
+			return where ~ ": expected type '" ~ t ~ "'";
+	}
+
+	return "";
+}
+
+// required: every listed property must be present on the object value.
+private string checkRequired(Json value, Json schema, string where) @safe
+{
+	if (value.type == Json.Type.object && "required" in schema
+			&& schema["required"].type == Json.Type.array)
+	{
+		auto req = schema["required"];
+		foreach (i; 0 .. req.length)
+			if (req[i].type == Json.Type.string)
+			{
+				const field = req[i].get!string;
+				if (field !in value)
+					return where ~ ": missing required property '" ~ field ~ "'";
+			}
+	}
+
+	return "";
+}
+
+// additionalProperties in both forms. The object form validates each member
+// whose key is not covered by an explicit `properties` entry against the value
+// schema; the boolean `false` form rejects any such undeclared member. The two
+// forms are mutually exclusive on a given schema. SDK-emitted AA schemas have
+// no `properties`, so every member is checked; combined schemas stay correct by
+// only checking the residual keys.
+private string checkAdditionalProps(Json value, Json schema, string where) @safe
+{
+	if (value.type != Json.Type.object || "additionalProperties" !in schema)
+		return "";
+
+	const hasProps = "properties" in schema && schema["properties"].type == Json.Type.object;
+	auto ap = schema["additionalProperties"];
+
+	if (ap.type == Json.Type.object)
+	{
+		foreach (string key, member; value.byKeyValue)
 		{
-			const lo = jsonNumber(schema["minimum"]);
-			if (num < lo)
-				return where ~ ": value is below the minimum";
+			if (hasProps && key in schema["properties"])
+				continue;
+			auto msg = validateAt(member, ap, where == "(root)" ? key : where ~ "." ~ key);
+			if (msg.length)
+				return msg;
 		}
-		if ("maximum" in schema && schema["maximum"].type != Json.Type.undefined)
+	}
+	else if (ap.type == Json.Type.bool_ && !ap.get!bool)
+	{
+		foreach (string key, member; value.byKeyValue)
 		{
-			const hi = jsonNumber(schema["maximum"]);
-			if (num > hi)
-				return where ~ ": value is above the maximum";
+			if (hasProps && key in schema["properties"])
+				continue;
+			return where ~ ": additional property '" ~ key ~ "' is not permitted";
 		}
 	}
 
-	// String length bounds (minLength / maxLength), counted in code points.
-	if (value.type == Json.Type.string)
-	{
-		import std.utf : count;
+	return "";
+}
 
-		const len = value.get!string.count;
-		if ("minLength" in schema && schema["minLength"].type == Json.Type.int_)
-		{
-			if (len < schema["minLength"].get!long)
-				return where ~ ": string is shorter than minLength";
-		}
-		if ("maxLength" in schema && schema["maxLength"].type == Json.Type.int_)
-		{
-			if (len > schema["maxLength"].get!long)
-				return where ~ ": string is longer than maxLength";
-		}
+// minimum / maximum on number and integer values.
+private string checkNumericBounds(Json value, Json schema, string where) @safe
+{
+	if (value.type != Json.Type.int_ && value.type != Json.Type.float_
+			&& value.type != Json.Type.bigInt)
+		return "";
+
+	const num = jsonNumber(value);
+	if ("minimum" in schema && schema["minimum"].type != Json.Type.undefined)
+	{
+		if (num < jsonNumber(schema["minimum"]))
+			return where ~ ": value is below the minimum";
+	}
+	if ("maximum" in schema && schema["maximum"].type != Json.Type.undefined)
+	{
+		if (num > jsonNumber(schema["maximum"]))
+			return where ~ ": value is above the maximum";
 	}
 
-	// Array length bounds (minItems / maxItems).
-	if (value.type == Json.Type.array)
+	return "";
+}
+
+// minLength / maxLength, counted in code points.
+private string checkStringBounds(Json value, Json schema, string where) @safe
+{
+	if (value.type != Json.Type.string)
+		return "";
+
+	import std.utf : count;
+
+	const len = value.get!string.count;
+	if ("minLength" in schema && schema["minLength"].type == Json.Type.int_)
 	{
-		if ("minItems" in schema && schema["minItems"].type == Json.Type.int_)
-		{
-			if (value.length < schema["minItems"].get!long)
-				return where ~ ": array has fewer than minItems items";
-		}
-		if ("maxItems" in schema && schema["maxItems"].type == Json.Type.int_)
-		{
-			if (value.length > schema["maxItems"].get!long)
-				return where ~ ": array has more than maxItems items";
-		}
+		if (len < schema["minLength"].get!long)
+			return where ~ ": string is shorter than minLength";
+	}
+	if ("maxLength" in schema && schema["maxLength"].type == Json.Type.int_)
+	{
+		if (len > schema["maxLength"].get!long)
+			return where ~ ": string is longer than maxLength";
+	}
+
+	return "";
+}
+
+// minItems / maxItems on array length.
+private string checkArrayBounds(Json value, Json schema, string where) @safe
+{
+	if (value.type != Json.Type.array)
+		return "";
+
+	if ("minItems" in schema && schema["minItems"].type == Json.Type.int_)
+	{
+		if (value.length < schema["minItems"].get!long)
+			return where ~ ": array has fewer than minItems items";
+	}
+	if ("maxItems" in schema && schema["maxItems"].type == Json.Type.int_)
+	{
+		if (value.length > schema["maxItems"].get!long)
+			return where ~ ": array has more than maxItems items";
 	}
 
 	return "";
