@@ -31,7 +31,7 @@
 /// are unit-testable with a mocked upstream.
 module mcp.auth.oauth_proxy;
 
-import std.string : endsWith, startsWith;
+import std.string : endsWith, indexOf, startsWith;
 
 import vibe.data.json : Json;
 
@@ -331,6 +331,98 @@ string proxyTokenAuthHeader(const OAuthProxyConfig cfg) @safe
 }
 
 // ===========================================================================
+// Redirect-URI registration + validation (RFC 6749 §3.1.2.2 / §10.6, RFC 8252)
+// ===========================================================================
+
+/// Whether a client `redirect_uri` uses a scheme the proxy is willing to relay an
+/// authorization code to. `https` is always allowed; plain `http` is allowed only
+/// for loopback hosts (`127.0.0.1`, `[::1]`, `localhost`) per RFC 8252 §7.3. All
+/// other schemes (including `http` to a non-loopback host, and custom/private-use
+/// schemes) are rejected so the upstream code can never be relayed over an
+/// open-redirect-prone or interceptable channel.
+bool isAllowedRedirectScheme(string redirectUri) @safe
+{
+	if (redirectUri.startsWith("https://"))
+		return true;
+	if (redirectUri.startsWith("http://"))
+	{
+		const host = hostOf(redirectUri["http://".length .. $]);
+		return host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1";
+	}
+	return false;
+}
+
+private string hostOf(string authorityAndRest) @safe
+{
+	auto s = authorityAndRest;
+	const slash = s.indexOf('/');
+	if (slash >= 0)
+		s = s[0 .. slash];
+	const at = s.indexOf('@');
+	if (at >= 0)
+		s = s[at + 1 .. $];
+	if (s.startsWith("["))
+	{
+		const close = s.indexOf(']');
+		if (close >= 0)
+			return s[0 .. close + 1];
+		return s;
+	}
+	const colon = s.indexOf(':');
+	if (colon >= 0)
+		s = s[0 .. colon];
+	return s;
+}
+
+/// Records the exact set of `redirect_uris` a dynamically-registered client
+/// presented at `/register`, keyed by a server-issued registration handle, and
+/// answers whether a given `redirect_uri` is an exact member of that set. This is
+/// the allowlist the proxy enforces at `/authorize` before relaying an upstream
+/// authorization code.
+interface RedirectUriRegistry
+{
+	/// Persist the exact `redirect_uris` registered under `registrationHandle`.
+	void register(string registrationHandle, const string[] redirectUris) @safe;
+
+	/// Whether `redirectUri` is an exact-string member of ANY registered set.
+	bool isRegistered(string redirectUri) @safe;
+}
+
+/// A simple in-memory `RedirectUriRegistry`. Suitable for a single-process proxy;
+/// for a multi-process deployment back it with shared storage instead.
+final class InMemoryRedirectUriRegistry : RedirectUriRegistry
+{
+	private bool[string] allowed;
+
+	override void register(string registrationHandle, const string[] redirectUris) @safe
+	{
+		foreach (u; redirectUris)
+			allowed[u] = true;
+	}
+
+	override bool isRegistered(string redirectUri) @safe
+	{
+		return (redirectUri in allowed) !is null;
+	}
+}
+
+/// Thrown by `OAuthProxy.authorize` when the client-supplied `redirect_uri` is not
+/// an exact match against a previously-registered `redirect_uri` (RFC 6749
+/// §3.1.2.2 / §10.6) or uses a scheme that is not allowed (RFC 8252 §7.3). The
+/// proxy fails closed: it neither mints proxy state nor forwards the request
+/// upstream. An HTTP mount maps this to a `400 invalid_request`.
+class InvalidRedirectUriException : Exception
+{
+	string redirectUri;
+
+	this(string redirectUri, string reason, string file = __FILE__, size_t line = __LINE__) @safe
+	{
+		super("invalid redirect_uri '" ~ redirectUri ~ "': " ~ reason, file, line);
+		this.redirectUri = redirectUri;
+	}
+}
+
+// ===========================================================================
 // Consent gate (confused-deputy mitigation)
 // ===========================================================================
 
@@ -407,10 +499,11 @@ final class OAuthProxy
 {
 	private OAuthProxyConfig cfg;
 	private ConsentStore consentStore;
+	private RedirectUriRegistry redirectRegistry;
 
 	this(OAuthProxyConfig cfg) @safe
 	{
-		this(cfg, new InMemoryConsentStore());
+		this(cfg, new InMemoryConsentStore(), new InMemoryRedirectUriRegistry());
 	}
 
 	/// Construct with an explicit `ConsentStore` (e.g. a shared-storage backed
@@ -420,8 +513,20 @@ final class OAuthProxy
 	this(OAuthProxyConfig cfg, ConsentStore consentStore) @safe
 	in (consentStore !is null)
 	{
+		this(cfg, consentStore, new InMemoryRedirectUriRegistry());
+	}
+
+	/// Construct with explicit `ConsentStore` and `RedirectUriRegistry`. The
+	/// registry records the exact `redirect_uris` each client presents at
+	/// `/register` so `authorize` can reject any `redirect_uri` that was never
+	/// registered (RFC 6749 §3.1.2.2 / §10.6).
+	this(OAuthProxyConfig cfg, ConsentStore consentStore, RedirectUriRegistry redirectRegistry) @safe
+	in (consentStore !is null)
+	in (redirectRegistry !is null)
+	{
 		this.cfg = cfg;
 		this.consentStore = consentStore;
+		this.redirectRegistry = redirectRegistry;
 	}
 
 	/// The proxy's configuration.
@@ -442,11 +547,36 @@ final class OAuthProxy
 		return protectedResourceMetadata(cfg);
 	}
 
-	/// Handle a DCR (`/register`) request: return the registration response for
-	/// the given client `redirect_uris`.
-	Json register(const string[] requestedRedirectUris) const @safe
+	/// Handle a DCR (`/register`) request: persist the exact client
+	/// `redirect_uris` into the registry (so a later `/authorize` can be checked
+	/// against them) and return the registration response. The fixed upstream
+	/// `client_id` is shared across clients, so the registry is keyed by a
+	/// server-issued registration handle rather than that shared id.
+	Json register(const string[] requestedRedirectUris) @safe
 	{
+		import std.uuid : randomUUID;
+
+		const handle = () @trusted { return randomUUID().toString(); }();
+		redirectRegistry.register(handle, requestedRedirectUris);
 		return registrationResponseJson(cfg, requestedRedirectUris);
+	}
+
+	/// Reject a client `redirect_uri` that is not safe to relay an authorization
+	/// code to. Fails closed by throwing `InvalidRedirectUriException` when the
+	/// `redirect_uri` is empty, uses a disallowed scheme (RFC 8252 §7.3), or is
+	/// not an exact match against any previously-registered `redirect_uri` (RFC
+	/// 6749 §3.1.2.2 / §10.6). Called by both `authorize` overloads before any
+	/// proxy state is minted or the request is forwarded upstream.
+	void validateRedirectUri(string clientRedirectUri) @safe
+	{
+		if (clientRedirectUri.length == 0)
+			throw new InvalidRedirectUriException(clientRedirectUri, "redirect_uri is required");
+		if (!isAllowedRedirectScheme(clientRedirectUri))
+			throw new InvalidRedirectUriException(clientRedirectUri,
+					"scheme not allowed (https, or http for loopback only)");
+		if (!redirectRegistry.isRegistered(clientRedirectUri))
+			throw new InvalidRedirectUriException(clientRedirectUri,
+					"redirect_uri is not registered for any client");
 	}
 
 	/// Whether the dynamically-registered client identified by its
@@ -479,18 +609,23 @@ final class OAuthProxy
 	/// then retries.
 	string authorize(string clientRedirectUri, string codeChallenge, string scopeStr, string state) @safe
 	{
+		validateRedirectUri(clientRedirectUri);
 		if (!consentStore.hasConsent(clientRedirectUri))
 			throw new ConsentRequiredException(clientRedirectUri);
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
 	}
 
-	/// Build the upstream authorization redirect WITHOUT a per-client consent
-	/// gate. Provided for flows that do their own consent enforcement (or a
-	/// fixed, non-DCR client). For dynamically-registered clients prefer the
-	/// four-argument `authorize` overload, which enforces the confused-deputy
-	/// consent MUST.
-	string authorize(string codeChallenge, string scopeStr, string state) const @safe
+	/// Build the upstream authorization redirect WITHOUT the per-client consent
+	/// gate, for flows that do their own consent enforcement. The
+	/// `clientRedirectUri` is still validated against the registered allowlist and
+	/// scheme rules (RFC 6749 §3.1.2.2 / RFC 8252) — the ungated path cannot relay
+	/// a code to an unregistered redirect_uri. For dynamically-registered clients
+	/// prefer the consent-gated `authorize` overload, which additionally enforces
+	/// the confused-deputy consent MUST.
+	string authorizeWithoutConsent(string clientRedirectUri,
+			string codeChallenge, string scopeStr, string state) @safe
 	{
+		validateRedirectUri(clientRedirectUri);
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
 	}
 
@@ -762,7 +897,8 @@ unittest  // the OAuthProxy class exposes the full client-facing surface end to 
 	auto reg = proxy.register(["http://127.0.0.1:8765/cb"]);
 	assert(reg["client_id"].get!string == "Iv1.upstream");
 
-	auto authUrl = proxy.authorize("CH", "read:user", "S");
+	auto authUrl = proxy.authorizeWithoutConsent("http://127.0.0.1:8765/cb",
+			"CH", "read:user", "S");
 	assert(authUrl.startsWith("https://github.com/login/oauth/authorize?"));
 
 	auto form = proxy.tokenForm("CODE", "VER");
@@ -775,6 +911,7 @@ unittest  // CONFUSED DEPUTY: gated authorize refuses to forward an un-consented
 
 	auto cfg = sampleConfig();
 	auto proxy = new OAuthProxy(cfg);
+	proxy.register(["http://localhost:5000/callback"]);
 	// No consent recorded yet for this dynamically-registered client.
 	assertThrown!ConsentRequiredException(
 			proxy.authorize("http://localhost:5000/callback", "CH", "read:user", "S"));
@@ -786,6 +923,7 @@ unittest  // CONFUSED DEPUTY: after grantConsent the gated authorize forwards up
 
 	auto cfg = sampleConfig();
 	auto proxy = new OAuthProxy(cfg);
+	proxy.register(["http://localhost:5000/callback"]);
 	proxy.grantConsent("http://localhost:5000/callback");
 	auto url = proxy.authorize("http://localhost:5000/callback", "CH", "read:user", "S");
 	assert(url.startsWith("https://github.com/login/oauth/authorize?"));
@@ -798,6 +936,9 @@ unittest  // CONFUSED DEPUTY: consent is per-client (one approval does not cover
 
 	auto cfg = sampleConfig();
 	auto proxy = new OAuthProxy(cfg);
+	proxy.register([
+		"http://localhost:5000/callback", "http://localhost:6000/callback"
+	]);
 	proxy.grantConsent("http://localhost:5000/callback");
 	assert(proxy.hasConsent("http://localhost:5000/callback"));
 	assert(!proxy.hasConsent("http://localhost:6000/callback"));
@@ -809,6 +950,7 @@ unittest  // CONFUSED DEPUTY: the exception names the client redirect_uri needin
 {
 	auto cfg = sampleConfig();
 	auto proxy = new OAuthProxy(cfg);
+	proxy.register(["http://localhost:7000/cb"]);
 	bool threw = false;
 	try
 		proxy.authorize("http://localhost:7000/cb", "CH", "s", "S");
@@ -837,7 +979,129 @@ unittest  // a custom ConsentStore can be injected and is consulted by authorize
 	auto store = new InMemoryConsentStore();
 	store.grantConsent("http://localhost:9000/cb");
 	auto proxy = new OAuthProxy(cfg, store);
+	proxy.register(["http://localhost:9000/cb"]);
 	auto url = proxy.authorize("http://localhost:9000/cb", "CH", "read:user", "S");
+	assert(url.canFind("client_id=Iv1.upstream"));
+}
+
+unittest  // REDIRECT VALIDATION: gated authorize rejects an unregistered redirect_uri
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	auto proxy = new OAuthProxy(cfg);
+	proxy.grantConsent("https://attacker.example/cb");
+	// Consent alone must not let an unregistered redirect_uri through.
+	assertThrown!InvalidRedirectUriException(
+			proxy.authorize("https://attacker.example/cb", "CH", "read:user", "S"));
+}
+
+unittest  // REDIRECT VALIDATION: ungated authorizeWithoutConsent rejects an unregistered redirect_uri
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	auto proxy = new OAuthProxy(cfg);
+	assertThrown!InvalidRedirectUriException(proxy.authorizeWithoutConsent(
+			"https://attacker.example/cb", "CH", "read:user", "S"));
+}
+
+unittest  // REDIRECT VALIDATION: a registered redirect_uri passes the ungated path
+{
+	import std.algorithm : canFind;
+
+	auto cfg = sampleConfig();
+	auto proxy = new OAuthProxy(cfg);
+	proxy.register(["https://app.example.com/cb"]);
+	auto url = proxy.authorizeWithoutConsent("https://app.example.com/cb", "CH", "read:user", "S");
+	assert(url.canFind("client_id=Iv1.upstream"));
+}
+
+unittest  // REDIRECT VALIDATION: an empty redirect_uri is rejected (fail closed)
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	auto proxy = new OAuthProxy(cfg);
+	assertThrown!InvalidRedirectUriException(proxy.validateRedirectUri(""));
+}
+
+unittest  // REDIRECT VALIDATION: a registered redirect_uri with an unrelated one is exact-matched
+{
+	auto cfg = sampleConfig();
+	auto proxy = new OAuthProxy(cfg);
+	proxy.register(["https://app.example.com/cb"]);
+	// Exact match passes; a near-miss (different path) is rejected.
+	proxy.validateRedirectUri("https://app.example.com/cb");
+}
+
+unittest  // REDIRECT VALIDATION: a near-miss of a registered redirect_uri is rejected
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	auto proxy = new OAuthProxy(cfg);
+	proxy.register(["https://app.example.com/cb"]);
+	assertThrown!InvalidRedirectUriException(
+			proxy.validateRedirectUri("https://app.example.com/cb/extra"));
+}
+
+unittest  // SCHEME ALLOWLIST: https is accepted
+{
+	assert(isAllowedRedirectScheme("https://app.example.com/cb"));
+}
+
+unittest  // SCHEME ALLOWLIST: http to loopback is accepted (RFC 8252)
+{
+	assert(isAllowedRedirectScheme("http://127.0.0.1:8765/cb"));
+	assert(isAllowedRedirectScheme("http://localhost:5000/callback"));
+	assert(isAllowedRedirectScheme("http://[::1]:9000/cb"));
+}
+
+unittest  // SCHEME ALLOWLIST: http to a non-loopback host is rejected
+{
+	assert(!isAllowedRedirectScheme("http://app.example.com/cb"));
+	assert(!isAllowedRedirectScheme("http://evil.test/cb"));
+}
+
+unittest  // SCHEME ALLOWLIST: a custom/private-use scheme is rejected
+{
+	assert(!isAllowedRedirectScheme("com.example.app:/oauth/cb"));
+	assert(!isAllowedRedirectScheme("javascript:alert(1)"));
+	assert(!isAllowedRedirectScheme(""));
+}
+
+unittest  // SCHEME ALLOWLIST: a registered scheme is still scheme-checked (registered http non-loopback rejected)
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	auto proxy = new OAuthProxy(cfg);
+	// Even if such a URI were registered, the scheme gate rejects it.
+	proxy.register(["http://app.example.com/cb"]);
+	assertThrown!InvalidRedirectUriException(proxy.validateRedirectUri("http://app.example.com/cb"));
+}
+
+unittest  // REDIRECT REGISTRY: InMemoryRedirectUriRegistry exact-matches across registrations
+{
+	RedirectUriRegistry reg = new InMemoryRedirectUriRegistry();
+	assert(!reg.isRegistered("https://a/cb"));
+	reg.register("h1", ["https://a/cb"]);
+	reg.register("h2", ["https://b/cb"]);
+	assert(reg.isRegistered("https://a/cb"));
+	assert(reg.isRegistered("https://b/cb"));
+	assert(!reg.isRegistered("https://c/cb"));
+}
+
+unittest  // REDIRECT REGISTRY: a custom registry can be injected and is consulted by authorize
+{
+	import std.algorithm : canFind;
+
+	auto cfg = sampleConfig();
+	auto registry = new InMemoryRedirectUriRegistry();
+	registry.register("pre", ["https://app.example.com/cb"]);
+	auto proxy = new OAuthProxy(cfg, new InMemoryConsentStore(), registry);
+	auto url = proxy.authorizeWithoutConsent("https://app.example.com/cb", "CH", "read:user", "S");
 	assert(url.canFind("client_id=Iv1.upstream"));
 }
 
