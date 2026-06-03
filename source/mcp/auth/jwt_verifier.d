@@ -111,6 +111,12 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 	if (alg != "RS256" && alg != "ES256")
 		return TokenInfo.invalid();
 
+	// RFC 7515 4.1.11: a `crit` header lists extensions the recipient MUST
+	// understand. This verifier implements none, so any token carrying a
+	// `crit` member MUST be rejected rather than silently accepted.
+	if ("crit" in headerJson)
+		return TokenInfo.invalid();
+
 	// Gather candidate keys: pinned PEM keys plus any JWKS keys for this kid.
 	string[] candidates = cfg.staticPublicKeysPem.dup;
 	candidates ~= keys.keysFor(kid);
@@ -585,17 +591,29 @@ string[] audiences(Json payload) @safe
 	return result;
 }
 
+/// Split a space-delimited scope string into individual scopes, dropping empty
+/// elements so an empty or all-whitespace claim yields no scopes (an empty
+/// string would otherwise split into a spurious single `""` scope).
+private string[] splitScopes(string s) @safe
+{
+	import std.algorithm : filter;
+	import std.array : array;
+
+	auto parts = s.strip.split(' ').filter!(x => x.length).array;
+	return parts.length ? parts : null;
+}
+
 /// Extract granted scopes: OAuth uses a space-delimited `scope` string; some
 /// issuers use `scp` (string or array).
 string[] tokenScopes(Json payload) @safe
 {
 	auto scope_ = payload["scope"];
 	if (scope_.type == Json.Type.string)
-		return scope_.get!string.strip.split(' ');
+		return splitScopes(scope_.get!string);
 
 	auto scp = payload["scp"];
 	if (scp.type == Json.Type.string)
-		return scp.get!string.strip.split(' ');
+		return splitScopes(scp.get!string);
 	if (scp.type == Json.Type.array)
 	{
 		string[] result;
@@ -840,6 +858,45 @@ unittest  // an unsupported alg (e.g. none) is rejected outright
 
 	auto ti = verifyToken(cfg, jwt, new NoKeys, 1_700_001_000);
 	assert(!ti.valid);
+}
+
+unittest  // a token carrying a `crit` header is rejected even with a valid signature (RFC 7515 4.1.11)
+{
+	import mcp.auth.jwt : signEs256;
+	import mcp.auth.oauth : base64UrlNoPad;
+
+	JwtVerifierConfig cfg;
+	cfg.staticPublicKeysPem = [testEcPubPem];
+
+	const header = `{"alg":"ES256","typ":"JWT","crit":["exp"]}`;
+	const payload = `{"sub":"ec-user","exp":1700003600}`;
+	const si = base64UrlNoPad(cast(const(ubyte)[]) header) ~ "." ~ base64UrlNoPad(
+			cast(const(ubyte)[]) payload);
+	auto sig = signEs256(testEcPrivPem, cast(const(ubyte)[]) si);
+	auto jwt = si ~ "." ~ base64UrlNoPad(sig);
+
+	auto ti = verifyToken(cfg, jwt, new NoKeys, 1_700_001_000);
+	assert(!ti.valid);
+}
+
+unittest  // an empty `scope` claim yields no scopes (not a spurious empty-string scope)
+{
+	assert(tokenScopes(parseJsonString(`{"scope":""}`)) is null);
+}
+
+unittest  // an all-whitespace `scope` claim yields no scopes
+{
+	assert(tokenScopes(parseJsonString(`{"scope":"   "}`)) is null);
+}
+
+unittest  // an empty `scp` string claim yields no scopes
+{
+	assert(tokenScopes(parseJsonString(`{"scp":""}`)) is null);
+}
+
+unittest  // internal runs of spaces do not produce empty-string scopes
+{
+	assert(tokenScopes(parseJsonString(`{"scope":"a   b"}`)) == ["a", "b"]);
 }
 
 unittest  // parseJwks reads RSA and EC keys, ignoring unknown members
