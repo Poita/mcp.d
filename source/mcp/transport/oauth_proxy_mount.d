@@ -188,6 +188,7 @@ private string htmlEscape(string s) @safe
 final class ProxyStateStore
 {
 	import core.time : Duration, MonoTime, minutes;
+	import mcp.transport.session : BoundedExpiringMap;
 
 	/// Lifetime of a pending authorization (authorize -> consent -> callback). An
 	/// abandoned or un-consented flow is swept after this elapses.
@@ -197,11 +198,8 @@ final class ProxyStateStore
 	/// oldest entries are evicted so a flood cannot exhaust memory inside the TTL.
 	enum size_t defaultMaxEntries = 10_000;
 
-	private ProxyAuthState[string] entries;
-	private MonoTime[string] inserted;
-	private const Duration ttl;
-	private const size_t maxEntries;
-	private MonoTime delegate() @safe clock;
+	// `synchronized(this)` serializes access; the container itself does no locking.
+	private BoundedExpiringMap!ProxyAuthState entries;
 
 	this() @safe
 	{
@@ -212,46 +210,21 @@ final class ProxyStateStore
 	/// tests to drive TTL expiry deterministically). A null clock uses `MonoTime.currTime`.
 	this(Duration ttl, size_t maxEntries, MonoTime delegate() @safe clock) @safe
 	{
-		this.ttl = ttl;
-		this.maxEntries = maxEntries;
-		this.clock = clock;
-	}
-
-	private MonoTime now() @safe
-	{
-		return clock is null ? MonoTime.currTime : clock();
+		entries = BoundedExpiringMap!ProxyAuthState(ttl, maxEntries, clock);
 	}
 
 	/// Record the client's authorization details under the proxy `state`.
 	void put(string proxyState, ProxyAuthState st) @safe
 	{
 		synchronized (this)
-		{
-			const t = now();
-			sweepExpired(t);
-			entries[proxyState] = st;
-			inserted[proxyState] = t;
-			enforceCap();
-		}
+			entries.put(proxyState, st);
 	}
 
 	/// Consume and return the details for `proxyState`, setting `found`.
 	ProxyAuthState take(string proxyState, out bool found) @safe
 	{
 		synchronized (this)
-		{
-			sweepExpired(now());
-			if (auto p = proxyState in entries)
-			{
-				found = true;
-				auto v = *p;
-				entries.remove(proxyState);
-				inserted.remove(proxyState);
-				return v;
-			}
-		}
-		found = false;
-		return ProxyAuthState.init;
+			return entries.take(proxyState, found);
 	}
 
 	/// Number of live pending authorizations (test/diagnostic use).
@@ -259,38 +232,6 @@ final class ProxyStateStore
 	{
 		synchronized (this)
 			return entries.length;
-	}
-
-	private void sweepExpired(MonoTime t) @safe
-	{
-		string[] stale;
-		foreach (k, ins; inserted)
-			if (t - ins >= ttl)
-				stale ~= k;
-		foreach (k; stale)
-		{
-			entries.remove(k);
-			inserted.remove(k);
-		}
-	}
-
-	private void enforceCap() @safe
-	{
-		while (entries.length > maxEntries)
-		{
-			string oldestKey;
-			MonoTime oldest;
-			bool first = true;
-			foreach (k, ins; inserted)
-				if (first || ins < oldest)
-				{
-					oldest = ins;
-					oldestKey = k;
-					first = false;
-				}
-			entries.remove(oldestKey);
-			inserted.remove(oldestKey);
-		}
 	}
 }
 
