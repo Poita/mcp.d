@@ -21,15 +21,15 @@ enum ErrorCode : int
 	headerMismatch = -32001,
 	// draft: requested protocol version not supported (data: {supported, requested})
 	unsupportedProtocolVersion = -32004,
-	// 2025-11-25 (elicitation §"URL Elicitation Required Error"): a request
-	// cannot be processed until a URL-mode elicitation is completed. The error
-	// MUST carry a `data.elicitations` list of URL-mode elicitations.
 	// draft basic/lifecycle (draft/schema MissingRequiredClientCapabilityError):
 	// returned when processing a request requires a capability the client did
 	// NOT declare in its `clientCapabilities`. HTTP transports MUST map this to
 	// a 400 response. The error carries `data.requiredCapabilities` (a
 	// ClientCapabilities object describing the capabilities the request needs).
 	missingRequiredClientCapability = -32003,
+	// 2025-11-25 (elicitation §"URL Elicitation Required Error"): a request
+	// cannot be processed until a URL-mode elicitation is completed. The error
+	// MUST carry a `data.elicitations` list of URL-mode elicitations.
 	urlElicitationRequired = -32042,
 	// sampling (client/sampling §Error Handling): the user declined the
 	// server's `sampling/createMessage` request. Not a JSON-RPC reserved code;
@@ -325,6 +325,13 @@ unittest  // toErrorJson includes data when present
 	]));
 	auto j = e.toErrorJson();
 	assert(j["data"]["field"].get!string == "name");
+}
+
+unittest  // urlElicitationRequired and missingRequiredClientCapability are distinct codes
+{
+	assert(ErrorCode.urlElicitationRequired == -32042);
+	assert(ErrorCode.missingRequiredClientCapability == -32003);
+	assert(ErrorCode.urlElicitationRequired != ErrorCode.missingRequiredClientCapability);
 }
 
 unittest  // urlElicitationRequired uses the -32042 code
