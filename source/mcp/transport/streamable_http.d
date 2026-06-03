@@ -1172,8 +1172,18 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
 			return;
 		}
-		const ver = effectivePostVersion(req.headers.get(HttpHeader.protocolVersion,
-				""), server.negotiatedVersion);
+		// Resolve THIS request's connection state (the SessionManager-owned state
+		// for a stateful session, else a fresh/implicit-peer state) and gate the
+		// batch on its negotiated version — the SAME source the server core gates
+		// on — rather than trusting the client's MCP-Protocol-Version header. This
+		// keeps the transport gate and the core gate from disagreeing: a batch the
+		// transport forwards is one the core will accept.
+		// A batch is never an `initialize` (that is a single message), so no session
+		// is minted on this path: the only session id is the `Mcp-Session-Id` header
+		// (`connToken`).
+		ConnectionState reqState = postState(server, sessions, "", connToken,
+				req.headers.get(HttpHeader.protocolVersion, ""), Json.undefined);
+		const ver = (reqState !is null) ? reqState.negotiated : server.negotiatedVersion;
 		if (!streamableBatchAllowed(ver))
 		{
 			// Single-message-only: reject the array body with -32600 on HTTP 400.
@@ -1185,8 +1195,9 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			return;
 		}
 		// 2025-03-26 back-compat: the non-streaming batch path (no in-flight
-		// server->client traffic).
-		const txt = server.handleRaw(payload);
+		// server->client traffic), dispatched against the resolved state so the
+		// legacy path is actually reachable for a session that negotiated 2025-03-26.
+		const txt = server.handleRaw(payload, reqState);
 		if (txt.length == 0)
 		{
 			res.statusCode = HTTPStatus.accepted;

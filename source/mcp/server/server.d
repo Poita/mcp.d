@@ -272,6 +272,32 @@ enum ServerMode
 	stateful
 }
 
+/// A channel-less context bound to a specific `ConnectionState`, so the server
+/// core dispatches against THAT per-session/per-request state rather than the
+/// single bound `activeConnection`. Used by the non-streaming raw batch path
+/// (the 2025-03-26 Streamable HTTP batch back-compat path) where a transport has
+/// already resolved the request's connection state but supplies no server->client
+/// channel. Notifications are dropped and server->client requests are rejected.
+private final class ConnectionScopedContext : BaseRequestContext, ConnectionScoped
+{
+	private ConnectionState conn_;
+
+	this(ConnectionState conn) @safe
+	{
+		this.conn_ = conn;
+	}
+
+	string connectionToken() @safe
+	{
+		return "";
+	}
+
+	ConnectionState connectionState() @safe
+	{
+		return conn_;
+	}
+}
+
 /// The transport-agnostic core of an MCP server.
 ///
 /// `McpServer` owns registration and JSON-RPC dispatch. It has no I/O: feed it
@@ -1284,7 +1310,54 @@ final class McpServer
 	/// become JSON-RPC error responses with a null id.
 	string handleRaw(string text) @safe
 	{
-		return handleRaw(text, null);
+		return handleRaw(text, cast(void delegate(string) @safe) null);
+	}
+
+	/// As `handleRaw`, but dispatched against an explicit per-request
+	/// `ConnectionState` (for the Streamable HTTP batch back-compat path, which
+	/// resolves the request's session/per-request state in the transport). The
+	/// batch version gate and per-message dispatch both consult `conn` instead of
+	/// the single bound `activeConnection`, so a session that negotiated 2025-03-26
+	/// can actually reach the legacy batch path and a modern session is gated on its
+	/// own negotiated version. `null` falls back to the no-arg behaviour.
+	string handleRaw(string text, ConnectionState conn) @safe
+	{
+		if (conn is null)
+			return handleRaw(text);
+
+		ParsedInput input;
+		try
+			input = parseAny(text);
+		catch (McpException e)
+			return makeErrorResponse(Json(null), e).toString();
+		catch (Exception e)
+			return makeErrorResponse(Json(null), parseError(e.msg)).toString();
+
+		auto dispatch = (Message m) @safe {
+			return handle(m, new ConnectionScopedContext(conn));
+		};
+
+		if (!input.isBatch)
+		{
+			auto resp = dispatch(input.messages[0]);
+			return resp.isNull ? "" : resp.get.toString();
+		}
+
+		if (conn.negotiated >= ProtocolVersion.v2025_06_18)
+			return makeErrorResponse(Json(null),
+					invalidRequest("JSON-RPC batching is not supported on this protocol version"))
+				.toString();
+
+		Json responses = Json.emptyArray;
+		foreach (m; input.messages)
+		{
+			auto resp = dispatch(m);
+			if (!resp.isNull)
+				responses ~= resp.get;
+		}
+		foreach (err; input.errors)
+			responses ~= makeErrorResponse(Json(null), err.error);
+		return responses.length == 0 ? "" : responses.toString();
 	}
 
 	/// As `handleRaw`, but with a server->client write `sink` for transports (such
@@ -2525,22 +2598,24 @@ final class McpServer
 		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
 			throw missingRequiredClientCapability(missing.get);
 
-		// Task-augmented execution gating (2025-11-25 tasks / draft
-		// io.modelcontextprotocol/tasks). The SDK does not yet drive the two-phase
+		// Task-augmented execution gating. The SDK does not yet drive the two-phase
 		// CreateTaskResult flow from `tools/call`, so it must not silently downgrade
 		// a task-augmented call to a synchronous result, nor execute a tool that
 		// declares it MUST run as a task:
 		//   (a) a tool whose execution.taskSupport == "required" invoked WITHOUT
 		//       task augmentation is rejected (the tool cannot be run synchronously);
-		//   (b) a task-augmented call (the 2025-11-25 `task` param, or the draft
-		//       `_meta["io.modelcontextprotocol/task"]`) is rejected because the
-		//       receiver cannot return a CreateTaskResult.
-		// Both surface -32601 rather than running the handler and returning a plain
-		// CallToolResult the conformant client did not ask for.
-		const bool taskAugmented = isTaskAugmented(params);
+		//       this is independent of whether tasks were declared.
+		//   (b) a task-augmented call (the 2025-11-25 `task` param) is rejected with
+		//       -32601 ONLY when the server actually declared task support for
+		//       `tools/call`. A receiver that never declared the task capability MUST
+		//       process the request normally, ignoring the task augmentation
+		//       (basic/utilities/tasks: "Receivers that do not declare the task
+		//       capability for a request type MUST process requests of that type
+		//       normally, ignoring any task-augmentation metadata if present").
 		const bool taskRequired = !entry.descriptor.execution.isNull
 			&& !entry.descriptor.execution.get.taskSupport.isNull
 			&& entry.descriptor.execution.get.taskSupport.get == "required";
+		const bool taskAugmented = isTaskAugmented(params) && declaresTaskToolsCall();
 		if (taskAugmented || taskRequired)
 			throw methodNotFound(name);
 
@@ -2607,19 +2682,33 @@ final class McpServer
 	}
 
 	/// Whether a `tools/call` request carries task augmentation. The 2025-11-25
-	/// shape is a top-level `task` param object; the draft carries it under
-	/// `_meta["io.modelcontextprotocol/task"]`. Either presence means the client
-	/// asked for two-phase task execution.
+	/// shape is a top-level `task` param object. The draft (SEP-2663) removed the
+	/// per-request opt-in entirely — the field is treated as unknown — so there is
+	/// no draft augmentation form to detect.
 	private static bool isTaskAugmented(Json params) @safe
 	{
 		if (params.type != Json.Type.object)
 			return false;
 		if ("task" in params && params["task"].type != Json.Type.undefined)
 			return true;
-		if ("_meta" in params && params["_meta"].type == Json.Type.object
-				&& MetaKey.task in params["_meta"])
-			return true;
 		return false;
+	}
+
+	/// Whether the server declared task support for `tools/call`. This is true only
+	/// when the `tasks` capability was advertised AND its nested `requests` object
+	/// marks `tools.call` as task-augmentable (`tasks.requests.tools.call`). A
+	/// server that never declared this MUST ignore task augmentation on a
+	/// `tools/call` and process the request normally.
+	private bool declaresTaskToolsCall() @safe
+	{
+		if (tasksCapability.isNull)
+			return false;
+		auto requests = tasksCapability.get.requests;
+		if (requests.type != Json.Type.object)
+			return false;
+		if ("tools" !in requests || requests["tools"].type != Json.Type.object)
+			return false;
+		return ("call" in requests["tools"]) !is null;
 	}
 
 	/// When input-schema validation is enabled, verify that a tool call's
@@ -3458,7 +3547,7 @@ unittest  // a taskSupport:"required" tool invoked WITHOUT augmentation is rejec
 	assert(!ran, "the handler must not execute for a required-task tool sans augmentation");
 }
 
-unittest  // a task-augmented tools/call is rejected rather than silently downgraded
+unittest  // a task-augmented tools/call runs normally when tasks were never declared
 {
 	auto s = new McpServer("aug-task-srv", "0.1.0");
 	bool ran;
@@ -3475,7 +3564,31 @@ unittest  // a task-augmented tools/call is rejected rather than silently downgr
 	params["name"] = "add";
 	params["task"] = Json.emptyObject; // 2025-11-25 task augmentation
 	auto resp = s.handle(req(4, "tools/call", params)).get;
-	assert("error" in resp, "a task-augmented call cannot be served as a CallToolResult");
+	assert("result" in resp,
+			"a server that never declared tasks must ignore the augmentation and run");
+	assert(resp["result"]["content"][0]["text"].get!string == "ok");
+	assert(ran, "the handler must run when the task augmentation is ignored");
+}
+
+unittest  // a task-augmented tools/call is rejected when the server declared task support
+{
+	auto s = new McpServer("aug-task-cap-srv", "0.1.0");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+	bool ran;
+	Tool t = {name: "add"};
+	t.execution = ToolExecution(nullable("optional"));
+	s.registerDynamicTool(t, (Json args) @safe {
+		ran = true;
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+
+	Json params = Json.emptyObject;
+	params["name"] = "add";
+	params["task"] = Json.emptyObject; // 2025-11-25 task augmentation
+	auto resp = s.handle(req(4, "tools/call", params)).get;
+	assert("error" in resp, "a declared task-augmented call cannot be served as a CallToolResult");
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 	assert(!ran);
 }
@@ -4223,6 +4336,51 @@ unittest  // handleRaw rejects a non-string method as -32600 instead of crashing
 	auto s = makeTestServer();
 	auto j = parseJsonString(s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":42}`));
 	assert(j["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // handleRaw(text, conn) gates a batch on the supplied state's version
+{
+	import vibe.data.json : parseJsonString;
+
+	// A modern session (negotiated >= 2025-06-18) rejects the batch with a single
+	// -32600, regardless of the server's own bound activeConnection.
+	auto s = makeTestServer();
+	auto conn = new ConnectionState;
+	conn.negotiated = ProtocolVersion.v2025_06_18;
+	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
+		{"jsonrpc":"2.0","id":2,"method":"ping"}]`, conn);
+	auto resp = parseJsonString(outText);
+	assert(resp.type == Json.Type.object);
+	assert(resp["id"].type == Json.Type.null_);
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // handleRaw(text, conn) processes a batch on a 2025-03-26 state
+{
+	import vibe.data.json : parseJsonString;
+
+	// The legacy batch path is reachable when the resolved state negotiated
+	// 2025-03-26, even though the server's bound activeConnection defaults to the
+	// latest stable version.
+	auto s = makeTestServer();
+	auto conn = new ConnectionState;
+	conn.negotiated = ProtocolVersion.v2025_03_26;
+	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
+		{"jsonrpc":"2.0","id":2,"method":"ping"}]`, conn);
+	auto arr = parseJsonString(outText);
+	assert(arr.type == Json.Type.array);
+	assert(arr.length == 2);
+}
+
+unittest  // handleRaw(null) falls back to the no-arg activeConnection behaviour
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = makeTestServer();
+	auto j = parseJsonString(s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"ping"}`,
+			cast(ConnectionState) null));
+	assert(j["id"].get!int == 1);
+	assert("result" in j);
 }
 
 unittest  // handleRaw on a batch returns only the responses (notifications drop out)

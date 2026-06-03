@@ -20,7 +20,6 @@ enum MetaKey : string
 	clientCapabilities = "io.modelcontextprotocol/clientCapabilities",
 	logLevel = "io.modelcontextprotocol/logLevel",
 	subscriptionId = "io.modelcontextprotocol/subscriptionId",
-	task = "io.modelcontextprotocol/task",
 }
 
 // ===========================================================================
