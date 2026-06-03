@@ -18,6 +18,11 @@ module mcp.auth.csprng;
  * reached, the function throws rather than emit predictable bytes.
  */
 
+// D has no `version(linux) || version(Posix)` operator. linux implies Posix,
+// so aliasing both onto one identifier selects the shared /dev/urandom reader.
+version (linux) version = McpHasDevUrandom;
+version (Posix) version = McpHasDevUrandom;
+
 @safe:
 
 /// Thrown when the operating system CSPRNG cannot be read.
@@ -146,61 +151,32 @@ version (linux)
 		else
 			return syscall(sysno, buf, buflen, flags);
 	}
-
-	private void readDevUrandom(scope ubyte[] buf) @trusted
-	{
-		import core.sys.posix.unistd : read, close;
-		import core.sys.posix.fcntl : open, O_RDONLY;
-		import core.stdc.errno : errno, EINTR;
-
-		const fd = open("/dev/urandom", O_RDONLY);
-		if (fd < 0)
-			throw new CsprngException("cannot open /dev/urandom");
-		scope (exit)
-			close(fd);
-		size_t filled = 0;
-		while (filled < buf.length)
-		{
-			const n = read(fd, &buf[filled], buf.length - filled);
-			if (n < 0)
-			{
-				if (errno == EINTR)
-					continue;
-				throw new CsprngException("read(/dev/urandom) failed");
-			}
-			if (n == 0)
-				throw new CsprngException("unexpected EOF on /dev/urandom");
-			filled += cast(size_t) n;
-		}
-	}
 }
-else version (Posix)
-{
-	private void readDevUrandom(scope ubyte[] buf) @trusted
-	{
-		import core.sys.posix.unistd : read, close;
-		import core.sys.posix.fcntl : open, O_RDONLY;
-		import core.stdc.errno : errno, EINTR;
 
-		const fd = open("/dev/urandom", O_RDONLY);
-		if (fd < 0)
-			throw new CsprngException("cannot open /dev/urandom");
-		scope (exit)
-			close(fd);
-		size_t filled = 0;
-		while (filled < buf.length)
+version (McpHasDevUrandom) private void readDevUrandom(scope ubyte[] buf) @trusted
+{
+	import core.sys.posix.unistd : read, close;
+	import core.sys.posix.fcntl : open, O_RDONLY;
+	import core.stdc.errno : errno, EINTR;
+
+	const fd = open("/dev/urandom", O_RDONLY);
+	if (fd < 0)
+		throw new CsprngException("cannot open /dev/urandom");
+	scope (exit)
+		close(fd);
+	size_t filled = 0;
+	while (filled < buf.length)
+	{
+		const n = read(fd, &buf[filled], buf.length - filled);
+		if (n < 0)
 		{
-			const n = read(fd, &buf[filled], buf.length - filled);
-			if (n < 0)
-			{
-				if (errno == EINTR)
-					continue;
-				throw new CsprngException("read(/dev/urandom) failed");
-			}
-			if (n == 0)
-				throw new CsprngException("unexpected EOF on /dev/urandom");
-			filled += cast(size_t) n;
+			if (errno == EINTR)
+				continue;
+			throw new CsprngException("read(/dev/urandom) failed");
 		}
+		if (n == 0)
+			throw new CsprngException("unexpected EOF on /dev/urandom");
+		filled += cast(size_t) n;
 	}
 }
 
