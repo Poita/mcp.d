@@ -375,29 +375,18 @@ final class LegacySseChannel
 	}
 }
 
-/// Open a legacy GET SSE stream: register it on `channel` (which emits the
-/// leading `endpoint` event), then hold the connection open with SSE comment
-/// heartbeats so a client disconnect terminates the loop and drops the listener.
-private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @safe
+/// Serialize every write to one response's bodyWriter through a fresh per-stream
+/// TaskMutex and return the resulting write+flush closure. Each SSE handler shares
+/// its connection between a registered-listener writer and a heartbeat loop running
+/// on different fibers, and the underlying channel mutex guards only channel state,
+/// not these foreign writers — so without per-stream serialization two concurrent
+/// writes could interleave the bytes of different SSE frames.
+private void delegate(string) @safe sseFrameWriter(HTTPServerResponse res) @safe
 {
-	import vibe.core.core : sleep;
-	import core.time : seconds;
 	import vibe.core.sync : TaskMutex;
 
-	res.contentType = "text/event-stream";
-	applySseStreamHeaders(res, false);
-
-	// Serialize every write to THIS response's bodyWriter through one per-stream
-	// TaskMutex (mirroring handleGet/handleListenStream): the registered-listener
-	// writer (driven by LegacySseChannel.deliver) and the heartbeat loop share this
-	// connection, and LegacySseChannel.deliver itself has no write serialization, so
-	// without this lock two concurrent deliveries -- or a delivery racing the
-	// heartbeat -- could interleave the bytes of different SSE frames. A
-	// channel-level mutex would not help, since it cannot serialize against this
-	// foreign heartbeat writer; the serialization must live here.
 	auto writeMtx = new TaskMutex;
-	void writeFrame(string frame) @safe
-	{
+	return (string frame) @safe {
 		() @trusted {
 			synchronized (writeMtx)
 			{
@@ -405,13 +394,15 @@ private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @
 				res.bodyWriter.flush();
 			}
 		}();
-	}
+	};
+}
 
-	const listenerId = channel.addListener((string frame) @safe {
-		writeFrame(frame);
-	});
-	scope (exit)
-		channel.removeListener(listenerId);
+/// Hold an SSE connection open, emitting a comment heartbeat every 15s so a write
+/// failure (client disconnect) is observed and the loop terminates.
+private void runSseHeartbeat(void delegate(string) @safe writeFrame) @safe
+{
+	import vibe.core.core : sleep;
+	import core.time : seconds;
 
 	while (true)
 	{
@@ -421,6 +412,28 @@ private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @
 		catch (Exception)
 			break;
 	}
+}
+
+/// Open a legacy GET SSE stream: register it on `channel` (which emits the
+/// leading `endpoint` event), then hold the connection open with SSE comment
+/// heartbeats so a client disconnect terminates the loop and drops the listener.
+private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @safe
+{
+	res.contentType = "text/event-stream";
+	applySseStreamHeaders(res, false);
+
+	// LegacySseChannel.deliver itself has no write serialization, so without the
+	// per-stream lock two concurrent deliveries -- or a delivery racing the
+	// heartbeat -- could interleave SSE frames.
+	auto writeFrame = sseFrameWriter(res);
+
+	const listenerId = channel.addListener((string frame) @safe {
+		writeFrame(frame);
+	});
+	scope (exit)
+		channel.removeListener(listenerId);
+
+	runSseHeartbeat(writeFrame);
 }
 
 /// Process a single JSON-RPC message POSTed to the legacy message endpoint and
@@ -445,15 +458,9 @@ string formatLegacyEndpointEvent(string uri) @safe
 	return "event: endpoint\ndata: " ~ uri ~ "\n\n";
 }
 
-/// Frame a legacy server `message` SSE event from a JSON-RPC value (2024-11-05
-/// basic/transports §HTTP with SSE: "Server messages are sent as SSE `message`
-/// events, with the message content encoded as JSON in the event data").
-string formatLegacyMessageEvent(Json msg) @safe
-{
-	return formatLegacyMessageEventRaw(msg.toString());
-}
-
-/// As `formatLegacyMessageEvent` but from already-serialised JSON text.
+/// Frame a legacy server `message` SSE event from already-serialised JSON text
+/// (2024-11-05 basic/transports §HTTP with SSE: "Server messages are sent as SSE
+/// `message` events, with the message content encoded as JSON in the event data").
 string formatLegacyMessageEventRaw(string jsonText) @safe
 {
 	return "event: message\ndata: " ~ jsonText ~ "\n\n";
@@ -804,34 +811,13 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 
 	// Open a long-lived SSE stream wired to the server-push channel, so the
 	// server can deliver unsolicited notifications/requests outside any POST.
-	import vibe.core.core : sleep;
-	import core.time : seconds;
-
 	res.contentType = "text/event-stream";
 	// The standalone GET stream is offered only on the stable revisions
 	// (getOpensSseStream gated above); the X-Accel-Buffering: no SHOULD is a
 	// draft-only rule, so it is not emitted here.
 	applySseStreamHeaders(res, false);
 
-	// Serialize every write to THIS response's bodyWriter through one per-stream
-	// TaskMutex (mirroring duplex.d): the push-channel listener callback, the
-	// up-front retry: event, and the heartbeat loop all share this connection, and
-	// without the lock two fibers could interleave the bytes of different SSE
-	// frames. The channel's own mutex guards only its state, not a foreign
-	// heartbeat writer, so the serialization must live here.
-	import vibe.core.sync : TaskMutex;
-
-	auto writeMtx = new TaskMutex;
-	void writeFrame(string frame) @safe
-	{
-		() @trusted {
-			synchronized (writeMtx)
-			{
-				res.bodyWriter.write(cast(const(ubyte)[]) frame);
-				res.bodyWriter.flush();
-			}
-		}();
-	}
+	auto writeFrame = sseFrameWriter(res);
 
 	// Resumability and Redelivery (basic/transports §Resumability and Redelivery):
 	// if the reconnecting client supplied the `Last-Event-ID` header, hand it to
@@ -863,16 +849,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 		}
 	}
 
-	// Hold the connection open, emitting an SSE comment heartbeat so a write
-	// failure (client disconnect) is observed and the loop terminates.
-	while (true)
-	{
-		sleep(15.seconds);
-		try
-			writeFrame(": ping\n\n");
-		catch (Exception)
-			break;
-	}
+	runSseHeartbeat(writeFrame);
 }
 
 /// Serve a draft `subscriptions/listen` request as a long-lived SSE notification
@@ -891,9 +868,6 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 private void handleListenStream(McpServer server, StreamCoordinator coord,
 		Message msg, HTTPServerResponse res) @safe
 {
-	import vibe.core.core : sleep;
-	import core.time : seconds;
-
 	// Record the opted-in filters (route -> doSubscribeListen). The one-shot
 	// JSON result is discarded: on this path the acknowledgement is delivered as
 	// the first SSE event instead.
@@ -911,24 +885,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	// §Receiving Messages).
 	applySseStreamHeaders(res, true);
 
-	// Serialize every write to THIS response's bodyWriter through one per-stream
-	// TaskMutex: the push-channel listener callback (the leading ack and every
-	// subsequent notification) and the heartbeat loop share this connection, so
-	// without the lock two fibers could interleave the bytes of different SSE
-	// frames.
-	import vibe.core.sync : TaskMutex;
-
-	auto writeMtx = new TaskMutex;
-	void writeFrame(string frame) @safe
-	{
-		() @trusted {
-			synchronized (writeMtx)
-			{
-				res.bodyWriter.write(cast(const(ubyte)[]) frame);
-				res.bodyWriter.flush();
-			}
-		}();
-	}
+	auto writeFrame = sseFrameWriter(res);
 
 	auto push = server.serverPushChannel(coord);
 	// The listen request's id becomes the stream's subscriptionId: every
@@ -953,16 +910,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	push.emitTo(listenerId,
 			subscriptionsAcknowledgedNotification(server.acknowledgedSubsetFor(streamFilter)));
 
-	// Hold the connection open, emitting an SSE comment heartbeat so a write
-	// failure (client disconnect) is observed and the loop terminates.
-	while (true)
-	{
-		sleep(15.seconds);
-		try
-			writeFrame(": ping\n\n");
-		catch (Exception)
-			break;
-	}
+	runSseHeartbeat(writeFrame);
 }
 
 /// A minimal connection-scoped `RequestContext` used only to dispatch an inbound
@@ -1042,6 +990,32 @@ private final class HttpNotifyContext : RequestContext, ConnectionScoped
 	{
 		return TokenInfo.invalid();
 	}
+}
+
+/// Validate the draft-only request headers on a POSTed JSON-RPC request, returning
+/// the first error (caller emits it as a 400) or null when they pass. The
+/// MCP-Protocol-Version header is already validated by `postProtocolVersionGate`.
+private McpException validatePostRequestHeaders(HTTPServerRequest req,
+		ref Message msg, bool isDraftReq, McpServer server) @safe
+{
+	// Draft: validate the standard request headers against the body.
+	if (auto hdrErr = validateDraftHeaders(req.headers.get(HttpHeader.protocolVersion,
+			""), req.headers.get(HttpHeader.method, ""),
+			req.headers.get(HttpHeader.name, ""), msg, isDraftReq))
+		return hdrErr;
+
+	// Draft x-mcp-header: validate Mcp-Param-* headers against the tool's
+	// declared header parameters and the body arguments.
+	if (msg.method == "tools/call" && isDraftReq)
+	{
+		const tname = ("name" in msg.params && msg.params["name"].type == Json.Type.string) ? msg
+			.params["name"].get!string : "";
+		auto schema = server.toolInputSchema(tname);
+		auto args = ("arguments" in msg.params) ? msg.params["arguments"] : Json.emptyObject;
+		return validateParamHeaders(schema, args, (string h) => req.headers.get(h, ""));
+	}
+
+	return null;
 }
 
 private void handlePost(McpServer server, StreamCoordinator coord,
@@ -1235,33 +1209,11 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// uses. All draft-gated header validation below keys off this single value.
 		const isDraftReq = tryDraft(req.headers.get(HttpHeader.protocolVersion, ""))
 			|| tryDraft(RequestMeta.fromParams(msg.params).protocolVersion);
-		// The MCP-Protocol-Version header was already validated by
-		// postProtocolVersionGate above (it gates every POST kind).
-		// Draft: validate the standard request headers against the body.
-		auto hdrErr = validateDraftHeaders(req.headers.get(HttpHeader.protocolVersion,
-				""), req.headers.get(HttpHeader.method, ""),
-				req.headers.get(HttpHeader.name, ""), msg, isDraftReq);
-		if (hdrErr !is null)
+		if (auto hdrErr = validatePostRequestHeaders(req, msg, isDraftReq, server))
 		{
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeBody(makeErrorResponse(msg.id, hdrErr).toString(), "application/json");
 			return;
-		}
-		// Draft x-mcp-header: validate Mcp-Param-* headers against the tool's
-		// declared header parameters and the body arguments.
-		if (msg.method == "tools/call" && isDraftReq)
-		{
-			const tname = ("name" in msg.params && msg.params["name"].type == Json.Type.string) ? msg
-				.params["name"].get!string : "";
-			auto schema = server.toolInputSchema(tname);
-			auto args = ("arguments" in msg.params) ? msg.params["arguments"] : Json.emptyObject;
-			auto perr = validateParamHeaders(schema, args, (string h) => req.headers.get(h, ""));
-			if (perr !is null)
-			{
-				res.statusCode = HTTPStatus.badRequest;
-				res.writeBody(makeErrorResponse(msg.id, perr).toString(), "application/json");
-				return;
-			}
 		}
 		// Draft subscriptions/listen: the response is itself a long-lived SSE
 		// stream that stays open and delivers change notifications until the
@@ -1644,7 +1596,7 @@ unittest  // legacy server messages are SSE `message` events with JSON data
 	import std.algorithm : canFind;
 
 	auto j = makeNotification("notifications/message", Json.emptyObject);
-	const frame = formatLegacyMessageEvent(j);
+	const frame = formatLegacyMessageEventRaw(j.toString());
 	assert(frame.startsWith("event: message\ndata: "));
 	assert(frame.canFind("\"method\":\"notifications/message\""));
 	assert(frame.endsWith("\n\n"));
