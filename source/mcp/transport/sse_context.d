@@ -886,17 +886,25 @@ final class ServerPushChannel
 	/// or timeout. Throws `internalError` if no GET listener is connected (there
 	/// is nobody to answer). This is the request/response counterpart to
 	/// `notify`, and the foundation for server-initiated `ping`.
-	Json sendRequest(string method, Json params = Json.emptyObject, Duration timeout = 60.seconds) @safe
+	///
+	/// `ownerToken` scopes the request to the session that owns the target GET
+	/// stream: the waiter is registered under it so only a response POSTed under
+	/// the SAME session resolves it, and the request frame is delivered only on a
+	/// listener whose `Listener.ownerToken` matches. The empty token preserves the
+	/// stateless / shared path (any session, any listener), mirroring the unscoped
+	/// `StreamCoordinator.Waiter` and `Listener`.
+	Json sendRequest(string method, Json params = Json.emptyObject,
+			Duration timeout = 60.seconds, string ownerToken = "") @safe
 	{
 		const id = coord.alloc();
-		coord.register(id);
+		coord.register(id, ownerToken);
 		// Bind the in-flight request to its target listener under the channel mutex
 		// BEFORE the blocking write (passing `id` into `deliver`), not after it
 		// returns. A listener disconnect that races the write is then seen by
 		// `removeListenerLocked`'s scan, which fails this awaiter immediately rather
 		// than stranding it for the full timeout.
 		const listenerId = deliver(makeRequest(Json(id), method, params),
-				(ref const Listener) @safe => true, id);
+				(ref const Listener l) @safe => l.ownerToken == ownerToken, id);
 		if (listenerId < 0)
 		{
 			coord.cancel(id);
@@ -922,10 +930,11 @@ final class ServerPushChannel
 	/// connection-health check the spec describes for either party. Throws on a
 	/// client error, a timeout (treat as a stale connection), or when no GET
 	/// listener is connected. The `ping` request carries no params, exactly as
-	/// the spec requires.
-	void ping(Duration timeout = 60.seconds) @safe
+	/// the spec requires. `ownerToken` scopes the probe to one session's GET
+	/// stream (empty == the stateless / shared path); see `sendRequest`.
+	void ping(Duration timeout = 60.seconds, string ownerToken = "") @safe
 	{
-		sendRequest("ping", Json.emptyObject, timeout);
+		sendRequest("ping", Json.emptyObject, timeout, ownerToken);
 	}
 
 	/// Frame `msg` and write it to a single listener (identified by `listenerId`),
@@ -2077,6 +2086,46 @@ unittest  // push-channel ping round-trips: request frame out, empty result back
 	runEventLoop();
 
 	assert(pinged); // ping() returned without throwing -> client acknowledged
+}
+
+unittest  // a session-scoped push sendRequest is delivered only on the owning session's listener
+{
+	// Two GET listeners A and B own distinct sessions. A server->client request
+	// scoped to session A must land on A's stream, never B's, so B never even sees
+	// the request frame it could otherwise answer.
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string aFrame, bFrame;
+	ch.addListener((string f) @safe { aFrame = f; }, "",
+			SubscriptionFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { bFrame = f; }, "",
+			SubscriptionFilter.init, "", null, "sess-B");
+
+	// Deliver the scoped request frame exactly as sendRequest does (eligibility
+	// keyed on the owning token) without blocking on a reply.
+	const id = coord.alloc();
+	coord.register(id, "sess-A");
+	const landed = ch.deliver(makeRequest(Json(id), "ping", Json.emptyObject),
+			(ref const ServerPushChannel.Listener l) @safe => l.ownerToken == "sess-A", id);
+	assert(landed >= 0, "the scoped request must land on session A's listener");
+	assert(aFrame.canFind("\"method\":\"ping\""), "session A's stream must receive the request");
+	assert(bFrame.length == 0, "session B's stream must NOT receive a request it does not own");
+}
+
+unittest  // a different session's response cannot resolve a push sendRequest waiter
+{
+	// A server->client request issued on the GET push channel scoped to session A
+	// registers its waiter under sess-A. A response POSTed under session B must NOT
+	// resolve it -- the same cross-session hijack the POST path already closes.
+	auto coord = new StreamCoordinator;
+	const id = coord.alloc();
+	coord.register(id, "sess-A");
+	assert(!coord.resolve(Json(id), Json.emptyObject, Json.undefined, "sess-B"),
+			"a session-B response wrongly resolved session A's GET-stream waiter");
+	assert(coord.resolve(Json(id), Json.emptyObject, Json.undefined, "sess-A"),
+			"the owning session's response must resolve its own GET-stream waiter");
 }
 
 unittest  // failPending wakes a single awaiter promptly with an McpException
