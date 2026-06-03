@@ -15,11 +15,10 @@ module mcp.auth.introspection_verifier;
 import core.time : Duration, seconds;
 
 import std.algorithm : canFind;
-import std.array : split;
-import std.string : strip;
 
 import vibe.data.json : Json, parseJsonString;
 
+import mcp.auth.jwt_verifier : audiences, currentUnixTime, jsonStr, splitScopes;
 import mcp.auth.oauth : TokenEndpointAuthMethod, basicAuthHeader, requireSecureUrl;
 import mcp.auth.resource_server : TokenInfo, TokenValidator;
 
@@ -122,7 +121,7 @@ TokenInfo introspectionResult(IntrospectionConfig cfg, string responseJson) @saf
 	if (active.type != Json.Type.bool_ || !active.get!bool)
 		return TokenInfo.invalid();
 
-	auto auds = introspectionAudiences(doc);
+	auto auds = audiences(doc);
 	if (cfg.audience.length && !auds.canFind(cfg.audience))
 		return TokenInfo.invalid();
 
@@ -265,21 +264,6 @@ final class PositiveCache
 // Small helpers
 // ===========================================================================
 
-private long currentUnixTime() @safe
-{
-	import std.datetime.systime : Clock;
-
-	return Clock.currTime.toUnixTime;
-}
-
-private string jsonStr(Json j, string key) @safe
-{
-	auto v = j[key];
-	if (v.type == Json.Type.string)
-		return v.get!string;
-	return null;
-}
-
 /// Extract the `exp` claim (token expiry, unix seconds) from an introspection
 /// response (RFC 7662 2.2 / RFC 7519 4.1.1). Returns 0 when absent or not a
 /// number, signalling "no known expiry".
@@ -295,33 +279,13 @@ long introspectionExp(Json doc) @safe
 	return 0;
 }
 
-/// Extract the audiences from an introspection response: `aud` may be a string
-/// or an array of strings (RFC 7662 2.2 / RFC 7519 4.1.3).
-string[] introspectionAudiences(Json doc) @safe
-{
-	string[] result;
-	auto a = doc["aud"];
-	if (a.type == Json.Type.string)
-		result ~= a.get!string;
-	else if (a.type == Json.Type.array)
-		foreach (e; ()@trusted { return a.get!(Json[]); }())
-			if (e.type == Json.Type.string)
-				result ~= e.get!string;
-	return result;
-}
-
 /// Extract granted scopes from an introspection response: `scope` is a
 /// space-delimited string (RFC 7662 2.2).
 string[] introspectionScopes(Json doc) @safe
 {
 	auto scope_ = doc["scope"];
 	if (scope_.type == Json.Type.string)
-	{
-		auto s = scope_.get!string.strip;
-		if (s.length == 0)
-			return null;
-		return s.split(' ');
-	}
+		return splitScopes(scope_.get!string);
 	return null;
 }
 
@@ -441,6 +405,14 @@ unittest  // an empty scope string yields no scopes
 	auto ti = introspectionResult(cfg, `{"active":true,"scope":""}`);
 	assert(ti.valid);
 	assert(ti.scopes.length == 0);
+}
+
+unittest  // internal runs of spaces do not produce empty-string scopes
+{
+	IntrospectionConfig cfg;
+	auto ti = introspectionResult(cfg, `{"active":true,"scope":"a   b"}`);
+	assert(ti.valid);
+	assert(ti.scopes == ["a", "b"]);
 }
 
 unittest  // introspectionBody for client_secret_basic carries only the token
