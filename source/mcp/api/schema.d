@@ -247,10 +247,13 @@ private template hasFieldDefault(T, size_t i)
 		/// output schemas: `type` (object/array/string/integer/number/boolean), nested
 		/// `properties` with `required`, `additionalProperties` (both the object
 		/// value-schema form and the boolean `false` form, which forbids any
-		/// undeclared object key), array `items`,
-		/// and `enum`. Unknown keywords are
-		/// ignored (treated as satisfied), so a richer hand-written schema never reports
-		/// a spurious failure.
+		/// undeclared object key), array `items`, `enum`, `anyOf`/`oneOf` (the value
+		/// must match at least one sub-schema, as emitted for SumType parameters and
+		/// returns), and the facet bounds `minimum`/`maximum` (numbers),
+		/// `minLength`/`maxLength` (code-point string length), and
+		/// `minItems`/`maxItems` (array length). Other unknown keywords are ignored
+		/// (treated as satisfied), so a richer hand-written schema never reports a
+		/// spurious failure.
 		string validateAgainstSchema(Json value, Json schema) @safe
 		{
 			return validateAt(value, schema, "");
@@ -365,7 +368,92 @@ private template hasFieldDefault(T, size_t i)
 				}
 			}
 
+			// anyOf / oneOf: the value conforms iff it validates against at least
+			// one sub-schema. SumType-typed parameters and returns are emitted as
+			// `{anyOf:[…]}`; only when every branch fails is the value rejected.
+			foreach (kw; ["anyOf", "oneOf"])
+				if (kw in schema && schema[kw].type == Json.Type.array)
+					{
+					auto subs = schema[kw];
+					bool any;
+					string firstMsg;
+					foreach (i; 0 .. subs.length)
+						{
+						auto msg = validateAt(value, subs[i], path);
+						if (msg.length == 0)
+							{
+							any = true;
+							break;
+						}
+						if (firstMsg.length == 0)
+							firstMsg = msg;
+					}
+					if (!any)
+						return where ~ ": value does not match any permitted schema";
+				}
+
+			// Numeric bounds (minimum / maximum) on number and integer values.
+			if (value.type == Json.Type.int_ || value.type == Json.Type.float_)
+				{
+				const num = value.type == Json.Type.int_
+					? cast(double) value.get!long : value.get!double;
+				if ("minimum" in schema && schema["minimum"].type != Json.Type.undefined)
+					{
+					const lo = jsonNumber(schema["minimum"]);
+					if (num < lo)
+						return where ~ ": value is below the minimum";
+				}
+				if ("maximum" in schema && schema["maximum"].type != Json.Type.undefined)
+					{
+					const hi = jsonNumber(schema["maximum"]);
+					if (num > hi)
+						return where ~ ": value is above the maximum";
+				}
+			}
+
+			// String length bounds (minLength / maxLength), counted in code points.
+			if (value.type == Json.Type.string)
+				{
+				import std.utf : count;
+
+				const len = value.get!string.count;
+				if ("minLength" in schema && schema["minLength"].type == Json.Type.int_)
+					{
+					if (len < schema["minLength"].get!long)
+						return where ~ ": string is shorter than minLength";
+				}
+				if ("maxLength" in schema && schema["maxLength"].type == Json.Type.int_)
+					{
+					if (len > schema["maxLength"].get!long)
+						return where ~ ": string is longer than maxLength";
+				}
+			}
+
+			// Array length bounds (minItems / maxItems).
+			if (value.type == Json.Type.array)
+				{
+				if ("minItems" in schema && schema["minItems"].type == Json.Type.int_)
+					{
+					if (value.length < schema["minItems"].get!long)
+						return where ~ ": array has fewer than minItems items";
+				}
+				if ("maxItems" in schema && schema["maxItems"].type == Json.Type.int_)
+					{
+					if (value.length > schema["maxItems"].get!long)
+						return where ~ ": array has more than maxItems items";
+				}
+			}
+
 			return "";
+		}
+
+		private double jsonNumber(Json j) @safe
+		{
+			if (j.type == Json.Type.int_)
+				return cast(double) j.get!long;
+			if (j.type == Json.Type.float_)
+				return j.get!double;
+			return 0;
 		}
 
 		private bool matchesType(Json value, string type) @safe
@@ -543,6 +631,75 @@ private template hasFieldDefault(T, size_t i)
 		{
 			assert(validateAgainstSchema(Json("anything"), Json.undefined) == "");
 			assert(validateAgainstSchema(Json(42), Json.emptyObject) == "");
+		}
+
+		unittest  // validateAgainstSchema enforces a SumType (anyOf) schema
+		{
+			import std.sumtype : SumType;
+
+			auto schema = jsonSchemaOf!(SumType!(int, string));
+			assert("anyOf" in schema);
+			assert(validateAgainstSchema(Json(7), schema) == "");
+			assert(validateAgainstSchema(Json("hi"), schema) == "");
+			assert(validateAgainstSchema(Json(true), schema).length > 0);
+			assert(validateAgainstSchema(Json.emptyObject, schema).length > 0);
+		}
+
+		unittest  // validateAgainstSchema enforces minimum / maximum
+		{
+			Json schema = Json.emptyObject;
+			schema["type"] = "integer";
+			schema["minimum"] = Json(1);
+			schema["maximum"] = Json(100);
+			assert(validateAgainstSchema(Json(50), schema) == "");
+			assert(validateAgainstSchema(Json(0), schema).length > 0);
+			assert(validateAgainstSchema(Json(101), schema).length > 0);
+		}
+
+		unittest  // validateAgainstSchema enforces minLength / maxLength
+		{
+			Json schema = Json.emptyObject;
+			schema["type"] = "string";
+			schema["minLength"] = Json(3);
+			schema["maxLength"] = Json(5);
+			assert(validateAgainstSchema(Json("abcd"), schema) == "");
+			assert(validateAgainstSchema(Json("ab"), schema).length > 0);
+			assert(validateAgainstSchema(Json("abcdef"), schema).length > 0);
+		}
+
+		unittest  // validateAgainstSchema enforces minItems / maxItems
+		{
+			Json schema = Json.emptyObject;
+			schema["type"] = "array";
+			schema["minItems"] = Json(1);
+			schema["maxItems"] = Json(2);
+			Json one = Json.emptyArray;
+			one ~= 1;
+			Json three = Json.emptyArray;
+			three ~= 1;
+			three ~= 2;
+			three ~= 3;
+			assert(validateAgainstSchema(one, schema) == "");
+			assert(validateAgainstSchema(Json.emptyArray, schema).length > 0);
+			assert(validateAgainstSchema(three, schema).length > 0);
+		}
+
+		unittest  // a @minimum field UDA is emitted and enforced together
+		{
+			import mcp.api.attributes : minimum;
+
+			struct P
+			{
+				@minimum(1) int count;
+			}
+
+			auto schema = jsonSchemaOf!P;
+			Json good = Json.emptyObject;
+			good["count"] = Json(5);
+			assert(validateAgainstSchema(good, schema) == "");
+			Json bad = Json.emptyObject;
+			bad["count"] = Json(-5);
+			assert(validateAgainstSchema(bad, schema).length > 0);
 		}
 
 		unittest  // associative array maps to object with additionalProperties
