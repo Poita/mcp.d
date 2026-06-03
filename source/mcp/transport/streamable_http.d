@@ -682,6 +682,17 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 		}
 	}
 
+	// The GET that opens the standalone stream is a subsequent HTTP request and
+	// is subject to the same rule as the POST path: an invalid or unsupported
+	// MCP-Protocol-Version MUST be answered with 400 Bad Request rather than a
+	// 200 text/event-stream.
+	if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
+	{
+		res.statusCode = HTTPStatus.badRequest;
+		res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
+		return;
+	}
+
 	// Open a long-lived SSE stream wired to the server-push channel, so the
 	// server can deliver unsolicited notifications/requests outside any POST.
 	import vibe.core.core : sleep;
@@ -934,11 +945,13 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		input = parseAny(payload);
 	catch (McpException e)
 	{
+		res.statusCode = HTTPStatus.badRequest;
 		res.writeBody(makeErrorResponse(Json(null), e).toString(), "application/json");
 		return;
 	}
 	catch (Exception e)
 	{
+		res.statusCode = HTTPStatus.badRequest;
 		res.writeBody(makeErrorResponse(Json(null), parseError(e.msg))
 				.toString(), "application/json");
 		return;
@@ -1801,6 +1814,24 @@ unittest  // the version gate applies to EVERY POST kind, not just requests
 	assert(postProtocolVersionGate("") is null);
 }
 
+unittest  // the standalone GET stream is version-gated like a POST: bad version -> 400, not a 200 stream
+{
+	// basic/transports §Protocol Version Header: the GET that opens the
+	// standalone server->client stream is a subsequent HTTP request, so an
+	// invalid/unsupported MCP-Protocol-Version MUST yield 400 Bad Request rather
+	// than opening a 200 text/event-stream. handleGet runs postProtocolVersionGate
+	// (the same gate every POST kind runs) after the session check and before
+	// setting Content-Type, so the rejecting McpException maps to HTTP 400.
+	auto bad = postProtocolVersionGate("1.0.0");
+	assert(bad !is null, "an invalid version on the standalone GET must be rejected");
+	assert(bad.code == ErrorCode.unsupportedProtocolVersion);
+	auto j = makeErrorResponse(Json(null), bad);
+	assert(httpStatusForResponse(j, false) == 400);
+	// a supported / absent header opens the stream (gate returns null)
+	assert(postProtocolVersionGate("2025-11-25") is null);
+	assert(postProtocolVersionGate("") is null);
+}
+
 /// True if the protocol-version header denotes a draft+ request.
 private bool tryDraft(string protoHeader) @safe
 {
@@ -2007,6 +2038,27 @@ unittest  // a batch on a modern version is rejected with an invalidRequest 400
 	assert(e.code == ErrorCode.invalidRequest);
 	auto j = makeErrorResponse(Json(null), e);
 	assert(j["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // an unparseable / non-envelope POST body throws so handlePost answers 400
+{
+	// basic/transports: a POST whose body is not parseable JSON, or is JSON but
+	// not a valid JSON-RPC envelope, is answered with HTTP 400. handlePost wraps
+	// parseAny in try/catch and, on failure, sets statusCode = badRequest before
+	// writing the JSON-RPC error body. This asserts the trigger the fix relies on:
+	// parseAny throws a parseError (-32700) for invalid JSON and an invalidRequest
+	// (-32600) for a body that is not a valid JSON-RPC envelope, and that those
+	// codes carry into the error response body the handler writes alongside the 400.
+	import std.exception : assertThrown, collectException;
+
+	auto badJson = collectException!McpException(parseAny("not json at all"));
+	assert(badJson !is null, "unparseable JSON must throw");
+
+	auto badEnvelope = collectException!McpException(parseAny(`{"id":1,"method":"ping"}`));
+	assert(badEnvelope !is null, "a body missing the jsonrpc field must throw");
+	assert(badEnvelope.code == ErrorCode.invalidRequest);
+	auto body_ = makeErrorResponse(Json(null), badEnvelope);
+	assert(body_["error"]["code"].get!int == ErrorCode.invalidRequest);
 }
 
 /// Decide whether a request must be answered with a long-lived `text/event-stream`

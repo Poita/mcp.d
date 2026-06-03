@@ -1338,9 +1338,14 @@ final class McpServer
 			ProtocolVersion mv;
 			if (tryParseVersion(meta.protocolVersion, mv))
 			{
-				effective = mv;
 				if (mv.isDraft)
 				{
+					// Per-request body `_meta.protocolVersion` is the stateless/draft
+					// negotiation channel: only on the draft model does it select the
+					// effective version. On a stateful 2025-era session the negotiated
+					// version is fixed at `initialize` and governs every request, so a
+					// per-request body version is ignored for version selection.
+					effective = mv;
 					// Per-request client capabilities (draft, stateless): not stored on the
 					// shared instance. clientCapabilities() reflects the negotiated session.
 					if (meta.logLevel.isNull)
@@ -2711,6 +2716,33 @@ unittest  // public flagship type uses single-cap Mcp* casing
 	static assert(is(McpServer == class));
 	auto s = new McpServer("casing-srv", "0.1.0");
 	assert(s !is null);
+}
+
+unittest  // a stateful session ignores a body _meta.protocolVersion naming an earlier version
+{
+	// On a stateful 2025-era session the negotiated version is fixed at
+	// initialize and governs every request: a per-request body
+	// `_meta.protocolVersion` naming an earlier version MUST NOT re-select the
+	// effective version. The tasks RPCs are gated at >= 2025-11-25, so if the body
+	// version (2025-03-26) were honoured `tasks/list` would report -32601; gated at
+	// the negotiated 2025-11-25 it returns an empty page.
+	auto s = McpServer.stateful("ver-srv", "0.1.0");
+	s.enableTasks();
+
+	Json init = Json.emptyObject;
+	init["protocolVersion"] = "2025-11-25";
+	init["capabilities"] = Json.emptyObject;
+	init["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	auto ir = s.handle(req(1, "initialize", init)).get;
+	assert(ir["result"]["protocolVersion"].get!string == "2025-11-25");
+
+	Json params = Json.emptyObject;
+	Json meta = Json.emptyObject;
+	meta["io.modelcontextprotocol/protocolVersion"] = "2025-03-26";
+	params["_meta"] = meta;
+	auto resp = s.handle(req(2, "tasks/list", params)).get;
+	assert("error" !in resp, "body _meta.protocolVersion must not down-gate a stateful session");
+	assert(resp["result"]["tasks"].type == Json.Type.array);
 }
 
 unittest  // initialize negotiates the requested version and reports server info
