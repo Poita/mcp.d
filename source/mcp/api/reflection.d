@@ -47,26 +47,7 @@ template EnumByNamePolicy(T) if (is(T == enum))
 /// marshalling from the method signatures (FastMCP-style ergonomics).
 void registerHandlers(T)(McpServer server, T obj) @safe
 {
-	static foreach (memberName; __traits(allMembers, T))
-	{
-		static if (__traits(compiles, __traits(getOverloads, T, memberName)))
-		{
-			static foreach (overload; __traits(getOverloads, T, memberName))
-			{
-				static foreach (attr; __traits(getAttributes, overload))
-				{
-					static if (is(typeof(attr) == tool))
-						registerToolMethod!(memberName, overload, obj)(server, attr);
-					else static if (is(typeof(attr) == prompt))
-						registerPromptMethod!(memberName, overload, obj)(server, attr);
-					else static if (is(typeof(attr) == resource))
-						registerResourceMethod!(memberName, overload, obj)(server, attr);
-					else static if (is(typeof(attr) == resourceTemplate))
-						registerTemplateMethod!(memberName, overload, obj)(server, attr);
-				}
-			}
-		}
-	}
+	registerAnnotatedMembers!(T, obj)(server);
 }
 
 /// Register every `@tool` / `@prompt` / `@resource` / `@resourceTemplate`
@@ -79,22 +60,32 @@ void registerHandlers(T)(McpServer server, T obj) @safe
 /// Non-function members and functions without a recognized UDA are skipped.
 void registerModule(alias mod)(McpServer server) @safe
 {
-	static foreach (memberName; __traits(allMembers, mod))
+	registerAnnotatedMembers!(mod, mod)(server);
+}
+
+/// Walk every overload of every member of `root` and dispatch each recognized
+/// handler UDA to the matching register method. `root` supplies the member set;
+/// `parent` is the symbol member calls resolve against — `(T, obj)` for an
+/// instance, `(mod, mod)` for a module's free functions. Members without a
+/// recognized UDA are skipped.
+private void registerAnnotatedMembers(alias root, alias parent)(McpServer server) @safe
+{
+	static foreach (memberName; __traits(allMembers, root))
 	{
-		static if (__traits(compiles, __traits(getOverloads, mod, memberName)))
+		static if (__traits(compiles, __traits(getOverloads, root, memberName)))
 		{
-			static foreach (overload; __traits(getOverloads, mod, memberName))
+			static foreach (overload; __traits(getOverloads, root, memberName))
 			{
 				static foreach (attr; __traits(getAttributes, overload))
 				{
 					static if (is(typeof(attr) == tool))
-						registerToolMethod!(memberName, overload, mod)(server, attr);
+						registerToolMethod!(memberName, overload, parent)(server, attr);
 					else static if (is(typeof(attr) == prompt))
-						registerPromptMethod!(memberName, overload, mod)(server, attr);
+						registerPromptMethod!(memberName, overload, parent)(server, attr);
 					else static if (is(typeof(attr) == resource))
-						registerResourceMethod!(memberName, overload, mod)(server, attr);
+						registerResourceMethod!(memberName, overload, parent)(server, attr);
 					else static if (is(typeof(attr) == resourceTemplate))
-						registerTemplateMethod!(memberName, overload, mod)(server, attr);
+						registerTemplateMethod!(memberName, overload, parent)(server, attr);
 				}
 			}
 		}
@@ -205,6 +196,15 @@ private Json parametersSchema(alias func)() @safe
 	return s;
 }
 
+/// Whether argument `name` is meaningfully present in `args`: keyed, and neither
+/// JSON `null` nor `undefined`. The canonical absent/null/undefined predicate
+/// shared by the defaulting and Nullable marshalling paths.
+private bool argPresent(Json args, string name) @safe
+{
+	return (name in args) !is null && args[name].type != Json.Type.null_
+		&& args[name].type != Json.Type.undefined;
+}
+
 /// Convert one JSON argument value into the parameter type `P`, falling back to
 /// the parameter's declared D-level default `def` when the argument is absent.
 /// `def` is the value from `ParameterDefaultValueTuple` for this slot.
@@ -216,9 +216,7 @@ private P marshalArgDefault(P, alias def)(Json args, string name) @safe
 	}
 	else
 	{
-		const present = (name in args) !is null
-			&& args[name].type != Json.Type.null_ && args[name].type != Json.Type.undefined;
-		if (!present)
+		if (!argPresent(args, name))
 			return def;
 		return marshalArg!P(args, name);
 	}
@@ -234,8 +232,7 @@ private P marshalArg(P)(Json args, string name) @safe
 	else static if (isInstanceOf!(Nullable, P))
 	{
 		alias Inner = TemplateArgsOf!P[0];
-		if (name in args && args[name].type != Json.Type.null_
-				&& args[name].type != Json.Type.undefined)
+		if (argPresent(args, name))
 			return P(marshalScalar!Inner(args[name]));
 		return P.init;
 	}
@@ -400,6 +397,36 @@ private Json collectMeta(alias overload)() @safe
 	return m;
 }
 
+/// Fold a method's `@icon` UDAs into `descriptor.icons` and its `@meta` UDA into
+/// `descriptor.meta`. Generic over any descriptor exposing those members (Tool,
+/// Prompt, Resource, ResourceTemplate).
+private void applyIconsAndMeta(alias overload, D)(ref D descriptor) @safe
+{
+	descriptor.icons = collectIcons!overload();
+	auto m = collectMeta!overload();
+	if (m.type == Json.Type.object)
+		descriptor.meta = m;
+}
+
+/// Fold a resource/template method's value UDAs into `descriptor`: the
+/// `@audience` / `@priority` / `@lastModified` annotations plus the shared
+/// `@icon` / `@meta` metadata. Generic over Resource and ResourceTemplate, which
+/// share the `annotations` / `icons` / `meta` members. Absent UDAs leave the
+/// corresponding field unset (omitted from the wire form).
+private void applyResourceMetadata(alias overload, D)(ref D descriptor) @safe
+{
+	static foreach (a; __traits(getAttributes, overload))
+	{
+		static if (is(typeof(a) == audience))
+			descriptor.annotations.audience = a.roles;
+		else static if (is(typeof(a) == priority))
+			descriptor.annotations.priority = a.value;
+		else static if (is(typeof(a) == lastModified))
+			descriptor.annotations.lastModified = a.value;
+	}
+	applyIconsAndMeta!overload(descriptor);
+}
+
 /// Collect a `@cache` UDA into a `Nullable!CacheHint` for resource/template
 /// registration; null when absent.
 private Nullable!CacheHint collectCache(alias overload)() @safe
@@ -476,52 +503,29 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		}
 	}
 
-	// @icon UDAs -> descriptor.icons; @meta UDA -> descriptor._meta.
-	descriptor.icons = collectIcons!overload();
-	{
-		auto m = collectMeta!overload();
-		if (m.type == Json.Type.object)
-			descriptor.meta = m;
-	}
+	applyIconsAndMeta!overload(descriptor);
 
-	static if (is(ReturnType!overload == ToolResponse))
-	{
-		// MRTR-capable tool: the method itself returns a ToolResponse, so it may
-		// answer `inputRequired` (stateless elicitation) as well as `complete`.
-		server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
-			alias names = ParameterIdentifierTuple!overload;
-			alias defs = ParameterDefaultValueTuple!overload;
-			Tuple!(Parameters!overload) argv;
-			static foreach (i, P; Parameters!overload)
-			{
-				static if (is(P : RequestContext))
-					argv[i] = ctx;
-				else static if (is(defs[i] == void))
-					argv[i] = marshalArg!P(args, names[i]);
-				else
-					argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
-			}
+	server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
+		alias names = ParameterIdentifierTuple!overload;
+		alias defs = ParameterDefaultValueTuple!overload;
+		Tuple!(Parameters!overload) argv;
+		static foreach (i, P; Parameters!overload)
+		{
+			static if (is(P : RequestContext))
+				argv[i] = ctx;
+			else static if (is(defs[i] == void))
+				argv[i] = marshalArg!P(args, names[i]);
+			else
+				argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
+		}
+		// An MRTR-capable tool returns a ToolResponse directly, so it may answer
+		// `inputRequired` (stateless elicitation) as well as `complete`; any other
+		// return type is wrapped into a CallToolResult.
+		static if (is(ReturnType!overload == ToolResponse))
 			return __traits(getMember, parent, memberName)(argv.expand);
-		});
-	}
-	else
-	{
-		server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
-			alias names = ParameterIdentifierTuple!overload;
-			alias defs = ParameterDefaultValueTuple!overload;
-			Tuple!(Parameters!overload) argv;
-			static foreach (i, P; Parameters!overload)
-			{
-				static if (is(P : RequestContext))
-					argv[i] = ctx;
-				else static if (is(defs[i] == void))
-					argv[i] = marshalArg!P(args, names[i]);
-				else
-					argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
-			}
+		else
 			return toToolResult(__traits(getMember, parent, memberName)(argv.expand));
-		});
-	}
+	});
 }
 
 /// Wrap a prompt method's return value into a `GetPromptResult`.
@@ -571,13 +575,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 		}
 	}
 
-	// @icon UDAs -> descriptor.icons; @meta UDA -> descriptor._meta.
-	descriptor.icons = collectIcons!overload();
-	{
-		auto m = collectMeta!overload();
-		if (m.type == Json.Type.object)
-			descriptor.meta = m;
-	}
+	applyIconsAndMeta!overload(descriptor);
 
 	server.registerDynamicPrompt(descriptor, (Json args) @safe {
 		import mcp.protocol.errors : McpException, invalidParams;
@@ -635,26 +633,7 @@ private void registerResourceMethod(string memberName, alias overload, alias par
 	if (attr.mimeType.length)
 		descriptor.mimeType = nullable(attr.mimeType);
 
-	// Fold the positional value UDAs (@audience / @priority / @lastModified) on
-	// the same method into the descriptor's annotations. Absent UDAs leave the
-	// corresponding field unset (omitted from the wire form).
-	static foreach (a; __traits(getAttributes, overload))
-	{
-		static if (is(typeof(a) == audience))
-			descriptor.annotations.audience = a.roles;
-		else static if (is(typeof(a) == priority))
-			descriptor.annotations.priority = a.value;
-		else static if (is(typeof(a) == lastModified))
-			descriptor.annotations.lastModified = a.value;
-	}
-
-	// @icon UDAs -> descriptor.icons; @meta UDA -> descriptor._meta.
-	descriptor.icons = collectIcons!overload();
-	{
-		auto m = collectMeta!overload();
-		if (m.type == Json.Type.object)
-			descriptor.meta = m;
-	}
+	applyResourceMetadata!overload(descriptor);
 
 	server.registerResource(descriptor, () @safe {
 		return toResourceContents(__traits(getMember, parent, memberName)(),
@@ -671,26 +650,7 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 	if (attr.mimeType.length)
 		descriptor.mimeType = nullable(attr.mimeType);
 
-	// Fold the positional value UDAs (@audience / @priority / @lastModified) on
-	// the same method into the descriptor's annotations. Absent UDAs leave the
-	// corresponding field unset (omitted from the wire form).
-	static foreach (a; __traits(getAttributes, overload))
-	{
-		static if (is(typeof(a) == audience))
-			descriptor.annotations.audience = a.roles;
-		else static if (is(typeof(a) == priority))
-			descriptor.annotations.priority = a.value;
-		else static if (is(typeof(a) == lastModified))
-			descriptor.annotations.lastModified = a.value;
-	}
-
-	// @icon UDAs -> descriptor.icons; @meta UDA -> descriptor._meta.
-	descriptor.icons = collectIcons!overload();
-	{
-		auto m = collectMeta!overload();
-		if (m.type == Json.Type.object)
-			descriptor.meta = m;
-	}
+	applyResourceMetadata!overload(descriptor);
 
 	server.registerResourceTemplate(descriptor, (string uri, string[string] params) @safe {
 		import mcp.protocol.errors : invalidParams;
