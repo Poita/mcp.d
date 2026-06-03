@@ -46,6 +46,11 @@ final class StdioClientTransport : ClientTransport
 	private void delegate(Message) @safe inbound;
 	private DuplexChannel channel;
 	private bool started;
+	private bool closed_;
+	// Counts how many times the child-shutdown sequence ran; exists so the
+	// idempotency of `close()` is directly observable. The sequence must run at
+	// most once per transport.
+	private int closeProcessRuns_;
 	// When spawned via `McpClient.spawn`, the owned subprocess pipes so `close()`
 	// can run the MCP stdio shutdown sequence (close stdin -> SIGTERM -> SIGKILL).
 	private ProcessPipes* pipes;
@@ -190,10 +195,20 @@ final class StdioClientTransport : ClientTransport
 	/// no owned subprocess (a custom `readLine`/`writeLine` channel).
 	void close() @safe
 	{
+		if (closed_)
+			return;
+		closed_ = true;
 		if (channel !is null)
 			channel.close();
 		if (pipes !is null)
 			closeProcess(5.seconds, 5.seconds);
+	}
+
+	/// How many times the child-shutdown sequence has run (for tests asserting
+	/// `close()` idempotency).
+	package int closeProcessRuns() @safe
+	{
+		return closeProcessRuns_;
 	}
 
 	/// Shut the owned child down per the MCP stdio Shutdown sequence and return its
@@ -203,6 +218,7 @@ final class StdioClientTransport : ClientTransport
 	{
 		import core.sys.posix.signal : SIGTERM, SIGKILL;
 
+		++closeProcessRuns_;
 		auto p = pipes;
 		// Step 0: close the child's stdin so a well-behaved server sees EOF and exits.
 		() @trusted { p.stdin.close(); }();
@@ -473,6 +489,20 @@ version (Posix) unittest  // an over-long newline-less stream ends the read loop
 		assert(sw.peek < 30.seconds,
 			"the over-long-line bound must trip promptly, well under the 60s deliver timeout");
 		transport.closeProcess(200.msecs, 200.msecs);
+	});
+}
+
+version (Posix) unittest  // close() is idempotent: a second call does not re-run the child shutdown
+{
+	inLoop(() @safe {
+		// `cat` exits 0 on stdin EOF, so the first close() reaps it cleanly. A second
+		// close() must short-circuit rather than re-close stdin and re-wait/re-signal
+		// the already-reaped process.
+		auto transport = spawnStdioTransport(["cat"]);
+		transport.close();
+		assert(transport.closeProcessRuns() == 1, "first close() runs the shutdown once");
+		transport.close();
+		assert(transport.closeProcessRuns() == 1, "second close() must be a no-op");
 	});
 }
 
