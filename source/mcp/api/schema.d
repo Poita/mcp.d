@@ -368,29 +368,39 @@ private template hasFieldDefault(T, size_t i)
 				}
 			}
 
-			// anyOf / oneOf: the value conforms iff it validates against at least
-			// one sub-schema. SumType-typed parameters and returns are emitted as
+			// anyOf: the value conforms iff it validates against at least one
+			// sub-schema. SumType-typed parameters and returns are emitted as
 			// `{anyOf:[…]}`; only when every branch fails is the value rejected.
-			foreach (kw; ["anyOf", "oneOf"])
-				if (kw in schema && schema[kw].type == Json.Type.array)
-					{
-					auto subs = schema[kw];
-					bool any;
-					string firstMsg;
-					foreach (i; 0 .. subs.length)
+			if ("anyOf" in schema && schema["anyOf"].type == Json.Type.array)
+				{
+				auto subs = schema["anyOf"];
+				bool any;
+				foreach (i; 0 .. subs.length)
+					if (validateAt(value, subs[i], path).length == 0)
 						{
-						auto msg = validateAt(value, subs[i], path);
-						if (msg.length == 0)
-							{
-							any = true;
-							break;
-						}
-						if (firstMsg.length == 0)
-							firstMsg = msg;
+						any = true;
+						break;
 					}
-					if (!any)
-						return where ~ ": value does not match any permitted schema";
-				}
+				if (!any)
+					return where ~ ": value does not match any permitted schema";
+			}
+
+			// oneOf: the value conforms iff it validates against exactly one
+			// sub-schema. Every branch is checked: zero matches is rejected as
+			// unmatched, and two or more matches is rejected because the branches
+			// are mutually exclusive.
+			if ("oneOf" in schema && schema["oneOf"].type == Json.Type.array)
+				{
+				auto subs = schema["oneOf"];
+				size_t matches;
+				foreach (i; 0 .. subs.length)
+					if (validateAt(value, subs[i], path).length == 0)
+						matches++;
+				if (matches == 0)
+					return where ~ ": value does not match any permitted schema";
+				if (matches > 1)
+					return where ~ ": value matches more than one mutually-exclusive schema";
+			}
 
 			// Numeric bounds (minimum / maximum) on number and integer values.
 			if (value.type == Json.Type.int_ || value.type == Json.Type.float_
@@ -650,6 +660,56 @@ private template hasFieldDefault(T, size_t i)
 			assert(validateAgainstSchema(Json("hi"), schema) == "");
 			assert(validateAgainstSchema(Json(true), schema).length > 0);
 			assert(validateAgainstSchema(Json.emptyObject, schema).length > 0);
+		}
+
+		unittest  // oneOf rejects a value that matches more than one branch
+		{
+			Json intSchema = Json.emptyObject;
+			intSchema["type"] = "integer";
+			Json minSchema = Json.emptyObject;
+			minSchema["type"] = "integer";
+			minSchema["minimum"] = Json(0);
+
+			Json branches = Json.emptyArray;
+			branches ~= intSchema;
+			branches ~= minSchema;
+			Json schema = Json.emptyObject;
+			schema["oneOf"] = branches;
+
+			assert(validateAgainstSchema(Json(5), schema).length > 0);
+		}
+
+		unittest  // oneOf accepts a value that matches exactly one branch
+		{
+			Json intSchema = Json.emptyObject;
+			intSchema["type"] = "integer";
+			Json strSchema = Json.emptyObject;
+			strSchema["type"] = "string";
+
+			Json branches = Json.emptyArray;
+			branches ~= intSchema;
+			branches ~= strSchema;
+			Json schema = Json.emptyObject;
+			schema["oneOf"] = branches;
+
+			assert(validateAgainstSchema(Json(5), schema) == "");
+			assert(validateAgainstSchema(Json("hi"), schema) == "");
+		}
+
+		unittest  // oneOf rejects a value that matches no branch
+		{
+			Json intSchema = Json.emptyObject;
+			intSchema["type"] = "integer";
+			Json strSchema = Json.emptyObject;
+			strSchema["type"] = "string";
+
+			Json branches = Json.emptyArray;
+			branches ~= intSchema;
+			branches ~= strSchema;
+			Json schema = Json.emptyObject;
+			schema["oneOf"] = branches;
+
+			assert(validateAgainstSchema(Json(true), schema).length > 0);
 		}
 
 		unittest  // validateAgainstSchema enforces minimum / maximum
