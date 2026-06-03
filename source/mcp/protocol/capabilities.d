@@ -595,13 +595,14 @@ struct ClientCapabilities
 	/// and the result is a `ClientCapabilities` containing exactly the missing
 	/// ones. A capability is satisfied when the client declared at least the same
 	/// presence flag (sub-capability flags imply their parent presence here, in
-	/// line with `toJson`). The boolean `anyMissing` out-param is `true` iff the
-	/// returned object carries at least one unmet requirement. The `experimental`
-	/// and `extensions` Json maps are compared by required-key presence: any
-	/// required key absent from `declared` is reported.
-	ClientCapabilities missingFrom(const ClientCapabilities declared, out bool anyMissing) const @safe
+	/// line with `toJson`). The result is null iff every requirement is met; a
+	/// non-null value carries exactly the unmet ones. The `experimental` and
+	/// `extensions` Json maps are compared by required-key presence: any required
+	/// key absent from `declared` is reported.
+	Nullable!ClientCapabilities missingFrom(const ClientCapabilities declared) const @safe
 	{
 		ClientCapabilities missing;
+		bool anyMissing;
 		const declSampling = declared.sampling || declared.samplingTools || declared
 			.samplingContext;
 		const declElicit = declared.elicitation || declared.elicitationForm
@@ -653,47 +654,39 @@ struct ClientCapabilities
 			missing.tasks = tasks;
 			anyMissing = true;
 		}
-		if (experimental.type == Json.Type.object)
+
+		const missingExp = diffMissingKeys(experimental, declared.experimental);
+		if (missingExp.type == Json.Type.object && missingExp.length > 0)
 		{
-			Json missingExp = Json.emptyObject;
-			bool anyExp;
-			// `Json.opApply` is `@system` and non-`const`; we only read, so cast
-			// away `const` inside the trusted block to iterate the object.
-			() @trusted {
-				foreach (string k, Json v; cast() experimental)
-					if (declared.experimental.type != Json.Type.object || k !in declared
-							.experimental)
-					{
-						missingExp[k] = v;
-						anyExp = true;
-					}
-			}();
-			if (anyExp)
-			{
-				missing.experimental = missingExp;
-				anyMissing = true;
-			}
+			missing.experimental = missingExp;
+			anyMissing = true;
 		}
-		if (extensions.type == Json.Type.object)
+		const missingExt = diffMissingKeys(extensions, declared.extensions);
+		if (missingExt.type == Json.Type.object && missingExt.length > 0)
 		{
-			Json missingExt = Json.emptyObject;
-			bool anyExt;
-			// `Json.opApply` is `@system` and non-`const`; we only read, so cast
-			// away `const` inside the trusted block to iterate the object.
-			() @trusted {
-				foreach (string k, Json v; cast() extensions)
-					if (declared.extensions.type != Json.Type.object || k !in declared.extensions)
-					{
-						missingExt[k] = v;
-						anyExt = true;
-					}
-			}();
-			if (anyExt)
-			{
-				missing.extensions = missingExt;
-				anyMissing = true;
-			}
+			missing.extensions = missingExt;
+			anyMissing = true;
 		}
+
+		return anyMissing ? nullable(missing) : Nullable!ClientCapabilities.init;
+	}
+
+	/// Keys of the object map `required` that are absent from `declared`, with
+	/// their required values. Returns `null` when `required` is not an object
+	/// (nothing to require); otherwise an object holding exactly the unmet keys.
+	/// Shared by the `experimental` and `extensions` diffs in `missingFrom`.
+	private static Json diffMissingKeys(const Json required, const Json declared) @safe
+	{
+		if (required.type != Json.Type.object)
+			return Json(null);
+		Json missing = Json.emptyObject;
+		// `Json.opApply` is `@system` and non-`const`; we only read, so cast
+		// away `const` inside the trusted block to iterate the object.
+		() @trusted {
+			foreach (string k, Json v; cast() required)
+				if (declared.type != Json.Type.object || k !in declared)
+					missing[k] = v;
+		}();
 		return missing;
 	}
 
@@ -736,32 +729,27 @@ unittest  // missingFrom: an unmet sampling requirement is reported
 {
 	ClientCapabilities required = {sampling: true};
 	ClientCapabilities declared; // nothing advertised
-	bool any;
-	auto missing = required.missingFrom(declared, any);
-	assert(any);
-	assert(missing.sampling);
-	assert("sampling" in missing.toJson());
+	auto missing = required.missingFrom(declared);
+	assert(!missing.isNull);
+	assert(missing.get.sampling);
+	assert("sampling" in missing.get.toJson());
 }
 
 unittest  // missingFrom: a satisfied requirement reports nothing
 {
 	ClientCapabilities required = {sampling: true};
 	ClientCapabilities declared = {sampling: true};
-	bool any;
-	auto missing = required.missingFrom(declared, any);
-	assert(!any);
-	assert(!missing.sampling);
-	assert(missing.toJson().length == 0);
+	auto missing = required.missingFrom(declared);
+	assert(missing.isNull);
 }
 
 unittest  // missingFrom: elicitation url submode unmet by a form-only client
 {
 	ClientCapabilities required = {elicitationUrl: true};
 	ClientCapabilities declared = {elicitationForm: true};
-	bool any;
-	auto missing = required.missingFrom(declared, any);
-	assert(any);
-	assert(missing.elicitationUrl);
+	auto missing = required.missingFrom(declared);
+	assert(!missing.isNull);
+	assert(missing.get.elicitationUrl);
 }
 
 unittest  // missingFrom: a required experimental key absent from the client
@@ -769,10 +757,9 @@ unittest  // missingFrom: a required experimental key absent from the client
 	ClientCapabilities required;
 	required.experimental = Json(["io.example/x": Json.emptyObject]);
 	ClientCapabilities declared;
-	bool any;
-	auto missing = required.missingFrom(declared, any);
-	assert(any);
-	assert("io.example/x" in missing.experimental);
+	auto missing = required.missingFrom(declared);
+	assert(!missing.isNull);
+	assert("io.example/x" in missing.get.experimental);
 }
 
 unittest  // Implementation round-trips with optional title omitted

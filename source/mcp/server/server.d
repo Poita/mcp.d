@@ -2382,10 +2382,8 @@ final class McpServer
 		// `initialize` on the stateful 2025-era protocols.
 		const ClientCapabilities declared = ver.isDraft
 			? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
-		bool anyMissing;
-		const missing = entry.requiredClientCapabilities.missingFrom(declared, anyMissing);
-		if (anyMissing)
-			throw missingRequiredClientCapability(missing);
+		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
+			throw missingRequiredClientCapability(missing.get);
 
 		Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
 		// Validate the supplied arguments against the tool's declared inputSchema
