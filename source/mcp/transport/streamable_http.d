@@ -13,7 +13,7 @@ import mcp.protocol.draft;
 import mcp.transport.sse_context;
 import mcp.transport.session;
 import mcp.auth.resource_server;
-import mcp.server.context : RequestContext, ConnectionScoped;
+import mcp.server.context : RequestContext, BaseRequestContext, ConnectionScoped;
 import mcp.server.connection : ConnectionState;
 import mcp.protocol.capabilities : ClientCapabilities;
 
@@ -918,12 +918,11 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 /// transport while carrying the request's per-connection token. It
 /// has no server->client channel: the cancellation path only reads the
 /// connection token to scope the in-flight cancellation key, and never emits
-/// progress/logging or server-initiated requests. Mirrors the no-op behaviour of
-/// `NullContext` for every other member.
-private final class HttpNotifyContext : RequestContext, ConnectionScoped
+/// progress/logging or server-initiated requests. It inherits the no-op member
+/// bodies from `BaseRequestContext` and overrides only the connection scope and
+/// the no-channel exception message.
+private final class HttpNotifyContext : BaseRequestContext, ConnectionScoped
 {
-	import std.typecons : Nullable;
-
 	private string token_;
 	// The session's ConnectionState, so an inbound
 	// `notifications/cancelled` on this connection flips the cancellation token in
@@ -947,48 +946,9 @@ private final class HttpNotifyContext : RequestContext, ConnectionScoped
 		return connState_;
 	}
 
-	bool isCancelled() @safe
-	{
-		return false;
-	}
-
-	void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
-	{
-	}
-
-	void log(string, Json, string = null) @safe
-	{
-	}
-
-	Json sendRequest(string, Json) @safe
+	protected override Json noChannel() @safe
 	{
 		throw internalError("notification context has no server-to-client channel");
-	}
-
-	bool clientSupports(string) @safe
-	{
-		return false;
-	}
-
-	bool isStateless() @safe
-	{
-		return false;
-	}
-
-	Json[string] inputResponses() @safe
-	{
-		Json[string] empty;
-		return empty;
-	}
-
-	string requestState() @safe
-	{
-		return "";
-	}
-
-	TokenInfo auth() @safe
-	{
-		return TokenInfo.invalid();
 	}
 }
 

@@ -3848,12 +3848,10 @@ unittest  // cancellation matches string-id requests too
 	assert(resp.isNull);
 }
 
-version (unittest) private final class ConnCtx : RequestContext, ConnectionScoped
+version (unittest) private final class ConnCtx : BaseRequestContext, ConnectionScoped
 {
 	// A RequestContext that reports a fixed per-connection token, modelling two
 	// concurrent Streamable HTTP sessions sharing one McpServer.
-	import mcp.auth.resource_server : TokenInfo;
-
 	private string token_;
 	private ConnectionState connState_;
 	this(string token, ConnectionState connState = null) @safe
@@ -3872,48 +3870,9 @@ version (unittest) private final class ConnCtx : RequestContext, ConnectionScope
 		return connState_;
 	}
 
-	bool isCancelled() @safe
-	{
-		return false;
-	}
-
-	void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
-	{
-	}
-
-	void log(string, Json, string = null) @safe
-	{
-	}
-
-	Json sendRequest(string, Json) @safe
-	{
-		throw invalidRequest("no channel");
-	}
-
-	bool clientSupports(string) @safe
+	override bool clientSupports(ClientCapability) @safe
 	{
 		return true;
-	}
-
-	bool isStateless() @safe
-	{
-		return false;
-	}
-
-	Json[string] inputResponses() @safe
-	{
-		Json[string] empty;
-		return empty;
-	}
-
-	string requestState() @safe
-	{
-		return "";
-	}
-
-	TokenInfo auth() @safe
-	{
-		return TokenInfo.invalid();
 	}
 }
 
@@ -4504,54 +4463,13 @@ unittest  // draft: logging/setLevel is method-not-found (removed in 2026-07-28)
 unittest  // after setLevel(error), a handler's sub-error logs are dropped
 {
 	// A context that records every log notification its handler emits.
-	static final class RecordingCtx : RequestContext
+	static final class RecordingCtx : BaseRequestContext
 	{
 		string[] emitted;
-		bool isCancelled() @safe
-		{
-			return false;
-		}
 
-		void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
-		{
-		}
-
-		void log(string level, Json, string = null) @safe
+		override void log(string level, Json, string = null) @safe
 		{
 			emitted ~= level;
-		}
-
-		Json sendRequest(string, Json) @safe
-		{
-			return Json.undefined;
-		}
-
-		bool clientSupports(string) @safe
-		{
-			return false;
-		}
-
-		bool isStateless() @safe
-		{
-			return false;
-		}
-
-		Json[string] inputResponses() @safe
-		{
-			Json[string] e;
-			return e;
-		}
-
-		string requestState() @safe
-		{
-			return "";
-		}
-
-		import mcp.auth.resource_server : TokenInfo;
-
-		TokenInfo auth() @safe
-		{
-			return TokenInfo.invalid();
 		}
 	}
 
@@ -4584,54 +4502,13 @@ unittest  // after setLevel(error), a handler's sub-error logs are dropped
 	assert(ctx.emitted == ["error", "emergency"]);
 }
 
-version (unittest) private final class DraftLogCtx : RequestContext
+version (unittest) private final class DraftLogCtx : BaseRequestContext
 {
 	string[] emitted;
-	bool isCancelled() @safe
-	{
-		return false;
-	}
 
-	void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
-	{
-	}
-
-	void log(string level, Json, string = null) @safe
+	override void log(string level, Json, string = null) @safe
 	{
 		emitted ~= level;
-	}
-
-	Json sendRequest(string, Json) @safe
-	{
-		return Json.undefined;
-	}
-
-	bool clientSupports(string) @safe
-	{
-		return false;
-	}
-
-	bool isStateless() @safe
-	{
-		return false;
-	}
-
-	Json[string] inputResponses() @safe
-	{
-		Json[string] e;
-		return e;
-	}
-
-	string requestState() @safe
-	{
-		return "";
-	}
-
-	import mcp.auth.resource_server : TokenInfo;
-
-	TokenInfo auth() @safe
-	{
-		return TokenInfo.invalid();
 	}
 }
 
@@ -5998,22 +5875,9 @@ unittest  // ToolResponse.inputRequired serializes the input requests
 version (unittest)
 {
 	// A fake transport context: server->client requests return a canned answer.
-	private final class FakeCtx : RequestContext
+	private final class FakeCtx : BaseRequestContext
 	{
-		bool isCancelled() @safe
-		{
-			return false;
-		}
-
-		void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
-		{
-		}
-
-		void log(string, Json, string = null) @safe
-		{
-		}
-
-		Json sendRequest(string, Json) @safe
+		override Json elicitRaw(Json) @safe
 		{
 			return Json([
 				"action": Json("accept"),
@@ -6021,32 +5885,9 @@ version (unittest)
 			]);
 		}
 
-		bool clientSupports(string) @safe
+		override bool clientSupports(ClientCapability) @safe
 		{
 			return true;
-		}
-
-		bool isStateless() @safe
-		{
-			return false;
-		}
-
-		Json[string] inputResponses() @safe
-		{
-			Json[string] empty;
-			return empty;
-		}
-
-		string requestState() @safe
-		{
-			return "";
-		}
-
-		import mcp.auth.resource_server : TokenInfo;
-
-		TokenInfo auth() @safe
-		{
-			return TokenInfo.invalid();
 		}
 	}
 

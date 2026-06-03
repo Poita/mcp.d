@@ -6,7 +6,7 @@ import vibe.data.json : Json, deserializeJson, parseJsonString;
 import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction, LogLevel;
-import mcp.protocol.capabilities : ClientCapabilities;
+import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
 import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
 import mcp.protocol.jsonrpc : makeNotification;
@@ -201,14 +201,21 @@ interface RequestContext
 	/// any JSON value (commonly a string or object); `logger` is optional.
 	void log(string level, Json data, string logger = null) @safe;
 
-	/// Send a server->client request and block until the client responds.
-	/// Returns the result, or throws `McpException` if the client returned an
-	/// error or does not support the feature.
-	Json sendRequest(string method, Json params) @safe;
+	/// Send `sampling/createMessage` and block until the client responds,
+	/// returning the raw result `Json`. The transport primitive behind `sample`;
+	/// gating lives in `sample`, so a channel-less context just throws here.
+	Json sampleRaw(Json params) @safe;
 
-	/// Whether the connected client advertised the named capability
-	/// ("sampling", "elicitation", "roots").
-	bool clientSupports(string capability) @safe;
+	/// Send `elicitation/create` and block until the client responds, returning
+	/// the raw result `Json`. The transport primitive behind `elicit`/`elicitUrl`.
+	Json elicitRaw(Json params) @safe;
+
+	/// Send `roots/list` and block until the client responds, returning the raw
+	/// result `Json`. The transport primitive behind `listRoots`.
+	Json listRootsRaw() @safe;
+
+	/// Whether the connected client advertised `cap`.
+	bool clientSupports(ClientCapability cap) @safe;
 
 	/// True when this request is on a stateless (MRTR) protocol — the draft
 	/// revision, where there is no server->client channel. On such requests a
@@ -243,7 +250,7 @@ interface RequestContext
 	{
 		if (isStateless)
 			throw internalError("sample() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
-		if (!clientSupports("sampling"))
+		if (!clientSupports(ClientCapability.sampling))
 			throw invalidRequest("Client does not support sampling");
 		// Per spec, servers MUST NOT send tool-enabled sampling requests to
 		// clients that have not declared the `sampling.tools` sub-capability.
@@ -251,7 +258,7 @@ interface RequestContext
 		// a request that sets `toolChoice` (even `{mode:"none"}`) without any
 		// `tools` still exercises the tool-use sampling surface.
 		if (params.type == Json.Type.object && ("tools" in params
-				|| "toolChoice" in params) && !clientSupports("sampling.tools"))
+				|| "toolChoice" in params) && !clientSupports(ClientCapability.samplingTools))
 			throw invalidRequest("Client does not support tool use in sampling (sampling.tools)");
 		// The soft-deprecated `sampling.context` sub-capability gates the
 		// `includeContext` values `thisServer`/`allServers`.
@@ -259,11 +266,12 @@ interface RequestContext
 				&& params["includeContext"].type == Json.Type.string)
 		{
 			const inc = params["includeContext"].get!string;
-			if ((inc == "thisServer" || inc == "allServers") && !clientSupports("sampling.context"))
+			if ((inc == "thisServer" || inc == "allServers")
+					&& !clientSupports(ClientCapability.samplingContext))
 				throw invalidRequest(
 						"Client does not support context-enabled sampling (sampling.context)");
 		}
-		return sendRequest("sampling/createMessage", params);
+		return sampleRaw(params);
 	}
 
 	/// Typed convenience over `sample(Json)`: build a `CreateMessageRequest`,
@@ -292,12 +300,12 @@ interface RequestContext
 		// Per client/elicitation: servers MUST NOT send elicitation requests
 		// with modes the client does not support. A bare `elicitation:{}` is
 		// form-only, so a generic declaration already sets the form submode.
-		if (!clientSupports("elicitation.form"))
+		if (!clientSupports(ClientCapability.elicitationForm))
 			throw invalidRequest("Client does not support form-mode elicitation");
 		Json params = Json.emptyObject;
 		params["message"] = message;
 		params["requestedSchema"] = requestedSchema;
-		return ElicitResult.fromJson(sendRequest("elicitation/create", params));
+		return ElicitResult.fromJson(elicitRaw(params));
 	}
 
 	/// Typed convenience over `elicit(string, Json)`: derive the form
@@ -334,7 +342,7 @@ interface RequestContext
 			throw internalError("elicitUrl() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
 		// Per client/elicitation: servers MUST NOT send a url-mode request to a
 		// client that only declared form mode (e.g. a bare `elicitation:{}`).
-		if (!clientSupports("elicitation.url"))
+		if (!clientSupports(ClientCapability.elicitationUrl))
 			throw invalidRequest("Client does not support url-mode elicitation");
 		if (url.length == 0)
 			throw invalidParams("URL-mode elicitation requires a non-empty url");
@@ -347,7 +355,7 @@ interface RequestContext
 		params["message"] = message;
 		params["url"] = url;
 		params["elicitationId"] = elicitationId;
-		return ElicitResult.fromJson(sendRequest("elicitation/create", params));
+		return ElicitResult.fromJson(elicitRaw(params));
 	}
 
 	/// List the client's filesystem roots (`roots/list`). Per client/roots
@@ -356,9 +364,9 @@ interface RequestContext
 	/// the client's reply into a typed `ListRootsResult`.
 	final ListRootsResult listRoots() @safe
 	{
-		if (!clientSupports("roots"))
+		if (!clientSupports(ClientCapability.roots))
 			throw invalidRequest("Client does not support roots");
-		return ListRootsResult.fromJson(sendRequest("roots/list", Json.emptyObject));
+		return ListRootsResult.fromJson(listRootsRaw());
 	}
 
 	/// Typed convenience over `inputResponses`: decode the MRTR answer the client
@@ -430,10 +438,14 @@ interface RequestContext
 	}
 }
 
-/// A context with no client channel: notifications are dropped and
-/// server->client requests are rejected. Used by transports that do not (yet)
-/// support streaming, and as the default when none is supplied.
-final class NullContext : RequestContext
+/// The canonical no-op `RequestContext`: every member has a passive default
+/// (never cancelled, notifications dropped, server->client requests rejected, no
+/// capabilities, not stateless, no input responses / request state, no auth). A
+/// focused context — most of them test fakes — subclasses this and overrides only
+/// the one or two members it exercises, instead of re-stubbing the whole 12-method
+/// surface. Channel-less production contexts (`NullContext`,
+/// `HttpNotifyContext`) override only the server->client reject message.
+abstract class BaseRequestContext : RequestContext
 {
 	bool isCancelled() @safe
 	{
@@ -448,12 +460,30 @@ final class NullContext : RequestContext
 	{
 	}
 
-	Json sendRequest(string, Json) @safe
+	Json sampleRaw(Json) @safe
+	{
+		return noChannel();
+	}
+
+	Json elicitRaw(Json) @safe
+	{
+		return noChannel();
+	}
+
+	Json listRootsRaw() @safe
+	{
+		return noChannel();
+	}
+
+	/// The exception thrown by the server->client primitives when this context
+	/// has no channel. Overridable so a context can give a transport-specific
+	/// message while inheriting the three throwing primitives.
+	protected Json noChannel() @safe
 	{
 		throw invalidRequest("This transport has no server-to-client channel");
 	}
 
-	bool clientSupports(string) @safe
+	bool clientSupports(ClientCapability) @safe
 	{
 		return false;
 	}
@@ -478,6 +508,13 @@ final class NullContext : RequestContext
 	{
 		return TokenInfo.invalid();
 	}
+}
+
+/// A context with no client channel: notifications are dropped and
+/// server->client requests are rejected. Used by transports that do not (yet)
+/// support streaming, and as the default when none is supplied.
+final class NullContext : BaseRequestContext
+{
 }
 
 /// A `RequestContext` for the stdio transport. The stdio transport is a single
@@ -572,38 +609,35 @@ final class StdioContext : RequestContext
 			sink(frame.toString());
 	}
 
-	Json sendRequest(string method, Json params) @safe
+	Json sampleRaw(Json params) @safe
+	{
+		return serverRequest("sampling/createMessage", params);
+	}
+
+	Json elicitRaw(Json params) @safe
+	{
+		return serverRequest("elicitation/create", params);
+	}
+
+	Json listRootsRaw() @safe
+	{
+		return serverRequest("roots/list", Json.emptyObject);
+	}
+
+	private Json serverRequest(string method, Json params) @safe
 	{
 		if (serverRequestFn is null)
 			throw invalidRequest("The stdio transport has no server-to-client request channel");
 		return serverRequestFn(method, params);
 	}
 
-	bool clientSupports(string capability) @safe
+	bool clientSupports(ClientCapability cap) @safe
 	{
 		// No channel wired -> report false (cannot satisfy a server->client
 		// request).
 		if (serverRequestFn is null)
 			return false;
-		switch (capability)
-		{
-		case "sampling":
-			return clientCaps.sampling;
-		case "sampling.tools":
-			return clientCaps.samplingTools;
-		case "sampling.context":
-			return clientCaps.samplingContext;
-		case "elicitation":
-			return clientCaps.elicitation;
-		case "elicitation.form":
-			return clientCaps.elicitationForm;
-		case "elicitation.url":
-			return clientCaps.elicitationUrl;
-		case "roots":
-			return clientCaps.roots;
-		default:
-			return false;
-		}
+		return clientCaps.supports(cap);
 	}
 
 	bool isStateless() @safe
@@ -729,14 +763,24 @@ final class RequestScope : RequestContext, ConnectionScoped
 		inner.log(level, data, logger);
 	}
 
-	Json sendRequest(string method, Json params) @safe
+	Json sampleRaw(Json params) @safe
 	{
-		return inner.sendRequest(method, params);
+		return inner.sampleRaw(params);
 	}
 
-	bool clientSupports(string capability) @safe
+	Json elicitRaw(Json params) @safe
 	{
-		return inner.clientSupports(capability);
+		return inner.elicitRaw(params);
+	}
+
+	Json listRootsRaw() @safe
+	{
+		return inner.listRootsRaw();
+	}
+
+	bool clientSupports(ClientCapability cap) @safe
+	{
+		return inner.clientSupports(cap);
 	}
 
 	bool isStateless() @safe
@@ -760,24 +804,11 @@ final class RequestScope : RequestContext, ConnectionScoped
 	}
 }
 
-version (unittest) private final class SamplingProbe : RequestContext
+version (unittest) private final class SamplingProbe : BaseRequestContext
 {
 	Json lastParams;
 
-	bool isCancelled() @safe
-	{
-		return false;
-	}
-
-	void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
-	{
-	}
-
-	void log(string, Json, string = null) @safe
-	{
-	}
-
-	Json sendRequest(string method, Json params) @safe
+	override Json sampleRaw(Json params) @safe
 	{
 		lastParams = params;
 		// Echo back a typed-looking sampling result.
@@ -792,56 +823,22 @@ version (unittest) private final class SamplingProbe : RequestContext
 		return r;
 	}
 
-	bool clientSupports(string capability) @safe
+	override bool clientSupports(ClientCapability cap) @safe
 	{
-		return capability == "sampling";
-	}
-
-	bool isStateless() @safe
-	{
-		return false;
-	}
-
-	Json[string] inputResponses() @safe
-	{
-		Json[string] empty;
-		return empty;
-	}
-
-	string requestState() @safe
-	{
-		return "";
-	}
-
-	TokenInfo auth() @safe
-	{
-		return TokenInfo.invalid();
+		return cap == ClientCapability.sampling;
 	}
 }
 
-version (unittest) private final class RootsProbe : RequestContext
+version (unittest) private final class RootsProbe : BaseRequestContext
 {
 	string lastMethod;
 	Json lastParams;
 	bool supportsRoots = true;
 
-	bool isCancelled() @safe
+	override Json listRootsRaw() @safe
 	{
-		return false;
-	}
-
-	void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
-	{
-	}
-
-	void log(string, Json, string = null) @safe
-	{
-	}
-
-	Json sendRequest(string method, Json params) @safe
-	{
-		lastMethod = method;
-		lastParams = params;
+		lastMethod = "roots/list";
+		lastParams = Json.emptyObject;
 		Json r = Json.emptyObject;
 		Json arr = Json.emptyArray;
 		Json root = Json.emptyObject;
@@ -852,34 +849,13 @@ version (unittest) private final class RootsProbe : RequestContext
 		return r;
 	}
 
-	bool clientSupports(string capability) @safe
+	override bool clientSupports(ClientCapability cap) @safe
 	{
-		return capability == "roots" && supportsRoots;
-	}
-
-	bool isStateless() @safe
-	{
-		return false;
-	}
-
-	Json[string] inputResponses() @safe
-	{
-		Json[string] empty;
-		return empty;
-	}
-
-	string requestState() @safe
-	{
-		return "";
-	}
-
-	TokenInfo auth() @safe
-	{
-		return TokenInfo.invalid();
+		return cap == ClientCapability.roots && supportsRoots;
 	}
 }
 
-version (unittest) private final class ElicitProbe : RequestContext
+version (unittest) private final class ElicitProbe : BaseRequestContext
 {
 	string lastMethod;
 	Json lastParams;
@@ -893,61 +869,38 @@ version (unittest) private final class ElicitProbe : RequestContext
 	/// MRTR round-2 answers a test can populate to exercise `inputResponseAs!T`.
 	Json[string] responses;
 
-	bool isCancelled() @safe
+	override Json elicitRaw(Json params) @safe
 	{
-		return false;
-	}
-
-	void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
-	{
-	}
-
-	void log(string, Json, string = null) @safe
-	{
-	}
-
-	Json sendRequest(string method, Json params) @safe
-	{
-		lastMethod = method;
+		lastMethod = "elicitation/create";
 		lastParams = params;
 		Json r = Json.emptyObject;
 		r["action"] = "accept";
 		return r;
 	}
 
-	bool clientSupports(string capability) @safe
+	override bool clientSupports(ClientCapability cap) @safe
 	{
-		switch (capability)
+		switch (cap)
 		{
-		case "elicitation":
+		case ClientCapability.elicitation:
 			return supportsElicitation;
-		case "elicitation.form":
+		case ClientCapability.elicitationForm:
 			return supportsElicitation && supportsForm;
-		case "elicitation.url":
+		case ClientCapability.elicitationUrl:
 			return supportsElicitation && supportsUrl;
 		default:
 			return false;
 		}
 	}
 
-	bool isStateless() @safe
+	override bool isStateless() @safe
 	{
 		return stateless;
 	}
 
-	Json[string] inputResponses() @safe
+	override Json[string] inputResponses() @safe
 	{
 		return responses;
-	}
-
-	string requestState() @safe
-	{
-		return "";
-	}
-
-	TokenInfo auth() @safe
-	{
-		return TokenInfo.invalid();
 	}
 }
 
@@ -1186,53 +1139,13 @@ unittest  // sample() gates toolChoice (without tools) on the sampling.tools cap
 	assertThrown!McpException(probe.sample(req));
 }
 
-version (unittest) private final class LogProbe : RequestContext
+version (unittest) private final class LogProbe : BaseRequestContext
 {
 	string[] emittedLevels;
 
-	bool isCancelled() @safe
-	{
-		return false;
-	}
-
-	void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
-	{
-	}
-
-	void log(string level, Json, string = null) @safe
+	override void log(string level, Json, string = null) @safe
 	{
 		emittedLevels ~= level;
-	}
-
-	Json sendRequest(string, Json) @safe
-	{
-		return Json.undefined;
-	}
-
-	bool clientSupports(string) @safe
-	{
-		return false;
-	}
-
-	bool isStateless() @safe
-	{
-		return false;
-	}
-
-	Json[string] inputResponses() @safe
-	{
-		Json[string] empty;
-		return empty;
-	}
-
-	string requestState() @safe
-	{
-		return "";
-	}
-
-	TokenInfo auth() @safe
-	{
-		return TokenInfo.invalid();
 	}
 }
 
@@ -1394,11 +1307,11 @@ unittest  // StdioContext has no server->client request channel
 	import mcp.protocol.errors : McpException;
 
 	auto ctx = new StdioContext((string) @safe {});
-	assert(!ctx.clientSupports("sampling"));
+	assert(!ctx.clientSupports(ClientCapability.sampling));
 	assert(!ctx.isCancelled);
 	bool threw;
 	try
-		ctx.sendRequest("sampling/createMessage", Json.emptyObject);
+		ctx.sampleRaw(Json.emptyObject);
 	catch (McpException)
 		threw = true;
 	assert(threw);
@@ -1410,52 +1323,24 @@ version (unittest) private Nullable!double nullableProgress(double v) @safe
 	return n;
 }
 
-version (unittest) private final class StateProbe : RequestContext
+version (unittest) private final class StateProbe : BaseRequestContext
 {
 	string state;
 	Json[string] responses;
 
-	bool isCancelled() @safe
-	{
-		return false;
-	}
-
-	void reportProgress(double, Nullable!double = Nullable!double.init, string = null) @safe
-	{
-	}
-
-	void log(string, Json, string = null) @safe
-	{
-	}
-
-	Json sendRequest(string, Json) @safe
-	{
-		return Json.undefined;
-	}
-
-	bool clientSupports(string) @safe
-	{
-		return false;
-	}
-
-	bool isStateless() @safe
+	override bool isStateless() @safe
 	{
 		return true;
 	}
 
-	Json[string] inputResponses() @safe
+	override Json[string] inputResponses() @safe
 	{
 		return responses;
 	}
 
-	string requestState() @safe
+	override string requestState() @safe
 	{
 		return state;
-	}
-
-	TokenInfo auth() @safe
-	{
-		return TokenInfo.invalid();
 	}
 }
 

@@ -411,6 +411,21 @@ struct ServerCapabilities
 	}
 }
 
+/// A single client capability flag a server checks before issuing the
+/// corresponding server->client request. Used by `ClientCapabilities.supports`
+/// and `RequestContext.clientSupports` so capability gating is type-checked
+/// rather than keyed on a magic string that silently fails on a typo.
+enum ClientCapability
+{
+	sampling,
+	samplingTools,
+	samplingContext,
+	elicitation,
+	elicitationForm,
+	elicitationUrl,
+	roots,
+}
+
 /// Capabilities a client advertises during initialization.
 struct ClientCapabilities
 {
@@ -681,6 +696,40 @@ struct ClientCapabilities
 		}
 		return missing;
 	}
+
+	/// Whether `cap` is advertised. The single lookup that owns the
+	/// capability->field mapping; transports gate `sample`/`elicit`/`listRoots`
+	/// through here rather than re-deriving it.
+	bool supports(ClientCapability cap) const @safe nothrow @nogc
+	{
+		final switch (cap)
+		{
+		case ClientCapability.sampling:
+			return sampling;
+		case ClientCapability.samplingTools:
+			return samplingTools;
+		case ClientCapability.samplingContext:
+			return samplingContext;
+		case ClientCapability.elicitation:
+			return elicitation;
+		case ClientCapability.elicitationForm:
+			return elicitationForm;
+		case ClientCapability.elicitationUrl:
+			return elicitationUrl;
+		case ClientCapability.roots:
+			return roots;
+		}
+	}
+}
+
+unittest  // supports() reads the field backing each ClientCapability
+{
+	ClientCapabilities c = {sampling: true, elicitationForm: true, roots: true};
+	assert(c.supports(ClientCapability.sampling));
+	assert(c.supports(ClientCapability.elicitationForm));
+	assert(c.supports(ClientCapability.roots));
+	assert(!c.supports(ClientCapability.samplingTools));
+	assert(!c.supports(ClientCapability.elicitationUrl));
 }
 
 unittest  // missingFrom: an unmet sampling requirement is reported
