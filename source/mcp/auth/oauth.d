@@ -314,28 +314,6 @@ string[] protectedResourceMetadataUrls(string mcpEndpoint) @safe
 	return urls;
 }
 
-/// Build the authorization-server metadata URL for an issuer, per RFC 8414
-/// (default `oauth-authorization-server` well-known suffix).
-string authorizationServerMetadataUrl(string issuer) @safe
-{
-	import std.string : endsWith, indexOf;
-
-	auto iss = issuer;
-	if (iss.endsWith("/"))
-		iss = iss[0 .. $ - 1];
-	// RFC 8414: insert the well-known segment after the origin, before any path.
-	auto schemeEnd = iss.indexOf("://");
-	if (schemeEnd < 0)
-		return iss ~ "/.well-known/oauth-authorization-server";
-	const afterScheme = schemeEnd + 3;
-	const slash = iss[afterScheme .. $].indexOf('/');
-	if (slash < 0)
-		return iss ~ "/.well-known/oauth-authorization-server";
-	const origin = iss[0 .. afterScheme + slash];
-	const path = iss[afterScheme + slash .. $];
-	return origin ~ "/.well-known/oauth-authorization-server" ~ path;
-}
-
 /// The ordered list of authorization-server metadata URLs to try for an issuer,
 /// covering RFC 8414 (`oauth-authorization-server`) and OpenID Connect Discovery
 /// (`openid-configuration`), in both path-aware and path-append forms.
@@ -382,24 +360,32 @@ string selectScope(string wwwAuthScope, const string[] scopesSupported) @safe
 /// The canonical resource indicator (RFC 8707) for an MCP server: the endpoint
 /// URL with a lowercased scheme+authority, any fragment dropped, and a single
 /// trailing slash stripped. The MCP "Canonical Server URI" rules prefer the
-/// no-trailing-slash form. This MUST agree with `mcp.auth.login.canonicalResource`
-/// (see the cross-check unittest below); both implement the same canonicalization.
-string canonicalResourceUri(string mcpEndpoint) @safe
+/// no-trailing-slash form. ASCII case is folded in place (rather than via
+/// `toLower`) to keep this `pure nothrow`.
+string canonicalResourceUri(string mcpEndpoint) @safe pure nothrow
 {
-	import std.string : indexOf, toLower;
+	import std.string : indexOf;
 
 	auto frag = mcpEndpoint.indexOf('#');
 	auto s = (frag < 0) ? mcpEndpoint : mcpEndpoint[0 .. frag];
 	// Strip a single trailing slash (spec prefers the no-trailing-slash form).
 	if (s.length > 1 && s[$ - 1] == '/')
 		s = s[0 .. $ - 1];
-	auto schemeEnd = s.indexOf("://");
+	const schemeEnd = s.indexOf("://");
 	if (schemeEnd < 0)
 		return s;
 	const afterScheme = schemeEnd + 3;
 	const slash = s[afterScheme .. $].indexOf('/');
 	const hostEnd = (slash < 0) ? s.length : afterScheme + slash;
-	return s[0 .. hostEnd].toLower ~ s[hostEnd .. $];
+	char[] buf = new char[s.length];
+	foreach (i, ch; s)
+	{
+		char c = ch;
+		if (i < hostEnd && c >= 'A' && c <= 'Z')
+			c = cast(char)(c + 32);
+		buf[i] = c;
+	}
+	return () @trusted { return cast(string) buf; }();
 }
 
 unittest  // PKCE: known verifier bytes produce a stable S256 challenge
@@ -466,12 +452,13 @@ unittest  // protected-resource metadata well-known URLs: path-scoped then root
 	assert(rootUrls[0] == "https://example.com/.well-known/oauth-protected-resource");
 }
 
-unittest  // AS metadata URL inserts well-known after origin, before path
+unittest  // AS metadata candidates insert well-known after origin, before path
 {
-	assert(authorizationServerMetadataUrl("https://auth.example.com")
-			== "https://auth.example.com/.well-known/oauth-authorization-server");
-	assert(authorizationServerMetadataUrl("https://auth.example.com/tenant1")
-			== "https://auth.example.com/.well-known/oauth-authorization-server/tenant1");
+	auto root = authServerMetadataCandidates("https://auth.example.com");
+	assert(root[0] == "https://auth.example.com/.well-known/oauth-authorization-server");
+
+	auto tenant = authServerMetadataCandidates("https://auth.example.com/tenant1");
+	assert(tenant[0] == "https://auth.example.com/.well-known/oauth-authorization-server/tenant1");
 }
 
 unittest  // metadata documents parse the relevant fields
@@ -497,12 +484,14 @@ unittest  // canonical resource URI lowercases scheme+host, drops fragment + tra
 {
 	assert(canonicalResourceUri(
 			"HTTPS://MCP.Example.com/Path#frag") == "https://mcp.example.com/Path");
-	// A single trailing slash is stripped (spec prefers the no-trailing-slash form),
-	// matching mcp.auth.login.canonicalResource.
+	// A single trailing slash is stripped (spec prefers the no-trailing-slash form).
 	assert(canonicalResourceUri("https://mcp.example.com/") == "https://mcp.example.com");
 	assert(canonicalResourceUri("HTTPS://MCP.Example.com/Mcp/") == "https://mcp.example.com/Mcp");
 	assert(canonicalResourceUri("https://mcp.example.com/mcp") == "https://mcp.example.com/mcp");
 	assert(canonicalResourceUri("https://mcp.example.com:8443/") == "https://mcp.example.com:8443");
+	assert(canonicalResourceUri("https://mcp.example.com/mcp/") == "https://mcp.example.com/mcp");
+	assert(canonicalResourceUri("https://mcp.example.com#frag") == "https://mcp.example.com");
+	assert(canonicalResourceUri("https://mcp.example.com") == "https://mcp.example.com");
 }
 
 version (unittest) private Json parseJson(string s) @safe
@@ -1723,6 +1712,37 @@ private string enc(string s) @safe
 	return encodeComponent(s);
 }
 
+/// A single form field. `required` fields are always emitted; optional ones are
+/// emitted only when their value is non-empty.
+private struct FormField
+{
+	string key;
+	string value;
+	bool required;
+}
+
+private FormField req(string key, string value) @safe pure nothrow
+{
+	return FormField(key, value, true);
+}
+
+private FormField opt(string key, string value) @safe pure nothrow
+{
+	return FormField(key, value, false);
+}
+
+/// Assemble an `application/x-www-form-urlencoded` body: `grant_type=<grantType>`
+/// followed by `&key=enc(value)` for each required field and each optional field
+/// with a non-empty value.
+private string buildForm(string grantType, scope const FormField[] fields) @safe
+{
+	auto body_ = "grant_type=" ~ enc(grantType);
+	foreach (f; fields)
+		if (f.required || f.value.length)
+			body_ ~= "&" ~ f.key ~ "=" ~ enc(f.value);
+	return body_;
+}
+
 /// Build the authorization-request URL for the PKCE auth-code flow.
 string buildAuthorizationUrl(string authorizationEndpoint, string clientId,
 		string redirectUri, string codeChallenge, string scopeStr, string resource, string state) @safe
@@ -1754,31 +1774,21 @@ string buildAuthorizationUrl(string authorizationEndpoint, string clientId,
 package string buildAuthCodeTokenForm(string code, string redirectUri,
 		string codeVerifier, string clientId, string resource, string clientSecretForPost = "") @safe
 {
-	auto body_ = "grant_type=authorization_code";
-	body_ ~= "&code=" ~ enc(code);
-	body_ ~= "&redirect_uri=" ~ enc(redirectUri);
-	body_ ~= "&code_verifier=" ~ enc(codeVerifier);
-	body_ ~= "&client_id=" ~ enc(clientId);
-	if (resource.length)
-		body_ ~= "&resource=" ~ enc(resource);
-	if (clientSecretForPost.length)
-		body_ ~= "&client_secret=" ~ enc(clientSecretForPost);
-	return body_;
+	return buildForm("authorization_code", [
+		req("code", code), req("redirect_uri", redirectUri),
+		req("code_verifier", codeVerifier), req("client_id", clientId),
+		opt("resource", resource), opt("client_secret", clientSecretForPost),
+	]);
 }
 
 /// Build the token-request body for the `client_credentials` grant.
 package string buildClientCredentialsForm(string clientId, string scopeStr,
 		string resource, string clientSecretForPost = "") @safe
 {
-	auto body_ = "grant_type=client_credentials";
-	body_ ~= "&client_id=" ~ enc(clientId);
-	if (scopeStr.length)
-		body_ ~= "&scope=" ~ enc(scopeStr);
-	if (resource.length)
-		body_ ~= "&resource=" ~ enc(resource);
-	if (clientSecretForPost.length)
-		body_ ~= "&client_secret=" ~ enc(clientSecretForPost);
-	return body_;
+	return buildForm("client_credentials", [
+		req("client_id", clientId), opt("scope", scopeStr),
+		opt("resource", resource), opt("client_secret", clientSecretForPost),
+	]);
 }
 
 /// Build an RFC 8693 token-exchange request body (used by the cross-app /
@@ -1786,18 +1796,14 @@ package string buildClientCredentialsForm(string clientId, string scopeStr,
 package string buildTokenExchangeForm(string subjectToken, string subjectTokenType,
 		string requestedTokenType, string audience, string resource, string clientId) @safe
 {
-	auto body_ = "grant_type=" ~ enc("urn:ietf:params:oauth:grant-type:token-exchange");
-	body_ ~= "&subject_token=" ~ enc(subjectToken);
-	body_ ~= "&subject_token_type=" ~ enc(subjectTokenType);
-	if (requestedTokenType.length)
-		body_ ~= "&requested_token_type=" ~ enc(requestedTokenType);
-	if (audience.length)
-		body_ ~= "&audience=" ~ enc(audience);
-	if (resource.length)
-		body_ ~= "&resource=" ~ enc(resource);
-	if (clientId.length)
-		body_ ~= "&client_id=" ~ enc(clientId);
-	return body_;
+	return buildForm("urn:ietf:params:oauth:grant-type:token-exchange",
+			[
+				req("subject_token", subjectToken),
+				req("subject_token_type", subjectTokenType),
+				opt("requested_token_type", requestedTokenType),
+				opt("audience", audience), opt("resource", resource),
+				opt("client_id", clientId),
+	]);
 }
 
 /// Build an RFC 7523 JWT-bearer grant request body (exchange an assertion JWT
@@ -1805,15 +1811,10 @@ package string buildTokenExchangeForm(string subjectToken, string subjectTokenTy
 package string buildJwtBearerForm(string assertion, string scopeStr,
 		string resource, string clientId) @safe
 {
-	auto body_ = "grant_type=" ~ enc("urn:ietf:params:oauth:grant-type:jwt-bearer");
-	body_ ~= "&assertion=" ~ enc(assertion);
-	if (scopeStr.length)
-		body_ ~= "&scope=" ~ enc(scopeStr);
-	if (resource.length)
-		body_ ~= "&resource=" ~ enc(resource);
-	if (clientId.length)
-		body_ ~= "&client_id=" ~ enc(clientId);
-	return body_;
+	return buildForm("urn:ietf:params:oauth:grant-type:jwt-bearer", [
+		req("assertion", assertion), opt("scope", scopeStr),
+		opt("resource", resource), opt("client_id", clientId),
+	]);
 }
 
 /// Build the token-request body for refreshing an access token. When
@@ -1823,14 +1824,10 @@ package string buildJwtBearerForm(string assertion, string scopeStr,
 package string buildRefreshTokenForm(string refreshToken, string clientId,
 		string resource, string clientSecretForPost = "") @safe
 {
-	auto body_ = "grant_type=refresh_token";
-	body_ ~= "&refresh_token=" ~ enc(refreshToken);
-	body_ ~= "&client_id=" ~ enc(clientId);
-	if (resource.length)
-		body_ ~= "&resource=" ~ enc(resource);
-	if (clientSecretForPost.length)
-		body_ ~= "&client_secret=" ~ enc(clientSecretForPost);
-	return body_;
+	return buildForm("refresh_token", [
+		req("refresh_token", refreshToken), req("client_id", clientId),
+		opt("resource", resource), opt("client_secret", clientSecretForPost),
+	]);
 }
 
 /// Build the HTTP `Authorization: Basic` header value for `client_secret_basic`.

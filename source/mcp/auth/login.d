@@ -453,44 +453,6 @@ string defaultTokenStorePath() @safe
 	return buildPath(base, "dlang-mcp", "tokens.json");
 }
 
-/// The canonical resource URI for `mcpEndpoint`, per the MCP authorization
-/// "Canonical Server URI" rules: drop any fragment and a single trailing slash,
-/// and lowercase the scheme + authority (host[:port]) while leaving the path
-/// case untouched. This MUST agree with `mcp.auth.oauth.canonicalResourceUri`
-/// for all inputs (a cross-check unittest enforces it); both implement the same
-/// canonicalization. Kept `@safe pure nothrow` by lowercasing in place rather
-/// than calling `toLower`.
-string canonicalResource(string mcpEndpoint) @safe pure nothrow
-{
-	import std.string : indexOf;
-
-	auto s = mcpEndpoint;
-	const hash = s.indexOf('#');
-	if (hash >= 0)
-		s = s[0 .. hash];
-	if (s.length > 1 && s[$ - 1] == '/')
-		s = s[0 .. $ - 1];
-
-	// Lowercase the scheme + authority (everything up to the first '/' after
-	// "://"), leaving the path untouched. `toLower` is neither pure nor nothrow,
-	// so fold ASCII case manually to preserve this function's contract.
-	const schemeEnd = s.indexOf("://");
-	if (schemeEnd < 0)
-		return s;
-	const afterScheme = schemeEnd + 3;
-	const slash = s[afterScheme .. $].indexOf('/');
-	const authorityEnd = (slash < 0) ? s.length : afterScheme + slash;
-	char[] buf = new char[s.length];
-	foreach (i, ch; s)
-	{
-		char c = ch;
-		if (i < authorityEnd && c >= 'A' && c <= 'Z')
-			c = cast(char)(c + 32);
-		buf[i] = c;
-	}
-	return () @trusted { return cast(string) buf; }();
-}
-
 /// Generate a random `state` value (base64url, 16 bytes of randomness) for the
 /// authorization request (MCP "Open Redirection" mitigation). The bytes come
 /// from the OS CSPRNG -- `state` is the CSRF / mix-up defense and MUST be
@@ -642,7 +604,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	auto store = opts.store !is null ? opts.store : new FileTokenStore(defaultTokenStorePath());
 
 	auto oauth = new OAuthClient();
-	oauth.resource = canonicalResource(mcpEndpoint);
+	oauth.resource = canonicalResourceUri(mcpEndpoint);
 	oauth.authMethod = opts.authMethod;
 	oauth.clientIdMetadataUrl = opts.clientIdMetadataUrl;
 
@@ -955,37 +917,6 @@ unittest  // loopbackRedirectUri formats a localhost URI for the bound port
 	assert(loopbackRedirectUri(8765) == "http://localhost:8765/callback");
 	assert(loopbackRedirectUri(1234, "/cb") == "http://localhost:1234/cb");
 	assert(loopbackRedirectUri(1234, "cb") == "http://localhost:1234/cb");
-}
-
-unittest  // canonicalResource drops a trailing slash and any fragment
-{
-	assert(canonicalResource("https://mcp.example.com/") == "https://mcp.example.com");
-	assert(canonicalResource("https://mcp.example.com/mcp") == "https://mcp.example.com/mcp");
-	assert(canonicalResource("https://mcp.example.com#frag") == "https://mcp.example.com");
-}
-
-unittest  // canonicalResource lowercases scheme+host but preserves the path case
-{
-	// Per the spec's canonical-server-URI rule (and matching canonicalResourceUri):
-	// the scheme and host are lowercased while the path is left untouched.
-	assert(canonicalResource("https://MCP.Example.com/Mcp") == "https://mcp.example.com/Mcp");
-	assert(canonicalResource("HTTPS://MCP.Example.com/Mcp/") == "https://mcp.example.com/Mcp");
-	assert(canonicalResource(
-			"https://MCP.Example.com:8443/Path#frag") == "https://mcp.example.com:8443/Path");
-}
-
-unittest  // canonicalResource agrees with oauth.canonicalResourceUri
-{
-	import mcp.auth.oauth : canonicalResourceUri;
-
-	foreach (x; [
-		"https://mcp.example.com/", "https://mcp.example.com/mcp",
-		"https://mcp.example.com/mcp/", "HTTPS://MCP.Example.com/Mcp/",
-		"https://MCP.Example.com/Path#frag",
-		"https://MCP.Example.com:8443/Path#frag",
-		"https://mcp.example.com:8443/", "https://mcp.example.com",
-	])
-		assert(canonicalResource(x) == canonicalResourceUri(x), x);
 }
 
 unittest  // scopeString space-joins the requested scopes
