@@ -1775,6 +1775,13 @@ final class McpServer
 			// is not hard-gated on the version here.
 			return doSubscribeListen(params, conn);
 		case "ping":
+			// The draft (2026-07-28) removed `ping` (SEP-2575), so on a
+			// draft-negotiated session the method does not exist and MUST answer
+			// -32601 (method not found), mirroring its co-removed siblings
+			// logging/setLevel and resources/subscribe. Stable (<= 2025-11-25)
+			// versions still answer with an empty-success result.
+			if (ver.isDraft)
+				throw methodNotFound(method);
 			return Json.emptyObject;
 		case "tools/list":
 			return doListTools(params, ver);
@@ -1809,6 +1816,12 @@ final class McpServer
 		case "logging/setLevel":
 			return doSetLevel(params, ver, conn);
 		case "tasks/list":
+			// SEP-2663 removed `tasks/list` from the draft tasks extension, so on
+			// a draft-negotiated session the method does not exist and MUST answer
+			// -32601 (method not found), mirroring tasks/result. The 2025-11-25
+			// family still defines it, where doTasksList returns an empty page.
+			if (ver.isDraft)
+				throw methodNotFound(method);
 			return doTasksList(params, ver);
 		case "tasks/get":
 			return doTasksGet(params, ver);
@@ -2873,6 +2886,22 @@ unittest  // ping returns an empty result object
 {
 	auto s = makeTestServer();
 	auto resp = s.handle(req(2, "ping")).get;
+	assert(resp["result"].type == Json.Type.object);
+	assert(resp["result"].length == 0);
+}
+
+unittest  // draft ping is -32601: the draft (SEP-2575) removed the ping method
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(draftReq(2, "ping")).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+}
+
+unittest  // stable (<= 2025-11-25) ping still returns an empty result object
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(req(2, "ping")).get;
+	assert("error" !in resp);
 	assert(resp["result"].type == Json.Type.object);
 	assert(resp["result"].length == 0);
 }
@@ -4580,6 +4609,24 @@ unittest  // draft tasks/result is -32601: SEP-2663 defines no tasks/result in t
 	p["taskId"] = "nope";
 	auto resp = s.handle(draftReq(1, "tasks/result", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+}
+
+unittest  // draft tasks/list is -32601: SEP-2663 removed tasks/list from the draft extension
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+	auto resp = s.handle(draftReq(1, "tasks/list")).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+}
+
+unittest  // 2025-11-25 tasks/list still returns an empty page (defined in the stable family)
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+	auto resp = s.handle(req(1, "tasks/list")).get;
+	assert("error" !in resp);
+	assert(resp["result"]["tasks"].type == Json.Type.array);
+	assert(resp["result"]["tasks"].length == 0);
 }
 
 unittest  // 2025-11-25 tasks/result for an unknown taskId is -32602 (still defined)
