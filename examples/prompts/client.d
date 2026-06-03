@@ -29,9 +29,9 @@ module prompts_client;
 import std.algorithm : map, canFind, sort;
 import std.array : array;
 
-import mcp.client.client : McpClient;
+import mcp.client.client : McpClient, byName;
 import mcp.protocol.types : ContentKind, CompletionReference, CompleteResult,
-	ListPromptsResult, GetPromptResult, ResourceContents;
+	ListPromptsResult, GetPromptResult, Prompt, ResourceContents;
 import mcp.protocol.errors : McpException, ErrorCode;
 import vibe.data.json : Json;
 
@@ -144,11 +144,12 @@ int run(McpClient client) @safe
 	return 0;
 }
 
-/// Small helper: find a prompt by name in a slice (asserts presence).
-auto canFindAndGet(P)(P[] prompts, string name) @safe
+/// Small helper: find a prompt by name in a slice (asserts presence). Delegates
+/// the scan to the SDK's `byName` accessor and unwraps, throwing when absent.
+Prompt canFindAndGet(Prompt[] prompts, string name) @safe
 {
-	foreach (p; prompts)
-		if (p.name == name)
-			return p;
-	throw new Exception("expected prompt not present: " ~ name);
+	auto p = prompts.byName(name);
+	if (p.isNull)
+		throw new Exception("expected prompt not present: " ~ name);
+	return p.get;
 }
