@@ -121,10 +121,12 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			break;
 		case MessageKind.response:
 		case MessageKind.errorResponse:
-			// A reply to a server->client request: the channel correlates it itself,
-			// so this branch is unreachable (the read loop routes responses to the
-			// coordinator before calling onInbound). Ignore defensively.
-			break;
+			// A reply to a server->client request is correlated by the coordinator in
+			// `routeMessage`, which only ever hands request/notification kinds to
+			// `onInbound`. Reaching here means that dispatch contract was broken; assert
+			// rather than silently drop the reply (compiled out in release builds).
+			assert(false,
+					"onInbound receives request/notification only; responses are coordinator-routed");
 		}
 	}
 
