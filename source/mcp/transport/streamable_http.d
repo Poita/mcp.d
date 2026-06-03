@@ -201,6 +201,16 @@ void mountMcp(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
+		// The DELETE is a subsequent HTTP request and is subject to the same
+		// rule as the POST and GET paths: an invalid or unsupported
+		// MCP-Protocol-Version MUST be answered with 400 Bad Request (a null-id
+		// JSON-RPC error) rather than proceeding to a 204 terminate or a 405.
+		if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
+			return;
+		}
 		if (sessions !is null && deleteTerminatesSession(server.negotiatedVersion))
 		{
 			// Session Management: a client signals it no longer needs the
@@ -645,6 +655,19 @@ unittest  // 405 Allow header enumerates every supported method (RFC 9110 §10.2
 private void handleGet(McpServer server, ServerPushChannel push, SessionManager sessions,
 		uint reconnectDelayMs, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
+	// The GET that opens the standalone stream is a subsequent HTTP request and
+	// is subject to the same rule as the POST path: an invalid or unsupported
+	// MCP-Protocol-Version MUST be answered with 400 Bad Request rather than a
+	// 200 text/event-stream or a 405. This precedes the mode/getOpensSseStream
+	// gate so a stateless or draft-negotiated server still rejects a bad version
+	// with 400 rather than masking it behind a 405.
+	if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
+	{
+		res.statusCode = HTTPStatus.badRequest;
+		res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
+		return;
+	}
+
 	// The standalone GET SSE stream is an unsolicited server->client
 	// push channel — shared state correlating more than one HTTP call. A stateless
 	// server keeps no such state, so it MUST answer 405 (no unsolicited push
@@ -680,17 +703,6 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 					"text/plain");
 			return;
 		}
-	}
-
-	// The GET that opens the standalone stream is a subsequent HTTP request and
-	// is subject to the same rule as the POST path: an invalid or unsupported
-	// MCP-Protocol-Version MUST be answered with 400 Bad Request rather than a
-	// 200 text/event-stream.
-	if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
-	{
-		res.statusCode = HTTPStatus.badRequest;
-		res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
-		return;
 	}
 
 	// Open a long-lived SSE stream wired to the server-push channel, so the
@@ -1819,15 +1831,34 @@ unittest  // the standalone GET stream is version-gated like a POST: bad version
 	// basic/transports §Protocol Version Header: the GET that opens the
 	// standalone server->client stream is a subsequent HTTP request, so an
 	// invalid/unsupported MCP-Protocol-Version MUST yield 400 Bad Request rather
-	// than opening a 200 text/event-stream. handleGet runs postProtocolVersionGate
-	// (the same gate every POST kind runs) after the session check and before
-	// setting Content-Type, so the rejecting McpException maps to HTTP 400.
+	// than opening a 200 text/event-stream or a 405. handleGet runs
+	// postProtocolVersionGate (the same gate every POST kind runs) ahead of the
+	// mode/getOpensSseStream 405 gate and before setting Content-Type, so the
+	// rejecting McpException maps to HTTP 400 even for a stateless/draft server.
 	auto bad = postProtocolVersionGate("1.0.0");
 	assert(bad !is null, "an invalid version on the standalone GET must be rejected");
 	assert(bad.code == ErrorCode.unsupportedProtocolVersion);
 	auto j = makeErrorResponse(Json(null), bad);
 	assert(httpStatusForResponse(j, false) == 400);
 	// a supported / absent header opens the stream (gate returns null)
+	assert(postProtocolVersionGate("2025-11-25") is null);
+	assert(postProtocolVersionGate("") is null);
+}
+
+unittest  // DELETE is version-gated like POST/GET: bad version -> 400, not 204/405
+{
+	// basic/transports §Protocol Version Header: the DELETE that signals session
+	// teardown is a subsequent HTTP request, so an invalid/unsupported
+	// MCP-Protocol-Version MUST yield 400 Bad Request (a null-id JSON-RPC error)
+	// rather than proceeding to a 204 terminate or a 405. The DELETE route runs
+	// postProtocolVersionGate after the origin/auth guards and before the
+	// deleteTerminatesSession branch, so the rejecting McpException maps to 400.
+	auto bad = postProtocolVersionGate("1.0.0");
+	assert(bad !is null, "an invalid version on a DELETE must be rejected");
+	assert(bad.code == ErrorCode.unsupportedProtocolVersion);
+	auto j = makeErrorResponse(Json(null), bad);
+	assert(httpStatusForResponse(j, false) == 400);
+	// a supported / absent header lets the DELETE proceed (gate returns null)
 	assert(postProtocolVersionGate("2025-11-25") is null);
 	assert(postProtocolVersionGate("") is null);
 }
