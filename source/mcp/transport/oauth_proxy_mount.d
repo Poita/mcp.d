@@ -48,7 +48,8 @@ import vibe.http.server : HTTPServerRequest, HTTPServerResponse, HTTPStatus;
 import vibe.http.router : URLRouter;
 import vibe.http.common : HTTPMethod;
 
-import mcp.auth.oauth_proxy : ConsentRequiredException, OAuthProxy, OAuthProxyConfig;
+import mcp.auth.oauth_proxy : ConsentRequiredException,
+	InvalidRedirectUriException, OAuthProxy, OAuthProxyConfig;
 
 @safe:
 
@@ -75,6 +76,17 @@ string buildClientCallbackRedirect(string clientRedirectUri, string code, string
 	if (clientState.length)
 		url ~= "&state=" ~ enc(clientState);
 	return url;
+}
+
+/// Build the RFC 6749 §5.2 `invalid_request` error document returned (with HTTP
+/// 400) when a client presents a `redirect_uri` that is not registered or uses a
+/// disallowed scheme. The offending code is never relayed.
+Json invalidRequestJson(string description) @safe
+{
+	Json j = Json.emptyObject;
+	j["error"] = "invalid_request";
+	j["error_description"] = description;
+	return j;
 }
 
 /// Extract the `redirect_uris` array from a parsed RFC 7591 DCR request body,
@@ -250,6 +262,19 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 		const scope_ = req.query.get("scope", "");
 		const clientRedirect = req.query.get("redirect_uri", "");
 		const clientState = req.query.get("state", "");
+
+		// Reject an unregistered or disallowed-scheme redirect_uri BEFORE minting any
+		// proxy state or rendering the consent screen (RFC 6749 §3.1.2.2 / §10.6,
+		// RFC 8252). Failing closed here means the upstream code can never be relayed
+		// to a URI the client never registered.
+		try
+			proxy.validateRedirectUri(clientRedirect);
+		catch (InvalidRedirectUriException)
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(invalidRequestJson("invalid redirect_uri"));
+			return;
+		}
 
 		const proxyState = mintState();
 		store.put(proxyState, ProxyAuthState(clientRedirect, clientState, codeChallenge, scope_));
@@ -568,6 +593,7 @@ unittest  // CONFUSED DEPUTY: an un-consented client gets the consent screen, NO
 	cfg.resource = "https://mcp.example.com/mcp";
 
 	auto proxy = new OAuthProxy(cfg);
+	proxy.register(["http://localhost:5000/cb"]);
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
@@ -601,6 +627,7 @@ unittest  // CONFUSED DEPUTY: after the user approves, /consent records consent 
 	cfg.resource = "https://mcp.example.com/mcp";
 
 	auto proxy = new OAuthProxy(cfg);
+	proxy.register(["http://localhost:5000/cb"]);
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
@@ -633,4 +660,74 @@ unittest  // CONFUSED DEPUTY: after the user approves, /consent records consent 
 	assert(res2.headers["Location"].startsWith("https://github.com/login/oauth/authorize?"));
 	assert(res2.headers["Location"].canFind("client_id=Iv1.upstream"));
 	assert(res2.headers["Location"].canFind("code_challenge=CH"));
+}
+
+unittest  // invalidRequestJson carries the RFC 6749 invalid_request error shape
+{
+	auto j = invalidRequestJson("invalid redirect_uri");
+	assert(j["error"].get!string == "invalid_request");
+	assert(j["error_description"].get!string == "invalid redirect_uri");
+}
+
+unittest  // OPEN REDIRECT: /authorize 400s an unregistered redirect_uri and does NOT render consent
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com";
+	cfg.resource = "https://mcp.example.com/mcp";
+
+	auto proxy = new OAuthProxy(cfg);
+	// Note: no /register for the attacker's redirect_uri.
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=https%3A%2F%2Fattacker.example%2Fcb&state=cs"));
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	assert(res.statusCode == 400);
+	assert(body_.canFind("invalid_request"));
+	// The consent screen is NOT rendered for an unregistered redirect_uri.
+	assert(!body_.canFind("Authorize application"));
+	assert(!proxy.hasConsent("https://attacker.example/cb"));
+}
+
+unittest  // OPEN REDIRECT: /authorize 400s an http non-loopback redirect_uri even if registered
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com";
+	cfg.resource = "https://mcp.example.com/mcp";
+
+	auto proxy = new OAuthProxy(cfg);
+	proxy.register(["http://app.example.com/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Fapp.example.com%2Fcb&state=cs"));
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	assert(res.statusCode == 400);
+	assert(body_.canFind("invalid_request"));
 }
