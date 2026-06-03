@@ -71,6 +71,17 @@ struct RequestOptions
 	ProgressToken progressToken;
 	string logLevel;
 	void delegate(ProgressNotification) @safe onProgress;
+
+	/// Convenience factory for the dominant per-call case: route this request's
+	/// progress to `cb` (the verb mints a unique token), leaving `progressToken`
+	/// and `logLevel` unset. Spelled out so a single-callback caller need not pad
+	/// the leading positional fields with throwaway values.
+	static RequestOptions withProgress(void delegate(ProgressNotification) @safe cb) @safe
+	{
+		RequestOptions opts;
+		opts.onProgress = cb;
+		return opts;
+	}
 }
 
 /// Merge `progressToken` into a request's `params._meta.progressToken`, per
@@ -180,6 +191,15 @@ final class McpClient : ClientProtocol
 	// how many requests the call's MRTR loop issues, and unique across calls per
 	// basic/utilities/progress ("MUST be unique across all active requests").
 	private long nextProgressToken_ = 1;
+	// Per-call progress sinks keyed by the request's `ProgressToken` rendered as a
+	// JSON string (so string and integer tokens both key uniquely). A
+	// `RequestOptions.onProgress` sink is registered here for the duration of its
+	// call and removed on return; `dispatchNotification` routes an inbound
+	// `notifications/progress` to the entry matching its token, falling back to the
+	// global `onProgress` when no per-call sink is registered for that token. Keyed
+	// by token (not stacked on a single mutable field) so overlapping concurrent
+	// calls never clobber each other's sink or leave a stale wrapper installed.
+	private void delegate(ProgressNotification) @safe[string] perCallProgress_;
 	// Server identity/capabilities discovered at connect/initialize, exposed via
 	// the `serverCapabilities`/`serverInfo`/`serverInstructions` accessors. Both
 	// the stable initialize handshake and the stateless draft `server/discover`
@@ -365,6 +385,37 @@ final class McpClient : ClientProtocol
 		return DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject));
 	}
 
+	/// `server/discover` self-advertising draft framing, used by `connect()` to
+	/// auto-detect a draft/stateless server before any version is negotiated.
+	///
+	/// `route()`/`freshStatelessState` gate `server/discover` on a draft effective
+	/// version, which a stateless server only resolves when the probe carries draft
+	/// framing (the `MCP-Protocol-Version` draft header and a draft
+	/// `_meta.protocolVersion`). Without it the server falls back to its stable
+	/// default and answers methodNotFound, so an undecorated probe can never select
+	/// draft. This temporarily stamps draft framing on the single probe request and
+	/// restores the prior (unnegotiated) state on any non-draft outcome, so a
+	/// genuine legacy server is still detected by the caller.
+	private DiscoverResult discoverProbe() @safe
+	{
+		const priorUseDraft = useDraft;
+		const priorNegotiated = negotiated;
+		useDraft = true;
+		negotiated = ProtocolVersion.draft;
+		bool keepDraftFraming;
+		scope (exit)
+			if (!keepDraftFraming)
+			{
+				useDraft = priorUseDraft;
+				negotiated = priorNegotiated;
+			}
+		auto result = DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject));
+		// The probe succeeded as draft; leave the framing in place so `connect`'s
+		// version selection runs against a draft-capable peer.
+		keepDraftFraming = true;
+		return result;
+	}
+
 	/// Attach an OAuth bearer access token, sent as `Authorization: Bearer
 	/// <token>` on every subsequent request (HTTP transport). Pass an empty
 	/// string to clear it; a no-op over stdio.
@@ -426,7 +477,10 @@ final class McpClient : ClientProtocol
 		bool haveDisc;
 		try
 		{
-			disc = discover();
+			// Probe with draft framing so a stateless/draft server resolves the
+			// request to draft and serves `server/discover`; an undecorated probe
+			// would fall back to the server's stable default and be rejected.
+			disc = discoverProbe();
 			haveDisc = true;
 			serverVersions = disc.protocolVersions;
 		}
@@ -473,7 +527,14 @@ final class McpClient : ClientProtocol
 			}
 		}
 		else
+		{
+			// The draft-framed probe left draft framing set; the mutually-chosen
+			// version is stable, so clear it before the `initialize` handshake runs
+			// under that stable version.
+			useDraft = false;
+			negotiated = chosen;
 			initialize(chosen.toWire); // modern discovery, pre-draft version
+		}
 		return negotiated;
 	}
 
@@ -663,6 +724,25 @@ final class McpClient : ClientProtocol
 		return callTool(name, serializeToJson(args), opts);
 	}
 
+	/// Convenience overload for the dominant single-callback case: route this
+	/// call's progress to `onProgress` (a unique token is minted) without padding
+	/// the leading `RequestOptions` fields.
+	CallToolResult callTool(string name, Json arguments,
+			void delegate(ProgressNotification) @safe onProgress) @safe
+	{
+		return callTool(name, arguments, RequestOptions.withProgress(onProgress));
+	}
+
+	/// Typed-arguments twin of the progress-callback `callTool` convenience
+	/// overload: serialize the struct `args` and route this call's progress to
+	/// `onProgress`.
+	CallToolResult callTool(T)(string name, T args,
+			void delegate(ProgressNotification) @safe onProgress) @safe
+			if (!is(T : Json))
+	{
+		return callTool(name, serializeToJson(args), RequestOptions.withProgress(onProgress));
+	}
+
 	/// Issue `tools/call` and, against a draft server, complete any MRTR
 	/// (SEP-2322) round-trips by satisfying each `InputRequest` and resubmitting
 	/// the request with the answers. Returns the first completed `CallToolResult`.
@@ -741,29 +821,24 @@ final class McpClient : ClientProtocol
 		return opts.progressToken;
 	}
 
-	/// Run `body_` with `opts.onProgress` installed as a per-call sink (when
+	/// Run `body_` with `opts.onProgress` registered as a per-call sink (when
 	/// non-null): while it executes, inbound progress correlated to
-	/// `opts.progressToken` is delivered to `opts.onProgress`, and progress for
-	/// any other token still reaches the previously-installed global
-	/// `this.onProgress`. The prior global handler is restored on return
-	/// (including on throw). A null `opts.onProgress` runs `body_` directly.
-	/// Centralises the save/wrap/restore so every request verb shares one
-	/// implementation and the global field is never left swapped out.
+	/// `opts.progressToken` is delivered to `opts.onProgress`, and progress for any
+	/// other token still reaches the global `this.onProgress`. The sink is
+	/// registered under its token in `perCallProgress_` on entry and removed on
+	/// return (including on throw). A null `opts.onProgress` runs `body_` directly.
+	///
+	/// The registration is keyed by token rather than stacked on a single mutable
+	/// field, so two overlapping concurrent calls each route to their own sink and
+	/// neither leaves a stale handler installed when it completes.
 	private R withPerCallProgress(R)(RequestOptions opts, scope R delegate() @safe body_) @safe
 	{
 		if (opts.onProgress is null)
 			return body_();
-		const token = opts.progressToken;
-		auto onProgress = opts.onProgress;
-		auto prior = this.onProgress;
+		const key = opts.progressToken.toJson().toString();
+		perCallProgress_[key] = opts.onProgress;
 		scope (exit)
-			this.onProgress = prior;
-		this.onProgress = (ProgressNotification n) @safe {
-			if (n.matches(token))
-				onProgress(n);
-			else if (prior !is null)
-				prior(n);
-		};
+			perCallProgress_.remove(key);
 		return body_();
 	}
 
@@ -1513,10 +1588,19 @@ final class McpClient : ClientProtocol
 				return; // unknown or already-completed id -> ignore per spec
 			elicitationIds_.remove(eid); // completion forwarded -> stop tracking
 		}
-		// Deliver progress updates as a typed value to the dedicated observer,
-		// in addition to the generic catch-all below.
-		if (method == "notifications/progress" && onProgress !is null)
-			onProgress(ProgressNotification.fromJson(params));
+		// Deliver progress updates as a typed value: route to the per-call sink
+		// registered for the notification's token when one exists (so overlapping
+		// concurrent calls each see only their own progress), otherwise to the
+		// global observer.
+		if (method == "notifications/progress")
+		{
+			auto pn = ProgressNotification.fromJson(params);
+			auto perCall = pn.progressToken.toString() in perCallProgress_;
+			if (perCall !is null)
+				(*perCall)(pn);
+			else if (onProgress !is null)
+				onProgress(pn);
+		}
 		// Deliver log messages as a typed value to the dedicated observer,
 		// in addition to the generic catch-all below.
 		if (method == "notifications/message" && onLogMessage !is null)
@@ -3139,6 +3223,111 @@ unittest  // RequestOptions combines an explicit progressToken, logLevel and onP
 	assert(received[0].progress == 0.25);
 }
 
+unittest  // overlapping per-call progress sinks each receive only their own token
+{
+	auto c = McpClient.http("http://localhost");
+
+	ProgressNotification[] globalSeen;
+	c.onProgress = (ProgressNotification n) @safe { globalSeen ~= n; };
+
+	ProgressNotification[] sinkA;
+	ProgressNotification[] sinkB;
+
+	// Simulate two concurrent calls A and B by nesting B's call inside A's RPC,
+	// so B opens (and its sink registers) while A is still in flight. Each emits a
+	// progress notification correlated to its own minted token. The single
+	// mutable-field save/restore could not keep both sinks live at once; the
+	// per-token registry must route each token to its own sink.
+	string tokenA;
+	c.onRpcForTest = (string method, Json paramsA) @safe {
+		tokenA = paramsA["_meta"]["progressToken"].get!string;
+
+		c.onRpcForTest = (string method2, Json paramsB) @safe {
+			const tokenB = paramsB["_meta"]["progressToken"].get!string;
+			assert(tokenB != tokenA);
+			// Progress for A's token arrives while B is also in flight: it must
+			// still reach A's sink, not B's.
+			Json pa = Json.emptyObject;
+			pa["progressToken"] = tokenA;
+			pa["progress"] = 0.1;
+			c.dispatchInbound(Message(makeNotification("notifications/progress", pa)));
+			// Progress for B's token reaches B's sink.
+			Json pb = Json.emptyObject;
+			pb["progressToken"] = tokenB;
+			pb["progress"] = 0.2;
+			c.dispatchInbound(Message(makeNotification("notifications/progress", pb)));
+			Json rb = Json.emptyObject;
+			rb["content"] = Json.emptyArray;
+			return rb;
+		};
+		c.callTool("inner", Json.emptyObject, (ProgressNotification n) @safe {
+			sinkB ~= n;
+		});
+
+		Json ra = Json.emptyObject;
+		ra["content"] = Json.emptyArray;
+		return ra;
+	};
+
+	c.callTool("outer", Json.emptyObject, (ProgressNotification n) @safe {
+		sinkA ~= n;
+	});
+
+	assert(sinkA.length == 1 && sinkA[0].progress == 0.1);
+	assert(sinkB.length == 1 && sinkB[0].progress == 0.2);
+	// No per-call progress was misrouted to the global handler.
+	assert(globalSeen.length == 0);
+	// Both calls have returned: every per-call sink is unregistered (no stale
+	// wrapper left behind), and the global field was never swapped out.
+	assert(c.perCallProgress_.length == 0);
+	assert(c.onProgress !is null);
+
+	// After both calls complete, the global handler is intact and still receives
+	// progress for any other (unregistered) token.
+	Json pg = Json.emptyObject;
+	pg["progressToken"] = "other";
+	pg["progress"] = 0.9;
+	c.dispatchInbound(Message(makeNotification("notifications/progress", pg)));
+	assert(globalSeen.length == 1 && globalSeen[0].progress == 0.9);
+}
+
+unittest  // callTool delegate overload routes a single callback as a per-call sink
+{
+	auto c = McpClient.http("http://localhost");
+
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "tools/call");
+		// The convenience overload still mints a token and stamps it on the request.
+		auto tok = params["_meta"]["progressToken"];
+		Json pn = Json.emptyObject;
+		pn["progressToken"] = tok;
+		pn["progress"] = 0.75;
+		c.dispatchInbound(Message(makeNotification("notifications/progress", pn)));
+		Json r = Json.emptyObject;
+		r["content"] = Json.emptyArray;
+		return r;
+	};
+
+	ProgressNotification[] received;
+	c.callTool("work", Json.emptyObject, (ProgressNotification n) @safe {
+		received ~= n;
+	});
+
+	assert(received.length == 1);
+	assert(received[0].progress == 0.75);
+}
+
+unittest  // RequestOptions.withProgress sets only the onProgress sink
+{
+	bool called;
+	auto opts = RequestOptions.withProgress((ProgressNotification) @safe {
+		called = true;
+	});
+	assert(opts.onProgress !is null);
+	assert(!opts.progressToken.isSet);
+	assert(opts.logLevel.length == 0);
+}
+
 unittest  // typed getPrompt produces the same wire args as the Json form
 {
 	static struct GreetArgs
@@ -3831,6 +4020,65 @@ unittest  // connect() routes a legacy HTTP+SSE fallback through the transport s
 	};
 	c.connect();
 	assert(transport.legacyFallbackCalled);
+}
+
+unittest  // connect() auto-detect probes server/discover with draft framing and selects draft
+{
+	// A stateless/draft server only serves `server/discover` when the probe is
+	// itself draft-framed; an undecorated probe would resolve to the server's
+	// stable default and be rejected. The probe must carry the draft
+	// `_meta.protocolVersion` and the draft `MCP-Protocol-Version` header, and
+	// connect() must end up on draft.
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	bool sawDraftFramedDiscover;
+	transport.responder = (Json message, long expectId) @safe {
+		assert(message["method"].get!string == "server/discover");
+		// The probe self-advertises draft in the body...
+		assert(message["params"]["_meta"][MetaKey.protocolVersion].get!string
+				== ProtocolVersion.draft.toWire);
+		// ...and in the protocol-derived headers the transport would send.
+		auto headers = c.headersFor(message);
+		assert(headers[HttpHeader.protocolVersion] == ProtocolVersion.draft.toWire);
+		sawDraftFramedDiscover = true;
+		Json r = Json.emptyObject;
+		r["protocolVersions"] = Json.emptyArray;
+		r["protocolVersions"] ~= Json(ProtocolVersion.draft.toWire);
+		r["capabilities"] = Json.emptyObject;
+		Json info = Json.emptyObject;
+		info["name"] = "draft-srv";
+		info["version"] = "1.0";
+		r["serverInfo"] = info;
+		return r;
+	};
+	auto chosen = c.connect();
+	assert(sawDraftFramedDiscover);
+	assert(chosen == ProtocolVersion.draft);
+}
+
+unittest  // connect() still falls back to initialize when even a draft-framed probe is methodNotFound
+{
+	// A genuine legacy server rejects `server/discover` with -32601 regardless of
+	// draft framing; connect() must then run the legacy initialize handshake and
+	// must not be left in draft mode by the probe.
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	transport.responder = (Json message, long expectId) @safe {
+		if (message["method"].get!string == "server/discover")
+			throw new McpException(ErrorCode.methodNotFound, "Method not found");
+		// The legacy initialize handshake.
+		Json r = Json.emptyObject;
+		r["protocolVersion"] = latestStable.toWire;
+		r["capabilities"] = Json.emptyObject;
+		Json info = Json.emptyObject;
+		info["name"] = "legacy-srv";
+		info["version"] = "1.0";
+		r["serverInfo"] = info;
+		return r;
+	};
+	auto chosen = c.connect();
+	assert(chosen == latestStable);
+	assert(!chosen.isDraft);
 }
 
 unittest  // test-only RPC/notify hooks are guarded behind version(unittest)
