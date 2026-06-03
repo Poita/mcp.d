@@ -957,6 +957,11 @@ bool isSecureFetchUrl(string url) @safe pure nothrow @nogc
 		}
 	}
 	auto host = rest[0 .. hostEnd];
+	// Drop an optional `userinfo@` prefix so the host checks inspect the real
+	// authority host rather than the user component.
+	const at = host.indexOf('@');
+	if (at >= 0)
+		host = host[at + 1 .. $];
 	if (host.length == 0)
 		return false;
 
@@ -1075,6 +1080,27 @@ unittest  // isSecureFetchUrl rejects schemeless / file / non-loopback http
 	assert(!isSecureFetchUrl("as.example.com/x"));
 	assert(!isSecureFetchUrl("file:///etc/passwd"));
 	assert(!isSecureFetchUrl(""));
+}
+
+unittest  // isSecureFetchUrl strips userinfo before private IPv4 literal checks (SSRF)
+{
+	assert(!isSecureFetchUrl("https://user@169.254.169.254/"));
+	assert(!isSecureFetchUrl("https://x@10.0.0.1/"));
+	assert(!isSecureFetchUrl("https://user:pass@192.168.1.1/x"));
+}
+
+unittest  // isSecureFetchUrl strips userinfo before bracketed IPv6 literal checks (SSRF)
+{
+	assert(!isSecureFetchUrl("https://a@[fe80::1]/"));
+	assert(!isSecureFetchUrl("https://a@[fd00::1]/x"));
+	assert(!isSecureFetchUrl("https://user@[::ffff:169.254.169.254]/latest/meta-data"));
+}
+
+unittest  // isSecureFetchUrl still accepts a public host carrying userinfo
+{
+	assert(isSecureFetchUrl("https://user@public.example.com/"));
+	assert(isSecureFetchUrl("https://user:pass@as.example.com/token"));
+	assert(isSecureFetchUrl("https://user@[2606:4700:4700::1111]/x"));
 }
 
 unittest  // requireSecureUrl throws on an insecure URL and passes a secure one
