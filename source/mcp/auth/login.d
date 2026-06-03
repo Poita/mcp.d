@@ -202,12 +202,42 @@ class FileTokenStore : TokenStore
 			catch (Exception)
 			{
 			}
+			restrictDirPermissions(dir);
 		}
 		auto all = readAll();
 		all[resource] = token.toJson();
 		auto bytes = serialize(all);
+		// Create the token file with owner-only permissions BEFORE writing any
+		// secret bytes, so the plaintext refresh token is never momentarily
+		// group/world-readable. On POSIX this opens the file `O_CREAT|O_EXCL`
+		// with mode 0600; `write` then truncates the now-private file.
+		precreatePrivateFile();
 		() @trusted { write(path, bytes); }();
 		restrictPermissions();
+	}
+
+	/// Atomically create the token file with owner-only (`0600`) permissions if
+	/// it does not already exist, so secret bytes are never written to a
+	/// group/world-readable file. No-op on platforms without POSIX permissions
+	/// and when the file already exists (its permissions are reasserted by
+	/// `restrictPermissions` after the write).
+	private void precreatePrivateFile() @safe
+	{
+		version (Posix)
+		{
+			import core.sys.posix.fcntl : open, O_CREAT, O_EXCL, O_WRONLY;
+			import core.sys.posix.unistd : close;
+			import core.sys.posix.sys.stat : S_IRUSR, S_IWUSR;
+			import std.string : toStringz;
+
+			if (!path.length)
+				return;
+			() @trusted {
+				int fd = open(path.toStringz, O_CREAT | O_EXCL | O_WRONLY, S_IRUSR | S_IWUSR);
+				if (fd >= 0)
+					close(fd);
+			}();
+		}
 	}
 
 	/// Restrict the token file to owner-only access (POSIX `0600`). No-op on
@@ -223,6 +253,27 @@ class FileTokenStore : TokenStore
 			{
 				try
 					() @trusted { setAttributes(path, S_IRUSR | S_IWUSR); }();
+				catch (Exception)
+				{
+				}
+			}
+		}
+	}
+
+	/// Restrict the token file's parent directory to owner-only access (POSIX
+	/// `0700`), so the directory holding the plaintext token file is not
+	/// group/other-traversable. No-op on platforms without POSIX permissions.
+	private static void restrictDirPermissions(string dir) @safe
+	{
+		version (Posix)
+		{
+			import std.file : setAttributes, exists;
+			import core.sys.posix.sys.stat : S_IRWXU;
+
+			if (dir.length && dir.exists)
+			{
+				try
+					() @trusted { setAttributes(dir, S_IRWXU); }();
 				catch (Exception)
 				{
 				}
@@ -1167,6 +1218,58 @@ unittest  // enforceIssOnCapture runs even on an error response (does not act on
 	auto checked = enforceIssOnCapture(cap, as_);
 	assert(!checked.ok);
 	assert(checked.error == "invalid_iss");
+}
+
+version (Posix) unittest  // FileTokenStore creates the token file 0600 (never a readable window)
+{
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse, getAttributes, exists;
+	import std.path : buildPath;
+	import std.conv : to;
+	import core.sys.posix.sys.stat : S_IRWXU, S_IRWXG, S_IRWXO;
+	import std.datetime.systime : Clock;
+
+	auto root = buildPath(tempDir, "mcp-login-perm-" ~ Clock.currTime().toUnixTime().to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		() @trusted { rmdirRecurse(root); }();
+
+	auto file = buildPath(root, "sub", "tokens.json");
+	auto store = new FileTokenStore(file);
+	StoredToken t;
+	t.accessToken = "secret-access";
+	t.refreshToken = "secret-refresh";
+	t.resource = "https://mcp.example.com";
+	store.save("https://mcp.example.com", t);
+
+	assert(file.exists);
+	// The file must end up owner-only (0600): no group/other bits set.
+	const fileMode = getAttributes(file) & (S_IRWXU | S_IRWXG | S_IRWXO);
+	assert((fileMode & (S_IRWXG | S_IRWXO)) == 0, "token file is group/other accessible");
+}
+
+version (Posix) unittest  // FileTokenStore restricts the parent dir to 0700
+{
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse, getAttributes;
+	import std.path : buildPath, dirName;
+	import std.conv : to;
+	import core.sys.posix.sys.stat : S_IRWXG, S_IRWXO;
+	import std.datetime.systime : Clock;
+
+	auto root = buildPath(tempDir, "mcp-login-dir-" ~ Clock.currTime()
+			.toUnixTime().to!string ~ "-d");
+	mkdirRecurse(root);
+	scope (exit)
+		() @trusted { rmdirRecurse(root); }();
+
+	auto file = buildPath(root, "sub", "tokens.json");
+	auto store = new FileTokenStore(file);
+	StoredToken t;
+	t.accessToken = "secret";
+	store.save("https://mcp.example.com", t);
+
+	// The directory the SDK created must not be group/other-traversable.
+	const dirMode = getAttributes(dirName(file)) & (S_IRWXG | S_IRWXO);
+	assert(dirMode == 0, "token dir is group/other accessible");
 }
 
 unittest  // the loopback flow aborts with a timeout error when no redirect arrives
