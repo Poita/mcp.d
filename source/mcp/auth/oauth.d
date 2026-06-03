@@ -1332,7 +1332,10 @@ private string enc(string s) @safe
 string buildAuthorizationUrl(string authorizationEndpoint, string clientId,
 		string redirectUri, string codeChallenge, string scopeStr, string resource, string state) @safe
 {
+	import std.exception : enforce;
 	import std.string : indexOf;
+
+	enforce(codeChallenge.length, "code_challenge is required (PKCE S256)");
 
 	auto url = authorizationEndpoint;
 	url ~= (authorizationEndpoint.indexOf('?') < 0) ? "?" : "&";
@@ -1478,6 +1481,14 @@ unittest  // authorization URL includes PKCE S256, resource, scope, state
 	assert(url.canFind("scope=read%20write"));
 	assert(url.canFind("resource=https%3A%2F%2Fmcp.example.com"));
 	assert(url.canFind("state=xyz"));
+}
+
+unittest  // authorization URL refuses to build a challenge-less (non-PKCE) request
+{
+	import std.exception : assertThrown;
+
+	assertThrown(buildAuthorizationUrl("https://auth.example.com/authorize", "client1",
+			"http://localhost:3000/cb", "", "read", "https://mcp.example.com", "xyz"));
 }
 
 unittest  // token request forms carry the right grant + params
