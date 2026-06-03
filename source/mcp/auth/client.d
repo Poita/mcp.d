@@ -1,7 +1,7 @@
 module mcp.auth.client;
 
 import vibe.data.json : Json, parseJsonString;
-import vibe.http.client : requestHTTP, HTTPClientRequest, HTTPClientResponse;
+import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 import vibe.http.common : HTTPMethod;
 import vibe.stream.operations : readAllUTF8;
 
@@ -352,26 +352,24 @@ final class OAuthClient
 	string probeUnauthorized(string mcpEndpoint, string bearer = "") @safe
 	{
 		string www;
-		() @trusted {
-			try
-			{
-				requestHTTP(mcpEndpoint, (scope HTTPClientRequest req) {
-					req.method = HTTPMethod.POST;
-					req.contentType = "application/json";
-					req.headers["Accept"] = "application/json, text/event-stream";
-					if (bearer.length)
-						req.headers["Authorization"] = "Bearer " ~ bearer;
-					req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}`);
-				}, (scope HTTPClientResponse res) {
-					if (res.statusCode == 401 || res.statusCode == 403)
-						www = res.headers.get("WWW-Authenticate", "");
-					res.dropBody();
-				});
-			}
-			catch (Exception)
-			{
-			}
-		}();
+		try
+		{
+			secureRequestHTTP(mcpEndpoint, (scope HTTPClientRequest req) {
+				req.method = HTTPMethod.POST;
+				req.contentType = "application/json";
+				req.headers["Accept"] = "application/json, text/event-stream";
+				if (bearer.length)
+					req.headers["Authorization"] = "Bearer " ~ bearer;
+				req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}`);
+			}, (scope HTTPClientResponse res) {
+				if (res.statusCode == 401 || res.statusCode == 403)
+					www = res.headers.get("WWW-Authenticate", "");
+				res.dropBody();
+			});
+		}
+		catch (Exception)
+		{
+		}
 		return www;
 	}
 
@@ -381,26 +379,24 @@ final class OAuthClient
 	string probeOperation(string mcpEndpoint, string bearer) @safe
 	{
 		string www;
-		() @trusted {
-			try
-			{
-				requestHTTP(mcpEndpoint, (scope HTTPClientRequest req) {
-					req.method = HTTPMethod.POST;
-					req.contentType = "application/json";
-					req.headers["Accept"] = "application/json, text/event-stream";
-					if (bearer.length)
-						req.headers["Authorization"] = "Bearer " ~ bearer;
-					req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"step-up","arguments":{}}}`);
-				}, (scope HTTPClientResponse res) {
-					if (res.statusCode == 401 || res.statusCode == 403)
-						www = res.headers.get("WWW-Authenticate", "");
-					res.dropBody();
-				});
-			}
-			catch (Exception)
-			{
-			}
-		}();
+		try
+		{
+			secureRequestHTTP(mcpEndpoint, (scope HTTPClientRequest req) {
+				req.method = HTTPMethod.POST;
+				req.contentType = "application/json";
+				req.headers["Accept"] = "application/json, text/event-stream";
+				if (bearer.length)
+					req.headers["Authorization"] = "Bearer " ~ bearer;
+				req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"step-up","arguments":{}}}`);
+			}, (scope HTTPClientResponse res) {
+				if (res.statusCode == 401 || res.statusCode == 403)
+					www = res.headers.get("WWW-Authenticate", "");
+				res.dropBody();
+			});
+		}
+		catch (Exception)
+		{
+		}
 		return www;
 	}
 
@@ -417,19 +413,17 @@ final class OAuthClient
 	string authorizeAndGetCode(string authzUrl, string expectedState = "") @safe
 	{
 		// SSRF guard: never issue the outbound GET to a plaintext-http (non-loopback)
-		// or internal/link-local authorization endpoint.
-		requireSecureUrl(authzUrl);
+		// or internal/link-local authorization endpoint; the connect is pinned to a
+		// pre-vetted resolved address.
 		string code, state;
-		() @trusted {
-			requestHTTP(authzUrl, (scope HTTPClientRequest req) {
-				req.method = HTTPMethod.GET;
-			}, (scope HTTPClientResponse res) {
-				const loc = res.headers.get("Location", "");
-				code = extractQueryParam(loc, "code");
-				state = extractQueryParam(loc, "state");
-				res.dropBody();
-			});
-		}();
+		secureRequestHTTP(authzUrl, (scope HTTPClientRequest req) {
+			req.method = HTTPMethod.GET;
+		}, (scope HTTPClientResponse res) {
+			const loc = res.headers.get("Location", "");
+			code = extractQueryParam(loc, "code");
+			state = extractQueryParam(loc, "state");
+			res.dropBody();
+		});
 		if (!validateAuthorizationResponseState(state, expectedState))
 			return "";
 		return code;
@@ -452,20 +446,18 @@ final class OAuthClient
 	string authorizeAndGetCode(AuthorizationServerMetadata as_, string authzUrl,
 			string expectedState = "") @safe
 	{
-		// SSRF guard (see overload above).
-		requireSecureUrl(authzUrl);
+		// SSRF guard (see overload above); the connect is pinned to a pre-vetted
+		// resolved address.
 		string code, iss, state;
-		() @trusted {
-			requestHTTP(authzUrl, (scope HTTPClientRequest req) {
-				req.method = HTTPMethod.GET;
-			}, (scope HTTPClientResponse res) {
-				const loc = res.headers.get("Location", "");
-				code = extractQueryParam(loc, "code");
-				iss = extractQueryParam(loc, "iss");
-				state = extractQueryParam(loc, "state");
-				res.dropBody();
-			});
-		}();
+		secureRequestHTTP(authzUrl, (scope HTTPClientRequest req) {
+			req.method = HTTPMethod.GET;
+		}, (scope HTTPClientResponse res) {
+			const loc = res.headers.get("Location", "");
+			code = extractQueryParam(loc, "code");
+			iss = extractQueryParam(loc, "iss");
+			state = extractQueryParam(loc, "state");
+			res.dropBody();
+		});
 		if (!validateAuthorizationResponseIss(iss, as_.issuer,
 				as_.authorizationResponseIssParameterSupported))
 			throw invalidRequest(
@@ -482,29 +474,25 @@ final class OAuthClient
 	{
 		// Never fetch a discovery URL that is not HTTPS (or loopback for dev) or
 		// that targets an internal/link-local address — including a hostname that
-		// resolves to one (DNS-rebinding SSRF mitigation).
-		if (!isSecureFetchUrlResolved(url))
-			return false;
+		// resolves to one (DNS-rebinding SSRF mitigation, pinned at connect time).
 		bool ok;
 		Json parsed;
-		() @trusted {
-			try
-			{
-				requestHTTP(url, (scope HTTPClientRequest req) {
-					req.method = HTTPMethod.GET;
-					req.headers["Accept"] = "application/json";
-				}, (scope HTTPClientResponse res) {
-					auto body = res.bodyReader.readAllUTF8();
-					if (res.statusCode / 100 == 2 && body.length)
-					{
-						parsed = parseJsonString(body);
-						ok = true;
-					}
-				});
-			}
-			catch (Exception)
-				ok = false;
-		}();
+		try
+		{
+			secureRequestHTTP(url, (scope HTTPClientRequest req) {
+				req.method = HTTPMethod.GET;
+				req.headers["Accept"] = "application/json";
+			}, (scope HTTPClientResponse res) {
+				auto body = res.bodyReader.readAllUTF8();
+				if (res.statusCode / 100 == 2 && body.length)
+				{
+					parsed = parseJsonString(body);
+					ok = true;
+				}
+			});
+		}
+		catch (Exception)
+			ok = false;
 		result = parsed;
 		return ok;
 	}
@@ -514,21 +502,18 @@ final class OAuthClient
 	private Json postParse(string url, string contentType,
 			scope const(ubyte)[] payload, string authHeader = null) @safe
 	{
-		requireSecureUrl(url);
 		Json result;
-		() @trusted {
-			requestHTTP(url, (scope HTTPClientRequest req) {
-				req.method = HTTPMethod.POST;
-				req.contentType = contentType;
-				req.headers["Accept"] = "application/json";
-				if (authHeader.length)
-					req.headers["Authorization"] = authHeader;
-				req.writeBody(payload);
-			}, (scope HTTPClientResponse res) {
-				auto body = res.bodyReader.readAllUTF8();
-				result = body.length ? parseJsonString(body) : Json.emptyObject;
-			});
-		}();
+		secureRequestHTTP(url, (scope HTTPClientRequest req) {
+			req.method = HTTPMethod.POST;
+			req.contentType = contentType;
+			req.headers["Accept"] = "application/json";
+			if (authHeader.length)
+				req.headers["Authorization"] = authHeader;
+			req.writeBody(payload);
+		}, (scope HTTPClientResponse res) {
+			auto body = res.bodyReader.readAllUTF8();
+			result = body.length ? parseJsonString(body) : Json.emptyObject;
+		});
 		return result;
 	}
 

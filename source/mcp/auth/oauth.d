@@ -2,6 +2,7 @@ module mcp.auth.oauth;
 
 import std.typecons : Nullable;
 import vibe.data.json : Json;
+import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 
 @safe:
 
@@ -727,8 +728,11 @@ private bool isLoopbackHost(string host) @safe pure nothrow @nogc
 	}
 	else
 	{
+		// Strip a `host:port` suffix, but not the colons of a bracketless IPv6
+		// literal (vibe's URL parser yields IPv6 hosts without brackets). A single
+		// colon is a port separator; two or more colons mark an IPv6 address.
 		const colon = host.indexOf(':');
-		if (colon >= 0)
+		if (colon >= 0 && host.indexOf(':', colon + 1) < 0)
 			host = host[0 .. colon];
 	}
 	if (host == "localhost" || host == "::1")
@@ -1022,11 +1026,12 @@ private bool isUnsafeIpv4Octets(ubyte a, ubyte b, ubyte c, ubyte d) @safe pure n
 /// rebinding mitigation, e.g. 169.254.169.254 / RFC 1918, fc00::/7, fe80::/10).
 ///
 /// This guard is purely lexical: it inspects the host as written and does not
-/// perform DNS resolution. A registered hostname that resolves to an internal
-/// address (e.g. an attacker-controlled name pointing at 169.254.169.254) is
-/// NOT covered here; that residual case is handled by `requireSecureUrl`, which
-/// resolves the host and re-checks every returned A/AAAA address against the
-/// same private/link-local ranges before any request is made.
+/// perform DNS resolution, and it parses the authority independently of the HTTP
+/// connector. It is therefore only a coarse pre-filter (used on the WWW-
+/// Authenticate metadata URL). The authoritative, TOCTOU-safe SSRF guard for an
+/// actual fetch is `secureRequestHTTP`, which parses with vibe's own URL parser
+/// (no parser differential), resolves the host once, vets every returned
+/// address, and PINS the connection to a vetted address.
 bool isSecureFetchUrl(string url) @safe pure nothrow @nogc
 {
 	import std.string : indexOf;
@@ -1150,89 +1155,339 @@ private bool isUnsafeResolvedAddress(string addr) @safe pure nothrow @nogc
 	return isUnsafeIpv4Octets(oct[0], oct[1], oct[2], oct[3]);
 }
 
-/// Resolve a registered hostname and report whether it is safe to fetch. Returns
-/// false only when resolution SUCCEEDS and at least one returned A/AAAA address
-/// falls in a private/link-local/loopback/ULA range — the DNS-rebinding case the
-/// lexical guard cannot see. IP literals and loopback hosts are already covered
-/// lexically and are reported safe without resolving. A resolution failure
-/// (NXDOMAIN, timeout, no network) is reported safe so this guard never rejects
-/// a host purely for failing to resolve; the subsequent connect would fail on
-/// its own and no internal address was exposed. `@safe`.
-private bool resolvedHostIsSafe(string host) @safe
+/// Resolve a registered hostname, vet EVERY returned A/AAAA address against the
+/// private/link-local/loopback/ULA ranges, and return a single vetted numeric
+/// address string to connect to so that the value checked is the value the
+/// connector uses (TOCTOU close: the caller pins the connection to this address
+/// rather than letting the connector re-resolve the name). `ok` is set false —
+/// and the empty string returned — when the host cannot be resolved (fail
+/// CLOSED) or when any resolved address is unsafe. IP literals and loopback
+/// hosts are already vetted lexically; for those `ok` is true and the bare host
+/// is returned unchanged so the connector uses it verbatim. `@safe`.
+private string vettedConnectAddress(string host, out bool ok) @safe
 {
 	import std.string : indexOf;
 	import std.socket : getAddressInfo, AddressFamily, SocketException;
 
+	ok = false;
 	if (host.length == 0)
-		return false;
+		return "";
 
-	// Bracketed IPv6 literals and loopback hosts are handled lexically.
+	// Bracketed IPv6 literals and loopback hosts are handled lexically; connect
+	// to them verbatim (the lexical guard already vetted IP-literal ranges).
 	if (host[0] == '[')
-		return true;
+	{
+		ok = true;
+		return host;
+	}
 	if (isLoopbackHost(host))
-		return true;
+	{
+		ok = true;
+		return host;
+	}
 
-	// Strip an optional port suffix to obtain the bare hostname.
-	const colon = host.indexOf(':');
-	if (colon >= 0)
-		host = host[0 .. colon];
+	// Strip an optional `host:port` suffix (a single trailing colon) to obtain the
+	// bare hostname; preserve the colons of a bracketless IPv6 literal.
+	auto bare = host;
+	const colon = bare.indexOf(':');
+	if (colon >= 0 && bare.indexOf(':', colon + 1) < 0)
+		bare = bare[0 .. colon];
 
-	// A numeric IPv4 literal in any encoding is already vetted lexically.
+	// A numeric IPv4 literal in any encoding is already vetted lexically; connect
+	// to it verbatim.
 	ubyte[4] oct;
-	if (canonicalizeNumericIpv4(host, oct))
-		return true;
+	if (canonicalizeNumericIpv4(bare, oct))
+	{
+		ok = true;
+		return host;
+	}
 
 	try
 	{
-		auto infos = getAddressInfo(host);
+		auto infos = getAddressInfo(bare);
+		string chosen;
 		foreach (info; infos)
 		{
 			if (info.family != AddressFamily.INET && info.family != AddressFamily.INET6)
 				continue;
-			if (isUnsafeResolvedAddress(info.address.toAddrString()))
+			const addr = info.address.toAddrString();
+			if (isUnsafeResolvedAddress(addr))
+				return ""; // any unsafe address -> reject the whole host
+			if (chosen.length == 0)
+				chosen = addr;
+		}
+		if (chosen.length == 0)
+			return ""; // no usable A/AAAA record -> fail closed
+		ok = true;
+		return chosen;
+	}
+	catch (SocketException)
+	{
+		return ""; // unresolved -> fail CLOSED; never fall through to an un-vetted connect
+	}
+}
+
+/// Whether a registered hostname resolves only to safe (public) addresses.
+/// Thin boolean wrapper over `vettedConnectAddress`; fails CLOSED on a
+/// resolution error. `@safe`.
+private bool resolvedHostIsSafe(string host) @safe
+{
+	bool ok;
+	vettedConnectAddress(host, ok);
+	return ok;
+}
+
+/// Parse `url` with the SAME parser the connector uses (`vibe.inet.url.URL`) and
+/// return its scheme and authority host. This is the single source of truth that
+/// closes the parser-differential class of SSRF bypasses: the bytes vetted below
+/// are exactly the bytes vibe will connect to, so a guard/connector disagreement
+/// over where the authority ends (`?@`, `#@`, control bytes, multiple `@`, etc.)
+/// cannot route a vetted request to a different host. `host` is the empty string
+/// when the URL is malformed or carries no host. `@safe`.
+private void parseFetchUrl(string url, out string scheme, out string host) @safe
+{
+	import vibe.inet.url : URL;
+
+	scheme = "";
+	host = "";
+	try
+	{
+		auto u = URL(url);
+		scheme = u.schema;
+		host = u.host;
+	}
+	catch (Exception)
+	{
+		// Unparseable -> leave both empty; callers fail closed.
+	}
+}
+
+/// Whether the (scheme, host) pair extracted by `parseFetchUrl` is lexically
+/// permitted: https to any host, or http to an explicit loopback host, with
+/// private/link-local IP literals rejected in either scheme. Mirrors
+/// `isSecureFetchUrl` but operates on the already-separated authority host from
+/// vibe's parser, so there is no second, divergent host parse. `@safe`.
+private bool schemeHostIsSecure(string scheme, string host) @safe nothrow @nogc
+{
+	import std.string : indexOf;
+
+	if (host.length == 0)
+		return false;
+
+	const loopback = isLoopbackHost(host);
+
+	if (host[0] == '[')
+	{
+		const close = host.indexOf(']');
+		if (close >= 0)
+		{
+			auto inner = host[1 .. close];
+			if (isUnsafeIpv6Literal(inner, loopback))
+				return false;
+		}
+		// A bracketless IPv6 host coming from vibe's parser (it strips brackets)
+		// is handled by the no-bracket branch below.
+	}
+	else if (host.indexOf(':') >= 0 && host.indexOf('.') < 0)
+	{
+		// vibe stores IPv6 hosts without brackets; classify them too.
+		if (isUnsafeIpv6Literal(host, loopback))
+			return false;
+	}
+	if (!loopback && isPrivateIpv4Literal(host))
+		return false;
+
+	bool eqScheme(string sc) @safe nothrow @nogc
+	{
+		if (scheme.length != sc.length)
+			return false;
+		foreach (k, ch; scheme)
+		{
+			char c = ch;
+			if (c >= 'A' && c <= 'Z')
+				c = cast(char)(c + 32);
+			if (c != sc[k])
 				return false;
 		}
 		return true;
 	}
-	catch (SocketException)
-	{
-		return true; // unresolved -> let the connect fail naturally; no internal target exposed
-	}
+
+	if (eqScheme("https"))
+		return true;
+	if (eqScheme("http") && loopback)
+		return true;
+	return false;
 }
 
-/// Throw `invalidRequest` when `url` is not safe to fetch. First applies the
-/// lexical `isSecureFetchUrl` guard (scheme + IP-literal ranges), then resolves
-/// the host and rejects the request if any returned A/AAAA address falls in a
-/// private/link-local range — closing the DNS-rebinding gap where an
-/// attacker-controlled hostname points at an internal address (e.g. a
-/// `resource_metadata` URL from a `WWW-Authenticate` header that resolves to
-/// 169.254.169.254). Used at the start of every outbound OAuth/discovery
-/// request.
+/// Throw `invalidRequest` when `url` is not safe to fetch. Parses the URL with
+/// vibe's own parser (the single source of truth), applies the scheme +
+/// IP-literal guard. This is a check-time scheme/host gate (no DNS resolution),
+/// suitable for paths that VALIDATE a URL without fetching it (e.g. building the
+/// authorization-request URL the host will open). Because the host is taken from
+/// vibe's own parser, the `?@` / `#@` authority differential cannot route past
+/// it. The TOCTOU-safe resolve-and-pin connect for an actual fetch is performed
+/// by `secureRequestHTTP`, which every outbound OAuth/discovery request uses.
 void requireSecureUrl(string url) @safe
 {
 	import mcp.protocol.errors : invalidRequest;
 
-	if (!isSecureFetchUrl(url))
+	string scheme, host;
+	parseFetchUrl(url, scheme, host);
+
+	if (!schemeHostIsSecure(scheme, host))
+		throw invalidRequest(
+				"Refusing to fetch insecure OAuth/discovery URL (must be https, or http to an "
+				~ "explicit loopback host; private/link-local addresses are rejected): " ~ url);
+}
+
+/// Non-throwing scheme/host + resolution gate. Returns true only when the
+/// vibe-parsed scheme/host pass the lexical guard AND the host resolves only to
+/// safe addresses (fail CLOSED on a resolution error). Loopback and IP-literal
+/// hosts short-circuit without resolving. `@safe`.
+bool isSecureFetchUrlResolved(string url) @safe
+{
+	string scheme, host;
+	parseFetchUrl(url, scheme, host);
+	if (!schemeHostIsSecure(scheme, host))
+		return false;
+	return resolvedHostIsSafe(host);
+}
+
+/// Consolidated SSRF-safe HTTP fetch used by every outbound OAuth/discovery
+/// request. This is the one place that closes the SSRF class for good:
+///
+/// 1. Parse `url` with vibe's `URL` — the exact parser the connector uses — so
+///    the host vetted is the host connected to (no parser differential).
+/// 2. Reject by scheme + IP-literal ranges (`schemeHostIsSecure`).
+/// 3. Resolve the host ONCE, vet every returned address, and pick a vetted IP
+///    (`vettedConnectAddress`); fail CLOSED on a resolution error.
+/// 4. Rewrite the request URL's host to that vetted IP literal and pin the
+///    connection to it, while preserving the original hostname for the `Host`
+///    header and TLS SNI (`tlsPeerName`). The connector therefore connects to
+///    the address we vetted rather than re-resolving the name (no TOCTOU).
+///
+/// Throws `invalidRequest` when the URL is unsafe (insecure scheme, an IP-literal
+/// or resolved address in a private/link-local range, or an unresolvable host —
+/// fail CLOSED). `@trusted` because the vibe HTTP client API is `@system`; the
+/// requester/responder run inside the same trusted boundary as the existing call
+/// sites did.
+void secureRequestHTTP(string url, scope void delegate(scope HTTPClientRequest) requester,
+		scope void delegate(scope HTTPClientResponse) responder) @trusted
+{
+	import mcp.protocol.errors : invalidRequest;
+	import std.string : indexOf;
+	import vibe.inet.url : URL;
+	import vibe.http.client : requestHTTP, HTTPClientSettings;
+
+	string scheme, host;
+	parseFetchUrl(url, scheme, host);
+	if (!schemeHostIsSecure(scheme, host))
 		throw invalidRequest(
 				"Refusing to fetch insecure OAuth/discovery URL (must be https, or http to an "
 				~ "explicit loopback host; private/link-local addresses are rejected): " ~ url);
 
-	if (!resolvedHostIsSafe(fetchUrlHost(url)))
+	bool ok;
+	const connectAddr = vettedConnectAddress(host, ok);
+	if (!ok)
 		throw invalidRequest("Refusing to fetch OAuth/discovery URL whose host resolves to a "
 				~ "private/link-local address (or could not be resolved): " ~ url);
+
+	// Build the pinned URL: same scheme/path/port/userinfo, host replaced by the
+	// vetted numeric address so the connector cannot re-resolve to a different
+	// (internal) target. Preserve the original host for Host header + SNI.
+	const originalHost = host;
+	auto u = URL(url);
+	// Strip a port suffix from the chosen address before assigning to the URL
+	// host (the URL keeps its own port).
+	string connHost = connectAddr;
+	if (connHost.length && connHost[0] != '[')
+	{
+		const c = connHost.indexOf(':');
+		// Only IPv4/host:port carries a single ':'; an unbracketed IPv6 literal
+		// has many. Keep IPv6 (many colons) intact; trim host:port.
+		if (c >= 0 && connHost.indexOf(':', c + 1) < 0)
+			connHost = connHost[0 .. c];
+	}
+	u.host = connHost;
+
+	auto settings = new HTTPClientSettings;
+	settings.tlsPeerName = originalHost;
+
+	// vibe derives the Host header from u.host; restore the original host so the
+	// server sees the intended virtual host, not the pinned IP.
+	string hostHeader = originalHost;
+	if (u.port && u.port != u.defaultPort)
+	{
+		import std.conv : to;
+
+		hostHeader = (originalHost.indexOf(':') >= 0 ? "[" ~ originalHost ~ "]" : originalHost)
+			~ ":" ~ u.port.to!string;
+	}
+
+	requestHTTP(u, (scope HTTPClientRequest req) {
+		req.headers["Host"] = hostHeader;
+		if (requester !is null)
+			requester(req);
+	}, (scope HTTPClientResponse res) {
+		if (responder !is null)
+			responder(res);
+	}, settings);
 }
 
-/// Non-throwing counterpart to `requireSecureUrl` for discovery GET paths that
-/// signal failure by returning rather than raising. Applies the lexical
-/// `isSecureFetchUrl` guard AND the DNS-resolution `resolvedHostIsSafe` check, so
-/// an attacker-controlled hostname that resolves to an internal/link-local
-/// address (the DNS-rebinding case) is rejected on GETs exactly as it is on the
-/// POST paths. Returns true only when both guards pass. `@safe`.
-bool isSecureFetchUrlResolved(string url) @safe
+unittest  // parseFetchUrl uses vibe's authority parse so '?@' does not hide an internal host
 {
-	if (!isSecureFetchUrl(url))
-		return false;
-	return resolvedHostIsSafe(fetchUrlHost(url));
+	// vibe treats '?' and '#' as plain authority bytes (not terminators), so the
+	// real host after the first '@' is the internal address — the guard must see
+	// the SAME host vibe will connect to and reject it.
+	string scheme, host;
+	parseFetchUrl("https://public?@169.254.169.254/jwks", scheme, host);
+	assert(host == "169.254.169.254");
+	assert(!schemeHostIsSecure(scheme, host));
+}
+
+unittest  // parseFetchUrl uses vibe's authority parse so '#@' does not hide an internal host
+{
+	string scheme, host;
+	parseFetchUrl("https://public#@10.0.0.5/jwks", scheme, host);
+	assert(host == "10.0.0.5");
+	assert(!schemeHostIsSecure(scheme, host));
+}
+
+unittest  // isSecureFetchUrlResolved rejects the '?@' / '#@' authority differential (SSRF)
+{
+	// The end-to-end gate (parse + scheme/host check) must reject both forms; the
+	// old lexical guard parsed the host as the benign prefix and let them through.
+	assert(!isSecureFetchUrlResolved("https://public?@169.254.169.254/jwks"));
+	assert(!isSecureFetchUrlResolved("https://public#@10.0.0.5/jwks"));
+}
+
+unittest  // vettedConnectAddress fails CLOSED for an unresolvable hostname (no fail-open)
+{
+	// RFC 6761 reserves `.invalid` to always fail resolution. The guard must
+	// report ok=false (and never fall through to an un-vetted connect).
+	bool ok = true;
+	const addr = vettedConnectAddress("nonexistent-host.invalid", ok);
+	assert(!ok);
+	assert(addr.length == 0);
+}
+
+unittest  // vettedConnectAddress returns loopback/IP-literal hosts verbatim as safe
+{
+	bool ok;
+	assert(vettedConnectAddress("127.0.0.1", ok) == "127.0.0.1" && ok);
+	assert(vettedConnectAddress("localhost", ok) == "localhost" && ok);
+	assert(vettedConnectAddress("[::1]", ok) == "[::1]" && ok);
+}
+
+unittest  // schemeHostIsSecure mirrors the scheme + IP-literal policy on a pre-split host
+{
+	assert(schemeHostIsSecure("https", "as.example.com"));
+	assert(schemeHostIsSecure("http", "localhost"));
+	assert(schemeHostIsSecure("http", "127.0.0.1"));
+	assert(!schemeHostIsSecure("http", "internal.local"));
+	assert(!schemeHostIsSecure("https", "169.254.169.254"));
+	assert(!schemeHostIsSecure("https", "10.0.0.5"));
+	assert(!schemeHostIsSecure("", ""));
 }
 
 unittest  // isSecureFetchUrl accepts https and rejects plaintext http to a remote host
