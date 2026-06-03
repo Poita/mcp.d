@@ -19,7 +19,7 @@ import std.algorithm : canFind;
 import vibe.data.json : Json, parseJsonString;
 
 import mcp.auth.jwt_verifier : audiences, currentUnixTime, jsonStr, splitScopes;
-import mcp.auth.oauth : TokenEndpointAuthMethod, basicAuthHeader, requireSecureUrl;
+import mcp.auth.oauth : TokenEndpointAuthMethod, basicAuthHeader, secureRequestHTTP;
 import mcp.auth.resource_server : TokenInfo, TokenValidator;
 
 @safe:
@@ -177,18 +177,18 @@ string introspectionBody(IntrospectionConfig cfg, string token) @safe
 
 private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
 {
-	import vibe.http.client : requestHTTP, HTTPClientRequest, HTTPClientResponse;
+	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 	import vibe.http.common : HTTPMethod;
 	import vibe.stream.operations : readAllUTF8;
 
 	// Refuse to introspect over an insecure transport (must be https, or http to
-	// a loopback host for dev) or against an internal/link-local address.
-	requireSecureUrl(cfg.introspectionEndpoint);
-
+	// a loopback host for dev) or against an internal/link-local address. The
+	// connect is pinned to a pre-vetted resolved address (DNS-rebinding
+	// mitigation); secureRequestHTTP throws on an unsafe or unresolvable host.
 	const body_ = introspectionBody(cfg, token);
 	string responseBody;
 	bool ok = false;
-	requestHTTP(cfg.introspectionEndpoint, (scope HTTPClientRequest req) {
+	secureRequestHTTP(cfg.introspectionEndpoint, (scope HTTPClientRequest req) {
 		req.method = HTTPMethod.POST;
 		req.headers["Content-Type"] = "application/x-www-form-urlencoded";
 		req.headers["Accept"] = "application/json";

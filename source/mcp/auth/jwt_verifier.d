@@ -504,21 +504,19 @@ package final class JwksCache : KeySource
 /// Fetch a JWKS document over HTTP(S). Returns the body, or empty on failure.
 private string fetchJwks(string uri) @trusted
 {
-	import vibe.http.client : requestHTTP, HTTPClientRequest, HTTPClientResponse;
+	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 	import vibe.http.common : HTTPMethod;
 	import vibe.stream.operations : readAllUTF8;
-	import mcp.auth.oauth : isSecureFetchUrlResolved;
+	import mcp.auth.oauth : secureRequestHTTP;
 
 	// Refuse to fetch a JWKS over an insecure transport (must be https, or http
-	// to a loopback host for dev) or from an internal/link-local address —
-	// including a hostname that resolves to one (DNS-rebinding SSRF mitigation).
-	if (!isSecureFetchUrlResolved(uri))
-		return null;
-
+	// to a loopback host for dev) or from an internal/link-local address. The
+	// fetch is pinned to a pre-vetted resolved address (DNS-rebinding SSRF
+	// mitigation); secureRequestHTTP throws on an unsafe or unresolvable host.
 	string body_;
 	try
 	{
-		requestHTTP(uri, (scope HTTPClientRequest req) {
+		secureRequestHTTP(uri, (scope HTTPClientRequest req) {
 			req.method = HTTPMethod.GET;
 		}, (scope HTTPClientResponse res) { body_ = res.bodyReader.readAllUTF8(); });
 	}
