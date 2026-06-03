@@ -9,12 +9,28 @@ import mcp.protocol.errors;
 
 @safe:
 
+/// Resolve a settled waiter's outcome into a value or an exception: if `error`
+/// is a JSON-RPC error object, throw `McpException` decoded from its `code`
+/// (defaulting to `internalError`) and `message` (defaulting to `defaultMsg`);
+/// otherwise return `result`. Shared by every coordinator's await path so the
+/// error decoding lives in one place.
+Json throwOrReturn(Json result, Json error, string defaultMsg) @safe
+{
+	if (error.type != Json.Type.undefined)
+	{
+		const code = ("code" in error) ? error["code"].get!int : ErrorCode.internalError;
+		const m = ("message" in error) ? error["message"].get!string : defaultMsg;
+		throw new McpException(code, m, error);
+	}
+	return result;
+}
+
 /// Correlates outbound JSON-RPC requests with the peer's responses on a single
 /// duplex byte channel (the MCP **stdio** transport, where both directions share
-/// one stream). This generalizes `StreamCoordinator`'s waiter registry — which
-/// the Streamable HTTP transport uses to match a server->client request with the
-/// client's reply that arrives on a *separate* POST — to a symmetric, transport-
-/// neutral primitive used by `DuplexChannel` for BOTH peers:
+/// one stream). It is the symmetric, transport-neutral counterpart to the
+/// Streamable HTTP transport's `StreamCoordinator` (which matches a server->client
+/// request with the client's reply that arrives on a *separate* POST), used by
+/// `DuplexChannel` for BOTH peers:
 ///
 ///   - the client awaits the response to a request it sent the server, and
 ///   - the server awaits the response to a server->client request it sent the
@@ -94,13 +110,7 @@ final class DuplexCoordinator
 				throw internalError("Timed out awaiting peer response to request " ~ idStr(id));
 			ec = newEc;
 		}
-		if (w.error.type != Json.Type.undefined)
-		{
-			const code = ("code" in w.error) ? w.error["code"].get!int : ErrorCode.internalError;
-			const m = ("message" in w.error) ? w.error["message"].get!string : "peer error";
-			throw new McpException(code, m, w.error);
-		}
-		return w.result;
+		return throwOrReturn(w.result, w.error, "peer error");
 	}
 
 	/// Drop a registered-but-unawaited request id (e.g. when sending the request
