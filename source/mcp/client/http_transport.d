@@ -668,7 +668,12 @@ final class HttpClientTransport : ClientTransport
 		req.method = HTTPMethod.POST;
 		req.headers["Accept"] = "application/json, text/event-stream";
 		req.contentType = "application/json";
-		if (bearerToken.length)
+		// Defense-in-depth: only attach the bearer when this POST targets the
+		// configured origin. In legacy mode the target is the server-supplied
+		// `legacyEndpoint`; if a future change ever let a cross-origin value reach
+		// here, the credential still must not leave the configured origin.
+		const target = legacyMode ? legacyEndpoint : url;
+		if (bearerToken.length && sameOrigin(url, target))
 			req.headers["Authorization"] = "Bearer " ~ bearerToken;
 		if (sessionId.length)
 			req.headers["Mcp-Session-Id"] = sessionId;
@@ -1492,15 +1497,32 @@ bool parseEndpointEvent(string sse, out string uri) @safe
 	return flush();
 }
 
+/// Whether `candidate` shares `base`'s security origin: same scheme, host, and
+/// effective port (per-scheme default applied). The legacy POST endpoint a server
+/// supplies on the SSE stream is only trusted when it is same-origin, so the
+/// client never POSTs its bearer token to a server-named cross-origin URI. A
+/// scheme mismatch (e.g. an https base vs. an http candidate) is rejected too, so
+/// a downgrade cannot leak the credential in plaintext.
+bool sameOrigin(string base, string candidate) @safe
+{
+	import std.string : toLower;
+
+	auto b = parseHttpEndpoint(base);
+	auto c = parseHttpEndpoint(candidate);
+	return b.tls == c.tls && b.host.toLower == c.host.toLower && b.port == c.port;
+}
+
 /// Resolve a legacy `endpoint` event URI (which may be absolute, root-relative,
 /// or document-relative) against the GET-SSE base URL, yielding the absolute URL
-/// to POST subsequent JSON-RPC messages to.
+/// to POST subsequent JSON-RPC messages to. An absolute URI is only accepted when
+/// it is same-origin with the base; a cross-origin absolute URI yields null so the
+/// legacy fallback fails closed rather than POSTing the bearer token off-origin.
 string resolveEndpointUri(string baseUrl, string endpoint) @safe
 {
 	import std.string : indexOf, startsWith, lastIndexOf;
 
 	if (endpoint.startsWith("http://") || endpoint.startsWith("https://"))
-		return endpoint;
+		return sameOrigin(baseUrl, endpoint) ? endpoint : null;
 
 	// Split base into scheme://authority and path.
 	const sep = baseUrl.indexOf("://");
@@ -1691,10 +1713,63 @@ unittest  // parseEndpointEvent returns false when no endpoint event is present
 	assert(!parseEndpointEvent(sse, uri));
 }
 
-unittest  // resolveEndpointUri keeps an absolute URI unchanged
+unittest  // resolveEndpointUri keeps a same-origin absolute URI unchanged
 {
 	assert(resolveEndpointUri("http://host:8080/mcp",
-			"http://other:9000/messages") == "http://other:9000/messages");
+			"http://host:8080/messages") == "http://host:8080/messages");
+}
+
+unittest  // resolveEndpointUri rejects a cross-origin absolute URI (returns null)
+{
+	// A server (or SSE-injecting attacker) naming a foreign host must not become
+	// the legacy POST target; null keeps `legacyEndpoint` empty so the fallback
+	// fails closed and the bearer is never POSTed off-origin.
+	assert(resolveEndpointUri("http://host:8080/mcp", "http://attacker.example/messages") is null);
+}
+
+unittest  // resolveEndpointUri rejects a same-host cross-port absolute URI
+{
+	assert(resolveEndpointUri("http://host:8080/mcp", "http://host:9000/messages") is null);
+}
+
+unittest  // resolveEndpointUri rejects a TLS downgrade for the absolute endpoint
+{
+	// An https base must not accept an http endpoint: that would leak the bearer
+	// in plaintext.
+	assert(resolveEndpointUri("https://host/mcp", "http://host/messages") is null);
+}
+
+unittest  // sameOrigin matches scheme, host, and effective default port
+{
+	assert(sameOrigin("https://host/mcp", "https://host:443/messages"));
+	assert(sameOrigin("http://host/mcp", "http://host:80/messages"));
+	assert(!sameOrigin("https://host/mcp", "https://other/messages"));
+	assert(!sameOrigin("https://host/mcp", "http://host/messages"));
+}
+
+unittest  // setupRequest withholds the bearer when the legacy target is cross-origin
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	t.setBearerToken("secret-token");
+	t.legacyMode = true;
+	t.legacyEndpoint = "http://attacker.example/messages";
+
+	// A minimal real HTTPClientRequest cannot be constructed @safe in a unittest,
+	// so assert the gating predicate directly: the bearer is only attached when
+	// the POST target is same-origin with the configured url.
+	const target = t.legacyMode ? t.legacyEndpoint : t.url;
+	assert(!sameOrigin(t.url, target));
+}
+
+unittest  // setupRequest attaches the bearer when the legacy target is same-origin
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	t.setBearerToken("secret-token");
+	t.legacyMode = true;
+	t.legacyEndpoint = "http://host:8080/messages";
+
+	const target = t.legacyMode ? t.legacyEndpoint : t.url;
+	assert(sameOrigin(t.url, target));
 }
 
 unittest  // resolveEndpointUri resolves a root-relative path against the server origin
