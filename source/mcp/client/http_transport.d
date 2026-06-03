@@ -93,6 +93,17 @@ private struct LegacyWaiter
 	bool got;
 }
 
+/// Per-reader SSE resumption cursor: the most recent `id:`/`retry:` seen while
+/// decoding one response stream. Owned by the caller of `readSseBody` (a local in
+/// each POST / GET reader path) rather than shared across the transport, so a
+/// concurrent reader's `id:`/`retry:` line cannot clobber another stream's
+/// resume decision under vibe's cooperative scheduler.
+private struct SseCursor
+{
+	string lastEventId;
+	long retryMs;
+}
+
 /// A `ClientTransport` over the MCP Streamable HTTP transport.
 ///
 /// Owns the HTTP/SSE machinery: the POST-and-await loop (with SSE resumability),
@@ -108,11 +119,6 @@ final class HttpClientTransport : ClientTransport
 	private string url;
 	private string sessionId;
 	private string bearerToken;
-	// SSE resumability: the most recent `id:`/`retry:` seen on a response stream,
-	// and the Last-Event-ID to send when retrying after a premature stream close.
-	private string sseLastEventId;
-	private long sseRetryMs;
-	private string pendingLastEventId;
 	// Legacy HTTP+SSE (2024-11-05) transport state. When `legacyMode` is set,
 	// JSON-RPC messages are POSTed to `legacyEndpoint` (discovered from the GET
 	// stream's `endpoint` event) and responses arrive on the standalone GET SSE
@@ -337,8 +343,10 @@ final class HttpClientTransport : ClientTransport
 		Json result = Json.undefined;
 		bool got;
 		McpException err;
-		sseRetryMs = 0;
-		sseLastEventId = null;
+		// This POST owns its own resume cursor, so a concurrently scheduled stream
+		// reader cannot overwrite the Last-Event-ID / retry delay this POST uses to
+		// decide resumption.
+		SseCursor cursor;
 
 		// The modern single-endpoint POST is sent over a DEDICATED, raw TCP
 		// connection (`postAndAwaitRaw`) rather than vibe's pooled `requestHTTP`.
@@ -352,7 +360,7 @@ final class HttpClientTransport : ClientTransport
 		// approach `runServerStream`/`resumeViaGet` use for long-lived SSE)
 		// delivers each event immediately, so the client can reply and the
 		// round-trip completes.
-		postAndAwaitRaw(message, expectId, result, got, err);
+		postAndAwaitRaw(message, expectId, cursor, result, got, err);
 
 		// An HTTP 400/404/405 on the modern single endpoint is the signal to try
 		// the legacy HTTP+SSE (2024-11-05) transport. Surface it as a typed
@@ -368,10 +376,10 @@ final class HttpClientTransport : ClientTransport
 		// Premature stream close with an SSE `retry:` hint: wait the prescribed
 		// delay, then RESUME the stream with a GET carrying `Last-Event-ID`
 		// (per Streamable HTTP resumability — not a re-POST of the request).
-		if (sseRetryMs > 0)
+		if (cursor.retryMs > 0)
 		{
-			sleep(sseRetryMs.msecs);
-			resumeViaGet(expectId, sseLastEventId, result, got, err);
+			sleep(cursor.retryMs.msecs);
+			resumeViaGet(expectId, cursor.lastEventId, result, got, err);
 			if (err !is null)
 				throw err;
 			if (got)
@@ -388,8 +396,8 @@ final class HttpClientTransport : ClientTransport
 	/// the key property the pooled `requestHTTP` reader does not provide (see
 	/// `postAndAwait`). Mirrors the chunked-decode SSE parser of
 	/// `runServerStream`/`resumeViaGet`.
-	private void postAndAwaitRaw(Json message, long expectId, ref Json result,
-			ref bool got, ref McpException err) @safe
+	private void postAndAwaitRaw(Json message, long expectId, ref SseCursor cursor,
+			ref Json result, ref bool got, ref McpException err) @safe
 	{
 		import vibe.core.net : connectTCP;
 		import vibe.stream.operations : readLine;
@@ -426,8 +434,7 @@ final class HttpClientTransport : ClientTransport
 				auto conn = openClientStream(sock, ep.tls, ep.host);
 
 				const req = buildHttpRequest("POST", ep.path, ep.host,
-						"application/json, text/event-stream",
-						"close", true, hdrs, pendingLastEventId, payload);
+						"application/json, text/event-stream", "close", true, hdrs, null, payload);
 				conn.write(cast(const(ubyte)[]) req);
 
 				// Status line + response headers.
@@ -477,8 +484,8 @@ final class HttpClientTransport : ClientTransport
 				// immediately. This is what lets a mid-stream server->client request
 				// be answered while we keep reading for the final response. Stop once
 				// the awaited response/error arrives or the transport is closing.
-				readSseBody(conn, chunked, () @safe => got || err !is null
-						|| closing, (string eventType, string data) @safe {
+				readSseBody(conn, chunked, cursor, () @safe => got
+						|| err !is null || closing, (string eventType, string data) @safe {
 					dispatchSse(data, expectId, result, got, err);
 				});
 			}
@@ -607,7 +614,9 @@ final class HttpClientTransport : ClientTransport
 					return;
 
 				bool done;
-				readSseBody(conn, chunked, () @safe => done, (string eventType, string data) @safe {
+				SseCursor cursor;
+				readSseBody(conn, chunked, cursor, () @safe => done,
+						(string eventType, string data) @safe {
 					try
 					{
 						auto m = Message(parseJsonString(data));
@@ -657,8 +666,6 @@ final class HttpClientTransport : ClientTransport
 		foreach (k, v; requestHeaders(message))
 			if (!isHeaderValueUnsafe(v))
 				req.headers[k] = v;
-		if (pendingLastEventId.length)
-			req.headers["Last-Event-ID"] = pendingLastEventId;
 		req.writeBody(cast(const(ubyte)[]) message.toString());
 	}
 
@@ -783,12 +790,14 @@ final class HttpClientTransport : ClientTransport
 	/// EOF via `leastSize`) and runs the SSE line tokenizer over it, accumulating
 	/// `data:` (joined with `\n`, one leading space stripped) and `event:` and
 	/// flushing a complete event to `onEvent(eventType, data)` on each blank line.
-	/// `id:`/`retry:` fields are handled uniformly here — updating the transport's
-	/// `sseLastEventId`/`sseRetryMs` resumption fields — so every caller gets
-	/// `event:`/`id:`/`retry:` support whether or not it consumes them. The loop
+	/// `id:`/`retry:` fields are handled uniformly here — updating the caller-owned
+	/// `cursor` resumption state — so every caller gets `event:`/`id:`/`retry:`
+	/// support whether or not it consumes them, while keeping that state per-reader
+	/// (no shared mutable resumption fields across concurrent streams). The loop
 	/// stops between reads (and after each flushed event) once `shouldStop()`
 	/// returns true. Must run inside a `@trusted` block (raw socket I/O).
-	private void readSseBody(Conn)(Conn conn, bool chunked, scope bool delegate() @safe shouldStop,
+	private void readSseBody(Conn)(Conn conn, bool chunked, ref SseCursor cursor,
+			scope bool delegate() @safe shouldStop,
 			scope void delegate(string eventType, string data) @safe onEvent) @trusted
 	{
 		import vibe.stream.operations : readLine;
@@ -830,11 +839,11 @@ final class HttpClientTransport : ClientTransport
 					data ~= (data.length ? "\n" : "") ~ d;
 				}
 				else if (line.startsWith("id:"))
-					sseLastEventId = line["id:".length .. $].strip;
+					cursor.lastEventId = line["id:".length .. $].strip;
 				else if (line.startsWith("retry:"))
 				{
 					try
-						sseRetryMs = line["retry:".length .. $].strip.to!long;
+						cursor.retryMs = line["retry:".length .. $].strip.to!long;
 					catch (Exception)
 					{
 					}
@@ -918,14 +927,16 @@ final class HttpClientTransport : ClientTransport
 		// Protocol-version header for the GET stream (set after initialize).
 		auto verHeaders = requestHeaders(Json.undefined);
 
-		// `id:`/`retry:` resumption state is tracked in `sseLastEventId`/`sseRetryMs`
-		// by the shared decoder; the reconnect loop reads them between attempts.
-		sseLastEventId = null;
+		// `id:`/`retry:` resumption state is tracked in this reconnect loop's own
+		// cursor by the decoder; the loop reads it between attempts. Keeping it local
+		// (not a shared transport field) prevents a concurrent POST/listen reader from
+		// clobbering this stream's Last-Event-ID resume on reconnect.
+		SseCursor cursor;
 		foreach (attempt; 0 .. 2)
 		{
 			if (closing)
 				break;
-			sseRetryMs = 0;
+			cursor.retryMs = 0;
 			bool sawData;
 			() @trusted {
 				try
@@ -951,14 +962,14 @@ final class HttpClientTransport : ClientTransport
 					auto conn = openClientStream(sock, ep.tls, ep.host);
 
 					const req = buildHttpRequest("GET", ep.path, ep.host, "text/event-stream",
-							"keep-alive", false, verHeaders, sseLastEventId, null);
+							"keep-alive", false, verHeaders, cursor.lastEventId, null);
 					conn.write(cast(const(ubyte)[]) req);
 
 					bool chunked;
 					if (!readSseResponseHead(conn, chunked))
 						return;
 
-					readSseBody(conn, chunked, () @safe => closing,
+					readSseBody(conn, chunked, cursor, () @safe => closing,
 							(string eventType, string data) @safe {
 						sawData = true;
 						try
@@ -976,8 +987,8 @@ final class HttpClientTransport : ClientTransport
 			if (closing)
 				break;
 			// Reconnect honoring the server-provided retry delay (SSE `retry:`).
-			if (sseRetryMs > 0)
-				sleep(sseRetryMs.msecs);
+			if (cursor.retryMs > 0)
+				sleep(cursor.retryMs.msecs);
 			else if (!sawData)
 				break; // stream unavailable and no retry hint: stop
 		}
@@ -1055,7 +1066,10 @@ final class HttpClientTransport : ClientTransport
 			if (!readSseResponseHead(conn, chunked))
 				return;
 
-			readSseBody(conn, chunked, isCancelled, (string eventType, string data) @safe {
+			// This stream consumes no resumption state; give the decoder its own
+			// throwaway cursor rather than a shared field.
+			SseCursor cursor;
+			readSseBody(conn, chunked, cursor, isCancelled, (string eventType, string data) @safe {
 				try
 					dispatch(Message(parseJsonString(data)));
 				catch (Exception)
@@ -1203,7 +1217,8 @@ final class HttpClientTransport : ClientTransport
 				if (!readSseResponseHead(conn, chunked))
 					return;
 
-				readSseBody(conn, chunked, () @safe => closing,
+				SseCursor cursor;
+				readSseBody(conn, chunked, cursor, () @safe => closing,
 						(string eventType, string data) @safe {
 					if (eventType == "endpoint")
 					{
@@ -1758,4 +1773,55 @@ unittest  // notifyLegacy is a no-op before the completion event is created
 	assert(!t.legacyEventInit);
 	t.notifyLegacy(); // must not touch an uninitialized LocalManualEvent
 	assert(!t.legacyEventInit);
+}
+
+unittest  // readSseBody records id:/retry: into the caller-owned cursor
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[]) "id: evt-7\nretry: 1500\ndata: {}\n\n".dup, false);
+	}();
+	SseCursor cursor;
+	string[] events;
+	() @trusted {
+		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+			events ~= d;
+		});
+	}();
+	assert(cursor.lastEventId == "evt-7");
+	assert(cursor.retryMs == 1500);
+	assert(events == ["{}"]);
+}
+
+unittest  // each readSseBody caller's cursor is independent (no shared resumption state)
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	// Regression: the resumption cursor must be per-reader. One stream's `id:`/
+	// `retry:` line must not clobber another concurrent reader's resume decision,
+	// so two decode passes with distinct cursors keep distinct state.
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+
+	auto streamA = () @trusted {
+		return createMemoryStream(cast(ubyte[]) "id: A\nretry: 100\ndata: a\n\n".dup, false);
+	}();
+	SseCursor cursorA;
+	() @trusted {
+		t.readSseBody(streamA, false, cursorA, () @safe => false, (string e, string d) @safe {
+		});
+	}();
+
+	auto streamB = () @trusted {
+		return createMemoryStream(cast(ubyte[]) "id: B\nretry: 200\ndata: b\n\n".dup, false);
+	}();
+	SseCursor cursorB;
+	() @trusted {
+		t.readSseBody(streamB, false, cursorB, () @safe => false, (string e, string d) @safe {
+		});
+	}();
+
+	assert(cursorA.lastEventId == "A" && cursorA.retryMs == 100);
+	assert(cursorB.lastEventId == "B" && cursorB.retryMs == 200);
 }
