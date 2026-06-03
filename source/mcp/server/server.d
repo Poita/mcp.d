@@ -2228,7 +2228,7 @@ final class McpServer
 		if (auto direct = uri in resources)
 		{
 			ReadResourceResult result;
-			result.contents = [direct.reader()];
+			result.contents = [direct.reader().forVersion(ver)];
 			return maybeCache(result, direct.cache, ver);
 		}
 
@@ -2238,7 +2238,7 @@ final class McpServer
 			if (matchUriTemplate(t.descriptor.uriTemplate, uri, captured))
 			{
 				ReadResourceResult result;
-				result.contents = [t.reader(uri, captured)];
+				result.contents = [t.reader(uri, captured).forVersion(ver)];
 				return maybeCache(result, t.cache, ver);
 			}
 		}
@@ -4199,6 +4199,52 @@ unittest  // resources/list and resources/read for a direct resource
 	p["uri"] = "test://x";
 	auto read = s.handle(req(2, "resources/read", p)).get;
 	assert(read["result"]["contents"][0]["text"].get!string == "hi");
+}
+
+unittest  // resources/read strips per-content _meta for a 2024-11-05 client
+{
+	auto s = new McpServer("t", "1");
+	Resource r = {uri: "test://x", name: "x", mimeType: nullable("text/plain")};
+	s.registerResource(r, () @safe {
+		auto c = ResourceContents.makeText("test://x", "text/plain", "hi");
+		Json m = Json.emptyObject;
+		m["k"] = "v";
+		c.meta = m;
+		return c;
+	});
+
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2024-11-05";
+	s.handle(req(1, "initialize", initP)).get;
+
+	Json p = Json.emptyObject;
+	p["uri"] = "test://x";
+	auto read = s.handle(req(2, "resources/read", p)).get;
+	assert("_meta" !in read["result"]["contents"][0],
+			"per-content _meta must NOT be emitted to a 2024-11-05 client");
+	assert(read["result"]["contents"][0]["text"].get!string == "hi");
+}
+
+unittest  // resources/read keeps per-content _meta for a 2025-06-18 client
+{
+	auto s = new McpServer("t", "1");
+	Resource r = {uri: "test://x", name: "x", mimeType: nullable("text/plain")};
+	s.registerResource(r, () @safe {
+		auto c = ResourceContents.makeText("test://x", "text/plain", "hi");
+		Json m = Json.emptyObject;
+		m["k"] = "v";
+		c.meta = m;
+		return c;
+	});
+
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2025-06-18";
+	s.handle(req(1, "initialize", initP)).get;
+
+	Json p = Json.emptyObject;
+	p["uri"] = "test://x";
+	auto read = s.handle(req(2, "resources/read", p)).get;
+	assert(read["result"]["contents"][0]["_meta"]["k"].get!string == "v");
 }
 
 unittest  // resources/read for an unknown uri is resourceNotFound
