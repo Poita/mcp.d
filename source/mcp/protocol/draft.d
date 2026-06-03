@@ -469,13 +469,16 @@ string encodeHeaderValue(string value) @safe
 /// Decode an `Mcp-Param-*` header value produced by `encodeHeaderValue`.
 string decodeHeaderValue(string headerValue) @safe
 {
-	import std.base64 : Base64;
+	import std.base64 : Base64, Base64Exception;
 
 	if (headerValue.length >= 11 && headerValue[0 .. 9] == "=?base64?"
 			&& headerValue[$ - 2 .. $] == "?=")
 	{
 		const inner = headerValue[9 .. $ - 2];
-		return () @trusted { return cast(string) Base64.decode(inner); }();
+		try
+			return () @trusted { return cast(string) Base64.decode(inner); }();
+		catch (Base64Exception)
+			return headerValue;
 	}
 	return headerValue;
 }
@@ -1507,6 +1510,14 @@ unittest  // header value codec: plain ASCII passes through; others base64
 	assert(encodeHeaderValue(" padded ")[0 .. 9] == "=?base64?");
 	assert(decodeHeaderValue(encodeHeaderValue(" padded ")) == " padded ");
 	assert(decodeHeaderValue(encodeHeaderValue("=?base64?x?=")) == "=?base64?x?=");
+}
+
+unittest  // decodeHeaderValue tolerates sentinel-framed but invalid base64
+{
+	// Valid sentinel framing with an undecodable body must not throw; the raw
+	// value is returned so downstream comparison yields a clean mismatch.
+	const malformed = "=?base64?@@@@?=";
+	assert(decodeHeaderValue(malformed) == malformed);
 }
 
 unittest  // encodeHeaderValue neutralises CR/LF, so an encoded value is wire-safe
