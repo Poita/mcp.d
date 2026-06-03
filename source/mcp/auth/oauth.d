@@ -1222,6 +1222,19 @@ void requireSecureUrl(string url) @safe
 				~ "private/link-local address (or could not be resolved): " ~ url);
 }
 
+/// Non-throwing counterpart to `requireSecureUrl` for discovery GET paths that
+/// signal failure by returning rather than raising. Applies the lexical
+/// `isSecureFetchUrl` guard AND the DNS-resolution `resolvedHostIsSafe` check, so
+/// an attacker-controlled hostname that resolves to an internal/link-local
+/// address (the DNS-rebinding case) is rejected on GETs exactly as it is on the
+/// POST paths. Returns true only when both guards pass. `@safe`.
+bool isSecureFetchUrlResolved(string url) @safe
+{
+	if (!isSecureFetchUrl(url))
+		return false;
+	return resolvedHostIsSafe(fetchUrlHost(url));
+}
+
 unittest  // isSecureFetchUrl accepts https and rejects plaintext http to a remote host
 {
 	assert(isSecureFetchUrl("https://as.example.com/.well-known/oauth-authorization-server"));
@@ -1389,6 +1402,23 @@ unittest  // requireSecureUrl throws on an insecure URL and passes a secure loop
 	// Loopback hosts skip DNS resolution, so these are network-independent.
 	requireSecureUrl("https://127.0.0.1/token"); // does not throw
 	requireSecureUrl("http://127.0.0.1:8765/callback"); // loopback dev ok
+}
+
+unittest  // isSecureFetchUrlResolved rejects what the lexical guard rejects (GET-path SSRF)
+{
+	// Plaintext http to a remote host, and IP literals in private/link-local
+	// ranges, must be refused on the discovery GET paths just as on POST paths.
+	assert(!isSecureFetchUrlResolved("http://as.example.com/.well-known/jwks"));
+	assert(!isSecureFetchUrlResolved("https://169.254.169.254/latest/meta-data"));
+	assert(!isSecureFetchUrlResolved("https://10.0.0.5/jwks"));
+}
+
+unittest  // isSecureFetchUrlResolved accepts lexically-safe loopback without resolving (dev)
+{
+	// Loopback hosts short-circuit DNS resolution, so these are network-independent.
+	assert(isSecureFetchUrlResolved("https://127.0.0.1/jwks"));
+	assert(isSecureFetchUrlResolved("http://127.0.0.1:8765/jwks"));
+	assert(isSecureFetchUrlResolved("http://[::1]:9000/jwks"));
 }
 
 unittest  // fetchUrlHost extracts the authority host, dropping userinfo and path
