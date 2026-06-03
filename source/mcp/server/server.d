@@ -1594,12 +1594,6 @@ final class McpServer
 		pageSize_ = size;
 	}
 
-	/// The current `*/list` page size (`0` = unbounded; see `setPageSize`).
-	size_t pageSize() const @safe
-	{
-		return pageSize_;
-	}
-
 	/// Set a per-result draft cacheable-result hint on the typed result, then
 	/// serialize via the single symmetric `toJson` emission path. The hint is set
 	/// only when the effective version is draft+ AND a hint was supplied, so the

@@ -1295,15 +1295,6 @@ final class McpClient : ClientProtocol
 		notify(method, params);
 	}
 
-	/// The JSON-RPC id assigned to the most recently issued request. Useful to
-	/// learn the id of an in-flight request so it can be `cancel`led from another
-	/// task (the blocking `rpc` does not otherwise surface it). Returns `0`
-	/// before any request has been sent.
-	long lastRequestId() const @safe nothrow @nogc
-	{
-		return nextId - 1;
-	}
-
 	/// The server capabilities advertised at connect time. Populated by both the
 	/// stable `initialize` handshake and the stateless draft `server/discover`
 	/// path; default-constructed before either has run.
