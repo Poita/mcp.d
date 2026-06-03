@@ -41,13 +41,29 @@ bool isValidMetaKey(string key) @safe pure nothrow
 
 	string prefix;
 	string name;
-	// The prefix, if present, is everything up to and including the final '/'.
+	bool hasPrefix;
+	splitMetaKey(key, prefix, name, hasPrefix);
+
+	if (hasPrefix && !isValidMetaPrefixLabels(prefix))
+		return false;
+	return isValidMetaName(name);
+}
+
+/// Split a `_meta` key into its optional `<prefix>` and `<name>` at the final
+/// `/`. A `_meta` key is `[<prefix>/]<name>`; the prefix (the dot-separated
+/// labels, WITHOUT the trailing slash) is present only when a `/` occurs.
+/// `hasPrefix` reports whether a `/` was found; when false `prefix` is empty and
+/// `name` is the whole key. Centralises the last-`/` scan shared by the meta-key
+/// validators.
+private void splitMetaKey(string key, out string prefix, out string name, out bool hasPrefix) @safe pure nothrow
+{
 	ptrdiff_t slash = -1;
 	foreach (i, char c; key)
 		if (c == '/')
 			slash = i;
 	if (slash >= 0)
 	{
+		hasPrefix = true;
 		prefix = key[0 .. slash]; // labels without the trailing slash
 		name = key[slash + 1 .. $];
 	}
@@ -55,10 +71,23 @@ bool isValidMetaKey(string key) @safe pure nothrow
 	{
 		name = key;
 	}
+}
 
-	if (slash >= 0 && !isValidMetaPrefixLabels(prefix))
-		return false;
-	return isValidMetaName(name);
+/// Split a prefix's dot-separated label portion into its individual labels,
+/// preserving empty labels (so `"a..b"` yields `["a", "", "b"]` and `""` yields
+/// `[""]`). Centralises the label-walk skeleton shared by the prefix validators
+/// and the reserved-prefix scanners.
+private string[] metaLabels(string labels) @safe pure nothrow
+{
+	string[] result;
+	size_t start = 0;
+	for (size_t i = 0; i <= labels.length; i++)
+		if (i == labels.length || labels[i] == '.')
+		{
+			result ~= labels[start .. i];
+			start = i + 1;
+		}
+	return result;
 }
 
 /// Validate the label portion of a prefix (everything before the trailing `/`).
@@ -68,19 +97,10 @@ private bool isValidMetaPrefixLabels(string labels) @safe pure nothrow
 {
 	if (labels.length == 0)
 		return false; // a bare "/name" has an empty prefix, which is invalid
-	size_t start = 0;
-	bool any = false;
-	for (size_t i = 0; i <= labels.length; i++)
-	{
-		if (i == labels.length || labels[i] == '.')
-		{
-			if (!isValidMetaLabel(labels[start .. i]))
-				return false;
-			any = true;
-			start = i + 1;
-		}
-	}
-	return any;
+	foreach (label; metaLabels(labels))
+		if (!isValidMetaLabel(label))
+			return false;
+	return true;
 }
 
 private bool isValidMetaLabel(string label) @safe pure nothrow
@@ -132,36 +152,17 @@ private bool isAlphaNum(char c) @safe pure nothrow
 /// known, since 2025-06-18 uses a broader rule (see below).
 bool isReservedMetaPrefix(string key) @safe pure nothrow
 {
-	ptrdiff_t slash = -1;
-	foreach (i, char c; key)
-		if (c == '/')
-			slash = i;
-	if (slash < 0)
+	string labels, name;
+	bool hasPrefix;
+	splitMetaKey(key, labels, name, hasPrefix);
+	if (!hasPrefix)
 		return false;
-	auto labels = key[0 .. slash];
 
-	// Collect the second dot-separated label, if any.
-	size_t start = 0;
-	size_t idx = 0;
-	string second;
-	bool haveSecond = false;
-	for (size_t i = 0; i <= labels.length; i++)
-	{
-		if (i == labels.length || labels[i] == '.')
-		{
-			if (idx == 1)
-			{
-				second = labels[start .. i];
-				haveSecond = true;
-				break;
-			}
-			idx++;
-			start = i + 1;
-		}
-	}
-	if (!haveSecond)
+	// The second dot-separated label, if any, decides reservation.
+	auto parts = metaLabels(labels);
+	if (parts.length < 2)
 		return false;
-	return second == "modelcontextprotocol" || second == "mcp";
+	return parts[1] == "modelcontextprotocol" || parts[1] == "mcp";
 }
 
 /// Whether a `_meta` key's prefix is reserved for MCP use under the effective
@@ -185,33 +186,18 @@ bool isReservedMetaPrefix(string key, ProtocolVersion v) @safe pure nothrow
 
 	// 2025-06-18 (and earlier, as a safe superset): an mcp-token in any label
 	// position that is followed by at least one further label reserves the prefix.
-	ptrdiff_t slash = -1;
-	foreach (i, char c; key)
-		if (c == '/')
-			slash = i;
-	if (slash < 0)
+	string labels, name;
+	bool hasPrefix;
+	splitMetaKey(key, labels, name, hasPrefix);
+	if (!hasPrefix)
 		return false;
-	auto labels = key[0 .. slash];
 
-	size_t start = 0;
-	size_t labelIndex = 0;
-	size_t labelCount = 0;
-	// First count the labels so we can tell whether an mcp-token has a trailing label.
-	for (size_t i = 0; i <= labels.length; i++)
-		if (i == labels.length || labels[i] == '.')
-			labelCount++;
-
-	for (size_t i = 0; i <= labels.length; i++)
+	auto parts = metaLabels(labels);
+	foreach (i, label; parts)
 	{
-		if (i == labels.length || labels[i] == '.')
-		{
-			auto label = labels[start .. i];
-			// Reserved only if this mcp-token is followed by at least one more label.
-			if ((label == "modelcontextprotocol" || label == "mcp") && labelIndex + 1 < labelCount)
-				return true;
-			labelIndex++;
-			start = i + 1;
-		}
+		// Reserved only if this mcp-token is followed by at least one more label.
+		if ((label == "modelcontextprotocol" || label == "mcp") && i + 1 < parts.length)
+			return true;
 	}
 	return false;
 }
@@ -946,25 +932,44 @@ struct InputRequiredResult
 		// client knows to gather input and retry rather than treat this as a
 		// completed response.
 		j["resultType"] = "input_required";
-		// SEP-2322: `inputRequests` is an `InputRequests` object — a map whose
-		// keys are the server-assigned ids and whose values are request objects
-		// (`{ method, params }`), not an array.
-		j["inputRequests"] = inputRequestsToJson(inputRequests);
-		// SEP-2322: `requestState` is an optional top-level field; omit it when
-		// empty so the client knows not to echo one back.
-		if (requestState.length)
-			j["requestState"] = requestState;
+		emitInputRequired(j, inputRequests, requestState);
 		return j;
 	}
 
 	static InputRequiredResult fromJson(Json j) @safe
 	{
 		InputRequiredResult r;
-		if ("inputRequests" in j)
-			r.inputRequests = inputRequestsFromJson(j["inputRequests"]);
-		tryGet(j, "requestState", r.requestState);
+		parseInputRequired(j, r.inputRequests, r.requestState);
 		return r;
 	}
+}
+
+/// Emit the shared MRTR (SEP-2322) `InputRequiredResult` payload onto `j`: the
+/// `inputRequests` map plus the optional top-level `requestState`. This is the
+/// glue common to `InputRequiredResult.toJson` and `CallToolResult.toJson`; it
+/// deliberately does NOT write the `resultType` discriminator (a `CallToolResult`
+/// stamps that elsewhere), so callers add it themselves when required.
+void emitInputRequired(ref Json j, const(InputRequest)[] requests, string requestState) @safe
+{
+	// SEP-2322: `inputRequests` is an `InputRequests` object — a map whose
+	// keys are the server-assigned ids and whose values are request objects
+	// (`{ method, params }`), not an array.
+	j["inputRequests"] = inputRequestsToJson(requests);
+	// SEP-2322: `requestState` is an optional top-level field; omit it when
+	// empty so the client knows not to echo one back.
+	if (requestState.length)
+		j["requestState"] = requestState;
+}
+
+/// Parse the shared MRTR (SEP-2322) `InputRequiredResult` payload from `j` into
+/// `requests` and `requestState`. Inverse of `emitInputRequired`; shared by
+/// `InputRequiredResult.fromJson` and `CallToolResult.fromJson`. Both reads are
+/// guarded, so a `j` carrying neither field leaves the outputs untouched.
+void parseInputRequired(Json j, ref InputRequest[] requests, ref string requestState) @safe
+{
+	if ("inputRequests" in j && j["inputRequests"].type == Json.Type.object)
+		requests = inputRequestsFromJson(j["inputRequests"]);
+	tryGet(j, "requestState", requestState);
 }
 
 /// Serialize a list of `InputRequest`s as a spec `InputRequests` object: a map
@@ -1123,6 +1128,31 @@ unittest  // SEP-2322: inputRequests serializes as a map keyed by id, value {met
 	assert("id" !in value);
 	assert("type" !in value);
 	assert(value["params"]["message"].get!string == "hi");
+}
+
+unittest  // emitInputRequired/parseInputRequired round-trip the shared MRTR glue
+{
+	Json j = Json.emptyObject;
+	auto reqs = [InputRequest("date", "elicitation", Json.emptyObject)];
+	emitInputRequired(j, reqs, "opaque-state");
+	// resultType is NOT written by the shared helper (callers stamp it).
+	assert("resultType" !in j);
+	assert(j["inputRequests"].type == Json.Type.object);
+	assert(j["requestState"].get!string == "opaque-state");
+
+	InputRequest[] outReqs;
+	string outState;
+	parseInputRequired(j, outReqs, outState);
+	assert(outReqs.length == 1);
+	assert(outReqs[0].id == "date");
+	assert(outState == "opaque-state");
+}
+
+unittest  // emitInputRequired omits an empty requestState
+{
+	Json j = Json.emptyObject;
+	emitInputRequired(j, [InputRequest("x", "roots", Json.emptyObject)], "");
+	assert("requestState" !in j);
 }
 
 unittest  // SEP-2322: sampling/roots methods map to their full JSON-RPC names
@@ -1640,6 +1670,44 @@ unittest  // MetaKey enum values are all valid keys (spec-compliant by construct
 
 	static foreach (k; EnumMembers!MetaKey)
 		assert(isValidMetaKey(cast(string) k));
+}
+
+unittest  // splitMetaKey splits at the final slash into prefix + name
+{
+	string prefix, name;
+	bool hasPrefix;
+	splitMetaKey("io.example/data.point", prefix, name, hasPrefix);
+	assert(hasPrefix);
+	assert(prefix == "io.example");
+	assert(name == "data.point");
+}
+
+unittest  // splitMetaKey treats a key without a slash as a bare name
+{
+	string prefix, name;
+	bool hasPrefix;
+	splitMetaKey("progress", prefix, name, hasPrefix);
+	assert(!hasPrefix);
+	assert(prefix == "");
+	assert(name == "progress");
+}
+
+unittest  // splitMetaKey splits at the LAST slash (names may not contain '/', but be defensive)
+{
+	string prefix, name;
+	bool hasPrefix;
+	splitMetaKey("a/b/c", prefix, name, hasPrefix);
+	assert(hasPrefix);
+	assert(prefix == "a/b");
+	assert(name == "c");
+}
+
+unittest  // metaLabels splits dot-separated labels, preserving empties
+{
+	assert(metaLabels("io.example") == ["io", "example"]);
+	assert(metaLabels("a..b") == ["a", "", "b"]);
+	assert(metaLabels("") == [""]);
+	assert(metaLabels("solo") == ["solo"]);
 }
 
 unittest  // paramHeaderMap reads x-mcp-header annotations

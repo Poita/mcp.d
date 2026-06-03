@@ -6,8 +6,8 @@ import mcp.protocol.capabilities;
 import mcp.protocol.errors : ErrorCode, McpException;
 import mcp.protocol.versions : ProtocolVersion, toWire;
 import mcp.protocol.jsonhelpers : getOr, tryGet;
-import mcp.protocol.draft : InputRequest, inputRequestsToJson,
-	inputRequestsFromJson, CacheHint, parseCacheHint, withCache;
+import mcp.protocol.draft : InputRequest, emitInputRequired, parseInputRequired,
+	CacheHint, parseCacheHint, withCache;
 import mcp.client.client : ProgressToken;
 
 @safe:
@@ -1113,17 +1113,12 @@ struct CallToolResult
 	{
 		Json j = Json.emptyObject;
 		// An `InputRequiredResult` is a distinct result shape (only `inputRequests`),
-		// not a `CallToolResult` with content — serialise it as such.
+		// not a `CallToolResult` with content — serialise it as such. The
+		// `resultType` discriminator is stamped at the server's response layer, so
+		// emit only the shared MRTR glue here.
 		if (inputRequests.length)
 		{
-			// SEP-2322: `inputRequests` is an `InputRequests` object (map keyed
-			// by the server-assigned id with `{ method, params }` values), not
-			// an array.
-			j["inputRequests"] = inputRequestsToJson(inputRequests);
-			// SEP-2322: `requestState` is an optional top-level field on the
-			// result; omit it when empty.
-			if (requestState.length)
-				j["requestState"] = requestState;
+			emitInputRequired(j, inputRequests, requestState);
 			return j;
 		}
 		Json arr = Json.emptyArray;
@@ -1152,13 +1147,9 @@ struct CallToolResult
 		if ("structuredContent" in j)
 			r.structuredContent = j["structuredContent"];
 		r.parseMetaField(j);
-		// MRTR: detect an `InputRequiredResult` (the server asks for more input).
-		// `inputRequests` is a map keyed by the server-assigned id.
-		if ("inputRequests" in j && j["inputRequests"].type == Json.Type.object)
-			r.inputRequests = inputRequestsFromJson(j["inputRequests"]);
-		// SEP-2322: capture the opaque requestState so the client can echo it
-		// back verbatim on the retry.
-		tryGet(j, "requestState", r.requestState);
+		// MRTR (SEP-2322): detect an `InputRequiredResult` (the server asks for
+		// more input) and capture the opaque `requestState` to echo back on retry.
+		parseInputRequired(j, r.inputRequests, r.requestState);
 		return r;
 	}
 
