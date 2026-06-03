@@ -397,6 +397,14 @@ final class ServerPushChannel
 		void delegate(string frame) @safe write;
 		string subscriptionId;
 		SubscriptionFilter filter;
+		/// Per-listener fallback eligibility for an INACTIVE-filter stream (a plain
+		/// 2025-era standalone GET stream). When set, `emitFiltered` consults this
+		/// instead of the mount-wide `plainEligible`, so a change notification's
+		/// delivery gate (notably `notifications/resources/updated`) honours the
+		/// per-session subscription set bound to THIS listener rather than a shared
+		/// fallback. Null for streams that have no per-session gate (stdio fallbacks,
+		/// active `subscriptions/listen` streams which decide via `filter`).
+		bool delegate(string method, string uri) @safe plainEligible;
 		/// Per-listener serialization point. The blocking `write` to this stream —
 		/// together with the seq read it is framed with and the seq/history commit
 		/// that follows — runs under THIS mutex, NOT the channel-wide `mtx`. Keeping
@@ -485,7 +493,8 @@ final class ServerPushChannel
 	/// "replay messages that would have been delivered on a different stream" — is
 	/// honoured because replay is keyed strictly on the id's ordinal.
 	long addListener(void delegate(string frame) @safe write, string subscriptionId = "",
-			SubscriptionFilter filter = SubscriptionFilter.init, string resumeFrom = "") @safe
+			SubscriptionFilter filter = SubscriptionFilter.init, string resumeFrom = "",
+			bool delegate(string method, string uri) @safe plainEligible = null) @safe
 	{
 		return () @trusted {
 			auto lWriteMtx = new TaskMutex;
@@ -499,7 +508,7 @@ final class ServerPushChannel
 			synchronized (mtx)
 			{
 				id = nextListenerId++;
-				listeners ~= Listener(id, write, subscriptionId, filter, lWriteMtx);
+				listeners ~= Listener(id, write, subscriptionId, filter, plainEligible, lWriteMtx);
 
 				long resumeOrdinal, resumeSeq;
 				if (parseEventId(resumeFrom, resumeOrdinal, resumeSeq) && resumeOrdinal in history)
@@ -651,6 +660,12 @@ final class ServerPushChannel
 		return deliver(msg, (ref const Listener l) @safe {
 			if (l.filter.active)
 				return l.filter.accepts(method, uri);
+			// Inactive filter (plain 2025-era standalone GET stream): consult the
+			// listener's own per-session gate when present so the delivery decision
+			// (notably `notifications/resources/updated`) honours the subscriptions
+			// bound to THIS stream's session rather than a shared fallback.
+			if (l.plainEligible !is null)
+				return l.plainEligible(method, uri);
 			return plainEligible;
 		}) >= 0 ? 1 : 0;
 	}
@@ -1139,6 +1154,37 @@ unittest  // emitFiltered still reaches a plain GET stream (inactive filter acce
 	import std.algorithm : canFind;
 
 	assert(frame.canFind("notifications/tools/list_changed"));
+}
+
+unittest  // a per-listener plainEligible gate overrides the mount-wide plainEligible
+{
+	// Two plain GET streams (inactive filters) bound to DIFFERENT per-session
+	// subscription gates: a `resources/updated` for a URI only session A
+	// subscribed to must reach A and not B, regardless of the mount-wide flag.
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string aFrame, bFrame;
+	bool aGate(string method, string uri) @safe
+	{
+		return method != "notifications/resources/updated" || uri == "file:///a";
+	}
+
+	bool bGate(string method, string uri) @safe
+	{
+		return method != "notifications/resources/updated" || uri == "file:///b";
+	}
+
+	ch.addListener((string f) @safe { aFrame = f; }, "", SubscriptionFilter.init, "", &aGate);
+	ch.addListener((string f) @safe { bFrame = f; }, "", SubscriptionFilter.init, "", &bGate);
+
+	auto p = Json(["uri": Json("file:///a")]);
+	// Mount-wide plainEligible is the default true; the per-listener gates decide.
+	const delivered = ch.emitFiltered("notifications/resources/updated", p, "file:///a");
+	import std.algorithm : canFind;
+
+	assert(delivered == 1);
+	assert(aFrame.canFind("file:///a"), "session A (subscribed) must receive its URI");
+	assert(bFrame.length == 0, "session B (unsubscribed) must not receive A's update");
 }
 
 unittest  // emit self-heals: it skips a broken stream and delivers on a live one

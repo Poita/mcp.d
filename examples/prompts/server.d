@@ -18,8 +18,6 @@
 /// See README.md.
 module prompts_server;
 
-import std.algorithm : startsWith, filter;
-import std.array : array;
 import std.string : toLower;
 import std.typecons : nullable;
 
@@ -27,7 +25,7 @@ import mcp.server.server : McpServer;
 import mcp.api.reflection : registerHandlers;
 import mcp.api.attributes : prompt, describe;
 import mcp.protocol.types : GetPromptResult, PromptMessage, Content,
-	CompleteRequest, CompleteResult;
+	CompleteResult, CompletionReference;
 
 import examples_common : runServerFromArgs;
 
@@ -127,27 +125,14 @@ private McpServer buildServer() @safe
 	// Register the @prompt methods (typed dispatch + descriptors) by reflection.
 	registerHandlers(server, new PromptApp);
 
-	// Prompt-argument autocompletion. Advertising this handler makes the server
-	// declare the `completions` capability. Completion is keyed on BOTH the prompt
-	// name and the argument name: we only complete the `language` argument of the
-	// `code_review` prompt by prefix-matching the partial value. Any other prompt
-	// or argument falls through to the default empty `CompleteResult`.
-	server.setCompletionRequestHandler((CompleteRequest request) @safe {
-		CompleteResult result;
-		if (request.isPrompt && request.reference.name == "code_review"
-			&& request.argumentName == "language")
-		{
-			const partial = request.argumentValue.toLower;
-			string[] matches;
-			foreach (l; knownLanguages)
-				if (l.startsWith(partial))
-					matches ~= l;
-			result.values = matches;
-			result.total = matches.length;
-			result.hasMore = false;
-		}
-		return result;
-	});
+	// Prompt-argument autocompletion. Registering a per-argument completer makes
+	// the server declare the `completions` capability and keys completion on BOTH
+	// the prompt name and the argument name — no hand-routing in a global delegate.
+	// We complete only the `language` argument of the `code_review` prompt, prefix-
+	// matching the partial value with the built-in `CompleteResult.prefixMatch`
+	// helper. Any other (prompt, argument) pair falls through to an empty result.
+	server.setArgumentCompleter(CompletionReference.forPrompt("code_review"), "language",
+			(string prefix) @safe => CompleteResult.prefixMatch(knownLanguages, prefix).values);
 
 	return server;
 }

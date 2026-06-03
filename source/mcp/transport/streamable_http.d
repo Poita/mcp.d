@@ -795,6 +795,11 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// Mirror the POST/DELETE branches: a missing header SHOULD be 400, an
 	// unknown/terminated session MUST be 404 — never open the 200 stream without
 	// a valid id.
+	// The per-session ConnectionState this GET stream belongs to, resolved from
+	// Mcp-Session-Id. Bound into the push listener's eligibility predicate so
+	// `notifications/resources/updated` delivery on this stream gates on THIS
+	// session's `resources/subscribe` set rather than the shared fallback state.
+	ConnectionState getConn;
 	if (sessions !is null)
 	{
 		const sid = req.headers.get(SessionHeader, "");
@@ -807,6 +812,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 					"text/plain");
 			return;
 		}
+		getConn = sessions.stateFor(sid);
 	}
 
 	// Open a long-lived SSE stream wired to the server-push channel, so the
@@ -828,7 +834,8 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	const lastEventId = req.headers.get("Last-Event-ID", "");
 	const listenerId = push.addListener((string frame) @safe {
 		writeFrame(frame);
-	}, "", SubscriptionFilter.init, lastEventId);
+	}, "", SubscriptionFilter.init, lastEventId, getConn !is null
+			? server.sessionPushEligibility(getConn) : null);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
