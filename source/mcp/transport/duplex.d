@@ -157,6 +157,8 @@ final class DuplexChannel
 	/// error reply / timeout / channel close.
 	Json deliver(Json message, long expectId, Duration timeout = 60.seconds) @safe
 	{
+		if (closed_)
+			throw internalError("stdio channel closed");
 		coord.register(expectId);
 		try
 			send(message);
@@ -174,6 +176,8 @@ final class DuplexChannel
 	/// channel close.
 	Json request(string method, Json params, Duration timeout = 60.seconds) @safe
 	{
+		if (closed_)
+			throw internalError("stdio channel closed");
 		const id = coord.alloc();
 		coord.register(id);
 		Json req = makeRequest(Json(id), method, params);
@@ -199,17 +203,25 @@ final class DuplexChannel
 		writeLineDg(text);
 	}
 
-	/// Whether the read loop has ended (EOF or read error).
+	/// Whether the channel has closed: the read loop ended (EOF or read error) or
+	/// `close` was called. Once closed, `deliver`/`request` fail fast instead of
+	/// blocking on a reply that can never arrive.
 	bool closed() @safe
 	{
 		return closed_;
 	}
 
-	/// Release the channel. The owning transport closes the underlying byte stream
-	/// (which makes the read loop observe EOF and exit); this is a hook for any
-	/// channel-local cleanup and is currently a no-op.
+	/// Close the channel. Marks it closed and fails every still-pending request so
+	/// awaiting callers are released immediately instead of waiting out their
+	/// timeout; any request issued after this point also fails fast. The owning
+	/// transport still closes the underlying byte stream to stop the read loop;
+	/// `close` is idempotent and the read loop's own EOF path is equivalent.
 	void close() @safe
 	{
+		if (closed_)
+			return;
+		closed_ = true;
+		coord.failPending(internalError("stdio channel closed"));
 	}
 }
 
@@ -540,4 +552,99 @@ unittest  // a failing writeLine propagates out of request() instead of being sw
 	});
 	runEventLoop();
 	assert(threw, "a failed write must surface to the request() caller");
+}
+
+unittest  // request() issued after the read loop closed fails fast instead of blocking for the timeout
+{
+	auto toClient = new LineLink;
+	bool threw;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return toClient.take(); }, (string) @safe {
+			}, (Message) @safe {});
+			channel.start();
+			// Let the read loop reach EOF and mark the channel closed.
+			toClient.closeEnd();
+			foreach (_; 0 .. 4)
+				yield();
+			// A generous timeout would be paid in full if the guard were missing.
+			try
+				channel.request("ping", Json.emptyObject, 30.seconds);
+			catch (McpException)
+				threw = true;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(threw, "request() after close must fail fast, not wait out the timeout");
+}
+
+unittest  // close() wakes a pending deliver() and is idempotent
+{
+	auto toClient = new LineLink;
+	bool threw;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return toClient.take(); }, (string) @safe {
+			}, (Message) @safe {});
+			// No read loop is started; close() must wake the pending deliver itself.
+			runTask(() nothrow{
+				try
+				{
+					foreach (_; 0 .. 2)
+						yield();
+					channel.close();
+					channel.close(); // idempotent: a second call is a no-op
+				}
+				catch (Exception)
+				{
+				}
+			});
+			try
+				channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1, 30.seconds);
+			catch (McpException)
+				threw = true;
+			assert(channel.closed(), "closed() must report true after close()");
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(threw, "close() must wake a pending deliver() with a channel-closed error");
+}
+
+unittest  // deliver() after close() fails fast
+{
+	bool threw;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			string delegate() @safe nullRead = () @safe {
+				return cast(string) null;
+			};
+			auto channel = new DuplexChannel(nullRead, (string) @safe {}, (Message) @safe {
+			});
+			channel.close();
+			try
+				channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1, 30.seconds);
+			catch (McpException)
+				threw = true;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(threw, "deliver() after close() must throw immediately");
 }
