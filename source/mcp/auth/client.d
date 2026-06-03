@@ -93,12 +93,7 @@ final class OAuthClient
 		{
 			Json j;
 			if (tryGetJson(u, j))
-			{
-				auto m = AuthorizationServerMetadata.fromJson(j);
-				if (m.issuer.length == 0)
-					m.issuer = issuer;
-				return m;
-			}
+				return acceptDiscoveredAuthServer(j, issuer);
 		}
 		// 2025-03-26 fallback: no metadata document — use default endpoints
 		// derived from the issuer.
@@ -110,6 +105,19 @@ final class OAuthClient
 		m.authorizationEndpoint = base ~ "/authorize";
 		m.tokenEndpoint = base ~ "/token";
 		m.registrationEndpoint = base ~ "/register";
+		return m;
+	}
+
+	/// Parse a fetched authorization-server metadata document and bind it to the
+	/// requested issuer. Per RFC 8414 Section 3.3 the document's `issuer` MUST be
+	/// present and MUST match the issuer the document was requested for; a missing
+	/// or mismatched value fails closed so the recorded issuer remains the AS's
+	/// authenticated self-assertion that RFC 9207 mix-up detection anchors on.
+	private static AuthorizationServerMetadata acceptDiscoveredAuthServer(Json j, string issuer) @safe
+	{
+		auto m = AuthorizationServerMetadata.fromJson(j);
+		if (m.issuer.length == 0 || m.issuer != issuer)
+			throw internalError("Authorization server metadata issuer mismatch");
 		return m;
 	}
 
@@ -650,6 +658,37 @@ unittest  // exchangeCode refuses when the AS advertises non-S256 PKCE methods o
 	as_.tokenEndpoint = "https://as.example.com/token";
 	as_.codeChallengeMethodsSupported = ["plain"]; // S256 not offered -> MUST refuse.
 	assertThrown(c.exchangeCode(as_, RegisteredClient("cid", ""), "code", "verifier"));
+}
+
+unittest  // discovered AS document whose issuer matches the request is accepted
+{
+	import vibe.data.json : parseJsonString;
+
+	auto j = parseJsonString(`{"issuer":"https://as.example.com","authorization_endpoint":"https://as.example.com/authorize","code_challenge_methods_supported":["S256"]}`);
+	auto m = OAuthClient.acceptDiscoveredAuthServer(j, "https://as.example.com");
+	assert(m.issuer == "https://as.example.com");
+}
+
+unittest  // discovered AS document whose issuer mismatches the request is rejected
+{
+	import std.exception : assertThrown;
+	import vibe.data.json : parseJsonString;
+
+	// RFC 8414 Section 3.3: the document asserts a different issuer than the one
+	// it was fetched for, so it MUST be rejected rather than trusted.
+	auto j = parseJsonString(`{"issuer":"https://evil.example.com","authorization_endpoint":"https://as.example.com/authorize"}`);
+	assertThrown(OAuthClient.acceptDiscoveredAuthServer(j, "https://as.example.com"));
+}
+
+unittest  // discovered AS document with no issuer fails closed (no synthesis)
+{
+	import std.exception : assertThrown;
+	import vibe.data.json : parseJsonString;
+
+	// A fetched document missing `issuer` must not have one synthesized from the
+	// request; RFC 8414 Section 3.3 requires the AS to self-assert its issuer.
+	auto j = parseJsonString(`{"authorization_endpoint":"https://as.example.com/authorize"}`);
+	assertThrown(OAuthClient.acceptDiscoveredAuthServer(j, "https://as.example.com"));
 }
 
 unittest  // discoverAuthServer no-metadata fallback proceeds (absence allows S256)
