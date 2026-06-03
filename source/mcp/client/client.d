@@ -1641,19 +1641,12 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Answer a server->client request by dispatching to the matching handler and
-	/// sending the response. We are currently inside the transport's inbound-read
-	/// callback of an in-flight request, and the server will not send that
-	/// request's final response until it receives this reply, so *how* we send it
-	/// depends on the transport (`transport.repliesSynchronously`):
-	///   - synchronous transports (stdio): the inbound-read loop is not the
-	///     coroutine holding the awaited response and the reply is just another
-	///     line written to the child's stdin, so we send it inline. This works with
-	///     no event loop, which is what makes the documented synchronous
-	///     `McpClient.spawn` model able to answer ping / sampling / elicitation /
-	///     roots requests.
-	///   - other transports (HTTP): a nested synchronous send here could deadlock
-	///     (the reply travels on a different request), so we defer it to a separate
-	///     task (the HTTP transport already runs under an event loop).
+	/// sending the response. We are inside the transport's inbound-read callback of
+	/// an in-flight request, and the server withholds that request's final response
+	/// until it receives this reply, so *how* we send it depends on
+	/// `transport.repliesSynchronously` (see `ClientTransport` for the rationale):
+	/// true sends the reply inline, false defers it via `runTask` so the read loop
+	/// keeps draining and the two directions cannot wedge each other.
 	private void handleServerRequest(Message msg) @safe
 	{
 		import vibe.core.core : runTask;

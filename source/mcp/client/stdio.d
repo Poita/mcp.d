@@ -159,20 +159,9 @@ final class StdioClientTransport : ClientTransport
 		send(message);
 	}
 
-	/// False: a reply to a server->client request MUST NOT be written inline from
-	/// the channel's read-loop task. Although the write is serialized by the
-	/// channel's `writeMutex`, writing the reply inline blocks the single read-loop
-	/// task until the OS pipe buffer accepts the whole frame. With a spawned
-	/// subprocess that can deadlock: the child may be blocked writing more stdout
-	/// (because we have stopped draining it while writing the reply) while we are
-	/// blocked writing the reply into its stdin (because the child has stopped
-	/// draining its stdin to write that stdout). Returning false makes
-	/// `McpClient.handleServerRequest` dispatch the reply on its own vibe task, so
-	/// the read loop keeps draining the child's stdout and the two directions cannot
-	/// wedge each other. The stdio transport always runs its read loop as a vibe
-	/// task (`DuplexChannel.start` -> `runTask`), so an event loop is always
-	/// available for that deferred task — both in the spawned-subprocess model and
-	/// the custom `McpClient.stdio(readLine, writeLine)` delegate channel.
+	/// false: replies are deferred — see `ClientTransport.repliesSynchronously`.
+	/// The read loop always runs as a vibe task (`DuplexChannel.start` -> `runTask`),
+	/// so the event loop that deferral needs is always available.
 	bool repliesSynchronously() @safe
 	{
 		return false;
