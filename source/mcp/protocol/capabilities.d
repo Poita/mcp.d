@@ -3,6 +3,7 @@ module mcp.protocol.capabilities;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 import mcp.protocol.versions : ProtocolVersion, isDraft;
+import mcp.protocol.jsonhelpers : getOr, tryGet;
 
 @safe:
 
@@ -57,16 +58,36 @@ struct Icon
 	static Icon fromJson(Json j) @safe
 	{
 		Icon icon;
-		icon.src = ("src" in j) ? j["src"].get!string : "";
-		if ("mimeType" in j && j["mimeType"].type == Json.Type.string)
-			icon.mimeType = j["mimeType"].get!string;
+		icon.src = j.getOr("src", "");
+		tryGet(j, "mimeType", icon.mimeType);
 		if ("sizes" in j && j["sizes"].type == Json.Type.array)
 			foreach (i; 0 .. j["sizes"].length)
 				icon.sizes ~= j["sizes"][i].get!string;
-		if ("theme" in j && j["theme"].type == Json.Type.string)
-			icon.theme = j["theme"].get!string;
+		tryGet(j, "theme", icon.theme);
 		return icon;
 	}
+
+	/// Deep-copy this icon. Scalar and `Nullable` fields copy by value; the
+	/// `sizes` slice is duplicated so the copy does not alias the original.
+	Icon dup() const @safe
+	{
+		Icon c;
+		c.src = src;
+		c.mimeType = mimeType;
+		c.sizes = sizes.dup;
+		c.theme = theme;
+		return c;
+	}
+}
+
+@safe unittest  // Icon.dup deep-copies sizes so the copy does not alias the original
+{
+	Icon icon;
+	icon.src = "https://example/icon.png";
+	icon.sizes = ["48x48", "96x96"];
+	Icon copy = icon.dup();
+	copy.sizes[0] = "16x16";
+	assert(icon.sizes[0] == "48x48");
 }
 
 /// Identifies an MCP implementation (client or server).
@@ -109,14 +130,11 @@ struct Implementation
 	static Implementation fromJson(Json j) @safe
 	{
 		Implementation impl;
-		impl.name = ("name" in j) ? j["name"].get!string : "";
-		impl.version_ = ("version" in j) ? j["version"].get!string : "";
-		if ("title" in j && j["title"].type == Json.Type.string)
-			impl.title = j["title"].get!string;
-		if ("description" in j && j["description"].type == Json.Type.string)
-			impl.description = j["description"].get!string;
-		if ("websiteUrl" in j && j["websiteUrl"].type == Json.Type.string)
-			impl.websiteUrl = j["websiteUrl"].get!string;
+		impl.name = j.getOr("name", "");
+		impl.version_ = j.getOr("version", "");
+		tryGet(j, "title", impl.title);
+		tryGet(j, "description", impl.description);
+		tryGet(j, "websiteUrl", impl.websiteUrl);
 		if ("icons" in j && j["icons"].type == Json.Type.array)
 			foreach (i; 0 .. j["icons"].length)
 				impl.icons ~= Icon.fromJson(j["icons"][i]);
@@ -141,14 +159,7 @@ struct Implementation
 			projected.description = description;
 			projected.websiteUrl = websiteUrl;
 			foreach (icon; icons)
-			{
-				Icon copy;
-				copy.src = icon.src;
-				copy.mimeType = icon.mimeType;
-				copy.sizes = icon.sizes.dup;
-				copy.theme = icon.theme;
-				projected.icons ~= copy;
-			}
+				projected.icons ~= icon.dup();
 		}
 		return projected;
 	}

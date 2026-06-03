@@ -8,6 +8,7 @@ import mcp.protocol.versions : ProtocolVersion;
 import mcp.protocol.sampling : CreateMessageRequest;
 import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
 import mcp.protocol.errors : isValidElicitationUrl, invalidParams;
+import mcp.protocol.jsonhelpers : getOr, tryGet;
 
 @safe:
 
@@ -383,8 +384,7 @@ struct DiscoverResult
 			r.capabilities = ServerCapabilities.fromJson(j["capabilities"]);
 		if ("serverInfo" in j)
 			r.serverInfo = Implementation.fromJson(j["serverInfo"]);
-		if ("instructions" in j && j["instructions"].type == Json.Type.string)
-			r.instructions = j["instructions"].get!string;
+		tryGet(j, "instructions", r.instructions);
 		return r;
 	}
 }
@@ -962,8 +962,7 @@ struct InputRequiredResult
 		InputRequiredResult r;
 		if ("inputRequests" in j)
 			r.inputRequests = inputRequestsFromJson(j["inputRequests"]);
-		if ("requestState" in j && j["requestState"].type == Json.Type.string)
-			r.requestState = j["requestState"].get!string;
+		tryGet(j, "requestState", r.requestState);
 		return r;
 	}
 }

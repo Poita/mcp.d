@@ -5,6 +5,7 @@ import vibe.data.json : Json, parseJsonString, deserializeJson, serializeToJson;
 import mcp.protocol.capabilities;
 import mcp.protocol.errors : ErrorCode, McpException;
 import mcp.protocol.versions : ProtocolVersion, toWire;
+import mcp.protocol.jsonhelpers : getOr, tryGet;
 import mcp.protocol.draft : InputRequest, inputRequestsToJson,
 	inputRequestsFromJson, CacheHint, parseCacheHint, withCache;
 import mcp.client.client : ProgressToken;
@@ -53,6 +54,27 @@ mixin template ContentMetaFields()
 	{
 		if ("annotations" in j)
 			annotations = j["annotations"];
+		if ("_meta" in j && j["_meta"].type == Json.Type.object)
+			meta = j["_meta"];
+	}
+}
+
+/// The lone `_meta` object carried by non-content structs (results, descriptors).
+/// Mixed in so the `_meta` field and its emit/parse guards live once. Names are
+/// distinct from `ContentMetaFields`' `emitMeta`/`parseMeta` to avoid clashes in
+/// structs that could mix both.
+mixin template MetaField()
+{
+	Json meta = Json.undefined; /// optional `_meta` object
+
+	private void emitMetaField(ref Json j) const @safe
+	{
+		if (meta.type == Json.Type.object)
+			j["_meta"] = meta;
+	}
+
+	private void parseMetaField(Json j) @safe
+	{
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			meta = j["_meta"];
 	}
@@ -666,30 +688,28 @@ struct Content
 		{
 		case "text":
 			TextContent c;
-			c.text = ("text" in j) ? j["text"].get!string : "";
+			c.text = j.getOr("text", "");
 			c.parseMeta(j);
 			return Content(c);
 		case "image":
 			ImageContent c;
-			c.data = ("data" in j) ? j["data"].get!string : "";
-			c.mimeType = ("mimeType" in j) ? j["mimeType"].get!string : "";
+			c.data = j.getOr("data", "");
+			c.mimeType = j.getOr("mimeType", "");
 			c.parseMeta(j);
 			return Content(c);
 		case "audio":
 			AudioContent c;
-			c.data = ("data" in j) ? j["data"].get!string : "";
-			c.mimeType = ("mimeType" in j) ? j["mimeType"].get!string : "";
+			c.data = j.getOr("data", "");
+			c.mimeType = j.getOr("mimeType", "");
 			c.parseMeta(j);
 			return Content(c);
 		case "resource_link":
 			ResourceLink c;
-			c.uri = ("uri" in j) ? j["uri"].get!string : "";
-			c.name = ("name" in j) ? j["name"].get!string : "";
-			c.mimeType = ("mimeType" in j) ? j["mimeType"].get!string : "";
-			if ("title" in j && j["title"].type == Json.Type.string)
-				c.title = j["title"].get!string;
-			if ("description" in j && j["description"].type == Json.Type.string)
-				c.description = j["description"].get!string;
+			c.uri = j.getOr("uri", "");
+			c.name = j.getOr("name", "");
+			c.mimeType = j.getOr("mimeType", "");
+			tryGet(j, "title", c.title);
+			tryGet(j, "description", c.description);
 			if ("size" in j && j["size"].type == Json.Type.int_)
 				c.size = j["size"].get!long;
 			c.parseMeta(j);
@@ -701,7 +721,7 @@ struct Content
 			return Content(c);
 		case "tool_use":
 			ToolUseContent c;
-			c.id = ("id" in j && j["id"].type == Json.Type.string) ? j["id"].get!string : "";
+			c.id = j.getOr("id", "");
 			c.name = ("name" in j && j["name"].type == Json.Type.string) ? j["name"].get!string
 				: "";
 			c.input = ("input" in j) ? j["input"] : Json.emptyObject;
@@ -790,8 +810,7 @@ struct Annotations
 			auto p = cast(double) j["priority"].get!long;
 			a.priority = p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p);
 		}
-		if ("lastModified" in j && j["lastModified"].type == Json.Type.string)
-			a.lastModified = j["lastModified"].get!string;
+		tryGet(j, "lastModified", a.lastModified);
 		return a;
 	}
 
@@ -847,8 +866,7 @@ struct ToolAnnotations
 	static ToolAnnotations fromJson(Json j) @safe
 	{
 		ToolAnnotations a;
-		if ("title" in j && j["title"].type == Json.Type.string)
-			a.title = j["title"].get!string;
+		tryGet(j, "title", a.title);
 		if ("readOnlyHint" in j && j["readOnlyHint"].type == Json.Type.bool_)
 			a.readOnlyHint = j["readOnlyHint"].get!bool;
 		if ("destructiveHint" in j && j["destructiveHint"].type == Json.Type.bool_)
@@ -892,8 +910,7 @@ struct ToolExecution
 	static ToolExecution fromJson(Json j) @safe
 	{
 		ToolExecution e;
-		if ("taskSupport" in j && j["taskSupport"].type == Json.Type.string)
-			e.taskSupport = j["taskSupport"].get!string;
+		tryGet(j, "taskSupport", e.taskSupport);
 		return e;
 	}
 
@@ -915,7 +932,7 @@ struct Tool
 	Nullable!ToolExecution execution; /// optional per-tool task-augmented execution descriptor (2025-11-25)
 	Json annotations = Json.undefined; /// optional ToolAnnotations
 	Icon[] icons; /// optional icons for display in user interfaces
-	Json meta; /// optional descriptor-level `_meta` object
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -939,19 +956,16 @@ struct Tool
 				arr ~= icon.toJson();
 			j["icons"] = arr;
 		}
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
 	static Tool fromJson(Json j) @safe
 	{
 		Tool t;
-		t.name = ("name" in j) ? j["name"].get!string : "";
-		if ("title" in j && j["title"].type == Json.Type.string)
-			t.title = j["title"].get!string;
-		if ("description" in j && j["description"].type == Json.Type.string)
-			t.description = j["description"].get!string;
+		t.name = j.getOr("name", "");
+		tryGet(j, "title", t.title);
+		tryGet(j, "description", t.description);
 		if ("inputSchema" in j)
 			t.inputSchema = j["inputSchema"];
 		if ("outputSchema" in j)
@@ -963,8 +977,7 @@ struct Tool
 		if ("icons" in j && j["icons"].type == Json.Type.array)
 			foreach (i; 0 .. j["icons"].length)
 				t.icons ~= Icon.fromJson(j["icons"][i]);
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			t.meta = j["_meta"];
+		t.parseMetaField(j);
 		return t;
 	}
 
@@ -1002,14 +1015,7 @@ struct Tool
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
 			foreach (icon; icons)
-			{
-				Icon copy;
-				copy.src = icon.src;
-				copy.mimeType = icon.mimeType;
-				copy.sizes = icon.sizes.dup;
-				copy.theme = icon.theme;
-				projected.icons ~= copy;
-			}
+				projected.icons ~= icon.dup();
 		}
 		// `Tool.execution` is a 2025-11-25-only field: emit it solely when the
 		// negotiated version is exactly 2025-11-25 (absent pre-2025-11-25,
@@ -1089,7 +1095,7 @@ struct CallToolResult
 	Content[] content;
 	bool isError;
 	Json structuredContent = Json.undefined;
-	Json meta; /// optional result-level `_meta` object
+	mixin MetaField;
 	/// Multi Round-Trip Requests (MRTR / SEP-2322): when the draft server needs
 	/// more input to complete the call, it answers `tools/call` with an
 	/// `InputRequiredResult` instead of a `CallToolResult` — a set of
@@ -1128,8 +1134,7 @@ struct CallToolResult
 			j["isError"] = true;
 		if (structuredContent.type != Json.Type.undefined)
 			j["structuredContent"] = structuredContent;
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
@@ -1146,16 +1151,14 @@ struct CallToolResult
 			r.isError = j["isError"].get!bool;
 		if ("structuredContent" in j)
 			r.structuredContent = j["structuredContent"];
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			r.meta = j["_meta"];
+		r.parseMetaField(j);
 		// MRTR: detect an `InputRequiredResult` (the server asks for more input).
 		// `inputRequests` is a map keyed by the server-assigned id.
 		if ("inputRequests" in j && j["inputRequests"].type == Json.Type.object)
 			r.inputRequests = inputRequestsFromJson(j["inputRequests"]);
 		// SEP-2322: capture the opaque requestState so the client can echo it
 		// back verbatim on the retry.
-		if ("requestState" in j && j["requestState"].type == Json.Type.string)
-			r.requestState = j["requestState"].get!string;
+		tryGet(j, "requestState", r.requestState);
 		return r;
 	}
 
@@ -1236,6 +1239,40 @@ struct CallToolResult
 		];
 		return r;
 	}
+
+	/// Build a successful result carrying a single text content block.
+	static CallToolResult text(string s) @safe
+	{
+		return CallToolResult([Content.makeText(s)]);
+	}
+
+	/// Build an error result (`isError = true`) carrying a single text content
+	/// block describing the failure.
+	static CallToolResult error(string s) @safe
+	{
+		auto r = CallToolResult([Content.makeText(s)]);
+		r.isError = true;
+		return r;
+	}
+}
+
+unittest  // CallToolResult.text builds a non-error single-text result
+{
+	auto r = CallToolResult.text("ok");
+	assert(!r.isError);
+	assert(r.content.length == 1);
+	auto j = r.toJson();
+	assert(j["content"][0]["text"].get!string == "ok");
+	assert("isError" !in j);
+}
+
+unittest  // CallToolResult.error flags isError and carries the message
+{
+	auto r = CallToolResult.error("boom");
+	assert(r.isError);
+	auto j = r.toJson();
+	assert(j["content"][0]["text"].get!string == "boom");
+	assert(j["isError"].get!bool == true);
 }
 
 unittest  // CallToolResult.structured!T serializes a struct into structuredContent
@@ -1311,7 +1348,7 @@ struct ListToolsResult
 	/// (the base interface all paginated list results extend), so it round-trips
 	/// on every protocol version: `toJson` emits it only when set and `fromJson`
 	/// parses it. Unset by default, so pre-existing wire output is unchanged.
-	Json meta;
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -1324,8 +1361,7 @@ struct ListToolsResult
 			j["nextCursor"] = nextCursor.get;
 		if (!cache.isNull)
 			j = withCache(j, cache.get);
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
@@ -1338,11 +1374,9 @@ struct ListToolsResult
 			foreach (i; 0 .. arr.length)
 				r.tools ~= Tool.fromJson(arr[i]);
 		}
-		if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
-			r.nextCursor = j["nextCursor"].get!string;
+		tryGet(j, "nextCursor", r.nextCursor);
 		r.cache = parseCacheHint(j);
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			r.meta = j["_meta"];
+		r.parseMetaField(j);
 		return r;
 	}
 }
@@ -1464,7 +1498,7 @@ struct InitializeParams
 	static InitializeParams fromJson(Json j) @safe
 	{
 		InitializeParams p;
-		p.protocolVersion = ("protocolVersion" in j) ? j["protocolVersion"].get!string : "";
+		p.protocolVersion = j.getOr("protocolVersion", "");
 		if ("capabilities" in j)
 			p.capabilities = ClientCapabilities.fromJson(j["capabilities"]);
 		if ("clientInfo" in j)
@@ -1495,13 +1529,12 @@ struct InitializeResult
 	static InitializeResult fromJson(Json j) @safe
 	{
 		InitializeResult r;
-		r.protocolVersion = ("protocolVersion" in j) ? j["protocolVersion"].get!string : "";
+		r.protocolVersion = j.getOr("protocolVersion", "");
 		if ("capabilities" in j)
 			r.capabilities = ServerCapabilities.fromJson(j["capabilities"]);
 		if ("serverInfo" in j)
 			r.serverInfo = Implementation.fromJson(j["serverInfo"]);
-		if ("instructions" in j && j["instructions"].type == Json.Type.string)
-			r.instructions = j["instructions"].get!string;
+		tryGet(j, "instructions", r.instructions);
 		return r;
 	}
 }
@@ -2437,6 +2470,18 @@ unittest  // ResourceTemplate.forVersion preserves non-gated fields (uriTemplate
 	assert(j["mimeType"].get!string == "text/plain");
 }
 
+unittest  // ResourceTemplate.forVersion strips annotations.lastModified for pre-2025-06-18 peers
+{
+	ResourceTemplate t = {uriTemplate: "test://{id}", name: "x"};
+	t.annotations.lastModified = "2026-01-01T00:00:00Z";
+	auto older = t.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("annotations" !in older || "lastModified" !in older["annotations"]);
+	auto mid = t.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("annotations" !in mid || "lastModified" !in mid["annotations"]);
+	auto newer = t.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert(newer["annotations"]["lastModified"].get!string == "2026-01-01T00:00:00Z");
+}
+
 unittest  // Prompt round-trips _meta
 {
 	Prompt p = {name: "p"};
@@ -2697,7 +2742,7 @@ struct Resource
 	Annotations annotations; /// optional audience/priority/lastModified annotations
 	Nullable!long size; /// optional size in bytes
 	Icon[] icons; /// optional icons for display in user interfaces
-	Json meta; /// optional descriptor-level `_meta` object
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -2721,22 +2766,18 @@ struct Resource
 				arr ~= icon.toJson();
 			j["icons"] = arr;
 		}
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
 	static Resource fromJson(Json j) @safe
 	{
 		Resource r;
-		r.uri = ("uri" in j) ? j["uri"].get!string : "";
-		r.name = ("name" in j) ? j["name"].get!string : "";
-		if ("title" in j && j["title"].type == Json.Type.string)
-			r.title = j["title"].get!string;
-		if ("description" in j && j["description"].type == Json.Type.string)
-			r.description = j["description"].get!string;
-		if ("mimeType" in j && j["mimeType"].type == Json.Type.string)
-			r.mimeType = j["mimeType"].get!string;
+		r.uri = j.getOr("uri", "");
+		r.name = j.getOr("name", "");
+		tryGet(j, "title", r.title);
+		tryGet(j, "description", r.description);
+		tryGet(j, "mimeType", r.mimeType);
 		if ("annotations" in j && j["annotations"].type == Json.Type.object)
 			r.annotations = Annotations.fromJson(j["annotations"]);
 		if ("size" in j && j["size"].type == Json.Type.int_)
@@ -2744,8 +2785,7 @@ struct Resource
 		if ("icons" in j && j["icons"].type == Json.Type.array)
 			foreach (i; 0 .. j["icons"].length)
 				r.icons ~= Icon.fromJson(j["icons"][i]);
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			r.meta = j["_meta"];
+		r.parseMetaField(j);
 		return r;
 	}
 
@@ -2782,14 +2822,7 @@ struct Resource
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
 			foreach (icon; icons)
-			{
-				Icon copy;
-				copy.src = icon.src;
-				copy.mimeType = icon.mimeType;
-				copy.sizes = icon.sizes.dup;
-				copy.theme = icon.theme;
-				projected.icons ~= copy;
-			}
+				projected.icons ~= icon.dup();
 		}
 		return projected;
 	}
@@ -2805,7 +2838,7 @@ struct ResourceTemplate
 	Nullable!string title;
 	Annotations annotations; /// optional audience/priority/lastModified annotations
 	Icon[] icons; /// optional icons for display in user interfaces
-	Json meta; /// optional descriptor-level `_meta` object
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -2827,29 +2860,24 @@ struct ResourceTemplate
 				arr ~= icon.toJson();
 			j["icons"] = arr;
 		}
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
 	static ResourceTemplate fromJson(Json j) @safe
 	{
 		ResourceTemplate t;
-		t.uriTemplate = ("uriTemplate" in j) ? j["uriTemplate"].get!string : "";
-		t.name = ("name" in j) ? j["name"].get!string : "";
-		if ("title" in j && j["title"].type == Json.Type.string)
-			t.title = j["title"].get!string;
-		if ("description" in j && j["description"].type == Json.Type.string)
-			t.description = j["description"].get!string;
-		if ("mimeType" in j && j["mimeType"].type == Json.Type.string)
-			t.mimeType = j["mimeType"].get!string;
+		t.uriTemplate = j.getOr("uriTemplate", "");
+		t.name = j.getOr("name", "");
+		tryGet(j, "title", t.title);
+		tryGet(j, "description", t.description);
+		tryGet(j, "mimeType", t.mimeType);
 		if ("annotations" in j && j["annotations"].type == Json.Type.object)
 			t.annotations = Annotations.fromJson(j["annotations"]);
 		if ("icons" in j && j["icons"].type == Json.Type.array)
 			foreach (i; 0 .. j["icons"].length)
 				t.icons ~= Icon.fromJson(j["icons"][i]);
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			t.meta = j["_meta"];
+		t.parseMetaField(j);
 		return t;
 	}
 
@@ -2867,9 +2895,7 @@ struct ResourceTemplate
 		projected.name = name;
 		projected.description = description;
 		projected.mimeType = mimeType;
-		projected.annotations.audience = annotations.audience.dup;
-		projected.annotations.priority = annotations.priority;
-		projected.annotations.lastModified = annotations.lastModified;
+		projected.annotations = annotations.forVersion(v);
 		projected.meta = meta;
 		// `BaseMetadata.title` was introduced by 2025-06-18.
 		if (v >= ProtocolVersion.v2025_06_18)
@@ -2878,14 +2904,7 @@ struct ResourceTemplate
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
 			foreach (icon; icons)
-			{
-				Icon copy;
-				copy.src = icon.src;
-				copy.mimeType = icon.mimeType;
-				copy.sizes = icon.sizes.dup;
-				copy.theme = icon.theme;
-				projected.icons ~= copy;
-			}
+				projected.icons ~= icon.dup();
 		}
 		return projected;
 	}
@@ -2899,7 +2918,7 @@ struct ResourceContents
 	bool isBlob;
 	string text;
 	string blob;
-	Json meta; /// optional per-content `_meta` object
+	mixin MetaField;
 
 	static ResourceContents makeText(string uri, string mime, string text) @safe
 	{
@@ -2930,17 +2949,15 @@ struct ResourceContents
 			j["blob"] = blob;
 		else
 			j["text"] = text;
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
 	static ResourceContents fromJson(Json j) @safe
 	{
 		ResourceContents c;
-		c.uri = ("uri" in j) ? j["uri"].get!string : "";
-		if ("mimeType" in j && j["mimeType"].type == Json.Type.string)
-			c.mimeType = j["mimeType"].get!string;
+		c.uri = j.getOr("uri", "");
+		tryGet(j, "mimeType", c.mimeType);
 		if ("blob" in j && j["blob"].type == Json.Type.string)
 		{
 			c.isBlob = true;
@@ -2948,8 +2965,7 @@ struct ResourceContents
 		}
 		else if ("text" in j && j["text"].type == Json.Type.string)
 			c.text = j["text"].get!string;
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			c.meta = j["_meta"];
+		c.parseMetaField(j);
 		return c;
 	}
 
@@ -3098,7 +3114,7 @@ struct ListResourcesResult
 	/// (the base interface all paginated list results extend), so it round-trips
 	/// on every protocol version: `toJson` emits it only when set and `fromJson`
 	/// parses it. Unset by default, so pre-existing wire output is unchanged.
-	Json meta;
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -3111,8 +3127,7 @@ struct ListResourcesResult
 			j["nextCursor"] = nextCursor.get;
 		if (!cache.isNull)
 			j = withCache(j, cache.get);
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
@@ -3125,11 +3140,9 @@ struct ListResourcesResult
 			foreach (i; 0 .. arr.length)
 				r.resources ~= Resource.fromJson(arr[i]);
 		}
-		if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
-			r.nextCursor = j["nextCursor"].get!string;
+		tryGet(j, "nextCursor", r.nextCursor);
 		r.cache = parseCacheHint(j);
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			r.meta = j["_meta"];
+		r.parseMetaField(j);
 		return r;
 	}
 }
@@ -3147,7 +3160,7 @@ struct ListResourceTemplatesResult
 	/// (the base interface all paginated list results extend), so it round-trips
 	/// on every protocol version: `toJson` emits it only when set and `fromJson`
 	/// parses it. Unset by default, so pre-existing wire output is unchanged.
-	Json meta;
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -3160,8 +3173,7 @@ struct ListResourceTemplatesResult
 			j["nextCursor"] = nextCursor.get;
 		if (!cache.isNull)
 			j = withCache(j, cache.get);
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
@@ -3174,11 +3186,9 @@ struct ListResourceTemplatesResult
 			foreach (i; 0 .. arr.length)
 				r.resourceTemplates ~= ResourceTemplate.fromJson(arr[i]);
 		}
-		if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
-			r.nextCursor = j["nextCursor"].get!string;
+		tryGet(j, "nextCursor", r.nextCursor);
 		r.cache = parseCacheHint(j);
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			r.meta = j["_meta"];
+		r.parseMetaField(j);
 		return r;
 	}
 }
@@ -3192,7 +3202,7 @@ struct Root
 {
 	string uri; /// MUST be a `file://` URI
 	Nullable!string name; /// optional human-readable name
-	Json meta; /// optional `_meta` object
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -3200,19 +3210,16 @@ struct Root
 		j["uri"] = uri;
 		if (!name.isNull)
 			j["name"] = name.get;
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
 	static Root fromJson(Json j) @safe
 	{
 		Root r;
-		r.uri = ("uri" in j) ? j["uri"].get!string : "";
-		if ("name" in j && j["name"].type == Json.Type.string)
-			r.name = j["name"].get!string;
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			r.meta = j["_meta"];
+		r.uri = j.getOr("uri", "");
+		tryGet(j, "name", r.name);
+		r.parseMetaField(j);
 		return r;
 	}
 }
@@ -3266,16 +3273,12 @@ struct ElicitParams
 		p.raw = j;
 		if (j.type != Json.Type.object)
 			return p;
-		if ("mode" in j && j["mode"].type == Json.Type.string)
-			p.mode = j["mode"].get!string;
-		if ("message" in j && j["message"].type == Json.Type.string)
-			p.message = j["message"].get!string;
+		tryGet(j, "mode", p.mode);
+		tryGet(j, "message", p.message);
 		if ("requestedSchema" in j && j["requestedSchema"].type == Json.Type.object)
 			p.requestedSchema = j["requestedSchema"];
-		if ("url" in j && j["url"].type == Json.Type.string)
-			p.url = j["url"].get!string;
-		if ("elicitationId" in j && j["elicitationId"].type == Json.Type.string)
-			p.elicitationId = j["elicitationId"].get!string;
+		tryGet(j, "url", p.url);
+		tryGet(j, "elicitationId", p.elicitationId);
 		return p;
 	}
 }
@@ -3298,7 +3301,7 @@ struct ElicitResult
 {
 	ElicitAction action; /// the user's decision
 	Json content = Json.undefined; /// accept: the collected `{name: value}` map
-	Json meta = Json.undefined; /// optional `_meta` object
+	mixin MetaField;
 
 	/// Convenience constructor for an `accept` carrying collected `content`.
 	static ElicitResult accept(Json content) @safe
@@ -3356,8 +3359,7 @@ struct ElicitResult
 		// when present so decline/cancel stay `{action}`-only on the wire.
 		if (action == ElicitAction.accept && content.type == Json.Type.object)
 			j["content"] = content;
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
@@ -3395,8 +3397,7 @@ struct ElicitResult
 		if (r.action == ElicitAction.accept && "content" in j
 				&& j["content"].type == Json.Type.object)
 			r.content = j["content"];
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			r.meta = j["_meta"];
+		r.parseMetaField(j);
 		return r;
 	}
 
@@ -3417,7 +3418,7 @@ struct ElicitResult
 struct ListRootsResult
 {
 	Root[] roots;
-	Json meta; /// optional `_meta` object
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -3426,8 +3427,7 @@ struct ListRootsResult
 		foreach (r; roots)
 			arr ~= r.toJson();
 		j["roots"] = arr;
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
@@ -3440,8 +3440,7 @@ struct ListRootsResult
 			foreach (i; 0 .. arr.length)
 				r.roots ~= Root.fromJson(arr[i]);
 		}
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			r.meta = j["_meta"];
+		r.parseMetaField(j);
 		return r;
 	}
 }
@@ -3820,7 +3819,7 @@ unittest  // Annotations.fromJson clamps an out-of-range priority into 0.0..1.0
 struct ReadResourceResult
 {
 	ResourceContents[] contents;
-	Json meta; /// optional result-level `_meta` object
+	mixin MetaField;
 	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
 	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
 	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
@@ -3833,8 +3832,7 @@ struct ReadResourceResult
 		foreach (c; contents)
 			arr ~= c.toJson();
 		j["contents"] = arr;
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		if (!cache.isNull)
 			j = withCache(j, cache.get);
 		return j;
@@ -3849,8 +3847,7 @@ struct ReadResourceResult
 			foreach (i; 0 .. arr.length)
 				r.contents ~= ResourceContents.fromJson(arr[i]);
 		}
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			r.meta = j["_meta"];
+		r.parseMetaField(j);
 		r.cache = parseCacheHint(j);
 		return r;
 	}
@@ -3891,11 +3888,9 @@ struct PromptArgument
 	static PromptArgument fromJson(Json j) @safe
 	{
 		PromptArgument a;
-		a.name = ("name" in j) ? j["name"].get!string : "";
-		if ("title" in j && j["title"].type == Json.Type.string)
-			a.title = j["title"].get!string;
-		if ("description" in j && j["description"].type == Json.Type.string)
-			a.description = j["description"].get!string;
+		a.name = j.getOr("name", "");
+		tryGet(j, "title", a.title);
+		tryGet(j, "description", a.description);
 		if ("required" in j && j["required"].type == Json.Type.bool_)
 			a.required = j["required"].get!bool;
 		return a;
@@ -3966,7 +3961,7 @@ struct Prompt
 	Nullable!string description;
 	PromptArgument[] arguments;
 	Icon[] icons; /// optional icons for display in user interfaces
-	Json meta; /// optional descriptor-level `_meta` object
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -3990,19 +3985,16 @@ struct Prompt
 				arr ~= icon.toJson();
 			j["icons"] = arr;
 		}
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
 	static Prompt fromJson(Json j) @safe
 	{
 		Prompt p;
-		p.name = ("name" in j) ? j["name"].get!string : "";
-		if ("title" in j && j["title"].type == Json.Type.string)
-			p.title = j["title"].get!string;
-		if ("description" in j && j["description"].type == Json.Type.string)
-			p.description = j["description"].get!string;
+		p.name = j.getOr("name", "");
+		tryGet(j, "title", p.title);
+		tryGet(j, "description", p.description);
 		if ("arguments" in j && j["arguments"].type == Json.Type.array)
 		{
 			auto arr = j["arguments"];
@@ -4012,8 +4004,7 @@ struct Prompt
 		if ("icons" in j && j["icons"].type == Json.Type.array)
 			foreach (i; 0 .. j["icons"].length)
 				p.icons ~= Icon.fromJson(j["icons"][i]);
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			p.meta = j["_meta"];
+		p.parseMetaField(j);
 		return p;
 	}
 
@@ -4036,14 +4027,7 @@ struct Prompt
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
 			foreach (icon; icons)
-			{
-				Icon copy;
-				copy.src = icon.src;
-				copy.mimeType = icon.mimeType;
-				copy.sizes = icon.sizes.dup;
-				copy.theme = icon.theme;
-				projected.icons ~= copy;
-			}
+				projected.icons ~= icon.dup();
 		}
 		return projected;
 	}
@@ -4190,7 +4174,7 @@ struct PromptMessage
 	static PromptMessage fromJson(Json j) @safe
 	{
 		PromptMessage m;
-		m.role = ("role" in j) ? j["role"].get!string : "";
+		m.role = j.getOr("role", "");
 		if ("content" in j)
 			m.content = Content.fromJson(j["content"]);
 		return m;
@@ -4221,7 +4205,7 @@ struct ListPromptsResult
 	/// (the base interface all paginated list results extend), so it round-trips
 	/// on every protocol version: `toJson` emits it only when set and `fromJson`
 	/// parses it. Unset by default, so pre-existing wire output is unchanged.
-	Json meta;
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -4234,8 +4218,7 @@ struct ListPromptsResult
 			j["nextCursor"] = nextCursor.get;
 		if (!cache.isNull)
 			j = withCache(j, cache.get);
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
@@ -4248,11 +4231,9 @@ struct ListPromptsResult
 			foreach (i; 0 .. arr.length)
 				r.prompts ~= Prompt.fromJson(arr[i]);
 		}
-		if ("nextCursor" in j && j["nextCursor"].type == Json.Type.string)
-			r.nextCursor = j["nextCursor"].get!string;
+		tryGet(j, "nextCursor", r.nextCursor);
 		r.cache = parseCacheHint(j);
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			r.meta = j["_meta"];
+		r.parseMetaField(j);
 		return r;
 	}
 }
@@ -4262,7 +4243,7 @@ struct GetPromptResult
 {
 	Nullable!string description;
 	PromptMessage[] messages;
-	Json meta; /// optional result-level `_meta` object
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -4273,24 +4254,21 @@ struct GetPromptResult
 		foreach (m; messages)
 			arr ~= m.toJson();
 		j["messages"] = arr;
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
 	static GetPromptResult fromJson(Json j) @safe
 	{
 		GetPromptResult r;
-		if ("description" in j && j["description"].type == Json.Type.string)
-			r.description = j["description"].get!string;
+		tryGet(j, "description", r.description);
 		if ("messages" in j && j["messages"].type == Json.Type.array)
 		{
 			auto arr = j["messages"];
 			foreach (i; 0 .. arr.length)
 				r.messages ~= PromptMessage.fromJson(arr[i]);
 		}
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			r.meta = j["_meta"];
+		r.parseMetaField(j);
 		return r;
 	}
 
@@ -4529,7 +4507,7 @@ struct CompleteResult
 	string[] values;
 	Nullable!size_t total;
 	bool hasMore;
-	Json meta; /// optional result-level `_meta` object
+	mixin MetaField;
 
 	/// The spec hard-caps `completion.values` at 100 items
 	/// (schema `@maxItems 100`: "Must not exceed 100 items.").
@@ -4552,8 +4530,7 @@ struct CompleteResult
 		completion["hasMore"] = hasMore || truncated;
 		Json j = Json.emptyObject;
 		j["completion"] = completion;
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
@@ -4598,8 +4575,7 @@ struct CompleteResult
 		}
 		if ("hasMore" in c && c["hasMore"].type == Json.Type.bool_)
 			r.hasMore = c["hasMore"].get!bool;
-		if ("_meta" in j && j["_meta"].type == Json.Type.object)
-			r.meta = j["_meta"];
+		r.parseMetaField(j);
 		return r;
 	}
 }
@@ -4616,7 +4592,7 @@ struct ResourceUpdatedNotification
 	string uri;
 	/// The optional `_meta` object carried on the notification; `Json.undefined`
 	/// when absent.
-	Json meta = Json.undefined;
+	mixin MetaField;
 
 	/// The JSON-RPC method name of this notification.
 	enum methodName = "notifications/resources/updated";
@@ -4625,8 +4601,7 @@ struct ResourceUpdatedNotification
 	{
 		Json j = Json.emptyObject;
 		j["uri"] = uri;
-		if (meta.type == Json.Type.object)
-			j["_meta"] = meta;
+		emitMetaField(j);
 		return j;
 	}
 
@@ -4639,8 +4614,7 @@ struct ResourceUpdatedNotification
 			return n;
 		if ("uri" in params && params["uri"].type == Json.Type.string)
 			n.uri = params["uri"].get!string;
-		if ("_meta" in params && params["_meta"].type == Json.Type.object)
-			n.meta = params["_meta"];
+		n.parseMetaField(params);
 		return n;
 	}
 }
