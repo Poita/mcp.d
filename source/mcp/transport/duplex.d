@@ -115,7 +115,26 @@ final class DuplexChannel
 
 	private void handleLine(string line) @safe
 	{
-		Message m = parseMessage(line);
+		// One inbound line is either a single JSON-RPC message or a 2025-03-26 batch
+		// array; `parseAny` normalizes both to a list of messages. Each contained
+		// message is routed through the same per-kind dispatch as a single message,
+		// so a batch yields one response per id-bearing request rather than silence.
+		ParsedInput input;
+		try
+			input = parseAny(line);
+		catch (McpException e)
+		{
+			// A malformed/invalid line has no recoverable id, so reply with a
+			// null-id JSON-RPC error rather than dropping it silently.
+			send(makeErrorResponse(Json(null), e));
+			return;
+		}
+		foreach (m; input.messages)
+			routeMessage(m);
+	}
+
+	private void routeMessage(Message m) @safe
+	{
 		final switch (m.kind)
 		{
 		case MessageKind.response:
@@ -424,4 +443,101 @@ unittest  // a malformed inbound line does not kill the read loop
 	runEventLoop();
 	// The good notification after the garbage line was still dispatched.
 	assert(seen == 1);
+}
+
+unittest  // an inbound batch array routes every contained request/notification to onInbound
+{
+	auto inbound = new LineLink;
+	int requests;
+	int notifications;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+			}, (Message m) @safe {
+				if (m.kind == MessageKind.request)
+					requests++;
+				else if (m.kind == MessageKind.notification)
+					notifications++;
+			});
+			channel.start();
+			inbound.put(`[{"jsonrpc":"2.0","id":1,"method":"ping"},`
+				~ `{"jsonrpc":"2.0","method":"notifications/initialized"},`
+				~ `{"jsonrpc":"2.0","id":2,"method":"ping"}]`);
+			inbound.closeEnd();
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	// Both batched requests and the batched notification were dispatched, not dropped.
+	assert(requests == 2);
+	assert(notifications == 1);
+}
+
+unittest  // a malformed inbound line is answered with a null-id JSON-RPC error instead of silence
+{
+	auto inbound = new LineLink;
+	string written;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
+				written = s;
+			}, (Message) @safe {});
+			channel.start();
+			inbound.put("this is not json");
+			inbound.closeEnd();
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	import vibe.data.json : parseJsonString;
+
+	assert(written.length, "a malformed line must produce an error reply");
+	auto j = parseJsonString(written);
+	assert(j["jsonrpc"].get!string == "2.0");
+	assert(j["id"].type == Json.Type.null_);
+	assert("error" in j);
+}
+
+unittest  // a failing writeLine propagates out of request() instead of being swallowed
+{
+	// Mirrors the stdio write path surfacing a broken pipe: when the writer throws
+	// (the peer closed its read end), the originating server->client request must
+	// observe the failure rather than block on a reply that can never arrive.
+	bool threw;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			string delegate() @safe nullRead = () @safe {
+				return cast(string) null;
+			};
+			auto channel = new DuplexChannel(nullRead, (string) @safe {
+				throw new Exception("stdout write failed (peer closed its read end)");
+			}, (Message) @safe {});
+			try
+				channel.request("ping", Json.emptyObject);
+			catch (Exception)
+				threw = true;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(threw, "a failed write must surface to the request() caller");
 }
