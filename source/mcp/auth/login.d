@@ -191,7 +191,7 @@ class FileTokenStore : TokenStore
 
 	override void save(string resource, StoredToken token) @safe
 	{
-		import std.file : write, mkdirRecurse;
+		import std.file : mkdirRecurse;
 		import std.path : dirName;
 
 		auto dir = dirName(path);
@@ -207,36 +207,91 @@ class FileTokenStore : TokenStore
 		auto all = readAll();
 		all[resource] = token.toJson();
 		auto bytes = serialize(all);
-		// Create the token file with owner-only permissions BEFORE writing any
-		// secret bytes, so the plaintext refresh token is never momentarily
-		// group/world-readable. On POSIX this opens the file `O_CREAT|O_EXCL`
-		// with mode 0600; `write` then truncates the now-private file.
-		precreatePrivateFile();
-		() @trusted { write(path, bytes); }();
-		restrictPermissions();
+		writeSecretFile(bytes);
 	}
 
-	/// Atomically create the token file with owner-only (`0600`) permissions if
-	/// it does not already exist, so secret bytes are never written to a
-	/// group/world-readable file. No-op on platforms without POSIX permissions
-	/// and when the file already exists (its permissions are reasserted by
-	/// `restrictPermissions` after the write).
-	private void precreatePrivateFile() @safe
+	/// Persist `bytes` to `path` such that the plaintext secrets they contain are
+	/// never present in a group/world-readable file. On POSIX the bytes are
+	/// written to a fresh temp file in the same directory, created
+	/// `O_CREAT|O_EXCL` with mode `0600`, then atomically `rename`d over the
+	/// target; because the secret bytes only ever live in the private temp file
+	/// (and rename preserves its `0600` mode), a pre-existing loose-permission
+	/// target is never written to before being tightened. Falls back to a plain
+	/// write on platforms without POSIX permissions.
+	private void writeSecretFile(const(ubyte)[] bytes) @safe
 	{
+		import std.file : write;
+
 		version (Posix)
 		{
 			import core.sys.posix.fcntl : open, O_CREAT, O_EXCL, O_WRONLY;
-			import core.sys.posix.unistd : close;
+			import core.sys.posix.unistd : close, getpid;
 			import core.sys.posix.sys.stat : S_IRUSR, S_IWUSR;
+			import core.stdc.stdio : rename;
+			import std.file : remove;
 			import std.string : toStringz;
+			import std.conv : to;
+			import std.random : uniform;
 
 			if (!path.length)
 				return;
-			() @trusted {
-				int fd = open(path.toStringz, O_CREAT | O_EXCL | O_WRONLY, S_IRUSR | S_IWUSR);
-				if (fd >= 0)
+
+			// A unique private temp name in the same directory so the atomic
+			// `rename` stays on one filesystem and `O_CREAT|O_EXCL` cannot collide
+			// with a concurrent writer or a stale leftover.
+			auto tmp = path ~ ".tmp-" ~ (() @trusted => getpid()
+					.to!string)() ~ "-" ~ uniform(0, int.max).to!string;
+
+			bool wrote = () @trusted {
+				int fd = open(tmp.toStringz, O_CREAT | O_EXCL | O_WRONLY, S_IRUSR | S_IWUSR);
+				if (fd < 0)
+					return false;
+				scope (exit)
 					close(fd);
+				import core.sys.posix.unistd : write_ = write;
+
+				size_t off;
+				while (off < bytes.length)
+				{
+					auto n = write_(fd, bytes.ptr + off, bytes.length - off);
+					if (n <= 0)
+						return false;
+					off += cast(size_t) n;
+				}
+				return true;
 			}();
+
+			void discardTmp() @safe nothrow
+			{
+				() @trusted {
+					try
+						remove(tmp);
+					catch (Exception)
+					{
+					}
+				}();
+			}
+
+			if (wrote && ()@trusted {
+					return rename(tmp.toStringz, path.toStringz) == 0;
+				}())
+				return;
+
+			// The atomic path failed (could not create/write the temp file, or the
+			// rename failed). Clean up any temp and fall back to an in-place write.
+			// Tighten any pre-existing file to owner-only BEFORE writing secrets so
+			// they are not exposed through a loose-permission file, and reassert
+			// afterwards in case the file had to be created by `write`.
+			discardTmp();
+			restrictPermissions();
+			() @trusted { write(path, bytes); }();
+			restrictPermissions();
+			return;
+		}
+		else
+		{
+			() @trusted { write(path, bytes); }();
+			restrictPermissions();
 		}
 	}
 
@@ -333,6 +388,20 @@ struct LoopbackCapture
 /// `state` clears the captured `code` and records an error (MCP "Open
 /// Redirection": clients SHOULD verify the state parameter and discard
 /// mismatched results).
+/// Extract just the path component of an inbound HTTP request target, dropping
+/// any `?query` and `#fragment`. An empty target yields an empty path.
+string requestTargetPath(string requestTarget) @safe pure nothrow
+{
+	import std.string : indexOf;
+
+	auto q = requestTarget.indexOf('?');
+	auto path = q >= 0 ? requestTarget[0 .. q] : requestTarget;
+	auto h = path.indexOf('#');
+	if (h >= 0)
+		path = path[0 .. h];
+	return path;
+}
+
 LoopbackCapture parseLoopbackCallback(string requestTarget, string expectedState = "") @safe
 {
 	LoopbackCapture c;
@@ -731,6 +800,22 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationS
 
 	void handle(scope HTTPServerRequest req, scope HTTPServerResponse res) @safe
 	{
+		// Only the genuine callback path (or a request actually carrying an OAuth
+		// `code`/`error` response parameter) may complete the flow. Stray requests
+		// to other paths — favicon probes, prefetch, port scans, a second tab —
+		// must not terminate the listener, otherwise they race ahead of the real
+		// redirect and abort an otherwise-valid login.
+		const reqPath = requestTargetPath(req.requestURI);
+		const hasResponseParam = extractQueryParam(req.requestURI, "code").length > 0
+			|| extractQueryParam(req.requestURI, "error").length > 0;
+		if (reqPath != opts.callbackPath && !hasResponseParam)
+		{
+			res.statusCode = 404;
+			res.contentType = "text/plain; charset=utf-8";
+			res.writeBody("Not Found");
+			return;
+		}
+
 		auto cap = parseLoopbackCallback(req.requestURI, state);
 		// RFC 9207 mix-up protection: validate the `iss` authorization-response
 		// parameter against the selected AS's recorded issuer BEFORE the token
@@ -1178,6 +1263,62 @@ version (Posix) unittest  // FileTokenStore creates the token file 0600 (never a
 	assert((fileMode & (S_IRWXG | S_IRWXO)) == 0, "token file is group/other accessible");
 }
 
+version (Posix) unittest  // FileTokenStore never writes secrets through a pre-existing loose-perm inode
+{
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse, getAttributes, write,
+		setAttributes, readText;
+	import std.path : buildPath;
+	import std.conv : to;
+	import std.string : indexOf, toStringz;
+	import core.sys.posix.sys.stat : S_IRWXU, S_IRWXG, S_IRWXO, S_IRUSR,
+		S_IWUSR, S_IRGRP, S_IROTH;
+	import core.sys.posix.unistd : link;
+	import std.datetime.systime : Clock;
+
+	auto root = buildPath(tempDir, "mcp-login-pre-" ~ Clock.currTime().toUnixTime().to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		() @trusted { rmdirRecurse(root); }();
+
+	auto file = buildPath(root, "tokens.json");
+	// Pre-create the target as a world/group-readable (0644) file, as an earlier
+	// SDK version, an interrupted run, or an unusual umask might leave it.
+	() @trusted {
+		write(file, "{}");
+		setAttributes(file, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+	}();
+	assert((getAttributes(file) & (S_IRWXG | S_IRWXO)) != 0);
+
+	// A second name (hard link) onto the same loose-perm inode stands in for any
+	// reference an attacker might hold to the pre-existing readable file. If save
+	// writes the plaintext secrets in place, they become visible through this
+	// still-loose alias; an atomic create-and-rename instead allocates a fresh
+	// 0600 inode for the new name, leaving the alias with the old contents.
+	auto alias_ = buildPath(root, "tokens.alias");
+	auto linked = () @trusted {
+		return link(file.toStringz, alias_.toStringz) == 0;
+	}();
+	assert(linked);
+
+	auto store = new FileTokenStore(file);
+	StoredToken t;
+	t.accessToken = "secret-access";
+	t.refreshToken = "secret-refresh";
+	t.resource = "https://mcp.example.com";
+	store.save("https://mcp.example.com", t);
+
+	// The new token file must be owner-only and actually contain the secrets.
+	const fileMode = getAttributes(file) & (S_IRWXU | S_IRWXG | S_IRWXO);
+	assert((fileMode & (S_IRWXG | S_IRWXO)) == 0,
+			"token file is group/other accessible after overwriting a loose file");
+	assert((() @trusted => readText(file))().indexOf("secret-refresh") >= 0);
+
+	// The loose-perm alias to the old inode must NOT have received the secrets.
+	auto aliasContents = () @trusted { return readText(alias_); }();
+	assert(aliasContents.indexOf("secret-refresh") < 0,
+			"secrets were written through a pre-existing group/world-readable inode");
+}
+
 version (Posix) unittest  // FileTokenStore restricts the parent dir to 0700
 {
 	import std.file : tempDir, mkdirRecurse, rmdirRecurse, getAttributes;
@@ -1225,4 +1366,70 @@ unittest  // the loopback flow aborts with a timeout error when no redirect arri
 
 	assert(!captured.ok);
 	assert(captured.error == "authorization_timeout");
+}
+
+unittest  // requestTargetPath strips the query and fragment from a request target
+{
+	assert(requestTargetPath("/callback?code=abc&state=xyz") == "/callback");
+	assert(requestTargetPath("/favicon.ico") == "/favicon.ico");
+	assert(requestTargetPath("/callback") == "/callback");
+	assert(requestTargetPath("/cb#frag") == "/cb");
+	assert(requestTargetPath("") == "");
+}
+
+unittest  // a stray non-callback request does not abort the loopback flow
+{
+	import core.time : msecs, seconds;
+	import vibe.core.core : runTask, sleep;
+	import vibe.http.client : requestHTTP;
+
+	auto oauth = new OAuthClient();
+	oauth.resource = "https://mcp.example.com/mcp";
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "https://as.example.com/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto rc = RegisteredClient("cid", "");
+	auto pkce = generatePkce();
+
+	OAuthLogin opts;
+	opts.callbackTimeout = 5.seconds;
+
+	// The authorization URL carries the bound redirect_uri (with the ephemeral
+	// port). Drive a stray /favicon.ico probe first, then the genuine callback;
+	// the stray request must NOT terminate the listener.
+	opts.openBrowser = (string url) @safe {
+		auto redirectUri = extractQueryParam(url, "redirect_uri");
+		import std.string : indexOf;
+
+		// redirect_uri looks like http://localhost:<port>/callback
+		auto hostStart = redirectUri.indexOf("localhost:");
+		assert(hostStart >= 0);
+		auto rest = redirectUri[hostStart + "localhost:".length .. $];
+		auto slash = rest.indexOf('/');
+		auto portStr = slash >= 0 ? rest[0 .. slash] : rest;
+		auto baseUrl = "http://127.0.0.1:" ~ portStr;
+
+		() @trusted {
+			runTask(() nothrow{
+				try
+				{
+					sleep(50.msecs);
+					requestHTTP(baseUrl ~ "/favicon.ico", (scope req) {}, (scope res) {
+						res.dropBody();
+					});
+					sleep(50.msecs);
+					requestHTTP(baseUrl ~ "/callback?code=real-code&state=state-xyz", (scope req) {
+					}, (scope res) { res.dropBody(); });
+				}
+				catch (Exception)
+				{
+				}
+			});
+		}();
+	};
+
+	auto captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, "state-xyz");
+
+	assert(captured.ok, "genuine callback should be captured despite the stray request");
+	assert(captured.code == "real-code");
 }
