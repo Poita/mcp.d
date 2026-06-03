@@ -50,8 +50,15 @@ final class ConnectionState
 	/// identically-numbered request.
 	CancellationToken[string] inFlight;
 
-	/// Whether `initialize` has completed for this connection (stateful).
+	/// Whether the client has sent `notifications/initialized` for this connection
+	/// (stateful). The lifecycle gate (opt-in via `requireInitialized`) serves
+	/// non-`ping` requests only once this is set.
 	bool initialized;
+
+	/// Whether an `initialize` request has been processed for this connection
+	/// (stateful). Distinct from `initialized` (the post-handshake notification):
+	/// this guards against a second `initialize` re-negotiating the session.
+	bool negotiated_;
 }
 
 unittest  // two ConnectionStates do not share negotiated version or caps
@@ -104,6 +111,7 @@ unittest  // a fresh ConnectionState carries spec defaults
 	auto c = new ConnectionState;
 	assert(c.logLevel == "info");
 	assert(!c.initialized);
+	assert(!c.negotiated_);
 	assert(c.negotiated == latestStable);
 	assert(c.subscriptions.length == 0);
 	assert(c.inFlight.length == 0);

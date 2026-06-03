@@ -1194,8 +1194,14 @@ struct CallToolResult
 			projected.content ~= c.forVersion(v);
 		projected.isError = isError;
 		projected.meta = meta;
-		projected.inputRequests = inputRequests.dup;
-		projected.requestState = requestState;
+		// `inputRequests`/`requestState` form the draft-only MRTR
+		// `InputRequiredResult` shape; a non-draft `CallToolResult` schema has no
+		// such fields, so drop them when projecting below the draft.
+		if (v >= ProtocolVersion.draft)
+		{
+			projected.inputRequests = inputRequests.dup;
+			projected.requestState = requestState;
+		}
 		// `structuredContent` is a 2025-06-18+ field: absent from 2025-03-26 and
 		// 2024-11-05, so omit it for those versions.
 		if (v >= ProtocolVersion.v2025_06_18)
@@ -2495,6 +2501,28 @@ unittest  // CallToolResult.forVersion drops structuredContent on 2024-11-05 (in
 	auto j = r.forVersion(ProtocolVersion.v2024_11_05).toJson();
 	assert("structuredContent" !in j);
 	assert(j["content"].length == 1);
+}
+
+unittest  // CallToolResult.forVersion drops draft-only MRTR fields below the draft
+{
+	CallToolResult r;
+	r.content = [Content.makeText("ok")];
+	r.inputRequests = [InputRequest("req1", "elicitation", Json.emptyObject)];
+	r.requestState = "blob";
+	auto projected = r.forVersion(ProtocolVersion.v2025_11_25);
+	assert(projected.inputRequests.length == 0,
+			"inputRequests is a draft-only MRTR field and must not project below the draft");
+	assert(projected.requestState.length == 0);
+}
+
+unittest  // CallToolResult.forVersion keeps MRTR fields on the draft
+{
+	CallToolResult r;
+	r.inputRequests = [InputRequest("req1", "elicitation", Json.emptyObject)];
+	r.requestState = "blob";
+	auto projected = r.forVersion(ProtocolVersion.draft);
+	assert(projected.inputRequests.length == 1);
+	assert(projected.requestState == "blob");
 }
 
 unittest  // CallToolResult.forVersion drops structuredContent on 2025-03-26 (introduced 2025-06-18)
