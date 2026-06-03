@@ -291,6 +291,11 @@ final class McpServer
 	private RegisteredTemplate[] templates;
 	private RegisteredPrompt[string] prompts;
 	private CompleteResult delegate(CompleteRequest request) @safe typedCompletionHandler;
+	/// Per-argument completers keyed by "<ref-key>\0<argumentName>", so a consumer
+	/// can register one completer per (reference, argument) instead of hand-routing
+	/// inside a single global delegate. Consulted by `doComplete` when no global
+	/// `typedCompletionHandler` matched.
+	private string[]delegate(string prefix) @safe[string] argumentCompleters;
 	private bool loggingEnabled;
 	private bool resourceSubscriptionsEnabled;
 	private Nullable!TasksCapability tasksCapability;
@@ -791,6 +796,31 @@ final class McpServer
 		typedCompletionHandler = handler;
 	}
 
+	/// Register a completer for a single `(reference, argumentName)` pair, so a
+	/// consumer no longer hand-routes every completable argument inside one global
+	/// `setCompletionRequestHandler` delegate. The delegate receives the partial
+	/// value typed so far and returns the candidate completions; the server wraps
+	/// them in a `CompleteResult` (use `CompleteResult.prefixMatch` for the common
+	/// prefix-matching case). Declaring any completer advertises the `completions`
+	/// capability. `completion/complete` dispatch tries the global handler first
+	/// (when set) and falls back to a matching per-argument completer, then to an
+	/// empty `CompleteResult`.
+	void setArgumentCompleter(CompletionReference reference, string argumentName,
+			string[]delegate(string prefix) @safe completer) @safe
+	{
+		argumentCompleters[argumentCompleterKey(reference, argumentName)] = completer;
+	}
+
+	/// The lookup key for a per-argument completer: the reference's identity
+	/// (prompt name or resource-template URI, distinguished by type) joined to the
+	/// argument name with a NUL separator that cannot occur in either part.
+	private static string argumentCompleterKey(CompletionReference reference, string argumentName) @safe
+	{
+		const refPart = reference.type ~ ":" ~ (reference.type == "ref/resource"
+				? reference.uri : reference.name);
+		return refPart ~ "\0" ~ argumentName;
+	}
+
 	/// Observe inbound client-originated notifications.
 	///
 	/// The server consumes `notifications/initialized` and
@@ -1099,9 +1129,30 @@ final class McpServer
 	/// driven.
 	private bool plainGetEligible(string method, string uri) @safe
 	{
+		return plainGetEligibleFor(activeConnection, method, uri);
+	}
+
+	/// Plain-GET eligibility evaluated against an EXPLICIT connection's
+	/// subscription set, so a standalone GET stream opened for a specific session
+	/// gates `notifications/resources/updated` on that session's own
+	/// `resources/subscribe` set rather than the shared fallback `activeConnection`.
+	private static bool plainGetEligibleFor(ConnectionState conn, string method, string uri) @safe
+	{
 		if (method == "notifications/resources/updated")
-			return isSubscribed(uri);
+			return conn !is null && (uri in conn.subscriptions) !is null;
 		return true;
+	}
+
+	/// Build the per-session plain-GET eligibility predicate a standalone GET
+	/// stream registers with the push channel, bound to the session's resolved
+	/// `ConnectionState`. The Streamable HTTP transport supplies this when opening
+	/// the GET stream so `notifications/resources/updated` delivery consults the
+	/// listener's own per-session subscriptions (keyed on `Mcp-Session-Id`) instead
+	/// of the shared fallback connection.
+	package(mcp) bool delegate(string method, string uri) @safe sessionPushEligibility(
+			ConnectionState conn) @safe
+	{
+		return (string method, string uri) @safe => plainGetEligibleFor(conn, method, uri);
 	}
 
 	/// Initiate a server->client `ping` on the standalone GET SSE push channel
@@ -1136,7 +1187,7 @@ final class McpServer
 					resourcesListChangedEnabled);
 		if (prompts.length > 0 || promptsListChangedEnabled)
 			caps.prompts = ListChangedCapability(promptsListChangedEnabled);
-		if (typedCompletionHandler !is null)
+		if (typedCompletionHandler !is null || argumentCompleters.length)
 			caps.completions = true;
 		if (loggingEnabled)
 			caps.logging = true;
@@ -1337,11 +1388,15 @@ final class McpServer
 					}
 				}
 			}
-			else
+			else if (mode_ == ServerMode.stateless || conn.negotiated.isDraft)
 			{
-				// Per-request protocol-version negotiation (draft): the client
-				// declared a version we do not support -> reject with the list of
-				// versions we do support so it can retry with a compatible one.
+				// Per-request protocol-version negotiation (draft/stateless): the
+				// client declared a version we do not support -> reject with the
+				// list of versions we do support so it can retry with a compatible
+				// one. On a stateful, already-negotiated 2025-era session the
+				// negotiated version is fixed at `initialize` and governs every
+				// request, so a stray/garbage body `_meta.protocolVersion` is
+				// ignored for version selection (symmetric with the success path).
 				return nullable(makeErrorResponse(msg.id,
 						unsupportedVersionError(meta.protocolVersion)));
 			}
@@ -2269,8 +2324,26 @@ final class McpServer
 
 	private Json doComplete(Json params) @safe
 	{
+		auto request = CompleteRequest.fromJson(params);
+		// The global handler takes precedence (advanced/dynamic routing), then a
+		// per-argument completer registered via `setArgumentCompleter`.
 		if (typedCompletionHandler !is null)
-			return typedCompletionHandler(CompleteRequest.fromJson(params)).toJson();
+			return typedCompletionHandler(request).toJson();
+		if (argumentCompleters.length)
+		{
+			const key = argumentCompleterKey(request.reference, request.argumentName);
+			if (auto completer = key in argumentCompleters)
+			{
+				CompleteResult result;
+				auto values = (*completer)(request.argumentValue);
+				result.values = values;
+				result.total = values.length;
+				return result.toJson();
+			}
+			// A registered (reference, argument) surface exists but this request
+			// matched none of them: an empty completion is the spec-compliant answer.
+			return CompleteResult.init.toJson();
+		}
 		// No handler registered => the `completions` capability is not advertised.
 		// The spec directs servers to answer with -32601 (Capability not
 		// supported) rather than a success result in this case.
@@ -2385,6 +2458,25 @@ final class McpServer
 		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
 			throw missingRequiredClientCapability(missing.get);
 
+		// Task-augmented execution gating (2025-11-25 tasks / draft
+		// io.modelcontextprotocol/tasks). The SDK does not yet drive the two-phase
+		// CreateTaskResult flow from `tools/call`, so it must not silently downgrade
+		// a task-augmented call to a synchronous result, nor execute a tool that
+		// declares it MUST run as a task:
+		//   (a) a tool whose execution.taskSupport == "required" invoked WITHOUT
+		//       task augmentation is rejected (the tool cannot be run synchronously);
+		//   (b) a task-augmented call (the 2025-11-25 `task` param, or the draft
+		//       `_meta["io.modelcontextprotocol/task"]`) is rejected because the
+		//       receiver cannot return a CreateTaskResult.
+		// Both surface -32601 rather than running the handler and returning a plain
+		// CallToolResult the conformant client did not ask for.
+		const bool taskAugmented = isTaskAugmented(params);
+		const bool taskRequired = !entry.descriptor.execution.isNull
+			&& !entry.descriptor.execution.get.taskSupport.isNull
+			&& entry.descriptor.execution.get.taskSupport.get == "required";
+		if (taskAugmented || taskRequired)
+			throw methodNotFound(name);
+
 		Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
 		// Validate the supplied arguments against the tool's declared inputSchema
 		// before dispatch (spec: server/tools § Security Considerations,
@@ -2445,6 +2537,22 @@ final class McpServer
 			err.isError = true;
 			return err.toJson();
 		}
+	}
+
+	/// Whether a `tools/call` request carries task augmentation. The 2025-11-25
+	/// shape is a top-level `task` param object; the draft carries it under
+	/// `_meta["io.modelcontextprotocol/task"]`. Either presence means the client
+	/// asked for two-phase task execution.
+	private static bool isTaskAugmented(Json params) @safe
+	{
+		if (params.type != Json.Type.object)
+			return false;
+		if ("task" in params && params["task"].type != Json.Type.undefined)
+			return true;
+		if ("_meta" in params && params["_meta"].type == Json.Type.object
+				&& MetaKey.task in params["_meta"])
+			return true;
+		return false;
 	}
 
 	/// When input-schema validation is enabled, verify that a tool call's
@@ -3179,6 +3287,67 @@ unittest  // tools/call keeps structuredContent for a 2025-11-25 client
 	params["arguments"] = Json(["a": Json(2), "b": Json(3)]);
 	auto resp = s.handle(req(4, "tools/call", params)).get;
 	assert("structuredContent" in resp["result"]);
+}
+
+unittest  // a taskSupport:"required" tool invoked WITHOUT augmentation is rejected, not run
+{
+	auto s = new McpServer("req-task-srv", "0.1.0");
+	bool ran;
+	Tool t = {name: "longjob"};
+	t.execution = ToolExecution(nullable("required"));
+	s.registerDynamicTool(t, (Json args) @safe {
+		ran = true;
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+
+	Json params = Json.emptyObject;
+	params["name"] = "longjob";
+	auto resp = s.handle(req(4, "tools/call", params)).get;
+	assert("error" in resp, "a required-task tool must not run synchronously");
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+	assert(!ran, "the handler must not execute for a required-task tool sans augmentation");
+}
+
+unittest  // a task-augmented tools/call is rejected rather than silently downgraded
+{
+	auto s = new McpServer("aug-task-srv", "0.1.0");
+	bool ran;
+	Tool t = {name: "add"};
+	t.execution = ToolExecution(nullable("optional"));
+	s.registerDynamicTool(t, (Json args) @safe {
+		ran = true;
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+
+	Json params = Json.emptyObject;
+	params["name"] = "add";
+	params["task"] = Json.emptyObject; // 2025-11-25 task augmentation
+	auto resp = s.handle(req(4, "tools/call", params)).get;
+	assert("error" in resp, "a task-augmented call cannot be served as a CallToolResult");
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+	assert(!ran);
+}
+
+unittest  // an ordinary (non-augmented) call to an optional-task tool still runs
+{
+	auto s = new McpServer("opt-task-srv", "0.1.0");
+	Tool t = {name: "add"};
+	t.execution = ToolExecution(nullable("optional"));
+	s.registerDynamicTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+
+	Json params = Json.emptyObject;
+	params["name"] = "add";
+	auto resp = s.handle(req(4, "tools/call", params)).get;
+	assert("error" !in resp, "an optional-task tool runs normally without augmentation");
+	assert(resp["result"]["content"][0]["text"].get!string == "ok");
 }
 
 unittest  // tools/list emits a tool descriptor's _meta
@@ -4272,6 +4441,53 @@ unittest  // typed completion handler receives the resolved context.arguments
 	assert(resp["result"]["completion"]["values"][0].get!string == "main");
 	assert(seenContext["repo"] == "mcp.d");
 	assert(seenContext["owner"] == "Poita");
+}
+
+unittest  // a per-argument completer is dispatched on its (reference, argument) pair
+{
+	auto s = new McpServer("t", "1");
+	immutable langs = ["c", "cpp", "d", "go", "java", "javascript"];
+	s.setArgumentCompleter(CompletionReference.forPrompt("code_review"), "language",
+			(string prefix) @safe => CompleteResult.prefixMatch(langs, prefix).values);
+
+	Json p = Json.emptyObject;
+	p["ref"] = CompletionReference.forPrompt("code_review").toJson();
+	Json arg = Json.emptyObject;
+	arg["name"] = "language";
+	arg["value"] = "ja";
+	p["argument"] = arg;
+	auto resp = s.handle(req(1, "completion/complete", p)).get;
+	auto values = resp["result"]["completion"]["values"];
+	assert(values.length == 2);
+	assert(values[0].get!string == "java");
+	assert(values[1].get!string == "javascript");
+}
+
+unittest  // a per-argument completer surface answers a non-matching request with empty
+{
+	auto s = new McpServer("t", "1");
+	s.setArgumentCompleter(CompletionReference.forPrompt("code_review"),
+			"language", (string prefix) @safe => ["d"]);
+
+	// Different argument name on the same prompt: no completer, empty result (not -32601).
+	Json p = Json.emptyObject;
+	p["ref"] = CompletionReference.forPrompt("code_review").toJson();
+	Json arg = Json.emptyObject;
+	arg["name"] = "unrelated";
+	arg["value"] = "x";
+	p["argument"] = arg;
+	auto resp = s.handle(req(1, "completion/complete", p)).get;
+	assert("error" !in resp);
+	assert(resp["result"]["completion"]["values"].length == 0);
+}
+
+unittest  // registering a per-argument completer advertises the completions capability
+{
+	auto s = new McpServer("t", "1");
+	s.setArgumentCompleter(CompletionReference.forPrompt("p"), "a",
+			(string prefix) @safe => cast(string[]) null);
+	auto caps = s.capabilities();
+	assert(caps.completions);
 }
 
 unittest  // typed completion handler advertises the completions capability

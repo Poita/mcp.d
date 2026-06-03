@@ -4504,6 +4504,28 @@ struct CompleteResult
 	/// (schema `@maxItems 100`: "Must not exceed 100 items.").
 	enum size_t maxValues = 100;
 
+	/// Build a `CompleteResult` by case-insensitively prefix-matching `prefix`
+	/// against `candidates`. The matches populate `values`, `total` is set to the
+	/// match count, and `hasMore` reflects whether the spec's 100-item cap
+	/// truncated the set. This is the built-in helper for the common
+	/// autocompletion pattern, so consumers do not hand-roll `startsWith`.
+	static CompleteResult prefixMatch(const(string)[] candidates, string prefix) @safe
+	{
+		import std.algorithm : startsWith;
+		import std.uni : toLower;
+
+		const lowered = prefix.toLower;
+		string[] matches;
+		foreach (c; candidates)
+			if (c.toLower.startsWith(lowered))
+				matches ~= c;
+		CompleteResult r;
+		r.total = matches.length;
+		r.hasMore = matches.length > maxValues;
+		r.values = matches;
+		return r;
+	}
+
 	Json toJson() const @safe
 	{
 		Json completion = Json.emptyObject;
@@ -4569,6 +4591,30 @@ struct CompleteResult
 		r.parseMetaField(j);
 		return r;
 	}
+}
+
+unittest  // CompleteResult.prefixMatch case-insensitively filters candidates
+{
+	immutable langs = ["c", "cpp", "d", "go", "java", "javascript"];
+	auto r = CompleteResult.prefixMatch(langs, "ja");
+	assert(r.values == ["java", "javascript"]);
+	assert(!r.total.isNull && r.total.get == 2);
+	assert(!r.hasMore);
+}
+
+unittest  // CompleteResult.prefixMatch with an empty prefix returns every candidate
+{
+	immutable langs = ["c", "d", "rust"];
+	auto r = CompleteResult.prefixMatch(langs, "");
+	assert(r.values == ["c", "d", "rust"]);
+	assert(!r.total.isNull && r.total.get == 3);
+}
+
+unittest  // CompleteResult.prefixMatch ignores case in both prefix and candidate
+{
+	immutable names = ["Python", "Perl"];
+	auto r = CompleteResult.prefixMatch(names, "pe");
+	assert(r.values == ["Perl"]);
 }
 
 /// A typed `notifications/resources/updated` payload, per
