@@ -1939,6 +1939,16 @@ final class McpServer
 			return doTasksResult(params, ver);
 		case "tasks/cancel":
 			return doTasksCancel(params, ver);
+		case "tasks/update":
+			// `tasks/update` is a draft-only method (SEP-2663 lists tasks/get,
+			// tasks/update, tasks/cancel for the `io.modelcontextprotocol/tasks`
+			// extension) and is NOT part of the 2025-11-25 stable family. This is the
+			// inverse of tasks/result: stable answers -32601 (method not found), the
+			// draft routes to doTasksUpdate which yields -32602 (task not found) for
+			// any id against the permanently-empty store.
+			if (!ver.isDraft)
+				throw methodNotFound(method);
+			return doTasksUpdate(params, ver);
 		default:
 			throw methodNotFound(method);
 		}
@@ -2001,6 +2011,12 @@ final class McpServer
 	}
 
 	private Json doTasksCancel(Json params, ProtocolVersion ver) @safe
+	{
+		requireTasksAdvertised(ver);
+		return taskNotFound(params);
+	}
+
+	private Json doTasksUpdate(Json params, ProtocolVersion ver) @safe
 	{
 		requireTasksAdvertised(ver);
 		return taskNotFound(params);
@@ -4910,6 +4926,36 @@ unittest  // draft tasks/result is -32601: SEP-2663 defines no tasks/result in t
 	Json p = Json.emptyObject;
 	p["taskId"] = "nope";
 	auto resp = s.handle(draftReq(1, "tasks/result", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+}
+
+unittest  // draft tasks/update for an unknown taskId is -32602 with the echoed taskId
+{
+	// SEP-2663 lists tasks/update among the three methods the draft
+	// `io.modelcontextprotocol/tasks` extension MUST support, so a draft session
+	// MUST route it. Against the permanently-empty store an unknown taskId yields
+	// -32602 (task not found), echoing the taskId in error.data, exactly like its
+	// sibling draft methods tasks/get and tasks/cancel.
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+	Json p = Json.emptyObject;
+	p["taskId"] = "nope";
+	auto resp = s.handle(draftReq(1, "tasks/update", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(resp["error"]["code"].get!int != ErrorCode.methodNotFound);
+	assert(resp["error"]["data"]["taskId"].get!string == "nope");
+}
+
+unittest  // 2025-11-25 tasks/update is -32601: it is a draft-only method
+{
+	// tasks/update is draft-only per SEP-2663 and is NOT part of the 2025-11-25
+	// stable family — the inverse of tasks/result. On a stable session it MUST
+	// answer -32601 (method not found).
+	auto s = new McpServer("t", "1");
+	s.enableTasks(true, true, TaskRequests().tool().toJson());
+	Json p = Json.emptyObject;
+	p["taskId"] = "nope";
+	auto resp = s.handle(req(1, "tasks/update", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 

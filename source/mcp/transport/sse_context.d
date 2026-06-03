@@ -405,6 +405,14 @@ final class ServerPushChannel
 		/// fallback. Null for streams that have no per-session gate (stdio fallbacks,
 		/// active `subscriptions/listen` streams which decide via `filter`).
 		bool delegate(string method, string uri) @safe plainEligible;
+		/// The session/connection token that owns this listener's stream. Resume
+		/// (Last-Event-ID) is scoped to the owning session: a listener may only
+		/// resume a stream ordinal whose recorded owner equals this token, so one
+		/// session cannot replay another session's buffered history by guessing its
+		/// event id (cross-session disclosure). The empty token marks an unscoped
+		/// (stateless / shared) stream, mirroring the unscoped
+		/// `StreamCoordinator.Waiter`, for which any resume is accepted.
+		string ownerToken;
 		/// Per-listener serialization point. The blocking `write` to this stream —
 		/// together with the seq read it is framed with and the seq/history commit
 		/// that follows — runs under THIS mutex, NOT the channel-wide `mtx`. Keeping
@@ -422,6 +430,15 @@ final class ServerPushChannel
 	private long[long] streamOf; /// listener id -> its allocated stream ordinal
 	private long[long] seqOf; /// listener id -> its monotonic event sequence
 	private long nextListenerId = 1;
+
+	/// Stream ordinal -> the session/connection token that owns it. A Last-Event-ID
+	/// resume is honoured only when the resuming listener's `ownerToken` matches the
+	/// owner recorded here, so a session cannot resume (and have replayed to it)
+	/// another session's stream history by guessing its globally-monotonic event id.
+	/// An ordinal owned by the empty token is unscoped (stateless / shared) and may
+	/// be resumed by any listener, preserving prior behaviour where no session
+	/// attribution exists.
+	private string[long] streamOwner;
 
 	/// Guards the channel's shared state: the listener list, `streamOf`/`seqOf`,
 	/// `requestListener`, and the replay history. Held only for short,
@@ -494,7 +511,8 @@ final class ServerPushChannel
 	/// honoured because replay is keyed strictly on the id's ordinal.
 	long addListener(void delegate(string frame) @safe write, string subscriptionId = "",
 			SubscriptionFilter filter = SubscriptionFilter.init, string resumeFrom = "",
-			bool delegate(string method, string uri) @safe plainEligible = null) @safe
+			bool delegate(string method, string uri) @safe plainEligible = null,
+			string ownerToken = "") @safe
 	{
 		return () @trusted {
 			auto lWriteMtx = new TaskMutex;
@@ -508,10 +526,20 @@ final class ServerPushChannel
 			synchronized (mtx)
 			{
 				id = nextListenerId++;
-				listeners ~= Listener(id, write, subscriptionId, filter, plainEligible, lWriteMtx);
+				listeners ~= Listener(id, write, subscriptionId, filter,
+						plainEligible, ownerToken, lWriteMtx);
 
 				long resumeOrdinal, resumeSeq;
-				if (parseEventId(resumeFrom, resumeOrdinal, resumeSeq) && resumeOrdinal in history)
+				// A resume is honoured only when the ordinal exists AND its recorded
+				// owner matches this listener's token: a session must not be able to
+				// replay another session's history by presenting its event id. An
+				// ordinal owned by the empty token (unscoped / stateless) is resumable
+				// by anyone. A token mismatch falls through to a fresh ordinal, never
+				// disclosing the other session's frames.
+				if (parseEventId(resumeFrom, resumeOrdinal, resumeSeq)
+						&& resumeOrdinal in history && resumeOrdinal in streamOwner
+						&& (streamOwner[resumeOrdinal].length == 0
+							|| streamOwner[resumeOrdinal] == ownerToken))
 				{
 					// Resume the disconnected stream: keep its ordinal, replay every
 					// buffered event after the cursor in sequence order, and continue
@@ -532,7 +560,9 @@ final class ServerPushChannel
 				}
 				else
 				{
-					streamOf[id] = coord.allocStream();
+					const ord = coord.allocStream();
+					streamOf[id] = ord;
+					streamOwner[ord] = ownerToken;
 					seqOf[id] = 0;
 				}
 			}
@@ -833,6 +863,9 @@ final class ServerPushChannel
 			const victim = historyOrder[0];
 			historyOrder = historyOrder[1 .. $];
 			history.remove(victim);
+			// Drop the ordinal's owner attribution alongside its evicted history so
+			// the scoping map stays bounded with the history it guards.
+			streamOwner.remove(victim);
 		}
 	}
 
@@ -1050,6 +1083,74 @@ unittest  // replay never crosses streams (MUST NOT replay a different stream)
 	assert(resumed[0].canFind("A2"));
 	assert(!resumed[0].canFind("B1"));
 	assert(!resumed[0].canFind("A1"));
+}
+
+unittest  // resume is session-scoped: another session cannot replay a stream's history
+{
+	// A client must not be able to resume (and have replayed to it) another
+	// session's buffered stream history by presenting that session's Last-Event-ID.
+	// Session A emits an event (recording history under A's token); session B then
+	// reconnects with A's event id but B's owner token. B MUST receive nothing and
+	// be given a FRESH ordinal — no cross-session disclosure.
+	import std.string : indexOf, startsWith;
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+
+	string[] aFrames;
+	const a = ch.addListener((string f) @safe { aFrames ~= f; }, "",
+			SubscriptionFilter.init, "", null, "session-A");
+	ch.notify("notifications/message", Json(["s": Json("secretA1")]));
+	ch.notify("notifications/message", Json(["s": Json("secretA2")]));
+	assert(aFrames.length == 2);
+	const aId0 = aFrames[0]["id: ".length .. aFrames[0].indexOf("\n")];
+	const aOrdinal = aId0[0 .. aId0.indexOf("-")];
+	ch.removeListener(a); // A's connection breaks
+
+	// Session B presents A's Last-Event-ID but B's own token: NO replay, and the
+	// fresh ordinal it gets must NOT be A's ordinal.
+	string[] bFrames;
+	ch.addListener((string f) @safe { bFrames ~= f; }, "",
+			SubscriptionFilter.init, aId0, null, "session-B");
+	assert(bFrames.length == 0, "session B must not replay session A's history");
+
+	// A subsequent event to B carries a fresh ordinal distinct from A's, confirming
+	// B did not resume A's stream.
+	string[] bLive;
+	const b2 = ch.addListener((string f) @safe { bLive ~= f; }, "",
+			SubscriptionFilter.init, aId0, null, "session-B");
+	ch.emitTo(b2, makeNotification("notifications/message", Json([
+		"s": Json("B")
+	])));
+	assert(bLive.length == 1);
+	const bId0 = bLive[0]["id: ".length .. bLive[0].indexOf("\n")];
+	assert(!bId0.startsWith(aOrdinal ~ "-"), "session B must get a fresh ordinal, not A's");
+}
+
+unittest  // an unscoped (empty-token) stream remains resumable by anyone (prior behaviour)
+{
+	// A stream owned by the empty token (stateless / shared mode, no session
+	// attribution) keeps the prior resumable-by-anyone behaviour: a reconnect with
+	// no owner token still replays the post-cursor events.
+	import std.string : indexOf;
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+
+	string[] first;
+	const a = ch.addListener((string f) @safe { first ~= f; }); // empty owner token
+	ch.notify("notifications/message", Json(["n": Json(1)]));
+	ch.notify("notifications/message", Json(["n": Json(2)]));
+	assert(first.length == 2);
+	const idLine = first[0]["id: ".length .. first[0].indexOf("\n")];
+	ch.removeListener(a);
+
+	string[] resumed;
+	ch.addListener((string f) @safe { resumed ~= f; }, "", SubscriptionFilter.init, idLine);
+	assert(resumed.length == 1);
+	assert(resumed[0].canFind("\"n\":2"));
 }
 
 unittest  // emit delivers to exactly ONE stream, never broadcasting to all
