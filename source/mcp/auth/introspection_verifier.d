@@ -52,7 +52,11 @@ struct IntrospectionConfig
 	string[] requiredScopes;
 
 	/// Optional TTL for caching positive (`active:true`) introspection results,
-	/// keyed by the raw token. Zero (the default) disables caching.
+	/// keyed by the raw token. Zero (the default) disables caching. Caching trades
+	/// revocation latency for performance: a token revoked at the AS, or one whose
+	/// own `exp` is sooner than the TTL, may be served as valid from cache until
+	/// the entry expires. Entry expiry is clamped to the token's `exp` (RFC 7662)
+	/// when present, so the staleness window never outlives the token itself.
 	Duration cacheTtl = Duration.zero;
 }
 
@@ -244,10 +248,16 @@ final class PositiveCache
 		return null;
 	}
 
-	/// Cache a positive result for `token`.
+	/// Cache a positive result for `token`. The entry expiry is the TTL, clamped
+	/// down to the token's own `exp` (RFC 7662) when present, so a cached result
+	/// never outlives the token it represents.
 	void put(string token, TokenInfo info, long now) @safe
 	{
-		entries[token] = Entry(info, now + cast(long) ttl.total!"seconds");
+		long expiresAt = now + cast(long) ttl.total!"seconds";
+		const exp = introspectionExp(info.claims);
+		if (exp > 0 && exp < expiresAt)
+			expiresAt = exp;
+		entries[token] = Entry(info, expiresAt);
 	}
 }
 
@@ -268,6 +278,21 @@ private string jsonStr(Json j, string key) @safe
 	if (v.type == Json.Type.string)
 		return v.get!string;
 	return null;
+}
+
+/// Extract the `exp` claim (token expiry, unix seconds) from an introspection
+/// response (RFC 7662 2.2 / RFC 7519 4.1.1). Returns 0 when absent or not a
+/// number, signalling "no known expiry".
+long introspectionExp(Json doc) @safe
+{
+	if (doc.type != Json.Type.object)
+		return 0;
+	auto e = doc["exp"];
+	if (e.type == Json.Type.int_)
+		return e.get!long;
+	if (e.type == Json.Type.float_)
+		return cast(long) e.get!double;
+	return 0;
 }
 
 /// Extract the audiences from an introspection response: `aud` may be a string
@@ -483,6 +508,52 @@ unittest  // PositiveCache returns a hit before expiry and a miss after
 
 	assert(cache.get("tok", 1040) is null); // expired (1000 + 30 == 1030)
 	assert(cache.get("other", 1010) is null); // never stored
+}
+
+unittest  // PositiveCache clamps entry expiry to the token's exp claim
+{
+	auto cache = new PositiveCache(30.seconds);
+	TokenInfo ti;
+	ti.valid = true;
+	// exp at 1005 is sooner than now(1000) + ttl(30) == 1030, so it must win.
+	ti.claims = parseJsonString(`{"active":true,"exp":1005}`);
+	cache.put("tok", ti, 1000);
+
+	assert(cache.get("tok", 1004) !is null); // still valid before exp
+	assert(cache.get("tok", 1005) is null); // expired at exp, not at 1030
+}
+
+unittest  // PositiveCache keeps the TTL when exp is later than now + ttl
+{
+	auto cache = new PositiveCache(30.seconds);
+	TokenInfo ti;
+	ti.valid = true;
+	ti.claims = parseJsonString(`{"active":true,"exp":9999}`);
+	cache.put("tok", ti, 1000);
+
+	assert(cache.get("tok", 1029) !is null); // within TTL window
+	assert(cache.get("tok", 1030) is null); // TTL (1030) bounds it, not exp
+}
+
+unittest  // PositiveCache falls back to the TTL when no exp is present
+{
+	auto cache = new PositiveCache(30.seconds);
+	TokenInfo ti;
+	ti.valid = true;
+	ti.claims = parseJsonString(`{"active":true}`);
+	cache.put("tok", ti, 1000);
+
+	assert(cache.get("tok", 1029) !is null);
+	assert(cache.get("tok", 1030) is null);
+}
+
+unittest  // introspectionExp parses integer and floating exp, 0 otherwise
+{
+	assert(introspectionExp(parseJsonString(`{"exp":1700}`)) == 1700);
+	assert(introspectionExp(parseJsonString(`{"exp":1700.9}`)) == 1700);
+	assert(introspectionExp(parseJsonString(`{"active":true}`)) == 0);
+	assert(introspectionExp(parseJsonString(`{"exp":"soon"}`)) == 0);
+	assert(introspectionExp(parseJsonString(`"not-an-object"`)) == 0);
 }
 
 unittest  // introspectionVerifier yields a usable TokenValidator
