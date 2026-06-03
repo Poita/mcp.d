@@ -111,17 +111,26 @@ Json invalidRequestJson(string description) @safe
 }
 
 /// Extract the `redirect_uris` array from a parsed RFC 7591 DCR request body,
-/// returning an empty array when the field is absent or malformed.
+/// returning an empty array when the field is absent or malformed. The number of
+/// URIs collected is capped at `maxRedirectUrisPerRegistration` so an
+/// unauthenticated `POST /register` carrying an oversized array cannot force an
+/// unbounded allocation here before the proxy's own registration cap applies.
 string[] redirectUrisFrom(Json body_) @safe
 {
+	import mcp.auth.oauth_proxy : maxRedirectUrisPerRegistration;
+
 	string[] uris;
 	if (body_.type == Json.Type.object && "redirect_uris" in body_
 			&& body_["redirect_uris"].type == Json.Type.array)
 	{
 		auto arr = body_["redirect_uris"];
 		foreach (i; 0 .. arr.length)
+		{
+			if (uris.length >= maxRedirectUrisPerRegistration)
+				break;
 			if (arr[i].type == Json.Type.string)
 				uris ~= arr[i].get!string;
+		}
 	}
 	return uris;
 }
@@ -654,6 +663,26 @@ unittest  // redirectUrisFrom tolerates a missing/!array field
 	assert(redirectUrisFrom(parseJsonString(`{"client_name":"x"}`)).length == 0);
 	assert(redirectUrisFrom(parseJsonString(`{"redirect_uris":"oops"}`)).length == 0);
 	assert(redirectUrisFrom(Json.emptyObject).length == 0);
+}
+
+unittest  // redirectUrisFrom caps an oversized redirect_uris array (DoS bound)
+{
+	import mcp.auth.oauth_proxy : maxRedirectUrisPerRegistration;
+	import std.array : appender;
+
+	auto a = appender!string;
+	a.put(`{"redirect_uris":[`);
+	foreach (i; 0 .. maxRedirectUrisPerRegistration + 50)
+	{
+		if (i)
+			a.put(',');
+		a.put(`"http://localhost/cb`);
+		a.put(cast(char)('0' + cast(int)(i % 10)));
+		a.put('"');
+	}
+	a.put(`]}`);
+	auto uris = redirectUrisFrom(parseJsonString(a.data));
+	assert(uris.length == maxRedirectUrisPerRegistration);
 }
 
 unittest  // the proxy state store round-trips and is single-use (consumed on take)

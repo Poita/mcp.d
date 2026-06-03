@@ -380,6 +380,12 @@ private string hostOf(string authorityAndRest) @safe
 /// answers whether a given `redirect_uri` is an exact member of that set. This is
 /// the allowlist the proxy enforces at `/authorize` before relaying an upstream
 /// authorization code.
+/// Upper bound on the number of `redirect_uris` a single `/register` request may
+/// register. An unauthenticated DCR request carrying more than this is truncated
+/// to the first `maxRedirectUrisPerRegistration` entries so one request cannot
+/// inflate the registry without bound.
+enum size_t maxRedirectUrisPerRegistration = 10;
+
 interface RedirectUriRegistry
 {
 	/// Persist the exact `redirect_uris` registered under `registrationHandle`.
@@ -389,21 +395,78 @@ interface RedirectUriRegistry
 	bool isRegistered(string redirectUri) @safe;
 }
 
-/// A simple in-memory `RedirectUriRegistry`. Suitable for a single-process proxy;
-/// for a multi-process deployment back it with shared storage instead.
+/// A simple in-memory `RedirectUriRegistry` bounded against unauthenticated
+/// growth: each `/register` call is scoped under its server-issued
+/// `registrationHandle`, and when the number of live registrations exceeds the
+/// cap the oldest registration (and all its redirect URIs) is evicted as a unit.
+/// The cap is what keeps an unauthenticated `POST /register` flood from growing
+/// process memory without bound.
+///
+/// NOTE: even bounded, the unbounded-default in-memory backing is unsuitable for
+/// an internet-exposed multi-process proxy: state is per-process and lost on
+/// restart. Back it with shared, bounded storage (and gate `/register` behind the
+/// integrator's auth or a rate limiter) for such deployments.
 final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 {
-	private bool[string] allowed;
+	/// Maximum number of live registrations (one per `/register` call). When
+	/// exceeded on `register`, the oldest registration is evicted as a whole.
+	enum size_t defaultMaxRegistrations = 10_000;
+
+	private string[][string] byHandle;
+	private string[] order;
+	private size_t[string] refCount;
+	private const size_t maxRegistrations;
+
+	this() @safe
+	{
+		this(defaultMaxRegistrations);
+	}
+
+	/// Construct with an explicit registration cap (used by tests to drive
+	/// oldest-first eviction deterministically).
+	this(size_t maxRegistrations) @safe
+	{
+		this.maxRegistrations = maxRegistrations;
+	}
 
 	override void register(string registrationHandle, const string[] redirectUris) @safe
 	{
+		string[] uris;
 		foreach (u; redirectUris)
-			allowed[u] = true;
+			uris ~= u;
+		byHandle[registrationHandle] = uris;
+		order ~= registrationHandle;
+		foreach (u; uris)
+			refCount[u] = (u in refCount ? refCount[u] : 0) + 1;
+		enforceCap();
 	}
 
 	override bool isRegistered(string redirectUri) @safe
 	{
-		return (redirectUri in allowed) !is null;
+		return (redirectUri in refCount) !is null;
+	}
+
+	private void enforceCap() @safe
+	{
+		while (order.length > maxRegistrations)
+		{
+			const oldest = order[0];
+			order = order[1 .. $];
+			if (auto p = oldest in byHandle)
+			{
+				foreach (u; *p)
+				{
+					if (auto c = u in refCount)
+					{
+						if (*c <= 1)
+							refCount.remove(u);
+						else
+							*c = *c - 1;
+					}
+				}
+				byHandle.remove(oldest);
+			}
+		}
 	}
 }
 
@@ -454,11 +517,36 @@ interface ConsentStore
 	void grantConsent(string clientRedirectUri) @safe;
 }
 
-/// A simple in-memory `ConsentStore`. Suitable for a single-process proxy; for
-/// a multi-process deployment back it with shared storage instead.
+/// A simple in-memory `ConsentStore` bounded against unauthenticated growth: the
+/// number of approved clients is capped, evicting the oldest approval first when
+/// the cap is reached, so the (otherwise insert-only) consent map cannot grow
+/// process memory without bound.
+///
+/// NOTE: even bounded, this in-memory default is unsuitable for an
+/// internet-exposed multi-process proxy: consent is per-process and lost on
+/// restart. Back it with shared, bounded storage (and consider a consent TTL) for
+/// such deployments.
 final class InMemoryConsentStore : ConsentStore
 {
+	/// Maximum number of approved clients retained. When exceeded on
+	/// `grantConsent`, the oldest approval is evicted.
+	enum size_t defaultMaxApprovals = 10_000;
+
 	private bool[string] approved;
+	private string[] order;
+	private const size_t maxApprovals;
+
+	this() @safe
+	{
+		this(defaultMaxApprovals);
+	}
+
+	/// Construct with an explicit approval cap (used by tests to drive
+	/// oldest-first eviction deterministically).
+	this(size_t maxApprovals) @safe
+	{
+		this.maxApprovals = maxApprovals;
+	}
 
 	override bool hasConsent(string clientRedirectUri) @safe
 	{
@@ -467,7 +555,16 @@ final class InMemoryConsentStore : ConsentStore
 
 	override void grantConsent(string clientRedirectUri) @safe
 	{
+		if (clientRedirectUri in approved)
+			return;
 		approved[clientRedirectUri] = true;
+		order ~= clientRedirectUri;
+		while (order.length > maxApprovals)
+		{
+			const oldest = order[0];
+			order = order[1 .. $];
+			approved.remove(oldest);
+		}
 	}
 }
 
@@ -560,8 +657,10 @@ final class OAuthProxy
 		import std.uuid : randomUUID;
 
 		const handle = () @trusted { return randomUUID().toString(); }();
-		redirectRegistry.register(handle, requestedRedirectUris);
-		return registrationResponseJson(cfg, requestedRedirectUris);
+		const capped = requestedRedirectUris.length > maxRedirectUrisPerRegistration
+			? requestedRedirectUris[0 .. maxRedirectUrisPerRegistration] : requestedRedirectUris;
+		redirectRegistry.register(handle, capped);
+		return registrationResponseJson(cfg, capped);
 	}
 
 	/// Reject a client `redirect_uri` that is not safe to relay an authorization
@@ -1094,6 +1193,65 @@ unittest  // REDIRECT REGISTRY: InMemoryRedirectUriRegistry exact-matches across
 	assert(reg.isRegistered("https://a/cb"));
 	assert(reg.isRegistered("https://b/cb"));
 	assert(!reg.isRegistered("https://c/cb"));
+}
+
+unittest  // REDIRECT REGISTRY: the registry caps live registrations, evicting the oldest as a unit
+{
+	auto reg = new InMemoryRedirectUriRegistry(2);
+	reg.register("h1", ["https://a/cb"]);
+	reg.register("h2", ["https://b/cb"]);
+	// Third registration exceeds the cap of 2: the oldest ("h1") is evicted whole.
+	reg.register("h3", ["https://c/cb"]);
+	assert(!reg.isRegistered("https://a/cb"));
+	assert(reg.isRegistered("https://b/cb"));
+	assert(reg.isRegistered("https://c/cb"));
+}
+
+unittest  // REDIRECT REGISTRY: a redirect_uri shared by two registrations survives evicting one
+{
+	auto reg = new InMemoryRedirectUriRegistry(2);
+	reg.register("h1", ["https://shared/cb"]);
+	reg.register("h2", ["https://shared/cb"]);
+	// Evict h1 by overflowing the cap; the shared URI is still held by h2.
+	reg.register("h3", ["https://other/cb"]);
+	assert(reg.isRegistered("https://shared/cb"));
+	assert(reg.isRegistered("https://other/cb"));
+}
+
+unittest  // REDIRECT REGISTRY: an oversized redirect_uris array is truncated at register time
+{
+	auto cfg = sampleConfig();
+	auto reg = new InMemoryRedirectUriRegistry();
+	auto proxy = new OAuthProxy(cfg, new InMemoryConsentStore(), reg);
+	string[] many;
+	foreach (i; 0 .. maxRedirectUrisPerRegistration + 5)
+		many ~= "https://app.example.com/cb" ~ cast(char)('0' + cast(int)(i % 10));
+	auto resp = proxy.register(many);
+	// The response echoes only the capped subset (RFC 7591 §3.2.1).
+	assert(resp["redirect_uris"].length == maxRedirectUrisPerRegistration);
+}
+
+unittest  // CONSENT STORE: the consent store caps approvals, evicting the oldest first
+{
+	auto store = new InMemoryConsentStore(2);
+	store.grantConsent("http://a/cb");
+	store.grantConsent("http://b/cb");
+	// Third approval exceeds the cap of 2: the oldest ("a") is evicted.
+	store.grantConsent("http://c/cb");
+	assert(!store.hasConsent("http://a/cb"));
+	assert(store.hasConsent("http://b/cb"));
+	assert(store.hasConsent("http://c/cb"));
+}
+
+unittest  // CONSENT STORE: re-granting an existing consent does not consume cap headroom
+{
+	auto store = new InMemoryConsentStore(2);
+	store.grantConsent("http://a/cb");
+	store.grantConsent("http://a/cb"); // duplicate: no new slot used
+	store.grantConsent("http://b/cb");
+	// "a" must still be present: the duplicate did not push it out of the cap.
+	assert(store.hasConsent("http://a/cb"));
+	assert(store.hasConsent("http://b/cb"));
 }
 
 unittest  // REDIRECT REGISTRY: a custom registry can be injected and is consulted by authorize
