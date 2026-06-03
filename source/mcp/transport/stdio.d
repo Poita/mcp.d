@@ -46,7 +46,7 @@ private __gshared bool _ranStdio;
 void serveStdio(McpServer server, string delegate() @safe readLine,
 		void delegate(string) @safe writeLine)
 {
-	import vibe.core.core : runTask;
+	import vibe.core.core : runTask, yield;
 	import vibe.data.json : Json;
 	import mcp.protocol.jsonrpc : Message, MessageKind;
 	import mcp.server.connection : ConnectionState;
@@ -59,6 +59,14 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	server.bindConnection(new ConnectionState);
 
 	DuplexChannel channel;
+
+	// Count of dispatched-but-not-yet-finished request handler tasks. Cooperative
+	// vibe tasks on one thread never preempt each other between yield points, so a
+	// plain counter (incremented before runTask, decremented in the handler's
+	// finally) needs no atomics. After the read loop ends at EOF we drain this to
+	// zero under a bounded grace period so an already-computed reply still flushes
+	// through channel.sendRaw before the loop tears down.
+	size_t inflight;
 
 	// The server->client write sink and request channel both go through the one
 	// serialized writer on `channel`.
@@ -89,6 +97,9 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			// Dispatch the request in its own task so a blocking/long-running handler
 			// (server->client request, cancellation poll loop) does not stall the
 			// read loop. The handler's notifications + reply ride `channel.send`.
+			// Track it as in-flight so EOF cannot abandon a handler that has computed
+			// its reply but not yet written it.
+			++inflight;
 			runTask((Message msg) nothrow{
 				try
 				{
@@ -98,6 +109,8 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 				catch (Exception)
 				{
 				}
+				finally
+					--inflight;
 			}, m);
 			break;
 		case MessageKind.notification:
@@ -117,6 +130,15 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 
 	channel = new DuplexChannel(readLine, writeLine, &onInbound);
 	channel.runReadLoop();
+
+	// The read loop has ended at stdin EOF. failPending (inside runReadLoop) already
+	// released any handler blocked in a server->client request, but a handler that
+	// has computed its reply still needs to be scheduled so its sendRaw runs. Yield
+	// until every dispatched handler task has finished, bounded so a handler stuck
+	// in unbounded local work cannot hold the process open forever.
+	enum size_t drainYields = 4096;
+	for (size_t i = 0; i < drainYields && inflight > 0; ++i)
+		yield();
 }
 
 /// Helper that dispatches one inbound stdio request through the server with a
@@ -869,6 +891,66 @@ unittest  // serveStdio stops at end-of-input (null line) after servicing pendin
 	// The read loop serviced the ping and then exited cleanly on EOF (the event
 	// loop returning is what lets us reach here).
 	assert(outCount == 1);
+}
+
+unittest  // a handler still running when stdin EOFs is drained: its reply is not dropped
+{
+	// Reproduces the EOF/in-flight race: a tool handler blocks until after stdin
+	// reaches EOF, then computes its reply. Without a drain after the read loop the
+	// reply task is never scheduled again and the response is silently lost.
+	auto s = new McpServer("eof-drain", "1.0");
+	auto release = createManualEvent();
+	auto entered = createManualEvent();
+	Tool slow = {name: "slow"};
+	s.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+		entered.emit();
+		auto ec = release.emitCount;
+		() @trusted { release.wait(ec); }();
+		CallToolResult r;
+		r.content = [Content.makeText("late")];
+		return r;
+	});
+
+	auto link = new ServerLink;
+	string[] outputs;
+	() @trusted {
+		runTask(() nothrow{
+			scope (exit)
+				exitEventLoop();
+			try
+				serveStdio(s, &link.readLine, &link.writeLine);
+			catch (Exception)
+			{
+			}
+		});
+		runTask(() nothrow{
+			try
+			{
+				link.feed(
+					`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}`);
+				// Wait until the handler is actually running, then EOF stdin while it
+				// is still blocked (reply not yet computed or written).
+				auto ec = entered.emitCount;
+				entered.wait(ec);
+				link.closeInput();
+				foreach (_; 0 .. 4)
+					yield();
+				// Now let the handler finish: its reply must still flush during the
+				// post-EOF drain rather than being abandoned.
+				release.emit();
+			}
+			catch (Exception)
+			{
+			}
+		});
+		runEventLoop();
+		outputs = link.outbound.dup;
+	}();
+
+	assert(outputs.length == 1, "the in-flight handler's reply must survive stdin EOF");
+	auto resp = parseJsonString(outputs[0]);
+	assert(resp["id"].get!int == 1);
+	assert(resp["result"]["content"][0]["text"].get!string == "late");
 }
 
 unittest  // a tool handler's ctx.log() is delivered as a notifications/message frame over stdio
