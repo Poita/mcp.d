@@ -1550,7 +1550,22 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		writeEvent(makeNotification("notifications/message", p));
 	}
 
-	Json sendRequest(string method, Json params) @safe
+	Json sampleRaw(Json params) @safe
+	{
+		return serverRequest("sampling/createMessage", params);
+	}
+
+	Json elicitRaw(Json params) @safe
+	{
+		return serverRequest("elicitation/create", params);
+	}
+
+	Json listRootsRaw() @safe
+	{
+		return serverRequest("roots/list", Json.emptyObject);
+	}
+
+	private Json serverRequest(string method, Json params) @safe
 	{
 		// A stateless server has NO shared state across HTTP calls.
 		// A server->client request (elicitation / sampling / roots / any
@@ -1585,27 +1600,9 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 				internalError("client disconnected before responding"));
 	}
 
-	bool clientSupports(string capability) @safe
+	bool clientSupports(ClientCapability cap) @safe
 	{
-		switch (capability)
-		{
-		case "sampling":
-			return clientCaps.sampling;
-		case "sampling.tools":
-			return clientCaps.samplingTools;
-		case "sampling.context":
-			return clientCaps.samplingContext;
-		case "elicitation":
-			return clientCaps.elicitation;
-		case "elicitation.form":
-			return clientCaps.elicitationForm;
-		case "elicitation.url":
-			return clientCaps.elicitationUrl;
-		case "roots":
-			return clientCaps.roots;
-		default:
-			return false;
-		}
+		return clientCaps.supports(cap);
 	}
 
 	// Per-request protocol state (statelessness, input responses) is supplied by
@@ -2405,7 +2402,7 @@ unittest  // a stateful HttpStreamContext does NOT gate sendRequest
 	bool gated;
 	void delegate() @safe nothrow initiator = () @safe nothrow{
 		try
-			ctx.sendRequest("elicitation/create", Json.emptyObject);
+			ctx.elicitRaw(Json.emptyObject);
 		catch (McpException e)
 		{
 			// A stateful context never throws the stateless-pointer message. It may
@@ -2464,7 +2461,7 @@ unittest  // a failed SSE write in sendRequest deregisters the coordinator waite
 
 	bool threw;
 	try
-		ctx.sendRequest("elicitation/create", Json.emptyObject);
+		ctx.elicitRaw(Json.emptyObject);
 	catch (Exception)
 		threw = true;
 	assert(threw, "a broken-pipe SSE write must propagate out of sendRequest");
