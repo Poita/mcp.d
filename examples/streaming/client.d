@@ -25,8 +25,8 @@
  * a `callTool` is in flight.
  *
  * Typed/ergonomic SDK APIs used here:
- *   - per-call progress sink: `callTool(name, args, RequestOptions(onProgress:))`
- *     delivers THIS call's progress to a local callback.
+ *   - per-call progress sink: `callTool(name, args, onProgress)` (the delegate
+ *     overload) delivers THIS call's progress to a local callback.
  *   - `result.structuredContentAs!T` decodes structured output into a struct.
  *   - typed `callTool(name, T args)` passes a struct for the static-shape calls.
  *   - `ElicitResult.accept(T)` / `CreateMessageResult.text(model, text)` build
@@ -254,10 +254,10 @@ private int phaseListProgressLogging(McpClient client, int steps) @safe
 	// and routes only its progress notifications to this callback for the
 	// duration of the call.
 	auto result = client.callTool("countdown", CountdownArgs(steps, 20),
-			RequestOptions(ProgressToken.init, "", (ProgressNotification n) @safe {
-				progress ~= ProgressUpdate(n.progress, n.total.isNull
-				? -1 : n.total.get, n.progressTokenString);
-			}));
+			(ProgressNotification n) @safe {
+		progress ~= ProgressUpdate(n.progress, n.total.isNull
+			? -1 : n.total.get, n.progressTokenString);
+	});
 
 	// Final structured result, decoded into the typed CountdownResult.
 	check(result.structuredContent.type == Json.Type.object, "result must carry structuredContent");
@@ -359,10 +359,10 @@ private int phaseCancellation(string url, int cancelledBefore) @trusted
 		// of being silently swallowed.
 		try
 			client.callTool("countdown", CountdownArgs(longSteps, 40),
-				RequestOptions(ProgressToken.init, "", (ProgressNotification) @safe {
-					sawFirstProgress = true;
-					progressCount++;
-				}));
+				(ProgressNotification) @safe {
+				sawFirstProgress = true;
+				progressCount++;
+			});
 		catch (Exception)
 		{
 			// Interrupt/disconnect aborts the in-flight read: the call ends abnormally.
