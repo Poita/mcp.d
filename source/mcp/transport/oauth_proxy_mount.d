@@ -516,15 +516,18 @@ private string formField(string form, string name) @safe
 private void exchangeUpstream(string endpoint, string body_, string authHeader,
 		out string responseBody, out int status) @trusted
 {
-	import vibe.http.client : requestHTTP, HTTPClientRequest, HTTPClientResponse;
+	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 	import vibe.stream.operations : readAllUTF8;
-	import mcp.auth.oauth : requireSecureUrl;
+	import mcp.auth.oauth : secureRequestHTTP;
 
-	requireSecureUrl(endpoint);
-
+	// Refuse to exchange over an insecure transport (must be https, or http to a
+	// loopback host for dev) or against an internal/link-local address. The connect
+	// is pinned to a pre-vetted resolved address (DNS-rebinding mitigation);
+	// secureRequestHTTP throws on an unsafe or unresolvable host, so the upstream
+	// client_secret cannot be steered to a rebinding-chosen internal target.
 	int st = 502;
 	string rb;
-	requestHTTP(endpoint, (scope HTTPClientRequest creq) {
+	secureRequestHTTP(endpoint, (scope HTTPClientRequest creq) {
 		creq.method = HTTPMethod.POST;
 		creq.headers["Content-Type"] = "application/x-www-form-urlencoded";
 		creq.headers["Accept"] = "application/json";
@@ -763,6 +766,19 @@ unittest  // exchangeUpstream refuses a plaintext (non-loopback) upstream endpoi
 	string rb;
 	int st;
 	assertThrown(exchangeUpstream("http://upstream.example.com/token", "grant_type=x", "", rb, st));
+}
+
+unittest  // exchangeUpstream fails CLOSED for an https host that cannot be resolved
+{
+	import std.exception : assertThrown;
+
+	// A lexical-only guard accepts this https host; the resolve-and-pin connector
+	// rejects it because it does not resolve, so the upstream client_secret is
+	// never sent to an un-vetted target.
+	string rb;
+	int st;
+	assertThrown(exchangeUpstream("https://nonexistent-host.invalid/token",
+			"grant_type=x", "Basic c2VjcmV0", rb, st));
 }
 
 unittest  // constructing a proxy with a plaintext upstream endpoint fails closed
