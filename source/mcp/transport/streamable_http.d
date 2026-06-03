@@ -1253,6 +1253,7 @@ unittest  // the standalone GET SSE stream uses the same session gate as POST/DE
 /// modern-vs-legacy servers — can act without parsing the body:
 ///   - `UnsupportedProtocolVersionError` (-32004) -> `400` (all modern versions),
 ///   - `HeaderMismatch` (-32001) -> `400`,
+///   - `MissingRequiredClientCapability` (-32003) -> `400` (all modern versions),
 ///   - `Method not found` (-32601) -> `404` on draft requests, which lets a client
 ///     tell a modern MCP endpoint apart from a legacy HTTP+SSE `404`. Pre-draft
 ///     versions keep the legacy JSON-RPC-error-over-`200` shape.
@@ -1264,7 +1265,8 @@ int httpStatusForResponse(Json resp, bool isDraft) @safe
 	if ("code" !in err || err["code"].type != Json.Type.int_)
 		return 200;
 	const code = err["code"].get!int;
-	if (code == ErrorCode.unsupportedProtocolVersion || code == ErrorCode.headerMismatch)
+	if (code == ErrorCode.unsupportedProtocolVersion || code == ErrorCode.headerMismatch
+			|| code == ErrorCode.missingRequiredClientCapability)
 		return 400;
 	if (isDraft && code == ErrorCode.methodNotFound)
 		return 404;
@@ -2316,6 +2318,13 @@ unittest  // HeaderMismatch maps to HTTP 400
 {
 	auto r = errResponse(ErrorCode.headerMismatch);
 	assert(httpStatusForResponse(r, true) == 400);
+}
+
+unittest  // MissingRequiredClientCapability maps to HTTP 400 on any modern version
+{
+	auto r = errResponse(ErrorCode.missingRequiredClientCapability);
+	assert(httpStatusForResponse(r, true) == 400);
+	assert(httpStatusForResponse(r, false) == 400);
 }
 
 unittest  // draft Method-not-found maps to HTTP 404 (distinguishes modern endpoint from legacy)
