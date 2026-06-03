@@ -226,17 +226,32 @@ template isFlatElicitationStruct(T)
 		enum isFlatElicitationStruct = false;
 }
 
-/// True when field `i` of struct `T` declares an explicit non-`.init` default
-/// initialiser, so it may be omitted from a JSON payload and is therefore not
-/// listed in `required`.
+/// True when field `i` of struct `T` carries a declared default, so it may be
+/// omitted from a JSON payload and is therefore not listed in `required`. A
+/// field counts as defaulted when it carries a `@schemaDefault` UDA (an explicit
+/// presence test, observable even when the value equals the type's `.init`) or
+/// when its declared initialiser differs from the type's `.init`. D exposes no
+/// trait distinguishing `int x = 0;` from `int x;` once the value equals `.init`,
+/// so the value comparison is the closest available signal for the latter case;
+/// `@schemaDefault` is the way to mark such a field optional unambiguously.
 private template hasFieldDefault(T, size_t i)
 {
+	import mcp.api.attributes : SchemaDefault;
+	import std.traits : hasUDA;
+
 	alias FT = typeof(T.tupleof[i]);
-	enum readableAtCompileTime = __traits(compiles, { enum d = T.init.tupleof[i]; });
-	static if (readableAtCompileTime)
-		enum hasFieldDefault = T.init.tupleof[i] != FT.init;
+	static if (hasUDA!(T.tupleof[i], SchemaDefault))
+		enum hasFieldDefault = true;
 	else
-		enum hasFieldDefault = false;
+	{
+		enum readableAtCompileTime = __traits(compiles, {
+				enum d = T.init.tupleof[i];
+			});
+		static if (readableAtCompileTime)
+			enum hasFieldDefault = T.init.tupleof[i] != FT.init;
+		else
+			enum hasFieldDefault = false;
+	}
 }
 
 /// Validate a JSON `value` against a JSON Schema `schema` (a schema document of
@@ -935,6 +950,71 @@ unittest  // struct fields with a declared default are optional, not required
 	auto s = jsonSchemaOf!Options;
 	assert(s["required"].length == 1);
 	assert(s["required"][0].get!string == "required");
+}
+
+unittest  // a @schemaDefault field is optional even when no D initialiser is present
+{
+	import mcp.api.attributes : schemaDefault;
+
+	struct Form
+	{
+		int required;
+		@schemaDefault(false) bool verbose;
+		@schemaDefault(10) int limit;
+	}
+
+	auto s = jsonSchemaOf!Form;
+	assert(s["required"].length == 1);
+	assert(s["required"][0].get!string == "required");
+}
+
+unittest  // a @schemaDefault field is optional even when its value equals .init
+{
+	import mcp.api.attributes : schemaDefault;
+
+	struct Form
+	{
+		@schemaDefault(0) int limit = 0;
+		@schemaDefault(false) bool flag = false;
+		@schemaDefault("") string note = "";
+	}
+
+	auto s = jsonSchemaOf!Form;
+	assert("required" !in s);
+}
+
+unittest  // a @schemaDefault enum field carrying its .init member is optional
+{
+	import mcp.api.attributes : schemaDefault;
+
+	enum Cabin
+	{
+		economy,
+		business
+	}
+
+	struct Form
+	{
+		string destination;
+		@schemaDefault(Cabin.economy) Cabin cabin = Cabin.economy;
+	}
+
+	auto s = jsonSchemaOf!Form;
+	assert(s["required"].length == 1);
+	assert(s["required"][0].get!string == "destination");
+}
+
+unittest  // without @schemaDefault, a field defaulted to .init stays required
+{
+	struct Form
+	{
+		int limit = 0;
+		bool flag = false;
+		string note = "";
+	}
+
+	auto s = jsonSchemaOf!Form;
+	assert(s["required"].length == 3);
 }
 
 unittest  // unsupported types fail to compile (no silent string fallback)
