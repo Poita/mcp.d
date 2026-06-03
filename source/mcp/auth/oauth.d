@@ -596,9 +596,135 @@ bool isValidClientIdMetadataUrl(string clientId) @safe pure nothrow @nogc
 	return slash + 1 < rest.length;
 }
 
+/// Canonicalize a bare all-numeric IPv4 authority host into four octets using
+/// `inet_aton` rules so that alternate encodings cannot slip past the SSRF
+/// guard. Accepts 1-4 parts where each part may be decimal, octal (`0`-prefix)
+/// or hex (`0x`-prefix); a short form lets the final part absorb the remaining
+/// low bytes (1 part = 32 bits, 2 parts = a.(24 bits), 3 parts = a.b.(16 bits)).
+/// Returns true and fills `outOct` only when the whole host is such a literal;
+/// returns false for any host that is not a pure numeric IPv4 literal (e.g. a
+/// registered hostname), which the caller treats as "not an IP literal".
+/// `@safe pure nothrow @nogc`.
+private bool canonicalizeNumericIpv4(string host, out ubyte[4] outOct) @safe pure nothrow @nogc
+{
+	if (host.length == 0)
+		return false;
+
+	// Parse 1-4 dot-separated parts, each decimal/octal/hex.
+	ulong[4] part;
+	size_t parts;
+	size_t i;
+	while (i < host.length)
+	{
+		if (parts >= 4)
+			return false;
+		ulong v;
+		size_t digits;
+		if (i + 1 < host.length && host[i] == '0' && (host[i + 1] == 'x' || host[i + 1] == 'X'))
+		{
+			// Hex part.
+			i += 2;
+			while (i < host.length)
+			{
+				const ch = host[i];
+				uint d;
+				if (ch >= '0' && ch <= '9')
+					d = cast(uint)(ch - '0');
+				else if (ch >= 'a' && ch <= 'f')
+					d = cast(uint)(ch - 'a' + 10);
+				else if (ch >= 'A' && ch <= 'F')
+					d = cast(uint)(ch - 'A' + 10);
+				else
+					break;
+				v = v * 16 + d;
+				if (v > 0xFFFF_FFFFUL)
+					return false;
+				i++;
+				digits++;
+			}
+		}
+		else if (host[i] == '0' && i + 1 < host.length && host[i + 1] >= '0'
+				&& host[i + 1] <= '7' && !(i + 1 < host.length && host[i + 1] == '.'))
+		{
+			// Octal part (leading 0 followed by octal digits).
+			i++; // skip leading 0
+			digits++;
+			while (i < host.length && host[i] >= '0' && host[i] <= '7')
+			{
+				v = v * 8 + cast(uint)(host[i] - '0');
+				if (v > 0xFFFF_FFFFUL)
+					return false;
+				i++;
+				digits++;
+			}
+			// A non-octal digit (8/9) inside an octal part is not a valid literal.
+			if (i < host.length && host[i] >= '0' && host[i] <= '9')
+				return false;
+		}
+		else
+		{
+			// Decimal part.
+			while (i < host.length && host[i] >= '0' && host[i] <= '9')
+			{
+				v = v * 10 + cast(uint)(host[i] - '0');
+				if (v > 0xFFFF_FFFFUL)
+					return false;
+				i++;
+				digits++;
+			}
+		}
+		if (digits == 0)
+			return false; // empty part -> not a numeric literal
+		part[parts++] = v;
+		if (i < host.length)
+		{
+			if (host[i] != '.')
+				return false; // trailing junk -> not a numeric literal
+			i++;
+			if (i == host.length)
+				return false; // trailing dot
+		}
+	}
+	if (parts == 0)
+		return false;
+
+	// Combine parts per inet_aton short-form rules into a 32-bit address.
+	ulong addr;
+	final switch (parts)
+	{
+	case 1:
+		addr = part[0];
+		break;
+	case 2:
+		if (part[0] > 0xFF || part[1] > 0x00FF_FFFF)
+			return false;
+		addr = (part[0] << 24) | part[1];
+		break;
+	case 3:
+		if (part[0] > 0xFF || part[1] > 0xFF || part[2] > 0xFFFF)
+			return false;
+		addr = (part[0] << 24) | (part[1] << 16) | part[2];
+		break;
+	case 4:
+		if (part[0] > 0xFF || part[1] > 0xFF || part[2] > 0xFF || part[3] > 0xFF)
+			return false;
+		addr = (part[0] << 24) | (part[1] << 16) | (part[2] << 8) | part[3];
+		break;
+	}
+	if (addr > 0xFFFF_FFFFUL)
+		return false;
+	outOct[0] = cast(ubyte)((addr >> 24) & 0xFF);
+	outOct[1] = cast(ubyte)((addr >> 16) & 0xFF);
+	outOct[2] = cast(ubyte)((addr >> 8) & 0xFF);
+	outOct[3] = cast(ubyte)(addr & 0xFF);
+	return true;
+}
+
 /// The set of explicit loopback hosts permitted over plaintext `http` for
 /// local development (MCP loopback redirect URIs, locally-hosted dev auth
-/// servers). Any other host MUST use `https`.
+/// servers). Any other host MUST use `https`. Numeric encodings of the loopback
+/// address (e.g. `127.1`, `2130706433`, `0x7f000001`) are canonicalized so they
+/// are recognized rather than slipping through as opaque hostnames.
 private bool isLoopbackHost(string host) @safe pure nothrow @nogc
 {
 	// Strip an optional port suffix (host:port). IPv6 literals are bracketed.
@@ -616,14 +742,23 @@ private bool isLoopbackHost(string host) @safe pure nothrow @nogc
 		if (colon >= 0)
 			host = host[0 .. colon];
 	}
-	return host == "localhost" || host == "127.0.0.1" || host == "::1";
+	if (host == "localhost" || host == "::1")
+		return true;
+	// Treat any numeric encoding that canonicalizes into 127.0.0.0/8 as loopback
+	// (covers 127.0.0.1, 127.1, 2130706433, 0x7f000001, 0177.0.0.1, ...).
+	ubyte[4] oct;
+	if (canonicalizeNumericIpv4(host, oct))
+		return oct[0] == 127;
+	return false;
 }
 
 /// Reject a private/link-local IPv4 literal host to close the SSRF /
 /// DNS-rebinding vector the MCP authorization spec calls out (e.g. the cloud
 /// metadata service at 169.254.169.254, RFC 1918 ranges). Returns true when the
 /// host is a private/link-local IPv4 *literal* that is not an explicit loopback
-/// (loopback is handled separately and permitted for dev).
+/// (loopback is handled separately and permitted for dev). Numeric encodings
+/// (decimal-integer, octal, hex and inet_aton short forms such as `0x7f000001`
+/// or `2852039166`) are canonicalized first so they cannot bypass the filter.
 private bool isPrivateIpv4Literal(string host) @safe pure nothrow @nogc
 {
 	import std.string : indexOf;
@@ -633,56 +768,14 @@ private bool isPrivateIpv4Literal(string host) @safe pure nothrow @nogc
 	if (colon >= 0)
 		host = host[0 .. colon];
 
-	// Parse up to four dotted decimal octets; bail (treat as non-literal) on
-	// anything that is not a clean a.b.c.d IPv4 literal.
-	uint[4] oct;
-	size_t idx;
-	size_t i;
-	while (i < host.length)
-	{
-		uint v;
-		size_t digits;
-		while (i < host.length && host[i] >= '0' && host[i] <= '9')
-		{
-			v = v * 10 + cast(uint)(host[i] - '0');
-			if (v > 255)
-				return false;
-			i++;
-			digits++;
-		}
-		if (digits == 0)
-			return false; // not a numeric octet -> not an IPv4 literal
-		if (idx >= 4)
-			return false;
-		oct[idx++] = v;
-		if (i < host.length)
-		{
-			if (host[i] != '.')
-				return false;
-			i++;
-		}
-	}
-	if (idx != 4)
-		return false;
-	// 127.0.0.0/8 loopback (handled/permitted elsewhere) -> not flagged here.
+	ubyte[4] oct;
+	if (!canonicalizeNumericIpv4(host, oct))
+		return false; // not a numeric IPv4 literal in any encoding
+
+	// 127.0.0.0/8 loopback is handled/permitted by isLoopbackHost; not flagged here.
 	if (oct[0] == 127)
 		return false;
-	// 10.0.0.0/8
-	if (oct[0] == 10)
-		return true;
-	// 172.16.0.0/12
-	if (oct[0] == 172 && oct[1] >= 16 && oct[1] <= 31)
-		return true;
-	// 192.168.0.0/16
-	if (oct[0] == 192 && oct[1] == 168)
-		return true;
-	// 169.254.0.0/16 link-local (incl. cloud metadata 169.254.169.254)
-	if (oct[0] == 169 && oct[1] == 254)
-		return true;
-	// 0.0.0.0/8 "this host"
-	if (oct[0] == 0)
-		return true;
-	return false;
+	return isUnsafeIpv4Octets(oct[0], oct[1], oct[2], oct[3]);
 }
 
 /// Parse an IPv6 literal (the inner text of a bracketed host, with any zone-id
@@ -935,8 +1028,15 @@ private bool isUnsafeIpv4Octets(ubyte a, ubyte b, ubyte c, ubyte d) @safe pure n
 /// scheme, OR target an explicit loopback host (`localhost`, `127.0.0.1`,
 /// `[::1]`) over `http` for local development. Plaintext `http` to any other
 /// host is rejected, as are URLs whose host is a private/link-local IPv4 or
-/// IPv6 literal — including IPv4-mapped/compatible IPv6 (SSRF / DNS-rebinding
-/// mitigation, e.g. 169.254.169.254 / RFC 1918, fc00::/7, fe80::/10).
+/// IPv6 literal — including alternate numeric IPv4 encodings (decimal/octal/hex
+/// and inet_aton short forms) and IPv4-mapped/compatible IPv6 (SSRF / DNS-
+/// rebinding mitigation, e.g. 169.254.169.254 / RFC 1918, fc00::/7, fe80::/10).
+///
+/// This guard is purely lexical: it inspects the host as written and does not
+/// perform DNS resolution. A registered hostname that resolves to an internal
+/// address (e.g. an attacker-controlled name pointing at 169.254.169.254) is
+/// NOT covered here; mitigating that residual TOCTOU requires resolving and
+/// pinning the address at connect time and is out of this function's scope.
 bool isSecureFetchUrl(string url) @safe pure nothrow @nogc
 {
 	import std.string : indexOf;
@@ -1101,6 +1201,81 @@ unittest  // isSecureFetchUrl still accepts a public host carrying userinfo
 	assert(isSecureFetchUrl("https://user@public.example.com/"));
 	assert(isSecureFetchUrl("https://user:pass@as.example.com/token"));
 	assert(isSecureFetchUrl("https://user@[2606:4700:4700::1111]/x"));
+}
+
+unittest  // isSecureFetchUrl treats numeric loopback encodings as loopback (https + dev http)
+{
+	// 127.0.0.0/8 is loopback in any encoding: https is always allowed, and so is
+	// plaintext http (the dev-loopback exception), matching plain 127.0.0.1.
+	assert(isSecureFetchUrl("https://2130706433/x")); // 127.0.0.1
+	assert(isSecureFetchUrl("https://127.1/x")); // short form of 127.0.0.1
+	assert(isSecureFetchUrl("https://0x7f000001/x")); // hex 127.0.0.1
+	assert(isSecureFetchUrl("https://0177.0.0.1/x")); // octal-leading 127.0.0.1
+}
+
+unittest  // isSecureFetchUrl rejects numeric encodings of the cloud metadata address (SSRF)
+{
+	assert(!isSecureFetchUrl("https://0xa9fea9fe/latest/meta-data")); // 169.254.169.254
+	assert(!isSecureFetchUrl("https://2852039166/latest/meta-data")); // 169.254.169.254
+	assert(!isSecureFetchUrl("https://169.254.169.254/latest/meta-data"));
+}
+
+unittest  // isSecureFetchUrl rejects octal/hex encodings of RFC1918 ranges (SSRF)
+{
+	assert(!isSecureFetchUrl("https://0xa000005/x")); // 10.0.0.5
+	assert(!isSecureFetchUrl("https://192.0xa8.0.1/x")); // 192.168.0.1 mixed
+	assert(!isSecureFetchUrl("https://10.0/x")); // short form 10.0.0.0
+}
+
+unittest  // isSecureFetchUrl permits http loopback via numeric encodings (dev)
+{
+	assert(isSecureFetchUrl("http://2130706433/jwks")); // 127.0.0.1
+	assert(isSecureFetchUrl("http://127.1/jwks"));
+	assert(isSecureFetchUrl("http://0x7f000001/jwks"));
+}
+
+unittest  // isSecureFetchUrl still accepts genuine public numeric IPv4 literals
+{
+	assert(isSecureFetchUrl("https://8.8.8.8/x"));
+	assert(isSecureFetchUrl("https://1.1.1.1/x"));
+}
+
+unittest  // canonicalizeNumericIpv4 rejects non-numeric / malformed hosts (treated as hostnames)
+{
+	ubyte[4] oct;
+	assert(!canonicalizeNumericIpv4("metadata.attacker.example", oct));
+	assert(!canonicalizeNumericIpv4("example.com", oct));
+	assert(!canonicalizeNumericIpv4("1.2.3.4.5", oct)); // too many parts
+	assert(!canonicalizeNumericIpv4("256.0.0.1", oct)); // octet overflow in 4-part form
+	assert(!canonicalizeNumericIpv4("0x", oct)); // empty hex
+	assert(!canonicalizeNumericIpv4("1..2", oct)); // empty part
+	assert(!canonicalizeNumericIpv4("0192.168.0.1", oct)); // 9 is not an octal digit
+}
+
+unittest  // canonicalizeNumericIpv4 decodes the documented inet_aton forms
+{
+	ubyte[4] oct;
+	assert(canonicalizeNumericIpv4("2130706433", oct) && oct == cast(ubyte[4])[
+		127, 0, 0, 1
+	]);
+	assert(canonicalizeNumericIpv4("0x7f000001", oct) && oct == cast(ubyte[4])[
+		127, 0, 0, 1
+	]);
+	assert(canonicalizeNumericIpv4("0177.0.0.1", oct) && oct == cast(ubyte[4])[
+		127, 0, 0, 1
+	]);
+	assert(canonicalizeNumericIpv4("127.1", oct) && oct == cast(ubyte[4])[
+		127, 0, 0, 1
+	]);
+	assert(canonicalizeNumericIpv4("0xa9fea9fe", oct) && oct == cast(ubyte[4])[
+		169, 254, 169, 254
+	]);
+	assert(canonicalizeNumericIpv4("2852039166", oct) && oct == cast(ubyte[4])[
+		169, 254, 169, 254
+	]);
+	assert(canonicalizeNumericIpv4("8.8.8.8", oct) && oct == cast(ubyte[4])[
+		8, 8, 8, 8
+	]);
 }
 
 unittest  // requireSecureUrl throws on an insecure URL and passes a secure one
