@@ -327,7 +327,7 @@ private Json outputSchemaOf(R)() @safe
 /// result mirrors `outputSchemaOf!R`: structs serialize to an object; scalars,
 /// arrays, and enums are wrapped under a `result` key; strings become text
 /// content with no structured output.
-private CallToolResult toToolResult(R)(R ret) @safe
+private CallToolResult toToolResult(R)(R ret) @safe if (!is(R == void))
 {
 	static if (is(R == CallToolResult))
 		return ret;
@@ -523,6 +523,12 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		// return type is wrapped into a CallToolResult.
 		static if (is(ReturnType!overload == ToolResponse))
 			return __traits(getMember, parent, memberName)(argv.expand);
+		else static if (is(ReturnType!overload == void))
+		{
+			__traits(getMember, parent, memberName)(argv.expand);
+			CallToolResult empty;
+			return empty;
+		}
 		else
 			return toToolResult(__traits(getMember, parent, memberName)(argv.expand));
 	});
@@ -928,6 +934,58 @@ unittest  // @tool reflection: string return becomes text content
 	p["arguments"] = Json(["name": Json("Sam")]);
 	auto r = s.handle(Message(makeRequest(Json(3), "tools/call", p))).get;
 	assert(r["result"]["content"][0]["text"].get!string == "Hello, Sam!");
+}
+
+unittest  // @tool reflection: a void-returning tool compiles, registers, and dispatches
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	static final class VoidApi
+	{
+		string lastCommand;
+
+		@tool("doThing", "Perform a side-effecting command")
+		void doThing(string what) @safe
+		{
+			lastCommand = what;
+		}
+	}
+
+	auto api = new VoidApi;
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, api);
+
+	// The void tool is registered like any other.
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	assert(tools.length == 1);
+	assert(tools[0]["name"].get!string == "doThing");
+
+	// Dispatching invokes the method and returns an empty, non-error result.
+	Json p = Json.emptyObject;
+	p["name"] = "doThing";
+	p["arguments"] = Json(["what": Json("erase")]);
+	auto r = s.handle(Message(makeRequest(Json(7), "tools/call", p))).get;
+	assert(api.lastCommand == "erase");
+	assert(("error" in r) is null);
+	assert(r["result"]["content"].length == 0);
+	assert(("structuredContent" in r["result"]) is null);
+}
+
+unittest  // @tool reflection: a void-returning tool advertises no outputSchema
+{
+	static final class VoidSchemaApi
+	{
+		@tool("noop", "Does nothing observable")
+		void noop() @safe
+		{
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new VoidSchemaApi);
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	assert(tools.length == 1);
+	assert(("outputSchema" in tools[0]) is null);
 }
 
 unittest  // @tool reflection: enum param schema + optional Nullable param
