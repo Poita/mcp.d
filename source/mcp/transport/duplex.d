@@ -196,7 +196,16 @@ final class DuplexChannel
 	/// line framing holds and only a valid MCP message is written.
 	void send(Json message) @safe
 	{
-		const text = message.toString();
+		sendRaw(message.toString());
+	}
+
+	/// Write an already-serialized JSON-RPC line as a single newline-delimited line,
+	/// serialized against concurrent writers. Used by callers that already hold the
+	/// serialized text (the stdio server sink and reply path) so the line is not
+	/// parsed back to `Json` only to be re-serialized. The caller is responsible for
+	/// the text being one valid MCP message with no embedded newline.
+	void sendRaw(string text) @safe
+	{
 		writeMutex.lock();
 		scope (exit)
 			writeMutex.unlock();
@@ -620,6 +629,34 @@ unittest  // close() wakes a pending deliver() and is idempotent
 	});
 	runEventLoop();
 	assert(threw, "close() must wake a pending deliver() with a channel-closed error");
+}
+
+unittest  // sendRaw() writes the already-serialized line verbatim, without a parse+reserialize round-trip
+{
+	// A line whose byte form is not canonical JSON (extra spaces, distinct key
+	// order) must reach the writer EXACTLY as given; a parse->reserialize path would
+	// normalize it and change the bytes.
+	enum raw = `{"jsonrpc":"2.0",  "id":1,  "method":"ping"}`;
+	string written;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			string delegate() @safe nullRead = () @safe {
+				return cast(string) null;
+			};
+			auto channel = new DuplexChannel(nullRead, (string s) @safe {
+				written = s;
+			}, (Message) @safe {});
+			channel.sendRaw(raw);
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(written == raw, "sendRaw must write the line verbatim, not re-serialize it");
 }
 
 unittest  // deliver() after close() fails fast

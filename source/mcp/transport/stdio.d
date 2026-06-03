@@ -64,7 +64,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	// serialized writer on `channel`.
 	void sink(string line) @safe
 	{
-		channel.send(parseToJson(line));
+		channel.sendRaw(line);
 	}
 
 	Json serverRequest(string method, Json params) @safe
@@ -145,18 +145,8 @@ private final class StdioContextFactoryReply
 	{
 		auto reply = server.handleRaw(msg.raw.toString(), sink, serverRequest);
 		if (reply.length)
-			channel.send(parseToJson(reply));
+			channel.sendRaw(reply);
 	}
-}
-
-/// Parse a serialized JSON-RPC line back into a `Json` for the channel's
-/// serialized writer (which takes a `Json` and re-serializes it). Cheap and keeps
-/// `serveStdio`'s sink symmetric with `DuplexChannel.send`.
-private Json parseToJson(string line) @safe
-{
-	import vibe.data.json : parseJsonString;
-
-	return parseJsonString(line);
 }
 
 /// Serve `server` over the process's standard input/output: read JSON-RPC
