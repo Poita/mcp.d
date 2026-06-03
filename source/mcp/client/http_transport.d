@@ -13,6 +13,7 @@ import vibe.stream.wrapper : ProxyStream, createProxyStream;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
+import mcp.protocol.draft : isHeaderValueUnsafe;
 import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.subscription : SubscriptionStream;
 
@@ -29,6 +30,66 @@ final class LegacyFallbackException : Exception
 		super("legacy HTTP+SSE fallback (HTTP " ~ status.to!string ~ ")");
 		this.status = status;
 	}
+}
+
+/// A handle to the live socket of a `subscriptions/listen` background stream,
+/// shared between the stream's task (which `attach`es its socket once connected)
+/// and the `SubscriptionStream.onCancel` delegate (which `closeSocket`s it). A
+/// blocked `readLine`/`conn.read` on the parked stream returns immediately once
+/// the socket is closed, so cancellation tears the connection down promptly
+/// rather than waiting for the next server event.
+private final class ListenSocketSlot
+{
+	import vibe.core.net : TCPConnection;
+
+	private TCPConnection sock;
+	private bool open;
+
+	/// Record the connected socket. If a cancel already arrived (`closeSocket`
+	/// ran before the task connected), close immediately.
+	void attach(TCPConnection s) @trusted nothrow
+	{
+		if (closed)
+		{
+			try
+				s.close();
+			catch (Exception)
+			{
+			}
+			return;
+		}
+		sock = s;
+		open = true;
+	}
+
+	private bool closed;
+
+	/// Force-close the socket (idempotent). Safe to call before `attach`: it sets
+	/// a flag so the subsequent `attach` closes the socket on arrival.
+	void closeSocket() @trusted nothrow
+	{
+		closed = true;
+		if (open)
+		{
+			open = false;
+			try
+				sock.close();
+			catch (Exception)
+			{
+			}
+		}
+	}
+}
+
+/// A single in-flight legacy (2024-11-05) request's response slot, owned by the
+/// `legacyRpc` call that registered it under its request id. The legacy GET-SSE
+/// reader fills `result`/`err` and sets `got` on the matching id; any unmatched
+/// message falls through to the inbound dispatcher.
+private struct LegacyWaiter
+{
+	Json result;
+	McpException err;
+	bool got;
 }
 
 /// A `ClientTransport` over the MCP Streamable HTTP transport.
@@ -60,12 +121,26 @@ final class HttpClientTransport : ClientTransport
 	// The most recent HTTP status seen on a POST, so the lifecycle code can
 	// detect the 400/404/405 backward-compatibility trigger.
 	private int lastPostStatus;
-	// When awaiting a legacy response on the GET stream, the id we expect and
-	// the slot the GET-stream reader fills in.
-	private long legacyExpectId;
-	private Json legacyResult;
-	private bool legacyGot;
-	private McpException legacyErr;
+	// Per-request waiters for responses arriving on the legacy GET SSE stream,
+	// keyed by request id. Each in-flight `legacyRpc` registers a waiter and polls
+	// its own slot, so overlapping or reentrant legacy requests never clobber one
+	// another's response (the modern path is already per-call by ref locals).
+	private LegacyWaiter*[long] legacyWaiters;
+	// Set when a oneway send (notification / server->client reply) is rejected
+	// with a session-gone status (404/410): the session no longer exists, so the
+	// next request `deliver()` throws a clear "session expired" error rather than
+	// silently issuing requests under a dead session.
+	private bool sessionExpired;
+	// Set by `close()` to ask the background stream readers to stop between reads;
+	// the held sockets are closed so a blocked read returns immediately.
+	private shared(bool) closeRequested;
+	// Live sockets for the spawned server / legacy background streams, closed by
+	// `close()` so a parked `conn.read` unblocks. Guarded for @safe access only on
+	// the owning event loop.
+	private TCPConnection serverStreamSock;
+	private bool serverStreamSockOpen;
+	private TCPConnection legacyStreamSock;
+	private bool legacyStreamSockOpen;
 
 	/// Inbound dispatcher installed by `McpClient` (its `dispatchInbound`),
 	/// invoked for notifications and server->client requests on any stream.
@@ -106,10 +181,37 @@ final class HttpClientTransport : ClientTransport
 		return legacyMode;
 	}
 
+	/// Stop the transport: signal the background stream readers
+	/// (server->client, legacy GET) to stop between reads and force-close their
+	/// held sockets so any blocked `conn.read` unblocks immediately, terminating
+	/// the spawned tasks. A `subscriptions/listen` stream is owned by its
+	/// `SubscriptionStream` handle and torn down through `cancel()`.
 	void close() @safe
 	{
-		// Streams run on background tasks tied to the event loop; there is no
-		// owned subprocess to terminate. Nothing to release here.
+		() @trusted {
+			import core.atomic : atomicStore;
+
+			atomicStore(closeRequested, true);
+		}();
+		if (serverStreamSockOpen)
+		{
+			serverStreamSockOpen = false;
+			() @trusted { serverStreamSock.close(); }();
+		}
+		if (legacyStreamSockOpen)
+		{
+			legacyStreamSockOpen = false;
+			() @trusted { legacyStreamSock.close(); }();
+		}
+	}
+
+	private bool closing() @safe
+	{
+		return () @trusted {
+			import core.atomic : atomicLoad;
+
+			return atomicLoad(closeRequested);
+		}();
 	}
 
 	private string[string] requestHeaders(Json message) @safe
@@ -119,6 +221,9 @@ final class HttpClientTransport : ClientTransport
 
 	Json deliver(Json message, long expectId) @safe
 	{
+		if (sessionExpired)
+			throw internalError(
+					"MCP session expired (server rejected a prior request with HTTP 404/410)");
 		if (legacyMode)
 			return legacyRpc(message, expectId);
 		return postAndAwait(message, expectId);
@@ -145,14 +250,31 @@ final class HttpClientTransport : ClientTransport
 	/// In legacy HTTP+SSE mode, messages go to the server-supplied endpoint URI.
 	private void post(Json message) @safe
 	{
+		import std.conv : to;
+
 		const target = legacyMode ? legacyEndpoint : url;
+		int status;
 		() @trusted {
 			requestHTTP(target, (scope HTTPClientRequest req) {
 				setupRequest(req, message);
 			}, (scope HTTPClientResponse res) {
 				captureSession(res);
+				status = res.statusCode;
 				res.dropBody();
 			});
+		}();
+		lastPostStatus = status;
+		// A oneway send carries no awaited reply, so a rejection would otherwise be
+		// invisible: 404/410 means the session is gone (mark it so the next request
+		// surfaces a clear error); any other non-2xx is logged so the rejection is
+		// at least observable.
+		if (status == 404 || status == 410)
+			sessionExpired = true;
+		else if (status != 0 && (status < 200 || status >= 300))
+			() @trusted {
+			import vibe.core.log : logWarn;
+
+			logWarn("MCP oneway HTTP send rejected with status %d", status);
 		}();
 	}
 
@@ -254,7 +376,8 @@ final class HttpClientTransport : ClientTransport
 				if (sessionId.length)
 					req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
 				foreach (k, v; hdrs)
-					req ~= k ~ ": " ~ v ~ "\r\n";
+					if (!isHeaderValueUnsafe(v))
+						req ~= k ~ ": " ~ v ~ "\r\n";
 				if (pendingLastEventId.length)
 					req ~= "Last-Event-ID: " ~ pendingLastEventId ~ "\r\n";
 				req ~= "Content-Length: " ~ payload.length.to!string ~ "\r\n\r\n";
@@ -515,7 +638,8 @@ final class HttpClientTransport : ClientTransport
 				if (sessionId.length)
 					req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
 				foreach (k, v; verHeaders)
-					req ~= k ~ ": " ~ v ~ "\r\n";
+					if (!isHeaderValueUnsafe(v))
+						req ~= k ~ ": " ~ v ~ "\r\n";
 				if (lastEventId.length)
 					req ~= "Last-Event-ID: " ~ lastEventId ~ "\r\n";
 				req ~= "\r\n";
@@ -648,7 +772,8 @@ final class HttpClientTransport : ClientTransport
 		if (sessionId.length)
 			req.headers["Mcp-Session-Id"] = sessionId;
 		foreach (k, v; requestHeaders(message))
-			req.headers[k] = v;
+			if (!isHeaderValueUnsafe(v))
+				req.headers[k] = v;
 		if (pendingLastEventId.length)
 			req.headers["Last-Event-ID"] = pendingLastEventId;
 		req.writeBody(cast(const(ubyte)[]) message.toString());
@@ -817,13 +942,20 @@ final class HttpClientTransport : ClientTransport
 		long retryMs = 0;
 		foreach (attempt; 0 .. 2)
 		{
+			if (closing)
+				break;
 			bool sawData;
 			() @trusted {
 				try
 				{
 					auto sock = connectTCP(host, port);
+					serverStreamSock = sock;
+					serverStreamSockOpen = true;
 					scope (exit)
+					{
+						serverStreamSockOpen = false;
 						sock.close();
+					}
 					// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 					auto conn = openClientStream(sock, ep.tls, host);
 
@@ -832,7 +964,8 @@ final class HttpClientTransport : ClientTransport
 					if (sessionId.length)
 						req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
 					foreach (k, v; verHeaders)
-						req ~= k ~ ": " ~ v ~ "\r\n";
+						if (!isHeaderValueUnsafe(v))
+							req ~= k ~ ": " ~ v ~ "\r\n";
 					if (lastEventId.length)
 						req ~= "Last-Event-ID: " ~ lastEventId ~ "\r\n";
 					req ~= "\r\n";
@@ -911,6 +1044,8 @@ final class HttpClientTransport : ClientTransport
 					// parser; or read raw to EOF when not chunked.
 					for (;;)
 					{
+						if (closing)
+							break;
 						if (chunked)
 						{
 							auto sizeLine = (cast(string) readLine(conn).idup).strip;
@@ -950,6 +1085,8 @@ final class HttpClientTransport : ClientTransport
 				}
 			}();
 
+			if (closing)
+				break;
 			// Reconnect honoring the server-provided retry delay (SSE `retry:`).
 			if (retryMs > 0)
 				sleep(retryMs.msecs);
@@ -965,10 +1102,21 @@ final class HttpClientTransport : ClientTransport
 		import vibe.core.core : runTask;
 
 		auto cancelled = () @trusted { return new shared bool(false); }();
-		auto stream = new SubscriptionStream(cancelled);
+		// The background task fills this slot with its live socket once connected;
+		// the stream's onCancel delegate force-closes it so a blocked readLine /
+		// conn.read returns immediately rather than parking until the next event.
+		auto slot = new ListenSocketSlot;
+		auto onCancel = () @safe nothrow{
+			try
+				slot.closeSocket();
+			catch (Exception)
+			{
+			}
+		};
+		auto stream = new SubscriptionStream(cancelled, onCancel);
 		runTask(() nothrow{
 			try
-				runListenStream(message, cancelled);
+				runListenStream(message, cancelled, slot);
 			catch (Exception)
 			{
 			}
@@ -985,7 +1133,7 @@ final class HttpClientTransport : ClientTransport
 	/// the caller cancels. A raw TCP POST is used (rather than vibe's pooled
 	/// `requestHTTP`) for the same reason as `runServerStream`: a long-lived,
 	/// idle-then-active SSE body is not reliably surfaced by the pooled client.
-	private void runListenStream(Json message, shared(bool)* cancelled) @safe
+	private void runListenStream(Json message, shared(bool)* cancelled, ListenSocketSlot slot) @safe
 	{
 		import vibe.core.net : connectTCP;
 		import vibe.stream.operations : readLine;
@@ -1004,9 +1152,15 @@ final class HttpClientTransport : ClientTransport
 		const 
 		body = message.toString();
 		() @trusted {
+			if (*cancelled)
+				return;
 			auto sock = connectTCP(host, port);
+			slot.attach(sock);
 			scope (exit)
-				sock.close();
+				slot.closeSocket();
+			// A cancel() that raced ahead of attach must still tear the socket down.
+			if (*cancelled)
+				return;
 			// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 			auto conn = openClientStream(sock, ep.tls, host);
 
@@ -1018,7 +1172,8 @@ final class HttpClientTransport : ClientTransport
 			if (sessionId.length)
 				req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
 			foreach (k, v; reqHeaders)
-				req ~= k ~ ": " ~ v ~ "\r\n";
+				if (!isHeaderValueUnsafe(v))
+					req ~= k ~ ": " ~ v ~ "\r\n";
 			import std.conv : to;
 
 			req ~= "Content-Length: " ~ body.length.to!string ~ "\r\n\r\n";
@@ -1164,24 +1319,24 @@ final class HttpClientTransport : ClientTransport
 		import vibe.core.core : sleep;
 		import core.time : msecs;
 
-		legacyExpectId = expectId;
-		legacyResult = Json.undefined;
-		legacyGot = false;
-		legacyErr = null;
+		auto waiter = new LegacyWaiter;
+		waiter.result = Json.undefined;
+		legacyWaiters[expectId] = waiter;
+		scope (exit)
+			legacyWaiters.remove(expectId);
 
 		post(message); // POST to legacyEndpoint; server replies on the GET stream
 
 		foreach (_; 0 .. 1200) // up to ~60s at 50ms granularity
 		{
-			if (legacyGot || legacyErr !is null)
+			if (waiter.got || waiter.err !is null)
 				break;
 			() @trusted { sleep(50.msecs); }();
 		}
-		legacyExpectId = 0;
-		if (legacyErr !is null)
-			throw legacyErr;
-		if (legacyGot)
-			return legacyResult;
+		if (waiter.err !is null)
+			throw waiter.err;
+		if (waiter.got)
+			return waiter.result;
 		throw internalError("No legacy HTTP+SSE response for request " ~ idStr(expectId));
 	}
 
@@ -1205,9 +1360,16 @@ final class HttpClientTransport : ClientTransport
 		() @trusted {
 			try
 			{
+				if (closing)
+					return;
 				auto sock = connectTCP(host, port);
+				legacyStreamSock = sock;
+				legacyStreamSockOpen = true;
 				scope (exit)
+				{
+					legacyStreamSockOpen = false;
 					sock.close();
+				}
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, host);
 
@@ -1251,20 +1413,26 @@ final class HttpClientTransport : ClientTransport
 						legacyEndpoint = resolveEndpointUri(url, data.strip);
 						return;
 					}
-					// `message` event (or untyped): a JSON-RPC message.
+					// `message` event (or untyped): a JSON-RPC message. A response
+					// resolves the waiter registered under its id; anything with no
+					// matching waiter (notification, server->client request, or a
+					// response for an id we are not awaiting) falls through to the
+					// inbound dispatcher.
 					try
 					{
 						auto m = Message(parseJsonString(data));
+						LegacyWaiter** w;
 						if ((m.kind == MessageKind.response
 								|| m.kind == MessageKind.errorResponse)
-								&& m.id.type == Json.Type.int_ && m.id.get!long == legacyExpectId)
+								&& m.id.type == Json.Type.int_
+								&& (w = (m.id.get!long  in legacyWaiters)) !is null)
 						{
 							if (m.kind == MessageKind.errorResponse)
-								legacyErr = errorFrom(m.error);
+								(*w).err = errorFrom(m.error);
 							else
 							{
-								legacyResult = m.result;
-								legacyGot = true;
+								(*w).result = m.result;
+								(*w).got = true;
 							}
 						}
 						else
@@ -1307,6 +1475,8 @@ final class HttpClientTransport : ClientTransport
 
 				for (;;)
 				{
+					if (closing)
+						break;
 					if (chunked)
 					{
 						auto sizeLine = (cast(string) readLine(conn).idup).strip;
@@ -1342,6 +1512,12 @@ final class HttpClientTransport : ClientTransport
 			{
 			}
 		}();
+
+		// The stream closed: fail every still-outstanding waiter so its `legacyRpc`
+		// poll returns promptly with a clear error instead of timing out.
+		foreach (id, w; legacyWaiters)
+			if (!w.got && w.err is null)
+				w.err = internalError("legacy HTTP+SSE stream closed before response");
 	}
 
 	private static McpException errorFrom(Json error) @safe

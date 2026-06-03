@@ -30,7 +30,8 @@ final class SubscriptionStream
 	// Optional transport-supplied action run exactly once on the first cancel().
 	// The stdio transport uses it to emit `notifications/cancelled` referencing
 	// the listen request id (draft basic/utilities/subscriptions Cancellation,
-	// stdio); transports that tear down by closing a stream (HTTP) leave it null.
+	// stdio); the HTTP transport uses it to force-close the listen stream's socket
+	// so a blocked read unblocks immediately.
 	private void delegate() @safe nothrow onCancel_;
 
 	/// Construct a handle wrapping a shared cancellation flag. Created by a
@@ -79,4 +80,17 @@ unittest  // a SubscriptionStream handle reports and toggles its cancelled state
 	assert(*cancelled);
 	s.close(); // idempotent
 	assert(s.cancelled);
+}
+
+unittest  // a transport onCancel (e.g. HTTP socket close) runs exactly once on first cancel
+{
+	auto cancelled = () @trusted { return new shared bool(false); }();
+	int closes;
+	auto s = new SubscriptionStream(cancelled, () @safe nothrow{ closes++; });
+	assert(closes == 0);
+	s.cancel();
+	assert(closes == 1, "onCancel must fire on the first cancel (socket teardown)");
+	s.cancel(); // idempotent: no second teardown
+	s.close();
+	assert(closes == 1, "onCancel must not fire again on a repeat cancel");
 }
