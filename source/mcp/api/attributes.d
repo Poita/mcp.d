@@ -141,6 +141,12 @@ struct audience
 struct priority
 {
 	double value; /// importance 0.0 (least) .. 1.0 (most)
+
+	this(double value) @safe pure nothrow
+	in (value >= 0.0 && value <= 1.0, "@priority value must be in [0.0, 1.0]")
+	{
+		this.value = value;
+	}
 }
 
 /// Positional value UDA declaring the ISO 8601 `lastModified` timestamp for a
@@ -351,4 +357,33 @@ struct cache
 {
 	long ttlMs; /// how long the result may be cached, in milliseconds
 	string scope_ = "public"; /// "public" (default) | "private"
+}
+
+unittest  // @priority accepts in-range values
+{
+	auto p = priority(0.5);
+	assert(p.value == 0.5);
+}
+
+unittest  // @priority accepts the boundary values 0.0 and 1.0
+{
+	assert(priority(0.0).value == 0.0);
+	assert(priority(1.0).value == 1.0);
+}
+
+unittest  // @priority rejects out-of-range values via its contract
+{
+	import core.exception : AssertError;
+
+	static bool rejects(double v) @trusted
+	{
+		try
+			cast(void) priority(v);
+		catch (AssertError)
+			return true;
+		return false;
+	}
+
+	assert(rejects(5.0));
+	assert(rejects(-1.0));
 }
