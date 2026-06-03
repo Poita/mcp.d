@@ -393,10 +393,10 @@ private template hasFieldDefault(T, size_t i)
 				}
 
 			// Numeric bounds (minimum / maximum) on number and integer values.
-			if (value.type == Json.Type.int_ || value.type == Json.Type.float_)
+			if (value.type == Json.Type.int_ || value.type == Json.Type.float_
+				|| value.type == Json.Type.bigInt)
 				{
-				const num = value.type == Json.Type.int_
-					? cast(double) value.get!long : value.get!double;
+				const num = jsonNumber(value);
 				if ("minimum" in schema && schema["minimum"].type != Json.Type.undefined)
 					{
 					const lo = jsonNumber(schema["minimum"]);
@@ -453,6 +453,12 @@ private template hasFieldDefault(T, size_t i)
 				return cast(double) j.get!long;
 			if (j.type == Json.Type.float_)
 				return j.get!double;
+			if (j.type == Json.Type.bigInt)
+				{
+				import std.bigint : BigInt, toDecimalString;
+
+				return toDecimalString(j.get!BigInt).to!double;
+			}
 			return 0;
 		}
 
@@ -470,7 +476,7 @@ private template hasFieldDefault(T, size_t i)
 				return value.type == Json.Type.bool_;
 			case "integer":
 				// Accept an integral JSON value, or a float that is integral-valued.
-				if (value.type == Json.Type.int_)
+				if (value.type == Json.Type.int_ || value.type == Json.Type.bigInt)
 					return true;
 				if (value.type == Json.Type.float_)
 					{
@@ -480,7 +486,8 @@ private template hasFieldDefault(T, size_t i)
 				}
 				return false;
 			case "number":
-				return value.type == Json.Type.int_ || value.type == Json.Type.float_;
+				return value.type == Json.Type.int_
+					|| value.type == Json.Type.float_ || value.type == Json.Type.bigInt;
 			case "null":
 				return value.type == Json.Type.null_;
 			default:
@@ -654,6 +661,64 @@ private template hasFieldDefault(T, size_t i)
 			assert(validateAgainstSchema(Json(50), schema) == "");
 			assert(validateAgainstSchema(Json(0), schema).length > 0);
 			assert(validateAgainstSchema(Json(101), schema).length > 0);
+		}
+
+		unittest  // validateAgainstSchema accepts a long-overflow integer (bigInt)
+		{
+			import vibe.data.json : parseJsonString;
+
+			auto big = parseJsonString("99999999999999999999999999999");
+			assert(big.type == Json.Type.bigInt);
+			Json schema = Json.emptyObject;
+			schema["type"] = "integer";
+			assert(validateAgainstSchema(big, schema) == "");
+		}
+
+		unittest  // validateAgainstSchema accepts a long-overflow number (bigInt)
+		{
+			import vibe.data.json : parseJsonString;
+
+			auto big = parseJsonString("99999999999999999999999999999");
+			assert(big.type == Json.Type.bigInt);
+			Json schema = Json.emptyObject;
+			schema["type"] = "number";
+			assert(validateAgainstSchema(big, schema) == "");
+		}
+
+		unittest  // validateAgainstSchema enforces maximum on a bigInt value
+		{
+			import vibe.data.json : parseJsonString;
+
+			auto big = parseJsonString("99999999999999999999999999999");
+			assert(big.type == Json.Type.bigInt);
+			Json schema = Json.emptyObject;
+			schema["type"] = "integer";
+			schema["maximum"] = Json(100);
+			assert(validateAgainstSchema(big, schema).length > 0);
+		}
+
+		unittest  // validateAgainstSchema enforces minimum on a negative bigInt value
+		{
+			import vibe.data.json : parseJsonString;
+
+			auto big = parseJsonString("-99999999999999999999999999999");
+			assert(big.type == Json.Type.bigInt);
+			Json schema = Json.emptyObject;
+			schema["type"] = "integer";
+			schema["minimum"] = Json(0);
+			assert(validateAgainstSchema(big, schema).length > 0);
+		}
+
+		unittest  // validateAgainstSchema accepts an in-range bigInt value
+		{
+			import vibe.data.json : parseJsonString;
+
+			auto big = parseJsonString("99999999999999999999999999999");
+			assert(big.type == Json.Type.bigInt);
+			Json schema = Json.emptyObject;
+			schema["type"] = "integer";
+			schema["minimum"] = Json(1);
+			assert(validateAgainstSchema(big, schema) == "");
 		}
 
 		unittest  // validateAgainstSchema enforces minLength / maxLength
