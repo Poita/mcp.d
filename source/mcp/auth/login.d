@@ -597,9 +597,13 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 
 	const long now = () @trusted { return Clock.currTime().toUnixTime(); }();
 
-	// Discover the issuer and AS metadata.
-	const issuer = oauth.resolveIssuer(mcpEndpoint);
-	auto as_ = oauth.discoverAuthServer(issuer);
+	// Discover the issuer and AS metadata. Enforce the discovered AS document's
+	// issuer only on the modern RFC 9728 path (issuer named by a
+	// protected-resource-metadata document); stay lenient on the 2025-03-26
+	// origin fallback.
+	bool issuerFromPrm;
+	const issuer = oauth.resolveIssuer(mcpEndpoint, issuerFromPrm);
+	auto as_ = oauth.discoverAuthServer(issuer, issuerFromPrm);
 
 	// Reuse a cached, still-valid token when present.
 	auto cached = store.load(oauth.resource);
