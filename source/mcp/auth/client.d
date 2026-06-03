@@ -88,18 +88,8 @@ final class OAuthClient
 	/// Discover authorization-server metadata for an issuer, trying the RFC 8414
 	/// and OpenID Connect Discovery well-known locations in order.
 	///
-	/// `enforceIssuerMatch` selects how a discovered metadata document's `issuer`
-	/// is treated. On the modern RFC 8414 / RFC 9728 path the issuer is the value
-	/// an RFC 9728 protected-resource-metadata document named as its authorization
-	/// server, so the discovered document MUST self-assert that same issuer
-	/// (RFC 8414 Section 3.3): a missing or mismatched `issuer` fails closed so the
-	/// recorded issuer stays the AS's authenticated self-assertion that RFC 9207
-	/// mix-up detection anchors on. On the 2025-03-26 backcompat path the issuer is
-	/// merely the MCP server origin (no protected-resource-metadata document named
-	/// the AS), so a document served from a sub-path may legitimately self-assert a
-	/// different issuer; there the discovered value is accepted as-is and a missing
-	/// one is synthesized from the requested issuer. `resolveIssuer`'s
-	/// `fromProtectedResourceMetadata` out-parameter reports which path applies.
+	/// `enforceIssuerMatch` selects how a discovered document's `issuer` is treated;
+	/// the issuer enforcement rule is documented on `bindDiscoveredIssuer`.
 	AuthorizationServerMetadata discoverAuthServer(string issuer, bool enforceIssuerMatch = true) @safe
 	{
 		foreach (u; authServerMetadataCandidates(issuer))
@@ -148,10 +138,9 @@ final class OAuthClient
 	/// Discover protected-resource metadata, falling back to treating the MCP
 	/// server's origin as the issuer when no PRM document exists (the pre-RFC-9728
 	/// 2025-03-26 behavior). Returns the issuer to use for AS discovery, and sets
-	/// `fromProtectedResourceMetadata` to true when the issuer came from an RFC 9728
-	/// protected-resource-metadata document (the modern path, for which the
-	/// discovered AS document's issuer must match), or false for the 2025-03-26
-	/// origin fallback (the lenient backcompat path).
+	/// `fromProtectedResourceMetadata` to true on the modern RFC 9728 path or false
+	/// on the 2025-03-26 origin fallback (the issuer enforcement implications of each
+	/// path are documented on `bindDiscoveredIssuer`).
 	string resolveIssuer(string mcpEndpoint,
 			out bool fromProtectedResourceMetadata, string wwwAuthenticateHeader = "") @safe
 	{
@@ -463,8 +452,7 @@ final class OAuthClient
 	string authorizeAndGetCode(AuthorizationServerMetadata as_, string authzUrl,
 			string expectedState = "") @safe
 	{
-		// SSRF guard: never issue the outbound GET to a plaintext-http (non-loopback)
-		// or internal/link-local authorization endpoint.
+		// SSRF guard (see overload above).
 		requireSecureUrl(authzUrl);
 		string code, iss, state;
 		() @trusted {
@@ -520,16 +508,21 @@ final class OAuthClient
 		return ok;
 	}
 
-	private Json postJson(string url, Json payload) @safe
+	// Secure POST a body to `url` with the given content type, optionally adding
+	// an Authorization header, and parse the response as JSON (empty body -> {}).
+	private Json postParse(string url, string contentType,
+			scope const(ubyte)[] payload, string authHeader = null) @safe
 	{
 		requireSecureUrl(url);
 		Json result;
 		() @trusted {
 			requestHTTP(url, (scope HTTPClientRequest req) {
 				req.method = HTTPMethod.POST;
-				req.contentType = "application/json";
+				req.contentType = contentType;
 				req.headers["Accept"] = "application/json";
-				req.writeBody(cast(const(ubyte)[]) payload.toString());
+				if (authHeader.length)
+					req.headers["Authorization"] = authHeader;
+				req.writeBody(payload);
 			}, (scope HTTPClientResponse res) {
 				auto body = res.bodyReader.readAllUTF8();
 				result = body.length ? parseJsonString(body) : Json.emptyObject;
@@ -538,27 +531,17 @@ final class OAuthClient
 		return result;
 	}
 
+	private Json postJson(string url, Json payload) @safe
+	{
+		return postParse(url, "application/json", cast(const(ubyte)[]) payload.toString());
+	}
+
 	private Json postForm(string url, string form, RegisteredClient client) @safe
 	{
-		requireSecureUrl(url);
-		Json result;
 		const useBasic = authMethod == TokenEndpointAuthMethod.clientSecretBasic
 			&& client.clientSecret.length;
 		const auth = useBasic ? basicAuthHeader(client.clientId, client.clientSecret) : "";
-		() @trusted {
-			requestHTTP(url, (scope HTTPClientRequest req) {
-				req.method = HTTPMethod.POST;
-				req.contentType = "application/x-www-form-urlencoded";
-				req.headers["Accept"] = "application/json";
-				if (auth.length)
-					req.headers["Authorization"] = auth;
-				req.writeBody(cast(const(ubyte)[]) form);
-			}, (scope HTTPClientResponse res) {
-				auto body = res.bodyReader.readAllUTF8();
-				result = body.length ? parseJsonString(body) : Json.emptyObject;
-			});
-		}();
-		return result;
+		return postParse(url, "application/x-www-form-urlencoded", cast(const(ubyte)[]) form, auth);
 	}
 }
 
