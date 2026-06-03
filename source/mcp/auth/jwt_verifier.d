@@ -530,7 +530,8 @@ private string fetchJwks(string uri) @trusted
 // Small helpers
 // ===========================================================================
 
-private long currentUnixTime() @safe
+// Shared across the mcp.auth package (also used by introspection_verifier).
+package long currentUnixTime() @safe
 {
 	import std.datetime.systime : Clock;
 
@@ -557,7 +558,8 @@ private Json decodeSegmentJson(string seg) @safe
 		return Json.undefined;
 }
 
-private string jsonStr(Json j, string key) @safe
+// Shared across the mcp.auth package (also used by introspection_verifier).
+package string jsonStr(Json j, string key) @safe
 {
 	auto v = j[key];
 	if (v.type == Json.Type.string)
@@ -576,9 +578,9 @@ private long jsonLong(Json j, string key) @safe
 	return 0;
 }
 
-/// Extract the audiences from a payload: `aud` may be a string or an array of
-/// strings (RFC 7519 §4.1.3).
-string[] audiences(Json payload) @safe
+/// Extract the audiences from a claims object: `aud` may be a string or an array
+/// of strings (RFC 7519 §4.1.3). Shared with introspection (RFC 7662 §2.2).
+package string[] audiences(Json payload) @safe
 {
 	string[] result;
 	auto a = payload["aud"];
@@ -593,8 +595,9 @@ string[] audiences(Json payload) @safe
 
 /// Split a space-delimited scope string into individual scopes, dropping empty
 /// elements so an empty or all-whitespace claim yields no scopes (an empty
-/// string would otherwise split into a spurious single `""` scope).
-private string[] splitScopes(string s) @safe
+/// string would otherwise split into a spurious single `""` scope). Shared with
+/// introspection's `scope` parsing (RFC 7662 §2.2).
+package string[] splitScopes(string s) @safe
 {
 	import std.algorithm : filter;
 	import std.array : array;
