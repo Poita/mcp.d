@@ -209,8 +209,9 @@ private int runAuthScenario(string url, string scenario) @safe
 		return 0;
 	}
 
-	const issuer = oauth.resolveIssuer(url, www);
-	auto as_ = oauth.discoverAuthServer(issuer);
+	bool issuerFromPrm;
+	const issuer = oauth.resolveIssuer(url, issuerFromPrm, www);
+	auto as_ = oauth.discoverAuthServer(issuer, issuerFromPrm);
 
 	const w = parseWwwAuthenticate(www);
 	auto scopeStr = selectScope(w.scope_, prm.scopesSupported.length

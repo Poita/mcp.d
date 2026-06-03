@@ -87,18 +87,27 @@ final class OAuthClient
 
 	/// Discover authorization-server metadata for an issuer, trying the RFC 8414
 	/// and OpenID Connect Discovery well-known locations in order.
-	AuthorizationServerMetadata discoverAuthServer(string issuer) @safe
+	///
+	/// `enforceIssuerMatch` selects how a discovered metadata document's `issuer`
+	/// is treated. On the modern RFC 8414 / RFC 9728 path the issuer is the value
+	/// an RFC 9728 protected-resource-metadata document named as its authorization
+	/// server, so the discovered document MUST self-assert that same issuer
+	/// (RFC 8414 Section 3.3): a missing or mismatched `issuer` fails closed so the
+	/// recorded issuer stays the AS's authenticated self-assertion that RFC 9207
+	/// mix-up detection anchors on. On the 2025-03-26 backcompat path the issuer is
+	/// merely the MCP server origin (no protected-resource-metadata document named
+	/// the AS), so a document served from a sub-path may legitimately self-assert a
+	/// different issuer; there the discovered value is accepted as-is and a missing
+	/// one is synthesized from the requested issuer. `resolveIssuer`'s
+	/// `fromProtectedResourceMetadata` out-parameter reports which path applies.
+	AuthorizationServerMetadata discoverAuthServer(string issuer, bool enforceIssuerMatch = true) @safe
 	{
 		foreach (u; authServerMetadataCandidates(issuer))
 		{
 			Json j;
 			if (tryGetJson(u, j))
-			{
-				auto m = AuthorizationServerMetadata.fromJson(j);
-				if (m.issuer.length == 0)
-					m.issuer = issuer;
-				return m;
-			}
+				return bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
+						issuer, enforceIssuerMatch);
 		}
 		// 2025-03-26 fallback: no metadata document — use default endpoints
 		// derived from the issuer.
@@ -113,22 +122,61 @@ final class OAuthClient
 		return m;
 	}
 
+	/// Bind a discovered authorization-server metadata document to the requested
+	/// issuer. When `enforceIssuerMatch` is set (the modern RFC 8414 / RFC 9728
+	/// path) the document MUST self-assert an `issuer` equal to the requested one
+	/// (RFC 8414 Section 3.3); a missing or mismatched value fails closed rather
+	/// than being synthesized, keeping the recorded issuer the AS's authenticated
+	/// self-assertion that RFC 9207 mix-up detection anchors on. On the lenient
+	/// 2025-03-26 backcompat path a missing `issuer` is synthesized from the
+	/// request and a sub-path document's own assertion is accepted as-is.
+	private static AuthorizationServerMetadata bindDiscoveredIssuer(
+			AuthorizationServerMetadata m, string issuer, bool enforceIssuerMatch) @safe
+	{
+		if (enforceIssuerMatch)
+		{
+			if (m.issuer.length == 0 || m.issuer != issuer)
+				throw internalError("Authorization server metadata issuer mismatch");
+		}
+		else if (m.issuer.length == 0)
+		{
+			m.issuer = issuer;
+		}
+		return m;
+	}
+
 	/// Discover protected-resource metadata, falling back to treating the MCP
 	/// server's origin as the issuer when no PRM document exists (the pre-RFC-9728
-	/// 2025-03-26 behavior). Returns the issuer to use for AS discovery.
-	string resolveIssuer(string mcpEndpoint, string wwwAuthenticateHeader = "") @safe
+	/// 2025-03-26 behavior). Returns the issuer to use for AS discovery, and sets
+	/// `fromProtectedResourceMetadata` to true when the issuer came from an RFC 9728
+	/// protected-resource-metadata document (the modern path, for which the
+	/// discovered AS document's issuer must match), or false for the 2025-03-26
+	/// origin fallback (the lenient backcompat path).
+	string resolveIssuer(string mcpEndpoint,
+			out bool fromProtectedResourceMetadata, string wwwAuthenticateHeader = "") @safe
 	{
 		try
 		{
 			auto prm = discoverProtectedResource(mcpEndpoint, wwwAuthenticateHeader);
 			if (prm.authorizationServers.length)
+			{
+				fromProtectedResourceMetadata = true;
 				return prm.authorizationServers[0];
+			}
 		}
 		catch (Exception)
 		{
 		}
 		// Backcompat: no PRM -> the MCP server origin is the authorization server.
+		fromProtectedResourceMetadata = false;
 		return originOf(mcpEndpoint);
+	}
+
+	/// Convenience overload that discards the discovery-source signal.
+	string resolveIssuer(string mcpEndpoint, string wwwAuthenticateHeader = "") @safe
+	{
+		bool fromPrm;
+		return resolveIssuer(mcpEndpoint, fromPrm, wwwAuthenticateHeader);
 	}
 
 	private static string originOf(string url) @safe
@@ -669,6 +717,69 @@ unittest  // discoverAuthServer no-metadata fallback proceeds (absence allows S2
 	auto pkce = makePkce(new ubyte[32]);
 	auto url = c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "", "");
 	assert(url.canFind("code_challenge_method=S256"));
+}
+
+unittest  // modern path: discovered AS document whose issuer matches is accepted
+{
+	import vibe.data.json : parseJsonString;
+
+	auto j = parseJsonString(`{"issuer":"https://as.example.com",`
+			~ `"authorization_endpoint":"https://as.example.com/authorize",`
+			~ `"code_challenge_methods_supported":["S256"]}`);
+	auto m = OAuthClient.bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
+			"https://as.example.com", true);
+	assert(m.issuer == "https://as.example.com");
+}
+
+unittest  // modern path: discovered AS document whose issuer mismatches is rejected
+{
+	import std.exception : assertThrown;
+	import vibe.data.json : parseJsonString;
+
+	// RFC 8414 Section 3.3: the document asserts a different issuer than the one
+	// it was fetched for, so on the modern RFC 9728 path it MUST be rejected
+	// rather than trusted as the RFC 9207 mix-up anchor.
+	auto j = parseJsonString(`{"issuer":"https://evil.example.com",`
+			~ `"authorization_endpoint":"https://as.example.com/authorize"}`);
+	assertThrown(OAuthClient.bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
+			"https://as.example.com", true));
+}
+
+unittest  // modern path: discovered AS document with no issuer fails closed (no synthesis)
+{
+	import std.exception : assertThrown;
+	import vibe.data.json : parseJsonString;
+
+	// On the modern path a fetched document missing `issuer` must not have one
+	// synthesized from the request; the AS must self-assert its issuer.
+	auto j = parseJsonString(`{"authorization_endpoint":"https://as.example.com/authorize"}`);
+	assertThrown(OAuthClient.bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
+			"https://as.example.com", true));
+}
+
+unittest  // 2025-03-26 backcompat path: a sub-path issuer mismatch is tolerated
+{
+	import vibe.data.json : parseJsonString;
+
+	// No protected-resource-metadata document named this AS; the requested issuer
+	// is only the MCP server origin, while the document served from a sub-path
+	// legitimately self-asserts a prefixed issuer. The lenient path keeps the
+	// document's own assertion rather than failing closed.
+	auto j = parseJsonString(`{"issuer":"https://mcp.example.com/oauth",`
+			~ `"authorization_endpoint":"https://mcp.example.com/oauth/authorize"}`);
+	auto m = OAuthClient.bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
+			"https://mcp.example.com", false);
+	assert(m.issuer == "https://mcp.example.com/oauth");
+}
+
+unittest  // 2025-03-26 backcompat path: a missing issuer is synthesized from the request
+{
+	import vibe.data.json : parseJsonString;
+
+	auto j = parseJsonString(`{"authorization_endpoint":"https://mcp.example.com/authorize"}`);
+	auto m = OAuthClient.bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
+			"https://mcp.example.com", false);
+	assert(m.issuer == "https://mcp.example.com");
 }
 
 unittest  // discovered AS document missing code_challenge_methods_supported -> refuse (authorizationUrl)
