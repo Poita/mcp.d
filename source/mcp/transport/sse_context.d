@@ -1,6 +1,6 @@
 module mcp.transport.sse_context;
 
-import core.time : Duration, seconds;
+import core.time : Duration, seconds, msecs;
 import std.typecons : Nullable;
 
 import vibe.core.sync : LocalManualEvent, createManualEvent, TaskMutex;
@@ -92,6 +92,56 @@ final class StreamCoordinator
 		return w.result;
 	}
 
+	/// Block the current task until the client responds to `id`, while polling
+	/// `alive` in short slices so a dropped connection releases the awaiting fiber
+	/// promptly rather than parking for the full `timeout`. When `alive` returns
+	/// false before a response arrives, the pending request is failed with
+	/// `disconnectError` (mirroring the GET path's `failPendingForIds` on listener
+	/// disconnect) and that error is thrown. A null `alive` probe degrades to the
+	/// plain `await(id, timeout)` behaviour.
+	Json awaitLive(long id, bool delegate() @safe alive, McpException disconnectError,
+			Duration timeout = 60.seconds, Duration slice = 250.msecs) @safe
+	{
+		if (alive is null)
+			return await(id, timeout);
+
+		auto w = waiters[id];
+		scope (exit)
+			waiters.remove(id);
+
+		auto ec = w.evt.emitCount;
+		auto remaining = timeout;
+		while (!w.done)
+		{
+			if (!alive())
+			{
+				Json err = Json.emptyObject;
+				err["code"] = disconnectError.code;
+				err["message"] = disconnectError.msg;
+				w.error = err;
+				w.done = true;
+				break;
+			}
+			const thisSlice = remaining < slice ? remaining : slice;
+			const newEc = () @trusted { return w.evt.wait(thisSlice, ec); }();
+			if (newEc == ec && !w.done)
+			{
+				remaining -= thisSlice;
+				if (remaining <= Duration.zero)
+					throw internalError("Timed out awaiting client response");
+				continue;
+			}
+			ec = newEc;
+		}
+		if (w.error.type != Json.Type.undefined)
+		{
+			const code = ("code" in w.error) ? w.error["code"].get!int : ErrorCode.internalError;
+			const m = ("message" in w.error) ? w.error["message"].get!string : "client error";
+			throw new McpException(code, m, w.error);
+		}
+		return w.result;
+	}
+
 	/// Drop a registered-but-unawaited request id (e.g. when delivery failed so
 	/// the request will never get a response). Idempotent; unknown ids are
 	/// ignored. Keeps the waiter table from leaking when `register` is not
@@ -152,6 +202,48 @@ final class StreamCoordinator
 		foreach (id; ids)
 			failPending(id, error);
 	}
+}
+
+unittest  // awaitLive releases promptly with the disconnect error when liveness is false
+{
+	auto coord = new StreamCoordinator;
+	const id = coord.alloc();
+	coord.register(id);
+
+	bool threw;
+	try
+		coord.awaitLive(id, () @safe => false,
+				internalError("client disconnected before responding"));
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.msg == "client disconnected before responding");
+		assert(e.code == ErrorCode.internalError);
+	}
+	assert(threw, "disconnect must release the awaiting fiber with an McpException");
+}
+
+unittest  // a resolved response wins even when liveness is checked
+{
+	auto coord = new StreamCoordinator;
+	const id = coord.alloc();
+	coord.register(id);
+	assert(coord.resolve(Json(id), Json("ok"), Json.undefined));
+
+	const r = coord.awaitLive(id, () @safe => true,
+			internalError("client disconnected before responding"));
+	assert(r == Json("ok"));
+}
+
+unittest  // a null liveness probe degrades to a plain resolved await
+{
+	auto coord = new StreamCoordinator;
+	const id = coord.alloc();
+	coord.register(id);
+	assert(coord.resolve(Json(id), Json("done"), Json.undefined));
+
+	const r = coord.awaitLive(id, null, internalError("client disconnected before responding"));
+	assert(r == Json("done"));
 }
 
 /// A long-lived server->client SSE channel for *unsolicited* traffic — the
@@ -1380,7 +1472,13 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		// arriving on the same session can resolve it.
 		coord.register(id, token_);
 		writeEvent(makeRequest(Json(id), method, params));
-		return coord.await(id);
+		// Bind the awaiting fiber to this connection's liveness. The response to
+		// this server->client request arrives on a SEPARATE POST, so a disconnect of
+		// the issuing connection would otherwise leave this fiber parked for the
+		// full timeout. Polling `connAlive_` in short slices releases it promptly on
+		// disconnect, mirroring the GET path's listener-disconnect handling.
+		return coord.awaitLive(id, connAlive_,
+				internalError("client disconnected before responding"));
 	}
 
 	bool clientSupports(string capability) @safe
