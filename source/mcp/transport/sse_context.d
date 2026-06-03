@@ -1121,7 +1121,7 @@ unittest  // resume is session-scoped: another session cannot replay a stream's 
 	const b2 = ch.addListener((string f) @safe { bLive ~= f; }, "",
 			SubscriptionFilter.init, aId0, null, "session-B");
 	ch.emitTo(b2, makeNotification("notifications/message", Json([
-				"s": Json("B")
+		"s": Json("B")
 	])));
 	assert(bLive.length == 1);
 	const bId0 = bLive[0]["id: ".length .. bLive[0].indexOf("\n")];
