@@ -113,11 +113,13 @@ final class McpClient : ClientProtocol
 	private long nextId = 1;
 	// Opt-in: validate tool results against the tool's outputSchema (client side).
 	private bool validateOutputSchema_;
-	// URL-mode elicitation correlation: ids the server asked us to complete via
-	// an `elicitation/create` with `mode:"url"`, mapped to whether we have already
-	// observed their `notifications/elicitation/complete`. Used to honour the spec
-	// rule "Clients MUST ignore notifications referencing unknown or
-	// already-completed IDs."
+	// URL-mode elicitation correlation: in-flight ids the server asked us to
+	// complete via an `elicitation/create` with `mode:"url"`. An id is added
+	// (value false) when the request is seen and evicted once its
+	// `notifications/elicitation/complete` has been forwarded, so the set holds
+	// only ids still awaiting completion. Used to honour the spec rule "Clients
+	// MUST ignore notifications referencing unknown or already-completed IDs": an
+	// evicted (completed) or never-issued id is absent and so ignored.
 	private bool[string] elicitationIds_;
 	// Request ids this client has cancelled via notifications/cancelled. Per
 	// basic/utilities/cancellation, "The sender of the cancellation notification
@@ -125,6 +127,13 @@ final class McpClient : ClientProtocol
 	// late response correlated to one of these ids is dropped rather than
 	// returned. Keyed by the JSON-RPC id under which the request was POSTed.
 	private bool[long] cancelledRequests_;
+	// Size backstop for `cancelledRequests_`: ids are normally evicted when their
+	// late response is observed (`isCancelled`), but a late response that never
+	// arrives would otherwise pin its id forever. Once the tracked set reaches
+	// this many entries it is cleared on the next `cancel`; the only consequence
+	// is that an as-yet-unseen late response for a long-evicted id is no longer
+	// suppressed, an acceptable trade for a bounded set.
+	private enum size_t maxCancelledTracked_ = 4096;
 	// The JSON-RPC id used for the `initialize` request, so cancel() can enforce
 	// the spec rule that clients MUST NOT cancel initialize. 0 until sent.
 	private long initializeRequestId;
@@ -150,6 +159,21 @@ final class McpClient : ClientProtocol
 	// how many requests the call's MRTR loop issues, and unique across calls per
 	// basic/utilities/progress ("MUST be unique across all active requests").
 	private long nextProgressToken_ = 1;
+	// Server identity/capabilities discovered at connect/initialize, exposed via
+	// the `serverCapabilities`/`serverInfo`/`serverInstructions` accessors. Both
+	// the stable initialize handshake and the stateless draft `server/discover`
+	// path populate these so a connected caller can inspect what the peer
+	// advertised without re-issuing discovery.
+	private ServerCapabilities serverCapabilities_;
+	private Implementation serverInfo_;
+	private Nullable!string serverInstructions_;
+	// Upper bound on the number of pages any auto-paginating list call will
+	// follow before giving up, guarding against a peer that returns a
+	// non-progressing or cycling `nextCursor` (which would otherwise loop and
+	// accumulate items without bound). Mirrors the bounded-iteration style used
+	// elsewhere (e.g. `maxActive`, `idleTtl`). Set to 0 to disable the cap (the
+	// non-progress/cycle checks still apply).
+	size_t maxListPages_ = 1000;
 
 	/// Capabilities this client advertises at initialize. Treated as a baseline:
 	/// unless `autoAdvertiseCapabilities` is disabled, the capabilities actually
@@ -352,6 +376,12 @@ final class McpClient : ClientProtocol
 		// Validate before completing the handshake so we never silently proceed
 		// under a version the server did not agree to.
 		negotiated = resolveNegotiatedVersion(init.protocolVersion);
+		// Record what the server advertised so `serverCapabilities`/`serverInfo`/
+		// `serverInstructions` work uniformly across the initialize and draft
+		// discovery paths (symmetry with `connect`'s draft branch).
+		serverCapabilities_ = init.capabilities;
+		serverInfo_ = init.serverInfo;
+		serverInstructions_ = init.instructions;
 		didInitialize = true;
 		notify("notifications/initialized", Json.emptyObject);
 		return init;
@@ -371,9 +401,13 @@ final class McpClient : ClientProtocol
 	ProtocolVersion connect() @safe
 	{
 		string[] serverVersions;
+		DiscoverResult disc;
+		bool haveDisc;
 		try
 		{
-			serverVersions = discover().protocolVersions;
+			disc = discover();
+			haveDisc = true;
+			serverVersions = disc.protocolVersions;
 		}
 		catch (LegacyFallbackException)
 		{
@@ -407,6 +441,15 @@ final class McpClient : ClientProtocol
 		{
 			useDraft = true;
 			negotiated = chosen;
+			// No initialize handshake follows on the stateless draft path, so
+			// capture what `server/discover` advertised; otherwise the caller
+			// would have no way to inspect the server's capabilities/identity.
+			if (haveDisc)
+			{
+				serverCapabilities_ = disc.capabilities;
+				serverInfo_ = disc.serverInfo;
+				serverInstructions_ = disc.instructions;
+			}
 		}
 		else
 			initialize(chosen.toWire); // modern discovery, pre-draft version
@@ -439,6 +482,45 @@ final class McpClient : ClientProtocol
 		rpc("ping", Json.emptyObject);
 	}
 
+	/// Drive an auto-paginating list call. `fetchPage` is invoked once per page
+	/// with the current cursor (`Nullable!string.init` for the first page) and
+	/// returns that page's `nextCursor`; iteration stops when it is null.
+	///
+	/// Guards against a peer that never makes forward progress: a returned
+	/// `nextCursor` equal to the one just sent, or any cursor already seen on a
+	/// prior page (a cycle), throws `McpException(invalidParams)` rather than
+	/// looping; a configurable `maxListPages_` cap throws
+	/// `McpException(internalError)` once exceeded. Without these checks a
+	/// malicious or buggy server could make the client loop forever, growing the
+	/// accumulator without bound.
+	private void paginate(scope Nullable!string delegate(Nullable!string cursor) @safe fetchPage) @safe
+	{
+		Nullable!string cursor;
+		bool[string] seenCursors;
+		size_t pages;
+		do
+		{
+			if (maxListPages_ != 0 && pages >= maxListPages_)
+				throw new McpException(ErrorCode.internalError,
+						"List pagination exceeded the page cap; the server is not converging");
+			auto next = fetchPage(cursor);
+			pages++;
+			if (!next.isNull)
+			{
+				const advanced = next.get;
+				if (!cursor.isNull && advanced == cursor.get)
+					throw new McpException(ErrorCode.invalidParams,
+							"Server returned a non-progressing pagination cursor");
+				if (advanced in seenCursors)
+					throw new McpException(ErrorCode.invalidParams,
+							"Server returned a cycling pagination cursor");
+				seenCursors[advanced] = true;
+			}
+			cursor = next;
+		}
+		while (!cursor.isNull);
+	}
+
 	/// `tools/list`, following pagination cursors to completion. Returns the
 	/// drained `ListToolsResult`: `tools` aggregates every page's items,
 	/// `nextCursor` is null, and `cache` carries the first page's parsed draft
@@ -446,10 +528,8 @@ final class McpClient : ClientProtocol
 	ListToolsResult listTools() @safe
 	{
 		ListToolsResult acc;
-		Nullable!string cursor;
 		bool first = true;
-		do
-		{
+		paginate((Nullable!string cursor) @safe {
 			Json p = Json.emptyObject;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
@@ -460,9 +540,8 @@ final class McpClient : ClientProtocol
 				acc.cache = res.cache;
 				first = false;
 			}
-			cursor = res.nextCursor;
-		}
-		while (!cursor.isNull);
+			return res.nextCursor;
+		});
 		acc.nextCursor = Nullable!string.init;
 		// On a draft session over HTTP (the x-mcp-header feature), the client MUST
 		// exclude from tools/list any tool whose inputSchema carries an invalid
@@ -838,10 +917,8 @@ final class McpClient : ClientProtocol
 	ListResourcesResult listResources() @safe
 	{
 		ListResourcesResult acc;
-		Nullable!string cursor;
 		bool first = true;
-		do
-		{
+		paginate((Nullable!string cursor) @safe {
 			Json p = Json.emptyObject;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
@@ -852,9 +929,8 @@ final class McpClient : ClientProtocol
 				acc.cache = res.cache;
 				first = false;
 			}
-			cursor = res.nextCursor;
-		}
-		while (!cursor.isNull);
+			return res.nextCursor;
+		});
 		acc.nextCursor = Nullable!string.init;
 		return acc;
 	}
@@ -866,10 +942,8 @@ final class McpClient : ClientProtocol
 	ListResourceTemplatesResult listResourceTemplates() @safe
 	{
 		ListResourceTemplatesResult acc;
-		Nullable!string cursor;
 		bool first = true;
-		do
-		{
+		paginate((Nullable!string cursor) @safe {
 			Json p = Json.emptyObject;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
@@ -880,9 +954,8 @@ final class McpClient : ClientProtocol
 				acc.cache = res.cache;
 				first = false;
 			}
-			cursor = res.nextCursor;
-		}
-		while (!cursor.isNull);
+			return res.nextCursor;
+		});
 		acc.nextCursor = Nullable!string.init;
 		return acc;
 	}
@@ -925,10 +998,8 @@ final class McpClient : ClientProtocol
 	ListPromptsResult listPrompts() @safe
 	{
 		ListPromptsResult acc;
-		Nullable!string cursor;
 		bool first = true;
-		do
-		{
+		paginate((Nullable!string cursor) @safe {
 			Json p = Json.emptyObject;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
@@ -939,9 +1010,8 @@ final class McpClient : ClientProtocol
 				acc.cache = res.cache;
 				first = false;
 			}
-			cursor = res.nextCursor;
-		}
-		while (!cursor.isNull);
+			return res.nextCursor;
+		});
 		acc.nextCursor = Nullable!string.init;
 		return acc;
 	}
@@ -1313,6 +1383,30 @@ final class McpClient : ClientProtocol
 		return nextId - 1;
 	}
 
+	/// The server capabilities advertised at connect time. Populated by both the
+	/// stable `initialize` handshake and the stateless draft `server/discover`
+	/// path; default-constructed before either has run.
+	ServerCapabilities serverCapabilities() @safe nothrow
+	{
+		return serverCapabilities_;
+	}
+
+	/// The server's identity (`name`/`version`) advertised at connect time.
+	/// Populated by both the `initialize` handshake and draft discovery;
+	/// default-constructed before either has run.
+	Implementation serverInfo() @safe nothrow
+	{
+		return serverInfo_;
+	}
+
+	/// The optional server `instructions` advertised at connect time (null when
+	/// the server sent none, or before connecting). Populated by both the
+	/// `initialize` handshake and draft discovery.
+	Nullable!string serverInstructions() @safe nothrow
+	{
+		return serverInstructions_;
+	}
+
 	/// Cancel an in-flight request by sending `notifications/cancelled` for
 	/// `requestId` (basic/utilities/cancellation: "Either side can send a
 	/// cancellation notification ... to indicate that a previously-issued request
@@ -1328,6 +1422,8 @@ final class McpClient : ClientProtocol
 	{
 		if (requestId == initializeRequestId && initializeRequestId != 0)
 			throw invalidRequest("The initialize request MUST NOT be cancelled by clients");
+		if (cancelledRequests_.length >= maxCancelledTracked_)
+			cancelledRequests_.clear();
 		cancelledRequests_[requestId] = true;
 		Json params = Json.emptyObject;
 		params["requestId"] = requestId;
@@ -1488,7 +1584,10 @@ final class McpClient : ClientProtocol
 	/// `notifications/elicitation/complete` for an `elicitationId` we never issued
 	/// a URL-mode request for, or one we have already seen completed, is dropped
 	/// (never forwarded); the first valid completion for a known id is forwarded
-	/// and then marked completed. Every other notification is forwarded unchanged.
+	/// and then evicted, so the tracking set keeps only in-flight ids and does not
+	/// grow without bound. A later duplicate completion for an evicted id no
+	/// longer matches a tracked id and is dropped as unknown, the same ignore
+	/// outcome. Every other notification is forwarded unchanged.
 	private void dispatchNotification(string method, Json params) @safe
 	{
 		if (method == "notifications/elicitation/complete")
@@ -1500,7 +1599,7 @@ final class McpClient : ClientProtocol
 			auto seen = eid in elicitationIds_;
 			if (seen is null || *seen)
 				return; // unknown or already-completed id -> ignore per spec
-			elicitationIds_[eid] = true; // mark completed
+			elicitationIds_.remove(eid); // completion forwarded -> stop tracking
 		}
 		// Deliver progress updates as a typed value to the dedicated observer,
 		// in addition to the generic catch-all below.
@@ -1670,10 +1769,17 @@ final class McpClient : ClientProtocol
 
 	/// `ClientProtocol.isCancelled`: the transport consults this through the
 	/// `ClientProtocol` seam to drop a late response for a request the client has
-	/// cancelled (basic/utilities/cancellation).
+	/// cancelled (basic/utilities/cancellation). The id is evicted from the
+	/// cancelled-id set once its late response has been observed and dropped here,
+	/// so the set does not grow without bound over a long-lived client; an id
+	/// whose late response never arrives is reclaimed by the size backstop in
+	/// `cancel`.
 	bool isCancelled(long id) @safe
 	{
-		return isResponseCancelled(id);
+		if (id !in cancelledRequests_)
+			return false;
+		cancelledRequests_.remove(id);
+		return true;
 	}
 
 	/// Test seam: set the id `cancel()` treats as the (uncancellable) initialize
@@ -3499,6 +3605,96 @@ unittest  // listResourceTemplates calls resources/templates/list and auto-pagin
 	assert(templates.length == 2);
 	assert(templates[0].uriTemplate == "file:///a/{x}");
 	assert(templates[1].name == "b");
+}
+
+unittest  // listTools throws (rather than looping) when the server never advances the cursor
+{
+	import std.exception : assertThrown;
+
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		r["tools"] = Json.emptyArray;
+		r["nextCursor"] = "stuck"; // same cursor forever, even after we send it back
+		return r;
+	};
+	assertThrown!McpException(c.listTools());
+}
+
+unittest  // listResources throws when the server cycles the pagination cursor
+{
+	import std.exception : assertThrown;
+
+	auto c = McpClient.http("http://localhost");
+	int call;
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		r["resources"] = Json.emptyArray;
+		// A -> B -> A cycle: each page makes apparent progress but revisits A.
+		r["nextCursor"] = (call++ % 2 == 0) ? "A" : "B";
+		return r;
+	};
+	assertThrown!McpException(c.listResources());
+}
+
+unittest  // a cancelled-request id is evicted once its late response has been dropped
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	c.cancel(42);
+	// First observation of the late response: dropped (true) and the id evicted.
+	assert(c.isCancelled(42));
+	// A second response for the same id is no longer suppressed: the set shrank.
+	assert(!c.isCancelled(42));
+}
+
+unittest  // a completed URL-elicitation id is evicted from the in-flight tracking set
+{
+	auto c = McpClient.http("http://localhost");
+	c.capabilities.elicitation = true;
+	c.capabilities.elicitationUrl = true;
+	c.onElicitation = (ElicitParams) @safe { return ElicitResult.init; };
+
+	Json create = Json.emptyObject;
+	create["mode"] = "url";
+	create["url"] = "https://example.com/elicit";
+	create["elicitationId"] = "e-evict";
+	c.dispatchServerMethod("elicitation/create", create);
+
+	int forwarded;
+	c.onNotification = (string, Json) @safe { forwarded++; };
+
+	Json note = Json.emptyObject;
+	note["elicitationId"] = "e-evict";
+	c.dispatchNotification("notifications/elicitation/complete", note);
+	assert(forwarded == 1); // forwarded once, then the id is evicted
+	// A duplicate completion for the now-untracked id is ignored, not forwarded.
+	c.dispatchNotification("notifications/elicitation/complete", note);
+	assert(forwarded == 1);
+}
+
+unittest  // initialize records the server's advertised capabilities/info/instructions
+{
+	auto c = McpClient.http("http://localhost");
+	c.onNotifyForTest = (Json message) @safe {}; // swallow notifications/initialized
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json res = Json.emptyObject;
+		res["protocolVersion"] = latestStable.toWire;
+		Json caps = Json.emptyObject;
+		caps["logging"] = Json.emptyObject;
+		res["capabilities"] = caps;
+		Json info = Json.emptyObject;
+		info["name"] = "demo-server";
+		info["version"] = "9.9.9";
+		res["serverInfo"] = info;
+		res["instructions"] = "be nice";
+		return res;
+	};
+	c.initialize(latestStable.toWire);
+	assert(c.serverInfo().name == "demo-server");
+	assert(c.serverInfo().version_ == "9.9.9");
+	assert(!c.serverInstructions().isNull);
+	assert(c.serverInstructions().get == "be nice");
 }
 
 unittest  // readResource exposes the parsed CacheableResult freshness hint as .cache
