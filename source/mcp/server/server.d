@@ -1789,12 +1789,18 @@ final class McpServer
 				throw methodNotFound(method);
 			return Json.emptyObject;
 		case "tools/list":
+			if (capabilities().tools.isNull)
+				throw methodNotFound(method);
 			return doListTools(params, ver);
 		case "tools/call":
 			return doCallTool(params, ctx, ver, conn);
 		case "resources/list":
+			if (capabilities().resources.isNull)
+				throw methodNotFound(method);
 			return doListResources(params, ver);
 		case "resources/templates/list":
+			if (capabilities().resources.isNull)
+				throw methodNotFound(method);
 			return doListResourceTemplates(params, ver);
 		case "resources/read":
 			return doReadResource(params, ver);
@@ -1813,6 +1819,8 @@ final class McpServer
 				throw methodNotFound(method);
 			return doUnsubscribe(params, conn);
 		case "prompts/list":
+			if (capabilities().prompts.isNull)
+				throw methodNotFound(method);
 			return doListPrompts(params, ver);
 		case "prompts/get":
 			return doGetPrompt(params, ctx, ver);
@@ -5234,6 +5242,16 @@ unittest  // draft tools/list defaults to the mandatory ttlMs:0 cache hint
 unittest  // draft resources/list, templates/list, prompts/list default to ttlMs:0
 {
 	auto s = makeTestServer();
+	s.registerResource(Resource("res://x", "x"), () @safe {
+		ResourceContents c;
+		return c;
+	});
+	s.registerResourceTemplate(ResourceTemplate("res://{id}", "tpl"),
+			(string uri, string[string]) @safe { ResourceContents c; return c; });
+	s.registerDynamicPrompt(Prompt("p"), (Json) @safe {
+		GetPromptResult r;
+		return r;
+	});
 	foreach (m; ["resources/list", "resources/templates/list", "prompts/list"])
 	{
 		auto resp = s.handle(draftReq(2, m)).get;
@@ -6316,6 +6334,7 @@ unittest  // enableToolListChanged advertises tools capability with zero tools r
 unittest  // removeTool unregisters a previously registered tool
 {
 	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
 	Tool add = {name: "add"};
 	s.registerDynamicTool(add, (Json) @safe { return CallToolResult(); });
 	assert(s.removeTool("add"));
@@ -7299,4 +7318,74 @@ unittest  // two stateful sessions on ONE server cannot observe each other's sta
 	assert(("res://b" in csA.subscriptions) is null, "session A saw session B's subscription");
 	assert(csB.negotiated != ProtocolVersion.v2025_03_26, "session B saw session A's version");
 	assert(("i:1" in csB.inFlight) is null, "session B saw session A's in-flight id");
+}
+
+unittest  // prompts/list on a server with no prompts capability -> -32601
+{
+	// An empty server with prompts listChanged disabled does not advertise the
+	// prompts capability, so prompts/list must report method-not-found rather
+	// than an empty-success result.
+	auto s = new McpServer("t", "1");
+	assert(s.capabilities().prompts.isNull);
+	auto resp = s.handle(req(1, "prompts/list")).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound,
+			"prompts/list must be -32601 when the prompts capability is not advertised");
+}
+
+unittest  // prompts/list still answers when promptsListChanged is advertised
+{
+	// A server with zero prompts but promptsListChanged enabled DOES advertise
+	// the prompts capability, so prompts/list must answer with an empty list.
+	auto s = new McpServer("t", "1");
+	s.enablePromptsListChanged();
+	assert(!s.capabilities().prompts.isNull);
+	auto resp = s.handle(req(1, "prompts/list")).get;
+	assert("error" !in resp, "prompts/list must succeed when prompts is advertised");
+	assert(resp["result"]["prompts"].length == 0, "prompts/list must return an empty list");
+}
+
+unittest  // tools/list on a server with no tools capability -> -32601
+{
+	auto s = new McpServer("t", "1");
+	assert(s.capabilities().tools.isNull);
+	auto resp = s.handle(req(1, "tools/list")).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound,
+			"tools/list must be -32601 when the tools capability is not advertised");
+}
+
+unittest  // resources/list and resources/templates/list -> -32601 without resources capability
+{
+	auto s = new McpServer("t", "1");
+	assert(s.capabilities().resources.isNull);
+	auto rl = s.handle(req(1, "resources/list")).get;
+	assert(rl["error"]["code"].get!int == ErrorCode.methodNotFound,
+			"resources/list must be -32601 when the resources capability is not advertised");
+	auto tl = s.handle(req(2, "resources/templates/list")).get;
+	assert(tl["error"]["code"].get!int == ErrorCode.methodNotFound,
+			"resources/templates/list must be -32601 when resources is not advertised");
+}
+
+unittest  // list endpoints answer once their capability is advertised
+{
+	// A server with a registered tool/resource/prompt advertises each capability,
+	// so the matching list endpoint must answer rather than report -32601.
+	auto s = new McpServer("t", "1");
+	Tool tool = {name: "t"};
+	s.registerDynamicTool(tool, (Json) @safe {
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+	s.registerResource(Resource("res://x", "x"), () @safe {
+		ResourceContents c;
+		return c;
+	});
+	s.registerDynamicPrompt(Prompt("p"), (Json) @safe {
+		GetPromptResult r;
+		return r;
+	});
+	assert("error" !in s.handle(req(1, "tools/list")).get);
+	assert("error" !in s.handle(req(2, "resources/list")).get);
+	assert("error" !in s.handle(req(3, "resources/templates/list")).get);
+	assert("error" !in s.handle(req(4, "prompts/list")).get);
 }
