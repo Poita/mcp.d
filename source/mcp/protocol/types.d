@@ -762,7 +762,12 @@ struct Annotations
 			j["audience"] = arr;
 		}
 		if (!priority.isNull)
-			j["priority"] = priority.get;
+		{
+			// Defensive clamp: the spec range for `priority` is 0.0..1.0, so a
+			// misbehaving producer's out-of-range value is never emitted on the wire.
+			auto p = priority.get;
+			j["priority"] = p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p);
+		}
 		if (!lastModified.isNull)
 			j["lastModified"] = lastModified.get;
 		return j;
@@ -775,9 +780,16 @@ struct Annotations
 			foreach (i; 0 .. j["audience"].length)
 				a.audience ~= j["audience"][i].get!string;
 		if ("priority" in j && j["priority"].type == Json.Type.float_)
-			a.priority = j["priority"].get!double;
+		{
+			// Defensive clamp to the spec range 0.0..1.0 on read, mirroring emit.
+			auto p = j["priority"].get!double;
+			a.priority = p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p);
+		}
 		else if ("priority" in j && j["priority"].type == Json.Type.int_)
-			a.priority = cast(double) j["priority"].get!long;
+		{
+			auto p = cast(double) j["priority"].get!long;
+			a.priority = p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p);
+		}
 		if ("lastModified" in j && j["lastModified"].type == Json.Type.string)
 			a.lastModified = j["lastModified"].get!string;
 		return a;
@@ -970,7 +982,6 @@ struct Tool
 		projected.name = name;
 		projected.description = description;
 		projected.inputSchema = inputSchema;
-		projected.meta = meta;
 		// `Tool.annotations` (ToolAnnotations) was introduced by 2025-03-26; it
 		// is absent from the 2024-11-05 'Tool' type (name/description/inputSchema
 		// only). Strip it for any version older than 2025-03-26.
@@ -978,10 +989,13 @@ struct Tool
 			projected.annotations = annotations;
 		// `BaseMetadata.title` and `Tool.outputSchema` were introduced by
 		// 2025-06-18; they are absent from 2025-03-26 and 2024-11-05.
+		// `Tool._meta` was introduced by 2025-06-18; the 2024-11-05 and
+		// 2025-03-26 `Tool` types have no `_meta`, so strip it for older peers.
 		if (v >= ProtocolVersion.v2025_06_18)
 		{
 			projected.title = title;
 			projected.outputSchema = outputSchema;
+			projected.meta = meta;
 		}
 		// `Tool.icons` was introduced by 2025-11-25; absent from every earlier
 		// version (and present in draft, which is >= 2025-11-25).
@@ -2085,6 +2099,30 @@ unittest  // Tool.forVersion keeps outputSchema for 2025-06-18 (introduced here)
 	t.outputSchema = emptyObjectSchema();
 	auto j = t.forVersion(ProtocolVersion.v2025_06_18).toJson();
 	assert("outputSchema" in j);
+}
+
+unittest  // Tool.forVersion strips _meta for 2024-11-05 (Tool._meta introduced 2025-06-18)
+{
+	Tool t = {name: "t"};
+	t.meta = Json(["k": Json("v")]);
+	auto j = t.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("_meta" !in j);
+}
+
+unittest  // Tool.forVersion strips _meta for 2025-03-26 (Tool._meta introduced 2025-06-18)
+{
+	Tool t = {name: "t"};
+	t.meta = Json(["k": Json("v")]);
+	auto j = t.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("_meta" !in j);
+}
+
+unittest  // Tool.forVersion keeps _meta for 2025-06-18 (Tool._meta introduced here)
+{
+	Tool t = {name: "t"};
+	t.meta = Json(["k": Json("v")]);
+	auto j = t.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("_meta" in j);
 }
 
 unittest  // Tool.forVersion strips icons for 2025-06-18 (Tool.icons introduced 2025-11-25)
@@ -3652,6 +3690,30 @@ unittest  // Annotations.empty reflects whether any field is set
 	assert(a.empty);
 	a.priority = 0.1;
 	assert(!a.empty);
+}
+
+unittest  // Annotations.toJson clamps priority above 1.0 to 1.0
+{
+	Annotations a;
+	a.priority = 5.0;
+	auto j = a.toJson();
+	assert(j["priority"].get!double == 1.0);
+}
+
+unittest  // Annotations.toJson clamps priority below 0.0 to 0.0
+{
+	Annotations a;
+	a.priority = -1.0;
+	auto j = a.toJson();
+	assert(j["priority"].get!double == 0.0);
+}
+
+unittest  // Annotations.fromJson clamps an out-of-range priority into 0.0..1.0
+{
+	auto j = Json.emptyObject;
+	j["priority"] = Json(2.5);
+	auto a = Annotations.fromJson(j);
+	assert(a.priority.get == 1.0);
 }
 
 /// Result of `resources/read`.
