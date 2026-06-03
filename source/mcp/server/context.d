@@ -242,7 +242,7 @@ interface RequestContext
 	final Json sample(Json params) @safe
 	{
 		if (isStateless)
-			throw invalidRequest("sample() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
+			throw internalError("sample() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
 		if (!clientSupports("sampling"))
 			throw invalidRequest("Client does not support sampling");
 		// Per spec, servers MUST NOT send tool-enabled sampling requests to
@@ -288,7 +288,7 @@ interface RequestContext
 	final ElicitResult elicit(string message, Json requestedSchema) @safe
 	{
 		if (isStateless)
-			throw invalidRequest("elicit() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
+			throw internalError("elicit() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
 		// Per client/elicitation: servers MUST NOT send elicitation requests
 		// with modes the client does not support. A bare `elicitation:{}` is
 		// form-only, so a generic declaration already sets the form submode.
@@ -331,7 +331,7 @@ interface RequestContext
 	final ElicitResult elicitUrl(string message, string url, string elicitationId) @safe
 	{
 		if (isStateless)
-			throw invalidRequest("elicitUrl() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
+			throw internalError("elicitUrl() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
 		// Per client/elicitation: servers MUST NOT send a url-mode request to a
 		// client that only declared form mode (e.g. a bare `elicitation:{}`).
 		if (!clientSupports("elicitation.url"))
@@ -395,6 +395,15 @@ interface RequestContext
 	final void log(LogLevel level, string message, string logger = null) @safe
 	{
 		log(cast(string) level, Json(message), logger);
+	}
+
+	/// Typed convenience over `log(string, Json, string)`: emit a
+	/// `notifications/message` at the given `LogLevel` with an arbitrary JSON
+	/// payload (commonly a structured object). Forwards to the string/Json overload
+	/// with the level's wire string, so the level cannot be misspelled.
+	final void log(LogLevel level, Json data, string logger = null) @safe
+	{
+		log(cast(string) level, data, logger);
 	}
 
 	/// Integer-step convenience over `reportProgress(double, Nullable!double,
@@ -1536,4 +1545,72 @@ unittest  // isResubmit is true exactly when inputResponses is non-empty
 	assert(!probe.isResubmit);
 	probe.responses["q1"] = Json.emptyObject;
 	assert(probe.isResubmit);
+}
+
+unittest  // typed log(LogLevel, Json) carries an arbitrary JSON payload to the inner overload
+{
+	import vibe.data.json : parseJsonString;
+
+	string[] frames;
+	RequestContext ctx = new StdioContext((string str) @safe { frames ~= str; });
+	Json payload = Json.emptyObject;
+	payload["component"] = "db";
+	payload["retries"] = 3;
+	ctx.log(LogLevel.warning, payload, "lg");
+	assert(frames.length == 1);
+	auto j = parseJsonString(frames[0]);
+	assert(j["params"]["level"].get!string == "warning");
+	assert(j["params"]["data"]["component"].get!string == "db");
+	assert(j["params"]["data"]["retries"].get!long == 3);
+	assert(j["params"]["logger"].get!string == "lg");
+}
+
+unittest  // sample() on a stateless (MRTR) request throws an internalError (server fault)
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto probe = new StateProbe; // isStateless() == true
+	bool threw;
+	try
+		probe.sample(Json.emptyObject);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.internalError);
+	}
+	assert(threw);
+}
+
+unittest  // elicit() on a stateless (MRTR) request throws an internalError (server fault)
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto probe = new ElicitProbe;
+	probe.stateless = true;
+	bool threw;
+	try
+		probe.elicit("Pick one", Json.emptyObject);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.internalError);
+	}
+	assert(threw);
+}
+
+unittest  // elicitUrl() on a stateless (MRTR) request throws an internalError (server fault)
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto probe = new ElicitProbe;
+	probe.stateless = true;
+	bool threw;
+	try
+		probe.elicitUrl("msg", "https://example.com", "elic-1");
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.internalError);
+	}
+	assert(threw);
 }

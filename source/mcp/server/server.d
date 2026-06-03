@@ -6031,7 +6031,10 @@ unittest  // elicit() is rejected on a stateless (draft) request
 	Json p = Json.emptyObject;
 	auto resp = s.handle(draftReq(3, "tools/call", buildName(p, "bad"))).get;
 	assert("error" in resp);
-	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
+	// Invoking a blocking server->client API on a stateless (MRTR) request is a
+	// server-author fault, so it surfaces as internalError (-32603) rather than
+	// the peer-facing invalidRequest (-32600).
+	assert(resp["error"]["code"].get!int == ErrorCode.internalError);
 }
 
 unittest  // 2025-era request: ctx.elicit() blocks and the handler completes
