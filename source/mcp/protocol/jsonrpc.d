@@ -61,8 +61,15 @@ private void validateEnvelope(Json j) @safe
 {
 	if (j.type != Json.Type.object)
 		throw invalidRequest("JSON-RPC message must be an object");
-	if (("jsonrpc" !in j) || j["jsonrpc"].get!string != "2.0")
+	if (("jsonrpc" !in j) || j["jsonrpc"].type != Json.Type.string
+			|| j["jsonrpc"].get!string != "2.0")
 		throw invalidRequest("Missing or invalid jsonrpc version (expected \"2.0\")");
+	// A present `method` must be a string. Without this guard a non-string method
+	// (number, object, array, boolean, null) is classified by presence alone and
+	// later read with `.get!string`, throwing an uncaught JSONException instead of
+	// yielding a clean -32600 across every transport.
+	if (("method" in j) && j["method"].type != Json.Type.string)
+		throw invalidRequest("`method` must be a string");
 	// A message bearing a `method` with an explicit `id:null` is neither a valid
 	// request (the spec requires a request id that is not null) nor a
 	// notification (which omits `id` entirely). Reject it so the peer receives a
@@ -275,6 +282,34 @@ unittest  // reject wrong jsonrpc version
 	import std.exception : assertThrown;
 
 	assertThrown!McpException(parseMessage(`{"jsonrpc":"1.0","id":1,"method":"x"}`));
+}
+
+unittest  // reject a numeric method as -32600 rather than throwing JSONException
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":1,"method":42}`));
+}
+
+unittest  // reject an object method as -32600
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":1,"method":{}}`));
+}
+
+unittest  // reject a null method as -32600
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":1,"method":null}`));
+}
+
+unittest  // reject a non-string jsonrpc version as -32600 rather than throwing
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(`{"jsonrpc":2.0,"id":1,"method":"x"}`));
 }
 
 unittest  // reject malformed json with a parse error

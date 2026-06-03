@@ -4216,6 +4216,15 @@ unittest  // handleRaw reports malformed JSON as a parse error with null id
 	assert(j["id"].type == Json.Type.null_);
 }
 
+unittest  // handleRaw rejects a non-string method as -32600 instead of crashing
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = makeTestServer();
+	auto j = parseJsonString(s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":42}`));
+	assert(j["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
 unittest  // handleRaw on a batch returns only the responses (notifications drop out)
 {
 	import vibe.data.json : parseJsonString;
