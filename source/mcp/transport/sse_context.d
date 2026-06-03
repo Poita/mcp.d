@@ -9,6 +9,7 @@ import vibe.http.server : HTTPServerResponse;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
+import mcp.transport.coordinator : throwOrReturn;
 import mcp.protocol.capabilities;
 import mcp.protocol.draft : withSubscriptionId;
 import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
@@ -83,13 +84,7 @@ final class StreamCoordinator
 				throw internalError("Timed out awaiting client response");
 			ec = newEc;
 		}
-		if (w.error.type != Json.Type.undefined)
-		{
-			const code = ("code" in w.error) ? w.error["code"].get!int : ErrorCode.internalError;
-			const m = ("message" in w.error) ? w.error["message"].get!string : "client error";
-			throw new McpException(code, m, w.error);
-		}
-		return w.result;
+		return throwOrReturn(w.result, w.error, "client error");
 	}
 
 	/// Block the current task until the client responds to `id`, while polling
@@ -133,13 +128,7 @@ final class StreamCoordinator
 			}
 			ec = newEc;
 		}
-		if (w.error.type != Json.Type.undefined)
-		{
-			const code = ("code" in w.error) ? w.error["code"].get!int : ErrorCode.internalError;
-			const m = ("message" in w.error) ? w.error["message"].get!string : "client error";
-			throw new McpException(code, m, w.error);
-		}
-		return w.result;
+		return throwOrReturn(w.result, w.error, "client error");
 	}
 
 	/// Drop a registered-but-unawaited request id (e.g. when delivery failed so
