@@ -52,6 +52,27 @@ struct ProgressToken
 	}
 }
 
+/// Per-request options shared by every `McpClient` request verb (`callTool`,
+/// `readResource`, `getPrompt`, `complete`). All fields are independently
+/// combinable and default to "unset":
+///
+/// - `progressToken`: attached as `params._meta.progressToken` so the server may
+///   emit `notifications/progress` for the request (basic/utilities/progress).
+/// - `logLevel`: minimum `notifications/message` severity for this request,
+///   carried in `params._meta["io.modelcontextprotocol/logLevel"]` (draft
+///   server/utilities/logging, SEP-2575/2577); ignored on a released protocol,
+///   empty attaches nothing.
+/// - `onProgress`: a per-call progress sink. When non-null and no explicit
+///   `progressToken` is given, the verb mints a unique token; for the duration
+///   of the call, progress correlated to that token is routed here while
+///   progress for other tokens still reaches the global `onProgress`.
+struct RequestOptions
+{
+	ProgressToken progressToken;
+	string logLevel;
+	void delegate(ProgressNotification) @safe onProgress;
+}
+
 /// Merge `progressToken` into a request's `params._meta.progressToken`, per
 /// basic/utilities/progress ("a party ... includes a progressToken in the
 /// request metadata", at `params._meta.progressToken`). Returns `params`
@@ -150,11 +171,11 @@ final class McpClient : ClientProtocol
 	// omits it (server/utilities/logging, SEP-2575/2577). This is the sticky
 	// default level applied to every draft request by `injectDraftMeta`; empty
 	// means "no opt-in" (no field stamped). Set via `setLogLevel` on a draft
-	// session. Per-request overrides go through the request-method overloads /
+	// session. Per-request overrides go through `RequestOptions.logLevel` /
 	// `withRequestLogLevel` and are NOT stored here.
 	private string requestLogLevel_;
 	// Monotonic counter behind `mintProgressToken`, which mints a unique string
-	// progress token for the per-call-progress `callTool` overload. A
+	// progress token for a per-call `RequestOptions.onProgress` sink. A
 	// distinct counter (not `nextId`) keeps the minted token stable regardless of
 	// how many requests the call's MRTR loop issues, and unique across calls per
 	// basic/utilities/progress ("MUST be unique across all active requests").
@@ -221,9 +242,9 @@ final class McpClient : ClientProtocol
 	/// When set, an inbound `notifications/progress` is parsed into a
 	/// `ProgressNotification` and delivered here in addition to the generic
 	/// `onNotification`. Correlate `n.progressToken` against the
-	/// `ProgressToken` you attached to the originating request (see the
-	/// `callTool`/`readResource`/`getPrompt` overloads taking a `ProgressToken`)
-	/// to track an individual request's progress.
+	/// `ProgressToken` you attached to the originating request (via
+	/// `RequestOptions.progressToken` on `callTool`/`readResource`/`getPrompt`/
+	/// `complete`) to track an individual request's progress.
 	void delegate(ProgressNotification n) @safe onProgress;
 	/// Typed observer for `notifications/message` (server/utilities/logging).
 	///
@@ -457,8 +478,9 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Extract the `supported` wire-version list from an
-	/// `UnsupportedProtocolVersionError`. `errorFrom` stores the whole JSON-RPC
-	/// error object in `data`, so the list lives at `data.data.supported`.
+	/// `UnsupportedProtocolVersionError`. The transport's `errorFrom`
+	/// (http_transport.d) stores the whole JSON-RPC error object in `data`, so the
+	/// list lives at `data.data.supported`.
 	private static string[] supportedListFromError(McpException e) @safe
 	{
 		auto d = e.data;
@@ -521,20 +543,20 @@ final class McpClient : ClientProtocol
 		while (!cursor.isNull);
 	}
 
-	/// `tools/list`, following pagination cursors to completion. Returns the
-	/// drained `ListToolsResult`: `tools` aggregates every page's items,
-	/// `nextCursor` is null, and `cache` carries the first page's parsed draft
-	/// `CacheableResult` freshness hint (if any).
-	ListToolsResult listTools() @safe
+	/// Drain a paginated `<method>` list into a single accumulated result `R`.
+	/// Owns the cursor-param building, the first-page `cache` capture, and the
+	/// `nextCursor` reset shared by every `list*` method; `append` is the only
+	/// per-call variation, concatenating one page's items onto the accumulator.
+	private R drainList(R)(string method, scope void delegate(ref R acc, ref R page) @safe append) @safe
 	{
-		ListToolsResult acc;
+		R acc;
 		bool first = true;
 		paginate((Nullable!string cursor) @safe {
 			Json p = Json.emptyObject;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
-			auto res = ListToolsResult.fromJson(rpc("tools/list", p));
-			acc.tools ~= res.tools;
+			auto res = R.fromJson(rpc(method, p));
+			append(acc, res);
 			if (first)
 			{
 				acc.cache = res.cache;
@@ -543,6 +565,19 @@ final class McpClient : ClientProtocol
 			return res.nextCursor;
 		});
 		acc.nextCursor = Nullable!string.init;
+		return acc;
+	}
+
+	/// `tools/list`, following pagination cursors to completion. Returns the
+	/// drained `ListToolsResult`: `tools` aggregates every page's items,
+	/// `nextCursor` is null, and `cache` carries the first page's parsed draft
+	/// `CacheableResult` freshness hint (if any).
+	ListToolsResult listTools() @safe
+	{
+		auto acc = drainList!ListToolsResult("tools/list",
+				(ref ListToolsResult a, ref ListToolsResult r) @safe {
+			a.tools ~= r.tools;
+		});
 		// On a draft session over HTTP (the x-mcp-header feature), the client MUST
 		// exclude from tools/list any tool whose inputSchema carries an invalid
 		// `x-mcp-header` annotation (draft server/tools #x-mcp-header). Validate each
@@ -597,7 +632,8 @@ final class McpClient : ClientProtocol
 			toolInputSchemas_[name] = inputSchema;
 	}
 
-	/// `tools/call`.
+	/// `tools/call`. Per-request `progressToken` / `logLevel` / `onProgress` are
+	/// carried in `opts` (see `RequestOptions`).
 	///
 	/// Against a draft (MRTR / SEP-2322) server this transparently completes a
 	/// Multi Round-Trip Request: if the server answers with an
@@ -609,77 +645,22 @@ final class McpClient : ClientProtocol
 	/// `CallToolResult`. The loop only
 	/// engages when draft mode is enabled (see `enableDraft`/`connect`); other
 	/// protocol versions never see `inputRequests`.
-	CallToolResult callTool(string name, Json arguments = Json.emptyObject) @safe
+	CallToolResult callTool(string name, Json arguments = Json.emptyObject,
+			RequestOptions opts = RequestOptions.init) @safe
 	{
-		return callToolLoop(name, arguments, ProgressToken.init);
-	}
-
-	/// `tools/call`, requesting progress updates for the call. The server may
-	/// then emit `notifications/progress` carrying `progressToken`, observable
-	/// via `onNotification`. Per basic/utilities/progress, the token is sent in
-	/// `params._meta.progressToken`. Drives the same MRTR loop as the no-token
-	/// overload (see `callTool`).
-	CallToolResult callTool(string name, Json arguments, ProgressToken progressToken) @safe
-	{
-		return callToolLoop(name, arguments, progressToken);
-	}
-
-	/// `tools/call`, opting in to per-request log messages on the draft protocol.
-	/// `logLevel` is the minimum `LogLevel` severity (e.g. `"debug"`) the server
-	/// should emit `notifications/message` at for this call; it is carried in
-	/// `params._meta["io.modelcontextprotocol/logLevel"]` (draft
-	/// server/utilities/logging, SEP-2575/2577). On a released protocol the field
-	/// is ignored by the server (use `setLogLevel`). An empty `logLevel` attaches
-	/// nothing. Drives the same MRTR loop as the other overloads.
-	CallToolResult callTool(string name, Json arguments,
-			ProgressToken progressToken, string logLevel) @safe
-	{
-		return callToolLoop(name, arguments, progressToken, logLevel);
+		auto token = effectiveToken(opts);
+		return withPerCallProgress!CallToolResult(opts,
+				() @safe => callToolLoop(name, arguments, token, opts.logLevel));
 	}
 
 	/// Typed-arguments convenience: serialize the struct `args` to its JSON wire
 	/// shape via vibe's `serializeToJson` and forward to the `Json`-arguments
 	/// `callTool`. Lets callers pass a strongly typed parameter struct instead of
-	/// hand-building a `Json` object. Equivalent to
-	/// `callTool(name, serializeToJson(args))`.
-	CallToolResult callTool(T)(string name, T args) @safe if (!is(T : Json))
-	{
-		return callTool(name, serializeToJson(args));
-	}
-
-	/// Typed-arguments convenience requesting progress updates: serialize the
-	/// struct `args` and forward to the `ProgressToken` `Json`-arguments overload
-	/// (see `callTool` with a `ProgressToken`).
-	CallToolResult callTool(T)(string name, T args, ProgressToken progressToken) @safe
+	/// hand-building a `Json` object.
+	CallToolResult callTool(T)(string name, T args, RequestOptions opts = RequestOptions.init) @safe
 			if (!is(T : Json))
 	{
-		return callTool(name, serializeToJson(args), progressToken);
-	}
-
-	/// `tools/call`, routing this call's progress to a per-call callback. Mints a
-	/// unique `ProgressToken` for the request, attaches it (so the server may emit
-	/// `notifications/progress` for it), and for the duration of the call delivers
-	/// every inbound progress notification correlated to that token to `onProgress`
-	/// (basic/utilities/progress). The prior global `this.onProgress` is restored
-	/// when the call returns (even on throw), and progress for *other* tokens still
-	/// flows to it. A null `onProgress` is treated as "no per-call sink" and behaves
-	/// like the plain `callTool`. Drives the same MRTR loop as the other overloads.
-	CallToolResult callTool(string name, Json arguments,
-			scope void delegate(ProgressNotification) @safe onProgress) @safe
-	{
-		auto token = mintProgressToken();
-		return withPerCallProgress(token, onProgress,
-				() @safe => callToolLoop(name, arguments, token));
-	}
-
-	/// Typed-arguments convenience for the per-call progress overload: serialize
-	/// the struct `args` and forward to the `Json`-arguments per-call-progress
-	/// `callTool`.
-	CallToolResult callTool(T)(string name, T args,
-			scope void delegate(ProgressNotification) @safe onProgress) @safe
-			if (!is(T : Json))
-	{
-		return callTool(name, serializeToJson(args), onProgress);
+		return callTool(name, serializeToJson(args), opts);
 	}
 
 	/// Issue `tools/call` and, against a draft server, complete any MRTR
@@ -748,19 +729,32 @@ final class McpClient : ClientProtocol
 				.to!string ~ "-" ~ n.to!string);
 	}
 
-	/// Run `body_` with a per-call progress sink installed: while it executes,
-	/// inbound progress correlated to `token` is delivered to `onProgress`, and
-	/// progress for any other token still reaches the previously-installed global
-	/// `this.onProgress`. The prior global handler is restored on return (including
-	/// on throw). A null `onProgress` installs no per-call routing. Centralises the
-	/// save/wrap/restore so the request-method overloads share one implementation
-	/// and the global field is never left swapped out.
-	private CallToolResult withPerCallProgress(ProgressToken token,
-			scope void delegate(ProgressNotification) @safe onProgress,
-			scope CallToolResult delegate() @safe body_) @safe
+	/// The progress token a request should attach: the caller's explicit
+	/// `opts.progressToken` when set, else a freshly minted one when an
+	/// `opts.onProgress` sink needs a token to correlate against, else unset.
+	private ProgressToken effectiveToken(ref RequestOptions opts) @safe
 	{
-		if (onProgress is null)
+		if (opts.progressToken.isSet)
+			return opts.progressToken;
+		if (opts.onProgress !is null)
+			opts.progressToken = mintProgressToken();
+		return opts.progressToken;
+	}
+
+	/// Run `body_` with `opts.onProgress` installed as a per-call sink (when
+	/// non-null): while it executes, inbound progress correlated to
+	/// `opts.progressToken` is delivered to `opts.onProgress`, and progress for
+	/// any other token still reaches the previously-installed global
+	/// `this.onProgress`. The prior global handler is restored on return
+	/// (including on throw). A null `opts.onProgress` runs `body_` directly.
+	/// Centralises the save/wrap/restore so every request verb shares one
+	/// implementation and the global field is never left swapped out.
+	private R withPerCallProgress(R)(RequestOptions opts, scope R delegate() @safe body_) @safe
+	{
+		if (opts.onProgress is null)
 			return body_();
+		const token = opts.progressToken;
+		auto onProgress = opts.onProgress;
 		auto prior = this.onProgress;
 		scope (exit)
 			this.onProgress = prior;
@@ -873,9 +867,10 @@ final class McpClient : ClientProtocol
 	/// against it: per the spec, "Clients SHOULD validate structured results
 	/// against this schema." A non-conforming result raises a clear
 	/// `McpException` rather than being accepted silently.
-	CallToolResult callTool(const Tool tool, Json arguments = Json.emptyObject) @safe
+	CallToolResult callTool(const Tool tool, Json arguments = Json.emptyObject,
+			RequestOptions opts = RequestOptions.init) @safe
 	{
-		auto result = callTool(tool.name, arguments);
+		auto result = callTool(tool.name, arguments, opts);
 		if (validateOutputSchema_)
 		{
 			const msg = validateOutput(tool, result);
@@ -916,23 +911,10 @@ final class McpClient : ClientProtocol
 	/// null, and `cache` carries the first page's parsed freshness hint.
 	ListResourcesResult listResources() @safe
 	{
-		ListResourcesResult acc;
-		bool first = true;
-		paginate((Nullable!string cursor) @safe {
-			Json p = Json.emptyObject;
-			if (!cursor.isNull)
-				p["cursor"] = cursor.get;
-			auto res = ListResourcesResult.fromJson(rpc("resources/list", p));
-			acc.resources ~= res.resources;
-			if (first)
-			{
-				acc.cache = res.cache;
-				first = false;
-			}
-			return res.nextCursor;
+		return drainList!ListResourcesResult("resources/list",
+				(ref ListResourcesResult a, ref ListResourcesResult r) @safe {
+			a.resources ~= r.resources;
 		});
-		acc.nextCursor = Nullable!string.init;
-		return acc;
 	}
 
 	/// `resources/templates/list`, auto-paginated. Returns the drained
@@ -941,47 +923,20 @@ final class McpClient : ClientProtocol
 	/// is null, and `cache` carries the first page's parsed freshness hint.
 	ListResourceTemplatesResult listResourceTemplates() @safe
 	{
-		ListResourceTemplatesResult acc;
-		bool first = true;
-		paginate((Nullable!string cursor) @safe {
-			Json p = Json.emptyObject;
-			if (!cursor.isNull)
-				p["cursor"] = cursor.get;
-			auto res = ListResourceTemplatesResult.fromJson(rpc("resources/templates/list", p));
-			acc.resourceTemplates ~= res.resourceTemplates;
-			if (first)
-			{
-				acc.cache = res.cache;
-				first = false;
-			}
-			return res.nextCursor;
+		return drainList!ListResourceTemplatesResult("resources/templates/list",
+				(ref ListResourceTemplatesResult a, ref ListResourceTemplatesResult r) @safe {
+			a.resourceTemplates ~= r.resourceTemplates;
 		});
-		acc.nextCursor = Nullable!string.init;
-		return acc;
 	}
 
-	/// `resources/read`.
-	ReadResourceResult readResource(string uri) @safe
+	/// `resources/read`. Per-request `progressToken` / `logLevel` / `onProgress`
+	/// are carried in `opts` (see `RequestOptions`).
+	ReadResourceResult readResource(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
-		return ReadResourceResult.fromJson(rpc("resources/read",
-				buildReadResourceParams(uri, ProgressToken.init)));
-	}
-
-	/// `resources/read`, requesting progress updates for the read (see
-	/// `callTool` with a `ProgressToken`).
-	ReadResourceResult readResource(string uri, ProgressToken progressToken) @safe
-	{
-		return ReadResourceResult.fromJson(rpc("resources/read",
-				buildReadResourceParams(uri, progressToken)));
-	}
-
-	/// `resources/read`, opting in to per-request log messages on the draft
-	/// protocol (see `callTool` with a `logLevel`). `logLevel` is carried in
-	/// `params._meta["io.modelcontextprotocol/logLevel"]`; empty attaches nothing.
-	ReadResourceResult readResource(string uri, ProgressToken progressToken, string logLevel) @safe
-	{
-		return ReadResourceResult.fromJson(rpc("resources/read",
-				withRequestLogLevel(buildReadResourceParams(uri, progressToken), logLevel)));
+		auto token = effectiveToken(opts);
+		auto params = withRequestLogLevel(buildReadResourceParams(uri, token), opts.logLevel);
+		return withPerCallProgress!ReadResourceResult(opts,
+				() @safe => ReadResourceResult.fromJson(rpc("resources/read", params)));
 	}
 
 	/// Build the `resources/read` params, optionally attaching a progress token.
@@ -997,58 +952,33 @@ final class McpClient : ClientProtocol
 	/// the first page's parsed freshness hint.
 	ListPromptsResult listPrompts() @safe
 	{
-		ListPromptsResult acc;
-		bool first = true;
-		paginate((Nullable!string cursor) @safe {
-			Json p = Json.emptyObject;
-			if (!cursor.isNull)
-				p["cursor"] = cursor.get;
-			auto res = ListPromptsResult.fromJson(rpc("prompts/list", p));
-			acc.prompts ~= res.prompts;
-			if (first)
-			{
-				acc.cache = res.cache;
-				first = false;
-			}
-			return res.nextCursor;
+		return drainList!ListPromptsResult("prompts/list",
+				(ref ListPromptsResult a, ref ListPromptsResult r) @safe {
+			a.prompts ~= r.prompts;
 		});
-		acc.nextCursor = Nullable!string.init;
-		return acc;
 	}
 
-	/// `prompts/get`.
-	GetPromptResult getPrompt(string name, Json arguments = Json.emptyObject) @safe
+	/// `prompts/get`. Per-request `progressToken` / `logLevel` / `onProgress` are
+	/// carried in `opts` (see `RequestOptions`).
+	GetPromptResult getPrompt(string name, Json arguments = Json.emptyObject,
+			RequestOptions opts = RequestOptions.init) @safe
 	{
-		return GetPromptResult.fromJson(rpc("prompts/get",
-				buildGetPromptParams(name, arguments, ProgressToken.init)));
-	}
-
-	/// `prompts/get`, requesting progress updates for the request (see
-	/// `callTool` with a `ProgressToken`).
-	GetPromptResult getPrompt(string name, Json arguments, ProgressToken progressToken) @safe
-	{
-		return GetPromptResult.fromJson(rpc("prompts/get",
-				buildGetPromptParams(name, arguments, progressToken)));
-	}
-
-	/// `prompts/get`, opting in to per-request log messages on the draft protocol
-	/// (see `callTool` with a `logLevel`). `logLevel` is carried in
-	/// `params._meta["io.modelcontextprotocol/logLevel"]`; empty attaches nothing.
-	GetPromptResult getPrompt(string name, Json arguments,
-			ProgressToken progressToken, string logLevel) @safe
-	{
-		return GetPromptResult.fromJson(rpc("prompts/get",
-				withRequestLogLevel(buildGetPromptParams(name, arguments, progressToken), logLevel)));
+		auto token = effectiveToken(opts);
+		auto params = withRequestLogLevel(buildGetPromptParams(name, arguments,
+				token), opts.logLevel);
+		return withPerCallProgress!GetPromptResult(opts,
+				() @safe => GetPromptResult.fromJson(rpc("prompts/get", params)));
 	}
 
 	/// Typed-arguments convenience: serialize the struct `args` to its JSON wire
 	/// shape via vibe's `serializeToJson` and forward to the `Json`-arguments
 	/// `getPrompt`. Mirrors the typed `callTool(T)` so callers can pass a
 	/// strongly typed prompt-argument struct instead of hand-building a `Json`
-	/// object. Equivalent to `getPrompt(name, serializeToJson(args))`.
-	GetPromptResult getPrompt(T)(string name, T args) @safe if (!is(T : Json))
+	/// object.
+	GetPromptResult getPrompt(T)(string name, T args, RequestOptions opts = RequestOptions.init) @safe
+			if (!is(T : Json))
 	{
-		return getPrompt(name, serializeToJson(args));
+		return getPrompt(name, serializeToJson(args), opts);
 	}
 
 	/// Build the `prompts/get` params, optionally attaching a progress token.
@@ -1068,26 +998,17 @@ final class McpClient : ClientProtocol
 	/// `argumentValue` are the argument being filled in and its partial value.
 	/// `context`, when non-null, supplies previously-resolved argument values
 	/// (`{name: value}`) so the server can give context-aware completions.
+	/// Per-request `progressToken` / `logLevel` / `onProgress` are carried in
+	/// `opts` (see `RequestOptions`).
 	CompleteResult complete(CompletionReference reference, string argumentName,
-			string argumentValue, string[string] context = null) @safe
+			string argumentValue, string[string] context = null,
+			RequestOptions opts = RequestOptions.init) @safe
 	{
-		return CompleteResult.fromJson(rpc("completion/complete",
-				buildCompleteParams(reference, argumentName, argumentValue, context)));
-	}
-
-	/// `completion/complete`, requesting progress updates for the request. The
-	/// server may then emit `notifications/progress` carrying `progressToken`,
-	/// observable via `onNotification` / `onProgress`. Per
-	/// basic/utilities/progress, the token is sent in `params._meta.progressToken`.
-	/// Mirrors the `ProgressToken` overloads on `callTool` / `readResource` /
-	/// `getPrompt`. `context`, when non-null, supplies previously-resolved
-	/// argument values so the server can give context-aware completions.
-	CompleteResult complete(CompletionReference reference, string argumentName,
-			string argumentValue, ProgressToken progressToken, string[string] context = null) @safe
-	{
-		return CompleteResult.fromJson(rpc("completion/complete",
-				withProgressToken(buildCompleteParams(reference,
-				argumentName, argumentValue, context), progressToken)));
+		auto token = effectiveToken(opts);
+		auto params = withRequestLogLevel(withProgressToken(buildCompleteParams(reference,
+				argumentName, argumentValue, context), token), opts.logLevel);
+		return withPerCallProgress!CompleteResult(opts,
+				() @safe => CompleteResult.fromJson(rpc("completion/complete", params)));
 	}
 
 	/// Build the `completion/complete` request params. Separated from `complete`
@@ -1187,8 +1108,8 @@ final class McpClient : ClientProtocol
 	/// `_meta["io.modelcontextprotocol/logLevel"]`. So on a draft-negotiated
 	/// session this does NOT send the removed RPC; instead it records `level` as
 	/// the sticky per-request opt-in that `injectDraftMeta` stamps onto every
-	/// subsequent request's `_meta` (see `withRequestLogLevel` and the
-	/// request-method log-level overloads for a single-request override). Passing
+	/// subsequent request's `_meta` (see `withRequestLogLevel` and
+	/// `RequestOptions.logLevel` for a single-request override). Passing
 	/// an empty `level` clears the draft opt-in.
 	///
 	/// Typed entry point: pass a `LogLevel` for compile-time safety, so an invalid
@@ -1781,13 +1702,6 @@ final class McpClient : ClientProtocol
 	{
 		initializeRequestId = id;
 	}
-
-	private static McpException errorFrom(Json error) @safe
-	{
-		const code = ("code" in error) ? error["code"].get!int : ErrorCode.internalError;
-		const m = ("message" in error) ? error["message"].get!string : "server error";
-		return new McpException(code, m, error);
-	}
 }
 
 /// Pick the newest protocol version both this SDK and the server support, given
@@ -2205,7 +2119,7 @@ unittest  // an absent nested intermediate node emits no header
 	assert(HttpHeader.paramPrefix ~ "Region" !in headers);
 }
 
-unittest  // callTool logLevel overload attaches the draft per-request opt-in
+unittest  // callTool RequestOptions.logLevel attaches the draft per-request opt-in
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableDraft();
@@ -2220,12 +2134,12 @@ unittest  // callTool logLevel overload attaches the draft per-request opt-in
 		res["content"] = Json.emptyArray;
 		return res;
 	};
-	c.callTool("countdown", Json.emptyObject, ProgressToken.init, "debug");
+	c.callTool("countdown", Json.emptyObject, RequestOptions(ProgressToken.init, "debug"));
 	assert(seen.type == Json.Type.object);
 	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
 }
 
-unittest  // readResource logLevel overload attaches the draft per-request opt-in
+unittest  // readResource RequestOptions.logLevel attaches the draft per-request opt-in
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableDraft();
@@ -2237,11 +2151,11 @@ unittest  // readResource logLevel overload attaches the draft per-request opt-i
 		res["contents"] = Json.emptyArray;
 		return res;
 	};
-	c.readResource("file:///x", ProgressToken.init, "notice");
+	c.readResource("file:///x", RequestOptions(ProgressToken.init, "notice"));
 	assert(seen["_meta"][MetaKey.logLevel].get!string == "notice");
 }
 
-unittest  // getPrompt logLevel overload attaches the draft per-request opt-in
+unittest  // getPrompt RequestOptions.logLevel attaches the draft per-request opt-in
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableDraft();
@@ -2253,7 +2167,7 @@ unittest  // getPrompt logLevel overload attaches the draft per-request opt-in
 		res["messages"] = Json.emptyArray;
 		return res;
 	};
-	c.getPrompt("greet", Json.emptyObject, ProgressToken.init, "warning");
+	c.getPrompt("greet", Json.emptyObject, RequestOptions(ProgressToken.init, "warning"));
 	assert(seen["_meta"][MetaKey.logLevel].get!string == "warning");
 }
 
@@ -2790,7 +2704,7 @@ unittest  // -32042 URLElicitationRequiredError registers its elicitationIds (cl
 {
 	auto c = McpClient.http("http://localhost");
 
-	// Build the error object exactly as `errorFrom` would hand it to rpc():
+	// Build the error object exactly as the transport hands it to rpc():
 	// {code: -32042, message, data: {elicitations: [ElicitRequestURLParams...]}}.
 	Json e0 = Json.emptyObject;
 	e0["mode"] = "url";
@@ -2805,7 +2719,8 @@ unittest  // -32042 URLElicitationRequiredError registers its elicitationIds (cl
 
 	// rpc() must surface the error AND, as a side effect, register the id so a
 	// later completion correlates. Drive it through the real rpc() path via the
-	// test seam, which throws the McpException `errorFrom` would build.
+	// test seam, which throws the McpException the transport
+	// (HttpClientTransport.errorFrom) would build.
 	c.onRpcForTest = (string, Json) @safe {
 		throw new McpException(cast(int) ErrorCode.urlElicitationRequired,
 				"URL elicitation required", error);
@@ -3020,7 +2935,7 @@ unittest  // buildCompleteParams includes the resolved-argument context when giv
 	assert(p["context"]["arguments"]["owner"].get!string == "octocat");
 }
 
-unittest  // complete() ProgressToken overload attaches the token under _meta.progressToken
+unittest  // complete() RequestOptions.progressToken attaches the token under _meta.progressToken
 {
 	auto c = McpClient.http("http://localhost");
 	Json sent;
@@ -3034,7 +2949,8 @@ unittest  // complete() ProgressToken overload attaches the token under _meta.pr
 		return r;
 	};
 
-	c.complete(CompletionReference.forPrompt("greet"), "name", "al", ProgressToken("comp-tok"));
+	c.complete(CompletionReference.forPrompt("greet"), "name", "al", null,
+			RequestOptions(ProgressToken("comp-tok")));
 
 	assert(sent["_meta"]["progressToken"].get!string == "comp-tok");
 	// The base completion params are still shaped as usual.
@@ -3042,7 +2958,7 @@ unittest  // complete() ProgressToken overload attaches the token under _meta.pr
 	assert(sent["argument"]["value"].get!string == "al");
 }
 
-unittest  // complete() ProgressToken overload still carries the resolved-argument context
+unittest  // complete() with RequestOptions.progressToken still carries the resolved-argument context
 {
 	auto c = McpClient.http("http://localhost");
 	Json sent;
@@ -3056,7 +2972,8 @@ unittest  // complete() ProgressToken overload still carries the resolved-argume
 	};
 
 	string[string] ctx = ["owner": "octocat"];
-	c.complete(CompletionReference.forPrompt("pr"), "repo", "m", ProgressToken(7L), ctx);
+	c.complete(CompletionReference.forPrompt("pr"), "repo", "m", ctx,
+			RequestOptions(ProgressToken(7L)));
 
 	assert(sent["_meta"]["progressToken"].get!long == 7);
 	assert(sent["context"]["arguments"]["owner"].get!string == "octocat");
@@ -3170,9 +3087,8 @@ unittest  // callTool with a per-call progress callback receives that call's pro
 	};
 
 	ProgressNotification[] received;
-	c.callTool("work", Json.emptyObject, (ProgressNotification n) @safe {
-		received ~= n;
-	});
+	c.callTool("work", Json.emptyObject, RequestOptions(ProgressToken.init, "",
+			(ProgressNotification n) @safe { received ~= n; }));
 
 	assert(received.length == 1);
 	assert(received[0].progress == 0.5);
@@ -3189,7 +3105,8 @@ unittest  // a per-call progress callback restores the prior global onProgress
 		return r;
 	};
 
-	c.callTool("work", Json.emptyObject, (ProgressNotification n) @safe {});
+	c.callTool("work", Json.emptyObject, RequestOptions(ProgressToken.init, "",
+			(ProgressNotification n) @safe {}));
 
 	// After the call the global onProgress field must be restored, and a later
 	// progress notification reaches it.
@@ -3199,6 +3116,36 @@ unittest  // a per-call progress callback restores the prior global onProgress
 	pn["progress"] = 1.0;
 	c.dispatchInbound(Message(makeNotification("notifications/progress", pn)));
 	assert(global.length == 1);
+}
+
+unittest  // RequestOptions combines an explicit progressToken, logLevel and onProgress
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableDraft();
+
+	// The caller supplies its own token; onProgress must correlate against THAT
+	// token (no minting), and logLevel must still ride along in the same request.
+	Json seen = Json.undefined;
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "tools/call");
+		seen = params;
+		Json pn = Json.emptyObject;
+		pn["progressToken"] = params["_meta"]["progressToken"];
+		pn["progress"] = 0.25;
+		c.dispatchInbound(Message(makeNotification("notifications/progress", pn)));
+		Json r = Json.emptyObject;
+		r["content"] = Json.emptyArray;
+		return r;
+	};
+
+	ProgressNotification[] received;
+	c.callTool("work", Json.emptyObject, RequestOptions(ProgressToken("caller-tok"),
+			"debug", (ProgressNotification n) @safe { received ~= n; }));
+
+	assert(seen["_meta"]["progressToken"].get!string == "caller-tok");
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
+	assert(received.length == 1);
+	assert(received[0].progress == 0.25);
 }
 
 unittest  // typed getPrompt produces the same wire args as the Json form
