@@ -63,6 +63,13 @@ private void validateEnvelope(Json j) @safe
 		throw invalidRequest("JSON-RPC message must be an object");
 	if (("jsonrpc" !in j) || j["jsonrpc"].get!string != "2.0")
 		throw invalidRequest("Missing or invalid jsonrpc version (expected \"2.0\")");
+	// A message bearing a `method` with an explicit `id:null` is neither a valid
+	// request (the spec requires a request id that is not null) nor a
+	// notification (which omits `id` entirely). Reject it so the peer receives a
+	// -32600 rather than having the message silently classified as a
+	// notification and dropped.
+	if (("method" in j) && ("id" in j) && j["id"].type == Json.Type.null_)
+		throw invalidRequest("Request id MUST NOT be null");
 }
 
 /// Parse and classify a single JSON-RPC message from text.
@@ -78,7 +85,36 @@ Message parseMessage(string text) @safe
 }
 
 /// Parse a JSON-RPC batch (array) from text.
+///
+/// JSON-RPC 2.0 requires a recognizable batch to be processed member-by-member:
+/// each well-formed member yields its own response and only the malformed members
+/// produce individual `id:null` errors. So a member that fails `validateEnvelope`
+/// is not fatal to the batch — it is collected into `errors` (with its position)
+/// while the well-formed members are returned in `messages`, letting the
+/// dispatcher answer every member. Only a genuinely unrecognizable batch (not
+/// valid JSON, not an array, empty array) throws.
 Message[] parseBatch(string text) @safe
+{
+	return parseBatchTolerant(text).messages;
+}
+
+/// A malformed batch member: its position in the array and the validation error.
+struct BatchMemberError
+{
+	size_t index;
+	McpException error;
+}
+
+/// `parseBatch` result that keeps malformed members rather than discarding the
+/// whole batch.
+struct BatchResult
+{
+	Message[] messages;
+	BatchMemberError[] errors;
+}
+
+/// As `parseBatch`, but tolerant of individual malformed members (see `parseBatch`).
+BatchResult parseBatchTolerant(string text) @safe
 {
 	Json arr;
 	try
@@ -89,21 +125,29 @@ Message[] parseBatch(string text) @safe
 		throw invalidRequest("Batch must be a JSON array");
 	if (arr.length == 0)
 		throw invalidRequest("Batch must not be empty");
-	Message[] msgs;
+	BatchResult result;
 	foreach (i; 0 .. arr.length)
 	{
 		auto item = arr[i];
-		validateEnvelope(item);
-		msgs ~= Message(item);
+		try
+		{
+			validateEnvelope(item);
+			result.messages ~= Message(item);
+		}
+		catch (McpException e)
+			result.errors ~= BatchMemberError(i, e);
 	}
-	return msgs;
+	return result;
 }
 
-/// Result of `parseAny`: a single message or a batch, normalized to a list.
+/// Result of `parseAny`: a single message or a batch, normalized to a list. For a
+/// batch, `errors` carries any malformed members (empty otherwise) so the
+/// dispatcher can emit a distinct `id:null` error per malformed member.
 struct ParsedInput
 {
 	bool isBatch;
 	Message[] messages;
+	BatchMemberError[] errors;
 }
 
 /// Parse text that may be either a single message or a batch array.
@@ -112,7 +156,10 @@ ParsedInput parseAny(string text) @safe
 	import std.string : strip, startsWith;
 
 	if (text.strip.startsWith("["))
-		return ParsedInput(true, parseBatch(text));
+	{
+		auto batch = parseBatchTolerant(text);
+		return ParsedInput(true, batch.messages, batch.errors);
+	}
 	return ParsedInput(false, [parseMessage(text)]);
 }
 
@@ -275,4 +322,47 @@ unittest  // parseAny distinguishes single vs batch
 
 	auto many = parseAny(`[{"jsonrpc":"2.0","id":1,"method":"ping"}]`);
 	assert(many.isBatch && many.messages.length == 1);
+}
+
+unittest  // a mixed batch keeps valid members and reports malformed ones
+{
+	auto batch = parseAny(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
+		{"jsonrpc":"1.0","id":2,"method":"ping"},
+		{"jsonrpc":"2.0","method":"notifications/initialized"}]`);
+	assert(batch.isBatch);
+	assert(batch.messages.length == 2);
+	assert(batch.messages[0].kind == MessageKind.request);
+	assert(batch.messages[1].kind == MessageKind.notification);
+	assert(batch.errors.length == 1);
+	assert(batch.errors[0].index == 1);
+	assert(batch.errors[0].error.code == ErrorCode.invalidRequest);
+}
+
+unittest  // a batch of only malformed members reports each error, no messages
+{
+	auto batch = parseAny(`[{"id":1,"method":"ping"},{"jsonrpc":"1.0"}]`);
+	assert(batch.isBatch);
+	assert(batch.messages.length == 0);
+	assert(batch.errors.length == 2);
+}
+
+unittest  // an unrecognizable batch (empty / non-array) still throws
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseBatch(`[]`));
+	assertThrown!McpException(parseBatch(`{"jsonrpc":"2.0"}`));
+}
+
+unittest  // method with explicit null id is rejected, not treated as notification
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":null,"method":"tools/list"}`));
+}
+
+unittest  // a genuine notification (no id) is still accepted
+{
+	auto m = parseMessage(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+	assert(m.kind == MessageKind.notification);
 }

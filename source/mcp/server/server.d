@@ -1279,6 +1279,10 @@ final class McpServer
 			if (!resp.isNull)
 				responses ~= resp.get;
 		}
+		// A malformed member of an otherwise-recognizable batch yields its own
+		// `id:null` error rather than discarding the valid members alongside it.
+		foreach (err; input.errors)
+			responses ~= makeErrorResponse(Json(null), err.error);
 		return responses.length == 0 ? "" : responses.toString();
 	}
 
@@ -3909,6 +3913,40 @@ unittest  // handleRaw still processes a batch on a 2025-03-26 session
 	auto arr = parseJsonString(outText);
 	assert(arr.type == Json.Type.array);
 	assert(arr.length == 2);
+}
+
+unittest  // handleRaw answers valid members of a mixed batch and errors malformed ones
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = makeTestServer();
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-03-26";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", params));
+
+	// The middle member has a wrong jsonrpc version: it must not discard the two
+	// valid requests. Expect three responses — two results plus one null-id error.
+	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
+		{"jsonrpc":"1.0","id":99,"method":"ping"},
+		{"jsonrpc":"2.0","id":2,"method":"ping"}]`);
+	auto arr = parseJsonString(outText);
+	assert(arr.type == Json.Type.array);
+	assert(arr.length == 3);
+
+	bool sawId1, sawId2, sawNullError;
+	foreach (i; 0 .. arr.length)
+	{
+		auto r = arr[i];
+		if (r["id"].type == Json.Type.null_ && "error" in r)
+			sawNullError = r["error"]["code"].get!int == ErrorCode.invalidRequest;
+		else if (r["id"].type == Json.Type.int_ && r["id"].get!int == 1)
+			sawId1 = true;
+		else if (r["id"].type == Json.Type.int_ && r["id"].get!int == 2)
+			sawId2 = true;
+	}
+	assert(sawId1 && sawId2 && sawNullError);
 }
 
 unittest  // registering a tool whose name already exists throws
