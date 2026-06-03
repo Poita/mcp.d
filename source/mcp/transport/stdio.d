@@ -360,12 +360,21 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 	void writeLine(string s) @safe
 	{
 		auto bytes = cast(const(ubyte)[])(s ~ "\n");
-		// Write the whole frame (IOMode.all loops internally until done).
-		() @trusted {
-			asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
+		// Write the whole frame (IOMode.all loops internally until done). Inspect
+		// the result symmetrically with readLine: a status that is neither ok nor
+		// wouldBlock, or a short write, means the peer closed its read end (EPIPE /
+		// IOStatus.error) and the channel is broken. Throw so DuplexChannel.send
+		// observes the failure instead of producing replies that are silently lost.
+		// On POSIX a broken-pipe write may also raise SIGPIPE; a server using this
+		// transport should ignore SIGPIPE (signal(SIGPIPE, SIG_IGN)) so the failure
+		// surfaces here as IOStatus.error rather than terminating the process.
+		auto res = () @trusted {
+			return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
 				eventDriver.pipes.write(outFD, bytes, IOMode.all, cb);
 			});
 		}();
+		if (writeFailed(res[1], res[2], bytes.length))
+			throw new Exception("runStdio: write to stdout failed (peer closed its read end?)");
 	}
 
 	() @trusted {
@@ -380,6 +389,30 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 		});
 		runEventLoop();
 	}();
+}
+
+/// Decide whether a stdout write is a failure the channel must surface. A status
+/// that is neither `ok` nor `wouldBlock`, or a short write (fewer bytes than the
+/// frame), means the peer closed its read end (EPIPE / `IOStatus.error`); the
+/// channel is broken and the write must not be silently swallowed.
+private bool writeFailed(ECStatus)(ECStatus status, size_t nbytes, size_t expected) @safe pure nothrow @nogc
+{
+	import eventcore.driver : IOStatus;
+
+	if (status != IOStatus.ok && status != IOStatus.wouldBlock)
+		return true;
+	return nbytes < expected;
+}
+
+unittest  // writeFailed flags a non-ok status and a short write, accepts a full ok write
+{
+	import eventcore.driver : IOStatus;
+
+	assert(!writeFailed(IOStatus.ok, 10, 10));
+	assert(!writeFailed(IOStatus.wouldBlock, 10, 10));
+	assert(writeFailed(IOStatus.error, 10, 10));
+	assert(writeFailed(IOStatus.disconnected, 0, 10));
+	assert(writeFailed(IOStatus.ok, 4, 10));
 }
 
 unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with its O_NONBLOCK bit unchanged
