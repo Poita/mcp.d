@@ -212,6 +212,10 @@ private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
 
 /// A short-TTL cache of positive (`active:true`) introspection results, keyed by
 /// the raw token. Negative results are never cached.
+///
+/// The keyed lookup is not constant-time, but a hit requires the attacker to
+/// already present a token that introspected as active, so it is not a guessing
+/// oracle; opaque bearer tokens are assumed to be high-entropy secrets.
 final class PositiveCache
 {
 	private struct Entry
