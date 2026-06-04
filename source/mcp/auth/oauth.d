@@ -56,8 +56,12 @@ PkcePair generatePkce() @safe
 // WWW-Authenticate parsing (RFC 9728 §5.1)
 // ===========================================================================
 
-/// A parsed `WWW-Authenticate` challenge: the auth scheme plus its parameters
-/// (e.g. `resource_metadata`, `scope`, `error`).
+/// A parsed `WWW-Authenticate` challenge: the auth scheme plus its parameters.
+///
+/// `parseWwwAuthenticate` populates the standard challenge fields (RFC 9728
+/// §5.1 `resource_metadata`/`scope` and RFC 6750 §3.1 `error`/`error_description`)
+/// into `params`; the typed accessors below expose them without forcing
+/// consumers toward substring matching on the raw header.
 struct WwwAuthenticate
 {
 	string scheme;
@@ -71,6 +75,16 @@ struct WwwAuthenticate
 	string scope_() const @safe
 	{
 		return ("scope" in params) ? params["scope"] : null;
+	}
+
+	string error() const @safe
+	{
+		return ("error" in params) ? params["error"] : null;
+	}
+
+	string errorDescription() const @safe
+	{
+		return ("error_description" in params) ? params["error_description"] : null;
 	}
 }
 
@@ -439,6 +453,21 @@ unittest  // WWW-Authenticate parsing extracts resource_metadata and scope
 	assert(w.resourceMetadata == "https://mcp.example.com/.well-known/oauth-protected-resource");
 	assert(w.scope_ == "read write");
 	assert(w.params["error"] == "insufficient_scope");
+}
+
+unittest  // WWW-Authenticate exposes typed error()/errorDescription() accessors
+{
+	auto w = parseWwwAuthenticate(
+			`Bearer error="insufficient_scope", error_description="needs more scope"`);
+	assert(w.error == "insufficient_scope");
+	assert(w.errorDescription == "needs more scope");
+}
+
+unittest  // WWW-Authenticate error()/errorDescription() are null when absent
+{
+	auto w = parseWwwAuthenticate(`Bearer scope="read"`);
+	assert(w.error is null);
+	assert(w.errorDescription is null);
 }
 
 unittest  // protected-resource metadata well-known URLs: path-scoped then root
@@ -2315,8 +2344,27 @@ bool validateAuthorizationResponseState(string responseState, string expectedSta
 	// No expected state -> the client did not use one; nothing to verify.
 	if (expectedState.length == 0)
 		return true;
-	// Expected state set: the response MUST include a matching state.
-	return responseState == expectedState;
+	// Expected state set: the response MUST include a matching state. Use a
+	// constant-time compare so the helper stays safe even if reused for a
+	// multi-use or attacker-probeable secret (defence in depth: the generated
+	// state is a single-use CSRF/mix-up nonce, not a long-lived secret).
+	return constantTimeEquals(responseState, expectedState);
+}
+
+/// Length-independent constant-time byte comparison. The running time depends
+/// only on the longer input's length, never on the position of the first
+/// differing byte, so it leaks no information through a timing side channel.
+private bool constantTimeEquals(scope const(char)[] a, scope const(char)[] b) @safe pure nothrow @nogc
+{
+	const n = a.length > b.length ? a.length : b.length;
+	uint diff = cast(uint)(a.length ^ b.length);
+	foreach (i; 0 .. n)
+	{
+		const ca = i < a.length ? a[i] : 0;
+		const cb = i < b.length ? b[i] : 0;
+		diff |= cast(uint)(ca ^ cb);
+	}
+	return diff == 0;
 }
 
 unittest  // state matching the expected value is accepted
@@ -2342,6 +2390,15 @@ unittest  // no expected state means nothing to verify (accept)
 unittest  // state comparison is raw string comparison with no normalization
 {
 	assert(!validateAuthorizationResponseState("XYZ", "xyz"));
+}
+
+unittest  // constant-time state compare rejects prefixes and length mismatches
+{
+	// A prefix of the expected value must not be accepted.
+	assert(!validateAuthorizationResponseState("xy", "xyz"));
+	assert(!validateAuthorizationResponseState("xyzz", "xyz"));
+	// A full match is still accepted.
+	assert(validateAuthorizationResponseState("xyz", "xyz"));
 }
 
 unittest  // metadata parses authorization_response_iss_parameter_supported
