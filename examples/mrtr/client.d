@@ -170,14 +170,13 @@ private int runE2E(McpClient client) @safe
 	check(sawDate, "missing 'meeting_date' input request");
 	check(sawAgenda, "missing 'meeting_agenda' input request");
 
-	// SEP-2322: the opaque requestState the server stashed (it encoded the topic
-	// as a typed RequestState struct, i.e. a JSON object `{"topic":"Q3 roadmap"}`).
-	// The typed `requestStateAs!T` accessor mirrors the server's
-	// `RequestContext.requestStateAs!T`; per SEP-2322 a conformant client treats
-	// `requestState` as opaque and only echoes it — this decode is purely the
-	// round-trip-shape assertion, not a normal operation.
-	check(raw.requestStateAs!RequestState.topic == "Q3 roadmap",
-			"requestState topic mismatch: '" ~ raw.requestState ~ "'");
+	// SEP-2322: requestState is server-owned and opaque — the client MUST NOT
+	// parse it, only echo it verbatim. This server also runs `secureRequestState`,
+	// so the blob is a signed+expiring envelope the client could not read even if
+	// it tried. We assert only that a blob is present to echo; that the server
+	// correctly recovered the stashed topic from the verified blob is proven
+	// end-to-end by the final result assertions below (`Booking.topic`).
+	check(raw.requestState.length > 0, "expected an opaque requestState blob to echo back");
 
 	// ---- Second round-trip view: install mock handlers; the SDK completes the loop. ----
 	// Installing onElicitation/onSampling alone auto-advertises the matching
@@ -218,14 +217,4 @@ private int runE2E(McpClient client) @safe
 				"server completed in 2 rounds.");
 	}();
 	return 0;
-}
-
-/// The client's view of the server's opaque `requestState` contract: the server
-/// encodes a typed `RequestState` struct, so the blob is a JSON object
-/// `{"topic":"..."}`. Only used by the round-trip-shape assertion via
-/// `CallToolResult.requestStateAs!RequestState`; per SEP-2322 a conformant client
-/// otherwise treats `requestState` as opaque and merely echoes it.
-private struct RequestState
-{
-	string topic;
 }

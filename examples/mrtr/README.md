@@ -54,6 +54,14 @@ MRTR `Json`** — it uses the typed builders and decoders throughout:
   — the opaque `requestState` is a typed `RequestState` struct (serialized on the
   way out, decoded on the retry) rather than a `"topic="`-prefixed string parsed
   by hand.
+- **`server.secureRequestState(RequestStateSecurity(key))`** — opts into the
+  SEP-2322 protections for `requestState`: the blob the client echoes is signed
+  (HMAC-SHA256), expiry-stamped, and bound to the authenticated subject, and a
+  tampered / expired / cross-user blob is rejected and the round re-elicited. It
+  is transparent (the handler's `inputRequired(reqs, T)` / `requestStateAs!T` are
+  unchanged), and the client treats `requestState` as a fully opaque blob it only
+  echoes. A real deployment supplies a secret key shared across instances; the
+  example uses a fixed demo key.
 - **`ctx.isResubmit()` / `ctx.hasInputResponse(id)`** — detect the resubmit round
   instead of open-coding `(id in ctx.inputResponses())` membership checks.
 - **`ctx.inputResponseAs!ElicitResult(id)`** and

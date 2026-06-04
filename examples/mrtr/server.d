@@ -58,6 +58,12 @@ import examples_common : runServerFromArgs;
 /// client.d (and the README) agree.
 enum ushort defaultPort = 8765;
 
+/// Demo secret for `secureRequestState`. A real deployment loads the key from a
+/// secret store and shares it across instances (verification fails if round 2
+/// lands on an instance with a different key); this fixed 32-byte value keeps the
+/// example's e2e deterministic.
+enum string demoRequestStateKey = "mrtr-demo-requeststate-key-0001!";
+
 void main(string[] args) @safe
 {
 	auto server = new McpServer("mrtr-example", "0.1.0",
@@ -65,6 +71,17 @@ void main(string[] args) @safe
 	// Register every @tool method of the API class in one call; the tool's input
 	// schema and argument marshalling are derived from the method signature.
 	registerHandlers(server, new MrtrApi);
+
+	// SEP-2322 says the server MUST validate the client-echoed `requestState` and
+	// SHOULD protect it, since it round-trips through the untrusted client. Opt in
+	// to the SDK's codec: it signs (HMAC-SHA256) the opaque blob, stamps a short
+	// expiry, and binds it to the authenticated subject — so a tampered, expired,
+	// or cross-user blob is rejected and the round is re-elicited. This is
+	// transparent: `bookMeeting` keeps using `inputRequired(reqs, T)` /
+	// `requestStateAs!T` unchanged. (This example is unauthenticated, so the
+	// subject binding is a no-op here; integrity + expiry still apply, and an
+	// authenticated server gets per-user binding for free.)
+	server.secureRequestState(RequestStateSecurity(cast(ubyte[]) demoRequestStateKey.dup));
 
 	// The scaffold picks the transport from argv and blocks until exit.
 	runServerFromArgs(server, args, defaultPort);
