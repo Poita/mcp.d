@@ -392,18 +392,22 @@ struct CacheHint
 }
 
 /// Attach the draft `CacheableResult` fields (`ttlMs`, `cacheScope`) to a result
-/// object from a `CacheHint`. A freshness hint for clients/intermediaries that
-/// complements `listChanged` notifications.
+/// object from a `CacheHint` and return it, leaving the original untouched (matching
+/// the sibling `withSubscriptionId`). A freshness hint for clients/intermediaries
+/// that complements `listChanged` notifications.
 Json withCache(Json result, CacheHint hint) @safe
 {
 	if (result.type != Json.Type.object)
 		return result;
+	// `vibe.data.Json` is a reference type, so clone before writing to avoid
+	// mutating the caller's object as a side effect.
+	Json out_ = result.clone();
 	// Spec (`CacheableResult`): servers MUST provide a `ttlMs` value that is
 	// >= 0. Clamp at this single emission chokepoint so a negative value can
 	// never reach the wire, regardless of caller input.
-	result["ttlMs"] = hint.ttlMs < 0 ? 0L : hint.ttlMs;
-	result["cacheScope"] = cast(string) hint.cacheScope;
-	return result;
+	out_["ttlMs"] = hint.ttlMs < 0 ? 0L : hint.ttlMs;
+	out_["cacheScope"] = cast(string) hint.cacheScope;
+	return out_;
 }
 
 /// Parse a draft `CacheableResult` freshness hint from a result object. Reads
@@ -701,9 +705,12 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 /// map of (top-level) parameter name -> header name (`Mcp-Param-{name}`).
 ///
 /// Retained for backward compatibility; only top-level, primitive-typed, valid
-/// annotations appear. Prefer `paramHeaders` (path-aware, any nesting depth) for
-/// new code.
-string[string] paramHeaderMap(Json inputSchema) @safe
+/// annotations appear. Nested annotations (which `validateInputSchemaHeaders`
+/// accepts and `paramHeaders` surfaces) are silently omitted, so a schema whose
+/// only annotations are nested validates yet yields an empty map. Prefer
+/// `paramHeaders` (path-aware, any nesting depth) for new code.
+deprecated("nested x-mcp-header annotations are dropped; use paramHeaders") string[string] paramHeaderMap(
+		Json inputSchema) @safe
 {
 	string[string] map;
 	foreach (ph; paramHeaders(inputSchema))
@@ -1327,6 +1334,16 @@ unittest  // withCache clamps a negative ttlMs to 0 (spec: ttlMs MUST be >= 0)
 	assert(c["ttlMs"].get!long == 0);
 }
 
+unittest  // withCache leaves the original result untouched (clones, like withSubscriptionId)
+{
+	Json r = Json.emptyObject;
+	r["tools"] = Json.emptyArray;
+	auto c = withCache(r, CacheHint(5000, CacheScope.private_));
+	assert("ttlMs" !in r);
+	assert("cacheScope" !in r);
+	assert(c["ttlMs"].get!long == 5000);
+}
+
 unittest  // parseCacheHint clamps a negative ttlMs to 0 on read
 {
 	Json r = Json.emptyObject;
@@ -1721,7 +1738,7 @@ unittest  // metaLabels splits dot-separated labels, preserving empties
 	assert(metaLabels("solo") == ["solo"]);
 }
 
-unittest  // paramHeaderMap reads x-mcp-header annotations
+deprecated unittest  // paramHeaderMap reads x-mcp-header annotations
 {
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
@@ -1737,6 +1754,24 @@ unittest  // paramHeaderMap reads x-mcp-header annotations
 	assert("region" in m);
 	assert(m["region"] == "Mcp-Param-Region");
 	assert("query" !in m);
+}
+
+deprecated unittest  // paramHeaderMap silently drops nested annotations (use paramHeaders)
+{
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json nested = Json.emptyObject;
+	nested["type"] = "object";
+	nested["properties"] = Json([
+		"region": Json(["type": Json("string"), "x-mcp-header": Json("Region")])
+	]);
+	schema["properties"] = Json(["filter": nested]);
+
+	// The schema is valid and the annotation is path-aware-visible, ...
+	assert(validateInputSchemaHeaders(schema) is null);
+	assert(paramHeaders(schema).length == 1);
+	// ... but the legacy map form drops the nested annotation entirely.
+	assert(paramHeaderMap(schema).length == 0);
 }
 
 unittest  // validateHeaderName: empty value rejected (draft x-mcp-header MUST NOT be empty)
