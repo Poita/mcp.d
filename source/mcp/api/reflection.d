@@ -645,14 +645,18 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 
 	applyIconsAndMeta!overload(descriptor);
 
-	server.registerDynamicPrompt(descriptor, (Json args) @safe {
+	server.registerDynamicPrompt(descriptor, (Json args, RequestContext ctx) @safe {
 		import mcp.protocol.errors : McpException, invalidParams;
+		import mcp.server.server : PromptResponse;
 
 		Tuple!(Parameters!overload) argv;
 		static foreach (i, P; Parameters!overload)
 		{
+			// A declared RequestContext parameter binds to the real per-request
+			// context so context-dependent features (logging, cancellation,
+			// elicitation) work from prompts, exactly as the tool path does.
 			static if (is(P : RequestContext))
-				argv[i] = new NullContext;
+				argv[i] = ctx;
 			else static if (is(defs[i] == void))
 			{
 				// A malformed argument (e.g. an out-of-range enum member or a
@@ -678,7 +682,8 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 					throw invalidParams("argument '" ~ names[i] ~ "': " ~ e.msg);
 			}
 		}
-		return toPromptResult(__traits(getMember, parent, memberName)(argv.expand));
+		return PromptResponse.complete(toPromptResult(__traits(getMember,
+			parent, memberName)(argv.expand)));
 	});
 }
 
@@ -720,15 +725,19 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 
 	applyResourceMetadata!overload(descriptor);
 
-	server.registerResourceTemplate(descriptor, (string uri, string[string] params) @safe {
+	server.registerResourceTemplate(descriptor, (string uri,
+			string[string] params, RequestContext ctx) @safe {
 		import mcp.protocol.errors : invalidParams;
 
 		alias names = ParameterIdentifierTuple!overload;
 		Tuple!(Parameters!overload) argv;
 		static foreach (i, P; Parameters!overload)
 		{
+			// A declared RequestContext parameter binds to the real per-request
+			// context so context-dependent features work from resource templates,
+			// exactly as the tool path does.
 			static if (is(P : RequestContext))
-				argv[i] = new NullContext;
+				argv[i] = ctx;
 			else static if (is(P == string))
 				argv[i] = (names[i] in params) ? params[names[i]] : "";
 			else
@@ -2019,4 +2028,75 @@ unittest  // resource-template invalid scalar yields an InvalidParams error
 	auto rr = s.handle(Message(makeRequest(Json(3), "resources/read", rp))).get;
 	assert("error" in rr);
 	assert(rr["error"]["code"].get!int == -32602);
+}
+
+version (unittest)
+{
+	import mcp.protocol.capabilities : ClientCapability;
+
+	/// A context that advertises elicitation, so a handler receiving the real
+	/// context observes a capability a `NullContext` (which reports no
+	/// capabilities) never would.
+	private final class ContextProbe : BaseRequestContext
+	{
+		override bool clientSupports(ClientCapability cap) @safe
+		{
+			return cap == ClientCapability.elicitationForm;
+		}
+	}
+
+	private final class ContextPromptApi
+	{
+		@prompt("ctxPrompt", "Prompt exercising the request context")
+		string ctxPrompt(string topic, RequestContext ctx) @safe
+		{
+			return ctx.clientSupports(ClientCapability.elicitationForm)
+				? "elicit-capable: " ~ topic : "no-elicit: " ~ topic;
+		}
+	}
+
+	private final class ContextTemplateApi
+	{
+		@resourceTemplate("ctx://{topic}", "ctxTpl", "text/plain")
+		string ctxTpl(string topic, RequestContext ctx) @safe
+		{
+			return ctx.clientSupports(ClientCapability.elicitationForm)
+				? "elicit-capable: " ~ topic : "no-elicit: " ~ topic;
+		}
+	}
+}
+
+unittest  // @prompt RequestContext parameter binds to the real request context
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ContextPromptApi);
+
+	auto probe = new ContextProbe;
+	Json pp = Json.emptyObject;
+	pp["name"] = "ctxPrompt";
+	pp["arguments"] = Json(["topic": Json("MCP")]);
+	auto pr = s.handle(Message(makeRequest(Json(1), "prompts/get", pp)), probe).get;
+
+	// The handler observed the real context's capabilities; a dummy NullContext
+	// would report no capabilities and yield "no-elicit".
+	assert(pr["result"]["messages"][0]["content"]["text"].get!string == "elicit-capable: MCP");
+}
+
+unittest  // @resourceTemplate RequestContext parameter binds to the real request context
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ContextTemplateApi);
+
+	auto probe = new ContextProbe;
+	Json rp = Json.emptyObject;
+	rp["uri"] = "ctx://MCP";
+	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp)), probe).get;
+
+	// The handler observed the real context's capabilities; a dummy NullContext
+	// would report no capabilities and yield "no-elicit".
+	assert(rr["result"]["contents"][0]["text"].get!string == "elicit-capable: MCP");
 }
