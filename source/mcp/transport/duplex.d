@@ -168,6 +168,9 @@ final class DuplexChannel
 			break;
 		case MessageKind.request:
 		case MessageKind.notification:
+			// Request/notification is the sole `onInbound` entry point: responses and
+			// error responses are always correlated by the coordinator above and never
+			// reach the delegate.
 			if (onInbound !is null)
 				onInbound(m);
 			break;
