@@ -547,6 +547,21 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 				argv[i] = ctx;
 			else
 			{
+				// A required parameter (neither Nullable nor carrying a D-level
+				// default) must be present even when input-schema validation is
+				// disabled; a missing one is a tool input error, not a silently
+				// default-constructed value.
+				static if (is(defs[i] == void) && !isInstanceOf!(Nullable, P))
+				{
+					if (!argPresent(args, names[i]))
+					{
+						static if (is(ReturnType!overload == ToolResponse))
+							return ToolResponse.complete(marshalError(names[i],
+								"required argument is missing"));
+						else
+							return marshalError(names[i], "required argument is missing");
+					}
+				}
 				try
 				{
 					static if (is(defs[i] == void))
@@ -1953,6 +1968,20 @@ unittest  // omitting a defaulted arg passes the declared default, not P.init
 	auto r = s.handle(Message(makeRequest(Json(6), "tools/call", p))).get;
 	// limit defaults to 7, so 3 + 7 = 10 (not 3 + 0 = 3 from int.init).
 	assert(r["result"]["structuredContent"]["result"].get!int == 10);
+}
+
+unittest  // a required tool arg missing (schema validation disabled) is an isError, not a default value
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	s.disableInputSchemaValidation();
+	registerHandlers(s, new EnumApi);
+	Json p = Json.emptyObject;
+	p["name"] = "limited";
+	p["arguments"] = Json.emptyObject; // omit the required 'n'
+	auto r = s.handle(Message(makeRequest(Json(7), "tools/call", p))).get;
+	assert(r["result"]["isError"].get!bool);
 }
 
 unittest  // resource-template int param receives the captured value, not T.init

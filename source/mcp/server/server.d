@@ -764,6 +764,14 @@ final class McpServer
 	void registerResourceTemplate(ResourceTemplate descriptor, ResourceContents delegate(string uri,
 			string[string] params) @safe reader, Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
+		// Two adjacent variables ("{a}{b}") can never be reverse-matched against a
+		// concrete URI (there is no boundary between them), so such a template would
+		// silently never match; reject it at registration rather than shadowing it.
+		import std.string : indexOf;
+
+		if (descriptor.uriTemplate.indexOf("}{") >= 0)
+			throw new Exception("resource template '" ~ descriptor.name
+					~ "' has adjacent variables that can never match: " ~ descriptor.uriTemplate);
 		templates ~= RegisteredTemplate(descriptor, reader, cache);
 	}
 
@@ -2534,6 +2542,15 @@ final class McpServer
 		// `initialize` handshake, so the guard applies only to stateful sessions.
 		if (mode_ == ServerMode.stateful && conn.negotiated_)
 			throw invalidRequest("Session already initialized");
+
+		// The client MUST send a protocol version to negotiate; an omitted, empty,
+		// or non-string protocolVersion is a malformed request, not a silent
+		// downgrade to the latest stable version. (A present-but-unsupported version
+		// still negotiates down per the version-negotiation rule below.)
+		if (params.type != Json.Type.object || "protocolVersion" !in params
+				|| params["protocolVersion"].type != Json.Type.string
+				|| params["protocolVersion"].get!string.length == 0)
+			throw invalidParams("initialize requires a non-empty string 'protocolVersion'");
 
 		auto p = InitializeParams.fromJson(params);
 		conn.negotiated = negotiate(p.protocolVersion);
@@ -4812,8 +4829,41 @@ unittest  // typed completion handler advertises the completions capability
 		CompleteResult res;
 		return res;
 	});
-	auto init = s.handle(req(1, "initialize", Json.emptyObject)).get;
+	Json ip = Json.emptyObject;
+	ip["protocolVersion"] = "2025-11-25";
+	auto init = s.handle(req(1, "initialize", ip)).get;
 	assert("completions" in init["result"]["capabilities"]);
+}
+
+unittest  // initialize requires a non-empty string protocolVersion
+{
+	import mcp.protocol.errors : ErrorCode;
+
+	auto s = new McpServer("t", "1");
+	// Omitted protocolVersion -> invalidParams (not a silent downgrade).
+	auto missing = s.handle(req(1, "initialize", Json.emptyObject)).get;
+	assert(missing["error"]["code"].get!int == ErrorCode.invalidParams);
+	// Non-string protocolVersion -> invalidParams.
+	Json bad = Json.emptyObject;
+	bad["protocolVersion"] = 3;
+	auto nonStr = s.handle(req(2, "initialize", bad)).get;
+	assert(nonStr["error"]["code"].get!int == ErrorCode.invalidParams);
+	// A present but unsupported version still negotiates down to a supported one.
+	Json old = Json.emptyObject;
+	old["protocolVersion"] = "1999-01-01";
+	auto down = s.handle(req(3, "initialize", old)).get;
+	assert("result" in down && down["result"]["protocolVersion"].get!string.length > 0);
+}
+
+unittest  // registerResourceTemplate rejects adjacent variables that can never match
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	ResourceTemplate t = {uriTemplate: "test://{a}{b}", name: "adjacent"};
+	assertThrown!Exception(s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
+			return ResourceContents.makeText(uri, "text/plain", "x");
+		}));
 }
 
 unittest  // logging/setLevel stores the level and returns an empty object
