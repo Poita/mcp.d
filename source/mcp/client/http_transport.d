@@ -1429,16 +1429,45 @@ HttpEndpoint parseHttpEndpoint(string url) @safe
 	const hostPort = (slash < 0) ? rest : rest[0 .. slash];
 	ep.path = (slash < 0) ? "/" : rest[slash .. $];
 
-	const colon = hostPort.indexOf(':');
-	ep.host = (colon < 0) ? hostPort : hostPort[0 .. colon];
-	if (colon < 0)
-		ep.port = ep.tls ? cast(ushort) 443 : cast(ushort) 80;
+	const defaultPort = ep.tls ? cast(ushort) 443 : cast(ushort) 80;
+
+	// An IPv6 literal is bracketed (RFC 3986 §3.2.2): the host runs to the
+	// matching ']' and only a ':' *after* the bracket introduces the port. The
+	// brackets are kept on `ep.host` (the form the `Host` header needs); the SNI
+	// and connect paths strip them where the bare address is required.
+	string portText;
+	if (hostPort.length && hostPort[0] == '[')
+	{
+		const close = hostPort.indexOf(']');
+		if (close < 0)
+		{
+			// Unterminated bracket: take the whole authority as the host.
+			ep.host = hostPort;
+		}
+		else
+		{
+			ep.host = hostPort[0 .. close + 1];
+			const after = hostPort[close + 1 .. $];
+			if (after.length && after[0] == ':')
+				portText = after[1 .. $];
+		}
+	}
+	else
+	{
+		const colon = hostPort.indexOf(':');
+		ep.host = (colon < 0) ? hostPort : hostPort[0 .. colon];
+		if (colon >= 0)
+			portText = hostPort[colon + 1 .. $];
+	}
+
+	if (portText.length == 0)
+		ep.port = defaultPort;
 	else
 	{
 		try
-			ep.port = hostPort[colon + 1 .. $].to!ushort;
+			ep.port = portText.to!ushort;
 		catch (Exception)
-			ep.port = ep.tls ? cast(ushort) 443 : cast(ushort) 80;
+			ep.port = defaultPort;
 	}
 	return ep;
 }
@@ -1474,13 +1503,26 @@ string pinnedEndpointHost(HttpEndpoint ep) @safe
 /// validated; the underlying `conn` must outlive the returned stream (callers keep
 /// it in scope and `close()` it). On a plaintext endpoint the raw connection is
 /// returned unwrapped (still as a `ProxyStream` for a single static type).
+/// Remove the surrounding brackets from a bracketed IPv6 literal host
+/// (`[::1]` -> `::1`), leaving any other host untouched. The TLS SNI/peer name
+/// and the SSRF/connect resolver both want the bare address, while the `Host`
+/// header keeps the brackets.
+string unbracketHost(string host) pure nothrow @safe @nogc
+{
+	if (host.length >= 2 && host[0] == '[' && host[$ - 1] == ']')
+		return host[1 .. $ - 1];
+	return host;
+}
+
 private ProxyStream openClientStream(TCPConnection conn, bool tls, string host) @trusted
 {
 	if (tls)
 	{
 		auto ctx = createTLSContext(TLSContextKind.client);
 		ctx.peerValidationMode = TLSPeerValidationMode.checkPeer;
-		auto t = createTLSStream(conn, ctx, host);
+		// vibe's TLS layer wants the bare peer name; an IPv6 literal reaches here
+		// bracketed (the form the `Host` header needs), so strip the brackets.
+		auto t = createTLSStream(conn, ctx, unbracketHost(host));
 		return createProxyStream(t);
 	}
 	return createProxyStream(conn);
@@ -1670,6 +1712,35 @@ unittest  // parseHttpEndpoint defaults the port per scheme (443 for TLS)
 
 	auto bare = parseHttpEndpoint("host:9000/p");
 	assert(!bare.tls && bare.port == 9000 && bare.host == "host" && bare.path == "/p");
+}
+
+unittest  // parseHttpEndpoint keeps the explicit port and bracketed host for IPv6 literals
+{
+	// A bracketed IPv6 literal with an explicit port must not let the colons
+	// inside the address be mistaken for the port delimiter: the host keeps its
+	// brackets and the trailing :port is preserved.
+	auto ep = parseHttpEndpoint("https://[::1]:8443/mcp");
+	assert(ep.tls);
+	assert(ep.host == "[::1]");
+	assert(ep.port == 8443);
+	assert(ep.path == "/mcp");
+
+	// Without an explicit port the scheme default applies (not a colon inside ::).
+	auto noport = parseHttpEndpoint("https://[2606:4700::1]/x");
+	assert(noport.host == "[2606:4700::1]");
+	assert(noport.port == 443);
+	assert(noport.path == "/x");
+
+	// Plaintext IPv6 with an explicit port and no path.
+	auto plain = parseHttpEndpoint("http://[fe80::1]:9000");
+	assert(!plain.tls);
+	assert(plain.host == "[fe80::1]");
+	assert(plain.port == 9000);
+	assert(plain.path == "/");
+
+	// The bare address (for SNI / connect resolution) drops the brackets.
+	assert(unbracketHost(ep.host) == "::1");
+	assert(unbracketHost("host") == "host");
 }
 
 unittest  // an https URL constructs (TLS supported)
