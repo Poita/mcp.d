@@ -119,6 +119,9 @@ final class HttpClientTransport : ClientTransport
 	private string url;
 	private string sessionId;
 	private string bearerToken;
+	// Set after the first plaintext-bearer warning so the cleartext-credential
+	// notice is logged at most once per transport instead of on every request.
+	private bool warnedInsecureBearer;
 	// Legacy HTTP+SSE (2024-11-05) transport state. When `legacyMode` is set,
 	// JSON-RPC messages are POSTed to `legacyEndpoint` (discovered from the GET
 	// stream's `endpoint` event) and responses arrive on the standalone GET SSE
@@ -543,38 +546,63 @@ final class HttpClientTransport : ClientTransport
 		return headers;
 	}
 
-	/// Read the remaining response body from `conn` to end-of-stream, decoding
-	/// chunked transfer-encoding when `chunked` is true. Used for the small
-	/// non-streaming JSON body and the 4xx legacy-fallback body.
-	private static string readRemaining(Conn)(Conn conn, bool chunked) @trusted
+	/// Read one chunked-transfer-encoding frame from `conn`: the hex size line,
+	/// then `size` payload bytes, then the trailing per-chunk CRLF. Sets `data` to
+	/// the payload and returns true to continue; returns false on the terminating
+	/// zero-size chunk, a malformed/unparseable size line, or end-of-stream. The
+	/// single chunk-framing primitive shared by `readRemaining` and `readSseBody`,
+	/// so size parsing and trailing-CRLF consumption live in exactly one place.
+	private static bool readChunk(Conn)(Conn conn, out string data) @trusted
 	{
 		import vibe.stream.operations : readLine;
 		import vibe.core.stream : IOMode;
 		import std.string : strip;
 		import std.conv : parse;
 
+		for (;;)
+		{
+			string sizeLine;
+			try
+				sizeLine = (cast(string) readLine(conn).idup).strip;
+			catch (Exception)
+				return false;
+			if (sizeLine.length == 0)
+				continue; // tolerate a stray blank line before the size
+			uint sz;
+			try
+			{
+				auto sl = sizeLine;
+				sz = parse!uint(sl, 16);
+			}
+			catch (Exception)
+				return false;
+			if (sz == 0)
+				return false; // last chunk
+			auto chunk = new ubyte[sz];
+			conn.read(chunk, IOMode.all);
+			data = cast(string) chunk.idup;
+			try
+				readLine(conn); // trailing CRLF after the chunk data
+			catch (Exception)
+			{
+			}
+			return true;
+		}
+	}
+
+	/// Read the remaining response body from `conn` to end-of-stream, decoding
+	/// chunked transfer-encoding when `chunked` is true. Used for the small
+	/// non-streaming JSON body and the 4xx legacy-fallback body.
+	private static string readRemaining(Conn)(Conn conn, bool chunked) @trusted
+	{
+		import vibe.core.stream : IOMode;
+
 		string acc;
 		if (chunked)
 		{
-			for (;;)
-			{
-				auto sizeLine = (cast(string) readLine(conn).idup).strip;
-				if (sizeLine.length == 0)
-					continue;
-				uint sz;
-				try
-				{
-					auto sl = sizeLine;
-					sz = parse!uint(sl, 16);
-				}
-				catch (Exception)
-					break;
-				if (sz == 0)
-					break;
-				auto chunk = new ubyte[sz];
-				conn.read(chunk, IOMode.all);
-				acc ~= cast(string) chunk.idup;
-			}
+			string chunk;
+			while (readChunk(conn, chunk))
+				acc ~= chunk;
 		}
 		else
 		{
@@ -633,6 +661,14 @@ final class HttpClientTransport : ClientTransport
 							|| m.kind == MessageKind.errorResponse)
 							&& m.id.type == Json.Type.int_ && m.id.get!long == expectId)
 						{
+							// A response for a request we have cancelled is dropped
+							// per spec, even when it matches the awaited id (mirrors
+							// the guard `dispatchSse` applies on the POST path).
+							if (protocol !is null && protocol.isCancelled(m.id.get!long))
+							{
+								done = true;
+								return;
+							}
 							if (m.kind == MessageKind.errorResponse)
 								err = errorFrom(m.error);
 							else
@@ -663,6 +699,30 @@ final class HttpClientTransport : ClientTransport
 		return id.to!string;
 	}
 
+	/// Warn (once) when a bearer token is about to be sent over a plaintext,
+	/// non-loopback endpoint. RFC 6750 5.3 and the MCP authorization spec require
+	/// TLS for bearer credentials; a plaintext `http://` target transmits the
+	/// token in cleartext. Loopback (localhost/127.0.0.1/::1) is exempt as a
+	/// development/testing convenience. This does not refuse the request — it
+	/// surfaces the misconfiguration rather than silently leaking the credential.
+	private void warnIfInsecureBearer() @safe
+	{
+		import std.string : toLower;
+		import vibe.core.log : logWarn;
+
+		if (warnedInsecureBearer || bearerToken.length == 0)
+			return;
+		const ep = parseHttpEndpoint(url);
+		if (ep.tls)
+			return;
+		const host = ep.host.toLower;
+		if (host == "localhost" || host == "127.0.0.1" || host == "::1")
+			return;
+		warnedInsecureBearer = true;
+		logWarn("MCP bearer token sent over plaintext http:// to non-loopback host %s; "
+				~ "use https:// to avoid transmitting the credential in cleartext", ep.host);
+	}
+
 	private void setupRequest(scope HTTPClientRequest req, Json message) @safe
 	{
 		req.method = HTTPMethod.POST;
@@ -674,7 +734,10 @@ final class HttpClientTransport : ClientTransport
 		// here, the credential still must not leave the configured origin.
 		const target = legacyMode ? legacyEndpoint : url;
 		if (bearerToken.length && sameOrigin(url, target))
+		{
+			warnIfInsecureBearer();
 			req.headers["Authorization"] = "Bearer " ~ bearerToken;
+		}
 		if (sessionId.length)
 			req.headers["Mcp-Session-Id"] = sessionId;
 		foreach (k, v; requestHeaders(message))
@@ -759,7 +822,10 @@ final class HttpClientTransport : ClientTransport
 			req ~= "Content-Type: application/json\r\n";
 		req ~= "Connection: " ~ connection ~ "\r\n";
 		if (includeAuth && bearerToken.length)
+		{
+			warnIfInsecureBearer();
 			req ~= "Authorization: Bearer " ~ bearerToken ~ "\r\n";
+		}
 		if (sessionId.length)
 			req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
 		foreach (k, v; extraHeaders)
@@ -814,10 +880,9 @@ final class HttpClientTransport : ClientTransport
 			scope bool delegate() @safe shouldStop,
 			scope void delegate(string eventType, string data) @safe onEvent) @trusted
 	{
-		import vibe.stream.operations : readLine;
 		import vibe.core.stream : IOMode;
 		import std.string : indexOf, startsWith, strip;
-		import std.conv : to, parse;
+		import std.conv : to;
 
 		string acc, data, eventType;
 		void tokenize()
@@ -873,23 +938,10 @@ final class HttpClientTransport : ClientTransport
 				break;
 			if (chunked)
 			{
-				auto sizeLine = (cast(string) readLine(conn).idup).strip;
-				if (sizeLine.length == 0)
-					continue;
-				uint sz;
-				try
-				{
-					auto sl = sizeLine;
-					sz = parse!uint(sl, 16);
-				}
-				catch (Exception)
+				string chunk;
+				if (!readChunk(conn, chunk))
 					break;
-				if (sz == 0)
-					break; // last chunk
-				auto chunk = new ubyte[sz];
-				conn.read(chunk, IOMode.all);
-				acc ~= cast(string) chunk.idup;
-				readLine(conn); // trailing CRLF after the chunk data
+				acc ~= chunk;
 				tokenize();
 			}
 			else
@@ -1264,6 +1316,11 @@ final class HttpClientTransport : ClientTransport
 							|| m.kind == MessageKind.errorResponse) && m.id.type == Json.Type.int_
 							&& (w = (m.id.get!long  in legacyWaiters)) !is null)
 						{
+							// A response for a request we have cancelled is dropped
+							// per spec, even when a waiter is still registered for its
+							// id (mirrors the guard `dispatchSse` applies).
+							if (protocol !is null && protocol.isCancelled(m.id.get!long))
+								return;
 							if (m.kind == MessageKind.errorResponse)
 								(*w).err = errorFrom(m.error);
 							else
@@ -1951,4 +2008,96 @@ unittest  // each readSseBody caller's cursor is independent (no shared resumpti
 
 	assert(cursorA.lastEventId == "A" && cursorA.retryMs == 100);
 	assert(cursorB.lastEventId == "B" && cursorB.retryMs == 200);
+}
+
+unittest  // readChunk decodes a multi-frame chunked body via readRemaining
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	// Two data chunks (each with its trailing CRLF) then the terminating
+	// zero-size chunk; the shared `readChunk` framing must reassemble the bytes
+	// exactly and stop at the 0 chunk.
+	auto body = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[])
+				body.dup, false);
+	}();
+	auto got = () @trusted {
+		return HttpClientTransport.readRemaining(stream, true);
+	}();
+	assert(got == "hello world");
+}
+
+unittest  // readChunk consumes the per-chunk trailing CRLF so framing stays aligned
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	// Regression for the previously divergent trailing-CRLF handling: with the
+	// per-chunk CRLF consumed, the size line of the next chunk parses cleanly and
+	// the full payload is recovered rather than the decoder desyncing.
+	auto body = "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n";
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[])
+				body.dup, false);
+	}();
+	auto got = () @trusted {
+		return HttpClientTransport.readRemaining(stream, true);
+	}();
+	assert(got == "abcdef");
+}
+
+unittest  // readSseBody decodes events delivered across chunked frames
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	// A single SSE event split across two chunked frames: the shared `readChunk`
+	// reader must rejoin the frames so the tokenizer sees one complete event.
+	auto body = "6\r\ndata: \r\n4\r\nhi\n\n\r\n0\r\n\r\n";
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[])
+				body.dup, false);
+	}();
+	SseCursor cursor;
+	string[] events;
+	() @trusted {
+		t.readSseBody(stream, true, cursor, () @safe => false, (string e, string d) @safe {
+			events ~= d;
+		});
+	}();
+	assert(events == ["hi"]);
+}
+
+unittest  // warnIfInsecureBearer warns once for a plaintext non-loopback bearer
+{
+	auto t = new HttpClientTransport("http://example.com/mcp");
+	t.setBearerToken("secret-token");
+	assert(!t.warnedInsecureBearer);
+	t.warnIfInsecureBearer();
+	assert(t.warnedInsecureBearer); // plaintext + non-loopback host -> warned
+	t.warnIfInsecureBearer();
+	assert(t.warnedInsecureBearer); // idempotent: still set, no second warning path
+}
+
+unittest  // warnIfInsecureBearer stays silent for an https endpoint
+{
+	auto t = new HttpClientTransport("https://example.com/mcp");
+	t.setBearerToken("secret-token");
+	t.warnIfInsecureBearer();
+	assert(!t.warnedInsecureBearer);
+}
+
+unittest  // warnIfInsecureBearer exempts loopback plaintext endpoints
+{
+	auto t = new HttpClientTransport("http://127.0.0.1:8080/mcp");
+	t.setBearerToken("secret-token");
+	t.warnIfInsecureBearer();
+	assert(!t.warnedInsecureBearer);
+}
+
+unittest  // warnIfInsecureBearer is a no-op when no bearer token is set
+{
+	auto t = new HttpClientTransport("http://example.com/mcp");
+	t.warnIfInsecureBearer();
+	assert(!t.warnedInsecureBearer);
 }
