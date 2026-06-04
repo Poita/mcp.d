@@ -12,6 +12,8 @@ import mcp.protocol.types;
 import mcp.protocol.draft;
 import mcp.server.context;
 import mcp.server.connection : ConnectionState;
+import mcp.server.request_state : RequestStateSecurity, RequestStateMode,
+	RequestStateBinding, RequestStateCodec, generateEphemeralKey;
 import mcp.transport.sse_context : ServerPushChannel, StreamCoordinator, SubscriptionFilter;
 
 @safe:
@@ -390,6 +392,11 @@ final class McpServer
 	// session has an `initialized` handshake — the stateless path (one shared
 	// fallback state across sequential single-peer clients) is always exempt.
 	private bool requireInitialized_;
+	// The opt-in MRTR `requestState` codec installed by `secureRequestState`.
+	// Null (the default) means plaintext passthrough — the wire and behaviour are
+	// exactly as if no codec existed. When set, the dispatch path wraps outgoing
+	// requestState and verifies incoming requestState transparently to handlers.
+	private RequestStateCodec requestStateCodec_;
 	// In-flight requests (keyed by their JSON-RPC id, scoped by connection token)
 	// live on the threaded `ConnectionState.inFlight` registry; see the
 	// `activeConnection` field above.
@@ -660,6 +667,43 @@ final class McpServer
 	void requireInitialized() @safe
 	{
 		requireInitialized_ = true;
+	}
+
+	/// Enable the opt-in secure codec for the MRTR (SEP-2322) `requestState`. Once
+	/// enabled, the dispatch path transparently wraps every outgoing
+	/// `requestState` (tool, prompt, and task input-required results) and verifies
+	/// every echoed incoming one — handlers keep calling `inputRequired!T` /
+	/// `requestStateAs!T` against plaintext. This delivers the three SEP-2322
+	/// protections at once: integrity (the client cannot tamper with the opaque
+	/// state), expiry (`ttl`), and user-binding (the echoed state must belong to
+	/// the currently authenticated subject, defending against replay/hijack).
+	///
+	/// Verification is fail-closed: a tampered, expired, wrong-subject, or
+	/// otherwise invalid blob is treated as if the client echoed NO state, so the
+	/// handler runs a fresh round and re-prompts (a warning is logged). The
+	/// request is never errored and no rejection flag is exposed to the handler.
+	///
+	/// Provide a stable secret of at least 32 bytes via `sec.key`. When `sec.key`
+	/// is empty the server generates a single-process ephemeral 32-byte key and
+	/// logs a warning: blobs issued by one process will then FAIL verification on
+	/// any other instance or after a restart (no cross-instance/restart
+	/// continuity). Binding is a no-op on transports without an authenticated
+	/// identity (stdio / in-process, empty subject).
+	void secureRequestState(RequestStateSecurity sec) @safe
+	{
+		import vibe.core.log : logWarn;
+
+		if (sec.key.length == 0)
+		{
+			sec.key = generateEphemeralKey();
+			logWarn("secureRequestState: no key supplied; using an ephemeral "
+					~ "single-process key. requestState issued here will FAIL "
+					~ "verification on other instances or after a restart. Supply a "
+					~ "stable >=32-byte key for multi-instance/persistent deployments.");
+		}
+		else if (sec.key.length < 32)
+			throw new Exception("secureRequestState: key must be at least 32 bytes");
+		requestStateCodec_ = new RequestStateCodec(sec);
 	}
 
 	/// Broadcast a `notifications/tools/list_changed` to every client listening
@@ -1615,12 +1659,22 @@ final class McpServer
 						conn.inFlight.remove(idKey);
 			}
 
+		// When the secure codec is enabled, verify the echoed (untrusted) MRTR
+		// requestState here, before the handler sees it. The identity it must be
+		// bound to is the request's authenticated subject (empty on stdio /
+		// in-process) and the tool/prompt name. On any verification failure the
+		// handler observes NO requestState (empty) and re-elicits; see
+		// `verifyIncomingRequestState`. When no codec is configured the raw value
+		// passes through unchanged.
+		const incomingState = verifyIncomingRequestState(readRequestState(msg.params),
+				msg.method, msg.params, ctx);
+
 		// Install the per-request scope so handlers see the right statelessness
 		// (MRTR vs blocking), the input responses carried on a retried draft
 		// request, and the cancellation token, regardless of which transport
 		// supplied the base context.
 		auto scoped = new RequestScope(ctx, effective.usesMRTR, readInputResponses(msg.params),
-				requestLogLevel, loggingRequested, token, readRequestState(msg.params), effective);
+				requestLogLevel, loggingRequested, token, incomingState, effective);
 
 		try
 		{
@@ -1629,6 +1683,13 @@ final class McpServer
 			// for the cancelled request" — suppress it if cancelled meanwhile.
 			if (token.cancelled)
 				return Nullable!Json.init;
+			// When the secure codec is enabled, wrap the outgoing MRTR requestState
+			// (tool/prompt/task input-required results all share the top-level
+			// `requestState` field) before serialisation, so the client only ever
+			// sees an integrity-protected (and optionally encrypted), expiry-stamped,
+			// user-bound blob. A no-op for results that carry no requestState and
+			// when no codec is configured.
+			result = secureOutgoingRequestState(result, msg.method, msg.params, ctx);
 			return nullable(makeResponse(msg.id, stampResultType(result, effective)));
 		}
 		catch (McpException e)
@@ -1797,6 +1858,72 @@ final class McpServer
 		if (ver.cacheableResults)
 			result.cache = hint.isNull ? nullable(CacheHint(0)) : hint;
 		return result.toJson();
+	}
+
+	/// The identity an MRTR `requestState` blob is bound to: the request's
+	/// authenticated subject (empty on stdio / in-process, where binding is a
+	/// no-op) and the tool/prompt name (the top-level `params.name`, used only by
+	/// the `authSubjectAndTool` binding). Shared by the incoming/outgoing seams so
+	/// both sides bind to the same identity.
+	private static string requestStateSubject(RequestContext ctx) @safe
+	{
+		return ctx.auth().subject;
+	}
+
+	private static string requestStateToolName(Json params) @safe
+	{
+		if (params.type == Json.Type.object && "name" in params
+				&& params["name"].type == Json.Type.string)
+			return params["name"].get!string;
+		return "";
+	}
+
+	/// Verify an incoming (echoed) MRTR `requestState`. With no codec configured
+	/// the raw value passes through unchanged (plaintext, exactly as before). With
+	/// the codec enabled, a non-empty blob is decoded and verified against the
+	/// request's authenticated subject and tool name; on success the inner state
+	/// is returned, and on ANY failure (tamper / GCM auth fail / expiry /
+	/// wrong-subject / unparseable) it fails closed to an empty string so the
+	/// handler re-elicits, with a warning logged. The transparent re-elicit means
+	/// no rejection is surfaced to the handler.
+	private string verifyIncomingRequestState(string raw, string method,
+			Json params, RequestContext ctx) @safe
+	{
+		import vibe.core.log : logWarn;
+
+		if (requestStateCodec_ is null || raw.length == 0)
+			return raw;
+		auto decoded = requestStateCodec_.decode(raw, requestStateSubject(ctx),
+				requestStateToolName(params));
+		if (decoded.isNull)
+		{
+			logWarn("secureRequestState: rejected an echoed requestState on %s "
+					~ "(tamper, expiry, wrong-subject, or malformed); re-eliciting.", method);
+			return "";
+		}
+		return decoded.get;
+	}
+
+	/// Wrap an outgoing MRTR `requestState` on an input-required result. With no
+	/// codec configured the result is returned unchanged (plaintext, no wire
+	/// change). With the codec enabled, a non-empty top-level `requestState`
+	/// string is replaced by an integrity-protected (and optionally encrypted),
+	/// expiry-stamped, user-bound blob bound to the same subject/tool the incoming
+	/// seam will verify against. Tool, prompt, and task input-required results all
+	/// share this single top-level field, so one seam covers all three.
+	private Json secureOutgoingRequestState(Json result, string method,
+			Json params, RequestContext ctx) @safe
+	{
+		if (requestStateCodec_ is null || result.type != Json.Type.object)
+			return result;
+		if ("requestState" !in result || result["requestState"].type != Json.Type.string)
+			return result;
+		const plain = result["requestState"].get!string;
+		if (plain.length == 0)
+			return result;
+		result["requestState"] = requestStateCodec_.encode(plain,
+				requestStateSubject(ctx), requestStateToolName(params));
+		return result;
 	}
 
 	/// Stamp the mandatory draft `resultType` discriminator onto a result.
@@ -6601,6 +6728,127 @@ unittest  // SEP-2322: a stateless server emits requestState and reads it back o
 	auto retry = s.handle(Message(makeRequest(Json(11), "tools/call", params))).get;
 	assert("inputRequests" !in retry["result"]);
 	assert(retry["result"]["content"][0]["text"].get!string == "resumed:awaiting-date day:friday");
+}
+
+version (unittest) private McpServer secureStatebookServer() @safe
+{
+	// A tool that round-trips its progress entirely through the opaque
+	// requestState, used to prove the secure codec is transparent: the handler
+	// stores/reads the plaintext "awaiting-date" exactly as in the unsecured
+	// test, while the wire carries an integrity-protected blob.
+	auto s = new McpServer("t", "1");
+	RequestStateSecurity sec;
+	sec.key = new ubyte[32];
+	foreach (i; 0 .. 32)
+		sec.key[i] = cast(ubyte) i;
+	// No authenticated identity on in-process dispatch, so use no binding to keep
+	// the round deterministic (binding would be a no-op with an empty subject
+	// anyway, but `none` documents the intent for this test).
+	sec.bindTo = RequestStateBinding.none;
+	s.secureRequestState(sec);
+
+	Tool book = {name: "statebook"};
+	s.registerDynamicTool(book, (Json args, RequestContext ctx) @safe {
+		if (ctx.requestState() == "awaiting-date")
+		{
+			auto answers = ctx.inputResponses();
+			CallToolResult r;
+			r.content = [
+				Content.makeText("resumed:" ~ ctx.requestState() ~ " day:"
+					~ answers["date"]["content"]["day"].get!string)
+			];
+			return ToolResponse.complete(r);
+		}
+		Json ep = Json.emptyObject;
+		ep["message"] = "When?";
+		return ToolResponse.inputRequired([
+			InputRequest("date", "elicitation", ep)
+		], "awaiting-date");
+	});
+	return s;
+}
+
+unittest  // secureRequestState: outgoing requestState is wrapped, not plaintext
+{
+	auto s = secureStatebookServer();
+	auto first = s.handle(draftCall(20, "statebook", [])).get;
+	const wire = first["result"]["requestState"].get!string;
+	// The handler stored "awaiting-date"; the wire MUST be the codec blob, not
+	// the plaintext.
+	assert(wire != "awaiting-date");
+	assert(wire.length > "awaiting-date".length);
+	import std.algorithm : startsWith;
+
+	assert(wire.startsWith("v1."));
+}
+
+unittest  // secureRequestState: a full MRTR round verifies the wrapped blob transparently
+{
+	auto s = secureStatebookServer();
+	auto first = s.handle(draftCall(21, "statebook", [])).get;
+	const wire = first["result"]["requestState"].get!string;
+
+	// Retry: the client echoes the wrapped blob verbatim; the handler must see
+	// the verified inner plaintext state via ctx.requestState().
+	auto answer = InputResponse("date", Json([
+			"content": Json(["day": Json("friday")])
+	]));
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["name"] = "statebook";
+	params["arguments"] = Json.emptyObject;
+	params["requestState"] = wire;
+	params["inputResponses"] = inputResponsesToJson([answer]);
+	params["_meta"] = meta;
+	auto retry = s.handle(Message(makeRequest(Json(22), "tools/call", params))).get;
+	assert("inputRequests" !in retry["result"]);
+	assert(retry["result"]["content"][0]["text"].get!string == "resumed:awaiting-date day:friday");
+}
+
+unittest  // secureRequestState: a tampered echoed blob re-elicits instead of resuming
+{
+	auto s = secureStatebookServer();
+	auto first = s.handle(draftCall(23, "statebook", [])).get;
+	auto wire = first["result"]["requestState"].get!string.dup;
+	wire[5] = wire[5] == 'A' ? 'B' : 'A'; // corrupt the payload segment
+
+	auto answer = InputResponse("date", Json([
+			"content": Json(["day": Json("friday")])
+	]));
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	meta[MetaKey.clientCapabilities] = Json(["elicitation": Json.emptyObject]);
+	Json params = Json.emptyObject;
+	params["name"] = "statebook";
+	params["arguments"] = Json.emptyObject;
+	params["requestState"] = wire.idup;
+	params["inputResponses"] = inputResponsesToJson([answer]);
+	params["_meta"] = meta;
+	auto retry = s.handle(Message(makeRequest(Json(24), "tools/call", params))).get;
+	// Fail-closed: the handler saw no requestState, so it re-elicits (asks again)
+	// rather than resuming or erroring the request.
+	assert("error" !in retry);
+	assert("inputRequests" in retry["result"]);
+	assert("date" in retry["result"]["inputRequests"]);
+}
+
+unittest  // no codec configured: outgoing requestState stays plaintext (wire unchanged)
+{
+	auto s = new McpServer("t", "1");
+	Tool book = {name: "statebook"};
+	s.registerDynamicTool(book, (Json args, RequestContext ctx) @safe {
+		Json ep = Json.emptyObject;
+		ep["message"] = "When?";
+		return ToolResponse.inputRequired([
+			InputRequest("date", "elicitation", ep)
+		], "awaiting-date");
+	});
+	auto first = s.handle(draftCall(25, "statebook", [])).get;
+	assert(first["result"]["requestState"].get!string == "awaiting-date");
 }
 
 unittest  // a draft InputRequiredResult drops an elicitation request the client cannot satisfy
