@@ -67,6 +67,13 @@ struct IntrospectionConfig
 /// bearer token at the configured endpoint and yields a `TokenInfo`
 /// (`valid == false` on `active:false`, HTTP failure, or parse error). Plug it
 /// into `ResourceServerConfig.validator`.
+///
+/// Concurrency: the returned validator and its internal `PositiveCache` hold
+/// unsynchronized mutable state (the cached positive results). Like the rest of
+/// the SDK they are bound to vibe.d's default single-threaded event loop. Do not
+/// share the validator across worker threads; running the router with
+/// `HTTPServerOption.distribute` or worker threads is unsupported (see the
+/// concurrency contract in `mcp.transport.session`).
 TokenValidator introspectionVerifier(IntrospectionConfig cfg) @safe
 {
 	auto introspector = new HttpIntrospector(cfg);
