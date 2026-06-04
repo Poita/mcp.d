@@ -376,7 +376,13 @@ private AddressClass classifyIpv4Octets(ubyte a, ubyte b, ubyte c, ubyte d) @saf
 		return AddressClass.privateOrLinkLocal;
 	if (a == 169 && b == 254) // 169.254.0.0/16 link-local (incl. metadata 169.254.169.254)
 		return AddressClass.privateOrLinkLocal;
+	if (a == 100 && b >= 64 && b <= 127) // 100.64.0.0/10 RFC 6598 carrier-grade-NAT shared space (not globally routable)
+		return AddressClass.privateOrLinkLocal;
 	if (a == 0) // 0.0.0.0/8 "this host"
+		return AddressClass.privateOrLinkLocal;
+	if (a >= 224 && a <= 239) // 224.0.0.0/4 multicast (not a unicast destination)
+		return AddressClass.privateOrLinkLocal;
+	if (a >= 240) // 240.0.0.0/4 reserved/future-use, incl. 255.255.255.255 broadcast
 		return AddressClass.privateOrLinkLocal;
 	return AddressClass.public_;
 }
@@ -417,6 +423,9 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 		return AddressClass.privateOrLinkLocal;
 	// Link-local fe80::/10 (0xFE 0x80..0xBF).
 	if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80)
+		return AddressClass.privateOrLinkLocal;
+	// Multicast ff00::/8 (first byte 0xFF) — not a unicast destination.
+	if (b[0] == 0xFF)
 		return AddressClass.privateOrLinkLocal;
 
 	// IPv4-mapped ::ffff:a.b.c.d/96 and IPv4-compatible ::/96 (first 12 bytes
@@ -861,6 +870,44 @@ unittest  // classifyIpv6Literal classes public global-unicast and fails closed 
 	assert(classifyIpv6Literal("2606:4700:4700::1111") == AddressClass.public_);
 	assert(classifyIpv6Literal("2606:4700::1") == AddressClass.public_);
 	assert(classifyIpv6Literal("not-an-ipv6") == AddressClass.privateOrLinkLocal);
+}
+
+unittest  // classifyIpv4Octets classes 224.0.0.0/4 multicast as private/link-local
+{
+	assert(classifyIpv4Octets(224, 0, 0, 1) == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv4Octets(239, 255, 255, 250) == AddressClass.privateOrLinkLocal);
+}
+
+unittest  // classifyIpv4Octets classes 240.0.0.0/4 reserved (incl. broadcast) as private/link-local
+{
+	assert(classifyIpv4Octets(240, 0, 0, 1) == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv4Octets(255, 255, 255, 255) == AddressClass.privateOrLinkLocal);
+}
+
+unittest  // classifyIpv4Octets keeps a public unicast control public
+{
+	assert(classifyIpv4Octets(8, 8, 8, 8) == AddressClass.public_);
+}
+
+unittest  // classifyIpv4Octets classes 100.64.0.0/10 CGNAT shared space as private/link-local
+{
+	assert(classifyIpv4Octets(100, 64, 0, 1) == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv4Octets(100, 127, 255, 255) == AddressClass.privateOrLinkLocal);
+	// 100.0.0.0/8 outside the 64..127 second-octet window stays public.
+	assert(classifyIpv4Octets(100, 63, 255, 255) == AddressClass.public_);
+	assert(classifyIpv4Octets(100, 128, 0, 0) == AddressClass.public_);
+	assert(classifyIpv4Octets(100, 0, 0, 1) == AddressClass.public_);
+}
+
+unittest  // classifyIpv6Literal classes ff00::/8 multicast as private/link-local
+{
+	assert(classifyIpv6Literal("ff02::1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("ff05::1:3") == AddressClass.privateOrLinkLocal);
+}
+
+unittest  // classifyIpv6Literal keeps a public global-unicast control public
+{
+	assert(classifyIpv6Literal("2001:db8::1") == AddressClass.public_);
 }
 
 unittest  // classifyHost classes loopback hosts without resolving
