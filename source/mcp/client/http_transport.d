@@ -4,7 +4,7 @@ import std.algorithm : canFind;
 import std.string : startsWith;
 
 import vibe.data.json : Json, parseJsonString;
-import vibe.http.client : requestHTTP, HTTPClientRequest, HTTPClientResponse;
+import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 import vibe.http.common : HTTPMethod;
 import vibe.stream.operations : readAllUTF8, readLine;
 import vibe.core.net : TCPConnection;
@@ -316,17 +316,21 @@ final class HttpClientTransport : ClientTransport
 	{
 		import std.conv : to;
 
+		import mcp.auth.ssrf : secureRequestHTTP, SsrfPolicy;
+
 		const target = legacyMode ? legacyEndpoint : url;
 		int status;
-		() @trusted {
-			requestHTTP(target, (scope HTTPClientRequest req) {
-				setupRequest(req, message);
-			}, (scope HTTPClientResponse res) {
-				captureSession(res);
-				status = res.statusCode;
-				res.dropBody();
-			});
-		}();
+		// Funnel the pooled-client oneway POST through the resolve-validate-pin
+		// connector with the user-configured policy: the user-chosen endpoint host
+		// is resolved and the connection pinned to that vetted address (preserving
+		// the Host header + TLS SNI), but internal/loopback targets stay permitted.
+		secureRequestHTTP(target, SsrfPolicy.allowUserConfigured, (scope HTTPClientRequest req) {
+			setupRequest(req, message);
+		}, (scope HTTPClientResponse res) {
+			captureSession(res);
+			status = res.statusCode;
+			res.dropBody();
+		});
 		lastPostStatus = status;
 		// A oneway send carries no awaited reply, so a rejection would otherwise be
 		// invisible: 404/410 means the session is gone (mark it so the next request
@@ -417,6 +421,9 @@ final class HttpClientTransport : ClientTransport
 		import std.conv : to;
 
 		const ep = parseHttpEndpoint(url);
+		// Resolve + pin the user-configured endpoint host to a numeric address; the
+		// connect targets the pinned IP while `ep.host` is still used for SNI/Host.
+		const pinnedHost = pinnedEndpointHost(ep);
 
 		const payload = message.toString();
 		auto hdrs = requestHeaders(message);
@@ -436,7 +443,7 @@ final class HttpClientTransport : ClientTransport
 		() @trusted {
 			try
 			{
-				auto sock = connectTCP(ep.host, ep.port);
+				auto sock = connectTCP(pinnedHost, ep.port);
 				// `attach` closes `sock` immediately if a `close()` already ran during
 				// the `connectTCP` yield, so the socket is never leaked or left parked.
 				slot.attach(sock);
@@ -630,6 +637,8 @@ final class HttpClientTransport : ClientTransport
 		import vibe.core.net : connectTCP;
 
 		const ep = parseHttpEndpoint(url);
+		// Resolve + pin the user-configured endpoint host to a numeric address.
+		const pinnedHost = pinnedEndpointHost(ep);
 
 		// Protocol-version header for the GET stream (set after initialize).
 		auto verHeaders = requestHeaders(Json.undefined);
@@ -637,7 +646,7 @@ final class HttpClientTransport : ClientTransport
 		() @trusted {
 			try
 			{
-				auto sock = connectTCP(ep.host, ep.port);
+				auto sock = connectTCP(pinnedHost, ep.port);
 				scope (exit)
 					sock.close();
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
@@ -1000,6 +1009,8 @@ final class HttpClientTransport : ClientTransport
 
 		// Parse scheme://host[:port]/path.
 		const ep = parseHttpEndpoint(url);
+		// Resolve + pin the user-configured endpoint host to a numeric address.
+		const pinnedHost = pinnedEndpointHost(ep);
 
 		// Protocol-version header for the GET stream (set after initialize).
 		auto verHeaders = requestHeaders(Json.undefined);
@@ -1029,7 +1040,7 @@ final class HttpClientTransport : ClientTransport
 			() @trusted {
 				try
 				{
-					auto sock = connectTCP(ep.host, ep.port);
+					auto sock = connectTCP(pinnedHost, ep.port);
 					// `attach` closes `sock` immediately if a `close()` already ran during
 					// the `connectTCP` yield, so the socket is never leaked or left parked.
 					slot.attach(sock);
@@ -1114,6 +1125,8 @@ final class HttpClientTransport : ClientTransport
 		import vibe.core.net : connectTCP;
 
 		const ep = parseHttpEndpoint(url);
+		// Resolve + pin the user-configured endpoint host to a numeric address.
+		const pinnedHost = pinnedEndpointHost(ep);
 
 		// Protocol-derived headers (version + draft method) for this POST.
 		auto reqHeaders = requestHeaders(message);
@@ -1125,7 +1138,7 @@ final class HttpClientTransport : ClientTransport
 		() @trusted {
 			if (*cancelled)
 				return;
-			auto sock = connectTCP(ep.host, ep.port);
+			auto sock = connectTCP(pinnedHost, ep.port);
 			slot.attach(sock);
 			scope (exit)
 				slot.closeSocket();
@@ -1257,6 +1270,8 @@ final class HttpClientTransport : ClientTransport
 		import std.string : strip;
 
 		const ep = parseHttpEndpoint(url);
+		// Resolve + pin the user-configured endpoint host to a numeric address.
+		const pinnedHost = pinnedEndpointHost(ep);
 
 		legacyStreamAlive = true;
 		scope (exit)
@@ -1267,7 +1282,7 @@ final class HttpClientTransport : ClientTransport
 			{
 				if (closing)
 					return;
-				auto sock = connectTCP(ep.host, ep.port);
+				auto sock = connectTCP(pinnedHost, ep.port);
 				// `connectTCP` yielded; a `close()` during that yield saw the socket as
 				// not-yet-open and did nothing. Re-check here, in the same fiber with no
 				// intervening yield, so the freshly connected socket is not leaked.
@@ -1409,6 +1424,28 @@ HttpEndpoint parseHttpEndpoint(string url) @safe
 			ep.port = ep.tls ? cast(ushort) 443 : cast(ushort) 80;
 	}
 	return ep;
+}
+
+/// Resolve, classify and PIN the host of an MCP client transport endpoint to a
+/// numeric address, returning the address to `connectTCP` to. The endpoint is
+/// user-configured (the URL the host passed to `McpClient`), so the
+/// `allowUserConfigured` SSRF policy is used: the address is resolved and pinned
+/// for TOCTOU stability, but loopback/private/link-local targets are permitted
+/// (a developer may legitimately point the client at `localhost` or an internal
+/// service). Only a fail-closed classification (unresolvable / malformed host)
+/// throws. The original `ep.host` is still used for the TLS SNI / `Host` header
+/// by `openClientStream`/`buildHttpRequest`; only the connect target changes.
+/// `@safe`.
+string pinnedEndpointHost(HttpEndpoint ep) @safe
+{
+	import mcp.auth.ssrf : pinnedConnectAddress, SsrfPolicy;
+	import mcp.protocol.errors : internalError;
+
+	const pin = pinnedConnectAddress(ep.host, ep.tls, SsrfPolicy.allowUserConfigured);
+	if (!pin.ok)
+		throw internalError(
+				"Refusing to connect to MCP endpoint whose host could not be resolved: " ~ ep.host);
+	return pin.pinnedIp;
 }
 
 /// Open a client byte stream to `ep`, wrapping the raw TCP connection in a vibe
