@@ -1458,7 +1458,16 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// cancellation: emit no response, exactly as `notifications/cancelled` would
 		// suppress it. Released versions (2025-*) keep their behaviour: a dropped
 		// connection still completes the write, which is a harmless no-op there.
-		if (suppressOnDisconnect(isDraftReq, res.connected))
+		//
+		// A null `Nullable` from `server.handle` means the request was cancelled
+		// (notifications/cancelled), possibly while the handler was parked awaiting a
+		// server->client reply: the contract is that a cancelled request produces no
+		// response, so suppress it exactly as a client disconnect would. This also
+		// guards the `resp.get` dereferences below — no path may reach `resp.get`
+		// while `resp.isNull`. If the SSE stream is already open, returning here
+		// closes it with no terminating response event, the correct signal for a
+		// cancelled request.
+		if (suppressOnDisconnect(isDraftReq, res.connected) || resp.isNull)
 		{
 			// The draft is stateless-only, so it never mints a session; the rollback
 			// is a no-op there. Kept for symmetry: a suppressed initialize must not
@@ -1632,6 +1641,38 @@ unittest  // released versions never suppress on disconnect (draft-only MUST)
 {
 	assert(!suppressOnDisconnect(false, false));
 	assert(!suppressOnDisconnect(false, true));
+}
+
+unittest  // a request cancelled mid-flight yields a null response that handlePost must suppress
+{
+	// When a concurrent notifications/cancelled flips a request's token while its
+	// handler runs, server.handle returns a null Nullable: the contract is that a
+	// cancelled request produces no reply. handlePost guards every resp.get behind
+	// `suppressOnDisconnect(...) || resp.isNull`; for a still-connected, non-draft
+	// request the disconnect predicate is false, so resp.isNull alone must short the
+	// guard. Without it, resp.get on a null Nullable asserts (or is UB in -release).
+	import mcp.protocol.types : Tool, CallToolResult, Content;
+
+	auto server = new McpServer("t", "1");
+	Tool slow = {name: "slow"};
+	server.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+		// Simulate a concurrent cancellation arriving for this same request id.
+		Json p = Json.emptyObject;
+		p["requestId"] = 7;
+		server.handle(Message(makeNotification("notifications/cancelled", p)));
+		CallToolResult r;
+		r.content = [Content.makeText("done")];
+		return r;
+	});
+
+	Json callP = Json.emptyObject;
+	callP["name"] = "slow";
+	auto resp = server.handle(Message(makeRequest(Json(7), "tools/call", callP)));
+
+	assert(resp.isNull, "the cancelled request's response must be suppressed");
+	// The guard handlePost evaluates for a still-connected, released-version request:
+	// the disconnect predicate is false, so only resp.isNull can suppress the reply.
+	assert(suppressOnDisconnect(false, true) || resp.isNull);
 }
 
 /// Validate the draft Streamable HTTP request headers against the JSON-RPC body.
