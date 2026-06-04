@@ -163,6 +163,12 @@ final class HttpClientTransport : ClientTransport
 	// `attach`/`closeSocket` are order-independent, closing the window where a
 	// `close()` races the `connectTCP` yield.
 	private ListenSocketSlot[] postSockets;
+	// Slots for the sockets of in-flight `resumeViaGet` resume streams. Each
+	// resume attempt registers a slot before connecting and removes it on scope
+	// exit; `close()` force-closes every registered slot so a resume parked on a
+	// long-lived SSE read unblocks at once instead of leaking until the server
+	// sends data or drops the connection.
+	private ListenSocketSlot[] resumeSockets;
 	// True while the legacy GET-SSE reader task is running. A `legacyRpc` issued
 	// after the reader has exited fails its waiter at once instead of polling for
 	// the full timeout, since no response can ever arrive on a dead stream.
@@ -238,6 +244,10 @@ final class HttpClientTransport : ClientTransport
 		// Force-close every in-flight POST socket so a POST parked reading a
 		// long-lived SSE response stream unblocks at once.
 		foreach (slot; postSockets)
+			slot.closeSocket();
+		// Force-close every in-flight resume socket so a `resumeViaGet` parked on
+		// the GET response stream unblocks at once instead of leaking.
+		foreach (slot; resumeSockets)
 			slot.closeSocket();
 		// Fail any in-flight legacy waiter at once so its `legacyRpc` wait returns
 		// immediately instead of waiting out the timeout on a closing transport.
@@ -634,12 +644,30 @@ final class HttpClientTransport : ClientTransport
 		// Protocol-version header for the GET stream (set after initialize).
 		auto verHeaders = requestHeaders(Json.undefined);
 
+		// Register a slot so `close()` can force-close this resume connection's
+		// socket even while the reader is parked on a long-lived SSE read.
+		auto slot = new ListenSocketSlot;
+		resumeSockets ~= slot;
+		scope (exit)
+		{
+			import std.algorithm : remove;
+
+			slot.closeSocket();
+			resumeSockets = resumeSockets.remove!(s => s is slot);
+		}
+
+		if (closing)
+			return;
+
 		() @trusted {
 			try
 			{
 				auto sock = connectTCP(ep.host, ep.port);
-				scope (exit)
-					sock.close();
+				// `attach` closes `sock` immediately if a `close()` already ran during
+				// the `connectTCP` yield, so the socket is never leaked or left parked.
+				slot.attach(sock);
+				if (closing)
+					return;
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, ep.host);
 				const req = buildHttpRequest("GET", ep.path, ep.host, "text/event-stream",
@@ -652,7 +680,7 @@ final class HttpClientTransport : ClientTransport
 
 				bool done;
 				SseCursor cursor;
-				readSseBody(conn, chunked, cursor, () @safe => done,
+				readSseBody(conn, chunked, cursor, () @safe => done || closing,
 						(string eventType, string data) @safe {
 					try
 					{
@@ -1939,6 +1967,20 @@ unittest  // close() force-closes every registered server-stream socket slot
 	auto slotB = new ListenSocketSlot;
 	t.serverStreamSlots ~= slotA;
 	t.serverStreamSlots ~= slotB;
+	t.close();
+	assert(slotA.closed && slotB.closed);
+}
+
+unittest  // close() force-closes every registered resume socket slot
+{
+	// Regression: a resumeViaGet parked on the GET response stream must be torn
+	// down by close(). Each resume attempt registers a slot; close() must
+	// force-close every one so the parked SSE read unblocks instead of leaking.
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto slotA = new ListenSocketSlot;
+	auto slotB = new ListenSocketSlot;
+	t.resumeSockets ~= slotA;
+	t.resumeSockets ~= slotB;
 	t.close();
 	assert(slotA.closed && slotB.closed);
 }
