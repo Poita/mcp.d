@@ -77,6 +77,21 @@ private void validateEnvelope(Json j) @safe
 	// notification and dropped.
 	if (("method" in j) && ("id" in j) && j["id"].type == Json.Type.null_)
 		throw invalidRequest("Request id MUST NOT be null");
+	// A `method`-less message with a non-null `id` is a response. JSON-RPC 2.0 5
+	// requires a response to carry exactly one of `result`/`error`; otherwise
+	// `Message.kind` would silently classify a both-present reply as an error (the
+	// result dropped) and a neither-present reply as a bogus success. Reject both
+	// shapes so a malformed peer response yields -32600 rather than corrupting the
+	// awaited result.
+	const isResponse = ("method" !in j) && ("id" in j)
+		&& j["id"].type != Json.Type.null_ && j["id"].type != Json.Type.undefined;
+	if (isResponse)
+	{
+		const hasResult = ("result" in j) !is null;
+		const hasError = ("error" in j) !is null;
+		if (hasResult == hasError)
+			throw invalidRequest("Response must contain exactly one of result or error");
+	}
 }
 
 /// Parse and classify a single JSON-RPC message from text.
@@ -400,4 +415,19 @@ unittest  // a genuine notification (no id) is still accepted
 {
 	auto m = parseMessage(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
 	assert(m.kind == MessageKind.notification);
+}
+
+unittest  // a response carrying both result and error is rejected
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(
+			`{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"x"}}`));
+}
+
+unittest  // a response carrying neither result nor error is rejected
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":1}`));
 }
