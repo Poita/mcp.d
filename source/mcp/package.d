@@ -49,3 +49,10 @@ public import mcp.api.reflection;
 // (but not the transport/wire plumbing that also lives in
 // `mcp.protocol.draft`) so they are usable with `import mcp;` alone.
 public import mcp.protocol.draft : DiscoverResult, CacheHint, CacheScope, RequestMeta;
+
+// --- Opt-in MRTR requestState security ---
+// Referenced by `McpServer.secureRequestState(RequestStateSecurity)`. The codec
+// itself (`RequestStateCodec`) is internal dispatch plumbing and is not
+// re-exported.
+public import mcp.server.request_state : RequestStateSecurity,
+	RequestStateMode, RequestStateBinding;
