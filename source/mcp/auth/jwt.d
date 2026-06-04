@@ -119,6 +119,66 @@ string makeClientAssertion(string clientId, string audience, string privateKeyPe
 /// The OAuth `client_assertion_type` for a JWT bearer client assertion.
 enum jwtBearerAssertionType = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
+/// A general-purpose set of JWT claims for an ES256 access token, as a typed
+/// alternative to hand-concatenating JSON. Unlike `makeClientAssertion` (which
+/// is fixed to RFC 7523 client-assertion shape with iss==sub==clientId), this
+/// lets the issuer, subject, audience and scope vary independently. String
+/// claims are populated into the payload via `Json`, so they are escaped rather
+/// than interpolated. Empty `iss`/`aud`/`sub`/`scope`/`kid` are omitted; the
+/// time claims (`iat`/`nbf`/`exp`) are emitted only when non-zero.
+struct JwtClaims
+{
+	string iss; /// `iss` — token issuer (omitted if empty).
+	string aud; /// `aud` — intended audience / resource (omitted if empty).
+	string sub; /// `sub` — subject the token represents (omitted if empty).
+	string scope_; /// `scope` — space-delimited granted scopes (omitted if empty).
+	long iat; /// `iat` — issued-at (seconds since epoch; omitted if 0).
+	long nbf; /// `nbf` — not-before (seconds since epoch; omitted if 0).
+	long exp; /// `exp` — expiry (seconds since epoch; omitted if 0).
+	string kid; /// JWS `kid` header parameter (omitted if empty).
+}
+
+/// Build a signed ES256 JWT carrying the given `claims`, using the supplied
+/// PKCS#8 EC P-256 private key (PEM). This is the general access-token sibling of
+/// `makeClientAssertion`: the payload is assembled with `Json` (so string claims
+/// are JSON-escaped, never interpolated) and string claims are rejected up front
+/// if they contain control characters, reusing the same injection-hardening.
+string mintJwtEs256(string privateKeyPem, JwtClaims claims) @safe
+{
+	foreach (s; [claims.iss, claims.aud, claims.sub, claims.scope_, claims.kid])
+		if (containsControlChar(s))
+			throw new Exception("mintJwtEs256: claim contains control characters");
+
+	auto headerJson = Json.emptyObject;
+	headerJson["alg"] = "ES256";
+	headerJson["typ"] = "JWT";
+	if (claims.kid.length)
+		headerJson["kid"] = claims.kid;
+
+	auto payloadJson = Json.emptyObject;
+	if (claims.iss.length)
+		payloadJson["iss"] = claims.iss;
+	if (claims.aud.length)
+		payloadJson["aud"] = claims.aud;
+	if (claims.sub.length)
+		payloadJson["sub"] = claims.sub;
+	if (claims.scope_.length)
+		payloadJson["scope"] = claims.scope_;
+	if (claims.iat != 0)
+		payloadJson["iat"] = claims.iat;
+	if (claims.nbf != 0)
+		payloadJson["nbf"] = claims.nbf;
+	if (claims.exp != 0)
+		payloadJson["exp"] = claims.exp;
+
+	const header = headerJson.toString();
+	const payload = payloadJson.toString();
+	const signingInput = base64UrlNoPad(cast(const(ubyte)[]) header) ~ "."
+		~ base64UrlNoPad(cast(const(ubyte)[]) payload);
+	auto sig = signEs256(privateKeyPem, cast(const(ubyte)[]) signingInput);
+	return signingInput ~ "." ~ base64UrlNoPad(sig);
+}
+
 unittest  // ES256 JWT client assertion has 3 parts and a 64-byte (raw) signature
 {
 	import std.algorithm : count;
@@ -207,4 +267,105 @@ unittest  // Control characters in clientId or audience fail closed
 		~ "-----END PRIVATE KEY-----\n";
 	assertThrown(makeClientAssertion("bad\nid", "https://as.example.com/token", pem, 1));
 	assertThrown(makeClientAssertion("client-1", "https://as.example.com/\ttoken", pem, 1));
+}
+
+version (unittest) private enum testEcPem = "-----BEGIN PRIVATE KEY-----\n"
+	~ "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7K6+stITLYsQjC9o\n"
+	~ "hyL925dgd6gNWRcGOl5RPvIpye+hRANCAATSBYPkHq12VDW5un1kub6zkBc4ieZ9\n"
+	~ "nurGMu+tLzJ6+6syOZsQCGlazcSOGsopLyl1QZMIFh9atUYaDfUjJxMq\n" ~ "-----END PRIVATE KEY-----\n";
+
+unittest  // mintJwtEs256 emits the supplied claims with iss/sub/aud varying independently
+{
+	import std.array : split;
+	import std.base64 : Base64URLNoPadding;
+	import vibe.data.json : parseJsonString;
+
+	JwtClaims claims;
+	claims.iss = "https://auth.example.com";
+	claims.aud = "https://rs.example.com/mcp";
+	claims.sub = "user-42";
+	claims.scope_ = "mcp:read mcp:write";
+	claims.iat = 1_700_000_000;
+	claims.nbf = 1_700_000_000;
+	claims.exp = 1_700_003_600;
+	claims.kid = "as-1";
+	auto jwt = mintJwtEs256(testEcPem, claims);
+	auto parts = jwt.split('.');
+	assert(parts.length == 3);
+
+	auto headerStr = () @trusted {
+		return (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
+	}();
+	auto h = parseJsonString(headerStr);
+	assert(h["alg"].get!string == "ES256");
+	assert(h["kid"].get!string == "as-1");
+
+	auto payloadStr = () @trusted {
+		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
+	}();
+	auto j = parseJsonString(payloadStr);
+	assert(j["iss"].get!string == "https://auth.example.com");
+	assert(j["aud"].get!string == "https://rs.example.com/mcp");
+	assert(j["sub"].get!string == "user-42");
+	assert(j["scope"].get!string == "mcp:read mcp:write");
+	assert(j["iat"].get!long == 1_700_000_000);
+	assert(j["nbf"].get!long == 1_700_000_000);
+	assert(j["exp"].get!long == 1_700_003_600);
+}
+
+unittest  // mintJwtEs256 JSON-escapes a subject containing a quote rather than injecting claims
+{
+	import std.array : split;
+	import std.base64 : Base64URLNoPadding;
+	import vibe.data.json : parseJsonString;
+
+	JwtClaims claims;
+	claims.iss = "https://auth.example.com";
+	claims.sub = `x","admin":"true`;
+	auto jwt = mintJwtEs256(testEcPem, claims);
+	auto parts = jwt.split('.');
+	auto payloadStr = () @trusted {
+		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
+	}();
+	auto j = parseJsonString(payloadStr);
+	assert(j["sub"].get!string == `x","admin":"true`);
+	assert(j["admin"].type == Json.Type.undefined);
+}
+
+unittest  // mintJwtEs256 omits empty string claims and zero time claims
+{
+	import std.array : split;
+	import std.base64 : Base64URLNoPadding;
+	import vibe.data.json : parseJsonString;
+
+	JwtClaims claims;
+	claims.iss = "https://auth.example.com";
+	claims.sub = "user-42";
+	auto jwt = mintJwtEs256(testEcPem, claims);
+	auto parts = jwt.split('.');
+	auto payloadStr = () @trusted {
+		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
+	}();
+	auto j = parseJsonString(payloadStr);
+	assert(j["aud"].type == Json.Type.undefined);
+	assert(j["scope"].type == Json.Type.undefined);
+	assert(j["iat"].type == Json.Type.undefined);
+	assert(j["nbf"].type == Json.Type.undefined);
+	assert(j["exp"].type == Json.Type.undefined);
+
+	auto headerStr = () @trusted {
+		return (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
+	}();
+	auto h = parseJsonString(headerStr);
+	assert(h["kid"].type == Json.Type.undefined);
+}
+
+unittest  // mintJwtEs256 fails closed on control characters in a claim
+{
+	import std.exception : assertThrown;
+
+	JwtClaims claims;
+	claims.iss = "https://auth.example.com";
+	claims.sub = "bad\nsub";
+	assertThrown(mintJwtEs256(testEcPem, claims));
 }

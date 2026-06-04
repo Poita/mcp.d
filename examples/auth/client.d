@@ -69,7 +69,7 @@ import vibe.http.router : URLRouter;
 import vibe.stream.operations : readAllUTF8;
 
 import mcp;
-import mcp.auth : signEs256, base64UrlNoPad, parseWwwAuthenticate, WwwAuthenticate, OAuthClient,
+import mcp.auth : mintJwtEs256, JwtClaims, parseWwwAuthenticate, WwwAuthenticate, OAuthClient,
 	ProtectedResourceMetadata, AuthorizationServerMetadata, RegisteredClient, TokenSet;
 
 import examples_common : check, checkEq, runClient, connectFromArgs, WhoamiResult;
@@ -120,18 +120,21 @@ int main(string[] args) @safe
 }
 
 /// Mint a signed ES256 JWT for the given subject/scope/audience, valid now.
+/// Populates the SDK's typed `JwtClaims` builder rather than concatenating JSON
+/// by hand, so claim values are JSON-escaped instead of interpolated.
 string mintToken(string subject, string scope_, string audience) @safe
 {
 	const now = Clock.currTime.toUnixTime;
-	const header = `{"alg":"ES256","typ":"JWT","kid":"as-1"}`;
-	const payload = `{"iss":"` ~ Issuer ~ `","aud":"` ~ audience ~ `","sub":"` ~ subject
-		~ `","scope":"` ~ scope_ ~ `","iat":` ~ (now - 10)
-			.to!string ~ `,"nbf":` ~ (now - 10).to!string ~ `,"exp":` ~ (now + 3600)
-			.to!string ~ `}`;
-	const si = base64UrlNoPad(cast(const(ubyte)[]) header) ~ "." ~ base64UrlNoPad(
-			cast(const(ubyte)[]) payload);
-	auto sig = signEs256(PrivateKeyPem, cast(const(ubyte)[]) si);
-	return si ~ "." ~ base64UrlNoPad(sig);
+	JwtClaims claims;
+	claims.iss = Issuer;
+	claims.aud = audience;
+	claims.sub = subject;
+	claims.scope_ = scope_;
+	claims.iat = now - 10;
+	claims.nbf = now - 10;
+	claims.exp = now + 3600;
+	claims.kid = "as-1";
+	return mintJwtEs256(PrivateKeyPem, claims);
 }
 
 /// Stand up a tiny in-process OAuth authorization-server token endpoint and
