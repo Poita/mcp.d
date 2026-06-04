@@ -71,7 +71,7 @@ private int runScenario(string url, string scenario) @safe
 	// _meta + standard headers against a draft-capable server.
 	if (draftRequested())
 	{
-		client.enableDraft();
+		client.enableModern();
 		auto d = client.discover();
 		() @trusted {
 			import std.stdio : stderr;

@@ -18,4 +18,4 @@ public import mcp.transport.oauth_proxy_mount;
 // The draft module is predominantly transport-layer plumbing (header
 // encoding, param-header extraction, request-state parsing, MRTR shapes),
 // so it is reachable here rather than from the top-level surface.
-public import mcp.protocol.draft;
+public import mcp.protocol.modern;

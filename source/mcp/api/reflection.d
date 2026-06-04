@@ -9,7 +9,7 @@ import vibe.data.serialization : serializeWithPolicy, deserializeWithPolicy;
 
 import mcp.protocol.types;
 import mcp.protocol.capabilities : Icon;
-import mcp.protocol.draft : CacheHint, CacheScope;
+import mcp.protocol.modern : CacheHint, CacheScope;
 import mcp.server.server : McpServer, ToolResponse;
 import mcp.server.context;
 import mcp.api.attributes;
@@ -152,7 +152,7 @@ private template isPrimitiveHeaderParam(P)
 /// parameters, skipping any `RequestContext` parameter.
 private Json parametersSchema(alias func)() @safe
 {
-	import mcp.protocol.draft : validateHeaderName;
+	import mcp.protocol.modern : validateHeaderName;
 	import std.traits : ParameterDefaultValueTuple;
 
 	alias names = ParameterIdentifierTuple!func;
@@ -881,7 +881,7 @@ version (unittest)
 
 	import vibe.data.json : parseJsonString;
 	import mcp.server.server : ToolResponse;
-	import mcp.protocol.draft : InputRequest;
+	import mcp.protocol.modern : InputRequest;
 
 	// Fixture exercising icons, _meta, annotation title, per-resource cache
 	// hint, and MRTR (ToolResponse) tools.
@@ -1414,7 +1414,7 @@ unittest  // @mcpHeader: a Nullable-of-primitive parameter is accepted at compil
 unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schema
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.draft : paramHeaderMap;
+	import mcp.protocol.modern : paramHeaderMap;
 
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
@@ -1596,7 +1596,7 @@ unittest  // @hintTitle: annotation-level title appears in annotations
 unittest  // MRTR UDA tool: returning ToolResponse.inputRequired surfaces inputRequests
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.draft : MetaKey;
+	import mcp.protocol.modern : MetaKey;
 
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new ExtApi);
@@ -1753,7 +1753,7 @@ unittest  // @meta UDA on a @prompt: descriptor `_meta` appears in prompts/list
 version (unittest) private auto draftRead(string uri) @safe
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.draft : MetaKey;
+	import mcp.protocol.modern : MetaKey;
 
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";

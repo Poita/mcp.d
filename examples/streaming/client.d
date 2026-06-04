@@ -341,7 +341,7 @@ private int phaseCancellation(string url, int cancelledBefore) @trusted
 	// Draft mode: on Streamable HTTP the cancellation signal is the client
 	// closing its response stream (draft basic/utilities/cancellation
 	// §Transport-Specific Cancellation). connect() negotiates the draft revision.
-	client.enableDraft();
+	client.enableModern();
 	client.connect();
 
 	bool sawFirstProgress = false;

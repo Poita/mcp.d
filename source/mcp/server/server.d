@@ -9,7 +9,7 @@ import mcp.protocol.errors;
 import mcp.protocol.jsonrpc;
 import mcp.protocol.capabilities;
 import mcp.protocol.types;
-import mcp.protocol.draft;
+import mcp.protocol.modern;
 import mcp.server.context;
 import mcp.server.connection : ConnectionState;
 import mcp.server.request_state : RequestStateSecurity, RequestStateMode,
@@ -1148,7 +1148,7 @@ final class McpServer
 		auto meta = RequestMeta.fromParams(msg.params);
 		ProtocolVersion mv;
 		if (!meta.protocolVersion.length
-				|| !tryParseVersion(meta.protocolVersion, mv) || !mv.isDraft)
+				|| !tryParseVersion(meta.protocolVersion, mv) || !mv.isModern)
 			return false;
 
 		// Do NOT overwrite the shared session `clientCaps` here: the draft
@@ -1580,7 +1580,7 @@ final class McpServer
 			ProtocolVersion mv;
 			if (tryParseVersion(meta.protocolVersion, mv))
 			{
-				if (mv.isDraft)
+				if (mv.isModern)
 				{
 					// Per-request body `_meta.protocolVersion` is the stateless/draft
 					// negotiation channel: only on the draft model does it select the
@@ -1605,7 +1605,7 @@ final class McpServer
 					}
 				}
 			}
-			else if (mode_ == ServerMode.stateless || conn.negotiated.isDraft)
+			else if (mode_ == ServerMode.stateless || conn.negotiated.isModern)
 			{
 				// Per-request protocol-version negotiation (draft/stateless): the
 				// client declared a version we do not support -> reject with the
@@ -1944,7 +1944,7 @@ final class McpServer
 	/// "complete". A no-op for pre-draft versions, which carry no `resultType`.
 	private Json stampResultType(Json result, ProtocolVersion ver) @safe
 	{
-		if (!ver.isDraft)
+		if (!ver.isModern)
 			return result;
 		if (result.type != Json.Type.object)
 			return result;
@@ -2175,7 +2175,7 @@ final class McpServer
 			// -32601 (method not found), mirroring its co-removed siblings
 			// logging/setLevel and resources/subscribe. Stable (<= 2025-11-25)
 			// versions still answer with an empty-success result.
-			if (ver.isDraft)
+			if (ver.isModern)
 				throw methodNotFound(method);
 			return Json.emptyObject;
 		case "tools/list":
@@ -2201,11 +2201,11 @@ final class McpServer
 			// so it MUST return -32601 rather than an empty-success result,
 			// mirroring logging/setLevel. Stable (<= 2025-11-25) versions honour
 			// the RPC.
-			if (ver.isDraft)
+			if (ver.isModern)
 				throw methodNotFound(method);
 			return doSubscribe(params, conn);
 		case "resources/unsubscribe":
-			if (ver.isDraft)
+			if (ver.isModern)
 				throw methodNotFound(method);
 			return doUnsubscribe(params, conn);
 		case "prompts/list":
@@ -2223,7 +2223,7 @@ final class McpServer
 			// a draft-negotiated session the method does not exist and MUST answer
 			// -32601 (method not found), mirroring tasks/result. The 2025-11-25
 			// family still defines it, where doTasksList returns an empty page.
-			if (ver.isDraft)
+			if (ver.isModern)
 				throw methodNotFound(method);
 			return doTasksList(params, ver);
 		case "tasks/get":
@@ -2234,7 +2234,7 @@ final class McpServer
 			// -32601 (method not found) rather than -32602 (task not found). The
 			// 2025-11-25 family still defines it, where doTasksResult yields -32602
 			// for any (always-unknown) taskId.
-			if (ver.isDraft)
+			if (ver.isModern)
 				throw methodNotFound(method);
 			return doTasksResult(params, ver);
 		case "tasks/cancel":
@@ -2246,7 +2246,7 @@ final class McpServer
 			// inverse of tasks/result: stable answers -32601 (method not found), the
 			// draft routes to doTasksUpdate which yields -32602 (task not found) for
 			// any id against the permanently-empty store.
-			if (!ver.isDraft)
+			if (!ver.isModern)
 				throw methodNotFound(method);
 			return doTasksUpdate(params, ver);
 		default:
@@ -2276,7 +2276,7 @@ final class McpServer
 		// is never advertised even when `enableTasks()` was called, so these RPCs
 		// MUST report -32601 — matching the version gates on server/discover,
 		// resources/subscribe, and logging/setLevel.
-		if (ver < ProtocolVersion.v2025_11_25 && !ver.isDraft)
+		if (ver < ProtocolVersion.v2025_11_25 && !ver.isModern)
 			throw methodNotFound("tasks");
 		if (tasksCapability.isNull)
 			throw methodNotFound("tasks");
@@ -2329,8 +2329,8 @@ final class McpServer
 		DiscoverResult d;
 		foreach (v; supportedVersions)
 			d.protocolVersions ~= v.toWire;
-		d.capabilities = capabilities().forVersion(ProtocolVersion.draft);
-		d.serverInfo = serverInfo_.forVersion(ProtocolVersion.draft);
+		d.capabilities = capabilities().forVersion(ProtocolVersion.modern);
+		d.serverInfo = serverInfo_.forVersion(ProtocolVersion.modern);
 		d.instructions = instructions;
 		return d.toJson();
 	}
@@ -2673,7 +2673,7 @@ final class McpServer
 		// logLevel"]` (SEP-2575/2577). The method does not exist on the draft, so
 		// it MUST be answered with -32601 (method not found) rather than accepted,
 		// regardless of whether the logging capability is enabled.
-		if (ver.isDraft)
+		if (ver.isModern)
 			throw methodNotFound("logging/setLevel");
 		// On stable (<= 2025-11-25) versions the logging feature is gated on the
 		// declared `logging` capability (server/utilities/logging: "Servers that
@@ -2731,7 +2731,7 @@ final class McpServer
 		// supports — SHOULD be the latest"), clamp a draft negotiation down to the
 		// latest stable rather than emitting an InitializeResult that claims a
 		// version with no initialize semantics.
-		if (conn.negotiated.isDraft)
+		if (conn.negotiated.isModern)
 			conn.negotiated = latestStable;
 		conn.clientCaps = p.capabilities;
 		// Record that this stateful session has processed its `initialize`, so the
@@ -2778,7 +2778,7 @@ final class McpServer
 		// taken from this request's `_meta.clientCapabilities` on the stateless
 		// draft protocol, or from the session capabilities negotiated at
 		// `initialize` on the stateful 2025-era protocols.
-		const ClientCapabilities declared = ver.isDraft
+		const ClientCapabilities declared = ver.isModern
 			? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
 		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
 			throw missingRequiredClientCapability(missing.get);
@@ -3425,13 +3425,13 @@ unittest  // initialize MUST NOT negotiate draft: it has no InitializeResult
 	// version it supports"), never the draft version.
 	auto s = makeTestServer();
 	Json params = Json.emptyObject;
-	params["protocolVersion"] = ProtocolVersion.draft.toWire; // "2026-07-28"
+	params["protocolVersion"] = ProtocolVersion.modern.toWire; // "2026-07-28"
 	params["capabilities"] = Json.emptyObject;
 	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
 	auto resp = s.handle(req(1, "initialize", params)).get;
 	assert("result" in resp);
 	assert(resp["result"]["protocolVersion"].get!string == latestStable.toWire);
-	assert(resp["result"]["protocolVersion"].get!string != ProtocolVersion.draft.toWire);
+	assert(resp["result"]["protocolVersion"].get!string != ProtocolVersion.modern.toWire);
 }
 
 unittest  // initialize MUST NOT negotiate draft via the "draft" alias
@@ -3457,7 +3457,7 @@ unittest  // initialize draft clamp does not pin the connection to draft
 	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
 	s.handle(req(1, "initialize", params));
 	assert(s.negotiatedVersion == latestStable);
-	assert(!s.negotiatedVersion.isDraft);
+	assert(!s.negotiatedVersion.isModern);
 }
 
 unittest  // ping returns an empty result object
@@ -6202,7 +6202,7 @@ unittest  // draft InputRequiredResult is stamped resultType:"input_required", n
 
 unittest  // draft: a raw CallToolResult carrying inputRequests is stamped "input_required"
 {
-	import mcp.protocol.draft : InputRequest;
+	import mcp.protocol.modern : InputRequest;
 
 	// Register via the CallToolResult-returning overload and populate the public
 	// `inputRequests` field DIRECTLY (not via ToolResponse.inputRequired). This

@@ -11,7 +11,7 @@ import mcp.protocol.versions;
 import mcp.protocol.capabilities;
 import mcp.protocol.types;
 import mcp.protocol.sampling : validateSamplingMessages, CreateMessageRequest, CreateMessageResult;
-import mcp.protocol.draft;
+import mcp.protocol.modern;
 import mcp.server.context : logLevelRank;
 import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.http_transport : HttpClientTransport, LegacyFallbackException;
@@ -141,7 +141,7 @@ final class McpClient : ClientProtocol
 	private ClientTransport transport;
 	private ProtocolVersion negotiated = latestStable;
 	private bool didInitialize;
-	private bool useDraft;
+	private bool useModern;
 	private long nextId = 1;
 	// Opt-in: validate tool results against the tool's outputSchema (client side).
 	private bool validateOutputSchema_;
@@ -186,7 +186,7 @@ final class McpClient : ClientProtocol
 	// `_meta["io.modelcontextprotocol/logLevel"]` on each request, and a
 	// conformant server emits no `notifications/message` for a request that
 	// omits it (server/utilities/logging, SEP-2575/2577). This is the sticky
-	// default level applied to every draft request by `injectDraftMeta`; empty
+	// default level applied to every draft request by `injectModernMeta`; empty
 	// means "no opt-in" (no field stamped). Set via `setLogLevel` on a draft
 	// session. Per-request overrides go through `RequestOptions.logLevel` /
 	// `withRequestLogLevel` and are NOT stored here.
@@ -373,15 +373,15 @@ final class McpClient : ClientProtocol
 		return negotiated;
 	}
 
-	/// Switch to the stateless draft (2026-07-28) protocol: no `initialize`
+	/// Switch to the stateless modern (>= 2026-07-28) protocol: no `initialize`
 	/// handshake; every request carries `_meta` (protocolVersion / clientInfo /
 	/// clientCapabilities) and the standard `Mcp-Method` / `Mcp-Name` /
 	/// `MCP-Protocol-Version` headers. Call `discover()` for up-front version
 	/// selection, or just issue requests.
-	void enableDraft() @safe
+	void enableModern() @safe
 	{
-		useDraft = true;
-		negotiated = ProtocolVersion.draft;
+		useModern = true;
+		negotiated = ProtocolVersion.modern;
 	}
 
 	/// `server/discover` (draft): fetch the server's supported versions,
@@ -404,21 +404,21 @@ final class McpClient : ClientProtocol
 	/// genuine legacy server is still detected by the caller.
 	private DiscoverResult discoverProbe() @safe
 	{
-		const priorUseDraft = useDraft;
+		const priorUseModern = useModern;
 		const priorNegotiated = negotiated;
-		useDraft = true;
-		negotiated = ProtocolVersion.draft;
-		bool keepDraftFraming;
+		useModern = true;
+		negotiated = ProtocolVersion.modern;
+		bool keepModernFraming;
 		scope (exit)
-			if (!keepDraftFraming)
+			if (!keepModernFraming)
 			{
-				useDraft = priorUseDraft;
+				useModern = priorUseModern;
 				negotiated = priorNegotiated;
 			}
 		auto result = DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject));
 		// The probe succeeded as draft; leave the framing in place so `connect`'s
 		// version selection runs against a draft-capable peer.
-		keepDraftFraming = true;
+		keepModernFraming = true;
 		return result;
 	}
 
@@ -518,9 +518,9 @@ final class McpClient : ClientProtocol
 			throw new McpException(ErrorCode.unsupportedProtocolVersion,
 					"No mutually supported protocol version");
 
-		if (chosen.isDraft)
+		if (chosen.isModern)
 		{
-			useDraft = true;
+			useModern = true;
 			negotiated = chosen;
 			// No initialize handshake follows on the stateless draft path, so
 			// capture what `server/discover` advertised; otherwise the caller
@@ -537,7 +537,7 @@ final class McpClient : ClientProtocol
 			// The draft-framed probe left draft framing set; the mutually-chosen
 			// version is stable, so clear it before the `initialize` handshake runs
 			// under that stable version.
-			useDraft = false;
+			useModern = false;
 			negotiated = chosen;
 			initialize(chosen.toWire); // modern discovery, pre-draft version
 		}
@@ -650,7 +650,7 @@ final class McpClient : ClientProtocol
 		// `x-mcp-header` annotation (draft server/tools #x-mcp-header). Validate each
 		// tool's schema; drop offenders (and skip caching them), keeping siblings.
 		// stdio / non-draft sessions MAY ignore x-mcp-header, so they are unaffected.
-		if (useDraft)
+		if (useModern)
 			acc.tools = excludeInvalidHeaderTools(acc.tools);
 		// Cache each tool's inputSchema so a subsequent tools/call can mirror any
 		// x-mcp-header-annotated arguments into Mcp-Param-{Name} headers (draft
@@ -669,7 +669,7 @@ final class McpClient : ClientProtocol
 	/// for a draft session (the feature is draft-only and HTTP-transport-specific).
 	package static Tool[] excludeInvalidHeaderTools(Tool[] tools) @safe
 	{
-		import mcp.protocol.draft : validateInputSchemaHeaders;
+		import mcp.protocol.modern : validateInputSchemaHeaders;
 		import vibe.core.log : logWarn;
 
 		Tool[] kept;
@@ -710,7 +710,7 @@ final class McpClient : ClientProtocol
 	/// the top-level `params.inputResponses` map (and the server's opaque
 	/// `requestState` echoed back), looping until the server returns a completed
 	/// `CallToolResult`. The loop only
-	/// engages when draft mode is enabled (see `enableDraft`/`connect`); other
+	/// engages when draft mode is enabled (see `enableModern`/`connect`); other
 	/// protocol versions never see `inputRequests`.
 	CallToolResult callTool(string name, Json arguments = Json.emptyObject,
 			RequestOptions opts = RequestOptions.init) @safe
@@ -775,7 +775,7 @@ final class McpClient : ClientProtocol
 			auto params = buildToolCallParams(name, arguments, progressToken,
 					responses, requestState);
 			// Per-request draft logging opt-in: stamp the explicit level so
-			// `injectDraftMeta` carries it (and leaves it to win over any sticky
+			// `injectModernMeta` carries it (and leaves it to win over any sticky
 			// `setLogLevel` default). Empty -> no field.
 			params = withRequestLogLevel(params, logLevel);
 			result = CallToolResult.fromJson(rpc("tools/call", params));
@@ -1141,14 +1141,14 @@ final class McpClient : ClientProtocol
 	/// (and `onProgress` for progress). Returns a `SubscriptionStream` handle;
 	/// call its `cancel()`/`close()` to stop listening and close the stream.
 	///
-	/// Only meaningful for draft servers (call `enableDraft`/`connect` first);
+	/// Only meaningful for draft servers (call `enableModern`/`connect` first);
 	/// pre-draft servers do not implement `subscriptions/listen`.
 	SubscriptionStream subscriptionsListen(SubscriptionFilter filter) @safe
 	{
 		const id = nextId++;
 		Json params = buildSubscriptionsListenParams(filter);
-		if (useDraft)
-			params = injectDraftMeta(params);
+		if (useModern)
+			params = injectModernMeta(params);
 		auto message = makeRequest(Json(id), "subscriptions/listen", params);
 		return transport.openListen(message);
 	}
@@ -1188,7 +1188,7 @@ final class McpClient : ClientProtocol
 	/// `notifications/message` for any request that does not carry
 	/// `_meta["io.modelcontextprotocol/logLevel"]`. So on a draft-negotiated
 	/// session this does NOT send the removed RPC; instead it records `level` as
-	/// the sticky per-request opt-in that `injectDraftMeta` stamps onto every
+	/// the sticky per-request opt-in that `injectModernMeta` stamps onto every
 	/// subsequent request's `_meta` (see `withRequestLogLevel` and
 	/// `RequestOptions.logLevel` for a single-request override). Passing
 	/// an empty `level` clears the draft opt-in.
@@ -1211,7 +1211,7 @@ final class McpClient : ClientProtocol
 		// guard at server.d:1118.
 		if (level.length && logLevelRank(level) < 0)
 			throw new McpException(ErrorCode.invalidParams, "Invalid log level: " ~ level);
-		if (useDraft)
+		if (useModern)
 		{
 			requestLogLevel_ = level;
 			return;
@@ -1248,8 +1248,8 @@ final class McpClient : ClientProtocol
 				if (onRpcForTest !is null)
 					return onRpcForTest(method, params);
 			const id = nextId++;
-			if (useDraft)
-				params = injectDraftMeta(params);
+			if (useModern)
+				params = injectModernMeta(params);
 			auto message = makeRequest(Json(id), method, params);
 			return transport.deliver(message, id);
 		}
@@ -1320,7 +1320,7 @@ final class McpClient : ClientProtocol
 
 	/// Add the draft per-request `_meta` (protocol version, client identity,
 	/// capabilities) to a request's params.
-	private Json injectDraftMeta(Json params) @safe
+	private Json injectModernMeta(Json params) @safe
 	{
 		if (params.type != Json.Type.object)
 			params = Json.emptyObject;
@@ -1341,12 +1341,12 @@ final class McpClient : ClientProtocol
 		return params;
 	}
 
-	/// Test seam: run `injectDraftMeta` from a unittest so the per-request draft
+	/// Test seam: run `injectModernMeta` from a unittest so the per-request draft
 	/// `_meta` (including the logging opt-in) can be asserted without a live
 	/// server. Production code never calls this.
-	version (unittest) package Json injectDraftMetaForTest(Json params) @safe
+	version (unittest) package Json injectModernMetaForTest(Json params) @safe
 	{
-		return injectDraftMeta(params);
+		return injectModernMeta(params);
 	}
 
 	/// Test seam: when set, `notify` routes the built notification message here
@@ -1479,7 +1479,7 @@ final class McpClient : ClientProtocol
 	string[string] headersFor(Json message) @safe
 	{
 		string[string] headers;
-		if (useDraft)
+		if (useModern)
 		{
 			headers[HttpHeader.protocolVersion] = negotiated.toWire;
 			if (message.type != Json.Type.object || "method" !in message)
@@ -1523,7 +1523,7 @@ final class McpClient : ClientProtocol
 
 	/// Compute the `Mcp-Param-*` headers to emit for a `tools/call`, given the
 	/// tool's `inputSchema` and the call `arguments`. Uses the path-aware
-	/// `mcp.protocol.draft.paramHeaders`, which discovers every valid `x-mcp-header`
+	/// `mcp.protocol.modern.paramHeaders`, which discovers every valid `x-mcp-header`
 	/// annotation at *any* nesting depth (not only top-level properties), and
 	/// descends each annotation's `path` into the arguments object: for each path
 	/// segment it indexes into the current `Json` object; if any intermediate node
@@ -1539,7 +1539,7 @@ final class McpClient : ClientProtocol
 	/// helper so the mirroring can be unit-tested without a live server.
 	package static string[string] paramHeaders(Json inputSchema, Json arguments) @safe
 	{
-		import mcp.protocol.draft : draftParamHeaders = paramHeaders;
+		import mcp.protocol.modern : draftParamHeaders = paramHeaders;
 
 		string[string] headers;
 		if (arguments.type != Json.Type.object)
@@ -1906,7 +1906,7 @@ unittest  // public flagship type uses single-cap Mcp* casing
 unittest  // resolveNegotiatedVersion accepts a supported server version
 {
 	assert(resolveNegotiatedVersion("2025-06-18") == ProtocolVersion.v2025_06_18);
-	assert(resolveNegotiatedVersion("2026-07-28") == ProtocolVersion.draft);
+	assert(resolveNegotiatedVersion("2026-07-28") == ProtocolVersion.modern);
 }
 
 unittest  // resolveNegotiatedVersion throws on an unparseable server version
@@ -1932,7 +1932,7 @@ unittest  // resolveNegotiatedVersion throws with the unsupported-version error 
 unittest  // selectMutualVersion prefers the newest mutually-supported version
 {
 	ProtocolVersion v;
-	assert(selectMutualVersion(["2025-11-25", "2026-07-28"], v) && v == ProtocolVersion.draft);
+	assert(selectMutualVersion(["2025-11-25", "2026-07-28"], v) && v == ProtocolVersion.modern);
 	assert(selectMutualVersion(["2024-11-05", "2025-03-26"], v) && v == ProtocolVersion.v2025_03_26);
 }
 
@@ -1979,7 +1979,7 @@ unittest  // draft setLogLevel does NOT send the removed logging/setLevel RPC
 	// draft server answers it with -32601. So on a draft session setLogLevel must
 	// NOT POST that RPC — it records the sticky per-request opt-in instead.
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	bool sentRpc;
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "logging/setLevel")
@@ -1990,22 +1990,22 @@ unittest  // draft setLogLevel does NOT send the removed logging/setLevel RPC
 	assert(!sentRpc);
 }
 
-unittest  // draft setLogLevel makes injectDraftMeta stamp the per-request logLevel
+unittest  // draft setLogLevel makes injectModernMeta stamp the per-request logLevel
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	c.setLogLevel("info");
-	auto meta = c.injectDraftMetaForTest(Json.emptyObject);
+	auto meta = c.injectModernMetaForTest(Json.emptyObject);
 	// Every subsequent draft request carries the opt-in field the server needs
 	// before it may emit notifications/message.
 	assert(meta["_meta"][MetaKey.logLevel].get!string == "info");
 }
 
-unittest  // injectDraftMeta omits logLevel when no opt-in level has been set
+unittest  // injectModernMeta omits logLevel when no opt-in level has been set
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
-	auto meta = c.injectDraftMetaForTest(Json.emptyObject);
+	c.enableModern();
+	auto meta = c.injectModernMetaForTest(Json.emptyObject);
 	// No setLogLevel/per-request level -> the server emits no notifications/message.
 	assert(MetaKey.logLevel !in meta["_meta"]);
 }
@@ -2013,11 +2013,11 @@ unittest  // injectDraftMeta omits logLevel when no opt-in level has been set
 unittest  // an explicit per-request logLevel wins over the sticky setLogLevel default
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	c.setLogLevel("error"); // sticky default
 	Json p = Json.emptyObject;
 	p = withRequestLogLevel(p, "debug"); // explicit per-request override
-	auto meta = c.injectDraftMetaForTest(p);
+	auto meta = c.injectModernMetaForTest(p);
 	assert(meta["_meta"][MetaKey.logLevel].get!string == "debug");
 }
 
@@ -2058,38 +2058,38 @@ unittest  // setLogLevel rejects an invalid level locally (draft) without storin
 	import std.exception : assertThrown;
 
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	assertThrown!McpException(c.setLogLevel("verbose"));
 	// The bad level must not be stamped into subsequent draft requests' _meta.
-	auto meta = c.injectDraftMetaForTest(Json.emptyObject);
+	auto meta = c.injectModernMetaForTest(Json.emptyObject);
 	assert(MetaKey.logLevel !in meta["_meta"], "an invalid level must not be stored");
 }
 
 unittest  // the typed LogLevel overload is accepted and forwarded
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	c.setLogLevel(LogLevel.warning);
-	auto meta = c.injectDraftMetaForTest(Json.emptyObject);
+	auto meta = c.injectModernMetaForTest(Json.emptyObject);
 	assert(meta["_meta"][MetaKey.logLevel].get!string == "warning");
 }
 
 unittest  // a valid string level still passes
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	c.setLogLevel("debug");
-	auto meta = c.injectDraftMetaForTest(Json.emptyObject);
+	auto meta = c.injectModernMetaForTest(Json.emptyObject);
 	assert(meta["_meta"][MetaKey.logLevel].get!string == "debug");
 }
 
 unittest  // empty level clears the draft opt-in
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	c.setLogLevel("info");
 	c.setLogLevel(""); // clear
-	auto meta = c.injectDraftMetaForTest(Json.emptyObject);
+	auto meta = c.injectModernMetaForTest(Json.emptyObject);
 	assert(MetaKey.logLevel !in meta["_meta"]);
 }
 
@@ -2113,7 +2113,7 @@ private Tool headerTool(string name, Json[string] props) @safe
 unittest  // listTools excludes a tool whose x-mcp-header value is empty (draft)
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	Tool bad = headerTool("bad", [
 		"region": Json(["type": Json("string"), "x-mcp-header": Json("")])
 	]);
@@ -2143,7 +2143,7 @@ unittest  // listTools excludes a tool whose x-mcp-header value is empty (draft)
 unittest  // listTools excludes a tool whose x-mcp-header value contains CR/LF
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	Tool bad = headerTool("crlf", [
 		"region": Json([
 			"type": Json("string"),
@@ -2165,7 +2165,7 @@ unittest  // listTools excludes a tool whose x-mcp-header value contains CR/LF
 unittest  // listTools excludes a tool annotating a number-typed parameter
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	Tool bad = headerTool("num", [
 		"amount": Json(["type": Json("number"), "x-mcp-header": Json("Amount")])
 	]);
@@ -2184,7 +2184,7 @@ unittest  // listTools excludes a tool annotating a number-typed parameter
 unittest  // listTools excludes a tool with case-insensitively duplicate header values
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	Tool bad = headerTool("dup", [
 		"a": Json(["type": Json("string"), "x-mcp-header": Json("Region")]),
 		"b": Json(["type": Json("string"), "x-mcp-header": Json("region")])
@@ -2204,7 +2204,7 @@ unittest  // listTools excludes a tool with case-insensitively duplicate header 
 unittest  // a non-draft session does NOT exclude tools (x-mcp-header MAY be ignored)
 {
 	auto c = McpClient.http("http://localhost");
-	// no enableDraft() -> released session
+	// no enableModern() -> released session
 	Tool bad = headerTool("bad", [
 		"region": Json(["type": Json("string"), "x-mcp-header": Json("")])
 	]);
@@ -2272,11 +2272,11 @@ unittest  // an absent nested intermediate node emits no header
 unittest  // callTool RequestOptions.logLevel attaches the draft per-request opt-in
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	Json seen = Json.undefined;
 	c.onNotifyForTest = (Json) @safe {};
 	c.onRpcForTest = (string method, Json params) @safe {
-		// onRpcForTest runs before injectDraftMeta, so the explicit per-request
+		// onRpcForTest runs before injectModernMeta, so the explicit per-request
 		// level pre-stamped by the overload is already present here.
 		if (method == "tools/call")
 			seen = params;
@@ -2292,7 +2292,7 @@ unittest  // callTool RequestOptions.logLevel attaches the draft per-request opt
 unittest  // readResource RequestOptions.logLevel attaches the draft per-request opt-in
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	Json seen = Json.undefined;
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "resources/read")
@@ -2308,7 +2308,7 @@ unittest  // readResource RequestOptions.logLevel attaches the draft per-request
 unittest  // getPrompt RequestOptions.logLevel attaches the draft per-request opt-in
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 	Json seen = Json.undefined;
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "prompts/get")
@@ -3298,7 +3298,7 @@ unittest  // a per-call progress callback restores the prior global onProgress
 unittest  // RequestOptions combines an explicit progressToken, logLevel and onProgress
 {
 	auto c = McpClient.http("http://localhost");
-	c.enableDraft();
+	c.enableModern();
 
 	// The caller supplies its own token; onProgress must correlate against THAT
 	// token (no minting), and logLevel must still ride along in the same request.
@@ -3577,7 +3577,7 @@ unittest  // paramHeaders omits headers for absent or null annotated arguments
 
 unittest  // paramHeaders base64-encodes a non-ASCII annotated value
 {
-	import mcp.protocol.draft : decodeHeaderValue;
+	import mcp.protocol.modern : decodeHeaderValue;
 
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
@@ -3766,7 +3766,7 @@ unittest  // MRTR: resolveInputRequest fails for an unknown input type
 
 unittest  // a server that keeps requesting input stops at exactly maxRounds tools/call requests
 {
-	import mcp.protocol.draft : InputRequiredResult;
+	import mcp.protocol.modern : InputRequiredResult;
 
 	auto c = McpClient.http("http://localhost/mcp");
 	c.onElicitation = (ElicitParams) @safe {
@@ -4046,18 +4046,18 @@ unittest  // a draft client's ClientProtocol yields the MCP-Protocol-Version hea
 {
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
-	c.enableDraft();
+	c.enableModern();
 	auto headers = transport.protocol.headersFor(Json.undefined);
-	assert(headers["MCP-Protocol-Version"] == ProtocolVersion.draft.toWire);
+	assert(headers["MCP-Protocol-Version"] == ProtocolVersion.modern.toWire);
 }
 
 unittest  // a resources/read URI is encoded in Mcp-Name, never placed raw (no CR/LF injection)
 {
-	import mcp.protocol.draft : decodeHeaderValue;
+	import mcp.protocol.modern : decodeHeaderValue;
 
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
-	c.enableDraft();
+	c.enableModern();
 
 	// A server-advertised URI carrying CR/LF must not appear verbatim in the
 	// header value; it round-trips through encodeHeaderValue instead.
@@ -4079,11 +4079,11 @@ unittest  // a resources/read URI is encoded in Mcp-Name, never placed raw (no C
 
 unittest  // a benign reserved-character resource URI still survives Mcp-Name encoding
 {
-	import mcp.protocol.draft : decodeHeaderValue;
+	import mcp.protocol.modern : decodeHeaderValue;
 
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
-	c.enableDraft();
+	c.enableModern();
 
 	// A space is a non-token byte: it must be encoded rather than corrupt the line.
 	const uri = "file:///a b";
@@ -4137,19 +4137,19 @@ unittest  // connect() auto-detect probes server/discover with draft framing and
 	// connect() must end up on draft.
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
-	bool sawDraftFramedDiscover;
+	bool sawModernFramedDiscover;
 	transport.responder = (Json message, long expectId) @safe {
 		assert(message["method"].get!string == "server/discover");
 		// The probe self-advertises draft in the body...
 		assert(message["params"]["_meta"][MetaKey.protocolVersion].get!string
-				== ProtocolVersion.draft.toWire);
+				== ProtocolVersion.modern.toWire);
 		// ...and in the protocol-derived headers the transport would send.
 		auto headers = c.headersFor(message);
-		assert(headers[HttpHeader.protocolVersion] == ProtocolVersion.draft.toWire);
-		sawDraftFramedDiscover = true;
+		assert(headers[HttpHeader.protocolVersion] == ProtocolVersion.modern.toWire);
+		sawModernFramedDiscover = true;
 		Json r = Json.emptyObject;
 		r["protocolVersions"] = Json.emptyArray;
-		r["protocolVersions"] ~= Json(ProtocolVersion.draft.toWire);
+		r["protocolVersions"] ~= Json(ProtocolVersion.modern.toWire);
 		r["capabilities"] = Json.emptyObject;
 		Json info = Json.emptyObject;
 		info["name"] = "draft-srv";
@@ -4158,8 +4158,8 @@ unittest  // connect() auto-detect probes server/discover with draft framing and
 		return r;
 	};
 	auto chosen = c.connect();
-	assert(sawDraftFramedDiscover);
-	assert(chosen == ProtocolVersion.draft);
+	assert(sawModernFramedDiscover);
+	assert(chosen == ProtocolVersion.modern);
 }
 
 unittest  // connect() still falls back to initialize when even a draft-framed probe is methodNotFound
@@ -4184,7 +4184,7 @@ unittest  // connect() still falls back to initialize when even a draft-framed p
 	};
 	auto chosen = c.connect();
 	assert(chosen == latestStable);
-	assert(!chosen.isDraft);
+	assert(!chosen.isModern);
 }
 
 unittest  // test-only RPC/notify hooks are guarded behind version(unittest)

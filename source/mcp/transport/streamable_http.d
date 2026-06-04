@@ -9,7 +9,7 @@ import mcp.server.server;
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.versions;
-import mcp.protocol.draft;
+import mcp.protocol.modern;
 import mcp.transport.sse_context;
 import mcp.transport.session;
 import mcp.auth.resource_server;
@@ -685,7 +685,7 @@ unittest  // resourceOrigin strips the path from a configured resource identifie
 /// 405 is the correct answer.
 bool getOpensSseStream(ProtocolVersion negotiated) @safe
 {
-	return !negotiated.isDraft;
+	return !negotiated.isModern;
 }
 
 unittest  // stable revisions open the GET SSE stream; the draft does not
@@ -693,7 +693,7 @@ unittest  // stable revisions open the GET SSE stream; the draft does not
 	assert(getOpensSseStream(ProtocolVersion.v2025_11_25));
 	assert(getOpensSseStream(ProtocolVersion.v2025_06_18));
 	assert(getOpensSseStream(ProtocolVersion.v2025_03_26));
-	assert(!getOpensSseStream(ProtocolVersion.draft));
+	assert(!getOpensSseStream(ProtocolVersion.modern));
 }
 
 /// Decide how to answer an HTTP DELETE to the MCP endpoint
@@ -709,7 +709,7 @@ unittest  // stable revisions open the GET SSE stream; the draft does not
 /// gate `getOpensSseStream` already applies to GET.
 bool deleteTerminatesSession(ProtocolVersion negotiated) @safe
 {
-	return !negotiated.isDraft;
+	return !negotiated.isModern;
 }
 
 unittest  // stable revisions terminate sessions on DELETE; the draft answers 405
@@ -717,7 +717,7 @@ unittest  // stable revisions terminate sessions on DELETE; the draft answers 40
 	assert(deleteTerminatesSession(ProtocolVersion.v2025_11_25));
 	assert(deleteTerminatesSession(ProtocolVersion.v2025_06_18));
 	assert(deleteTerminatesSession(ProtocolVersion.v2025_03_26));
-	assert(!deleteTerminatesSession(ProtocolVersion.draft));
+	assert(!deleteTerminatesSession(ProtocolVersion.modern));
 }
 
 /// Decide whether protocol-level sessions apply to a POST request
@@ -736,7 +736,7 @@ unittest  // stable revisions terminate sessions on DELETE; the draft answers 40
 /// `deleteTerminatesSession` (DELETE) already apply.
 bool sessionsApply(ProtocolVersion negotiated) @safe
 {
-	return !negotiated.isDraft;
+	return !negotiated.isModern;
 }
 
 unittest  // stable revisions mint/require Mcp-Session-Id on POST; the draft does not
@@ -744,7 +744,7 @@ unittest  // stable revisions mint/require Mcp-Session-Id on POST; the draft doe
 	assert(sessionsApply(ProtocolVersion.v2025_11_25));
 	assert(sessionsApply(ProtocolVersion.v2025_06_18));
 	assert(sessionsApply(ProtocolVersion.v2025_03_26));
-	assert(!sessionsApply(ProtocolVersion.draft));
+	assert(!sessionsApply(ProtocolVersion.modern));
 }
 
 /// The value of the `Allow` header a 405 Method Not Allowed response must carry
@@ -775,7 +775,7 @@ unittest  // 405 Allow header enumerates every supported method (RFC 9110 §10.2
 	assert(allowedMethodsHeader(ProtocolVersion.v2025_03_26) == "GET, POST");
 	// The draft drops the standalone GET stream and protocol-level DELETE, so POST
 	// is the only supported method and the 405 advertises only POST.
-	assert(allowedMethodsHeader(ProtocolVersion.draft) == "POST");
+	assert(allowedMethodsHeader(ProtocolVersion.modern) == "POST");
 }
 
 unittest  // a stateless server (no GET stream) advertises only POST, matching its own GET 405
@@ -785,7 +785,7 @@ unittest  // a stateless server (no GET stream) advertises only POST, matching i
 	assert(allowedMethodsHeader(ProtocolVersion.v2025_11_25, false) == "POST");
 	assert(allowedMethodsHeader(ProtocolVersion.v2025_06_18, false) == "POST");
 	assert(allowedMethodsHeader(ProtocolVersion.v2025_03_26, false) == "POST");
-	assert(allowedMethodsHeader(ProtocolVersion.draft, false) == "POST");
+	assert(allowedMethodsHeader(ProtocolVersion.modern, false) == "POST");
 }
 
 /// Whether the given `Accept` request-header value admits a `text/event-stream`
@@ -2284,7 +2284,7 @@ unittest  // DELETE is version-gated like POST/GET: bad version -> 400, not 204/
 private bool tryDraft(string protoHeader) @safe
 {
 	ProtocolVersion pv;
-	return tryParseVersion(protoHeader, pv) && pv.isDraft;
+	return tryParseVersion(protoHeader, pv) && pv.isModern;
 }
 
 /// The effective protocol version for a POST that decides whether a JSON-RPC
@@ -2374,7 +2374,7 @@ private ConnectionState freshStatelessState(string protoHeader, Json params,
 		eff = mv;
 	// Pre-draft stateless: defer to the single implicit-peer `activeConnection`
 	// (return null) so an initialize-negotiated capability survives to tools/call.
-	if (!eff.isDraft)
+	if (!eff.isModern)
 		return null;
 	auto conn = new ConnectionState;
 	conn.negotiated = eff;
@@ -2399,7 +2399,7 @@ unittest  // a pre-draft stateless request defers to activeConnection (null)
 unittest  // a modern (draft/MRTR) stateless request gets a FRESH state from _meta
 {
 	import vibe.data.json : parseJsonString;
-	import mcp.protocol.draft : MetaKey;
+	import mcp.protocol.modern : MetaKey;
 
 	// The draft request carries its capabilities + log level in _meta; the fresh
 	// per-request state is built from them and retained nowhere.
@@ -2408,7 +2408,7 @@ unittest  // a modern (draft/MRTR) stateless request gets a FRESH state from _me
 			~ `"io.modelcontextprotocol/logLevel":"warning"}}`);
 	auto conn = freshStatelessState("2026-07-28", params, ProtocolVersion.v2025_11_25);
 	assert(conn !is null);
-	assert(conn.negotiated.isDraft);
+	assert(conn.negotiated.isModern);
 	assert(conn.clientCaps.sampling, "modern-stateless caps must come from the request _meta");
 	assert(conn.logLevel == "warning");
 }
@@ -2453,7 +2453,7 @@ unittest  // batches are accepted only on 2025-03-26, rejected on every newer ve
 	assert(streamableBatchAllowed(ProtocolVersion.v2025_03_26));
 	assert(!streamableBatchAllowed(ProtocolVersion.v2025_06_18));
 	assert(!streamableBatchAllowed(ProtocolVersion.v2025_11_25));
-	assert(!streamableBatchAllowed(ProtocolVersion.draft));
+	assert(!streamableBatchAllowed(ProtocolVersion.modern));
 }
 
 unittest  // a 2024-11-05 fallback (no batching in HTTP+SSE era) also rejects arrays
@@ -2800,7 +2800,7 @@ unittest  // x-mcp-header: present param but missing header fails
 
 unittest  // x-mcp-header: non-ASCII value matched via base64-encoded header
 {
-	import mcp.protocol.draft : encodeHeaderValue;
+	import mcp.protocol.modern : encodeHeaderValue;
 
 	auto schema = schemaWithHeaderParam();
 	Json args = Json(["region": Json("Zürich")]);
@@ -2945,7 +2945,7 @@ unittest  // ordinary application errors (e.g. invalidParams) ride on HTTP 200
 unittest  // draft subscriptions/listen: ack first, then opted-in change notifications flow
 {
 	import mcp.transport.sse_context : StreamCoordinator, ServerPushChannel, SubscriptionFilter;
-	import mcp.protocol.draft : MetaKey;
+	import mcp.protocol.modern : MetaKey;
 	import std.algorithm : canFind;
 
 	auto server = new McpServer("t", "1");
