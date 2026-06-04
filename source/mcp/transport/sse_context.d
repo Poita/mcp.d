@@ -1698,12 +1698,25 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// than silently dropping. stdio uses a different context (`StdioContext`), so
 	// server->client over stdio is unaffected by this gate in any mode.
 	private bool serverStateless_;
+	// Whether THIS request's `Accept` header admits `text/event-stream` (the
+	// transport resolves it from the POST's Accept via `acceptsEventStream`). When
+	// false the client provably cannot consume an SSE body, so an attempt to
+	// upgrade this response to a stream (progress/log/server-initiated request) is
+	// refused rather than emitting a stream the client declared it cannot read
+	// (basic/transports §Sending Messages content negotiation). Defaults to true
+	// so every existing caller (and the GET/listen paths) keep streaming.
+	private bool acceptsEventStream_;
+	// Set once `beginStream` has refused an SSE upgrade because the client's Accept
+	// excludes `text/event-stream`. The transport reads it after `server.handle`
+	// returns to surface a 406 Not Acceptable instead of the would-be SSE body.
+	private bool streamRefused_;
 
 	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
 			TokenInfo auth = TokenInfo.invalid(),
 			bool isDraft = false, ProtocolVersion negotiated = latestStable,
 			string connectionToken = "",
-			ConnectionState connState = null, bool serverStateless = false) @safe
+			ConnectionState connState = null,
+			bool serverStateless = false, bool acceptsEventStream = true) @safe
 	{
 		this.res = res;
 		this.coord = coord;
@@ -1716,7 +1729,16 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		this.token_ = connectionToken;
 		this.connState_ = connState;
 		this.serverStateless_ = serverStateless;
+		this.acceptsEventStream_ = acceptsEventStream;
 		this.connAlive_ = () @safe => res.connected;
+	}
+
+	/// Whether an SSE upgrade was refused for this request because the client's
+	/// `Accept` provably excludes `text/event-stream`. The transport surfaces this
+	/// as a 406 Not Acceptable after dispatch (see `streamable_http.handlePost`).
+	bool streamRefused() const @safe
+	{
+		return streamRefused_;
 	}
 
 	/// The per-connection cancellation scope for this request. This is
@@ -1783,6 +1805,16 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	{
 		if (streaming_)
 			return;
+		// Content negotiation (basic/transports §Sending Messages): if the client's
+		// Accept provably excludes text/event-stream, do not upgrade to an SSE body
+		// it declared it cannot read. Flag the refusal (the transport turns it into a
+		// 406 Not Acceptable) and abort the stream before any header/body is written.
+		if (!acceptsEventStream_)
+		{
+			streamRefused_ = true;
+			throw invalidRequest(
+					"client Accept header does not admit text/event-stream; cannot stream this response");
+		}
 		res.contentType = "text/event-stream";
 		// Cache-Control: no-cache on every version; X-Accel-Buffering: no only
 		// on the draft (basic/transports §Receiving Messages SHOULD).
