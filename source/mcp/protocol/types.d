@@ -1207,12 +1207,40 @@ struct CallToolResult
 	/// `ElicitResult.contentAs!T`: returns `T.init` when `structuredContent` is not
 	/// an object (e.g. unset, or a content-only tool result), so callers that opted
 	/// into a typed output schema can read the result without re-deserializing by
-	/// hand.
+	/// hand. The result comes from an untrusted/possibly non-conforming server, so
+	/// — mirroring the inbound `argsAs!T` accessor — a deserialization failure on a
+	/// shape that does not match `T` is mapped to `invalidParams` (rather than
+	/// leaking a raw vibe exception); an `McpException` propagates unchanged.
 	T structuredContentAs(T)() const @safe
 	{
+		import mcp.protocol.errors : invalidParams;
+
 		if (structuredContent.type != Json.Type.object)
 			return T.init;
-		return () @trusted { return deserializeJson!T(structuredContent); }();
+		try
+			return () @trusted { return deserializeJson!T(structuredContent); }();
+		catch (McpException e)
+			throw e;
+		catch (Exception e)
+			throw invalidParams("structuredContent: " ~ e.msg);
+	}
+
+	/// Decode the MRTR (SEP-2322) `requestState` as JSON into `T`, the typed
+	/// inverse of the server-side `RequestContext.requestStateAs!T` (the server
+	/// encodes `serializeToJson(state).toString()`). Returns `T.init` when the
+	/// server sent no state (`requestState` empty).
+	///
+	/// Per SEP-2322 `requestState` is opaque and server-owned: a conformant client
+	/// MUST NOT inspect it and normally only echoes it back verbatim on retry. This
+	/// accessor is a convenience (e.g. for tests asserting the round-trip shape),
+	/// not the expected path. The value is untrusted, so a malformed payload throws.
+	T requestStateAs(T)() const @safe
+	{
+		if (requestState.length == 0)
+			return T.init;
+		return () @trusted {
+			return deserializeJson!T(parseJsonString(requestState));
+		}();
 	}
 
 	/// Build a `CallToolResult` whose `structuredContent` is `value` serialized via
@@ -3682,6 +3710,49 @@ unittest  // CallToolResult.structuredContentAs!T returns T.init when structured
 	auto w = r.structuredContentAs!Weather;
 	assert(w.city == "");
 	assert(isNaN(w.tempC));
+}
+
+unittest  // structuredContentAs!T maps a malformed object to invalidParams (not a raw vibe exception)
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
+	static struct Weather
+	{
+		string city;
+		double tempC;
+	}
+
+	Json sc = Json.emptyObject;
+	sc["tempC"] = Json("not-a-number"); // wrong leaf type for a double
+	CallToolResult r;
+	r.structuredContent = sc;
+	auto e = collectException!McpException(r.structuredContentAs!Weather);
+	assert(e !is null);
+	assert(e.code == ErrorCode.invalidParams);
+}
+
+unittest  // CallToolResult.requestStateAs!T decodes the opaque requestState into a struct
+{
+	static struct State
+	{
+		string topic;
+	}
+
+	CallToolResult r;
+	r.requestState = `{"topic":"Q3 roadmap"}`;
+	assert(r.requestStateAs!State.topic == "Q3 roadmap");
+}
+
+unittest  // CallToolResult.requestStateAs!T returns T.init when no requestState was sent
+{
+	static struct State
+	{
+		string topic;
+	}
+
+	CallToolResult r;
+	assert(r.requestStateAs!State.topic == "");
 }
 
 unittest  // Resource emits annotations (audience/priority/lastModified)

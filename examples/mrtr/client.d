@@ -172,7 +172,11 @@ private int runE2E(McpClient client) @safe
 
 	// SEP-2322: the opaque requestState the server stashed (it encoded the topic
 	// as a typed RequestState struct, i.e. a JSON object `{"topic":"Q3 roadmap"}`).
-	check(parseRequestStateTopic(raw.requestState) == "Q3 roadmap",
+	// The typed `requestStateAs!T` accessor mirrors the server's
+	// `RequestContext.requestStateAs!T`; per SEP-2322 a conformant client treats
+	// `requestState` as opaque and only echoes it — this decode is purely the
+	// round-trip-shape assertion, not a normal operation.
+	check(raw.requestStateAs!RequestState.topic == "Q3 roadmap",
 			"requestState topic mismatch: '" ~ raw.requestState ~ "'");
 
 	// ---- Second round-trip view: install mock handlers; the SDK completes the loop. ----
@@ -216,18 +220,12 @@ private int runE2E(McpClient client) @safe
 	return 0;
 }
 
-/// Read the `topic` out of the server's opaque `requestState`. The server
+/// The client's view of the server's opaque `requestState` contract: the server
 /// encodes a typed `RequestState` struct, so the blob is a JSON object
-/// `{"topic":"..."}`; this is the client's view of that contract for the
-/// round-trip-shape assertion.
-private string parseRequestStateTopic(string requestState) @safe
+/// `{"topic":"..."}`. Only used by the round-trip-shape assertion via
+/// `CallToolResult.requestStateAs!RequestState`; per SEP-2322 a conformant client
+/// otherwise treats `requestState` as opaque and merely echoes it.
+private struct RequestState
 {
-	import vibe.data.json : parseJsonString;
-
-	if (requestState.length == 0)
-		return "";
-	auto j = () @trusted { return parseJsonString(requestState); }();
-	if (j.type == Json.Type.object && "topic" in j)
-		return j["topic"].get!string;
-	return "";
+	string topic;
 }
