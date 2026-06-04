@@ -194,12 +194,18 @@ struct RegisteredResource
 	Nullable!CacheHint cache;
 }
 
+/// A resource template reader receiving the concrete URI, the captured `{var}`
+/// parameters, and the per-request `RequestContext` (so a template handler can
+/// log, observe cancellation, or elicit through the real request channel).
+alias TemplateReader = ResourceContents delegate(string uri,
+		string[string] params, RequestContext ctx) @safe;
+
 /// A registered resource template: descriptor + reader receiving the concrete
-/// URI and the captured `{var}` parameters.
+/// URI, the captured `{var}` parameters, and the per-request context.
 struct RegisteredTemplate
 {
 	ResourceTemplate descriptor;
-	ResourceContents delegate(string uri, string[string] params) @safe reader;
+	TemplateReader reader;
 	/// Per-template draft `CacheableResult` freshness hint for `resources/read`.
 	Nullable!CacheHint cache;
 }
@@ -761,8 +767,25 @@ final class McpServer
 	/// Register a resource template with a reader receiving the matched URI and
 	/// captured `{var}` parameters. An optional per-template draft `CacheableResult`
 	/// freshness hint is emitted on a matching `resources/read` (draft only).
+	///
+	/// This is the context-less form; for a reader that needs the per-request
+	/// `RequestContext` (logging, cancellation, elicitation) use the overload
+	/// taking a `(string, string[string], RequestContext)` reader.
 	void registerResourceTemplate(ResourceTemplate descriptor, ResourceContents delegate(string uri,
 			string[string] params) @safe reader, Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
+	{
+		// Adapt the context-less reader to the context-aware form, ignoring the
+		// per-request context.
+		registerResourceTemplate(descriptor, (string uri, string[string] params,
+				RequestContext) => reader(uri, params), cache);
+	}
+
+	/// Register a resource template whose reader also receives the per-request
+	/// `RequestContext`, so a template handler can log, poll cancellation, or
+	/// elicit through the real request channel. Otherwise identical to the
+	/// context-less overload.
+	void registerResourceTemplate(ResourceTemplate descriptor,
+			TemplateReader reader, Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
 		// Two adjacent variables ("{a}{b}") can never be reverse-matched against a
 		// concrete URI (there is no boundary between them), so such a template would
@@ -2030,7 +2053,7 @@ final class McpServer
 				throw methodNotFound(method);
 			return doListResourceTemplates(params, ver);
 		case "resources/read":
-			return doReadResource(params, ver);
+			return doReadResource(params, ctx, ver);
 		case "resources/subscribe":
 			// The draft has no resources/subscribe RPC; subscriptions/listen takes
 			// its place (the SubscriptionFilter "Replaces the former
@@ -2343,7 +2366,7 @@ final class McpServer
 				templates, (RegisteredTemplate t) => t.descriptor, params, ver);
 	}
 
-	private Json doReadResource(Json params, ProtocolVersion ver) @safe
+	private Json doReadResource(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/read requires a string 'uri'");
@@ -2362,7 +2385,7 @@ final class McpServer
 			if (matchUriTemplate(t.descriptor.uriTemplate, uri, captured))
 			{
 				ReadResourceResult result;
-				result.contents = [t.reader(uri, captured).forVersion(ver)];
+				result.contents = [t.reader(uri, captured, ctx).forVersion(ver)];
 				return maybeCache(result, t.cache, ver);
 			}
 		}
