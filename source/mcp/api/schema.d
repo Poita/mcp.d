@@ -449,15 +449,14 @@ private string checkNumericBounds(Json value, Json schema, string where) @safe
 			&& value.type != Json.Type.bigInt)
 		return "";
 
-	const num = jsonNumber(value);
 	if ("minimum" in schema && schema["minimum"].type != Json.Type.undefined)
 	{
-		if (num < jsonNumber(schema["minimum"]))
+		if (compareJsonNumbers(value, schema["minimum"]) < 0)
 			return where ~ ": value is below the minimum";
 	}
 	if ("maximum" in schema && schema["maximum"].type != Json.Type.undefined)
 	{
-		if (num > jsonNumber(schema["maximum"]))
+		if (compareJsonNumbers(value, schema["maximum"]) > 0)
 			return where ~ ": value is above the maximum";
 	}
 
@@ -505,6 +504,39 @@ private string checkArrayBounds(Json value, Json schema, string where) @safe
 	}
 
 	return "";
+}
+
+// Compare two JSON numbers, returning a negative value when `a < b`, zero when
+// equal, and a positive value when `a > b`. Integral operands (int_/bigInt) are
+// compared exactly via BigInt so that values beyond 2^53 do not collapse onto a
+// shared double; the lossy double path is used only when a float is involved.
+private int compareJsonNumbers(Json a, Json b) @safe
+{
+	static bool isIntegral(Json j)
+	{
+		return j.type == Json.Type.int_ || j.type == Json.Type.bigInt;
+	}
+
+	if (isIntegral(a) && isIntegral(b))
+	{
+		import std.bigint : BigInt;
+
+		const BigInt x = a.type == Json.Type.int_ ? BigInt(a.get!long) : a.get!BigInt;
+		const BigInt y = b.type == Json.Type.int_ ? BigInt(b.get!long) : b.get!BigInt;
+		if (x < y)
+			return -1;
+		if (x > y)
+			return 1;
+		return 0;
+	}
+
+	const da = jsonNumber(a);
+	const db = jsonNumber(b);
+	if (da < db)
+		return -1;
+	if (da > db)
+		return 1;
+	return 0;
 }
 
 private double jsonNumber(Json j) @safe
@@ -828,6 +860,45 @@ unittest  // validateAgainstSchema accepts an in-range bigInt value
 	Json schema = Json.emptyObject;
 	schema["type"] = "integer";
 	schema["minimum"] = Json(1);
+	assert(validateAgainstSchema(big, schema) == "");
+}
+
+unittest  // validateAgainstSchema rejects a bigInt one above a 2^53 maximum
+{
+	import vibe.data.json : parseJsonString;
+
+	// 2^53 + 1 collapses onto the same double as 2^53, so a double comparison
+	// would wrongly accept it; the BigInt path must reject it.
+	auto big = parseJsonString("9007199254740993");
+	assert(big.type == Json.Type.int_ || big.type == Json.Type.bigInt);
+	Json schema = Json.emptyObject;
+	schema["type"] = "integer";
+	schema["maximum"] = parseJsonString("9007199254740992");
+	assert(validateAgainstSchema(big, schema).length > 0);
+}
+
+unittest  // validateAgainstSchema rejects a true bigInt one above a 2^53 maximum
+{
+	import std.bigint : BigInt;
+
+	// A value forced into the bigInt representation, just past the double mantissa.
+	auto big = Json(BigInt("9007199254740993"));
+	assert(big.type == Json.Type.bigInt);
+	Json schema = Json.emptyObject;
+	schema["type"] = "integer";
+	schema["maximum"] = Json(9007199254740992L);
+	assert(validateAgainstSchema(big, schema).length > 0);
+}
+
+unittest  // validateAgainstSchema accepts a bigInt equal to a 2^53 maximum
+{
+	import vibe.data.json : parseJsonString;
+
+	auto big = parseJsonString("9007199254740992");
+	assert(big.type == Json.Type.bigInt || big.type == Json.Type.int_);
+	Json schema = Json.emptyObject;
+	schema["type"] = "integer";
+	schema["maximum"] = parseJsonString("9007199254740992");
 	assert(validateAgainstSchema(big, schema) == "");
 }
 
