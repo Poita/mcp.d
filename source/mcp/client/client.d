@@ -159,12 +159,18 @@ final class McpClient : ClientProtocol
 	// late response correlated to one of these ids is dropped rather than
 	// returned. Keyed by the JSON-RPC id under which the request was POSTed.
 	private bool[long] cancelledRequests_;
+	// Insertion order of the ids in `cancelledRequests_`, used to evict the
+	// single oldest id when the set is full (FIFO) rather than clearing it
+	// wholesale. May contain ids already removed by `isCancelled`; those are
+	// skipped during eviction.
+	private long[] cancelledOrder_;
 	// Size backstop for `cancelledRequests_`: ids are normally evicted when their
 	// late response is observed (`isCancelled`), but a late response that never
-	// arrives would otherwise pin its id forever. Once the tracked set reaches
-	// this many entries it is cleared on the next `cancel`; the only consequence
-	// is that an as-yet-unseen late response for a long-evicted id is no longer
-	// suppressed, an acceptable trade for a bounded set.
+	// arrives would otherwise pin its id forever. Once the tracked set is full,
+	// the next `cancel` evicts only the OLDEST tracked id, so recently-cancelled
+	// ids stay remembered and their late responses are still dropped per
+	// basic/utilities/cancellation. The only id at risk is the oldest one, whose
+	// as-yet-unseen late response is the least likely to still be relevant.
 	private enum size_t maxCancelledTracked_ = 4096;
 	// The JSON-RPC id used for the `initialize` request, so cancel() can enforce
 	// the spec rule that clients MUST NOT cancel initialize. 0 until sent.
@@ -1409,9 +1415,25 @@ final class McpClient : ClientProtocol
 	{
 		if (requestId == initializeRequestId && initializeRequestId != 0)
 			throw invalidRequest("The initialize request MUST NOT be cancelled by clients");
-		if (cancelledRequests_.length >= maxCancelledTracked_)
-			cancelledRequests_.clear();
-		cancelledRequests_[requestId] = true;
+		// Already tracked: nothing to add (and avoid a duplicate order entry).
+		if (requestId !in cancelledRequests_)
+		{
+			// Bounded FIFO: when full, evict the oldest still-tracked id rather
+			// than clearing the whole set, so recently-cancelled ids remain
+			// remembered and their late responses are still dropped.
+			while (cancelledRequests_.length >= maxCancelledTracked_ && cancelledOrder_.length)
+			{
+				const oldest = cancelledOrder_[0];
+				cancelledOrder_ = cancelledOrder_[1 .. $];
+				if (oldest in cancelledRequests_)
+				{
+					cancelledRequests_.remove(oldest);
+					break;
+				}
+			}
+			cancelledRequests_[requestId] = true;
+			cancelledOrder_ ~= requestId;
+		}
 		Json params = Json.emptyObject;
 		params["requestId"] = requestId;
 		if (reason.length)
@@ -2562,6 +2584,33 @@ unittest  // after cancel(), a response for that id is treated as cancelled (ign
 	assert(c.isResponseCancelled(11));
 	// Unrelated ids are unaffected.
 	assert(!c.isResponseCancelled(12));
+}
+
+unittest  // overflowing the cancelled set evicts only the oldest, keeping recent ids
+{
+	auto c = McpClient.http("http://localhost");
+	c.onNotifyForTest = (Json message) @safe {};
+
+	// The first id cancelled is the oldest; it is the only one at risk once the
+	// set overflows. A wholesale clear (the bug) would instead drop EVERY id.
+	const oldest = 1L;
+	c.cancel(oldest);
+
+	// Fill the rest of the set right up to its bound with distinct ids.
+	foreach (i; 0 .. McpClient.maxCancelledTracked_ - 1)
+		c.cancel(1000L + i);
+
+	// One more, recently cancelled id tips the set over the bound; FIFO eviction
+	// removes the single oldest entry (`oldest`) and keeps everything else.
+	const recent = 999L;
+	c.cancel(recent);
+
+	// The bug accepted late responses for still-relevant cancelled ids after the
+	// clear; the fix keeps recently-cancelled ids suppressed and only drops the
+	// oldest.
+	assert(c.isResponseCancelled(recent));
+	assert(c.isResponseCancelled(1000L)); // a mid-set filler survives
+	assert(!c.isResponseCancelled(oldest));
 }
 
 unittest  // cancel() refuses to cancel the initialize request per spec
