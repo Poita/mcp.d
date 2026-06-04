@@ -853,6 +853,80 @@ unittest  // matching is case-insensitive and tolerant of surrounding whitespace
 	assert(acceptsEventStream("application/json ,  text/event-stream"));
 }
 
+/// Whether the given `Accept` request-header value admits an `application/json`
+/// response — the single-JSON reply a plain POST request receives. Matching
+/// mirrors `acceptsEventStream`: an exact `application/json` token, the
+/// `application/*` subtype wildcard, or the `*/*` full wildcard; quality and
+/// other `;`-parameters are ignored. An empty value (no `Accept`) is permissive.
+bool acceptsJson(string accept) @safe
+{
+	import std.string : strip, toLower;
+	import std.algorithm : splitter;
+
+	auto trimmed = accept.strip;
+	if (trimmed.length == 0)
+		return true;
+
+	foreach (part; trimmed.splitter(','))
+	{
+		auto mediaType = part;
+		foreach (i, c; part)
+		{
+			if (c == ';')
+			{
+				mediaType = part[0 .. i];
+				break;
+			}
+		}
+		const token = mediaType.strip.toLower;
+		if (token == "application/json" || token == "application/*" || token == "*/*")
+			return true;
+	}
+	return false;
+}
+
+unittest  // an Accept that names application/json (or a wildcard covering it) is admitted
+{
+	assert(acceptsJson("application/json"));
+	assert(acceptsJson("application/json, text/event-stream"));
+	assert(acceptsJson("application/json;q=0.9"));
+	assert(acceptsJson("application/*"));
+	assert(acceptsJson("*/*"));
+	assert(acceptsJson(""));
+}
+
+unittest  // an Accept that names media types but omits application/json is rejected
+{
+	assert(!acceptsJson("text/event-stream"));
+	assert(!acceptsJson("text/plain"));
+	assert(!acceptsJson("text/*"));
+}
+
+/// Whether a POSTed request's `Accept` header admits at least one of the two
+/// media types the Streamable HTTP transport can answer a request with —
+/// `application/json` (a single JSON reply) or `text/event-stream` (an SSE
+/// stream). The spec REQUIRES POST clients to send
+/// `Accept: application/json, text/event-stream`; a request whose Accept
+/// provably excludes BOTH could not consume any response the server may produce,
+/// so it is rejected up front with 406 Not Acceptable. A missing/blank Accept is
+/// permissive (both helpers admit it), matching the GET path's tolerance.
+bool postAccepted(string accept) @safe
+{
+	return acceptsJson(accept) || acceptsEventStream(accept);
+}
+
+unittest  // a POST Accept admitting either media type is accepted; one excluding both is not
+{
+	assert(postAccepted("application/json, text/event-stream"));
+	assert(postAccepted("application/json"));
+	assert(postAccepted("text/event-stream"));
+	assert(postAccepted("*/*"));
+	assert(postAccepted("")); // permissive: no Accept header
+	// Provably excludes BOTH acceptable media types -> not accepted.
+	assert(!postAccepted("text/plain"));
+	assert(!postAccepted("application/xml"));
+}
+
 private void handleGet(McpServer server, ServerPushChannel push, SessionManager sessions,
 		uint reconnectDelayMs, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
@@ -1273,21 +1347,40 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		res.writeBody("", "text/plain");
 		return;
 	case MessageKind.request:
-		// Session Management: assign a session id on the InitializeResult so the
-		// client can echo it on subsequent requests. Set before writing the body.
-		// `sessions.create()` is fail-closed: it throws
-		// McpException when the OS CSPRNG is unavailable. Map that to a JSON-RPC
-		// error response on HTTP 500 -- the same shape as every other error path in
-		// handlePost -- instead of letting it escape to vibe's generic error page.
+		// Content Negotiation (basic/transports §Sending Messages): a POST carrying
+		// a request "MUST include an Accept header, listing both application/json and
+		// text/event-stream as supported content types." A client whose Accept
+		// provably excludes BOTH could not consume any response the server may
+		// produce (a single JSON reply or an SSE stream), so reject it up front with
+		// 406 Not Acceptable rather than answering with a body it declared it cannot
+		// read. A missing/blank Accept stays permissive. This precedes session
+		// minting so a 406 never leaves a session behind.
+		if (!postAccepted(req.headers.get("Accept", "")))
+		{
+			res.statusCode = HTTPStatus.notAcceptable;
+			res.writeBody(
+					"Not Acceptable: POST requests must accept application/json or text/event-stream",
+					"text/plain");
+			return;
+		}
+		// Session Management: mint a session id for an `initialize` so dispatch can
+		// negotiate against the SessionManager-owned `ConnectionState`. The id is
+		// COMMITTED to the response (its `Mcp-Session-Id` header) only once
+		// `server.handle` returns a successful `InitializeResult`; on any error path
+		// below the minted session is rolled back via `sessions.terminate` so a
+		// failed/invalid initialize neither leaks a session nor stamps the header on
+		// a non-`InitializeResult` response (the spec ties that header to "the HTTP
+		// response containing the InitializeResult").
+		// `sessions.create()` is fail-closed: it throws McpException when the OS
+		// CSPRNG is unavailable. Map that to a JSON-RPC error response on HTTP 500 --
+		// the same shape as every other error path in handlePost -- instead of
+		// letting it escape to vibe's generic error page.
 		string mintedSessionId;
 		if (sessions !is null && sessionsApply(server.negotiatedVersion)
 				&& msg.method == "initialize")
 		{
 			try
-			{
 				mintedSessionId = sessions.create();
-				res.headers[SessionHeader] = mintedSessionId;
-			}
 			catch (McpException e)
 			{
 				res.statusCode = HTTPStatus.internalServerError;
@@ -1305,6 +1398,10 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			|| tryDraft(RequestMeta.fromParams(msg.params).protocolVersion);
 		if (auto hdrErr = validatePostRequestHeaders(req, msg, isDraftReq, server))
 		{
+			// Roll back a session minted above for an initialize that fails header
+			// validation: it never reached a successful InitializeResult, so it must
+			// not survive as a leaked session (no-op when nothing was minted).
+			sessions !is null && sessions.terminate(mintedSessionId);
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeBody(makeErrorResponse(msg.id, hdrErr).toString(), "application/json");
 			return;
@@ -1343,10 +1440,15 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// seeded from the effective version + `_meta`, retained nowhere.
 		ConnectionState reqState = postState(server, sessions, mintedSessionId,
 				connToken, req.headers.get(HttpHeader.protocolVersion, ""), msg.params);
+		// Whether this POST's Accept admits text/event-stream. When it provably does
+		// not, an attempt by the handler to stream (progress/log/server-initiated
+		// request) is refused inside the context and surfaced as 406 below, rather
+		// than emitting an SSE body the client declared it cannot read.
+		const reqAcceptsSse = acceptsEventStream(req.headers.get("Accept", ""));
 		auto ctx = new HttpStreamContext(res, coord, clientCapsFor(server, reqState),
 				extractProgressToken(msg.params),
 				token, isDraftReq, effVersion, connToken, reqState,
-				server.mode == ServerMode.stateless);
+				server.mode == ServerMode.stateless, reqAcceptsSse);
 		auto resp = server.handle(msg, ctx);
 		// Draft basic/utilities/cancellation §Transport-Specific Cancellation: on
 		// Streamable HTTP "Closing the SSE response stream is the cancellation
@@ -1357,15 +1459,42 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// suppress it. Released versions (2025-*) keep their behaviour: a dropped
 		// connection still completes the write, which is a harmless no-op there.
 		if (suppressOnDisconnect(isDraftReq, res.connected))
+		{
+			// The draft is stateless-only, so it never mints a session; the rollback
+			// is a no-op there. Kept for symmetry: a suppressed initialize must not
+			// leave a session behind.
+			sessions !is null && sessions.terminate(mintedSessionId);
 			return;
+		}
+		auto j = resp.get;
+		// Commit the minted session only now that initialize produced a successful
+		// InitializeResult: set its Mcp-Session-Id header. Any other outcome (a
+		// JSON-RPC error result) rolls the minted session back so neither the leaked
+		// session nor the spec-deviating header on an error response survives.
+		if (mintedSessionId.length)
+		{
+			if (initializeSucceeded(j))
+				res.headers[SessionHeader] = mintedSessionId;
+			else
+				sessions.terminate(mintedSessionId);
+		}
+		// The handler tried to stream but this POST's Accept excludes
+		// text/event-stream, so the context refused the SSE upgrade (no body was
+		// written). Surface 406 Not Acceptable with the refusal as a JSON-RPC error,
+		// rather than the would-be SSE body the client declared it cannot read.
+		if (ctx.streamRefused)
+		{
+			res.statusCode = HTTPStatus.notAcceptable;
+			res.writeBody(j.toString(), "application/json");
+			return;
+		}
 		if (ctx.streaming)
-			ctx.finishWith(resp.get);
+			ctx.finishWith(j);
 		else
 		{
 			// Map reserved JSON-RPC errors onto their required HTTP statuses
 			// (400 for unsupported-version/header-mismatch, draft 404 for
 			// method-not-found); everything else rides on 200.
-			auto j = resp.get;
 			res.statusCode = httpStatusForResponse(j, isDraftReq);
 			res.writeBody(j.toString(), "application/json");
 		}
@@ -1446,6 +1575,33 @@ int httpStatusForResponse(Json resp, bool isDraft) @safe
 	if (isDraft && code == ErrorCode.methodNotFound)
 		return 404;
 	return 200;
+}
+
+/// Whether a JSON-RPC response to an `initialize` request carries a successful
+/// result rather than an error. Session Management (basic/transports §Session
+/// Management) ties the `Mcp-Session-Id` header to "the HTTP response containing
+/// the InitializeResult", so a freshly-minted session is committed (its header
+/// set, the session kept) only when this is true; an error response (e.g. a
+/// second initialize rejected with `invalidRequest`) rolls the minted session
+/// back instead.
+bool initializeSucceeded(Json resp) @safe
+{
+	return ("result" in resp) !is null && ("error" in resp) is null;
+}
+
+unittest  // a successful InitializeResult commits; an error response does not
+{
+	Json ok = Json.emptyObject;
+	ok["result"] = Json.emptyObject;
+	assert(initializeSucceeded(ok));
+
+	Json err = Json.emptyObject;
+	err["error"] = Json.emptyObject;
+	assert(!initializeSucceeded(err));
+
+	// A malformed response carrying neither is treated as not-successful so the
+	// session is rolled back rather than leaked.
+	assert(!initializeSucceeded(Json.emptyObject));
 }
 
 /// Decide whether a finished POST response must be suppressed because the client
@@ -2351,6 +2507,102 @@ unittest  // only a draft subscriptions/listen opens the long-lived stream
 	assert(!opensListenStream("subscriptions/listen", false));
 	assert(!opensListenStream("tools/list", true));
 	assert(!opensListenStream("initialize", true));
+}
+
+version (unittest) private HTTPServerRequest makeInitPostReq(string body_,
+		string[string] headers = null) @safe
+{
+	import vibe.http.server : createTestHTTPServerRequest;
+	import vibe.http.common : HTTPMethod;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryStream;
+
+	auto buf = () @trusted { return cast(ubyte[]) body_.dup; }();
+	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"),
+			HTTPMethod.POST, createMemoryStream(buf, false));
+	req.headers["Host"] = "127.0.0.1";
+	req.headers["Content-Type"] = "application/json";
+	if (headers !is null)
+		foreach (k, v; headers)
+			req.headers[k] = v;
+	return req;
+}
+
+version (unittest) private string initializeBody(string ver = "2025-11-25") @safe
+{
+	return `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{` ~ `"protocolVersion":"`
+		~ ver ~ `","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}`;
+}
+
+unittest  // a successful stateful initialize commits the Mcp-Session-Id header (issue #815)
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto req = makeInitPostReq(initializeBody(), [
+		"Accept": "application/json, text/event-stream"
+	]);
+	router.handleRequest(req, res);
+
+	// The session id is committed only on a successful InitializeResult.
+	assert(SessionHeader in res.headers, "a successful initialize MUST carry Mcp-Session-Id");
+	assert(res.headers[SessionHeader].length > 0);
+}
+
+unittest  // an initialize that fails header validation mints no surviving session and no header (issue #815)
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	// A draft-tagged initialize whose Mcp-Method header mismatches the body method
+	// fails validatePostRequestHeaders -> 400, exercising the rollback path: the
+	// minted session must be terminated and NO Mcp-Session-Id stamped on the error.
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto req = makeInitPostReq(initializeBody("2026-07-28"),
+			[
+				"Accept": "application/json, text/event-stream",
+				HttpHeader.protocolVersion: "2026-07-28",
+				HttpHeader.method: "tools/list",
+	]);
+	router.handleRequest(req, res);
+
+	assert(res.statusCode == HTTPStatus.badRequest);
+	assert(SessionHeader !in res.headers,
+			"a failed initialize MUST NOT stamp Mcp-Session-Id on the error response");
+}
+
+unittest  // a POST request whose Accept excludes both media types is rejected with 406 (issue #816)
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	// Accept names a media type but provably excludes both application/json and
+	// text/event-stream -> 406, before any session is minted.
+	auto req = makeInitPostReq(initializeBody(), ["Accept": "text/plain"]);
+	router.handleRequest(req, res);
+
+	assert(res.statusCode == HTTPStatus.notAcceptable);
+	assert(SessionHeader !in res.headers);
 }
 
 /// Build the leading event the transport sends when it opens a
