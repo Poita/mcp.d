@@ -643,12 +643,29 @@ final class HttpClientTransport : ClientTransport
 		// Protocol-version header for the GET stream (set after initialize).
 		auto verHeaders = requestHeaders(Json.undefined);
 
+		// Register a slot so `close()` force-closes this retry-resume GET socket even
+		// while the reader is parked on a long-lived SSE read, exactly as
+		// `runServerStream`/`postAndAwaitRaw` do. Without it a `close()` could not
+		// interrupt a parked resume read and the socket would leak.
+		auto slot = new ListenSocketSlot;
+		serverStreamSlots ~= slot;
+		scope (exit)
+		{
+			import std.algorithm : remove;
+
+			slot.closeSocket();
+			serverStreamSlots = serverStreamSlots.remove!(s => s is slot);
+		}
+
 		() @trusted {
 			try
 			{
 				auto sock = connectTCP(pinnedHost, ep.port);
-				scope (exit)
-					sock.close();
+				// `attach` closes `sock` immediately if a `close()` already ran during
+				// the `connectTCP` yield, so the socket is never leaked or left parked.
+				slot.attach(sock);
+				if (closing)
+					return;
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, ep.host);
 				const req = buildHttpRequest("GET", ep.path, ep.host, "text/event-stream",
@@ -1986,6 +2003,26 @@ unittest  // close() sets closing(), which the post-connect re-check in the stre
 	assert(!t.closing);
 	t.close();
 	assert(t.closing);
+}
+
+unittest  // a slot registered after close() is born-closed, so resumeViaGet's race-window socket is torn down
+{
+	// resumeViaGet now registers its retry-resume socket in `serverStreamSlots`
+	// (the same teardown contract runServerStream/postAndAwaitRaw use), so a
+	// `close()` racing the connect closes the socket on arrival rather than leaking
+	// a parked SSE read. Model the connectTCP-yield race: close() first, then a slot
+	// registered + attached afterwards must be torn down immediately.
+	import vibe.core.net : TCPConnection;
+
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	t.close();
+	auto slot = new ListenSocketSlot;
+	t.serverStreamSlots ~= slot;
+	// close() already ran, but a slot registered in the race window must be closed
+	// the moment a socket is attached: closeSocket() set `closed`, so attach() closes.
+	slot.closeSocket();
+	assert(slot.closed,
+			"a resume-path slot registered around close() must be force-closed, not leaked");
 }
 
 unittest  // notifyLegacy is a no-op before the completion event is created
