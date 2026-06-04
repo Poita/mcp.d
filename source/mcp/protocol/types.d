@@ -6,8 +6,8 @@ import mcp.protocol.capabilities;
 import mcp.protocol.errors : ErrorCode, McpException;
 import mcp.protocol.versions : ProtocolVersion, toWire;
 import mcp.protocol.jsonhelpers : getOr, tryGet;
-import mcp.protocol.draft : InputRequest, emitInputRequired, parseInputRequired,
-	CacheHint, parseCacheHint, withCache;
+import mcp.protocol.modern : InputRequest, emitInputRequired,
+	parseInputRequired, CacheHint, parseCacheHint, withCache;
 import mcp.client.client : ProgressToken;
 
 @safe:
@@ -1191,7 +1191,7 @@ struct CallToolResult
 		// `inputRequests`/`requestState` form the draft-only MRTR
 		// `InputRequiredResult` shape; a non-draft `CallToolResult` schema has no
 		// such fields, so drop them when projecting below the draft.
-		if (v >= ProtocolVersion.draft)
+		if (v >= ProtocolVersion.modern)
 		{
 			projected.inputRequests = inputRequests.dup;
 			projected.requestState = requestState;
@@ -1402,7 +1402,7 @@ struct ListToolsResult
 
 unittest  // ListToolsResult: a set cache hint round-trips through toJson/fromJson
 {
-	import mcp.protocol.draft : CacheScope;
+	import mcp.protocol.modern : CacheScope;
 	import core.time : seconds;
 
 	ListToolsResult r;
@@ -2076,7 +2076,7 @@ unittest  // Tool.forVersion strips execution on draft (field was dropped from d
 {
 	Tool t = {name: "longjob"};
 	t.execution = ToolExecution(nullable("optional"));
-	auto j = t.forVersion(ProtocolVersion.draft).toJson();
+	auto j = t.forVersion(ProtocolVersion.modern).toJson();
 	assert("execution" !in j);
 }
 
@@ -2100,7 +2100,7 @@ unittest  // Tool.forVersion leaves the original Tool unmodified (returns a proj
 {
 	Tool t = {name: "longjob"};
 	t.execution = ToolExecution(nullable("optional"));
-	cast(void) t.forVersion(ProtocolVersion.draft);
+	cast(void) t.forVersion(ProtocolVersion.modern);
 	assert(!t.execution.isNull);
 	assert(t.execution.get.taskSupport.get == "optional");
 }
@@ -2336,7 +2336,7 @@ unittest  // Resource.forVersion keeps icons for draft (>= 2025-11-25)
 {
 	Resource r = {uri: "test://x", name: "x"};
 	r.icons ~= Icon("https://example.com/i.png");
-	auto j = r.forVersion(ProtocolVersion.draft).toJson();
+	auto j = r.forVersion(ProtocolVersion.modern).toJson();
 	assert("icons" in j && j["icons"].length == 1);
 }
 
@@ -2450,7 +2450,7 @@ unittest  // ResourceTemplate.forVersion keeps icons for draft (>= 2025-11-25)
 {
 	ResourceTemplate t = {uriTemplate: "test://{id}", name: "x"};
 	t.icons ~= Icon("https://example.com/i.png");
-	auto j = t.forVersion(ProtocolVersion.draft).toJson();
+	auto j = t.forVersion(ProtocolVersion.modern).toJson();
 	assert("icons" in j && j["icons"].length == 1);
 }
 
@@ -2585,7 +2585,7 @@ unittest  // CallToolResult.forVersion keeps MRTR fields on the draft
 	CallToolResult r;
 	r.inputRequests = [InputRequest("req1", "elicitation", Json.emptyObject)];
 	r.requestState = "blob";
-	auto projected = r.forVersion(ProtocolVersion.draft);
+	auto projected = r.forVersion(ProtocolVersion.modern);
 	assert(projected.inputRequests.length == 1);
 	assert(projected.requestState == "blob");
 }
@@ -2629,7 +2629,7 @@ unittest  // CallToolResult.forVersion keeps structuredContent on draft
 	Json sc = Json.emptyObject;
 	sc["result"] = 7;
 	r.structuredContent = sc;
-	auto j = r.forVersion(ProtocolVersion.draft).toJson();
+	auto j = r.forVersion(ProtocolVersion.modern).toJson();
 	assert("structuredContent" in j);
 }
 
@@ -4003,7 +4003,7 @@ unittest  // PromptArgument.forVersion keeps title for draft
 {
 	PromptArgument a = {name: "arg"};
 	a.title = "Arg";
-	auto j = a.forVersion(ProtocolVersion.draft).toJson();
+	auto j = a.forVersion(ProtocolVersion.modern).toJson();
 	assert(j["title"].get!string == "Arg");
 }
 
@@ -4132,7 +4132,7 @@ unittest  // Prompt.forVersion keeps title for draft
 {
 	Prompt p = {name: "greet"};
 	p.title = "Greeting";
-	auto j = p.forVersion(ProtocolVersion.draft).toJson();
+	auto j = p.forVersion(ProtocolVersion.modern).toJson();
 	assert(j["title"].get!string == "Greeting");
 }
 
@@ -4165,7 +4165,7 @@ unittest  // Prompt.forVersion keeps icons for draft (draft >= 2025-11-25)
 {
 	Prompt p = {name: "greet"};
 	p.icons = [Icon("https://e/p.png", nullable("image/png"), ["16x16"])];
-	auto j = p.forVersion(ProtocolVersion.draft).toJson();
+	auto j = p.forVersion(ProtocolVersion.modern).toJson();
 	assert(j["icons"].type == Json.Type.array);
 }
 
@@ -4367,7 +4367,7 @@ unittest  // Content.forVersion downgrades audio to a text placeholder pre-2025-
 	assert(j["type"].get!string == "text");
 	// audio is in-schema from 2025-03-26 onward -> preserved unchanged
 	assert(c.forVersion(ProtocolVersion.v2025_03_26).kind == ContentKind.audio);
-	assert(c.forVersion(ProtocolVersion.draft).kind == ContentKind.audio);
+	assert(c.forVersion(ProtocolVersion.modern).kind == ContentKind.audio);
 }
 
 unittest  // Content.forVersion downgrades resource_link to a placeholder pre-2025-06-18

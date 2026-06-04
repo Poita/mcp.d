@@ -38,7 +38,7 @@ module caching_server;
 import mcp;
 import mcp.api.attributes : resource, cache;
 import mcp.api.reflection : registerHandlers;
-import mcp.protocol.draft : CacheHint, CacheScope;
+import mcp.protocol.modern : CacheHint, CacheScope;
 
 import examples_common : runServerFromArgs;
 

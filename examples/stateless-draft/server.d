@@ -30,7 +30,7 @@ import std.typecons : nullable;
 import core.time : seconds;
 
 import mcp;
-import mcp.protocol.draft : CacheHint, CacheScope;
+import mcp.protocol.modern : CacheHint, CacheScope;
 
 import examples_common : runServerFromArgs;
 

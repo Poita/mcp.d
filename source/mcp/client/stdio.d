@@ -341,7 +341,7 @@ unittest  // stdio openListen writes the subscriptions/listen request to the ser
 		auto client = McpClient.stdio(() @safe { return cast(string) null; }, (string s) @safe {
 			toServer ~= s;
 		});
-		client.enableDraft();
+		client.enableModern();
 
 		SubscriptionFilter filter = {toolsListChanged: true};
 		client.subscriptionsListen(filter);
@@ -364,7 +364,7 @@ unittest  // stdio listen cancel() emits notifications/cancelled referencing the
 		auto client = McpClient.stdio(() @safe { return cast(string) null; }, (string s) @safe {
 			toServer ~= s;
 		});
-		client.enableDraft();
+		client.enableModern();
 
 		SubscriptionFilter filter = {resourcesListChanged: true};
 		auto stream = client.subscriptionsListen(filter);

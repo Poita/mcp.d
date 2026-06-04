@@ -39,7 +39,7 @@ import std.algorithm : map, canFind;
 import std.array : array;
 
 import mcp.client.client : McpClient;
-import mcp.protocol.draft : CacheScope;
+import mcp.protocol.modern : CacheScope;
 
 import examples_common : check, checkEq, runClient, connectFromArgs;
 
@@ -61,7 +61,7 @@ int main(string[] args) @safe
 		// Cache hints are a draft-only feature: speak the stateless draft
 		// protocol (no initialize handshake). Transport-agnostic — the same call
 		// works over stdio and HTTP.
-		client.enableDraft();
+		client.enableModern();
 
 		// --- 1. resources/list carries the per-list cache hint ----------------
 		auto list = client.listResources();

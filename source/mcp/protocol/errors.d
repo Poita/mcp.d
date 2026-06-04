@@ -286,11 +286,11 @@ unittest  // resourceNotFound (no-version) keeps the legacy -32002 code
 
 unittest  // resourceNotFound(version) selects -32602 for draft, -32002 otherwise
 {
-	assert(resourceNotFound("file:///x", ProtocolVersion.draft).code == -32602);
+	assert(resourceNotFound("file:///x", ProtocolVersion.modern).code == -32602);
 	assert(resourceNotFound("file:///x", ProtocolVersion.v2025_11_25).code == -32002);
 	assert(resourceNotFound("file:///x", ProtocolVersion.v2024_11_05).code == -32002);
 	// message still carries the uri
-	assert(resourceNotFound("file:///x", ProtocolVersion.draft)
+	assert(resourceNotFound("file:///x", ProtocolVersion.modern)
 			.msg == "Resource not found: file:///x");
 }
 

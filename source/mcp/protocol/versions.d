@@ -9,17 +9,18 @@ enum ProtocolVersion
 	v2025_03_26,
 	v2025_06_18,
 	v2025_11_25,
-	draft
+	modern
 }
 
-/// The newest stable (non-draft) version this SDK speaks.
+/// The newest stable (legacy) version this SDK speaks. Versions before
+/// `modern` (2026-07-28) are "legacy"; `modern` and later are "modern".
 enum ProtocolVersion latestStable = ProtocolVersion.v2025_11_25;
 
-/// All versions this SDK can speak, oldest to newest (draft last).
+/// All versions this SDK can speak, oldest to newest (modern last).
 immutable ProtocolVersion[] supportedVersions = [
 	ProtocolVersion.v2024_11_05, ProtocolVersion.v2025_03_26,
 	ProtocolVersion.v2025_06_18, ProtocolVersion.v2025_11_25,
-	ProtocolVersion.draft
+	ProtocolVersion.modern
 ];
 
 /// Convert a version to its on-the-wire date string.
@@ -35,8 +36,8 @@ string toWire(ProtocolVersion v) pure nothrow
 		return "2025-06-18";
 	case ProtocolVersion.v2025_11_25:
 		return "2025-11-25";
-	case ProtocolVersion.draft:
-		return "2026-07-28"; // the current draft revision
+	case ProtocolVersion.modern:
+		return "2026-07-28"; // wire token for the modern revision (spec labels it "draft")
 	}
 }
 
@@ -52,10 +53,11 @@ ProtocolVersion parseVersion(string s) pure
 /// Parse a wire string; returns false (without throwing) if unknown.
 bool tryParseVersion(string s, out ProtocolVersion v) pure nothrow
 {
-	// Accept the literal "draft" as an alias for the current draft revision.
+	// The spec labels the modern revision's wire token "draft"; accept it as
+	// an alias for the dated "2026-07-28" token.
 	if (s == "draft")
 	{
-		v = ProtocolVersion.draft;
+		v = ProtocolVersion.modern;
 		return true;
 	}
 	foreach (candidate; supportedVersions)
@@ -93,36 +95,42 @@ bool supportsProgressMessage(ProtocolVersion v) pure nothrow
 	return v >= ProtocolVersion.v2025_03_26;
 }
 
-/// The draft (2026-07-28) redesign: stateless HTTP, per-request `_meta`,
+/// The modern (>= 2026-07-28) redesign: stateless HTTP, per-request `_meta`,
 /// `server/discover`, MRTR, `subscriptions/listen`, cacheable results, and the
 /// standard request headers. Gated behind this single predicate so older
 /// versions keep their session/handshake-based behavior.
-bool isDraft(ProtocolVersion v) pure nothrow
+bool isModern(ProtocolVersion v) pure nothrow
 {
-	return v >= ProtocolVersion.draft;
+	return v >= ProtocolVersion.modern;
 }
 
-/// Draft+ uses per-request `_meta` (protocolVersion/clientInfo/clientCapabilities)
+/// Whether a version predates the modern redesign (< 2026-07-28).
+bool isLegacy(ProtocolVersion v) pure nothrow
+{
+	return v < ProtocolVersion.modern;
+}
+
+/// Modern uses per-request `_meta` (protocolVersion/clientInfo/clientCapabilities)
 /// instead of an `initialize` handshake.
-alias usesPerRequestMeta = isDraft;
+alias usesPerRequestMeta = isModern;
 
-/// Draft+ implements `server/discover`.
-alias supportsDiscover = isDraft;
+/// Modern implements `server/discover`.
+alias supportsDiscover = isModern;
 
-/// Draft+ uses Multi Round-Trip Requests instead of server-initiated requests.
-alias usesMRTR = isDraft;
+/// Modern uses Multi Round-Trip Requests instead of server-initiated requests.
+alias usesMRTR = isModern;
 
-/// Draft+ uses `subscriptions/listen` instead of GET stream + resources/subscribe.
-alias usesSubscriptionsListen = isDraft;
+/// Modern uses `subscriptions/listen` instead of GET stream + resources/subscribe.
+alias usesSubscriptionsListen = isModern;
 
-/// Draft+ returns `ttlMs`/`cacheScope` on cacheable results.
-alias cacheableResults = isDraft;
+/// Modern returns `ttlMs`/`cacheScope` on cacheable results.
+alias cacheableResults = isModern;
 
-/// The JSON-RPC error code for "resource not found": draft aligns it to
+/// The JSON-RPC error code for "resource not found": modern aligns it to
 /// invalidParams (-32602); earlier versions used the MCP-specific -32002.
 int resourceNotFoundCode(ProtocolVersion v) pure nothrow
 {
-	return v.isDraft ? -32602 : -32002;
+	return v.isModern ? -32602 : -32002;
 }
 
 unittest  // wire string round-trips for every version
@@ -130,10 +138,10 @@ unittest  // wire string round-trips for every version
 	import std.exception : assertThrown;
 
 	assert(ProtocolVersion.v2024_11_05.toWire == "2024-11-05");
-	assert(ProtocolVersion.draft.toWire == "2026-07-28");
+	assert(ProtocolVersion.modern.toWire == "2026-07-28");
 	assert("2025-06-18".parseVersion == ProtocolVersion.v2025_06_18);
-	assert("draft".parseVersion == ProtocolVersion.draft);
-	assert("2026-07-28".parseVersion == ProtocolVersion.draft);
+	assert("draft".parseVersion == ProtocolVersion.modern);
+	assert("2026-07-28".parseVersion == ProtocolVersion.modern);
 	assertThrown("1999-01-01".parseVersion);
 }
 
@@ -160,17 +168,32 @@ unittest  // feature gating: elicitation introduced in 2025-06-18
 {
 	assert(!ProtocolVersion.v2025_03_26.supportsElicitation);
 	assert(ProtocolVersion.v2025_06_18.supportsElicitation);
-	assert(ProtocolVersion.draft.supportsElicitation);
+	assert(ProtocolVersion.modern.supportsElicitation);
 }
 
-unittest  // draft feature gates and resource-not-found code
+unittest  // modern feature gates and resource-not-found code
 {
-	assert(ProtocolVersion.draft.isDraft);
-	assert(!ProtocolVersion.v2025_11_25.isDraft);
-	assert(ProtocolVersion.draft.supportsDiscover);
-	assert(ProtocolVersion.draft.usesMRTR);
-	assert(ProtocolVersion.draft.usesSubscriptionsListen);
-	assert(ProtocolVersion.draft.cacheableResults);
-	assert(ProtocolVersion.draft.resourceNotFoundCode == -32602);
+	assert(ProtocolVersion.modern.isModern);
+	assert(!ProtocolVersion.v2025_11_25.isModern);
+	assert(ProtocolVersion.modern.supportsDiscover);
+	assert(ProtocolVersion.modern.usesMRTR);
+	assert(ProtocolVersion.modern.usesSubscriptionsListen);
+	assert(ProtocolVersion.modern.cacheableResults);
+	assert(ProtocolVersion.modern.resourceNotFoundCode == -32602);
 	assert(ProtocolVersion.v2025_11_25.resourceNotFoundCode == -32002);
+}
+
+unittest  // isLegacy: every pre-modern version is legacy, modern is not
+{
+	assert(ProtocolVersion.v2024_11_05.isLegacy);
+	assert(ProtocolVersion.v2025_03_26.isLegacy);
+	assert(ProtocolVersion.v2025_06_18.isLegacy);
+	assert(ProtocolVersion.v2025_11_25.isLegacy);
+	assert(!ProtocolVersion.modern.isLegacy);
+}
+
+unittest  // both wire tokens for the modern revision still parse
+{
+	assert("draft".parseVersion == ProtocolVersion.modern);
+	assert("2026-07-28".parseVersion == ProtocolVersion.modern);
 }

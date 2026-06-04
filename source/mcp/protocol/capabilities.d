@@ -2,7 +2,7 @@ module mcp.protocol.capabilities;
 
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
-import mcp.protocol.versions : ProtocolVersion, isDraft;
+import mcp.protocol.versions : ProtocolVersion, isModern;
 import mcp.protocol.jsonhelpers : getOr, tryGet;
 
 @safe:
@@ -381,9 +381,9 @@ struct ServerCapabilities
 		// top-level `tasks`; task support there is negotiated via the `extensions`
 		// map keyed by `tasksExtensionKey`. The range + `!isDraft` predicate keeps a
 		// future stable version inserted before `draft` emitting top-level `tasks`.
-		if (v >= ProtocolVersion.v2025_11_25 && !v.isDraft)
+		if (v >= ProtocolVersion.v2025_11_25 && !v.isModern)
 			projected.tasks = tasks;
-		else if (v.isDraft)
+		else if (v.isModern)
 			projected.extensions = foldTasksIntoExtensions(extensions, tasks);
 		return projected;
 	}
@@ -534,9 +534,9 @@ struct ClientCapabilities
 		// `tasks` is first-class in the stable 2025-11-25 era and any future stable
 		// (non-draft) revision; the draft era folds it into `extensions`. Mirror the
 		// range + `!isDraft` predicate used by `ServerCapabilities.forVersion`.
-		if (v >= ProtocolVersion.v2025_11_25 && !v.isDraft)
+		if (v >= ProtocolVersion.v2025_11_25 && !v.isModern)
 			projected.tasks = tasks;
-		else if (v.isDraft)
+		else if (v.isModern)
 			projected.extensions = foldTasksIntoExtensions(extensions, tasks);
 		return projected;
 	}
@@ -818,7 +818,7 @@ unittest  // forVersion keeps every field for 2025-11-25 and draft
 			Icon("https://example.com/i.png")
 		]
 	};
-	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.draft])
+	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.modern])
 	{
 		auto j = impl.forVersion(v).toJson();
 		assert(j["title"].get!string == "My Server");
@@ -861,7 +861,7 @@ unittest  // Implementation.forVersion carries icon theme for 2025-11-25 and dra
 			Icon("https://example.com/i.png", Nullable!string.init, [], nullable("dark"))
 		]
 	};
-	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.draft])
+	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.modern])
 	{
 		auto projected = impl.forVersion(v);
 		assert(projected.icons.length == 1);
@@ -884,7 +884,7 @@ unittest  // ServerCapabilities.forVersion keeps completions from 2025-03-26
 	caps.completions = true;
 	foreach (v; [
 		ProtocolVersion.v2025_03_26, ProtocolVersion.v2025_06_18,
-		ProtocolVersion.v2025_11_25, ProtocolVersion.draft
+		ProtocolVersion.v2025_11_25, ProtocolVersion.modern
 	])
 		assert("completions" in caps.forVersion(v).toJson());
 }
@@ -911,7 +911,7 @@ unittest  // ServerCapabilities.forVersion: draft has no top-level tasks capabil
 {
 	ServerCapabilities caps;
 	caps.tasks = TasksCapability(true, true);
-	auto j = caps.forVersion(ProtocolVersion.draft).toJson();
+	auto j = caps.forVersion(ProtocolVersion.modern).toJson();
 	assert("tasks" !in j);
 }
 
@@ -919,7 +919,7 @@ unittest  // ServerCapabilities.forVersion folds tasks into extensions for draft
 {
 	ServerCapabilities caps;
 	caps.tasks = TasksCapability(true, true);
-	auto j = caps.forVersion(ProtocolVersion.draft).toJson();
+	auto j = caps.forVersion(ProtocolVersion.modern).toJson();
 	assert("extensions" in j);
 	assert("io.modelcontextprotocol/tasks" in j["extensions"]);
 	// The per-extension settings object carries the negotiated tasks shape.
@@ -936,7 +936,7 @@ unittest  // ServerCapabilities.forVersion: explicit tasks extension wins over f
 	settings["maxConcurrent"] = 4;
 	ext["io.modelcontextprotocol/tasks"] = settings;
 	caps.extensions = ext;
-	auto j = caps.forVersion(ProtocolVersion.draft).toJson();
+	auto j = caps.forVersion(ProtocolVersion.modern).toJson();
 	// The caller's explicit advertisement is preserved, not overwritten by fold.
 	assert(j["extensions"]["io.modelcontextprotocol/tasks"]["maxConcurrent"].get!int == 4);
 }
@@ -952,7 +952,7 @@ unittest  // ClientCapabilities.forVersion: draft has no top-level tasks capabil
 {
 	ClientCapabilities caps;
 	caps.tasks = TasksCapability(false, false);
-	auto j = caps.forVersion(ProtocolVersion.draft).toJson();
+	auto j = caps.forVersion(ProtocolVersion.modern).toJson();
 	assert("tasks" !in j);
 }
 
@@ -960,7 +960,7 @@ unittest  // ClientCapabilities.forVersion folds tasks into extensions for draft
 {
 	ClientCapabilities caps;
 	caps.tasks = TasksCapability(false, false);
-	auto j = caps.forVersion(ProtocolVersion.draft).toJson();
+	auto j = caps.forVersion(ProtocolVersion.modern).toJson();
 	assert("extensions" in j);
 	assert("io.modelcontextprotocol/tasks" in j["extensions"]);
 }
@@ -999,7 +999,7 @@ unittest  // ServerCapabilities.forVersion keeps extensions for draft
 	Json ext = Json.emptyObject;
 	ext["io.modelcontextprotocol/tasks"] = Json.emptyObject;
 	caps.extensions = ext;
-	assert("extensions" in caps.forVersion(ProtocolVersion.draft).toJson());
+	assert("extensions" in caps.forVersion(ProtocolVersion.modern).toJson());
 }
 
 unittest  // ServerCapabilities.forVersion always keeps base capabilities
@@ -1488,7 +1488,7 @@ unittest  // ClientCapabilities.forVersion keeps roots/rootsListChanged uncondit
 	foreach (v; [
 		ProtocolVersion.v2024_11_05, ProtocolVersion.v2025_03_26,
 		ProtocolVersion.v2025_06_18, ProtocolVersion.v2025_11_25,
-		ProtocolVersion.draft
+		ProtocolVersion.modern
 	])
 		assert(caps.forVersion(v).toJson()["roots"]["listChanged"].get!bool);
 }
@@ -1504,7 +1504,7 @@ unittest  // ServerCapabilities.forVersion keeps top-level tasks for any stable 
 	foreach (v; supportedVersionsAtLeast(ProtocolVersion.v2025_11_25))
 	{
 		auto j = caps.forVersion(v).toJson();
-		if (v.isDraft)
+		if (v.isModern)
 		{
 			assert("tasks" !in j);
 			assert("extensions" in j);
@@ -1521,7 +1521,7 @@ unittest  // ClientCapabilities.forVersion keeps top-level tasks for any stable 
 	foreach (v; supportedVersionsAtLeast(ProtocolVersion.v2025_11_25))
 	{
 		auto j = caps.forVersion(v).toJson();
-		if (v.isDraft)
+		if (v.isModern)
 		{
 			assert("tasks" !in j);
 			assert("extensions" in j);

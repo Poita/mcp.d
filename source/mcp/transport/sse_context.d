@@ -11,7 +11,7 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.transport.coordinator : throwOrReturn;
 import mcp.protocol.capabilities;
-import mcp.protocol.draft : withSubscriptionId;
+import mcp.protocol.modern : withSubscriptionId;
 import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
 import mcp.server.context;
 import mcp.server.connection : ConnectionState;
@@ -1649,7 +1649,7 @@ unittest  // emitTo delivers only to the named listener, not the others
 unittest  // a notification delivered on a listen stream is stamped with its subscriptionId
 {
 	import std.algorithm : canFind;
-	import mcp.protocol.draft : MetaKey;
+	import mcp.protocol.modern : MetaKey;
 
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
@@ -1667,7 +1667,7 @@ unittest  // a notification delivered on a listen stream is stamped with its sub
 unittest  // a notification delivered on a plain GET stream carries no subscriptionId
 {
 	import std.algorithm : canFind;
-	import mcp.protocol.draft : MetaKey;
+	import mcp.protocol.modern : MetaKey;
 
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
@@ -1682,7 +1682,7 @@ unittest  // a notification delivered on a plain GET stream carries no subscript
 unittest  // emitTo to a listen stream stamps subscriptionId (e.g. the leading ack)
 {
 	import std.algorithm : canFind;
-	import mcp.protocol.draft : MetaKey;
+	import mcp.protocol.modern : MetaKey;
 
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
@@ -2202,7 +2202,7 @@ unittest  // the priming event is sent ONLY on 2025-11-25
 	assert(!sendsPrimingEvent(ProtocolVersion.v2025_03_26));
 	assert(!sendsPrimingEvent(ProtocolVersion.v2024_11_05));
 	// The draft drops Last-Event-ID resumability, so no priming event there.
-	assert(!sendsPrimingEvent(ProtocolVersion.draft));
+	assert(!sendsPrimingEvent(ProtocolVersion.modern));
 }
 
 /// Whether the server SHOULD emit an SSE `retry:` field before closing a
@@ -2228,7 +2228,7 @@ unittest  // the retry-on-close hint is sent ONLY on 2025-11-25
 	assert(!sendsRetryOnClose(ProtocolVersion.v2025_03_26));
 	assert(!sendsRetryOnClose(ProtocolVersion.v2024_11_05));
 	// The draft drops Last-Event-ID resumability, so no reconnect hint there.
-	assert(!sendsRetryOnClose(ProtocolVersion.draft));
+	assert(!sendsRetryOnClose(ProtocolVersion.modern));
 }
 
 /// Frame a standalone Server-Sent Events `retry:` event carrying the
@@ -2766,7 +2766,7 @@ unittest  // draft HttpStreamContext: a disconnected client reports cancelled
 	auto coord = new StreamCoordinator;
 	ClientCapabilities caps;
 	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
-			TokenInfo.invalid(), true, ProtocolVersion.draft);
+			TokenInfo.invalid(), true, ProtocolVersion.modern);
 
 	// Connection alive -> not cancelled.
 	ctx.setConnectionProbe(() @safe => true);

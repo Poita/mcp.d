@@ -17,7 +17,7 @@
  * vs internal plumbing. Bring them in explicitly when needed:
  *
  *   - `import mcp.transport;` — stdio / Streamable HTTP / SSE / session /
- *     OAuth-proxy mount / draft transport helpers,
+ *     OAuth-proxy mount / modern transport helpers,
  *   - `import mcp.auth;`      — token verifiers / OAuth client / login /
  *     resource-server / OAuth proxy.
  */
@@ -42,13 +42,13 @@ public import mcp.api.attributes;
 public import mcp.api.schema;
 public import mcp.api.reflection;
 
-// --- User-facing draft (next-version) result/hint types ---
+// --- User-facing modern (next-version) result/hint types ---
 // These are referenced by members already on the lean public surface:
 // `McpServer.setListCacheHint(string, CacheHint)` and `McpClient.discover()`
 // returning `DiscoverResult`. Re-export the user-facing result/hint types
 // (but not the transport/wire plumbing that also lives in
-// `mcp.protocol.draft`) so they are usable with `import mcp;` alone.
-public import mcp.protocol.draft : DiscoverResult, CacheHint, CacheScope, RequestMeta;
+// `mcp.protocol.modern`) so they are usable with `import mcp;` alone.
+public import mcp.protocol.modern : DiscoverResult, CacheHint, CacheScope, RequestMeta;
 
 // --- Opt-in MRTR requestState security ---
 // Referenced by `McpServer.secureRequestState(RequestStateSecurity)`. The codec

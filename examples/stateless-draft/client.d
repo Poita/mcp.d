@@ -13,7 +13,7 @@
  * newline-delimited JSON-RPC over its stdin/stdout. `runClient(scenario)` drives
  * the vibe event loop uniformly so the IDENTICAL assertion body works over both
  * channels. The draft (2026-07-28) stateless model is engaged the same way on
- * either channel — `enableDraft()` + per-request `_meta`.
+ * either channel — `enableModern()` + per-request `_meta`.
  *
  * It ASSERTS the consumer's-eye view:
  *
@@ -43,7 +43,7 @@ import std.conv : to;
 import vibe.data.json : Json;
 
 import mcp;
-import mcp.protocol.draft : CacheScope;
+import mcp.protocol.modern : CacheScope;
 
 import examples_common : check, checkEq, runClient, connectFromArgs;
 
@@ -86,7 +86,7 @@ int main(string[] args) @safe
 	return runClient(() @safe {
 		// connectFromArgs picks HTTP (`--http <url>`/`--url <url>`) or spawns the
 		// sibling `stateless-draft-server` over stdio. The client is not yet
-		// initialized; the draft path uses enableDraft()/connect() below.
+		// initialized; the draft path uses enableModern()/connect() below.
 		auto client = connectFromArgs(args, "stateless-draft-server");
 		scope (exit)
 			client.close();
@@ -97,7 +97,7 @@ int main(string[] args) @safe
 private int runE2E(McpClient client, bool overHttp) @safe
 {
 	// --- 1. server/discover (stateless, up-front version negotiation) ---------
-	client.enableDraft();
+	client.enableModern();
 	auto disc = client.discover();
 	check(disc.protocolVersions.canFind("2026-07-28"),
 			"discover.supportedVersions should contain the draft 2026-07-28; got "
@@ -106,8 +106,8 @@ private int runE2E(McpClient client, bool overHttp) @safe
 
 	// --- 2. connect() selects the stateless draft -----------------------------
 	auto negotiated = client.connect();
-	checkEq(negotiated, ProtocolVersion.draft, "connect() negotiated version");
-	checkEq(client.protocolVersion(), ProtocolVersion.draft, "client.protocolVersion()");
+	checkEq(negotiated, ProtocolVersion.modern, "connect() negotiated version");
+	checkEq(client.protocolVersion(), ProtocolVersion.modern, "client.protocolVersion()");
 
 	// --- 3. listTools + per-list draft CacheableResult hint -------------------
 	auto tools = client.listTools();

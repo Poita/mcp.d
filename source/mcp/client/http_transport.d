@@ -14,7 +14,7 @@ import vibe.core.sync : LocalManualEvent, createManualEvent;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
-import mcp.protocol.draft : isHeaderValueUnsafe;
+import mcp.protocol.modern : isHeaderValueUnsafe;
 import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.subscription : SubscriptionStream;
 
