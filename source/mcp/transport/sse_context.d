@@ -72,7 +72,10 @@ final class StreamCoordinator
 	/// elapses). Returns the result, or throws `McpException` on error/timeout.
 	Json await(long id, Duration timeout = 60.seconds) @safe
 	{
-		auto w = waiters[id];
+		auto wp = id in waiters;
+		if (wp is null)
+			throw internalError("awaiting an unknown request id");
+		auto w = *wp;
 		scope (exit)
 			waiters.remove(id);
 
@@ -100,7 +103,10 @@ final class StreamCoordinator
 		if (alive is null)
 			return await(id, timeout);
 
-		auto w = waiters[id];
+		auto wp = id in waiters;
+		if (wp is null)
+			throw internalError("awaiting an unknown request id");
+		auto w = *wp;
 		scope (exit)
 			waiters.remove(id);
 
@@ -241,6 +247,34 @@ unittest  // a null liveness probe degrades to a plain resolved await
 
 	const r = coord.awaitLive(id, null, internalError("client disconnected before responding"));
 	assert(r == Json("done"));
+}
+
+unittest  // await on an unregistered id surfaces a catchable McpException, not a RangeError
+{
+	auto coord = new StreamCoordinator;
+	bool threw;
+	try
+		coord.await(99);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.internalError);
+	}
+	assert(threw, "awaiting an unknown id must throw a catchable McpException");
+}
+
+unittest  // awaitLive on an unregistered id surfaces a catchable McpException, not a RangeError
+{
+	auto coord = new StreamCoordinator;
+	bool threw;
+	try
+		coord.awaitLive(99, () @safe => true, internalError("disconnected"));
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.internalError);
+	}
+	assert(threw, "awaiting an unknown id must throw a catchable McpException");
 }
 
 /// The per-stream opt-in a client expressed when it opened a draft
