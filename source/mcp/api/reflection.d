@@ -459,7 +459,7 @@ private Nullable!CacheHint collectCache(alias overload)() @safe
 		{
 			{
 				CacheHint h;
-				h.ttlMs = a.ttlMs;
+				h.ttl = a.ttl;
 				h.cacheScope = (a.scope_ == "private") ? CacheScope.private_ : CacheScope.public_;
 				hint = h;
 			}
@@ -765,6 +765,8 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 
 version (unittest)
 {
+	import core.time : seconds;
+
 	private enum Priority
 	{
 		low,
@@ -908,7 +910,7 @@ version (unittest)
 		@resource("ext://cached", "Cached", "application/json")
 		@icon("https://example.com/res.svg")
 		@meta(parseJsonString(`{"origin":"db"}`))
-		@cache(5000, "private")
+		@cache(5.seconds, "private")
 		string cached() @safe
 		{
 			return "{}";

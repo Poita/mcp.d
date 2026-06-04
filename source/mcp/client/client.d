@@ -3921,6 +3921,8 @@ unittest  // initialize records the server's advertised capabilities/info/instru
 
 unittest  // readResource exposes the parsed CacheableResult freshness hint as .cache
 {
+	import core.time : seconds;
+
 	auto c = McpClient.http("http://localhost");
 	c.onRpcForTest = (string method, Json params) @safe {
 		Json r = Json.emptyObject;
@@ -3933,12 +3935,14 @@ unittest  // readResource exposes the parsed CacheableResult freshness hint as .
 	};
 	auto res = c.readResource("test://x");
 	assert(!res.cache.isNull);
-	assert(res.cache.get.ttlMs == 6000);
+	assert(res.cache.get.ttl == 6.seconds);
 	assert(res.cache.get.cacheScope == CacheScope.private_);
 }
 
 unittest  // a list result exposes .cache from the first page's freshness hint
 {
+	import core.time : seconds;
+
 	auto c = McpClient.http("http://localhost");
 	c.onRpcForTest = (string method, Json params) @safe {
 		Json r = Json.emptyObject;
@@ -3949,7 +3953,7 @@ unittest  // a list result exposes .cache from the first page's freshness hint
 	};
 	auto res = c.listTools();
 	assert(!res.cache.isNull);
-	assert(res.cache.get.ttlMs == 5000);
+	assert(res.cache.get.ttl == 5.seconds);
 	assert(res.cache.get.cacheScope == CacheScope.public_);
 }
 

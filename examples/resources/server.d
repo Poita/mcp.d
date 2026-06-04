@@ -5,7 +5,7 @@
  * UDA style (`@resource` / `@resourceTemplate` / `@tool` annotated methods
  * registered with `registerHandlers`):
  *   - a static `@resource` direct resource (`config://app`) with a draft
- *     `CacheableResult` freshness hint declared via `@cache(ttlMs, scope)`,
+ *     `CacheableResult` freshness hint declared via `@cache(ttl, scope)`,
  *   - a `@resourceTemplate` (`note:///{id}`) whose reader receives the matched
  *     `{id}` as a typed argument,
  *   - `subscriptions/listen` + push `notifications/resources/updated` (via
@@ -34,6 +34,7 @@ import mcp.api.attributes;
 import mcp.api.reflection : registerHandlers;
 
 import std.typecons : nullable;
+import core.time : seconds;
 
 import examples_common;
 
@@ -73,7 +74,7 @@ final class ResourcesApi
 	/// (ttlMs/cacheScope) is emitted on the draft `resources/read` response so a
 	/// draft client can cache the contents.
 	@resource("config://app", "App config", "application/json")
-	@cache(60_000, "public")
+	@cache(60.seconds, "public")
 	string config() @safe
 	{
 		return `{"name":"resources-example","featureFlags":["resources","subscribe"]}`;

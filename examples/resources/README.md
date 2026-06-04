@@ -11,8 +11,9 @@ Server side (`server.d`), written in the ergonomic **UDA style**
 (`@resource` / `@resourceTemplate` / `@tool` + `registerHandlers`):
 
 - **Direct resource** — a static `@resource` `config://app`, carrying a draft
-  `CacheableResult` freshness hint declared with `@cache(ttlMs, scope)` that
-  rides on `resources/read`.
+  `CacheableResult` freshness hint declared with `@cache(ttl, scope)` (a
+  `core.time.Duration`) that rides on `resources/read` (serialized on the wire as
+  `ttlMs` milliseconds).
 - **Resource template** — `@resourceTemplate("note:///{id}")`; the reader
   receives the captured `{id}` as a typed argument.
 - **Subscriptions** — `enableResourceSubscriptions()` advertises the capability;
