@@ -69,6 +69,15 @@ struct JwtVerifierConfig
 /// Build a `TokenValidator` from `cfg`. The returned delegate verifies a bearer
 /// JWT and yields a `TokenInfo` (`valid == false` on any failure). Plug it into
 /// `ResourceServerConfig.validator`.
+///
+/// Concurrency: the returned validator and its internal `JwksCache` hold
+/// unsynchronized mutable state (the cached PEM keys and fetch timestamp). Like
+/// the rest of the SDK they are bound to vibe.d's default single-threaded event
+/// loop, where the only fiber yield is the JWKS network fetch (which completes
+/// before the cache is mutated), so concurrent fibers never corrupt the cache.
+/// Do not share the validator across worker threads; running the router with
+/// `HTTPServerOption.distribute` or worker threads is unsupported (see the
+/// concurrency contract in `mcp.transport.session`).
 TokenValidator jwtVerifier(JwtVerifierConfig cfg) @safe
 {
 	auto cache = new JwksCache(cfg.jwksUri, cfg.jwksCacheTtl);
@@ -152,7 +161,10 @@ package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) 
 	if (payload["exp"].type != Json.Type.int_)
 		return TokenInfo.invalid();
 	const e = jsonLong(payload, "exp");
-	if (now > e + skew)
+	// RFC 7519 4.1.4: the token is expired once the current time is no longer
+	// before `exp`. With `clockSkew` the grace boundary is `now <= exp + skew`,
+	// so reject at the boundary (`>=`) rather than one second past it.
+	if (now >= e + skew)
 		return TokenInfo.invalid();
 	const nbf = jsonLong(payload, "nbf");
 	if (nbf != 0 && now + skew < nbf)
@@ -194,6 +206,24 @@ package bool verifyJws(string alg, const(ubyte)[] signingInput,
 		return false;
 	scope (exit)
 		EVP_PKEY_free(pkey);
+
+	// Bind the token-header `alg` to the key type rather than relying on OpenSSL
+	// to reject a cross-type attempt: RS256 requires an RSA key, ES256 an EC key.
+	// This keeps a future symmetric/other alg from introducing an alg-confusion
+	// bypass through a key of the wrong family.
+	const baseId = EVP_PKEY_base_id(pkey);
+	if (alg == "RS256")
+	{
+		if (baseId != EVP_PKEY_RSA)
+			return false;
+	}
+	else if (alg == "ES256")
+	{
+		if (baseId != EVP_PKEY_EC)
+			return false;
+	}
+	else
+		return false;
 
 	const(ubyte)[] derSig;
 	if (alg == "ES256")
@@ -281,6 +311,8 @@ package struct Jwk
 	string kty; /// "RSA" or "EC"
 	string kid;
 	string alg;
+	string use; /// RFC 7517 4.2: intended use ("sig" or "enc"), if declared.
+	string[] keyOps; /// RFC 7517 4.3: permitted operations, if declared.
 	// RSA
 	string n;
 	string e;
@@ -309,6 +341,8 @@ package Jwk[] parseJwks(string jwksJson) @safe
 		j.kty = jsonStr(k, "kty");
 		j.kid = jsonStr(k, "kid");
 		j.alg = jsonStr(k, "alg");
+		j.use = jsonStr(k, "use");
+		j.keyOps = jsonStrArray(k, "key_ops");
 		j.n = jsonStr(k, "n");
 		j.e = jsonStr(k, "e");
 		j.crv = jsonStr(k, "crv");
@@ -317,6 +351,19 @@ package Jwk[] parseJwks(string jwksJson) @safe
 		result ~= j;
 	}
 	return result;
+}
+
+/// Whether a JWK may be used to verify signatures (RFC 7517 4.2/4.3): a key
+/// declaring `use` must declare `use=="sig"`, and a key declaring `key_ops` must
+/// include `"verify"`. Keys that declare neither are usable (the members are
+/// optional). Keys declaring an incompatible use/op are excluded as candidates.
+package bool jwkUsableForSig(Jwk jwk) @safe
+{
+	if (jwk.use.length && jwk.use != "sig")
+		return false;
+	if (jwk.keyOps.length && !jwk.keyOps.canFind("verify"))
+		return false;
+	return true;
 }
 
 /// Convert a JWK to a PEM SubjectPublicKeyInfo public key. Supports RSA (n/e)
@@ -489,6 +536,8 @@ package final class JwksCache : KeySource
 		allPems = null;
 		foreach (jwk; parseJwks(jwksJson))
 		{
+			if (!jwkUsableForSig(jwk))
+				continue;
 			const pem = jwkToPem(jwk);
 			if (pem.length == 0)
 				continue;
@@ -564,6 +613,20 @@ package string jsonStr(Json j, string key) @safe
 	if (v.type == Json.Type.string)
 		return v.get!string;
 	return null;
+}
+
+// Read a JSON array-of-strings member, returning null when absent or not an
+// array; non-string elements are skipped.
+private string[] jsonStrArray(Json j, string key) @safe
+{
+	auto v = j[key];
+	if (v.type != Json.Type.array)
+		return null;
+	string[] result;
+	foreach (e; ()@trusted { return v.get!(Json[]); }())
+		if (e.type == Json.Type.string)
+			result ~= e.get!string;
+	return result;
 }
 
 /// Read an integer claim, returning 0 when absent or not an integer. Callers
@@ -754,6 +817,23 @@ unittest  // a non-integer exp claim is rejected (cannot be validated as unexpir
 	assert(!ti.valid);
 }
 
+unittest  // a token is rejected at the exact exp+skew boundary (RFC 7519 4.1.4)
+{
+	JwtVerifierConfig cfg; // default clockSkew is 60s
+	auto payload = parseJsonString(`{"sub":"ec-user","exp":1700003600,"nbf":1700000000}`);
+	// now == exp + skew: the token is no longer before its expiry, so reject.
+	auto ti = validateClaims(cfg, payload, 1_700_003_660);
+	assert(!ti.valid);
+}
+
+unittest  // a token one second before the exp+skew boundary is still valid
+{
+	JwtVerifierConfig cfg;
+	auto payload = parseJsonString(`{"sub":"ec-user","exp":1700003600,"nbf":1700000000}`);
+	auto ti = validateClaims(cfg, payload, 1_700_003_659);
+	assert(ti.valid);
+}
+
 unittest  // the wrong issuer is rejected
 {
 	JwtVerifierConfig cfg;
@@ -937,6 +1017,54 @@ unittest  // JwksCache.keysFor selects by kid, then refreshes from a new documen
 			~ testEcX ~ `","y":"` ~ testEcY ~ `"}]}`);
 	assert(cache.keysFor("rsa-1").length == 1); // falls back to all keys
 	assert(cache.keysFor("ec-9").length == 1);
+}
+
+unittest  // a JWK declaring use!="sig" is excluded as a verification candidate (RFC 7517 4.2)
+{
+	auto cache = new JwksCache("", 300.seconds);
+	cache.load(
+			`{"keys":[{"kty":"RSA","kid":"rsa-1","use":"enc","n":"` ~ testRsaN ~ `","e":"AQAB"}]}`);
+	assert(cache.keysFor("rsa-1").length == 0);
+}
+
+unittest  // a JWK declaring key_ops without "verify" is excluded (RFC 7517 4.3)
+{
+	auto cache = new JwksCache("", 300.seconds);
+	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","key_ops":["encrypt"],"n":"`
+			~ testRsaN ~ `","e":"AQAB"}]}`);
+	assert(cache.keysFor("rsa-1").length == 0);
+}
+
+unittest  // a JWK with use=="sig" and key_ops including "verify" is retained
+{
+	auto cache = new JwksCache("", 300.seconds);
+	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","use":"sig","key_ops":["verify"],"n":"`
+			~ testRsaN ~ `","e":"AQAB"}]}`);
+	assert(cache.keysFor("rsa-1").length == 1);
+}
+
+unittest  // an RS256 token offered only an EC key is rejected (kty<->alg binding)
+{
+	JwtVerifierConfig cfg;
+	auto cache = new JwksCache("", cfg.jwksCacheTtl);
+	// Only an EC key is available; the token's header alg is RS256, so the
+	// kty<->alg binding rejects it before relying on OpenSSL.
+	cache.load(`{"keys":[{"kty":"EC","kid":"ec-1","crv":"P-256","x":"`
+			~ testEcX ~ `","y":"` ~ testEcY ~ `"}]}`);
+	auto ti = verifyToken(cfg, testRs256Jwt, cache, 1_700_001_000);
+	assert(!ti.valid);
+}
+
+unittest  // an ES256 token offered only an RSA key is rejected (kty<->alg binding)
+{
+	JwtVerifierConfig cfg;
+	cfg.staticPublicKeysPem = []; // none pinned
+	auto cache = new JwksCache("", cfg.jwksCacheTtl);
+	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"AQAB"}]}`);
+	const payload = `{"sub":"ec-user","exp":1700003600,"nbf":1700000000}`;
+	auto jwt = makeEs256(payload, "rsa-1");
+	auto ti = verifyToken(cfg, jwt, cache, 1_700_001_000);
+	assert(!ti.valid);
 }
 
 unittest  // audiences() handles both a string and an array aud claim
