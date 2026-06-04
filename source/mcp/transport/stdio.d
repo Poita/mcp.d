@@ -228,9 +228,6 @@ private final class StdioContextFactoryReply
 void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 {
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
-	import eventcore.core : eventDriver;
-	import eventcore.driver : IOMode, PipeIOCallback;
-	import vibe.internal.async : asyncAwaitUninterruptible;
 
 	// Enforce the documented "at most once per process" invariant explicitly, so it
 	// holds for both a concurrent second call and a sequential one and does not
@@ -267,12 +264,8 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 		// On POSIX a broken-pipe write may also raise SIGPIPE; a server using this
 		// transport should ignore SIGPIPE (signal(SIGPIPE, SIG_IGN)) so the failure
 		// surfaces here as IOStatus.error rather than terminating the process.
-		auto res = () @trusted {
-			return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
-				eventDriver.pipes.write(outFD, bytes, IOMode.all, cb);
-			});
-		}();
-		if (writeFailed(res[1], res[2], bytes.length))
+		auto res = outFD.writeAll(bytes);
+		if (writeFailed(res.status, res.nbytes, bytes.length))
 			throw new Exception("runStdio: write to stdout failed (peer closed its read end?)");
 	}
 
@@ -290,6 +283,122 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 	}();
 }
 
+/// Result of one `StdioEnd` read/write: the eventcore status and byte count,
+/// surfaced uniformly whether the underlying fd is a pipe or a socket.
+private struct IoResult
+{
+	import eventcore.driver : IOStatus;
+
+	IOStatus status;
+	size_t nbytes;
+}
+
+/// One end (stdin or stdout) of the stdio transport, abstracting over whether the
+/// adopted fd is a pipe/FIFO or a stream socket. This matters because a child
+/// process launched by a libuv-based host (Node — the MCP Inspector, Claude
+/// Desktop, VS Code, …) is given a unix-domain SOCKET as fd 0/1, not a pipe, and
+/// eventcore's pipe read path does not deliver readability for data that arrives
+/// after the read is parked on a socket fd. Adopting the fd through the matching
+/// eventcore API (pipes vs sockets) makes server->client requests (elicit/sample)
+/// work over stdio with both kinds of host.
+private struct StdioEnd
+{
+	import eventcore.driver : PipeFD, StreamSocketFD;
+
+	private bool isSocket_;
+	private PipeFD pipe_;
+	private StreamSocketFD sock_;
+
+	/// Adopt `fd` into eventcore, picking the socket or pipe driver by inspecting
+	/// the fd's type. Returns an end whose `valid` is false if adoption failed.
+	static StdioEnd adopt(int fd) @safe
+	{
+		import eventcore.core : eventDriver;
+		import core.sys.posix.sys.stat : fstat, stat_t, S_ISSOCK;
+
+		StdioEnd e;
+		stat_t st;
+		e.isSocket_ = () @trusted {
+			return fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode);
+		}();
+		if (e.isSocket_)
+			e.sock_ = () @trusted { return eventDriver.sockets.adoptStream(fd); }();
+		else
+			e.pipe_ = () @trusted { return eventDriver.pipes.adopt(fd); }();
+		return e;
+	}
+
+	/// Whether adoption produced a usable eventcore handle.
+	bool valid() @safe
+	{
+		import eventcore.core : eventDriver;
+
+		if (isSocket_)
+			return () @trusted { return eventDriver.sockets.isValid(sock_); }();
+		return () @trusted { return eventDriver.pipes.isValid(pipe_); }();
+	}
+
+	/// Release the adopted handle (closes the dup'd fd eventcore owns).
+	void releaseRef() @safe
+	{
+		import eventcore.core : eventDriver;
+
+		if (isSocket_)
+			() @trusted { eventDriver.sockets.releaseRef(sock_); }();
+		else
+			() @trusted { eventDriver.pipes.releaseRef(pipe_); }();
+	}
+
+	/// Read whatever is currently available into `buf` (`IOMode.once`), blocking
+	/// the calling fiber until at least one byte arrives or the peer closes.
+	IoResult readOnce(ubyte[] buf) @safe
+	{
+		import eventcore.core : eventDriver;
+		import eventcore.driver : IOMode, IOCallback, PipeIOCallback;
+		import vibe.internal.async : asyncAwaitUninterruptible;
+
+		if (isSocket_)
+		{
+			auto res = () @trusted {
+				return asyncAwaitUninterruptible!(IOCallback, (cb) {
+					eventDriver.sockets.read(sock_, buf, IOMode.once, cb);
+				});
+			}();
+			return IoResult(res[1], res[2]);
+		}
+		auto res = () @trusted {
+			return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
+				eventDriver.pipes.read(pipe_, buf, IOMode.once, cb);
+			});
+		}();
+		return IoResult(res[1], res[2]);
+	}
+
+	/// Write the whole `bytes` frame (`IOMode.all` loops internally until done).
+	IoResult writeAll(const(ubyte)[] bytes) @safe
+	{
+		import eventcore.core : eventDriver;
+		import eventcore.driver : IOMode, IOCallback, PipeIOCallback;
+		import vibe.internal.async : asyncAwaitUninterruptible;
+
+		if (isSocket_)
+		{
+			auto res = () @trusted {
+				return asyncAwaitUninterruptible!(IOCallback, (cb) {
+					eventDriver.sockets.write(sock_, bytes, IOMode.all, cb);
+				});
+			}();
+			return IoResult(res[1], res[2]);
+		}
+		auto res = () @trusted {
+			return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
+				eventDriver.pipes.write(pipe_, bytes, IOMode.all, cb);
+			});
+		}();
+		return IoResult(res[1], res[2]);
+	}
+}
+
 /// Owns the dup()'d, vibe-adopted copies of fd 0/1 plus the saved descriptor flags
 /// of the real fd 0/1, encapsulating runStdio's fd lifecycle ceremony.
 ///
@@ -299,10 +408,8 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 /// the flags BEFORE releasing, so the restore operates on still-valid descriptors.
 private struct AdoptedStdio
 {
-	import eventcore.driver : PipeFD;
-
-	PipeFD inFD;
-	PipeFD outFD;
+	StdioEnd inFD;
+	StdioEnd outFD;
 	private int inFlags;
 	private int outFlags;
 
@@ -312,7 +419,6 @@ private struct AdoptedStdio
 	/// Adopting fd 0/1 directly would close the real stdin/stdout.
 	static AdoptedStdio acquire() @safe
 	{
-		import eventcore.core : eventDriver;
 		import core.sys.posix.unistd : dup, close;
 		import core.sys.posix.fcntl : fcntl, F_GETFL;
 
@@ -339,25 +445,25 @@ private struct AdoptedStdio
 		a.inFlags = () @trusted { return fcntl(0, F_GETFL); }();
 		a.outFlags = () @trusted { return fcntl(1, F_GETFL); }();
 
-		a.inFD = () @trusted { return eventDriver.pipes.adopt(in2); }();
-		a.outFD = () @trusted { return eventDriver.pipes.adopt(out2); }();
+		// Adopt each dup through the eventcore driver matching its fd type (pipe vs
+		// socket): a libuv-based host hands the child a socket as fd 0/1, which must
+		// be driven through the sockets API to receive readability for late-arriving
+		// replies (the server->client elicit/sample case).
+		a.inFD = StdioEnd.adopt(in2);
+		a.outFD = StdioEnd.adopt(out2);
 
 		// Fail fast: if adopt rejected a dup (returned an invalid handle), close the
 		// dups we still own and bail rather than silently operating on invalid handles.
-		if (!()@trusted { return eventDriver.pipes.isValid(a.inFD); }() || !()@trusted {
-				return eventDriver.pipes.isValid(a.outFD);
-			}())
+		if (!a.inFD.valid() || !a.outFD.valid())
 		{
-			() @trusted {
-				if (eventDriver.pipes.isValid(a.inFD))
-					eventDriver.pipes.releaseRef(a.inFD);
-				else
-					close(in2);
-				if (eventDriver.pipes.isValid(a.outFD))
-					eventDriver.pipes.releaseRef(a.outFD);
-				else
-					close(out2);
-			}();
+			if (a.inFD.valid())
+				a.inFD.releaseRef();
+			else
+				() @trusted { close(in2); }();
+			if (a.outFD.valid())
+				a.outFD.releaseRef();
+			else
+				() @trusted { close(out2); }();
 			throw new Exception("runStdio: failed to adopt stdin/stdout dups");
 		}
 		return a;
@@ -369,7 +475,6 @@ private struct AdoptedStdio
 	/// before release operates on still-valid descriptors.
 	void release() @safe
 	{
-		import eventcore.core : eventDriver;
 		import core.sys.posix.fcntl : fcntl, F_SETFL;
 
 		() @trusted {
@@ -377,9 +482,9 @@ private struct AdoptedStdio
 				fcntl(0, F_SETFL, inFlags);
 			if (outFlags != -1)
 				fcntl(1, F_SETFL, outFlags);
-			eventDriver.pipes.releaseRef(inFD);
-			eventDriver.pipes.releaseRef(outFD);
 		}();
+		inFD.releaseRef();
+		outFD.releaseRef();
 	}
 }
 
@@ -392,46 +497,36 @@ private struct AdoptedStdio
 /// the next call.
 private struct StdinLineReader
 {
-	import eventcore.driver : PipeFD;
-
-	private PipeFD inFD;
+	private StdioEnd inEnd;
 	private size_t maxLineBytes;
 	private enum size_t chunk = 64 * 1024;
 	private ubyte[] buf; // bytes read but not yet consumed
 	private size_t bufPos; // index of the next unconsumed byte in `buf`
 
-	this(PipeFD inFD, size_t maxLineBytes) @safe
+	this(StdioEnd inEnd, size_t maxLineBytes) @safe
 	{
-		this.inFD = inFD;
+		this.inEnd = inEnd;
 		this.maxLineBytes = maxLineBytes;
 	}
 
-	// Refill `buf` from the pipe (IOMode.once into a chunk-sized buffer): return
+	// Refill `buf` from stdin (IOMode.once into a chunk-sized buffer): return
 	// false on EOF/error (a 0-byte or non-ok/non-wouldBlock read) with `buf` cleared,
 	// else true with `buf` trimmed to the bytes read and `bufPos` reset to 0.
 	private bool refill() @safe
 	{
-		import eventcore.core : eventDriver;
-		import eventcore.driver : IOMode, IOStatus, PipeIOCallback;
-		import vibe.internal.async : asyncAwaitUninterruptible;
+		import eventcore.driver : IOStatus;
 
 		if (buf.length < chunk)
 			buf.length = chunk;
 		bufPos = 0;
-		auto res = () @trusted {
-			return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
-				eventDriver.pipes.read(inFD, buf, IOMode.once, cb);
-			});
-		}();
-		const status = res[1];
-		const nbytes = res[2];
-		if (nbytes == 0 || (status != IOStatus.ok && status != IOStatus.wouldBlock))
+		auto res = inEnd.readOnce(buf);
+		if (res.nbytes == 0 || (res.status != IOStatus.ok && res.status != IOStatus.wouldBlock))
 		{
 			buf = null;
 			bufPos = 0;
 			return false;
 		}
-		buf = buf[0 .. nbytes];
+		buf = buf[0 .. res.nbytes];
 		return true;
 	}
 
@@ -649,6 +744,40 @@ unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with 
 	const postNonBlock = (postFlags & O_NONBLOCK) != 0;
 	assert(postNonBlock == preNonBlock,
 			"original fd's O_NONBLOCK bit changed across the adopt/releaseRef cycle");
+}
+
+unittest  // StdioEnd.adopt routes a socket fd through the sockets driver, a pipe fd through pipes
+{
+	// A libuv/Node host (the MCP Inspector, Claude Desktop, …) hands the child a
+	// unix-domain socket as stdin; a pipe-based host / vibe spawn hands a FIFO. The
+	// fd must be adopted through the matching eventcore driver, otherwise a reply
+	// that arrives after a handler parks (server->client elicit/sample) is never
+	// read. Adopt dups (as runStdio does) so the originals stay ours to close.
+	import core.sys.posix.sys.socket : socketpair, AF_UNIX, SOCK_STREAM;
+	import core.sys.posix.unistd : dup, pipe, close;
+
+	int[2] sp;
+	assert(() @trusted { return socketpair(AF_UNIX, SOCK_STREAM, 0, sp); }() == 0,
+			"socketpair() failed");
+	scope (exit)
+		() @trusted { close(sp[0]); close(sp[1]); }();
+	const sdup = () @trusted { return dup(sp[0]); }();
+	auto sockEnd = StdioEnd.adopt(sdup);
+	scope (exit)
+		sockEnd.releaseRef();
+	assert(sockEnd.valid(), "adopting a socket end should yield a valid handle");
+	assert(sockEnd.isSocket_, "a socketpair fd must be detected and adopted as a socket");
+
+	int[2] pp;
+	assert(() @trusted { return pipe(pp); }() == 0, "pipe() failed");
+	scope (exit)
+		() @trusted { close(pp[0]); close(pp[1]); }();
+	const pdup = () @trusted { return dup(pp[0]); }();
+	auto pipeEnd = StdioEnd.adopt(pdup);
+	scope (exit)
+		pipeEnd.releaseRef();
+	assert(pipeEnd.valid(), "adopting a pipe end should yield a valid handle");
+	assert(!pipeEnd.isSocket_, "a pipe fd must be detected and adopted as a pipe");
 }
 
 unittest  // runStdio enforces its "at most once per process" invariant via the module guard
