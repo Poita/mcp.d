@@ -195,7 +195,7 @@ The Streamable HTTP transport derives session minting purely from
 
 ## Examples
 
-The repository ships ten runnable, self-verifying server/client pairs in
+The repository ships eleven runnable, self-verifying server/client pairs in
 [`examples/`](examples/). Each `client.d` is an end-to-end test that asserts the
 matching server's behaviour, and CI runs every pair over **both** stdio and
 Streamable HTTP.
@@ -211,6 +211,7 @@ Streamable HTTP.
 | MRTR | multi-round-trip tool input (carried in the result) | [server](examples/mrtr/server.d) | [client](examples/mrtr/client.d) |
 | Sampling | server-initiated LLM sampling (`ctx.sample`) | [server](examples/sampling/server.d) | [client](examples/sampling/client.d) |
 | Elicitation | server-initiated, typed user input (`ctx.elicit!T`) | [server](examples/elicitation/server.d) | [client](examples/elicitation/client.d) |
+| Sticky notes | stateful tools + a resource per note + elicitation-confirmed clear | [server](examples/stickynotes/server.d) | [client](examples/stickynotes/client.d) |
 | Auth | OAuth 2.1 protected HTTP resource server (HTTP only) | [server](examples/auth/server.d) | [client](examples/auth/client.d) |
 
 Annotate plain typed D functions with `@tool` / `@resource` / `@prompt` and register

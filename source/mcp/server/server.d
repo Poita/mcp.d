@@ -585,6 +585,19 @@ final class McpServer
 		return true;
 	}
 
+	/// Unregister a previously registered direct resource by URI. Returns `true`
+	/// if a resource was removed, `false` if no resource with that URI was
+	/// registered. The mirror of `registerResource`; pair with
+	/// `notifyResourcesListChanged` to inform connected clients that the available
+	/// resource set changed.
+	bool removeResource(string uri) @safe
+	{
+		if ((uri in resources) is null)
+			return false;
+		resources.remove(uri);
+		return true;
+	}
+
 	/// Advertise the tools `listChanged` capability so `capabilities()` emits
 	/// `tools: { listChanged: true }`. Declare this (before `initialize` /
 	/// `server/discover`) when the server may add or remove tools at runtime and
@@ -4546,6 +4559,42 @@ unittest  // registering a resource whose uri already exists throws
 	catch (Exception)
 		threw = true;
 	assert(threw, "duplicate resource registration must throw");
+}
+
+unittest  // removeResource drops a registered resource and reports success
+{
+	auto s = new McpServer("t", "1");
+	Resource r = {uri: "test://x", name: "x"};
+	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
+
+	assert(s.removeResource("test://x"), "removeResource should report it removed the resource");
+
+	auto list = s.handle(req(1, "resources/list")).get;
+	assert(list["result"]["resources"].length == 0,
+			"removed resource must not appear in resources/list");
+}
+
+unittest  // removeResource reports false for a uri that was never registered
+{
+	auto s = new McpServer("t", "1");
+	assert(!s.removeResource("test://missing"),
+			"removeResource should report false for an unknown uri");
+}
+
+unittest  // a uri can be re-registered after removeResource
+{
+	auto s = new McpServer("t", "1");
+	Resource r = {uri: "test://x", name: "x"};
+	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "one"));
+	s.removeResource("test://x");
+	// Re-registering the same uri must not throw now that the prior entry is gone.
+	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "two"));
+
+	Json p = Json.emptyObject;
+	p["uri"] = "test://x";
+	auto read = s.handle(req(2, "resources/read", p)).get;
+	assert(read["result"]["contents"][0]["text"].get!string == "two",
+			"re-registered resource should serve the new contents");
 }
 
 unittest  // registering a prompt whose name already exists throws

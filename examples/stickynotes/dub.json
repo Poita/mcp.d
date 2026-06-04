@@ -1,0 +1,23 @@
+{
+	"name": "stickynotes",
+	"description": "MCP example: a stateful sticky-notes board combining tools (add/remove/remove-all), a resource per note, and an elicitation-confirmed destructive clear (server + self-verifying client e2e) over BOTH stdio and Streamable HTTP.",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp": { "path": "../.." },
+		"examples-common": { "path": "../common" }
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "stickynotes-server",
+			"mainSourceFile": "server.d"
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "stickynotes-client",
+			"mainSourceFile": "client.d"
+		}
+	]
+}
