@@ -17,6 +17,13 @@
 #     that file are false positives and are ignored here. Everything else --
 #     including any other finding in that same file -- still fails the gate.
 #
+#   * source/mcp/internal/unittest_runner.d "Catching Error or Throwable".
+#     The macOS-only custom unittest runner must catch `Throwable` per module,
+#     exactly as druntime's own default module-unit-tester does, so a failing
+#     `assert` (an `Error`) in one module is recorded and the remaining modules
+#     still run. Catching `Throwable` here is intentional and required; any
+#     other finding in that file still fails the gate.
+#
 # Usage:
 #   scripts/dscanner-lint.sh
 #
@@ -36,6 +43,7 @@ raw="$(dub run --quiet dscanner -- --styleCheck source/ 2>/dev/null || true)"
 findings="$(printf '%s\n' "${raw}" \
   | grep -E '\[(warn|error)\]' \
   | grep -vE '^source/mcp/api/reflection\.d\([0-9]+:[0-9]+\)\[error\]: (Expected `\)` instead of `:`|Declaration expected)' \
+  | grep -vE '^source/mcp/internal/unittest_runner\.d\([0-9]+:[0-9]+\)\[warn\]: Catching Error or Throwable is almost always a bad idea\.' \
   || true)"
 
 if [[ -n "${findings}" ]]; then
