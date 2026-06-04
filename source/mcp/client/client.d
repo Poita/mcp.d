@@ -1779,6 +1779,59 @@ final class McpClient : ClientProtocol
 	}
 }
 
+/// Find a `Tool` by its `name` in a drained `tools/list` slice (typically
+/// `client.listTools().tools`). Returns the first match wrapped in a
+/// `Nullable!Tool`, or a null `Nullable` when no tool carries that name, so
+/// callers can branch on presence without hand-rolling the scan. Usable via
+/// UFCS as `tools.byName("calc")`.
+Nullable!Tool byName(Tool[] tools, string name) @safe
+{
+	foreach (t; tools)
+		if (t.name == name)
+			return nullable(t);
+	return Nullable!Tool.init;
+}
+
+/// Find a `Prompt` by its `name` in a drained `prompts/list` slice (typically
+/// `client.listPrompts().prompts`). Returns the first match wrapped in a
+/// `Nullable!Prompt`, or a null `Nullable` when absent. Usable via UFCS as
+/// `prompts.byName("greet")`.
+Nullable!Prompt byName(Prompt[] prompts, string name) @safe
+{
+	foreach (p; prompts)
+		if (p.name == name)
+			return nullable(p);
+	return Nullable!Prompt.init;
+}
+
+unittest  // byName returns the matching Tool wrapped in a non-null Nullable
+{
+	Tool[] tools = [Tool("calc"), Tool("greet")];
+	auto found = tools.byName("greet");
+	assert(!found.isNull);
+	assert(found.get.name == "greet");
+}
+
+unittest  // byName over Tool[] returns a null Nullable when no name matches
+{
+	Tool[] tools = [Tool("calc")];
+	assert(tools.byName("missing").isNull);
+}
+
+unittest  // byName returns the matching Prompt wrapped in a non-null Nullable
+{
+	Prompt[] prompts = [Prompt("greet"), Prompt("code_review")];
+	auto found = prompts.byName("code_review");
+	assert(!found.isNull);
+	assert(found.get.name == "code_review");
+}
+
+unittest  // byName over Prompt[] returns a null Nullable when no name matches
+{
+	Prompt[] prompts = [Prompt("greet")];
+	assert(prompts.byName("missing").isNull);
+}
+
 /// Pick the newest protocol version both this SDK and the server support, given
 /// the server's advertised wire-string list (from `server/discover` or the
 /// `supported` field of an `UnsupportedProtocolVersionError`). Returns false

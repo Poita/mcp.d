@@ -136,10 +136,9 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		auto names = tools.map!(t => t.name).array;
 		check(names.canFind("plan_trip"), "tools/list missing 'plan_trip'");
 
-		Tool planTrip;
-		foreach (t; tools)
-			if (t.name == "plan_trip")
-				planTrip = t;
+		auto found = tools.byName("plan_trip");
+		check(!found.isNull, "tools/list missing 'plan_trip'");
+		auto planTrip = found.isNull ? Tool.init : found.get;
 		auto props = planTrip.inputSchema["properties"];
 		check(("destination" in props) !is null, "plan_trip.inputSchema missing 'destination'");
 		// The auto-injected RequestContext must NOT leak into the input schema.

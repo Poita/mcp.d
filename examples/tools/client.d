@@ -44,18 +44,17 @@ import vibe.data.json : Json;
 
 import examples_common : check, checkEq, connectFromArgs, runClient;
 
-import mcp.client.client : McpClient;
+import mcp.client.client : McpClient, byName;
 import mcp.protocol.errors : ErrorCode, McpException;
 import mcp.protocol.types : CallToolResult, ContentKind, Tool, ToolAnnotations;
 
 /// Locate a tool by name in a list, or fail (the scaffold's `check` throws).
+/// Delegates the scan to the SDK's `byName` accessor and asserts presence.
 private Tool find(Tool[] tools, string name) @safe
 {
-	foreach (t; tools)
-		if (t.name == name)
-			return t;
-	check(false, "tool not found in tools/list: " ~ name);
-	return Tool.init;
+	auto t = tools.byName(name);
+	check(!t.isNull, "tool not found in tools/list: " ~ name);
+	return t.isNull ? Tool.init : t.get;
 }
 
 /// Typed `calc` arguments — passed straight to `client.callTool("calc", CalcArgs(...))`,
