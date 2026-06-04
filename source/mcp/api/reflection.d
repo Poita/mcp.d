@@ -133,12 +133,27 @@ private string describeFor(alias func, size_t i, string pname)() @safe
 	return desc;
 }
 
+/// Whether `P` is an admissible `@mcpHeader` parameter type: one whose
+/// `jsonSchemaOf` yields a draft primitive header type (integer/string/boolean).
+/// `Nullable!T` is unwrapped to its inner type. Mirrors the runtime check
+/// `draft.isPrimitiveHeaderType` so detection is symmetric at compile time.
+private template isPrimitiveHeaderParam(P)
+{
+	import std.traits : isIntegral;
+
+	static if (isInstanceOf!(Nullable, P))
+		enum isPrimitiveHeaderParam = isPrimitiveHeaderParam!(TemplateArgsOf!P[0]);
+	else
+		enum isPrimitiveHeaderParam = is(P == bool) || is(P == enum)
+			|| isIntegral!P || isSomeString!P;
+}
+
 /// Build the `{type:object, properties, required}` schema for a method's
 /// parameters, skipping any `RequestContext` parameter.
 private Json parametersSchema(alias func)() @safe
 {
 	import mcp.protocol.draft : validateHeaderName;
-	import std.traits : isFloatingPoint, ParameterDefaultValueTuple;
+	import std.traits : ParameterDefaultValueTuple;
 
 	alias names = ParameterIdentifierTuple!func;
 	alias types = Parameters!func;
@@ -168,7 +183,13 @@ private Json parametersSchema(alias func)() @safe
 						static assert(validateHeaderName(attr.name) is null,
 								"@mcpHeader(\"" ~ attr.name ~ "\") is not a valid x-mcp-header value: "
 								~ validateHeaderName(attr.name));
-						static assert(!isFloatingPoint!P, "@mcpHeader cannot be applied to a floating-point ('number') parameter '" ~ names[i] ~ "'; x-mcp-header permits only integer/string/boolean");
+						// The draft permits only primitive x-mcp-header value types
+						// (integer/string/boolean). Whitelist exactly those (plus the
+						// `Nullable` thereof) so a struct/array/AA/`number` parameter is
+						// rejected at the registration site rather than per-request via
+						// the transport's `headerMismatch` (see draft.isPrimitiveHeaderType).
+						static assert(isPrimitiveHeaderParam!P, "@mcpHeader cannot be applied to parameter '" ~ names[i] ~ "' of type " ~ P
+								.stringof ~ "; x-mcp-header permits only integer/string/boolean (or Nullable thereof)");
 						ps["x-mcp-header"] = attr.name;
 					}
 				// Fold the @describe UDA into the property's JSON Schema
@@ -463,11 +484,13 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 	if (outSchema.type == Json.Type.object)
 		descriptor.outputSchema = outSchema;
 
-	// Fold the marker hint UDAs (@readOnly / @destructive / @idempotent /
-	// @openWorld) and the @hintTitle value UDA on the same method into typed
-	// ToolAnnotations, then serialize into the descriptor's annotations field.
-	// A marker's presence sets the corresponding hint to true; absence leaves it
-	// unset (omitted from the wire form).
+	// Fold every method UDA in a single pass: the marker hint UDAs (@readOnly /
+	// @destructive / @idempotent / @openWorld) and the @hintTitle value UDA into
+	// typed ToolAnnotations, and @toolExecution into the descriptor's `execution`
+	// field (2025-11-25 per-tool task-augmented execution negotiation). A single
+	// loop keeps every UDA handled in one place so a new UDA cannot land in only
+	// one pass. A marker's presence sets the corresponding hint to true; absence
+	// leaves it unset (omitted from the wire form).
 	ToolAnnotations anns;
 	static foreach (a; __traits(getAttributes, overload))
 	{
@@ -484,15 +507,7 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 			if (a.value.length)
 				anns.title = a.value;
 		}
-	}
-	if (!anns.empty)
-		descriptor.annotations = anns.toJson();
-
-	// Fold any @toolExecution UDA into the descriptor's `execution` field
-	// (2025-11-25 per-tool task-augmented execution negotiation).
-	static foreach (a; __traits(getAttributes, overload))
-	{
-		static if (is(typeof(a) == toolExecution))
+		else static if (is(typeof(a) == toolExecution))
 		{
 			static assert(a.taskSupport == "forbidden"
 					|| a.taskSupport == "optional" || a.taskSupport == "required",
@@ -502,21 +517,53 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 				descriptor.execution = ToolExecution(nullable(a.taskSupport));
 		}
 	}
+	if (!anns.empty)
+		descriptor.annotations = anns.toJson();
 
 	applyIconsAndMeta!overload(descriptor);
 
 	server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
+		import mcp.protocol.errors : McpException;
+
 		alias names = ParameterIdentifierTuple!overload;
 		alias defs = ParameterDefaultValueTuple!overload;
+		// A malformed argument that the coarse input-schema check admits (e.g. when
+		// schema validation is disabled, or a conversion the type-check cannot rule
+		// out) must surface as a clean, attributed tool-execution error rather than
+		// a raw std.conv/vibe exception string. This SDK classifies tool input
+		// failures as `isError:true` results (not -32602), so the marshalling
+		// failure is returned as an error CallToolResult, wrapped to the handler's
+		// return type. Protocol errors thrown by the marshaller are re-thrown so an
+		// inner McpException is not swallowed (mirrors the prompt path's pass-through).
+		static CallToolResult marshalError(string argName, string msg) @safe
+		{
+			return CallToolResult.error("argument '" ~ argName ~ "': " ~ msg);
+		}
+
 		Tuple!(Parameters!overload) argv;
 		static foreach (i, P; Parameters!overload)
 		{
 			static if (is(P : RequestContext))
 				argv[i] = ctx;
-			else static if (is(defs[i] == void))
-				argv[i] = marshalArg!P(args, names[i]);
 			else
-				argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
+			{
+				try
+				{
+					static if (is(defs[i] == void))
+						argv[i] = marshalArg!P(args, names[i]);
+					else
+						argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
+				}
+				catch (McpException e)
+					throw e;
+				catch (Exception e)
+				{
+					static if (is(ReturnType!overload == ToolResponse))
+						return ToolResponse.complete(marshalError(names[i], e.msg));
+					else
+						return marshalError(names[i], e.msg);
+				}
+			}
 		}
 		// An MRTR-capable tool returns a ToolResponse directly, so it may answer
 		// `inputRequired` (stateless elicitation) as well as `complete`; any other
@@ -1288,6 +1335,56 @@ unittest  // @toolExecution: a valid taskSupport value reflects, an invalid one 
 	assert(!__traits(compiles, registerHandlers(s, new InvalidExecutionApi)));
 }
 
+version (unittest) private struct HeaderPayload
+{
+	string id;
+}
+
+version (unittest) private class StructHeaderApi
+{
+	@tool("agg", "Aggregate header")
+	string agg(@mcpHeader("X-Payload") HeaderPayload p)@safe
+	{
+		return p.id;
+	}
+}
+
+version (unittest) private class ArrayHeaderApi
+{
+	@tool("arr", "Array header")
+	string arr(@mcpHeader("X-Tags") string[] tags)@safe
+	{
+		return tags.length ? tags[0] : "";
+	}
+}
+
+version (unittest) private class NullableHeaderApi
+{
+	@tool("opt", "Optional primitive header")
+	string opt(@mcpHeader("X-Region") Nullable!int region)@safe
+	{
+		return region.isNull ? "" : "set";
+	}
+}
+
+unittest  // @mcpHeader: a struct-typed parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new StructHeaderApi)));
+}
+
+unittest  // @mcpHeader: an array-typed parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new ArrayHeaderApi)));
+}
+
+unittest  // @mcpHeader: a Nullable-of-primitive parameter is accepted at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(__traits(compiles, registerHandlers(s, new NullableHeaderApi)));
+}
+
 unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schema
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
@@ -1313,6 +1410,29 @@ unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schem
 	// The consumer side (draft.paramHeaderMap) now reads it from the UDA-driven schema.
 	auto m = paramHeaderMap(schema);
 	assert(m["region"] == "Mcp-Param-Region");
+}
+
+unittest  // @tool dispatch: a malformed arg (validation off) yields a clean attributed message
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import std.algorithm.searching : canFind;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DemoApi);
+	// With schema validation off the coarse pre-dispatch check is bypassed, so the
+	// marshaller sees the malformed value and must report a clean, attributed error.
+	s.disableInputSchemaValidation();
+
+	Json cp = Json.emptyObject;
+	cp["name"] = "query";
+	cp["arguments"] = Json(["region": Json("us"), "limit": Json("abc")]);
+	auto resp = s.handle(Message(makeRequest(Json(4), "tools/call", cp))).get;
+	// Tool input failures are classified as isError:true results, not -32602.
+	assert("result" in resp, "malformed tool arg must be an isError result, not a protocol error");
+	assert(resp["result"]["isError"].get!bool);
+	auto text = resp["result"]["content"][0]["text"].get!string;
+	assert(text.canFind("argument 'limit'"),
+			"the error text must attribute the failure to the named argument: " ~ text);
 }
 
 unittest  // @describe UDA: parameter descriptions appear in tool inputSchema
