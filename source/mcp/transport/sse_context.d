@@ -17,6 +17,22 @@ import mcp.server.context;
 import mcp.server.connection : ConnectionState;
 import mcp.auth.resource_server : TokenInfo;
 
+/// The composite key under which a pending server->client request's waiter is
+/// tracked: the session/connection token the request was issued to, paired with
+/// the JSON-RPC request id. Keying by `(sessionToken, id)` — rather than by `id`
+/// alone with a separately-checked owner — means a reply that arrives on one
+/// session can never reach (let alone resolve) another session's waiter, even if
+/// the two sessions independently allocated the same numeric id: the lookup for
+/// `(sessionB, id)` simply finds nothing in session A's slot. A waiter registered
+/// under the empty token is the stateless / shared mode, looked up only by a
+/// reply that also carries the empty token; a real (non-empty) session's reply
+/// can never match it.
+private struct WaiterKey
+{
+	string token;
+	long id;
+}
+
 /// Correlates outbound server->client requests with the client's responses,
 /// which arrive on a *separate* POST. One instance is shared across all
 /// handlers of a single server mount.
@@ -28,16 +44,10 @@ final class StreamCoordinator
 		Json result = Json.undefined;
 		Json error = Json.undefined;
 		bool done;
-		/// The connection/session token of the peer the outbound request was
-		/// issued to. A client response only resolves this waiter when it arrives
-		/// from the SAME token, so one session cannot satisfy another session's
-		/// pending server->client request. The empty token marks an unscoped
-		/// (stateless / shared) waiter, which any responder may resolve.
-		string ownerToken;
 	}
 
 	private long counter = 1;
-	private Waiter[long] waiters;
+	private Waiter[WaiterKey] waiters;
 	private long streamCounter = 0;
 
 	/// Allocate a fresh outbound request id.
@@ -56,28 +66,31 @@ final class StreamCoordinator
 		return streamCounter++;
 	}
 
-	/// Begin tracking a pending outbound request, bound to the connection/session
-	/// `ownerToken` it was issued to. Only a response arriving from the same token
-	/// may resolve it; an empty token leaves the waiter unscoped (stateless /
-	/// shared mode), resolvable by any responder.
-	void register(long id, string ownerToken = "") @safe
+	/// Begin tracking a pending outbound request, keyed by `(sessionToken, id)`.
+	/// Only a response that arrives on the SAME session token may resolve it, so
+	/// one session cannot satisfy another session's pending server->client request
+	/// even when both happen to use the same numeric id. The empty token registers
+	/// an unscoped (stateless / shared mode) waiter, resolvable only by a reply
+	/// that likewise carries the empty token.
+	void register(long id, string sessionToken = "") @safe
 	{
 		auto w = new Waiter;
 		w.evt = createManualEvent();
-		w.ownerToken = ownerToken;
-		waiters[id] = w;
+		waiters[WaiterKey(sessionToken, id)] = w;
 	}
 
-	/// Block the current task until the client responds to `id` (or `timeout`
-	/// elapses). Returns the result, or throws `McpException` on error/timeout.
-	Json await(long id, Duration timeout = 60.seconds) @safe
+	/// Block the current task until the client responds to `(sessionToken, id)`
+	/// (or `timeout` elapses). Returns the result, or throws `McpException` on
+	/// error/timeout.
+	Json await(long id, Duration timeout = 60.seconds, string sessionToken = "") @safe
 	{
-		auto wp = id in waiters;
+		const key = WaiterKey(sessionToken, id);
+		auto wp = key in waiters;
 		if (wp is null)
 			throw internalError("awaiting an unknown request id");
 		auto w = *wp;
 		scope (exit)
-			waiters.remove(id);
+			waiters.remove(key);
 
 		auto ec = w.evt.emitCount;
 		while (!w.done)
@@ -90,25 +103,26 @@ final class StreamCoordinator
 		return throwOrReturn(w.result, w.error, "client error");
 	}
 
-	/// Block the current task until the client responds to `id`, while polling
-	/// `alive` in short slices so a dropped connection releases the awaiting fiber
-	/// promptly rather than parking for the full `timeout`. When `alive` returns
-	/// false before a response arrives, the pending request is failed with
-	/// `disconnectError` (mirroring the GET path's `failPendingForIds` on listener
-	/// disconnect) and that error is thrown. A null `alive` probe degrades to the
-	/// plain `await(id, timeout)` behaviour.
+	/// Block the current task until the client responds to `(sessionToken, id)`,
+	/// while polling `alive` in short slices so a dropped connection releases the
+	/// awaiting fiber promptly rather than parking for the full `timeout`. When
+	/// `alive` returns false before a response arrives, the pending request is
+	/// failed with `disconnectError` (mirroring the GET path's `failPendingForIds`
+	/// on listener disconnect) and that error is thrown. A null `alive` probe
+	/// degrades to the plain `await(id, timeout, sessionToken)` behaviour.
 	Json awaitLive(long id, bool delegate() @safe alive, McpException disconnectError,
-			Duration timeout = 60.seconds, Duration slice = 250.msecs) @safe
+			Duration timeout = 60.seconds, Duration slice = 250.msecs, string sessionToken = "") @safe
 	{
 		if (alive is null)
-			return await(id, timeout);
+			return await(id, timeout, sessionToken);
 
-		auto wp = id in waiters;
+		const key = WaiterKey(sessionToken, id);
+		auto wp = key in waiters;
 		if (wp is null)
 			throw internalError("awaiting an unknown request id");
 		auto w = *wp;
 		scope (exit)
-			waiters.remove(id);
+			waiters.remove(key);
 
 		auto ec = w.evt.emitCount;
 		auto remaining = timeout;
@@ -137,32 +151,30 @@ final class StreamCoordinator
 		return throwOrReturn(w.result, w.error, "client error");
 	}
 
-	/// Drop a registered-but-unawaited request id (e.g. when delivery failed so
-	/// the request will never get a response). Idempotent; unknown ids are
-	/// ignored. Keeps the waiter table from leaking when `register` is not
-	/// followed by `await`.
-	void cancel(long id) @safe
+	/// Drop a registered-but-unawaited request `(sessionToken, id)` (e.g. when
+	/// delivery failed so the request will never get a response). Idempotent;
+	/// unknown keys are ignored. Keeps the waiter table from leaking when
+	/// `register` is not followed by `await`.
+	void cancel(long id, string sessionToken = "") @safe
 	{
-		waiters.remove(id);
+		waiters.remove(WaiterKey(sessionToken, id));
 	}
 
 	/// Deliver a client response/errorResponse from the peer identified by
 	/// `responderToken`. Returns true if it matched a pending outbound request
-	/// that was issued to the SAME token. A response whose token differs from the
-	/// waiter's owner is rejected (returns false) so one session cannot resolve or
-	/// hijack another session's pending server->client request. A waiter
-	/// registered with an empty owner token (stateless / shared mode) is matched
-	/// regardless of `responderToken`, preserving prior behavior where no session
-	/// attribution exists.
+	/// issued to the SAME session token. The waiter is looked up by
+	/// `(responderToken, id)`, so a reply arriving on one session can never resolve
+	/// (or even reach) another session's waiter — closing the cross-session hijack
+	/// without a separate owner check. A waiter registered under the empty token
+	/// (stateless / shared mode) is matched only by a reply that likewise carries
+	/// the empty token.
 	bool resolve(Json idJson, Json result, Json error, string responderToken = "") @safe
 	{
 		if (idJson.type != Json.Type.int_)
 			return false;
 		const id = idJson.get!long;
-		if (auto w = id in waiters)
+		if (auto w = WaiterKey(responderToken, id) in waiters)
 		{
-			if (w.ownerToken.length != 0 && w.ownerToken != responderToken)
-				return false;
 			w.result = result;
 			w.error = error;
 			w.done = true;
@@ -172,23 +184,25 @@ final class StreamCoordinator
 		return false;
 	}
 
-	/// Fail a single still-pending outbound request with `error` and wake its
-	/// awaiting task immediately (mirrors `DuplexCoordinator.failPending`, but
-	/// targeted at one id). Used when the GET SSE listener a server->client request
-	/// was delivered on disconnects before the client could respond: rather than
-	/// letting the awaiter block for the full timeout, it is released promptly with
-	/// an `McpException`. Unknown ids are ignored.
+	/// Fail a single still-pending outbound request `(sessionToken, id)` with
+	/// `error` and wake its awaiting task immediately (mirrors
+	/// `DuplexCoordinator.failPending`, but targeted at one waiter). Used when the
+	/// GET SSE listener a server->client request was delivered on disconnects
+	/// before the client could respond: rather than letting the awaiter block for
+	/// the full timeout, it is released promptly with an `McpException`. Unknown
+	/// keys are ignored.
 	///
 	/// The waiter is left in the table: cleanup is the awaiter's responsibility via
-	/// `await`/`awaitLive`'s `scope (exit) waiters.remove(id)`. Callers MUST only fail
-	/// ids that have (or will have) a live awaiter, which holds for the sole caller
-	/// `removeListenerLocked`: every id it fails was registered in `sendRequest`
-	/// immediately before its `awaitLive`, and an id whose delivery failed is dropped
-	/// via `cancel` rather than reaching this path. A failed waiter that is awaited
-	/// only afterwards still observes `done`/`error` (see the fail-then-await unittest).
-	void failPending(long id, McpException error) @safe
+	/// `await`/`awaitLive`'s `scope (exit) waiters.remove(key)`. Callers MUST only
+	/// fail keys that have (or will have) a live awaiter, which holds for the sole
+	/// caller `removeListenerLocked`: every id it fails was registered in
+	/// `requestOnSession` immediately before its `awaitLive`, and an id whose
+	/// delivery failed is dropped via `cancel` rather than reaching this path. A
+	/// failed waiter that is awaited only afterwards still observes `done`/`error`
+	/// (see the fail-then-await unittest).
+	void failPending(long id, McpException error, string sessionToken = "") @safe
 	{
-		if (auto w = id in waiters)
+		if (auto w = WaiterKey(sessionToken, id) in waiters)
 		{
 			Json err = Json.emptyObject;
 			err["code"] = error.code;
@@ -199,11 +213,12 @@ final class StreamCoordinator
 		}
 	}
 
-	/// Fail several pending outbound requests at once (see `failPending`).
-	void failPendingForIds(long[] ids, McpException error) @safe
+	/// Fail several pending outbound requests at once for one session
+	/// (see `failPending`).
+	void failPendingForIds(long[] ids, McpException error, string sessionToken = "") @safe
 	{
 		foreach (id; ids)
-			failPending(id, error);
+			failPending(id, error, sessionToken);
 	}
 }
 
@@ -432,7 +447,7 @@ final class ServerPushChannel
 		string subscriptionId;
 		SubscriptionFilter filter;
 		/// Per-listener fallback eligibility for an INACTIVE-filter stream (a plain
-		/// 2025-era standalone GET stream). When set, `emitFiltered` consults this
+		/// 2025-era standalone GET stream). When set, `listenerEligible` consults this
 		/// instead of the mount-wide `plainEligible`, so a change notification's
 		/// delivery gate (notably `notifications/resources/updated`) honours the
 		/// per-session subscription set bound to THIS listener rather than a shared
@@ -451,7 +466,7 @@ final class ServerPushChannel
 		/// together with the seq read it is framed with and the seq/history commit
 		/// that follows — runs under THIS mutex, NOT the channel-wide `mtx`. Keeping
 		/// the write off `mtx` means a slow stream X does not block delivery to stream
-		/// Y, `notify`, `sendRequest`, `addListener`, or `removeListener` mount-wide,
+		/// Y, `notify`, `requestOnSession`, `addListener`, or `removeListener` mount-wide,
 		/// while still serializing concurrent writes to the SAME stream so seq
 		/// assignment cannot reorder relative to the bytes on the wire — every event id
 		/// stays per-stream-monotonic and globally unique. Allocated per listener in
@@ -480,17 +495,20 @@ final class ServerPushChannel
 	/// seq/history commit — and explicitly RELEASED across the blocking `l.write`
 	/// socket write. The write itself is serialized per stream by the target
 	/// `Listener.writeMtx` instead, so a slow stream does not block delivery to
-	/// other streams / `notify` / `sendRequest` / `addListener` / `removeListener`
+	/// other streams / `notify` / `requestOnSession` / `addListener` / `removeListener`
 	/// while still keeping each stream's writes — and the seq ids they carry —
 	/// strictly ordered: the listener list stays consistent and event ids stay
 	/// per-stream-monotonic and globally unique.
 	private TaskMutex mtx;
 
-	/// In-flight server->client request id -> the listener id it was delivered on.
-	/// When that listener disconnects (`removeListener`) the bound requests are
-	/// failed immediately so their awaiters do not hang for the full timeout.
-	/// Cleared as requests complete or their listener drops.
-	private long[long] requestListener;
+	/// In-flight server->client request -> the listener id it was delivered on.
+	/// Keyed by the request's `(sessionToken, id)` (the same key the coordinator
+	/// tracks the waiter under) so a disconnecting listener fails exactly the
+	/// session-scoped waiters bound to it. When that listener disconnects
+	/// (`removeListener`) the bound requests are failed immediately so their
+	/// awaiters do not hang for the full timeout. Cleared as requests complete or
+	/// their listener drops.
+	private long[WaiterKey] requestListener;
 
 	/// LRU order of stream ordinals that currently hold replay history, oldest
 	/// first. Bounds total retained memory across the mount's lifetime to
@@ -646,16 +664,20 @@ final class ServerPushChannel
 
 		// Fail exactly the in-flight server->client requests bound to this listener
 		// (not every pending waiter): other requests may be bound to surviving
-		// listeners.
-		long[] orphaned;
-		foreach (reqId, lid; requestListener)
+		// listeners. Each is keyed by its `(sessionToken, id)`, so the coordinator
+		// fails the precise session-scoped waiter, never a same-id waiter of another
+		// session.
+		WaiterKey[] orphaned;
+		foreach (key, lid; requestListener)
 			if (lid == id)
-				orphaned ~= reqId;
-		foreach (reqId; orphaned)
-			requestListener.remove(reqId);
-		if (orphaned.length)
-			coord.failPendingForIds(orphaned,
-					internalError("GET SSE listener disconnected before the client responded"));
+				orphaned ~= key;
+		foreach (key; orphaned)
+		{
+			requestListener.remove(key);
+			coord.failPending(key.id,
+					internalError("GET SSE listener disconnected before the client responded"),
+					key.token);
+		}
 	}
 
 	/// Number of currently-connected listeners.
@@ -669,7 +691,7 @@ final class ServerPushChannel
 	/// server->client request (e.g. `ping`), so a caller can probe every live
 	/// session in turn rather than blindly forwarding an empty token that matches no
 	/// session-scoped listener. The empty (unscoped / stateless / shared) token is
-	/// excluded, since that path is reached via the no-token `ping`/`sendRequest`.
+	/// excluded, since that path is reached via the no-token `ping`/`requestOnSession`.
 	string[] connectedOwnerTokens() @safe
 	{
 		return () @trusted {
@@ -689,7 +711,7 @@ final class ServerPushChannel
 	}
 
 	/// Whether a listener with `id` is still connected. Used as the liveness probe
-	/// for `sendRequest`'s `awaitLive`, so a server->client request awaiter is
+	/// for `requestOnSession`'s `awaitLive`, so a server->client request awaiter is
 	/// released promptly if its target stream drops.
 	private bool isListenerLive(long listenerId) @safe
 	{
@@ -726,63 +748,45 @@ final class ServerPushChannel
 		return deliver(msg, (ref const Listener) @safe => true) >= 0 ? 1 : 0;
 	}
 
-	/// Frame `msg` and deliver it on exactly ONE connected stream whose per-stream
-	/// `SubscriptionFilter` accepts a notification with this `method` (and, for
-	/// `notifications/resources/updated`, this resource `uri`). This honours the draft
-	/// basic/utilities/subscriptions MUST NOT — "The server MUST NOT send notification
-	/// types the client has not explicitly requested" — under Multiple Concurrent
-	/// Subscriptions: with two listen streams (A opting into one type, B into another),
-	/// a change notification reaches only a stream that requested it, never the other.
-	///
-	/// A listener whose filter is *active* (a real `subscriptions/listen` stream) is
-	/// eligible only if its own filter accepts the notification. A listener with an
-	/// *inactive* filter (a plain GET stream that did not go through `subscriptions/
-	/// listen`) falls back to `plainEligible`: the server passes its global opt-in
-	/// decision there, so the single-stream draft path — where a client opts in
-	/// globally and a plain GET listener receives the notification — works, while
-	/// concurrent active listen streams are still isolated to their own opt-in.
-	/// Returns 1 if the message was delivered to an eligible live stream, else 0.
-	size_t emitFiltered(string method, Json params, string uri = "", bool plainEligible = true) @safe
+	/// The per-stream eligibility decision shared by every delivery mode: an
+	/// *active* `subscriptions/listen` filter is consulted directly (the stream
+	/// receives a type only if it explicitly opted in, honouring the draft
+	/// basic/utilities/subscriptions MUST NOT — "The server MUST NOT send
+	/// notification types the client has not explicitly requested"); an *inactive*
+	/// filter (a plain GET stream) falls back to the listener's own per-session
+	/// gate when present, else the mount-wide `plainEligible`.
+	private static bool listenerEligible(ref const Listener l, string method,
+			string uri, bool plainEligible) @safe
 	{
-		auto msg = makeNotification(method, params);
-		return deliver(msg, (ref const Listener l) @safe {
-			if (l.filter.active)
-				return l.filter.accepts(method, uri);
-			// Inactive filter (plain 2025-era standalone GET stream): consult the
-			// listener's own per-session gate when present so the delivery decision
-			// (notably `notifications/resources/updated`) honours the subscriptions
-			// bound to THIS stream's session rather than a shared fallback.
-			if (l.plainEligible !is null)
-				return l.plainEligible(method, uri);
-			return plainEligible;
-		}) >= 0 ? 1 : 0;
+		if (l.filter.active)
+			return l.filter.accepts(method, uri);
+		// Inactive filter (plain 2025-era standalone GET stream): consult the
+		// listener's own per-session gate when present so the delivery decision
+		// (notably `notifications/resources/updated`) honours the subscriptions
+		// bound to THIS stream's session rather than a shared fallback.
+		if (l.plainEligible !is null)
+			return l.plainEligible(method, uri);
+		return plainEligible;
 	}
 
-	/// Broadcast variant of `emitFiltered` for the genuinely fan-out change
-	/// notifications (`notifications/tools/list_changed`, `prompts/list_changed`,
-	/// `resources/list_changed`): deliver the notification once per distinct
-	/// session, so EVERY connected session's stream is reached rather than only the
-	/// first eligible one. Listeners are grouped by their `ownerToken`, and the
-	/// existing single-stream `deliver` runs once per distinct token — so the
-	/// transport's Multiple Connections rule ("MUST NOT broadcast the same message
-	/// across multiple streams") is still honoured WITHIN a session (only one of a
-	/// session's streams receives it), while distinct sessions each get their own
-	/// copy. Eligibility for each listener is decided exactly as in `emitFiltered`
-	/// (active filter via its own opt-in; inactive filter via the per-listener or
-	/// mount-wide `plainEligible`). Returns the number of distinct sessions reached.
-	size_t emitFilteredPerOwner(string method, Json params, string uri = "",
-			bool plainEligible = true) @safe
+	/// MODE 1 — BROADCAST. Deliver a notification to EVERY connected session's GET
+	/// listener (the `notifications/*/list_changed` fan-out): each distinct session
+	/// MUST be told the list changed, not just the first eligible stream. Listeners
+	/// are grouped by their session token and the single-stream `deliver` runs once
+	/// per distinct token, so the transport's Multiple Connections rule ("MUST NOT
+	/// broadcast the same message across multiple streams") is still honoured WITHIN
+	/// a session (only one of a session's streams receives it) while distinct
+	/// sessions each get their own copy. The session token is otherwise IGNORED:
+	/// broadcast reaches all sessions, including the unscoped/stateless one.
+	/// Eligibility per listener is the shared `listenerEligible` decision. Returns
+	/// the number of distinct sessions reached.
+	size_t broadcast(string method, Json params, string uri = "", bool plainEligible = true) @safe
 	{
 		auto msg = makeNotification(method, params);
-		scope eligible = (ref const Listener l) @safe {
-			if (l.filter.active)
-				return l.filter.accepts(method, uri);
-			if (l.plainEligible !is null)
-				return l.plainEligible(method, uri);
-			return plainEligible;
-		};
+		scope eligible = (ref const Listener l) @safe => listenerEligible(l,
+				method, uri, plainEligible);
 
-		// Snapshot the distinct owner tokens that currently have at least one
+		// Snapshot the distinct session tokens that currently have at least one
 		// eligible live listener, under the lock, so the listener list cannot mutate
 		// while we enumerate; the actual writes happen off the lock inside `deliver`.
 		string[] owners;
@@ -813,6 +817,27 @@ final class ServerPushChannel
 		return delivered;
 	}
 
+	/// MODE 2 — PUSH TO SESSION. Deliver a notification on exactly ONE connected
+	/// stream of the ONE session named by `sessionToken`, used by
+	/// `notifications/resources/updated` to a subscriber. The chosen stream still
+	/// applies its own per-stream `SubscriptionFilter` (resource-updated URI/type
+	/// filtering) and per-session gate via the shared `listenerEligible` decision,
+	/// so a session's update reaches only a stream that opted into this `method`
+	/// (and, for `resources/updated`, this `uri`). An empty `sessionToken` is the
+	/// unscoped path: every listener is a candidate (the draft self-contained
+	/// `subscriptions/listen` stream and the stateless/no-session case), matching
+	/// the prior single-stream filtered delivery. Returns 1 if delivered, else 0.
+	size_t pushToSession(string sessionToken, string method, Json params,
+			string uri = "", bool plainEligible = true) @safe
+	{
+		auto msg = makeNotification(method, params);
+		return deliver(msg, (ref const Listener l) @safe {
+			if (sessionToken.length && l.ownerToken != sessionToken)
+				return false;
+			return listenerEligible(l, method, uri, plainEligible);
+		}) >= 0 ? 1 : 0;
+	}
+
 	/// Shared single-stream delivery: try eligible listeners (those for which
 	/// `eligible` is true) in registration order, writing `msg` to the first live one
 	/// and stopping there (the Multiple Connections rule: never broadcast the same
@@ -835,8 +860,8 @@ final class ServerPushChannel
 	/// race: a `removeListenerLocked` scan that runs while the frame is being written
 	/// already observes the binding and fails the awaiter immediately, rather than the
 	/// binding being recorded only after `deliver` returns.
-	private long deliver(Json msg,
-			scope bool delegate(ref const Listener) @safe eligible, long bindRequestId = -1) @safe
+	private long deliver(Json msg, scope bool delegate(ref const Listener) @safe eligible,
+			long bindRequestId = -1, string bindToken = "") @safe
 	{
 		// Snapshot the eligible candidates (in registration order) under the lock so
 		// the list cannot mutate under us; the actual writes happen off the lock.
@@ -852,7 +877,7 @@ final class ServerPushChannel
 
 		foreach (l; candidates)
 		{
-			if (writeToListener(l, msg, bindRequestId))
+			if (writeToListener(l, msg, bindRequestId, bindToken))
 				return l.id; // single-stream delivery: stop at the first success
 		}
 		return -1;
@@ -865,7 +890,7 @@ final class ServerPushChannel
 	/// monotonic in write order. Returns true if the frame was written; false if the
 	/// listener was concurrently removed or its write threw (in which case it is
 	/// dropped from the channel).
-	private bool writeToListener(Listener l, Json msg, long bindRequestId = -1) @safe
+	private bool writeToListener(Listener l, Json msg, long bindRequestId = -1, string bindToken = "") @safe
 	{
 		import std.conv : to;
 
@@ -886,10 +911,10 @@ final class ServerPushChannel
 						ordinal = streamOf[l.id];
 						// Commit the request->listener binding here, under `mtx` and
 						// before the blocking write, so a concurrent disconnect's
-						// `removeListenerLocked` scan observes the in-flight id and
+						// `removeListenerLocked` scan observes the in-flight request and
 						// fails its awaiter immediately instead of after the write.
 						if (bindRequestId >= 0)
-							requestListener[bindRequestId] = l.id;
+							requestListener[WaiterKey(bindToken, bindRequestId)] = l.id;
 					}
 				}
 				if (!present)
@@ -909,7 +934,7 @@ final class ServerPushChannel
 						// in-flight request is failed exactly once by the caller, not
 						// orphaned onto a listener that is about to disappear.
 						if (bindRequestId >= 0)
-							requestListener.remove(bindRequestId);
+							requestListener.remove(WaiterKey(bindToken, bindRequestId));
 						removeListenerLocked(l.id);
 					}
 					return false;
@@ -988,66 +1013,66 @@ final class ServerPushChannel
 		return emit(makeNotification(method, params));
 	}
 
-	/// Send a server->client JSON-RPC *request* on the standalone GET SSE push
-	/// channel and block until a client responds. The request id is allocated
-	/// and tracked by the shared `StreamCoordinator`, so the client's reply --
-	/// which arrives on a *separate* POST to the MCP endpoint and is routed
-	/// through `StreamCoordinator.resolve` -- wakes this call. The request frame
-	/// is delivered on a single connected listener; the matching response
-	/// resolves the waiter.
-	/// Returns the client's result, or throws `McpException` on a client error
-	/// or timeout. Throws `internalError` if no GET listener is connected (there
-	/// is nobody to answer). This is the request/response counterpart to
-	/// `notify`, and the foundation for server-initiated `ping`.
+	/// MODE 3 — REQUEST ON SESSION. Send a server->client JSON-RPC *request*
+	/// (elicit / sample / roots / server-initiated `ping`) on the GET SSE stream of
+	/// the session named by `sessionToken`, and block until that client responds.
+	/// The reply arrives on a *separate* POST to the MCP endpoint and is routed
+	/// through `StreamCoordinator.resolve`, which wakes this call.
 	///
-	/// `ownerToken` scopes the request to the session that owns the target GET
-	/// stream: the waiter is registered under it so only a response POSTed under
-	/// the SAME session resolves it, and the request frame is delivered only on a
-	/// listener whose `Listener.ownerToken` matches. The empty token preserves the
-	/// stateless / shared path (any session, any listener), mirroring the unscoped
-	/// `StreamCoordinator.Waiter` and `Listener`.
-	Json sendRequest(string method, Json params = Json.emptyObject,
-			Duration timeout = 60.seconds, string ownerToken = "") @safe
+	/// Correlation is keyed by `(sessionToken, id)`: the waiter is registered under
+	/// the session, the request frame is delivered only on a listener whose
+	/// `Listener.ownerToken` matches, and only a response POSTed under the SAME
+	/// session resolves it — so a reply arriving on another session can never
+	/// resolve this one's pending request. The empty token is the stateless /
+	/// shared path (any unscoped listener, resolvable only by an unscoped reply).
+	///
+	/// Returns the client's result, or throws `McpException` on a client error or
+	/// timeout. Throws `internalError` if no matching GET listener is connected
+	/// (there is nobody to answer). The request/response counterpart to `broadcast`
+	/// / `pushToSession`, and the foundation for the server-initiated `ping`.
+	Json requestOnSession(string sessionToken, string method,
+			Json params = Json.emptyObject, Duration timeout = 60.seconds) @safe
 	{
 		const id = coord.alloc();
-		coord.register(id, ownerToken);
+		coord.register(id, sessionToken);
 		// Bind the in-flight request to its target listener under the channel mutex
-		// BEFORE the blocking write (passing `id` into `deliver`), not after it
-		// returns. A listener disconnect that races the write is then seen by
-		// `removeListenerLocked`'s scan, which fails this awaiter immediately rather
-		// than stranding it for the full timeout.
+		// BEFORE the blocking write (passing `(id, sessionToken)` into `deliver`),
+		// not after it returns. A listener disconnect that races the write is then
+		// seen by `removeListenerLocked`'s scan, which fails this awaiter immediately
+		// rather than stranding it for the full timeout.
 		const listenerId = deliver(makeRequest(Json(id), method, params),
-				(ref const Listener l) @safe => l.ownerToken == ownerToken, id);
+				(ref const Listener l) @safe => l.ownerToken == sessionToken, id, sessionToken);
 		if (listenerId < 0)
 		{
-			coord.cancel(id);
+			coord.cancel(id, sessionToken);
 			throw internalError(
 					"No GET SSE listener connected to receive the server->client request");
 		}
 		scope (exit)
 			() @trusted {
 			synchronized (mtx)
-				requestListener.remove(id);
+				requestListener.remove(WaiterKey(sessionToken, id));
 		}();
 		// Liveness defense-in-depth: even if a disconnect is somehow missed, polling
 		// whether the bound listener is still connected releases the fiber within one
 		// slice instead of the full timeout (mirrors the POST path's `awaitLive`).
 		return coord.awaitLive(id, () @safe => isListenerLive(listenerId),
-				internalError("GET SSE listener disconnected before the client responded"), timeout);
+				internalError("GET SSE listener disconnected before the client responded"),
+				timeout, 250.msecs, sessionToken);
 	}
 
-	/// Initiate a `ping` toward the connected client(s) on the GET SSE push
-	/// channel and block until one acknowledges with the spec-mandated empty
-	/// result (basic/utilities/ping). This is the server-side counterpart to the
-	/// client's `ping()`: it lets a server perform the SHOULD-periodic
-	/// connection-health check the spec describes for either party. Throws on a
-	/// client error, a timeout (treat as a stale connection), or when no GET
-	/// listener is connected. The `ping` request carries no params, exactly as
-	/// the spec requires. `ownerToken` scopes the probe to one session's GET
-	/// stream (empty == the stateless / shared path); see `sendRequest`.
-	void ping(Duration timeout = 60.seconds, string ownerToken = "") @safe
+	/// Initiate a `ping` toward the client on the session's GET SSE stream and
+	/// block until it acknowledges with the spec-mandated empty result
+	/// (basic/utilities/ping). This is the server-side counterpart to the client's
+	/// `ping()`: it lets a server perform the SHOULD-periodic connection-health
+	/// check the spec describes for either party. Throws on a client error, a
+	/// timeout (treat as a stale connection), or when no GET listener is connected
+	/// for the session. The `ping` request carries no params, exactly as the spec
+	/// requires. `sessionToken` scopes the probe to one session's GET stream
+	/// (empty == the stateless / shared path); see `requestOnSession`.
+	void ping(Duration timeout = 60.seconds, string sessionToken = "") @safe
 	{
-		sendRequest("ping", Json.emptyObject, timeout, ownerToken);
+		requestOnSession(sessionToken, "ping", Json.emptyObject, timeout);
 	}
 
 	/// Frame `msg` and write it to a single listener (identified by `listenerId`),
@@ -1294,7 +1319,7 @@ unittest  // emit delivers to exactly ONE stream, never broadcasting to all
 	assert(ch.listenerCount == 2); // both streams remain open
 }
 
-unittest  // emitFiltered delivers a change notification ONLY to a stream that opted in
+unittest  // pushToSession delivers a change notification ONLY to a stream that opted in
 {
 	// draft basic/utilities/subscriptions: "The server MUST NOT send notification
 	// types the client has not explicitly requested." Two concurrent listen streams:
@@ -1314,7 +1339,7 @@ unittest  // emitFiltered delivers a change notification ONLY to a stream that o
 	ch.addListener((string f) @safe { bFrame = f; }, "listen-B", fb);
 	ch.addListener((string f) @safe { aFrame = f; }, "listen-A", fa);
 
-	const delivered = ch.emitFiltered("notifications/tools/list_changed", Json.undefined);
+	const delivered = ch.pushToSession("", "notifications/tools/list_changed", Json.undefined);
 	assert(delivered == 1);
 	import std.algorithm : canFind;
 
@@ -1323,7 +1348,7 @@ unittest  // emitFiltered delivers a change notification ONLY to a stream that o
 	assert(bFrame.length == 0); // B never requested toolsListChanged
 }
 
-unittest  // emitFiltered for resources/updated targets only the stream with that URI
+unittest  // pushToSession for resources/updated targets only the stream with that URI
 {
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
@@ -1341,7 +1366,7 @@ unittest  // emitFiltered for resources/updated targets only the stream with tha
 
 	Json p = Json.emptyObject;
 	p["uri"] = "file:///b";
-	const delivered = ch.emitFiltered("notifications/resources/updated", p, "file:///b");
+	const delivered = ch.pushToSession("", "notifications/resources/updated", p, "file:///b");
 	assert(delivered == 1);
 	import std.algorithm : canFind;
 
@@ -1349,11 +1374,11 @@ unittest  // emitFiltered for resources/updated targets only the stream with tha
 	assert(aFrame.length == 0); // A opted into a different URI only
 }
 
-unittest  // emitFilteredPerOwner fans out to every distinct session, once each
+unittest  // broadcast fans out to every distinct session, once each
 {
 	// A list_changed broadcast must reach EVERY connected session, but only one
 	// stream per session. Two sessions (A, B) each with one plain GET stream: a
-	// single emitFilteredPerOwner reaches both.
+	// single broadcast reaches both.
 	import std.algorithm : canFind;
 
 	auto coord = new StreamCoordinator;
@@ -1362,13 +1387,13 @@ unittest  // emitFilteredPerOwner fans out to every distinct session, once each
 	ch.addListener((string f) @safe { aFrame = f; }, "", SubscriptionFilter.init, "", null, "A");
 	ch.addListener((string f) @safe { bFrame = f; }, "", SubscriptionFilter.init, "", null, "B");
 
-	const delivered = ch.emitFilteredPerOwner("notifications/tools/list_changed", Json.undefined);
+	const delivered = ch.broadcast("notifications/tools/list_changed", Json.undefined);
 	assert(delivered == 2);
 	assert(aFrame.canFind("notifications/tools/list_changed"));
 	assert(bFrame.canFind("notifications/tools/list_changed"));
 }
 
-unittest  // emitFilteredPerOwner honours Multiple Connections within one session
+unittest  // broadcast honours Multiple Connections within one session
 {
 	// Two GET streams of the SAME session: the broadcast lands on exactly one of
 	// them (one stream per session), reaching the session once.
@@ -1378,12 +1403,12 @@ unittest  // emitFilteredPerOwner honours Multiple Connections within one sessio
 	ch.addListener((string) @safe { aCount++; }, "", SubscriptionFilter.init, "", null, "S");
 	ch.addListener((string) @safe { bCount++; }, "", SubscriptionFilter.init, "", null, "S");
 
-	const delivered = ch.emitFilteredPerOwner("notifications/tools/list_changed", Json.undefined);
+	const delivered = ch.broadcast("notifications/tools/list_changed", Json.undefined);
 	assert(delivered == 1);
 	assert(aCount + bCount == 1);
 }
 
-unittest  // emitFilteredPerOwner skips a session whose only stream is not eligible
+unittest  // broadcast skips a session whose only stream is not eligible
 {
 	// A session whose active filter did not opt into the type must not be reached,
 	// while a session that did is reached.
@@ -1401,10 +1426,111 @@ unittest  // emitFilteredPerOwner skips a session whose only stream is not eligi
 	ch.addListener((string f) @safe { aFrame = f; }, "listen-A", fa, "", null, "A");
 	ch.addListener((string f) @safe { bFrame = f; }, "listen-B", fb, "", null, "B");
 
-	const delivered = ch.emitFilteredPerOwner("notifications/tools/list_changed", Json.undefined);
+	const delivered = ch.broadcast("notifications/tools/list_changed", Json.undefined);
 	assert(delivered == 1);
 	assert(aFrame.canFind("notifications/tools/list_changed"));
 	assert(bFrame.length == 0);
+}
+
+unittest  // MODE 1 broadcast reaches every connected session's listener
+{
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string a, b, c;
+	ch.addListener((string f) @safe { a = f; }, "", SubscriptionFilter.init, "", null, "A");
+	ch.addListener((string f) @safe { b = f; }, "", SubscriptionFilter.init, "", null, "B");
+	ch.addListener((string f) @safe { c = f; }, "", SubscriptionFilter.init, "", null, "C");
+
+	const reached = ch.broadcast("notifications/tools/list_changed", Json.undefined);
+	assert(reached == 3, "broadcast must reach all three sessions");
+	assert(a.canFind("notifications/tools/list_changed"));
+	assert(b.canFind("notifications/tools/list_changed"));
+	assert(c.canFind("notifications/tools/list_changed"));
+}
+
+unittest  // MODE 2 pushToSession reaches only the named session's listener
+{
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string a, b;
+	ch.addListener((string f) @safe { a = f; }, "", SubscriptionFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { b = f; }, "", SubscriptionFilter.init, "", null, "sess-B");
+
+	const reached = ch.pushToSession("sess-A", "notifications/resources/updated",
+			Json(["uri": Json("file:///x")]), "file:///x");
+	assert(reached == 1);
+	assert(a.canFind("file:///x"), "session A's stream must receive its update");
+	assert(b.length == 0, "session B's stream must NOT receive session A's update");
+}
+
+unittest  // MODE 3 requestOnSession: a reply on session B does NOT resolve session A's pending request
+{
+	// Cross-session isolation: two sessions both allocate (independently) the same
+	// id space; a reply that arrives on session B must never resolve session A's
+	// waiter, even at the same numeric id.
+	auto coord = new StreamCoordinator;
+	const idA = coord.alloc();
+	coord.register(idA, "sess-A");
+	// A response carrying idA but POSTed under session B finds nothing in A's slot.
+	assert(!coord.resolve(Json(idA), Json.emptyObject, Json.undefined, "sess-B"),
+			"a session-B reply wrongly resolved session A's pending request");
+	// The owning session's reply resolves its own waiter.
+	assert(coord.resolve(Json(idA), Json.emptyObject, Json.undefined,
+			"sess-A"), "session A's own reply must resolve its pending request");
+}
+
+unittest  // MODE 3 a real session's reply cannot resolve an empty-token (stateless) waiter
+{
+	// An empty/zero-token registration must not be matchable by a real session's
+	// reply: only an unscoped (empty-token) reply resolves the unscoped waiter.
+	auto coord = new StreamCoordinator;
+	const id = coord.alloc();
+	coord.register(id); // empty token (stateless / shared)
+	assert(!coord.resolve(Json(id), Json.emptyObject, Json.undefined,
+			"sess-A"), "a real session's reply wrongly resolved an unscoped waiter");
+	assert(coord.resolve(Json(id), Json.emptyObject, Json.undefined),
+			"the unscoped reply must resolve the unscoped waiter");
+}
+
+unittest  // MODE 3 ping reaches the session listener and round-trips its empty reply
+{
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string aFrame, bFrame;
+	ch.addListener((string f) @safe { aFrame = f; }, "",
+			SubscriptionFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { bFrame = f; }, "",
+			SubscriptionFilter.init, "", null, "sess-B");
+
+	bool pinged;
+	runTask(() @safe nothrow{
+		try
+			ch.ping(60.seconds, "sess-A");
+		catch (Exception)
+			assert(false, "session-scoped ping threw");
+		pinged = true;
+		exitEventLoop();
+	});
+	runTask(() @safe nothrow{
+		// Only session A's stream received the ping request; resolve it as session A.
+		assert(aFrame.canFind("\"method\":\"ping\""), "ping must reach session A's stream");
+		assert(bFrame.length == 0, "session B must not receive session A's ping");
+		bool matched;
+		try
+			matched = coord.resolve(Json(1), Json.emptyObject, Json.undefined, "sess-A");
+		catch (Exception)
+			assert(false, "resolve threw");
+		assert(matched);
+	});
+	runEventLoop();
+	assert(pinged);
 }
 
 unittest  // connectedOwnerTokens lists distinct non-empty session tokens
@@ -1424,7 +1550,7 @@ unittest  // connectedOwnerTokens lists distinct non-empty session tokens
 	assert(tokens.canFind("B"));
 }
 
-unittest  // emitFiltered: no eligible stream means no delivery (returns 0)
+unittest  // pushToSession: no eligible stream means no delivery (returns 0)
 {
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
@@ -1435,19 +1561,19 @@ unittest  // emitFiltered: no eligible stream means no delivery (returns 0)
 	ch.addListener((string fr) @safe { frame = fr; }, "only", f);
 
 	// promptsListChanged was never requested by the only stream.
-	const delivered = ch.emitFiltered("notifications/prompts/list_changed", Json.undefined);
+	const delivered = ch.pushToSession("", "notifications/prompts/list_changed", Json.undefined);
 	assert(delivered == 0);
 	assert(frame.length == 0);
 }
 
-unittest  // emitFiltered still reaches a plain GET stream (inactive filter accepts all)
+unittest  // pushToSession still reaches a plain GET stream (inactive filter accepts all)
 {
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 	string frame;
 	ch.addListener((string f) @safe { frame = f; }); // plain GET stream, no opt-in
 
-	const delivered = ch.emitFiltered("notifications/tools/list_changed", Json.undefined);
+	const delivered = ch.pushToSession("", "notifications/tools/list_changed", Json.undefined);
 	assert(delivered == 1);
 	import std.algorithm : canFind;
 
@@ -1477,7 +1603,7 @@ unittest  // a per-listener plainEligible gate overrides the mount-wide plainEli
 
 	auto p = Json(["uri": Json("file:///a")]);
 	// Mount-wide plainEligible is the default true; the per-listener gates decide.
-	const delivered = ch.emitFiltered("notifications/resources/updated", p, "file:///a");
+	const delivered = ch.pushToSession("", "notifications/resources/updated", p, "file:///a");
 	import std.algorithm : canFind;
 
 	assert(delivered == 1);
@@ -1607,7 +1733,7 @@ unittest  // a disconnect DURING the request write fails the awaiter, not after 
 	// The write delegate disconnects this very listener mid-write.
 	selfId = ch.addListener((string) @safe { ch.removeListener(selfId); });
 
-	// Deliver the request frame WITH the binding (as sendRequest now does). The
+	// Deliver the request frame WITH the binding (as requestOnSession now does). The
 	// mid-write removeListener observes the binding and fails the pending id.
 	const landed = ch.deliver(makeRequest(Json(id), "ping", Json.emptyObject),
 			(ref const ServerPushChannel.Listener) @safe => true, id);
@@ -1951,8 +2077,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		if (serverStateless_)
 			throw invalidRequest("server-initiated requests (elicitation/sampling/roots) require a stateful server; construct with McpServer.stateful()");
 		const id = coord.alloc();
-		// Bind the outbound id to this request's session token so only a response
-		// arriving on the same session can resolve it.
+		// Bind the outbound id to this request's session token (keyed `(token, id)`)
+		// so only a response arriving on the same session can resolve it.
 		coord.register(id, token_);
 		// A failed SSE write (broken pipe on the priming-event or request frame)
 		// must deregister the waiter before propagating, otherwise the mount-global
@@ -1961,7 +2087,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 			writeEvent(makeRequest(Json(id), method, params));
 		catch (Exception e)
 		{
-			coord.cancel(id);
+			coord.cancel(id, token_);
 			throw e;
 		}
 		// Bind the awaiting fiber to this connection's liveness. The response to
@@ -1970,7 +2096,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		// full timeout. Polling `connAlive_` in short slices releases it promptly on
 		// disconnect, mirroring the GET path's listener-disconnect handling.
 		return coord.awaitLive(id, connAlive_,
-				internalError("client disconnected before responding"));
+				internalError("client disconnected before responding"),
+				60.seconds, 250.msecs, token_);
 	}
 
 	bool clientSupports(ClientCapability cap) @safe
@@ -2231,7 +2358,7 @@ unittest  // cancel() drops a registered-but-unawaited request id
 	c.cancel(9999);
 }
 
-unittest  // push-channel sendRequest with no listener throws (nobody to answer)
+unittest  // push-channel requestOnSession with no listener throws (nobody to answer)
 {
 	import mcp.protocol.errors : McpException, ErrorCode;
 
@@ -2239,7 +2366,7 @@ unittest  // push-channel sendRequest with no listener throws (nobody to answer)
 	auto ch = new ServerPushChannel(coord);
 	bool threw;
 	try
-		ch.sendRequest("ping");
+		ch.requestOnSession("", "ping");
 	catch (McpException e)
 	{
 		threw = true;
@@ -2323,7 +2450,7 @@ unittest  // a session-scoped push sendRequest is delivered only on the owning s
 	ch.addListener((string f) @safe { bFrame = f; }, "",
 			SubscriptionFilter.init, "", null, "sess-B");
 
-	// Deliver the scoped request frame exactly as sendRequest does (eligibility
+	// Deliver the scoped request frame exactly as requestOnSession does (eligibility
 	// keyed on the owning token) without blocking on a reply.
 	const id = coord.alloc();
 	coord.register(id, "sess-A");
@@ -2394,7 +2521,7 @@ unittest  // a response from the owning session resolves the pending request
 	runTask(() @safe nothrow{
 		Json r;
 		try
-			r = c.await(id);
+			r = c.await(id, 60.seconds, "sess-A");
 		catch (Exception)
 			assert(false, "await threw");
 		awaited = r.type == Json.Type.object;
@@ -2411,15 +2538,19 @@ unittest  // a response from the owning session resolves the pending request
 	assert(awaited);
 }
 
-unittest  // an unscoped (stateless) waiter is resolvable by any responder
+unittest  // an unscoped (stateless) waiter is resolved only by an unscoped reply
 {
-	// A waiter registered with an empty owner token (stateless / shared mode)
-	// preserves prior behavior: any responder token, including empty, matches.
+	// With `(sessionToken, id)` keying, a waiter registered under the empty token
+	// (stateless / shared mode) is looked up at `("", id)`: only a reply that also
+	// carries the empty token finds it. A real session's reply keys to a different
+	// slot and can never resolve the unscoped waiter.
 	auto c = new StreamCoordinator;
 	const id = c.alloc();
 	c.register(id);
-	const matched = c.resolve(Json(id), Json.emptyObject, Json.undefined, "anyone");
-	assert(matched, "an unscoped waiter must remain resolvable regardless of responder token");
+	assert(!c.resolve(Json(id), Json.emptyObject, Json.undefined, "anyone"),
+			"a real session's reply must not resolve an unscoped waiter");
+	assert(c.resolve(Json(id), Json.emptyObject, Json.undefined),
+			"the unscoped reply must resolve the unscoped waiter");
 }
 
 unittest  // a server->client request fails fast when its bound listener disconnects
@@ -2439,7 +2570,7 @@ unittest  // a server->client request fails fast when its bound listener disconn
 	bool failedFast;
 	void delegate() @safe nothrow initiator = () @safe nothrow{
 		try
-			ch.sendRequest("ping");
+			ch.requestOnSession("", "ping");
 		catch (McpException)
 			failedFast = true;
 		catch (Exception)

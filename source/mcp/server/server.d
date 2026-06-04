@@ -1146,16 +1146,21 @@ final class McpServer
 			// the 2025-era subscribe-then-deliver gate (`isSubscribed(uri)`). On the
 			// draft single-connection path the global opt-in still gates that fallback.
 			const plainEligible = plainGetEligible(method, uri);
-			// The three list-changed notifications are genuine broadcasts: every
-			// connected session MUST be told the list changed, not just the first
-			// eligible stream. Fan them out once per distinct session via
-			// `emitFilteredPerOwner` (still one stream per session, honouring Multiple
-			// Connections within a session). `notifications/resources/updated` stays
-			// single-stream and per-session gated via `plainGetEligibleFor`.
+			// The three list-changed notifications are genuine broadcasts (MODE 1):
+			// every connected session MUST be told the list changed, not just the first
+			// eligible stream. `broadcast` fans them out once per distinct session
+			// (still one stream per session, honouring Multiple Connections within a
+			// session). `notifications/resources/updated` is a session-scoped push
+			// (MODE 2) — delivered on one stream, per-session gated via
+			// `plainGetEligibleFor` / the stream's own `SubscriptionFilter`. The empty
+			// session token here keeps the unscoped fan-out (a list-changed reaches all
+			// sessions) and the unscoped single-stream filtered delivery for the draft
+			// self-contained listen path; per-session attribution lives in each
+			// listener's own `ownerToken` and gate.
 			if (isListChangedBroadcast(method))
-				delivered += pushChannel.emitFilteredPerOwner(method, params, uri, plainEligible);
+				delivered += pushChannel.broadcast(method, params, uri, plainEligible);
 			else
-				delivered += pushChannel.emitFiltered(method, params, uri, plainEligible);
+				delivered += pushChannel.pushToSession("", method, params, uri, plainEligible);
 		}
 		return delivered;
 	}

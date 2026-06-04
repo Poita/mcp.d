@@ -1466,6 +1466,26 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			sessions !is null && sessions.terminate(mintedSessionId);
 			return;
 		}
+		// A request whose handling was cancelled mid-flight (e.g. a
+		// `notifications/cancelled` arrived on a sibling POST, or the draft
+		// client-disconnect cancellation) returns a NULL response: the spec says no
+		// response is sent for a cancelled request. Guard the dereference exactly as
+		// the stdio path does (`resp.isNull ? <no response> : resp.get`) so a
+		// cancelled request suppresses its reply rather than asserting on `resp.get`.
+		if (resp.isNull)
+		{
+			// No response to commit. Roll back any session minted for an initialize
+			// that produced no result so a cancelled initialize leaves nothing behind,
+			// then send the spec's no-body acknowledgement on the non-streaming path
+			// (a streamed response has already written its events and simply ends).
+			sessions !is null && sessions.terminate(mintedSessionId);
+			if (!ctx.streaming)
+			{
+				res.statusCode = HTTPStatus.accepted;
+				res.writeBody("", "text/plain");
+			}
+			return;
+		}
 		auto j = resp.get;
 		// Commit the minted session only now that initialize produced a successful
 		// InitializeResult: set its Mcp-Session-Id header. Any other outcome (a
