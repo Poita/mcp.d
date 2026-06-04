@@ -90,9 +90,10 @@ unittest
 unittest
 {
 	import mcp;
+	import core.time : seconds;
 
-	CacheHint hint = CacheHint(5000, CacheScope.private_);
-	assert(hint.ttlMs == 5000);
+	CacheHint hint = CacheHint(5.seconds, CacheScope.private_);
+	assert(hint.ttl == 5.seconds);
 	assert(hint.cacheScope == CacheScope.private_);
 
 	DiscoverResult r;

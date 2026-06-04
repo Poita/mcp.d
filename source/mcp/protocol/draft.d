@@ -1,6 +1,7 @@
 module mcp.protocol.draft;
 
 import std.typecons : Nullable, nullable;
+import core.time : Duration, msecs, seconds;
 import vibe.data.json : Json;
 
 import mcp.protocol.capabilities;
@@ -383,11 +384,12 @@ enum CacheScope : string
 }
 
 /// A per-result freshness hint (draft `CacheableResult`): how long a result may
-/// be cached (`ttlMs`) and by whom (`cacheScope`). Supplied per result by the
-/// user and surfaced to client consumers.
+/// be cached (`ttl`) and by whom (`cacheScope`). Supplied per result by the
+/// user and surfaced to client consumers. The wire field stays `ttlMs`
+/// (milliseconds); `ttl` is the typed SDK-facing value.
 struct CacheHint
 {
-	long ttlMs;
+	Duration ttl;
 	CacheScope cacheScope = CacheScope.public_;
 }
 
@@ -403,9 +405,11 @@ Json withCache(Json result, CacheHint hint) @safe
 	// mutating the caller's object as a side effect.
 	Json out_ = result.clone();
 	// Spec (`CacheableResult`): servers MUST provide a `ttlMs` value that is
-	// >= 0. Clamp at this single emission chokepoint so a negative value can
-	// never reach the wire, regardless of caller input.
-	out_["ttlMs"] = hint.ttlMs < 0 ? 0L : hint.ttlMs;
+	// >= 0. The wire field is milliseconds; convert from the typed Duration and
+	// clamp at this single emission chokepoint so a negative/zero Duration can
+	// never reach the wire as a negative value, regardless of caller input.
+	const ttlMs = hint.ttl.total!"msecs";
+	out_["ttlMs"] = ttlMs < 0 ? 0L : ttlMs;
 	out_["cacheScope"] = cast(string) hint.cacheScope;
 	return out_;
 }
@@ -420,17 +424,20 @@ Nullable!CacheHint parseCacheHint(Json result) @safe
 		return Nullable!CacheHint.init;
 	auto ttl = result["ttlMs"];
 	CacheHint hint;
+	long ttlMs;
 	if (ttl.type == Json.Type.int_)
-		hint.ttlMs = ttl.get!long;
+		ttlMs = ttl.get!long;
 	else if (ttl.type == Json.Type.float_)
-		hint.ttlMs = cast(long) ttl.get!double;
+		ttlMs = cast(long) ttl.get!double;
 	else
 		return Nullable!CacheHint.init;
 	// Spec (`CacheableResult`): `ttlMs` MUST be >= 0; clamp defensively on read
 	// so values round-tripped through this SDK honour the constraint even if a
-	// non-conforming peer emitted a negative value.
-	if (hint.ttlMs < 0)
-		hint.ttlMs = 0;
+	// non-conforming peer emitted a negative value. The wire field is
+	// milliseconds; store as a typed Duration.
+	if (ttlMs < 0)
+		ttlMs = 0;
+	hint.ttl = ttlMs.msecs;
 	if ("cacheScope" in result && result["cacheScope"].type == Json.Type.string)
 	{
 		const s = result["cacheScope"].get!string;
@@ -1317,20 +1324,28 @@ unittest  // DiscoverResult.fromJson reads the spec wire field `supportedVersion
 	assert(r.protocolVersions[0] == "2026-07-28");
 }
 
-unittest  // withCache attaches ttlMs and cacheScope from a CacheHint
+unittest  // withCache attaches ttlMs (ms) and cacheScope from a CacheHint Duration
 {
 	Json r = Json.emptyObject;
 	r["tools"] = Json.emptyArray;
-	auto c = withCache(r, CacheHint(5000, CacheScope.private_));
+	auto c = withCache(r, CacheHint(5.seconds, CacheScope.private_));
 	assert(c["ttlMs"].get!long == 5000);
 	assert(c["cacheScope"].get!string == "private");
 }
 
-unittest  // withCache clamps a negative ttlMs to 0 (spec: ttlMs MUST be >= 0)
+unittest  // withCache clamps a negative Duration to ttlMs:0 (spec: ttlMs MUST be >= 0)
 {
 	Json r = Json.emptyObject;
 	r["tools"] = Json.emptyArray;
-	auto c = withCache(r, CacheHint(-5000, CacheScope.public_));
+	auto c = withCache(r, CacheHint((-5).seconds, CacheScope.public_));
+	assert(c["ttlMs"].get!long == 0);
+}
+
+unittest  // withCache emits ttlMs:0 for a zero Duration
+{
+	Json r = Json.emptyObject;
+	r["tools"] = Json.emptyArray;
+	auto c = withCache(r, CacheHint(Duration.zero, CacheScope.public_));
 	assert(c["ttlMs"].get!long == 0);
 }
 
@@ -1338,49 +1353,59 @@ unittest  // withCache leaves the original result untouched (clones, like withSu
 {
 	Json r = Json.emptyObject;
 	r["tools"] = Json.emptyArray;
-	auto c = withCache(r, CacheHint(5000, CacheScope.private_));
+	auto c = withCache(r, CacheHint(5.seconds, CacheScope.private_));
 	assert("ttlMs" !in r);
 	assert("cacheScope" !in r);
 	assert(c["ttlMs"].get!long == 5000);
 }
 
-unittest  // parseCacheHint clamps a negative ttlMs to 0 on read
+unittest  // parseCacheHint clamps a negative ttlMs to a zero Duration on read
 {
 	Json r = Json.emptyObject;
 	r["ttlMs"] = -42;
 	auto h = parseCacheHint(r);
 	assert(!h.isNull);
-	assert(h.get.ttlMs == 0);
+	assert(h.get.ttl == Duration.zero);
 }
 
-unittest  // parseCacheHint clamps a negative float ttlMs to 0 on read
+unittest  // parseCacheHint clamps a negative float ttlMs to a zero Duration on read
 {
 	Json r = Json.emptyObject;
 	r["ttlMs"] = -1500.0;
 	auto h = parseCacheHint(r);
 	assert(!h.isNull);
-	assert(h.get.ttlMs == 0);
+	assert(h.get.ttl == Duration.zero);
 }
 
-unittest  // parseCacheHint reads an integer ttlMs and a cacheScope string
+unittest  // parseCacheHint reads an integer ttlMs (ms) into a Duration and a cacheScope string
 {
 	Json r = Json.emptyObject;
 	r["ttlMs"] = 5000;
 	r["cacheScope"] = "private";
 	auto h = parseCacheHint(r);
 	assert(!h.isNull);
-	assert(h.get.ttlMs == 5000);
+	assert(h.get.ttl == 5.seconds);
 	assert(h.get.cacheScope == CacheScope.private_);
 }
 
-unittest  // parseCacheHint accepts a float ttlMs and defaults cacheScope to public
+unittest  // parseCacheHint accepts a float ttlMs (ms) and defaults cacheScope to public
 {
 	Json r = Json.emptyObject;
 	r["ttlMs"] = 1500.0;
 	auto h = parseCacheHint(r);
 	assert(!h.isNull);
-	assert(h.get.ttlMs == 1500);
+	assert(h.get.ttl == 1500.msecs);
 	assert(h.get.cacheScope == CacheScope.public_);
+}
+
+unittest  // round-trip: CacheHint(5.seconds) -> wire ttlMs:5000 -> 5.seconds
+{
+	Json r = Json.emptyObject;
+	auto c = withCache(r, CacheHint(5.seconds, CacheScope.public_));
+	assert(c["ttlMs"].get!long == 5000);
+	auto h = parseCacheHint(c);
+	assert(!h.isNull);
+	assert(h.get.ttl == 5.seconds);
 }
 
 unittest  // parseCacheHint returns null when ttlMs is absent

@@ -1,6 +1,6 @@
 module mcp.server.server;
 
-import core.time : Duration, seconds;
+import core.time : Duration, seconds, msecs;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
@@ -1856,7 +1856,7 @@ final class McpServer
 		// pre-draft (2025-era) protocols `cacheableResults` is false, so the field
 		// is never written.
 		if (ver.cacheableResults)
-			result.cache = hint.isNull ? nullable(CacheHint(0)) : hint;
+			result.cache = hint.isNull ? nullable(CacheHint(Duration.zero)) : hint;
 		return result.toJson();
 	}
 
@@ -6027,7 +6027,7 @@ unittest  // server/discover advertises all supported versions + identity
 unittest  // per-list setListCacheHint: draft tools/list carries CacheableResult fields
 {
 	auto s = makeTestServer();
-	s.setListCacheHint("tools/list", CacheHint(5000, CacheScope.private_));
+	s.setListCacheHint("tools/list", CacheHint(5.seconds, CacheScope.private_));
 	auto resp = s.handle(draftReq(2, "tools/list")).get;
 	assert(resp["result"]["ttlMs"].get!long == 5000);
 	assert(resp["result"]["cacheScope"].get!string == "private");
@@ -6036,7 +6036,7 @@ unittest  // per-list setListCacheHint: draft tools/list carries CacheableResult
 unittest  // per-list setListCacheHint: pre-draft tools/list has no cache fields
 {
 	auto s = makeTestServer();
-	s.setListCacheHint("tools/list", CacheHint(5000));
+	s.setListCacheHint("tools/list", CacheHint(5.seconds));
 	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestStable
 	assert("ttlMs" !in resp["result"]);
 }
@@ -6044,7 +6044,7 @@ unittest  // per-list setListCacheHint: pre-draft tools/list has no cache fields
 unittest  // per-list hint only emits on the matching list, not on others
 {
 	auto s = makeTestServer();
-	s.setListCacheHint("resources/list", CacheHint(7000));
+	s.setListCacheHint("resources/list", CacheHint(7.seconds));
 	// tools/list has no explicit hint, so it carries the mandatory draft default
 	// (ttlMs:0) rather than the resources/list value: the per-list hint does
 	// not leak across methods.
@@ -6058,7 +6058,7 @@ unittest  // per-resource registerResource hint emits ttlMs/cacheScope on a draf
 	auto s = new McpServer("t", "1");
 	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://r",
-			"text/plain", "x"), nullable(CacheHint(9000, CacheScope.private_)));
+			"text/plain", "x"), nullable(CacheHint(9.seconds, CacheScope.private_)));
 	Json p = Json.emptyObject;
 	p["uri"] = "test://r";
 	auto resp = s.handle(draftReq(2, "resources/read", p)).get;
@@ -6071,7 +6071,7 @@ unittest  // per-resource hint is NOT emitted on a non-draft (2025-11-25) resour
 	auto s = new McpServer("t", "1");
 	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://r",
-			"text/plain", "x"), nullable(CacheHint(9000, CacheScope.private_)));
+			"text/plain", "x"), nullable(CacheHint(9.seconds, CacheScope.private_)));
 	Json p = Json.emptyObject;
 	p["uri"] = "test://r";
 	auto resp = s.handle(req(2, "resources/read", p)).get; // no draft _meta -> latestStable
@@ -6084,7 +6084,7 @@ unittest  // per-template registerResourceTemplate hint emits on a matching draf
 	ResourceTemplate t = {uriTemplate: "test://{id}", name: "tmpl"};
 	s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
 		return ResourceContents.makeText(uri, "text/plain", "y");
-	}, nullable(CacheHint(4200)));
+	}, nullable(CacheHint(4200.msecs)));
 	Json p = Json.emptyObject;
 	p["uri"] = "test://abc";
 	auto resp = s.handle(draftReq(2, "resources/read", p)).get;

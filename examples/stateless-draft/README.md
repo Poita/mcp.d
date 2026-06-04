@@ -37,7 +37,8 @@ hand-built request/response Json on the server:
   (plus a JSON text mirror) from the returned struct — no hand-built
   `CallToolResult`.
 - The `@resource` `greeting` method's draft freshness hint is declared with the
-  `@cache(ttlMs, scope)` UDA, and `registerHandlers` wires everything up.
+  `@cache(ttl, scope)` UDA (a `core.time.Duration`), and `registerHandlers` wires
+  everything up.
 
 The client side likewise uses the SDK's typed surface where it cleanly applies:
 

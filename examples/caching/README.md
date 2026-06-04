@@ -17,21 +17,22 @@ They are **draft-only** (protocol `2026-07-28`): the server only emits the
 fields when the negotiated protocol is the stateless draft, and the client must
 opt in with `client.enableDraft()`.
 
-- **Per-resource hint** — `server.d` declares it with the `@cache(ttlMs, scope)`
-  UDA on a `@resource` method; `registerHandlers` plumbs it onto that resource's
-  `resources/read` result.
+- **Per-resource hint** — `server.d` declares it with the `@cache(ttl, scope)`
+  UDA (a `core.time.Duration`) on a `@resource` method; `registerHandlers` plumbs
+  it onto that resource's `resources/read` result (serialized on the wire as
+  `ttlMs` milliseconds).
   ```d
   @resource("config://app", "Application configuration", "application/json")
-  @cache(60_000, "private")
+  @cache(60.seconds, "private")
   string config() @safe { return `{"theme":"dark","retries":3}`; }
   ```
 - **Per-list hint** — `server.d` calls
-  `server.setListCacheHint("resources/list", CacheHint(5_000, CacheScope.public_))`.
+  `server.setListCacheHint("resources/list", CacheHint(5.seconds, CacheScope.public_))`.
   It rides on the `resources/list` result. (Valid list methods: `tools/list`,
   `resources/list`, `resources/templates/list`, `prompts/list`.)
 - **Consumer's-eye view** — `client.d` enables draft mode
-  (`client.enableDraft()`), then reads `list.cache.ttlMs` / `cacheScope` and
-  `readResource(uri).cache.ttlMs` / `cacheScope`.
+  (`client.enableDraft()`), then reads `list.cache.ttl` / `cacheScope` and
+  `readResource(uri).cache.ttl` / `cacheScope` (each `.ttl` a `Duration`).
 
 A third resource (`status://live`) is registered with **no** hint, and the
 client asserts that its read carries **no** cache hint — proving the absence is

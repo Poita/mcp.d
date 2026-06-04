@@ -21,13 +21,13 @@
  *     server's identity (no `initialize` handshake);
  *   - `connect()` selects the stateless draft as the negotiated version;
  *   - `listTools()` contains the expected tool, and its draft `CacheableResult`
- *     freshness hint (`cache.ttlMs` / `cache.cacheScope`) matches the server's
+ *     freshness hint (`cache.ttl` / `cache.cacheScope`) matches the server's
  *     per-list hint;
  *   - a `tools/call` returns the expected (typed-struct-derived)
  *     `structuredContent` — read back via `structuredContentAs!SumResult` — and
  *     the JSON text mirror;
  *   - `readResource()` returns the expected text and the per-resource draft
- *     cache hint (`ttlMs` / `cacheScope`);
+ *     cache hint (`ttl` / `cacheScope`);
  *   - a bad `tools/call` returns the expected JSON-RPC error code.
  *
  * On success it prints an "OK:" summary and the scenario returns 0; on any
@@ -46,6 +46,8 @@ import mcp;
 import mcp.protocol.draft : CacheScope;
 
 import examples_common : check, checkEq, runClient, connectFromArgs;
+
+import core.time : seconds;
 
 private void printLine(string s) @trusted nothrow
 {
@@ -112,7 +114,7 @@ private int runE2E(McpClient client, bool overHttp) @safe
 	auto names = tools.tools.map!(t => t.name).array;
 	check(names.canFind("add"), "listTools should contain 'add'; got " ~ names.to!string);
 	check(!tools.cache.isNull, "listTools result should carry a draft cache hint");
-	checkEq(tools.cache.get.ttlMs, 5000L, "tools/list cache.ttlMs");
+	checkEq(tools.cache.get.ttl, 5.seconds, "tools/list cache.ttl");
 	checkEq(tools.cache.get.cacheScope, CacheScope.public_, "tools/list cache.cacheScope");
 
 	// --- 4. tools/call: typed-struct-derived structuredContent + text mirror --
@@ -133,7 +135,7 @@ private int runE2E(McpClient client, bool overHttp) @safe
 	checkEq(rr.contents[0].text, "hello from the stateless draft server",
 			"greeting resource text");
 	check(!rr.cache.isNull, "greeting resources/read should carry a draft cache hint");
-	checkEq(rr.cache.get.ttlMs, 9000L, "resources/read cache.ttlMs");
+	checkEq(rr.cache.get.ttl, 9.seconds, "resources/read cache.ttl");
 	checkEq(rr.cache.get.cacheScope, CacheScope.private_, "resources/read cache.cacheScope");
 
 	// --- 6. error path: unknown tool -> invalidParams (-32602) ----------------

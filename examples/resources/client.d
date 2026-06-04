@@ -24,7 +24,7 @@
  *   5. resources/read of an unknown URI fails with an error (the draft maps
  *      not-found to invalidParams -32602).
  *   6. the draft read of `config://app` surfaces the server's CacheableResult
- *      freshness hint (ttlMs == 60000, cacheScope == public).
+ *      freshness hint (ttl == 60.seconds, wire ttlMs == 60000, cacheScope == public).
  *   7. after subscriptions/listen, calling `set_note` delivers a
  *      notifications/resources/updated for the subscribed URI AND a
  *      notifications/resources/list_changed for the newly-created note resource;
@@ -46,7 +46,7 @@ module client;
 
 import std.stdio : writeln;
 import std.format : format;
-import core.time : msecs, MonoTime;
+import core.time : msecs, seconds, Duration, MonoTime;
 
 import vibe.core.core : sleep, yield;
 import vibe.data.json : Json;
@@ -61,7 +61,7 @@ import examples_common;
 
 // Expected contract — must match server.d.
 enum string expectedConfig = `{"name":"resources-example","featureFlags":["resources","subscribe"]}`;
-enum long expectedTtlMs = 60_000;
+enum Duration expectedTtl = 60.seconds;
 
 /// Typed arguments for the `set_note` tool. Passing this struct to the typed
 /// `callTool(name, T args)` overload lets the SDK serialize the wire arguments
@@ -135,7 +135,7 @@ int run(string[] args) @safe
 	check(!cfg.cache.isNull, "draft read: expected a cache hint on config://app");
 	if (!cfg.cache.isNull)
 	{
-		checkEq(cfg.cache.get.ttlMs, expectedTtlMs, "cache ttlMs");
+		checkEq(cfg.cache.get.ttl, expectedTtl, "cache ttl");
 		check(cfg.cache.get.cacheScope == CacheScope.public_,
 				"cache scope mismatch: expected public");
 	}

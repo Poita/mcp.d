@@ -1,6 +1,7 @@
 module mcp.api.attributes;
 
 import vibe.data.json : Json;
+import core.time : Duration;
 
 @safe:
 
@@ -350,12 +351,12 @@ SchemaDefault!T schemaDefault(T)(T value) @safe pure nothrow
 /// Example:
 /// ---
 /// @resource("file:///data", "Data", "application/json")
-/// @cache(5000, "private")
+/// @cache(5.seconds, "private")
 /// string data() { ... }
 /// ---
 struct cache
 {
-	long ttlMs; /// how long the result may be cached, in milliseconds
+	Duration ttl; /// how long the result may be cached
 	string scope_ = "public"; /// "public" (default) | "private"
 }
 

@@ -1403,12 +1403,13 @@ struct ListToolsResult
 unittest  // ListToolsResult: a set cache hint round-trips through toJson/fromJson
 {
 	import mcp.protocol.draft : CacheScope;
+	import core.time : seconds;
 
 	ListToolsResult r;
-	r.cache = CacheHint(5000, CacheScope.private_);
+	r.cache = CacheHint(5.seconds, CacheScope.private_);
 	auto back = ListToolsResult.fromJson(r.toJson());
 	assert(!back.cache.isNull);
-	assert(back.cache.get.ttlMs == 5000);
+	assert(back.cache.get.ttl == 5.seconds);
 	assert(back.cache.get.cacheScope == CacheScope.private_);
 }
 

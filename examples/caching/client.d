@@ -43,9 +43,11 @@ import mcp.protocol.draft : CacheScope;
 
 import examples_common : check, checkEq, runClient, connectFromArgs;
 
+import core.time : Duration, seconds;
+
 // Expected contract — must match the enums/values in server.d.
-enum long ExpectConfigTtlMs = 60_000;
-enum long ExpectListTtlMs = 5_000;
+enum Duration ExpectConfigTtl = 60.seconds;
+enum Duration ExpectListTtl = 5.seconds;
 
 int main(string[] args) @safe
 {
@@ -68,7 +70,7 @@ int main(string[] args) @safe
 		check(names.canFind("status://live"), "resources/list missing status://live");
 
 		check(!list.cache.isNull, "resources/list result carried NO cache hint (expected one)");
-		checkEq(list.cache.get.ttlMs, ExpectListTtlMs, "resources/list ttlMs");
+		checkEq(list.cache.get.ttl, ExpectListTtl, "resources/list ttl");
 		checkEq(list.cache.get.cacheScope, CacheScope.public_, "resources/list cacheScope");
 
 		// --- 2. reading config://app carries the per-resource cache hint ------
@@ -76,7 +78,7 @@ int main(string[] args) @safe
 		checkEq(cfg.contents.length, 1UL, "config://app content block count");
 		checkEq(cfg.contents[0].text, `{"theme":"dark","retries":3}`, "config://app body");
 		check(!cfg.cache.isNull, "config://app read carried NO cache hint (expected one)");
-		checkEq(cfg.cache.get.ttlMs, ExpectConfigTtlMs, "config://app ttlMs");
+		checkEq(cfg.cache.get.ttl, ExpectConfigTtl, "config://app ttl");
 		checkEq(cfg.cache.get.cacheScope, CacheScope.private_, "config://app cacheScope");
 
 		// --- 3. status://live has no @cache UDA, so under the draft protocol it
@@ -86,7 +88,8 @@ int main(string[] args) @safe
 		auto st = client.readResource("status://live");
 		check(!st.cache.isNull,
 			"status://live read should carry the draft do-not-cache default hint (ttlMs:0)");
-		checkEq(st.cache.get.ttlMs, 0, "status://live ttlMs should be 0 (do-not-cache default)");
+		checkEq(st.cache.get.ttl, Duration.zero,
+			"status://live ttl should be zero (do-not-cache default)");
 		checkEq(st.cache.get.cacheScope, CacheScope.public_,
 			"status://live cacheScope should default to public");
 

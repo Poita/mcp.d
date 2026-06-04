@@ -27,6 +27,7 @@
 module stateless_draft_server;
 
 import std.typecons : nullable;
+import core.time : seconds;
 
 import mcp;
 import mcp.protocol.draft : CacheHint, CacheScope;
@@ -61,9 +62,10 @@ final class StatelessDraftApi
 	/// A static greeting resource. The draft-only per-resource `CacheableResult`
 	/// freshness hint is declared via `@cache`; a draft client's
 	/// `readResource("demo://greeting").cache` will carry exactly these values
-	/// (ttlMs=9000, scope=private). Pre-draft peers see no cache fields.
+	/// (ttl=9.seconds, wire ttlMs=9000, scope=private). Pre-draft peers see no
+	/// cache fields.
 	@resource("demo://greeting", "greeting", "text/plain")
-	@cache(9000, "private")
+	@cache(9.seconds, "private")
 	string greeting() @safe
 	{
 		return "hello from the stateless draft server";
@@ -85,7 +87,7 @@ void main(string[] args) @safe
 	// will carry these `ttlMs` / `cacheScope` values. Pre-draft wire output is
 	// unchanged (no cache fields emitted). This is a server-level list hint, not
 	// a per-tool one, so it stays a direct server call.
-	server.setListCacheHint("tools/list", CacheHint(5000, CacheScope.public_));
+	server.setListCacheHint("tools/list", CacheHint(5.seconds, CacheScope.public_));
 
 	// Transport selection (stdio default; `--http` + `--port`/`--host` for
 	// Streamable HTTP) comes from the shared scaffold. The draft stateless model
