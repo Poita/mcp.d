@@ -440,6 +440,25 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 	if (mapped && ((b[10] == 0xFF && b[11] == 0xFF) || (b[10] == 0 && b[11] == 0)))
 		return classifyIpv4Octets(b[12], b[13], b[14], b[15]);
 
+	// NAT64 prefixes carry an embedded IPv4 in the low 32 bits that a NAT64
+	// gateway translates and routes, so classify that IPv4 the same as ::ffff:.
+	// Well-known 64:ff9b::/96 (RFC 6052): 00 64 ff 9b then bytes 4..11 zero.
+	if (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xFF && b[3] == 0x9B)
+	{
+		bool wellKnown = true;
+		foreach (k; 4 .. 12)
+			if (b[k] != 0)
+			{
+				wellKnown = false;
+				break;
+			}
+		if (wellKnown)
+			return classifyIpv4Octets(b[12], b[13], b[14], b[15]);
+		// Local-use 64:ff9b:1::/48 (RFC 8215): 00 64 ff 9b 00 01.
+		if (b[4] == 0x00 && b[5] == 0x01)
+			return classifyIpv4Octets(b[12], b[13], b[14], b[15]);
+	}
+
 	return AddressClass.public_;
 }
 
@@ -863,6 +882,30 @@ unittest  // classifyIpv6Literal classes loopback/ULA/link-local/embedded-v4
 	assert(classifyIpv6Literal("::ffff:169.254.169.254") == AddressClass.privateOrLinkLocal);
 	assert(classifyIpv6Literal("::ffff:10.0.0.5") == AddressClass.privateOrLinkLocal);
 	assert(classifyIpv6Literal("::ffff:0a00:0001") == AddressClass.privateOrLinkLocal);
+}
+
+unittest  // classifyIpv6Literal classes NAT64 well-known 64:ff9b::/96 embedded internal IPv4 as private/link-local
+{
+	// A NAT64 gateway translates these to the embedded low-32-bit IPv4 and routes it,
+	// reaching loopback / link-local-metadata / RFC1918 internal targets. The embedded
+	// IPv4 is classified exactly as the ::ffff: path does, so each matches the IPv4 class.
+	assert(classifyIpv6Literal("64:ff9b::7f00:1") == AddressClass.loopback); // 127.0.0.1
+	assert(classifyIpv6Literal("64:ff9b::a9fe:a9fe") == AddressClass.privateOrLinkLocal); // 169.254.169.254
+	assert(classifyIpv6Literal("64:ff9b::a00:5") == AddressClass.privateOrLinkLocal); // 10.0.0.5
+}
+
+unittest  // classifyIpv6Literal classes NAT64 local-use 64:ff9b:1::/48 embedded internal IPv4 as internal
+{
+	assert(classifyIpv6Literal("64:ff9b:1::7f00:1") == AddressClass.loopback); // 127.0.0.1
+	assert(classifyIpv6Literal("64:ff9b:1::a9fe:a9fe") == AddressClass.privateOrLinkLocal); // 169.254.169.254
+}
+
+unittest  // classifyIpv6Literal treats NAT64 with public embedded IPv4 like ::ffff: public embedded
+{
+	// 8.8.8.8 classifies public_, so the NAT64-embedded form matches the existing
+	// embedded-public behaviour of the ::ffff: path.
+	assert(classifyIpv6Literal("64:ff9b::808:808") == classifyIpv6Literal("::ffff:808:808")); // 8.8.8.8
+	assert(classifyIpv6Literal("64:ff9b::808:808") == AddressClass.public_);
 }
 
 unittest  // classifyIpv6Literal classes public global-unicast and fails closed on garbage
