@@ -4564,6 +4564,9 @@ unittest  // registering a resource whose uri already exists throws
 unittest  // removeResource drops a registered resource and reports success
 {
 	auto s = new McpServer("t", "1");
+	// A server that removes resources at runtime advertises listChanged, which
+	// keeps resources/list valid even once the set is empty.
+	s.enableResourcesListChanged();
 	Resource r = {uri: "test://x", name: "x"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
 
