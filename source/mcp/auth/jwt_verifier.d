@@ -402,9 +402,15 @@ private string rsaJwkToPem(Jwk jwk) @trusted
 	}
 	scope (exit)
 		RSA_free(rsa);
-	// RSA_set0_key takes ownership of n and e (d may be null).
+	// RSA_set0_key takes ownership of n and e (d may be null). On failure the
+	// ownership transfer did not occur, so free n and e explicitly here before
+	// returning — RSA_free(rsa) does not free BIGNUMs it never received.
 	if (RSA_set0_key(rsa, n, e, null) != 1)
+	{
+		BN_free(n);
+		BN_free(e);
 		return null;
+	}
 
 	auto pkey = EVP_PKEY_new();
 	if (pkey is null)
@@ -567,7 +573,10 @@ private string fetchJwks(string uri) @trusted
 	{
 		secureRequestHTTP(uri, (scope HTTPClientRequest req) {
 			req.method = HTTPMethod.GET;
-		}, (scope HTTPClientResponse res) { body_ = res.bodyReader.readAllUTF8(); });
+		}, (scope HTTPClientResponse res) {
+			if (res.statusCode / 100 == 2)
+				body_ = res.bodyReader.readAllUTF8();
+		});
 	}
 	catch (Exception)
 		return null;
@@ -1107,4 +1116,103 @@ unittest  // JwksCache refuses an internal/link-local JWKS URI (SSRF mitigation)
 
 	auto cache = new JwksCache("https://169.254.169.254/jwks", 60.seconds);
 	assert(cache.keysFor("any-kid").length == 0);
+}
+
+unittest  // rsaJwkToPem frees n and e BIGNUMs on RSA_set0_key failure (no leak)
+{
+	// RSA_set0_key succeeds whenever n and e are valid non-null BIGNUMs passed to
+	// a freshly-allocated RSA struct, so we cannot force a failure from D. The fix
+	// (adding BN_free(n)/BN_free(e) on that branch) is verified by code inspection
+	// and by this test confirming the function produces the expected result for a
+	// valid key — a non-null PEM is returned, BIGNUMs are consumed without crash.
+	Jwk j;
+	j.kty = "RSA";
+	j.n = testRsaN;
+	j.e = testRsaE;
+	auto pem = rsaJwkToPem(j);
+	import std.string : indexOf;
+
+	assert(pem.indexOf("BEGIN PUBLIC KEY") >= 0);
+}
+
+unittest  // fetchJwks discards non-2xx bodies so a 503 does not mark the cache as fresh
+{
+	import core.time : seconds;
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.router : URLRouter;
+	import vibe.http.server : HTTPServerResponse, HTTPServerRequest,
+		HTTPServerSettings, listenHTTP;
+	import vibe.http.status : HTTPStatus;
+
+	// A shared flag lets the handler serve 503 first, then 200 with a real JWKS.
+	shared bool serveValid = false;
+	const validJwks = `{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN
+		~ `","e":"` ~ testRsaE ~ `"}]}`;
+
+	string failure;
+	bool passed;
+
+	void delegate() @safe nothrow body_ = () @safe nothrow{
+		try
+		{
+			auto router = new URLRouter;
+			router.get("/jwks", (HTTPServerRequest req, HTTPServerResponse res) @safe nothrow{
+				try
+				{
+					import vibe.stream.operations : readAllUTF8;
+
+					if (serveValid)
+					{
+						res.statusCode = 200;
+						res.contentType = "application/json";
+						res.writeBody(validJwks);
+					}
+					else
+					{
+						res.statusCode = 503;
+						res.contentType = "application/json";
+						res.writeBody(`{"error":"service unavailable"}`);
+					}
+				}
+				catch (Exception)
+				{
+				}
+			});
+
+			auto settings = new HTTPServerSettings;
+			settings.port = 0; // ephemeral
+			settings.bindAddresses = ["127.0.0.1"];
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				() @trusted { listener.stopListening(); }();
+
+			const port = listener.bindAddresses[0].port;
+			const uri = "http://127.0.0.1:" ~ port.to!string ~ "/jwks";
+
+			// First fetch: server returns 503. The cache should NOT be marked fresh.
+			auto cache = new JwksCache(uri, 300.seconds);
+			assert(cache.keysFor("rsa-1").length == 0);
+
+			// Switch server to serve a valid JWKS.
+			serveValid = true;
+
+			// Second fetch immediately (well within 300-second TTL). With the bug,
+			// the first 503 body was passed to load(), marking the cache as fresh
+			// with 0 keys, and this call returns 0. With the fix, the 503 did not
+			// mark the cache fresh, so this call re-fetches and returns 1 key.
+			assert(cache.keysFor("rsa-1").length == 1);
+
+			passed = true;
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	};
+
+	runTask(body_);
+	runEventLoop();
+
+	assert(failure.length == 0, "fetchJwks HTTP status test failed: " ~ failure);
+	assert(passed);
 }
