@@ -64,14 +64,18 @@ ubyte[] signEs256(string privateKeyPem, const(ubyte)[] data) @trusted
 }
 
 /// Left-pad a BIGNUM into a fixed-width big-endian buffer.
+/// Throws if the BIGNUM is zero or wider than dst, because either case indicates
+/// a catastrophic failure (e.g. uninitialised component, memory corruption, wrong
+/// key type) that must not be masked by silently emitting an all-zero component.
 private void bnToFixed(const(BIGNUM)* bn, ubyte[] dst) @trusted
 {
 	import core.stdc.string : memset;
+	import std.conv : to;
 
 	const n = BN_num_bytes(bn);
-	memset(dst.ptr, 0, dst.length);
 	if (n <= 0 || n > dst.length)
-		return;
+		throw new Exception("openssl: ECDSA component out of range (n=" ~ n.to!string ~ ")");
+	memset(dst.ptr, 0, dst.length);
 	ubyte[64] tmp;
 	BN_bn2bin(bn, tmp.ptr);
 	dst[$ - n .. $] = tmp[0 .. n];
@@ -383,4 +387,36 @@ unittest  // mintJwtEs256 fails closed on control characters in a claim
 	claims.iss = "https://auth.example.com";
 	claims.sub = "bad\nsub";
 	assertThrown(mintJwtEs256(testEcPem, claims));
+}
+
+unittest  // bnToFixed throws when the BIGNUM is zero (n == 0) rather than silently zeroing dst
+{
+	import std.exception : assertThrown;
+
+	() @trusted {
+		// BN_new() returns a zero-valued BIGNUM; BN_num_bytes returns 0 for it.
+		auto bn = BN_new();
+		scope (exit)
+			BN_free(bn);
+		ubyte[32] dst;
+		assertThrown(bnToFixed(bn, dst[]));
+	}();
+}
+
+unittest  // bnToFixed throws when the BIGNUM is wider than dst rather than silently zeroing dst
+{
+	import std.exception : assertThrown;
+
+	() @trusted {
+		// A BIGNUM that requires 33 bytes does not fit in a 32-byte dst.
+		auto bn = BN_new();
+		scope (exit)
+			BN_free(bn);
+		// 2^256 requires 33 bytes to encode.
+		ubyte[33] bigBytes;
+		bigBytes[0] = 1; // = 2^256
+		BN_bin2bn(bigBytes.ptr, cast(int) bigBytes.length, bn);
+		ubyte[32] dst;
+		assertThrown(bnToFixed(bn, dst[]));
+	}();
 }
