@@ -531,9 +531,11 @@ private struct StdinLineReader
 	}
 
 	// Async, cooperative line read over stdin: return the next line (without its
-	// '\n', stripping a trailing '\r'); a 0-byte read (disconnected) is EOF -> the
-	// partial accumulator if any, else null. An over-long line (> maxLineBytes) is
-	// dropped and reading resumes after the next newline.
+	// '\n', stripping a trailing '\r'); a 0-byte read (disconnected) is EOF -> null.
+	// A partial, unterminated fragment accumulated before EOF is unrecoverable and
+	// is discarded (null is returned) rather than forwarded as a malformed line.
+	// An over-long line (> maxLineBytes) is dropped and reading resumes after the
+	// next newline.
 	string next() @safe
 	{
 		return nextWith(&refill);
@@ -553,13 +555,7 @@ private struct StdinLineReader
 			{
 				// Refill from the pipe.
 				if (!refillFn())
-				{
-					if (dropping)
-						return null; // EOF in the middle of an over-long, dropped line
-					return acc.length ? () @trusted {
-						return cast(string) acc.idup;
-					}() : null;
-				}
+					return null; // EOF — partial fragment is unrecoverable
 			}
 
 			// Scan the filled region for a newline.
@@ -694,10 +690,14 @@ unittest  // StdinLineReader reassembles a line split across two refills
 	assert(lines == ["hello", "world"], "a line spanning two refills is reassembled");
 }
 
-unittest  // StdinLineReader returns a final unterminated partial line at EOF
+unittest  // StdinLineReader discards a partial (unterminated) fragment at EOF and returns null
 {
+	// A newline-less fragment at EOF is unrecoverable: passing it to the line
+	// dispatcher would trigger a malformed-JSON parse error and a spurious
+	// null-id error-response write to the already-closed peer. null is returned
+	// to signal end-of-input cleanly.
 	auto lines = drainLineReader(64, [cast(ubyte[]) "noeol".dup]);
-	assert(lines == ["noeol"], "a trailing line without a newline is returned at EOF");
+	assert(lines == [], "a trailing line without a newline must be discarded at EOF");
 }
 
 unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with its O_NONBLOCK bit unchanged
