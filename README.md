@@ -152,26 +152,29 @@ out-of-band concern, not the SDK's.)
 > draft MRTR (more-requests-then-respond) input flow.
 
 **stdio note:** stdio is a single implicit connection for the life of the process
-(it assumes protocol `2025-11-25`), so server->client requests (`elicit`/`sample`/
-`roots`) work over stdio **in any mode** — the gating above applies only to the
-HTTP transport. A stateless server is therefore fully usable over stdio even for
-elicitation/sampling.
+(it negotiates protocol `2025-11-25` by default). Statefulness (`server.mode`),
+not the transport, governs server->client requests (`elicit`/`sample`/`roots`) and
+`logging/setLevel`: the same mode-based gating applies over stdio and HTTP alike.
+A stateless server has no `elicit`/`sample`/`roots` and no `logging/setLevel` on
+any transport; use `McpServer.stateful()` for those features, or MRTR on the modern
+protocol.
 
 ### The three effective modes
 
 | | Resolution of per-connection state | Notes |
 |---|---|---|
-| **Modern stateless** (stateless + request >= draft) | Per-request `_meta` (protocolVersion + clientCapabilities + logLevel) | No `initialize` (uses `server/discover`); input via MRTR; `subscriptions/listen` is supported (a self-contained stream); **no** blocking server->client elicitation/sampling over HTTP (see the feature-gating matrix) |
+| **Modern stateless** (stateless + request >= draft) | Per-request `_meta` (protocolVersion + clientCapabilities + logLevel) | No `initialize` (uses `server/discover`); input via MRTR; `subscriptions/listen` is supported (a self-contained stream); **no** blocking server->client elicitation/sampling on any transport (see the feature-gating matrix) |
 | **Legacy stateless** (stateless + request < draft) | `MCP-Protocol-Version` header (default `2025-03-26`; stdio assumes `2025-11-25`); client capabilities **unknown** (assumed none) | `initialize`/`notifications/initialized` are no-ops (no session id minted); a `tools/call` may be the first request with no prior `initialize`; correlation features are forbidden |
 | **Stateful** (opt-in, pre-draft only) | `ConnectionState` resolved by `Mcp-Session-Id`, created at `initialize` | The draft is **excluded** from negotiation (clamped down to `<= 2025-11-25`); `server/discover` is not served; DELETE terminates the session |
 
 ### Feature-gating matrix
 
 The gating is keyed on `server.mode`, not the protocol version, so the two
-stateless eras (modern-draft and legacy) forbid the same correlation features over
-HTTP — they differ only in how each request's `ConnectionState` is resolved.
+stateless eras (modern-draft and legacy) forbid the same correlation features
+regardless of transport — they differ only in how each request's `ConnectionState`
+is resolved.
 
-| Feature (over HTTP) | Modern stateless | Legacy stateless | Stateful |
+| Feature | Modern stateless | Legacy stateless | Stateful |
 |---|---|---|---|
 | `initialize` handshake | n/a (`server/discover`) | no-op (no session id) | mints `Mcp-Session-Id` |
 | Per-request `_meta` version/caps | yes | n/a (header + empty caps) | n/a (session-negotiated) |
@@ -179,15 +182,15 @@ HTTP — they differ only in how each request's `ConnectionState` is resolved.
 | `resources/subscribe` / `unsubscribe` | forbidden (-32601) | forbidden (-32601) | yes |
 | `subscriptions/listen` (draft) | yes (self-contained stream) | n/a (draft-only) | yes |
 | Server->client `elicit`/`sample`/`roots` | forbidden (error; MRTR instead) | forbidden (error) | yes |
-| `logging/setLevel` | n/a (per-request `_meta`) | per-request / n/a | yes (session-scoped) |
+| `logging/setLevel` | n/a (per-request `_meta`) | forbidden (-32601) | yes (session-scoped) |
 | Session id minted | never | never | yes |
 
 The `subscribe` capability advertisement follows the same rule: a stateless server
 does **not** advertise the resources `subscribe` capability even after
 `enableResourceSubscriptions()` (the opt-in is inert in stateless mode), so a
 client never expects per-resource update push it could not receive. The
-server->client (elicit/sample/roots) gating is bypassed on **stdio** (a single
-implicit connection — see the stdio note above).
+server->client (elicit/sample/roots) gating is transport-agnostic — stdio follows
+the same `server.mode` rules as HTTP.
 
 The Streamable HTTP transport derives session minting purely from
 `server.mode` (`ServerMode.stateful` => mint and require `Mcp-Session-Id`;
