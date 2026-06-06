@@ -681,9 +681,14 @@ final class ServerPushChannel
 	}
 
 	/// Number of currently-connected listeners.
-	size_t listenerCount() const @safe
+	size_t listenerCount() @safe
 	{
-		return listeners.length;
+		return () @trusted {
+			synchronized (mtx)
+			{
+				return listeners.length;
+			}
+		}();
 	}
 
 	/// The distinct, non-empty owner tokens of the currently-connected listeners.
@@ -729,9 +734,14 @@ final class ServerPushChannel
 	/// Number of stream ordinals currently retaining replay history. Exposed for
 	/// tests/diagnostics to verify the LRU bound; the value is at most
 	/// `maxHistoryStreams`.
-	size_t retainedHistoryStreams() const @safe
+	size_t retainedHistoryStreams() @safe
 	{
-		return history.length;
+		return () @trusted {
+			synchronized (mtx)
+			{
+				return history.length;
+			}
+		}();
 	}
 
 	/// Frame `msg` as an SSE event (with a per-stream globally-unique id) and
@@ -1752,6 +1762,28 @@ unittest  // a disconnect DURING the request write fails the awaiter, not after 
 	catch (McpException)
 		threw = true;
 	assert(threw, "a disconnect during the write must fail the awaiter, not strand it");
+}
+
+unittest  // listenerCount acquires mtx: must not be const
+{
+	// Acquiring a TaskMutex requires a mutable receiver; the method must not carry
+	// const so that it can lock mtx before reading the shared listeners array.
+	import std.algorithm : canFind;
+
+	static assert(!canFind([
+		__traits(getFunctionAttributes, ServerPushChannel.listenerCount)
+	], "const"), "listenerCount must not be const — it must lock mtx before reading listeners");
+}
+
+unittest  // retainedHistoryStreams acquires mtx: must not be const
+{
+	// Same reasoning as listenerCount: taking a TaskMutex is incompatible with const.
+	import std.algorithm : canFind;
+
+	static assert(!canFind([
+		__traits(getFunctionAttributes, ServerPushChannel.retainedHistoryStreams)
+	], "const"),
+		"retainedHistoryStreams must not be const — it must lock mtx before reading history");
 }
 
 /// The HTTP response headers a server sets when it upgrades a response to a
