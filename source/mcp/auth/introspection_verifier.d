@@ -205,7 +205,7 @@ private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
 	}, (scope HTTPClientResponse res) {
 		if (res.statusCode >= 200 && res.statusCode < 300)
 		{
-			responseBody = res.bodyReader.readAllUTF8();
+			responseBody = res.bodyReader.readAllUTF8(false, maxIntrospectionBodyBytes);
 			ok = true;
 		}
 		else
@@ -320,6 +320,12 @@ final class PositiveCache
 			entries.remove(oldest);
 	}
 }
+
+// Maximum bytes accepted from an introspection endpoint response body.
+// RFC 7662 responses are tiny JSON objects; this cap prevents a hostile or
+// misconfigured endpoint from exhausting heap memory by streaming an
+// arbitrarily large body.
+package enum size_t maxIntrospectionBodyBytes = 256 * 1024;
 
 // ===========================================================================
 // Small helpers
@@ -587,6 +593,28 @@ unittest  // introspectionExp parses integer and floating exp, 0 otherwise
 	assert(introspectionExp(parseJsonString(`{"active":true}`)) == 0);
 	assert(introspectionExp(parseJsonString(`{"exp":"soon"}`)) == 0);
 	assert(introspectionExp(parseJsonString(`"not-an-object"`)) == 0);
+}
+
+unittest  // postIntrospect body read is capped at maxIntrospectionBodyBytes
+{
+	// Verify that readAllUTF8 throws when given more data than the cap allows.
+	// This directly exercises the cap that postIntrospect must pass to readAllUTF8.
+	import std.exception : assertThrown;
+	import vibe.stream.memory : createMemoryStream;
+	import vibe.stream.operations : readAllUTF8;
+
+	// A stream of 1 byte more than the cap must be rejected.
+	ubyte[] bigData = new ubyte[](maxIntrospectionBodyBytes + 1);
+	auto stream = createMemoryStream(bigData);
+	assertThrown(readAllUTF8(stream, false, maxIntrospectionBodyBytes));
+
+	// A stream exactly at the cap must be accepted.
+	ubyte[] okData = cast(ubyte[]) new char[](maxIntrospectionBodyBytes);
+	foreach (ref b; okData)
+		b = 'a'; // ASCII so readAllUTF8's UTF-8 validation passes
+	auto okStream = createMemoryStream(okData);
+	assert(readAllUTF8(okStream, false, maxIntrospectionBodyBytes)
+			.length == maxIntrospectionBodyBytes);
 }
 
 unittest  // introspectionVerifier yields a usable TokenValidator
