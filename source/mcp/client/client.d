@@ -1,5 +1,6 @@
 module mcp.client.client;
 
+import core.time : Duration, seconds;
 import std.algorithm : canFind, startsWith;
 import std.typecons : Nullable, nullable;
 
@@ -298,11 +299,16 @@ final class McpClient : ClientProtocol
 		transport.setProtocol(this);
 	}
 
-	/// Build a client over the Streamable HTTP transport at `url`.
-	static McpClient http(string url,
-			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
+	/// Build a client over the Streamable HTTP transport at `url`. `connectTimeout`
+	/// bounds every raw TCP connect the transport makes, so a connect that cannot
+	/// complete (e.g. the local ephemeral-port range is exhausted) fails with a typed
+	/// error instead of hanging indefinitely.
+	static McpClient http(string url, Implementation clientInfo = Implementation(
+			"dlang-mcp-client", "0.1.0"), Duration connectTimeout = 30.seconds) @safe
 	{
-		return new McpClient(new HttpClientTransport(url), clientInfo);
+		auto transport = new HttpClientTransport(url);
+		transport.setConnectTimeout(connectTimeout);
+		return new McpClient(transport, clientInfo);
 	}
 
 	/// Build a client over the stdio transport, exchanging newline-delimited

@@ -1,5 +1,6 @@
 module mcp.client.http_transport;
 
+import core.time : Duration, seconds;
 import std.algorithm : canFind;
 import std.string : startsWith;
 
@@ -7,7 +8,7 @@ import vibe.data.json : Json, parseJsonString;
 import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 import vibe.http.common : HTTPMethod;
 import vibe.stream.operations : readAllUTF8, readLine;
-import vibe.core.net : TCPConnection;
+import vibe.core.net : TCPConnection, connectTCP;
 import vibe.stream.tls : createTLSContext, createTLSStream, TLSContextKind, TLSPeerValidationMode;
 import vibe.stream.wrapper : ProxyStream, createProxyStream;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
@@ -190,6 +191,11 @@ final class HttpClientTransport : ClientTransport
 	// every wake and honors a bounded deadline.
 	private LocalManualEvent legacyEvent;
 	private bool legacyEventInit;
+	// Upper bound on each raw `connectTCP`. A connect that cannot complete within
+	// this window (e.g. the local ephemeral-port range is exhausted, so the kernel
+	// cannot allocate a source port) fails with a typed error instead of parking
+	// the calling fiber forever. Configurable via `setConnectTimeout`.
+	private Duration connectTimeout = 30.seconds;
 
 	/// Inbound dispatcher installed by `McpClient` (its `dispatchInbound`),
 	/// invoked for notifications and server->client requests on any stream.
@@ -230,6 +236,14 @@ final class HttpClientTransport : ClientTransport
 	void setDraftProtocol(bool isDraft) @safe
 	{
 		draftProtocol = isDraft;
+	}
+
+	/// Bound each raw `connectTCP` by `timeout`. A connect that cannot complete in
+	/// time fails with a typed `McpException` rather than parking indefinitely,
+	/// so ephemeral-port exhaustion surfaces as an error the caller can handle.
+	void setConnectTimeout(Duration timeout) @safe
+	{
+		connectTimeout = timeout;
 	}
 
 	/// Stop the transport: signal the background stream readers
@@ -424,6 +438,28 @@ final class HttpClientTransport : ClientTransport
 		throw internalError("No response received for request " ~ idStr(expectId));
 	}
 
+	/// Open a raw TCP connection to `host:port`, bounding the attempt by
+	/// `connectTimeout`. vibe's `connectTCP` reports an expired timeout by throwing
+	/// with a `": timeout"` message; translate that into a typed, descriptive
+	/// `McpException` so an exhausted local ephemeral-port range surfaces as a clear
+	/// error instead of parking the calling fiber forever. Any other connect failure
+	/// (e.g. connection refused) is rethrown unchanged for the caller's own handling.
+	private TCPConnection connectTimed(string host, ushort port) @trusted
+	{
+		import std.algorithm : canFind;
+		import std.conv : to;
+
+		try
+			return connectTCP(host, port, null, 0, connectTimeout);
+		catch (Exception e)
+		{
+			if (e.msg.canFind("timeout"))
+				throw internalError("connect to " ~ host ~ ":" ~ port.to!string ~ " timed out after "
+						~ connectTimeout.toString ~ " — local ephemeral ports may be exhausted");
+			throw e;
+		}
+	}
+
 	/// POST `message` over a fresh TCP connection and read the response, awaiting
 	/// the JSON-RPC response with id `expectId`. The response is either a single
 	/// JSON body or a `text/event-stream`; for an SSE response, notifications and
@@ -435,7 +471,6 @@ final class HttpClientTransport : ClientTransport
 	private void postAndAwaitRaw(Json message, long expectId, ref SseCursor cursor,
 			ref Json result, ref bool got, ref McpException err) @safe
 	{
-		import vibe.core.net : connectTCP;
 		import vibe.stream.operations : readLine;
 		import std.string : indexOf, startsWith, strip, toLower;
 		import std.conv : to;
@@ -463,7 +498,7 @@ final class HttpClientTransport : ClientTransport
 		() @trusted {
 			try
 			{
-				auto sock = connectTCP(pinnedHost, ep.port);
+				auto sock = connectTimed(pinnedHost, ep.port);
 				// `attach` closes `sock` immediately if a `close()` already ran during
 				// the `connectTCP` yield, so the socket is never leaked or left parked.
 				slot.attach(sock);
@@ -654,8 +689,6 @@ final class HttpClientTransport : ClientTransport
 	private void resumeViaGet(long expectId, string lastEventId, ref Json result,
 			ref bool got, ref McpException err) @safe
 	{
-		import vibe.core.net : connectTCP;
-
 		const ep = parseHttpEndpoint(url);
 		// Resolve + pin the user-configured endpoint host to a numeric address.
 		const pinnedHost = pinnedEndpointHost(ep);
@@ -680,7 +713,7 @@ final class HttpClientTransport : ClientTransport
 		() @trusted {
 			try
 			{
-				auto sock = connectTCP(pinnedHost, ep.port);
+				auto sock = connectTimed(pinnedHost, ep.port);
 				// `attach` closes `sock` immediately if a `close()` already ran during
 				// the `connectTCP` yield, so the socket is never leaked or left parked.
 				slot.attach(sock);
@@ -1035,7 +1068,6 @@ final class HttpClientTransport : ClientTransport
 	/// `Last-Event-ID` on reconnect, up to a few attempts.
 	private void runServerStream() @safe
 	{
-		import vibe.core.net : connectTCP;
 		import core.time : msecs;
 		import vibe.core.core : sleep;
 
@@ -1077,7 +1109,7 @@ final class HttpClientTransport : ClientTransport
 			() @trusted {
 				try
 				{
-					auto sock = connectTCP(pinnedHost, ep.port);
+					auto sock = connectTimed(pinnedHost, ep.port);
 					// `attach` closes `sock` immediately if a `close()` already ran during
 					// the `connectTCP` yield, so the socket is never leaked or left parked.
 					slot.attach(sock);
@@ -1159,8 +1191,6 @@ final class HttpClientTransport : ClientTransport
 	/// idle-then-active SSE body is not reliably surfaced by the pooled client.
 	private void runListenStream(Json message, shared(bool)* cancelled, ListenSocketSlot slot) @safe
 	{
-		import vibe.core.net : connectTCP;
-
 		const ep = parseHttpEndpoint(url);
 		// Resolve + pin the user-configured endpoint host to a numeric address.
 		const pinnedHost = pinnedEndpointHost(ep);
@@ -1175,7 +1205,7 @@ final class HttpClientTransport : ClientTransport
 		() @trusted {
 			if (*cancelled)
 				return;
-			auto sock = connectTCP(pinnedHost, ep.port);
+			auto sock = connectTimed(pinnedHost, ep.port);
 			slot.attach(sock);
 			scope (exit)
 				slot.closeSocket();
@@ -1312,7 +1342,6 @@ final class HttpClientTransport : ClientTransport
 	/// response slot or to the inbound dispatcher.
 	private void runLegacyStream() @safe
 	{
-		import vibe.core.net : connectTCP;
 		import std.string : strip;
 
 		const ep = parseHttpEndpoint(url);
@@ -1328,7 +1357,7 @@ final class HttpClientTransport : ClientTransport
 			{
 				if (closing)
 					return;
-				auto sock = connectTCP(pinnedHost, ep.port);
+				auto sock = connectTimed(pinnedHost, ep.port);
 				// `connectTCP` yielded; a `close()` during that yield saw the socket as
 				// not-yet-open and did nothing. Re-check here, in the same fiber with no
 				// intervening yield, so the freshly connected socket is not leaked.
@@ -2428,4 +2457,49 @@ unittest  // readSseBody handles a partial IOMode.once read without appending ze
 	assert(events == ["hello"],
 			"partial IOMode.once read must not corrupt the SSE accumulator with zero bytes; got: "
 			~ events.to!string);
+}
+
+unittest  // a bounded connect timeout surfaces ephemeral-port exhaustion as a typed McpException instead of hanging
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import core.time : msecs, seconds, MonoTime, Duration;
+
+	// RFC 5737 TEST-NET-1 is a black hole: a connect to it never completes. It is a
+	// literal IP, so the SSRF guard's user-configured policy permits it. With a short
+	// connect timeout the deliver must fail loud (typed McpException) within roughly
+	// the timeout window rather than parking the calling fiber forever.
+	auto t = new HttpClientTransport("http://192.0.2.1:80/mcp");
+	t.setConnectTimeout(200.msecs);
+
+	Json req = Json.emptyObject;
+	req["jsonrpc"] = "2.0";
+	req["id"] = 1;
+	req["method"] = "ping";
+
+	bool threw;
+	bool typed;
+	Duration elapsed;
+
+	void delegate() @safe nothrow body_ = () @safe nothrow{
+		const start = MonoTime.currTime;
+		try
+			t.deliver(req, 1);
+		catch (McpException)
+		{
+			threw = true;
+			typed = true;
+		}
+		catch (Exception)
+			threw = true;
+		elapsed = MonoTime.currTime - start;
+		exitEventLoop();
+	};
+
+	runTask(body_);
+	runEventLoop();
+
+	assert(threw, "connect to a black-hole address did not throw");
+	assert(typed, "connect timeout was not surfaced as a typed McpException");
+	assert(elapsed < 10.seconds,
+			"connect did not honor the bounded timeout; elapsed: " ~ elapsed.toString);
 }
