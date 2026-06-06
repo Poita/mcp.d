@@ -239,7 +239,7 @@ final class StdioClientTransport : ClientTransport
 			() @trusted { p.process.kill(SIGTERM); }();
 			status = () @trusted { return p.process.wait(killGrace); }();
 			if (!status.isNull)
-				return -SIGTERM;
+				return status.get;
 
 			// Step 3: still alive -> force kill (SIGKILL) and reap.
 			() @trusted { p.process.kill(SIGKILL); }();
@@ -413,6 +413,26 @@ version (Posix) unittest  // close() escalates to SIGTERM when the child ignores
 		auto status = transport.closeProcess(200.msecs, 2.seconds);
 		assert(sw.peek < 5.seconds);
 		assert(status == -SIGTERM);
+	});
+}
+
+version (Posix) unittest  // close() returns real exit code (0) when child handles SIGTERM gracefully
+{
+	import core.time : seconds, msecs;
+
+	inLoop(() @safe {
+		// This child ignores stdin EOF but catches SIGTERM and exits 0, simulating
+		// a graceful shutdown handler. The spin loop keeps the shell alive and in
+		// signal-dispatch mode so the TERM trap fires reliably. closeProcess must
+		// return 0 (the real exit code from the trap's exit(0)), not -SIGTERM,
+		// because eventcore already encodes truly signal-killed processes as negative
+		// codes; returning -SIGTERM here discards the actual clean exit status.
+		auto transport = spawnStdioTransport([
+			"sh", "-c", "trap 'exit 0' TERM; while :; do sleep 0.1; done"
+		]);
+		auto status = transport.closeProcess(200.msecs, 2.seconds);
+		assert(status == 0,
+			"graceful SIGTERM handler that calls exit(0) must report status 0, not -SIGTERM");
 	});
 }
 
