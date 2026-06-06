@@ -301,6 +301,17 @@ final class HttpClientTransport : ClientTransport
 		return protocol is null ? null : protocol.headersFor(message);
 	}
 
+	/// Whether the owning client has registered any server->client handler
+	/// (sampling / elicitation / roots). When true a tool call may make the server
+	/// open a server->client request on the POST's response stream and block
+	/// awaiting a reply on a separate POST, so the request/response exchange needs
+	/// the dedicated raw socket; when false (or no protocol installed) it can ride
+	/// a pooled keep-alive connection. See `postAndAwait`.
+	private bool expectsServerRequests() @safe
+	{
+		return protocol !is null && protocol.expectsServerRequests();
+	}
+
 	Json deliver(Json message, long expectId) @safe
 	{
 		if (sessionExpired)
@@ -382,19 +393,28 @@ final class HttpClientTransport : ClientTransport
 		// decide resumption.
 		SseCursor cursor;
 
-		// The modern single-endpoint POST is sent over a DEDICATED, raw TCP
-		// connection (`postAndAwaitRaw`) rather than vibe's pooled `requestHTTP`.
-		// When a tool handler on the server opens a server->client request
-		// (sampling / elicitation / roots) it writes that request as an SSE event
-		// on THIS POST's response stream and then blocks awaiting our reply. The
-		// reply must be sent on a SEPARATE POST while we are still reading this
-		// stream. vibe's pooled chunked HTTP-client reader does not surface a
-		// freshly-flushed SSE event's terminating blank line until the next chunk
-		// arrives, which would deadlock both peers. A raw connection (the same
-		// approach `runServerStream`/`resumeViaGet` use for long-lived SSE)
-		// delivers each event immediately, so the client can reply and the
-		// round-trip completes.
-		postAndAwaitRaw(message, expectId, cursor, result, got, err);
+		// When the client has registered a server->client handler the modern
+		// single-endpoint POST is sent over a DEDICATED, raw TCP connection
+		// (`postAndAwaitRaw`) rather than vibe's pooled `requestHTTP`. A tool
+		// handler on the server may open a server->client request (sampling /
+		// elicitation / roots), writing it as an SSE event on THIS POST's response
+		// stream and then blocking awaiting our reply, which must be sent on a
+		// SEPARATE POST while we are still reading this stream. vibe's pooled chunked
+		// HTTP-client reader does not surface a freshly-flushed SSE event's
+		// terminating blank line until the next chunk arrives, which would deadlock
+		// both peers. A raw connection (the same approach `runServerStream` /
+		// `resumeViaGet` use for long-lived SSE) delivers each event immediately, so
+		// the client can reply and the round-trip completes.
+		//
+		// When NO such handler is registered the server can never owe us a
+		// mid-stream reply, so the exchange rides a pooled keep-alive connection
+		// (`postAndAwaitPooled`) that is reused across calls instead of being torn
+		// down per request — eliminating the per-call connect/teardown that
+		// otherwise dominates the round-trip and exhausts ephemeral ports.
+		if (expectsServerRequests())
+			postAndAwaitRaw(message, expectId, cursor, result, got, err);
+		else
+			postAndAwaitPooled(message, expectId, cursor, result, got, err);
 
 		// An HTTP 400/404/405 on the modern single endpoint is the signal to try
 		// the legacy HTTP+SSE (2024-11-05) transport. Surface it as a typed
@@ -534,6 +554,86 @@ final class HttpClientTransport : ClientTransport
 					err = internalError(e.msg);
 			}
 		}();
+	}
+
+	/// POST `message` over a POOLED keep-alive connection (vibe's `requestHTTP`
+	/// via `secureRequestHTTP`) and read the response, awaiting the JSON-RPC
+	/// response with id `expectId`. Used only when the client has registered no
+	/// server->client handler (`expectsServerRequests` is false): the server then
+	/// can never open a sampling / elicitation / roots request that must be
+	/// answered on a separate POST mid-stream, so the connection is safe to reuse
+	/// across calls rather than torn down per request. The response is either a
+	/// single JSON body or a `text/event-stream` whose events are decoded and
+	/// dispatched as they arrive (the server closes the stream once it has emitted
+	/// the final response); interleaved notifications reach the inbound handler
+	/// incrementally, and an SSE `id:` / `retry:` hint is recorded in `cursor` so
+	/// `postAndAwait`'s premature-close resumption still applies.
+	private void postAndAwaitPooled(Json message, long expectId,
+			ref SseCursor cursor, ref Json result, ref bool got, ref McpException err) @safe
+	{
+		import mcp.auth.ssrf : secureRequestHTTP, SsrfPolicy;
+		import std.string : indexOf, toLower;
+		import vibe.stream.operations : readAllUTF8;
+
+		Json localResult = Json.undefined;
+		bool localGot;
+		McpException localErr;
+		SseCursor localCursor;
+		int status;
+
+		secureRequestHTTP(url, SsrfPolicy.allowUserConfigured, (scope HTTPClientRequest req) {
+			setupRequest(req, message);
+		}, (scope HTTPClientResponse res) {
+			captureSession(res);
+			status = res.statusCode;
+			const ctype = ("Content-Type" in res.headers) ? res.headers["Content-Type"].toLower : "";
+			const sse = ctype.indexOf("text/event-stream") >= 0;
+
+			// A 400/404/405 is the legacy-fallback signal: surface a recognised
+			// modern JSON-RPC error if the (small) body carries one.
+			if (isLegacyFallbackStatus(status))
+			{
+				const b = () @trusted { return res.bodyReader.readAllUTF8(); }();
+				McpException modernErr;
+				if (modernErrorFromBody(b, modernErr))
+					localErr = modernErr;
+				return;
+			}
+
+			if (!sse)
+			{
+				// A single JSON body (the common non-streaming response).
+				const b = () @trusted { return res.bodyReader.readAllUTF8(); }();
+				auto m = parseMessage(b);
+				if (m.kind == MessageKind.errorResponse)
+					localErr = errorFrom(m.error);
+				else
+				{
+					localResult = m.result;
+					localGot = true;
+				}
+				return;
+			}
+
+			// SSE body: decode the pooled response stream, dispatching each COMPLETE
+			// event as it arrives so interleaved progress / log notifications reach
+			// the inbound handler incrementally — the per-call cancellation that
+			// tears the stream down mid-flight depends on this. vibe's pooled reader
+			// already de-chunks the body, so it is read as a plain stream to EOF. No
+			// mid-stream reply is ever owed here (no server->client handler).
+			() @trusted {
+				readSseBody(res.bodyReader, false, localCursor, () @safe => localGot
+					|| localErr !is null || closing, (string eventType, string data) @safe {
+					dispatchSse(data, expectId, localResult, localGot, localErr);
+				});
+			}();
+		});
+
+		lastPostStatus = status;
+		cursor = localCursor;
+		result = localResult;
+		got = localGot;
+		err = localErr;
 	}
 
 	/// Parse the numeric status code out of an HTTP status line

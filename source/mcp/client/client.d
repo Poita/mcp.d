@@ -1831,6 +1831,16 @@ final class McpClient : ClientProtocol
 		return true;
 	}
 
+	/// `ClientProtocol.expectsServerRequests`: true once any server->client
+	/// handler is installed (`onSampling` / `onElicitation` / `onListRoots`). The
+	/// HTTP transport consults this to decide whether a tool call may have to
+	/// answer a server->client request mid-stream — in which case it keeps the
+	/// exchange on a dedicated connection — or may reuse a pooled keep-alive one.
+	bool expectsServerRequests() @safe
+	{
+		return onSampling !is null || onElicitation !is null || onListRoots !is null;
+	}
+
 	/// Test seam: set the id `cancel()` treats as the (uncancellable) initialize
 	/// request, without driving the live `initialize` handshake.
 	version (unittest) package void setInitializeRequestIdForTest(long id) @safe nothrow @nogc

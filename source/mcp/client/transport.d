@@ -28,6 +28,14 @@ interface ClientProtocol
 	/// client has cancelled (basic/utilities/cancellation): such a response is
 	/// dropped rather than returned.
 	bool isCancelled(long id) @safe;
+
+	/// Whether the client has registered any server->client handler (sampling /
+	/// elicitation / roots). When true a tool call may make the server open a
+	/// server->client request on this POST's response stream and block awaiting a
+	/// reply on a separate POST, so the transport must keep that request/response
+	/// exchange on a dedicated connection. When false no such reply is ever owed,
+	/// so the transport may carry the exchange over a pooled keep-alive connection.
+	bool expectsServerRequests() @safe;
 }
 
 /// The transport seam under `McpClient`. The client speaks pure JSON-RPC and
