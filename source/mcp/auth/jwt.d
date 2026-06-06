@@ -14,6 +14,70 @@ import vibe.data.json : Json;
 
 @safe:
 
+/// Sign `data` with RSASSA-PKCS1-v1_5 / SHA-256 (the JWS RS256 algorithm) using
+/// the given PKCS#8 RSA private key (PEM), returning the raw DER signature bytes.
+/// Unlike ES256, the RS256 signature is already in the wire format that JWS
+/// requires (RFC 7518 §3.3): the raw octets of the PKCS#1 v1.5 signature.
+ubyte[] signRs256(string privateKeyPem, const(ubyte)[] data) @trusted
+{
+	auto bio = BIO_new_mem_buf(cast(void*) privateKeyPem.ptr, cast(int) privateKeyPem.length);
+	if (bio is null)
+		throw new Exception("openssl: BIO_new_mem_buf failed");
+	scope (exit)
+		BIO_free(bio);
+
+	auto pkey = PEM_read_bio_PrivateKey(bio, null, null, null);
+	if (pkey is null)
+		throw new Exception("openssl: failed to parse RSA private key");
+	scope (exit)
+		EVP_PKEY_free(pkey);
+
+	auto ctx = EVP_MD_CTX_new();
+	if (ctx is null)
+		throw new Exception("openssl: EVP_MD_CTX_new failed");
+	scope (exit)
+		EVP_MD_CTX_free(ctx);
+
+	if (EVP_DigestSignInit(ctx, null, EVP_sha256(), null, pkey) != 1)
+		throw new Exception("openssl: EVP_DigestSignInit failed");
+
+	size_t sigLen;
+	if (EVP_DigestSign(ctx, null, &sigLen, data.ptr, data.length) != 1)
+		throw new Exception("openssl: EVP_DigestSign (size) failed");
+	auto sig = new ubyte[sigLen];
+	if (EVP_DigestSign(ctx, sig.ptr, &sigLen, data.ptr, data.length) != 1)
+		throw new Exception("openssl: EVP_DigestSign failed");
+	// sigLen may be shorter than the allocated buffer after the real sign call.
+	return sig[0 .. sigLen].dup;
+}
+
+/// Detect the JWS algorithm to use for the given PKCS#8 private key PEM.
+/// Returns "RS256" for RSA keys and "ES256" for EC keys. Throws for unsupported
+/// key types. This drives the algorithm selection in makeClientAssertion so that
+/// callers do not have to specify the algorithm separately.
+private string detectKeyAlg(string privateKeyPem) @trusted
+{
+	auto bio = BIO_new_mem_buf(cast(void*) privateKeyPem.ptr, cast(int) privateKeyPem.length);
+	if (bio is null)
+		throw new Exception("openssl: BIO_new_mem_buf failed");
+	scope (exit)
+		BIO_free(bio);
+
+	auto pkey = PEM_read_bio_PrivateKey(bio, null, null, null);
+	if (pkey is null)
+		throw new Exception("openssl: failed to parse private key");
+	scope (exit)
+		EVP_PKEY_free(pkey);
+
+	const baseId = EVP_PKEY_base_id(pkey);
+	if (baseId == EVP_PKEY_RSA)
+		return "RS256";
+	if (baseId == EVP_PKEY_EC)
+		return "ES256";
+	throw new Exception(
+			"makeClientAssertion: unsupported key type; only RSA and EC keys are supported");
+}
+
 /// Sign `data` with ECDSA P-256 / SHA-256 (the JWS ES256 algorithm) using the
 /// given PKCS#8 EC private key (PEM), returning the raw 64-byte R||S signature.
 ubyte[] signEs256(string privateKeyPem, const(ubyte)[] data) @trusted
@@ -129,11 +193,19 @@ string makeClientAssertion(string clientId, string audience, string privateKeyPe
 	payloadJson["iat"] = now;
 	payloadJson["exp"] = now + lifetimeSeconds;
 
-	const header = `{"alg":"ES256","typ":"JWT"}`;
+	// Detect the algorithm from the key type so that RS256 is used for RSA keys
+	// and ES256 for EC keys. The algorithm is embedded in the JWS header so the
+	// authorization server can verify without guessing.
+	const alg = detectKeyAlg(privateKeyPem);
+	const header = `{"alg":"` ~ alg ~ `","typ":"JWT"}`;
 	const payload = payloadJson.toString();
 	const signingInput = base64UrlNoPad(cast(const(ubyte)[]) header) ~ "."
 		~ base64UrlNoPad(cast(const(ubyte)[]) payload);
-	auto sig = signEs256(privateKeyPem, cast(const(ubyte)[]) signingInput);
+	ubyte[] sig;
+	if (alg == "RS256")
+		sig = signRs256(privateKeyPem, cast(const(ubyte)[]) signingInput);
+	else
+		sig = signEs256(privateKeyPem, cast(const(ubyte)[]) signingInput);
 	return signingInput ~ "." ~ base64UrlNoPad(sig);
 }
 
@@ -462,4 +534,31 @@ unittest  // bnToFixed throws when the BIGNUM is wider than dst rather than sile
 		ubyte[32] dst;
 		assertThrown(bnToFixed(bn, dst[]));
 	}();
+}
+
+// A throwaway RSA-2048 PKCS#8 private key (no padding) for testing RS256.
+version (unittest) private enum testRsaPrivPem = "-----BEGIN PRIVATE KEY-----\n" ~ "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCwzhkfVSlO+GrO\n" ~ "gSR+Nf2X8AzL6nnR4rF029xEdzQUpTqdn9Q1ixjRbndoTFm617eK3KBzyAIw2WmL\n" ~ "MWfMABbO5dRg9M8cfgUSNJsWFE/BC+8gzoyoh4DKpUeYQNN4n6q+QzkTn5rqeVhS\n" ~ "UF6rGL4Fr9wlA0aq0ZcO5lKNqMRMwolgCYiDb5KKkABTIl7gbdAF/9l8g7z/O84y\n" ~ "gAwEK697kz0/p5l9kOjhtPvmghSJ9I36HDrO3eeY3Xm2Tp9Tgq2fhmjDnoFU4xGM\n" ~ "miNKCicsgZ2lZ09LgpwOby9+GPDV24Pelke/JZtdW4CeaHykwcamagaFUYXZDTr+\n" ~ "gJVRGegZAgMBAAECggEAEY1wcIwhlPm0DsrC3vXIto4KEy90xxm4kNen6zMjXD5Y\n" ~ "DqB4rpUf0mDjYVsdGF/ElLhZBI2RbByVbhBqU9YZbZJjDnoXWqaHJdrLn7pF/a4L\n" ~ "4CepTqzfJB8a97pN1D6Tsp5VWwWgGVGRK2DXuSg0azedhR4pZJl4o+3JOc+Mp2sJ\n" ~ "GrlK6Uz7tdNrlDD/2TYI/+IIcDWV5PoKi7zk5Pv+sClPH2hrT8N1yGGTFlRulvOH\n" ~ "jW/sECPIFmpcNaLF4G+4jOj6EjqEEFrRVljwJzOfdIK9DleHu6Ebx1TRMy1dtCe7\n" ~ "Z0f7u2ROF1EX0/t4R5jHt+44bsXONxpYiO6/GPc2AQKBgQDzuxoQdW+db55x9GBv\n" ~ "ROF3z8ixX2bLEuei8pbXE1olNLGkLfnRq5h92i3tT6khx3wOpH8buKSurD5I0Dm9\n" ~ "jRvzNm/KZjAfWtsBdcY8R8OalTcDX7cE4oV5ac4raMoOvyPYhC3ZXCvVZHP5FoJT\n" ~ "CJlsdtTXlBeJ/EfxDC5XIT7BAQKBgQC5tIpcsfZHF37ftJRj96nivsRmJOwmorQi\n" ~ "hfroW2JANdMT3yVlXgtIday2jflX+9z1nLbiPA0+TptyueBLYiRPsmZxssLWw1WU\n" ~ "CrzJP1S3ur696tBYc1zotRJ4nmjOurKcaSNO536Cp6zyOf2VTzFmRFIm08klx7e9\n" ~ "AVm6OqoPGQKBgDGVzg6tJaD89VovonLgq5IpdqYHR61m0jNHcUKeUEejecRyChIK\n" ~ "/AIWoiNWgo05vVZpRubH4NEcf6tmmWijzZzkZUfjFEU8wbOBV2wqGXRYiRGppl1b\n" ~ "DFaQHP6d2gW4Az3oXj+LTeui/Ske2DK2XChB4LlfCo7rAWPb242kWNUBAoGADZ+5\n" ~ "JuPHdZ+7px3QZSUeSYxFTFkZGhyFqqK5raJGqv9H5QVR8QXdPgukCCCSUmof48UD\n" ~ "hcVyE0ghD2GjmuQwVch4y46ZzLe354yCHSGQTYpdxAEeF98eydO+7ypv9fqsb90m\n" ~ "wfspxNwYTA0FFZchwKbyf/a5oxPr3unic08qesECgYBs+cKp0TkGjbW5GWRBkWce\n" ~ "F872rRi1roMzzvB9uYpGw/PvpZUSmuiMBAVfw3fffcogCpkKHA3VF2qhNtmt5Mqk\n" ~ "+OOcVWKeFIiYLVqm5JklHWTNXuphiz7EfMyueuC0xQ6SmTo+W07luShqD9T9oh4o\n" ~ "fUoeRLrXlmTTxxM+OAsQQA==\n" ~ "-----END PRIVATE KEY-----\n";
+
+unittest  // makeClientAssertion emits RS256 when given an RSA private key
+{
+	import std.array : split;
+	import std.base64 : Base64URLNoPadding;
+	import vibe.data.json : parseJsonString;
+
+	// An RSA private key must produce an RS256 JWT, not ES256.
+	auto jwt = makeClientAssertion("client-rsa",
+			"https://as.example.com/token", testRsaPrivPem, 1_700_000_000);
+	auto parts = jwt.split('.');
+	assert(parts.length == 3);
+
+	// Header must declare RS256.
+	auto headerStr = () @trusted {
+		return (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
+	}();
+	auto h = parseJsonString(headerStr);
+	assert(h["alg"].get!string == "RS256", "RSA key must produce RS256, not ES256");
+
+	// RSA-2048 signature is 256 bytes.
+	auto sig = Base64URLNoPadding.decode(parts[2]);
+	assert(sig.length == 256, "RS256 signature must be 256 bytes for RSA-2048");
 }
