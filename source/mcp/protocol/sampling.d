@@ -387,14 +387,20 @@ void validateSamplingMessages(Json params) @safe
 		// tool_result blocks, each tool_use id matched by a toolUseId.
 		if (role == "assistant")
 		{
-			string[] toolUseIds;
+			// Use a set rather than an array so that a duplicate tool_use id is
+			// detected immediately: the spec requires each id to be unique and
+			// each to be matched by exactly one tool_result.
+			bool[string] toolUseIds;
 			foreach (b; blocks)
 			{
 				if (blockType(b) != "tool_use")
 					continue;
 				if (b.type != Json.Type.object || "id" !in b || b["id"].type != Json.Type.string)
 					throw invalidParams("Tool use block missing required string id");
-				toolUseIds ~= b["id"].get!string;
+				const id = b["id"].get!string;
+				if (id in toolUseIds)
+					throw invalidParams("Duplicate tool_use id");
+				toolUseIds[id] = true;
 			}
 			if (toolUseIds.length == 0)
 				continue;
@@ -418,7 +424,7 @@ void validateSamplingMessages(Json params) @safe
 					throw invalidParams("Tool result block missing required string toolUseId");
 				resultIds[b["toolUseId"].get!string] = true;
 			}
-			foreach (id; toolUseIds)
+			foreach (id; toolUseIds.byKey)
 				if (id !in resultIds)
 					throw invalidParams("Tool result missing in request");
 		}
@@ -1229,4 +1235,24 @@ unittest  // tool_result blocks missing "toolUseId" are rejected immediately
 		assert(e.msg == "Tool result block missing required string toolUseId");
 	}
 	assert(threw);
+}
+
+unittest  // duplicate tool_use ids with one matching tool_result are rejected
+{
+	// Two tool_use blocks sharing the same id "call_1" with only one tool_result
+	// for "call_1": the balance check must detect the structural imbalance (2
+	// tool_use, 1 tool_result) and reject it rather than accepting because the
+	// single result's id passes membership for both duplicate entries.
+	auto p = samplingParams(msg("assistant", toolUse("call_1", "get_weather"),
+			toolUse("call_1", "get_weather")), msg("user", toolResult("call_1")));
+
+	bool threw;
+	try
+		validateSamplingMessages(p);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.invalidParams);
+	}
+	assert(threw, "duplicate tool_use ids must be rejected");
 }
