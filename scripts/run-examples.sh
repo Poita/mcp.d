@@ -70,7 +70,15 @@ for d in examples/*/; do
     clientflag="--http"
   fi
   srvpid=$!
-  sleep 4
+  # Poll until the server is ready (up to 30 s) instead of sleeping a fixed
+  # amount, which is a CI-flake source on slow or loaded runners.
+  for i in $(seq 1 30); do
+    if curl -sf -o /dev/null "$url" \
+        -H 'Accept: application/json, text/event-stream' \
+        -H 'Content-Type: application/json' \
+        -X POST -d '{}'; then break; fi
+    sleep 1
+  done
   if ! ( cd "$d" && dub run -c client --quiet -- "$clientflag" "$url" ); then
     echo "E2E FAILED (http): ${n}"; echo "--- server log ---"; tail -20 "/tmp/ex-${n}-srv.log"; fail=1
   fi
