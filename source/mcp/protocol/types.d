@@ -4595,7 +4595,7 @@ struct CompleteResult
 		CompleteResult r;
 		r.total = matches.length;
 		r.hasMore = matches.length > maxValues;
-		r.values = matches;
+		r.values = matches.length > maxValues ? matches[0 .. maxValues] : matches;
 		return r;
 	}
 
@@ -4688,6 +4688,20 @@ unittest  // CompleteResult.prefixMatch ignores case in both prefix and candidat
 	immutable names = ["Python", "Perl"];
 	auto r = CompleteResult.prefixMatch(names, "pe");
 	assert(r.values == ["Perl"]);
+}
+
+unittest  // CompleteResult.prefixMatch caps r.values at 100 when matches exceed the spec limit
+{
+	import std.conv : to;
+
+	string[] candidates;
+	foreach (i; 0 .. 150)
+		candidates ~= "item" ~ i.to!string;
+	auto r = CompleteResult.prefixMatch(candidates, "item");
+	assert(r.values.length <= CompleteResult.maxValues,
+			"r.values must not exceed the spec's 100-item cap");
+	assert(!r.total.isNull && r.total.get == 150);
+	assert(r.hasMore);
 }
 
 /// A typed `notifications/resources/updated` payload, per
