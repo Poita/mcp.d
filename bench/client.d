@@ -36,8 +36,8 @@ void main(string[] args) @safe
 	(() @trusted {
 		getopt(args, "url|u", "Server endpoint URL.", &url, "calls|n",
 			"Total timed tool calls.", &calls, "concurrency|c",
-			"Parallel client connections.", &concurrency, "warmup|w",
-			"Warmup calls per client.", &warmup);
+			"Parallel client connections.",
+			&concurrency, "warmup|w", "Warmup calls per client.", &warmup);
 	})();
 
 	if (concurrency < 1)
@@ -94,8 +94,10 @@ private void runBench(string url, long calls, int concurrency, long warmup) @tru
 				auto c = clients[k];
 				tasks[k] = runTask(() nothrow{
 					try
+					{
 						foreach (j; 0 .. perWorker)
 							oneCall(c, j);
+					}
 					catch (Exception e)
 						assert(false, e.msg);
 				});
