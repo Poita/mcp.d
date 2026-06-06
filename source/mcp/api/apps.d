@@ -3,6 +3,9 @@ module mcp.api.apps;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
+import mcp.server.server : McpServer;
+import mcp.protocol.types : Tool, Resource, ResourceContents;
+
 @safe:
 
 /// The MCP Apps extension identifier (the key under `capabilities.extensions`
@@ -186,6 +189,80 @@ struct UiResourceMeta
 	}
 }
 
+/// Attach a UI link to a tool's `_meta` under the `ui` key, preserving any
+/// other `_meta` entries already present. Use this on a `Tool` descriptor built
+/// for `McpServer.registerDynamicTool`; the `@ui` UDA does the same for the
+/// FastMCP-style `@tool` API.
+void setUiToolMeta(ref Tool tool, UiToolMeta ui) @safe
+{
+	Json m = (tool.meta.type == Json.Type.object) ? tool.meta : Json.emptyObject;
+	m["ui"] = ui.toJson();
+	tool.meta = m;
+}
+
+/// Advertise MCP Apps support in the server's extension capabilities. The
+/// extension is carried in the `extensions` negotiation map (emitted to draft
+/// clients), declaring the content types this server's UI resources use.
+/// `mimeTypes` defaults to `[mcpAppMimeType]`.
+void advertiseMcpApps(McpServer server, string[] mimeTypes = null) @safe
+{
+	Json arr = Json.emptyArray;
+	if (mimeTypes.length == 0)
+		arr ~= Json(mcpAppMimeType);
+	else
+		foreach (m; mimeTypes)
+			arr ~= Json(m);
+	Json settings = Json.emptyObject;
+	settings["mimeTypes"] = arr;
+	server.advertiseExtension(mcpAppsExtensionKey, settings);
+}
+
+/// Whether the connected client advertised the MCP Apps extension at
+/// initialization (valid after `initialize` / `server/discover`). A tool handler
+/// can branch on this to decide whether to return a UI-linked result.
+bool clientSupportsMcpApps(McpServer server) @safe
+{
+	auto ext = server.clientExtensions();
+	return ext.type == Json.Type.object && (mcpAppsExtensionKey in ext) !is null;
+}
+
+/// Register a `ui://` HTML resource an MCP App tool can render. The resource is
+/// served with the `text/html;profile=mcp-app` MIME type and, when `meta`
+/// carries any field, a `_meta.ui` object on both the listing and the read
+/// contents. Throws if `uri` is not in the `ui://` scheme.
+void registerUiResource(McpServer server, string uri, string name, string html,
+		UiResourceMeta meta = UiResourceMeta.init, string description = null) @safe
+{
+	import std.algorithm.searching : startsWith;
+
+	if (!uri.startsWith("ui://"))
+		throw new Exception("a UI resource uri must start with \"ui://\", got: " ~ uri);
+
+	const uiMeta = meta.toJson();
+	Json wrapped = Json.undefined;
+	if (uiMeta.length)
+	{
+		wrapped = Json.emptyObject;
+		wrapped["ui"] = uiMeta;
+	}
+
+	Resource descriptor;
+	descriptor.uri = uri;
+	descriptor.name = name;
+	descriptor.mimeType = nullable(mcpAppMimeType);
+	if (description.length)
+		descriptor.description = nullable(description);
+	if (wrapped.type == Json.Type.object)
+		descriptor.meta = wrapped;
+
+	server.registerResource(descriptor, () @safe {
+		auto c = ResourceContents.makeText(uri, mcpAppMimeType, html);
+		if (wrapped.type == Json.Type.object)
+			c.meta = wrapped;
+		return c;
+	});
+}
+
 unittest  // UiToolMeta serializes to the spec's _meta.ui shape
 {
 	UiToolMeta ui = {
@@ -286,4 +363,137 @@ unittest  // UiResourceMeta round-trips through fromJson
 	assert(back.permissions.microphone);
 	assert(back.domain.get == "x.example.com");
 	assert(back.prefersBorder.get == false);
+}
+
+unittest  // advertiseMcpApps surfaces the extension with its mimeTypes (draft)
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.modern : MetaKey;
+
+	auto s = new McpServer("t", "1");
+	advertiseMcpApps(s);
+
+	Json params = Json.emptyObject;
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	params["_meta"] = meta;
+	auto caps = s.handle(Message(makeRequest(Json(1), "server/discover",
+			params))).get["result"]["capabilities"];
+
+	assert(mcpAppsExtensionKey in caps["extensions"]);
+	auto settings = caps["extensions"][mcpAppsExtensionKey];
+	assert(settings["mimeTypes"][0].get!string == mcpAppMimeType);
+}
+
+unittest  // clientSupportsMcpApps reflects what the client advertised at initialize
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	Json caps = Json.emptyObject;
+	Json ext = Json.emptyObject;
+	ext[mcpAppsExtensionKey] = Json(["mimeTypes": Json([Json(mcpAppMimeType)])]);
+	caps["extensions"] = ext;
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-06-18";
+	params["capabilities"] = caps;
+	s.handle(Message(makeRequest(Json(1), "initialize", params)));
+
+	assert(clientSupportsMcpApps(s));
+}
+
+unittest  // clientSupportsMcpApps is false for a client that did not advertise it
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-06-18";
+	params["capabilities"] = Json.emptyObject;
+	s.handle(Message(makeRequest(Json(1), "initialize", params)));
+
+	assert(!clientSupportsMcpApps(s));
+}
+
+unittest  // registerUiResource serves HTML with the app mime type and _meta.ui
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	UiResourceMeta meta;
+	meta.csp.connectDomains = ["https://api.example.com"];
+	registerUiResource(s, "ui://demo/widget", "widget", "<h1>hi</h1>", meta);
+
+	Json rp = Json.emptyObject;
+	rp["uri"] = "ui://demo/widget";
+	auto contents = s.handle(Message(makeRequest(Json(1), "resources/read",
+			rp))).get["result"]["contents"][0];
+	assert(contents["mimeType"].get!string == mcpAppMimeType);
+	assert(contents["text"].get!string == "<h1>hi</h1>");
+	assert(
+			contents["_meta"]["ui"]["csp"]["connectDomains"][0].get!string
+			== "https://api.example.com");
+}
+
+unittest  // registerUiResource lists the resource with mime type and _meta.ui
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	UiResourceMeta meta;
+	meta.prefersBorder = nullable(true);
+	registerUiResource(s, "ui://demo/widget", "widget", "<h1>hi</h1>", meta);
+
+	auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
+			Json.emptyObject))).get["result"]["resources"][0];
+	assert(res["uri"].get!string == "ui://demo/widget");
+	assert(res["mimeType"].get!string == mcpAppMimeType);
+	assert(res["_meta"]["ui"]["prefersBorder"].get!bool == true);
+}
+
+unittest  // registerUiResource with no metadata emits a clean resource (no _meta)
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerUiResource(s, "ui://demo/plain", "plain", "<p>x</p>");
+
+	Json rp = Json.emptyObject;
+	rp["uri"] = "ui://demo/plain";
+	auto contents = s.handle(Message(makeRequest(Json(1), "resources/read",
+			rp))).get["result"]["contents"][0];
+	assert(contents["mimeType"].get!string == mcpAppMimeType);
+	assert("_meta" !in contents);
+}
+
+unittest  // registerUiResource rejects a uri that is not in the ui:// scheme
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	assertThrown!Exception(registerUiResource(s, "https://demo/widget", "w", "<x/>"));
+}
+
+unittest  // setUiToolMeta attaches the ui link under a tool's _meta.ui
+{
+	Tool t;
+	t.name = "render";
+	UiToolMeta ui = {resourceUri: "ui://demo/widget", visibility: ["model"]};
+	setUiToolMeta(t, ui);
+	auto j = t.toJson();
+	assert(j["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget");
+	assert(j["_meta"]["ui"]["visibility"][0].get!string == "model");
+}
+
+unittest  // setUiToolMeta preserves other _meta keys already on the tool
+{
+	Tool t;
+	t.name = "render";
+	t.meta = Json(["category": Json("demo")]);
+	setUiToolMeta(t, UiToolMeta("ui://demo/widget"));
+	auto j = t.toJson();
+	assert(j["_meta"]["category"].get!string == "demo");
+	assert(j["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget");
 }
