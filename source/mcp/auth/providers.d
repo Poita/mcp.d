@@ -88,6 +88,8 @@ ResourceServerConfig resourceServer(JwtVerifierConfig vc) @safe
 ResourceServerConfig entraId(string tenant, string audience, string[] scopes = [
 ]) @safe
 {
+	enforce(tenant.length > 0,
+			"entraId: tenant must be a concrete tenant GUID or domain name, not an empty string.");
 	enforce(tenant != "common" && tenant != "organizations" && tenant != "consumers",
 			"entraId: pseudo-tenants (\"common\", \"organizations\", \"consumers\") are not "
 			~ "supported — Entra ID never stamps them in the iss claim, so every token "
@@ -276,6 +278,13 @@ unittest  // entraId rejects pseudo-tenant "consumers" at call time
 	import std.exception : assertThrown;
 
 	assertThrown(entraId("consumers", "api://my-app"));
+}
+
+unittest  // entraId rejects an empty tenant string at call time
+{
+	import std.exception : assertThrown;
+
+	assertThrown(entraId("", "api://my-app"));
 }
 
 unittest  // a JWT preset wires a working validator that rejects garbage tokens
