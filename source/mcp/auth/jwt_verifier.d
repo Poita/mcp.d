@@ -273,9 +273,13 @@ private const(ubyte)[] rawEcdsaToDer(const(ubyte)[] raw) @trusted
 	}
 	scope (exit)
 		ECDSA_SIG_free(sig);
-	// ECDSA_SIG_set0 takes ownership of r and s.
+	// ECDSA_SIG_set0 takes ownership of r and s on success; free them on failure.
 	if (ECDSA_SIG_set0(sig, r, s) != 1)
+	{
+		BN_free(r);
+		BN_free(s);
 		return null;
+	}
 
 	ubyte* der;
 	const len = i2d_ECDSA_SIG(sig, &der);
@@ -1133,6 +1137,23 @@ unittest  // rsaJwkToPem frees n and e BIGNUMs on RSA_set0_key failure (no leak)
 	import std.string : indexOf;
 
 	assert(pem.indexOf("BEGIN PUBLIC KEY") >= 0);
+}
+
+unittest  // rawEcdsaToDer frees r and s BIGNUMs on ECDSA_SIG_set0 failure (no leak)
+{
+	import mcp.auth.jwt : signEs256;
+
+	// ECDSA_SIG_set0 succeeds whenever r and s are valid non-null BIGNUMs passed to
+	// a freshly-allocated ECDSA_SIG struct, so we cannot force a failure from D. The
+	// fix (adding BN_free(r)/BN_free(s) on that branch) is verified by code
+	// inspection and by this test confirming the function produces a valid DER output
+	// for a well-formed 64-byte raw P-256 signature — BIGNUMs are consumed without
+	// crash.
+	const rawSig = signEs256(testEcPrivPem, cast(const(ubyte)[]) "test.payload");
+	assert(rawSig.length == 64);
+	auto der = rawEcdsaToDer(rawSig);
+	// DER-encoded ECDSA signatures start with 0x30 (SEQUENCE tag).
+	assert(der.length > 0 && der[0] == 0x30);
 }
 
 unittest  // fetchJwks discards non-2xx bodies so a 503 does not mark the cache as fresh
