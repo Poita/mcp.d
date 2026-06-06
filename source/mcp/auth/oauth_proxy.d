@@ -627,6 +627,7 @@ final class OAuthProxy
 	{
 		requireSecureUrl(cfg.upstreamAuthorizationEndpoint);
 		requireSecureUrl(cfg.upstreamTokenEndpoint);
+		requireSecureUrl(cfg.callbackUrl());
 		this.cfg = cfg;
 		this.consentStore = consentStore;
 		this.redirectRegistry = redirectRegistry;
@@ -1315,4 +1316,27 @@ unittest  // toResourceServer fails closed when the proxy has no tokenVerifier
 	auto rs = cfg.toResourceServer();
 	assert(rs.enabled); // validator is non-null (rejects everything)
 	assert(!rs.validator("anything").valid);
+}
+
+unittest  // CONSTRUCTOR SECURITY: a plaintext (http) baseUrl over a non-loopback host is rejected
+{
+	import std.exception : assertThrown;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "client-id";
+	cfg.baseUrl = "http://mcp.example.com"; // insecure non-loopback base URL
+	assertThrown(new OAuthProxy(cfg));
+}
+
+unittest  // CONSTRUCTOR SECURITY: a loopback http baseUrl is accepted for local development
+{
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "client-id";
+	cfg.baseUrl = "http://127.0.0.1:8080"; // loopback dev config is allowed
+	auto proxy = new OAuthProxy(cfg); // must not throw
+	assert(proxy !is null);
 }
