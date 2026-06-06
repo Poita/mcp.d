@@ -228,19 +228,24 @@ class FileTokenStore : TokenStore
 			import core.sys.posix.unistd : close, getpid;
 			import core.sys.posix.sys.stat : S_IRUSR, S_IWUSR;
 			import core.stdc.stdio : rename;
+			import std.digest : toHexString;
 			import std.file : remove;
 			import std.string : toStringz;
 			import std.conv : to;
-			import std.random : uniform;
+			import mcp.auth.csprng : cryptoRandomFill;
 
 			if (!path.length)
 				return;
 
 			// A unique private temp name in the same directory so the atomic
 			// `rename` stays on one filesystem and `O_CREAT|O_EXCL` cannot collide
-			// with a concurrent writer or a stale leftover.
+			// with a concurrent writer or a stale leftover.  The suffix comes
+			// from the OS CSPRNG so that concurrent writers cannot predict and
+			// pre-create the temp path to win the O_EXCL race.
+			ubyte[8] rndBuf;
+			cryptoRandomFill(rndBuf[]);
 			auto tmp = path ~ ".tmp-" ~ (() @trusted => getpid()
-					.to!string)() ~ "-" ~ uniform(0, int.max).to!string;
+					.to!string)() ~ "-" ~ rndBuf[].toHexString;
 
 			bool wrote = () @trusted {
 				int fd = open(tmp.toStringz, O_CREAT | O_EXCL | O_WRONLY, S_IRUSR | S_IWUSR);
@@ -1234,6 +1239,39 @@ unittest  // enforceIssOnCapture runs even on an error response (does not act on
 	auto checked = enforceIssOnCapture(cap, as_);
 	assert(!checked.ok);
 	assert(checked.error == "invalid_iss");
+}
+
+version (Posix) unittest  // FileTokenStore.writeSecretFile does not draw from the Mersenne Twister (std.random)
+{
+	// writeSecretFile MUST obtain its temp-file suffix from the OS CSPRNG
+	// (cryptoRandomFill), not from the thread-local Mersenne Twister (rndGen).
+	// Detection: snapshot rndGen before and after the save.  If MT were used,
+	// the snapshot would differ because uniform(0, int.max) advances rndGen.
+	// With the CSPRNG path, rndGen is untouched and the snapshots must match.
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+	import std.path : buildPath;
+	import std.random : rndGen;
+	import std.datetime.systime : Clock;
+	import std.conv : to;
+
+	auto root = buildPath(tempDir, "mcp-login-mt-" ~ Clock.currTime().toUnixTime().to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		() @trusted { rmdirRecurse(root); }();
+
+	auto before = rndGen; // snapshot the MT state before the save
+
+	auto file = buildPath(root, "tokens.json");
+	auto store = new FileTokenStore(file);
+	StoredToken t;
+	t.accessToken = "secret";
+	t.resource = "https://mcp.example.com";
+	store.save("https://mcp.example.com", t);
+
+	auto after = rndGen; // snapshot the MT state after the save
+	// The two snapshots must be equal: the CSPRNG path must not advance rndGen.
+	assert(before == after,
+			"writeSecretFile advanced rndGen (Mersenne Twister): OS CSPRNG not used for temp suffix");
 }
 
 version (Posix) unittest  // FileTokenStore creates the token file 0600 (never a readable window)
