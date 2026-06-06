@@ -340,7 +340,7 @@ struct SubscriptionFilter
 				return false;
 			// A blanket boolean opt-in (no per-URI list) accepts any URI;
 			// otherwise only the explicitly named URIs are accepted.
-			return resourceUris.length == 0 || uri.length == 0 || resourceUris.canFind(uri);
+			return resourceUris.length == 0 || resourceUris.canFind(uri);
 		default:
 			// Not a subscription-gated change notification: always deliverable.
 			return true;
@@ -402,6 +402,18 @@ unittest  // resourceSubscriptions matches only the opted-in URIs
 	SubscriptionFilter none;
 	none.active = true;
 	assert(!none.accepts("notifications/resources/updated", "file:///x"));
+}
+
+unittest  // a per-URI filter must reject a notification that carries no URI
+{
+	// A server emitting notifications/resources/updated with an empty uri (e.g. a
+	// bug upstream or a server that omits the field) must not bypass the per-URI
+	// filter: an empty uri is not in the opted-in list and must not be delivered.
+	SubscriptionFilter f;
+	f.active = true;
+	f.resourceSubscriptions = true;
+	f.resourceUris = ["file:///project/config.json"];
+	assert(!f.accepts("notifications/resources/updated", ""));
 }
 
 /// A long-lived server->client SSE channel for *unsolicited* traffic — the
