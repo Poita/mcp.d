@@ -1771,7 +1771,7 @@ unittest  // listenerCount acquires mtx: must not be const
 	import std.algorithm : canFind;
 
 	static assert(!canFind([
-			__traits(getFunctionAttributes, ServerPushChannel.listenerCount)
+		__traits(getFunctionAttributes, ServerPushChannel.listenerCount)
 	], "const"), "listenerCount must not be const — it must lock mtx before reading listeners");
 }
 
@@ -1781,9 +1781,9 @@ unittest  // retainedHistoryStreams acquires mtx: must not be const
 	import std.algorithm : canFind;
 
 	static assert(!canFind([
-			__traits(getFunctionAttributes, ServerPushChannel.retainedHistoryStreams)
+		__traits(getFunctionAttributes, ServerPushChannel.retainedHistoryStreams)
 	], "const"),
-			"retainedHistoryStreams must not be const — it must lock mtx before reading history");
+		"retainedHistoryStreams must not be const — it must lock mtx before reading history");
 }
 
 /// The HTTP response headers a server sets when it upgrades a response to a
