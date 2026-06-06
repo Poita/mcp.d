@@ -509,7 +509,7 @@ private string readFormString(scope HTTPServerRequest req) @safe
 /// body (the field is URL-decoded). Returns "" when absent.
 private string formField(string form, string name) @safe
 {
-	import std.array : split;
+	import std.array : replace, split;
 	import std.uri : decodeComponent;
 
 	foreach (pair; form.split("&"))
@@ -517,8 +517,12 @@ private string formField(string form, string name) @safe
 		const eq = pair.indexOf('=');
 		if (eq < 0)
 			continue;
-		if (pair[0 .. eq] == name)
-			return () @trusted { return decodeComponent(pair[eq + 1 .. $]); }();
+		if (pair[0 .. eq] == name) // RFC 1866 §8.2.1 and the HTML Living Standard §4.10.21.6 define
+			// '+' as a space in application/x-www-form-urlencoded values; replace
+			// it before passing to decodeComponent, which handles %xx sequences.
+			return () @trusted {
+			return decodeComponent(pair[eq + 1 .. $].replace("+", " "));
+		}();
 	}
 	return "";
 }
@@ -709,6 +713,12 @@ unittest  // formField URL-decodes a value and returns "" for an absent field
 	assert(formField("grant_type=authorization_code&code=ab%20cd&code_verifier=V",
 			"code") == "ab cd");
 	assert(formField("grant_type=authorization_code&code=X", "code_verifier") == "");
+}
+
+unittest  // formField decodes '+' as a space per application/x-www-form-urlencoded
+{
+	assert(formField("code=ab+cd", "code") == "ab cd");
+	assert(formField("refresh_token=tok%2Bplus+space", "refresh_token") == "tok+plus space");
 }
 
 unittest  // the /token dispatch reads grant_type + refresh_token from a refresh request body
