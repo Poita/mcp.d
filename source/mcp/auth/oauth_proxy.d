@@ -454,7 +454,7 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 		while (order.length > maxRegistrations)
 		{
 			const oldest = order[0];
-			order = order[1 .. $];
+			order = order[1 .. $].dup;
 			if (auto p = oldest in byHandle)
 			{
 				foreach (u; *p)
@@ -565,7 +565,7 @@ final class InMemoryConsentStore : ConsentStore
 		while (order.length > maxApprovals)
 		{
 			const oldest = order[0];
-			order = order[1 .. $];
+			order = order[1 .. $].dup;
 			approved.remove(oldest);
 		}
 	}
