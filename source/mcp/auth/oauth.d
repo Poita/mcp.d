@@ -315,6 +315,7 @@ private string[] stringArray(Json j, string key) @safe
 /// for an MCP endpoint URL, per RFC 9728: the path-scoped URL first, then root.
 string[] protectedResourceMetadataUrls(string mcpEndpoint) @safe
 {
+	import std.algorithm : min;
 	import std.string : indexOf;
 
 	// Split scheme://host[/path]
@@ -325,6 +326,16 @@ string[] protectedResourceMetadataUrls(string mcpEndpoint) @safe
 	const slash = mcpEndpoint[afterScheme .. $].indexOf('/');
 	string origin = (slash < 0) ? mcpEndpoint : mcpEndpoint[0 .. afterScheme + slash];
 	string path = (slash < 0) ? "" : mcpEndpoint[afterScheme + slash .. $];
+
+	// RFC 9728 uses scheme+host+path only; strip query string and fragment.
+	auto cut = path.length;
+	auto q = path.indexOf('?');
+	auto h = path.indexOf('#');
+	if (q >= 0)
+		cut = min(cut, q);
+	if (h >= 0)
+		cut = min(cut, h);
+	path = path[0 .. cut];
 
 	string[] urls;
 	if (path.length && path != "/")
@@ -338,6 +349,7 @@ string[] protectedResourceMetadataUrls(string mcpEndpoint) @safe
 /// (`openid-configuration`), in both path-aware and path-append forms.
 string[] authServerMetadataCandidates(string issuer) @safe
 {
+	import std.algorithm : min;
 	import std.string : endsWith, indexOf;
 
 	auto iss = issuer;
@@ -354,7 +366,19 @@ string[] authServerMetadataCandidates(string issuer) @safe
 		iss ~ "/.well-known/openid-configuration"
 	];
 	const origin = iss[0 .. afterScheme + slash];
-	const path = iss[afterScheme + slash .. $];
+	string path = iss[afterScheme + slash .. $];
+
+	// Issuer identifiers must not contain query strings or fragments; strip
+	// them defensively so well-known URLs remain valid per RFC 8414.
+	auto cut = path.length;
+	auto q = path.indexOf('?');
+	auto h = path.indexOf('#');
+	if (q >= 0)
+		cut = min(cut, q);
+	if (h >= 0)
+		cut = min(cut, h);
+	path = path[0 .. cut];
+
 	return [
 		origin ~ "/.well-known/oauth-authorization-server" ~ path,
 		origin ~ "/.well-known/openid-configuration" ~ path,
@@ -486,6 +510,22 @@ unittest  // protected-resource metadata well-known URLs: path-scoped then root
 	assert(rootUrls[0] == "https://example.com/.well-known/oauth-protected-resource");
 }
 
+unittest  // protectedResourceMetadataUrls strips query string from path per RFC 9728
+{
+	auto urls = protectedResourceMetadataUrls("https://api.example.com/mcp?version=2026-11-05");
+	assert(urls.length == 2);
+	assert(urls[0] == "https://api.example.com/.well-known/oauth-protected-resource/mcp");
+	assert(urls[1] == "https://api.example.com/.well-known/oauth-protected-resource");
+}
+
+unittest  // protectedResourceMetadataUrls strips fragment from path per RFC 9728
+{
+	auto urls = protectedResourceMetadataUrls("https://example.com/mcp#section");
+	assert(urls.length == 2);
+	assert(urls[0] == "https://example.com/.well-known/oauth-protected-resource/mcp");
+	assert(urls[1] == "https://example.com/.well-known/oauth-protected-resource");
+}
+
 unittest  // AS metadata candidates insert well-known after origin, before path
 {
 	auto root = authServerMetadataCandidates("https://auth.example.com");
@@ -493,6 +533,15 @@ unittest  // AS metadata candidates insert well-known after origin, before path
 
 	auto tenant = authServerMetadataCandidates("https://auth.example.com/tenant1");
 	assert(tenant[0] == "https://auth.example.com/.well-known/oauth-authorization-server/tenant1");
+}
+
+unittest  // authServerMetadataCandidates strips query string and fragment from issuer path
+{
+	auto urls = authServerMetadataCandidates("https://auth.example.com/tenant1?foo=bar");
+	assert(urls[0] == "https://auth.example.com/.well-known/oauth-authorization-server/tenant1");
+
+	auto urlsFrag = authServerMetadataCandidates("https://auth.example.com/tenant1#anchor");
+	assert(urlsFrag[0] == "https://auth.example.com/.well-known/oauth-authorization-server/tenant1");
 }
 
 unittest  // metadata documents parse the relevant fields
