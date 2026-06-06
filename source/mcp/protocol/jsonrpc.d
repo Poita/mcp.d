@@ -134,10 +134,14 @@ deprecated("Use parseBatchTolerant or parseAny to preserve per-member error info
 	return result.messages;
 }
 
-/// A malformed batch member: its position in the array and the validation error.
+/// A malformed batch member: its position in the array, the raw member item, and
+/// the validation error. The raw `item` is retained so a dispatcher can recover the
+/// member's `id` (which may still be present even when the envelope is invalid) and
+/// resolve a pending request rather than letting it time out.
 struct BatchMemberError
 {
 	size_t index;
+	Json item;
 	McpException error;
 }
 
@@ -171,7 +175,7 @@ BatchResult parseBatchTolerant(string text) @safe
 			result.messages ~= Message(item);
 		}
 		catch (McpException e)
-			result.errors ~= BatchMemberError(i, e);
+			result.errors ~= BatchMemberError(i, item, e);
 	}
 	return result;
 }
