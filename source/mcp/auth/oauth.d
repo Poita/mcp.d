@@ -1228,8 +1228,14 @@ struct TokenSet
 		TokenSet t;
 		t.accessToken = strField(j, "access_token");
 		t.tokenType = strField(j, "token_type");
-		if ("expires_in" in j && j["expires_in"].type == Json.Type.int_)
-			t.expiresIn = j["expires_in"].get!long;
+		if ("expires_in" in j)
+		{
+			auto e = j["expires_in"];
+			if (e.type == Json.Type.int_)
+				t.expiresIn = e.get!long;
+			else if (e.type == Json.Type.float_)
+				t.expiresIn = cast(long) e.get!double;
+		}
 		t.refreshToken = strField(j, "refresh_token");
 		t.scope_ = strField(j, "scope");
 		return t;
@@ -1392,6 +1398,13 @@ unittest  // DCR request + responses round-trip
 			`{"access_token":"tok","token_type":"Bearer","expires_in":3600,"refresh_token":"r"}`));
 	assert(ts.accessToken == "tok" && ts.tokenType == "Bearer" && ts.expiresIn == 3600);
 	assert(ts.refreshToken == "r");
+}
+
+unittest  // TokenSet.fromJson parses expires_in when AS returns it as a JSON float
+{
+	auto ts = TokenSet.fromJson(parseJson(
+			`{"access_token":"tok","token_type":"Bearer","expires_in":3600.0,"refresh_token":"r"}`));
+	assert(ts.expiresIn == 3600, "float expires_in must be parsed as long");
 }
 
 unittest  // authorization URL includes PKCE S256, resource, scope, state
