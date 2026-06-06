@@ -55,6 +55,18 @@ struct JwtVerifierConfig
 	/// Scopes the token must carry (from `scope` or `scp`). All must be present.
 	string[] requiredScopes;
 
+	/// JOSE `typ` header values accepted for a bearer access token, compared
+	/// case-insensitively (RFC 7515 §4.1.9, which also lets an `application/`
+	/// media-type prefix be omitted). RFC 9068 §2.1 specifies `at+jwt` for JWT
+	/// access tokens, and §4.1 requires the resource server to reject a token
+	/// whose `typ` does not match the expected type, defeating type-confusion
+	/// attacks (e.g. an OIDC `id_token` signed with the same key replayed as an
+	/// access token). The default also accepts the bare `JWT` that many issuers
+	/// (including this SDK's own token signer) emit. A token whose `typ` is
+	/// absent or not listed here is rejected; set this empty to disable the
+	/// check for legacy issuers.
+	string[] acceptedTokenTypes = ["at+jwt", "JWT"];
+
 	/// Leeway applied to `exp`/`nbf` to tolerate clock skew.
 	Duration clockSkew = 60.seconds;
 
@@ -124,6 +136,12 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 	// understand. This verifier implements none, so any token carrying a
 	// `crit` member MUST be rejected rather than silently accepted.
 	if ("crit" in headerJson)
+		return TokenInfo.invalid();
+
+	// RFC 9068 4.1: reject a token whose `typ` is not an expected access-token
+	// type, so a token of another type (e.g. an OIDC `id_token`) signed with the
+	// same key cannot be replayed as an access token.
+	if (!typAccepted(cfg.acceptedTokenTypes, jsonStr(headerJson, "typ")))
 		return TokenInfo.invalid();
 
 	// Gather candidate keys: pinned PEM keys plus any JWKS keys for this kid.
@@ -684,6 +702,33 @@ package string[] splitScopes(string s) @safe
 	return parts.length ? parts : null;
 }
 
+/// Whether a token's `typ` header is one of the `accepted` types. The match is
+/// case-insensitive and ignores an optional `application/` media-type prefix on
+/// either side (RFC 7515 §4.1.9). An empty `accepted` disables the check; an
+/// absent (empty) `typ` matches nothing and is therefore rejected.
+package bool typAccepted(string[] accepted, string typ) @safe
+{
+	import std.uni : toLower;
+	import std.algorithm : startsWith;
+
+	if (accepted.length == 0)
+		return true;
+
+	static string normalize(string t) @safe
+	{
+		auto lower = t.toLower;
+		return lower.startsWith("application/") ? lower["application/".length .. $] : lower;
+	}
+
+	const want = normalize(typ);
+	if (want.length == 0)
+		return false;
+	foreach (a; accepted)
+		if (want == normalize(a))
+			return true;
+	return false;
+}
+
 /// Extract granted scopes: OAuth uses a space-delimited `scope` string; some
 /// issuers use `scp` (string or array).
 string[] tokenScopes(Json payload) @safe
@@ -975,6 +1020,86 @@ unittest  // a token carrying a `crit` header is rejected even with a valid sign
 
 	auto ti = verifyToken(cfg, jwt, new NoKeys, 1_700_001_000);
 	assert(!ti.valid);
+}
+
+unittest  // a token whose `typ` is an OIDC id_token is rejected (RFC 9068 §4.1 type confusion)
+{
+	import mcp.auth.jwt : signEs256;
+	import mcp.auth.oauth : base64UrlNoPad;
+
+	JwtVerifierConfig cfg;
+	cfg.staticPublicKeysPem = [testEcPubPem];
+
+	// An ID token signed with the same key as access tokens: every claim check
+	// would pass, so only the `typ` mismatch can stop it being replayed.
+	const header = `{"alg":"ES256","typ":"id_token"}`;
+	const payload = `{"iss":"https://as.example.com","aud":"https://mcp.example.com/mcp","sub":"user-42","exp":1700003600}`;
+	const si = base64UrlNoPad(cast(const(ubyte)[]) header) ~ "." ~ base64UrlNoPad(
+			cast(const(ubyte)[]) payload);
+	auto sig = signEs256(testEcPrivPem, cast(const(ubyte)[]) si);
+	auto jwt = si ~ "." ~ base64UrlNoPad(sig);
+
+	auto ti = verifyToken(cfg, jwt, new NoKeys, 1_700_001_000);
+	assert(!ti.valid);
+}
+
+unittest  // an RFC 9068 `at+jwt` typ is accepted (case-insensitive, RFC 7515 §4.1.9)
+{
+	import mcp.auth.jwt : signEs256;
+	import mcp.auth.oauth : base64UrlNoPad;
+
+	JwtVerifierConfig cfg;
+	cfg.staticPublicKeysPem = [testEcPubPem];
+
+	const header = `{"alg":"ES256","typ":"AT+JWT"}`;
+	const payload = `{"sub":"ec-user","exp":1700003600}`;
+	const si = base64UrlNoPad(cast(const(ubyte)[]) header) ~ "." ~ base64UrlNoPad(
+			cast(const(ubyte)[]) payload);
+	auto sig = signEs256(testEcPrivPem, cast(const(ubyte)[]) si);
+	auto jwt = si ~ "." ~ base64UrlNoPad(sig);
+
+	auto ti = verifyToken(cfg, jwt, new NoKeys, 1_700_001_000);
+	assert(ti.valid);
+	assert(ti.subject == "ec-user");
+}
+
+unittest  // a token with no `typ` header is rejected by default (RFC 9068 §4.1)
+{
+	import mcp.auth.jwt : signEs256;
+	import mcp.auth.oauth : base64UrlNoPad;
+
+	JwtVerifierConfig cfg;
+	cfg.staticPublicKeysPem = [testEcPubPem];
+
+	const header = `{"alg":"ES256"}`;
+	const payload = `{"sub":"ec-user","exp":1700003600}`;
+	const si = base64UrlNoPad(cast(const(ubyte)[]) header) ~ "." ~ base64UrlNoPad(
+			cast(const(ubyte)[]) payload);
+	auto sig = signEs256(testEcPrivPem, cast(const(ubyte)[]) si);
+	auto jwt = si ~ "." ~ base64UrlNoPad(sig);
+
+	auto ti = verifyToken(cfg, jwt, new NoKeys, 1_700_001_000);
+	assert(!ti.valid);
+}
+
+unittest  // emptying acceptedTokenTypes disables the `typ` check (escape hatch for legacy issuers)
+{
+	import mcp.auth.jwt : signEs256;
+	import mcp.auth.oauth : base64UrlNoPad;
+
+	JwtVerifierConfig cfg;
+	cfg.staticPublicKeysPem = [testEcPubPem];
+	cfg.acceptedTokenTypes = [];
+
+	const header = `{"alg":"ES256","typ":"id_token"}`;
+	const payload = `{"sub":"ec-user","exp":1700003600}`;
+	const si = base64UrlNoPad(cast(const(ubyte)[]) header) ~ "." ~ base64UrlNoPad(
+			cast(const(ubyte)[]) payload);
+	auto sig = signEs256(testEcPrivPem, cast(const(ubyte)[]) si);
+	auto jwt = si ~ "." ~ base64UrlNoPad(sig);
+
+	auto ti = verifyToken(cfg, jwt, new NoKeys, 1_700_001_000);
+	assert(ti.valid);
 }
 
 unittest  // an empty `scope` claim yields no scopes (not a spurious empty-string scope)
