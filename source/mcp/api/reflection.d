@@ -395,6 +395,8 @@ private Icon[] collectIcons(alias overload)() @safe
 				if (a.mimeType.length)
 					ic.mimeType = nullable(a.mimeType);
 				ic.sizes = a.sizes;
+				if (a.theme.length)
+					ic.theme = nullable(a.theme);
 				icons ~= ic;
 			}
 		}
@@ -1799,6 +1801,31 @@ unittest  // @meta UDA on a @prompt: descriptor `_meta` appears in prompts/list
 			greeting = prompts[i];
 	assert(greeting.type == Json.Type.object);
 	assert(greeting["_meta"]["audience"].get!string == "all");
+}
+
+version (unittest) private final class ThemedIconApi
+{
+	@tool("night", "A tool with a dark-theme icon")
+	@icon("https://example.com/night.png", "image/png", ["48x48"], "dark")
+	string night(string x) @safe
+	{
+		return x;
+	}
+}
+
+unittest  // @icon UDA: theme field propagates through collectIcons to tools/list
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ThemedIconApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+
+	assert(tools.length == 1);
+	assert(tools[0]["icons"].length == 1);
+	assert(tools[0]["icons"][0]["src"].get!string == "https://example.com/night.png");
+	assert(tools[0]["icons"][0]["theme"].get!string == "dark");
 }
 
 version (unittest) private auto draftRead(string uri) @safe

@@ -191,12 +191,12 @@ struct mcpHeader
 /// `@resourceTemplate`-annotated method (the MCP `Icons` mixin: `Tool.icons`,
 /// `Resource.icons`). Attach one or more `@icon` UDAs to the same method; each
 /// becomes an entry in the descriptor's `icons` array. `src` is required;
-/// `mimeType` and `sizes` are optional.
+/// `mimeType`, `sizes`, and `theme` are optional.
 ///
 /// Example:
 /// ---
 /// @tool("draw", "Draw something")
-/// @icon("https://example.com/draw.png", "image/png", ["48x48"])
+/// @icon("https://example.com/draw.png", "image/png", ["48x48"], "dark")
 /// string draw(string spec) { ... }
 /// ---
 struct icon
@@ -204,6 +204,7 @@ struct icon
 	string src; /// URI or data: URL of the icon (required)
 	string mimeType; /// optional MIME type, e.g. "image/png" (empty = unset)
 	string[] sizes; /// optional size strings, e.g. ["48x48", "96x96"]
+	string theme; /// optional theme preference: "light" or "dark" (empty = unset)
 }
 
 /// UDA attaching a descriptor-level `_meta` object to a `@tool`, `@resource`,
