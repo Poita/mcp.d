@@ -527,11 +527,22 @@ final class McpClient : ClientProtocol
 			// No initialize handshake follows on the stateless draft path, so
 			// capture what `server/discover` advertised; otherwise the caller
 			// would have no way to inspect the server's capabilities/identity.
+			// When the probe succeeded (haveDisc), the result is already in hand;
+			// when it failed with UnsupportedProtocolVersionError (haveDisc is
+			// false), modern framing is now active so a fresh discover() populates
+			// the same fields.
 			if (haveDisc)
 			{
 				serverCapabilities_ = disc.capabilities;
 				serverInfo_ = disc.serverInfo;
 				serverInstructions_ = disc.instructions;
+			}
+			else
+			{
+				auto freshDisc = discover();
+				serverCapabilities_ = freshDisc.capabilities;
+				serverInfo_ = freshDisc.serverInfo;
+				serverInstructions_ = freshDisc.instructions;
 			}
 		}
 		else
@@ -4297,6 +4308,50 @@ unittest  // connect() still falls back to initialize when even a draft-framed p
 	auto chosen = c.connect();
 	assert(chosen == latestStable);
 	assert(!chosen.isModern);
+}
+
+unittest  // connect() populates serverCapabilities/serverInfo/serverInstructions on UnsupportedProtocolVersionError path selecting modern
+{
+	// When discoverProbe() throws UnsupportedProtocolVersionError the client
+	// extracts the server's supported list, selects a modern version, and MUST
+	// still populate serverCapabilities_/serverInfo_/serverInstructions_ by
+	// issuing a server/discover after switching to modern framing.
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	int callCount;
+	transport.responder = (Json message, long expectId) @safe {
+		const method = message["method"].get!string;
+		callCount++;
+		if (method == "server/discover" && callCount == 1)
+		{
+			// First probe: server rejects our draft version and advertises modern.
+			Json errData = Json.emptyObject;
+			errData["supported"] = Json.emptyArray;
+			errData["supported"] ~= Json(ProtocolVersion.modern.toWire);
+			throw new McpException(ErrorCode.unsupportedProtocolVersion,
+					"Unsupported protocol version", errData);
+		}
+		// Second call: server/discover after modern mode is enabled.
+		assert(method == "server/discover", "expected server/discover, got " ~ method);
+		Json r = Json.emptyObject;
+		r["supportedVersions"] = Json.emptyArray;
+		r["supportedVersions"] ~= Json(ProtocolVersion.modern.toWire);
+		Json caps = Json.emptyObject;
+		caps["logging"] = Json.emptyObject;
+		r["capabilities"] = caps;
+		Json info = Json.emptyObject;
+		info["name"] = "modern-srv";
+		info["version"] = "2.0";
+		r["serverInfo"] = info;
+		r["instructions"] = "hello";
+		return r;
+	};
+	auto chosen = c.connect();
+	assert(chosen == ProtocolVersion.modern);
+	assert(c.serverInfo().name == "modern-srv");
+	assert(c.serverInfo().version_ == "2.0");
+	assert(!c.serverInstructions().isNull);
+	assert(c.serverInstructions().get == "hello");
 }
 
 unittest  // test-only RPC/notify hooks are guarded behind version(unittest)
