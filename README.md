@@ -134,9 +134,10 @@ Open `docs/index.html` in a browser when it finishes. The generated `docs/`
 directory is a build artifact and is git-ignored.
 
 CI builds the docs on every push/PR (`.github/workflows/docs.yml`) so doc
-generation can never silently break, and publishes them to GitHub Pages on
-pushes to `main` (best-effort: the publish step is skipped if Pages is not
-enabled for the repository).
+generation can never silently break, and publishes them to GitHub Pages on a
+published **release** (or a manual `workflow_dispatch`), not on every push to
+`main` (best-effort: the publish step is skipped if Pages is not enabled for the
+repository).
 
 ## Statefulness
 

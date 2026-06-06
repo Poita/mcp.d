@@ -2,18 +2,20 @@ name: Docs
 
 # Generate browsable API documentation from ddoc comments.
 #
-# - Always builds the docs on every push/PR so doc generation can never silently
-#   break (the "docs generate in CI" acceptance criterion).
-# - Optionally publishes to GitHub Pages on pushes to main. Publishing is gated:
-#   it only runs when Pages is enabled for the repository (public repo or a plan
-#   that allows private Pages). If Pages is not available the publish step is
-#   skipped and the build job still succeeds.
+# - Always builds the docs on every push/PR (and release) so doc generation can
+#   never silently break (the "docs generate in CI" acceptance criterion).
+# - Publishes to GitHub Pages only on a published release (or a manual
+#   workflow_dispatch), not on every push to main. Publishing is gated: it only
+#   runs when Pages is enabled for the repository. If Pages is not available the
+#   deploy step fails softly and the build job still succeeds.
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -52,7 +54,7 @@ jobs:
           path: docs/
 
       - name: Upload Pages artifact
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-pages-artifact@v5
         with:
           path: docs/
@@ -60,7 +62,7 @@ jobs:
   publish-pages:
     name: Publish to GitHub Pages
     needs: build-docs
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       pages: write
