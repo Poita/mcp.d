@@ -563,8 +563,11 @@ package final class JwksCache : KeySource
 	/// Populate the cache from a raw JWKS document (also the test seam).
 	void load(string jwksJson) @safe
 	{
-		pemByKid = null;
-		allPems = null;
+		// Build new key maps in temporaries so that a parse exception (malformed
+		// JSON or invalid base64url in a JWK field) leaves the existing cache
+		// state untouched rather than clearing it and marking it stale.
+		string[string] newPemByKid;
+		string[] newAllPems;
 		foreach (jwk; parseJwks(jwksJson))
 		{
 			if (!jwkUsableForSig(jwk))
@@ -572,10 +575,13 @@ package final class JwksCache : KeySource
 			const pem = jwkToPem(jwk);
 			if (pem.length == 0)
 				continue;
-			allPems ~= pem;
+			newAllPems ~= pem;
 			if (jwk.kid.length)
-				pemByKid[jwk.kid] = pem;
+				newPemByKid[jwk.kid] = pem;
 		}
+		// Swap atomically into the cache fields only after all parsing succeeds.
+		pemByKid = newPemByKid;
+		allPems = newAllPems;
 		loaded = true;
 		fetchedAt = currentUnixTime();
 	}
@@ -1389,4 +1395,23 @@ unittest  // fetchJwks discards non-2xx bodies so a 503 does not mark the cache 
 
 	assert(failure.length == 0, "fetchJwks HTTP status test failed: " ~ failure);
 	assert(passed);
+}
+
+unittest  // JwksCache.load() retains previous keys when parsing a malformed JWKS document throws
+{
+	// Successful initial load populates the cache.
+	auto cache = new JwksCache("", 300.seconds);
+	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE
+			~ `"}]}`);
+	assert(cache.keysFor("rsa-1").length == 1, "initial load must populate keys");
+
+	// A subsequent load with malformed JSON throws from parseJwks. The previous
+	// keys must remain intact so JWT verification continues to succeed.
+	try
+		cache.load(`{not valid json`);
+	catch (Exception)
+	{
+	}
+	assert(cache.keysFor("rsa-1").length == 1,
+			"keys must survive a failed re-load (clear-then-parse bug)");
 }
