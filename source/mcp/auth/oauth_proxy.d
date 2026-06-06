@@ -188,6 +188,7 @@ AuthorizationServerMetadata authorizationServerMetadata(const OAuthProxyConfig c
 	m.scopesSupported = cfg.scopesSupported.dup;
 	m.grantTypesSupported = ["authorization_code", "refresh_token"];
 	m.tokenEndpointAuthMethodsSupported = ["none"];
+	m.responseTypesSupported = ["code"];
 	return m;
 }
 
@@ -204,9 +205,10 @@ ProtectedResourceMetadata protectedResourceMetadata(const OAuthProxyConfig cfg) 
 
 /// Serialize the RFC 8414 AS metadata document the proxy serves at
 /// `/.well-known/oauth-authorization-server`. Emits the proxy endpoints,
-/// `code_challenge_methods_supported`, `grant_types_supported`,
-/// `token_endpoint_auth_methods_supported`, and (when non-empty)
-/// `scopes_supported`.
+/// `response_types_supported` (RFC 8414 §2 REQUIRED when
+/// `authorization_endpoint` is present), `code_challenge_methods_supported`,
+/// `grant_types_supported`, `token_endpoint_auth_methods_supported`, and
+/// (when non-empty) `scopes_supported`.
 Json authorizationServerMetadataJson(const OAuthProxyConfig cfg) @safe
 {
 	auto m = authorizationServerMetadata(cfg);
@@ -216,6 +218,7 @@ Json authorizationServerMetadataJson(const OAuthProxyConfig cfg) @safe
 	j["token_endpoint"] = m.tokenEndpoint;
 	j["registration_endpoint"] = m.registrationEndpoint;
 	j["code_challenge_methods_supported"] = strArray(m.codeChallengeMethodsSupported);
+	j["response_types_supported"] = strArray(m.responseTypesSupported);
 	j["grant_types_supported"] = strArray(m.grantTypesSupported);
 	j["token_endpoint_auth_methods_supported"] = strArray(m.tokenEndpointAuthMethodsSupported);
 	if (m.scopesSupported.length)
@@ -834,6 +837,15 @@ unittest  // AS metadata JSON omits scopes_supported when none configured
 	cfg.baseUrl = "https://mcp.example.com";
 	auto j = authorizationServerMetadataJson(cfg);
 	assert("scopes_supported" !in j);
+}
+
+unittest  // AS metadata JSON carries response_types_supported as required by RFC 8414 §2
+{
+	auto cfg = sampleConfig();
+	auto j = authorizationServerMetadataJson(cfg);
+	assert("response_types_supported" in j);
+	assert(j["response_types_supported"].length == 1);
+	assert(j["response_types_supported"][0].get!string == "code");
 }
 
 unittest  // PRM names the proxy itself as the authorization server
