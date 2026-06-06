@@ -15,7 +15,7 @@
  *
  * Every observation is asserted against the value the server promises; the
  * process exits NON-ZERO on any mismatch, so CI can run it as an e2e regression
- * test. The transport-agnostic phases (A/B/C) run over BOTH transports; the
+ * test. The transport-agnostic phases (A/C) run over BOTH transports; the
  * mid-flight cancellation phase (D) runs over HTTP, where the cancel signal is
  * tearing down the per-request SSE response stream (a client disconnect). Over
  * stdio the cancel signal is instead a `notifications/cancelled` message, which
@@ -29,25 +29,16 @@
  *     overload) delivers THIS call's progress to a local callback.
  *   - `result.structuredContentAs!T` decodes structured output into a struct.
  *   - typed `callTool(name, T args)` passes a struct for the static-shape calls.
- *   - `ElicitResult.accept(T)` / `CreateMessageResult.text(model, text)` build
- *     the mocked client replies from typed values.
- *   - Installing `onElicitation` alone advertises elicitation; the inbound gate
- *     honours `effectiveCapabilities()`.
  *
  * What it verifies, in order:
  *   A. LIST + PROGRESS + LOGGING (transport-agnostic)
- *      - `listTools()` contains `countdown`, `summarize`, `cancel_stats`, and
+ *      - `listTools()` contains `countdown` and `cancel_stats`, and
  *        `countdown` declares its output schema.
  *      - A `countdown` call with a per-call progress sink streams EXACTLY N
  *        `notifications/progress` (monotonically increasing, last == total,
  *        carrying a progress token) AND N `notifications/message` (level=info,
  *        logger="countdown") BEFORE the final result `{completed:N, total:N,
  *        cancelled:false}`.
- *   B. TYPED ELICITATION + SAMPLING round-trip (transport-agnostic)
- *      - `summarize` opens a blocking server->client elicitation; the client's
- *        mocked `onElicitation` accepts with concrete values, then its mocked
- *        `onSampling` returns a concrete model + text. The structured result
- *        echoes those mocked values exactly.
  *   C. ERROR CODE (transport-agnostic)
  *      - an unknown tool raises McpException with code invalidParams (-32602).
  *   D. CANCELLATION (HTTP only) — disconnect IS the cancel signal on Streamable
@@ -70,21 +61,11 @@ import vibe.data.json : Json;
 import mcp;
 import mcp.client.client : McpClient;
 import mcp.protocol.errors : ErrorCode, McpException;
-import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
-import mcp.protocol.types : ElicitParams, ElicitResult;
 
 import examples_common : check, runClient, connectFromArgs;
 
-// Mocked sampling reply the client returns to the server's `summarize` tool, and
-// the elicited values it accepts. These are the contract: the structured result
-// must echo them back exactly.
-enum string MockedModel = "mock-model-1";
-enum string MockedSummary = "A concise mock summary.";
-enum string ElicitedTone = "concise";
-
-// Typed mirrors of the server's structures, used for typed callTool args,
-// structuredContentAs!T decoding, and the elicitation accept content. They
-// match the server's field names exactly.
+// Typed mirrors of the server's structures, used for typed callTool args and
+// structuredContentAs!T decoding. They match the server's field names exactly.
 
 /// `countdown` arguments.
 struct CountdownArgs
@@ -101,39 +82,17 @@ struct CountdownResult
 	bool cancelled;
 }
 
-/// `summarize` arguments.
-struct SummarizeArgs
-{
-	string text;
-}
-
-/// `summarize` structured result.
-struct SummaryResult
-{
-	string status;
-	string tone;
-	string model;
-	string summary;
-}
-
 /// `cancel_stats` structured result.
 struct CancelStats
 {
 	int cancelled;
 }
 
-/// The flat elicitation content the server's `summarize` tool collects.
-struct Confirm
-{
-	bool proceed;
-	string tone;
-}
-
 int main(string[] args) @safe
 {
 	// Detect the HTTP URL (if any) up front: phase D (mid-flight cancellation) is
 	// HTTP-only and needs to open its OWN draft-mode client to the same URL. The
-	// transport for phases A/B/C is chosen by the scaffold's `connectFromArgs`.
+	// transport for phases A/C is chosen by the scaffold's `connectFromArgs`.
 	string httpUrl;
 	(() @trusted {
 		getopt(args, "http", "Connect over Streamable HTTP to this MCP endpoint.",
@@ -152,25 +111,17 @@ private int run(string[] args, bool useHttp, string httpUrl) @safe
 
 	// One connection for the transport-agnostic phases. `connectFromArgs` picks
 	// HTTP (when --http/--url is given) or spawns the sibling `streaming-server`
-	// over stdio. Handlers are installed BEFORE initialize so the
-	// `sampling`/`elicitation` capabilities are advertised at the handshake.
+	// over stdio.
 	auto client = connectFromArgs(args, "streaming-server");
 	scope (exit)
 		client.close();
-	installMockHandlers(client);
 	client.initialize();
-	client.setLogLevel("debug");
+	// The streaming server is stateless and refuses the `logging/setLevel` RPC
+	// (-32601) on every transport. The server's default minimum log level is "info",
+	// so the countdown's info-level logs flow on both transports without setLogLevel.
+	// The Phase A assertion checks for level == "info", which holds at the default.
 
 	const int progressSeen = phaseListProgressLogging(client, steps);
-	// Typed elicit+sample are server->client requests. They run only
-	// over STDIO (a single implicit connection — server->client is allowed in any
-	// mode). The streaming server is STATELESS (its HTTP phase D needs the draft
-	// transport, which a stateful server cannot serve), and a stateless server
-	// correctly FORBIDS server->client requests over HTTP — so the client skips
-	// this phase over HTTP. The dedicated elicitation/ and sampling/ examples cover
-	// these features over HTTP against stateful servers.
-	if (!useHttp)
-		phaseTypedElicitSampling(client);
 	phaseErrorCode(client);
 
 	if (useHttp)
@@ -187,13 +138,12 @@ private int run(string[] args, bool useHttp, string httpUrl) @safe
 		report("OK [http]: countdown streamed " ~ progressSeen.to!string ~ " progress + "
 				~ progressSeen.to!string ~ " log msgs; unknown-tool error code; "
 				~ "mid-flight cancel honored (cancel_stats "
-				~ cancelledBefore.to!string ~ " -> " ~ cancelledAfter.to!string ~ "). "
-				~ "(elicit+sample skipped over HTTP: stateless server forbids server->client.)");
+				~ cancelledBefore.to!string ~ " -> " ~ cancelledAfter.to!string ~ ").");
 		return 0;
 	}
 
-	report("OK [stdio]: countdown streamed " ~ progressSeen.to!string ~ " progress + "
-			~ progressSeen.to!string ~ " log msgs; typed elicit+sample round-trip verified; "
+	report("OK [stdio]: countdown streamed " ~ progressSeen.to!string
+			~ " progress + " ~ progressSeen.to!string ~ " log msgs; "
 			~ "unknown-tool error code. (phase D not run here: this client cannot inject "
 			~ "notifications/cancelled mid-callTool; the SDK server honours it over stdio "
 			~ "— see serveStdio's unittest.)");
@@ -207,31 +157,13 @@ private void report(string msg) @trusted
 	writeln(msg);
 }
 
-// --- mocked client-side input handlers ---------------------------------------
-
-/// Install the mocked client-side input handlers. Installing them is sufficient:
-/// the handlers auto-advertise the `sampling` / `elicitation` capabilities at
-/// initialize, and the inbound `elicitation/create` gate honours
-/// `effectiveCapabilities()` — so no redundant raw flag-setting is needed.
-private void installMockHandlers(McpClient client) @safe
-{
-	client.onElicitation = (ElicitParams params) @safe {
-		// Accept with concrete values matching the server's flat `Confirm` struct.
-		return ElicitResult.accept(Confirm(true, ElicitedTone));
-	};
-	client.onSampling = (CreateMessageRequest request) @safe {
-		// Return a typed result with a concrete model + summary text.
-		return CreateMessageResult.text(MockedModel, MockedSummary);
-	};
-}
-
 // --- Phase A: list + progress + logging (transport-agnostic) -----------------
 
 private int phaseListProgressLogging(McpClient client, int steps) @safe
 {
 	auto tools = client.listTools().tools;
 	auto names = tools.map!(t => t.name).array;
-	foreach (want; ["countdown", "summarize", "cancel_stats"])
+	foreach (want; ["countdown", "cancel_stats"])
 		check(names.canFind(want), "listTools() must contain '" ~ want ~ "'");
 
 	long idx = -1;
@@ -294,25 +226,6 @@ private int phaseListProgressLogging(McpClient client, int steps) @safe
 		check(l.logger == "countdown", "log logger should be 'countdown', got " ~ l.logger);
 	}
 	return cast(int) progress.length;
-}
-
-// --- Phase B: typed elicitation + sampling round-trip (transport-agnostic) ----
-
-private void phaseTypedElicitSampling(McpClient client) @safe
-{
-	auto r = client.callTool("summarize",
-			SummarizeArgs("The quick brown fox jumps over the lazy dog."));
-	check(!r.isError, "summarize should not be an error");
-	check(r.structuredContent.type == Json.Type.object, "summarize must return structuredContent");
-	const sc = r.structuredContentAs!SummaryResult;
-	check(sc.status == "summarized", "summarize status should be 'summarized', got " ~ sc.status);
-	check(sc.tone == ElicitedTone,
-			"summarize tone should echo the elicited '" ~ ElicitedTone ~ "', got " ~ sc.tone);
-	check(sc.model == MockedModel,
-			"summarize model should echo the mocked sampling model '"
-			~ MockedModel ~ "', got " ~ sc.model);
-	check(sc.summary == MockedSummary, "summarize summary should echo the mocked sampling text '"
-			~ MockedSummary ~ "', got " ~ sc.summary);
 }
 
 // --- Phase C: error code (transport-agnostic) --------------------------------
@@ -415,7 +328,7 @@ private int phaseCancellation(string url, int cancelledBefore) @trusted
 	return after;
 }
 
-// --- Phase C/D helpers: read the server-side cancel counter -------------------
+// --- Phase D helper: read the server-side cancel counter ---------------------
 
 private int readCancelCount(string url) @safe
 {
