@@ -517,8 +517,8 @@ final class OAuthClient
 		}, (scope HTTPClientResponse res) {
 			auto body = res.bodyReader.readAllUTF8();
 			if (res.statusCode / 100 != 2)
-				throw internalError("Token endpoint returned HTTP " ~ res.statusCode.to!string
-						~ (body.length ? ": " ~ body : ""));
+				throw internalError("Token endpoint returned HTTP " ~ res.statusCode.to!string ~ (
+					body.length ? ": " ~ body : ""));
 			result = body.length ? parseJsonString(body) : Json.emptyObject;
 		});
 		return result;
@@ -928,7 +928,8 @@ unittest  // postParse treats a non-2xx token-endpoint response as an error
 {
 	import std.conv : to;
 	import std.exception : assertThrown;
-	import vibe.http.server : HTTPServerRequest, HTTPServerResponse, HTTPServerSettings, listenHTTP;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
 
 	// Spin up a loopback server that always returns 400 with an OAuth error body.
 	auto settings = new HTTPServerSettings();
@@ -938,7 +939,7 @@ unittest  // postParse treats a non-2xx token-endpoint response as an error
 		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
 			res.statusCode = 400;
 			res.writeBody(`{"error":"invalid_client","error_description":"bad credentials"}`,
-					"application/json");
+				"application/json");
 		});
 	}();
 	scope (exit)
