@@ -4,6 +4,7 @@ import vibe.http.server;
 import vibe.http.router : URLRouter;
 import vibe.stream.operations : readAllUTF8;
 import vibe.data.json : Json;
+import std.typecons : Nullable;
 
 import mcp.server.server;
 import mcp.protocol.jsonrpc;
@@ -1063,12 +1064,21 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 /// notifications onto it. The connection is held open (with SSE comment
 /// heartbeats) until the client disconnects.
 private void handleListenStream(McpServer server, StreamCoordinator coord,
-		Message msg, HTTPServerResponse res) @safe
+		Message msg, HTTPServerResponse res, string protoHeader, string connToken) @safe
 {
-	// Record the opted-in filters (route -> doSubscribeListen). The one-shot
-	// JSON result is discarded: on this path the acknowledgement is delivered as
-	// the first SSE event instead.
-	server.handle(msg);
+	// Record the opted-in filters (route -> doSubscribeListen). The one-shot JSON
+	// result is discarded on success: the acknowledgement is delivered as the
+	// first SSE event instead. A routing error (e.g. the version gate rejected
+	// the request) is surfaced as a JSON-RPC error response — listen is draft-only,
+	// so a method-not-found rides the draft 404 — rather than opening the stream
+	// with a stale filter.
+	auto routed = routeListenRequest(server, msg, protoHeader, connToken);
+	if (!routed.isNull)
+	{
+		res.statusCode = httpStatusForResponse(routed.get, true);
+		res.writeBody(routed.get.toString(), "application/json");
+		return;
+	}
 	// Capture THIS request's parsed filter once, immediately after routing, so both
 	// the per-stream listener and its acknowledgement reflect exactly this listen
 	// request's opt-in (draft basic/utilities/subscriptions §Multiple Concurrent
@@ -1110,21 +1120,26 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	runSseHeartbeat(writeFrame);
 }
 
-/// A minimal connection-scoped `RequestContext` used only to dispatch an inbound
-/// notification (notably `notifications/cancelled`) on the Streamable HTTP
-/// transport while carrying the request's per-connection token. It
-/// has no server->client channel: the cancellation path only reads the
-/// connection token to scope the in-flight cancellation key, and never emits
-/// progress/logging or server-initiated requests. It inherits the no-op member
-/// bodies from `BaseRequestContext` and overrides only the connection scope and
-/// the no-channel exception message.
-private final class HttpNotifyContext : BaseRequestContext, ConnectionScoped
+/// A minimal connection-scoped `RequestContext` for one-shot dispatches on the
+/// Streamable HTTP transport that carry a per-connection token and
+/// `ConnectionState` but never stream server->client traffic. Two paths use it:
+/// an inbound `notifications/cancelled` (which reads the token to scope the
+/// in-flight cancellation key), and the draft `subscriptions/listen` route (which
+/// reads the `ConnectionState` so dispatch resolves the draft effective version
+/// before the long-lived stream is wired up on the push channel separately). It
+/// has no server->client channel — it never emits progress/logging or
+/// server-initiated requests — inheriting the no-op member bodies from
+/// `BaseRequestContext` and overriding only the connection scope and the
+/// no-channel exception message.
+private final class HttpScopedContext : BaseRequestContext, ConnectionScoped
 {
 	private string token_;
-	// The session's ConnectionState, so an inbound
-	// `notifications/cancelled` on this connection flips the cancellation token in
-	// the SAME per-session in-flight registry the request side used. Null in
-	// stateless mode (no session, no cross-POST cancellation correlation).
+	// The request's ConnectionState. For an inbound `notifications/cancelled` this
+	// is the session's state, so the cancellation flips the token in the SAME
+	// per-session in-flight registry the request side used (null in stateless mode,
+	// which has no cross-POST cancellation correlation). For the draft listen route
+	// it is the per-request draft state, so dispatch resolves the draft effective
+	// version and serves the draft-only listen RPC.
 	private ConnectionState connState_;
 
 	this(string token, ConnectionState connState = null) @safe
@@ -1145,8 +1160,54 @@ private final class HttpNotifyContext : BaseRequestContext, ConnectionScoped
 
 	protected override Json noChannel() @safe
 	{
-		throw internalError("notification context has no server-to-client channel");
+		throw internalError("connection-scoped context has no server-to-client channel");
 	}
+}
+
+/// Route a draft `subscriptions/listen` through `server.handle` with a
+/// draft-aware `ConnectionState`, so dispatch resolves the draft effective
+/// version — and thus the draft-only listen RPC — even when the draft was
+/// signalled by the `MCP-Protocol-Version` header alone (no body
+/// `_meta.protocolVersion`). The state is built the same way the regular POST
+/// path builds it (`freshStatelessState`: header, then body `_meta`, then the
+/// server default). On success the server has recorded this request's per-stream
+/// filter (`lastListenFilter`) and `null` is returned; when routing rejects the
+/// request the JSON-RPC error response is returned for the caller to surface
+/// instead of opening a stream with a stale filter.
+private Nullable!Json routeListenRequest(McpServer server, Message msg,
+		string protoHeader, string connToken) @safe
+{
+	ConnectionState reqState = freshStatelessState(protoHeader, msg.params,
+			server.negotiatedVersion);
+	auto resp = server.handle(msg, new HttpScopedContext(connToken, reqState));
+	if (!resp.isNull && "error" in resp.get && resp.get["error"].type == Json.Type.object)
+		return resp;
+	return Nullable!Json.init;
+}
+
+unittest  // a draft listen signalled by the header alone routes against the draft version
+{
+	import mcp.protocol.jsonrpc : makeRequest, Message;
+
+	// A draft client may signal the draft via the MCP-Protocol-Version header
+	// alone, with no `_meta.protocolVersion` in the body. The listen routing must
+	// still dispatch against the draft effective version so the draft-only
+	// subscriptions/listen RPC is served (not -32601 methodNotFound) and THIS
+	// request's opt-in filter is recorded — not dropped on an error path that
+	// would open the stream with a stale filter.
+	auto server = McpServer.stateful("t", "1");
+	server.enableToolsListChanged();
+
+	Json notifications = Json.emptyObject;
+	notifications["toolsListChanged"] = true;
+	Json params = Json.emptyObject;
+	params["notifications"] = notifications;
+	auto msg = Message(makeRequest(Json(7), "subscriptions/listen", params));
+
+	auto routed = routeListenRequest(server, msg, "2026-07-28", "");
+	assert(routed.isNull, "a header-signalled draft listen must route, not error");
+	assert(server.lastListenFilter().active);
+	assert(server.lastListenFilter().toolsListChanged);
 }
 
 /// Validate the draft-only request headers on a POSTed JSON-RPC request, returning
@@ -1342,7 +1403,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// stateless has no cross-POST correlation, so the state is null there.
 		ConnectionState noteState = (sessions !is null && sessionsApply(server.negotiatedVersion)) ? sessions
 			.stateFor(connToken) : null;
-		server.handle(msg, new HttpNotifyContext(connToken, noteState));
+		server.handle(msg, new HttpScopedContext(connToken, noteState));
 		res.statusCode = HTTPStatus.accepted;
 		res.writeBody("", "text/plain");
 		return;
@@ -1424,7 +1485,8 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			// is driven by this stream's own per-URI `SubscriptionFilter` at the push
 			// channel. (The 2025-era resources/subscribe RPC and the standalone GET
 			// stream stay gated in stateless; only this draft listen path is opened.)
-			handleListenStream(server, coord, msg, res);
+			handleListenStream(server, coord, msg, res,
+					req.headers.get(HttpHeader.protocolVersion, ""), connToken);
 			return;
 		}
 		// The effective version for this POST decides whether a server-initiated
