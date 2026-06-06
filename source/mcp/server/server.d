@@ -2722,7 +2722,7 @@ final class McpServer
 		// server shares one fallback `ConnectionState` across its sequential
 		// single-peer clients, each of which legitimately performs its own
 		// `initialize` handshake, so the guard applies only to stateful sessions.
-		if (mode_ == ServerMode.stateful && conn.negotiated_)
+		if (mode_ == ServerMode.stateful && conn.initializeProcessed)
 			throw invalidRequest("Session already initialized");
 
 		// The client MUST send a protocol version to negotiate; an omitted, empty,
@@ -2752,7 +2752,7 @@ final class McpServer
 		// re-init guard above rejects a second one even if it arrives before the
 		// client's `notifications/initialized`.
 		if (mode_ == ServerMode.stateful)
-			conn.negotiated_ = true;
+			conn.initializeProcessed = true;
 
 		InitializeResult result;
 		result.protocolVersion = conn.negotiated.toWire;
