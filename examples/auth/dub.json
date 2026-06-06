@@ -11,15 +11,13 @@
 			"name": "server",
 			"targetType": "executable",
 			"targetName": "auth-server",
-			"mainSourceFile": "server.d",
-			"sourceFiles": ["server.d"]
+			"mainSourceFile": "server.d"
 		},
 		{
 			"name": "client",
 			"targetType": "executable",
 			"targetName": "auth-client",
-			"mainSourceFile": "client.d",
-			"sourceFiles": ["client.d"]
+			"mainSourceFile": "client.d"
 		}
 	]
 }
