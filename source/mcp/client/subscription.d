@@ -1,5 +1,7 @@
 module mcp.client.subscription;
 
+import core.atomic : atomicLoad, cas;
+
 /// The set of change-notification types a draft client opts into when opening a
 /// `subscriptions/listen` stream (draft basic/utilities/subscriptions). The three
 /// list-changed booleans request `notifications/tools|prompts|resources/list_changed`;
@@ -49,9 +51,11 @@ final class SubscriptionStream
 	/// the transport-supplied `onCancel` (if any) runs only on the first call.
 	void cancel() @safe nothrow
 	{
-		if (cancelled_ !is null && !*cancelled_)
+		// Atomic compare-and-swap so only the thread that flips the flag from
+		// false to true runs onCancel_; concurrent cancel() calls see the flag
+		// already set and skip it, guaranteeing exactly-once teardown.
+		if (cancelled_ !is null && cas(cancelled_, false, true))
 		{
-			*cancelled_ = true;
 			if (onCancel_ !is null)
 				onCancel_();
 		}
@@ -66,7 +70,7 @@ final class SubscriptionStream
 	/// Whether `cancel()`/`close()` has been called.
 	bool cancelled() const @safe nothrow @nogc
 	{
-		return cancelled_ !is null && *cancelled_;
+		return cancelled_ !is null && atomicLoad(*cancelled_);
 	}
 }
 
@@ -80,6 +84,43 @@ unittest  // a SubscriptionStream handle reports and toggles its cancelled state
 	assert(*cancelled);
 	s.close(); // idempotent
 	assert(s.cancelled);
+}
+
+unittest  // onCancel fires exactly once even when many threads call cancel() concurrently
+{
+	import core.thread : Thread;
+	import core.atomic : atomicLoad, atomicStore, atomicOp;
+
+	// Repeat to give the read-then-write race ample opportunity to surface.
+	foreach (iteration; 0 .. 500)
+	{
+		auto cancelled = () @trusted { return new shared bool(false); }();
+		shared int closes = 0;
+		auto s = new SubscriptionStream(cancelled, () @safe nothrow{
+			atomicOp!"+="(closes, 1);
+		});
+
+		// All threads spin on a shared gate so they enter cancel() together,
+		// maximising the overlap of the unguarded read-then-write window.
+		shared bool start = false;
+		enum threadCount = 16;
+		Thread[threadCount] threads;
+		foreach (ref t; threads)
+		{
+			t = new Thread({
+				while (!atomicLoad(start))
+				{
+				}
+				s.cancel();
+			});
+			t.start();
+		}
+		atomicStore(start, true);
+		foreach (t; threads)
+			t.join();
+
+		assert(atomicLoad(closes) == 1, "onCancel must fire exactly once under concurrent cancel()");
+	}
 }
 
 unittest  // a transport onCancel (e.g. HTTP socket close) runs exactly once on first cancel
