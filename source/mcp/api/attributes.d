@@ -71,8 +71,9 @@ struct hintTitle
 
 /// UDA declaring a `@tool`-annotated method's per-tool task-augmented execution
 /// support (the MCP 2025-11-25 `Tool.execution` descriptor). Attach alongside
-/// `@tool`; `taskSupport` must be one of `"forbidden"` (the default when this
-/// UDA is absent), `"optional"`, or `"required"`.
+/// `@tool`; `taskSupport` must be `"optional"` or `"required"`. Using
+/// `"forbidden"` (or omitting this UDA entirely) leaves the `execution` field
+/// absent from the wire form — both are equivalent to the spec default.
 ///
 /// Example:
 /// ---
@@ -82,7 +83,7 @@ struct hintTitle
 /// ---
 struct toolExecution
 {
-	string taskSupport; /// "forbidden" | "optional" | "required"
+	string taskSupport; /// "optional" | "required" (or "forbidden" as a no-op self-documenting marker)
 }
 
 /// UDA marking a method as an MCP prompt. The method returns the prompt's

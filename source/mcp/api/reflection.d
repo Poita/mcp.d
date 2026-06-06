@@ -515,7 +515,7 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 					|| a.taskSupport == "optional" || a.taskSupport == "required",
 					"@toolExecution requires one of forbidden/optional/required, got \""
 					~ a.taskSupport ~ "\"");
-			if (a.taskSupport.length)
+			if (a.taskSupport.length && a.taskSupport != "forbidden")
 				descriptor.execution = ToolExecution(nullable(a.taskSupport));
 		}
 	}
@@ -1334,6 +1334,29 @@ unittest  // @toolExecution reflection: execution.taskSupport appears in tools/l
 	assert(renderTool["execution"]["taskSupport"].get!string == "optional");
 	// A tool without @toolExecution carries no execution object.
 	assert("execution" !in addTool);
+}
+
+version (unittest) private class ForbiddenExecutionApi
+{
+	@tool("noop", "No-op tool")
+	@toolExecution("forbidden")
+	string noop() @safe
+	{
+		return "noop";
+	}
+}
+
+unittest  // @toolExecution("forbidden") is wire-equivalent to absent UDA: no execution field emitted
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ForbiddenExecutionApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+	assert(tools.length == 1);
+	// @toolExecution("forbidden") must not emit an execution field — it is wire-equivalent to absent.
+	assert("execution" !in tools[0]);
 }
 
 version (unittest) private class ValidExecutionApi
