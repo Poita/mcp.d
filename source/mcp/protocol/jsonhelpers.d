@@ -53,9 +53,9 @@ bool tryGet(T)(Json j, string key, ref T val) @safe if (!is(T : Nullable!U, U))
 	return true;
 }
 
-/// `Nullable` overload: assigns the unwrapped value into `val` (leaving it null
-/// on a missing/mismatched field), so a struct's `Nullable!T` field can be filled
-/// directly without a temporary.
+/// `Nullable` overload: assigns the unwrapped value into `val` (leaving it
+/// untouched — preserving any pre-set default — on a missing/mismatched field),
+/// so a struct's `Nullable!T` field can be filled directly without a temporary.
 bool tryGet(N : Nullable!T, T)(Json j, string key, ref N val) @safe
 {
 	T tmp;
@@ -110,4 +110,15 @@ bool tryGet(N : Nullable!T, T)(Json j, string key, ref N val) @safe
 	string s = "orig";
 	assert(!tryGet(j, "title", s));
 	assert(s == "orig");
+}
+
+@safe unittest  // Nullable tryGet preserves a pre-set non-null val when key is absent
+{
+	import std.typecons : nullable;
+
+	Json j = Json.emptyObject;
+	Nullable!string s = "sentinel";
+	assert(!tryGet(j, "missing", s));
+	assert(!s.isNull);
+	assert(s.get == "sentinel");
 }
