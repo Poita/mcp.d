@@ -179,6 +179,9 @@ final class RequestStateCodec
 			return Nullable!string.init;
 		const payloadBytes = base64UrlDecode(parts[1]);
 		const presentedMac = base64UrlDecode(parts[2]);
+		// Reject an absent or wrong-length MAC outright; a valid MAC is 32 bytes.
+		if (presentedMac.length != 32)
+			return Nullable!string.init;
 		const expectedMac = hmacSha256(key, payloadBytes);
 		if (!constantTimeEquals(presentedMac, expectedMac))
 			return Nullable!string.init;
@@ -261,8 +264,10 @@ private ubyte[] hmacSha256(const(ubyte)[] key, const(ubyte)[] data) @trusted
 	const k = key.length ? key.ptr : (cast(const(ubyte)*) "".ptr);
 	auto r = HMAC(EVP_sha256(), k, cast(int) key.length, data.length ? data.ptr
 			: null, data.length, mac.ptr, &macLen);
+	// A failed HMAC must never yield an empty MAC: an empty expected MAC would let
+	// verification accept a forged empty MAC. Throw so the codec fails closed.
 	if (r is null || macLen != 32)
-		return null;
+		throw new Exception("HMAC-SHA256 failed");
 	return mac.dup;
 }
 
@@ -276,13 +281,15 @@ private void randomBytes(ubyte[] dst) @trusted
 }
 
 /// Constant-time byte comparison (timing-safe). Differing lengths compare
-/// unequal without short-circuiting on the common prefix.
+/// unequal without short-circuiting on the common prefix. An empty side always
+/// compares unequal: a MAC verifier must reject when either MAC is absent rather
+/// than accept two empty slices as a match.
 private bool constantTimeEquals(const(ubyte)[] a, const(ubyte)[] b) @trusted
 {
+	if (a.length == 0 || b.length == 0)
+		return false;
 	if (a.length != b.length)
 		return false;
-	if (a.length == 0)
-		return true;
 	return CRYPTO_memcmp(a.ptr, b.ptr, a.length) == 0;
 }
 
@@ -525,4 +532,28 @@ unittest  // a garbage / non-envelope wire string decodes to null, not a throw
 	assert(codec.decode("not-a-valid-blob", "alice", "tool").isNull);
 	assert(codec.decode("", "alice", "tool").isNull);
 	assert(codec.decode("v1e.@@@", "alice", "tool").isNull);
+}
+
+unittest  // constantTimeEquals is fail-closed: an empty side never compares equal
+{
+	const ubyte[] empty;
+	const ubyte[] some = [1, 2, 3];
+	// Two empty slices must NOT be treated as equal: a MAC verifier must reject
+	// when the expected MAC could not be computed (hmacSha256 returned empty).
+	assert(!constantTimeEquals(empty, empty));
+	assert(!constantTimeEquals(empty, some));
+	assert(!constantTimeEquals(some, empty));
+	assert(constantTimeEquals(some, some));
+}
+
+unittest  // signed: an envelope presenting an empty MAC segment is rejected
+{
+	import std.array : split;
+
+	auto codec = signedCodec(RequestStateBinding.none);
+	const wire = codec.encode(`{"step":1}`, "", "tool");
+	auto parts = wire.split('.');
+	// Forge the same payload with an empty MAC (base64url of an empty slice).
+	const forged = parts[0] ~ "." ~ parts[1] ~ ".";
+	assert(codec.decode(forged, "", "tool").isNull);
 }
