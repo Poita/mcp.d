@@ -2183,6 +2183,8 @@ final class McpServer
 				throw methodNotFound(method);
 			return doListTools(params, ver);
 		case "tools/call":
+			if (capabilities().tools.isNull)
+				throw methodNotFound(method);
 			return doCallTool(params, ctx, ver, conn);
 		case "resources/list":
 			if (capabilities().resources.isNull)
@@ -2193,6 +2195,8 @@ final class McpServer
 				throw methodNotFound(method);
 			return doListResourceTemplates(params, ver);
 		case "resources/read":
+			if (capabilities().resources.isNull)
+				throw methodNotFound(method);
 			return doReadResource(params, ctx, ver);
 		case "resources/subscribe":
 			// The draft has no resources/subscribe RPC; subscriptions/listen takes
@@ -2213,6 +2217,8 @@ final class McpServer
 				throw methodNotFound(method);
 			return doListPrompts(params, ver);
 		case "prompts/get":
+			if (capabilities().prompts.isNull)
+				throw methodNotFound(method);
 			return doGetPrompt(params, ctx, ver);
 		case "completion/complete":
 			return doComplete(params);
@@ -2790,19 +2796,22 @@ final class McpServer
 		//   (a) a tool whose execution.taskSupport == "required" invoked WITHOUT
 		//       task augmentation is rejected (the tool cannot be run synchronously);
 		//       this is independent of whether tasks were declared.
-		//   (b) a task-augmented call (the 2025-11-25 `task` param) is rejected with
-		//       -32601 ONLY when the server actually declared task support for
-		//       `tools/call`. A receiver that never declared the task capability MUST
-		//       process the request normally, ignoring the task augmentation
+		//   (b) a task-augmented call (the 2025-11-25 `task` param) is rejected ONLY
+		//       when the server actually declared task support for `tools/call`. A
+		//       receiver that never declared the task capability MUST process the
+		//       request normally, ignoring the task augmentation
 		//       (basic/utilities/tasks: "Receivers that do not declare the task
 		//       capability for a request type MUST process requests of that type
 		//       normally, ignoring any task-augmentation metadata if present").
+		// The tool is registered, so this is reported as an invalid request rather
+		// than -32601 (method not found), whose "Method not found: <tool>" message
+		// would misleadingly imply the tool name itself is unknown.
 		const bool taskRequired = !entry.descriptor.execution.isNull
 			&& !entry.descriptor.execution.get.taskSupport.isNull
 			&& entry.descriptor.execution.get.taskSupport.get == "required";
 		const bool taskAugmented = isTaskAugmented(params) && declaresTaskToolsCall();
 		if (taskAugmented || taskRequired)
-			throw methodNotFound(name);
+			throw invalidRequest("Task-based execution of tool '" ~ name ~ "' is not supported");
 
 		Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
 		// Validate the supplied arguments against the tool's declared inputSchema
@@ -3728,7 +3737,7 @@ unittest  // a taskSupport:"required" tool invoked WITHOUT augmentation is rejec
 	params["name"] = "longjob";
 	auto resp = s.handle(req(4, "tools/call", params)).get;
 	assert("error" in resp, "a required-task tool must not run synchronously");
-	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
 	assert(!ran, "the handler must not execute for a required-task tool sans augmentation");
 }
 
@@ -3774,7 +3783,7 @@ unittest  // a task-augmented tools/call is rejected when the server declared ta
 	params["task"] = Json.emptyObject; // 2025-11-25 task augmentation
 	auto resp = s.handle(req(4, "tools/call", params)).get;
 	assert("error" in resp, "a declared task-augmented call cannot be served as a CallToolResult");
-	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
 	assert(!ran);
 }
 
@@ -3794,6 +3803,64 @@ unittest  // an ordinary (non-augmented) call to an optional-task tool still run
 	auto resp = s.handle(req(4, "tools/call", params)).get;
 	assert("error" !in resp, "an optional-task tool runs normally without augmentation");
 	assert(resp["result"]["content"][0]["text"].get!string == "ok");
+}
+
+unittest  // a task-gated rejection reports an accurate error, not a misleading methodNotFound
+{
+	// The tool IS registered, so -32601 "Method not found: longjob" would wrongly
+	// suggest the tool name is unknown. The rejection is about the unsupported
+	// task-execution mode, so it must carry an accurate message that does not read
+	// as "method not found".
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("task-msg-srv", "0.1.0");
+	Tool t = {name: "longjob"};
+	t.execution = ToolExecution(nullable("required"));
+	s.registerDynamicTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+
+	Json params = Json.emptyObject;
+	params["name"] = "longjob";
+	auto resp = s.handle(req(1, "tools/call", params)).get;
+	assert("error" in resp);
+	assert(resp["error"]["code"].get!int != ErrorCode.methodNotFound);
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
+	const msg = resp["error"]["message"].get!string;
+	assert(msg.canFind("longjob"));
+	assert(!msg.canFind("Method not found"));
+}
+
+unittest  // tools/call is -32601 when the server advertises no tools capability
+{
+	// A server that never registered a tool advertises no `tools` capability, so a
+	// tools/call MUST be reported as -32601 (method not found), not -32602
+	// (invalid params / unknown tool), mirroring the gating of tools/list.
+	auto s = new McpServer("no-tools-srv", "0.1.0");
+	Json p = Json.emptyObject;
+	p["name"] = "nope";
+	auto resp = s.handle(req(1, "tools/call", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+}
+
+unittest  // resources/read is -32601 when the server advertises no resources capability
+{
+	auto s = new McpServer("no-res-srv", "0.1.0");
+	Json p = Json.emptyObject;
+	p["uri"] = "file:///nope";
+	auto resp = s.handle(req(1, "resources/read", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+}
+
+unittest  // prompts/get is -32601 when the server advertises no prompts capability
+{
+	auto s = new McpServer("no-prompt-srv", "0.1.0");
+	Json p = Json.emptyObject;
+	p["name"] = "nope";
+	auto resp = s.handle(req(1, "prompts/get", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
 unittest  // tools/list emits a tool descriptor's _meta
@@ -4804,6 +4871,8 @@ unittest  // resources/read keeps per-content _meta for a 2025-06-18 client
 unittest  // resources/read for an unknown uri is resourceNotFound
 {
 	auto s = new McpServer("t", "1");
+	Resource r = {uri: "test://x", name: "x"};
+	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
 	Json p = Json.emptyObject;
 	p["uri"] = "test://missing";
 	auto resp = s.handle(req(1, "resources/read", p)).get;
@@ -4813,6 +4882,8 @@ unittest  // resources/read for an unknown uri is resourceNotFound
 unittest  // resources/read not-found carries structured data.uri (spec example shape)
 {
 	auto s = new McpServer("t", "1");
+	Resource r = {uri: "test://x", name: "x"};
+	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
 	Json p = Json.emptyObject;
 	p["uri"] = "test://missing";
 	auto resp = s.handle(req(1, "resources/read", p)).get;
@@ -6230,6 +6301,8 @@ unittest  // draft: a raw CallToolResult carrying inputRequests is stamped "inpu
 unittest  // draft resources/read unknown uri uses invalidParams (-32602)
 {
 	auto s = new McpServer("t", "1");
+	Resource r = {uri: "test://x", name: "x"};
+	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
 	Json p = Json.emptyObject;
 	p["uri"] = "test://missing";
 	auto resp = s.handle(draftReq(3, "resources/read", p)).get;
