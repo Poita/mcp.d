@@ -1254,8 +1254,7 @@ version (Posix) unittest  // FileTokenStore.writeSecretFile does not draw from t
 	import std.datetime.systime : Clock;
 	import std.conv : to;
 
-	auto root = buildPath(tempDir,
-			"mcp-login-mt-" ~ Clock.currTime().toUnixTime().to!string);
+	auto root = buildPath(tempDir, "mcp-login-mt-" ~ Clock.currTime().toUnixTime().to!string);
 	mkdirRecurse(root);
 	scope (exit)
 		() @trusted { rmdirRecurse(root); }();
