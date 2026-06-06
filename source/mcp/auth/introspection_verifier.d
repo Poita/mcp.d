@@ -226,8 +226,16 @@ private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
 /// The keyed lookup is not constant-time, but a hit requires the attacker to
 /// already present a token that introspected as active, so it is not a guessing
 /// oracle; opaque bearer tokens are assumed to be high-entropy secrets.
+///
+/// Every `put` sweeps entries whose `expiresAt` is in the past, and when a new
+/// key would push `entries.length` past `maxEntries`, the entry with the earliest
+/// `expiresAt` is evicted. This keeps memory bounded under sustained load with
+/// many distinct short-lived tokens.
 final class PositiveCache
 {
+	/// Default maximum number of live cache entries.
+	enum size_t defaultMaxEntries = 10_000;
+
 	private struct Entry
 	{
 		TokenInfo info;
@@ -235,11 +243,19 @@ final class PositiveCache
 	}
 
 	private Duration ttl;
+	private size_t maxEntries;
 	private Entry[string] entries;
 
-	this(Duration ttl) @safe
+	this(Duration ttl, size_t maxEntries = defaultMaxEntries) @safe
 	{
 		this.ttl = ttl;
+		this.maxEntries = maxEntries;
+	}
+
+	/// Number of live (not yet swept) entries.
+	size_t length() @safe
+	{
+		return entries.length;
 	}
 
 	/// Return the cached `TokenInfo` for `token` if present and unexpired.
@@ -256,14 +272,52 @@ final class PositiveCache
 
 	/// Cache a positive result for `token`. The entry expiry is the TTL, clamped
 	/// down to the token's own `exp` (RFC 7662) when present, so a cached result
-	/// never outlives the token it represents.
+	/// never outlives the token it represents. Expired entries are swept on every
+	/// call; when the cap would be exceeded by a new key, the soonest-expiring
+	/// entry is evicted first.
 	void put(string token, TokenInfo info, long now) @safe
 	{
 		long expiresAt = now + cast(long) ttl.total!"seconds";
 		const exp = introspectionExp(info.claims);
 		if (exp > 0 && exp < expiresAt)
 			expiresAt = exp;
+		sweep(now);
+		if (maxEntries != 0 && (token in entries) is null)
+			while (entries.length >= maxEntries)
+				evictOldest();
 		entries[token] = Entry(info, expiresAt);
+	}
+
+	// Remove all entries whose expiresAt is not in the future.
+	private void sweep(long now) @safe
+	{
+		if (entries.length == 0)
+			return;
+		string[] expired;
+		foreach (k, ref e; entries)
+			if (now >= e.expiresAt)
+				expired ~= k;
+		foreach (k; expired)
+			entries.remove(k);
+	}
+
+	// Evict the entry with the earliest expiresAt (closest to expiry / most stale).
+	private void evictOldest() @safe
+	{
+		string oldest;
+		long oldestExpiry = long.max;
+		bool found;
+		foreach (k, ref e; entries)
+		{
+			if (!found || e.expiresAt < oldestExpiry)
+			{
+				oldest = k;
+				oldestExpiry = e.expiresAt;
+				found = true;
+			}
+		}
+		if (found)
+			entries.remove(oldest);
 	}
 }
 
@@ -565,4 +619,37 @@ unittest  // HttpIntrospector refuses an internal/link-local introspection endpo
 	cfg.introspectionEndpoint = "https://169.254.169.254/introspect";
 	auto introspector = new HttpIntrospector(cfg);
 	assertThrown(introspector.introspect("some-token"));
+}
+
+unittest  // PositiveCache does not grow beyond the configured maxEntries cap
+{
+	// A cache with cap of 3 — inserting 5 distinct tokens must not keep all 5.
+	auto cache = new PositiveCache(60.seconds, 3);
+	TokenInfo ti;
+	ti.valid = true;
+	foreach (i; 0 .. 5)
+	{
+		import std.conv : to;
+
+		cache.put("tok-" ~ i.to!string, ti, 1000);
+	}
+	// The map must be capped; all 5 entries must NOT all be present.
+	assert(cache.length <= 3);
+}
+
+unittest  // PositiveCache sweeps expired entries on put, reclaiming space
+{
+	// All entries inserted at t=1000 with ttl=30s expire at t=1030.
+	// After advancing past expiry, a new put must sweep the stale entries.
+	auto cache = new PositiveCache(30.seconds, 10);
+	TokenInfo ti;
+	ti.valid = true;
+	cache.put("a", ti, 1000);
+	cache.put("b", ti, 1000);
+	// Advance past expiry and insert a new entry.
+	cache.put("c", ti, 1031);
+	// "a" and "b" should have been swept; only "c" should remain.
+	assert(cache.get("a", 1031) is null);
+	assert(cache.get("b", 1031) is null);
+	assert(cache.get("c", 1031) !is null);
 }
