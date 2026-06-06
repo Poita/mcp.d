@@ -104,7 +104,22 @@ string makeClientAssertion(string clientId, string audience, string privateKeyPe
 	if (jti.length && containsControlChar(jti))
 		throw new Exception("makeClientAssertion: jti contains control characters");
 
-	const theJti = jti.length ? jti : ("jti-" ~ now.to!string);
+	string theJti;
+	if (jti.length)
+	{
+		theJti = jti;
+	}
+	else
+	{
+		import mcp.auth.csprng : cryptoRandomBytes;
+		import std.base64 : Base64URLNoPadding;
+
+		// Append 8 random bytes (base64url, no padding) so the JTI is unique
+		// even when two assertions are generated within the same wall-clock second.
+		// RFC 7523 §3 requires each jti to be unique per assertion.
+		auto randomSuffix = () @trusted { return cryptoRandomBytes(8); }();
+		theJti = "jti-" ~ now.to!string ~ "-" ~ Base64URLNoPadding.encode(randomSuffix).idup;
+	}
 
 	auto payloadJson = Json.emptyObject;
 	payloadJson["iss"] = clientId;
@@ -387,6 +402,34 @@ unittest  // mintJwtEs256 fails closed on control characters in a claim
 	claims.iss = "https://auth.example.com";
 	claims.sub = "bad\nsub";
 	assertThrown(mintJwtEs256(testEcPem, claims));
+}
+
+unittest  // auto-generated jti values are unique even when now is identical across calls
+{
+	import std.array : split;
+	import std.base64 : Base64URLNoPadding;
+	import vibe.data.json : parseJsonString;
+
+	const pem = "-----BEGIN PRIVATE KEY-----\n"
+		~ "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7K6+stITLYsQjC9o\n"
+		~ "hyL925dgd6gNWRcGOl5RPvIpye+hRANCAATSBYPkHq12VDW5un1kub6zkBc4ieZ9\n"
+		~ "nurGMu+tLzJ6+6syOZsQCGlazcSOGsopLyl1QZMIFh9atUYaDfUjJxMq\n"
+		~ "-----END PRIVATE KEY-----\n";
+	// Use the same `now` for both calls, as happens when two concurrent requests
+	// hit the token endpoint within the same wall-clock second.
+	const now = 1_700_000_000L;
+	auto jwt1 = makeClientAssertion("client-1", "https://as.example.com/token", pem, now);
+	auto jwt2 = makeClientAssertion("client-1", "https://as.example.com/token", pem, now);
+	auto payload1 = () @trusted {
+		return (cast(char[]) Base64URLNoPadding.decode(jwt1.split('.')[1])).idup;
+	}();
+	auto payload2 = () @trusted {
+		return (cast(char[]) Base64URLNoPadding.decode(jwt2.split('.')[1])).idup;
+	}();
+	auto j1 = parseJsonString(payload1);
+	auto j2 = parseJsonString(payload2);
+	// The two auto-generated JTI values must differ to prevent replay rejection.
+	assert(j1["jti"].get!string != j2["jti"].get!string);
 }
 
 unittest  // bnToFixed throws when the BIGNUM is zero (n == 0) rather than silently zeroing dst
