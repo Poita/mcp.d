@@ -1,0 +1,27 @@
+{
+	"name": "bench",
+	"description": "Local throughput benchmark for the mcp.d Streamable HTTP client + server",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp-d": { "path": "../" }
+	},
+	"buildTypes": {
+		"release": {
+			"buildOptions": ["releaseMode", "optimize", "inline"]
+		}
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "bench-server",
+			"mainSourceFile": "server.d"
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "bench-client",
+			"mainSourceFile": "client.d"
+		}
+	]
+}
