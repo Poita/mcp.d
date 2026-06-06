@@ -130,11 +130,24 @@ final class DuplexCoordinator
 	/// Deliver a peer response / errorResponse. Returns true if `idJson` matched a
 	/// pending outbound request (waking its awaiting task), false otherwise (an id
 	/// we are not awaiting — e.g. a stray response — is ignored).
+	///
+	/// Accepts both `int_` and whole-number `float_` ids: some peers (JavaScript,
+	/// Python `json.dumps`) serialise integer ids as floats (e.g. `1.0`), which
+	/// `validateEnvelope` already permits for ids with no fractional part.
 	bool resolve(Json idJson, Json result, Json error) @safe
 	{
-		if (idJson.type != Json.Type.int_)
+		long id;
+		if (idJson.type == Json.Type.int_)
+			id = idJson.get!long;
+		else if (idJson.type == Json.Type.float_)
+		{
+			immutable v = idJson.get!double;
+			if (v != cast(long) v)
+				return false; // fractional float — cannot match any registered waiter
+			id = cast(long) v;
+		}
+		else
 			return false;
-		const id = idJson.get!long;
 		if (auto w = id in waiters)
 		{
 			w.result = result;
@@ -392,4 +405,41 @@ unittest  // await on an unregistered id throws a catchable McpException, not a 
 		assert(e.code == ErrorCode.internalError);
 	}
 	assert(threw, "awaiting an unknown id must throw a catchable McpException");
+}
+
+unittest  // resolve matches a whole-number float id (e.g. 1.0) to the waiter registered as long 1
+{
+	auto coord = new DuplexCoordinator;
+	int rc;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			coord.register(1);
+			runTask(() nothrow{
+				try
+					coord.resolve(Json(1.0), Json(["ok": Json(true)]), Json.undefined);
+				catch (Exception)
+				{
+				}
+			});
+			auto r = coord.await(1);
+			if (r["ok"].get!bool)
+				rc = 1;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(rc == 1, "whole-number float id must resolve the matching integer waiter");
+}
+
+unittest  // resolve returns false for a fractional float id (e.g. 1.5) — no waiter can match it
+{
+	auto coord = new DuplexCoordinator;
+	coord.register(1);
+	assert(!coord.resolve(Json(1.5), Json.emptyObject, Json.undefined));
+	coord.cancel(1);
 }
