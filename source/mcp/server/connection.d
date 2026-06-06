@@ -58,7 +58,7 @@ final class ConnectionState
 	/// Whether an `initialize` request has been processed for this connection
 	/// (stateful). Distinct from `initialized` (the post-handshake notification):
 	/// this guards against a second `initialize` re-negotiating the session.
-	bool negotiated_;
+	bool initializeProcessed;
 }
 
 unittest  // two ConnectionStates do not share negotiated version or caps
@@ -111,7 +111,7 @@ unittest  // a fresh ConnectionState carries spec defaults
 	auto c = new ConnectionState;
 	assert(c.logLevel == "info");
 	assert(!c.initialized);
-	assert(!c.negotiated_);
+	assert(!c.initializeProcessed);
 	assert(c.negotiated == latestStable);
 	assert(c.subscriptions.length == 0);
 	assert(c.inFlight.length == 0);
