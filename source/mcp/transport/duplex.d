@@ -165,8 +165,8 @@ final class DuplexChannel
 					null);
 			if (id.type == Json.Type.null_ || id.type == Json.Type.undefined)
 				send(makeErrorResponse(Json(null), e.error));
-			else
-				coord.resolve(id, Json.undefined, toErrorJson(e.error));
+			else if (!coord.resolve(id, Json.undefined, toErrorJson(e.error)))
+				send(makeErrorResponse(Json(null), e.error));
 		}
 	}
 
@@ -784,6 +784,41 @@ unittest  // a malformed batch member carrying a pending id wakes its deliver() 
 	assert(threw, "a malformed batch member for a pending id must wake its deliver()");
 	assert(errCode == ErrorCode.invalidRequest,
 			"the waiter must wake with the member's -32600 error, not a -32603 timeout");
+}
+
+unittest  // a malformed batch member with a non-integer (string) id sends a null-id error, not silence
+{
+	// coord.resolve() returns false for any non-integer id; the else branch must fall
+	// back to the null-id error path so the peer is notified rather than dropped.
+	auto inbound = new LineLink;
+	string written;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
+				written = s;
+			}, (Message) @safe {});
+			channel.start();
+			// A batch where member 0 has a string id and is malformed (both result and error).
+			inbound.put(
+				`[{"jsonrpc":"2.0","id":"req-abc","result":{},"error":{"code":-1,"message":"x"}}]`);
+			inbound.closeEnd();
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	import vibe.data.json : parseJsonString;
+
+	assert(written.length, "a string-id batch member error must produce a null-id error reply");
+	auto j = parseJsonString(written);
+	assert(j["id"].type == Json.Type.null_, "the fallback error reply must carry a null id");
+	assert("error" in j, "the fallback reply must be an error response");
 }
 
 unittest  // deliver() after close() fails fast
