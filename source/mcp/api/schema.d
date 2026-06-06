@@ -9,15 +9,32 @@ import vibe.data.json : Json;
 
 @safe:
 
-/// True when `T` is one of the `std.datetime` value types that serialize to an
-/// ISO date-time string. Imported lazily so the trait does not force a
-/// `std.datetime` dependency on callers that never use it.
+/// True when `T` is one of the `std.datetime` value types. Imported lazily so
+/// the trait does not force a `std.datetime` dependency on callers that never
+/// use it.
 private template isStdDateTime(T)
 {
 	import std.datetime.systime : SysTime;
 	import std.datetime.date : DateTime, Date, TimeOfDay;
 
 	enum isStdDateTime = is(T == SysTime) || is(T == DateTime) || is(T == Date) || is(T == TimeOfDay);
+}
+
+/// The JSON Schema `format` keyword value for a `std.datetime` type. `SysTime`
+/// and `DateTime` carry both date and time components, so they map to
+/// `"date-time"`. `Date` encodes only a calendar date (`"date"`) and `TimeOfDay`
+/// encodes only a wall-clock time (`"time"`).
+private template stdDateTimeFormat(T)
+{
+	import std.datetime.systime : SysTime;
+	import std.datetime.date : DateTime, Date, TimeOfDay;
+
+	static if (is(T == Date))
+		enum stdDateTimeFormat = "date";
+	else static if (is(T == TimeOfDay))
+		enum stdDateTimeFormat = "time";
+	else
+		enum stdDateTimeFormat = "date-time";
 }
 
 /// Generate a JSON Schema (2020-12) fragment describing the D type `T`.
@@ -38,8 +55,9 @@ private template isStdDateTime(T)
 /// - `Nullable!T` -> the schema of `T` (optionality is handled by the
 ///   enclosing object via `required`)
 /// - `SumType!(A, B, …)` / tagged unions -> `{anyOf: [schema(A), schema(B), …]}`
-/// - `std.datetime` types (`SysTime`, `DateTime`, `Date`, `TimeOfDay`) ->
-///   `{type: "string", format: "date-time"}`
+/// - `std.datetime` types: `SysTime`/`DateTime` -> `{type: "string", format: "date-time"}`;
+///   `Date` -> `{type: "string", format: "date"}`;
+///   `TimeOfDay` -> `{type: "string", format: "time"}`
 ///
 /// Any other type — pointers, delegates, classes, `void`, or an associative
 /// array with a non-string key — is genuinely unmappable and raises a clear
@@ -68,7 +86,7 @@ Json jsonSchemaOf(T)() @safe
 	else static if (isStdDateTime!T)
 	{
 		s["type"] = "string";
-		s["format"] = "date-time";
+		s["format"] = stdDateTimeFormat!T;
 	}
 	else static if (isIntegral!T)
 	{
@@ -1041,8 +1059,14 @@ unittest  // std.datetime maps to a date-time formatted string
 	assert(a["format"].get!string == "date-time");
 
 	assert(jsonSchemaOf!DateTime["format"].get!string == "date-time");
-	assert(jsonSchemaOf!Date["format"].get!string == "date-time");
-	assert(jsonSchemaOf!TimeOfDay["format"].get!string == "date-time");
+}
+
+unittest  // Date maps to format "date" and TimeOfDay maps to format "time"
+{
+	import std.datetime.date : Date, TimeOfDay;
+
+	assert(jsonSchemaOf!Date["format"].get!string == "date");
+	assert(jsonSchemaOf!TimeOfDay["format"].get!string == "time");
 }
 
 unittest  // struct fields with a declared default are optional, not required
