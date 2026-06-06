@@ -365,7 +365,8 @@ struct DiscoverResult
 		{
 			auto arr = j[verKey];
 			foreach (i; 0 .. arr.length)
-				r.protocolVersions ~= arr[i].get!string;
+				if (arr[i].type == Json.Type.string)
+					r.protocolVersions ~= arr[i].get!string;
 		}
 		if ("capabilities" in j)
 			r.capabilities = ServerCapabilities.fromJson(j["capabilities"]);
@@ -1114,6 +1115,19 @@ unittest  // DiscoverResult.toJson emits the spec wire field `supportedVersions`
 	assert("protocolVersions" !in j);
 	assert(j["supportedVersions"].length == 2);
 	assert(j["supportedVersions"][0].get!string == "2026-07-28");
+}
+
+unittest  // DiscoverResult.fromJson skips non-string entries in supportedVersions
+{
+	// A malformed server response with non-string elements must not throw;
+	// only the valid string entries are collected.
+	import vibe.data.json : parseJsonString;
+
+	auto j = parseJsonString(`{"supportedVersions": ["2026-07-28", 42, null, true, "2025-11-25"]}`);
+	auto r = DiscoverResult.fromJson(j);
+	assert(r.protocolVersions.length == 2);
+	assert(r.protocolVersions[0] == "2026-07-28");
+	assert(r.protocolVersions[1] == "2025-11-25");
 }
 
 unittest  // InputRequiredResult.toJson carries resultType:"input_required"
