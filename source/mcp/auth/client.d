@@ -278,6 +278,7 @@ final class OAuthClient
 	TokenSet jwtBearerGrant(AuthorizationServerMetadata as_,
 			RegisteredClient client, string assertion, string scopeStr) @safe
 	{
+		requireResource();
 		auto form = buildJwtBearerForm(assertion, scopeStr, resource, client.clientId);
 		return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
 	}
@@ -870,6 +871,30 @@ unittest  // clientCredentials refuses when the RFC 8707 resource indicator is u
 	AuthorizationServerMetadata as_;
 	as_.tokenEndpoint = "https://as.example.com/token";
 	assertThrown(c.clientCredentials(as_, RegisteredClient("cid", ""), "scope"));
+}
+
+unittest  // jwtBearerGrant refuses when the RFC 8707 resource indicator is unset
+{
+	import mcp.protocol.errors : McpException;
+	import std.exception : assertThrown;
+	import std.string : indexOf;
+
+	auto c = new OAuthClient();
+	// c.resource left empty.
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = "https://as.example.com/token";
+	bool caught;
+	try
+		c.jwtBearerGrant(as_, RegisteredClient("cid", ""), "assertion", "scope");
+	catch (McpException e)
+	{
+		caught = e.msg.indexOf("resource indicator") >= 0;
+	}
+	catch (Exception)
+	{
+		// Any non-McpException means requireResource() was not called first.
+	}
+	assert(caught, "jwtBearerGrant must throw McpException mentioning 'resource indicator' when resource is unset");
 }
 
 unittest  // authorizationUrl refuses an internal/plaintext authorization endpoint (SSRF)
