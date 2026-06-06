@@ -289,7 +289,7 @@ StdioClientTransport spawnStdioTransport(string[] args, size_t maxLineBytes = de
 			size_t n;
 			n = () @trusted { return pipes.stdout.read(one[], IOMode.once); }();
 			if (n == 0)
-				return acc.length ? () @trusted { return cast(string) acc.idup; }() : null;
+				return null; // EOF — partial fragment is unrecoverable
 			if (one[0] == '\n')
 				break;
 			acc ~= one[0];
@@ -522,4 +522,33 @@ unittest  // a server->client reply is NOT written inline from the read-loop tas
 			(string) @safe {});
 	assert(!transport.repliesSynchronously(),
 			"stdio reply must be deferred (not inline) so the read loop keeps draining the child");
+}
+
+version (Posix) unittest  // partial fragment at EOF closes the channel cleanly, not via a spurious error write
+{
+	import core.time : seconds, msecs;
+	import std.algorithm.searching : canFind;
+
+	// A child that writes a partial JSON fragment (no terminating newline) then exits
+	// leaves those bytes buffered in the pipe. spawnStdioTransport's readLine must
+	// return null on EOF regardless of accumulated bytes — the fragment is
+	// unrecoverable and returning it as a non-null string would route it through
+	// handleLine, causing a spurious null-id error-response write to the
+	// already-exited subprocess's stdin (broken pipe).
+	inLoop(() @safe {
+		auto transport = spawnStdioTransport([
+			"sh", "-c", `printf '{"jsonrpc":"2.0","id":1'`
+		]);
+		string msg;
+		try
+		{
+			Json req = parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+			transport.deliver(req, 1);
+		}
+		catch (McpException e)
+			msg = e.msg;
+		assert(msg.canFind("closed"),
+			"partial EOF fragment must close the channel cleanly, got: " ~ msg);
+		transport.closeProcess(200.msecs, 200.msecs);
+	});
 }
