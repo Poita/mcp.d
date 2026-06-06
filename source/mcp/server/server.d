@@ -1821,10 +1821,9 @@ final class McpServer
 	/// and per-template hints are supplied at registration time instead.
 	void setListCacheHint(string listMethod, CacheHint hint) @safe
 	{
-		assert(listMethod == "tools/list" || listMethod == "resources/list"
-				|| listMethod == "resources/templates/list"
-				|| listMethod == "prompts/list",
-				"setListCacheHint: unknown list method '" ~ listMethod ~ "'");
+		if (listMethod != "tools/list" && listMethod != "resources/list"
+				&& listMethod != "resources/templates/list" && listMethod != "prompts/list")
+			throw new Exception("setListCacheHint: unknown list method '" ~ listMethod ~ "'");
 		listCacheHints[listMethod] = nullable(hint);
 	}
 
@@ -6147,6 +6146,15 @@ unittest  // per-list hint only emits on the matching list, not on others
 	auto tools = s.handle(draftReq(2, "tools/list")).get;
 	assert(tools["result"]["ttlMs"].get!long == 0);
 	assert(tools["result"]["ttlMs"].get!long != 7000);
+}
+
+unittest  // setListCacheHint rejects unknown method names in release builds
+{
+	import std.exception : assertThrown;
+
+	auto s = makeTestServer();
+	assertThrown!Exception(s.setListCacheHint("tool/list", CacheHint(5.seconds)));
+	assertThrown!Exception(s.setListCacheHint("bogus", CacheHint(5.seconds)));
 }
 
 unittest  // per-resource registerResource hint emits ttlMs/cacheScope on a draft resources/read
