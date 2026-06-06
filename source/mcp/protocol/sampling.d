@@ -389,9 +389,13 @@ void validateSamplingMessages(Json params) @safe
 		{
 			string[] toolUseIds;
 			foreach (b; blocks)
-				if (blockType(b) == "tool_use")
-					toolUseIds ~= (b.type == Json.Type.object && "id" in b
-							&& b["id"].type == Json.Type.string) ? b["id"].get!string : "";
+			{
+				if (blockType(b) != "tool_use")
+					continue;
+				if (b.type != Json.Type.object || "id" !in b || b["id"].type != Json.Type.string)
+					throw invalidParams("Tool use block missing required string id");
+				toolUseIds ~= b["id"].get!string;
+			}
 			if (toolUseIds.length == 0)
 				continue;
 
@@ -409,10 +413,10 @@ void validateSamplingMessages(Json params) @safe
 			{
 				if (blockType(b) != "tool_result")
 					throw invalidParams("Tool results mixed with other content");
-				const id = (b.type == Json.Type.object && "toolUseId" in b
-						&& b["toolUseId"].type == Json.Type.string) ? b["toolUseId"].get!string
-					: "";
-				resultIds[id] = true;
+				if (b.type != Json.Type.object || "toolUseId" !in b
+						|| b["toolUseId"].type != Json.Type.string)
+					throw invalidParams("Tool result block missing required string toolUseId");
+				resultIds[b["toolUseId"].get!string] = true;
 			}
 			foreach (id; toolUseIds)
 				if (id !in resultIds)
@@ -1173,4 +1177,56 @@ unittest  // missing/empty messages is a no-op (nothing to validate)
 	Json p = Json.emptyObject;
 	p["messages"] = Json.emptyArray;
 	validateSamplingMessages(p);
+}
+
+unittest  // tool_use blocks missing "id" are rejected, not collapsed onto empty-string sentinel
+{
+	// Two tool_use blocks with no "id" and one tool_result with no "toolUseId":
+	// without the fix they both fall back to "" and the single resultIds[""]
+	// satisfies both, so no exception is thrown. With the fix, the missing "id"
+	// is caught immediately.
+	Json tu = Json.emptyObject;
+	tu["type"] = "tool_use";
+	tu["name"] = "get_weather";
+	tu["input"] = Json.emptyObject;
+	// deliberately no "id" field
+
+	Json tr = Json.emptyObject;
+	tr["type"] = "tool_result";
+	tr["content"] = Json.emptyArray;
+	// deliberately no "toolUseId" field
+
+	auto p = samplingParams(msg("assistant", tu, tu), msg("user", tr));
+
+	bool threw;
+	try
+		validateSamplingMessages(p);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.msg == "Tool use block missing required string id");
+	}
+	assert(threw);
+}
+
+unittest  // tool_result blocks missing "toolUseId" are rejected immediately
+{
+	// A valid tool_use followed by a tool_result with no toolUseId must be
+	// rejected rather than passing via the empty-string collision.
+	Json tr = Json.emptyObject;
+	tr["type"] = "tool_result";
+	tr["content"] = Json.emptyArray;
+	// deliberately no "toolUseId" field
+
+	auto p = samplingParams(msg("assistant", toolUse("call_1", "get_weather")), msg("user", tr));
+
+	bool threw;
+	try
+		validateSamplingMessages(p);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.msg == "Tool result block missing required string toolUseId");
+	}
+	assert(threw);
 }
