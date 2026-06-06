@@ -997,8 +997,8 @@ final class HttpClientTransport : ClientTransport
 					break;
 				const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
 				auto buf = new ubyte[toRead];
-				conn.read(buf, IOMode.once);
-				acc ~= cast(string) buf.idup;
+				const n = conn.read(buf, IOMode.once);
+				acc ~= cast(string) buf[0 .. n].idup;
 				tokenize();
 			}
 		}
@@ -2339,4 +2339,93 @@ unittest  // postAndAwait skips resumeViaGet when the session is in draft/modern
 			"transport starts in non-draft mode; resumeViaGet is allowed by default");
 	t.draftProtocol = true;
 	assert(t.draftProtocol, "after setDraftProtocol(true) the transport skips resumeViaGet");
+}
+
+unittest  // readSseBody handles a partial IOMode.once read without appending zero bytes
+{
+	import vibe.core.stream : IOMode, InputStream;
+	import std.conv : to;
+
+	// A mock InputStream that reports more bytes available via leastSize than it
+	// actually delivers per read(IOMode.once) call. This exercises the partial-read
+	// path: the previous code discarded the return value of read(), so it appended
+	// the full (zero-padded) buffer instead of only the bytes that were read,
+	// corrupting the SSE accumulator with null bytes.
+	class PartialInputStream : InputStream
+	{
+	@safe:
+		private ubyte[] data;
+		private size_t pos;
+
+		this(ubyte[] d)
+		{
+			data = d;
+		}
+
+		@property bool empty()
+		{
+			return pos >= data.length;
+		}
+
+		// leastSize reports all remaining bytes.
+		@property ulong leastSize()
+		{
+			return data.length - pos;
+		}
+
+		@property bool dataAvailableForRead()
+		{
+			return pos < data.length;
+		}
+
+		const(ubyte)[] peek()
+		{
+			return data[pos .. $];
+		}
+
+		// read with IOMode.once delivers at most half the bytes to simulate a partial
+		// TCP read; IOMode.all delivers everything requested (required for readLine).
+		size_t read(scope ubyte[] dst, IOMode mode) @trusted
+		{
+			if (pos >= data.length)
+				return 0;
+			size_t off;
+			while (off < dst.length)
+			{
+				const avail = data.length - pos;
+				if (avail == 0)
+					break;
+				// IOMode.once: at most half the available bytes (simulates a short read).
+				const limit = (mode == IOMode.once && avail / 2 > 0) ? avail / 2 : avail;
+				const take = (dst.length - off < limit) ? dst.length - off : limit;
+				dst[off .. off + take] = data[pos .. pos + take];
+				pos += take;
+				off += take;
+				if (mode == IOMode.once)
+					break;
+			}
+			return off;
+		}
+
+		// Expose the one-arg read from InputStream (hidden by the two-arg override above).
+		alias read = InputStream.read;
+	}
+
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+
+	// A well-formed SSE event: the partial-read stream will deliver it in two
+	// read() calls (each half the leastSize). Both halves together must produce
+	// exactly one event with data "hello" — no corruption from extra null bytes.
+	auto stream = new PartialInputStream(cast(ubyte[]) "data: hello\n\n".dup);
+
+	SseCursor cursor;
+	string[] events;
+	() @trusted {
+		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+			events ~= d;
+		});
+	}();
+	assert(events == ["hello"],
+			"partial IOMode.once read must not corrupt the SSE accumulator with zero bytes; got: "
+			~ events.to!string);
 }
