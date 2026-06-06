@@ -369,6 +369,7 @@ version (unittest)
 	{
 		string response;
 		string lastToken;
+		bool wasCalled; // true if introspect was ever invoked
 		this(string response) @safe
 		{
 			this.response = response;
@@ -376,6 +377,7 @@ version (unittest)
 
 		string introspect(string token) @safe
 		{
+			wasCalled = true;
 			lastToken = token;
 			return response;
 		}
@@ -532,7 +534,7 @@ unittest  // an empty token is rejected without introspecting
 	auto stub = new StubIntrospector(`{"active":true}`);
 	auto v = stubVerifier(cfg, stub);
 	assert(!v("").valid);
-	assert(stub.lastToken == "");
+	assert(!stub.wasCalled);
 }
 
 unittest  // PositiveCache returns a hit before expiry and a miss after
