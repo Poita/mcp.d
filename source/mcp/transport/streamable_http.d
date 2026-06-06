@@ -342,8 +342,8 @@ final class LegacySseChannel
 	{
 		const id = nextId++;
 		const sessionId = generateSessionId();
-		listeners ~= Listener(id, sessionId, write);
 		write(formatLegacyEndpointEvent(endpointWithSession(endpointPath, sessionId)));
+		listeners ~= Listener(id, sessionId, write);
 		return id;
 	}
 
@@ -2030,6 +2030,21 @@ unittest  // legacy channel: an unknown or empty session token delivers nowhere
 	ch.deliverTo("", `{"jsonrpc":"2.0","id":1,"result":{}}`);
 	ch.deliverTo("not-a-real-token", `{"jsonrpc":"2.0","id":2,"result":{}}`);
 	assert(frames.length == 1); // nothing delivered to the open stream
+}
+
+unittest  // addListener does not leave a zombie entry when the initial write throws
+{
+	// If the delegate write throws on the first call (e.g., the client disconnected
+	// between sending the GET and the server flushing the endpoint event), the
+	// listener must not remain in the channel's listener array.
+	auto ch = new LegacySseChannel("/message");
+	bool threw = false;
+	try
+		ch.addListener((string) @safe { throw new Exception("write failed"); });
+	catch (Exception)
+		threw = true;
+	assert(threw, "write exception must propagate to the caller");
+	assert(ch.listenerCount == 0, "failed-write listener must not remain in the channel");
 }
 
 unittest  // endpointWithSession appends the session token, preserving any existing query
