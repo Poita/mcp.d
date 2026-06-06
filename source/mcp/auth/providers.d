@@ -18,6 +18,7 @@
 /// )
 module mcp.auth.providers;
 
+import std.exception : enforce;
 import std.string : endsWith;
 
 import mcp.auth.jwt_verifier : JwtVerifierConfig, jwtVerifier;
@@ -77,9 +78,21 @@ ResourceServerConfig resourceServer(JwtVerifierConfig vc) @safe
 /// Microsoft Entra ID (Azure AD). Pins the v2.0 issuer
 /// `https://login.microsoftonline.com/{tenant}/v2.0` and the matching JWKS
 /// (`/discovery/v2.0/keys`). `audience` is the API's App ID URI or client id.
+///
+/// `tenant` must be a concrete tenant GUID or a registered domain name.
+/// The pseudo-tenants `"common"`, `"organizations"`, and `"consumers"` are
+/// rejected because Entra ID never stamps them in the `iss` claim of a real
+/// token — every token would fail the issuer check at runtime. For multi-tenant
+/// validation without a pinned issuer, use `jwtResourceServer` with an empty
+/// `issuer` and rely on `audience` binding alone.
 ResourceServerConfig entraId(string tenant, string audience, string[] scopes = [
 ]) @safe
 {
+	enforce(tenant != "common" && tenant != "organizations" && tenant != "consumers",
+			"entraId: pseudo-tenants (\"common\", \"organizations\", \"consumers\") are not "
+			~ "supported — Entra ID never stamps them in the iss claim, so every token "
+			~ "would be rejected. Pass a concrete tenant GUID or domain, or use "
+			~ "jwtResourceServer with an empty issuer for multi-tenant validation.");
 	const issuer = "https://login.microsoftonline.com/" ~ tenant ~ "/v2.0";
 	const jwks = "https://login.microsoftonline.com/" ~ tenant ~ "/discovery/v2.0/keys";
 	return jwtResourceServer(issuer, jwks, audience, scopes);
@@ -242,6 +255,27 @@ unittest  // Google fills in its fixed authorize/token endpoints + credentials
 	assert(cfg.upstreamClientId == "client.apps.googleusercontent.com");
 	assert(cfg.upstreamClientSecret == "gsecret");
 	assert(cfg.scopesSupported == ["openid", "email"]);
+}
+
+unittest  // entraId rejects pseudo-tenant "common" at call time to prevent silent failures
+{
+	import std.exception : assertThrown;
+
+	assertThrown(entraId("common", "api://my-app"));
+}
+
+unittest  // entraId rejects pseudo-tenant "organizations" at call time
+{
+	import std.exception : assertThrown;
+
+	assertThrown(entraId("organizations", "api://my-app"));
+}
+
+unittest  // entraId rejects pseudo-tenant "consumers" at call time
+{
+	import std.exception : assertThrown;
+
+	assertThrown(entraId("consumers", "api://my-app"));
 }
 
 unittest  // a JWT preset wires a working validator that rejects garbage tokens
