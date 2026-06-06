@@ -100,7 +100,10 @@ final class DuplexCoordinator
 	/// channel close (`failPending`). Deregisters the waiter on the way out.
 	Json await(long id, Duration timeout = 60.seconds) @safe
 	{
-		auto w = waiters[id];
+		auto wp = id in waiters;
+		if (wp is null)
+			throw internalError("awaiting unregistered request id " ~ idStr(id));
+		auto w = *wp;
 		scope (exit)
 			waiters.remove(id);
 
@@ -375,4 +378,18 @@ unittest  // throwOrReturn yields McpException with defaultMsg when "message" is
 	assert(caught !is null, "expected McpException, got nothing");
 	assert(caught.code == -32600);
 	assert(caught.msg == "my-default");
+}
+
+unittest  // await on an unregistered id throws a catchable McpException, not a RangeError
+{
+	auto coord = new DuplexCoordinator;
+	bool threw;
+	try
+		coord.await(99);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.internalError);
+	}
+	assert(threw, "awaiting an unknown id must throw a catchable McpException");
 }
