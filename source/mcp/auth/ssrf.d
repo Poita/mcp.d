@@ -794,14 +794,7 @@ void secureRequestHTTP(string url, SsrfPolicy policy, scope void delegate(
 
 	// vibe derives the Host header from u.host; restore the original host so the
 	// server sees the intended virtual host, not the pinned IP.
-	string hostHeader = originalHost;
-	if (u.port && u.port != u.defaultPort)
-	{
-		import std.conv : to;
-
-		hostHeader = (originalHost.indexOf(':') >= 0 ? "[" ~ originalHost ~ "]" : originalHost)
-			~ ":" ~ u.port.to!string;
-	}
+	string hostHeader = buildHostHeader(originalHost, u.port, u.defaultPort);
 
 	requestHTTP(u, (scope HTTPClientRequest req) {
 		req.headers["Host"] = hostHeader;
@@ -811,6 +804,23 @@ void secureRequestHTTP(string url, SsrfPolicy policy, scope void delegate(
 		if (responder !is null)
 			responder(res);
 	}, settings);
+}
+
+/// Build the RFC 7230 §5.4 Host header value from a bare host string (as
+/// returned by vibe's URL.host, which strips brackets from IPv6 literals) and
+/// the connection's port numbers. IPv6 literals (detected by a colon in the
+/// host string) are re-bracketed per RFC 3986 §3.2.2; the port suffix is
+/// appended only when the port is non-zero and differs from the scheme default.
+private string buildHostHeader(string host, ushort port, ushort defaultPort) @safe pure
+{
+	import std.conv : to;
+	import std.string : indexOf;
+
+	// Re-bracket IPv6 literals stripped by vibe's URL parser.
+	string base = host.indexOf(':') >= 0 ? "[" ~ host ~ "]" : host;
+	if (port && port != defaultPort)
+		return base ~ ":" ~ port.to!string;
+	return base;
 }
 
 /// Case-insensitive ASCII scheme compare without allocating.
@@ -1103,4 +1113,21 @@ unittest  // secureRequestHTTP(blockInternal) rejects insecure scheme and privat
 			SsrfPolicy.blockInternal, null, null));
 	assertThrown!McpException(secureRequestHTTP("file:///etc/passwd",
 			SsrfPolicy.blockInternal, null, null));
+}
+
+unittest  // buildHostHeader brackets IPv6 literals on the default port (RFC 7230 §5.4)
+{
+	// IPv6 on default port: must produce "[::1]", not bare "::1".
+	assert(buildHostHeader("::1", 0, 443) == "[::1]");
+	assert(buildHostHeader("::1", 443, 443) == "[::1]");
+	// IPv6 on non-default port: must produce "[::1]:8443".
+	assert(buildHostHeader("::1", 8443, 443) == "[::1]:8443");
+	// IPv4 on default port: no brackets, no port suffix.
+	assert(buildHostHeader("127.0.0.1", 0, 80) == "127.0.0.1");
+	assert(buildHostHeader("127.0.0.1", 80, 80) == "127.0.0.1");
+	// IPv4 on non-default port: no brackets, port suffix.
+	assert(buildHostHeader("127.0.0.1", 8080, 80) == "127.0.0.1:8080");
+	// Hostname: unchanged.
+	assert(buildHostHeader("example.com", 0, 443) == "example.com");
+	assert(buildHostHeader("example.com", 8443, 443) == "example.com:8443");
 }
