@@ -1,6 +1,6 @@
 {
 	"name": "streaming",
-	"description": "MCP example: progress, logging, cancellation + typed elicitation/sampling over stdio AND Streamable HTTP (server + self-verifying client e2e). Issue #357 / #436 / #437.",
+	"description": "MCP example: progress, logging, cancellation over stdio AND Streamable HTTP (server + self-verifying client e2e). Issue #357.",
 	"license": "Apache-2.0",
 	"dependencies": {
 		"mcp-d": { "path": "../.." },
