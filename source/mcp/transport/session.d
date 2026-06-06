@@ -78,9 +78,11 @@ struct BoundedExpiringMap(V)
 		return null;
 	}
 
-	/// Whether `key` has a live entry.
+	/// Whether `key` has a live entry. Sweeps expired entries first so that a
+	/// session past its idle TTL is not reported as present.
 	bool contains(string key) @safe
 	{
+		sweep(now());
 		return (key in values) !is null;
 	}
 
@@ -406,6 +408,24 @@ unittest  // an idle session past the TTL is swept on the next create()
 	const fresh = mgr.create();
 	assert(!mgr.isActive(stale), "an idle session past the TTL must be swept");
 	assert(mgr.isActive(fresh));
+}
+
+unittest  // isActive sweeps expired entries without needing a create() to trigger the sweep
+{
+	// contains() must call sweep() so that isActive() returns false for a session
+	// whose idle TTL has elapsed, even when no new session is created afterward.
+	// Without the sweep, the stale entry remains in the map and isActive() returns
+	// true, allowing requests to a dead session to proceed past the 404 gate.
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	auto mgr = new SessionManager(5.msecs, 0);
+	const stale = mgr.create();
+	assert(mgr.isActive(stale));
+	Thread.sleep(20.msecs);
+	// No create() here — isActive() alone must detect expiry.
+	assert(!mgr.isActive(stale),
+			"isActive must return false for a session past its idle TTL without needing a create()");
 }
 
 unittest  // a disabled idle TTL and disabled cap leave sessions resident (historical behaviour)
