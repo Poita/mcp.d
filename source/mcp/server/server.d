@@ -1767,7 +1767,7 @@ final class McpServer
 				&& reqst.params["mode"].get!string == "url";
 			return isUrl ? declared.elicitationUrl : declared.elicitationForm;
 		case InputKind.sampling:
-			if (!declared.sampling)
+			if (!declared.supports(ClientCapability.sampling))
 				return false;
 			const usesTools = reqst.params.type == Json.Type.object
 				&& ("tools" in reqst.params || "toolChoice" in reqst.params);
@@ -8491,4 +8491,25 @@ unittest  // list endpoints answer once their capability is advertised
 	assert("error" !in s.handle(req(2, "resources/list")).get);
 	assert("error" !in s.handle(req(3, "resources/templates/list")).get);
 	assert("error" !in s.handle(req(4, "prompts/list")).get);
+}
+
+unittest  // clientCanSatisfy: samplingTools alone implies sampling capability
+{
+	// A client that advertises only samplingTools (without the top-level sampling
+	// flag) must still satisfy a plain sampling InputRequest, because samplingTools
+	// implies sampling by definition.
+	ClientCapabilities declared = {samplingTools: true};
+	InputRequest r = InputRequest("s1", "sampling", Json.emptyObject);
+	auto kept = McpServer.supportedInputRequests([r], declared);
+	assert(kept.length == 1, "samplingTools must imply sampling for clientCanSatisfy");
+}
+
+unittest  // clientCanSatisfy: samplingContext alone implies sampling capability
+{
+	// A client that advertises only samplingContext (without the top-level sampling
+	// flag) must still satisfy a plain sampling InputRequest.
+	ClientCapabilities declared = {samplingContext: true};
+	InputRequest r = InputRequest("s1", "sampling", Json.emptyObject);
+	auto kept = McpServer.supportedInputRequests([r], declared);
+	assert(kept.length == 1, "samplingContext must imply sampling for clientCanSatisfy");
 }
