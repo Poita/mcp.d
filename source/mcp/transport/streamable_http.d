@@ -2437,13 +2437,17 @@ private ClientCapabilities clientCapsFor(McpServer server, ConnectionState reqSt
 /// negotiates capabilities once at `initialize` that the server must honour on
 /// later requests over the same connection, which is the single implicit-peer
 /// model held in `activeConnection` (the server falls back to it on null). The
-/// effective version is the `MCP-Protocol-Version` header, then the draft
-/// `_meta.protocolVersion`, then the server default.
+/// effective version is the body `_meta.protocolVersion`, then the
+/// `MCP-Protocol-Version` header, then the server default. When both the header
+/// and `_meta.protocolVersion` are present, `validateDraftHeaders` already
+/// ensures they agree, so the final overwrite is always a no-op in practice.
 private ConnectionState freshStatelessState(string protoHeader, Json params,
 		ProtocolVersion serverDefault) @safe
 {
-	// Effective version: header wins, then the draft _meta protocolVersion, then
-	// the server default (reusing the same precedence the dispatch path applies).
+	// Effective version: _meta.protocolVersion wins over the header when present;
+	// the header (via effectivePostVersion) is the fallback before the server
+	// default. validateDraftHeaders rejects any request where both are present but
+	// disagree, so when both exist they are equal and the overwrite is benign.
 	auto meta = RequestMeta.fromParams(params);
 	ProtocolVersion eff = effectivePostVersion(protoHeader, serverDefault);
 	ProtocolVersion mv;
