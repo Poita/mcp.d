@@ -392,7 +392,7 @@ package bool jwkUsableForSig(Jwk jwk) @safe
 }
 
 /// Convert a JWK to a PEM SubjectPublicKeyInfo public key. Supports RSA (n/e)
-/// and EC P-256 (crv=P-256, x/y). Returns null for unsupported keys.
+/// and EC P-256/P-384/P-521 (crv/x/y, RFC 7518). Returns null for unsupported keys.
 package string jwkToPem(Jwk jwk) @trusted
 {
 	if (jwk.kty == "RSA")
@@ -449,9 +449,18 @@ private string rsaJwkToPem(Jwk jwk) @trusted
 
 private string ecJwkToPem(Jwk jwk) @trusted
 {
-	if (jwk.crv != "P-256" || jwk.x.length == 0 || jwk.y.length == 0)
+	if (jwk.x.length == 0 || jwk.y.length == 0)
 		return null;
-	auto eckey = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+	int nid;
+	if (jwk.crv == "P-256")
+		nid = NID_X9_62_prime256v1;
+	else if (jwk.crv == "P-384")
+		nid = NID_secp384r1;
+	else if (jwk.crv == "P-521")
+		nid = NID_secp521r1;
+	else
+		return null;
+	auto eckey = EC_KEY_new_by_curve_name(nid);
 	if (eckey is null)
 		return null;
 	scope (exit)
@@ -1395,6 +1404,31 @@ unittest  // fetchJwks discards non-2xx bodies so a 503 does not mark the cache 
 
 	assert(failure.length == 0, "fetchJwks HTTP status test failed: " ~ failure);
 	assert(passed);
+}
+
+unittest  // ecJwkToPem produces a parseable PEM for P-384 and P-521 EC JWKs (RFC 7518)
+{
+	import std.string : indexOf;
+
+	// P-384 key coordinates (secp384r1, generated with openssl ecparam -name secp384r1)
+	Jwk j384;
+	j384.kty = "EC";
+	j384.crv = "P-384";
+	j384.x = "nAPaQ-Yp5yOfUbCoua-9vveg8CN2xGZcC0pwleiN32_13F8e5ucb4TDIECm7HNHF";
+	j384.y = "50RD8Uk-e11KLEhoe67lPP-XrPZNz_BTJ8Mc4Pw9fzfEp_Bx3kfvopo3CvsqMx9M";
+	auto pem384 = jwkToPem(j384);
+	assert(pem384.indexOf("BEGIN PUBLIC KEY") >= 0, "P-384 JWK must produce a PEM");
+
+	// P-521 key coordinates (secp521r1, generated with openssl ecparam -name secp521r1)
+	Jwk j521;
+	j521.kty = "EC";
+	j521.crv = "P-521";
+	j521.x
+		= "AdsIuUmbV1MADf8_U1vxvq7HgqY7rSroFHKSdrgoX20IJxB8WqbDiT5VUe9peyobeRWX5BxmsDvUWBjCGG_0gutA";
+	j521.y
+		= "AegUPdPnBttrFflQ9wJbUurLisEyJu-PZW-PnJomKpiFt9D2o0Ve0uXpqSqLHZTVhWpXu3ddF3Kw9JoO2hsNDE0q";
+	auto pem521 = jwkToPem(j521);
+	assert(pem521.indexOf("BEGIN PUBLIC KEY") >= 0, "P-521 JWK must produce a PEM");
 }
 
 unittest  // JwksCache.load() retains previous keys when parsing a malformed JWKS document throws
