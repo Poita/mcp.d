@@ -28,9 +28,9 @@ private bool typeMatchesFor(T)(Json.Type t) pure nothrow @safe @nogc
 		static assert(false, "jsonhelpers: unsupported scalar type " ~ T.stringof);
 }
 
-/// Read `j[key]` as `T`, returning `fallback` when the key is absent or present
-/// with a mismatched JSON type. Never throws on a type mismatch (unlike the bare
-/// `j[key].get!T`), so it is safe for tolerant wire parsing.
+/// Read `j[key]` as `T`, returning `fallback` when the key is absent, present
+/// with a mismatched JSON type, or (for narrow integral T) when the wire value
+/// is outside T's range. Never throws, so it is safe for tolerant wire parsing.
 T getOr(T)(Json j, string key, T fallback) @safe
 {
 	if (j.type != Json.Type.object)
@@ -38,12 +38,23 @@ T getOr(T)(Json j, string key, T fallback) @safe
 	auto p = key in j;
 	if (p is null || !typeMatchesFor!T(p.type))
 		return fallback;
-	return (*p).get!T;
+	static if (isIntegral!T && !is(T == long) && !is(T == ulong))
+	{
+		long v = (*p).get!long;
+		if (v < T.min || v > T.max)
+			return fallback;
+		return cast(T) v;
+	}
+	else
+	{
+		return (*p).get!T;
+	}
 }
 
-/// Assign `j[key]` into `val` only when the key is present and its JSON type
-/// matches `T`; leaves `val` untouched otherwise (preserving any default).
-/// Returns whether the assignment happened.
+/// Assign `j[key]` into `val` only when the key is present, its JSON type
+/// matches `T`, and (for narrow integral T) the wire value fits in T's range.
+/// Leaves `val` untouched otherwise (preserving any default).
+/// Returns whether the assignment happened. Never throws.
 bool tryGet(T)(Json j, string key, ref T val) @safe if (!is(T : Nullable!U, U))
 {
 	if (j.type != Json.Type.object)
@@ -51,7 +62,17 @@ bool tryGet(T)(Json j, string key, ref T val) @safe if (!is(T : Nullable!U, U))
 	auto p = key in j;
 	if (p is null || !typeMatchesFor!T(p.type))
 		return false;
-	val = (*p).get!T;
+	static if (isIntegral!T && !is(T == long) && !is(T == ulong))
+	{
+		long v = (*p).get!long;
+		if (v < T.min || v > T.max)
+			return false;
+		val = cast(T) v;
+	}
+	else
+	{
+		val = (*p).get!T;
+	}
 	return true;
 }
 
@@ -155,4 +176,24 @@ bool tryGet(N : Nullable!T, T)(Json j, string key, ref N val) @safe
 	assert(!tryGet(j, "missing", s));
 	assert(!s.isNull);
 	assert(s.get == "sentinel");
+}
+
+@safe unittest  // getOr returns fallback instead of throwing when wire int exceeds narrow T.max
+{
+	// A long value that fits JSON int_ but exceeds int.max; get!int would throw
+	// in vibe.d, violating the documented no-throw guarantee.
+	Json j = Json.emptyObject;
+	j["code"] = Json(long(2_147_483_648L)); // int.max + 1
+	int result = j.getOr("code", -1);
+	assert(result == -1);
+}
+
+@safe unittest  // tryGet returns false instead of throwing when wire int exceeds narrow T.max
+{
+	Json j = Json.emptyObject;
+	j["code"] = Json(long(2_147_483_648L)); // int.max + 1
+	int val = 99;
+	bool assigned = tryGet(j, "code", val);
+	assert(!assigned);
+	assert(val == 99);
 }
