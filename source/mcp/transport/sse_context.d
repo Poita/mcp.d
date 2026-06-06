@@ -170,9 +170,22 @@ final class StreamCoordinator
 	/// the empty token.
 	bool resolve(Json idJson, Json result, Json error, string responderToken = "") @safe
 	{
-		if (idJson.type != Json.Type.int_)
+		long id;
+		if (idJson.type == Json.Type.int_)
+			id = idJson.get!long;
+		else if (idJson.type == Json.Type.float_)
+		{
+			// vibe.d preserves the original token type: "id": 1.0 parses as float_.
+			// validateEnvelope accepts whole-number floats (only fractional floats are
+			// rejected there), so a client response carrying "id": 1.0 is valid and must
+			// resolve the pending waiter. Fractional values cannot match any integer id.
+			immutable v = idJson.get!double;
+			if (v != cast(long) v)
+				return false;
+			id = cast(long) v;
+		}
+		else
 			return false;
-		const id = idJson.get!long;
 		if (auto w = WaiterKey(responderToken, id) in waiters)
 		{
 			w.result = result;
@@ -290,6 +303,35 @@ unittest  // awaitLive on an unregistered id surfaces a catchable McpException, 
 		assert(e.code == ErrorCode.internalError);
 	}
 	assert(threw, "awaiting an unknown id must throw a catchable McpException");
+}
+
+unittest  // resolve accepts a whole-number float id (e.g. "id": 1.0 from the wire)
+{
+	// vibe.d's JSON parser preserves the original token type: "id": 1.0 produces
+	// Json.Type.float_, while "id": 1 produces Json.Type.int_. validateEnvelope
+	// accepts whole-number floats (only fractional floats are rejected), so a
+	// client POST carrying "id": 1.0 reaches resolve() — which must treat it as
+	// equivalent to "id": 1 and wake the awaiting waiter rather than silently dropping
+	// the response and leaving the fiber parked until the 60-second timeout.
+	auto coord = new StreamCoordinator;
+	const id = coord.alloc();
+	coord.register(id);
+	// Json(1.0) produces Json.Type.float_ — the exact scenario validateEnvelope passes
+	assert(coord.resolve(Json(1.0), Json("ok"), Json.undefined),
+			"whole-number float id must resolve the pending waiter");
+}
+
+unittest  // resolve rejects a fractional float id (not a valid JSON-RPC integer id)
+{
+	// A fractional float like 1.5 is rejected by validateEnvelope before reaching
+	// resolve(), but resolve() must also guard against it so the two validations stay
+	// consistent.
+	auto coord = new StreamCoordinator;
+	const id = coord.alloc();
+	coord.register(id);
+	assert(!coord.resolve(Json(1.5), Json("ok"), Json.undefined),
+			"fractional float id must be rejected by resolve");
+	coord.cancel(id); // clean up the unresolved waiter
 }
 
 /// The per-stream opt-in a client expressed when it opened a draft
