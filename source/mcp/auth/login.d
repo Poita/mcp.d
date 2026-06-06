@@ -629,7 +629,7 @@ final class OAuthSession
 /// (`open` on macOS, `xdg-open` on Linux/BSD, `cmd /c start` on Windows).
 void openSystemBrowser(string url) @safe
 {
-	import std.process : spawnProcess;
+	import std.process : spawnProcess, Config;
 
 	string[] cmd;
 	version (OSX)
@@ -642,8 +642,7 @@ void openSystemBrowser(string url) @safe
 	() @trusted {
 		try
 		{
-			auto pid = spawnProcess(cmd);
-			cast(void) pid; // detach; do not wait for the launcher
+			spawnProcess(cmd, null, Config.detached);
 		}
 		catch (Exception)
 		{
@@ -1413,6 +1412,39 @@ unittest  // requestTargetPath strips the query and fragment from a request targ
 	assert(requestTargetPath("/callback") == "/callback");
 	assert(requestTargetPath("/cb#frag") == "/cb");
 	assert(requestTargetPath("") == "");
+}
+
+version (Posix) unittest  // openSystemBrowser does not leave a zombie process after the launcher exits
+{
+	// openSystemBrowser must spawn the launcher with Config.detached so the OS
+	// never keeps a zombie entry after the process exits.  Without Config.detached,
+	// discarding the Pid without calling wait() causes the exited child to remain
+	// in the process table as a zombie until the parent process exits.
+	//
+	// Call openSystemBrowser with a URL scheme that the platform launcher cannot
+	// handle, causing it to exit within milliseconds with an error — fast enough
+	// to reliably produce a zombie before the assertion if Config.detached is absent.
+	// With Config.detached the launcher runs as a grandchild (double-fork), so this
+	// process has no direct child to reap and waitpid returns ECHILD.
+	import core.stdc.errno : errno, ECHILD;
+	import core.sys.posix.sys.types : pid_t;
+	import core.sys.posix.sys.wait : waitpid, WNOHANG;
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	openSystemBrowser("mcp-sdk-test-zombie://localhost/verify-detach");
+
+	Thread.sleep(300.msecs); // allow the launcher to exit and become a zombie if not detached
+
+	// Reap any zombie direct children.  With Config.detached, the grandchild is
+	// not a direct child of this process, so waitpid returns -1/ECHILD.
+	// Without Config.detached the exited launcher is a zombie child and waitpid
+	// returns its PID, causing the assertion to fail.
+	int status;
+	pid_t reaped = () @trusted { return waitpid(-1, &status, WNOHANG); }();
+
+	assert(reaped == -1 && errno == ECHILD,
+			"openSystemBrowser left a zombie child process; it must spawn with Config.detached");
 }
 
 unittest  // a stray non-callback request does not abort the loopback flow
