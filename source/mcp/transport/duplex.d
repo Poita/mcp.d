@@ -154,6 +154,20 @@ final class DuplexChannel
 		}
 		foreach (m; input.messages)
 			routeMessage(m);
+		// A malformed batch member may still carry the id of a pending outbound
+		// request; wake that waiter with the member's error so the caller fails fast
+		// instead of blocking until its timeout. When no id is recoverable (the member
+		// is not an object, or its id is null/absent), reply with a null-id JSON-RPC
+		// error so the peer is still notified rather than dropped silently.
+		foreach (e; input.errors)
+		{
+			Json id = (e.item.type == Json.Type.object && "id" in e.item) ? e.item["id"] : Json(
+					null);
+			if (id.type == Json.Type.null_ || id.type == Json.Type.undefined)
+				send(makeErrorResponse(Json(null), e.error));
+			else
+				coord.resolve(id, Json.undefined, toErrorJson(e.error));
+		}
 	}
 
 	private void routeMessage(Message m) @safe
@@ -718,6 +732,58 @@ unittest  // sendRaw() writes the already-serialized line verbatim, without a pa
 	});
 	runEventLoop();
 	assert(written == raw, "sendRaw must write the line verbatim, not re-serialize it");
+}
+
+unittest  // a malformed batch member carrying a pending id wakes its deliver() with an error, not a timeout
+{
+	// Client read path (no batch handler): the peer replies with a batch whose
+	// member for the pending id is malformed (both result and error present →
+	// -32600). That member lands in input.errors; its id must still wake the
+	// awaiting deliver() with the member's error rather than being dropped so the
+	// caller blocks until its timeout.
+	auto toResponder = new LineLink; // client -> responder
+	auto toClient = new LineLink; // responder -> client
+
+	bool threw;
+	int errCode;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return toClient.take(); }, (string s) @safe {
+				toResponder.put(s);
+			}, (Message) @safe {});
+			channel.start();
+
+			runTask(() nothrow{
+				try
+				{
+					toResponder.take(); // the deliver() request frame
+					enum batch = `[{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"x"}},` ~ `{"jsonrpc":"2.0","id":2,"result":{}}]`;
+					toClient.put(batch);
+				}
+				catch (Exception)
+				{
+				}
+			});
+
+			try
+				channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1, 5.seconds);
+			catch (McpException e)
+			{
+				threw = true;
+				errCode = e.code;
+			}
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(threw, "a malformed batch member for a pending id must wake its deliver()");
+	assert(errCode == ErrorCode.invalidRequest,
+			"the waiter must wake with the member's -32600 error, not a -32603 timeout");
 }
 
 unittest  // deliver() after close() fails fast
