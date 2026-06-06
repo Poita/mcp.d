@@ -237,6 +237,9 @@ struct AuthorizationServerMetadata
 	string[] scopesSupported;
 	string[] grantTypesSupported;
 	string[] tokenEndpointAuthMethodsSupported;
+	/// RFC 8414 §2: REQUIRED when `authorization_endpoint` is present. Lists the
+	/// OAuth `response_type` values the server supports (e.g. `["code"]`).
+	string[] responseTypesSupported;
 	/// RFC 9207: whether the AS includes the `iss` parameter in authorization
 	/// responses. When true, clients MUST require and validate `iss`.
 	bool authorizationResponseIssParameterSupported;
@@ -273,6 +276,7 @@ struct AuthorizationServerMetadata
 		m.grantTypesSupported = stringArray(j, "grant_types_supported");
 		m.tokenEndpointAuthMethodsSupported = stringArray(j,
 				"token_endpoint_auth_methods_supported");
+		m.responseTypesSupported = stringArray(j, "response_types_supported");
 		m.authorizationResponseIssParameterSupported = boolField(j,
 				"authorization_response_iss_parameter_supported");
 		m.clientIdMetadataDocumentSupported = boolField(j, "client_id_metadata_document_supported");
