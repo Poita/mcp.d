@@ -128,6 +128,11 @@ final class HttpClientTransport : ClientTransport
 	// stream rather than on the POST response.
 	private bool legacyMode;
 	private string legacyEndpoint;
+	// Set when the background reader receives an `endpoint` event whose URI is
+	// rejected by the SSRF guard (cross-origin). Distinguishes "endpoint received
+	// but rejected" from "endpoint not yet received", so `startLegacyFallback` can
+	// break its wait loop immediately instead of stalling until the 10s deadline.
+	private bool legacyEndpointRejected;
 	// The most recent HTTP status seen on a POST, so the lifecycle code can
 	// detect the 400/404/405 backward-compatibility trigger.
 	private int lastPostStatus;
@@ -1201,6 +1206,7 @@ final class HttpClientTransport : ClientTransport
 
 		legacyMode = true;
 		legacyEndpoint = null;
+		legacyEndpointRejected = false;
 
 		// Create the completion event before spawning the reader so an `endpoint`
 		// event the reader discovers immediately cannot be missed.
@@ -1218,13 +1224,22 @@ final class HttpClientTransport : ClientTransport
 
 		// Wait (bounded, ~10s ceiling) for the background task to discover the
 		// endpoint URI, woken by the reader's `notifyLegacy` rather than polling.
+		// Exit immediately when the reader sets `legacyEndpointRejected`: a
+		// cross-origin endpoint was received and rejected by the SSRF guard, so
+		// no valid endpoint will ever arrive on this stream.
 		const deadline = MonoTime.currTime + 10_000.msecs;
-		while (legacyEndpoint.length == 0)
+		while (legacyEndpoint.length == 0 && !legacyEndpointRejected)
 		{
 			const now = MonoTime.currTime;
 			if (now >= deadline)
 				break;
 			ec = legacyCompletionEvent().waitUninterruptible(deadline - now, ec);
+		}
+		if (legacyEndpointRejected)
+		{
+			legacyMode = false;
+			throw internalError(
+					"legacy HTTP+SSE server sent a cross-origin `endpoint` event (SSRF guard rejected it)");
 		}
 		if (legacyEndpoint.length == 0)
 		{
@@ -1331,7 +1346,11 @@ final class HttpClientTransport : ClientTransport
 						(string eventType, string data) @safe {
 					if (eventType == "endpoint")
 					{
-						legacyEndpoint = resolveEndpointUri(url, data.strip);
+						const resolved = resolveEndpointUri(url, data.strip);
+						if (resolved is null)
+							legacyEndpointRejected = true; // cross-origin: SSRF guard rejected it
+						else
+							legacyEndpoint = resolved;
 						notifyLegacy(); // wake `startLegacyFallback`
 						return;
 					}
@@ -2102,6 +2121,26 @@ unittest  // notifyLegacy is a no-op before the completion event is created
 	assert(!t.legacyEventInit);
 	t.notifyLegacy(); // must not touch an uninitialized LocalManualEvent
 	assert(!t.legacyEventInit);
+}
+
+unittest  // a cross-origin endpoint event sets the rejection flag, not the endpoint
+{
+	// When resolveEndpointUri returns null (cross-origin URL), the endpoint handler
+	// must set legacyEndpointRejected so the startLegacyFallback wait loop can
+	// break immediately rather than stalling until the 10-second deadline expires.
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	assert(!t.legacyEndpointRejected);
+
+	// Simulate the endpoint event handler receiving a cross-origin URL.
+	const resolved = resolveEndpointUri(t.url, "http://attacker.example/messages");
+	assert(resolved is null); // cross-origin: resolveEndpointUri returns null
+	if (resolved is null)
+		t.legacyEndpointRejected = true;
+	else
+		t.legacyEndpoint = resolved;
+
+	assert(t.legacyEndpointRejected);
+	assert(t.legacyEndpoint is null); // endpoint is not populated on rejection
 }
 
 unittest  // readSseBody records id:/retry: into the caller-owned cursor
