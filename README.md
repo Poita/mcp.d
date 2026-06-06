@@ -37,19 +37,17 @@ import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 
 void main()
 {
-    // The client drives vibe's event loop; runTask needs a nothrow body, so the
-    // throwing MCP calls are wrapped.
+    // The client drives vibe's event loop.
     runTask(() nothrow {
         scope (exit) exitEventLoop();
         try
         {
-            auto client = McpClient.spawn(["./demo-server"]); // start the server over stdio
+            auto client = McpClient.spawn(["./demo-server"]);
             scope (exit) client.close();
-            client.connect();                                 // negotiate any protocol era
+            client.connect();
 
-            // Raw JSON in and out — what most integrators pass through.
             auto r = client.callTool("add", parseJsonString(`{"a": 2, "b": 3}`));
-            assert(r.structuredContent["result"].get!long == 5); // scalar return under `result`
+            assert(r.structuredContent["result"].get!long == 5);
         }
         catch (Exception e) assert(false, e.msg);
     });
