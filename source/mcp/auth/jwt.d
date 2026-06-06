@@ -97,6 +97,8 @@ string makeClientAssertion(string clientId, string audience, string privateKeyPe
 		throw new Exception("makeClientAssertion: clientId contains control characters");
 	if (containsControlChar(audience))
 		throw new Exception("makeClientAssertion: audience contains control characters");
+	if (jti.length && containsControlChar(jti))
+		throw new Exception("makeClientAssertion: jti contains control characters");
 
 	const theJti = jti.length ? jti : ("jti-" ~ now.to!string);
 
@@ -267,6 +269,19 @@ unittest  // Control characters in clientId or audience fail closed
 		~ "-----END PRIVATE KEY-----\n";
 	assertThrown(makeClientAssertion("bad\nid", "https://as.example.com/token", pem, 1));
 	assertThrown(makeClientAssertion("client-1", "https://as.example.com/\ttoken", pem, 1));
+}
+
+unittest  // A control character in a caller-supplied jti fails closed
+{
+	import std.exception : assertThrown;
+
+	const pem = "-----BEGIN PRIVATE KEY-----\n"
+		~ "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7K6+stITLYsQjC9o\n"
+		~ "hyL925dgd6gNWRcGOl5RPvIpye+hRANCAATSBYPkHq12VDW5un1kub6zkBc4ieZ9\n"
+		~ "nurGMu+tLzJ6+6syOZsQCGlazcSOGsopLyl1QZMIFh9atUYaDfUjJxMq\n"
+		~ "-----END PRIVATE KEY-----\n";
+	assertThrown(makeClientAssertion("client-1",
+			"https://as.example.com/token", pem, 1, 300, "bad\njti"));
 }
 
 version (unittest) private enum testEcPem = "-----BEGIN PRIVATE KEY-----\n"
