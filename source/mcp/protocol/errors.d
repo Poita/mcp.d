@@ -123,6 +123,7 @@ McpException resourceNotFound(string uri, ProtocolVersion v, Json data = Json.un
 bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 {
 	import std.ascii : isAlpha, isAlphaNum;
+	import std.string : indexOf;
 
 	if (url.length == 0)
 		return false;
@@ -168,6 +169,11 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 		if (c == '@')
 			authority = authority[j + 1 .. $]; // host is whatever follows last '@'
 	}
+	// Strip the port suffix before checking that the host is non-empty.
+	// A URL such as "https://:8080/" has authority ":8080" with an empty host.
+	const colon = indexOf(authority, ':');
+	if (colon >= 0)
+		authority = authority[0 .. colon];
 	return authority.length > 0;
 }
 
@@ -468,6 +474,14 @@ unittest  // isValidElicitationUrl rejects non-web schemes that still carry a //
 	assert(!isValidElicitationUrl("ftp://host/x"));
 	assert(!isValidElicitationUrl("ws://host"));
 	assert(!isValidElicitationUrl("wss://host/socket"));
+}
+
+unittest  // isValidElicitationUrl rejects empty host when port is present
+{
+	// https://:8080/ has no host — the colon-port alone must not count as a host.
+	assert(!isValidElicitationUrl("https://:8080/"));
+	assert(!isValidElicitationUrl("http://:443"));
+	assert(!isValidElicitationUrl("https://:"));
 }
 
 unittest  // isValidElicitationUrl still accepts http/https (case-insensitive scheme)
