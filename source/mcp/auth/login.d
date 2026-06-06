@@ -807,6 +807,15 @@ LoopbackCapture enforceIssOnCapture(LoopbackCapture cap, AuthorizationServerMeta
 	return cap;
 }
 
+/// Returns true when `reqPath` matches `callbackPath` exactly, meaning the
+/// request should be processed as an OAuth callback. Requests on any other path
+/// are always rejected with 404, regardless of query parameters — a request
+/// carrying `code=` or `error=` on the wrong path must not abort the flow.
+private bool isLoopbackCallbackPath(string reqPath, string callbackPath) @safe pure nothrow @nogc
+{
+	return reqPath == callbackPath;
+}
+
 /// Open the browser at the authorization URL and run a localhost loopback HTTP
 /// listener to capture the redirect. Blocks (on the vibe event loop) until the
 /// redirect arrives or `opts.callbackTimeout` elapses, then returns the
@@ -833,15 +842,12 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationS
 
 	void handle(scope HTTPServerRequest req, scope HTTPServerResponse res) @safe
 	{
-		// Only the genuine callback path (or a request actually carrying an OAuth
-		// `code`/`error` response parameter) may complete the flow. Stray requests
-		// to other paths — favicon probes, prefetch, port scans, a second tab —
-		// must not terminate the listener, otherwise they race ahead of the real
-		// redirect and abort an otherwise-valid login.
+		// Only requests on the exact callback path proceed. Stray requests
+		// — favicon probes, prefetch, port scans, or any request carrying
+		// code=/error= on a wrong path — are rejected with 404 so they cannot
+		// race ahead of the genuine AS redirect and abort the flow.
 		const reqPath = requestTargetPath(req.requestURI);
-		const hasResponseParam = extractQueryParam(req.requestURI, "code").length > 0
-			|| extractQueryParam(req.requestURI, "error").length > 0;
-		if (reqPath != opts.callbackPath && !hasResponseParam)
+		if (!isLoopbackCallbackPath(reqPath, opts.callbackPath))
 		{
 			res.statusCode = 404;
 			res.contentType = "text/plain; charset=utf-8";
@@ -1290,6 +1296,24 @@ unittest  // enforceIssOnCapture runs even on an error response (does not act on
 	auto checked = enforceIssOnCapture(cap, as_);
 	assert(!checked.ok);
 	assert(checked.error == "invalid_iss");
+}
+
+unittest  // isLoopbackCallbackPath accepts the exact callback path
+{
+	assert(isLoopbackCallbackPath("/callback", "/callback"));
+}
+
+unittest  // isLoopbackCallbackPath rejects a different path even when it carries a code= parameter
+{
+	// A wrong-path request with code= must not be treated as a valid callback —
+	// a local process racing the real AS redirect could otherwise abort the flow
+	// by setting done=true with a state_mismatch error before the genuine redirect.
+	assert(!isLoopbackCallbackPath("/evil", "/callback"));
+}
+
+unittest  // isLoopbackCallbackPath rejects a different path even with an error= parameter
+{
+	assert(!isLoopbackCallbackPath("/favicon.ico", "/callback"));
 }
 
 version (Posix) unittest  // FileTokenStore.writeSecretFile does not draw from the Mersenne Twister (std.random)
