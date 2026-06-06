@@ -587,8 +587,12 @@ unittest  // when a batch handler is installed (server path) a batch line is rou
 	assert(wholeRaw == batch, "the batch handler must receive the whole raw line");
 }
 
-unittest  // an exception thrown by the onInbound notification handler is logged to stderr, not silently swallowed
+version (Posix) unittest  // an exception thrown by the onInbound notification handler is logged to stderr, not silently swallowed
 {
+	// Guarded to POSIX: the test captures stderr by redirecting its file descriptor
+	// via pipe()/dup2(), which has no portable Windows equivalent. The behaviour
+	// under test (a throwing notification handler logs to stderr and the read loop
+	// continues) is itself platform-independent.
 	// When the synchronous onInbound delegate throws for a notification (e.g.
 	// a notifications/cancelled handler encountering an unexpected requestId type),
 	// the exception must produce a diagnostic on stderr so the failure is visible;
