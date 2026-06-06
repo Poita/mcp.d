@@ -258,6 +258,25 @@ struct meta
 	Json value; /// the `_meta` object (must be a JSON object to be emitted)
 }
 
+/// Field-level UDA declaring a human-readable `description` (the JSON Schema
+/// `description` keyword) for a struct field. When `jsonSchemaOf!T` reflects
+/// over a struct, a field annotated with `@fieldDescription("…")` emits
+/// `"description": "…"` on its property schema. Named `fieldDescription`
+/// rather than `description` to avoid shadowing D's `std.traits.description`
+/// and to keep the name unambiguous at the call site.
+///
+/// Example:
+/// ---
+/// struct Form
+/// {
+///     @fieldDescription("Number of items to return") int count;
+/// }
+/// ---
+struct fieldDescription
+{
+	string value; /// the description emitted as JSON Schema `description`
+}
+
 /// Field-level UDA declaring a numeric lower bound (the JSON Schema `minimum`
 /// keyword) for a struct field. When `jsonSchemaOf!T` reflects over a struct,
 /// a field annotated with `@minimum(v)` emits `"minimum": v` on its property
