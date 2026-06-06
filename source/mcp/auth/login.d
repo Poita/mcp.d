@@ -46,6 +46,10 @@ struct StoredToken
 	string refreshToken;
 	string scope_;
 	string resource;
+	/// The OAuth `client_id` used to obtain this token (pre-registered, CIMD, or
+	/// DCR-issued). Persisted so a later refresh can authenticate at the token
+	/// endpoint even when no `client_id` was statically configured.
+	string clientId;
 
 	/// Whether this record holds a usable access token.
 	bool hasToken() const @safe pure nothrow @nogc
@@ -78,6 +82,7 @@ struct StoredToken
 		j["refresh_token"] = refreshToken;
 		j["scope"] = scope_;
 		j["resource"] = resource;
+		j["client_id"] = clientId;
 		return j;
 	}
 
@@ -98,6 +103,8 @@ struct StoredToken
 			s.scope_ = p.type == Json.Type.string ? p.get!string : "";
 		if (auto p = "resource" in j)
 			s.resource = p.type == Json.Type.string ? p.get!string : "";
+		if (auto p = "client_id" in j)
+			s.clientId = p.type == Json.Type.string ? p.get!string : "";
 		return s;
 	}
 }
@@ -613,7 +620,11 @@ final class OAuthSession
 			auto ts = refreshFn_(token_.refreshToken);
 			if (ts.accessToken.length == 0)
 				throw internalError("OAuth token refresh returned no access token");
+			// Carry the registered client_id forward so the persisted record can
+			// authenticate a later refresh (the refresh response omits it).
+			auto clientId = token_.clientId.length ? token_.clientId : client_.clientId;
 			token_ = StoredToken.fromTokenSet(ts, resource_, now, token_.refreshToken);
+			token_.clientId = clientId;
 			if (store_ !is null)
 				store_.save(resource_, token_);
 		}
@@ -653,6 +664,17 @@ void openSystemBrowser(string url) @safe
 // ===========================================================================
 // The one-call flow
 // ===========================================================================
+
+/// The `RegisteredClient` to use on the cache fast-path. The `client_id` is
+/// read from the persisted token (so DCR/CIMD users, who have no statically
+/// configured `client_id`, still carry the AS-issued one needed to refresh),
+/// falling back to the configured `opts.clientId` for records that predate
+/// persisting it. The secret comes from `opts` (it is not persisted).
+RegisteredClient cacheHitClient(StoredToken cached, OAuthLogin opts) @safe pure nothrow
+{
+	const id = cached.clientId.length ? cached.clientId : opts.clientId;
+	return RegisteredClient(id, opts.clientSecret);
+}
 
 /// Perform the full interactive OAuth login for `client` and attach the
 /// resulting bearer token, refreshing automatically thereafter.
@@ -696,8 +718,8 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	if (cached.hasToken && !needsRefresh(cached, now))
 	{
 		client.setBearerToken(cached.accessToken);
-		return new OAuthSession(oauth, as_, RegisteredClient(opts.clientId,
-				opts.clientSecret), store, oauth.resource, cached);
+		return new OAuthSession(oauth, as_, cacheHitClient(cached, opts),
+				store, oauth.resource, cached);
 	}
 
 	// Select / obtain a client registration.
@@ -731,6 +753,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 			{
 				auto refreshed = StoredToken.fromTokenSet(ts, oauth.resource,
 						now, cached.refreshToken);
+				refreshed.clientId = rc.clientId;
 				store.save(oauth.resource, refreshed);
 				client.setBearerToken(refreshed.accessToken);
 				return new OAuthSession(oauth, as_, rc, store, oauth.resource, refreshed);
@@ -754,6 +777,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	if (ts.accessToken.length == 0)
 		throw internalError("OAuth token exchange returned no access token");
 	auto stored = StoredToken.fromTokenSet(ts, oauth.resource, now);
+	stored.clientId = rc.clientId;
 	store.save(oauth.resource, stored);
 	client.setBearerToken(stored.accessToken);
 	return new OAuthSession(oauth, as_, rc, store, oauth.resource, stored);
@@ -1445,6 +1469,58 @@ version (Posix) unittest  // openSystemBrowser does not leave a zombie process a
 
 	assert(reaped == -1 && errno == ECHILD,
 			"openSystemBrowser left a zombie child process; it must spawn with Config.detached");
+}
+
+unittest  // the cache fast-path carries the registered client_id (DCR/CIMD have no static client_id)
+{
+	OAuthLogin opts; // DCR/CIMD: opts.clientId is empty
+	StoredToken cached;
+	cached.accessToken = "valid";
+	cached.clientId = "abc123"; // issued by the AS on the first run and persisted
+	auto rc = cacheHitClient(cached, opts);
+	assert(rc.clientId == "abc123");
+}
+
+unittest  // the cache fast-path falls back to the pre-registered client_id when none was persisted
+{
+	OAuthLogin opts;
+	opts.clientId = "pre-reg"; // older cache records predate the stored client_id
+	StoredToken cached;
+	cached.accessToken = "valid";
+	auto rc = cacheHitClient(cached, opts);
+	assert(rc.clientId == "pre-reg");
+}
+
+unittest  // StoredToken persists the registered client_id across JSON round-trips
+{
+	StoredToken t;
+	t.accessToken = "tok";
+	t.clientId = "abc123";
+	auto back = StoredToken.fromJson(t.toJson());
+	assert(back.clientId == "abc123");
+}
+
+unittest  // refreshing an expired token preserves the registered client_id for later refreshes
+{
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt";
+	t.clientId = "abc123";
+	t.expiresAt = 1000; // expired relative to the request time below
+
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		TokenSet ts;
+		ts.accessToken = "new";
+		ts.expiresIn = 3600;
+		return ts;
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+	sess.bearerForRequest(5000);
+
+	// The persisted token still carries the registered client_id so a subsequent
+	// refresh (e.g. after a process restart) can authenticate at the AS.
+	assert(store.load("https://mcp.example.com").clientId == "abc123");
 }
 
 unittest  // a stray non-callback request does not abort the loopback flow
