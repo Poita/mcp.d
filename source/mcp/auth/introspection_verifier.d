@@ -281,6 +281,8 @@ final class PositiveCache
 		const exp = introspectionExp(info.claims);
 		if (exp > 0 && exp < expiresAt)
 			expiresAt = exp;
+		if (expiresAt <= now)
+			return; // token is already expired — nothing to cache
 		sweep(now);
 		if (maxEntries != 0 && (token in entries) is null)
 			while (entries.length >= maxEntries)
@@ -680,4 +682,19 @@ unittest  // PositiveCache sweeps expired entries on put, reclaiming space
 	assert(cache.get("a", 1031) is null);
 	assert(cache.get("b", 1031) is null);
 	assert(cache.get("c", 1031) !is null);
+}
+
+unittest  // PositiveCache skips storing a token whose exp claim is already in the past
+{
+	// TTL = 30s, now = 1000, but exp = 500 (500 s in the past).
+	// The clamping sets expiresAt = 500, which is already expired relative to now.
+	// put must not store the entry; the cache must remain empty.
+	auto cache = new PositiveCache(30.seconds);
+	TokenInfo ti;
+	ti.valid = true;
+	ti.claims = parseJsonString(`{"active":true,"exp":500}`);
+	cache.put("tok", ti, 1000);
+	// The entry must not be stored — length stays 0 and a get returns null.
+	assert(cache.length == 0);
+	assert(cache.get("tok", 1000) is null);
 }
