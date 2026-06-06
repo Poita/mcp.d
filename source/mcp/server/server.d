@@ -194,6 +194,12 @@ struct RegisteredResource
 	ResourceContents delegate() @safe reader;
 	/// Per-resource draft `CacheableResult` freshness hint for `resources/read`.
 	Nullable!CacheHint cache;
+	/// Client capabilities this resource's reader requires to run. On the draft
+	/// protocol, `resources/read` rejects with a `-32003`
+	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
+	/// lists the unmet ones) when the request's declared client capabilities do
+	/// not cover these. Empty (the default) means no gating.
+	ClientCapabilities requiredClientCapabilities;
 }
 
 /// A resource template reader receiving the concrete URI, the captured `{var}`
@@ -210,6 +216,12 @@ struct RegisteredTemplate
 	TemplateReader reader;
 	/// Per-template draft `CacheableResult` freshness hint for `resources/read`.
 	Nullable!CacheHint cache;
+	/// Client capabilities this template's reader requires to run. On the draft
+	/// protocol, `resources/read` rejects with a `-32003`
+	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
+	/// lists the unmet ones) when the request's declared client capabilities do
+	/// not cover these. Empty (the default) means no gating.
+	ClientCapabilities requiredClientCapabilities;
 }
 
 /// The outcome of a `prompts/get` call: either the final `GetPromptResult`, or
@@ -259,6 +271,12 @@ struct RegisteredPrompt
 {
 	Prompt descriptor;
 	MrtrPromptHandler handler;
+	/// Client capabilities this prompt's handler requires to run. On the draft
+	/// protocol, `prompts/get` rejects with a `-32003`
+	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
+	/// lists the unmet ones) when the request's declared client capabilities do
+	/// not cover these. Empty (the default) means no gating.
+	ClientCapabilities requiredClientCapabilities;
 }
 
 /// How a server manages per-connection state. The author chooses;
@@ -578,6 +596,78 @@ final class McpServer
 			return false;
 		entry.requiredClientCapabilities = caps;
 		return true;
+	}
+
+	/// Declare the client capabilities a registered prompt's handler requires.
+	///
+	/// On the draft protocol (which carries the caller's `clientCapabilities`
+	/// per-request in `_meta`), a `prompts/get` for this prompt is rejected up
+	/// front with a `-32003` `MissingRequiredClientCapabilityError` — whose
+	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
+	/// exactly the unmet capabilities — when the request's declared capabilities
+	/// do not cover `caps`. On the stateful 2025-era protocols the gate uses the
+	/// session capabilities negotiated at `initialize`. Passing a
+	/// default-constructed `ClientCapabilities` clears the requirement. Returns
+	/// `false` if no prompt with `name` is registered.
+	bool setPromptRequiredClientCapabilities(string name, ClientCapabilities caps) @safe
+	{
+		auto entry = name in prompts;
+		if (entry is null)
+			return false;
+		entry.requiredClientCapabilities = caps;
+		return true;
+	}
+
+	/// Declare the client capabilities a registered resource (direct or template)
+	/// requires to be read.
+	///
+	/// On the draft protocol (which carries the caller's `clientCapabilities`
+	/// per-request in `_meta`), a `resources/read` for a URI matching this
+	/// resource is rejected up front with a `-32003`
+	/// `MissingRequiredClientCapabilityError` — whose
+	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
+	/// exactly the unmet capabilities — when the request's declared capabilities
+	/// do not cover `caps`. On the stateful 2025-era protocols the gate uses the
+	/// session capabilities negotiated at `initialize`. Passing a
+	/// default-constructed `ClientCapabilities` clears the requirement.
+	///
+	/// For a direct resource, `uri` is the exact resource URI. Returns `false`
+	/// if no direct resource with that URI is registered.
+	bool setResourceRequiredClientCapabilities(string uri, ClientCapabilities caps) @safe
+	{
+		auto entry = uri in resources;
+		if (entry is null)
+			return false;
+		entry.requiredClientCapabilities = caps;
+		return true;
+	}
+
+	/// Declare the client capabilities a registered resource template requires
+	/// to be read.
+	///
+	/// On the draft protocol (which carries the caller's `clientCapabilities`
+	/// per-request in `_meta`), a `resources/read` for a URI matching this
+	/// template is rejected up front with a `-32003`
+	/// `MissingRequiredClientCapabilityError` — whose
+	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
+	/// exactly the unmet capabilities — when the request's declared capabilities
+	/// do not cover `caps`. On the stateful 2025-era protocols the gate uses the
+	/// session capabilities negotiated at `initialize`. Passing a
+	/// default-constructed `ClientCapabilities` clears the requirement.
+	///
+	/// `uriTemplate` is the URI template string (e.g. `"res://{id}"`). Returns
+	/// `false` if no template with that URI template string is registered.
+	bool setResourceTemplateRequiredClientCapabilities(string uriTemplate, ClientCapabilities caps) @safe
+	{
+		foreach (ref t; templates)
+		{
+			if (t.descriptor.uriTemplate == uriTemplate)
+			{
+				t.requiredClientCapabilities = caps;
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/// Unregister a previously registered tool by name. Returns `true` if a tool
@@ -2196,7 +2286,7 @@ final class McpServer
 		case "resources/read":
 			if (capabilities().resources.isNull)
 				throw methodNotFound(method);
-			return doReadResource(params, ctx, ver);
+			return doReadResource(params, ctx, ver, conn);
 		case "resources/subscribe":
 			// The draft has no resources/subscribe RPC; subscriptions/listen takes
 			// its place (the SubscriptionFilter "Replaces the former
@@ -2218,7 +2308,7 @@ final class McpServer
 		case "prompts/get":
 			if (capabilities().prompts.isNull)
 				throw methodNotFound(method);
-			return doGetPrompt(params, ctx, ver);
+			return doGetPrompt(params, ctx, ver, conn);
 		case "completion/complete":
 			return doComplete(params);
 		case "logging/setLevel":
@@ -2511,7 +2601,8 @@ final class McpServer
 				templates, (RegisteredTemplate t) => t.descriptor, params, ver);
 	}
 
-	private Json doReadResource(Json params, RequestContext ctx, ProtocolVersion ver) @safe
+	private Json doReadResource(Json params, RequestContext ctx,
+			ProtocolVersion ver, ConnectionState conn) @safe
 	{
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/read requires a string 'uri'");
@@ -2519,6 +2610,13 @@ final class McpServer
 
 		if (auto direct = uri in resources)
 		{
+			// Capability gating: mirrors doCallTool — uses per-request
+			// _meta.clientCapabilities on the stateless draft, or the session caps
+			// negotiated at initialize on stateful 2025-era protocols.
+			const ClientCapabilities declared = ver.isModern
+				? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
+			if (auto missing = direct.requiredClientCapabilities.missingFrom(declared))
+				throw missingRequiredClientCapability(missing.get);
 			ReadResourceResult result;
 			result.contents = [direct.reader().forVersion(ver)];
 			return maybeCache(result, direct.cache, ver);
@@ -2529,6 +2627,11 @@ final class McpServer
 			string[string] captured;
 			if (matchUriTemplate(t.descriptor.uriTemplate, uri, captured))
 			{
+				// Capability gating: same logic as for direct resources.
+				const ClientCapabilities declared = ver.isModern
+					? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
+				if (auto missing = t.requiredClientCapabilities.missingFrom(declared))
+					throw missingRequiredClientCapability(missing.get);
 				ReadResourceResult result;
 				result.contents = [t.reader(uri, captured, ctx).forVersion(ver)];
 				return maybeCache(result, t.cache, ver);
@@ -2598,7 +2701,8 @@ final class McpServer
 		return Nullable!CacheHint.init;
 	}
 
-	private Json doGetPrompt(Json params, RequestContext ctx, ProtocolVersion ver) @safe
+	private Json doGetPrompt(Json params, RequestContext ctx,
+			ProtocolVersion ver, ConnectionState conn) @safe
 	{
 		if ("name" !in params || params["name"].type != Json.Type.string)
 			throw invalidParams("prompts/get requires a string 'name'");
@@ -2606,6 +2710,15 @@ final class McpServer
 		auto entry = name in prompts;
 		if (entry is null)
 			throw invalidParams("Unknown prompt: " ~ name);
+
+		// Capability gating: mirrors doCallTool — uses per-request
+		// _meta.clientCapabilities on the stateless draft, or the session caps
+		// negotiated at initialize on stateful 2025-era protocols.
+		const ClientCapabilities declared = ver.isModern
+			? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
+		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
+			throw missingRequiredClientCapability(missing.get);
+
 		Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
 		// Validate declared required arguments before invoking the handler so a
 		// missing required argument yields -32602 instead of a default-valued
@@ -2630,13 +2743,10 @@ final class McpServer
 		// so the 2025-era protocols never see it.
 		auto response = entry.handler(args, ctx);
 		// MRTR: mirror doCallTool — never ask the client for an input kind
-		// it did not declare. MRTR is draft-only (`usesMRTR`); the declared set is
-		// the request's own `_meta.clientCapabilities`.
+		// it did not declare. MRTR is draft-only (`usesMRTR`); reuse the
+		// `declared` set already resolved above for capability gating.
 		if (ver.usesMRTR && response.needsInput)
-		{
-			const ClientCapabilities declared = RequestMeta.fromParams(params).clientCapabilities;
 			response = filterInputRequests(response, declared, "prompts/get");
-		}
 		// Project the final result to the negotiated protocol version so newer
 		// content kinds (audio/resource_link/tool_use/tool_result) and
 		// content-level `_meta`/`lastModified` do not leak to an older peer.
@@ -6101,6 +6211,159 @@ unittest  // stateful (2025-era) tools/call gates on negotiated session capabili
 	]);
 	auto resp = s.handle(req(2, "tools/call", p)).get;
 	assert(resp["error"]["code"].get!long == -32003);
+}
+
+unittest  // draft prompts/get rejects with -32003 when a required client cap is undeclared
+{
+	auto s = new McpServer("t", "1");
+	Prompt pr = {name: "greet"};
+	s.registerDynamicPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
+	ClientCapabilities reqCap;
+	reqCap.sampling = true;
+	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
+	// draftReq declares empty clientCapabilities -> sampling is missing.
+	Json p = Json(["name": Json("greet")]);
+	auto resp = s.handle(draftReq(1, "prompts/get", p)).get;
+	assert(resp["error"]["code"].get!long == -32003);
+	assert("requiredCapabilities" in resp["error"]["data"]);
+	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
+}
+
+unittest  // draft prompts/get proceeds when the required cap is declared
+{
+	auto s = new McpServer("t", "1");
+	Prompt pr = {name: "greet"};
+	s.registerDynamicPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
+	ClientCapabilities reqCap;
+	reqCap.sampling = true;
+	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
+	// Build a draft request declaring the sampling capability.
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	meta[MetaKey.clientCapabilities] = Json(["sampling": Json.emptyObject]);
+	Json p = Json(["name": Json("greet")]);
+	p["_meta"] = meta;
+	auto resp = s.handle(req(2, "prompts/get", p)).get;
+	assert("error" !in resp);
+}
+
+unittest  // setPromptRequiredClientCapabilities returns false for an unknown prompt
+{
+	auto s = new McpServer("t", "1");
+	ClientCapabilities reqCap;
+	reqCap.sampling = true;
+	assert(!s.setPromptRequiredClientCapabilities("nope", reqCap));
+}
+
+unittest  // stateful (2025-era) prompts/get gates on negotiated session capabilities
+{
+	auto s = new McpServer("t", "1");
+	Prompt pr = {name: "greet"};
+	s.registerDynamicPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
+	ClientCapabilities reqCap;
+	reqCap.sampling = true;
+	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
+	// Initialize on a stateful version declaring NO sampling capability.
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2025-06-18";
+	initP["capabilities"] = Json.emptyObject;
+	initP["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", initP));
+	Json p = Json(["name": Json("greet")]);
+	auto resp = s.handle(req(2, "prompts/get", p)).get;
+	assert(resp["error"]["code"].get!long == -32003);
+}
+
+unittest  // draft resources/read rejects with -32003 when a required client cap is undeclared
+{
+	auto s = new McpServer("t", "1");
+	s.registerResource(Resource("res://x", "x"), () @safe {
+		ResourceContents c;
+		return c;
+	});
+	ClientCapabilities reqCap;
+	reqCap.sampling = true;
+	assert(s.setResourceRequiredClientCapabilities("res://x", reqCap));
+	// draftReq declares empty clientCapabilities -> sampling is missing.
+	Json p = Json(["uri": Json("res://x")]);
+	auto resp = s.handle(draftReq(1, "resources/read", p)).get;
+	assert(resp["error"]["code"].get!long == -32003);
+	assert("requiredCapabilities" in resp["error"]["data"]);
+	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
+}
+
+unittest  // draft resources/read proceeds when the required cap is declared
+{
+	auto s = new McpServer("t", "1");
+	s.registerResource(Resource("res://x", "x"), () @safe {
+		ResourceContents c;
+		return c;
+	});
+	ClientCapabilities reqCap;
+	reqCap.sampling = true;
+	assert(s.setResourceRequiredClientCapabilities("res://x", reqCap));
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	meta[MetaKey.clientCapabilities] = Json(["sampling": Json.emptyObject]);
+	Json p = Json(["uri": Json("res://x")]);
+	p["_meta"] = meta;
+	auto resp = s.handle(req(2, "resources/read", p)).get;
+	assert("error" !in resp);
+}
+
+unittest  // setResourceRequiredClientCapabilities returns false for an unknown resource
+{
+	auto s = new McpServer("t", "1");
+	ClientCapabilities reqCap;
+	reqCap.sampling = true;
+	assert(!s.setResourceRequiredClientCapabilities("res://nope", reqCap));
+}
+
+unittest  // stateful (2025-era) resources/read gates on negotiated session capabilities
+{
+	auto s = new McpServer("t", "1");
+	s.registerResource(Resource("res://x", "x"), () @safe {
+		ResourceContents c;
+		return c;
+	});
+	ClientCapabilities reqCap;
+	reqCap.sampling = true;
+	assert(s.setResourceRequiredClientCapabilities("res://x", reqCap));
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2025-06-18";
+	initP["capabilities"] = Json.emptyObject;
+	initP["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", initP));
+	Json p = Json(["uri": Json("res://x")]);
+	auto resp = s.handle(req(2, "resources/read", p)).get;
+	assert(resp["error"]["code"].get!long == -32003);
+}
+
+unittest  // draft resources/read via template rejects with -32003 when cap undeclared
+{
+	auto s = new McpServer("t", "1");
+	ResourceTemplate tmpl = {uriTemplate: "res://{id}", name: "item"};
+	s.registerResourceTemplate(tmpl, (string uri, string[string] params) @safe {
+		ResourceContents c;
+		return c;
+	});
+	ClientCapabilities reqCap;
+	reqCap.sampling = true;
+	assert(s.setResourceTemplateRequiredClientCapabilities("res://{id}", reqCap));
+	Json p = Json(["uri": Json("res://42")]);
+	auto resp = s.handle(draftReq(1, "resources/read", p)).get;
+	assert(resp["error"]["code"].get!long == -32003);
+	assert("requiredCapabilities" in resp["error"]["data"]);
+}
+
+unittest  // setResourceTemplateRequiredClientCapabilities returns false for unknown template
+{
+	auto s = new McpServer("t", "1");
+	ClientCapabilities reqCap;
+	reqCap.sampling = true;
+	assert(!s.setResourceTemplateRequiredClientCapabilities("res://{nope}", reqCap));
 }
 
 unittest  // server/discover advertises all supported versions + identity
