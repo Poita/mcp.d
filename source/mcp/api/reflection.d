@@ -709,6 +709,10 @@ private void registerResourceMethod(string memberName, alias overload, alias par
 	descriptor.name = attr.name;
 	if (attr.mimeType.length)
 		descriptor.mimeType = nullable(attr.mimeType);
+	if (attr.description.length)
+		descriptor.description = nullable(attr.description);
+	if (attr.title.length)
+		descriptor.title = nullable(attr.title);
 
 	applyResourceMetadata!overload(descriptor);
 
@@ -726,6 +730,10 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 	descriptor.name = attr.name;
 	if (attr.mimeType.length)
 		descriptor.mimeType = nullable(attr.mimeType);
+	if (attr.description.length)
+		descriptor.description = nullable(attr.description);
+	if (attr.title.length)
+		descriptor.title = nullable(attr.title);
 
 	applyResourceMetadata!overload(descriptor);
 
@@ -2195,4 +2203,91 @@ unittest  // @resourceTemplate RequestContext parameter binds to the real reques
 	// The handler observed the real context's capabilities; a dummy NullContext
 	// would report no capabilities and yield "no-elicit".
 	assert(rr["result"]["contents"][0]["text"].get!string == "elicit-capable: MCP");
+}
+
+version (unittest) private final class DescribedResourceApi
+{
+	@resource("res://described", "Described", "text/plain",
+			"A human-readable description", "Display Title")
+	string described() @safe
+	{
+		return "body";
+	}
+
+	@resource("res://bare", "Bare", "text/plain")
+	string bare() @safe
+	{
+		return "bare body";
+	}
+
+	@resourceTemplate("tmpl://{id}", "DescribedTmpl", "text/plain",
+			"Template description", "Template Title")
+	string describedTmpl(string id) @safe
+	{
+		return "tmpl " ~ id;
+	}
+
+	@resourceTemplate("tmpl2://{id}", "BareTmpl", "text/plain")
+	string bareTmpl(string id) @safe
+	{
+		return "bare tmpl " ~ id;
+	}
+}
+
+unittest  // @resource description and title fields are emitted in resources/list
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DescribedResourceApi);
+	auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
+			Json.emptyObject))).get["result"]["resources"];
+
+	Json described, bare;
+	foreach (i; 0 .. res.length)
+	{
+		auto uri = res[i]["uri"].get!string;
+		if (uri == "res://described")
+			described = res[i];
+		else if (uri == "res://bare")
+			bare = res[i];
+	}
+
+	assert(described.type == Json.Type.object);
+	assert(described["description"].get!string == "A human-readable description");
+	assert(described["title"].get!string == "Display Title");
+
+	assert(bare.type == Json.Type.object);
+	// A resource without description or title carries neither on the wire.
+	assert("description" !in bare);
+	assert("title" !in bare);
+}
+
+unittest  // @resourceTemplate description and title fields are emitted in resources/templates/list
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DescribedResourceApi);
+	auto tmpl = s.handle(Message(makeRequest(Json(1), "resources/templates/list",
+			Json.emptyObject))).get["result"]["resourceTemplates"];
+
+	Json described, bare;
+	foreach (i; 0 .. tmpl.length)
+	{
+		auto ut = tmpl[i]["uriTemplate"].get!string;
+		if (ut == "tmpl://{id}")
+			described = tmpl[i];
+		else if (ut == "tmpl2://{id}")
+			bare = tmpl[i];
+	}
+
+	assert(described.type == Json.Type.object);
+	assert(described["description"].get!string == "Template description");
+	assert(described["title"].get!string == "Template Title");
+
+	assert(bare.type == Json.Type.object);
+	// A template without description or title carries neither on the wire.
+	assert("description" !in bare);
+	assert("title" !in bare);
 }

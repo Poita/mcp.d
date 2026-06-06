@@ -100,20 +100,30 @@ struct prompt
 
 /// UDA marking a method as a static MCP resource. The method takes no arguments
 /// and returns the resource contents (`string`, or a `ResourceContents`).
+///
+/// An optional human-readable `title` may be supplied for display purposes; it
+/// is independent of the programmatic `name`.
 struct resource
 {
 	string uri;
 	string name;
 	string mimeType;
+	string description;
+	string title; /// optional human-readable display name (empty = unset)
 }
 
 /// UDA marking a method as a resource template (URI contains `{var}`
 /// placeholders). The method receives the captured parameters as its arguments.
+///
+/// An optional human-readable `title` may be supplied for display purposes; it
+/// is independent of the programmatic `name`.
 struct resourceTemplate
 {
 	string uriTemplate;
 	string name;
 	string mimeType;
+	string description;
+	string title; /// optional human-readable display name (empty = unset)
 }
 
 /// Positional value UDA declaring the intended `audience` for a `@resource`- or
