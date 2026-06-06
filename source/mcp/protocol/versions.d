@@ -156,6 +156,9 @@ unittest  // tryParseVersion does not throw on unknown
 unittest  // negotiation: client version supported -> echo it back
 {
 	assert(negotiate("2025-06-18") == ProtocolVersion.v2025_06_18);
+	// both wire tokens for the modern revision must echo back modern, not fall through to latestStable
+	assert(negotiate("draft") == ProtocolVersion.modern);
+	assert(negotiate("2026-07-28") == ProtocolVersion.modern);
 }
 
 unittest  // negotiation: client version unknown/newer -> fall back to latest stable
