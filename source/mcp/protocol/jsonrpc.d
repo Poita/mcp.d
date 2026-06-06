@@ -86,14 +86,22 @@ private void validateEnvelope(Json j) @safe
 		if (v != cast(long) v)
 			throw invalidRequest("JSON-RPC id MUST NOT have a fractional part");
 	}
-	// A `method`-less message with a non-null `id` is a response. JSON-RPC 2.0 5
+	// Every JSON-RPC 2.0 message is exactly one of: request (has method + non-null id),
+	// notification (has method, no id), or response (no method, has non-null id).
+	// A message with neither method nor a non-null id fits no category and must be
+	// rejected so that truncated or malformed frames never reach the dispatcher.
+	const hasNonNullId = ("id" in j) && j["id"].type != Json.Type.null_
+		&& j["id"].type != Json.Type.undefined;
+	if (("method" !in j) && !hasNonNullId)
+		throw invalidRequest("Message must have either method (request/notification) "
+				~ "or a non-null id with result/error (response)");
+	// A `method`-less message with a non-null `id` is a response. JSON-RPC 2.0 §5
 	// requires a response to carry exactly one of `result`/`error`; otherwise
 	// `Message.kind` would silently classify a both-present reply as an error (the
 	// result dropped) and a neither-present reply as a bogus success. Reject both
 	// shapes so a malformed peer response yields -32600 rather than corrupting the
 	// awaited result.
-	const isResponse = ("method" !in j) && ("id" in j)
-		&& j["id"].type != Json.Type.null_ && j["id"].type != Json.Type.undefined;
+	const isResponse = ("method" !in j) && hasNonNullId;
 	if (isResponse)
 	{
 		const hasResult = ("result" in j) !is null;
@@ -446,6 +454,14 @@ unittest  // parseBatch throws when every batch member is malformed (no silent e
 
 	// All members malformed — parseBatch must not silently return [] with no signal.
 	assertThrown!McpException(parseBatch(`[{"id":1,"method":"ping"},{"jsonrpc":"1.0"}]`));
+}
+
+unittest  // a message with no method and no id is rejected as unclassifiable
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0"}`));
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","result":{}}`));
 }
 
 unittest  // method with explicit null id is rejected, not treated as notification
