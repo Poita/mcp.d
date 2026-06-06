@@ -32,14 +32,13 @@ or modern) with `connect()`, calls the tool, and checks the result:
 ```d
 // client.d — build server.d as ./demo-server first
 import mcp;
+import vibe.data.json : parseJsonString;
 import vibe.core.core : runTask, runEventLoop, exitEventLoop;
-
-struct AddArgs { long a; long b; }
-struct Sum     { long result; }   // a scalar tool return arrives under `result`
 
 void main()
 {
-    // The client drives vibe's event loop; run the session in a task.
+    // The client drives vibe's event loop; runTask needs a nothrow body, so the
+    // throwing MCP calls are wrapped.
     runTask(() nothrow {
         scope (exit) exitEventLoop();
         try
@@ -47,8 +46,10 @@ void main()
             auto client = McpClient.spawn(["./demo-server"]); // start the server over stdio
             scope (exit) client.close();
             client.connect();                                 // negotiate any protocol era
-            auto r = client.callTool("add", AddArgs(2, 3));
-            assert(r.structuredContentAs!Sum.result == 5);
+
+            // Raw JSON in and out — what most integrators pass through.
+            auto r = client.callTool("add", parseJsonString(`{"a": 2, "b": 3}`));
+            assert(r.structuredContent["result"].get!long == 5); // scalar return under `result`
         }
         catch (Exception e) assert(false, e.msg);
     });
