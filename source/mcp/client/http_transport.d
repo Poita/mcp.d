@@ -1238,8 +1238,7 @@ final class HttpClientTransport : ClientTransport
 		if (legacyEndpointRejected)
 		{
 			legacyMode = false;
-			throw internalError(
-					"legacy HTTP+SSE server sent a cross-origin `endpoint` event (SSRF guard rejected it)");
+			throw internalError("legacy HTTP+SSE server sent a cross-origin `endpoint` event (SSRF guard rejected it)");
 		}
 		if (legacyEndpoint.length == 0)
 		{
