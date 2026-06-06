@@ -515,7 +515,7 @@ struct ClientCapabilities
 		ClientCapabilities projected;
 		projected.roots = roots;
 		projected.rootsListChanged = rootsListChanged;
-		projected.sampling = sampling;
+		projected.sampling = sampling || samplingTools || samplingContext;
 		projected.experimental = experimental;
 		// elicitation applies from 2025-06-18. `toJson` treats a set
 		// `elicitationForm`/`elicitationUrl` as implying elicitation presence, so a
@@ -1549,6 +1549,26 @@ unittest  // ClientCapabilities.forVersion keeps top-level tasks for any stable 
 		}
 		else
 			assert("tasks" in j);
+	}
+}
+
+unittest  // ClientCapabilities.forVersion: sampling sub-cap only still projects bare sampling to pre-2025-11-25 peers
+{
+	// A client that sets only samplingTools (not the bare sampling flag) must
+	// still advertise a bare `sampling: {}` to peers that predate the sub-cap
+	// era, because toJson treats samplingTools/samplingContext as implying
+	// sampling presence. The same OR-of-sub-flags pattern applies here as for elicitation.
+	ClientCapabilities caps;
+	caps.samplingTools = true; // only sub-cap set; bare sampling flag is false
+	foreach (v; [
+		ProtocolVersion.v2024_11_05, ProtocolVersion.v2025_03_26,
+		ProtocolVersion.v2025_06_18
+	])
+	{
+		auto j = caps.forVersion(v).toJson();
+		assert("sampling" in j, "sampling must be present for pre-2025-11-25 version");
+		assert(j["sampling"].type == Json.Type.object && j["sampling"].length == 0);
+		assert("tools" !in j["sampling"]);
 	}
 }
 
