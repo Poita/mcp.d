@@ -499,9 +499,13 @@ final class OAuthClient
 
 	// Secure POST a body to `url` with the given content type, optionally adding
 	// an Authorization header, and parse the response as JSON (empty body -> {}).
+	// Throws when the response status is not 2xx, surfacing the error body if
+	// present (consistent with tryGetJson which guards status the same way).
 	private Json postParse(string url, string contentType,
 			scope const(ubyte)[] payload, string authHeader = null) @safe
 	{
+		import std.conv : to;
+
 		Json result;
 		secureRequestHTTP(url, (scope HTTPClientRequest req) {
 			req.method = HTTPMethod.POST;
@@ -512,6 +516,9 @@ final class OAuthClient
 			req.writeBody(payload);
 		}, (scope HTTPClientResponse res) {
 			auto body = res.bodyReader.readAllUTF8();
+			if (res.statusCode / 100 != 2)
+				throw internalError("Token endpoint returned HTTP " ~ res.statusCode.to!string ~ (
+					body.length ? ": " ~ body : ""));
 			result = body.length ? parseJsonString(body) : Json.emptyObject;
 		});
 		return result;
@@ -915,4 +922,37 @@ unittest  // discoverProtectedResource ignores a cross-origin resource_metadata 
 	// The MCP endpoint origin (loopback) differs from the challenge's origin, and
 	// the loopback well-known URLs are unreachable in the test, so discovery throws.
 	assertThrown(c.discoverProtectedResource("http://127.0.0.1:1/mcp", www));
+}
+
+unittest  // postParse treats a non-2xx token-endpoint response as an error
+{
+	import std.conv : to;
+	import std.exception : assertThrown;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	// Spin up a loopback server that always returns 400 with an OAuth error body.
+	auto settings = new HTTPServerSettings();
+	settings.bindAddresses = ["127.0.0.1"];
+	settings.port = 0;
+	auto listener = () @trusted {
+		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+			res.statusCode = 400;
+			res.writeBody(`{"error":"invalid_client","error_description":"bad credentials"}`,
+				"application/json");
+		});
+	}();
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
+
+	const port = listener.bindAddresses[0].port;
+	const tokenUrl = "http://127.0.0.1:" ~ port.to!string ~ "/token";
+
+	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = tokenUrl;
+	// A non-2xx response from the token endpoint must surface as an exception,
+	// not silently return an empty TokenSet.
+	assertThrown(c.refresh(as_, RegisteredClient("cid", ""), "rt"));
 }
