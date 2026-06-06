@@ -147,12 +147,12 @@ final class McpClient : ClientProtocol
 	private bool validateOutputSchema_;
 	// URL-mode elicitation correlation: in-flight ids the server asked us to
 	// complete via an `elicitation/create` with `mode:"url"`. An id is added
-	// (value false) when the request is seen and evicted once its
+	// when the request is seen and evicted once its
 	// `notifications/elicitation/complete` has been forwarded, so the set holds
 	// only ids still awaiting completion. Used to honour the spec rule "Clients
 	// MUST ignore notifications referencing unknown or already-completed IDs": an
 	// evicted (completed) or never-issued id is absent and so ignored.
-	private bool[string] elicitationIds_;
+	private void[0][string] elicitationIds_;
 	// Request ids this client has cancelled via notifications/cancelled. Per
 	// basic/utilities/cancellation, "The sender of the cancellation notification
 	// SHOULD ignore any response to the request that arrives afterward", so a
@@ -1309,7 +1309,7 @@ final class McpClient : ClientProtocol
 				continue;
 			const eid = e["elicitationId"].get!string;
 			if (eid.length && eid !in elicitationIds_)
-				elicitationIds_[eid] = false; // tracked, not yet completed
+				elicitationIds_[eid] = (void[0]).init;
 		}
 	}
 
@@ -1633,8 +1633,7 @@ final class McpClient : ClientProtocol
 					|| params["elicitationId"].type != Json.Type.string)
 				return; // malformed: no id to correlate -> ignore
 			const eid = params["elicitationId"].get!string;
-			auto seen = eid in elicitationIds_;
-			if (seen is null || *seen)
+			if (eid !in elicitationIds_)
 				return; // unknown or already-completed id -> ignore per spec
 			elicitationIds_.remove(eid); // completion forwarded -> stop tracking
 		}
@@ -1783,7 +1782,7 @@ final class McpClient : ClientProtocol
 				{
 					const eid = params["elicitationId"].get!string;
 					if (eid.length && eid !in elicitationIds_)
-						elicitationIds_[eid] = false; // tracked, not yet completed
+						elicitationIds_[eid] = (void[0]).init;
 				}
 			}
 			return onElicitation(ElicitParams.fromJson(params)).toJson();
