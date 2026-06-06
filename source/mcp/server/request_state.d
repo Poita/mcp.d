@@ -84,9 +84,10 @@ enum RequestStateBinding
 /// or restarts — see `secureRequestState`).
 struct RequestStateSecurity
 {
-	/// The shared secret. HMAC key in `signed` mode; in `encrypted` mode its
-	/// first 32 bytes are the AES-256 key and the whole key is the bind-tag HMAC
-	/// key. MUST be >= 32 bytes when supplied.
+	/// The shared secret. The codec derives two independent 32-byte sub-keys from
+	/// it via HKDF-SHA256 — one for AES-256-GCM, one for the bind/payload HMAC — so
+	/// the cipher key and the MAC key never share bytes regardless of how long this
+	/// secret is. MUST be >= 32 bytes when supplied.
 	ubyte[] key;
 
 	/// Wire protection mode. Defaults to `signed` (HMAC-SHA256).
@@ -107,14 +108,19 @@ struct RequestStateSecurity
 /// re-elicits). All crypto is fail-closed.
 final class RequestStateCodec
 {
-	private const ubyte[] key;
+	private const ubyte[32] cipherKey;
+	private const ubyte[32] macSubkey;
 	private const RequestStateMode mode;
 	private const Duration ttl;
 	private const RequestStateBinding bindTo;
 
 	this(RequestStateSecurity sec) @safe
 	{
-		this.key = sec.key.idup;
+		// Split the operator secret into two independent sub-keys via HKDF-SHA256
+		// (RFC 5869) with distinct info labels, so the AES key and the HMAC key
+		// share no bytes even when the secret is exactly 32 bytes long.
+		this.cipherKey = hkdfSha256Subkey(sec.key, "mcp.requestState aes-256-gcm key");
+		this.macSubkey = hkdfSha256Subkey(sec.key, "mcp.requestState bind-hmac key");
 		this.mode = sec.mode;
 		this.ttl = sec.ttl;
 		this.bindTo = sec.bindTo;
@@ -139,7 +145,7 @@ final class RequestStateCodec
 		final switch (mode)
 		{
 		case RequestStateMode.signed:
-			const mac = hmacSha256(key, payloadBytes);
+			const mac = hmacSha256(macKey(), payloadBytes);
 			return "v1." ~ base64UrlNoPad(payloadBytes) ~ "." ~ base64UrlNoPad(mac);
 		case RequestStateMode.encrypted:
 			ubyte[12] nonce;
@@ -182,7 +188,7 @@ final class RequestStateCodec
 		// Reject an absent or wrong-length MAC outright; a valid MAC is 32 bytes.
 		if (presentedMac.length != 32)
 			return Nullable!string.init;
-		const expectedMac = hmacSha256(key, payloadBytes);
+		const expectedMac = hmacSha256(macKey(), payloadBytes);
 		if (!constantTimeEquals(presentedMac, expectedMac))
 			return Nullable!string.init;
 		return openEnvelope(payloadBytes, subject, toolName);
@@ -238,15 +244,20 @@ final class RequestStateCodec
 		string material = subject;
 		if (bindTo == RequestStateBinding.authSubjectAndTool)
 			material = subject ~ "\0" ~ toolName;
-		const mac = hmacSha256(key, cast(const(ubyte)[]) material.representation);
+		const mac = hmacSha256(macKey(), cast(const(ubyte)[]) material.representation);
 		return toHex(mac);
 	}
 
-	/// The 32-byte AES-256 key derived from the configured secret (its first 32
-	/// bytes; the secret is required to be >= 32 bytes).
+	/// The 32-byte AES-256 sub-key.
 	private const(ubyte)[] aesKey() @safe
 	{
-		return key[0 .. 32];
+		return cipherKey[];
+	}
+
+	/// The HMAC sub-key for bind tags and signed-mode payload MACs.
+	private const(ubyte)[] macKey() @safe
+	{
+		return macSubkey[];
 	}
 }
 
@@ -269,6 +280,20 @@ private ubyte[] hmacSha256(const(ubyte)[] key, const(ubyte)[] data) @trusted
 	if (r is null || macLen != 32)
 		throw new Exception("HMAC-SHA256 failed");
 	return mac.dup;
+}
+
+/// HKDF-SHA256 (RFC 5869) deriving a 32-byte sub-key from `ikm` for the given
+/// `info` label, using a zero salt. Distinct labels yield independent sub-keys,
+/// giving cryptographic key separation between the cipher and MAC keys.
+private ubyte[32] hkdfSha256Subkey(const(ubyte)[] ikm, string info) @safe
+{
+	// Extract: PRK = HMAC-SHA256(salt, IKM), salt = HashLen zero bytes.
+	ubyte[32] salt;
+	const prk = hmacSha256(salt[], ikm);
+	// Expand one 32-byte block: T(1) = HMAC-SHA256(PRK, info ~ 0x01).
+	const block = hmacSha256(prk, cast(const(ubyte)[])(info.representation) ~ cast(ubyte) 0x01);
+	ubyte[32] outk = block[0 .. 32];
+	return outk;
 }
 
 /// Fill `dst` with cryptographically secure random bytes.
@@ -556,4 +581,13 @@ unittest  // signed: an envelope presenting an empty MAC segment is rejected
 	// Forge the same payload with an empty MAC (base64url of an empty slice).
 	const forged = parts[0] ~ "." ~ parts[1] ~ ".";
 	assert(codec.decode(forged, "", "tool").isNull);
+}
+
+unittest  // encrypted: AES and bind-HMAC keys are independent (no key reuse)
+{
+	// A 32-byte operator key is the documented minimum and the natural AES-256
+	// key length. The AES sub-key and the bind-HMAC sub-key MUST NOT share bytes,
+	// otherwise recovering one key compromises the other.
+	auto codec = encryptedCodec();
+	assert(codec.aesKey() != codec.macKey());
 }
