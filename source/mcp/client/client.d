@@ -1910,12 +1910,14 @@ bool selectMutualVersion(const string[] serverVersions, out ProtocolVersion chos
 /// Version Negotiation requirement ("If the client does not support the version
 /// in the server's response, it SHOULD disconnect"), throws an
 /// `UnsupportedProtocolVersionError` `McpException` when the server's version is
-/// unparseable or not in `supportedVersions`, rather than silently proceeding
-/// under a stale negotiated version.
+/// unparseable, not in `supportedVersions`, or is the modern revision
+/// (>= 2026-07-28). Conformant modern servers use `server/discover` rather than
+/// `initialize`, so a modern version in an `initialize` response is invalid; the
+/// client rejects it to avoid operating with `useModern` unset.
 ProtocolVersion resolveNegotiatedVersion(string serverVersion) @safe
 {
 	ProtocolVersion v;
-	if (!tryParseVersion(serverVersion, v))
+	if (!tryParseVersion(serverVersion, v) || v.isModern)
 		throw new McpException(ErrorCode.unsupportedProtocolVersion,
 				"Server returned unsupported protocol version: " ~ serverVersion);
 	return v;
@@ -1930,10 +1932,10 @@ unittest  // public flagship type uses single-cap Mcp* casing
 	assert(c !is null);
 }
 
-unittest  // resolveNegotiatedVersion accepts a supported server version
+unittest  // resolveNegotiatedVersion accepts a supported stable server version
 {
 	assert(resolveNegotiatedVersion("2025-06-18") == ProtocolVersion.v2025_06_18);
-	assert(resolveNegotiatedVersion("2026-07-28") == ProtocolVersion.modern);
+	assert(resolveNegotiatedVersion("2025-11-25") == ProtocolVersion.v2025_11_25);
 }
 
 unittest  // resolveNegotiatedVersion throws on an unparseable server version
@@ -1954,6 +1956,17 @@ unittest  // resolveNegotiatedVersion throws with the unsupported-version error 
 		assert(e.code == ErrorCode.unsupportedProtocolVersion);
 	}
 	assert(threw);
+}
+
+unittest  // resolveNegotiatedVersion rejects a modern version in an initialize response
+{
+	import std.exception : assertThrown;
+
+	// A conformant modern server uses server/discover, not initialize.
+	// Echoing "2026-07-28" or "draft" in an initialize response is invalid;
+	// accepting it would leave useModern unset and create split-brain state.
+	assertThrown!McpException(resolveNegotiatedVersion("2026-07-28"));
+	assertThrown!McpException(resolveNegotiatedVersion("draft"));
 }
 
 unittest  // selectMutualVersion prefers the newest mutually-supported version
