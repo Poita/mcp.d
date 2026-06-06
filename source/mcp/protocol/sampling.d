@@ -67,6 +67,8 @@ struct SamplingMessage
 
 	Json toJson() const @safe
 	{
+		if (contentBlocks.length == 0)
+			throw invalidParams("SamplingMessage requires at least one content block");
 		Json j = Json.emptyObject;
 		j["role"] = role;
 		// Preserve the single-object wire shape for the common one-block message
@@ -530,6 +532,8 @@ struct CreateMessageResult
 
 	Json toJson() const @safe
 	{
+		if (contentBlocks.length == 0)
+			throw invalidParams("CreateMessageResult requires at least one content block");
 		Json j = Json.emptyObject;
 		j["role"] = role;
 		// Preserve the single-object wire shape for the common one-block reply
@@ -1009,6 +1013,43 @@ unittest  // CreateMessageResult.text honours custom stopReason and role
 	assert(r.stopReasonEnum.get == StopReason.maxTokens);
 	auto u = CreateMessageResult.text("m", "echo", "endTurn", "user");
 	assert(u.role == "user");
+}
+
+unittest  // SamplingMessage.toJson throws invalidParams when contentBlocks is empty
+{
+	import mcp.protocol.errors : ErrorCode;
+
+	SamplingMessage m;
+	m.role = "user";
+	// contentBlocks is empty — toJson must reject this rather than emit `"content": []`
+	bool threw;
+	try
+		cast(void) m.toJson();
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.invalidParams);
+	}
+	assert(threw, "SamplingMessage.toJson must throw invalidParams when contentBlocks is empty");
+}
+
+unittest  // CreateMessageResult.toJson throws invalidParams when contentBlocks is empty
+{
+	import mcp.protocol.errors : ErrorCode;
+
+	CreateMessageResult r;
+	r.role = "assistant";
+	r.model = "m";
+	// contentBlocks is empty — toJson must reject this rather than emit `"content": []`
+	bool threw;
+	try
+		cast(void) r.toJson();
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.invalidParams);
+	}
+	assert(threw, "CreateMessageResult.toJson must throw invalidParams when contentBlocks is empty");
 }
 
 unittest  // StopReason wire mapping is exact and reversible
