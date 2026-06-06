@@ -202,7 +202,7 @@ class FileTokenStore : TokenStore
 		import std.path : dirName;
 
 		auto dir = dirName(path);
-		if (dir.length)
+		if (dir.length && dir != ".")
 		{
 			try
 				() @trusted { mkdirRecurse(dir); }();
@@ -1403,6 +1403,35 @@ version (Posix) unittest  // FileTokenStore restricts the parent dir to 0700
 	// The directory the SDK created must not be group/other-traversable.
 	const dirMode = getAttributes(dirName(file)) & (S_IRWXG | S_IRWXO);
 	assert(dirMode == 0, "token dir is group/other accessible");
+}
+
+version (Posix) unittest  // FileTokenStore.save does not chmod CWD when path has no directory component
+{
+	import std.file : tempDir, getcwd, chdir, getAttributes, remove, exists;
+	import std.path : buildPath;
+	import std.conv : to;
+	import core.sys.posix.sys.stat : S_IRWXG, S_IRWXO;
+	import std.datetime.systime : Clock;
+
+	// Record the CWD permissions before the save call.
+	const cwdBefore = getAttributes(".") & (S_IRWXG | S_IRWXO);
+
+	// Use a bare filename (no directory component) so dirName returns ".".
+	auto bare = "mcp-bare-token-" ~ Clock.currTime().toUnixTime().to!string ~ ".json";
+	scope (exit)
+	{
+		if (bare.exists)
+			remove(bare);
+	}
+
+	auto store = new FileTokenStore(bare);
+	StoredToken t;
+	t.accessToken = "secret";
+	store.save("https://mcp.example.com", t);
+
+	// The CWD must retain its original group/other bits — save must not chmod ".".
+	const cwdAfter = getAttributes(".") & (S_IRWXG | S_IRWXO);
+	assert(cwdAfter == cwdBefore, "save() stripped group/other bits from the CWD");
 }
 
 unittest  // the loopback flow aborts with a timeout error when no redirect arrives
