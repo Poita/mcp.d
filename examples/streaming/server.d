@@ -14,7 +14,7 @@
  * EITHER transport — so the getopt + transport branch lives in the scaffold,
  * not here.
  *
- * Three tools:
+ * Two tools:
  *
  *   `countdown` — a long-running task. On every step it:
  *       - emits a `notifications/progress` via the integer-step convenience
@@ -22,26 +22,22 @@
  *         client only when the call carried a `_meta.progressToken`,
  *       - emits a `notifications/message` (logging) via the typed
  *         `ctx.log(LogLevel.info, message, logger)` convenience — a plain
- *         string payload, no hand-built `Json`, and
+ *         string payload, no hand-built `Json` data, and
  *       - polls `ctx.isCancelled` and stops promptly when the client cancels.
  *     Its structured result records `{completed, total, cancelled}` so the client
  *     can assert concrete values. When a run is cancelled it bumps a server-side
  *     counter so cancellation can be verified out of band.
  *
- *   `summarize` — exercises the TYPED server->client round-trip APIs,
- *     which work over BOTH transports (the SDK pumps the same channel mid-handler):
- *       - `ctx.elicit!Confirm(message)` derives the elicitation `requestedSchema`
- *         from the flat struct `Confirm` via `jsonSchemaOf!T` and returns a typed
- *         `ElicitResult` (we branch on `.action` and decode with `.contentAs!T`),
- *       - `ctx.sample(CreateMessageRequest)` builds a typed sampling request from
- *         `SamplingMessage` + `Content.makeText` and parses the typed
- *         `CreateMessageResult` reply.
- *     It returns a typed `SummaryResult` so the SDK infers the output schema.
- *
  *   `cancel_stats` — returns `{cancelled: <int>}`, the number of `countdown`
  *     runs that observed a cancellation. The cancellation client closes its
  *     stream mid-flight (the Streamable HTTP cancellation signal); a later,
  *     fresh client reads this tool to confirm the server honored it.
+ *
+ * This example is STATELESS (the default). Its HTTP path exercises the draft
+ * transport's client-disconnect cancellation, which a stateful server cannot
+ * serve (the draft is excluded from stateful negotiation). Server->client
+ * features (elicit/sample/roots) require a stateful server and are demonstrated
+ * by the dedicated `examples/elicitation` and `examples/sampling` examples.
  *
  * Run standalone:
  *   dub build -c server
@@ -59,22 +55,12 @@ import vibe.core.core : sleep;
 import mcp;
 import mcp.api.attributes : tool, describe;
 import mcp.api.reflection : registerHandlers;
-import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult, SamplingMessage;
-import mcp.protocol.types : Content, ElicitAction, LogLevel;
+import mcp.protocol.types : LogLevel;
 
 import examples_common : runServerFromArgs;
 
 void main(string[] args) @safe
 {
-	// This example is STATELESS (the default). Its HTTP path
-	// exercises the draft transport (client-disconnect cancellation, a
-	// draft-only feature) which a stateful server cannot serve — the draft is
-	// excluded from stateful negotiation. The `summarize` tool's ctx.elicit +
-	// ctx.sample (server->client requests) therefore run only over STDIO here (a
-	// single implicit connection where server->client is allowed in any mode); the
-	// client skips them over HTTP, where a stateless server correctly forbids
-	// server->client requests. The dedicated elicitation/ and sampling/ examples
-	// cover those features over HTTP (they are stateful).
 	auto server = new McpServer("streaming-example", "1.0.0",
 			nullable("Progress / logging / cancellation demo over stdio AND Streamable HTTP."));
 	// Advertise the `logging` capability so `ctx.log` notifications are emitted on
@@ -105,25 +91,6 @@ struct CountdownResult
 struct CancelStats
 {
 	int cancelled;
-}
-
-/// The flat elicitation struct for `summarize`. `ctx.elicit!Confirm` derives the
-/// `requestedSchema` from this struct via `jsonSchemaOf!T`, and the typed
-/// `ElicitResult.contentAs!Confirm` decodes the accept content — no hand-built
-/// schema Json, no hand-built field reads.
-struct Confirm
-{
-	bool proceed; /// whether the user agrees to summarize
-	string tone; /// requested tone, e.g. "concise"
-}
-
-/// The `summarize` structured result.
-struct SummaryResult
-{
-	string status; /// "summarized" | "declined"
-	string tone; /// the tone the user asked for (echoed)
-	string model; /// the model the client's sampling reply reported
-	string summary; /// the text the client's sampling reply produced
 }
 
 /// The annotated MCP tool surface for this example. The mutable cancellation
@@ -186,44 +153,6 @@ final class StreamingApi
 			cancelled_++;
 
 		return CountdownResult(completed, steps, cancelled);
-	}
-
-	/// `summarize`: mid-handler it BLOCKS on the typed server->client round-trip
-	/// APIs (both work over stdio AND Streamable HTTP because the SDK pumps the
-	/// same channel while the handler is in flight):
-	///
-	///   - `ctx.elicit!Confirm(message)` derives the elicitation schema from the
-	///     flat `Confirm` struct (no hand-built schema Json) and returns a typed
-	///     `ElicitResult`; on accept we decode it with `.contentAs!Confirm`.
-	///   - `ctx.sample(CreateMessageRequest)` sends a typed sampling request built
-	///     from `SamplingMessage` + `Content.makeText`, and parses the typed
-	///     `CreateMessageResult` reply (reading `.model` and `.content.text`).
-	@tool("summarize",
-			"Summarize text after confirming tone via a typed elicitation, using typed sampling.")
-	SummaryResult summarize(@describe("the text to summarize") string text, RequestContext ctx)@safe
-	{
-		// Typed elicitation: requestedSchema is DERIVED from `Confirm`.
-		auto elicited = ctx.elicit!Confirm("Confirm summarization preferences");
-		if (elicited.action != ElicitAction.accept)
-			return SummaryResult("declined", "", "", "User declined to summarize.");
-
-		const confirm = elicited.contentAs!Confirm;
-		if (!confirm.proceed)
-			return SummaryResult("declined", confirm.tone, "", "User chose not to proceed.");
-
-		// Typed sampling: build CreateMessageRequest from typed SamplingMessage +
-		// Content.makeText instead of hand-built content Json.
-		CreateMessageRequest req;
-		req.messages = [
-			SamplingMessage("user",
-					Content.makeText(
-						"Summarize the following in a " ~ confirm.tone ~ " tone:\n" ~ text))
-		];
-		req.maxTokens = nullable(256L);
-		req.systemPrompt = nullable("You are a careful summarizer.");
-
-		CreateMessageResult reply = ctx.sample(req);
-		return SummaryResult("summarized", confirm.tone, reply.model, reply.content.text);
 	}
 
 	/// `cancel_stats`: returns `{cancelled:<int>}`, how many countdown runs have

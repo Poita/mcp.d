@@ -1490,8 +1490,8 @@ final class McpServer
 			if (serverRequest is null)
 				return handle(m, new StdioContext(sink,
 						readProgressToken(m.params), cs.negotiated));
-			return handle(m, new StdioContext(sink, serverRequest,
-					cs.clientCaps, readProgressToken(m.params), cs.negotiated));
+			return handle(m, new StdioContext(sink, serverRequest, cs.clientCaps,
+					readProgressToken(m.params), cs.negotiated, mode_ == ServerMode.stateless));
 		};
 
 		if (!input.isBatch)
@@ -2680,6 +2680,14 @@ final class McpServer
 		// it MUST be answered with -32601 (method not found) rather than accepted,
 		// regardless of whether the logging capability is enabled.
 		if (ver.isModern)
+			throw methodNotFound("logging/setLevel");
+		// A stateless server keeps no per-peer connection across requests, so a
+		// session-scoped minimum log level has nowhere to live: honouring the RPC
+		// would be a silent no-op (or, over stdio, leak into the single implicit
+		// connection). Refuse it on every transport — matching resources/subscribe —
+		// rather than pretend to accept it; a stateful server stores the level on
+		// its session, and log emission still works per-request regardless of mode.
+		if (mode_ == ServerMode.stateless)
 			throw methodNotFound("logging/setLevel");
 		// On stable (<= 2025-11-25) versions the logging feature is gated on the
 		// declared `logging` capability (server/utilities/logging: "Servers that
@@ -5144,9 +5152,26 @@ unittest  // registerResourceTemplate rejects adjacent variables that can never 
 		}));
 }
 
+unittest  // logging/setLevel is refused on a stateless server (no session-scoped level)
+{
+	// A stateless server keeps no per-peer connection across requests, so a
+	// session-scoped minimum log level has nowhere to live. The RPC is refused with
+	// -32601 on every transport (matching resources/subscribe) rather than being a
+	// silent no-op; log emission still works per-request. Statefulness, not the
+	// transport, governs this — the stdio transport follows the same rule.
+	auto s = new McpServer("t", "1"); // default mode is stateless
+	s.enableLogging();
+	Json p = Json.emptyObject;
+	p["level"] = "debug";
+	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
+	// The default level is untouched by the rejected request.
+	assert(s.currentLogLevel == "info");
+}
+
 unittest  // logging/setLevel stores the level and returns an empty object
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateful("t", "1");
 	s.enableLogging();
 	Json p = Json.emptyObject;
 	p["level"] = "debug";
@@ -5157,7 +5182,7 @@ unittest  // logging/setLevel stores the level and returns an empty object
 
 unittest  // logging/setLevel rejects an unrecognised level with -32602
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateful("t", "1");
 	s.enableLogging();
 	Json p = Json.emptyObject;
 	p["level"] = "verbose";
@@ -5169,7 +5194,7 @@ unittest  // logging/setLevel rejects an unrecognised level with -32602
 
 unittest  // logging/setLevel requires a string 'level' param
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateful("t", "1");
 	s.enableLogging();
 	Json p = Json.emptyObject;
 	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
@@ -5182,7 +5207,7 @@ unittest  // logging/setLevel is rejected when the logging capability was never 
 	// `logging` capability. A server that never called enableLogging() advertises
 	// no logging capability, so logging/setLevel MUST NOT be handled: it returns
 	// -32601 (Capability not supported), matching completion/complete's gating.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateful("t", "1");
 	Json p = Json.emptyObject;
 	p["level"] = "debug";
 	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
@@ -5219,7 +5244,7 @@ unittest  // after setLevel(error), a handler's sub-error logs are dropped
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateful("t", "1");
 	s.enableLogging();
 
 	// A tool that emits a log at every severity.
@@ -8178,7 +8203,7 @@ unittest  // dispatch resolves the ConnectionState carried by the context
 	// A context carrying its own ConnectionState makes the server dispatch against
 	// THAT state, never the single bound activeConnection. logging/setLevel must
 	// land on the carried state and leave activeConnection untouched.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateful("t", "1");
 	s.enableLogging();
 	auto state = new ConnectionState;
 	auto ctx = new ConnCtx("sess-X", state);
@@ -8239,7 +8264,7 @@ unittest  // bare handle(msg) uses the single bound activeConnection
 
 	// A NullContext carries no ConnectionState, so the server falls back to its
 	// single bound activeConnection — the stdio / in-process single-peer model.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateful("t", "1");
 	s.enableLogging();
 	auto set = parseJsonString(
 			`{"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"error"}}`);
@@ -8309,24 +8334,31 @@ unittest  // a STATEFUL server advertises + honours subscribe
 
 unittest  // stateless requests get INDEPENDENT ConnectionState; the server keeps no reference
 {
-	// Two requests bound to two distinct (transient) ConnectionStates — as the
-	// stateless HTTP transport builds per request — must not bleed into each other,
-	// and dispatching against one must not retain it on the server. Drive via two
-	// ConnCtx carrying separate ConnectionStates.
+	// Two transient ConnectionStates — one per request, as the stateless HTTP
+	// transport builds — must not bleed into each other, and dispatching against
+	// one must not retain it on the server. A stateless server refuses
+	// logging/setLevel (-32601) on every transport; the per-request states are
+	// left untouched, and the server's bound activeConnection is neither of them.
+	import mcp.server.connection : ConnectionState;
+
 	auto s = McpServer.stateless("t", "1");
 	s.enableLogging();
 
 	auto a = new ConnectionState;
 	auto b = new ConnectionState;
-	a.negotiated = ProtocolVersion.v2025_06_18;
-	b.negotiated = ProtocolVersion.v2025_11_25;
 
-	// A logging/setLevel routed against A's state must mutate ONLY A's state.
+	// logging/setLevel must be refused with -32601 on a stateless server.
 	Json lvl = Json.emptyObject;
 	lvl["level"] = "error";
-	s.handle(req(1, "logging/setLevel", lvl), new ConnCtx("", a));
-	assert(a.logLevel == "error", "request A's state must record its own log level");
-	assert(b.logLevel == "info", "request B's independent state must be untouched");
+	auto respA = s.handle(req(1, "logging/setLevel", lvl), new ConnCtx("", a)).get;
+	assert(respA["error"]["code"].get!int == ErrorCode.methodNotFound,
+			"a stateless server must refuse logging/setLevel with -32601");
+	auto respB = s.handle(req(2, "logging/setLevel", lvl), new ConnCtx("", b)).get;
+	assert(respB["error"]["code"].get!int == ErrorCode.methodNotFound,
+			"a stateless server must refuse logging/setLevel with -32601 for every request");
+	// The per-request states are untouched by the refused call.
+	assert(a.logLevel == "info", "request A's state must be untouched after refusal");
+	assert(b.logLevel == "info", "request B's state must be untouched after refusal");
 	// The server retains no reference to the per-request state between calls: its
 	// bound activeConnection is neither A nor B.
 	assert(s.activeConnection !is a && s.activeConnection !is b,
