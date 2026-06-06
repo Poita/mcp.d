@@ -293,10 +293,10 @@ private template hasFieldDefault(T, size_t i)
 /// undeclared object key), array `items`, `enum`, `anyOf`/`oneOf` (the value
 /// must match at least one sub-schema, as emitted for SumType parameters and
 /// returns), and the facet bounds `minimum`/`maximum` (numbers),
-/// `minLength`/`maxLength` (code-point string length), and
-/// `minItems`/`maxItems` (array length). Other unknown keywords are ignored
-/// (treated as satisfied), so a richer hand-written schema never reports a
-/// spurious failure.
+/// `minLength`/`maxLength` (code-point string length), `pattern` (regex the
+/// string must match), and `minItems`/`maxItems` (array length). Other
+/// unknown keywords are ignored (treated as satisfied), so a richer
+/// hand-written schema never reports a spurious failure.
 string validateAgainstSchema(Json value, Json schema) @safe
 {
 	return validateAt(value, schema, "");
@@ -491,7 +491,7 @@ private string checkNumericBounds(Json value, Json schema, string where) @safe
 	return "";
 }
 
-// minLength / maxLength, counted in code points.
+// minLength / maxLength (counted in code points) and pattern (ECMA-262 regex) on string values.
 private string checkStringBounds(Json value, Json schema, string where) @safe
 {
 	if (value.type != Json.Type.string)
@@ -509,6 +509,29 @@ private string checkStringBounds(Json value, Json schema, string where) @safe
 	{
 		if (len > schema["maxLength"].get!long)
 			return where ~ ": string is longer than maxLength";
+	}
+
+	// Enforce the JSON Schema `pattern` keyword: the string must match the
+	// regular expression (a partial match anywhere in the string satisfies it,
+	// per the JSON Schema spec which uses ECMA-262 semantics).
+	if ("pattern" in schema && schema["pattern"].type == Json.Type.string)
+	{
+		import std.regex : regex, matchFirst, RegexException;
+
+		const pat = schema["pattern"].get!string;
+		const str = value.get!string;
+		try
+		{
+			auto r = regex(pat);
+			if (matchFirst(str, r).empty)
+				return where ~ ": string does not match pattern '" ~ pat ~ "'";
+		}
+		catch (RegexException)
+		{
+			// An invalid pattern is treated as unsatisfied rather than silently
+			// passing, so malformed UDAs surface as a validation error.
+			return where ~ ": pattern '" ~ pat ~ "' is not a valid regular expression";
+		}
 	}
 
 	return "";
@@ -981,6 +1004,19 @@ unittest  // validateAgainstSchema enforces minLength / maxLength
 	assert(validateAgainstSchema(Json("abcd"), schema) == "");
 	assert(validateAgainstSchema(Json("ab"), schema).length > 0);
 	assert(validateAgainstSchema(Json("abcdef"), schema).length > 0);
+}
+
+unittest  // validateAgainstSchema enforces the pattern keyword
+{
+	Json schema = Json.emptyObject;
+	schema["type"] = "string";
+	schema["pattern"] = "^[0-9]+$";
+	// A string of only digits matches the pattern.
+	assert(validateAgainstSchema(Json("123"), schema) == "");
+	// A string with non-digit characters does not match.
+	assert(validateAgainstSchema(Json("abc"), schema).length > 0);
+	// Non-string values are not checked against pattern.
+	assert(validateAgainstSchema(Json(42), schema).length > 0); // fails "type" check, not pattern
 }
 
 unittest  // validateAgainstSchema enforces minItems / maxItems
