@@ -112,7 +112,7 @@ These conventions are enforced by review (and some by CI). Please follow them:
   match the authoritative schema for the relevant protocol version. **Draft-only
   behavior must apply only when the negotiated protocol version is `draft`** — it
   must not change the wire output of released versions (`2025-11-25`,
-  `2025-06-18`, …). Don't regress the conformance baseline (**server 38/38**,
+  `2025-06-18`, …). Don't regress the conformance baseline (**server 39/39**,
   **client 287/287**).
 - **Keep new public API reachable.** Anything new and public should be exported
   via `source/mcp/package.d` and usable from `McpServer` / `McpClient` /

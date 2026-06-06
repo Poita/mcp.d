@@ -2,7 +2,7 @@ name: Conformance
 
 # Gates spec conformance on every push/PR so regressions in the official
 # `@modelcontextprotocol/conformance` suite cannot land silently. This is what
-# keeps the "server 38/38 + client 287/287" claim in the README honest.
+# keeps the "server 39/39 + client 287/287" claim in the README honest.
 
 on:
   push:
