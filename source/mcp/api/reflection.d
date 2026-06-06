@@ -101,6 +101,29 @@ void registerModules(mods...)(McpServer server) @safe
 		registerModule!mod(server);
 }
 
+/// Reject any method-level `@describe` UDA that uses the single-argument form
+/// (`@describe("text")` with no second argument). At method level, the first
+/// field of the `describe` struct is the *parameter name* to match — it is not
+/// the description text. A single-argument form therefore fills only `parameter`
+/// and leaves `description` empty, so the UDA matches nothing and the text is
+/// silently discarded. This is always a programmer error; reject it at compile
+/// time so the user gets a clear diagnostic instead of an undocumented tool.
+private void rejectSingleArgMethodDescribe(alias func)()
+{
+	static foreach (attr; __traits(getAttributes, func))
+	{
+		static if (is(typeof(attr) == describe))
+		{
+			static assert(attr.description.length != 0,
+					"method-level @describe(\"" ~ attr.parameter
+					~ "\") is a single-argument form: the first field is the parameter "
+					~ "name to match, not the description. Use " ~ "@describe(\"" ~ attr.parameter
+					~ "\", \"<description text>\") "
+					~ "to document parameter '" ~ attr.parameter ~ "'.");
+		}
+	}
+}
+
 /// Resolve the documentation string for parameter `i` (named `pname`) of `func`
 /// from the `@describe` UDA layer, or `""` when none applies.
 ///
@@ -478,6 +501,8 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 {
 	import std.traits : ReturnType;
 
+	rejectSingleArgMethodDescribe!overload();
+
 	Tool descriptor;
 	descriptor.name = attr.name;
 	if (attr.description.length)
@@ -624,6 +649,8 @@ private GetPromptResult toPromptResult(R)(R ret) @safe
 private void registerPromptMethod(string memberName, alias overload, alias parent)(
 		McpServer server, prompt attr) @safe
 {
+	rejectSingleArgMethodDescribe!overload();
+
 	Prompt descriptor;
 	descriptor.name = attr.name;
 	if (attr.title.length)
@@ -2208,4 +2235,27 @@ unittest  // @resourceTemplate description and title fields are emitted in resou
 	// A template without description or title carries neither on the wire.
 	assert("description" !in bare);
 	assert("title" !in bare);
+}
+
+// A method-level single-argument @describe (i.e. @describe("someText") with no
+// parameter name) is always a programmer error: the first field of the `describe`
+// struct is `parameter` (the name to match), not the description, so the single-
+// arg form never documents anything and must be rejected at compile time.
+version (unittest) private final class MethodDescribeSingleArgApi
+{
+	@tool("ping", "Ping tool")
+	@describe("this text is silently lost without the fix")
+	string ping(string msg) @safe
+	{
+		return msg;
+	}
+}
+
+unittest  // method-level single-argument @describe is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	// A single-arg @describe at method level always silently drops the text
+	// (the first field is `parameter`, not `description`). After the fix this
+	// must fail to compile rather than silently produce an undocumented tool.
+	assert(!__traits(compiles, registerHandlers(s, new MethodDescribeSingleArgApi)));
 }
