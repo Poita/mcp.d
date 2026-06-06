@@ -7,16 +7,52 @@
 A feature-complete [Model Context Protocol](https://modelcontextprotocol.io) (MCP) SDK for
 the D programming language — client and server, built on [vibe-d](https://vibed.org).
 
+## Quickstart
+
+A server is a handful of annotated functions plus `runStdio`:
+
 ```d
+// server.d
 import mcp;
 
 @tool("add", "Add two integers")
 long add(long a, long b) @safe { return a + b; }
+
 void main()
 {
     auto server = new McpServer("demo", "1.0.0");
     registerModule!(__traits(parent, add))(server);
     runStdio(server);
+}
+```
+
+A client spawns that server over stdio, negotiates the protocol (any era — legacy
+or modern) with `connect()`, calls the tool, and checks the result:
+
+```d
+// client.d — build server.d as ./demo-server first
+import mcp;
+import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+
+struct AddArgs { long a; long b; }
+struct Sum     { long result; }   // a scalar tool return arrives under `result`
+
+void main()
+{
+    // The client drives vibe's event loop; run the session in a task.
+    runTask(() nothrow {
+        scope (exit) exitEventLoop();
+        try
+        {
+            auto client = McpClient.spawn(["./demo-server"]); // start the server over stdio
+            scope (exit) client.close();
+            client.connect();                                 // negotiate any protocol era
+            auto r = client.callTool("add", AddArgs(2, 3));
+            assert(r.structuredContentAs!Sum.result == 5);
+        }
+        catch (Exception e) assert(false, e.msg);
+    });
+    runEventLoop();
 }
 ```
 
