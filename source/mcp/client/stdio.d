@@ -89,6 +89,11 @@ final class StdioClientTransport : ClientTransport
 	{
 	}
 
+	/// No-op: the draft-protocol flag has no effect on stdio (no SSE GET streams).
+	void setDraftProtocol(bool isDraft) @safe
+	{
+	}
+
 	/// No-op: there is no standalone server->client stream over stdio (the single
 	/// duplex channel already carries server->client traffic).
 	void startServerStream() @safe

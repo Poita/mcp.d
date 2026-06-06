@@ -102,6 +102,11 @@ interface ClientTransport
 	/// no-op on stdio. An empty string clears it.
 	void setBearerToken(string token) @safe;
 
+	/// Signal whether the negotiated protocol version is modern (2026-07-28 / draft).
+	/// The HTTP transport uses this to skip Last-Event-ID resumption (GET) that the
+	/// draft removed; a no-op on stdio and on transports where the flag is irrelevant.
+	void setDraftProtocol(bool isDraft) @safe;
+
 	/// Release transport resources: stdio terminates the subprocess (when one was
 	/// spawned); HTTP stops any background streams.
 	void close() @safe;
