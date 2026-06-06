@@ -1486,6 +1486,9 @@ package string extractQueryParam(string url, string key) @safe
 
 	const q = url.indexOf('?');
 	auto query = (q < 0) ? url : url[q + 1 .. $];
+	const hashPos = query.indexOf('#');
+	if (hashPos >= 0)
+		query = query[0 .. hashPos];
 	const needle = key ~ "=";
 	size_t i;
 	while (i < query.length)
@@ -1506,6 +1509,13 @@ unittest  // extractQueryParam pulls and decodes a parameter
 	assert(extractQueryParam("http://x/cb?code=a%20b", "code") == "a b");
 	assert(extractQueryParam("http://x/cb?state=xyz", "code") == "");
 	assert(extractQueryParam("http://x/cb", "code") == "");
+}
+
+unittest  // extractQueryParam strips URI fragment before parsing query parameters
+{
+	assert(extractQueryParam("http://x/cb?state=xyz#frag", "state") == "xyz");
+	assert(extractQueryParam("http://x/cb?code=abc&state=xyz#frag", "state") == "xyz");
+	assert(extractQueryParam("http://x/cb?code=abc#frag", "code") == "abc");
 }
 
 /// Validate the RFC 9207 `iss` authorization-response parameter against the
