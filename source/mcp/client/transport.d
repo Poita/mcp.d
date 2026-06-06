@@ -6,18 +6,6 @@ import mcp.protocol.jsonrpc : Message;
 
 public import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 
-/// The transport seam under `McpClient`. The client speaks pure JSON-RPC and
-/// protocol logic; a `ClientTransport` carries the bytes — over Streamable HTTP
-/// (`HttpClientTransport`) or stdio (`StdioClientTransport`).
-///
-/// The client installs its inbound dispatcher via `setInboundHandler` (it passes
-/// `McpClient.dispatchInbound`); the transport invokes that handler for every
-/// interleaved notification and server->client request it reads on any stream.
-/// A response to a server->client request, and any client-originated
-/// notification, are sent with `sendOneway`. Per-request work goes through
-/// `deliver`, which sends the request and returns its correlated result (or
-/// throws `McpException` on an error response), dispatching anything else it sees
-/// in the meantime to the inbound handler.
 /// The protocol-side collaborator an `McpClient` hands to its transport at
 /// construction (`ClientTransport.setProtocol`). It lets the transport pull the
 /// protocol-derived request headers and consult the cancelled-request set
@@ -42,6 +30,18 @@ interface ClientProtocol
 	bool isCancelled(long id) @safe;
 }
 
+/// The transport seam under `McpClient`. The client speaks pure JSON-RPC and
+/// protocol logic; a `ClientTransport` carries the bytes — over Streamable HTTP
+/// (`HttpClientTransport`) or stdio (`StdioClientTransport`).
+///
+/// The client installs its inbound dispatcher via `setInboundHandler` (it passes
+/// `McpClient.dispatchInbound`); the transport invokes that handler for every
+/// interleaved notification and server->client request it reads on any stream.
+/// A response to a server->client request, and any client-originated
+/// notification, are sent with `sendOneway`. Per-request work goes through
+/// `deliver`, which sends the request and returns its correlated result (or
+/// throws `McpException` on an error response), dispatching anything else it sees
+/// in the meantime to the inbound handler.
 interface ClientTransport
 {
 	/// Send a JSON-RPC request `requestMessage` and return its result `Json`
