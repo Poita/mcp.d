@@ -924,7 +924,8 @@ struct InputRequest
 	{
 		InputRequest r;
 		r.id = key;
-		r.type = ("method" in j) ? typeForMethod(j["method"].get!string) : "";
+		r.type = ("method" in j && j["method"].type == Json.Type.string)
+			? typeForMethod(j["method"].get!string) : "";
 		if ("params" in j)
 			r.params = j["params"];
 		return r;
@@ -2124,4 +2125,16 @@ unittest  // InputRequest.elicitationUrl rejects empty elicitationId
 	import mcp.protocol.errors : McpException;
 
 	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "https://example.com", ""));
+}
+
+unittest  // InputRequest.fromJson: non-string "method" field is treated as unknown type
+{
+	// A peer may emit a non-string value for "method" (e.g. a number); the parser
+	// must not throw a JSONException — it should degrade gracefully to an empty type.
+	Json j = Json.emptyObject;
+	j["method"] = Json(99); // integer, not a string
+	j["params"] = Json.emptyObject;
+	auto r = InputRequest.fromJson("req-1", j);
+	assert(r.id == "req-1");
+	assert(r.type == ""); // unknown type, not a crash
 }
