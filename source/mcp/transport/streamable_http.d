@@ -1800,7 +1800,7 @@ private string stripPort(string hostport) @safe
 
 private bool isLoopbackHostname(string h) @safe
 {
-	return h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "[::1]";
+	return h == "localhost" || h == "127.0.0.1" || h == "::1";
 }
 
 /// Start a standalone Streamable HTTP server for `server` on `port` and run the
@@ -2554,7 +2554,7 @@ version (unittest) private string initializeBody(string ver = "2025-11-25") @saf
 		~ ver ~ `","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}`;
 }
 
-unittest  // a successful stateful initialize commits the Mcp-Session-Id header (issue #815)
+unittest  // a successful stateful initialize commits the Mcp-Session-Id header
 {
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
 	import vibe.http.router : URLRouter;
@@ -2576,7 +2576,7 @@ unittest  // a successful stateful initialize commits the Mcp-Session-Id header 
 	assert(res.headers[SessionHeader].length > 0);
 }
 
-unittest  // an initialize that fails header validation mints no surviving session and no header (issue #815)
+unittest  // an initialize that fails header validation mints no surviving session and no header
 {
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
 	import vibe.http.router : URLRouter;
@@ -2604,7 +2604,7 @@ unittest  // an initialize that fails header validation mints no surviving sessi
 			"a failed initialize MUST NOT stamp Mcp-Session-Id on the error response");
 }
 
-unittest  // a POST request whose Accept excludes both media types is rejected with 406 (issue #816)
+unittest  // a POST request whose Accept excludes both media types is rejected with 406
 {
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
 	import vibe.http.router : URLRouter;
