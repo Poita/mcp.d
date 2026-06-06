@@ -608,9 +608,10 @@ struct Content
 	///   is 2025-03-26+, resource_link is 2025-06-18+, tool_use/tool_result are
 	///   2025-11-25+) is downgraded to a `TextContent` placeholder describing the
 	///   dropped block, rather than leaking an out-of-schema content type.
-	/// - Shared FIELDS: content-level `_meta` was introduced post-2024-11-05 and
-	///   `Annotations.lastModified` in 2025-06-18, so for an older peer the
-	///   `_meta` key is dropped and `annotations.lastModified` is stripped.
+	/// - Shared FIELDS: content-level `_meta` and `Annotations.lastModified` were
+	///   both introduced in v2025-06-18, so for any older peer (v2024-11-05 or
+	///   v2025-03-26) the `_meta` key is dropped and `annotations.lastModified`
+	///   is stripped.
 	///
 	/// Mirrors the `Tool.forVersion` field-stripping pattern.
 	Content forVersion(ProtocolVersion v) const @safe
@@ -630,7 +631,7 @@ struct Content
 		auto projAnn = projectAnnotations(c.annotations, v);
 		c.payload.match!((ref x) {
 			x.annotations = projAnn;
-			// Content-level `_meta` is post-2024-11-05; drop it for the oldest peer.
+			// Content-level `_meta` is not in-schema before v2025-06-18; strip it for older peers.
 			if (v < ProtocolVersion.v2025_06_18)
 				x.meta = Json.undefined;
 		});
