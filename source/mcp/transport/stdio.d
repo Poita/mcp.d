@@ -1006,7 +1006,7 @@ unittest  // stdio: a tool calling ctx.elicit is answered over the same stdio ch
 {
 	import mcp.protocol.types : ElicitAction;
 
-	auto s = new McpServer("stdio-peer", "1.0");
+	auto s = McpServer.stateful("stdio-peer", "1.0");
 	Tool ask = {name: "ask"};
 	s.registerDynamicTool(ask, (Json args, RequestContext ctx) @safe {
 		auto schema = Json(["type": Json("object")]);
@@ -1219,7 +1219,7 @@ unittest  // a tool handler's ctx.log() is delivered as a notifications/message 
 
 unittest  // logging below the configured minimum level is dropped over stdio
 {
-	auto s = new McpServer("logsrv", "1.0");
+	auto s = McpServer.stateful("logsrv", "1.0");
 	s.enableLogging();
 	Tool logger = {name: "logit"};
 	s.registerDynamicTool(logger, (Json args, RequestContext ctx) @safe {
@@ -1626,7 +1626,7 @@ unittest  // END-TO-END: a server tool's ctx.sample round-trips to the client's 
 	import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
 	import mcp.protocol.types : Content;
 
-	auto s = new McpServer("e2e-sample", "1.0");
+	auto s = McpServer.stateful("e2e-sample", "1.0");
 	Tool ask = {name: "ask"};
 	s.registerDynamicTool(ask, (Json args, RequestContext ctx) @safe {
 		Json p = Json.emptyObject;

@@ -361,9 +361,13 @@ interface RequestContext
 	/// List the client's filesystem roots (`roots/list`). Per client/roots
 	/// §Implementation Guidelines, checks the client's `roots` capability before
 	/// usage and throws `McpException` if the client does not support it; parses
-	/// the client's reply into a typed `ListRootsResult`.
+	/// the client's reply into a typed `ListRootsResult`. Throws on a stateless
+	/// (MRTR) request — like `sample`/`elicit`, a server->client round-trip has no
+	/// channel on the stateless protocol; use `ToolResponse.inputRequired` instead.
 	final ListRootsResult listRoots() @safe
 	{
+		if (isStateless)
+			throw internalError("listRoots() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
 		if (!clientSupports(ClientCapability.roots))
 			throw invalidRequest("Client does not support roots");
 		return ListRootsResult.fromJson(listRootsRaw());
@@ -536,6 +540,7 @@ final class StdioContext : RequestContext
 	private ClientCapabilities clientCaps;
 	private Json progressTok;
 	private ProtocolVersion version_;
+	private bool serverStateless_;
 
 	/// `sink` receives one serialised JSON-RPC frame per call (the transport
 	/// adds the newline terminator). `progressToken` is the originating request's
@@ -558,15 +563,19 @@ final class StdioContext : RequestContext
 	/// reply (the `DuplexChannel` correlates it on its read loop), returning the
 	/// `result` or throwing on error. `clientCaps` are the capabilities the client
 	/// declared at `initialize`, so `clientSupports` can gate `sample`/`elicit`.
+	/// `serverStateless` mirrors `server.mode == ServerMode.stateless`: when true,
+	/// server-initiated requests are refused (a stateless server has no per-peer
+	/// connection to carry the round-trip), exactly as on the HTTP transport.
 	this(void delegate(string) @safe sink, Json delegate(string, Json) @safe serverRequest,
 			ClientCapabilities clientCaps, Json progressToken = Json.undefined,
-			ProtocolVersion negotiated = latestStable) @safe
+			ProtocolVersion negotiated = latestStable, bool serverStateless = false) @safe
 	{
 		this.sink = sink;
 		this.serverRequestFn = serverRequest;
 		this.clientCaps = clientCaps;
 		this.progressTok = progressToken;
 		this.version_ = negotiated;
+		this.serverStateless_ = serverStateless;
 	}
 
 	bool isCancelled() @safe
@@ -626,6 +635,13 @@ final class StdioContext : RequestContext
 
 	private Json serverRequest(string method, Json params) @safe
 	{
+		// Server-initiated requests are a stateful feature: a stateless server keeps
+		// no per-peer connection to carry the round-trip, so they are refused on
+		// every transport (stdio included), matching the HTTP transport. Use
+		// `McpServer.stateful()`; on the modern stateless protocol, return
+		// `ToolResponse.inputRequired` (MRTR) instead.
+		if (serverStateless_)
+			throw invalidRequest("server-initiated requests (elicitation/sampling/roots) require a stateful server; construct with McpServer.stateful()");
 		if (serverRequestFn is null)
 			throw invalidRequest("The stdio transport has no server-to-client request channel");
 		return serverRequestFn(method, params);
@@ -1205,6 +1221,33 @@ unittest  // NullContext reports never-cancelled (no out-of-band channel)
 	assert(!ctx.isCancelled);
 }
 
+unittest  // a stateless server's StdioContext refuses server->client requests on every transport
+{
+	import mcp.protocol.errors : McpException;
+	import std.exception : assertThrown;
+
+	// serverStateless = true mirrors McpServer.stateless(): even though the stdio
+	// channel is physically bidirectional, a stateless server has no per-peer
+	// connection to carry the round-trip, so elicit/sample/roots are refused —
+	// matching the HTTP transport rather than special-casing stdio.
+	auto ctx = new StdioContext((string) @safe {}, (string m, Json p) @safe => Json.emptyObject,
+			ClientCapabilities.init, Json.undefined, latestStable, true);
+	assertThrown!McpException(ctx.sampleRaw(Json.emptyObject));
+	assertThrown!McpException(ctx.elicitRaw(Json.emptyObject));
+	assertThrown!McpException(ctx.listRootsRaw());
+}
+
+unittest  // a stateful StdioContext issues server->client requests through the channel
+{
+	bool called;
+	auto ctx = new StdioContext((string) @safe {}, (string m, Json p) @safe {
+		called = true;
+		return Json.emptyObject;
+	}, ClientCapabilities.init, Json.undefined, latestStable, false);
+	ctx.listRootsRaw();
+	assert(called);
+}
+
 unittest  // StdioContext.log serialises a notifications/message frame to the sink
 {
 	import vibe.data.json : parseJsonString;
@@ -1458,6 +1501,24 @@ unittest  // sample() on a stateless (MRTR) request throws an internalError (ser
 	bool threw;
 	try
 		probe.sample(Json.emptyObject);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.internalError);
+	}
+	assert(threw);
+}
+
+unittest  // listRoots() on a stateless (MRTR) request throws an internalError (server fault)
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	// roots/list is a server->client round-trip like sample/elicit, so it has no
+	// channel on the stateless protocol and must fail fast (use MRTR instead).
+	auto probe = new StateProbe; // isStateless() == true
+	bool threw;
+	try
+		probe.listRoots();
 	catch (McpException e)
 	{
 		threw = true;
