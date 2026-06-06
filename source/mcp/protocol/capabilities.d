@@ -639,7 +639,7 @@ struct ClientCapabilities
 			missing.elicitation = true;
 			anyMissing = true;
 		}
-		if (elicitationForm && !(declared.elicitationForm || declElicit))
+		if (elicitationForm && !declared.elicitationForm)
 		{
 			missing.elicitationForm = true;
 			anyMissing = true;
@@ -750,6 +750,15 @@ unittest  // missingFrom: elicitation url submode unmet by a form-only client
 	auto missing = required.missingFrom(declared);
 	assert(!missing.isNull);
 	assert(missing.get.elicitationUrl);
+}
+
+unittest  // missingFrom: elicitation form submode unmet by a url-only client
+{
+	ClientCapabilities required = {elicitationForm: true};
+	ClientCapabilities declared = {elicitationUrl: true};
+	auto missing = required.missingFrom(declared);
+	assert(!missing.isNull);
+	assert(missing.get.elicitationForm);
 }
 
 unittest  // missingFrom: a required experimental key absent from the client
