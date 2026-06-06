@@ -681,6 +681,14 @@ final class ServerPushChannel
 			// without holding the channel mutex across these blocking writes.
 			if (replay.length)
 			{
+				// Remove the Phase 1 registration if a write throws (e.g. the client
+				// disconnects mid-replay). Without this guard the listener stays alive
+				// with a stale write delegate, consuming memory and blocking deliver.
+				scope (failure)
+				{
+					synchronized (mtx)
+						removeListenerLocked(id);
+				}
 				synchronized (lWriteMtx)
 				{
 					foreach (frame; replay)
@@ -3101,4 +3109,39 @@ unittest  // a failed SSE write in sendRequest deregisters the coordinator waite
 	foreach (long id; 1 .. 1000)
 		assert(!coord.resolve(Json(id), Json.emptyObject, Json.undefined),
 				"the waiter registered before the failed write must have been removed");
+}
+
+unittest  // addListener cleans up its Phase 1 registration when Phase 2 replay write throws
+{
+	// If the write delegate throws mid-replay (e.g. client disconnects), the listener
+	// registered in Phase 1 must not remain in the channel. An orphaned listener would
+	// accumulate replayed frames indefinitely and hold a stale write delegate.
+	import std.string : indexOf;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+
+	// Emit two events on a fresh stream.
+	string[] first;
+	const a = ch.addListener((string f) @safe { first ~= f; });
+	ch.notify("notifications/message", Json(["n": Json(1)]));
+	ch.notify("notifications/message", Json(["n": Json(2)]));
+	const idLine = first[0]["id: ".length .. first[0].indexOf("\n")];
+	ch.removeListener(a);
+
+	// A write delegate that throws on the very first call (simulating disconnect mid-replay).
+	bool threw;
+	try
+	{
+		ch.addListener((string) @safe {
+			throw new Exception("client disconnected");
+		}, "", SubscriptionFilter.init, idLine);
+	}
+	catch (Exception)
+	{
+		threw = true;
+	}
+	assert(threw, "exception from write must propagate out of addListener");
+	// The listener registered in Phase 1 must have been removed when Phase 2 threw.
+	assert(ch.listenerCount == 0, "orphaned listener must be cleaned up when replay write throws");
 }
