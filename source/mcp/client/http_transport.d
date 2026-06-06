@@ -10,7 +10,7 @@ import vibe.stream.operations : readAllUTF8, readLine;
 import vibe.core.net : TCPConnection;
 import vibe.stream.tls : createTLSContext, createTLSStream, TLSContextKind, TLSPeerValidationMode;
 import vibe.stream.wrapper : ProxyStream, createProxyStream;
-import vibe.core.sync : LocalManualEvent, createManualEvent;
+import vibe.core.sync : LocalManualEvent, createManualEvent, LocalTaskSemaphore;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
@@ -200,9 +200,19 @@ final class HttpClientTransport : ClientTransport
 	/// the tool inputSchema cache or draft state.
 	private ClientProtocol protocol;
 
-	this(string url) @safe
+	// Optional cap on the number of POSTs in flight at once. Zero (the default)
+	// means unlimited: no semaphore is created and every request issues its POST
+	// immediately, so existing callers see no behavior change. When positive, a
+	// `LocalTaskSemaphore` admits at most this many concurrent POSTs and an excess
+	// caller awaits a permit instead of minting another socket, bounding the
+	// ephemeral-port / TIME_WAIT pressure a burst of concurrent requests creates.
+	private uint maxInFlight;
+	private LocalTaskSemaphore inFlightSem;
+
+	this(string url, uint maxInFlight = 0) @safe
 	{
 		this.url = url;
+		this.maxInFlight = maxInFlight;
 	}
 
 	void setInboundHandler(void delegate(Message) @safe handler) @safe
@@ -301,6 +311,21 @@ final class HttpClientTransport : ClientTransport
 		return protocol is null ? null : protocol.headersFor(message);
 	}
 
+	/// Acquire one in-flight POST permit, blocking the calling task until one is
+	/// free when the cap is reached, and return the semaphore so the caller can
+	/// release it. Returns null when no cap is configured (`maxInFlight == 0`), in
+	/// which case the POST proceeds unthrottled. The `LocalTaskSemaphore` is created
+	/// lazily on first use because it must be constructed on the event loop.
+	private LocalTaskSemaphore acquireInFlight() @safe
+	{
+		if (maxInFlight == 0)
+			return null;
+		if (inFlightSem is null)
+			inFlightSem = new LocalTaskSemaphore(maxInFlight);
+		inFlightSem.lock();
+		return inFlightSem;
+	}
+
 	Json deliver(Json message, long expectId) @safe
 	{
 		if (sessionExpired)
@@ -338,6 +363,13 @@ final class HttpClientTransport : ClientTransport
 
 		const target = legacyMode ? legacyEndpoint : url;
 		int status;
+		// Hold an in-flight permit (no-op when uncapped) for the duration of the
+		// POST so a oneway send counts against the concurrency cap and releases on
+		// every exit path, including exceptions.
+		auto permit = acquireInFlight();
+		scope (exit)
+			if (permit !is null)
+				permit.unlock();
 		// Funnel the pooled-client oneway POST through the resolve-validate-pin
 		// connector with the user-configured policy: the user-chosen endpoint host
 		// is resolved and the connection pinned to that vetted address (preserving
@@ -447,6 +479,14 @@ final class HttpClientTransport : ClientTransport
 
 		const payload = message.toString();
 		auto hdrs = requestHeaders(message);
+
+		// Hold an in-flight permit (no-op when uncapped) across the whole POST,
+		// including the long-lived SSE response read, so no more than `maxInFlight`
+		// POSTs occupy a socket at once. Released on every exit path via scope(exit).
+		auto permit = acquireInFlight();
+		scope (exit)
+			if (permit !is null)
+				permit.unlock();
 
 		// Register a slot so `close()` can force-close this POST's socket even while
 		// it is parked reading a long-lived SSE response stream.

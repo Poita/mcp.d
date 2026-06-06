@@ -299,10 +299,21 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Build a client over the Streamable HTTP transport at `url`.
-	static McpClient http(string url,
-			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
+	///
+	/// `maxInFlight` optionally caps the number of POSTs in flight at once: each
+	/// request uses its own connection, so a caller issuing many concurrent
+	/// `callTool`s otherwise mints unbounded sockets and can exhaust ephemeral
+	/// ports / pile up TIME_WAIT. With a positive cap, excess requests await a
+	/// permit rather than opening another socket. The default (0) is unlimited, so
+	/// existing callers are unaffected. The cap counts both request POSTs and the
+	/// oneway POSTs that carry notifications and replies to server-initiated
+	/// requests (sampling / elicitation / roots); when a tool uses those, size the
+	/// cap above the round-trip nesting depth so an awaiting request POST and its
+	/// reply POST can both hold a permit.
+	static McpClient http(string url, Implementation clientInfo = Implementation(
+			"dlang-mcp-client", "0.1.0"), uint maxInFlight = 0) @safe
 	{
-		return new McpClient(new HttpClientTransport(url), clientInfo);
+		return new McpClient(new HttpClientTransport(url, maxInFlight), clientInfo);
 	}
 
 	/// Build a client over the stdio transport, exchanging newline-delimited
