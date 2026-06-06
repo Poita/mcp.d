@@ -287,7 +287,10 @@ final class OAuthClient
 	TokenSet refresh(AuthorizationServerMetadata as_, RegisteredClient client, string refreshToken) @safe
 	{
 		requireResource();
-		auto form = buildRefreshTokenForm(refreshToken, client.clientId, resource);
+		const post = authMethod == TokenEndpointAuthMethod.clientSecretPost;
+		auto form = buildRefreshTokenForm(refreshToken, client.clientId,
+				resource, post ? client.clientSecret : "") ~ clientAssertionParams(client.clientId,
+				as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
 		return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
 	}
 
@@ -980,4 +983,43 @@ unittest  // postParse treats a non-2xx token-endpoint response as an error
 	// A non-2xx response from the token endpoint must surface as an exception,
 	// not silently return an empty TokenSet.
 	assertThrown(c.refresh(as_, RegisteredClient("cid", ""), "rt"));
+}
+
+unittest  // refresh() sends client_secret in the POST body for client_secret_post auth
+{
+	import std.algorithm : canFind;
+	import std.conv : to;
+	import std.exception : assertThrown;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	// Capture the raw POST body sent by refresh() so we can assert it contains
+	// client_secret when the auth method is client_secret_post.
+	string capturedBody;
+	auto settings = new HTTPServerSettings();
+	settings.bindAddresses = ["127.0.0.1"];
+	settings.port = 0;
+	auto listener = () @trusted {
+		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+			capturedBody = req.bodyReader.readAllUTF8();
+			res.statusCode = 200;
+			res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+		});
+	}();
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
+
+	const port = listener.bindAddresses[0].port;
+	const tokenUrl = "http://127.0.0.1:" ~ port.to!string ~ "/token";
+
+	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
+	c.authMethod = TokenEndpointAuthMethod.clientSecretPost;
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = tokenUrl;
+	c.refresh(as_, RegisteredClient("cid", "mysecret"), "myrefreshtoken");
+	// The POST body must include the client_secret for client_secret_post auth.
+	assert(capturedBody.canFind("client_secret=mysecret"),
+			"refresh() must include client_secret in POST body for client_secret_post; got: "
+			~ capturedBody);
 }
