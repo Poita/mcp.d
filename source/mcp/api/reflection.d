@@ -1439,7 +1439,7 @@ unittest  // @mcpHeader: a Nullable-of-primitive parameter is accepted at compil
 unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schema
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.modern : paramHeaderMap;
+	import mcp.protocol.modern : paramHeaders;
 
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
@@ -1458,8 +1458,11 @@ unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schem
 	// The non-annotated parameter does not.
 	assert("x-mcp-header" !in schema["properties"]["limit"]);
 
-	// The consumer side (draft.paramHeaderMap) now reads it from the UDA-driven schema.
-	auto m = paramHeaderMap(schema);
+	// paramHeaders surfaces top-level annotations; filter to path.length == 1 for the flat map.
+	string[string] m;
+	foreach (ph; paramHeaders(schema))
+		if (ph.path.length == 1)
+			m[ph.path[0]] = ph.header;
 	assert(m["region"] == "Mcp-Param-Region");
 }
 
