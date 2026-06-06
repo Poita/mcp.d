@@ -1,0 +1,23 @@
+{
+	"name": "apps",
+	"description": "MCP Apps example (server + self-verifying client e2e) for mcp.d — interactive UI resources",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp-d": { "path": "../.." },
+		"examples-common": { "path": "../common" }
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "apps-server",
+			"mainSourceFile": "server.d"
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "apps-client",
+			"mainSourceFile": "client.d"
+		}
+	]
+}

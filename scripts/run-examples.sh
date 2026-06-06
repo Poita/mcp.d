@@ -17,6 +17,7 @@ fail=0
 # Per-example HTTP port, kept distinct so the servers never collide.
 port_for() {
   case "$1" in
+    apps) echo 8538 ;;
     auth) echo 8742 ;;
     caching) echo 8531 ;;
     elicitation) echo 9355 ;;

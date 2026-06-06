@@ -42,6 +42,9 @@ public import mcp.api.attributes;
 public import mcp.api.schema;
 public import mcp.api.reflection;
 
+// --- MCP Apps extension (interactive UI resources) ---
+public import mcp.api.apps;
+
 // --- User-facing modern (next-version) result/hint types ---
 // These are referenced by members already on the lean public surface:
 // `McpServer.setListCacheHint(string, CacheHint)` and `McpClient.discover()`

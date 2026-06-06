@@ -235,7 +235,7 @@ The Streamable HTTP transport derives session minting purely from
 
 ## Examples
 
-The repository ships eleven runnable, self-verifying server/client pairs in
+The repository ships twelve runnable, self-verifying server/client pairs in
 [`examples/`](examples/). Each `client.d` is an end-to-end test that asserts the
 matching server's behaviour, and CI runs every pair over **both** stdio and
 Streamable HTTP.
@@ -253,6 +253,7 @@ Streamable HTTP.
 | Elicitation | server-initiated, typed user input (`ctx.elicit!T`) | [server](examples/elicitation/server.d) | [client](examples/elicitation/client.d) |
 | Sticky notes | stateful tools + a resource per note + elicitation-confirmed clear | [server](examples/stickynotes/server.d) | [client](examples/stickynotes/client.d) |
 | Auth | OAuth 2.1 protected HTTP resource server (HTTP only) | [server](examples/auth/server.d) | [client](examples/auth/client.d) |
+| Apps | MCP Apps extension: `@ui` tool link + a `ui://` HTML resource | [server](examples/apps/server.d) | [client](examples/apps/client.d) |
 
 Annotate plain typed D functions with `@tool` / `@resource` / `@prompt` and register
 a whole module with `registerModule!(my.module)(server)` — the input schema (from
@@ -262,6 +263,36 @@ trailing `RequestContext` parameter to report progress, log, or call back to the
 client (sampling/elicitation). For tools whose schema is only known at runtime,
 drop to `server.registerDynamicTool(Tool, delegate)` / `registerResource` /
 `registerDynamicPrompt`, which receive the raw `Json`.
+
+## MCP Apps (interactive UI)
+
+The [MCP Apps extension](https://modelcontextprotocol.io/extensions/apps/overview)
+(`io.modelcontextprotocol/ui`) lets a server ship an interactive HTML UI that a
+host renders inline in the conversation. On the server side it is metadata plus a
+resource convention, and `import mcp;` brings in the helpers (`mcp.api.apps`):
+
+```d
+auto server = new McpServer("weather", "1.0.0");
+registerModule!(my.module)(server);     // a @tool tagged @ui("ui://weather/dashboard", "model", "app")
+advertiseMcpApps(server);               // declare the extension capability
+
+UiResourceMeta ui;
+ui.csp.connectDomains = ["https://api.open-meteo.com"];
+ui.prefersBorder = nullable(true);
+registerUiResource(server, "ui://weather/dashboard", "weather_dashboard",
+        dashboardHtml, ui);             // serve the ui:// HTML with text/html;profile=mcp-app
+```
+
+A `@tool` carries its UI link via `@ui(resourceUri, visibility…)` (folded into the
+tool's `_meta.ui`); the dynamic path uses `setUiToolMeta(tool, UiToolMeta(...))`.
+`clientSupportsMcpApps(server)` reports whether the connected client opted into the
+extension. The runnable [Apps example](examples/apps/) verifies the whole surface
+over both transports.
+
+The extension's `ui/` postMessage dialect (iframe ↔ host) and sandbox rendering
+are a **host (browser) concern** and intentionally out of scope for this
+transport-level SDK — when the embedded app calls a tool, the host proxies it to
+the server as an ordinary `tools/call`, so the server implements no `ui/` methods.
 
 ## Event-loop model
 

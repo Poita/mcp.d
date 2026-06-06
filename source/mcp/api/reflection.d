@@ -13,6 +13,7 @@ import mcp.protocol.modern : CacheHint, CacheScope;
 import mcp.server.server : McpServer, ToolResponse;
 import mcp.server.context;
 import mcp.api.attributes;
+import mcp.api.apps : UiToolMeta, setUiToolMeta;
 import mcp.api.schema;
 
 @safe:
@@ -525,6 +526,14 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		descriptor.annotations = anns.toJson();
 
 	applyIconsAndMeta!overload(descriptor);
+
+	// Fold a @ui UDA into the tool's _meta.ui (MCP Apps), merging with any
+	// _meta already set by @meta above.
+	static foreach (a; __traits(getAttributes, overload))
+	{
+		static if (is(typeof(a) == ui))
+			setUiToolMeta(descriptor, UiToolMeta(a.resourceUri, a.visibility));
+	}
 
 	server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
 		import mcp.protocol.errors : McpException;
