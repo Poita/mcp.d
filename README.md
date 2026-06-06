@@ -83,10 +83,13 @@ void main()
   `subscriptions/listen`, `CacheableResult` (`ttlMs`/`cacheScope`), MRTR types, the standard
   request headers (`Mcp-Method`/`Mcp-Name`/`MCP-Protocol-Version`) with `HeaderMismatch`
   validation, and `x-mcp-header` mirroring — on both client and server.
+  `callTool` transparently drives the full MRTR (SEP-2322) round-trip loop via an internal
+  `callToolLoop`, satisfying each `InputRequest` and resubmitting until a completed result is
+  returned (capped at 16 rounds to guard against misbehaving servers).
 
 Optional follow-ups (not required for conformance): Client-ID-Metadata-Document client_id
-(currently uses DCR, a passing SHOULD warning), MRTR end-to-end client retry helper, and a
-built-in loopback redirect listener for the interactive auth-code flow.
+(currently uses DCR, a passing SHOULD warning), and a built-in loopback redirect listener for
+the interactive auth-code flow.
 
 ## Requirements
 
