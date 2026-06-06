@@ -485,10 +485,7 @@ string generateSessionId() @safe
 
 	ubyte[32] buf;
 	fillSecureRandom(buf[]);
-	string s;
-	foreach (b; buf[])
-		s ~= format("%02x", b);
-	return s;
+	return format("%(%02x%)", buf[]);
 }
 
 /// Fill `dst` with cryptographically-secure random bytes drawn from the host
