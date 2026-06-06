@@ -30,7 +30,7 @@ dub build -c client -b release
 ## Run
 
 ```bash
-# Terminal 1 — start the server
+# Terminal 1 — start the server (single event-loop thread = one core)
 ./bench-server --port 8550
 
 # Terminal 2 — synchronous baseline (one connection, calls are serial)
@@ -42,6 +42,11 @@ dub build -c client -b release
 
 Client options: `--url`, `--calls` (total timed calls), `--concurrency` (parallel
 connections), `--warmup` (per-client warmup calls before timing).
+
+Server options: `--port`, `--host`, `--threads N`. With `--threads N` the server
+runs N independent event-loop threads, each with its own `McpServer` + router, all
+binding the same port via `SO_REUSEPORT` so the kernel load-balances connections
+across them — i.e. N cores instead of one.
 
 ## Results
 
@@ -66,12 +71,42 @@ round-trip).
 
 Because each call opens and closes its own TCP connection, a sustained run mints
 thousands of short-lived sockets that linger in `TIME_WAIT` (2×MSL ≈ 30 s on
-macOS). Past concurrency ~16 the client exhausts the ephemeral port range
-(`49152–65535`, ~16k ports) faster than sockets drain, and new `connectTCP` calls
-block — throughput collapses rather than climbing. The CPU-bound ceiling (~17k/s)
-is hit before that point; both server and client saturate one core.
+macOS). Mid-run `netstat` shows ~16,182 `TIME_WAIT` sockets on the endpoint — the
+*entire* ephemeral port range (`49152–65535`, ~16k ports). Once the pool is
+exhausted, new `connectTCP` calls **block indefinitely** (there is no free local
+port), so throughput collapses rather than climbing. The CPU-bound ceiling
+(~17k/s) is hit before that point; both server and client saturate one core.
 
-The single biggest lever to raise this number would be HTTP keep-alive / connection
-reuse for the request/response path (falling back to a dedicated connection only
-when a handler actually initiates a server→client request) — but that is a transport
-design change, not a benchmark tuning knob.
+This also makes the loopback ephemeral pool the binding constraint for *any*
+multi-process load test: all clients on `127.0.0.1` share one ~16k-port pool, and
+a poisoned pool needs ~30 s to drain, so back-to-back high-rate runs must pause
+between them (the scripts here drain `TIME_WAIT` before each run).
+
+### Multi-threaded server (`--threads`)
+
+`--threads N` was added to test multi-core scaling, but on a single loopback host
+the offered load is hard to push past one server core: each single-threaded client
+process maxes ~8–9k calls/sec, and the connection-per-call churn exhausts the
+shared ephemeral pool before enough client processes can be added. Two parallel
+clients (≈17k/sec aggregate) barely saturate one server core, so extra server
+threads add little:
+
+| Server threads | Aggregate (2 parallel clients) |
+| -------------: | -----------------------------: |
+| 1              | ~17,200 calls/sec              |
+| 2              | ~19,000 calls/sec              |
+| 4              | ~17,700 calls/sec              |
+
+The flag is correct (N `SO_REUSEPORT` listeners, kernel-balanced); demonstrating
+real multi-core scaling needs a load generator that does NOT churn a connection per
+call (HTTP keep-alive) or a second host / a widened ephemeral range.
+
+### The real fix
+
+The single biggest lever for both throughput and the `TIME_WAIT` storm is HTTP
+keep-alive / connection reuse for the request/response path — falling back to a
+dedicated `Connection: close` socket only when a handler actually initiates a
+server→client request (sampling / elicitation / roots). That is a transport design
+change, not a benchmark tuning knob. A secondary, cheaper improvement: bound the
+client `connectTCP` with a timeout so ephemeral-port exhaustion surfaces as a clear
+error instead of an indefinite hang.
