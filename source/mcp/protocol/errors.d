@@ -164,10 +164,16 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 	while (authEnd < url.length && url[authEnd] != '/' && url[authEnd] != '?' && url[authEnd] != '#')
 		authEnd++;
 	auto authority = url[i .. authEnd];
-	foreach (j, c; authority)
+	// Userinfo is separated from host by the last '@' in the authority component
+	// (RFC 3986 §3.2.1). Scan backward to locate it so that a URL with multiple
+	// '@' characters does not cause an out-of-bounds re-slice.
+	foreach_reverse (j, c; authority)
 	{
 		if (c == '@')
-			authority = authority[j + 1 .. $]; // host is whatever follows last '@'
+		{
+			authority = authority[j + 1 .. $];
+			break;
+		}
 	}
 	// Strip the port suffix before checking that the host is non-empty.
 	// A URL such as "https://:8080/" has authority ":8080" with an empty host.
@@ -452,6 +458,16 @@ unittest  // isValidElicitationUrl accepts ordinary https/http URLs
 	assert(isValidElicitationUrl("http://example.com"));
 	assert(isValidElicitationUrl("https://mcp.example.com/connect?elicitationId=abc#frag"));
 	assert(isValidElicitationUrl("https://user@host.example/path"));
+}
+
+unittest  // isValidElicitationUrl handles multiple '@' in authority without crashing
+{
+	// A double-'@' userinfo is syntactically valid per RFC 3986; the host is
+	// everything after the last '@'. The foreach loop that mutated the authority
+	// slice mid-iteration would produce an ArraySliceError here.
+	assert(isValidElicitationUrl("https://user1@user2@host.example/path"));
+	assert(isValidElicitationUrl("https://a@b@c@host.example/"));
+	assert(!isValidElicitationUrl("https://user1@user2@/path")); // empty host after last '@'
 }
 
 unittest  // isValidElicitationUrl rejects malformed / non-absolute values
