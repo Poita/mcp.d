@@ -1313,11 +1313,14 @@ package string buildRefreshTokenForm(string refreshToken, string clientId,
 }
 
 /// Build the HTTP `Authorization: Basic` header value for `client_secret_basic`.
+/// Per RFC 6749 §2.3.1, both the client identifier and password are
+/// percent-encoded (application/x-www-form-urlencoded) before concatenation.
 string basicAuthHeader(string clientId, string clientSecret) @safe
 {
 	import std.base64 : Base64;
+	import std.uri : encodeComponent;
 
-	const raw = clientId ~ ":" ~ clientSecret;
+	const raw = encodeComponent(clientId) ~ ":" ~ encodeComponent(clientSecret);
 	return "Basic " ~ () @trusted {
 		return cast(string) Base64.encode(cast(const(ubyte)[]) raw);
 	}();
@@ -1401,6 +1404,16 @@ unittest  // basic auth header is base64(client:secret)
 {
 	// base64("id:secret") = aWQ6c2VjcmV0
 	assert(basicAuthHeader("id", "secret") == "Basic aWQ6c2VjcmV0");
+}
+
+unittest  // basic auth header percent-encodes credentials per RFC 6749 §2.3.1
+{
+	// client_id "id:with:colons", client_secret "secret+value"
+	// After encodeComponent: "id%3Awith%3Acolons" and "secret%2Bvalue"
+	// raw = "id%3Awith%3Acolons:secret%2Bvalue"
+	// base64 of that = "aWQlM0F3aXRoJTNBY29sb25zOnNlY3JldCUyQnZhbHVl"
+	assert(basicAuthHeader("id:with:colons",
+			"secret+value") == "Basic aWQlM0F3aXRoJTNBY29sb25zOnNlY3JldCUyQnZhbHVl");
 }
 
 /// Extract a query-string parameter value from a URL (URL-decoded), or "".
