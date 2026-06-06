@@ -24,7 +24,8 @@ final class OAuthClient
 	/// MCP authorization/token flows: per RFC 8707 the `resource` indicator MUST
 	/// be sent on the authorization and token requests regardless of whether the
 	/// authorization server advertises support, so `authorizationUrl`,
-	/// `exchangeCode`, `refresh`, and `clientCredentials` reject an empty value.
+	/// `exchangeCode`, `refresh`, `clientCredentials`, `tokenExchange`, and
+	/// `jwtBearerGrant` reject an empty value.
 	/// `useOAuth` sets this to the canonical MCP server URI automatically.
 	string resource;
 	/// The client's redirect URI for the auth-code flow.
@@ -266,9 +267,11 @@ final class OAuthClient
 
 	/// RFC 8693 token exchange: swap a subject token (e.g. an IdP id_token) for
 	/// a requested token type (e.g. an ID-JAG assertion) at `tokenEndpoint`.
+	/// Rejects an empty `resource` — see the class docstring for the rationale.
 	TokenSet tokenExchange(string tokenEndpoint, string subjectToken,
 			string subjectTokenType, string requestedTokenType, string audience, string clientId) @safe
 	{
+		requireResource();
 		auto form = buildTokenExchangeForm(subjectToken, subjectTokenType,
 				requestedTokenType, audience, resource, clientId);
 		return TokenSet.fromJson(postForm(tokenEndpoint, form, RegisteredClient(clientId, "")));
@@ -983,6 +986,30 @@ unittest  // postParse treats a non-2xx token-endpoint response as an error
 	// A non-2xx response from the token endpoint must surface as an exception,
 	// not silently return an empty TokenSet.
 	assertThrown(c.refresh(as_, RegisteredClient("cid", ""), "rt"));
+}
+
+unittest  // tokenExchange refuses when the RFC 8707 resource indicator is unset
+{
+	import mcp.protocol.errors : McpException;
+	import std.exception : assertThrown;
+	import std.string : indexOf;
+
+	auto c = new OAuthClient();
+	// c.resource left empty.
+	bool caught;
+	try
+		c.tokenExchange("https://as.example.com/token", "subj_token",
+				"urn:ietf:params:oauth:token-type:id_token",
+				"urn:ietf:params:oauth:token-type:access_token", "aud", "cid");
+	catch (McpException e)
+	{
+		caught = e.msg.indexOf("resource indicator") >= 0;
+	}
+	catch (Exception)
+	{
+		// Any non-McpException means requireResource() was not called first.
+	}
+	assert(caught, "tokenExchange must throw McpException mentioning 'resource indicator' when resource is unset");
 }
 
 unittest  // refresh() sends client_secret in the POST body for client_secret_post auth
