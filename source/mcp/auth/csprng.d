@@ -201,7 +201,10 @@ else version (OpenBSD)
 else version (DragonFlyBSD)
 	private extern (C) void arc4random_buf(scope void* buf, size_t nbytes) @system nothrow @nogc;
 
-version (Windows) private extern (C) int BCryptGenRandom(void* hAlgorithm,
+// BCryptGenRandom is a WINAPI (`__stdcall`) function, so it must be bound with
+// extern(Windows). extern(C) would mismatch the calling convention and corrupt
+// the stack on 32-bit Windows.
+version (Windows) private extern (Windows) int BCryptGenRandom(void* hAlgorithm,
 		scope ubyte* pbBuffer, uint cbBuffer, uint dwFlags) @system nothrow @nogc;
 
 // ===========================================================================
