@@ -390,6 +390,16 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 			res.writeBody("Unknown or expired authorization state", "text/plain");
 			return;
 		}
+		// Validate the redirect_uri before committing any state: the registry may
+		// have evicted it under cap pressure since the /authorize request.
+		try
+			proxy.validateRedirectUri(st.clientRedirectUri);
+		catch (InvalidRedirectUriException)
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(invalidRequestJson("invalid redirect_uri"));
+			return;
+		}
 		proxy.grantConsent(st.clientRedirectUri);
 		// Re-store the pending authorization so the upstream callback can relay it.
 		store.put(proxyState, st);
@@ -1176,4 +1186,69 @@ unittest  // PKCE: /authorize 400s a non-S256 code_challenge_method
 	assert(res.statusCode == 400);
 	assert(body_.canFind("invalid_request"));
 	assert(body_.canFind("S256"));
+}
+
+unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent yields 400 not 500
+{
+	// When the InMemoryRedirectUriRegistry evicts the client's redirect_uri under
+	// cap pressure between the /authorize request and the user's /consent POST,
+	// proxy.authorize throws InvalidRedirectUriException. The handler must catch it
+	// and return 400 (matching the /authorize handler) rather than leaking a 500.
+	import std.algorithm : canFind;
+	import mcp.auth.oauth_proxy : InMemoryConsentStore, InMemoryRedirectUriRegistry;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com";
+	cfg.resource = "https://mcp.example.com/mcp";
+
+	// Registry with cap=1: registering a second client evicts the first.
+	auto reg = new InMemoryRedirectUriRegistry(1);
+	auto proxy = new OAuthProxy(cfg, new InMemoryConsentStore(), reg);
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	// /authorize for the client's redirect_uri: returns the consent screen.
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	const html = () @trusted { return cast(string) sink.data; }();
+	assert(html.canFind("Authorize application"), "expected consent screen");
+
+	// Extract the hidden proxy state from the consent screen form.
+	import std.string : indexOf;
+
+	const stateMark = `name="state" value="`;
+	const hi = html.indexOf(stateMark);
+	assert(hi >= 0);
+	const rest = html[hi + stateMark.length .. $];
+	const proxyState = rest[0 .. rest.indexOf('"')];
+	assert(proxyState.length > 0);
+
+	// Evict the client's redirect_uri from the registry by registering a second
+	// client (cap=1 causes the first registration to be discarded).
+	proxy.register(["http://localhost:9999/other"]);
+
+	// POST /consent: with the redirect_uri evicted, proxy.authorize throws
+	// InvalidRedirectUriException. The handler must catch it and return 400.
+	auto formBody = () @trusted { return cast(ubyte[])("state=" ~ proxyState).dup; }();
+	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/consent"),
+			HTTPMethod.POST, createMemoryStream(formBody, false));
+	req2.headers["Content-Type"] = "application/x-www-form-urlencoded";
+	auto sink2 = createMemoryOutputStream();
+	auto res2 = createTestHTTPServerResponse(sink2, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req2, res2);
+
+	assert(res2.statusCode == 400, "expected 400 for evicted redirect_uri");
+	const body2 = () @trusted { return cast(string) sink2.data; }();
+	assert(body2.canFind("invalid_request"), "expected invalid_request error body");
 }
