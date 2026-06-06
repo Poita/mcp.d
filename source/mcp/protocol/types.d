@@ -243,13 +243,19 @@ struct UnknownContent
 
 	Json toJson() const @safe
 	{
-		// Emit the original block verbatim. The shared `annotations`/`_meta`
-		// fields (mutated via `withAnnotations`/`withContentMeta`) are overlaid so
-		// those setters still take effect on an unknown block; otherwise the raw
-		// block already carries whatever it was parsed with.
+		// Emit the original block verbatim, but treat the shared `annotations`/
+		// `_meta` fields as authoritative: drop the raw copies and re-emit from the
+		// struct fields. `parseMeta` populated those fields from the inbound block,
+		// and `forVersion` projects them for an older peer (stripping
+		// `annotations.lastModified` and `_meta`), so overlaying alone is not enough
+		// — a stale `_meta`/`lastModified` in `raw` would otherwise leak through.
 		Json j = raw.clone;
 		if (j.type != Json.Type.object)
 			return raw;
+		if ("annotations" in j)
+			j.remove("annotations");
+		if ("_meta" in j)
+			j.remove("_meta");
 		emitMeta(j);
 		return j;
 	}
@@ -748,6 +754,7 @@ struct Content
 			// original `type` and all of its fields).
 			UnknownContent c;
 			c.raw = j;
+			c.parseMeta(j);
 			return Content(c);
 		}
 	}
@@ -4426,6 +4433,32 @@ unittest  // Content.forVersion strips Annotations.lastModified pre-2025-06-18
 	assert("audience" in old["annotations"]); // audience preserved
 
 	auto keep = c.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("lastModified" in keep["annotations"]);
+}
+
+unittest  // Content.forVersion strips _meta and annotations.lastModified from an UnknownContent block pre-2025-06-18
+{
+	Json block = Json.emptyObject;
+	block["type"] = "custom/chart";
+	Json ann = Json.emptyObject;
+	ann["audience"] = Json([Json("user")]);
+	ann["lastModified"] = Json("2025-01-01T00:00:00Z");
+	block["annotations"] = ann;
+	Json meta = Json.emptyObject;
+	meta["cost"] = 0.01;
+	block["_meta"] = meta;
+	auto c = Content.fromJson(block);
+	assert(c.kind == ContentKind.unknown);
+
+	auto old = c.forVersion(ProtocolVersion.v2024_11_05).toJson();
+	assert("_meta" !in old);
+	assert("annotations" in old);
+	assert("lastModified" !in old["annotations"]);
+	assert("audience" in old["annotations"]); // audience preserved
+	assert(old["type"].get!string == "custom/chart"); // unknown kind round-trips
+
+	auto keep = c.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("_meta" in keep);
 	assert("lastModified" in keep["annotations"]);
 }
 
