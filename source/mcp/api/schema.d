@@ -52,8 +52,9 @@ private template stdDateTimeFormat(T)
 ///   `{type: "object", additionalProperties: <recursive>}`
 /// - `struct` -> `{type: "object", properties: <recursive>,
 ///   required: <fields that are neither `Nullable!T` nor have a default>}`
-/// - `Nullable!T` -> the schema of `T` (optionality is handled by the
-///   enclosing object via `required`)
+/// - `Nullable!T` -> `{anyOf: [schema(T), {type: "null"}]}` (accepts both the
+///   inner type and JSON null; optionality is handled by the enclosing object
+///   via `required`)
 /// - `SumType!(A, B, …)` / tagged unions -> `{anyOf: [schema(A), schema(B), …]}`
 /// - `std.datetime` types: `SysTime`/`DateTime` -> `{type: "string", format: "date-time"}`;
 ///   `Date` -> `{type: "string", format: "date"}`;
@@ -69,7 +70,16 @@ Json jsonSchemaOf(T)() @safe
 
 	static if (isInstanceOf!(Nullable, T))
 	{
-		return jsonSchemaOf!(TemplateArgsOf!T[0]);
+		// A Nullable!T field accepts either the inner type or JSON null (LLMs
+		// routinely send explicit null for absent optional parameters). Emit
+		// anyOf so both the inner schema and {type:"null"} are valid.
+		Json nullSchema = Json.emptyObject;
+		nullSchema["type"] = "null";
+		Json variants = Json.emptyArray;
+		variants ~= jsonSchemaOf!(TemplateArgsOf!T[0]);
+		variants ~= nullSchema;
+		s["anyOf"] = variants;
+		return s;
 	}
 	else static if (is(T == bool))
 	{
@@ -648,14 +658,23 @@ unittest  // structs become objects with properties and required
 	auto s = jsonSchemaOf!Point;
 	assert(s["type"].get!string == "object");
 	assert(s["properties"]["x"]["type"].get!string == "integer");
-	assert(s["properties"]["label"]["type"].get!string == "string");
+	// Nullable!string emits anyOf:[{type:"string"},{type:"null"}].
+	auto label = s["properties"]["label"];
+	assert("anyOf" in label);
+	assert(label["anyOf"].length == 2);
+	assert(label["anyOf"][0]["type"].get!string == "string");
+	assert(label["anyOf"][1]["type"].get!string == "null");
 	// x and y are required; the Nullable label is not.
 	assert(s["required"].length == 2);
 }
 
-unittest  // Nullable unwraps to the inner schema
+unittest  // Nullable emits anyOf with the inner schema and null
 {
-	assert(jsonSchemaOf!(Nullable!int)["type"].get!string == "integer");
+	auto s = jsonSchemaOf!(Nullable!int);
+	assert("anyOf" in s);
+	assert(s["anyOf"].length == 2);
+	assert(s["anyOf"][0]["type"].get!string == "integer");
+	assert(s["anyOf"][1]["type"].get!string == "null");
 }
 
 unittest  // validateAgainstSchema accepts a conforming object
@@ -714,6 +733,22 @@ unittest  // validateAgainstSchema treats Nullable members as optional
 	Json v = Json.emptyObject;
 	v["total"] = 3;
 	assert(validateAgainstSchema(v, schema) == "");
+}
+
+unittest  // validateAgainstSchema accepts explicit JSON null for Nullable fields
+{
+	struct Result
+	{
+		int total;
+		Nullable!string label;
+	}
+
+	auto schema = jsonSchemaOf!Result;
+	Json v = Json.emptyObject;
+	v["total"] = 3;
+	v["label"] = Json(null);
+	assert(validateAgainstSchema(v, schema) == "",
+			"explicit null must be accepted for a Nullable!string field");
 }
 
 unittest  // validateAgainstSchema descends into array items
@@ -1025,9 +1060,13 @@ unittest  // nested optionals: Nullable struct field carrying an AA
 	// tags is Nullable -> optional; only id is required.
 	assert(s["required"].length == 1);
 	assert(s["required"][0].get!string == "id");
+	// Nullable!(string[string]) emits anyOf:[{object schema},{type:"null"}].
 	auto tags = s["properties"]["tags"];
-	assert(tags["type"].get!string == "object");
-	assert(tags["additionalProperties"]["type"].get!string == "string");
+	assert("anyOf" in tags);
+	assert(tags["anyOf"].length == 2);
+	assert(tags["anyOf"][0]["type"].get!string == "object");
+	assert(tags["anyOf"][0]["additionalProperties"]["type"].get!string == "string");
+	assert(tags["anyOf"][1]["type"].get!string == "null");
 }
 
 unittest  // SumType maps to anyOf over the recursive variant schemas
