@@ -259,7 +259,7 @@ private P marshalArg(P)(Json args, string name) @safe
 	}
 	else
 	{
-		if (name in args)
+		if (argPresent(args, name))
 			return marshalScalar!P(args[name]);
 		return P.init;
 	}
@@ -1136,6 +1136,29 @@ unittest  // @prompt integer arg given a non-numeric string -> InvalidParams (-3
 	assert("error" in resp, "expected an error for a non-numeric integer prompt argument");
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams,
 			"non-numeric integer prompt arg must map to -32602, not -32603");
+}
+
+unittest  // @prompt string arg given JSON null -> clean InvalidParams, not vibe deserialization error
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.errors : ErrorCode;
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DemoApi);
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "intro";
+	pp["arguments"] = Json(["topic": Json(null)]); // null for required string arg
+	auto resp = s.handle(Message(makeRequest(Json(4), "prompts/get", pp))).get;
+	assert("error" in resp, "expected an error for a null required prompt argument");
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams,
+			"null required prompt arg must map to -32602, not -32603");
+	// The clean error path treats null as absent and reports a missing-required diagnostic.
+	// The indirect path (vibe deserialization) produces an "argument 'topic': ..." prefix.
+	const msg = resp["error"]["message"].get!string;
+	assert(msg.canFind("Missing required argument") || msg.canFind("required argument is missing"),
+			"expected a clean missing-required diagnostic, got: " ~ msg);
 }
 
 unittest  // @prompt reflection: optional title is emitted in prompts/list

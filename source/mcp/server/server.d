@@ -2615,7 +2615,9 @@ final class McpServer
 		{
 			if (!arg.required)
 				continue;
-			if (args.type != Json.Type.object || arg.name !in args)
+			if (args.type != Json.Type.object || arg.name !in args
+					|| args[arg.name].type == Json.Type.null_
+					|| args[arg.name].type == Json.Type.undefined)
 				throw invalidParams("Missing required argument '" ~ arg.name
 						~ "' for prompt: " ~ name);
 		}
