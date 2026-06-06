@@ -799,7 +799,8 @@ struct Annotations
 		Annotations a;
 		if ("audience" in j && j["audience"].type == Json.Type.array)
 			foreach (i; 0 .. j["audience"].length)
-				a.audience ~= j["audience"][i].get!string;
+				if (j["audience"][i].type == Json.Type.string)
+					a.audience ~= j["audience"][i].get!string;
 		if ("priority" in j && j["priority"].type == Json.Type.float_)
 		{
 			// Defensive clamp to the spec range 0.0..1.0 on read, mirroring emit.
@@ -3877,6 +3878,18 @@ unittest  // Annotations.fromJson clamps an out-of-range priority into 0.0..1.0
 	j["priority"] = Json(2.5);
 	auto a = Annotations.fromJson(j);
 	assert(a.priority.get == 1.0);
+}
+
+unittest  // Annotations.fromJson silently skips non-string audience elements instead of throwing
+{
+	auto j = Json.emptyObject;
+	auto arr = Json.emptyArray;
+	arr ~= Json(1);
+	arr ~= Json("user");
+	arr ~= Json(true);
+	j["audience"] = arr;
+	auto a = Annotations.fromJson(j);
+	assert(a.audience == ["user"]);
 }
 
 /// Result of `resources/read`.
