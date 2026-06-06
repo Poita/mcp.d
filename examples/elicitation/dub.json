@@ -3,7 +3,7 @@
 	"description": "MCP example: 2025-era blocking elicitation (server + self-verifying client e2e) over BOTH stdio and Streamable HTTP, using the typed elicitation APIs. Issue #355.",
 	"license": "Apache-2.0",
 	"dependencies": {
-		"mcp": { "path": "../.." },
+		"mcp-d": { "path": "../.." },
 		"examples-common": { "path": "../common" }
 	},
 	"configurations": [

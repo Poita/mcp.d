@@ -3,7 +3,7 @@
 	"description": "MCP example: a stateful sticky-notes board combining tools (add/remove/remove-all), a resource per note, and an elicitation-confirmed destructive clear (server + self-verifying client e2e) over BOTH stdio and Streamable HTTP.",
 	"license": "Apache-2.0",
 	"dependencies": {
-		"mcp": { "path": "../.." },
+		"mcp-d": { "path": "../.." },
 		"examples-common": { "path": "../common" }
 	},
 	"configurations": [

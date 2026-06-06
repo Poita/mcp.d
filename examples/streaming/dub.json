@@ -3,7 +3,7 @@
 	"description": "MCP example: progress, logging, cancellation + typed elicitation/sampling over stdio AND Streamable HTTP (server + self-verifying client e2e). Issue #357 / #436 / #437.",
 	"license": "Apache-2.0",
 	"dependencies": {
-		"mcp": { "path": "../.." },
+		"mcp-d": { "path": "../.." },
 		"examples-common": { "path": "../common" }
 	},
 	"configurations": [
