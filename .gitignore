@@ -3,8 +3,13 @@
 *.obj
 *.a
 *.lib
+# dub build/test output binaries at the package root (named after the dub
+# package + config, e.g. mcp-d, mcp-d-test-library, mcp-d-test-application).
+# Pattern-based so a package rename does not silently un-ignore them.
 /mcp
-mcp-test-library
+/mcp-d
+*-test-library
+*-test-application
 __test__*__
 dub.selections.json
 conformance-results/
