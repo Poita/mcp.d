@@ -527,9 +527,11 @@ private string stripPortAndBrackets(string host) @safe pure nothrow @nogc
 ///   verbatim.
 /// - A registered hostname is resolved; EVERY returned A/AAAA address is
 ///   classified and `pinnedIp` is set to the first one. If ANY resolved address
-///   is private/link-local the result is `privateOrLinkLocal` (DNS-rebinding
-///   guard). On a resolution error (or no usable record) the result is
-///   `privateOrLinkLocal` with an empty `pinnedIp` (fail CLOSED).
+///   is loopback/private/link-local the result is `privateOrLinkLocal` (resolved
+///   loopback is demoted to private so it cannot claim the literal-loopback dev
+///   allowance — DNS-rebinding guard). On a resolution error (or no usable
+///   record) the result is `privateOrLinkLocal` with an empty `pinnedIp` (fail
+///   CLOSED).
 ///
 /// `@safe` (DNS resolution is `@system` in `std.socket`; wrapped here).
 AddressClass classifyHost(string host, out string pinnedIp) @safe
@@ -582,8 +584,14 @@ AddressClass classifyHost(string host, out string pinnedIp) @safe
 			if (info.family != AddressFamily.INET && info.family != AddressFamily.INET6)
 				continue;
 			const addr = info.address.toAddrString();
-			const cls = classifyResolvedAddress(addr);
+			auto cls = classifyResolvedAddress(addr);
 			any = true;
+			// A resolved loopback address is demoted to private/link-local: the
+			// literal-loopback dev allowance applies only to literal hosts
+			// (localhost/127.x/[::1], handled above before this DNS branch), never to
+			// a registered name an attacker can point at 127.x via DNS.
+			if (cls == AddressClass.loopback)
+				cls = AddressClass.privateOrLinkLocal;
 			// A single internal address taints the whole host (DNS-rebinding guard).
 			if (cls != AddressClass.public_)
 				worst = cls;
@@ -652,12 +660,14 @@ struct PinnedConnect
 
 /// Vet a `host` (authority host, optionally bracketed / with a `:port` suffix)
 /// against `policy` for a raw-TCP connect, returning the address to connect to
-/// and the SNI/Host name to present. `tls` selects whether plaintext-http
-/// internal targets are subject to the dev-loopback allowance (only relevant to
-/// `blockInternal`).
+/// and the SNI/Host name to present. `tls` records whether the connection uses
+/// TLS; the http-vs-loopback scheme restriction itself is enforced by the
+/// caller's scheme gate (`secureRequestHTTP`), not here.
 ///
-/// `blockInternal`: public hosts pass; loopback passes only when `!tls` (the
-/// dev-loopback-over-http allowance); everything else is rejected.
+/// `blockInternal`: public hosts pass; an explicit literal-loopback host
+/// (`localhost`, `127.x` in any encoding, `[::1]`) passes as the dev-loopback
+/// allowance; everything else — including a registered name that DNS-resolves to
+/// loopback — is rejected (`classifyHost` demotes resolved loopback to private).
 /// `allowUserConfigured`: every classifiable host passes (loopback and private
 /// included); only a fail-closed classification (unresolvable / malformed)
 /// is rejected.
@@ -683,7 +693,7 @@ PinnedConnect pinnedConnectAddress(string host, bool tls, SsrfPolicy policy) @sa
 		if (cls == AddressClass.public_)
 			break;
 		if (cls == AddressClass.loopback)
-			break; // explicit dev-loopback allowance (the scheme gate guards http)
+			break; // literal-loopback dev allowance; the caller's scheme gate restricts http to it
 		return r; // private/link-local -> reject
 	case SsrfPolicy.allowUserConfigured:
 		break; // any classifiable host is permitted
@@ -1033,6 +1043,17 @@ unittest  // blockInternal rejects private/link-local hosts
 	assert(!pinnedConnectAddress("10.0.0.5", true, SsrfPolicy.blockInternal).ok);
 	assert(!pinnedConnectAddress("[fe80::1]", true, SsrfPolicy.blockInternal).ok);
 	assert(!pinnedConnectAddress("0xa9fea9fe", true, SsrfPolicy.blockInternal).ok);
+}
+
+unittest  // blockInternal rejects a registered name that DNS-resolves to loopback (no literal-loopback allowance for resolved hosts)
+{
+	// "LOCALHOST" does not match the case-sensitive literal `localhost` fast path,
+	// so it goes through DNS resolution and resolves to 127.0.0.1/::1. A resolved
+	// loopback address must NOT receive the literal dev-loopback allowance.
+	string pin;
+	assert(classifyHost("LOCALHOST", pin) == AddressClass.privateOrLinkLocal);
+	assert(!pinnedConnectAddress("LOCALHOST", true, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("LOCALHOST", false, SsrfPolicy.blockInternal).ok);
 }
 
 unittest  // allowUserConfigured permits loopback and private targets (user-chosen endpoint)
