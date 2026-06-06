@@ -64,6 +64,13 @@ jobs:
     needs: build-docs
     if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    # GitHub Pages allows one in-flight deployment at a time; without a shared
+    # queue, two publishes started close together (e.g. two releases) supersede
+    # each other and the superseded one is marked "failure". A dedicated `pages`
+    # concurrency group with cancel-in-progress:false serialises them instead.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     permissions:
       pages: write
       id-token: write
