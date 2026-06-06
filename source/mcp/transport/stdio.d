@@ -588,9 +588,12 @@ private struct StdinLineReader
 			if (!dropping)
 				acc ~= rest[0 .. nl];
 			bufPos += nl + 1;
-			if (dropping)
+			// Enforce the size cap here too: when the line and its newline land in the
+			// same chunk the no-newline accumulation path above never runs, so the cap
+			// must also be checked on the newline-found path. An over-long line (already
+			// dropping, or only now over the cap) is discarded and a fresh one started.
+			if (dropping || acc.length > maxLineBytes)
 			{
-				// Drop this over-long line and start a fresh one.
 				dropping = false;
 				acc = null;
 				continue;
@@ -680,6 +683,16 @@ unittest  // StdinLineReader drops an over-long line and resumes reading after t
 		cast(ubyte[]) "1111\ntail\n".dup
 	]);
 	assert(lines == ["a", "tail"], "over-long line dropped, reading resumes after its newline");
+}
+
+unittest  // StdinLineReader drops an over-long line whose terminating newline shares its chunk
+{
+	// maxLineBytes = 8. The over-long line and its newline arrive in the SAME chunk,
+	// so the no-newline accumulation path (which enforces the cap) is never taken.
+	// The size cap must still be enforced on the newline-found path: the over-long
+	// line is dropped and the following short line still comes through.
+	auto lines = drainLineReader(8, [cast(ubyte[]) "aaaaaaaaaaaa\ntail\n".dup]);
+	assert(lines == ["tail"], "over-long line with same-chunk newline must still be dropped");
 }
 
 unittest  // StdinLineReader reassembles a line split across two refills
