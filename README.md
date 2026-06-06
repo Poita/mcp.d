@@ -97,6 +97,15 @@ built-in loopback redirect listener for the interactive auth-code flow.
     are missing).
   - **macOS:** `brew install openssl@3`, then export
     `PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"` so dub can find it.
+  - **Windows:** install OpenSSL 3.x (e.g. `choco install openssl`) and ensure its
+    `bin` directory is on `PATH` so the runtime DLLs are found.
+
+### Platform support
+
+Linux, macOS, and Windows are all supported and exercised in CI (Linux/macOS with
+DMD and LDC, Windows with LDC). The stdio transport, the OS CSPRNG, and the OAuth
+token store each have native Windows code paths; on Windows the token store
+tightens file permissions via ACLs rather than POSIX modes.
 
 ## Build & test
 
