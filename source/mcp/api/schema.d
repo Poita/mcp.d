@@ -160,43 +160,55 @@ Json jsonSchemaOf(T)() @safe
 	return s;
 }
 
+/// Emit facet UDAs from a compile-time sequence `udas` (e.g. from
+/// `__traits(getAttributes, …)`) onto a property schema `prop`.  Handles
+/// `@minimum`, `@maximum`, `@title`, `@format`, `@minLength`, `@maxLength`,
+/// `@pattern`, `@minItems`, `@maxItems`, and `@schemaDefault`.  UDA values not
+/// matching any facet type are silently ignored.
+package void applyUdaFacets(udas...)(ref Json prop) @safe
+{
+	import mcp.api.attributes : minimum, maximum, title, SchemaDefault, format,
+		minLength, maxLength, pattern, minItems, maxItems;
+	import std.traits : isInstanceOf;
+
+	static foreach (uda; udas)
+	{
+		static if (is(typeof(uda) == minimum))
+			prop["minimum"] = Json(uda.value);
+		else static if (is(typeof(uda) == maximum))
+			prop["maximum"] = Json(uda.value);
+		else static if (is(typeof(uda) == title))
+			prop["title"] = Json(uda.value);
+		else static if (is(typeof(uda) == format))
+			prop["format"] = Json(uda.value);
+		else static if (is(typeof(uda) == minLength))
+			prop["minLength"] = Json(cast(long) uda.value);
+		else static if (is(typeof(uda) == maxLength))
+			prop["maxLength"] = Json(cast(long) uda.value);
+		else static if (is(typeof(uda) == pattern))
+			prop["pattern"] = Json(uda.value);
+		else static if (is(typeof(uda) == minItems))
+			prop["minItems"] = Json(cast(long) uda.value);
+		else static if (is(typeof(uda) == maxItems))
+			prop["maxItems"] = Json(cast(long) uda.value);
+		else static if (isInstanceOf!(SchemaDefault, typeof(uda)))
+			prop["default"] = schemaDefaultJson(uda.value);
+	}
+}
+
 /// Emit the field-level facet UDAs (`@minimum`, `@maximum`, `@title`,
 /// `@schemaDefault`) declared on `T.field` onto its property schema `prop`.
 /// Fields without these UDAs are left untouched.
 private void applyFieldFacets(T, string field)(ref Json prop) @safe
 {
-	import mcp.api.attributes : fieldDescription, minimum, maximum, title,
-		SchemaDefault, format, minLength, maxLength, pattern, minItems, maxItems;
+	import mcp.api.attributes : fieldDescription;
 	import std.traits : getUDAs, hasUDA;
 
 	alias member = __traits(getMember, T, field);
 
 	static if (hasUDA!(member, fieldDescription))
 		prop["description"] = Json(getUDAs!(member, fieldDescription)[0].value);
-	static if (hasUDA!(member, minimum))
-		prop["minimum"] = Json(getUDAs!(member, minimum)[0].value);
-	static if (hasUDA!(member, maximum))
-		prop["maximum"] = Json(getUDAs!(member, maximum)[0].value);
-	static if (hasUDA!(member, title))
-		prop["title"] = Json(getUDAs!(member, title)[0].value);
-
-	// String facets (format / minLength / maxLength / pattern) and array
-	// facets (minItems / maxItems) for richer elicitation form schemas.
-	static if (hasUDA!(member, format))
-		prop["format"] = Json(getUDAs!(member, format)[0].value);
-	static if (hasUDA!(member, minLength))
-		prop["minLength"] = Json(cast(long) getUDAs!(member, minLength)[0].value);
-	static if (hasUDA!(member, maxLength))
-		prop["maxLength"] = Json(cast(long) getUDAs!(member, maxLength)[0].value);
-	static if (hasUDA!(member, pattern))
-		prop["pattern"] = Json(getUDAs!(member, pattern)[0].value);
-	static if (hasUDA!(member, minItems))
-		prop["minItems"] = Json(cast(long) getUDAs!(member, minItems)[0].value);
-	static if (hasUDA!(member, maxItems))
-		prop["maxItems"] = Json(cast(long) getUDAs!(member, maxItems)[0].value);
-
-	static foreach (uda; getUDAs!(member, SchemaDefault))
-		prop["default"] = schemaDefaultJson(uda.value);
+	applyUdaFacets!(__traits(getAttributes, __traits(getMember, T, field)))(prop);
 }
 
 /// Serialize a `@schemaDefault` value into its JSON wire form. An `enum` value
