@@ -458,6 +458,8 @@ private Nullable!CacheHint collectCache(alias overload)() @safe
 		static if (is(typeof(a) == cache))
 		{
 			{
+				static assert(a.scope_ == "public" || a.scope_ == "private",
+						"@cache scope_ must be \"public\" or \"private\", got: " ~ a.scope_);
 				CacheHint h;
 				h.ttl = a.ttl;
 				h.cacheScope = (a.scope_ == "private") ? CacheScope.private_ : CacheScope.public_;
@@ -1787,6 +1789,22 @@ unittest  // @cache UDA: pre-draft resources/read has NO cache fields (no wire r
 	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
 	assert("ttlMs" !in rr["result"]);
 	assert("cacheScope" !in rr["result"]);
+}
+
+version (unittest) private class InvalidCacheScopeApi
+{
+	@resource("ext://bad", "Bad", "application/json")
+	@cache(5.seconds, "Private")
+	string bad() @safe
+	{
+		return "{}";
+	}
+}
+
+unittest  // @cache: an unrecognised scope_ value is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new InvalidCacheScopeApi)));
 }
 
 version (unittest)
