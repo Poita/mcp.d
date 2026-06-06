@@ -1,6 +1,6 @@
 # Security Policy
 
-`dlang-mcp-sdk` (the D MCP SDK) implements the Model Context Protocol, including
+`mcp.d` (the D MCP SDK) implements the Model Context Protocol, including
 OAuth 2.1 token handling, DNS-rebinding protection, and the Streamable HTTP
 transport. Because it sits on the trust boundary between MCP clients and servers,
 we take security reports seriously and ask that they be disclosed responsibly.
