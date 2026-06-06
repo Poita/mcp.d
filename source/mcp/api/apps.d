@@ -497,3 +497,47 @@ unittest  // setUiToolMeta preserves other _meta keys already on the tool
 	assert(j["_meta"]["category"].get!string == "demo");
 	assert(j["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget");
 }
+
+version (unittest) private final class UiToolApi
+{
+	import mcp.api.attributes : tool, ui;
+
+	@tool("render", "Render a widget")
+	@ui("ui://demo/widget", "model", "app")
+	string render(string spec) @safe
+	{
+		return spec;
+	}
+
+	@tool("plain", "A tool with no UI link")
+	string plain() @safe
+	{
+		return "x";
+	}
+}
+
+unittest  // @ui UDA attaches _meta.ui to a reflected @tool
+{
+	import mcp.api.reflection : registerHandlers;
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new UiToolApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+
+	Json renderTool, plainTool;
+	foreach (i; 0 .. tools.length)
+	{
+		const n = tools[i]["name"].get!string;
+		if (n == "render")
+			renderTool = tools[i];
+		else if (n == "plain")
+			plainTool = tools[i];
+	}
+	assert(renderTool["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget");
+	assert(renderTool["_meta"]["ui"]["visibility"][0].get!string == "model");
+	assert(renderTool["_meta"]["ui"]["visibility"][1].get!string == "app");
+	// A tool without @ui carries no _meta.
+	assert("_meta" !in plainTool);
+}

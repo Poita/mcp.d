@@ -217,6 +217,30 @@ struct icon
 	string theme; /// optional theme preference: "light" or "dark" (empty = unset)
 }
 
+/// UDA linking a `@tool`-annotated method to an MCP Apps UI resource (the MCP
+/// Apps `_meta.ui` field on `Tool`). `resourceUri` points at the `ui://`
+/// resource a host renders for this tool; the optional trailing `visibility`
+/// roles name who may invoke the tool ("model" and/or "app"). The reflection
+/// layer folds this into the tool's `_meta.ui`, merging with any `@meta` object.
+///
+/// Example:
+/// ---
+/// @tool("get_weather", "Show the weather dashboard")
+/// @ui("ui://weather/dashboard", "model", "app")
+/// WeatherData getWeather(string city) { ... }
+/// ---
+struct ui
+{
+	string resourceUri; /// the `ui://` resource the tool renders
+	string[] visibility; /// optional roles permitted to call the tool
+
+	this(string resourceUri, string[] visibility...) @safe pure nothrow
+	{
+		this.resourceUri = resourceUri;
+		this.visibility = visibility.dup;
+	}
+}
+
 /// UDA attaching a descriptor-level `_meta` object to a `@tool`, `@resource`,
 /// or `@resourceTemplate`-annotated method (the MCP `_meta` field on `Tool`,
 /// `Resource`, `ResourceTemplate`). The supplied JSON must be an object; it is
