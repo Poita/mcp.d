@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spec replaced it with the SEP-2663 extension below. Those methods now answer
   `-32601`.
 
+## [0.0.1] - 2026-06-06
+
 ### Added
 
 - **MCP Tasks extension** (`io.modelcontextprotocol/tasks`, SEP-2663) for
@@ -63,4 +65,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Second audit-driven fix wave: pre-production readiness fixes covering
   transport edge cases, version negotiation, and OAuth flow corner cases.
 
-[Unreleased]: https://github.com/Poita/mcp.d/commits/main
+[Unreleased]: https://github.com/Poita/mcp.d/compare/v0.0.1...HEAD
+[0.0.1]: https://github.com/Poita/mcp.d/releases/tag/v0.0.1
