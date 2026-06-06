@@ -600,9 +600,10 @@ private bool matchesType(Json value, string type) @safe
 			return true;
 		if (value.type == Json.Type.float_)
 		{
-			import std.math : floor;
+			import std.math : floor, isFinite;
 
-			return value.get!double == floor(value.get!double);
+			auto v = value.get!double;
+			return isFinite(v) && v == floor(v);
 		}
 		return false;
 	case "number":
@@ -614,6 +615,22 @@ private bool matchesType(Json value, string type) @safe
 		// Unknown / unsupported type keyword: do not report a failure.
 		return true;
 	}
+}
+
+unittest  // matchesType rejects infinity and NaN as integer
+{
+	import vibe.data.json : Json;
+
+	auto intSchema = Json.emptyObject;
+	intSchema["type"] = "integer";
+
+	// +inf, -inf, and NaN are not valid integers
+	assert(validateAgainstSchema(Json(double.infinity), intSchema).length > 0);
+	assert(validateAgainstSchema(Json(-double.infinity), intSchema).length > 0);
+	assert(validateAgainstSchema(Json(double.nan), intSchema).length > 0);
+
+	// Finite integral floats remain valid
+	assert(validateAgainstSchema(Json(42.0), intSchema) == "");
 }
 
 unittest  // scalar schemas
