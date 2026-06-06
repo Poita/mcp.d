@@ -3,7 +3,7 @@
 	"description": "MCP Sampling example (server + self-verifying client e2e) over BOTH stdio and Streamable HTTP for mcp.d (#354)",
 	"license": "Apache-2.0",
 	"dependencies": {
-		"mcp": { "path": "../.." },
+		"mcp-d": { "path": "../.." },
 		"examples-common": { "path": "../common" }
 	},
 	"configurations": [

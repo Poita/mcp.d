@@ -3,7 +3,7 @@
 	"description": "OAuth 2.1 (Authorization) MCP example: protected Streamable HTTP server + self-verifying client e2e",
 	"license": "Apache-2.0",
 	"dependencies": {
-		"mcp": { "path": "../.." },
+		"mcp-d": { "path": "../.." },
 		"examples-common": { "path": "../common" }
 	},
 	"configurations": [

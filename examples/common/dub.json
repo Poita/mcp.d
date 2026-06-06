@@ -6,6 +6,6 @@
 	"sourcePaths": ["source"],
 	"importPaths": ["source"],
 	"dependencies": {
-		"mcp": { "path": "../.." }
+		"mcp-d": { "path": "../.." }
 	}
 }

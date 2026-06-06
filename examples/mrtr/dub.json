@@ -3,7 +3,7 @@
 	"description": "MRTR (multi round-trip) example: stateless inputRequired/inputResponses over BOTH stdio and Streamable HTTP, using the typed SEP-2322 builders and the examples/common scaffold.",
 	"license": "Apache-2.0",
 	"dependencies": {
-		"mcp": {
+		"mcp-d": {
 			"path": "../.."
 		},
 		"examples-common": {

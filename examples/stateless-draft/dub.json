@@ -3,7 +3,7 @@
 	"description": "Stateless (draft) MCP protocol over Streamable HTTP: server/discover, per-request _meta, enableDraft()/connect(), CacheableResult freshness hints",
 	"license": "Apache-2.0",
 	"dependencies": {
-		"mcp": { "path": "../.." },
+		"mcp-d": { "path": "../.." },
 		"examples-common": { "path": "../common" }
 	},
 	"configurations": [
