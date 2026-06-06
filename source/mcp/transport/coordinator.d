@@ -18,8 +18,10 @@ Json throwOrReturn(Json result, Json error, string defaultMsg) @safe
 {
 	if (error.type != Json.Type.undefined)
 	{
-		const code = ("code" in error) ? error["code"].get!int : ErrorCode.internalError;
-		const m = ("message" in error) ? error["message"].get!string : defaultMsg;
+		const code = ("code" in error && error["code"].type == Json.Type.int_) ? error["code"]
+			.get!int : ErrorCode.internalError;
+		const m = ("message" in error && error["message"].type == Json.Type.string) ? error["message"]
+			.get!string : defaultMsg;
 		throw new McpException(code, m, error);
 	}
 	return result;
@@ -339,4 +341,38 @@ unittest  // cancel drops an unawaited registration without leaking
 	coord.cancel(5);
 	// A subsequent resolve for the cancelled id matches nothing.
 	assert(!coord.resolve(Json(5L), Json.emptyObject, Json.undefined));
+}
+
+unittest  // throwOrReturn yields McpException with internalError when "code" is not an integer
+{
+	import std.exception : assertThrown;
+	import vibe.data.json : parseJsonString;
+
+	// A peer that sends "code" as a string must not throw JSONException; it must
+	// throw McpException with the internalError fallback code.
+	Json error = parseJsonString(`{"code":"not-an-int","message":"bad"}`);
+	McpException caught;
+	try
+		throwOrReturn(Json.undefined, error, "fallback");
+	catch (McpException e)
+		caught = e;
+	assert(caught !is null, "expected McpException, got nothing");
+	assert(caught.code == ErrorCode.internalError);
+}
+
+unittest  // throwOrReturn yields McpException with defaultMsg when "message" is not a string
+{
+	import vibe.data.json : parseJsonString;
+
+	// A peer that sends "message" as a number must not throw JSONException; the
+	// default message must be used instead.
+	Json error = parseJsonString(`{"code":-32600,"message":42}`);
+	McpException caught;
+	try
+		throwOrReturn(Json.undefined, error, "my-default");
+	catch (McpException e)
+		caught = e;
+	assert(caught !is null, "expected McpException, got nothing");
+	assert(caught.code == -32600);
+	assert(caught.msg == "my-default");
 }
