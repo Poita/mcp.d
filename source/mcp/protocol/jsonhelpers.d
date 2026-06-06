@@ -112,10 +112,17 @@ bool tryGet(N : Nullable!T, T)(Json j, string key, ref N val) @safe
 	assert(s == "orig");
 }
 
-@safe unittest  // Nullable tryGet preserves a pre-set non-null val when key is absent
+@safe unittest  // tryGet(Nullable) sets the wrapped value and returns true when key is present
 {
-	import std.typecons : nullable;
+	Json j = Json.emptyObject;
+	j["name"] = "hello";
+	Nullable!string n;
+	assert(tryGet(j, "name", n));
+	assert(!n.isNull && n.get == "hello");
+}
 
+@safe unittest  // tryGet(Nullable) leaves a pre-set non-null val untouched and returns false when key is absent
+{
 	Json j = Json.emptyObject;
 	Nullable!string s = "sentinel";
 	assert(!tryGet(j, "missing", s));
