@@ -434,6 +434,36 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 
 	override void register(string registrationHandle, const string[] redirectUris) @safe
 	{
+		// If the handle already exists, decrement refCounts for its current URIs
+		// and remove it from the order queue before re-registering, so stale URIs
+		// do not remain visible via isRegistered after the handle is overwritten.
+		if (auto existing = registrationHandle in byHandle)
+		{
+			foreach (u; *existing)
+			{
+				if (auto c = u in refCount)
+				{
+					if (*c <= 1)
+						refCount.remove(u);
+					else
+						*c = *c - 1;
+				}
+			}
+			byHandle.remove(registrationHandle);
+			// Remove the handle from the order queue (keep only the first occurrence,
+			// removing it so the re-registration gets a fresh slot at the back).
+			size_t found = size_t.max;
+			foreach (i, h; order)
+			{
+				if (h == registrationHandle)
+				{
+					found = i;
+					break;
+				}
+			}
+			if (found != size_t.max)
+				order = (order[0 .. found] ~ order[found + 1 .. $]).dup;
+		}
 		string[] uris;
 		foreach (u; redirectUris)
 			uris ~= u;
@@ -1339,4 +1369,21 @@ unittest  // CONSTRUCTOR SECURITY: a loopback http baseUrl is accepted for local
 	cfg.baseUrl = "http://127.0.0.1:8080"; // loopback dev config is allowed
 	auto proxy = new OAuthProxy(cfg); // must not throw
 	assert(proxy !is null);
+}
+
+unittest  // REDIRECT REGISTRY: re-registering the same handle drops old URIs from refCount
+{
+	// A duplicate-handle registration must decrement refCounts for the old URIs
+	// before overwriting the handle entry, so that isRegistered never returns true
+	// for a URI whose registration no longer exists.
+	auto reg = new InMemoryRedirectUriRegistry(2);
+	reg.register("same-handle", ["https://old.example.com/cb"]);
+	reg.register("same-handle", ["https://new.example.com/cb"]);
+	// Force eviction of the (now phantom) duplicate order entry by adding a third handle.
+	reg.register("h3", ["https://h3.example.com/cb"]);
+	// The old URI is no longer part of any live registration.
+	assert(!reg.isRegistered("https://old.example.com/cb"));
+	// The new URI and h3 URI remain registered.
+	assert(reg.isRegistered("https://new.example.com/cb"));
+	assert(reg.isRegistered("https://h3.example.com/cb"));
 }
