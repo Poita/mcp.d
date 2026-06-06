@@ -304,11 +304,14 @@ final class McpClient : ClientProtocol
 	/// Build a client over the Streamable HTTP transport at `url`. `connectTimeout`
 	/// bounds every raw TCP connect the transport makes, so a connect that cannot
 	/// complete (e.g. the local ephemeral-port range is exhausted) fails with a typed
-	/// error instead of hanging indefinitely.
+	/// error instead of hanging indefinitely. `maxInFlight` optionally caps the
+	/// number of POSTs in flight at once (0 = unlimited); excess requests await a
+	/// permit rather than opening another socket, bounding socket/ephemeral-port use.
 	static McpClient http(string url, Implementation clientInfo = Implementation(
-			"dlang-mcp-client", "0.1.0"), Duration connectTimeout = 30.seconds) @safe
+			"dlang-mcp-client", "0.1.0"), Duration connectTimeout = 30.seconds,
+			uint maxInFlight = 0) @safe
 	{
-		auto transport = new HttpClientTransport(url);
+		auto transport = new HttpClientTransport(url, maxInFlight);
 		transport.setConnectTimeout(connectTimeout);
 		return new McpClient(transport, clientInfo);
 	}
