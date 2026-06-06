@@ -301,7 +301,11 @@ private struct IoResult
 /// after the read is parked on a socket fd. Adopting the fd through the matching
 /// eventcore API (pipes vs sockets) makes server->client requests (elicit/sample)
 /// work over stdio with both kinds of host.
-private struct StdioEnd
+///
+/// POSIX adopts the dup'd fd into eventcore (pipe or socket). Windows has no
+/// working eventcore pipe driver for an inherited stdio handle, so its `StdioEnd`
+/// (defined below) bridges a blocking reader thread to the loop instead.
+version (Posix) private struct StdioEnd
 {
 	import eventcore.driver : PipeFD, StreamSocketFD;
 
@@ -399,6 +403,132 @@ private struct StdioEnd
 	}
 }
 
+/// Windows stdin/stdout end. eventcore's WinAPI pipe driver is unimplemented, so
+/// an inherited console/pipe HANDLE cannot be adopted as an async pipe. The read
+/// end is pumped by a dedicated daemon thread doing blocking `ReadFile`, which
+/// hands byte chunks to the cooperative read loop through a thread-safe vibe
+/// `Channel`; `readOnce` drains that channel, yielding the calling fiber (not the
+/// event-loop thread) until a chunk arrives or stdin reaches end-of-input. The
+/// write end issues a blocking `WriteFile` inline -- MCP frames are small and the
+/// host drains stdout promptly, so the brief loop stall is acceptable.
+else version (Windows) private struct StdioEnd
+{
+	import core.sys.windows.windef : HANDLE, DWORD;
+	import core.sys.windows.winbase : INVALID_HANDLE_VALUE, ReadFile, WriteFile;
+	import vibe.core.channel : Channel, createChannel;
+	import core.thread : Thread;
+
+	private HANDLE handle_;
+	private bool valid_;
+	private bool isRead_;
+	// Read end only: the chunk channel fed by the reader thread.
+	private Channel!(immutable(ubyte)[]) chan_;
+
+	/// Adopt `h` (the process's stdin) and start pumping it on a daemon thread.
+	static StdioEnd adoptRead(HANDLE h) @safe
+	{
+		StdioEnd e;
+		e.handle_ = h;
+		e.isRead_ = true;
+		e.valid_ = isValidHandle(h);
+		if (!e.valid_)
+			return e;
+		e.chan_ = createChannel!(immutable(ubyte)[])();
+		auto chan = e.chan_;
+		() @trusted {
+			auto t = new Thread({ pumpStdin(h, chan); });
+			t.isDaemon = true;
+			t.start();
+		}();
+		return e;
+	}
+
+	/// Adopt `h` (the process's stdout) for blocking writes; no thread needed.
+	static StdioEnd adoptWrite(HANDLE h) @safe
+	{
+		StdioEnd e;
+		e.handle_ = h;
+		e.valid_ = isValidHandle(h);
+		return e;
+	}
+
+	/// Whether the adopted handle is usable.
+	bool valid() @safe
+	{
+		return valid_;
+	}
+
+	/// Close the read channel so a parked `readOnce` observes end-of-input. The
+	/// daemon reader thread exits when stdin reaches EOF (or with the process); it
+	/// is never joined, so a thread still parked in `ReadFile` cannot hold teardown.
+	void releaseRef() @safe
+	{
+		if (isRead_ && valid_)
+			() @trusted { chan_.close(); }();
+	}
+
+	/// Drain the next chunk the reader thread produced into `buf`, blocking the
+	/// calling fiber (not the event-loop thread) until a chunk arrives or stdin
+	/// reaches EOF (channel closed -> `disconnected`, mirroring a 0-byte POSIX read).
+	IoResult readOnce(ubyte[] buf) @safe
+	{
+		import eventcore.driver : IOStatus;
+
+		immutable(ubyte)[] chunk;
+		const got = () @trusted { return chan_.tryConsumeOne(chunk); }();
+		if (!got)
+			return IoResult(IOStatus.disconnected, 0);
+		const n = chunk.length <= buf.length ? chunk.length : buf.length;
+		buf[0 .. n] = chunk[0 .. n];
+		return IoResult(IOStatus.ok, n);
+	}
+
+	/// Write the whole `bytes` frame with a blocking `WriteFile` loop. A failed or
+	/// short write surfaces as `IOStatus.error` so `DuplexChannel.send` observes the
+	/// broken channel rather than silently dropping replies.
+	IoResult writeAll(const(ubyte)[] bytes) @safe
+	{
+		import eventcore.driver : IOStatus;
+
+		size_t off;
+		while (off < bytes.length)
+		{
+			DWORD wrote;
+			const ok = () @trusted {
+				return WriteFile(handle_, cast(const(void)*)(bytes.ptr + off),
+						cast(DWORD)(bytes.length - off), &wrote, null) != 0;
+			}();
+			if (!ok || wrote == 0)
+				return IoResult(IOStatus.error, off);
+			off += wrote;
+		}
+		return IoResult(IOStatus.ok, off);
+	}
+
+	private static bool isValidHandle(HANDLE h) @safe
+	{
+		return h !is null && h !is INVALID_HANDLE_VALUE;
+	}
+
+	/// Reader-thread body: blocking `ReadFile` into 32 KiB chunks, each handed to
+	/// the fiber through the channel; a failed/0-byte read closes the channel to
+	/// signal EOF. Chunks are <= the reader loop's refill buffer (64 KiB), so
+	/// `readOnce` never has to split a chunk across calls.
+	private static void pumpStdin(HANDLE h, Channel!(immutable(ubyte)[]) chan) @system
+	{
+		ubyte[32 * 1024] buf;
+		for (;;)
+		{
+			DWORD got;
+			const ok = ReadFile(h, cast(void*) buf.ptr, cast(DWORD) buf.length, &got, null) != 0;
+			if (!ok || got == 0)
+				break;
+			chan.put(buf[0 .. got].idup);
+		}
+		chan.close();
+	}
+}
+
 /// Owns the dup()'d, vibe-adopted copies of fd 0/1 plus the saved descriptor flags
 /// of the real fd 0/1, encapsulating runStdio's fd lifecycle ceremony.
 ///
@@ -406,7 +536,7 @@ private struct StdioEnd
 /// vibe-async pipes; `release` restores the saved flags on fd 0/1 and then releases
 /// the adopted dups. The exact ordering runStdio relies on is preserved: restore
 /// the flags BEFORE releasing, so the restore operates on still-valid descriptors.
-private struct AdoptedStdio
+version (Posix) private struct AdoptedStdio
 {
 	StdioEnd inFD;
 	StdioEnd outFD;
@@ -483,6 +613,41 @@ private struct AdoptedStdio
 			if (outFlags != -1)
 				fcntl(1, F_SETFL, outFlags);
 		}();
+		inFD.releaseRef();
+		outFD.releaseRef();
+	}
+}
+
+/// Windows counterpart: there is no fd dup/`O_NONBLOCK` ceremony because the
+/// transport does not adopt the handles into eventcore. `acquire` takes the
+/// process's stdin/stdout handles via `GetStdHandle` (the read end spins up its
+/// pump thread); `release` closes the read channel so the read loop ends. The
+/// real stdin/stdout handles are never closed, so code running after `runStdio`
+/// still inherits them.
+else version (Windows) private struct AdoptedStdio
+{
+	StdioEnd inFD;
+	StdioEnd outFD;
+
+	static AdoptedStdio acquire() @safe
+	{
+		import core.sys.windows.winbase : GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE;
+
+		AdoptedStdio a;
+		auto hIn = () @trusted { return GetStdHandle(STD_INPUT_HANDLE); }();
+		auto hOut = () @trusted { return GetStdHandle(STD_OUTPUT_HANDLE); }();
+		a.inFD = StdioEnd.adoptRead(hIn);
+		a.outFD = StdioEnd.adoptWrite(hOut);
+		if (!a.inFD.valid() || !a.outFD.valid())
+		{
+			a.inFD.releaseRef();
+			throw new Exception("runStdio: failed to acquire Windows stdin/stdout handles");
+		}
+		return a;
+	}
+
+	void release() @safe
+	{
 		inFD.releaseRef();
 		outFD.releaseRef();
 	}
@@ -713,7 +878,7 @@ unittest  // StdinLineReader discards a partial (unterminated) fragment at EOF a
 	assert(lines == [], "a trailing line without a newline must be discarded at EOF");
 }
 
-unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with its O_NONBLOCK bit unchanged
+version (Posix) unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with its O_NONBLOCK bit unchanged
 {
 	// Mirrors runStdio's fd lifecycle: save the original flags, dup the fd,
 	// adopt the dup, then on teardown restore the saved flags BEFORE releaseRef.
@@ -759,7 +924,7 @@ unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with 
 			"original fd's O_NONBLOCK bit changed across the adopt/releaseRef cycle");
 }
 
-unittest  // StdioEnd.adopt routes a socket fd through the sockets driver, a pipe fd through pipes
+version (Posix) unittest  // StdioEnd.adopt routes a socket fd through the sockets driver, a pipe fd through pipes
 {
 	// A libuv/Node host (the MCP Inspector, Claude Desktop, …) hands the child a
 	// unix-domain socket as stdin; a pipe-based host / vibe spawn hands a FIFO. The
