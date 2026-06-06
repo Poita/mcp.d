@@ -698,13 +698,13 @@ struct ClientCapabilities
 		final switch (cap)
 		{
 		case ClientCapability.sampling:
-			return sampling;
+			return sampling || samplingTools || samplingContext;
 		case ClientCapability.samplingTools:
 			return samplingTools;
 		case ClientCapability.samplingContext:
 			return samplingContext;
 		case ClientCapability.elicitation:
-			return elicitation;
+			return elicitation || elicitationForm || elicitationUrl;
 		case ClientCapability.elicitationForm:
 			return elicitationForm;
 		case ClientCapability.elicitationUrl:
@@ -723,6 +723,18 @@ unittest  // supports() reads the field backing each ClientCapability
 	assert(c.supports(ClientCapability.roots));
 	assert(!c.supports(ClientCapability.samplingTools));
 	assert(!c.supports(ClientCapability.elicitationUrl));
+}
+
+unittest  // supports(.elicitation) implies elicitationForm and elicitationUrl sub-caps
+{
+	ClientCapabilities c = {elicitationUrl: true};
+	assert(c.supports(ClientCapability.elicitation)); // implied by elicitationUrl
+	ClientCapabilities d = {elicitationForm: true};
+	assert(d.supports(ClientCapability.elicitation)); // implied by elicitationForm
+	ClientCapabilities e = {samplingTools: true};
+	assert(e.supports(ClientCapability.sampling)); // implied by samplingTools
+	ClientCapabilities f = {samplingContext: true};
+	assert(f.supports(ClientCapability.sampling)); // implied by samplingContext
 }
 
 unittest  // missingFrom: an unmet sampling requirement is reported
