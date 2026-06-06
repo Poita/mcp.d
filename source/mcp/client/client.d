@@ -382,6 +382,7 @@ final class McpClient : ClientProtocol
 	{
 		useModern = true;
 		negotiated = ProtocolVersion.modern;
+		transport.setDraftProtocol(true);
 	}
 
 	/// `server/discover` (draft): fetch the server's supported versions,
@@ -522,6 +523,7 @@ final class McpClient : ClientProtocol
 		{
 			useModern = true;
 			negotiated = chosen;
+			transport.setDraftProtocol(true);
 			// No initialize handshake follows on the stateless draft path, so
 			// capture what `server/discover` advertised; otherwise the caller
 			// would have no way to inspect the server's capabilities/identity.
@@ -4075,6 +4077,10 @@ version (unittest)
 		}
 
 		void setBearerToken(string token) @safe
+		{
+		}
+
+		void setDraftProtocol(bool isDraft) @safe
 		{
 		}
 

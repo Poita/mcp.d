@@ -146,6 +146,11 @@ final class HttpClientTransport : ClientTransport
 	// next request `deliver()` throws a clear "session expired" error rather than
 	// silently issuing requests under a dead session.
 	private bool sessionExpired;
+	// True when the negotiated protocol version is modern (2026-07-28 / draft).
+	// The draft removed Last-Event-ID resumption and standalone GET SSE streams;
+	// postAndAwait skips resumeViaGet when this is set so the pointless 405
+	// round-trip to a draft server is avoided.
+	private bool draftProtocol;
 	// Set by `close()` to ask the background stream readers to stop between reads;
 	// the held sockets are closed so a blocked read returns immediately.
 	private shared(bool) closeRequested;
@@ -217,6 +222,14 @@ final class HttpClientTransport : ClientTransport
 	void setBearerToken(string token) @safe
 	{
 		bearerToken = token;
+	}
+
+	/// Mark whether the negotiated protocol version is modern (2026-07-28 / draft).
+	/// When true, `postAndAwait` skips Last-Event-ID resumption via GET because the
+	/// draft removed SSE resumability; a draft server responds to such a GET with 405.
+	void setDraftProtocol(bool isDraft) @safe
+	{
+		draftProtocol = isDraft;
 	}
 
 	/// Stop the transport: signal the background stream readers
@@ -397,7 +410,9 @@ final class HttpClientTransport : ClientTransport
 		// Premature stream close with an SSE `retry:` hint: wait the prescribed
 		// delay, then RESUME the stream with a GET carrying `Last-Event-ID`
 		// (per Streamable HTTP resumability — not a re-POST of the request).
-		if (cursor.retryMs > 0)
+		// The draft (2026-07-28) removed resumability; a draft server responds with
+		// 405, so skip the GET when the negotiated version is modern.
+		if (cursor.retryMs > 0 && !draftProtocol)
 		{
 			sleep(cursor.retryMs.msecs);
 			resumeViaGet(expectId, cursor.lastEventId, result, got, err);
@@ -673,8 +688,8 @@ final class HttpClientTransport : ClientTransport
 					return;
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, ep.host);
-				const req = buildHttpRequest("GET", ep.path, ep.host, "text/event-stream",
-						"keep-alive", false, verHeaders, lastEventId, null);
+				const req = buildHttpRequest("GET", ep.path, ep.host,
+						"text/event-stream", "keep-alive", true, verHeaders, lastEventId, null);
 				conn.write(cast(const(ubyte)[]) req);
 
 				bool chunked;
@@ -1072,7 +1087,7 @@ final class HttpClientTransport : ClientTransport
 					auto conn = openClientStream(sock, ep.tls, ep.host);
 
 					const req = buildHttpRequest("GET", ep.path, ep.host, "text/event-stream",
-							"keep-alive", false, verHeaders, cursor.lastEventId, null);
+							"keep-alive", true, verHeaders, cursor.lastEventId, null);
 					conn.write(cast(const(ubyte)[]) req);
 
 					bool chunked;
@@ -2283,4 +2298,45 @@ unittest  // warnIfInsecureBearer is a no-op when no bearer token is set
 	auto t = new HttpClientTransport("http://example.com/mcp");
 	t.warnIfInsecureBearer();
 	assert(!t.warnedInsecureBearer);
+}
+
+unittest  // resumeViaGet GET includes Authorization: Bearer when a bearer token is set
+{
+	// Regression: the GET paths (resumeViaGet, runServerStream) must pass
+	// includeAuth=true so the bearer token is forwarded on resume and standalone
+	// server-stream GETs against OAuth-protected 2025-era servers.
+	import std.algorithm : canFind;
+
+	auto t = new HttpClientTransport("https://host:8080/mcp");
+	t.setBearerToken("my-token");
+	const req = t.buildHttpRequest("GET", "/mcp", "host:8080", "text/event-stream",
+			"keep-alive", true, (string[string]).init, "last-id", null);
+	assert(req.canFind("Authorization: Bearer my-token"),
+			"GET resume path must include Authorization header when bearer token is set");
+}
+
+unittest  // runServerStream GET includes Authorization: Bearer when a bearer token is set
+{
+	// Regression: the standalone server->client stream GET passed includeAuth=false,
+	// so the bearer token was dropped on OAuth-protected 2025-era servers.
+	import std.algorithm : canFind;
+
+	auto t = new HttpClientTransport("https://host:8080/mcp");
+	t.setBearerToken("stream-token");
+	const req = t.buildHttpRequest("GET", "/mcp", "host:8080",
+			"text/event-stream", "keep-alive", true, (string[string]).init, null, null);
+	assert(req.canFind("Authorization: Bearer stream-token"),
+			"standalone server-stream GET must include Authorization header when bearer token is set");
+}
+
+unittest  // postAndAwait skips resumeViaGet when the session is in draft/modern mode
+{
+	// The draft (2026-07-28) removed Last-Event-ID resumption; a draft server responds
+	// to the GET with 405. skipDraftResumption gates the resume on !draftProtocol so
+	// the pointless GET round-trip is avoided when the negotiated version is modern.
+	auto t = new HttpClientTransport("https://host:8080/mcp");
+	assert(!t.draftProtocol,
+			"transport starts in non-draft mode; resumeViaGet is allowed by default");
+	t.draftProtocol = true;
+	assert(t.draftProtocol, "after setDraftProtocol(true) the transport skips resumeViaGet");
 }
