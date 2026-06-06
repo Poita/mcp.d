@@ -2670,6 +2670,8 @@ unittest  // cancel() refuses to cancel the initialize request per spec
 
 unittest  // sampling dispatch forwards a valid request to the delegate
 {
+	import mcp.protocol.types : Content;
+
 	auto c = McpClient.http("http://localhost");
 	bool delegateCalled;
 	string seenText;
@@ -2678,7 +2680,7 @@ unittest  // sampling dispatch forwards a valid request to the delegate
 		// The handler now receives the typed request, parsed from the wire.
 		if (request.messages.length)
 			seenText = request.messages[0].content.text;
-		return CreateMessageResult.init;
+		return CreateMessageResult.text("test-model", "reply");
 	};
 
 	// A SamplingMessage's content is a single content block (object) per the
@@ -3763,9 +3765,7 @@ unittest  // MRTR: resolveInputRequest routes a sampling request to onSampling
 {
 	auto c = McpClient.http("http://localhost/mcp");
 	c.onSampling = (CreateMessageRequest request) @safe {
-		CreateMessageResult r;
-		r.role = "assistant";
-		return r;
+		return CreateMessageResult.text("test-model", "reply");
 	};
 	InputResponse answer;
 	const ok = c.resolveInputRequest(InputRequest("s1", "sampling", Json.emptyObject), answer);
