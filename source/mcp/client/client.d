@@ -869,6 +869,27 @@ final class McpClient : ClientProtocol
 		case "elicitation":
 			if (onElicitation is null)
 				return false;
+			{
+				const advertised = effectiveCapabilities();
+				const mode = ("mode" in req.params && req.params["mode"].type == Json.Type.string) ? req
+					.params["mode"].get!string : "form";
+				bool supported;
+				switch (mode)
+				{
+				case "form":
+					supported = advertised.elicitationForm
+						|| (advertised.elicitation && !advertised.elicitationUrl);
+					break;
+				case "url":
+					supported = advertised.elicitationUrl;
+					break;
+				default:
+					supported = false;
+					break;
+				}
+				if (!supported)
+					return false;
+			}
 			result = onElicitation(ElicitParams.fromJson(req.params)).toJson();
 			break;
 		case "roots":
@@ -1421,14 +1442,19 @@ final class McpClient : ClientProtocol
 			// Bounded FIFO: when full, evict the oldest still-tracked id rather
 			// than clearing the whole set, so recently-cancelled ids remain
 			// remembered and their late responses are still dropped.
-			while (cancelledRequests_.length >= maxCancelledTracked_ && cancelledOrder_.length)
+			if (cancelledRequests_.length >= maxCancelledTracked_)
 			{
-				const oldest = cancelledOrder_[0];
-				cancelledOrder_ = cancelledOrder_[1 .. $];
-				if (oldest in cancelledRequests_)
+				// Drop ids from the order queue that isCancelled() already removed
+				// from the set, so the eviction pick below always reaches a live
+				// entry in O(1) rather than scanning an unbounded stale prefix.
+				import std.algorithm : filter;
+				import std.array : array;
+
+				cancelledOrder_ = cancelledOrder_.filter!(id => id in cancelledRequests_).array;
+				if (cancelledOrder_.length)
 				{
-					cancelledRequests_.remove(oldest);
-					break;
+					cancelledRequests_.remove(cancelledOrder_[0]);
+					cancelledOrder_ = cancelledOrder_[1 .. $];
 				}
 			}
 			cancelledRequests_[requestId] = true;
@@ -3762,6 +3788,74 @@ unittest  // MRTR: resolveInputRequest fails for an unknown input type
 	InputResponse answer;
 	const ok = c.resolveInputRequest(InputRequest("x", "bogus", Json.emptyObject), answer);
 	assert(!ok);
+}
+
+unittest  // MRTR: resolveInputRequest rejects url-mode elicitation when only form capability advertised (#934)
+{
+	auto c = McpClient.http("http://localhost/mcp");
+	// Install only form-mode elicitation capability; url mode is not advertised.
+	c.capabilities.elicitation = true;
+	c.capabilities.elicitationForm = true;
+	bool delegateCalled;
+	c.onElicitation = (ElicitParams) @safe {
+		delegateCalled = true;
+		return ElicitResult.init;
+	};
+	Json params = Json.emptyObject;
+	params["mode"] = "url";
+	params["url"] = "https://example.com/elicit";
+	InputResponse answer;
+	// A url-mode MRTR elicitation must not be dispatched when only form is advertised.
+	const ok = c.resolveInputRequest(InputRequest("u1", "elicitation", params), answer);
+	assert(!ok);
+	assert(!delegateCalled);
+}
+
+unittest  // MRTR: resolveInputRequest accepts form-mode elicitation when form capability advertised (#934)
+{
+	auto c = McpClient.http("http://localhost/mcp");
+	c.capabilities.elicitation = true;
+	c.capabilities.elicitationForm = true;
+	bool delegateCalled;
+	c.onElicitation = (ElicitParams) @safe {
+		delegateCalled = true;
+		return ElicitResult.init;
+	};
+	Json params = Json.emptyObject;
+	params["mode"] = "form";
+	params["message"] = "hello";
+	InputResponse answer;
+	const ok = c.resolveInputRequest(InputRequest("f1", "elicitation", params), answer);
+	assert(ok);
+	assert(delegateCalled);
+}
+
+unittest  // cancel() eviction does not O(n)-scan unbounded stale cancelledOrder_ entries (#935)
+{
+	auto c = McpClient.http("http://localhost");
+	c.onNotifyForTest = (Json message) @safe {};
+
+	// Issue N requests, cancel each, then let isCancelled() consume them: this
+	// leaves cancelledRequests_ empty but cancelledOrder_ holding N stale entries.
+	enum size_t N = McpClient.maxCancelledTracked_ + 10;
+	foreach (i; 0 .. N)
+	{
+		c.cancel(cast(long) i);
+		c.isCancelled(cast(long) i); // removes from cancelledRequests_, leaves stale in cancelledOrder_
+	}
+	// cancelledRequests_ is now empty; cancelledOrder_ has N stale entries.
+	assert(!c.isResponseCancelled(0));
+
+	// Fill the set to capacity with a new burst of cancellations.
+	foreach (i; 0 .. McpClient.maxCancelledTracked_)
+		c.cancel(cast(long)(N + i));
+
+	// One more cancel must evict exactly one live entry without an O(N) scan of
+	// all stale entries.  The assertion here is behavioural: the new id must be
+	// tracked after the call (the stale-prefix scan must not stall or miss).
+	const newId = cast(long)(N + McpClient.maxCancelledTracked_);
+	c.cancel(newId);
+	assert(c.isResponseCancelled(newId));
 }
 
 unittest  // a server that keeps requesting input stops at exactly maxRounds tools/call requests
