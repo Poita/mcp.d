@@ -10,18 +10,20 @@ import vibe.data.json : Json;
 
 @safe:
 
-/// The `Json.Type` that backs a `tryGet`/`getOr` of type `T`. Kept explicit so
-/// the supported set stays auditable; unsupported `T` fails to compile.
-private template jsonTypeFor(T)
+/// Returns true when `t` is a JSON type that can legitimately hold a value of
+/// type `T`. For integral `T`, both `Type.int_` and `Type.bigInt` are accepted:
+/// vibe.d parses JSON integers that exceed `long.max` as `Type.bigInt`, and its
+/// `get!T` already enforces range, so the type guard must not exclude them.
+private bool typeMatchesFor(T)(Json.Type t) pure nothrow @safe @nogc
 {
 	static if (is(T == string))
-		enum jsonTypeFor = Json.Type.string;
+		return t == Json.Type.string;
 	else static if (is(T == bool))
-		enum jsonTypeFor = Json.Type.bool_;
+		return t == Json.Type.bool_;
 	else static if (isIntegral!T)
-		enum jsonTypeFor = Json.Type.int_;
+		return t == Json.Type.int_ || t == Json.Type.bigInt;
 	else static if (isFloatingPoint!T)
-		enum jsonTypeFor = Json.Type.float_;
+		return t == Json.Type.float_;
 	else
 		static assert(false, "jsonhelpers: unsupported scalar type " ~ T.stringof);
 }
@@ -34,7 +36,7 @@ T getOr(T)(Json j, string key, T fallback) @safe
 	if (j.type != Json.Type.object)
 		return fallback;
 	auto p = key in j;
-	if (p is null || p.type != jsonTypeFor!T)
+	if (p is null || !typeMatchesFor!T(p.type))
 		return fallback;
 	return (*p).get!T;
 }
@@ -47,7 +49,7 @@ bool tryGet(T)(Json j, string key, ref T val) @safe if (!is(T : Nullable!U, U))
 	if (j.type != Json.Type.object)
 		return false;
 	auto p = key in j;
-	if (p is null || p.type != jsonTypeFor!T)
+	if (p is null || !typeMatchesFor!T(p.type))
 		return false;
 	val = (*p).get!T;
 	return true;
@@ -92,6 +94,31 @@ bool tryGet(N : Nullable!T, T)(Json j, string key, ref N val) @safe
 	j["flag"] = true;
 	assert(j.getOr("count", 0L) == 7);
 	assert(j.getOr("flag", false) == true);
+}
+
+@safe unittest  // getOr accepts a bigInt-typed node for ulong and does not silently return the fallback
+{
+	import vibe.data.json : parseJsonString;
+
+	// long.max + 1 = 9223372036854775808 is stored as Type.bigInt by vibe.d;
+	// the type guard must accept it so get!ulong can produce a result rather
+	// than silently discarding the value by returning the fallback.
+	Json j = parseJsonString(`{"size": 9223372036854775808}`);
+	// The fallback is 0; with the guard fixed, getOr delegates to get!ulong
+	// which returns long.max for this value (vibe.d's bigInt-to-ulong behaviour).
+	// Either way, the result must not be the fallback 0.
+	assert(j.getOr("size", 0UL) != 0UL);
+}
+
+@safe unittest  // tryGet accepts a bigInt-typed node for ulong and returns true (does not silently leave val untouched)
+{
+	import vibe.data.json : parseJsonString;
+
+	// long.max + 1 is stored as Type.bigInt by vibe.d; tryGet must return true.
+	Json j = parseJsonString(`{"size": 9223372036854775808}`);
+	ulong val = 0;
+	assert(tryGet(j, "size", val));
+	assert(val != 0UL);
 }
 
 @safe unittest  // tryGet assigns and reports true on a matching field
