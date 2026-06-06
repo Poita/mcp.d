@@ -203,9 +203,14 @@ else version (DragonFlyBSD)
 
 // BCryptGenRandom is a WINAPI (`__stdcall`) function, so it must be bound with
 // extern(Windows). extern(C) would mismatch the calling convention and corrupt
-// the stack on 32-bit Windows.
-version (Windows) private extern (Windows) int BCryptGenRandom(void* hAlgorithm,
-		scope ubyte* pbBuffer, uint cbBuffer, uint dwFlags) @system nothrow @nogc;
+// the stack on 32-bit Windows. The symbol lives in bcrypt.dll; link its import
+// library so the reference resolves (druntime does not link it implicitly).
+version (Windows)
+{
+	pragma(lib, "bcrypt");
+	private extern (Windows) int BCryptGenRandom(void* hAlgorithm,
+			scope ubyte* pbBuffer, uint cbBuffer, uint dwFlags) @system nothrow @nogc;
+}
 
 // ===========================================================================
 // Tests

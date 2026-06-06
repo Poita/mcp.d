@@ -5,6 +5,10 @@ import core.time : Duration, MonoTime, minutes;
 import mcp.protocol.errors : McpException, internalError;
 import mcp.server.connection : ConnectionState;
 
+// fillSecureRandom binds BCryptGenRandom from bcrypt.dll on Windows; druntime
+// does not link its import library implicitly, so request it here.
+version (Windows) pragma(lib, "bcrypt");
+
 /// A string-keyed cache of `V` with a per-entry insertion/activity timestamp,
 /// bounded by an idle TTL and a maximum live-entry count. It owns the value map
 /// and the parallel timestamp map together so the "remove from both" invariant
