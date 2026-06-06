@@ -113,9 +113,20 @@ final class DuplexChannel
 				continue; // blank line, ignore
 			try
 				handleLine(line);
-			catch (Exception)
+			catch (Exception e)
 			{
-				// One malformed/erroring line must not kill the loop; skip it.
+				// One malformed/erroring line — or a notification handler that throws —
+				// must not kill the loop; log the failure so it is visible rather than
+				// silently discarded, then continue with the next line.
+				import std.stdio : stderr;
+
+				() @trusted nothrow{
+					try
+						stderr.writeln("[mcp.transport.duplex] readLoop: ", e.message);
+					catch (Exception)
+					{
+					}
+				}();
 			}
 		}
 		closed_ = true;
@@ -574,6 +585,92 @@ unittest  // when a batch handler is installed (server path) a batch line is rou
 	// The per-member dispatcher was never called; the raw batch was handed over whole.
 	assert(members == 0, "a batch must not be split when a batch handler is installed");
 	assert(wholeRaw == batch, "the batch handler must receive the whole raw line");
+}
+
+unittest  // an exception thrown by the onInbound notification handler is logged to stderr, not silently swallowed
+{
+	// When the synchronous onInbound delegate throws for a notification (e.g.
+	// a notifications/cancelled handler encountering an unexpected requestId type),
+	// the exception must produce a diagnostic on stderr so the failure is visible;
+	// silent swallowing makes notification-handler bugs completely invisible at runtime.
+	// This test also verifies the read loop continues after the throwing notification
+	// so a subsequent valid notification is still dispatched.
+	import core.sys.posix.unistd : pipe, close, read;
+	import core.sys.posix.fcntl : fcntl, F_SETFL, O_NONBLOCK;
+
+	int[2] errPipe;
+	assert(() @trusted { return pipe(errPipe); }() == 0, "pipe() failed");
+	scope (exit)
+		() @trusted { close(errPipe[0]); }();
+
+	// Save the real stderr fd and redirect stderr to the write end of the pipe.
+	import std.stdio : stderr;
+
+	const stderrFd = () @trusted { return stderr.fileno(); }();
+	const savedStderrFd = () @trusted {
+		import core.sys.posix.unistd : dup;
+
+		return dup(stderrFd);
+	}();
+	scope (exit)
+	{
+		() @trusted {
+			import core.sys.posix.unistd : dup2;
+
+			stderr.flush();
+			dup2(savedStderrFd, stderrFd);
+			close(savedStderrFd);
+		}();
+	}
+	() @trusted {
+		import core.sys.posix.unistd : dup2;
+
+		dup2(errPipe[1], stderrFd);
+		close(errPipe[1]);
+	}();
+
+	auto inbound = new LineLink;
+	int goodSeen;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+			}, (Message m) @safe {
+				if (m.method == "notifications/bad")
+					throw new Exception("notification handler error: unexpected requestId type");
+				if (m.kind == MessageKind.notification)
+					goodSeen++;
+			});
+			channel.start();
+			// A notification whose handler throws.
+			inbound.put(`{"jsonrpc":"2.0","method":"notifications/bad"}`);
+			// A well-formed notification that must still be dispatched after the error.
+			inbound.put(
+				`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}`);
+			inbound.closeEnd();
+			foreach (_; 0 .. 12)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+
+	// Flush stderr (now pointing at the pipe) and read what was written to the pipe.
+	() @trusted { stderr.flush(); }();
+	// Make the read end non-blocking so we don't hang if nothing was written.
+	() @trusted { fcntl(errPipe[0], F_SETFL, O_NONBLOCK); }();
+	char[4096] buf;
+	const n = () @trusted { return read(errPipe[0], buf.ptr, buf.length); }();
+	const stderrOut = n > 0 ? () @trusted { return cast(string) buf[0 .. n].dup; }() : "";
+
+	// The good notification after the throwing one must still reach onInbound.
+	assert(goodSeen == 1, "read loop must continue and dispatch subsequent notifications");
+	// The thrown exception must produce a diagnostic on stderr, not be silently discarded.
+	assert(stderrOut.length > 0, "a notification handler exception must be logged to stderr");
 }
 
 unittest  // a malformed inbound line is answered with a null-id JSON-RPC error instead of silence
