@@ -317,9 +317,10 @@ struct RequestMeta
 		if (MetaKey.protocolVersion in meta && meta[MetaKey.protocolVersion].type
 				== Json.Type.string)
 			m.protocolVersion = meta[MetaKey.protocolVersion].get!string;
-		if (MetaKey.clientInfo in meta)
+		if (MetaKey.clientInfo in meta && meta[MetaKey.clientInfo].type == Json.Type.object)
 			m.clientInfo = Implementation.fromJson(meta[MetaKey.clientInfo]);
-		if (MetaKey.clientCapabilities in meta)
+		if (MetaKey.clientCapabilities in meta
+				&& meta[MetaKey.clientCapabilities].type == Json.Type.object)
 			m.clientCapabilities = ClientCapabilities.fromJson(meta[MetaKey.clientCapabilities]);
 		if (MetaKey.logLevel in meta && meta[MetaKey.logLevel].type == Json.Type.string)
 			m.logLevel = meta[MetaKey.logLevel].get!string;
@@ -1090,6 +1091,25 @@ unittest  // RequestMeta parses per-request _meta
 	assert(m.clientInfo.name == "c");
 	assert(m.clientCapabilities.sampling);
 	assert(m.logLevel.get == "debug");
+}
+
+unittest  // RequestMeta.fromParams ignores non-object clientInfo and clientCapabilities without throwing
+{
+	// A malicious or buggy peer may send a non-object value for clientInfo or
+	// clientCapabilities; the parser must treat them as absent rather than
+	// propagating a JSONException from the fromJson helpers.
+	import vibe.data.json : parseJsonString;
+
+	auto params = parseJsonString(`{"_meta":{"` ~ MetaKey.clientInfo ~ `":42,"`
+			~ MetaKey.clientCapabilities ~ `":"not-an-object"}}`);
+	RequestMeta m;
+	// Must not throw even though both values are not JSON objects.
+	m = RequestMeta.fromParams(params);
+	// Non-object values are treated as absent; scalar fields stay at their defaults.
+	assert(m.clientInfo.name == "");
+	assert(m.clientInfo.version_ == "");
+	assert(!m.clientCapabilities.sampling);
+	assert(!m.clientCapabilities.roots);
 }
 
 unittest  // DiscoverResult round-trips
