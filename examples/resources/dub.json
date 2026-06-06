@@ -1,6 +1,7 @@
 {
 	"name": "resources",
 	"description": "MCP Resources example (server + self-verifying e2e client) over BOTH stdio and Streamable HTTP.",
+	"license": "Apache-2.0",
 	"dependencies": {
 		"mcp-d": { "path": "../.." },
 		"examples-common": { "path": "../common" }
