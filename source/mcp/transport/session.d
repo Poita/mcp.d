@@ -65,10 +65,13 @@ struct BoundedExpiringMap(V)
 		return V.init;
 	}
 
-	/// Pointer to the live value for `key`, or `null` when absent. When `refresh`
-	/// is set, a hit stamps the entry as just-active so it survives the idle sweep.
+	/// Pointer to the live value for `key`, or `null` when absent. Sweeps expired
+	/// entries before the lookup so a session past its idle TTL is not returned.
+	/// When `refresh` is set, a hit stamps the entry as just-active so it survives
+	/// future idle sweeps.
 	V* get(string key, bool refresh) @safe
 	{
+		sweep(now());
 		if (auto p = key in values)
 		{
 			if (refresh)
@@ -426,6 +429,26 @@ unittest  // isActive sweeps expired entries without needing a create() to trigg
 	// No create() here — isActive() alone must detect expiry.
 	assert(!mgr.isActive(stale),
 			"isActive must return false for a session past its idle TTL without needing a create()");
+}
+
+unittest  // stateFor returns null for an expired session without needing a prior isActive()
+{
+	// get() must sweep before the lookup so that stateFor() cannot resurrect a
+	// session whose idle TTL has elapsed. Without the sweep, get(id, true) finds
+	// the expired entry, resets its timestamp to now(), and returns the stale
+	// ConnectionState — silently extending the session beyond its intended TTL.
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	auto mgr = new SessionManager(5.msecs, 0);
+	const stale = mgr.create();
+	assert(mgr.isActive(stale));
+	Thread.sleep(20.msecs);
+	// Call stateFor() directly without a prior isActive() — the session is expired.
+	assert(mgr.stateFor(stale) is null, "stateFor must return null for a session past its idle TTL");
+	// Confirm it was not resurrected: isActive() must also return false.
+	assert(!mgr.isActive(stale),
+			"stateFor must not resurrect an expired session by refreshing its timestamp");
 }
 
 unittest  // a disabled idle TTL and disabled cap leave sessions resident (historical behaviour)
