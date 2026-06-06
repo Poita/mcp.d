@@ -47,8 +47,8 @@ over either transport. It asserts concrete expected values:
   arg out of `required`; `magnitude`'s `v` arg is an object sub-schema;
 - the marker UDAs surface as the right `ToolAnnotations` hints (incl. the
   `@hintTitle`), read via the ergonomic `tool.toolAnnotations()` accessor;
-- `calc(add, 3, 4)` returns `structuredContent` `{op: 0, result: 7}` (the enum
-  field serializes as its ordinal);
+- `calc(add, 3, 4)` returns `structuredContent` `{op: "add", result: 7}` (the
+  enum field serializes by member name, not ordinal, via `EnumByNamePolicy`);
 - the optional `round` arg flows through (`mul(1/3, 1)` rounded to 2dp = 0.33);
 - the scalar-returning `magnitude(3,4)` wraps its `5` under `result`;
 - `greet("Ada")` returns the text `Hello, Ada!` with no `structuredContent`;
