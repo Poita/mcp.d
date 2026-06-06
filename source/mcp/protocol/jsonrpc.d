@@ -77,6 +77,15 @@ private void validateEnvelope(Json j) @safe
 	// notification and dropped.
 	if (("method" in j) && ("id" in j) && j["id"].type == Json.Type.null_)
 		throw invalidRequest("Request id MUST NOT be null");
+	// JSON-RPC 2.0 §5 allows a Number id but RECOMMENDS it have no fractional
+	// part. A fractional float id (e.g. 1.5) cannot round-trip cleanly as an
+	// integer and cannot be matched by a conformant implementation; reject it.
+	if (("id" in j) && j["id"].type == Json.Type.float_)
+	{
+		immutable v = j["id"].get!double;
+		if (v != cast(long) v)
+			throw invalidRequest("JSON-RPC id MUST NOT have a fractional part");
+	}
 	// A `method`-less message with a non-null `id` is a response. JSON-RPC 2.0 5
 	// requires a response to carry exactly one of `result`/`error`; otherwise
 	// `Message.kind` would silently classify a both-present reply as an error (the
@@ -217,8 +226,10 @@ string rpcIdString(Json id) @safe
 	case Json.Type.bigInt:
 		return id.toString();
 	case Json.Type.float_:
-		return id.get!double
-			.to!string;
+		immutable v = id.get!double;
+		if (v != cast(long) v)
+			throw invalidRequest("JSON-RPC id MUST NOT have a fractional part");
+		return (cast(long) v).to!string;
 	default:
 		return "";
 	}
@@ -229,6 +240,25 @@ unittest  // rpcIdString renders string and numeric ids, empties null
 	assert(rpcIdString(Json("abc")) == "abc");
 	assert(rpcIdString(Json(42)) == "42");
 	assert(rpcIdString(Json(null)) == "");
+}
+
+unittest  // rpcIdString rejects a float id with a fractional part
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(rpcIdString(Json(1.5)));
+}
+
+unittest  // rpcIdString accepts a whole-number float id and renders it as an integer
+{
+	assert(rpcIdString(Json(3.0)) == "3");
+}
+
+unittest  // parseMessage rejects a request with a fractional float id
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":1.5,"method":"ping"}`));
 }
 
 /// Build a notification object (no id).
