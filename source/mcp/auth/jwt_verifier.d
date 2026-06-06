@@ -484,6 +484,12 @@ private string ecJwkToPem(Jwk jwk) @trusted
 		return null;
 	if (EC_KEY_set_public_key(eckey, pt) != 1)
 		return null;
+	// Explicitly verify the public key is valid: the point lies on the P-256 curve,
+	// is not the point at infinity, and satisfies nQ = O. This guards against
+	// invalid-curve attacks on OpenSSL versions (< 1.1.0) where
+	// EC_POINT_set_affine_coordinates_GFp does not itself validate the point.
+	if (EC_KEY_check_key(eckey) != 1)
+		return null;
 
 	auto pkey = EVP_PKEY_new();
 	if (pkey is null)
@@ -1414,4 +1420,20 @@ unittest  // JwksCache.load() retains previous keys when parsing a malformed JWK
 	}
 	assert(cache.keysFor("rsa-1").length == 1,
 			"keys must survive a failed re-load (clear-then-parse bug)");
+}
+
+unittest  // ecJwkToPem rejects an EC point that is not on the P-256 curve
+{
+	// A valid P-256 x coordinate paired with an all-zero y does not satisfy the
+	// curve equation y^2 = x^3 - 3x + b (mod p), so the point is not on P-256.
+	// The function must return null (not silently produce a PEM for an invalid
+	// key). Without EC_KEY_check_key() this defence relied solely on
+	// EC_POINT_set_affine_coordinates_GFp, which does not validate on all OpenSSL
+	// versions (< 1.1.0). EC_KEY_check_key() provides the explicit check.
+	Jwk j;
+	j.kty = "EC";
+	j.crv = "P-256";
+	j.x = testEcX; // valid P-256 x coordinate
+	j.y = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // 32 zero bytes: not the correct y
+	assert(jwkToPem(j) is null, "off-curve EC point must be rejected");
 }
