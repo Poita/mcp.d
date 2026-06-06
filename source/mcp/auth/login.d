@@ -776,7 +776,12 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	auto ts = oauth.exchangeCode(as_, rc, captured.code, pkce.verifier);
 	if (ts.accessToken.length == 0)
 		throw internalError("OAuth token exchange returned no access token");
-	auto stored = StoredToken.fromTokenSet(ts, oauth.resource, now);
+	// Capture a fresh timestamp immediately after the exchange so that
+	// expiresAt = issuedAt + expiresIn reflects the actual token-issuance
+	// wall time, not the time useOAuth was entered (which predates the
+	// interactive browser wait by however long the user took to authenticate).
+	const long issuedAt = () @trusted { return Clock.currTime().toUnixTime(); }();
+	auto stored = StoredToken.fromTokenSet(ts, oauth.resource, issuedAt);
 	stored.clientId = rc.clientId;
 	store.save(oauth.resource, stored);
 	client.setBearerToken(stored.accessToken);
@@ -988,6 +993,29 @@ unittest  // fromTokenSet computes the absolute expiry from now + expires_in
 	assert(s.expiresAt == 4600);
 	assert(s.refreshToken == "r");
 	assert(s.resource == "https://mcp.example.com");
+}
+
+unittest  // fromTokenSet expiresAt is anchored to the timestamp passed in, not an earlier one
+{
+	// useOAuth must pass a timestamp captured AFTER exchangeCode() returns, not
+	// one captured at function entry. A stale entry-time timestamp (nowBefore)
+	// produces an expiresAt that is earlier than the correct post-exchange value
+	// (nowAfter + expiresIn), shortening the effective token lifetime by the
+	// duration of the interactive browser wait.
+	TokenSet ts;
+	ts.accessToken = "tok";
+	ts.expiresIn = 300;
+	const long nowBefore = 1_000_000; // simulates now captured before browser wait
+	const long nowAfter = nowBefore + 180; // simulates 3 minutes of browser interaction
+	const long expiresIn = 300;
+
+	auto stalePaths = StoredToken.fromTokenSet(ts, "https://mcp.example.com", nowBefore);
+	auto freshPath = StoredToken.fromTokenSet(ts, "https://mcp.example.com", nowAfter);
+
+	// The stale path expires 180 seconds earlier than the fresh path.
+	assert(freshPath.expiresAt == nowAfter + expiresIn);
+	assert(stalePaths.expiresAt == nowBefore + expiresIn);
+	assert(freshPath.expiresAt - stalePaths.expiresAt == 180);
 }
 
 unittest  // fromTokenSet keeps the previous refresh token when the AS omits one
