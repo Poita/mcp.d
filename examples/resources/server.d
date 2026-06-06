@@ -27,7 +27,7 @@
  *   stdio (default): dub run -c server
  *   http:            dub run -c server -- --http --port 8349
  */
-module server;
+module resources_server;
 
 import mcp;
 import mcp.api.attributes;

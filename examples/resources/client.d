@@ -42,7 +42,7 @@
  *   http:  dub run -c server -- --http --port 8349   # terminal 1
  *          dub run -c client -- --http http://127.0.0.1:8349/mcp   # terminal 2
  */
-module client;
+module resources_client;
 
 import std.stdio : writeln;
 import std.format : format;
