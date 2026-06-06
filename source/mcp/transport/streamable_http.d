@@ -297,7 +297,10 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		// correlates this POST with the GET stream that should receive the reply, so
 		// a response never leaks onto another client's stream.
 		const sessionId = req.query.get("sessionId", "");
-		cast(void) handleLegacyPostBody(server, channel, sessionId, payload);
+		// Resolve the per-stream ConnectionState so each client's dispatch runs
+		// against its own isolated state rather than the shared fallback.
+		auto connState = channel.connStateFor(sessionId);
+		cast(void) handleLegacyPostBody(server, channel, sessionId, payload, connState);
 		// All subsequent client messages are POSTed here; the response (if any)
 		// is delivered on the GET SSE stream, so the POST itself just acknowledges
 		// receipt with 202 Accepted and no body.
@@ -315,6 +318,10 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 /// so a response is routed back ONLY to the originating stream — never broadcast
 /// to other concurrently-connected clients (which would leak one client's results
 /// onto another client's stream).
+///
+/// Each registered listener owns a fresh `ConnectionState` so concurrent clients
+/// do not interfere with each other's negotiated version, client capabilities,
+/// subscriptions, or in-flight cancellation registry.
 final class LegacySseChannel
 {
 	private struct Listener
@@ -322,6 +329,7 @@ final class LegacySseChannel
 		long id;
 		string sessionId;
 		void delegate(string frame) @safe write;
+		ConnectionState connState;
 	}
 
 	private string endpointPath;
@@ -333,17 +341,18 @@ final class LegacySseChannel
 		this.endpointPath = endpointPath;
 	}
 
-	/// Register an open GET SSE stream. A fresh per-stream session token is minted
-	/// and the listener immediately receives the leading `endpoint` event
-	/// (basic/transports §HTTP with SSE: the server MUST send it "When a client
-	/// connects") whose URI carries that token, so a later POST can be correlated
-	/// back to exactly this stream. Returns the listener id.
+	/// Register an open GET SSE stream. A fresh per-stream session token and a
+	/// fresh per-stream `ConnectionState` are minted; the listener immediately
+	/// receives the leading `endpoint` event (basic/transports §HTTP with SSE:
+	/// the server MUST send it "When a client connects") whose URI carries that
+	/// token, so a later POST can be correlated back to exactly this stream.
+	/// Returns the listener id.
 	long addListener(void delegate(string frame) @safe write) @safe
 	{
 		const id = nextId++;
 		const sessionId = generateSessionId();
 		write(formatLegacyEndpointEvent(endpointWithSession(endpointPath, sessionId)));
-		listeners ~= Listener(id, sessionId, write);
+		listeners ~= Listener(id, sessionId, write, new ConnectionState);
 		return id;
 	}
 
@@ -355,6 +364,18 @@ final class LegacySseChannel
 		foreach (l; listeners)
 			if (l.id == id)
 				return l.sessionId;
+		return null;
+	}
+
+	/// The per-stream `ConnectionState` for the stream whose session token is
+	/// `sessionId`, or null when no matching open stream exists. The POST handler
+	/// passes this to `handleRaw` so each client's JSON-RPC dispatch runs against
+	/// its own isolated state (negotiated version, client capabilities, etc.).
+	ConnectionState connStateFor(string sessionId) @safe
+	{
+		foreach (l; listeners)
+			if (l.sessionId == sessionId)
+				return l.connState;
 		return null;
 	}
 
@@ -478,15 +499,19 @@ private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @
 /// route any response back onto the originating client's legacy GET SSE stream as a
 /// `message` event. `sessionId` is the per-stream token the client echoed from its
 /// `endpoint` event, so the response is delivered ONLY to the stream that issued
-/// this POST — never broadcast across concurrently-connected clients. Returns true
-/// (the server accepts every well-formed POST on this transport; a parse failure
-/// still yields a JSON-RPC error response delivered on the stream). A notification
-/// produces no response, so nothing is delivered. Exposed (package-level) so the
-/// two-endpoint flow can be exercised without a live socket.
+/// this POST — never broadcast across concurrently-connected clients. `conn` is the
+/// per-stream `ConnectionState` owned by the originating GET listener; passing it
+/// to `handleRaw` ensures each client's dispatch runs against its own isolated state
+/// (negotiated version, client capabilities, subscriptions) rather than the shared
+/// fallback. Returns true (the server accepts every well-formed POST on this
+/// transport; a parse failure still yields a JSON-RPC error response delivered on
+/// the stream). A notification produces no response, so nothing is delivered.
+/// Exposed (package-level) so the two-endpoint flow can be exercised without a
+/// live socket.
 bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
-		string sessionId, string payload) @safe
+		string sessionId, string payload, ConnectionState conn = null) @safe
 {
-	const responseText = server.handleRaw(payload);
+	const responseText = server.handleRaw(payload, conn);
 	channel.deliverTo(sessionId, responseText);
 	return true;
 }
@@ -2045,6 +2070,38 @@ unittest  // addListener does not leave a zombie entry when the initial write th
 		threw = true;
 	assert(threw, "write exception must propagate to the caller");
 	assert(ch.listenerCount == 0, "failed-write listener must not remain in the channel");
+}
+
+unittest  // legacy channel: each connected client gets its own isolated ConnectionState
+{
+	// Two concurrent legacy clients must not share a ConnectionState. Sharing one
+	// causes one client's initialize (which writes conn.negotiated / conn.clientCaps)
+	// to overwrite the other client's in-flight state. Each listener registered with
+	// LegacySseChannel must own a distinct ConnectionState instance.
+	import std.algorithm : canFind;
+
+	auto ch = new LegacySseChannel("/message");
+	string[] framesA;
+	string[] framesB;
+	const idA = ch.addListener((string f) @safe { framesA ~= f; });
+	const idB = ch.addListener((string f) @safe { framesB ~= f; });
+	const sidA = ch.sessionIdFor(idA);
+	const sidB = ch.sessionIdFor(idB);
+
+	auto stateA = ch.connStateFor(sidA);
+	auto stateB = ch.connStateFor(sidB);
+
+	// Each listener must have its own ConnectionState (not the same object).
+	assert(stateA !is null, "client A must have a ConnectionState");
+	assert(stateB !is null, "client B must have a ConnectionState");
+	assert(stateA !is stateB, "two concurrent legacy clients must not share one ConnectionState");
+
+	// Mutating one client's state must not affect the other.
+	import mcp.protocol.versions : ProtocolVersion;
+
+	stateA.negotiated = ProtocolVersion.v2025_03_26;
+	assert(stateB.negotiated != ProtocolVersion.v2025_03_26,
+			"client B's negotiated version must be independent of client A's");
 }
 
 unittest  // endpointWithSession appends the session token, preserving any existing query
