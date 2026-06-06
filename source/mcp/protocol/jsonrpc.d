@@ -77,6 +77,15 @@ private void validateEnvelope(Json j) @safe
 	// notification and dropped.
 	if (("method" in j) && ("id" in j) && j["id"].type == Json.Type.null_)
 		throw invalidRequest("Request id MUST NOT be null");
+	// JSON-RPC 2.0 §5 requires that `id` is a String, Number, or null. Bool,
+	// object, and array ids are not permitted; reject them so misrouted
+	// responses (e.g. two requests with bool ids both resolving to id string "")
+	// are caught at the boundary rather than silently mangled.
+	if (("id" in j) && j["id"].type != Json.Type.string
+			&& j["id"].type != Json.Type.int_
+			&& j["id"].type != Json.Type.float_
+			&& j["id"].type != Json.Type.bigInt && j["id"].type != Json.Type.null_)
+		throw invalidRequest("JSON-RPC id MUST be a String, Number, or null");
 	// JSON-RPC 2.0 §5 allows a Number id but RECOMMENDS it have no fractional
 	// part. A fractional float id (e.g. 1.5) cannot round-trip cleanly as an
 	// integer and cannot be matched by a conformant implementation; reject it.
@@ -494,4 +503,26 @@ unittest  // a response carrying neither result nor error is rejected
 	import std.exception : assertThrown;
 
 	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":1}`));
+}
+
+unittest  // boolean id is rejected (JSON-RPC 2.0 §5: id must be string, number, or null)
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":true,"method":"ping"}`));
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":false,"method":"ping"}`));
+}
+
+unittest  // object id is rejected (JSON-RPC 2.0 §5: id must be string, number, or null)
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":{},"method":"ping"}`));
+}
+
+unittest  // array id is rejected (JSON-RPC 2.0 §5: id must be string, number, or null)
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":[],"method":"ping"}`));
 }
