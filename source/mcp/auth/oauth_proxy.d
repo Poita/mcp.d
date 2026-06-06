@@ -351,7 +351,7 @@ bool isAllowedRedirectScheme(string redirectUri) @safe
 	if (redirectUri.startsWith("http://"))
 	{
 		const host = hostOf(redirectUri["http://".length .. $]);
-		return host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1";
+		return host == "127.0.0.1" || host == "localhost" || host == "[::1]";
 	}
 	return false;
 }
@@ -1170,6 +1170,12 @@ unittest  // SCHEME ALLOWLIST: http to loopback is accepted (RFC 8252)
 	assert(isAllowedRedirectScheme("http://127.0.0.1:8765/cb"));
 	assert(isAllowedRedirectScheme("http://localhost:5000/callback"));
 	assert(isAllowedRedirectScheme("http://[::1]:9000/cb"));
+}
+
+unittest  // SCHEME ALLOWLIST: bare (unbracketed) IPv6 loopback is rejected; RFC 3986 §3.2.2 requires brackets
+{
+	assert(!isAllowedRedirectScheme("http://::1/cb"));
+	assert(!isAllowedRedirectScheme("http://::1:8080/cb"));
 }
 
 unittest  // SCHEME ALLOWLIST: http to a non-loopback host is rejected
