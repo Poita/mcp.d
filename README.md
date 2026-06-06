@@ -301,7 +301,7 @@ vibe event loop — wrap your calls in a `runTask` under `runEventLoop()` (the
 examples' shared scaffold does this for you). The same API (`initialize` /
 `listTools` / `callTool` / `listResources` / `readResource` / `listPrompts` /
 `getPrompt` / `subscribe` / `setLogLevel`, plus the auto-paginated list helpers and
-`enableDraft()`) works over every transport. `McpClient.http(url)` builds a client
+`enableModern()`) works over every transport. `McpClient.http(url)` builds a client
 over Streamable HTTP; `McpClient.spawn(command)` / `McpClient.stdio(readLine,
 writeLine)` build one over stdio. The server side is `runStreamableHttp(server,
 port)` or `runStdio(server)`.

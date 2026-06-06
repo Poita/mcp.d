@@ -1,6 +1,6 @@
 {
 	"name": "stateless-draft",
-	"description": "Stateless (draft) MCP protocol over Streamable HTTP: server/discover, per-request _meta, enableDraft()/connect(), CacheableResult freshness hints",
+	"description": "Stateless (draft) MCP protocol over Streamable HTTP: server/discover, per-request _meta, enableModern()/connect(), CacheableResult freshness hints",
 	"license": "Apache-2.0",
 	"dependencies": {
 		"mcp-d": { "path": "../.." },

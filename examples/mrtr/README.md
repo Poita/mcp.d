@@ -106,7 +106,7 @@ Both sides use the shared `examples_common` scaffold (`dub` package
   loop uniformly and maps any thrown assertion to a non-zero exit;
 - the e2e assertions use the scaffold's shared **`check`** helper.
 
-Other client APIs: `enableDraft`, `discover`, `listTools`, `callTool` (which
+Other client APIs: `enableModern`, `discover`, `listTools`, `callTool` (which
 transparently drives the MRTR loop), `CallToolResult.isInputRequired` /
 `inputRequests` / `requestState`.
 

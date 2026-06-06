@@ -15,7 +15,7 @@ Cache hints let a server tell clients and intermediaries how long a result may
 be reused and by whom (`public` shared cache vs `private` per-client cache).
 They are **draft-only** (protocol `2026-07-28`): the server only emits the
 fields when the negotiated protocol is the stateless draft, and the client must
-opt in with `client.enableDraft()`.
+opt in with `client.enableModern()`.
 
 - **Per-resource hint** — `server.d` declares it with the `@cache(ttl, scope)`
   UDA (a `core.time.Duration`) on a `@resource` method; `registerHandlers` plumbs
@@ -31,7 +31,7 @@ opt in with `client.enableDraft()`.
   It rides on the `resources/list` result. (Valid list methods: `tools/list`,
   `resources/list`, `resources/templates/list`, `prompts/list`.)
 - **Consumer's-eye view** — `client.d` enables draft mode
-  (`client.enableDraft()`), then reads `list.cache.ttl` / `cacheScope` and
+  (`client.enableModern()`), then reads `list.cache.ttl` / `cacheScope` and
   `readResource(uri).cache.ttl` / `cacheScope` (each `.ttl` a `Duration`).
 
 A third resource (`status://live`) is registered with **no** hint, and the
