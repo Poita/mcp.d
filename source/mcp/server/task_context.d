@@ -202,10 +202,7 @@ void runTaskExecutor(TaskRuntime rt, string taskId, TaskExecutor executor) @safe
 	}
 	catch (McpException e)
 	{
-		Json err = Json.emptyObject;
-		err["code"] = cast(int) e.code;
-		err["message"] = e.msg;
-		rt.fail(taskId, err);
+		rt.fail(taskId, e);
 	}
 	catch (Exception e)
 	{
