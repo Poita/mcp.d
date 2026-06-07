@@ -14,6 +14,9 @@
 set -uo pipefail
 fail=0
 
+# Raise the file-descriptor limit; the D toolchain opens many files at once.
+ulimit -n 65536 2>/dev/null || true
+
 # Per-example HTTP port, kept distinct so the servers never collide.
 port_for() {
   case "$1" in
