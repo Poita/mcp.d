@@ -418,6 +418,13 @@ private string rsaJwkToPem(Jwk jwk) @trusted
 			BN_free(e);
 		return null;
 	}
+	// Reject keys shorter than 2048 bits (NIST SP 800-131A / RFC 8017).
+	if (BN_num_bits(n) < 2048)
+	{
+		BN_free(n);
+		BN_free(e);
+		return null;
+	}
 	auto rsa = RSA_new();
 	if (rsa is null)
 	{
@@ -1470,4 +1477,15 @@ unittest  // ecJwkToPem rejects an EC point that is not on the P-256 curve
 	j.x = testEcX; // valid P-256 x coordinate
 	j.y = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // 32 zero bytes: not the correct y
 	assert(jwkToPem(j) is null, "off-curve EC point must be rejected");
+}
+
+unittest  // rsaJwkToPem rejects RSA keys shorter than 2048 bits (NIST SP 800-131A)
+{
+	// 512-bit RSA modulus (base64url, no padding); well below the 2048-bit minimum.
+	enum smallN = "xqhAjKOZdfUx4SiVpGhYDk7vdz1cCNfyLHX9gQvRe26KRa4GNKf43jn51CAgM3lc_f3dTlqRRWbftgFovIPye0c";
+	Jwk j;
+	j.kty = "RSA";
+	j.n = smallN;
+	j.e = "AQAB";
+	assert(jwkToPem(j) is null, "sub-2048-bit RSA key must be rejected");
 }
