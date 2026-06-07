@@ -29,6 +29,7 @@ public import mcp.protocol.errors;
 public import mcp.protocol.jsonrpc;
 public import mcp.protocol.capabilities;
 public import mcp.protocol.types;
+public import mcp.protocol.tasks;
 public import mcp.protocol.sampling;
 
 // --- Server / client entry points ---
