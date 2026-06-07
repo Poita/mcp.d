@@ -288,18 +288,38 @@ final class StdioClientTransport : ClientTransport
 		auto c = winChild;
 		() @trusted { c.closeStdin(); }();
 
+		int status;
+		bool reaped;
 		Duration waited;
 		while (waited < grace)
 		{
 			auto t = () @trusted { return tryWait(c.pid); }();
 			if (t.terminated)
-				return t.status;
+			{
+				status = t.status;
+				reaped = true;
+				break;
+			}
 			() @trusted { sleep(50.msecs); }();
 			waited += 50.msecs;
 		}
+		if (!reaped)
+			status = () @trusted { kill(c.pid); return wait(c.pid); }();
 
-		() @trusted { kill(c.pid); }();
-		return () @trusted { return wait(c.pid); }();
+		// The child is gone, so its stdout write end is closed and the daemon reader
+		// thread hits EOF. Drain any chunks it still buffers (so it never parks on a
+		// full channel) until it closes the channel, then join it. A GC-touching
+		// daemon thread left alive into druntime shutdown faults (0xC0000005) on
+		// Windows and would lose buffered stdout, e.g. an example's final "OK:" line.
+		() @trusted {
+			string discard;
+			while (c.lines.tryConsumeOne(discard))
+			{
+			}
+			if (c.reader !is null)
+				c.reader.join(false);
+		}();
+		return status;
 	}
 }
 
@@ -370,15 +390,21 @@ version (Windows)
 
 /// Owned Windows child: the std.process pid plus the writable stdin handle.
 /// `close()` routes through `StdioClientTransport.closeWinChild`, which closes
-/// stdin (EOF) then terminates the process. The stdout reader runs on a daemon
-/// thread (see `pumpChildStdout`); it is not joined, mirroring the daemon stdin
-/// pump on the server side.
+/// stdin (EOF), terminates the process, then drains the stdout channel and joins
+/// the reader daemon thread (see `pumpChildStdout`) so it cannot touch the GC
+/// during druntime shutdown.
 version (Windows) private struct WinChild
 {
 	import std.process : Pid;
+	import core.thread : Thread;
 
 	Pid pid;
 	File childStdin;
+	// The daemon thread pumping the child's stdout, and the channel it feeds.
+	// closeWinChild drains the channel and joins the thread so no GC-touching
+	// daemon thread survives into druntime shutdown, which faults on Windows.
+	Thread reader;
+	Channel!string lines;
 	private bool stdinClosed_;
 
 	void closeStdin() @system
@@ -412,10 +438,12 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 	// Daemon reader: blocking reads on the child's stdout, lines pushed to `lines`.
 	auto lines = createChannel!string();
 	auto chan = lines;
+	child.lines = lines;
 	() @trusted {
 		auto t = new Thread({ pumpChildStdout(childStdout, chan, maxLineBytes); });
 		t.isDaemon = true;
 		t.start();
+		child.reader = t;
 	}();
 
 	string readLine() @safe
