@@ -334,44 +334,44 @@ lets a server answer a long-running `tools/call` with a durable task handle
 instead of blocking; the client polls `tasks/get` to completion, supplies
 mid-flight input via `tasks/update`, and may `tasks/cancel`. `enableTasks` turns
 it on (draft protocol only); the ergonomic way to expose a long-running tool is
-the `@task` UDA — a `@task` method becomes a tool whose `tools/call` returns a
+the `@task` UDA — a `@task` function becomes a tool whose `tools/call` returns a
 task handle immediately and whose body runs asynchronously, its typed return
-value becoming the task's final result:
+value becoming the task's final result. The injected `TaskContext` reports
+progress, observes cooperative cancellation, and elicits input mid-task; it is
+omitted from the tool's input schema (the typed params derive it):
 
 ```d
-import core.time : seconds, minutes;
-
-auto server = new McpServer("ci", "1.0.0");
-server.enableTasks();                   // advertise io.modelcontextprotocol/tasks
+server.enableTasks();   // advertise io.modelcontextprotocol/tasks
 
 struct BuildResult { bool passed; string log; }
 
-final class Ci
+@task("build", "Run a CI build (asynchronous).")
+@taskTtl(10.minutes) @taskPollInterval(2.seconds)
+BuildResult build(string gitRef, TaskContext tc) @safe
 {
-    // tools/call returns a task handle at once; this body runs on the task
-    // dispatcher and its return value becomes the task result. The injected
-    // TaskContext reports progress and observes cooperative cancellation; it is
-    // omitted from the tool's input schema (the typed params derive the schema).
-    @task("build", "Run a CI build (asynchronous).")
-    @taskTtl(10.minutes) @taskPollInterval(2.seconds)
-    BuildResult build(string gitRef, TaskContext tc) @safe
-    {
-        tc.progress("cloning " ~ gitRef);
-        // ... long-running work; `if (tc.cancelRequested) return ...;` to stop early
-        return BuildResult(true, "ok");
-    }
+    tc.progress("cloning " ~ gitRef);
+    return BuildResult(true, "ok");
 }
 
-registerHandlers(server, new Ci);       // wires the @task tool — no manual plumbing
+struct Approval { bool deploy; }
+
+@task("deploy", "Deploy a build, confirming with the client mid-task.")
+string deploy(string gitRef, TaskContext tc) @safe
+{
+    if (!tc.hasInput("ok"))
+        return tc.requireInput([InputRequest.elicitation!Approval("ok", "Deploy " ~ gitRef ~ "?")]);
+    return tc.inputAs!ElicitResult("ok").contentAs!Approval().deploy ? "deploying" : "skipped";
+}
 ```
 
-For human-in-the-loop, return `tc.requireInput([InputRequest.elicitation!T(...)])`
-to suspend the task into `input_required`; the client answers via `tasks/update`,
-the executor re-runs, and the answer is visible through `tc.hasInput` /
-`tc.inputAs`. Because the typed params are reconstituted from the task's durable
-input on every dispatch, the same handler is correct whether it runs in-process
-or is re-dispatched on another node. See [`examples/tasks`](examples/tasks/) for
-all three shapes (plain async, cancellable, and mid-task elicitation).
+`deploy` is human-in-the-loop: `tc.requireInput` suspends the task into
+`input_required`, the client answers via `tasks/update`, and the re-dispatched
+executor reads the answer through `tc.hasInput` / `tc.inputAs`. Because the typed
+params are reconstituted from the task's durable input on every dispatch, the same
+handler is correct whether it runs in-process or is re-dispatched on another node.
+Register `@task` functions like any other UDA handlers (`registerModule` /
+`registerHandlers`); see [`examples/tasks`](examples/tasks/) for the full set
+(plain async, cancellable, and mid-task elicitation) plus the matching client.
 
 The server serves `tasks/get`, `tasks/update`, and `tasks/cancel` against the
 task store (in-memory by default; pass your own `TaskStore` for durability and a
