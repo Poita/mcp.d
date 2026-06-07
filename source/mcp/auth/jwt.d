@@ -14,9 +14,8 @@ import deimos.openssl.bn;
 // absent. Declare it here when the binding omits it; this is a no-op when deimos
 // provides it (static if skips the duplicate).
 static if (!is(typeof(EVP_DigestSign)))
-    extern (C) @system nothrow @nogc
-    int EVP_DigestSign(EVP_MD_CTX* ctx, ubyte* sigret, size_t* siglen,
-        const(ubyte)* tbs, size_t tbslen);
+	extern (C) @system nothrow @nogc int EVP_DigestSign(EVP_MD_CTX* ctx,
+			ubyte* sigret, size_t* siglen, const(ubyte)* tbs, size_t tbslen);
 
 import mcp.auth.oauth : base64UrlNoPad;
 
