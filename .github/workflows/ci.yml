@@ -51,12 +51,16 @@ jobs:
       fail-fast: false
       matrix:
         compiler: [ldc-latest, dmd-latest]
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         # DMD ships no macOS/arm64 build and macos-latest is Apple Silicon,
         # so dmd-latest cannot install there; LDC covers macOS instead.
+        # On Windows we gate on LDC (the recommended production toolchain there)
+        # to get a clean signal before widening to DMD's MSVC link path.
         exclude:
           - compiler: dmd-latest
             os: macos-latest
+          - compiler: dmd-latest
+            os: windows-latest
 
     steps:
       - name: Checkout
@@ -74,6 +78,19 @@ jobs:
         run: |
           brew install openssl@3
           echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      # The windows-latest image ships OpenSSL 3.x under C:\Program Files\OpenSSL.
+      # Point the linker at its import libraries so the `openssl` / vibe-d:tls
+      # dependency resolves libssl/libcrypto. This wiring is the part most likely
+      # to need adjustment from the first Windows CI run.
+      - name: Configure OpenSSL 3.x (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ssl = "C:\Program Files\OpenSSL"
+          if (-not (Test-Path $ssl)) { choco install openssl --no-progress -y; $ssl = "C:\Program Files\OpenSSL" }
+          "OPENSSL_ROOT_DIR=$ssl" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$ssl\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Build
         run: dub build
@@ -134,3 +151,49 @@ jobs:
       # http: start the server, run the client against it, check the exit code).
       - name: Build + run all examples
         run: ./scripts/run-examples.sh
+
+  examples-windows:
+    name: examples (stdio e2e, Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install D compiler
+        uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-latest
+
+      - name: Configure OpenSSL 3.x (Windows)
+        shell: pwsh
+        run: |
+          $ssl = "C:\Program Files\OpenSSL"
+          if (-not (Test-Path $ssl)) { choco install openssl --no-progress -y }
+          "OPENSSL_ROOT_DIR=$ssl" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$ssl\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      # The stdio examples are the real exercise of the Windows threaded stdio
+      # transport: the client spawns the server binary and round-trips MCP over a
+      # real OS pipe (the in-memory unittests cannot reach this). elicitation and
+      # sampling additionally drive server->client requests over stdio, validating
+      # that the threaded reader preserves concurrency. The HTTP leg and its
+      # background-server/pkill dance from run-examples.sh are skipped here (bash
+      # process semantics are unreliable on the Windows runner); each client
+      # self-verifies and exits non-zero on any mismatch.
+      - name: stdio examples e2e
+        shell: pwsh
+        run: |
+          $examples = @('tools','resources','elicitation','sampling','prompts')
+          foreach ($e in $examples) {
+            Write-Host "::group::stdio example $e"
+            Push-Location "examples/$e"
+            # --combined compiles all dependency sources in one pass, avoiding the
+            # LDC/Windows COMDAT issue where D template instantiations split across
+            # static library objects become unresolved symbols at final link time.
+            dub build --combined -c server; if ($LASTEXITCODE) { Pop-Location; throw "build server: $e" }
+            dub build --combined -c client; if ($LASTEXITCODE) { Pop-Location; throw "build client: $e" }
+            dub run --combined -c client --quiet; if ($LASTEXITCODE) { Pop-Location; throw "stdio e2e: $e" }
+            Pop-Location
+            Write-Host "::endgroup::"
+          }
+          Write-Host "ALL WINDOWS STDIO EXAMPLES PASSED"

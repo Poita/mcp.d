@@ -5,6 +5,23 @@ import core.time : Duration, MonoTime, minutes;
 import mcp.protocol.errors : McpException, internalError;
 import mcp.server.connection : ConnectionState;
 
+// fillSecureRandom binds BCryptGenRandom from bcrypt.dll on Windows; druntime
+// does not link its import library implicitly, so request it here.
+version (Windows) pragma(lib, "bcrypt");
+
+// extern (Windows) declarations must be at module scope to receive C linkage;
+// inside a function body they get D name mangling and the linker cannot resolve
+// them against bcrypt.lib.
+version (Windows)
+{
+	import core.sys.windows.windows : ULONG, PUCHAR;
+
+	private alias NTSTATUS = int;
+	private enum ULONG BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002;
+	private extern (Windows) NTSTATUS BCryptGenRandom(void* hAlgorithm,
+			PUCHAR pbBuffer, ULONG cbBuffer, ULONG dwFlags) nothrow @nogc;
+}
+
 /// A string-keyed cache of `V` with a per-entry insertion/activity timestamp,
 /// bounded by an idle TTL and a maximum live-entry count. It owns the value map
 /// and the parallel timestamp map together so the "remove from both" invariant
@@ -551,14 +568,6 @@ private void fillSecureRandom(ubyte[] dst) @trusted
 		// BCryptGenRandom with BCRYPT_USE_SYSTEM_PREFERRED_RNG draws from the
 		// system-preferred CSPRNG without needing an algorithm handle. NTSTATUS 0
 		// (STATUS_SUCCESS) indicates success.
-		import core.sys.windows.windows : ULONG, PUCHAR;
-
-		alias NTSTATUS = int;
-		enum ULONG BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002;
-
-		extern (Windows) NTSTATUS BCryptGenRandom(void* hAlgorithm,
-				PUCHAR pbBuffer, ULONG cbBuffer, ULONG dwFlags) nothrow @nogc;
-
 		const status = BCryptGenRandom(null, cast(PUCHAR) dst.ptr,
 				cast(ULONG) dst.length, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 		if (status == 0)
