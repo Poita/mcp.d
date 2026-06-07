@@ -16,6 +16,8 @@ import mcp.server.request_state : RequestStateSecurity, RequestStateMode,
 	RequestStateBinding, RequestStateCodec, generateEphemeralKey;
 import mcp.server.task_store : TaskStore, InMemoryTaskStore;
 import mcp.server.task_runtime : TaskRuntime, TaskOptions;
+import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher,
+	InProcessTaskDispatcher, SyncTaskDispatcher, runTaskExecutor;
 import mcp.transport.sse_context : ServerPushChannel, StreamCoordinator, SubscriptionFilter;
 
 @safe:
@@ -153,6 +155,36 @@ struct ToolResponse
 		return ToolResponse.inputRequired(requests, serializeToJson(state).toString());
 	}
 
+	/// The handler created an asynchronous task: `j` is the `CreateTaskResult`
+	/// (`resultType:"task"`) returned verbatim in lieu of a `CallToolResult`. Task
+	/// results are draft-only; `forVersion` rejects them on a non-draft session.
+	static ToolResponse task(Json j) @safe
+	{
+		ToolResponse t;
+		t.isTask_ = true;
+		t.taskResult_ = j;
+		return t;
+	}
+
+	/// Whether this outcome is an asynchronous task handle (`CreateTaskResult`).
+	bool isTask() const @safe
+	{
+		return isTask_;
+	}
+
+	private bool isTask_;
+	private Json taskResult_;
+
+	/// The JSON-RPC `result` payload: the verbatim `CreateTaskResult` for a task
+	/// outcome, else the `InputRequiredResult` or final `CallToolResult`. Shadows
+	/// the mixed-in `toJson` to add the task case.
+	Json toJson() const @safe
+	{
+		if (isTask_)
+			return taskResult_;
+		return needsInput_ ? required_.toJson() : result_.toJson();
+	}
+
 	/// Project the final `CallToolResult` to the negotiated protocol version so
 	/// version-gated fields are not emitted to peers that don't understand them.
 	/// `CallToolResult.structuredContent` is a 2025-06-18+ field and is stripped
@@ -164,6 +196,13 @@ struct ToolResponse
 	/// projecting an off-schema result onto the wire.
 	ToolResponse forVersion(ProtocolVersion v) const @safe
 	{
+		if (isTask_)
+		{
+			if (!v.isModern)
+				throw internalError(
+						"tools/call handler returned a task result on a non-draft session");
+			return ToolResponse.task(taskResult_);
+		}
 		if (needsInput_)
 		{
 			if (!v.usesMRTR)
@@ -354,6 +393,8 @@ final class McpServer
 	private bool resourceSubscriptionsEnabled;
 	private bool tasksEnabled_;
 	private TaskRuntime taskRuntime_;
+	private TaskDispatcher taskDispatcher_;
+	private TaskExecutor[string] taskExecutors_;
 	private Json extensions = Json.undefined;
 	// Per-connection mutable state — negotiated protocol version, client
 	// capabilities, log level, subscriptions, and the `inFlight` cancellation
@@ -1116,18 +1157,66 @@ final class McpServer
 	/// Advertises the extension in `server/discover` capabilities (draft only) and
 	/// routes `tasks/get` / `tasks/update` / `tasks/cancel` against `store`
 	/// (default: in-memory). `opts` tunes the ID generator, default TTL / poll
-	/// interval, and TTL sweep cadence. The runtime emits `notifications/tasks` on
-	/// status changes via the server's notify path. Returns the `TaskRuntime` so
-	/// tools can create and resolve tasks.
-	TaskRuntime enableTasks(TaskStore store = null, TaskOptions opts = TaskOptions.init) @safe
+	/// interval, and TTL sweep cadence. `dispatcher` decides where a `@task`
+	/// executor runs (default: an in-process fiber; supply a queue-backed
+	/// dispatcher for a durable, multi-node deployment). The runtime emits
+	/// `notifications/tasks` on status changes via the server's notify path.
+	/// Returns the `TaskRuntime` so tools can create and resolve tasks.
+	TaskRuntime enableTasks(TaskStore store = null,
+			TaskOptions opts = TaskOptions.init, TaskDispatcher dispatcher = null) @safe
 	{
 		taskRuntime_ = new TaskRuntime((store is null) ? new InMemoryTaskStore() : store, opts);
+		taskDispatcher_ = (dispatcher is null) ? new InProcessTaskDispatcher() : dispatcher;
 		taskRuntime_.onStatusChange((Json detailed) @safe {
 			notify("notifications/tasks", detailed);
 		});
 		tasksEnabled_ = true;
 		advertiseExtension(tasksExtensionKey, Json.emptyObject);
 		return taskRuntime_;
+	}
+
+	/// Register a `@task` tool: a tool whose `tools/call` returns a task handle
+	/// immediately and runs `executor` asynchronously via the dispatcher. The
+	/// executor is stored by `descriptor.name` so the dispatcher can re-invoke it
+	/// on each `tasks/update`. `ttlMs` / `pollIntervalMs` seed the task's TTL and
+	/// suggested poll cadence (null inherits the runtime's defaults). Requires
+	/// `enableTasks` to have been called first. Used by the UDA reflection layer;
+	/// callable directly for dynamic task tools.
+	void registerTaskTool(Tool descriptor, TaskExecutor executor,
+			Nullable!Duration ttl = Nullable!Duration.init,
+			Nullable!Duration pollInterval = Nullable!Duration.init) @safe
+	{
+		if (taskRuntime_ is null)
+			throw internalError("registerTaskTool requires enableTasks() first");
+		taskExecutors_[descriptor.name] = executor;
+		const toolName = descriptor.name;
+		const ttlDur = ttl;
+		const pollDur = pollInterval;
+		registerDynamicTool(descriptor, (Json args, RequestContext) @safe {
+			import mcp.protocol.tasks : makeCreateTaskResult;
+
+			auto seed = taskRuntime_.createFor(toolName, args, ttlDur, pollDur);
+			taskDispatcher_.dispatch(seed.taskId, &runTaskExecutorById);
+			return ToolResponse.task(makeCreateTaskResult(seed));
+		});
+	}
+
+	/// Look up and run the executor bound to `taskId`'s tool, recording its outcome
+	/// on the durable task. Invoked by the dispatcher on creation and on each
+	/// resume. Fails the task if no executor is registered for its tool name.
+	private void runTaskExecutorById(string taskId) @safe
+	{
+		const name = taskRuntime_.toolName(taskId);
+		auto p = name in taskExecutors_;
+		if (p is null)
+		{
+			taskRuntime_.fail(taskId, Json([
+				"code": Json(cast(int) ErrorCode.methodNotFound),
+				"message": Json("no task executor registered for tool: " ~ name)
+			]));
+			return;
+		}
+		runTaskExecutor(taskRuntime_, taskId, *p);
 	}
 
 	/// The task runtime created by `enableTasks`, or null if tasks are not enabled.
@@ -2353,10 +2442,22 @@ final class McpServer
 
 	private Json doTasksUpdate(Json params, ProtocolVersion ver) @safe
 	{
+		import mcp.protocol.tasks : TaskStatus;
+
 		requireTasks(ver);
 		const id = requireTaskId(params);
 		Json responses = ("inputResponses" in params) ? params["inputResponses"] : Json.emptyObject;
 		taskRuntime_.deliverInput(id, responses); // throws -32602 for an unknown task
+		// Resume an executor-backed task that was waiting on this input: move it
+		// back to `working` and re-dispatch so the executor re-runs and consumes
+		// the delivered answers. Manual (executor-less) tasks are left as-is.
+		auto st = taskRuntime_.statusOf(id);
+		if (!st.isNull && st.get == TaskStatus.inputRequired
+				&& taskRuntime_.toolName(id).length > 0 && taskDispatcher_ !is null)
+		{
+			taskRuntime_.resumeWorking(id);
+			taskDispatcher_.dispatch(id, &runTaskExecutorById);
+		}
 		return Json.emptyObject; // empty acknowledgement
 	}
 
@@ -2897,7 +2998,7 @@ final class McpServer
 			// Validate the handler's (un-projected) output against the tool's
 			// declared outputSchema before version-shaping, so validation always
 			// sees the full structuredContent regardless of the negotiated version.
-			if (validateOutputSchema_)
+			if (validateOutputSchema_ && !response.isTask)
 				checkOutputSchema(entry.descriptor, response.toJson());
 			// Project the result to the negotiated protocol version so version-
 			// gated fields are not emitted to peers that don't understand them.
@@ -5754,6 +5855,69 @@ unittest  // tasks/update for an unknown taskId is -32602
 	Json up = Json(["taskId": Json("nope"), "inputResponses": Json.emptyObject]);
 	auto resp = s.handle(draftReq(1, "tasks/update", up)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // registerTaskTool: tools/call returns a task handle the executor completes
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	Tool desc;
+	desc.name = "dbl";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		auto n = tc.inputJson()["n"].get!int;
+		return Json(["structuredContent": Json(["result": Json(n * 2)])]);
+	});
+
+	auto call = s.handle(draftReq(1, "tools/call", Json([
+		"name": Json("dbl"),
+		"arguments": Json(["n": Json(21)])
+	]))).get;
+	assert(call["result"]["resultType"].get!string == "task");
+	const id = call["result"]["taskId"].get!string;
+
+	// The synchronous dispatcher ran the executor inline, so the task is already
+	// completed by the time we poll.
+	auto got = s.handle(draftReq(2, "tasks/get", Json(["taskId": Json(id)]))).get;
+	assert(got["result"]["status"].get!string == "completed");
+	assert(got["result"]["result"]["structuredContent"]["result"].get!int == 42);
+}
+
+unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
+{
+	import mcp.protocol.modern : InputRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	Tool desc;
+	desc.name = "gate";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		if (!tc.hasInput("ok"))
+			return tc.requireInput([InputRequest.elicitation("ok", "Proceed?")]);
+		return Json(["structuredContent": Json(["approved": tc.input("ok")])]);
+	});
+
+	auto call = s.handle(draftReq(1, "tools/call", Json([
+		"name": Json("gate"),
+		"arguments": Json.emptyObject
+	]))).get;
+	const id = call["result"]["taskId"].get!string;
+
+	// Inline run suspended into input_required, surfacing the elicitation.
+	auto blocked = s.handle(draftReq(2, "tasks/get", Json(["taskId": Json(id)]))).get;
+	assert(blocked["result"]["status"].get!string == "input_required");
+	assert(blocked["result"]["inputRequests"]["ok"]["method"].get!string == "elicitation/create");
+
+	// The answer resumes the executor (re-dispatched inline) to completion.
+	auto ack = s.handle(draftReq(3, "tasks/update", Json([
+		"taskId": Json(id),
+		"inputResponses": Json(["ok": Json(true)])
+	]))).get;
+	assert("error" !in ack);
+	auto done = s.handle(draftReq(4, "tasks/get", Json(["taskId": Json(id)]))).get;
+	assert(done["result"]["status"].get!string == "completed");
+	assert(done["result"]["result"]["structuredContent"]["approved"].get!bool);
 }
 
 unittest  // draft tools/call rejects with -32003 when a required client cap is undeclared

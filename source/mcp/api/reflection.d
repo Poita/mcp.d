@@ -12,6 +12,8 @@ import mcp.protocol.capabilities : Icon;
 import mcp.protocol.modern : CacheHint, CacheScope;
 import mcp.server.server : McpServer, ToolResponse;
 import mcp.server.context;
+import mcp.server.task_context : TaskContext;
+import mcp.server.task_runtime : TaskOptions;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
 import mcp.api.schema;
@@ -81,6 +83,8 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 				{
 					static if (is(typeof(attr) == tool))
 						registerToolMethod!(memberName, overload, parent)(server, attr);
+					else static if (is(typeof(attr) == task))
+						registerTaskMethod!(memberName, overload, parent)(server, attr);
 					else static if (is(typeof(attr) == prompt))
 						registerPromptMethod!(memberName, overload, parent)(server, attr);
 					else static if (is(typeof(attr) == resource))
@@ -189,7 +193,7 @@ private Json parametersSchema(alias func)() @safe
 	Json required = Json.emptyArray;
 	static foreach (i, P; types)
 	{
-		static if (!is(P : RequestContext))
+		static if (!is(P : RequestContext) && !is(P == TaskContext))
 		{
 			{
 				Json ps = jsonSchemaOf!P;
@@ -626,6 +630,100 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		else
 			return toToolResult(__traits(getMember, parent, memberName)(argv.expand));
 	});
+}
+
+private void registerTaskMethod(string memberName, alias overload, alias parent)(
+		McpServer server, task attr) @safe
+{
+	import std.traits : ReturnType;
+
+	rejectSingleArgMethodDescribe!overload();
+
+	// A task executor runs asynchronously, after the originating request has
+	// already returned a task handle — there is no live RequestContext to inject.
+	// Task methods observe progress/cancellation/input through a TaskContext.
+	static foreach (P; Parameters!overload)
+		static assert(!is(P : RequestContext),
+				"@task method '" ~ memberName ~ "' must not take a RequestContext "
+				~ "(the request has already returned); take a TaskContext instead.");
+	static assert(!is(ReturnType!overload == ToolResponse),
+			"@task method '" ~ memberName ~ "' must return a value (or void), not ToolResponse");
+
+	Tool descriptor;
+	descriptor.name = attr.name;
+	if (attr.description.length)
+		descriptor.description = nullable(attr.description);
+	if (attr.title.length)
+		descriptor.title = nullable(attr.title);
+	descriptor.inputSchema = parametersSchema!overload();
+	auto outSchema = outputSchemaOf!(ReturnType!overload)();
+	if (outSchema.type == Json.Type.object)
+		descriptor.outputSchema = outSchema;
+
+	// Behavioral-hint UDAs fold exactly as for @tool.
+	ToolAnnotations anns;
+	static foreach (a; __traits(getAttributes, overload))
+	{
+		static if (__traits(isSame, a, readOnly))
+			anns.readOnlyHint = true;
+		else static if (__traits(isSame, a, destructive))
+			anns.destructiveHint = true;
+		else static if (__traits(isSame, a, idempotent))
+			anns.idempotentHint = true;
+		else static if (__traits(isSame, a, openWorld))
+			anns.openWorldHint = true;
+		else static if (is(typeof(a) == hintTitle))
+		{
+			if (a.value.length)
+				anns.title = a.value;
+		}
+	}
+	if (!anns.empty)
+		descriptor.annotations = anns.toJson();
+	applyIconsAndMeta!overload(descriptor);
+
+	// Per-task timing from @taskTtl / @taskPollInterval; an absent UDA inherits the
+	// corresponding server default.
+	import core.time : Duration;
+
+	Nullable!Duration ttl;
+	Nullable!Duration pollInterval;
+	static foreach (a; __traits(getAttributes, overload))
+	{
+		static if (is(typeof(a) == taskTtl))
+			ttl = a.value;
+		else static if (is(typeof(a) == taskPollInterval))
+			pollInterval = a.value;
+	}
+
+	// The executor runs on each dispatch: it reconstitutes the typed arguments
+	// from the task's durable input, injects the TaskContext, invokes the method,
+	// and wraps the return value into a CallToolResult-shaped result JSON. A
+	// marshalling failure or a thrown exception propagates to runTaskExecutor,
+	// which fails the task; a `tc.requireInput(...)` suspends it.
+	server.registerTaskTool(descriptor, (TaskContext tc) @safe {
+		alias names = ParameterIdentifierTuple!overload;
+		alias defs = ParameterDefaultValueTuple!overload;
+		Json args = tc.inputJson();
+		Tuple!(Parameters!overload) argv;
+		static foreach (i, P; Parameters!overload)
+		{
+			static if (is(P == TaskContext))
+				argv[i] = tc;
+			else static if (is(defs[i] == void))
+				argv[i] = marshalArg!P(args, names[i]);
+			else
+				argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
+		}
+		static if (is(ReturnType!overload == void))
+		{
+			__traits(getMember, parent, memberName)(argv.expand);
+			CallToolResult empty;
+			return empty.toJson();
+		}
+		else
+			return toToolResult(__traits(getMember, parent, memberName)(argv.expand)).toJson();
+	}, ttl, pollInterval);
 }
 
 /// Wrap a prompt method's return value into a `GetPromptResult`.
@@ -2308,4 +2406,139 @@ unittest  // facet UDAs on bare tool parameters are emitted into inputSchema
 	auto addrProp = emailTool["inputSchema"]["properties"]["address"];
 	assert(addrProp["type"].get!string == "string");
 	assert(addrProp["format"].get!string == "email");
+}
+
+version (unittest) private final class TaskUdaApi
+{
+	import mcp.server.task_context : TaskContext;
+	import mcp.protocol.modern : InputRequest;
+	import core.time : msecs;
+
+	struct Doubled
+	{
+		int value;
+	}
+
+	struct Approved
+	{
+		string topic;
+		bool approved;
+	}
+
+	/// A plain async task: returns a typed result the framework wraps. The
+	/// @taskTtl / @taskPollInterval set this task's TTL and poll cadence.
+	@task("async_double", "Double a number asynchronously")
+	@taskTtl(12_345.msecs) @taskPollInterval(250.msecs)
+	@readOnly Doubled asyncDouble(int n, TaskContext tc) @safe
+	{
+		tc.progress("doubling");
+		return Doubled(n * 2);
+	}
+
+	/// A task that elicits mid-execution before finishing (re-entrant model).
+	@task("approve", "Ask for approval, then finish")
+	Approved approve(string topic, TaskContext tc) @safe
+	{
+		if (!tc.hasInput("ok"))
+			return tc.requireInput([
+			InputRequest.elicitation("ok", "Approve " ~ topic ~ "?")
+		]);
+		return Approved(topic, tc.input("ok").get!bool);
+	}
+}
+
+version (unittest) private Json draftMeta() @safe
+{
+	import mcp.protocol.modern : MetaKey;
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	return meta;
+}
+
+unittest  // @task UDA: tool is listed with an input schema derived from its params
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.server.task_context : SyncTaskDispatcher;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	registerHandlers(s, new TaskUdaApi);
+
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+	Json dbl;
+	foreach (i; 0 .. tools.length)
+		if (tools[i]["name"].get!string == "async_double")
+			dbl = tools[i];
+	assert(dbl.type == Json.Type.object);
+	// The TaskContext parameter is injected and omitted from the schema; `n` is.
+	assert(("n" in dbl["inputSchema"]["properties"]) !is null);
+	assert("tc" !in dbl["inputSchema"]["properties"]);
+	assert(dbl["annotations"]["readOnlyHint"].get!bool);
+}
+
+unittest  // @task UDA: tools/call returns a task the executor completes
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.server.task_context : SyncTaskDispatcher;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	registerHandlers(s, new TaskUdaApi);
+
+	Json p = Json.emptyObject;
+	p["name"] = "async_double";
+	p["arguments"] = Json(["n": Json(21)]);
+	p["_meta"] = draftMeta();
+	auto call = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
+	assert(call["result"]["resultType"].get!string == "task");
+	const id = call["result"]["taskId"].get!string;
+	// @taskTtl(12_345.msecs) / @taskPollInterval(250.msecs) seed the task timing.
+	assert(call["result"]["ttlMs"].get!long == 12_345);
+	assert(call["result"]["pollIntervalMs"].get!long == 250);
+
+	Json gp = Json(["taskId": Json(id)]);
+	gp["_meta"] = draftMeta();
+	auto got = s.handle(Message(makeRequest(Json(3), "tasks/get", gp))).get;
+	assert(got["result"]["status"].get!string == "completed");
+	assert(got["result"]["result"]["structuredContent"]["value"].get!int == 42);
+	assert(got["result"]["pollIntervalMs"].get!long == 250);
+}
+
+unittest  // @task UDA: a mid-task elicitation suspends and resumes via tasks/update
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.server.task_context : SyncTaskDispatcher;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	registerHandlers(s, new TaskUdaApi);
+
+	Json p = Json.emptyObject;
+	p["name"] = "approve";
+	p["arguments"] = Json(["topic": Json("deploy")]);
+	p["_meta"] = draftMeta();
+	auto call = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
+	const id = call["result"]["taskId"].get!string;
+
+	Json gp = Json(["taskId": Json(id)]);
+	gp["_meta"] = draftMeta();
+	auto blocked = s.handle(Message(makeRequest(Json(3), "tasks/get", gp))).get;
+	assert(blocked["result"]["status"].get!string == "input_required");
+	assert(blocked["result"]["inputRequests"]["ok"]["method"].get!string == "elicitation/create");
+
+	Json up = Json([
+		"taskId": Json(id),
+		"inputResponses": Json(["ok": Json(true)])
+	]);
+	up["_meta"] = draftMeta();
+	auto ack = s.handle(Message(makeRequest(Json(4), "tasks/update", up))).get;
+	assert("error" !in ack);
+
+	auto done = s.handle(Message(makeRequest(Json(5), "tasks/get", gp))).get;
+	assert(done["result"]["status"].get!string == "completed");
+	assert(done["result"]["result"]["structuredContent"]["topic"].get!string == "deploy");
+	assert(done["result"]["result"]["structuredContent"]["approved"].get!bool);
 }

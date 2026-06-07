@@ -30,6 +30,67 @@ struct tool
 	string title; /// optional human-readable display name (empty = unset)
 }
 
+/// UDA marking a method as an asynchronous MCP task tool (SEP-2663). Like `@tool`,
+/// the input schema is derived from the parameter types; but the `tools/call`
+/// returns a task handle immediately and the method body runs asynchronously via
+/// the server's task dispatcher, its return value becoming the task's final
+/// result. The method may take an injected `TaskContext` parameter (omitted from
+/// the input schema) to report progress, observe cancellation, or suspend for
+/// mid-execution input via `requireInput`. Requires `enableTasks()` on the server.
+///
+/// Behavioral-hint marker UDAs (`@readOnly`, `@destructive`, ...) and
+/// `@hintTitle` apply exactly as for `@tool`.
+///
+/// Example:
+/// ---
+/// @task("word_count", "Count words asynchronously")
+/// @readOnly
+/// WordCount count(string text, TaskContext tc) @safe { ... }
+/// ---
+struct task
+{
+	string name;
+	string description;
+	string title; /// optional human-readable display name (empty = unset)
+}
+
+/// Per-task time-to-live UDA, attached alongside `@task`: how long the task lives
+/// from creation. Intrinsic to the work the task does (a long-running job vs a
+/// quick computation), so it belongs on the task, not the server. Omit it to
+/// inherit `TaskOptions.defaultTtl`.
+///
+/// Example:
+/// ---
+/// import core.time : hours;
+/// @task("build", "Run the build")
+/// @taskTtl(1.hours)
+/// BuildResult build(string target, TaskContext tc) @safe { ... }
+/// ---
+struct taskTtl
+{
+	import core.time : Duration;
+
+	Duration value; /// task TTL (serialized to integer ms on the wire)
+}
+
+/// Per-task poll-cadence UDA, attached alongside `@task`: the interval the client
+/// SHOULD wait between `tasks/get` polls. Like `@taskTtl`, it is intrinsic to the
+/// task. Omit it to inherit `TaskOptions.defaultPollInterval`.
+///
+/// Example:
+/// ---
+/// import core.time : seconds;
+/// @task("build", "Run the build")
+/// @taskTtl(1.hours) @taskPollInterval(5.seconds)
+/// BuildResult build(string target, TaskContext tc) @safe { ... }
+/// ---
+struct taskPollInterval
+{
+	import core.time : Duration;
+
+	Duration value; /// suggested poll cadence (serialized to integer ms on the wire)
+}
+
 /// Marker UDA declaring the `readOnlyHint` behavioral hint (the MCP spec's
 /// `ToolAnnotations.readOnlyHint`). Attach alongside `@tool`; presence sets the
 /// hint to `true`, absence leaves it unset (omitted from the wire form).
