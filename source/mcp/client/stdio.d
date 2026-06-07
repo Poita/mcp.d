@@ -440,7 +440,8 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 	import core.thread : Thread;
 
 	import core.sys.windows.windef : HANDLE, FALSE;
-	import core.sys.windows.winbase : DuplicateHandle, GetCurrentProcess, DUPLICATE_SAME_ACCESS;
+	import core.sys.windows.winbase : DuplicateHandle, GetCurrentProcess;
+	import core.sys.windows.winnt : DUPLICATE_SAME_ACCESS;
 
 	auto child = () @trusted { return new WinChild; }();
 
