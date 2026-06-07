@@ -1,0 +1,23 @@
+{
+	"name": "tasks",
+	"description": "MCP Tasks example (server + self-verifying client e2e) for mcp.d — SEP-2663 async tools/call",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp-d": { "path": "../.." },
+		"examples-common": { "path": "../common" }
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "tasks-server",
+			"mainSourceFile": "server.d"
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "tasks-client",
+			"mainSourceFile": "client.d"
+		}
+	]
+}

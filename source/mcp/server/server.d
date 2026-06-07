@@ -153,17 +153,45 @@ struct ToolResponse
 		return ToolResponse.inputRequired(requests, serializeToJson(state).toString());
 	}
 
-	/// Project the final `CallToolResult` to the negotiated protocol version so
-	/// version-gated fields are not emitted to peers that don't understand them.
-	/// `CallToolResult.structuredContent` is a 2025-06-18+ field and is stripped
-	/// for 2024-11-05 / 2025-03-26. An `InputRequiredResult` is draft-only (MRTR):
-	/// its `{inputRequests, [requestState]}` shape carries no `content` and exists
-	/// only on versions whose schema permits it. Emitting it to a non-MRTR peer,
-	/// whose `CallToolResult` requires `content`, is a programming error (a handler
-	/// ignoring the documented stateless contract), so reject it rather than
-	/// projecting an off-schema result onto the wire.
+	/// Return a SEP-2663 `CreateTaskResult` as the `tools/call` response. `j` is
+	/// the raw JSON produced by `makeCreateTaskResult(task)`; it already carries
+	/// `resultType:"task"` so `stampResultType` leaves it untouched. Task results
+	/// are draft-only: `forVersion` throws on a non-draft peer.
+	static ToolResponse task(Json j) @safe
+	{
+		ToolResponse t;
+		t.isTask_ = true;
+		t.taskResult_ = j;
+		return t;
+	}
+
+	/// Whether this outcome is a SEP-2663 `CreateTaskResult` (draft-only async).
+	bool isTask() const @safe
+	{
+		return isTask_;
+	}
+
+	/// The JSON-RPC `result` payload.
+	Json toJson() const @safe
+	{
+		if (isTask_)
+			return taskResult_;
+		return needsInput_ ? required_.toJson() : result_.toJson();
+	}
+
+	/// Project the result to the negotiated protocol version. Task and
+	/// input-required results are draft-only; returning them to a pre-draft peer
+	/// is a programming error and throws rather than emitting an off-schema wire
+	/// message.
 	ToolResponse forVersion(ProtocolVersion v) const @safe
 	{
+		if (isTask_)
+		{
+			if (!v.isModern)
+				throw internalError(
+						"tools/call handler returned a task result on a non-draft session");
+			return ToolResponse.task(taskResult_);
+		}
 		if (needsInput_)
 		{
 			if (!v.usesMRTR)
@@ -172,6 +200,10 @@ struct ToolResponse
 		}
 		return ToolResponse.complete(result_.forVersion(v));
 	}
+
+private:
+	bool isTask_;
+	Json taskResult_;
 }
 
 /// A registered tool: its descriptor plus the handler that executes it. The
@@ -2897,7 +2929,8 @@ final class McpServer
 			// Validate the handler's (un-projected) output against the tool's
 			// declared outputSchema before version-shaping, so validation always
 			// sees the full structuredContent regardless of the negotiated version.
-			if (validateOutputSchema_)
+			// Skip for task results: a CreateTaskResult has no outputSchema shape.
+			if (validateOutputSchema_ && !response.isTask)
 				checkOutputSchema(entry.descriptor, response.toJson());
 			// Project the result to the negotiated protocol version so version-
 			// gated fields are not emitted to peers that don't understand them.
