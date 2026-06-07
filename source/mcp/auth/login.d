@@ -1452,8 +1452,7 @@ version (Windows) unittest  // FileTokenStore restricts the token file to the cu
 	auto res = () @trusted { return execute(["icacls", file]); }();
 	assert(res.status == 0, "icacls failed: " ~ res.output);
 	assert(!res.output.canFind("Everyone"), "token file grants Everyone: " ~ res.output);
-	assert(!res.output.canFind("BUILTIN\\Users"),
-			"token file grants BUILTIN\\Users: " ~ res.output);
+	assert(!res.output.canFind("BUILTIN\\Users"), "token file grants BUILTIN\\Users: " ~ res.output);
 }
 
 version (Posix) unittest  // FileTokenStore never writes secrets through a pre-existing loose-perm inode

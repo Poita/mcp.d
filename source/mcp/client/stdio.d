@@ -55,8 +55,10 @@ final class StdioClientTransport : ClientTransport
 	// can run the MCP stdio shutdown sequence (close stdin -> SIGTERM -> SIGKILL).
 	// Windows has no eventcore pipe driver, so it owns a `WinChild` (std.process
 	// pid + a blocking-reader thread) and shuts down via close-stdin -> terminate.
-	version (Posix) private ProcessPipes* pipes;
-	else version (Windows) private WinChild* winChild;
+	version (Posix)
+		private ProcessPipes* pipes;
+	else version (Windows)
+		private WinChild* winChild;
 
 	/// Construct over a newline-delimited JSON-RPC channel. `readLine` returns the
 	/// next line from the server (without its terminator) or `null` at

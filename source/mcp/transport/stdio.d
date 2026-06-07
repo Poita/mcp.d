@@ -305,7 +305,8 @@ private struct IoResult
 /// POSIX adopts the dup'd fd into eventcore (pipe or socket). Windows has no
 /// working eventcore pipe driver for an inherited stdio handle, so its `StdioEnd`
 /// (defined below) bridges a blocking reader thread to the loop instead.
-version (Posix) private struct StdioEnd
+version (Posix)
+	private struct StdioEnd
 {
 	import eventcore.driver : PipeFD, StreamSocketFD;
 
@@ -411,7 +412,8 @@ version (Posix) private struct StdioEnd
 /// event-loop thread) until a chunk arrives or stdin reaches end-of-input. The
 /// write end issues a blocking `WriteFile` inline -- MCP frames are small and the
 /// host drains stdout promptly, so the brief loop stall is acceptable.
-else version (Windows) private struct StdioEnd
+else version (Windows)
+	private struct StdioEnd
 {
 	import core.sys.windows.windef : HANDLE, DWORD;
 	import core.sys.windows.winbase : INVALID_HANDLE_VALUE, ReadFile, WriteFile;
@@ -536,7 +538,8 @@ else version (Windows) private struct StdioEnd
 /// vibe-async pipes; `release` restores the saved flags on fd 0/1 and then releases
 /// the adopted dups. The exact ordering runStdio relies on is preserved: restore
 /// the flags BEFORE releasing, so the restore operates on still-valid descriptors.
-version (Posix) private struct AdoptedStdio
+version (Posix)
+	private struct AdoptedStdio
 {
 	StdioEnd inFD;
 	StdioEnd outFD;
@@ -624,7 +627,8 @@ version (Posix) private struct AdoptedStdio
 /// pump thread); `release` closes the read channel so the read loop ends. The
 /// real stdin/stdout handles are never closed, so code running after `runStdio`
 /// still inherits them.
-else version (Windows) private struct AdoptedStdio
+else version (Windows)
+	private struct AdoptedStdio
 {
 	StdioEnd inFD;
 	StdioEnd outFD;
