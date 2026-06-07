@@ -310,7 +310,9 @@ unittest  // detach stops the dispatch without completing; the task stays workin
 
 	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
 	auto t = rt.createFor("deploy", Json.undefined);
-	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe { return tc.detach(); });
+	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
+		return tc.detach();
+	});
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 
 	// An external signal completes it later.
