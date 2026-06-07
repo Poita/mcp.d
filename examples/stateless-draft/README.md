@@ -19,7 +19,7 @@ The draft redesign drops the stateful `initialize` handshake in favor of a
   session to set up or tear down. Because this is purely message-level, the
   draft model rides **identically over stdio and Streamable HTTP** — the same
   client e2e verifies both.
-- **`enableDraft()` / `connect()`** — `enableDraft()` switches the client into
+- **`enableModern()` / `connect()`** — `enableModern()` switches the client into
   stateless draft mode; `connect()` runs `server/discover` and selects the
   newest mutually-supported version (the draft here).
 - **`CacheableResult` freshness hints** — draft results may carry `ttlMs` /
