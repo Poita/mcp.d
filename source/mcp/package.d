@@ -34,6 +34,7 @@ public import mcp.protocol.sampling;
 
 // --- Server / client entry points ---
 public import mcp.server.task_store;
+public import mcp.server.task_runtime : TaskOptions, TaskRuntime;
 public import mcp.server.context;
 public import mcp.server.server;
 public import mcp.client.client;

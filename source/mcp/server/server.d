@@ -14,6 +14,8 @@ import mcp.server.context;
 import mcp.server.connection : ConnectionState;
 import mcp.server.request_state : RequestStateSecurity, RequestStateMode,
 	RequestStateBinding, RequestStateCodec, generateEphemeralKey;
+import mcp.server.task_store : TaskStore, InMemoryTaskStore;
+import mcp.server.task_runtime : TaskRuntime, TaskOptions;
 import mcp.transport.sse_context : ServerPushChannel, StreamCoordinator, SubscriptionFilter;
 
 @safe:
@@ -332,6 +334,8 @@ final class McpServer
 	private string[]delegate(string prefix) @safe[string] argumentCompleters;
 	private bool loggingEnabled;
 	private bool resourceSubscriptionsEnabled;
+	private bool tasksEnabled_;
+	private TaskRuntime taskRuntime_;
 	private Json extensions = Json.undefined;
 	// Per-connection mutable state — negotiated protocol version, client
 	// capabilities, log level, subscriptions, and the `inFlight` cancellation
@@ -1016,6 +1020,32 @@ final class McpServer
 	void enablePromptsListChanged() @safe
 	{
 		promptsListChangedEnabled = true;
+	}
+
+	/// Enable the SEP-2663 MCP Tasks extension (`io.modelcontextprotocol/tasks`).
+	/// Advertises the extension in `server/discover` capabilities (draft only) and
+	/// routes `tasks/get` / `tasks/update` / `tasks/cancel` against `store`
+	/// (default: in-memory). `opts` tunes the ID generator, default TTL / poll
+	/// interval, and TTL sweep cadence. The runtime emits `notifications/tasks` on
+	/// status changes via the server's notify path. Returns the `TaskRuntime` so
+	/// tools can create and resolve tasks.
+	TaskRuntime enableTasks(TaskStore store = null, TaskOptions opts = TaskOptions.init) @safe
+	{
+		taskRuntime_ = new TaskRuntime((store is null) ? new InMemoryTaskStore() : store, opts);
+		taskRuntime_.onStatusChange((Json detailed) @safe {
+			notify("notifications/tasks", detailed);
+		});
+		tasksEnabled_ = true;
+		advertiseExtension(tasksExtensionKey, Json.emptyObject);
+		return taskRuntime_;
+	}
+
+	/// The task runtime created by `enableTasks`, or null if tasks are not enabled.
+	/// Tool handlers use it to create (`create`) and resolve (`complete`/`fail`/
+	/// `requireInput`/`cancel`) tasks.
+	TaskRuntime tasks() @safe
+	{
+		return taskRuntime_;
 	}
 
 	/// Advertise a draft protocol extension (e.g. "io.modelcontextprotocol/tasks")
@@ -2195,9 +2225,57 @@ final class McpServer
 			return doComplete(params);
 		case "logging/setLevel":
 			return doSetLevel(params, ver, conn);
+		case "tasks/get":
+			return doTasksGet(params, ver);
+		case "tasks/update":
+			return doTasksUpdate(params, ver);
+		case "tasks/cancel":
+			return doTasksCancel(params, ver);
 		default:
 			throw methodNotFound(method);
 		}
+	}
+
+	// The SEP-2663 `io.modelcontextprotocol/tasks` extension RPCs. The extension
+	// is draft-only and opt-in via `enableTasks()`; a session that is not draft or
+	// a server that never enabled tasks does not expose these methods and MUST
+	// answer -32601 (method not found). SEP-2663 defines exactly tasks/get,
+	// tasks/update, and tasks/cancel — there is no tasks/list or tasks/result.
+	private void requireTasks(ProtocolVersion ver) @safe
+	{
+		if (!ver.isModern || !tasksEnabled_)
+			throw methodNotFound("tasks");
+	}
+
+	private string requireTaskId(Json params) @safe
+	{
+		if (params.type != Json.Type.object || "taskId" !in params
+				|| params["taskId"].type != Json.Type.string)
+			throw invalidParams("tasks request requires a string 'taskId'");
+		return params["taskId"].get!string;
+	}
+
+	private Json doTasksGet(Json params, ProtocolVersion ver) @safe
+	{
+		requireTasks(ver);
+		return taskRuntime_.getDetailed(requireTaskId(params));
+	}
+
+	private Json doTasksUpdate(Json params, ProtocolVersion ver) @safe
+	{
+		requireTasks(ver);
+		const id = requireTaskId(params);
+		Json responses = ("inputResponses" in params) ? params["inputResponses"] : Json.emptyObject;
+		taskRuntime_.deliverInput(id, responses); // throws -32602 for an unknown task
+		return Json.emptyObject; // empty acknowledgement
+	}
+
+	private Json doTasksCancel(Json params, ProtocolVersion ver) @safe
+	{
+		requireTasks(ver);
+		const id = requireTaskId(params);
+		taskRuntime_.cancel(id); // throws -32602 for an unknown task
+		return Json.emptyObject; // empty acknowledgement
 	}
 
 	/// `server/discover` (draft): advertise supported versions, capabilities,
@@ -5442,6 +5520,120 @@ version (unittest)
 		params["_meta"] = meta;
 		return Message(makeRequest(Json(id), method, params));
 	}
+}
+
+unittest  // enableTasks advertises the tasks extension under draft server/discover
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks();
+	auto resp = s.handle(draftReq(1, "server/discover")).get;
+	auto caps = resp["result"]["capabilities"];
+	assert("tasks" !in caps, "no top-level tasks capability under the extension model");
+	assert("io.modelcontextprotocol/tasks" in caps["extensions"]);
+}
+
+unittest  // tasks/* are -32601 when the server never enabled tasks
+{
+	auto s = new McpServer("t", "1");
+	foreach (m; ["tasks/get", "tasks/update", "tasks/cancel"])
+	{
+		Json p = Json(["taskId": Json("x")]);
+		auto resp = s.handle(draftReq(1, m, p)).get;
+		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+	}
+}
+
+unittest  // tasks/* are -32601 on a non-draft session even when enabled (extension is draft-only)
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks();
+	foreach (m; ["tasks/get", "tasks/update", "tasks/cancel"])
+	{
+		Json p = Json(["taskId": Json("x")]);
+		auto resp = s.handle(req(1, m, p)).get;
+		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+	}
+}
+
+unittest  // tasks/list and tasks/result do not exist in the extension (always -32601)
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks();
+	foreach (m; ["tasks/list", "tasks/result"])
+	{
+		auto resp = s.handle(draftReq(1, m, Json(["taskId": Json("x")]))).get;
+		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+	}
+}
+
+unittest  // tasks/get for an unknown taskId is -32602 with the taskId echoed
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks();
+	auto resp = s.handle(draftReq(1, "tasks/get", Json(["taskId": Json("nope")]))).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(resp["error"]["data"]["taskId"].get!string == "nope");
+}
+
+unittest  // a created task is served via tasks/get, progressing working -> completed
+{
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks();
+	auto t = rt.create();
+
+	auto working = s.handle(draftReq(1, "tasks/get", Json(["taskId": Json(t.taskId)]))).get;
+	assert(working["result"]["status"].get!string == "working");
+	assert(working["result"]["resultType"].get!string == "complete");
+
+	Json result = Json([
+		"content": Json([Json(["type": Json("text"), "text": Json("done")])])
+	]);
+	rt.complete(t.taskId, result);
+	auto done = s.handle(draftReq(2, "tasks/get", Json(["taskId": Json(t.taskId)]))).get;
+	assert(done["result"]["status"].get!string == "completed");
+	assert(done["result"]["result"]["content"][0]["text"].get!string == "done");
+}
+
+unittest  // input_required surfaces inputRequests and tasks/update is acknowledged
+{
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks();
+	auto t = rt.create();
+	rt.requireInput(t.taskId, Json(["k1": Json(["method": Json("elicitation/create")])]));
+
+	auto blocked = s.handle(draftReq(1, "tasks/get", Json(["taskId": Json(t.taskId)]))).get;
+	assert(blocked["result"]["status"].get!string == "input_required");
+	assert(blocked["result"]["inputRequests"]["k1"]["method"].get!string == "elicitation/create");
+
+	Json up = Json([
+		"taskId": Json(t.taskId),
+		"inputResponses": Json(["k1": Json(["answer": Json("yes")])])
+	]);
+	auto ack = s.handle(draftReq(2, "tasks/update", up)).get;
+	assert("error" !in ack);
+	assert(ack["result"].type == Json.Type.object);
+	assert(rt.takenInput(t.taskId)["k1"]["answer"].get!string == "yes");
+}
+
+unittest  // tasks/cancel acknowledges and cancels a task
+{
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks();
+	auto t = rt.create();
+	auto ack = s.handle(draftReq(1, "tasks/cancel", Json(["taskId": Json(t.taskId)]))).get;
+	assert("error" !in ack);
+	assert(ack["result"].type == Json.Type.object);
+	auto got = s.handle(draftReq(2, "tasks/get", Json(["taskId": Json(t.taskId)]))).get;
+	assert(got["result"]["status"].get!string == "cancelled");
+}
+
+unittest  // tasks/update for an unknown taskId is -32602
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks();
+	Json up = Json(["taskId": Json("nope"), "inputResponses": Json.emptyObject]);
+	auto resp = s.handle(draftReq(1, "tasks/update", up)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
 unittest  // draft tools/call rejects with -32003 when a required client cap is undeclared
