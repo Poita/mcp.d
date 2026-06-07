@@ -302,13 +302,17 @@ class FileTokenStore : TokenStore
 		}
 		else
 		{
+			// Tighten any pre-existing loose-permission file to owner-only BEFORE
+			// writing secrets, and reassert afterwards in case `write` had to create
+			// it (so secrets are never exposed through a broadly-readable file).
+			restrictPermissions();
 			() @trusted { write(path, bytes); }();
 			restrictPermissions();
 		}
 	}
 
-	/// Restrict the token file to owner-only access (POSIX `0600`). No-op on
-	/// platforms without POSIX permissions.
+	/// Restrict the token file to owner-only access (POSIX `0600`, or a current-user
+	/// only ACL on Windows). No-op on platforms with neither.
 	private void restrictPermissions() @safe
 	{
 		version (Posix)
@@ -325,11 +329,18 @@ class FileTokenStore : TokenStore
 				}
 			}
 		}
+		else version (Windows)
+		{
+			import std.file : exists;
+
+			if (path.length && path.exists)
+				restrictWindowsAcl(path, false);
+		}
 	}
 
 	/// Restrict the token file's parent directory to owner-only access (POSIX
-	/// `0700`), so the directory holding the plaintext token file is not
-	/// group/other-traversable. No-op on platforms without POSIX permissions.
+	/// `0700`, or a current-user only ACL on Windows), so the directory holding the
+	/// plaintext token file is not group/other-traversable. No-op otherwise.
 	private static void restrictDirPermissions(string dir) @safe
 	{
 		version (Posix)
@@ -345,6 +356,42 @@ class FileTokenStore : TokenStore
 				{
 				}
 			}
+		}
+		else version (Windows)
+		{
+			import std.file : exists;
+
+			if (dir.length && dir.exists)
+				restrictWindowsAcl(dir, true);
+		}
+	}
+
+	/// Set a current-user-only ACL on `p` using `icacls`: `/inheritance:r` drops
+	/// inherited ACEs (removing any Everyone / BUILTIN\Users access the parent
+	/// directory contributed) and `/grant:r` replaces grants with the current user
+	/// alone. A directory additionally gets object/container inheritance so new
+	/// children are owner-only too -- matching the POSIX 0600 (file) / 0700 (dir)
+	/// intent. Best-effort and never throws, mirroring the POSIX `setAttributes`
+	/// path; the OAuth token secrets it protects must not be exposed even if the
+	/// ACL change fails to apply, so callers treat failure as non-fatal.
+	version (Windows) private static void restrictWindowsAcl(string p, bool isDir) @trusted nothrow
+	{
+		import std.process : execute, environment;
+
+		try
+		{
+			// icacls accepts a DOMAIN\user account name; build it from the
+			// environment of the running process.
+			auto user = environment.get("USERNAME");
+			if (user.length == 0)
+				return;
+			auto domain = environment.get("USERDOMAIN");
+			const account = domain.length ? domain ~ "\\" ~ user : user;
+			const grant = isDir ? account ~ ":(OI)(CI)F" : account ~ ":F";
+			execute(["icacls", p, "/inheritance:r", "/grant:r", grant]);
+		}
+		catch (Exception)
+		{
 		}
 	}
 }
@@ -1374,6 +1421,39 @@ version (Posix) unittest  // FileTokenStore creates the token file 0600 (never a
 	// The file must end up owner-only (0600): no group/other bits set.
 	const fileMode = getAttributes(file) & (S_IRWXU | S_IRWXG | S_IRWXO);
 	assert((fileMode & (S_IRWXG | S_IRWXO)) == 0, "token file is group/other accessible");
+}
+
+version (Windows) unittest  // FileTokenStore restricts the token file to the current user (no inherited broad ACEs)
+{
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse, exists;
+	import std.path : buildPath;
+	import std.conv : to;
+	import std.process : execute;
+	import std.algorithm.searching : canFind;
+	import std.datetime.systime : Clock;
+
+	auto root = buildPath(tempDir, "mcp-login-acl-" ~ Clock.currTime().toUnixTime().to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		() @trusted { rmdirRecurse(root); }();
+
+	auto file = buildPath(root, "sub", "tokens.json");
+	auto store = new FileTokenStore(file);
+	StoredToken t;
+	t.accessToken = "secret-access";
+	t.refreshToken = "secret-refresh";
+	t.resource = "https://mcp.example.com";
+	store.save("https://mcp.example.com", t);
+
+	assert(file.exists);
+	// After `/inheritance:r` the inherited broad ACEs the temp directory contributes
+	// (Everyone / BUILTIN\Users) must be gone, so the plaintext token file is not
+	// readable by other accounts -- the Windows analogue of POSIX 0600.
+	auto res = () @trusted { return execute(["icacls", file]); }();
+	assert(res.status == 0, "icacls failed: " ~ res.output);
+	assert(!res.output.canFind("Everyone"), "token file grants Everyone: " ~ res.output);
+	assert(!res.output.canFind("BUILTIN\\Users"),
+			"token file grants BUILTIN\\Users: " ~ res.output);
 }
 
 version (Posix) unittest  // FileTokenStore never writes secrets through a pre-existing loose-perm inode
