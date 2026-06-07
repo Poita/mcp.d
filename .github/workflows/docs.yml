@@ -21,9 +21,14 @@ on:
 permissions:
   contents: read
 
+# Serialise Docs runs per ref without cancelling in-flight ones: the always-on
+# build job runs on every push/PR, and cancelling a superseded run leaves a red
+# "cancelled" check on the intermediate commit. Queuing instead lets each build
+# finish green. Actual Pages deploys are serialised separately by the `pages`
+# group on the publish job.
 concurrency:
   group: docs-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build-docs:
