@@ -282,7 +282,10 @@ unittest  // makeDetailedTask(inputRequests) inlines outstanding requests for in
 	t.status = TaskStatus.inputRequired;
 	t.createdAt = t.lastUpdatedAt = "2026-06-07T10:30:00Z";
 	Json reqs = Json([
-		"k1": Json(["method": Json("elicitation/create"), "params": Json.emptyObject])
+		"k1": Json([
+			"method": Json("elicitation/create"),
+			"params": Json.emptyObject
+		])
 	]);
 	auto j = makeDetailedTask(t, DetailedTaskPayload.inputRequests(reqs));
 	assert(j["status"].get!string == "input_required");

@@ -2200,8 +2200,8 @@ unittest  // enableTasks advertises the tasks extension (draft only)
 unittest  // isTaskResult recognizes a CreateTaskResult by its resultType discriminator
 {
 	assert(McpClient.isTaskResult(Json([
-				"resultType": Json("task"),
-				"taskId": Json("x")
+		"resultType": Json("task"),
+		"taskId": Json("x")
 	])));
 	assert(!McpClient.isTaskResult(Json(["resultType": Json("complete")])));
 	assert(!McpClient.isTaskResult(Json(["content": Json.emptyArray])));

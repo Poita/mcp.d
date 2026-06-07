@@ -1157,4 +1157,3 @@ unittest  // ClientCapabilities.forVersion: sampling sub-cap only still projects
 		assert("tools" !in j["sampling"]);
 	}
 }
-
