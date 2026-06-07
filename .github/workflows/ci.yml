@@ -92,6 +92,24 @@ jobs:
           "OPENSSL_ROOT_DIR=$ssl" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$ssl\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
+      # The deimos/openssl dub package's preGenerateCommands are posix-only: on
+      # Windows the generate_version.d script never runs, so version_.di is never
+      # written, and the binding falls back to treating OpenSSL as 1.1.0h.
+      # Fetch all packages first, then run the script manually so dub's
+      # DeimosOpenSSLAutoDetect path finds the correct OpenSSL 3.x version.
+      - name: Generate OpenSSL D version binding (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dub describe 2>&1 | Out-Null; $true
+          $pkgs = "$env:LOCALAPPDATA\dub\packages\openssl"
+          $vdir = Get-ChildItem $pkgs -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name | Select-Object -Last 1
+          if ($vdir) {
+            $gen = Join-Path $vdir.FullName "openssl\scripts\generate_version.d"
+            if (Test-Path $gen) { ldc2 -run $gen }
+          }
+
       - name: Build
         run: dub build
 
@@ -171,6 +189,18 @@ jobs:
           if (-not (Test-Path $ssl)) { choco install openssl --no-progress -y }
           "OPENSSL_ROOT_DIR=$ssl" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$ssl\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Generate OpenSSL D version binding (Windows)
+        shell: pwsh
+        run: |
+          dub describe 2>&1 | Out-Null; $true
+          $pkgs = "$env:LOCALAPPDATA\dub\packages\openssl"
+          $vdir = Get-ChildItem $pkgs -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name | Select-Object -Last 1
+          if ($vdir) {
+            $gen = Join-Path $vdir.FullName "openssl\scripts\generate_version.d"
+            if (Test-Path $gen) { ldc2 -run $gen }
+          }
 
       # The stdio examples are the real exercise of the Windows threaded stdio
       # transport: the client spawns the server binary and round-trips MCP over a

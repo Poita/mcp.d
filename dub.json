@@ -18,7 +18,6 @@
 		"vibe-d:http": "~>0.9.8",
 		"openssl": "~>3.4"
 	},
-	"versions-windows": ["DeimosOpenSSL_3_0"],
 	"configurations": [
 		{
 			"name": "library",
