@@ -724,6 +724,13 @@ class ConsentRequiredException : Exception
 // The proxy provider
 // ===========================================================================
 
+/// Fetches and parses the OAuth Client ID Metadata Document (SEP-991) hosted at a
+/// URL-formatted `client_id`. The default fetcher is the SSRF-guarded HTTP fetch
+/// (`OAuthProxy.fetchClientIdMetadata`); inject a custom one (e.g. a caching
+/// fetcher honouring HTTP cache headers, or a test stub) via
+/// `OAuthProxy.clientIdMetadataFetcher`.
+alias ClientIdMetadataFetcher = ClientIdMetadataDocument delegate(string clientIdUrl) @safe;
+
 /// A reusable OAuth proxy provider. Construct it from an `OAuthProxyConfig`, then
 /// read the metadata surface to publish, drive the authorize/token proxying, and
 /// obtain a `TokenValidator` for `ResourceServerConfig.validator`.
@@ -732,6 +739,7 @@ final class OAuthProxy
 	private OAuthProxyConfig cfg;
 	private ConsentStore consentStore;
 	private RedirectUriRegistry redirectRegistry;
+	private ClientIdMetadataFetcher cimdFetcher;
 
 	this(OAuthProxyConfig cfg) @safe
 	{
@@ -866,13 +874,23 @@ final class OAuthProxy
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
 	}
 
+	/// Install a custom Client ID Metadata Document fetcher (e.g. a caching fetcher
+	/// honouring HTTP cache headers, or a test stub), replacing the default
+	/// SSRF-guarded HTTP fetch. The fail-fast enabled/URL checks in
+	/// `fetchClientIdMetadata` still run before the injected fetcher is consulted.
+	void clientIdMetadataFetcher(ClientIdMetadataFetcher fetcher) @safe
+	{
+		cimdFetcher = fetcher;
+	}
+
 	/// Fetch and parse the OAuth Client ID Metadata Document (SEP-991) hosted at a
 	/// URL-formatted `client_id`. Fails fast (no network) when CIMD is not enabled
 	/// on this proxy or `clientIdUrl` is not a valid https-with-path URL, then
-	/// fetches the document through the SSRF-guarded connector (`secureRequestHTTP`
-	/// with the block-internal policy: resolve + pin, reject internal/link-local
-	/// targets), capping the response at `maxClientIdMetadataBytes`. The returned
-	/// document is NOT yet validated against the request — pass it to
+	/// fetches the document via the injected `clientIdMetadataFetcher` if set, else
+	/// through the SSRF-guarded connector (`secureRequestHTTP` with the
+	/// block-internal policy: resolve + pin, reject internal/link-local targets),
+	/// capping the response at `maxClientIdMetadataBytes`. The returned document is
+	/// NOT yet validated against the request — pass it to
 	/// `authorizeWithClientIdMetadata`, which enforces the SEP-991 MUSTs. Throws
 	/// `InvalidClientIdMetadataException` on any fail-fast, fetch, or parse error.
 	ClientIdMetadataDocument fetchClientIdMetadata(string clientIdUrl) @safe
@@ -887,6 +905,9 @@ final class OAuthProxy
 		if (!isValidClientIdMetadataUrl(clientIdUrl))
 			throw new InvalidClientIdMetadataException(clientIdUrl,
 					"client_id must be an https URL with a path component (SEP-991)");
+
+		if (cimdFetcher !is null)
+			return cimdFetcher(clientIdUrl);
 
 		string responseBody;
 		bool ok = false;
@@ -1190,6 +1211,35 @@ unittest  // CIMD PARSE: a JSON body that is not an object is rejected
 
 	assertThrown!InvalidClientIdMetadataException(parseClientIdMetadataDocument(
 			"https://app.example.com/oauth/client.json", `["not","an","object"]`));
+}
+
+unittest  // CIMD FETCH: an injected fetcher is consulted instead of the network
+{
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	auto doc = sampleCimdDoc();
+	bool called = false;
+	proxy.clientIdMetadataFetcher = (string url) @safe {
+		called = true;
+		assert(url == "https://app.example.com/oauth/client.json");
+		return doc;
+	};
+	auto got = proxy.fetchClientIdMetadata("https://app.example.com/oauth/client.json");
+	assert(called);
+	assert(got.clientId == doc.clientId);
+}
+
+unittest  // CIMD FETCH: even with an injected fetcher, a malformed client_id URL fails fast
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	proxy.clientIdMetadataFetcher = (string url) @safe { return sampleCimdDoc(); };
+	assertThrown!InvalidClientIdMetadataException(
+			proxy.fetchClientIdMetadata("http://app.example.com/oauth/client.json"));
 }
 
 unittest  // CIMD FETCH: fails fast (no network) when CIMD is not enabled on the proxy
