@@ -33,3 +33,6 @@ lcov.info
 # server/client configs build <name>-server / <name>-client)
 examples/*/*-server
 examples/*/*-client
+
+# Claude Code agent/session state
+.claude/
