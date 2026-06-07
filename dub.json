@@ -1,6 +1,6 @@
 {
 	"name": "mcp-d",
-	"description": "Production-grade Model Context Protocol SDK for D",
+	"description": "Model Context Protocol SDK for D",
 	"homepage": "https://github.com/Poita/mcp.d",
 	"license": "Apache-2.0",
 	"copyright": "Copyright © 2026 Peter Alexander",
