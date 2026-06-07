@@ -24,6 +24,7 @@ enum SessionHeader = "Mcp-Session-Id";
 /// Configuration for the Streamable HTTP server transport.
 struct StreamableHttpOptions
 {
+	ushort port = 8080; /// the TCP port to listen on
 	string path = "/mcp"; /// the single MCP endpoint path
 	string[] bindAddresses = ["127.0.0.1"]; /// addresses to bind
 
@@ -1969,6 +1970,14 @@ void runStreamableHttp(McpServer server, ushort port, string host) @safe
 	StreamableHttpOptions opts;
 	opts.bindAddresses = [host];
 	runStreamableHttp(server, port, opts);
+}
+
+/// Start a Streamable HTTP server fully described by `opts` (listening on
+/// `opts.port`). The single-struct form of `runStreamableHttp`, used by the
+/// `ServerSettings`-based entry point. Blocks until exit.
+void runStreamableHttp(McpServer server, StreamableHttpOptions opts) @safe
+{
+	runStreamableHttp(server, opts.port, opts);
 }
 
 unittest  // runStreamableHttp(server, port, host) overload exists and forwards

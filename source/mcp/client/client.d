@@ -1,8 +1,8 @@
 module mcp.client.client;
 
+import core.time : Duration, seconds, msecs;
 import std.algorithm : canFind, startsWith;
 import std.typecons : Nullable, nullable;
-import core.time : Duration, msecs;
 
 import vibe.data.json : Json, parseJsonString, serializeToJson;
 
@@ -126,6 +126,32 @@ Json withRequestLogLevel(Json params, string level) @safe
 	meta[MetaKey.logLevel] = level;
 	params["_meta"] = meta;
 	return params;
+}
+
+/// Static configuration for an `McpClient`, bundled into one value so the client
+/// factories stay stable as options accumulate (rather than growing a positional
+/// argument per knob). Fields scoped to a particular transport are documented as
+/// such; other transports ignore them. Pass it to `McpClient.http` / `stdio` /
+/// `spawn` / `spawnSibling`; the defaults reproduce the previous behavior.
+struct ClientSettings
+{
+	/// Client identity advertised to the server during initialization.
+	Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0");
+
+	/// HTTP transport only: bound on every raw TCP connect the transport makes,
+	/// so a connect that cannot complete (e.g. the local ephemeral-port range is
+	/// exhausted) fails with a typed error instead of hanging indefinitely.
+	Duration connectTimeout = 30.seconds;
+
+	/// HTTP transport only: cap on concurrent in-flight POSTs (0 = unlimited).
+	/// Each request uses its own connection, so a positive cap makes excess
+	/// requests await a permit rather than opening another socket, bounding
+	/// socket / ephemeral-port use. The cap counts both request POSTs and the
+	/// oneway POSTs that carry notifications and replies to server-initiated
+	/// requests (sampling / elicitation / roots); when a tool uses those, size the
+	/// cap above the round-trip nesting depth so an awaiting request POST and its
+	/// reply POST can both hold a permit.
+	uint maxInFlight = 0;
 }
 
 /// A Model Context Protocol client, transport-agnostic.
@@ -300,33 +326,38 @@ final class McpClient : ClientProtocol
 		transport.setProtocol(this);
 	}
 
-	/// Build a client over the Streamable HTTP transport at `url`.
-	static McpClient http(string url,
-			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
+	/// Build a client over the Streamable HTTP transport at `url`. `settings`
+	/// carries the client identity plus the HTTP transport knobs (connect timeout
+	/// and in-flight cap); see `ClientSettings`. The defaults reproduce the
+	/// previous behavior.
+	static McpClient http(string url, ClientSettings settings = ClientSettings.init) @safe
 	{
-		return new McpClient(new HttpClientTransport(url), clientInfo);
+		auto transport = new HttpClientTransport(url, settings.maxInFlight);
+		transport.setConnectTimeout(settings.connectTimeout);
+		return new McpClient(transport, settings.clientInfo);
 	}
 
 	/// Build a client over the stdio transport, exchanging newline-delimited
 	/// JSON-RPC over the supplied `readLine`/`writeLine` channel (symmetric to
 	/// `mcp.transport.stdio.serveStdio`). `readLine` returns the next server line
 	/// (without its terminator) or `null` at end-of-input; `writeLine` emits one
-	/// message line (the sink appends the terminator).
-	static McpClient stdio(string delegate() @safe readLine, void delegate(string) @safe writeLine,
-			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
+	/// message line (the sink appends the terminator). Only `settings.clientInfo`
+	/// applies to stdio; the HTTP-only fields are ignored.
+	static McpClient stdio(string delegate() @safe readLine,
+			void delegate(string) @safe writeLine, ClientSettings settings = ClientSettings.init) @safe
 	{
-		return new McpClient(new StdioClientTransport(readLine, writeLine), clientInfo);
+		return new McpClient(new StdioClientTransport(readLine, writeLine), settings.clientInfo);
 	}
 
 	/// Launch an MCP server as a subprocess and build a client over its
 	/// stdin/stdout (stderr inherited for logging). `command` is the command line
 	/// (`command[0]` is the executable). The returned client is NOT yet
 	/// initialized — call `initialize()` (or `ping()` for a stateless probe).
-	/// `close()` runs the MCP stdio shutdown sequence on the subprocess.
-	static McpClient spawn(string[] command,
-			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
+	/// `close()` runs the MCP stdio shutdown sequence on the subprocess. Only
+	/// `settings.clientInfo` applies; the HTTP-only fields are ignored.
+	static McpClient spawn(string[] command, ClientSettings settings = ClientSettings.init) @safe
 	{
-		return new McpClient(spawnStdioTransport(command), clientInfo);
+		return new McpClient(spawnStdioTransport(command), settings.clientInfo);
 	}
 
 	/// Launch an MCP server binary that ships *next to this executable* and build a
@@ -337,9 +368,9 @@ final class McpClient : ClientProtocol
 	/// does not exist) a `.exe` suffix is tried as a fallback. As with `spawn`, the
 	/// returned client is NOT yet initialized — call `initialize()` (or `ping()`).
 	static McpClient spawnSibling(string exeName, string[] extraArgs = null,
-			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
+			ClientSettings settings = ClientSettings.init) @safe
 	{
-		return spawn([resolveSiblingPath(exeName)] ~ extraArgs, clientInfo);
+		return spawn([resolveSiblingPath(exeName)] ~ extraArgs, settings);
 	}
 
 	/// Resolve `exeName` to an absolute path next to the running executable

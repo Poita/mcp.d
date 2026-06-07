@@ -197,6 +197,24 @@ private final class StdioContextFactoryReply
 	}
 }
 
+/// Static options for the stdio server transport, bundled into one value so
+/// `runStdio` keeps a stable signature as options accumulate. Mirrors
+/// `StreamableHttpOptions` for the HTTP transport.
+struct StdioOptions
+{
+	/// Bounds a single inbound line; an oversized frame is dropped (its bytes are
+	/// skipped up to the next newline) so one misbehaving frame cannot exhaust
+	/// memory.
+	size_t maxLineBytes = defaultMaxLineBytes;
+}
+
+/// Serve `server` over stdio with the options in `opts`. The single-struct form
+/// of `runStdio`, used by the `ServerSettings`-based entry point.
+void runStdio(McpServer server, StdioOptions opts)
+{
+	runStdio(server, opts.maxLineBytes);
+}
+
 /// Serve `server` over the process's standard input/output: read JSON-RPC
 /// messages from stdin (one per line) and write responses to stdout. Per the MCP
 /// stdio transport, only valid MCP messages are written to stdout; use stderr for

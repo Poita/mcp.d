@@ -21,7 +21,7 @@ module mcp.client.http_streaming_test;
 version (unittest)
 {
 	import std.conv : to;
-	import core.time : msecs, MonoTime;
+	import core.time : msecs, MonoTime, seconds;
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
 	import vibe.data.json : Json, parseJsonString;
 	import vibe.stream.operations : readAllUTF8;
@@ -31,8 +31,9 @@ version (unittest)
 
 	import mcp.server.server : McpServer;
 	import mcp.server.context : RequestContext;
-	import mcp.client.client : McpClient;
+	import mcp.client.client : McpClient, ClientSettings;
 	import mcp.protocol.types : CallToolResult, Content, Tool;
+	import mcp.protocol.capabilities : Implementation;
 	import mcp.protocol.versions : ProtocolVersion;
 	import mcp.client.subscription : SubscriptionFilter, SubscriptionStream;
 	import mcp.transport.streamable_http : mountMcp, StreamableHttpOptions;
@@ -380,4 +381,93 @@ unittest
 	assert(getResumed, "client never issued the Last-Event-ID resume GET");
 	assert(completed, "listTools never completed; the dropped response was not resumed");
 	assert(toolCount == 0, "resumed response did not decode as the empty tool list");
+}
+
+// Optional cap on concurrent in-flight POSTs: with `maxInFlight` set to 1, a burst
+// of concurrent `callTool`s must be serialized client-side so the server never sees
+// more than one request in flight at a time, while every call still completes. The
+// tool handler records the peak number of overlapping requests; with the cap that
+// peak must equal the cap, and without it the burst would drive it above the cap.
+unittest
+{
+	auto server = McpServer.stateless("inflight-cap-e2e", "1.0.0");
+
+	// Observed concurrency on the server side. The handler increments on entry,
+	// captures the running peak, yields (sleep) so concurrent calls overlap, then
+	// decrements on exit. Single-threaded event loop makes these updates atomic
+	// between yields.
+	int inFlight;
+	int peak;
+	Tool tool;
+	tool.name = "slow";
+	tool.description = "Sleeps so concurrent calls overlap";
+	server.registerDynamicTool(tool, (Json args, RequestContext ctx) @safe {
+		inFlight++;
+		if (inFlight > peak)
+			peak = inFlight;
+		sleep(100.msecs);
+		inFlight--;
+		return CallToolResult([Content.makeText("ok")]);
+	});
+
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	enum cap = 1;
+	enum calls = 4;
+	int completed;
+	string failure;
+
+	void delegate() @safe nothrow body_ = () @safe nothrow{
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				() @trusted { listener.stopListening(); }();
+			const port = listener.bindAddresses[0].port;
+			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
+
+			// Cap concurrent in-flight POSTs at `cap`.
+			auto client = McpClient.http(url,
+					ClientSettings(Implementation("inflight-client", "1.0"), 30.seconds, cap));
+			scope (exit)
+				closeQuietly(client);
+
+			client.connect();
+
+			// Fire the burst: each task issues an independent `callTool` whose POST
+			// races the others. The cap must throttle them to `cap` at a time.
+			foreach (i; 0 .. calls)
+				runTask(() nothrow{
+					try
+						client.callTool("slow", Json.emptyObject);
+					catch (Exception e)
+					{
+						if (failure.length == 0)
+							failure = e.msg;
+					}
+					completed++;
+				});
+
+			const deadline = MonoTime.currTime + 10_000.msecs;
+			while (completed < calls && MonoTime.currTime < deadline)
+				sleep(20.msecs);
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	};
+
+	runTask(body_);
+	runEventLoop();
+
+	assert(failure.length == 0, "in-flight cap test failed: " ~ failure);
+	assert(completed == calls, "not all capped calls completed");
+	assert(peak <= cap,
+			"observed concurrency exceeded the cap: peak=" ~ peak.to!string
+			~ " cap=" ~ cap.to!string);
 }
