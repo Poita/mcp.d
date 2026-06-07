@@ -8,6 +8,16 @@ import deimos.openssl.evp;
 import deimos.openssl.ecdsa;
 import deimos.openssl.bn;
 
+// deimos/openssl gates EVP_DigestSign on OPENSSL_VERSION_AT_LEAST(1,1,1), which
+// requires the auto-detect binding. On Windows the posix-only preGenerateCommands
+// never run, so the fallback is OpenSSL 1.1.0h (<1.1.1) and EVP_DigestSign is
+// absent. Declare it here when the binding omits it; this is a no-op when deimos
+// provides it (static if skips the duplicate).
+static if (!is(typeof(EVP_DigestSign)))
+    extern (C) @system nothrow @nogc
+    int EVP_DigestSign(EVP_MD_CTX* ctx, ubyte* sigret, size_t* siglen,
+        const(ubyte)* tbs, size_t tbslen);
+
 import mcp.auth.oauth : base64UrlNoPad;
 
 import vibe.data.json : Json;

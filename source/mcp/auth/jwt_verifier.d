@@ -27,6 +27,13 @@ import deimos.openssl.rsa;
 import deimos.openssl.bn;
 import deimos.openssl.obj_mac;
 
+// Same guard as in jwt.d: declare EVP_DigestVerify when the deimos binding omits
+// it due to failed version detection on Windows.
+static if (!is(typeof(EVP_DigestVerify)))
+    extern (C) @system nothrow @nogc
+    int EVP_DigestVerify(EVP_MD_CTX* ctx, const(ubyte)* sig, size_t siglen,
+        const(ubyte)* tbs, size_t tbslen);
+
 import mcp.auth.resource_server : TokenInfo, TokenValidator;
 
 @safe:
