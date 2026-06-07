@@ -50,6 +50,14 @@ struct TaskContext
 		return taskId_;
 	}
 
+	/// The durable input recorded when the task was created (the original tool
+	/// `arguments`). Reconstituted from the store on every dispatch, so an executor
+	/// reads identical input whether on its first run or a re-dispatch elsewhere.
+	Json inputJson() @safe
+	{
+		return rt_.executorInput(taskId_);
+	}
+
 	/// Set the task's human-readable status message (visible via `tasks/get`).
 	void progress(string statusMessage) @safe
 	{
@@ -104,8 +112,7 @@ struct TaskContext
 	{
 		auto j = rt_.getCheckpoint(taskId_, key);
 		if (j.type == Json.Type.undefined)
-			throw new McpException(ErrorCode.internalError,
-					"no checkpoint stored under key: " ~ key);
+			throw new McpException(ErrorCode.internalError, "no checkpoint stored under key: " ~ key);
 		return deserializeJson!T(j);
 	}
 
@@ -206,6 +213,19 @@ final class InProcessTaskDispatcher : TaskDispatcher
 	}
 }
 
+/// A dispatcher that runs the executor inline, synchronously, on the dispatching
+/// thread. Suitable for fast CPU-bound executors that need no concurrency, and
+/// for deterministic tests (no event loop required). Note the executor runs
+/// before `dispatch` returns, so a synchronous task may already be `completed`
+/// (or `input_required`) by the time the `CreateTaskResult` reaches the client.
+final class SyncTaskDispatcher : TaskDispatcher
+{
+	void dispatch(string taskId, void delegate(string taskId) @safe run) @safe
+	{
+		run(taskId);
+	}
+}
+
 unittest  // runTaskExecutor completes a task with the executor's result
 {
 	import mcp.server.task_store : InMemoryTaskStore;
@@ -232,9 +252,7 @@ unittest  // requireInput suspends into input_required; re-run completes after a
 	// The executor needs an "ok" answer before it can finish.
 	TaskExecutor exec = (TaskContext tc) @safe {
 		if (!tc.hasInput("ok"))
-			return tc.requireInput([
-				InputRequest.elicitation("ok", "Proceed?")
-			]);
+			return tc.requireInput([InputRequest.elicitation("ok", "Proceed?")]);
 		return Json(["structuredContent": Json(["done": Json(true)])]);
 	};
 
@@ -259,7 +277,7 @@ unittest  // an executor that throws fails the task with a JSON-RPC error
 
 	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
 	auto t = rt.createFor("boom", Json.undefined);
-	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe{
+	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
 		throw new Exception("kaboom");
 	});
 	auto d = rt.getDetailed(t.taskId);
@@ -293,7 +311,11 @@ unittest  // checkpoint state survives a suspension and is restored on re-run
 	TaskExecutor exec = (TaskContext tc) @safe {
 		if (!tc.hasInput("go"))
 			return tc.requireInput([InputRequest.elicitation("go", "go?")], "carried");
-		return Json(["structuredContent": Json(["state": Json(tc.restore!string("_state"))])]);
+		return Json([
+			"structuredContent": Json([
+				"state": Json(tc.restore!string("_state"))
+			])
+		]);
 	};
 	runTaskExecutor(rt, t.taskId, exec);
 	rt.deliverInput(t.taskId, Json(["go": Json(true)]));

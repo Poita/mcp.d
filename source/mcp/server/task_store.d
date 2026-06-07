@@ -79,8 +79,8 @@ struct TaskRecord
 			foreach (string k, v; j["inputResponses"])
 				r.inputResponses[k] = cloneJson(v);
 		}();
-		r.cancelRequested = ("cancelRequested" in j) && j["cancelRequested"].type == Json.Type.bool_
-			&& j["cancelRequested"].get!bool;
+		r.cancelRequested = ("cancelRequested" in j)
+			&& j["cancelRequested"].type == Json.Type.bool_ && j["cancelRequested"].get!bool;
 		if ("toolName" in j && j["toolName"].type == Json.Type.string)
 			r.toolName = j["toolName"].get!string;
 		r.executorInput = ("executorInput" in j) ? cloneJson(j["executorInput"]) : Json.undefined;

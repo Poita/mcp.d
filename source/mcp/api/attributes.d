@@ -30,6 +30,30 @@ struct tool
 	string title; /// optional human-readable display name (empty = unset)
 }
 
+/// UDA marking a method as an asynchronous MCP task tool (SEP-2663). Like `@tool`,
+/// the input schema is derived from the parameter types; but the `tools/call`
+/// returns a task handle immediately and the method body runs asynchronously via
+/// the server's task dispatcher, its return value becoming the task's final
+/// result. The method may take an injected `TaskContext` parameter (omitted from
+/// the input schema) to report progress, observe cancellation, or suspend for
+/// mid-execution input via `requireInput`. Requires `enableTasks()` on the server.
+///
+/// Behavioral-hint marker UDAs (`@readOnly`, `@destructive`, ...) and
+/// `@hintTitle` apply exactly as for `@tool`.
+///
+/// Example:
+/// ---
+/// @task("word_count", "Count words asynchronously")
+/// @readOnly
+/// WordCount count(string text, TaskContext tc) @safe { ... }
+/// ---
+struct task
+{
+	string name;
+	string description;
+	string title; /// optional human-readable display name (empty = unset)
+}
+
 /// Marker UDA declaring the `readOnlyHint` behavioral hint (the MCP spec's
 /// `ToolAnnotations.readOnlyHint`). Attach alongside `@tool`; presence sets the
 /// hint to `true`, absence leaves it unset (omitted from the wire form).

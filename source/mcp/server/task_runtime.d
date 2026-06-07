@@ -88,8 +88,7 @@ final class TaskRuntime
 	/// persisting `executorInput` as the durable input the executor reconstitutes
 	/// on each dispatch. The returned `Task` seeds a `CreateTaskResult`. The
 	/// generated ID is guaranteed unique against the store.
-	Task createFor(string toolName, Json executorInput,
-			Nullable!long ttlMs = Nullable!long.init,
+	Task createFor(string toolName, Json executorInput, Nullable!long ttlMs = Nullable!long.init,
 			Nullable!long pollIntervalMs = Nullable!long.init) @safe
 	{
 		string id;
@@ -143,8 +142,7 @@ final class TaskRuntime
 	/// Whether a status is terminal (`completed`/`failed`/`cancelled`).
 	private static bool isTerminal(TaskStatus s) @safe pure nothrow
 	{
-		return s == TaskStatus.completed || s == TaskStatus.failed
-			|| s == TaskStatus.cancelled;
+		return s == TaskStatus.completed || s == TaskStatus.failed || s == TaskStatus.cancelled;
 	}
 
 	/// Update a `working`/`input_required` task's human-readable status message.
@@ -188,8 +186,8 @@ final class TaskRuntime
 	{
 		auto r = require(id);
 		r.meta.status = TaskStatus.inputRequired;
-		r.inputRequests = (inputRequests.type == Json.Type.object)
-			? inputRequests : Json.emptyObject;
+		r.inputRequests = (inputRequests.type == Json.Type.object) ? inputRequests
+			: Json.emptyObject;
 		touchAndStore(r);
 	}
 
@@ -272,6 +270,13 @@ final class TaskRuntime
 		return r.isNull ? "" : r.get.toolName;
 	}
 
+	/// The current status of a task, or null if unknown.
+	Nullable!TaskStatus statusOf(string id) @safe
+	{
+		auto r = store_.get(id);
+		return r.isNull ? Nullable!TaskStatus.init : nullable(r.get.meta.status);
+	}
+
 	/// Persist a re-entry checkpoint value under `key`.
 	void putCheckpoint(string id, string key, Json value) @safe
 	{
@@ -302,7 +307,8 @@ final class TaskRuntime
 		case TaskStatus.cancelled:
 			return makeDetailedTask(r.meta, DetailedTaskPayload.none());
 		case TaskStatus.inputRequired:
-			return makeDetailedTask(r.meta, DetailedTaskPayload.inputRequests(r.inputRequests));
+			return makeDetailedTask(r.meta,
+					DetailedTaskPayload.inputRequests(r.inputRequests));
 		case TaskStatus.completed:
 			return makeDetailedTask(r.meta,
 					DetailedTaskPayload.completed(r.result.isNull ? Json.emptyObject : r.result.get));
@@ -467,7 +473,7 @@ unittest  // STATELESSNESS: two runtimes sharing one store see each other's stat
 	// A creates and an executor on A requires input; B must see input_required.
 	auto t = nodeA.createFor("deploy", Json(["build": Json("v9")]));
 	nodeA.requireInput(t.taskId, Json([
-		"approval": Json(["method": Json("elicitation/create")])
+			"approval": Json(["method": Json("elicitation/create")])
 	]));
 	auto onB = nodeB.getDetailed(t.taskId);
 	assert(onB["status"].get!string == "input_required");
@@ -480,7 +486,9 @@ unittest  // STATELESSNESS: two runtimes sharing one store see each other's stat
 	assert(nodeA.executorInput(t.taskId)["build"].get!string == "v9");
 
 	// A completes; B sees the result.
-	nodeA.complete(t.taskId, Json(["structuredContent": Json(["ok": Json(true)])]));
+	nodeA.complete(t.taskId, Json([
+			"structuredContent": Json(["ok": Json(true)])
+	]));
 	auto done = nodeB.getDetailed(t.taskId);
 	assert(done["status"].get!string == "completed");
 	assert(done["result"]["structuredContent"]["ok"].get!bool);
