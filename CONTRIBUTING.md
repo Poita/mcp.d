@@ -163,11 +163,9 @@ The conformance entry points live in `conformance/server.d` and
    ./scripts/dscanner-lint.sh
    ```
    All unit tests must pass and the format/lint gates must be clean.
-4. **Update `CHANGELOG.md`** under `## [Unreleased]` when your change is
-   user-visible (new feature, fix, or behavior change).
-5. **Commit** with a clear message; reference the issue (e.g. `Closes #167`) in
+4. **Commit** with a clear message; reference the issue (e.g. `Closes #167`) in
    the body where applicable.
-6. **Open a PR against `main`.** Describe what changed, the spec rule or behavior
+5. **Open a PR against `main`.** Describe what changed, the spec rule or behavior
    it matches, and the test that covers it. CI must be green before merge.
 
 ## License
