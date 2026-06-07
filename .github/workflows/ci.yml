@@ -187,9 +187,12 @@ jobs:
           foreach ($e in $examples) {
             Write-Host "::group::stdio example $e"
             Push-Location "examples/$e"
-            dub build -c server; if ($LASTEXITCODE) { Pop-Location; throw "build server: $e" }
-            dub build -c client; if ($LASTEXITCODE) { Pop-Location; throw "build client: $e" }
-            dub run -c client --quiet; if ($LASTEXITCODE) { Pop-Location; throw "stdio e2e: $e" }
+            # --combined compiles all dependency sources in one pass, avoiding the
+            # LDC/Windows COMDAT issue where D template instantiations split across
+            # static library objects become unresolved symbols at final link time.
+            dub build --combined -c server; if ($LASTEXITCODE) { Pop-Location; throw "build server: $e" }
+            dub build --combined -c client; if ($LASTEXITCODE) { Pop-Location; throw "build client: $e" }
+            dub run --combined -c client --quiet; if ($LASTEXITCODE) { Pop-Location; throw "stdio e2e: $e" }
             Pop-Location
             Write-Host "::endgroup::"
           }
