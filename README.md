@@ -342,7 +342,7 @@ server.enableTasks();   // advertise io.modelcontextprotocol/tasks; pass a TaskS
 
 struct Approval { bool deploy; }
 
-@task("deploy", "Deploy a build, confirming with the client mid-task.")
+@task("deploy", "Deploy a build, confirming first; finishes when the deploy signals back.")
 @taskTtl(10.minutes) @taskPollInterval(2.seconds)
 string deploy(string gitRef, TaskContext tc) @safe
 {
@@ -350,12 +350,16 @@ string deploy(string gitRef, TaskContext tc) @safe
         return tc.requireInput([InputRequest.elicitation!Approval("ok", "Deploy " ~ gitRef ~ "?")]);
     if (!tc.inputAs!ElicitResult("ok").contentAs!Approval().deploy)
         return "skipped";
-    tc.progress("deploying " ~ gitRef);
-    waitForDeploy(gitRef);   // fictional: parks this fiber until the deploy finishes
-    return "deployed";
+    startDeploy(gitRef, tc.taskId);             // fictional: kicks off the deploy, returns at once
+    return tc.detach("deploying " ~ gitRef);    // leave it working; a webhook completes it
 }
 ```
 
+The three exits cover the lifecycle: `return` a value completes the task,
+`tc.requireInput(...)` suspends it for a client answer (delivered via `tasks/update`),
+and `tc.detach(...)` leaves it `working` so an external signal can finish it — your
+deploy webhook calls `rt.complete(taskId, …)` (or `rt.fail`) on the `TaskRuntime`
+that `enableTasks` returns. `detach` holds no fiber, so completion works on any node.
 See [`examples/tasks`](examples/tasks/) for cancellation, durable stores, and the
 client side.
 
