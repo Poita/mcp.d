@@ -351,7 +351,11 @@ string deploy(string gitRef, TaskContext tc) @safe
 {
     if (!tc.hasInput("ok"))
         return tc.requireInput([InputRequest.elicitation!Approval("ok", "Deploy " ~ gitRef ~ "?")]);
-    return tc.inputAs!ElicitResult("ok").contentAs!Approval().deploy ? "deploying" : "skipped";
+    if (!tc.inputAs!ElicitResult("ok").contentAs!Approval().deploy)
+        return "skipped";
+    tc.progress("deploying " ~ gitRef);
+    waitForDeploy(gitRef);   // fictional: parks this fiber until the deploy finishes
+    return "deployed";
 }
 ```
 
@@ -360,6 +364,10 @@ string deploy(string gitRef, TaskContext tc) @safe
 executor reads the answer through `tc.hasInput` / `tc.inputAs`. Because the typed
 params are reconstituted from the task's durable input on every dispatch, the same
 handler is correct whether it runs in-process or is re-dispatched on another node.
+The `waitForDeploy` call parks the executor's fiber until the deploy finishes;
+returning then completes the task. For an externally-signalled completion that
+should not hold a fiber, return early instead and have your webhook (or job
+callback) call `rt.complete(taskId, …)` on the `TaskRuntime` `enableTasks` returns.
 Register `@task` functions like any other UDA handlers (`registerModule` /
 `registerHandlers`); see [`examples/tasks`](examples/tasks/) for the full set
 (plain async, cancellable, and mid-task elicitation) plus the matching client.
