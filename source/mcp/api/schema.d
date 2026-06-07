@@ -165,12 +165,14 @@ Json jsonSchemaOf(T)() @safe
 /// Fields without these UDAs are left untouched.
 private void applyFieldFacets(T, string field)(ref Json prop) @safe
 {
-	import mcp.api.attributes : minimum, maximum, title, SchemaDefault, format,
-		minLength, maxLength, pattern, minItems, maxItems;
+	import mcp.api.attributes : fieldDescription, minimum, maximum, title,
+		SchemaDefault, format, minLength, maxLength, pattern, minItems, maxItems;
 	import std.traits : getUDAs, hasUDA;
 
 	alias member = __traits(getMember, T, field);
 
+	static if (hasUDA!(member, fieldDescription))
+		prop["description"] = Json(getUDAs!(member, fieldDescription)[0].value);
 	static if (hasUDA!(member, minimum))
 		prop["minimum"] = Json(getUDAs!(member, minimum)[0].value);
 	static if (hasUDA!(member, maximum))
@@ -1422,4 +1424,19 @@ unittest  // a multi-select enum array is a valid elicitation field
 	assert(sel["type"].get!string == "array");
 	assert(sel["items"]["type"].get!string == "string");
 	assert(sel["items"]["enum"].length == 3);
+}
+
+unittest  // @fieldDescription emits the description on the property schema
+{
+	import mcp.api.attributes : fieldDescription;
+
+	struct Form
+	{
+		@fieldDescription("The user's age in years") int age;
+		string name;
+	}
+
+	auto s = jsonSchemaOf!Form;
+	assert(s["properties"]["age"]["description"].get!string == "The user's age in years");
+	assert("description" !in s["properties"]["name"]);
 }
