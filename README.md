@@ -331,17 +331,14 @@ the server as an ordinary `tools/call`, so the server implements no `ui/` method
 The [MCP Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview)
 (`io.modelcontextprotocol/tasks`, [SEP-2663](https://modelcontextprotocol.io/seps/2663-tasks-extension))
 lets a server answer a long-running `tools/call` with a durable task handle
-instead of blocking; the client polls `tasks/get` to completion, supplies
-mid-flight input via `tasks/update`, and may `tasks/cancel`. `enableTasks` turns
-it on (draft protocol only); the ergonomic way to expose a long-running tool is
-the `@task` UDA — a `@task` function becomes a tool whose `tools/call` returns a
-task handle immediately and whose body runs asynchronously, its typed return
-value becoming the task's final result. The injected `TaskContext` reports
-progress, observes cooperative cancellation, and elicits input mid-task; it is
-omitted from the tool's input schema (the typed params derive it):
+instead of blocking — the client polls `tasks/get` until it completes, and may
+`tasks/update` (mid-flight input) or `tasks/cancel`. Mark a function `@task` and it
+becomes one of these tools: the call returns a handle at once, the body runs
+asynchronously, and its return value becomes the result; the injected `TaskContext`
+reports progress, observes cancellation, and elicits input mid-task.
 
 ```d
-server.enableTasks();   // advertise io.modelcontextprotocol/tasks; pass a TaskStore for durable storage
+server.enableTasks();   // advertise io.modelcontextprotocol/tasks; pass a TaskStore for durability
 
 struct Approval { bool deploy; }
 
@@ -359,29 +356,8 @@ string deploy(string gitRef, TaskContext tc) @safe
 }
 ```
 
-`deploy` is human-in-the-loop: `tc.requireInput` suspends the task into
-`input_required`, the client answers via `tasks/update`, and the re-dispatched
-executor reads the answer through `tc.hasInput` / `tc.inputAs`. Because the typed
-params are reconstituted from the task's durable input on every dispatch, the same
-handler is correct whether it runs in-process or is re-dispatched on another node.
-The `waitForDeploy` call parks the executor's fiber until the deploy finishes;
-returning then completes the task. For an externally-signalled completion that
-should not hold a fiber, return early instead and have your webhook (or job
-callback) call `rt.complete(taskId, …)` on the `TaskRuntime` `enableTasks` returns.
-Register `@task` functions like any other UDA handlers (`registerModule` /
-`registerHandlers`); see [`examples/tasks`](examples/tasks/) for the full set
-(plain async, cancellable, and mid-task elicitation) plus the matching client.
-
-The server serves `tasks/get`, `tasks/update`, and `tasks/cancel` against the
-task store (in-memory by default; pass your own `TaskStore` for durability and a
-`TaskDispatcher` for horizontal scale — the `@task` handlers do not change).
-Supply a custom `TaskIdGenerator` via `TaskOptions` to correlate task IDs with an
-external job system; the runtime keeps them unique. Status changes are pushed as
-`notifications/tasks` for clients that opt into a listen stream, but polling
-remains the contract. For dynamic (non-UDA) tools, `enableTasks` returns a
-`TaskRuntime` and `server.registerTaskTool(descriptor, executor)` registers a
-task tool by hand; `ToolResponse.task(...)` is the underlying result a handler
-returns to answer a call with a task handle.
+See [`examples/tasks`](examples/tasks/) for cancellation, durable stores, and the
+client side.
 
 > **Not supported: the experimental 2025-11-25 tasks.** The `tasks` feature that
 > shipped in the 2025-11-25 core specification (a top-level `tasks` capability,
