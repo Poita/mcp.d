@@ -838,6 +838,31 @@ final class OAuthProxy
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
 	}
 
+	/// Build the upstream authorization redirect for a proxied `/authorize` whose
+	/// `client_id` is an OAuth Client ID Metadata Document URL (SEP-991), using an
+	/// already-fetched `doc` (fetch it SSRF-safely via `fetchClientIdMetadata`).
+	///
+	/// The document and `clientRedirectUri` are validated against the SEP-991
+	/// AS-side MUSTs (`validateClientIdMetadata`) before anything is forwarded;
+	/// the request is then gated on per-client user consent — keyed on the stable
+	/// `client_id` URL rather than the redirect_uri, since CIMD gives the client a
+	/// durable identity — to satisfy the confused-deputy MUST (the proxy still
+	/// collapses every client onto one upstream `client_id`). Throws
+	/// `InvalidClientIdMetadataException` when CIMD is not enabled on this proxy or
+	/// the document fails validation, and `ConsentRequiredException` when the
+	/// client_id URL has not been approved via `grantConsent`.
+	string authorizeWithClientIdMetadata(string clientIdUrl, const ClientIdMetadataDocument doc,
+			string clientRedirectUri, string codeChallenge, string scopeStr, string state) @safe
+	{
+		if (!cfg.clientIdMetadataDocumentSupported)
+			throw new InvalidClientIdMetadataException(clientIdUrl,
+					"Client ID Metadata Documents are not enabled on this proxy");
+		validateClientIdMetadata(clientIdUrl, doc, clientRedirectUri);
+		if (!consentStore.hasConsent(clientIdUrl))
+			throw new ConsentRequiredException(clientIdUrl);
+		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
+	}
+
 	/// Build the upstream token-exchange form for a proxied `/token`.
 	string tokenForm(string code, string codeVerifier) const @safe
 	{
@@ -1009,6 +1034,62 @@ unittest  // CIMD VALIDATE: the exception names the offending client_id URL
 		assert(e.clientId == "https://app.example.com/oauth/client.json");
 	}
 	assert(threw);
+}
+
+unittest  // CIMD AUTHORIZE: with a valid doc + consent on the client_id URL, forwards upstream with the fixed client_id
+{
+	import std.algorithm : canFind;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	auto doc = sampleCimdDoc();
+	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	auto url = proxy.authorizeWithClientIdMetadata("https://app.example.com/oauth/client.json",
+			doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S");
+	assert(url.startsWith("https://github.com/login/oauth/authorize?"));
+	assert(url.canFind("client_id=Iv1.upstream"));
+}
+
+unittest  // CIMD AUTHORIZE: confused-deputy gate — an un-consented client_id is refused
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	auto doc = sampleCimdDoc();
+	assertThrown!ConsentRequiredException(
+			proxy.authorizeWithClientIdMetadata("https://app.example.com/oauth/client.json",
+				doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S"));
+}
+
+unittest  // CIMD AUTHORIZE: an invalid document is rejected before the consent gate is consulted
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	auto doc = sampleCimdDoc();
+	doc.clientId = "https://app.example.com/oauth/OTHER.json"; // mismatch
+	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	assertThrown!InvalidClientIdMetadataException(
+			proxy.authorizeWithClientIdMetadata("https://app.example.com/oauth/client.json",
+				doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S"));
+}
+
+unittest  // CIMD AUTHORIZE: refused when the proxy is not configured to support CIMD
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig(); // clientIdMetadataDocumentSupported defaults to false
+	auto proxy = new OAuthProxy(cfg);
+	auto doc = sampleCimdDoc();
+	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	assertThrown!InvalidClientIdMetadataException(
+			proxy.authorizeWithClientIdMetadata("https://app.example.com/oauth/client.json",
+				doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S"));
 }
 
 unittest  // callback URL joins base_url and the default redirect path
