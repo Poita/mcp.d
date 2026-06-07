@@ -35,7 +35,7 @@
  */
 module tasks_server;
 
-import core.time : msecs;
+import core.time : msecs, seconds;
 
 import vibe.core.core : sleep;
 
@@ -85,7 +85,9 @@ final class TasksApi
 	import std.array : array, Appender;
 
 	/// Plain async task: count words and characters, with a progress update.
+	/// @taskTtl / @taskPollInterval set this task's timing (per-task, not global).
 	@task("word_count", "Count words and characters in text (runs asynchronously).")
+	@taskTtl(10.seconds) @taskPollInterval(200.msecs)
 	@readOnly WordCountResult wordCount(string text, TaskContext tc) @safe
 	{
 		tc.progress("counting...");
@@ -96,6 +98,7 @@ final class TasksApi
 	/// at a time, checking `cancelRequested` between characters. Returns the
 	/// partial result with `cancelled = true` if a cancel was observed.
 	@task("slow_reverse", "Reverse a string one character at a time (cancellable).")
+	@taskTtl(30.seconds) @taskPollInterval(100.msecs)
 	ReverseResult slowReverse(string text, TaskContext tc) @safe
 	{
 		Appender!string buf;
@@ -115,6 +118,7 @@ final class TasksApi
 	/// the client answers via `tasks/update`, the executor is re-invoked and the
 	/// answer is present.
 	@task("labeled_count", "Count words under a label the client supplies mid-task.")
+	@taskTtl(60.seconds) @taskPollInterval(200.msecs)
 	@readOnly LabeledCount labeledCount(string text, TaskContext tc) @safe
 	{
 		if (!tc.hasInput("label"))
@@ -133,9 +137,9 @@ void main(string[] args) @safe
 {
 	auto server = new McpServer("tasks-example", "1.0.0");
 
-	// Enable the tasks extension. A short default poll interval keeps the e2e
-	// brisk; passing a null store uses the in-memory default and a null dispatcher
-	// uses the in-process (fiber) default — fine for a single-node demo.
+	// Enable the tasks extension. A null store uses the in-memory default and a
+	// null dispatcher uses the in-process (fiber) default — fine for a single-node
+	// demo. Per-task timing comes from each @task's @taskTtl / @taskPollInterval.
 	//
 	// For a durable, horizontally-scaled deployment you supply your own store and
 	// dispatcher; the @task handlers above do not change. Because all task state
@@ -153,12 +157,9 @@ void main(string[] args) @safe
 	//   final class QueueTaskDispatcher : TaskDispatcher {
 	//       void dispatch(string taskId, void delegate(string) @safe run) { queue.publish(taskId); }
 	//   }
-	//   server.enableTasks(new RedisTaskStore(...), opts, new QueueTaskDispatcher(...));
+	//   server.enableTasks(new RedisTaskStore(...), TaskOptions.init, new QueueTaskDispatcher(...));
 	//
-	TaskOptions opts;
-	opts.defaultTtlMs = 30_000;
-	opts.defaultPollIntervalMs = 200;
-	server.enableTasks(null, opts);
+	server.enableTasks();
 
 	// Register all @task methods in one call — no per-tool wiring.
 	registerHandlers(server, new TasksApi);
