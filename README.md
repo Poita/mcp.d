@@ -294,6 +294,41 @@ are a **host (browser) concern** and intentionally out of scope for this
 transport-level SDK — when the embedded app calls a tool, the host proxies it to
 the server as an ordinary `tools/call`, so the server implements no `ui/` methods.
 
+## MCP Tasks (asynchronous execution)
+
+The [MCP Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview)
+(`io.modelcontextprotocol/tasks`, [SEP-2663](https://modelcontextprotocol.io/seps/2663-tasks-extension))
+lets a server answer a long-running `tools/call` with a durable task handle
+instead of blocking; the client polls `tasks/get` to completion, supplies
+mid-flight input via `tasks/update`, and may `tasks/cancel`. `enableTasks` turns
+it on (draft protocol only) and returns a `TaskRuntime`:
+
+```d
+auto server = new McpServer("ci", "1.0.0");
+auto tasks = server.enableTasks();      // advertise io.modelcontextprotocol/tasks
+
+// In a long-running tool: create a task, return its CreateTaskResult, and
+// resolve it as the work progresses (complete / fail / requireInput / cancel).
+auto t = tasks.create();
+// ... drive the work, then: tasks.complete(t.taskId, callToolResultJson);
+return makeCreateTaskResult(t);
+```
+
+The server serves `tasks/get`, `tasks/update`, and `tasks/cancel` against the
+task store (in-memory by default; pass your own `TaskStore` for durability).
+Supply a custom `TaskIdGenerator` via `TaskOptions` to correlate task IDs with an
+external job system; the runtime keeps them unique. Status changes are pushed as
+`notifications/tasks` for clients that opt into a listen stream, but polling
+remains the contract.
+
+> **Not supported: the experimental 2025-11-25 tasks.** The `tasks` feature that
+> shipped in the 2025-11-25 core specification (a top-level `tasks` capability,
+> `tasks/list`, `tasks/result`, the per-tool `execution.taskSupport` field, and
+> the per-request `task` parameter) was a stopgap the spec has since replaced with
+> this extension. It is **intentionally not implemented** — those methods answer
+> `-32601` and no `tasks` capability is advertised. Only the SEP-2663 extension
+> above is supported, and only under the draft protocol version.
+
 ## Event-loop model
 
 `McpClient` speaks vibe.d async I/O: call every `McpClient` method from inside the
