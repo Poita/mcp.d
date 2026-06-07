@@ -721,6 +721,19 @@ unittest  // formField decodes '+' as a space per application/x-www-form-urlenco
 	assert(formField("refresh_token=tok%2Bplus+space", "refresh_token") == "tok+plus space");
 }
 
+unittest  // formField '+' decoding in consent-flow state values (RFC 1866 §8.2.1)
+{
+	// Browsers form-encode '+' as a space when submitting a consent form; the
+	// state field must round-trip correctly when it contains '+'-encoded spaces.
+	assert(formField("state=hello+world&grant=ok", "state") == "hello world");
+	// Leading, trailing, and consecutive '+' signs must all become spaces.
+	assert(formField("state=+leading", "state") == " leading");
+	assert(formField("state=trailing+", "state") == "trailing ");
+	assert(formField("state=two++spaces", "state") == "two  spaces");
+	// A literal '+' encoded as %2B must survive as '+', not be decoded to space.
+	assert(formField("state=plus%2Bsign", "state") == "plus+sign");
+}
+
 unittest  // the /token dispatch reads grant_type + refresh_token from a refresh request body
 {
 	// A client following the advertised refresh_token grant POSTs this body. The
