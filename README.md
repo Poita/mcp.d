@@ -125,7 +125,7 @@ the interactive auth-code flow.
 ```bash
 ulimit -n 65536        # required: dub misbehaves under ghostty's `ulimit -n unlimited`
 dub build              # build the library
-dub test               # run all unit tests (11 modules, ~120 tests)
+dub test               # run all unit tests (42 modules, ~1900 tests)
 ```
 
 Formatting and linting:
