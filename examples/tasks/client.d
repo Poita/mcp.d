@@ -6,20 +6,35 @@
  *   - STDIO (default): spawns the sibling `tasks-server` binary.
  *   - HTTP (`--http <url>`): connects to a running server via Streamable HTTP.
  *
- * The Tasks extension is draft-only (`io.modelcontextprotocol/tasks`, SEP-2663):
- * before calling any tool the client enables the draft protocol with
- * `enableModern()` and declares the tasks extension with `enableTasks()`, then
- * negotiates via `server/discover` + `connect()`. `callToolAwait` transparently
- * handles the poll loop for any `CreateTaskResult` the server returns.
+ * Two complementary async input patterns are exercised:
+ *
+ *   1. SEP-2663 async tasks — `callToolAwait` calls the tool, detects the
+ *      `CreateTaskResult`, polls `tasks/get` until completed, and returns the
+ *      final `CallToolResult`. Tested via `word_count` and `slow_reverse`.
+ *
+ *   2. SEP-2322 MRTR stateless elicitation — `callTool` has the MRTR loop built
+ *      in: when the server returns `InputRequiredResult`, the SDK gathers answers
+ *      from the installed handlers and resubmits transparently. Tested via
+ *      `labeled_word_count`:
+ *        a. First called with no handler installed to inspect the raw
+ *           `InputRequiredResult` shape (input requests + requestState blob).
+ *        b. Then `onElicitation` is installed and the call is repeated; the SDK
+ *           loop satisfies round 1 and returns the completed round-2 result.
  *
  * Assertions verified:
  *   - `server/discover` advertises the tasks extension under `capabilities`.
- *   - `callToolAwait("word_count", ...)` polls until completed and returns the
- *     expected word/character counts decoded from `structuredContent`.
+ *   - `callToolAwait("word_count", ...)` returns correct word/character counts.
  *   - `callToolAwait("slow_reverse", ...)` returns the fully reversed string.
+ *   - `callTool("labeled_word_count", ...)` surfaces `isInputRequired` on the
+ *     first call (no handler), with the correct request id and type.
+ *   - With handler installed, `callTool("labeled_word_count", ...)` completes
+ *     with the label supplied by the handler and the correct counts.
  *   - `isTaskResult` correctly identifies a `CreateTaskResult` JSON object.
  */
 module tasks_client;
+
+import std.conv : to;
+import std.stdio : writeln;
 
 import vibe.data.json : Json;
 
@@ -40,6 +55,22 @@ struct ReverseResult
 	bool cancelled;
 }
 
+/// Elicitation answer for `labeled_word_count` — mirrors the server's
+/// `LabelOptions` form struct so `ElicitResult.accept!LabelOptions` builds the
+/// correct wire payload.
+struct LabelOptions
+{
+	string label;
+}
+
+/// Typed view of the `labeled_word_count` structured result.
+struct LabeledCount
+{
+	string label;
+	int words;
+	int chars;
+}
+
 int main(string[] args) @safe
 {
 	return runClient(() @safe {
@@ -48,10 +79,15 @@ int main(string[] args) @safe
 			client.close();
 
 		// The tasks extension is draft-only: switch to the stateless draft
-		// protocol and declare the extension in client capabilities before
+		// protocol and declare the tasks extension in client capabilities before
 		// version negotiation.
 		client.enableModern();
 		client.enableTasks();
+
+		// Advertise elicitation capability before discover() so the server
+		// includes elicitation InputRequests for clients that support it.
+		client.capabilities.elicitation = true;
+		client.capabilities.elicitationForm = true;
 
 		// --- 1. server/discover: tasks extension must be advertised ---------
 		auto disc = client.discover();
@@ -69,10 +105,10 @@ int main(string[] args) @safe
 		auto negotiated = client.connect();
 		checkEq(negotiated, ProtocolVersion.modern, "connect() should negotiate draft");
 
-		// --- 3. word_count (async, no user input required) ------------------
-		// `callToolAwait` calls the tool, detects the `CreateTaskResult`, and
-		// polls `tasks/get` until the task moves to `completed`, then returns
-		// the final `CallToolResult` decoded from the task's structured result.
+		// --- 3. word_count (async task, no user input required) -------------
+		// `callToolAwait` detects the `CreateTaskResult`, polls `tasks/get`
+		// until the task moves to `completed`, and returns the final
+		// `CallToolResult` decoded from the task's structured result.
 		{
 			Json a = Json.emptyObject;
 			a["text"] = "the quick brown fox jumps over the lazy dog";
@@ -83,8 +119,8 @@ int main(string[] args) @safe
 			checkEq(wc.chars, 43, "word_count.chars");
 		}
 
-		// --- 4. slow_reverse (async, runs to completion) -------------------
-		// A short string so the e2e test finishes quickly (5 chars × 10ms).
+		// --- 4. slow_reverse (async task, runs to completion) ---------------
+		// A short string so the e2e test finishes quickly (5 chars × 10 ms).
 		{
 			Json a = Json.emptyObject;
 			a["text"] = "hello";
@@ -95,7 +131,53 @@ int main(string[] args) @safe
 			check(!rv.cancelled, "slow_reverse completed normally (not cancelled)");
 		}
 
-		// --- 5. isTaskResult discriminator ----------------------------------
+		// --- 5. labeled_word_count (MRTR / stateless elicitation) -----------
+		// Round a: no handler installed → `callTool` surfaces the raw
+		// `InputRequiredResult` so we can inspect the request shape.
+		{
+			auto raw = client.callTool("labeled_word_count", Json([
+					"text": Json("hello world")
+			]));
+			check(raw.isInputRequired,
+				"labeled_word_count round 1 should return InputRequiredResult");
+			check(raw.inputRequests.length == 1,
+				"labeled_word_count should have 1 input request, got " ~ to!string(
+				raw.inputRequests.length));
+			check(raw.inputRequests[0].id == "label_req",
+				"input request id should be 'label_req', got '" ~ raw.inputRequests[0].id ~ "'");
+			check(raw.inputRequests[0].type == "elicitation",
+				"input request type should be 'elicitation', got '" ~ raw.inputRequests[0].type
+				~ "'");
+			// The schema is derived from the server's `LabelOptions` struct; it
+			// must expose a `label` string property.
+			auto schema = raw.inputRequests[0].requestedSchema();
+			check(schema.type == Json.Type.object,
+				"labeled_word_count requestedSchema should be a JSON object");
+			check(("label" in schema["properties"]) !is null,
+				"labeled_word_count requestedSchema should expose a 'label' property");
+			check(raw.requestState.length > 0,
+				"labeled_word_count round 1 should carry a requestState blob");
+		}
+
+		// Round b: install handler → the SDK MRTR loop satisfies round 1 and
+		// returns the completed round-2 result directly.
+		client.onElicitation = (ElicitParams p) @safe {
+			return ElicitResult.accept(LabelOptions("my-label"));
+		};
+		{
+			auto done = client.callTool("labeled_word_count", Json([
+					"text": Json("hello world")
+			]));
+			check(!done.isInputRequired,
+				"labeled_word_count with handler should have completed, not returned InputRequired");
+			check(!done.isError, "labeled_word_count should not be an error");
+			auto lc = done.structuredContentAs!LabeledCount;
+			checkEq(lc.label, "my-label", "labeled_word_count.label");
+			checkEq(lc.words, 2, "labeled_word_count.words");
+			checkEq(lc.chars, 11, "labeled_word_count.chars");
+		}
+
+		// --- 6. isTaskResult discriminator ----------------------------------
 		{
 			check(McpClient.isTaskResult(Json([
 				"resultType": Json("task"),
@@ -108,17 +190,16 @@ int main(string[] args) @safe
 				"isTaskResult should be false for resultType:\"complete\"");
 		}
 
-		import std.stdio : writeln;
-
 		bool http;
 		foreach (arg; args)
 			if (arg == "--http" || arg == "--url")
 				http = true;
-		writeln("OK: tasks example e2e passed over ",
-			http ? "http" : "stdio",
-			" — tasks extension advertised, word_count async completion (",
-			"9 words/43 chars), slow_reverse completion (\"hello\"->\"olleh\"), ",
-			"isTaskResult discriminator all verified.");
+		writeln("OK: tasks example e2e passed over ", http
+			? "http" : "stdio",
+			" — tasks extension advertised, word_count async task (9 words/43 chars),",
+			" slow_reverse async task (\"hello\"->\"olleh\"),",
+			" labeled_word_count MRTR (raw InputRequired shape + handler completion),",
+			" isTaskResult discriminator all verified.");
 		return 0;
 	});
 }
