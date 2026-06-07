@@ -332,7 +332,6 @@ final class McpServer
 	private string[]delegate(string prefix) @safe[string] argumentCompleters;
 	private bool loggingEnabled;
 	private bool resourceSubscriptionsEnabled;
-	private Nullable!TasksCapability tasksCapability;
 	private Json extensions = Json.undefined;
 	// Per-connection mutable state — negotiated protocol version, client
 	// capabilities, log level, subscriptions, and the `inFlight` cancellation
@@ -1019,31 +1018,6 @@ final class McpServer
 		promptsListChangedEnabled = true;
 	}
 
-	/// Advertise the 2025-11-25 `tasks` capability, i.e. support for
-	/// task-augmented requests. `list`/`cancel` indicate support for
-	/// `tasks/list` and `tasks/cancel`; `requests` is the nested-by-category
-	/// object describing which requests may be task-augmented. Its spec shape is
-	/// the nested form `{"tools": {"call": {}}}`, NOT a flat `"tools/call"` key.
-	/// Build it with `TaskRequests`, for example
-	/// `enableTasks(true, true, TaskRequests().tool().toJson())`. The capability
-	/// appears in the `tasks` field of the server capabilities sent during
-	/// `initialize` / `server/discover`.
-	void enableTasks(bool list = true, bool cancel = true, Json requests = Json.undefined) @safe
-	{
-		TasksCapability t;
-		t.list = list;
-		t.cancel = cancel;
-		t.requests = requests;
-		tasksCapability = t;
-	}
-
-	/// The `tasks` capability the connected client advertised (valid after
-	/// `initialize`). Null if the client advertised none.
-	Nullable!TasksCapability clientTasks() const @safe
-	{
-		return activeConnection.clientCaps.tasks;
-	}
-
 	/// Advertise a draft protocol extension (e.g. "io.modelcontextprotocol/tasks")
 	/// with an optional per-extension settings object. The identifier and its
 	/// settings appear in the `extensions` field of the server capabilities sent
@@ -1361,8 +1335,6 @@ final class McpServer
 			caps.completions = true;
 		if (loggingEnabled)
 			caps.logging = true;
-		if (!tasksCapability.isNull)
-			caps.tasks = tasksCapability;
 		if (extensions.type == Json.Type.object && extensions.length > 0)
 			caps.extensions = extensions;
 		return caps;
@@ -2223,108 +2195,9 @@ final class McpServer
 			return doComplete(params);
 		case "logging/setLevel":
 			return doSetLevel(params, ver, conn);
-		case "tasks/list":
-			// SEP-2663 removed `tasks/list` from the draft tasks extension, so on
-			// a draft-negotiated session the method does not exist and MUST answer
-			// -32601 (method not found), mirroring tasks/result. The 2025-11-25
-			// family still defines it, where doTasksList returns an empty page.
-			if (ver.isModern)
-				throw methodNotFound(method);
-			return doTasksList(params, ver);
-		case "tasks/get":
-			return doTasksGet(params, ver);
-		case "tasks/result":
-			// SEP-2663 removed `tasks/result` from the draft tasks extension, so on
-			// a draft-negotiated session the method does not exist and MUST answer
-			// -32601 (method not found) rather than -32602 (task not found). The
-			// 2025-11-25 family still defines it, where doTasksResult yields -32602
-			// for any (always-unknown) taskId.
-			if (ver.isModern)
-				throw methodNotFound(method);
-			return doTasksResult(params, ver);
-		case "tasks/cancel":
-			return doTasksCancel(params, ver);
-		case "tasks/update":
-			// `tasks/update` is a draft-only method (SEP-2663 lists tasks/get,
-			// tasks/update, tasks/cancel for the `io.modelcontextprotocol/tasks`
-			// extension) and is NOT part of the 2025-11-25 stable family. This is the
-			// inverse of tasks/result: stable answers -32601 (method not found), the
-			// draft routes to doTasksUpdate which yields -32602 (task not found) for
-			// any id against the permanently-empty store.
-			if (!ver.isModern)
-				throw methodNotFound(method);
-			return doTasksUpdate(params, ver);
 		default:
 			throw methodNotFound(method);
 		}
-	}
-
-	// The `tasks` extension (2025-11-25 / draft `io.modelcontextprotocol/tasks`)
-	// RPCs. `enableTasks()` advertises support for these, so the server MUST route
-	// them rather than returning -32601 for an advertised operation. This SDK
-	// does not yet drive the two-phase CreateTaskResult flow from `tools/call`, so
-	// no task is ever created: the task store is permanently empty. `tasks/get`,
-	// `tasks/result`, and `tasks/cancel` answer with `-32602` (task not found) for
-	// any id under the 2025-11-25 family, per the extension's "unknown /
-	// non-cancellable task" rule, and `tasks/list` returns an empty page. The draft
-	// (`io.modelcontextprotocol/tasks`, SEP-2663) defines no `tasks/result`, so on a
-	// draft-negotiated session that method does not exist and is gated in route()
-	// to `-32601` (method not found); `tasks/get`/`tasks/cancel` remain `-32602`.
-	// A server that never called `enableTasks()` does not advertise the capability
-	// and MUST NOT serve these (returns -32601), matching logging/setLevel and
-	// resources/subscribe gating.
-	private void requireTasksAdvertised(ProtocolVersion ver) @safe
-	{
-		// The tasks capability is advertised only on versions that define it:
-		// 2025-11-25 (and later stable) and the draft (where it is folded into the
-		// `extensions` map). On 2024-11-05 / 2025-03-26 / 2025-06-18 the capability
-		// is never advertised even when `enableTasks()` was called, so these RPCs
-		// MUST report -32601 — matching the version gates on server/discover,
-		// resources/subscribe, and logging/setLevel.
-		if (ver < ProtocolVersion.v2025_11_25 && !ver.isModern)
-			throw methodNotFound("tasks");
-		if (tasksCapability.isNull)
-			throw methodNotFound("tasks");
-	}
-
-	private Json doTasksList(Json params, ProtocolVersion ver) @safe
-	{
-		requireTasksAdvertised(ver);
-		Json result = Json.emptyObject;
-		result["tasks"] = Json.emptyArray;
-		return result;
-	}
-
-	private Json taskNotFound(Json params) @safe
-	{
-		Json data = Json.emptyObject;
-		if (params.type == Json.Type.object && "taskId" in params)
-			data["taskId"] = params["taskId"];
-		throw new McpException(ErrorCode.invalidParams, "Task not found", data);
-	}
-
-	private Json doTasksGet(Json params, ProtocolVersion ver) @safe
-	{
-		requireTasksAdvertised(ver);
-		return taskNotFound(params);
-	}
-
-	private Json doTasksResult(Json params, ProtocolVersion ver) @safe
-	{
-		requireTasksAdvertised(ver);
-		return taskNotFound(params);
-	}
-
-	private Json doTasksCancel(Json params, ProtocolVersion ver) @safe
-	{
-		requireTasksAdvertised(ver);
-		return taskNotFound(params);
-	}
-
-	private Json doTasksUpdate(Json params, ProtocolVersion ver) @safe
-	{
-		requireTasksAdvertised(ver);
-		return taskNotFound(params);
 	}
 
 	/// `server/discover` (draft): advertise supported versions, capabilities,
@@ -2767,10 +2640,7 @@ final class McpServer
 	{
 		// Each tool is projected to the negotiated protocol version (via
 		// `paginatedList` -> `forVersion`) so version-gated fields are not emitted
-		// to peers that don't understand them. `Tool.execution`
-		// (ToolExecution.taskSupport) is a 2025-11-25-only field (absent
-		// pre-2025-11-25, dropped from draft); forVersion emits it only when `ver`
-		// is exactly 2025-11-25.
+		// to peers that don't understand them.
 		return paginatedList!(ListToolsResult, "tools")("tools/list",
 				sortedToolNames(), (string name) => tools[name].descriptor, params, ver);
 	}
@@ -2797,30 +2667,6 @@ final class McpServer
 			? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
 		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
 			throw missingRequiredClientCapability(missing.get);
-
-		// Task-augmented execution gating. The SDK does not yet drive the two-phase
-		// CreateTaskResult flow from `tools/call`, so it must not silently downgrade
-		// a task-augmented call to a synchronous result, nor execute a tool that
-		// declares it MUST run as a task:
-		//   (a) a tool whose execution.taskSupport == "required" invoked WITHOUT
-		//       task augmentation is rejected (the tool cannot be run synchronously);
-		//       this is independent of whether tasks were declared.
-		//   (b) a task-augmented call (the 2025-11-25 `task` param) is rejected ONLY
-		//       when the server actually declared task support for `tools/call`. A
-		//       receiver that never declared the task capability MUST process the
-		//       request normally, ignoring the task augmentation
-		//       (basic/utilities/tasks: "Receivers that do not declare the task
-		//       capability for a request type MUST process requests of that type
-		//       normally, ignoring any task-augmentation metadata if present").
-		// The tool is registered, so this is reported as an invalid request rather
-		// than -32601 (method not found), whose "Method not found: <tool>" message
-		// would misleadingly imply the tool name itself is unknown.
-		const bool taskRequired = !entry.descriptor.execution.isNull
-			&& !entry.descriptor.execution.get.taskSupport.isNull
-			&& entry.descriptor.execution.get.taskSupport.get == "required";
-		const bool taskAugmented = isTaskAugmented(params) && declaresTaskToolsCall();
-		if (taskAugmented || taskRequired)
-			throw invalidRequest("Task-based execution of tool '" ~ name ~ "' is not supported");
 
 		Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
 		// Validate the supplied arguments against the tool's declared inputSchema
@@ -2882,36 +2728,6 @@ final class McpServer
 			err.isError = true;
 			return err.toJson();
 		}
-	}
-
-	/// Whether a `tools/call` request carries task augmentation. The 2025-11-25
-	/// shape is a top-level `task` param object. The draft (SEP-2663) removed the
-	/// per-request opt-in entirely — the field is treated as unknown — so there is
-	/// no draft augmentation form to detect.
-	private static bool isTaskAugmented(Json params) @safe
-	{
-		if (params.type != Json.Type.object)
-			return false;
-		if ("task" in params && params["task"].type != Json.Type.undefined)
-			return true;
-		return false;
-	}
-
-	/// Whether the server declared task support for `tools/call`. This is true only
-	/// when the `tasks` capability was advertised AND its nested `requests` object
-	/// marks `tools.call` as task-augmentable (`tasks.requests.tools.call`). A
-	/// server that never declared this MUST ignore task augmentation on a
-	/// `tools/call` and process the request normally.
-	private bool declaresTaskToolsCall() @safe
-	{
-		if (tasksCapability.isNull)
-			return false;
-		auto requests = tasksCapability.get.requests;
-		if (requests.type != Json.Type.object)
-			return false;
-		if ("tools" !in requests || requests["tools"].type != Json.Type.object)
-			return false;
-		return ("call" in requests["tools"]) !is null;
 	}
 
 	/// When input-schema validation is enabled, verify that a tool call's
@@ -3166,11 +2982,14 @@ unittest  // a stateful session ignores a body _meta.protocolVersion naming an e
 	// On a stateful 2025-era session the negotiated version is fixed at
 	// initialize and governs every request: a per-request body
 	// `_meta.protocolVersion` naming an earlier version MUST NOT re-select the
-	// effective version. The tasks RPCs are gated at >= 2025-11-25, so if the body
-	// version (2025-03-26) were honoured `tasks/list` would report -32601; gated at
-	// the negotiated 2025-11-25 it returns an empty page.
+	// effective version or cause the request to be rejected.
 	auto s = McpServer.stateful("ver-srv", "0.1.0");
-	s.enableTasks();
+	Tool t = {name: "noop"};
+	s.registerDynamicTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
 
 	Json init = Json.emptyObject;
 	init["protocolVersion"] = "2025-11-25";
@@ -3183,9 +3002,10 @@ unittest  // a stateful session ignores a body _meta.protocolVersion naming an e
 	Json meta = Json.emptyObject;
 	meta["io.modelcontextprotocol/protocolVersion"] = "2025-03-26";
 	params["_meta"] = meta;
-	auto resp = s.handle(req(2, "tasks/list", params)).get;
+	auto resp = s.handle(req(2, "tools/list", params)).get;
 	assert("error" !in resp, "body _meta.protocolVersion must not down-gate a stateful session");
-	assert(resp["result"]["tasks"].type == Json.Type.array);
+	assert(resp["result"]["tools"].type == Json.Type.array);
+	assert(s.negotiatedVersion == ProtocolVersion.v2025_11_25);
 }
 
 unittest  // initialize negotiates the requested version and reports server info
@@ -3729,119 +3549,6 @@ unittest  // tools/call keeps structuredContent for a 2025-11-25 client
 	assert("structuredContent" in resp["result"]);
 }
 
-unittest  // a taskSupport:"required" tool invoked WITHOUT augmentation is rejected, not run
-{
-	auto s = new McpServer("req-task-srv", "0.1.0");
-	bool ran;
-	Tool t = {name: "longjob"};
-	t.execution = ToolExecution(nullable("required"));
-	s.registerDynamicTool(t, (Json args) @safe {
-		ran = true;
-		CallToolResult r;
-		r.content = [Content.makeText("ok")];
-		return r;
-	});
-
-	Json params = Json.emptyObject;
-	params["name"] = "longjob";
-	auto resp = s.handle(req(4, "tools/call", params)).get;
-	assert("error" in resp, "a required-task tool must not run synchronously");
-	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
-	assert(!ran, "the handler must not execute for a required-task tool sans augmentation");
-}
-
-unittest  // a task-augmented tools/call runs normally when tasks were never declared
-{
-	auto s = new McpServer("aug-task-srv", "0.1.0");
-	bool ran;
-	Tool t = {name: "add"};
-	t.execution = ToolExecution(nullable("optional"));
-	s.registerDynamicTool(t, (Json args) @safe {
-		ran = true;
-		CallToolResult r;
-		r.content = [Content.makeText("ok")];
-		return r;
-	});
-
-	Json params = Json.emptyObject;
-	params["name"] = "add";
-	params["task"] = Json.emptyObject; // 2025-11-25 task augmentation
-	auto resp = s.handle(req(4, "tools/call", params)).get;
-	assert("result" in resp,
-			"a server that never declared tasks must ignore the augmentation and run");
-	assert(resp["result"]["content"][0]["text"].get!string == "ok");
-	assert(ran, "the handler must run when the task augmentation is ignored");
-}
-
-unittest  // a task-augmented tools/call is rejected when the server declared task support
-{
-	auto s = new McpServer("aug-task-cap-srv", "0.1.0");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-	bool ran;
-	Tool t = {name: "add"};
-	t.execution = ToolExecution(nullable("optional"));
-	s.registerDynamicTool(t, (Json args) @safe {
-		ran = true;
-		CallToolResult r;
-		r.content = [Content.makeText("ok")];
-		return r;
-	});
-
-	Json params = Json.emptyObject;
-	params["name"] = "add";
-	params["task"] = Json.emptyObject; // 2025-11-25 task augmentation
-	auto resp = s.handle(req(4, "tools/call", params)).get;
-	assert("error" in resp, "a declared task-augmented call cannot be served as a CallToolResult");
-	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
-	assert(!ran);
-}
-
-unittest  // an ordinary (non-augmented) call to an optional-task tool still runs
-{
-	auto s = new McpServer("opt-task-srv", "0.1.0");
-	Tool t = {name: "add"};
-	t.execution = ToolExecution(nullable("optional"));
-	s.registerDynamicTool(t, (Json args) @safe {
-		CallToolResult r;
-		r.content = [Content.makeText("ok")];
-		return r;
-	});
-
-	Json params = Json.emptyObject;
-	params["name"] = "add";
-	auto resp = s.handle(req(4, "tools/call", params)).get;
-	assert("error" !in resp, "an optional-task tool runs normally without augmentation");
-	assert(resp["result"]["content"][0]["text"].get!string == "ok");
-}
-
-unittest  // a task-gated rejection reports an accurate error, not a misleading methodNotFound
-{
-	// The tool IS registered, so -32601 "Method not found: longjob" would wrongly
-	// suggest the tool name is unknown. The rejection is about the unsupported
-	// task-execution mode, so it must carry an accurate message that does not read
-	// as "method not found".
-	import std.algorithm : canFind;
-
-	auto s = new McpServer("task-msg-srv", "0.1.0");
-	Tool t = {name: "longjob"};
-	t.execution = ToolExecution(nullable("required"));
-	s.registerDynamicTool(t, (Json args) @safe {
-		CallToolResult r;
-		r.content = [Content.makeText("ok")];
-		return r;
-	});
-
-	Json params = Json.emptyObject;
-	params["name"] = "longjob";
-	auto resp = s.handle(req(1, "tools/call", params)).get;
-	assert("error" in resp);
-	assert(resp["error"]["code"].get!int != ErrorCode.methodNotFound);
-	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
-	const msg = resp["error"]["message"].get!string;
-	assert(msg.canFind("longjob"));
-	assert(!msg.canFind("Method not found"));
-}
-
 unittest  // tools/call is -32601 when the server advertises no tools capability
 {
 	// A server that never registered a tool advertises no `tools` capability, so a
@@ -3887,66 +3594,6 @@ unittest  // tools/list emits a tool descriptor's _meta
 
 	auto resp = s.handle(req(1, "tools/list")).get;
 	assert(resp["result"]["tools"][0]["_meta"]["x.example/group"].get!string == "demo");
-}
-
-unittest  // tools/list gates Tool.execution to a 2025-11-25-negotiated client
-{
-	auto s = new McpServer("exec-srv", "0.1.0");
-	Tool t = {name: "longjob"};
-	t.execution = ToolExecution(nullable("optional"));
-	s.registerDynamicTool(t, (Json args) @safe {
-		CallToolResult r;
-		r.content = [Content.makeText("ok")];
-		return r;
-	});
-
-	Json initP = Json.emptyObject;
-	initP["protocolVersion"] = "2025-11-25";
-	s.handle(req(1, "initialize", initP)).get;
-
-	auto resp = s.handle(req(2, "tools/list")).get;
-	auto tool = resp["result"]["tools"][0];
-	assert("execution" in tool, "execution must be emitted to a 2025-11-25 client");
-	assert(tool["execution"]["taskSupport"].get!string == "optional");
-}
-
-unittest  // tools/list omits Tool.execution for a draft client
-{
-	auto s = new McpServer("exec-srv", "0.1.0");
-	Tool t = {name: "longjob"};
-	t.execution = ToolExecution(nullable("optional"));
-	s.registerDynamicTool(t, (Json args) @safe {
-		CallToolResult r;
-		r.content = [Content.makeText("ok")];
-		return r;
-	});
-
-	// A draft client establishes the draft protocol via per-request `_meta`,
-	// NOT the `initialize` handshake (which has no draft semantics).
-	auto resp = s.handle(draftReq(2, "tools/list")).get;
-	auto tool = resp["result"]["tools"][0];
-	assert("execution" !in tool,
-			"execution must NOT be emitted to a draft client (dropped from draft schema)");
-}
-
-unittest  // tools/list omits Tool.execution for a 2025-06-18-negotiated client
-{
-	auto s = new McpServer("exec-srv", "0.1.0");
-	Tool t = {name: "longjob"};
-	t.execution = ToolExecution(nullable("required"));
-	s.registerDynamicTool(t, (Json args) @safe {
-		CallToolResult r;
-		r.content = [Content.makeText("ok")];
-		return r;
-	});
-
-	Json initP = Json.emptyObject;
-	initP["protocolVersion"] = "2025-06-18";
-	s.handle(req(1, "initialize", initP)).get;
-
-	auto resp = s.handle(req(2, "tools/list")).get;
-	auto tool = resp["result"]["tools"][0];
-	assert("execution" !in tool, "execution did not exist before 2025-11-25");
 }
 
 unittest  // tools/call propagates a handler's result-level _meta to the wire
@@ -5476,190 +5123,6 @@ unittest  // completions ARE advertised from 2025-03-26 onward
 	}
 }
 
-unittest  // tasks are NOT advertised before 2025-11-25
-{
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-
-	foreach (ver; ["2024-11-05", "2025-03-26", "2025-06-18"])
-	{
-		Json params = Json.emptyObject;
-		params["protocolVersion"] = ver;
-		auto resp = s.handle(req(1, "initialize", params)).get;
-		assert("tasks" !in resp["result"]["capabilities"],
-				"tasks leaked into negotiated version " ~ ver);
-	}
-}
-
-unittest  // enableTasks advertises the `tasks` capability at initialize
-{
-	auto s = new McpServer("t", "1");
-	// Spec 2025-11-25: nested-by-category `requests`, i.e. {"tools": {"call": {}}}.
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-
-	Json params = Json.emptyObject;
-	params["protocolVersion"] = "2025-11-25";
-	auto resp = s.handle(req(1, "initialize", params)).get;
-	auto t = resp["result"]["capabilities"]["tasks"];
-	assert(t.type == Json.Type.object);
-	assert(t["list"].type == Json.Type.object);
-	assert(t["cancel"].type == Json.Type.object);
-	assert(t["requests"]["tools"]["call"].type == Json.Type.object);
-	assert("tools/call" !in t["requests"]);
-}
-
-unittest  // enableTasks routes tasks/list rather than returning -32601
-{
-	// The server advertises tasks support, so it MUST serve the tasks/* RPCs it
-	// advertises. tasks/list returns an (empty) task page, never method-not-found.
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-	auto resp = s.handle(req(1, "tasks/list")).get;
-	assert("error" !in resp, "tasks/list returned an error on a task-enabled server");
-	assert(resp["result"]["tasks"].type == Json.Type.array);
-	assert(resp["result"]["tasks"].length == 0);
-}
-
-unittest  // enableTasks routes tasks/get|result|cancel as task-not-found, not -32601
-{
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-	foreach (m; ["tasks/get", "tasks/result", "tasks/cancel"])
-	{
-		Json p = Json.emptyObject;
-		p["taskId"] = "nope";
-		auto resp = s.handle(req(1, m, p)).get;
-		// Advertised but no such task: -32602 (not the -32601 unknown-method code).
-		assert(resp["error"]["code"].get!int == ErrorCode.invalidParams, m);
-		assert(resp["error"]["code"].get!int != ErrorCode.methodNotFound, m);
-	}
-}
-
-unittest  // tasks/* are -32601 when the server never advertised the capability
-{
-	// A server that did not call enableTasks() advertises no tasks capability, so
-	// it MUST NOT serve the tasks/* RPCs (returns -32601), mirroring the gating of
-	// logging/setLevel and resources/subscribe.
-	auto s = new McpServer("t", "1");
-	foreach (m; ["tasks/list", "tasks/get", "tasks/result", "tasks/cancel"])
-	{
-		auto resp = s.handle(req(1, m)).get;
-		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
-	}
-}
-
-unittest  // tasks/list|get|cancel are -32601 on a pre-2025-11-25 negotiated session
-{
-	// The tasks capability is only advertised on 2025-11-25 and the draft. On a
-	// 2025-06-18 session an enableTasks() server advertises NO tasks capability,
-	// so the three tasks RPCs MUST report -32601 rather than serving an empty
-	// page / task-not-found.
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-
-	Json params = Json.emptyObject;
-	params["protocolVersion"] = "2025-06-18";
-	params["capabilities"] = Json.emptyObject;
-	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
-	auto init = s.handle(req(1, "initialize", params)).get;
-	assert(init["result"]["protocolVersion"].get!string == "2025-06-18");
-	assert("tasks" !in init["result"]["capabilities"]);
-
-	foreach (m; ["tasks/list", "tasks/get", "tasks/cancel"])
-	{
-		auto resp = s.handle(req(2, m)).get;
-		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
-	}
-}
-
-unittest  // draft tasks/result is -32601: SEP-2663 defines no tasks/result in the draft extension
-{
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-	Json p = Json.emptyObject;
-	p["taskId"] = "nope";
-	auto resp = s.handle(draftReq(1, "tasks/result", p)).get;
-	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
-}
-
-unittest  // draft tasks/update for an unknown taskId is -32602 with the echoed taskId
-{
-	// SEP-2663 lists tasks/update among the three methods the draft
-	// `io.modelcontextprotocol/tasks` extension MUST support, so a draft session
-	// MUST route it. Against the permanently-empty store an unknown taskId yields
-	// -32602 (task not found), echoing the taskId in error.data, exactly like its
-	// sibling draft methods tasks/get and tasks/cancel.
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-	Json p = Json.emptyObject;
-	p["taskId"] = "nope";
-	auto resp = s.handle(draftReq(1, "tasks/update", p)).get;
-	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
-	assert(resp["error"]["code"].get!int != ErrorCode.methodNotFound);
-	assert(resp["error"]["data"]["taskId"].get!string == "nope");
-}
-
-unittest  // 2025-11-25 tasks/update is -32601: it is a draft-only method
-{
-	// tasks/update is draft-only per SEP-2663 and is NOT part of the 2025-11-25
-	// stable family — the inverse of tasks/result. On a stable session it MUST
-	// answer -32601 (method not found).
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-	Json p = Json.emptyObject;
-	p["taskId"] = "nope";
-	auto resp = s.handle(req(1, "tasks/update", p)).get;
-	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
-}
-
-unittest  // draft tasks/list is -32601: SEP-2663 removed tasks/list from the draft extension
-{
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-	auto resp = s.handle(draftReq(1, "tasks/list")).get;
-	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
-}
-
-unittest  // 2025-11-25 tasks/list still returns an empty page (defined in the stable family)
-{
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-	auto resp = s.handle(req(1, "tasks/list")).get;
-	assert("error" !in resp);
-	assert(resp["result"]["tasks"].type == Json.Type.array);
-	assert(resp["result"]["tasks"].length == 0);
-}
-
-unittest  // 2025-11-25 tasks/result for an unknown taskId is -32602 (still defined)
-{
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-	Json p = Json.emptyObject;
-	p["taskId"] = "nope";
-	auto resp = s.handle(req(1, "tasks/result", p)).get;
-	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
-}
-
-unittest  // draft tasks/get for an unknown taskId is -32602
-{
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-	Json p = Json.emptyObject;
-	p["taskId"] = "nope";
-	auto resp = s.handle(draftReq(1, "tasks/get", p)).get;
-	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
-}
-
-unittest  // draft tasks/cancel for an unknown taskId is -32602
-{
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-	Json p = Json.emptyObject;
-	p["taskId"] = "nope";
-	auto resp = s.handle(draftReq(1, "tasks/cancel", p)).get;
-	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
-}
-
 unittest  // prompts/get downgrades audio content to a text placeholder for a 2024-11-05 peer
 {
 	// Guards the doGetPrompt wiring of PromptResponse.forVersion: a prompt message
@@ -5730,52 +5193,6 @@ unittest  // prompts/get keeps resource_link content intact for a 2025-06-18 pee
 	params["name"] = "p";
 	auto resp = s.handle(req(2, "prompts/get", params)).get;
 	assert(resp["result"]["messages"][0]["content"]["type"].get!string == "resource_link");
-}
-
-unittest  // enableTasks: draft server/discover folds tasks into extensions, no top-level
-{
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-
-	// Draft clients discover capabilities via `server/discover`, not `initialize`
-	// (which has no draft semantics).
-	auto resp = s.handle(draftReq(1, "server/discover")).get;
-	auto caps = resp["result"]["capabilities"];
-	// draft schema defines no top-level `tasks` capability.
-	assert("tasks" !in caps, "tasks leaked as a top-level capability under draft");
-	// Task support is carried via the extensions negotiation map.
-	assert("extensions" in caps);
-	assert("io.modelcontextprotocol/tasks" in caps["extensions"]);
-	auto folded = caps["extensions"]["io.modelcontextprotocol/tasks"];
-	assert(folded["requests"]["tools"]["call"].type == Json.Type.object);
-}
-
-unittest  // enableTasks: draft server/discover folds tasks into extensions
-{
-	auto s = new McpServer("t", "1");
-	s.enableTasks(true, true, TaskRequests().tool().toJson());
-	auto resp = s.handle(draftReq(1, "server/discover")).get;
-	auto caps = resp["result"]["capabilities"];
-	assert("tasks" !in caps);
-	assert("io.modelcontextprotocol/tasks" in caps["extensions"]);
-}
-
-unittest  // server reads the `tasks` capability a client advertises at initialize
-{
-	auto s = new McpServer("t", "1");
-	Json caps = Json.emptyObject;
-	Json t = Json.emptyObject;
-	// Client advertises nested-by-category requests per spec 2025-11-25.
-	t["requests"] = TaskRequests().samplingCreateMessage().toJson();
-	caps["tasks"] = t;
-
-	Json params = Json.emptyObject;
-	params["protocolVersion"] = "2025-11-25";
-	params["capabilities"] = caps;
-	s.handle(req(1, "initialize", params));
-
-	assert(!s.clientTasks.isNull);
-	assert(s.clientTasks.get.requests["sampling"]["createMessage"].type == Json.Type.object);
 }
 
 unittest  // server reads the extensions a client advertises at initialize

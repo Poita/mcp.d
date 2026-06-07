@@ -7,25 +7,10 @@ import mcp.protocol.jsonhelpers : getOr, tryGet;
 
 @safe:
 
-/// The draft Extension Negotiation identifier under which task support is
-/// declared. In the draft schema, `ServerCapabilities`/`ClientCapabilities`
-/// have NO top-level `tasks` field; task support is carried in the `extensions`
-/// map keyed by this identifier. (2025-11-25 keeps `tasks` as a first-class
-/// capability instead.)
+/// The Extension Negotiation identifier under which task support is declared
+/// (the SEP-2663 MCP Tasks extension). Carried in the draft `extensions`
+/// capability map; an empty settings object indicates support.
 enum string tasksExtensionKey = "io.modelcontextprotocol/tasks";
-
-/// Fold a (possibly null) first-class `tasks` capability into a copy of the
-/// draft `extensions` map under `tasksExtensionKey`. Used by `forVersion` to
-/// project task support to the draft wire shape, where `tasks` is not a
-/// top-level field. An explicit `extensions[tasksExtensionKey]` entry already
-/// present in `ext` is preserved (the caller's explicit advertisement wins).
-private Json foldTasksIntoExtensions(Json ext, const Nullable!TasksCapability tasks) @safe
-{
-	Json merged = (ext.type == Json.Type.object) ? ext.clone() : Json.emptyObject;
-	if (!tasks.isNull && tasksExtensionKey !in merged)
-		merged[tasksExtensionKey] = tasks.get.toJson();
-	return (merged.length > 0) ? merged : Json.undefined;
-}
 
 /// An icon for display in user interfaces. Used by `Implementation`,
 /// `Tool` (and other definitions) per the MCP spec's icon shape: a required
@@ -214,113 +199,6 @@ struct ResourcesCapability
 	}
 }
 
-/// Tasks capability (2025-11-25): support for task-augmented requests.
-///
-/// Server form may carry presence-only `list`/`cancel` sub-capabilities and a
-/// `requests` object structured by request category (e.g. `tools.call`).
-/// Client form carries only the `requests` object. Each struct preserves the
-/// distinction by only emitting the fields relevant to its role. Build the
-/// nested `requests` shape with `TaskRequests`.
-struct TasksCapability
-{
-	bool list; /// server: presence-only ({} when set); supports tasks/list
-	bool cancel; /// server: presence-only ({} when set); supports tasks/cancel
-	/// Which request types may be task-augmented, structured by request
-	/// category with presence-only sub-objects (spec 2025-11-25). Server form:
-	/// `{"tools": {"call": {}}}`; client form:
-	/// `{"sampling": {"createMessage": {}}, "elicitation": {"create": {}}}`.
-	/// Use `TaskRequests` to build this shape rather than flat slash-delimited
-	/// method names like `"tools/call"`.
-	Json requests = Json.undefined;
-
-	Json toJson() const @safe
-	{
-		Json j = Json.emptyObject;
-		if (list)
-			j["list"] = Json.emptyObject;
-		if (cancel)
-			j["cancel"] = Json.emptyObject;
-		if (requests.type == Json.Type.object)
-			j["requests"] = requests;
-		return j;
-	}
-
-	static TasksCapability fromJson(Json j) @safe
-	{
-		TasksCapability c;
-		if ("list" in j)
-			c.list = true;
-		if ("cancel" in j)
-			c.cancel = true;
-		if ("requests" in j && j["requests"].type == Json.Type.object)
-			c.requests = j["requests"];
-		return c;
-	}
-}
-
-/// Builder for the nested `tasks.requests` capability object (spec 2025-11-25).
-///
-/// The spec structures `tasks.requests` by request category with presence-only
-/// sub-objects rather than flat slash-delimited method names. For example, a
-/// server advertises task-augmented `tools/call` as
-/// `{"tools": {"call": {}}}` (capability key `tasks.requests.tools.call`), and
-/// a client advertises task-augmented `sampling/createMessage` and
-/// `elicitation/create` as
-/// `{"sampling": {"createMessage": {}}, "elicitation": {"create": {}}}`.
-///
-/// Chain the convenience methods (or `add`) and call `toJson` to obtain the
-/// object to assign to `TasksCapability.requests`:
-/// ---
-/// TasksCapability t;
-/// t.requests = TaskRequests().tool().toJson();        // server
-/// t.requests = TaskRequests()
-///     .samplingCreateMessage()
-///     .elicitationCreate()
-///     .toJson();                                       // client
-/// ---
-struct TaskRequests
-{
-	private Json obj = Json.emptyObject;
-
-	/// Mark `category.operation` (e.g. `tools.call`) as task-augmentable.
-	ref TaskRequests add(string category, string operation) return @safe
-	{
-		if (obj.type != Json.Type.object)
-			obj = Json.emptyObject;
-		if (category !in obj || obj[category].type != Json.Type.object)
-			obj[category] = Json.emptyObject;
-		obj[category][operation] = Json.emptyObject;
-		return this;
-	}
-
-	/// Server: task-augmented `tools/call` (`tasks.requests.tools.call`).
-	ref TaskRequests tool() return @safe
-	{
-		return add("tools", "call");
-	}
-
-	/// Client: task-augmented `sampling/createMessage`
-	/// (`tasks.requests.sampling.createMessage`).
-	ref TaskRequests samplingCreateMessage() return @safe
-	{
-		return add("sampling", "createMessage");
-	}
-
-	/// Client: task-augmented `elicitation/create`
-	/// (`tasks.requests.elicitation.create`).
-	ref TaskRequests elicitationCreate() return @safe
-	{
-		return add("elicitation", "create");
-	}
-
-	/// The accumulated nested `requests` object. Returns an empty object when
-	/// nothing was added.
-	Json toJson() const @safe
-	{
-		return obj;
-	}
-}
-
 /// Capabilities a server advertises during initialization.
 struct ServerCapabilities
 {
@@ -329,7 +207,6 @@ struct ServerCapabilities
 	Nullable!ListChangedCapability prompts;
 	bool logging; /// presence-only ({} when set)
 	bool completions; /// presence-only ({} when set)
-	Nullable!TasksCapability tasks; /// task-augmented requests (>= 2025-11-25)
 	Json experimental = Json.undefined;
 	/// draft Extension Negotiation: map of extension identifiers (e.g.
 	/// "io.modelcontextprotocol/tasks") to per-extension settings objects.
@@ -349,8 +226,6 @@ struct ServerCapabilities
 			j["logging"] = Json.emptyObject;
 		if (completions)
 			j["completions"] = Json.emptyObject;
-		if (!tasks.isNull)
-			j["tasks"] = tasks.get.toJson();
 		if (experimental.type == Json.Type.object)
 			j["experimental"] = experimental;
 		if (extensions.type == Json.Type.object)
@@ -363,9 +238,9 @@ struct ServerCapabilities
 	/// capabilities that existed in (and were negotiated for) the peer's
 	/// version. Mirrors `Implementation.forVersion`. The basic/lifecycle rule
 	/// "Only use capabilities that were successfully negotiated" requires this:
-	/// `completions` applies from 2025-03-26, `tasks` from 2025-11-25, and
-	/// the `extensions` negotiation map is draft-only. `tools`/`resources`/
-	/// `prompts`/`logging`/`experimental` exist in every supported version.
+	/// `completions` applies from 2025-03-26 and the `extensions` negotiation
+	/// map is draft-only. `tools`/`resources`/`prompts`/`logging`/`experimental`
+	/// exist in every supported version.
 	ServerCapabilities forVersion(ProtocolVersion v) const @safe
 	{
 		ServerCapabilities projected;
@@ -376,15 +251,9 @@ struct ServerCapabilities
 		projected.experimental = experimental;
 		if (v >= ProtocolVersion.v2025_03_26)
 			projected.completions = completions;
-		// `tasks` is a first-class capability in the stable 2025-11-25 era and any
-		// future stable (non-draft) revision >= 2025-11-25. The draft schema has no
-		// top-level `tasks`; task support there is negotiated via the `extensions`
-		// map keyed by `tasksExtensionKey`. The range + `!isDraft` predicate keeps a
-		// future stable version inserted before `draft` emitting top-level `tasks`.
-		if (v >= ProtocolVersion.v2025_11_25 && !v.isModern)
-			projected.tasks = tasks;
-		else if (v.isModern)
-			projected.extensions = foldTasksIntoExtensions(extensions, tasks);
+		// The `extensions` negotiation map is draft-only.
+		if (v.isModern && extensions.type == Json.Type.object)
+			projected.extensions = extensions;
 		return projected;
 	}
 
@@ -401,8 +270,6 @@ struct ServerCapabilities
 			c.logging = true;
 		if ("completions" in j)
 			c.completions = true;
-		if ("tasks" in j && j["tasks"].type == Json.Type.object)
-			c.tasks = TasksCapability.fromJson(j["tasks"]);
 		if ("experimental" in j)
 			c.experimental = j["experimental"];
 		if ("extensions" in j)
@@ -449,9 +316,6 @@ struct ClientCapabilities
 	/// elicitation (`elicitUrl`). Implies `elicitation`. Servers MUST NOT send
 	/// URL-mode elicitation requests unless this is advertised.
 	bool elicitationUrl;
-	/// task-augmented requests (>= 2025-11-25); client form carries only the
-	/// `requests` map (its `list`/`cancel` fields are server-only).
-	Nullable!TasksCapability tasks;
 	Json experimental = Json.undefined;
 	/// draft Extension Negotiation: map of extension identifiers (e.g.
 	/// "io.modelcontextprotocol/ui") to per-extension settings objects.
@@ -488,8 +352,6 @@ struct ClientCapabilities
 				e["url"] = Json.emptyObject;
 			j["elicitation"] = e;
 		}
-		if (!tasks.isNull)
-			j["tasks"] = tasks.get.toJson();
 		if (experimental.type == Json.Type.object)
 			j["experimental"] = experimental;
 		if (extensions.type == Json.Type.object)
@@ -498,18 +360,14 @@ struct ClientCapabilities
 	}
 
 	/// Project these capabilities to the wire shape for protocol version `v`,
-	/// stripping any field newer than `v` and migrating `tasks` to the draft
-	/// `extensions` map. `roots`/`rootsListChanged`, a bare `sampling`, and
-	/// `experimental` exist in every supported version and pass through unchanged.
-	/// `elicitation` applies from 2025-06-18, so it is gated to
-	/// `>= 2025-06-18` (a client that set only an elicitation submode still
+	/// stripping any field newer than `v`. `roots`/`rootsListChanged`, a bare
+	/// `sampling`, and `experimental` exist in every supported version and pass
+	/// through unchanged. `elicitation` applies from 2025-06-18, so it is gated
+	/// to `>= 2025-06-18` (a client that set only an elicitation submode still
 	/// projects a bare `elicitation` there). The sampling/elicitation sub-objects
 	/// (`sampling.tools`/`sampling.context`, `elicitation.form`/`elicitation.url`)
-	/// apply from 2025-11-25 and are stripped below that. `tasks` is a
-	/// first-class client capability in the stable 2025-11-25 era (and any future
-	/// stable revision >= 2025-11-25); the draft schema has no top-level client
-	/// `tasks`, so for draft it is folded into `extensions[tasksExtensionKey]`. The
-	/// `extensions` negotiation map itself is draft-only.
+	/// apply from 2025-11-25 and are stripped below that. The `extensions`
+	/// negotiation map is draft-only.
 	ClientCapabilities forVersion(ProtocolVersion v) const @safe
 	{
 		ClientCapabilities projected;
@@ -531,13 +389,9 @@ struct ClientCapabilities
 			projected.elicitationForm = elicitationForm;
 			projected.elicitationUrl = elicitationUrl;
 		}
-		// `tasks` is first-class in the stable 2025-11-25 era and any future stable
-		// (non-draft) revision; the draft era folds it into `extensions`. Mirror the
-		// range + `!isDraft` predicate used by `ServerCapabilities.forVersion`.
-		if (v >= ProtocolVersion.v2025_11_25 && !v.isModern)
-			projected.tasks = tasks;
-		else if (v.isModern)
-			projected.extensions = foldTasksIntoExtensions(extensions, tasks);
+		// The `extensions` negotiation map is draft-only.
+		if (v.isModern && extensions.type == Json.Type.object)
+			projected.extensions = extensions;
 		return projected;
 	}
 
@@ -579,8 +433,6 @@ struct ClientCapabilities
 				c.elicitationForm = true;
 			}
 		}
-		if ("tasks" in j && j["tasks"].type == Json.Type.object)
-			c.tasks = TasksCapability.fromJson(j["tasks"]);
 		if ("experimental" in j)
 			c.experimental = j["experimental"];
 		if ("extensions" in j)
@@ -649,12 +501,6 @@ struct ClientCapabilities
 			missing.elicitationUrl = true;
 			anyMissing = true;
 		}
-		if (!tasks.isNull && declared.tasks.isNull)
-		{
-			missing.tasks = tasks;
-			anyMissing = true;
-		}
-
 		const missingExp = diffMissingKeys(experimental, declared.experimental);
 		if (missingExp.type == Json.Type.object && missingExp.length > 0)
 		{
@@ -910,97 +756,6 @@ unittest  // ServerCapabilities.forVersion keeps completions from 2025-03-26
 		assert("completions" in caps.forVersion(v).toJson());
 }
 
-unittest  // ServerCapabilities.forVersion strips tasks before 2025-11-25
-{
-	ServerCapabilities caps;
-	caps.tasks = TasksCapability(true, true);
-	foreach (v; [
-		ProtocolVersion.v2024_11_05, ProtocolVersion.v2025_03_26,
-		ProtocolVersion.v2025_06_18
-	])
-		assert("tasks" !in caps.forVersion(v).toJson());
-}
-
-unittest  // ServerCapabilities.forVersion keeps top-level tasks only for 2025-11-25
-{
-	ServerCapabilities caps;
-	caps.tasks = TasksCapability(true, true);
-	assert("tasks" in caps.forVersion(ProtocolVersion.v2025_11_25).toJson());
-}
-
-unittest  // ServerCapabilities.forVersion: draft has no top-level tasks capability
-{
-	ServerCapabilities caps;
-	caps.tasks = TasksCapability(true, true);
-	auto j = caps.forVersion(ProtocolVersion.modern).toJson();
-	assert("tasks" !in j);
-}
-
-unittest  // ServerCapabilities.forVersion folds tasks into extensions for draft
-{
-	ServerCapabilities caps;
-	caps.tasks = TasksCapability(true, true);
-	auto j = caps.forVersion(ProtocolVersion.modern).toJson();
-	assert("extensions" in j);
-	assert("io.modelcontextprotocol/tasks" in j["extensions"]);
-	// The per-extension settings object carries the negotiated tasks shape.
-	assert("list" in j["extensions"]["io.modelcontextprotocol/tasks"]);
-	assert("cancel" in j["extensions"]["io.modelcontextprotocol/tasks"]);
-}
-
-unittest  // ServerCapabilities.forVersion: explicit tasks extension wins over folded tasks
-{
-	ServerCapabilities caps;
-	caps.tasks = TasksCapability(true, true);
-	Json ext = Json.emptyObject;
-	Json settings = Json.emptyObject;
-	settings["maxConcurrent"] = 4;
-	ext["io.modelcontextprotocol/tasks"] = settings;
-	caps.extensions = ext;
-	auto j = caps.forVersion(ProtocolVersion.modern).toJson();
-	// The caller's explicit advertisement is preserved, not overwritten by fold.
-	assert(j["extensions"]["io.modelcontextprotocol/tasks"]["maxConcurrent"].get!int == 4);
-}
-
-unittest  // ClientCapabilities.forVersion keeps top-level tasks only for 2025-11-25
-{
-	ClientCapabilities caps;
-	caps.tasks = TasksCapability(false, false);
-	assert("tasks" in caps.forVersion(ProtocolVersion.v2025_11_25).toJson());
-}
-
-unittest  // ClientCapabilities.forVersion: draft has no top-level tasks capability
-{
-	ClientCapabilities caps;
-	caps.tasks = TasksCapability(false, false);
-	auto j = caps.forVersion(ProtocolVersion.modern).toJson();
-	assert("tasks" !in j);
-}
-
-unittest  // ClientCapabilities.forVersion folds tasks into extensions for draft
-{
-	ClientCapabilities caps;
-	caps.tasks = TasksCapability(false, false);
-	auto j = caps.forVersion(ProtocolVersion.modern).toJson();
-	assert("extensions" in j);
-	assert("io.modelcontextprotocol/tasks" in j["extensions"]);
-}
-
-unittest  // ClientCapabilities.forVersion strips top-level tasks before 2025-11-25
-{
-	ClientCapabilities caps;
-	caps.tasks = TasksCapability(false, false);
-	foreach (v; [
-		ProtocolVersion.v2024_11_05, ProtocolVersion.v2025_03_26,
-		ProtocolVersion.v2025_06_18
-	])
-	{
-		auto j = caps.forVersion(v).toJson();
-		assert("tasks" !in j);
-		assert("extensions" !in j);
-	}
-}
-
 unittest  // ServerCapabilities.forVersion strips extensions for non-draft
 {
 	ServerCapabilities caps;
@@ -1117,126 +872,6 @@ unittest  // ClientCapabilities omits `extensions` when unset
 {
 	ClientCapabilities caps;
 	assert("extensions" !in caps.toJson());
-}
-
-unittest  // ServerCapabilities advertises the 2025-11-25 `tasks` capability
-{
-	ServerCapabilities caps;
-	TasksCapability t;
-	t.list = true;
-	t.cancel = true;
-	// Spec 2025-11-25: `requests` is structured by request category with boolean
-	// (presence) properties, e.g. {"tools": {"call": {}}} -- NOT a flat
-	// "tools/call" key.
-	t.requests = TaskRequests().tool().toJson();
-	caps.tasks = t;
-	auto j = caps.toJson();
-	assert(j["tasks"]["list"].type == Json.Type.object && j["tasks"]["list"].length == 0);
-	assert(j["tasks"]["cancel"].type == Json.Type.object);
-	assert(j["tasks"]["requests"]["tools"]["call"].type == Json.Type.object);
-	assert("tools/call" !in j["tasks"]["requests"]);
-}
-
-unittest  // ServerCapabilities round-trips the `tasks` capability
-{
-	ServerCapabilities caps;
-	TasksCapability t;
-	t.list = true;
-	t.requests = TaskRequests().tool().toJson();
-	caps.tasks = t;
-	auto back = ServerCapabilities.fromJson(caps.toJson());
-	assert(!back.tasks.isNull);
-	assert(back.tasks.get.list);
-	assert(!back.tasks.get.cancel);
-	assert(back.tasks.get.requests["tools"]["call"].type == Json.Type.object);
-}
-
-unittest  // ServerCapabilities omits `tasks` when unset
-{
-	ServerCapabilities caps;
-	assert("tasks" !in caps.toJson());
-}
-
-unittest  // ClientCapabilities advertises the 2025-11-25 `tasks` capability
-{
-	ClientCapabilities caps;
-	TasksCapability t;
-	// Spec 2025-11-25 client form: {"sampling": {"createMessage": {}},
-	// "elicitation": {"create": {}}} -- nested by category, not flat
-	// "sampling/createMessage".
-	t.requests = TaskRequests().samplingCreateMessage().elicitationCreate().toJson();
-	caps.tasks = t;
-	auto j = caps.toJson();
-	assert(j["tasks"]["requests"]["sampling"]["createMessage"].type == Json.Type.object);
-	assert(j["tasks"]["requests"]["elicitation"]["create"].type == Json.Type.object);
-	assert("sampling/createMessage" !in j["tasks"]["requests"]);
-	// Client form carries only `requests` (no server-only list/cancel keys).
-	assert("list" !in j["tasks"]);
-	assert("cancel" !in j["tasks"]);
-}
-
-unittest  // ClientCapabilities round-trips the `tasks` capability
-{
-	ClientCapabilities caps;
-	TasksCapability t;
-	t.requests = TaskRequests().samplingCreateMessage().toJson();
-	caps.tasks = t;
-	auto back = ClientCapabilities.fromJson(caps.toJson());
-	assert(!back.tasks.isNull);
-	assert(back.tasks.get.requests["sampling"]["createMessage"].type == Json.Type.object);
-}
-
-unittest  // ClientCapabilities omits `tasks` when unset
-{
-	ClientCapabilities caps;
-	assert("tasks" !in caps.toJson());
-}
-
-unittest  // TaskRequests builds the spec server shape {"tools": {"call": {}}}
-{
-	auto j = TaskRequests().tool().toJson();
-	assert(j.type == Json.Type.object);
-	assert(j["tools"].type == Json.Type.object);
-	assert(j["tools"]["call"].type == Json.Type.object && j["tools"]["call"].length == 0);
-	assert("tools/call" !in j);
-}
-
-unittest  // TaskRequests builds the spec client shape with nested categories
-{
-	auto j = TaskRequests().samplingCreateMessage().elicitationCreate().toJson();
-	assert(j["sampling"]["createMessage"].type == Json.Type.object);
-	assert(j["elicitation"]["create"].type == Json.Type.object);
-	assert("sampling/createMessage" !in j);
-	assert("elicitation/create" !in j);
-}
-
-unittest  // TaskRequests.add nests arbitrary category/operation pairs
-{
-	auto j = TaskRequests().add("tools", "call").add("sampling", "createMessage").toJson();
-	assert(j["tools"]["call"].type == Json.Type.object);
-	assert(j["sampling"]["createMessage"].type == Json.Type.object);
-}
-
-unittest  // TaskRequests.add groups multiple operations under one category
-{
-	auto j = TaskRequests().add("tools", "call").add("tools", "list").toJson();
-	assert(j["tools"]["call"].type == Json.Type.object);
-	assert(j["tools"]["list"].type == Json.Type.object);
-}
-
-unittest  // TaskRequests with nothing added yields an empty object
-{
-	auto j = TaskRequests().toJson();
-	assert(j.type == Json.Type.object && j.length == 0);
-}
-
-unittest  // TaskRequests output assigned to TasksCapability round-trips nested keys
-{
-	TasksCapability t;
-	t.list = true;
-	t.requests = TaskRequests().tool().toJson();
-	auto back = TasksCapability.fromJson(t.toJson());
-	assert(back.requests["tools"]["call"].type == Json.Type.object);
 }
 
 unittest  // ClientCapabilities advertises sampling.tools sub-capability (2025-11-25)
@@ -1374,17 +1009,6 @@ unittest  // ClientCapabilities elicitation submodes imply elicitation presence
 	assert(j["elicitation"]["url"].type == Json.Type.object);
 }
 
-unittest  // TasksCapability with empty `requests` map still round-trips presence
-{
-	TasksCapability t;
-	t.list = true;
-	auto j = t.toJson();
-	assert("requests" !in j);
-	auto back = TasksCapability.fromJson(j);
-	assert(back.list && !back.cancel);
-	assert(back.requests.type != Json.Type.object);
-}
-
 unittest  // Implementation emits 2025-11-25 description/websiteUrl/icons when set
 {
 	Implementation impl;
@@ -1514,44 +1138,6 @@ unittest  // ClientCapabilities.forVersion keeps roots/rootsListChanged uncondit
 		assert(caps.forVersion(v).toJson()["roots"]["listChanged"].get!bool);
 }
 
-unittest  // ServerCapabilities.forVersion keeps top-level tasks for any stable version >= 2025-11-25
-{
-	// Any stable (non-draft) version >= 2025-11-25 must keep top-level tasks; the
-	// draft era folds tasks into `extensions` instead. Today 2025-11-25 is the
-	// only such stable version, but the predicate must be range + draft based so a
-	// future stable version inserted before `draft` still emits top-level tasks.
-	ServerCapabilities caps;
-	caps.tasks = TasksCapability(true, true);
-	foreach (v; supportedVersionsAtLeast(ProtocolVersion.v2025_11_25))
-	{
-		auto j = caps.forVersion(v).toJson();
-		if (v.isModern)
-		{
-			assert("tasks" !in j);
-			assert("extensions" in j);
-		}
-		else
-			assert("tasks" in j);
-	}
-}
-
-unittest  // ClientCapabilities.forVersion keeps top-level tasks for any stable version >= 2025-11-25
-{
-	ClientCapabilities caps;
-	caps.tasks = TasksCapability(false, false);
-	foreach (v; supportedVersionsAtLeast(ProtocolVersion.v2025_11_25))
-	{
-		auto j = caps.forVersion(v).toJson();
-		if (v.isModern)
-		{
-			assert("tasks" !in j);
-			assert("extensions" in j);
-		}
-		else
-			assert("tasks" in j);
-	}
-}
-
 unittest  // ClientCapabilities.forVersion: sampling sub-cap only still projects bare sampling to pre-2025-11-25 peers
 {
 	// A client that sets only samplingTools (not the bare sampling flag) must
@@ -1572,13 +1158,3 @@ unittest  // ClientCapabilities.forVersion: sampling sub-cap only still projects
 	}
 }
 
-version (unittest) private ProtocolVersion[] supportedVersionsAtLeast(ProtocolVersion min) @safe
-{
-	import mcp.protocol.versions : supportedVersions;
-
-	ProtocolVersion[] result;
-	foreach (v; supportedVersions)
-		if (v >= min)
-			result ~= v;
-	return result;
-}
