@@ -1073,16 +1073,21 @@ final class McpClient : ClientProtocol
 		});
 	}
 
-	/// `prompts/get`. Per-request `progressToken` / `logLevel` / `onProgress` are
-	/// carried in `opts` (see `RequestOptions`).
+	/// `prompts/get`. Against a draft (MRTR / SEP-2322) server this transparently
+	/// completes a full retry loop: when the server responds with an
+	/// `InputRequiredResult` (the result carries `inputRequests`), each request is
+	/// dispatched to the matching client handler (`onElicitation`, `onSampling`,
+	/// `onListRoots`) and the call is resubmitted with the answers. Returns the
+	/// first completed `GetPromptResult`. Against stable-protocol servers the loop
+	/// never fires (stable-protocol servers never emit `inputRequests`).
+	/// Per-request `progressToken` / `logLevel` / `onProgress` are carried in
+	/// `opts` (see `RequestOptions`).
 	GetPromptResult getPrompt(string name, Json arguments = Json.emptyObject,
 			RequestOptions opts = RequestOptions.init) @safe
 	{
 		auto token = effectiveToken(opts);
-		auto params = withRequestLogLevel(buildGetPromptParams(name, arguments,
-				token), opts.logLevel);
 		return withPerCallProgress!GetPromptResult(opts,
-				() @safe => GetPromptResult.fromJson(rpc("prompts/get", params)));
+				() @safe => getPromptLoop(name, arguments, token, opts.logLevel));
 	}
 
 	/// Typed-arguments convenience: serialize the struct `args` to its JSON wire
@@ -1096,6 +1101,44 @@ final class McpClient : ClientProtocol
 		return getPrompt(name, serializeToJson(args), opts);
 	}
 
+	/// Issue `prompts/get` and, against a draft server, complete any MRTR
+	/// (SEP-2322) round-trips by satisfying each `InputRequest` and resubmitting
+	/// the request with the answers. Returns the first completed `GetPromptResult`.
+	///
+	/// A bound is placed on the number of rounds so a misbehaving server that
+	/// keeps asking for input cannot loop forever. If a handler for a requested
+	/// input type is missing, or the loop bound is exceeded, the (still
+	/// `inputRequired`) result is returned so the caller can inspect it via
+	/// `GetPromptResult.isInputRequired`. Mirrors `callToolLoop`.
+	private GetPromptResult getPromptLoop(string name, Json arguments,
+			ProgressToken progressToken, string logLevel = "") @safe
+	{
+		enum maxRounds = 16;
+		InputResponse[] responses;
+		string requestState;
+		GetPromptResult result;
+		foreach (round; 0 .. maxRounds)
+		{
+			auto params = buildGetPromptParams(name, arguments, progressToken,
+					responses, requestState);
+			params = withRequestLogLevel(params, logLevel);
+			result = GetPromptResult.fromJson(rpc("prompts/get", params));
+			if (!result.isInputRequired)
+				return result;
+			InputResponse[] answers;
+			foreach (req; result.inputRequests)
+			{
+				InputResponse answer;
+				if (!resolveInputRequest(req, answer))
+					return result;
+				answers ~= answer;
+			}
+			responses = answers;
+			requestState = result.requestState;
+		}
+		return result;
+	}
+
 	/// Build the `prompts/get` params, optionally attaching a progress token.
 	package static Json buildGetPromptParams(string name, Json arguments,
 			ProgressToken progressToken) @safe
@@ -1104,6 +1147,19 @@ final class McpClient : ClientProtocol
 		p["name"] = name;
 		p["arguments"] = arguments;
 		return withProgressToken(p, progressToken);
+	}
+
+	/// Build the `prompts/get` params with any gathered MRTR (SEP-2322) input
+	/// responses attached as the top-level `params.inputResponses` map, and the
+	/// opaque `requestState` echoed back as `params.requestState`. With no
+	/// responses and no requestState this is identical to the plain
+	/// `buildGetPromptParams`. Mirrors `buildToolCallParams`.
+	package static Json buildGetPromptParams(string name, Json arguments,
+			ProgressToken progressToken, InputResponse[] responses, string requestState = "") @safe
+	{
+		Json p = buildGetPromptParams(name, arguments, progressToken);
+		p = withInputResponses(p, responses);
+		return withRequestState(p, requestState);
 	}
 
 	/// `completion/complete` — request autocompletion suggestions for an
@@ -4352,6 +4408,83 @@ unittest  // connect() populates serverCapabilities/serverInfo/serverInstruction
 	assert(c.serverInfo().version_ == "2.0");
 	assert(!c.serverInstructions().isNull);
 	assert(c.serverInstructions().get == "hello");
+}
+
+unittest  // MRTR: getPrompt drives a retry loop when the server returns inputRequired
+{
+	import mcp.protocol.modern : InputRequiredResult;
+
+	auto c = McpClient.http("http://localhost/mcp");
+	c.onElicitation = (ElicitParams) @safe {
+		return ElicitResult.accept(Json(["day": Json("tuesday")]));
+	};
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "prompts/get");
+		calls++;
+		if (calls == 1)
+		{
+			// First call: respond with inputRequired asking for elicitation.
+			InputRequiredResult ir;
+			ir.inputRequests = [
+				InputRequest("q", "elicitation", Json.emptyObject)
+			];
+			return ir.toJson();
+		}
+		// Second call: respond with a completed prompt result.
+		Json res = Json.emptyObject;
+		res["messages"] = Json.emptyArray;
+		return res;
+	};
+
+	auto result = c.getPrompt("greet", Json.emptyObject);
+	// The loop must have completed two prompts/get requests and returned the
+	// final non-inputRequired result.
+	assert(calls == 2);
+	assert(!result.isInputRequired);
+}
+
+unittest  // MRTR: getPrompt surfaces an inputRequired result when no handler is registered
+{
+	import mcp.protocol.modern : InputRequiredResult;
+
+	auto c = McpClient.http("http://localhost/mcp");
+	// No onElicitation handler registered — resolveInputRequest must return false.
+	c.onRpcForTest = (string method, Json params) @safe {
+		InputRequiredResult ir;
+		ir.inputRequests = [InputRequest("q", "elicitation", Json.emptyObject)];
+		return ir.toJson();
+	};
+
+	auto result = c.getPrompt("greet", Json.emptyObject);
+	// With no handler the loop cannot satisfy the request; the still-inputRequired
+	// result is returned to the caller so it can inspect it.
+	assert(result.isInputRequired);
+	assert(result.inputRequests.length == 1);
+}
+
+unittest  // MRTR: getPrompt stops at maxRounds prompts/get requests
+{
+	import mcp.protocol.modern : InputRequiredResult;
+
+	auto c = McpClient.http("http://localhost/mcp");
+	c.onElicitation = (ElicitParams) @safe {
+		return ElicitResult.accept(Json.emptyObject);
+	};
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "prompts/get");
+		calls++;
+		InputRequiredResult ir;
+		ir.inputRequests = [InputRequest("q", "elicitation", Json.emptyObject)];
+		return ir.toJson();
+	};
+
+	auto result = c.getPrompt("greet", Json.emptyObject);
+	// The bound (maxRounds == 16) must cap the loop; the still-inputRequired
+	// result is returned without an extra round-trip.
+	assert(calls == 16);
+	assert(result.isInputRequired);
 }
 
 unittest  // test-only RPC/notify hooks are guarded behind version(unittest)

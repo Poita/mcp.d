@@ -4327,10 +4327,32 @@ struct GetPromptResult
 {
 	Nullable!string description;
 	PromptMessage[] messages;
+	/// MRTR (SEP-2322): input requests the client must satisfy and resubmit as a
+	/// fresh `prompts/get`. Non-empty only when the server returned an
+	/// `InputRequiredResult` instead of a final `GetPromptResult`. Mirrors the
+	/// same field on `CallToolResult`.
+	InputRequest[] inputRequests;
+	/// MRTR (SEP-2322): the opaque server-owned `requestState` to echo back
+	/// verbatim on the retried `prompts/get`. Empty when the server sent none.
+	string requestState;
 	mixin MetaField;
+
+	/// Returns `true` when the server responded with an `InputRequiredResult`
+	/// instead of a final prompt result. Mirrors `CallToolResult.isInputRequired`.
+	bool isInputRequired() const @safe nothrow
+	{
+		return inputRequests.length > 0;
+	}
 
 	Json toJson() const @safe
 	{
+		if (isInputRequired)
+		{
+			Json j = Json.emptyObject;
+			j["resultType"] = "input_required";
+			emitInputRequired(j, inputRequests, requestState);
+			return j;
+		}
 		Json j = Json.emptyObject;
 		if (!description.isNull)
 			j["description"] = description.get;
@@ -4345,6 +4367,10 @@ struct GetPromptResult
 	static GetPromptResult fromJson(Json j) @safe
 	{
 		GetPromptResult r;
+		// An InputRequiredResult carries `inputRequests` instead of `messages`.
+		parseInputRequired(j, r.inputRequests, r.requestState);
+		if (r.isInputRequired)
+			return r;
 		tryGet(j, "description", r.description);
 		if ("messages" in j && j["messages"].type == Json.Type.array)
 		{
