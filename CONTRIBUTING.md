@@ -1,4 +1,4 @@
-# Contributing to dlang-mcp-sdk
+# Contributing to mcp.d
 
 Thanks for your interest in contributing to the D
 [Model Context Protocol](https://modelcontextprotocol.io) SDK! This guide covers
