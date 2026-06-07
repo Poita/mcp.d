@@ -404,8 +404,9 @@ unittest  // mintJwtEs256 fails closed on control characters in a claim
 	assertThrown(mintJwtEs256(testEcPem, claims));
 }
 
-unittest  // auto-generated jti values are unique even when now is identical across calls
+unittest  // auto-generated jti values are unique even when now is identical across calls (#1160)
 {
+	import std.algorithm : startsWith;
 	import std.array : split;
 	import std.base64 : Base64URLNoPadding;
 	import vibe.data.json : parseJsonString;
@@ -428,7 +429,11 @@ unittest  // auto-generated jti values are unique even when now is identical acr
 	}();
 	auto j1 = parseJsonString(payload1);
 	auto j2 = parseJsonString(payload2);
-	// The two auto-generated JTI values must differ to prevent replay rejection.
+	// Each jti must include the timestamp prefix so an AS can bound its replay window.
+	assert(j1["jti"].get!string.startsWith("jti-1700000000-"));
+	assert(j2["jti"].get!string.startsWith("jti-1700000000-"));
+	// The two auto-generated JTI values must differ to prevent replay rejection
+	// (RFC 7523 §4 requires each jti to be unique per assertion).
 	assert(j1["jti"].get!string != j2["jti"].get!string);
 }
 
