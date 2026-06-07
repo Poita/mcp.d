@@ -253,13 +253,16 @@ final class TaskRuntime
 		case TaskStatus.cancelled:
 			return makeDetailedTask(t, DetailedTaskPayload.none());
 		case TaskStatus.inputRequired:
-			Json reqs = (e !is null) ? e.outstandingInputRequests : Json.emptyObject;
+			Json reqs = (e !is null)
+				? e.outstandingInputRequests : Json.emptyObject;
 			return makeDetailedTask(t, DetailedTaskPayload.inputRequests(reqs));
 		case TaskStatus.completed:
-			Json r = (e !is null && !e.result.isNull) ? e.result.get : Json.emptyObject;
+			Json r = (e !is null && !e.result.isNull)
+				? e.result.get : Json.emptyObject;
 			return makeDetailedTask(t, DetailedTaskPayload.completed(r));
 		case TaskStatus.failed:
-			Json err = (e !is null && !e.error.isNull) ? e.error.get : Json.emptyObject;
+			Json err = (e !is null && !e.error.isNull)
+				? e.error.get : Json.emptyObject;
 			return makeDetailedTask(t, DetailedTaskPayload.failed(err));
 		}
 	}
@@ -290,7 +293,9 @@ unittest  // complete stores the result and getDetailed inlines it
 {
 	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
 	auto t = rt.create();
-	Json result = Json(["content": Json([Json(["type": Json("text"), "text": Json("done")])])]);
+	Json result = Json([
+		"content": Json([Json(["type": Json("text"), "text": Json("done")])])
+	]);
 	rt.complete(t.taskId, result);
 	auto d = rt.getDetailed(t.taskId);
 	assert(d["status"].get!string == "completed");
@@ -354,7 +359,10 @@ unittest  // onStatusChange fires with the DetailedTask on each transition
 	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
 	int calls;
 	string lastStatus;
-	rt.onStatusChange((Json d) @safe { calls++; lastStatus = d["status"].get!string; });
+	rt.onStatusChange((Json d) @safe {
+		calls++;
+		lastStatus = d["status"].get!string;
+	});
 	auto t = rt.create();
 	rt.complete(t.taskId, Json.emptyObject);
 	assert(calls >= 1);

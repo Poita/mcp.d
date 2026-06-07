@@ -1042,8 +1042,8 @@ final class McpClient : ClientProtocol
 	{
 		Json p = Json.emptyObject;
 		p["taskId"] = taskId;
-		p["inputResponses"] = (inputResponses.type == Json.Type.object)
-			? inputResponses : Json.emptyObject;
+		p["inputResponses"] = (inputResponses.type == Json.Type.object) ? inputResponses
+			: Json.emptyObject;
 		rpc("tasks/update", p);
 	}
 
@@ -1061,26 +1061,27 @@ final class McpClient : ClientProtocol
 	/// `inputRequests` map so the caller can answer via `respondTaskInput`; with no
 	/// handler the poll continues. Works from a bare `taskId` string, so a client
 	/// can resume a task persisted across a restart.
-	CallToolResult awaitTask(string taskId,
-			void delegate(string taskId, Json inputRequests) @safe onInputRequired = null) @safe
+	CallToolResult awaitTask(string taskId, void delegate(string taskId,
+			Json inputRequests) @safe onInputRequired = null) @safe
 	{
 		for (;;)
 		{
 			auto state = getTaskState(taskId);
-			const status = ("status" in state && state["status"].type == Json.Type.string)
-				? state["status"].get!string : "working";
+			const status = ("status" in state && state["status"].type == Json.Type.string) ? state["status"]
+				.get!string : "working";
 			switch (status)
 			{
 			case "completed":
-				return CallToolResult.fromJson(("result" in state) ? state["result"] : Json.emptyObject);
+				return CallToolResult.fromJson(("result" in state)
+						? state["result"] : Json.emptyObject);
 			case "failed":
 				throw taskFailedError(taskId, state);
 			case "cancelled":
 				throw new McpException(ErrorCode.invalidRequest, "Task was cancelled: " ~ taskId);
 			case "input_required":
 				if (onInputRequired !is null)
-					onInputRequired(taskId,
-						("inputRequests" in state) ? state["inputRequests"] : Json.emptyObject);
+					onInputRequired(taskId, ("inputRequests" in state)
+							? state["inputRequests"] : Json.emptyObject);
 				break;
 			default: // working
 				break;
@@ -1097,7 +1098,8 @@ final class McpClient : ClientProtocol
 	/// the final `CallToolResult`; otherwise return the synchronous result. Lets a
 	/// caller treat task and non-task tools identically. Requires `enableTasks`.
 	CallToolResult callToolAwait(string name, Json arguments = Json.emptyObject,
-			void delegate(string taskId, Json inputRequests) @safe onInputRequired = null,
+			void delegate(string taskId,
+				Json inputRequests) @safe onInputRequired = null,
 			RequestOptions opts = RequestOptions.init) @safe
 	{
 		auto raw = rpc("tools/call", buildToolCallParams(name, arguments, effectiveToken(opts)));
@@ -1111,10 +1113,10 @@ final class McpClient : ClientProtocol
 		if ("error" in state && state["error"].type == Json.Type.object)
 		{
 			auto e = state["error"];
-			const code = ("code" in e && e["code"].type == Json.Type.int_)
-				? e["code"].get!int : ErrorCode.internalError;
-			const msg = ("message" in e && e["message"].type == Json.Type.string)
-				? e["message"].get!string : "Task failed";
+			const code = ("code" in e && e["code"].type == Json.Type.int_) ? e["code"]
+				.get!int : ErrorCode.internalError;
+			const msg = ("message" in e && e["message"].type == Json.Type.string) ? e["message"]
+				.get!string : "Task failed";
 			return new McpException(cast(ErrorCode) code, msg);
 		}
 		return new McpException(ErrorCode.internalError, "Task failed: " ~ taskId);
@@ -2197,7 +2199,10 @@ unittest  // enableTasks advertises the tasks extension (draft only)
 
 unittest  // isTaskResult recognizes a CreateTaskResult by its resultType discriminator
 {
-	assert(McpClient.isTaskResult(Json(["resultType": Json("task"), "taskId": Json("x")])));
+	assert(McpClient.isTaskResult(Json([
+				"resultType": Json("task"),
+				"taskId": Json("x")
+	])));
 	assert(!McpClient.isTaskResult(Json(["resultType": Json("complete")])));
 	assert(!McpClient.isTaskResult(Json(["content": Json.emptyArray])));
 }
@@ -2209,9 +2214,12 @@ unittest  // getTask parses the Task metadata from a tasks/get reply
 		assert(method == "tasks/get");
 		assert(params["taskId"].get!string == "t1");
 		return Json([
-			"resultType": Json("complete"), "taskId": Json("t1"),
-			"status": Json("working"), "createdAt": Json("2026-06-07T10:30:00Z"),
-			"lastUpdatedAt": Json("2026-06-07T10:30:00Z"), "ttlMs": Json(60_000),
+			"resultType": Json("complete"),
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"createdAt": Json("2026-06-07T10:30:00Z"),
+			"lastUpdatedAt": Json("2026-06-07T10:30:00Z"),
+			"ttlMs": Json(60_000),
 			"pollIntervalMs": Json(5_000)
 		]);
 	};
@@ -2230,14 +2238,19 @@ unittest  // awaitTask polls to completion and returns the final CallToolResult
 		polls++;
 		if (polls < 3)
 			return Json([
-				"resultType": Json("complete"), "taskId": Json("t1"),
-				"status": Json("working"), "pollIntervalMs": Json(5_000)
-			]);
+			"resultType": Json("complete"),
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"pollIntervalMs": Json(5_000)
+		]);
 		return Json([
-			"resultType": Json("complete"), "taskId": Json("t1"),
+			"resultType": Json("complete"),
+			"taskId": Json("t1"),
 			"status": Json("completed"),
 			"result": Json([
-				"content": Json([Json(["type": Json("text"), "text": Json("done")])])
+				"content": Json([
+					Json(["type": Json("text"), "text": Json("done")])
+				])
 			])
 		]);
 	};
@@ -2258,13 +2271,18 @@ unittest  // awaitTask surfaces input_required to the callback and continues to 
 			polls++;
 			if (polls == 1)
 				return Json([
-					"resultType": Json("complete"), "taskId": Json("t1"),
-					"status": Json("input_required"),
-					"inputRequests": Json(["k1": Json(["method": Json("elicitation/create")])])
-				]);
+				"resultType": Json("complete"),
+				"taskId": Json("t1"),
+				"status": Json("input_required"),
+				"inputRequests": Json([
+					"k1": Json(["method": Json("elicitation/create")])
+				])
+			]);
 			return Json([
-				"resultType": Json("complete"), "taskId": Json("t1"),
-				"status": Json("completed"), "result": Json(["content": Json.emptyArray])
+				"resultType": Json("complete"),
+				"taskId": Json("t1"),
+				"status": Json("completed"),
+				"result": Json(["content": Json.emptyArray])
 			]);
 		}
 		assert(method == "tasks/update");
@@ -2277,6 +2295,7 @@ unittest  // awaitTask surfaces input_required to the callback and continues to 
 		c.respondTaskInput(id, Json(["k1": Json(["answer": Json("yes")])]));
 	});
 	assert(sawInput && polls == 2);
+	assert(result.content.length == 0);
 }
 
 unittest  // awaitTask throws on a failed task carrying a JSON-RPC error
@@ -2287,7 +2306,8 @@ unittest  // awaitTask throws on a failed task carrying a JSON-RPC error
 	c.onTaskSleepForTest = (Duration d) @safe {};
 	c.onRpcForTest = (string method, Json params) @safe {
 		return Json([
-			"resultType": Json("complete"), "taskId": Json("t1"),
+			"resultType": Json("complete"),
+			"taskId": Json("t1"),
 			"status": Json("failed"),
 			"error": Json(["code": Json(-32000), "message": Json("boom")])
 		]);
@@ -2316,14 +2336,19 @@ unittest  // callToolAwait drives a task reply to completion
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "tools/call")
 			return Json([
-				"resultType": Json("task"), "taskId": Json("t9"), "status": Json("working")
-			]);
+			"resultType": Json("task"),
+			"taskId": Json("t9"),
+			"status": Json("working")
+		]);
 		assert(method == "tasks/get" && params["taskId"].get!string == "t9");
 		return Json([
-			"resultType": Json("complete"), "taskId": Json("t9"),
+			"resultType": Json("complete"),
+			"taskId": Json("t9"),
 			"status": Json("completed"),
 			"result": Json([
-				"content": Json([Json(["type": Json("text"), "text": Json("async")])])
+				"content": Json([
+					Json(["type": Json("text"), "text": Json("async")])
+				])
 			])
 		]);
 	};

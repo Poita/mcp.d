@@ -5581,7 +5581,9 @@ unittest  // a created task is served via tasks/get, progressing working -> comp
 	auto rt = s.enableTasks();
 	auto t = rt.create();
 
-	auto working = s.handle(draftReq(1, "tasks/get", Json(["taskId": Json(t.taskId)]))).get;
+	auto working = s.handle(draftReq(1, "tasks/get", Json([
+				"taskId": Json(t.taskId)
+	]))).get;
 	assert(working["result"]["status"].get!string == "working");
 	assert(working["result"]["resultType"].get!string == "complete");
 
@@ -5589,7 +5591,9 @@ unittest  // a created task is served via tasks/get, progressing working -> comp
 		"content": Json([Json(["type": Json("text"), "text": Json("done")])])
 	]);
 	rt.complete(t.taskId, result);
-	auto done = s.handle(draftReq(2, "tasks/get", Json(["taskId": Json(t.taskId)]))).get;
+	auto done = s.handle(draftReq(2, "tasks/get", Json([
+				"taskId": Json(t.taskId)
+	]))).get;
 	assert(done["result"]["status"].get!string == "completed");
 	assert(done["result"]["result"]["content"][0]["text"].get!string == "done");
 }
@@ -5599,9 +5603,13 @@ unittest  // input_required surfaces inputRequests and tasks/update is acknowled
 	auto s = new McpServer("t", "1");
 	auto rt = s.enableTasks();
 	auto t = rt.create();
-	rt.requireInput(t.taskId, Json(["k1": Json(["method": Json("elicitation/create")])]));
+	rt.requireInput(t.taskId, Json([
+			"k1": Json(["method": Json("elicitation/create")])
+	]));
 
-	auto blocked = s.handle(draftReq(1, "tasks/get", Json(["taskId": Json(t.taskId)]))).get;
+	auto blocked = s.handle(draftReq(1, "tasks/get", Json([
+				"taskId": Json(t.taskId)
+	]))).get;
 	assert(blocked["result"]["status"].get!string == "input_required");
 	assert(blocked["result"]["inputRequests"]["k1"]["method"].get!string == "elicitation/create");
 
@@ -5620,7 +5628,9 @@ unittest  // tasks/cancel acknowledges and cancels a task
 	auto s = new McpServer("t", "1");
 	auto rt = s.enableTasks();
 	auto t = rt.create();
-	auto ack = s.handle(draftReq(1, "tasks/cancel", Json(["taskId": Json(t.taskId)]))).get;
+	auto ack = s.handle(draftReq(1, "tasks/cancel", Json([
+				"taskId": Json(t.taskId)
+	]))).get;
 	assert("error" !in ack);
 	assert(ack["result"].type == Json.Type.object);
 	auto got = s.handle(draftReq(2, "tasks/get", Json(["taskId": Json(t.taskId)]))).get;
