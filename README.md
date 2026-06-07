@@ -338,7 +338,7 @@ asynchronously, and its return value becomes the result; the injected `TaskConte
 reports progress, observes cancellation, and elicits input mid-task.
 
 ```d
-server.enableTasks();   // advertise io.modelcontextprotocol/tasks; pass a TaskStore for durability
+auto rt = server.enableTasks();   // keep the runtime; pass a TaskStore for durability
 
 struct Approval { bool deploy; }
 
@@ -351,17 +351,24 @@ string deploy(string gitRef, TaskContext tc) @safe
     if (!tc.inputAs!ElicitResult("ok").contentAs!Approval().deploy)
         return "skipped";
     startDeploy(gitRef, tc.taskId);             // fictional: kicks off the deploy, returns at once
-    return tc.detach("deploying " ~ gitRef);    // leave it working; a webhook completes it
+    return tc.detach("deploying " ~ gitRef);    // leave it working; the webhook below completes it
+}
+
+// The deploy system's callback — runs on any node, holds no fiber:
+void onDeployFinished(string taskId, bool ok) @safe
+{
+    if (ok)
+        rt.complete(taskId, CallToolResult([Content.makeText("deployed")]).toJson());
+    else
+        rt.fail(taskId, Json(["code": Json(-32000), "message": Json("deploy failed")]));
 }
 ```
 
 The three exits cover the lifecycle: `return` a value completes the task,
 `tc.requireInput(...)` suspends it for a client answer (delivered via `tasks/update`),
-and `tc.detach(...)` leaves it `working` so an external signal can finish it — your
-deploy webhook calls `rt.complete(taskId, …)` (or `rt.fail`) on the `TaskRuntime`
-that `enableTasks` returns. `detach` holds no fiber, so completion works on any node.
-See [`examples/tasks`](examples/tasks/) for cancellation, durable stores, and the
-client side.
+and `tc.detach(...)` leaves it `working` for `onDeployFinished` to complete out of
+band via `rt.complete` / `rt.fail` — no fiber held, so it works on any node. See
+[`examples/tasks`](examples/tasks/) for cancellation, durable stores, and the client side.
 
 > **Not supported: the experimental 2025-11-25 tasks.** The `tasks` feature that
 > shipped in the 2025-11-25 core specification (a top-level `tasks` capability,
