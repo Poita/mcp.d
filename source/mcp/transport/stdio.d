@@ -492,6 +492,7 @@ else version (Windows)
 	{
 		import eventcore.driver : IOStatus;
 
+		srvTrace("server.writeAll.begin", bytes.length);
 		size_t off;
 		while (off < bytes.length)
 		{
@@ -501,9 +502,13 @@ else version (Windows)
 						cast(DWORD)(bytes.length - off), &wrote, null) != 0;
 			}();
 			if (!ok || wrote == 0)
+			{
+				srvTrace("server.writeAll.error", off);
 				return IoResult(IOStatus.error, off);
+			}
 			off += wrote;
 		}
+		srvTrace("server.writeAll.ok", off);
 		return IoResult(IOStatus.ok, off);
 	}
 
@@ -518,16 +523,38 @@ else version (Windows)
 	/// `readOnce` never has to split a chunk across calls.
 	private static void pumpStdin(HANDLE h, Channel!(immutable(ubyte)[]) chan) @system
 	{
+		srvTrace("server.pumpStdin.start");
 		ubyte[32 * 1024] buf;
 		for (;;)
 		{
 			DWORD got;
 			const ok = ReadFile(h, cast(void*) buf.ptr, cast(DWORD) buf.length, &got, null) != 0;
+			srvTrace(ok ? "server.pumpStdin.read" : "server.pumpStdin.readfail", got);
 			if (!ok || got == 0)
 				break;
 			chan.put(buf[0 .. got].idup);
 		}
+		srvTrace("server.pumpStdin.eof");
 		chan.close();
+	}
+}
+
+// Diagnostic trace to stderr (inherited by the spawning host), gated to the
+// Windows stdio path. Used to pinpoint where the stdio round-trip stalls.
+version (Windows) private void srvTrace(string label, long n = -1) @trusted nothrow
+{
+	import std.stdio : stderr;
+
+	try
+	{
+		if (n >= 0)
+			stderr.writeln("[MCPTRACE] ", label, " ", n);
+		else
+			stderr.writeln("[MCPTRACE] ", label);
+		stderr.flush();
+	}
+	catch (Exception)
+	{
 	}
 }
 

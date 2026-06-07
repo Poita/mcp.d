@@ -459,22 +459,46 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 
 	string readLine() @safe
 	{
+		cliTrace("client.readLine.wait");
 		string line;
 		const got = () @trusted { return lines.tryConsumeOne(line); }();
+		cliTrace(got ? "client.readLine.got" : "client.readLine.closed", got
+				? cast(long) line.length : -1);
 		return got ? line : null; // channel closed (EOF / over-long) -> end the loop
 	}
 
 	void writeLine(string s) @safe
 	{
+		cliTrace("client.writeLine", cast(long) s.length);
 		() @trusted {
 			child.childStdin.rawWrite(cast(const(ubyte)[])(s ~ "\n"));
 			child.childStdin.flush();
 		}();
+		cliTrace("client.writeLine.flushed", cast(long) s.length);
 	}
 
 	auto transport = new StdioClientTransport(&readLine, &writeLine);
 	transport.attachWinChild(child);
 	return transport;
+}
+
+// Diagnostic trace to stderr, gated to the Windows stdio client path. Used to
+// pinpoint where the stdio round-trip stalls.
+version (Windows) private void cliTrace(string label, long n = -1) @trusted nothrow
+{
+	import std.stdio : stderr;
+
+	try
+	{
+		if (n >= 0)
+			stderr.writeln("[MCPTRACE] ", label, " ", n);
+		else
+			stderr.writeln("[MCPTRACE] ", label);
+		stderr.flush();
+	}
+	catch (Exception)
+	{
+	}
 }
 
 /// Reader-thread body (Windows client): blocking reads on the child's stdout,
@@ -484,11 +508,13 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 /// a partial fragment at EOF is dropped rather than forwarded as a malformed line.
 version (Windows) private void pumpChildStdout(File stdout, Channel!string chan, size_t maxLineBytes) @system
 {
+	cliTrace("client.pump.start");
 	ubyte[32 * 1024] buf;
 	ubyte[] acc;
 	for (;;)
 	{
 		auto got = stdout.rawRead(buf[]);
+		cliTrace("client.pump.read", cast(long) got.length);
 		if (got.length == 0)
 			break; // EOF -> drop any partial fragment
 		size_t i;
