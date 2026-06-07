@@ -193,6 +193,10 @@ private Json parametersSchema(alias func)() @safe
 		{
 			{
 				Json ps = jsonSchemaOf!P;
+				// Apply field-level facet UDAs (@minimum, @maximum, @title,
+				// @format, @minLength, @maxLength, @pattern, @minItems,
+				// @maxItems, @schemaDefault) attached directly to the parameter.
+				mcp.api.schema.applyUdaFacets!(__traits(getAttributes, types[i .. i + 1]))(ps);
 				// Draft x-mcp-header: a parameter tagged @mcpHeader is mirrored
 				// into an `Mcp-Param-<name>` request header; emit the extension
 				// property so the transport can validate it (see draft.paramHeaders).
@@ -2258,4 +2262,50 @@ unittest  // method-level single-argument @describe is rejected at compile time
 	// (the first field is `parameter`, not `description`). After the fix this
 	// must fail to compile rather than silently produce an undocumented tool.
 	assert(!__traits(compiles, registerHandlers(s, new MethodDescribeSingleArgApi)));
+}
+
+version (unittest) private final class FacetParamApi
+{
+	@tool("clamp", "Clamp a value to a range")
+	int clamp(@minimum(0) @maximum(100) int value)@safe
+	{
+		return value < 0 ? 0 : value > 100 ? 100 : value;
+	}
+
+	@tool("email", "Send to an email address")
+	string email(@format("email") string address)@safe
+	{
+		return address;
+	}
+}
+
+unittest  // facet UDAs on bare tool parameters are emitted into inputSchema
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new FacetParamApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+
+	Json clampTool, emailTool;
+	foreach (i; 0 .. tools.length)
+	{
+		const name = tools[i]["name"].get!string;
+		if (name == "clamp")
+			clampTool = tools[i];
+		else if (name == "email")
+			emailTool = tools[i];
+	}
+
+	// @minimum and @maximum on a bare int parameter must appear in its schema.
+	auto valueProp = clampTool["inputSchema"]["properties"]["value"];
+	assert(valueProp["type"].get!string == "integer");
+	assert(valueProp["minimum"].get!double == 0.0);
+	assert(valueProp["maximum"].get!double == 100.0);
+
+	// @format on a bare string parameter must appear in its schema.
+	auto addrProp = emailTool["inputSchema"]["properties"]["address"];
+	assert(addrProp["type"].get!string == "string");
+	assert(addrProp["format"].get!string == "email");
 }
