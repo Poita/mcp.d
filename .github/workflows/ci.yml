@@ -94,20 +94,23 @@ jobs:
 
       # The deimos/openssl dub package's preGenerateCommands are posix-only: on
       # Windows the generate_version.d script never runs, so version_.di is never
-      # written, and the binding falls back to treating OpenSSL as 1.1.0h.
-      # Fetch all packages first, then run the script manually so dub's
-      # DeimosOpenSSLAutoDetect path finds the correct OpenSSL 3.x version.
+      # written, and the binding falls back to treating OpenSSL as 1.1.0h —
+      # which predates EVP_DigestSign (requires OpenSSL >= 1.1.1).
+      # Fetch the package explicitly, then write version_.di so the
+      # DeimosOpenSSLAutoDetect path picks up the correct OpenSSL 3.x version.
       - name: Generate OpenSSL D version binding (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          dub describe 2>&1 | Out-Null; $true
-          $pkgs = "$env:LOCALAPPDATA\dub\packages\openssl"
-          $vdir = Get-ChildItem $pkgs -Directory -ErrorAction SilentlyContinue |
-                  Sort-Object Name | Select-Object -Last 1
-          if ($vdir) {
-            $gen = Join-Path $vdir.FullName "openssl\scripts\generate_version.d"
-            if (Test-Path $gen) { ldc2 -run $gen }
+          dub fetch openssl@3.4.0 2>&1
+          $di = "$env:LOCALAPPDATA\dub\packages\openssl\3.4.0\openssl\source\deimos\openssl\version_.di"
+          if (-not (Test-Path $di)) {
+            $raw = & "$env:OPENSSL_ROOT_DIR\bin\openssl.exe" version 2>$null
+            $ver = if ($raw -match 'OpenSSL (\d+\.\d+\.\d+)') { $Matches[1] } else { "3.0.3" }
+            Set-Content $di -Encoding UTF8 -Value "module deimos.openssl.version_;`npackage enum OpenSSLTextVersion = ``"$ver``";"
+            Write-Host "Wrote version_.di (OpenSSL $ver)"
+          } else {
+            Write-Host "version_.di already present"
           }
 
       - name: Build
@@ -193,13 +196,15 @@ jobs:
       - name: Generate OpenSSL D version binding (Windows)
         shell: pwsh
         run: |
-          dub describe 2>&1 | Out-Null; $true
-          $pkgs = "$env:LOCALAPPDATA\dub\packages\openssl"
-          $vdir = Get-ChildItem $pkgs -Directory -ErrorAction SilentlyContinue |
-                  Sort-Object Name | Select-Object -Last 1
-          if ($vdir) {
-            $gen = Join-Path $vdir.FullName "openssl\scripts\generate_version.d"
-            if (Test-Path $gen) { ldc2 -run $gen }
+          dub fetch openssl@3.4.0 2>&1
+          $di = "$env:LOCALAPPDATA\dub\packages\openssl\3.4.0\openssl\source\deimos\openssl\version_.di"
+          if (-not (Test-Path $di)) {
+            $raw = & "$env:OPENSSL_ROOT_DIR\bin\openssl.exe" version 2>$null
+            $ver = if ($raw -match 'OpenSSL (\d+\.\d+\.\d+)') { $Matches[1] } else { "3.0.3" }
+            Set-Content $di -Encoding UTF8 -Value "module deimos.openssl.version_;`npackage enum OpenSSLTextVersion = ``"$ver``";"
+            Write-Host "Wrote version_.di (OpenSSL $ver)"
+          } else {
+            Write-Host "version_.di already present"
           }
 
       # The stdio examples are the real exercise of the Windows threaded stdio
