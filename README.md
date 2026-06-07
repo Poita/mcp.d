@@ -57,6 +57,24 @@ void main()
 }
 ```
 
+## Installation
+
+Add mcp.d to your project with dub:
+
+```bash
+dub add mcp-d
+```
+
+Or add it manually to your `dub.json`:
+
+```json
+"dependencies": {
+    "mcp-d": "~>0.1"
+}
+```
+
+Then `import mcp;` in your source files.
+
 ## Goals
 
 - Full MCP support across every protocol version (`2024-11-05` → `draft`) with negotiation.
