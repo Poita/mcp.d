@@ -37,6 +37,7 @@ public import mcp.server.task_store;
 public import mcp.server.task_runtime : TaskOptions, TaskRuntime;
 public import mcp.server.context;
 public import mcp.server.server;
+public import mcp.server.settings;
 public import mcp.client.client;
 public import mcp.client.subscription;
 

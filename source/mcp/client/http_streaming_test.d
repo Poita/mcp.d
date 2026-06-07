@@ -21,7 +21,7 @@ module mcp.client.http_streaming_test;
 version (unittest)
 {
 	import std.conv : to;
-	import core.time : msecs, MonoTime;
+	import core.time : msecs, MonoTime, seconds;
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
 	import vibe.data.json : Json, parseJsonString;
 	import vibe.stream.operations : readAllUTF8;
@@ -31,7 +31,7 @@ version (unittest)
 
 	import mcp.server.server : McpServer;
 	import mcp.server.context : RequestContext;
-	import mcp.client.client : McpClient;
+	import mcp.client.client : McpClient, ClientSettings;
 	import mcp.protocol.types : CallToolResult, Content, Tool;
 	import mcp.protocol.capabilities : Implementation;
 	import mcp.protocol.versions : ProtocolVersion;
@@ -432,7 +432,8 @@ unittest
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
 			// Cap concurrent in-flight POSTs at `cap`.
-			auto client = McpClient.http(url, Implementation("inflight-client", "1.0"), cap);
+			auto client = McpClient.http(url,
+					ClientSettings(Implementation("inflight-client", "1.0"), 30.seconds, cap));
 			scope (exit)
 				closeQuietly(client);
 
