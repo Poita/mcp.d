@@ -165,6 +165,13 @@ Json jsonSchemaOf(T)() @safe
 /// `@minimum`, `@maximum`, `@title`, `@format`, `@minLength`, `@maxLength`,
 /// `@pattern`, `@minItems`, `@maxItems`, and `@schemaDefault`.  UDA values not
 /// matching any facet type are silently ignored.
+///
+/// The sequence may contain type-valued UDAs — e.g. the bare-enum behavioral
+/// markers `@readOnly`/`@destructive`/`@idempotent`, which leak into a
+/// parameter's attribute set from its enclosing function. `typeof` has no
+/// meaning for a type symbol, so each facet match is guarded on the UDA being an
+/// expression; type-valued UDAs are skipped rather than instantiated against a
+/// `typeof` they cannot satisfy.
 package void applyUdaFacets(udas...)(ref Json prop) @safe
 {
 	import mcp.api.attributes : minimum, maximum, title, SchemaDefault, format,
@@ -173,7 +180,11 @@ package void applyUdaFacets(udas...)(ref Json prop) @safe
 
 	static foreach (uda; udas)
 	{
-		static if (is(typeof(uda) == minimum))
+		static if (!__traits(compiles, typeof(uda)))
+		{
+			// A type-valued UDA (a bare-enum marker): no `typeof`, not a facet.
+		}
+		else static if (is(typeof(uda) == minimum))
 			prop["minimum"] = Json(uda.value);
 		else static if (is(typeof(uda) == maximum))
 			prop["maximum"] = Json(uda.value);

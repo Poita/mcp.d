@@ -1466,6 +1466,48 @@ unittest  // marker-UDA hints: @readOnly + @hintTitle produce the wire shape
 	assert("openWorldHint" !in anns);
 }
 
+unittest  // a function-level marker UDA coexists with a @describe'd first parameter
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	// A bare-enum marker UDA (`@readOnly`/`@idempotent`) declared at the method
+	// level leaks into the attribute set of the first parameter when that
+	// parameter carries its own UDA (here `@describe`). The parameter schema
+	// builder must ignore those type-valued markers rather than treat them as
+	// facet values, and the markers must still populate ToolAnnotations.
+	@safe final class MarkedParamApi
+	{
+		@tool("calc", "Read-only calc with a described first parameter")
+		@readOnly @idempotent int calc(@describe("the left operand") int a, int b)@safe
+		{
+			return a + b;
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new MarkedParamApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+
+	Json calcTool;
+	foreach (i; 0 .. tools.length)
+		if (tools[i]["name"].get!string == "calc")
+			calcTool = tools[i];
+	assert(calcTool.type == Json.Type.object);
+
+	// The described parameter keeps its description; the leaked markers add no
+	// spurious facet keys to its schema.
+	auto aSchema = calcTool["inputSchema"]["properties"]["a"];
+	assert(aSchema["description"].get!string == "the left operand");
+	assert("minimum" !in aSchema);
+	assert("maximum" !in aSchema);
+
+	// The method-level markers still set the behavioral hints.
+	auto anns = calcTool["annotations"];
+	assert(anns["readOnlyHint"].get!bool == true);
+	assert(anns["idempotentHint"].get!bool == true);
+}
+
 version (unittest) private struct HeaderPayload
 {
 	string id;
