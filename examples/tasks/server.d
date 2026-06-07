@@ -134,7 +134,27 @@ void main(string[] args) @safe
 	auto server = new McpServer("tasks-example", "1.0.0");
 
 	// Enable the tasks extension. A short default poll interval keeps the e2e
-	// brisk; the default InProcessTaskDispatcher runs each executor in a fiber.
+	// brisk; passing a null store uses the in-memory default and a null dispatcher
+	// uses the in-process (fiber) default — fine for a single-node demo.
+	//
+	// For a durable, horizontally-scaled deployment you supply your own store and
+	// dispatcher; the @task handlers above do not change. Because all task state
+	// lives in the store, any node can serve tasks/get|update|cancel and re-run an
+	// executor purely from the task ID:
+	//
+	//   final class RedisTaskStore : TaskStore {
+	//       void put(TaskRecord r)               { redis.set(r.meta.taskId, r.toJson.toString); }
+	//       Nullable!TaskRecord get(string id)   { ... TaskRecord.fromJson(...) ... }
+	//       void update(TaskRecord r)            { redis.set(r.meta.taskId, r.toJson.toString); }
+	//       void remove(string id)               { redis.del(id); }
+	//   }
+	//   // A dispatcher that enqueues the task ID; a worker process running the same
+	//   // server + @task registration picks it up and runs the executor.
+	//   final class QueueTaskDispatcher : TaskDispatcher {
+	//       void dispatch(string taskId, void delegate(string) @safe run) { queue.publish(taskId); }
+	//   }
+	//   server.enableTasks(new RedisTaskStore(...), opts, new QueueTaskDispatcher(...));
+	//
 	TaskOptions opts;
 	opts.defaultTtlMs = 30_000;
 	opts.defaultPollIntervalMs = 200;
