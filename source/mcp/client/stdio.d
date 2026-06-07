@@ -307,17 +307,28 @@ final class StdioClientTransport : ClientTransport
 			status = () @trusted { kill(c.pid); return wait(c.pid); }();
 
 		// The child is gone, so its stdout write end is closed and the daemon reader
-		// thread hits EOF. Drain any chunks it still buffers (so it never parks on a
-		// full channel) until it closes the channel, then join it. A GC-touching
+		// thread runs to EOF. Wait for it to exit before returning: a GC-touching
 		// daemon thread left alive into druntime shutdown faults (0xC0000005) on
-		// Windows and would lose buffered stdout, e.g. an example's final "OK:" line.
+		// Windows and discards buffered stdout, e.g. an example's final "OK:" line.
+		// The wait is cooperative -- a non-blocking channel drain each pass (so the
+		// reader never parks on a full buffer) plus a vibe `sleep` yield -- because
+		// the channel's wakeups are fiber-based: a blocking OS-level `join` here
+		// would stall the event loop the reader's channel-close notification needs.
+		// The trailing `join` runs only once the thread has already exited, so it
+		// returns immediately and just reclaims the thread.
 		() @trusted {
-			string discard;
-			while (c.lines.tryConsumeOne(discard))
-			{
-			}
 			if (c.reader !is null)
+			{
+				string discard;
+				while (c.reader.isRunning)
+				{
+					while (c.lines.tryConsumeOne(discard, Duration.zero))
+					{
+					}
+					sleep(5.msecs);
+				}
 				c.reader.join(false);
+			}
 		}();
 		return status;
 	}
