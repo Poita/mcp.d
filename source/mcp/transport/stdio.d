@@ -493,7 +493,9 @@ else version (Windows)
 		import eventcore.driver : IOStatus;
 
 		srvTrace("server.writeAll.begin", bytes.length);
+		srvTrace("server.writeAll.handle", cast(long) cast(size_t) handle_);
 		size_t off;
+		bool wfOk = true;
 		while (off < bytes.length)
 		{
 			DWORD wrote;
@@ -503,13 +505,50 @@ else version (Windows)
 			}();
 			if (!ok || wrote == 0)
 			{
-				srvTrace("server.writeAll.error", off);
-				return IoResult(IOStatus.error, off);
+				const gle = () @trusted {
+					import core.sys.windows.winbase : GetLastError;
+
+					return cast(long) GetLastError();
+				}();
+				srvTrace("server.writeAll.wf_fail.gle", gle);
+				srvTrace("server.writeAll.wf_fail.ok", ok ? 1 : 0);
+				wfOk = false;
+				break;
 			}
 			off += wrote;
 		}
-		srvTrace("server.writeAll.ok", off);
-		return IoResult(IOStatus.ok, off);
+		if (wfOk)
+		{
+			srvTrace("server.writeAll.wf_ok", off);
+			return IoResult(IOStatus.ok, off);
+		}
+		// Fallback (and the symmetric path the client uses successfully): write via
+		// the CRT stdout. Only safe when nothing was written yet (off == 0), which the
+		// observed failure satisfies.
+		if (off == 0)
+		{
+			const fbOk = () @trusted {
+				import std.stdio : stdout;
+
+				try
+				{
+					stdout.rawWrite(bytes);
+					stdout.flush();
+					return true;
+				}
+				catch (Exception)
+				{
+					srvTrace("server.writeAll.crt_fail");
+					return false;
+				}
+			}();
+			if (fbOk)
+			{
+				srvTrace("server.writeAll.crt_ok", bytes.length);
+				return IoResult(IOStatus.ok, bytes.length);
+			}
+		}
+		return IoResult(IOStatus.error, off);
 	}
 
 	private static bool isValidHandle(HANDLE h) @safe
