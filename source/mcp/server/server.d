@@ -1171,7 +1171,7 @@ final class McpServer
 			notify("notifications/tasks", detailed);
 		});
 		tasksEnabled_ = true;
-		advertiseExtension(tasksExtensionKey, Json.emptyObject);
+		enableExtension(tasksExtensionKey, Json.emptyObject);
 		return taskRuntime_;
 	}
 
@@ -1232,7 +1232,7 @@ final class McpServer
 	/// settings appear in the `extensions` field of the server capabilities sent
 	/// during `initialize` / `server/discover`, per the draft Extension
 	/// Negotiation rules. `settings` defaults to an empty object.
-	void advertiseExtension(string identifier, Json settings = Json.emptyObject) @safe
+	void enableExtension(string identifier, Json settings = Json.emptyObject) @safe
 	{
 		if (extensions.type != Json.Type.object)
 			extensions = Json.emptyObject;
@@ -5361,7 +5361,7 @@ unittest  // advertised extensions appear in server/discover capabilities under 
 	auto s = new McpServer("t", "1");
 	Json settings = Json.emptyObject;
 	settings["maxConcurrent"] = 4;
-	s.advertiseExtension("io.modelcontextprotocol/tasks", settings);
+	s.enableExtension("io.modelcontextprotocol/tasks", settings);
 
 	// The `extensions` negotiation map is draft-only; a draft client discovers it
 	// via `server/discover`, not the `initialize` handshake.
@@ -5374,7 +5374,7 @@ unittest  // advertised extensions appear in server/discover capabilities under 
 unittest  // extensions are NOT advertised for pre-draft negotiated versions
 {
 	auto s = new McpServer("t", "1");
-	s.advertiseExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
+	s.enableExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
 
 	foreach (ver; ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"])
 	{

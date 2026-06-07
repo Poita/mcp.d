@@ -305,7 +305,7 @@ resource convention, and `import mcp;` brings in the helpers (`mcp.api.apps`):
 ```d
 auto server = new McpServer("weather", "1.0.0");
 registerModule!(my.module)(server);     // a @tool tagged @ui("ui://weather/dashboard", "model", "app")
-advertiseMcpApps(server);               // declare the extension capability
+enableApps(server);               // declare the extension capability
 
 UiResourceMeta ui;
 ui.csp.connectDomains = ["https://api.open-meteo.com"];
@@ -316,7 +316,7 @@ registerUiResource(server, "ui://weather/dashboard", "weather_dashboard",
 
 A `@tool` carries its UI link via `@ui(resourceUri, visibility…)` (folded into the
 tool's `_meta.ui`); the dynamic path uses `setUiToolMeta(tool, UiToolMeta(...))`.
-`clientSupportsMcpApps(server)` reports whether the connected client opted into the
+`clientSupportsApps(server)` reports whether the connected client opted into the
 extension. The runnable [Apps example](examples/apps/) verifies the whole surface
 over both transports.
 
