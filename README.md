@@ -341,21 +341,12 @@ progress, observes cooperative cancellation, and elicits input mid-task; it is
 omitted from the tool's input schema (the typed params derive it):
 
 ```d
-server.enableTasks();   // advertise io.modelcontextprotocol/tasks
-
-struct BuildResult { bool passed; string log; }
-
-@task("build", "Run a CI build (asynchronous).")
-@taskTtl(10.minutes) @taskPollInterval(2.seconds)
-BuildResult build(string gitRef, TaskContext tc) @safe
-{
-    tc.progress("cloning " ~ gitRef);
-    return BuildResult(true, "ok");
-}
+server.enableTasks();   // advertise io.modelcontextprotocol/tasks; pass a TaskStore for durable storage
 
 struct Approval { bool deploy; }
 
 @task("deploy", "Deploy a build, confirming with the client mid-task.")
+@taskTtl(10.minutes) @taskPollInterval(2.seconds)
 string deploy(string gitRef, TaskContext tc) @safe
 {
     if (!tc.hasInput("ok"))
