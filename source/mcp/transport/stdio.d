@@ -492,10 +492,7 @@ else version (Windows)
 	{
 		import eventcore.driver : IOStatus;
 
-		srvTrace("server.writeAll.begin", bytes.length);
-		srvTrace("server.writeAll.handle", cast(long) cast(size_t) handle_);
 		size_t off;
-		bool wfOk = true;
 		while (off < bytes.length)
 		{
 			DWORD wrote;
@@ -504,51 +501,10 @@ else version (Windows)
 						cast(DWORD)(bytes.length - off), &wrote, null) != 0;
 			}();
 			if (!ok || wrote == 0)
-			{
-				const gle = () @trusted {
-					import core.sys.windows.winbase : GetLastError;
-
-					return cast(long) GetLastError();
-				}();
-				srvTrace("server.writeAll.wf_fail.gle", gle);
-				srvTrace("server.writeAll.wf_fail.ok", ok ? 1 : 0);
-				wfOk = false;
-				break;
-			}
+				return IoResult(IOStatus.error, off);
 			off += wrote;
 		}
-		if (wfOk)
-		{
-			srvTrace("server.writeAll.wf_ok", off);
-			return IoResult(IOStatus.ok, off);
-		}
-		// Fallback (and the symmetric path the client uses successfully): write via
-		// the CRT stdout. Only safe when nothing was written yet (off == 0), which the
-		// observed failure satisfies.
-		if (off == 0)
-		{
-			const fbOk = () @trusted {
-				import std.stdio : stdout;
-
-				try
-				{
-					stdout.rawWrite(bytes);
-					stdout.flush();
-					return true;
-				}
-				catch (Exception)
-				{
-					srvTrace("server.writeAll.crt_fail");
-					return false;
-				}
-			}();
-			if (fbOk)
-			{
-				srvTrace("server.writeAll.crt_ok", bytes.length);
-				return IoResult(IOStatus.ok, bytes.length);
-			}
-		}
-		return IoResult(IOStatus.error, off);
+		return IoResult(IOStatus.ok, off);
 	}
 
 	private static bool isValidHandle(HANDLE h) @safe
@@ -562,38 +518,16 @@ else version (Windows)
 	/// `readOnce` never has to split a chunk across calls.
 	private static void pumpStdin(HANDLE h, Channel!(immutable(ubyte)[]) chan) @system
 	{
-		srvTrace("server.pumpStdin.start");
 		ubyte[32 * 1024] buf;
 		for (;;)
 		{
 			DWORD got;
 			const ok = ReadFile(h, cast(void*) buf.ptr, cast(DWORD) buf.length, &got, null) != 0;
-			srvTrace(ok ? "server.pumpStdin.read" : "server.pumpStdin.readfail", got);
 			if (!ok || got == 0)
 				break;
 			chan.put(buf[0 .. got].idup);
 		}
-		srvTrace("server.pumpStdin.eof");
 		chan.close();
-	}
-}
-
-// Diagnostic trace to stderr (inherited by the spawning host), gated to the
-// Windows stdio path. Used to pinpoint where the stdio round-trip stalls.
-version (Windows) private void srvTrace(string label, long n = -1) @trusted nothrow
-{
-	import std.stdio : stderr;
-
-	try
-	{
-		if (n >= 0)
-			stderr.writeln("[MCPTRACE] ", label, " ", n);
-		else
-			stderr.writeln("[MCPTRACE] ", label);
-		stderr.flush();
-	}
-	catch (Exception)
-	{
 	}
 }
 

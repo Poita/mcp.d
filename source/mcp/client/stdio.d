@@ -476,46 +476,22 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 
 	string readLine() @safe
 	{
-		cliTrace("client.readLine.wait");
 		string line;
 		const got = () @trusted { return lines.tryConsumeOne(line); }();
-		cliTrace(got ? "client.readLine.got" : "client.readLine.closed", got
-				? cast(long) line.length : -1);
 		return got ? line : null; // channel closed (EOF / over-long) -> end the loop
 	}
 
 	void writeLine(string s) @safe
 	{
-		cliTrace("client.writeLine", cast(long) s.length);
 		() @trusted {
 			child.childStdin.rawWrite(cast(const(ubyte)[])(s ~ "\n"));
 			child.childStdin.flush();
 		}();
-		cliTrace("client.writeLine.flushed", cast(long) s.length);
 	}
 
 	auto transport = new StdioClientTransport(&readLine, &writeLine);
 	transport.attachWinChild(child);
 	return transport;
-}
-
-// Diagnostic trace to stderr, gated to the Windows stdio client path. Used to
-// pinpoint where the stdio round-trip stalls.
-version (Windows) private void cliTrace(string label, long n = -1) @trusted nothrow
-{
-	import std.stdio : stderr;
-
-	try
-	{
-		if (n >= 0)
-			stderr.writeln("[MCPTRACE] ", label, " ", n);
-		else
-			stderr.writeln("[MCPTRACE] ", label);
-		stderr.flush();
-	}
-	catch (Exception)
-	{
-	}
 }
 
 /// Reader-thread body (Windows client): blocking reads on the child's stdout,
@@ -528,7 +504,6 @@ version (Windows) private void pumpChildStdout(HANDLE h, Channel!string chan, si
 	import core.sys.windows.windef : DWORD;
 	import core.sys.windows.winbase : ReadFile, CloseHandle;
 
-	cliTrace("client.pump.start");
 	scope (exit)
 		CloseHandle(h);
 	ubyte[32 * 1024] buf;
@@ -537,7 +512,6 @@ version (Windows) private void pumpChildStdout(HANDLE h, Channel!string chan, si
 	{
 		DWORD n;
 		const ok = ReadFile(h, cast(void*) buf.ptr, cast(DWORD) buf.length, &n, null) != 0;
-		cliTrace(ok ? "client.pump.read" : "client.pump.readfail", cast(long) n);
 		if (!ok || n == 0)
 			break; // EOF/error -> drop any partial fragment
 		auto got = buf[0 .. n];
