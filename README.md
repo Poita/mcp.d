@@ -266,7 +266,7 @@ The Streamable HTTP transport derives session minting purely from
 
 ## Examples
 
-The repository ships twelve runnable, self-verifying server/client pairs in
+The repository ships thirteen runnable, self-verifying server/client pairs in
 [`examples/`](examples/). Each `client.d` is an end-to-end test that asserts the
 matching server's behaviour, and CI runs every pair over **both** stdio and
 Streamable HTTP.
@@ -280,6 +280,7 @@ Streamable HTTP.
 | Stateless draft | the stateless draft protocol (`server/discover`, per-request `_meta`) | [server](examples/stateless-draft/server.d) | [client](examples/stateless-draft/client.d) |
 | Streaming | progress notifications from a long-running tool | [server](examples/streaming/server.d) | [client](examples/streaming/client.d) |
 | MRTR | multi-round-trip tool input (carried in the result) | [server](examples/mrtr/server.d) | [client](examples/mrtr/client.d) |
+| Tasks | async `@task` tools (progress, cancellation, mid-task input) | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
 | Sampling | server-initiated LLM sampling (`ctx.sample`) | [server](examples/sampling/server.d) | [client](examples/sampling/client.d) |
 | Elicitation | server-initiated, typed user input (`ctx.elicit!T`) | [server](examples/elicitation/server.d) | [client](examples/elicitation/client.d) |
 | Sticky notes | stateful tools + a resource per note + elicitation-confirmed clear | [server](examples/stickynotes/server.d) | [client](examples/stickynotes/client.d) |
@@ -331,27 +332,44 @@ the server as an ordinary `tools/call`, so the server implements no `ui/` method
 The [MCP Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview)
 (`io.modelcontextprotocol/tasks`, [SEP-2663](https://modelcontextprotocol.io/seps/2663-tasks-extension))
 lets a server answer a long-running `tools/call` with a durable task handle
-instead of blocking; the client polls `tasks/get` to completion, supplies
-mid-flight input via `tasks/update`, and may `tasks/cancel`. `enableTasks` turns
-it on (draft protocol only) and returns a `TaskRuntime`:
+instead of blocking — the client polls `tasks/get` until it completes, and may
+`tasks/update` (mid-flight input) or `tasks/cancel`. Mark a function `@task` and it
+becomes one of these tools: the call returns a handle at once, the body runs
+asynchronously, and its return value becomes the result; the injected `TaskContext`
+reports progress, observes cancellation, and elicits input mid-task.
 
 ```d
-auto server = new McpServer("ci", "1.0.0");
-auto tasks = server.enableTasks();      // advertise io.modelcontextprotocol/tasks
+auto rt = server.enableTasks();   // keep the runtime; pass a TaskStore for durability
 
-// In a long-running tool: create a task, return its CreateTaskResult, and
-// resolve it as the work progresses (complete / fail / requireInput / cancel).
-auto t = tasks.create();
-// ... drive the work, then: tasks.complete(t.taskId, callToolResultJson);
-return makeCreateTaskResult(t);
+struct Approval { bool deploy; }
+
+@task("deploy", "Deploy a build, confirming first; finishes when the deploy signals back.")
+@taskTtl(10.minutes) @taskPollInterval(2.seconds)
+string deploy(string gitRef, TaskContext tc) @safe
+{
+    if (!tc.hasInput("ok"))
+        return tc.requireInput([InputRequest.elicitation!Approval("ok", "Deploy " ~ gitRef ~ "?")]);
+    if (!tc.inputAs!ElicitResult("ok").contentAs!Approval().deploy)
+        return "skipped";
+    startDeploy(gitRef, tc.taskId);             // fictional: kicks off the deploy, returns at once
+    return tc.detach("deploying " ~ gitRef);    // leave it working; the webhook below completes it
+}
+
+// The deploy system's callback — runs on any node, holds no fiber:
+void onDeployFinished(string taskId, bool ok) @safe
+{
+    if (ok)
+        rt.complete(taskId, CallToolResult([Content.makeText("deployed")]).toJson());
+    else
+        rt.fail(taskId, internalError("deploy failed"));
+}
 ```
 
-The server serves `tasks/get`, `tasks/update`, and `tasks/cancel` against the
-task store (in-memory by default; pass your own `TaskStore` for durability).
-Supply a custom `TaskIdGenerator` via `TaskOptions` to correlate task IDs with an
-external job system; the runtime keeps them unique. Status changes are pushed as
-`notifications/tasks` for clients that opt into a listen stream, but polling
-remains the contract.
+The three exits cover the lifecycle: `return` a value completes the task,
+`tc.requireInput(...)` suspends it for a client answer (delivered via `tasks/update`),
+and `tc.detach(...)` leaves it `working` for `onDeployFinished` to complete out of
+band via `rt.complete` / `rt.fail` — no fiber held, so it works on any node. See
+[`examples/tasks`](examples/tasks/) for cancellation, durable stores, and the client side.
 
 > **Not supported: the experimental 2025-11-25 tasks.** The `tasks` feature that
 > shipped in the 2025-11-25 core specification (a top-level `tasks` capability,

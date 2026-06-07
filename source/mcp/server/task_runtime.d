@@ -5,7 +5,7 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
 import mcp.protocol.tasks;
-import mcp.protocol.errors : McpException, ErrorCode;
+import mcp.protocol.errors : McpException, ErrorCode, toErrorJson, internalError;
 import mcp.server.task_store : TaskStore, TaskRecord, InMemoryTaskStore,
 	TaskIdGenerator, defaultTaskIdGenerator;
 
@@ -182,6 +182,14 @@ final class TaskRuntime
 		r.error = nullable(error);
 		r.inputRequests = Json.emptyObject;
 		touchAndStore(r);
+	}
+
+	/// `fail` from an `McpException`, recording its JSON-RPC `code`/`message`/`data`.
+	/// Pair with the error builders (`internalError`, `invalidParams`, …) instead of
+	/// hand-rolling the error object.
+	void fail(string id, const McpException e) @safe
+	{
+		fail(id, toErrorJson(e));
 	}
 
 	/// Move a task to `input_required`, surfacing `inputRequests` on the next
@@ -373,6 +381,18 @@ unittest  // fail stores the JSON-RPC error and getDetailed inlines it
 	auto d = rt.getDetailed(t.taskId);
 	assert(d["status"].get!string == "failed");
 	assert(d["error"]["code"].get!int == -32000);
+}
+
+unittest  // fail from an McpException records its code, message, and data
+{
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.create();
+	rt.fail(t.taskId, internalError("deploy failed", Json(["ref": Json("abc")])));
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "failed");
+	assert(d["error"]["code"].get!int == cast(int) ErrorCode.internalError);
+	assert(d["error"]["message"].get!string == "deploy failed");
+	assert(d["error"]["data"]["ref"].get!string == "abc");
 }
 
 unittest  // requireInput surfaces inputRequests and deliverInput records responses

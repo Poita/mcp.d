@@ -23,6 +23,19 @@ final class TaskSuspended : Exception
 	}
 }
 
+/// Thrown by `TaskContext.detach` to unwind a task executor that has handed its
+/// work off to be completed out of band. Unlike `TaskSuspended`, the task is left
+/// `working` (no `inputRequests`): the dispatcher catches this and stops the
+/// current dispatch, and an external signal later calls `rt.complete` / `rt.fail`.
+/// Do not catch this in executor code.
+final class TaskDetached : Exception
+{
+	this(string taskId) @safe nothrow
+	{
+		super("task detached: " ~ taskId);
+	}
+}
+
 /// The handle a task executor uses to drive its task. It is store-backed (every
 /// call reads/writes the durable `TaskRecord` via the runtime), so an executor is
 /// a pure function of its persisted input plus this context — it can run in-process
@@ -135,6 +148,25 @@ struct TaskContext
 		checkpoint("_state", state);
 		return requireInput(requests);
 	}
+
+	/// Stop this dispatch without completing the task: it stays `working` and is
+	/// finished out of band via `rt.complete` / `rt.fail` (e.g. a deploy webhook or
+	/// job callback that holds the task ID). Use this after kicking off external work
+	/// so no fiber is held — any node can later complete the task from the store.
+	/// Never returns — its `noreturn` result type lets an executor write
+	/// `return tc.detach();` from a value-returning method.
+	noreturn detach() @safe
+	{
+		throw new TaskDetached(taskId_);
+	}
+
+	/// `detach` that also records a human-readable working status message (visible
+	/// on the next `tasks/get`).
+	noreturn detach(string statusMessage) @safe
+	{
+		rt_.progress(taskId_, statusMessage);
+		throw new TaskDetached(taskId_);
+	}
 }
 
 /// A registered task executor: given its `TaskContext`, it produces the final
@@ -164,12 +196,13 @@ void runTaskExecutor(TaskRuntime rt, string taskId, TaskExecutor executor) @safe
 	{
 		// Already persisted as input_required; nothing further this dispatch.
 	}
+	catch (TaskDetached)
+	{
+		// Left `working`; an external signal completes it via rt.complete/rt.fail.
+	}
 	catch (McpException e)
 	{
-		Json err = Json.emptyObject;
-		err["code"] = cast(int) e.code;
-		err["message"] = e.msg;
-		rt.fail(taskId, err);
+		rt.fail(taskId, e);
 	}
 	catch (Exception e)
 	{
@@ -268,6 +301,40 @@ unittest  // requireInput suspends into input_required; re-run completes after a
 	auto done = rt.getDetailed(t.taskId);
 	assert(done["status"].get!string == "completed");
 	assert(done["result"]["structuredContent"]["done"].get!bool);
+}
+
+unittest  // detach stops the dispatch without completing; the task stays working
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("deploy", Json.undefined);
+	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
+		return tc.detach();
+	});
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
+
+	// An external signal completes it later.
+	rt.complete(t.taskId, Json(["structuredContent": Json(["ok": Json(true)])]));
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "completed");
+	assert(d["result"]["structuredContent"]["ok"].get!bool);
+}
+
+unittest  // detach(statusMessage) records a working status message
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("deploy", Json.undefined);
+	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
+		return tc.detach("deploying");
+	});
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "working");
+	assert(d["statusMessage"].get!string == "deploying");
 }
 
 unittest  // an executor that throws fails the task with a JSON-RPC error
