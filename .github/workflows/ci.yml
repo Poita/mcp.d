@@ -107,7 +107,7 @@ jobs:
           if (-not (Test-Path $di)) {
             $raw = & "$env:OPENSSL_ROOT_DIR\bin\openssl.exe" version 2>$null
             $ver = if ($raw -match 'OpenSSL (\d+\.\d+\.\d+)') { $Matches[1] } else { "3.0.3" }
-            Set-Content $di -Encoding UTF8 -Value "module deimos.openssl.version_;`npackage enum OpenSSLTextVersion = ``"$ver``";"
+            Set-Content $di -Encoding UTF8 -Value "module deimos.openssl.version_;`npackage enum OpenSSLTextVersion = `"$ver`";"
             Write-Host "Wrote version_.di (OpenSSL $ver)"
           } else {
             Write-Host "version_.di already present"
@@ -201,7 +201,7 @@ jobs:
           if (-not (Test-Path $di)) {
             $raw = & "$env:OPENSSL_ROOT_DIR\bin\openssl.exe" version 2>$null
             $ver = if ($raw -match 'OpenSSL (\d+\.\d+\.\d+)') { $Matches[1] } else { "3.0.3" }
-            Set-Content $di -Encoding UTF8 -Value "module deimos.openssl.version_;`npackage enum OpenSSLTextVersion = ``"$ver``";"
+            Set-Content $di -Encoding UTF8 -Value "module deimos.openssl.version_;`npackage enum OpenSSLTextVersion = `"$ver`";"
             Write-Host "Wrote version_.di (OpenSSL $ver)"
           } else {
             Write-Host "version_.di already present"
