@@ -109,7 +109,7 @@ final class StickyNotesApi
 	/// that reads the note back, and announce the new resource via
 	/// `notifications/resources/list_changed`.
 	@tool("add_note", "Add a sticky note; registers a note:///{id} resource for it.")
-	@describe("the note text")
+	@describe("text", "the note text")
 	AddNoteResult addNote(string text) @safe
 	{
 		const id = (nextId++).to!string;
@@ -132,7 +132,7 @@ final class StickyNotesApi
 	/// `remove_note`: delete one note and unregister its resource, announcing the
 	/// list change. Returns `removed:false` (not an error) for an unknown id.
 	@tool("remove_note", "Remove one sticky note by id and unregister its resource.")
-	@describe("the id of the note to remove")
+	@describe("id", "the id of the note to remove")
 	RemoveNoteResult removeNote(string id) @safe
 	{
 		if (id !in notes)
