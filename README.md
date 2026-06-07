@@ -15,6 +15,7 @@ A server is a handful of annotated functions plus `runStdio`:
 ```d
 // server.d
 import mcp;
+import mcp.transport : runStdio;
 
 @tool("add", "Add two integers")
 long add(long a, long b) @safe { return a + b; }
