@@ -16,7 +16,7 @@ Closes #
 - [ ] **`dub test` passes** — all modules green locally (`ulimit -n 65536 && dub test`).
 - [ ] **`dfmt` clean** — ran `dub run dfmt -- --inplace source/ conformance/`; `git diff --exit-code` is clean.
 - [ ] **`dscanner` clean** — ran `./scripts/dscanner-lint.sh`.
-- [ ] **Conformance unaffected** — server **38/38** and client **287/287** baseline not regressed.
+- [ ] **Conformance unaffected** — server **39/39** and client **287/287** baseline not regressed.
 - [ ] **Draft-only behavior gated** — any draft-only change does NOT alter `2025-11-25` / `2025-06-18` wire output.
 - [ ] **Public API reachable** — new public API is exported via `source/mcp/package.d` and usable from `McpServer` / `McpClient` / `RequestContext` (or the UDA layer).
 - [ ] **`CHANGELOG.md` updated** under `## [Unreleased]` if the change is user-visible.

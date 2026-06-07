@@ -32,7 +32,7 @@ fmt:
 lint:
     ./scripts/dscanner-lint.sh
 
-# Build + run the official MCP server conformance suite (server 38/38).
+# Build + run the official MCP server conformance suite (server 39/39).
 conformance-server:
     ulimit -n 65536 && dub build -c conformance-server
     ./conformance-server --port 3000 & \

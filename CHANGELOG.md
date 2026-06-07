@@ -53,7 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   streaming, sampling, and elicitation (incl. SEP-1034 / SEP-1330).
 - DNS-rebinding protection for the Streamable HTTP transport.
 - Validation against the official `@modelcontextprotocol/conformance` suite:
-  **server 38/38** and **client 287/287** passing.
+  **server 39/39** and **client 287/287** passing.
 
 ### Fixed
 

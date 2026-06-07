@@ -88,7 +88,7 @@ Then `import mcp;` in your source files.
 **All official conformance tests pass** (0 failures): **server 39/39**, **client 287/287**
 (one advisory `SHOULD` warning on the optional Client-ID-Metadata-Document flow).
 
-- ✅ **All 30 server scenarios**: lifecycle, tools with every content type, resources +
+- ✅ **All 39 server scenarios**: lifecycle, tools with every content type, resources +
   templates + subscribe, prompts, completion, logging, progress/logging streaming, sampling,
   elicitation (incl. SEP-1034/1330), DNS-rebinding protection.
 - ✅ **All client scenarios**, including the **complete OAuth 2.1** suite — token-endpoint
