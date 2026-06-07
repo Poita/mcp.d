@@ -396,6 +396,7 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 version (Windows)
 {
 	import std.stdio : File;
+	import core.sys.windows.windef : HANDLE;
 	import vibe.core.channel : Channel, createChannel;
 }
 
@@ -438,20 +439,35 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 	import std.process : pipeProcess, Redirect;
 	import core.thread : Thread;
 
+	import core.sys.windows.windef : HANDLE, FALSE;
+	import core.sys.windows.winbase : DuplicateHandle, GetCurrentProcess, DUPLICATE_SAME_ACCESS;
+
 	auto child = () @trusted { return new WinChild; }();
-	auto childStdout = () @trusted {
+
+	// std.stdio.File is not safe to share across threads: its reference count is
+	// non-atomic, so handing the child-stdout File to the reader thread races the
+	// refcount and can close the handle. That closes our end of the pipe, and the
+	// server's writes then fail with ERROR_NO_DATA. Instead, duplicate the read
+	// handle into one the reader thread owns outright (and closes on EOF), letting
+	// the original File close with `pp`. The duplicate keeps the pipe's read end
+	// open, mirroring the server's raw-HANDLE ReadFile pump.
+	HANDLE readHandle;
+	() @trusted {
 		auto pp = pipeProcess(args, Redirect.stdin | Redirect.stdout);
 		child.pid = pp.pid;
 		child.childStdin = pp.stdin;
-		return pp.stdout;
+		auto proc = GetCurrentProcess();
+		DuplicateHandle(proc, pp.stdout.windowsHandle, proc, &readHandle, 0,
+				FALSE, DUPLICATE_SAME_ACCESS);
 	}();
 
-	// Daemon reader: blocking reads on the child's stdout, lines pushed to `lines`.
+	// Daemon reader: blocking ReadFile on the duplicated stdout handle, lines pushed
+	// to `lines`.
 	auto lines = createChannel!string();
 	auto chan = lines;
 	child.lines = lines;
 	() @trusted {
-		auto t = new Thread({ pumpChildStdout(childStdout, chan, maxLineBytes); });
+		auto t = new Thread({ pumpChildStdout(readHandle, chan, maxLineBytes); });
 		t.isDaemon = true;
 		t.start();
 		child.reader = t;
@@ -506,17 +522,24 @@ version (Windows) private void cliTrace(string label, long n = -1) @trusted noth
 /// line is pushed to `chan`. An over-long newline-less run (> `maxLineBytes`) or
 /// EOF closes the channel, which surfaces to the duplex read loop as end-of-input;
 /// a partial fragment at EOF is dropped rather than forwarded as a malformed line.
-version (Windows) private void pumpChildStdout(File stdout, Channel!string chan, size_t maxLineBytes) @system
+version (Windows) private void pumpChildStdout(HANDLE h, Channel!string chan, size_t maxLineBytes) @system
 {
+	import core.sys.windows.windef : DWORD;
+	import core.sys.windows.winbase : ReadFile, CloseHandle;
+
 	cliTrace("client.pump.start");
+	scope (exit)
+		CloseHandle(h);
 	ubyte[32 * 1024] buf;
 	ubyte[] acc;
 	for (;;)
 	{
-		auto got = stdout.rawRead(buf[]);
-		cliTrace("client.pump.read", cast(long) got.length);
-		if (got.length == 0)
-			break; // EOF -> drop any partial fragment
+		DWORD n;
+		const ok = ReadFile(h, cast(void*) buf.ptr, cast(DWORD) buf.length, &n, null) != 0;
+		cliTrace(ok ? "client.pump.read" : "client.pump.readfail", cast(long) n);
+		if (!ok || n == 0)
+			break; // EOF/error -> drop any partial fragment
+		auto got = buf[0 .. n];
 		size_t i;
 		while (i < got.length)
 		{
