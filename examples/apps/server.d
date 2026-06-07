@@ -7,7 +7,7 @@
 ///   - `registerUiResource` to publish the linked `ui://` HTML resource with the
 ///     `text/html;profile=mcp-app` MIME type and a `_meta.ui` carrying CSP /
 ///     border hints;
-///   - `advertiseMcpApps` to declare the extension capability (surfaced to draft
+///   - `enableApps` to declare the extension capability (surfaced to draft
 ///     clients via the `extensions` negotiation map).
 ///
 /// MCP Apps is, on the server side, metadata plus a resource convention: the
@@ -69,7 +69,7 @@ void main(string[] args) @safe
 	registerModule!(apps_server)(server);
 
 	// Declare MCP Apps support (visible to draft clients via the extensions map).
-	advertiseMcpApps(server);
+	enableApps(server);
 
 	// Publish the ui:// resource the tool links to, with CSP + border hints.
 	UiResourceMeta ui;

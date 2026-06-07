@@ -204,7 +204,7 @@ void setUiToolMeta(ref Tool tool, UiToolMeta ui) @safe
 /// extension is carried in the `extensions` negotiation map (emitted to draft
 /// clients), declaring the content types this server's UI resources use.
 /// `mimeTypes` defaults to `[mcpAppMimeType]`.
-void advertiseMcpApps(McpServer server, string[] mimeTypes = null) @safe
+void enableApps(McpServer server, string[] mimeTypes = null) @safe
 {
 	Json arr = Json.emptyArray;
 	if (mimeTypes.length == 0)
@@ -214,13 +214,13 @@ void advertiseMcpApps(McpServer server, string[] mimeTypes = null) @safe
 			arr ~= Json(m);
 	Json settings = Json.emptyObject;
 	settings["mimeTypes"] = arr;
-	server.advertiseExtension(mcpAppsExtensionKey, settings);
+	server.enableExtension(mcpAppsExtensionKey, settings);
 }
 
 /// Whether the connected client advertised the MCP Apps extension at
 /// initialization (valid after `initialize` / `server/discover`). A tool handler
 /// can branch on this to decide whether to return a UI-linked result.
-bool clientSupportsMcpApps(McpServer server) @safe
+bool clientSupportsApps(McpServer server) @safe
 {
 	auto ext = server.clientExtensions();
 	return ext.type == Json.Type.object && (mcpAppsExtensionKey in ext) !is null;
@@ -365,13 +365,13 @@ unittest  // UiResourceMeta round-trips through fromJson
 	assert(back.prefersBorder.get == false);
 }
 
-unittest  // advertiseMcpApps surfaces the extension with its mimeTypes (draft)
+unittest  // enableApps surfaces the extension with its mimeTypes (draft)
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.modern : MetaKey;
 
 	auto s = new McpServer("t", "1");
-	advertiseMcpApps(s);
+	enableApps(s);
 
 	Json params = Json.emptyObject;
 	Json meta = Json.emptyObject;
@@ -387,7 +387,7 @@ unittest  // advertiseMcpApps surfaces the extension with its mimeTypes (draft)
 	assert(settings["mimeTypes"][0].get!string == mcpAppMimeType);
 }
 
-unittest  // clientSupportsMcpApps reflects what the client advertised at initialize
+unittest  // clientSupportsApps reflects what the client advertised at initialize
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -401,10 +401,10 @@ unittest  // clientSupportsMcpApps reflects what the client advertised at initia
 	params["capabilities"] = caps;
 	s.handle(Message(makeRequest(Json(1), "initialize", params)));
 
-	assert(clientSupportsMcpApps(s));
+	assert(clientSupportsApps(s));
 }
 
-unittest  // clientSupportsMcpApps is false for a client that did not advertise it
+unittest  // clientSupportsApps is false for a client that did not advertise it
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -414,7 +414,7 @@ unittest  // clientSupportsMcpApps is false for a client that did not advertise 
 	params["capabilities"] = Json.emptyObject;
 	s.handle(Message(makeRequest(Json(1), "initialize", params)));
 
-	assert(!clientSupportsMcpApps(s));
+	assert(!clientSupportsApps(s));
 }
 
 unittest  // registerUiResource serves HTML with the app mime type and _meta.ui
