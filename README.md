@@ -360,7 +360,7 @@ void onDeployFinished(string taskId, bool ok) @safe
     if (ok)
         rt.complete(taskId, CallToolResult([Content.makeText("deployed")]).toJson());
     else
-        rt.fail(taskId, Json(["code": Json(-32000), "message": Json("deploy failed")]));
+        rt.fail(taskId, internalError("deploy failed"));
 }
 ```
 
