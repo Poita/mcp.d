@@ -335,10 +335,15 @@ final class LegacySseChannel
 	private string endpointPath;
 	private Listener[] listeners;
 	private long nextId = 1;
+	/// Correlates server->client requests with the client's reply POSTs, keyed by
+	/// (sessionId, requestId). A handler that blocks in ctx.sample/ctx.elicit/
+	/// ctx.listRoots registers here; the client's reply POST resolves the waiter.
+	StreamCoordinator coord;
 
 	this(string endpointPath) @safe
 	{
 		this.endpointPath = endpointPath;
+		this.coord = new StreamCoordinator;
 	}
 
 	/// Register an open GET SSE stream. A fresh per-stream session token and a
@@ -500,18 +505,63 @@ private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @
 /// `message` event. `sessionId` is the per-stream token the client echoed from its
 /// `endpoint` event, so the response is delivered ONLY to the stream that issued
 /// this POST — never broadcast across concurrently-connected clients. `conn` is the
-/// per-stream `ConnectionState` owned by the originating GET listener; passing it
-/// to `handleRaw` ensures each client's dispatch runs against its own isolated state
-/// (negotiated version, client capabilities, subscriptions) rather than the shared
-/// fallback. Returns true (the server accepts every well-formed POST on this
-/// transport; a parse failure still yields a JSON-RPC error response delivered on
-/// the stream). A notification produces no response, so nothing is delivered.
-/// Exposed (package-level) so the two-endpoint flow can be exercised without a
-/// live socket.
+/// per-stream `ConnectionState` owned by the originating GET listener. Returns true
+/// (the server accepts every well-formed POST on this transport; a parse failure
+/// still yields a JSON-RPC error response delivered on the stream). A notification
+/// produces no response, so nothing is delivered. A client response/errorResponse
+/// (the client's reply to a server->client request) is routed to the channel's
+/// coordinator so a handler blocked in ctx.sample/ctx.elicit/ctx.listRoots is
+/// unblocked. Exposed (package-level) so the two-endpoint flow can be exercised
+/// without a live socket.
 bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 		string sessionId, string payload, ConnectionState conn = null) @safe
 {
-	const responseText = server.handleRaw(payload, conn);
+	// Parse the message to distinguish client responses (replies to a server->client
+	// request) from client requests and notifications. A parse failure falls through
+	// to handleRaw which produces a JSON-RPC error response on the SSE stream.
+	try
+	{
+		const msg = parseMessage(payload);
+		if (msg.kind == MessageKind.response || msg.kind == MessageKind.errorResponse)
+		{
+			// Route the client's reply to whatever handler task is awaiting it.
+			// The coordinator key is (sessionId, requestId) so a reply for one session
+			// cannot wake a waiter registered under a different session token.
+			channel.coord.resolve(msg.id, msg.result, msg.error, sessionId);
+			return true;
+		}
+	}
+	catch (Exception)
+	{
+		// Parse failure: fall through so handleRaw returns the protocol error.
+	}
+
+	// Wire a sink that pushes any out-of-band server frame (progress, log,
+	// server->client request) onto the originating SSE stream, and a serverRequest
+	// delegate that issues a server->client request through the channel coordinator
+	// and blocks until the client's reply POST arrives.
+	void sink(string frame) @safe
+	{
+		channel.deliverTo(sessionId, frame);
+	}
+
+	Json serverRequest(string method, Json params) @safe
+	{
+		import core.time : seconds;
+
+		const id = channel.coord.alloc();
+		channel.coord.register(id, sessionId);
+		try
+			channel.deliverTo(sessionId, makeRequest(Json(id), method, params).toString());
+		catch (Exception e)
+		{
+			channel.coord.cancel(id, sessionId);
+			throw e;
+		}
+		return channel.coord.await(id, 60.seconds, sessionId);
+	}
+
+	const responseText = server.handleRaw(payload, &sink, &serverRequest);
 	channel.deliverTo(sessionId, responseText);
 	return true;
 }
@@ -2014,6 +2064,79 @@ unittest  // legacy POST: a request is processed and its response pushed onto th
 			`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
 	assert(accepted2);
 	assert(frames.length == 2); // no new frame
+}
+
+unittest  // legacy POST: a handler that calls ctx.listRoots() sends the request on the SSE stream
+{
+	// A handler may issue a server->client request (roots/list, sampling, elicitation).
+	// On the legacy HTTP+SSE transport, handleLegacyPostBody must wire a serverRequest
+	// delegate so the outbound request is pushed onto the originating GET SSE stream
+	// and the client's reply POST is correlated back to the blocked handler.
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, yield;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.types : Tool, CallToolResult;
+
+	auto server = McpServer.stateful("t", "1");
+	// Register a tool whose handler issues a roots/list server->client request.
+	Tool descriptor;
+	descriptor.name = "roottool";
+	server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
+		ctx.listRootsRaw(); // blocks until client replies; bypasses capability check
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+
+	auto ch = new LegacySseChannel("/message");
+	string[] frames;
+	const id = ch.addListener((string f) @safe { frames ~= f; });
+	const sid = ch.sessionIdFor(id);
+	assert(frames.length == 1); // endpoint event only
+
+	// The tool call is dispatched in a task so it can block on the roots/list reply.
+	bool done;
+	runTask(() nothrow{
+		try
+		{
+			cast(void) handleLegacyPostBody(server, ch, sid, `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"roottool","arguments":{}}}`);
+		}
+		catch (Exception)
+		{
+		}
+		finally
+			done = true;
+	});
+	// Yield so the task runs and the handler blocks awaiting the roots/list reply.
+	yield();
+	// The handler must have sent the roots/list request as an SSE message event.
+	assert(frames.length == 2, "expected roots/list request on SSE stream");
+	assert(frames[1].canFind("roots/list"), "SSE frame must contain roots/list");
+
+	// Parse the server->client request id from the SSE frame so we can correlate
+	// the client's reply POST back to the blocked handler.
+	const reqFrame = frames[1]["event: message\ndata: ".length .. $ - 2]; // strip SSE wrapper
+	auto reqJson = parseJsonString(reqFrame);
+	const serverReqId = reqJson["id"];
+
+	// Client POSTs back a roots/list response; handleLegacyPostBody routes it to
+	// the coordinator, waking the blocked handler.
+	Json resp = Json.emptyObject;
+	resp["jsonrpc"] = "2.0";
+	resp["id"] = serverReqId;
+	resp["result"] = Json(["roots": Json.emptyArray]);
+	cast(void) handleLegacyPostBody(server, ch, sid, resp.toString());
+
+	// Drain until the handler task completes and delivers the tool result.
+	foreach (_; 0 .. 4096)
+	{
+		if (done)
+			break;
+		yield();
+	}
+	assert(done, "handler task must complete after receiving the roots/list reply");
+	// The tool-call response must now appear on the SSE stream.
+	assert(frames.length == 3, "expected tool-call response on SSE stream");
+	assert(frames[2].canFind("\"id\":10"), "tool response must echo the original request id");
 }
 
 unittest  // legacy channel: a response routes only to the originating stream, not all clients
