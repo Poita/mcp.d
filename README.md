@@ -266,7 +266,7 @@ The Streamable HTTP transport derives session minting purely from
 
 ## Examples
 
-The repository ships twelve runnable, self-verifying server/client pairs in
+The repository ships thirteen runnable, self-verifying server/client pairs in
 [`examples/`](examples/). Each `client.d` is an end-to-end test that asserts the
 matching server's behaviour, and CI runs every pair over **both** stdio and
 Streamable HTTP.
@@ -280,6 +280,7 @@ Streamable HTTP.
 | Stateless draft | the stateless draft protocol (`server/discover`, per-request `_meta`) | [server](examples/stateless-draft/server.d) | [client](examples/stateless-draft/client.d) |
 | Streaming | progress notifications from a long-running tool | [server](examples/streaming/server.d) | [client](examples/streaming/client.d) |
 | MRTR | multi-round-trip tool input (carried in the result) | [server](examples/mrtr/server.d) | [client](examples/mrtr/client.d) |
+| Tasks | async `@task` tools (progress, cancellation, mid-task input) | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
 | Sampling | server-initiated LLM sampling (`ctx.sample`) | [server](examples/sampling/server.d) | [client](examples/sampling/client.d) |
 | Elicitation | server-initiated, typed user input (`ctx.elicit!T`) | [server](examples/elicitation/server.d) | [client](examples/elicitation/client.d) |
 | Sticky notes | stateful tools + a resource per note + elicitation-confirmed clear | [server](examples/stickynotes/server.d) | [client](examples/stickynotes/client.d) |
@@ -332,25 +333,56 @@ The [MCP Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overv
 lets a server answer a long-running `tools/call` with a durable task handle
 instead of blocking; the client polls `tasks/get` to completion, supplies
 mid-flight input via `tasks/update`, and may `tasks/cancel`. `enableTasks` turns
-it on (draft protocol only) and returns a `TaskRuntime`:
+it on (draft protocol only); the ergonomic way to expose a long-running tool is
+the `@task` UDA — a `@task` method becomes a tool whose `tools/call` returns a
+task handle immediately and whose body runs asynchronously, its typed return
+value becoming the task's final result:
 
 ```d
-auto server = new McpServer("ci", "1.0.0");
-auto tasks = server.enableTasks();      // advertise io.modelcontextprotocol/tasks
+import core.time : seconds, minutes;
 
-// In a long-running tool: create a task, return its CreateTaskResult, and
-// resolve it as the work progresses (complete / fail / requireInput / cancel).
-auto t = tasks.create();
-// ... drive the work, then: tasks.complete(t.taskId, callToolResultJson);
-return makeCreateTaskResult(t);
+auto server = new McpServer("ci", "1.0.0");
+server.enableTasks();                   // advertise io.modelcontextprotocol/tasks
+
+struct BuildResult { bool passed; string log; }
+
+final class Ci
+{
+    // tools/call returns a task handle at once; this body runs on the task
+    // dispatcher and its return value becomes the task result. The injected
+    // TaskContext reports progress and observes cooperative cancellation; it is
+    // omitted from the tool's input schema (the typed params derive the schema).
+    @task("build", "Run a CI build (asynchronous).")
+    @taskTtl(10.minutes) @taskPollInterval(2.seconds)
+    BuildResult build(string gitRef, TaskContext tc) @safe
+    {
+        tc.progress("cloning " ~ gitRef);
+        // ... long-running work; `if (tc.cancelRequested) return ...;` to stop early
+        return BuildResult(true, "ok");
+    }
+}
+
+registerHandlers(server, new Ci);       // wires the @task tool — no manual plumbing
 ```
 
+For human-in-the-loop, return `tc.requireInput([InputRequest.elicitation!T(...)])`
+to suspend the task into `input_required`; the client answers via `tasks/update`,
+the executor re-runs, and the answer is visible through `tc.hasInput` /
+`tc.inputAs`. Because the typed params are reconstituted from the task's durable
+input on every dispatch, the same handler is correct whether it runs in-process
+or is re-dispatched on another node. See [`examples/tasks`](examples/tasks/) for
+all three shapes (plain async, cancellable, and mid-task elicitation).
+
 The server serves `tasks/get`, `tasks/update`, and `tasks/cancel` against the
-task store (in-memory by default; pass your own `TaskStore` for durability).
+task store (in-memory by default; pass your own `TaskStore` for durability and a
+`TaskDispatcher` for horizontal scale — the `@task` handlers do not change).
 Supply a custom `TaskIdGenerator` via `TaskOptions` to correlate task IDs with an
 external job system; the runtime keeps them unique. Status changes are pushed as
 `notifications/tasks` for clients that opt into a listen stream, but polling
-remains the contract.
+remains the contract. For dynamic (non-UDA) tools, `enableTasks` returns a
+`TaskRuntime` and `server.registerTaskTool(descriptor, executor)` registers a
+task tool by hand; `ToolResponse.task(...)` is the underlying result a handler
+returns to answer a call with a task handle.
 
 > **Not supported: the experimental 2025-11-25 tasks.** The `tasks` feature that
 > shipped in the 2025-11-25 core specification (a top-level `tasks` capability,
