@@ -305,13 +305,19 @@ private const(ubyte)[] rawEcdsaToDer(const(ubyte)[] raw) @trusted
 		return null;
 	}
 
-	ubyte* der;
-	const len = i2d_ECDSA_SIG(sig, &der);
+	// i2d_ECDSA_SIG with a null output pointer returns the required buffer length
+	// without allocating. We then allocate a D-GC buffer and pass it to the
+	// encoding call, avoiding an OpenSSL-owned allocation and CRYPTO_free entirely.
+	// This also sidesteps a --combined build conflict: deimos/openssl/bio.di publicly
+	// imports deimos/openssl/crypto.di, which declares CRYPTO_free with the old
+	// single-argument signature, conflicting with any 3-arg re-declaration.
+	const len = i2d_ECDSA_SIG(sig, null);
 	if (len <= 0)
 		return null;
-	scope (exit)
-		CRYPTO_free(der, __FILE__.ptr, __LINE__);
-	return der[0 .. len].dup;
+	auto buf = new ubyte[len];
+	ubyte* der = buf.ptr;
+	i2d_ECDSA_SIG(sig, &der);
+	return buf;
 }
 
 /// Parse a PEM SubjectPublicKeyInfo (`-----BEGIN PUBLIC KEY-----`) into an
@@ -325,12 +331,6 @@ private EVP_PKEY* parsePublicKeyPem(string pem) @trusted
 		BIO_free(bio);
 	return PEM_read_bio_PUBKEY(bio, null, null, null);
 }
-
-// OpenSSL 1.1.0+ CRYPTO_free takes three arguments: the pointer, the source file
-// name, and the line number. OpenSSL uses these for debug memory accounting when
-// a custom allocator (set via CRYPTO_set_mem_functions) tracks allocation sites.
-// The 1.0.x single-argument form is wrong on all supported OpenSSL versions.
-private extern (C) void CRYPTO_free(void* ptr, const(char)* file, int line) @nogc nothrow;
 
 // ===========================================================================
 // JWKS handling
@@ -1296,29 +1296,16 @@ unittest  // rawEcdsaToDer frees r and s BIGNUMs on ECDSA_SIG_set0 failure (no l
 	assert(der.length > 0 && der[0] == 0x30);
 }
 
-unittest  // CRYPTO_free is declared with the 3-argument OpenSSL 1.1.0+ signature (file/line)
+unittest  // rawEcdsaToDer round-trips via pre-allocated buffer (no OpenSSL allocation)
 {
-	// Verify that the CRYPTO_free binding accepts the correct 3-argument call
-	// (ptr, file, line) as required by OpenSSL 1.1.0+ and 3.x. Calling with only
-	// 1 argument is UB on these versions: the callee reads garbage from the
-	// file/line registers. This test exercises the call path in rawEcdsaToDer that
-	// calls CRYPTO_free via the scope(exit), confirming it compiles and links with
-	// the correct 3-argument extern(C) binding.
 	import mcp.auth.jwt : signEs256;
 
 	const rawSig = signEs256(testEcPrivPem, cast(const(ubyte)[]) "test.payload");
 	assert(rawSig.length == 64);
-	// rawEcdsaToDer calls CRYPTO_free(der, __FILE__.ptr, __LINE__) internally;
-	// this call would be a compile error if the binding still has only 1 argument.
+	// rawEcdsaToDer uses i2d_ECDSA_SIG with a D-GC buffer rather than an
+	// OpenSSL-allocated buffer, so no CRYPTO_free call is needed.
 	auto der = () @trusted { return rawEcdsaToDer(rawSig); }();
 	assert(der.length > 0 && der[0] == 0x30);
-	// Also directly verify the 3-argument form compiles: allocate a small buffer
-	// via OpenSSL and free it with the correct 3-arg call.
-	import core.stdc.stdlib : malloc;
-
-	auto buf = () @trusted { return cast(void*) malloc(1); }();
-	// CRYPTO_free with 3 args: this line fails to compile with the old 1-arg declaration.
-	() @trusted { CRYPTO_free(buf, __FILE__.ptr, __LINE__); }();
 }
 
 unittest  // fetchJwks discards non-2xx bodies so a 503 does not mark the cache as fresh
