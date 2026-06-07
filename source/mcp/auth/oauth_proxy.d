@@ -101,6 +101,14 @@ struct OAuthProxyConfig
 	/// parameter so issued tokens are audience-bound to this server.
 	string resource;
 
+	/// Opt-in: advertise and accept OAuth Client ID Metadata Documents (SEP-991).
+	/// When set, the proxy publishes `client_id_metadata_document_supported: true`
+	/// in its AS metadata and accepts URL-formatted `client_id`s at `/authorize`,
+	/// fetching and validating the hosted document instead of requiring DCR. DCR
+	/// remains advertised as the deprecated fallback. CIMD is the spec-recommended
+	/// registration mechanism; DCR is deprecated.
+	bool clientIdMetadataDocumentSupported;
+
 	/// The proxy's fixed upstream redirect URI (`baseUrl` + `redirectPath`),
 	/// registered with the IdP.
 	string callbackUrl() const @safe
@@ -190,6 +198,7 @@ AuthorizationServerMetadata authorizationServerMetadata(const OAuthProxyConfig c
 	m.grantTypesSupported = ["authorization_code", "refresh_token"];
 	m.tokenEndpointAuthMethodsSupported = ["none"];
 	m.responseTypesSupported = ["code"];
+	m.clientIdMetadataDocumentSupported = cfg.clientIdMetadataDocumentSupported;
 	return m;
 }
 
@@ -224,6 +233,8 @@ Json authorizationServerMetadataJson(const OAuthProxyConfig cfg) @safe
 	j["token_endpoint_auth_methods_supported"] = strArray(m.tokenEndpointAuthMethodsSupported);
 	if (m.scopesSupported.length)
 		j["scopes_supported"] = strArray(m.scopesSupported);
+	if (m.clientIdMetadataDocumentSupported)
+		j["client_id_metadata_document_supported"] = true;
 	return j;
 }
 
@@ -891,6 +902,26 @@ version (unittest)
 		d.redirectUris = ["http://127.0.0.1:8765/callback"];
 		return d;
 	}
+}
+
+unittest  // CIMD ADVERTISE: AS metadata sets client_id_metadata_document_supported when enabled
+{
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto m = authorizationServerMetadata(cfg);
+	assert(m.clientIdMetadataDocumentSupported);
+	auto j = authorizationServerMetadataJson(cfg);
+	assert(j["client_id_metadata_document_supported"].get!bool == true);
+	// DCR stays advertised as the deprecated fallback (spec retains it).
+	assert(j["registration_endpoint"].get!string == "https://mcp.example.com/register");
+}
+
+unittest  // CIMD ADVERTISE: AS metadata omits client_id_metadata_document_supported by default
+{
+	auto cfg = sampleConfig();
+	assert(!cfg.clientIdMetadataDocumentSupported);
+	auto j = authorizationServerMetadataJson(cfg);
+	assert("client_id_metadata_document_supported" !in j);
 }
 
 unittest  // CIMD VALIDATE: a well-formed document whose client_id matches the URL and lists the redirect_uri passes
