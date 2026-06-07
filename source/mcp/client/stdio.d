@@ -38,7 +38,7 @@ import mcp.transport.duplex : DuplexChannel, defaultMaxLineBytes;
 /// async delegates.
 final class StdioClientTransport : ClientTransport
 {
-	import vibe.core.process : ProcessPipes;
+	version (Posix) import vibe.core.process : ProcessPipes;
 	import core.time : Duration, seconds, msecs;
 
 	private string delegate() @safe readLine;
@@ -53,7 +53,10 @@ final class StdioClientTransport : ClientTransport
 	private int closeProcessRuns_;
 	// When spawned via `McpClient.spawn`, the owned subprocess pipes so `close()`
 	// can run the MCP stdio shutdown sequence (close stdin -> SIGTERM -> SIGKILL).
-	private ProcessPipes* pipes;
+	// Windows has no eventcore pipe driver, so it owns a `WinChild` (std.process
+	// pid + a blocking-reader thread) and shuts down via close-stdin -> terminate.
+	version (Posix) private ProcessPipes* pipes;
+	else version (Windows) private WinChild* winChild;
 
 	/// Construct over a newline-delimited JSON-RPC channel. `readLine` returns the
 	/// next line from the server (without its terminator) or `null` at
@@ -187,10 +190,18 @@ final class StdioClientTransport : ClientTransport
 	}
 
 	/// Attach owned subprocess pipes so `close()` runs the stdio shutdown
-	/// sequence. Set by `McpClient.spawn`.
-	package void attachProcess(ProcessPipes* pipes) @safe
+	/// sequence. Set by `McpClient.spawn` (POSIX uses vibe's process pipes).
+	version (Posix) package void attachProcess(ProcessPipes* pipes) @safe
 	{
 		this.pipes = pipes;
+	}
+
+	/// Attach the owned Windows child (std.process pid + reader thread) so
+	/// `close()` runs the close-stdin -> terminate shutdown. Set by the Windows
+	/// `spawnStdioTransport`.
+	version (Windows) package void attachWinChild(WinChild* c) @safe
+	{
+		this.winChild = c;
 	}
 
 	/// Release transport resources. When this transport owns a spawned subprocess
@@ -205,8 +216,16 @@ final class StdioClientTransport : ClientTransport
 		closed_ = true;
 		if (channel !is null)
 			channel.close();
-		if (pipes !is null)
-			closeProcess(5.seconds, 5.seconds);
+		version (Posix)
+		{
+			if (pipes !is null)
+				closeProcess(5.seconds, 5.seconds);
+		}
+		else version (Windows)
+		{
+			if (winChild !is null)
+				closeWinChild(5.seconds);
+		}
 	}
 
 	/// How many times the child-shutdown sequence has run (for tests asserting
@@ -219,7 +238,7 @@ final class StdioClientTransport : ClientTransport
 	/// Shut the owned child down per the MCP stdio Shutdown sequence and return its
 	/// exit status (a process killed by signal reports a negative status:
 	/// `-SIGTERM` / `-SIGKILL`). Safe to call once.
-	package int closeProcess(Duration termGrace, Duration killGrace) @safe
+	version (Posix) package int closeProcess(Duration termGrace, Duration killGrace) @safe
 	{
 		import core.sys.posix.signal : SIGTERM, SIGKILL;
 
@@ -252,6 +271,34 @@ final class StdioClientTransport : ClientTransport
 			return () @trusted { return p.process.wait(); }();
 		}
 	}
+
+	/// Windows child shutdown. Windows has no SIGTERM/SIGKILL distinction, so the
+	/// sequence is: close the child's stdin (a well-behaved server sees EOF and
+	/// exits), poll for a clean exit within `grace` (yielding the fiber between
+	/// polls so the loop keeps running), then forcibly terminate and reap.
+	version (Windows) package int closeWinChild(Duration grace) @safe
+	{
+		import std.process : wait, tryWait, kill;
+		import core.time : msecs;
+		import vibe.core.core : sleep;
+
+		++closeProcessRuns_;
+		auto c = winChild;
+		() @trusted { c.closeStdin(); }();
+
+		Duration waited;
+		while (waited < grace)
+		{
+			auto t = () @trusted { return tryWait(c.pid); }();
+			if (t.terminated)
+				return t.status;
+			() @trusted { sleep(50.msecs); }();
+			waited += 50.msecs;
+		}
+
+		() @trusted { kill(c.pid); }();
+		return () @trusted { return wait(c.pid); }();
+	}
 }
 
 /// Launch an MCP server as a subprocess and wire a `StdioClientTransport` to its
@@ -262,7 +309,8 @@ final class StdioClientTransport : ClientTransport
 /// (cooperative on the vibe event loop) so the duplex read loop never blocks the
 /// loop. The returned transport owns the subprocess: its `close()` runs the stdio
 /// shutdown sequence. Used by `McpClient.spawn`. REQUIRES a running event loop.
-StdioClientTransport spawnStdioTransport(string[] args, size_t maxLineBytes = defaultMaxLineBytes) @safe
+version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
+		size_t maxLineBytes = defaultMaxLineBytes) @safe
 {
 	import vibe.core.process : pipeProcess, ProcessPipes, Redirect;
 	import eventcore.driver : IOMode;
@@ -310,6 +358,132 @@ StdioClientTransport spawnStdioTransport(string[] args, size_t maxLineBytes = de
 	auto transport = new StdioClientTransport(&readLine, &writeLine);
 	transport.attachProcess(pipes);
 	return transport;
+}
+
+version (Windows)
+{
+	import std.stdio : File;
+	import vibe.core.channel : Channel, createChannel;
+}
+
+/// Owned Windows child: the std.process pid plus the writable stdin handle.
+/// `close()` routes through `StdioClientTransport.closeWinChild`, which closes
+/// stdin (EOF) then terminates the process. The stdout reader runs on a daemon
+/// thread (see `pumpChildStdout`); it is not joined, mirroring the daemon stdin
+/// pump on the server side.
+version (Windows) private struct WinChild
+{
+	import std.process : Pid;
+
+	Pid pid;
+	File childStdin;
+	private bool stdinClosed_;
+
+	void closeStdin() @system
+	{
+		if (!stdinClosed_ && childStdin.isOpen)
+			childStdin.close();
+		stdinClosed_ = true;
+	}
+}
+
+/// Windows counterpart to the POSIX `spawnStdioTransport`. eventcore has no
+/// working pipe driver, so the child is launched with std.process and its stdout
+/// is read by a dedicated daemon thread that assembles newline-delimited lines and
+/// hands them to the cooperative read loop through a thread-safe vibe `Channel`
+/// (`readLine` drains it, yielding the fiber). Requests are written with a blocking
+/// `rawWrite` to the child's stdin.
+version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
+		size_t maxLineBytes = defaultMaxLineBytes) @safe
+{
+	import std.process : pipeProcess, Redirect;
+	import core.thread : Thread;
+
+	auto child = () @trusted { return new WinChild; }();
+	auto childStdout = () @trusted {
+		auto pp = pipeProcess(args, Redirect.stdin | Redirect.stdout);
+		child.pid = pp.pid;
+		child.childStdin = pp.stdin;
+		return pp.stdout;
+	}();
+
+	// Daemon reader: blocking reads on the child's stdout, lines pushed to `lines`.
+	auto lines = createChannel!string();
+	auto chan = lines;
+	() @trusted {
+		auto t = new Thread({ pumpChildStdout(childStdout, chan, maxLineBytes); });
+		t.isDaemon = true;
+		t.start();
+	}();
+
+	string readLine() @safe
+	{
+		string line;
+		const got = () @trusted { return lines.tryConsumeOne(line); }();
+		return got ? line : null; // channel closed (EOF / over-long) -> end the loop
+	}
+
+	void writeLine(string s) @safe
+	{
+		() @trusted {
+			child.childStdin.rawWrite(cast(const(ubyte)[])(s ~ "\n"));
+			child.childStdin.flush();
+		}();
+	}
+
+	auto transport = new StdioClientTransport(&readLine, &writeLine);
+	transport.attachWinChild(child);
+	return transport;
+}
+
+/// Reader-thread body (Windows client): blocking reads on the child's stdout,
+/// assembling newline-delimited lines with a trailing '\r' stripped. Each complete
+/// line is pushed to `chan`. An over-long newline-less run (> `maxLineBytes`) or
+/// EOF closes the channel, which surfaces to the duplex read loop as end-of-input;
+/// a partial fragment at EOF is dropped rather than forwarded as a malformed line.
+version (Windows) private void pumpChildStdout(File stdout, Channel!string chan, size_t maxLineBytes) @system
+{
+	ubyte[32 * 1024] buf;
+	ubyte[] acc;
+	for (;;)
+	{
+		auto got = stdout.rawRead(buf[]);
+		if (got.length == 0)
+			break; // EOF -> drop any partial fragment
+		size_t i;
+		while (i < got.length)
+		{
+			size_t nl = size_t.max;
+			foreach (j; i .. got.length)
+				if (got[j] == '\n')
+				{
+					nl = j;
+					break;
+				}
+			if (nl == size_t.max)
+			{
+				acc ~= got[i .. $];
+				if (acc.length > maxLineBytes)
+				{
+					chan.close(); // over-long, newline-less frame -> end the loop
+					return;
+				}
+				break; // need more data
+			}
+			acc ~= got[i .. nl];
+			i = nl + 1;
+			if (acc.length > maxLineBytes)
+			{
+				chan.close();
+				return;
+			}
+			if (acc.length && acc[$ - 1] == '\r')
+				acc = acc[0 .. $ - 1];
+			chan.put(cast(string) acc.idup);
+			acc = null;
+		}
+	}
+	chan.close();
 }
 
 version (unittest)
