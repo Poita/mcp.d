@@ -1178,18 +1178,24 @@ final class McpServer
 	/// Register a `@task` tool: a tool whose `tools/call` returns a task handle
 	/// immediately and runs `executor` asynchronously via the dispatcher. The
 	/// executor is stored by `descriptor.name` so the dispatcher can re-invoke it
-	/// on each `tasks/update`. Requires `enableTasks` to have been called first.
-	/// Used by the UDA reflection layer; callable directly for dynamic task tools.
-	void registerTaskTool(Tool descriptor, TaskExecutor executor) @safe
+	/// on each `tasks/update`. `ttlMs` / `pollIntervalMs` seed the task's TTL and
+	/// suggested poll cadence (null inherits the runtime's defaults). Requires
+	/// `enableTasks` to have been called first. Used by the UDA reflection layer;
+	/// callable directly for dynamic task tools.
+	void registerTaskTool(Tool descriptor, TaskExecutor executor,
+			Nullable!Duration ttl = Nullable!Duration.init,
+			Nullable!Duration pollInterval = Nullable!Duration.init) @safe
 	{
 		if (taskRuntime_ is null)
 			throw internalError("registerTaskTool requires enableTasks() first");
 		taskExecutors_[descriptor.name] = executor;
 		const toolName = descriptor.name;
+		const ttlDur = ttl;
+		const pollDur = pollInterval;
 		registerDynamicTool(descriptor, (Json args, RequestContext) @safe {
 			import mcp.protocol.tasks : makeCreateTaskResult;
 
-			auto seed = taskRuntime_.createFor(toolName, args);
+			auto seed = taskRuntime_.createFor(toolName, args, ttlDur, pollDur);
 			taskDispatcher_.dispatch(seed.taskId, &runTaskExecutorById);
 			return ToolResponse.task(makeCreateTaskResult(seed));
 		});

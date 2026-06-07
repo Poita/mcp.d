@@ -1,6 +1,6 @@
 module mcp.server.task_runtime;
 
-import core.time : Duration, seconds;
+import core.time : Duration, seconds, msecs;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
@@ -12,15 +12,15 @@ import mcp.server.task_store : TaskStore, TaskRecord, InMemoryTaskStore,
 @safe:
 
 /// Tuning for the task runtime. `idGenerator` mints task IDs (default
-/// `defaultTaskIdGenerator`). `defaultTtlMs` / `defaultPollIntervalMs` seed a
-/// task's `ttlMs` / `pollIntervalMs` when a creator does not specify them.
+/// `defaultTaskIdGenerator`). `defaultTtl` / `defaultPollInterval` seed a task's
+/// TTL / suggested poll cadence when a creator does not specify them.
 /// `sweepInterval` is how often the (fiber-layer) TTL sweep runs. `nowIso` is an
 /// injectable clock returning an ISO-8601 timestamp; null uses the system clock.
 struct TaskOptions
 {
 	TaskIdGenerator idGenerator;
-	long defaultTtlMs = 60_000;
-	long defaultPollIntervalMs = 5_000;
+	Duration defaultTtl = 60.seconds;
+	Duration defaultPollInterval = 5.seconds;
 	Duration sweepInterval = 30.seconds;
 	string delegate() @safe nowIso;
 }
@@ -76,20 +76,23 @@ final class TaskRuntime
 	}
 
 	/// Create a fresh `working` task with no associated executor (the manual path,
-	/// where the caller drives the lifecycle itself). `ttlMs`/`pollIntervalMs`
-	/// default to the runtime options when null.
-	Task create(Nullable!long ttlMs = Nullable!long.init,
-			Nullable!long pollIntervalMs = Nullable!long.init) @safe
+	/// where the caller drives the lifecycle itself). `ttl`/`pollInterval` default
+	/// to the runtime options when null.
+	Task create(Nullable!Duration ttl = Nullable!Duration.init,
+			Nullable!Duration pollInterval = Nullable!Duration.init) @safe
 	{
-		return createFor("", Json.undefined, ttlMs, pollIntervalMs);
+		return createFor("", Json.undefined, ttl, pollInterval);
 	}
 
 	/// Create a fresh `working` task bound to a registered executor (`toolName`),
 	/// persisting `executorInput` as the durable input the executor reconstitutes
 	/// on each dispatch. The returned `Task` seeds a `CreateTaskResult`. The
-	/// generated ID is guaranteed unique against the store.
-	Task createFor(string toolName, Json executorInput, Nullable!long ttlMs = Nullable!long.init,
-			Nullable!long pollIntervalMs = Nullable!long.init) @safe
+	/// generated ID is guaranteed unique against the store. `ttl`/`pollInterval`
+	/// default to the runtime options when null; both are serialized to integer
+	/// milliseconds on the wire `Task`.
+	Task createFor(string toolName, Json executorInput,
+			Nullable!Duration ttl = Nullable!Duration.init,
+			Nullable!Duration pollInterval = Nullable!Duration.init) @safe
 	{
 		string id;
 		// Defend against a misbehaving custom generator returning a duplicate.
@@ -104,15 +107,17 @@ final class TaskRuntime
 			throw new McpException(ErrorCode.internalError,
 					"task id generator failed to produce a unique id");
 
+		const ttlDur = ttl.isNull ? opts_.defaultTtl : ttl.get;
+		const pollDur = pollInterval.isNull ? opts_.defaultPollInterval : pollInterval.get;
+
 		TaskRecord r;
 		r.meta.taskId = id;
 		r.meta.status = TaskStatus.working;
 		const now = opts_.nowIso();
 		r.meta.createdAt = now;
 		r.meta.lastUpdatedAt = now;
-		r.meta.ttlMs = ttlMs.isNull ? nullable(opts_.defaultTtlMs) : ttlMs;
-		r.meta.pollIntervalMs = pollIntervalMs.isNull
-			? nullable(opts_.defaultPollIntervalMs) : pollIntervalMs;
+		r.meta.ttlMs = nullable(ttlDur.total!"msecs");
+		r.meta.pollIntervalMs = nullable(pollDur.total!"msecs");
 		r.toolName = toolName;
 		r.executorInput = executorInput;
 		store_.put(r);
@@ -335,7 +340,7 @@ unittest  // create yields a working task with seeded ttl/poll and timestamps
 unittest  // create honors explicit ttl/poll overrides
 {
 	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
-	auto t = rt.create(nullable(1_000L), nullable(250L));
+	auto t = rt.create(nullable(1_000.msecs), nullable(250.msecs));
 	assert(t.ttlMs.get == 1_000 && t.pollIntervalMs.get == 250);
 }
 

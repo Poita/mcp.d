@@ -54,6 +54,43 @@ struct task
 	string title; /// optional human-readable display name (empty = unset)
 }
 
+/// Per-task time-to-live UDA, attached alongside `@task`: how long the task lives
+/// from creation. Intrinsic to the work the task does (a long-running job vs a
+/// quick computation), so it belongs on the task, not the server. Omit it to
+/// inherit `TaskOptions.defaultTtl`.
+///
+/// Example:
+/// ---
+/// import core.time : hours;
+/// @task("build", "Run the build")
+/// @taskTtl(1.hours)
+/// BuildResult build(string target, TaskContext tc) @safe { ... }
+/// ---
+struct taskTtl
+{
+	import core.time : Duration;
+
+	Duration value; /// task TTL (serialized to integer ms on the wire)
+}
+
+/// Per-task poll-cadence UDA, attached alongside `@task`: the interval the client
+/// SHOULD wait between `tasks/get` polls. Like `@taskTtl`, it is intrinsic to the
+/// task. Omit it to inherit `TaskOptions.defaultPollInterval`.
+///
+/// Example:
+/// ---
+/// import core.time : seconds;
+/// @task("build", "Run the build")
+/// @taskTtl(1.hours) @taskPollInterval(5.seconds)
+/// BuildResult build(string target, TaskContext tc) @safe { ... }
+/// ---
+struct taskPollInterval
+{
+	import core.time : Duration;
+
+	Duration value; /// suggested poll cadence (serialized to integer ms on the wire)
+}
+
 /// Marker UDA declaring the `readOnlyHint` behavioral hint (the MCP spec's
 /// `ToolAnnotations.readOnlyHint`). Attach alongside `@tool`; presence sets the
 /// hint to `true`, absence leaves it unset (omitted from the wire form).

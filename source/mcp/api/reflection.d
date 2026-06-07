@@ -682,6 +682,20 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 		descriptor.annotations = anns.toJson();
 	applyIconsAndMeta!overload(descriptor);
 
+	// Per-task timing from @taskTtl / @taskPollInterval; an absent UDA inherits the
+	// corresponding server default.
+	import core.time : Duration;
+
+	Nullable!Duration ttl;
+	Nullable!Duration pollInterval;
+	static foreach (a; __traits(getAttributes, overload))
+	{
+		static if (is(typeof(a) == taskTtl))
+			ttl = a.value;
+		else static if (is(typeof(a) == taskPollInterval))
+			pollInterval = a.value;
+	}
+
 	// The executor runs on each dispatch: it reconstitutes the typed arguments
 	// from the task's durable input, injects the TaskContext, invokes the method,
 	// and wraps the return value into a CallToolResult-shaped result JSON. A
@@ -709,7 +723,7 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 		}
 		else
 			return toToolResult(__traits(getMember, parent, memberName)(argv.expand)).toJson();
-	});
+	}, ttl, pollInterval);
 }
 
 /// Wrap a prompt method's return value into a `GetPromptResult`.
@@ -2398,6 +2412,7 @@ version (unittest) private final class TaskUdaApi
 {
 	import mcp.server.task_context : TaskContext;
 	import mcp.protocol.modern : InputRequest;
+	import core.time : msecs;
 
 	struct Doubled
 	{
@@ -2410,8 +2425,10 @@ version (unittest) private final class TaskUdaApi
 		bool approved;
 	}
 
-	/// A plain async task: returns a typed result the framework wraps.
+	/// A plain async task: returns a typed result the framework wraps. The
+	/// @taskTtl / @taskPollInterval set this task's TTL and poll cadence.
 	@task("async_double", "Double a number asynchronously")
+	@taskTtl(12_345.msecs) @taskPollInterval(250.msecs)
 	@readOnly Doubled asyncDouble(int n, TaskContext tc) @safe
 	{
 		tc.progress("doubling");
@@ -2478,12 +2495,16 @@ unittest  // @task UDA: tools/call returns a task the executor completes
 	auto call = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
 	assert(call["result"]["resultType"].get!string == "task");
 	const id = call["result"]["taskId"].get!string;
+	// @taskTtl(12_345.msecs) / @taskPollInterval(250.msecs) seed the task timing.
+	assert(call["result"]["ttlMs"].get!long == 12_345);
+	assert(call["result"]["pollIntervalMs"].get!long == 250);
 
 	Json gp = Json(["taskId": Json(id)]);
 	gp["_meta"] = draftMeta();
 	auto got = s.handle(Message(makeRequest(Json(3), "tasks/get", gp))).get;
 	assert(got["result"]["status"].get!string == "completed");
 	assert(got["result"]["result"]["structuredContent"]["value"].get!int == 42);
+	assert(got["result"]["pollIntervalMs"].get!long == 250);
 }
 
 unittest  // @task UDA: a mid-task elicitation suspends and resumes via tasks/update
