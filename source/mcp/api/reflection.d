@@ -491,11 +491,10 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 
 	// Fold every method UDA in a single pass: the marker hint UDAs (@readOnly /
 	// @destructive / @idempotent / @openWorld) and the @hintTitle value UDA into
-	// typed ToolAnnotations, and @toolExecution into the descriptor's `execution`
-	// field (2025-11-25 per-tool task-augmented execution negotiation). A single
-	// loop keeps every UDA handled in one place so a new UDA cannot land in only
-	// one pass. A marker's presence sets the corresponding hint to true; absence
-	// leaves it unset (omitted from the wire form).
+	// typed ToolAnnotations. A single loop keeps every UDA handled in one place so
+	// a new UDA cannot land in only one pass. A marker's presence sets the
+	// corresponding hint to true; absence leaves it unset (omitted from the wire
+	// form).
 	ToolAnnotations anns;
 	static foreach (a; __traits(getAttributes, overload))
 	{
@@ -511,15 +510,6 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		{
 			if (a.value.length)
 				anns.title = a.value;
-		}
-		else static if (is(typeof(a) == toolExecution))
-		{
-			static assert(a.taskSupport == "forbidden"
-					|| a.taskSupport == "optional" || a.taskSupport == "required",
-					"@toolExecution requires one of forbidden/optional/required, got \""
-					~ a.taskSupport ~ "\"");
-			if (a.taskSupport.length && a.taskSupport != "forbidden")
-				descriptor.execution = ToolExecution(nullable(a.taskSupport));
 		}
 	}
 	if (!anns.empty)
@@ -838,12 +828,6 @@ version (unittest)
 			return "erased " ~ id;
 		}
 
-		@tool("render", "Render a long report")
-		@toolExecution("optional") string render(string spec) @safe
-		{
-			return "rendered " ~ spec;
-		}
-
 		@resource("test://doc", "Doc", "text/plain")
 		string doc() @safe
 		{
@@ -956,7 +940,7 @@ unittest  // @tool reflection: schema derivation + typed dispatch
 
 	Json lp = Json.emptyObject;
 	auto list = s.handle(Message(makeRequest(Json(1), "tools/list", lp))).get;
-	assert(list["result"]["tools"].length == 8);
+	assert(list["result"]["tools"].length == 7);
 
 	// add -> scalar return wrapped under `result`, with an inferred outputSchema.
 	Json p = Json.emptyObject;
@@ -1351,81 +1335,6 @@ unittest  // marker-UDA hints: @readOnly + @hintTitle produce the wire shape
 	assert("destructiveHint" !in anns);
 	assert("idempotentHint" !in anns);
 	assert("openWorldHint" !in anns);
-}
-
-unittest  // @toolExecution reflection: execution.taskSupport appears in tools/list
-{
-	import mcp.protocol.jsonrpc : Message, makeRequest;
-
-	auto s = new McpServer("t", "1");
-	registerHandlers(s, new DemoApi);
-	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
-			Json.emptyObject))).get["result"]["tools"];
-
-	Json renderTool, addTool;
-	foreach (i; 0 .. tools.length)
-	{
-		const name = tools[i]["name"].get!string;
-		if (name == "render")
-			renderTool = tools[i];
-		else if (name == "add")
-			addTool = tools[i];
-	}
-
-	assert(renderTool.type == Json.Type.object);
-	assert(renderTool["execution"]["taskSupport"].get!string == "optional");
-	// A tool without @toolExecution carries no execution object.
-	assert("execution" !in addTool);
-}
-
-version (unittest) private class ForbiddenExecutionApi
-{
-	@tool("noop", "No-op tool")
-	@toolExecution("forbidden")
-	string noop() @safe
-	{
-		return "noop";
-	}
-}
-
-unittest  // @toolExecution("forbidden") is wire-equivalent to absent UDA: no execution field emitted
-{
-	import mcp.protocol.jsonrpc : Message, makeRequest;
-
-	auto s = new McpServer("t", "1");
-	registerHandlers(s, new ForbiddenExecutionApi);
-	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
-			Json.emptyObject))).get["result"]["tools"];
-	assert(tools.length == 1);
-	// @toolExecution("forbidden") must not emit an execution field — it is wire-equivalent to absent.
-	assert("execution" !in tools[0]);
-}
-
-version (unittest) private class ValidExecutionApi
-{
-	@tool("render", "Render")
-	@toolExecution("required")
-	string render(string spec) @safe
-	{
-		return spec;
-	}
-}
-
-version (unittest) private class InvalidExecutionApi
-{
-	@tool("render", "Render")
-	@toolExecution("optionl")
-	string render(string spec) @safe
-	{
-		return spec;
-	}
-}
-
-unittest  // @toolExecution: a valid taskSupport value reflects, an invalid one fails to compile
-{
-	auto s = new McpServer("t", "1");
-	assert(__traits(compiles, registerHandlers(s, new ValidExecutionApi)));
-	assert(!__traits(compiles, registerHandlers(s, new InvalidExecutionApi)));
 }
 
 version (unittest) private struct HeaderPayload

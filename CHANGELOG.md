@@ -7,8 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **The experimental 2025-11-25 tasks feature is not supported.** The stopgap
+  `tasks` surface from the 2025-11-25 core spec (top-level `tasks` capability,
+  `tasks/list`, `tasks/result`, per-tool `execution.taskSupport` / the
+  `@toolExecution` UDA, and the per-request `task` parameter) was removed; the
+  spec replaced it with the SEP-2663 extension below. Those methods now answer
+  `-32601`.
+
 ### Added
 
+- **MCP Tasks extension** (`io.modelcontextprotocol/tasks`, SEP-2663) for
+  asynchronous `tools/call` execution, draft protocol only: `enableTasks`
+  advertises the extension and serves `tasks/get` / `tasks/update` /
+  `tasks/cancel` against a pluggable `TaskStore` (in-memory default). A
+  `TaskRuntime` drives the task lifecycle (create / progress / complete / fail /
+  input-required / cancel), a pluggable `TaskIdGenerator` mints unguessable IDs,
+  and status changes are pushed as `notifications/tasks`.
 - Full MCP protocol-version support across every revision with negotiation:
   `2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`, and `draft`
   (`2026-07-28`). Mutual-version selection picks the newest version both peers

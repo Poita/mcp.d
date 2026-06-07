@@ -895,41 +895,6 @@ struct ToolAnnotations
 	}
 }
 
-/// Per-tool task-augmented execution descriptor (`Tool.execution`), introduced
-/// in MCP 2025-11-25. Lets a tool declare whether it supports the `tasks`
-/// augmentation when invoked via `tools/call`.
-///
-/// `taskSupport` is one of `"forbidden"` (default when absent — the tool does
-/// not support task-augmented execution), `"optional"` (the client may request
-/// it), or `"required"` (the tool must be invoked as a task). The field is
-/// omitted from the serialized form when unset, which the spec treats as
-/// `"forbidden"`.
-struct ToolExecution
-{
-	Nullable!string taskSupport; /// "forbidden" (default) | "optional" | "required"
-
-	Json toJson() const @safe
-	{
-		Json j = Json.emptyObject;
-		if (!taskSupport.isNull)
-			j["taskSupport"] = taskSupport.get;
-		return j;
-	}
-
-	static ToolExecution fromJson(Json j) @safe
-	{
-		ToolExecution e;
-		tryGet(j, "taskSupport", e.taskSupport);
-		return e;
-	}
-
-	/// True when no field is set (serializes to an empty object).
-	bool empty() const @safe
-	{
-		return taskSupport.isNull;
-	}
-}
-
 /// A tool the server exposes for the model to call.
 struct Tool
 {
@@ -938,7 +903,6 @@ struct Tool
 	Nullable!string description;
 	Json inputSchema = Json.undefined; /// JSON Schema (object); defaults to empty object schema
 	Json outputSchema = Json.undefined; /// optional JSON Schema for structured results
-	Nullable!ToolExecution execution; /// optional per-tool task-augmented execution descriptor (2025-11-25)
 	Json annotations = Json.undefined; /// optional ToolAnnotations
 	Icon[] icons; /// optional icons for display in user interfaces
 	mixin MetaField;
@@ -954,8 +918,6 @@ struct Tool
 		j["inputSchema"] = (inputSchema.type == Json.Type.object) ? inputSchema : emptyObjectSchema();
 		if (outputSchema.type == Json.Type.object)
 			j["outputSchema"] = outputSchema;
-		if (!execution.isNull && !execution.get.empty)
-			j["execution"] = execution.get.toJson();
 		if (annotations.type == Json.Type.object)
 			j["annotations"] = annotations;
 		if (icons.length)
@@ -979,8 +941,6 @@ struct Tool
 			t.inputSchema = j["inputSchema"];
 		if ("outputSchema" in j)
 			t.outputSchema = j["outputSchema"];
-		if ("execution" in j && j["execution"].type == Json.Type.object)
-			t.execution = ToolExecution.fromJson(j["execution"]);
 		if ("annotations" in j)
 			t.annotations = j["annotations"];
 		if ("icons" in j && j["icons"].type == Json.Type.array)
@@ -992,12 +952,7 @@ struct Tool
 
 	/// Return a copy of this `Tool` with any fields newer than (or absent from)
 	/// the negotiated protocol version stripped, so the wire output stays valid
-	/// for the peer's version. `Tool.execution` (`ToolExecution.taskSupport`)
-	/// exists ONLY in the 2025-11-25 schema: it was never present before
-	/// 2025-11-25 and was dropped again in the draft schema. It is therefore
-	/// emitted only when the negotiated version is exactly 2025-11-25, and
-	/// omitted for every other version (including `draft`). Mirrors
-	/// `Implementation.forVersion`.
+	/// for the peer's version. Mirrors `Implementation.forVersion`.
 	Tool forVersion(ProtocolVersion v) const @safe
 	{
 		Tool projected;
@@ -1026,11 +981,6 @@ struct Tool
 			foreach (icon; icons)
 				projected.icons ~= icon.dup();
 		}
-		// `Tool.execution` is a 2025-11-25-only field: emit it solely when the
-		// negotiated version is exactly 2025-11-25 (absent pre-2025-11-25,
-		// dropped from draft).
-		if (v == ProtocolVersion.v2025_11_25)
-			projected.execution = execution;
 		return projected;
 	}
 
@@ -1988,22 +1938,6 @@ unittest  // Tool icons round-trip through fromJson, including optional fields
 	assert(back.icons[1].sizes == ["16x16", "32x32"]);
 }
 
-unittest  // Tool emits execution.taskSupport when set (2025-11-25 ToolExecution)
-{
-	Tool t = {name: "longjob"};
-	t.execution = ToolExecution(nullable("optional"));
-	auto j = t.toJson();
-	assert(j["execution"].type == Json.Type.object);
-	assert(j["execution"]["taskSupport"].get!string == "optional");
-}
-
-unittest  // Tool omits execution when taskSupport unset (forbidden default)
-{
-	Tool t = {name: "plain"};
-	auto j = t.toJson();
-	assert("execution" !in j);
-}
-
 unittest  // Tool.toolAnnotations parses the raw annotations Json into a typed struct
 {
 	ToolAnnotations a;
@@ -2048,80 +1982,12 @@ unittest  // Tool.withToolAnnotations with an empty struct clears the field (omi
 	assert("annotations" !in t.toJson());
 }
 
-unittest  // Tool execution round-trips taskSupport through fromJson
-{
-	Tool t = {name: "task", execution: ToolExecution(nullable("required"))};
-	auto back = Tool.fromJson(t.toJson());
-	assert(!back.execution.isNull);
-	assert(back.execution.get.taskSupport.get == "required");
-}
-
-unittest  // Tool.fromJson leaves execution null when absent
-{
-	Json j = Json.emptyObject;
-	j["name"] = "noexec";
-	auto t = Tool.fromJson(j);
-	assert(t.execution.isNull);
-}
-
-unittest  // ToolExecution serializes only when taskSupport present
-{
-	ToolExecution e;
-	assert("taskSupport" !in e.toJson());
-	e.taskSupport = "forbidden";
-	assert(e.toJson()["taskSupport"].get!string == "forbidden");
-}
-
-unittest  // Tool.forVersion keeps execution on 2025-11-25 (the only version with it)
-{
-	Tool t = {name: "longjob"};
-	t.execution = ToolExecution(nullable("optional"));
-	auto j = t.forVersion(ProtocolVersion.v2025_11_25).toJson();
-	assert("execution" in j);
-	assert(j["execution"]["taskSupport"].get!string == "optional");
-}
-
-unittest  // Tool.forVersion strips execution on draft (field was dropped from draft schema)
-{
-	Tool t = {name: "longjob"};
-	t.execution = ToolExecution(nullable("optional"));
-	auto j = t.forVersion(ProtocolVersion.modern).toJson();
-	assert("execution" !in j);
-}
-
-unittest  // Tool.forVersion strips execution on 2025-06-18 (field never existed pre-2025-11-25)
-{
-	Tool t = {name: "longjob"};
-	t.execution = ToolExecution(nullable("required"));
-	auto j = t.forVersion(ProtocolVersion.v2025_06_18).toJson();
-	assert("execution" !in j);
-}
-
-unittest  // Tool.forVersion strips execution on 2024-11-05
-{
-	Tool t = {name: "longjob"};
-	t.execution = ToolExecution(nullable("required"));
-	auto j = t.forVersion(ProtocolVersion.v2024_11_05).toJson();
-	assert("execution" !in j);
-}
-
-unittest  // Tool.forVersion leaves the original Tool unmodified (returns a projected copy)
-{
-	Tool t = {name: "longjob"};
-	t.execution = ToolExecution(nullable("optional"));
-	cast(void) t.forVersion(ProtocolVersion.modern);
-	assert(!t.execution.isNull);
-	assert(t.execution.get.taskSupport.get == "optional");
-}
-
 unittest  // Tool.forVersion preserves non-version-gated fields (name/description) intact
 {
 	Tool t = {name: "longjob", description: nullable("does a long job")};
-	t.execution = ToolExecution(nullable("optional"));
 	auto pj = t.forVersion(ProtocolVersion.v2025_06_18);
 	assert(pj.name == "longjob");
 	assert(pj.description.get == "does a long job");
-	assert(pj.execution.isNull);
 }
 
 unittest  // Tool.forVersion strips title for 2024-11-05 (BaseMetadata.title introduced 2025-06-18)
