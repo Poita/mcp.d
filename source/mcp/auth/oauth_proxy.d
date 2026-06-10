@@ -54,7 +54,13 @@ import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidato
 /// `IssuedToken` the proxy stores and hands the client. The returned token's
 /// `subject`/`scopes`/`audience`/`claims` become the client principal; the proxy
 /// stashes the upstream token alongside it so the server can call downstream
-/// APIs with it.
+/// APIs with it. Always set the returned `IssuedToken.expiresAt` — an unset, zero
+/// value is already expired.
+///
+/// The hook runs synchronously on the `/token` request fiber, so any work it does
+/// to derive the principal — e.g. an upstream userinfo/tokeninfo call to resolve
+/// the subject or email — happens inline there (wrap such a network call in
+/// `@trusted` as the call site requires). Keep it bounded; it blocks that fiber.
 alias IssueTokenHook = IssuedToken delegate(TokenSet upstream) @safe;
 
 /// Configuration for an `OAuthProxy`.

@@ -572,9 +572,10 @@ in (exchange !is null)
 		exchange(upstreamTokenEndpoint, upstreamBody, authHeader, responseBody, status);
 
 		// In broker mode, mint OUR token for the client from the upstream response
-		// and keep the upstream token server-side. The client never sees the
-		// upstream token. Refresh grants are relayed as-is (opaque tokens are not
-		// refreshable through the proxy), and a non-2xx upstream is surfaced verbatim.
+		// and keep the upstream token server-side — the client never sees the
+		// upstream token. (Broker-mode refresh grants are already refused above.)
+		// Otherwise — passthrough mode, or a non-2xx upstream — relay the upstream
+		// body to the client verbatim.
 		if (proxy.brokerEnabled() && !isRefresh && status >= 200 && status < 300)
 		{
 			const upstream = TokenSet.fromJson(parseJsonBody(responseBody));

@@ -20,7 +20,11 @@ struct IssuedToken
 	string[] scopes; /// the scopes the token grants
 	string[] audience; /// the resources the token was issued for (RFC 8707)
 	Json claims = Json.undefined; /// arbitrary claims surfaced to handlers
-	long expiresAt; /// absolute Unix-time expiry in seconds
+	/// Absolute Unix-time expiry in seconds. The zero-value default (0) is
+	/// already in the past, so an `IssueTokenHook` that leaves this unset mints
+	/// an instantly-dead token — always set it (use `long.max` for a
+	/// non-expiring token).
+	long expiresAt;
 }
 
 /// Mints opaque bearer tokens and resolves them back to the `IssuedToken` they
