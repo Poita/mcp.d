@@ -110,12 +110,36 @@ private long nowUnixSeconds() @safe
 {
 	import std.datetime.systime : Clock;
 
-	return Clock.currStdTime / 10_000_000L;
+	// Unix time (seconds since 1970), matching the documented unit of
+	// `IssuedToken.expiresAt`. `Clock.currStdTime` is hnsecs since 1 AD, so
+	// dividing it alone yields seconds since 1 AD — ~62 billion seconds too large,
+	// which would make every realistically-dated token read as already expired.
+	return Clock.currTime.toUnixTime;
 }
 
 // ===========================================================================
 // Tests
 // ===========================================================================
+
+@safe unittest
+{
+	// REGRESSION: IssuedToken.expiresAt is documented as absolute Unix time, so a
+	// token expiring an hour from now (real unix seconds) MUST validate. This fails
+	// when the validator's notion of "now" is not actually unix seconds (e.g.
+	// seconds since 1 AD), which makes every realistically-dated token read as
+	// already expired and rejects it.
+	import std.datetime.systime : Clock;
+
+	auto store = new ReferenceTokenStore();
+	IssuedToken t;
+	t.subject = "alice";
+	t.audience = ["https://api.example.com"];
+	t.expiresAt = Clock.currTime.toUnixTime + 3600;
+	const tok = store.issue(t);
+
+	auto validate = referenceTokenValidator(store, "https://api.example.com");
+	assert(validate(tok).valid);
+}
 
 unittest  // issue -> lookup round-trips the IssuedToken for a live token
 {
