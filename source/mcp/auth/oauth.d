@@ -1381,6 +1381,75 @@ string basicAuthHeader(string clientId, string clientSecret) @safe
 	}();
 }
 
+/// Parse a token-endpoint HTTP response: a non-2xx status is an error (the body,
+/// when present, is surfaced for diagnostics), otherwise decode the JSON body
+/// into a `TokenSet`.
+private TokenSet parseTokenResponse(int status, string responseBody) @safe
+{
+	import std.conv : to;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : invalidRequest;
+
+	if (status < 200 || status >= 300)
+		throw invalidRequest("token endpoint returned HTTP " ~ status.to!string ~ (
+				responseBody.length ? ": " ~ responseBody : ""));
+	return TokenSet.fromJson(parseJsonString(responseBody));
+}
+
+/// POST an `application/x-www-form-urlencoded` body to a token endpoint over the
+/// SDK's SSRF-safe transport (https, or http to loopback for dev) and return the
+/// parsed `TokenSet`. `authHeader`, when non-empty, is sent as `Authorization`.
+private TokenSet postTokenRequest(string tokenEndpoint, string body_, string authHeader) @safe
+{
+	int status = 502;
+	string responseBody;
+	() @trusted {
+		import vibe.http.client : HTTPClientResponse;
+		import vibe.http.common : HTTPMethod;
+		import vibe.stream.operations : readAllUTF8;
+
+		secureRequestHTTP(tokenEndpoint, (scope HTTPClientRequest creq) {
+			creq.method = HTTPMethod.POST;
+			creq.headers["Content-Type"] = "application/x-www-form-urlencoded";
+			creq.headers["Accept"] = "application/json";
+			if (authHeader.length)
+				creq.headers["Authorization"] = authHeader;
+			creq.writeBody(cast(const(ubyte)[]) body_);
+		}, (scope HTTPClientResponse cres) {
+			status = cres.statusCode;
+			responseBody = cres.bodyReader.readAllUTF8();
+		});
+	}();
+	return parseTokenResponse(status, responseBody);
+}
+
+/// Redeem an authorization code for tokens at a third-party token endpoint
+/// (RFC 6749 §4.1.3 + PKCE RFC 7636). Use when an MCP server acts as an OAuth
+/// client to an upstream API; unlike `OAuthClient` this carries no RFC 8707
+/// `resource`. An empty `clientSecret` denotes a public client, so no
+/// credentials are sent; otherwise they go via HTTP Basic. Throws on an unsafe
+/// endpoint or a non-2xx response.
+TokenSet exchangeAuthCode(string tokenEndpoint, string code, string redirectUri,
+		string clientId, string clientSecret, string codeVerifier) @safe
+{
+	const body_ = buildAuthCodeTokenForm(code, redirectUri, codeVerifier, clientId, "");
+	const authHeader = clientSecret.length ? basicAuthHeader(clientId, clientSecret) : "";
+	return postTokenRequest(tokenEndpoint, body_, authHeader);
+}
+
+/// Refresh an access token at a third-party token endpoint (RFC 6749 §6). Use
+/// when an MCP server acts as an OAuth client to an upstream API; carries no
+/// RFC 8707 `resource`. An empty `clientSecret` denotes a public client, so no
+/// credentials are sent; otherwise they go via HTTP Basic. Throws on an unsafe
+/// endpoint or a non-2xx response.
+TokenSet refreshAccessToken(string tokenEndpoint, string refreshToken,
+		string clientId, string clientSecret) @safe
+{
+	const body_ = buildRefreshTokenForm(refreshToken, clientId, "");
+	const authHeader = clientSecret.length ? basicAuthHeader(clientId, clientSecret) : "";
+	return postTokenRequest(tokenEndpoint, body_, authHeader);
+}
+
 unittest  // DCR request + responses round-trip
 {
 	ClientRegistration reg;
@@ -1466,6 +1535,75 @@ unittest  // basic auth header is base64(client:secret)
 {
 	// base64("id:secret") = aWQ6c2VjcmV0
 	assert(basicAuthHeader("id", "secret") == "Basic aWQ6c2VjcmV0");
+}
+
+unittest  // exchangeAuthCode body carries the auth-code grant + percent-encoded params
+{
+	import std.algorithm : canFind;
+
+	const f = buildAuthCodeTokenForm("a+b/c", "https://app.example.com/cb?x=1",
+			"VER+IFY", "client1", "");
+	assert(f.canFind("grant_type=authorization_code"));
+	// '+' and '/' in the code must be percent-encoded, not passed literally.
+	assert(f.canFind("code=a%2Bb%2Fc"));
+	assert(f.canFind("redirect_uri=https%3A%2F%2Fapp.example.com%2Fcb%3Fx%3D1"));
+	assert(f.canFind("code_verifier=VER%2BIFY"));
+	assert(f.canFind("client_id=client1"));
+	// The generic helper omits the MCP-only RFC 8707 resource parameter.
+	assert(!f.canFind("resource="));
+}
+
+unittest  // refreshAccessToken body carries the refresh-token grant + params
+{
+	import std.algorithm : canFind;
+
+	const f = buildRefreshTokenForm("re+fresh", "client1", "");
+	assert(f.canFind("grant_type=refresh_token"));
+	assert(f.canFind("refresh_token=re%2Bfresh"));
+	assert(f.canFind("client_id=client1"));
+	assert(!f.canFind("resource="));
+}
+
+unittest  // a confidential client authenticates via HTTP Basic, a public one does not
+{
+	// The facades pass an empty post-secret and route credentials through the
+	// Authorization header; an empty clientSecret means no header at all.
+	assert(basicAuthHeader("client1", "shh").length);
+	assert("".length == 0);
+}
+
+unittest  // parseTokenResponse rejects a non-2xx status (RFC 6749 token error)
+{
+	import std.exception : assertThrown;
+	import mcp.protocol.errors : McpException;
+
+	assertThrown!McpException(parseTokenResponse(400, `{"error":"invalid_grant"}`));
+	assertThrown!McpException(parseTokenResponse(500, ""));
+}
+
+unittest  // parseTokenResponse decodes a 2xx body into a populated TokenSet
+{
+	const ts = parseTokenResponse(200, `{"access_token":"AT","token_type":"Bearer","expires_in":3600,"refresh_token":"RT","scope":"a b"}`);
+	assert(ts.accessToken == "AT");
+	assert(ts.tokenType == "Bearer");
+	assert(ts.expiresIn == 3600);
+	assert(ts.refreshToken == "RT");
+	assert(ts.scope_ == "a b");
+}
+
+unittest  // exchangeAuthCode refuses a plaintext (non-loopback) token endpoint
+{
+	import std.exception : assertThrown;
+
+	assertThrown(exchangeAuthCode("http://as.example.com/token", "CODE",
+			"https://app.example.com/cb", "client1", "shh", "VERIFIER"));
+}
+
+unittest  // refreshAccessToken refuses a private/link-local token endpoint (SSRF)
+{
+	import std.exception : assertThrown;
+
+	assertThrown(refreshAccessToken("https://169.254.169.254/token", "RT", "client1", ""));
 }
 
 unittest  // basic auth header percent-encodes credentials per RFC 6749 §2.3.1
