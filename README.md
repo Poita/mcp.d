@@ -308,11 +308,34 @@ s.defaultCacheTtl = 30.seconds; // cache even responses the server left unhinted
 auto c = McpClient.http(url, s);
 ```
 
-A `CacheStore` is a small `get`/`put`/`invalidate`/`invalidateMethod`/`clear`
-interface; supply your own to pre-seed entries and skip round-trips, or share one
-across clients. The default `InMemoryCacheStore` is per-client and bounded by an
-LRU-style size cap. `client.setCache`, `setDefaultCacheTtl`, and `clearCache`
-adjust this at runtime; `cache()` exposes the live store for pre-seeding.
+A `CacheStore` is a small `get`/`put`/`invalidate`/`invalidateMethod`/
+`invalidatePartition`/`clear` interface; supply your own to pre-seed entries and
+skip round-trips, or share one across clients. The default `InMemoryCacheStore`
+is per-client and bounded by an LRU-style size cap. `client.setCache`,
+`setDefaultCacheTtl`, and `clearCache` adjust this at runtime; `cache()` exposes
+the live store for pre-seeding.
+
+**`public` vs `private` scope (shared caches).** The server's `cacheScope`
+controls *where* an entry is stored, which only matters when several clients
+share one backend. A `public` result lives under a shared key, so **every client
+hits the same entry** — the point of a shared cache. A `private` result is
+namespaced under the requesting client's `cachePartition` (a stable principal /
+tenant id you set in `ClientSettings`), so it is never served to another
+identity. The default per-client store leaves `cachePartition` empty and the
+distinction is moot.
+
+```d
+auto shared = new MyRedisStore;
+ClientSettings sa; sa.cache = shared; sa.cachePartition = "tenant-a";
+ClientSettings sb; sb.cache = shared; sb.cachePartition = "tenant-b";
+// a public listTools fetched by tenant-a is served to tenant-b with no round-trip;
+// a private readResource stays isolated to its tenant.
+```
+
+On `setBearerToken`, the client evicts only its **own** partition (the previous
+identity's `private` entries), sparing shared `public` entries and other
+principals' partitions; for the default per-client store that empty partition
+holds everything, so it behaves as a full clear.
 
 **Per-call modes** via `RequestOptions.cacheMode`:
 
@@ -333,8 +356,8 @@ entries so the next call lazily refetches: `notifications/tools/list_changed`,
 cache(s), and `resources/updated` drops just that URI's `readResource` entry. Each
 also fires a typed callback (`onToolsListChanged`, `onPromptsListChanged`,
 `onResourcesListChanged`, `onResourceUpdated(uri)`) in addition to the generic
-`onNotification`. `setBearerToken` clears the whole cache so a re-authenticated
-session never reads another principal's `private` results.
+`onNotification`. `setBearerToken` evicts the client's own partition so a
+re-authenticated session never reads the previous identity's `private` results.
 
 ## Examples
 

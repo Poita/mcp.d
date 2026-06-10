@@ -22,20 +22,28 @@ import mcp.protocol.modern : CacheScope;
 /// Identifies one cacheable response. `method` is the JSON-RPC method
 /// (`tools/list`, `resources/read`, `server/discover`, …); `key` is empty for
 /// the singleton endpoints (the four lists and `server/discover`, which take no
-/// distinguishing argument) and the resource URI for `resources/read`. The pair
-/// is used directly as an associative-array key.
+/// distinguishing argument) and the resource URI for `resources/read`.
+///
+/// `partition` namespaces the entry by cache scope so a *shared* store can hold
+/// both global and per-principal results without collision: a `public` result is
+/// stored under the empty partition (every client hits the same key — the point
+/// of a shared cache), while a `private` result is stored under the owning
+/// client's `cachePartition` (its principal id) so it is never served to another
+/// identity. A per-client store leaves `partition` empty and the distinction is
+/// moot. The whole struct is used directly as an associative-array key.
 struct CacheKey
 {
 	string method;
 	string key;
+	string partition;
 }
 
 /// A stored response plus the freshness metadata needed to decide a hit.
 /// `value` is the result's `toJson()` so any result type round-trips uniformly
 /// through its `fromJson`. `expiresAt` is absolute, computed by the client when
-/// it stores (now + the hint's ttl). `scope_` is advisory: the per-client
-/// default store ignores it, but a shared backend must not serve a `private_`
-/// entry to a different client identity.
+/// it stores (now + the hint's ttl). `scope_` records the server's
+/// `cacheScope`; isolation is enforced by `CacheKey.partition`, so this is
+/// informational (useful to a backend that wants to inspect or report it).
 struct CacheEntry
 {
 	Json value;
@@ -61,6 +69,12 @@ interface CacheStore
 	/// Drop every entry whose `CacheKey.method` equals `method` (e.g. all
 	/// `resources/read` URIs at once).
 	void invalidateMethod(string method) @safe;
+
+	/// Drop every entry whose `CacheKey.partition` equals `partition` — i.e. one
+	/// principal's slice of a shared cache, leaving the shared (`""`) public
+	/// entries and other principals' entries intact. The client uses this on
+	/// `setBearerToken` to evict just its own private results on an identity change.
+	void invalidatePartition(string partition) @safe;
 
 	/// Drop every entry.
 	void clear() @safe;
@@ -117,6 +131,13 @@ final class InMemoryCacheStore : CacheStore
 				entries_.remove(k);
 	}
 
+	override void invalidatePartition(string partition) @safe
+	{
+		foreach (k; entries_.keys)
+			if (k.partition == partition)
+				entries_.remove(k);
+	}
+
 	override void clear() @safe
 	{
 		entries_ = null;
@@ -162,6 +183,10 @@ final class NullCacheStore : CacheStore
 	}
 
 	override void invalidateMethod(string) @safe
+	{
+	}
+
+	override void invalidatePartition(string) @safe
 	{
 	}
 
@@ -259,6 +284,28 @@ CacheStore noCache() @safe nothrow
 			}()), CacheEntry(Json(i)));
 	assert(!s.get(CacheKey("resources/read", "0")).isNull, "nothing evicted when unbounded");
 	assert(!s.get(CacheKey("resources/read", "999")).isNull);
+}
+
+@safe unittest  // the partition field distinguishes otherwise-identical keys
+{
+	auto s = new InMemoryCacheStore();
+	s.put(CacheKey("tools/list", "", ""), CacheEntry(Json("shared")));
+	s.put(CacheKey("tools/list", "", "alice"), CacheEntry(Json("alice")));
+	assert(s.get(CacheKey("tools/list", "", "")).get.value == Json("shared"));
+	assert(s.get(CacheKey("tools/list", "", "alice")).get.value == Json("alice"));
+	assert(s.get(CacheKey("tools/list", "", "bob")).isNull);
+}
+
+@safe unittest  // invalidatePartition drops one principal's slice, sparing shared and others
+{
+	auto s = new InMemoryCacheStore();
+	s.put(CacheKey("tools/list", "", ""), CacheEntry(Json("shared")));
+	s.put(CacheKey("tools/list", "", "alice"), CacheEntry(Json("alice")));
+	s.put(CacheKey("tools/list", "", "bob"), CacheEntry(Json("bob")));
+	s.invalidatePartition("alice");
+	assert(s.get(CacheKey("tools/list", "", "alice")).isNull);
+	assert(!s.get(CacheKey("tools/list", "", "")).isNull, "shared public entry survives");
+	assert(!s.get(CacheKey("tools/list", "", "bob")).isNull, "other principal survives");
 }
 
 @safe unittest  // noCache stores nothing and returns the same singleton
