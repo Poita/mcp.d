@@ -559,7 +559,7 @@ class InvalidClientIdMetadataException : Exception
 /// authorization request, enforcing the SEP-991 AS-side MUSTs:
 ///   * `clientIdUrl` is https with a path component (`isValidClientIdMetadataUrl`);
 ///   * the document's `client_id` equals `clientIdUrl` exactly;
-///   * the document carries the required fields (`client_id`, `redirect_uris`);
+///   * the document carries the required fields (`client_id`, `client_name`, `redirect_uris`);
 ///   * `redirectUri` is an exact-string member of the document's `redirect_uris`;
 ///   * `redirectUri` uses a scheme the proxy will relay a code to (RFC 8252).
 /// Pure (no HTTP): the SSRF-guarded fetch is performed by
@@ -580,6 +580,9 @@ void validateClientIdMetadata(string clientIdUrl,
 	if (doc.clientId != clientIdUrl)
 		throw new InvalidClientIdMetadataException(clientIdUrl,
 				"metadata document client_id does not match the document URL exactly");
+	if (doc.clientName.length == 0)
+		throw new InvalidClientIdMetadataException(clientIdUrl,
+				"metadata document is missing the required client_name field");
 	if (doc.redirectUris.length == 0)
 		throw new InvalidClientIdMetadataException(clientIdUrl,
 				"metadata document is missing the required redirect_uris field");
@@ -1091,6 +1094,16 @@ unittest  // CIMD VALIDATE: a document with no redirect_uris (required field) is
 
 	auto doc = sampleCimdDoc();
 	doc.redirectUris = [];
+	assertThrown!InvalidClientIdMetadataException(validateClientIdMetadata(
+			"https://app.example.com/oauth/client.json", doc, "http://127.0.0.1:8765/callback"));
+}
+
+unittest  // CIMD VALIDATE: a document missing client_name (required field) is rejected
+{
+	import std.exception : assertThrown;
+
+	auto doc = sampleCimdDoc();
+	doc.clientName = "";
 	assertThrown!InvalidClientIdMetadataException(validateClientIdMetadata(
 			"https://app.example.com/oauth/client.json", doc, "http://127.0.0.1:8765/callback"));
 }
