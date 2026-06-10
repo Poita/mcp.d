@@ -10,7 +10,10 @@
  *
  *   1. word_count — `callToolAwait` calls the tool, detects the CreateTaskResult,
  *      polls `tasks/get` to completion, and returns the final CallToolResult.
- *   2. slow_reverse — same await flow; verifies the reversed string.
+ *   2. slow_reverse — same await flow; verifies the reversed string. A second
+ *      call then skips the await helper: plain `callTool` returns the task handle
+ *      directly (`CallToolResult.isTask`/`task`), the `taskId` is persisted, and
+ *      `awaitTask` resumes polling from that bare id — the post-restart path.
  *   3. labeled_count — a task that needs input MID-EXECUTION. `callToolAwait`
  *      surfaces the task's `inputRequests` (an elicitation) through its
  *      `onInputRequired` callback; the client answers via `respondTaskInput`
@@ -23,6 +26,8 @@
  *   - `server/discover` advertises the tasks extension under `capabilities`.
  *   - word_count returns the expected word/character counts.
  *   - slow_reverse returns the fully reversed string (not cancelled).
+ *   - a `callTool` task handle exposes `task.taskId`, which `awaitTask` resumes
+ *     from a bare id (the persist-then-restart path) to the same final result.
  *   - labeled_count surfaces an elicitation mid-task, and after the client
  *     answers it completes with the supplied label and correct counts.
  *   - `isTaskResult` correctly identifies a CreateTaskResult JSON object.
@@ -117,6 +122,27 @@ int main(string[] args) @safe
 			check(!rv.cancelled, "slow_reverse completed normally (not cancelled)");
 		}
 
+		// --- 3b. persist-and-resume: callTool exposes the task handle -------
+		// Instead of awaiting inline, call the tool with plain `callTool`. When the
+		// server creates a task the result IS the handle (`isTask`); persist
+		// `task.taskId` somewhere durable, then drive it to completion with
+		// `awaitTask` — the same call a client would make after a restart, rebuilt
+		// from nothing but the stored id.
+		{
+			Json a = Json.emptyObject;
+			a["text"] = "resume me";
+			auto handle = client.callTool("slow_reverse", a);
+			check(handle.isTask, "slow_reverse via callTool should return a task handle");
+			check(handle.task.taskId.length > 0, "the task handle should carry a taskId");
+
+			// Pretend the process restarted: all we keep is the id string.
+			string persistedTaskId = handle.task.taskId;
+			auto r = client.awaitTask(persistedTaskId);
+			check(!r.isError, "resumed slow_reverse should not be an error");
+			auto rv = r.structuredContentAs!ReverseResult;
+			checkEq(rv.reversed, "em emuser", "resumed slow_reverse.reversed");
+		}
+
 		// --- 4. labeled_count (mid-task elicitation via tasks/update) -------
 		// The task suspends into input_required with an elicitation. callToolAwait
 		// surfaces it through onInputRequired; we answer with respondTaskInput
@@ -165,10 +191,10 @@ int main(string[] args) @safe
 		foreach (arg; args)
 			if (arg == "--http" || arg == "--url")
 				http = true;
-		writeln("OK: tasks example e2e passed over ",
-			http ? "http" : "stdio",
+		writeln("OK: tasks example e2e passed over ", http ? "http" : "stdio",
 			" — tasks extension advertised, word_count (9 words/43 chars),",
 			" slow_reverse (\"hello\"->\"olleh\"),",
+			" callTool task handle persisted + resumed via awaitTask,",
 			" labeled_count mid-task elicitation answered via tasks/update (label=my-label),",
 			" isTaskResult discriminator all verified.");
 		return 0;

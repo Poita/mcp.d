@@ -106,9 +106,20 @@ Then `import mcp;` in your source files.
   `callToolLoop`, satisfying each `InputRequest` and resubmitting until a completed result is
   returned (capped at 16 rounds to guard against misbehaving servers).
 
-Optional follow-ups (not required for conformance): Client-ID-Metadata-Document client_id
-(currently uses DCR, a passing SHOULD warning), and a built-in loopback redirect listener for
-the interactive auth-code flow.
+- ✅ **Client ID Metadata Documents (SEP-991)** on both sides — the spec-recommended
+  registration mechanism now that DCR is deprecated. The **client** advertises and uses an
+  HTTPS-URL `client_id` when the AS supports it; the **server-side OAuth proxy** opts in via
+  `OAuthProxyConfig.clientIdMetadataDocumentSupported`, advertising
+  `client_id_metadata_document_supported`, then fetching (SSRF-guarded, size-capped) and
+  validating the hosted document at `/authorize` — exact `client_id` match, required fields
+  (`client_id`, `client_name`, `redirect_uris`), and a redirect-URI allowlist sourced from the
+  document — with confused-deputy consent keyed on the stable `client_id` URL. The consent
+  screen surfaces the verified `client_name` and the redirect-URI hostname. DCR remains as the
+  deprecated fallback.
+
+Optional follow-ups (not required for conformance): a built-in loopback redirect listener for
+the interactive auth-code flow, and a localhost-redirect impersonation warning on the proxy's
+CIMD consent screen (a spec `SHOULD`).
 
 ## Requirements
 
@@ -370,6 +381,25 @@ The three exits cover the lifecycle: `return` a value completes the task,
 and `tc.detach(...)` leaves it `working` for `onDeployFinished` to complete out of
 band via `rt.complete` / `rt.fail` — no fiber held, so it works on any node. See
 [`examples/tasks`](examples/tasks/) for cancellation, durable stores, and the client side.
+
+On the client, `callToolAwait` hides the whole flow — it drives the poll loop and
+returns the final `CallToolResult`, so task and non-task tools look identical. When
+you need to survive a restart, call plain `callTool` instead: if the server made a
+task the result is the handle (`result.isTask`, with the seed `Task` in
+`result.task`). Persist `result.task.taskId`, then resume any time — even in a fresh
+process — with `awaitTask(taskId)`, which polls to completion (and surfaces mid-task
+input requests to an optional callback).
+
+```d
+auto r = client.callTool("deploy", args);   // sync or task — you needn't know
+if (r.isTask)
+{
+    store.save(r.task.taskId);               // durable handle; survives a restart
+    auto done = client.awaitTask(r.task.taskId);
+}
+else
+    use(r);                                  // synchronous tool, nothing to resume
+```
 
 > **Not supported: the experimental 2025-11-25 tasks.** The `tasks` feature that
 > shipped in the 2025-11-25 core specification (a top-level `tasks` capability,

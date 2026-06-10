@@ -115,6 +115,15 @@ Json makeCreateTaskResult(const Task seed) @safe
 	return j;
 }
 
+/// Whether `j` is a `CreateTaskResult` — a task handle the server returned
+/// instead of a synchronous result — identified by its `resultType: "task"`
+/// discriminator (SEP-2663).
+bool isCreateTaskResult(Json j) @safe
+{
+	return j.type == Json.Type.object && "resultType" in j
+		&& j["resultType"].type == Json.Type.string && j["resultType"].get!string == "task";
+}
+
 /// The status-specific payload a `tasks/get` response (`DetailedTask`) inlines:
 /// `inputRequests` for `input_required`, `result` for `completed`, `error` for
 /// `failed`; `none` for `working`/`cancelled`. Construct via the factory methods.
@@ -245,6 +254,16 @@ unittest  // makeCreateTaskResult tags the seed task with resultType "task"
 	assert(j["resultType"].get!string == "task");
 	assert(j["taskId"].get!string == "x");
 	assert(j["status"].get!string == "working");
+}
+
+unittest  // isCreateTaskResult recognizes a task handle by its resultType discriminator
+{
+	assert(isCreateTaskResult(Json([
+		"resultType": Json("task"),
+		"taskId": Json("x")
+	])));
+	assert(!isCreateTaskResult(Json(["resultType": Json("complete")])));
+	assert(!isCreateTaskResult(Json(["content": Json.emptyArray])));
 }
 
 unittest  // makeDetailedTask(completed) inlines the result and tags resultType "complete"

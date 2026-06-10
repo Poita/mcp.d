@@ -35,10 +35,12 @@ import std.string : endsWith, indexOf, startsWith;
 
 import vibe.data.json : Json;
 
-import mcp.auth.oauth : AuthorizationServerMetadata, ProtectedResourceMetadata,
-	RegisteredClient, TokenEndpointAuthMethod, TokenSet,
-	basicAuthHeader, buildAuthCodeTokenForm,
-	buildAuthorizationUrl, buildRefreshTokenForm, requireSecureUrl;
+import mcp.auth.oauth : AuthorizationServerMetadata, ClientIdMetadataDocument,
+	ProtectedResourceMetadata,
+	RegisteredClient, TokenEndpointAuthMethod, TokenSet, basicAuthHeader,
+	buildAuthCodeTokenForm,
+	buildAuthorizationUrl,
+	buildRefreshTokenForm, isValidClientIdMetadataUrl, requireSecureUrl, secureRequestHTTP;
 import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore, referenceTokenValidator;
 import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidator;
 
@@ -142,6 +144,14 @@ struct OAuthProxyConfig
 	/// (`referenceTokenValidator`). Set together with `issueToken`. Null (the
 	/// default) leaves the proxy in passthrough.
 	ReferenceTokenStore tokenStore;
+
+	/// Opt-in: advertise and accept OAuth Client ID Metadata Documents (SEP-991).
+	/// When set, the proxy publishes `client_id_metadata_document_supported: true`
+	/// in its AS metadata and accepts URL-formatted `client_id`s at `/authorize`,
+	/// fetching and validating the hosted document instead of requiring DCR. DCR
+	/// remains advertised as the deprecated fallback. CIMD is the spec-recommended
+	/// registration mechanism; DCR is deprecated.
+	bool clientIdMetadataDocumentSupported;
 
 	/// The proxy's fixed upstream redirect URI (`baseUrl` + `redirectPath`),
 	/// registered with the IdP.
@@ -247,6 +257,7 @@ AuthorizationServerMetadata authorizationServerMetadata(const OAuthProxyConfig c
 	}
 	m.tokenEndpointAuthMethodsSupported = ["none"];
 	m.responseTypesSupported = ["code"];
+	m.clientIdMetadataDocumentSupported = cfg.clientIdMetadataDocumentSupported;
 	return m;
 }
 
@@ -281,6 +292,8 @@ Json authorizationServerMetadataJson(const OAuthProxyConfig cfg) @safe
 	j["token_endpoint_auth_methods_supported"] = strArray(m.tokenEndpointAuthMethodsSupported);
 	if (m.scopesSupported.length)
 		j["scopes_supported"] = strArray(m.scopesSupported);
+	if (m.clientIdMetadataDocumentSupported)
+		j["client_id_metadata_document_supported"] = true;
 	return j;
 }
 
@@ -596,6 +609,99 @@ class InvalidRedirectUriException : Exception
 }
 
 // ===========================================================================
+// Client ID Metadata Documents (SEP-991) — server (AS) side
+// ===========================================================================
+
+/// Thrown when a URL-formatted `client_id` or its fetched OAuth Client ID
+/// Metadata Document (SEP-991) fails the AS-side validation the spec requires
+/// before an authorization request may be honoured: the `client_id` URL must be
+/// https with a path component, the document's `client_id` MUST equal that URL
+/// exactly, the document MUST be valid JSON carrying the required fields, and the
+/// requested `redirect_uri` MUST be an exact, scheme-allowed member of the
+/// document's `redirect_uris`. The proxy fails closed by throwing — it neither
+/// mints proxy state nor forwards upstream. An HTTP mount maps this to a
+/// `400 invalid_client` / `invalid_request`.
+class InvalidClientIdMetadataException : Exception
+{
+	string clientId;
+
+	this(string clientId, string reason, string file = __FILE__, size_t line = __LINE__) @safe
+	{
+		super("invalid client_id metadata '" ~ clientId ~ "': " ~ reason, file, line);
+		this.clientId = clientId;
+	}
+}
+
+/// Validate a fetched OAuth Client ID Metadata Document against the URL
+/// `client_id` it was fetched from and the `redirect_uri` presented in the
+/// authorization request, enforcing the SEP-991 AS-side MUSTs:
+///   * `clientIdUrl` is https with a path component (`isValidClientIdMetadataUrl`);
+///   * the document's `client_id` equals `clientIdUrl` exactly;
+///   * the document carries the required fields (`client_id`, `client_name`, `redirect_uris`);
+///   * `redirectUri` is an exact-string member of the document's `redirect_uris`;
+///   * `redirectUri` uses a scheme the proxy will relay a code to (RFC 8252).
+/// Pure (no HTTP): the SSRF-guarded fetch is performed by
+/// `OAuthProxy.fetchClientIdMetadata`; this carries the validation logic so it is
+/// unit-testable against a document obtained any way. Throws
+/// `InvalidClientIdMetadataException` on the first failed check (fail closed).
+void validateClientIdMetadata(string clientIdUrl,
+		const ClientIdMetadataDocument doc, string redirectUri) @safe
+{
+	import std.algorithm : canFind;
+
+	if (!isValidClientIdMetadataUrl(clientIdUrl))
+		throw new InvalidClientIdMetadataException(clientIdUrl,
+				"client_id must be an https URL with a path component (SEP-991)");
+	if (doc.clientId.length == 0)
+		throw new InvalidClientIdMetadataException(clientIdUrl,
+				"metadata document is missing the required client_id field");
+	if (doc.clientId != clientIdUrl)
+		throw new InvalidClientIdMetadataException(clientIdUrl,
+				"metadata document client_id does not match the document URL exactly");
+	if (doc.clientName.length == 0)
+		throw new InvalidClientIdMetadataException(clientIdUrl,
+				"metadata document is missing the required client_name field");
+	if (doc.redirectUris.length == 0)
+		throw new InvalidClientIdMetadataException(clientIdUrl,
+				"metadata document is missing the required redirect_uris field");
+	if (!doc.redirectUris.canFind(redirectUri))
+		throw new InvalidClientIdMetadataException(clientIdUrl,
+				"redirect_uri is not listed in the metadata document");
+	if (!isAllowedRedirectScheme(redirectUri))
+		throw new InvalidClientIdMetadataException(clientIdUrl,
+				"redirect_uri scheme not allowed (https, or http for loopback only)");
+}
+
+/// Upper bound on the size of a fetched Client ID Metadata Document. A document
+/// larger than this is rejected rather than buffered, so an attacker-supplied
+/// `client_id` URL cannot make the proxy buffer an unbounded response (SSRF
+/// amplification). Mirrors the introspection/JWKS body caps elsewhere.
+package enum size_t maxClientIdMetadataBytes = 256 * 1024;
+
+/// Parse a fetched Client ID Metadata Document body (SEP-991). The body MUST be
+/// a JSON object; a non-JSON or non-object body throws
+/// `InvalidClientIdMetadataException` (the spec MUST that the AS validate the
+/// document is valid JSON). Field-level requirements (`client_id`,
+/// `redirect_uris`, exact-match checks) are enforced separately by
+/// `validateClientIdMetadata`. Pure: no HTTP, so it is unit-testable on a body
+/// string obtained any way.
+ClientIdMetadataDocument parseClientIdMetadataDocument(string clientIdUrl, string body) @safe
+{
+	import vibe.data.json : parseJsonString, Json;
+
+	Json j;
+	try
+		j = parseJsonString(body);
+	catch (Exception e)
+		throw new InvalidClientIdMetadataException(clientIdUrl,
+				"metadata document is not valid JSON");
+	if (j.type != Json.Type.object)
+		throw new InvalidClientIdMetadataException(clientIdUrl,
+				"metadata document is not a JSON object");
+	return ClientIdMetadataDocument.fromJson(j);
+}
+
+// ===========================================================================
 // Consent gate (confused-deputy mitigation)
 // ===========================================================================
 
@@ -699,6 +805,13 @@ class ConsentRequiredException : Exception
 // The proxy provider
 // ===========================================================================
 
+/// Fetches and parses the OAuth Client ID Metadata Document (SEP-991) hosted at a
+/// URL-formatted `client_id`. The default fetcher is the SSRF-guarded HTTP fetch
+/// (`OAuthProxy.fetchClientIdMetadata`); inject a custom one (e.g. a caching
+/// fetcher honouring HTTP cache headers, or a test stub) via
+/// `OAuthProxy.clientIdMetadataFetcher`.
+alias ClientIdMetadataFetcher = ClientIdMetadataDocument delegate(string clientIdUrl) @safe;
+
 /// A reusable OAuth proxy provider. Construct it from an `OAuthProxyConfig`, then
 /// read the metadata surface to publish, drive the authorize/token proxying, and
 /// obtain a `TokenValidator` for `ResourceServerConfig.validator`.
@@ -713,6 +826,7 @@ final class OAuthProxy
 	private OAuthProxyConfig cfg;
 	private ConsentStore consentStore;
 	private RedirectUriRegistry redirectRegistry;
+	private ClientIdMetadataFetcher cimdFetcher;
 
 	this(OAuthProxyConfig cfg) @safe
 	{
@@ -847,6 +961,94 @@ final class OAuthProxy
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
 	}
 
+	/// Install a custom Client ID Metadata Document fetcher (e.g. a caching fetcher
+	/// honouring HTTP cache headers, or a test stub), replacing the default
+	/// SSRF-guarded HTTP fetch. The fail-fast enabled/URL checks in
+	/// `fetchClientIdMetadata` still run before the injected fetcher is consulted.
+	void clientIdMetadataFetcher(ClientIdMetadataFetcher fetcher) @safe
+	{
+		cimdFetcher = fetcher;
+	}
+
+	/// Fetch and parse the OAuth Client ID Metadata Document (SEP-991) hosted at a
+	/// URL-formatted `client_id`. Fails fast (no network) when CIMD is not enabled
+	/// on this proxy or `clientIdUrl` is not a valid https-with-path URL, then
+	/// fetches the document via the injected `clientIdMetadataFetcher` if set, else
+	/// through the SSRF-guarded connector (`secureRequestHTTP` with the
+	/// block-internal policy: resolve + pin, reject internal/link-local targets),
+	/// capping the response at `maxClientIdMetadataBytes`. The returned document is
+	/// NOT yet validated against the request — pass it to
+	/// `authorizeWithClientIdMetadata`, which enforces the SEP-991 MUSTs. Throws
+	/// `InvalidClientIdMetadataException` on any fail-fast, fetch, or parse error.
+	ClientIdMetadataDocument fetchClientIdMetadata(string clientIdUrl) @safe
+	{
+		import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
+		import vibe.http.common : HTTPMethod;
+		import vibe.stream.operations : readAllUTF8;
+
+		if (!cfg.clientIdMetadataDocumentSupported)
+			throw new InvalidClientIdMetadataException(clientIdUrl,
+					"Client ID Metadata Documents are not enabled on this proxy");
+		if (!isValidClientIdMetadataUrl(clientIdUrl))
+			throw new InvalidClientIdMetadataException(clientIdUrl,
+					"client_id must be an https URL with a path component (SEP-991)");
+
+		if (cimdFetcher !is null)
+			return cimdFetcher(clientIdUrl);
+
+		string responseBody;
+		bool ok = false;
+		try
+		{
+			secureRequestHTTP(clientIdUrl, (scope HTTPClientRequest req) {
+				req.method = HTTPMethod.GET;
+				req.headers["Accept"] = "application/json";
+			}, (scope HTTPClientResponse res) {
+				if (res.statusCode >= 200 && res.statusCode < 300)
+				{
+					responseBody = () @trusted {
+						return res.bodyReader.readAllUTF8(false, maxClientIdMetadataBytes);
+					}();
+					ok = true;
+				}
+				else
+					res.dropBody();
+			});
+		}
+		catch (Exception e)
+			throw new InvalidClientIdMetadataException(clientIdUrl,
+					"failed to fetch metadata document: " ~ e.msg);
+		if (!ok)
+			throw new InvalidClientIdMetadataException(clientIdUrl,
+					"metadata document endpoint did not return a success status");
+		return parseClientIdMetadataDocument(clientIdUrl, responseBody);
+	}
+
+	/// Build the upstream authorization redirect for a proxied `/authorize` whose
+	/// `client_id` is an OAuth Client ID Metadata Document URL (SEP-991), using an
+	/// already-fetched `doc` (fetch it SSRF-safely via `fetchClientIdMetadata`).
+	///
+	/// The document and `clientRedirectUri` are validated against the SEP-991
+	/// AS-side MUSTs (`validateClientIdMetadata`) before anything is forwarded;
+	/// the request is then gated on per-client user consent — keyed on the stable
+	/// `client_id` URL rather than the redirect_uri, since CIMD gives the client a
+	/// durable identity — to satisfy the confused-deputy MUST (the proxy still
+	/// collapses every client onto one upstream `client_id`). Throws
+	/// `InvalidClientIdMetadataException` when CIMD is not enabled on this proxy or
+	/// the document fails validation, and `ConsentRequiredException` when the
+	/// client_id URL has not been approved via `grantConsent`.
+	string authorizeWithClientIdMetadata(string clientIdUrl, const ClientIdMetadataDocument doc,
+			string clientRedirectUri, string codeChallenge, string scopeStr, string state) @safe
+	{
+		if (!cfg.clientIdMetadataDocumentSupported)
+			throw new InvalidClientIdMetadataException(clientIdUrl,
+					"Client ID Metadata Documents are not enabled on this proxy");
+		validateClientIdMetadata(clientIdUrl, doc, clientRedirectUri);
+		if (!consentStore.hasConsent(clientIdUrl))
+			throw new ConsentRequiredException(clientIdUrl);
+		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
+	}
+
 	/// Build the upstream token-exchange form for a proxied `/token`.
 	string tokenForm(string code, string codeVerifier) const @safe
 	{
@@ -920,6 +1122,8 @@ final class OAuthProxy
 
 version (unittest)
 {
+	import mcp.auth.oauth : ClientIdMetadataDocument;
+
 	private OAuthProxyConfig sampleConfig() @safe
 	{
 		OAuthProxyConfig cfg;
@@ -932,6 +1136,271 @@ version (unittest)
 		cfg.resource = "https://mcp.example.com/mcp";
 		return cfg;
 	}
+
+	private ClientIdMetadataDocument sampleCimdDoc() @safe
+	{
+		ClientIdMetadataDocument d;
+		d.clientId = "https://app.example.com/oauth/client.json";
+		d.clientName = "Example MCP Client";
+		d.redirectUris = ["http://127.0.0.1:8765/callback"];
+		return d;
+	}
+}
+
+unittest  // CIMD ADVERTISE: AS metadata sets client_id_metadata_document_supported when enabled
+{
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto m = authorizationServerMetadata(cfg);
+	assert(m.clientIdMetadataDocumentSupported);
+	auto j = authorizationServerMetadataJson(cfg);
+	assert(j["client_id_metadata_document_supported"].get!bool == true);
+	// DCR stays advertised as the deprecated fallback (spec retains it).
+	assert(j["registration_endpoint"].get!string == "https://mcp.example.com/register");
+}
+
+unittest  // CIMD ADVERTISE: AS metadata omits client_id_metadata_document_supported by default
+{
+	auto cfg = sampleConfig();
+	assert(!cfg.clientIdMetadataDocumentSupported);
+	auto j = authorizationServerMetadataJson(cfg);
+	assert("client_id_metadata_document_supported" !in j);
+}
+
+unittest  // CIMD VALIDATE: a well-formed document whose client_id matches the URL and lists the redirect_uri passes
+{
+	auto doc = sampleCimdDoc();
+	// Must not throw.
+	validateClientIdMetadata("https://app.example.com/oauth/client.json", doc,
+			"http://127.0.0.1:8765/callback");
+}
+
+unittest  // CIMD VALIDATE: the client_id URL must be https with a path component (SEP-991)
+{
+	import std.exception : assertThrown;
+
+	auto doc = sampleCimdDoc();
+	assertThrown!InvalidClientIdMetadataException(validateClientIdMetadata(
+			"http://app.example.com/oauth/client.json", doc, "http://127.0.0.1:8765/callback"));
+}
+
+unittest  // CIMD VALIDATE: the document's client_id MUST equal the URL exactly
+{
+	import std.exception : assertThrown;
+
+	auto doc = sampleCimdDoc();
+	doc.clientId = "https://app.example.com/oauth/OTHER.json";
+	assertThrown!InvalidClientIdMetadataException(validateClientIdMetadata(
+			"https://app.example.com/oauth/client.json", doc, "http://127.0.0.1:8765/callback"));
+}
+
+unittest  // CIMD VALIDATE: a document missing client_id (required field) is rejected
+{
+	import std.exception : assertThrown;
+
+	auto doc = sampleCimdDoc();
+	doc.clientId = "";
+	assertThrown!InvalidClientIdMetadataException(validateClientIdMetadata("",
+			doc, "http://127.0.0.1:8765/callback"));
+}
+
+unittest  // CIMD VALIDATE: a document with no redirect_uris (required field) is rejected
+{
+	import std.exception : assertThrown;
+
+	auto doc = sampleCimdDoc();
+	doc.redirectUris = [];
+	assertThrown!InvalidClientIdMetadataException(validateClientIdMetadata(
+			"https://app.example.com/oauth/client.json", doc, "http://127.0.0.1:8765/callback"));
+}
+
+unittest  // CIMD VALIDATE: a document missing client_name (required field) is rejected
+{
+	import std.exception : assertThrown;
+
+	auto doc = sampleCimdDoc();
+	doc.clientName = "";
+	assertThrown!InvalidClientIdMetadataException(validateClientIdMetadata(
+			"https://app.example.com/oauth/client.json", doc, "http://127.0.0.1:8765/callback"));
+}
+
+unittest  // CIMD VALIDATE: the requested redirect_uri MUST be an exact member of the document's list
+{
+	import std.exception : assertThrown;
+
+	auto doc = sampleCimdDoc();
+	assertThrown!InvalidClientIdMetadataException(validateClientIdMetadata(
+			"https://app.example.com/oauth/client.json", doc,
+			"http://127.0.0.1:8765/callback/extra"));
+}
+
+unittest  // CIMD VALIDATE: a redirect_uri using a disallowed scheme is rejected even if listed
+{
+	import std.exception : assertThrown;
+
+	auto doc = sampleCimdDoc();
+	doc.redirectUris = ["http://evil.example.com/cb"];
+	assertThrown!InvalidClientIdMetadataException(validateClientIdMetadata(
+			"https://app.example.com/oauth/client.json", doc, "http://evil.example.com/cb"));
+}
+
+unittest  // CIMD VALIDATE: the exception names the offending client_id URL
+{
+	auto doc = sampleCimdDoc();
+	doc.clientId = "https://app.example.com/oauth/mismatch.json";
+	bool threw = false;
+	try
+		validateClientIdMetadata("https://app.example.com/oauth/client.json",
+				doc, "http://127.0.0.1:8765/callback");
+	catch (InvalidClientIdMetadataException e)
+	{
+		threw = true;
+		assert(e.clientId == "https://app.example.com/oauth/client.json");
+	}
+	assert(threw);
+}
+
+unittest  // CIMD AUTHORIZE: with a valid doc + consent on the client_id URL, forwards upstream with the fixed client_id
+{
+	import std.algorithm : canFind;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	auto doc = sampleCimdDoc();
+	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	auto url = proxy.authorizeWithClientIdMetadata("https://app.example.com/oauth/client.json",
+			doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S");
+	assert(url.startsWith("https://github.com/login/oauth/authorize?"));
+	assert(url.canFind("client_id=Iv1.upstream"));
+}
+
+unittest  // CIMD AUTHORIZE: confused-deputy gate — an un-consented client_id is refused
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	auto doc = sampleCimdDoc();
+	assertThrown!ConsentRequiredException(proxy.authorizeWithClientIdMetadata(
+			"https://app.example.com/oauth/client.json",
+			doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S"));
+}
+
+unittest  // CIMD AUTHORIZE: an invalid document is rejected before the consent gate is consulted
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	auto doc = sampleCimdDoc();
+	doc.clientId = "https://app.example.com/oauth/OTHER.json"; // mismatch
+	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	assertThrown!InvalidClientIdMetadataException(
+			proxy.authorizeWithClientIdMetadata("https://app.example.com/oauth/client.json",
+			doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S"));
+}
+
+unittest  // CIMD AUTHORIZE: refused when the proxy is not configured to support CIMD
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig(); // clientIdMetadataDocumentSupported defaults to false
+	auto proxy = new OAuthProxy(cfg);
+	auto doc = sampleCimdDoc();
+	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	assertThrown!InvalidClientIdMetadataException(
+			proxy.authorizeWithClientIdMetadata("https://app.example.com/oauth/client.json",
+			doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S"));
+}
+
+unittest  // CIMD PARSE: a valid JSON document body parses into a ClientIdMetadataDocument
+{
+	auto doc = parseClientIdMetadataDocument("https://app.example.com/oauth/client.json",
+			`{"client_id":"https://app.example.com/oauth/client.json",`
+			~ `"client_name":"Example","redirect_uris":["http://127.0.0.1:8765/callback"]}`);
+	assert(doc.clientId == "https://app.example.com/oauth/client.json");
+	assert(doc.clientName == "Example");
+	assert(doc.redirectUris == ["http://127.0.0.1:8765/callback"]);
+}
+
+unittest  // CIMD PARSE: a non-JSON body is rejected (MUST validate document is valid JSON)
+{
+	import std.exception : assertThrown;
+
+	assertThrown!InvalidClientIdMetadataException(parseClientIdMetadataDocument(
+			"https://app.example.com/oauth/client.json", "this is not json"));
+}
+
+unittest  // CIMD PARSE: a JSON body that is not an object is rejected
+{
+	import std.exception : assertThrown;
+
+	assertThrown!InvalidClientIdMetadataException(parseClientIdMetadataDocument(
+			"https://app.example.com/oauth/client.json", `["not","an","object"]`));
+}
+
+unittest  // CIMD FETCH: an injected fetcher is consulted instead of the network
+{
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	auto doc = sampleCimdDoc();
+	bool called = false;
+	proxy.clientIdMetadataFetcher = (string url) @safe {
+		called = true;
+		assert(url == "https://app.example.com/oauth/client.json");
+		return doc;
+	};
+	auto got = proxy.fetchClientIdMetadata("https://app.example.com/oauth/client.json");
+	assert(called);
+	assert(got.clientId == doc.clientId);
+}
+
+unittest  // CIMD FETCH: even with an injected fetcher, a malformed client_id URL fails fast
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	proxy.clientIdMetadataFetcher = (string url) @safe { return sampleCimdDoc(); };
+	assertThrown!InvalidClientIdMetadataException(
+			proxy.fetchClientIdMetadata("http://app.example.com/oauth/client.json"));
+}
+
+unittest  // CIMD FETCH: fails fast (no network) when CIMD is not enabled on the proxy
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	auto proxy = new OAuthProxy(cfg);
+	assertThrown!InvalidClientIdMetadataException(
+			proxy.fetchClientIdMetadata("https://app.example.com/oauth/client.json"));
+}
+
+unittest  // CIMD FETCH: fails fast (no network) on a non-https client_id URL
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	assertThrown!InvalidClientIdMetadataException(
+			proxy.fetchClientIdMetadata("http://app.example.com/oauth/client.json"));
+}
+
+unittest  // CIMD FETCH: fails fast (no network) on an https client_id URL with no path component
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	assertThrown!InvalidClientIdMetadataException(
+			proxy.fetchClientIdMetadata("https://app.example.com"));
 }
 
 unittest  // callback URL joins base_url and the default redirect path
