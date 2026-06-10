@@ -162,12 +162,23 @@ struct ProxyAuthState
 /// resumes the upstream redirect. Using a form POST (rather than a hyperlink GET)
 /// means link prefetch/preload cannot auto-fire the state-changing grant and the
 /// opaque `state` is not carried in a URL that could leak via Referer/history/logs.
-string consentScreenHtml(string clientRedirectUri, string consentPath, string proxyState) @safe
+///
+/// `clientName` is the verified human-readable name from a SEP-991 Client ID
+/// Metadata Document; when non-empty it is displayed prominently so the user
+/// authorizes a named identity (phishing mitigation), and is empty for a DCR
+/// client, which has no attested name. The `clientRedirectUri` is always shown:
+/// the spec requires the redirect URI hostname be clearly displayed during
+/// authorization, since under CIMD a localhost redirect cannot be attested.
+string consentScreenHtml(string clientName, string clientRedirectUri,
+		string consentPath, string proxyState) @safe
 {
+	const safeName = htmlEscape(clientName);
 	const safeUri = htmlEscape(clientRedirectUri);
 	const safeAction = htmlEscape(consentPath);
 	const safeState = htmlEscape(proxyState);
-	return "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" ~ "<meta name=\"referrer\" content=\"no-referrer\">" ~ "<title>Authorize application</title></head><body>" ~ "<h1>Authorize application</h1>" ~ "<p>An application is requesting to sign in via this server and be" ~ " forwarded to the upstream identity provider.</p>" ~ "<p>Redirect URI: <code>" ~ safeUri ~ "</code></p>" ~ "<form method=\"post\" action=\"" ~ safeAction ~ "\">" ~ "<input type=\"hidden\" name=\"state\" value=\"" ~ safeState ~ "\">" ~ "<button type=\"submit\">Approve and continue</button></form>" ~ "</body></html>";
+	const nameSection = clientName.length
+		? "<p>Application: <strong>" ~ safeName ~ "</strong></p>" : "";
+	return "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" ~ "<meta name=\"referrer\" content=\"no-referrer\">" ~ "<title>Authorize application</title></head><body>" ~ "<h1>Authorize application</h1>" ~ "<p>An application is requesting to sign in via this server and be" ~ " forwarded to the upstream identity provider.</p>" ~ nameSection ~ "<p>Redirect URI: <code>" ~ safeUri ~ "</code></p>" ~ "<form method=\"post\" action=\"" ~ safeAction ~ "\">" ~ "<input type=\"hidden\" name=\"state\" value=\"" ~ safeState ~ "\">" ~ "<button type=\"submit\">Approve and continue</button></form>" ~ "</body></html>";
 }
 
 private string htmlEscape(string s) @safe
@@ -343,18 +354,19 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 			return;
 		}
 
-		void renderConsent(string redirectForDisplay, string proxyState) @safe
+		void renderConsent(string clientNameForDisplay, string redirectForDisplay, string proxyState) @safe
 		{
 			// Un-consented client: present the consent screen rather than forwarding
 			// to the upstream authorization server. The screen's approval control is a
 			// form POST, and the opaque proxy state is carried in a hidden field rather
 			// than a URL, so it cannot leak via Referer/history and cannot be auto-fired
-			// by link prefetch/preload.
+			// by link prefetch/preload. `clientNameForDisplay` is the verified CIMD
+			// client_name (empty for a DCR client, which has no attested name).
 			res.headers["Cache-Control"] = "no-store";
 			res.headers["Referrer-Policy"] = "no-referrer";
 			res.statusCode = HTTPStatus.ok;
-			res.writeBody(consentScreenHtml(redirectForDisplay, consentPath,
-				proxyState), "text/html; charset=utf-8");
+			res.writeBody(consentScreenHtml(clientNameForDisplay, redirectForDisplay,
+				consentPath, proxyState), "text/html; charset=utf-8");
 		}
 
 		if (isCimd)
@@ -384,7 +396,7 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 				res.redirect(location, HTTPStatus.found);
 			}
 			catch (ConsentRequiredException)
-				renderConsent(clientRedirect, proxyState);
+				renderConsent(doc.clientName, clientRedirect, proxyState);
 			catch (InvalidClientIdMetadataException)
 			{
 				res.statusCode = HTTPStatus.badRequest;
@@ -415,7 +427,7 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 			res.redirect(location, HTTPStatus.found);
 		}
 		catch (ConsentRequiredException)
-			renderConsent(clientRedirect, proxyState);
+			renderConsent("", clientRedirect, proxyState);
 	});
 
 	// /consent: the confused-deputy consent-approval action. The user reaches this
@@ -913,7 +925,7 @@ unittest  // CONSENT SCREEN: HTML names the client redirect_uri and a POST appro
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml("http://localhost:5000/cb", "/consent", "abc");
+	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc");
 	assert(html.canFind("Authorize application"));
 	assert(html.canFind("http://localhost:5000/cb"));
 	assert(html.canFind("method=\"post\""));
@@ -925,7 +937,7 @@ unittest  // CONSENT SCREEN: the approve control is a form POST, not a GET hyper
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml("http://localhost:5000/cb", "/consent", "abc");
+	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc");
 	// No hyperlink that link prefetch/preload could auto-fire as a GET grant, and the
 	// opaque state is in a hidden field rather than a URL that could leak.
 	assert(!html.canFind("<a href"));
@@ -936,13 +948,33 @@ unittest  // CONSENT SCREEN: the untrusted client redirect_uri and proxy state a
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml(`http://x/cb?a=1&b="<script>`, "/consent", `"><b>`);
+	const html = consentScreenHtml("", `http://x/cb?a=1&b="<script>`, "/consent", `"><b>`);
 	assert(html.canFind("&amp;"));
 	assert(html.canFind("&lt;script&gt;"));
 	assert(html.canFind("&quot;"));
 	assert(!html.canFind("<script>"));
 	// The proxy state is escaped before being placed in the hidden field value.
 	assert(!html.canFind("value=\"\"><b>\""));
+}
+
+unittest  // CONSENT SCREEN: a CIMD client_name is displayed (verified identity) and HTML-escaped
+{
+	import std.algorithm : canFind;
+
+	const html = consentScreenHtml(`Acme <Client>`, "http://localhost:5000/cb", "/consent", "abc");
+	// The verified client_name from the metadata document is surfaced to the user.
+	assert(html.canFind("Acme &lt;Client&gt;"));
+	assert(!html.canFind("<Client>"));
+}
+
+unittest  // CONSENT SCREEN: an empty client_name (DCR client) renders no name section
+{
+	import std.algorithm : canFind;
+
+	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc");
+	// The redirect_uri is still shown; there is no empty "Application:" label.
+	assert(html.canFind("http://localhost:5000/cb"));
+	assert(!html.canFind("Application:"));
 }
 
 unittest  // CONFUSED DEPUTY: an un-consented client gets the consent screen, NOT a 302 upstream
@@ -1242,6 +1274,8 @@ unittest  // CIMD MOUNT: /authorize with a URL client_id and no consent renders 
 	const body_ = () @trusted { return cast(string) sink.data; }();
 	assert(body_.canFind("Authorize application"));
 	assert(body_.canFind("http://127.0.0.1:8765/cb"));
+	// The verified client_name from the metadata document is shown to the user.
+	assert(body_.canFind("Example MCP Client"));
 	assert(!proxy.hasConsent("https://app.example.com/oauth/client.json"));
 }
 
