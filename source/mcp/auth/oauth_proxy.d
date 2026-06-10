@@ -39,7 +39,7 @@ import mcp.auth.oauth : AuthorizationServerMetadata, ProtectedResourceMetadata,
 	RegisteredClient, TokenEndpointAuthMethod, TokenSet,
 	basicAuthHeader, buildAuthCodeTokenForm,
 	buildAuthorizationUrl, buildRefreshTokenForm, requireSecureUrl;
-import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore;
+import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore, referenceTokenValidator;
 import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidator;
 
 @safe:
@@ -181,14 +181,20 @@ struct OAuthProxyConfig
 	/// Collapse this proxy config into the single `auth` object the transport
 	/// accepts (`StreamableHttpOptions.auth` / `mountMcp`), so an `OAuthProxy`
 	/// preset flows through the same one entry point as `jwtResourceServer` and
-	/// the JWKS presets — no re-typing of resource/scopes. The `validator` is the
-	/// configured `tokenVerifier` (fails closed when none is set); the proxy's own
-	/// `baseUrl` is advertised as the sole authorization server (it fronts the
-	/// upstream IdP), and `resource`/`scopesSupported` are mirrored.
-	ResourceServerConfig toResourceServer() const @safe
+	/// the JWKS presets — no re-typing of resource/scopes. In broker mode the
+	/// client presents the server's own opaque reference token, so the `validator`
+	/// is `referenceTokenValidator` over `tokenStore`; otherwise it is the
+	/// configured `tokenVerifier` for the upstream/passthrough token (failing
+	/// closed when none is set). The proxy's own `baseUrl` is advertised as the
+	/// sole authorization server (it fronts the upstream IdP), and
+	/// `resource`/`scopesSupported` are mirrored.
+	ResourceServerConfig toResourceServer() @safe
 	{
 		ResourceServerConfig rs;
-		rs.validator = tokenVerifier !is null ? tokenVerifier : (string t) => TokenInfo.invalid();
+		if (issueToken !is null && tokenStore !is null)
+			rs.validator = referenceTokenValidator(tokenStore, resource);
+		else
+			rs.validator = tokenVerifier !is null ? tokenVerifier : (string t) => TokenInfo.invalid();
 		rs.resource = resource;
 		if (baseUrl.length)
 			rs.authorizationServers = [stripTrailingSlash(baseUrl)];
@@ -224,6 +230,15 @@ AuthorizationServerMetadata authorizationServerMetadata(const OAuthProxyConfig c
 	m.codeChallengeMethodsSupported = ["S256"];
 	m.scopesSupported = cfg.scopesSupported.dup;
 	m.grantTypesSupported = cfg.grantTypesSupported.dup;
+	// Broker mode issues non-refreshable opaque tokens, so it never honours a
+	// refresh_token grant; don't advertise one.
+	if (cfg.issueToken !is null && cfg.tokenStore !is null)
+	{
+		import std.algorithm : filter;
+		import std.array : array;
+
+		m.grantTypesSupported = m.grantTypesSupported.filter!(g => g != "refresh_token").array;
+	}
 	m.tokenEndpointAuthMethodsSupported = ["none"];
 	m.responseTypesSupported = ["code"];
 	return m;
@@ -1580,4 +1595,30 @@ unittest  // BROKER: the issued token is audience-bound to the proxy's own resou
 
 	auto validate = referenceTokenValidator(cfg.tokenStore, cfg.resource);
 	assert(validate(issued.token).hasAudience(cfg.resource));
+}
+
+unittest  // BROKER: toResourceServer validates the issued opaque token, not the upstream token
+{
+	auto cfg = brokerConfig();
+	auto proxy = new OAuthProxy(cfg);
+	TokenSet upstream;
+	upstream.accessToken = "gho_upstream_secret";
+	const issued = proxy.issueClientToken(upstream);
+
+	// In broker mode the client presents the server's own opaque reference
+	// token; the resource server must validate it by store lookup, not via the
+	// upstream tokenVerifier (which only knows upstream-issued tokens).
+	auto rs = cfg.toResourceServer();
+	assert(rs.validator(issued.token).valid);
+	assert(!rs.validator("gho_upstream_secret").valid);
+}
+
+unittest  // BROKER: AS metadata omits the refresh_token grant (opaque tokens are non-refreshable)
+{
+	import std.algorithm : canFind;
+
+	auto cfg = brokerConfig();
+	auto m = authorizationServerMetadata(cfg);
+	assert(m.grantTypesSupported.canFind("authorization_code"));
+	assert(!m.grantTypesSupported.canFind("refresh_token"));
 }

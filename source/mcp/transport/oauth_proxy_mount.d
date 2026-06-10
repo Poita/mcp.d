@@ -518,8 +518,9 @@ void mountOAuthToken(URLRouter router, OAuthProxy proxy) @safe
 /// are set) the endpoint still exchanges upstream, but then mints the MCP
 /// server's OWN opaque token for the client via `proxy.issueClientToken`, keeps
 /// the upstream token server-side, and returns OUR token — never the upstream
-/// token. Refresh-token grants are not brokered (the proxy issues non-refreshable
-/// opaque tokens), so they fall through to the upstream relay.
+/// token. Refresh-token grants are refused with `unsupported_grant_type` in
+/// broker mode (the proxy issues non-refreshable opaque tokens), so the upstream
+/// token is never relayed to the client.
 ///
 /// An integrator building a spec-compliant token broker can also skip this leg
 /// and register their own `/token`, reusing `exchangeUpstream`.
@@ -540,6 +541,19 @@ in (exchange !is null)
 		// upstream token endpoint with the fixed upstream credentials.
 		const grantType = formField(form, "grant_type");
 		const isRefresh = grantType == "refresh_token";
+
+		// Broker mode issues non-refreshable opaque tokens and keeps the upstream
+		// token server-side. Honouring a refresh grant here would exchange and
+		// relay the upstream token to the client, leaking it; refuse instead.
+		if (proxy.brokerEnabled() && isRefresh)
+		{
+			Json err = Json.emptyObject;
+			err["error"] = "unsupported_grant_type";
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(err);
+			return;
+		}
+
 		string upstreamBody;
 		if (isRefresh)
 		{
@@ -1732,4 +1746,44 @@ unittest  // PASSTHROUGH REGRESSION: with no issueToken/tokenStore the upstream 
 	assert(res.statusCode == 200);
 	// Passthrough relays the upstream token to the client verbatim.
 	assert(body_.canFind("gho_upstream_secret"));
+}
+
+unittest  // BROKER MOUNT: a refresh_token grant is refused, never relaying the upstream token
+{
+	import std.algorithm : canFind;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto store = new ReferenceTokenStore();
+	auto proxy = brokerMountProxy(store);
+	auto router = new URLRouter;
+	bool upstreamCalled;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		rb = `{"access_token":"gho_upstream_secret","token_type":"bearer"}`;
+		status = 200;
+	});
+
+	auto formBody = () @trusted {
+		return cast(ubyte[]) "grant_type=refresh_token&refresh_token=RT".dup;
+	}();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
+			HTTPMethod.POST, createMemoryStream(formBody, false));
+	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	// A brokered client holds a non-refreshable opaque token, so the proxy must
+	// refuse a refresh grant outright rather than exchange-and-relay the upstream
+	// token (which would leak it to the client).
+	assert(res.statusCode == 400);
+	assert(body_.canFind("unsupported_grant_type"));
+	assert(!body_.canFind("gho_upstream_secret"));
+	assert(!upstreamCalled);
 }
