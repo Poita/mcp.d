@@ -1995,15 +1995,17 @@ final class McpServer
 		return response;
 	}
 
-	/// Configure the per-list draft `CacheableResult` freshness hint
-	/// (`ttlMs`/`cacheScope`) emitted on a specific `*/list` result when speaking
-	/// the draft protocol. `listMethod` MUST be one of `tools/list`,
-	/// `resources/list`, `resources/templates/list`, or `prompts/list`. Per-resource
+	/// Configure the draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`)
+	/// emitted on a specific cacheable result when speaking the draft protocol.
+	/// `listMethod` MUST be one of `tools/list`, `resources/list`,
+	/// `resources/templates/list`, `prompts/list`, or `server/discover`
+	/// (`DiscoverResult extends CacheableResult` in the draft schema). Per-resource
 	/// and per-template hints are supplied at registration time instead.
 	void setListCacheHint(string listMethod, CacheHint hint) @safe
 	{
 		if (listMethod != "tools/list" && listMethod != "resources/list"
-				&& listMethod != "resources/templates/list" && listMethod != "prompts/list")
+				&& listMethod != "resources/templates/list"
+				&& listMethod != "prompts/list" && listMethod != "server/discover")
 			throw new Exception("setListCacheHint: unknown list method '" ~ listMethod ~ "'");
 		listCacheHints[listMethod] = nullable(hint);
 	}
@@ -2479,7 +2481,9 @@ final class McpServer
 		d.capabilities = capabilities().forVersion(ProtocolVersion.modern);
 		d.serverInfo = serverInfo_.forVersion(ProtocolVersion.modern);
 		d.instructions = instructions;
-		return d.toJson();
+		// `server/discover` is draft-only, so the version is always modern here;
+		// emit the configured discover hint (or the conservative ttlMs:0 default).
+		return maybeCache(d, listHint("server/discover"), ProtocolVersion.modern);
 	}
 
 	/// `subscriptions/listen` (draft): record the opted-in change-notification
@@ -6203,6 +6207,22 @@ unittest  // setListCacheHint rejects unknown method names in release builds
 	auto s = makeTestServer();
 	assertThrown!Exception(s.setListCacheHint("tool/list", CacheHint(5.seconds)));
 	assertThrown!Exception(s.setListCacheHint("bogus", CacheHint(5.seconds)));
+}
+
+unittest  // setListCacheHint: draft server/discover carries the configured CacheableResult fields
+{
+	auto s = makeTestServer();
+	s.setListCacheHint("server/discover", CacheHint(30.seconds, CacheScope.private_));
+	auto resp = s.handle(draftReq(2, "server/discover")).get;
+	assert(resp["result"]["ttlMs"].get!long == 30_000);
+	assert(resp["result"]["cacheScope"].get!string == "private");
+}
+
+unittest  // server/discover with no configured hint emits the mandatory ttlMs:0 default
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(draftReq(2, "server/discover")).get;
+	assert(resp["result"]["ttlMs"].get!long == 0);
 }
 
 unittest  // per-resource registerResource hint emits ttlMs/cacheScope on a draft resources/read

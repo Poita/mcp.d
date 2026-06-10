@@ -275,6 +275,90 @@ The Streamable HTTP transport derives session minting purely from
 `server.mode` (`ServerMode.stateful` => mint and require `Mcp-Session-Id`;
 `ServerMode.stateless` => never). There is no separate `enableSessions` option.
 
+## Client response cache
+
+`McpClient` caches the six read-only operations the draft marks `CacheableResult`
+— `listTools`, `listResources`, `listResourceTemplates`, `listPrompts`,
+`readResource`, and `discover` — so a repeat call within the server's freshness
+window is served locally with **no round-trip**. `callTool` and `getPrompt` are
+never cached (the spec excludes them).
+
+**On by default, byte-identical when idle.** A client built via
+`McpClient.http`/`stdio`/`spawn` ships an in-memory store. Caching engages only
+when a result carries a positive `ttlMs` hint, so against pre-draft servers (or a
+draft server sending `ttlMs:0`) behaviour matches the uncached client exactly.
+The stored entry's lifetime is the server's `ttlMs`; its `cacheScope`
+(`public`/`private`) is recorded for shared backends.
+
+```d
+auto c = McpClient.http("https://server.example/mcp");
+c.connect();
+c.listTools();   // round-trips, then caches per the server's ttlMs
+c.listTools();   // served from cache — no request
+```
+
+**Configure via `ClientSettings`** (the per-client knobs you'd otherwise pass
+loose):
+
+```d
+ClientSettings s;
+s.cache = noCache;            // disable caching entirely
+s.cache = new MyRedisStore;   // or bring your own CacheStore (shared/persistent)
+s.defaultCacheTtl = 30.seconds; // cache even responses the server left unhinted
+auto c = McpClient.http(url, s);
+```
+
+A `CacheStore` is a small `get`/`put`/`invalidate`/`invalidateMethod`/
+`invalidatePartition`/`clear` interface; supply your own to pre-seed entries and
+skip round-trips, or share one across clients. The default `InMemoryCacheStore`
+is per-client and bounded by an LRU-style size cap. `client.setCache`,
+`setDefaultCacheTtl`, and `clearCache` adjust this at runtime; `cache()` exposes
+the live store for pre-seeding.
+
+**`public` vs `private` scope (shared caches).** The server's `cacheScope`
+controls *where* an entry is stored, which only matters when several clients
+share one backend. A `public` result lives under a shared key, so **every client
+hits the same entry** — the point of a shared cache. A `private` result is
+namespaced under the requesting client's `cachePartition` (a stable principal /
+tenant id you set in `ClientSettings`), so it is never served to another
+identity. The default per-client store leaves `cachePartition` empty and the
+distinction is moot.
+
+```d
+auto shared = new MyRedisStore;
+ClientSettings sa; sa.cache = shared; sa.cachePartition = "tenant-a";
+ClientSettings sb; sb.cache = shared; sb.cachePartition = "tenant-b";
+// a public listTools fetched by tenant-a is served to tenant-b with no round-trip;
+// a private readResource stays isolated to its tenant.
+```
+
+On `setBearerToken`, the client evicts only its **own** partition (the previous
+identity's `private` entries), sparing shared `public` entries and other
+principals' partitions; for the default per-client store that empty partition
+holds everything, so it behaves as a full clear.
+
+**Per-call modes** via `RequestOptions.cacheMode`:
+
+| Mode | Behaviour |
+| --- | --- |
+| `use` (default) | serve a fresh entry, else fetch and store |
+| `bypass` | ignore the cache for read and write — force the network, store nothing |
+| `refresh` | skip the read, force the network, then store the fresh result |
+
+```d
+RequestOptions o; o.cacheMode = CacheMode.refresh;
+c.listResources(o); // re-fetch and update the cached entry
+```
+
+**Automatic invalidation.** The server's change notifications evict the affected
+entries so the next call lazily refetches: `notifications/tools/list_changed`,
+`prompts/list_changed`, and `resources/list_changed` drop the matching list
+cache(s), and `resources/updated` drops just that URI's `readResource` entry. Each
+also fires a typed callback (`onToolsListChanged`, `onPromptsListChanged`,
+`onResourcesListChanged`, `onResourceUpdated(uri)`) in addition to the generic
+`onNotification`. `setBearerToken` evicts the client's own partition so a
+re-authenticated session never reads the previous identity's `private` results.
+
 ## Examples
 
 The repository ships thirteen runnable, self-verifying server/client pairs in

@@ -2,6 +2,7 @@ module mcp.client.client;
 
 import core.time : Duration, seconds, msecs;
 import std.algorithm : canFind, startsWith;
+import std.datetime : Clock, SysTime;
 import std.typecons : Nullable, nullable;
 
 import vibe.data.json : Json, parseJsonString, serializeToJson;
@@ -19,6 +20,7 @@ import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.http_transport : HttpClientTransport, LegacyFallbackException;
 import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
 import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
+import mcp.client.cache : CacheStore, InMemoryCacheStore, CacheKey, CacheEntry, noCache;
 
 /// A progress token attached to an outgoing request so the server may emit
 /// `notifications/progress` for it. Per basic/utilities/progress, "Progress
@@ -54,9 +56,25 @@ struct ProgressToken
 	}
 }
 
+/// How a cacheable request verb interacts with the client's response cache.
+/// Only meaningful on the six cacheable reads (`listTools`, `listResources`,
+/// `listResourceTemplates`, `listPrompts`, `readResource`, `discover`); ignored
+/// elsewhere.
+enum CacheMode
+{
+	/// Serve a fresh cached entry when present, otherwise fetch and store.
+	use,
+	/// Ignore the cache for both read and write: force the network and store
+	/// nothing (a one-off uncached fetch that leaves any existing entry intact).
+	bypass,
+	/// Skip the cache read but force the network and store the fresh result
+	/// (an unconditional revalidation).
+	refresh,
+}
+
 /// Per-request options shared by every `McpClient` request verb (`callTool`,
-/// `readResource`, `getPrompt`, `complete`). All fields are independently
-/// combinable and default to "unset":
+/// `readResource`, `getPrompt`, `complete`, and the cacheable list/discover
+/// verbs). All fields are independently combinable and default to "unset":
 ///
 /// - `progressToken`: attached as `params._meta.progressToken` so the server may
 ///   emit `notifications/progress` for the request (basic/utilities/progress).
@@ -68,11 +86,13 @@ struct ProgressToken
 ///   `progressToken` is given, the verb mints a unique token; for the duration
 ///   of the call, progress correlated to that token is routed here while
 ///   progress for other tokens still reaches the global `onProgress`.
+/// - `cacheMode`: per-call override of the response cache (default `use`).
 struct RequestOptions
 {
 	ProgressToken progressToken;
 	string logLevel;
 	void delegate(ProgressNotification) @safe onProgress;
+	CacheMode cacheMode = CacheMode.use;
 
 	/// Convenience factory for the dominant per-call case: route this request's
 	/// progress to `cb` (the verb mints a unique token), leaving `progressToken`
@@ -152,6 +172,31 @@ struct ClientSettings
 	/// cap above the round-trip nesting depth so an awaiting request POST and its
 	/// reply POST can both hold a permit.
 	uint maxInFlight = 0;
+
+	/// Response cache for the six cacheable reads (the four `*/list` verbs,
+	/// `resources/read`, and `server/discover`). `null` (the default) installs an
+	/// in-memory store, so caching is on by default — a repeat call within a
+	/// server's `ttlMs` hint is served locally with no round-trip. Assign your own
+	/// `CacheStore` to share or persist entries (and pre-seed them), or `noCache`
+	/// to disable caching entirely. Against pre-draft servers (or any response
+	/// with no hint) nothing is cached unless `defaultCacheTtl` is positive, so the
+	/// default-on behavior is byte-identical to the uncached client there.
+	CacheStore cache = null;
+
+	/// Fallback freshness applied to a cacheable result when the server attaches
+	/// no `ttlMs` hint (pre-draft servers, or a draft server that omits it). Zero
+	/// (the default) means "do not cache unhinted responses", preserving exact
+	/// pre-cache behavior; a positive value caches even unhinted responses for
+	/// this long. A server-supplied hint always takes precedence over this.
+	Duration defaultCacheTtl = Duration.zero;
+
+	/// This client's cache partition — a stable principal identifier (user / tenant
+	/// id) under which its `private`-scoped results are namespaced. Only relevant
+	/// when several clients share one `cache` backend: it keeps one principal's
+	/// `private` entries from being served to another, while `public` entries stay
+	/// shared (every client hits the same key). Empty (the default) treats the
+	/// store as per-client and is the right value for the default in-memory store.
+	string cachePartition = "";
 }
 
 /// A Model Context Protocol client, transport-agnostic.
@@ -249,6 +294,30 @@ final class McpClient : ClientProtocol
 	// elsewhere (e.g. `maxActive`, `idleTtl`). Set to 0 to disable the cap (the
 	// non-progress/cycle checks still apply).
 	size_t maxListPages_ = 1000;
+	// Response cache for the six cacheable reads. Never null after construction:
+	// the constructor installs an `InMemoryCacheStore` (caching on by default),
+	// and `setCache(null)` restores that default while `noCache` disables it. A
+	// cacheable verb consults this through `cachedFetch`, keying entries by method
+	// (and resource URI for `resources/read`); `dispatchNotification` evicts from
+	// it on the server's `*/list_changed` and `resources/updated` notifications.
+	private CacheStore cacheStore_;
+	// Fallback freshness used when a cacheable result carries no server `ttlMs`
+	// hint (pre-draft servers, or a draft server that omits it). Zero means
+	// "do not cache unhinted responses" (the default), so behavior against such
+	// servers matches the uncached client. A server hint always wins over this.
+	private Duration defaultCacheTtl_;
+	// This client's cache partition: the namespace under which its `private`-scoped
+	// cacheable results are stored, so a SHARED `cacheStore_` keeps one principal's
+	// private entries from being served to another. `public` results ignore it and
+	// live under the shared empty partition (every client hits the same key). Empty
+	// (the default) means the store is treated as per-client: public and private
+	// both land under "" and the distinction is moot.
+	private string cachePartition_;
+	// Clock seam behind the cache's freshness check: `cachedFetch` stamps an entry
+	// with `now_() + ttl` and treats it as a hit while `now_() < expiresAt`.
+	// Defaults to the wall clock; tests substitute a controllable clock to make
+	// expiry deterministic without sleeping.
+	private SysTime delegate() @safe now_;
 
 	/// Capabilities this client advertises at initialize. Treated as a baseline:
 	/// unless `autoAdvertiseCapabilities` is disabled, the capabilities actually
@@ -309,6 +378,25 @@ final class McpClient : ClientProtocol
 	/// the UI / display severity visually.
 	void delegate(LogMessageNotification n) @safe onLogMessage;
 
+	/// Fired on `notifications/tools/list_changed`, after the cached `tools/list`
+	/// entry is evicted (so a `listTools` from inside the callback refetches).
+	/// Delivered in addition to the generic `onNotification`.
+	void delegate() @safe onToolsListChanged;
+
+	/// Fired on `notifications/prompts/list_changed`, after the cached
+	/// `prompts/list` entry is evicted. In addition to `onNotification`.
+	void delegate() @safe onPromptsListChanged;
+
+	/// Fired on `notifications/resources/list_changed`, after the cached
+	/// `resources/list` and `resources/templates/list` entries are evicted. In
+	/// addition to `onNotification`.
+	void delegate() @safe onResourcesListChanged;
+
+	/// Fired on `notifications/resources/updated` with the changed resource `uri`,
+	/// after that URI's cached `resources/read` entry is evicted. In addition to
+	/// `onNotification`.
+	void delegate(string uri) @safe onResourceUpdated;
+
 	/// Construct over an explicit `ClientTransport`. The client installs its
 	/// inbound dispatcher (and, for the HTTP transport, the per-message header /
 	/// cancelled-response callbacks) on the transport.
@@ -317,6 +405,11 @@ final class McpClient : ClientProtocol
 	{
 		this.transport = transport;
 		this.clientInfo = clientInfo;
+		// Caching is on by default: install the in-memory store and the wall clock.
+		// Factories override the store from `ClientSettings`; `setCache`/
+		// `setDefaultCacheTtl`/`setCacheClock` adjust them at runtime.
+		cacheStore_ = new InMemoryCacheStore();
+		now_ = () @safe => Clock.currTime();
 		transport.setInboundHandler(&dispatchInbound);
 		// Hand the transport this client as its `ClientProtocol`: it pulls the
 		// protocol-derived request headers (`headersFor`) and the cancelled-response
@@ -324,6 +417,19 @@ final class McpClient : ClientProtocol
 		// schema-cache logic and the cancellation set stay here and no transport has
 		// to be a concrete type the client downcasts to.
 		transport.setProtocol(this);
+	}
+
+	/// Apply the cache-related `ClientSettings` to a freshly constructed client and
+	/// return it (for fluent use in the factories). A null `settings.cache` keeps
+	/// the constructor's default in-memory store; a non-null value (including
+	/// `noCache`) replaces it.
+	private McpClient applyCacheSettings(ClientSettings settings) @safe
+	{
+		if (settings.cache !is null)
+			cacheStore_ = settings.cache;
+		defaultCacheTtl_ = settings.defaultCacheTtl;
+		cachePartition_ = settings.cachePartition;
+		return this;
 	}
 
 	/// Build a client over the Streamable HTTP transport at `url`. `settings`
@@ -334,7 +440,7 @@ final class McpClient : ClientProtocol
 	{
 		auto transport = new HttpClientTransport(url, settings.maxInFlight);
 		transport.setConnectTimeout(settings.connectTimeout);
-		return new McpClient(transport, settings.clientInfo);
+		return (new McpClient(transport, settings.clientInfo)).applyCacheSettings(settings);
 	}
 
 	/// Build a client over the stdio transport, exchanging newline-delimited
@@ -346,7 +452,8 @@ final class McpClient : ClientProtocol
 	static McpClient stdio(string delegate() @safe readLine,
 			void delegate(string) @safe writeLine, ClientSettings settings = ClientSettings.init) @safe
 	{
-		return new McpClient(new StdioClientTransport(readLine, writeLine), settings.clientInfo);
+		return (new McpClient(new StdioClientTransport(readLine, writeLine), settings.clientInfo))
+			.applyCacheSettings(settings);
 	}
 
 	/// Launch an MCP server as a subprocess and build a client over its
@@ -357,7 +464,8 @@ final class McpClient : ClientProtocol
 	/// `settings.clientInfo` applies; the HTTP-only fields are ignored.
 	static McpClient spawn(string[] command, ClientSettings settings = ClientSettings.init) @safe
 	{
-		return new McpClient(spawnStdioTransport(command), settings.clientInfo);
+		return (new McpClient(spawnStdioTransport(command), settings.clientInfo))
+			.applyCacheSettings(settings);
 	}
 
 	/// Launch an MCP server binary that ships *next to this executable* and build a
@@ -419,10 +527,13 @@ final class McpClient : ClientProtocol
 	}
 
 	/// `server/discover` (draft): fetch the server's supported versions,
-	/// capabilities, and identity.
-	DiscoverResult discover() @safe
+	/// capabilities, and identity. `DiscoverResult` is a `CacheableResult`, so a
+	/// still-fresh response is served from the cache without a round-trip;
+	/// `opts.cacheMode` overrides.
+	DiscoverResult discover(RequestOptions opts = RequestOptions.init) @safe
 	{
-		return DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject));
+		return cachedFetch!DiscoverResult(CacheKey("server/discover", ""), opts.cacheMode,
+				() @safe => DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject)));
 	}
 
 	/// `server/discover` self-advertising draft framing, used by `connect()` to
@@ -462,6 +573,14 @@ final class McpClient : ClientProtocol
 	void setBearerToken(string token) @safe
 	{
 		transport.setBearerToken(token);
+		// The identity behind requests just changed; evict this client's own
+		// partition so a re-authenticated session cannot read the previous
+		// identity's `private` results. For the default per-client store the
+		// partition is "" and this drops every entry (the prior safety-net
+		// behavior); for a shared store it leaves the shared `public` entries and
+		// other principals' partitions intact.
+		if (cacheStore_ !is null)
+			cacheStore_.invalidatePartition(cachePartition_);
 	}
 
 	/// Perform the initialize handshake and send `notifications/initialized`.
@@ -684,23 +803,27 @@ final class McpClient : ClientProtocol
 	/// `tools/list`, following pagination cursors to completion. Returns the
 	/// drained `ListToolsResult`: `tools` aggregates every page's items,
 	/// `nextCursor` is null, and `cache` carries the first page's parsed draft
-	/// `CacheableResult` freshness hint (if any).
-	ListToolsResult listTools() @safe
+	/// `CacheableResult` freshness hint (if any). A still-fresh result is served
+	/// from the response cache without a round-trip; `opts.cacheMode` overrides.
+	ListToolsResult listTools(RequestOptions opts = RequestOptions.init) @safe
 	{
-		auto acc = drainList!ListToolsResult("tools/list",
-				(ref ListToolsResult a, ref ListToolsResult r) @safe {
-			a.tools ~= r.tools;
+		auto acc = cachedFetch!ListToolsResult(CacheKey("tools/list", ""), opts.cacheMode, () @safe {
+			auto a = drainList!ListToolsResult("tools/list",
+				(ref ListToolsResult x, ref ListToolsResult r) @safe {
+				x.tools ~= r.tools;
+			});
+			// On a draft session over HTTP (the x-mcp-header feature), the client MUST
+			// exclude from tools/list any tool whose inputSchema carries an invalid
+			// `x-mcp-header` annotation (draft server/tools #x-mcp-header). Validate each
+			// tool's schema; drop offenders (and skip caching them), keeping siblings.
+			// stdio / non-draft sessions MAY ignore x-mcp-header, so they are unaffected.
+			if (useModern)
+				a.tools = excludeInvalidHeaderTools(a.tools);
+			return a;
 		});
-		// On a draft session over HTTP (the x-mcp-header feature), the client MUST
-		// exclude from tools/list any tool whose inputSchema carries an invalid
-		// `x-mcp-header` annotation (draft server/tools #x-mcp-header). Validate each
-		// tool's schema; drop offenders (and skip caching them), keeping siblings.
-		// stdio / non-draft sessions MAY ignore x-mcp-header, so they are unaffected.
-		if (useModern)
-			acc.tools = excludeInvalidHeaderTools(acc.tools);
-		// Cache each tool's inputSchema so a subsequent tools/call can mirror any
-		// x-mcp-header-annotated arguments into Mcp-Param-{Name} headers (draft
-		// basic/transports, "Custom Headers from Tool Parameters").
+		// Refresh the x-mcp-header inputSchema cache from whatever we return — on a
+		// cache hit too, so the Mcp-Param-{Name} mirroring stays consistent with the
+		// served list even when it came from a pre-seeded store.
 		foreach (t; acc.tools)
 			cacheToolSchema(t.name, t.inputSchema);
 		return acc;
@@ -743,6 +866,143 @@ final class McpClient : ClientProtocol
 	{
 		if (name.length && inputSchema.type == Json.Type.object)
 			toolInputSchemas_[name] = inputSchema;
+	}
+
+	/// Replace the response cache backend. `store` may be your own `CacheStore`
+	/// (shared / persistent, optionally pre-seeded to skip round-trips) or
+	/// `noCache` to disable caching; passing `null` restores the default
+	/// in-memory store. Takes effect on the next cacheable call.
+	void setCache(CacheStore store) @safe
+	{
+		cacheStore_ = store is null ? new InMemoryCacheStore() : store;
+	}
+
+	/// The active response cache backend (never null), so callers can pre-seed or
+	/// inspect it.
+	CacheStore cache() @safe nothrow
+	{
+		return cacheStore_;
+	}
+
+	/// Set the fallback freshness applied when a cacheable result carries no
+	/// server `ttlMs` hint. Zero (the default) caches nothing unhinted.
+	void setDefaultCacheTtl(Duration ttl) @safe nothrow
+	{
+		defaultCacheTtl_ = ttl;
+	}
+
+	/// Set this client's cache partition — a stable principal id under which its
+	/// `private`-scoped results are namespaced in a shared `cache` backend (see
+	/// `ClientSettings.cachePartition`). Empty treats the store as per-client.
+	void setCachePartition(string partition) @safe nothrow
+	{
+		cachePartition_ = partition;
+	}
+
+	/// This client's cache partition (empty when unpartitioned / per-client).
+	string cachePartition() @safe nothrow
+	{
+		return cachePartition_;
+	}
+
+	/// Drop every cached response in the backing store — including, for a shared
+	/// store, other principals' entries. Prefer this only for a per-client store;
+	/// `setBearerToken` instead evicts just this client's own partition.
+	void clearCache() @safe
+	{
+		if (cacheStore_ !is null)
+			cacheStore_.clear();
+	}
+
+	/// Substitute the clock the cache uses to decide entry freshness. Intended for
+	/// tests, which advance a controllable clock to exercise TTL expiry without
+	/// sleeping; a null delegate restores the wall clock.
+	package void setCacheClock(SysTime delegate() @safe clock) @safe
+	{
+		now_ = clock is null ? () @safe => Clock.currTime() : clock;
+	}
+
+	/// The partition a `public` result is stored under (the shared empty
+	/// partition, so every client hits the same key) versus a `private` one (this
+	/// client's `cachePartition`, isolating it from other identities).
+	private CacheKey scopedKey(CacheKey logical, CacheScope scope_) @safe
+	{
+		return CacheKey(logical.method, logical.key,
+				scope_ == CacheScope.private_ ? cachePartition_ : "");
+	}
+
+	/// A still-fresh entry under `key`, or null if absent or expired.
+	private Nullable!CacheEntry freshEntry(CacheKey key) @safe
+	{
+		auto hit = cacheStore_.get(key);
+		if (!hit.isNull && now_() < hit.get.expiresAt)
+			return hit;
+		return Nullable!CacheEntry.init;
+	}
+
+	/// Run a cacheable read through the response cache. `logical` identifies the
+	/// entry (method, plus the resource URI for `resources/read`) with an empty
+	/// partition; the actual storage partition is chosen from the result's
+	/// `cacheScope`. `fetch` performs the live request and returns a result type
+	/// carrying a `.cache` freshness hint. `use` serves a still-fresh entry without
+	/// calling `fetch`; `bypass` skips the cache entirely (no read, no write);
+	/// `refresh` always fetches and re-stores. On a miss/refresh the result is
+	/// stored with an absolute expiry of `now + ttl` (the server hint, or
+	/// `defaultCacheTtl` when absent); a non-positive `ttl` stores nothing.
+	///
+	/// A `public` result lives under the shared empty partition (every client hits
+	/// the same key); a `private` result lives under this client's `cachePartition`
+	/// so a shared store never serves it to another identity. Because the scope is
+	/// only known after fetching, a read probes this client's own partition first
+	/// and then the shared one.
+	private R cachedFetch(R)(CacheKey logical, CacheMode mode, scope R delegate() @safe fetch) @safe
+	{
+		if (cacheStore_ is null || mode == CacheMode.bypass)
+			return fetch();
+		const sharedKey = scopedKey(logical, CacheScope.public_); // partition ""
+		const ownKey = CacheKey(logical.method, logical.key, cachePartition_);
+		if (mode == CacheMode.use)
+		{
+			auto own = freshEntry(ownKey);
+			if (!own.isNull)
+				return R.fromJson(own.get.value);
+			// A `public` entry lives under the shared partition; only probe it
+			// separately when this client is partitioned (otherwise ownKey == it).
+			if (cachePartition_.length)
+			{
+				auto shared_ = freshEntry(sharedKey);
+				if (!shared_.isNull)
+					return R.fromJson(shared_.get.value);
+			}
+		}
+		R result = fetch();
+		const ttl = result.cache.isNull ? defaultCacheTtl_ : result.cache.get.ttl;
+		if (ttl > Duration.zero)
+		{
+			const scope_ = result.cache.isNull ? CacheScope.public_ : result.cache.get.cacheScope;
+			const storeKey = scopedKey(logical, scope_);
+			cacheStore_.put(storeKey, CacheEntry(result.toJson(), now_() + ttl, scope_));
+			// If the scope flipped since a prior fetch, drop the now-stale entry
+			// that was stored under the other partition for this logical key.
+			const otherKey = (storeKey == ownKey) ? sharedKey : ownKey;
+			if (otherKey != storeKey)
+				cacheStore_.invalidate(otherKey);
+		}
+		else
+			invalidateLogical(logical.method, logical.key); // do-not-cache: drop any stale entry
+		return result;
+	}
+
+	/// Evict a logical cacheable entry from both this client's own partition and
+	/// the shared partition (the only two places a given client could have stored
+	/// it). Used on do-not-cache results and on the server's change notifications.
+	private void invalidateLogical(string method, string key) @safe
+	{
+		if (cacheStore_ is null)
+			return;
+		cacheStore_.invalidate(CacheKey(method, key, ""));
+		if (cachePartition_.length)
+			cacheStore_.invalidate(CacheKey(method, key, cachePartition_));
 	}
 
 	/// `tools/call`. Per-request `progressToken` / `logLevel` / `onProgress` are
@@ -1206,35 +1466,48 @@ final class McpClient : ClientProtocol
 
 	/// `resources/list`, auto-paginated. Returns the drained
 	/// `ListResourcesResult`: `resources` aggregates every page, `nextCursor` is
-	/// null, and `cache` carries the first page's parsed freshness hint.
-	ListResourcesResult listResources() @safe
+	/// null, and `cache` carries the first page's parsed freshness hint. A
+	/// still-fresh result is served from the cache; `opts.cacheMode` overrides.
+	ListResourcesResult listResources(RequestOptions opts = RequestOptions.init) @safe
 	{
-		return drainList!ListResourcesResult("resources/list",
+		return cachedFetch!ListResourcesResult(CacheKey("resources/list", ""),
+				opts.cacheMode, () @safe {
+			return drainList!ListResourcesResult("resources/list",
 				(ref ListResourcesResult a, ref ListResourcesResult r) @safe {
-			a.resources ~= r.resources;
+				a.resources ~= r.resources;
+			});
 		});
 	}
 
 	/// `resources/templates/list`, auto-paginated. Returns the drained
 	/// `ListResourceTemplatesResult` (URI templates clients can expand and
 	/// `resources/read`). `resourceTemplates` aggregates every page, `nextCursor`
-	/// is null, and `cache` carries the first page's parsed freshness hint.
-	ListResourceTemplatesResult listResourceTemplates() @safe
+	/// is null, and `cache` carries the first page's parsed freshness hint. A
+	/// still-fresh result is served from the cache; `opts.cacheMode` overrides.
+	ListResourceTemplatesResult listResourceTemplates(RequestOptions opts = RequestOptions.init) @safe
 	{
-		return drainList!ListResourceTemplatesResult("resources/templates/list",
+		return cachedFetch!ListResourceTemplatesResult(CacheKey("resources/templates/list",
+				""), opts.cacheMode, () @safe {
+			return drainList!ListResourceTemplatesResult("resources/templates/list",
 				(ref ListResourceTemplatesResult a, ref ListResourceTemplatesResult r) @safe {
-			a.resourceTemplates ~= r.resourceTemplates;
+				a.resourceTemplates ~= r.resourceTemplates;
+			});
 		});
 	}
 
 	/// `resources/read`. Per-request `progressToken` / `logLevel` / `onProgress`
-	/// are carried in `opts` (see `RequestOptions`).
+	/// are carried in `opts` (see `RequestOptions`). A still-fresh result (keyed by
+	/// `uri`) is served from the cache without a round-trip — and so fires no
+	/// progress callbacks; `opts.cacheMode` overrides.
 	ReadResourceResult readResource(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
-		auto token = effectiveToken(opts);
-		auto params = withRequestLogLevel(buildReadResourceParams(uri, token), opts.logLevel);
-		return withPerCallProgress!ReadResourceResult(opts,
+		return cachedFetch!ReadResourceResult(CacheKey("resources/read", uri),
+				opts.cacheMode, () @safe {
+			auto token = effectiveToken(opts);
+			auto params = withRequestLogLevel(buildReadResourceParams(uri, token), opts.logLevel);
+			return withPerCallProgress!ReadResourceResult(opts,
 				() @safe => ReadResourceResult.fromJson(rpc("resources/read", params)));
+		});
 	}
 
 	/// Build the `resources/read` params, optionally attaching a progress token.
@@ -1247,12 +1520,15 @@ final class McpClient : ClientProtocol
 
 	/// `prompts/list`, auto-paginated. Returns the drained `ListPromptsResult`:
 	/// `prompts` aggregates every page, `nextCursor` is null, and `cache` carries
-	/// the first page's parsed freshness hint.
-	ListPromptsResult listPrompts() @safe
+	/// the first page's parsed freshness hint. A still-fresh result is served from
+	/// the cache; `opts.cacheMode` overrides.
+	ListPromptsResult listPrompts(RequestOptions opts = RequestOptions.init) @safe
 	{
-		return drainList!ListPromptsResult("prompts/list",
+		return cachedFetch!ListPromptsResult(CacheKey("prompts/list", ""), opts.cacheMode, () @safe {
+			return drainList!ListPromptsResult("prompts/list",
 				(ref ListPromptsResult a, ref ListPromptsResult r) @safe {
-			a.prompts ~= r.prompts;
+				a.prompts ~= r.prompts;
+			});
 		});
 	}
 
@@ -1904,8 +2180,52 @@ final class McpClient : ClientProtocol
 		// in addition to the generic catch-all below.
 		if (method == "notifications/message" && onLogMessage !is null)
 			onLogMessage(LogMessageNotification.fromJson(params));
+		// Evict the cached reads the server says have changed (lazy refetch on the
+		// next call) and fire the matching typed change callback.
+		dispatchCacheInvalidation(method, params);
 		if (onNotification !is null)
 			onNotification(method, params);
+	}
+
+	/// React to the server's change notifications: evict the affected cached
+	/// response(s) so the next call repopulates from the network, and fire the
+	/// matching typed callback (in addition to the generic `onNotification`).
+	/// Eviction happens whether or not a callback is installed.
+	private void dispatchCacheInvalidation(string method, Json params) @safe
+	{
+		switch (method)
+		{
+		case "notifications/tools/list_changed":
+			invalidateLogical("tools/list", "");
+			if (onToolsListChanged !is null)
+				onToolsListChanged();
+			break;
+		case "notifications/prompts/list_changed":
+			invalidateLogical("prompts/list", "");
+			if (onPromptsListChanged !is null)
+				onPromptsListChanged();
+			break;
+		case "notifications/resources/list_changed":
+			// The draft has no separate templates/list_changed; a resource-set change
+			// can move templates too, so drop both resource list caches.
+			invalidateLogical("resources/list", "");
+			invalidateLogical("resources/templates/list", "");
+			if (onResourcesListChanged !is null)
+				onResourcesListChanged();
+			break;
+		case "notifications/resources/updated":
+			if (params.type == Json.Type.object && "uri" in params
+					&& params["uri"].type == Json.Type.string)
+			{
+				const uri = params["uri"].get!string;
+				invalidateLogical("resources/read", uri);
+				if (onResourceUpdated !is null)
+					onResourceUpdated(uri);
+			}
+			break;
+		default:
+			break;
+		}
 	}
 
 	/// Dispatch an inbound message handed up by the transport: server->
@@ -4563,6 +4883,323 @@ unittest  // a list result exposes .cache from the first page's freshness hint
 	assert(!res.cache.isNull);
 	assert(res.cache.get.ttl == 5.seconds);
 	assert(res.cache.get.cacheScope == CacheScope.public_);
+}
+
+version (unittest)
+{
+	// A `tools/list` responder that counts how many times it actually reached the
+	// "wire" (via `onRpcForTest`) and returns an empty list carrying `ttlMs`.
+	private McpClient cachingTestClient(string method, long ttlMs, ref int calls) @safe
+	{
+		auto c = McpClient.http("http://localhost");
+		c.onRpcForTest = (string m, Json p) @safe {
+			Json r = Json.emptyObject;
+			if (m == method)
+			{
+				calls++;
+				if (method == "tools/list")
+					r["tools"] = Json.emptyArray;
+				else if (method == "prompts/list")
+					r["prompts"] = Json.emptyArray;
+			}
+			if (ttlMs >= 0)
+				r["ttlMs"] = ttlMs;
+			return r;
+		};
+		return c;
+	}
+}
+
+unittest  // a cacheable list is served from cache on the second call (no second RPC)
+{
+	int calls;
+	auto c = cachingTestClient("tools/list", 5000, calls);
+	c.listTools();
+	c.listTools();
+	assert(calls == 1, "second listTools must be served from the cache");
+}
+
+unittest  // cacheMode.bypass forces the network and stores nothing
+{
+	int calls;
+	auto c = cachingTestClient("tools/list", 5000, calls);
+	RequestOptions opts;
+	opts.cacheMode = CacheMode.bypass;
+	c.listTools(opts); // network, no store (calls == 1)
+	c.listTools(); // cache still empty -> network + store (calls == 2)
+	c.listTools(); // now a hit (calls == 2)
+	assert(calls == 2, "bypass must not populate the cache");
+}
+
+unittest  // cacheMode.refresh always refetches and replaces the entry
+{
+	int calls;
+	auto c = cachingTestClient("tools/list", 5000, calls);
+	c.listTools(); // miss -> store (calls == 1)
+	c.listTools(); // hit (calls == 1)
+	RequestOptions opts;
+	opts.cacheMode = CacheMode.refresh;
+	c.listTools(opts); // forced refetch + store (calls == 2)
+	c.listTools(); // hit on the refreshed entry (calls == 2)
+	assert(calls == 2);
+}
+
+unittest  // a ttlMs:0 (do-not-cache) result is never cached
+{
+	int calls;
+	auto c = cachingTestClient("tools/list", 0, calls);
+	c.listTools();
+	c.listTools();
+	assert(calls == 2, "ttlMs:0 must not be cached");
+}
+
+unittest  // with no server hint and zero defaultCacheTtl nothing is cached
+{
+	int calls;
+	auto c = cachingTestClient("tools/list", -1, calls); // -1 => omit ttlMs
+	c.listTools();
+	c.listTools();
+	assert(calls == 2);
+}
+
+unittest  // defaultCacheTtl caches a response that carries no server hint
+{
+	import core.time : seconds;
+
+	int calls;
+	auto c = cachingTestClient("tools/list", -1, calls); // no ttlMs on the wire
+	c.setDefaultCacheTtl(60.seconds);
+	c.listTools();
+	c.listTools();
+	assert(calls == 1, "unhinted response cached under defaultCacheTtl");
+}
+
+unittest  // an expired cache entry triggers a refetch
+{
+	import std.datetime : SysTime, DateTime;
+	import core.time : seconds;
+
+	int calls;
+	auto c = cachingTestClient("tools/list", 5000, calls);
+	auto clock = SysTime(DateTime(2026, 1, 1, 0, 0, 0));
+	c.setCacheClock(() @safe => clock);
+	c.listTools(); // miss -> expires at clock + 5s (calls == 1)
+	c.listTools(); // still fresh -> hit (calls == 1)
+	assert(calls == 1);
+	clock += 6.seconds; // past expiry
+	c.listTools(); // expired -> refetch (calls == 2)
+	assert(calls == 2);
+}
+
+unittest  // setCache(noCache) disables caching entirely
+{
+	int calls;
+	auto c = cachingTestClient("tools/list", 5000, calls);
+	c.setCache(noCache());
+	c.listTools();
+	c.listTools();
+	assert(calls == 2);
+}
+
+unittest  // readResource caches independently per URI
+{
+	auto c = McpClient.http("http://localhost");
+	int calls;
+	c.onRpcForTest = (string m, Json p) @safe {
+		Json r = Json.emptyObject;
+		if (m == "resources/read")
+		{
+			calls++;
+			Json arr = Json.emptyArray;
+			arr ~= ResourceContents.makeText("test://x", "text/plain", "hi").toJson();
+			r["contents"] = arr;
+			r["ttlMs"] = 5000;
+		}
+		return r;
+	};
+	c.readResource("a"); // miss (calls == 1)
+	c.readResource("a"); // hit (calls == 1)
+	c.readResource("b"); // different URI -> miss (calls == 2)
+	assert(calls == 2);
+}
+
+unittest  // discover caches the server/discover response
+{
+	auto c = McpClient.http("http://localhost");
+	int calls;
+	c.onRpcForTest = (string m, Json p) @safe {
+		Json r = Json.emptyObject;
+		if (m == "server/discover")
+		{
+			calls++;
+			r["supportedVersions"] = Json.emptyArray;
+			r["ttlMs"] = 5000;
+		}
+		return r;
+	};
+	c.discover();
+	c.discover();
+	assert(calls == 1);
+}
+
+unittest  // tools/list_changed evicts the cached list and fires the typed callback
+{
+	int calls;
+	bool fired;
+	auto c = cachingTestClient("tools/list", 5000, calls);
+	c.onToolsListChanged = () @safe { fired = true; };
+	c.listTools(); // cached (calls == 1)
+	c.listTools(); // hit (calls == 1)
+	c.dispatchNotification("notifications/tools/list_changed", Json.emptyObject);
+	assert(fired, "typed callback must fire");
+	c.listTools(); // evicted -> refetch (calls == 2)
+	assert(calls == 2);
+}
+
+unittest  // resources/updated evicts only the named resource
+{
+	auto c = McpClient.http("http://localhost");
+	int calls;
+	string updated;
+	c.onResourceUpdated = (string uri) @safe { updated = uri; };
+	c.onRpcForTest = (string m, Json p) @safe {
+		Json r = Json.emptyObject;
+		if (m == "resources/read")
+		{
+			calls++;
+			Json arr = Json.emptyArray;
+			arr ~= ResourceContents.makeText("test://x", "text/plain", "hi").toJson();
+			r["contents"] = arr;
+			r["ttlMs"] = 5000;
+		}
+		return r;
+	};
+	c.readResource("a"); // calls == 1
+	c.readResource("b"); // calls == 2
+	Json p = Json.emptyObject;
+	p["uri"] = "a";
+	c.dispatchNotification("notifications/resources/updated", p);
+	assert(updated == "a");
+	c.readResource("a"); // evicted -> refetch (calls == 3)
+	c.readResource("b"); // still cached (calls == 3)
+	assert(calls == 3);
+}
+
+unittest  // resources/list_changed evicts both the resources list and the templates list
+{
+	auto c = McpClient.http("http://localhost");
+	int listCalls, tmplCalls;
+	bool fired;
+	c.onResourcesListChanged = () @safe { fired = true; };
+	c.onRpcForTest = (string m, Json p) @safe {
+		Json r = Json.emptyObject;
+		r["ttlMs"] = 5000;
+		if (m == "resources/list")
+		{
+			listCalls++;
+			r["resources"] = Json.emptyArray;
+		}
+		else if (m == "resources/templates/list")
+		{
+			tmplCalls++;
+			r["resourceTemplates"] = Json.emptyArray;
+		}
+		return r;
+	};
+	c.listResources();
+	c.listResourceTemplates(); // both cached (1, 1)
+	c.listResources();
+	c.listResourceTemplates(); // both hits (1, 1)
+	assert(listCalls == 1 && tmplCalls == 1);
+	c.dispatchNotification("notifications/resources/list_changed", Json.emptyObject);
+	assert(fired);
+	c.listResources();
+	c.listResourceTemplates(); // both refetch (2, 2)
+	assert(listCalls == 2 && tmplCalls == 2);
+}
+
+unittest  // setBearerToken clears the response cache (no cross-identity leakage)
+{
+	int calls;
+	auto c = cachingTestClient("tools/list", 5000, calls);
+	c.listTools(); // cached (calls == 1)
+	c.setBearerToken("new-token"); // must clear the cache
+	c.listTools(); // refetch (calls == 2)
+	assert(calls == 2);
+}
+
+version (unittest)
+{
+	// A `tools/list` client over a SHARED store, bound to `partition`, whose
+	// canned response declares the given `cacheScope` and counts its wire hits.
+	private McpClient sharedCacheClient(CacheStore store, string partition,
+			string cacheScope, ref int calls) @safe
+	{
+		ClientSettings s;
+		s.cache = store;
+		s.cachePartition = partition;
+		auto c = McpClient.http("http://localhost", s);
+		c.onRpcForTest = (string m, Json p) @safe {
+			Json r = Json.emptyObject;
+			if (m == "tools/list")
+			{
+				calls++;
+				r["tools"] = Json.emptyArray;
+			}
+			r["ttlMs"] = 5000;
+			r["cacheScope"] = cacheScope;
+			return r;
+		};
+		return c;
+	}
+}
+
+unittest  // a public result in a shared store is hit by every partition (one fetch total)
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	auto a = sharedCacheClient(store, "alice", "public", aCalls);
+	auto b = sharedCacheClient(store, "bob", "public", bCalls);
+	a.listTools(); // fetch -> stored under the shared partition (aCalls == 1)
+	b.listTools(); // bob probes own (miss) then shared (hit) -> bCalls == 0
+	assert(aCalls == 1 && bCalls == 0, "public entry must be shared across partitions");
+}
+
+unittest  // a private result in a shared store is isolated per partition
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	auto a = sharedCacheClient(store, "alice", "private", aCalls);
+	auto b = sharedCacheClient(store, "bob", "private", bCalls);
+	a.listTools(); // stored under "alice" (aCalls == 1)
+	b.listTools(); // bob sees neither own nor shared -> fetches (bCalls == 1)
+	a.listTools(); // alice hits its own private entry (aCalls still 1)
+	assert(aCalls == 1 && bCalls == 1, "private entries must not cross partitions");
+}
+
+unittest  // setBearerToken evicts only the caller's partition in a shared store
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	auto a = sharedCacheClient(store, "alice", "private", aCalls);
+	auto b = sharedCacheClient(store, "bob", "private", bCalls);
+	a.listTools(); // under "alice" (aCalls == 1)
+	b.listTools(); // under "bob" (bCalls == 1)
+	a.setBearerToken("rotated"); // evict only partition "alice"
+	a.listTools(); // alice gone -> refetch (aCalls == 2)
+	b.listTools(); // bob untouched -> still a hit (bCalls == 1)
+	assert(aCalls == 2 && bCalls == 1);
+}
+
+unittest  // a partitioned client's setBearerToken spares shared public entries
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls;
+	auto a = sharedCacheClient(store, "alice", "public", aCalls);
+	a.listTools(); // stored under the shared partition (aCalls == 1)
+	a.setBearerToken("rotated"); // evicts partition "alice", not the shared ""
+	a.listTools(); // shared public entry still fresh -> hit (aCalls == 1)
+	assert(aCalls == 1, "public entries survive an own-partition eviction");
 }
 
 version (unittest)
