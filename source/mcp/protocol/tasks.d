@@ -259,8 +259,8 @@ unittest  // makeCreateTaskResult tags the seed task with resultType "task"
 unittest  // isCreateTaskResult recognizes a task handle by its resultType discriminator
 {
 	assert(isCreateTaskResult(Json([
-				"resultType": Json("task"),
-				"taskId": Json("x")
+		"resultType": Json("task"),
+		"taskId": Json("x")
 	])));
 	assert(!isCreateTaskResult(Json(["resultType": Json("complete")])));
 	assert(!isCreateTaskResult(Json(["content": Json.emptyArray])));
