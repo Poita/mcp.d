@@ -111,9 +111,11 @@ Then `import mcp;` in your source files.
   HTTPS-URL `client_id` when the AS supports it; the **server-side OAuth proxy** opts in via
   `OAuthProxyConfig.clientIdMetadataDocumentSupported`, advertising
   `client_id_metadata_document_supported`, then fetching (SSRF-guarded, size-capped) and
-  validating the hosted document at `/authorize` — exact `client_id` match, required fields,
-  and a redirect-URI allowlist sourced from the document — with confused-deputy consent keyed
-  on the stable `client_id` URL. DCR remains as the deprecated fallback.
+  validating the hosted document at `/authorize` — exact `client_id` match, required fields
+  (`client_id`, `client_name`, `redirect_uris`), and a redirect-URI allowlist sourced from the
+  document — with confused-deputy consent keyed on the stable `client_id` URL. The consent
+  screen surfaces the verified `client_name` and the redirect-URI hostname. DCR remains as the
+  deprecated fallback.
 
 Optional follow-ups (not required for conformance): a built-in loopback redirect listener for
 the interactive auth-code flow, and a localhost-redirect impersonation warning on the proxy's
