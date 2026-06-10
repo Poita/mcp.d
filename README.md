@@ -371,6 +371,25 @@ and `tc.detach(...)` leaves it `working` for `onDeployFinished` to complete out 
 band via `rt.complete` / `rt.fail` — no fiber held, so it works on any node. See
 [`examples/tasks`](examples/tasks/) for cancellation, durable stores, and the client side.
 
+On the client, `callToolAwait` hides the whole flow — it drives the poll loop and
+returns the final `CallToolResult`, so task and non-task tools look identical. When
+you need to survive a restart, call plain `callTool` instead: if the server made a
+task the result is the handle (`result.isTask`, with the seed `Task` in
+`result.task`). Persist `result.task.taskId`, then resume any time — even in a fresh
+process — with `awaitTask(taskId)`, which polls to completion (and surfaces mid-task
+input requests to an optional callback).
+
+```d
+auto r = client.callTool("deploy", args);   // sync or task — you needn't know
+if (r.isTask)
+{
+    store.save(r.task.taskId);               // durable handle; survives a restart
+    auto done = client.awaitTask(r.task.taskId);
+}
+else
+    use(r);                                  // synchronous tool, nothing to resume
+```
+
 > **Not supported: the experimental 2025-11-25 tasks.** The `tasks` feature that
 > shipped in the 2025-11-25 core specification (a top-level `tasks` capability,
 > `tasks/list`, `tasks/result`, the per-tool `execution.taskSupport` field, and
