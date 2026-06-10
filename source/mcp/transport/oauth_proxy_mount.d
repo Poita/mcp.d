@@ -263,52 +263,69 @@ private string mintState() @safe
 /// metadata it publishes.
 void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 {
-	auto cfg = proxy.config();
 	auto store = new ProxyStateStore;
+	mountOAuthMetadata(router, proxy);
+	mountOAuthRegister(router, proxy);
+	mountOAuthAuthorize(router, proxy, store);
+	mountOAuthConsent(router, proxy, store);
+	mountOAuthCallback(router, proxy, store);
+	mountOAuthToken(router, proxy);
+}
 
-	const authorizePath = pathOf(cfg.authorizeEndpoint());
-	const tokenPath = pathOf(cfg.tokenEndpoint());
-	const registerPath = pathOf(cfg.registrationEndpoint());
-	const callbackPath = cfg.redirectPath;
-	const consentPath = pathOf(cfg.consentEndpoint());
-	const upstreamTokenEndpoint = cfg.upstreamTokenEndpoint;
-
-	// RFC 8414 Authorization Server Metadata (the proxy advertises ITSELF as the
-	// AS, so this lives at the proxy's own well-known path).
+/// Mount the RFC 8414 Authorization Server Metadata and RFC 9728 Protected
+/// Resource Metadata well-known documents. The proxy advertises ITSELF as the
+/// AS, so these live at the proxy's own well-known paths.
+void mountOAuthMetadata(URLRouter router, OAuthProxy proxy) @safe
+{
 	router.get("/.well-known/oauth-authorization-server",
 			(HTTPServerRequest req, HTTPServerResponse res) @safe {
 		res.statusCode = HTTPStatus.ok;
 		res.writeJsonBody(proxy.metadataJson());
 	});
 
-	// RFC 9728 Protected Resource Metadata.
 	router.get("/.well-known/oauth-protected-resource", (HTTPServerRequest req,
 			HTTPServerResponse res) @safe {
 		res.statusCode = HTTPStatus.ok;
 		res.writeJsonBody(proxy.resourceMetadata().toJson());
 	});
+}
 
-	// RFC 7591 Dynamic Client Registration: echo the requested redirect_uris and
-	// hand back the fixed upstream client_id (public PKCE client).
+/// Mount the RFC 7591 Dynamic Client Registration endpoint: echo the requested
+/// redirect_uris and hand back the fixed upstream client_id (public PKCE client).
+void mountOAuthRegister(URLRouter router, OAuthProxy proxy) @safe
+{
+	const registerPath = pathOf(proxy.config().registrationEndpoint());
 	router.post(registerPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		auto body_ = readJsonBody(req);
 		const uris = redirectUrisFrom(body_);
 		res.statusCode = HTTPStatus.created;
 		res.writeJsonBody(proxy.register(uris));
 	});
+}
 
-	// /authorize: persist the client's dynamic redirect_uri + state (and PKCE
-	// code_challenge + scope) under a fresh proxy state, then forward to the
-	// upstream authorization endpoint with the client's PKCE code_challenge
-	// (transparent PKCE) — BUT ONLY after the confused-deputy consent gate.
-	//
-	// Because every dynamically-registered client receives the SAME fixed upstream
-	// client_id, the upstream may auto-skip its own consent screen. The MCP
-	// authorization spec therefore requires the proxy to obtain user consent for
-	// EACH dynamically-registered client (identified by its redirect_uri) before
-	// forwarding upstream. The gated `proxy.authorize` throws
-	// `ConsentRequiredException` for an un-consented client; we then render the
-	// proxy's own consent screen instead of forwarding.
+/// Mount the `/authorize` endpoint: persist the client's dynamic redirect_uri +
+/// state (and PKCE code_challenge + scope) under a fresh proxy state in `store`,
+/// then forward to the upstream authorization endpoint with the client's PKCE
+/// code_challenge (transparent PKCE) — BUT ONLY after the confused-deputy consent
+/// gate.
+///
+/// Because every dynamically-registered client receives the SAME fixed upstream
+/// client_id, the upstream may auto-skip its own consent screen. The MCP
+/// authorization spec therefore requires the proxy to obtain user consent for
+/// EACH dynamically-registered client (identified by its redirect_uri) before
+/// forwarding upstream. The gated `proxy.authorize` throws
+/// `ConsentRequiredException` for an un-consented client; the handler then renders
+/// the proxy's own consent screen instead of forwarding.
+///
+/// The `store` MUST be shared with `mountOAuthConsent` and `mountOAuthCallback`
+/// so the consent approval and the upstream callback can read back the pending
+/// authorization this leg wrote.
+void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore store) @safe
+{
+	auto cfg = proxy.config();
+	const authorizePath = pathOf(cfg.authorizeEndpoint());
+	const consentPath = pathOf(cfg.consentEndpoint());
+
 	router.get(authorizePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const codeChallenge = req.query.get("code_challenge", "");
 		const codeChallengeMethod = req.query.get("code_challenge_method", "");
@@ -368,17 +385,24 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 				proxyState), "text/html; charset=utf-8");
 		}
 	});
+}
 
-	// /consent: the confused-deputy consent-approval action. The user reaches this
-	// from the consent screen; it records consent for the pending client (keyed by
-	// its redirect_uri) and resumes the upstream authorize redirect with the stored
-	// PKCE code_challenge + scope. The pending entry is re-stored under the same
-	// proxy state so the eventual upstream callback can still relay the code.
-	//
-	// Registered as POST (not GET): granting consent is a state change, so it is
-	// driven by the consent screen's form submission. A GET cannot trigger it, which
-	// keeps link prefetch/preload from auto-firing the grant and keeps the opaque
-	// proxy state out of the URL (no Referer/history/log leakage).
+/// Mount the `/consent` endpoint: the confused-deputy consent-approval action.
+/// The user reaches this from the consent screen; it records consent for the
+/// pending client (keyed by its redirect_uri) and resumes the upstream authorize
+/// redirect with the stored PKCE code_challenge + scope. The pending entry is
+/// re-stored under the same proxy state so the eventual upstream callback can
+/// still relay the code.
+///
+/// Registered as POST (not GET): granting consent is a state change, so it is
+/// driven by the consent screen's form submission. A GET cannot trigger it, which
+/// keeps link prefetch/preload from auto-firing the grant and keeps the opaque
+/// proxy state out of the URL (no Referer/history/log leakage).
+///
+/// The `store` MUST be the one `mountOAuthAuthorize` writes to.
+void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store) @safe
+{
+	const consentPath = pathOf(proxy.config().consentEndpoint());
 	router.post(consentPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const form = readFormString(req);
 		const proxyState = formField(form, "state");
@@ -407,9 +431,16 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 			st.codeChallenge, st.scope_, proxyState);
 		res.redirect(location, HTTPStatus.found);
 	});
+}
 
-	// The fixed upstream callback: look up the client's redirect_uri by the proxy
-	// state and relay the upstream code straight back to the client.
+/// Mount the fixed upstream callback path: look up the client's redirect_uri by
+/// the proxy state in `store` and relay the upstream code straight back to the
+/// client.
+///
+/// The `store` MUST be the one `mountOAuthAuthorize` writes to.
+void mountOAuthCallback(URLRouter router, OAuthProxy proxy, ProxyStateStore store) @safe
+{
+	const callbackPath = proxy.config().redirectPath;
 	router.get(callbackPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const code = req.query.get("code", "");
 		const upstreamError = req.query.get("error", "");
@@ -437,10 +468,21 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 		const location = buildClientCallbackRedirect(st.clientRedirectUri, code, st.clientState);
 		res.redirect(location, HTTPStatus.found);
 	});
+}
 
-	// /token: exchange the relayed code + the client's code_verifier at the
-	// upstream token endpoint with the fixed credentials, relaying the upstream
-	// token response back to the client.
+/// Mount the `/token` endpoint: exchange the relayed code + the client's
+/// code_verifier (or a relayed refresh_token) at the upstream token endpoint with
+/// the fixed credentials, relaying the upstream token response back to the client.
+///
+/// An integrator building a spec-compliant token broker can skip this leg and
+/// register their own `/token`, reusing `exchangeUpstream` for the SSRF-pinned
+/// upstream call.
+void mountOAuthToken(URLRouter router, OAuthProxy proxy) @safe
+{
+	auto cfg = proxy.config();
+	const tokenPath = pathOf(cfg.tokenEndpoint());
+	const upstreamTokenEndpoint = cfg.upstreamTokenEndpoint;
+
 	router.post(tokenPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const form = readFormString(req);
 		// Branch on the OAuth grant the client requests. The proxy advertises both
@@ -527,18 +569,23 @@ private string formField(string form, string name) @safe
 	return "";
 }
 
-private void exchangeUpstream(string endpoint, string body_, string authHeader,
+/// Exchange a form-encoded body at the upstream token endpoint, returning the
+/// upstream response body and status. The connect is pinned to a pre-vetted
+/// resolved address (DNS-rebinding mitigation) and refuses an insecure transport
+/// (must be https, or http to a loopback host for dev) or an internal/link-local
+/// address, so the upstream credentials cannot be steered to a rebinding-chosen
+/// internal target. An integrator overriding `/token` can reuse this for the
+/// SSRF-pinned upstream call.
+void exchangeUpstream(string endpoint, string body_, string authHeader,
 		out string responseBody, out int status) @trusted
 {
 	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 	import vibe.stream.operations : readAllUTF8;
 	import mcp.auth.oauth : secureRequestHTTP;
 
-	// Refuse to exchange over an insecure transport (must be https, or http to a
-	// loopback host for dev) or against an internal/link-local address. The connect
-	// is pinned to a pre-vetted resolved address (DNS-rebinding mitigation);
-	// secureRequestHTTP throws on an unsafe or unresolvable host, so the upstream
-	// client_secret cannot be steered to a rebinding-chosen internal target.
+	// secureRequestHTTP throws on an unsafe or unresolvable host and pins the
+	// connect to the pre-vetted resolved address, so the upstream client_secret
+	// cannot be steered to a rebinding-chosen internal target.
 	int st = 502;
 	string rb;
 	secureRequestHTTP(endpoint, (scope HTTPClientRequest creq) {
@@ -1274,4 +1321,167 @@ unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent 
 	assert(res2.statusCode == 400, "expected 400 for evicted redirect_uri");
 	const body2 = () @trusted { return cast(string) sink2.data; }();
 	assert(body2.canFind("invalid_request"), "expected invalid_request error body");
+}
+
+version (unittest)
+{
+	private OAuthProxy mountSampleProxy() @safe
+	{
+		OAuthProxyConfig cfg;
+		cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+		cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+		cfg.upstreamClientId = "Iv1.upstream";
+		cfg.upstreamClientSecret = "secret";
+		cfg.baseUrl = "https://mcp.example.com";
+		cfg.resource = "https://mcp.example.com/mcp";
+		cfg.scopesSupported = ["read:user"];
+		return new OAuthProxy(cfg);
+	}
+}
+
+unittest  // COMPOSE: the per-route helpers reproduce the AS-metadata leg
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthMetadata(router, proxy);
+
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(
+			URL("https://mcp.example.com/.well-known/oauth-authorization-server"));
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	import std.algorithm : canFind;
+
+	assert(res.statusCode == 200);
+	assert(body_.canFind("authorization_endpoint"));
+}
+
+unittest  // COMPOSE: the per-route helpers reproduce the /register leg
+{
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthRegister(router, proxy);
+
+	auto formBody = () @trusted {
+		return cast(ubyte[]) `{"redirect_uris":["http://localhost:5000/cb"]}`.dup;
+	}();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
+			HTTPMethod.POST, createMemoryStream(formBody, false));
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	import std.algorithm : canFind;
+
+	assert(res.statusCode == 201);
+	assert(body_.canFind("Iv1.upstream"));
+}
+
+unittest  // COMPOSE: the authorize/consent/callback legs share a state store and round-trip end to end
+{
+	import std.algorithm : canFind, startsWith;
+	import std.string : indexOf;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto proxy = mountSampleProxy();
+	proxy.register(["http://localhost:5000/cb"]);
+
+	// Compose only the authorize-consent-callback legs from the per-route helpers,
+	// threading a single shared store between them (no monolithic mount).
+	auto router = new URLRouter;
+	auto store = new ProxyStateStore;
+	mountOAuthAuthorize(router, proxy, store);
+	mountOAuthConsent(router, proxy, store);
+	mountOAuthCallback(router, proxy, store);
+
+	// /authorize renders the consent screen and stashes pending auth under a state.
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	const html = () @trusted { return cast(string) sink.data; }();
+	assert(html.canFind("Authorize application"));
+
+	const stateMark = `name="state" value="`;
+	const hi = html.indexOf(stateMark);
+	assert(hi >= 0);
+	const rest = html[hi + stateMark.length .. $];
+	const proxyState = rest[0 .. rest.indexOf('"')];
+
+	// POST /consent grants consent and 302s upstream (proving the consent leg sees
+	// the SAME store the authorize leg wrote to).
+	auto res2 = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
+	auto formBody = () @trusted { return cast(ubyte[])("state=" ~ proxyState).dup; }();
+	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/consent"),
+			HTTPMethod.POST, createMemoryStream(formBody, false));
+	req2.headers["Content-Type"] = "application/x-www-form-urlencoded";
+	router.handleRequest(req2, res2);
+	assert(res2.statusCode == 302);
+	assert(res2.headers["Location"].startsWith("https://github.com/login/oauth/authorize?"));
+}
+
+unittest  // COMPOSE: an integrator's own /token wins without route-ordering shadowing
+{
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+
+	// The integrator mounts the proxy's non-token legs plus their OWN /token, with
+	// no proxy /token registered at all — so there is no shadowing to rely on.
+	mountOAuthMetadata(router, proxy);
+	mountOAuthRegister(router, proxy);
+	router.post("/token", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.statusCode = HTTPStatus.ok;
+		res.writeBody(`{"custom_broker":true}`, "application/json");
+	});
+
+	auto formBody = () @trusted {
+		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
+	}();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
+			HTTPMethod.POST, createMemoryStream(formBody, false));
+	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	import std.algorithm : canFind;
+
+	assert(res.statusCode == 200);
+	assert(body_.canFind("custom_broker"));
+}
+
+unittest  // exchangeUpstream is public so an overriding /token can reuse the SSRF-pinned path
+{
+	import std.exception : assertThrown;
+
+	// The promoted helper keeps its transport-security guard: a plaintext
+	// non-loopback endpoint is still refused.
+	string rb;
+	int st;
+	assertThrown(exchangeUpstream("http://upstream.example.com/token", "grant_type=x", "", rb, st));
 }
