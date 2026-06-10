@@ -336,6 +336,11 @@ struct DiscoverResult
 	ServerCapabilities capabilities;
 	Implementation serverInfo;
 	Nullable!string instructions;
+	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`):
+	/// `DiscoverResult extends CacheableResult` in the draft schema, so a client
+	/// may cache the discovery response. Round-trips symmetrically; the server
+	/// sets it (draft-gated), leaving pre-draft wire output unchanged.
+	Nullable!CacheHint cache;
 
 	Json toJson() const @safe
 	{
@@ -353,6 +358,8 @@ struct DiscoverResult
 		j["serverInfo"] = serverInfo.toJson();
 		if (!instructions.isNull)
 			j["instructions"] = instructions.get;
+		if (!cache.isNull)
+			j = withCache(j, cache.get);
 		return j;
 	}
 
@@ -374,8 +381,35 @@ struct DiscoverResult
 		if ("serverInfo" in j)
 			r.serverInfo = Implementation.fromJson(j["serverInfo"]);
 		tryGet(j, "instructions", r.instructions);
+		r.cache = parseCacheHint(j);
 		return r;
 	}
+}
+
+@safe unittest  // DiscoverResult round-trips the CacheableResult freshness hint
+{
+	import core.time : msecs;
+
+	DiscoverResult r;
+	r.protocolVersions = ["2026-07-28"];
+	r.cache = CacheHint(60_000.msecs, CacheScope.private_);
+	auto j = r.toJson();
+	assert(j["ttlMs"].get!long == 60_000);
+	assert(j["cacheScope"].get!string == "private");
+	auto back = DiscoverResult.fromJson(j);
+	assert(!back.cache.isNull);
+	assert(back.cache.get.ttl == 60_000.msecs);
+	assert(back.cache.get.cacheScope == CacheScope.private_);
+}
+
+@safe unittest  // a DiscoverResult with no hint emits no cache fields and parses back null
+{
+	DiscoverResult r;
+	r.protocolVersions = ["2026-07-28"];
+	auto j = r.toJson();
+	assert("ttlMs" !in j);
+	assert("cacheScope" !in j);
+	assert(DiscoverResult.fromJson(j).cache.isNull);
 }
 
 /// Whether a shared (public) or per-client (private) cache may hold a result.
