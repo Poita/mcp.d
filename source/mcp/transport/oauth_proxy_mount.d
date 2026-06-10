@@ -48,7 +48,8 @@ import vibe.http.server : HTTPServerRequest, HTTPServerResponse, HTTPStatus;
 import vibe.http.router : URLRouter;
 import vibe.http.common : HTTPMethod;
 
-import mcp.auth.oauth_proxy : ConsentRequiredException,
+import mcp.auth.oauth : isValidClientIdMetadataUrl;
+import mcp.auth.oauth_proxy : ConsentRequiredException, InvalidClientIdMetadataException,
 	InvalidRedirectUriException, OAuthProxy, OAuthProxyConfig;
 
 @safe:
@@ -147,6 +148,7 @@ struct ProxyAuthState
 	string clientState; /// the client's original OAuth `state`, relayed back verbatim
 	string codeChallenge; /// the client's PKCE S256 `code_challenge`, forwarded upstream
 	string scope_; /// the client's requested `scope`, forwarded upstream
+	string clientId; /// the SEP-991 CIMD `client_id` URL (empty for DCR clients); the consent identity for CIMD
 }
 
 /// Build the minimal HTML consent screen presented when a dynamically-registered
@@ -160,12 +162,23 @@ struct ProxyAuthState
 /// resumes the upstream redirect. Using a form POST (rather than a hyperlink GET)
 /// means link prefetch/preload cannot auto-fire the state-changing grant and the
 /// opaque `state` is not carried in a URL that could leak via Referer/history/logs.
-string consentScreenHtml(string clientRedirectUri, string consentPath, string proxyState) @safe
+///
+/// `clientName` is the verified human-readable name from a SEP-991 Client ID
+/// Metadata Document; when non-empty it is displayed prominently so the user
+/// authorizes a named identity (phishing mitigation), and is empty for a DCR
+/// client, which has no attested name. The `clientRedirectUri` is always shown:
+/// the spec requires the redirect URI hostname be clearly displayed during
+/// authorization, since under CIMD a localhost redirect cannot be attested.
+string consentScreenHtml(string clientName, string clientRedirectUri,
+		string consentPath, string proxyState) @safe
 {
+	const safeName = htmlEscape(clientName);
 	const safeUri = htmlEscape(clientRedirectUri);
 	const safeAction = htmlEscape(consentPath);
 	const safeState = htmlEscape(proxyState);
-	return "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" ~ "<meta name=\"referrer\" content=\"no-referrer\">" ~ "<title>Authorize application</title></head><body>" ~ "<h1>Authorize application</h1>" ~ "<p>An application is requesting to sign in via this server and be" ~ " forwarded to the upstream identity provider.</p>" ~ "<p>Redirect URI: <code>" ~ safeUri ~ "</code></p>" ~ "<form method=\"post\" action=\"" ~ safeAction ~ "\">" ~ "<input type=\"hidden\" name=\"state\" value=\"" ~ safeState ~ "\">" ~ "<button type=\"submit\">Approve and continue</button></form>" ~ "</body></html>";
+	const nameSection = clientName.length
+		? "<p>Application: <strong>" ~ safeName ~ "</strong></p>" : "";
+	return "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" ~ "<meta name=\"referrer\" content=\"no-referrer\">" ~ "<title>Authorize application</title></head><body>" ~ "<h1>Authorize application</h1>" ~ "<p>An application is requesting to sign in via this server and be" ~ " forwarded to the upstream identity provider.</p>" ~ nameSection ~ "<p>Redirect URI: <code>" ~ safeUri ~ "</code></p>" ~ "<form method=\"post\" action=\"" ~ safeAction ~ "\">" ~ "<input type=\"hidden\" name=\"state\" value=\"" ~ safeState ~ "\">" ~ "<button type=\"submit\">Approve and continue</button></form>" ~ "</body></html>";
 }
 
 private string htmlEscape(string s) @safe
@@ -315,19 +328,14 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 		const scope_ = req.query.get("scope", "");
 		const clientRedirect = req.query.get("redirect_uri", "");
 		const clientState = req.query.get("state", "");
+		const clientId = req.query.get("client_id", "");
 
-		// Reject an unregistered or disallowed-scheme redirect_uri BEFORE minting any
-		// proxy state or rendering the consent screen (RFC 6749 §3.1.2.2 / §10.6,
-		// RFC 8252). Failing closed here means the upstream code can never be relayed
-		// to a URI the client never registered.
-		try
-			proxy.validateRedirectUri(clientRedirect);
-		catch (InvalidRedirectUriException)
-		{
-			res.statusCode = HTTPStatus.badRequest;
-			res.writeJsonBody(invalidRequestJson("invalid redirect_uri"));
-			return;
-		}
+		// A URL-formatted client_id selects the SEP-991 Client ID Metadata Document
+		// flow (when CIMD is enabled): the client's allowlist of redirect URIs comes
+		// from its hosted document rather than a prior DCR /register, and consent is
+		// keyed on the stable client_id URL. Otherwise this is a DCR client and the
+		// redirect_uri is validated against the registry.
+		const isCimd = cfg.clientIdMetadataDocumentSupported && isValidClientIdMetadataUrl(clientId);
 
 		// Enforce PKCE on the proxy->upstream leg. The proxy advertises S256-only
 		// support, so a missing code_challenge — or a code_challenge_method other
@@ -346,6 +354,70 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 			return;
 		}
 
+		void renderConsent(string clientNameForDisplay, string redirectForDisplay, string proxyState) @safe
+		{
+			// Un-consented client: present the consent screen rather than forwarding
+			// to the upstream authorization server. The screen's approval control is a
+			// form POST, and the opaque proxy state is carried in a hidden field rather
+			// than a URL, so it cannot leak via Referer/history and cannot be auto-fired
+			// by link prefetch/preload. `clientNameForDisplay` is the verified CIMD
+			// client_name (empty for a DCR client, which has no attested name).
+			res.headers["Cache-Control"] = "no-store";
+			res.headers["Referrer-Policy"] = "no-referrer";
+			res.statusCode = HTTPStatus.ok;
+			res.writeBody(consentScreenHtml(clientNameForDisplay, redirectForDisplay,
+				consentPath, proxyState), "text/html; charset=utf-8");
+		}
+
+		if (isCimd)
+		{
+			// Fetch + validate the document up front (SSRF-guarded). A fetch/validation
+			// failure — bad document, mismatched client_id, or a redirect_uri not listed
+			// in the document — is RFC 6749 §5.2 invalid_request; nothing is forwarded.
+			import mcp.auth.oauth : ClientIdMetadataDocument;
+
+			ClientIdMetadataDocument doc;
+			try
+				doc = proxy.fetchClientIdMetadata(clientId);
+			catch (InvalidClientIdMetadataException)
+			{
+				res.statusCode = HTTPStatus.badRequest;
+				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
+				return;
+			}
+
+			const proxyState = mintState();
+			store.put(proxyState, ProxyAuthState(clientRedirect, clientState,
+				codeChallenge, scope_, clientId));
+			try
+			{
+				const location = proxy.authorizeWithClientIdMetadata(clientId,
+					doc, clientRedirect, codeChallenge, scope_, proxyState);
+				res.redirect(location, HTTPStatus.found);
+			}
+			catch (ConsentRequiredException)
+				renderConsent(doc.clientName, clientRedirect, proxyState);
+			catch (InvalidClientIdMetadataException)
+			{
+				res.statusCode = HTTPStatus.badRequest;
+				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
+			}
+			return;
+		}
+
+		// DCR client: reject an unregistered or disallowed-scheme redirect_uri BEFORE
+		// minting any proxy state or rendering the consent screen (RFC 6749 §3.1.2.2 /
+		// §10.6, RFC 8252). Failing closed here means the upstream code can never be
+		// relayed to a URI the client never registered.
+		try
+			proxy.validateRedirectUri(clientRedirect);
+		catch (InvalidRedirectUriException)
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(invalidRequestJson("invalid redirect_uri"));
+			return;
+		}
+
 		const proxyState = mintState();
 		store.put(proxyState, ProxyAuthState(clientRedirect, clientState, codeChallenge, scope_));
 
@@ -355,18 +427,7 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 			res.redirect(location, HTTPStatus.found);
 		}
 		catch (ConsentRequiredException)
-		{
-			// Un-consented dynamically-registered client: present the consent screen
-			// rather than forwarding to the upstream authorization server. The screen's
-			// approval control is a form POST, and the opaque proxy state is carried in
-			// a hidden field rather than a URL, so it cannot leak via Referer/history
-			// and cannot be auto-fired by link prefetch/preload.
-			res.headers["Cache-Control"] = "no-store";
-			res.headers["Referrer-Policy"] = "no-referrer";
-			res.statusCode = HTTPStatus.ok;
-			res.writeBody(consentScreenHtml(clientRedirect, consentPath,
-				proxyState), "text/html; charset=utf-8");
-		}
+			renderConsent("", clientRedirect, proxyState);
 	});
 
 	// /consent: the confused-deputy consent-approval action. The user reaches this
@@ -390,8 +451,41 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 			res.writeBody("Unknown or expired authorization state", "text/plain");
 			return;
 		}
-		// Validate the redirect_uri before committing any state: the registry may
-		// have evicted it under cap pressure since the /authorize request.
+
+		// CIMD client: consent is keyed on the stable client_id URL. Re-fetch and
+		// re-validate the document (it may have changed since /authorize) before
+		// committing consent, then resume the upstream redirect.
+		if (st.clientId.length)
+		{
+			import mcp.auth.oauth : ClientIdMetadataDocument;
+
+			ClientIdMetadataDocument doc;
+			try
+				doc = proxy.fetchClientIdMetadata(st.clientId);
+			catch (InvalidClientIdMetadataException)
+			{
+				res.statusCode = HTTPStatus.badRequest;
+				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
+				return;
+			}
+			proxy.grantConsent(st.clientId);
+			store.put(proxyState, st);
+			try
+			{
+				const location = proxy.authorizeWithClientIdMetadata(st.clientId, doc,
+					st.clientRedirectUri, st.codeChallenge, st.scope_, proxyState);
+				res.redirect(location, HTTPStatus.found);
+			}
+			catch (InvalidClientIdMetadataException)
+			{
+				res.statusCode = HTTPStatus.badRequest;
+				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
+			}
+			return;
+		}
+
+		// DCR client: validate the redirect_uri before committing any state — the
+		// registry may have evicted it under cap pressure since the /authorize request.
 		try
 			proxy.validateRedirectUri(st.clientRedirectUri);
 		catch (InvalidRedirectUriException)
@@ -831,7 +925,7 @@ unittest  // CONSENT SCREEN: HTML names the client redirect_uri and a POST appro
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml("http://localhost:5000/cb", "/consent", "abc");
+	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc");
 	assert(html.canFind("Authorize application"));
 	assert(html.canFind("http://localhost:5000/cb"));
 	assert(html.canFind("method=\"post\""));
@@ -843,7 +937,7 @@ unittest  // CONSENT SCREEN: the approve control is a form POST, not a GET hyper
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml("http://localhost:5000/cb", "/consent", "abc");
+	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc");
 	// No hyperlink that link prefetch/preload could auto-fire as a GET grant, and the
 	// opaque state is in a hidden field rather than a URL that could leak.
 	assert(!html.canFind("<a href"));
@@ -854,13 +948,33 @@ unittest  // CONSENT SCREEN: the untrusted client redirect_uri and proxy state a
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml(`http://x/cb?a=1&b="<script>`, "/consent", `"><b>`);
+	const html = consentScreenHtml("", `http://x/cb?a=1&b="<script>`, "/consent", `"><b>`);
 	assert(html.canFind("&amp;"));
 	assert(html.canFind("&lt;script&gt;"));
 	assert(html.canFind("&quot;"));
 	assert(!html.canFind("<script>"));
 	// The proxy state is escaped before being placed in the hidden field value.
 	assert(!html.canFind("value=\"\"><b>\""));
+}
+
+unittest  // CONSENT SCREEN: a CIMD client_name is displayed (verified identity) and HTML-escaped
+{
+	import std.algorithm : canFind;
+
+	const html = consentScreenHtml(`Acme <Client>`, "http://localhost:5000/cb", "/consent", "abc");
+	// The verified client_name from the metadata document is surfaced to the user.
+	assert(html.canFind("Acme &lt;Client&gt;"));
+	assert(!html.canFind("<Client>"));
+}
+
+unittest  // CONSENT SCREEN: an empty client_name (DCR client) renders no name section
+{
+	import std.algorithm : canFind;
+
+	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc");
+	// The redirect_uri is still shown; there is no empty "Application:" label.
+	assert(html.canFind("http://localhost:5000/cb"));
+	assert(!html.canFind("Application:"));
 }
 
 unittest  // CONFUSED DEPUTY: an un-consented client gets the consent screen, NOT a 302 upstream
@@ -1075,6 +1189,189 @@ unittest  // UPSTREAM ERROR: /callback relays an upstream error to the client, n
 	assert(clientLoc.canFind("state=cs"));
 	// The client must NOT receive an empty code.
 	assert(!clientLoc.canFind("code="));
+}
+
+version (unittest)
+{
+	import mcp.auth.oauth : ClientIdMetadataDocument;
+
+	private OAuthProxyConfig cimdMountConfig() @safe
+	{
+		OAuthProxyConfig cfg;
+		cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+		cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+		cfg.upstreamClientId = "Iv1.upstream";
+		cfg.baseUrl = "https://mcp.example.com";
+		cfg.resource = "https://mcp.example.com/mcp";
+		cfg.clientIdMetadataDocumentSupported = true;
+		return cfg;
+	}
+
+	// Install a stub fetcher returning a fixed CIMD document so the mount's
+	// /authorize CIMD branch is exercised without any network fetch.
+	private OAuthProxy cimdProxyWithStubDoc(OAuthProxyConfig cfg, ClientIdMetadataDocument doc) @safe
+	{
+		auto proxy = new OAuthProxy(cfg);
+		proxy.clientIdMetadataFetcher = (string url) @safe { return doc; };
+		return proxy;
+	}
+
+	private ClientIdMetadataDocument cimdMountDoc() @safe
+	{
+		ClientIdMetadataDocument d;
+		d.clientId = "https://app.example.com/oauth/client.json";
+		d.clientName = "Example MCP Client";
+		d.redirectUris = ["http://127.0.0.1:8765/cb"];
+		return d;
+	}
+}
+
+unittest  // CIMD MOUNT: /authorize with a URL client_id + prior consent 302s upstream (no DCR register)
+{
+	import std.algorithm : canFind, startsWith;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
+	// Consent is keyed on the stable client_id URL for CIMD clients.
+	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?"
+			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
+			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs"));
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	assert(res.statusCode == 302);
+	assert(res.headers["Location"].startsWith("https://github.com/login/oauth/authorize?"));
+	assert(res.headers["Location"].canFind("client_id=Iv1.upstream"));
+}
+
+unittest  // CIMD MOUNT: /authorize with a URL client_id and no consent renders the consent screen
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?"
+			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
+			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs"));
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	assert(body_.canFind("Authorize application"));
+	assert(body_.canFind("http://127.0.0.1:8765/cb"));
+	// The verified client_name from the metadata document is shown to the user.
+	assert(body_.canFind("Example MCP Client"));
+	assert(!proxy.hasConsent("https://app.example.com/oauth/client.json"));
+}
+
+unittest  // CIMD MOUNT: POST /consent for a CIMD client grants consent on the client_id URL + 302s upstream
+{
+	import std.algorithm : canFind, startsWith;
+	import std.string : indexOf;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?"
+			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
+			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs"));
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	const html = () @trusted { return cast(string) sink.data; }();
+
+	const stateMark = `name="state" value="`;
+	const hi = html.indexOf(stateMark);
+	assert(hi >= 0);
+	const rest = html[hi + stateMark.length .. $];
+	const proxyState = rest[0 .. rest.indexOf('"')];
+
+	auto res2 = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
+	auto formBody = () @trusted { return cast(ubyte[])("state=" ~ proxyState).dup; }();
+	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/consent"),
+			HTTPMethod.POST, createMemoryStream(formBody, false));
+	req2.headers["Content-Type"] = "application/x-www-form-urlencoded";
+	router.handleRequest(req2, res2);
+
+	assert(proxy.hasConsent("https://app.example.com/oauth/client.json"));
+	assert(res2.statusCode == 302);
+	assert(res2.headers["Location"].startsWith("https://github.com/login/oauth/authorize?"));
+	assert(res2.headers["Location"].canFind("code_challenge=CH"));
+}
+
+unittest  // CIMD MOUNT: a document whose client_id does not match the URL yields 400 invalid_request
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto badDoc = cimdMountDoc();
+	badDoc.clientId = "https://app.example.com/oauth/DIFFERENT.json"; // mismatch
+	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), badDoc);
+	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?"
+			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
+			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs"));
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	assert(res.statusCode == 400);
+	assert(body_.canFind("invalid_request"));
+	assert(!body_.canFind("Authorize application"));
+}
+
+unittest  // CIMD MOUNT: a redirect_uri not listed in the document yields 400 invalid_request
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
+	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	auto sink = createMemoryOutputStream();
+	// redirect_uri is not the one listed in the document.
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?"
+			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
+			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fother&state=cs"));
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	assert(res.statusCode == 400);
+	assert(body_.canFind("invalid_request"));
 }
 
 unittest  // invalidRequestJson carries the RFC 6749 invalid_request error shape

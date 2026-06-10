@@ -106,9 +106,20 @@ Then `import mcp;` in your source files.
   `callToolLoop`, satisfying each `InputRequest` and resubmitting until a completed result is
   returned (capped at 16 rounds to guard against misbehaving servers).
 
-Optional follow-ups (not required for conformance): Client-ID-Metadata-Document client_id
-(currently uses DCR, a passing SHOULD warning), and a built-in loopback redirect listener for
-the interactive auth-code flow.
+- ✅ **Client ID Metadata Documents (SEP-991)** on both sides — the spec-recommended
+  registration mechanism now that DCR is deprecated. The **client** advertises and uses an
+  HTTPS-URL `client_id` when the AS supports it; the **server-side OAuth proxy** opts in via
+  `OAuthProxyConfig.clientIdMetadataDocumentSupported`, advertising
+  `client_id_metadata_document_supported`, then fetching (SSRF-guarded, size-capped) and
+  validating the hosted document at `/authorize` — exact `client_id` match, required fields
+  (`client_id`, `client_name`, `redirect_uris`), and a redirect-URI allowlist sourced from the
+  document — with confused-deputy consent keyed on the stable `client_id` URL. The consent
+  screen surfaces the verified `client_name` and the redirect-URI hostname. DCR remains as the
+  deprecated fallback.
+
+Optional follow-ups (not required for conformance): a built-in loopback redirect listener for
+the interactive auth-code flow, and a localhost-redirect impersonation warning on the proxy's
+CIMD consent screen (a spec `SHOULD`).
 
 ## Requirements
 
