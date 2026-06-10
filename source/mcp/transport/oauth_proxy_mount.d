@@ -32,8 +32,10 @@
 ///     the relayed code with its own `code_verifier`).
 ///   * `POST /token` — exchanges the (relayed upstream) `code` + the client's
 ///     `code_verifier` at the upstream token endpoint using the fixed upstream
-///     credentials (`proxy.tokenForm`/`proxy.tokenAuthHeader`), relaying the
-///     upstream token response back to the client verbatim.
+///     credentials (`proxy.tokenForm`/`proxy.tokenAuthHeader`). By default
+///     (passthrough) it relays the upstream token response to the client
+///     verbatim; in issue-own-token (broker) mode it instead mints the MCP
+///     server's own opaque token and keeps the upstream token server-side.
 ///
 /// The pure relay helpers (`buildClientCallbackRedirect`, `redirectUrisFrom`,
 /// `ProxyStateStore`, `consentScreenHtml`) carry no HTTP state and are unit-tested
@@ -48,6 +50,7 @@ import vibe.http.server : HTTPServerRequest, HTTPServerResponse, HTTPStatus;
 import vibe.http.router : URLRouter;
 import vibe.http.common : HTTPMethod;
 
+import mcp.auth.oauth : TokenSet;
 import mcp.auth.oauth_proxy : ConsentRequiredException,
 	InvalidRedirectUriException, OAuthProxy, OAuthProxyConfig;
 
@@ -470,14 +473,58 @@ void mountOAuthCallback(URLRouter router, OAuthProxy proxy, ProxyStateStore stor
 	});
 }
 
-/// Mount the `/token` endpoint: exchange the relayed code + the client's
-/// code_verifier (or a relayed refresh_token) at the upstream token endpoint with
-/// the fixed credentials, relaying the upstream token response back to the client.
-///
-/// An integrator building a spec-compliant token broker can skip this leg and
-/// register their own `/token`, reusing `exchangeUpstream` for the SSRF-pinned
-/// upstream call.
+/// A seam for the upstream token call, matching `exchangeUpstream`'s signature.
+/// `mountOAuthToken` defaults to `exchangeUpstream` (the SSRF-pinned path);
+/// tests inject a stub so the `/token` route can be driven without a real
+/// upstream.
+alias UpstreamExchange = void delegate(string endpoint, string body_,
+		string authHeader, out string responseBody, out int status) @safe;
+
+/// Build the RFC 6749 §5.1 token response document the proxy returns to the
+/// client in ISSUE-OWN-TOKEN (broker) mode: it carries OUR opaque MCP token, not
+/// the upstream token. `expiresIn` is emitted only when positive; `scope` only
+/// when non-empty. The upstream token never appears here — it is kept
+/// server-side in the proxy's `tokenStore`.
+Json brokerTokenResponseJson(string accessToken, long expiresIn, string scope_) @safe
+{
+	Json j = Json.emptyObject;
+	j["access_token"] = accessToken;
+	j["token_type"] = "Bearer";
+	if (expiresIn > 0)
+		j["expires_in"] = expiresIn;
+	if (scope_.length)
+		j["scope"] = scope_;
+	return j;
+}
+
+/// Mount the `/token` endpoint, defaulting to the SSRF-pinned `exchangeUpstream`.
 void mountOAuthToken(URLRouter router, OAuthProxy proxy) @safe
+{
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string responseBody, out int status) @safe {
+		exchangeUpstream(endpoint, body_, authHeader, responseBody, status);
+	});
+}
+
+/// Mount the `/token` endpoint with an injectable upstream-exchange seam.
+///
+/// In PASSTHROUGH mode (the default) the endpoint exchanges the relayed code +
+/// the client's code_verifier (or a relayed refresh_token) at the upstream token
+/// endpoint with the fixed credentials, relaying the upstream token response back
+/// to the client verbatim — the client presents the UPSTREAM token as its MCP
+/// bearer.
+///
+/// In ISSUE-OWN-TOKEN (broker) mode (when the proxy's `issueToken` + `tokenStore`
+/// are set) the endpoint still exchanges upstream, but then mints the MCP
+/// server's OWN opaque token for the client via `proxy.issueClientToken`, keeps
+/// the upstream token server-side, and returns OUR token — never the upstream
+/// token. Refresh-token grants are not brokered (the proxy issues non-refreshable
+/// opaque tokens), so they fall through to the upstream relay.
+///
+/// An integrator building a spec-compliant token broker can also skip this leg
+/// and register their own `/token`, reusing `exchangeUpstream`.
+void mountOAuthToken(URLRouter router, OAuthProxy proxy, UpstreamExchange exchange) @safe
+in (exchange !is null)
 {
 	auto cfg = proxy.config();
 	const tokenPath = pathOf(cfg.tokenEndpoint());
@@ -492,8 +539,9 @@ void mountOAuthToken(URLRouter router, OAuthProxy proxy) @safe
 		// refresh_token exchange (OAuth 2.1 §4.3), relaying the refresh token to the
 		// upstream token endpoint with the fixed upstream credentials.
 		const grantType = formField(form, "grant_type");
+		const isRefresh = grantType == "refresh_token";
 		string upstreamBody;
-		if (grantType == "refresh_token")
+		if (isRefresh)
 		{
 			const refreshToken = formField(form, "refresh_token");
 			upstreamBody = proxy.refreshTokenForm(refreshToken);
@@ -507,7 +555,22 @@ void mountOAuthToken(URLRouter router, OAuthProxy proxy) @safe
 		const authHeader = proxy.tokenAuthHeader();
 		string responseBody;
 		int status;
-		exchangeUpstream(upstreamTokenEndpoint, upstreamBody, authHeader, responseBody, status);
+		exchange(upstreamTokenEndpoint, upstreamBody, authHeader, responseBody, status);
+
+		// In broker mode, mint OUR token for the client from the upstream response
+		// and keep the upstream token server-side. The client never sees the
+		// upstream token. Refresh grants are relayed as-is (opaque tokens are not
+		// refreshable through the proxy), and a non-2xx upstream is surfaced verbatim.
+		if (proxy.brokerEnabled() && !isRefresh && status >= 200 && status < 300)
+		{
+			const upstream = TokenSet.fromJson(parseJsonBody(responseBody));
+			const brokered = proxy.issueClientToken(upstream);
+			res.statusCode = HTTPStatus.ok;
+			res.writeJsonBody(brokerTokenResponseJson(brokered.token,
+				upstream.expiresIn, upstream.scope_));
+			return;
+		}
+
 		res.statusCode = cast(HTTPStatus) status;
 		res.writeBody(responseBody.length ? responseBody : "{}", "application/json");
 	});
@@ -545,6 +608,19 @@ private string readFormString(scope HTTPServerRequest req) @safe
 	import vibe.stream.operations : readAllUTF8;
 
 	return req.bodyReader.readAllUTF8();
+}
+
+/// Parse a JSON token-response body into a `Json` object, tolerating an empty or
+/// malformed body by returning an empty object (so a `TokenSet.fromJson` of it
+/// yields an empty token set rather than throwing).
+private Json parseJsonBody(string payload) @safe
+{
+	if (payload.length == 0)
+		return Json.emptyObject;
+	try
+		return parseJsonString(payload);
+	catch (Exception)
+		return Json.emptyObject;
 }
 
 /// Extract a single field value from an `application/x-www-form-urlencoded`
@@ -1484,4 +1560,176 @@ unittest  // exchangeUpstream is public so an overriding /token can reuse the SS
 	string rb;
 	int st;
 	assertThrown(exchangeUpstream("http://upstream.example.com/token", "grant_type=x", "", rb, st));
+}
+
+version (unittest)
+{
+	import mcp.auth.oauth : TokenSet;
+	import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore;
+
+	// A broker-mode proxy whose upstream exchange is stubbed so no real network
+	// call is made: the injected exchange returns a fixed upstream token body.
+	private OAuthProxy brokerMountProxy(ReferenceTokenStore store) @safe
+	{
+		OAuthProxyConfig cfg;
+		cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+		cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+		cfg.upstreamClientId = "Iv1.upstream";
+		cfg.upstreamClientSecret = "secret";
+		cfg.baseUrl = "https://mcp.example.com";
+		cfg.resource = "https://mcp.example.com/mcp";
+		cfg.scopesSupported = ["read:user"];
+		cfg.tokenStore = store;
+		cfg.issueToken = (TokenSet upstream) @safe {
+			IssuedToken t;
+			t.subject = "octocat";
+			t.scopes = ["read:user"];
+			t.expiresAt = long.max;
+			return t;
+		};
+		return new OAuthProxy(cfg);
+	}
+
+	private UpstreamExchange fixedUpstream(string responseBody) @safe
+	{
+		return (string endpoint, string body_, string authHeader, out string rb, out int status) @safe {
+			rb = responseBody;
+			status = 200;
+		};
+	}
+}
+
+unittest  // BROKER MOUNT: /token returns OUR opaque token, never the upstream token
+{
+	import std.algorithm : canFind;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto store = new ReferenceTokenStore();
+	auto proxy = brokerMountProxy(store);
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
+
+	auto formBody = () @trusted {
+		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
+	}();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
+			HTTPMethod.POST, createMemoryStream(formBody, false));
+	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	assert(res.statusCode == 200);
+	// The client must NOT receive the upstream token.
+	assert(!body_.canFind("gho_upstream_secret"));
+	assert(body_.canFind("access_token"));
+}
+
+unittest  // BROKER MOUNT: the resource server accepts the issued token and rejects the raw upstream token
+{
+	import std.algorithm : canFind;
+	import std.string : indexOf;
+	import mcp.auth.reference_token : referenceTokenValidator;
+	import vibe.data.json : parseJsonString;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto store = new ReferenceTokenStore();
+	auto proxy = brokerMountProxy(store);
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
+
+	auto formBody = () @trusted {
+		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
+	}();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
+			HTTPMethod.POST, createMemoryStream(formBody, false));
+	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const issuedToken = parseJsonString(() @trusted {
+		return cast(string) sink.data;
+	}())["access_token"].get!string;
+
+	auto validate = referenceTokenValidator(store, "https://mcp.example.com/mcp");
+	assert(validate(issuedToken).valid);
+	assert(!validate("gho_upstream_secret").valid);
+}
+
+unittest  // BROKER MOUNT: the upstream token is retrievable server-side from the validated TokenInfo
+{
+	import mcp.auth.reference_token : referenceTokenValidator;
+	import vibe.data.json : parseJsonString;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto store = new ReferenceTokenStore();
+	auto proxy = brokerMountProxy(store);
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
+
+	auto formBody = () @trusted {
+		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
+	}();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
+			HTTPMethod.POST, createMemoryStream(formBody, false));
+	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const issuedToken = parseJsonString(() @trusted {
+		return cast(string) sink.data;
+	}())["access_token"].get!string;
+
+	auto validate = referenceTokenValidator(store, "https://mcp.example.com/mcp");
+	auto info = validate(issuedToken);
+	assert(info.valid);
+	assert(info.claims["upstream_access_token"].get!string == "gho_upstream_secret");
+}
+
+unittest  // PASSTHROUGH REGRESSION: with no issueToken/tokenStore the upstream body is relayed verbatim
+{
+	import std.algorithm : canFind;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto proxy = mountSampleProxy(); // passthrough: no issueToken/tokenStore
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
+
+	auto formBody = () @trusted {
+		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
+	}();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
+			HTTPMethod.POST, createMemoryStream(formBody, false));
+	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	assert(res.statusCode == 200);
+	// Passthrough relays the upstream token to the client verbatim.
+	assert(body_.canFind("gho_upstream_secret"));
 }

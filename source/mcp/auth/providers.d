@@ -23,7 +23,8 @@ import std.string : endsWith;
 
 import mcp.auth.jwt_verifier : JwtVerifierConfig, jwtVerifier;
 import mcp.auth.oauth : TokenEndpointAuthMethod;
-import mcp.auth.oauth_proxy : OAuthProxyConfig;
+import mcp.auth.oauth_proxy : IssueTokenHook, OAuthProxyConfig;
+import mcp.auth.reference_token : ReferenceTokenStore;
 import mcp.auth.resource_server : ResourceServerConfig;
 
 @safe:
@@ -144,10 +145,28 @@ ResourceServerConfig scalekit(string envUrl, string audience, string[] scopes = 
 // Bucket B — Non-DCR / opaque-token presets -> OAuthProxyConfig
 // ===========================================================================
 
+/// Switch a proxy preset into ISSUE-OWN-TOKEN (broker) mode: the proxy mints the
+/// MCP server's OWN opaque token for the client and keeps the upstream token
+/// server-side in `store` (reachable from the validated `TokenInfo.claims`),
+/// instead of relaying the upstream token to the client (passthrough). A
+/// self-brokering server — one that calls a downstream API with the issued token
+/// — should chain this onto a preset, e.g. `github(...).brokered(hook, store)`.
+OAuthProxyConfig brokered(OAuthProxyConfig cfg, IssueTokenHook issueToken,
+		ReferenceTokenStore store) @safe
+in (issueToken !is null)
+in (store !is null)
+{
+	cfg.issueToken = issueToken;
+	cfg.tokenStore = store;
+	return cfg;
+}
+
 /// GitHub OAuth app. Fills in GitHub's fixed authorize/token endpoints; the IdP
 /// has no DCR and issues opaque tokens, so the proxy fronts it. The author still
 /// supplies a `tokenVerifier` (e.g. one that maps `/user` -> subject) and a
-/// `baseUrl`/`resource` for the proxy surface.
+/// `baseUrl`/`resource` for the proxy surface. Defaults to passthrough; a server
+/// that calls GitHub's API with the issued token should chain `.brokered(...)` to
+/// switch to issue-own-token mode.
 OAuthProxyConfig github(string clientId, string clientSecret, string[] scopes = [
 ]) @safe
 {
@@ -163,7 +182,9 @@ OAuthProxyConfig github(string clientId, string clientSecret, string[] scopes = 
 
 /// Google. Fills in Google's fixed authorize/token endpoints; Google has no DCR,
 /// so the proxy fronts it. The author supplies a `tokenVerifier` plus the proxy
-/// `baseUrl`/`resource`.
+/// `baseUrl`/`resource`. Defaults to passthrough; a server that calls Google's
+/// API with the issued token should chain `.brokered(...)` to switch to
+/// issue-own-token mode.
 OAuthProxyConfig google(string clientId, string clientSecret, string[] scopes = [
 ]) @safe
 {
@@ -285,6 +306,40 @@ unittest  // entraId rejects an empty tenant string at call time
 	import std.exception : assertThrown;
 
 	assertThrown(entraId("", "api://my-app"));
+}
+
+unittest  // BROKER: github(...).brokered(...) reaches issue-own-token mode through the preset
+{
+	import mcp.auth.oauth : TokenSet;
+	import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore;
+
+	auto store = new ReferenceTokenStore();
+	auto cfg = github("Iv1.client", "ghsecret", ["read:user"]).brokered((TokenSet u) @safe {
+		IssuedToken t;
+		t.subject = "octocat";
+		t.expiresAt = long.max;
+		return t;
+	}, store);
+	// The preset endpoints survive; broker mode is now enabled.
+	assert(cfg.upstreamTokenEndpoint == "https://github.com/login/oauth/access_token");
+	assert(cfg.issueToken !is null);
+	assert(cfg.tokenStore is store);
+}
+
+unittest  // BROKER: google(...).brokered(...) reaches issue-own-token mode through the preset
+{
+	import mcp.auth.oauth : TokenSet;
+	import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore;
+
+	auto store = new ReferenceTokenStore();
+	auto cfg = google("client.apps.googleusercontent.com", "gsecret").brokered((TokenSet u) @safe {
+		IssuedToken t;
+		t.expiresAt = long.max;
+		return t;
+	}, store);
+	assert(cfg.upstreamTokenEndpoint == "https://oauth2.googleapis.com/token");
+	assert(cfg.issueToken !is null);
+	assert(cfg.tokenStore is store);
 }
 
 unittest  // a JWT preset wires a working validator that rejects garbage tokens

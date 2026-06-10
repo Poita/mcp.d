@@ -36,9 +36,10 @@ import std.string : endsWith, indexOf, startsWith;
 import vibe.data.json : Json;
 
 import mcp.auth.oauth : AuthorizationServerMetadata, ProtectedResourceMetadata,
-	RegisteredClient, TokenEndpointAuthMethod,
+	RegisteredClient, TokenEndpointAuthMethod, TokenSet,
 	basicAuthHeader, buildAuthCodeTokenForm,
 	buildAuthorizationUrl, buildRefreshTokenForm, requireSecureUrl;
+import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore;
 import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidator;
 
 @safe:
@@ -47,7 +48,24 @@ import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidato
 // Configuration
 // ===========================================================================
 
+/// Mints the MCP server's OWN token for the client from the upstream token
+/// response. Called in issue-own-token (broker) mode after the proxy exchanges
+/// the code upstream: it receives the upstream `TokenSet` and returns the
+/// `IssuedToken` the proxy stores and hands the client. The returned token's
+/// `subject`/`scopes`/`audience`/`claims` become the client principal; the proxy
+/// stashes the upstream token alongside it so the server can call downstream
+/// APIs with it.
+alias IssueTokenHook = IssuedToken delegate(TokenSet upstream) @safe;
+
 /// Configuration for an `OAuthProxy`.
+///
+/// By default the proxy operates in PASSTHROUGH mode: its `/token` endpoint
+/// relays the upstream token exchange verbatim and the client presents the
+/// UPSTREAM token as its MCP bearer. A self-brokering server — one that calls a
+/// downstream API with the issued token — should instead set `issueToken` +
+/// `tokenStore` to switch to ISSUE-OWN-TOKEN (broker) mode, where the proxy mints
+/// its own opaque MCP token for the client and keeps the upstream token
+/// server-side (reachable from the validated `TokenInfo.claims`).
 struct OAuthProxyConfig
 {
 	/// The upstream IdP's authorization endpoint (e.g.
@@ -106,6 +124,18 @@ struct OAuthProxyConfig
 	/// in the PRM document and forwarded to the upstream as the `resource`
 	/// parameter so issued tokens are audience-bound to this server.
 	string resource;
+
+	/// In ISSUE-OWN-TOKEN (broker) mode, mints the MCP server's own token for the
+	/// client from the upstream token response. Set together with `tokenStore` to
+	/// switch the proxy out of passthrough: the proxy then NEVER hands the client
+	/// the upstream token. Null (the default) leaves the proxy in passthrough.
+	IssueTokenHook issueToken;
+
+	/// In ISSUE-OWN-TOKEN (broker) mode, stores the minted client token and the
+	/// upstream token stashed alongside it, and validates issued tokens by lookup
+	/// (`referenceTokenValidator`). Set together with `issueToken`. Null (the
+	/// default) leaves the proxy in passthrough.
+	ReferenceTokenStore tokenStore;
 
 	/// The proxy's fixed upstream redirect URI (`baseUrl` + `redirectPath`),
 	/// registered with the IdP.
@@ -340,6 +370,24 @@ string proxyTokenAuthHeader(const OAuthProxyConfig cfg) @safe
 		return basicAuthHeader(cfg.upstreamClientId, cfg.upstreamClientSecret);
 	return null;
 }
+
+/// The result of minting a client-facing token in issue-own-token (broker) mode:
+/// the opaque MCP `token` the proxy hands the client, and the `issued` record
+/// (subject/scopes/audience/expiry) stored under it.
+struct BrokeredToken
+{
+	string token; /// the opaque MCP bearer the proxy returns to the client
+	IssuedToken issued; /// the stored principal the token resolves to
+}
+
+/// The `TokenInfo.claims` key under which the proxy stashes the upstream access
+/// token in broker mode, so a server handler can read it back from the validated
+/// token to call the upstream API on the user's behalf.
+enum string upstreamAccessTokenClaim = "upstream_access_token";
+
+/// The `TokenInfo.claims` key under which the proxy stashes the upstream refresh
+/// token in broker mode (present only when the upstream returned one).
+enum string upstreamRefreshTokenClaim = "upstream_refresh_token";
 
 // ===========================================================================
 // Redirect-URI registration + validation (RFC 6749 §3.1.2.2 / §10.6, RFC 8252)
@@ -633,6 +681,12 @@ class ConsentRequiredException : Exception
 /// A reusable OAuth proxy provider. Construct it from an `OAuthProxyConfig`, then
 /// read the metadata surface to publish, drive the authorize/token proxying, and
 /// obtain a `TokenValidator` for `ResourceServerConfig.validator`.
+///
+/// The proxy defaults to PASSTHROUGH: the client presents the upstream token as
+/// its MCP bearer. A self-brokering server — one that calls a downstream API with
+/// the issued token — should set `OAuthProxyConfig.issueToken` + `tokenStore` to
+/// switch to ISSUE-OWN-TOKEN (broker) mode, where the proxy mints its own opaque
+/// MCP token for the client and keeps the upstream token server-side.
 final class OAuthProxy
 {
 	private OAuthProxyConfig cfg;
@@ -793,6 +847,38 @@ final class OAuthProxy
 	string tokenAuthHeader() const @safe
 	{
 		return proxyTokenAuthHeader(cfg);
+	}
+
+	/// Whether the proxy is in ISSUE-OWN-TOKEN (broker) mode: it mints its own
+	/// token for the client and keeps the upstream token server-side rather than
+	/// relaying the upstream token (passthrough). True only when both `issueToken`
+	/// and `tokenStore` are configured.
+	bool brokerEnabled() @safe
+	{
+		return cfg.issueToken !is null && cfg.tokenStore !is null;
+	}
+
+	/// Mint the MCP server's OWN token for the client from the `upstream` token
+	/// response, stash the upstream access (and refresh, when present) token in the
+	/// issued token's claims so the server can call the upstream API on the user's
+	/// behalf, store it, and return the opaque token to hand the client. The
+	/// audience is bound to the proxy's `resource` so the issued token validates
+	/// against this server. Only valid in broker mode (`brokerEnabled`).
+	BrokeredToken issueClientToken(TokenSet upstream) @safe
+	in (cfg.issueToken !is null && cfg.tokenStore !is null)
+	{
+		import std.algorithm : canFind;
+
+		auto issued = cfg.issueToken(upstream);
+		if (cfg.resource.length && !issued.audience.canFind(cfg.resource))
+			issued.audience ~= cfg.resource;
+		Json claims = issued.claims.type == Json.Type.object ? issued.claims : Json.emptyObject;
+		claims[upstreamAccessTokenClaim] = upstream.accessToken;
+		if (upstream.refreshToken.length)
+			claims[upstreamRefreshTokenClaim] = upstream.refreshToken;
+		issued.claims = claims;
+		const token = cfg.tokenStore.issue(issued);
+		return BrokeredToken(token, issued);
 	}
 
 	/// A `TokenValidator` that validates an incoming MCP bearer token (an
@@ -1411,4 +1497,87 @@ unittest  // REDIRECT REGISTRY: re-registering the same handle drops old URIs fr
 	// The new URI and h3 URI remain registered.
 	assert(reg.isRegistered("https://new.example.com/cb"));
 	assert(reg.isRegistered("https://h3.example.com/cb"));
+}
+
+version (unittest)
+{
+	import mcp.auth.oauth : TokenSet;
+	import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore, referenceTokenValidator;
+
+	// A broker-mode proxy config: after the upstream exchange the proxy mints its
+	// OWN token for the client and stashes the upstream token server-side.
+	private OAuthProxyConfig brokerConfig() @safe
+	{
+		auto cfg = sampleConfig();
+		cfg.tokenStore = new ReferenceTokenStore();
+		cfg.issueToken = (TokenSet upstream) @safe {
+			IssuedToken t;
+			t.subject = "octocat";
+			t.scopes = ["read:user"];
+			t.expiresAt = long.max;
+			return t;
+		};
+		return cfg;
+	}
+}
+
+unittest  // BROKER: a config with both issueToken and tokenStore is in broker mode
+{
+	auto proxy = new OAuthProxy(brokerConfig());
+	assert(proxy.brokerEnabled());
+}
+
+unittest  // BROKER: passthrough remains the default (no issueToken, no tokenStore)
+{
+	auto proxy = new OAuthProxy(sampleConfig());
+	assert(!proxy.brokerEnabled());
+}
+
+unittest  // BROKER: issuing a client token does NOT return the upstream token
+{
+	auto proxy = new OAuthProxy(brokerConfig());
+	TokenSet upstream;
+	upstream.accessToken = "gho_upstream_secret";
+	const issued = proxy.issueClientToken(upstream);
+	assert(issued.token.length > 0);
+	assert(issued.token != "gho_upstream_secret");
+}
+
+unittest  // BROKER: the resource server accepts the issued token, rejects the raw upstream token
+{
+	auto cfg = brokerConfig();
+	auto proxy = new OAuthProxy(cfg);
+	TokenSet upstream;
+	upstream.accessToken = "gho_upstream_secret";
+	const issued = proxy.issueClientToken(upstream);
+
+	auto validate = referenceTokenValidator(cfg.tokenStore, cfg.resource);
+	assert(validate(issued.token).valid);
+	assert(!validate("gho_upstream_secret").valid);
+}
+
+unittest  // BROKER: the stashed upstream token is retrievable from the validated TokenInfo claims
+{
+	auto cfg = brokerConfig();
+	auto proxy = new OAuthProxy(cfg);
+	TokenSet upstream;
+	upstream.accessToken = "gho_upstream_secret";
+	const issued = proxy.issueClientToken(upstream);
+
+	auto validate = referenceTokenValidator(cfg.tokenStore, cfg.resource);
+	auto info = validate(issued.token);
+	assert(info.valid);
+	assert(info.claims["upstream_access_token"].get!string == "gho_upstream_secret");
+}
+
+unittest  // BROKER: the issued token is audience-bound to the proxy's own resource
+{
+	auto cfg = brokerConfig();
+	auto proxy = new OAuthProxy(cfg);
+	TokenSet upstream;
+	upstream.accessToken = "gho_upstream_secret";
+	const issued = proxy.issueClientToken(upstream);
+
+	auto validate = referenceTokenValidator(cfg.tokenStore, cfg.resource);
+	assert(validate(issued.token).hasAudience(cfg.resource));
 }
