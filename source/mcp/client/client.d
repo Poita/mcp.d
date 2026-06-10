@@ -1043,12 +1043,14 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Whether a raw `tools/call` reply is a task handle (`resultType: "task"`,
-	/// SEP-2663) rather than a synchronous `CallToolResult`.
+	/// SEP-2663) rather than a synchronous `CallToolResult`. Prefer
+	/// `CallToolResult.isTask` when working with a decoded result; this static form
+	/// is for inspecting raw JSON.
 	static bool isTaskResult(Json result) @safe
 	{
-		return result.type == Json.Type.object && "resultType" in result
-			&& result["resultType"].type == Json.Type.string
-			&& result["resultType"].get!string == "task";
+		import mcp.protocol.tasks : isCreateTaskResult;
+
+		return isCreateTaskResult(result);
 	}
 
 	/// Fetch a task's current state (`tasks/get`). Returns the raw `DetailedTask`
@@ -1128,15 +1130,21 @@ final class McpClient : ClientProtocol
 	/// with a `CreateTaskResult`, poll it to completion via `awaitTask` and return
 	/// the final `CallToolResult`; otherwise return the synchronous result. Lets a
 	/// caller treat task and non-task tools identically. Requires `enableTasks`.
+	///
+	/// Built on `callTool`, so any MRTR (SEP-2322) round-trips and per-call progress
+	/// are handled before the task handle is observed. A caller that instead needs
+	/// to persist the task and resume after a restart should call `callTool`
+	/// directly, store `result.task.taskId` when `result.isTask`, and later resume
+	/// with `awaitTask`.
 	CallToolResult callToolAwait(string name, Json arguments = Json.emptyObject,
 			void delegate(string taskId,
 				Json inputRequests) @safe onInputRequired = null,
 			RequestOptions opts = RequestOptions.init) @safe
 	{
-		auto raw = rpc("tools/call", buildToolCallParams(name, arguments, effectiveToken(opts)));
-		if (isTaskResult(raw))
-			return awaitTask(raw["taskId"].get!string, onInputRequired);
-		return CallToolResult.fromJson(raw);
+		auto r = callTool(name, arguments, opts);
+		if (r.isTask())
+			return awaitTask(r.task.taskId, onInputRequired);
+		return r;
 	}
 
 	private McpException taskFailedError(string taskId, Json state) @safe
@@ -2292,6 +2300,72 @@ unittest  // isTaskResult recognizes a CreateTaskResult by its resultType discri
 	])));
 	assert(!McpClient.isTaskResult(Json(["resultType": Json("complete")])));
 	assert(!McpClient.isTaskResult(Json(["content": Json.emptyArray])));
+}
+
+unittest  // callTool surfaces a server-created task handle instead of awaiting it
+{
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "tools/call");
+		return Json([
+			"resultType": Json("task"),
+			"taskId": Json("t-42"),
+			"status": Json("working"),
+			"createdAt": Json("2026-06-07T10:30:00Z"),
+			"lastUpdatedAt": Json("2026-06-07T10:30:00Z"),
+			"ttlMs": Json(60_000),
+			"pollIntervalMs": Json(200)
+		]);
+	};
+	auto r = c.callTool("slow", Json.emptyObject);
+	assert(r.isTask());
+	assert(r.task.taskId == "t-42");
+	assert(r.task.pollIntervalMs.get == 200);
+}
+
+unittest  // callTool returns a synchronous result unchanged (not a task)
+{
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "tools/call");
+		return Json([
+			"content": Json([Json(["type": Json("text"), "text": Json("hi")])])
+		]);
+	};
+	auto r = c.callTool("fast", Json.emptyObject);
+	assert(!r.isTask());
+	assert(r.content[0].text == "hi");
+}
+
+unittest  // callToolAwait drives a server-created task to completion transparently
+{
+	auto c = McpClient.http("http://localhost");
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		calls++;
+		if (method == "tools/call")
+			return Json([
+			"resultType": Json("task"),
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"pollIntervalMs": Json(5_000)
+		]);
+		assert(method == "tasks/get");
+		return Json([
+			"resultType": Json("complete"),
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json([
+				"content": Json([
+					Json(["type": Json("text"), "text": Json("done")])
+				])
+			])
+		]);
+	};
+	auto r = c.callToolAwait("slow", Json.emptyObject);
+	assert(!r.isTask());
+	assert(r.content[0].text == "done");
 }
 
 unittest  // getTask parses the Task metadata from a tasks/get reply

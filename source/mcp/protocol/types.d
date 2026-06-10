@@ -6,6 +6,7 @@ import mcp.protocol.capabilities;
 import mcp.protocol.errors : ErrorCode, McpException;
 import mcp.protocol.versions : ProtocolVersion, toWire;
 import mcp.protocol.jsonhelpers : getOr, tryGet;
+import mcp.protocol.tasks : Task, makeCreateTaskResult, isCreateTaskResult;
 import mcp.protocol.modern : InputRequest, emitInputRequired,
 	parseInputRequired, CacheHint, parseCacheHint, withCache;
 import mcp.client.client : ProgressToken;
@@ -1067,10 +1068,23 @@ struct CallToolResult
 	/// `InputRequiredResult`. The client MUST echo it back verbatim (and MUST
 	/// NOT inspect it) when retrying. Empty when the server sent none.
 	string requestState;
+	/// SEP-2663 task handle: when the server elects to run the call as an
+	/// asynchronous task it answers `tools/call` with a `CreateTaskResult` rather
+	/// than a final result. This carries the seed `Task` (id, status, ttl, suggested
+	/// poll interval); `content`/`structuredContent` are then empty and the real
+	/// result is fetched later via `tasks/get` (see `McpClient.awaitTask`). A
+	/// non-empty `task.taskId` is the discriminator — see `isTask`. Mirrors the
+	/// `inputRequests` carrier above.
+	Task task;
 
 	Json toJson() const @safe
 	{
 		Json j = Json.emptyObject;
+		// A `CreateTaskResult` is a distinct result shape (the seed `Task` tagged
+		// `resultType: "task"`), not a `CallToolResult` with content — serialise it
+		// as such so the carrier round-trips.
+		if (isTask())
+			return makeCreateTaskResult(task);
 		// An `InputRequiredResult` is a distinct result shape (only `inputRequests`),
 		// not a `CallToolResult` with content — serialise it as such. The
 		// `resultType` discriminator is stamped at the server's response layer, so
@@ -1095,6 +1109,14 @@ struct CallToolResult
 	static CallToolResult fromJson(Json j) @safe
 	{
 		CallToolResult r;
+		// SEP-2663: the server returned a task handle (`CreateTaskResult`) instead
+		// of a final result. Capture the seed `Task`; `content`/`structuredContent`
+		// stay empty — the result is retrieved later via `tasks/get`.
+		if (isCreateTaskResult(j))
+		{
+			r.task = Task.fromJson(j);
+			return r;
+		}
 		if ("content" in j && j["content"].type == Json.Type.array)
 		{
 			auto arr = j["content"];
@@ -1118,6 +1140,14 @@ struct CallToolResult
 	bool isInputRequired() const @safe nothrow
 	{
 		return inputRequests.length > 0;
+	}
+
+	/// Whether this result is a SEP-2663 task handle (`CreateTaskResult`): the
+	/// server chose to run the call asynchronously. `task` carries the seed `Task`;
+	/// persist `task.taskId` and drive it to completion via `McpClient.awaitTask`.
+	bool isTask() const @safe nothrow
+	{
+		return task.taskId.length > 0;
 	}
 
 	/// Fluent setter for the result-level `_meta` object, e.g.
@@ -1154,6 +1184,8 @@ struct CallToolResult
 		{
 			projected.inputRequests = inputRequests.dup;
 			projected.requestState = requestState;
+			// The SEP-2663 task handle is likewise a draft-only result shape.
+			projected.task = task;
 		}
 		// `structuredContent` is a 2025-06-18+ field: absent from 2025-03-26 and
 		// 2024-11-05, so omit it for those versions.
@@ -2582,6 +2614,56 @@ unittest  // a completed CallToolResult is not an InputRequiredResult
 	assert(!back.isInputRequired());
 	assert(back.inputRequests.length == 0);
 	assert(back.content[0].text == "done");
+}
+
+unittest  // CallToolResult.fromJson decodes a SEP-2663 task handle into `task`
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	Json j = Json.emptyObject;
+	j["resultType"] = "task";
+	j["taskId"] = "t1";
+	j["status"] = "working";
+	j["createdAt"] = "2026-06-07T10:30:00Z";
+	j["lastUpdatedAt"] = "2026-06-07T10:30:00Z";
+	j["ttlMs"] = 60_000;
+	j["pollIntervalMs"] = 200;
+
+	auto r = CallToolResult.fromJson(j);
+	assert(r.isTask());
+	assert(r.task.taskId == "t1");
+	assert(r.task.status == TaskStatus.working);
+	assert(r.task.pollIntervalMs.get == 200);
+	// A task handle carries no synchronous result and is not an MRTR request.
+	assert(!r.isError && !r.isInputRequired());
+	assert(r.content.length == 0);
+}
+
+unittest  // CallToolResult.fromJson: a normal content result is not a task handle
+{
+	Json j = Json.emptyObject;
+	j["content"] = Json([Json(["type": Json("text"), "text": Json("hi")])]);
+	auto r = CallToolResult.fromJson(j);
+	assert(!r.isTask());
+	assert(r.content.length == 1);
+}
+
+unittest  // a task-handle CallToolResult round-trips through toJson
+{
+	import mcp.protocol.tasks : Task, TaskStatus;
+
+	CallToolResult r;
+	r.task.taskId = "t9";
+	r.task.status = TaskStatus.working;
+	r.task.createdAt = r.task.lastUpdatedAt = "2026-06-07T10:30:00Z";
+	assert(r.isTask());
+
+	auto j = r.toJson();
+	assert(j["resultType"].get!string == "task");
+	assert("content" !in j);
+
+	auto back = CallToolResult.fromJson(j);
+	assert(back.isTask() && back.task.taskId == "t9");
 }
 
 unittest  // ListToolsResult carries tools and optional cursor
