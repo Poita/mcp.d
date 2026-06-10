@@ -42,6 +42,7 @@ public import mcp.server.server;
 public import mcp.server.settings;
 public import mcp.client.client;
 public import mcp.client.subscription;
+public import mcp.client.cache;
 
 // --- Declarative UDA / reflection API ---
 public import mcp.api.attributes;
