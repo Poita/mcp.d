@@ -1033,7 +1033,12 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	{
 		res.statusCode = HTTPStatus.methodNotAllowed;
 		res.headers["Allow"] = "POST";
-		res.writeBody("", "text/plain");
+		// A stateless server has no session to anchor the unsolicited push stream;
+		// name the remedy. The draft (stateful or not) simply has no standalone GET
+		// stream, so its 405 stays bodiless.
+		res.writeBody(server.mode != ServerMode.stateful
+				? "The standalone GET SSE stream requires a stateful server;"
+				~ " construct it with McpServer.stateful()." : "", "text/plain");
 		return;
 	}
 
@@ -2090,7 +2095,7 @@ unittest  // legacy POST: a handler that calls ctx.listRoots() sends the request
 	// Register a tool whose handler issues a roots/list server->client request.
 	Tool descriptor;
 	descriptor.name = "roottool";
-	server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
 		ctx.listRootsRaw(); // blocks until client replies; bypasses capability check
 		CallToolResult r;
 		return ToolResponse.complete(r);
