@@ -53,7 +53,7 @@ import std.typecons : nullable;
 import vibe.core.core : sleep;
 
 import mcp;
-import mcp.api.attributes : tool, describe;
+import mcp.api.attributes : tool, describeParam;
 import mcp.api.reflection : registerHandlers;
 import mcp.protocol.types : LogLevel;
 
@@ -107,8 +107,9 @@ final class StreamingApi
 	/// server counter), then reports progress `i/steps` and logs an info line.
 	@tool("countdown",
 			"Run a multi-step task, reporting progress + logging each step and honoring cancellation.")
-	CountdownResult countdown(@describe("number of steps to run") int steps,
-			@describe("delay between steps, in milliseconds") int delayMs, RequestContext ctx)@safe
+	@describeParam("steps", "number of steps to run")
+	@describeParam("delayMs", "delay between steps, in milliseconds")
+	CountdownResult countdown(int steps, int delayMs, RequestContext ctx) @safe
 	{
 		bool cancelled = false;
 		int completed = 0;
