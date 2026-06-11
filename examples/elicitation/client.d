@@ -127,11 +127,15 @@ int main(string[] args) @safe
 private int run(McpClient delegate() @safe makeClient) @safe
 {
 	// ---- A. DISCOVERY -----------------------------------------------------
+	// This example deliberately uses the stable initialize() handshake, not
+	// connect(): server->client elicitation needs a stateful session, and
+	// connect() against this SDK server would negotiate the stateless draft
+	// (where ctx.elicit is unavailable and tools surface inputRequired instead).
 	{
 		auto client = makeClient();
 		scope (exit)
 			client.close();
-		client.connect();
+		client.initialize();
 		checkEq(client.serverInfo().name, "elicitation-example", "server name");
 
 		auto tools = client.listTools().tools;
@@ -167,7 +171,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 			// false).
 			return ElicitResult.accept(AcceptForm(3));
 		};
-		client.connect();
+		client.initialize();
 
 		auto r = client.callTool("plan_trip", planArgs("Kyoto"));
 
@@ -212,7 +216,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		client.onElicitation = (ElicitParams p) @safe {
 			return ElicitResult.decline();
 		};
-		client.connect();
+		client.initialize();
 
 		auto r = client.callTool("plan_trip", planArgs("Oslo"));
 		check(!r.isError, "plan_trip (decline) should not be a tool error");
@@ -228,7 +232,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		client.onElicitation = (ElicitParams p) @safe {
 			return ElicitResult.cancel();
 		};
-		client.connect();
+		client.initialize();
 
 		auto r = client.callTool("plan_trip", planArgs("Lima"));
 		check(!r.isError, "plan_trip (cancel) should not be a tool error");
@@ -244,7 +248,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		// Deliberately install NO onElicitation handler, so this client does not
 		// advertise the elicitation capability. The server's ctx.elicit then
 		// refuses to send to a non-elicitation client, and the tool fails.
-		client.connect();
+		client.initialize();
 
 		bool failed;
 		try
