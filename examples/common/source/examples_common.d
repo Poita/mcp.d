@@ -72,31 +72,24 @@ void checkEq(T)(T actual, T expected, lazy string label) @safe
 }
 
 /// Run a self-verifying client `scenario` to completion and return its int
-/// return code (0 = pass, non-zero = fail). The scenario body is executed
-/// inside a vibe `runTask` and the event loop is driven uniformly, which is what
-/// lets the IDENTICAL scenario work over BOTH a synchronous stdio
-/// (`McpClient.spawn` / `spawnSibling`) transport and an HTTP transport: the
-/// stdio client's blocking request/response still completes inside the loop, and
-/// the HTTP client's background streams get a loop to run on. Any `Throwable`
-/// escaping the scenario is reported as a `FAIL:` line and mapped to rc 1.
+/// return code (0 = pass, non-zero = fail). A thin wrapper over
+/// `mcp.client.runner.runWithEventLoop` that keeps the example harness's
+/// int-rc + `FAIL:`-line contract: the scenario runs on the vibe event loop
+/// (which is what lets the IDENTICAL scenario work over BOTH a synchronous stdio
+/// `McpClient.spawn` / `spawnSibling` transport and an HTTP transport), and any
+/// `Throwable` escaping it — rethrown to us by `runWithEventLoop` — is reported as
+/// a `FAIL:` line and mapped to rc 1.
 int runClient(scope int delegate() @safe scenario) @trusted
 {
-	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import mcp.client.runner : runWithEventLoop;
 
-	int rc;
-	runTask(() nothrow{
-		scope (exit)
-			exitEventLoop();
-		try
-			rc = scenario();
-		catch (Throwable t)
-		{
-			logFail(t.msg);
-			rc = 1;
-		}
-	});
-	runEventLoop();
-	return rc;
+	try
+		return runWithEventLoop(scenario);
+	catch (Throwable t)
+	{
+		logFail(t.msg);
+		return 1;
+	}
 }
 
 /// Build the example client's transport from command-line `args`. If a

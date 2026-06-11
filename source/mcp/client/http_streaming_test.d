@@ -64,7 +64,7 @@ unittest
 	Tool tool;
 	tool.name = "echo";
 	tool.description = "Returns a fixed string";
-	server.registerDynamicTool(tool, (Json args, RequestContext ctx) @safe {
+	server.registerTool(tool, (Json args, RequestContext ctx) @safe {
 		return CallToolResult([Content.makeText("legacy-ok")]);
 	});
 
@@ -401,7 +401,7 @@ unittest
 	Tool tool;
 	tool.name = "slow";
 	tool.description = "Sleeps so concurrent calls overlap";
-	server.registerDynamicTool(tool, (Json args, RequestContext ctx) @safe {
+	server.registerTool(tool, (Json args, RequestContext ctx) @safe {
 		inFlight++;
 		if (inFlight > peak)
 			peak = inFlight;
