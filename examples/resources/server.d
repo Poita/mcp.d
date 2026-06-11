@@ -135,10 +135,11 @@ void main(string[] args) @safe
 
 	registerHandlers(server, new ResourcesApi(server));
 
-	// Advertise the resources subscribe + listChanged capabilities so the
-	// client may open a `subscriptions/listen` stream and receive push
-	// notifications over either transport.
-	server.enableResourceSubscriptions();
+	// Advertise the resources listChanged capability so the client learns it may
+	// receive list-changed notifications. The draft `subscriptions/listen` push of
+	// `notifications/resources/updated` is driven by each listen stream's own
+	// per-URI filter, so it works on this stateless server without (and indeed
+	// cannot use) `enableResourceSubscriptions()`, which is stateful-only.
 	server.enableResourcesListChanged();
 
 	// Transport (stdio default / --http on --port/--host) is handled by the

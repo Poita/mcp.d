@@ -24,6 +24,13 @@
 #     still run. Catching `Throwable` here is intentional and required; any
 #     other finding in that file still fails the gate.
 #
+#   * source/mcp/client/runner.d "Catching Error or Throwable".
+#     `runWithEventLoop` runs the caller's scenario inside a `nothrow` vibe
+#     task, so it must catch `Throwable` there to capture a failure (including
+#     a failing `assert`, an `Error`) and rethrow it to the caller after the
+#     event loop exits. Capture-and-rethrow, never swallow; any other finding
+#     in that file still fails the gate.
+#
 # Usage:
 #   scripts/dscanner-lint.sh
 #
@@ -44,6 +51,7 @@ findings="$(printf '%s\n' "${raw}" \
   | grep -E '\[(warn|error)\]' \
   | grep -vE '^source/mcp/api/reflection\.d\([0-9]+:[0-9]+\)\[error\]: (Expected `\)` instead of `:`|Declaration expected)' \
   | grep -vE '^source/mcp/internal/unittest_runner\.d\([0-9]+:[0-9]+\)\[warn\]: Catching Error or Throwable is almost always a bad idea\.' \
+  | grep -vE '^source/mcp/client/runner\.d\([0-9]+:[0-9]+\)\[warn\]: Catching Error or Throwable is almost always a bad idea\.' \
   || true)"
 
 if [[ -n "${findings}" ]]; then
