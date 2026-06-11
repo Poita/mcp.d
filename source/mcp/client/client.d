@@ -5,7 +5,7 @@ import std.algorithm : canFind, startsWith;
 import std.datetime : Clock, SysTime;
 import std.typecons : Nullable, nullable;
 
-import vibe.data.json : Json, parseJsonString, serializeToJson;
+import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
@@ -1128,16 +1128,6 @@ final class McpClient : ClientProtocol
 				() @safe => callToolLoop(name, arguments, token, opts.logLevel));
 	}
 
-	/// Typed-arguments convenience: serialize the struct `args` to its JSON wire
-	/// shape via vibe's `serializeToJson` and forward to the `Json`-arguments
-	/// `callTool`. Lets callers pass a strongly typed parameter struct instead of
-	/// hand-building a `Json` object.
-	CallToolResult callTool(T)(string name, T args, RequestOptions opts = RequestOptions.init) @safe
-			if (!is(T : Json))
-	{
-		return callTool(name, serializeToJson(args), opts);
-	}
-
 	/// Convenience overload for the dominant single-callback case: route this
 	/// call's progress to `onProgress` (a unique token is minted) without padding
 	/// the leading `RequestOptions` fields.
@@ -1145,16 +1135,6 @@ final class McpClient : ClientProtocol
 			void delegate(ProgressNotification) @safe onProgress) @safe
 	{
 		return callTool(name, arguments, RequestOptions.withProgress(onProgress));
-	}
-
-	/// Typed-arguments twin of the progress-callback `callTool` convenience
-	/// overload: serialize the struct `args` and route this call's progress to
-	/// `onProgress`.
-	CallToolResult callTool(T)(string name, T args,
-			void delegate(ProgressNotification) @safe onProgress) @safe
-			if (!is(T : Json))
-	{
-		return callTool(name, serializeToJson(args), RequestOptions.withProgress(onProgress));
 	}
 
 	/// Issue `tools/call` and, against a draft server, complete any MRTR
@@ -1664,17 +1644,6 @@ final class McpClient : ClientProtocol
 		auto token = effectiveToken(opts);
 		return withPerCallProgress!GetPromptResult(opts,
 				() @safe => getPromptLoop(name, arguments, token, opts.logLevel));
-	}
-
-	/// Typed-arguments convenience: serialize the struct `args` to its JSON wire
-	/// shape via vibe's `serializeToJson` and forward to the `Json`-arguments
-	/// `getPrompt`. Mirrors the typed `callTool(T)` so callers can pass a
-	/// strongly typed prompt-argument struct instead of hand-building a `Json`
-	/// object.
-	GetPromptResult getPrompt(T)(string name, T args, RequestOptions opts = RequestOptions.init) @safe
-			if (!is(T : Json))
-	{
-		return getPrompt(name, serializeToJson(args), opts);
 	}
 
 	/// Issue `prompts/get` and, against a draft server, complete any MRTR
@@ -4497,7 +4466,7 @@ unittest  // buildToolCallParams omits _meta when no progress token is requested
 	assert("_meta" !in p);
 }
 
-unittest  // typed callTool args serialize to the same wire object as hand-built Json
+unittest  // serializeToJson produces the same wire object as a hand-built Json
 {
 	import vibe.data.json : serializeToJson;
 
@@ -4507,18 +4476,18 @@ unittest  // typed callTool args serialize to the same wire object as hand-built
 		int b;
 	}
 
-	// The typed overload forwards `serializeToJson(args)` to the Json overload,
-	// so the wire arguments object must match a hand-built Json exactly.
-	auto typed = serializeToJson(AddArgs(2, 3));
+	// Callers building request arguments from a struct via `serializeToJson` get
+	// the same wire `arguments` object as building the `Json` by hand.
+	auto serialized = serializeToJson(AddArgs(2, 3));
 	Json hand = Json.emptyObject;
 	hand["a"] = 2;
 	hand["b"] = 3;
 
-	auto fromTyped = McpClient.buildToolCallParams("add", typed, ProgressToken.init);
+	auto fromSerialized = McpClient.buildToolCallParams("add", serialized, ProgressToken.init);
 	auto fromHand = McpClient.buildToolCallParams("add", hand, ProgressToken.init);
-	assert(fromTyped == fromHand);
-	assert(fromTyped["arguments"]["a"].get!int == 2);
-	assert(fromTyped["arguments"]["b"].get!int == 3);
+	assert(fromSerialized == fromHand);
+	assert(fromSerialized["arguments"]["a"].get!int == 2);
+	assert(fromSerialized["arguments"]["b"].get!int == 3);
 }
 
 unittest  // callTool with a per-call progress callback receives that call's progress
@@ -4705,33 +4674,6 @@ unittest  // RequestOptions.withProgress sets only the onProgress sink
 	assert(opts.onProgress !is null);
 	assert(!opts.progressToken.isSet);
 	assert(opts.logLevel.length == 0);
-}
-
-unittest  // typed getPrompt produces the same wire args as the Json form
-{
-	static struct GreetArgs
-	{
-		string who;
-	}
-
-	Json[] sentArgs;
-	auto c = McpClient.http("http://localhost");
-	c.onRpcForTest = (string method, Json params) @safe {
-		assert(method == "prompts/get");
-		sentArgs ~= params["arguments"];
-		Json r = Json.emptyObject;
-		r["messages"] = Json.emptyArray;
-		return r;
-	};
-
-	c.getPrompt("greet", GreetArgs("world"));
-	Json hand = Json.emptyObject;
-	hand["who"] = "world";
-	c.getPrompt("greet", hand);
-
-	assert(sentArgs.length == 2);
-	assert(sentArgs[0] == sentArgs[1]);
-	assert(sentArgs[0]["who"].get!string == "world");
 }
 
 unittest  // spawnSibling resolves a binary next to the running executable

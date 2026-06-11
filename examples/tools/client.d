@@ -57,28 +57,6 @@ private Tool find(Tool[] tools, string name) @safe
 	return t.isNull ? Tool.init : t.get;
 }
 
-/// Typed `calc` arguments — passed straight to `client.callTool("calc", CalcArgs(...))`,
-/// which serializes to the same wire object as a hand-built Json. `op` is
-/// the server's `Op` enum member as a string.
-struct CalcArgs
-{
-	string op;
-	double a;
-	double b;
-}
-
-/// Typed `magnitude` arguments — a nested `Vec2` struct serialized for the call.
-struct Vec2Arg
-{
-	double x;
-	double y;
-}
-
-struct MagnitudeArgs
-{
-	Vec2Arg v;
-}
-
 /// Typed view of `calc`'s structured output, decoded via `structuredContentAs!T`.
 /// The server's `Op` enum return field serializes by MEMBER NAME (e.g.
 /// "add") to match the tool's string `enum` outputSchema, so `op` is read
@@ -178,9 +156,15 @@ int main(string[] args) @safe
 		}
 
 		// --- call `calc` (struct return -> structuredContent) --------------
-		// Pass typed args and decode the typed structured output.
+		// Build the request arguments as Json and decode the typed structured
+		// output. The `op` enum is sent by member NAME ("add") to match the
+		// tool's string `enum` inputSchema.
 		{
-			auto r = client.callTool("calc", CalcArgs("add", 3.0, 4.0));
+			Json a = Json.emptyObject;
+			a["op"] = "add";
+			a["a"] = 3.0;
+			a["b"] = 4.0;
+			auto r = client.callTool("calc", a);
 			check(!r.isError, "calc add should not be an error");
 			auto calcOut = r.structuredContentAs!CalcOutput;
 			// The enum return field serializes by member name, so `op` is the string
@@ -205,7 +189,13 @@ int main(string[] args) @safe
 
 		// --- scalar return wrapped under `result` --------------------------
 		{
-			auto r = client.callTool("magnitude", MagnitudeArgs(Vec2Arg(3.0, 4.0)));
+			// `magnitude` takes a nested `v` object; build it as Json.
+			Json v = Json.emptyObject;
+			v["x"] = 3.0;
+			v["y"] = 4.0;
+			Json a = Json.emptyObject;
+			a["v"] = v;
+			auto r = client.callTool("magnitude", a);
 			check(isClose(r.structuredContentAs!ScalarOutput.result, 5.0),
 				"magnitude(3,4) should be 5");
 		}

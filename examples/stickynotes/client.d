@@ -46,18 +46,6 @@ import mcp;
 import examples_common : check, checkEq, runClient, connectFromArgs;
 import mcp.protocol.errors : McpException;
 
-/// Typed `add_note` arguments (passed to callTool as a struct, never hand-built).
-struct AddArgs
-{
-	string text;
-}
-
-/// Typed `remove_note` arguments.
-struct RemoveArgs
-{
-	string id;
-}
-
 /// Mirrors the server's `AddNoteResult` for typed decoding via structuredContentAs.
 struct AddNoteResult
 {
@@ -110,6 +98,22 @@ private bool hasResource(McpClient client, string uri) @safe
 	return client.listResources().resources.map!(r => r.uri).array.canFind(uri);
 }
 
+/// `add_note` arguments as a JSON object (`{ "text": text }`).
+private Json addArgs(string text) @safe
+{
+	Json a = Json.emptyObject;
+	a["text"] = text;
+	return a;
+}
+
+/// `remove_note` arguments as a JSON object (`{ "id": id }`).
+private Json removeArgs(string id) @safe
+{
+	Json a = Json.emptyObject;
+	a["id"] = id;
+	return a;
+}
+
 /// The transport-agnostic e2e body. The main flow uses one stateful connection;
 /// the unsupported-elicitation check opens its own.
 private int run(McpClient delegate() @safe makeClient) @safe
@@ -140,12 +144,12 @@ private int run(McpClient delegate() @safe makeClient) @safe
 	check(noteCount(client) == 0, "a fresh board should have no note resources");
 
 	// ---- B. ADD -----------------------------------------------------------
-	auto first = client.callTool("add_note", AddArgs("Buy milk"));
+	auto first = client.callTool("add_note", addArgs("Buy milk"));
 	check(!first.isError, "add_note should succeed");
 	auto firstNote = first.structuredContentAs!AddNoteResult;
 	check(firstNote.uri.canFind("note:///"), "add_note uri should be a note:/// URI");
 
-	auto second = client.callTool("add_note", AddArgs("Walk the dog"));
+	auto second = client.callTool("add_note", addArgs("Walk the dog"));
 	auto secondNote = second.structuredContentAs!AddNoteResult;
 	check(firstNote.id != secondNote.id, "each note should get a distinct id");
 
@@ -157,13 +161,13 @@ private int run(McpClient delegate() @safe makeClient) @safe
 			"reading the first note should return its text");
 
 	// ---- C. REMOVE ONE ----------------------------------------------------
-	auto removed = client.callTool("remove_note", RemoveArgs(firstNote.id));
+	auto removed = client.callTool("remove_note", removeArgs(firstNote.id));
 	checkEq(removed.structuredContentAs!RemoveNoteResult.removed, true,
 			"remove_note should remove it");
 	check(!hasResource(client, firstNote.uri), "removed note's resource should be gone");
 	checkEq(noteCount(client), cast(size_t) 1, "one note should remain after removing one");
 
-	auto missing = client.callTool("remove_note", RemoveArgs("does-not-exist"));
+	auto missing = client.callTool("remove_note", removeArgs("does-not-exist"));
 	check(!missing.isError, "removing an unknown id is not an error");
 	checkEq(missing.structuredContentAs!RemoveNoteResult.removed, false,
 			"removing an unknown id reports removed:false");
@@ -213,7 +217,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		plain.initialize();
 		// Add a note so remove_all actually tries to elicit (an empty board would
 		// short-circuit to "empty" before any elicitation).
-		plain.callTool("add_note", AddArgs("To be confirmed"));
+		plain.callTool("add_note", addArgs("To be confirmed"));
 
 		bool failed;
 		try

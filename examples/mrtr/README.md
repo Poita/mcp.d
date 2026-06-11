@@ -75,8 +75,9 @@ The **client** likewise adopts the typed/ergonomic SDK APIs on every path that
 has a clean one — no hand-built `Json` on the args, handler replies, or the
 structured result:
 
-- **typed `callTool("book_meeting", BookMeetingArgs("Q3 roadmap"))`** (#468) —
-  the wire `{topic}` object is serialized from a struct.
+- **`callTool("book_meeting", bookMeetingArgs("Q3 roadmap"))`** — the wire
+  `{topic}` object is built as a JSON object (the client request surface is
+  untyped — see the repo-root `DESIGN.md`).
 - **typed inbound `InputRequest` readers** (#503) — the surfaced requests are read
   via `req.elicitationMessage()` / `req.requestedSchema()` (the elicitation) and
   `req.asSampling()` (the sampling, decoded back into a typed

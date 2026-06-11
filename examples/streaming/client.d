@@ -28,7 +28,8 @@
  *   - per-call progress sink: `callTool(name, args, onProgress)` (the delegate
  *     overload) delivers THIS call's progress to a local callback.
  *   - `result.structuredContentAs!T` decodes structured output into a struct.
- *   - typed `callTool(name, T args)` passes a struct for the static-shape calls.
+ *   - the call `arguments` are built as a JSON object (the untyped client
+ *     request surface — see the repo-root DESIGN.md).
  *
  * What it verifies, in order:
  *   A. LIST + PROGRESS + LOGGING (transport-agnostic)
@@ -64,14 +65,17 @@ import mcp.protocol.errors : ErrorCode, McpException;
 
 import examples_common : check, runClient, connectFromArgs;
 
-// Typed mirrors of the server's structures, used for typed callTool args and
-// structuredContentAs!T decoding. They match the server's field names exactly.
+// Typed mirrors of the server's structured RESULTS, used for structuredContentAs!T
+// decoding. They match the server's field names exactly.
 
-/// `countdown` arguments.
-struct CountdownArgs
+/// `countdown` arguments as a JSON object (`{ "steps": steps, "delayMs": delayMs }`).
+/// The client request surface is untyped — see the repo-root `DESIGN.md`.
+private Json countdownArgs(int steps, int delayMs) @safe
 {
-	int steps;
-	int delayMs;
+	Json j = Json.emptyObject;
+	j["steps"] = steps;
+	j["delayMs"] = delayMs;
+	return j;
 }
 
 /// `countdown` final structured result.
@@ -185,7 +189,7 @@ private int phaseListProgressLogging(McpClient client, int steps) @safe
 	// Per-call progress sink: the SDK mints a unique progressToken for THIS call
 	// and routes only its progress notifications to this callback for the
 	// duration of the call.
-	auto result = client.callTool("countdown", CountdownArgs(steps, 20),
+	auto result = client.callTool("countdown", countdownArgs(steps, 20),
 			(ProgressNotification n) @safe {
 		progress ~= ProgressUpdate(n.progress, n.total.isNull
 			? -1 : n.total.get, n.progressTokenString);
@@ -271,7 +275,7 @@ private int phaseCancellation(string url, int cancelledBefore) @trusted
 		// cancel signal is absorbed, but Errors propagate and fail the run instead
 		// of being silently swallowed.
 		try
-			client.callTool("countdown", CountdownArgs(longSteps, 40),
+			client.callTool("countdown", countdownArgs(longSteps, 40),
 				(ProgressNotification) @safe {
 				sawFirstProgress = true;
 				progressCount++;

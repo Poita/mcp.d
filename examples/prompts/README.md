@@ -46,10 +46,10 @@ Client (`client.d`) — a **self-verifying e2e test** over both transports:
   The whole scenario runs inside the scaffold's `runClient(...)`. The assertions
   are transport-agnostic, so the **same** checks verify both runs.
 - asserts `prompts/list` contains exactly `greet` and `code_review`, with their
-  titles and typed-argument descriptors;
-- asserts `prompts/get greet` renders the typed `name` argument (passed as a
-  typed struct via `getPrompt(name, T args)`, not hand-built Json) into the
-  message text;
+  titles and argument descriptors;
+- asserts `prompts/get greet` renders the `name` argument (built as a JSON
+  object — the client request surface is untyped, see the repo-root `DESIGN.md`)
+  into the message text;
 - asserts `prompts/get code_review` returns an embedded-resource block, decoded
   via the typed `Content.embeddedResource()` -> `ResourceContents`, whose
   `uri`/`mimeType`/`text` match what was submitted;

@@ -50,7 +50,7 @@ Over stdio the client spawns the server with `McpClient.spawn([serverBinaryPath(
 and reaps it with `client.close()` (the SDK owns the subprocess and runs the MCP
 stdio shutdown sequence: close stdin → `SIGTERM` → `SIGKILL`) — there is no
 hand-rolled `ProcessPipes` plumbing. (This example has no tool/elicitation/sampling
-surface, so the typed callTool / `structuredContentAs!T` / elicitation /
+surface, so the `callTool` / `structuredContentAs!T` / elicitation /
 MRTR-builder APIs do not apply here.)
 
 ## Dual transport — one binary each
