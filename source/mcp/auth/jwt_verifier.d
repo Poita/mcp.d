@@ -100,11 +100,28 @@ TokenValidator jwtVerifier(JwtVerifierConfig cfg) @safe
 {
 	auto cache = new JwksCache(cfg.jwksUri, cfg.jwksCacheTtl);
 	return (string token) @safe {
-		try
-			return verifyToken(cfg, token, cache, currentUnixTime());
-		catch (Exception)
-			return TokenInfo.invalid();
+		return verifyOrInvalid(() @safe => verifyToken(cfg, token, cache, currentUnixTime()));
 	};
+}
+
+/// Run `verify` fail-closed: any exception (a JWKS-fetch outage, a key-parse
+/// error, an OpenSSL-internal failure) yields an invalid token rather than
+/// propagating, so an exception can never be mistaken for a valid credential.
+/// The exception is logged first — otherwise a verifier-side outage is
+/// indistinguishable from a flood of genuinely-bad-token rejections. The token
+/// itself is never logged (it is a bearer credential).
+package TokenInfo verifyOrInvalid(scope TokenInfo delegate() @safe verify) @safe
+{
+	try
+		return verify();
+	catch (Exception e)
+	{
+		import vibe.core.log : logWarn;
+
+		logWarn("jwtVerifier: token verification raised an exception (treated as invalid): %s",
+				e.msg);
+		return TokenInfo.invalid();
+	}
 }
 
 // ===========================================================================
@@ -1481,4 +1498,22 @@ unittest  // rsaJwkToPem rejects RSA keys shorter than 2048 bits (NIST SP 800-13
 	j.n = smallN;
 	j.e = "AQAB";
 	assert(jwkToPem(j) is null, "sub-2048-bit RSA key must be rejected");
+}
+
+unittest  // verifyOrInvalid fails closed: an exception during verification yields an invalid token
+{
+	auto info = verifyOrInvalid(() @safe {
+		throw new Exception("jwks unreachable");
+		return TokenInfo.invalid(); // unreachable; fixes the delegate's return type
+	});
+	assert(!info.valid);
+}
+
+unittest  // verifyOrInvalid returns the verifier's result when no exception is raised
+{
+	TokenInfo ok;
+	ok.valid = true;
+	ok.subject = "alice";
+	auto info = verifyOrInvalid(() @safe => ok);
+	assert(info.valid && info.subject == "alice");
 }
