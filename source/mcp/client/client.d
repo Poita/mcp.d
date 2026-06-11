@@ -254,6 +254,12 @@ final class McpClient : ClientProtocol
 	// Tool Parameters"). Populated by listTools; consumed by `headersFor`,
 	// which the HTTP transport calls to obtain the per-message headers.
 	private Json[string] toolInputSchemas_;
+	// Tool outputSchemas seen via tools/list, keyed by tool name. Lets a
+	// string-name `callTool` validate the returned structuredContent against the
+	// tool's declared outputSchema (when output-schema validation is enabled)
+	// without the caller having to hold the `Tool` descriptor. Populated by
+	// listTools; consumed by `callTool(string, ...)`.
+	private Json[string] toolOutputSchemas_;
 	// Draft (2026-07-28) per-request logging opt-in. The draft removed the
 	// `logging/setLevel` RPC; a client instead controls verbosity by stamping
 	// `_meta["io.modelcontextprotocol/logLevel"]` on each request, and a
@@ -825,7 +831,10 @@ final class McpClient : ClientProtocol
 		// cache hit too, so the Mcp-Param-{Name} mirroring stays consistent with the
 		// served list even when it came from a pre-seeded store.
 		foreach (t; acc.tools)
+		{
 			cacheToolSchema(t.name, t.inputSchema);
+			cacheToolOutputSchema(t.name, t.outputSchema);
+		}
 		return acc;
 	}
 
@@ -866,6 +875,19 @@ final class McpClient : ClientProtocol
 	{
 		if (name.length && inputSchema.type == Json.Type.object)
 			toolInputSchemas_[name] = inputSchema;
+	}
+
+	/// Record a tool's `outputSchema` (keyed by tool name) so a later string-name
+	/// `callTool` can validate the returned `structuredContent` against it when
+	/// output-schema validation is enabled (see `enableOutputSchemaValidation`).
+	/// Normally populated automatically by `listTools`; exposed so callers that
+	/// obtain a `Tool` descriptor by other means (e.g. a cached `tools/list`
+	/// result, or a `notifications/tools/list_changed` refresh) can register it
+	/// too. A non-object schema is ignored.
+	void cacheToolOutputSchema(string name, Json outputSchema) @safe
+	{
+		if (name.length && outputSchema.type == Json.Type.object)
+			toolOutputSchemas_[name] = outputSchema;
 	}
 
 	/// Replace the response cache backend. `store` may be your own `CacheStore`
@@ -1018,8 +1040,30 @@ final class McpClient : ClientProtocol
 	/// `CallToolResult`. The loop only
 	/// engages when draft mode is enabled (see `enableModern`/`connect`); other
 	/// protocol versions never see `inputRequests`.
+	///
+	/// When output-schema validation is enabled (see
+	/// `enableOutputSchemaValidation`) and a prior `listTools` cached this tool's
+	/// `outputSchema`, the returned `structuredContent` is validated against it and
+	/// a non-conforming result raises an `invalidParams` `McpException` — the same
+	/// guarantee as `callTool(Tool, ...)`, without the caller holding the descriptor.
 	CallToolResult callTool(string name, Json arguments = Json.emptyObject,
 			RequestOptions opts = RequestOptions.init) @safe
+	{
+		auto result = callToolImpl(name, arguments, opts);
+		// When output-schema validation is enabled and `listTools` has cached this
+		// tool's outputSchema, validate the returned structuredContent against it so
+		// a string-name call gets the same guarantee as `callTool(Tool, ...)`.
+		if (validateOutputSchema_)
+			if (auto schema = name in toolOutputSchemas_)
+				enforceOutputSchema(name, *schema, result);
+		return result;
+	}
+
+	/// Issue the `tools/call` (with per-call progress routing and MRTR looping)
+	/// without any output-schema validation. Shared by the string-name and
+	/// `Tool`-descriptor `callTool` overloads so validation happens in exactly one
+	/// place per call.
+	private CallToolResult callToolImpl(string name, Json arguments, RequestOptions opts) @safe
 	{
 		auto token = effectiveToken(opts);
 		return withPerCallProgress!CallToolResult(opts,
@@ -1278,14 +1322,9 @@ final class McpClient : ClientProtocol
 	CallToolResult callTool(const Tool tool, Json arguments = Json.emptyObject,
 			RequestOptions opts = RequestOptions.init) @safe
 	{
-		auto result = callTool(tool.name, arguments, opts);
+		auto result = callToolImpl(tool.name, arguments, opts);
 		if (validateOutputSchema_)
-		{
-			const msg = validateOutput(tool, result);
-			if (msg.length)
-				throw new McpException(ErrorCode.invalidParams, "Tool '" ~ tool.name
-						~ "' returned structuredContent that does not conform to its outputSchema: " ~ msg);
-		}
+			enforceOutputSchema(tool.name, tool.outputSchema, result);
 		return result;
 	}
 
@@ -1455,13 +1494,33 @@ final class McpClient : ClientProtocol
 	/// automatic validation.
 	static string validateOutput(const Tool tool, const CallToolResult result) @safe
 	{
+		return validateStructured(result, tool.outputSchema);
+	}
+
+	/// Validate a result's `structuredContent` against a raw `outputSchema` Json.
+	/// Returns an empty string when it conforms (including when the schema is not
+	/// an object or there is no structured content), otherwise the first violation.
+	private static string validateStructured(const CallToolResult result, Json outputSchema) @safe
+	{
 		import mcp.api.schema : validateAgainstSchema;
 
-		if (tool.outputSchema.type != Json.Type.object)
+		if (outputSchema.type != Json.Type.object)
 			return "";
 		if (result.structuredContent.type == Json.Type.undefined)
 			return "";
-		return validateAgainstSchema(result.structuredContent, tool.outputSchema);
+		return validateAgainstSchema(result.structuredContent, outputSchema);
+	}
+
+	/// Throw an `invalidParams` `McpException` if `result`'s `structuredContent`
+	/// does not conform to `outputSchema`; a no-op when it conforms.
+	private static void enforceOutputSchema(string name, Json outputSchema,
+			const CallToolResult result) @safe
+	{
+		const msg = validateStructured(result, outputSchema);
+		if (msg.length)
+			throw new McpException(ErrorCode.invalidParams, "Tool '" ~ name
+					~ "' returned structuredContent that does not conform to its outputSchema: "
+					~ msg);
 	}
 
 	/// `resources/list`, auto-paginated. Returns the drained
@@ -3231,6 +3290,131 @@ unittest  // validateOutput is a no-op when there is no structured content
 	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
 	CallToolResult r; // structuredContent stays undefined
 	assert(McpClient.validateOutput(t, r) == "");
+}
+
+unittest  // string-name callTool validates against the listTools-cached outputSchema
+{
+	import mcp.api.schema : jsonSchemaOf;
+
+	struct AddResult
+	{
+		int result;
+	}
+
+	auto c = McpClient.http("http://localhost");
+	c.enableOutputSchemaValidation();
+	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tools/list")
+		{
+			Json r = Json.emptyObject;
+			Json arr = Json.emptyArray;
+			arr ~= t.toJson();
+			r["tools"] = arr;
+			return r;
+		}
+		return Json(["structuredContent": Json(["result": Json("oops")])]);
+	};
+	c.listTools(); // populates the outputSchema cache
+
+	bool threw;
+	try
+		c.callTool("add");
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.invalidParams);
+	}
+	assert(threw, "string-name callTool must reject a result that violates the cached outputSchema");
+}
+
+unittest  // string-name callTool accepts a conforming result against the cached outputSchema
+{
+	import mcp.api.schema : jsonSchemaOf;
+
+	struct AddResult
+	{
+		int result;
+	}
+
+	auto c = McpClient.http("http://localhost");
+	c.enableOutputSchemaValidation();
+	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tools/list")
+		{
+			Json r = Json.emptyObject;
+			Json arr = Json.emptyArray;
+			arr ~= t.toJson();
+			r["tools"] = arr;
+			return r;
+		}
+		return Json(["structuredContent": Json(["result": Json(5)])]);
+	};
+	c.listTools();
+	auto res = c.callTool("add");
+	assert(res.structuredContent["result"].get!int == 5);
+}
+
+unittest  // string-name callTool skips output validation when it is not enabled
+{
+	import mcp.api.schema : jsonSchemaOf;
+
+	struct AddResult
+	{
+		int result;
+	}
+
+	auto c = McpClient.http("http://localhost");
+	// validation left disabled (the default)
+	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tools/list")
+		{
+			Json r = Json.emptyObject;
+			Json arr = Json.emptyArray;
+			arr ~= t.toJson();
+			r["tools"] = arr;
+			return r;
+		}
+		return Json(["structuredContent": Json(["result": Json("oops")])]);
+	};
+	c.listTools();
+	auto res = c.callTool("add"); // non-conforming, but accepted: validation is off
+	assert(res.structuredContent["result"].get!string == "oops");
+}
+
+unittest  // listTools caches each tool's outputSchema for later string-name validation
+{
+	import mcp.api.schema : jsonSchemaOf;
+
+	struct AddResult
+	{
+		int result;
+	}
+
+	auto c = McpClient.http("http://localhost");
+	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		Json arr = Json.emptyArray;
+		arr ~= t.toJson();
+		r["tools"] = arr;
+		return r;
+	};
+	c.listTools();
+	assert("add" in c.toolOutputSchemas_);
+}
+
+unittest  // cacheToolOutputSchema records an object schema and ignores a non-object one
+{
+	auto c = McpClient.http("http://localhost");
+	Json schema = Json(["type": Json("object")]);
+	c.cacheToolOutputSchema("search", schema);
+	assert("search" in c.toolOutputSchemas_);
+
+	c.cacheToolOutputSchema("bad", Json("not-an-object"));
+	assert("bad" !in c.toolOutputSchemas_);
 }
 
 unittest  // sampling dispatch rejects an unbalanced tool_use with -32602
