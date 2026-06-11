@@ -1000,7 +1000,7 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationS
 
 	void delegate(string) @safe opener = opts.openBrowser;
 	if (opener is null)
-		opener = (string u) @safe { openSystemBrowser(u); };
+		opener = (string u) @safe { cast(void) openSystemBrowser(u); };
 	opener(authzUrl);
 
 	void onTimeout() @safe nothrow
@@ -1683,7 +1683,7 @@ version (Posix) unittest  // openSystemBrowser does not leave a zombie process a
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	openSystemBrowser("mcp-sdk-test-zombie://localhost/verify-detach");
+	cast(void) openSystemBrowser("mcp-sdk-test-zombie://localhost/verify-detach");
 
 	Thread.sleep(300.msecs); // allow the launcher to exit and become a zombie if not detached
 
