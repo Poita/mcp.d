@@ -2090,7 +2090,7 @@ unittest  // legacy POST: a handler that calls ctx.listRoots() sends the request
 	// Register a tool whose handler issues a roots/list server->client request.
 	Tool descriptor;
 	descriptor.name = "roottool";
-	server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
 		ctx.listRootsRaw(); // blocks until client replies; bypasses capability check
 		CallToolResult r;
 		return ToolResponse.complete(r);

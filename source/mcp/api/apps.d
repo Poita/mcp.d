@@ -191,7 +191,7 @@ struct UiResourceMeta
 
 /// Attach a UI link to a tool's `_meta` under the `ui` key, preserving any
 /// other `_meta` entries already present. Use this on a `Tool` descriptor built
-/// for `McpServer.registerDynamicTool`; the `@ui` UDA does the same for the
+/// for `McpServer.registerTool`; the `@ui` UDA does the same for the
 /// FastMCP-style `@tool` API.
 void setUiToolMeta(ref Tool tool, UiToolMeta ui) @safe
 {

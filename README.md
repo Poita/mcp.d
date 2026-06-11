@@ -389,8 +389,8 @@ the parameter types) and output schema (from the return type) are derived at
 compile time, and arguments/results are marshalled for you. A handler may take a
 trailing `RequestContext` parameter to report progress, log, or call back to the
 client (sampling/elicitation). For tools whose schema is only known at runtime,
-drop to `server.registerDynamicTool(Tool, delegate)` / `registerResource` /
-`registerDynamicPrompt`, which receive the raw `Json`.
+drop to `server.registerTool(Tool, delegate)` / `registerResource` /
+`registerPrompt`, which receive the raw `Json`.
 
 ## MCP Apps (interactive UI)
 

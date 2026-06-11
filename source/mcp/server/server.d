@@ -582,7 +582,7 @@ final class McpServer
 	/// wire. For a statically-typed tool, prefer the UDA layer
 	/// (`@tool`-annotated methods registered via `registerTools`), which marshals
 	/// typed parameters for you and dispatches through this same dynamic path.
-	void registerDynamicTool(Tool descriptor, ToolHandler handler) @safe
+	void registerTool(Tool descriptor, ToolHandler handler) @safe
 	{
 		requireToolNameAvailable(descriptor.name);
 		tools[descriptor.name] = RegisteredTool(descriptor, (Json args,
@@ -590,9 +590,9 @@ final class McpServer
 	}
 
 	/// Register a *dynamic* tool with a simple handler that ignores the request
-	/// context. See `registerDynamicTool(Tool, ToolHandler)` for when to use the
+	/// context. See `registerTool(Tool, ToolHandler)` for when to use the
 	/// dynamic path versus the typed UDA layer.
-	void registerDynamicTool(Tool descriptor, CallToolResult delegate(Json) @safe handler) @safe
+	void registerTool(Tool descriptor, CallToolResult delegate(Json) @safe handler) @safe
 	{
 		requireToolNameAvailable(descriptor.name);
 		tools[descriptor.name] = RegisteredTool(descriptor, (Json args,
@@ -605,7 +605,7 @@ final class McpServer
 	/// `ToolResponse.complete` or `ToolResponse.inputRequired`; otherwise it may
 	/// call the blocking `ctx.elicit`/`ctx.sample`. A server that wants to serve
 	/// both protocol eras handles both branches here.
-	void registerDynamicTool(Tool descriptor, MrtrToolHandler handler) @safe
+	void registerTool(Tool descriptor, MrtrToolHandler handler) @safe
 	{
 		requireToolNameAvailable(descriptor.name);
 		tools[descriptor.name] = RegisteredTool(descriptor, handler);
@@ -844,7 +844,7 @@ final class McpServer
 	/// on the standalone GET SSE stream, informing them the set of available
 	/// tools changed (per the server/tools List Changed Notification). Returns
 	/// the number of listeners reached; `0` when no GET stream is open. Call
-	/// after a runtime `registerDynamicTool` / `removeTool`. For the draft protocol,
+	/// after a runtime `registerTool` / `removeTool`. For the draft protocol,
 	/// the notification is suppressed unless a client opted in via
 	/// `subscriptions/listen` with `toolsListChanged:true`.
 	size_t notifyToolsListChanged() @safe
@@ -869,7 +869,7 @@ final class McpServer
 	/// on the standalone GET SSE stream, informing them the set of available
 	/// prompts changed (per the server/prompts List Changed Notification).
 	/// Returns the number of listeners reached; `0` when no GET stream is open.
-	/// Call after a runtime `registerDynamicPrompt` (or a removal). For the draft
+	/// Call after a runtime `registerPrompt` (or a removal). For the draft
 	/// protocol, the notification is suppressed unless a client opted in via
 	/// `subscriptions/listen` with `promptsListChanged:true`.
 	size_t notifyPromptsListChanged() @safe
@@ -991,12 +991,12 @@ final class McpServer
 
 	/// Register a *dynamic* prompt with the handler that produces its messages.
 	///
-	/// Like `registerDynamicTool`, this is the explicit escape hatch for prompts
+	/// Like `registerTool`, this is the explicit escape hatch for prompts
 	/// whose argument set is defined at runtime: the handler receives the raw
 	/// `Json arguments`. For statically-typed prompts, prefer the UDA layer
 	/// (`@prompt`-annotated methods registered via `registerPrompts`), which
 	/// marshals typed parameters and dispatches through this same dynamic path.
-	void registerDynamicPrompt(Prompt descriptor, GetPromptResult delegate(Json) @safe handler) @safe
+	void registerPrompt(Prompt descriptor, GetPromptResult delegate(Json) @safe handler) @safe
 	{
 		// Adapt the simple handler — which always produces a final result — to the
 		// `PromptResponse`-returning form, ignoring the per-request context. Prompts
@@ -1017,7 +1017,7 @@ final class McpServer
 	/// Register a *dynamic* prompt whose handler may, on a stateless (MRTR) draft
 	/// request, ask the client for more input instead of returning a final result.
 	///
-	/// This is the prompts counterpart of the MRTR `registerDynamicTool` overload:
+	/// This is the prompts counterpart of the MRTR `registerTool` overload:
 	/// the handler receives the raw `Json arguments` and the per-request
 	/// `RequestContext`, and returns a `PromptResponse` — either
 	/// `PromptResponse.complete(result)` or, when it needs the client to gather
@@ -1028,7 +1028,7 @@ final class McpServer
 	/// `GetPromptResultResponse.result` as `GetPromptResult | InputRequiredResult`,
 	/// which this enables; on the 2025-era protocols a handler simply always
 	/// `complete`s, so its wire output carries only a plain `GetPromptResult`.
-	void registerDynamicPrompt(Prompt descriptor, MrtrPromptHandler handler) @safe
+	void registerPrompt(Prompt descriptor, MrtrPromptHandler handler) @safe
 	{
 		requirePromptNameAvailable(descriptor.name);
 		prompts[descriptor.name] = RegisteredPrompt(descriptor, handler);
@@ -1192,7 +1192,7 @@ final class McpServer
 		const toolName = descriptor.name;
 		const ttlDur = ttl;
 		const pollDur = pollInterval;
-		registerDynamicTool(descriptor, (Json args, RequestContext) @safe {
+		registerTool(descriptor, (Json args, RequestContext) @safe {
 			import mcp.protocol.tasks : makeCreateTaskResult;
 
 			auto seed = taskRuntime_.createFor(toolName, args, ttlDur, pollDur);
@@ -3245,7 +3245,7 @@ version (unittest)
 	private void registerAddTool(McpServer s) @safe
 	{
 		Tool add = {name: "add", description: nullable("Add two integers")};
-		s.registerDynamicTool(add, (Json args) @safe {
+		s.registerTool(add, (Json args) @safe {
 			const a = args["a"].get!int;
 			const b = args["b"].get!int;
 			CallToolResult r;
@@ -3278,7 +3278,7 @@ unittest  // a stateful session ignores a body _meta.protocolVersion naming an e
 	// effective version or cause the request to be rejected.
 	auto s = McpServer.stateful("ver-srv", "0.1.0");
 	Tool t = {name: "noop"};
-	s.registerDynamicTool(t, (Json args) @safe {
+	s.registerTool(t, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -3879,7 +3879,7 @@ unittest  // tools/list emits a tool descriptor's _meta
 	Json m = Json.emptyObject;
 	m["x.example/group"] = "demo";
 	t.meta = m;
-	s.registerDynamicTool(t, (Json args) @safe {
+	s.registerTool(t, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -3893,7 +3893,7 @@ unittest  // tools/call propagates a handler's result-level _meta to the wire
 {
 	auto s = new McpServer("meta-srv", "0.1.0");
 	Tool t = {name: "withmeta"};
-	s.registerDynamicTool(t, (Json args) @safe {
+	s.registerTool(t, (Json args) @safe {
 		Json m = Json.emptyObject;
 		m["io.modelcontextprotocol/cacheHit"] = true;
 		return CallToolResult([Content.makeText("ok")]).withMeta(m);
@@ -3927,7 +3927,7 @@ unittest  // output-schema validation: conforming structuredContent passes
 	Tool add = {
 		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
 	};
-	s.registerDynamicTool(add, (Json args) @safe {
+	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("sum")];
 		r.structuredContent = Json(["result": Json(5)]);
@@ -3955,7 +3955,7 @@ unittest  // output-schema validation: non-conforming structuredContent errors
 	Tool add = {
 		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
 	};
-	s.registerDynamicTool(add, (Json args) @safe {
+	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("sum")];
 		// Wrong type: result should be an integer.
@@ -3983,7 +3983,7 @@ unittest  // output-schema validation is off by default: bad output still ships
 	Tool add = {
 		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
 	};
-	s.registerDynamicTool(add, (Json args) @safe {
+	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("sum")];
 		r.structuredContent = Json(["result": Json("oops")]);
@@ -4014,7 +4014,7 @@ unittest  // output-schema validation: missing structuredContent is a violation
 	// Spec (2025-06-18 server/tools, Output Schema): "If an output schema is
 	// provided: Servers MUST provide structured results that conform to this
 	// schema." A missing structuredContent must therefore be flagged.
-	s.registerDynamicTool(add, (Json args) @safe {
+	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("sum")];
 		return r;
@@ -4044,7 +4044,7 @@ unittest  // output-schema validation: an isError result is exempt from the stru
 	// content and no structuredContent. The "MUST provide structured results"
 	// rule applies to successful results, so an isError result must not be
 	// turned into an internal protocol error.
-	s.registerDynamicTool(add, (Json args) @safe {
+	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("boom")];
 		r.isError = true;
@@ -4072,7 +4072,7 @@ unittest  // output-schema validation off: missing structuredContent still ships
 	Tool add = {
 		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
 	};
-	s.registerDynamicTool(add, (Json args) @safe {
+	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("sum")];
 		return r;
@@ -4099,7 +4099,7 @@ unittest  // input-schema validation: a missing required argument yields an isEr
 	Tool add = {
 		name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!AddArgs
 	};
-	s.registerDynamicTool(add, (Json args) @safe {
+	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -4131,7 +4131,7 @@ unittest  // input-schema validation: a wrong-typed argument yields an isError r
 	Tool add = {
 		name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!AddArgs
 	};
-	s.registerDynamicTool(add, (Json args) @safe {
+	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -4163,7 +4163,7 @@ unittest  // input-schema validation: conforming arguments dispatch normally
 	Tool add = {
 		name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!AddArgs
 	};
-	s.registerDynamicTool(add, (Json args) @safe {
+	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -4195,7 +4195,7 @@ unittest  // input-schema validation is ON by default: a missing required argume
 	Tool add = {
 		name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!AddArgs
 	};
-	s.registerDynamicTool(add, (Json args) @safe {
+	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -4224,7 +4224,7 @@ unittest  // input-schema validation default can be turned off via disableInputS
 	Tool add = {
 		name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!AddArgs
 	};
-	s.registerDynamicTool(add, (Json args) @safe {
+	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -4255,7 +4255,7 @@ unittest  // a genuinely malformed CallToolRequest (non-string name) is still -3
 	Tool add = {
 		name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!AddArgs
 	};
-	s.registerDynamicTool(add, (Json args) @safe {
+	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -4275,7 +4275,7 @@ unittest  // a tool handler that throws becomes an isError result, not a protoco
 	CallToolResult delegate(Json) @safe handler = (Json) {
 		throw new Exception("kaboom");
 	};
-	s.registerDynamicTool(boom, handler);
+	s.registerTool(boom, handler);
 	Json params = Json.emptyObject;
 	params["name"] = "boom";
 	auto resp = s.handle(req(6, "tools/call", params)).get;
@@ -4299,7 +4299,7 @@ unittest  // notifications/cancelled mid-handler: ctx.isCancelled flips and the 
 	auto s = new McpServer("t", "1");
 	bool sawCancelled;
 	Tool slow = {name: "slow"};
-	s.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
 		assert(!ctx.isCancelled);
 		// Concurrent cancellation for request id 42 (same as the call below).
 		Json p = Json.emptyObject;
@@ -4349,7 +4349,7 @@ unittest  // cancellation matches string-id requests too
 	auto s = new McpServer("t", "1");
 	bool sawCancelled;
 	Tool slow = {name: "slow"};
-	s.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
 		Json p = Json.emptyObject;
 		p["requestId"] = "req-abc";
 		s.handle(Message(makeNotification("notifications/cancelled", p)));
@@ -4405,7 +4405,7 @@ unittest  // a cancellation on connection B must not suppress connection A's sam
 	auto ctxB = new ConnCtx("conn-B");
 
 	Tool slow = {name: "slow"};
-	s.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
 		// While request id 42 runs on connection A, a cancellation for id 42
 		// arrives on connection B. With per-connection keying this must NOT flip
 		// A's token.
@@ -4432,7 +4432,7 @@ unittest  // a cancellation on the SAME connection still cancels
 	bool sawCancelled;
 
 	Tool slow = {name: "slow"};
-	s.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
 		Json p = Json.emptyObject;
 		p["requestId"] = 42;
 		// Same connection A as the in-flight request -> must match and cancel.
@@ -4682,10 +4682,10 @@ unittest  // registering a tool whose name already exists throws
 {
 	auto s = new McpServer("t", "1");
 	Tool a = {name: "dup"};
-	s.registerDynamicTool(a, (Json) @safe => CallToolResult.init);
+	s.registerTool(a, (Json) @safe => CallToolResult.init);
 	bool threw;
 	try
-		s.registerDynamicTool(a, (Json) @safe => CallToolResult.init);
+		s.registerTool(a, (Json) @safe => CallToolResult.init);
 	catch (Exception)
 		threw = true;
 	assert(threw, "duplicate tool registration must throw");
@@ -4747,10 +4747,10 @@ unittest  // registering a prompt whose name already exists throws
 {
 	auto s = new McpServer("t", "1");
 	Prompt p = {name: "dup"};
-	s.registerDynamicPrompt(p, (Json) @safe => GetPromptResult.init);
+	s.registerPrompt(p, (Json) @safe => GetPromptResult.init);
 	bool threw;
 	try
-		s.registerDynamicPrompt(p, (Json) @safe => GetPromptResult.init);
+		s.registerPrompt(p, (Json) @safe => GetPromptResult.init);
 	catch (Exception)
 		threw = true;
 	assert(threw, "duplicate prompt registration must throw");
@@ -4861,7 +4861,7 @@ unittest  // prompts/list and prompts/get with arguments
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet", description: nullable("greets")};
 	pr.arguments = [PromptArgument("who", nullable("name"), true)];
-	s.registerDynamicPrompt(pr, (Json args) @safe {
+	s.registerPrompt(pr, (Json args) @safe {
 		const who = ("who" in args) ? args["who"].get!string : "";
 		GetPromptResult r;
 		r.messages = [PromptMessage("user", Content.makeText("Hi " ~ who))];
@@ -4883,7 +4883,7 @@ unittest  // prompts/get returns -32602 when a required argument is missing
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet", description: nullable("greets")};
 	pr.arguments = [PromptArgument("who", nullable("name"), true)];
-	s.registerDynamicPrompt(pr, (Json args) @safe {
+	s.registerPrompt(pr, (Json args) @safe {
 		const who = ("who" in args) ? args["who"].get!string : "";
 		GetPromptResult r;
 		r.messages = [PromptMessage("user", Content.makeText("Hi " ~ who))];
@@ -4911,7 +4911,7 @@ unittest  // prompts/get allows a missing optional argument
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet", description: nullable("greets")};
 	pr.arguments = [PromptArgument("who", nullable("name"), false)];
-	s.registerDynamicPrompt(pr, (Json args) @safe {
+	s.registerPrompt(pr, (Json args) @safe {
 		const who = ("who" in args) ? args["who"].get!string : "world";
 		GetPromptResult r;
 		r.messages = [PromptMessage("user", Content.makeText("Hi " ~ who))];
@@ -5190,7 +5190,7 @@ unittest  // after setLevel(error), a handler's sub-error logs are dropped
 
 	// A tool that emits a log at every severity.
 	Tool t = {name: "noisy"};
-	s.registerDynamicTool(t, (Json args, RequestContext ctx) @safe {
+	s.registerTool(t, (Json args, RequestContext ctx) @safe {
 		ctx.log("debug", Json("d"));
 		ctx.log("warning", Json("w"));
 		ctx.log("error", Json("e"));
@@ -5229,7 +5229,7 @@ version (unittest) private McpServer makeNoisyLogServer() @safe
 	auto s = new McpServer("t", "1");
 	s.enableLogging();
 	Tool t = {name: "noisy"};
-	s.registerDynamicTool(t, (Json args, RequestContext ctx) @safe {
+	s.registerTool(t, (Json args, RequestContext ctx) @safe {
 		ctx.log("debug", Json("d"));
 		ctx.log("warning", Json("w"));
 		ctx.log("error", Json("e"));
@@ -5303,7 +5303,7 @@ version (unittest) private McpServer makeNoisyLogServerNoLogging() @safe
 	// so the server advertises no `logging` capability in initialize.
 	auto s = new McpServer("t", "1");
 	Tool t = {name: "noisy"};
-	s.registerDynamicTool(t, (Json args, RequestContext ctx) @safe {
+	s.registerTool(t, (Json args, RequestContext ctx) @safe {
 		ctx.log("debug", Json("d"));
 		ctx.log("warning", Json("w"));
 		ctx.log("error", Json("e"));
@@ -5424,7 +5424,7 @@ unittest  // prompts/get downgrades audio content to a text placeholder for a 20
 	// leaking an `audio` block.
 	auto s = new McpServer("t", "1");
 	Prompt descr = {name: "p"};
-	s.registerDynamicPrompt(descr, (Json) @safe {
+	s.registerPrompt(descr, (Json) @safe {
 		GetPromptResult r;
 		r.messages = [
 			PromptMessage("user", Content.makeAudio("YWJj", "audio/wav"))
@@ -5448,7 +5448,7 @@ unittest  // prompts/get downgrades resource_link content for a 2025-03-26 peer
 	// type method).
 	auto s = new McpServer("t", "1");
 	Prompt descr = {name: "p"};
-	s.registerDynamicPrompt(descr, (Json) @safe {
+	s.registerPrompt(descr, (Json) @safe {
 		GetPromptResult r;
 		r.messages = [
 			PromptMessage("user", Content.makeResourceLink("file:///a", "a"))
@@ -5471,7 +5471,7 @@ unittest  // prompts/get keeps resource_link content intact for a 2025-06-18 pee
 	// so it survives the dispatch path unchanged.
 	auto s = new McpServer("t", "1");
 	Prompt descr = {name: "p"};
-	s.registerDynamicPrompt(descr, (Json) @safe {
+	s.registerPrompt(descr, (Json) @safe {
 		GetPromptResult r;
 		r.messages = [
 			PromptMessage("user", Content.makeResourceLink("file:///a", "a"))
@@ -6004,7 +6004,7 @@ unittest  // draft prompts/get rejects with -32003 when a required client cap is
 {
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet"};
-	s.registerDynamicPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
+	s.registerPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
 	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
@@ -6020,7 +6020,7 @@ unittest  // draft prompts/get proceeds when the required cap is declared
 {
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet"};
-	s.registerDynamicPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
+	s.registerPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
 	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
@@ -6047,7 +6047,7 @@ unittest  // stateful (2025-era) prompts/get gates on negotiated session capabil
 {
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet"};
-	s.registerDynamicPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
+	s.registerPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
 	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
@@ -6284,10 +6284,7 @@ unittest  // draft resources/list, templates/list, prompts/list default to ttlMs
 	});
 	s.registerResourceTemplate(ResourceTemplate("res://{id}", "tpl"),
 			(string uri, string[string]) @safe { ResourceContents c; return c; });
-	s.registerDynamicPrompt(Prompt("p"), (Json) @safe {
-		GetPromptResult r;
-		return r;
-	});
+	s.registerPrompt(Prompt("p"), (Json) @safe { GetPromptResult r; return r; });
 	foreach (m; ["resources/list", "resources/templates/list", "prompts/list"])
 	{
 		auto resp = s.handle(draftReq(2, m)).get;
@@ -6328,7 +6325,7 @@ unittest
 	auto s = new McpServer("t", "1");
 	Json innerResp = Json.undefined;
 	Tool yielder = {name: "yielder", description: nullable("reentrant")};
-	s.registerDynamicTool(yielder, (Json args, RequestContext ctx) @safe {
+	s.registerTool(yielder, (Json args, RequestContext ctx) @safe {
 		// Mid-handle: dispatch a DIFFERENT-version request on the same server.
 		// This is the interleave a yielding handler would expose under concurrency.
 		innerResp = s.handle(req(99, "tools/list")).get; // pre-draft (latestStable)
@@ -6382,7 +6379,7 @@ unittest  // draft: a raw CallToolResult carrying inputRequests is stamped "inpu
 	// InputRequiredResult shape but reaches stampResultType without a resultType.
 	auto s = new McpServer("t", "1");
 	Tool t = {name: "raw"};
-	s.registerDynamicTool(t, (Json args) @safe {
+	s.registerTool(t, (Json args) @safe {
 		CallToolResult r;
 		r.inputRequests = [
 			InputRequest("date", "elicitation", Json(["message": Json("When?")]))
@@ -6774,7 +6771,7 @@ version (unittest)
 	private void registerBookTool(McpServer s) @safe
 	{
 		Tool book = {name: "book"};
-		s.registerDynamicTool(book, (Json args, RequestContext ctx) @safe {
+		s.registerTool(book, (Json args, RequestContext ctx) @safe {
 			if (ctx.isStateless)
 			{
 				auto answers = ctx.inputResponses();
@@ -6863,7 +6860,7 @@ unittest  // SEP-2322: a stateless server emits requestState and reads it back o
 	// the first round it asks for a date and attaches state "awaiting-date";
 	// on retry it reads ctx.requestState() to know how to finish.
 	Tool book = {name: "statebook"};
-	s.registerDynamicTool(book, (Json args, RequestContext ctx) @safe {
+	s.registerTool(book, (Json args, RequestContext ctx) @safe {
 		if (ctx.requestState() == "awaiting-date")
 		{
 			auto answers = ctx.inputResponses();
@@ -6922,7 +6919,7 @@ version (unittest) private McpServer secureStatebookServer() @safe
 	s.secureRequestState(sec);
 
 	Tool book = {name: "statebook"};
-	s.registerDynamicTool(book, (Json args, RequestContext ctx) @safe {
+	s.registerTool(book, (Json args, RequestContext ctx) @safe {
 		if (ctx.requestState() == "awaiting-date")
 		{
 			auto answers = ctx.inputResponses();
@@ -7014,7 +7011,7 @@ unittest  // no codec configured: outgoing requestState stays plaintext (wire un
 {
 	auto s = new McpServer("t", "1");
 	Tool book = {name: "statebook"};
-	s.registerDynamicTool(book, (Json args, RequestContext ctx) @safe {
+	s.registerTool(book, (Json args, RequestContext ctx) @safe {
 		Json ep = Json.emptyObject;
 		ep["message"] = "When?";
 		return ToolResponse.inputRequired([
@@ -7034,7 +7031,7 @@ unittest  // a draft InputRequiredResult drops an elicitation request the client
 	// an InputRequiredResult that the client could never fulfil.
 	auto s = new McpServer("t", "1");
 	Tool ask = {name: "ask"};
-	s.registerDynamicTool(ask, (Json args, RequestContext ctx) @safe {
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
 		Json ep = Json.emptyObject;
 		ep["message"] = "Your name?";
 		return ToolResponse.inputRequired([
@@ -7055,7 +7052,7 @@ unittest  // the same elicitation request IS emitted when the client declared el
 {
 	auto s = new McpServer("t", "1");
 	Tool ask = {name: "ask"};
-	s.registerDynamicTool(ask, (Json args, RequestContext ctx) @safe {
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
 		Json ep = Json.emptyObject;
 		ep["message"] = "Your name?";
 		return ToolResponse.inputRequired([
@@ -7081,7 +7078,7 @@ unittest  // a mixed InputRequiredResult drops only the unsupported kinds
 	// the elicitation request survives so the round trip can still proceed.
 	auto s = new McpServer("t", "1");
 	Tool ask = {name: "ask"};
-	s.registerDynamicTool(ask, (Json args, RequestContext ctx) @safe {
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
 		Json ep = Json.emptyObject;
 		ep["message"] = "Your name?";
 		return ToolResponse.inputRequired([
@@ -7107,7 +7104,7 @@ unittest  // elicit() is rejected on a stateless (draft) request
 {
 	auto s = new McpServer("t", "1");
 	Tool bad = {name: "bad"};
-	s.registerDynamicTool(bad, (Json args, RequestContext ctx) @safe {
+	s.registerTool(bad, (Json args, RequestContext ctx) @safe {
 		ctx.elicit("x", Json.emptyObject); // illegal under MRTR
 		CallToolResult r;
 		return ToolResponse.complete(r);
@@ -7167,7 +7164,7 @@ version (unittest)
 	private void registerTopicPrompt(McpServer s) @safe
 	{
 		Prompt descriptor = {name: "draftprompt"};
-		s.registerDynamicPrompt(descriptor, (Json args, RequestContext ctx) @safe {
+		s.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
 			auto answers = ctx.inputResponses();
 			if ("topic" !in answers)
 			{
@@ -7221,7 +7218,7 @@ unittest  // draft prompts/get reads back the echoed opaque requestState (SEP-23
 {
 	auto s = new McpServer("t", "1");
 	Prompt descriptor = {name: "stateprompt"};
-	s.registerDynamicPrompt(descriptor, (Json args, RequestContext ctx) @safe {
+	s.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
 		if (ctx.requestState() == "awaiting-topic")
 		{
 			GetPromptResult r;
@@ -7254,7 +7251,7 @@ unittest  // non-draft prompts/get is unaffected: no resultType, plain GetPrompt
 {
 	auto s = new McpServer("t", "1");
 	Prompt descriptor = {name: "plainprompt"};
-	s.registerDynamicPrompt(descriptor, (Json args, RequestContext ctx) @safe {
+	s.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
 		GetPromptResult r;
 		r.messages = [PromptMessage("user", Content.makeText("hi"))];
 		return PromptResponse.complete(r);
@@ -7424,7 +7421,7 @@ unittest  // tools listChanged is not advertised by default
 {
 	auto s = new McpServer("t", "1");
 	Tool add = {name: "add"};
-	s.registerDynamicTool(add, (Json) @safe { return CallToolResult(); });
+	s.registerTool(add, (Json) @safe { return CallToolResult(); });
 	auto caps = s.capabilities();
 	assert(!caps.tools.isNull);
 	assert(!caps.tools.get.listChanged);
@@ -7434,7 +7431,7 @@ unittest  // enableToolsListChanged advertises listChanged:true for tools
 {
 	auto s = new McpServer("t", "1");
 	Tool add = {name: "add"};
-	s.registerDynamicTool(add, (Json) @safe { return CallToolResult(); });
+	s.registerTool(add, (Json) @safe { return CallToolResult(); });
 	s.enableToolsListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.tools.isNull);
@@ -7461,7 +7458,7 @@ unittest  // removeTool unregisters a previously registered tool
 	auto s = new McpServer("t", "1");
 	s.enableToolsListChanged();
 	Tool add = {name: "add"};
-	s.registerDynamicTool(add, (Json) @safe { return CallToolResult(); });
+	s.registerTool(add, (Json) @safe { return CallToolResult(); });
 	assert(s.removeTool("add"));
 	auto resp = s.handle(req(1, "tools/list")).get;
 	assert(resp["result"]["tools"].length == 0);
@@ -7603,7 +7600,7 @@ unittest  // prompts listChanged is not advertised by default
 {
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet"};
-	s.registerDynamicPrompt(pr, (Json) @safe { return GetPromptResult(); });
+	s.registerPrompt(pr, (Json) @safe { return GetPromptResult(); });
 	auto caps = s.capabilities();
 	assert(!caps.prompts.isNull);
 	assert(!caps.prompts.get.listChanged);
@@ -7627,7 +7624,7 @@ unittest  // enablePromptsListChanged advertises listChanged:true for prompts
 {
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet"};
-	s.registerDynamicPrompt(pr, (Json) @safe { return GetPromptResult(); });
+	s.registerPrompt(pr, (Json) @safe { return GetPromptResult(); });
 	s.enablePromptsListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.prompts.isNull);
@@ -7889,7 +7886,7 @@ unittest  // setPageSize paginates tools/list across cursor-following pages
 	foreach (i; 0 .. 5)
 	{
 		Tool tool = {name: "tool" ~ i.to!string};
-		s.registerDynamicTool(tool, (Json) @safe {
+		s.registerTool(tool, (Json) @safe {
 			CallToolResult r;
 			r.content = [Content.makeText("ok")];
 			return r;
@@ -7927,7 +7924,7 @@ unittest  // without setPageSize, tools/list returns everything in one page (no 
 	foreach (i; 0 .. 5)
 	{
 		Tool tool = {name: "tool" ~ i.to!string};
-		s.registerDynamicTool(tool, (Json) @safe {
+		s.registerTool(tool, (Json) @safe {
 			CallToolResult r;
 			r.content = [Content.makeText("ok")];
 			return r;
@@ -7969,7 +7966,7 @@ unittest  // setPageSize paginates prompts/list
 	foreach (i; 0 .. 3)
 	{
 		Prompt pr = {name: "p" ~ i.to!string};
-		s.registerDynamicPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
+		s.registerPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
 	}
 	s.setPageSize(2);
 
@@ -8015,7 +8012,7 @@ unittest  // an invalid pagination cursor yields invalidParams (-32602)
 {
 	auto s = new McpServer("t", "1");
 	Tool tool = {name: "only"};
-	s.registerDynamicTool(tool, (Json) @safe {
+	s.registerTool(tool, (Json) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -8034,7 +8031,7 @@ unittest  // a stale cursor pointing past the end of the list yields invalidPara
 
 	auto s = new McpServer("t", "1");
 	Tool tool = {name: "only"};
-	s.registerDynamicTool(tool, (Json) @safe {
+	s.registerTool(tool, (Json) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -8060,7 +8057,7 @@ unittest  // a full roundtrip through cursor-following pagination yields every t
 	foreach (i; 0 .. 7)
 	{
 		Tool tool = {name: "tool" ~ i.to!string};
-		s.registerDynamicTool(tool, (Json) @safe {
+		s.registerTool(tool, (Json) @safe {
 			CallToolResult r;
 			r.content = [Content.makeText("ok")];
 			return r;
@@ -8092,17 +8089,17 @@ unittest  // a full roundtrip through cursor-following pagination yields every t
 // --- The whole handler surface is typed; raw-Json registration is
 // confined to a single, explicitly-named dynamic escape hatch ----------------
 
-unittest  // there are no raw-Json register*/completion entry points
+unittest  // the raw-Json escape hatches are named register{Tool,Prompt}
 {
 	auto s = new McpServer("t", "1");
 	Tool t;
 	t.name = "x";
 	Prompt p;
 	p.name = "x";
-	// Raw-Json names do not compile: the only Json-typed registration is the
-	// explicit dynamic hatch.
-	static assert(!__traits(hasMember, s, "registerTool"));
-	static assert(!__traits(hasMember, s, "registerPrompt"));
+	// The dynamic, raw-Json registration hatches are the un-prefixed names.
+	static assert(__traits(hasMember, s, "registerTool"));
+	static assert(__traits(hasMember, s, "registerPrompt"));
+	// Completion still has no raw-Json entry point; only the typed one exists.
 	static assert(!__traits(hasMember, s, "setCompletionHandler"));
 }
 
@@ -8111,7 +8108,7 @@ unittest  // the dynamic tool hatch accepts a raw-Json handler and dispatches it
 	auto s = new McpServer("t", "1");
 	Tool t;
 	t.name = "shout";
-	s.registerDynamicTool(t, (Json args) @safe {
+	s.registerTool(t, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText(args["msg"].get!string)];
 		return r;
@@ -8130,7 +8127,7 @@ unittest  // the dynamic prompt hatch accepts a raw-Json handler and dispatches 
 	auto s = new McpServer("t", "1");
 	Prompt pr;
 	pr.name = "greet";
-	s.registerDynamicPrompt(pr, (Json args) @safe {
+	s.registerPrompt(pr, (Json args) @safe {
 		GetPromptResult r;
 		r.messages = [PromptMessage("user", Content.makeText("hello"))];
 		return r;
@@ -8542,7 +8539,7 @@ unittest  // list endpoints answer once their capability is advertised
 	// so the matching list endpoint must answer rather than report -32601.
 	auto s = new McpServer("t", "1");
 	Tool tool = {name: "t"};
-	s.registerDynamicTool(tool, (Json) @safe {
+	s.registerTool(tool, (Json) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -8551,10 +8548,7 @@ unittest  // list endpoints answer once their capability is advertised
 		ResourceContents c;
 		return c;
 	});
-	s.registerDynamicPrompt(Prompt("p"), (Json) @safe {
-		GetPromptResult r;
-		return r;
-	});
+	s.registerPrompt(Prompt("p"), (Json) @safe { GetPromptResult r; return r; });
 	assert("error" !in s.handle(req(1, "tools/list")).get);
 	assert("error" !in s.handle(req(2, "resources/list")).get);
 	assert("error" !in s.handle(req(3, "resources/templates/list")).get);
