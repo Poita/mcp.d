@@ -7,7 +7,7 @@
 ///   - inferred output schema + `structuredContent` from a `struct` return;
 ///   - the behavioral marker UDAs `@readOnly` and `@destructive`
 ///     (plus `@idempotent`) that populate `ToolAnnotations`;
-///   - `@describe` argument documentation;
+///   - `@describeParam` argument documentation;
 ///   - returning a typed `CallToolResult` built with the typed `Content.make*`
 ///     factories (`Content.makeText`, `Content.makeResourceLink`) — no
 ///     hand-built content Json;
@@ -65,9 +65,11 @@ struct CalcResult
 /// `structuredContent`.
 @tool("calc", "Apply an arithmetic operation to two numbers")
 @readOnly @idempotent @hintTitle("Calculator")
-CalcResult calc(@describe("the operation to apply") Op op, @describe("left operand") double a,
-		@describe("right operand") double b,
-		@describe("optional rounding to N decimals") Nullable!int round)@safe
+@describeParam("op", "the operation to apply")
+@describeParam("a", "left operand")
+@describeParam("b", "right operand")
+@describeParam("round", "optional rounding to N decimals")
+CalcResult calc(Op op, double a, double b, Nullable!int round) @safe
 {
 	double r;
 	final switch (op)
@@ -95,7 +97,8 @@ CalcResult calc(@describe("the operation to apply") Op op, @describe("left opera
 /// A tool taking a struct argument and returning a scalar. Scalar returns are
 /// wrapped under a `result` key in structuredContent.
 @tool("magnitude", "Euclidean length of a 2D vector")
-@readOnly double magnitude(@describe("the vector") Vec2 v)@safe
+@readOnly @describeParam("v", "the vector")
+double magnitude(Vec2 v) @safe
 {
 	import std.math : sqrt;
 
@@ -104,7 +107,8 @@ CalcResult calc(@describe("the operation to apply") Op op, @describe("left opera
 
 /// A string-returning tool — produces plain text content, no structuredContent.
 @tool("greet", "Greet someone by name")
-@readOnly string greet(@describe("who to greet") string name)@safe
+@readOnly @describeParam("name", "who to greet")
+string greet(string name) @safe
 {
 	return "Hello, " ~ name ~ "!";
 }
@@ -112,7 +116,8 @@ CalcResult calc(@describe("the operation to apply") Op op, @describe("left opera
 /// A `@destructive` tool — its presence sets `destructiveHint:true`. The body is
 /// a no-op stand-in for a real side effect; it just confirms the request.
 @tool("erase", "Erase a record by id (destructive)")
-@destructive string erase(@describe("record id") string id)@safe
+@destructive @describeParam("id", "record id")
+string erase(string id) @safe
 {
 	return "erased " ~ id;
 }
@@ -122,7 +127,8 @@ CalcResult calc(@describe("the operation to apply") Op op, @describe("left opera
 /// `Content.makeResourceLink` for a pointer to a related resource. This shows
 /// building multi-block tool content WITHOUT hand-writing any content Json.
 @tool("describe_doc", "Return a text note plus a resource link for a document id")
-@readOnly CallToolResult describeDoc(@describe("document id") string id)@safe
+@readOnly @describeParam("id", "document id")
+CallToolResult describeDoc(string id) @safe
 {
 	CallToolResult r;
 	r.content = [

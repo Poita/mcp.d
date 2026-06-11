@@ -17,7 +17,8 @@ Server (`server.d`) — one binary, either transport:
 
 - **`@prompt` with typed arguments.** Prompt methods are plain D methods
   annotated with `@prompt(...)`; their parameters become the prompt's typed
-  arguments, and `@describe(...)` documents each one. The reflection layer
+  arguments, and a method-level `@describeParam("name", ...)` documents each one.
+  The reflection layer
   (`registerHandlers`) derives the `prompts/list` descriptors and the typed
   dispatch for `prompts/get` automatically.
 - **Typed content, no hand-built Json.** The `code_review` prompt returns a

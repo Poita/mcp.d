@@ -13,7 +13,8 @@ the D programming language — client and server, built on [vibe-d](https://vibe
 A server is a handful of annotated functions plus `runStdio`:
 
 ```d
-// server.d
+module demo;
+
 import mcp;
 import mcp.transport : runStdio;
 
@@ -23,37 +24,31 @@ long add(long a, long b) @safe { return a + b; }
 void main()
 {
     auto server = new McpServer("demo", "1.0.0");
-    registerModule!(__traits(parent, add))(server);
+    registerModule!demo(server);
     runStdio(server);
 }
 ```
 
 A client spawns that server over stdio, negotiates the protocol (any era — legacy
-or modern) with `connect()`, calls the tool, and checks the result:
+or modern) with `connect()`, calls the tool, and checks the result. Wrap the work
+in `runWithEventLoop` — it drives vibe's event loop for you and hands back the
+scenario's value (see [Concurrency model](#concurrency-model)):
 
 ```d
 // client.d — build server.d as ./demo-server first
 import mcp;
 import vibe.data.json : parseJsonString;
-import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 
 void main()
 {
-    // The client drives vibe's event loop.
-    runTask(() nothrow {
-        scope (exit) exitEventLoop();
-        try
-        {
-            auto client = McpClient.spawn(["./demo-server"]);
-            scope (exit) client.close();
-            client.connect();
+    auto result = runWithEventLoop(() @safe {
+        auto client = McpClient.spawn(["./demo-server"]);
+        scope (exit) client.close();
+        client.connect();
 
-            auto r = client.callTool("add", parseJsonString(`{"a": 2, "b": 3}`));
-            assert(r.structuredContent["result"].get!long == 5);
-        }
-        catch (Exception e) assert(false, e.msg);
+        return client.callTool("add", parseJsonString(`{"a": 2, "b": 3}`));
     });
-    runEventLoop();
+    assert(result.structuredContent["result"].get!long == 5);
 }
 ```
 
@@ -265,9 +260,10 @@ is resolved.
 | Session id minted | never | never | yes |
 
 The `subscribe` capability advertisement follows the same rule: a stateless server
-does **not** advertise the resources `subscribe` capability even after
-`enableResourceSubscriptions()` (the opt-in is inert in stateless mode), so a
-client never expects per-resource update push it could not receive. The
+does **not** advertise the resources `subscribe` capability. Calling
+`enableResourceSubscriptions()` on a stateless server **throws** rather than
+silently doing nothing — it names `McpServer.stateful()` as the remedy — so the
+mistake surfaces at construction instead of as a missing capability at runtime. The
 server->client (elicit/sample/roots) gating is transport-agnostic — stdio follows
 the same `server.mode` rules as HTTP.
 
@@ -389,8 +385,8 @@ the parameter types) and output schema (from the return type) are derived at
 compile time, and arguments/results are marshalled for you. A handler may take a
 trailing `RequestContext` parameter to report progress, log, or call back to the
 client (sampling/elicitation). For tools whose schema is only known at runtime,
-drop to `server.registerDynamicTool(Tool, delegate)` / `registerResource` /
-`registerDynamicPrompt`, which receive the raw `Json`.
+drop to `server.registerTool(Tool, delegate)` / `registerResource` /
+`registerPrompt`, which receive the raw `Json`.
 
 ## MCP Apps (interactive UI)
 
@@ -493,17 +489,72 @@ else
 > `-32601` and no `tasks` capability is advertised. Only the SEP-2663 extension
 > above is supported, and only under the draft protocol version.
 
-## Event-loop model
+## Concurrency model
 
-`McpClient` speaks vibe.d async I/O: call every `McpClient` method from inside the
-vibe event loop — wrap your calls in a `runTask` under `runEventLoop()` (the
-examples' shared scaffold does this for you). The same API (`initialize` /
+`McpClient` speaks vibe.d async I/O. Its verbs (`connect` / `initialize` /
 `listTools` / `callTool` / `listResources` / `readResource` / `listPrompts` /
 `getPrompt` / `subscribe` / `setLogLevel`, plus the auto-paginated list helpers and
-`enableModern()`) works over every transport. `McpClient.http(url)` builds a client
-over Streamable HTTP; `McpClient.spawn(command)` / `McpClient.stdio(readLine,
-writeLine)` build one over stdio. The server side is `runStreamableHttp(server,
-port)` or `runStdio(server)`.
+`enableModern()`) are **fiber-blocking, not thread-blocking** — this is the Go-SDK
+model: a call reads like a plain blocking call, but under the hood it yields its
+fiber back to the event loop until the reply arrives, costing you nothing but a
+cheap green thread. You get concurrency by **spawning more tasks**, not by reaching
+for an async surface.
+
+Because the loop stays live *during* a call, progress notifications and
+server→client handlers (sampling / elicitation) still dispatch mid-call — a
+`callTool` that takes a minute does not freeze the loop. The same API works over
+every transport: `McpClient.http(url)` builds a client over Streamable HTTP,
+`McpClient.spawn(command)` / `McpClient.stdio(readLine, writeLine)` build one over
+stdio. The server side is `runStreamableHttp(server, port)` or `runStdio(server)`.
+
+**Running concurrent calls.** Every verb must run inside a task under a running
+event loop. Spawn each concurrent call as its own `runTask` and let the loop
+interleave their I/O:
+
+```d
+import vibe.core.core : runTask;
+
+runTask({ auto a = client.callTool("one", argsA); /* ... */ });
+runTask({ auto b = client.callTool("two", argsB); /* ... */ });
+```
+
+**Entering the loop from a non-vibe process.** If your process is not otherwise
+vibe-based and its MCP work has a scoped lifetime (CLI tools, batch jobs, tests),
+use `runWithEventLoop` — it spins up the loop, runs your scenario inside a task,
+exits the loop when the scenario returns, hands back its value, and rethrows any
+exception on your side:
+
+```d
+import mcp; // re-exports runWithEventLoop
+
+void main()
+{
+    auto five = runWithEventLoop(() @safe {
+        auto client = McpClient.spawn(["./demo-server"]);
+        scope (exit) client.close();
+        client.connect();
+        auto r = client.callTool("add", parseJsonString(`{"a": 2, "b": 3}`));
+        return r.structuredContent["result"].get!long;
+    });
+    assert(five == 5);
+}
+```
+
+A vibe-native app needs no runner — there is already a loop, so just call
+`McpClient` from any task. For a long-lived non-vibe host (a GUI, a game loop, a
+server in another framework), run your MCP integration on the loop on its own
+thread and hand results to the rest of the app over your own channel, rather than
+entering and exiting the loop per call.
+
+**Long-running work** belongs to `RequestOptions.onProgress` and the
+[Tasks extension](#mcp-tasks-asynchronous-execution) (`@task` / `awaitTask`), not
+to a blocked thread.
+
+**No sync wrapper, by design.** There is deliberately no blocking cross-thread
+synchronous `McpClient` facade and no "sync client" wrapper: tool calls can run
+for minutes, and parking a host thread on one is a foot-gun. Fiber-blocking already
+gives you the Go model on the loop's own thread, so the decision is settled — reach
+for `runTask` and the Tasks extension, not a thread bridge.
 
 
 ## Running the conformance suite
