@@ -265,9 +265,10 @@ is resolved.
 | Session id minted | never | never | yes |
 
 The `subscribe` capability advertisement follows the same rule: a stateless server
-does **not** advertise the resources `subscribe` capability even after
-`enableResourceSubscriptions()` (the opt-in is inert in stateless mode), so a
-client never expects per-resource update push it could not receive. The
+does **not** advertise the resources `subscribe` capability. Calling
+`enableResourceSubscriptions()` on a stateless server **throws** rather than
+silently doing nothing — it names `McpServer.stateful()` as the remedy — so the
+mistake surfaces at construction instead of as a missing capability at runtime. The
 server->client (elicit/sample/roots) gating is transport-agnostic — stdio follows
 the same `server.mode` rules as HTTP.
 
@@ -389,8 +390,8 @@ the parameter types) and output schema (from the return type) are derived at
 compile time, and arguments/results are marshalled for you. A handler may take a
 trailing `RequestContext` parameter to report progress, log, or call back to the
 client (sampling/elicitation). For tools whose schema is only known at runtime,
-drop to `server.registerDynamicTool(Tool, delegate)` / `registerResource` /
-`registerDynamicPrompt`, which receive the raw `Json`.
+drop to `server.registerTool(Tool, delegate)` / `registerResource` /
+`registerPrompt`, which receive the raw `Json`.
 
 ## MCP Apps (interactive UI)
 

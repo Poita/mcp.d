@@ -249,7 +249,9 @@ interface RequestContext
 	final Json sample(Json params) @safe
 	{
 		if (isStateless)
-			throw internalError("sample() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
+			throw internalError("sample() is unavailable on a stateless (MRTR) request;"
+					~ " return ToolResponse.inputRequired instead, or construct the server with"
+					~ " McpServer.stateful() for a blocking server->client round-trip");
 		if (!clientSupports(ClientCapability.sampling))
 			throw invalidRequest("Client does not support sampling");
 		// Per spec, servers MUST NOT send tool-enabled sampling requests to
@@ -296,7 +298,9 @@ interface RequestContext
 	final ElicitResult elicit(string message, Json requestedSchema) @safe
 	{
 		if (isStateless)
-			throw internalError("elicit() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
+			throw internalError("elicit() is unavailable on a stateless (MRTR) request;"
+					~ " return ToolResponse.inputRequired instead, or construct the server with"
+					~ " McpServer.stateful() for a blocking server->client round-trip");
 		// Per client/elicitation: servers MUST NOT send elicitation requests
 		// with modes the client does not support. A bare `elicitation:{}` is
 		// form-only, so a generic declaration already sets the form submode.
@@ -339,7 +343,9 @@ interface RequestContext
 	final ElicitResult elicitUrl(string message, string url, string elicitationId) @safe
 	{
 		if (isStateless)
-			throw internalError("elicitUrl() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
+			throw internalError("elicitUrl() is unavailable on a stateless (MRTR) request;"
+					~ " return ToolResponse.inputRequired instead, or construct the server with"
+					~ " McpServer.stateful() for a blocking server->client round-trip");
 		// Per client/elicitation: servers MUST NOT send a url-mode request to a
 		// client that only declared form mode (e.g. a bare `elicitation:{}`).
 		if (!clientSupports(ClientCapability.elicitationUrl))
@@ -367,7 +373,9 @@ interface RequestContext
 	final ListRootsResult listRoots() @safe
 	{
 		if (isStateless)
-			throw internalError("listRoots() is unavailable on a stateless (MRTR) request; return ToolResponse.inputRequired instead");
+			throw internalError("listRoots() is unavailable on a stateless (MRTR) request;"
+					~ " return ToolResponse.inputRequired instead, or construct the server with"
+					~ " McpServer.stateful() for a blocking server->client round-trip");
 		if (!clientSupports(ClientCapability.roots))
 			throw invalidRequest("Client does not support roots");
 		return ListRootsResult.fromJson(listRootsRaw());
@@ -1530,6 +1538,7 @@ unittest  // listRoots() on a stateless (MRTR) request throws an internalError (
 unittest  // elicit() on a stateless (MRTR) request throws an internalError (server fault)
 {
 	import mcp.protocol.errors : McpException, ErrorCode;
+	import std.algorithm.searching : canFind;
 
 	auto probe = new ElicitProbe;
 	probe.stateless = true;
@@ -1540,6 +1549,12 @@ unittest  // elicit() on a stateless (MRTR) request throws an internalError (ser
 	{
 		threw = true;
 		assert(e.code == ErrorCode.internalError);
+		// The message must name both stateless remedies: the MRTR escape hatch
+		// (ToolResponse.inputRequired) and the stateful-server construction.
+		assert(e.msg.canFind("ToolResponse.inputRequired"),
+				"the stateless elicit error must name ToolResponse.inputRequired");
+		assert(e.msg.canFind("McpServer.stateful()"),
+				"the stateless elicit error must name McpServer.stateful()");
 	}
 	assert(threw);
 }

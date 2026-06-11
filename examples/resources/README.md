@@ -16,9 +16,12 @@ Server side (`server.d`), written in the ergonomic **UDA style**
   `ttlMs` milliseconds).
 - **Resource template** — `@resourceTemplate("note:///{id}")`; the reader
   receives the captured `{id}` as a typed argument.
-- **Subscriptions** — `enableResourceSubscriptions()` advertises the capability;
-  `notifyResourceUpdated(uri)` pushes `notifications/resources/updated` to
-  subscribers.
+- **Subscriptions** — the draft `subscriptions/listen` stream delivers
+  `notifyResourceUpdated(uri)` pushes (`notifications/resources/updated`) per its
+  own per-URI filter, so it works on this stateless server. The 2025-era
+  `resources/subscribe` capability instead requires a stateful server
+  (`McpServer.stateful()`) opted in via `enableResourceSubscriptions()`, which
+  now throws on a stateless server rather than silently doing nothing.
 - **List-changed** — `enableResourcesListChanged()` + `notifyResourcesListChanged()`
   emit `notifications/resources/list_changed` when the available set changes.
 - A `@tool` `set_note` mutates (or creates) a note, then pushes the appropriate

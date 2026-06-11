@@ -105,59 +105,52 @@ void registerModules(mods...)(McpServer server) @safe
 		registerModule!mod(server);
 }
 
-/// Reject any method-level `@describe` UDA that uses the single-argument form
-/// (`@describe("text")` with no second argument). At method level, the first
-/// field of the `describe` struct is the *parameter name* to match — it is not
-/// the description text. A single-argument form therefore fills only `parameter`
-/// and leaves `description` empty, so the UDA matches nothing and the text is
-/// silently discarded. This is always a programmer error; reject it at compile
-/// time so the user gets a clear diagnostic instead of an undocumented tool.
-private void rejectSingleArgMethodDescribe(alias func)()
+/// Reject any method-level `@describeParam` or `@mcpHeader` UDA whose
+/// `parameter` does not name a schema parameter of `func`. A parameter that is
+/// not declared at all, or one that is an injected context parameter (a trailing
+/// `RequestContext` / `TaskContext`, which is excluded from the input schema and
+/// has no property to annotate), is always a programmer error: the annotation
+/// would silently match nothing. Reject it at compile time with a clear
+/// diagnostic instead.
+private void validateParamUdas(alias func)()
 {
+	alias names = ParameterIdentifierTuple!func;
+	alias types = Parameters!func;
+
+	// Whether `pname` names a parameter of `func` that appears in the input
+	// schema (declared, and not an injected RequestContext / TaskContext).
+	static bool namesSchemaParam(string pname)()
+	{
+		bool found;
+		static foreach (i, P; types)
+			static if (!is(P : RequestContext) && !is(P == TaskContext))
+				if (names[i] == pname)
+					found = true;
+		return found;
+	}
+
 	static foreach (attr; __traits(getAttributes, func))
 	{
-		static if (is(typeof(attr) == describe))
-		{
-			static assert(attr.description.length != 0,
-					"method-level @describe(\"" ~ attr.parameter
-					~ "\") is a single-argument form: the first field is the parameter "
-					~ "name to match, not the description. Use " ~ "@describe(\"" ~ attr.parameter
-					~ "\", \"<description text>\") "
-					~ "to document parameter '" ~ attr.parameter ~ "'.");
-		}
+		static if (is(typeof(attr) == describeParam))
+			static assert(namesSchemaParam!(attr.parameter)(), "@describeParam(\""
+					~ attr.parameter ~ "\", ...) names no schema parameter of this method "
+					~ "(an injected RequestContext/TaskContext has no schema property).");
+		else static if (is(typeof(attr) == mcpHeader))
+			static assert(namesSchemaParam!(attr.parameter)(), "@mcpHeader(\""
+					~ attr.parameter ~ "\", ...) names no schema parameter of this method "
+					~ "(an injected RequestContext/TaskContext has no schema property).");
 	}
 }
 
-/// Resolve the documentation string for parameter `i` (named `pname`) of `func`
-/// from the `@describe` UDA layer, or `""` when none applies.
-///
-/// Two spellings are honored:
-///  * parameter-level `@describe(...)` attached directly to the parameter. The
-///    single-string form `@describe("text")` (which fills the struct's first
-///    field, `parameter`) is treated as the description; the explicit
-///    `@describe(name, text)` form on a parameter uses `description`.
-///  * method-level `@describe(name, text)` whose `parameter` matches `pname`,
-///    documenting an argument from the function's own UDA list.
-private string describeFor(alias func, size_t i, string pname)() @safe
+/// Resolve the documentation string for the parameter named `pname` of `func`
+/// from the method-level `@describeParam` UDA layer, or `""` when none applies.
+private string describeFor(alias func, string pname)() @safe
 {
-	alias types = Parameters!func;
 	string desc;
-	// Parameter-level @describe.
-	static foreach (attr; __traits(getAttributes, types[i .. i + 1]))
-		static if (is(typeof(attr) == describe))
-			{
-			if (attr.description.length)
-				desc = attr.description;
-			else if (attr.parameter.length)
-				desc = attr.parameter;
-		}
-	// Method-level @describe(name, text) naming this parameter.
 	static foreach (attr; __traits(getAttributes, func))
-		static if (is(typeof(attr) == describe))
-			{
+		static if (is(typeof(attr) == describeParam))
 			if (attr.parameter == pname && attr.description.length)
 				desc = attr.description;
-		}
 	return desc;
 }
 
@@ -183,6 +176,8 @@ private Json parametersSchema(alias func)() @safe
 	import mcp.protocol.modern : validateHeaderName;
 	import std.traits : ParameterDefaultValueTuple;
 
+	validateParamUdas!func();
+
 	alias names = ParameterIdentifierTuple!func;
 	alias types = Parameters!func;
 	// ParameterDefaultValueTuple yields `void` for a parameter with no declared
@@ -201,34 +196,38 @@ private Json parametersSchema(alias func)() @safe
 				// @format, @minLength, @maxLength, @pattern, @minItems,
 				// @maxItems, @schemaDefault) attached directly to the parameter.
 				mcp.api.schema.applyUdaFacets!(__traits(getAttributes, types[i .. i + 1]))(ps);
-				// Draft x-mcp-header: a parameter tagged @mcpHeader is mirrored
-				// into an `Mcp-Param-<name>` request header; emit the extension
-				// property so the transport can validate it (see draft.paramHeaders).
-				// The header name and parameter type are checked against the draft
+				// Draft x-mcp-header: a method-level @mcpHeader(parameter, name)
+				// naming this parameter mirrors it into an `Mcp-Param-<name>`
+				// request header; emit the extension property so the transport can
+				// validate it (see draft.paramHeaders). The header name and the
+				// named parameter's type are checked against the draft
 				// `x-mcp-header` constraints at compile time: the value MUST be a
 				// valid HTTP token (non-empty, 1*tchar, no CR/LF) and the parameter
 				// MUST be a primitive type (string/integral/bool); `number`
 				// (floating point) is NOT permitted.
-				static foreach (attr; __traits(getAttributes, types[i .. i + 1]))
+				static foreach (attr; __traits(getAttributes, func))
 					static if (is(typeof(attr) == mcpHeader))
-						{
-						static assert(validateHeaderName(attr.name) is null,
-								"@mcpHeader(\"" ~ attr.name ~ "\") is not a valid x-mcp-header value: "
-								~ validateHeaderName(attr.name));
-						// The draft permits only primitive x-mcp-header value types
-						// (integer/string/boolean). Whitelist exactly those (plus the
-						// `Nullable` thereof) so a struct/array/AA/`number` parameter is
-						// rejected at the registration site rather than per-request via
-						// the transport's `headerMismatch` (see draft.isPrimitiveHeaderType).
-						static assert(isPrimitiveHeaderParam!P, "@mcpHeader cannot be applied to parameter '" ~ names[i] ~ "' of type " ~ P
-								.stringof ~ "; x-mcp-header permits only integer/string/boolean (or Nullable thereof)");
-						ps["x-mcp-header"] = attr.name;
-					}
-				// Fold the @describe UDA into the property's JSON Schema
+						if (attr.parameter == names[i])
+							{
+							static assert(validateHeaderName(attr.name) is null,
+									"@mcpHeader(\"" ~ attr.parameter ~ "\", \"" ~ attr.name
+									~ "\") is not a valid x-mcp-header value: " ~ validateHeaderName(
+										attr.name));
+							// The draft permits only primitive x-mcp-header value
+							// types (integer/string/boolean). Whitelist exactly those
+							// (plus the `Nullable` thereof) so a struct/array/AA/
+							// `number` parameter is rejected at the registration site
+							// rather than per-request via the transport's
+							// `headerMismatch` (see draft.isPrimitiveHeaderType).
+							static assert(isPrimitiveHeaderParam!P, "@mcpHeader cannot be applied to parameter '" ~ names[i] ~ "' of type " ~ P
+									.stringof ~ "; x-mcp-header permits only integer/string/boolean (or Nullable thereof)");
+							ps["x-mcp-header"] = attr.name;
+						}
+				// Fold the @describeParam UDA into the property's JSON Schema
 				// `description` (a standard annotation keyword, valid in every
 				// protocol version).
 				{
-					enum d = describeFor!(func, i, names[i]);
+					enum d = describeFor!(func, names[i]);
 					static if (d.length)
 						ps["description"] = d;
 				}
@@ -332,7 +331,7 @@ private P marshalScalar(P)(Json v) @safe
 /// Deserialize a dynamic handler's raw wire `arguments` into a typed value `T`.
 ///
 /// The UDA-driven registration overloads marshal each argument from the method
-/// signature for you, but the dynamic `registerDynamicTool`/`registerDynamicPrompt`
+/// signature for you, but the dynamic `registerTool`/`registerPrompt`
 /// overloads hand the handler the raw `Json arguments`. This is the inbound
 /// counterpart of the client's `callTool!T`: it deserializes `arguments` through
 /// the same enum-by-name policy the UDA layer uses (so any `enum` leaf is read
@@ -509,8 +508,6 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 {
 	import std.traits : ReturnType;
 
-	rejectSingleArgMethodDescribe!overload();
-
 	Tool descriptor;
 	descriptor.name = attr.name;
 	if (attr.description.length)
@@ -558,7 +555,7 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 			setUiToolMeta(descriptor, UiToolMeta(a.resourceUri, a.visibility));
 	}
 
-	server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
 		import mcp.protocol.errors : McpException;
 
 		alias names = ParameterIdentifierTuple!overload;
@@ -636,8 +633,6 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 		McpServer server, task attr) @safe
 {
 	import std.traits : ReturnType;
-
-	rejectSingleArgMethodDescribe!overload();
 
 	// A task executor runs asynchronously, after the originating request has
 	// already returned a task handle — there is no live RequestContext to inject.
@@ -751,7 +746,7 @@ private GetPromptResult toPromptResult(R)(R ret) @safe
 private void registerPromptMethod(string memberName, alias overload, alias parent)(
 		McpServer server, prompt attr) @safe
 {
-	rejectSingleArgMethodDescribe!overload();
+	validateParamUdas!overload();
 
 	Prompt descriptor;
 	descriptor.name = attr.name;
@@ -765,8 +760,8 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 	{
 		static if (!is(P : RequestContext))
 		{
-			// Populate PromptArgument.description from the @describe UDA.
-			enum d = describeFor!(overload, i, names[i]);
+			// Populate PromptArgument.description from the @describeParam UDA.
+			enum d = describeFor!(overload, names[i]);
 			// A prompt argument is required only when it is neither Nullable nor
 			// carries a declared D-level default, matching the tool path.
 			descriptor.arguments ~= PromptArgument(names[i], d.length
@@ -777,7 +772,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 
 	applyIconsAndMeta!overload(descriptor);
 
-	server.registerDynamicPrompt(descriptor, (Json args, RequestContext ctx) @safe {
+	server.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
 		import mcp.protocol.errors : McpException, invalidParams;
 		import mcp.server.server : PromptResponse;
 
@@ -970,20 +965,23 @@ version (unittest)
 		}
 
 		@tool("query", "Query a region")
-		string query(@mcpHeader("Region") string region, int limit)@safe
+		@mcpHeader("region", "Region")
+		string query(string region, int limit) @safe
 		{
 			return region;
 		}
 
 		@tool("annotate", "Tool with described parameters")
-		string annotate(@describe("the document id") string id,
-				@describe("count", "how many copies") int count)@safe
+		@describeParam("id", "the document id")
+		@describeParam("count", "how many copies")
+		string annotate(string id, int count) @safe
 		{
 			return id;
 		}
 
 		@prompt("describedPrompt", "Prompt with a described argument")
-		string describedPrompt(@describe("the subject to write about") string topic)@safe
+		@describeParam("topic", "the subject to write about")
+		string describedPrompt(string topic) @safe
 		{
 			return "Tell me about " ~ topic;
 		}
@@ -1466,19 +1464,19 @@ unittest  // marker-UDA hints: @readOnly + @hintTitle produce the wire shape
 	assert("openWorldHint" !in anns);
 }
 
-unittest  // a function-level marker UDA coexists with a @describe'd first parameter
+unittest  // method-level marker UDAs coexist with a @describeParam'd parameter
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	// A bare-enum marker UDA (`@readOnly`/`@idempotent`) declared at the method
-	// level leaks into the attribute set of the first parameter when that
-	// parameter carries its own UDA (here `@describe`). The parameter schema
-	// builder must ignore those type-valued markers rather than treat them as
-	// facet values, and the markers must still populate ToolAnnotations.
+	// Method-level marker UDAs (`@readOnly`/`@idempotent`) and `@describeParam`
+	// live side by side on the declaration. The schema builder must fold the
+	// description into the named property without the markers adding spurious
+	// facet keys, and the markers must still populate ToolAnnotations.
 	@safe final class MarkedParamApi
 	{
-		@tool("calc", "Read-only calc with a described first parameter")
-		@readOnly @idempotent int calc(@describe("the left operand") int a, int b)@safe
+		@tool("calc", "Read-only calc with a described parameter")
+		@readOnly @idempotent @describeParam("a", "the left operand")
+		int calc(int a, int b) @safe
 		{
 			return a + b;
 		}
@@ -1516,7 +1514,8 @@ version (unittest) private struct HeaderPayload
 version (unittest) private class StructHeaderApi
 {
 	@tool("agg", "Aggregate header")
-	string agg(@mcpHeader("X-Payload") HeaderPayload p)@safe
+	@mcpHeader("p", "X-Payload")
+	string agg(HeaderPayload p) @safe
 	{
 		return p.id;
 	}
@@ -1525,7 +1524,8 @@ version (unittest) private class StructHeaderApi
 version (unittest) private class ArrayHeaderApi
 {
 	@tool("arr", "Array header")
-	string arr(@mcpHeader("X-Tags") string[] tags)@safe
+	@mcpHeader("tags", "X-Tags")
+	string arr(string[] tags) @safe
 	{
 		return tags.length ? tags[0] : "";
 	}
@@ -1534,9 +1534,30 @@ version (unittest) private class ArrayHeaderApi
 version (unittest) private class NullableHeaderApi
 {
 	@tool("opt", "Optional primitive header")
-	string opt(@mcpHeader("X-Region") Nullable!int region)@safe
+	@mcpHeader("region", "X-Region")
+	string opt(Nullable!int region) @safe
 	{
 		return region.isNull ? "" : "set";
+	}
+}
+
+version (unittest) private class UnknownHeaderParamApi
+{
+	@tool("q", "Header naming a missing parameter")
+	@mcpHeader("nope", "X-Region")
+	string q(string region) @safe
+	{
+		return region;
+	}
+}
+
+version (unittest) private class CtxHeaderParamApi
+{
+	@tool("q", "Header naming an injected context parameter")
+	@mcpHeader("ctx", "X-Region")
+	string q(string region, RequestContext ctx) @safe
+	{
+		return region;
 	}
 }
 
@@ -1556,6 +1577,18 @@ unittest  // @mcpHeader: a Nullable-of-primitive parameter is accepted at compil
 {
 	auto s = new McpServer("t", "1");
 	assert(__traits(compiles, registerHandlers(s, new NullableHeaderApi)));
+}
+
+unittest  // @mcpHeader: naming a non-existent parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new UnknownHeaderParamApi)));
+}
+
+unittest  // @mcpHeader: naming an injected context parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new CtxHeaderParamApi)));
 }
 
 unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schema
@@ -1611,7 +1644,7 @@ unittest  // @tool dispatch: a malformed arg (validation off) yields a clean att
 			"the error text must attribute the failure to the named argument: " ~ text);
 }
 
-unittest  // @describe UDA: parameter descriptions appear in tool inputSchema
+unittest  // @describeParam UDA: parameter descriptions appear in tool inputSchema
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1627,13 +1660,12 @@ unittest  // @describe UDA: parameter descriptions appear in tool inputSchema
 	assert(annotateTool.type == Json.Type.object);
 
 	auto props = annotateTool["inputSchema"]["properties"];
-	// Parameter-level @describe with a single argument documents the property.
+	// Each method-level @describeParam documents the named property.
 	assert(props["id"]["description"].get!string == "the document id");
-	// Parameter-level @describe naming itself documents the property.
 	assert(props["count"]["description"].get!string == "how many copies");
 }
 
-unittest  // @describe UDA: prompt argument descriptions appear in prompts/list
+unittest  // @describeParam UDA: prompt argument descriptions appear in prompts/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -1653,7 +1685,7 @@ unittest  // @describe UDA: prompt argument descriptions appear in prompts/list
 	assert(args[0]["name"].get!string == "topic");
 	assert(args[0]["description"].get!string == "the subject to write about");
 
-	// A prompt argument without @describe carries no description on the wire.
+	// A prompt argument without @describeParam carries no description on the wire.
 	Json intro;
 	foreach (i; 0 .. prompts.length)
 		if (prompts[i]["name"].get!string == "intro")
@@ -2381,27 +2413,41 @@ unittest  // @resourceTemplate description and title fields are emitted in resou
 	assert("title" !in bare);
 }
 
-// A method-level single-argument @describe (i.e. @describe("someText") with no
-// parameter name) is always a programmer error: the first field of the `describe`
-// struct is `parameter` (the name to match), not the description, so the single-
-// arg form never documents anything and must be rejected at compile time.
-version (unittest) private final class MethodDescribeSingleArgApi
+// A @describeParam naming a parameter the method does not declare matches
+// nothing and silently documents no argument: a programmer error rejected at
+// compile time.
+version (unittest) private final class DescribeUnknownParamApi
 {
 	@tool("ping", "Ping tool")
-	@describe("this text is silently lost without the fix")
+	@describeParam("nope", "names no parameter of ping")
 	string ping(string msg) @safe
 	{
 		return msg;
 	}
 }
 
-unittest  // method-level single-argument @describe is rejected at compile time
+// A @describeParam naming an injected context parameter (excluded from the
+// input schema) has no property to document: also a compile-time error.
+version (unittest) private final class DescribeCtxParamApi
+{
+	@tool("ping", "Ping tool")
+	@describeParam("ctx", "names the injected context parameter")
+	string ping(string msg, RequestContext ctx) @safe
+	{
+		return msg;
+	}
+}
+
+unittest  // @describeParam naming an unknown parameter is rejected at compile time
 {
 	auto s = new McpServer("t", "1");
-	// A single-arg @describe at method level always silently drops the text
-	// (the first field is `parameter`, not `description`). After the fix this
-	// must fail to compile rather than silently produce an undocumented tool.
-	assert(!__traits(compiles, registerHandlers(s, new MethodDescribeSingleArgApi)));
+	assert(!__traits(compiles, registerHandlers(s, new DescribeUnknownParamApi)));
+}
+
+unittest  // @describeParam naming an injected context parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new DescribeCtxParamApi)));
 }
 
 version (unittest) private final class FacetParamApi
