@@ -172,10 +172,17 @@ class FileTokenStore : TokenStore
 		return parseJsonString(cast(string) data.idup);
 	}
 
-	private Json readAll() @safe
+	/// Read the on-disk token map. A genuinely absent file yields an empty map
+	/// silently (a normal first run). A present-but-unreadable/corrupt file also
+	/// yields an empty map (so the caller re-authenticates rather than crashing)
+	/// but sets `corrupt` and logs, so the failure is observable instead of looking
+	/// like a fresh store.
+	private Json tryReadMap(out bool corrupt) @safe
 	{
 		import std.file : exists, read;
+		import vibe.core.log : logWarn;
 
+		corrupt = false;
 		if (!path.length || !path.exists)
 			return Json.emptyObject;
 		try
@@ -184,8 +191,20 @@ class FileTokenStore : TokenStore
 			auto j = deserialize(data);
 			return j.type == Json.Type.object ? j : Json.emptyObject;
 		}
-		catch (Exception)
+		catch (Exception e)
+		{
+			corrupt = true;
+			logWarn(
+					"FileTokenStore: token file %s is unreadable/corrupt (%s); treating as empty. "
+					~ "Re-authentication will be required.", path, e.msg);
 			return Json.emptyObject;
+		}
+	}
+
+	private Json readAll() @safe
+	{
+		bool corrupt;
+		return tryReadMap(corrupt);
 	}
 
 	override StoredToken load(string resource) @safe
@@ -198,7 +217,7 @@ class FileTokenStore : TokenStore
 
 	override void save(string resource, StoredToken token) @safe
 	{
-		import std.file : mkdirRecurse;
+		import std.file : mkdirRecurse, rename;
 		import std.path : dirName;
 
 		auto dir = dirName(path);
@@ -206,12 +225,25 @@ class FileTokenStore : TokenStore
 		{
 			try
 				() @trusted { mkdirRecurse(dir); }();
+			catch (Exception e)
+				throw internalError(
+						"FileTokenStore: could not create token directory " ~ dir ~ ": " ~ e.msg);
+			restrictDirPermissions(dir);
+		}
+
+		bool corrupt;
+		auto all = tryReadMap(corrupt);
+		// Do not silently overwrite an unparseable token file: preserve its bytes
+		// alongside (path~) so any recoverable tokens for other resources are not
+		// destroyed by this save.
+		if (corrupt)
+			() @trusted {
+			try
+				rename(path, path ~ "~");
 			catch (Exception)
 			{
 			}
-			restrictDirPermissions(dir);
-		}
-		auto all = readAll();
+		}();
 		all[resource] = token.toJson();
 		auto bytes = serialize(all);
 		writeSecretFile(bytes);
@@ -311,23 +343,42 @@ class FileTokenStore : TokenStore
 		}
 	}
 
+	/// True when `mode` still grants any group or other access, i.e. owner-only
+	/// tightening did not take effect (some filesystems accept a chmod but ignore
+	/// the mode bits).
+	version (Posix) private static bool stillGroupOrOtherAccessible(uint mode) @safe
+	{
+		import core.sys.posix.sys.stat : S_IRWXG, S_IRWXO;
+
+		return (mode & (S_IRWXG | S_IRWXO)) != 0;
+	}
+
 	/// Restrict the token file to owner-only access (POSIX `0600`, or a current-user
-	/// only ACL on Windows). No-op on platforms with neither.
+	/// only ACL on Windows). No-op on platforms with neither. A failure to tighten
+	/// the permissions is non-fatal (it must not abort a save) but is logged, since
+	/// it can leave the plaintext OAuth tokens readable by other local users.
 	private void restrictPermissions() @safe
 	{
 		version (Posix)
 		{
-			import std.file : setAttributes, exists;
+			import std.file : setAttributes, getAttributes, exists;
 			import core.sys.posix.sys.stat : S_IRUSR, S_IWUSR;
+			import vibe.core.log : logWarn;
 
-			if (path.exists)
+			if (!path.exists)
+				return;
+			try
+				() @trusted { setAttributes(path, S_IRUSR | S_IWUSR); }();
+			catch (Exception e)
 			{
-				try
-					() @trusted { setAttributes(path, S_IRUSR | S_IWUSR); }();
-				catch (Exception)
-				{
-				}
+				logWarn("FileTokenStore: could not restrict token file %s to owner-only (0600); "
+						~ "OAuth tokens may be readable by other local users: %s", path, e.msg);
+				return;
 			}
+			const mode = () @trusted { return getAttributes(path); }();
+			if (stillGroupOrOtherAccessible(mode))
+				logWarn("FileTokenStore: token file %s remains group/other-accessible after "
+						~ "chmod; OAuth tokens may be exposed to other local users", path);
 		}
 		else version (Windows)
 		{
@@ -683,9 +734,18 @@ final class OAuthSession
 // Browser opener
 // ===========================================================================
 
+/// A browser-launch sink. The default path spawns the platform launcher; tests
+/// inject a stub to exercise the success and failure branches deterministically.
+alias BrowserSpawn = void delegate(string[] cmd) @safe;
+
 /// Open `url` in the user's default browser using the platform launcher
 /// (`open` on macOS, `xdg-open` on Linux/BSD, `cmd /c start` on Windows).
-void openSystemBrowser(string url) @safe
+/// Returns true if the launcher started. On failure (no launcher on a headless
+/// host, spawn error) it does not throw — the loopback flow can still complete
+/// if the user opens the URL manually — but it logs the URL so the user is not
+/// left staring at a silent multi-minute wait. Pass `spawn` to override the
+/// launcher (used by tests).
+bool openSystemBrowser(string url, scope BrowserSpawn spawn = null) @safe
 {
 	import std.process : spawnProcess, Config;
 
@@ -697,15 +757,22 @@ void openSystemBrowser(string url) @safe
 	else
 		cmd = ["xdg-open", url];
 
-	() @trusted {
-		try
-		{
-			spawnProcess(cmd, null, Config.detached);
-		}
-		catch (Exception)
-		{
-		}
-	}();
+	try
+	{
+		if (spawn !is null)
+			spawn(cmd);
+		else
+			() @trusted { spawnProcess(cmd, null, Config.detached); }();
+		return true;
+	}
+	catch (Exception e)
+	{
+		import vibe.core.log : logWarn;
+
+		logWarn("Could not launch a browser (%s) to open the OAuth authorization URL. "
+				~ "Open this URL manually to continue:\n%s", e.msg, url);
+		return false;
+	}
 }
 
 // ===========================================================================
@@ -933,7 +1000,7 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationS
 
 	void delegate(string) @safe opener = opts.openBrowser;
 	if (opener is null)
-		opener = (string u) @safe { openSystemBrowser(u); };
+		opener = (string u) @safe { cast(void) openSystemBrowser(u); };
 	opener(authzUrl);
 
 	void onTimeout() @safe nothrow
@@ -1616,7 +1683,7 @@ version (Posix) unittest  // openSystemBrowser does not leave a zombie process a
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	openSystemBrowser("mcp-sdk-test-zombie://localhost/verify-detach");
+	cast(void) openSystemBrowser("mcp-sdk-test-zombie://localhost/verify-detach");
 
 	Thread.sleep(300.msecs); // allow the launcher to exit and become a zombie if not detached
 
@@ -1738,4 +1805,90 @@ unittest  // a stray non-callback request does not abort the loopback flow
 
 	assert(captured.ok, "genuine callback should be captured despite the stray request");
 	assert(captured.code == "real-code");
+}
+
+version (Posix) unittest  // save() throws a typed error when the token directory cannot be created
+{
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse, write;
+	import std.path : buildPath;
+	import std.conv : to;
+	import std.datetime.systime : Clock;
+
+	auto root = buildPath(tempDir, "mcp-login-mkdir-" ~ Clock.currTime().toUnixTime().to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		() @trusted { rmdirRecurse(root); }();
+
+	// A regular file standing where the token file's parent directory must be, so
+	// mkdirRecurse cannot create the directory.
+	auto blocker = buildPath(root, "blocker");
+	() @trusted { write(blocker, "x"); }();
+	auto store = new FileTokenStore(buildPath(blocker, "tokens.json"));
+	StoredToken t;
+	t.accessToken = "secret";
+
+	bool threw;
+	try
+		store.save("https://mcp.example.com", t);
+	catch (McpException)
+		threw = true;
+	assert(threw,
+			"save must surface a directory-creation failure rather than silently dropping the token");
+}
+
+version (Posix) unittest  // save() backs up an unparseable token file instead of silently destroying it
+{
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse, write, readText, exists;
+	import std.path : buildPath;
+	import std.conv : to;
+	import std.datetime.systime : Clock;
+
+	auto root = buildPath(tempDir, "mcp-login-corrupt-" ~ Clock.currTime().toUnixTime().to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		() @trusted { rmdirRecurse(root); }();
+
+	auto file = buildPath(root, "tokens.json");
+	() @trusted { write(file, "{ this is not valid json"); }();
+
+	auto store = new FileTokenStore(file);
+	StoredToken t;
+	t.accessToken = "new-secret";
+	store.save("https://mcp.example.com", t);
+
+	// The corrupt file's bytes are preserved alongside, not overwritten away.
+	assert(exists(file ~ "~"));
+	assert((() @trusted => readText(file ~ "~"))() == "{ this is not valid json");
+	// The fresh store holds the new token.
+	assert(store.load("https://mcp.example.com").accessToken == "new-secret");
+}
+
+version (Posix) unittest  // stillGroupOrOtherAccessible flags any lingering group/other permission bit
+{
+	import core.sys.posix.sys.stat : S_IRUSR, S_IWUSR, S_IRGRP, S_IROTH;
+
+	assert(!FileTokenStore.stillGroupOrOtherAccessible(S_IRUSR | S_IWUSR));
+	assert(FileTokenStore.stillGroupOrOtherAccessible(S_IRUSR | S_IWUSR | S_IRGRP));
+	assert(FileTokenStore.stillGroupOrOtherAccessible(S_IRUSR | S_IWUSR | S_IROTH));
+}
+
+unittest  // openSystemBrowser reports a launcher failure instead of swallowing it into a hang
+{
+	bool called;
+	const ok = openSystemBrowser("https://example.com/authz?state=s", (string[] cmd) @safe {
+		called = true;
+		throw new Exception("no launcher");
+	});
+	assert(called);
+	assert(!ok, "a launcher failure must be surfaced, not swallowed");
+}
+
+unittest  // openSystemBrowser reports success and passes the URL to the launcher
+{
+	string[] seen;
+	const ok = openSystemBrowser("https://example.com/x", (string[] cmd) @safe {
+		seen = cmd;
+	});
+	assert(ok);
+	assert(seen.length && seen[$ - 1] == "https://example.com/x");
 }

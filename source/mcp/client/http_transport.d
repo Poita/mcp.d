@@ -605,8 +605,7 @@ final class HttpClientTransport : ClientTransport
 			}
 			catch (Exception e)
 			{
-				if (err is null && !got)
-					err = internalError(e.msg);
+				recordTransportFailure(e.msg, got, err);
 			}
 		}();
 	}
@@ -773,40 +772,19 @@ final class HttpClientTransport : ClientTransport
 				SseCursor cursor;
 				readSseBody(conn, chunked, cursor, () @safe => done,
 						(string eventType, string data) @safe {
-					try
-					{
-						auto m = Message(parseJsonString(data));
-						if ((m.kind == MessageKind.response
-							|| m.kind == MessageKind.errorResponse)
-							&& m.id.type == Json.Type.int_ && m.id.get!long == expectId)
-						{
-							// A response for a request we have cancelled is dropped
-							// per spec, even when it matches the awaited id (mirrors
-							// the guard `dispatchSse` applies on the POST path).
-							if (protocol !is null && protocol.isCancelled(m.id.get!long))
-							{
-								done = true;
-								return;
-							}
-							if (m.kind == MessageKind.errorResponse)
-								err = errorFrom(m.error);
-							else
-							{
-								result = m.result;
-								got = true;
-							}
-							done = true;
-						}
-						else
-							dispatch(m);
-					}
-					catch (Exception)
-					{
-					}
+					// Reuse the POST-path dispatcher: it isolates parseJsonString
+					// (keep-alive tolerance), applies the cancelled-id guard, and
+					// captures got/result/err for the awaited id or dispatches an
+					// inbound message. A cancelled-but-matching response leaves
+					// got/err unset, so the read continues to stream end — the same
+					// observable outcome as the POST path.
+					dispatchSse(data, expectId, result, got, err);
+					done = awaitSatisfied(got, err);
 				});
 			}
-			catch (Exception)
+			catch (Exception e)
 			{
+				recordTransportFailure(e.msg, got, err);
 			}
 		}();
 	}
@@ -1437,52 +1415,94 @@ final class HttpClientTransport : ClientTransport
 						notifyLegacy(); // wake `startLegacyFallback`
 						return;
 					}
-					// `message` event (or untyped): a JSON-RPC message. A response
-					// resolves the waiter registered under its id; anything with no
-					// matching waiter (notification, server->client request, or a
-					// response for an id we are not awaiting) falls through to the
-					// inbound dispatcher.
-					try
-					{
-						auto m = Message(parseJsonString(data));
-						LegacyWaiter** w;
-						if ((m.kind == MessageKind.response
-							|| m.kind == MessageKind.errorResponse) && m.id.type == Json.Type.int_
-							&& (w = (m.id.get!long  in legacyWaiters)) !is null)
-						{
-							// A response for a request we have cancelled is dropped
-							// per spec, even when a waiter is still registered for its
-							// id (mirrors the guard `dispatchSse` applies).
-							if (protocol !is null && protocol.isCancelled(m.id.get!long))
-								return;
-							if (m.kind == MessageKind.errorResponse)
-								(*w).err = errorFrom(m.error);
-							else
-							{
-								(*w).result = m.result;
-								(*w).got = true;
-							}
-							notifyLegacy(); // wake the matching `legacyRpc`
-						}
-						else
-							dispatch(m);
-					}
-					catch (Exception)
-					{
-					}
+					// `message` event (or untyped): a JSON-RPC message. Resolution and
+					// inbound dispatch run OUTSIDE any catch here, so a failure during
+					// dispatch propagates to the outer catch and tears the stream down
+					// (fast-failing every waiter) rather than being swallowed.
+					resolveLegacyMessage(data);
 				});
 			}
-			catch (Exception)
+			catch (Exception e)
 			{
+				failOutstandingLegacyWaiters("legacy HTTP+SSE stream failed: " ~ e.msg);
 			}
 		}();
 
 		// The stream closed: fail every still-outstanding waiter so its `legacyRpc`
 		// wait returns promptly with a clear error instead of waiting out the timeout.
+		failOutstandingLegacyWaiters("legacy HTTP+SSE stream closed before response");
+	}
+
+	/// Resolve one `message`-event frame from the legacy HTTP+SSE stream. A response
+	/// or error addressed to a registered waiter id resolves that waiter; any other
+	/// message falls through to the inbound dispatcher. Only the `parseJsonString`
+	/// step tolerates failure (non-JSON keep-alive frames), logged for visibility;
+	/// a failure anywhere else propagates so the caller can tear the stream down.
+	private void resolveLegacyMessage(string data) @safe
+	{
+		Message m;
+		try
+			m = Message(parseJsonString(data));
+		catch (Exception e)
+		{
+			import vibe.core.log : logDiagnostic;
+
+			// Tolerate non-JSON keep-alive frames (mirrors dispatchSse), but make a
+			// malformed legacy frame visible rather than an invisible swallow that
+			// strands a waiter until its deadline.
+			logDiagnostic("legacy HTTP+SSE: ignoring unparseable event data: %s", e.msg);
+			return;
+		}
+
+		LegacyWaiter** w;
+		if ((m.kind == MessageKind.response
+				|| m.kind == MessageKind.errorResponse) && m.id.type == Json.Type.int_
+				&& (w = (m.id.get!long  in legacyWaiters)) !is null)
+		{
+			// A response for a request we have cancelled is dropped per spec, even
+			// when a waiter is still registered for its id (mirrors `dispatchSse`).
+			if (protocol !is null && protocol.isCancelled(m.id.get!long))
+				return;
+			if (m.kind == MessageKind.errorResponse)
+				(*w).err = errorFrom(m.error);
+			else
+			{
+				(*w).result = m.result;
+				(*w).got = true;
+			}
+			notifyLegacy(); // wake the matching `legacyRpc`
+		}
+		else
+			dispatch(m);
+	}
+
+	/// Fail every still-outstanding legacy waiter with a typed error so each blocked
+	/// `legacyRpc` returns promptly with the real cause instead of waiting out the
+	/// timeout. Already-resolved waiters are left untouched.
+	private void failOutstandingLegacyWaiters(string msg) @safe
+	{
 		foreach (id, w; legacyWaiters)
 			if (!w.got && w.err is null)
-				w.err = internalError("legacy HTTP+SSE stream closed before response");
+				w.err = internalError(msg);
 		notifyLegacy();
+	}
+
+	/// Record a connect/TLS/write/read failure as a typed `McpException` through the
+	/// by-ref `err` out-param shared by the raw-TCP request paths, so the caller
+	/// throws the actual cause instead of a generic "No response". The guard keeps a
+	/// response (`got`) or error already captured by an in-stream dispatch from being
+	/// overwritten by a failure that arrives later on the same stream.
+	private static void recordTransportFailure(string msg, ref bool got, ref McpException err) @safe
+	{
+		if (err is null && !got)
+			err = internalError(msg);
+	}
+
+	/// The awaited response/error has arrived, so an SSE read loop can stop. Used as
+	/// the resume-via-GET stop predicate, mirroring the POST path's predicate.
+	private static bool awaitSatisfied(bool got, McpException err) @safe
+	{
+		return got || err !is null;
 	}
 
 	private static McpException errorFrom(Json error) @safe
@@ -2542,4 +2562,107 @@ unittest  // a bounded connect timeout surfaces ephemeral-port exhaustion as a t
 	assert(typed, "connect timeout was not surfaced as a typed McpException");
 	assert(elapsed < 10.seconds,
 			"connect did not honor the bounded timeout; elapsed: " ~ elapsed.toString);
+}
+
+unittest  // recordTransportFailure surfaces a transport failure as a typed McpException
+{
+	bool got;
+	McpException err;
+	HttpClientTransport.recordTransportFailure("Connection refused", got, err);
+	assert(err !is null);
+	assert(err.code == ErrorCode.internalError);
+	assert(err.msg == "Connection refused");
+}
+
+unittest  // recordTransportFailure does not clobber a response already captured by an in-stream dispatch
+{
+	bool got = true;
+	McpException err;
+	HttpClientTransport.recordTransportFailure("late read error", got, err);
+	assert(err is null);
+}
+
+unittest  // recordTransportFailure does not overwrite an error already captured for the awaited id
+{
+	bool got;
+	McpException err = new McpException(-32000, "server error");
+	HttpClientTransport.recordTransportFailure("late read error", got, err);
+	assert(err.code == -32000);
+}
+
+unittest  // the resume-via-GET read reuses dispatchSse: a matching error response is captured and stops the read
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	Json result;
+	bool got;
+	McpException err;
+	t.dispatchSse(`{"jsonrpc":"2.0","id":9,"error":{"code":-32000,"message":"boom"}}`,
+			9, result, got, err);
+	assert(err !is null && err.code == -32000);
+	assert(!got);
+	assert(HttpClientTransport.awaitSatisfied(got, err));
+}
+
+unittest  // a matching success response on the resume path is captured and stops the read
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	Json result;
+	bool got;
+	McpException err;
+	t.dispatchSse(`{"jsonrpc":"2.0","id":9,"result":{"ok":true}}`, 9, result, got, err);
+	assert(got && result["ok"].get!bool);
+	assert(HttpClientTransport.awaitSatisfied(got, err));
+}
+
+unittest  // a non-JSON keep-alive frame on the resume path neither fails nor stops the read
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	Json result;
+	bool got;
+	McpException err;
+	t.dispatchSse(": keep-alive", 9, result, got, err);
+	assert(!got && err is null);
+	assert(!HttpClientTransport.awaitSatisfied(got, err));
+}
+
+unittest  // resolveLegacyMessage resolves the matching waiter from a well-formed response
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto w = new LegacyWaiter;
+	t.legacyWaiters[5] = w;
+	t.resolveLegacyMessage(`{"jsonrpc":"2.0","id":5,"result":{"ok":true}}`);
+	assert(w.got);
+	assert(w.result["ok"].get!bool);
+}
+
+unittest  // resolveLegacyMessage routes a JSON-RPC error response to the waiter's err
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto w = new LegacyWaiter;
+	t.legacyWaiters[5] = w;
+	t.resolveLegacyMessage(`{"jsonrpc":"2.0","id":5,"error":{"code":-32601,"message":"nope"}}`);
+	assert(!w.got);
+	assert(w.err !is null && w.err.code == -32601);
+}
+
+unittest  // resolveLegacyMessage tolerates a non-JSON keep-alive frame without resolving a waiter
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto w = new LegacyWaiter;
+	t.legacyWaiters[5] = w;
+	t.resolveLegacyMessage(": keep-alive");
+	assert(!w.got && w.err is null);
+}
+
+unittest  // failOutstandingLegacyWaiters fails every still-pending waiter with a typed error
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto pending = new LegacyWaiter;
+	auto done = new LegacyWaiter;
+	done.got = true;
+	t.legacyWaiters[1] = pending;
+	t.legacyWaiters[2] = done;
+	t.failOutstandingLegacyWaiters("stream failed");
+	assert(pending.err !is null && pending.err.msg == "stream failed");
+	assert(done.err is null); // an already-resolved waiter is left untouched
 }

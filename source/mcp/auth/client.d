@@ -10,6 +10,32 @@ import mcp.auth.oauth;
 
 @safe:
 
+/// Thrown when protected-resource-metadata discovery establishes the document is
+/// genuinely ABSENT — every candidate location was reachable but reported no
+/// document (a 404 / empty body). This is the only outcome that licenses the
+/// lenient 2025-03-26 origin-issuer fallback. A fetch FAILURE (SSRF block, TLS,
+/// DNS, network error, or a malformed body) is a different, non-absent outcome
+/// and must not be downgraded onto that lenient path.
+class PrmAbsentException : Exception
+{
+	this(string msg, string file = __FILE__, size_t line = __LINE__) @safe pure nothrow
+	{
+		super(msg, file, line);
+	}
+}
+
+/// The outcome of a discovery fetch: `ok` (2xx with a parseable JSON body),
+/// `notFound` (reachable but no usable document — a non-2xx or empty 2xx), or
+/// `error` (the fetch itself failed: SSRF block, TLS/DNS/network error, or a
+/// malformed body). The `error`/`notFound` split is what keeps a fetch failure
+/// from masquerading as a genuinely-absent document.
+enum FetchResult
+{
+	ok,
+	notFound,
+	error
+}
+
 /// A production OAuth 2.1 client for MCP: drives protected-resource and
 /// authorization-server metadata discovery (RFC 9728 / RFC 8414), Dynamic Client
 /// Registration (RFC 7591), and the token endpoint (authorization-code + PKCE,
@@ -77,13 +103,35 @@ final class OAuthClient
 		}
 		urls ~= protectedResourceMetadataUrls(mcpEndpoint);
 
+		bool anyError;
 		foreach (u; urls)
 		{
 			Json j;
-			if (tryGetJson(u, j))
+			final switch (tryGetJson(u, j))
+			{
+			case FetchResult.ok:
 				return ProtectedResourceMetadata.fromJson(j);
+			case FetchResult.error:
+				anyError = true;
+				break;
+			case FetchResult.notFound:
+				break;
+			}
 		}
-		throw internalError("Could not discover protected-resource metadata");
+		throwPrmDiscoveryFailure(anyError);
+		assert(0); // throwPrmDiscoveryFailure never returns
+	}
+
+	/// Signal exhausted protected-resource-metadata discovery. A genuine absence
+	/// (no candidate errored) throws `PrmAbsentException`, which alone licenses the
+	/// lenient origin-issuer fallback; a fetch error throws a generic failure so it
+	/// can never be silently downgraded onto that path.
+	private static void throwPrmDiscoveryFailure(bool anyError) @safe
+	{
+		if (anyError)
+			throw internalError("Protected-resource metadata discovery failed (a candidate could "
+					~ "not be fetched); refusing to downgrade to the lenient origin issuer");
+		throw new PrmAbsentException("No protected-resource metadata document");
 	}
 
 	/// Discover authorization-server metadata for an issuer, trying the RFC 8414
@@ -96,7 +144,11 @@ final class OAuthClient
 		foreach (u; authServerMetadataCandidates(issuer))
 		{
 			Json j;
-			if (tryGetJson(u, j))
+			// Both a not-found and a fetch error fall through to the next candidate
+			// and then to the 2025-03-26 default-endpoint fallback below; the
+			// synthesized endpoints derive from the already-validated issuer, not
+			// from attacker-influenced data, so the lenient fallback is safe here.
+			if (tryGetJson(u, j) == FetchResult.ok)
 				return bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
 						issuer, enforceIssuerMatch);
 		}
@@ -145,19 +197,32 @@ final class OAuthClient
 	string resolveIssuer(string mcpEndpoint,
 			out bool fromProtectedResourceMetadata, string wwwAuthenticateHeader = "") @safe
 	{
+		return resolveIssuerFrom(() => discoverProtectedResource(mcpEndpoint,
+				wwwAuthenticateHeader), mcpEndpoint, fromProtectedResourceMetadata);
+	}
+
+	/// Decide the issuer from a protected-resource-metadata discovery, with the
+	/// discovery itself injected so the security-critical downgrade rule is unit
+	/// testable. Only a genuinely-absent document (`PrmAbsentException`) downgrades
+	/// to the 2025-03-26 origin-issuer fallback; any other failure (a fetch error,
+	/// an SSRF/insecure-URL rejection, a malformed document) propagates so the flow
+	/// fails closed rather than silently relaxing issuer binding.
+	private static string resolveIssuerFrom(scope ProtectedResourceMetadata delegate() @safe discover,
+			string mcpEndpoint, out bool fromProtectedResourceMetadata) @safe
+	{
 		try
 		{
-			auto prm = discoverProtectedResource(mcpEndpoint, wwwAuthenticateHeader);
+			auto prm = discover();
 			if (prm.authorizationServers.length)
 			{
 				fromProtectedResourceMetadata = true;
 				return prm.authorizationServers[0];
 			}
 		}
-		catch (Exception)
+		catch (PrmAbsentException)
 		{
+			// Genuine pre-RFC-9728 server: no PRM document at all -> origin fallback.
 		}
-		// Backcompat: no PRM -> the MCP server origin is the authorization server.
 		fromProtectedResourceMetadata = false;
 		return originOf(mcpEndpoint);
 	}
@@ -477,13 +542,17 @@ final class OAuthClient
 
 	// --- HTTP helpers --------------------------------------------------------
 
-	private bool tryGetJson(string url, out Json result) @safe
+	private FetchResult tryGetJson(string url, out Json result) @safe
 	{
 		// Never fetch a discovery URL that is not HTTPS (or loopback for dev) or
 		// that targets an internal/link-local address — including a hostname that
 		// resolves to one (DNS-rebinding SSRF mitigation, pinned at connect time).
-		bool ok;
 		Json parsed;
+		// A reachable response that is not a usable 2xx-with-body means "no document
+		// here"; an exception (SSRF block, TLS/DNS/network failure, or a malformed
+		// 2xx body) is a fetch error, tracked distinctly so it cannot be mistaken
+		// for a genuinely-absent document.
+		auto outcome = FetchResult.notFound;
 		try
 		{
 			secureRequestHTTP(url, (scope HTTPClientRequest req) {
@@ -493,15 +562,21 @@ final class OAuthClient
 				auto body = res.bodyReader.readAllUTF8();
 				if (res.statusCode / 100 == 2 && body.length)
 				{
-					parsed = parseJsonString(body);
-					ok = true;
+					parsed = parseJsonString(body); // a throw here is a fetch error, caught below
+					outcome = FetchResult.ok;
 				}
 			});
 		}
-		catch (Exception)
-			ok = false;
+		catch (Exception e)
+		{
+			import vibe.core.log : logDiagnostic;
+
+			logDiagnostic("Discovery fetch of %s failed (not treated as document-absent): %s",
+					url, e.msg);
+			outcome = FetchResult.error;
+		}
 		result = parsed;
-		return ok;
+		return outcome;
 	}
 
 	// Secure POST a body to `url` with the given content type, optionally adding
@@ -738,6 +813,56 @@ unittest  // modern path: discovered AS document with no issuer fails closed (no
 	auto j = parseJsonString(`{"authorization_endpoint":"https://as.example.com/authorize"}`);
 	assertThrown(OAuthClient.bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
 			"https://as.example.com", true));
+}
+
+unittest  // exhausted PRM discovery distinguishes genuine absence from a fetch error
+{
+	import std.exception : assertThrown, collectException;
+
+	// All candidates reported the document absent (reachable 404 / empty): the
+	// lenient origin-issuer downgrade is licensed.
+	assertThrown!PrmAbsentException(OAuthClient.throwPrmDiscoveryFailure(false));
+
+	// A candidate failed to fetch (SSRF block / TLS / DNS / malformed body): this
+	// must NOT be classified as document-absent, or the downgrade would be granted
+	// to an attacker who can merely make the PRM fetch fail.
+	auto e = collectException(OAuthClient.throwPrmDiscoveryFailure(true));
+	assert(e !is null);
+	assert(cast(PrmAbsentException) e is null, "a fetch error must not be treated as absence");
+}
+
+unittest  // resolveIssuerFrom downgrades to the origin only when the PRM document is genuinely absent
+{
+	bool fromPrm;
+	const issuer = OAuthClient.resolveIssuerFrom(() @safe {
+		throw new PrmAbsentException("no PRM");
+		return ProtectedResourceMetadata.init;
+	}, "https://mcp.example.com/sse", fromPrm);
+	assert(!fromPrm);
+	assert(issuer == "https://mcp.example.com");
+}
+
+unittest  // resolveIssuerFrom does NOT silently downgrade on a fetch/security error — it propagates
+{
+	import std.exception : assertThrown;
+
+	bool fromPrm;
+	assertThrown!McpException(OAuthClient.resolveIssuerFrom(() @safe {
+			throw internalError("Refusing to fetch URL with no parseable host");
+			return ProtectedResourceMetadata.init;
+		}, "https://mcp.example.com/sse", fromPrm));
+}
+
+unittest  // resolveIssuerFrom returns the PRM-advertised authorization server on the modern path
+{
+	bool fromPrm;
+	const issuer = OAuthClient.resolveIssuerFrom(() @safe {
+		ProtectedResourceMetadata prm;
+		prm.authorizationServers = ["https://as.example.com"];
+		return prm;
+	}, "https://mcp.example.com/sse", fromPrm);
+	assert(fromPrm);
+	assert(issuer == "https://as.example.com");
 }
 
 unittest  // 2025-03-26 backcompat path: a sub-path issuer mismatch is tolerated
