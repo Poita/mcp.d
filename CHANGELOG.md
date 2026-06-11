@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **`CallToolResult.structuredContentAs!T` now throws on a missing/non-object
+  `structuredContent`** (`McpException(invalidParams)`) instead of returning
+  `T.init`. Asking for a typed structured result asserts the tool produces one, so
+  an absent payload is a contract violation rather than a silently-empty struct.
+
+### Added
+
+- **`CallToolResult.ensureOk()`** — returns normally on a success result; on an
+  error result throws `McpException(internalError)` whose message surfaces the
+  first text content block (or a generic message when there is none). Turns a
+  tool's in-band error result into an exception at the call site.
+
 ### Removed
 
 - **Client typed-argument request overloads.** `McpClient.callTool(T)(string,

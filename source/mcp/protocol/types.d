@@ -1194,20 +1194,23 @@ struct CallToolResult
 		return projected;
 	}
 
-	/// Decode `structuredContent` into a typed struct `T`. Mirrors
-	/// `ElicitResult.contentAs!T`: returns `T.init` when `structuredContent` is not
-	/// an object (e.g. unset, or a content-only tool result), so callers that opted
-	/// into a typed output schema can read the result without re-deserializing by
-	/// hand. The result comes from an untrusted/possibly non-conforming server, so
-	/// — mirroring the inbound `argsAs!T` accessor — a deserialization failure on a
-	/// shape that does not match `T` is mapped to `invalidParams` (rather than
-	/// leaking a raw vibe exception); an `McpException` propagates unchanged.
+	/// Decode `structuredContent` into a typed struct `T`. Throws
+	/// `McpException(invalidParams)` when `structuredContent` is absent or not a
+	/// JSON object: a caller asking for a typed structured result is asserting the
+	/// tool produces one, so a missing/non-object `structuredContent` is a contract
+	/// violation, not a silently-empty `T.init`. The result comes from an
+	/// untrusted/possibly non-conforming server, so — mirroring the inbound
+	/// `argsAs!T` accessor — a deserialization failure on a shape that does not
+	/// match `T` is likewise mapped to `invalidParams` (rather than leaking a raw
+	/// vibe exception); an `McpException` propagates unchanged.
 	T structuredContentAs(T)() const @safe
 	{
 		import mcp.protocol.errors : invalidParams;
 
 		if (structuredContent.type != Json.Type.object)
-			return T.init;
+			throw invalidParams("structuredContent: expected a JSON object, got " ~ (
+					structuredContent.type == Json.Type.undefined
+					? "no structuredContent" : "a non-object value"));
 		try
 			return () @trusted { return deserializeJson!T(structuredContent); }();
 		catch (McpException e)
@@ -1232,6 +1235,32 @@ struct CallToolResult
 		return () @trusted {
 			return deserializeJson!T(parseJsonString(requestState));
 		}();
+	}
+
+	/// Assert this is a success result. Returns normally when `!isError`; when
+	/// `isError`, throws `McpException(internalError)` whose message surfaces the
+	/// first text content block (or a generic message when the result carries no
+	/// text). Lets a caller turn a tool's in-band error result into an exception at
+	/// the call site (`client.callTool(...).ensureOk()`) instead of branching on
+	/// `isError` by hand.
+	void ensureOk() const @safe
+	{
+		import mcp.protocol.errors : internalError;
+
+		if (!isError)
+			return;
+		string detail;
+		foreach (ref c; content)
+		{
+			const t = c.text;
+			if (t.length)
+			{
+				detail = t;
+				break;
+			}
+		}
+		throw internalError(detail.length ? "Tool call failed: " ~ detail
+				: "Tool call returned an error result");
 	}
 
 	/// Build a `CallToolResult` whose `structuredContent` is `value` serialized via
@@ -3654,20 +3683,73 @@ unittest  // CallToolResult.structuredContentAs!T decodes structuredContent into
 	assert(w.tempC == 19.5);
 }
 
-unittest  // CallToolResult.structuredContentAs!T returns T.init when structuredContent is unset
+unittest  // structuredContentAs!T throws invalidParams when structuredContent is unset
 {
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
 	static struct Weather
 	{
 		string city;
 		double tempC;
 	}
 
-	import std.math : isNaN;
+	CallToolResult r; // no structuredContent set
+	auto e = collectException!McpException(r.structuredContentAs!Weather);
+	assert(e !is null);
+	assert(e.code == ErrorCode.invalidParams);
+}
+
+unittest  // structuredContentAs!T throws invalidParams when structuredContent is not an object
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
+	static struct Weather
+	{
+		string city;
+		double tempC;
+	}
 
 	CallToolResult r;
-	auto w = r.structuredContentAs!Weather;
-	assert(w.city == "");
-	assert(isNaN(w.tempC));
+	r.structuredContent = Json("not-an-object");
+	auto e = collectException!McpException(r.structuredContentAs!Weather);
+	assert(e !is null);
+	assert(e.code == ErrorCode.invalidParams);
+}
+
+unittest  // ensureOk is a no-op on a success result
+{
+	auto r = CallToolResult.text("done");
+	r.ensureOk(); // must not throw
+	assert(!r.isError);
+}
+
+unittest  // ensureOk throws on an error result, surfacing the first text block
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
+	auto r = CallToolResult.error("disk full");
+	auto e = collectException!McpException(r.ensureOk());
+	assert(e !is null);
+	assert(e.code == ErrorCode.internalError);
+	import std.algorithm : canFind;
+
+	assert(e.msg.canFind("disk full"));
+}
+
+unittest  // ensureOk throws a generic message on an error result with no text content
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
+	CallToolResult r;
+	r.isError = true; // error result, but no content blocks
+	auto e = collectException!McpException(r.ensureOk());
+	assert(e !is null);
+	assert(e.code == ErrorCode.internalError);
+	assert(e.msg.length > 0);
 }
 
 unittest  // structuredContentAs!T maps a malformed object to invalidParams (not a raw vibe exception)
