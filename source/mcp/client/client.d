@@ -1,6 +1,6 @@
 module mcp.client.client;
 
-import core.time : Duration, seconds, msecs;
+import core.time : Duration, seconds, msecs, hours;
 import std.algorithm : canFind, startsWith;
 import std.datetime : Clock, SysTime;
 import std.typecons : Nullable, nullable;
@@ -184,11 +184,13 @@ struct ClientSettings
 	CacheStore cache = null;
 
 	/// Fallback freshness applied to a cacheable result when the server attaches
-	/// no `ttlMs` hint (pre-draft servers, or a draft server that omits it). Zero
-	/// (the default) means "do not cache unhinted responses", preserving exact
-	/// pre-cache behavior; a positive value caches even unhinted responses for
-	/// this long. A server-supplied hint always takes precedence over this.
-	Duration defaultCacheTtl = Duration.zero;
+	/// no `ttlMs` hint (pre-draft servers, or a draft server that omits it).
+	/// Defaults to one hour: responses are cached by default and a server-supplied
+	/// hint always overrides this. This also makes the cached `tools/list` the
+	/// single source for `x-mcp-header` mirroring and output-schema validation, so
+	/// they work from a shared/pre-seeded store with no local `listTools`. Set to
+	/// `Duration.zero` to cache only responses that carry an explicit server hint.
+	Duration defaultCacheTtl = 1.hours;
 
 	/// This client's cache partition — a stable principal identifier (user / tenant
 	/// id) under which its `private`-scoped results are namespaced. Only relevant
@@ -248,18 +250,17 @@ final class McpClient : ClientProtocol
 	// The JSON-RPC id used for the `initialize` request, so cancel() can enforce
 	// the spec rule that clients MUST NOT cancel initialize. 0 until sent.
 	private long initializeRequestId;
-	// Tool inputSchemas seen via tools/list, keyed by tool name. Used by the
-	// draft client to mirror x-mcp-header-annotated tool-call arguments into
-	// Mcp-Param-{Name} headers (draft basic/transports, "Custom Headers from
-	// Tool Parameters"). Populated by listTools; consumed by `headersFor`,
-	// which the HTTP transport calls to obtain the per-message headers.
-	private Json[string] toolInputSchemas_;
-	// Tool outputSchemas seen via tools/list, keyed by tool name. Lets a
-	// string-name `callTool` validate the returned structuredContent against the
-	// tool's declared outputSchema (when output-schema validation is enabled)
-	// without the caller having to hold the `Tool` descriptor. Populated by
-	// listTools; consumed by `callTool(string, ...)`.
-	private Json[string] toolOutputSchemas_;
+	// Parse cache of the cached tools/list response (name -> Tool descriptor),
+	// shared by `headersFor` (x-mcp-header mirroring, reads inputSchema) and
+	// `callTool(string, ...)` (output-schema validation, reads outputSchema). It
+	// is a pure derivative of the authoritative response cache: `cachedTool`
+	// re-derives it whenever the underlying CacheStore entry changes (a different
+	// physical key or expiry) and drops it when the entry is gone, so it never
+	// outlives or diverges from the store — including a shared/pre-seeded one.
+	private Tool[string] toolIndex_;
+	private CacheKey toolIndexKey_;
+	private SysTime toolIndexStamp_;
+	private bool toolIndexValid_;
 	// Draft (2026-07-28) per-request logging opt-in. The draft removed the
 	// `logging/setLevel` RPC; a client instead controls verbosity by stamping
 	// `_meta["io.modelcontextprotocol/logLevel"]` on each request, and a
@@ -311,7 +312,7 @@ final class McpClient : ClientProtocol
 	// hint (pre-draft servers, or a draft server that omits it). Zero means
 	// "do not cache unhinted responses" (the default), so behavior against such
 	// servers matches the uncached client. A server hint always wins over this.
-	private Duration defaultCacheTtl_;
+	private Duration defaultCacheTtl_ = 1.hours;
 	// This client's cache partition: the namespace under which its `private`-scoped
 	// cacheable results are stored, so a SHARED `cacheStore_` keeps one principal's
 	// private entries from being served to another. `public` results ignore it and
@@ -420,7 +421,7 @@ final class McpClient : ClientProtocol
 		// Hand the transport this client as its `ClientProtocol`: it pulls the
 		// protocol-derived request headers (`headersFor`) and the cancelled-response
 		// predicate (`isCancelled`) through that single seam, so the draft-header /
-		// schema-cache logic and the cancellation set stay here and no transport has
+		// schema-lookup logic and the cancellation set stay here and no transport has
 		// to be a concrete type the client downcasts to.
 		transport.setProtocol(this);
 	}
@@ -821,20 +822,13 @@ final class McpClient : ClientProtocol
 			// On a draft session over HTTP (the x-mcp-header feature), the client MUST
 			// exclude from tools/list any tool whose inputSchema carries an invalid
 			// `x-mcp-header` annotation (draft server/tools #x-mcp-header). Validate each
-			// tool's schema; drop offenders (and skip caching them), keeping siblings.
-			// stdio / non-draft sessions MAY ignore x-mcp-header, so they are unaffected.
+			// tool's schema and drop offenders before the result is cached, keeping
+			// siblings. stdio / non-draft sessions MAY ignore x-mcp-header, so they are
+			// unaffected.
 			if (useModern)
 				a.tools = excludeInvalidHeaderTools(a.tools);
 			return a;
 		});
-		// Refresh the x-mcp-header inputSchema cache from whatever we return — on a
-		// cache hit too, so the Mcp-Param-{Name} mirroring stays consistent with the
-		// served list even when it came from a pre-seeded store.
-		foreach (t; acc.tools)
-		{
-			cacheToolSchema(t.name, t.inputSchema);
-			cacheToolOutputSchema(t.name, t.outputSchema);
-		}
 		return acc;
 	}
 
@@ -863,31 +857,6 @@ final class McpClient : ClientProtocol
 			kept ~= t;
 		}
 		return kept;
-	}
-
-	/// Record a tool's `inputSchema` (keyed by tool name) so the draft client can
-	/// mirror its x-mcp-header-annotated arguments into `Mcp-Param-*` headers on a
-	/// later `tools/call`. Normally populated automatically by `listTools`; exposed
-	/// so callers that obtain a `Tool` descriptor by other means (e.g. a cached
-	/// `tools/list` result, or a `notifications/tools/list_changed` refresh) can
-	/// register it too. A non-object schema is ignored.
-	void cacheToolSchema(string name, Json inputSchema) @safe
-	{
-		if (name.length && inputSchema.type == Json.Type.object)
-			toolInputSchemas_[name] = inputSchema;
-	}
-
-	/// Record a tool's `outputSchema` (keyed by tool name) so a later string-name
-	/// `callTool` can validate the returned `structuredContent` against it when
-	/// output-schema validation is enabled (see `enableOutputSchemaValidation`).
-	/// Normally populated automatically by `listTools`; exposed so callers that
-	/// obtain a `Tool` descriptor by other means (e.g. a cached `tools/list`
-	/// result, or a `notifications/tools/list_changed` refresh) can register it
-	/// too. A non-object schema is ignored.
-	void cacheToolOutputSchema(string name, Json outputSchema) @safe
-	{
-		if (name.length && outputSchema.type == Json.Type.object)
-			toolOutputSchemas_[name] = outputSchema;
 	}
 
 	/// Replace the response cache backend. `store` may be your own `CacheStore`
@@ -962,6 +931,66 @@ final class McpClient : ClientProtocol
 		return Nullable!CacheEntry.init;
 	}
 
+	/// Resolve the still-fresh cache entry for `logical`, probing this client's
+	/// own partition first and then the shared/public one (only when partitioned,
+	/// since otherwise they coincide) — the same read order `cachedFetch` uses.
+	/// `hitKey` reports the physical key that hit so callers can memoize against
+	/// it. Null when nothing fresh is held.
+	private Nullable!CacheEntry cachedEntry(CacheKey logical, out CacheKey hitKey) @safe
+	{
+		if (cacheStore_ is null)
+			return Nullable!CacheEntry.init;
+		const ownKey = CacheKey(logical.method, logical.key, cachePartition_);
+		auto own = freshEntry(ownKey);
+		if (!own.isNull)
+		{
+			hitKey = ownKey;
+			return own;
+		}
+		if (cachePartition_.length)
+		{
+			const sharedKey = scopedKey(logical, CacheScope.public_);
+			auto shared_ = freshEntry(sharedKey);
+			if (!shared_.isNull)
+			{
+				hitKey = sharedKey;
+				return shared_;
+			}
+		}
+		return Nullable!CacheEntry.init;
+	}
+
+	/// The descriptor for tool `name` taken from the currently-cached `tools/list`
+	/// response — the single source for both `x-mcp-header` mirroring and
+	/// output-schema validation. Returns a null `Nullable` when no fresh
+	/// `tools/list` response is cached (locally OR in a shared/pre-seeded store),
+	/// so a caller that never ran `listTools` still gets schemas from a populated
+	/// cache. The parsed `name -> Tool` index is memoized and re-derived only when
+	/// the backing cache entry changes.
+	private Nullable!Tool cachedTool(string name) @safe
+	{
+		CacheKey hitKey;
+		auto entry = cachedEntry(CacheKey("tools/list", ""), hitKey);
+		if (entry.isNull)
+		{
+			toolIndexValid_ = false;
+			return Nullable!Tool.init;
+		}
+		if (!toolIndexValid_ || hitKey != toolIndexKey_ || entry.get.expiresAt != toolIndexStamp_)
+		{
+			auto list = ListToolsResult.fromJson(entry.get.value);
+			toolIndex_ = null;
+			foreach (t; list.tools)
+				toolIndex_[t.name] = t;
+			toolIndexKey_ = hitKey;
+			toolIndexStamp_ = entry.get.expiresAt;
+			toolIndexValid_ = true;
+		}
+		if (auto t = name in toolIndex_)
+			return nullable(*t);
+		return Nullable!Tool.init;
+	}
+
 	/// Run a cacheable read through the response cache. `logical` identifies the
 	/// entry (method, plus the resource URI for `resources/read`) with an empty
 	/// partition; the actual storage partition is chosen from the result's
@@ -985,17 +1014,10 @@ final class McpClient : ClientProtocol
 		const ownKey = CacheKey(logical.method, logical.key, cachePartition_);
 		if (mode == CacheMode.use)
 		{
-			auto own = freshEntry(ownKey);
-			if (!own.isNull)
-				return R.fromJson(own.get.value);
-			// A `public` entry lives under the shared partition; only probe it
-			// separately when this client is partitioned (otherwise ownKey == it).
-			if (cachePartition_.length)
-			{
-				auto shared_ = freshEntry(sharedKey);
-				if (!shared_.isNull)
-					return R.fromJson(shared_.get.value);
-			}
+			CacheKey hitKey;
+			auto hit = cachedEntry(logical, hitKey);
+			if (!hit.isNull)
+				return R.fromJson(hit.get.value);
 		}
 		R result = fetch();
 		const ttl = result.cache.isNull ? defaultCacheTtl_ : result.cache.get.ttl;
@@ -1042,20 +1064,25 @@ final class McpClient : ClientProtocol
 	/// protocol versions never see `inputRequests`.
 	///
 	/// When output-schema validation is enabled (see
-	/// `enableOutputSchemaValidation`) and a prior `listTools` cached this tool's
-	/// `outputSchema`, the returned `structuredContent` is validated against it and
-	/// a non-conforming result raises an `invalidParams` `McpException` — the same
-	/// guarantee as `callTool(Tool, ...)`, without the caller holding the descriptor.
+	/// `enableOutputSchemaValidation`) and the cached `tools/list` response carries
+	/// this tool's `outputSchema` (from any source — a local `listTools`, or a
+	/// shared/pre-seeded `CacheStore`), the returned `structuredContent` is
+	/// validated against it and a non-conforming result raises an `invalidParams`
+	/// `McpException` — the same guarantee as `callTool(Tool, ...)`, without the
+	/// caller holding the descriptor.
 	CallToolResult callTool(string name, Json arguments = Json.emptyObject,
 			RequestOptions opts = RequestOptions.init) @safe
 	{
 		auto result = callToolImpl(name, arguments, opts);
-		// When output-schema validation is enabled and `listTools` has cached this
-		// tool's outputSchema, validate the returned structuredContent against it so
-		// a string-name call gets the same guarantee as `callTool(Tool, ...)`.
+		// When output-schema validation is enabled and the cached tools/list carries
+		// this tool's outputSchema, validate the returned structuredContent against
+		// it so a string-name call gets the same guarantee as `callTool(Tool, ...)`.
 		if (validateOutputSchema_)
-			if (auto schema = name in toolOutputSchemas_)
-				enforceOutputSchema(name, *schema, result);
+		{
+			auto tool = cachedTool(name);
+			if (!tool.isNull)
+				enforceOutputSchema(name, tool.get.outputSchema, result);
+		}
 		return result;
 	}
 
@@ -2120,11 +2147,11 @@ final class McpClient : ClientProtocol
 			// header for each annotated argument that is present and non-null.
 			if (method == "tools/call" && name.length)
 			{
-				auto schema = name in toolInputSchemas_;
-				if (schema !is null)
+				auto tool = cachedTool(name);
+				if (!tool.isNull)
 				{
 					auto args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
-					foreach (header, value; paramHeaders(*schema, args))
+					foreach (header, value; paramHeaders(tool.get.inputSchema, args))
 						headers[header] = value;
 				}
 			}
@@ -3029,6 +3056,100 @@ private Tool headerTool(string name, Json[string] props) @safe
 	return t;
 }
 
+unittest  // a pre-seeded tools/list cache drives x-mcp-header mirroring with no local listTools
+{
+	import std.datetime : SysTime, DateTime;
+
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	Tool t = headerTool("locate", [
+		"region": Json(["type": Json("string"), "x-mcp-header": Json("Region")])
+	]);
+	ListToolsResult lr;
+	lr.tools = [t];
+	// Pre-seed a shared store as if another process (or a prior session) had
+	// already fetched tools/list; this client never calls listTools itself.
+	auto store = new InMemoryCacheStore();
+	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	c.setCache(store);
+
+	Json msg = Json.emptyObject;
+	msg["method"] = "tools/call";
+	Json params = Json.emptyObject;
+	params["name"] = "locate";
+	params["arguments"] = Json(["region": Json("us-west1")]);
+	msg["params"] = params;
+
+	auto headers = c.headersFor(msg);
+	assert("Mcp-Param-Region" in headers,
+			"header mirroring must work from a pre-seeded cache without a local listTools");
+	assert(headers["Mcp-Param-Region"] == "us-west1");
+}
+
+unittest  // an expired tools/list cache entry yields no header mirroring (freshness honored)
+{
+	import std.datetime : SysTime, DateTime;
+
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	Tool t = headerTool("locate", [
+		"region": Json(["type": Json("string"), "x-mcp-header": Json("Region")])
+	]);
+	ListToolsResult lr;
+	lr.tools = [t];
+	auto store = new InMemoryCacheStore();
+	// expiresAt in the past -> freshEntry treats it as a miss.
+	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2000, 1, 1))));
+	c.setCache(store);
+
+	Json msg = Json.emptyObject;
+	msg["method"] = "tools/call";
+	Json params = Json.emptyObject;
+	params["name"] = "locate";
+	params["arguments"] = Json(["region": Json("us-west1")]);
+	msg["params"] = params;
+
+	assert("Mcp-Param-Region" !in c.headersFor(msg),
+			"a stale tools/list entry must not drive header mirroring");
+}
+
+unittest  // the tool index re-derives when the underlying cache entry changes
+{
+	import std.datetime : SysTime, DateTime;
+
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	auto store = new InMemoryCacheStore();
+	c.setCache(store);
+
+	Json msg = Json.emptyObject;
+	msg["method"] = "tools/call";
+	Json params = Json.emptyObject;
+	params["name"] = "locate";
+	params["arguments"] = Json(["region": Json("us-west1")]);
+	msg["params"] = params;
+
+	Tool a = headerTool("locate", [
+		"region": Json(["type": Json("string"), "x-mcp-header": Json("Region")])
+	]);
+	ListToolsResult lrA;
+	lrA.tools = [a];
+	store.put(CacheKey("tools/list", ""), CacheEntry(lrA.toJson(), SysTime(DateTime(2999, 1, 1))));
+	assert("Mcp-Param-Region" in c.headersFor(msg)); // builds the index
+
+	// Replace the entry (new expiry) with the same tool annotated differently;
+	// the memoized index must be re-derived, not reused.
+	Tool b = headerTool("locate", [
+		"region": Json(["type": Json("string"), "x-mcp-header": Json("Zone")])
+	]);
+	ListToolsResult lrB;
+	lrB.tools = [b];
+	store.put(CacheKey("tools/list", ""), CacheEntry(lrB.toJson(), SysTime(DateTime(2999, 1, 2))));
+	auto headers = c.headersFor(msg);
+	assert("Mcp-Param-Region" !in headers, "stale memoized schema must not survive a cache change");
+	assert("Mcp-Param-Zone" in headers, "re-derived index must reflect the new cache entry");
+}
+
 unittest  // listTools excludes a tool whose x-mcp-header value is empty (draft)
 {
 	auto c = McpClient.http("http://localhost");
@@ -3054,9 +3175,6 @@ unittest  // listTools excludes a tool whose x-mcp-header value is empty (draft)
 	auto names = res.tools.map!(t => t.name).array;
 	assert(!names.canFind("bad"), "tool with empty x-mcp-header must be excluded");
 	assert(names.canFind("good"), "sibling valid tool must remain");
-	// The offending tool must not be cached for header mirroring.
-	assert("bad" !in c.toolInputSchemas_);
-	assert("good" in c.toolInputSchemas_);
 }
 
 unittest  // listTools excludes a tool whose x-mcp-header value contains CR/LF
@@ -3078,7 +3196,6 @@ unittest  // listTools excludes a tool whose x-mcp-header value contains CR/LF
 	};
 	auto res = c.listTools();
 	assert(res.tools.length == 0, "tool with CR/LF header must be excluded");
-	assert("crlf" !in c.toolInputSchemas_);
 }
 
 unittest  // listTools excludes a tool annotating a number-typed parameter
@@ -3097,7 +3214,6 @@ unittest  // listTools excludes a tool annotating a number-typed parameter
 	};
 	auto res = c.listTools();
 	assert(res.tools.length == 0, "number-typed x-mcp-header must be excluded");
-	assert("num" !in c.toolInputSchemas_);
 }
 
 unittest  // listTools excludes a tool with case-insensitively duplicate header values
@@ -3117,7 +3233,6 @@ unittest  // listTools excludes a tool with case-insensitively duplicate header 
 	};
 	auto res = c.listTools();
 	assert(res.tools.length == 0, "duplicate header values must be excluded");
-	assert("dup" !in c.toolInputSchemas_);
 }
 
 unittest  // a non-draft session does NOT exclude tools (x-mcp-header MAY be ignored)
@@ -3384,9 +3499,10 @@ unittest  // string-name callTool skips output validation when it is not enabled
 	assert(res.structuredContent["result"].get!string == "oops");
 }
 
-unittest  // listTools caches each tool's outputSchema for later string-name validation
+unittest  // a pre-seeded tools/list cache drives output validation with no local listTools
 {
 	import mcp.api.schema : jsonSchemaOf;
+	import std.datetime : SysTime, DateTime;
 
 	struct AddResult
 	{
@@ -3394,27 +3510,51 @@ unittest  // listTools caches each tool's outputSchema for later string-name val
 	}
 
 	auto c = McpClient.http("http://localhost");
+	c.enableOutputSchemaValidation();
 	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	ListToolsResult lr;
+	lr.tools = [t];
+	auto store = new InMemoryCacheStore();
+	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	c.setCache(store);
 	c.onRpcForTest = (string method, Json params) @safe {
-		Json r = Json.emptyObject;
-		Json arr = Json.emptyArray;
-		arr ~= t.toJson();
-		r["tools"] = arr;
-		return r;
+		return Json(["structuredContent": Json(["result": Json("oops")])]);
 	};
-	c.listTools();
-	assert("add" in c.toolOutputSchemas_);
+
+	bool threw;
+	try
+		c.callTool("add"); // non-conforming, validated against the pre-seeded schema
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.invalidParams);
+	}
+	assert(threw, "output validation must work from a pre-seeded cache without a local listTools");
 }
 
-unittest  // cacheToolOutputSchema records an object schema and ignores a non-object one
+unittest  // a pre-seeded tools/list cache accepts a conforming result with no local listTools
 {
-	auto c = McpClient.http("http://localhost");
-	Json schema = Json(["type": Json("object")]);
-	c.cacheToolOutputSchema("search", schema);
-	assert("search" in c.toolOutputSchemas_);
+	import mcp.api.schema : jsonSchemaOf;
+	import std.datetime : SysTime, DateTime;
 
-	c.cacheToolOutputSchema("bad", Json("not-an-object"));
-	assert("bad" !in c.toolOutputSchemas_);
+	struct AddResult
+	{
+		int result;
+	}
+
+	auto c = McpClient.http("http://localhost");
+	c.enableOutputSchemaValidation();
+	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	ListToolsResult lr;
+	lr.tools = [t];
+	auto store = new InMemoryCacheStore();
+	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	c.setCache(store);
+	c.onRpcForTest = (string method, Json params) @safe {
+		return Json(["structuredContent": Json(["result": Json(5)])]);
+	};
+	auto res = c.callTool("add");
+	assert(res.structuredContent["result"].get!int == 5);
 }
 
 unittest  // sampling dispatch rejects an unbalanced tool_use with -32602
@@ -4676,18 +4816,6 @@ unittest  // paramHeaders yields nothing when the schema has no x-mcp-header ann
 	assert(headers.length == 0);
 }
 
-unittest  // cacheToolSchema records a schema and ignores a non-object one
-{
-	auto c = McpClient.http("http://localhost/mcp");
-	Json schema = Json.emptyObject;
-	schema["type"] = "object";
-	c.cacheToolSchema("search", schema);
-	assert("search" in c.toolInputSchemas_);
-	// Non-object schema is ignored.
-	c.cacheToolSchema("bad", Json("not-an-object"));
-	assert("bad" !in c.toolInputSchemas_);
-}
-
 unittest  // MRTR: withInputResponses attaches answers in top-level params.inputResponses
 {
 	auto resp = InputResponse("date", Json([
@@ -5141,6 +5269,7 @@ unittest  // with no server hint and zero defaultCacheTtl nothing is cached
 {
 	int calls;
 	auto c = cachingTestClient("tools/list", -1, calls); // -1 => omit ttlMs
+	c.setDefaultCacheTtl(Duration.zero); // opt out of the default-on caching
 	c.listTools();
 	c.listTools();
 	assert(calls == 2);
