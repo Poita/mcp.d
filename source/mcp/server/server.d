@@ -1112,13 +1112,17 @@ final class McpServer
 	/// `resources/subscribe` correlates more than one HTTP call (a
 	/// subscription set up on one call is honoured by a `notifications/resources/
 	/// updated` pushed on another), so it is per-peer state a `stateless` server
-	/// must not keep. In stateless mode this opt-in is therefore INERT: the
-	/// `subscribe` capability is not advertised and `resources/subscribe` /
-	/// `resources/unsubscribe` answer `-32601` (method not found). Construct the
-	/// server with `McpServer.stateful()` to actually enable subscriptions (keyed
-	/// on `Mcp-Session-Id`). See `effectiveResourceSubscriptions`.
+	/// must not keep. Calling this on a `stateless` server therefore THROWS rather
+	/// than silently doing nothing: construct the server with `McpServer.stateful()`
+	/// to enable subscriptions (keyed on `Mcp-Session-Id`). On a `stateful` server
+	/// it advertises the capability and honours the subscribe/unsubscribe methods.
+	/// See `effectiveResourceSubscriptions`.
 	void enableResourceSubscriptions() @safe
 	{
+		if (mode_ == ServerMode.stateless)
+			throw new Exception("enableResourceSubscriptions() is not available on a stateless"
+					~ " server: resource subscriptions correlate multiple HTTP calls and need"
+					~ " per-peer state. Construct the server with McpServer.stateful() instead.");
 		resourceSubscriptionsEnabled = true;
 	}
 
@@ -2586,16 +2590,20 @@ final class McpServer
 		case "resourcesListChanged":
 			return resourcesListChangedEnabled;
 		case "resourceSubscriptions":
-			// Capability-based, NOT mode-gated. The stateless HTTP
-			// transport refuses subscriptions/listen BEFORE it reaches the server core
-			// (handlePost -> -32601), so this is only consulted on the stdio listen
-			// path, where there is a single implicit connection and resource-update
-			// push is allowed in any mode (the requirement's stdio carve-out). Gating
-			// it on the server MODE here would wrongly break stdio listen for a
-			// stateless server; the HTTP no-shared-state guarantee is enforced at the
-			// transport, and the `subscribe` CAPABILITY advertisement is mode-gated in
-			// `capabilities()` / `effectiveResourceSubscriptions`.
-			return resourceSubscriptionsEnabled;
+			// The draft `subscriptions/listen` stream is a self-contained channel
+			// whose per-stream filter IS the client's resource-update opt-in, so on a
+			// stateless (draft) server the listen filter alone drives delivery — the
+			// stateful-only `enableResourceSubscriptions()` (which throws on a
+			// stateless server) is neither required nor callable there. The stateless
+			// HTTP transport refuses subscriptions/listen BEFORE it reaches the server
+			// core (handlePost -> -32601), so this is only consulted on the stdio
+			// listen path (a single implicit connection where resource-update push is
+			// allowed in any mode — the requirement's stdio carve-out). On a stateful
+			// server the 2025-era `resources/subscribe` opt-in
+			// (`resourceSubscriptionsEnabled`) gates it, and the `subscribe`
+			// CAPABILITY advertisement is mode-gated in `capabilities()` /
+			// `effectiveResourceSubscriptions`.
+			return resourceSubscriptionsEnabled || mode_ == ServerMode.stateless;
 		default:
 			return false;
 		}
@@ -2708,15 +2716,25 @@ final class McpServer
 		// resources"); a server advertises it only after enableResourceSubscriptions().
 		// A server that never advertised it MUST answer with -32601 rather than
 		// silently accepting, matching logging/setLevel's capability gating.
-		// A stateless server keeps no per-peer subscription state across
-		// HTTP calls, so effectiveResourceSubscriptions() is false in stateless
-		// mode even when enableResourceSubscriptions() was called — yielding -32601.
+		// A stateless server keeps no per-peer subscription state across HTTP calls,
+		// so effectiveResourceSubscriptions() is always false in stateless mode; the
+		// -32601 then names McpServer.stateful() as the remedy.
 		if (!effectiveResourceSubscriptions())
-			throw methodNotFound("resources/subscribe");
+			throw methodNotFound("resources/subscribe", subscriptionRejectionHint());
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/subscribe requires a string 'uri'");
 		conn.subscriptions[params["uri"].get!string] = true;
 		return Json.emptyObject;
+	}
+
+	/// The `data` payload accompanying a -32601 for resources/subscribe or
+	/// /unsubscribe: on a stateless server it names the remedy (construct with
+	/// `McpServer.stateful()`); otherwise it points at the missing opt-in.
+	private Json subscriptionRejectionHint() const @safe
+	{
+		Json data = Json.emptyObject;
+		data["reason"] = mode_ == ServerMode.stateless ? "resource subscriptions require a stateful server; construct it with McpServer.stateful()" : "the server has not called enableResourceSubscriptions()";
+		return data;
 	}
 
 	private Json doUnsubscribe(Json params, ConnectionState conn) @safe
@@ -2724,10 +2742,10 @@ final class McpServer
 		// Gated on the same optional `subscribe` capability as doSubscribe: a server
 		// that never advertised it MUST answer with -32601 rather than silently
 		// accepting an unsubscribe for a subscription it could never have created.
-		// Also -32601 in stateless mode (no per-peer state across
-		// HTTP calls), via effectiveResourceSubscriptions().
+		// Also -32601 in stateless mode (no per-peer state across HTTP calls); the
+		// hint names McpServer.stateful().
 		if (!effectiveResourceSubscriptions())
-			throw methodNotFound("resources/unsubscribe");
+			throw methodNotFound("resources/unsubscribe", subscriptionRejectionHint());
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/unsubscribe requires a string 'uri'");
 		conn.subscriptions.remove(params["uri"].get!string);
@@ -2854,8 +2872,16 @@ final class McpServer
 		// connection). Refuse it on every transport — matching resources/subscribe —
 		// rather than pretend to accept it; a stateful server stores the level on
 		// its session, and log emission still works per-request regardless of mode.
+		// The -32601's data names McpServer.stateful() (the session-scoped remedy)
+		// and the draft per-request _meta logging alternative.
 		if (mode_ == ServerMode.stateless)
-			throw methodNotFound("logging/setLevel");
+		{
+			Json data = Json.emptyObject;
+			data["reason"] = "logging/setLevel needs a session to store the level;"
+				~ " construct the server with McpServer.stateful(), or set the level"
+				~ " per-request via _meta[\"io.modelcontextprotocol/logLevel\"] on the draft";
+			throw methodNotFound("logging/setLevel", data);
+		}
 		// On stable (<= 2025-11-25) versions the logging feature is gated on the
 		// declared `logging` capability (server/utilities/logging: "Servers that
 		// emit log message notifications MUST declare the `logging` capability").
@@ -5542,10 +5568,10 @@ unittest  // draft: resources/subscribe is method-not-found (subscriptions/liste
 	// The draft has no resources/subscribe RPC; subscriptions/listen with a
 	// resourceSubscriptions string[] takes its place (the draft
 	// SubscriptionFilter "Replaces the former resources/subscribe RPC"). On the
-	// draft the method does not exist, so it MUST be answered with -32601 even
-	// when subscriptions are enabled, and MUST NOT record the URI.
+	// draft (stateless) the method does not exist, so it MUST be answered with
+	// -32601 and MUST NOT record the URI. (A stateless server cannot even opt into
+	// subscriptions — enableResourceSubscriptions() throws — so none is enabled.)
 	auto s = new McpServer("t", "1");
-	s.enableResourceSubscriptions();
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
 	auto resp = s.handle(draftReq(1, "resources/subscribe", p)).get;
@@ -5566,7 +5592,6 @@ unittest  // resources/unsubscribe is rejected with -32601 when capability not a
 unittest  // draft: resources/unsubscribe is method-not-found (removed for subscriptions/listen)
 {
 	auto s = new McpServer("t", "1");
-	s.enableResourceSubscriptions();
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
 	auto resp = s.handle(draftReq(2, "resources/unsubscribe", p)).get;
@@ -6649,8 +6674,11 @@ unittest  // subscriptions/listen ack omits resourcesListChanged when unsupporte
 
 unittest  // subscriptions/listen ack omits resourceSubscriptions when subscriptions disabled
 {
-	// resource subscriptions not enabled -> the agreed subset must omit the URIs.
-	auto s = new McpServer("t", "1");
+	// On a stateful server that never opted into resource subscriptions, the listen
+	// gate (resourceSubscriptionsEnabled) is closed, so the agreed subset omits the
+	// URIs. (On a stateless/draft server the listen filter itself is the opt-in, so
+	// that case is covered separately.)
+	auto s = McpServer.stateful("t", "1");
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
 	Json p = Json.emptyObject;
@@ -6659,6 +6687,21 @@ unittest  // subscriptions/listen ack omits resourceSubscriptions when subscript
 	assert(!s.lastListenFilter().resourceSubscriptions);
 	assert("resourceSubscriptions" !in s.acknowledgedSubsetFor(s.lastListenFilter()));
 	assert(!s.isSubscribed("file:///x"));
+}
+
+unittest  // a stateless/draft server honours a subscriptions/listen resourceSubscriptions filter
+{
+	// The draft `subscriptions/listen` filter is the client's own resource-update
+	// opt-in; a stateless (draft) server honours it without (and cannot use)
+	// `enableResourceSubscriptions()`.
+	auto s = McpServer.stateless("t", "1");
+	Json filter = Json.emptyObject;
+	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
+	Json p = Json.emptyObject;
+	p["notifications"] = filter;
+	s.handle(draftReq(4, "subscriptions/listen", p));
+	assert(s.lastListenFilter().resourceSubscriptions);
+	assert(s.acknowledgedSubsetFor(s.lastListenFilter())["resourceSubscriptions"].length == 1);
 }
 
 unittest  // subscriptions/listen ack keeps resourceSubscriptions once enabled
@@ -7328,7 +7371,9 @@ unittest  // notifyResourceUpdated emits resources/updated for a subscribed uri
 
 unittest  // notifyResourceUpdated is a no-op for a uri nobody subscribed to
 {
-	auto s = new McpServer("t", "1");
+	// Subscriptions require a stateful server (enableResourceSubscriptions throws
+	// otherwise); the no-op-for-unsubscribed behaviour holds regardless.
+	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
 	auto ch = s.serverPushChannel(coord);
@@ -7377,7 +7422,8 @@ unittest  // notifyResourceUpdated has no title overload (title is not a spec pa
 
 unittest  // notifyResourceUpdated is a no-op before a push channel exists
 {
-	auto s = new McpServer("t", "1");
+	// resources/subscribe requires a stateful server.
+	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
@@ -7739,8 +7785,9 @@ unittest  // STATELESS HTTP subscriptions/listen delivers resources/updated per-
 	// for note:///b.
 	import std.algorithm : canFind;
 
+	// Delivery is driven by the open listener's own SubscriptionFilter, not by
+	// enableResourceSubscriptions() (which a stateless server cannot call).
 	auto s = McpServer.stateless("t", "1");
-	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
 	auto push = s.serverPushChannel(coord);
 
@@ -7805,8 +7852,9 @@ unittest  // stdio listen sink is per-URI filtered (subscribed delivered, other 
 	// stdio listener subscribed to uriA does NOT receive an update for uriB.
 	import std.algorithm : canFind;
 
+	// Delivery is driven by the stdio listen stream's own recorded filter, not by
+	// enableResourceSubscriptions() (which a stateless server cannot call).
 	auto s = new McpServer("t", "1");
-	s.enableResourceSubscriptions();
 
 	string[] sink;
 	// Open a draft stdio listen subscribed to note:///a only.
@@ -8345,30 +8393,36 @@ unittest  // bare handle(msg) uses the single bound activeConnection
 	assert(s.activeConnection.logLevel == "error", "bare handle must fall back to activeConnection");
 }
 
-unittest  // a stateless server does NOT advertise the subscribe capability
+unittest  // enableResourceSubscriptions() throws on a stateless server
 {
-	// resources/subscribe correlates more than one HTTP call, so a stateless
-	// server (the default) keeps it inert: even after enableResourceSubscriptions()
-	// the `subscribe` resources capability is NOT advertised.
+	// resources/subscribe correlates more than one HTTP call, so it cannot work on
+	// a stateless server. Rather than silently doing nothing, the opt-in throws and
+	// names the remedy (McpServer.stateful()).
 	auto s = McpServer.stateless("t", "1");
-	s.registerResource(Resource("res://x", "x"), () @safe {
-		ResourceContents c;
-		return c;
-	});
-	s.enableResourceSubscriptions();
+	bool threw;
+	try
+		s.enableResourceSubscriptions();
+	catch (Exception e)
+	{
+		threw = true;
+		import std.algorithm.searching : canFind;
+
+		assert(e.msg.canFind("McpServer.stateful()"),
+				"the stateless rejection must name McpServer.stateful()");
+	}
+	assert(threw, "enableResourceSubscriptions() must throw on a stateless server");
+	// The capability stays unadvertised because the opt-in never took effect.
 	auto caps = s.capabilities();
-	assert(!caps.resources.isNull);
-	assert(!caps.resources.get.subscribe,
+	assert(caps.resources.isNull || !caps.resources.get.subscribe,
 			"a stateless server must NOT advertise the resources subscribe capability");
 }
 
 unittest  // resources/subscribe on a stateless server -> -32601
 {
-	// Even with enableResourceSubscriptions() called, a stateless server answers
-	// resources/subscribe AND resources/unsubscribe with method-not-found (-32601):
-	// there is no per-peer subscription state across HTTP calls.
+	// A stateless server that could not opt in still answers resources/subscribe AND
+	// resources/unsubscribe with method-not-found (-32601): there is no per-peer
+	// subscription state across HTTP calls.
 	auto s = McpServer.stateless("t", "1");
-	s.enableResourceSubscriptions();
 
 	Json sub = Json.emptyObject;
 	sub["uri"] = "res://x";

@@ -265,9 +265,10 @@ is resolved.
 | Session id minted | never | never | yes |
 
 The `subscribe` capability advertisement follows the same rule: a stateless server
-does **not** advertise the resources `subscribe` capability even after
-`enableResourceSubscriptions()` (the opt-in is inert in stateless mode), so a
-client never expects per-resource update push it could not receive. The
+does **not** advertise the resources `subscribe` capability. Calling
+`enableResourceSubscriptions()` on a stateless server **throws** rather than
+silently doing nothing — it names `McpServer.stateful()` as the remedy — so the
+mistake surfaces at construction instead of as a missing capability at runtime. The
 server->client (elicit/sample/roots) gating is transport-agnostic — stdio follows
 the same `server.mode` rules as HTTP.
 
