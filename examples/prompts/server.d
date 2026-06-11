@@ -23,7 +23,7 @@ import std.typecons : nullable;
 
 import mcp.server.server : McpServer;
 import mcp.api.reflection : registerHandlers;
-import mcp.api.attributes : prompt, describe;
+import mcp.api.attributes : prompt, describeParam;
 import mcp.protocol.types : GetPromptResult, PromptMessage, Content,
 	CompleteResult, CompletionReference;
 
@@ -82,7 +82,8 @@ final class PromptApp
 	/// A simple prompt with one typed, described argument. Returns plain text,
 	/// which the SDK wraps into a single user `PromptMessage`.
 	@prompt("greet", "Greet someone by name", "Greeting")
-	string greet(@describe("the person to greet") string name)@safe
+	@describeParam("name", "the person to greet")
+	string greet(string name) @safe
 	{
 		return "Please write a warm, one-line greeting for " ~ name ~ ".";
 	}
@@ -92,8 +93,8 @@ final class PromptApp
 	/// helpers (no hand-built content Json). The `language` argument is completed
 	/// via the completion handler below.
 	@prompt("code_review", "Ask the model to review a code snippet", "Code Review")
-	GetPromptResult codeReview(
-			@describe("programming language to review a sample of") string language)@safe
+	@describeParam("language", "programming language to review a sample of")
+	GetPromptResult codeReview(string language) @safe
 	{
 		GetPromptResult r;
 		r.description = "Review request for a " ~ language ~ " snippet";

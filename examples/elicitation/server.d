@@ -125,7 +125,7 @@ final class TripApi
 	/// `structuredContent`.
 	@tool("plan_trip",
 			"Plan a trip to a destination; elicits traveler count, cabin class and insurance.")
-	@describe("destination", "the destination city")
+	@describeParam("destination", "the destination city")
 	TripPlan planTrip(string destination, RequestContext ctx) @safe
 	{
 		// BLOCKING server->client elicitation. The requestedSchema is derived

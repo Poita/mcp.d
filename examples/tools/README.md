@@ -32,7 +32,7 @@ Both sides build on the shared **examples/common** scaffold (`examples-common`):
 - **Behavioral marker UDAs** that populate `ToolAnnotations`:
   `@readOnly` → `readOnlyHint`, `@destructive` → `destructiveHint`,
   `@idempotent` → `idempotentHint`, and `@hintTitle("...")` → annotation title.
-- **`@describe`** to document individual arguments.
+- **`@describeParam("name", "text")`** (method-level) to document individual arguments.
 - **`registerModule!(thisModule)(server)`** to register every module-level
   `@tool` free function in one call (no class instance required).
 - **Transport selection** via the shared `runServerFromArgs` scaffold helper:

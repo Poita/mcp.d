@@ -41,6 +41,7 @@ public import mcp.server.context;
 public import mcp.server.server;
 public import mcp.server.settings;
 public import mcp.client.client;
+public import mcp.client.runner;
 public import mcp.client.subscription;
 public import mcp.client.cache;
 

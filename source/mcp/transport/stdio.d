@@ -1091,7 +1091,7 @@ unittest  // serveStdio processes newline-delimited requests and writes response
 {
 	auto s = new McpServer("stdio-srv", "1.0");
 	Tool echo = {name: "echo"};
-	s.registerDynamicTool(echo, (Json args) @safe {
+	s.registerTool(echo, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -1208,7 +1208,7 @@ unittest  // stdio: a tool calling ctx.elicit is answered over the same stdio ch
 
 	auto s = McpServer.stateful("stdio-peer", "1.0");
 	Tool ask = {name: "ask"};
-	s.registerDynamicTool(ask, (Json args, RequestContext ctx) @safe {
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
 		auto schema = Json(["type": Json("object")]);
 		auto reply = ctx.elicit("What is your name?", schema);
 		const name = (reply.action == ElicitAction.accept) ? reply.content["name"].get!string
@@ -1268,7 +1268,7 @@ unittest  // stdio: notifications/cancelled mid-handler is observed via the in-f
 	auto entered = createManualEvent();
 	bool observedCancel;
 	Tool slow = {name: "slow"};
-	s.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
 		// Signal that the handler is running, then poll ctx.isCancelled while
 		// yielding so the read loop can dispatch the inbound notifications/cancelled.
 		entered.emit();
@@ -1334,7 +1334,7 @@ unittest  // a handler still running when stdin EOFs is drained: its reply is no
 	auto release = createManualEvent();
 	auto entered = createManualEvent();
 	Tool slow = {name: "slow"};
-	s.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
 		entered.emit();
 		auto ec = release.emitCount;
 		() @trusted { release.wait(ec); }();
@@ -1390,7 +1390,7 @@ unittest  // a tool handler's ctx.log() is delivered as a notifications/message 
 	auto s = new McpServer("logsrv", "1.0");
 	s.enableLogging();
 	Tool logger = {name: "logit"};
-	s.registerDynamicTool(logger, (Json args, RequestContext ctx) @safe {
+	s.registerTool(logger, (Json args, RequestContext ctx) @safe {
 		ctx.log("error", Json("boom"), "mylogger");
 		CallToolResult r;
 		r.content = [Content.makeText("done")];
@@ -1422,7 +1422,7 @@ unittest  // logging below the configured minimum level is dropped over stdio
 	auto s = McpServer.stateful("logsrv", "1.0");
 	s.enableLogging();
 	Tool logger = {name: "logit"};
-	s.registerDynamicTool(logger, (Json args, RequestContext ctx) @safe {
+	s.registerTool(logger, (Json args, RequestContext ctx) @safe {
 		ctx.log("debug", Json("noise")); // below minimum -> dropped
 		CallToolResult r;
 		r.content = [Content.makeText("done")];
@@ -1451,7 +1451,7 @@ unittest  // reportProgress is delivered over stdio when the request carries a p
 {
 	auto s = new McpServer("progsrv", "1.0");
 	Tool worker = {name: "work"};
-	s.registerDynamicTool(worker, (Json args, RequestContext ctx) @safe {
+	s.registerTool(worker, (Json args, RequestContext ctx) @safe {
 		ctx.reportProgress(0.5, nullable(1.0), "halfway");
 		CallToolResult r;
 		r.content = [Content.makeText("done")];
@@ -1479,7 +1479,7 @@ unittest  // reportProgress without a progressToken emits nothing over stdio
 {
 	auto s = new McpServer("progsrv", "1.0");
 	Tool worker = {name: "work"};
-	s.registerDynamicTool(worker, (Json args, RequestContext ctx) @safe {
+	s.registerTool(worker, (Json args, RequestContext ctx) @safe {
 		ctx.reportProgress(0.5); // no token on the request -> dropped
 		CallToolResult r;
 		r.content = [Content.makeText("done")];
@@ -1652,7 +1652,7 @@ unittest  // two tool handlers overlap concurrently over the duplex (barrier pro
 	auto barrier = createManualEvent();
 	shared int entered = 0;
 	Tool slow = {name: "slow"};
-	s.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
 		// Each handler increments the entered count, signals, then waits until
 		// BOTH have entered. If handlers were serialized the second would never
 		// enter and this would hang (the test's event loop would time out).
@@ -1741,7 +1741,7 @@ unittest  // END-TO-END: McpClient over stdio drives an McpServer; two concurren
 {
 	auto s = new McpServer("e2e-srv", "1.0");
 	Tool echo = {name: "echo"};
-	s.registerDynamicTool(echo, (Json args) @safe {
+	s.registerTool(echo, (Json args) @safe {
 		CallToolResult r;
 		const which = ("which" in args) ? args["which"].get!string : "?";
 		r.content = [Content.makeText("echo:" ~ which)];
@@ -1828,7 +1828,7 @@ unittest  // END-TO-END: a server tool's ctx.sample round-trips to the client's 
 
 	auto s = McpServer.stateful("e2e-sample", "1.0");
 	Tool ask = {name: "ask"};
-	s.registerDynamicTool(ask, (Json args, RequestContext ctx) @safe {
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
 		Json p = Json.emptyObject;
 		p["messages"] = Json.emptyArray;
 		p["maxTokens"] = 16;
