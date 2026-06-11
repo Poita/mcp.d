@@ -5403,6 +5403,62 @@ unittest  // tools/list_changed evicts the cached list and fires the typed callb
 	assert(calls == 2);
 }
 
+unittest  // prompts/list_changed evicts the cached list and fires the typed callback
+{
+	int calls;
+	bool fired;
+	auto c = cachingTestClient("prompts/list", 5000, calls);
+	c.onPromptsListChanged = () @safe { fired = true; };
+	c.listPrompts(); // cached (calls == 1)
+	c.listPrompts(); // hit (calls == 1)
+	c.dispatchNotification("notifications/prompts/list_changed", Json.emptyObject);
+	assert(fired, "typed callback must fire");
+	c.listPrompts(); // evicted -> refetch (calls == 2)
+	assert(calls == 2);
+}
+
+unittest  // a typed change observer fires in ADDITION to the generic onNotification
+{
+	int calls;
+	bool typedFired;
+	string genericMethod;
+	auto c = cachingTestClient("tools/list", 5000, calls);
+	c.onToolsListChanged = () @safe { typedFired = true; };
+	c.onNotification = (string method, Json params) @safe {
+		genericMethod = method;
+	};
+	c.dispatchNotification("notifications/tools/list_changed", Json.emptyObject);
+	assert(typedFired, "typed callback must fire");
+	assert(genericMethod == "notifications/tools/list_changed",
+			"generic onNotification must also fire for the same notification");
+}
+
+unittest  // resources/updated fires onResourceUpdated in addition to onNotification
+{
+	auto c = McpClient.http("http://localhost");
+	string updated;
+	string genericMethod;
+	c.onResourceUpdated = (string uri) @safe { updated = uri; };
+	c.onNotification = (string method, Json params) @safe {
+		genericMethod = method;
+	};
+	Json p = Json.emptyObject;
+	p["uri"] = "test://x";
+	c.dispatchNotification("notifications/resources/updated", p);
+	assert(updated == "test://x", "typed observer receives the changed uri");
+	assert(genericMethod == "notifications/resources/updated",
+			"generic onNotification must also fire");
+}
+
+unittest  // resources/updated without a uri does not fire onResourceUpdated
+{
+	auto c = McpClient.http("http://localhost");
+	bool fired;
+	c.onResourceUpdated = (string uri) @safe { fired = true; };
+	c.dispatchNotification("notifications/resources/updated", Json.emptyObject);
+	assert(!fired, "no uri -> the typed observer must not fire");
+}
+
 unittest  // resources/updated evicts only the named resource
 {
 	auto c = McpClient.http("http://localhost");

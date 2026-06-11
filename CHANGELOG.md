@@ -13,6 +13,11 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- **Test coverage for the typed list-change observers** (`onToolsListChanged`,
+  `onPromptsListChanged`, `onResourcesListChanged`, `onResourceUpdated`):
+  exercises the `prompts/list_changed` callback, confirms each typed observer
+  fires *in addition to* the generic `onNotification`, and that a
+  `resources/updated` with no `uri` fires no typed observer.
 - **`CallToolResult.ensureOk()`** — returns normally on a success result; on an
   error result throws `McpException(internalError)` whose message surfaces the
   first text content block (or a generic message when there is none). Turns a
