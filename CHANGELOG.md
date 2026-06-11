@@ -7,6 +7,21 @@ This project is pre-1.0 and makes no backward-compatibility guarantees yet.
 
 ## [Unreleased]
 
+### Added
+
+- `ServerSettings` gained capability/validation flags so static server
+  configuration can be declared in one value and applied by `newServer()`:
+  `toolsListChanged`, `resourcesListChanged`, `promptsListChanged`, `logging`,
+  `resourceSubscriptions`, `outputSchemaValidation`, and `apps` (all `bool`,
+  default off), plus `inputSchemaValidation` (`Nullable!bool`: `null` = leave the
+  on-by-default behaviour, `true`/`false` = explicit enable/disable). `newServer()`
+  applies each via the matching `enable*`/`disable*` method; a stateless-mode
+  `resourceSubscriptions = true` surfaces the same loud error a direct
+  `enableResourceSubscriptions()` call raises. `enableTasks` stays method-only (it
+  returns a `TaskRuntime` and takes a `TaskStore`). Settings are now the primary
+  documented path for static configuration; the `enable*` methods remain for
+  dynamic/runtime use.
+
 ### Changed
 
 - `McpServer.enableResourceSubscriptions()` now **throws** on a stateless server
