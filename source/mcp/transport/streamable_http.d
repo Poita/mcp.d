@@ -1033,7 +1033,12 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	{
 		res.statusCode = HTTPStatus.methodNotAllowed;
 		res.headers["Allow"] = "POST";
-		res.writeBody("", "text/plain");
+		// A stateless server has no session to anchor the unsolicited push stream;
+		// name the remedy. The draft (stateful or not) simply has no standalone GET
+		// stream, so its 405 stays bodiless.
+		res.writeBody(server.mode != ServerMode.stateful
+				? "The standalone GET SSE stream requires a stateful server;"
+				~ " construct it with McpServer.stateful()." : "", "text/plain");
 		return;
 	}
 
