@@ -1175,3 +1175,304 @@ unittest  // refresh() sends client_secret in the POST body for client_secret_po
 			"refresh() must include client_secret in POST body for client_secret_post; got: "
 			~ capturedBody);
 }
+
+// ===========================================================================
+// Loopback-server tests for the HTTP-network discovery / registration / token /
+// probe / redirect paths. secureRequestHTTP permits a loopback (127.0.0.1) host
+// over plaintext http for local development, so a bound `listenHTTP` on
+// 127.0.0.1 exercises the real fetch/parse code that pure in-memory tests cannot.
+// ===========================================================================
+
+version (unittest)
+{
+	import vibe.http.server : HTTPListener, HTTPServerRequest,
+		HTTPServerResponse, HTTPServerSettings, listenHTTP;
+
+	// A loopback HTTP server bound to an ephemeral port, driving the supplied
+	// request handler. `stop()` releases the listener (call via scope(exit)).
+	private struct LoopbackServer
+	{
+		HTTPListener listener;
+		ushort port;
+		void stop() @safe
+		{
+			() @trusted { listener.stopListening(); }();
+		}
+		// The loopback base URL ("http://127.0.0.1:<port>").
+		string base() @safe const
+		{
+			import std.conv : to;
+
+			return "http://127.0.0.1:" ~ port.to!string;
+		}
+	}
+
+	private LoopbackServer startLoopback(void delegate(scope HTTPServerRequest,
+			scope HTTPServerResponse) @safe handler) @safe
+	{
+		auto settings = new HTTPServerSettings();
+		settings.bindAddresses = ["127.0.0.1"];
+		settings.port = 0;
+		auto l = () @trusted { return listenHTTP(settings, handler); }();
+		return LoopbackServer(l, l.bindAddresses[0].port);
+	}
+}
+
+unittest  // discovery: protected-resource (well-known + same-origin WWW-Authenticate) and AS metadata
+{
+	import std.algorithm : canFind;
+
+	// One router: RFC 9728 PRM for any protected-resource path (well-known or the
+	// challenge-named /custom-prm), and RFC 8414 AS metadata for authorization-server
+	// / openid paths. The AS document self-asserts the loopback issuer so the modern
+	// enforce-issuer-match path accepts it.
+	LoopbackServer srv;
+	srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		if (req.path.canFind("oauth-protected-resource") || req.path == "/custom-prm")
+		{
+			res.writeBody(
+				`{"resource":"` ~ srv.base ~ `/mcp",` ~ `"authorization_servers":["` ~ srv.base ~ `"]}`,
+				"application/json");
+		}
+		else if (req.path.canFind("authorization-server") || req.path.canFind("openid"))
+		{
+			res.writeBody(`{"issuer":"http://` ~ req.host ~ `",` ~ `"authorization_endpoint":"`
+				~ srv.base ~ `/authorize",` ~ `"token_endpoint":"` ~ srv.base ~ `/token",`
+				~ `"code_challenge_methods_supported":["S256"]}`, "application/json");
+		}
+		else
+		{
+			res.statusCode = 404;
+			res.writeBody("", "text/plain");
+		}
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	const endpoint = srv.base ~ "/mcp";
+
+	// Well-known RFC 9728 discovery (no WWW-Authenticate hint).
+	auto prm = c.discoverProtectedResource(endpoint);
+	assert(prm.authorizationServers == [srv.base]);
+
+	// A same-origin resource_metadata URL from the WWW-Authenticate challenge is
+	// fetched (RFC 9728 origin check passes for the loopback origin).
+	const www = `Bearer resource_metadata="` ~ srv.base ~ `/custom-prm"`;
+	auto prm2 = c.discoverProtectedResource(endpoint, www);
+	assert(prm2.resource == endpoint);
+
+	// RFC 8414 AS metadata discovery with the default enforce-issuer-match path.
+	auto as_ = c.discoverAuthServer(srv.base);
+	assert(as_.issuer == srv.base);
+	assert(as_.tokenEndpoint == srv.base ~ "/token");
+	assert(as_.metadataDocumentDiscovered);
+
+	// resolveIssuer: the modern path returns the PRM-advertised authorization server.
+	bool fromPrm;
+	const issuer = c.resolveIssuer(endpoint, fromPrm);
+	assert(fromPrm);
+	assert(issuer == srv.base);
+	// Convenience overload discards the discovery-source signal.
+	assert(c.resolveIssuer(endpoint) == srv.base);
+}
+
+unittest  // discoverAuthServer falls back to synthesized endpoints when no document exists
+{
+	// Every AS metadata candidate is reachable but reports no document (404), so
+	// discoverAuthServer takes the 2025-03-26 endpoint-fallback path and derives
+	// default endpoints from the (trailing-slash-stripped) issuer.
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 404;
+		res.writeBody("", "text/plain");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	auto as_ = c.discoverAuthServer(srv.base ~ "/");
+	assert(as_.issuer == srv.base ~ "/");
+	assert(as_.authorizationEndpoint == srv.base ~ "/authorize");
+	assert(as_.tokenEndpoint == srv.base ~ "/token");
+	assert(as_.registrationEndpoint == srv.base ~ "/register");
+	assert(!as_.metadataDocumentDiscovered);
+}
+
+unittest  // register() POSTs an RFC 7591 request and parses the returned credentials
+{
+	import std.algorithm : canFind;
+
+	string captured;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		captured = req.bodyReader.readAllUTF8();
+		res.writeBody(`{"client_id":"generated-id","client_secret":"generated-secret"}`,
+			"application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.redirectUri = "http://localhost:8765/callback";
+	AuthorizationServerMetadata as_;
+	as_.registrationEndpoint = srv.base ~ "/register";
+	auto rc = c.register(as_, "dlang-mcp", "mcp:read");
+	assert(rc.clientId == "generated-id");
+	assert(rc.clientSecret == "generated-secret");
+	// The request carried the configured redirect URI and client name.
+	assert(captured.canFind("dlang-mcp"));
+	assert(captured.canFind("http://localhost:8765/callback"));
+
+	// An AS without a registration endpoint refuses DCR before any request.
+	import std.exception : assertThrown;
+
+	AuthorizationServerMetadata none;
+	assertThrown(c.register(none, "x"));
+}
+
+unittest  // token grants POST their forms and parse the token response (loopback)
+{
+	import std.algorithm : canFind;
+
+	string lastForm;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		lastForm = req.bodyReader.readAllUTF8();
+		res.writeBody(`{"access_token":"at-123","token_type":"bearer","expires_in":3600,`
+			~ `"refresh_token":"rt-123","scope":"mcp:read"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.tokenEndpoint = srv.base ~ "/token";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto client = RegisteredClient("cid", "");
+
+	auto t1 = c.exchangeCode(as_, client, "the-code", "the-verifier");
+	assert(t1.accessToken == "at-123");
+	assert(t1.expiresIn == 3600);
+	assert(lastForm.canFind("grant_type=authorization_code"));
+	assert(lastForm.canFind("code=the-code"));
+
+	auto t2 = c.clientCredentials(as_, client, "mcp:read");
+	assert(t2.accessToken == "at-123");
+	assert(lastForm.canFind("grant_type=client_credentials"));
+
+	auto t3 = c.refresh(as_, client, "the-refresh");
+	assert(t3.refreshToken == "rt-123");
+	assert(lastForm.canFind("grant_type=refresh_token"));
+
+	auto t4 = c.jwtBearerGrant(as_, client, "the-assertion", "mcp:read");
+	assert(t4.accessToken == "at-123");
+	assert(lastForm.canFind("assertion=the-assertion"));
+
+	auto t5 = c.tokenExchange(srv.base ~ "/token", "subj", "urn:t:id_token",
+			"urn:t:access_token", "aud", "cid");
+	assert(t5.accessToken == "at-123");
+	assert(lastForm.canFind(
+			"grant_type=" ~ "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange"));
+
+	// client_secret_basic puts the credentials in the Authorization header rather
+	// than the form body, exercising the basic-auth branch of postForm/postParse.
+	c.authMethod = TokenEndpointAuthMethod.clientSecretBasic;
+	auto t6 = c.clientCredentials(as_, RegisteredClient("cid", "shh"), "mcp:read");
+	assert(t6.accessToken == "at-123");
+	assert(!lastForm.canFind("client_secret="));
+}
+
+unittest  // private_key_jwt: token requests carry a client_assertion (RFC 7523)
+{
+	import std.algorithm : canFind;
+
+	string lastForm;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		lastForm = req.bodyReader.readAllUTF8();
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	// A throwaway P-256 PKCS#8 key (shared with the jwt module's own test).
+	const pem = "-----BEGIN PRIVATE KEY-----\n"
+		~ "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7K6+stITLYsQjC9o\n"
+		~ "hyL925dgd6gNWRcGOl5RPvIpye+hRANCAATSBYPkHq12VDW5un1kub6zkBc4ieZ9\n"
+		~ "nurGMu+tLzJ6+6syOZsQCGlazcSOGsopLyl1QZMIFh9atUYaDfUjJxMq\n"
+		~ "-----END PRIVATE KEY-----\n";
+
+	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
+	c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	c.privateKeyPem = pem;
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.tokenEndpoint = srv.base ~ "/token";
+	as_.codeChallengeMethodsSupported = ["S256"];
+
+	c.exchangeCode(as_, RegisteredClient("cid", ""), "code", "verifier");
+	assert(lastForm.canFind("client_assertion_type="));
+	assert(lastForm.canFind("client_assertion="));
+}
+
+unittest  // probeUnauthorized / probeOperation return the WWW-Authenticate challenge on 401
+{
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 401;
+		res.headers["WWW-Authenticate"] = `Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"`;
+		res.writeBody("", "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	const endpoint = srv.base ~ "/mcp";
+	const w1 = c.probeUnauthorized(endpoint);
+	assert(w1
+			== `Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"`);
+	// The bearer-bearing probe sets an Authorization header on the request.
+	const w1b = c.probeUnauthorized(endpoint, "an-access-token");
+	assert(w1b == w1);
+	const w2 = c.probeOperation(endpoint, "some-bearer");
+	assert(w2 == w1);
+}
+
+unittest  // authorizeAndGetCode extracts the code from the redirect Location header
+{
+	// The server answers the authorization GET with a 302 whose Location carries
+	// the authorization code (plus state / RFC 9207 iss for the validating overload).
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 302;
+		res.headers["Location"]
+			= "http://localhost:8765/callback?code=auth-code-xyz&state=st-1&iss="
+			~ "https%3A%2F%2Fas.example.com";
+		res.writeBody("", "text/plain");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	const authzUrl = srv.base ~ "/authorize?client_id=cid";
+
+	// Overload 1: state is verified when expectedState is non-empty.
+	assert(c.authorizeAndGetCode(authzUrl, "st-1") == "auth-code-xyz");
+	// A mismatched expected state discards the code.
+	assert(c.authorizeAndGetCode(authzUrl, "wrong") == "");
+
+	// Overload 2: validates the RFC 9207 iss against the recorded issuer.
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.authorizationResponseIssParameterSupported = true;
+	assert(c.authorizeAndGetCode(as_, authzUrl, "st-1") == "auth-code-xyz");
+
+	import std.exception : assertThrown;
+
+	// A redirect whose iss does not match the recorded issuer is a possible mix-up
+	// attack and must be rejected (RFC 9207).
+	AuthorizationServerMetadata wrongIss;
+	wrongIss.issuer = "https://attacker.example.com";
+	wrongIss.authorizationResponseIssParameterSupported = true;
+	assertThrown(c.authorizeAndGetCode(wrongIss, authzUrl, "st-1"));
+	// A state mismatch on the validating overload is likewise rejected.
+	assertThrown(c.authorizeAndGetCode(as_, authzUrl, "wrong-state"));
+}
