@@ -69,7 +69,7 @@ private void registerEchoTool(McpServer server) @safe
 	Tool echo = {
 		name: "echo", description: nullable("Echo back the provided text"), inputSchema: schema
 	};
-	server.registerDynamicTool(echo, (Json args) @safe {
+	server.registerTool(echo, (Json args) @safe {
 		const text = ("text" in args) ? args["text"].get!string : "";
 		CallToolResult r;
 		r.content = [Content.makeText(text)];
@@ -91,7 +91,7 @@ private void registerAddTool(McpServer server) @safe
 	Tool add = {
 		name: "add", description: nullable("Add two integers"), inputSchema: schema
 	};
-	server.registerDynamicTool(add, (Json args) @safe {
+	server.registerTool(add, (Json args) @safe {
 		import std.conv : to;
 
 		const a = args["a"].get!int;
@@ -109,7 +109,7 @@ private void registerConformanceFixtures(McpServer server) @safe
 	Tool simpleText = {
 		name: "test_simple_text", description: nullable("Returns a simple text response")
 	};
-	server.registerDynamicTool(simpleText, (Json args) @safe {
+	server.registerTool(simpleText, (Json args) @safe {
 		CallToolResult r;
 		r.content = [
 			Content.makeText("This is a simple text response for testing.")
@@ -121,7 +121,7 @@ private void registerConformanceFixtures(McpServer server) @safe
 	Tool errorTool = {
 		name: "test_error_handling", description: nullable("Always returns a tool error")
 	};
-	server.registerDynamicTool(errorTool, (Json args) @safe {
+	server.registerTool(errorTool, (Json args) @safe {
 		CallToolResult r;
 		r.content = [
 			Content.makeText("This tool intentionally returns an error for testing")
@@ -134,7 +134,7 @@ private void registerConformanceFixtures(McpServer server) @safe
 	Tool imageTool = {
 		name: "test_image_content", description: nullable("Returns image content")
 	};
-	server.registerDynamicTool(imageTool, (Json args) @safe {
+	server.registerTool(imageTool, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeImage(onePixelPng, "image/png")];
 		return r;
@@ -144,7 +144,7 @@ private void registerConformanceFixtures(McpServer server) @safe
 	Tool audioTool = {
 		name: "test_audio_content", description: nullable("Returns audio content")
 	};
-	server.registerDynamicTool(audioTool, (Json args) @safe {
+	server.registerTool(audioTool, (Json args) @safe {
 		CallToolResult r;
 		r.content = [Content.makeAudio(minimalWav, "audio/wav")];
 		return r;
@@ -154,7 +154,7 @@ private void registerConformanceFixtures(McpServer server) @safe
 	Tool embeddedTool = {
 		name: "test_embedded_resource", description: nullable("Returns an embedded resource")
 	};
-	server.registerDynamicTool(embeddedTool, (Json args) @safe {
+	server.registerTool(embeddedTool, (Json args) @safe {
 		CallToolResult r;
 		r.content = [
 			Content.makeEmbeddedText("test://embedded-resource", "text/plain",
@@ -167,7 +167,7 @@ private void registerConformanceFixtures(McpServer server) @safe
 	Tool mixedTool = {
 		name: "test_multiple_content_types", description: nullable("Returns multiple content types")
 	};
-	server.registerDynamicTool(mixedTool, (Json args) @safe {
+	server.registerTool(mixedTool, (Json args) @safe {
 		CallToolResult r;
 		r.content = [
 			Content.makeText("Multiple content types test:"),
@@ -230,7 +230,7 @@ private void registerPromptFixtures(McpServer server) @safe
 	Prompt simple = {
 		name: "test_simple_prompt", description: nullable("A simple test prompt")
 	};
-	server.registerDynamicPrompt(simple, (Json args) @safe {
+	server.registerPrompt(simple, (Json args) @safe {
 		GetPromptResult r;
 		r.messages = [
 			PromptMessage("user", Content.makeText("This is a simple prompt for testing."))
@@ -245,7 +245,7 @@ private void registerPromptFixtures(McpServer server) @safe
 		PromptArgument("arg1", nullable("First test argument"), true),
 		PromptArgument("arg2", nullable("Second test argument"), true)
 	];
-	server.registerDynamicPrompt(withArgs, (Json args) @safe {
+	server.registerPrompt(withArgs, (Json args) @safe {
 		const a1 = ("arg1" in args) ? args["arg1"].get!string : "";
 		const a2 = ("arg2" in args) ? args["arg2"].get!string : "";
 		GetPromptResult r;
@@ -263,7 +263,7 @@ private void registerPromptFixtures(McpServer server) @safe
 	withEmbedded.arguments = [
 		PromptArgument("resourceUri", nullable("URI of the resource to embed"), true)
 	];
-	server.registerDynamicPrompt(withEmbedded, (Json args) @safe {
+	server.registerPrompt(withEmbedded, (Json args) @safe {
 		const uri = ("resourceUri" in args) ? args["resourceUri"].get!string : "";
 		GetPromptResult r;
 		r.messages = [
@@ -278,7 +278,7 @@ private void registerPromptFixtures(McpServer server) @safe
 	Prompt withImage = {
 		name: "test_prompt_with_image", description: nullable("A prompt that includes an image")
 	};
-	server.registerDynamicPrompt(withImage, (Json args) @safe {
+	server.registerPrompt(withImage, (Json args) @safe {
 		GetPromptResult r;
 		r.messages = [
 			PromptMessage("user", Content.makeImage(onePixelPng, "image/png")),
@@ -299,7 +299,7 @@ private void registerStreamingFixtures(McpServer server) @safe
 	Tool progressTool = {
 		name: "test_tool_with_progress", description: nullable("Reports progress")
 	};
-	server.registerDynamicTool(progressTool, (Json args, RequestContext ctx) @safe {
+	server.registerTool(progressTool, (Json args, RequestContext ctx) @safe {
 		ctx.reportProgress(0, nullable(100.0));
 		sleep(50.msecs);
 		ctx.reportProgress(50, nullable(100.0));
@@ -314,7 +314,7 @@ private void registerStreamingFixtures(McpServer server) @safe
 	Tool loggingTool = {
 		name: "test_tool_with_logging", description: nullable("Logs during execution")
 	};
-	server.registerDynamicTool(loggingTool, (Json args, RequestContext ctx) @safe {
+	server.registerTool(loggingTool, (Json args, RequestContext ctx) @safe {
 		ctx.log("info", Json("Tool execution started"));
 		sleep(50.msecs);
 		ctx.log("info", Json("Tool processing data"));
@@ -329,7 +329,7 @@ private void registerStreamingFixtures(McpServer server) @safe
 	Tool samplingTool = {
 		name: "test_sampling", description: nullable("Requests LLM sampling")
 	};
-	server.registerDynamicTool(samplingTool, (Json args, RequestContext ctx) @safe {
+	server.registerTool(samplingTool, (Json args, RequestContext ctx) @safe {
 		const prompt = ("prompt" in args) ? args["prompt"].get!string : "";
 		Json msg = Json.emptyObject;
 		msg["role"] = "user";
@@ -350,7 +350,7 @@ private void registerStreamingFixtures(McpServer server) @safe
 	Tool elicitTool = {
 		name: "test_elicitation", description: nullable("Requests user input")
 	};
-	server.registerDynamicTool(elicitTool, (Json args, RequestContext ctx) @safe {
+	server.registerTool(elicitTool, (Json args, RequestContext ctx) @safe {
 		const message = ("message" in args) ? args["message"].get!string : "";
 		Json schema = Json.emptyObject;
 		schema["type"] = "object";
@@ -386,7 +386,7 @@ private void registerElicitationSepFixtures(McpServer server) @safe
 		name: "test_elicitation_sep1034_defaults", description: nullable(
 				"Elicitation with default values for all primitive types")
 	};
-	server.registerDynamicTool(defaults, (Json args, RequestContext ctx) @safe {
+	server.registerTool(defaults, (Json args, RequestContext ctx) @safe {
 		Json props = Json.emptyObject;
 		props["name"] = Json([
 			"type": Json("string"),
@@ -418,7 +418,7 @@ private void registerElicitationSepFixtures(McpServer server) @safe
 		name: "test_elicitation_sep1330_enums", description: nullable(
 				"Elicitation with all enum schema variants")
 	};
-	server.registerDynamicTool(enums, (Json args, RequestContext ctx) @safe {
+	server.registerTool(enums, (Json args, RequestContext ctx) @safe {
 		Json props = Json.emptyObject;
 
 		// 1. Untitled single-select.

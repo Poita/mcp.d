@@ -331,7 +331,7 @@ private P marshalScalar(P)(Json v) @safe
 /// Deserialize a dynamic handler's raw wire `arguments` into a typed value `T`.
 ///
 /// The UDA-driven registration overloads marshal each argument from the method
-/// signature for you, but the dynamic `registerDynamicTool`/`registerDynamicPrompt`
+/// signature for you, but the dynamic `registerTool`/`registerPrompt`
 /// overloads hand the handler the raw `Json arguments`. This is the inbound
 /// counterpart of the client's `callTool!T`: it deserializes `arguments` through
 /// the same enum-by-name policy the UDA layer uses (so any `enum` leaf is read
@@ -555,7 +555,7 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 			setUiToolMeta(descriptor, UiToolMeta(a.resourceUri, a.visibility));
 	}
 
-	server.registerDynamicTool(descriptor, (Json args, RequestContext ctx) @safe {
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
 		import mcp.protocol.errors : McpException;
 
 		alias names = ParameterIdentifierTuple!overload;
@@ -772,7 +772,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 
 	applyIconsAndMeta!overload(descriptor);
 
-	server.registerDynamicPrompt(descriptor, (Json args, RequestContext ctx) @safe {
+	server.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
 		import mcp.protocol.errors : McpException, invalidParams;
 		import mcp.server.server : PromptResponse;
 
