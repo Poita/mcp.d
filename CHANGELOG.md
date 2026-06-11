@@ -20,3 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - The README's "Event-loop model" section is replaced by a fuller "Concurrency
   model" section; `examples_common.runClient` now delegates to `runWithEventLoop`.
+- README quickstart rewritten: the server snippet declares `module demo;` and uses
+  `registerModule!demo(server)` instead of the `__traits(parent, add)` incantation,
+  and the client snippet uses `runWithEventLoop` + `connect()` rather than
+  hand-rolled `runTask` / `runEventLoop` / `exitEventLoop` boilerplate. Both
+  snippets are verified by compilation against the SDK.

@@ -13,7 +13,8 @@ the D programming language — client and server, built on [vibe-d](https://vibe
 A server is a handful of annotated functions plus `runStdio`:
 
 ```d
-// server.d
+module demo;
+
 import mcp;
 import mcp.transport : runStdio;
 
@@ -23,37 +24,31 @@ long add(long a, long b) @safe { return a + b; }
 void main()
 {
     auto server = new McpServer("demo", "1.0.0");
-    registerModule!(__traits(parent, add))(server);
+    registerModule!demo(server);
     runStdio(server);
 }
 ```
 
 A client spawns that server over stdio, negotiates the protocol (any era — legacy
-or modern) with `connect()`, calls the tool, and checks the result:
+or modern) with `connect()`, calls the tool, and checks the result. Wrap the work
+in `runWithEventLoop` — it drives vibe's event loop for you and hands back the
+scenario's value (see [Concurrency model](#concurrency-model)):
 
 ```d
 // client.d — build server.d as ./demo-server first
 import mcp;
 import vibe.data.json : parseJsonString;
-import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 
 void main()
 {
-    // The client drives vibe's event loop.
-    runTask(() nothrow {
-        scope (exit) exitEventLoop();
-        try
-        {
-            auto client = McpClient.spawn(["./demo-server"]);
-            scope (exit) client.close();
-            client.connect();
+    auto result = runWithEventLoop(() @safe {
+        auto client = McpClient.spawn(["./demo-server"]);
+        scope (exit) client.close();
+        client.connect();
 
-            auto r = client.callTool("add", parseJsonString(`{"a": 2, "b": 3}`));
-            assert(r.structuredContent["result"].get!long == 5);
-        }
-        catch (Exception e) assert(false, e.msg);
+        return client.callTool("add", parseJsonString(`{"a": 2, "b": 3}`));
     });
-    runEventLoop();
+    assert(result.structuredContent["result"].get!long == 5);
 }
 ```
 
