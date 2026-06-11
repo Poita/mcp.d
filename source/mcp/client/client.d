@@ -931,17 +931,22 @@ final class McpClient : ClientProtocol
 		return Nullable!CacheEntry.init;
 	}
 
-	/// Resolve the still-fresh cache entry for `logical`, probing this client's
-	/// own partition first and then the shared/public one (only when partitioned,
-	/// since otherwise they coincide) — the same read order `cachedFetch` uses.
-	/// `hitKey` reports the physical key that hit so callers can memoize against
-	/// it. Null when nothing fresh is held.
-	private Nullable!CacheEntry cachedEntry(CacheKey logical, out CacheKey hitKey) @safe
+	/// Resolve the cache entry for `logical`, probing this client's own partition
+	/// first and then the shared/public one (only when partitioned, since
+	/// otherwise they coincide) — the same read order `cachedFetch` uses. `hitKey`
+	/// reports the physical key that hit so callers can memoize against it. With
+	/// `requireFresh` (the default, used for serving cached responses) an expired
+	/// entry counts as a miss; without it the entry is returned regardless of
+	/// `expiresAt` — schema lookups want the descriptor for as long as the entry
+	/// is held, with `*/list_changed` eviction (not the TTL clock) as the trigger
+	/// to stop. Null when nothing matching is held.
+	private Nullable!CacheEntry cachedEntry(CacheKey logical, out CacheKey hitKey,
+			bool requireFresh = true) @safe
 	{
 		if (cacheStore_ is null)
 			return Nullable!CacheEntry.init;
 		const ownKey = CacheKey(logical.method, logical.key, cachePartition_);
-		auto own = freshEntry(ownKey);
+		auto own = requireFresh ? freshEntry(ownKey) : cacheStore_.get(ownKey);
 		if (!own.isNull)
 		{
 			hitKey = ownKey;
@@ -950,7 +955,7 @@ final class McpClient : ClientProtocol
 		if (cachePartition_.length)
 		{
 			const sharedKey = scopedKey(logical, CacheScope.public_);
-			auto shared_ = freshEntry(sharedKey);
+			auto shared_ = requireFresh ? freshEntry(sharedKey) : cacheStore_.get(sharedKey);
 			if (!shared_.isNull)
 			{
 				hitKey = sharedKey;
@@ -960,17 +965,20 @@ final class McpClient : ClientProtocol
 		return Nullable!CacheEntry.init;
 	}
 
-	/// The descriptor for tool `name` taken from the currently-cached `tools/list`
-	/// response — the single source for both `x-mcp-header` mirroring and
-	/// output-schema validation. Returns a null `Nullable` when no fresh
-	/// `tools/list` response is cached (locally OR in a shared/pre-seeded store),
-	/// so a caller that never ran `listTools` still gets schemas from a populated
-	/// cache. The parsed `name -> Tool` index is memoized and re-derived only when
-	/// the backing cache entry changes.
+	/// The descriptor for tool `name` taken from the cached `tools/list` response
+	/// — the single source for both `x-mcp-header` mirroring and output-schema
+	/// validation. Returns a null `Nullable` only when no `tools/list` response is
+	/// held at all (locally OR in a shared/pre-seeded store), so a caller that
+	/// never ran `listTools` still gets schemas from a populated cache. The read
+	/// ignores serving-freshness (`requireFresh: false`): a tool's schema stays
+	/// valid for as long as the entry is held, and `notifications/*/list_changed`
+	/// eviction — not the TTL clock — is what stops mirroring/validation. The
+	/// parsed `name -> Tool` index is memoized and re-derived only when the backing
+	/// cache entry changes (a different physical key or expiry stamp).
 	private Nullable!Tool cachedTool(string name) @safe
 	{
 		CacheKey hitKey;
-		auto entry = cachedEntry(CacheKey("tools/list", ""), hitKey);
+		auto entry = cachedEntry(CacheKey("tools/list", ""), hitKey, false);
 		if (entry.isNull)
 		{
 			toolIndexValid_ = false;
@@ -3086,7 +3094,7 @@ unittest  // a pre-seeded tools/list cache drives x-mcp-header mirroring with no
 	assert(headers["Mcp-Param-Region"] == "us-west1");
 }
 
-unittest  // an expired tools/list cache entry yields no header mirroring (freshness honored)
+unittest  // a stale-but-present tools/list entry still drives mirroring (schema reads ignore serving-freshness)
 {
 	import std.datetime : SysTime, DateTime;
 
@@ -3098,7 +3106,9 @@ unittest  // an expired tools/list cache entry yields no header mirroring (fresh
 	ListToolsResult lr;
 	lr.tools = [t];
 	auto store = new InMemoryCacheStore();
-	// expiresAt in the past -> freshEntry treats it as a miss.
+	// expiresAt in the past: stale for *serving* a cached listTools, but schema
+	// lookups deliberately ignore serving-freshness — the schema is still valid
+	// until tools/list_changed evicts the entry.
 	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2000, 1, 1))));
 	c.setCache(store);
 
@@ -3109,8 +3119,37 @@ unittest  // an expired tools/list cache entry yields no header mirroring (fresh
 	params["arguments"] = Json(["region": Json("us-west1")]);
 	msg["params"] = params;
 
+	assert("Mcp-Param-Region" in c.headersFor(msg),
+			"a stale-but-present tools/list entry must still drive header mirroring");
+}
+
+unittest  // evicting the tools/list entry (e.g. tools/list_changed) stops header mirroring
+{
+	import std.datetime : SysTime, DateTime;
+
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	Tool t = headerTool("locate", [
+		"region": Json(["type": Json("string"), "x-mcp-header": Json("Region")])
+	]);
+	ListToolsResult lr;
+	lr.tools = [t];
+	auto store = new InMemoryCacheStore();
+	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	c.setCache(store);
+
+	Json msg = Json.emptyObject;
+	msg["method"] = "tools/call";
+	Json params = Json.emptyObject;
+	params["name"] = "locate";
+	params["arguments"] = Json(["region": Json("us-west1")]);
+	msg["params"] = params;
+
+	assert("Mcp-Param-Region" in c.headersFor(msg)); // present while the entry exists
+	// notifications/tools/list_changed evicts the entry via invalidateLogical.
+	c.dispatchNotification("notifications/tools/list_changed", Json.emptyObject);
 	assert("Mcp-Param-Region" !in c.headersFor(msg),
-			"a stale tools/list entry must not drive header mirroring");
+			"once the tools/list entry is evicted, mirroring must stop until a refresh");
 }
 
 unittest  // the tool index re-derives when the underlying cache entry changes
