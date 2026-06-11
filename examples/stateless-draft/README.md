@@ -22,6 +22,11 @@ The draft redesign drops the stateful `initialize` handshake in favor of a
 - **`enableModern()` / `connect()`** — `enableModern()` switches the client into
   stateless draft mode; `connect()` runs `server/discover` and selects the
   newest mutually-supported version (the draft here).
+- **zero-RTT reconnect — `connect(discoverResult())`** — the first client's
+  `server/discover` result is persisted (it round-trips through
+  `DiscoverResult.toJson`/`fromJson`), and a second client reconnects from it
+  alone with **no** `server/discover` round-trip, adopting the draft session and
+  the server identity directly before serving a `tools/call`.
 - **`CacheableResult` freshness hints** — draft results may carry `ttlMs` /
   `cacheScope`. The server attaches a per-list hint to `tools/list` and a
   per-resource hint to `resources/read`; the client reads them back off
@@ -113,7 +118,7 @@ echo "exit code: $?"    # 0 = all assertions passed
 Either way the client prints a line like:
 
 ```
-OK: stateless-draft e2e passed over <transport> — discover(2026-07-28), connect()=draft, listTools[add] cache(5000/public), add->{"sum":42} (+structuredContent), greeting resource cache(9000/private), unknown-tool=-32602.
+OK: stateless-draft e2e passed over <transport> — discover(2026-07-28), connect()=draft, listTools[add] cache(5000/public), add->{"sum":42} (+structuredContent), greeting resource cache(9000/private), unknown-tool=-32602, zero-RTT reconnect via connect(discoverResult).
 ```
 
 CI runs both: the stdio path (run the client, which spawns the server) and the

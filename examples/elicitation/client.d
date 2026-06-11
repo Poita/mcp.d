@@ -131,8 +131,8 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		auto client = makeClient();
 		scope (exit)
 			client.close();
-		auto init = client.initialize();
-		checkEq(init.serverInfo.name, "elicitation-example", "server name");
+		client.connect();
+		checkEq(client.serverInfo().name, "elicitation-example", "server name");
 
 		auto tools = client.listTools().tools;
 		auto names = tools.map!(t => t.name).array;
@@ -167,7 +167,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 			// false).
 			return ElicitResult.accept(AcceptForm(3));
 		};
-		client.initialize();
+		client.connect();
 
 		auto r = client.callTool("plan_trip", planArgs("Kyoto"));
 
@@ -212,7 +212,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		client.onElicitation = (ElicitParams p) @safe {
 			return ElicitResult.decline();
 		};
-		client.initialize();
+		client.connect();
 
 		auto r = client.callTool("plan_trip", planArgs("Oslo"));
 		check(!r.isError, "plan_trip (decline) should not be a tool error");
@@ -228,7 +228,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		client.onElicitation = (ElicitParams p) @safe {
 			return ElicitResult.cancel();
 		};
-		client.initialize();
+		client.connect();
 
 		auto r = client.callTool("plan_trip", planArgs("Lima"));
 		check(!r.isError, "plan_trip (cancel) should not be a tool error");
@@ -244,7 +244,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		// Deliberately install NO onElicitation handler, so this client does not
 		// advertise the elicitation capability. The server's ctx.elicit then
 		// refuses to send to a non-elicitation client, and the tool fails.
-		client.initialize();
+		client.connect();
 
 		bool failed;
 		try

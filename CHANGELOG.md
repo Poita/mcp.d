@@ -13,6 +13,15 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- **`McpClient.connect(DiscoverResult prior)`** — a zero-round-trip reconnect that
+  runs the same version selection as `connect()` over a previously obtained
+  `server/discover` result, without any network probe. On a modern (draft) version
+  it adopts the prior capabilities/serverInfo/instructions directly; on a stable
+  version it runs a single `initialize` handshake.
+- **`McpClient.discoverResult()`** — the most recent `DiscoverResult` the client
+  obtained or adopted (`discover()`, `connect()`'s probe, or
+  `connect(DiscoverResult)`), so callers can persist it (it round-trips via
+  `toJson`/`fromJson`) and feed it back for the zero-RTT reconnect.
 - **Test coverage for the typed list-change observers** (`onToolsListChanged`,
   `onPromptsListChanged`, `onResourcesListChanged`, `onResourceUpdated`):
   exercises the `prompts/list_changed` callback, confirms each typed observer

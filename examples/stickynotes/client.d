@@ -122,14 +122,15 @@ private int run(McpClient delegate() @safe makeClient) @safe
 	auto client = makeClient();
 	scope (exit)
 		client.close();
-	// Install an elicitation handler BEFORE initialize so the client advertises
+	// Install an elicitation handler BEFORE connecting so the client advertises
 	// the elicitation capability at negotiation time; the per-scenario handlers
-	// below reassign this delegate. Without a handler at init the server would
+	// below reassign this delegate. Without a handler at connect the server would
 	// (correctly) refuse to elicit later.
 	client.onElicitation = (ElicitParams p) @safe { return ElicitResult.cancel(); };
-	auto init = client.initialize();
-	checkEq(init.serverInfo.name, "stickynotes-example", "server name");
-	check(!init.capabilities.resources.isNull && init.capabilities.resources.get.listChanged,
+	client.connect();
+	checkEq(client.serverInfo().name, "stickynotes-example", "server name");
+	auto serverCaps = client.serverCapabilities();
+	check(!serverCaps.resources.isNull && serverCaps.resources.get.listChanged,
 			"server should advertise resources.listChanged");
 
 	auto names = client.listTools().tools.map!(t => t.name).array;
@@ -214,7 +215,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		auto plain = makeClient();
 		scope (exit)
 			plain.close();
-		plain.initialize();
+		plain.connect();
 		// Add a note so remove_all actually tries to elicit (an empty board would
 		// short-circuit to "empty" before any elicitation).
 		plain.callTool("add_note", addArgs("To be confirmed"));

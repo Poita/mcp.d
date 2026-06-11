@@ -46,8 +46,8 @@ int main(string[] args) @safe
 		scope (exit)
 			client.close();
 
-		auto init = client.initialize();
-		checkEq(init.serverInfo.name, "apps-example", "serverInfo.name");
+		client.connect();
+		checkEq(client.serverInfo().name, "apps-example", "serverInfo.name");
 
 		// --- tools/list: the tool carries the MCP Apps _meta.ui link ---------
 		auto tools = client.listTools().tools;
