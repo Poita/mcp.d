@@ -10,9 +10,16 @@ All notable changes to this project are documented here.
   `structuredContent`** (`McpException(invalidParams)`) instead of returning
   `T.init`. Asking for a typed structured result asserts the tool produces one, so
   an absent payload is a contract violation rather than a silently-empty struct.
+- **Client cleanups.** The default client identity has a single source of truth
+  (`ClientSettings.init.clientInfo`, no longer duplicated in the `McpClient`
+  constructor default), and `RequestOptions` now documents exactly which verbs
+  accept it.
 
 ### Added
 
+- **`McpClient.maxListPages` property** — getter/setter for the auto-pagination
+  page cap (the backing field is now `private`; `0` uncaps it), documented as the
+  cap the auto-paginating list verbs honor.
 - **`McpClient.connect(DiscoverResult prior)`** — a zero-round-trip reconnect that
   runs the same version selection as `connect()` over a previously obtained
   `server/discover` result, without any network probe. On a modern (draft) version

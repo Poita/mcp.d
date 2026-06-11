@@ -72,9 +72,14 @@ enum CacheMode
 	refresh,
 }
 
-/// Per-request options shared by every `McpClient` request verb (`callTool`,
-/// `readResource`, `getPrompt`, `complete`, and the cacheable list/discover
-/// verbs). All fields are independently combinable and default to "unset":
+/// Per-request options shared by the `McpClient` request verbs. All fields are
+/// independently combinable and default to "unset".
+///
+/// Exactly these verbs accept a trailing `RequestOptions`: `callTool`,
+/// `getPrompt`, `complete`, `readResource`, `listTools`, `listResources`,
+/// `listResourceTemplates`, `listPrompts`, and `discover`. (`cacheMode` is only
+/// meaningful on the cacheable reads — the four `*/list` verbs, `readResource`,
+/// and `discover` — and is ignored on the others.)
 ///
 /// - `progressToken`: attached as `params._meta.progressToken` so the server may
 ///   emit `notifications/progress` for the request (basic/utilities/progress).
@@ -309,8 +314,9 @@ final class McpClient : ClientProtocol
 	// non-progressing or cycling `nextCursor` (which would otherwise loop and
 	// accumulate items without bound). Mirrors the bounded-iteration style used
 	// elsewhere (e.g. `maxActive`, `idleTtl`). Set to 0 to disable the cap (the
-	// non-progress/cycle checks still apply).
-	size_t maxListPages_ = 1000;
+	// non-progress/cycle checks still apply). Read/written via the `maxListPages`
+	// property.
+	private size_t maxListPages_ = 1000;
 	// Response cache for the six cacheable reads. Never null after construction:
 	// the constructor installs an `InMemoryCacheStore` (caching on by default),
 	// and `setCache(null)` restores that default while `noCache` disables it. A
@@ -417,8 +423,7 @@ final class McpClient : ClientProtocol
 	/// Construct over an explicit `ClientTransport`. The client installs its
 	/// inbound dispatcher (and, for the HTTP transport, the per-message header /
 	/// cancelled-response callbacks) on the transport.
-	this(ClientTransport transport,
-			Implementation clientInfo = Implementation("dlang-mcp-client", "0.1.0")) @safe
+	this(ClientTransport transport, Implementation clientInfo = ClientSettings.init.clientInfo) @safe
 	{
 		this.transport = transport;
 		this.clientInfo = clientInfo;
@@ -529,6 +534,22 @@ final class McpClient : ClientProtocol
 	ProtocolVersion protocolVersion() const @safe
 	{
 		return negotiated;
+	}
+
+	/// The auto-pagination page cap: the maximum number of pages any
+	/// auto-paginating list verb (`listTools`/`listResources`/`listPrompts`/
+	/// `listResourceTemplates`) follows before giving up, guarding against a peer
+	/// whose `nextCursor` never converges. `0` disables the cap (the
+	/// non-progress/cycle checks still apply); the default is 1000.
+	size_t maxListPages() const @safe nothrow
+	{
+		return maxListPages_;
+	}
+
+	/// Set the auto-pagination page cap (see `maxListPages`). `0` uncaps it.
+	void maxListPages(size_t pages) @safe nothrow
+	{
+		maxListPages_ = pages;
 	}
 
 	/// Switch to the stateless modern (>= 2026-07-28) protocol: no `initialize`
@@ -6026,10 +6047,42 @@ unittest  // connect(DiscoverResult) throws when no version is mutually supporte
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
 	auto e = collectException!McpException(c.connect(fixtureDiscover([
-				"1999-01-01"
+		"1999-01-01"
 	])));
 	assert(e !is null);
 	assert(e.code == ErrorCode.unsupportedProtocolVersion);
+}
+
+unittest  // maxListPages property round-trips its value (default 1000)
+{
+	auto c = McpClient.http("http://localhost");
+	assert(c.maxListPages == 1000, "default page cap");
+	c.maxListPages = 7;
+	assert(c.maxListPages == 7);
+	c.maxListPages = 0; // uncapped
+	assert(c.maxListPages == 0);
+}
+
+unittest  // the maxListPages cap aborts a non-converging paginated list
+{
+	import std.exception : collectException;
+	import std.conv : to;
+
+	auto c = McpClient.http("http://localhost");
+	c.maxListPages = 3;
+	// A server that always advances to a fresh cursor never converges; the cap
+	// must abort it with internalError rather than looping forever.
+	long page;
+	c.onRpcForTest = (string m, Json p) @safe {
+		Json r = Json.emptyObject;
+		r["tools"] = Json.emptyArray;
+		r["nextCursor"] = "cursor-" ~ (++page).to!string;
+		return r;
+	};
+
+	auto e = collectException!McpException(c.listTools());
+	assert(e !is null);
+	assert(e.code == ErrorCode.internalError);
 }
 
 unittest  // MRTR: getPrompt drives a retry loop when the server returns inputRequired
