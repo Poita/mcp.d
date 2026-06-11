@@ -1415,51 +1415,75 @@ final class HttpClientTransport : ClientTransport
 						notifyLegacy(); // wake `startLegacyFallback`
 						return;
 					}
-					// `message` event (or untyped): a JSON-RPC message. A response
-					// resolves the waiter registered under its id; anything with no
-					// matching waiter (notification, server->client request, or a
-					// response for an id we are not awaiting) falls through to the
-					// inbound dispatcher.
-					try
-					{
-						auto m = Message(parseJsonString(data));
-						LegacyWaiter** w;
-						if ((m.kind == MessageKind.response
-							|| m.kind == MessageKind.errorResponse) && m.id.type == Json.Type.int_
-							&& (w = (m.id.get!long  in legacyWaiters)) !is null)
-						{
-							// A response for a request we have cancelled is dropped
-							// per spec, even when a waiter is still registered for its
-							// id (mirrors the guard `dispatchSse` applies).
-							if (protocol !is null && protocol.isCancelled(m.id.get!long))
-								return;
-							if (m.kind == MessageKind.errorResponse)
-								(*w).err = errorFrom(m.error);
-							else
-							{
-								(*w).result = m.result;
-								(*w).got = true;
-							}
-							notifyLegacy(); // wake the matching `legacyRpc`
-						}
-						else
-							dispatch(m);
-					}
-					catch (Exception)
-					{
-					}
+					// `message` event (or untyped): a JSON-RPC message. Resolution and
+					// inbound dispatch run OUTSIDE any catch here, so a failure during
+					// dispatch propagates to the outer catch and tears the stream down
+					// (fast-failing every waiter) rather than being swallowed.
+					resolveLegacyMessage(data);
 				});
 			}
-			catch (Exception)
+			catch (Exception e)
 			{
+				failOutstandingLegacyWaiters("legacy HTTP+SSE stream failed: " ~ e.msg);
 			}
 		}();
 
 		// The stream closed: fail every still-outstanding waiter so its `legacyRpc`
 		// wait returns promptly with a clear error instead of waiting out the timeout.
+		failOutstandingLegacyWaiters("legacy HTTP+SSE stream closed before response");
+	}
+
+	/// Resolve one `message`-event frame from the legacy HTTP+SSE stream. A response
+	/// or error addressed to a registered waiter id resolves that waiter; any other
+	/// message falls through to the inbound dispatcher. Only the `parseJsonString`
+	/// step tolerates failure (non-JSON keep-alive frames), logged for visibility;
+	/// a failure anywhere else propagates so the caller can tear the stream down.
+	private void resolveLegacyMessage(string data) @safe
+	{
+		Message m;
+		try
+			m = Message(parseJsonString(data));
+		catch (Exception e)
+		{
+			import vibe.core.log : logDiagnostic;
+
+			// Tolerate non-JSON keep-alive frames (mirrors dispatchSse), but make a
+			// malformed legacy frame visible rather than an invisible swallow that
+			// strands a waiter until its deadline.
+			logDiagnostic("legacy HTTP+SSE: ignoring unparseable event data: %s", e.msg);
+			return;
+		}
+
+		LegacyWaiter** w;
+		if ((m.kind == MessageKind.response
+				|| m.kind == MessageKind.errorResponse) && m.id.type == Json.Type.int_
+				&& (w = (m.id.get!long  in legacyWaiters)) !is null)
+		{
+			// A response for a request we have cancelled is dropped per spec, even
+			// when a waiter is still registered for its id (mirrors `dispatchSse`).
+			if (protocol !is null && protocol.isCancelled(m.id.get!long))
+				return;
+			if (m.kind == MessageKind.errorResponse)
+				(*w).err = errorFrom(m.error);
+			else
+			{
+				(*w).result = m.result;
+				(*w).got = true;
+			}
+			notifyLegacy(); // wake the matching `legacyRpc`
+		}
+		else
+			dispatch(m);
+	}
+
+	/// Fail every still-outstanding legacy waiter with a typed error so each blocked
+	/// `legacyRpc` returns promptly with the real cause instead of waiting out the
+	/// timeout. Already-resolved waiters are left untouched.
+	private void failOutstandingLegacyWaiters(string msg) @safe
+	{
 		foreach (id, w; legacyWaiters)
 			if (!w.got && w.err is null)
-				w.err = internalError("legacy HTTP+SSE stream closed before response");
+				w.err = internalError(msg);
 		notifyLegacy();
 	}
 
@@ -2599,4 +2623,46 @@ unittest  // a non-JSON keep-alive frame on the resume path neither fails nor st
 	t.dispatchSse(": keep-alive", 9, result, got, err);
 	assert(!got && err is null);
 	assert(!HttpClientTransport.awaitSatisfied(got, err));
+}
+
+unittest  // resolveLegacyMessage resolves the matching waiter from a well-formed response
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto w = new LegacyWaiter;
+	t.legacyWaiters[5] = w;
+	t.resolveLegacyMessage(`{"jsonrpc":"2.0","id":5,"result":{"ok":true}}`);
+	assert(w.got);
+	assert(w.result["ok"].get!bool);
+}
+
+unittest  // resolveLegacyMessage routes a JSON-RPC error response to the waiter's err
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto w = new LegacyWaiter;
+	t.legacyWaiters[5] = w;
+	t.resolveLegacyMessage(`{"jsonrpc":"2.0","id":5,"error":{"code":-32601,"message":"nope"}}`);
+	assert(!w.got);
+	assert(w.err !is null && w.err.code == -32601);
+}
+
+unittest  // resolveLegacyMessage tolerates a non-JSON keep-alive frame without resolving a waiter
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto w = new LegacyWaiter;
+	t.legacyWaiters[5] = w;
+	t.resolveLegacyMessage(": keep-alive");
+	assert(!w.got && w.err is null);
+}
+
+unittest  // failOutstandingLegacyWaiters fails every still-pending waiter with a typed error
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto pending = new LegacyWaiter;
+	auto done = new LegacyWaiter;
+	done.got = true;
+	t.legacyWaiters[1] = pending;
+	t.legacyWaiters[2] = done;
+	t.failOutstandingLegacyWaiters("stream failed");
+	assert(pending.err !is null && pending.err.msg == "stream failed");
+	assert(done.err is null); // an already-resolved waiter is left untouched
 }
