@@ -113,6 +113,17 @@ Json invalidRequestJson(string description) @safe
 	return j;
 }
 
+/// Build the RFC 7591 §3.2.2 `invalid_client_metadata` error document returned
+/// (with HTTP 400) when a `POST /register` body is malformed or omits the
+/// `redirect_uris` this PKCE proxy requires.
+Json invalidClientMetadataJson(string description) @safe
+{
+	Json j = Json.emptyObject;
+	j["error"] = "invalid_client_metadata";
+	j["error_description"] = description;
+	return j;
+}
+
 /// Extract the `redirect_uris` array from a parsed RFC 7591 DCR request body,
 /// returning an empty array when the field is absent or malformed. The number of
 /// URIs collected is capped at `maxRedirectUrisPerRegistration` so an
@@ -311,8 +322,21 @@ void mountOAuthRegister(URLRouter router, OAuthProxy proxy) @safe
 {
 	const registerPath = pathOf(proxy.config().registrationEndpoint());
 	router.post(registerPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
-		auto body_ = readJsonBody(req);
+		Json body_;
+		if (!tryReadJsonBody(req, body_))
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(invalidClientMetadataJson("request body is not valid JSON"));
+			return;
+		}
 		const uris = redirectUrisFrom(body_);
+		if (uris.length == 0)
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(invalidClientMetadataJson(
+				"redirect_uris is required and must contain at least one usable URI"));
+			return;
+		}
 		res.statusCode = HTTPStatus.created;
 		res.writeJsonBody(proxy.register(uris));
 	});
@@ -698,17 +722,33 @@ private string pathOf(string url) @safe
 	return slash >= 0 ? rest[slash .. $] : "/";
 }
 
-private Json readJsonBody(scope HTTPServerRequest req) @safe
+/// Read the request body as JSON, distinguishing a malformed body (returns
+/// false, so the caller can reply 400) from an absent body (permitted; yields an
+/// empty object). A malformed body is logged rather than silently treated as
+/// empty, which would let an unparseable `/register` request succeed with no
+/// redirect URIs.
+private bool tryReadJsonBody(scope HTTPServerRequest req, out Json body_) @safe
 {
 	import vibe.stream.operations : readAllUTF8;
 
 	const payload = req.bodyReader.readAllUTF8();
 	if (payload.length == 0)
-		return Json.emptyObject;
+	{
+		body_ = Json.emptyObject;
+		return true;
+	}
 	try
-		return parseJsonString(payload);
-	catch (Exception)
-		return Json.emptyObject;
+	{
+		body_ = parseJsonString(payload);
+		return true;
+	}
+	catch (Exception e)
+	{
+		import vibe.core.log : logWarn;
+
+		logWarn("/register: rejecting malformed JSON body: %s", e.msg);
+		return false;
+	}
 }
 
 private string readFormString(scope HTTPServerRequest req) @safe
@@ -1776,6 +1816,56 @@ unittest  // COMPOSE: the per-route helpers reproduce the /register leg
 
 	assert(res.statusCode == 201);
 	assert(body_.canFind("Iv1.upstream"));
+}
+
+unittest  // /register rejects a malformed JSON body with 400 invalid_client_metadata
+{
+	import std.algorithm : canFind;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthRegister(router, proxy);
+
+	auto formBody = () @trusted { return cast(ubyte[]) `{ not valid json`.dup; }();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
+			HTTPMethod.POST, createMemoryStream(formBody, false));
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	assert(res.statusCode == 400);
+	assert(body_.canFind("invalid_client_metadata"));
+}
+
+unittest  // /register rejects a body with no usable redirect_uris with 400
+{
+	import std.algorithm : canFind;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthRegister(router, proxy);
+
+	auto formBody = () @trusted { return cast(ubyte[]) `{"client_name":"x"}`.dup; }();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
+			HTTPMethod.POST, createMemoryStream(formBody, false));
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	assert(res.statusCode == 400);
+	assert(body_.canFind("invalid_client_metadata"));
 }
 
 unittest  // COMPOSE: the authorize/consent/callback legs share a state store and round-trip end to end
