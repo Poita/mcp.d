@@ -746,40 +746,41 @@ void requireSecureUrl(string url) @safe
 		host = u.host;
 	}
 	catch (Exception)
-	{
-	}
+		throw invalidRequest("Refusing to fetch URL with no parseable host: " ~ url);
 
-	bool secure = host.length > 0;
-	if (secure)
-	{
-		// Lexical only (no DNS): a registered name is treated as public here; the
-		// resolve-and-pin connector enforces the resolved-address policy at fetch.
-		const cls = classifyHostLexical(host);
+	// A URL that parsed but carries no host is just as unfetchable; report it as
+	// such rather than letting it fall through to the misleading "insecure" branch.
+	if (host.length == 0)
+		throw invalidRequest("Refusing to fetch URL with no parseable host: " ~ url);
 
-		bool eqScheme(string sc) @safe nothrow @nogc
+	// Lexical only (no DNS): a registered name is treated as public here; the
+	// resolve-and-pin connector enforces the resolved-address policy at fetch.
+	const cls = classifyHostLexical(host);
+
+	bool eqScheme(string sc) @safe nothrow @nogc
+	{
+		if (scheme.length != sc.length)
+			return false;
+		foreach (k, ch; scheme)
 		{
-			if (scheme.length != sc.length)
+			char c = ch;
+			if (c >= 'A' && c <= 'Z')
+				c = cast(char)(c + 32);
+			if (c != sc[k])
 				return false;
-			foreach (k, ch; scheme)
-			{
-				char c = ch;
-				if (c >= 'A' && c <= 'Z')
-					c = cast(char)(c + 32);
-				if (c != sc[k])
-					return false;
-			}
-			return true;
 		}
-
-		if (cls == AddressClass.privateOrLinkLocal)
-			secure = false;
-		else if (eqScheme("https"))
-			secure = true;
-		else if (eqScheme("http") && cls == AddressClass.loopback)
-			secure = true;
-		else
-			secure = false;
+		return true;
 	}
+
+	bool secure;
+	if (cls == AddressClass.privateOrLinkLocal)
+		secure = false;
+	else if (eqScheme("https"))
+		secure = true;
+	else if (eqScheme("http") && cls == AddressClass.loopback)
+		secure = true;
+	else
+		secure = false;
 
 	if (!secure)
 		throw invalidRequest(
@@ -874,6 +875,23 @@ unittest  // requireSecureUrl rejects the '?@' / '#@' authority differential (SS
 
 	assertThrown(requireSecureUrl("https://public?@169.254.169.254/jwks"));
 	assertThrown(requireSecureUrl("https://public#@10.0.0.5/jwks"));
+}
+
+unittest  // requireSecureUrl reports an unparseable URL accurately, not as merely "insecure"
+{
+	import std.algorithm.searching : canFind;
+
+	bool threw;
+	string msg;
+	try
+		requireSecureUrl("http://");
+	catch (Exception e)
+	{
+		threw = true;
+		msg = e.msg;
+	}
+	assert(threw);
+	assert(msg.canFind("no parseable host"), "expected a parse-failure message, got: " ~ msg);
 }
 
 unittest  // isSecureFetchUrl accepts https and rejects plaintext http to a remote host
