@@ -60,13 +60,15 @@ private void printLine(string s) @trusted nothrow
 	}
 }
 
-/// Typed arguments for the `add` tool. Passing this struct to the typed
-/// `callTool` overload lets the SDK marshal the JSON-RPC `arguments` object from
-/// the struct shape — no hand-built `Json` for a statically-known call.
-struct AddArgs
+/// Build the `add` tool's JSON-RPC `arguments` object (`{ "a": a, "b": b }`).
+/// The client request surface is untyped — callers hand it the JSON a host
+/// would receive from a model (see DESIGN.md).
+private Json addArgs(long a, long b) @safe
 {
-	long a;
-	long b;
+	Json j = Json.emptyObject;
+	j["a"] = a;
+	j["b"] = b;
+	return j;
 }
 
 /// Typed view of the `add` tool's `structuredContent`, mirroring the server's
@@ -117,9 +119,9 @@ private int runE2E(McpClient client, bool overHttp) @safe
 	checkEq(tools.cache.get.ttl, 5.seconds, "tools/list cache.ttl");
 	checkEq(tools.cache.get.cacheScope, CacheScope.public_, "tools/list cache.cacheScope");
 
-	// --- 4. tools/call: typed-struct-derived structuredContent + text mirror --
-	// Pass typed args (the SDK marshals the `arguments` object from the struct).
-	auto res = client.callTool("add", AddArgs(2, 40));
+	// --- 4. tools/call: structuredContent + text mirror -----------------------
+	// Pass the arguments as a JSON object (the untyped client request surface).
+	auto res = client.callTool("add", addArgs(2, 40));
 	check(!res.isError, "add tool call should not be an error result");
 	// The @tool returns a SumResult struct; the SDK mirrors it into a single
 	// JSON text content block and into structuredContent.

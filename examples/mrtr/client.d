@@ -24,7 +24,8 @@
  *
  * Typed/ergonomic SDK APIs used here (args, handlers, and result decode are all
  * typed; no hand-built Json on those paths):
- *   - typed `callTool(name, BookMeetingArgs)` serializes the arguments;
+ *   - the call `arguments` are built as a JSON object (`bookMeetingArgs(topic)`,
+ *     the untyped client request surface);
  *   - the inbound `InputRequest`s are read with the typed readers
  *     `req.elicitationMessage()` / `req.requestedSchema()` / `req.asSampling()`;
  *   - `ElicitResult.accept!MeetingDate` and `CreateMessageResult.text` build the
@@ -52,11 +53,13 @@ import mcp;
 
 import examples_common : check, runClient, connectFromArgs;
 
-/// Typed view of the `book_meeting` arguments. The typed `callTool(name, T)`
-/// overload serializes this into the wire `{topic}` object.
-struct BookMeetingArgs
+/// `book_meeting` arguments as a JSON object (`{ "topic": topic }`). The client
+/// request surface is untyped — see the repo-root `DESIGN.md`.
+private Json bookMeetingArgs(string topic) @safe
 {
-	string topic;
+	Json j = Json.emptyObject;
+	j["topic"] = topic;
+	return j;
 }
 
 /// Typed view of the elicitation answer. `ElicitResult.accept!MeetingDate(...)`
@@ -121,8 +124,8 @@ private int runE2E(McpClient client) @safe
 			found = true;
 	check(found, "listTools did not contain 'book_meeting'");
 
-	// Typed arguments: pass a struct rather than hand-building a Json object.
-	auto topicArg = BookMeetingArgs("Q3 roadmap");
+	// Build the arguments as a JSON object (the untyped client request surface).
+	auto topicArg = bookMeetingArgs("Q3 roadmap");
 
 	// ---- First round-trip view: no handlers -> the server's InputRequiredResult
 	// is surfaced so we can assert the raw MRTR shape. ----

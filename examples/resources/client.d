@@ -29,7 +29,7 @@
  *      notifications/resources/updated for the subscribed URI AND a
  *      notifications/resources/list_changed for the newly-created note resource;
  *      the new note then reads back its pushed body. The tool is invoked with a
- *      typed args struct and its typed `structuredContent` is decoded with
+ *      JSON arguments object and its typed `structuredContent` is decoded with
  *      `structuredContentAs!SetNoteResult` (uri + created) before asserting. The
  *      resources/updated notification is parsed with
  *      `ResourceUpdatedNotification.fromJson` rather than raw `params["uri"]`.
@@ -63,13 +63,14 @@ import examples_common;
 enum string expectedConfig = `{"name":"resources-example","featureFlags":["resources","subscribe"]}`;
 enum Duration expectedTtl = 60.seconds;
 
-/// Typed arguments for the `set_note` tool. Passing this struct to the typed
-/// `callTool(name, T args)` overload lets the SDK serialize the wire arguments
-/// for a fixed-shape call.
-struct SetNoteArgs
+/// `set_note` arguments as a JSON object (`{ "id": id, "body": body }`). The
+/// client request surface is untyped — see the repo-root `DESIGN.md`.
+private Json setNoteArgs(string id, string body) @safe
 {
-	string id;
-	string body;
+	Json j = Json.emptyObject;
+	j["id"] = id;
+	j["body"] = body;
+	return j;
 }
 
 /// Mirrors the server's typed `SetNoteResult`. Decoding the tool's
@@ -202,7 +203,7 @@ int run(string[] args) @safe
 	// resources/updated (subscribed) + resources/list_changed (new resource).
 	// The args have a fixed shape, so pass a typed struct to the typed callTool
 	// overload rather than hand-building a Json object.
-	auto callRes = client.callTool("set_note", SetNoteArgs("e2e", "pushed body"));
+	auto callRes = client.callTool("set_note", setNoteArgs("e2e", "pushed body"));
 	check(!callRes.isError, "set_note should not be an error");
 	// Decode the tool's typed structuredContent in one step instead of reading
 	// raw Json fields, then assert on the typed values.

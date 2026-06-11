@@ -57,12 +57,11 @@ over either transport. It asserts concrete expected values:
 - calling an unknown tool raises an `McpException` with code
   `invalidParams` (-32602).
 
-The client exercises the SDK's typed client ergonomics rather than hand-built
-Json wherever the call is static: it passes typed parameter structs to
-`client.callTool(name, T args)` (e.g. `callTool("calc", CalcArgs("add", 3, 4))`)
-and decodes structured output with `result.structuredContentAs!T` into small
-result structs (`CalcOutput`, `ScalarOutput`); a dynamic Json arguments object is
-kept only for the genuinely optional `round` argument.
+The client builds each call's `arguments` as a JSON object — the request surface
+is untyped, because a real host hands the model the tool's schema and forwards the
+model's raw JSON back (see `DESIGN.md`). It decodes structured *output* with the
+typed `result.structuredContentAs!T` into small result structs (`CalcOutput`,
+`ScalarOutput`): result-side decoding stays typed.
 
 On success it prints `OK: ...` and exits `0`; on **any** failed assertion it
 prints what differed and exits **non-zero**, so the example doubles as a CI

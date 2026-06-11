@@ -46,9 +46,9 @@ One binary, either transport:
 
 - the `onSampling` handler returns `CreateMessageResult.text(model, text)`
   instead of assembling the `role`/`content`/`model`/`stopReason` reply by hand;
-- it calls a tool with a typed argument struct
-  (`callTool("summarize", SummarizeArgs(text))`) rather than hand-building a Json
-  arguments object;
+- it calls a tool with a JSON arguments object
+  (`callTool("summarize", summarizeArgs(text))`); the client request surface is
+  untyped (see the repo-root `DESIGN.md`);
 - it decodes the structured result in one step with
   `result.structuredContentAs!SummaryResult` instead of reading
   `structuredContent["x"].get!...` field by field.

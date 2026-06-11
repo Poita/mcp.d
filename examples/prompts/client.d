@@ -16,9 +16,9 @@
 ///
 /// What it verifies (transport-agnostic):
 ///   * `prompts/list` contains exactly the two prompts the server registers,
-///     with their titles and typed-argument descriptors.
-///   * `prompts/get greet` renders the typed `name` argument (passed as a typed
-///     struct, not hand-built Json) into a text message.
+///     with their titles and argument descriptors.
+///   * `prompts/get greet` renders the `name` argument (built as a JSON object,
+///     the untyped client request surface) into a text message.
 ///   * `prompts/get code_review` returns an embedded-resource content block,
 ///     decoded via the typed `Content.embeddedResource()` (uri + mimeType + text).
 ///   * `completion/complete` for the `language` argument prefix-matches the
@@ -37,16 +37,21 @@ import vibe.data.json : Json;
 
 import examples_common : check, checkEq, runClient, connectFromArgs;
 
-/// Typed argument structs for `prompts/get`, serialized by the typed
-/// `getPrompt(name, T args)` overload instead of hand-built Json objects.
-struct GreetArgs
+/// `greet` prompt arguments as a JSON object (`{ "name": name }`). The client
+/// request surface is untyped — see the repo-root `DESIGN.md`.
+private Json greetArgs(string name) @safe
 {
-	string name;
+	Json j = Json.emptyObject;
+	j["name"] = name;
+	return j;
 }
 
-struct CodeReviewArgs
+/// `code_review` prompt arguments as a JSON object (`{ "language": language }`).
+private Json codeReviewArgs(string language) @safe
 {
-	string language;
+	Json j = Json.emptyObject;
+	j["language"] = language;
+	return j;
 }
 
 int main(string[] args) @safe
@@ -86,18 +91,18 @@ int run(McpClient client) @safe
 	auto reviewArgNames = review.arguments.map!(a => a.name).array;
 	checkEq(reviewArgNames, ["language"], "code_review arg order");
 
-	// --- 2. prompts/get greet: typed arg flows into the message text. ---
-	// Typed `getPrompt(name, T args)` serializes the struct for us; no hand-built
-	// Json.emptyObject + per-field assignment.
-	GetPromptResult greetResult = client.getPrompt("greet", GreetArgs("Ada"));
+	// --- 2. prompts/get greet: the arg flows into the message text. ---
+	// Build the prompt arguments as a JSON object (the untyped client request
+	// surface).
+	GetPromptResult greetResult = client.getPrompt("greet", greetArgs("Ada"));
 	checkEq(greetResult.messages.length, 1UL, "greet message count");
 	checkEq(greetResult.messages[0].role, "user", "greet message role");
 	checkEq(greetResult.messages[0].content.kind, ContentKind.text, "greet message content kind");
 	check(greetResult.messages[0].content.text.canFind("Ada"),
-			"greet message mentions 'Ada' (typed arg flowed through)");
+			"greet message mentions 'Ada' (arg flowed through)");
 
 	// --- 3. prompts/get code_review: embedded-resource content block. ---
-	GetPromptResult cr = client.getPrompt("code_review", CodeReviewArgs("d"));
+	GetPromptResult cr = client.getPrompt("code_review", codeReviewArgs("d"));
 	checkEq(cr.messages.length, 2UL, "code_review message count");
 	checkEq(cr.messages[0].content.kind, ContentKind.text, "code_review first message is text");
 	// Second message: embedded resource carrying the snippet. Decode it with the
@@ -137,7 +142,7 @@ int run(McpClient client) @safe
 	import std.stdio : writeln;
 
 	() @trusted {
-		writeln("OK: prompts/list (2), greet typed-arg render, ",
+		writeln("OK: prompts/list (2), greet arg render, ",
 				"code_review embedded resource, completion prefix-match ",
 				"(ru->rust, p->python, ''->9), unknown-prompt -> -32602. All assertions passed.");
 	}();

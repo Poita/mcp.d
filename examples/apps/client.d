@@ -22,10 +22,13 @@ import mcp.client.client : McpClient, byName;
 import mcp.protocol.types : Tool;
 import mcp.api.apps : mcpAppMimeType;
 
-/// Typed `get_weather` arguments.
-struct WeatherArgs
+/// `get_weather` arguments as a JSON object (`{ "city": city }`). The client
+/// request surface is untyped — see the repo-root `DESIGN.md`.
+private Json weatherArgs(string city) @safe
 {
-	string city;
+	Json j = Json.emptyObject;
+	j["city"] = city;
+	return j;
 }
 
 /// Typed view of `get_weather`'s structured output.
@@ -90,7 +93,7 @@ int main(string[] args) @safe
 			"ui:// read should carry the _meta.ui CSP hint");
 
 		// --- call get_weather: structured result -----------------------------
-		auto r = client.callTool("get_weather", WeatherArgs("Paris"));
+		auto r = client.callTool("get_weather", weatherArgs("Paris"));
 		check(!r.isError, "get_weather should not be an error");
 		auto out_ = r.structuredContentAs!WeatherOutput;
 		checkEq(out_.city, "Paris", "get_weather city");

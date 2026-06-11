@@ -42,6 +42,8 @@ module sampling_client;
 import std.algorithm : canFind, map;
 import std.array : array;
 
+import vibe.data.json : Json;
+
 import mcp;
 import examples_common : check, runClient, connectFromArgs;
 
@@ -53,12 +55,13 @@ enum string mockModelId = "mock-summarizer-v1";
 /// `summarize` structured result.
 enum string fixedSummary = "A terse one-line summary.";
 
-/// Typed arguments for the `summarize` tool — passed to the typed
-/// `callTool(name, T)` overload so the SDK serializes them (no hand-built
-/// Json argument object).
-struct SummarizeArgs
+/// `summarize` arguments as a JSON object (`{ "text": text }`). The client
+/// request surface is untyped — see the repo-root `DESIGN.md`.
+private Json summarizeArgs(string text) @safe
 {
-	string text;
+	Json j = Json.emptyObject;
+	j["text"] = text;
+	return j;
 }
 
 /// Mirror of the server's `summarize` structured output, decoded with
@@ -132,8 +135,8 @@ private int run(McpClient client) @safe
 	// --- summarize: the mocked sampling value must flow through -------------
 	const longText = "MCP sampling lets a server borrow the client's LLM. "
 		~ "The server sends sampling/createMessage; the client answers with a completion.";
-	// Typed args: pass a struct; the SDK serializes it to the arguments object.
-	auto sres = client.callTool("summarize", SummarizeArgs(longText));
+	// Build the arguments as a JSON object (the untyped client request surface).
+	auto sres = client.callTool("summarize", summarizeArgs(longText));
 
 	check(!sres.isError, "summarize must not be an error");
 	// Typed structured output: decode the whole result in one step.

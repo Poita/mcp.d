@@ -40,16 +40,15 @@ hand-built request/response Json on the server:
   `@cache(ttl, scope)` UDA (a `core.time.Duration`), and `registerHandlers` wires
   everything up.
 
-The client side likewise uses the SDK's typed surface where it cleanly applies:
+The client side keeps types where they belong — on the *result*:
 
-- It calls `add` with a typed **`callTool("add", AddArgs(2, 40))`** instead of
-  hand-building an `arguments` Json object.
+- The client **request** surface is untyped: it calls `add` by building the
+  `arguments` as a JSON object (`callTool("add", addArgs(2, 40))`). A real host
+  hands a model the tool schema and forwards the model's raw JSON back, so typed
+  argument structs would only ever serve tests (see the repo-root `DESIGN.md`).
 - It reads the result's `structuredContent` back as a typed struct via
   **`res.structuredContentAs!SumResult`**, asserting on `sum.sum` rather than
-  indexing raw `Json`.
-
-(The *error-path* call still passes a dynamic `Json.emptyObject`, since it is a
-deliberately malformed call to an unknown tool.)
+  indexing raw `Json` — result-side decoding stays typed.
 
 ## Shared scaffold
 

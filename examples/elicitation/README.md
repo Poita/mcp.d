@@ -60,8 +60,9 @@ Json, on both sides of the wire:
   binary via `McpClient.spawnSibling` + `scope(exit) client.close()`, #470 — no
   hand-rolled `ProcessPipes` plumbing) and runs its self-verifying body inside
   `runClient(...)`. Its assertions use the scaffold's `check`/`checkEq` helpers;
-- the client passes tool arguments as the typed `PlanArgs(destination)` struct
-  (#468), and answers `accept` with `ElicitResult.accept(AcceptForm(3))` (#466).
+- the client passes tool arguments as a JSON object (`planArgs(destination)`;
+  the client request surface is untyped — see the repo-root `DESIGN.md`), and
+  answers `accept` with `ElicitResult.accept(AcceptForm(3))` (#466).
   Installing `onElicitation` alone advertises form elicitation (the inbound gate
   honours `effectiveCapabilities()`, #463), so no raw capability flags are set.
 

@@ -30,8 +30,8 @@
  *     `scope(exit) close()`;
  *   - the `accept` handler returns `ElicitResult.accept(AcceptForm(3))` — the
  *     struct's fields become the collected `{name: value}` content map;
- *   - the `plan_trip` arguments are passed as the typed `PlanArgs(destination)`
- *     struct;
+ *   - the `plan_trip` arguments are built as a JSON object
+ *     (`planArgs(destination)`), since the client request surface is untyped;
  *   - the structured result is decoded once with `result.structuredContentAs!
  *     TripPlan` and the assertions read its typed fields;
  *   - installing `onElicitation` alone advertises form elicitation; the inbound
@@ -71,11 +71,13 @@ import examples_common : check, checkEq, runClient, connectFromArgs;
 import mcp.protocol.errors : McpException;
 import mcp.protocol.types : asNumber;
 
-/// Typed arguments for the `plan_trip` tool: passed to `callTool` as a struct
-/// so the client never hand-builds the arguments Json.
-struct PlanArgs
+/// `plan_trip` arguments as a JSON object (`{ "destination": destination }`).
+/// The client request surface is untyped — see the repo-root `DESIGN.md`.
+private Json planArgs(string destination) @safe
 {
-	string destination;
+	Json j = Json.emptyObject;
+	j["destination"] = destination;
+	return j;
 }
 
 /// The `accept` form the client submits: only `travelers` is supplied, so
@@ -167,7 +169,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		};
 		client.initialize();
 
-		auto r = client.callTool("plan_trip", PlanArgs("Kyoto"));
+		auto r = client.callTool("plan_trip", planArgs("Kyoto"));
 
 		check(!r.isError, "plan_trip (accept) should not be an error");
 		check(sawElicit, "client should have received an elicitation/create request");
@@ -212,7 +214,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		};
 		client.initialize();
 
-		auto r = client.callTool("plan_trip", PlanArgs("Oslo"));
+		auto r = client.callTool("plan_trip", planArgs("Oslo"));
 		check(!r.isError, "plan_trip (decline) should not be a tool error");
 		auto plan = r.structuredContentAs!TripPlan;
 		checkEq(plan.status, "declined", "decline status");
@@ -228,7 +230,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		};
 		client.initialize();
 
-		auto r = client.callTool("plan_trip", PlanArgs("Lima"));
+		auto r = client.callTool("plan_trip", planArgs("Lima"));
 		check(!r.isError, "plan_trip (cancel) should not be a tool error");
 		auto plan = r.structuredContentAs!TripPlan;
 		checkEq(plan.status, "cancelled", "cancel status");
@@ -247,7 +249,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		bool failed;
 		try
 		{
-			auto r = client.callTool("plan_trip", PlanArgs("Cairo"));
+			auto r = client.callTool("plan_trip", planArgs("Cairo"));
 			// Over some transports the refusal surfaces as a tool error result
 			// rather than a JSON-RPC error; accept either as the expected failure.
 			failed = r.isError;
