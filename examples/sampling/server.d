@@ -94,7 +94,8 @@ final class SamplingApi
 	/// `summary` alongside the `model`/`stopReason` the client reported.
 	@tool("summarize",
 			"Summarize a block of text by asking the client's LLM (sampling/createMessage).")
-	SummaryResult summarize(@describe("the text to summarize") string text, RequestContext ctx)@safe
+	@describeParam("text", "the text to summarize")
+	SummaryResult summarize(string text, RequestContext ctx) @safe
 	{
 		CreateMessageRequest req;
 		req.systemPrompt = nullable(
