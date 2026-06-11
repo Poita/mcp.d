@@ -1,6 +1,6 @@
 module mcp.client.client;
 
-import core.time : Duration, seconds, msecs, hours;
+import core.time : Duration, seconds, msecs;
 import std.algorithm : canFind, startsWith;
 import std.datetime : Clock, SysTime;
 import std.typecons : Nullable, nullable;
@@ -184,13 +184,16 @@ struct ClientSettings
 	CacheStore cache = null;
 
 	/// Fallback freshness applied to a cacheable result when the server attaches
-	/// no `ttlMs` hint (pre-draft servers, or a draft server that omits it).
-	/// Defaults to one hour: responses are cached by default and a server-supplied
-	/// hint always overrides this. This also makes the cached `tools/list` the
-	/// single source for `x-mcp-header` mirroring and output-schema validation, so
-	/// they work from a shared/pre-seeded store with no local `listTools`. Set to
-	/// `Duration.zero` to cache only responses that carry an explicit server hint.
-	Duration defaultCacheTtl = 1.hours;
+	/// no `ttlMs` hint (pre-draft servers, or a draft server that omits it). Zero
+	/// (the default) means "do not cache unhinted responses", preserving exact
+	/// pre-cache behavior; a positive value caches even unhinted responses for
+	/// this long. A server-supplied hint always takes precedence over this.
+	///
+	/// This governs only whether a response is *served* from cache. The
+	/// `tools/list` response is always retained (stale-for-serving) so the
+	/// `x-mcp-header` mirroring and output-schema validation derived from it keep
+	/// working without a local `listTools` even at this default; see `cachedTool`.
+	Duration defaultCacheTtl = Duration.zero;
 
 	/// This client's cache partition — a stable principal identifier (user / tenant
 	/// id) under which its `private`-scoped results are namespaced. Only relevant
@@ -312,7 +315,7 @@ final class McpClient : ClientProtocol
 	// hint (pre-draft servers, or a draft server that omits it). Zero means
 	// "do not cache unhinted responses" (the default), so behavior against such
 	// servers matches the uncached client. A server hint always wins over this.
-	private Duration defaultCacheTtl_ = 1.hours;
+	private Duration defaultCacheTtl_;
 	// This client's cache partition: the namespace under which its `private`-scoped
 	// cacheable results are stored, so a SHARED `cacheStore_` keeps one principal's
 	// private entries from being served to another. `public` results ignore it and
@@ -828,7 +831,7 @@ final class McpClient : ClientProtocol
 			if (useModern)
 				a.tools = excludeInvalidHeaderTools(a.tools);
 			return a;
-		});
+		}, true); // retainForSchema: keep tools/list available to cachedTool
 		return acc;
 	}
 
@@ -1014,7 +1017,15 @@ final class McpClient : ClientProtocol
 	/// so a shared store never serves it to another identity. Because the scope is
 	/// only known after fetching, a read probes this client's own partition first
 	/// and then the shared one.
-	private R cachedFetch(R)(CacheKey logical, CacheMode mode, scope R delegate() @safe fetch) @safe
+	///
+	/// `retainForSchema` (set by `listTools`) keeps the result available to
+	/// `cachedTool` even when it is not cached for serving: on a non-positive `ttl`
+	/// the body is stored stale-for-serving (expiry = now) instead of being
+	/// dropped, so `x-mcp-header` mirroring and output-schema validation work after
+	/// a local `listTools` regardless of `defaultCacheTtl`, while a cached
+	/// `listTools` still refetches per its hint.
+	private R cachedFetch(R)(CacheKey logical, CacheMode mode,
+			scope R delegate() @safe fetch, bool retainForSchema = false) @safe
 	{
 		if (cacheStore_ is null || mode == CacheMode.bypass)
 			return fetch();
@@ -1036,6 +1047,18 @@ final class McpClient : ClientProtocol
 			cacheStore_.put(storeKey, CacheEntry(result.toJson(), now_() + ttl, scope_));
 			// If the scope flipped since a prior fetch, drop the now-stale entry
 			// that was stored under the other partition for this logical key.
+			const otherKey = (storeKey == ownKey) ? sharedKey : ownKey;
+			if (otherKey != storeKey)
+				cacheStore_.invalidate(otherKey);
+		}
+		else if (retainForSchema)
+		{
+			// Not cached for serving, but keep the body for schema lookups: store it
+			// already-expired (expiry = now) under the shared partition so a cached
+			// `listTools` still refetches, while `cachedTool` (which ignores
+			// serving-freshness) can read the descriptors until a `list_changed`.
+			const storeKey = scopedKey(logical, CacheScope.public_);
+			cacheStore_.put(storeKey, CacheEntry(result.toJson(), now_(), CacheScope.public_));
 			const otherKey = (storeKey == ownKey) ? sharedKey : ownKey;
 			if (otherKey != storeKey)
 				cacheStore_.invalidate(otherKey);
@@ -3150,6 +3173,35 @@ unittest  // evicting the tools/list entry (e.g. tools/list_changed) stops heade
 	c.dispatchNotification("notifications/tools/list_changed", Json.emptyObject);
 	assert("Mcp-Param-Region" !in c.headersFor(msg),
 			"once the tools/list entry is evicted, mirroring must stop until a refresh");
+}
+
+unittest  // a local listTools with no server hint still enables header mirroring (retained for schema)
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	Tool t = headerTool("locate", [
+		"region": Json(["type": Json("string"), "x-mcp-header": Json("Region")])
+	]);
+	// No ttlMs hint and the default (zero) defaultCacheTtl: the list is not served
+	// from cache, but is retained so mirroring works without a separate map.
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		Json arr = Json.emptyArray;
+		arr ~= t.toJson();
+		r["tools"] = arr;
+		return r;
+	};
+	c.listTools();
+
+	Json msg = Json.emptyObject;
+	msg["method"] = "tools/call";
+	Json params = Json.emptyObject;
+	params["name"] = "locate";
+	params["arguments"] = Json(["region": Json("us-west1")]);
+	msg["params"] = params;
+
+	assert("Mcp-Param-Region" in c.headersFor(msg),
+			"header mirroring must work after a local listTools even with no cache hint");
 }
 
 unittest  // the tool index re-derives when the underlying cache entry changes
@@ -5304,11 +5356,12 @@ unittest  // a ttlMs:0 (do-not-cache) result is never cached
 	assert(calls == 2, "ttlMs:0 must not be cached");
 }
 
-unittest  // with no server hint and zero defaultCacheTtl nothing is cached
+unittest  // with no server hint and zero defaultCacheTtl nothing is served from cache
 {
 	int calls;
 	auto c = cachingTestClient("tools/list", -1, calls); // -1 => omit ttlMs
-	c.setDefaultCacheTtl(Duration.zero); // opt out of the default-on caching
+	// tools/list is retained for schema lookup but stale-for-serving, so the
+	// second call still refetches rather than being served from cache.
 	c.listTools();
 	c.listTools();
 	assert(calls == 2);
