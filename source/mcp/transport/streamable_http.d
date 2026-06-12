@@ -16,6 +16,7 @@ import mcp.transport.session;
 import mcp.auth.resource_server;
 import mcp.server.context : RequestContext, BaseRequestContext, ConnectionScoped;
 import mcp.server.connection : ConnectionState;
+import mcp.server.push : ListenFilter;
 import mcp.protocol.capabilities : ClientCapabilities;
 
 /// The HTTP header carrying the session id (basic/transports §Session Management).
@@ -187,7 +188,7 @@ void mountMcp(URLRouter router, McpServer server,
 			return;
 		handlePost(server, coord, sessions, token, req, res);
 	});
-	auto push = server.serverPushChannel(coord);
+	auto push = ensurePushChannel(server, coord);
 	router.get(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		if (!guardOrigin(req, res, opts))
 			return;
@@ -1106,7 +1107,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	const lastEventId = req.headers.get("Last-Event-ID", "");
 	const listenerId = push.addListener((string frame) @safe {
 		writeFrame(frame);
-	}, "", SubscriptionFilter.init, lastEventId, getConn !is null
+	}, "", ListenFilter.init, lastEventId, getConn !is null
 			? server.sessionPushEligibility(getConn) : null, ownerToken);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
@@ -1152,20 +1153,24 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	// first SSE event instead. A routing error (e.g. the version gate rejected
 	// the request) is surfaced as a JSON-RPC error response — listen is draft-only,
 	// so a method-not-found rides the draft 404 — rather than opening the stream
-	// with a stale filter.
-	auto routed = routeListenRequest(server, msg, protoHeader, connToken);
+	// with a stale filter. The state is built the same way the regular POST path
+	// builds it (`freshStatelessState`: header, then body `_meta`, then the
+	// server default).
+	auto reqState = freshStatelessState(protoHeader, msg.params, server.negotiatedVersion);
+	auto routed = routeListenRequest(server, msg, reqState, connToken);
 	if (!routed.isNull)
 	{
 		res.statusCode = httpStatusForResponse(routed.get, true);
 		res.writeBody(routed.get.toString(), "application/json");
 		return;
 	}
-	// Capture THIS request's parsed filter once, immediately after routing, so both
-	// the per-stream listener and its acknowledgement reflect exactly this listen
-	// request's opt-in (draft basic/utilities/subscriptions §Multiple Concurrent
-	// Subscriptions: each subscription is independent). Reading it once also avoids a
-	// later concurrent listen on the shared McpServer overwriting lastListenFilter_.
-	auto streamFilter = server.lastListenFilter();
+	// THIS request's parsed filter, read back from its own per-request state, so
+	// both the per-stream listener and its acknowledgement reflect exactly this
+	// listen request's opt-in (draft basic/utilities/subscriptions §Multiple
+	// Concurrent Subscriptions: each subscription is independent) — a concurrent
+	// listen on the shared McpServer dispatches on a different state and cannot
+	// overwrite it.
+	auto streamFilter = reqState.listenFilter;
 
 	res.contentType = "text/event-stream";
 	// subscriptions/listen is a draft-only stream; emit the draft SHOULD header
@@ -1175,7 +1180,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 
 	auto writeFrame = sseFrameWriter(res);
 
-	auto push = server.serverPushChannel(coord);
+	auto push = ensurePushChannel(server, coord);
 	// The listen request's id becomes the stream's subscriptionId: every
 	// notification delivered to this listener (including the leading
 	// acknowledgement) is stamped with it in
@@ -1245,21 +1250,17 @@ private final class HttpScopedContext : BaseRequestContext, ConnectionScoped
 	}
 }
 
-/// Route a draft `subscriptions/listen` through `server.handle` with a
-/// draft-aware `ConnectionState`, so dispatch resolves the draft effective
-/// version — and thus the draft-only listen RPC — even when the draft was
-/// signalled by the `MCP-Protocol-Version` header alone (no body
-/// `_meta.protocolVersion`). The state is built the same way the regular POST
-/// path builds it (`freshStatelessState`: header, then body `_meta`, then the
-/// server default). On success the server has recorded this request's per-stream
-/// filter (`lastListenFilter`) and `null` is returned; when routing rejects the
-/// request the JSON-RPC error response is returned for the caller to surface
-/// instead of opening a stream with a stale filter.
+/// Route a draft `subscriptions/listen` through `server.handle` with the
+/// caller's draft-aware per-request `ConnectionState`, so dispatch resolves the
+/// draft effective version — and thus the draft-only listen RPC — even when the
+/// draft was signalled by the `MCP-Protocol-Version` header alone (no body
+/// `_meta.protocolVersion`). On success the server has recorded this request's
+/// per-stream filter on `reqState.listenFilter` and `null` is returned; when
+/// routing rejects the request the JSON-RPC error response is returned for the
+/// caller to surface instead of opening a stream with a stale filter.
 private Nullable!Json routeListenRequest(McpServer server, Message msg,
-		string protoHeader, string connToken) @safe
+		ConnectionState reqState, string connToken) @safe
 {
-	ConnectionState reqState = freshStatelessState(protoHeader, msg.params,
-			server.negotiatedVersion);
 	auto resp = server.handle(msg, new HttpScopedContext(connToken, reqState));
 	if (!resp.isNull && "error" in resp.get && resp.get["error"].type == Json.Type.object)
 		return resp;
@@ -1285,10 +1286,50 @@ unittest  // a draft listen signalled by the header alone routes against the dra
 	params["notifications"] = notifications;
 	auto msg = Message(makeRequest(Json(7), "subscriptions/listen", params));
 
-	auto routed = routeListenRequest(server, msg, "2026-07-28", "");
+	auto reqState = freshStatelessState("2026-07-28", params, server.negotiatedVersion);
+	auto routed = routeListenRequest(server, msg, reqState, "");
 	assert(routed.isNull, "a header-signalled draft listen must route, not error");
-	assert(server.lastListenFilter().active);
-	assert(server.lastListenFilter().toolsListChanged);
+	assert(reqState.listenFilter.active);
+	assert(reqState.listenFilter.toolsListChanged);
+}
+
+unittest  // concurrent listens each keep their own per-stream filter
+{
+	import mcp.protocol.jsonrpc : makeRequest, Message;
+
+	// Two subscriptions/listen requests interleaved on one shared server (as two
+	// concurrent HTTP listen streams race). Each stream's opt-in must be recorded
+	// on its own request state: a server-global "last filter" field would hand
+	// the first stream the second stream's filter.
+	auto server = McpServer.stateful("t", "1");
+	server.enableToolsListChanged();
+	server.enablePromptsListChanged();
+
+	static Json listenParams(string changeType)
+	{
+		Json notifications = Json.emptyObject;
+		notifications[changeType] = true;
+		Json params = Json.emptyObject;
+		params["notifications"] = notifications;
+		return params;
+	}
+
+	auto paramsA = listenParams("toolsListChanged");
+	auto paramsB = listenParams("promptsListChanged");
+	auto msgA = Message(makeRequest(Json(1), "subscriptions/listen", paramsA));
+	auto msgB = Message(makeRequest(Json(2), "subscriptions/listen", paramsB));
+
+	auto a = freshStatelessState("2026-07-28", paramsA, server.negotiatedVersion);
+	auto b = freshStatelessState("2026-07-28", paramsB, server.negotiatedVersion);
+	assert(routeListenRequest(server, msgA, a, "").isNull);
+	assert(routeListenRequest(server, msgB, b, "").isNull);
+
+	assert(a.listenFilter.active && a.listenFilter.toolsListChanged
+			&& !a.listenFilter.promptsListChanged,
+			"stream A must keep its own toolsListChanged opt-in");
+	assert(b.listenFilter.active && b.listenFilter.promptsListChanged
+			&& !b.listenFilter.toolsListChanged,
+			"stream B must keep its own promptsListChanged opt-in");
 }
 
 /// Validate the draft-only request headers on a POSTed JSON-RPC request, returning
@@ -1563,7 +1604,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			// `notifications/resources/updated` and `.../list_changed` down THAT SAME
 			// stream — exactly like a tool call emitting progress on its own SSE stream.
 			// It needs NO session, NO Mcp-Session-Id, NO inbound correlation; delivery
-			// is driven by this stream's own per-URI `SubscriptionFilter` at the push
+			// is driven by this stream's own per-URI `ListenFilter` at the push
 			// channel. (The 2025-era resources/subscribe RPC and the standalone GET
 			// stream stay gated in stateless; only this draft listen path is opened.)
 			handleListenStream(server, coord, msg, res,
@@ -3219,7 +3260,7 @@ unittest  // ordinary application errors (e.g. invalidParams) ride on HTTP 200
 
 unittest  // draft subscriptions/listen: ack first, then opted-in change notifications flow
 {
-	import mcp.transport.sse_context : StreamCoordinator, ServerPushChannel, SubscriptionFilter;
+	import mcp.transport.sse_context : StreamCoordinator, ServerPushChannel;
 	import mcp.protocol.modern : MetaKey;
 	import std.algorithm : canFind;
 
@@ -3233,23 +3274,24 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
 	Json listenParams = Json.emptyObject;
 	listenParams["toolsListChanged"] = true;
 	auto m = draftMsg("subscriptions/listen", listenParams);
-	server.handle(m);
-	assert(server.lastListenFilter().toolsListChanged);
-	assert(!server.lastListenFilter().resourcesListChanged);
+	auto reqState = freshStatelessState("2026-07-28", m.params, server.negotiatedVersion);
+	assert(routeListenRequest(server, m, reqState, "").isNull);
+	assert(reqState.listenFilter.toolsListChanged);
+	assert(!reqState.listenFilter.resourcesListChanged);
 
 	// The listen stream registers as a push-channel listener (carrying the listen
 	// request's id as the stream's subscriptionId, and its OWN active per-stream
 	// filter — exactly as handleListenStream does) and receives the ack. Delivery
 	// onto the stream is decided by that filter.
 	auto coord = new StreamCoordinator;
-	auto push = server.serverPushChannel(coord);
+	auto push = ensurePushChannel(server, coord);
 	string[] frames;
-	SubscriptionFilter streamFilter;
+	ListenFilter streamFilter;
 	streamFilter.active = true;
 	streamFilter.toolsListChanged = true;
 	const lid = push.addListener((string f) @safe { frames ~= f; }, rpcIdString(m.id), streamFilter);
 	push.emitTo(lid, subscriptionsAcknowledgedNotification(
-			server.acknowledgedSubsetFor(server.lastListenFilter())));
+			server.acknowledgedSubsetFor(reqState.listenFilter)));
 	assert(frames.length == 1);
 	assert(frames[0].canFind("notifications/subscriptions/acknowledged"));
 	// The agreed subset is nested under params.notifications (draft spec shape).

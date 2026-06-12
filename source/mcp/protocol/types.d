@@ -9,7 +9,6 @@ import mcp.protocol.jsonhelpers : getOr, tryGet;
 import mcp.protocol.tasks : Task, makeCreateTaskResult, isCreateTaskResult;
 import mcp.protocol.modern : InputRequest, emitInputRequired,
 	parseInputRequired, CacheHint, parseCacheHint, withCache;
-import mcp.client.client : ProgressToken;
 
 @safe:
 
@@ -4864,6 +4863,40 @@ unittest  // ResourceUpdatedNotification carries the method-name constant
 	assert(ResourceUpdatedNotification.methodName == "notifications/resources/updated");
 }
 
+/// A progress token attached to an outgoing request so the receiver may emit
+/// `notifications/progress` for it. Per basic/utilities/progress, "Progress
+/// tokens MUST be a string or integer value" and "MUST be unique across all
+/// active requests". Construct one from either a `string` or a `long`; an
+/// unset token is omitted from the request.
+struct ProgressToken
+{
+	private Json value_ = Json.undefined;
+
+	/// A string-valued progress token.
+	this(string token) @safe nothrow
+	{
+		value_ = Json(token);
+	}
+
+	/// An integer-valued progress token.
+	this(long token) @safe nothrow
+	{
+		value_ = Json(token);
+	}
+
+	/// Whether a token has been set (false for a default-constructed token).
+	bool isSet() const @safe nothrow
+	{
+		return value_.type != Json.Type.undefined;
+	}
+
+	/// The token as JSON (a string or integer), or `Json.undefined` when unset.
+	Json toJson() const @safe nothrow
+	{
+		return value_;
+	}
+}
+
 /// A typed `notifications/progress` payload, per basic/utilities/progress: the
 /// notification carries `params: {progressToken, progress, total?, message?}`.
 /// `progressToken` correlates the update to the request that supplied it (a
@@ -4999,8 +5032,6 @@ unittest  // ProgressNotification.progressTokenString returns a string token, el
 
 unittest  // ProgressNotification.matches a string ProgressToken
 {
-	import mcp.client.client : ProgressToken;
-
 	ProgressNotification n;
 	n.progressToken = Json("abc");
 	assert(n.matches(ProgressToken("abc")));
@@ -5010,8 +5041,6 @@ unittest  // ProgressNotification.matches a string ProgressToken
 
 unittest  // ProgressNotification.matches an integer ProgressToken
 {
-	import mcp.client.client : ProgressToken;
-
 	ProgressNotification n;
 	n.progressToken = Json(42);
 	assert(n.matches(ProgressToken(42)));
@@ -5040,6 +5069,84 @@ enum LogLevel : string
 	critical = "critical",
 	alert = "alert",
 	emergency = "emergency"
+}
+
+/// The RFC 5424 severity ordering used by `notifications/message` logging
+/// (server/utilities/logging). Lower index == less severe; a message is emitted
+/// only when its severity is at or above the client's configured minimum (set
+/// via `logging/setLevel`). Returns `-1` for an unrecognised level name.
+int logLevelRank(string level) @safe pure nothrow @nogc
+{
+	switch (level)
+	{
+	case "debug":
+		return 0;
+	case "info":
+		return 1;
+	case "notice":
+		return 2;
+	case "warning":
+		return 3;
+	case "error":
+		return 4;
+	case "critical":
+		return 5;
+	case "alert":
+		return 6;
+	case "emergency":
+		return 7;
+	default:
+		return -1;
+	}
+}
+
+/// Whether a log message at `level` should be emitted when the client's
+/// configured minimum is `minLevel` (RFC 5424 ordering). After
+/// `logging/setLevel(error)` only `error` and above pass. An unrecognised
+/// `level` is treated as always emitted (fail-open, so custom levels are not
+/// silently dropped); an unrecognised `minLevel` admits everything.
+bool shouldLog(string level, string minLevel) @safe pure nothrow @nogc
+{
+	const lvl = logLevelRank(level);
+	const min = logLevelRank(minLevel);
+	if (lvl < 0 || min < 0)
+		return true;
+	return lvl >= min;
+}
+
+unittest  // RFC 5424 ordering: debug < info < ... < emergency
+{
+	assert(logLevelRank("debug") < logLevelRank("info"));
+	assert(logLevelRank("info") < logLevelRank("notice"));
+	assert(logLevelRank("notice") < logLevelRank("warning"));
+	assert(logLevelRank("warning") < logLevelRank("error"));
+	assert(logLevelRank("error") < logLevelRank("critical"));
+	assert(logLevelRank("critical") < logLevelRank("alert"));
+	assert(logLevelRank("alert") < logLevelRank("emergency"));
+	assert(logLevelRank("bogus") == -1);
+}
+
+unittest  // shouldLog gates by the configured minimum level
+{
+	// minLevel "error": only error and above pass.
+	assert(!shouldLog("debug", "error"));
+	assert(!shouldLog("warning", "error"));
+	assert(shouldLog("error", "error"));
+	assert(shouldLog("critical", "error"));
+	assert(shouldLog("emergency", "error"));
+}
+
+unittest  // shouldLog with the default minimum "info" drops only debug
+{
+	assert(!shouldLog("debug", "info"));
+	assert(shouldLog("info", "info"));
+	assert(shouldLog("warning", "info"));
+}
+
+unittest  // shouldLog fails open on unrecognised level names
+{
+	assert(shouldLog("custom", "error"));
+	assert(shouldLog("debug", "bogus"));
 }
 
 /// A typed `notifications/message` payload, per server/utilities/logging: the

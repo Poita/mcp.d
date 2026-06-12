@@ -1533,7 +1533,7 @@ version (unittest)
 	import mcp.protocol.modern : MetaKey;
 
 	// A draft `subscriptions/listen` request line carrying per-request _meta
-	// (protocolVersion draft) and a nested `notifications` SubscriptionFilter.
+	// (protocolVersion draft) and a nested `notifications` ListenFilter.
 	private string draftListenLine(long id, Json filter) @safe
 	{
 		import mcp.protocol.jsonrpc : makeRequest;

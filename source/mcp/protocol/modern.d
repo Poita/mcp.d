@@ -7,7 +7,6 @@ import vibe.data.json : Json;
 import mcp.protocol.capabilities;
 import mcp.protocol.versions : ProtocolVersion;
 import mcp.protocol.sampling : CreateMessageRequest;
-import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
 import mcp.protocol.errors : isValidElicitationUrl, invalidParams;
 import mcp.protocol.jsonhelpers : getOr, tryGet;
 
@@ -822,9 +821,14 @@ struct InputRequest
 
 	/// Build a form-`elicitation` input-request whose `requestedSchema` is
 	/// derived from the flat struct `T` via `jsonSchemaOf!T` (same compile-time
-	/// flat-struct restriction as `RequestContext.elicit!T`).
+	/// flat-struct restriction as `RequestContext.elicit!T`). The schema layer
+	/// is imported inside the template body, so the protocol module itself does
+	/// not depend on `mcp.api`; only an instantiation of this convenience pulls
+	/// the reflection layer in.
 	static InputRequest elicitation(T)(string id, string message) @safe
 	{
+		import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
+
 		static assert(isFlatElicitationStruct!T, "elicitation!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
 				.stringof ~ " has a nested or non-scalar field");
 		return elicitation(id, message, jsonSchemaOf!T);

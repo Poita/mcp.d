@@ -5,7 +5,7 @@ import vibe.data.json : Json, deserializeJson, parseJsonString;
 
 import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
-import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction, LogLevel;
+import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction, LogLevel, shouldLog;
 import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
 import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
@@ -14,84 +14,6 @@ import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMe
 import mcp.server.connection : ConnectionState;
 
 @safe:
-
-/// The RFC 5424 severity ordering used by `notifications/message` logging
-/// (server/utilities/logging). Lower index == less severe; a message is emitted
-/// only when its severity is at or above the client's configured minimum (set
-/// via `logging/setLevel`). Returns `-1` for an unrecognised level name.
-int logLevelRank(string level) @safe pure nothrow @nogc
-{
-	switch (level)
-	{
-	case "debug":
-		return 0;
-	case "info":
-		return 1;
-	case "notice":
-		return 2;
-	case "warning":
-		return 3;
-	case "error":
-		return 4;
-	case "critical":
-		return 5;
-	case "alert":
-		return 6;
-	case "emergency":
-		return 7;
-	default:
-		return -1;
-	}
-}
-
-/// Whether a log message at `level` should be emitted when the client's
-/// configured minimum is `minLevel` (RFC 5424 ordering). After
-/// `logging/setLevel(error)` only `error` and above pass. An unrecognised
-/// `level` is treated as always emitted (fail-open, so custom levels are not
-/// silently dropped); an unrecognised `minLevel` admits everything.
-bool shouldLog(string level, string minLevel) @safe pure nothrow @nogc
-{
-	const lvl = logLevelRank(level);
-	const min = logLevelRank(minLevel);
-	if (lvl < 0 || min < 0)
-		return true;
-	return lvl >= min;
-}
-
-unittest  // RFC 5424 ordering: debug < info < ... < emergency
-{
-	assert(logLevelRank("debug") < logLevelRank("info"));
-	assert(logLevelRank("info") < logLevelRank("notice"));
-	assert(logLevelRank("notice") < logLevelRank("warning"));
-	assert(logLevelRank("warning") < logLevelRank("error"));
-	assert(logLevelRank("error") < logLevelRank("critical"));
-	assert(logLevelRank("critical") < logLevelRank("alert"));
-	assert(logLevelRank("alert") < logLevelRank("emergency"));
-	assert(logLevelRank("bogus") == -1);
-}
-
-unittest  // shouldLog gates by the configured minimum level
-{
-	// minLevel "error": only error and above pass.
-	assert(!shouldLog("debug", "error"));
-	assert(!shouldLog("warning", "error"));
-	assert(shouldLog("error", "error"));
-	assert(shouldLog("critical", "error"));
-	assert(shouldLog("emergency", "error"));
-}
-
-unittest  // shouldLog with the default minimum "info" drops only debug
-{
-	assert(!shouldLog("debug", "info"));
-	assert(shouldLog("info", "info"));
-	assert(shouldLog("warning", "info"));
-}
-
-unittest  // shouldLog fails open on unrecognised level names
-{
-	assert(shouldLog("custom", "error"));
-	assert(shouldLog("debug", "bogus"));
-}
 
 /// A shared, mutable cancellation flag for one in-flight request. The server
 /// hands the same token to the request's `RequestContext` (so the handler can
