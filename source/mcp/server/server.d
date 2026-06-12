@@ -417,14 +417,10 @@ final class McpServer
 	// Maximum number of items returned per `*/list` page. 0 (the default) means
 	// unbounded: the full list is returned in a single response with no cursor.
 	private size_t pageSize_;
-	// The per-stream `SubscriptionFilter` parsed from the most recent
-	// `subscriptions/listen` request. The transport reads it right after routing the
-	// listen request so it can attach the exact opt-in to that one stream's push
-	// listener (draft basic/utilities/subscriptions §Notification Filter / Multiple
-	// Concurrent Subscriptions). This per-stream filter is the single source of
-	// truth for what a connection is listening for; the acknowledgement echo is
-	// derived from it via `acknowledgedSubsetFor`.
-	private SubscriptionFilter lastListenFilter_;
+	// The per-stream `SubscriptionFilter` parsed from a `subscriptions/listen`
+	// request is recorded on that request's `ConnectionState.listenFilter` (see
+	// `doSubscribeListen`), never on the shared server, so concurrent listen
+	// streams cannot observe each other's opt-in.
 	private PushChannel pushChannel;
 	// The stdio `subscriptions/listen` delivery channel (draft only). On the
 	// stdio transport every message shares the single stdout channel, so there
@@ -1357,10 +1353,11 @@ final class McpServer
 		// stamped with it in `params._meta`.
 		stdioListenSubscriptionId = rpcIdString(msg.id);
 		stdioListenSink = writeLine;
-		// Capture THIS listen request's parsed per-stream filter so subsequent
-		// notify*/notifyResourceUpdated deliver only the types/URIs it opted into
-		// (per-URI), independent of any other connection's state.
-		stdioListenFilter_ = lastListenFilter_;
+		// Capture THIS listen request's parsed per-stream filter (recorded on the
+		// stdio connection's state) so subsequent notify*/notifyResourceUpdated
+		// deliver only the types/URIs it opted into (per-URI), independent of any
+		// other connection's state.
+		stdioListenFilter_ = cs().listenFilter;
 
 		// First message on the stream: the acknowledgement carrying the agreed-upon
 		// subset for THIS listen request only (draft basic/utilities/subscriptions
@@ -1368,7 +1365,7 @@ final class McpServer
 		// from the just-parsed per-stream filter so concurrent (or already-closed)
 		// streams' opt-ins do not leak into this ack. Stamped with the subscriptionId.
 		Json ackParams = Json.emptyObject;
-		ackParams["notifications"] = acknowledgedSubsetFor(lastListenFilter_);
+		ackParams["notifications"] = acknowledgedSubsetFor(stdioListenFilter_);
 		auto ack = withSubscriptionId(makeNotification("notifications/subscriptions/acknowledged",
 				ackParams), stdioListenSubscriptionId);
 		writeLine(ack.toString());
@@ -1390,7 +1387,7 @@ final class McpServer
 		// Stdio `subscriptions/listen` channel (draft): the single stdout channel
 		// carries change notifications too, stamped with the listen subscriptionId.
 		// Delivery is driven by the stdio listen stream's OWN recorded filter
-		// (`lastListenFilter_`, the single stdio connection) via `accepts(method, uri)`
+		// (`stdioListenFilter_`, the single stdio connection) via `accepts(method, uri)`
 		// — so a stdio listener subscribed to uriA does NOT receive an update for uriB
 		// (per-URI), via the per-stream `SubscriptionFilter`.
 		// Without this branch a stdio listener receives nothing, since there is no
@@ -2315,12 +2312,11 @@ final class McpServer
 			// Drop every piece of listen state this single stdio stream recorded so
 			// a later notify*/notifyResourceUpdated writes nothing: the per-URI
 			// resource `subscriptions` (keyed by the URIs the per-stream filter
-			// opted into), the per-stream `lastListenFilter_`, and the stdio
-			// delivery filter `stdioListenFilter_`. Stdio is single-connection, so
-			// the caller is the only listener and clearing all of it is correct.
-			foreach (u; lastListenFilter_.resourceUris)
+			// opted into) and the stdio delivery filter `stdioListenFilter_`.
+			// Stdio is single-connection, so the caller is the only listener and
+			// clearing all of it is correct.
+			foreach (u; stdioListenFilter_.resourceUris)
 				conn.subscriptions.remove(u);
-			lastListenFilter_ = SubscriptionFilter.init;
 			stdioListenFilter_ = SubscriptionFilter.init;
 			return;
 		}
@@ -2568,11 +2564,15 @@ final class McpServer
 				}
 			}
 		}
-		lastListenFilter_ = perStream;
+		// Record the filter on THIS request's connection state (a fresh
+		// per-request state on the HTTP listen route, the single bound state on
+		// stdio), so a concurrent listen dispatched on another state can never
+		// overwrite it before the transport reads it back.
+		conn.listenFilter = perStream;
 
 		// The `{acknowledged:true}` body is discarded by both callers (the stdio
 		// route and the HTTP transport derive the acknowledgement from
-		// `acknowledgedSubsetFor(lastListenFilter_)`), so return an empty object.
+		// `acknowledgedSubsetFor` of the recorded filter), so return an empty object.
 		return Json.emptyObject;
 	}
 
@@ -2611,17 +2611,6 @@ final class McpServer
 		default:
 			return false;
 		}
-	}
-
-	/// The per-stream `SubscriptionFilter` parsed from the most recent
-	/// `subscriptions/listen` request handled by this server. The transport reads it
-	/// immediately after routing a listen request so it can attach the exact opt-in to
-	/// that stream's push-channel listener (draft basic/utilities/subscriptions
-	/// §Notification Filter), ensuring a notification is delivered only to a stream
-	/// that explicitly requested its type.
-	SubscriptionFilter lastListenFilter() @safe
-	{
-		return lastListenFilter_;
 	}
 
 	/// The acknowledged subset for a single `subscriptions/listen` request's filter,
@@ -6450,7 +6439,7 @@ unittest  // subscriptions/listen reads the spec-shaped filter nested under para
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p)).get;
-	auto f = s.lastListenFilter();
+	auto f = s.cs().listenFilter;
 	assert(f.toolsListChanged);
 	assert(f.resourceSubscriptions);
 	assert(!f.promptsListChanged);
@@ -6468,7 +6457,7 @@ unittest  // subscriptions/listen accepts the flat (top-level) filter shape
 	p["toolsListChanged"] = true;
 	p["resourceSubscriptions"] = true;
 	s.handle(draftReq(4, "subscriptions/listen", p)).get;
-	auto f = s.lastListenFilter();
+	auto f = s.cs().listenFilter;
 	assert(f.toolsListChanged);
 	assert(f.resourceSubscriptions);
 	assert(!f.promptsListChanged);
@@ -6482,7 +6471,7 @@ unittest  // subscriptions/listen with an empty resourceSubscriptions array does
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p));
-	assert(!s.lastListenFilter().resourceSubscriptions);
+	assert(!s.cs().listenFilter.resourceSubscriptions);
 }
 
 unittest  // the per-stream ack reflects exactly the opted-in change types
@@ -6492,8 +6481,8 @@ unittest  // the per-stream ack reflects exactly the opted-in change types
 	s.enableToolsListChanged();
 	s.enableResourceSubscriptions();
 	// Nothing opted in yet -> empty object.
-	assert(s.acknowledgedSubsetFor(s.lastListenFilter()).type == Json.Type.object);
-	assert(s.acknowledgedSubsetFor(s.lastListenFilter()).length == 0);
+	assert(s.acknowledgedSubsetFor(s.cs().listenFilter).type == Json.Type.object);
+	assert(s.acknowledgedSubsetFor(s.cs().listenFilter).length == 0);
 
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
@@ -6503,7 +6492,7 @@ unittest  // the per-stream ack reflects exactly the opted-in change types
 	p["notifications"] = filter;
 	s.handle(draftReq(7, "subscriptions/listen", p));
 
-	auto subset = s.acknowledgedSubsetFor(s.lastListenFilter());
+	auto subset = s.acknowledgedSubsetFor(s.cs().listenFilter);
 	assert(subset["toolsListChanged"].get!bool);
 	// `resourceSubscriptions` is the agreed string[] of URIs (a SubscriptionFilter),
 	// not a boolean (draft basic/utilities/subscriptions Acknowledgment).
@@ -6526,7 +6515,7 @@ unittest  // ack echoes every opted-in resourceSubscriptions URI in request orde
 	p["notifications"] = filter;
 	s.handle(draftReq(8, "subscriptions/listen", p));
 
-	auto subset = s.acknowledgedSubsetFor(s.lastListenFilter());
+	auto subset = s.acknowledgedSubsetFor(s.cs().listenFilter);
 	assert(subset["resourceSubscriptions"].type == Json.Type.array);
 	assert(subset["resourceSubscriptions"].length == 2);
 	assert(subset["resourceSubscriptions"][0].get!string == "file:///a.txt");
@@ -6593,7 +6582,7 @@ unittest  // per-stream ack does not leak a concurrent stream's opt-in
 	Json pa = Json.emptyObject;
 	pa["notifications"] = fa;
 	s.handle(draftReq(1, "subscriptions/listen", pa));
-	auto ackA = s.acknowledgedSubsetFor(s.lastListenFilter());
+	auto ackA = s.acknowledgedSubsetFor(s.cs().listenFilter);
 	assert(ackA["toolsListChanged"].get!bool);
 	assert("resourceSubscriptions" !in ackA);
 
@@ -6602,7 +6591,7 @@ unittest  // per-stream ack does not leak a concurrent stream's opt-in
 	Json pb = Json.emptyObject;
 	pb["notifications"] = fb;
 	s.handle(draftReq(2, "subscriptions/listen", pb));
-	auto ackB = s.acknowledgedSubsetFor(s.lastListenFilter());
+	auto ackB = s.acknowledgedSubsetFor(s.cs().listenFilter);
 	// B requested resourceSubscriptions ONLY — its ack must not carry A's tools opt-in.
 	assert("toolsListChanged" !in ackB);
 	assert(ackB["resourceSubscriptions"].type == Json.Type.array);
@@ -6634,8 +6623,8 @@ unittest  // subscriptions/listen ack omits a list-changed type the server does 
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p)).get;
-	assert(!s.lastListenFilter().toolsListChanged);
-	assert("toolsListChanged" !in s.acknowledgedSubsetFor(s.lastListenFilter()));
+	assert(!s.cs().listenFilter.toolsListChanged);
+	assert("toolsListChanged" !in s.acknowledgedSubsetFor(s.cs().listenFilter));
 }
 
 unittest  // subscriptions/listen ack keeps a list-changed type once the server enables it
@@ -6647,8 +6636,8 @@ unittest  // subscriptions/listen ack keeps a list-changed type once the server 
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p));
-	assert(s.lastListenFilter().toolsListChanged);
-	assert(s.acknowledgedSubsetFor(s.lastListenFilter())["toolsListChanged"].get!bool);
+	assert(s.cs().listenFilter.toolsListChanged);
+	assert(s.acknowledgedSubsetFor(s.cs().listenFilter)["toolsListChanged"].get!bool);
 }
 
 unittest  // subscriptions/listen ack omits promptsListChanged when unsupported
@@ -6660,8 +6649,8 @@ unittest  // subscriptions/listen ack omits promptsListChanged when unsupported
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p));
-	assert(!s.lastListenFilter().promptsListChanged);
-	assert("promptsListChanged" !in s.acknowledgedSubsetFor(s.lastListenFilter()));
+	assert(!s.cs().listenFilter.promptsListChanged);
+	assert("promptsListChanged" !in s.acknowledgedSubsetFor(s.cs().listenFilter));
 }
 
 unittest  // subscriptions/listen ack omits resourcesListChanged when unsupported
@@ -6672,8 +6661,8 @@ unittest  // subscriptions/listen ack omits resourcesListChanged when unsupporte
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p));
-	assert(!s.lastListenFilter().resourcesListChanged);
-	assert("resourcesListChanged" !in s.acknowledgedSubsetFor(s.lastListenFilter()));
+	assert(!s.cs().listenFilter.resourcesListChanged);
+	assert("resourcesListChanged" !in s.acknowledgedSubsetFor(s.cs().listenFilter));
 }
 
 unittest  // subscriptions/listen ack omits resourceSubscriptions when subscriptions disabled
@@ -6688,8 +6677,8 @@ unittest  // subscriptions/listen ack omits resourceSubscriptions when subscript
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p));
-	assert(!s.lastListenFilter().resourceSubscriptions);
-	assert("resourceSubscriptions" !in s.acknowledgedSubsetFor(s.lastListenFilter()));
+	assert(!s.cs().listenFilter.resourceSubscriptions);
+	assert("resourceSubscriptions" !in s.acknowledgedSubsetFor(s.cs().listenFilter));
 	assert(!s.isSubscribed("file:///x"));
 }
 
@@ -6704,8 +6693,8 @@ unittest  // a stateless/draft server honours a subscriptions/listen resourceSub
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p));
-	assert(s.lastListenFilter().resourceSubscriptions);
-	assert(s.acknowledgedSubsetFor(s.lastListenFilter())["resourceSubscriptions"].length == 1);
+	assert(s.cs().listenFilter.resourceSubscriptions);
+	assert(s.acknowledgedSubsetFor(s.cs().listenFilter)["resourceSubscriptions"].length == 1);
 }
 
 unittest  // subscriptions/listen ack keeps resourceSubscriptions once enabled
@@ -6718,8 +6707,8 @@ unittest  // subscriptions/listen ack keeps resourceSubscriptions once enabled
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
 	s.handle(draftReq(4, "subscriptions/listen", p));
-	assert(s.lastListenFilter().resourceSubscriptions);
-	assert(s.acknowledgedSubsetFor(s.lastListenFilter())["resourceSubscriptions"].length == 1);
+	assert(s.cs().listenFilter.resourceSubscriptions);
+	assert(s.acknowledgedSubsetFor(s.cs().listenFilter)["resourceSubscriptions"].length == 1);
 	assert(s.isSubscribed("file:///x"));
 }
 
@@ -7749,7 +7738,7 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	pb["notifications"] = nb;
 	s.handle(draftReq(10, "subscriptions/listen", pb));
 	string bFrame;
-	push.addListener((string f) @safe { bFrame = f; }, "10", s.lastListenFilter());
+	push.addListener((string f) @safe { bFrame = f; }, "10", s.cs().listenFilter);
 
 	// Stream A (toolsListChanged only) opens second.
 	Json na = Json.emptyObject;
@@ -7758,7 +7747,7 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	pa["notifications"] = na;
 	s.handle(draftReq(11, "subscriptions/listen", pa));
 	string aFrame;
-	push.addListener((string f) @safe { aFrame = f; }, "11", s.lastListenFilter());
+	push.addListener((string f) @safe { aFrame = f; }, "11", s.cs().listenFilter);
 
 	// A tools/list_changed must land on A (which requested it), not B.
 	const n = s.notifyToolsListChanged();

@@ -3,6 +3,7 @@ module mcp.server.connection;
 import mcp.protocol.versions : ProtocolVersion, latestStable;
 import mcp.protocol.capabilities : ClientCapabilities;
 import mcp.server.context : CancellationToken;
+import mcp.server.push : SubscriptionFilter;
 
 @safe:
 
@@ -43,6 +44,14 @@ final class ConnectionState
 
 	/// The resource URIs this connection has subscribed to (stateful only).
 	bool[string] subscriptions;
+
+	/// The per-stream opt-in parsed from a `subscriptions/listen` request
+	/// dispatched with this state (draft basic/utilities/subscriptions
+	/// §Notification Filter). The HTTP transport builds a fresh per-request state
+	/// for each listen request and reads the filter back from it, so two
+	/// concurrent listen streams can never observe each other's opt-in;
+	/// `SubscriptionFilter.init` (inactive) until a listen request is routed.
+	SubscriptionFilter listenFilter;
 
 	/// In-flight cancellation tokens keyed by this connection's request ids.
 	/// Scoping the registry to the `ConnectionState` keeps a
