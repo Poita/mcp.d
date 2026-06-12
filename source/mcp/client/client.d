@@ -1184,17 +1184,20 @@ final class McpClient : ClientProtocol
 		return callTool(name, arguments, RequestOptions.withProgress(onProgress));
 	}
 
-	/// Issue `tools/call` and, against a draft server, complete any MRTR
-	/// (SEP-2322) round-trips by satisfying each `InputRequest` and resubmitting
-	/// the request with the answers. Returns the first completed `CallToolResult`.
+	/// Issue `method` and, against a draft server, complete any MRTR (SEP-2322)
+	/// round-trips by satisfying each `InputRequest` and resubmitting the
+	/// request with the answers. Returns the first completed result. `R` is the
+	/// typed result (`CallToolResult`/`GetPromptResult`); `buildParams` rebuilds
+	/// the request params for a round from the gathered input responses and the
+	/// opaque `requestState` to echo.
 	///
 	/// A bound is placed on the number of rounds so a misbehaving server that
 	/// keeps asking for input cannot loop forever. If a handler for a requested
 	/// input type is missing, or the loop bound is exceeded, the (still
 	/// `inputRequired`) result is returned so the caller can inspect it via
-	/// `CallToolResult.isInputRequired`.
-	private CallToolResult callToolLoop(string name, Json arguments,
-			ProgressToken progressToken, string logLevel = "") @safe
+	/// `R.isInputRequired`.
+	private R mrtrLoop(R)(string method, string logLevel,
+			scope Json delegate(InputResponse[] responses, string requestState) @safe buildParams) @safe
 	{
 		enum maxRounds = 16;
 		InputResponse[] responses;
@@ -1203,17 +1206,15 @@ final class McpClient : ClientProtocol
 		string requestState;
 		// Hoisted so `maxRounds` is a true cap: after the last bounded round we
 		// return whatever it produced (still an inputRequired result when the
-		// server kept asking) without issuing an extra `tools/call`.
-		CallToolResult result;
+		// server kept asking) without issuing an extra round-trip.
+		R result;
 		foreach (round; 0 .. maxRounds)
 		{
-			auto params = buildToolCallParams(name, arguments, progressToken,
-					responses, requestState);
 			// Per-request draft logging opt-in: stamp the explicit level so
 			// `injectModernMeta` carries it (and leaves it to win over any sticky
 			// `setLogLevel` default). Empty -> no field.
-			params = withRequestLogLevel(params, logLevel);
-			result = CallToolResult.fromJson(rpc("tools/call", params));
+			auto params = withRequestLogLevel(buildParams(responses, requestState), logLevel);
+			result = R.fromJson(rpc(method, params));
 			if (!result.isInputRequired)
 				return result;
 			// Gather an answer for each requested input. If any cannot be
@@ -1235,6 +1236,15 @@ final class McpClient : ClientProtocol
 		// Bound exceeded: return the last bounded round's still-inputRequired
 		// result rather than looping forever (and without an extra round-trip).
 		return result;
+	}
+
+	/// `tools/call` through the MRTR loop; see `mrtrLoop`.
+	private CallToolResult callToolLoop(string name, Json arguments,
+			ProgressToken progressToken, string logLevel = "") @safe
+	{
+		return mrtrLoop!CallToolResult("tools/call", logLevel,
+				(responses, requestState) => buildToolCallParams(name,
+					arguments, progressToken, responses, requestState));
 	}
 
 	/// Mint a process-unique string `ProgressToken` for a per-call progress sink.
@@ -1703,42 +1713,13 @@ final class McpClient : ClientProtocol
 				() @safe => getPromptLoop(name, arguments, token, opts.logLevel));
 	}
 
-	/// Issue `prompts/get` and, against a draft server, complete any MRTR
-	/// (SEP-2322) round-trips by satisfying each `InputRequest` and resubmitting
-	/// the request with the answers. Returns the first completed `GetPromptResult`.
-	///
-	/// A bound is placed on the number of rounds so a misbehaving server that
-	/// keeps asking for input cannot loop forever. If a handler for a requested
-	/// input type is missing, or the loop bound is exceeded, the (still
-	/// `inputRequired`) result is returned so the caller can inspect it via
-	/// `GetPromptResult.isInputRequired`. Mirrors `callToolLoop`.
+	/// `prompts/get` through the MRTR loop; see `mrtrLoop`.
 	private GetPromptResult getPromptLoop(string name, Json arguments,
 			ProgressToken progressToken, string logLevel = "") @safe
 	{
-		enum maxRounds = 16;
-		InputResponse[] responses;
-		string requestState;
-		GetPromptResult result;
-		foreach (round; 0 .. maxRounds)
-		{
-			auto params = buildGetPromptParams(name, arguments, progressToken,
-					responses, requestState);
-			params = withRequestLogLevel(params, logLevel);
-			result = GetPromptResult.fromJson(rpc("prompts/get", params));
-			if (!result.isInputRequired)
-				return result;
-			InputResponse[] answers;
-			foreach (req; result.inputRequests)
-			{
-				InputResponse answer;
-				if (!resolveInputRequest(req, answer))
-					return result;
-				answers ~= answer;
-			}
-			responses = answers;
-			requestState = result.requestState;
-		}
-		return result;
+		return mrtrLoop!GetPromptResult("prompts/get", logLevel,
+				(responses, requestState) => buildGetPromptParams(name,
+					arguments, progressToken, responses, requestState));
 	}
 
 	/// Build the `prompts/get` params, optionally attaching a progress token.
