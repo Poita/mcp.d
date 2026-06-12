@@ -9,7 +9,6 @@ import mcp.protocol.jsonhelpers : getOr, tryGet;
 import mcp.protocol.tasks : Task, makeCreateTaskResult, isCreateTaskResult;
 import mcp.protocol.modern : InputRequest, emitInputRequired,
 	parseInputRequired, CacheHint, parseCacheHint, withCache;
-import mcp.client.client : ProgressToken;
 
 @safe:
 
@@ -4864,6 +4863,40 @@ unittest  // ResourceUpdatedNotification carries the method-name constant
 	assert(ResourceUpdatedNotification.methodName == "notifications/resources/updated");
 }
 
+/// A progress token attached to an outgoing request so the receiver may emit
+/// `notifications/progress` for it. Per basic/utilities/progress, "Progress
+/// tokens MUST be a string or integer value" and "MUST be unique across all
+/// active requests". Construct one from either a `string` or a `long`; an
+/// unset token is omitted from the request.
+struct ProgressToken
+{
+	private Json value_ = Json.undefined;
+
+	/// A string-valued progress token.
+	this(string token) @safe nothrow
+	{
+		value_ = Json(token);
+	}
+
+	/// An integer-valued progress token.
+	this(long token) @safe nothrow
+	{
+		value_ = Json(token);
+	}
+
+	/// Whether a token has been set (false for a default-constructed token).
+	bool isSet() const @safe nothrow
+	{
+		return value_.type != Json.Type.undefined;
+	}
+
+	/// The token as JSON (a string or integer), or `Json.undefined` when unset.
+	Json toJson() const @safe nothrow
+	{
+		return value_;
+	}
+}
+
 /// A typed `notifications/progress` payload, per basic/utilities/progress: the
 /// notification carries `params: {progressToken, progress, total?, message?}`.
 /// `progressToken` correlates the update to the request that supplied it (a
@@ -4999,8 +5032,6 @@ unittest  // ProgressNotification.progressTokenString returns a string token, el
 
 unittest  // ProgressNotification.matches a string ProgressToken
 {
-	import mcp.client.client : ProgressToken;
-
 	ProgressNotification n;
 	n.progressToken = Json("abc");
 	assert(n.matches(ProgressToken("abc")));
@@ -5010,8 +5041,6 @@ unittest  // ProgressNotification.matches a string ProgressToken
 
 unittest  // ProgressNotification.matches an integer ProgressToken
 {
-	import mcp.client.client : ProgressToken;
-
 	ProgressNotification n;
 	n.progressToken = Json(42);
 	assert(n.matches(ProgressToken(42)));

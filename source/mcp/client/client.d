@@ -22,39 +22,10 @@ import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
 import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 import mcp.client.cache : CacheStore, InMemoryCacheStore, CacheKey, CacheEntry, noCache;
 
-/// A progress token attached to an outgoing request so the server may emit
-/// `notifications/progress` for it. Per basic/utilities/progress, "Progress
-/// tokens MUST be a string or integer value" and "MUST be unique across all
-/// active requests". Construct one from either a `string` or a `long`; an
-/// unset token is omitted from the request.
-struct ProgressToken
-{
-	private Json value_ = Json.undefined;
-
-	/// A string-valued progress token.
-	this(string token) @safe nothrow
-	{
-		value_ = Json(token);
-	}
-
-	/// An integer-valued progress token.
-	this(long token) @safe nothrow
-	{
-		value_ = Json(token);
-	}
-
-	/// Whether a token has been set (false for a default-constructed token).
-	bool isSet() const @safe nothrow
-	{
-		return value_.type != Json.Type.undefined;
-	}
-
-	/// The token as JSON (a string or integer), or `Json.undefined` when unset.
-	Json toJson() const @safe nothrow
-	{
-		return value_;
-	}
-}
+/// `ProgressToken` lives in `mcp.protocol.types` (it is shared protocol
+/// vocabulary, not a client-only concept); re-exported here so existing
+/// `mcp.client.client : ProgressToken` imports keep working.
+public import mcp.protocol.types : ProgressToken;
 
 /// How a cacheable request verb interacts with the client's response cache.
 /// Only meaningful on the six cacheable reads (`listTools`, `listResources`,
