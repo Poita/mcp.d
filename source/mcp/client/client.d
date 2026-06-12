@@ -297,6 +297,13 @@ final class McpClient : ClientProtocol
 	private ServerCapabilities serverCapabilities_;
 	private Implementation serverInfo_;
 	private Nullable!string serverInstructions_;
+	// The most recent `DiscoverResult` this client obtained from (or was handed
+	// for) `server/discover`, exposed via `discoverResult()` so a caller can
+	// persist it (it round-trips through `toJson`/`fromJson`) and feed it back to
+	// `connect(DiscoverResult)` for a zero-round-trip reconnect. Populated by the
+	// `discover()` verb, by `connect()`'s probe path, and by the
+	// `connect(DiscoverResult)` overload. Null until any of those has run.
+	private Nullable!DiscoverResult discoverResult_;
 	// Upper bound on the number of pages any auto-paginating list call will
 	// follow before giving up, guarding against a peer that returns a
 	// non-progressing or cycling `nextCursor` (which would otherwise loop and
@@ -542,8 +549,10 @@ final class McpClient : ClientProtocol
 	/// `opts.cacheMode` overrides.
 	DiscoverResult discover(RequestOptions opts = RequestOptions.init) @safe
 	{
-		return cachedFetch!DiscoverResult(CacheKey("server/discover", ""), opts.cacheMode,
+		auto result = cachedFetch!DiscoverResult(CacheKey("server/discover", ""), opts.cacheMode,
 				() @safe => DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject)));
+		discoverResult_ = result;
+		return result;
 	}
 
 	/// `server/discover` self-advertising draft framing, used by `connect()` to
@@ -651,6 +660,7 @@ final class McpClient : ClientProtocol
 			// would fall back to the server's stable default and be rejected.
 			disc = discoverProbe();
 			haveDisc = true;
+			discoverResult_ = disc;
 			serverVersions = disc.protocolVersions;
 		}
 		catch (LegacyFallbackException)
@@ -715,6 +725,52 @@ final class McpClient : ClientProtocol
 			useModern = false;
 			negotiated = chosen;
 			initialize(chosen.toWire); // modern discovery, pre-draft version
+		}
+		return negotiated;
+	}
+
+	/// Connect using a `server/discover` result obtained earlier, performing the
+	/// same version selection as `connect()` over `prior.protocolVersions` but
+	/// WITHOUT any network probe. This is the zero-round-trip reconnect: a caller
+	/// that persisted a previous session's `discoverResult()` (it round-trips via
+	/// `DiscoverResult.toJson`/`fromJson`) can rehydrate it and reconnect without
+	/// re-issuing `server/discover`.
+	///
+	/// When the mutually-chosen version is modern, modern (stateless draft) framing
+	/// is enabled and `prior`'s capabilities/serverInfo/instructions are adopted
+	/// directly — zero round trips. When the chosen version is stable, modern
+	/// framing is cleared and a single `initialize(chosen.toWire)` handshake runs
+	/// (one round trip), because a stable session still requires the handshake.
+	/// Throws `McpException(unsupportedProtocolVersion)` when there is no mutually
+	/// supported version in `prior.protocolVersions`. Records `prior` as the
+	/// client's `discoverResult()`.
+	ProtocolVersion connect(DiscoverResult prior) @safe
+	{
+		discoverResult_ = prior;
+
+		ProtocolVersion chosen;
+		if (!selectMutualVersion(prior.protocolVersions, chosen))
+			throw new McpException(ErrorCode.unsupportedProtocolVersion,
+					"No mutually supported protocol version");
+
+		if (chosen.isModern)
+		{
+			useModern = true;
+			negotiated = chosen;
+			transport.setDraftProtocol(true);
+			// No `initialize` follows on the stateless draft path, so adopt what the
+			// prior discovery advertised directly — no `server/discover` round-trip.
+			serverCapabilities_ = prior.capabilities;
+			serverInfo_ = prior.serverInfo;
+			serverInstructions_ = prior.instructions;
+		}
+		else
+		{
+			// The chosen version is stable: clear any modern framing and run the
+			// `initialize` handshake under that stable version (one round trip).
+			useModern = false;
+			negotiated = chosen;
+			initialize(chosen.toWire);
 		}
 		return negotiated;
 	}
@@ -2033,6 +2089,20 @@ final class McpClient : ClientProtocol
 	Nullable!string serverInstructions() @safe nothrow
 	{
 		return serverInstructions_;
+	}
+
+	/// The most recent `server/discover` result this client obtained or adopted —
+	/// from the `discover()` verb, from `connect()`'s probe, or handed to the
+	/// `connect(DiscoverResult)` overload. Null before any of those has run.
+	///
+	/// `DiscoverResult` round-trips through `toJson`/`fromJson`, so the intended
+	/// caching pattern is to persist this value after a first `connect()` (e.g.
+	/// `client.discoverResult().get.toJson`) and, on a later session, rehydrate it
+	/// (`DiscoverResult.fromJson(...)`) and pass it to `connect(prior)` to
+	/// reconnect without any `server/discover` round-trip.
+	Nullable!DiscoverResult discoverResult() @safe nothrow
+	{
+		return discoverResult_;
 	}
 
 	/// Cancel an in-flight request by sending `notifications/cancelled` for
@@ -5881,6 +5951,85 @@ unittest  // connect() populates serverCapabilities/serverInfo/serverInstruction
 	assert(c.serverInfo().version_ == "2.0");
 	assert(!c.serverInstructions().isNull);
 	assert(c.serverInstructions().get == "hello");
+}
+
+version (unittest)
+{
+	// A `DiscoverResult` advertising `versions`, plus a fixed identity/instructions,
+	// for the `connect(DiscoverResult)` tests.
+	private DiscoverResult fixtureDiscover(string[] versions) @safe
+	{
+		DiscoverResult d;
+		d.protocolVersions = versions;
+		d.serverInfo = Implementation("cached-srv", "3.1");
+		d.instructions = "from cache";
+		return d;
+	}
+}
+
+unittest  // connect(DiscoverResult) adopts a draft session with zero round trips
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	int calls;
+	transport.responder = (Json message, long expectId) @safe {
+		calls++;
+		return Json.emptyObject;
+	};
+
+	auto chosen = c.connect(fixtureDiscover([ProtocolVersion.modern.toWire]));
+	assert(chosen == ProtocolVersion.modern);
+	assert(c.protocolVersion() == ProtocolVersion.modern);
+	// No server/discover (or any) round-trip was made: the prior result was adopted.
+	assert(calls == 0, "draft adoption must not hit the network");
+	// The prior discovery's identity/instructions were adopted directly.
+	assert(c.serverInfo().name == "cached-srv");
+	assert(c.serverInfo().version_ == "3.1");
+	assert(!c.serverInstructions().isNull && c.serverInstructions().get == "from cache");
+	// The adopted result is exposed via discoverResult().
+	assert(!c.discoverResult().isNull);
+	assert(c.discoverResult().get.protocolVersions == [
+		ProtocolVersion.modern.toWire
+	]);
+}
+
+unittest  // connect(DiscoverResult) falls back to an initialize handshake on a stable version
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	int initCalls;
+	transport.responder = (Json message, long expectId) @safe {
+		assert(message["method"].get!string == "initialize",
+				"a stable-version reconnect must run the initialize handshake");
+		initCalls++;
+		Json r = Json.emptyObject;
+		r["protocolVersion"] = ProtocolVersion.v2025_03_26.toWire;
+		r["capabilities"] = Json.emptyObject;
+		Json info = Json.emptyObject;
+		info["name"] = "stable-srv";
+		info["version"] = "1.0";
+		r["serverInfo"] = info;
+		return r;
+	};
+
+	auto chosen = c.connect(fixtureDiscover([ProtocolVersion.v2025_03_26.toWire]));
+	assert(chosen == ProtocolVersion.v2025_03_26);
+	assert(c.protocolVersion() == ProtocolVersion.v2025_03_26);
+	assert(initCalls == 1, "exactly one initialize round trip");
+	assert(c.serverInfo().name == "stable-srv");
+}
+
+unittest  // connect(DiscoverResult) throws when no version is mutually supported
+{
+	import std.exception : collectException;
+
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	auto e = collectException!McpException(c.connect(fixtureDiscover([
+		"1999-01-01"
+	])));
+	assert(e !is null);
+	assert(e.code == ErrorCode.unsupportedProtocolVersion);
 }
 
 unittest  // MRTR: getPrompt drives a retry loop when the server returns inputRequired

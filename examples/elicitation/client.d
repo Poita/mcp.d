@@ -127,12 +127,16 @@ int main(string[] args) @safe
 private int run(McpClient delegate() @safe makeClient) @safe
 {
 	// ---- A. DISCOVERY -----------------------------------------------------
+	// This example deliberately uses the stable initialize() handshake, not
+	// connect(): server->client elicitation needs a stateful session, and
+	// connect() against this SDK server would negotiate the stateless draft
+	// (where ctx.elicit is unavailable and tools surface inputRequired instead).
 	{
 		auto client = makeClient();
 		scope (exit)
 			client.close();
-		auto init = client.initialize();
-		checkEq(init.serverInfo.name, "elicitation-example", "server name");
+		client.initialize();
+		checkEq(client.serverInfo().name, "elicitation-example", "server name");
 
 		auto tools = client.listTools().tools;
 		auto names = tools.map!(t => t.name).array;

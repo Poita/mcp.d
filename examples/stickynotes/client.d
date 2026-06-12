@@ -126,10 +126,15 @@ private int run(McpClient delegate() @safe makeClient) @safe
 	// the elicitation capability at negotiation time; the per-scenario handlers
 	// below reassign this delegate. Without a handler at init the server would
 	// (correctly) refuse to elicit later.
+	// NOTE: this example deliberately uses the stable initialize() handshake, not
+	// connect(): server->client elicitation needs a stateful session, and
+	// connect() against this SDK server would negotiate the stateless draft
+	// (where ctx.elicit is unavailable and tools surface inputRequired instead).
 	client.onElicitation = (ElicitParams p) @safe { return ElicitResult.cancel(); };
-	auto init = client.initialize();
-	checkEq(init.serverInfo.name, "stickynotes-example", "server name");
-	check(!init.capabilities.resources.isNull && init.capabilities.resources.get.listChanged,
+	client.initialize();
+	checkEq(client.serverInfo().name, "stickynotes-example", "server name");
+	auto serverCaps = client.serverCapabilities();
+	check(!serverCaps.resources.isNull && serverCaps.resources.get.listChanged,
 			"server should advertise resources.listChanged");
 
 	auto names = client.listTools().tools.map!(t => t.name).array;

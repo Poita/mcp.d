@@ -86,8 +86,8 @@ int main(string[] args) @safe
 		scope (exit)
 			client.close();
 
-		auto init = client.initialize();
-		checkEq(init.serverInfo.name, "tools-example", "serverInfo.name");
+		client.connect();
+		checkEq(client.serverInfo().name, "tools-example", "serverInfo.name");
 
 		// --- tools/list -----------------------------------------------------
 		auto tools = client.listTools().tools;

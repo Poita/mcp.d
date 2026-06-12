@@ -28,7 +28,10 @@
  *     the JSON text mirror;
  *   - `readResource()` returns the expected text and the per-resource draft
  *     cache hint (`ttl` / `cacheScope`);
- *   - a bad `tools/call` returns the expected JSON-RPC error code.
+ *   - a bad `tools/call` returns the expected JSON-RPC error code;
+ *   - a second client reconnects with ZERO round trips via
+ *     `connect(discoverResult())` (rehydrated through `DiscoverResult`
+ *     `toJson`/`fromJson`) — no `server/discover` — and still serves a call.
  *
  * On success it prints an "OK:" summary and the scenario returns 0; on any
  * mismatch the shared `check`/`checkEq` print a `FAIL:` line and throw, so
@@ -89,14 +92,19 @@ int main(string[] args) @safe
 		// connectFromArgs picks HTTP (`--http <url>`/`--url <url>`) or spawns the
 		// sibling `stateless-draft-server` over stdio. The client is not yet
 		// initialized; the draft path uses enableModern()/connect() below.
-		auto client = connectFromArgs(args, "stateless-draft-server");
+		McpClient makeClient() @safe
+		{
+			return connectFromArgs(args, "stateless-draft-server");
+		}
+
+		auto client = makeClient();
 		scope (exit)
 			client.close();
-		return runE2E(client, overHttp);
+		return runE2E(client, &makeClient, overHttp);
 	});
 }
 
-private int runE2E(McpClient client, bool overHttp) @safe
+private int runE2E(McpClient client, McpClient delegate() @safe makeClient, bool overHttp) @safe
 {
 	// --- 1. server/discover (stateless, up-front version negotiation) ---------
 	client.enableModern();
@@ -153,6 +161,31 @@ private int runE2E(McpClient client, bool overHttp) @safe
 	check(threw, "calling an unknown tool should throw an McpException");
 	checkEq(gotCode, cast(int) ErrorCode.invalidParams, "unknown-tool error code");
 
+	// --- 7. zero-RTT reconnect via connect(DiscoverResult) --------------------
+	// The first client persisted its discovery; a second client rehydrates it and
+	// reconnects with NO server/discover round-trip. We round-trip the result
+	// through toJson/fromJson to model loading it from a cache.
+	check(!client.discoverResult().isNull,
+			"client.discoverResult() should be populated after connect()");
+	auto persisted = DiscoverResult.fromJson(client.discoverResult().get.toJson());
+
+	auto second = makeClient();
+	scope (exit)
+		second.close();
+	// No enableModern(), no discover(): connect(prior) selects the version from the
+	// persisted result alone and adopts modern framing with zero round trips.
+	auto reNegotiated = second.connect(persisted);
+	checkEq(reNegotiated, ProtocolVersion.modern, "connect(DiscoverResult) negotiated version");
+	checkEq(second.protocolVersion(), ProtocolVersion.modern,
+			"reconnected client.protocolVersion()");
+	// The adopted identity came straight from the persisted discovery (no network).
+	checkEq(second.serverInfo().name, "stateless-draft-server",
+			"reconnected serverInfo adopted from the persisted discovery");
+	// It serves a real call over the adopted draft session.
+	auto reAdd = second.callTool("add", addArgs(1, 1));
+	check(!reAdd.isError, "reconnected client should serve a tools/call");
+	checkEq(reAdd.structuredContentAs!SumResult.sum, 2L, "reconnected add(1,1) should be 2");
+
 	// Transport teardown is owned by main's scope(exit) client.close() (the stdio
 	// shutdown sequence on the spawned subprocess), so don't close here.
 
@@ -160,6 +193,7 @@ private int runE2E(McpClient client, bool overHttp) @safe
 	printLine("OK: stateless-draft e2e passed over " ~ transport
 			~ " — discover(2026-07-28), connect()=draft, "
 			~ "listTools[add] cache(5000/public), add->{\"sum\":42} (+structuredContent), "
-			~ "greeting resource cache(9000/private), unknown-tool=-32602.");
+			~ "greeting resource cache(9000/private), unknown-tool=-32602, "
+			~ "zero-RTT reconnect via connect(discoverResult).");
 	return 0;
 }
