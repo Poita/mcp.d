@@ -6026,7 +6026,7 @@ unittest  // connect(DiscoverResult) throws when no version is mutually supporte
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
 	auto e = collectException!McpException(c.connect(fixtureDiscover([
-				"1999-01-01"
+		"1999-01-01"
 	])));
 	assert(e !is null);
 	assert(e.code == ErrorCode.unsupportedProtocolVersion);
