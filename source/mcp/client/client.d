@@ -15,7 +15,6 @@ import mcp.protocol.types;
 import mcp.protocol.tasks : Task, TaskStatus;
 import mcp.protocol.sampling : validateSamplingMessages, CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.modern;
-import mcp.server.context : logLevelRank;
 import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.http_transport : HttpClientTransport, LegacyFallbackException;
 import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
