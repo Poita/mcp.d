@@ -1517,3 +1517,94 @@ unittest  // verifyOrInvalid returns the verifier's result when no exception is 
 	auto info = verifyOrInvalid(() @safe => ok);
 	assert(info.valid && info.subject == "alice");
 }
+
+// ---------------------------------------------------------------------------
+// Negative-branch coverage for the verification core and JWKS helpers.
+// ---------------------------------------------------------------------------
+
+unittest  // a token whose nbf is in the future is rejected (not-yet-valid)
+{
+	JwtVerifierConfig cfg;
+	// Valid exp, but nbf is well beyond now + skew: the token is not yet valid.
+	auto payload = parseJsonString(`{"sub":"ec-user","exp":1700100000,"nbf":1700090000}`);
+	auto ti = validateClaims(cfg, payload, 1_700_001_000);
+	assert(!ti.valid);
+}
+
+unittest  // verifyToken rejects a well-formed token when no candidate key exists
+{
+	JwtVerifierConfig cfg;
+	// A structurally valid ES256 token carrying a kid, but the key source offers
+	// nothing and no static PEM is pinned, so there are zero candidate keys.
+	auto token = makeEs256(`{"sub":"x","exp":1700100000}`, "unknown-kid");
+	auto ti = verifyToken(cfg, token, new NoKeys(), 1_700_001_000);
+	assert(!ti.valid);
+}
+
+unittest  // verifyJws fails closed on an unparseable PEM, unsupported alg, or bad ES256 sig length
+{
+	const input = cast(const(ubyte)[]) "header.payload";
+
+	// An unparseable public key yields no EVP_PKEY -> false.
+	assert(!verifyJws("ES256", input, cast(const(ubyte)[]) "sig", "not-a-pem"));
+
+	// An algorithm other than RS256/ES256 is refused outright.
+	assert(!verifyJws("HS256", input, cast(const(ubyte)[]) "sig", testEcPubPem));
+
+	// An ES256 signature that is not exactly 64 bytes cannot be DER-encoded.
+	assert(!verifyJws("ES256", input, cast(const(ubyte)[])[1, 2, 3], testEcPubPem));
+
+	// alg<->key family binding: ES256 alg with an RSA-shaped expectation is covered
+	// elsewhere; here an RS256 alg verified against an EC key is rejected.
+	assert(!verifyJws("RS256", input, cast(const(ubyte)[]) "sig", testEcPubPem));
+}
+
+unittest  // parseJwks tolerates a non-object root, a non-array keys member, and non-object entries
+{
+	assert(parseJwks(`"not an object"`).length == 0);
+	assert(parseJwks(`{"keys":"not-an-array"}`).length == 0);
+	// Non-object array entries are skipped, leaving no usable keys.
+	assert(parseJwks(`{"keys":[1, "two", null]}`).length == 0);
+}
+
+unittest  // jwkToPem returns null for an unsupported key type and for malformed RSA/EC material
+{
+	// Unsupported kty (neither RSA nor EC).
+	Jwk oct;
+	oct.kty = "oct";
+	assert(jwkToPem(oct).length == 0);
+
+	// RSA JWK missing modulus/exponent.
+	Jwk rsa;
+	rsa.kty = "RSA";
+	assert(jwkToPem(rsa).length == 0);
+
+	// EC JWK missing coordinates.
+	Jwk ecNoXy;
+	ecNoXy.kty = "EC";
+	ecNoXy.crv = "P-256";
+	assert(jwkToPem(ecNoXy).length == 0);
+
+	// EC JWK with an unsupported curve.
+	Jwk ecBadCrv;
+	ecBadCrv.kty = "EC";
+	ecBadCrv.crv = "P-192";
+	ecBadCrv.x = testEcX;
+	ecBadCrv.y = testEcY;
+	assert(jwkToPem(ecBadCrv).length == 0);
+}
+
+unittest  // JwksCache: an empty-URI cache that was never loaded offers no keys
+{
+	auto cache = new JwksCache("", 300.seconds);
+	assert(cache.keysFor("any-kid").length == 0);
+}
+
+unittest  // JwksCache.load drops a JWK that cannot be converted to a PEM (sub-2048-bit RSA)
+{
+	// A usable-for-sig RSA JWK whose modulus is far below the 2048-bit floor is
+	// rejected by jwkToPem, so load() retains no keys from it.
+	auto cache = new JwksCache("", 300.seconds);
+	cache.load(`{"keys":[{"kty":"RSA","kid":"weak","n":"AQAB","e":"AQAB"}]}`);
+	assert(cache.keysFor("weak").length == 0);
+}

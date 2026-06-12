@@ -1131,3 +1131,58 @@ unittest  // buildHostHeader brackets IPv6 literals on the default port (RFC 723
 	assert(buildHostHeader("example.com", 0, 443) == "example.com");
 	assert(buildHostHeader("example.com", 8443, 443) == "example.com:8443");
 }
+
+// ---------------------------------------------------------------------------
+// Edge-case coverage for the numeric-IPv4 and IPv6-literal parsers. These guard
+// the SSRF classifier against malformed / overflowing / alternately-encoded
+// literals, all of which must fail closed (never classified public).
+// ---------------------------------------------------------------------------
+
+unittest  // canonicalizeNumericIpv4 rejects overflow / malformed parts and decodes uppercase hex
+{
+	ubyte[4] oct;
+
+	// Empty input is not a literal.
+	assert(!canonicalizeNumericIpv4("", oct));
+	// Uppercase hex digits decode (single-part inet_aton form 0xAB -> 0.0.0.171).
+	assert(canonicalizeNumericIpv4("0xAB", oct));
+	assert(oct == [0, 0, 0, 0xAB]);
+	// Each numeric base can overflow the 32-bit address space.
+	assert(!canonicalizeNumericIpv4("0xFFFFFFFFF", oct)); // hex > 2^32-1
+	assert(!canonicalizeNumericIpv4("0777777777777", oct)); // octal > 2^32-1
+	assert(!canonicalizeNumericIpv4("99999999999", oct)); // decimal > 2^32-1
+	// Trailing junk and a trailing dot are both rejected.
+	assert(!canonicalizeNumericIpv4("1a", oct));
+	assert(!canonicalizeNumericIpv4("1.2.", oct));
+	// Short-form part-range violations (2-part: b > 24 bits; 3-part: c > 16 bits).
+	assert(!canonicalizeNumericIpv4("0xFF.0xFFFFFFFF", oct));
+	assert(!canonicalizeNumericIpv4("1.2.0x1FFFF", oct));
+	// A well-formed dotted quad still decodes.
+	assert(canonicalizeNumericIpv4("192.168.1.1", oct));
+	assert(oct == [192, 168, 1, 1]);
+}
+
+unittest  // malformed IPv6 literals fail closed; an IPv4-mapped public address classifies public
+{
+	// Every malformed literal must be treated as unsafe (never public).
+	static immutable string[] bad = [
+		"[%eth0]", // empty after zone-id strip
+		"[::1.2.3.999]", // embedded-IPv4 octet out of range
+		"[::1.2..4]", // empty embedded-IPv4 octet
+		"[::1.2.3.4.5]", // too many embedded-IPv4 octets
+		"[::1.2.3x4]", // non-dot separator in the embedded-IPv4 tail
+		"[::1.2.3]", // too few embedded-IPv4 octets
+		"[1:2:3]", // no "::" but the hextet area is underfilled
+		"[:::2]", // ":::" — a hextet group adjacent to "::"
+		"[g::1]", // invalid hextet left of "::"
+		"[::g]", // invalid hextet right of "::"
+		"[1:2:3:4:5:6:7:8::9]", // more than 16 bytes of hextets
+	];
+	foreach (h; bad)
+		assert(classifyHostLexical(h) == AddressClass.privateOrLinkLocal,
+				"malformed IPv6 literal must fail closed: " ~ h);
+
+	// A fully-specified (no "::") public global-unicast literal fills the entire
+	// hextet area and classifies public.
+	assert(classifyHostLexical("[2606:4700:4700:1:2:3:4:5]") == AddressClass.public_);
+}
