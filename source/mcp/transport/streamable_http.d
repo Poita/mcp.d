@@ -187,7 +187,7 @@ void mountMcp(URLRouter router, McpServer server,
 			return;
 		handlePost(server, coord, sessions, token, req, res);
 	});
-	auto push = server.serverPushChannel(coord);
+	auto push = ensurePushChannel(server, coord);
 	router.get(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		if (!guardOrigin(req, res, opts))
 			return;
@@ -1175,7 +1175,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 
 	auto writeFrame = sseFrameWriter(res);
 
-	auto push = server.serverPushChannel(coord);
+	auto push = ensurePushChannel(server, coord);
 	// The listen request's id becomes the stream's subscriptionId: every
 	// notification delivered to this listener (including the leading
 	// acknowledgement) is stamped with it in
@@ -3242,7 +3242,7 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
 	// filter — exactly as handleListenStream does) and receives the ack. Delivery
 	// onto the stream is decided by that filter.
 	auto coord = new StreamCoordinator;
-	auto push = server.serverPushChannel(coord);
+	auto push = ensurePushChannel(server, coord);
 	string[] frames;
 	SubscriptionFilter streamFilter;
 	streamFilter.active = true;

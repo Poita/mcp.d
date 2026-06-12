@@ -15,7 +15,14 @@ import mcp.protocol.modern : withSubscriptionId;
 import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
 import mcp.server.context;
 import mcp.server.connection : ConnectionState;
+import mcp.server.push : PushChannel;
+import mcp.server.server : McpServer;
 import mcp.auth.resource_server : TokenInfo;
+
+/// `SubscriptionFilter` lives in `mcp.server.push` (the server core consumes it
+/// without depending on the transport); re-exported here so existing
+/// `mcp.transport.sse_context : SubscriptionFilter` imports keep working.
+public import mcp.server.push : SubscriptionFilter;
 
 /// The composite key under which a pending server->client request's waiter is
 /// tracked: the session/connection token the request was issued to, paired with
@@ -334,62 +341,6 @@ unittest  // resolve rejects a fractional float id (not a valid JSON-RPC integer
 	coord.cancel(id); // clean up the unresolved waiter
 }
 
-/// The per-stream opt-in a client expressed when it opened a draft
-/// `subscriptions/listen` stream (draft basic/utilities/subscriptions §Notification
-/// Filter). It records exactly which change-notification types this one stream asked
-/// for, so the server can honour the MUST NOT: "The server MUST NOT send notification
-/// types the client has not explicitly requested." With Multiple Concurrent
-/// Subscriptions each listen stream carries its own filter (keyed by its listen
-/// request id), so a notification is delivered only to streams that opted into it —
-/// never to a concurrent stream that requested a different type.
-///
-/// `active` distinguishes a real listen-stream filter (an opted-in draft stream) from
-/// the zero value used for plain GET streams that did not go through `subscriptions/
-/// listen`; an inactive filter accepts everything, so the plain GET stream still obeys
-/// only the transport's Multiple Connections rule.
-struct SubscriptionFilter
-{
-	bool active; /// true once this is a real `subscriptions/listen` filter
-	bool toolsListChanged;
-	bool promptsListChanged;
-	bool resourcesListChanged;
-	bool resourceSubscriptions; /// opted into `notifications/resources/updated`
-	string[] resourceUris; /// the exact URIs opted into for `notifications/resources/updated`
-
-	/// Whether a notification with this JSON-RPC `method` (and, for
-	/// `notifications/resources/updated`, this resource `uri`) is one this stream
-	/// explicitly requested. An inactive filter (a plain GET stream) accepts every
-	/// notification; an active filter accepts only its opted-in types. Notification
-	/// methods that are not subscription-gated (progress, logging, elicitation
-	/// completion, server->client requests, etc.) are always accepted — the draft
-	/// filter governs only the four list/subscription change types.
-	bool accepts(string method, string uri = "") const @safe
-	{
-		if (!active)
-			return true;
-		switch (method)
-		{
-		case "notifications/tools/list_changed":
-			return toolsListChanged;
-		case "notifications/prompts/list_changed":
-			return promptsListChanged;
-		case "notifications/resources/list_changed":
-			return resourcesListChanged;
-		case "notifications/resources/updated":
-			import std.algorithm : canFind;
-
-			if (!resourceSubscriptions)
-				return false;
-			// A blanket boolean opt-in (no per-URI list) accepts any URI;
-			// otherwise only the explicitly named URIs are accepted.
-			return resourceUris.length == 0 || resourceUris.canFind(uri);
-		default:
-			// Not a subscription-gated change notification: always deliverable.
-			return true;
-		}
-	}
-}
-
 unittest  // failPending is idempotent and leaves the awaiter to clean the table up
 {
 	// Failing the same id twice must not throw: the second call simply re-marks an
@@ -401,61 +352,6 @@ unittest  // failPending is idempotent and leaves the awaiter to clean the table
 
 	coord.failPending(id, internalError("first"));
 	coord.failPending(id, internalError("second")); // idempotent: no throw, no crash
-}
-
-unittest  // an inactive filter (plain GET stream) accepts every notification type
-{
-	SubscriptionFilter f;
-	assert(f.accepts("notifications/tools/list_changed"));
-	assert(f.accepts("notifications/resources/updated", "file:///x"));
-	assert(f.accepts("notifications/message"));
-}
-
-unittest  // an active filter accepts only the change types it opted into
-{
-	SubscriptionFilter f;
-	f.active = true;
-	f.toolsListChanged = true;
-	assert(f.accepts("notifications/tools/list_changed"));
-	assert(!f.accepts("notifications/prompts/list_changed"));
-	assert(!f.accepts("notifications/resources/list_changed"));
-	assert(!f.accepts("notifications/resources/updated", "file:///x"));
-	// Non-gated notifications still flow regardless of opt-in.
-	assert(f.accepts("notifications/message"));
-	assert(f.accepts("notifications/progress"));
-}
-
-unittest  // resourceSubscriptions matches only the opted-in URIs
-{
-	SubscriptionFilter f;
-	f.active = true;
-	f.resourceSubscriptions = true;
-	f.resourceUris = ["file:///project/config.json"];
-	assert(f.accepts("notifications/resources/updated", "file:///project/config.json"));
-	assert(!f.accepts("notifications/resources/updated", "file:///other"));
-
-	// A blanket boolean opt-in (no per-URI list) accepts any resource URI.
-	SubscriptionFilter blanket;
-	blanket.active = true;
-	blanket.resourceSubscriptions = true;
-	assert(blanket.accepts("notifications/resources/updated", "file:///x"));
-
-	// Without resourceSubscriptions opt-in, resources/updated is rejected.
-	SubscriptionFilter none;
-	none.active = true;
-	assert(!none.accepts("notifications/resources/updated", "file:///x"));
-}
-
-unittest  // a per-URI filter must reject a notification that carries no URI
-{
-	// A server emitting notifications/resources/updated with an empty uri (e.g. a
-	// bug upstream or a server that omits the field) must not bypass the per-URI
-	// filter: an empty uri is not in the opted-in list and must not be delivered.
-	SubscriptionFilter f;
-	f.active = true;
-	f.resourceSubscriptions = true;
-	f.resourceUris = ["file:///project/config.json"];
-	assert(!f.accepts("notifications/resources/updated", ""));
 }
 
 /// A long-lived server->client SSE channel for *unsolicited* traffic — the
@@ -482,7 +378,21 @@ unittest  // a per-URI filter must reject a notification that carries no URI
 /// connection. Like the rest of the SDK, this assumes vibe.d's default
 /// single-threaded event loop; running the router with `HTTPServerOption.distribute`
 /// or worker threads is unsupported.
-final class ServerPushChannel
+/// The mount's `ServerPushChannel` for `server`, created and attached to the
+/// server's transport-agnostic `PushChannel` seam (sharing `coord`) on first
+/// use, so the server's `notify*`/`ping*` APIs deliver onto it. Returns the
+/// concrete channel so the transport can register stream listeners; a channel
+/// attached by an earlier mount is reused (its coordinator wins).
+ServerPushChannel ensurePushChannel(McpServer server, StreamCoordinator coord) @safe
+{
+	if (auto existing = cast(ServerPushChannel) server.serverPushChannel())
+		return existing;
+	auto ch = new ServerPushChannel(coord);
+	server.attachPushChannel(ch);
+	return ch;
+}
+
+final class ServerPushChannel : PushChannel
 {
 	/// A connected GET listener: an opaque id plus the writer that delivers a
 	/// pre-framed SSE block to it. `subscriptionId`, when non-empty, is the

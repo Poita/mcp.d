@@ -18,7 +18,12 @@ import mcp.server.task_store : TaskStore, InMemoryTaskStore;
 import mcp.server.task_runtime : TaskRuntime, TaskOptions;
 import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher,
 	InProcessTaskDispatcher, SyncTaskDispatcher, runTaskExecutor;
-import mcp.transport.sse_context : ServerPushChannel, StreamCoordinator, SubscriptionFilter;
+import mcp.server.push : PushChannel, SubscriptionFilter;
+
+// The push-integration unittests below exercise the server seam against the
+// real Streamable HTTP channel; the library build itself has no transport
+// dependency.
+version (unittest) import mcp.transport.sse_context : StreamCoordinator, ensurePushChannel;
 
 @safe:
 
@@ -420,7 +425,7 @@ final class McpServer
 	// truth for what a connection is listening for; the acknowledgement echo is
 	// derived from it via `acknowledgedSubsetFor`.
 	private SubscriptionFilter lastListenFilter_;
-	private ServerPushChannel pushChannel;
+	private PushChannel pushChannel;
 	// The stdio `subscriptions/listen` delivery channel (draft only). On the
 	// stdio transport every message shares the single stdout channel, so there
 	// is no separate SSE push stream: when a draft `subscriptions/listen`
@@ -1262,24 +1267,23 @@ final class McpServer
 		return activeConnection.logLevel;
 	}
 
-	/// The server->client push channel for *unsolicited* traffic — the messages
-	/// a server sends on the standalone SSE stream a client opens with an HTTP
-	/// GET to the MCP endpoint (basic/transports §Listening for Messages from the
-	/// Server), outside any in-flight POST. The Streamable HTTP transport creates
-	/// it (sharing the supplied `StreamCoordinator`) when the mount is set up;
-	/// it is created lazily on first access so callers can hold a reference
-	/// before mounting. Use `notify` (or the returned channel's `emit`) to deliver
-	/// notifications/requests to every connected GET listener.
-	ServerPushChannel serverPushChannel(StreamCoordinator coord) @safe
+	/// Attach the server->client push channel for *unsolicited* traffic — the
+	/// messages a server sends on the standalone SSE stream a client opens with
+	/// an HTTP GET to the MCP endpoint (basic/transports §Listening for Messages
+	/// from the Server), outside any in-flight POST. The Streamable HTTP
+	/// transport creates one channel per mount and attaches it here (via
+	/// `ensurePushChannel`); the `notify*`/`ping*` APIs deliver through it.
+	/// Attaching when a channel is already present is a no-op, so a second mount
+	/// of the same server reuses the first mount's channel.
+	void attachPushChannel(PushChannel channel) @safe
 	{
 		if (pushChannel is null)
-			pushChannel = new ServerPushChannel(coord);
-		return pushChannel;
+			pushChannel = channel;
 	}
 
-	/// The active server->client push channel, or null if none has been created
-	/// (e.g. the server is not mounted on a Streamable HTTP transport).
-	ServerPushChannel serverPushChannel() @safe
+	/// The attached server->client push channel, or null if none has been
+	/// attached (e.g. the server is not mounted on a Streamable HTTP transport).
+	PushChannel serverPushChannel() @safe
 	{
 		return pushChannel;
 	}
@@ -3664,7 +3668,7 @@ unittest  // pingClient drives a ping on the push channel and awaits the empty r
 
 	auto srv = makeTestServer();
 	auto coord = new StreamCoordinator;
-	auto ch = srv.serverPushChannel(coord); // create + attach the GET push channel
+	auto ch = ensurePushChannel(srv, coord); // create + attach the GET push channel
 	string frame;
 	ch.addListener((string f) @safe { frame = f; });
 
@@ -3703,7 +3707,7 @@ unittest  // pingClient(sessionId) reaches a session-scoped GET listener (non-em
 
 	auto srv = makeTestServer();
 	auto coord = new StreamCoordinator;
-	auto ch = srv.serverPushChannel(coord);
+	auto ch = ensurePushChannel(srv, coord);
 	string frame;
 	// The production registration path: a per-session GET stream owned by its
 	// Mcp-Session-Id (a NON-empty owner token), unlike the empty default.
@@ -3741,7 +3745,7 @@ unittest  // pingClient with an empty/mismatched token cannot reach a session-sc
 
 	auto srv = makeTestServer();
 	auto coord = new StreamCoordinator;
-	auto ch = srv.serverPushChannel(coord);
+	auto ch = ensurePushChannel(srv, coord);
 	ch.addListener((string) @safe {}, "", SubscriptionFilter.init, "", null, "sess-A");
 
 	// The empty-token no-arg form matches no session-scoped listener.
@@ -3765,7 +3769,7 @@ unittest  // connectedSessions enumerates the live session-scoped GET streams
 {
 	auto srv = makeTestServer();
 	auto coord = new StreamCoordinator;
-	auto ch = srv.serverPushChannel(coord);
+	auto ch = ensurePushChannel(srv, coord);
 	ch.addListener((string) @safe {}, "", SubscriptionFilter.init, "", null, "sess-A");
 	ch.addListener((string) @safe {}, "", SubscriptionFilter.init, "", null, "sess-B");
 
@@ -7331,7 +7335,7 @@ unittest  // notify delivers unsolicited notifications to GET-stream listeners
 {
 	auto s = new McpServer("t", "1");
 	auto coord = new StreamCoordinator;
-	auto ch = s.serverPushChannel(coord);
+	auto ch = ensurePushChannel(s, coord);
 	assert(s.serverPushChannel() is ch); // same instance returned thereafter
 
 	string[] received;
@@ -7352,7 +7356,7 @@ unittest  // notifyResourceUpdated emits resources/updated for a subscribed uri
 	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
-	auto ch = s.serverPushChannel(coord);
+	auto ch = ensurePushChannel(s, coord);
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
 
@@ -7376,7 +7380,7 @@ unittest  // notifyResourceUpdated is a no-op for a uri nobody subscribed to
 	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
-	auto ch = s.serverPushChannel(coord);
+	auto ch = ensurePushChannel(s, coord);
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
 
@@ -7393,7 +7397,7 @@ unittest  // notifyResourceUpdated emits params that are exactly { uri } (no non
 	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
-	auto ch = s.serverPushChannel(coord);
+	auto ch = ensurePushChannel(s, coord);
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
 
@@ -7435,7 +7439,7 @@ unittest  // notifyElicitationComplete emits notifications/elicitation/complete 
 {
 	auto s = new McpServer("t", "1");
 	auto coord = new StreamCoordinator;
-	auto ch = s.serverPushChannel(coord);
+	auto ch = ensurePushChannel(s, coord);
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
 
@@ -7515,7 +7519,7 @@ unittest  // notifyToolsListChanged broadcasts notifications/tools/list_changed
 {
 	auto s = new McpServer("t", "1");
 	auto coord = new StreamCoordinator;
-	auto ch = s.serverPushChannel(coord);
+	auto ch = ensurePushChannel(s, coord);
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
 	const n = s.notifyToolsListChanged();
@@ -7542,7 +7546,7 @@ unittest  // notifyToolsListChanged fans out to EVERY connected session, not jus
 
 	auto s = new McpServer("t", "1");
 	auto coord = new StreamCoordinator;
-	auto ch = s.serverPushChannel(coord);
+	auto ch = ensurePushChannel(s, coord);
 	string aFrame, bFrame;
 	ch.addListener((string f) @safe { aFrame = f; }, "",
 			SubscriptionFilter.init, "", null, "sess-A");
@@ -7561,7 +7565,7 @@ unittest  // a list_changed broadcast still delivers only ONE stream within a si
 	// both receive the same broadcast — only one of the session's streams does.
 	auto s = new McpServer("t", "1");
 	auto coord = new StreamCoordinator;
-	auto ch = s.serverPushChannel(coord);
+	auto ch = ensurePushChannel(s, coord);
 	int aCount, bCount;
 	ch.addListener((string) @safe { aCount++; }, "", SubscriptionFilter.init, "", null, "sess-A");
 	ch.addListener((string) @safe { bCount++; }, "", SubscriptionFilter.init, "", null, "sess-A");
@@ -7625,7 +7629,7 @@ unittest  // notifyResourcesListChanged broadcasts notifications/resources/list_
 {
 	auto s = new McpServer("t", "1");
 	auto coord = new StreamCoordinator;
-	auto ch = s.serverPushChannel(coord);
+	auto ch = ensurePushChannel(s, coord);
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
 	const n = s.notifyResourcesListChanged();
@@ -7682,7 +7686,7 @@ unittest  // notifyPromptsListChanged broadcasts notifications/prompts/list_chan
 {
 	auto s = new McpServer("t", "1");
 	auto coord = new StreamCoordinator;
-	auto ch = s.serverPushChannel(coord);
+	auto ch = ensurePushChannel(s, coord);
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
 	const n = s.notifyPromptsListChanged();
@@ -7736,7 +7740,7 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	s.enableToolsListChanged();
 	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
-	auto push = s.serverPushChannel(coord);
+	auto push = ensurePushChannel(s, coord);
 
 	// Stream B (resourceSubscriptions only) opens FIRST.
 	Json nb = Json.emptyObject;
@@ -7789,7 +7793,7 @@ unittest  // STATELESS HTTP subscriptions/listen delivers resources/updated per-
 	// enableResourceSubscriptions() (which a stateless server cannot call).
 	auto s = McpServer.stateless("t", "1");
 	auto coord = new StreamCoordinator;
-	auto push = s.serverPushChannel(coord);
+	auto push = ensurePushChannel(s, coord);
 
 	// Simulate handleListenStream attaching the listen stream's own per-URI filter
 	// (note:///a only) on the push channel. The server's activeConnection (what cs()
@@ -7825,7 +7829,7 @@ unittest  // STATELESS HTTP subscriptions/listen delivers resources/list_changed
 	auto s = McpServer.stateless("t", "1");
 	s.enableResourcesListChanged();
 	auto coord = new StreamCoordinator;
-	auto push = s.serverPushChannel(coord);
+	auto push = ensurePushChannel(s, coord);
 
 	// Stream A opted into resourcesListChanged; stream B did not (toolsListChanged only).
 	SubscriptionFilter fa;
@@ -7892,7 +7896,7 @@ unittest  // draft subscriptions/listen: a stream gets list_changed only if its 
 	auto s = new McpServer("t", "1");
 	s.enablePromptsListChanged();
 	auto coord = new StreamCoordinator;
-	auto ch = s.serverPushChannel(coord);
+	auto ch = ensurePushChannel(s, coord);
 
 	// A listen stream whose active filter did NOT opt into promptsListChanged: suppressed.
 	string[] a;
