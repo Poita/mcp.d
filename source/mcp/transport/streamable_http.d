@@ -16,6 +16,7 @@ import mcp.transport.session;
 import mcp.auth.resource_server;
 import mcp.server.context : RequestContext, BaseRequestContext, ConnectionScoped;
 import mcp.server.connection : ConnectionState;
+import mcp.server.push : ListenFilter;
 import mcp.protocol.capabilities : ClientCapabilities;
 
 /// The HTTP header carrying the session id (basic/transports §Session Management).
@@ -1106,7 +1107,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	const lastEventId = req.headers.get("Last-Event-ID", "");
 	const listenerId = push.addListener((string frame) @safe {
 		writeFrame(frame);
-	}, "", SubscriptionFilter.init, lastEventId, getConn !is null
+	}, "", ListenFilter.init, lastEventId, getConn !is null
 			? server.sessionPushEligibility(getConn) : null, ownerToken);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
@@ -1603,7 +1604,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			// `notifications/resources/updated` and `.../list_changed` down THAT SAME
 			// stream — exactly like a tool call emitting progress on its own SSE stream.
 			// It needs NO session, NO Mcp-Session-Id, NO inbound correlation; delivery
-			// is driven by this stream's own per-URI `SubscriptionFilter` at the push
+			// is driven by this stream's own per-URI `ListenFilter` at the push
 			// channel. (The 2025-era resources/subscribe RPC and the standalone GET
 			// stream stay gated in stateless; only this draft listen path is opened.)
 			handleListenStream(server, coord, msg, res,
@@ -3259,7 +3260,7 @@ unittest  // ordinary application errors (e.g. invalidParams) ride on HTTP 200
 
 unittest  // draft subscriptions/listen: ack first, then opted-in change notifications flow
 {
-	import mcp.transport.sse_context : StreamCoordinator, ServerPushChannel, SubscriptionFilter;
+	import mcp.transport.sse_context : StreamCoordinator, ServerPushChannel;
 	import mcp.protocol.modern : MetaKey;
 	import std.algorithm : canFind;
 
@@ -3285,7 +3286,7 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
 	auto coord = new StreamCoordinator;
 	auto push = ensurePushChannel(server, coord);
 	string[] frames;
-	SubscriptionFilter streamFilter;
+	ListenFilter streamFilter;
 	streamFilter.active = true;
 	streamFilter.toolsListChanged = true;
 	const lid = push.addListener((string f) @safe { frames ~= f; }, rpcIdString(m.id), streamFilter);

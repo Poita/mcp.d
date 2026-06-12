@@ -15,14 +15,9 @@ import mcp.protocol.modern : withSubscriptionId;
 import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
 import mcp.server.context;
 import mcp.server.connection : ConnectionState;
-import mcp.server.push : PushChannel;
+import mcp.server.push : PushChannel, ListenFilter;
 import mcp.server.server : McpServer;
 import mcp.auth.resource_server : TokenInfo;
-
-/// `SubscriptionFilter` lives in `mcp.server.push` (the server core consumes it
-/// without depending on the transport); re-exported here so existing
-/// `mcp.transport.sse_context : SubscriptionFilter` imports keep working.
-public import mcp.server.push : SubscriptionFilter;
 
 /// The composite key under which a pending server->client request's waiter is
 /// tracked: the session/connection token the request was issued to, paired with
@@ -409,7 +404,7 @@ final class ServerPushChannel : PushChannel
 		long id;
 		void delegate(string frame) @safe write;
 		string subscriptionId;
-		SubscriptionFilter filter;
+		ListenFilter filter;
 		/// Per-listener fallback eligibility for an INACTIVE-filter stream (a plain
 		/// 2025-era standalone GET stream). When set, `listenerEligible` consults this
 		/// instead of the mount-wide `plainEligible`, so a change notification's
@@ -526,7 +521,7 @@ final class ServerPushChannel : PushChannel
 	/// "replay messages that would have been delivered on a different stream" — is
 	/// honoured because replay is keyed strictly on the id's ordinal.
 	long addListener(void delegate(string frame) @safe write, string subscriptionId = "",
-			SubscriptionFilter filter = SubscriptionFilter.init, string resumeFrom = "",
+			ListenFilter filter = ListenFilter.init, string resumeFrom = "",
 			bool delegate(string method, string uri) @safe plainEligible = null,
 			string ownerToken = "") @safe
 	{
@@ -802,7 +797,7 @@ final class ServerPushChannel : PushChannel
 	/// MODE 2 — PUSH TO SESSION. Deliver a notification on exactly ONE connected
 	/// stream of the ONE session named by `sessionToken`, used by
 	/// `notifications/resources/updated` to a subscriber. The chosen stream still
-	/// applies its own per-stream `SubscriptionFilter` (resource-updated URI/type
+	/// applies its own per-stream `ListenFilter` (resource-updated URI/type
 	/// filtering) and per-session gate via the shared `listenerEligible` decision,
 	/// so a session's update reaches only a stream that opted into this `method`
 	/// (and, for `resources/updated`, this `uri`). An empty `sessionToken` is the
@@ -1141,7 +1136,7 @@ unittest  // a GET carrying Last-Event-ID replays events emitted after that curs
 	ch.removeListener(a); // connection breaks
 
 	string[] resumed;
-	ch.addListener((string f) @safe { resumed ~= f; }, "", SubscriptionFilter.init, idLine);
+	ch.addListener((string f) @safe { resumed ~= f; }, "", ListenFilter.init, idLine);
 
 	// Exactly the second event is replayed, with its ORIGINAL id (same ordinal).
 	assert(resumed.length == 1);
@@ -1169,7 +1164,7 @@ unittest  // an unknown / empty Last-Event-ID falls back to a fresh stream ordin
 	assert(plain.length == 0); // nothing replayed onto a fresh stream
 
 	string[] bogus;
-	ch.addListener((string f) @safe { bogus ~= f; }, "", SubscriptionFilter.init, "999-5");
+	ch.addListener((string f) @safe { bogus ~= f; }, "", ListenFilter.init, "999-5");
 	assert(bogus.length == 0); // unknown ordinal -> no replay
 }
 
@@ -1207,7 +1202,7 @@ unittest  // replay never crosses streams (MUST NOT replay a different stream)
 
 	// Resume A: only A2 replays; B1 must never appear.
 	string[] resumed;
-	ch.addListener((string f) @safe { resumed ~= f; }, "", SubscriptionFilter.init, aId0);
+	ch.addListener((string f) @safe { resumed ~= f; }, "", ListenFilter.init, aId0);
 	assert(resumed.length == 1);
 	assert(resumed[0].canFind("A2"));
 	assert(!resumed[0].canFind("B1"));
@@ -1229,7 +1224,7 @@ unittest  // resume is session-scoped: another session cannot replay a stream's 
 
 	string[] aFrames;
 	const a = ch.addListener((string f) @safe { aFrames ~= f; }, "",
-			SubscriptionFilter.init, "", null, "session-A");
+			ListenFilter.init, "", null, "session-A");
 	ch.notify("notifications/message", Json(["s": Json("secretA1")]));
 	ch.notify("notifications/message", Json(["s": Json("secretA2")]));
 	assert(aFrames.length == 2);
@@ -1240,15 +1235,15 @@ unittest  // resume is session-scoped: another session cannot replay a stream's 
 	// Session B presents A's Last-Event-ID but B's own token: NO replay, and the
 	// fresh ordinal it gets must NOT be A's ordinal.
 	string[] bFrames;
-	ch.addListener((string f) @safe { bFrames ~= f; }, "",
-			SubscriptionFilter.init, aId0, null, "session-B");
+	ch.addListener((string f) @safe { bFrames ~= f; }, "", ListenFilter.init,
+			aId0, null, "session-B");
 	assert(bFrames.length == 0, "session B must not replay session A's history");
 
 	// A subsequent event to B carries a fresh ordinal distinct from A's, confirming
 	// B did not resume A's stream.
 	string[] bLive;
 	const b2 = ch.addListener((string f) @safe { bLive ~= f; }, "",
-			SubscriptionFilter.init, aId0, null, "session-B");
+			ListenFilter.init, aId0, null, "session-B");
 	ch.emitTo(b2, makeNotification("notifications/message", Json([
 		"s": Json("B")
 	])));
@@ -1277,7 +1272,7 @@ unittest  // an unscoped (empty-token) stream remains resumable by anyone (prior
 	ch.removeListener(a);
 
 	string[] resumed;
-	ch.addListener((string f) @safe { resumed ~= f; }, "", SubscriptionFilter.init, idLine);
+	ch.addListener((string f) @safe { resumed ~= f; }, "", ListenFilter.init, idLine);
 	assert(resumed.length == 1);
 	assert(resumed[0].canFind("\"n\":2"));
 }
@@ -1310,10 +1305,10 @@ unittest  // pushToSession delivers a change notification ONLY to a stream that 
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 	string aFrame, bFrame;
-	SubscriptionFilter fa;
+	ListenFilter fa;
 	fa.active = true;
 	fa.toolsListChanged = true;
-	SubscriptionFilter fb;
+	ListenFilter fb;
 	fb.active = true;
 	fb.resourceSubscriptions = true;
 	// B registers FIRST to confirm delivery follows the per-stream filter, not
@@ -1335,11 +1330,11 @@ unittest  // pushToSession for resources/updated targets only the stream with th
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 	string aFrame, bFrame;
-	SubscriptionFilter fa;
+	ListenFilter fa;
 	fa.active = true;
 	fa.resourceSubscriptions = true;
 	fa.resourceUris = ["file:///a"];
-	SubscriptionFilter fb;
+	ListenFilter fb;
 	fb.active = true;
 	fb.resourceSubscriptions = true;
 	fb.resourceUris = ["file:///b"];
@@ -1366,8 +1361,8 @@ unittest  // broadcast fans out to every distinct session, once each
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 	string aFrame, bFrame;
-	ch.addListener((string f) @safe { aFrame = f; }, "", SubscriptionFilter.init, "", null, "A");
-	ch.addListener((string f) @safe { bFrame = f; }, "", SubscriptionFilter.init, "", null, "B");
+	ch.addListener((string f) @safe { aFrame = f; }, "", ListenFilter.init, "", null, "A");
+	ch.addListener((string f) @safe { bFrame = f; }, "", ListenFilter.init, "", null, "B");
 
 	const delivered = ch.broadcast("notifications/tools/list_changed", Json.undefined);
 	assert(delivered == 2);
@@ -1382,8 +1377,8 @@ unittest  // broadcast honours Multiple Connections within one session
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 	int aCount, bCount;
-	ch.addListener((string) @safe { aCount++; }, "", SubscriptionFilter.init, "", null, "S");
-	ch.addListener((string) @safe { bCount++; }, "", SubscriptionFilter.init, "", null, "S");
+	ch.addListener((string) @safe { aCount++; }, "", ListenFilter.init, "", null, "S");
+	ch.addListener((string) @safe { bCount++; }, "", ListenFilter.init, "", null, "S");
 
 	const delivered = ch.broadcast("notifications/tools/list_changed", Json.undefined);
 	assert(delivered == 1);
@@ -1399,10 +1394,10 @@ unittest  // broadcast skips a session whose only stream is not eligible
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 	string aFrame, bFrame;
-	SubscriptionFilter fa;
+	ListenFilter fa;
 	fa.active = true;
 	fa.toolsListChanged = true;
-	SubscriptionFilter fb;
+	ListenFilter fb;
 	fb.active = true;
 	fb.promptsListChanged = true; // not tools
 	ch.addListener((string f) @safe { aFrame = f; }, "listen-A", fa, "", null, "A");
@@ -1421,9 +1416,9 @@ unittest  // MODE 1 broadcast reaches every connected session's listener
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 	string a, b, c;
-	ch.addListener((string f) @safe { a = f; }, "", SubscriptionFilter.init, "", null, "A");
-	ch.addListener((string f) @safe { b = f; }, "", SubscriptionFilter.init, "", null, "B");
-	ch.addListener((string f) @safe { c = f; }, "", SubscriptionFilter.init, "", null, "C");
+	ch.addListener((string f) @safe { a = f; }, "", ListenFilter.init, "", null, "A");
+	ch.addListener((string f) @safe { b = f; }, "", ListenFilter.init, "", null, "B");
+	ch.addListener((string f) @safe { c = f; }, "", ListenFilter.init, "", null, "C");
 
 	const reached = ch.broadcast("notifications/tools/list_changed", Json.undefined);
 	assert(reached == 3, "broadcast must reach all three sessions");
@@ -1439,8 +1434,8 @@ unittest  // MODE 2 pushToSession reaches only the named session's listener
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 	string a, b;
-	ch.addListener((string f) @safe { a = f; }, "", SubscriptionFilter.init, "", null, "sess-A");
-	ch.addListener((string f) @safe { b = f; }, "", SubscriptionFilter.init, "", null, "sess-B");
+	ch.addListener((string f) @safe { a = f; }, "", ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { b = f; }, "", ListenFilter.init, "", null, "sess-B");
 
 	const reached = ch.pushToSession("sess-A", "notifications/resources/updated",
 			Json(["uri": Json("file:///x")]), "file:///x");
@@ -1486,10 +1481,8 @@ unittest  // MODE 3 ping reaches the session listener and round-trips its empty 
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 	string aFrame, bFrame;
-	ch.addListener((string f) @safe { aFrame = f; }, "",
-			SubscriptionFilter.init, "", null, "sess-A");
-	ch.addListener((string f) @safe { bFrame = f; }, "",
-			SubscriptionFilter.init, "", null, "sess-B");
+	ch.addListener((string f) @safe { aFrame = f; }, "", ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { bFrame = f; }, "", ListenFilter.init, "", null, "sess-B");
 
 	bool pinged;
 	runTask(() @safe nothrow{
@@ -1521,9 +1514,9 @@ unittest  // connectedOwnerTokens lists distinct non-empty session tokens
 
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
-	ch.addListener((string) @safe {}, "", SubscriptionFilter.init, "", null, "A");
-	ch.addListener((string) @safe {}, "", SubscriptionFilter.init, "", null, "A"); // dup token
-	ch.addListener((string) @safe {}, "", SubscriptionFilter.init, "", null, "B");
+	ch.addListener((string) @safe {}, "", ListenFilter.init, "", null, "A");
+	ch.addListener((string) @safe {}, "", ListenFilter.init, "", null, "A"); // dup token
+	ch.addListener((string) @safe {}, "", ListenFilter.init, "", null, "B");
 	ch.addListener((string) @safe {}); // empty token excluded
 
 	auto tokens = ch.connectedOwnerTokens();
@@ -1537,7 +1530,7 @@ unittest  // pushToSession: no eligible stream means no delivery (returns 0)
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 	string frame;
-	SubscriptionFilter f;
+	ListenFilter f;
 	f.active = true;
 	f.toolsListChanged = true; // opted into tools only
 	ch.addListener((string fr) @safe { frame = fr; }, "only", f);
@@ -1580,8 +1573,8 @@ unittest  // a per-listener plainEligible gate overrides the mount-wide plainEli
 		return method != "notifications/resources/updated" || uri == "file:///b";
 	}
 
-	ch.addListener((string f) @safe { aFrame = f; }, "", SubscriptionFilter.init, "", &aGate);
-	ch.addListener((string f) @safe { bFrame = f; }, "", SubscriptionFilter.init, "", &bGate);
+	ch.addListener((string f) @safe { aFrame = f; }, "", ListenFilter.init, "", &aGate);
+	ch.addListener((string f) @safe { bFrame = f; }, "", ListenFilter.init, "", &bGate);
 
 	auto p = Json(["uri": Json("file:///a")]);
 	// Mount-wide plainEligible is the default true; the per-listener gates decide.
@@ -2449,10 +2442,8 @@ unittest  // a session-scoped push sendRequest is delivered only on the owning s
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 	string aFrame, bFrame;
-	ch.addListener((string f) @safe { aFrame = f; }, "",
-			SubscriptionFilter.init, "", null, "sess-A");
-	ch.addListener((string f) @safe { bFrame = f; }, "",
-			SubscriptionFilter.init, "", null, "sess-B");
+	ch.addListener((string f) @safe { aFrame = f; }, "", ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { bFrame = f; }, "", ListenFilter.init, "", null, "sess-B");
 
 	// Deliver the scoped request frame exactly as requestOnSession does (eligibility
 	// keyed on the owning token) without blocking on a reply.
@@ -3045,7 +3036,7 @@ unittest  // addListener cleans up its Phase 1 registration when Phase 2 replay 
 	{
 		ch.addListener((string) @safe {
 			throw new Exception("client disconnected");
-		}, "", SubscriptionFilter.init, idLine);
+		}, "", ListenFilter.init, idLine);
 	}
 	catch (Exception)
 	{

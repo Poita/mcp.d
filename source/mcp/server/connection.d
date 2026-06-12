@@ -3,7 +3,7 @@ module mcp.server.connection;
 import mcp.protocol.versions : ProtocolVersion, latestStable;
 import mcp.protocol.capabilities : ClientCapabilities;
 import mcp.server.context : CancellationToken;
-import mcp.server.push : SubscriptionFilter;
+import mcp.server.push : ListenFilter;
 
 @safe:
 
@@ -28,7 +28,7 @@ final class ConnectionState
 	/// The protocol version negotiated for this connection (stateful) or the
 	/// effective version for the current request (stateless). This is the single
 	/// version concept: the server->client push/notification path is driven by
-	/// each open listener's own `SubscriptionFilter`, not by a separate
+	/// each open listener's own `ListenFilter`, not by a separate
 	/// connection-level version (`subscriptions/listen` is an ordinary
 	/// request and is not special-cased).
 	ProtocolVersion negotiated = latestStable;
@@ -50,8 +50,8 @@ final class ConnectionState
 	/// §Notification Filter). The HTTP transport builds a fresh per-request state
 	/// for each listen request and reads the filter back from it, so two
 	/// concurrent listen streams can never observe each other's opt-in;
-	/// `SubscriptionFilter.init` (inactive) until a listen request is routed.
-	SubscriptionFilter listenFilter;
+	/// `ListenFilter.init` (inactive) until a listen request is routed.
+	ListenFilter listenFilter;
 
 	/// In-flight cancellation tokens keyed by this connection's request ids.
 	/// Scoping the registry to the `ConnectionState` keeps a

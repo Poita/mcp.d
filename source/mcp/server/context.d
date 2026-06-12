@@ -5,7 +5,7 @@ import vibe.data.json : Json, deserializeJson, parseJsonString;
 
 import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
-import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction, LogLevel;
+import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction, LogLevel, shouldLog;
 import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
 import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
@@ -14,11 +14,6 @@ import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMe
 import mcp.server.connection : ConnectionState;
 
 @safe:
-
-/// `logLevelRank`/`shouldLog` live in `mcp.protocol.types` (RFC 5424 ordering
-/// is shared protocol vocabulary used by both sides); re-exported here so
-/// existing `mcp.server.context : logLevelRank` imports keep working.
-public import mcp.protocol.types : logLevelRank, shouldLog;
 
 /// A shared, mutable cancellation flag for one in-flight request. The server
 /// hands the same token to the request's `RequestContext` (so the handler can

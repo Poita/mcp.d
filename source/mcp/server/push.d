@@ -28,7 +28,7 @@ import vibe.data.json : Json;
 /// the zero value used for plain GET streams that did not go through `subscriptions/
 /// listen`; an inactive filter accepts everything, so the plain GET stream still obeys
 /// only the transport's Multiple Connections rule.
-struct SubscriptionFilter
+struct ListenFilter
 {
 	bool active; /// true once this is a real `subscriptions/listen` filter
 	bool toolsListChanged;
@@ -73,7 +73,7 @@ struct SubscriptionFilter
 
 unittest  // an inactive filter (plain GET stream) accepts every notification type
 {
-	SubscriptionFilter f;
+	ListenFilter f;
 	assert(f.accepts("notifications/tools/list_changed"));
 	assert(f.accepts("notifications/resources/updated", "file:///x"));
 	assert(f.accepts("notifications/message"));
@@ -81,7 +81,7 @@ unittest  // an inactive filter (plain GET stream) accepts every notification ty
 
 unittest  // an active filter accepts only the change types it opted into
 {
-	SubscriptionFilter f;
+	ListenFilter f;
 	f.active = true;
 	f.toolsListChanged = true;
 	assert(f.accepts("notifications/tools/list_changed"));
@@ -95,7 +95,7 @@ unittest  // an active filter accepts only the change types it opted into
 
 unittest  // resourceSubscriptions matches only the opted-in URIs
 {
-	SubscriptionFilter f;
+	ListenFilter f;
 	f.active = true;
 	f.resourceSubscriptions = true;
 	f.resourceUris = ["file:///project/config.json"];
@@ -103,13 +103,13 @@ unittest  // resourceSubscriptions matches only the opted-in URIs
 	assert(!f.accepts("notifications/resources/updated", "file:///other"));
 
 	// A blanket boolean opt-in (no per-URI list) accepts any resource URI.
-	SubscriptionFilter blanket;
+	ListenFilter blanket;
 	blanket.active = true;
 	blanket.resourceSubscriptions = true;
 	assert(blanket.accepts("notifications/resources/updated", "file:///x"));
 
 	// Without resourceSubscriptions opt-in, resources/updated is rejected.
-	SubscriptionFilter none;
+	ListenFilter none;
 	none.active = true;
 	assert(!none.accepts("notifications/resources/updated", "file:///x"));
 }
@@ -119,7 +119,7 @@ unittest  // a per-URI filter must reject a notification that carries no URI
 	// A server emitting notifications/resources/updated with an empty uri (e.g. a
 	// bug upstream or a server that omits the field) must not bypass the per-URI
 	// filter: an empty uri is not in the opted-in list and must not be delivered.
-	SubscriptionFilter f;
+	ListenFilter f;
 	f.active = true;
 	f.resourceSubscriptions = true;
 	f.resourceUris = ["file:///project/config.json"];

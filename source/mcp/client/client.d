@@ -21,11 +21,6 @@ import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
 import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 import mcp.client.cache : CacheStore, InMemoryCacheStore, CacheKey, CacheEntry, noCache;
 
-/// `ProgressToken` lives in `mcp.protocol.types` (it is shared protocol
-/// vocabulary, not a client-only concept); re-exported here so existing
-/// `mcp.client.client : ProgressToken` imports keep working.
-public import mcp.protocol.types : ProgressToken;
-
 /// How a cacheable request verb interacts with the client's response cache.
 /// Only meaningful on the six cacheable reads (`listTools`, `listResources`,
 /// `listResourceTemplates`, `listPrompts`, `readResource`, `discover`); ignored
@@ -1242,9 +1237,9 @@ final class McpClient : ClientProtocol
 	private CallToolResult callToolLoop(string name, Json arguments,
 			ProgressToken progressToken, string logLevel = "") @safe
 	{
-		return mrtrLoop!CallToolResult("tools/call", logLevel,
-				(responses, requestState) => buildToolCallParams(name,
-					arguments, progressToken, responses, requestState));
+		return mrtrLoop!CallToolResult("tools/call", logLevel, (responses,
+				requestState) => buildToolCallParams(name,
+				arguments, progressToken, responses, requestState));
 	}
 
 	/// Mint a process-unique string `ProgressToken` for a per-call progress sink.
@@ -1297,8 +1292,8 @@ final class McpClient : ClientProtocol
 	/// client/elicitation, `mode` defaults to `"form"` when absent.
 	private static string elicitationModeOf(Json params) @safe
 	{
-		return ("mode" in params && params["mode"].type == Json.Type.string)
-			? params["mode"].get!string : "form";
+		return ("mode" in params && params["mode"].type == Json.Type.string) ? params["mode"]
+			.get!string : "form";
 	}
 
 	/// Whether `advertised` client capabilities declare support for elicitation
@@ -1313,8 +1308,8 @@ final class McpClient : ClientProtocol
 		switch (mode)
 		{
 		case "form":
-			return advertised.elicitationForm
-				|| (advertised.elicitation && !advertised.elicitationUrl);
+			return advertised.elicitationForm || (advertised.elicitation
+					&& !advertised.elicitationUrl);
 		case "url":
 			return advertised.elicitationUrl;
 		default:
@@ -1717,9 +1712,9 @@ final class McpClient : ClientProtocol
 	private GetPromptResult getPromptLoop(string name, Json arguments,
 			ProgressToken progressToken, string logLevel = "") @safe
 	{
-		return mrtrLoop!GetPromptResult("prompts/get", logLevel,
-				(responses, requestState) => buildGetPromptParams(name,
-					arguments, progressToken, responses, requestState));
+		return mrtrLoop!GetPromptResult("prompts/get", logLevel, (responses,
+				requestState) => buildGetPromptParams(name,
+				arguments, progressToken, responses, requestState));
 	}
 
 	/// Build the `prompts/get` params, optionally attaching a progress token.
