@@ -1283,6 +1283,35 @@ final class McpClient : ClientProtocol
 		return body_();
 	}
 
+	/// The elicitation `mode` carried in a request's `params`. Per
+	/// client/elicitation, `mode` defaults to `"form"` when absent.
+	private static string elicitationModeOf(Json params) @safe
+	{
+		return ("mode" in params && params["mode"].type == Json.Type.string)
+			? params["mode"].get!string : "form";
+	}
+
+	/// Whether `advertised` client capabilities declare support for elicitation
+	/// `mode`, per client/elicitation §Error Handling (2025-11-25): a request
+	/// whose `mode` was not declared in client capabilities must be rejected.
+	/// A bare `elicitation` declaration is parsed as form-capable
+	/// (elicitationForm=true). An explicit url-only declaration (`{"url":{}}` =>
+	/// elicitation=true, elicitationUrl=true, elicitationForm=false) does NOT
+	/// declare form mode, so it must not satisfy the form case.
+	private static bool supportsElicitationMode(ClientCapabilities advertised, string mode) @safe
+	{
+		switch (mode)
+		{
+		case "form":
+			return advertised.elicitationForm
+				|| (advertised.elicitation && !advertised.elicitationUrl);
+		case "url":
+			return advertised.elicitationUrl;
+		default:
+			return false;
+		}
+	}
+
 	/// Satisfy one MRTR `InputRequest` by dispatching it to the matching client
 	/// handler, writing the answer into `answer` (keyed by `req.id`). Returns
 	/// `false` (leaving `answer` untouched) when no handler is registered for the
@@ -1304,27 +1333,8 @@ final class McpClient : ClientProtocol
 		case "elicitation":
 			if (onElicitation is null)
 				return false;
-			{
-				const advertised = effectiveCapabilities();
-				const mode = ("mode" in req.params && req.params["mode"].type == Json.Type.string) ? req
-					.params["mode"].get!string : "form";
-				bool supported;
-				switch (mode)
-				{
-				case "form":
-					supported = advertised.elicitationForm
-						|| (advertised.elicitation && !advertised.elicitationUrl);
-					break;
-				case "url":
-					supported = advertised.elicitationUrl;
-					break;
-				default:
-					supported = false;
-					break;
-				}
-				if (!supported)
-					return false;
-			}
+			if (!supportsElicitationMode(effectiveCapabilities(), elicitationModeOf(req.params)))
+				return false;
 			result = onElicitation(ElicitParams.fromJson(req.params)).toJson();
 			break;
 		case "roots":
@@ -2467,29 +2477,8 @@ final class McpClient : ClientProtocol
 				// installing `onElicitation` alone auto-advertises the form submode
 				// on the wire, so an inbound form request must be accepted
 				// even when no manual capability flags were set.
-				const advertised = effectiveCapabilities();
-				const mode = ("mode" in params && params["mode"].type == Json.Type.string) ? params["mode"]
-					.get!string : "form";
-				bool supported;
-				switch (mode)
-				{
-				case "form":
-					// A bare `elicitation` declaration is parsed as form-capable
-					// (elicitationForm=true). An explicit url-only declaration
-					// (`{"url":{}}` => elicitation=true, elicitationUrl=true,
-					// elicitationForm=false) does NOT declare form mode, so it must
-					// not satisfy the form case.
-					supported = advertised.elicitationForm
-						|| (advertised.elicitation && !advertised.elicitationUrl);
-					break;
-				case "url":
-					supported = advertised.elicitationUrl;
-					break;
-				default:
-					supported = false;
-					break;
-				}
-				if (!supported)
+				const mode = elicitationModeOf(params);
+				if (!supportsElicitationMode(effectiveCapabilities(), mode))
 					throw invalidParams("Unsupported elicitation mode: " ~ mode);
 				// Remember the id of a URL-mode request so a later
 				// notifications/elicitation/complete can be correlated; an
