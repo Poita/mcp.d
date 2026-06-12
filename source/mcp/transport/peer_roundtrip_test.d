@@ -51,7 +51,7 @@ unittest
 	tool.name = "echo_sample";
 	tool.description = "Echoes the client's sampled text";
 	bool toolReached;
-	server.registerDynamicTool(tool, (Json args, RequestContext ctx) @safe {
+	server.registerTool(tool, (Json args, RequestContext ctx) @safe {
 		toolReached = true;
 		Json sp = Json.emptyObject;
 		Json messages = Json.emptyArray;
@@ -136,7 +136,7 @@ unittest
 	Tool tool;
 	tool.name = "ask_name";
 	tool.description = "Asks the client for the user's name";
-	server.registerDynamicTool(tool, (Json args, RequestContext ctx) @safe {
+	server.registerTool(tool, (Json args, RequestContext ctx) @safe {
 		Json schema = Json.emptyObject;
 		schema["type"] = "object";
 		auto reply = ctx.elicit("What is your name?", schema); // server->client request

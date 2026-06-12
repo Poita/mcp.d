@@ -213,31 +213,55 @@ struct lastModified
 	string value; /// ISO 8601 last-modified timestamp
 }
 
-/// Optional per-parameter description, attached to a function parameter or used
-/// alongside `@tool` to document a named argument.
-struct describe
+/// Method-level UDA documenting a named parameter of a `@tool`, `@task`, or
+/// `@prompt` method. Attach it to the method declaration (never inline to a
+/// parameter); `parameter` names the argument it documents and `description`
+/// is the human-readable text folded into that property's JSON Schema
+/// `description` (or, for prompts, into `PromptArgument.description`).
+///
+/// Repeatable: attach one `@describeParam` per documented parameter. Naming a
+/// parameter that the method does not declare — or an injected context
+/// parameter (a trailing `RequestContext` / `TaskContext`, which has no schema
+/// property) — is a compile-time error.
+///
+/// Example:
+/// ---
+/// @tool("annotate", "Annotate a document")
+/// @describeParam("id", "the document id")
+/// @describeParam("count", "how many copies")
+/// string annotate(string id, int count) { ... }
+/// ---
+struct describeParam
 {
 	string parameter;
 	string description;
 }
 
-/// UDA marking a `@tool` parameter as mirrored into an HTTP request header.
+/// Method-level UDA mirroring a named `@tool` parameter into an HTTP request
+/// header. Attach it to the method declaration (never inline to a parameter):
+/// `parameter` names the tool argument and `name` is the header suffix, so the
+/// argument is mirrored into the `Mcp-Param-<name>` request header.
 ///
 /// Per the MCP draft (`server/tools` #x-mcp-header), a server MAY designate tool
 /// parameters to be mirrored into headers via an `x-mcp-header` extension
-/// property in the parameter's `inputSchema`. Apply this UDA directly to the
-/// parameter; the reflection layer emits the corresponding `x-mcp-header`
-/// property (carrying `name`) into the generated input schema, so that the
-/// streamable-HTTP transport can validate the `Mcp-Param-<name>` header against
-/// the argument value.
+/// property in the parameter's `inputSchema`. The reflection layer emits the
+/// corresponding `x-mcp-header` property (carrying `name`) onto the named
+/// parameter's schema, so the streamable-HTTP transport can validate the
+/// `Mcp-Param-<name>` header against the argument value.
+///
+/// Naming a parameter the method does not declare is a compile-time error, as is
+/// applying it to a non-primitive parameter (only integer/string/boolean — or a
+/// `Nullable` thereof — are permitted x-mcp-header value types).
 ///
 /// Example:
 /// ---
 /// @tool("query", "Query a region")
-/// string query(@mcpHeader("Region") string region) { ... }
+/// @mcpHeader("region", "Region")
+/// string query(string region) { ... }
 /// ---
 struct mcpHeader
 {
+	string parameter; /// the tool parameter mirrored into the header
 	string name; /// the header suffix, e.g. "Region" -> `Mcp-Param-Region`
 }
 

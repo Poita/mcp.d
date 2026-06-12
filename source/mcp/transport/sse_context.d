@@ -2941,7 +2941,7 @@ unittest  // a cancellation scoped to session B must not suppress session A's sa
 			TokenInfo.invalid(), false, latestStable, "sess-B");
 
 	Tool slow = {name: "slow"};
-	s.registerDynamicTool(slow, (Json args, RequestContext ctx) @safe {
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
 		// While request id 1 runs on session A, a cancellation for id 1 arrives on
 		// session B. With per-connection keying via connectionToken this MUST NOT
 		// flip A's token.
@@ -2987,7 +2987,7 @@ unittest  // a stateless HttpStreamContext FORBIDS server->client requests
 	auto s = McpServer.stateless("t", "1");
 	bool sawStatelessError;
 	Tool ask = {name: "ask"};
-	s.registerDynamicTool(ask, (Json args, RequestContext ctx) @safe {
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
 		try
 		{
 			ctx.elicit("hi", Json.emptyObject);
