@@ -64,7 +64,7 @@ Or add it manually to your `dub.json`:
 
 ```json
 "dependencies": {
-    "mcp-d": "~>0.1"
+    "mcp-d": "~>0.2"
 }
 ```
 
