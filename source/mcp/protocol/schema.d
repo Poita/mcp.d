@@ -1,4 +1,4 @@
-module mcp.api.schema;
+module mcp.protocol.schema;
 
 import std.traits : isInstanceOf, isArray, isSomeString, isIntegral, isFloatingPoint;
 import std.typecons : Nullable;
@@ -19,7 +19,8 @@ import jsonschema : Validator;
 /// `inputSchema`/`outputSchema` and elicitation `requestedSchema` directly, and
 /// not every client resolves `$ref` within an embedded schema. The compile-time
 /// settings overload rejects a directly or mutually recursive `T` with a
-/// `static assert` (as the previous inlining generator did by construction).
+/// `static assert`, so recursive types fail at the instantiation site rather than
+/// silently producing an incomplete schema.
 Json jsonSchemaOf(T)()
 {
 	import jsonschema : generate = jsonSchemaOf, GeneratorSettings;
@@ -174,8 +175,8 @@ unittest  // full 2020-12: a $ref/$defs schema is now resolved and enforced
 {
 	import vibe.data.json : parseJsonString;
 
-	// The previous SDK validator ignored $ref (unknown keyword => satisfied);
-	// the jsonschema-backed one resolves it, so a wrong-typed value is rejected.
+	// The validator resolves $ref against $defs, so a value whose nested type is
+	// wrong is rejected.
 	auto schema = parseJsonString(`{
 		"type": "object",
 		"properties": {"point": {"$ref": "#/$defs/pt"}},

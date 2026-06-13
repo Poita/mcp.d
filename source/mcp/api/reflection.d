@@ -16,7 +16,7 @@ import mcp.server.task_context : TaskContext;
 import mcp.server.task_runtime : TaskOptions;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
-import mcp.api.schema;
+import mcp.protocol.schema;
 
 @safe:
 
@@ -204,7 +204,7 @@ private Json parametersSchema(alias func)() @safe
 				// servers use), not as a union with null. So a `Nullable!T` parameter
 				// emits the bare schema for T rather than anyOf:[T,null]; optionality
 				// is carried by `required` below. (Output and elicitation schemas use
-				// the mcp.api.schema adapter, which keeps the honest anyOf:[T,null].)
+				// the mcp.protocol.schema adapter, which keeps the honest anyOf:[T,null].)
 				import jsonschema : genParamNode = jsonSchemaOf, applyUdaFacets, GeneratorSettings;
 				import jsonschema.vibejson : nodeToVibeJson;
 

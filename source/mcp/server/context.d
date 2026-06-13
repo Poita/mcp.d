@@ -7,7 +7,7 @@ import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction, LogLevel, shouldLog;
 import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
-import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
+import mcp.protocol.schema : jsonSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
 import mcp.protocol.jsonrpc : makeNotification;
 import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
@@ -983,7 +983,7 @@ unittest  // form-mode elicit() returns a typed ElicitResult with the parsed act
 
 unittest  // elicit!T derives requestedSchema from the struct via jsonSchemaOf
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	static struct TripDetails
 	{
