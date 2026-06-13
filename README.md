@@ -1,5 +1,6 @@
 # mcp.d
 
+[![Dub version](https://img.shields.io/dub/v/mcp-d.svg)](https://code.dlang.org/packages/mcp-d)
 [![CI](https://github.com/Poita/mcp.d/actions/workflows/ci.yml/badge.svg)](https://github.com/Poita/mcp.d/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/Poita/mcp.d/branch/main/graph/badge.svg)](https://codecov.io/gh/Poita/mcp.d)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
