@@ -12,7 +12,7 @@ import vibe.data.json : Json;
 import mcp.protocol.errors : internalError;
 import mcp.protocol.versions : ProtocolVersion, isModern, usesMRTR;
 import mcp.protocol.types : CallToolResult, GetPromptResult, Content;
-import mcp.protocol.modern : InputRequest, InputRequiredResult;
+import mcp.protocol.mrtr : InputRequest, InputRequiredResult;
 import mcp.server.context : RequestContext;
 
 @safe:

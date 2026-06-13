@@ -83,6 +83,18 @@ struct StreamableHttpOptions
 	bool legacyHttpSse = false;
 	string legacySsePath = "/sse"; /// legacy GET SSE endpoint path
 	string legacyMessagePath = "/message"; /// legacy POST message endpoint path
+
+	/// Emit one Apache-combined-format access-log line per request
+	/// (`%h - %u %t "%r" %s %b "%{Referer}i" "%{User-Agent}i"`: client IP,
+	/// authenticated user, timestamp, request line, status, response bytes,
+	/// Referer and User-Agent). Off by default: the transport stays silent so it
+	/// imposes no logging — or PII capture (client IPs, user agents) — on the host
+	/// process. Lines are written through vibe.core.log to the console, unless
+	/// `accessLogFile` directs them to a file instead.
+	bool accessLog = false;
+	/// When `accessLog` is enabled, write the access-log lines to this file path
+	/// instead of the console. Ignored unless `accessLog` is set.
+	string accessLogFile = "";
 }
 
 /// The well-known path (RFC 9728 §3) at which a protected resource server
@@ -1988,6 +2000,25 @@ private bool isLoopbackHostname(string h) @safe
 	return h == "localhost" || h == "127.0.0.1" || h == "::1";
 }
 
+/// Translate the transport-level `opts` into a vibe.d `HTTPServerSettings`:
+/// listen address, plus access logging when `opts.accessLog` is set (to
+/// `opts.accessLogFile` if given, otherwise the console). Access logging stays
+/// off unless explicitly opted in.
+private HTTPServerSettings buildStreamableHttpSettings(ushort port, StreamableHttpOptions opts) @safe
+{
+	auto settings = new HTTPServerSettings;
+	settings.port = port;
+	settings.bindAddresses = opts.bindAddresses;
+	if (opts.accessLog)
+	{
+		if (opts.accessLogFile.length)
+			settings.accessLogFile = opts.accessLogFile;
+		else
+			settings.accessLogToConsole = true;
+	}
+	return settings;
+}
+
 /// Start a standalone Streamable HTTP server for `server` on `port` and run the
 /// vibe.d event loop. Blocks until the application exits.
 void runStreamableHttp(McpServer server, ushort port,
@@ -1998,9 +2029,7 @@ void runStreamableHttp(McpServer server, ushort port,
 	auto router = new URLRouter;
 	mountMcp(router, server, opts);
 
-	auto settings = new HTTPServerSettings;
-	settings.port = port;
-	settings.bindAddresses = opts.bindAddresses;
+	auto settings = buildStreamableHttpSettings(port, opts);
 	auto listener = listenHTTP(settings, router);
 	scope (exit)
 		listener.stopListening();
@@ -2025,6 +2054,50 @@ void runStreamableHttp(McpServer server, ushort port, string host) @safe
 void runStreamableHttp(McpServer server, StreamableHttpOptions opts) @safe
 {
 	runStreamableHttp(server, opts.port, opts);
+}
+
+unittest  // access logging is off by default
+{
+	StreamableHttpOptions opts;
+	assert(!opts.accessLog);
+	assert(opts.accessLogFile == "");
+}
+
+unittest  // accessLog routes per-request lines to the console
+{
+	StreamableHttpOptions opts;
+	opts.accessLog = true;
+	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
+	assert(settings.accessLogToConsole);
+	assert(settings.accessLogFile == "");
+}
+
+unittest  // accessLogFile sends lines to the file instead of the console
+{
+	StreamableHttpOptions opts;
+	opts.accessLog = true;
+	opts.accessLogFile = "/var/log/mcp.log";
+	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
+	assert(!settings.accessLogToConsole);
+	assert(settings.accessLogFile == "/var/log/mcp.log");
+}
+
+unittest  // accessLogFile alone (without accessLog) emits nothing
+{
+	StreamableHttpOptions opts;
+	opts.accessLogFile = "/var/log/mcp.log";
+	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
+	assert(!settings.accessLogToConsole);
+	assert(settings.accessLogFile == "");
+}
+
+unittest  // port and bind addresses still flow through unchanged
+{
+	StreamableHttpOptions opts;
+	opts.bindAddresses = ["0.0.0.0"];
+	auto settings = buildStreamableHttpSettings(cast(ushort) 9090, opts);
+	assert(settings.port == 9090);
+	assert(settings.bindAddresses == ["0.0.0.0"]);
 }
 
 unittest  // runStreamableHttp(server, port, host) overload exists and forwards
