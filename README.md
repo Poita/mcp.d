@@ -272,6 +272,59 @@ The Streamable HTTP transport derives session minting purely from
 `server.mode` (`ServerMode.stateful` => mint and require `Mcp-Session-Id`;
 `ServerMode.stateless` => never). There is no separate `enableSessions` option.
 
+## Implementing a custom server transport
+
+The server side has a named transport seam symmetric to the client's
+`ClientTransport`: the `ServerCore` interface (also exported as `ServerTransport`)
+in `mcp.server.transport`, reachable from `import mcp.transport;`. `McpServer`
+implements it, so a transport can hold its server through the interface and drive
+it without depending on the concrete class.
+
+Two directions make up the contract:
+
+- **Inbound (peer -> server)** is the `handle` / `handleRaw` family. The minimal
+  recipe is to parse the peer's bytes into a single string and call `handleRaw`,
+  writing the returned string back (empty string => nothing to send, e.g. a
+  notification):
+
+  ```d
+  import mcp.transport; // ServerCore / ServerTransport + the wire transports
+
+  void pump(ServerCore core, string requestText, void delegate(string) @safe reply)
+  {
+      const responseText = core.handleRaw(requestText);
+      if (responseText.length)
+          reply(responseText);
+  }
+  ```
+
+  For a transport that can also push out-of-band frames on the same channel (the
+  way stdio does), use `handleRaw(text, sink)` so a handler's `ctx.log` /
+  `ctx.reportProgress` reach the peer while the request is in flight, and
+  `handleRaw(text, sink, serverRequest)` to additionally carry the blocking
+  server->client request channel behind `ctx.sample` / `ctx.elicit`.
+
+- **Outbound (server -> peer)** is the `RequestContext` interface
+  (`mcp.server.context`), the named companion the transport implements. Supply a
+  concrete `RequestContext` to `handle` (or via the `sink` / `serverRequest`
+  overloads of `handleRaw`); the server calls back into it to emit notifications
+  and issue server->client requests. A transport that multiplexes many sessions
+  over one server also implements `ConnectionScoped` on its `RequestContext` so
+  the core scopes per-connection state (the cancellation registry) per session,
+  and threads each request's own `ConnectionState` via `handleRaw(text, conn)`.
+
+**Connection / session ownership is in-package only.** The fallback
+`ConnectionState` hook the out-of-request notify/push path uses
+(`McpServer.bindConnection`) and the `SessionManager` that owns per-session state
+are `package(mcp)`-private — the in-tree Streamable HTTP transport relies on them.
+This is a deliberate pre-1.0 choice: the seam stays narrow rather than exposing
+connection internals that would be hard to evolve. An out-of-package transport can
+fully drive request/response and per-request state through `ServerCore` +
+`RequestContext` (building its own `ConnectionState` and passing it to
+`handleRaw(text, conn)`), but it cannot own the fallback connection the
+out-of-request notify/push path reads. Transports that need that ownership belong
+in `mcp.transport.*`.
+
 ## Client response cache
 
 `McpClient` caches the six read-only operations the draft marks `CacheableResult`
