@@ -191,11 +191,20 @@ private Json parametersSchema(alias func)() @safe
 		static if (!is(P : RequestContext) && !is(P == TaskContext))
 		{
 			{
-				Json ps = jsonSchemaOf!P;
-				// Apply field-level facet UDAs (@minimum, @maximum, @title,
-				// @format, @minLength, @maxLength, @pattern, @minItems,
-				// @maxItems, @schemaDefault) attached directly to the parameter.
-				mcp.api.schema.applyUdaFacets!(__traits(getAttributes, types[i .. i + 1]))(ps);
+				// Generate the parameter's schema and fold in the field-level
+				// facet UDAs (@minimum, @maximum, @title, @format, @minLength,
+				// @maxLength, @pattern, @minItems, @maxItems, @schemaDefault)
+				// attached directly to the parameter. Both the generator and
+				// applyUdaFacets are jsonschema's, operating in its JsonNode IR;
+				// render to vibe Json once the facets are applied, then layer the
+				// MCP-specific extensions (x-mcp-header, description) on below.
+				import jsonschema : genParamNode = jsonSchemaOf, applyUdaFacets, GeneratorSettings;
+				import jsonschema.vibejson : nodeToVibeJson;
+
+				enum GeneratorSettings paramSettings = {inlineSubschemas: true};
+				auto psNode = genParamNode!(P, paramSettings)();
+				applyUdaFacets!(__traits(getAttributes, types[i .. i + 1]))(psNode);
+				Json ps = nodeToVibeJson(psNode);
 				// Draft x-mcp-header: a method-level @mcpHeader(parameter, name)
 				// naming this parameter mirrors it into an `Mcp-Param-<name>`
 				// request header; emit the extension property so the transport can
