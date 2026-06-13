@@ -605,7 +605,7 @@ final class McpServer
 	/// silently under-validating each `tools/call`.
 	private static RegisteredTool withCompiledValidators(RegisteredTool rt) @safe
 	{
-		import mcp.api.schema : makeValidator;
+		import mcp.protocol.schema : makeValidator;
 
 		rt.inputValidator = makeValidator(rt.descriptor.inputSchema);
 		rt.outputValidator = makeValidator(rt.descriptor.outputSchema);
@@ -3074,7 +3074,7 @@ final class McpServer
 	/// returned message into a `CallToolResult` rather than throwing.
 	private static string checkInputSchema(Validator validator, string toolName, Json args) @safe
 	{
-		import mcp.api.schema : validationError;
+		import mcp.protocol.schema : validationError;
 
 		const msg = validationError(validator, args);
 		if (msg.length)
@@ -3096,7 +3096,7 @@ final class McpServer
 	/// internal `McpException` on a violation.
 	private static void checkOutputSchema(Validator validator, string toolName, Json result) @safe
 	{
-		import mcp.api.schema : validationError;
+		import mcp.protocol.schema : validationError;
 
 		// A null validator means the tool declared no output schema.
 		if (validator is null)
@@ -3955,7 +3955,7 @@ unittest  // tools/call with unknown tool is an invalid-params protocol error
 
 unittest  // output-schema validation: conforming structuredContent passes
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
@@ -3983,7 +3983,7 @@ unittest  // output-schema validation: conforming structuredContent passes
 
 unittest  // output-schema validation: non-conforming structuredContent errors
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
@@ -4011,7 +4011,7 @@ unittest  // output-schema validation: non-conforming structuredContent errors
 
 unittest  // output-schema validation is off by default: bad output still ships
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
@@ -4038,7 +4038,7 @@ unittest  // output-schema validation is off by default: bad output still ships
 
 unittest  // output-schema validation: missing structuredContent is a violation
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
@@ -4068,7 +4068,7 @@ unittest  // output-schema validation: missing structuredContent is a violation
 
 unittest  // output-schema validation: an isError result is exempt from the structuredContent MUST
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
@@ -4100,7 +4100,7 @@ unittest  // output-schema validation: an isError result is exempt from the stru
 
 unittest  // output-schema validation off: missing structuredContent still ships
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
@@ -4126,7 +4126,7 @@ unittest  // output-schema validation off: missing structuredContent still ships
 
 unittest  // input-schema validation: a missing required argument yields an isError result
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddArgs
@@ -4159,7 +4159,7 @@ unittest  // input-schema validation: a missing required argument yields an isEr
 
 unittest  // input-schema validation: a wrong-typed argument yields an isError result
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddArgs
@@ -4190,7 +4190,7 @@ unittest  // input-schema validation: a wrong-typed argument yields an isError r
 
 unittest  // input-schema validation: conforming arguments dispatch normally
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddArgs
@@ -4219,7 +4219,7 @@ unittest  // input-schema validation: conforming arguments dispatch normally
 
 unittest  // input-schema validation is ON by default: a missing required argument is rejected
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	// Spec: server/tools § Security Considerations — "Servers MUST: Validate all
 	// tool inputs". The SDK validates tool arguments against the declared
@@ -4251,7 +4251,7 @@ unittest  // input-schema validation is ON by default: a missing required argume
 
 unittest  // input-schema validation default can be turned off via disableInputSchemaValidation
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddArgs
@@ -4280,7 +4280,7 @@ unittest  // input-schema validation default can be turned off via disableInputS
 
 unittest  // a genuinely malformed CallToolRequest (non-string name) is still -32602
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	// The spec reserves protocol errors for requests that fail the
 	// CallToolRequest schema itself (name/arguments), so a non-string `name`

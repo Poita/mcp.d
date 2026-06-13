@@ -1,4 +1,4 @@
-module mcp.api.schema;
+module mcp.protocol.schema;
 
 import std.traits : isInstanceOf, isArray, isSomeString, isIntegral, isFloatingPoint;
 import std.typecons : Nullable;

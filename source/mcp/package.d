@@ -31,6 +31,7 @@ public import mcp.protocol.capabilities;
 public import mcp.protocol.types;
 public import mcp.protocol.tasks;
 public import mcp.protocol.sampling;
+public import mcp.protocol.schema;
 
 // --- Server / client entry points ---
 public import mcp.server.task_store;
@@ -47,7 +48,6 @@ public import mcp.client.cache;
 
 // --- Declarative UDA / reflection API ---
 public import mcp.api.attributes;
-public import mcp.api.schema;
 public import mcp.api.reflection;
 
 // --- MCP Apps extension (interactive UI resources) ---
