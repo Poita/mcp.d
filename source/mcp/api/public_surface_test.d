@@ -74,6 +74,14 @@ unittest
 	static assert(visibleFromMcp!"RequestContext");
 }
 
+// The schema layer's `elicitationRequest!T` builder is the user-facing entry
+// point for deriving an elicitation request from a flat struct, so it stays
+// reachable from `import mcp;`.
+unittest
+{
+	static assert(visibleFromMcp!"elicitationRequest");
+}
+
 // User-facing draft result/hint types referenced by lean-surface members
 // (`McpServer.setListCacheHint(string, CacheHint)` and `McpClient.discover()`
 // returning `DiscoverResult`) must be usable with `import mcp;` alone.
@@ -83,6 +91,15 @@ unittest
 	static assert(visibleFromMcp!"CacheHint");
 	static assert(visibleFromMcp!"CacheScope");
 	static assert(visibleFromMcp!"RequestMeta");
+}
+
+// `mcp.protocol.modern` holds only user-facing result/hint types, so it is
+// re-exported wholesale. Its cache-hint codec (`withCache`/`parseCacheHint`)
+// therefore rides along on the top-level surface.
+unittest
+{
+	static assert(visibleFromMcp!"withCache");
+	static assert(visibleFromMcp!"parseCacheHint");
 }
 
 // A user with only `import mcp;` can construct a CacheHint to call
@@ -134,12 +151,34 @@ unittest
 	static assert(!visibleFromMcp!"readRequestState");
 }
 
+// The MRTR request/response shapes live in `mcp.protocol.mrtr` and are
+// transport plumbing, not top-level public surface: they stay out of
+// `import mcp;`.
+unittest
+{
+	static assert(!visibleFromMcp!"InputRequest");
+	static assert(!visibleFromMcp!"InputRequiredResult");
+	static assert(!visibleFromMcp!"InputResponse");
+}
+
 // Transport wiring is reachable behind the opt-in `mcp.transport` import.
 unittest
 {
 	static assert(visibleFromTransport!"generateSessionId");
 	static assert(visibleFromTransport!"mountOAuthProxy");
 	static assert(visibleFromTransport!"sseStreamHeaders");
+}
+
+// The MRTR plumbing re-exported by `mcp.transport` (header encoding,
+// param-header extraction, `_meta` validation, request-state parsing, and the
+// `InputRequest` shape) is reachable behind the same opt-in import.
+unittest
+{
+	static assert(visibleFromTransport!"encodeHeaderValue");
+	static assert(visibleFromTransport!"paramHeaders");
+	static assert(visibleFromTransport!"validateInputSchemaHeaders");
+	static assert(visibleFromTransport!"readRequestState");
+	static assert(visibleFromTransport!"InputRequest");
 }
 
 // Auth plumbing is reachable behind the opt-in `mcp.auth` import.
