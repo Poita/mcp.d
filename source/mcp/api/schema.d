@@ -198,6 +198,19 @@ unittest  // an unsupported $schema dialect is rejected (MCP "reject unknown dia
 	assertThrown!SchemaException(makeValidator(schema));
 }
 
+unittest  // a draft-07 dialect schema is accepted and enforced (not rejected)
+{
+	import vibe.data.json : parseJsonString;
+
+	// jsonschema supports 2020-12, 2019-09, and draft-07; a schema that declares
+	// a supported non-default dialect compiles and validates rather than throwing.
+	auto v = makeValidator(parseJsonString(
+			`{"$schema": "http://json-schema.org/draft-07/schema#", "type": "integer"}`));
+	assert(v !is null);
+	assert(validationError(v, Json(7)) == "");
+	assert(validationError(v, Json("no")).length > 0);
+}
+
 unittest  // makeValidator returns null for a non-object schema
 {
 	assert(makeValidator(Json.undefined) is null);
