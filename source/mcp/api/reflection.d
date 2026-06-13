@@ -16,6 +16,7 @@ import mcp.server.task_context : TaskContext;
 import mcp.server.task_runtime : TaskOptions;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
+import mcp.api.skills : Skill, registerSkill;
 import mcp.protocol.schema;
 
 @safe:
@@ -91,6 +92,8 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 						registerResourceMethod!(memberName, overload, parent)(server, attr);
 					else static if (is(typeof(attr) == resourceTemplate))
 						registerTemplateMethod!(memberName, overload, parent)(server, attr);
+					else static if (is(typeof(attr) == skill))
+						registerSkillMethod!(memberName, overload, parent)(server, attr);
 				}
 			}
 		}
@@ -915,6 +918,26 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 	}, collectCache!overload());
 }
 
+private void registerSkillMethod(string memberName, alias overload, alias parent)(
+		McpServer server, skill attr) @safe
+{
+	import std.traits : ReturnType;
+
+	// A skill method declares the SKILL.md instructions: it takes no arguments
+	// and returns the body as a string. The frontmatter is synthesized from the
+	// @skill name/description, so the method body need only be the instructions.
+	static assert(Parameters!overload.length == 0, "@skill method '" ~ memberName
+			~ "' must take no parameters; it returns the " ~ "SKILL.md instructions as a string");
+	static assert(isSomeString!(ReturnType!overload),
+			"@skill method '" ~ memberName ~ "' must return the SKILL.md instructions as a string");
+
+	Skill sk;
+	sk.name = attr.name;
+	sk.description = attr.description;
+	sk.instructions = __traits(getMember, parent, memberName)();
+	registerSkill(server, sk);
+}
+
 version (unittest)
 {
 	import core.time : seconds;
@@ -1249,6 +1272,47 @@ unittest  // @resource and @prompt reflection register and dispatch
 	pp["arguments"] = Json(["topic": Json("MCP")]);
 	auto pr = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
 	assert(pr["result"]["messages"][0]["content"]["text"].get!string == "Tell me about MCP");
+}
+
+unittest  // @skill reflection: registerHandlers serves SKILL.md and the index
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.api.skills : skillUri, skillIndexUri, skillMimeType;
+	import vibe.data.json : parseJsonString;
+
+	@safe final class SkillApi
+	{
+		@skill("git-workflow", "Follow Git conventions")
+		string gitWorkflow() @safe
+		{
+			return "# Git Workflow\n\n1. Branch from main.\n";
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new SkillApi);
+
+	// The @skill method is served as a skill:// markdown resource with synthesized
+	// frontmatter wrapping the returned instructions body.
+	Json rp = Json.emptyObject;
+	rp["uri"] = skillUri("git-workflow");
+	auto contents = s.handle(Message(makeRequest(Json(1), "resources/read",
+			rp))).get["result"]["contents"][0];
+	assert(contents["mimeType"].get!string == skillMimeType);
+	const md = contents["text"].get!string;
+	import std.algorithm : canFind;
+
+	assert(md.canFind("name: git-workflow"));
+	assert(md.canFind("# Git Workflow"));
+
+	// The skill is listed in the discovery index.
+	Json ip = Json.emptyObject;
+	ip["uri"] = skillIndexUri;
+	auto idx = s.handle(Message(makeRequest(Json(2), "resources/read",
+			ip))).get["result"]["contents"][0];
+	auto doc = parseJsonString(idx["text"].get!string);
+	assert(doc["skills"].length == 1);
+	assert(doc["skills"][0]["name"].get!string == "git-workflow");
 }
 
 unittest  // @prompt enum arg given an invalid member -> InvalidParams (-32602)
