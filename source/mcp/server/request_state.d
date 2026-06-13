@@ -270,14 +270,14 @@ final class RequestStateCodec
 /// authenticated subject (empty on stdio / in-process, where binding is a
 /// no-op). Shared by the incoming/outgoing seams so both sides bind to the same
 /// identity.
-string requestStateSubject(RequestContext ctx) @safe
+package string requestStateSubject(RequestContext ctx) @safe
 {
 	return ctx.auth().subject;
 }
 
 /// The tool/prompt name (the top-level `params.name`) an MRTR `requestState`
 /// blob binds to under the `authSubjectAndTool` binding.
-string requestStateToolName(Json params) @safe
+package string requestStateToolName(Json params) @safe
 {
 	if (params.type == Json.Type.object && "name" in params
 			&& params["name"].type == Json.Type.string)
@@ -293,7 +293,7 @@ string requestStateToolName(Json params) @safe
 /// wrong-subject / unparseable) it fails closed to an empty string so the
 /// handler re-elicits, with a warning logged. The transparent re-elicit means
 /// no rejection is surfaced to the handler.
-string verifyIncomingRequestState(RequestStateCodec codec, string raw,
+package string verifyIncomingRequestState(RequestStateCodec codec, string raw,
 		string method, Json params, RequestContext ctx) @safe
 {
 	import vibe.core.log : logWarn;
@@ -317,7 +317,7 @@ string verifyIncomingRequestState(RequestStateCodec codec, string raw,
 /// encrypted), expiry-stamped, user-bound blob bound to the same subject/tool
 /// the incoming seam will verify against. Tool, prompt, and task input-required
 /// results all share this single top-level field, so one seam covers all three.
-Json secureOutgoingRequestState(RequestStateCodec codec, Json result,
+package Json secureOutgoingRequestState(RequestStateCodec codec, Json result,
 		string method, Json params, RequestContext ctx) @safe
 {
 	if (codec is null || result.type != Json.Type.object)

@@ -16,7 +16,7 @@ import mcp.protocol.errors : invalidParams;
 /// Encode an offset into the opaque pagination cursor handed to the client.
 /// The format is intentionally opaque per spec ("Clients MUST treat cursors
 /// as opaque tokens"); we base64url-encode the decimal offset.
-string encodeCursor(size_t offset) @safe
+package string encodeCursor(size_t offset) @safe
 {
 	import std.conv : to;
 	import std.string : representation;
@@ -28,7 +28,7 @@ string encodeCursor(size_t offset) @safe
 /// Decode a pagination cursor previously produced by `encodeCursor`. Throws
 /// `invalidParams` (-32602) for a malformed cursor, per the pagination spec
 /// ("If the cursor is invalid ... SHOULD return ... Invalid params").
-size_t decodeCursor(string cursor) @safe
+package size_t decodeCursor(string cursor) @safe
 {
 	import std.base64 : Base64URLNoPadding, Base64Exception;
 	import std.conv : to, ConvException;
@@ -52,8 +52,8 @@ size_t decodeCursor(string cursor) @safe
 /// (otherwise left null). With pagination disabled (`pageSize == 0`) the whole
 /// list is returned and `next` stays null. Throws `invalidParams` for a
 /// malformed or out-of-range cursor.
-void pageBounds(Json params, size_t total, size_t pageSize, out size_t begin,
-		out size_t end, out Nullable!string next) @safe
+package void pageBounds(Json params, size_t total, size_t pageSize,
+		out size_t begin, out size_t end, out Nullable!string next) @safe
 {
 	begin = 0;
 	if (params.type == Json.Type.object && "cursor" in params
