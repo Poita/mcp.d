@@ -321,9 +321,9 @@ identity. The default per-client store leaves `cachePartition` empty and the
 distinction is moot.
 
 ```d
-auto shared = new MyRedisStore;
-ClientSettings sa; sa.cache = shared; sa.cachePartition = "tenant-a";
-ClientSettings sb; sb.cache = shared; sb.cachePartition = "tenant-b";
+auto store = new MyRedisStore;
+ClientSettings sa; sa.cache = store; sa.cachePartition = "tenant-a";
+ClientSettings sb; sb.cache = store; sb.cachePartition = "tenant-b";
 // a public listTools fetched by tenant-a is served to tenant-b with no round-trip;
 // a private readResource stays isolated to its tenant.
 ```
