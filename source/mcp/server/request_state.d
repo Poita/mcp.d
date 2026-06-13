@@ -35,6 +35,7 @@ import deimos.openssl.rand;
 import deimos.openssl.crypto;
 
 import mcp.auth.oauth : base64UrlNoPad;
+import mcp.server.context : RequestContext;
 
 @safe:
 
@@ -259,6 +260,76 @@ final class RequestStateCodec
 	{
 		return macSubkey[];
 	}
+}
+
+// ===========================================================================
+// Dispatch-path seams (bind/verify/wrap the MRTR requestState in one place)
+// ===========================================================================
+
+/// The identity an MRTR `requestState` blob is bound to: the request's
+/// authenticated subject (empty on stdio / in-process, where binding is a
+/// no-op). Shared by the incoming/outgoing seams so both sides bind to the same
+/// identity.
+package string requestStateSubject(RequestContext ctx) @safe
+{
+	return ctx.auth().subject;
+}
+
+/// The tool/prompt name (the top-level `params.name`) an MRTR `requestState`
+/// blob binds to under the `authSubjectAndTool` binding.
+package string requestStateToolName(Json params) @safe
+{
+	if (params.type == Json.Type.object && "name" in params
+			&& params["name"].type == Json.Type.string)
+		return params["name"].get!string;
+	return "";
+}
+
+/// Verify an incoming (echoed) MRTR `requestState`. With no codec configured
+/// (`codec is null`) the raw value passes through unchanged (plaintext). With
+/// the codec enabled, a non-empty blob is decoded and verified against the
+/// request's authenticated subject and tool name; on success the inner state
+/// is returned, and on ANY failure (tamper / GCM auth fail / expiry /
+/// wrong-subject / unparseable) it fails closed to an empty string so the
+/// handler re-elicits, with a warning logged. The transparent re-elicit means
+/// no rejection is surfaced to the handler.
+package string verifyIncomingRequestState(RequestStateCodec codec, string raw,
+		string method, Json params, RequestContext ctx) @safe
+{
+	import vibe.core.log : logWarn;
+
+	if (codec is null || raw.length == 0)
+		return raw;
+	auto decoded = codec.decode(raw, requestStateSubject(ctx), requestStateToolName(params));
+	if (decoded.isNull)
+	{
+		logWarn("secureRequestState: rejected an echoed requestState on %s "
+				~ "(tamper, expiry, wrong-subject, or malformed); re-eliciting.", method);
+		return "";
+	}
+	return decoded.get;
+}
+
+/// Wrap an outgoing MRTR `requestState` on an input-required result. With no
+/// codec configured (`codec is null`) the result is returned unchanged
+/// (plaintext, no wire change). With the codec enabled, a non-empty top-level
+/// `requestState` string is replaced by an integrity-protected (and optionally
+/// encrypted), expiry-stamped, user-bound blob bound to the same subject/tool
+/// the incoming seam will verify against. Tool, prompt, and task input-required
+/// results all share this single top-level field, so one seam covers all three.
+package Json secureOutgoingRequestState(RequestStateCodec codec, Json result,
+		string method, Json params, RequestContext ctx) @safe
+{
+	if (codec is null || result.type != Json.Type.object)
+		return result;
+	if ("requestState" !in result || result["requestState"].type != Json.Type.string)
+		return result;
+	const plain = result["requestState"].get!string;
+	if (plain.length == 0)
+		return result;
+	result["requestState"] = codec.encode(plain, requestStateSubject(ctx),
+			requestStateToolName(params));
+	return result;
 }
 
 // ===========================================================================

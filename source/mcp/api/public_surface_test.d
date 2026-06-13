@@ -102,6 +102,19 @@ unittest
 	assert(r.toJson()["supportedVersions"][0].get!string == "2025-11-25");
 }
 
+// Handler-outcome DTOs and handler aliases are reachable from `import mcp;`.
+// server.d re-exports these from mcp.server.responses; package.d reaches them
+// transitively through `public import mcp.server.server`.
+unittest
+{
+	static assert(visibleFromMcp!"ToolResponse");
+	static assert(visibleFromMcp!"PromptResponse");
+	static assert(visibleFromMcp!"ToolHandler");
+	static assert(visibleFromMcp!"MrtrToolHandler");
+	static assert(visibleFromMcp!"MrtrPromptHandler");
+	static assert(visibleFromMcp!"InputRequiredPart");
+}
+
 // Auth verifier internals are NOT dumped at the top level.
 unittest
 {
