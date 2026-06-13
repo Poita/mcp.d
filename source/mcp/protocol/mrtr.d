@@ -621,9 +621,9 @@ struct InputRequest
 
 	/// Build a form-`elicitation` input-request from a message and an optional
 	/// JSON Schema (`requestedSchema`). For a `requestedSchema` derived from a flat
-	/// struct `T`, use `mcp.api.schema.elicitationRequest!T` (the schema layer is
-	/// where reflection-driven schema generation lives, so the protocol module
-	/// stays free of any `mcp.api` dependency).
+	/// struct `T`, use `mcp.protocol.schema.elicitationRequest!T` (where
+	/// reflection-driven schema generation lives, so this module stays free of any
+	/// schema/reflection dependency).
 	static InputRequest elicitation(string id, string message, Json requestedSchema = Json
 			.undefined) @safe
 	{

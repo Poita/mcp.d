@@ -181,6 +181,21 @@ unittest
 	static assert(visibleFromTransport!"InputRequest");
 }
 
+// The named server-side transport seam is reachable behind the opt-in
+// `mcp.transport` import.
+unittest
+{
+	static assert(visibleFromTransport!"ServerCore");
+	static assert(visibleFromTransport!"ServerTransport");
+}
+
+// `ServerCore` / `ServerTransport` must NOT appear on the lean top-level surface.
+unittest
+{
+	static assert(!visibleFromMcp!"ServerCore");
+	static assert(!visibleFromMcp!"ServerTransport");
+}
+
 // Auth plumbing is reachable behind the opt-in `mcp.auth` import.
 unittest
 {

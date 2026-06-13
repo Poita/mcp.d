@@ -679,7 +679,7 @@ bool isValidClientIdMetadataUrl(string clientId) @safe pure nothrow @nogc
 /// `secureRequestHTTP`, which resolves, classifies and pins via the connector.
 bool isSecureFetchUrl(string url) @safe
 {
-	import mcp.auth.ssrf : classifyHostLexical, AddressClass;
+	import mcp.protocol.ssrf : classifyHostLexical, AddressClass;
 	import vibe.inet.url : URL;
 
 	string scheme, host;
@@ -735,7 +735,7 @@ bool isSecureFetchUrl(string url) @safe
 void requireSecureUrl(string url) @safe
 {
 	import mcp.protocol.errors : invalidRequest;
-	import mcp.auth.ssrf : classifyHostLexical, AddressClass;
+	import mcp.protocol.ssrf : classifyHostLexical, AddressClass;
 	import vibe.inet.url : URL;
 
 	string scheme, host;
@@ -794,7 +794,8 @@ void requireSecureUrl(string url) @safe
 /// Loopback and IP-literal hosts short-circuit without resolving. `@safe`.
 bool isSecureFetchUrlResolved(string url) @safe
 {
-	import mcp.auth.ssrf : classifyHostLexical, AddressClass, pinnedConnectAddress, SsrfPolicy;
+	import mcp.protocol.ssrf : classifyHostLexical, AddressClass,
+		pinnedConnectAddress, SsrfPolicy;
 	import vibe.inet.url : URL;
 
 	string scheme, host;
@@ -853,7 +854,7 @@ bool isSecureFetchUrlResolved(string url) @safe
 void secureRequestHTTP(string url, scope void delegate(scope HTTPClientRequest) requester,
 		scope void delegate(scope HTTPClientResponse) responder) @safe
 {
-	import mcp.auth.ssrf : connectorRequest = secureRequestHTTP, SsrfPolicy;
+	import mcp.protocol.ssrf : connectorRequest = secureRequestHTTP, SsrfPolicy;
 
 	connectorRequest(url, SsrfPolicy.blockInternal, requester, responder);
 }
