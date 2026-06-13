@@ -1,4 +1,4 @@
-module mcp.auth.ssrf;
+module mcp.protocol.ssrf;
 
 import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 

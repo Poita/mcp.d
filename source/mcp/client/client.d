@@ -1602,7 +1602,7 @@ final class McpClient : ClientProtocol
 	/// an object or there is no structured content), otherwise the first violation.
 	private static string validateStructured(const CallToolResult result, Json outputSchema) @safe
 	{
-		import mcp.api.schema : validateAgainstSchema;
+		import mcp.protocol.schema : validateAgainstSchema;
 
 		if (outputSchema.type != Json.Type.object)
 			return "";
@@ -3443,7 +3443,7 @@ unittest  // getPrompt RequestOptions.logLevel attaches the draft per-request op
 
 unittest  // validateOutput passes a conforming structured result
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	struct AddResult
 	{
@@ -3458,7 +3458,7 @@ unittest  // validateOutput passes a conforming structured result
 
 unittest  // validateOutput rejects a non-conforming structured result
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	struct AddResult
 	{
@@ -3481,7 +3481,7 @@ unittest  // validateOutput is a no-op when the tool has no output schema
 
 unittest  // validateOutput is a no-op when there is no structured content
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	struct AddResult
 	{
@@ -3495,7 +3495,7 @@ unittest  // validateOutput is a no-op when there is no structured content
 
 unittest  // string-name callTool validates against the listTools-cached outputSchema
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	struct AddResult
 	{
@@ -3531,7 +3531,7 @@ unittest  // string-name callTool validates against the listTools-cached outputS
 
 unittest  // string-name callTool accepts a conforming result against the cached outputSchema
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	struct AddResult
 	{
@@ -3559,7 +3559,7 @@ unittest  // string-name callTool accepts a conforming result against the cached
 
 unittest  // string-name callTool skips output validation when it is not enabled
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	struct AddResult
 	{
@@ -3587,7 +3587,7 @@ unittest  // string-name callTool skips output validation when it is not enabled
 
 unittest  // a pre-seeded tools/list cache drives output validation with no local listTools
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 	import std.datetime : SysTime, DateTime;
 
 	struct AddResult
@@ -3620,7 +3620,7 @@ unittest  // a pre-seeded tools/list cache drives output validation with no loca
 
 unittest  // a pre-seeded tools/list cache accepts a conforming result with no local listTools
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 	import std.datetime : SysTime, DateTime;
 
 	struct AddResult

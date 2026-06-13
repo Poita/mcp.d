@@ -827,7 +827,7 @@ struct InputRequest
 	/// the reflection layer in.
 	static InputRequest elicitation(T)(string id, string message) @safe
 	{
-		import mcp.api.schema : jsonSchemaOf, isFlatElicitationStruct;
+		import mcp.protocol.schema : jsonSchemaOf, isFlatElicitationStruct;
 
 		static assert(isFlatElicitationStruct!T, "elicitation!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
 				.stringof ~ " has a nested or non-scalar field");
@@ -1285,7 +1285,7 @@ unittest  // InputRequest.elicitation builder sets message + requestedSchema
 
 unittest  // InputRequest.elicitation!T derives requestedSchema from a flat struct
 {
-	import mcp.api.schema : jsonSchemaOf;
+	import mcp.protocol.schema : jsonSchemaOf;
 
 	static struct Details
 	{

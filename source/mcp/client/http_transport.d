@@ -373,7 +373,7 @@ final class HttpClientTransport : ClientTransport
 	{
 		import std.conv : to;
 
-		import mcp.auth.ssrf : secureRequestHTTP, SsrfPolicy;
+		import mcp.protocol.ssrf : secureRequestHTTP, SsrfPolicy;
 
 		const target = legacyMode ? legacyEndpoint : url;
 		int status;
@@ -1606,7 +1606,7 @@ HttpEndpoint parseHttpEndpoint(string url) @safe
 /// `@safe`.
 string pinnedEndpointHost(HttpEndpoint ep) @safe
 {
-	import mcp.auth.ssrf : pinnedConnectAddress, SsrfPolicy;
+	import mcp.protocol.ssrf : pinnedConnectAddress, SsrfPolicy;
 	import mcp.protocol.errors : internalError;
 
 	const pin = pinnedConnectAddress(ep.host, ep.tls, SsrfPolicy.allowUserConfigured);
