@@ -326,142 +326,15 @@ struct meta
 	Json value; /// the `_meta` object (must be a JSON object to be emitted)
 }
 
-/// Field-level UDA declaring a human-readable `description` (the JSON Schema
-/// `description` keyword) for a struct field. When `jsonSchemaOf!T` reflects
-/// over a struct, a field annotated with `@fieldDescription("…")` emits
-/// `"description": "…"` on its property schema. Named `fieldDescription`
-/// rather than `description` to avoid shadowing D's `std.traits.description`
-/// and to keep the name unambiguous at the call site.
-///
-/// Example:
-/// ---
-/// struct Form
-/// {
-///     @fieldDescription("Number of items to return") int count;
-/// }
-/// ---
-struct fieldDescription
-{
-	string value; /// the description emitted as JSON Schema `description`
-}
-
-/// Field-level UDA declaring a numeric lower bound (the JSON Schema `minimum`
-/// keyword) for a struct field. When `jsonSchemaOf!T` reflects over a struct,
-/// a field annotated with `@minimum(v)` emits `"minimum": v` on its property
-/// schema. Intended for numeric / integer fields (e.g. tool input or
-/// elicitation form schemas); applying it to a non-numeric field has no
-/// defined meaning but the bound is still emitted verbatim.
-///
-/// Example:
-/// ---
-/// struct Form
-/// {
-///     @minimum(1) @maximum(100) int count;
-/// }
-/// ---
-struct minimum
-{
-	double value; /// the inclusive lower bound emitted as JSON Schema `minimum`
-}
-
-/// Field-level UDA declaring a numeric upper bound (the JSON Schema `maximum`
-/// keyword) for a struct field. See `@minimum` for usage; a field annotated
-/// with `@maximum(v)` emits `"maximum": v` on its property schema.
-struct maximum
-{
-	double value; /// the inclusive upper bound emitted as JSON Schema `maximum`
-}
-
-/// Field-level UDA declaring a human-readable display `title` (the JSON Schema
-/// `title` keyword) for a struct field. When `jsonSchemaOf!T` reflects over a
-/// struct, a field annotated with `@title("…")` emits `"title": "…"` on its
-/// property schema.
-///
-/// Example:
-/// ---
-/// struct Form
-/// {
-///     @title("Item count") int count;
-/// }
-/// ---
-struct title
-{
-	string value; /// the display title emitted as JSON Schema `title`
-}
-
-/// Field-level UDA declaring the JSON Schema string `format` keyword (e.g.
-/// `"email"`, `"uri"`, `"date-time"`) for a struct/elicitation field. Emitted
-/// verbatim onto the property schema by `jsonSchemaOf`.
-struct format
-{
-	string value; /// the JSON Schema `format` token
-}
-
-/// Field-level UDA declaring the JSON Schema `minLength` keyword (minimum string
-/// length) for a struct/elicitation string field.
-struct minLength
-{
-	size_t value; /// inclusive minimum string length
-}
-
-/// Field-level UDA declaring the JSON Schema `maxLength` keyword (maximum string
-/// length) for a struct/elicitation string field.
-struct maxLength
-{
-	size_t value; /// inclusive maximum string length
-}
-
-/// Field-level UDA declaring the JSON Schema `pattern` keyword (an ECMA-262
-/// regular expression a string must match) for a struct/elicitation field.
-struct pattern
-{
-	string value; /// the regular-expression pattern
-}
-
-/// Field-level UDA declaring the JSON Schema `minItems` keyword (minimum array
-/// length) for a struct/elicitation array field.
-struct minItems
-{
-	size_t value; /// inclusive minimum array length
-}
-
-/// Field-level UDA declaring the JSON Schema `maxItems` keyword (maximum array
-/// length) for a struct/elicitation array field.
-struct maxItems
-{
-	size_t value; /// inclusive maximum array length
-}
-
-/// Field-level UDA declaring a default value (the JSON Schema `default`
-/// keyword) for a struct field. Named `@schemaDefault` to avoid clashing with
-/// D's `default` keyword. When `jsonSchemaOf!T` reflects over a struct, a field
-/// annotated with `@schemaDefault(v)` emits `"default": v` on its property
-/// schema, serializing the value (an `enum` value is emitted as its wire string,
-/// a `bool` as a JSON boolean, etc.).
-///
-/// Example:
-/// ---
-/// struct Form
-/// {
-///     @schemaDefault(false) bool verbose;
-///     @schemaDefault(10) int limit;
-/// }
-/// ---
-/// The payload struct carrying a `@schemaDefault` value. Construct it via the
-/// `schemaDefault(value)` factory below rather than naming it directly; the
-/// reflection layer detects it with `isInstanceOf!(SchemaDefault, UDA)`.
-struct SchemaDefault(T)
-{
-	T value; /// the default value emitted (serialized) as JSON Schema `default`
-}
-
-/// Factory producing the `@schemaDefault` UDA so the element type is inferred
-/// from the supplied value (`@schemaDefault(false)` rather than
-/// `@schemaDefault!bool(false)`).
-SchemaDefault!T schemaDefault(T)(T value) @safe pure nothrow
-{
-	return SchemaDefault!T(value);
-}
+/// The JSON Schema constraint UDAs (`@fieldDescription`, `@minimum`, `@maximum`,
+/// `@title`, `@format`, `@minLength`, `@maxLength`, `@pattern`, `@minItems`,
+/// `@maxItems`, `@schemaDefault`/`SchemaDefault`) are owned by the `jsonschema`
+/// package, which also owns the schema generation (`jsonSchemaOf`) and facet
+/// application (`applyUdaFacets`) that consume them. They are re-exported here so
+/// MCP users get them from `mcp.api.attributes` alongside the MCP-specific UDAs,
+/// and so the type identity matches what `jsonschema` matches against.
+public import jsonschema : fieldDescription, minimum, maximum, title, format,
+	minLength, maxLength, pattern, minItems, maxItems, SchemaDefault, schemaDefault;
 
 /// UDA declaring a per-resource / per-template draft `CacheableResult` freshness
 /// hint for a `@resource`- or `@resourceTemplate`-annotated method. The reflection

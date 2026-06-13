@@ -4,6 +4,8 @@ import core.time : Duration, seconds, msecs;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
+import jsonschema : Validator;
+
 import mcp.protocol.versions;
 import mcp.protocol.errors;
 import mcp.protocol.jsonrpc;
@@ -231,6 +233,12 @@ struct RegisteredTool
 	/// lists the unmet ones) when the request's declared client capabilities do
 	/// not cover these. Empty (the default) means no gating.
 	ClientCapabilities requiredClientCapabilities;
+	/// Validators compiled once from `descriptor.inputSchema`/`outputSchema` at
+	/// registration, so request-time input/output validation reuses the compiled
+	/// form instead of recompiling the schema on every `tools/call`. `null` when
+	/// the corresponding schema is absent (imposes no constraint).
+	Validator inputValidator;
+	Validator outputValidator; /// ditto
 }
 
 /// A registered direct resource: descriptor + reader producing its contents.
@@ -586,8 +594,22 @@ final class McpServer
 	void registerTool(Tool descriptor, ToolHandler handler) @safe
 	{
 		requireToolNameAvailable(descriptor.name);
-		tools[descriptor.name] = RegisteredTool(descriptor, (Json args,
-				RequestContext ctx) => ToolResponse.complete(handler(args, ctx)));
+		tools[descriptor.name] = withCompiledValidators(RegisteredTool(descriptor,
+				(Json args, RequestContext ctx) => ToolResponse.complete(handler(args, ctx))));
+	}
+
+	/// Compile a registered tool's input/output schema validators once, at
+	/// registration. A schema mcp.d generated is always valid 2020-12; a
+	/// hand-supplied schema that is a malformed object or declares an unsupported
+	/// `$schema` dialect throws here (a `jsonschema.SchemaException`) rather than
+	/// silently under-validating each `tools/call`.
+	private static RegisteredTool withCompiledValidators(RegisteredTool rt) @safe
+	{
+		import mcp.api.schema : makeValidator;
+
+		rt.inputValidator = makeValidator(rt.descriptor.inputSchema);
+		rt.outputValidator = makeValidator(rt.descriptor.outputSchema);
+		return rt;
 	}
 
 	/// Register a *dynamic* tool with a simple handler that ignores the request
@@ -596,8 +618,8 @@ final class McpServer
 	void registerTool(Tool descriptor, CallToolResult delegate(Json) @safe handler) @safe
 	{
 		requireToolNameAvailable(descriptor.name);
-		tools[descriptor.name] = RegisteredTool(descriptor, (Json args,
-				RequestContext) => ToolResponse.complete(handler(args)));
+		tools[descriptor.name] = withCompiledValidators(RegisteredTool(descriptor,
+				(Json args, RequestContext) => ToolResponse.complete(handler(args))));
 	}
 
 	/// Register a *dynamic* tool whose handler may ask the client for more input
@@ -609,7 +631,7 @@ final class McpServer
 	void registerTool(Tool descriptor, MrtrToolHandler handler) @safe
 	{
 		requireToolNameAvailable(descriptor.name);
-		tools[descriptor.name] = RegisteredTool(descriptor, handler);
+		tools[descriptor.name] = withCompiledValidators(RegisteredTool(descriptor, handler));
 	}
 
 	/// Throw when a tool with `name` is already registered. Registration entry
@@ -2994,7 +3016,7 @@ final class McpServer
 		// behaviour.
 		if (validateInputSchema_)
 		{
-			const schemaMsg = checkInputSchema(entry.descriptor, args);
+			const schemaMsg = checkInputSchema(entry.inputValidator, entry.descriptor.name, args);
 			if (schemaMsg.length)
 			{
 				CallToolResult err;
@@ -3022,7 +3044,7 @@ final class McpServer
 			// declared outputSchema before version-shaping, so validation always
 			// sees the full structuredContent regardless of the negotiated version.
 			if (validateOutputSchema_ && !response.isTask)
-				checkOutputSchema(entry.descriptor, response.toJson());
+				checkOutputSchema(entry.outputValidator, entry.descriptor.name, response.toJson());
 			// Project the result to the negotiated protocol version so version-
 			// gated fields are not emitted to peers that don't understand them.
 			// `CallToolResult.structuredContent` is a 2025-06-18+ field; forVersion
@@ -3050,15 +3072,13 @@ final class McpServer
 	/// input-validation error reported as a tool-execution result with
 	/// `isError:true`, NOT a JSON-RPC protocol error, so the caller turns the
 	/// returned message into a `CallToolResult` rather than throwing.
-	private static string checkInputSchema(ref const Tool descriptor, Json args) @safe
+	private static string checkInputSchema(Validator validator, string toolName, Json args) @safe
 	{
-		import mcp.api.schema : validateAgainstSchema;
+		import mcp.api.schema : validationError;
 
-		if (descriptor.inputSchema.type != Json.Type.object)
-			return null;
-		const msg = validateAgainstSchema(args, descriptor.inputSchema);
+		const msg = validationError(validator, args);
 		if (msg.length)
-			return "Invalid arguments for tool '" ~ descriptor.name ~ "': " ~ msg;
+			return "Invalid arguments for tool '" ~ toolName ~ "': " ~ msg;
 		return null;
 	}
 
@@ -3074,11 +3094,12 @@ final class McpServer
 	/// only, no `content`) are exempt: the MUST governs successful structured
 	/// results, not error reports or input-gathering round trips. Throws an
 	/// internal `McpException` on a violation.
-	private static void checkOutputSchema(ref const Tool descriptor, Json result) @safe
+	private static void checkOutputSchema(Validator validator, string toolName, Json result) @safe
 	{
-		import mcp.api.schema : validateAgainstSchema;
+		import mcp.api.schema : validationError;
 
-		if (descriptor.outputSchema.type != Json.Type.object)
+		// A null validator means the tool declared no output schema.
+		if (validator is null)
 			return;
 		if (result.type != Json.Type.object)
 			return;
@@ -3094,12 +3115,12 @@ final class McpServer
 		// Presence half of the MUST: a successful result with a declared
 		// outputSchema must provide structuredContent.
 		if ("structuredContent" !in result)
-			throw new McpException(ErrorCode.internalError, "Tool '" ~ descriptor.name
+			throw new McpException(ErrorCode.internalError, "Tool '" ~ toolName
 					~ "' declares an outputSchema but produced no structuredContent; "
 					~ "the spec requires servers to provide structured results that conform to the schema");
-		const msg = validateAgainstSchema(result["structuredContent"], descriptor.outputSchema);
+		const msg = validationError(validator, result["structuredContent"]);
 		if (msg.length)
-			throw new McpException(ErrorCode.internalError, "Tool '" ~ descriptor.name
+			throw new McpException(ErrorCode.internalError, "Tool '" ~ toolName
 					~ "' produced structuredContent that does not conform to its outputSchema: "
 					~ msg);
 	}

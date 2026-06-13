@@ -191,11 +191,20 @@ private Json parametersSchema(alias func)() @safe
 		static if (!is(P : RequestContext) && !is(P == TaskContext))
 		{
 			{
-				Json ps = jsonSchemaOf!P;
-				// Apply field-level facet UDAs (@minimum, @maximum, @title,
-				// @format, @minLength, @maxLength, @pattern, @minItems,
-				// @maxItems, @schemaDefault) attached directly to the parameter.
-				mcp.api.schema.applyUdaFacets!(__traits(getAttributes, types[i .. i + 1]))(ps);
+				// Generate the parameter's schema and fold in the field-level
+				// facet UDAs (@minimum, @maximum, @title, @format, @minLength,
+				// @maxLength, @pattern, @minItems, @maxItems, @schemaDefault)
+				// attached directly to the parameter. Both the generator and
+				// applyUdaFacets are jsonschema's, operating in its JsonNode IR;
+				// render to vibe Json once the facets are applied, then layer the
+				// MCP-specific extensions (x-mcp-header, description) on below.
+				import jsonschema : genParamNode = jsonSchemaOf, applyUdaFacets, GeneratorSettings;
+				import jsonschema.vibejson : nodeToVibeJson;
+
+				enum GeneratorSettings paramSettings = {inlineSubschemas: true};
+				auto psNode = genParamNode!(P, paramSettings)();
+				applyUdaFacets!(__traits(getAttributes, types[i .. i + 1]))(psNode);
+				Json ps = nodeToVibeJson(psNode);
 				// Draft x-mcp-header: a method-level @mcpHeader(parameter, name)
 				// naming this parameter mirrors it into an `Mcp-Param-<name>`
 				// request header; emit the extension property so the transport can
@@ -2485,10 +2494,12 @@ unittest  // facet UDAs on bare tool parameters are emitted into inputSchema
 	}
 
 	// @minimum and @maximum on a bare int parameter must appear in its schema.
+	// A whole-number facet is emitted as a JSON integer (`0`, not `0.0`), so read
+	// the bound as an integer rather than asserting a float storage type.
 	auto valueProp = clampTool["inputSchema"]["properties"]["value"];
 	assert(valueProp["type"].get!string == "integer");
-	assert(valueProp["minimum"].get!double == 0.0);
-	assert(valueProp["maximum"].get!double == 100.0);
+	assert(valueProp["minimum"].get!long == 0);
+	assert(valueProp["maximum"].get!long == 100);
 
 	// @format on a bare string parameter must appear in its schema.
 	auto addrProp = emailTool["inputSchema"]["properties"]["address"];
