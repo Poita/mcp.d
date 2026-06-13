@@ -2494,10 +2494,12 @@ unittest  // facet UDAs on bare tool parameters are emitted into inputSchema
 	}
 
 	// @minimum and @maximum on a bare int parameter must appear in its schema.
+	// A whole-number facet is emitted as a JSON integer (`0`, not `0.0`), so read
+	// the bound as an integer rather than asserting a float storage type.
 	auto valueProp = clampTool["inputSchema"]["properties"]["value"];
 	assert(valueProp["type"].get!string == "integer");
-	assert(valueProp["minimum"].get!double == 0.0);
-	assert(valueProp["maximum"].get!double == 100.0);
+	assert(valueProp["minimum"].get!long == 0);
+	assert(valueProp["maximum"].get!long == 100);
 
 	// @format on a bare string parameter must appear in its schema.
 	auto addrProp = emailTool["inputSchema"]["properties"]["address"];
