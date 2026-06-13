@@ -388,6 +388,34 @@ client (sampling/elicitation). For tools whose schema is only known at runtime,
 drop to `server.registerTool(Tool, delegate)` / `registerResource` /
 `registerPrompt`, which receive the raw `Json`.
 
+### D type → JSON Schema mapping
+
+The compile-time schema generator maps D types as follows (so the emitted schema
+is predictable when porting a hand-built server):
+
+| D type | JSON Schema |
+| --- | --- |
+| `bool` | `{"type": "boolean"}` |
+| `int` / `long` / `short` / `byte` (and `uint`/`ulong`/… ) | `{"type": "integer"}` (unsigned also gets `"minimum": 0`) |
+| `float` / `double` | `{"type": "number"}` |
+| `string` | `{"type": "string"}` |
+| `enum` | `{"type": "string", "enum": [members…]}` |
+| `T[]` | `{"type": "array", "items": <T>}` |
+| `V[string]` | `{"type": "object", "additionalProperties": <V>}` |
+| `struct` | `{"type": "object", "properties": …, "required": […]}` |
+| `std.datetime` `SysTime`/`DateTime`/`Date`/`TimeOfDay` | `{"type": "string", "format": "date-time"/"date"/"time"}` |
+| `SumType!(A, B, …)` | `{"anyOf": [<A>, <B>, …]}` |
+| `Nullable!T` (tool parameter) | `<T>`, made optional by omission from `required` |
+| `Nullable!T` (output / elicitation schema) | `{"anyOf": [<T>, {"type": "null"}]}` |
+
+Integer types map to `"integer"` (not `"number"`) deliberately — it is the more
+precise constraint; use `double` for a field that should accept fractional values.
+An optional tool parameter is modelled as a bare type left out of `required` (the
+convention used by the MCP reference servers); declare it `Nullable!T` or give it a
+D default value (`int page = 1`). Field/parameter constraints are added with UDAs:
+`@minimum` / `@maximum`, `@minLength` / `@maxLength`, `@pattern`, `@minItems` /
+`@maxItems`, `@format`, `@title`, `@schemaDefault`, and `@fieldDescription`.
+
 ## MCP Apps (interactive UI)
 
 The [MCP Apps extension](https://modelcontextprotocol.io/extensions/apps/overview)

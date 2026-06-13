@@ -198,10 +198,18 @@ private Json parametersSchema(alias func)() @safe
 				// applyUdaFacets are jsonschema's, operating in its JsonNode IR;
 				// render to vibe Json once the facets are applied, then layer the
 				// MCP-specific extensions (x-mcp-header, description) on below.
+				//
+				// nullableOmitsNull: a tool input models an optional parameter as a
+				// bare type absent from `required` (the convention the MCP reference
+				// servers use), not as a union with null. So a `Nullable!T` parameter
+				// emits the bare schema for T rather than anyOf:[T,null]; optionality
+				// is carried by `required` below. (Output and elicitation schemas use
+				// the mcp.api.schema adapter, which keeps the honest anyOf:[T,null].)
 				import jsonschema : genParamNode = jsonSchemaOf, applyUdaFacets, GeneratorSettings;
 				import jsonschema.vibejson : nodeToVibeJson;
 
-				enum GeneratorSettings paramSettings = {inlineSubschemas: true};
+				// (emitSchemaKeyword: false, inlineSubschemas: true, nullableOmitsNull: true)
+				enum GeneratorSettings paramSettings = GeneratorSettings(false, true, true);
 				auto psNode = genParamNode!(P, paramSettings)();
 				applyUdaFacets!(__traits(getAttributes, types[i .. i + 1]))(psNode);
 				Json ps = nodeToVibeJson(psNode);
@@ -2505,6 +2513,82 @@ unittest  // facet UDAs on bare tool parameters are emitted into inputSchema
 	auto addrProp = emailTool["inputSchema"]["properties"]["address"];
 	assert(addrProp["type"].get!string == "string");
 	assert(addrProp["format"].get!string == "email");
+}
+
+version (unittest) private final class OptionalParamApi
+{
+	enum Unique
+	{
+		cards,
+		art,
+		prints
+	}
+
+	// All-optional parameters: a plain Nullable, an optional enum, and a
+	// Nullable carrying a @schemaDefault.
+	@tool("opt", "Optional params")
+	string opt(Nullable!string order, Nullable!Unique unique, @schemaDefault(1) Nullable!int page)@safe
+	{
+		return "ok";
+	}
+
+	// A parameter facet (@schemaDefault/@minimum) AND a method-level marker
+	// (@readOnly/@openWorld) on the same function.
+	@tool("search", "Search")
+	@readOnly @openWorld string search(string query, @schemaDefault(1) @minimum(1) int page = 1)@safe
+	{
+		return query;
+	}
+}
+
+version (unittest) private Json optToolSchema() @safe
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new OptionalParamApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+	foreach (i; 0 .. tools.length)
+		if (tools[i]["name"].get!string == "opt")
+			return tools[i]["inputSchema"];
+	assert(false, "opt tool not found");
+}
+
+unittest  // a parameter facet + a method-level marker on the same tool compiles (#1263)
+{
+	// Registration must compile: applyUdaFacets has to ignore the bare-type
+	// markers (@readOnly/@openWorld) mixed into the parameter's attribute set.
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new OptionalParamApi);
+}
+
+unittest  // a Nullable!T parameter is a bare optional: no anyOf/null, absent from required (#1265)
+{
+	auto schema = optToolSchema();
+	auto order = schema["properties"]["order"];
+	assert(order["type"].get!string == "string");
+	assert("anyOf" !in order);
+	// All parameters are optional, so the schema carries no `required` array.
+	assert("required" !in schema);
+}
+
+unittest  // an optional enum parameter keeps its enum constraint without a null branch (#1266)
+{
+	auto schema = optToolSchema();
+	auto unique = schema["properties"]["unique"];
+	assert(unique["type"].get!string == "string");
+	assert("anyOf" !in unique);
+	assert(unique["enum"].length == 3);
+}
+
+unittest  // @schemaDefault on a Nullable parameter emits `default` (#1264)
+{
+	auto schema = optToolSchema();
+	auto page = schema["properties"]["page"];
+	assert(page["type"].get!string == "integer");
+	assert("anyOf" !in page);
+	assert(page["default"].get!long == 1);
 }
 
 version (unittest) private final class TaskUdaApi
