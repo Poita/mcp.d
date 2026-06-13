@@ -9,6 +9,12 @@
  */
 module mcp.transport;
 
+// The named server-side transport seam (`ServerCore` / `ServerTransport`),
+// symmetric to the client's `ClientTransport`. A custom server transport drives
+// its `McpServer` through this interface; it lives here so it is reachable from
+// the same import a transport author already pulls in.
+public import mcp.server.transport;
+
 public import mcp.transport.stdio;
 public import mcp.transport.streamable_http;
 public import mcp.transport.session;

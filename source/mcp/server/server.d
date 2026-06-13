@@ -21,6 +21,7 @@ import mcp.server.task_runtime : TaskRuntime, TaskOptions;
 import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher,
 	InProcessTaskDispatcher, SyncTaskDispatcher, runTaskExecutor;
 import mcp.server.push : PushChannel, ListenFilter;
+import mcp.server.transport : ServerCore;
 
 // The push-integration unittests below exercise the server seam against the
 // real Streamable HTTP channel; the library build itself has no transport
@@ -383,7 +384,14 @@ private final class ConnectionScopedContext : BaseRequestContext, ConnectionScop
 /// `McpServer` owns registration and JSON-RPC dispatch. It has no I/O: feed it
 /// parsed messages via `handle` (or raw text via `handleRaw`) and it returns the
 /// response to write back. Transports (stdio, HTTP) are thin drivers over this.
-final class McpServer
+///
+/// It satisfies `mcp.server.transport.ServerCore` (aka `ServerTransport`), the
+/// named server-side transport seam symmetric to the client's `ClientTransport`.
+/// A transport can hold its server through that interface and drives it via the
+/// `handle` / `handleRaw` family; `RequestContext` is the outbound companion the
+/// transport implements. See the README "implementing a custom server transport"
+/// recipe.
+final class McpServer : ServerCore
 {
 	/// The statefulness model this server was constructed with. Immutable after
 	/// construction. Transports derive session minting from this (`stateful` =>
