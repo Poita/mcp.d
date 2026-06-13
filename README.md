@@ -467,7 +467,7 @@ struct Approval { bool deploy; }
 string deploy(string gitRef, TaskContext tc) @safe
 {
     if (!tc.hasInput("ok"))
-        return tc.requireInput([InputRequest.elicitation!Approval("ok", "Deploy " ~ gitRef ~ "?")]);
+        return tc.requireInput([elicitationRequest!Approval("ok", "Deploy " ~ gitRef ~ "?")]);
     if (!tc.inputAs!ElicitResult("ok").contentAs!Approval().deploy)
         return "skipped";
     startDeploy(gitRef, tc.taskId);             // fictional: kicks off the deploy, returns at once

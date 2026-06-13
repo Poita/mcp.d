@@ -54,12 +54,14 @@ public import mcp.api.reflection;
 public import mcp.api.apps;
 
 // --- User-facing modern (next-version) result/hint types ---
-// These are referenced by members already on the lean public surface:
-// `McpServer.setListCacheHint(string, CacheHint)` and `McpClient.discover()`
-// returning `DiscoverResult`. Re-export the user-facing result/hint types
-// (but not the transport/wire plumbing that also lives in
-// `mcp.protocol.modern`) so they are usable with `import mcp;` alone.
-public import mcp.protocol.modern : DiscoverResult, CacheHint, CacheScope, RequestMeta;
+// `mcp.protocol.modern` holds only user-facing result/hint wire types
+// (`DiscoverResult`, `CacheHint`/`CacheScope`, `RequestMeta`, and the cache
+// hint codec). They are referenced by members already on the lean public
+// surface — `McpServer.setListCacheHint(string, CacheHint)` and
+// `McpClient.discover()` returning `DiscoverResult` — so the whole module is
+// safe to re-export. The transport/wire plumbing now lives in
+// `mcp.protocol.mrtr`, reachable via `import mcp.transport;`.
+public import mcp.protocol.modern;
 
 // --- Opt-in MRTR requestState security ---
 // Referenced by `McpServer.secureRequestState(RequestStateSecurity)`. The codec

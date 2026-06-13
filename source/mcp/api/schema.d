@@ -46,8 +46,8 @@ template isElicitScalar(F)
 
 /// True when `T` is a flat struct whose every field is an `isElicitScalar`, i.e. a
 /// valid type to derive an elicitation form `requestedSchema` from (via
-/// `jsonSchemaOf!T`). Used by `RequestContext.elicit!T` and
-/// `InputRequest.elicitation!T` to reject nested/array structs at compile time.
+/// `jsonSchemaOf!T`). Used by `RequestContext.elicit!T` and `elicitationRequest!T`
+/// to reject nested/array structs at compile time.
 template isFlatElicitationStruct(T)
 {
 	import std.meta : allSatisfy;
@@ -56,6 +56,52 @@ template isFlatElicitationStruct(T)
 		enum isFlatElicitationStruct = allSatisfy!(isElicitScalar, typeof(T.tupleof));
 	else
 		enum isFlatElicitationStruct = false;
+}
+
+/// Build a form-`elicitation` `InputRequest` whose `requestedSchema` is derived
+/// from the flat struct `T` via `jsonSchemaOf!T` (same compile-time flat-struct
+/// restriction as `RequestContext.elicit!T`). This convenience lives in the api
+/// layer because deriving a schema from a D type is reflection work; the protocol
+/// `InputRequest.elicitation(string, string, Json)` overload takes a ready-made
+/// schema and so stays free of any `mcp.api` dependency.
+auto elicitationRequest(T)(string id, string message) @safe
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	static assert(isFlatElicitationStruct!T, "elicitationRequest!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
+			.stringof ~ " has a nested or non-scalar field");
+	return InputRequest.elicitation(id, message, jsonSchemaOf!T);
+}
+
+@safe unittest  // elicitationRequest!T derives requestedSchema from a flat struct
+{
+	import vibe.data.json : Json;
+
+	static struct Details
+	{
+		int travelers;
+		bool insurance;
+	}
+
+	auto ir = elicitationRequest!Details("e2", "Details?");
+	assert(ir.type == "elicitation");
+	assert(ir.params["message"].get!string == "Details?");
+	assert(ir.params["requestedSchema"] == jsonSchemaOf!Details);
+}
+
+@safe unittest  // elicitationRequest!T rejects a non-flat struct at compile time
+{
+	static struct Inner
+	{
+		int x;
+	}
+
+	static struct Nested
+	{
+		Inner inner;
+	}
+
+	static assert(!__traits(compiles, elicitationRequest!Nested("e", "m")));
 }
 
 /// Compile a vibe `Json` schema document into a reusable `Validator`, or `null`

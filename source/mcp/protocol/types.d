@@ -7,8 +7,8 @@ import mcp.protocol.errors : ErrorCode, McpException;
 import mcp.protocol.versions : ProtocolVersion, toWire;
 import mcp.protocol.jsonhelpers : getOr, tryGet;
 import mcp.protocol.tasks : Task, makeCreateTaskResult, isCreateTaskResult;
-import mcp.protocol.modern : InputRequest, emitInputRequired,
-	parseInputRequired, CacheHint, parseCacheHint, withCache;
+import mcp.protocol.mrtr : InputRequest, emitInputRequired, parseInputRequired;
+import mcp.protocol.modern : CacheHint, parseCacheHint, withCache;
 
 @safe:
 

@@ -40,7 +40,7 @@ import core.time : msecs, seconds;
 import vibe.core.core : sleep;
 
 import mcp;
-import mcp.protocol.modern : InputRequest;
+import mcp.protocol.mrtr : InputRequest;
 import examples_common : runServerFromArgs;
 
 /// The fixed HTTP port for this example.
@@ -61,7 +61,7 @@ struct ReverseResult
 }
 
 /// Elicitation form for `labeled_count`: the client fills in `label`. The
-/// `requestedSchema` is derived from this flat struct by `InputRequest.elicitation!T`.
+/// `requestedSchema` is derived from this flat struct by `elicitationRequest!T`.
 struct LabelChoice
 {
 	string label;
@@ -123,7 +123,7 @@ final class TasksApi
 	{
 		if (!tc.hasInput("label"))
 			return tc.requireInput([
-			InputRequest.elicitation!LabelChoice("label", "Choose a label for this count")
+			elicitationRequest!LabelChoice("label", "Choose a label for this count")
 		]);
 
 		auto answer = tc.inputAs!ElicitResult("label");

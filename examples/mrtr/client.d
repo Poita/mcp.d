@@ -148,7 +148,7 @@ private int runE2E(McpClient client) @safe
 			check(req.elicitationMessage() == "On what date should we meet?",
 					"meeting_date message mismatch: '" ~ req.elicitationMessage() ~ "'");
 			// The schema was DERIVED from the server's flat MeetingDate struct via
-			// InputRequest.elicitation!T, so it must expose a `date` string property.
+			// elicitationRequest!T, so it must expose a `date` string property.
 			auto schema = req.requestedSchema();
 			check(schema.type == Json.Type.object,
 					"meeting_date requestedSchema should be an object");

@@ -11,6 +11,7 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.versions;
 import mcp.protocol.modern;
+import mcp.protocol.mrtr;
 import mcp.transport.sse_context;
 import mcp.transport.session;
 import mcp.auth.resource_server;
@@ -2715,7 +2716,7 @@ unittest  // a pre-draft stateless request defers to activeConnection (null)
 unittest  // a modern (draft/MRTR) stateless request gets a FRESH state from _meta
 {
 	import vibe.data.json : parseJsonString;
-	import mcp.protocol.modern : MetaKey;
+	import mcp.protocol.mrtr : MetaKey;
 
 	// The draft request carries its capabilities + log level in _meta; the fresh
 	// per-request state is built from them and retained nowhere.
@@ -3116,7 +3117,7 @@ unittest  // x-mcp-header: present param but missing header fails
 
 unittest  // x-mcp-header: non-ASCII value matched via base64-encoded header
 {
-	import mcp.protocol.modern : encodeHeaderValue;
+	import mcp.protocol.mrtr : encodeHeaderValue;
 
 	auto schema = schemaWithHeaderParam();
 	Json args = Json(["region": Json("Zürich")]);
@@ -3261,7 +3262,7 @@ unittest  // ordinary application errors (e.g. invalidParams) ride on HTTP 200
 unittest  // draft subscriptions/listen: ack first, then opted-in change notifications flow
 {
 	import mcp.transport.sse_context : StreamCoordinator, ServerPushChannel;
-	import mcp.protocol.modern : MetaKey;
+	import mcp.protocol.mrtr : MetaKey;
 	import std.algorithm : canFind;
 
 	auto server = new McpServer("t", "1");

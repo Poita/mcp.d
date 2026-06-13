@@ -44,7 +44,7 @@ structured content).
 The server is UDA style (`@tool` + `registerHandlers`) and builds **no hand-built
 MRTR `Json`** — it uses the typed builders and decoders throughout:
 
-- **`InputRequest.elicitation!MeetingDate(id, message)`** — derives the
+- **`elicitationRequest!MeetingDate(id, message)`** — derives the
   elicitation `requestedSchema` from the flat `MeetingDate` struct via
   `jsonSchemaOf!T` (no hand-built schema `Json`).
 - **`InputRequest.sampling(id, CreateMessageRequest)`** — builds the sampling
