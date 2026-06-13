@@ -93,7 +93,7 @@ Then `import mcp;` in your source files.
   offline-access, DCR, pre-registration, resource-mismatch, **cross-app access**
   (token-exchange → JWT-bearer); **elicitation** with schema defaults; and **SSE
   resumption** (`retry:` + `Last-Event-ID`).
-- ✅ **FastMCP-style UDA API** — `@tool` / `@resource` / `@prompt` with auto JSON-Schema.
+- ✅ **FastMCP-style UDA API** — `@tool` / `@resource` / `@prompt` / `@task` / `@skill` with auto JSON-Schema.
 - ✅ **DRAFT (2026-07-28)** — stateless per-request `_meta`, `server/discover`,
   `subscriptions/listen`, `CacheableResult` (`ttlMs`/`cacheScope`), MRTR types, the standard
   request headers (`Mcp-Method`/`Mcp-Name`/`MCP-Protocol-Version`) with `HeaderMismatch`
@@ -432,6 +432,7 @@ Streamable HTTP.
 | Auth | OAuth 2.1 protected HTTP resource server (HTTP only) | [server](examples/auth/server.d) | [client](examples/auth/client.d) |
 | Apps | MCP Apps extension: `@ui` tool link + a `ui://` HTML resource | [server](examples/apps/server.d) | [client](examples/apps/client.d) |
 | Tasks | MCP Tasks extension (SEP-2663): `@task` async tasks with progress, cancellation, and `input_required` | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
+| Skills | MCP Skills extension (SEP-2640): `@skill` Agent Skills served as resources + `skill://index.json` discovery | [server](examples/skills/server.d) | [client](examples/skills/client.d) |
 
 Annotate plain typed D functions with `@tool` / `@resource` / `@prompt` and register
 a whole module with `registerModule!(my.module)(server)` — the input schema (from
@@ -570,6 +571,56 @@ else
 > this extension. It is **intentionally not implemented** — those methods answer
 > `-32601` and no `tasks` capability is advertised. Only the SEP-2663 extension
 > above is supported, and only under the draft protocol version.
+
+## Skills (SEP-2640)
+
+The [MCP Skills extension](https://modelcontextprotocol.io/community/skills-over-mcp/charter)
+(`io.modelcontextprotocol/skills`, [SEP-2640](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640))
+serves [Agent Skills](https://agentskills.io) — a `SKILL.md` of instructions plus
+optional supporting files — over MCP. It deliberately adds **no new protocol
+methods**: a skill is a directory of files exposed through the existing Resources
+primitive, so any host that treats resources as a virtual filesystem consumes
+MCP-served skills exactly like local ones. Ship a skill alongside the tools it
+describes and they version and travel together.
+
+Mark a no-argument method `@skill` and it returns the `SKILL.md` body; the SDK
+synthesizes the YAML frontmatter from the name/description, serves it at
+`skill://<name>/SKILL.md` as `text/markdown`, advertises the extension, and lists
+it in the well-known `skill://index.json` discovery resource.
+
+```d
+final class Skills
+{
+    @skill("git-workflow", "Follow this team's Git branching and commit conventions")
+    string gitWorkflow() @safe
+    {
+        return "# Git Workflow\n\n1. Branch from `main`.\n2. Squash-merge once approved.\n";
+    }
+}
+
+registerHandlers(server, new Skills);    // serves skill://git-workflow/SKILL.md + the index
+```
+
+For a multi-file skill (references, templates, scripts) register it imperatively,
+attaching sibling files served at `skill://<name>/<path>`:
+
+```d
+Skill pdf = {
+    name: "pdf-forms",
+    description: "Fill in PDF forms using the field reference",
+    instructions: "# PDF Forms\n\nConsult `references/FORMS.md`, then fill each field.\n",
+    files: [SkillFile("references/FORMS.md", "text/markdown", "# Form Fields\n- applicant_name\n")]
+};
+registerSkill(server, pdf);               // skill://pdf-forms/SKILL.md + .../references/FORMS.md
+```
+
+On the client, `listSkills(client)` reads `skill://index.json` and returns the
+discovery entries, and `readSkill(client, "git-workflow")` reads the `SKILL.md` —
+both thin wrappers over `resources/read`, since SEP-2640 defines no `skills/*`
+methods. The extension is advertised only under the draft protocol (the
+`extensions` negotiation map is draft-only), so a client enables `enableModern()`
+before negotiation; the resource reads themselves work on any version. See
+[`examples/skills`](examples/skills/) for the full e2e.
 
 ## Concurrency model
 

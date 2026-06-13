@@ -156,6 +156,26 @@ struct resource
 	string title; /// optional human-readable display name (empty = unset)
 }
 
+/// UDA marking a method as an MCP skill (SEP-2640, the
+/// `io.modelcontextprotocol/skills` extension). The method takes no arguments
+/// and returns the `SKILL.md` instructions body as a `string`; the reflection
+/// layer synthesizes the YAML frontmatter from `name`/`description`, serves it
+/// as a `skill://<name>/SKILL.md` markdown resource, advertises the skills
+/// extension, and lists the skill in the `skill://index.json` discovery
+/// resource. `name` must be lowercase alphanumeric with single hyphens
+/// (1..64 chars), per the Agent Skills spec.
+///
+/// Example:
+/// ---
+/// @skill("git-workflow", "Follow this team's Git conventions")
+/// string gitWorkflow() @safe { return "# Git Workflow\n\n1. Branch from main.\n"; }
+/// ---
+struct skill
+{
+	string name;
+	string description;
+}
+
 /// UDA marking a method as a resource template (URI contains `{var}`
 /// placeholders). The method receives the captured parameters as its arguments.
 ///

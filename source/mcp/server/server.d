@@ -20,6 +20,7 @@ import mcp.server.request_state : RequestStateSecurity, RequestStateMode,
 	generateEphemeralKey, verifyIncomingRequestState, secureOutgoingRequestState;
 import mcp.server.task_store : TaskStore, InMemoryTaskStore;
 import mcp.server.task_runtime : TaskRuntime, TaskOptions;
+import mcp.server.skill_index : SkillIndex;
 import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher,
 	InProcessTaskDispatcher, SyncTaskDispatcher, runTaskExecutor;
 import mcp.server.push : PushChannel, ListenFilter;
@@ -193,6 +194,7 @@ final class McpServer : ServerCore
 	private TaskRuntime taskRuntime_;
 	private TaskDispatcher taskDispatcher_;
 	private TaskExecutor[string] taskExecutors_;
+	private SkillIndex skillIndex_;
 	private Json extensions = Json.undefined;
 	// Per-connection mutable state — negotiated protocol version, client
 	// capabilities, log level, subscriptions, and the `inFlight` cancellation
@@ -1056,6 +1058,18 @@ final class McpServer : ServerCore
 	Json clientExtensions() const @safe
 	{
 		return activeConnection.clientCaps.extensions;
+	}
+
+	/// The SEP-2640 skills index, created on first `enableSkills` / `registerSkill`
+	/// (`mcp.api.skills`), or null if no skill has been registered. The skills
+	/// helper layer appends discovery entries here and the `skill://index.json`
+	/// resource reader serializes them; the server itself holds the state so the
+	/// `@skill` UDA path and the imperative API share one index across calls.
+	package(mcp) SkillIndex ensureSkillIndex() @safe
+	{
+		if (skillIndex_ is null)
+			skillIndex_ = new SkillIndex();
+		return skillIndex_;
 	}
 
 	/// Whether a client is currently subscribed to updates for `uri`.

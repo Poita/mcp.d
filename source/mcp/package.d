@@ -53,6 +53,9 @@ public import mcp.api.reflection;
 // --- MCP Apps extension (interactive UI resources) ---
 public import mcp.api.apps;
 
+// --- MCP Skills extension (SEP-2640 Agent Skills over resources) ---
+public import mcp.api.skills;
+
 // --- User-facing modern (next-version) result/hint types ---
 // `mcp.protocol.modern` holds only user-facing result/hint wire types
 // (`DiscoverResult`, `CacheHint`/`CacheScope`, `RequestMeta`, and the cache
