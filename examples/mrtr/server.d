@@ -17,7 +17,7 @@
  * descriptors, or registration calls.
  *
  * Typed SEP-2322 builders drive every MRTR payload:
- *   - the elicitation `InputRequest` is built with `InputRequest.elicitation!T`,
+ *   - the elicitation `InputRequest` is built with `elicitationRequest!T`,
  *     which DERIVES its `requestedSchema` from the flat struct `MeetingDate`;
  *   - the sampling `InputRequest` is built with `InputRequest.sampling(id, req)`
  *     from a typed `CreateMessageRequest` (typed `SamplingMessage` + `Content`);
@@ -49,7 +49,7 @@ module mrtr_server;
 import std.typecons : nullable, Nullable;
 
 import mcp;
-import mcp.protocol.modern : InputRequest;
+import mcp.protocol.mrtr : InputRequest;
 import mcp.protocol.sampling : CreateMessageRequest, SamplingMessage;
 
 import examples_common : runServerFromArgs;
@@ -87,7 +87,7 @@ void main(string[] args) @safe
 	runServerFromArgs(server, args, defaultPort);
 }
 
-/// A flat struct describing the date elicitation form. `InputRequest.elicitation!T`
+/// A flat struct describing the date elicitation form. `elicitationRequest!T`
 /// derives its `requestedSchema` from this via `jsonSchemaOf!T`, and the client's
 /// answer decodes back into it through `ElicitResult.contentAs!MeetingDate`.
 struct MeetingDate
@@ -141,7 +141,7 @@ final class MrtrApi
 		{
 			// Typed elicitation builder: the `requestedSchema` is derived from the
 			// flat `MeetingDate` struct via jsonSchemaOf!T.
-			auto dateReq = InputRequest.elicitation!MeetingDate(dateId,
+			auto dateReq = elicitationRequest!MeetingDate(dateId,
 					"On what date should we meet?");
 
 			// Typed sampling builder: build a CreateMessageRequest from a typed

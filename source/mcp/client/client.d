@@ -15,6 +15,7 @@ import mcp.protocol.types;
 import mcp.protocol.tasks : Task, TaskStatus;
 import mcp.protocol.sampling : validateSamplingMessages, CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.modern;
+import mcp.protocol.mrtr;
 import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.http_transport : HttpClientTransport, LegacyFallbackException;
 import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
@@ -886,7 +887,7 @@ final class McpClient : ClientProtocol
 	/// for a draft session (the feature is draft-only and HTTP-transport-specific).
 	package static Tool[] excludeInvalidHeaderTools(Tool[] tools) @safe
 	{
-		import mcp.protocol.modern : validateInputSchemaHeaders;
+		import mcp.protocol.mrtr : validateInputSchemaHeaders;
 		import vibe.core.log : logWarn;
 
 		Tool[] kept;
@@ -2210,7 +2211,7 @@ final class McpClient : ClientProtocol
 
 	/// Compute the `Mcp-Param-*` headers to emit for a `tools/call`, given the
 	/// tool's `inputSchema` and the call `arguments`. Uses the path-aware
-	/// `mcp.protocol.modern.paramHeaders`, which discovers every valid `x-mcp-header`
+	/// `mcp.protocol.mrtr.paramHeaders`, which discovers every valid `x-mcp-header`
 	/// annotation at *any* nesting depth (not only top-level properties), and
 	/// descends each annotation's `path` into the arguments object: for each path
 	/// segment it indexes into the current `Json` object; if any intermediate node
@@ -2226,7 +2227,7 @@ final class McpClient : ClientProtocol
 	/// helper so the mirroring can be unit-tested without a live server.
 	package static string[string] paramHeaders(Json inputSchema, Json arguments) @safe
 	{
-		import mcp.protocol.modern : draftParamHeaders = paramHeaders;
+		import mcp.protocol.mrtr : draftParamHeaders = paramHeaders;
 
 		string[string] headers;
 		if (arguments.type != Json.Type.object)
@@ -4822,7 +4823,7 @@ unittest  // paramHeaders omits headers for absent or null annotated arguments
 
 unittest  // paramHeaders base64-encodes a non-ASCII annotated value
 {
-	import mcp.protocol.modern : decodeHeaderValue;
+	import mcp.protocol.mrtr : decodeHeaderValue;
 
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
@@ -5065,7 +5066,7 @@ unittest  // cancel() eviction does not O(n)-scan unbounded stale cancelledOrder
 
 unittest  // a server that keeps requesting input stops at exactly maxRounds tools/call requests
 {
-	import mcp.protocol.modern : InputRequiredResult;
+	import mcp.protocol.mrtr : InputRequiredResult;
 
 	auto c = McpClient.http("http://localhost/mcp");
 	c.onElicitation = (ElicitParams) @safe {
@@ -5731,7 +5732,7 @@ unittest  // a draft client's ClientProtocol yields the MCP-Protocol-Version hea
 
 unittest  // a resources/read URI is encoded in Mcp-Name, never placed raw (no CR/LF injection)
 {
-	import mcp.protocol.modern : decodeHeaderValue;
+	import mcp.protocol.mrtr : decodeHeaderValue;
 
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
@@ -5757,7 +5758,7 @@ unittest  // a resources/read URI is encoded in Mcp-Name, never placed raw (no C
 
 unittest  // a benign reserved-character resource URI still survives Mcp-Name encoding
 {
-	import mcp.protocol.modern : decodeHeaderValue;
+	import mcp.protocol.mrtr : decodeHeaderValue;
 
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
@@ -6022,7 +6023,7 @@ unittest  // the maxListPages cap aborts a non-converging paginated list
 
 unittest  // MRTR: getPrompt drives a retry loop when the server returns inputRequired
 {
-	import mcp.protocol.modern : InputRequiredResult;
+	import mcp.protocol.mrtr : InputRequiredResult;
 
 	auto c = McpClient.http("http://localhost/mcp");
 	c.onElicitation = (ElicitParams) @safe {
@@ -6056,7 +6057,7 @@ unittest  // MRTR: getPrompt drives a retry loop when the server returns inputRe
 
 unittest  // MRTR: getPrompt surfaces an inputRequired result when no handler is registered
 {
-	import mcp.protocol.modern : InputRequiredResult;
+	import mcp.protocol.mrtr : InputRequiredResult;
 
 	auto c = McpClient.http("http://localhost/mcp");
 	// No onElicitation handler registered — resolveInputRequest must return false.
@@ -6075,7 +6076,7 @@ unittest  // MRTR: getPrompt surfaces an inputRequired result when no handler is
 
 unittest  // MRTR: getPrompt stops at maxRounds prompts/get requests
 {
-	import mcp.protocol.modern : InputRequiredResult;
+	import mcp.protocol.mrtr : InputRequiredResult;
 
 	auto c = McpClient.http("http://localhost/mcp");
 	c.onElicitation = (ElicitParams) @safe {

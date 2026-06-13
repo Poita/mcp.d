@@ -12,6 +12,7 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.capabilities;
 import mcp.protocol.types;
 import mcp.protocol.modern;
+import mcp.protocol.mrtr;
 import mcp.server.context;
 import mcp.server.connection : ConnectionState;
 import mcp.server.request_state : RequestStateSecurity, RequestStateMode,
@@ -5582,7 +5583,7 @@ unittest  // registerTaskTool: tools/call returns a task handle the executor com
 
 unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
 {
-	import mcp.protocol.modern : InputRequest;
+	import mcp.protocol.mrtr : InputRequest;
 
 	auto s = new McpServer("t", "1");
 	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
@@ -6064,7 +6065,7 @@ unittest  // draft InputRequiredResult is stamped resultType:"input_required", n
 
 unittest  // draft: a raw CallToolResult carrying inputRequests is stamped "input_required"
 {
-	import mcp.protocol.modern : InputRequest;
+	import mcp.protocol.mrtr : InputRequest;
 
 	// Register via the CallToolResult-returning overload and populate the public
 	// `inputRequests` field DIRECTLY (not via ToolResponse.inputRequired). This

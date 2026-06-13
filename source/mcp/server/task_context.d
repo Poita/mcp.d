@@ -4,7 +4,7 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json, serializeToJson, deserializeJson;
 
 import mcp.protocol.errors : McpException, ErrorCode;
-import mcp.protocol.modern : InputRequest, inputRequestsToJson;
+import mcp.protocol.mrtr : InputRequest, inputRequestsToJson;
 import mcp.server.task_runtime : TaskRuntime;
 
 @safe:

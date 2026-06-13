@@ -1530,7 +1530,7 @@ unittest  // background push: notify* with no request in flight reaches a stdio 
 
 version (unittest)
 {
-	import mcp.protocol.modern : MetaKey;
+	import mcp.protocol.mrtr : MetaKey;
 
 	// A draft `subscriptions/listen` request line carrying per-request _meta
 	// (protocolVersion draft) and a nested `notifications` ListenFilter.

@@ -173,7 +173,7 @@ private template isPrimitiveHeaderParam(P)
 /// parameters, skipping any `RequestContext` parameter.
 private Json parametersSchema(alias func)() @safe
 {
-	import mcp.protocol.modern : validateHeaderName;
+	import mcp.protocol.mrtr : validateHeaderName;
 	import std.traits : ParameterDefaultValueTuple;
 
 	validateParamUdas!func();
@@ -1030,7 +1030,7 @@ version (unittest)
 
 	import vibe.data.json : parseJsonString;
 	import mcp.server.server : ToolResponse;
-	import mcp.protocol.modern : InputRequest;
+	import mcp.protocol.mrtr : InputRequest;
 
 	// Fixture exercising icons, _meta, annotation title, per-resource cache
 	// hint, and MRTR (ToolResponse) tools.
@@ -1611,7 +1611,7 @@ unittest  // @mcpHeader: naming an injected context parameter is rejected at com
 unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schema
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.modern : paramHeaders;
+	import mcp.protocol.mrtr : paramHeaders;
 
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new DemoApi);
@@ -1795,7 +1795,7 @@ unittest  // @hintTitle: annotation-level title appears in annotations
 unittest  // MRTR UDA tool: returning ToolResponse.inputRequired surfaces inputRequests
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.modern : MetaKey;
+	import mcp.protocol.mrtr : MetaKey;
 
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new ExtApi);
@@ -1977,7 +1977,7 @@ unittest  // @icon UDA: theme field propagates through collectIcons to tools/lis
 version (unittest) private auto draftRead(string uri) @safe
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.modern : MetaKey;
+	import mcp.protocol.mrtr : MetaKey;
 
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
@@ -2594,7 +2594,7 @@ unittest  // @schemaDefault on a Nullable parameter emits `default` (#1264)
 version (unittest) private final class TaskUdaApi
 {
 	import mcp.server.task_context : TaskContext;
-	import mcp.protocol.modern : InputRequest;
+	import mcp.protocol.mrtr : InputRequest;
 	import core.time : msecs;
 
 	struct Doubled
@@ -2632,7 +2632,7 @@ version (unittest) private final class TaskUdaApi
 
 version (unittest) private Json draftMeta() @safe
 {
-	import mcp.protocol.modern : MetaKey;
+	import mcp.protocol.mrtr : MetaKey;
 
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
