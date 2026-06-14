@@ -70,6 +70,10 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 	if (!(frontmatter.type == Json.Type.object && "name" in frontmatter
 			&& frontmatter["name"].type == Json.Type.string))
 		throw new Exception("registerSkillDir: SKILL.md frontmatter must define a string 'name'");
+	// The Agent Skills spec requires both name and description.
+	if (!("description" in frontmatter && frontmatter["description"].type == Json.Type.string))
+		throw new Exception(
+				"registerSkillDir: SKILL.md frontmatter must define a string 'description'");
 	const fmName = frontmatter["name"].get!string;
 
 	const path = options.path.length ? options.path : fmName;
@@ -112,19 +116,31 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 // --- Frontmatter -----------------------------------------------------------
 
 /// Parse the leading `---`-delimited YAML frontmatter of a `SKILL.md` into a
-/// JSON object (the verbatim `frontmatter` SEP-2640 puts in the index).
+/// JSON object (the verbatim `frontmatter` SEP-2640 puts in the index). The fence
+/// is matched a line at a time: the file must open with a line that is exactly
+/// `---`, and the frontmatter ends at the next line that is exactly `---` or
+/// `...` — so a `---` appearing inside a value does not close it early, and CRLF
+/// line endings work.
 private Json parseFrontmatter(string md) @safe
 {
-	import std.string : indexOf;
+	import std.string : splitLines, stripRight, join;
 
-	if (md.length < 3 || md[0 .. 3] != "---")
-		throw new Exception("SKILL.md must begin with YAML frontmatter delimited by '---'");
-	// The closing delimiter is a line that is exactly `---` (or `...`).
-	const close = md.indexOf("\n---", 3);
-	if (close < 0)
+	auto lines = md.splitLines; // strips both \n and \r\n terminators
+	if (lines.length == 0 || lines[0].stripRight != "---")
+		throw new Exception("SKILL.md must begin with a '---' frontmatter line");
+	size_t end = size_t.max;
+	foreach (i; 1 .. lines.length)
+	{
+		const t = lines[i].stripRight;
+		if (t == "---" || t == "...")
+		{
+			end = i;
+			break;
+		}
+	}
+	if (end == size_t.max)
 		throw new Exception("SKILL.md frontmatter is not closed by a '---' line");
-	const yaml = md[3 .. close];
-	return yamlToJson(yaml);
+	return yamlToJson(lines[1 .. end].join("\n"));
 }
 
 /// Convert a YAML document (dyaml) to a vibe `Json` value, preserving scalar
@@ -133,8 +149,13 @@ private Json yamlToJson(string yaml) @safe
 {
 	import dyaml : Loader;
 
-	auto root = Loader.fromString(yaml).load();
-	return nodeToJson(root);
+	try
+	{
+		auto root = Loader.fromString(yaml).load();
+		return nodeToJson(root);
+	}
+	catch (Exception e)
+		throw new Exception("registerSkillDir: invalid SKILL.md frontmatter YAML: " ~ e.msg);
 }
 
 // Templated on dyaml's Node so the converter need not name the type; recursion
@@ -165,6 +186,19 @@ private Json nodeToJson(N)(N node) @safe
 		case NodeType.decimal:
 			return Json(node.as!double);
 		case NodeType.null_:
+			return Json(null);
+		case NodeType.timestamp:
+			// Render a YAML-implicit timestamp as an ISO-8601 string rather than
+			// dyaml's SysTime.toString, which is not round-trippable.
+			import std.datetime.systime : SysTime;
+
+			return Json(node.as!SysTime.toISOExtString);
+		case NodeType.binary:
+			import std.base64 : Base64;
+
+			return Json(Base64.encode(node.as!(ubyte[])).idup);
+		case NodeType.merge:
+			// A bare merge key has no value of its own.
 			return Json(null);
 		default:
 			return Json(node.as!string);
@@ -233,10 +267,13 @@ private void walkInto(string base, string rel, ref RawFile[] files, ref size_t t
 
 		if (files.length + 1 > maxFiles)
 			throw new Exception("registerSkillDir: skill directory exceeds maxFiles");
-		const bytes = readBytes(joinPath(base, childRel));
-		total += bytes.length;
-		if (total > maxTotalBytes)
+		const fullPath = joinPath(base, childRel);
+		// Check the size against the cap BEFORE reading, so a single oversized
+		// file cannot be slurped into memory just to be rejected afterward.
+		if (total + fileSize(fullPath) > maxTotalBytes)
 			throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
+		const bytes = readBytes(fullPath);
+		total += bytes.length;
 
 		RawFile r;
 		r.path = childRel;
@@ -281,6 +318,9 @@ private void inferMime(string relPath, scope const(ubyte)[] bytes, out string mi
 	case ".xml":
 		textMime = "application/xml";
 		break;
+	case ".svg":
+		textMime = "image/svg+xml";
+		break;
 	case ".toml":
 		textMime = "application/toml";
 		break;
@@ -305,8 +345,18 @@ private void inferMime(string relPath, scope const(ubyte)[] bytes, out string mi
 		isText = false;
 		return;
 	default:
-		mime = "application/octet-stream";
-		isText = false;
+		// Unknown or extension-less (LICENSE, Makefile, .gitignore): serve as
+		// text when the bytes are valid UTF-8, otherwise as an opaque blob.
+		if (isValidUtf8(bytes))
+		{
+			mime = "text/plain";
+			isText = true;
+		}
+		else
+		{
+			mime = "application/octet-stream";
+			isText = false;
+		}
 		return;
 	}
 
@@ -377,12 +427,14 @@ private immutable(ubyte)[] buildZip(ArchiveEntry[] entries) @trusted
 {
 	import archive.zip : ZipArchive;
 
+	import std.datetime.systime : DosFileTime;
+
 	auto zip = new ZipArchive();
 	foreach (e; entries)
 	{
 		auto f = new ZipArchive.File(e.name);
 		f.data = e.bytes;
-		// Leave modificationTime at its zero default for deterministic output.
+		f.modificationTime = cast(DosFileTime) 0; // fixed, for deterministic output
 		zip.addFile(f);
 	}
 	return (cast(ubyte[]) zip.serialize()).idup;
@@ -447,6 +499,13 @@ private immutable(ubyte)[] readBytes(string p) @trusted
 	return cast(immutable(ubyte)[]) read(p);
 }
 
+private ulong fileSize(string p) @trusted
+{
+	import std.file : getSize;
+
+	return getSize(p);
+}
+
 private DirEntryInfo[] listDir(string dir) @trusted
 {
 	import std.file : dirEntries, SpanMode, DirEntry;
@@ -491,6 +550,17 @@ version (unittest)
 		import std.file : write;
 
 		write(path, content);
+	}
+
+	// A skill directory with a single, caller-supplied SKILL.md and no other files.
+	private void writeRawSkill(string root, string skillMd) @trusted
+	{
+		import std.file : mkdirRecurse, write, rmdirRecurse, exists;
+
+		if (exists(root))
+			rmdirRecurse(root);
+		mkdirRecurse(root);
+		write(root ~ "/SKILL.md", skillMd);
 	}
 
 	private void removeTree(string root) @trusted
@@ -698,6 +768,94 @@ unittest  // registerSkillDir rejects a path whose final segment != frontmatter 
 	auto s = new McpServer("t", "1");
 	SkillDirOptions opts;
 	opts.path = "office/wrong-name";
+	assertThrown!Exception(registerSkillDir(s, root, opts));
+}
+
+unittest  // a '---' inside a frontmatter value does not close the frontmatter early
+{
+	import mcp.api.skills : skillIndexUri;
+	import vibe.data.json : parseJsonString;
+
+	const root = tmpRoot("fence");
+	// `notes` is a block scalar that itself contains a `---` line; `trailing`
+	// comes after it and must survive into the parsed frontmatter.
+	writeRawSkill(root,
+			"---\nname: fence-skill\ndescription: d\nnotes: |\n  sep:\n  ---\n  more\n"
+			~ "trailing: kept\n---\n\n# Body\n");
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
+	auto fm = parseJsonString(idx)["skills"][0]["frontmatter"];
+	assert(fm["trailing"].get!string == "kept");
+}
+
+unittest  // registerSkillDir requires a string description in the frontmatter
+{
+	import std.exception : assertThrown;
+
+	const root = tmpRoot("nodesc");
+	writeRawSkill(root, "---\nname: x\n---\n\n# Body\n");
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	assertThrown!Exception(registerSkillDir(s, root));
+}
+
+unittest  // an extension-less text file is served as text/plain, not an opaque blob
+{
+	import std.algorithm : canFind;
+
+	const root = tmpRoot("license");
+	writeSkillFixture(root);
+	writeFile(root ~ "/LICENSE", "MIT License\n\nPermission is hereby granted...\n");
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	auto c = readResource(s, 1, "skill://pdf-forms/LICENSE");
+	assert(c["mimeType"].get!string == "text/plain");
+	assert(c["text"].get!string.canFind("MIT License"));
+}
+
+unittest  // a YAML timestamp in frontmatter is rendered as an ISO-8601 string
+{
+	import mcp.api.skills : skillIndexUri;
+	import vibe.data.json : parseJsonString;
+	import std.algorithm : canFind;
+
+	const root = tmpRoot("timestamp");
+	writeRawSkill(root, "---\nname: ts-skill\ndescription: d\ncreated: 2021-01-02\n---\n\n# Body\n");
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
+	auto fm = parseJsonString(idx)["skills"][0]["frontmatter"];
+	assert(fm["created"].type == Json.Type.string);
+	assert(fm["created"].get!string.canFind("2021-01-02"));
+}
+
+unittest  // registerSkillDir rejects a directory whose files exceed maxTotalBytes
+{
+	import std.exception : assertThrown;
+
+	const root = tmpRoot("toobig");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.maxTotalBytes = 4; // smaller than the fixture's FORMS.md
 	assertThrown!Exception(registerSkillDir(s, root, opts));
 }
 

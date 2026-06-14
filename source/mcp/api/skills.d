@@ -286,6 +286,21 @@ void enableSkills(McpServer server) @safe
 /// `frontmatter`, the `SKILL.md` `url` and its `digest`, and any `archives` — to
 /// the `skill://index.json` discovery document. Throws if `path` is not a valid
 /// skill path (see `isValidSkillPath`).
+// Build a resource reader that closes over its file/uri by PARAMETER. Capturing a
+// foreach-body local directly in the lambda would share a single closure frame
+// across iterations — every reader would then serve the last file registered — so
+// the per-resource values must be passed as function arguments instead.
+private ResourceContents delegate() @safe makeFileReader(SkillFile f, string uri) @safe
+{
+	return () @safe => f.isBlob ? ResourceContents.makeBlob(uri, f.mimeType,
+			f.content) : ResourceContents.makeText(uri, f.mimeType, f.content);
+}
+
+private ResourceContents delegate() @safe makeBlobReader(string uri, string mimeType, string content) @safe
+{
+	return () @safe => ResourceContents.makeBlob(uri, mimeType, content);
+}
+
 void registerSkill(McpServer server, Skill skill) @safe
 {
 	const name = skill.name;
@@ -331,19 +346,15 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 
 	foreach (file; files)
 	{
-		// Bind a per-iteration copy so each resource reader closes over its own
-		// file rather than the shared loop variable.
-		const f = file;
-		const fileUri = skillFileUri(path, f.path);
+		const fileUri = skillFileUri(path, file.path);
 		Resource fileDescriptor;
 		fileDescriptor.uri = fileUri;
-		fileDescriptor.name = f.path;
-		if (f.mimeType.length)
-			fileDescriptor.mimeType = nullable(f.mimeType);
-		server.registerResource(fileDescriptor, () @safe {
-			return f.isBlob ? ResourceContents.makeBlob(fileUri, f.mimeType,
-				f.content) : ResourceContents.makeText(fileUri, f.mimeType, f.content);
-		});
+		fileDescriptor.name = file.path;
+		if (file.mimeType.length)
+			fileDescriptor.mimeType = nullable(file.mimeType);
+		// The reader is built by a factory so it captures THIS file by parameter
+		// (see makeFileReader): a lambda over the loop-body local would alias.
+		server.registerResource(fileDescriptor, makeFileReader(file, fileUri));
 	}
 
 	Json entry = Json.emptyObject;
@@ -358,21 +369,20 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 		Json archiveEntries = Json.emptyArray;
 		foreach (archive; archives)
 		{
-			const a = archive;
-			const archiveUri = skillArchiveUri(path, a.suffix);
+			const archiveUri = skillArchiveUri(path, archive.suffix);
 			Resource archiveDescriptor;
 			archiveDescriptor.uri = archiveUri;
-			archiveDescriptor.name = name ~ a.suffix;
-			if (a.mimeType.length)
-				archiveDescriptor.mimeType = nullable(a.mimeType);
-			server.registerResource(archiveDescriptor, () @safe {
-				return ResourceContents.makeBlob(archiveUri, a.mimeType, a.content);
-			});
+			archiveDescriptor.name = name ~ archive.suffix;
+			if (archive.mimeType.length)
+				archiveDescriptor.mimeType = nullable(archive.mimeType);
+			// Factory-built reader, for the same per-iteration capture reason as files.
+			server.registerResource(archiveDescriptor,
+					makeBlobReader(archiveUri, archive.mimeType, archive.content));
 
 			Json e = Json.emptyObject;
 			e["url"] = archiveUri;
-			e["mimeType"] = a.mimeType;
-			e["digest"] = skillDigest(Base64.decode(a.content));
+			e["mimeType"] = archive.mimeType;
+			e["digest"] = skillDigest(Base64.decode(archive.content));
 			archiveEntries ~= e;
 		}
 		entry["archives"] = archiveEntries;
@@ -799,6 +809,64 @@ unittest  // an archive form is served as a blob and listed with a digest
 	assert(archive["url"].get!string == "skill://pdf.tar.gz");
 	assert(archive["mimeType"].get!string == "application/gzip");
 	assert(archive["digest"].get!string == skillDigest(raw));
+}
+
+unittest  // each of several supporting files serves its OWN content (no reader aliasing)
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	Skill sk = {
+		path: "multi", description: "Many files", instructions: "# Multi\n",
+		files: [
+				SkillFile("a.txt", "text/plain", "AAA"),
+				SkillFile("b.md", "text/markdown", "BBB"),
+				SkillFile("c.json", "application/json", "\"CCC\"")
+		]
+	};
+	registerSkill(s, sk);
+
+	string readBody(string uri) @safe
+	{
+		Json p = Json.emptyObject;
+		p["uri"] = uri;
+		return s.handle(Message(makeRequest(Json(1), "resources/read", p)))
+			.get["result"]["contents"][0]["text"].get!string;
+	}
+
+	// A reader-aliasing bug would make every file serve the last one's content.
+	assert(readBody("skill://multi/a.txt") == "AAA");
+	assert(readBody("skill://multi/b.md") == "BBB");
+	assert(readBody("skill://multi/c.json") == "\"CCC\"");
+}
+
+unittest  // each of several archives serves its OWN bytes (no reader aliasing)
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import std.base64 : Base64;
+
+	auto s = new McpServer("t", "1");
+	const zip = Base64.encode(cast(const(ubyte)[]) "ZIPDATA").idup;
+	const tar = Base64.encode(cast(const(ubyte)[]) "TARDATA").idup;
+	Skill sk = {
+		path: "arch", description: "Many archives", instructions: "# Arch\n",
+		archives: [
+				SkillArchive(".zip", "application/zip", zip),
+				SkillArchive(".tar.gz", "application/gzip", tar)
+		]
+	};
+	registerSkill(s, sk);
+
+	string readBlob(string uri) @safe
+	{
+		Json p = Json.emptyObject;
+		p["uri"] = uri;
+		return s.handle(Message(makeRequest(Json(1), "resources/read", p)))
+			.get["result"]["contents"][0]["blob"].get!string;
+	}
+
+	assert(readBlob("skill://arch.zip") == zip);
+	assert(readBlob("skill://arch.tar.gz") == tar);
 }
 
 unittest  // registerSkill rejects an invalid skill path

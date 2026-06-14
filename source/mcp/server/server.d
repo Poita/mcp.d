@@ -2457,6 +2457,10 @@ final class McpServer : ServerCore
 			}
 			else
 			{
+				// An empty first segment (e.g. a degenerate `scheme:` dir whose
+				// prefix is `scheme:/`) names no real subdirectory; skip it.
+				if (slash == 0)
+					continue;
 				const childUri = prefix ~ rest[0 .. slash];
 				if (childUri in seenDirs)
 					continue;
