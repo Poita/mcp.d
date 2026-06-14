@@ -123,10 +123,15 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 /// line endings work.
 private Json parseFrontmatter(string md) @safe
 {
-	import std.string : splitLines, stripRight, join;
+	import std.array : split, join, replace;
+	import std.string : stripRight;
 
-	auto lines = md.splitLines; // strips both \n and \r\n terminators
-	if (lines.length == 0 || lines[0].stripRight != "---")
+	// Normalize CRLF, then split on \n only — NOT std.string.splitLines, which
+	// also breaks on U+2028 / U+2029 / vertical tab and would corrupt a value
+	// containing one. Normalizing first means the reconstructed YAML carries no
+	// stray \r either.
+	auto lines = md.replace("\r\n", "\n").split('\n');
+	if (lines.length == 0 || lines[0] != "---")
 		throw new Exception("SKILL.md must begin with a '---' frontmatter line");
 	size_t end = size_t.max;
 	foreach (i; 1 .. lines.length)
@@ -791,6 +796,25 @@ unittest  // a '---' inside a frontmatter value does not close the frontmatter e
 	const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
 	auto fm = parseJsonString(idx)["skills"][0]["frontmatter"];
 	assert(fm["trailing"].get!string == "kept");
+}
+
+unittest  // a CRLF SKILL.md parses (fence and values carry trailing \r)
+{
+	import mcp.api.skills : skillIndexUri;
+	import vibe.data.json : parseJsonString;
+
+	const root = tmpRoot("crlf");
+	writeRawSkill(root, "---\r\nname: crlf-skill\r\ndescription: a value\r\n---\r\n\r\n# Body\r\n");
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
+	auto fm = parseJsonString(idx)["skills"][0]["frontmatter"];
+	assert(fm["name"].get!string == "crlf-skill");
+	assert(fm["description"].get!string == "a value");
 }
 
 unittest  // registerSkillDir requires a string description in the frontmatter

@@ -11,9 +11,9 @@ import vibe.data.json : Json;
 /// which appends to `entries` and reads them from the `skill://index.json`
 /// resource reader.
 ///
-/// Each entry in `entries` is one already-built discovery-document object
-/// (`{name, type, description, url}` for a `skill-md`, or `{type, description,
-/// url}` for an `mcp-resource-template`), per the Agent Skills discovery format.
+/// Each entry in `entries` is one already-built `skill://index.json` entry per
+/// SEP-2640: a verbatim `frontmatter` object plus the `SKILL.md` `url`, its
+/// sha256 `digest`, and any `archives`.
 final class SkillIndex
 {
 	/// Discovery entries, one per registered skill, in registration order.

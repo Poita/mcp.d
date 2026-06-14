@@ -930,7 +930,7 @@ private void registerSkillMethod(string memberName, alias overload, alias parent
 	// @skill name/description, so the method body need only be the instructions.
 	static assert(Parameters!overload.length == 0, "@skill method '" ~ memberName
 			~ "' must take no parameters; it returns the " ~ "SKILL.md instructions as a string");
-	static assert(isSomeString!(ReturnType!overload),
+	static assert(is(ReturnType!overload : string),
 			"@skill method '" ~ memberName ~ "' must return the SKILL.md instructions as a string");
 
 	Skill sk;
@@ -951,7 +951,7 @@ private void registerSkillDirMethod(string memberName, alias overload, alias par
 	// and (optionally) archives are served by registerSkillDir.
 	static assert(Parameters!overload.length == 0, "@skillDir method '" ~ memberName
 			~ "' must take no parameters; it returns the local skill directory path");
-	static assert(isSomeString!(ReturnType!overload),
+	static assert(is(ReturnType!overload : string),
 			"@skillDir method '" ~ memberName
 			~ "' must return the local skill directory path as a string");
 

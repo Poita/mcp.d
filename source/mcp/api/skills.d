@@ -251,17 +251,19 @@ private Json frontmatterJson(string name, string description, string[string] met
 /// `server/discover` so the extension appears in the negotiated capabilities.
 void enableSkills(McpServer server) @safe
 {
-	// Advertise the extension with `directoryRead: true` and turn the method on:
-	// this SDK serves skills as individual file resources, so `resources/directory/read`
-	// can scope-list any skill subtree.
-	Json settings = Json.emptyObject;
-	settings["directoryRead"] = true;
-	server.enableExtension(skillsExtensionKey, settings);
-	server.enableDirectoryRead();
 	auto index = server.ensureSkillIndex();
 	if (index.indexResourceRegistered)
 		return;
 	index.indexResourceRegistered = true;
+
+	// Advertise the extension with `directoryRead: true` and turn the method on:
+	// this SDK serves skills as individual file resources, so `resources/directory/read`
+	// can scope-list any skill subtree. Done once, on the first skill — repeated
+	// `registerSkill` calls must not re-clobber the negotiated settings.
+	Json settings = Json.emptyObject;
+	settings["directoryRead"] = true;
+	server.enableExtension(skillsExtensionKey, settings);
+	server.enableDirectoryRead();
 
 	Resource descriptor;
 	descriptor.uri = skillIndexUri;
@@ -279,13 +281,6 @@ void enableSkills(McpServer server) @safe
 	});
 }
 
-/// Register `skill` on `server`: serve its `SKILL.md` (with synthesized
-/// frontmatter) at `skill://<path>/SKILL.md`, serve each supporting file at
-/// `skill://<path>/<file>` and each archive at `skill://<path><suffix>`,
-/// advertise the skills extension, and add a conformant entry — verbatim
-/// `frontmatter`, the `SKILL.md` `url` and its `digest`, and any `archives` — to
-/// the `skill://index.json` discovery document. Throws if `path` is not a valid
-/// skill path (see `isValidSkillPath`).
 // Build a resource reader that closes over its file/uri by PARAMETER. Capturing a
 // foreach-body local directly in the lambda would share a single closure frame
 // across iterations — every reader would then serve the last file registered — so
@@ -301,6 +296,13 @@ private ResourceContents delegate() @safe makeBlobReader(string uri, string mime
 	return () @safe => ResourceContents.makeBlob(uri, mimeType, content);
 }
 
+/// Register `skill` on `server`: serve its `SKILL.md` (with synthesized
+/// frontmatter) at `skill://<path>/SKILL.md`, serve each supporting file at
+/// `skill://<path>/<file>` and each archive at `skill://<path><suffix>`,
+/// advertise the skills extension, and add a conformant entry — verbatim
+/// `frontmatter`, the `SKILL.md` `url` and its `digest`, and any `archives` — to
+/// the `skill://index.json` discovery document. Throws if `path` is not a valid
+/// skill path (see `isValidSkillPath`).
 void registerSkill(McpServer server, Skill skill) @safe
 {
 	const name = skill.name;
@@ -327,11 +329,41 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 				~ "must be a valid skill name (1..64 chars of lowercase letters, digits, "
 				~ "and single hyphens, no leading/trailing/consecutive hyphens)");
 
+	const name = skillName(path);
+	const uri = skillUri(path);
+
+	// Validate the skill's own resource URIs are unique among themselves up front,
+	// so a duplicate supporting-file path / archive suffix (or a file named
+	// `SKILL.md`) is a clear error rather than a half-finished registration.
+	bool[string] localUris;
+	localUris[uri] = true;
+	foreach (file; files)
+	{
+		const fu = skillFileUri(path, file.path);
+		if (fu in localUris)
+			throw new Exception("duplicate skill resource uri '" ~ fu
+					~ "' (a supporting file path collides with another file or with SKILL.md)");
+		localUris[fu] = true;
+	}
+	foreach (archive; archives)
+	{
+		const au = skillArchiveUri(path, archive.suffix);
+		if (au in localUris)
+			throw new Exception("duplicate skill archive uri '" ~ au ~ "'");
+		localUris[au] = true;
+	}
+
 	enableSkills(server);
 	auto index = server.ensureSkillIndex();
 
-	const name = skillName(path);
-	const uri = skillUri(path);
+	// Roll back any resources registered for THIS skill if a later registration
+	// throws (e.g. a URI already taken by another skill), so a failed registration
+	// never leaves orphaned resources or a half-listed skill behind. The shared
+	// index resource set up by enableSkills is left in place (it is empty-safe).
+	string[] registered;
+	scope (failure)
+		foreach (u; registered)
+			server.removeResource(u);
 
 	Resource descriptor;
 	descriptor.uri = uri;
@@ -343,6 +375,7 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 	server.registerResource(descriptor, () @safe {
 		return ResourceContents.makeText(uri, skillMimeType, skillMd);
 	});
+	registered ~= uri;
 
 	foreach (file; files)
 	{
@@ -355,6 +388,7 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 		// The reader is built by a factory so it captures THIS file by parameter
 		// (see makeFileReader): a lambda over the loop-body local would alias.
 		server.registerResource(fileDescriptor, makeFileReader(file, fileUri));
+		registered ~= fileUri;
 	}
 
 	Json entry = Json.emptyObject;
@@ -378,6 +412,7 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 			// Factory-built reader, for the same per-iteration capture reason as files.
 			server.registerResource(archiveDescriptor,
 					makeBlobReader(archiveUri, archive.mimeType, archive.content));
+			registered ~= archiveUri;
 
 			Json e = Json.emptyObject;
 			e["url"] = archiveUri;
@@ -875,6 +910,52 @@ unittest  // registerSkill rejects an invalid skill path
 
 	auto s = new McpServer("t", "1");
 	assertThrown!Exception(registerSkill(s, "Bad Name", "d", "body"));
+}
+
+unittest  // a duplicate supporting-file path is rejected and rolls back cleanly
+{
+	import std.exception : assertThrown, assertNotThrown;
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	Skill bad = {
+		path: "dup", description: "d", instructions: "# D\n", files: [
+			SkillFile("a.txt", "text/plain", "one"),
+			SkillFile("a.txt", "text/plain", "two")
+		]
+	};
+	assertThrown!Exception(registerSkill(s, bad));
+
+	// Rollback: the half-registered SKILL.md was removed, so the path is free and a
+	// corrected skill registers cleanly as the only index entry.
+	Skill good = {
+		path: "dup", description: "d", instructions: "# D\n", files: [
+			SkillFile("a.txt", "text/plain", "one")
+		]
+	};
+	assertNotThrown!Exception(registerSkill(s, good));
+
+	Json ip = Json.emptyObject;
+	ip["uri"] = skillIndexUri;
+	auto idx = s.handle(Message(makeRequest(Json(1), "resources/read", ip)))
+		.get["result"]["contents"][0];
+	auto doc = parseJsonString(idx["text"].get!string);
+	assert(doc["skills"].length == 1);
+	assert(doc["skills"][0]["frontmatter"]["name"].get!string == "dup");
+}
+
+unittest  // a supporting file named SKILL.md collides with the skill markdown and is rejected
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	Skill bad = {
+		path: "x", description: "d", instructions: "# X\n", files: [
+			SkillFile("SKILL.md", "text/markdown", "oops")
+		]
+	};
+	assertThrown!Exception(registerSkill(s, bad));
 }
 
 unittest  // multiple skills accumulate in the index across calls

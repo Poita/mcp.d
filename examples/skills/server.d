@@ -52,8 +52,10 @@ final class SkillsApi
 	}
 
 	// Served from a real directory under an organizational prefix, with a .zip
-	// archive form. `__FILE_FULL_PATH__` resolves the asset dir absolutely, so
-	// the path holds regardless of the server's working directory.
+	// archive form. `__FILE_FULL_PATH__` bakes in this source file's absolute
+	// path at compile time, so the asset dir resolves from any working directory
+	// when run from the source checkout (an installed binary would need the
+	// assets staged alongside it instead).
 	@skillDir("team/release-helper", ArchiveFormat.zip)
 	string releaseHelper() @safe
 	{
