@@ -6,15 +6,17 @@
  *   - STDIO (default): spawns the sibling `skills-server` binary.
  *   - HTTP (`--http <url>`): connects to a running server via Streamable HTTP.
  *
- * Exercises the SEP-2640 skills flow. Because SEP-2640 adds no new methods,
- * everything here is plain Resources access wrapped in skill-aware helpers:
+ * Exercises the SEP-2640 skills flow. Because SEP-2640 rides on the Resources
+ * primitive, everything here is plain Resources access wrapped in skill-aware
+ * helpers:
  *
  *   1. server/discover advertises the skills extension under `capabilities`.
- *   2. listSkills() reads skill://index.json and returns the discovery entries.
+ *   2. listSkills() reads skill://index.json and returns conformant entries
+ *      (verbatim frontmatter, SKILL.md url + sha256 digest, archives).
  *   3. readSkill("git-workflow") reads skill://git-workflow/SKILL.md and the
  *      synthesized frontmatter carries the name/description.
- *   4. The imperatively-registered pdf-forms skill exposes its sibling
- *      references/FORMS.md as its own resource.
+ *   4. The prefixed office/pdf-forms skill exposes its sibling
+ *      references/FORMS.md and a .tar.gz archive form, both addressable.
  *
  * The extensions negotiation map is draft-only, so the client enables the draft
  * protocol (`enableModern`) before negotiation — exactly as the tasks example
@@ -22,7 +24,7 @@
  */
 module skills_client;
 
-import std.algorithm : canFind, map;
+import std.algorithm : canFind, filter, map;
 import std.array : array;
 import std.stdio : writeln;
 
@@ -60,11 +62,12 @@ int main(string[] args) @safe
 		checkEq(skills.length, 3, "index should list three skills");
 		check(names.canFind("git-workflow"), "index should list git-workflow");
 		check(names.canFind("code-review"), "index should list code-review");
-		check(names.canFind("pdf-forms"), "index should list pdf-forms");
+		check(names.canFind("pdf-forms"), "index should list pdf-forms (final path segment)");
+		// Every direct entry carries a SKILL.md url and a sha256:<hex> digest.
 		foreach (s; skills)
 		{
-			checkEq(s.type, "skill-md", "every entry should be a skill-md");
-			check(s.url == skillUri(s.name), "entry url should be skill://<name>/SKILL.md");
+			check(s.url.length > 0, "entry should carry a SKILL.md url");
+			check(s.digest.canFind("sha256:"), "entry should carry a sha256 digest");
 		}
 
 		// --- 3. readSkill(): SKILL.md carries synthesized frontmatter -------
@@ -74,19 +77,33 @@ int main(string[] args) @safe
 			"SKILL.md frontmatter should carry the description");
 		check(md.canFind("# Git Workflow"), "SKILL.md should carry the instructions body");
 
-		// --- 4. a multi-file skill exposes its supporting files -------------
-		auto forms = client.readResource("skill://pdf-forms/references/FORMS.md");
+		// --- 4. the prefixed multi-file skill: supporting file + archive ----
+		auto pdf = skills.filter!(s => s.name == "pdf-forms").front;
+		check(pdf.url == "skill://office/pdf-forms/SKILL.md",
+			"pdf-forms should be served under its office/ prefix");
+
+		auto forms = client.readResource("skill://office/pdf-forms/references/FORMS.md");
 		check(forms.contents.length > 0, "the supporting file should be readable");
 		check(forms.contents[0].text.canFind("applicant_name"),
 			"references/FORMS.md should carry the field reference");
+
+		// The archive form is listed in the index and readable as a blob.
+		check(pdf.archives.length == 1, "pdf-forms should list one archive form");
+		checkEq(pdf.archives[0].mimeType, "application/gzip", "archive mimeType");
+		check(pdf.archives[0].digest.canFind("sha256:"), "archive should carry a digest");
+		auto archive = client.readResource(pdf.archives[0].url);
+		check(archive.contents.length > 0 && archive.contents[0].blob.length > 0,
+			"the archive resource should be readable as a blob");
 
 		bool http;
 		foreach (arg; args)
 			if (arg == "--http" || arg == "--url")
 				http = true;
-		writeln("OK: skills example e2e passed over ", http ? "http" : "stdio",
-			" — skills extension advertised, index lists git-workflow/code-review/pdf-forms,",
-			" SKILL.md frontmatter synthesized, supporting references/FORMS.md served.");
+		writeln("OK: skills example e2e passed over ", http
+			? "http" : "stdio",
+			" — skills extension advertised; index lists git-workflow/code-review/pdf-forms",
+			" with verbatim frontmatter + sha256 digests; SKILL.md frontmatter synthesized;",
+			" prefixed office/pdf-forms serves references/FORMS.md and a .tar.gz archive.");
 		return 0;
 	});
 }

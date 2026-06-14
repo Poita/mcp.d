@@ -577,16 +577,19 @@ else
 The [MCP Skills extension](https://modelcontextprotocol.io/community/skills-over-mcp/charter)
 (`io.modelcontextprotocol/skills`, [SEP-2640](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640))
 serves [Agent Skills](https://agentskills.io) — a `SKILL.md` of instructions plus
-optional supporting files — over MCP. It deliberately adds **no new protocol
-methods**: a skill is a directory of files exposed through the existing Resources
-primitive, so any host that treats resources as a virtual filesystem consumes
+optional supporting files — over MCP. It rides on the existing Resources
+primitive (its only new message is the optional `resources/directory/read`
+method), so any host that treats resources as a virtual filesystem consumes
 MCP-served skills exactly like local ones. Ship a skill alongside the tools it
 describes and they version and travel together.
 
 Mark a no-argument method `@skill` and it returns the `SKILL.md` body; the SDK
-synthesizes the YAML frontmatter from the name/description, serves it at
-`skill://<name>/SKILL.md` as `text/markdown`, advertises the extension, and lists
-it in the well-known `skill://index.json` discovery resource.
+synthesizes the YAML frontmatter from the path/description, serves it at
+`skill://<path>/SKILL.md` as `text/markdown`, advertises the extension, and lists
+a conformant entry — verbatim `frontmatter`, the SKILL.md `url`, and its
+`sha256` `digest` — in the well-known `skill://index.json` discovery resource.
+The skill path's final segment is the skill name; a leading prefix
+(`acme/billing/refunds`) is an optional organizational namespace.
 
 ```d
 final class Skills
@@ -602,22 +605,29 @@ registerHandlers(server, new Skills);    // serves skill://git-workflow/SKILL.md
 ```
 
 For a multi-file skill (references, templates, scripts) register it imperatively,
-attaching sibling files served at `skill://<name>/<path>`:
+attaching sibling files served at `skill://<path>/<file>` and, optionally, a
+pre-packed `archive` form of the whole skill served at `skill://<path><suffix>`:
 
 ```d
 Skill pdf = {
-    name: "pdf-forms",
+    path: "office/pdf-forms",
     description: "Fill in PDF forms using the field reference",
     instructions: "# PDF Forms\n\nConsult `references/FORMS.md`, then fill each field.\n",
-    files: [SkillFile("references/FORMS.md", "text/markdown", "# Form Fields\n- applicant_name\n")]
+    files: [SkillFile("references/FORMS.md", "text/markdown", "# Form Fields\n- applicant_name\n")],
+    archives: [SkillArchive(".tar.gz", "application/gzip", base64TarGz)]
 };
-registerSkill(server, pdf);               // skill://pdf-forms/SKILL.md + .../references/FORMS.md
+registerSkill(server, pdf);   // skill://office/pdf-forms/SKILL.md + references/FORMS.md + .tar.gz
 ```
 
+Each `archives` entry is listed alongside the SKILL.md `url` with its own
+`sha256` digest, so a host can fetch the whole skill in one round trip; both forms
+unpack to identical content.
+
 On the client, `listSkills(client)` reads `skill://index.json` and returns the
-discovery entries, and `readSkill(client, "git-workflow")` reads the `SKILL.md` —
-both thin wrappers over `resources/read`, since SEP-2640 defines no `skills/*`
-methods. The extension is advertised only under the draft protocol (the
+discovery entries (each with `frontmatter`, `url`, `digest`, and `archives`), and
+`readSkill(client, "git-workflow")` / `readSkillUri(client, uri)` read a
+`SKILL.md` — all thin wrappers over `resources/read`, since SEP-2640 defines no
+`skills/*` methods. The extension is advertised only under the draft protocol (the
 `extensions` negotiation map is draft-only), so a client enables `enableModern()`
 before negotiation; the resource reads themselves work on any version. See
 [`examples/skills`](examples/skills/) for the full e2e.

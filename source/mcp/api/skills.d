@@ -11,10 +11,11 @@ import mcp.protocol.types : Resource, ResourceContents;
 
 /// The MCP Skills extension identifier (SEP-2640) — the key under
 /// `capabilities.extensions` a server declares to advertise that it serves
-/// Agent Skills as resources. The extension adds no new protocol methods: a
-/// skill is a directory of files exposed through the existing Resources
-/// primitive, so a host that already treats resources as a virtual filesystem
-/// consumes MCP-served skills identically to local ones.
+/// Agent Skills as resources. The extension adds no new message types beyond the
+/// optional `resources/directory/read` method: a skill is a directory of files
+/// exposed through the existing Resources primitive, so a host that already
+/// treats resources as a virtual filesystem consumes MCP-served skills
+/// identically to local ones.
 enum string skillsExtensionKey = "io.modelcontextprotocol/skills";
 
 /// The MIME type a `SKILL.md` resource declares (Agent Skills are Markdown with
@@ -28,13 +29,9 @@ enum string skillIndexUri = "skill://index.json";
 /// The MIME type of the `skill://index.json` discovery document.
 enum string skillIndexMimeType = "application/json";
 
-/// The discovery-document `$schema` the index advertises (the Agent Skills
-/// well-known index format SEP-2640 reuses).
-enum string skillDiscoverySchema = "https://schemas.agentskills.io/discovery/0.2.0/schema.json";
-
 /// A supporting file shipped alongside a skill's `SKILL.md` (a reference doc,
 /// template, example, or asset). Served as a sibling resource at
-/// `skill://<skill-name>/<path>`; `path` is relative to the skill root and may
+/// `skill://<skill-path>/<path>`; `path` is relative to the skill root and may
 /// contain `/` for nested files (e.g. `references/FORMS.md`).
 struct SkillFile
 {
@@ -44,23 +41,57 @@ struct SkillFile
 	bool isBlob; /// whether `content` is base64-encoded binary rather than text
 }
 
+/// A pre-packed archive form of an entire skill directory (SEP-2640 "archives").
+/// Reading the archive resource retrieves the whole skill — `SKILL.md` and all
+/// supporting files — in one round trip; when several are listed they are
+/// alternative encodings of identical content and a host picks a format it
+/// supports. Served as a blob resource at `skill://<skill-path><suffix>`.
+struct SkillArchive
+{
+	string suffix; /// URI/extension suffix, e.g. ".tar.gz" or ".zip"
+	string mimeType; /// archive media type, e.g. "application/gzip", "application/zip"
+	string content; /// the archive bytes, base64-encoded (served as a blob)
+}
+
 /// A declarative skill: a `SKILL.md` (its `instructions` body, with frontmatter
-/// synthesized from `name`/`description`/`metadata`) plus any supporting
-/// `files`. Register it with `registerSkill`; the `@skill` UDA builds one of
-/// these for you from an annotated method.
+/// synthesized from `path`'s final segment, `description`, and `metadata`) plus
+/// any supporting `files` and pre-packed `archives`. Register it with
+/// `registerSkill`; the `@skill` UDA builds one of these from an annotated
+/// method.
 struct Skill
 {
-	string name; /// skill name (lowercase alphanumeric + single hyphens, 1..64 chars)
+	/// The skill path: a `/`-separated locator whose final segment is the skill
+	/// name (lowercase alphanumeric + single hyphens). May be a single segment
+	/// (`git-workflow`) or carry an organizational prefix (`acme/billing/refunds`).
+	string path;
 	string description; /// one-line description of when to use the skill
 	string instructions; /// the `SKILL.md` body (Markdown; frontmatter is synthesized)
 	string[string] metadata; /// optional extra frontmatter under `metadata:`
 	SkillFile[] files; /// optional supporting files served as sibling resources
+	SkillArchive[] archives; /// optional pre-packed archive forms of the whole skill
+
+	/// The skill name: the final segment of `path`, per SEP-2640's requirement
+	/// that the last `<skill-path>` segment equal the frontmatter `name`.
+	string name() const @safe pure
+	{
+		return skillName(path);
+	}
+}
+
+/// The final segment of a skill path — the skill's `name`. For `acme/billing/refunds`
+/// this is `refunds`; for `git-workflow` it is `git-workflow`.
+string skillName(string path) @safe pure
+{
+	import std.string : lastIndexOf;
+
+	const slash = path.lastIndexOf('/');
+	return slash < 0 ? path : path[slash + 1 .. $];
 }
 
 /// Whether `name` is a valid Agent Skills / SEP-2640 skill name: 1..64
 /// characters of lowercase ASCII letters, digits, and single hyphens, with no
-/// leading, trailing, or consecutive hyphens. The final URI segment of a
-/// skill's resources is this name, so it must be URI-safe and stable.
+/// leading, trailing, or consecutive hyphens. The final segment of a skill path
+/// must satisfy this so the name is recoverable from the URI and URI-safe.
 bool isValidSkillName(string name) @safe pure nothrow
 {
 	if (name.length == 0 || name.length > 64)
@@ -82,16 +113,57 @@ bool isValidSkillName(string name) @safe pure nothrow
 	return true;
 }
 
-/// The `skill://<name>/SKILL.md` resource URI for a skill.
-string skillUri(string name) @safe pure
+/// Whether `path` is a valid skill path: one or more non-empty `/`-separated
+/// segments whose final segment is a valid skill name (`isValidSkillName`).
+/// Prefix segments only need to be non-empty (RFC 3986 path segments).
+bool isValidSkillPath(string path) @safe pure nothrow
 {
-	return "skill://" ~ name ~ "/SKILL.md";
+	if (path.length == 0)
+		return false;
+	size_t segStart;
+	string last;
+	foreach (i, char c; path)
+	{
+		if (c != '/')
+			continue;
+		if (i == segStart) // empty segment (leading, trailing, or doubled '/')
+			return false;
+		last = path[segStart .. i];
+		segStart = i + 1;
+	}
+	if (segStart == path.length) // trailing '/' leaves an empty final segment
+		return false;
+	last = path[segStart .. $];
+	return isValidSkillName(last);
 }
 
-/// The `skill://<name>/<path>` resource URI for a skill's supporting file.
-string skillFileUri(string name, string path) @safe pure
+/// The `skill://<path>/SKILL.md` resource URI for a skill.
+string skillUri(string path) @safe pure
 {
-	return "skill://" ~ name ~ "/" ~ path;
+	return "skill://" ~ path ~ "/SKILL.md";
+}
+
+/// The `skill://<path>/<file>` resource URI for a skill's supporting file.
+string skillFileUri(string path, string file) @safe pure
+{
+	return "skill://" ~ path ~ "/" ~ file;
+}
+
+/// The `skill://<path><suffix>` resource URI for a skill's archive form.
+string skillArchiveUri(string path, string suffix) @safe pure
+{
+	return "skill://" ~ path ~ suffix;
+}
+
+/// A `sha256:<hex>` digest of `bytes`, the integrity form SEP-2640 requires for
+/// index `digest` fields (lowercase hex of the SHA-256 of the artifact's raw
+/// bytes).
+string skillDigest(scope const(ubyte)[] bytes) @safe
+{
+	import std.digest.sha : sha256Of;
+	import std.digest : toHexString, LetterCase;
+
+	return "sha256:" ~ toHexString!(LetterCase.lower)(sha256Of(bytes)).idup;
 }
 
 /// Double-quote and escape a string as a YAML flow scalar so an arbitrary
@@ -144,6 +216,28 @@ string skillMarkdown(string name, string description, string instructions,
 	return a.data;
 }
 
+/// The skill's frontmatter rendered as a JSON object, matching the YAML
+/// `skillMarkdown` synthesizes: `name` and `description` always, plus a nested
+/// `metadata` object when present. This is the verbatim `frontmatter` SEP-2640
+/// requires in each `skill://index.json` entry — identical in content to the
+/// `SKILL.md` it describes.
+private Json frontmatterJson(string name, string description, string[string] metadata) @safe
+{
+	import std.algorithm : sort;
+
+	Json fm = Json.emptyObject;
+	fm["name"] = name;
+	fm["description"] = description;
+	if (metadata.length)
+	{
+		Json m = Json.emptyObject;
+		foreach (key; metadata.keys.sort)
+			m[key] = metadata[key];
+		fm["metadata"] = m;
+	}
+	return fm;
+}
+
 /// Advertise the SEP-2640 skills extension on `server` and register the
 /// `skill://index.json` discovery resource (whose reader serializes whatever
 /// skills are registered at read time). Idempotent: safe to call before every
@@ -166,7 +260,6 @@ void enableSkills(McpServer server) @safe
 
 	server.registerResource(descriptor, () @safe {
 		Json doc = Json.emptyObject;
-		doc["$schema"] = skillDiscoverySchema;
 		Json skills = Json.emptyArray;
 		foreach (entry; index.entries)
 			skills ~= entry;
@@ -176,27 +269,30 @@ void enableSkills(McpServer server) @safe
 }
 
 /// Register `skill` on `server`: serve its `SKILL.md` (with synthesized
-/// frontmatter) at `skill://<name>/SKILL.md`, serve each supporting file at
-/// `skill://<name>/<path>`, advertise the skills extension, and add the skill
-/// to the `skill://index.json` discovery document. Throws if `name` is not a
-/// valid skill name (see `isValidSkillName`).
+/// frontmatter) at `skill://<path>/SKILL.md`, serve each supporting file at
+/// `skill://<path>/<file>` and each archive at `skill://<path><suffix>`,
+/// advertise the skills extension, and add a conformant entry — verbatim
+/// `frontmatter`, the `SKILL.md` `url` and its `digest`, and any `archives` — to
+/// the `skill://index.json` discovery document. Throws if `path` is not a valid
+/// skill path (see `isValidSkillPath`).
 void registerSkill(McpServer server, Skill skill) @safe
 {
-	if (!isValidSkillName(skill.name))
-		throw new Exception("invalid skill name '" ~ skill.name
-				~ "': must be 1..64 chars of lowercase letters, digits, and single hyphens "
-				~ "(no leading/trailing/consecutive hyphens)");
+	if (!isValidSkillPath(skill.path))
+		throw new Exception("invalid skill path '" ~ skill.path
+				~ "': each '/'-separated segment must be non-empty and the final segment "
+				~ "must be a valid skill name (1..64 chars of lowercase letters, digits, "
+				~ "and single hyphens, no leading/trailing/consecutive hyphens)");
 
 	enableSkills(server);
 	auto index = server.ensureSkillIndex();
 
-	const uri = skillUri(skill.name);
-	const markdown = skillMarkdown(skill.name, skill.description,
-			skill.instructions, skill.metadata);
+	const name = skill.name;
+	const uri = skillUri(skill.path);
+	const markdown = skillMarkdown(name, skill.description, skill.instructions, skill.metadata);
 
 	Resource descriptor;
 	descriptor.uri = uri;
-	descriptor.name = skill.name;
+	descriptor.name = name;
 	descriptor.description = nullable(skill.description);
 	descriptor.mimeType = nullable(skillMimeType);
 	server.registerResource(descriptor, () @safe {
@@ -208,10 +304,10 @@ void registerSkill(McpServer server, Skill skill) @safe
 		// Bind a per-iteration copy so each resource reader closes over its own
 		// file rather than the shared loop variable.
 		const f = file;
-		const fileUri = skillFileUri(skill.name, f.path);
+		const fileUri = skillFileUri(skill.path, f.path);
 		Resource fileDescriptor;
 		fileDescriptor.uri = fileUri;
-		fileDescriptor.name = skill.name ~ "/" ~ f.path;
+		fileDescriptor.name = f.path;
 		if (f.mimeType.length)
 			fileDescriptor.mimeType = nullable(f.mimeType);
 		server.registerResource(fileDescriptor, () @safe {
@@ -221,19 +317,46 @@ void registerSkill(McpServer server, Skill skill) @safe
 	}
 
 	Json entry = Json.emptyObject;
-	entry["name"] = skill.name;
-	entry["type"] = "skill-md";
-	entry["description"] = skill.description;
+	entry["frontmatter"] = frontmatterJson(name, skill.description, skill.metadata);
 	entry["url"] = uri;
+	entry["digest"] = skillDigest(cast(const(ubyte)[]) markdown);
+
+	if (skill.archives.length)
+	{
+		import std.base64 : Base64;
+
+		Json archives = Json.emptyArray;
+		foreach (archive; skill.archives)
+		{
+			const a = archive;
+			const archiveUri = skillArchiveUri(skill.path, a.suffix);
+			Resource archiveDescriptor;
+			archiveDescriptor.uri = archiveUri;
+			archiveDescriptor.name = name ~ a.suffix;
+			if (a.mimeType.length)
+				archiveDescriptor.mimeType = nullable(a.mimeType);
+			server.registerResource(archiveDescriptor, () @safe {
+				return ResourceContents.makeBlob(archiveUri, a.mimeType, a.content);
+			});
+
+			Json e = Json.emptyObject;
+			e["url"] = archiveUri;
+			e["mimeType"] = a.mimeType;
+			e["digest"] = skillDigest(Base64.decode(a.content));
+			archives ~= e;
+		}
+		entry["archives"] = archives;
+	}
+
 	index.entries ~= entry;
 }
 
-/// Convenience overload registering a skill from its parts (no supporting files
-/// or metadata). Equivalent to `registerSkill(server, Skill(name, description,
-/// instructions))`.
-void registerSkill(McpServer server, string name, string description, string instructions) @safe
+/// Convenience overload registering a skill from its parts (no supporting files,
+/// archives, or metadata). Equivalent to `registerSkill(server, Skill(path,
+/// description, instructions))`.
+void registerSkill(McpServer server, string path, string description, string instructions) @safe
 {
-	registerSkill(server, Skill(name, description, instructions));
+	registerSkill(server, Skill(path, description, instructions));
 }
 
 /// Whether the connected client advertised the skills extension at
@@ -248,25 +371,67 @@ bool clientSupportsSkills(McpServer server) @safe
 
 import mcp.client.client : McpClient;
 
-/// One entry from a server's `skill://index.json` discovery document.
+/// One archive form from a `skill://index.json` entry's `archives` array.
+struct SkillArchiveRef
+{
+	string url; /// resource URI of the archive
+	string mimeType; /// the archive format's media type
+	string digest; /// `sha256:<hex>` digest of the archive bytes
+
+	static SkillArchiveRef fromJson(Json j) @safe
+	{
+		SkillArchiveRef a;
+		if ("url" in j && j["url"].type == Json.Type.string)
+			a.url = j["url"].get!string;
+		if ("mimeType" in j && j["mimeType"].type == Json.Type.string)
+			a.mimeType = j["mimeType"].get!string;
+		if ("digest" in j && j["digest"].type == Json.Type.string)
+			a.digest = j["digest"].get!string;
+		return a;
+	}
+}
+
+/// One entry from a server's `skill://index.json` discovery document. `name` and
+/// `description` are read from the verbatim `frontmatter` object (always present
+/// per the Agent Skills spec); `url`/`digest` address the `SKILL.md` directly
+/// (absent for archive-only entries), and `archives` lists pre-packed forms.
 struct SkillEntry
 {
-	string name; /// skill name (empty for an `mcp-resource-template` entry)
-	string type; /// "skill-md" or "mcp-resource-template"
-	string description; /// one-line description
-	string url; /// full resource URI (`skill-md`) or RFC 6570 template
+	Json frontmatter; /// verbatim `SKILL.md` frontmatter as JSON
+	string url; /// resource URI of the `SKILL.md` (empty for archive-only entries)
+	string digest; /// `sha256:<hex>` of the `SKILL.md` (empty when `url` is empty)
+	SkillArchiveRef[] archives; /// pre-packed archive forms of the skill
+
+	/// The skill `name` from the frontmatter, or empty if absent.
+	string name() const @safe
+	{
+		if (frontmatter.type == Json.Type.object && "name" in frontmatter
+				&& frontmatter["name"].type == Json.Type.string)
+			return frontmatter["name"].get!string;
+		return null;
+	}
+
+	/// The skill `description` from the frontmatter, or empty if absent.
+	string description() const @safe
+	{
+		if (frontmatter.type == Json.Type.object && "description" in frontmatter
+				&& frontmatter["description"].type == Json.Type.string)
+			return frontmatter["description"].get!string;
+		return null;
+	}
 
 	static SkillEntry fromJson(Json j) @safe
 	{
 		SkillEntry e;
-		if ("name" in j && j["name"].type == Json.Type.string)
-			e.name = j["name"].get!string;
-		if ("type" in j && j["type"].type == Json.Type.string)
-			e.type = j["type"].get!string;
-		if ("description" in j && j["description"].type == Json.Type.string)
-			e.description = j["description"].get!string;
+		if ("frontmatter" in j)
+			e.frontmatter = j["frontmatter"];
 		if ("url" in j && j["url"].type == Json.Type.string)
 			e.url = j["url"].get!string;
+		if ("digest" in j && j["digest"].type == Json.Type.string)
+			e.digest = j["digest"].get!string;
+		if ("archives" in j && j["archives"].type == Json.Type.array)
+			foreach (i; 0 .. j["archives"].length)
+				e.archives ~= SkillArchiveRef.fromJson(j["archives"][i]);
 		return e;
 	}
 }
@@ -294,16 +459,24 @@ SkillEntry[] listSkills(McpClient client) @safe
 	return entries;
 }
 
-/// Read a skill's `SKILL.md` from `client` by skill name — a wrapper over
-/// `resources/read` of `skill://<name>/SKILL.md`. Returns the raw `SKILL.md`
-/// text (frontmatter + body), or `null` if the server returned no text content.
-string readSkill(McpClient client, string name) @safe
+/// Read a skill's `SKILL.md` by its resource URI — a wrapper over
+/// `resources/read`. Works whether or not the skill appears in any index (a
+/// skill URI is always a valid `resources/read` argument). Returns the raw
+/// `SKILL.md` text, or `null` if the server returned no text content.
+string readSkillUri(McpClient client, string uri) @safe
 {
-	auto result = client.readResource(skillUri(name));
+	auto result = client.readResource(uri);
 	foreach (content; result.contents)
 		if (content.text.length)
 			return content.text;
 	return null;
+}
+
+/// Read a skill's `SKILL.md` by skill path — `readSkillUri` against
+/// `skill://<path>/SKILL.md`.
+string readSkill(McpClient client, string path) @safe
+{
+	return readSkillUri(client, skillUri(path));
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -315,6 +488,14 @@ unittest  // the extension key and discovery constants carry the SEP-2640 litera
 	assert(skillIndexUri == "skill://index.json");
 	assert(skillUri("git-workflow") == "skill://git-workflow/SKILL.md");
 	assert(skillFileUri("pdf", "references/FORMS.md") == "skill://pdf/references/FORMS.md");
+}
+
+unittest  // a prefixed skill path maps to a nested skill:// URI
+{
+	assert(skillUri("acme/billing/refunds") == "skill://acme/billing/refunds/SKILL.md");
+	assert(skillName("acme/billing/refunds") == "refunds");
+	assert(skillName("git-workflow") == "git-workflow");
+	assert(skillArchiveUri("pdf-processing", ".tar.gz") == "skill://pdf-processing.tar.gz");
 }
 
 unittest  // isValidSkillName accepts well-formed names
@@ -339,6 +520,23 @@ unittest  // isValidSkillName rejects malformed names
 	foreach (_; 0 .. 65)
 		tooLong ~= "a";
 	assert(!isValidSkillName(tooLong));
+}
+
+unittest  // isValidSkillPath allows multi-segment prefixes but constrains the final segment
+{
+	assert(isValidSkillPath("git-workflow"));
+	assert(isValidSkillPath("acme/billing/refunds"));
+	assert(!isValidSkillPath(""));
+	assert(!isValidSkillPath("acme//refunds")); // empty middle segment
+	assert(!isValidSkillPath("acme/refunds/")); // empty (invalid) final segment
+	assert(!isValidSkillPath("acme/Bad_Name")); // invalid final segment
+}
+
+unittest  // skillDigest renders a lowercase sha256:<hex> of the bytes
+{
+	// SHA-256 of the empty input is a well-known constant.
+	assert(skillDigest(
+			[]) == "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 }
 
 unittest  // skillMarkdown synthesizes frontmatter with name/description and body
@@ -368,7 +566,7 @@ unittest  // skillMarkdown emits metadata in a deterministic sorted order
 	assert(a >= 0 && z >= 0 && a < z, "alpha must sort before zeta");
 }
 
-unittest  // enableSkills advertises the extension and serves an empty index
+unittest  // enableSkills advertises the extension and serves an empty {skills:[]} index
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.mrtr : MetaKey;
@@ -393,11 +591,12 @@ unittest  // enableSkills advertises the extension and serves an empty index
 			rp))).get["result"]["contents"][0];
 	assert(contents["mimeType"].get!string == skillIndexMimeType);
 	auto doc = parseJsonString(contents["text"].get!string);
-	assert(doc["$schema"].get!string == skillDiscoverySchema);
+	// The discovery document carries no $schema / version marker — just `skills`.
+	assert("$schema" !in doc);
 	assert(doc["skills"].type == Json.Type.array && doc["skills"].length == 0);
 }
 
-unittest  // registerSkill serves SKILL.md and lists the skill in the index
+unittest  // registerSkill serves SKILL.md and lists a conformant index entry
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import vibe.data.json : parseJsonString;
@@ -418,7 +617,7 @@ unittest  // registerSkill serves SKILL.md and lists the skill in the index
 	assert(md.canFind("name: git-workflow"));
 	assert(md.canFind("# Git Workflow"));
 
-	// The index lists the skill with the spec entry shape.
+	// The index lists the skill with verbatim frontmatter, url, and a digest.
 	Json ip = Json.emptyObject;
 	ip["uri"] = skillIndexUri;
 	auto idx = s.handle(Message(makeRequest(Json(2), "resources/read", ip)))
@@ -426,10 +625,56 @@ unittest  // registerSkill serves SKILL.md and lists the skill in the index
 	auto doc = parseJsonString(idx["text"].get!string);
 	assert(doc["skills"].length == 1);
 	auto e = doc["skills"][0];
-	assert(e["name"].get!string == "git-workflow");
-	assert(e["type"].get!string == "skill-md");
-	assert(e["description"].get!string == "Follow Git conventions");
+	assert(e["frontmatter"]["name"].get!string == "git-workflow");
+	assert(e["frontmatter"]["description"].get!string == "Follow Git conventions");
 	assert(e["url"].get!string == "skill://git-workflow/SKILL.md");
+	// digest MUST be present with url, and MUST match the served SKILL.md bytes.
+	assert(e["digest"].get!string == skillDigest(cast(const(ubyte)[]) md));
+	assert("type" !in e); // the old non-spec `type:"skill-md"` field is gone
+}
+
+unittest  // a prefixed skill path lists frontmatter.name as the final segment
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	registerSkill(s, "acme/billing/refunds", "Process refunds", "# Refunds\n");
+
+	Json rp = Json.emptyObject;
+	rp["uri"] = skillUri("acme/billing/refunds");
+	auto sm = s.handle(Message(makeRequest(Json(1), "resources/read", rp)))
+		.get["result"]["contents"][0];
+	assert(sm["text"].get!string.length > 0);
+
+	Json ip = Json.emptyObject;
+	ip["uri"] = skillIndexUri;
+	auto idx = s.handle(Message(makeRequest(Json(2), "resources/read", ip)))
+		.get["result"]["contents"][0];
+	auto doc = parseJsonString(idx["text"].get!string);
+	auto e = doc["skills"][0];
+	assert(e["frontmatter"]["name"].get!string == "refunds");
+	assert(e["url"].get!string == "skill://acme/billing/refunds/SKILL.md");
+}
+
+unittest  // metadata round-trips into the index frontmatter as a nested object
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	Skill sk = {
+		path: "pdf", description: "Process PDFs", instructions: "# PDF\n",
+		metadata: ["version": "2.1.0"]
+	};
+	registerSkill(s, sk);
+
+	Json ip = Json.emptyObject;
+	ip["uri"] = skillIndexUri;
+	auto idx = s.handle(Message(makeRequest(Json(1), "resources/read", ip)))
+		.get["result"]["contents"][0];
+	auto doc = parseJsonString(idx["text"].get!string);
+	assert(doc["skills"][0]["frontmatter"]["metadata"]["version"].get!string == "2.1.0");
 }
 
 unittest  // registerSkill serves supporting files as sibling resources
@@ -438,7 +683,7 @@ unittest  // registerSkill serves supporting files as sibling resources
 
 	auto s = new McpServer("t", "1");
 	Skill sk = {
-		name: "pdf", description: "Process PDFs", instructions: "See references/FORMS.md.",
+		path: "pdf", description: "Process PDFs", instructions: "See references/FORMS.md.",
 		files: [SkillFile("references/FORMS.md", "text/markdown", "# Forms\n")]
 	};
 	registerSkill(s, sk);
@@ -451,7 +696,43 @@ unittest  // registerSkill serves supporting files as sibling resources
 	assert(contents["text"].get!string == "# Forms\n");
 }
 
-unittest  // registerSkill rejects an invalid skill name
+unittest  // an archive form is served as a blob and listed with a digest
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import vibe.data.json : parseJsonString;
+	import std.base64 : Base64;
+
+	auto s = new McpServer("t", "1");
+	// A stand-in archive payload; the extension does not interpret the bytes.
+	const raw = cast(const(ubyte)[]) "fake-tar-gz-bytes";
+	const b64 = Base64.encode(raw).idup;
+	Skill sk = {
+		path: "pdf", description: "Process PDFs", instructions: "# PDF\n",
+		archives: [SkillArchive(".tar.gz", "application/gzip", b64)]
+	};
+	registerSkill(s, sk);
+
+	// The archive resource is served as a blob at skill://pdf.tar.gz.
+	Json rp = Json.emptyObject;
+	rp["uri"] = "skill://pdf.tar.gz";
+	auto contents = s.handle(Message(makeRequest(Json(1), "resources/read",
+			rp))).get["result"]["contents"][0];
+	assert(contents["mimeType"].get!string == "application/gzip");
+	assert(contents["blob"].get!string == b64);
+
+	// The index entry lists the archive with the matching url, mime, and digest.
+	Json ip = Json.emptyObject;
+	ip["uri"] = skillIndexUri;
+	auto idx = s.handle(Message(makeRequest(Json(2), "resources/read", ip)))
+		.get["result"]["contents"][0];
+	auto doc = parseJsonString(idx["text"].get!string);
+	auto archive = doc["skills"][0]["archives"][0];
+	assert(archive["url"].get!string == "skill://pdf.tar.gz");
+	assert(archive["mimeType"].get!string == "application/gzip");
+	assert(archive["digest"].get!string == skillDigest(raw));
+}
+
+unittest  // registerSkill rejects an invalid skill path
 {
 	import std.exception : assertThrown;
 
@@ -474,8 +755,8 @@ unittest  // multiple skills accumulate in the index across calls
 		.get["result"]["contents"][0];
 	auto doc = parseJsonString(idx["text"].get!string);
 	assert(doc["skills"].length == 2);
-	assert(doc["skills"][0]["name"].get!string == "alpha");
-	assert(doc["skills"][1]["name"].get!string == "beta");
+	assert(doc["skills"][0]["frontmatter"]["name"].get!string == "alpha");
+	assert(doc["skills"][1]["frontmatter"]["name"].get!string == "beta");
 }
 
 unittest  // clientSupportsSkills reflects what the client advertised at initialize
@@ -506,14 +787,22 @@ unittest  // clientSupportsSkills is false when the client did not advertise it
 	assert(!clientSupportsSkills(s));
 }
 
-unittest  // SkillEntry.fromJson reads the discovery entry fields
+unittest  // SkillEntry.fromJson reads frontmatter, url, digest, and archives
 {
 	import vibe.data.json : parseJsonString;
 
-	auto e = SkillEntry.fromJson(parseJsonString(
-			`{"name":"git","type":"skill-md","description":"d","url":"skill://git/SKILL.md"}`));
-	assert(e.name == "git");
-	assert(e.type == "skill-md");
+	auto e = SkillEntry.fromJson(parseJsonString(`{
+		"frontmatter": {"name": "refunds", "description": "d"},
+		"url": "skill://acme/billing/refunds/SKILL.md",
+		"digest": "sha256:abc",
+		"archives": [{"url": "skill://acme/billing/refunds.tar.gz",
+			"mimeType": "application/gzip", "digest": "sha256:def"}]
+	}`));
+	assert(e.name == "refunds");
 	assert(e.description == "d");
-	assert(e.url == "skill://git/SKILL.md");
+	assert(e.url == "skill://acme/billing/refunds/SKILL.md");
+	assert(e.digest == "sha256:abc");
+	assert(e.archives.length == 1);
+	assert(e.archives[0].mimeType == "application/gzip");
+	assert(e.archives[0].digest == "sha256:def");
 }

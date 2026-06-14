@@ -159,11 +159,14 @@ struct resource
 /// UDA marking a method as an MCP skill (SEP-2640, the
 /// `io.modelcontextprotocol/skills` extension). The method takes no arguments
 /// and returns the `SKILL.md` instructions body as a `string`; the reflection
-/// layer synthesizes the YAML frontmatter from `name`/`description`, serves it
-/// as a `skill://<name>/SKILL.md` markdown resource, advertises the skills
-/// extension, and lists the skill in the `skill://index.json` discovery
-/// resource. `name` must be lowercase alphanumeric with single hyphens
-/// (1..64 chars), per the Agent Skills spec.
+/// layer synthesizes the YAML frontmatter from the skill `path`'s final segment
+/// and `description`, serves it as a `skill://<path>/SKILL.md` markdown resource,
+/// advertises the skills extension, and lists a conformant entry (verbatim
+/// frontmatter, url, sha256 digest) in the `skill://index.json` discovery
+/// resource. `path` is a `/`-separated locator whose final segment is the skill
+/// name; that segment must be lowercase alphanumeric with single hyphens
+/// (1..64 chars), per the Agent Skills spec. Preceding segments are an optional
+/// organizational prefix (e.g. `acme/billing/refunds`).
 ///
 /// Example:
 /// ---
@@ -172,7 +175,7 @@ struct resource
 /// ---
 struct skill
 {
-	string name;
+	string path;
 	string description;
 }
 

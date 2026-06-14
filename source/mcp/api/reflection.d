@@ -932,7 +932,7 @@ private void registerSkillMethod(string memberName, alias overload, alias parent
 			"@skill method '" ~ memberName ~ "' must return the SKILL.md instructions as a string");
 
 	Skill sk;
-	sk.name = attr.name;
+	sk.path = attr.path;
 	sk.description = attr.description;
 	sk.instructions = __traits(getMember, parent, memberName)();
 	registerSkill(server, sk);
@@ -1308,11 +1308,12 @@ unittest  // @skill reflection: registerHandlers serves SKILL.md and the index
 	// The skill is listed in the discovery index.
 	Json ip = Json.emptyObject;
 	ip["uri"] = skillIndexUri;
-	auto idx = s.handle(Message(makeRequest(Json(2), "resources/read",
-			ip))).get["result"]["contents"][0];
+	auto idx = s.handle(Message(makeRequest(Json(2), "resources/read", ip)))
+		.get["result"]["contents"][0];
 	auto doc = parseJsonString(idx["text"].get!string);
 	assert(doc["skills"].length == 1);
-	assert(doc["skills"][0]["name"].get!string == "git-workflow");
+	assert(doc["skills"][0]["frontmatter"]["name"].get!string == "git-workflow");
+	assert(doc["skills"][0]["url"].get!string == skillUri("git-workflow"));
 }
 
 unittest  // @prompt enum arg given an invalid member -> InvalidParams (-32602)
