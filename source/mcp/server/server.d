@@ -195,6 +195,7 @@ final class McpServer : ServerCore
 	private TaskDispatcher taskDispatcher_;
 	private TaskExecutor[string] taskExecutors_;
 	private SkillIndex skillIndex_;
+	private bool directoryReadEnabled_;
 	private Json extensions = Json.undefined;
 	// Per-connection mutable state — negotiated protocol version, client
 	// capabilities, log level, subscriptions, and the `inFlight` cancellation
@@ -1070,6 +1071,17 @@ final class McpServer : ServerCore
 		if (skillIndex_ is null)
 			skillIndex_ = new SkillIndex();
 		return skillIndex_;
+	}
+
+	/// Enable the draft `resources/directory/read` method (SEP-2640): scoped,
+	/// paginated listing of a directory resource's direct children. The skills
+	/// layer turns this on (and advertises `directoryRead: true`) via
+	/// `enableSkills`, but the method is not skill-specific — it lists the direct
+	/// children of any registered resource subtree, under any scheme. A server
+	/// that never enables it answers -32601 (method not found).
+	void enableDirectoryRead() @safe
+	{
+		directoryReadEnabled_ = true;
 	}
 
 	/// Whether a client is currently subscribed to updates for `uri`.
@@ -2076,6 +2088,15 @@ final class McpServer : ServerCore
 			if (capabilities().resources.isNull)
 				throw methodNotFound(method);
 			return doReadResource(params, ctx, ver, conn);
+		case "resources/directory/read":
+			// The SEP-2640 directory-listing method: draft-only (its capability
+			// rides the draft-only `extensions` map) and opt-in via
+			// `enableDirectoryRead()`. A session that is not draft, or a server
+			// that never enabled it, MUST answer -32601 (method not found),
+			// mirroring the tasks RPC gating.
+			if (!ver.isModern || !directoryReadEnabled_)
+				throw methodNotFound(method);
+			return doDirectoryRead(params, ver);
 		case "resources/subscribe":
 			// The draft has no resources/subscribe RPC; subscriptions/listen takes
 			// its place (the ListenFilter "Replaces the former
@@ -2392,6 +2413,77 @@ final class McpServer : ServerCore
 		Json data = Json.emptyObject;
 		data["uri"] = uri;
 		throw new McpException(ver.resourceNotFoundCode, "Resource not found: " ~ uri, data);
+	}
+
+	// The MIME type SEP-2640 assigns to a directory resource. A directory is
+	// never registered explicitly — it is implied by the file resources beneath
+	// it — so `resources/directory/read` synthesizes one of these for each
+	// subdirectory it reports. Directory URIs are written without a trailing slash.
+	private enum string directoryMimeType = "inode/directory";
+
+	private Json doDirectoryRead(Json params, ProtocolVersion ver) @safe
+	{
+		import std.algorithm : sort;
+
+		if ("uri" !in params || params["uri"].type != Json.Type.string)
+			throw invalidParams("resources/directory/read requires a string 'uri'");
+		const dir = params["uri"].get!string;
+		const prefix = dir ~ "/";
+
+		// A directory's direct children: registered resources whose URI sits one
+		// path segment below `prefix` are files; a deeper resource contributes its
+		// first segment as a synthesized subdirectory (reported once).
+		Resource[] children;
+		bool[string] seenDirs;
+		foreach (uri; resources.keys)
+		{
+			if (uri.length <= prefix.length || uri[0 .. prefix.length] != prefix)
+				continue;
+			const rest = uri[prefix.length .. $];
+			size_t slash = size_t.max;
+			foreach (i, char c; rest)
+				if (c == '/')
+				{
+					slash = i;
+					break;
+				}
+			if (slash == size_t.max)
+			{
+				// A direct file child: report the registered descriptor, but with
+				// its name set to the file's basename (the directory-relative name).
+				Resource child = resources[uri].descriptor;
+				child.name = rest;
+				children ~= child;
+			}
+			else
+			{
+				const childUri = prefix ~ rest[0 .. slash];
+				if (childUri in seenDirs)
+					continue;
+				seenDirs[childUri] = true;
+				Resource d;
+				d.uri = childUri;
+				d.name = rest[0 .. slash];
+				d.mimeType = directoryMimeType;
+				children ~= d;
+			}
+		}
+
+		// The method applies only to directory resources: a URI that names no
+		// subtree (a file, or an unknown URI) is reported as -32602, the same code
+		// `resources/read` uses for an unknown resource, with the offending URI in
+		// `data` so the client need not parse the message.
+		if (children.length == 0)
+		{
+			Json data = Json.emptyObject;
+			data["uri"] = dir;
+			throw new McpException(ErrorCode.invalidParams, "Not a directory resource: " ~ dir,
+					data);
+		}
+
+		sort!((a, b) => a.uri < b.uri)(children);
+		return paginatedList!(ListResourcesResult, "resources")("resources/directory/read",
+				children, (Resource r) => r, params, ver);
 	}
 
 	private Json doSubscribe(Json params, ConnectionState conn) @safe

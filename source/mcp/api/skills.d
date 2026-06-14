@@ -29,6 +29,11 @@ enum string skillIndexUri = "skill://index.json";
 /// The MIME type of the `skill://index.json` discovery document.
 enum string skillIndexMimeType = "application/json";
 
+/// The MIME type SEP-2640 assigns to a directory resource — the `mimeType` that
+/// marks a `resources/directory/read` child as a subdirectory the client can
+/// descend into (rather than a file to read).
+enum string skillDirectoryMimeType = "inode/directory";
+
 /// A supporting file shipped alongside a skill's `SKILL.md` (a reference doc,
 /// template, example, or asset). Served as a sibling resource at
 /// `skill://<skill-path>/<path>`; `path` is relative to the skill root and may
@@ -246,7 +251,13 @@ private Json frontmatterJson(string name, string description, string[string] met
 /// `server/discover` so the extension appears in the negotiated capabilities.
 void enableSkills(McpServer server) @safe
 {
-	server.enableExtension(skillsExtensionKey);
+	// Advertise the extension with `directoryRead: true` and turn the method on:
+	// this SDK serves skills as individual file resources, so `resources/directory/read`
+	// can scope-list any skill subtree.
+	Json settings = Json.emptyObject;
+	settings["directoryRead"] = true;
+	server.enableExtension(skillsExtensionKey, settings);
+	server.enableDirectoryRead();
 	auto index = server.ensureSkillIndex();
 	if (index.indexResourceRegistered)
 		return;
@@ -479,6 +490,43 @@ string readSkill(McpClient client, string path) @safe
 	return readSkillUri(client, skillUri(path));
 }
 
+/// One direct child reported by `resources/directory/read`: either a file (read
+/// it with `resources/read`) or a subdirectory (`isDirectory`, descend with a
+/// further `readDirectory`).
+struct SkillDirEntry
+{
+	string uri; /// the child's resource URI
+	string name; /// the child's directory-relative name (basename)
+	string mimeType; /// the child's MIME type (`inode/directory` for a subdirectory)
+
+	/// Whether this child is a subdirectory rather than a file.
+	bool isDirectory() const @safe
+	{
+		return mimeType == skillDirectoryMimeType;
+	}
+}
+
+/// List the direct children of a directory resource via the SEP-2640
+/// `resources/directory/read` method (a wrapper over `client.readDirectory`).
+/// Only valid against a server that advertised `directoryRead: true`. Files come
+/// back with their own MIME type; subdirectories carry `inode/directory`
+/// (`SkillDirEntry.isDirectory`) and are descended with a further call.
+SkillDirEntry[] readDirectory(McpClient client, string uri) @safe
+{
+	SkillDirEntry[] entries;
+	auto result = client.readDirectory(uri);
+	foreach (r; result.resources)
+	{
+		SkillDirEntry e;
+		e.uri = r.uri;
+		e.name = r.name;
+		if (!r.mimeType.isNull)
+			e.mimeType = r.mimeType.get;
+		entries ~= e;
+	}
+	return entries;
+}
+
 // --- Tests ------------------------------------------------------------------
 
 unittest  // the extension key and discovery constants carry the SEP-2640 literals
@@ -584,6 +632,8 @@ unittest  // enableSkills advertises the extension and serves an empty {skills:[
 	auto caps = s.handle(Message(makeRequest(Json(1), "server/discover",
 			params))).get["result"]["capabilities"];
 	assert(skillsExtensionKey in caps["extensions"]);
+	// The capability advertises the optional directory-read method this SDK serves.
+	assert(caps["extensions"][skillsExtensionKey]["directoryRead"].get!bool == true);
 
 	Json rp = Json.emptyObject;
 	rp["uri"] = skillIndexUri;
@@ -805,4 +855,113 @@ unittest  // SkillEntry.fromJson reads frontmatter, url, digest, and archives
 	assert(e.archives.length == 1);
 	assert(e.archives[0].mimeType == "application/gzip");
 	assert(e.archives[0].digest == "sha256:def");
+}
+
+version (unittest)
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	// Build a draft-version request so `resources/directory/read` (draft-gated)
+	// is routed; mirrors the server's own `draftReq` test helper.
+	private Message draftRequest(long id, string method, Json params) @safe
+	{
+		import mcp.protocol.mrtr : MetaKey;
+
+		Json m = Json.emptyObject;
+		m[MetaKey.protocolVersion] = "2026-07-28";
+		m[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+		m[MetaKey.clientCapabilities] = Json.emptyObject;
+		params["_meta"] = m;
+		return Message(makeRequest(Json(id), method, params));
+	}
+
+	private McpServer pdfSkillServer() @safe
+	{
+		auto s = new McpServer("t", "1");
+		Skill sk = {
+			path: "office/pdf-forms", description: "Process PDFs", instructions: "# PDF\n", files: [
+				SkillFile("references/FORMS.md", "text/markdown", "# Forms\n")
+			]
+		};
+		registerSkill(s, sk);
+		return s;
+	}
+}
+
+unittest  // resources/directory/read lists a skill root's files and subdirectories
+{
+	auto s = pdfSkillServer();
+
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://office/pdf-forms";
+	auto res = s.handle(draftRequest(1, "resources/directory/read", p)).get["result"]["resources"];
+	assert(res.length == 2);
+
+	bool sawSkillMd, sawReferencesDir;
+	foreach (i; 0 .. res.length)
+	{
+		auto child = res[i];
+		if (child["uri"].get!string == "skill://office/pdf-forms/SKILL.md")
+		{
+			assert(child["name"].get!string == "SKILL.md");
+			sawSkillMd = true;
+		}
+		if (child["uri"].get!string == "skill://office/pdf-forms/references")
+		{
+			assert(child["name"].get!string == "references");
+			assert(child["mimeType"].get!string == skillDirectoryMimeType);
+			sawReferencesDir = true;
+		}
+	}
+	assert(sawSkillMd && sawReferencesDir);
+}
+
+unittest  // resources/directory/read descends into a subdirectory
+{
+	auto s = pdfSkillServer();
+
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://office/pdf-forms/references";
+	auto res = s.handle(draftRequest(1, "resources/directory/read", p)).get["result"]["resources"];
+	assert(res.length == 1);
+	assert(res[0]["uri"].get!string == "skill://office/pdf-forms/references/FORMS.md");
+	assert(res[0]["name"].get!string == "FORMS.md");
+	assert(res[0]["mimeType"].get!string == "text/markdown");
+}
+
+unittest  // resources/directory/read on a file (not a directory) is -32602
+{
+	import mcp.protocol.errors : ErrorCode;
+
+	auto s = pdfSkillServer();
+
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://office/pdf-forms/SKILL.md";
+	auto resp = s.handle(draftRequest(1, "resources/directory/read", p)).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
+	assert(resp["error"]["data"]["uri"].get!string == "skill://office/pdf-forms/SKILL.md");
+}
+
+unittest  // resources/directory/read is -32601 when skills (and the method) are not enabled
+{
+	import mcp.protocol.errors : ErrorCode;
+
+	auto s = new McpServer("t", "1");
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://anything";
+	auto resp = s.handle(draftRequest(1, "resources/directory/read", p)).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.methodNotFound);
+}
+
+unittest  // resources/directory/read does not exist on a non-draft (stable) session
+{
+	import mcp.protocol.errors : ErrorCode;
+
+	auto s = pdfSkillServer(); // enables the method on the draft path
+
+	// A stable session (no draft _meta) never sees the draft-only method.
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://office/pdf-forms";
+	auto resp = s.handle(Message(makeRequest(Json(1), "resources/directory/read", p))).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.methodNotFound);
 }

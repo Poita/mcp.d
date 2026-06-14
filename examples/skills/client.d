@@ -17,6 +17,8 @@
  *      synthesized frontmatter carries the name/description.
  *   4. The prefixed office/pdf-forms skill exposes its sibling
  *      references/FORMS.md and a .tar.gz archive form, both addressable.
+ *   5. resources/directory/read scope-lists the skill's tree: files plus
+ *      subdirectories (marked inode/directory), descended one level at a time.
  *
  * The extensions negotiation map is draft-only, so the client enables the draft
  * protocol (`enableModern`) before negotiation — exactly as the tasks example
@@ -24,7 +26,7 @@
  */
 module skills_client;
 
-import std.algorithm : canFind, filter, map;
+import std.algorithm : any, canFind, filter, map;
 import std.array : array;
 import std.stdio : writeln;
 
@@ -95,6 +97,16 @@ int main(string[] args) @safe
 		check(archive.contents.length > 0 && archive.contents[0].blob.length > 0,
 			"the archive resource should be readable as a blob");
 
+		// --- 5. resources/directory/read: scope-list the skill's tree -------
+		auto root = readDirectory(client, "skill://office/pdf-forms");
+		check(root.any!(e => e.name == "SKILL.md" && !e.isDirectory),
+			"directory read should list SKILL.md as a file");
+		check(root.any!(e => e.name == "references" && e.isDirectory),
+			"directory read should list references/ as a subdirectory");
+		auto refs = readDirectory(client, "skill://office/pdf-forms/references");
+		check(refs.any!(e => e.name == "FORMS.md"),
+			"descending into references/ should list FORMS.md");
+
 		bool http;
 		foreach (arg; args)
 			if (arg == "--http" || arg == "--url")
@@ -103,7 +115,8 @@ int main(string[] args) @safe
 			? "http" : "stdio",
 			" — skills extension advertised; index lists git-workflow/code-review/pdf-forms",
 			" with verbatim frontmatter + sha256 digests; SKILL.md frontmatter synthesized;",
-			" prefixed office/pdf-forms serves references/FORMS.md and a .tar.gz archive.");
+			" prefixed office/pdf-forms serves references/FORMS.md and a .tar.gz archive;",
+			" resources/directory/read walks the skill tree.");
 		return 0;
 	});
 }

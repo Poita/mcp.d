@@ -626,8 +626,12 @@ unpack to identical content.
 On the client, `listSkills(client)` reads `skill://index.json` and returns the
 discovery entries (each with `frontmatter`, `url`, `digest`, and `archives`), and
 `readSkill(client, "git-workflow")` / `readSkillUri(client, uri)` read a
-`SKILL.md` — all thin wrappers over `resources/read`, since SEP-2640 defines no
-`skills/*` methods. The extension is advertised only under the draft protocol (the
+`SKILL.md`. When a skill's instructions point at a directory ("pick a template
+from `templates/`"), `readDirectory(client, uri)` scope-lists that directory's
+direct children via the extension's one new method, `resources/directory/read`
+(files plus `inode/directory` subdirectories) — enabled automatically by
+`enableSkills`, which advertises `directoryRead: true`. The extension is
+advertised only under the draft protocol (the
 `extensions` negotiation map is draft-only), so a client enables `enableModern()`
 before negotiation; the resource reads themselves work on any version. See
 [`examples/skills`](examples/skills/) for the full e2e.
