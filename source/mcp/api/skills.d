@@ -288,8 +288,26 @@ void enableSkills(McpServer server) @safe
 /// skill path (see `isValidSkillPath`).
 void registerSkill(McpServer server, Skill skill) @safe
 {
-	if (!isValidSkillPath(skill.path))
-		throw new Exception("invalid skill path '" ~ skill.path
+	const name = skill.name;
+	registerSkillResources(server, skill.path, skillMarkdown(name, skill.description,
+			skill.instructions, skill.metadata), frontmatterJson(name,
+			skill.description, skill.metadata), skill.files, skill.archives);
+}
+
+/// The shared registration core both `registerSkill` (which synthesizes the
+/// `SKILL.md` and frontmatter from a `Skill`) and `registerSkillDir` (which
+/// reads them from a local directory) funnel into: serve `skillMd` verbatim at
+/// `skill://<path>/SKILL.md`, serve each supporting file and archive resource,
+/// and append the conformant `skill://index.json` entry (`frontmatter` verbatim,
+/// `url`, the `SKILL.md` `digest`, and any `archives`). `frontmatter` is the
+/// index entry's `frontmatter` object — for a directory skill the authored YAML
+/// parsed to JSON, for a `Skill` the synthesized `{name, description, metadata}`.
+/// Throws if `path` is not a valid skill path (see `isValidSkillPath`).
+package(mcp) void registerSkillResources(McpServer server, string path,
+		string skillMd, Json frontmatter, SkillFile[] files, SkillArchive[] archives) @safe
+{
+	if (!isValidSkillPath(path))
+		throw new Exception("invalid skill path '" ~ path
 				~ "': each '/'-separated segment must be non-empty and the final segment "
 				~ "must be a valid skill name (1..64 chars of lowercase letters, digits, "
 				~ "and single hyphens, no leading/trailing/consecutive hyphens)");
@@ -297,25 +315,26 @@ void registerSkill(McpServer server, Skill skill) @safe
 	enableSkills(server);
 	auto index = server.ensureSkillIndex();
 
-	const name = skill.name;
-	const uri = skillUri(skill.path);
-	const markdown = skillMarkdown(name, skill.description, skill.instructions, skill.metadata);
+	const name = skillName(path);
+	const uri = skillUri(path);
 
 	Resource descriptor;
 	descriptor.uri = uri;
 	descriptor.name = name;
-	descriptor.description = nullable(skill.description);
+	if (frontmatter.type == Json.Type.object && "description" in frontmatter
+			&& frontmatter["description"].type == Json.Type.string)
+		descriptor.description = nullable(frontmatter["description"].get!string);
 	descriptor.mimeType = nullable(skillMimeType);
 	server.registerResource(descriptor, () @safe {
-		return ResourceContents.makeText(uri, skillMimeType, markdown);
+		return ResourceContents.makeText(uri, skillMimeType, skillMd);
 	});
 
-	foreach (file; skill.files)
+	foreach (file; files)
 	{
 		// Bind a per-iteration copy so each resource reader closes over its own
 		// file rather than the shared loop variable.
 		const f = file;
-		const fileUri = skillFileUri(skill.path, f.path);
+		const fileUri = skillFileUri(path, f.path);
 		Resource fileDescriptor;
 		fileDescriptor.uri = fileUri;
 		fileDescriptor.name = f.path;
@@ -328,19 +347,19 @@ void registerSkill(McpServer server, Skill skill) @safe
 	}
 
 	Json entry = Json.emptyObject;
-	entry["frontmatter"] = frontmatterJson(name, skill.description, skill.metadata);
+	entry["frontmatter"] = frontmatter;
 	entry["url"] = uri;
-	entry["digest"] = skillDigest(cast(const(ubyte)[]) markdown);
+	entry["digest"] = skillDigest(cast(const(ubyte)[]) skillMd);
 
-	if (skill.archives.length)
+	if (archives.length)
 	{
 		import std.base64 : Base64;
 
-		Json archives = Json.emptyArray;
-		foreach (archive; skill.archives)
+		Json archiveEntries = Json.emptyArray;
+		foreach (archive; archives)
 		{
 			const a = archive;
-			const archiveUri = skillArchiveUri(skill.path, a.suffix);
+			const archiveUri = skillArchiveUri(path, a.suffix);
 			Resource archiveDescriptor;
 			archiveDescriptor.uri = archiveUri;
 			archiveDescriptor.name = name ~ a.suffix;
@@ -354,9 +373,9 @@ void registerSkill(McpServer server, Skill skill) @safe
 			e["url"] = archiveUri;
 			e["mimeType"] = a.mimeType;
 			e["digest"] = skillDigest(Base64.decode(a.content));
-			archives ~= e;
+			archiveEntries ~= e;
 		}
-		entry["archives"] = archives;
+		entry["archives"] = archiveEntries;
 	}
 
 	index.entries ~= entry;

@@ -55,6 +55,7 @@ public import mcp.api.apps;
 
 // --- MCP Skills extension (SEP-2640 Agent Skills over resources) ---
 public import mcp.api.skills;
+public import mcp.api.skill_dir;
 
 // --- User-facing modern (next-version) result/hint types ---
 // `mcp.protocol.modern` holds only user-facing result/hint wire types

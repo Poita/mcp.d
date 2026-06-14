@@ -94,6 +94,8 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 						registerTemplateMethod!(memberName, overload, parent)(server, attr);
 					else static if (is(typeof(attr) == skill))
 						registerSkillMethod!(memberName, overload, parent)(server, attr);
+					else static if (is(typeof(attr) == skillDir))
+						registerSkillDirMethod!(memberName, overload, parent)(server, attr);
 				}
 			}
 		}
@@ -936,6 +938,27 @@ private void registerSkillMethod(string memberName, alias overload, alias parent
 	sk.description = attr.description;
 	sk.instructions = __traits(getMember, parent, memberName)();
 	registerSkill(server, sk);
+}
+
+private void registerSkillDirMethod(string memberName, alias overload, alias parent)(
+		McpServer server, skillDir attr) @safe
+{
+	import std.traits : ReturnType;
+	import mcp.api.skill_dir : registerSkillDir, SkillDirOptions;
+
+	// A @skillDir method names a local directory: it takes no arguments and
+	// returns the directory path as a string. The directory's SKILL.md, files,
+	// and (optionally) archives are served by registerSkillDir.
+	static assert(Parameters!overload.length == 0, "@skillDir method '" ~ memberName
+			~ "' must take no parameters; it returns the local skill directory path");
+	static assert(isSomeString!(ReturnType!overload),
+			"@skillDir method '" ~ memberName
+			~ "' must return the local skill directory path as a string");
+
+	SkillDirOptions options;
+	options.path = attr.path;
+	options.archives = attr.archives;
+	registerSkillDir(server, __traits(getMember, parent, memberName)(), options);
 }
 
 version (unittest)

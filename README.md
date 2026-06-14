@@ -623,6 +623,39 @@ Each `archives` entry is listed alongside the SKILL.md `url` with its own
 `sha256` digest, so a host can fetch the whole skill in one round trip; both forms
 unpack to identical content.
 
+### Serving a skill from a local directory
+
+To serve an existing on-disk skill — a `SKILL.md` with authored frontmatter plus
+whatever files and subdirectories it ships — point `registerSkillDir` (or the
+`@skillDir` UDA) at the directory. The SDK serves the `SKILL.md` verbatim, parses
+its frontmatter into the index entry, exposes every file as a
+`skill://<path>/<file>` resource (so subdirectories are automatically walkable via
+`resources/directory/read`), and packs the tree into any archive formats you ask
+for:
+
+```d
+// UDA: the method returns the local directory; archives are opt-in per format.
+final class Skills
+{
+    @skillDir("team/release-helper", ArchiveFormat.zip)
+    string releaseHelper() @safe => "skills/release-helper";
+}
+
+// Or imperatively, with full control via SkillDirOptions:
+registerSkillDir(server, "skills/release-helper", SkillDirOptions(
+    path: "team/release-helper",            // empty derives it from the frontmatter name
+    archives: [ArchiveFormat.zip, ArchiveFormat.tarGz],
+));
+```
+
+The directory's final path segment must equal the frontmatter `name`. Frontmatter
+is parsed with [dyaml](https://code.dlang.org/packages/dyaml) and archives are
+built with the [archive](https://code.dlang.org/packages/archive) package (zip is
+in-tree via `std.zip`'s format; `tarGz` produces real gzip). Archives are built
+deterministically (sorted entries, no timestamps) so the index digest is stable.
+A symlink, a nested `SKILL.md`, or exceeding `maxFiles`/`maxTotalBytes` is
+rejected.
+
 On the client, `listSkills(client)` reads `skill://index.json` and returns the
 discovery entries (each with `frontmatter`, `url`, `digest`, and `archives`), and
 `readSkill(client, "git-workflow")` / `readSkillUri(client, uri)` read a

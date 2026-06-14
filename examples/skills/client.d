@@ -13,16 +13,15 @@
  *   1. server/discover advertises the skills extension under `capabilities`.
  *   2. listSkills() reads skill://index.json and returns conformant entries
  *      (verbatim frontmatter, SKILL.md url + sha256 digest, archives).
- *   3. readSkill("git-workflow") reads skill://git-workflow/SKILL.md and the
- *      synthesized frontmatter carries the name/description.
- *   4. The prefixed office/pdf-forms skill exposes its sibling
- *      references/FORMS.md and a .tar.gz archive form, both addressable.
- *   5. resources/directory/read scope-lists the skill's tree: files plus
+ *   3. readSkill("git-workflow") reads a @skill skill: synthesized frontmatter.
+ *   4. The @skillDir-sourced team/release-helper skill carries its AUTHORED
+ *      frontmatter, a references/CHECKLIST.md file, and a .zip archive form.
+ *   5. resources/directory/read scope-lists the release-helper tree: files plus
  *      subdirectories (marked inode/directory), descended one level at a time.
  *
  * The extensions negotiation map is draft-only, so the client enables the draft
- * protocol (`enableModern`) before negotiation — exactly as the tasks example
- * does. The resource reads themselves work on any protocol version.
+ * protocol (`enableModern`) before negotiation. The resource reads themselves
+ * work on any protocol version.
  */
 module skills_client;
 
@@ -54,6 +53,8 @@ int main(string[] args) @safe
 			"discover should include extensions in capabilities");
 		check((skillsExtensionKey in caps["extensions"]) !is null,
 			"discover capabilities.extensions should contain the skills extension key");
+		check(caps["extensions"][skillsExtensionKey]["directoryRead"].get!bool,
+			"the skills capability should advertise directoryRead");
 
 		auto negotiated = client.connect();
 		checkEq(negotiated, ProtocolVersion.modern, "connect() should negotiate draft");
@@ -64,59 +65,61 @@ int main(string[] args) @safe
 		checkEq(skills.length, 3, "index should list three skills");
 		check(names.canFind("git-workflow"), "index should list git-workflow");
 		check(names.canFind("code-review"), "index should list code-review");
-		check(names.canFind("pdf-forms"), "index should list pdf-forms (final path segment)");
-		// Every direct entry carries a SKILL.md url and a sha256:<hex> digest.
+		check(names.canFind("release-helper"), "index should list release-helper");
 		foreach (s; skills)
 		{
 			check(s.url.length > 0, "entry should carry a SKILL.md url");
 			check(s.digest.canFind("sha256:"), "entry should carry a sha256 digest");
 		}
 
-		// --- 3. readSkill(): SKILL.md carries synthesized frontmatter -------
+		// --- 3. a @skill skill: synthesized frontmatter ---------------------
 		auto md = readSkill(client, "git-workflow");
 		check(md.canFind("name: git-workflow"), "SKILL.md frontmatter should carry the name");
 		check(md.canFind("description: \"Follow this team's Git"),
 			"SKILL.md frontmatter should carry the description");
 		check(md.canFind("# Git Workflow"), "SKILL.md should carry the instructions body");
 
-		// --- 4. the prefixed multi-file skill: supporting file + archive ----
-		auto pdf = skills.filter!(s => s.name == "pdf-forms").front;
-		check(pdf.url == "skill://office/pdf-forms/SKILL.md",
-			"pdf-forms should be served under its office/ prefix");
+		// --- 4. the @skillDir skill: authored frontmatter, file, archive ----
+		auto rel = skills.filter!(s => s.name == "release-helper").front;
+		check(rel.url == "skill://team/release-helper/SKILL.md",
+			"release-helper should be served under its team/ prefix");
+		// The authored frontmatter (license + nested metadata) survives verbatim.
+		check(rel.frontmatter["license"].get!string == "Apache-2.0",
+			"authored license should pass through to the index frontmatter");
+		check(rel.frontmatter["metadata"]["version"].get!string == "1.3.0",
+			"authored metadata should pass through to the index frontmatter");
 
-		auto forms = client.readResource("skill://office/pdf-forms/references/FORMS.md");
-		check(forms.contents.length > 0, "the supporting file should be readable");
-		check(forms.contents[0].text.canFind("applicant_name"),
-			"references/FORMS.md should carry the field reference");
+		auto checklist = client.readResource("skill://team/release-helper/references/CHECKLIST.md");
+		check(checklist.contents.length > 0
+			&& checklist.contents[0].text.canFind("Release Checklist"),
+			"the supporting references/CHECKLIST.md should be readable");
 
-		// The archive form is listed in the index and readable as a blob.
-		check(pdf.archives.length == 1, "pdf-forms should list one archive form");
-		checkEq(pdf.archives[0].mimeType, "application/gzip", "archive mimeType");
-		check(pdf.archives[0].digest.canFind("sha256:"), "archive should carry a digest");
-		auto archive = client.readResource(pdf.archives[0].url);
+		check(rel.archives.length == 1, "release-helper should list one archive form");
+		checkEq(rel.archives[0].mimeType, "application/zip", "archive mimeType");
+		check(rel.archives[0].digest.canFind("sha256:"), "archive should carry a digest");
+		auto archive = client.readResource(rel.archives[0].url);
 		check(archive.contents.length > 0 && archive.contents[0].blob.length > 0,
 			"the archive resource should be readable as a blob");
 
-		// --- 5. resources/directory/read: scope-list the skill's tree -------
-		auto root = readDirectory(client, "skill://office/pdf-forms");
+		// --- 5. resources/directory/read: walk the skill's tree -------------
+		auto root = readDirectory(client, "skill://team/release-helper");
 		check(root.any!(e => e.name == "SKILL.md" && !e.isDirectory),
 			"directory read should list SKILL.md as a file");
 		check(root.any!(e => e.name == "references" && e.isDirectory),
 			"directory read should list references/ as a subdirectory");
-		auto refs = readDirectory(client, "skill://office/pdf-forms/references");
-		check(refs.any!(e => e.name == "FORMS.md"),
-			"descending into references/ should list FORMS.md");
+		auto refs = readDirectory(client, "skill://team/release-helper/references");
+		check(refs.any!(e => e.name == "CHECKLIST.md"),
+			"descending into references/ should list CHECKLIST.md");
 
 		bool http;
 		foreach (arg; args)
 			if (arg == "--http" || arg == "--url")
 				http = true;
-		writeln("OK: skills example e2e passed over ", http
-			? "http" : "stdio",
-			" — skills extension advertised; index lists git-workflow/code-review/pdf-forms",
-			" with verbatim frontmatter + sha256 digests; SKILL.md frontmatter synthesized;",
-			" prefixed office/pdf-forms serves references/FORMS.md and a .tar.gz archive;",
-			" resources/directory/read walks the skill tree.");
+		writeln("OK: skills example e2e passed over ", http ? "http" : "stdio",
+			" — skills extension advertised (directoryRead); index lists",
+			" git-workflow/code-review/release-helper with verbatim frontmatter + sha256",
+			" digests; @skillDir team/release-helper serves authored frontmatter,",
+			" references/CHECKLIST.md, and a .zip archive; resources/directory/read walks the tree.");
 		return 0;
 	});
 }

@@ -179,6 +179,48 @@ struct skill
 	string description;
 }
 
+/// An archive format a skill directory can be packed into and served as an
+/// alternative whole-skill download (SEP-2640 "archives"). `zip` needs no extra
+/// dependency; `tarGz` produces a gzip-compressed tar. Used by `@skillDir` and
+/// `SkillDirOptions` (`mcp.api.skill_dir`).
+enum ArchiveFormat
+{
+	zip, /// a ZIP archive (`application/zip`, served at `skill://<path>.zip`)
+	tarGz /// a gzip-compressed tar (`application/gzip`, served at `skill://<path>.tar.gz`)
+}
+
+/// UDA marking a method as an MCP skill served from a local directory (SEP-2640).
+/// The method takes no arguments and returns the path to a local skill directory
+/// (one containing a `SKILL.md`); the reflection layer reads `SKILL.md` verbatim,
+/// parses its authored frontmatter for the index, exposes every file in the
+/// directory tree as a `skill://<path>/<file>` resource (so subdirectories are
+/// walkable via `resources/directory/read`), and — for each `ArchiveFormat`
+/// passed — packs the whole directory into a downloadable archive listed in the
+/// index. `path` is the skill path (its final segment must equal the directory's
+/// `SKILL.md` frontmatter `name`); leave it empty to derive the path from that
+/// name. For finer control (read filters, size caps) use the imperative
+/// `registerSkillDir` with `SkillDirOptions`.
+///
+/// Example:
+/// ---
+/// @skillDir("office/pdf-forms", ArchiveFormat.zip)
+/// string pdfForms() @safe { return "skills/pdf-forms"; }
+/// ---
+struct skillDir
+{
+	string path;
+	ArchiveFormat[] archives;
+
+	/// Construct from a skill path and zero or more archive formats to also
+	/// expose (`@skillDir("x")`, `@skillDir("x", ArchiveFormat.zip)`,
+	/// `@skillDir("x", ArchiveFormat.zip, ArchiveFormat.tarGz)`).
+	this(string path, ArchiveFormat[] archives...) @safe
+	{
+		this.path = path;
+		this.archives = archives.dup;
+	}
+}
+
 /// UDA marking a method as a resource template (URI contains `{var}`
 /// placeholders). The method receives the captured parameters as its arguments.
 ///
