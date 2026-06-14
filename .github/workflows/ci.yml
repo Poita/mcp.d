@@ -127,7 +127,7 @@ jobs:
       # fail_ci_if_error stays false so a missing token / transient outage never
       # blocks CI.
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: ./lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
