@@ -18,7 +18,9 @@
 		"vibe-d:http": "~>0.9.8",
 		"openssl": "~>3.4",
 		"jsonschema": "~>0.3.0",
-		"jsonschema:vibe": "~>0.3.0"
+		"jsonschema:vibe": "~>0.3.0",
+		"dyaml": "~>0.9.2",
+		"archive": "~>0.7.1"
 	},
 	"sourceFiles-windows": ["source/deimos/openssl/version_.di"],
 	"configurations": [

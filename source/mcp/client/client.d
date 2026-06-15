@@ -1678,6 +1678,30 @@ final class McpClient : ClientProtocol
 		return withProgressToken(p, progressToken);
 	}
 
+	/// `resources/directory/read` (SEP-2640): the direct children of the directory
+	/// resource at `uri`, following pagination cursors to completion. Files come
+	/// back with their own metadata; subdirectories carry the `inode/directory`
+	/// MIME type and are descended with a further call. Only valid against a
+	/// server that advertised the skills extension's `directoryRead: true`;
+	/// otherwise the server answers -32601 (method not found). Not cached: a
+	/// directory listing is cheap and the skill catalogs that motivate it are
+	/// often generated on demand.
+	ListResourcesResult readDirectory(string uri) @safe
+	{
+		ListResourcesResult acc;
+		paginate((Nullable!string cursor) @safe {
+			Json p = Json.emptyObject;
+			p["uri"] = uri;
+			if (!cursor.isNull)
+				p["cursor"] = cursor.get;
+			auto res = ListResourcesResult.fromJson(rpc("resources/directory/read", p));
+			acc.resources ~= res.resources;
+			return res.nextCursor;
+		});
+		acc.nextCursor = Nullable!string.init;
+		return acc;
+	}
+
 	/// `prompts/list`, auto-paginated. Returns the drained `ListPromptsResult`:
 	/// `prompts` aggregates every page, `nextCursor` is null, and `cache` carries
 	/// the first page's parsed freshness hint. A still-fresh result is served from
