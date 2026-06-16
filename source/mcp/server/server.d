@@ -1042,11 +1042,13 @@ final class McpServer : ServerCore
 		return taskRuntime_;
 	}
 
-	/// Advertise a draft protocol extension (e.g. "io.modelcontextprotocol/tasks")
-	/// with an optional per-extension settings object. The identifier and its
-	/// settings appear in the `extensions` field of the server capabilities sent
-	/// during `initialize` / `server/discover`, per the draft Extension
-	/// Negotiation rules. `settings` defaults to an empty object.
+	/// Advertise a protocol extension (e.g. "io.modelcontextprotocol/tasks") with
+	/// an optional per-extension settings object. The identifier and its settings
+	/// appear in the `extensions` field of the server capabilities sent during
+	/// `initialize` / `server/discover`, per the Extension Negotiation rules, but
+	/// only once the negotiated version meets the extension's `extensionMinVersion`
+	/// floor (Apps/Skills from 2025-11-25, Tasks draft-only). `settings` defaults
+	/// to an empty object.
 	void enableExtension(string identifier, Json settings = Json.emptyObject) @safe
 	{
 		if (extensions.type != Json.Type.object)
@@ -1073,12 +1075,13 @@ final class McpServer : ServerCore
 		return skillIndex_;
 	}
 
-	/// Enable the draft `resources/directory/read` method (SEP-2640): scoped,
-	/// paginated listing of a directory resource's direct children. The skills
-	/// layer turns this on (and advertises `directoryRead: true`) via
-	/// `enableSkills`, but the method is not skill-specific — it lists the direct
-	/// children of any registered resource subtree, under any scheme. A server
-	/// that never enables it answers -32601 (method not found).
+	/// Enable the `resources/directory/read` method (SEP-2640): scoped, paginated
+	/// listing of a directory resource's direct children. Available from 2025-11-25
+	/// (the Skills extension floor). The skills layer turns this on (and advertises
+	/// `directoryRead: true`) via `enableSkills`, but the method is not
+	/// skill-specific — it lists the direct children of any registered resource
+	/// subtree, under any scheme. A server that never enables it, or a session
+	/// below 2025-11-25, answers -32601 (method not found).
 	void enableDirectoryRead() @safe
 	{
 		directoryReadEnabled_ = true;
@@ -2089,12 +2092,12 @@ final class McpServer : ServerCore
 				throw methodNotFound(method);
 			return doReadResource(params, ctx, ver, conn);
 		case "resources/directory/read":
-			// The SEP-2640 directory-listing method: draft-only (its capability
-			// rides the draft-only `extensions` map) and opt-in via
-			// `enableDirectoryRead()`. A session that is not draft, or a server
-			// that never enabled it, MUST answer -32601 (method not found),
-			// mirroring the tasks RPC gating.
-			if (!ver.isModern || !directoryReadEnabled_)
+			// The SEP-2640 directory-listing method: its capability rides the
+			// `extensions` map under the Skills extension, which negotiates from
+			// 2025-11-25, and it is opt-in via `enableDirectoryRead()`. A session
+			// below that floor, or a server that never enabled it, MUST answer
+			// -32601 (method not found).
+			if (ver < ProtocolVersion.v2025_11_25 || !directoryReadEnabled_)
 				throw methodNotFound(method);
 			return doDirectoryRead(params, ver);
 		case "resources/subscribe":
@@ -5172,15 +5175,15 @@ unittest  // advertised extensions appear in server/discover capabilities under 
 	settings["maxConcurrent"] = 4;
 	s.enableExtension("io.modelcontextprotocol/tasks", settings);
 
-	// The `extensions` negotiation map is draft-only; a draft client discovers it
-	// via `server/discover`, not the `initialize` handshake.
+	// The Tasks extension is draft-only; a draft client discovers it via
+	// `server/discover`, not the `initialize` handshake.
 	auto resp = s.handle(draftReq(1, "server/discover")).get;
 	auto ext = resp["result"]["capabilities"]["extensions"];
 	assert(ext.type == Json.Type.object);
 	assert(ext["io.modelcontextprotocol/tasks"]["maxConcurrent"].get!int == 4);
 }
 
-unittest  // extensions are NOT advertised for pre-draft negotiated versions
+unittest  // the Tasks extension is NOT advertised for pre-draft negotiated versions
 {
 	auto s = new McpServer("t", "1");
 	s.enableExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
@@ -5193,6 +5196,35 @@ unittest  // extensions are NOT advertised for pre-draft negotiated versions
 		assert("extensions" !in resp["result"]["capabilities"],
 				"extensions leaked into negotiated version " ~ ver);
 	}
+}
+
+unittest  // Apps/Skills extensions are advertised when negotiating 2025-11-25
+{
+	auto s = new McpServer("t", "1");
+	s.enableExtension("io.modelcontextprotocol/ui", Json.emptyObject);
+	s.enableExtension("io.modelcontextprotocol/skills", Json.emptyObject);
+
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-11-25";
+	auto resp = s.handle(req(1, "initialize", params)).get;
+	auto ext = resp["result"]["capabilities"]["extensions"];
+	assert(ext.type == Json.Type.object);
+	assert("io.modelcontextprotocol/ui" in ext);
+	assert("io.modelcontextprotocol/skills" in ext);
+}
+
+unittest  // a mixed extension set negotiated at 2025-11-25 advertises Apps/Skills but not Tasks
+{
+	auto s = new McpServer("t", "1");
+	s.enableExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
+	s.enableExtension("io.modelcontextprotocol/skills", Json.emptyObject);
+
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-11-25";
+	auto resp = s.handle(req(1, "initialize", params)).get;
+	auto ext = resp["result"]["capabilities"]["extensions"];
+	assert("io.modelcontextprotocol/skills" in ext);
+	assert("io.modelcontextprotocol/tasks" !in ext);
 }
 
 unittest  // completions are NOT advertised when negotiating 2024-11-05

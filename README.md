@@ -664,9 +664,9 @@ from `templates/`"), `readDirectory(client, uri)` scope-lists that directory's
 direct children via the extension's one new method, `resources/directory/read`
 (files plus `inode/directory` subdirectories) — enabled automatically by
 `enableSkills`, which advertises `directoryRead: true`. The extension is
-advertised only under the draft protocol (the
-`extensions` negotiation map is draft-only), so a client enables `enableModern()`
-before negotiation; the resource reads themselves work on any version. See
+advertised from 2025-11-25 onward (its entry in the `extensions` negotiation map
+carries that version floor), so it appears for clients on the latest stable
+version or the draft; the resource reads themselves work on any version. See
 [`examples/skills`](examples/skills/) for the full e2e.
 
 ## Concurrency model

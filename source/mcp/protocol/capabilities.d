@@ -2,15 +2,56 @@ module mcp.protocol.capabilities;
 
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
-import mcp.protocol.versions : ProtocolVersion, isModern;
+import mcp.protocol.versions : ProtocolVersion;
 import mcp.protocol.jsonhelpers : getOr, tryGet;
 
 @safe:
 
 /// The Extension Negotiation identifier under which task support is declared
-/// (the SEP-2663 MCP Tasks extension). Carried in the draft `extensions`
-/// capability map; an empty settings object indicates support.
+/// (the SEP-2663 MCP Tasks extension). Carried in the `extensions` capability
+/// map; an empty settings object indicates support.
 enum string tasksExtensionKey = "io.modelcontextprotocol/tasks";
+
+/// The minimum protocol version at which an Extension Negotiation identifier
+/// may be advertised in the `extensions` capability map. Apps
+/// (`io.modelcontextprotocol/ui`) and Skills (`io.modelcontextprotocol/skills`)
+/// negotiate from 2025-11-25; Tasks (SEP-2663) is draft-only. An identifier with
+/// no declared floor defaults to draft-only — the conservative choice for an
+/// extension whose version policy this SDK does not yet know.
+ProtocolVersion extensionMinVersion(string identifier) pure nothrow @safe @nogc
+{
+	switch (identifier)
+	{
+	case "io.modelcontextprotocol/ui": // Apps
+	case "io.modelcontextprotocol/skills": // Skills (SEP-2640)
+		return ProtocolVersion.v2025_11_25;
+	case tasksExtensionKey: // Tasks (SEP-2663) — draft only
+		return ProtocolVersion.modern;
+	default:
+		return ProtocolVersion.modern;
+	}
+}
+
+/// Project an `extensions` capability map onto protocol version `v`, keeping
+/// only those identifiers whose `extensionMinVersion` floor `v` meets. Returns
+/// `Json.undefined` when the input is not an object or nothing survives, so the
+/// caller omits an empty `extensions` field. Shared by the server and client
+/// `forVersion` projections.
+private Json projectExtensions(const Json extensions, ProtocolVersion v) @safe
+{
+	if (extensions.type != Json.Type.object)
+		return Json.undefined;
+	Json kept = Json.emptyObject;
+	// `Json.opApply` is `@system` and non-`const`; we only read, so cast away
+	// `const` inside the trusted block to iterate the object (mirrors
+	// `diffMissingKeys`).
+	() @trusted {
+		foreach (string key, Json settings; cast() extensions)
+			if (v >= extensionMinVersion(key))
+				kept[key] = settings;
+	}();
+	return kept.length > 0 ? kept : Json.undefined;
+}
 
 /// An icon for display in user interfaces. Used by `Implementation`,
 /// `Tool` (and other definitions) per the MCP spec's icon shape: a required
@@ -238,9 +279,10 @@ struct ServerCapabilities
 	/// capabilities that existed in (and were negotiated for) the peer's
 	/// version. Mirrors `Implementation.forVersion`. The basic/lifecycle rule
 	/// "Only use capabilities that were successfully negotiated" requires this:
-	/// `completions` applies from 2025-03-26 and the `extensions` negotiation
-	/// map is draft-only. `tools`/`resources`/`prompts`/`logging`/`experimental`
-	/// exist in every supported version.
+	/// `completions` applies from 2025-03-26 and each entry in the `extensions`
+	/// negotiation map is gated by its own `extensionMinVersion` floor.
+	/// `tools`/`resources`/`prompts`/`logging`/`experimental` exist in every
+	/// supported version.
 	ServerCapabilities forVersion(ProtocolVersion v) const @safe
 	{
 		ServerCapabilities projected;
@@ -251,9 +293,9 @@ struct ServerCapabilities
 		projected.experimental = experimental;
 		if (v >= ProtocolVersion.v2025_03_26)
 			projected.completions = completions;
-		// The `extensions` negotiation map is draft-only.
-		if (v.isModern && extensions.type == Json.Type.object)
-			projected.extensions = extensions;
+		// Each extension carries its own version floor (see extensionMinVersion):
+		// Apps/Skills from 2025-11-25, Tasks draft-only.
+		projected.extensions = projectExtensions(extensions, v);
 		return projected;
 	}
 
@@ -366,8 +408,9 @@ struct ClientCapabilities
 	/// to `>= 2025-06-18` (a client that set only an elicitation submode still
 	/// projects a bare `elicitation` there). The sampling/elicitation sub-objects
 	/// (`sampling.tools`/`sampling.context`, `elicitation.form`/`elicitation.url`)
-	/// apply from 2025-11-25 and are stripped below that. The `extensions`
-	/// negotiation map is draft-only.
+	/// apply from 2025-11-25 and are stripped below that. Each entry in the
+	/// `extensions` negotiation map is gated by its own `extensionMinVersion`
+	/// floor.
 	ClientCapabilities forVersion(ProtocolVersion v) const @safe
 	{
 		ClientCapabilities projected;
@@ -389,9 +432,9 @@ struct ClientCapabilities
 			projected.elicitationForm = elicitationForm;
 			projected.elicitationUrl = elicitationUrl;
 		}
-		// The `extensions` negotiation map is draft-only.
-		if (v.isModern && extensions.type == Json.Type.object)
-			projected.extensions = extensions;
+		// Each extension carries its own version floor (see extensionMinVersion):
+		// Apps/Skills from 2025-11-25, Tasks draft-only.
+		projected.extensions = projectExtensions(extensions, v);
 		return projected;
 	}
 
@@ -776,6 +819,80 @@ unittest  // ServerCapabilities.forVersion keeps extensions for draft
 	ext["io.modelcontextprotocol/tasks"] = Json.emptyObject;
 	caps.extensions = ext;
 	assert("extensions" in caps.forVersion(ProtocolVersion.modern).toJson());
+}
+
+unittest  // ServerCapabilities.forVersion: Apps/Skills ride extensions from 2025-11-25
+{
+	ServerCapabilities caps;
+	Json ext = Json.emptyObject;
+	ext["io.modelcontextprotocol/ui"] = Json.emptyObject;
+	ext["io.modelcontextprotocol/skills"] = Json.emptyObject;
+	caps.extensions = ext;
+	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.modern])
+	{
+		auto j = caps.forVersion(v).toJson();
+		assert("io.modelcontextprotocol/ui" in j["extensions"]);
+		assert("io.modelcontextprotocol/skills" in j["extensions"]);
+	}
+}
+
+unittest  // ServerCapabilities.forVersion: Apps/Skills stripped below 2025-11-25
+{
+	ServerCapabilities caps;
+	Json ext = Json.emptyObject;
+	ext["io.modelcontextprotocol/ui"] = Json.emptyObject;
+	ext["io.modelcontextprotocol/skills"] = Json.emptyObject;
+	caps.extensions = ext;
+	foreach (v; [
+		ProtocolVersion.v2024_11_05, ProtocolVersion.v2025_03_26,
+		ProtocolVersion.v2025_06_18
+	])
+		assert("extensions" !in caps.forVersion(v).toJson());
+}
+
+unittest  // ServerCapabilities.forVersion: Tasks stays draft-only at 2025-11-25
+{
+	ServerCapabilities caps;
+	Json ext = Json.emptyObject;
+	ext["io.modelcontextprotocol/tasks"] = Json.emptyObject;
+	caps.extensions = ext;
+	assert("extensions" !in caps.forVersion(ProtocolVersion.v2025_11_25).toJson());
+	assert("extensions" in caps.forVersion(ProtocolVersion.modern).toJson());
+}
+
+unittest  // ServerCapabilities.forVersion: a mixed map drops Tasks but keeps Apps/Skills at 2025-11-25
+{
+	ServerCapabilities caps;
+	Json ext = Json.emptyObject;
+	ext["io.modelcontextprotocol/tasks"] = Json.emptyObject;
+	ext["io.modelcontextprotocol/ui"] = Json.emptyObject;
+	ext["io.modelcontextprotocol/skills"] = Json.emptyObject;
+	caps.extensions = ext;
+	auto j = caps.forVersion(ProtocolVersion.v2025_11_25).toJson();
+	assert("io.modelcontextprotocol/tasks" !in j["extensions"]);
+	assert("io.modelcontextprotocol/ui" in j["extensions"]);
+	assert("io.modelcontextprotocol/skills" in j["extensions"]);
+}
+
+unittest  // ClientCapabilities.forVersion: Apps/Skills ride extensions from 2025-11-25, Tasks stays draft-only
+{
+	ClientCapabilities caps;
+	Json ext = Json.emptyObject;
+	ext["io.modelcontextprotocol/tasks"] = Json.emptyObject;
+	ext["io.modelcontextprotocol/skills"] = Json.emptyObject;
+	caps.extensions = ext;
+	auto j = caps.forVersion(ProtocolVersion.v2025_11_25).toJson();
+	assert("io.modelcontextprotocol/skills" in j["extensions"]);
+	assert("io.modelcontextprotocol/tasks" !in j["extensions"]);
+	assert("extensions" !in caps.forVersion(ProtocolVersion.v2025_06_18).toJson());
+}
+
+unittest  // extensionMinVersion: known floors and conservative default
+{
+	assert(extensionMinVersion("io.modelcontextprotocol/ui") == ProtocolVersion.v2025_11_25);
+	assert(extensionMinVersion("io.modelcontextprotocol/skills") == ProtocolVersion.v2025_11_25);
+	assert(extensionMinVersion(tasksExtensionKey) == ProtocolVersion.modern);
+	assert(extensionMinVersion("io.example/future") == ProtocolVersion.modern);
 }
 
 unittest  // ServerCapabilities.forVersion always keeps base capabilities
