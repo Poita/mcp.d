@@ -201,9 +201,9 @@ void setUiToolMeta(ref Tool tool, UiToolMeta ui) @safe
 }
 
 /// Advertise MCP Apps support in the server's extension capabilities. The
-/// extension is carried in the `extensions` negotiation map (emitted to draft
-/// clients), declaring the content types this server's UI resources use.
-/// `mimeTypes` defaults to `[mcpAppMimeType]`.
+/// extension is carried in the `extensions` negotiation map (emitted to clients
+/// from 2025-11-25 onward), declaring the content types this server's UI
+/// resources use. `mimeTypes` defaults to `[mcpAppMimeType]`.
 void enableApps(McpServer server, string[] mimeTypes = null) @safe
 {
 	Json arr = Json.emptyArray;
@@ -295,6 +295,14 @@ unittest  // mcp-app constants carry the spec's literal strings
 {
 	assert(mcpAppsExtensionKey == "io.modelcontextprotocol/ui");
 	assert(mcpAppMimeType == "text/html;profile=mcp-app");
+}
+
+unittest  // the Apps extension negotiates from 2025-11-25
+{
+	import mcp.protocol.capabilities : extensionMinVersion;
+	import mcp.protocol.versions : ProtocolVersion;
+
+	assert(extensionMinVersion(mcpAppsExtensionKey) == ProtocolVersion.v2025_11_25);
 }
 
 unittest  // UiResourceCsp emits only the non-empty domain lists

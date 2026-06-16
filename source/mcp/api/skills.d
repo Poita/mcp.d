@@ -602,6 +602,14 @@ unittest  // the extension key and discovery constants carry the SEP-2640 litera
 	assert(skillFileUri("pdf", "references/FORMS.md") == "skill://pdf/references/FORMS.md");
 }
 
+unittest  // the Skills extension negotiates from 2025-11-25
+{
+	import mcp.protocol.capabilities : extensionMinVersion;
+	import mcp.protocol.versions : ProtocolVersion;
+
+	assert(extensionMinVersion(skillsExtensionKey) == ProtocolVersion.v2025_11_25);
+}
+
 unittest  // a prefixed skill path maps to a nested skill:// URI
 {
 	assert(skillUri("acme/billing/refunds") == "skill://acme/billing/refunds/SKILL.md");
@@ -1121,15 +1129,33 @@ unittest  // resources/directory/read is -32601 when skills (and the method) are
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.methodNotFound);
 }
 
-unittest  // resources/directory/read does not exist on a non-draft (stable) session
+unittest  // resources/directory/read is served on a 2025-11-25 (stable) session
 {
-	import mcp.protocol.errors : ErrorCode;
+	auto s = pdfSkillServer(); // enables the method
 
-	auto s = pdfSkillServer(); // enables the method on the draft path
-
-	// A stable session (no draft _meta) never sees the draft-only method.
+	// The default negotiated version is the latest stable (2025-11-25), the floor
+	// at which the Skills extension — and so its directory-read method — applies.
 	Json p = Json.emptyObject;
 	p["uri"] = "skill://office/pdf-forms";
 	auto resp = s.handle(Message(makeRequest(Json(1), "resources/directory/read", p))).get;
+	assert("result" in resp);
+	assert(resp["result"]["resources"].length == 2);
+}
+
+unittest  // resources/directory/read does not exist below 2025-11-25
+{
+	import mcp.protocol.errors : ErrorCode;
+	import mcp.protocol.versions : ProtocolVersion;
+	import mcp.server.connection : ConnectionState;
+	import vibe.data.json : parseJsonString;
+
+	auto s = pdfSkillServer(); // enables the method
+
+	// A session that negotiated a version below the Skills floor never sees it.
+	auto conn = new ConnectionState;
+	conn.negotiated = ProtocolVersion.v2025_06_18;
+	auto outText = s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"resources/directory/read",`
+			~ `"params":{"uri":"skill://office/pdf-forms"}}`, conn);
+	auto resp = parseJsonString(outText);
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.methodNotFound);
 }
