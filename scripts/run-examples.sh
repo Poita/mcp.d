@@ -33,6 +33,7 @@ port_for() {
     stickynotes) echo 8537 ;;
     streaming) echo 9357 ;;
     tasks) echo 8643 ;;
+    events) echo 8646 ;;
     tools) echo 8530 ;;
     *) echo 8600 ;;
   esac

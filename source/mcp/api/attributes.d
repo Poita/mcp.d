@@ -91,6 +91,41 @@ struct taskPollInterval
 	Duration value; /// suggested poll cadence (serialized to integer ms on the wire)
 }
 
+/// UDA marking a typed "check for changes since cursor" method as an MCP event
+/// type (the Events extension) — the pull/fetch source. The method must have the
+/// shape `EventBatch!P fetch(A args, FetchContext ctx)`: `A` (the subscription
+/// arguments) derives the `inputSchema`, `P` (the payload) derives the
+/// `payloadSchema`, and the method becomes the type's fetch handler, backing poll
+/// directly and stream/webhook via the runtime's loop. Requires `enableEvents()`.
+///
+/// Push-only event types (no cursor-addressable upstream) use the builder instead
+/// — `auto ev = server.events.define!(A, P)("name"); ev.publish(payload);` — so the
+/// author keeps the typed handle to publish from wherever events arrive.
+///
+/// Example:
+/// ---
+/// struct EmailArgs { string from; }
+/// struct Email { string messageId; string from; }
+/// @event("email.received", "A new email arrives")
+/// EventBatch!Email checkEmail(EmailArgs args, FetchContext ctx) @safe { ... }
+/// ---
+struct event
+{
+	string name;
+	string description;
+	string title; /// optional human-readable display name (empty = unset)
+}
+
+/// Per-event-type poll-cadence UDA, attached alongside `@event`: the interval the
+/// client SHOULD wait between `events/poll` calls. Omit it to inherit
+/// `EventsOptions.defaultPollInterval`.
+struct eventPollInterval
+{
+	import core.time : Duration;
+
+	Duration value; /// suggested poll cadence (serialized to integer ms on the wire)
+}
+
 /// Marker UDA declaring the `readOnlyHint` behavioral hint (the MCP spec's
 /// `ToolAnnotations.readOnlyHint`). Attach alongside `@tool`; presence sets the
 /// hint to `true`, absence leaves it unset (omitted from the wire form).

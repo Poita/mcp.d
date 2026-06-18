@@ -21,6 +21,7 @@ import mcp.client.http_transport : HttpClientTransport, LegacyFallbackException;
 import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
 import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 import mcp.client.cache : CacheStore, InMemoryCacheStore, CacheKey, CacheEntry, noCache;
+import mcp.protocol.events;
 
 /// How a cacheable request verb interacts with the client's response cache.
 /// Only meaningful on the six cacheable reads (`listTools`, `listResources`,
@@ -1844,6 +1845,94 @@ final class McpClient : ClientProtocol
 			params = injectModernMeta(params);
 		auto message = makeRequest(Json(id), "subscriptions/listen", params);
 		return transport.openListen(message);
+	}
+
+	// --- MCP Events extension (draft) --------------------------------------
+
+	/// Whether the connected server advertised the Events extension. Only true on
+	/// a draft session whose `server/discover`/`initialize` capabilities carried
+	/// `io.modelcontextprotocol/events` in the `extensions` map.
+	bool eventsSupported() @safe
+	{
+		auto ext = serverCapabilities_.extensions;
+		return ext.type == Json.Type.object && (eventsExtensionKey in ext) !is null;
+	}
+
+	/// `events/list`, auto-paginated. Returns the drained `EventListResult` whose
+	/// `events` aggregates every page (and `nextCursor` is null).
+	EventListResult listEvents() @safe
+	{
+		EventListResult acc;
+		paginate((Nullable!string cursor) @safe {
+			Json p = Json.emptyObject;
+			if (!cursor.isNull)
+				p["cursor"] = cursor.get;
+			auto res = EventListResult.fromJson(rpc("events/list", p));
+			acc.events ~= res.events;
+			return res.nextCursor;
+		});
+		acc.nextCursor = Nullable!string.init;
+		return acc;
+	}
+
+	/// One `events/poll` round-trip for a single subscription. The low-level
+	/// primitive; a poll-mode subscription loops this at the server-recommended
+	/// `nextPollMs`, persisting the returned `cursor` and passing it back.
+	PollResult pollEvents(string name, Json arguments = Json.emptyObject,
+			Nullable!string cursor = Nullable!string.init,
+			Nullable!long maxAgeMs = Nullable!long.init,
+			Nullable!long maxEvents = Nullable!long.init) @safe
+	{
+		PollParams p;
+		p.name = name;
+		p.arguments = arguments;
+		p.cursor = cursor;
+		p.maxAgeMs = maxAgeMs;
+		p.maxEvents = maxEvents;
+		return PollResult.fromJson(rpc("events/poll", p.toJson()));
+	}
+
+	/// Open a push `events/stream` for one subscription. Returns a
+	/// `SubscriptionStream` handle; every `notifications/events/*` message
+	/// (`active`/`event`/`heartbeat`/`error`/`terminated`) is dispatched to
+	/// `onNotification`, each carrying the stream's id in
+	/// `params._meta["io.modelcontextprotocol/subscriptionId"]` so a client with
+	/// several concurrent streams can route them. `cancel()`/`close()` ends it.
+	SubscriptionStream streamEvents(string name, Json arguments = Json.emptyObject,
+			Nullable!string cursor = Nullable!string.init,
+			Nullable!long maxAgeMs = Nullable!long.init) @safe
+	{
+		const id = nextId++;
+		StreamParams sp;
+		sp.name = name;
+		sp.arguments = arguments;
+		sp.cursor = cursor;
+		sp.maxAgeMs = maxAgeMs;
+		Json params = sp.toJson();
+		if (useModern)
+			params = injectModernMeta(params);
+		auto message = makeRequest(Json(id), "events/stream", params);
+		return transport.openListen(message);
+	}
+
+	/// `events/subscribe` (webhook delivery): register/refresh a callback for one
+	/// subscription. Idempotent on `(principal, url, name, arguments)`. Returns the
+	/// server's `SubscribeResult` (id, granted `refreshBefore`, watermark cursor,
+	/// and — on a refresh — `deliveryStatus`).
+	SubscribeResult subscribeWebhookEvents(SubscribeParams p) @safe
+	{
+		return SubscribeResult.fromJson(rpc("events/subscribe", p.toJson()));
+	}
+
+	/// `events/unsubscribe` (webhook delivery): eager teardown of the subscription
+	/// keyed by `(principal, url, name, arguments)`.
+	void unsubscribeWebhookEvents(string name, Json arguments, string url) @safe
+	{
+		UnsubscribeParams p;
+		p.name = name;
+		p.arguments = arguments;
+		p.url = url;
+		rpc("events/unsubscribe", p.toJson());
 	}
 
 	/// Build the `subscriptions/listen` params, nesting the filter under

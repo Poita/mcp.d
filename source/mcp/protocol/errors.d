@@ -34,7 +34,17 @@ enum ErrorCode : int
 	// sampling (client/sampling §Error Handling): the user declined the
 	// server's `sampling/createMessage` request. Not a JSON-RPC reserved code;
 	// the spec assigns this conventional value.
-	userRejected = -1
+	userRejected = -1,
+	// General-purpose codes introduced by the MCP Events extension, carried in
+	// the JSON-RPC implementation-defined server range [-32000,-32099] alongside
+	// -32001/-32003/-32004. Each spans a family of conditions, conveying the
+	// specifics through a typed `data` payload (the -32004 pattern). Named for
+	// reuse across MCP rather than scoped to events.
+	notFound = -32011, /// referenced entity does not exist (data.kind disambiguates)
+	forbidden = -32012, /// principal not permitted, or access revoked
+	resourceExhausted = -32013, /// a server-imposed limit/quota was reached
+	unsupported = -32014, /// well-formed but an option is not supported here
+	callbackEndpointError = -32015 /// webhook callback failed verification/reachability
 }
 
 /// An error that maps onto a JSON-RPC error object.
@@ -86,6 +96,71 @@ McpException invalidParams(string message, Json data = Json.undefined) @safe pur
 McpException internalError(string message, Json data = Json.undefined) @safe pure nothrow
 {
 	return new McpException(ErrorCode.internalError, message, data);
+}
+
+/// Build a `-32011 NotFound`: a referenced entity (an event name, a
+/// subscription) does not exist. `kind` (`"event"` | `"subscription"`) MAY
+/// disambiguate via `data.kind`; pass `null` to omit it.
+McpException notFound(string message, string kind = null) @safe
+{
+	Json data = Json.undefined;
+	if (kind.length)
+	{
+		data = Json.emptyObject;
+		data["kind"] = kind;
+	}
+	return new McpException(ErrorCode.notFound, message, data);
+}
+
+/// Build a `-32012 Forbidden`: the authenticated principal is not permitted for
+/// this operation, or its access was revoked.
+McpException forbidden(string message, Json data = Json.undefined) @safe pure nothrow
+{
+	return new McpException(ErrorCode.forbidden, message, data);
+}
+
+/// Build a `-32013 ResourceExhausted`: a server-imposed limit or quota was
+/// reached. `limit` names it (e.g. `"subscriptions"`) via `data.limit`; a
+/// non-negative `max` adds `data.max`, the ceiling.
+McpException resourceExhausted(string message, string limit = null, long max = -1) @safe
+{
+	Json data = Json.undefined;
+	if (limit.length || max >= 0)
+	{
+		data = Json.emptyObject;
+		if (limit.length)
+			data["limit"] = limit;
+		if (max >= 0)
+			data["max"] = max;
+	}
+	return new McpException(ErrorCode.resourceExhausted, message, data);
+}
+
+/// Build a `-32014 Unsupported`: the request is well-formed but a requested
+/// capability or option is not supported here (e.g. a delivery mode the event
+/// type does not offer). `feature`/`value` identify it via `data`.
+McpException unsupported(string message, string feature = null, string value = null) @safe
+{
+	Json data = Json.undefined;
+	if (feature.length || value.length)
+	{
+		data = Json.emptyObject;
+		if (feature.length)
+			data["feature"] = feature;
+		if (value.length)
+			data["value"] = value;
+	}
+	return new McpException(ErrorCode.unsupported, message, data);
+}
+
+/// Build a `-32015 CallbackEndpointError`: a client-supplied webhook callback
+/// endpoint failed verification or could not be reached. `reason` is one of the
+/// `DeliveryErrorCategory` wire strings, surfaced via `data.reason`.
+McpException callbackEndpointError(string message, string reason) @safe
+{
+	Json data = Json.emptyObject;
+	data["reason"] = reason;
+	return new McpException(ErrorCode.callbackEndpointError, message, data);
 }
 
 /// Build a "resource not found" error using the legacy MCP-specific code
@@ -523,4 +598,51 @@ unittest  // urlElicitationRequired accepts a valid absolute url
 	assert(e.code == ErrorCode.urlElicitationRequired);
 	assert(e.data["elicitations"].length == 1);
 	assert(e.data["elicitations"][0]["url"].get!string == "https://example.com/connect");
+}
+
+unittest  // the Events general-purpose codes have the spec's values
+{
+	assert(ErrorCode.notFound == -32011);
+	assert(ErrorCode.forbidden == -32012);
+	assert(ErrorCode.resourceExhausted == -32013);
+	assert(ErrorCode.unsupported == -32014);
+	assert(ErrorCode.callbackEndpointError == -32015);
+}
+
+unittest  // notFound omits data by default and attaches data.kind when given
+{
+	assert(notFound("no such event").code == ErrorCode.notFound);
+	assert(notFound("no such event").data.type == Json.Type.undefined);
+	auto e = notFound("gone", "subscription");
+	assert(e.data["kind"].get!string == "subscription");
+}
+
+unittest  // forbidden uses -32012
+{
+	auto e = forbidden("access revoked");
+	assert(e.code == ErrorCode.forbidden && e.msg == "access revoked");
+}
+
+unittest  // resourceExhausted attaches limit/max only when provided
+{
+	assert(resourceExhausted("too many").data.type == Json.Type.undefined);
+	auto e = resourceExhausted("too many", "subscriptions", 100);
+	assert(e.code == ErrorCode.resourceExhausted);
+	assert(e.data["limit"].get!string == "subscriptions");
+	assert(e.data["max"].get!long == 100);
+}
+
+unittest  // unsupported carries a typed feature/value discriminator
+{
+	auto e = unsupported("mode not offered", "deliveryMode", "push");
+	assert(e.code == ErrorCode.unsupported);
+	assert(e.data["feature"].get!string == "deliveryMode");
+	assert(e.data["value"].get!string == "push");
+}
+
+unittest  // callbackEndpointError carries data.reason
+{
+	auto e = callbackEndpointError("endpoint refused", "connection_refused");
+	assert(e.code == ErrorCode.callbackEndpointError);
+	assert(e.data["reason"].get!string == "connection_refused");
 }

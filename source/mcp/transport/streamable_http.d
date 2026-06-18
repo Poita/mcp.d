@@ -12,6 +12,7 @@ import mcp.protocol.errors;
 import mcp.protocol.versions;
 import mcp.protocol.modern;
 import mcp.protocol.mrtr;
+import mcp.protocol.events;
 import mcp.transport.sse_context;
 import mcp.transport.session;
 import mcp.auth.resource_server;
@@ -1219,6 +1220,187 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	runSseHeartbeat(writeFrame);
 }
 
+/// Whether `method` opens a draft `events/stream` push response.
+bool opensEventsStream(string method, bool isDraft) @safe
+{
+	return isDraft && method == "events/stream";
+}
+
+/// The JSON-RPC error surfaced (under a 406 Not Acceptable) when a POST that would
+/// open a `text/event-stream` response (`subscriptions/listen` or `events/stream`)
+/// carries an `Accept` that provably excludes that media type.
+McpException eventStreamNotAcceptable() @safe
+{
+	return invalidRequest(
+			"this request opens a text/event-stream response; Accept must admit text/event-stream");
+}
+
+/// The heartbeat cadence: a `notifications/events/heartbeat` carries the cursor at
+/// least this often so a quiet stream still advances the client cursor and the
+/// periodic write doubles as the client-disconnect detector.
+enum long eventStreamHeartbeatIntervalMs = 15_000;
+
+/// One iteration's decision for the SSE hold-open loop, computed purely from the
+/// timing inputs so it is unit-testable without a network or a real clock.
+struct EventStreamTick
+{
+	bool poll; /// pull check-function events this iteration (false for emit-only streams)
+	bool heartbeat; /// write a cursor-carrying heartbeat this iteration
+}
+
+/// The fixed sleep between hold-open loop iterations. An emit-only stream wakes
+/// only on the heartbeat cadence (its events arrive via the sink); a poll-driven
+/// stream wakes on its poll cadence, clamped to `[1s, heartbeat interval]` so a
+/// fast poll never starves the disconnect-detecting heartbeat and a slow one never
+/// outlives it.
+long eventStreamSleepMs(bool emitOnly, long pollMs) @safe pure nothrow @nogc
+{
+	import std.algorithm : min, max;
+
+	return emitOnly ? eventStreamHeartbeatIntervalMs : max(1_000L, min(pollMs,
+			eventStreamHeartbeatIntervalMs));
+}
+
+/// Decide what one hold-open iteration does, given whether the stream is emit-only
+/// and how long it has been since the last heartbeat. A poll-driven stream always
+/// polls; either kind heartbeats only once the cadence has elapsed (so a sub-15s
+/// poll loop does not heartbeat on every wake-up).
+EventStreamTick eventStreamTick(bool emitOnly, long sinceHeartbeatMs) @safe pure nothrow @nogc
+{
+	EventStreamTick t;
+	t.poll = !emitOnly;
+	t.heartbeat = sinceHeartbeatMs >= eventStreamHeartbeatIntervalMs;
+	return t;
+}
+
+/// Serve a draft `events/stream` (push) request as a long-lived SSE response that
+/// carries `notifications/events/*` for one subscription. The subscription is
+/// validated via the events runtime (an invalid one yields a JSON-RPC error and
+/// no stream); then the response is upgraded to `text/event-stream`, the leading
+/// `notifications/events/active` carries the starting cursor, backlog (if any) is
+/// drained, and the connection is held open — emit-driven types receive live
+/// events via the registered sink while check-function types are polled — with a
+/// cursor-carrying `notifications/events/heartbeat` so the client's cursor
+/// advances during quiet periods. Every frame is stamped with the request id in
+/// `_meta` so a client multiplexing several streams can route it.
+private void handleEventsStream(McpServer server, Message msg,
+		HTTPServerResponse res, string principal) @safe
+{
+	import vibe.core.core : sleep;
+	import core.time : msecs;
+
+	auto rt = server.events();
+	if (rt is null)
+	{
+		auto e = methodNotFound("events");
+		res.statusCode = httpStatusForResponse(makeErrorResponse(msg.id, e), true);
+		res.writeBody(makeErrorResponse(msg.id, e).toString(), "application/json");
+		return;
+	}
+
+	auto p = StreamParams.fromJson(msg.params);
+	if (p.name.length == 0)
+	{
+		auto e = invalidParams("events/stream requires a string 'name'");
+		res.statusCode = httpStatusForResponse(makeErrorResponse(msg.id, e), true);
+		res.writeBody(makeErrorResponse(msg.id, e).toString(), "application/json");
+		return;
+	}
+
+	auto writeFrame = sseFrameWriter(res);
+	const subId = msg.id;
+	void deliver(string method, Json params) @safe
+	{
+		writeFrame("data: " ~ makeNotification(method, params).toString() ~ "\n\n");
+	}
+
+	// Validate (and register the emit sink + fire on_subscribe) BEFORE upgrading
+	// the response, so an invalid subscription returns a JSON-RPC error.
+	import mcp.server.events_runtime : PushHandle;
+
+	PushHandle handle;
+	try
+		handle = rt.openPushStream(p.name, p.arguments, principal, subId, &deliver);
+	catch (McpException e)
+	{
+		res.statusCode = httpStatusForResponse(makeErrorResponse(msg.id, e), true);
+		res.writeBody(makeErrorResponse(msg.id, e).toString(), "application/json");
+		return;
+	}
+	scope (exit)
+		handle.close();
+
+	res.contentType = "text/event-stream";
+	applySseStreamHeaders(res, true);
+
+	const emitOnly = rt.isEmitOnly(p.name);
+	Nullable!string cursor = p.cursor;
+	long pollMs = 15_000;
+
+	// Leading active frame + any backlog, from an initial poll.
+	try
+	{
+		auto first = rt.poll(p.name, p.arguments, principal, p.cursor,
+				p.maxAgeMs, Nullable!long.init);
+		deliver(eventsActiveNotification,
+				withSubscriptionId(activeParams(first.cursor, first.truncated), subId));
+		foreach (ev; first.events)
+			deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), subId));
+		cursor = first.cursor;
+		handle.stream.cursor = first.cursor;
+		if (!first.nextPollMs.isNull)
+			pollMs = first.nextPollMs.get;
+	}
+	catch (Exception)
+		deliver(eventsActiveNotification, withSubscriptionId(activeParams(p.cursor, false), subId));
+
+	// Hold open: poll-driven check types pull events on a cadence; emit-driven
+	// types receive them via the sink. Either way a heartbeat carries the cursor.
+	// The per-iteration (poll? heartbeat?) decision and the loop cadence are pure
+	// (`eventStreamTick`/`eventStreamSleepMs`); this loop only supplies the clock,
+	// the I/O, and the disconnect-on-write-failure break.
+	import core.time : MonoTime;
+
+	const sleepMs = eventStreamSleepMs(emitOnly, pollMs);
+	auto lastHeartbeat = MonoTime.currTime;
+	while (true)
+	{
+		try
+			sleep(sleepMs.msecs);
+		catch (Exception)
+			break;
+		const sinceHeartbeatMs = (MonoTime.currTime - lastHeartbeat).total!"msecs";
+		const tick = eventStreamTick(emitOnly, sinceHeartbeatMs);
+		if (tick.poll)
+		{
+			try
+			{
+				auto r = rt.poll(p.name, p.arguments, principal, cursor,
+						p.maxAgeMs, Nullable!long.init);
+				foreach (ev; r.events)
+					deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), subId));
+				if (!r.cursor.isNull)
+				{
+					cursor = r.cursor;
+					handle.stream.cursor = r.cursor;
+				}
+			}
+			catch (Exception)
+			{
+			}
+		}
+		else
+			cursor = handle.stream.cursor; // advanced by sink deliveries
+		if (!tick.heartbeat)
+			continue; // not yet due — avoid heartbeating every sub-15s poll iteration
+		try
+			deliver(eventsHeartbeatNotification, withSubscriptionId(heartbeatParams(cursor), subId));
+		catch (Exception)
+			break; // client disconnected
+		lastHeartbeat = MonoTime.currTime;
+	}
+}
+
 /// A minimal connection-scoped `RequestContext` for one-shot dispatches on the
 /// Streamable HTTP transport that carry a per-connection token and
 /// `ConnectionState` but never stream server->client traffic. Two paths use it:
@@ -1620,8 +1802,39 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			// is driven by this stream's own per-URI `ListenFilter` at the push
 			// channel. (The 2025-era resources/subscribe RPC and the standalone GET
 			// stream stay gated in stateless; only this draft listen path is opened.)
+			//
+			// The response is always text/event-stream. A client whose Accept provably
+			// excludes it could not read the stream, so refuse with 406 rather than
+			// upgrading regardless (mirroring the GET path). A missing Accept is permissive.
+			if (!acceptsEventStream(req.headers.get("Accept", "")))
+			{
+				sessions !is null && sessions.terminate(mintedSessionId);
+				res.statusCode = HTTPStatus.notAcceptable;
+				res.writeBody(makeErrorResponse(msg.id,
+						eventStreamNotAcceptable()).toString(), "application/json");
+				return;
+			}
 			handleListenStream(server, coord, msg, res,
 					req.headers.get(HttpHeader.protocolVersion, ""), connToken);
+			return;
+		}
+		// Draft events/stream (push): like subscriptions/listen, this POST opens a
+		// long-lived SSE response that streams `notifications/events/*` for one
+		// subscription until the client disconnects. It is self-contained (no
+		// session, no inbound correlation), so it works on a stateless server too.
+		if (opensEventsStream(msg.method, isDraftReq))
+		{
+			// As above: the response is text/event-stream, so a POST whose Accept
+			// provably excludes it is refused with 406 rather than upgraded anyway.
+			if (!acceptsEventStream(req.headers.get("Accept", "")))
+			{
+				sessions !is null && sessions.terminate(mintedSessionId);
+				res.statusCode = HTTPStatus.notAcceptable;
+				res.writeBody(makeErrorResponse(msg.id,
+						eventStreamNotAcceptable()).toString(), "application/json");
+				return;
+			}
+			handleEventsStream(server, msg, res, token.valid ? token.subject : "");
 			return;
 		}
 		// The effective version for this POST decides whether a server-initiated
@@ -2919,6 +3132,40 @@ unittest  // only a draft subscriptions/listen opens the long-lived stream
 	assert(!opensListenStream("initialize", true));
 }
 
+unittest  // only a draft events/stream opens the push response
+{
+	assert(opensEventsStream("events/stream", true));
+	assert(!opensEventsStream("events/stream", false));
+	assert(!opensEventsStream("events/poll", true));
+	assert(!opensEventsStream("subscriptions/listen", true));
+}
+
+unittest  // eventStreamSleepMs: emit-only sleeps the heartbeat interval, poll clamps to [1s, 15s]
+{
+	// An emit-only stream wakes only on the heartbeat cadence.
+	assert(eventStreamSleepMs(true, 1_000) == eventStreamHeartbeatIntervalMs);
+	assert(eventStreamSleepMs(true, 60_000) == eventStreamHeartbeatIntervalMs);
+	// A fast poll cadence floors at 1s.
+	assert(eventStreamSleepMs(false, 100) == 1_000);
+	// A mid-range cadence is used as-is.
+	assert(eventStreamSleepMs(false, 5_000) == 5_000);
+	// A slow poll cadence is capped at the heartbeat interval.
+	assert(eventStreamSleepMs(false, 60_000) == eventStreamHeartbeatIntervalMs);
+}
+
+unittest  // eventStreamTick: poll only for non-emit-only; heartbeat only once the cadence elapses
+{
+	// Emit-only never polls; heartbeats once due.
+	assert(!eventStreamTick(true, 0).poll);
+	assert(!eventStreamTick(true, eventStreamHeartbeatIntervalMs - 1).heartbeat);
+	assert(eventStreamTick(true, eventStreamHeartbeatIntervalMs).heartbeat);
+	// Poll-driven always polls; heartbeats only at/after the cadence boundary.
+	assert(eventStreamTick(false, 0).poll);
+	assert(!eventStreamTick(false, eventStreamHeartbeatIntervalMs - 1).heartbeat);
+	assert(eventStreamTick(false, eventStreamHeartbeatIntervalMs).heartbeat);
+	assert(eventStreamTick(false, eventStreamHeartbeatIntervalMs * 2).heartbeat);
+}
+
 version (unittest) private HTTPServerRequest makeInitPostReq(string body_,
 		string[string] headers = null) @safe
 {
@@ -3013,6 +3260,33 @@ unittest  // a POST request whose Accept excludes both media types is rejected w
 
 	assert(res.statusCode == HTTPStatus.notAcceptable);
 	assert(SessionHeader !in res.headers);
+}
+
+unittest  // an events/stream POST whose Accept excludes text/event-stream is 406
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableEvents();
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	// events/stream always opens a text/event-stream response. An Accept that admits
+	// application/json (so it passes the both-excluded gate) but provably excludes
+	// text/event-stream cannot read the stream, so the upgrade is refused with 406.
+	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
+		~ `"name":"x","_meta":{"protocolVersion":"2026-07-28"}}}`;
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json",
+		"MCP-Protocol-Version": "2026-07-28",
+		"Mcp-Method": "events/stream"
+	]);
+	router.handleRequest(req, res);
+	assert(res.statusCode == HTTPStatus.notAcceptable);
 }
 
 /// Build the leading event the transport sends when it opens a

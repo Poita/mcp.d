@@ -1,5 +1,6 @@
 module mcp.protocol.ssrf;
 
+import core.time : Duration;
 import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 
 @safe:
@@ -736,8 +737,10 @@ PinnedConnect pinnedConnectAddress(string host, bool tls, SsrfPolicy policy) @sa
 /// scheme for `blockInternal`, an internal IP-literal/resolved address, or an
 /// unresolvable host — fail CLOSED). `@trusted` because the vibe HTTP client API
 /// is `@system`.
-void secureRequestHTTP(string url, SsrfPolicy policy, scope void delegate(
-		scope HTTPClientRequest) requester, scope void delegate(scope HTTPClientResponse) responder) @trusted
+void secureRequestHTTP(string url, SsrfPolicy policy,
+		scope void delegate(scope HTTPClientRequest) requester,
+		scope void delegate(scope HTTPClientResponse) responder,
+		Duration requestTimeout = Duration.zero) @trusted
 {
 	import mcp.protocol.errors : invalidRequest;
 	import std.string : indexOf;
@@ -791,6 +794,13 @@ void secureRequestHTTP(string url, SsrfPolicy policy, scope void delegate(
 
 	auto settings = new HTTPClientSettings;
 	settings.tlsPeerName = originalHost;
+	// Bound the whole request (connect + read) so one slow callback can't hold a
+	// delivery worker — and its lease — open indefinitely.
+	if (requestTimeout > Duration.zero)
+	{
+		settings.connectTimeout = requestTimeout;
+		settings.readTimeout = requestTimeout;
+	}
 
 	// vibe derives the Host header from u.host; restore the original host so the
 	// server sees the intended virtual host, not the pinned IP.

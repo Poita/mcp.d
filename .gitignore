@@ -9,6 +9,7 @@
 /mcp
 /mcp-d
 *-test-library
+*-test-library-*
 *-test-application
 __test__*__
 dub.selections.json

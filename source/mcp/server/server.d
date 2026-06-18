@@ -26,6 +26,10 @@ import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher,
 import mcp.server.push : PushChannel, ListenFilter;
 import mcp.server.pagination : pageBounds;
 import mcp.server.transport : ServerCore;
+import mcp.protocol.events;
+import mcp.server.event_store : WebhookSubscriptionStore;
+import mcp.server.events_runtime : EventsRuntime, EventsOptions,
+	EventRegistration, PushHandle, PushStream;
 
 // The handler outcome DTOs live in their own module (part of the api.reflection
 // contract); re-export them so they stay reachable through `mcp.server.server`.
@@ -196,6 +200,9 @@ final class McpServer : ServerCore
 	private TaskExecutor[string] taskExecutors_;
 	private SkillIndex skillIndex_;
 	private bool directoryReadEnabled_;
+	private bool eventsEnabled_;
+	private EventsRuntime eventsRuntime_;
+	private PushHandle[string] stdioEventStreams_; // subscriptionId -> open stdio push stream
 	private Json extensions = Json.undefined;
 	// Per-connection mutable state — negotiated protocol version, client
 	// capabilities, log level, subscriptions, and the `inFlight` cancellation
@@ -1042,6 +1049,45 @@ final class McpServer : ServerCore
 		return taskRuntime_;
 	}
 
+	/// Enable the MCP Events extension (`io.modelcontextprotocol/events`), a
+	/// draft-only feature: a client subscribes to event types the server declares
+	/// and receives occurrences over poll, push, or webhook delivery. `store` holds
+	/// webhook subscriptions (default in-memory; supply a durable store to grant
+	/// long or no-expiry TTLs); `opts` tunes the emit buffer, TTL negotiation, poll
+	/// lease, and webhook security. Returns the `EventsRuntime` so the author can
+	/// `emit()` events and the reflection layer can register `@event` types.
+	EventsRuntime enableEvents(WebhookSubscriptionStore store = null,
+			EventsOptions opts = EventsOptions.init) @safe
+	{
+		eventsRuntime_ = new EventsRuntime(store, opts);
+		eventsRuntime_.onListChanged(() @safe {
+			notify(eventsListChangedNotification);
+		});
+		eventsEnabled_ = true;
+		Json settings = Json.emptyObject;
+		settings["listChanged"] = true;
+		enableExtension(eventsExtensionKey, settings);
+		return eventsRuntime_;
+	}
+
+	/// Register an event type against the events runtime. `check` is the author's
+	/// "changes since cursor" function (null for an emit-only type whose poll is
+	/// served from the ring buffer). Requires `enableEvents` first. Used by the UDA
+	/// reflection layer; callable directly for dynamic event types.
+	void registerEventType(EventRegistration reg) @safe
+	{
+		if (eventsRuntime_ is null)
+			throw internalError("registerEventType requires enableEvents() first");
+		eventsRuntime_.register(reg);
+	}
+
+	/// The events runtime created by `enableEvents`, or null if events are not
+	/// enabled. The author uses it to `emit()` events.
+	EventsRuntime events() @safe
+	{
+		return eventsRuntime_;
+	}
+
 	/// Advertise a protocol extension (e.g. "io.modelcontextprotocol/tasks") with
 	/// an optional per-extension settings object. The identifier and its settings
 	/// appear in the `extensions` field of the server capabilities sent during
@@ -1206,6 +1252,123 @@ final class McpServer : ServerCore
 				ackParams), stdioListenSubscriptionId);
 		writeLine(ack.toString());
 		return true;
+	}
+
+	/// Serve a draft `events/stream` (push) request over stdio. Like the listen
+	/// stream it is sink-driven: it opens the subscription, writes the leading
+	/// `notifications/events/active` (and any backlog), and registers the stream so
+	/// `emit()` delivers `notifications/events/event` on stdout — each stamped with
+	/// the request id in `_meta` so concurrent streams sharing stdout can be routed.
+	/// Check-function types and heartbeats are advanced by `tickStdioEventStreams`.
+	/// Returns true when the message was an `events/stream` request it handled.
+	bool tryServeStdioEventsStream(Message msg, void delegate(string) @safe writeLine) @safe
+	{
+		import mcp.protocol.events : StreamParams, eventsActiveNotification,
+			eventsEventNotification, activeParams, withSubscriptionId, subscriptionIdMetaKey;
+
+		if (msg.kind != MessageKind.request || msg.method != "events/stream")
+			return false;
+		auto meta = RequestMeta.fromParams(msg.params);
+		ProtocolVersion mv;
+		if (!meta.protocolVersion.length
+				|| !tryParseVersion(meta.protocolVersion, mv) || !mv.isModern)
+			return false;
+		if (eventsRuntime_ is null)
+		{
+			writeLine(makeErrorResponse(msg.id, methodNotFound("events")).toString());
+			return true;
+		}
+
+		auto p = StreamParams.fromJson(msg.params);
+		if (p.name.length == 0)
+		{
+			writeLine(makeErrorResponse(msg.id,
+					invalidParams("events/stream requires a string 'name'")).toString());
+			return true;
+		}
+
+		const subId = msg.id;
+		void deliver(string method, Json params) @safe
+		{
+			writeLine(makeNotification(method, params).toString());
+		}
+
+		PushHandle handle;
+		try
+			handle = eventsRuntime_.openPushStream(p.name, p.arguments, "", subId, &deliver);
+		catch (McpException e)
+		{
+			writeLine(makeErrorResponse(msg.id, e).toString());
+			return true;
+		}
+		stdioEventStreams_[rpcIdString(msg.id)] = handle;
+
+		// Leading active frame + any backlog from an initial poll.
+		try
+		{
+			auto first = eventsRuntime_.poll(p.name, p.arguments, "", p.cursor,
+					p.maxAgeMs, Nullable!long.init);
+			deliver(eventsActiveNotification,
+					withSubscriptionId(activeParams(first.cursor, first.truncated), subId));
+			foreach (ev; first.events)
+				deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), subId));
+			handle.stream.cursor = first.cursor;
+		}
+		catch (Exception)
+			deliver(eventsActiveNotification,
+					withSubscriptionId(activeParams(p.cursor, false), subId));
+		return true;
+	}
+
+	/// Advance open stdio push streams: poll check-function types for new events
+	/// and send each stream a cursor-carrying `notifications/events/heartbeat` at
+	/// least every 15s. Driven by the stdio transport's background ticker.
+	/// (Emit-only types receive their events live via `emit()`'s sink.)
+	void tickStdioEventStreams(long nowMs) @safe
+	{
+		import mcp.protocol.events : eventsEventNotification,
+			eventsHeartbeatNotification, heartbeatParams, withSubscriptionId;
+		import std.array : array;
+
+		if (eventsRuntime_ is null)
+			return;
+		// Iterate a snapshot: poll()/deliver() can yield, and a concurrent
+		// notifications/cancelled (handleCancelled) removes from stdioEventStreams_
+		// mid-iteration, which would corrupt a live foreach over the AA.
+		foreach (kv; stdioEventStreams_.byKeyValue.array)
+		{
+			auto handle = kv.value;
+			auto s = handle.stream;
+			if (!eventsRuntime_.isEmitOnly(s.name))
+			{
+				try
+				{
+					auto r = eventsRuntime_.poll(s.name, s.arguments, s.principal,
+							s.cursor, Nullable!long.init, Nullable!long.init);
+					foreach (ev; r.events)
+						s.deliver(eventsEventNotification,
+								withSubscriptionId(ev.toJson(), s.subscriptionId));
+					if (!r.cursor.isNull)
+						s.cursor = r.cursor;
+				}
+				catch (Exception)
+				{
+				}
+			}
+			if (nowMs - s.lastHeartbeatMs >= 15_000)
+			{
+				s.lastHeartbeatMs = nowMs;
+				s.deliver(eventsHeartbeatNotification,
+						withSubscriptionId(heartbeatParams(s.cursor), s.subscriptionId));
+			}
+		}
+	}
+
+	/// Whether any stdio push streams are open (the transport's ticker runs only
+	/// while events are enabled).
+	bool hasStdioEventStreams() @safe
+	{
+		return eventsRuntime_ !is null;
 	}
 
 	/// Deliver a change notification on the standalone GET / `subscriptions/listen`
@@ -2028,6 +2191,16 @@ final class McpServer : ServerCore
 			return;
 		}
 
+		// Stdio `events/stream` teardown: a push stream returns no JSON-RPC response,
+		// so the client cancels it by `notifications/cancelled` referencing the
+		// stream's request id. Close the handle (fires on_unsubscribe) and drop it.
+		if (auto h = rpcIdString(params["requestId"]) in stdioEventStreams_)
+		{
+			h.close();
+			stdioEventStreams_.remove(rpcIdString(params["requestId"]));
+			return;
+		}
+
 		const key = inFlightKey(connToken, params["requestId"]);
 		if (key.length == 0)
 			return;
@@ -2132,6 +2305,14 @@ final class McpServer : ServerCore
 			return doTasksUpdate(params, ver);
 		case "tasks/cancel":
 			return doTasksCancel(params, ver);
+		case "events/list":
+			return doEventsList(params, ver);
+		case "events/poll":
+			return doEventsPoll(params, ctx, ver);
+		case "events/subscribe":
+			return doEventsSubscribe(params, ctx, ver);
+		case "events/unsubscribe":
+			return doEventsUnsubscribe(params, ctx, ver);
 		default:
 			throw methodNotFound(method);
 		}
@@ -2189,6 +2370,61 @@ final class McpServer : ServerCore
 		const id = requireTaskId(params);
 		taskRuntime_.cancel(id); // throws -32602 for an unknown task
 		return Json.emptyObject; // empty acknowledgement
+	}
+
+	// The `io.modelcontextprotocol/events` extension RPCs. Like Tasks, the
+	// extension is draft-only and opt-in via `enableEvents()`; a non-draft session
+	// or a server that never enabled events answers -32601. `events/stream` (push)
+	// is long-lived and handled by the transports, not routed here.
+	private void requireEvents(ProtocolVersion ver) @safe
+	{
+		if (!ver.isModern || !eventsEnabled_)
+			throw methodNotFound("events");
+	}
+
+	// The authenticated principal for an events request, or "" when the request is
+	// unauthenticated. Webhook subscribe/unsubscribe require a non-empty principal.
+	private static string eventsPrincipal(RequestContext ctx) @safe
+	{
+		if (ctx is null)
+			return "";
+		auto info = ctx.auth();
+		return info.valid ? info.subject : "";
+	}
+
+	private Json doEventsList(Json params, ProtocolVersion ver) @safe
+	{
+		requireEvents(ver);
+		return eventsRuntime_.list().toJson();
+	}
+
+	private Json doEventsPoll(Json params, RequestContext ctx, ProtocolVersion ver) @safe
+	{
+		requireEvents(ver);
+		auto p = PollParams.fromJson(params);
+		if (p.name.length == 0)
+			throw invalidParams("events/poll requires a string 'name'");
+		return eventsRuntime_.poll(p.name, p.arguments, eventsPrincipal(ctx),
+				p.cursor, p.maxAgeMs, p.maxEvents).toJson();
+	}
+
+	private Json doEventsSubscribe(Json params, RequestContext ctx, ProtocolVersion ver) @safe
+	{
+		requireEvents(ver);
+		auto p = SubscribeParams.fromJson(params);
+		if (p.name.length == 0)
+			throw invalidParams("events/subscribe requires a string 'name'");
+		return eventsRuntime_.subscribeWebhook(p, eventsPrincipal(ctx)).toJson();
+	}
+
+	private Json doEventsUnsubscribe(Json params, RequestContext ctx, ProtocolVersion ver) @safe
+	{
+		requireEvents(ver);
+		auto p = UnsubscribeParams.fromJson(params);
+		if (p.name.length == 0)
+			throw invalidParams("events/unsubscribe requires a string 'name'");
+		eventsRuntime_.unsubscribeWebhook(p, eventsPrincipal(ctx));
+		return Json.emptyObject;
 	}
 
 	/// `server/discover` (draft): advertise supported versions, capabilities,
@@ -5624,6 +5860,284 @@ unittest  // tasks/get for an unknown taskId is -32602 with the taskId echoed
 	auto resp = s.handle(draftReq(1, "tasks/get", Json(["taskId": Json("nope")]))).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 	assert(resp["error"]["data"]["taskId"].get!string == "nope");
+}
+
+version (unittest)
+{
+	import mcp.server.events_runtime : EventRegistration;
+	import mcp.server.event_context : EventContext, EventResult;
+	import mcp.protocol.events : DeliveryMode, EventType, EventOccurrence;
+
+	// Register a simple emit-only event type on a server with events enabled.
+	private void registerDemoEvent(McpServer s, string name = "incident.created") @safe
+	{
+		EventRegistration reg;
+		reg.descriptor.name = name;
+		reg.emitOnly = true;
+		s.registerEventType(reg);
+	}
+}
+
+unittest  // enableEvents advertises the events extension (with listChanged) under draft discover
+{
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	auto resp = s.handle(draftReq(1, "server/discover")).get;
+	auto caps = resp["result"]["capabilities"];
+	assert("io.modelcontextprotocol/events" in caps["extensions"]);
+	assert(caps["extensions"]["io.modelcontextprotocol/events"]["listChanged"].get!bool);
+}
+
+unittest  // events/* are -32601 when the server never enabled events
+{
+	auto s = new McpServer("t", "1");
+	foreach (m; [
+		"events/list", "events/poll", "events/subscribe", "events/unsubscribe"
+	])
+	{
+		auto resp = s.handle(draftReq(1, m, Json(["name": Json("x")]))).get;
+		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+	}
+}
+
+unittest  // events/* are -32601 on a non-draft session even when enabled (draft-only)
+{
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	foreach (m; [
+		"events/list", "events/poll", "events/subscribe", "events/unsubscribe"
+	])
+	{
+		auto resp = s.handle(req(1, m, Json(["name": Json("x")]))).get;
+		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+	}
+}
+
+unittest  // events/list returns registered event types with computed delivery modes
+{
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	registerDemoEvent(s);
+	auto resp = s.handle(draftReq(1, "events/list")).get;
+	auto events = resp["result"]["events"];
+	assert(events.length == 1);
+	assert(events[0]["name"].get!string == "incident.created");
+	assert(events[0]["delivery"].length >= 1);
+}
+
+unittest  // events/poll bootstraps then drains an emitted event
+{
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableEvents();
+	registerDemoEvent(s);
+
+	auto boot = s.handle(draftReq(1, "events/poll", Json([
+		"name": Json("incident.created")
+	]))).get;
+	auto cursor = boot["result"]["cursor"];
+	assert(boot["result"]["events"].length == 0);
+
+	rt.emit(EventOccurrence("e1", "incident.created", "", Json([
+		"severity": Json("P1")
+	])));
+
+	Json pollParams = Json.emptyObject;
+	pollParams["name"] = "incident.created";
+	pollParams["cursor"] = cursor;
+	auto next = s.handle(draftReq(2, "events/poll", pollParams)).get;
+	assert(next["result"]["events"].length == 1);
+	assert(next["result"]["events"][0]["data"]["severity"].get!string == "P1");
+}
+
+unittest  // events/poll on an unknown event type is -32011 NotFound
+{
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	auto resp = s.handle(draftReq(1, "events/poll", Json(["name": Json("nope")]))).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.notFound);
+}
+
+unittest  // events/subscribe without an authenticated principal is -32012 Forbidden
+{
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	registerDemoEvent(s);
+	Json p = Json.emptyObject;
+	p["name"] = "incident.created";
+	Json d = Json.emptyObject;
+	d["mode"] = "webhook";
+	d["url"] = "https://proxy/hooks";
+	d["secret"] = "whsec_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+	p["delivery"] = d;
+	auto resp = s.handle(draftReq(1, "events/subscribe", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.forbidden);
+}
+
+unittest  // stdio events/stream opens with an active frame, then delivers emitted events
+{
+	import mcp.protocol.events : subscriptionIdMetaKey, EventOccurrence;
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableEvents();
+	registerDemoEvent(s);
+
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "incident.created";
+	assert(s.tryServeStdioEventsStream(draftReq(9, "events/stream", params), &sink));
+	// first frame is notifications/events/active stamped with the request id
+	auto active = parseJsonString(lines[0]);
+	assert(active["method"].get!string == "notifications/events/active");
+	assert(active["params"]["_meta"][subscriptionIdMetaKey].get!long == 9);
+
+	// an emitted event is delivered live on the same channel
+	rt.emit(EventOccurrence("evt_1", "incident.created", "", Json([
+		"sev": Json("P1")
+	])));
+	auto ev = parseJsonString(lines[$ - 1]);
+	assert(ev["method"].get!string == "notifications/events/event");
+	assert(ev["params"]["eventId"].get!string == "evt_1");
+	assert(ev["params"]["_meta"][subscriptionIdMetaKey].get!long == 9);
+}
+
+unittest  // a cancelled stdio events/stream stops receiving events
+{
+	import mcp.protocol.events : EventOccurrence;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableEvents();
+	registerDemoEvent(s);
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "incident.created";
+	s.tryServeStdioEventsStream(draftReq(9, "events/stream", params), &sink);
+	const before = lines.length;
+	// cancel the stream by its request id, then emit
+	s.handle(Message(makeNotification("notifications/cancelled", Json([
+		"requestId": Json(9)
+	]))));
+	rt.emit(EventOccurrence("evt_2", "incident.created", "t"));
+	assert(lines.length == before); // no further delivery after cancellation
+}
+
+unittest  // tickStdioEventStreams iterates a snapshot, so a mid-tick cancel can't corrupt it
+{
+	import mcp.protocol.events : EventOccurrence;
+	import mcp.server.event_context : EventContext, EventResult;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+
+	// A check-backed type whose check() cancels stream id 1 while the tick is mid-loop
+	// over the stdio-stream AA — exercising the snapshot iteration.
+	bool cancelDuringTick;
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		if (cancelDuringTick)
+			s.handle(Message(makeNotification("notifications/cancelled",
+					Json(["requestId": Json(1)]))));
+		return EventResult.empty("c0");
+	};
+	s.registerEventType(reg);
+
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "email.received";
+	s.tryServeStdioEventsStream(draftReq(1, "events/stream", params), &sink);
+	s.tryServeStdioEventsStream(draftReq(2, "events/stream", params), &sink);
+	cancelDuringTick = true;
+
+	// The tick removes stream 1 from the AA while iterating; a live foreach over the
+	// AA would be undefined behaviour. The snapshot makes it safe and stream 2 still
+	// ticks. No throw / corruption is the assertion.
+	s.tickStdioEventStreams(0);
+	assert(s.hasStdioEventStreams());
+}
+
+unittest  // tickStdioEventStreams polls a check-backed stream and heartbeats only every 15s
+{
+	import std.algorithm : count, canFind;
+	import mcp.protocol.events : EventOccurrence;
+	import mcp.server.event_context : EventContext, EventResult;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+
+	// A check-backed type that yields one fresh event on each non-bootstrap poll.
+	int pollNo;
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		if (ctx.isBootstrap())
+			return EventResult.empty("c0");
+		pollNo++;
+		import std.conv : to;
+
+		return EventResult.of([
+			EventOccurrence("evt_" ~ pollNo.to!string, "email.received", "t")
+		], "c" ~ pollNo.to!string);
+	};
+	s.registerEventType(reg);
+
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "email.received";
+	s.tryServeStdioEventsStream(draftReq(1, "events/stream", params), &sink);
+	// The leading active frame seeds lastHeartbeatMs at 0 (the stream's birth time).
+	const afterOpen = lines.length;
+
+	bool isHeartbeat(string l) @safe
+	{
+		return l.canFind("notifications/events/heartbeat");
+	}
+
+	bool isEvent(string l) @safe
+	{
+		return l.canFind("notifications/events/event");
+	}
+
+	// A tick well before the 15s cadence: the poll-derived event is delivered, but
+	// no heartbeat (nowMs - lastHeartbeatMs = 5000 < 15000).
+	s.tickStdioEventStreams(5_000);
+	auto first = lines[afterOpen .. $];
+	assert(first.count!isEvent == 1, "poll-derived event delivered on tick");
+	assert(first.count!isHeartbeat == 0, "no heartbeat before the 15s cadence");
+
+	// A tick at exactly 15s since the last heartbeat fires exactly one heartbeat.
+	const beforeBeat = lines.length;
+	s.tickStdioEventStreams(15_000);
+	auto second = lines[beforeBeat .. $];
+	assert(second.count!isHeartbeat == 1, "heartbeat fires once at the 15s boundary");
+
+	// A subsequent tick still inside the next 15s window sends no further heartbeat.
+	const beforeNoBeat = lines.length;
+	s.tickStdioEventStreams(20_000);
+	auto third = lines[beforeNoBeat .. $];
+	assert(third.count!isHeartbeat == 0, "no second heartbeat within the same window");
 }
 
 unittest  // a created task is served via tasks/get, progressing working -> completed

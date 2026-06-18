@@ -14,6 +14,8 @@ import mcp.server.server : McpServer, ToolResponse;
 import mcp.server.context;
 import mcp.server.task_context : TaskContext;
 import mcp.server.task_runtime : TaskOptions;
+import mcp.server.event_context : EventContext, EventResult, Event, EventBatch, FetchContext;
+import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
 import mcp.api.skills : Skill, registerSkill;
@@ -86,6 +88,8 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 						registerToolMethod!(memberName, overload, parent)(server, attr);
 					else static if (is(typeof(attr) == task))
 						registerTaskMethod!(memberName, overload, parent)(server, attr);
+					else static if (is(typeof(attr) == event))
+						registerEventMethod!(memberName, overload, parent)(server, attr);
 					else static if (is(typeof(attr) == prompt))
 						registerPromptMethod!(memberName, overload, parent)(server, attr);
 					else static if (is(typeof(attr) == resource))
@@ -193,7 +197,7 @@ private Json parametersSchema(alias func)() @safe
 	Json required = Json.emptyArray;
 	static foreach (i, P; types)
 	{
-		static if (!is(P : RequestContext) && !is(P == TaskContext))
+		static if (!is(P : RequestContext) && !is(P == TaskContext) && !is(P == EventContext))
 		{
 			{
 				// Generate the parameter's schema and fold in the field-level
@@ -741,6 +745,43 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 		else
 			return toToolResult(__traits(getMember, parent, memberName)(argv.expand)).toJson();
 	}, ttl, pollInterval);
+}
+
+/// Register a typed `@event` pull/fetch type. The method must have the shape
+/// `EventBatch!P fetch(A args, FetchContext ctx)`: `A` derives the subscription
+/// `inputSchema`, `P` the `payloadSchema`, and the method becomes the type's fetch
+/// handler (backing poll directly, stream/webhook via the runtime's loop) through
+/// `EventsRuntime.define!(A,P).onFetch`. `@eventPollInterval` sets the cadence.
+/// Push-only event types use the builder (`server.events.define!(A,P)(...)` +
+/// `publish`) directly rather than `@event`. Requires `enableEvents()` first.
+private void registerEventMethod(string memberName, alias overload, alias parent)(
+		McpServer server, event attr) @safe
+{
+	import std.traits : Parameters, ReturnType;
+	import mcp.protocol.errors : internalError;
+
+	static assert(Parameters!overload.length == 2,
+			"@event method '" ~ memberName ~ "' must take (Args, FetchContext)");
+	static assert(is(Parameters!overload[1] == FetchContext),
+			"@event method '" ~ memberName ~ "' must take FetchContext as its second parameter");
+
+	static if (is(ReturnType!overload == EventBatch!EP, EP))
+	{
+		alias A = Parameters!overload[0];
+
+		if (server.events is null)
+			throw internalError("@event requires enableEvents() before registerHandlers");
+
+		auto ev = server.events.define!(A, EP)(attr.name, attr.description, attr.title);
+		ev.onFetch((A args, scope FetchContext ctx) @safe => __traits(getMember,
+				parent, memberName)(args, ctx));
+		static foreach (a; __traits(getAttributes, overload))
+			static if (is(typeof(a) == eventPollInterval))
+				ev.pollInterval(a.value);
+	}
+	else
+		static assert(false, "@event method '" ~ memberName
+				~ "' must return EventBatch!P (its payload type P derives the payloadSchema)");
 }
 
 /// Wrap a prompt method's return value into a `GetPromptResult`.
@@ -2812,4 +2853,124 @@ unittest  // @task UDA: a mid-task elicitation suspends and resumes via tasks/up
 	assert(done["result"]["status"].get!string == "completed");
 	assert(done["result"]["result"]["structuredContent"]["topic"].get!string == "deploy");
 	assert(done["result"]["result"]["structuredContent"]["approved"].get!bool);
+}
+
+version (unittest)
+{
+	private struct EmailArgs
+	{
+		string from;
+	}
+
+	private struct Email
+	{
+		string messageId;
+		string from;
+	}
+
+	// A typed @event pull/fetch type: EventBatch!Email fetch(EmailArgs, FetchContext).
+	private class EventUdaApi
+	{
+		@event("email.received", "A new email arrives", "New Email")
+		EventBatch!Email checkEmail(EmailArgs args, FetchContext ctx) @safe
+		{
+			if (ctx.isBootstrap())
+				return EventBatch!Email.empty("c0");
+			return EventBatch!Email.of([
+				Event!Email(Email("e1", args.from), "c1")
+			], "c1");
+		}
+	}
+}
+
+unittest  // @event derives input + payload schemas from its typed signature
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	registerHandlers(s, new EventUdaApi);
+
+	Json params = Json.emptyObject;
+	params["_meta"] = draftMeta();
+	auto events = s.handle(Message(makeRequest(Json(1), "events/list",
+			params))).get["result"]["events"];
+	Json email;
+	foreach (i; 0 .. events.length)
+		if (events[i]["name"].get!string == "email.received")
+			email = events[i];
+	assert(email.type == Json.Type.object);
+	assert(("from" in email["inputSchema"]["properties"]) !is null); // from EmailArgs
+	assert(email["payloadSchema"].type == Json.Type.object);
+	assert(("messageId" in email["payloadSchema"]["properties"]) !is null); // from Email
+}
+
+unittest  // @event carries its title through to events/list
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	registerHandlers(s, new EventUdaApi);
+
+	Json params = Json.emptyObject;
+	params["_meta"] = draftMeta();
+	auto events = s.handle(Message(makeRequest(Json(1), "events/list",
+			params))).get["result"]["events"];
+	Json email;
+	foreach (i; 0 .. events.length)
+		if (events[i]["name"].get!string == "email.received")
+			email = events[i];
+	assert(email["title"].get!string == "New Email");
+}
+
+unittest  // @event fetch handler backs events/poll: bootstrap then deliver typed payload
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	registerHandlers(s, new EventUdaApi);
+
+	Json boot = Json.emptyObject;
+	boot["name"] = "email.received";
+	boot["arguments"] = Json(["from": Json("a@b.com")]);
+	boot["_meta"] = draftMeta();
+	auto b = s.handle(Message(makeRequest(Json(1), "events/poll", boot))).get;
+	assert(b["result"]["events"].length == 0 && b["result"]["cursor"].get!string == "c0");
+
+	Json next = Json.emptyObject;
+	next["name"] = "email.received";
+	next["arguments"] = Json(["from": Json("a@b.com")]);
+	next["cursor"] = "c0";
+	next["_meta"] = draftMeta();
+	auto n = s.handle(Message(makeRequest(Json(2), "events/poll", next))).get;
+	assert(n["result"]["events"].length == 1);
+	assert(n["result"]["events"][0]["data"]["from"].get!string == "a@b.com");
+	assert(n["result"]["events"][0]["data"]["messageId"].get!string == "e1");
+}
+
+unittest  // the typed builder defines a push type whose publish() feeds events/poll
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableEvents();
+	auto ev = rt.define!(EmailArgs, Email)("mail.pushed", "pushed mail");
+
+	Json boot = Json.emptyObject;
+	boot["name"] = "mail.pushed";
+	boot["_meta"] = draftMeta();
+	auto b = s.handle(Message(makeRequest(Json(1), "events/poll", boot))).get;
+	auto cursor = b["result"]["cursor"];
+
+	ev.publish(Email("m1", "x@y.com"));
+
+	Json next = Json.emptyObject;
+	next["name"] = "mail.pushed";
+	next["cursor"] = cursor;
+	next["_meta"] = draftMeta();
+	auto n = s.handle(Message(makeRequest(Json(2), "events/poll", next))).get;
+	assert(n["result"]["events"].length == 1);
+	assert(n["result"]["events"][0]["data"]["messageId"].get!string == "m1");
 }

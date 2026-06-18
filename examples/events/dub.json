@@ -1,0 +1,23 @@
+{
+	"name": "events",
+	"description": "MCP Events example (server + self-verifying client e2e) for mcp.d — the io.modelcontextprotocol/events extension via the @event UDA (poll/push/webhook)",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp-d": { "path": "../.." },
+		"examples-common": { "path": "../common" }
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "events-server",
+			"mainSourceFile": "server.d"
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "events-client",
+			"mainSourceFile": "client.d"
+		}
+	]
+}
