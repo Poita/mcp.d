@@ -8,9 +8,9 @@
 		"Peter Alexander"
 	],
 	"toolchainRequirements": {
-		"frontend": ">=2.100.0",
-		"dmd": ">=2.100.0",
-		"ldc": ">=1.30.0"
+		"frontend": ">=2.111.0",
+		"dmd": ">=2.111.0",
+		"ldc": ">=1.41.0"
 	},
 	"targetType": "library",
 	"dependencies": {
