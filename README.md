@@ -151,6 +151,13 @@ dub run dfmt -- --inplace source/
 dub run dscanner -- --styleCheck source/
 ```
 
+## Deploying
+
+To package an mcp.d server into a container and run it on a PaaS, see
+[`deploy/`](deploy/README.md) — a reference multi-stage `Dockerfile` plus the
+system dependencies, toolchain pinning, and the server-side settings (binding
+`0.0.0.0:$PORT`, allow-listing the public `Host`) a deployment needs.
+
 ## API documentation
 
 Browsable HTML API docs are generated from the ddoc comments in `source/mcp`:
