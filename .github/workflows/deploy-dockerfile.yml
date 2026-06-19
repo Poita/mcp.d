@@ -1,0 +1,52 @@
+name: Deploy Dockerfile
+
+# Validate deploy/Dockerfile so the documented container recipe can't silently
+# rot (a new transitive dependency needing a system library, an LDC bump, a base
+# image change, etc.). Builds the reference Dockerfile against a minimal fixture
+# server (deploy/ci-smoke), with the fixture pinned to this commit's SDK.
+
+on:
+  push:
+    paths:
+      - "deploy/**"
+      - ".github/workflows/deploy-dockerfile.yml"
+  pull_request:
+    paths:
+      - "deploy/**"
+      - ".github/workflows/deploy-dockerfile.yml"
+
+jobs:
+  reference-image:
+    name: build reference Dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Build the fixture against THIS commit's SDK (not the published release),
+      # so a change here that needs a new system dependency fails the build.
+      - name: Point the fixture at this commit's SDK
+        env:
+          SDK_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          path = "deploy/ci-smoke/dub.json"
+          d = json.load(open(path))
+          d["dependencies"]["mcp-d"] = {
+              "repository": f"git+https://github.com/{os.environ['REPO']}.git",
+              "version": os.environ["SDK_SHA"],
+          }
+          json.dump(d, open(path, "w"), indent="\t")
+          PY
+          echo "--- fixture dub.json ---"
+          cat deploy/ci-smoke/dub.json
+
+      - name: Build the reference Dockerfile
+        run: |
+          docker build \
+            -f deploy/Dockerfile \
+            --build-arg APP=ci-smoke \
+            -t mcpd-deploy-smoke \
+            deploy/ci-smoke

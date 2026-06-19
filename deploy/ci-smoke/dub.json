@@ -1,0 +1,9 @@
+{
+	"name": "ci-smoke",
+	"description": "Minimal mcp.d server built by CI to validate deploy/Dockerfile.",
+	"targetType": "executable",
+	"targetName": "ci-smoke",
+	"dependencies": {
+		"mcp-d": "~>0.2"
+	}
+}

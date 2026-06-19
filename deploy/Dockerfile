@@ -39,10 +39,10 @@ ENV PATH="/opt/dlang/ldc-${LDC_VERSION}/bin:${PATH}"
 ENV DC=ldc2
 
 WORKDIR /src
-# Copy the manifest first for layer caching. Commit dub.selections.json for
-# reproducible dependency versions (remove it from this line if you don't have
-# one).
-COPY dub.json dub.selections.json ./
+# Copy the manifest first for layer caching. For reproducible dependency
+# versions, commit dub.selections.json and add it here too:
+#   COPY dub.json dub.selections.json ./
+COPY dub.json ./
 COPY source ./source
 
 # Your dub `targetName` — the executable `dub build` produces. Required.

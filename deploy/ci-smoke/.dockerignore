@@ -1,0 +1,4 @@
+.dub
+*-test-*
+ci-smoke
+dub.selections.json
