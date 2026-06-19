@@ -35,6 +35,10 @@ final class SubscriptionStream
 	// stdio); the HTTP transport uses it to force-close the listen stream's socket
 	// so a blocked read unblocks immediately.
 	private void delegate() @safe nothrow onCancel_;
+	// Optional client-supplied cleanup, run once on the first cancel() after the
+	// transport's own teardown. `McpClient.streamEvents` uses it to deregister the
+	// stream's per-subscription event/control handlers when the stream ends.
+	private void delegate() @safe nothrow cleanup_;
 
 	/// Construct a handle wrapping a shared cancellation flag. Created by a
 	/// `ClientTransport` when it opens the listen stream. `onCancel`, when
@@ -58,7 +62,17 @@ final class SubscriptionStream
 		{
 			if (onCancel_ !is null)
 				onCancel_();
+			if (cleanup_ !is null)
+				cleanup_();
 		}
+	}
+
+	/// Attach a cleanup run exactly once on the first `cancel()`/`close()`, after
+	/// the transport's own teardown. Set immediately after the stream is opened
+	/// (before any cancel can race), so a later cancel deregisters client state.
+	void addCleanup(void delegate() @safe nothrow cleanup) @safe nothrow
+	{
+		cleanup_ = cleanup;
 	}
 
 	/// Alias for `cancel()`.

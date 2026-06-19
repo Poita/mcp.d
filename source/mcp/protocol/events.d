@@ -645,6 +645,158 @@ Json withSubscriptionId(Json params, Json subscriptionId) @safe
 }
 
 // ---------------------------------------------------------------------------
+// Typed control signals (delivered to a subscription's onControl handler)
+// ---------------------------------------------------------------------------
+
+/// A JSON-RPC-style error carried by a recoverable `error` control signal or a
+/// `terminated` one. `data` keeps any structured detail (e.g. a `reason`
+/// delivery-error category) without enumerating every producer.
+struct EventError
+{
+	long code; /// JSON-RPC error code; 0 when the producer sent none
+	string message; /// human-readable detail, possibly empty
+	Json data = Json.undefined; /// optional structured detail
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		j["code"] = code;
+		if (message.length)
+			j["message"] = message;
+		if (data.type != Json.Type.undefined)
+			j["data"] = data;
+		return j;
+	}
+
+	static EventError fromJson(Json j) @safe
+	{
+		EventError e;
+		if (j.type != Json.Type.object)
+			return e;
+		if ("code" in j && j["code"].type == Json.Type.int_)
+			e.code = j["code"].get!long;
+		e.message = j.getOr("message", "");
+		if ("data" in j)
+			e.data = j["data"];
+		return e;
+	}
+}
+
+/// The kind of a non-occurrence control signal on a subscription.
+enum EventControlKind
+{
+	active, /// delivery confirmed (push)
+	heartbeat, /// keepalive; the cursor advanced during a quiet period
+	gap, /// a delivery gap was detected; occurrences may have been missed
+	error, /// recoverable delivery error; the subscription stays open
+	terminated /// the subscription has ended; no more occurrences will arrive
+}
+
+/// A typed control signal handed to a subscription's `onControl`. Unifies the
+/// push `notifications/events/{active,heartbeat,error,terminated}` frames and the
+/// webhook `{gap,terminated}` control envelopes, so a client never parses raw
+/// control JSON. Fields are populated per kind: `cursor` for active/heartbeat/
+/// gap, and `error` for error/terminated.
+struct EventControl
+{
+	EventControlKind kind;
+	Nullable!string cursor; /// position checked up to (active/heartbeat/gap)
+	Nullable!EventError error; /// failure detail (error/terminated)
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		j["kind"] = controlKindToWire(kind);
+		if (!cursor.isNull)
+			j["cursor"] = cursor.get;
+		if (!error.isNull)
+			j["error"] = error.get.toJson();
+		return j;
+	}
+}
+
+/// The wire/log string for a control kind.
+string controlKindToWire(EventControlKind k) @safe pure nothrow
+{
+	final switch (k)
+	{
+	case EventControlKind.active:
+		return "active";
+	case EventControlKind.heartbeat:
+		return "heartbeat";
+	case EventControlKind.gap:
+		return "gap";
+	case EventControlKind.error:
+		return "error";
+	case EventControlKind.terminated:
+		return "terminated";
+	}
+}
+
+private void readCursorInto(Json j, ref Nullable!string cursor) @safe
+{
+	if (j.type == Json.Type.object && "cursor" in j && j["cursor"].type == Json.Type.string)
+		cursor = j["cursor"].get!string;
+}
+
+/// Parse a push `notifications/events/*` control frame into a typed control.
+/// Returns false for methods that aren't control frames (the event notification
+/// itself, or `list_changed`). An `active` re-sent with `truncated:true` is
+/// normalized to `gap`, so a client treats a push gap and a webhook gap alike.
+bool controlFromPushNotification(string method, Json params, out EventControl c) @safe
+{
+	switch (method)
+	{
+	case eventsActiveNotification:
+		readCursorInto(params, c.cursor);
+		const truncated = params.type == Json.Type.object && "truncated" in params
+			&& params["truncated"].type == Json.Type.bool_ && params["truncated"].get!bool;
+		c.kind = truncated ? EventControlKind.gap : EventControlKind.active;
+		return true;
+	case eventsHeartbeatNotification:
+		c.kind = EventControlKind.heartbeat;
+		readCursorInto(params, c.cursor);
+		return true;
+	case eventsErrorNotification:
+		c.kind = EventControlKind.error;
+		if (params.type == Json.Type.object && "error" in params)
+			c.error = EventError.fromJson(params["error"]);
+		return true;
+	case eventsTerminatedNotification:
+		c.kind = EventControlKind.terminated;
+		if (params.type == Json.Type.object && "error" in params)
+			c.error = EventError.fromJson(params["error"]);
+		return true;
+	default:
+		return false;
+	}
+}
+
+/// Parse a webhook control envelope (`{type: gap|terminated, ...}`) into a typed
+/// control. Returns false for non-control bodies and for envelope types not
+/// surfaced to the application (e.g. `verification`, handled internally).
+bool controlFromWebhookEnvelope(Json env, out EventControl c) @safe
+{
+	if (env.type != Json.Type.object || "type" !in env
+		|| env["type"].type != Json.Type.string)
+		return false;
+	switch (env["type"].get!string)
+	{
+	case "gap":
+		c.kind = EventControlKind.gap;
+		readCursorInto(env, c.cursor);
+		return true;
+	case "terminated":
+		c.kind = EventControlKind.terminated;
+		if ("error" in env)
+			c.error = EventError.fromJson(env["error"]);
+		return true;
+	default:
+		return false;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -971,4 +1123,72 @@ unittest  // withSubscriptionId merges into an existing _meta and supports strin
 	auto tagged = withSubscriptionId(params, Json("sub-7"));
 	assert(tagged["_meta"]["existing"].get!string == "keep");
 	assert(tagged["_meta"][subscriptionIdMetaKey].get!string == "sub-7");
+}
+
+unittest  // EventError round-trips code/message/data and tolerates a non-object
+{
+	auto err = EventError.fromJson(Json([
+		"code": Json(-32012), "message": Json("revoked"),
+		"data": Json(["reason": Json("challenge_failed")])
+	]));
+	assert(err.code == -32012);
+	assert(err.message == "revoked");
+	assert(err.data["reason"].get!string == "challenge_failed");
+	assert(EventError.fromJson(Json("nope")).code == 0);
+}
+
+unittest  // a push `active` frame parses to active, carrying its cursor
+{
+	EventControl c;
+	assert(controlFromPushNotification(eventsActiveNotification,
+		activeParams(nullable("cur-1"), false), c));
+	assert(c.kind == EventControlKind.active);
+	assert(c.cursor.get == "cur-1");
+}
+
+unittest  // a push `active` with truncated:true is normalized to gap
+{
+	EventControl c;
+	assert(controlFromPushNotification(eventsActiveNotification,
+		activeParams(nullable("cur-2"), true), c));
+	assert(c.kind == EventControlKind.gap);
+	assert(c.cursor.get == "cur-2");
+}
+
+unittest  // a push `terminated` frame carries its typed error
+{
+	EventControl c;
+	auto params = Json(["error": Json(["code": Json(-32012), "message": Json("gone")])]);
+	assert(controlFromPushNotification(eventsTerminatedNotification, params, c));
+	assert(c.kind == EventControlKind.terminated);
+	assert(c.error.get.code == -32012);
+	assert(c.error.get.message == "gone");
+}
+
+unittest  // a non-control push method (the event itself) is rejected
+{
+	EventControl c;
+	assert(!controlFromPushNotification(eventsEventNotification, Json.emptyObject, c));
+}
+
+unittest  // a webhook gap envelope parses to a typed gap with its cursor
+{
+	EventControl c;
+	assert(controlFromWebhookEnvelope(gapEnvelope("cur-3"), c));
+	assert(c.kind == EventControlKind.gap);
+	assert(c.cursor.get == "cur-3");
+}
+
+unittest  // a webhook terminated envelope carries its typed error
+{
+	EventControl c;
+	assert(controlFromWebhookEnvelope(terminatedEnvelope(Json(["code": Json(-32012)])), c));
+	assert(c.kind == EventControlKind.terminated);
+	assert(c.error.get.code == -32012);
+}
+
+unittest  // a webhook verification envelope is not surfaced as control
+{
+	EventControl c;
+	assert(!controlFromWebhookEnvelope(verificationEnvelope("nonce"), c));
 }

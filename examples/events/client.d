@@ -91,15 +91,15 @@ int main(string[] args) @safe
 		{
 			string lastEventSeverity;
 			int eventCount;
-			client.onNotification = (string method, Json params) @safe {
-				if (method == "notifications/events/event")
-				{
+			// Occurrences and control frames arrive on this stream's own handlers,
+			// already typed — no global onNotification, no manual subscriptionId
+			// routing.
+			auto stream = client.streamEvents("incident.created",
+				(EventOccurrence occ) @safe {
 					eventCount++;
-					if ("data" in params && "severity" in params["data"])
-						lastEventSeverity = params["data"]["severity"].get!string;
-				}
-			};
-			auto stream = client.streamEvents("incident.created");
+					if ("severity" in occ.data)
+						lastEventSeverity = occ.data["severity"].get!string;
+				});
 			scope (exit)
 				stream.close();
 
@@ -114,7 +114,6 @@ int main(string[] args) @safe
 			}
 			check(eventCount >= 1, "push stream should deliver the raised incident");
 			checkEq(lastEventSeverity, "P2", "pushed incident severity");
-			client.onNotification = null;
 		}
 
 		// --- 5. WEBHOOK: server signs + POSTs the occurrence to our receiver --

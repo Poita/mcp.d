@@ -261,6 +261,17 @@ final class McpClient : ClientProtocol
 	// by token (not stacked on a single mutable field) so overlapping concurrent
 	// calls never clobber each other's sink or leave a stale wrapper installed.
 	private void delegate(ProgressNotification) @safe[string] perCallProgress_;
+	// Per-subscription push handlers, keyed by the `events/stream` request id (the
+	// subscriptionId stamped on every `notifications/events/*` frame). streamEvents
+	// registers; the stream's cleanup hook and a `terminated` frame deregister, so
+	// concurrent streams for the same event type each get their own occurrences.
+	private struct EventStreamHandlers
+	{
+		void delegate(EventOccurrence) @safe onEvent;
+		void delegate(EventControl) @safe onControl;
+	}
+
+	private EventStreamHandlers[string] eventStreams_;
 	// Server identity/capabilities discovered at connect/initialize, exposed via
 	// the `serverCapabilities`/`serverInfo`/`serverInstructions` accessors. Both
 	// the stable initialize handshake and the stateless draft `server/discover`
@@ -1892,16 +1903,23 @@ final class McpClient : ClientProtocol
 		return PollResult.fromJson(rpc("events/poll", p.toJson()));
 	}
 
-	/// Open a push `events/stream` for one subscription. Returns a
-	/// `SubscriptionStream` handle; every `notifications/events/*` message
-	/// (`active`/`event`/`heartbeat`/`error`/`terminated`) is dispatched to
-	/// `onNotification`, each carrying the stream's id in
-	/// `params._meta["io.modelcontextprotocol/subscriptionId"]` so a client with
-	/// several concurrent streams can route them. `cancel()`/`close()` ends it.
-	SubscriptionStream streamEvents(string name, Json arguments = Json.emptyObject,
+	/// Open a push `events/stream` for one subscription. Occurrences are delivered
+	/// to `onEvent` and control frames (`active`/`heartbeat`/`gap`/`error`/
+	/// `terminated`) to the typed `onControl` — both bound to *this* stream, so
+	/// several concurrent streams (even for the same event type) never cross-route.
+	/// The SDK demuxes internally by the stream's
+	/// `params._meta["io.modelcontextprotocol/subscriptionId"]`; the client never
+	/// sees raw notifications. `cancel()`/`close()` ends the stream and drops its
+	/// handlers; a `terminated` control also drops them.
+	SubscriptionStream streamEvents(string name,
+			void delegate(EventOccurrence) @safe onEvent,
+			void delegate(EventControl) @safe onControl = null,
+			Json arguments = Json.emptyObject,
 			Nullable!string cursor = Nullable!string.init,
 			Nullable!long maxAgeMs = Nullable!long.init) @safe
 	{
+		import std.conv : to;
+
 		const id = nextId++;
 		StreamParams sp;
 		sp.name = name;
@@ -1912,7 +1930,12 @@ final class McpClient : ClientProtocol
 		if (useModern)
 			params = injectModernMeta(params);
 		auto message = makeRequest(Json(id), "events/stream", params);
-		return transport.openListen(message);
+		const key = id.to!string;
+		// Register before opening so an occurrence racing the open is routable.
+		eventStreams_[key] = EventStreamHandlers(onEvent, onControl);
+		auto stream = transport.openListen(message);
+		stream.addCleanup(() @safe nothrow { eventStreams_.remove(key); });
+		return stream;
 	}
 
 	/// `events/subscribe` (webhook delivery): register/refresh a callback for one
@@ -2430,8 +2453,64 @@ final class McpClient : ClientProtocol
 		// Evict the cached reads the server says have changed (lazy refetch on the
 		// next call) and fire the matching typed change callback.
 		dispatchCacheInvalidation(method, params);
+		// Push event-stream frames go to the per-subscription handlers registered
+		// by streamEvents (keyed by the `_meta` subscriptionId), not the generic
+		// onNotification, so concurrent streams for one event type don't collide.
+		if (dispatchEventStream(method, params))
+			return;
 		if (onNotification !is null)
 			onNotification(method, params);
+	}
+
+	/// Route a push `notifications/events/*` frame to the handlers `streamEvents`
+	/// registered for its `_meta` subscriptionId. Returns true when the frame was
+	/// an event-stream frame addressed to a live stream (and was delivered), so the
+	/// caller skips the generic `onNotification`. A frame with no/unknown
+	/// subscriptionId falls through (returns false) for back-compat.
+	private bool dispatchEventStream(string method, Json params) @safe
+	{
+		if (method != eventsEventNotification && method != eventsActiveNotification
+			&& method != eventsHeartbeatNotification && method != eventsErrorNotification
+			&& method != eventsTerminatedNotification)
+			return false;
+		if (params.type != Json.Type.object || "_meta" !in params)
+			return false;
+		auto meta = params["_meta"];
+		if (meta.type != Json.Type.object || subscriptionIdMetaKey !in meta)
+			return false;
+		const key = subscriptionKey(meta[subscriptionIdMetaKey]);
+		auto h = key in eventStreams_;
+		if (h is null)
+			return false;
+		if (method == eventsEventNotification)
+		{
+			if (h.onEvent !is null)
+				h.onEvent(EventOccurrence.fromJson(params));
+			return true;
+		}
+		EventControl c;
+		if (controlFromPushNotification(method, params, c))
+		{
+			if (h.onControl !is null)
+				h.onControl(c);
+			// A terminated subscription delivers nothing further: drop its handlers.
+			if (c.kind == EventControlKind.terminated)
+				eventStreams_.remove(key);
+		}
+		return true;
+	}
+
+	/// Normalize a `_meta` subscriptionId (a JSON-RPC id: integer or string) to the
+	/// string key `streamEvents` registers under.
+	private static string subscriptionKey(Json v) @safe
+	{
+		import std.conv : to;
+
+		if (v.type == Json.Type.string)
+			return v.get!string;
+		if (v.type == Json.Type.int_)
+			return v.get!long.to!string;
+		return v.toString();
 	}
 
 	/// React to the server's change notifications: evict the affected cached
@@ -6250,4 +6329,87 @@ unittest  // test-only RPC/notify hooks are guarded behind version(unittest)
 
 		assert(between.count('\n') <= 1, h.name ~ " is not directly guarded by version (unittest)");
 	}
+}
+
+unittest  // concurrent push streams for one event type each get only their own occurrences
+{
+	// The bug this guards against: routing by event name alone sent every
+	// occurrence to the first stream. Routing by the `_meta` subscriptionId keeps
+	// two same-event streams independent.
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+
+	int aCount, bCount;
+	string aSev, bSev;
+	// nextId starts at 1, so the first stream is subscriptionId 1, the second 2.
+	auto sa = c.streamEvents("incident.created", (EventOccurrence o) @safe {
+		aCount++;
+		if ("severity" in o.data)
+			aSev = o.data["severity"].get!string;
+	});
+	auto sb = c.streamEvents("incident.created", (EventOccurrence o) @safe {
+		bCount++;
+		if ("severity" in o.data)
+			bSev = o.data["severity"].get!string;
+	});
+
+	static Json occ(string sev) @safe
+	{
+		return Json([
+			"eventId": Json("e"), "name": Json("incident.created"),
+			"timestamp": Json("t"), "data": Json(["severity": Json(sev)])
+		]);
+	}
+
+	c.dispatchInbound(Message(makeNotification(eventsEventNotification,
+			withSubscriptionId(occ("P1"), Json(1)))));
+	c.dispatchInbound(Message(makeNotification(eventsEventNotification,
+			withSubscriptionId(occ("P2"), Json(2)))));
+
+	assert(aCount == 1 && aSev == "P1");
+	assert(bCount == 1 && bSev == "P2");
+}
+
+unittest  // a push terminated control is delivered typed and drops the stream's handlers
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+
+	int events;
+	EventControl gotCtrl;
+	bool gotControl;
+	auto s = c.streamEvents("incident.created",
+		(EventOccurrence o) @safe { events++; },
+		(EventControl ctrl) @safe { gotCtrl = ctrl; gotControl = true; });
+
+	c.dispatchInbound(Message(makeNotification(eventsTerminatedNotification,
+			withSubscriptionId(Json(["error": Json(["code": Json(-32012)])]), Json(1)))));
+	assert(gotControl);
+	assert(gotCtrl.kind == EventControlKind.terminated);
+	assert(gotCtrl.error.get.code == -32012);
+
+	// Handlers are gone after termination: a later occurrence for sub 1 is dropped.
+	c.dispatchInbound(Message(makeNotification(eventsEventNotification,
+			withSubscriptionId(Json([
+				"eventId": Json("e"), "name": Json("incident.created"),
+				"timestamp": Json("t"), "data": Json.emptyObject
+			]), Json(1)))));
+	assert(events == 0);
+}
+
+unittest  // cancelling a stream deregisters its handlers (later occurrences ignored)
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+
+	int events;
+	auto s = c.streamEvents("incident.created", (EventOccurrence o) @safe { events++; });
+	s.close();
+
+	c.dispatchInbound(Message(makeNotification(eventsEventNotification,
+			withSubscriptionId(Json([
+				"eventId": Json("e"), "name": Json("incident.created"),
+				"timestamp": Json("t"), "data": Json.emptyObject
+			]), Json(1)))));
+	assert(events == 0);
 }

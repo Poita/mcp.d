@@ -10,7 +10,8 @@ import std.base64 : Base64;
 import vibe.data.json : Json, parseJsonString;
 
 import standardwebhooks : Webhook;
-import mcp.protocol.events : EventOccurrence, isControlEnvelope;
+import mcp.protocol.events : EventOccurrence, isControlEnvelope, EventControl,
+	EventControlKind, controlFromWebhookEnvelope;
 
 @safe:
 
@@ -43,7 +44,7 @@ final class WebhookReceiver
 	{
 		string secret;
 		void delegate(EventOccurrence occ) @safe onEvent;
-		void delegate(Json envelope) @safe onControl;
+		void delegate(EventControl control) @safe onControl;
 	}
 
 	private Reg[string] regs_;
@@ -68,7 +69,7 @@ final class WebhookReceiver
 	/// value carried in `X-MCP-Subscription-Id`). `onControl` is optional.
 	void register(string subscriptionId, string secret,
 			void delegate(EventOccurrence occ) @safe onEvent,
-			void delegate(Json envelope) @safe onControl = null) @safe
+			void delegate(EventControl control) @safe onControl = null) @safe
 	{
 		regs_[subscriptionId] = Reg(secret, onEvent, onControl);
 	}
@@ -128,8 +129,9 @@ final class WebhookReceiver
 			const type = j["type"].get!string;
 			if (type == "verification") // Prove intent to receive: echo the challenge in a 2xx body.
 				return ReceiverResponse(200, Json(["challenge": j["challenge"]]).toString());
-			if (reg.onControl !is null)
-				reg.onControl(j);
+			EventControl ctrl;
+			if (reg.onControl !is null && controlFromWebhookEnvelope(j, ctrl))
+				reg.onControl(ctrl);
 			return ReceiverResponse(200, "");
 		}
 
@@ -368,14 +370,18 @@ unittest  // a terminated control envelope is routed to onControl
 
 	auto rx = new WebhookReceiver();
 	rx.verifyTimestamp = false;
-	Json gotControl;
-	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {}, (Json env) @safe {
-		gotControl = env;
+	EventControl gotControl;
+	bool got;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {}, (EventControl ctrl) @safe {
+		gotControl = ctrl;
+		got = true;
 	});
-	const 
+	const
 	body = terminatedEnvelope(Json(["code": Json(-32012)])).toString();
 	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "msg_term",
 			1700, body, "sub_1", null);
 	assert(rx.processDelivery(body, headers).status == 200);
-	assert(gotControl["type"].get!string == "terminated");
+	assert(got);
+	assert(gotControl.kind == EventControlKind.terminated);
+	assert(gotControl.error.get.code == -32012);
 }
