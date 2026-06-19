@@ -1,9 +1,9 @@
 {
 	"name": "ci-smoke",
-	"description": "Minimal mcp.d server built by CI to validate deploy/Dockerfile.",
+	"description": "Minimal mcp.d server built by CI to validate deploy/Dockerfile. CI overrides this dependency with a git ref pinned to the building commit; \"*\" (latest published) is the standalone default so it never goes out of date.",
 	"targetType": "executable",
 	"targetName": "ci-smoke",
 	"dependencies": {
-		"mcp-d": "~>0.2"
+		"mcp-d": "*"
 	}
 }
