@@ -645,13 +645,20 @@ EventBatch!Email checkEmail(EmailArgs args, FetchContext ctx) @safe
 The dynamic `server.registerEventType(EventRegistration(...))` path (raw `Json`)
 remains for runtime-defined types.
 
-On the **client**, `client.eventsSupported()` reports the negotiated extension;
-`listEvents()` enumerates types; `pollEvents(...)` and `streamEvents(...)` drive
-poll and push; and `subscribeWebhookEvents(...)` registers a webhook callback. A
-`WebhookReceiver` verifies inbound Standard Webhooks deliveries, answers the
-verification challenge, deduplicates by `webhook-id`, and routes occurrences —
-usable as the forward proxy a `delivery.url` points at; `generateWhsecSecret()`
-mints the client-supplied `whsec_` signing secret. The runnable
+On the **client**, `client.eventsSupported()` reports the negotiated extension and
+`listEvents()` enumerates types. For consuming a subscription, prefer the **managed
+layer**: `subscribePoll(PollParams, onEvent, onControl)`, `subscribeStream(StreamParams, …)`,
+and `subscribeWebhook(WebhookReceiver, SubscribeParams, …)` each return one
+mode-neutral `EventSubscription` handle — the SDK runs the poll loop (pacing by
+`nextPollMs`, threading the cursor, signalling gaps), demuxes the push stream, or
+keeps the webhook grant refreshed before it lapses; `sub.cursor()` exposes the live
+watermark for resume and `sub.cancel()` tears the subscription down. The low-level
+`pollEvents(...)`/`streamEvents(...)`/`subscribeWebhookEvents(...)` round-trips
+remain for callers who want to drive the loop themselves. A `WebhookReceiver`
+verifies inbound Standard Webhooks deliveries, answers the verification challenge,
+deduplicates per subscription, and routes occurrences — usable as the forward proxy
+a `delivery.url` points at; `generateWhsecSecret()` mints the client-supplied
+`whsec_` signing secret. The runnable
 [Events example](examples/events/) exercises **all three** modes end-to-end over
 both transports: poll and push through the server, and webhook by running the
 `WebhookReceiver` as a loopback HTTP listener the server signs and POSTs to.

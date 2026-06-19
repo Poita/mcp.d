@@ -94,12 +94,11 @@ int main(string[] args) @safe
 			// Occurrences and control frames arrive on this stream's own handlers,
 			// already typed — no global onNotification, no manual subscriptionId
 			// routing.
-			auto stream = client.streamEvents("incident.created",
-				(EventOccurrence occ) @safe {
-					eventCount++;
-					if ("severity" in occ.data)
-						lastEventSeverity = occ.data["severity"].get!string;
-				});
+			auto stream = client.streamEvents("incident.created", (EventOccurrence occ) @safe {
+				eventCount++;
+				if ("severity" in occ.data)
+					lastEventSeverity = occ.data["severity"].get!string;
+			});
 			scope (exit)
 				stream.close();
 
@@ -155,28 +154,22 @@ int main(string[] args) @safe
 			scope (exit)
 				() @trusted { listener.stopListening(); }();
 
-			rx.register("placeholder", secret, (EventOccurrence occ) @safe {
-				delivered = true;
-				if ("severity" in occ.data)
-					deliveredSeverity = occ.data["severity"].get!string;
-			});
-
-			// Subscribe, pointing the callback at our receiver. The server returns
-			// the derived subscription id (carried in X-MCP-Subscription-Id on every
-			// delivery); re-register the receiver under it.
+			// One managed call: subscribe, register the receiver under the
+			// server-derived id, and (when the grant expires) keep it refreshed.
+			// `sub.cancel()` unsubscribes and deregisters the receiver.
 			SubscribeParams sp;
 			sp.name = "incident.created";
 			sp.arguments = Json(["severity": Json("P3")]);
 			sp.delivery = WebhookDelivery("http://127.0.0.1:" ~ to!string(receiverPort) ~ "/hooks",
 				secret);
-			auto sub = client.subscribeWebhookEvents(sp);
-			check(sub.id.length > 0, "events/subscribe should return a subscription id");
-			rx.unregister("placeholder");
-			rx.register(sub.id, secret, (EventOccurrence occ) @safe {
+			auto sub = client.subscribeWebhook(rx, sp, (EventOccurrence occ) @safe {
 				delivered = true;
 				if ("severity" in occ.data)
 					deliveredSeverity = occ.data["severity"].get!string;
 			});
+			scope (exit)
+				sub.cancel();
+			check(sub.active, "managed webhook subscription should be active");
 
 			client.callTool("raise_incident", Json(["severity": Json("P3")]));
 
@@ -189,8 +182,6 @@ int main(string[] args) @safe
 			}
 			check(delivered, "server should deliver the incident to the webhook receiver");
 			checkEq(deliveredSeverity, "P3", "delivered webhook incident severity");
-
-			client.unsubscribeWebhookEvents("incident.created", sp.arguments, sp.delivery.url);
 		}
 
 		bool http;
