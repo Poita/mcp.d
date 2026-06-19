@@ -40,10 +40,11 @@ public import mcp.server.task_runtime : TaskOptions, TaskRuntime;
 public import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher,
 	InProcessTaskDispatcher, SyncTaskDispatcher, TaskSuspended, TaskDetached;
 public import mcp.server.event_store;
-public import mcp.server.event_context : EventContext, EventResult, Event, EventBatch,
-	FetchContext, SubContext;
-public import mcp.server.events_runtime : EventsRuntime, EventsOptions, EventRegistration,
-	EventHandle, EventCheck, EventMatch, EventTransform, EventLifecycle, PushHandle, PushStream;
+public import mcp.server.event_context : EventContext, EventResult, Event,
+	EventBatch, FetchContext, SubContext;
+public import mcp.server.events_runtime : EventsRuntime, EventsOptions,
+	EventRegistration, EventHandle,
+	EventCheck, EventMatch, EventTransform, EventLifecycle, PushHandle, PushStream;
 public import mcp.server.context;
 public import mcp.server.server;
 public import mcp.server.settings;
@@ -52,6 +53,7 @@ public import mcp.client.runner;
 public import mcp.client.subscription;
 public import mcp.client.cache;
 public import mcp.client.events : WebhookReceiver, ReceiverResponse, generateWhsecSecret;
+public import mcp.client.event_subscription : EventSubscription;
 
 // --- Declarative UDA / reflection API ---
 public import mcp.api.attributes;

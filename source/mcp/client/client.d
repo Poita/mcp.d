@@ -21,6 +21,8 @@ import mcp.client.http_transport : HttpClientTransport, LegacyFallbackException;
 import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
 import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 import mcp.client.cache : CacheStore, InMemoryCacheStore, CacheKey, CacheEntry, noCache;
+import mcp.client.event_subscription : EventSubscription;
+import mcp.client.events : WebhookReceiver;
 import mcp.protocol.events;
 
 /// How a cacheable request verb interacts with the client's response cache.
@@ -1911,10 +1913,8 @@ final class McpClient : ClientProtocol
 	/// `params._meta["io.modelcontextprotocol/subscriptionId"]`; the client never
 	/// sees raw notifications. `cancel()`/`close()` ends the stream and drops its
 	/// handlers; a `terminated` control also drops them.
-	SubscriptionStream streamEvents(string name,
-			void delegate(EventOccurrence) @safe onEvent,
-			void delegate(EventControl) @safe onControl = null,
-			Json arguments = Json.emptyObject,
+	SubscriptionStream streamEvents(string name, void delegate(EventOccurrence) @safe onEvent,
+			void delegate(EventControl) @safe onControl = null, Json arguments = Json.emptyObject,
 			Nullable!string cursor = Nullable!string.init,
 			Nullable!long maxAgeMs = Nullable!long.init) @safe
 	{
@@ -1934,7 +1934,7 @@ final class McpClient : ClientProtocol
 		// Register before opening so an occurrence racing the open is routable.
 		eventStreams_[key] = EventStreamHandlers(onEvent, onControl);
 		auto stream = transport.openListen(message);
-		stream.addCleanup(() @safe nothrow { eventStreams_.remove(key); });
+		stream.addCleanup(() @safe nothrow{ eventStreams_.remove(key); });
 		return stream;
 	}
 
@@ -1957,6 +1957,252 @@ final class McpClient : ClientProtocol
 		p.url = url;
 		rpc("events/unsubscribe", p.toJson());
 	}
+
+	// --- Managed subscriptions (poll / push / webhook) ---------------------
+
+	/// Subscribe to an event type in POLL mode and have the SDK run the loop. Each
+	/// occurrence is delivered to `onEvent`; a detected gap arrives as an
+	/// `EventControl(gap)` on `onControl`. The SDK threads the cursor, paces by the
+	/// server-recommended `nextPollMs` (clamped to a sane floor), and drains
+	/// `hasMore` without waiting. Returns immediately; the loop runs on a background
+	/// task until the returned `EventSubscription` is cancelled. The handle's
+	/// `cursor()` tracks the latest watermark for crash-safe resume.
+	EventSubscription subscribePoll(PollParams p, void delegate(EventOccurrence) @safe onEvent,
+			void delegate(EventControl) @safe onControl = null) @safe
+	{
+		auto sub = new EventSubscription();
+		sub.advanceCursor(p.cursor);
+		spawnEventTask(() @safe { runPollLoop(sub, p, onEvent, onControl); });
+		return sub;
+	}
+
+	/// The poll loop body, factored out and seam-driven so it runs synchronously
+	/// under `unittest` without a live event loop (mirrors `awaitTask`). Exits when
+	/// the subscription is cancelled or the server reports the subscription gone.
+	package void runPollLoop(EventSubscription sub, PollParams p,
+			void delegate(EventOccurrence) @safe onEvent, void delegate(EventControl) @safe onControl) @safe
+	{
+		auto cur = p;
+		while (!sub.isCancelled())
+		{
+			cur.cursor = sub.cursor();
+			PollResult res;
+			try
+				res = PollResult.fromJson(rpc("events/poll", cur.toJson()));
+			catch (McpException e)
+			{
+				// A poll error ends the managed subscription; surface it as a typed
+				// control so the caller learns why rather than seeing silence.
+				if (onControl !is null)
+				{
+					EventControl c;
+					c.kind = EventControlKind.error;
+					EventError err;
+					err.code = e.code;
+					err.message = e.msg;
+					c.error = err;
+					onControl(c);
+				}
+				sub.markTerminated();
+				return;
+			}
+			foreach (occ; res.events)
+			{
+				if (sub.isCancelled())
+					return;
+				if (onEvent !is null)
+					onEvent(occ);
+			}
+			if (res.truncated && onControl !is null)
+			{
+				EventControl c;
+				c.kind = EventControlKind.gap;
+				c.cursor = res.cursor;
+				onControl(c);
+			}
+			sub.advanceCursor(res.cursor);
+			if (sub.isCancelled())
+				return;
+			if (res.hasMore)
+				continue; // more buffered now — re-poll without sleeping
+			eventPollSleep(res.nextPollMs);
+		}
+	}
+
+	/// Subscribe to an event type in PUSH mode with the unified handle. Wraps
+	/// `streamEvents`, tracking the watermark from each occurrence and control frame
+	/// and ending the handle on a `terminated` control. `cancel()` closes the
+	/// stream and deregisters its handlers.
+	///
+	/// Resume-on-disconnect is intentionally not attempted here: the transport
+	/// exposes no end-of-stream signal yet, so a dropped stream simply goes quiet.
+	/// A future transport `onEnd` hook would let this re-open with `cursor()`.
+	EventSubscription subscribeStream(StreamParams p, void delegate(EventOccurrence) @safe onEvent,
+			void delegate(EventControl) @safe onControl = null) @safe
+	{
+		auto sub = new EventSubscription();
+		sub.advanceCursor(p.cursor);
+		auto stream = streamEvents(p.name, (EventOccurrence o) @safe {
+			sub.advanceCursor(o.cursor);
+			if (onEvent !is null)
+				onEvent(o);
+		}, (EventControl c) @safe {
+			sub.advanceCursor(c.cursor);
+			if (c.kind == EventControlKind.terminated)
+				sub.markTerminated();
+			if (onControl !is null)
+				onControl(c);
+		}, p.arguments, p.cursor, p.maxAgeMs);
+		sub.onTeardown(() @safe nothrow{ stream.close(); });
+		return sub;
+	}
+
+	/// Subscribe in WEBHOOK mode with the receiver wired automatically. Subscribes,
+	/// registers `rx` under the server-derived subscription id (so deliveries route
+	/// to `onEvent`/`onControl` without the placeholder-then-re-register dance), and
+	/// — when the grant expires — runs a background loop that re-subscribes before
+	/// `refreshBefore` so deliveries never lapse silently. `cancel()` unsubscribes,
+	/// deregisters the receiver, and stops the refresh loop.
+	EventSubscription subscribeWebhook(WebhookReceiver rx, SubscribeParams p,
+			void delegate(EventOccurrence) @safe onEvent,
+			void delegate(EventControl) @safe onControl = null) @safe
+	{
+		auto sub = new EventSubscription();
+		auto res = subscribeWebhookEvents(p);
+		const id = res.id;
+		sub.advanceCursor(res.cursor);
+		rx.register(id, p.delivery.secret, onEvent, onControl);
+		sub.onTeardown(() @safe nothrow{
+			try
+			{
+				unsubscribeWebhookEvents(p.name, p.arguments, p.delivery.url);
+				rx.unregister(id);
+			}
+			catch (Exception)
+			{
+			}
+		});
+		// A null `refreshBefore` is a no-expiry grant — no refresh loop needed.
+		if (!res.refreshBefore.isNull)
+			spawnEventTask(() @safe { runWebhookRefreshLoop(sub, p, res); });
+		return sub;
+	}
+
+	/// The webhook TTL-refresh loop: sleeps until shortly before the current grant
+	/// expires, re-subscribes (refreshing the TTL and advancing the watermark), and
+	/// repeats until cancelled or the grant becomes no-expiry. Seam-driven for tests.
+	package void runWebhookRefreshLoop(EventSubscription sub, SubscribeParams p,
+			SubscribeResult first) @safe
+	{
+		auto cur = p;
+		auto res = first;
+		while (!sub.isCancelled())
+		{
+			webhookRefreshSleep(res);
+			if (sub.isCancelled())
+				return;
+			try
+			{
+				cur.cursor = sub.cursor();
+				res = subscribeWebhookEvents(cur);
+				sub.advanceCursor(res.cursor);
+				if (res.refreshBefore.isNull)
+					return; // grant is now no-expiry; stop refreshing
+			}
+			catch (Exception)
+			{
+				// Transient refresh failure: retry on the next cycle.
+			}
+		}
+	}
+
+	/// Spawn a managed-subscription background loop. A no-op under `unittest` (tests
+	/// drive the loop methods directly); in production it runs on a vibe task.
+	private void spawnEventTask(void delegate() @safe work) @safe
+	{
+		version (unittest)
+		{
+		}
+		else
+		{
+			import vibe.core.core : runTask;
+
+			() @trusted {
+				runTask(() nothrow{
+					try
+						work();
+					catch (Exception)
+					{
+					}
+				});
+			}();
+		}
+	}
+
+	/// Sleep between event polls, clamped to a floor so a misbehaving server can't
+	/// drive a hot loop. A test seam mirrors `taskPollSleep`.
+	private void eventPollSleep(Nullable!long nextPollMs) @safe
+	{
+		long ms = nextPollMs.isNull ? defaultEventPollMs : nextPollMs.get;
+		if (ms < minEventPollMs)
+			ms = minEventPollMs;
+		version (unittest)
+			if (onEventPollSleepForTest !is null)
+			{
+				onEventPollSleepForTest(ms.msecs);
+				return;
+			}
+		import vibe.core.core : sleep;
+
+		() @trusted { sleep(ms.msecs); }();
+	}
+
+	/// Sleep until shortly before `res.refreshBefore`. A test seam runs the loop
+	/// synchronously and lets a test end it.
+	private void webhookRefreshSleep(SubscribeResult res) @safe
+	{
+		version (unittest)
+			if (onWebhookRefreshSleepForTest !is null)
+			{
+				onWebhookRefreshSleepForTest(res);
+				return;
+			}
+		import vibe.core.core : sleep;
+
+		() @trusted { sleep(webhookRefreshDelay(res)); }();
+	}
+
+	/// How long to wait before refreshing a webhook grant: ~80% of the way to
+	/// `refreshBefore` (with a floor), or a default when the grant time is unparsable.
+	private Duration webhookRefreshDelay(SubscribeResult res) @safe
+	{
+		import std.datetime.systime : Clock, SysTime;
+
+		if (res.refreshBefore.isNull)
+			return defaultWebhookRefreshMs.msecs;
+		try
+		{
+			auto expiry = SysTime.fromISOExtString(res.refreshBefore.get);
+			auto now = () @trusted { return Clock.currTime(expiry.timezone); }();
+			auto remaining = expiry - now;
+			if (remaining <= Duration.zero)
+				return minWebhookRefreshMs.msecs;
+			auto wait = remaining * 8 / 10; // refresh with ~20% of the grant to spare
+			if (wait < minWebhookRefreshMs.msecs)
+				wait = minWebhookRefreshMs.msecs;
+			return wait;
+		}
+		catch (Exception)
+			return defaultWebhookRefreshMs.msecs;
+	}
+
+	private enum long minEventPollMs = 250;
+	private enum long defaultEventPollMs = 1000;
+	private enum long minWebhookRefreshMs = 1000;
+	private enum long defaultWebhookRefreshMs = 60_000;
+
+	version (unittest) package void delegate(Duration) @safe onEventPollSleepForTest;
+	version (unittest) package void delegate(SubscribeResult) @safe onWebhookRefreshSleepForTest;
 
 	/// Build the `subscriptions/listen` params, nesting the filter under
 	/// `params.notifications` exactly as the draft spec's `SubscriptionFilter`
@@ -2470,8 +2716,8 @@ final class McpClient : ClientProtocol
 	private bool dispatchEventStream(string method, Json params) @safe
 	{
 		if (method != eventsEventNotification && method != eventsActiveNotification
-			&& method != eventsHeartbeatNotification && method != eventsErrorNotification
-			&& method != eventsTerminatedNotification)
+				&& method != eventsHeartbeatNotification
+				&& method != eventsErrorNotification && method != eventsTerminatedNotification)
 			return false;
 		if (params.type != Json.Type.object || "_meta" !in params)
 			return false;
@@ -2509,7 +2755,8 @@ final class McpClient : ClientProtocol
 		if (v.type == Json.Type.string)
 			return v.get!string;
 		if (v.type == Json.Type.int_)
-			return v.get!long.to!string;
+			return v.get!long
+				.to!string;
 		return v.toString();
 	}
 
@@ -6342,12 +6589,12 @@ unittest  // concurrent push streams for one event type each get only their own 
 	int aCount, bCount;
 	string aSev, bSev;
 	// nextId starts at 1, so the first stream is subscriptionId 1, the second 2.
-	auto sa = c.streamEvents("incident.created", (EventOccurrence o) @safe {
+	cast(void) c.streamEvents("incident.created", (EventOccurrence o) @safe {
 		aCount++;
 		if ("severity" in o.data)
 			aSev = o.data["severity"].get!string;
 	});
-	auto sb = c.streamEvents("incident.created", (EventOccurrence o) @safe {
+	cast(void) c.streamEvents("incident.created", (EventOccurrence o) @safe {
 		bCount++;
 		if ("severity" in o.data)
 			bSev = o.data["severity"].get!string;
@@ -6356,8 +6603,10 @@ unittest  // concurrent push streams for one event type each get only their own 
 	static Json occ(string sev) @safe
 	{
 		return Json([
-			"eventId": Json("e"), "name": Json("incident.created"),
-			"timestamp": Json("t"), "data": Json(["severity": Json(sev)])
+			"eventId": Json("e"),
+			"name": Json("incident.created"),
+			"timestamp": Json("t"),
+			"data": Json(["severity": Json(sev)])
 		]);
 	}
 
@@ -6378,9 +6627,9 @@ unittest  // a push terminated control is delivered typed and drops the stream's
 	int events;
 	EventControl gotCtrl;
 	bool gotControl;
-	auto s = c.streamEvents("incident.created",
-		(EventOccurrence o) @safe { events++; },
-		(EventControl ctrl) @safe { gotCtrl = ctrl; gotControl = true; });
+	cast(void) c.streamEvents("incident.created", (EventOccurrence o) @safe {
+		events++;
+	}, (EventControl ctrl) @safe { gotCtrl = ctrl; gotControl = true; });
 
 	c.dispatchInbound(Message(makeNotification(eventsTerminatedNotification,
 			withSubscriptionId(Json(["error": Json(["code": Json(-32012)])]), Json(1)))));
@@ -6391,9 +6640,11 @@ unittest  // a push terminated control is delivered typed and drops the stream's
 	// Handlers are gone after termination: a later occurrence for sub 1 is dropped.
 	c.dispatchInbound(Message(makeNotification(eventsEventNotification,
 			withSubscriptionId(Json([
-				"eventId": Json("e"), "name": Json("incident.created"),
-				"timestamp": Json("t"), "data": Json.emptyObject
-			]), Json(1)))));
+				"eventId": Json("e"),
+				"name": Json("incident.created"),
+				"timestamp": Json("t"),
+				"data": Json.emptyObject
+	]), Json(1)))));
 	assert(events == 0);
 }
 
@@ -6403,13 +6654,190 @@ unittest  // cancelling a stream deregisters its handlers (later occurrences ign
 	auto c = new McpClient(transport);
 
 	int events;
-	auto s = c.streamEvents("incident.created", (EventOccurrence o) @safe { events++; });
+	auto s = c.streamEvents("incident.created", (EventOccurrence o) @safe {
+		events++;
+	});
 	s.close();
 
 	c.dispatchInbound(Message(makeNotification(eventsEventNotification,
 			withSubscriptionId(Json([
-				"eventId": Json("e"), "name": Json("incident.created"),
-				"timestamp": Json("t"), "data": Json.emptyObject
-			]), Json(1)))));
+				"eventId": Json("e"),
+				"name": Json("incident.created"),
+				"timestamp": Json("t"),
+				"data": Json.emptyObject
+	]), Json(1)))));
 	assert(events == 0);
+}
+
+version (unittest) private enum managedTestWhsec = "whsec_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+unittest  // subscribePoll's loop: delivers events, advances the cursor, drains hasMore, signals a gap
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "events/poll");
+		polls++;
+		PollResult r;
+		if (polls == 1)
+		{
+			r.events ~= EventOccurrence("e1", "incident.created", "t");
+			r.cursor = "c1";
+			r.hasMore = true; // a second poll must follow immediately, no sleep
+		}
+		else
+		{
+			r.events ~= EventOccurrence("e2", "incident.created", "t");
+			r.cursor = "c2";
+			r.truncated = true; // a gap control must be delivered
+		}
+		return r.toJson();
+	};
+
+	EventOccurrence[] got;
+	EventControl[] ctrls;
+	int sleeps;
+	auto sub = new EventSubscription();
+	c.onEventPollSleepForTest = (Duration d) @safe { sleeps++; sub.cancel(); };
+	c.runPollLoop(sub, PollParams("incident.created"), (EventOccurrence o) @safe {
+		got ~= o;
+	}, (EventControl ctrl) @safe { ctrls ~= ctrl; });
+
+	assert(polls == 2); // hasMore drained without a sleep between the two polls
+	assert(sleeps == 1); // slept once (after the non-hasMore poll), which cancelled
+	assert(got.length == 2 && got[0].eventId == "e1" && got[1].eventId == "e2");
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.gap);
+	assert(sub.cursor.get == "c2");
+}
+
+unittest  // subscribePoll surfaces a poll error as a typed control and ends the subscription
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.onRpcForTest = (string method, Json params) @safe {
+		throw new McpException(ErrorCode.invalidRequest, "boom");
+	};
+	EventControl[] ctrls;
+	auto sub = new EventSubscription();
+	c.runPollLoop(sub, PollParams("incident.created"), null, (EventControl ctrl) @safe {
+		ctrls ~= ctrl;
+	});
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
+	assert(ctrls[0].error.get.code == ErrorCode.invalidRequest);
+	assert(!sub.active);
+}
+
+unittest  // subscribeStream tracks the cursor and ends the handle on a terminated control
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	int events;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
+		events++;
+	});
+
+	c.dispatchInbound(Message(makeNotification(eventsEventNotification,
+			withSubscriptionId(Json([
+				"eventId": Json("e"),
+				"name": Json("incident.created"),
+				"timestamp": Json("t"),
+				"data": Json.emptyObject,
+				"cursor": Json("c9")
+	]), Json(1)))));
+	assert(events == 1);
+	assert(sub.cursor.get == "c9");
+	assert(sub.active);
+
+	c.dispatchInbound(Message(makeNotification(eventsTerminatedNotification,
+			withSubscriptionId(Json(["error": Json(["code": Json(-32012)])]), Json(1)))));
+	assert(!sub.active);
+}
+
+unittest  // cancelling a managed stream stops delivery
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	int events;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
+		events++;
+	});
+	sub.cancel();
+	assert(!sub.active);
+	c.dispatchInbound(Message(makeNotification(eventsEventNotification,
+			withSubscriptionId(Json([
+				"eventId": Json("e"),
+				"name": Json("incident.created"),
+				"timestamp": Json("t"),
+				"data": Json.emptyObject
+	]), Json(1)))));
+	assert(events == 0);
+}
+
+unittest  // subscribeWebhook registers the receiver under the server id and tears it down on cancel
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	int subs, unsubs;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "events/subscribe")
+		{
+			subs++;
+			SubscribeResult r;
+			r.id = "sub_x"; // null refreshBefore => no-expiry grant, no refresh loop
+			return r.toJson();
+		}
+		if (method == "events/unsubscribe")
+		{
+			unsubs++;
+			return Json.emptyObject;
+		}
+		return Json.emptyObject;
+	};
+
+	auto rx = new WebhookReceiver();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+	auto sub = c.subscribeWebhook(rx, sp, (EventOccurrence o) @safe {});
+	assert(subs == 1);
+
+	// Registered under "sub_x": a delivery for it is verified (400, bad signature),
+	// not rejected as an unknown subscription (503).
+	string[string] known;
+	known["x-mcp-subscription-id"] = "sub_x";
+	assert(rx.processDelivery("{}", known).status != 503);
+	string[string] unknown;
+	unknown["x-mcp-subscription-id"] = "nope";
+	assert(rx.processDelivery("{}", unknown).status == 503);
+
+	sub.cancel();
+	assert(unsubs == 1);
+	assert(rx.processDelivery("{}", known).status == 503); // deregistered
+}
+
+unittest  // the webhook refresh loop re-subscribes before the grant expires
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	int subs;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "events/subscribe")
+		{
+			subs++;
+			SubscribeResult r;
+			r.id = "sub_x";
+			r.refreshBefore = "2999-01-01T00:00:00Z";
+			return r.toJson();
+		}
+		return Json.emptyObject;
+	};
+
+	auto sub = new EventSubscription();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+	SubscribeResult first;
+	first.id = "sub_x";
+	first.refreshBefore = "2999-01-01T00:00:00Z";
+	c.onWebhookRefreshSleepForTest = (SubscribeResult r) @safe {
+		if (subs >= 1)
+			sub.cancel(); // end the loop after one refresh
+	};
+	c.runWebhookRefreshLoop(sub, sp, first);
+	assert(subs == 1);
 }
