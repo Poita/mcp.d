@@ -94,6 +94,13 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			// normal concurrent request/reply path.
 			if (server.tryServeStdioListen(m, &sink))
 				return;
+			// Draft `events/stream` (push) shares the single stdout channel like
+			// listen: the server opens the subscription, writes the leading
+			// `notifications/events/active`, and routes subsequent
+			// `notifications/events/*` to the same sink (demuxed by the request id
+			// in `_meta`). A background ticker advances poll-driven types + heartbeats.
+			if (server.tryServeStdioEventsStream(m, &sink))
+				return;
 			// Dispatch the request in its own task so a blocking/long-running handler
 			// (server->client request, cancellation poll loop) does not stall the
 			// read loop. The handler's notifications + reply ride `channel.send`.
@@ -155,7 +162,31 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	}
 
 	channel = new DuplexChannel(readLine, writeLine, &onInbound, &onInboundBatch);
+
+	// Background ticker for draft `events/stream` push: poll-driven event types and
+	// per-stream heartbeats are advanced here (emit-only types deliver live via the
+	// sink). Runs only while events are enabled; stops when the read loop ends.
+	bool tickerRunning = server.hasStdioEventStreams();
+	if (tickerRunning)
+		runTask(() nothrow{
+			import vibe.core.core : sleep;
+			import core.time : seconds;
+			import mcp.server.event_store : nowUnixMs;
+
+			while (tickerRunning)
+			{
+				try
+				{
+					sleep(1.seconds);
+					server.tickStdioEventStreams(nowUnixMs());
+				}
+				catch (Exception)
+					break;
+			}
+		});
+
 	channel.runReadLoop();
+	tickerRunning = false;
 
 	// The read loop has ended at stdin EOF. failPending (inside runReadLoop) already
 	// released any handler blocked in a server->client request, but a handler that

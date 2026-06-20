@@ -12,12 +12,18 @@ import mcp.protocol.jsonhelpers : getOr, tryGet;
 /// map; an empty settings object indicates support.
 enum string tasksExtensionKey = "io.modelcontextprotocol/tasks";
 
+/// The Extension Negotiation identifier under which event support is declared
+/// (the MCP Events extension). Carried in the draft `extensions` capability map;
+/// the settings object MAY carry `{listChanged, delivery}` describing the
+/// supported delivery modes.
+enum string eventsExtensionKey = "io.modelcontextprotocol/events";
+
 /// The minimum protocol version at which an Extension Negotiation identifier
 /// may be advertised in the `extensions` capability map. Apps
 /// (`io.modelcontextprotocol/ui`) and Skills (`io.modelcontextprotocol/skills`)
-/// negotiate from 2025-11-25; Tasks (SEP-2663) is draft-only. An identifier with
-/// no declared floor defaults to draft-only — the conservative choice for an
-/// extension whose version policy this SDK does not yet know.
+/// negotiate from 2025-11-25; Tasks (SEP-2663) and Events are draft-only. An
+/// identifier with no declared floor defaults to draft-only — the conservative
+/// choice for an extension whose version policy this SDK does not yet know.
 ProtocolVersion extensionMinVersion(string identifier) pure nothrow @safe @nogc
 {
 	switch (identifier)
@@ -26,6 +32,7 @@ ProtocolVersion extensionMinVersion(string identifier) pure nothrow @safe @nogc
 	case "io.modelcontextprotocol/skills": // Skills (SEP-2640)
 		return ProtocolVersion.v2025_11_25;
 	case tasksExtensionKey: // Tasks (SEP-2663) — draft only
+	case eventsExtensionKey: // Events — draft only
 		return ProtocolVersion.modern;
 	default:
 		return ProtocolVersion.modern;

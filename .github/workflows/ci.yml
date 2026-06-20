@@ -103,6 +103,31 @@ jobs:
       - name: Test
         run: dub test
 
+  ed25519:
+    name: ed25519 webhook signing (library-ed25519)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install D compiler
+        uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-latest
+
+      # The library-ed25519 build configuration wires the asymmetric (v1a)
+      # webhook signer through the standardwebhooks:ed25519 subpackage, which
+      # links the system libsodium. The default build/test stays libsodium-free,
+      # so the ed25519 path needs its own job to be exercised in CI.
+      - name: Install libsodium
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev
+
+      - name: Build (library-ed25519)
+        run: dub build -c library-ed25519
+
+      - name: Test (library-ed25519)
+        run: dub test --config=library-ed25519
+
   coverage:
     name: coverage to Codecov
     runs-on: ubuntu-latest

@@ -94,6 +94,12 @@ This always pulls the latest release (see the Dub version badge above). Then
   `callTool` transparently drives the full MRTR (SEP-2322) round-trip loop via an internal
   `callToolLoop`, satisfying each `InputRequest` and resubmitting until a completed result is
   returned (capped at 16 rounds to guard against misbehaving servers).
+- ✅ **MCP Events extension** (`io.modelcontextprotocol/events`, draft-only) — the
+  `@event` UDA, `events/list`, and all three delivery modes (poll/push/webhook)
+  with cursors, the emit ring buffer, poll-lease lifecycle hooks, and the full
+  webhook-security surface (Standard Webhooks signing + rotation, SSRF hardening,
+  endpoint verification, bounded retry, `deliveryStatus`, optional `v1a,` server
+  identity). See [MCP Events](#mcp-events-triggers).
 
 - ✅ **Client ID Metadata Documents (SEP-991)** on both sides — the spec-recommended
   registration mechanism now that DCR is deprecated. The **client** advertises and uses an
@@ -218,7 +224,18 @@ an SSE response and the server streams `notifications/resources/updated` /
 `list_changed` down that same response, filtered by the stream's own subscription
 set — exactly like a tool call emitting progress on its own SSE stream. (Whether a
 mutation originating on another node reaches the stream is the deployment's
-out-of-band concern, not the SDK's.)
+out-of-band concern, not the SDK's.) The Events extension's `events/poll` (per
+request) and `events/stream` (a self-contained push response) work in stateless
+mode for the same reason; webhook subscription state is held mount-globally by the
+`EventsRuntime` — the same model that lets the task store work under
+`ServerMode.stateless` — and is keyed on the authenticated principal. Webhook
+delivery is decoupled from `publish` via a pluggable `DeliveryQueue`
+(`EventsOptions.deliveryQueue`): `publish` enqueues a job per matching
+subscription, and a worker leases/delivers/acks. The in-memory default is
+single-node; injecting a shared, durable queue (Redis/SQS/DB) plus a
+`SubscriptionStore` and running `EventsRuntime.startDeliveryWorker` on each node
+makes webhook delivery node-agnostic (any node delivers; a crashed node's leased
+job is re-leased) — mirroring the `TaskStore`/`TaskDispatcher` split.
 
 > **Guidance:** if your tools initiate elicitation/sampling/roots, or use the
 > 2025-era `resources/subscribe` push over HTTP, construct the server with
@@ -411,7 +428,7 @@ re-authenticated session never reads the previous identity's `private` results.
 
 ## Examples
 
-The repository ships thirteen runnable, self-verifying server/client pairs in
+The repository ships fourteen runnable, self-verifying server/client pairs in
 [`examples/`](examples/). Each `client.d` is an end-to-end test that asserts the
 matching server's behaviour, and CI runs every pair over **both** stdio and
 Streamable HTTP.
@@ -433,6 +450,7 @@ Streamable HTTP.
 | Apps | MCP Apps extension: `@ui` tool link + a `ui://` HTML resource | [server](examples/apps/server.d) | [client](examples/apps/client.d) |
 | Tasks | MCP Tasks extension (SEP-2663): `@task` async tasks with progress, cancellation, and `input_required` | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
 | Skills | MCP Skills extension (SEP-2640): `@skill` Agent Skills served as resources + `skill://index.json` discovery | [server](examples/skills/server.d) | [client](examples/skills/client.d) |
+| Events | MCP Events extension: `@event` types delivered over poll, push, **and** server-signed webhook (to a client `WebhookReceiver`) | [server](examples/events/server.d) | [client](examples/events/client.d) |
 
 Annotate plain typed D functions with `@tool` / `@resource` / `@prompt` and register
 a whole module with `registerModule!(my.module)(server)` — the input schema (from
@@ -571,6 +589,113 @@ else
 > this extension. It is **intentionally not implemented** — those methods answer
 > `-32601` and no `tasks` capability is advertised. Only the SEP-2663 extension
 > above is supported, and only under the draft protocol version.
+
+## MCP Events (triggers)
+
+The **MCP Events** extension (`io.modelcontextprotocol/events`, a draft-only
+proposal) lets a client subscribe to things happening upstream — a Slack message,
+a GitHub push, a PagerDuty incident — and have the agent react when they occur. A
+server declares event types; a client subscribes with `(name, arguments)` and
+receives `EventOccurrence` records over one of three delivery modes, advertised
+per type: **poll** (`events/poll`), **push** (`events/stream`), and **webhook**
+(`events/subscribe`, signed per [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks)).
+Event types are **strongly typed** — a subscription-argument type `A` (the
+filter, → `inputSchema`) and a payload type `P` (→ `payloadSchema`):
+
+```d
+struct IncidentArgs { string severity; }              // filter → inputSchema
+struct Incident     { string id; string severity; }   // payload → payloadSchema
+
+auto rt = server.enableEvents();
+
+// A push source: define the typed type and publish from wherever events arrive.
+auto incidents = rt.define!(IncidentArgs, Incident)("incident.created",
+        "Fires when a new incident is raised")
+    .match((IncidentArgs a, Incident i) @safe => a.severity.length == 0 || i.severity == a.severity);
+
+// ... when an incident occurs (an upstream webhook handler, a domain event):
+incidents.publish(Incident("INC-1", "P1"));   // fans out to streams/poll + the webhook queue
+```
+
+`publish(P)` is the single push verb; its reach is the scope of the injected
+registries (stream/poll are always node-local; webhook is as wide as the
+`SubscriptionStore`). The handle also carries typed `onSubscribe`/`onUnsubscribe`
+lifecycle hooks (`SubContext.runUntilUnsubscribe` hosts an author-owned live source
+loop) and `pollInterval`. The hooks fire **exactly once per `(principal, name,
+arguments)` per node**: the lifecycle refcount is node-local, so on a multi-node
+deployment (where webhook subscriptions are shared via the `SubscriptionStore`) the
+hooks fire once per node that first/last sees the key, not once cluster-wide — write
+them to be idempotent across nodes. A cluster-coherent shared-store atomic refcount
+is future work.
+
+A **pull** source (a cursor-addressable upstream — Gmail history, Kafka offsets)
+supplies a fetch handler instead, declared with the `@event` UDA — `EventBatch!P
+fetch(A args, FetchContext ctx)` — which the SDK calls to serve poll directly and
+stream/webhook via its loop:
+
+```d
+@event("email.received", "A new email arrives")
+EventBatch!Email checkEmail(EmailArgs args, FetchContext ctx) @safe
+{
+    if (ctx.isBootstrap) return EventBatch!Email.empty(currentCursor());
+    return EventBatch!Email.of(fetchSince(ctx.cursor, args), newCursor());
+}
+```
+
+The dynamic `server.registerEventType(EventRegistration(...))` path (raw `Json`)
+remains for runtime-defined types.
+
+On the **client**, `client.eventsSupported()` reports the negotiated extension and
+`listEvents()` enumerates types. For consuming a subscription, prefer the **managed
+layer**: `subscribePoll(PollParams, onEvent, onControl)`, `subscribeStream(StreamParams, …)`,
+and `subscribeWebhook(WebhookReceiver, SubscribeParams, …)` each return one
+mode-neutral `EventSubscription` handle — the SDK runs the poll loop (pacing by
+`nextPollMs`, threading the cursor, signalling gaps), demuxes the push stream, or
+keeps the webhook grant refreshed before it lapses; `sub.cursor()` exposes the live
+watermark for resume and `sub.cancel()` tears the subscription down. The low-level
+`pollEvents(...)`/`streamEvents(...)`/`subscribeWebhookEvents(...)` round-trips
+remain for callers who want to drive the loop themselves. A `WebhookReceiver`
+verifies inbound Standard Webhooks deliveries, answers the verification challenge,
+deduplicates per subscription, and routes occurrences — usable as the forward proxy
+a `delivery.url` points at; `generateWhsecSecret()` mints the client-supplied
+`whsec_` signing secret. The runnable
+[Events example](examples/events/) exercises **all three** modes end-to-end over
+both transports: poll and push through the server, and webhook by running the
+`WebhookReceiver` as a loopback HTTP listener the server signs and POSTs to.
+
+**Webhook security** is implemented in full: `https`-only callback URLs;
+delivery-time SSRF hardening (the resolved IP is validated against the IANA
+special-purpose registries and pinned, with no redirect following); per-delivery
+HMAC (`v1,`) signing with the client-supplied secret and a secret-rotation
+dual-signing grace window; mandatory **endpoint verification** before delivery
+(challenge handshake, server allowlist, or out-of-band) cached per
+`(principal, url)`; bounded retry with exponential backoff (`410`/`413` are
+non-retryable) and a safe-to-persist watermark cursor; and `deliveryStatus`
+surfaced on refresh. Optional **server identity** asymmetric signing (`v1a,`,
+ed25519) is an **opt-in build**: the default library is OpenSSL-only, and the
+`library-ed25519` dub configuration adds `standardwebhooks:ed25519` (which links
+**libsodium**) and defines `version(MCPWebhookEd25519)`. Built that way, setting
+`EventsOptions.webhookSigningKey` to a `whsk_` key auto-wires the signer
+(`AsymmetricWebhook`) and publishes the public key as a JWKS; consumers select it
+with `"subConfigurations": { "mcp-d": "library-ed25519" }` (or supply their own
+`EventsOptions.v1aSigner`). Its discovery mechanism is contingent on the
+still-draft SEP-2127 (server cards).
+
+`events/subscribe`/`events/unsubscribe` require an authenticated principal (the
+spec forbids webhook on unauthenticated servers); poll and push do not. A
+single-tenant or dev server that authenticates outside the SDK (or not at all)
+can set `EventsOptions.assumePrincipal` to treat callers as one fixed principal,
+and `EventsOptions.allowPrivateCallbackHosts` additionally relaxes the SSRF host
+check and permits a plain-`http` loopback callback — both are how the Events
+example drives webhook delivery to its local receiver. Production multi-tenant
+servers use real auth so the subscription key isolates tenants, and `https`-only
+callbacks.
+
+> **Status: draft-only.** Like Tasks, the Events extension is confined to the
+> draft protocol version — every `events/*` method answers `-32601` on a
+> pre-draft session, and the capability is advertised only under draft. This is a
+> design-sketch proposal ([experimental-ext-triggers-events](https://github.com/modelcontextprotocol/experimental-ext-triggers-events));
+> the wire surface may change as it moves through WG review.
 
 ## Skills (SEP-2640)
 
