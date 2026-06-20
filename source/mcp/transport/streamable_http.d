@@ -2213,6 +2213,19 @@ private bool isLoopbackHostname(string h) @safe
 	return h == "localhost" || h == "127.0.0.1" || h == "::1";
 }
 
+/// Whether the server is bound to a public (non-loopback) address while accepting
+/// no extra Host values — the configuration in which the DNS-rebinding guard
+/// rejects every external request with 403. Used to warn at startup.
+private bool publicBindWithoutAllowlist(const string[] bindAddresses, const string[] allowedHosts) @safe
+{
+	if (allowedHosts.length)
+		return false;
+	foreach (a; bindAddresses)
+		if (!isLoopbackHostname(a))
+			return true;
+	return false;
+}
+
 /// Translate the transport-level `opts` into a vibe.d `HTTPServerSettings`:
 /// listen address, plus access logging when `opts.accessLog` is set (to
 /// `opts.accessLogFile` if given, otherwise the console). Access logging stays
@@ -2238,6 +2251,14 @@ void runStreamableHttp(McpServer server, ushort port,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
 	import vibe.core.core : runEventLoop, lowerPrivileges;
+	import vibe.core.log : logWarn;
+	import std.array : join;
+
+	if (publicBindWithoutAllowlist(opts.bindAddresses, opts.allowedHosts))
+		logWarn("Streamable HTTP bound to a public address (%s) with an empty "
+				~ "allowedHosts: the DNS-rebinding guard will reject external requests "
+				~ "with 403. Set StreamableHttpOptions.allowedHosts to your public host(s).",
+				opts.bindAddresses.join(", "));
 
 	auto router = new URLRouter;
 	mountMcp(router, server, opts);
@@ -2267,6 +2288,20 @@ void runStreamableHttp(McpServer server, ushort port, string host) @safe
 void runStreamableHttp(McpServer server, StreamableHttpOptions opts) @safe
 {
 	runStreamableHttp(server, opts.port, opts);
+}
+
+unittest  // a public bind with no allowedHosts is flagged (would 403 external hosts)
+{
+	// 0.0.0.0 / :: are wildcard (public) binds; with an empty allowlist the
+	// DNS-rebinding guard rejects every non-loopback Host.
+	assert(publicBindWithoutAllowlist(["0.0.0.0"], []));
+	assert(publicBindWithoutAllowlist(["::"], []));
+	assert(publicBindWithoutAllowlist(["10.0.0.5", "127.0.0.1"], []));
+	// Loopback-only binds are fine without an allowlist.
+	assert(!publicBindWithoutAllowlist(["127.0.0.1"], []));
+	assert(!publicBindWithoutAllowlist(["localhost"], []));
+	// An allowlist resolves the public-bind case.
+	assert(!publicBindWithoutAllowlist(["0.0.0.0"], ["myapp.fly.dev"]));
 }
 
 unittest  // access logging is off by default
