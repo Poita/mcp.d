@@ -777,8 +777,7 @@ bool controlFromPushNotification(string method, Json params, out EventControl c)
 /// surfaced to the application (e.g. `verification`, handled internally).
 bool controlFromWebhookEnvelope(Json env, out EventControl c) @safe
 {
-	if (env.type != Json.Type.object || "type" !in env
-		|| env["type"].type != Json.Type.string)
+	if (env.type != Json.Type.object || "type" !in env || env["type"].type != Json.Type.string)
 		return false;
 	switch (env["type"].get!string)
 	{
@@ -1128,7 +1127,8 @@ unittest  // withSubscriptionId merges into an existing _meta and supports strin
 unittest  // EventError round-trips code/message/data and tolerates a non-object
 {
 	auto err = EventError.fromJson(Json([
-		"code": Json(-32012), "message": Json("revoked"),
+		"code": Json(-32012),
+		"message": Json("revoked"),
 		"data": Json(["reason": Json("challenge_failed")])
 	]));
 	assert(err.code == -32012);
@@ -1141,7 +1141,7 @@ unittest  // a push `active` frame parses to active, carrying its cursor
 {
 	EventControl c;
 	assert(controlFromPushNotification(eventsActiveNotification,
-		activeParams(nullable("cur-1"), false), c));
+			activeParams(nullable("cur-1"), false), c));
 	assert(c.kind == EventControlKind.active);
 	assert(c.cursor.get == "cur-1");
 }
@@ -1150,7 +1150,7 @@ unittest  // a push `active` with truncated:true is normalized to gap
 {
 	EventControl c;
 	assert(controlFromPushNotification(eventsActiveNotification,
-		activeParams(nullable("cur-2"), true), c));
+			activeParams(nullable("cur-2"), true), c));
 	assert(c.kind == EventControlKind.gap);
 	assert(c.cursor.get == "cur-2");
 }
@@ -1158,7 +1158,9 @@ unittest  // a push `active` with truncated:true is normalized to gap
 unittest  // a push `terminated` frame carries its typed error
 {
 	EventControl c;
-	auto params = Json(["error": Json(["code": Json(-32012), "message": Json("gone")])]);
+	auto params = Json([
+		"error": Json(["code": Json(-32012), "message": Json("gone")])
+	]);
 	assert(controlFromPushNotification(eventsTerminatedNotification, params, c));
 	assert(c.kind == EventControlKind.terminated);
 	assert(c.error.get.code == -32012);
@@ -1182,7 +1184,9 @@ unittest  // a webhook gap envelope parses to a typed gap with its cursor
 unittest  // a webhook terminated envelope carries its typed error
 {
 	EventControl c;
-	assert(controlFromWebhookEnvelope(terminatedEnvelope(Json(["code": Json(-32012)])), c));
+	assert(controlFromWebhookEnvelope(terminatedEnvelope(Json([
+		"code": Json(-32012)
+	])), c));
 	assert(c.kind == EventControlKind.terminated);
 	assert(c.error.get.code == -32012);
 }

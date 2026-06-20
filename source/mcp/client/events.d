@@ -376,7 +376,7 @@ unittest  // a terminated control envelope is routed to onControl
 		gotControl = ctrl;
 		got = true;
 	});
-	const
+	const 
 	body = terminatedEnvelope(Json(["code": Json(-32012)])).toString();
 	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "msg_term",
 			1700, body, "sub_1", null);
