@@ -65,7 +65,7 @@ Or add it manually to your `dub.json`:
 
 ```json
 "dependencies": {
-    "mcp-d": "~>0.2"
+    "mcp-d": "~>0.3"
 }
 ```
 
@@ -119,7 +119,7 @@ CIMD consent screen (a spec `SHOULD`).
 
 ## Requirements
 
-- A D toolchain with frontend **2.100+** (DMD 2.100+, or LDC 1.30+).
+- A D toolchain with frontend **2.111+** (DMD 2.111+, or LDC 1.41+).
 - **OpenSSL 3.x** must be installed on the system. The `openssl` / vibe-d:tls
   dependency links against it for TLS (HTTPS transport, OAuth 2.1).
   - **Ubuntu/Debian:** ships with OpenSSL 3.x (`apt install libssl-dev` if headers

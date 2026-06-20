@@ -44,6 +44,11 @@ jobs:
       - name: D-Scanner static analysis
         run: ./scripts/dscanner-lint.sh
 
+      # Fail if the README's toolchain requirement drifts from dub.json's
+      # toolchainRequirements (the single source of truth for the DMD/LDC floor).
+      - name: Check README toolchain versions
+        run: ./scripts/check-readme-versions.sh
+
   build-and-test:
     name: ${{ matrix.compiler }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
