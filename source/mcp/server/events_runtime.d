@@ -97,6 +97,21 @@ final class EventHandle(A, P)
 		rt_.emit(occ);
 	}
 
+	/// Publish a typed payload carrying an upstream identity: `eventId` (used for
+	/// dedup) and the occurrence `timestamp`. Use when re-publishing an event that
+	/// already has its own id/time — a bridge from Slack/GitHub/an SSE feed — where
+	/// the no-arg `publish` would otherwise mint a fresh id and stamp the current
+	/// time. An empty `timestamp` is filled with the current time by the runtime.
+	void publish(P payload, string eventId, string timestamp = "") @safe
+	{
+		EventOccurrence occ;
+		occ.name = reg_.descriptor.name;
+		occ.data = serializePayload(payload);
+		occ.eventId = eventId;
+		occ.timestamp = timestamp;
+		rt_.emit(occ);
+	}
+
 	/// Attach the pull/fetch handler — drain events since `ctx.cursor` and return a
 	/// typed batch. Backs poll directly and stream/webhook via the runtime's loop.
 	EventHandle onFetch(EventBatch!P delegate(A args, scope FetchContext ctx) @safe fetch) @safe
@@ -150,12 +165,14 @@ final class EventHandle(A, P)
 		return this;
 	}
 
-	/// Build an `EventOccurrence` carrying a typed payload, for use inside a
-	/// `transform` shaper. The runtime fills the identity/routing fields the shaper
-	/// leaves unset.
+	/// Build an `EventOccurrence` carrying a typed payload, stamped with this type's
+	/// name so it is routable by `emit`. Use inside a `transform` shaper, or to set
+	/// identity fields (`eventId`/`timestamp`) before `publish`ing the occurrence.
+	/// The runtime fills any identity/routing fields left unset.
 	EventOccurrence fromPayload(P payload) @safe
 	{
 		EventOccurrence o;
+		o.name = reg_.descriptor.name;
 		o.data = serializePayload(payload);
 		return o;
 	}
@@ -2095,6 +2112,28 @@ unittest  // typed publish marshals the payload and fans out to a push stream
 	ev.publish(DemoPayload("INC-1", "P1"));
 	assert(delivered["data"]["id"].get!string == "INC-1");
 	assert(delivered["data"]["severity"].get!string == "P1");
+}
+
+unittest  // typed publish(payload, id, timestamp) preserves an upstream identity
+{
+	auto rt = testRuntime();
+	auto ev = rt.define!(DemoArgs, DemoPayload)("incident.created");
+	Json delivered;
+	rt.openPushStream("incident.created", Json.emptyObject, "u", Json(1),
+			(string m, Json params) @safe { delivered = params; });
+	ev.publish(DemoPayload("INC-1", "P1"), "upstream-42", "2026-02-19T15:30:00Z");
+	assert(delivered["eventId"].get!string == "upstream-42");
+	assert(delivered["timestamp"].get!string == "2026-02-19T15:30:00Z");
+	assert(delivered["data"]["id"].get!string == "INC-1");
+}
+
+unittest  // fromPayload stamps the event name so the occurrence is routable
+{
+	auto rt = testRuntime();
+	auto ev = rt.define!(DemoArgs, DemoPayload)("incident.created");
+	auto occ = ev.fromPayload(DemoPayload("INC-1", "P1"));
+	assert(occ.name == "incident.created");
+	assert(occ.data["id"].get!string == "INC-1");
 }
 
 unittest  // typed onFetch backs events/poll with strongly-typed events
