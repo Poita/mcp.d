@@ -61,15 +61,8 @@ Add mcp.d to your project with dub:
 dub add mcp-d
 ```
 
-Or add it manually to your `dub.json`:
-
-```json
-"dependencies": {
-    "mcp-d": "~>0.3"
-}
-```
-
-Then `import mcp;` in your source files.
+This always pulls the latest release (see the Dub version badge above). Then
+`import mcp;` in your source files.
 
 ## Goals
 
