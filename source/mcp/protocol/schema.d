@@ -26,8 +26,17 @@ Json jsonSchemaOf(T)()
 	import jsonschema : generate = jsonSchemaOf, GeneratorSettings;
 	import jsonschema.vibejson : nodeToVibeJson;
 
-	enum GeneratorSettings settings = {inlineSubschemas: true};
-	return nodeToVibeJson(generate!(T, settings)());
+	// A `Json` member is arbitrary, unconstrained JSON (e.g. a pass-through event
+	// payload or tool field whose shape is the upstream system's, not ours). The
+	// generator can't reflect vibe's `Json`, so map it to the empty schema, which
+	// validates every JSON value.
+	static if (is(T == Json))
+		return Json.emptyObject;
+	else
+	{
+		enum GeneratorSettings settings = {inlineSubschemas: true};
+		return nodeToVibeJson(generate!(T, settings)());
+	}
 }
 
 /// True when `F` is a scalar permitted as an elicitation form field: a
@@ -144,6 +153,18 @@ unittest  // jsonSchemaOf maps a scalar to its primitive type
 {
 	auto s = jsonSchemaOf!int;
 	assert(s["type"].get!string == "integer");
+}
+
+unittest  // jsonSchemaOf!Json is a permissive schema accepting any JSON value
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = jsonSchemaOf!Json;
+	// An empty schema imposes no constraint — any JSON value conforms.
+	assert(s.type == Json.Type.object);
+	assert(validateAgainstSchema(Json("anything"), s) == "");
+	assert(validateAgainstSchema(Json(42), s) == "");
+	assert(validateAgainstSchema(parseJsonString(`{"a": 1}`), s) == "");
 }
 
 unittest  // jsonSchemaOf maps a struct to an object with properties and required
