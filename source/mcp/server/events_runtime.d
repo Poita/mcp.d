@@ -202,6 +202,23 @@ final class EventHandle(A, P)
 		return this;
 	}
 
+	/// Restrict delivery: opt this type out of the given modes. The advertised
+	/// `delivery` list becomes the server-available modes minus these (and minus any
+	/// server-wide `EventsOptions.disabledModes`). Chainable.
+	EventHandle disable(DeliveryMode[] modes...) @safe
+	{
+		reg_.disabledModes = modes.dup;
+		rt_.register(reg_);
+		return this;
+	}
+
+	/// Convenience: deliver this type ONLY by webhook — equivalent to
+	/// `disable(DeliveryMode.poll, DeliveryMode.push)`.
+	EventHandle webhookOnly() @safe
+	{
+		return disable(DeliveryMode.poll, DeliveryMode.push);
+	}
+
 	private EventResult toResult(EventBatch!P batch) @safe
 	{
 		EventOccurrence[] occs;
@@ -282,6 +299,7 @@ struct EventsOptions
 	Duration webhookMinTtl = 1.minutes; /// min granted webhook TTL (clamps tiny suggestions up)
 	bool allowNoExpiry; /// permit `ttlMs:null` no-expiry grants (requires a durable store)
 	bool webhookEnabled = true; /// advertise/serve webhook delivery
+	DeliveryMode[] disabledModes; /// modes disabled for ALL types (a type may narrow further, not re-enable)
 	int webhookMaxSubscriptionsPerPrincipal = 1000; /// cap on live webhook subscriptions one principal may hold (0 = unlimited)
 	string[] callbackAllowlist; /// callback URL prefixes treated as pre-verified
 	bool allowPrivateCallbackHosts; /// permit non-globally-routable callback IPs (tests/dev)
@@ -566,6 +584,14 @@ final class EventsRuntime
 	/// The effective delivery modes for a registered type: poll, push, and (when
 	/// enabled) webhook, minus any the author disabled. Emit-only types still
 	/// support poll (served from the ring buffer).
+	private static bool isDisabled(DeliveryMode m, const DeliveryMode[] disabled) @safe
+	{
+		foreach (d; disabled)
+			if (d == m)
+				return true;
+		return false;
+	}
+
 	DeliveryMode[] effectiveDelivery(string name) @safe
 	{
 		auto p = name in types_;
@@ -577,12 +603,11 @@ final class EventsRuntime
 		DeliveryMode[] result;
 		foreach (m; modes)
 		{
-			bool disabled;
-			foreach (d; p.disabledModes)
-				if (d == m)
-					disabled = true;
-			if (!disabled)
-				result ~= m;
+			if (isDisabled(m, opts_.disabledModes)) // server-wide policy
+				continue;
+			if (isDisabled(m, p.disabledModes)) // per-event opt-out
+				continue;
+			result ~= m;
 		}
 		return result;
 	}
@@ -1733,6 +1758,45 @@ unittest  // effectiveDelivery lists poll/push/webhook minus author-disabled mod
 	auto modes = rt.effectiveDelivery("x");
 	assert(modes.length == 2);
 	assert(modes[0] == DeliveryMode.poll && modes[1] == DeliveryMode.push);
+}
+
+unittest  // EventHandle.disable opts a typed event out of a delivery mode
+{
+	auto rt = testRuntime();
+	rt.define!(DemoArgs, DemoPayload)("x").disable(DeliveryMode.poll);
+	auto modes = rt.effectiveDelivery("x");
+	assert(modes.length == 2);
+	assert(modes[0] == DeliveryMode.push && modes[1] == DeliveryMode.webhook);
+}
+
+unittest  // EventHandle.webhookOnly leaves only webhook delivery
+{
+	auto rt = testRuntime();
+	rt.define!(DemoArgs, DemoPayload)("x").webhookOnly();
+	auto modes = rt.effectiveDelivery("x");
+	assert(modes == [DeliveryMode.webhook]);
+}
+
+unittest  // EventsOptions.disabledModes applies server-wide, intersected with per-event
+{
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "2026-02-19T15:30:00Z";
+	o.disabledModes = [DeliveryMode.push]; // server policy: no push for any type
+	auto rt = new EventsRuntime(null, o);
+
+	EventRegistration a;
+	a.descriptor.name = "a";
+	rt.register(a);
+	assert(rt.effectiveDelivery("a") == [
+		DeliveryMode.poll, DeliveryMode.webhook
+	]);
+
+	EventRegistration b;
+	b.descriptor.name = "b";
+	b.disabledModes = [DeliveryMode.webhook]; // per-event narrows further
+	rt.register(b);
+	assert(rt.effectiveDelivery("b") == [DeliveryMode.poll]);
 }
 
 unittest  // list returns registered types sorted by name with computed delivery
