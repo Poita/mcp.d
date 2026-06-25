@@ -272,6 +272,78 @@ unittest
 	assert(changed, "client never received a change notification on the listen stream");
 }
 
+// Regression: over HTTP, `openListen` (backing `subscriptionsListen`/`streamEvents`)
+// opens the SSE stream on a background task, so the call must not return until the
+// server has registered the subscription. Otherwise a notification published right
+// after — the ubiquitous "subscribe, then trigger" pattern — races ahead of the
+// registration and is lost. The client gates the return on the stream's leading
+// frame (`acknowledged`/`active`), which the server emits only after registering.
+// Unlike the test above, this one publishes the change EXACTLY ONCE (no
+// re-broadcast loop) immediately after the call returns, so it passes only if the
+// gate holds.
+unittest
+{
+	auto server = McpServer.stateless("listen-gate", "1.0.0");
+	server.enableToolsListChanged();
+
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	bool changed;
+	string failure;
+
+	void delegate() @safe nothrow body_ = () @safe nothrow{
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				() @trusted { listener.stopListening(); }();
+			const port = listener.bindAddresses[0].port;
+			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
+
+			auto client = McpClient.http(url);
+			scope (exit)
+				closeQuietly(client);
+
+			client.onNotification = (string method, Json params) @safe {
+				if (method == "notifications/tools/list_changed")
+					changed = true;
+			};
+
+			client.connect();
+
+			SubscriptionFilter filter;
+			filter.toolsListChanged = true;
+			auto stream = client.subscriptionsListen(filter);
+			scope (exit)
+				stream.close();
+
+			// Publish exactly once: the gated return guarantees the server has
+			// registered the listener, so this single notification must arrive.
+			server.notifyToolsListChanged();
+
+			const deadline = MonoTime.currTime + 5000.msecs;
+			while (!changed && MonoTime.currTime < deadline)
+				sleep(25.msecs);
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	};
+
+	runTask(body_);
+	runEventLoop();
+
+	assert(failure.length == 0, "listen-gate test failed: " ~ failure);
+	assert(changed,
+			"a notification published once right after subscriptionsListen returned was lost — "
+			~ "openListen did not gate on the server registering the subscription");
+}
+
 // Last-Event-ID resumption of a dropped POST response stream (Streamable HTTP,
 // 2025-11-25). When a request's POST opens an SSE response that emits a `retry:`
 // hint and an event `id:` but then closes WITHOUT the JSON-RPC response, the
