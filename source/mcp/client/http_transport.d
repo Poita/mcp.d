@@ -1174,6 +1174,7 @@ final class HttpClientTransport : ClientTransport
 	SubscriptionStream openListen(Json message) @safe
 	{
 		import vibe.core.core : runTask;
+		import core.time : seconds;
 
 		auto cancelled = () @trusted { return new shared bool(false); }();
 		// The background task fills this slot with its live socket once connected;
@@ -1188,13 +1189,42 @@ final class HttpClientTransport : ClientTransport
 			}
 		};
 		auto stream = new SubscriptionStream(cancelled, onCancel);
+
+		// Gate the return on the server confirming the stream is open. The reader
+		// fires `established` once it has dispatched the leading SSE frame — the
+		// server emits that frame (`active` for events/stream, `acknowledged` for
+		// subscriptions/listen) only after registering the subscription, so an
+		// occurrence published immediately after this call cannot race ahead of the
+		// registration and be missed. Capture the emit count before spawning the
+		// reader so an establishment that lands before we wait is not lost. The wait
+		// is bounded: a server that never sends a leading frame (or a connect
+		// failure, signalled on the reader's exit) degrades to returning rather than
+		// hanging.
+		auto established = createManualEvent();
+		const ec = established.emitCount;
+		auto signal = () @safe nothrow{
+			try
+				established.emit();
+			catch (Exception)
+			{
+			}
+		};
 		runTask(() nothrow{
 			try
-				runListenStream(message, cancelled, slot);
+				runListenStream(message, cancelled, slot, signal);
 			catch (Exception)
 			{
 			}
 		});
+		() @trusted {
+			if (*cancelled)
+				return;
+			try
+				established.waitUninterruptible(10.seconds, ec);
+			catch (Exception)
+			{
+			}
+		}();
 		return stream;
 	}
 
@@ -1207,7 +1237,8 @@ final class HttpClientTransport : ClientTransport
 	/// the caller cancels. A raw TCP POST is used (rather than vibe's pooled
 	/// `requestHTTP`) for the same reason as `runServerStream`: a long-lived,
 	/// idle-then-active SSE body is not reliably surfaced by the pooled client.
-	private void runListenStream(Json message, shared(bool)* cancelled, ListenSocketSlot slot) @safe
+	private void runListenStream(Json message, shared(bool)* cancelled,
+			ListenSocketSlot slot, void delegate() @safe nothrow onEstablished = null) @safe
 	{
 		const ep = parseHttpEndpoint(url);
 		// Resolve + pin the user-configured endpoint host to a numeric address.
@@ -1220,7 +1251,23 @@ final class HttpClientTransport : ClientTransport
 
 		auto isCancelled = () @safe => () @trusted { return *cancelled; }();
 
+		// Fire the establishment signal at most once: on the first dispatched frame
+		// (the stream is now confirmed open server-side) and, as a fallback, on any
+		// exit before that frame (connect/head failure) so a waiter in `openListen`
+		// returns promptly instead of blocking the full bound.
+		bool established;
+		void markEstablished() @safe nothrow
+		{
+			if (established)
+				return;
+			established = true;
+			if (onEstablished !is null)
+				onEstablished();
+		}
+
 		() @trusted {
+			scope (exit)
+				markEstablished();
 			if (*cancelled)
 				return;
 			auto sock = connectTimed(pinnedHost, ep.port);
@@ -1245,6 +1292,7 @@ final class HttpClientTransport : ClientTransport
 			// throwaway cursor rather than a shared field.
 			SseCursor cursor;
 			readSseBody(conn, chunked, cursor, isCancelled, (string eventType, string data) @safe {
+				markEstablished();
 				try
 					dispatch(Message(parseJsonString(data)));
 				catch (Exception)
