@@ -675,23 +675,20 @@ struct InputRequest
 	}
 
 	/// Build a url-mode `elicitation` input-request: instead of a `requestedSchema`
-	/// form, the client is directed to a `url` to gather input out-of-band and
-	/// correlate the result via `elicitationId`. Mirrors
-	/// `RequestContext.elicitUrl`'s invariants: `url` MUST be a non-empty valid
-	/// absolute URI and `elicitationId` MUST be non-empty (throws otherwise).
-	static InputRequest elicitationUrl(string id, string message, string url, string elicitationId) @safe
+	/// form, the client is directed to a `url` to gather input out-of-band. The
+	/// draft `ElicitRequestURLParams` is `{mode:"url", message, url}` — correlation
+	/// is the MRTR `InputRequest.id`, so the request carries no `elicitationId`
+	/// (removed from the draft). `url` MUST be a non-empty valid absolute URI.
+	static InputRequest elicitationUrl(string id, string message, string url) @safe
 	{
 		if (url.length == 0)
 			throw invalidParams("URL-mode elicitation requires a non-empty url");
 		if (!isValidElicitationUrl(url))
 			throw invalidParams("URL-mode elicitation requires a valid url (absolute URI): " ~ url);
-		if (elicitationId.length == 0)
-			throw invalidParams("URL-mode elicitation requires a non-empty elicitationId");
 		Json p = Json.emptyObject;
 		p["mode"] = "url";
 		p["message"] = message;
 		p["url"] = url;
-		p["elicitationId"] = elicitationId;
 		return InputRequest(id, "elicitation", p);
 	}
 
@@ -737,16 +734,6 @@ struct InputRequest
 		if (params.type == Json.Type.object && "url" in params
 				&& params["url"].type == Json.Type.string)
 			return params["url"].get!string;
-		return "";
-	}
-
-	/// Read `params["elicitationId"]` as a string (`""` when absent) — the reader
-	/// counterpart to the `elicitationUrl` builder.
-	string elicitationIdField() @safe
-	{
-		if (params.type == Json.Type.object && "elicitationId" in params
-				&& params["elicitationId"].type == Json.Type.string)
-			return params["elicitationId"].get!string;
 		return "";
 	}
 
@@ -1818,23 +1805,23 @@ unittest  // validateInputSchemaHeaders: rejects number-typed header on prefixIt
 	assert(validateInputSchemaHeaders(schema) !is null);
 }
 
-unittest  // InputRequest.elicitationUrl builds url-mode params with the four fields
+unittest  // InputRequest.elicitationUrl builds draft url-mode params (no elicitationId)
 {
-	auto ir = InputRequest.elicitationUrl("e1", "Authorize access",
-			"https://example.com/consent", "elic-123");
+	auto ir = InputRequest.elicitationUrl("e1", "Authorize access", "https://example.com/consent");
 	assert(ir.type == "elicitation");
 	assert(ir.kind.get == InputKind.elicitation);
 	assert(ir.params["mode"].get!string == "url");
 	assert(ir.params["message"].get!string == "Authorize access");
 	assert(ir.params["url"].get!string == "https://example.com/consent");
-	assert(ir.params["elicitationId"].get!string == "elic-123");
+	// The draft removed elicitationId from url-mode requests; correlation is the
+	// MRTR request id.
+	assert("elicitationId" !in ir.params);
 }
 
-unittest  // InputRequest.elicitationUrl readers round-trip url and elicitationId
+unittest  // InputRequest.elicitationUrl readers round-trip url and message
 {
-	auto ir = InputRequest.elicitationUrl("e1", "msg", "https://example.com/consent", "elic-123");
+	auto ir = InputRequest.elicitationUrl("e1", "msg", "https://example.com/consent");
 	assert(ir.elicitationUrl() == "https://example.com/consent");
-	assert(ir.elicitationIdField() == "elic-123");
 	assert(ir.elicitationMessage() == "msg");
 }
 
@@ -1843,7 +1830,7 @@ unittest  // InputRequest.elicitationUrl rejects empty url
 	import std.exception : assertThrown;
 	import mcp.protocol.errors : McpException;
 
-	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "", "elic-1"));
+	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", ""));
 }
 
 unittest  // InputRequest.elicitationUrl rejects a malformed (non-absolute) url
@@ -1851,15 +1838,7 @@ unittest  // InputRequest.elicitationUrl rejects a malformed (non-absolute) url
 	import std.exception : assertThrown;
 	import mcp.protocol.errors : McpException;
 
-	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "not a url", "elic-1"));
-}
-
-unittest  // InputRequest.elicitationUrl rejects empty elicitationId
-{
-	import std.exception : assertThrown;
-	import mcp.protocol.errors : McpException;
-
-	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "https://example.com", ""));
+	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "not a url"));
 }
 
 unittest  // InputRequest.fromJson: non-string "method" field is treated as unknown type
