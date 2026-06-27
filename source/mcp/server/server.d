@@ -735,8 +735,15 @@ final class McpServer : ServerCore
 	/// of listeners reached, or `0` when no GET stream is open (or the server is
 	/// not on a Streamable HTTP transport). Throws `invalidParams` on an empty
 	/// `elicitationId`.
+	///
+	/// The draft (modern) protocol removed this notification: a draft client tracks
+	/// URL-mode completion through the MRTR request-state retry, not a server push.
+	/// On a negotiated modern session this is therefore a no-op returning `0`; it
+	/// remains in effect for 2025-11-25 and earlier, where the notification is valid.
 	size_t notifyElicitationComplete(string elicitationId) @safe
 	{
+		if (negotiatedVersion().isModern)
+			return 0;
 		if (elicitationId.length == 0)
 			throw invalidParams(
 					"notifications/elicitation/complete requires a non-empty elicitationId");
@@ -7778,6 +7785,21 @@ unittest  // notifyElicitationComplete is a no-op before a push channel exists
 {
 	auto s = new McpServer("t", "1");
 	assert(s.notifyElicitationComplete("elic-1") == 0);
+}
+
+unittest  // notifyElicitationComplete is a no-op on a draft (modern) session
+{
+	// The draft removed `notifications/elicitation/complete`; even with an open
+	// push channel a modern session must emit nothing.
+	auto s = new McpServer("t", "1");
+	s.activeConnection.negotiated = ProtocolVersion.modern;
+	auto coord = new StreamCoordinator;
+	auto ch = ensurePushChannel(s, coord);
+	string[] received;
+	ch.addListener((string f) @safe { received ~= f; });
+
+	assert(s.notifyElicitationComplete("elic-123") == 0);
+	assert(received.length == 0);
 }
 
 unittest  // notifyElicitationComplete rejects an empty elicitationId
