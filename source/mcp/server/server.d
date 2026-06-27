@@ -51,7 +51,7 @@ struct RegisteredTool
 	Tool descriptor;
 	MrtrToolHandler handler;
 	/// Client capabilities this tool's handler requires to run. On the draft
-	/// protocol, `tools/call` rejects with a `-32003`
+	/// protocol, `tools/call` rejects with a `-32021`
 	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
 	/// lists the unmet ones) when the request's declared client capabilities do
 	/// not cover these. Empty (the default) means no gating.
@@ -72,7 +72,7 @@ struct RegisteredResource
 	/// Per-resource draft `CacheableResult` freshness hint for `resources/read`.
 	Nullable!CacheHint cache;
 	/// Client capabilities this resource's reader requires to run. On the draft
-	/// protocol, `resources/read` rejects with a `-32003`
+	/// protocol, `resources/read` rejects with a `-32021`
 	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
 	/// lists the unmet ones) when the request's declared client capabilities do
 	/// not cover these. Empty (the default) means no gating.
@@ -94,7 +94,7 @@ struct RegisteredTemplate
 	/// Per-template draft `CacheableResult` freshness hint for `resources/read`.
 	Nullable!CacheHint cache;
 	/// Client capabilities this template's reader requires to run. On the draft
-	/// protocol, `resources/read` rejects with a `-32003`
+	/// protocol, `resources/read` rejects with a `-32021`
 	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
 	/// lists the unmet ones) when the request's declared client capabilities do
 	/// not cover these. Empty (the default) means no gating.
@@ -109,7 +109,7 @@ struct RegisteredPrompt
 	Prompt descriptor;
 	MrtrPromptHandler handler;
 	/// Client capabilities this prompt's handler requires to run. On the draft
-	/// protocol, `prompts/get` rejects with a `-32003`
+	/// protocol, `prompts/get` rejects with a `-32021`
 	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
 	/// lists the unmet ones) when the request's declared client capabilities do
 	/// not cover these. Empty (the default) means no gating.
@@ -235,7 +235,7 @@ final class McpServer : ServerCore
 	// addition to any HTTP push channel. Null when no stdio listen is active,
 	// keeping the HTTP-only behaviour unchanged.
 	private void delegate(string) @safe stdioListenSink;
-	private string stdioListenSubscriptionId;
+	private Json stdioListenSubscriptionId = Json.init;
 	// The stdio `subscriptions/listen` stream's OWN per-stream/per-URI filter.
 	// stdio is single-connection, so this is the filter recorded by the active stdio
 	// listen; `notifyChange` consults it via `accepts(method, uri)` to deliver only the
@@ -443,7 +443,7 @@ final class McpServer : ServerCore
 	///
 	/// On the draft protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `tools/call` for this tool is rejected up front
-	/// with a `-32003` `MissingRequiredClientCapabilityError` — whose
+	/// with a `-32021` `MissingRequiredClientCapabilityError` — whose
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
 	/// exactly the unmet capabilities — when the request's declared capabilities
 	/// do not cover `caps` (draft basic/lifecycle: "A server MUST NOT rely on
@@ -464,7 +464,7 @@ final class McpServer : ServerCore
 	///
 	/// On the draft protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `prompts/get` for this prompt is rejected up
-	/// front with a `-32003` `MissingRequiredClientCapabilityError` — whose
+	/// front with a `-32021` `MissingRequiredClientCapabilityError` — whose
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
 	/// exactly the unmet capabilities — when the request's declared capabilities
 	/// do not cover `caps`. On the stateful 2025-era protocols the gate uses the
@@ -485,7 +485,7 @@ final class McpServer : ServerCore
 	///
 	/// On the draft protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `resources/read` for a URI matching this
-	/// resource is rejected up front with a `-32003`
+	/// resource is rejected up front with a `-32021`
 	/// `MissingRequiredClientCapabilityError` — whose
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
 	/// exactly the unmet capabilities — when the request's declared capabilities
@@ -509,7 +509,7 @@ final class McpServer : ServerCore
 	///
 	/// On the draft protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `resources/read` for a URI matching this
-	/// template is rejected up front with a `-32003`
+	/// template is rejected up front with a `-32021`
 	/// `MissingRequiredClientCapabilityError` — whose
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
 	/// exactly the unmet capabilities — when the request's declared capabilities
@@ -735,8 +735,15 @@ final class McpServer : ServerCore
 	/// of listeners reached, or `0` when no GET stream is open (or the server is
 	/// not on a Streamable HTTP transport). Throws `invalidParams` on an empty
 	/// `elicitationId`.
+	///
+	/// The draft (modern) protocol removed this notification: a draft client tracks
+	/// URL-mode completion through the MRTR request-state retry, not a server push.
+	/// On a negotiated modern session this is therefore a no-op returning `0`; it
+	/// remains in effect for 2025-11-25 and earlier, where the notification is valid.
 	size_t notifyElicitationComplete(string elicitationId) @safe
 	{
+		if (negotiatedVersion().isModern)
+			return 0;
 		if (elicitationId.length == 0)
 			throw invalidParams(
 					"notifications/elicitation/complete requires a non-empty elicitationId");
@@ -1185,8 +1192,8 @@ final class McpServer : ServerCore
 		// subscriptions). This is in addition to any HTTP push channel below.
 		if (stdioListenSink !is null)
 		{
-			auto note = withSubscriptionId(makeNotification(method, params),
-					stdioListenSubscriptionId);
+			auto note = withListenSubscriptionId(makeNotification(method,
+					params), stdioListenSubscriptionId);
 			stdioListenSink(note.toString());
 			delivered++;
 		}
@@ -1232,8 +1239,9 @@ final class McpServer : ServerCore
 
 		// The listen request's id is the stream's subscriptionId; every
 		// notification on this channel (starting with the acknowledgement) is
-		// stamped with it in `params._meta`.
-		stdioListenSubscriptionId = rpcIdString(msg.id);
+		// stamped with it in `params._meta`, carried verbatim so a numeric listen
+		// id stays numeric on the wire.
+		stdioListenSubscriptionId = msg.id;
 		stdioListenSink = writeLine;
 		// Capture THIS listen request's parsed per-stream filter (recorded on the
 		// stdio connection's state) so subsequent notify*/notifyResourceUpdated
@@ -1248,8 +1256,8 @@ final class McpServer : ServerCore
 		// streams' opt-ins do not leak into this ack. Stamped with the subscriptionId.
 		Json ackParams = Json.emptyObject;
 		ackParams["notifications"] = acknowledgedSubsetFor(stdioListenFilter_);
-		auto ack = withSubscriptionId(makeNotification("notifications/subscriptions/acknowledged",
-				ackParams), stdioListenSubscriptionId);
+		auto ack = withListenSubscriptionId(makeNotification(
+				"notifications/subscriptions/acknowledged", ackParams), stdioListenSubscriptionId);
 		writeLine(ack.toString());
 		return true;
 	}
@@ -1393,8 +1401,8 @@ final class McpServer : ServerCore
 		// `pushChannel` on the stdio transport.
 		if (stdioListenSink !is null && stdioListenFilter_.accepts(method, uri))
 		{
-			auto note = withSubscriptionId(makeNotification(method, params),
-					stdioListenSubscriptionId);
+			auto note = withListenSubscriptionId(makeNotification(method,
+					params), stdioListenSubscriptionId);
 			stdioListenSink(note.toString());
 			delivered++;
 		}
@@ -2103,7 +2111,7 @@ final class McpServer : ServerCore
 		return maybeCache(result, listHint(listMethod), ver);
 	}
 
-	/// Build the draft `UnsupportedProtocolVersionError` (-32004) listing the
+	/// Build the draft `UnsupportedProtocolVersionError` (-32022) listing the
 	/// versions this server supports and the one the client requested.
 	private McpException unsupportedVersionError(string requested) @safe
 	{
@@ -2174,11 +2182,15 @@ final class McpServer : ServerCore
 		// On a match, drop the delivery sink and clear the recorded per-stream
 		// filter so the listener-driven notify path matches nothing and any
 		// subsequent notify*/notifyResourceUpdated writes nothing.
-		if (stdioListenSink !is null && stdioListenSubscriptionId.length
-				&& rpcIdString(params["requestId"]) == stdioListenSubscriptionId)
+		if (stdioListenSink !is null && stdioListenSubscriptionId.type != Json.Type.undefined
+				&& rpcIdString(params["requestId"]) == rpcIdString(stdioListenSubscriptionId))
 		{
+			// Graceful teardown: the long-lived listen request returns its single
+			// response now — the `SubscriptionsListenResult` (draft
+			// basic/utilities/subscriptions) — before the stream closes.
+			stdioListenSink(subscriptionsListenResult(stdioListenSubscriptionId).toString());
 			stdioListenSink = null;
-			stdioListenSubscriptionId = null;
+			stdioListenSubscriptionId = Json.init;
 			// Drop every piece of listen state this single stdio stream recorded so
 			// a later notify*/notifyResourceUpdated writes nothing: the per-URI
 			// resource `subscriptions` (keyed by the URIs the per-stream filter
@@ -2996,7 +3008,7 @@ final class McpServer : ServerCore
 
 		// Capability gating (draft basic/lifecycle): a server MUST NOT rely on a
 		// capability the client did not declare. When this tool declares required
-		// client capabilities, reject the call with a `-32003`
+		// client capabilities, reject the call with a `-32021`
 		// `MissingRequiredClientCapabilityError` listing the unmet ones in
 		// `data.requiredCapabilities`. The set the client actually declared is
 		// taken from this request's `_meta.clientCapabilities` on the stateless
@@ -3726,7 +3738,8 @@ unittest  // pingClient(sessionId) reaches a session-scoped GET listener (non-em
 	string frame;
 	// The production registration path: a per-session GET stream owned by its
 	// Mcp-Session-Id (a NON-empty owner token), unlike the empty default.
-	ch.addListener((string f) @safe { frame = f; }, "", ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { frame = f; }, Json(""),
+			ListenFilter.init, "", null, "sess-A");
 
 	bool pinged;
 	void delegate() @safe nothrow initiator = () @safe nothrow{
@@ -3760,7 +3773,7 @@ unittest  // pingClient with an empty/mismatched token cannot reach a session-sc
 	auto srv = makeTestServer();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(srv, coord);
-	ch.addListener((string) @safe {}, "", ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string) @safe {}, Json(""), ListenFilter.init, "", null, "sess-A");
 
 	// The empty-token no-arg form matches no session-scoped listener.
 	bool threwEmpty;
@@ -3784,8 +3797,8 @@ unittest  // connectedSessions enumerates the live session-scoped GET streams
 	auto srv = makeTestServer();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(srv, coord);
-	ch.addListener((string) @safe {}, "", ListenFilter.init, "", null, "sess-A");
-	ch.addListener((string) @safe {}, "", ListenFilter.init, "", null, "sess-B");
+	ch.addListener((string) @safe {}, Json(""), ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string) @safe {}, Json(""), ListenFilter.init, "", null, "sess-B");
 
 	import std.algorithm : canFind, sort;
 
@@ -6274,7 +6287,7 @@ unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
 	assert(done["result"]["result"]["structuredContent"]["approved"].get!bool);
 }
 
-unittest  // draft tools/call rejects with -32003 when a required client cap is undeclared
+unittest  // draft tools/call rejects with -32021 when a required client cap is undeclared
 {
 	auto s = makeTestServer();
 	// The "add" tool now requires the client to support sampling.
@@ -6284,7 +6297,7 @@ unittest  // draft tools/call rejects with -32003 when a required client cap is 
 	// draftReq declares empty clientCapabilities -> sampling is missing.
 	Json p = Json(["name": Json("add"), "arguments": Json.emptyObject]);
 	auto resp = s.handle(draftReq(7, "tools/call", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 	assert("requiredCapabilities" in resp["error"]["data"]);
 	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
 }
@@ -6347,10 +6360,10 @@ unittest  // stateful (2025-era) tools/call gates on negotiated session capabili
 		"arguments": Json(["a": Json(1), "b": Json(1)])
 	]);
 	auto resp = s.handle(req(2, "tools/call", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 }
 
-unittest  // draft prompts/get rejects with -32003 when a required client cap is undeclared
+unittest  // draft prompts/get rejects with -32021 when a required client cap is undeclared
 {
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet"};
@@ -6361,7 +6374,7 @@ unittest  // draft prompts/get rejects with -32003 when a required client cap is
 	// draftReq declares empty clientCapabilities -> sampling is missing.
 	Json p = Json(["name": Json("greet")]);
 	auto resp = s.handle(draftReq(1, "prompts/get", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 	assert("requiredCapabilities" in resp["error"]["data"]);
 	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
 }
@@ -6409,10 +6422,10 @@ unittest  // stateful (2025-era) prompts/get gates on negotiated session capabil
 	s.handle(req(1, "initialize", initP));
 	Json p = Json(["name": Json("greet")]);
 	auto resp = s.handle(req(2, "prompts/get", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 }
 
-unittest  // draft resources/read rejects with -32003 when a required client cap is undeclared
+unittest  // draft resources/read rejects with -32021 when a required client cap is undeclared
 {
 	auto s = new McpServer("t", "1");
 	s.registerResource(Resource("res://x", "x"), () @safe {
@@ -6425,7 +6438,7 @@ unittest  // draft resources/read rejects with -32003 when a required client cap
 	// draftReq declares empty clientCapabilities -> sampling is missing.
 	Json p = Json(["uri": Json("res://x")]);
 	auto resp = s.handle(draftReq(1, "resources/read", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 	assert("requiredCapabilities" in resp["error"]["data"]);
 	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
 }
@@ -6475,10 +6488,10 @@ unittest  // stateful (2025-era) resources/read gates on negotiated session capa
 	s.handle(req(1, "initialize", initP));
 	Json p = Json(["uri": Json("res://x")]);
 	auto resp = s.handle(req(2, "resources/read", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 }
 
-unittest  // draft resources/read via template rejects with -32003 when cap undeclared
+unittest  // draft resources/read via template rejects with -32021 when cap undeclared
 {
 	auto s = new McpServer("t", "1");
 	ResourceTemplate tmpl = {uriTemplate: "res://{id}", name: "item"};
@@ -6491,7 +6504,7 @@ unittest  // draft resources/read via template rejects with -32003 when cap unde
 	assert(s.setResourceTemplateRequiredClientCapabilities("res://{id}", reqCap));
 	Json p = Json(["uri": Json("res://42")]);
 	auto resp = s.handle(draftReq(1, "resources/read", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 	assert("requiredCapabilities" in resp["error"]["data"]);
 }
 
@@ -7780,6 +7793,21 @@ unittest  // notifyElicitationComplete is a no-op before a push channel exists
 	assert(s.notifyElicitationComplete("elic-1") == 0);
 }
 
+unittest  // notifyElicitationComplete is a no-op on a draft (modern) session
+{
+	// The draft removed `notifications/elicitation/complete`; even with an open
+	// push channel a modern session must emit nothing.
+	auto s = new McpServer("t", "1");
+	s.activeConnection.negotiated = ProtocolVersion.modern;
+	auto coord = new StreamCoordinator;
+	auto ch = ensurePushChannel(s, coord);
+	string[] received;
+	ch.addListener((string f) @safe { received ~= f; });
+
+	assert(s.notifyElicitationComplete("elic-123") == 0);
+	assert(received.length == 0);
+}
+
 unittest  // notifyElicitationComplete rejects an empty elicitationId
 {
 	import std.exception : assertThrown;
@@ -7869,8 +7897,10 @@ unittest  // notifyToolsListChanged fans out to EVERY connected session, not jus
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string aFrame, bFrame;
-	ch.addListener((string f) @safe { aFrame = f; }, "", ListenFilter.init, "", null, "sess-A");
-	ch.addListener((string f) @safe { bFrame = f; }, "", ListenFilter.init, "", null, "sess-B");
+	ch.addListener((string f) @safe { aFrame = f; }, Json(""),
+			ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { bFrame = f; }, Json(""),
+			ListenFilter.init, "", null, "sess-B");
 
 	const n = s.notifyToolsListChanged();
 	assert(n == 2, "both sessions must be reached");
@@ -7886,8 +7916,8 @@ unittest  // a list_changed broadcast still delivers only ONE stream within a si
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	int aCount, bCount;
-	ch.addListener((string) @safe { aCount++; }, "", ListenFilter.init, "", null, "sess-A");
-	ch.addListener((string) @safe { bCount++; }, "", ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string) @safe { aCount++; }, Json(""), ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string) @safe { bCount++; }, Json(""), ListenFilter.init, "", null, "sess-A");
 
 	const n = s.notifyToolsListChanged();
 	assert(n == 1, "one session reached once");
@@ -8068,7 +8098,7 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	pb["notifications"] = nb;
 	s.handle(draftReq(10, "subscriptions/listen", pb));
 	string bFrame;
-	push.addListener((string f) @safe { bFrame = f; }, "10", s.cs().listenFilter);
+	push.addListener((string f) @safe { bFrame = f; }, Json("10"), s.cs().listenFilter);
 
 	// Stream A (toolsListChanged only) opens second.
 	Json na = Json.emptyObject;
@@ -8077,7 +8107,7 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	pa["notifications"] = na;
 	s.handle(draftReq(11, "subscriptions/listen", pa));
 	string aFrame;
-	push.addListener((string f) @safe { aFrame = f; }, "11", s.cs().listenFilter);
+	push.addListener((string f) @safe { aFrame = f; }, Json("11"), s.cs().listenFilter);
 
 	// A tools/list_changed must land on A (which requested it), not B.
 	const n = s.notifyToolsListChanged();
@@ -8122,7 +8152,7 @@ unittest  // STATELESS HTTP subscriptions/listen delivers resources/updated per-
 	f.resourceSubscriptions = true;
 	f.resourceUris = ["note:///a"];
 	string frame;
-	push.addListener((string fr) @safe { frame = fr; }, "listen-1", f);
+	push.addListener((string fr) @safe { frame = fr; }, Json("listen-1"), f);
 
 	// Subscribed URI: delivered down THAT stream, stamped with the subscriptionId.
 	const a = s.notifyResourceUpdated("note:///a");
@@ -8158,8 +8188,8 @@ unittest  // STATELESS HTTP subscriptions/listen delivers resources/list_changed
 	fb.active = true;
 	fb.toolsListChanged = true;
 	string aFrame, bFrame;
-	push.addListener((string fr) @safe { aFrame = fr; }, "A", fa);
-	push.addListener((string fr) @safe { bFrame = fr; }, "B", fb);
+	push.addListener((string fr) @safe { aFrame = fr; }, Json("A"), fa);
+	push.addListener((string fr) @safe { bFrame = fr; }, Json("B"), fb);
 
 	const n = s.notifyResourcesListChanged();
 	assert(n == 1, "exactly the opted-in listen stream receives resources/list_changed");
@@ -8222,7 +8252,7 @@ unittest  // draft subscriptions/listen: a stream gets list_changed only if its 
 	ListenFilter noPrompts;
 	noPrompts.active = true;
 	noPrompts.toolsListChanged = true;
-	const idA = ch.addListener((string f) @safe { a ~= f; }, "listen-a", noPrompts);
+	const idA = ch.addListener((string f) @safe { a ~= f; }, Json("listen-a"), noPrompts);
 	assert(s.notifyPromptsListChanged() == 0);
 	assert(a.length == 0);
 	ch.removeListener(idA);
@@ -8232,7 +8262,7 @@ unittest  // draft subscriptions/listen: a stream gets list_changed only if its 
 	ListenFilter withPrompts;
 	withPrompts.active = true;
 	withPrompts.promptsListChanged = true;
-	ch.addListener((string f) @safe { b ~= f; }, "listen-b", withPrompts);
+	ch.addListener((string f) @safe { b ~= f; }, Json("listen-b"), withPrompts);
 	assert(s.notifyPromptsListChanged() == 1);
 	assert(b.length == 1);
 }

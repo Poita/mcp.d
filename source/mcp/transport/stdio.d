@@ -1623,7 +1623,10 @@ unittest  // the stdio acknowledged notification is stamped with the listen id a
 
 	assert(outputs.length == 1);
 	auto ack = parseJsonString(outputs[0]);
-	assert(ack["params"]["_meta"][MetaKey.subscriptionId].get!string == "42");
+	// The numeric listen id is carried verbatim (RequestId = string | number), not stringified.
+	auto sid = ack["params"]["_meta"][MetaKey.subscriptionId];
+	assert(sid.type == Json.Type.int_);
+	assert(sid.get!long == 42);
 }
 
 unittest  // after a stdio subscriptions/listen, notify* change notifications flow on stdout, stamped with the subscriptionId
@@ -1650,7 +1653,39 @@ unittest  // after a stdio subscriptions/listen, notify* change notifications fl
 	auto note = parseJsonString(outputs[1]);
 	assert(note["method"].get!string == "notifications/tools/list_changed");
 	assert("id" !in note);
-	assert(note["params"]["_meta"][MetaKey.subscriptionId].get!string == "5");
+	auto sid = note["params"]["_meta"][MetaKey.subscriptionId];
+	assert(sid.type == Json.Type.int_);
+	assert(sid.get!long == 5);
+}
+
+unittest  // a stdio subscriptions/listen returns a SubscriptionsListenResult on graceful teardown
+{
+	auto s = new McpServer("listen-srv", "1.0");
+	s.enableToolsListChanged();
+
+	Json filter = Json.emptyObject;
+	filter["toolsListChanged"] = true;
+
+	string[] outputs;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(draftListenLine(5, filter));
+		foreach (_; 0 .. 8)
+			yield();
+		// The client cancels the listen by notifications/cancelled referencing its id;
+		// the server tears the subscription down gracefully.
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}`);
+		foreach (_; 0 .. 8)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	// Output 0 is the acknowledgement; output 1 is the graceful-teardown response.
+	assert(outputs.length == 2);
+	auto res = parseJsonString(outputs[1]);
+	assert(res["id"].get!long == 5);
+	assert("result" in res);
+	assert(res["result"]["resultType"].get!string == "complete");
+	assert(res["result"]["_meta"][MetaKey.subscriptionId].get!long == 5);
 }
 
 unittest  // a pre-draft (no protocolVersion) subscriptions/listen is method-not-found on the normal request/reply path over stdio

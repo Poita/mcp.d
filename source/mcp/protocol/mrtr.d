@@ -224,13 +224,17 @@ bool isUserMetaKeyAllowed(string key, ProtocolVersion v) @safe pure nothrow
 /// delivered on a `subscriptions/listen` stream MUST carry the listen request's id
 /// as `subscriptionId` in `_meta`, so clients can correlate the notification with
 /// the listen request that established the stream — this is the producer for that
-/// key. `subscriptionId` is the (string-rendered) JSON-RPC id of the originating
-/// `subscriptions/listen` request. An empty `subscriptionId` is a no-op (the
+/// key. `subscriptionId` is the originating `subscriptions/listen` request's
+/// JSON-RPC id, carried verbatim so its wire type is preserved (the spec types it
+/// as `RequestId = string | number`, so a numeric listen id stays numeric). An
+/// absent id — `undefined`, `null`, or an empty string — is a no-op (the
 /// notification is returned unchanged). Notifications carry their payload under
 /// `params`, so the key is nested as `params._meta.<subscriptionId>`.
-Json withSubscriptionId(Json notification, string subscriptionId) @safe
+Json withListenSubscriptionId(Json notification, Json subscriptionId) @safe
 {
-	if (subscriptionId.length == 0)
+	if (subscriptionId.type == Json.Type.undefined
+			|| subscriptionId.type == Json.Type.null_
+			|| (subscriptionId.type == Json.Type.string && subscriptionId.get!string.length == 0))
 		return notification;
 
 	Json n = notification.clone();
@@ -244,19 +248,68 @@ Json withSubscriptionId(Json notification, string subscriptionId) @safe
 	return n;
 }
 
-unittest  // withSubscriptionId stamps the listen request id into params._meta
+/// Build the JSON-RPC response for a `subscriptions/listen` request the server is
+/// gracefully tearing down (draft basic/utilities/subscriptions
+/// `SubscriptionsListenResult`). The long-lived listen stream emits this single
+/// response only on graceful teardown — e.g. server shutdown or an accepted
+/// cancellation; an abrupt transport close carries no response. The result body is
+/// `{resultType:"complete", _meta:{subscriptionId}}`, and the response `id` equals
+/// the listen request's id (carried verbatim, preserving its JSON type).
+Json subscriptionsListenResult(Json subscriptionId) @safe
+{
+	Json meta = Json.emptyObject;
+	meta[MetaKey.subscriptionId] = subscriptionId;
+	Json result = Json.emptyObject;
+	result["resultType"] = "complete";
+	result["_meta"] = meta;
+	Json resp = Json.emptyObject;
+	resp["jsonrpc"] = "2.0";
+	resp["id"] = subscriptionId;
+	resp["result"] = result;
+	return resp;
+}
+
+unittest  // subscriptionsListenResult is a complete result carrying the listen id as id and subscriptionId
+{
+	auto r = subscriptionsListenResult(Json("listen-1"));
+	assert(r["jsonrpc"].get!string == "2.0");
+	assert(r["id"].get!string == "listen-1");
+	assert(r["result"]["resultType"].get!string == "complete");
+	assert(r["result"]["_meta"][MetaKey.subscriptionId].get!string == "listen-1");
+}
+
+unittest  // subscriptionsListenResult preserves a numeric listen id in both id and subscriptionId
+{
+	auto r = subscriptionsListenResult(Json(7L));
+	assert(r["id"].type == Json.Type.int_ && r["id"].get!long == 7);
+	assert(r["result"]["_meta"][MetaKey.subscriptionId].get!long == 7);
+}
+
+unittest  // withListenSubscriptionId stamps the listen request id into params._meta
 {
 	auto n = Json([
 		"jsonrpc": Json("2.0"),
 		"method": Json("notifications/tools/list_changed")
 	]);
-	auto stamped = withSubscriptionId(n, "listen-7");
+	auto stamped = withListenSubscriptionId(n, Json("listen-7"));
 	assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "listen-7");
 	// The original is left untouched.
 	assert("params" !in n);
 }
 
-unittest  // withSubscriptionId preserves an existing params payload and _meta entries
+unittest  // withListenSubscriptionId preserves a numeric JSON-RPC id verbatim (RequestId = string | number)
+{
+	auto n = Json([
+		"jsonrpc": Json("2.0"),
+		"method": Json("notifications/tools/list_changed")
+	]);
+	auto stamped = withListenSubscriptionId(n, Json(42L));
+	auto id = stamped["params"]["_meta"][MetaKey.subscriptionId];
+	assert(id.type == Json.Type.int_, "a numeric listen id must stay numeric, not be stringified");
+	assert(id.get!long == 42);
+}
+
+unittest  // withListenSubscriptionId preserves an existing params payload and _meta entries
 {
 	Json params = Json.emptyObject;
 	params["uri"] = "file:///x";
@@ -268,19 +321,19 @@ unittest  // withSubscriptionId preserves an existing params payload and _meta e
 		"method": Json("notifications/resources/updated"),
 		"params": params
 	]);
-	auto stamped = withSubscriptionId(n, "id-42");
+	auto stamped = withListenSubscriptionId(n, Json("id-42"));
 	assert(stamped["params"]["uri"].get!string == "file:///x");
 	assert(stamped["params"]["_meta"]["other.vendor/flag"].get!bool);
 	assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "id-42");
 }
 
-unittest  // withSubscriptionId with an empty id is a no-op
+unittest  // withListenSubscriptionId with an empty id is a no-op
 {
 	auto n = Json([
 		"jsonrpc": Json("2.0"),
 		"method": Json("notifications/message")
 	]);
-	auto same = withSubscriptionId(n, "");
+	auto same = withListenSubscriptionId(n, Json(""));
 	assert("params" !in same);
 }
 
@@ -412,11 +465,15 @@ struct ParamHeader
 }
 
 /// Collect every valid `x-mcp-header` annotation in a tool `inputSchema`,
-/// recursing into nested `object` properties and `array` `items` schemas — the
-/// draft permits the annotation "at any nesting depth within the inputSchema,
-/// not only top-level properties". Annotations on non-primitive
-/// (`number`/object/array) properties, or with an invalid value, are skipped
-/// here; use `validateInputSchemaHeaders` to reject such schemas up front.
+/// recursing only through chains of `object` `properties` keys. The draft
+/// requires an annotated property to be _statically reachable_ from the schema
+/// root via `properties` alone — never through `items` (or any array keyword),
+/// composition (`oneOf`/`anyOf`/`allOf`/`not`), conditional (`if`/`then`/`else`),
+/// or `$ref` — so annotations sitting under those keywords are not surfaced.
+/// Nested object properties at any depth are permitted. Annotations on
+/// non-primitive (`number`/object/array) properties, or with an invalid value,
+/// are skipped here; use `validateInputSchemaHeaders` to reject such schemas up
+/// front.
 ParamHeader[] paramHeaders(Json inputSchema) @safe
 {
 	ParamHeader[] result;
@@ -444,25 +501,6 @@ ParamHeader[] paramHeaders(Json inputSchema) @safe
 				}
 			}();
 		}
-		// Object-form `items` (single schema) and array-form `items`/`prefixItems`
-		// (tuple schemas, 2020-12). Path is passed through unchanged — array
-		// element indices are not appended, matching the object-`items` case.
-		foreach (key; ["items", "prefixItems"])
-		{
-			if (key !in node)
-				continue;
-			auto sub = node[key];
-			if (sub.type == Json.Type.object)
-				walk(sub, path);
-			else if (sub.type == Json.Type.array)
-			{
-				() @trusted {
-					foreach (Json elem; sub)
-						if (elem.type == Json.Type.object)
-							walk(elem, path);
-				}();
-			}
-		}
 	}
 
 	walk(inputSchema, []);
@@ -472,13 +510,59 @@ ParamHeader[] paramHeaders(Json inputSchema) @safe
 /// Validate every `x-mcp-header` annotation in a tool `inputSchema` against the
 /// draft constraints (`server/tools` #x-mcp-header): non-empty, HTTP token
 /// syntax, no CR/LF, primitive-only (`number` forbidden), and case-insensitive
-/// uniqueness across the whole schema. Returns a human-readable reason on the
-/// first violation, or `null` when every annotation is valid. Recurses to any
-/// nesting depth.
+/// uniqueness across the whole schema. The annotation MUST also sit on a property
+/// that is _statically reachable_ from the root via a chain of `properties` keys
+/// only: an annotation reachable solely through `items` (or any other array
+/// keyword), composition (`oneOf`/`anyOf`/`allOf`/`not`), conditional
+/// (`if`/`then`/`else`), or `$ref`/`$defs` makes the tool definition invalid.
+/// Returns a human-readable reason on the first violation, or `null` when every
+/// annotation is valid.
 string validateInputSchemaHeaders(Json inputSchema) @safe
 {
 	string err;
 	bool[string] seen; // ASCII-lowercased header values already encountered
+
+	// True when `node`, or anything nested within it through any keyword, carries
+	// an `x-mcp-header`. Used to reject annotations that hang off a non-`properties`
+	// keyword and are therefore not statically reachable.
+	bool containsAnnotation(Json node) @safe
+	{
+		bool found;
+		if (node.type == Json.Type.object)
+		{
+			if ("x-mcp-header" in node)
+				return true;
+			() @trusted {
+				foreach (string _, Json v; node)
+					if (containsAnnotation(v))
+					{
+						found = true;
+						break;
+					}
+			}();
+		}
+		else if (node.type == Json.Type.array)
+		{
+			() @trusted {
+				foreach (Json elem; node)
+					if (containsAnnotation(elem))
+					{
+						found = true;
+						break;
+					}
+			}();
+		}
+		return found;
+	}
+
+	// Keywords whose subtrees are NOT a `properties` chain: an annotation reached
+	// only through one of these is not statically reachable (array keywords,
+	// composition, conditional, and reference/definition containers).
+	static immutable string[] nonReachableKeys = [
+		"items", "prefixItems", "additionalItems", "contains", "oneOf", "anyOf",
+		"allOf", "not", "if", "then", "else", "$defs", "definitions"
+	];
+
 	void walk(Json node) @safe
 	{
 		if (err !is null || node.type != Json.Type.object)
@@ -528,25 +612,18 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 				}
 			}();
 		}
-		// Object-form `items` and array-form `items`/`prefixItems` (tuple schemas).
-		foreach (key; ["items", "prefixItems"])
+		// An annotation reachable only through a non-`properties` keyword violates the
+		// statically-reachable rule and invalidates the whole tool definition.
+		foreach (key; nonReachableKeys)
 		{
-			if (err !is null || key !in node)
-				continue;
-			auto sub = node[key];
-			if (sub.type == Json.Type.object)
-				walk(sub);
-			else if (sub.type == Json.Type.array)
+			if (err !is null)
+				break;
+			if (key in node && containsAnnotation(node[key]))
 			{
-				() @trusted {
-					foreach (Json elem; sub)
-					{
-						if (err !is null)
-							return;
-						if (elem.type == Json.Type.object)
-							walk(elem);
-					}
-				}();
+				err = "x-mcp-header MUST only be applied to statically reachable properties"
+					~ " (a chain of `properties` keys); an annotation under `" ~ key
+					~ "` is invalid";
+				return;
 			}
 		}
 	}
@@ -635,23 +712,20 @@ struct InputRequest
 	}
 
 	/// Build a url-mode `elicitation` input-request: instead of a `requestedSchema`
-	/// form, the client is directed to a `url` to gather input out-of-band and
-	/// correlate the result via `elicitationId`. Mirrors
-	/// `RequestContext.elicitUrl`'s invariants: `url` MUST be a non-empty valid
-	/// absolute URI and `elicitationId` MUST be non-empty (throws otherwise).
-	static InputRequest elicitationUrl(string id, string message, string url, string elicitationId) @safe
+	/// form, the client is directed to a `url` to gather input out-of-band. The
+	/// draft `ElicitRequestURLParams` is `{mode:"url", message, url}` — correlation
+	/// is the MRTR `InputRequest.id`, so the request carries no `elicitationId`
+	/// (removed from the draft). `url` MUST be a non-empty valid absolute URI.
+	static InputRequest elicitationUrl(string id, string message, string url) @safe
 	{
 		if (url.length == 0)
 			throw invalidParams("URL-mode elicitation requires a non-empty url");
 		if (!isValidElicitationUrl(url))
 			throw invalidParams("URL-mode elicitation requires a valid url (absolute URI): " ~ url);
-		if (elicitationId.length == 0)
-			throw invalidParams("URL-mode elicitation requires a non-empty elicitationId");
 		Json p = Json.emptyObject;
 		p["mode"] = "url";
 		p["message"] = message;
 		p["url"] = url;
-		p["elicitationId"] = elicitationId;
 		return InputRequest(id, "elicitation", p);
 	}
 
@@ -697,16 +771,6 @@ struct InputRequest
 		if (params.type == Json.Type.object && "url" in params
 				&& params["url"].type == Json.Type.string)
 			return params["url"].get!string;
-		return "";
-	}
-
-	/// Read `params["elicitationId"]` as a string (`""` when absent) — the reader
-	/// counterpart to the `elicitationUrl` builder.
-	string elicitationIdField() @safe
-	{
-		if (params.type == Json.Type.object && "elicitationId" in params
-				&& params["elicitationId"].type == Json.Type.string)
-			return params["elicitationId"].get!string;
 		return "";
 	}
 
@@ -1588,8 +1652,10 @@ unittest  // paramHeaders: recurses into nested object properties (any nesting d
 	assert(phs[0].header == "Mcp-Param-Region");
 }
 
-unittest  // paramHeaders: recurses into array items schemas
+unittest  // x-mcp-header under array items is not statically reachable: rejected and not surfaced
 {
+	// The draft requires annotated properties to be reachable via a chain of
+	// `properties` keys only; a chain through `items` (an array keyword) is invalid.
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
 	Json itemProps = Json.emptyObject;
@@ -1607,10 +1673,72 @@ unittest  // paramHeaders: recurses into array items schemas
 	props["entries"] = arr;
 	schema["properties"] = props;
 
-	auto phs = paramHeaders(schema);
-	assert(phs.length == 1);
-	assert(phs[0].path == ["entries", "tag"]);
-	assert(phs[0].header == "Mcp-Param-Tag");
+	assert(validateInputSchemaHeaders(schema) !is null);
+	assert(paramHeaders(schema).length == 0);
+}
+
+unittest  // x-mcp-header under composition (oneOf/anyOf/allOf/not) is rejected
+{
+	foreach (key; ["oneOf", "anyOf", "allOf", "not"])
+	{
+		Json branch = Json.emptyObject;
+		branch["type"] = "object";
+		branch["properties"] = Json([
+			"region": Json([
+				"type": Json("string"),
+				"x-mcp-header": Json("Region")
+			])
+		]);
+		Json schema = Json.emptyObject;
+		schema["type"] = "object";
+		if (key == "not")
+			schema[key] = branch;
+		else
+			schema[key] = Json([branch]);
+		assert(validateInputSchemaHeaders(schema) !is null,
+				"annotation under " ~ key ~ " must reject");
+		assert(paramHeaders(schema).length == 0);
+	}
+}
+
+unittest  // x-mcp-header under conditional (if/then/else) is rejected
+{
+	foreach (key; ["if", "then", "else"])
+	{
+		Json branch = Json.emptyObject;
+		branch["type"] = "object";
+		branch["properties"] = Json([
+			"region": Json([
+				"type": Json("string"),
+				"x-mcp-header": Json("Region")
+			])
+		]);
+		Json schema = Json.emptyObject;
+		schema["type"] = "object";
+		schema[key] = branch;
+		assert(validateInputSchemaHeaders(schema) !is null,
+				"annotation under " ~ key ~ " must reject");
+	}
+}
+
+unittest  // x-mcp-header reachable only through $ref/$defs is rejected
+{
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	schema["properties"] = Json(["filter": Json(["$ref": Json("#/$defs/F")])]);
+	schema["$defs"] = Json([
+		"F": Json([
+			"type": Json("object"),
+			"properties": Json([
+				"region": Json([
+					"type": Json("string"),
+					"x-mcp-header": Json("Region")
+				])
+			])
+		])
+	]);
+	assert(validateInputSchemaHeaders(schema) !is null);
+	assert(paramHeaders(schema).length == 0);
 }
 
 unittest  // paramHeaders: number-typed annotations are skipped (not collected)
@@ -1626,7 +1754,7 @@ unittest  // paramHeaders: number-typed annotations are skipped (not collected)
 	assert(paramHeaders(schema).length == 0);
 }
 
-unittest  // paramHeaders: collects annotations under array-form (tuple) items
+unittest  // x-mcp-header under array-form (tuple) items is rejected, not surfaced
 {
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
@@ -1645,13 +1773,11 @@ unittest  // paramHeaders: collects annotations under array-form (tuple) items
 	props["entries"] = arr;
 	schema["properties"] = props;
 
-	auto phs = paramHeaders(schema);
-	assert(phs.length == 1);
-	assert(phs[0].path == ["entries", "tag"]);
-	assert(phs[0].header == "Mcp-Param-Tag");
+	assert(validateInputSchemaHeaders(schema) !is null);
+	assert(paramHeaders(schema).length == 0);
 }
 
-unittest  // paramHeaders: collects annotations under prefixItems element schemas
+unittest  // x-mcp-header under prefixItems element schemas is rejected, not surfaced
 {
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
@@ -1670,10 +1796,8 @@ unittest  // paramHeaders: collects annotations under prefixItems element schema
 	props["coords"] = arr;
 	schema["properties"] = props;
 
-	auto phs = paramHeaders(schema);
-	assert(phs.length == 1);
-	assert(phs[0].path == ["coords", "region"]);
-	assert(phs[0].header == "Mcp-Param-Region");
+	assert(validateInputSchemaHeaders(schema) !is null);
+	assert(paramHeaders(schema).length == 0);
 }
 
 unittest  // validateInputSchemaHeaders: rejects CR/LF header on array-form items element
@@ -1718,23 +1842,23 @@ unittest  // validateInputSchemaHeaders: rejects number-typed header on prefixIt
 	assert(validateInputSchemaHeaders(schema) !is null);
 }
 
-unittest  // InputRequest.elicitationUrl builds url-mode params with the four fields
+unittest  // InputRequest.elicitationUrl builds draft url-mode params (no elicitationId)
 {
-	auto ir = InputRequest.elicitationUrl("e1", "Authorize access",
-			"https://example.com/consent", "elic-123");
+	auto ir = InputRequest.elicitationUrl("e1", "Authorize access", "https://example.com/consent");
 	assert(ir.type == "elicitation");
 	assert(ir.kind.get == InputKind.elicitation);
 	assert(ir.params["mode"].get!string == "url");
 	assert(ir.params["message"].get!string == "Authorize access");
 	assert(ir.params["url"].get!string == "https://example.com/consent");
-	assert(ir.params["elicitationId"].get!string == "elic-123");
+	// The draft removed elicitationId from url-mode requests; correlation is the
+	// MRTR request id.
+	assert("elicitationId" !in ir.params);
 }
 
-unittest  // InputRequest.elicitationUrl readers round-trip url and elicitationId
+unittest  // InputRequest.elicitationUrl readers round-trip url and message
 {
-	auto ir = InputRequest.elicitationUrl("e1", "msg", "https://example.com/consent", "elic-123");
+	auto ir = InputRequest.elicitationUrl("e1", "msg", "https://example.com/consent");
 	assert(ir.elicitationUrl() == "https://example.com/consent");
-	assert(ir.elicitationIdField() == "elic-123");
 	assert(ir.elicitationMessage() == "msg");
 }
 
@@ -1743,7 +1867,7 @@ unittest  // InputRequest.elicitationUrl rejects empty url
 	import std.exception : assertThrown;
 	import mcp.protocol.errors : McpException;
 
-	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "", "elic-1"));
+	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", ""));
 }
 
 unittest  // InputRequest.elicitationUrl rejects a malformed (non-absolute) url
@@ -1751,15 +1875,7 @@ unittest  // InputRequest.elicitationUrl rejects a malformed (non-absolute) url
 	import std.exception : assertThrown;
 	import mcp.protocol.errors : McpException;
 
-	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "not a url", "elic-1"));
-}
-
-unittest  // InputRequest.elicitationUrl rejects empty elicitationId
-{
-	import std.exception : assertThrown;
-	import mcp.protocol.errors : McpException;
-
-	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "https://example.com", ""));
+	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "not a url"));
 }
 
 unittest  // InputRequest.fromJson: non-string "method" field is treated as unknown type

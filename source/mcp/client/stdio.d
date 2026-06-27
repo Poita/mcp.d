@@ -99,6 +99,13 @@ final class StdioClientTransport : ClientTransport
 	{
 	}
 
+	/// stdio signals cancellation with `notifications/cancelled` (it has no
+	/// per-request stream to close), so cancellation is never by stream close.
+	bool cancelsByStreamClose() @safe
+	{
+		return false;
+	}
+
 	/// No-op: there is no standalone server->client stream over stdio (the single
 	/// duplex channel already carries server->client traffic).
 	void startServerStream() @safe

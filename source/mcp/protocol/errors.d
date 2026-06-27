@@ -17,16 +17,17 @@ enum ErrorCode : int
 	// MCP-specific
 	resourceNotFound = -32002,
 	requestCancelled = -32800,
-	// draft Streamable HTTP: header/body validation failure
-	headerMismatch = -32001,
-	// draft: requested protocol version not supported (data: {supported, requested})
-	unsupportedProtocolVersion = -32004,
-	// draft basic/lifecycle (draft/schema MissingRequiredClientCapabilityError):
-	// returned when processing a request requires a capability the client did
-	// NOT declare in its `clientCapabilities`. HTTP transports MUST map this to
-	// a 400 response. The error carries `data.requiredCapabilities` (a
-	// ClientCapabilities object describing the capabilities the request needs).
-	missingRequiredClientCapability = -32003,
+	// MCP-allocated codes live in -32020..-32099 (sequential from -32020). The
+	// values below are emitted only to modern peers.
+	// Streamable HTTP: header/body validation failure.
+	headerMismatch = -32020,
+	// basic/lifecycle (MissingRequiredClientCapabilityError): processing a request
+	// requires a capability the client did NOT declare in its `clientCapabilities`.
+	// HTTP transports MUST map this to a 400 response; the error carries
+	// `data.requiredCapabilities` (a ClientCapabilities object).
+	missingRequiredClientCapability = -32021,
+	// requested protocol version not supported (data: {supported, requested}).
+	unsupportedProtocolVersion = -32022,
 	// 2025-11-25 (elicitation §"URL Elicitation Required Error"): a request
 	// cannot be processed until a URL-mode elicitation is completed. The error
 	// MUST carry a `data.elicitations` list of URL-mode elicitations.
@@ -335,7 +336,7 @@ McpException userRejected(string message = "User rejected sampling request",
 	return new McpException(ErrorCode.userRejected, message, data);
 }
 
-/// Build the `-32003` `MissingRequiredClientCapabilityError` a server returns
+/// Build the `-32021` `MissingRequiredClientCapabilityError` a server returns
 /// when processing a request requires a client capability that was not declared
 /// in the peer's `clientCapabilities` (draft basic/lifecycle,
 /// draft/schema MissingRequiredClientCapabilityError). HTTP transports MUST map
@@ -414,10 +415,20 @@ unittest  // toErrorJson includes data when present
 	assert(j["data"]["field"].get!string == "name");
 }
 
+unittest  // draft spec finalizes the MCP-allocated error codes in the -32020.. range
+{
+	// The spec allocates `-32020`..`-32099` for MCP-defined codes (sequential from
+	// -32020). The Streamable-HTTP/MRTR codes — emitted only to modern peers — take
+	// their finalized values; `-32001`/`-32003`/`-32004` were never released codes.
+	assert(ErrorCode.headerMismatch == -32020);
+	assert(ErrorCode.missingRequiredClientCapability == -32021);
+	assert(ErrorCode.unsupportedProtocolVersion == -32022);
+}
+
 unittest  // urlElicitationRequired and missingRequiredClientCapability are distinct codes
 {
 	assert(ErrorCode.urlElicitationRequired == -32042);
-	assert(ErrorCode.missingRequiredClientCapability == -32003);
+	assert(ErrorCode.missingRequiredClientCapability == -32021);
 	assert(ErrorCode.urlElicitationRequired != ErrorCode.missingRequiredClientCapability);
 }
 
@@ -481,12 +492,12 @@ unittest  // urlElicitationRequired rejects an entry missing url
 	]));
 }
 
-unittest  // missingRequiredClientCapability uses the -32003 code
+unittest  // missingRequiredClientCapability uses the -32021 code
 {
 	ClientCapabilities req;
 	req.sampling = true;
 	auto e = missingRequiredClientCapability(req);
-	assert(e.code == -32003);
+	assert(e.code == -32021);
 	assert(e.code == ErrorCode.missingRequiredClientCapability);
 }
 
