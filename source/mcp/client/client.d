@@ -645,7 +645,7 @@ final class McpClient : ClientProtocol
 	///     `_meta`, otherwise an `initialize` handshake for that stable version);
 	///   - `Method not found` (-32601) → legacy server; fall back to the
 	///     `initialize` handshake;
-	///   - `UnsupportedProtocolVersionError` (-32004) → modern server; pick from
+	///   - `UnsupportedProtocolVersionError` (-32022) → modern server; pick from
 	///     the advertised `supported` list rather than falling back.
 	/// Returns the negotiated protocol version. Throws if there is no mutually
 	/// supported version, or on any other error.

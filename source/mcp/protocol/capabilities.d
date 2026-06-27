@@ -492,7 +492,7 @@ struct ClientCapabilities
 
 	/// Compute the capabilities this object requires that are NOT present in
 	/// `declared`. Used by a server to build the `data.requiredCapabilities`
-	/// payload of a `-32003 MissingRequiredClientCapabilityError`: `this` is the
+	/// payload of a `-32021 MissingRequiredClientCapabilityError`: `this` is the
 	/// set a request needs, `declared` is what the client actually advertised,
 	/// and the result is a `ClientCapabilities` containing exactly the missing
 	/// ones. A capability is satisfied when the client declared at least the same

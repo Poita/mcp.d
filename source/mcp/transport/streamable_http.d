@@ -1697,7 +1697,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// REQUIRED for "All requests and notifications". A draft client POSTing
 		// a notification (e.g. notifications/initialized, notifications/cancelled)
 		// with a missing or mismatched Mcp-Method MUST be rejected with 400 and a
-		// -32001 HeaderMismatch error. The error body carries no id (a
+		// -32020 HeaderMismatch error. The error body carries no id (a
 		// notification has none). Pre-draft versions skip this (header undefined).
 		const isDraftNote = tryDraft(
 				req.headers.get(HttpHeader.protocolVersion, ""))
@@ -1985,9 +1985,9 @@ unittest  // the standalone GET SSE stream uses the same session gate as POST/DE
 /// surface. Successful results and ordinary application errors ride on `200`.
 /// The draft reserves specific statuses so intermediaries — and clients probing
 /// modern-vs-legacy servers — can act without parsing the body:
-///   - `UnsupportedProtocolVersionError` (-32004) -> `400` (all modern versions),
-///   - `HeaderMismatch` (-32001) -> `400`,
-///   - `MissingRequiredClientCapability` (-32003) -> `400` (all modern versions),
+///   - `UnsupportedProtocolVersionError` (-32022) -> `400` (all modern versions),
+///   - `HeaderMismatch` (-32020) -> `400`,
+///   - `MissingRequiredClientCapability` (-32021) -> `400` (all modern versions),
 ///   - `Method not found` (-32601) -> `404` on draft requests, which lets a client
 ///     tell a modern MCP endpoint apart from a legacy HTTP+SSE `404`. Pre-draft
 ///     versions keep the legacy JSON-RPC-error-over-`200` shape.
@@ -2065,7 +2065,7 @@ unittest  // released versions never suppress on disconnect (draft-only MUST)
 }
 
 /// Validate the draft Streamable HTTP request headers against the JSON-RPC body.
-/// Returns a `HeaderMismatch` (-32001) exception on failure, or null when the
+/// Returns a `HeaderMismatch` (-32020) exception on failure, or null when the
 /// request is valid — or when the request is not a draft request (older versions
 /// did not define these headers, so they are not enforced).
 ///
@@ -2124,7 +2124,7 @@ McpException validateDraftHeaders(string protoHeader, string methodHeader,
 /// 2025-06-18 / 2025-11-25 transport ("Protocol Version Header"): if the header
 /// is present but carries an invalid or unsupported version, the server MUST
 /// respond with `400 Bad Request`. Returns an `UnsupportedProtocolVersionError`
-/// (-32004, which the transport maps to HTTP 400) in that case, else null.
+/// (-32022, which the transport maps to HTTP 400) in that case, else null.
 ///
 /// An absent header is permitted: older clients omit it, and the request then
 /// proceeds under the previously negotiated version.
@@ -2842,7 +2842,7 @@ unittest  // the draft MCP-Protocol-Version header passes
 	assert(validateProtocolVersionHeader("draft") is null);
 }
 
-unittest  // an unsupported/invalid MCP-Protocol-Version header is rejected with -32004 (HTTP 400)
+unittest  // an unsupported/invalid MCP-Protocol-Version header is rejected with -32022 (HTTP 400)
 {
 	auto e = validateProtocolVersionHeader("1.0.0");
 	assert(e !is null);

@@ -1712,9 +1712,9 @@ bool isLegacyFallbackStatus(int status) pure nothrow @safe @nogc
 /// proves the peer speaks a *modern* MCP version (so the client should retry /
 /// correct rather than fall back to the legacy HTTP+SSE transport). Per draft
 /// basic/transports §Backward Compatibility the disambiguating modern errors a
-/// 4xx body may carry are `UnsupportedProtocolVersionError` (-32004),
-/// `HeaderMismatch` (-32001, header-validation failure),
-/// `MissingRequiredClientCapabilityError` (-32003), and — for a 404 to an
+/// 4xx body may carry are `UnsupportedProtocolVersionError` (-32022),
+/// `HeaderMismatch` (-32020, header-validation failure),
+/// `MissingRequiredClientCapabilityError` (-32021), and — for a 404 to an
 /// unimplemented modern method — `Method not found` (-32601). These mirror the
 /// codes the SDK's own server emits via `httpStatusForResponse`.
 bool isModernRpcErrorCode(int code) pure nothrow @safe @nogc
@@ -1972,10 +1972,10 @@ unittest  // isModernRpcErrorCode recognises the modern-vs-legacy disambiguators
 	// Per draft basic/transports §Backward Compatibility, these are the
 	// JSON-RPC error codes a 400/404/405 body may carry to prove the server
 	// speaks a modern MCP version rather than being a legacy HTTP+SSE server.
-	assert(isModernRpcErrorCode(ErrorCode.unsupportedProtocolVersion)); // -32004
-	assert(isModernRpcErrorCode(ErrorCode.headerMismatch)); // -32001
+	assert(isModernRpcErrorCode(ErrorCode.unsupportedProtocolVersion)); // -32022
+	assert(isModernRpcErrorCode(ErrorCode.headerMismatch)); // -32020
 	assert(isModernRpcErrorCode(ErrorCode.methodNotFound)); // -32601
-	assert(isModernRpcErrorCode(ErrorCode.missingRequiredClientCapability)); // -32003
+	assert(isModernRpcErrorCode(ErrorCode.missingRequiredClientCapability)); // -32021
 }
 
 unittest  // isModernRpcErrorCode rejects unrelated codes
@@ -1989,7 +1989,7 @@ unittest  // modernErrorFromBody surfaces a recognized modern JSON-RPC error
 {
 	// 400 + UnsupportedProtocolVersionError body → typed McpException, NOT legacy.
 	McpException err;
-	assert(modernErrorFromBody(`{"jsonrpc":"2.0","id":1,"error":{"code":-32004,"message":"bad version","data":{"supported":["2025-11-25"]}}}`,
+	assert(modernErrorFromBody(`{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"bad version","data":{"supported":["2025-11-25"]}}}`,
 			err));
 	assert(err !is null);
 	assert(err.code == ErrorCode.unsupportedProtocolVersion);

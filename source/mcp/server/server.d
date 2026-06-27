@@ -51,7 +51,7 @@ struct RegisteredTool
 	Tool descriptor;
 	MrtrToolHandler handler;
 	/// Client capabilities this tool's handler requires to run. On the draft
-	/// protocol, `tools/call` rejects with a `-32003`
+	/// protocol, `tools/call` rejects with a `-32021`
 	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
 	/// lists the unmet ones) when the request's declared client capabilities do
 	/// not cover these. Empty (the default) means no gating.
@@ -72,7 +72,7 @@ struct RegisteredResource
 	/// Per-resource draft `CacheableResult` freshness hint for `resources/read`.
 	Nullable!CacheHint cache;
 	/// Client capabilities this resource's reader requires to run. On the draft
-	/// protocol, `resources/read` rejects with a `-32003`
+	/// protocol, `resources/read` rejects with a `-32021`
 	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
 	/// lists the unmet ones) when the request's declared client capabilities do
 	/// not cover these. Empty (the default) means no gating.
@@ -94,7 +94,7 @@ struct RegisteredTemplate
 	/// Per-template draft `CacheableResult` freshness hint for `resources/read`.
 	Nullable!CacheHint cache;
 	/// Client capabilities this template's reader requires to run. On the draft
-	/// protocol, `resources/read` rejects with a `-32003`
+	/// protocol, `resources/read` rejects with a `-32021`
 	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
 	/// lists the unmet ones) when the request's declared client capabilities do
 	/// not cover these. Empty (the default) means no gating.
@@ -109,7 +109,7 @@ struct RegisteredPrompt
 	Prompt descriptor;
 	MrtrPromptHandler handler;
 	/// Client capabilities this prompt's handler requires to run. On the draft
-	/// protocol, `prompts/get` rejects with a `-32003`
+	/// protocol, `prompts/get` rejects with a `-32021`
 	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
 	/// lists the unmet ones) when the request's declared client capabilities do
 	/// not cover these. Empty (the default) means no gating.
@@ -443,7 +443,7 @@ final class McpServer : ServerCore
 	///
 	/// On the draft protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `tools/call` for this tool is rejected up front
-	/// with a `-32003` `MissingRequiredClientCapabilityError` — whose
+	/// with a `-32021` `MissingRequiredClientCapabilityError` — whose
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
 	/// exactly the unmet capabilities — when the request's declared capabilities
 	/// do not cover `caps` (draft basic/lifecycle: "A server MUST NOT rely on
@@ -464,7 +464,7 @@ final class McpServer : ServerCore
 	///
 	/// On the draft protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `prompts/get` for this prompt is rejected up
-	/// front with a `-32003` `MissingRequiredClientCapabilityError` — whose
+	/// front with a `-32021` `MissingRequiredClientCapabilityError` — whose
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
 	/// exactly the unmet capabilities — when the request's declared capabilities
 	/// do not cover `caps`. On the stateful 2025-era protocols the gate uses the
@@ -485,7 +485,7 @@ final class McpServer : ServerCore
 	///
 	/// On the draft protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `resources/read` for a URI matching this
-	/// resource is rejected up front with a `-32003`
+	/// resource is rejected up front with a `-32021`
 	/// `MissingRequiredClientCapabilityError` — whose
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
 	/// exactly the unmet capabilities — when the request's declared capabilities
@@ -509,7 +509,7 @@ final class McpServer : ServerCore
 	///
 	/// On the draft protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `resources/read` for a URI matching this
-	/// template is rejected up front with a `-32003`
+	/// template is rejected up front with a `-32021`
 	/// `MissingRequiredClientCapabilityError` — whose
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
 	/// exactly the unmet capabilities — when the request's declared capabilities
@@ -2103,7 +2103,7 @@ final class McpServer : ServerCore
 		return maybeCache(result, listHint(listMethod), ver);
 	}
 
-	/// Build the draft `UnsupportedProtocolVersionError` (-32004) listing the
+	/// Build the draft `UnsupportedProtocolVersionError` (-32022) listing the
 	/// versions this server supports and the one the client requested.
 	private McpException unsupportedVersionError(string requested) @safe
 	{
@@ -2996,7 +2996,7 @@ final class McpServer : ServerCore
 
 		// Capability gating (draft basic/lifecycle): a server MUST NOT rely on a
 		// capability the client did not declare. When this tool declares required
-		// client capabilities, reject the call with a `-32003`
+		// client capabilities, reject the call with a `-32021`
 		// `MissingRequiredClientCapabilityError` listing the unmet ones in
 		// `data.requiredCapabilities`. The set the client actually declared is
 		// taken from this request's `_meta.clientCapabilities` on the stateless
@@ -6274,7 +6274,7 @@ unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
 	assert(done["result"]["result"]["structuredContent"]["approved"].get!bool);
 }
 
-unittest  // draft tools/call rejects with -32003 when a required client cap is undeclared
+unittest  // draft tools/call rejects with -32021 when a required client cap is undeclared
 {
 	auto s = makeTestServer();
 	// The "add" tool now requires the client to support sampling.
@@ -6284,7 +6284,7 @@ unittest  // draft tools/call rejects with -32003 when a required client cap is 
 	// draftReq declares empty clientCapabilities -> sampling is missing.
 	Json p = Json(["name": Json("add"), "arguments": Json.emptyObject]);
 	auto resp = s.handle(draftReq(7, "tools/call", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 	assert("requiredCapabilities" in resp["error"]["data"]);
 	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
 }
@@ -6347,10 +6347,10 @@ unittest  // stateful (2025-era) tools/call gates on negotiated session capabili
 		"arguments": Json(["a": Json(1), "b": Json(1)])
 	]);
 	auto resp = s.handle(req(2, "tools/call", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 }
 
-unittest  // draft prompts/get rejects with -32003 when a required client cap is undeclared
+unittest  // draft prompts/get rejects with -32021 when a required client cap is undeclared
 {
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet"};
@@ -6361,7 +6361,7 @@ unittest  // draft prompts/get rejects with -32003 when a required client cap is
 	// draftReq declares empty clientCapabilities -> sampling is missing.
 	Json p = Json(["name": Json("greet")]);
 	auto resp = s.handle(draftReq(1, "prompts/get", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 	assert("requiredCapabilities" in resp["error"]["data"]);
 	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
 }
@@ -6409,10 +6409,10 @@ unittest  // stateful (2025-era) prompts/get gates on negotiated session capabil
 	s.handle(req(1, "initialize", initP));
 	Json p = Json(["name": Json("greet")]);
 	auto resp = s.handle(req(2, "prompts/get", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 }
 
-unittest  // draft resources/read rejects with -32003 when a required client cap is undeclared
+unittest  // draft resources/read rejects with -32021 when a required client cap is undeclared
 {
 	auto s = new McpServer("t", "1");
 	s.registerResource(Resource("res://x", "x"), () @safe {
@@ -6425,7 +6425,7 @@ unittest  // draft resources/read rejects with -32003 when a required client cap
 	// draftReq declares empty clientCapabilities -> sampling is missing.
 	Json p = Json(["uri": Json("res://x")]);
 	auto resp = s.handle(draftReq(1, "resources/read", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 	assert("requiredCapabilities" in resp["error"]["data"]);
 	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
 }
@@ -6475,10 +6475,10 @@ unittest  // stateful (2025-era) resources/read gates on negotiated session capa
 	s.handle(req(1, "initialize", initP));
 	Json p = Json(["uri": Json("res://x")]);
 	auto resp = s.handle(req(2, "resources/read", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 }
 
-unittest  // draft resources/read via template rejects with -32003 when cap undeclared
+unittest  // draft resources/read via template rejects with -32021 when cap undeclared
 {
 	auto s = new McpServer("t", "1");
 	ResourceTemplate tmpl = {uriTemplate: "res://{id}", name: "item"};
@@ -6491,7 +6491,7 @@ unittest  // draft resources/read via template rejects with -32003 when cap unde
 	assert(s.setResourceTemplateRequiredClientCapabilities("res://{id}", reqCap));
 	Json p = Json(["uri": Json("res://42")]);
 	auto resp = s.handle(draftReq(1, "resources/read", p)).get;
-	assert(resp["error"]["code"].get!long == -32003);
+	assert(resp["error"]["code"].get!long == -32021);
 	assert("requiredCapabilities" in resp["error"]["data"]);
 }
 
