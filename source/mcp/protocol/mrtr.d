@@ -230,7 +230,7 @@ bool isUserMetaKeyAllowed(string key, ProtocolVersion v) @safe pure nothrow
 /// absent id — `undefined`, `null`, or an empty string — is a no-op (the
 /// notification is returned unchanged). Notifications carry their payload under
 /// `params`, so the key is nested as `params._meta.<subscriptionId>`.
-Json withSubscriptionId(Json notification, Json subscriptionId) @safe
+Json withListenSubscriptionId(Json notification, Json subscriptionId) @safe
 {
 	if (subscriptionId.type == Json.Type.undefined
 			|| subscriptionId.type == Json.Type.null_
@@ -285,31 +285,31 @@ unittest  // subscriptionsListenResult preserves a numeric listen id in both id 
 	assert(r["result"]["_meta"][MetaKey.subscriptionId].get!long == 7);
 }
 
-unittest  // withSubscriptionId stamps the listen request id into params._meta
+unittest  // withListenSubscriptionId stamps the listen request id into params._meta
 {
 	auto n = Json([
 		"jsonrpc": Json("2.0"),
 		"method": Json("notifications/tools/list_changed")
 	]);
-	auto stamped = withSubscriptionId(n, Json("listen-7"));
+	auto stamped = withListenSubscriptionId(n, Json("listen-7"));
 	assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "listen-7");
 	// The original is left untouched.
 	assert("params" !in n);
 }
 
-unittest  // withSubscriptionId preserves a numeric JSON-RPC id verbatim (RequestId = string | number)
+unittest  // withListenSubscriptionId preserves a numeric JSON-RPC id verbatim (RequestId = string | number)
 {
 	auto n = Json([
 		"jsonrpc": Json("2.0"),
 		"method": Json("notifications/tools/list_changed")
 	]);
-	auto stamped = withSubscriptionId(n, Json(42L));
+	auto stamped = withListenSubscriptionId(n, Json(42L));
 	auto id = stamped["params"]["_meta"][MetaKey.subscriptionId];
 	assert(id.type == Json.Type.int_, "a numeric listen id must stay numeric, not be stringified");
 	assert(id.get!long == 42);
 }
 
-unittest  // withSubscriptionId preserves an existing params payload and _meta entries
+unittest  // withListenSubscriptionId preserves an existing params payload and _meta entries
 {
 	Json params = Json.emptyObject;
 	params["uri"] = "file:///x";
@@ -321,19 +321,19 @@ unittest  // withSubscriptionId preserves an existing params payload and _meta e
 		"method": Json("notifications/resources/updated"),
 		"params": params
 	]);
-	auto stamped = withSubscriptionId(n, Json("id-42"));
+	auto stamped = withListenSubscriptionId(n, Json("id-42"));
 	assert(stamped["params"]["uri"].get!string == "file:///x");
 	assert(stamped["params"]["_meta"]["other.vendor/flag"].get!bool);
 	assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "id-42");
 }
 
-unittest  // withSubscriptionId with an empty id is a no-op
+unittest  // withListenSubscriptionId with an empty id is a no-op
 {
 	auto n = Json([
 		"jsonrpc": Json("2.0"),
 		"method": Json("notifications/message")
 	]);
-	auto same = withSubscriptionId(n, Json(""));
+	auto same = withListenSubscriptionId(n, Json(""));
 	assert("params" !in same);
 }
 

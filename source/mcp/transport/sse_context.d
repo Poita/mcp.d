@@ -11,7 +11,7 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.transport.coordinator : throwOrReturn;
 import mcp.protocol.capabilities;
-import mcp.protocol.mrtr : withSubscriptionId;
+import mcp.protocol.mrtr : withListenSubscriptionId;
 import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
 import mcp.server.context;
 import mcp.server.connection : ConnectionState;
@@ -898,7 +898,7 @@ final class ServerPushChannel : PushChannel
 					return false; // removed by a concurrent path before we reached it
 
 				const eid = ordinal.to!string ~ "-" ~ seq.to!string;
-				const frame = formatSseEvent(eid, withSubscriptionId(msg, l.subscriptionId));
+				const frame = formatSseEvent(eid, withListenSubscriptionId(msg, l.subscriptionId));
 				try
 				{
 					l.write(frame);

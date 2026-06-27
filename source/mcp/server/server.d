@@ -1192,8 +1192,8 @@ final class McpServer : ServerCore
 		// subscriptions). This is in addition to any HTTP push channel below.
 		if (stdioListenSink !is null)
 		{
-			auto note = withSubscriptionId(makeNotification(method, params),
-					stdioListenSubscriptionId);
+			auto note = withListenSubscriptionId(makeNotification(method,
+					params), stdioListenSubscriptionId);
 			stdioListenSink(note.toString());
 			delivered++;
 		}
@@ -1256,8 +1256,8 @@ final class McpServer : ServerCore
 		// streams' opt-ins do not leak into this ack. Stamped with the subscriptionId.
 		Json ackParams = Json.emptyObject;
 		ackParams["notifications"] = acknowledgedSubsetFor(stdioListenFilter_);
-		auto ack = withSubscriptionId(makeNotification("notifications/subscriptions/acknowledged",
-				ackParams), stdioListenSubscriptionId);
+		auto ack = withListenSubscriptionId(makeNotification(
+				"notifications/subscriptions/acknowledged", ackParams), stdioListenSubscriptionId);
 		writeLine(ack.toString());
 		return true;
 	}
@@ -1401,8 +1401,8 @@ final class McpServer : ServerCore
 		// `pushChannel` on the stdio transport.
 		if (stdioListenSink !is null && stdioListenFilter_.accepts(method, uri))
 		{
-			auto note = withSubscriptionId(makeNotification(method, params),
-					stdioListenSubscriptionId);
+			auto note = withListenSubscriptionId(makeNotification(method,
+					params), stdioListenSubscriptionId);
 			stdioListenSink(note.toString());
 			delivered++;
 		}
