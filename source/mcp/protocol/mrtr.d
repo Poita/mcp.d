@@ -248,6 +248,43 @@ Json withSubscriptionId(Json notification, Json subscriptionId) @safe
 	return n;
 }
 
+/// Build the JSON-RPC response for a `subscriptions/listen` request the server is
+/// gracefully tearing down (draft basic/utilities/subscriptions
+/// `SubscriptionsListenResult`). The long-lived listen stream emits this single
+/// response only on graceful teardown — e.g. server shutdown or an accepted
+/// cancellation; an abrupt transport close carries no response. The result body is
+/// `{resultType:"complete", _meta:{subscriptionId}}`, and the response `id` equals
+/// the listen request's id (carried verbatim, preserving its JSON type).
+Json subscriptionsListenResult(Json subscriptionId) @safe
+{
+	Json meta = Json.emptyObject;
+	meta[MetaKey.subscriptionId] = subscriptionId;
+	Json result = Json.emptyObject;
+	result["resultType"] = "complete";
+	result["_meta"] = meta;
+	Json resp = Json.emptyObject;
+	resp["jsonrpc"] = "2.0";
+	resp["id"] = subscriptionId;
+	resp["result"] = result;
+	return resp;
+}
+
+unittest  // subscriptionsListenResult is a complete result carrying the listen id as id and subscriptionId
+{
+	auto r = subscriptionsListenResult(Json("listen-1"));
+	assert(r["jsonrpc"].get!string == "2.0");
+	assert(r["id"].get!string == "listen-1");
+	assert(r["result"]["resultType"].get!string == "complete");
+	assert(r["result"]["_meta"][MetaKey.subscriptionId].get!string == "listen-1");
+}
+
+unittest  // subscriptionsListenResult preserves a numeric listen id in both id and subscriptionId
+{
+	auto r = subscriptionsListenResult(Json(7L));
+	assert(r["id"].type == Json.Type.int_ && r["id"].get!long == 7);
+	assert(r["result"]["_meta"][MetaKey.subscriptionId].get!long == 7);
+}
+
 unittest  // withSubscriptionId stamps the listen request id into params._meta
 {
 	auto n = Json([

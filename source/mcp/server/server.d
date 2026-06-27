@@ -2185,6 +2185,10 @@ final class McpServer : ServerCore
 		if (stdioListenSink !is null && stdioListenSubscriptionId.type != Json.Type.undefined
 				&& rpcIdString(params["requestId"]) == rpcIdString(stdioListenSubscriptionId))
 		{
+			// Graceful teardown: the long-lived listen request returns its single
+			// response now — the `SubscriptionsListenResult` (draft
+			// basic/utilities/subscriptions) — before the stream closes.
+			stdioListenSink(subscriptionsListenResult(stdioListenSubscriptionId).toString());
 			stdioListenSink = null;
 			stdioListenSubscriptionId = Json.init;
 			// Drop every piece of listen state this single stdio stream recorded so

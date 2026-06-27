@@ -1658,6 +1658,36 @@ unittest  // after a stdio subscriptions/listen, notify* change notifications fl
 	assert(sid.get!long == 5);
 }
 
+unittest  // a stdio subscriptions/listen returns a SubscriptionsListenResult on graceful teardown
+{
+	auto s = new McpServer("listen-srv", "1.0");
+	s.enableToolsListChanged();
+
+	Json filter = Json.emptyObject;
+	filter["toolsListChanged"] = true;
+
+	string[] outputs;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(draftListenLine(5, filter));
+		foreach (_; 0 .. 8)
+			yield();
+		// The client cancels the listen by notifications/cancelled referencing its id;
+		// the server tears the subscription down gracefully.
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}`);
+		foreach (_; 0 .. 8)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	// Output 0 is the acknowledgement; output 1 is the graceful-teardown response.
+	assert(outputs.length == 2);
+	auto res = parseJsonString(outputs[1]);
+	assert(res["id"].get!long == 5);
+	assert("result" in res);
+	assert(res["result"]["resultType"].get!string == "complete");
+	assert(res["result"]["_meta"][MetaKey.subscriptionId].get!long == 5);
+}
+
 unittest  // a pre-draft (no protocolVersion) subscriptions/listen is method-not-found on the normal request/reply path over stdio
 {
 	// `subscriptions/listen` is a draft-only RPC. The genuine draft stdio listen
