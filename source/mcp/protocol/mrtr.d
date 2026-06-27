@@ -428,11 +428,15 @@ struct ParamHeader
 }
 
 /// Collect every valid `x-mcp-header` annotation in a tool `inputSchema`,
-/// recursing into nested `object` properties and `array` `items` schemas — the
-/// draft permits the annotation "at any nesting depth within the inputSchema,
-/// not only top-level properties". Annotations on non-primitive
-/// (`number`/object/array) properties, or with an invalid value, are skipped
-/// here; use `validateInputSchemaHeaders` to reject such schemas up front.
+/// recursing only through chains of `object` `properties` keys. The draft
+/// requires an annotated property to be _statically reachable_ from the schema
+/// root via `properties` alone — never through `items` (or any array keyword),
+/// composition (`oneOf`/`anyOf`/`allOf`/`not`), conditional (`if`/`then`/`else`),
+/// or `$ref` — so annotations sitting under those keywords are not surfaced.
+/// Nested object properties at any depth are permitted. Annotations on
+/// non-primitive (`number`/object/array) properties, or with an invalid value,
+/// are skipped here; use `validateInputSchemaHeaders` to reject such schemas up
+/// front.
 ParamHeader[] paramHeaders(Json inputSchema) @safe
 {
 	ParamHeader[] result;
@@ -460,25 +464,6 @@ ParamHeader[] paramHeaders(Json inputSchema) @safe
 				}
 			}();
 		}
-		// Object-form `items` (single schema) and array-form `items`/`prefixItems`
-		// (tuple schemas, 2020-12). Path is passed through unchanged — array
-		// element indices are not appended, matching the object-`items` case.
-		foreach (key; ["items", "prefixItems"])
-		{
-			if (key !in node)
-				continue;
-			auto sub = node[key];
-			if (sub.type == Json.Type.object)
-				walk(sub, path);
-			else if (sub.type == Json.Type.array)
-			{
-				() @trusted {
-					foreach (Json elem; sub)
-						if (elem.type == Json.Type.object)
-							walk(elem, path);
-				}();
-			}
-		}
 	}
 
 	walk(inputSchema, []);
@@ -488,13 +473,59 @@ ParamHeader[] paramHeaders(Json inputSchema) @safe
 /// Validate every `x-mcp-header` annotation in a tool `inputSchema` against the
 /// draft constraints (`server/tools` #x-mcp-header): non-empty, HTTP token
 /// syntax, no CR/LF, primitive-only (`number` forbidden), and case-insensitive
-/// uniqueness across the whole schema. Returns a human-readable reason on the
-/// first violation, or `null` when every annotation is valid. Recurses to any
-/// nesting depth.
+/// uniqueness across the whole schema. The annotation MUST also sit on a property
+/// that is _statically reachable_ from the root via a chain of `properties` keys
+/// only: an annotation reachable solely through `items` (or any other array
+/// keyword), composition (`oneOf`/`anyOf`/`allOf`/`not`), conditional
+/// (`if`/`then`/`else`), or `$ref`/`$defs` makes the tool definition invalid.
+/// Returns a human-readable reason on the first violation, or `null` when every
+/// annotation is valid.
 string validateInputSchemaHeaders(Json inputSchema) @safe
 {
 	string err;
 	bool[string] seen; // ASCII-lowercased header values already encountered
+
+	// True when `node`, or anything nested within it through any keyword, carries
+	// an `x-mcp-header`. Used to reject annotations that hang off a non-`properties`
+	// keyword and are therefore not statically reachable.
+	bool containsAnnotation(Json node) @safe
+	{
+		bool found;
+		if (node.type == Json.Type.object)
+		{
+			if ("x-mcp-header" in node)
+				return true;
+			() @trusted {
+				foreach (string _, Json v; node)
+					if (containsAnnotation(v))
+					{
+						found = true;
+						break;
+					}
+			}();
+		}
+		else if (node.type == Json.Type.array)
+		{
+			() @trusted {
+				foreach (Json elem; node)
+					if (containsAnnotation(elem))
+					{
+						found = true;
+						break;
+					}
+			}();
+		}
+		return found;
+	}
+
+	// Keywords whose subtrees are NOT a `properties` chain: an annotation reached
+	// only through one of these is not statically reachable (array keywords,
+	// composition, conditional, and reference/definition containers).
+	static immutable string[] nonReachableKeys = [
+		"items", "prefixItems", "additionalItems", "contains", "oneOf", "anyOf",
+		"allOf", "not", "if", "then", "else", "$defs", "definitions"
+	];
+
 	void walk(Json node) @safe
 	{
 		if (err !is null || node.type != Json.Type.object)
@@ -544,25 +575,18 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 				}
 			}();
 		}
-		// Object-form `items` and array-form `items`/`prefixItems` (tuple schemas).
-		foreach (key; ["items", "prefixItems"])
+		// An annotation reachable only through a non-`properties` keyword violates the
+		// statically-reachable rule and invalidates the whole tool definition.
+		foreach (key; nonReachableKeys)
 		{
-			if (err !is null || key !in node)
-				continue;
-			auto sub = node[key];
-			if (sub.type == Json.Type.object)
-				walk(sub);
-			else if (sub.type == Json.Type.array)
+			if (err !is null)
+				break;
+			if (key in node && containsAnnotation(node[key]))
 			{
-				() @trusted {
-					foreach (Json elem; sub)
-					{
-						if (err !is null)
-							return;
-						if (elem.type == Json.Type.object)
-							walk(elem);
-					}
-				}();
+				err = "x-mcp-header MUST only be applied to statically reachable properties"
+					~ " (a chain of `properties` keys); an annotation under `" ~ key
+					~ "` is invalid";
+				return;
 			}
 		}
 	}
@@ -1604,8 +1628,10 @@ unittest  // paramHeaders: recurses into nested object properties (any nesting d
 	assert(phs[0].header == "Mcp-Param-Region");
 }
 
-unittest  // paramHeaders: recurses into array items schemas
+unittest  // x-mcp-header under array items is not statically reachable: rejected and not surfaced
 {
+	// The draft requires annotated properties to be reachable via a chain of
+	// `properties` keys only; a chain through `items` (an array keyword) is invalid.
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
 	Json itemProps = Json.emptyObject;
@@ -1623,10 +1649,72 @@ unittest  // paramHeaders: recurses into array items schemas
 	props["entries"] = arr;
 	schema["properties"] = props;
 
-	auto phs = paramHeaders(schema);
-	assert(phs.length == 1);
-	assert(phs[0].path == ["entries", "tag"]);
-	assert(phs[0].header == "Mcp-Param-Tag");
+	assert(validateInputSchemaHeaders(schema) !is null);
+	assert(paramHeaders(schema).length == 0);
+}
+
+unittest  // x-mcp-header under composition (oneOf/anyOf/allOf/not) is rejected
+{
+	foreach (key; ["oneOf", "anyOf", "allOf", "not"])
+	{
+		Json branch = Json.emptyObject;
+		branch["type"] = "object";
+		branch["properties"] = Json([
+			"region": Json([
+				"type": Json("string"),
+				"x-mcp-header": Json("Region")
+			])
+		]);
+		Json schema = Json.emptyObject;
+		schema["type"] = "object";
+		if (key == "not")
+			schema[key] = branch;
+		else
+			schema[key] = Json([branch]);
+		assert(validateInputSchemaHeaders(schema) !is null,
+				"annotation under " ~ key ~ " must reject");
+		assert(paramHeaders(schema).length == 0);
+	}
+}
+
+unittest  // x-mcp-header under conditional (if/then/else) is rejected
+{
+	foreach (key; ["if", "then", "else"])
+	{
+		Json branch = Json.emptyObject;
+		branch["type"] = "object";
+		branch["properties"] = Json([
+			"region": Json([
+				"type": Json("string"),
+				"x-mcp-header": Json("Region")
+			])
+		]);
+		Json schema = Json.emptyObject;
+		schema["type"] = "object";
+		schema[key] = branch;
+		assert(validateInputSchemaHeaders(schema) !is null,
+				"annotation under " ~ key ~ " must reject");
+	}
+}
+
+unittest  // x-mcp-header reachable only through $ref/$defs is rejected
+{
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	schema["properties"] = Json(["filter": Json(["$ref": Json("#/$defs/F")])]);
+	schema["$defs"] = Json([
+		"F": Json([
+			"type": Json("object"),
+			"properties": Json([
+				"region": Json([
+					"type": Json("string"),
+					"x-mcp-header": Json("Region")
+				])
+			])
+		])
+	]);
+	assert(validateInputSchemaHeaders(schema) !is null);
+	assert(paramHeaders(schema).length == 0);
 }
 
 unittest  // paramHeaders: number-typed annotations are skipped (not collected)
@@ -1642,7 +1730,7 @@ unittest  // paramHeaders: number-typed annotations are skipped (not collected)
 	assert(paramHeaders(schema).length == 0);
 }
 
-unittest  // paramHeaders: collects annotations under array-form (tuple) items
+unittest  // x-mcp-header under array-form (tuple) items is rejected, not surfaced
 {
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
@@ -1661,13 +1749,11 @@ unittest  // paramHeaders: collects annotations under array-form (tuple) items
 	props["entries"] = arr;
 	schema["properties"] = props;
 
-	auto phs = paramHeaders(schema);
-	assert(phs.length == 1);
-	assert(phs[0].path == ["entries", "tag"]);
-	assert(phs[0].header == "Mcp-Param-Tag");
+	assert(validateInputSchemaHeaders(schema) !is null);
+	assert(paramHeaders(schema).length == 0);
 }
 
-unittest  // paramHeaders: collects annotations under prefixItems element schemas
+unittest  // x-mcp-header under prefixItems element schemas is rejected, not surfaced
 {
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
@@ -1686,10 +1772,8 @@ unittest  // paramHeaders: collects annotations under prefixItems element schema
 	props["coords"] = arr;
 	schema["properties"] = props;
 
-	auto phs = paramHeaders(schema);
-	assert(phs.length == 1);
-	assert(phs[0].path == ["coords", "region"]);
-	assert(phs[0].header == "Mcp-Param-Region");
+	assert(validateInputSchemaHeaders(schema) !is null);
+	assert(paramHeaders(schema).length == 0);
 }
 
 unittest  // validateInputSchemaHeaders: rejects CR/LF header on array-form items element

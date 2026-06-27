@@ -2114,7 +2114,10 @@ McpException validateDraftHeaders(string protoHeader, string methodHeader,
 	}
 	if (nameHeader.length == 0)
 		return new McpException(ErrorCode.headerMismatch, "Missing Mcp-Name header");
-	if (nameHeader != bodyName)
+	// Mcp-Name carries the body value under the same Base64 sentinel encoding as the
+	// Mcp-Param-* headers, so a non-ASCII or reserved name survives the HTTP header.
+	// Decode before comparing (the empty-header check above stays on the raw value).
+	if (decodeHeaderValue(nameHeader) != bodyName)
 		return new McpException(ErrorCode.headerMismatch,
 				"Mcp-Name header '" ~ nameHeader ~ "' does not match body value '" ~ bodyName ~ "'");
 	return null;
@@ -2770,6 +2773,23 @@ unittest  // draft resources/read mirrors uri into Mcp-Name
 	auto m = draftMsg("resources/read", p);
 	assert(validateDraftHeaders("2026-07-28", "resources/read", "test://x", m, true) is null);
 	assert(validateDraftHeaders("2026-07-28", "resources/read", "test://y", m, true) !is null);
+}
+
+unittest  // draft Mcp-Name is sentinel-decoded before matching the body value
+{
+	import mcp.protocol.mrtr : encodeHeaderValue;
+
+	// A name with non-ASCII / reserved characters must travel as a Base64 sentinel
+	// (=?base64?...?=) in the Mcp-Name header; the server decodes before comparing.
+	Json p = Json.emptyObject;
+	p["uri"] = "test://café/dat a";
+	auto m = draftMsg("resources/read", p);
+	const enc = encodeHeaderValue("test://café/dat a");
+	assert(enc != "test://café/dat a"); // it really was encoded
+	assert(validateDraftHeaders("2026-07-28", "resources/read", enc, m, true) is null);
+	// A wrong encoded name still mismatches.
+	assert(validateDraftHeaders("2026-07-28", "resources/read",
+			encodeHeaderValue("test://other"), m, true) !is null);
 }
 
 unittest  // draft notification with correct Mcp-Method passes (no Mcp-Name required)
