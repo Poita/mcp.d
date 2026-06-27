@@ -235,7 +235,7 @@ final class McpServer : ServerCore
 	// addition to any HTTP push channel. Null when no stdio listen is active,
 	// keeping the HTTP-only behaviour unchanged.
 	private void delegate(string) @safe stdioListenSink;
-	private string stdioListenSubscriptionId;
+	private Json stdioListenSubscriptionId = Json.init;
 	// The stdio `subscriptions/listen` stream's OWN per-stream/per-URI filter.
 	// stdio is single-connection, so this is the filter recorded by the active stdio
 	// listen; `notifyChange` consults it via `accepts(method, uri)` to deliver only the
@@ -1239,8 +1239,9 @@ final class McpServer : ServerCore
 
 		// The listen request's id is the stream's subscriptionId; every
 		// notification on this channel (starting with the acknowledgement) is
-		// stamped with it in `params._meta`.
-		stdioListenSubscriptionId = rpcIdString(msg.id);
+		// stamped with it in `params._meta`, carried verbatim so a numeric listen
+		// id stays numeric on the wire.
+		stdioListenSubscriptionId = msg.id;
 		stdioListenSink = writeLine;
 		// Capture THIS listen request's parsed per-stream filter (recorded on the
 		// stdio connection's state) so subsequent notify*/notifyResourceUpdated
@@ -2181,11 +2182,11 @@ final class McpServer : ServerCore
 		// On a match, drop the delivery sink and clear the recorded per-stream
 		// filter so the listener-driven notify path matches nothing and any
 		// subsequent notify*/notifyResourceUpdated writes nothing.
-		if (stdioListenSink !is null && stdioListenSubscriptionId.length
-				&& rpcIdString(params["requestId"]) == stdioListenSubscriptionId)
+		if (stdioListenSink !is null && stdioListenSubscriptionId.type != Json.Type.undefined
+				&& rpcIdString(params["requestId"]) == rpcIdString(stdioListenSubscriptionId))
 		{
 			stdioListenSink = null;
-			stdioListenSubscriptionId = null;
+			stdioListenSubscriptionId = Json.init;
 			// Drop every piece of listen state this single stdio stream recorded so
 			// a later notify*/notifyResourceUpdated writes nothing: the per-URI
 			// resource `subscriptions` (keyed by the URIs the per-stream filter
@@ -3733,7 +3734,8 @@ unittest  // pingClient(sessionId) reaches a session-scoped GET listener (non-em
 	string frame;
 	// The production registration path: a per-session GET stream owned by its
 	// Mcp-Session-Id (a NON-empty owner token), unlike the empty default.
-	ch.addListener((string f) @safe { frame = f; }, "", ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { frame = f; }, Json(""),
+			ListenFilter.init, "", null, "sess-A");
 
 	bool pinged;
 	void delegate() @safe nothrow initiator = () @safe nothrow{
@@ -3767,7 +3769,7 @@ unittest  // pingClient with an empty/mismatched token cannot reach a session-sc
 	auto srv = makeTestServer();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(srv, coord);
-	ch.addListener((string) @safe {}, "", ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string) @safe {}, Json(""), ListenFilter.init, "", null, "sess-A");
 
 	// The empty-token no-arg form matches no session-scoped listener.
 	bool threwEmpty;
@@ -3791,8 +3793,8 @@ unittest  // connectedSessions enumerates the live session-scoped GET streams
 	auto srv = makeTestServer();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(srv, coord);
-	ch.addListener((string) @safe {}, "", ListenFilter.init, "", null, "sess-A");
-	ch.addListener((string) @safe {}, "", ListenFilter.init, "", null, "sess-B");
+	ch.addListener((string) @safe {}, Json(""), ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string) @safe {}, Json(""), ListenFilter.init, "", null, "sess-B");
 
 	import std.algorithm : canFind, sort;
 
@@ -7891,8 +7893,10 @@ unittest  // notifyToolsListChanged fans out to EVERY connected session, not jus
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string aFrame, bFrame;
-	ch.addListener((string f) @safe { aFrame = f; }, "", ListenFilter.init, "", null, "sess-A");
-	ch.addListener((string f) @safe { bFrame = f; }, "", ListenFilter.init, "", null, "sess-B");
+	ch.addListener((string f) @safe { aFrame = f; }, Json(""),
+			ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { bFrame = f; }, Json(""),
+			ListenFilter.init, "", null, "sess-B");
 
 	const n = s.notifyToolsListChanged();
 	assert(n == 2, "both sessions must be reached");
@@ -7908,8 +7912,8 @@ unittest  // a list_changed broadcast still delivers only ONE stream within a si
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	int aCount, bCount;
-	ch.addListener((string) @safe { aCount++; }, "", ListenFilter.init, "", null, "sess-A");
-	ch.addListener((string) @safe { bCount++; }, "", ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string) @safe { aCount++; }, Json(""), ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string) @safe { bCount++; }, Json(""), ListenFilter.init, "", null, "sess-A");
 
 	const n = s.notifyToolsListChanged();
 	assert(n == 1, "one session reached once");
@@ -8090,7 +8094,7 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	pb["notifications"] = nb;
 	s.handle(draftReq(10, "subscriptions/listen", pb));
 	string bFrame;
-	push.addListener((string f) @safe { bFrame = f; }, "10", s.cs().listenFilter);
+	push.addListener((string f) @safe { bFrame = f; }, Json("10"), s.cs().listenFilter);
 
 	// Stream A (toolsListChanged only) opens second.
 	Json na = Json.emptyObject;
@@ -8099,7 +8103,7 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	pa["notifications"] = na;
 	s.handle(draftReq(11, "subscriptions/listen", pa));
 	string aFrame;
-	push.addListener((string f) @safe { aFrame = f; }, "11", s.cs().listenFilter);
+	push.addListener((string f) @safe { aFrame = f; }, Json("11"), s.cs().listenFilter);
 
 	// A tools/list_changed must land on A (which requested it), not B.
 	const n = s.notifyToolsListChanged();
@@ -8144,7 +8148,7 @@ unittest  // STATELESS HTTP subscriptions/listen delivers resources/updated per-
 	f.resourceSubscriptions = true;
 	f.resourceUris = ["note:///a"];
 	string frame;
-	push.addListener((string fr) @safe { frame = fr; }, "listen-1", f);
+	push.addListener((string fr) @safe { frame = fr; }, Json("listen-1"), f);
 
 	// Subscribed URI: delivered down THAT stream, stamped with the subscriptionId.
 	const a = s.notifyResourceUpdated("note:///a");
@@ -8180,8 +8184,8 @@ unittest  // STATELESS HTTP subscriptions/listen delivers resources/list_changed
 	fb.active = true;
 	fb.toolsListChanged = true;
 	string aFrame, bFrame;
-	push.addListener((string fr) @safe { aFrame = fr; }, "A", fa);
-	push.addListener((string fr) @safe { bFrame = fr; }, "B", fb);
+	push.addListener((string fr) @safe { aFrame = fr; }, Json("A"), fa);
+	push.addListener((string fr) @safe { bFrame = fr; }, Json("B"), fb);
 
 	const n = s.notifyResourcesListChanged();
 	assert(n == 1, "exactly the opted-in listen stream receives resources/list_changed");
@@ -8244,7 +8248,7 @@ unittest  // draft subscriptions/listen: a stream gets list_changed only if its 
 	ListenFilter noPrompts;
 	noPrompts.active = true;
 	noPrompts.toolsListChanged = true;
-	const idA = ch.addListener((string f) @safe { a ~= f; }, "listen-a", noPrompts);
+	const idA = ch.addListener((string f) @safe { a ~= f; }, Json("listen-a"), noPrompts);
 	assert(s.notifyPromptsListChanged() == 0);
 	assert(a.length == 0);
 	ch.removeListener(idA);
@@ -8254,7 +8258,7 @@ unittest  // draft subscriptions/listen: a stream gets list_changed only if its 
 	ListenFilter withPrompts;
 	withPrompts.active = true;
 	withPrompts.promptsListChanged = true;
-	ch.addListener((string f) @safe { b ~= f; }, "listen-b", withPrompts);
+	ch.addListener((string f) @safe { b ~= f; }, Json("listen-b"), withPrompts);
 	assert(s.notifyPromptsListChanged() == 1);
 	assert(b.length == 1);
 }

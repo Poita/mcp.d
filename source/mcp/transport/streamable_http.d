@@ -1121,7 +1121,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	const lastEventId = req.headers.get("Last-Event-ID", "");
 	const listenerId = push.addListener((string frame) @safe {
 		writeFrame(frame);
-	}, "", ListenFilter.init, lastEventId, getConn !is null
+	}, Json.init, ListenFilter.init, lastEventId, getConn !is null
 			? server.sessionPushEligibility(getConn) : null, ownerToken);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
@@ -1202,7 +1202,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	// basic/utilities/subscriptions).
 	const listenerId = push.addListener((string frame) @safe {
 		writeFrame(frame);
-	}, rpcIdString(msg.id), streamFilter);
+	}, msg.id, streamFilter);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
@@ -3672,7 +3672,7 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
 	ListenFilter streamFilter;
 	streamFilter.active = true;
 	streamFilter.toolsListChanged = true;
-	const lid = push.addListener((string f) @safe { frames ~= f; }, rpcIdString(m.id), streamFilter);
+	const lid = push.addListener((string f) @safe { frames ~= f; }, m.id, streamFilter);
 	push.emitTo(lid, subscriptionsAcknowledgedNotification(
 			server.acknowledgedSubsetFor(reqState.listenFilter)));
 	assert(frames.length == 1);

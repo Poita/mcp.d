@@ -224,13 +224,17 @@ bool isUserMetaKeyAllowed(string key, ProtocolVersion v) @safe pure nothrow
 /// delivered on a `subscriptions/listen` stream MUST carry the listen request's id
 /// as `subscriptionId` in `_meta`, so clients can correlate the notification with
 /// the listen request that established the stream — this is the producer for that
-/// key. `subscriptionId` is the (string-rendered) JSON-RPC id of the originating
-/// `subscriptions/listen` request. An empty `subscriptionId` is a no-op (the
+/// key. `subscriptionId` is the originating `subscriptions/listen` request's
+/// JSON-RPC id, carried verbatim so its wire type is preserved (the spec types it
+/// as `RequestId = string | number`, so a numeric listen id stays numeric). An
+/// absent id — `undefined`, `null`, or an empty string — is a no-op (the
 /// notification is returned unchanged). Notifications carry their payload under
 /// `params`, so the key is nested as `params._meta.<subscriptionId>`.
-Json withSubscriptionId(Json notification, string subscriptionId) @safe
+Json withSubscriptionId(Json notification, Json subscriptionId) @safe
 {
-	if (subscriptionId.length == 0)
+	if (subscriptionId.type == Json.Type.undefined
+			|| subscriptionId.type == Json.Type.null_
+			|| (subscriptionId.type == Json.Type.string && subscriptionId.get!string.length == 0))
 		return notification;
 
 	Json n = notification.clone();
@@ -250,10 +254,22 @@ unittest  // withSubscriptionId stamps the listen request id into params._meta
 		"jsonrpc": Json("2.0"),
 		"method": Json("notifications/tools/list_changed")
 	]);
-	auto stamped = withSubscriptionId(n, "listen-7");
+	auto stamped = withSubscriptionId(n, Json("listen-7"));
 	assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "listen-7");
 	// The original is left untouched.
 	assert("params" !in n);
+}
+
+unittest  // withSubscriptionId preserves a numeric JSON-RPC id verbatim (RequestId = string | number)
+{
+	auto n = Json([
+		"jsonrpc": Json("2.0"),
+		"method": Json("notifications/tools/list_changed")
+	]);
+	auto stamped = withSubscriptionId(n, Json(42L));
+	auto id = stamped["params"]["_meta"][MetaKey.subscriptionId];
+	assert(id.type == Json.Type.int_, "a numeric listen id must stay numeric, not be stringified");
+	assert(id.get!long == 42);
 }
 
 unittest  // withSubscriptionId preserves an existing params payload and _meta entries
@@ -268,7 +284,7 @@ unittest  // withSubscriptionId preserves an existing params payload and _meta e
 		"method": Json("notifications/resources/updated"),
 		"params": params
 	]);
-	auto stamped = withSubscriptionId(n, "id-42");
+	auto stamped = withSubscriptionId(n, Json("id-42"));
 	assert(stamped["params"]["uri"].get!string == "file:///x");
 	assert(stamped["params"]["_meta"]["other.vendor/flag"].get!bool);
 	assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "id-42");
@@ -280,7 +296,7 @@ unittest  // withSubscriptionId with an empty id is a no-op
 		"jsonrpc": Json("2.0"),
 		"method": Json("notifications/message")
 	]);
-	auto same = withSubscriptionId(n, "");
+	auto same = withSubscriptionId(n, Json(""));
 	assert("params" !in same);
 }
 
