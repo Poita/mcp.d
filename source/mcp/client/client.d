@@ -2504,6 +2504,13 @@ final class McpClient : ClientProtocol
 			cancelledRequests_[requestId] = true;
 			cancelledOrder_ ~= requestId;
 		}
+		// Over a draft Streamable HTTP transport, closing the request's SSE response
+		// stream is itself the cancellation signal and no `notifications/cancelled`
+		// is sent (basic/transports §Sending Messages, Note); the local tracking
+		// above still drops a late response. stdio and legacy HTTP send the
+		// notification as the cancellation signal.
+		if (transport.cancelsByStreamClose())
+			return;
 		Json params = Json.emptyObject;
 		params["requestId"] = requestId;
 		if (reason.length)
@@ -4282,6 +4289,24 @@ unittest  // cancel() without a reason omits the reason field
 
 	assert(sent["params"]["requestId"].get!long == 3);
 	assert("reason" !in sent["params"]);
+}
+
+unittest  // a draft Streamable-HTTP client cancels by closing the stream, not via notifications/cancelled
+{
+	auto t = new HttpClientTransport("http://localhost", 8);
+	auto c = new McpClient(t);
+	t.setDraftProtocol(true); // negotiated the draft (modern) protocol
+	bool postedCancelled;
+	c.onNotifyForTest = (Json message) @safe {
+		if (message["method"].get!string == "notifications/cancelled")
+			postedCancelled = true;
+	};
+
+	c.cancel(7, "user aborted");
+
+	assert(!postedCancelled, "draft HTTP must not POST notifications/cancelled");
+	// The id is still tracked locally so a late response for it is dropped.
+	assert(c.isCancelled(7));
 }
 
 unittest  // after cancel(), a response for that id is treated as cancelled (ignored)
@@ -6100,6 +6125,11 @@ version (unittest)
 
 		void setDraftProtocol(bool isDraft) @safe
 		{
+		}
+
+		bool cancelsByStreamClose() @safe
+		{
+			return false;
 		}
 
 		void startServerStream() @safe

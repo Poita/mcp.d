@@ -248,6 +248,14 @@ final class HttpClientTransport : ClientTransport
 		draftProtocol = isDraft;
 	}
 
+	/// A draft Streamable HTTP client cancels by closing the request's SSE response
+	/// stream; the draft sends no `notifications/cancelled` over HTTP. Legacy HTTP
+	/// (pre-draft) still uses the notification.
+	bool cancelsByStreamClose() @safe
+	{
+		return draftProtocol;
+	}
+
 	/// Bound each raw `connectTCP` by `timeout`. A connect that cannot complete in
 	/// time fails with a typed `McpException` rather than parking indefinitely,
 	/// so ephemeral-port exhaustion surfaces as an error the caller can handle.

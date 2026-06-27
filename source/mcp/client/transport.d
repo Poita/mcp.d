@@ -107,6 +107,14 @@ interface ClientTransport
 	/// draft removed; a no-op on stdio and on transports where the flag is irrelevant.
 	void setDraftProtocol(bool isDraft) @safe;
 
+	/// Whether this transport signals request cancellation by closing the request's
+	/// stream rather than by sending `notifications/cancelled`. True only for a draft
+	/// Streamable HTTP transport: the draft (basic/transports §Sending Messages, Note)
+	/// defines no client-to-server `notifications/cancelled` over Streamable HTTP —
+	/// closing the SSE response stream is itself the cancellation signal. stdio and
+	/// legacy HTTP send the notification, so they return false.
+	bool cancelsByStreamClose() @safe;
+
 	/// Release transport resources: stdio terminates the subprocess (when one was
 	/// spawned); HTTP stops any background streams.
 	void close() @safe;

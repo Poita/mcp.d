@@ -1693,23 +1693,10 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		res.writeBody("", "text/plain");
 		return;
 	case MessageKind.notification:
-		// Draft basic/transports Standard Request Headers: Mcp-Method is
-		// REQUIRED for "All requests and notifications". A draft client POSTing
-		// a notification (e.g. notifications/initialized, notifications/cancelled)
-		// with a missing or mismatched Mcp-Method MUST be rejected with 400 and a
-		// -32020 HeaderMismatch error. The error body carries no id (a
-		// notification has none). Pre-draft versions skip this (header undefined).
-		const isDraftNote = tryDraft(
-				req.headers.get(HttpHeader.protocolVersion, ""))
-			|| tryDraft(RequestMeta.fromParams(msg.params).protocolVersion);
-		if (auto noteErr = validateDraftHeaders(req.headers.get(HttpHeader.protocolVersion,
-				""), req.headers.get(HttpHeader.method, ""),
-				req.headers.get(HttpHeader.name, ""), msg, isDraftNote))
-		{
-			res.statusCode = HTTPStatus.badRequest;
-			res.writeBody(makeErrorResponse(Json(null), noteErr).toString(), "application/json");
-			return;
-		}
+		// Header requirements for notification POSTs are not defined by this
+		// revision (basic/transports §Sending Messages, Note), so a notification is
+		// accepted regardless of its request-metadata headers and never rejected
+		// for a missing/mismatched Mcp-Method.
 		// Route the notification through a connection-scoped context so a
 		// `notifications/cancelled` resolves to the SAME per-session in-flight key the
 		// request side (HttpStreamContext) uses. Without this it would go through
@@ -1718,8 +1705,8 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// `notifications/cancelled` flips the cancellation token in the SAME
 		// per-session in-flight registry the request side used. Stateful only —
 		// stateless has no cross-POST correlation, so the state is null there.
-		ConnectionState noteState = (sessions !is null && sessionsApply(server.negotiatedVersion)) ? sessions
-			.stateFor(connToken) : null;
+		ConnectionState noteState = (sessions !is null
+				&& sessionsApply(server.negotiatedVersion)) ? sessions.stateFor(connToken) : null;
 		server.handle(msg, new HttpScopedContext(connToken, noteState));
 		res.statusCode = HTTPStatus.accepted;
 		res.writeBody("", "text/plain");
@@ -2078,6 +2065,13 @@ McpException validateDraftHeaders(string protoHeader, string methodHeader,
 {
 	if (!isDraft)
 		return null; // not a draft request: do not enforce draft headers
+
+	// Header requirements for notification POSTs are not defined by this revision
+	// (basic/transports §Sending Messages, Note): a draft notification POST is
+	// accepted regardless of its request-metadata headers, so Mcp-Method/Mcp-Name
+	// are not enforced for it.
+	if (msg.kind == MessageKind.notification)
+		return null;
 
 	if (methodHeader.length == 0)
 		return new McpException(ErrorCode.headerMismatch, "Missing Mcp-Method header");
@@ -2792,27 +2786,17 @@ unittest  // draft Mcp-Name is sentinel-decoded before matching the body value
 			encodeHeaderValue("test://other"), m, true) !is null);
 }
 
-unittest  // draft notification with correct Mcp-Method passes (no Mcp-Name required)
+unittest  // draft notification POST is accepted regardless of Mcp-Method (headers not defined)
 {
-	// draft basic/transports Standard Request Headers: Mcp-Method is REQUIRED
-	// for "All requests and notifications"; Mcp-Name applies only to
-	// tools/call, resources/read, prompts/get requests.
+	// basic/transports §Sending Messages (Note): header requirements for
+	// notification POSTs are not defined by this revision, so a notification is
+	// accepted whether Mcp-Method is correct, absent, or mismatched.
 	auto m = draftNote("notifications/initialized", Json.emptyObject);
 	assert(validateDraftHeaders("2026-07-28", "notifications/initialized", "", m, true) is null);
-}
-
-unittest  // draft notification missing Mcp-Method is a header mismatch
-{
-	auto m = draftNote("notifications/initialized", Json.emptyObject);
-	auto e = validateDraftHeaders("2026-07-28", "", "", m, true);
-	assert(e !is null && e.code == ErrorCode.headerMismatch);
-}
-
-unittest  // draft notification with mismatched Mcp-Method fails
-{
-	auto m = draftNote("notifications/cancelled", Json.emptyObject);
-	auto e = validateDraftHeaders("2026-07-28", "notifications/initialized", "", m, true);
-	assert(e !is null && e.code == ErrorCode.headerMismatch);
+	assert(validateDraftHeaders("2026-07-28", "", "", m, true) is null); // missing Mcp-Method
+	auto mismatched = draftNote("notifications/cancelled", Json.emptyObject);
+	assert(validateDraftHeaders("2026-07-28", "notifications/initialized", "",
+			mismatched, true) is null); // mismatched Mcp-Method
 }
 
 unittest  // body-only draft (absent MCP-Protocol-Version header) still enforces Mcp-Method
