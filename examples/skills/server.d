@@ -13,7 +13,9 @@
  *   - `@skillDir` — the method returns a local directory path; the SDK reads the
  *     authored `SKILL.md` and exposes every file in the tree as a resource (so
  *     subdirectories are walkable via `resources/directory/read`). Used for
- *     team/release-helper, served from `assets/release-helper/`.
+ *     team/release-helper, served from `assets/release-helper/` — which also
+ *     contains a NESTED skill (`hotfix-helper/SKILL.md`), published as its own
+ *     flat entry alongside the enclosing skill's.
  *
  * Transport selection is delegated to `runServerFromArgs`:
  *   stdio (default):  ./skills-server
@@ -66,10 +68,11 @@ void main(string[] args) @safe
 {
 	auto server = new McpServer("skills-example", "1.0.0");
 
-	// One call registers all three skills: the two @skill methods and the
-	// @skillDir directory. The first registration also advertises the skills
-	// extension (committing the server to skills/list and skills/get) and
-	// enables resources/directory/read.
+	// One call registers everything: the two @skill methods and the @skillDir
+	// directory, whose nested hotfix-helper skill is published as a fourth flat
+	// entry. The first registration also advertises the skills extension
+	// (committing the server to skills/list and skills/get) and enables
+	// resources/directory/read.
 	registerHandlers(server, new SkillsApi);
 
 	runServerFromArgs(server, args, defaultPort);
