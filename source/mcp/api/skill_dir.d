@@ -512,12 +512,17 @@ version (unittest)
 		return s.handle(Message(makeRequest(Json(id), "resources/read", p)))
 			.get["result"]["contents"][0];
 	}
+
+	// The `index`-th entry of the server's skills/list result.
+	private Json listedSkill(McpServer s, long id, size_t index) @safe
+	{
+		return s.handle(Message(makeRequest(Json(id), "skills/list",
+				Json.emptyObject))).get["result"]["skills"][index];
+	}
 }
 
 unittest  // registerSkillDir serves SKILL.md verbatim with authored, type-preserved frontmatter
 {
-	import mcp.api.skills : skillIndexUri;
-	import vibe.data.json : parseJsonString;
 	import std.algorithm : canFind;
 
 	const root = tmpRoot("verbatim");
@@ -533,15 +538,17 @@ unittest  // registerSkillDir serves SKILL.md verbatim with authored, type-prese
 	assert(md.canFind("license: Apache-2.0"));
 	assert(md.canFind("# PDF Forms"));
 
-	// The index frontmatter is the parsed YAML — every field, with types kept.
-	const idx = readResource(s, 2, skillIndexUri)["text"].get!string;
-	auto e = parseJsonString(idx)["skills"][0];
+	// The entry frontmatter is the parsed YAML — every field, with types kept —
+	// and the resources manifest covers SKILL.md plus the supporting file.
+	auto e = listedSkill(s, 2, 0);
 	assert(e["frontmatter"]["name"].get!string == "pdf-forms");
 	assert(e["frontmatter"]["license"].get!string == "Apache-2.0");
 	assert(e["frontmatter"]["metadata"]["version"].get!string == "2.1.0");
 	assert(e["frontmatter"]["metadata"]["experimental"].get!bool == true);
-	assert(e["url"].get!string == "skill://pdf-forms/SKILL.md");
-	assert(e["digest"].get!string == skillDigestOf(md));
+	assert(e["uri"].get!string == "skill://pdf-forms/SKILL.md");
+	assert(e["resources"].length == 2);
+	assert(e["resources"][0]["uri"].get!string == "skill://pdf-forms/SKILL.md");
+	assert(e["resources"][0]["digest"].get!string == skillDigestOf(md));
 }
 
 unittest  // registerSkillDir exposes supporting files as sibling resources
@@ -602,9 +609,6 @@ unittest  // registerSkillDir rejects a nested SKILL.md (skills do not nest)
 
 unittest  // registerSkillDir honours an explicit prefixed path matching the frontmatter name
 {
-	import mcp.api.skills : skillIndexUri;
-	import vibe.data.json : parseJsonString;
-
 	const root = tmpRoot("prefix");
 	writeSkillFixture(root);
 	scope (exit)
@@ -615,9 +619,7 @@ unittest  // registerSkillDir honours an explicit prefixed path matching the fro
 	opts.path = "office/pdf-forms"; // final segment matches frontmatter name
 	registerSkillDir(s, root, opts);
 
-	const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
-	assert(parseJsonString(
-			idx)["skills"][0]["url"].get!string == "skill://office/pdf-forms/SKILL.md");
+	assert(listedSkill(s, 1, 0)["uri"].get!string == "skill://office/pdf-forms/SKILL.md");
 }
 
 unittest  // registerSkillDir rejects a path whose final segment != frontmatter name
@@ -637,9 +639,6 @@ unittest  // registerSkillDir rejects a path whose final segment != frontmatter 
 
 unittest  // a '---' inside a frontmatter value does not close the frontmatter early
 {
-	import mcp.api.skills : skillIndexUri;
-	import vibe.data.json : parseJsonString;
-
 	const root = tmpRoot("fence");
 	// `notes` is a block scalar that itself contains a `---` line; `trailing`
 	// comes after it and must survive into the parsed frontmatter.
@@ -652,16 +651,12 @@ unittest  // a '---' inside a frontmatter value does not close the frontmatter e
 	auto s = new McpServer("t", "1");
 	registerSkillDir(s, root);
 
-	const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
-	auto fm = parseJsonString(idx)["skills"][0]["frontmatter"];
+	auto fm = listedSkill(s, 1, 0)["frontmatter"];
 	assert(fm["trailing"].get!string == "kept");
 }
 
 unittest  // a CRLF SKILL.md parses (fence and values carry trailing \r)
 {
-	import mcp.api.skills : skillIndexUri;
-	import vibe.data.json : parseJsonString;
-
 	const root = tmpRoot("crlf");
 	writeRawSkill(root, "---\r\nname: crlf-skill\r\ndescription: a value\r\n---\r\n\r\n# Body\r\n");
 	scope (exit)
@@ -670,8 +665,7 @@ unittest  // a CRLF SKILL.md parses (fence and values carry trailing \r)
 	auto s = new McpServer("t", "1");
 	registerSkillDir(s, root);
 
-	const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
-	auto fm = parseJsonString(idx)["skills"][0]["frontmatter"];
+	auto fm = listedSkill(s, 1, 0)["frontmatter"];
 	assert(fm["name"].get!string == "crlf-skill");
 	assert(fm["description"].get!string == "a value");
 }
@@ -709,8 +703,6 @@ unittest  // an extension-less text file is served as text/plain, not an opaque 
 
 unittest  // a YAML timestamp in frontmatter is rendered as an ISO-8601 string
 {
-	import mcp.api.skills : skillIndexUri;
-	import vibe.data.json : parseJsonString;
 	import std.algorithm : canFind;
 
 	const root = tmpRoot("timestamp");
@@ -721,8 +713,7 @@ unittest  // a YAML timestamp in frontmatter is rendered as an ISO-8601 string
 	auto s = new McpServer("t", "1");
 	registerSkillDir(s, root);
 
-	const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
-	auto fm = parseJsonString(idx)["skills"][0]["frontmatter"];
+	auto fm = listedSkill(s, 1, 0)["frontmatter"];
 	assert(fm["created"].type == Json.Type.string);
 	assert(fm["created"].get!string.canFind("2021-01-02"));
 }

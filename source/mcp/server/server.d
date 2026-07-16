@@ -1118,8 +1118,8 @@ final class McpServer : ServerCore
 
 	/// The SEP-2640 skills index, created on first `enableSkills` / `registerSkill`
 	/// (`mcp.api.skills`), or null if no skill has been registered. The skills
-	/// helper layer appends discovery entries here and the `skill://index.json`
-	/// resource reader serializes them; the server itself holds the state so the
+	/// helper layer adds entries here and the server's `skills/list` /
+	/// `skills/get` handlers serve them; the server itself holds the state so the
 	/// `@skill` UDA path and the imperative API share one index across calls.
 	package(mcp) SkillIndex ensureSkillIndex() @safe
 	{
@@ -2285,6 +2285,15 @@ final class McpServer : ServerCore
 			if (ver < ProtocolVersion.v2025_11_25 || !directoryReadEnabled_)
 				throw methodNotFound(method);
 			return doDirectoryRead(params, ver);
+		case "skills/list":
+		case "skills/get":
+			// SEP-2640: declaring the skills extension commits the server to both
+			// skills/list and skills/get; the extension negotiates from 2025-11-25.
+			// A session below that floor, or a server that never enabled skills,
+			// answers -32601 (method not found).
+			if (ver < ProtocolVersion.v2025_11_25 || skillIndex_ is null || !skillIndex_.enabled)
+				throw methodNotFound(method);
+			return method == "skills/list" ? doListSkills(params) : doGetSkill(params);
 		case "resources/subscribe":
 			// The draft has no resources/subscribe RPC; subscriptions/listen takes
 			// its place (the ListenFilter "Replaces the former
@@ -2739,6 +2748,50 @@ final class McpServer : ServerCore
 		sort!((a, b) => a.uri < b.uri)(children);
 		return paginatedList!(ListResourcesResult, "resources")("resources/directory/read",
 				children, (Resource r) => r, params, ver);
+	}
+
+	/// Serve `skills/list` (SEP-2640): the registered skill entries in
+	/// registration order, paginated like the base `*/list` methods. Entries are
+	/// atomic — a skill's `resources` manifest is never split across pages.
+	/// Deliberately NOT routed through `paginatedList`/`maybeCache`: entries are
+	/// raw extension-defined Json (no `forVersion` projection), and SEP-2549
+	/// list-caching attributes apply to this method only from protocol
+	/// 2026-07-28, which this SDK does not implement yet.
+	private Json doListSkills(Json params) @safe
+	{
+		size_t begin, end;
+		Nullable!string next;
+		pageBounds(params, skillIndex_.order.length, pageSize_, begin, end, next);
+
+		ListSkillsResult result;
+		foreach (uri; skillIndex_.order[begin .. end])
+			result.skills ~= skillIndex_.byUri[uri];
+		result.nextCursor = next;
+		return result.toJson();
+	}
+
+	/// Serve `skills/get` (SEP-2640): the entry for the single skill whose
+	/// `SKILL.md` URI is `params.uri`, answering for every skill this server
+	/// serves whether or not a listing mentioned it (this SDK lists everything it
+	/// serves, so the index is that complete record).
+	private Json doGetSkill(Json params) @safe
+	{
+		if ("uri" !in params || params["uri"].type != Json.Type.string)
+			throw invalidParams("skills/get requires a string 'uri'");
+		const uri = params["uri"].get!string;
+		auto entry = uri in skillIndex_.byUri;
+		if (entry is null)
+		{
+			// SEP-2640 pins the miss to -32602 (Invalid params) on every protocol
+			// version, so this deliberately does NOT route through the
+			// version-dependent resourceNotFound helper (-32002 on 2025-11-25).
+			Json data = Json.emptyObject;
+			data["uri"] = uri;
+			throw new McpException(ErrorCode.invalidParams, "Unknown skill: " ~ uri, data);
+		}
+		GetSkillResult result;
+		result.skill = *entry;
+		return result.toJson();
 	}
 
 	private Json doSubscribe(Json params, ConnectionState conn) @safe
