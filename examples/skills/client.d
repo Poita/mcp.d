@@ -11,8 +11,8 @@
  * helpers:
  *
  *   1. server/discover advertises the skills extension under `capabilities`.
- *   2. listSkills() reads skill://index.json and returns conformant entries
- *      (verbatim frontmatter, SKILL.md url + sha256 digest).
+ *   2. listSkills() calls skills/list and returns conformant entries
+ *      (verbatim frontmatter, SKILL.md uri, per-file resources manifest).
  *   3. readSkill("git-workflow") reads a @skill skill: synthesized frontmatter.
  *   4. The @skillDir-sourced team/release-helper skill carries its AUTHORED
  *      frontmatter and a references/CHECKLIST.md file.

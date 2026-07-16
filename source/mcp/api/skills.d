@@ -11,23 +11,19 @@ import mcp.protocol.types : Resource, ResourceContents;
 
 /// The MCP Skills extension identifier (SEP-2640) — the key under
 /// `capabilities.extensions` a server declares to advertise that it serves
-/// Agent Skills as resources. The extension adds no new message types beyond the
-/// optional `resources/directory/read` method: a skill is a directory of files
-/// exposed through the existing Resources primitive, so a host that already
-/// treats resources as a virtual filesystem consumes MCP-served skills
-/// identically to local ones.
+/// Agent Skills as resources. Declaring it commits the server to the
+/// `skills/list` and `skills/get` methods; `resources/directory/read` is
+/// additionally gated behind the `directoryRead` capability setting. Skill
+/// content itself rides the existing Resources primitive, so a host that
+/// already treats resources as a virtual filesystem consumes MCP-served skills
+/// identically to local ones. Note that no URI scheme marks a resource as a
+/// skill — `skill://` included: a resource is known to be a skill only through
+/// a `skills/list` entry or a `skills/get` answer.
 enum string skillsExtensionKey = "io.modelcontextprotocol/skills";
 
 /// The MIME type a `SKILL.md` resource declares (Agent Skills are Markdown with
 /// YAML frontmatter).
 enum string skillMimeType = "text/markdown";
-
-/// The well-known discovery resource URI a skills server serves so clients can
-/// enumerate its skills (`resources/read` returns the discovery document).
-enum string skillIndexUri = "skill://index.json";
-
-/// The MIME type of the `skill://index.json` discovery document.
-enum string skillIndexMimeType = "application/json";
 
 /// The MIME type SEP-2640 assigns to a directory resource — the `mimeType` that
 /// marks a `resources/directory/read` child as a subdirectory the client can
@@ -58,7 +54,10 @@ struct Skill
 	string path;
 	string description; /// one-line description of when to use the skill
 	string instructions; /// the `SKILL.md` body (Markdown; frontmatter is synthesized)
-	string[string] metadata; /// optional extra frontmatter under `metadata:`
+	/// Optional extra frontmatter under `metadata:`. Keys prefixed
+	/// `io.modelcontextprotocol/` are reserved for metadata defined by MCP
+	/// extensions (none are currently defined).
+	string[string] metadata;
 	SkillFile[] files; /// optional supporting files served as sibling resources
 
 	/// The skill name: the final segment of `path`, per SEP-2640's requirement
@@ -204,8 +203,8 @@ string skillMarkdown(string name, string description, string instructions,
 /// The skill's frontmatter rendered as a JSON object, matching the YAML
 /// `skillMarkdown` synthesizes: `name` and `description` always, plus a nested
 /// `metadata` object when present. This is the verbatim `frontmatter` SEP-2640
-/// requires in each `skill://index.json` entry — identical in content to the
-/// `SKILL.md` it describes.
+/// requires in each skill entry — identical in content to the `SKILL.md` it
+/// describes.
 private Json frontmatterJson(string name, string description, string[string] metadata) @safe
 {
 	import std.algorithm : sort;
@@ -244,21 +243,6 @@ void enableSkills(McpServer server) @safe
 	settings["directoryRead"] = true;
 	server.enableExtension(skillsExtensionKey, settings);
 	server.enableDirectoryRead();
-
-	Resource descriptor;
-	descriptor.uri = skillIndexUri;
-	descriptor.name = "skills";
-	descriptor.description = nullable("Index of the skills this server provides");
-	descriptor.mimeType = nullable(skillIndexMimeType);
-
-	server.registerResource(descriptor, () @safe {
-		Json doc = Json.emptyObject;
-		Json skills = Json.emptyArray;
-		foreach (uri; index.order)
-			skills ~= index.byUri[uri];
-		doc["skills"] = skills;
-		return ResourceContents.makeText(skillIndexUri, skillIndexMimeType, doc.toString());
-	});
 }
 
 /// Add a fully-built skill entry (`{uri, frontmatter, resources}`) to the
@@ -287,9 +271,9 @@ private ResourceContents delegate() @safe makeFileReader(SkillFile f, string uri
 /// Register `skill` on `server`: serve its `SKILL.md` (with synthesized
 /// frontmatter) at `skill://<path>/SKILL.md`, serve each supporting file at
 /// `skill://<path>/<file>`, advertise the skills extension, and add a conformant
-/// entry — verbatim `frontmatter`, the `SKILL.md` `url` and its `digest` — to
-/// the `skill://index.json` discovery document. Throws if `path` is not a valid
-/// skill path (see `isValidSkillPath`).
+/// entry — verbatim `frontmatter`, the `SKILL.md` `uri`, and the per-file
+/// `resources` manifest — for `skills/list` / `skills/get` to serve. Throws if
+/// `path` is not a valid skill path (see `isValidSkillPath`).
 void registerSkill(McpServer server, Skill skill) @safe
 {
 	const name = skill.name;
@@ -445,6 +429,9 @@ struct SkillResourceRef
 /// per the Agent Skills spec); `uri` addresses the `SKILL.md` directly, and
 /// `resources` is the complete per-file manifest a host verifies reads against
 /// (empty only for dynamically generated skills, which offer no integrity).
+/// Within the frontmatter's `metadata` object, keys prefixed
+/// `io.modelcontextprotocol/` are reserved for MCP extensions; ignore
+/// unrecognized keys under that prefix.
 struct SkillEntry
 {
 	string uri; /// resource URI of the `SKILL.md`
@@ -592,7 +579,6 @@ unittest  // the extension key and discovery constants carry the SEP-2640 litera
 {
 	assert(skillsExtensionKey == "io.modelcontextprotocol/skills");
 	assert(skillMimeType == "text/markdown");
-	assert(skillIndexUri == "skill://index.json");
 	assert(skillUri("git-workflow") == "skill://git-workflow/SKILL.md");
 	assert(skillFileUri("pdf", "references/FORMS.md") == "skill://pdf/references/FORMS.md");
 }
@@ -680,11 +666,10 @@ unittest  // skillMarkdown emits metadata in a deterministic sorted order
 	assert(a >= 0 && z >= 0 && a < z, "alpha must sort before zeta");
 }
 
-unittest  // enableSkills advertises the extension and serves an empty {skills:[]} index
+unittest  // enableSkills advertises the extension (with directoryRead) and nothing else
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.mrtr : MetaKey;
-	import vibe.data.json : parseJsonString;
 
 	auto s = new McpServer("t", "1");
 	enableSkills(s);
@@ -700,16 +685,17 @@ unittest  // enableSkills advertises the extension and serves an empty {skills:[
 	assert(skillsExtensionKey in caps["extensions"]);
 	// The capability advertises the optional directory-read method this SDK serves.
 	assert(caps["extensions"][skillsExtensionKey]["directoryRead"].get!bool == true);
+}
 
+unittest  // there is no skill://index.json — the old discovery resource is gone
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = pdfSkillServer();
 	Json rp = Json.emptyObject;
-	rp["uri"] = skillIndexUri;
-	auto contents = s.handle(Message(makeRequest(Json(2), "resources/read",
-			rp))).get["result"]["contents"][0];
-	assert(contents["mimeType"].get!string == skillIndexMimeType);
-	auto doc = parseJsonString(contents["text"].get!string);
-	// The discovery document carries no $schema / version marker — just `skills`.
-	assert("$schema" !in doc);
-	assert(doc["skills"].type == Json.Type.array && doc["skills"].length == 0);
+	rp["uri"] = "skill://index.json";
+	auto resp = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	assert("error" in resp, "skill://index.json must not be served as a resource");
 }
 
 unittest  // registerSkill serves SKILL.md and skills/list carries a conformant entry
