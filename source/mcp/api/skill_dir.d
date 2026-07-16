@@ -15,8 +15,8 @@ module mcp.api.skill_dir;
 import vibe.data.json : Json;
 
 import mcp.server.server : McpServer;
-import mcp.api.skills : SkillFile, SkillEntry, registerSkillResources,
-	skillName, isValidSkillPath, skillDigest, verifyResourceDigest;
+import mcp.api.skills : SkillFile, SkillEntry, registerSkillResources, addSkillEntry, skillName,
+	skillFileUri, isValidSkillPath, isValidSkillName, skillDigest, verifyResourceDigest;
 
 @safe:
 
@@ -27,8 +27,15 @@ struct SkillDirOptions
 	/// The skill path to serve under. Empty derives it from the `SKILL.md`
 	/// frontmatter `name`; otherwise the final segment MUST equal that name.
 	string path;
+	/// Publish each nested skill (a `SKILL.md` in a descendant directory) as its
+	/// own flat entry alongside the enclosing skill's, per SEP-2640's
+	/// flat-publication rule. Off, a nested `SKILL.md` is served as an ordinary
+	/// supporting file only — readable, but nothing marks it as a skill.
+	bool publishNested = true;
 	/// Optional filter: return `false` to exclude a file by its skill-relative
-	/// path (e.g. drop `.git/…` or `*.pyc`). `null` includes everything.
+	/// path (e.g. drop `.git/…` or `*.pyc`). `null` includes everything. Note a
+	/// filtered-out nested `SKILL.md` is neither served nor published as a
+	/// nested skill.
 	bool delegate(string relPath) @safe include;
 	/// Reject the directory if it holds more than this many files (a guard
 	/// against accidentally serving an enormous tree).
@@ -39,13 +46,18 @@ struct SkillDirOptions
 
 /// Register the skill directory `dir` on `server`. Reads `dir/SKILL.md` (served
 /// verbatim, its frontmatter parsed for the skill's entry) and walks the tree to
-/// expose each file as a sibling resource.
+/// expose each file as a sibling resource. A `SKILL.md` in a descendant
+/// directory is a nested skill: its files are ordinary supporting content of the
+/// enclosing skill (listed in the enclosing `resources` manifest like any file),
+/// and with `publishNested` (the default) the nested skill is additionally
+/// published as its own flat entry whose `resources` cover exactly its subtree.
 ///
 /// Throws if `dir` is not a directory, has no `SKILL.md`, the frontmatter lacks
 /// a string `name`, the resolved skill path is invalid or its final segment does
-/// not match the frontmatter `name`, a nested `SKILL.md` is found (skills do not
-/// nest), a symlink is encountered, or the file count / total size exceeds the
-/// configured caps.
+/// not match the frontmatter `name`, a symlink is encountered, the file count /
+/// total size exceeds the configured caps, or (`publishNested`) a nested
+/// `SKILL.md` fails the same frontmatter/naming validation as a top-level one.
+/// Validation runs before registration, so a throw leaves the server unchanged.
 void registerSkillDir(McpServer server, string dir, SkillDirOptions options = SkillDirOptions.init) @safe
 {
 	import std.base64 : Base64;
@@ -92,7 +104,80 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 		files ~= f;
 	}
 
+	// Build (and fully validate) the nested skills' entries before anything is
+	// registered, so a malformed nested skill rejects the whole directory
+	// without side effects; the appends after registration cannot throw.
+	Json[] nestedEntries;
+	if (options.publishNested)
+		nestedEntries = buildNestedEntries(server, path, raws);
+
 	registerSkillResources(server, path, skillMd, frontmatter, files);
+	foreach (entry; nestedEntries)
+		addSkillEntry(server, entry);
+}
+
+/// One flat entry per nested skill found in `raws` (any `SKILL.md` below the
+/// root): `uri` is the nested `SKILL.md`'s file resource URI under the enclosing
+/// skill's `path`, `frontmatter` is the nested file's own authored frontmatter,
+/// and `resources` covers exactly the nested skill's subtree — itself first,
+/// then every deeper file, including any further-nested skills' files. Throws on
+/// the same validation failures as a top-level skill (frontmatter shape, naming,
+/// name/directory match, already-registered URI); the files themselves are
+/// registered once, by the enclosing skill's registration.
+private Json[] buildNestedEntries(McpServer server, string path, RawFile[] raws) @safe
+{
+	import std.algorithm : endsWith, startsWith;
+
+	Json[] entries;
+	foreach (r; raws)
+	{
+		if (!r.path.endsWith("/SKILL.md"))
+			continue;
+		const dirRel = r.path[0 .. $ - "/SKILL.md".length];
+		const basename = skillName(dirRel);
+		if (!r.isText)
+			throw new Exception(
+					"registerSkillDir: nested SKILL.md is not valid UTF-8 text: " ~ r.path);
+		Json fm = parseSkillFrontmatter(cast(string) r.bytes);
+		if (!(fm.type == Json.Type.object && "name" in fm && fm["name"].type == Json.Type.string))
+			throw new Exception("registerSkillDir: nested SKILL.md frontmatter must "
+					~ "define a string 'name': " ~ r.path);
+		if (!("description" in fm && fm["description"].type == Json.Type.string))
+			throw new Exception("registerSkillDir: nested SKILL.md frontmatter must "
+					~ "define a string 'description': " ~ r.path);
+		if (!isValidSkillName(basename))
+			throw new Exception("registerSkillDir: nested skill directory name '"
+					~ basename ~ "' is not a valid skill name (" ~ r.path ~ ")");
+		if (fm["name"].get!string != basename)
+			throw new Exception("registerSkillDir: nested skill directory '" ~ dirRel
+					~ "' must equal its SKILL.md frontmatter name '" ~ fm["name"].get!string ~ "'");
+
+		const uri = skillFileUri(path, r.path);
+		if (uri in server.ensureSkillIndex().byUri)
+			throw new Exception("a skill at '" ~ uri ~ "' is already registered");
+
+		Json manifest = Json.emptyArray;
+		Json self = Json.emptyObject;
+		self["uri"] = uri;
+		self["digest"] = skillDigest(r.bytes);
+		manifest ~= self;
+		foreach (rr; raws)
+		{
+			if (rr.path == r.path || !rr.path.startsWith(dirRel ~ "/"))
+				continue;
+			Json m = Json.emptyObject;
+			m["uri"] = skillFileUri(path, rr.path);
+			m["digest"] = skillDigest(rr.bytes);
+			manifest ~= m;
+		}
+
+		Json entry = Json.emptyObject;
+		entry["uri"] = uri;
+		entry["frontmatter"] = fm;
+		entry["resources"] = manifest;
+		entries ~= entry;
+	}
+	return entries;
 }
 
 // --- Frontmatter -----------------------------------------------------------
@@ -266,16 +351,12 @@ private void walkInto(string base, string rel, ref RawFile[] files, ref size_t t
 		if (!entry.isFile)
 			continue;
 		// The root SKILL.md is served as the skill markdown, not as a generic
-		// file; a SKILL.md anywhere deeper would mean a nested skill, which the
-		// spec forbids.
-		if (entry.name == "SKILL.md")
-		{
-			if (rel.length == 0)
-				continue;
-			throw new Exception(
-					"registerSkillDir: a nested SKILL.md is not allowed (skills do not nest): "
-					~ childRel);
-		}
+		// file. A SKILL.md anywhere deeper is a nested skill: from this skill's
+		// perspective it is ordinary supporting content, collected like any
+		// other file (and possibly published as its own entry — see
+		// `buildNestedEntries`).
+		if (entry.name == "SKILL.md" && rel.length == 0)
+			continue;
 		if (include !is null && !include(childRel))
 			continue;
 
@@ -494,6 +575,13 @@ version (unittest)
 		write(path, content);
 	}
 
+	private void writeNestedDir(string path) @trusted
+	{
+		import std.file : mkdirRecurse;
+
+		mkdirRecurse(path);
+	}
+
 	// A skill directory with a single, caller-supplied SKILL.md and no other files.
 	private void writeRawSkill(string root, string skillMd) @trusted
 	{
@@ -621,18 +709,195 @@ unittest  // registerSkillDir auto-exposes subdirectories via resources/director
 	assert(sawSkillMd && sawReferencesDir);
 }
 
-unittest  // registerSkillDir rejects a nested SKILL.md (skills do not nest)
+version (unittest)
+{
+	// A skill directory containing a nested skill two levels down, plus an
+	// ordinary supporting file at each level.
+	private void writeNestedFixture(string root) @trusted
+	{
+		import std.file : mkdirRecurse, write, rmdirRecurse, exists;
+
+		if (exists(root))
+			rmdirRecurse(root);
+		mkdirRecurse(root ~ "/references/sub-skill");
+		write(root ~ "/SKILL.md", "---\nname: outer\ndescription: Outer skill\n---\n\n# Outer\n");
+		write(root ~ "/references/GUIDE.md", "# Guide\n");
+		write(root ~ "/references/sub-skill/SKILL.md",
+				"---\nname: sub-skill\ndescription: Nested skill\n---\n\n# Sub\n");
+		write(root ~ "/references/sub-skill/notes.md", "# Notes\n");
+	}
+}
+
+unittest  // nested files are supporting content: the enclosing manifest lists them all
+{
+	const root = tmpRoot("nest-encl");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	auto e = listedSkill(s, 1, 0);
+	assert(e["uri"].get!string == "skill://outer/SKILL.md");
+	// Its own SKILL.md + GUIDE.md + the nested skill's SKILL.md + notes.md:
+	// the nested skill's files are ordinary files of the enclosing skill too.
+	auto res = e["resources"];
+	assert(res.length == 4);
+	bool sawNestedMd;
+	foreach (i; 0 .. res.length)
+		if (res[i]["uri"].get!string == "skill://outer/references/sub-skill/SKILL.md")
+			sawNestedMd = true;
+	assert(sawNestedMd);
+}
+
+unittest  // a nested skill is additionally published as its own flat entry
+{
+	const root = tmpRoot("nest-flat");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	// Two flat entries: the enclosing skill first, then the nested one, whose
+	// uri shares the enclosing path prefix and whose frontmatter is the nested
+	// file's own authored frontmatter.
+	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"];
+	assert(result["skills"].length == 2);
+	auto nested = result["skills"][1];
+	assert(nested["uri"].get!string == "skill://outer/references/sub-skill/SKILL.md");
+	assert(nested["frontmatter"]["name"].get!string == "sub-skill");
+	assert(nested["frontmatter"]["description"].get!string == "Nested skill");
+
+	// The nested entry's manifest covers exactly its subtree — itself first.
+	auto res = nested["resources"];
+	assert(res.length == 2);
+	assert(res[0]["uri"].get!string == nested["uri"].get!string);
+	assert(res[1]["uri"].get!string == "skill://outer/references/sub-skill/notes.md");
+	assert(res[1]["digest"].get!string == skillDigestOf("# Notes\n"));
+}
+
+unittest  // skills/get answers for a nested skill's uri
+{
+	const root = tmpRoot("nest-get");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://outer/references/sub-skill/SKILL.md";
+	auto got = s.handle(Message(makeRequest(Json(1), "skills/get", p))).get["result"]["skill"];
+	assert(got["frontmatter"]["name"].get!string == "sub-skill");
+}
+
+unittest  // a nested directory whose name mismatches its frontmatter rejects the whole dir
 {
 	import std.exception : assertThrown;
 
-	const root = tmpRoot("nested");
-	writeSkillFixture(root);
+	const root = tmpRoot("nest-bad");
+	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
-	writeFile(root ~ "/references/SKILL.md", "---\nname: x\ndescription: y\n---\n");
+	writeFile(root ~ "/references/sub-skill/SKILL.md",
+			"---\nname: other-name\ndescription: d\n---\n\n# Sub\n");
 
 	auto s = new McpServer("t", "1");
 	assertThrown!Exception(registerSkillDir(s, root));
+
+	// Validation precedes registration: the server is untouched, so the skills
+	// methods were never even enabled.
+	auto resp = s.handle(Message(makeRequest(Json(1), "skills/list", Json.emptyObject))).get;
+	assert("error" in resp);
+}
+
+unittest  // publishNested=false serves the nested SKILL.md as a plain file only
+{
+	import std.algorithm : canFind;
+
+	const root = tmpRoot("nest-off");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.publishNested = false;
+	registerSkillDir(s, root, opts);
+
+	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"];
+	assert(result["skills"].length == 1);
+	// Still readable — it is ordinary supporting content of the enclosing skill.
+	const md = readResource(s, 2, "skill://outer/references/sub-skill/SKILL.md")["text"]
+		.get!string;
+	assert(md.canFind("# Sub"));
+}
+
+unittest  // nested files are registered once and serve their authored bytes
+{
+	import std.algorithm : canFind;
+
+	const root = tmpRoot("nest-once");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	const md = readResource(s, 1, "skill://outer/references/sub-skill/SKILL.md")["text"]
+		.get!string;
+	assert(md.canFind("name: sub-skill") && md.canFind("# Sub"));
+
+	// Exactly one resource registration for the nested SKILL.md.
+	auto listed = s.handle(Message(makeRequest(Json(2), "resources/list",
+			Json.emptyObject))).get["result"]["resources"];
+	size_t count;
+	foreach (i; 0 .. listed.length)
+		if (listed[i]["uri"].get!string == "skill://outer/references/sub-skill/SKILL.md")
+			count++;
+	assert(count == 1);
+}
+
+unittest  // a doubly-nested skill publishes three flat entries with subtree manifests
+{
+	const root = tmpRoot("nest-deep");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+	// A further skill nested inside the nested one.
+	writeNestedDir(root ~ "/references/sub-skill/deep-skill");
+	writeFile(root ~ "/references/sub-skill/deep-skill/SKILL.md",
+			"---\nname: deep-skill\ndescription: Doubly nested\n---\n\n# Deep\n");
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"];
+	assert(result["skills"].length == 3);
+
+	// The middle skill's manifest includes the deep skill's file (nested content
+	// is supporting content, at every level); the deep skill's covers itself only.
+	Json subEntry, deepEntry;
+	foreach (i; 0 .. result["skills"].length)
+	{
+		const n = result["skills"][i]["frontmatter"]["name"].get!string;
+		if (n == "sub-skill")
+			subEntry = result["skills"][i];
+		if (n == "deep-skill")
+			deepEntry = result["skills"][i];
+	}
+	assert(subEntry["resources"].length == 3); // its SKILL.md, notes.md, deep SKILL.md
+	assert(deepEntry["resources"].length == 1);
+	assert(deepEntry["resources"][0]["uri"].get!string
+			== "skill://outer/references/sub-skill/deep-skill/SKILL.md");
 }
 
 unittest  // registerSkillDir honours an explicit prefixed path matching the frontmatter name
