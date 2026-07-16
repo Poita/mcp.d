@@ -309,8 +309,8 @@ string verifySkillMarkdown(const SkillEntry entry, string skillMd) @safe
 
 // --- Filesystem walk -------------------------------------------------------
 
-/// A file read from a skill directory, ready to become a resource and/or an
-/// archive entry.
+/// A file read from a skill directory, ready to become a resource and a
+/// `resources`-manifest entry.
 private struct RawFile
 {
 	string path; /// skill-relative posix path, e.g. "references/FORMS.md"
@@ -327,7 +327,7 @@ private RawFile[] collectFiles(string dir,
 	RawFile[] files;
 	size_t total;
 	walkInto(dir, "", files, total, include, maxFiles, maxTotalBytes);
-	// Sort by path so both the served order and the archive bytes are deterministic.
+	// Sort by path so the served order and the manifest order are deterministic.
 	sort!((a, b) => a.path < b.path)(files);
 	return files;
 }
