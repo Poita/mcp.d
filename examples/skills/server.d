@@ -68,8 +68,8 @@ void main(string[] args) @safe
 
 	// One call registers all three skills: the two @skill methods and the
 	// @skillDir directory. The first registration also advertises the skills
-	// extension, stands up skill://index.json, and enables
-	// resources/directory/read.
+	// extension (committing the server to skills/list and skills/get) and
+	// enables resources/directory/read.
 	registerHandlers(server, new SkillsApi);
 
 	runServerFromArgs(server, args, defaultPort);

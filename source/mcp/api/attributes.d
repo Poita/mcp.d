@@ -196,9 +196,9 @@ struct resource
 /// and returns the `SKILL.md` instructions body as a `string`; the reflection
 /// layer synthesizes the YAML frontmatter from the skill `path`'s final segment
 /// and `description`, serves it as a `skill://<path>/SKILL.md` markdown resource,
-/// advertises the skills extension, and lists a conformant entry (verbatim
-/// frontmatter, url, sha256 digest) in the `skill://index.json` discovery
-/// resource. `path` is a `/`-separated locator whose final segment is the skill
+/// advertises the skills extension, and publishes a conformant entry (verbatim
+/// frontmatter, uri, per-file sha256 digests) via the `skills/list` and
+/// `skills/get` methods. `path` is a `/`-separated locator whose final segment is the skill
 /// name; that segment must be lowercase alphanumeric with single hyphens
 /// (1..64 chars), per the Agent Skills spec. Preceding segments are an optional
 /// organizational prefix (e.g. `acme/billing/refunds`).
