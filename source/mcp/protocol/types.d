@@ -3152,6 +3152,73 @@ struct ListResourcesResult
 	}
 }
 
+/// Result of the SEP-2640 `skills/list` method. Entries are carried as raw
+/// `Json`: their shape (`{uri, frontmatter, resources}`) is defined by the
+/// Skills extension and passed through verbatim. Deliberately NOT a
+/// `CacheableResult`: SEP-2549 list-caching attributes apply to this method
+/// only from protocol 2026-07-28, which this SDK does not implement yet.
+struct ListSkillsResult
+{
+	Json[] skills;
+	Nullable!string nextCursor;
+	/// Optional result-level `_meta` object, reserved by MCP on every `Result`.
+	mixin MetaField;
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		Json arr = Json.emptyArray;
+		foreach (s; skills)
+			arr ~= s;
+		j["skills"] = arr;
+		if (!nextCursor.isNull)
+			j["nextCursor"] = nextCursor.get;
+		emitMetaField(j);
+		return j;
+	}
+
+	static ListSkillsResult fromJson(Json j) @safe
+	{
+		ListSkillsResult r;
+		if ("skills" in j && j["skills"].type == Json.Type.array)
+		{
+			auto arr = j["skills"];
+			foreach (i; 0 .. arr.length)
+				r.skills ~= arr[i];
+		}
+		tryGet(j, "nextCursor", r.nextCursor);
+		r.parseMetaField(j);
+		return r;
+	}
+}
+
+/// Result of the SEP-2640 `skills/get` method: the entry for a single skill,
+/// identical in shape and meaning to an entry of `skills/list`. A snapshot of
+/// one skill, so it carries no pagination cursor and no caching attributes.
+struct GetSkillResult
+{
+	Json skill;
+	/// Optional result-level `_meta` object, reserved by MCP on every `Result`.
+	mixin MetaField;
+
+	Json toJson() const @safe
+	{
+		Json j = Json.emptyObject;
+		j["skill"] = skill;
+		emitMetaField(j);
+		return j;
+	}
+
+	static GetSkillResult fromJson(Json j) @safe
+	{
+		GetSkillResult r;
+		if ("skill" in j)
+			r.skill = j["skill"];
+		r.parseMetaField(j);
+		return r;
+	}
+}
+
 /// Result of `resources/templates/list`.
 struct ListResourceTemplatesResult
 {
