@@ -988,8 +988,8 @@ private void registerSkillDirMethod(string memberName, alias overload, alias par
 	import mcp.api.skill_dir : registerSkillDir, SkillDirOptions;
 
 	// A @skillDir method names a local directory: it takes no arguments and
-	// returns the directory path as a string. The directory's SKILL.md, files,
-	// and (optionally) archives are served by registerSkillDir.
+	// returns the directory path as a string. The directory's SKILL.md and files
+	// are served by registerSkillDir.
 	static assert(Parameters!overload.length == 0, "@skillDir method '" ~ memberName
 			~ "' must take no parameters; it returns the local skill directory path");
 	static assert(is(ReturnType!overload : string),
@@ -998,7 +998,6 @@ private void registerSkillDirMethod(string memberName, alias overload, alias par
 
 	SkillDirOptions options;
 	options.path = attr.path;
-	options.archives = attr.archives;
 	registerSkillDir(server, __traits(getMember, parent, memberName)(), options);
 }
 

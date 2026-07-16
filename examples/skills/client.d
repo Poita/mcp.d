@@ -12,10 +12,10 @@
  *
  *   1. server/discover advertises the skills extension under `capabilities`.
  *   2. listSkills() reads skill://index.json and returns conformant entries
- *      (verbatim frontmatter, SKILL.md url + sha256 digest, archives).
+ *      (verbatim frontmatter, SKILL.md url + sha256 digest).
  *   3. readSkill("git-workflow") reads a @skill skill: synthesized frontmatter.
  *   4. The @skillDir-sourced team/release-helper skill carries its AUTHORED
- *      frontmatter, a references/CHECKLIST.md file, and a .zip archive form.
+ *      frontmatter and a references/CHECKLIST.md file.
  *   5. resources/directory/read scope-lists the release-helper tree: files plus
  *      subdirectories (marked inode/directory), descended one level at a time.
  *
@@ -79,7 +79,7 @@ int main(string[] args) @safe
 			"SKILL.md frontmatter should carry the description");
 		check(md.canFind("# Git Workflow"), "SKILL.md should carry the instructions body");
 
-		// --- 4. the @skillDir skill: authored frontmatter, file, archive ----
+		// --- 4. the @skillDir skill: authored frontmatter and files ---------
 		auto rel = skills.filter!(s => s.name == "release-helper").front;
 		check(rel.url == "skill://team/release-helper/SKILL.md",
 			"release-helper should be served under its team/ prefix");
@@ -93,13 +93,6 @@ int main(string[] args) @safe
 		check(checklist.contents.length > 0
 			&& checklist.contents[0].text.canFind("Release Checklist"),
 			"the supporting references/CHECKLIST.md should be readable");
-
-		check(rel.archives.length == 1, "release-helper should list one archive form");
-		checkEq(rel.archives[0].mimeType, "application/zip", "archive mimeType");
-		check(rel.archives[0].digest.canFind("sha256:"), "archive should carry a digest");
-		auto archive = client.readResource(rel.archives[0].url);
-		check(archive.contents.length > 0 && archive.contents[0].blob.length > 0,
-			"the archive resource should be readable as a blob");
 
 		// --- 5. resources/directory/read: walk the skill's tree -------------
 		auto root = readDirectory(client, "skill://team/release-helper");
@@ -118,8 +111,8 @@ int main(string[] args) @safe
 		writeln("OK: skills example e2e passed over ", http ? "http" : "stdio",
 			" — skills extension advertised (directoryRead); index lists",
 			" git-workflow/code-review/release-helper with verbatim frontmatter + sha256",
-			" digests; @skillDir team/release-helper serves authored frontmatter,",
-			" references/CHECKLIST.md, and a .zip archive; resources/directory/read walks the tree.");
+			" digests; @skillDir team/release-helper serves authored frontmatter and",
+			" references/CHECKLIST.md; resources/directory/read walks the tree.");
 		return 0;
 	});
 }
