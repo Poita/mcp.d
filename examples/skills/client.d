@@ -68,8 +68,10 @@ int main(string[] args) @safe
 		check(names.canFind("release-helper"), "index should list release-helper");
 		foreach (s; skills)
 		{
-			check(s.url.length > 0, "entry should carry a SKILL.md url");
-			check(s.digest.canFind("sha256:"), "entry should carry a sha256 digest");
+			check(s.uri.length > 0, "entry should carry a SKILL.md uri");
+			check(s.resources.length > 0, "entry should carry a resources manifest");
+			check(s.resources[0].digest.canFind("sha256:"),
+				"manifest entries should carry sha256 digests");
 		}
 
 		// --- 3. a @skill skill: synthesized frontmatter ---------------------
@@ -81,7 +83,7 @@ int main(string[] args) @safe
 
 		// --- 4. the @skillDir skill: authored frontmatter and files ---------
 		auto rel = skills.filter!(s => s.name == "release-helper").front;
-		check(rel.url == "skill://team/release-helper/SKILL.md",
+		check(rel.uri == "skill://team/release-helper/SKILL.md",
 			"release-helper should be served under its team/ prefix");
 		// The authored frontmatter (license + nested metadata) survives verbatim.
 		check(rel.frontmatter["license"].get!string == "Apache-2.0",

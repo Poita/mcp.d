@@ -15,7 +15,8 @@ module mcp.api.skill_dir;
 import vibe.data.json : Json;
 
 import mcp.server.server : McpServer;
-import mcp.api.skills : SkillFile, registerSkillResources, skillName, isValidSkillPath;
+import mcp.api.skills : SkillFile, SkillEntry, registerSkillResources,
+	skillName, isValidSkillPath, skillDigest, verifyResourceDigest;
 
 @safe:
 
@@ -56,7 +57,7 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 		throw new Exception("registerSkillDir: missing SKILL.md in " ~ dir);
 
 	const skillMd = readTextFile(skillMdPath);
-	Json frontmatter = parseFrontmatter(skillMd);
+	Json frontmatter = parseSkillFrontmatter(skillMd);
 	if (!(frontmatter.type == Json.Type.object && "name" in frontmatter
 			&& frontmatter["name"].type == Json.Type.string))
 		throw new Exception("registerSkillDir: SKILL.md frontmatter must define a string 'name'");
@@ -97,12 +98,13 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 // --- Frontmatter -----------------------------------------------------------
 
 /// Parse the leading `---`-delimited YAML frontmatter of a `SKILL.md` into a
-/// JSON object (the verbatim `frontmatter` SEP-2640 puts in the index). The fence
-/// is matched a line at a time: the file must open with a line that is exactly
-/// `---`, and the frontmatter ends at the next line that is exactly `---` or
-/// `...` — so a `---` appearing inside a value does not close it early, and CRLF
-/// line endings work.
-private Json parseFrontmatter(string md) @safe
+/// JSON object (the verbatim `frontmatter` SEP-2640 puts in a skill entry). The
+/// fence is matched a line at a time: the file must open with a line that is
+/// exactly `---`, and the frontmatter ends at the next line that is exactly
+/// `---` or `...` — so a `---` appearing inside a value does not close it early,
+/// and CRLF line endings work. Hosts use this to compare a fetched `SKILL.md`'s
+/// frontmatter against its entry (see `verifySkillMarkdown`).
+Json parseSkillFrontmatter(string md) @safe
 {
 	import std.array : split, join, replace;
 	import std.string : stripRight;
@@ -192,6 +194,32 @@ private Json nodeToJson(N)(N node) @safe
 	case NodeID.invalid:
 		return Json(null);
 	}
+}
+
+/// Verify a fetched `SKILL.md` against its skill entry, covering both host-side
+/// checks SEP-2640 requires: the bytes must match the digest the entry's
+/// `resources` manifest lists for the skill's own `uri`, and the parsed YAML
+/// frontmatter must be identical in content to the entry's `frontmatter` — so
+/// what a user approved from the listing is what the model actually receives.
+/// Returns `null` on success, or a reason string on failure; a failing skill
+/// must not be loaded.
+string verifySkillMarkdown(const SkillEntry entry, string skillMd) @safe
+{
+	const digestReason = verifyResourceDigest(entry, entry.uri, cast(const(ubyte)[]) skillMd);
+	if (digestReason !is null)
+		return digestReason;
+
+	Json parsed;
+	try
+		parsed = parseSkillFrontmatter(skillMd);
+	catch (Exception e)
+		return "the fetched SKILL.md has no parseable frontmatter: " ~ e.msg;
+	// vibe Json equality is deep, so one comparison covers every field the
+	// author wrote, in both directions (a missing field and an added field are
+	// both discrepancies).
+	if (parsed != entry.frontmatter)
+		return "the fetched SKILL.md frontmatter does not match the entry's frontmatter";
+	return null;
 }
 
 // --- Filesystem walk -------------------------------------------------------
@@ -735,7 +763,60 @@ unittest  // registerSkillDir rejects a directory whose files exceed maxTotalByt
 
 version (unittest) private string skillDigestOf(string s) @safe
 {
-	import mcp.api.skills : skillDigest;
-
 	return skillDigest(cast(const(ubyte)[]) s);
+}
+
+unittest  // parseSkillFrontmatter is public: hosts parse fetched SKILL.md frontmatter
+{
+	auto fm = parseSkillFrontmatter("---\nname: x\ndescription: d\n---\n\n# Body\n");
+	assert(fm["name"].get!string == "x");
+	assert(fm["description"].get!string == "d");
+}
+
+version (unittest)
+{
+	import mcp.api.skills : SkillResourceRef;
+
+	// A well-formed SKILL.md and the entry a server would publish for it.
+	private enum verifyMd = "---\nname: x\ndescription: d\n---\n\n# Body\n";
+
+	private SkillEntry verifyEntry() @safe
+	{
+		SkillEntry e;
+		e.uri = "skill://x/SKILL.md";
+		e.frontmatter = parseSkillFrontmatter(verifyMd);
+		e.resources = [
+			SkillResourceRef("skill://x/SKILL.md", skillDigestOf(verifyMd))
+		];
+		return e;
+	}
+}
+
+unittest  // verifySkillMarkdown passes for matching bytes and frontmatter
+{
+	assert(verifySkillMarkdown(verifyEntry(), verifyMd) is null);
+}
+
+unittest  // verifySkillMarkdown reports a body mutation as a digest failure
+{
+	const mutated = "---\nname: x\ndescription: d\n---\n\n# Tampered\n";
+	const reason = verifySkillMarkdown(verifyEntry(), mutated);
+	assert(reason !is null);
+	import std.algorithm : canFind;
+
+	assert(reason.canFind("digest mismatch"));
+}
+
+unittest  // verifySkillMarkdown reports entry frontmatter that diverges from the file
+{
+	// The digest matches the fetched bytes, but the entry claims different
+	// frontmatter than the file carries — the identity discrepancy the host-side
+	// field comparison exists to catch.
+	auto e = verifyEntry();
+	e.frontmatter["description"] = "something else";
+	const reason = verifySkillMarkdown(e, verifyMd);
+	assert(reason !is null);
+	import std.algorithm : canFind;
+
+	assert(reason.canFind("frontmatter"));
 }
