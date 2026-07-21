@@ -1884,7 +1884,8 @@ final class McpServer : ServerCore
 			// when no codec is configured.
 			result = secureOutgoingRequestState(requestStateCodec_, result,
 					msg.method, msg.params, ctx);
-			return nullable(makeResponse(msg.id, stampResultType(result, effective)));
+			return nullable(makeResponse(msg.id,
+					stampServerInfo(stampResultType(result, effective), effective)));
 		}
 		catch (McpException e)
 		{
@@ -2086,6 +2087,20 @@ final class McpServer : ServerCore
 			result["resultType"] = inputRequired ? "input_required" : "complete";
 		}
 		return result;
+	}
+
+	/// Identify this server in a modern result's `_meta`
+	/// (`io.modelcontextprotocol/serverInfo`).
+	///
+	/// Modern revisions have no `initialize` handshake to carry identity, so
+	/// every result advertises it instead. Centralized in the dispatch path so
+	/// each result type stays identity-agnostic. A no-op for pre-draft versions,
+	/// whose identity travels in the `initialize` reply.
+	private Json stampServerInfo(Json result, ProtocolVersion ver) @safe
+	{
+		if (!ver.isModern)
+			return result;
+		return withServerInfo(result, serverInfo_.forVersion(ver));
 	}
 
 	/// Shared `*/list` tail for `doListResources`/`doListResourceTemplates`/
@@ -2456,7 +2471,8 @@ final class McpServer : ServerCore
 		foreach (v; supportedVersions)
 			d.protocolVersions ~= v.toWire;
 		d.capabilities = capabilities().forVersion(ProtocolVersion.modern);
-		d.serverInfo = serverInfo_.forVersion(ProtocolVersion.modern);
+		// Identity is stamped into `_meta` by the dispatch path, along with every
+		// other modern result.
 		d.instructions = instructions;
 		// `server/discover` is draft-only, so the version is always modern here;
 		// emit the configured discover hint (or the conservative ttlMs:0 default).
@@ -3639,7 +3655,7 @@ unittest  // server/discover (draft) emits the full stored serverInfo
 	auto s = new McpServer(info);
 	// server/discover is a draft-only RPC: dispatch it as a draft request.
 	auto resp = s.handle(draftReq(1, "server/discover")).get;
-	auto si = resp["result"]["serverInfo"];
+	auto si = resp["result"]["_meta"][MetaKey.serverInfo];
 	assert(si["name"].get!string == "rich-srv");
 	assert(si["title"].get!string == "Rich Server");
 	assert(si["description"].get!string == "a helpful server");
@@ -5727,7 +5743,7 @@ unittest  // server/discover under draft still serves the discover result
 	auto s = new McpServer("disc-srv", "1.0");
 	auto resp = s.handle(draftReq(1, "server/discover")).get;
 	assert("error" !in resp);
-	assert(resp["result"]["serverInfo"]["name"].get!string == "disc-srv");
+	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "disc-srv");
 }
 
 unittest  // stdio subscriptions/listen is cancellable via notifications/cancelled
@@ -6584,7 +6600,7 @@ unittest  // server/discover advertises all supported versions + identity
 			hasFirst = true;
 	}
 	assert(hasDraft && hasFirst);
-	assert(resp["result"]["serverInfo"]["name"].get!string == "test-srv");
+	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "test-srv");
 }
 
 unittest  // per-list setListCacheHint: draft tools/list carries CacheableResult fields
@@ -6766,6 +6782,33 @@ unittest  // draft results carry the mandatory resultType:"complete" discriminat
 	auto resp = s.handle(draftReq(2, "tools/list")).get;
 	assert("error" !in resp);
 	assert(resp["result"]["resultType"].get!string == "complete");
+}
+
+unittest  // draft results identify the server in `_meta`
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(draftReq(2, "tools/list")).get;
+	assert("error" !in resp);
+	auto info = resp["result"]["_meta"][MetaKey.serverInfo];
+	assert(info["name"].get!string == "test-srv");
+	assert(info["version"].get!string == "0.1.0");
+}
+
+unittest  // server/discover carries identity in `_meta`, not a top-level field
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(draftReq(2, "server/discover")).get;
+	assert("error" !in resp);
+	assert("serverInfo" !in resp["result"]);
+	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "test-srv");
+}
+
+unittest  // pre-draft results never carry the `_meta` serverInfo key
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(req(2, "tools/list")).get;
+	assert("error" !in resp);
+	assert("_meta" !in resp["result"] || MetaKey.serverInfo !in resp["result"]["_meta"]);
 }
 
 unittest  // pre-draft results never emit resultType

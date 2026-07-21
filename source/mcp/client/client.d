@@ -6382,7 +6382,9 @@ unittest  // connect() auto-detect probes server/discover with draft framing and
 		Json info = Json.emptyObject;
 		info["name"] = "draft-srv";
 		info["version"] = "1.0";
-		r["serverInfo"] = info;
+		Json meta = Json.emptyObject;
+		meta[MetaKey.serverInfo] = info;
+		r["_meta"] = meta;
 		return r;
 	};
 	auto chosen = c.connect();
@@ -6447,7 +6449,9 @@ unittest  // connect() populates serverCapabilities/serverInfo/serverInstruction
 		Json info = Json.emptyObject;
 		info["name"] = "modern-srv";
 		info["version"] = "2.0";
-		r["serverInfo"] = info;
+		Json meta = Json.emptyObject;
+		meta[MetaKey.serverInfo] = info;
+		r["_meta"] = meta;
 		r["instructions"] = "hello";
 		return r;
 	};

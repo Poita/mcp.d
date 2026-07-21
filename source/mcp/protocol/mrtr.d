@@ -16,6 +16,9 @@ enum MetaKey : string
 	protocolVersion = "io.modelcontextprotocol/protocolVersion",
 	clientInfo = "io.modelcontextprotocol/clientInfo",
 	clientCapabilities = "io.modelcontextprotocol/clientCapabilities",
+	/// Identifies the server software producing a response. A `ResultMetaObject`
+	/// field, so it rides on every result rather than one handshake reply.
+	serverInfo = "io.modelcontextprotocol/serverInfo",
 	logLevel = "io.modelcontextprotocol/logLevel",
 	subscriptionId = "io.modelcontextprotocol/subscriptionId",
 }

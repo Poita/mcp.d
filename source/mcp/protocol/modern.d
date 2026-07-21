@@ -48,6 +48,9 @@ struct DiscoverResult
 {
 	string[] protocolVersions;
 	ServerCapabilities capabilities;
+	/// Server identity. Serialised into `_meta` under
+	/// `io.modelcontextprotocol/serverInfo` (the schema has no top-level
+	/// `serverInfo` field), and omitted entirely when unset.
 	Implementation serverInfo;
 	Nullable!string instructions;
 	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`):
@@ -69,7 +72,12 @@ struct DiscoverResult
 		// Response Fields table), even though the D member is `protocolVersions`.
 		j["supportedVersions"] = pv;
 		j["capabilities"] = capabilities.toJson();
-		j["serverInfo"] = serverInfo.toJson();
+		if (serverInfo.name.length || serverInfo.version_.length)
+		{
+			Json meta = Json.emptyObject;
+			meta[MetaKey.serverInfo] = serverInfo.toJson();
+			j["_meta"] = meta;
+		}
 		if (!instructions.isNull)
 			j["instructions"] = instructions.get;
 		if (!cache.isNull)
@@ -92,8 +100,7 @@ struct DiscoverResult
 		}
 		if ("capabilities" in j)
 			r.capabilities = ServerCapabilities.fromJson(j["capabilities"]);
-		if ("serverInfo" in j)
-			r.serverInfo = Implementation.fromJson(j["serverInfo"]);
+		r.serverInfo = readServerInfo(j);
 		tryGet(j, "instructions", r.instructions);
 		r.cache = parseCacheHint(j);
 		return r;
@@ -141,6 +148,46 @@ struct CacheHint
 {
 	Duration ttl;
 	CacheScope cacheScope = CacheScope.public_;
+}
+
+/// Attach the server's identity to a result's `_meta` under
+/// `io.modelcontextprotocol/serverInfo` and return it, leaving the original
+/// untouched (matching the sibling `withCache`/`withSubscriptionId`). Every
+/// modern result identifies its server, so this runs at one dispatch chokepoint
+/// rather than per result type. An identity-less `info` and a non-object result
+/// pass through unchanged; an existing key is never overwritten.
+Json withServerInfo(Json result, Implementation info) @safe
+{
+	if (result.type != Json.Type.object)
+		return result;
+	if (info.name.length == 0 && info.version_.length == 0)
+		return result;
+	Json out_ = result.clone();
+	Json meta = ("_meta" in out_ && out_["_meta"].type == Json.Type.object) ? out_["_meta"]
+		: Json.emptyObject;
+	if (MetaKey.serverInfo in meta)
+		return result;
+	meta[MetaKey.serverInfo] = info.toJson();
+	out_["_meta"] = meta;
+	return out_;
+}
+
+/// Read the server identity a result advertises in `_meta`
+/// (`io.modelcontextprotocol/serverInfo`). Returns a default-initialised
+/// `Implementation` when the result carries none — the field is optional, and
+/// the value is self-reported, so callers must not make security or behavioral
+/// decisions from it.
+Implementation readServerInfo(Json result) @safe
+{
+	if (result.type != Json.Type.object || "_meta" !in result)
+		return Implementation.init;
+	auto meta = result["_meta"];
+	if (meta.type != Json.Type.object || MetaKey.serverInfo !in meta)
+		return Implementation.init;
+	auto info = meta[MetaKey.serverInfo];
+	if (info.type != Json.Type.object)
+		return Implementation.init;
+	return Implementation.fromJson(info);
 }
 
 /// Attach the draft `CacheableResult` fields (`ttlMs`, `cacheScope`) to a result
@@ -244,6 +291,38 @@ unittest  // DiscoverResult round-trips
 	assert(back.protocolVersions.length == 2);
 	assert(back.serverInfo.name == "srv");
 	assert(back.capabilities.logging);
+}
+
+unittest  // server identity travels in result `_meta`, not a top-level `serverInfo`
+{
+	DiscoverResult d;
+	d.protocolVersions = ["2026-07-28"];
+	d.serverInfo = Implementation("srv", "1.0");
+	auto j = d.toJson();
+	// `DiscoverResult` has no `serverInfo` member in the schema; identity is a
+	// `ResultMetaObject` field carried by every result.
+	assert("serverInfo" !in j);
+	assert(j["_meta"][MetaKey.serverInfo]["name"].get!string == "srv");
+	assert(j["_meta"][MetaKey.serverInfo]["version"].get!string == "1.0");
+}
+
+unittest  // an identity-less DiscoverResult emits no `_meta` serverInfo
+{
+	DiscoverResult d;
+	d.protocolVersions = ["2026-07-28"];
+	auto j = d.toJson();
+	assert("_meta" !in j || MetaKey.serverInfo !in j["_meta"]);
+}
+
+unittest  // DiscoverResult.fromJson reads serverInfo out of `_meta`
+{
+	import vibe.data.json : parseJsonString;
+
+	auto j = parseJsonString(`{"resultType":"complete","supportedVersions":["2026-07-28"],`
+			~ `"_meta":{"` ~ MetaKey.serverInfo ~ `":{"name":"srv","version":"1.0"}}}`);
+	auto r = DiscoverResult.fromJson(j);
+	assert(r.serverInfo.name == "srv");
+	assert(r.serverInfo.version_ == "1.0");
 }
 
 unittest  // DiscoverResult.toJson emits the spec wire field `supportedVersions`
