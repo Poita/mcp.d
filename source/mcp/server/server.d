@@ -1118,8 +1118,8 @@ final class McpServer : ServerCore
 
 	/// The SEP-2640 skills index, created on first `enableSkills` / `registerSkill`
 	/// (`mcp.api.skills`), or null if no skill has been registered. The skills
-	/// helper layer appends discovery entries here and the `skill://index.json`
-	/// resource reader serializes them; the server itself holds the state so the
+	/// helper layer adds entries here and the server's `skills/list` /
+	/// `skills/get` handlers serve them; the server itself holds the state so the
 	/// `@skill` UDA path and the imperative API share one index across calls.
 	package(mcp) SkillIndex ensureSkillIndex() @safe
 	{
@@ -1884,7 +1884,8 @@ final class McpServer : ServerCore
 			// when no codec is configured.
 			result = secureOutgoingRequestState(requestStateCodec_, result,
 					msg.method, msg.params, ctx);
-			return nullable(makeResponse(msg.id, stampResultType(result, effective)));
+			return nullable(makeResponse(msg.id,
+					stampServerInfo(stampResultType(result, effective), effective)));
 		}
 		catch (McpException e)
 		{
@@ -2088,6 +2089,20 @@ final class McpServer : ServerCore
 		return result;
 	}
 
+	/// Identify this server in a modern result's `_meta`
+	/// (`io.modelcontextprotocol/serverInfo`).
+	///
+	/// Modern revisions have no `initialize` handshake to carry identity, so
+	/// every result advertises it instead. Centralized in the dispatch path so
+	/// each result type stays identity-agnostic. A no-op for pre-draft versions,
+	/// whose identity travels in the `initialize` reply.
+	private Json stampServerInfo(Json result, ProtocolVersion ver) @safe
+	{
+		if (!ver.isModern)
+			return result;
+		return withServerInfo(result, serverInfo_.forVersion(ver));
+	}
+
 	/// Shared `*/list` tail for `doListResources`/`doListResourceTemplates`/
 	/// `doListPrompts`/`doListTools`. Runs `pageBounds` over `keys` (already in the
 	/// handler's intended order), projects each item in the page via
@@ -2285,6 +2300,15 @@ final class McpServer : ServerCore
 			if (ver < ProtocolVersion.v2025_11_25 || !directoryReadEnabled_)
 				throw methodNotFound(method);
 			return doDirectoryRead(params, ver);
+		case "skills/list":
+		case "skills/get":
+			// SEP-2640: declaring the skills extension commits the server to both
+			// skills/list and skills/get; the extension negotiates from 2025-11-25.
+			// A session below that floor, or a server that never enabled skills,
+			// answers -32601 (method not found).
+			if (ver < ProtocolVersion.v2025_11_25 || skillIndex_ is null || !skillIndex_.enabled)
+				throw methodNotFound(method);
+			return method == "skills/list" ? doListSkills(params) : doGetSkill(params);
 		case "resources/subscribe":
 			// The draft has no resources/subscribe RPC; subscriptions/listen takes
 			// its place (the ListenFilter "Replaces the former
@@ -2447,7 +2471,8 @@ final class McpServer : ServerCore
 		foreach (v; supportedVersions)
 			d.protocolVersions ~= v.toWire;
 		d.capabilities = capabilities().forVersion(ProtocolVersion.modern);
-		d.serverInfo = serverInfo_.forVersion(ProtocolVersion.modern);
+		// Identity is stamped into `_meta` by the dispatch path, along with every
+		// other modern result.
 		d.instructions = instructions;
 		// `server/discover` is draft-only, so the version is always modern here;
 		// emit the configured discover hint (or the conservative ttlMs:0 default).
@@ -2739,6 +2764,50 @@ final class McpServer : ServerCore
 		sort!((a, b) => a.uri < b.uri)(children);
 		return paginatedList!(ListResourcesResult, "resources")("resources/directory/read",
 				children, (Resource r) => r, params, ver);
+	}
+
+	/// Serve `skills/list` (SEP-2640): the registered skill entries in
+	/// registration order, paginated like the base `*/list` methods. Entries are
+	/// atomic — a skill's `resources` manifest is never split across pages.
+	/// Deliberately NOT routed through `paginatedList`/`maybeCache`: entries are
+	/// raw extension-defined Json (no `forVersion` projection), and SEP-2549
+	/// list-caching attributes apply to this method only from protocol
+	/// 2026-07-28, which this SDK does not implement yet.
+	private Json doListSkills(Json params) @safe
+	{
+		size_t begin, end;
+		Nullable!string next;
+		pageBounds(params, skillIndex_.order.length, pageSize_, begin, end, next);
+
+		ListSkillsResult result;
+		foreach (uri; skillIndex_.order[begin .. end])
+			result.skills ~= skillIndex_.byUri[uri];
+		result.nextCursor = next;
+		return result.toJson();
+	}
+
+	/// Serve `skills/get` (SEP-2640): the entry for the single skill whose
+	/// `SKILL.md` URI is `params.uri`, answering for every skill this server
+	/// serves whether or not a listing mentioned it (this SDK lists everything it
+	/// serves, so the index is that complete record).
+	private Json doGetSkill(Json params) @safe
+	{
+		if ("uri" !in params || params["uri"].type != Json.Type.string)
+			throw invalidParams("skills/get requires a string 'uri'");
+		const uri = params["uri"].get!string;
+		auto entry = uri in skillIndex_.byUri;
+		if (entry is null)
+		{
+			// SEP-2640 pins the miss to -32602 (Invalid params) on every protocol
+			// version, so this deliberately does NOT route through the
+			// version-dependent resourceNotFound helper (-32002 on 2025-11-25).
+			Json data = Json.emptyObject;
+			data["uri"] = uri;
+			throw new McpException(ErrorCode.invalidParams, "Unknown skill: " ~ uri, data);
+		}
+		GetSkillResult result;
+		result.skill = *entry;
+		return result.toJson();
 	}
 
 	private Json doSubscribe(Json params, ConnectionState conn) @safe
@@ -3586,7 +3655,7 @@ unittest  // server/discover (draft) emits the full stored serverInfo
 	auto s = new McpServer(info);
 	// server/discover is a draft-only RPC: dispatch it as a draft request.
 	auto resp = s.handle(draftReq(1, "server/discover")).get;
-	auto si = resp["result"]["serverInfo"];
+	auto si = resp["result"]["_meta"][MetaKey.serverInfo];
 	assert(si["name"].get!string == "rich-srv");
 	assert(si["title"].get!string == "Rich Server");
 	assert(si["description"].get!string == "a helpful server");
@@ -5674,7 +5743,7 @@ unittest  // server/discover under draft still serves the discover result
 	auto s = new McpServer("disc-srv", "1.0");
 	auto resp = s.handle(draftReq(1, "server/discover")).get;
 	assert("error" !in resp);
-	assert(resp["result"]["serverInfo"]["name"].get!string == "disc-srv");
+	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "disc-srv");
 }
 
 unittest  // stdio subscriptions/listen is cancellable via notifications/cancelled
@@ -6531,7 +6600,7 @@ unittest  // server/discover advertises all supported versions + identity
 			hasFirst = true;
 	}
 	assert(hasDraft && hasFirst);
-	assert(resp["result"]["serverInfo"]["name"].get!string == "test-srv");
+	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "test-srv");
 }
 
 unittest  // per-list setListCacheHint: draft tools/list carries CacheableResult fields
@@ -6713,6 +6782,33 @@ unittest  // draft results carry the mandatory resultType:"complete" discriminat
 	auto resp = s.handle(draftReq(2, "tools/list")).get;
 	assert("error" !in resp);
 	assert(resp["result"]["resultType"].get!string == "complete");
+}
+
+unittest  // draft results identify the server in `_meta`
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(draftReq(2, "tools/list")).get;
+	assert("error" !in resp);
+	auto info = resp["result"]["_meta"][MetaKey.serverInfo];
+	assert(info["name"].get!string == "test-srv");
+	assert(info["version"].get!string == "0.1.0");
+}
+
+unittest  // server/discover carries identity in `_meta`, not a top-level field
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(draftReq(2, "server/discover")).get;
+	assert("error" !in resp);
+	assert("serverInfo" !in resp["result"]);
+	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "test-srv");
+}
+
+unittest  // pre-draft results never carry the `_meta` serverInfo key
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(req(2, "tools/list")).get;
+	assert("error" !in resp);
+	assert("_meta" !in resp["result"] || MetaKey.serverInfo !in resp["result"]["_meta"]);
 }
 
 unittest  // pre-draft results never emit resultType

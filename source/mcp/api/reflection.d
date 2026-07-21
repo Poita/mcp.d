@@ -988,8 +988,8 @@ private void registerSkillDirMethod(string memberName, alias overload, alias par
 	import mcp.api.skill_dir : registerSkillDir, SkillDirOptions;
 
 	// A @skillDir method names a local directory: it takes no arguments and
-	// returns the directory path as a string. The directory's SKILL.md, files,
-	// and (optionally) archives are served by registerSkillDir.
+	// returns the directory path as a string. The directory's SKILL.md and files
+	// are served by registerSkillDir.
 	static assert(Parameters!overload.length == 0, "@skillDir method '" ~ memberName
 			~ "' must take no parameters; it returns the local skill directory path");
 	static assert(is(ReturnType!overload : string),
@@ -998,7 +998,6 @@ private void registerSkillDirMethod(string memberName, alias overload, alias par
 
 	SkillDirOptions options;
 	options.path = attr.path;
-	options.archives = attr.archives;
 	registerSkillDir(server, __traits(getMember, parent, memberName)(), options);
 }
 
@@ -1338,11 +1337,10 @@ unittest  // @resource and @prompt reflection register and dispatch
 	assert(pr["result"]["messages"][0]["content"]["text"].get!string == "Tell me about MCP");
 }
 
-unittest  // @skill reflection: registerHandlers serves SKILL.md and the index
+unittest  // @skill reflection: registerHandlers serves SKILL.md and lists the skill
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.api.skills : skillUri, skillIndexUri, skillMimeType;
-	import vibe.data.json : parseJsonString;
+	import mcp.api.skills : skillUri, skillMimeType;
 
 	@safe final class SkillApi
 	{
@@ -1369,15 +1367,12 @@ unittest  // @skill reflection: registerHandlers serves SKILL.md and the index
 	assert(md.canFind("name: git-workflow"));
 	assert(md.canFind("# Git Workflow"));
 
-	// The skill is listed in the discovery index.
-	Json ip = Json.emptyObject;
-	ip["uri"] = skillIndexUri;
-	auto idx = s.handle(Message(makeRequest(Json(2), "resources/read", ip)))
-		.get["result"]["contents"][0];
-	auto doc = parseJsonString(idx["text"].get!string);
-	assert(doc["skills"].length == 1);
-	assert(doc["skills"][0]["frontmatter"]["name"].get!string == "git-workflow");
-	assert(doc["skills"][0]["url"].get!string == skillUri("git-workflow"));
+	// The skill is listed by skills/list.
+	auto result = s.handle(Message(makeRequest(Json(2), "skills/list",
+			Json.emptyObject))).get["result"];
+	assert(result["skills"].length == 1);
+	assert(result["skills"][0]["frontmatter"]["name"].get!string == "git-workflow");
+	assert(result["skills"][0]["uri"].get!string == skillUri("git-workflow"));
 }
 
 unittest  // @prompt enum arg given an invalid member -> InvalidParams (-32602)

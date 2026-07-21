@@ -6,22 +6,25 @@
  *   - STDIO (default): spawns the sibling `skills-server` binary.
  *   - HTTP (`--http <url>`): connects to a running server via Streamable HTTP.
  *
- * Exercises the SEP-2640 skills flow. Because SEP-2640 rides on the Resources
- * primitive, everything here is plain Resources access wrapped in skill-aware
- * helpers:
+ * Exercises the SEP-2640 skills flow — the extension's three methods plus the
+ * plain Resources reads skill content rides on:
  *
  *   1. server/discover advertises the skills extension under `capabilities`.
- *   2. listSkills() reads skill://index.json and returns conformant entries
- *      (verbatim frontmatter, SKILL.md url + sha256 digest, archives).
+ *   2. listSkills() calls skills/list and returns conformant entries
+ *      (verbatim frontmatter, SKILL.md uri, per-file resources manifest).
  *   3. readSkill("git-workflow") reads a @skill skill: synthesized frontmatter.
  *   4. The @skillDir-sourced team/release-helper skill carries its AUTHORED
- *      frontmatter, a references/CHECKLIST.md file, and a .zip archive form.
- *   5. resources/directory/read scope-lists the release-helper tree: files plus
+ *      frontmatter and a references/CHECKLIST.md file, and its nested
+ *      hotfix-helper skill is published as its own flat entry.
+ *   5. getSkill() fetches one entry by URI via skills/get, and the fetched
+ *      content is verified against the entry's digests and frontmatter
+ *      (verifySkillMarkdown / verifyResourceDigest).
+ *   6. resources/directory/read scope-lists the release-helper tree: files plus
  *      subdirectories (marked inode/directory), descended one level at a time.
  *
- * The extensions negotiation map is draft-only, so the client enables the draft
- * protocol (`enableModern`) before negotiation. The resource reads themselves
- * work on any protocol version.
+ * The example calls the draft-only server/discover, so the client enables the
+ * draft protocol (`enableModern`) up front. The skills extension itself
+ * negotiates from 2025-11-25; the resource reads work on any protocol version.
  */
 module skills_client;
 
@@ -41,8 +44,8 @@ int main(string[] args) @safe
 		scope (exit)
 			client.close();
 
-		// The extensions negotiation map is draft-only: switch to the draft
-		// protocol before version negotiation so the skills extension is visible.
+		// server/discover (used below) exists only on the draft protocol, so
+		// negotiate it. The skills extension itself is visible from 2025-11-25.
 		client.enableModern();
 
 		// --- 1. server/discover: skills extension must be advertised --------
@@ -59,17 +62,22 @@ int main(string[] args) @safe
 		auto negotiated = client.connect();
 		checkEq(negotiated, ProtocolVersion.modern, "connect() should negotiate draft");
 
-		// --- 2. listSkills(): the index enumerates every registered skill ---
+		// --- 2. listSkills(): skills/list enumerates every registered skill ---
 		auto skills = listSkills(client);
 		auto names = skills.map!(s => s.name).array;
-		checkEq(skills.length, 3, "index should list three skills");
-		check(names.canFind("git-workflow"), "index should list git-workflow");
-		check(names.canFind("code-review"), "index should list code-review");
-		check(names.canFind("release-helper"), "index should list release-helper");
+		checkEq(skills.length, 4, "skills/list should carry four entries");
+		check(names.canFind("git-workflow"), "listing should carry git-workflow");
+		check(names.canFind("code-review"), "listing should carry code-review");
+		check(names.canFind("release-helper"), "listing should carry release-helper");
+		check(names.canFind("hotfix-helper"),
+			"the nested skill should be published as its own flat entry");
 		foreach (s; skills)
 		{
-			check(s.url.length > 0, "entry should carry a SKILL.md url");
-			check(s.digest.canFind("sha256:"), "entry should carry a sha256 digest");
+			check(s.uri.length > 0, "entry should carry a SKILL.md uri");
+			check(s.resources.length > 0, "entry should carry a resources manifest");
+			check(s.resources[0].uri == s.uri, "the manifest should list the SKILL.md itself first");
+			check(s.resources[0].digest.canFind("sha256:"),
+				"manifest entries should carry sha256 digests");
 		}
 
 		// --- 3. a @skill skill: synthesized frontmatter ---------------------
@@ -79,9 +87,9 @@ int main(string[] args) @safe
 			"SKILL.md frontmatter should carry the description");
 		check(md.canFind("# Git Workflow"), "SKILL.md should carry the instructions body");
 
-		// --- 4. the @skillDir skill: authored frontmatter, file, archive ----
+		// --- 4. the @skillDir skill: authored frontmatter and files ---------
 		auto rel = skills.filter!(s => s.name == "release-helper").front;
-		check(rel.url == "skill://team/release-helper/SKILL.md",
+		check(rel.uri == "skill://team/release-helper/SKILL.md",
 			"release-helper should be served under its team/ prefix");
 		// The authored frontmatter (license + nested metadata) survives verbatim.
 		check(rel.frontmatter["license"].get!string == "Apache-2.0",
@@ -94,14 +102,23 @@ int main(string[] args) @safe
 			&& checklist.contents[0].text.canFind("Release Checklist"),
 			"the supporting references/CHECKLIST.md should be readable");
 
-		check(rel.archives.length == 1, "release-helper should list one archive form");
-		checkEq(rel.archives[0].mimeType, "application/zip", "archive mimeType");
-		check(rel.archives[0].digest.canFind("sha256:"), "archive should carry a digest");
-		auto archive = client.readResource(rel.archives[0].url);
-		check(archive.contents.length > 0 && archive.contents[0].blob.length > 0,
-			"the archive resource should be readable as a blob");
+		// --- 5. skills/get + host-side verification --------------------------
+		auto fetched = getSkill(client, "skill://team/release-helper/SKILL.md");
+		checkEq(fetched.name, "release-helper", "skills/get should return the entry by uri");
+		auto relMd = readSkillUri(client, fetched.uri);
+		check(verifySkillMarkdown(fetched, relMd) is null,
+			"the fetched SKILL.md should verify against its entry (digest + frontmatter)");
+		check(verifyResourceDigest(fetched, "skill://team/release-helper/references/CHECKLIST.md",
+			cast(const(ubyte)[]) checklist.contents[0].text) is null,
+			"CHECKLIST.md should verify against the entry's manifest digest");
 
-		// --- 5. resources/directory/read: walk the skill's tree -------------
+		// The nested skill is an ordinary flat entry, retrievable by its own uri.
+		auto hotfix = getSkill(client, "skill://team/release-helper/hotfix-helper/SKILL.md");
+		checkEq(hotfix.name, "hotfix-helper", "the nested skill answers skills/get");
+		check(hotfix.frontmatter["description"].get!string.canFind("hotfix"),
+			"the nested entry carries its own authored frontmatter");
+
+		// --- 6. resources/directory/read: walk the skill's tree -------------
 		auto root = readDirectory(client, "skill://team/release-helper");
 		check(root.any!(e => e.name == "SKILL.md" && !e.isDirectory),
 			"directory read should list SKILL.md as a file");
@@ -115,11 +132,13 @@ int main(string[] args) @safe
 		foreach (arg; args)
 			if (arg == "--http" || arg == "--url")
 				http = true;
-		writeln("OK: skills example e2e passed over ", http ? "http" : "stdio",
-			" — skills extension advertised (directoryRead); index lists",
-			" git-workflow/code-review/release-helper with verbatim frontmatter + sha256",
-			" digests; @skillDir team/release-helper serves authored frontmatter,",
-			" references/CHECKLIST.md, and a .zip archive; resources/directory/read walks the tree.");
+		writeln("OK: skills example e2e passed over ", http
+			? "http" : "stdio",
+			" — skills extension advertised (directoryRead); skills/list carries",
+			" git-workflow/code-review/release-helper plus the nested hotfix-helper,",
+			" each with verbatim frontmatter and a per-file sha256 manifest; skills/get",
+			" fetches entries by uri and the fetched content verifies (digest +",
+			" frontmatter); resources/directory/read walks the tree.");
 		return 0;
 	});
 }

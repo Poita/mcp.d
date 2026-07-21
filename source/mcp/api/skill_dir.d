@@ -4,22 +4,19 @@
  * `registerSkillDir(server, dir)` reads a skill directory — a `SKILL.md` plus
  * any supporting files and subdirectories — and exposes it over MCP: the
  * `SKILL.md` is served verbatim with its authored frontmatter parsed into the
- * `skill://index.json` entry, every file becomes a `skill://<path>/<file>`
- * resource (so subdirectories are walkable via `resources/directory/read`), and
- * each requested `ArchiveFormat` is packed into a downloadable whole-skill
- * archive listed alongside the per-file form.
+ * skill's entry, and every file becomes a `skill://<path>/<file>` resource (so
+ * subdirectories are walkable via `resources/directory/read`).
  *
- * This module owns the filesystem, YAML (`dyaml`), and archive (`archive`)
- * dependencies; `mcp.api.skills` itself stays free of them.
+ * This module owns the filesystem and YAML (`dyaml`) dependencies;
+ * `mcp.api.skills` itself stays free of them.
  */
 module mcp.api.skill_dir;
 
 import vibe.data.json : Json;
 
 import mcp.server.server : McpServer;
-import mcp.api.attributes : ArchiveFormat;
-import mcp.api.skills : SkillFile, SkillArchive, registerSkillResources,
-	skillName, isValidSkillPath;
+import mcp.api.skills : SkillFile, SkillEntry, registerSkillResources, addSkillEntry, skillName,
+	skillFileUri, isValidSkillPath, isValidSkillName, skillDigest, verifyResourceDigest;
 
 @safe:
 
@@ -30,14 +27,15 @@ struct SkillDirOptions
 	/// The skill path to serve under. Empty derives it from the `SKILL.md`
 	/// frontmatter `name`; otherwise the final segment MUST equal that name.
 	string path;
-	/// Expose each file in the directory as its own `skill://<path>/<file>`
-	/// resource. Turn off for archive-only distribution.
-	bool serveFiles = true;
-	/// Archive formats to also build and serve as whole-skill downloads. Empty
-	/// (the default) serves no archive.
-	ArchiveFormat[] archives;
+	/// Publish each nested skill (a `SKILL.md` in a descendant directory) as its
+	/// own flat entry alongside the enclosing skill's, per SEP-2640's
+	/// flat-publication rule. Off, a nested `SKILL.md` is served as an ordinary
+	/// supporting file only — readable, but nothing marks it as a skill.
+	bool publishNested = true;
 	/// Optional filter: return `false` to exclude a file by its skill-relative
-	/// path (e.g. drop `.git/…` or `*.pyc`). `null` includes everything.
+	/// path (e.g. drop `.git/…` or `*.pyc`). `null` includes everything. Note a
+	/// filtered-out nested `SKILL.md` is neither served nor published as a
+	/// nested skill.
 	bool delegate(string relPath) @safe include;
 	/// Reject the directory if it holds more than this many files (a guard
 	/// against accidentally serving an enormous tree).
@@ -47,14 +45,19 @@ struct SkillDirOptions
 }
 
 /// Register the skill directory `dir` on `server`. Reads `dir/SKILL.md` (served
-/// verbatim, its frontmatter parsed for the index), walks the tree to expose
-/// each file as a sibling resource, and builds any requested archive forms.
+/// verbatim, its frontmatter parsed for the skill's entry) and walks the tree to
+/// expose each file as a sibling resource. A `SKILL.md` in a descendant
+/// directory is a nested skill: its files are ordinary supporting content of the
+/// enclosing skill (listed in the enclosing `resources` manifest like any file),
+/// and with `publishNested` (the default) the nested skill is additionally
+/// published as its own flat entry whose `resources` cover exactly its subtree.
 ///
 /// Throws if `dir` is not a directory, has no `SKILL.md`, the frontmatter lacks
 /// a string `name`, the resolved skill path is invalid or its final segment does
-/// not match the frontmatter `name`, a nested `SKILL.md` is found (skills do not
-/// nest), a symlink is encountered, or the file count / total size exceeds the
-/// configured caps.
+/// not match the frontmatter `name`, a symlink is encountered, the file count /
+/// total size exceeds the configured caps, or (`publishNested`) a nested
+/// `SKILL.md` fails the same frontmatter/naming validation as a top-level one.
+/// Validation runs before registration, so a throw leaves the server unchanged.
 void registerSkillDir(McpServer server, string dir, SkillDirOptions options = SkillDirOptions.init) @safe
 {
 	import std.base64 : Base64;
@@ -66,7 +69,7 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 		throw new Exception("registerSkillDir: missing SKILL.md in " ~ dir);
 
 	const skillMd = readTextFile(skillMdPath);
-	Json frontmatter = parseFrontmatter(skillMd);
+	Json frontmatter = parseSkillFrontmatter(skillMd);
 	if (!(frontmatter.type == Json.Type.object && "name" in frontmatter
 			&& frontmatter["name"].type == Json.Type.string))
 		throw new Exception("registerSkillDir: SKILL.md frontmatter must define a string 'name'");
@@ -83,45 +86,110 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 		throw new Exception("registerSkillDir: the final skill-path segment '" ~ skillName(
 				path) ~ "' must equal the SKILL.md frontmatter name '" ~ fmName ~ "'");
 
-	// Collect the tree once if either the per-file resources or any archive needs
-	// it. An archive packs the whole directory regardless of `serveFiles`.
-	RawFile[] raws;
-	if (options.serveFiles || options.archives.length)
-		raws = collectFiles(dir, options.include, options.maxFiles, options.maxTotalBytes);
+	RawFile[] raws = collectFiles(dir, options.include, options.maxFiles, options.maxTotalBytes);
 
 	SkillFile[] files;
-	if (options.serveFiles)
-		foreach (r; raws)
+	foreach (r; raws)
+	{
+		SkillFile f;
+		f.path = r.path;
+		f.mimeType = r.mimeType;
+		if (r.isText)
+			f.content = cast(string) r.bytes;
+		else
 		{
-			SkillFile f;
-			f.path = r.path;
-			f.mimeType = r.mimeType;
-			if (r.isText)
-				f.content = cast(string) r.bytes;
-			else
-			{
-				f.content = Base64.encode(r.bytes).idup;
-				f.isBlob = true;
-			}
-			files ~= f;
+			f.content = Base64.encode(r.bytes).idup;
+			f.isBlob = true;
+		}
+		files ~= f;
+	}
+
+	// Build (and fully validate) the nested skills' entries before anything is
+	// registered, so a malformed nested skill rejects the whole directory
+	// without side effects; the appends after registration cannot throw.
+	Json[] nestedEntries;
+	if (options.publishNested)
+		nestedEntries = buildNestedEntries(server, path, raws);
+
+	registerSkillResources(server, path, skillMd, frontmatter, files);
+	foreach (entry; nestedEntries)
+		addSkillEntry(server, entry);
+}
+
+/// One flat entry per nested skill found in `raws` (any `SKILL.md` below the
+/// root): `uri` is the nested `SKILL.md`'s file resource URI under the enclosing
+/// skill's `path`, `frontmatter` is the nested file's own authored frontmatter,
+/// and `resources` covers exactly the nested skill's subtree — itself first,
+/// then every deeper file, including any further-nested skills' files. Throws on
+/// the same validation failures as a top-level skill (frontmatter shape, naming,
+/// name/directory match, already-registered URI); the files themselves are
+/// registered once, by the enclosing skill's registration.
+private Json[] buildNestedEntries(McpServer server, string path, RawFile[] raws) @safe
+{
+	import std.algorithm : endsWith, startsWith;
+
+	Json[] entries;
+	foreach (r; raws)
+	{
+		if (!r.path.endsWith("/SKILL.md"))
+			continue;
+		const dirRel = r.path[0 .. $ - "/SKILL.md".length];
+		const basename = skillName(dirRel);
+		if (!r.isText)
+			throw new Exception(
+					"registerSkillDir: nested SKILL.md is not valid UTF-8 text: " ~ r.path);
+		Json fm = parseSkillFrontmatter(cast(string) r.bytes);
+		if (!(fm.type == Json.Type.object && "name" in fm && fm["name"].type == Json.Type.string))
+			throw new Exception("registerSkillDir: nested SKILL.md frontmatter must "
+					~ "define a string 'name': " ~ r.path);
+		if (!("description" in fm && fm["description"].type == Json.Type.string))
+			throw new Exception("registerSkillDir: nested SKILL.md frontmatter must "
+					~ "define a string 'description': " ~ r.path);
+		if (!isValidSkillName(basename))
+			throw new Exception("registerSkillDir: nested skill directory name '"
+					~ basename ~ "' is not a valid skill name (" ~ r.path ~ ")");
+		if (fm["name"].get!string != basename)
+			throw new Exception("registerSkillDir: nested skill directory '" ~ dirRel
+					~ "' must equal its SKILL.md frontmatter name '" ~ fm["name"].get!string ~ "'");
+
+		const uri = skillFileUri(path, r.path);
+		if (uri in server.ensureSkillIndex().byUri)
+			throw new Exception("a skill at '" ~ uri ~ "' is already registered");
+
+		Json manifest = Json.emptyArray;
+		Json self = Json.emptyObject;
+		self["uri"] = uri;
+		self["digest"] = skillDigest(r.bytes);
+		manifest ~= self;
+		foreach (rr; raws)
+		{
+			if (rr.path == r.path || !rr.path.startsWith(dirRel ~ "/"))
+				continue;
+			Json m = Json.emptyObject;
+			m["uri"] = skillFileUri(path, rr.path);
+			m["digest"] = skillDigest(rr.bytes);
+			manifest ~= m;
 		}
 
-	SkillArchive[] archives;
-	foreach (fmt; options.archives)
-		archives ~= buildArchive(fmt, cast(immutable(ubyte)[]) skillMd, raws);
-
-	registerSkillResources(server, path, skillMd, frontmatter, files, archives);
+		Json entry = Json.emptyObject;
+		entry["uri"] = uri;
+		entry["frontmatter"] = fm;
+		entry["resources"] = manifest;
+		entries ~= entry;
+	}
+	return entries;
 }
 
 // --- Frontmatter -----------------------------------------------------------
 
 /// Parse the leading `---`-delimited YAML frontmatter of a `SKILL.md` into a
-/// JSON object (the verbatim `frontmatter` SEP-2640 puts in the index). The fence
-/// is matched a line at a time: the file must open with a line that is exactly
-/// `---`, and the frontmatter ends at the next line that is exactly `---` or
-/// `...` — so a `---` appearing inside a value does not close it early, and CRLF
-/// line endings work.
-private Json parseFrontmatter(string md) @safe
+/// JSON object (the verbatim `frontmatter` SEP-2640 puts in a skill entry). The
+/// fence is matched a line at a time: the file must open with a line that is
+/// exactly `---`, and the frontmatter ends at the next line that is exactly
+/// `---` or `...` — so a `---` appearing inside a value does not close it early,
+/// and CRLF line endings work. Hosts use this to compare a fetched `SKILL.md`'s
+/// frontmatter against its entry (see `verifySkillMarkdown`).
+Json parseSkillFrontmatter(string md) @safe
 {
 	import std.array : split, join, replace;
 	import std.string : stripRight;
@@ -213,10 +281,36 @@ private Json nodeToJson(N)(N node) @safe
 	}
 }
 
+/// Verify a fetched `SKILL.md` against its skill entry, covering both host-side
+/// checks SEP-2640 requires: the bytes must match the digest the entry's
+/// `resources` manifest lists for the skill's own `uri`, and the parsed YAML
+/// frontmatter must be identical in content to the entry's `frontmatter` — so
+/// what a user approved from the listing is what the model actually receives.
+/// Returns `null` on success, or a reason string on failure; a failing skill
+/// must not be loaded.
+string verifySkillMarkdown(const SkillEntry entry, string skillMd) @safe
+{
+	const digestReason = verifyResourceDigest(entry, entry.uri, cast(const(ubyte)[]) skillMd);
+	if (digestReason !is null)
+		return digestReason;
+
+	Json parsed;
+	try
+		parsed = parseSkillFrontmatter(skillMd);
+	catch (Exception e)
+		return "the fetched SKILL.md has no parseable frontmatter: " ~ e.msg;
+	// vibe Json equality is deep, so one comparison covers every field the
+	// author wrote, in both directions (a missing field and an added field are
+	// both discrepancies).
+	if (parsed != entry.frontmatter)
+		return "the fetched SKILL.md frontmatter does not match the entry's frontmatter";
+	return null;
+}
+
 // --- Filesystem walk -------------------------------------------------------
 
-/// A file read from a skill directory, ready to become a resource and/or an
-/// archive entry.
+/// A file read from a skill directory, ready to become a resource and a
+/// `resources`-manifest entry.
 private struct RawFile
 {
 	string path; /// skill-relative posix path, e.g. "references/FORMS.md"
@@ -233,7 +327,7 @@ private RawFile[] collectFiles(string dir,
 	RawFile[] files;
 	size_t total;
 	walkInto(dir, "", files, total, include, maxFiles, maxTotalBytes);
-	// Sort by path so both the served order and the archive bytes are deterministic.
+	// Sort by path so the served order and the manifest order are deterministic.
 	sort!((a, b) => a.path < b.path)(files);
 	return files;
 }
@@ -257,16 +351,12 @@ private void walkInto(string base, string rel, ref RawFile[] files, ref size_t t
 		if (!entry.isFile)
 			continue;
 		// The root SKILL.md is served as the skill markdown, not as a generic
-		// file; a SKILL.md anywhere deeper would mean a nested skill, which the
-		// spec forbids.
-		if (entry.name == "SKILL.md")
-		{
-			if (rel.length == 0)
-				continue;
-			throw new Exception(
-					"registerSkillDir: a nested SKILL.md is not allowed (skills do not nest): "
-					~ childRel);
-		}
+		// file. A SKILL.md anywhere deeper is a nested skill: from this skill's
+		// perspective it is ordinary supporting content, collected like any
+		// other file (and possibly published as its own entry — see
+		// `buildNestedEntries`).
+		if (entry.name == "SKILL.md" && rel.length == 0)
+			continue;
 		if (include !is null && !include(childRel))
 			continue;
 
@@ -389,78 +479,6 @@ private bool isValidUtf8(scope const(ubyte)[] bytes) @safe
 	return true;
 }
 
-// --- Archive building ------------------------------------------------------
-
-/// Pack `skillMd` (as `SKILL.md`) plus every file into one archive of `fmt`,
-/// base64-encoded into a `SkillArchive`. Entries are sorted and carry no
-/// timestamps, so the archive bytes — and thus the index digest — are stable
-/// across runs.
-private SkillArchive buildArchive(ArchiveFormat fmt, immutable(ubyte)[] skillMd, RawFile[] files) @safe
-{
-	import std.base64 : Base64;
-
-	ArchiveEntry[] entries;
-	entries ~= ArchiveEntry("SKILL.md", skillMd);
-	foreach (f; files)
-		entries ~= ArchiveEntry(f.path, f.bytes);
-
-	immutable(ubyte)[] data;
-	string suffix, mime;
-	final switch (fmt)
-	{
-	case ArchiveFormat.zip:
-		data = buildZip(entries);
-		suffix = ".zip";
-		mime = "application/zip";
-		break;
-	case ArchiveFormat.tarGz:
-		data = buildTarGz(entries);
-		suffix = ".tar.gz";
-		mime = "application/gzip";
-		break;
-	}
-	return SkillArchive(suffix, mime, Base64.encode(data).idup);
-}
-
-private struct ArchiveEntry
-{
-	string name;
-	immutable(ubyte)[] bytes;
-}
-
-private immutable(ubyte)[] buildZip(ArchiveEntry[] entries) @trusted
-{
-	import archive.zip : ZipArchive;
-
-	import std.datetime.systime : DosFileTime;
-
-	auto zip = new ZipArchive();
-	foreach (e; entries)
-	{
-		auto f = new ZipArchive.File(e.name);
-		f.data = e.bytes;
-		f.modificationTime = cast(DosFileTime) 0; // fixed, for deterministic output
-		zip.addFile(f);
-	}
-	return (cast(ubyte[]) zip.serialize()).idup;
-}
-
-private immutable(ubyte)[] buildTarGz(ArchiveEntry[] entries) @trusted
-{
-	import archive.targz : TarGzArchive;
-
-	auto tar = new TarGzArchive();
-	foreach (e; entries)
-	{
-		auto f = new TarGzArchive.File(e.name);
-		f.data = e.bytes;
-		f.modificationTime = 0;
-		f.permissions = 420; // 0644, fixed for deterministic output
-		tar.addFile(f);
-	}
-	return (cast(ubyte[]) tar.serialize()).idup;
-}
-
 // --- @trusted filesystem primitives ----------------------------------------
 
 private struct DirEntryInfo
@@ -557,6 +575,13 @@ version (unittest)
 		write(path, content);
 	}
 
+	private void writeNestedDir(string path) @trusted
+	{
+		import std.file : mkdirRecurse;
+
+		mkdirRecurse(path);
+	}
+
 	// A skill directory with a single, caller-supplied SKILL.md and no other files.
 	private void writeRawSkill(string root, string skillMd) @trusted
 	{
@@ -603,12 +628,17 @@ version (unittest)
 		return s.handle(Message(makeRequest(Json(id), "resources/read", p)))
 			.get["result"]["contents"][0];
 	}
+
+	// The `index`-th entry of the server's skills/list result.
+	private Json listedSkill(McpServer s, long id, size_t index) @safe
+	{
+		return s.handle(Message(makeRequest(Json(id), "skills/list",
+				Json.emptyObject))).get["result"]["skills"][index];
+	}
 }
 
 unittest  // registerSkillDir serves SKILL.md verbatim with authored, type-preserved frontmatter
 {
-	import mcp.api.skills : skillIndexUri;
-	import vibe.data.json : parseJsonString;
 	import std.algorithm : canFind;
 
 	const root = tmpRoot("verbatim");
@@ -624,15 +654,17 @@ unittest  // registerSkillDir serves SKILL.md verbatim with authored, type-prese
 	assert(md.canFind("license: Apache-2.0"));
 	assert(md.canFind("# PDF Forms"));
 
-	// The index frontmatter is the parsed YAML — every field, with types kept.
-	const idx = readResource(s, 2, skillIndexUri)["text"].get!string;
-	auto e = parseJsonString(idx)["skills"][0];
+	// The entry frontmatter is the parsed YAML — every field, with types kept —
+	// and the resources manifest covers SKILL.md plus the supporting file.
+	auto e = listedSkill(s, 2, 0);
 	assert(e["frontmatter"]["name"].get!string == "pdf-forms");
 	assert(e["frontmatter"]["license"].get!string == "Apache-2.0");
 	assert(e["frontmatter"]["metadata"]["version"].get!string == "2.1.0");
 	assert(e["frontmatter"]["metadata"]["experimental"].get!bool == true);
-	assert(e["url"].get!string == "skill://pdf-forms/SKILL.md");
-	assert(e["digest"].get!string == skillDigestOf(md));
+	assert(e["uri"].get!string == "skill://pdf-forms/SKILL.md");
+	assert(e["resources"].length == 2);
+	assert(e["resources"][0]["uri"].get!string == "skill://pdf-forms/SKILL.md");
+	assert(e["resources"][0]["digest"].get!string == skillDigestOf(md));
 }
 
 unittest  // registerSkillDir exposes supporting files as sibling resources
@@ -649,56 +681,6 @@ unittest  // registerSkillDir exposes supporting files as sibling resources
 
 	const ff = readResource(s, 1, "skill://pdf-forms/references/FORMS.md")["text"].get!string;
 	assert(ff.canFind("applicant_name"));
-}
-
-unittest  // registerSkillDir builds and lists a requested archive form
-{
-	import mcp.api.skills : skillIndexUri;
-	import vibe.data.json : parseJsonString;
-
-	const root = tmpRoot("archive");
-	writeSkillFixture(root);
-	scope (exit)
-		removeTree(root);
-
-	auto s = new McpServer("t", "1");
-	SkillDirOptions opts;
-	opts.archives = [ArchiveFormat.zip, ArchiveFormat.tarGz];
-	registerSkillDir(s, root, opts);
-
-	const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
-	auto archives = parseJsonString(idx)["skills"][0]["archives"];
-	assert(archives.length == 2);
-	assert(archives[0]["url"].get!string == "skill://pdf-forms.zip");
-	assert(archives[0]["mimeType"].get!string == "application/zip");
-	assert(archives[1]["url"].get!string == "skill://pdf-forms.tar.gz");
-	assert(archives[1]["mimeType"].get!string == "application/gzip");
-
-	// Each archive resource is readable as a blob.
-	assert(readResource(s, 2, "skill://pdf-forms.zip")["blob"].get!string.length > 0);
-	assert(readResource(s, 3, "skill://pdf-forms.tar.gz")["blob"].get!string.length > 0);
-}
-
-unittest  // archive bytes are deterministic — same input, same digest across runs
-{
-	import mcp.api.skills : skillIndexUri;
-	import vibe.data.json : parseJsonString;
-
-	string digestFor(string suffix) @safe
-	{
-		const root = tmpRoot("determinism-" ~ suffix);
-		writeSkillFixture(root);
-		scope (exit)
-			removeTree(root);
-		auto s = new McpServer("t", "1");
-		SkillDirOptions opts;
-		opts.archives = [ArchiveFormat.zip];
-		registerSkillDir(s, root, opts);
-		const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
-		return parseJsonString(idx)["skills"][0]["archives"][0]["digest"].get!string;
-	}
-
-	assert(digestFor("a") == digestFor("b"));
 }
 
 unittest  // registerSkillDir auto-exposes subdirectories via resources/directory/read
@@ -727,25 +709,199 @@ unittest  // registerSkillDir auto-exposes subdirectories via resources/director
 	assert(sawSkillMd && sawReferencesDir);
 }
 
-unittest  // registerSkillDir rejects a nested SKILL.md (skills do not nest)
+version (unittest)
+{
+	// A skill directory containing a nested skill two levels down, plus an
+	// ordinary supporting file at each level.
+	private void writeNestedFixture(string root) @trusted
+	{
+		import std.file : mkdirRecurse, write, rmdirRecurse, exists;
+
+		if (exists(root))
+			rmdirRecurse(root);
+		mkdirRecurse(root ~ "/references/sub-skill");
+		write(root ~ "/SKILL.md", "---\nname: outer\ndescription: Outer skill\n---\n\n# Outer\n");
+		write(root ~ "/references/GUIDE.md", "# Guide\n");
+		write(root ~ "/references/sub-skill/SKILL.md",
+				"---\nname: sub-skill\ndescription: Nested skill\n---\n\n# Sub\n");
+		write(root ~ "/references/sub-skill/notes.md", "# Notes\n");
+	}
+}
+
+unittest  // nested files are supporting content: the enclosing manifest lists them all
+{
+	const root = tmpRoot("nest-encl");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	auto e = listedSkill(s, 1, 0);
+	assert(e["uri"].get!string == "skill://outer/SKILL.md");
+	// Its own SKILL.md + GUIDE.md + the nested skill's SKILL.md + notes.md:
+	// the nested skill's files are ordinary files of the enclosing skill too.
+	auto res = e["resources"];
+	assert(res.length == 4);
+	bool sawNestedMd;
+	foreach (i; 0 .. res.length)
+		if (res[i]["uri"].get!string == "skill://outer/references/sub-skill/SKILL.md")
+			sawNestedMd = true;
+	assert(sawNestedMd);
+}
+
+unittest  // a nested skill is additionally published as its own flat entry
+{
+	const root = tmpRoot("nest-flat");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	// Two flat entries: the enclosing skill first, then the nested one, whose
+	// uri shares the enclosing path prefix and whose frontmatter is the nested
+	// file's own authored frontmatter.
+	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"];
+	assert(result["skills"].length == 2);
+	auto nested = result["skills"][1];
+	assert(nested["uri"].get!string == "skill://outer/references/sub-skill/SKILL.md");
+	assert(nested["frontmatter"]["name"].get!string == "sub-skill");
+	assert(nested["frontmatter"]["description"].get!string == "Nested skill");
+
+	// The nested entry's manifest covers exactly its subtree — itself first.
+	auto res = nested["resources"];
+	assert(res.length == 2);
+	assert(res[0]["uri"].get!string == nested["uri"].get!string);
+	assert(res[1]["uri"].get!string == "skill://outer/references/sub-skill/notes.md");
+	assert(res[1]["digest"].get!string == skillDigestOf("# Notes\n"));
+}
+
+unittest  // skills/get answers for a nested skill's uri
+{
+	const root = tmpRoot("nest-get");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://outer/references/sub-skill/SKILL.md";
+	auto got = s.handle(Message(makeRequest(Json(1), "skills/get", p))).get["result"]["skill"];
+	assert(got["frontmatter"]["name"].get!string == "sub-skill");
+}
+
+unittest  // a nested directory whose name mismatches its frontmatter rejects the whole dir
 {
 	import std.exception : assertThrown;
 
-	const root = tmpRoot("nested");
-	writeSkillFixture(root);
+	const root = tmpRoot("nest-bad");
+	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
-	writeFile(root ~ "/references/SKILL.md", "---\nname: x\ndescription: y\n---\n");
+	writeFile(root ~ "/references/sub-skill/SKILL.md",
+			"---\nname: other-name\ndescription: d\n---\n\n# Sub\n");
 
 	auto s = new McpServer("t", "1");
 	assertThrown!Exception(registerSkillDir(s, root));
+
+	// Validation precedes registration: the server is untouched, so the skills
+	// methods were never even enabled.
+	auto resp = s.handle(Message(makeRequest(Json(1), "skills/list", Json.emptyObject))).get;
+	assert("error" in resp);
+}
+
+unittest  // publishNested=false serves the nested SKILL.md as a plain file only
+{
+	import std.algorithm : canFind;
+
+	const root = tmpRoot("nest-off");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.publishNested = false;
+	registerSkillDir(s, root, opts);
+
+	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"];
+	assert(result["skills"].length == 1);
+	// Still readable — it is ordinary supporting content of the enclosing skill.
+	const md = readResource(s, 2, "skill://outer/references/sub-skill/SKILL.md")["text"]
+		.get!string;
+	assert(md.canFind("# Sub"));
+}
+
+unittest  // nested files are registered once and serve their authored bytes
+{
+	import std.algorithm : canFind;
+
+	const root = tmpRoot("nest-once");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	const md = readResource(s, 1, "skill://outer/references/sub-skill/SKILL.md")["text"]
+		.get!string;
+	assert(md.canFind("name: sub-skill") && md.canFind("# Sub"));
+
+	// Exactly one resource registration for the nested SKILL.md.
+	auto listed = s.handle(Message(makeRequest(Json(2), "resources/list",
+			Json.emptyObject))).get["result"]["resources"];
+	size_t count;
+	foreach (i; 0 .. listed.length)
+		if (listed[i]["uri"].get!string == "skill://outer/references/sub-skill/SKILL.md")
+			count++;
+	assert(count == 1);
+}
+
+unittest  // a doubly-nested skill publishes three flat entries with subtree manifests
+{
+	const root = tmpRoot("nest-deep");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+	// A further skill nested inside the nested one.
+	writeNestedDir(root ~ "/references/sub-skill/deep-skill");
+	writeFile(root ~ "/references/sub-skill/deep-skill/SKILL.md",
+			"---\nname: deep-skill\ndescription: Doubly nested\n---\n\n# Deep\n");
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"];
+	assert(result["skills"].length == 3);
+
+	// The middle skill's manifest includes the deep skill's file (nested content
+	// is supporting content, at every level); the deep skill's covers itself only.
+	Json subEntry, deepEntry;
+	foreach (i; 0 .. result["skills"].length)
+	{
+		const n = result["skills"][i]["frontmatter"]["name"].get!string;
+		if (n == "sub-skill")
+			subEntry = result["skills"][i];
+		if (n == "deep-skill")
+			deepEntry = result["skills"][i];
+	}
+	assert(subEntry["resources"].length == 3); // its SKILL.md, notes.md, deep SKILL.md
+	assert(deepEntry["resources"].length == 1);
+	assert(deepEntry["resources"][0]["uri"].get!string
+			== "skill://outer/references/sub-skill/deep-skill/SKILL.md");
 }
 
 unittest  // registerSkillDir honours an explicit prefixed path matching the frontmatter name
 {
-	import mcp.api.skills : skillIndexUri;
-	import vibe.data.json : parseJsonString;
-
 	const root = tmpRoot("prefix");
 	writeSkillFixture(root);
 	scope (exit)
@@ -756,9 +912,7 @@ unittest  // registerSkillDir honours an explicit prefixed path matching the fro
 	opts.path = "office/pdf-forms"; // final segment matches frontmatter name
 	registerSkillDir(s, root, opts);
 
-	const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
-	assert(parseJsonString(
-			idx)["skills"][0]["url"].get!string == "skill://office/pdf-forms/SKILL.md");
+	assert(listedSkill(s, 1, 0)["uri"].get!string == "skill://office/pdf-forms/SKILL.md");
 }
 
 unittest  // registerSkillDir rejects a path whose final segment != frontmatter name
@@ -778,9 +932,6 @@ unittest  // registerSkillDir rejects a path whose final segment != frontmatter 
 
 unittest  // a '---' inside a frontmatter value does not close the frontmatter early
 {
-	import mcp.api.skills : skillIndexUri;
-	import vibe.data.json : parseJsonString;
-
 	const root = tmpRoot("fence");
 	// `notes` is a block scalar that itself contains a `---` line; `trailing`
 	// comes after it and must survive into the parsed frontmatter.
@@ -793,16 +944,12 @@ unittest  // a '---' inside a frontmatter value does not close the frontmatter e
 	auto s = new McpServer("t", "1");
 	registerSkillDir(s, root);
 
-	const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
-	auto fm = parseJsonString(idx)["skills"][0]["frontmatter"];
+	auto fm = listedSkill(s, 1, 0)["frontmatter"];
 	assert(fm["trailing"].get!string == "kept");
 }
 
 unittest  // a CRLF SKILL.md parses (fence and values carry trailing \r)
 {
-	import mcp.api.skills : skillIndexUri;
-	import vibe.data.json : parseJsonString;
-
 	const root = tmpRoot("crlf");
 	writeRawSkill(root, "---\r\nname: crlf-skill\r\ndescription: a value\r\n---\r\n\r\n# Body\r\n");
 	scope (exit)
@@ -811,8 +958,7 @@ unittest  // a CRLF SKILL.md parses (fence and values carry trailing \r)
 	auto s = new McpServer("t", "1");
 	registerSkillDir(s, root);
 
-	const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
-	auto fm = parseJsonString(idx)["skills"][0]["frontmatter"];
+	auto fm = listedSkill(s, 1, 0)["frontmatter"];
 	assert(fm["name"].get!string == "crlf-skill");
 	assert(fm["description"].get!string == "a value");
 }
@@ -850,8 +996,6 @@ unittest  // an extension-less text file is served as text/plain, not an opaque 
 
 unittest  // a YAML timestamp in frontmatter is rendered as an ISO-8601 string
 {
-	import mcp.api.skills : skillIndexUri;
-	import vibe.data.json : parseJsonString;
 	import std.algorithm : canFind;
 
 	const root = tmpRoot("timestamp");
@@ -862,8 +1006,7 @@ unittest  // a YAML timestamp in frontmatter is rendered as an ISO-8601 string
 	auto s = new McpServer("t", "1");
 	registerSkillDir(s, root);
 
-	const idx = readResource(s, 1, skillIndexUri)["text"].get!string;
-	auto fm = parseJsonString(idx)["skills"][0]["frontmatter"];
+	auto fm = listedSkill(s, 1, 0)["frontmatter"];
 	assert(fm["created"].type == Json.Type.string);
 	assert(fm["created"].get!string.canFind("2021-01-02"));
 }
@@ -885,7 +1028,60 @@ unittest  // registerSkillDir rejects a directory whose files exceed maxTotalByt
 
 version (unittest) private string skillDigestOf(string s) @safe
 {
-	import mcp.api.skills : skillDigest;
-
 	return skillDigest(cast(const(ubyte)[]) s);
+}
+
+unittest  // parseSkillFrontmatter is public: hosts parse fetched SKILL.md frontmatter
+{
+	auto fm = parseSkillFrontmatter("---\nname: x\ndescription: d\n---\n\n# Body\n");
+	assert(fm["name"].get!string == "x");
+	assert(fm["description"].get!string == "d");
+}
+
+version (unittest)
+{
+	import mcp.api.skills : SkillResourceRef;
+
+	// A well-formed SKILL.md and the entry a server would publish for it.
+	private enum verifyMd = "---\nname: x\ndescription: d\n---\n\n# Body\n";
+
+	private SkillEntry verifyEntry() @safe
+	{
+		SkillEntry e;
+		e.uri = "skill://x/SKILL.md";
+		e.frontmatter = parseSkillFrontmatter(verifyMd);
+		e.resources = [
+			SkillResourceRef("skill://x/SKILL.md", skillDigestOf(verifyMd))
+		];
+		return e;
+	}
+}
+
+unittest  // verifySkillMarkdown passes for matching bytes and frontmatter
+{
+	assert(verifySkillMarkdown(verifyEntry(), verifyMd) is null);
+}
+
+unittest  // verifySkillMarkdown reports a body mutation as a digest failure
+{
+	const mutated = "---\nname: x\ndescription: d\n---\n\n# Tampered\n";
+	const reason = verifySkillMarkdown(verifyEntry(), mutated);
+	assert(reason !is null);
+	import std.algorithm : canFind;
+
+	assert(reason.canFind("digest mismatch"));
+}
+
+unittest  // verifySkillMarkdown reports entry frontmatter that diverges from the file
+{
+	// The digest matches the fetched bytes, but the entry claims different
+	// frontmatter than the file carries — the identity discrepancy the host-side
+	// field comparison exists to catch.
+	auto e = verifyEntry();
+	e.frontmatter["description"] = "something else";
+	const reason = verifySkillMarkdown(e, verifyMd);
+	assert(reason !is null);
+	import std.algorithm : canFind;
+
+	assert(reason.canFind("frontmatter"));
 }

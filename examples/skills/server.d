@@ -11,10 +11,11 @@
  *   - `@skill` — the method returns the `SKILL.md` body; the SDK synthesizes the
  *     frontmatter. Used for git-workflow and code-review (single-file skills).
  *   - `@skillDir` — the method returns a local directory path; the SDK reads the
- *     authored `SKILL.md`, exposes every file in the tree as a resource (so
- *     subdirectories are walkable via `resources/directory/read`), and packs the
- *     directory into the requested archive forms. Used for team/release-helper,
- *     served from `assets/release-helper/` with a `.zip` archive.
+ *     authored `SKILL.md` and exposes every file in the tree as a resource (so
+ *     subdirectories are walkable via `resources/directory/read`). Used for
+ *     team/release-helper, served from `assets/release-helper/` — which also
+ *     contains a NESTED skill (`hotfix-helper/SKILL.md`), published as its own
+ *     flat entry alongside the enclosing skill's.
  *
  * Transport selection is delegated to `runServerFromArgs`:
  *   stdio (default):  ./skills-server
@@ -32,7 +33,7 @@ enum ushort defaultPort = 8645;
 
 /// Skills declared the ergonomic way. The two `@skill` methods return their
 /// `SKILL.md` body; the `@skillDir` method returns a local directory whose files
-/// and archive are served wholesale.
+/// are served wholesale.
 final class SkillsApi
 {
 	@skill("git-workflow", "Follow this team's Git branching and commit conventions")
@@ -51,12 +52,12 @@ final class SkillsApi
 			~ "- Prefer the smallest change that is correct and clear.\n";
 	}
 
-	// Served from a real directory under an organizational prefix, with a .zip
-	// archive form. `__FILE_FULL_PATH__` bakes in this source file's absolute
-	// path at compile time, so the asset dir resolves from any working directory
-	// when run from the source checkout (an installed binary would need the
-	// assets staged alongside it instead).
-	@skillDir("team/release-helper", ArchiveFormat.zip)
+	// Served from a real directory under an organizational prefix.
+	// `__FILE_FULL_PATH__` bakes in this source file's absolute path at compile
+	// time, so the asset dir resolves from any working directory when run from
+	// the source checkout (an installed binary would need the assets staged
+	// alongside it instead).
+	@skillDir("team/release-helper")
 	string releaseHelper() @safe
 	{
 		return buildPath(dirName(__FILE_FULL_PATH__), "assets", "release-helper");
@@ -67,9 +68,10 @@ void main(string[] args) @safe
 {
 	auto server = new McpServer("skills-example", "1.0.0");
 
-	// One call registers all three skills: the two @skill methods and the
-	// @skillDir directory (files + archive). The first registration also
-	// advertises the skills extension, stands up skill://index.json, and enables
+	// One call registers everything: the two @skill methods and the @skillDir
+	// directory, whose nested hotfix-helper skill is published as a fourth flat
+	// entry. The first registration also advertises the skills extension
+	// (committing the server to skills/list and skills/get) and enables
 	// resources/directory/read.
 	registerHandlers(server, new SkillsApi);
 

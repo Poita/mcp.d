@@ -1716,6 +1716,40 @@ final class McpClient : ClientProtocol
 		return acc;
 	}
 
+	/// `skills/list` (SEP-2640): the skill entries the connected server publishes,
+	/// following pagination cursors to completion. Only valid against a server
+	/// that declared the `io.modelcontextprotocol/skills` extension; otherwise the
+	/// server answers -32601 (method not found). The result MAY be empty or
+	/// partial — per the SEP that is not proof the server has no skills. Not
+	/// cached: the SEP attaches no caching attributes to this method on the
+	/// protocol versions this SDK implements, and the per-entry `resources`
+	/// digests already give hosts a content-level caching signal.
+	ListSkillsResult skillsList() @safe
+	{
+		ListSkillsResult acc;
+		paginate((Nullable!string cursor) @safe {
+			Json p = Json.emptyObject;
+			if (!cursor.isNull)
+				p["cursor"] = cursor.get;
+			auto res = ListSkillsResult.fromJson(rpc("skills/list", p));
+			acc.skills ~= res.skills;
+			return res.nextCursor;
+		});
+		acc.nextCursor = Nullable!string.init;
+		return acc;
+	}
+
+	/// `skills/get` (SEP-2640): the entry for the single skill whose `SKILL.md`
+	/// URI is `uri`, whether or not any listing mentioned it. The server answers
+	/// -32602 (Invalid params) for a URI it does not serve as a skill. Not cached:
+	/// the point of the call is a fresh snapshot of the skill's digests.
+	GetSkillResult skillsGet(string uri) @safe
+	{
+		Json p = Json.emptyObject;
+		p["uri"] = uri;
+		return GetSkillResult.fromJson(rpc("skills/get", p));
+	}
+
 	/// `prompts/list`, auto-paginated. Returns the drained `ListPromptsResult`:
 	/// `prompts` aggregates every page, `nextCursor` is null, and `cache` carries
 	/// the first page's parsed freshness hint. A still-fresh result is served from
@@ -5593,6 +5627,52 @@ unittest  // listResourceTemplates calls resources/templates/list and auto-pagin
 	assert(templates[1].name == "b");
 }
 
+unittest  // skillsList drains pagination into a single result
+{
+	auto c = McpClient.http("http://localhost");
+	string[] methods;
+	int call;
+	c.onRpcForTest = (string method, Json params) @safe {
+		methods ~= method;
+		Json e = Json.emptyObject;
+		e["uri"] = call == 0 ? "skill://a/SKILL.md" : "skill://b/SKILL.md";
+		Json arr = Json.emptyArray;
+		arr ~= e;
+		Json r = Json.emptyObject;
+		r["skills"] = arr;
+		if (call == 0)
+		{
+			assert("cursor" !in params);
+			r["nextCursor"] = "p2";
+		}
+		else
+			assert(params["cursor"].get!string == "p2");
+		call++;
+		return r;
+	};
+
+	auto res = c.skillsList();
+	assert(methods == ["skills/list", "skills/list"]);
+	assert(res.skills.length == 2);
+	assert(res.skills[1]["uri"].get!string == "skill://b/SKILL.md");
+	assert(res.nextCursor.isNull);
+}
+
+unittest  // skillsGet sends the uri and returns the entry
+{
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "skills/get");
+		Json e = Json.emptyObject;
+		e["uri"] = params["uri"];
+		Json r = Json.emptyObject;
+		r["skill"] = e;
+		return r;
+	};
+	auto res = c.skillsGet("skill://a/SKILL.md");
+	assert(res.skill["uri"].get!string == "skill://a/SKILL.md");
+}
+
 unittest  // listTools throws (rather than looping) when the server never advances the cursor
 {
 	import std.exception : assertThrown;
@@ -6302,7 +6382,9 @@ unittest  // connect() auto-detect probes server/discover with draft framing and
 		Json info = Json.emptyObject;
 		info["name"] = "draft-srv";
 		info["version"] = "1.0";
-		r["serverInfo"] = info;
+		Json meta = Json.emptyObject;
+		meta[MetaKey.serverInfo] = info;
+		r["_meta"] = meta;
 		return r;
 	};
 	auto chosen = c.connect();
@@ -6367,7 +6449,9 @@ unittest  // connect() populates serverCapabilities/serverInfo/serverInstruction
 		Json info = Json.emptyObject;
 		info["name"] = "modern-srv";
 		info["version"] = "2.0";
-		r["serverInfo"] = info;
+		Json meta = Json.emptyObject;
+		meta[MetaKey.serverInfo] = info;
+		r["_meta"] = meta;
 		r["instructions"] = "hello";
 		return r;
 	};

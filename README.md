@@ -449,7 +449,7 @@ Streamable HTTP.
 | Auth | OAuth 2.1 protected HTTP resource server (HTTP only) | [server](examples/auth/server.d) | [client](examples/auth/client.d) |
 | Apps | MCP Apps extension: `@ui` tool link + a `ui://` HTML resource | [server](examples/apps/server.d) | [client](examples/apps/client.d) |
 | Tasks | MCP Tasks extension (SEP-2663): `@task` async tasks with progress, cancellation, and `input_required` | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
-| Skills | MCP Skills extension (SEP-2640): `@skill` Agent Skills served as resources + `skill://index.json` discovery | [server](examples/skills/server.d) | [client](examples/skills/client.d) |
+| Skills | MCP Skills extension (SEP-2640): `@skill` Agent Skills served as resources, `skills/list` / `skills/get` discovery | [server](examples/skills/server.d) | [client](examples/skills/client.d) |
 | Events | MCP Events extension: `@event` types delivered over poll, push, **and** server-signed webhook (to a client `WebhookReceiver`) | [server](examples/events/server.d) | [client](examples/events/client.d) |
 
 Annotate plain typed D functions with `@tool` / `@resource` / `@prompt` and register
@@ -702,17 +702,20 @@ callbacks.
 The [MCP Skills extension](https://modelcontextprotocol.io/community/skills-over-mcp/charter)
 (`io.modelcontextprotocol/skills`, [SEP-2640](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640))
 serves [Agent Skills](https://agentskills.io) — a `SKILL.md` of instructions plus
-optional supporting files — over MCP. It rides on the existing Resources
-primitive (its only new message is the optional `resources/directory/read`
-method), so any host that treats resources as a virtual filesystem consumes
-MCP-served skills exactly like local ones. Ship a skill alongside the tools it
-describes and they version and travel together.
+optional supporting files — over MCP. Skill content rides on the existing
+Resources primitive, so any host that treats resources as a virtual filesystem
+consumes MCP-served skills exactly like local ones. The extension adds three
+methods: `skills/list` and `skills/get` (implemented by every server that
+declares the extension) and the optional `resources/directory/read` (gated
+behind the `directoryRead` capability setting). Ship a skill alongside the
+tools it describes and they version and travel together.
 
 Mark a no-argument method `@skill` and it returns the `SKILL.md` body; the SDK
 synthesizes the YAML frontmatter from the path/description, serves it at
-`skill://<path>/SKILL.md` as `text/markdown`, advertises the extension, and lists
-a conformant entry — verbatim `frontmatter`, the SKILL.md `url`, and its
-`sha256` `digest` — in the well-known `skill://index.json` discovery resource.
+`skill://<path>/SKILL.md` as `text/markdown`, advertises the extension, and
+publishes a conformant entry — the SKILL.md `uri`, the verbatim `frontmatter`,
+and a complete `resources` manifest listing every file of the skill with the
+`sha256` digest of the bytes it serves — via `skills/list` and `skills/get`.
 The skill path's final segment is the skill name; a leading prefix
 (`acme/billing/refunds`) is an optional organizational namespace.
 
@@ -726,73 +729,77 @@ final class Skills
     }
 }
 
-registerHandlers(server, new Skills);    // serves skill://git-workflow/SKILL.md + the index
+registerHandlers(server, new Skills);    // serves skill://git-workflow/SKILL.md, listed by skills/list
 ```
 
 For a multi-file skill (references, templates, scripts) register it imperatively,
-attaching sibling files served at `skill://<path>/<file>` and, optionally, a
-pre-packed `archive` form of the whole skill served at `skill://<path><suffix>`:
+attaching sibling files served at `skill://<path>/<file>`:
 
 ```d
 Skill pdf = {
     path: "office/pdf-forms",
     description: "Fill in PDF forms using the field reference",
     instructions: "# PDF Forms\n\nConsult `references/FORMS.md`, then fill each field.\n",
-    files: [SkillFile("references/FORMS.md", "text/markdown", "# Form Fields\n- applicant_name\n")],
-    archives: [SkillArchive(".tar.gz", "application/gzip", base64TarGz)]
+    files: [SkillFile("references/FORMS.md", "text/markdown", "# Form Fields\n- applicant_name\n")]
 };
-registerSkill(server, pdf);   // skill://office/pdf-forms/SKILL.md + references/FORMS.md + .tar.gz
+registerSkill(server, pdf);   // skill://office/pdf-forms/SKILL.md + references/FORMS.md
 ```
 
-Each `archives` entry is listed alongside the SKILL.md `url` with its own
-`sha256` digest, so a host can fetch the whole skill in one round trip; both forms
-unpack to identical content.
+Every file — the `SKILL.md` itself included — appears in the entry's `resources`
+manifest as a `{uri, digest}` pair. The manifest is the unit a host verifies
+reads against and binds a user's approval to: a changed, added, or unlisted file
+is a verification failure, so content cannot rotate under a persisted approval.
 
 ### Serving a skill from a local directory
 
 To serve an existing on-disk skill — a `SKILL.md` with authored frontmatter plus
 whatever files and subdirectories it ships — point `registerSkillDir` (or the
-`@skillDir` UDA) at the directory. The SDK serves the `SKILL.md` verbatim, parses
-its frontmatter into the index entry, exposes every file as a
-`skill://<path>/<file>` resource (so subdirectories are automatically walkable via
-`resources/directory/read`), and packs the tree into any archive formats you ask
-for:
+`@skillDir` UDA) at the directory. The SDK serves the `SKILL.md` verbatim,
+parses its frontmatter into the skill's entry, and exposes every file as a
+`skill://<path>/<file>` resource (so subdirectories are automatically walkable
+via `resources/directory/read`):
 
 ```d
-// UDA: the method returns the local directory; archives are opt-in per format.
+// UDA: the method returns the local directory.
 final class Skills
 {
-    @skillDir("team/release-helper", ArchiveFormat.zip)
+    @skillDir("team/release-helper")
     string releaseHelper() @safe => "skills/release-helper";
 }
 
 // Or imperatively, with full control via SkillDirOptions:
 registerSkillDir(server, "skills/release-helper", SkillDirOptions(
     path: "team/release-helper",            // empty derives it from the frontmatter name
-    archives: [ArchiveFormat.zip, ArchiveFormat.tarGz],
 ));
 ```
 
-The directory's final path segment must equal the frontmatter `name`. Frontmatter
-is parsed with [dyaml](https://code.dlang.org/packages/dyaml) and archives are
-built with the [archive](https://code.dlang.org/packages/archive) package (zip is
-in-tree via `std.zip`'s format; `tarGz` produces real gzip). Archives are built
-deterministically (sorted entries, no timestamps) so the index digest is stable.
-A symlink, a nested `SKILL.md`, or exceeding `maxFiles`/`maxTotalBytes` is
-rejected.
+The directory's final path segment must equal the frontmatter `name`
+([dyaml](https://code.dlang.org/packages/dyaml) parses the frontmatter). A
+symlink or exceeding `maxFiles`/`maxTotalBytes` is rejected. Skills may nest: a
+`SKILL.md` in a descendant directory is ordinary supporting content of the
+enclosing skill (its files appear in the enclosing `resources` manifest too),
+and `SkillDirOptions.publishNested` (the default) additionally publishes each
+nested skill as its own flat entry — authored frontmatter, `resources` covering
+exactly its subtree — validated by the same rules as a top-level skill.
 
-On the client, `listSkills(client)` reads `skill://index.json` and returns the
-discovery entries (each with `frontmatter`, `url`, `digest`, and `archives`), and
-`readSkill(client, "git-workflow")` / `readSkillUri(client, uri)` read a
-`SKILL.md`. When a skill's instructions point at a directory ("pick a template
-from `templates/`"), `readDirectory(client, uri)` scope-lists that directory's
-direct children via the extension's one new method, `resources/directory/read`
-(files plus `inode/directory` subdirectories) — enabled automatically by
-`enableSkills`, which advertises `directoryRead: true`. The extension is
-advertised from 2025-11-25 onward (its entry in the `extensions` negotiation map
-carries that version floor), so it appears for clients on the latest stable
-version or the draft; the resource reads themselves work on any version. See
-[`examples/skills`](examples/skills/) for the full e2e.
+On the client, `listSkills(client)` calls `skills/list` (paginating to
+completion) and returns the typed entries; `getSkill(client, uri)` calls
+`skills/get` to fetch one skill's entry by its `SKILL.md` URI — including skills
+absent from the listing, which MAY be empty or partial. `readSkill(client,
+"git-workflow")` / `readSkillUri(client, uri)` read a `SKILL.md` via plain
+`resources/read`, and `verifyResourceDigest` / `verifySkillMarkdown` implement
+the host-side integrity checks the SEP requires (digest match, unlisted-file
+rejection, field-by-field frontmatter comparison). Note that no URI scheme marks
+a resource as a skill — a resource is known to be a skill only through a
+`skills/list` entry or a `skills/get` answer. When a skill's instructions point
+at a directory ("pick a template from `templates/`"), `readDirectory(client,
+uri)` scope-lists that directory's direct children via
+`resources/directory/read` (files plus `inode/directory` subdirectories) —
+enabled automatically by `enableSkills`, which advertises `directoryRead: true`.
+The extension is advertised from 2025-11-25 onward (its entry in the
+`extensions` negotiation map carries that version floor), so it appears for
+clients on the latest stable version or the draft; the resource reads themselves
+work on any version. See [`examples/skills`](examples/skills/) for the full e2e.
 
 ## Concurrency model
 
