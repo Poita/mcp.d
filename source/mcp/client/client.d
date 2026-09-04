@@ -22,7 +22,7 @@ import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
 import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 import mcp.client.cache : CacheStore, InMemoryCacheStore, CacheKey, CacheEntry, noCache;
 import mcp.client.event_subscription : EventSubscription;
-import mcp.client.events : WebhookReceiver;
+import mcp.client.events : WebhookReceiver, NoCompatibleDeliveryMode, generateWhsecSecret;
 import mcp.protocol.events;
 
 /// How a cacheable request verb interacts with the client's response cache.
@@ -208,6 +208,46 @@ struct EventClientSettings
 	/// `deliveryStatus` surfaces delivery problems. Zero disables these
 	/// health-check refreshes.
 	Duration noExpiryRefreshInterval = 1.hours;
+
+	/// The delivery modes this client is willing to use, in preference order.
+	/// `subscribeEvents` picks the first one the event type also advertises;
+	/// webhook additionally requires `webhook` to be configured. Remove a mode to
+	/// forbid it (e.g. drop `push` on a connection-capped deployment).
+	DeliveryMode[] preferredModes = [
+		DeliveryMode.webhook, DeliveryMode.push, DeliveryMode.poll
+	];
+
+	/// Webhook receiving configuration. Unset (empty `url`) leaves webhook out of
+	/// automatic mode selection.
+	WebhookClientConfig webhook;
+}
+
+/// Where and how this client receives webhook deliveries when `subscribeEvents`
+/// selects webhook mode. The SDK mints a per-subscription `whsec_` secret (or
+/// asks `secretProvider`) and registers it with `receiver` before subscribing.
+struct WebhookClientConfig
+{
+	/// The `https` callback URL the server POSTs to (the `delivery.url`).
+	string url;
+
+	/// The receiver that verifies and routes inbound deliveries for `url` — the
+	/// forward proxy, or an in-process `WebhookReceiver` served on that URL.
+	WebhookReceiver receiver;
+
+	/// Optional secret source; the default generates a CSPRNG `whsec_` value.
+	string delegate() @safe secretProvider;
+
+	/// Suggested subscription lifetime (`ttlMs`); zero leaves the server default.
+	Duration ttl = Duration.zero;
+}
+
+/// Per-subscription options for `McpClient.subscribeEvents`.
+struct SubscribeOptions
+{
+	Json arguments = Json.emptyObject; /// subscription arguments (per the type's inputSchema)
+	Nullable!string cursor; /// resume position; null = start from now
+	Nullable!long maxAgeMs; /// bound replay when resuming from a stale cursor
+	Nullable!DeliveryMode delivery; /// force a mode instead of selecting one
 }
 
 /// A Model Context Protocol client, transport-agnostic.
@@ -2042,6 +2082,93 @@ final class McpClient : ClientProtocol
 
 	// --- Managed subscriptions (poll / push / webhook) ---------------------
 
+	/// Subscribe to an event type, letting the SDK choose the delivery mode: the
+	/// first of `eventSettings.preferredModes` (webhook, push, poll by default)
+	/// that the type advertises and this client can use, or `opts.delivery` when
+	/// forced. Looks the type up via `events/list`; throws `NotFound` for an
+	/// unknown name and `NoCompatibleDeliveryMode` when no mode fits. Returns the
+	/// mode-neutral handle; `sub.mode()` reports the choice.
+	EventSubscription subscribeEvents(string name, SubscribeOptions opts,
+			void delegate(EventOccurrence) @safe onEvent,
+			void delegate(EventControl) @safe onControl = null) @safe
+	{
+		import mcp.protocol.errors : notFound;
+
+		EventType type;
+		bool found;
+		foreach (t; listEvents().events)
+			if (t.name == name)
+			{
+				type = t;
+				found = true;
+				break;
+			}
+		if (!found)
+			throw notFound("Unknown event type: " ~ name, "event");
+		const mode = selectDeliveryMode(type, opts.delivery);
+		final switch (mode)
+		{
+		case DeliveryMode.poll:
+			PollParams p;
+			p.name = name;
+			p.arguments = opts.arguments;
+			p.cursor = opts.cursor;
+			p.maxAgeMs = opts.maxAgeMs;
+			return subscribePoll(p, onEvent, onControl);
+		case DeliveryMode.push:
+			StreamParams p;
+			p.name = name;
+			p.arguments = opts.arguments;
+			p.cursor = opts.cursor;
+			p.maxAgeMs = opts.maxAgeMs;
+			return subscribeStream(p, onEvent, onControl);
+		case DeliveryMode.webhook:
+			auto cfg = eventSettings_.webhook;
+			SubscribeParams p;
+			p.name = name;
+			p.arguments = opts.arguments;
+			p.cursor = opts.cursor;
+			p.maxAgeMs = opts.maxAgeMs;
+			p.delivery.url = cfg.url;
+			p.delivery.secret = cfg.secretProvider !is null ? cfg.secretProvider()
+				: generateWhsecSecret();
+			if (cfg.ttl > Duration.zero)
+			{
+				p.ttlMsPresent = true;
+				p.ttlMs = cfg.ttl.total!"msecs";
+			}
+			return subscribeWebhook(cfg.receiver, p, onEvent, onControl);
+		}
+	}
+
+	/// Choose the delivery mode for `type`: `forced` if given (it must be
+	/// advertised and usable), otherwise the first preferred mode the type
+	/// advertises that this client can use. Webhook is usable only with a
+	/// configured `webhook.url` and receiver. Throws `NoCompatibleDeliveryMode`.
+	DeliveryMode selectDeliveryMode(const EventType type, Nullable!DeliveryMode forced = Nullable!DeliveryMode.init) @safe
+	{
+		import std.algorithm : canFind;
+
+		const webhookUsable = eventSettings_.webhook.url.length != 0
+			&& eventSettings_.webhook.receiver !is null;
+		bool usable(DeliveryMode m)
+		{
+			return type.delivery.canFind(m) && (m != DeliveryMode.webhook || webhookUsable);
+		}
+
+		if (!forced.isNull)
+		{
+			if (usable(forced.get))
+				return forced.get;
+			throw new NoCompatibleDeliveryMode("delivery mode " ~ deliveryModeToWire(forced.get)
+					~ " is not available for event type " ~ type.name);
+		}
+		foreach (m; eventSettings_.preferredModes)
+			if (usable(m))
+				return m;
+		throw new NoCompatibleDeliveryMode("no compatible delivery mode for event type " ~ type.name);
+	}
+
 	/// Subscribe to an event type in POLL mode and have the SDK run the loop. Each
 	/// occurrence is delivered to `onEvent`; a detected gap arrives as an
 	/// `EventControl(gap)` on `onControl`. The SDK threads the cursor, paces by the
@@ -2053,6 +2180,7 @@ final class McpClient : ClientProtocol
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
 		auto sub = new EventSubscription();
+		sub.setMode(DeliveryMode.poll);
 		sub.dedupCapacity(eventSettings_.dedupWindow);
 		sub.advanceCursor(p.cursor);
 		spawnEventTask(() @safe { runPollLoop(sub, p, onEvent, onControl); });
@@ -2124,6 +2252,7 @@ final class McpClient : ClientProtocol
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
 		auto sub = new EventSubscription();
+		sub.setMode(DeliveryMode.push);
 		sub.dedupCapacity(eventSettings_.dedupWindow);
 		sub.advanceCursor(p.cursor);
 		auto ms = new ManagedStream(p, onEvent, onControl);
@@ -2258,6 +2387,7 @@ final class McpClient : ClientProtocol
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
 		auto sub = new EventSubscription();
+		sub.setMode(DeliveryMode.webhook);
 		auto res = subscribeWebhookEvents(p);
 		const id = res.id;
 		sub.advanceCursor(res.cursor);
@@ -7040,6 +7170,128 @@ unittest  // the poll loop delivers a redelivered eventId only once
 		got++;
 	}, null);
 	assert(polls == 2 && got == 1);
+}
+
+unittest  // selectDeliveryMode prefers webhook, then push, then poll among advertised modes
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	EventType all = EventType("t", "", "", [DeliveryMode.poll, DeliveryMode.push, DeliveryMode.webhook]);
+	assert(c.selectDeliveryMode(all) == DeliveryMode.push); // no webhook config
+
+	EventClientSettings es;
+	es.webhook.url = "https://proxy.example.com/hooks/c1";
+	es.webhook.receiver = new WebhookReceiver();
+	c.eventSettings = es;
+	assert(c.selectDeliveryMode(all) == DeliveryMode.webhook);
+
+	EventType pollOnly = EventType("t", "", "", [DeliveryMode.poll]);
+	assert(c.selectDeliveryMode(pollOnly) == DeliveryMode.poll);
+}
+
+unittest  // a mode the client removed from preferredModes is never selected
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	EventClientSettings es;
+	es.preferredModes = [DeliveryMode.poll];
+	c.eventSettings = es;
+	EventType t = EventType("t", "", "", [DeliveryMode.push, DeliveryMode.poll]);
+	assert(c.selectDeliveryMode(t) == DeliveryMode.poll);
+}
+
+unittest  // selectDeliveryMode throws NoCompatibleDeliveryMode when nothing fits
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	EventType webhookOnly = EventType("t", "", "", [DeliveryMode.webhook]);
+	bool threw;
+	try
+		c.selectDeliveryMode(webhookOnly);
+	catch (NoCompatibleDeliveryMode)
+		threw = true;
+	assert(threw);
+}
+
+unittest  // a forced mode is honoured when advertised and rejected otherwise
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	EventType t = EventType("t", "", "", [DeliveryMode.push, DeliveryMode.poll]);
+	assert(c.selectDeliveryMode(t, nullable(DeliveryMode.poll)) == DeliveryMode.poll);
+	bool threw;
+	try
+		c.selectDeliveryMode(t, nullable(DeliveryMode.webhook));
+	catch (NoCompatibleDeliveryMode)
+		threw = true;
+	assert(threw);
+}
+
+unittest  // subscribeEvents looks the type up and opens a push stream for a push-capable type
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "events/list");
+		EventListResult r;
+		r.events = [EventType("incident.created", "", "", [DeliveryMode.poll, DeliveryMode.push])];
+		return r.toJson();
+	};
+	SubscribeOptions o;
+	o.cursor = "c0";
+	auto sub = c.subscribeEvents("incident.created", o, null);
+	assert(sub.mode == DeliveryMode.push);
+	assert(t.listens.length == 1);
+	assert(t.listens[0]["params"]["cursor"].get!string == "c0");
+}
+
+unittest  // subscribeEvents falls back to poll and reports an unknown type as NotFound
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.onRpcForTest = (string method, Json params) @safe {
+		EventListResult r;
+		r.events = [EventType("email.received", "", "", [DeliveryMode.poll])];
+		return r.toJson();
+	};
+	auto sub = c.subscribeEvents("email.received", SubscribeOptions.init, null);
+	assert(sub.mode == DeliveryMode.poll);
+	bool threw;
+	try
+		c.subscribeEvents("nope", SubscribeOptions.init, null);
+	catch (McpException e)
+		threw = e.code == ErrorCode.notFound;
+	assert(threw);
+}
+
+unittest  // subscribeEvents in webhook mode mints a secret, registers the receiver, and subscribes
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	auto rx = new WebhookReceiver();
+	EventClientSettings es;
+	es.webhook.url = "https://proxy.example.com/hooks/c1";
+	es.webhook.receiver = rx;
+	es.webhook.ttl = 1.hours;
+	c.eventSettings = es;
+	string sentSecret;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "events/list")
+		{
+			EventListResult r;
+			r.events = [EventType("incident.created", "", "", [DeliveryMode.webhook, DeliveryMode.poll])];
+			return r.toJson();
+		}
+		assert(method == "events/subscribe");
+		assert(params["delivery"]["url"].get!string == "https://proxy.example.com/hooks/c1");
+		assert(params["ttlMs"].get!long == 3_600_000);
+		sentSecret = params["delivery"]["secret"].get!string;
+		SubscribeResult r;
+		r.id = "sub_w";
+		return r.toJson();
+	};
+	auto sub = c.subscribeEvents("incident.created", SubscribeOptions.init, null);
+	assert(sub.mode == DeliveryMode.webhook);
+	import std.algorithm : startsWith;
+
+	assert(sentSecret.startsWith("whsec_"));
+	string[string] known;
+	known["x-mcp-subscription-id"] = "sub_w";
+	assert(rx.processDelivery("{}", known).status != 503); // registered under the server id
 }
 
 unittest  // subscribePoll surfaces a poll error as a typed control and ends the subscription

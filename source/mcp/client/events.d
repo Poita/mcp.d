@@ -25,6 +25,17 @@ string generateWhsecSecret() @safe
 	return ("whsec_" ~ Base64.encode(cryptoRandomBytes(32))).idup;
 }
 
+/// Thrown by `McpClient.subscribeEvents` when none of the delivery modes an
+/// event type advertises is usable by this client (or the forced mode is not
+/// offered).
+final class NoCompatibleDeliveryMode : Exception
+{
+	this(string msg, string file = __FILE__, size_t line = __LINE__) @safe pure nothrow
+	{
+		super(msg, file, line);
+	}
+}
+
 /// The status and body a `WebhookReceiver` wants returned for one delivery.
 struct ReceiverResponse
 {

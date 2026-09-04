@@ -7,6 +7,8 @@ module mcp.client.event_subscription;
 
 import std.typecons : Nullable;
 
+import mcp.protocol.events : DeliveryMode;
+
 @safe:
 
 /// One active managed event subscription, independent of delivery mode. Lives on
@@ -17,6 +19,7 @@ final class EventSubscription
 {
 	private bool cancelled_;
 	private bool terminated_;
+	private DeliveryMode mode_;
 	private Nullable!string cursor_;
 	private void delegate() @safe nothrow teardown_;
 	// Bounded `eventId` memory for deduplication: a fixed ring of the most recent
@@ -32,6 +35,12 @@ final class EventSubscription
 	Nullable!string cursor() @safe
 	{
 		return cursor_;
+	}
+
+	/// The delivery mode this subscription runs on.
+	DeliveryMode mode() @safe
+	{
+		return mode_;
 	}
 
 	/// True until `cancel()` is called or a terminal `terminated` control ends the
@@ -80,6 +89,12 @@ final class EventSubscription
 		seenHead_ = (seenHead_ + 1) % seenRing_.length;
 		seen_[eventId] = true;
 		return false;
+	}
+
+	/// Record the delivery mode the factory chose.
+	package void setMode(DeliveryMode m) @safe
+	{
+		mode_ = m;
 	}
 
 	/// Advance the watermark, ignoring a null (a null cursor never regresses it).
