@@ -332,6 +332,8 @@ struct EventsOptions
 	DeliveryMode[] disabledModes; /// modes disabled for ALL types (a type may narrow further, not re-enable)
 	int webhookMaxSubscriptionsPerPrincipal = 1000; /// cap on live webhook subscriptions one principal may hold (0 = unlimited)
 	string[] callbackAllowlist; /// callback URL prefixes treated as pre-verified
+	bool wellKnownReceiverVerification = true; /// honour a receiver-published /.well-known/mcp-webhook-receiver.json
+	Duration wellKnownCacheTtl = 10.minutes; /// how long a fetched (or absent) receiver document is cached per origin
 	bool allowPrivateCallbackHosts; /// permit non-globally-routable callback IPs (tests/dev)
 	string assumePrincipal; /// when set, requests with no authenticated principal are treated as this one
 	int webhookMaxAttempts = 5; /// bounded delivery attempts per event
@@ -406,6 +408,19 @@ private struct VerifyBackoff
 	long windowMs; /// current backoff window, doubled on each successive failure
 }
 
+/// A cached `/.well-known/mcp-webhook-receiver.json` for one callback origin: the
+/// path prefixes it declares as accepting MCP webhook deliveries (empty when the
+/// origin publishes none), and when it was fetched.
+private struct WellKnownReceivers
+{
+	string[] prefixes;
+	long fetchedAtMs;
+}
+
+/// The path of the receiver-published document that declares which paths under
+/// a callback origin accept MCP webhook deliveries.
+enum string wellKnownReceiverPath = "/.well-known/mcp-webhook-receiver.json";
+
 /// The verification backoff bounds: the first probe after a failure waits this long,
 /// doubling on each failure up to the cap.
 private enum long verifyBackoffBaseMs = 30 * 1000;
@@ -468,6 +483,7 @@ final class EventsRuntime
 	private PollLease[string] pollLeases_; // lease key -> lease record
 	private LifeRef[string] lifeRefs_; // (principal\0name\0args) -> live-subscription refcount
 	private bool[string] verifiedEndpoints_; // (principal\0url) -> verified, in-memory cache
+	private WellKnownReceivers[string] wellKnown_; // callback origin -> cached receiver document
 	private VerifyBackoff[string] pendingVerification_; // (principal\0url) -> next-probe backoff
 
 	this(WebhookSubscriptionStore webhookStore = null, EventsOptions opts = EventsOptions.init) @safe
@@ -1388,6 +1404,15 @@ final class EventsRuntime
 			return true;
 		}
 		const now = opts_.nowMs();
+		// A receiver that publishes its accepting paths at the callback origin has
+		// already consented: no challenge POST is needed.
+		if (opts_.wellKnownReceiverVerification && wellKnownCovers(sub.url, now))
+		{
+			verifiedEndpoints_[key] = true;
+			pendingVerification_.remove(key);
+			markVerified(sub.id);
+			return true;
+		}
 		// Honour the negative-cache backoff: skip the probe (and the POST) until the
 		// window elapses, so a never-verifying endpoint is not challenged every emit.
 		if (auto b = key in pendingVerification_)
@@ -1423,6 +1448,67 @@ final class EventsRuntime
 		if (auto b = key in pendingVerification_)
 			window = min(b.windowMs * 2, verifyBackoffCapMs);
 		pendingVerification_[key] = VerifyBackoff(now + window, window);
+	}
+
+	// Whether `url` falls under a path prefix its origin publishes in
+	// `/.well-known/mcp-webhook-receiver.json`. The document is fetched over the
+	// same SSRF-hardened path as deliveries and cached per origin (a missing or
+	// malformed document is cached as "publishes none") for `wellKnownCacheTtl`,
+	// so verifying many subscriptions against one gateway costs one GET.
+	private bool wellKnownCovers(string url, long now) @safe
+	{
+		import std.algorithm : startsWith;
+
+		string scheme, host, path;
+		ushort port;
+		bool hasUserinfo;
+		if (!parseAuthority(url, scheme, host, port, path, hasUserinfo) || hasUserinfo)
+			return false;
+		import std.conv : to;
+
+		const origin = scheme ~ "://" ~ host ~ ":" ~ port.to!string;
+		auto entry = origin in wellKnown_;
+		if (entry is null || now - entry.fetchedAtMs >= opts_.wellKnownCacheTtl.total!"msecs")
+		{
+			wellKnown_[origin] = WellKnownReceivers(fetchWellKnownReceivers(scheme, host, port), now);
+			entry = origin in wellKnown_;
+		}
+		foreach (prefix; entry.prefixes)
+			if (prefix.length && path.startsWith(prefix))
+				return true;
+		return false;
+	}
+
+	// GET the receiver document at the origin and return the prefixes it declares
+	// (empty on any failure). The URL is rebuilt from parsed components, so the
+	// fetch targets exactly the origin the callback resolves to.
+	private string[] fetchWellKnownReceivers(string scheme, string host, ushort port) @safe
+	{
+		import std.conv : to;
+		import vibe.data.json : parseJsonString;
+
+		const docUrl = scheme ~ "://" ~ host ~ ":" ~ port.to!string ~ wellKnownReceiverPath;
+		if (!callbackHostAllowed(docUrl, opts_.allowPrivateCallbackHosts))
+			return null;
+		WebhookHttpResult res;
+		try
+			res = opts_.webhookTransport.get(docUrl, opts_.allowPrivateCallbackHosts);
+		catch (Exception)
+			return null;
+		if (!res.ok)
+			return null;
+		Json j;
+		try
+			j = parseJsonString(res.body);
+		catch (Exception)
+			return null;
+		if (j.type != Json.Type.object || "receivers" !in j || j["receivers"].type != Json.Type.array)
+			return null;
+		string[] prefixes;
+		foreach (i; 0 .. j["receivers"].length)
+			if (j["receivers"][i].type == Json.Type.string)
+				prefixes ~= j["receivers"][i].get!string;
+		return prefixes;
 	}
 
 	/// Terminate a subscription (e.g. authorization revoked): POST a signed
@@ -2790,8 +2876,16 @@ version (unittest)
 					? DeliveryErrorCategory.http4xx : DeliveryErrorCategory.http5xx, status);
 		}
 
+		string wellKnownBody; // served for GET /.well-known/mcp-webhook-receiver.json when set
+		string[] gets; // every GET url, in order
+
 		WebhookHttpResult get(string url, bool allowPrivate) @safe
 		{
+			import std.algorithm : endsWith;
+
+			gets ~= url;
+			if (wellKnownBody.length && url.endsWith(wellKnownReceiverPath))
+				return WebhookHttpResult.success(200, wellKnownBody);
 			return WebhookHttpResult.failure(DeliveryErrorCategory.http4xx, 404);
 		}
 
@@ -2947,6 +3041,64 @@ unittest  // an endpoint that fails the challenge handshake receives no event de
 	// the failure was recorded as challenge_failed
 	assert(rt.webhookStore().get(r.id)
 			.get.lastErrorCat == cast(int) DeliveryErrorCategory.challengeFailed);
+}
+
+unittest  // a receiver-published well-known document verifies a covered callback without a challenge
+{
+	auto ft = new FakeWebhookTransport();
+	ft.echoChallenge = false; // a challenge, if sent, would fail
+	ft.wellKnownBody = `{"receivers": ["/hooks/"]}`;
+	auto rt = engineRuntime(ft);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks/c1"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(ft.eventPosts().length == 1); // delivered
+	assert(controlPostsOf(ft, "verification").length == 0); // no challenge POST
+	assert(ft.gets.length == 1 && ft.gets[0] == "https://proxy:443" ~ wellKnownReceiverPath);
+	assert(rt.webhookStore().get(r.id).get.verified);
+}
+
+unittest  // a callback outside the well-known document's prefixes still gets the challenge
+{
+	auto ft = new FakeWebhookTransport();
+	ft.wellKnownBody = `{"receivers": ["/hooks/"]}`;
+	auto rt = engineRuntime(ft);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/other/c1"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(controlPostsOf(ft, "verification").length == 1);
+	assert(ft.eventPosts().length == 1); // the echoed challenge verified it
+}
+
+unittest  // the well-known document is fetched once per origin and cached
+{
+	auto ft = new FakeWebhookTransport();
+	ft.wellKnownBody = `{"receivers": ["/hooks/"]}`;
+	auto rt = engineRuntime(ft);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks/a"), "user-1");
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks/b"), "user-2");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(ft.eventPosts().length == 2);
+	assert(ft.gets.length == 1);
+}
+
+unittest  // well-known verification can be disabled, falling back to the challenge
+{
+	auto ft = new FakeWebhookTransport();
+	ft.wellKnownBody = `{"receivers": ["/hooks/"]}`;
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	o.wellKnownReceiverVerification = false;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks/c1"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(ft.gets.length == 0);
+	assert(controlPostsOf(ft, "verification").length == 1);
 }
 
 unittest  // an unverified endpoint is not re-probed on every emit (verification backoff)
