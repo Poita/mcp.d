@@ -2175,9 +2175,9 @@ final class McpClient : ClientProtocol
 
 	/// Sleep between event polls, clamped to a floor so a misbehaving server can't
 	/// drive a hot loop. A test seam mirrors `taskPollSleep`.
-	private void eventPollSleep(Nullable!long nextPollMs) @safe
+	private void eventPollSleep(long nextPollMs) @safe
 	{
-		long ms = nextPollMs.isNull ? defaultEventPollMs : nextPollMs.get;
+		long ms = nextPollMs > 0 ? nextPollMs : defaultEventPollMs;
 		if (ms < minEventPollMs)
 			ms = minEventPollMs;
 		version (unittest)

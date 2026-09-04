@@ -248,14 +248,15 @@ struct PollParams
 
 /// The `events/poll` result. `cursor` is the position after this batch (the
 /// client persists it and passes it back next poll). `truncated` signals a gap;
-/// `hasMore` requests an immediate follow-up poll; `nextPollMs` paces the loop.
+/// `hasMore` requests an immediate follow-up poll; `nextPollMs` paces the loop
+/// and is always present (a client ignores it while `hasMore` is true).
 struct PollResult
 {
 	EventOccurrence[] events;
 	Nullable!string cursor; /// null when the event type does not support replay
 	bool truncated;
 	bool hasMore;
-	Nullable!long nextPollMs;
+	long nextPollMs; /// recommended delay before the next poll (ms)
 
 	Json toJson() const @safe
 	{
@@ -267,8 +268,7 @@ struct PollResult
 		j["cursor"] = cursor.isNull ? Json(null) : Json(cursor.get);
 		j["truncated"] = truncated;
 		j["hasMore"] = hasMore;
-		if (!nextPollMs.isNull)
-			j["nextPollMs"] = nextPollMs.get;
+		j["nextPollMs"] = nextPollMs;
 		return j;
 	}
 
@@ -282,7 +282,7 @@ struct PollResult
 			r.cursor = j["cursor"].get!string;
 		r.truncated = j.getOr("truncated", false);
 		r.hasMore = j.getOr("hasMore", false);
-		tryGet(j, "nextPollMs", r.nextPollMs);
+		r.nextPollMs = j.getOr("nextPollMs", 0L);
 		return r;
 	}
 }
@@ -937,7 +937,7 @@ unittest  // PollResult round-trips events + flags
 	assert(j["nextPollMs"].get!long == 30_000);
 	auto back = PollResult.fromJson(j);
 	assert(back.events.length == 1 && back.cursor.get == "c2");
-	assert(back.truncated && back.hasMore && back.nextPollMs.get == 30_000);
+	assert(back.truncated && back.hasMore && back.nextPollMs == 30_000);
 }
 
 unittest  // PollResult emits cursor:null when the event type does not support replay
@@ -946,6 +946,16 @@ unittest  // PollResult emits cursor:null when the event type does not support r
 	auto j = r.toJson();
 	assert(j["cursor"].type == Json.Type.null_);
 	assert(PollResult.fromJson(j).cursor.isNull);
+}
+
+unittest  // PollResult always carries nextPollMs, even when hasMore requests an immediate re-poll
+{
+	PollResult r;
+	r.hasMore = true;
+	r.nextPollMs = 5_000;
+	auto j = r.toJson();
+	assert("nextPollMs" in j && j["nextPollMs"].get!long == 5_000);
+	assert(PollResult.fromJson(j).nextPollMs == 5_000);
 }
 
 unittest  // WebhookDelivery serializes mode/url/secret and omits secret when empty

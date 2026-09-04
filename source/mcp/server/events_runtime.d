@@ -684,8 +684,7 @@ final class EventsRuntime
 			out_.truncated = er.truncated;
 			out_.hasMore = er.hasMore;
 		}
-		if (!out_.hasMore)
-			out_.nextPollMs = nextPollMsFor(*p);
+		out_.nextPollMs = nextPollMsFor(*p);
 		return out_;
 	}
 
@@ -1841,6 +1840,21 @@ unittest  // poll on an unknown event type throws NotFound
 			Nullable!string.init, Nullable!long.init, Nullable!long.init));
 }
 
+unittest  // poll carries nextPollMs even when hasMore requests an immediate re-poll
+{
+	auto rt = testRuntime();
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		return EventResult.of([EventOccurrence("e1", "email.received", "t")], "c1", false, true);
+	};
+	rt.register(reg);
+	auto r = rt.poll("email.received", Json.emptyObject, "", nullable("c0"),
+			Nullable!long.init, Nullable!long.init);
+	assert(r.hasMore);
+	assert(r.nextPollMs == 30_000);
+}
+
 unittest  // poll runs a check function and returns its events + nextPollMs
 {
 	auto rt = testRuntime();
@@ -1856,7 +1870,7 @@ unittest  // poll runs a check function and returns its events + nextPollMs
 	auto boot = rt.poll("email.received", Json.emptyObject, "",
 			Nullable!string.init, Nullable!long.init, Nullable!long.init);
 	assert(boot.events.length == 0 && boot.cursor.get == "c0");
-	assert(boot.nextPollMs.get == 30_000); // default poll interval
+	assert(boot.nextPollMs == 30_000); // default poll interval
 
 	auto next = rt.poll("email.received", Json.emptyObject, "", nullable("c0"),
 			Nullable!long.init, Nullable!long.init);

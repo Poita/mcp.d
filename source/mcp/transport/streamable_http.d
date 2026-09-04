@@ -1348,8 +1348,8 @@ private void handleEventsStream(McpServer server, Message msg,
 			deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), subId));
 		cursor = first.cursor;
 		handle.stream.cursor = first.cursor;
-		if (!first.nextPollMs.isNull)
-			pollMs = first.nextPollMs.get;
+		if (first.nextPollMs > 0)
+			pollMs = first.nextPollMs;
 	}
 	catch (Exception)
 		deliver(eventsActiveNotification, withSubscriptionId(activeParams(p.cursor, false), subId));
