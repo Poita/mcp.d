@@ -12,6 +12,7 @@ import std.algorithm : sort;
 import vibe.data.json : Json;
 
 import mcp.protocol.events;
+import mcp.protocol.jsonhelpers : getOr;
 import mcp.protocol.errors : McpException, notFound, unsupported, invalidParams,
 	forbidden, resourceExhausted, internalError, toErrorJson;
 import mcp.server.event_context : EventContext, EventResult, Event, EventBatch,
@@ -599,7 +600,67 @@ final class EventsRuntime
 	/// Register (or replace) an event type.
 	void register(EventRegistration reg) @safe
 	{
-		types_[reg.descriptor.name] = reg;
+		const name = reg.descriptor.name;
+		auto existing = name in types_;
+		bool descriptorChanged = existing is null;
+		if (existing !is null)
+		{
+			// A breaking change to either schema invalidates the contract every
+			// live subscription was created under: end them so the client SDK
+			// re-fetches events/list and resubscribes against the new descriptor.
+			// Additive evolution (new optional fields) keeps them.
+			foreach (feature; ["inputSchema", "payloadSchema"])
+			{
+				const before = feature == "inputSchema" ? existing.descriptor.inputSchema
+					: existing.descriptor.payloadSchema;
+				const after = feature == "inputSchema" ? reg.descriptor.inputSchema
+					: reg.descriptor.payloadSchema;
+				if (canonicalJsonString(before) == canonicalJsonString(after))
+					continue;
+				descriptorChanged = true;
+				if (!isAdditiveSchemaChange(before, after, feature == "inputSchema"))
+					terminateEventType(name, schemaChangedError(name, feature));
+			}
+			descriptorChanged = descriptorChanged
+				|| existing.descriptor.description != reg.descriptor.description
+				|| existing.descriptor.title != reg.descriptor.title
+				|| existing.disabledModes != reg.disabledModes
+				|| existing.emitOnly != reg.emitOnly
+				|| canonicalJsonString(existing.descriptor.meta) != canonicalJsonString(reg.descriptor.meta);
+		}
+		types_[name] = reg;
+		if (descriptorChanged)
+			notifyListChanged();
+	}
+
+	/// Remove an event type: every subscription to it ends with `-32011 NotFound
+	/// {kind: "event"}` (push streams get `notifications/events/terminated`,
+	/// webhook subscriptions a `terminated` envelope), the type leaves
+	/// `events/list`, and `notifications/events/list_changed` is sent. Returns
+	/// false when no such type is registered.
+	bool unregister(string name) @safe
+	{
+		if ((name in types_) is null)
+			return false;
+		terminateEventType(name, toErrorJson(notFound("Event type removed: " ~ name, "event")));
+		types_.remove(name);
+		notifyListChanged();
+		return true;
+	}
+
+	// The `-32014 Unsupported` a subscription ends with when its event type's
+	// schema changed incompatibly in place: `data.feature` names the schema and
+	// `data.reason` is `schema_changed`, so a client distinguishes it from an
+	// authorization failure.
+	private static Json schemaChangedError(string name, string feature) @safe
+	{
+		import mcp.protocol.errors : ErrorCode;
+
+		Json data = Json.emptyObject;
+		data["feature"] = feature;
+		data["reason"] = "schema_changed";
+		return toErrorJson(new McpException(ErrorCode.unsupported,
+				"Event type " ~ name ~ " changed its " ~ feature ~ " incompatibly", data));
 	}
 
 	/// Define a strongly-typed event type with subscription-argument type `A` and
@@ -2052,6 +2113,62 @@ final class EventsRuntime
 	}
 }
 
+/// Whether replacing JSON Schema `before` with `after` is additive: every property
+/// `before` declared is still present with an identical definition (so no field is
+/// removed, renamed, retyped, or narrowed), every other top-level keyword is
+/// unchanged, and — for an input schema, whose prior `arguments` must stay valid —
+/// no property became newly required. Any schema that is not an object schema
+/// with `properties` is treated as changed unless identical.
+bool isAdditiveSchemaChange(Json before, Json after, bool inputSchema) @safe
+{
+	if (before.type != Json.Type.object || after.type != Json.Type.object)
+		return false;
+	foreach (key; objectKeys(before))
+	{
+		if (key == "properties" || key == "required")
+			continue;
+		if (key !in after || canonicalJsonString(after[key]) != canonicalJsonString(before[key]))
+			return false;
+	}
+	foreach (key; objectKeys(after))
+		if (key != "properties" && key != "required" && key !in before)
+			return false;
+	Json oldProps = "properties" in before ? before["properties"] : Json.emptyObject;
+	Json newProps = "properties" in after ? after["properties"] : Json.emptyObject;
+	if (oldProps.type != Json.Type.object || newProps.type != Json.Type.object)
+		return false;
+	foreach (prop; objectKeys(oldProps))
+		if (prop !in newProps || canonicalJsonString(newProps[prop]) != canonicalJsonString(oldProps[prop]))
+			return false;
+	if (!inputSchema)
+		return true;
+	bool[string] wasRequired;
+	Json oldReq = "required" in before ? before["required"] : Json.emptyArray;
+	if (oldReq.type == Json.Type.array)
+		foreach (i; 0 .. oldReq.length)
+			if (oldReq[i].type == Json.Type.string)
+				wasRequired[oldReq[i].get!string] = true;
+	Json newReq = "required" in after ? after["required"] : Json.emptyArray;
+	if (newReq.type == Json.Type.array)
+		foreach (i; 0 .. newReq.length)
+			if (newReq[i].type == Json.Type.string && (newReq[i].get!string in wasRequired) is null)
+				return false;
+	return true;
+}
+
+/// The keys of a JSON object (empty for a non-object).
+private string[] objectKeys(Json j) @safe
+{
+	string[] keys;
+	if (j.type != Json.Type.object)
+		return keys;
+	() @trusted {
+		foreach (string k, Json v; cast() j)
+			keys ~= k;
+	}();
+	return keys;
+}
+
 /// A stable, key-sorted serialization of `j`, so two semantically-equal JSON
 /// values (objects differing only in key order) produce the same string — used
 /// for argument equality in subscription keys and lease keys.
@@ -2669,6 +2786,106 @@ unittest  // lifecycle is refcounted across modes: fires once per (principal,nam
 	now += 10 * 60 * 1000;
 	rt.sweepPollLeases();
 	assert(unsubs == 1); // onUnsubscribe fires once at 1->0
+}
+
+unittest  // isAdditiveSchemaChange accepts a new optional property and rejects removal/retyping
+{
+	auto before = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}`);
+	auto plusOptional = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"integer"}},"required":["a"]}`);
+	auto removed = parseJsonString(`{"type":"object","properties":{}}`);
+	auto retyped = parseJsonString(`{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]}`);
+	auto narrowed = parseJsonString(`{"type":"object","properties":{"a":{"type":"string","enum":["x"]}},"required":["a"]}`);
+	assert(isAdditiveSchemaChange(before, plusOptional, true));
+	assert(isAdditiveSchemaChange(before, plusOptional, false));
+	assert(!isAdditiveSchemaChange(before, removed, false));
+	assert(!isAdditiveSchemaChange(before, retyped, false));
+	assert(!isAdditiveSchemaChange(before, narrowed, false));
+}
+
+unittest  // a newly required input property is breaking for inputSchema but not payloadSchema
+{
+	auto before = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"}}}`);
+	auto nowRequired = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["b"]}`);
+	assert(!isAdditiveSchemaChange(before, nowRequired, true));
+	assert(isAdditiveSchemaChange(before, nowRequired, false));
+}
+
+unittest  // unregister ends every subscription with NotFound{kind:event} and notifies list_changed
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	int changed;
+	rt.onListChanged(() @safe { changed++; });
+	string[] methods;
+	Json[] params;
+	rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		methods ~= m;
+		params ~= p;
+	});
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	assert(rt.unregister("n"));
+	assert(methods == [eventsTerminatedNotification]);
+	assert(params[0]["error"]["code"].get!int == -32011);
+	assert(params[0]["error"]["data"]["kind"].get!string == "event");
+	assert(rt.webhookStore().get(r.id).isNull);
+	assert(controlPostsOf(ft, "terminated").length == 1);
+	assert(!rt.has("n") && rt.list().events.length == 0);
+	assert(changed == 1);
+	assert(!rt.unregister("n")); // already gone
+	import mcp.protocol.errors : ErrorCode;
+
+	bool threw;
+	try
+		rt.poll("n", Json.emptyObject, "", Nullable!string.init, Nullable!long.init, Nullable!long.init);
+	catch (McpException e)
+		threw = e.code == ErrorCode.notFound;
+	assert(threw);
+}
+
+unittest  // re-registering with an incompatible payloadSchema terminates with Unsupported{schema_changed}
+{
+	auto rt = testRuntime();
+	int changed;
+	rt.onListChanged(() @safe { changed++; });
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.descriptor.payloadSchema = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"}}}`);
+	rt.register(reg);
+	assert(changed == 1); // a new type
+	string[] methods;
+	Json[] params;
+	rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		methods ~= m;
+		params ~= p;
+	});
+	rt.register(reg); // identical: nothing happens
+	assert(methods.length == 0 && changed == 1);
+
+	reg.descriptor.payloadSchema = parseJsonString(`{"type":"object","properties":{"a":{"type":"integer"}}}`);
+	rt.register(reg);
+	assert(methods == [eventsTerminatedNotification]);
+	assert(params[0]["error"]["code"].get!int == -32014);
+	assert(params[0]["error"]["data"]["feature"].get!string == "payloadSchema");
+	assert(params[0]["error"]["data"]["reason"].get!string == "schema_changed");
+	assert(changed == 2);
+	assert(rt.has("n")); // the type stays, under its new contract
+}
+
+unittest  // an additive schema change keeps subscriptions but still notifies list_changed
+{
+	auto rt = testRuntime();
+	int changed;
+	rt.onListChanged(() @safe { changed++; });
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.descriptor.inputSchema = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"}}}`);
+	rt.register(reg);
+	string[] methods;
+	rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe { methods ~= m; });
+	reg.descriptor.inputSchema = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"boolean"}}}`);
+	rt.register(reg);
+	assert(methods.length == 0);
+	assert(changed == 2);
+	rt.emit(EventOccurrence("evt", "n", "t"));
+	assert(methods == [eventsEventNotification]); // still subscribed
 }
 
 unittest  // notifyListChanged invokes the registered callback
