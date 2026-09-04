@@ -341,6 +341,7 @@ struct EventsOptions
 	WebhookSuspension webhookSuspension; /// failure-rate policy that suspends delivery (active=false)
 	Duration webhookRetryBase = 30.seconds; /// exponential-backoff base between attempts (5 attempts span 7.5 min)
 	DeliveryQueue deliveryQueue; /// webhook outbox (default in-memory); shared/durable for multi-node
+	Duration workerInterval = 5.seconds; /// cadence of the periodic worker `enableEvents` starts (0 = the author runs it)
 	Duration deliveryLease = 1.minutes; /// how long a worker claims a leased delivery job
 	Duration webhookHttpTimeout = 10.seconds; /// per-attempt HTTP bound (default transport); also the worst-case-retry budget input
 	WebhookTransport webhookTransport; /// outbound HTTP (default SSRF-hardened); tests inject a fake
@@ -417,6 +418,15 @@ private struct WellKnownReceivers
 	long fetchedAtMs;
 }
 
+/// One position a webhook subscription has deliveries in flight at, with how many
+/// of them are still unsettled. Kept per subscription in enqueue order so the
+/// watermark advances to a position only once every earlier one has settled.
+private struct OutstandingCursor
+{
+	string cursor;
+	int remaining;
+}
+
 /// The path of the receiver-published document that declares which paths under
 /// a callback origin accept MCP webhook deliveries.
 enum string wellKnownReceiverPath = "/.well-known/mcp-webhook-receiver.json";
@@ -484,6 +494,8 @@ final class EventsRuntime
 	private LifeRef[string] lifeRefs_; // (principal\0name\0args) -> live-subscription refcount
 	private bool[string] verifiedEndpoints_; // (principal\0url) -> verified, in-memory cache
 	private WellKnownReceivers[string] wellKnown_; // callback origin -> cached receiver document
+	private OutstandingCursor[][string] outstanding_; // subscription id -> in-flight positions, enqueue order
+	private long[string] nextFetchAt_; // subscription id -> when the poll-driven loop next fetches
 	private VerifyBackoff[string] pendingVerification_; // (principal\0url) -> next-probe backoff
 
 	this(WebhookSubscriptionStore webhookStore = null, EventsOptions opts = EventsOptions.init) @safe
@@ -854,6 +866,13 @@ final class EventsRuntime
 		const id = webhookId(principal, p.delivery.url, p.name, p.arguments);
 		const now = opts_.nowMs();
 		auto existing = webhookStore_.get(id);
+		// A lapsed subscription no longer holds state the client can refresh: it is
+		// torn down and the call creates a fresh one from the supplied cursor.
+		if (!existing.isNull && existing.get.isExpired(now))
+		{
+			removeWebhookState(existing.get);
+			existing = Nullable!WebhookSubscription.init;
+		}
 		const isNew = existing.isNull;
 
 		// Cap the number of live webhook subscriptions a single principal may hold,
@@ -886,11 +905,14 @@ final class EventsRuntime
 		}
 		sub.secret = p.delivery.secret;
 		// The cursor is client-owned. On a fresh subscription the supplied cursor is
-		// the replay point; on a refresh of a live subscription the server keeps its
-		// own safe-to-persist watermark (advanced by acked deliveries) rather than
-		// regressing to the client's value.
+		// the replay point; on a refresh of a live subscription the client's value is
+		// at or behind the server's safe-to-persist watermark (advanced by acked
+		// deliveries), so it is a no-op rather than a regression.
 		if (isNew)
+		{
 			sub.cursor = p.cursor;
+			sub.fetchCursor = p.cursor;
+		}
 
 		auto grant = grantTtl(p, now);
 		sub.noExpiry = grant.isNull;
@@ -903,6 +925,9 @@ final class EventsRuntime
 
 		if (isNew)
 			acquireLifecycle(*reg, p.name, p.arguments, principal, id);
+		// A fresh subscription replays from its cursor (or bootstraps a fresh one);
+		// the backfill reports whether delivery starts later than that cursor.
+		const truncated = isNew ? backfillWebhook(sub, reg, p.maxAgeMs) : false;
 		// A successful refresh is the client's liveness signal: deliveries queued
 		// while suspended resume now rather than at the next worker pass.
 		if (reactivated)
@@ -912,7 +937,7 @@ final class EventsRuntime
 		r.id = id;
 		r.refreshBefore = grant.isNull ? Nullable!string.init : nullable(isoFromMs(grant.get));
 		r.cursor = sub.cursor;
-		r.truncated = false;
+		r.truncated = truncated;
 		// On a refresh, surface delivery health so the client can detect problems
 		// without a separate monitoring channel.
 		if (!isNew)
@@ -942,10 +967,135 @@ final class EventsRuntime
 		if (principal.length == 0)
 			throw forbidden("events/unsubscribe requires an authenticated principal");
 		const id = webhookId(principal, p.url, p.name, p.arguments);
-		if (webhookStore_.get(id).isNull)
+		auto existing = webhookStore_.get(id);
+		if (existing.isNull)
 			throw notFound("No matching subscription", "subscription");
-		webhookStore_.remove(id);
-		releaseLifecycle(p.name, p.arguments, principal);
+		removeWebhookState(existing.get);
+	}
+
+	/// Drop every webhook subscription whose grant has lapsed, firing
+	/// `on_unsubscribe` for each. The periodic worker calls this; a lapsed
+	/// subscription found by a refresh is dropped there directly.
+	void sweepWebhookSubscriptions() @safe
+	{
+		const now = opts_.nowMs();
+		foreach (sub; webhookStore_.all())
+			if (sub.isExpired(now))
+				removeWebhookState(sub);
+	}
+
+	// Forget a webhook subscription everywhere: the store, the lifecycle refcount
+	// (firing `on_unsubscribe` on the last reference), and this node's in-flight
+	// bookkeeping.
+	private void removeWebhookState(WebhookSubscription sub) @safe
+	{
+		webhookStore_.remove(sub.id);
+		outstanding_.remove(sub.id);
+		nextFetchAt_.remove(sub.id);
+		releaseLifecycle(sub.name, sub.arguments, sub.principal);
+	}
+
+	/// Replay for a fresh webhook subscription: enqueue every event since its
+	/// cursor (from the ring buffer for an emit-only type, from the check function
+	/// otherwise), bounded by `maxAgeMs`, and settle the subscription's cursors. A
+	/// null cursor bootstraps: nothing is replayed and the subscription starts from
+	/// the current position. Returns whether delivery starts later than the
+	/// supplied cursor (the response's `truncated`).
+	private bool backfillWebhook(ref WebhookSubscription sub, EventRegistration* reg,
+			Nullable!long maxAgeMs) @safe
+	{
+		EventResult er;
+		if (regIsEmitOnly(reg))
+			er = buffer_.readSince(sub.name, sub.cursor, maxAgeMs, Nullable!long.init);
+		else
+		{
+			auto ctx = new EventContext(sub.fetchCursor, sub.arguments, sub.principal, maxAgeMs);
+			try
+				er = reg.check(ctx);
+			catch (Exception)
+				return false; // the upstream is unavailable: no replay, delivery continues live
+			foreach (ref occ; er.events)
+				if (occ.cursor.isNull)
+					occ.cursor = er.cursor; // a batch-cursor event settles with its batch
+		}
+		sub.fetchCursor = er.cursor;
+		// With nothing to replay the reported position is already safe to persist;
+		// otherwise the watermark stays put until the replayed deliveries settle.
+		if (er.events.length == 0)
+			sub.cursor = er.cursor;
+		webhookStore_.put(sub);
+		bool any;
+		foreach (occ; er.events)
+			any |= enqueueForWebhook(sub, reg, occ, regIsEmitOnly(reg));
+		if (any)
+			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
+		return er.truncated;
+	}
+
+	/// The poll-driven webhook pass: for every live subscription to a check-backed
+	/// type whose cadence has come round, run the check function from the
+	/// subscription's fetch position and enqueue what it returns. A quiet fetch
+	/// with nothing in flight advances the watermark (so the client's cursor moves
+	/// during quiet periods); a fetch that reports `truncated` posts a `gap`
+	/// envelope. Emit-only types are not polled — `emit` routes them live.
+	void pollWebhookSubscriptions() @safe
+	{
+		if (!opts_.webhookEnabled)
+			return;
+		const now = opts_.nowMs();
+		bool any;
+		foreach (sub; webhookStore_.all())
+		{
+			if (sub.isExpired(now) || !sub.active)
+				continue;
+			auto reg = sub.name in types_;
+			if (regIsEmitOnly(reg))
+				continue;
+			if (auto next = sub.id in nextFetchAt_)
+				if (now < *next)
+					continue;
+			nextFetchAt_[sub.id] = now + nextPollMsFor(*reg);
+			auto ctx = new EventContext(sub.fetchCursor, sub.arguments, sub.principal);
+			EventResult er;
+			try
+				er = reg.check(ctx);
+			catch (Exception)
+				continue; // transient upstream failure: try again next pass
+			foreach (ref occ; er.events)
+				if (occ.cursor.isNull)
+					occ.cursor = er.cursor;
+			sub.fetchCursor = er.cursor;
+			if (er.events.length == 0 && (sub.id in outstanding_) is null)
+				sub.cursor = er.cursor;
+			webhookStore_.put(sub);
+			if (er.truncated && !er.cursor.isNull)
+				postGap(sub, er.cursor.get);
+			foreach (occ; er.events)
+				any |= enqueueForWebhook(sub, reg, occ, false);
+		}
+		if (any)
+			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
+	}
+
+	// Enqueue one delivery of `occ` for `sub`, applying the type's `match`/
+	// `transform` when `shape` is set (broadcast emits; a check function has
+	// already applied the subscription's arguments), and tracking the position for
+	// the watermark. Returns false when the filter dropped the event.
+	private bool enqueueForWebhook(WebhookSubscription sub, EventRegistration* reg,
+			EventOccurrence occ, bool shape) @safe
+	{
+		EventOccurrence shaped = occ;
+		if (shape)
+		{
+			auto ctx = new EventContext(sub.cursor, sub.arguments, sub.principal);
+			if (reg !is null && reg.match !is null && !reg.match(ctx, occ))
+				return false;
+			if (reg !is null && reg.transform !is null)
+				shaped = reg.transform(ctx, occ);
+		}
+		trackOutstanding(sub.id, shaped.cursor);
+		deliveryQueue_.enqueue(Delivery(sub.id ~ "/" ~ shaped.eventId, sub.id, shaped, 0));
+		return true;
 	}
 
 	/// The deterministic subscription id for a key — a truncated SHA-256 of the
@@ -1180,13 +1330,7 @@ final class EventsRuntime
 		{
 			if (sub.name != occ.name || sub.isExpired(now))
 				continue;
-			auto ctx = new EventContext(sub.cursor, sub.arguments, sub.principal);
-			if (reg !is null && reg.match !is null && !reg.match(ctx, occ))
-				continue;
-			EventOccurrence shaped = (reg !is null && reg.transform !is null) ? reg.transform(ctx,
-					occ) : occ;
-			deliveryQueue_.enqueue(Delivery(sub.id ~ "/" ~ shaped.eventId, sub.id, shaped, 0));
-			any = true;
+			any |= enqueueForWebhook(sub, reg, occ, true);
 		}
 		// Kick a drain on this node so the just-enqueued jobs deliver promptly
 		// (workers on other nodes also lease from a shared queue independently).
@@ -1205,9 +1349,16 @@ final class EventsRuntime
 			// Deliver each leased job in its own task so a slow job can't expire its
 			// siblings' leases (they wait sequentially otherwise). Each task renews
 			// its own lease around every attempt.
-			auto j = job;
-			opts_.deliveryExecutor(() @safe { deliverGuarded(j); });
+			opts_.deliveryExecutor(deliveryTask(job));
 		}
+	}
+
+	// A delegate delivering `job`. Built by a call so each task closes over its own
+	// copy: a closure created inside the lease loop would share the loop variable
+	// and every deferred task would deliver the last leased job.
+	private void delegate() @safe deliveryTask(Delivery job) @safe
+	{
+		return () @safe { deliverGuarded(job); };
 	}
 
 	// Run one job's bounded retry loop, settling it even when `deliverWithRetry`
@@ -1236,20 +1387,30 @@ final class EventsRuntime
 					opts_.nowMs() + opts_.deliveryLease.total!"msecs");
 	}
 
-	/// Run the delivery worker loop until `stop()` returns true: drain the queue,
-	/// then wait `interval`. A deployment runs one per node against a shared,
-	/// durable `DeliveryQueue` for node-agnostic delivery + crash recovery (a
-	/// leased-but-unacked job from a dead node becomes leasable again). Single-node
-	/// deployments need not call this — the per-publish kick delivers inline.
+	/// Run the periodic worker until `stop()` returns true: every `interval` it
+	/// expires poll leases, sweeps lapsed webhook subscriptions, runs the
+	/// poll-driven webhook pass, and drains the delivery queue. `enableEvents`
+	/// starts one per server at `workerInterval`; a multi-node deployment shares a
+	/// durable `DeliveryQueue` so any node's worker delivers (and re-leases a dead
+	/// node's jobs).
 	void startDeliveryWorker(Duration interval, bool delegate() @safe stop = null) @safe
 	{
 		opts_.deliveryExecutor(() @safe {
 			while (stop is null || !stop())
 			{
-				drainDeliveries();
+				tick();
 				opts_.deliverySleep(interval);
 			}
 		});
+	}
+
+	/// One pass of the periodic work the worker loop performs.
+	void tick() @safe
+	{
+		sweepPollLeases();
+		sweepWebhookSubscriptions();
+		pollWebhookSubscriptions();
+		drainDeliveries();
 	}
 
 	/// Deliver one queued job to its subscription, verifying the endpoint first (if
@@ -1290,7 +1451,7 @@ final class EventsRuntime
 		// for the watermark and a gap envelope tells the client it was skipped.
 		if (occ.toJson().toString().length > opts_.webhookMaxBodyBytes)
 		{
-			recordSuccess(subId, occ.cursor);
+			settlePosition(subId, occ.cursor);
 			signalGap(s0.get, occ);
 			deliveryQueue_.ack(job.jobId);
 			return;
@@ -1325,6 +1486,7 @@ final class EventsRuntime
 			{
 				const cat = res.error.isNull ? DeliveryErrorCategory.http5xx : res.error.get;
 				recordFailure(subId, cat);
+				settlePosition(subId, occ.cursor); // abandoned for watermark purposes
 				signalGap(sn.get, occ); // tell the client the event was lost
 				deliveryQueue_.ack(job.jobId);
 				return;
@@ -1341,9 +1503,15 @@ final class EventsRuntime
 	/// same signing + SSRF-guarded path as a normal delivery.
 	private void signalGap(WebhookSubscription sub, EventOccurrence occ) @safe
 	{
-		const cursorStr = occ.cursor.isNull ? "" : occ.cursor.get;
+		postGap(sub, occ.cursor.isNull ? "" : occ.cursor.get);
+	}
+
+	/// POST a signed `gap` control envelope carrying `cursor`, the fresh position
+	/// the client should persist and treat as truncated.
+	private void postGap(WebhookSubscription sub, string cursor) @safe
+	{
 		const 
-		body = gapEnvelope(cursorStr).toString();
+		body = gapEnvelope(cursor).toString();
 		const now = opts_.nowMs();
 		auto headers = signDeliveryHeaders(sub.secret, sub.previousSecret,
 				sub.previousSecretGraceUntilMs,
@@ -1527,7 +1695,7 @@ final class EventsRuntime
 		opts_.deliveryExecutor(() @safe {
 			postToCallback(sub.url, headers, body);
 		});
-		webhookStore_.remove(subId);
+		removeWebhookState(sub);
 	}
 
 	private void markVerified(string subId) @safe
@@ -1556,13 +1724,81 @@ final class EventsRuntime
 		rollWindow(sub, now);
 		sub.windowAttempts++;
 		clearExpiredRotation(sub, now);
-		// Advance the safe watermark only when the acked position is strictly ahead
-		// of the stored one. An out-of-order or duplicate ack (a slow attempt landing
-		// after a newer one) must not regress the cursor — that would re-deliver the
-		// intervening events. Both positions are ring-buffer sequence cursors.
-		if (!cursor.isNull && cursorAdvances(sub.cursor, cursor.get))
-			sub.cursor = cursor;
 		webhookStore_.put(sub);
+		settlePosition(subId, cursor);
+	}
+
+	// Record a delivery at `cursor` as settled (acked or abandoned) and advance the
+	// subscription's safe-to-persist watermark as far as the in-flight bookkeeping
+	// allows: to a position only once every earlier position has settled, so an
+	// out-of-order ack never lets the watermark skip an unacked event. A position
+	// this node never tracked (a job enqueued on another node, or before a
+	// restart) falls back to advancing when strictly ahead of the stored watermark.
+	private void settlePosition(string subId, Nullable!string cursor) @safe
+	{
+		if (cursor.isNull)
+			return;
+		string[] safe;
+		string candidate;
+		if (settleOutstanding(subId, cursor.get, safe))
+		{
+			if (safe.length == 0)
+				return; // an earlier position is still in flight
+			candidate = safe[$ - 1];
+		}
+		else
+			candidate = cursor.get;
+		auto sn = webhookStore_.get(subId);
+		if (sn.isNull)
+			return;
+		auto sub = sn.get;
+		if (cursorAdvances(sub.cursor, candidate))
+		{
+			sub.cursor = candidate;
+			webhookStore_.put(sub);
+		}
+	}
+
+	// Note a delivery in flight at `cursor` for `subId`, in enqueue order.
+	private void trackOutstanding(string subId, Nullable!string cursor) @safe
+	{
+		if (cursor.isNull)
+			return;
+		auto list = subId in outstanding_;
+		if (list !is null && (*list).length && (*list)[$ - 1].cursor == cursor.get)
+		{
+			(*list)[$ - 1].remaining++;
+			return;
+		}
+		outstanding_[subId] ~= OutstandingCursor(cursor.get, 1);
+	}
+
+	// Settle one in-flight delivery at `cursor`. Returns false when the position is
+	// not tracked here; otherwise `safe` receives, in order, every position that
+	// became safe to persist (possibly none, if an earlier one is still in flight).
+	private bool settleOutstanding(string subId, string cursor, out string[] safe) @safe
+	{
+		auto list = subId in outstanding_;
+		if (list is null)
+			return false;
+		size_t idx = size_t.max;
+		foreach (i, ref e; *list)
+			if (e.cursor == cursor)
+			{
+				idx = i;
+				break;
+			}
+		if (idx == size_t.max)
+			return false;
+		(*list)[idx].remaining--;
+		while ((*list).length && (*list)[0].remaining <= 0)
+		{
+			safe ~= (*list)[0].cursor;
+			*list = (*list)[1 .. $];
+		}
+		if ((*list).length == 0)
+			outstanding_.remove(subId);
+		return true;
 	}
 
 	// Drop a rotated previous secret once its grace window has elapsed, so a
@@ -3041,6 +3277,264 @@ unittest  // an endpoint that fails the challenge handshake receives no event de
 	// the failure was recorded as challenge_failed
 	assert(rt.webhookStore().get(r.id)
 			.get.lastErrorCat == cast(int) DeliveryErrorCategory.challengeFailed);
+}
+
+unittest  // a fresh webhook subscription replays the retained events after its cursor
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	// Three events in the buffer (seq 1..3) before anyone subscribes.
+	foreach (id; ["evt_1", "evt_2", "evt_3"])
+		rt.emit(EventOccurrence(id, "n", "t"));
+	assert(ft.eventPosts().length == 0); // no subscriber yet
+	auto p = webhookSub("n", "https://proxy/hooks");
+	p.cursor = "1"; // the client last persisted position 1
+	auto r = rt.subscribeWebhook(p, "user-1");
+	assert(!r.truncated);
+	assert(ft.eventPosts().length == 2); // evt_2 and evt_3 replayed
+	import std.algorithm : canFind;
+
+	assert(ft.eventPosts()[0].body.canFind("evt_2") && ft.eventPosts()[1].body.canFind("evt_3"));
+	// Both acked in order: the watermark settled at the last replayed position.
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "3");
+}
+
+unittest  // a null cursor bootstraps a webhook subscription at the current position
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	rt.emit(EventOccurrence("evt_old", "n", "t"));
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	assert(ft.eventPosts().length == 0); // nothing replayed
+	assert(!r.cursor.isNull && r.cursor.get == "1"); // a fresh cursor to persist
+	assert(!r.truncated);
+	rt.emit(EventOccurrence("evt_new", "n", "t"));
+	assert(ft.eventPosts().length == 1);
+}
+
+unittest  // a cursor the buffer no longer covers replays what remains and reports truncated
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	auto p = webhookSub("n", "https://proxy/hooks");
+	p.cursor = "not-a-position"; // from a prior process: unrecognisable
+	auto r = rt.subscribeWebhook(p, "user-1");
+	assert(r.truncated);
+	assert(!r.cursor.isNull); // reset to a position the server can serve from
+}
+
+unittest  // a check-backed type is served over webhook by replaying from the cursor, then polling
+{
+	auto ft = new FakeWebhookTransport();
+	long now = 1_000_000;
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	auto rt = new EventsRuntime(null, o);
+	Nullable!string[] seen;
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.pollInterval = 10.seconds;
+	reg.check = (EventContext ctx) @safe {
+		seen ~= ctx.cursor;
+		if (ctx.isBootstrap())
+			return EventResult.empty("h0");
+		if (ctx.cursor.get == "h0")
+			return EventResult.of([EventOccurrence("m1", "email.received", "t")], "h1");
+		return EventResult.empty(ctx.cursor.get); // quiet
+	};
+	rt.register(reg);
+
+	auto p = webhookSub("email.received", "https://proxy/hooks");
+	p.cursor = "h0";
+	auto r = rt.subscribeWebhook(p, "user-1");
+	assert(seen.length == 1 && seen[0].get == "h0"); // replayed from the client's cursor
+	assert(ft.eventPosts().length == 1); // m1 delivered
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "h1"); // batch cursor settled on ack
+
+	rt.pollWebhookSubscriptions();
+	assert(seen.length == 2 && seen[1].get == "h1"); // the loop resumes from the fetch position
+	rt.pollWebhookSubscriptions();
+	assert(seen.length == 2); // within the 10 s cadence: not fetched again
+	now += 10_000;
+	rt.pollWebhookSubscriptions();
+	assert(seen.length == 3);
+	assert(ft.eventPosts().length == 1); // quiet polls deliver nothing
+}
+
+unittest  // a check function that bootstraps a webhook subscription settles the fresh cursor
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		return ctx.isBootstrap() ? EventResult.empty("h0") : EventResult.empty(ctx.cursor.get);
+	};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("email.received", "https://proxy/hooks"), "user-1");
+	assert(r.cursor.get == "h0");
+	assert(ft.eventPosts().length == 0);
+}
+
+unittest  // the watermark advances to a position only once every earlier one has settled
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliverySleep = (Duration d) @safe {};
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t")); // seq 1
+	rt.emit(EventOccurrence("evt_2", "n", "t")); // seq 2
+	// Two drain kicks are queued; run them so each job gets its own deferred task.
+	deferred[0]();
+	deferred[1]();
+	auto jobs = deferred[2 .. $];
+	assert(jobs.length == 2);
+	jobs[1](); // evt_2 acks first
+	assert(rt.webhookStore().get(r.id).get.cursor == r.cursor); // evt_1 still in flight: unchanged
+	jobs[0](); // evt_1 acks
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "2"); // now both are safe
+}
+
+unittest  // a refresh of a live subscription does not replay from the client's older cursor
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	auto p = webhookSub("n", "https://proxy/hooks");
+	auto r1 = rt.subscribeWebhook(p, "user-1");
+	foreach (id; ["evt_1", "evt_2"])
+		rt.emit(EventOccurrence(id, "n", "t"));
+	assert(ft.eventPosts().length == 2);
+	assert(rt.webhookStore().get(r1.id).get.cursor.get == "2");
+	p.cursor = r1.cursor; // the client re-supplies the cursor it was first given
+	auto r2 = rt.subscribeWebhook(p, "user-1");
+	assert(ft.eventPosts().length == 2); // nothing redelivered
+	assert(r2.cursor.get == "2"); // the server's watermark, not the client's value
+	assert(!r2.deliveryStatus.isNull);
+}
+
+unittest  // a lapsed subscription is recreated from the client's cursor, with lifecycle hooks
+{
+	auto ft = new FakeWebhookTransport();
+	long now = 1_000_000;
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	o.webhookTtlCap = 1.minutes;
+	auto rt = new EventsRuntime(null, o);
+	int subs, unsubs;
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.onSubscribe = (EventContext ctx, string id) @safe { subs++; };
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	rt.register(reg);
+	auto p = webhookSub("n", "https://proxy/hooks");
+	rt.subscribeWebhook(p, "user-1");
+	assert(subs == 1);
+	foreach (id; ["evt_1", "evt_2", "evt_3"])
+		rt.emit(EventOccurrence(id, "n", "t"));
+	assert(ft.eventPosts().length == 3);
+
+	now += 2 * 60 * 1000; // the grant lapsed
+	p.cursor = "1"; // the client's last persisted position
+	auto r = rt.subscribeWebhook(p, "user-1");
+	assert(unsubs == 1 && subs == 2); // torn down and provisioned afresh
+	assert(ft.eventPosts().length == 5); // evt_2 and evt_3 replayed
+	assert(!r.deliveryStatus.isNull == false); // a fresh subscription carries no status
+}
+
+unittest  // sweepWebhookSubscriptions drops lapsed subscriptions and fires on_unsubscribe
+{
+	long now = 1_000_000;
+	auto rt = testRuntime(() @safe => now);
+	int unsubs;
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.sweepWebhookSubscriptions();
+	assert(!rt.webhookStore().get(r.id).isNull); // still within its grant
+	now += 60 * 60 * 1000;
+	rt.sweepWebhookSubscriptions();
+	assert(rt.webhookStore().get(r.id).isNull);
+	assert(unsubs == 1);
+}
+
+unittest  // events sharing a batch cursor settle the watermark together
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliverySleep = (Duration d) @safe {};
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		if (ctx.isBootstrap())
+			return EventResult.empty("h0");
+		return EventResult.of([
+			EventOccurrence("m1", "email.received", "t"), EventOccurrence("m2", "email.received", "t")
+		], "h1");
+	};
+	rt.register(reg);
+	auto p = webhookSub("email.received", "https://proxy/hooks");
+	p.cursor = "h0";
+	auto r = rt.subscribeWebhook(p, "user-1");
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "h0"); // replay in flight
+	deferred[0](); // the drain: two per-job tasks
+	auto jobs = deferred[1 .. $];
+	assert(jobs.length == 2);
+	jobs[0]();
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "h0"); // m2 still in flight
+	jobs[1]();
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "h1");
+}
+
+unittest  // a deferred drain delivers every leased job, each to its own task
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliverySleep = (Duration d) @safe {};
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	for (size_t i = 0; i < deferred.length; i++)
+		deferred[i]();
+	import std.algorithm : canFind;
+
+	auto posts = ft.eventPosts();
+	assert(posts.length == 2);
+	assert(posts[0].body.canFind("evt_1") && posts[1].body.canFind("evt_2"));
 }
 
 unittest  // a receiver-published well-known document verifies a covered callback without a challenge

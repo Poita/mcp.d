@@ -231,11 +231,13 @@ mode for the same reason; webhook subscription state is held mount-globally by t
 `ServerMode.stateless` — and is keyed on the authenticated principal. Webhook
 delivery is decoupled from `publish` via a pluggable `DeliveryQueue`
 (`EventsOptions.deliveryQueue`): `publish` enqueues a job per matching
-subscription, and a worker leases/delivers/acks. The in-memory default is
-single-node; injecting a shared, durable queue (Redis/SQS/DB) plus a
-`SubscriptionStore` and running `EventsRuntime.startDeliveryWorker` on each node
-makes webhook delivery node-agnostic (any node delivers; a crashed node's leased
-job is re-leased) — mirroring the `TaskStore`/`TaskDispatcher` split.
+subscription, and the periodic worker `enableEvents` starts (every
+`EventsOptions.workerInterval`) leases/delivers/acks — the same pass also expires
+poll leases, sweeps lapsed webhook subscriptions, and runs poll-driven webhook
+delivery for fetch-handler types. The in-memory default is single-node; injecting
+a shared, durable queue (Redis/SQS/DB) plus a `SubscriptionStore` makes webhook
+delivery node-agnostic (any node's worker delivers; a crashed node's leased job
+is re-leased) — mirroring the `TaskStore`/`TaskDispatcher` split.
 
 > **Guidance:** if your tools initiate elicitation/sampling/roots, or use the
 > 2025-era `resources/subscribe` push over HTTP, construct the server with

@@ -201,6 +201,7 @@ struct WebhookSubscription
 	string previousSecret; /// prior secret during rotation grace ("" if none)
 	long previousSecretGraceUntilMs; /// rotation grace deadline (0 if none)
 	Nullable!string cursor; /// last safe-to-persist watermark the server computed
+	Nullable!string fetchCursor; /// position the poll-driven loop has fetched up to (check-backed types)
 	bool noExpiry; /// true => never lapses (server-managed lifetime)
 	long expiresAtMs; /// expiry (ms since epoch) when !noExpiry
 	bool active = true; /// false => delivery suspended after repeated failures
@@ -234,6 +235,8 @@ struct WebhookSubscription
 		}
 		if (!cursor.isNull)
 			j["cursor"] = cursor.get;
+		if (!fetchCursor.isNull)
+			j["fetchCursor"] = fetchCursor.get;
 		j["noExpiry"] = noExpiry;
 		j["expiresAtMs"] = expiresAtMs;
 		j["active"] = active;
@@ -267,6 +270,8 @@ struct WebhookSubscription
 		s.previousSecretGraceUntilMs = j.getOr("previousSecretGraceUntilMs", 0L);
 		if ("cursor" in j && j["cursor"].type == Json.Type.string)
 			s.cursor = j["cursor"].get!string;
+		if ("fetchCursor" in j && j["fetchCursor"].type == Json.Type.string)
+			s.fetchCursor = j["fetchCursor"].get!string;
 		s.noExpiry = j.getOr("noExpiry", false);
 		s.expiresAtMs = j.getOr("expiresAtMs", 0L);
 		s.active = j.getOr("active", true);
@@ -408,24 +413,33 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 	{
 		Json job;
 		long leasedUntilMs;
+		ulong seq; /// enqueue order, so a lease hands jobs out first-in first-out
 	}
 
 	private Entry[string] entries_;
+	private ulong nextSeq_;
 
 	void enqueue(Delivery job) @safe
 	{
-		entries_[job.jobId] = Entry(job.toJson(), 0);
+		entries_[job.jobId] = Entry(job.toJson(), 0, nextSeq_++);
 	}
 
 	Delivery[] lease(long nowMs, long leaseMs) @safe
 	{
-		Delivery[] result;
+		import std.algorithm : sort;
+
+		string[] ready;
 		foreach (id, ref e; entries_)
 			if (e.leasedUntilMs <= nowMs)
-			{
-				e.leasedUntilMs = nowMs + leaseMs;
-				result ~= Delivery.fromJson(e.job);
-			}
+				ready ~= id;
+		ready.sort!((a, b) => entries_[a].seq < entries_[b].seq);
+		Delivery[] result;
+		foreach (id; ready)
+		{
+			auto e = id in entries_;
+			e.leasedUntilMs = nowMs + leaseMs;
+			result ~= Delivery.fromJson(e.job);
+		}
 		return result;
 	}
 
@@ -453,6 +467,16 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+unittest  // the in-memory delivery queue leases ready jobs in enqueue order
+{
+	auto q = new InMemoryDeliveryQueue();
+	foreach (id; ["c", "a", "b"])
+		q.enqueue(Delivery(id, "s", EventOccurrence(id, "n", "t"), 0));
+	auto leased = q.lease(0, 1000);
+	assert(leased.length == 3);
+	assert(leased[0].jobId == "c" && leased[1].jobId == "a" && leased[2].jobId == "b");
+}
 
 unittest  // EmitBuffer bootstrap returns no events and the head cursor
 {

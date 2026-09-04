@@ -1070,6 +1070,14 @@ final class McpServer : ServerCore
 		eventsRuntime_.onListChanged(() @safe {
 			notify(eventsListChangedNotification);
 		});
+		// The periodic worker expires poll leases, sweeps lapsed webhook
+		// subscriptions, runs poll-driven webhook delivery, and drains the outbox.
+		// Unit tests drive the runtime's passes directly.
+		version (unittest)
+		{
+		}
+		else if (opts.workerInterval > Duration.zero)
+			eventsRuntime_.startDeliveryWorker(opts.workerInterval);
 		eventsEnabled_ = true;
 		Json settings = Json.emptyObject;
 		settings["listChanged"] = true;
