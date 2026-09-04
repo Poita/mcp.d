@@ -649,11 +649,18 @@ remains for runtime-defined types.
 
 On the **client**, `client.eventsSupported()` reports the negotiated extension and
 `listEvents()` enumerates types. For consuming a subscription, prefer the **managed
-layer**: `subscribePoll(PollParams, onEvent, onControl)`, `subscribeStream(StreamParams, …)`,
-and `subscribeWebhook(WebhookReceiver, SubscribeParams, …)` each return one
-mode-neutral `EventSubscription` handle — the SDK runs the poll loop (pacing by
-`nextPollMs`, threading the cursor, signalling gaps), demuxes the push stream, or
-keeps the webhook grant refreshed before it lapses; `sub.cursor()` exposes the live
+layer**: `subscribeEvents(name, SubscribeOptions, onEvent, onControl)` looks the
+type up, intersects its advertised `delivery` with the client's
+`EventClientSettings.preferredModes` (webhook when a `webhook` receiver is
+configured, then push, then poll; `NoCompatibleDeliveryMode` when nothing fits, or
+force one via `SubscribeOptions.delivery`), and returns one mode-neutral
+`EventSubscription` handle (`sub.mode()` reports the choice). The per-mode
+`subscribePoll`/`subscribeStream`/`subscribeWebhook` factories return the same
+handle. The SDK runs the poll loop (pacing by `nextPollMs` above a configurable
+floor, default 1 s), demuxes the push stream and reopens it from the last cursor
+when no frame arrives for `streamDeadAfter` (default 60 s), keeps the webhook grant
+refreshed before it lapses (and, for a no-expiry grant, at a health-check cadence),
+deduplicates by `eventId`, and signals gaps; `sub.cursor()` exposes the live
 watermark for resume and `sub.cancel()` tears the subscription down. The low-level
 `pollEvents(...)`/`streamEvents(...)`/`subscribeWebhookEvents(...)` round-trips
 remain for callers who want to drive the loop themselves. A `WebhookReceiver`
@@ -665,15 +672,37 @@ a `delivery.url` points at; `generateWhsecSecret()` mints the client-supplied
 both transports: poll and push through the server, and webhook by running the
 `WebhookReceiver` as a loopback HTTP listener the server signs and POSTs to.
 
+**Webhook delivery** follows the sketch end to end: a fresh `events/subscribe`
+replays from the client's cursor (the emit buffer for push sources, the fetch
+handler for pull sources) bounded by `maxAgeMs` and reports `truncated`; a refresh
+of a live subscription keeps the server's watermark; a lapsed one is recreated.
+Fetch-handler types are served over webhook by the periodic worker `enableEvents`
+starts, which also sweeps lapsed subscriptions and expires poll leases. The
+watermark advances to a position only once every earlier in-flight delivery has
+settled. Delivery is suspended on a sustained failure rate (`WebhookSuspension`:
+95 % over a 60-minute window with a 100-attempt minimum), events emitted while
+suspended queue until the refresh that reactivates it, retries are 5 attempts over
+about 7.5 minutes, and bodies over 256 KiB are abandoned with a `gap` envelope.
+
 **Webhook security** is implemented in full: `https`-only callback URLs;
 delivery-time SSRF hardening (the resolved IP is validated against the IANA
 special-purpose registries and pinned, with no redirect following); per-delivery
 HMAC (`v1,`) signing with the client-supplied secret and a secret-rotation
 dual-signing grace window; mandatory **endpoint verification** before delivery
-(challenge handshake, server allowlist, or out-of-band) cached per
-`(principal, url)`; bounded retry with exponential backoff (`410`/`413` are
-non-retryable) and a safe-to-persist watermark cursor; and `deliveryStatus`
-surfaced on refresh. Optional **server identity** asymmetric signing (`v1a,`,
+(a receiver-published `/.well-known/mcp-webhook-receiver.json`, the challenge
+handshake, server allowlist, or out-of-band) cached per `(principal, url)`;
+bounded retry with exponential backoff (`410`/`413` are non-retryable) and a
+safe-to-persist watermark cursor; and `deliveryStatus` surfaced on refresh.
+
+**Termination.** `rt.unregister(name)` removes a type and ends every subscription
+to it with `NotFound {kind: "event"}`; re-registering a type whose schema changed
+non-additively ends them with `Unsupported {reason: "schema_changed"}` (additive
+changes keep them); both send `notifications/events/list_changed`.
+`rt.terminatePrincipal(principal, name, error)` ends a principal's subscriptions
+once access is revoked. Push streams receive `notifications/events/terminated`
+followed by the final `StreamEventsResult`; webhook subscriptions a signed
+`terminated` envelope. A throwing fetch handler mid-stream sends a recoverable
+`notifications/events/error`, and a gap re-sends `active {truncated: true}`. Optional **server identity** asymmetric signing (`v1a,`,
 ed25519) is an **opt-in build**: the default library is OpenSSL-only, and the
 `library-ed25519` dub configuration adds `standardwebhooks:ed25519` (which links
 **libsodium**) and defines `version(MCPWebhookEd25519)`. Built that way, setting

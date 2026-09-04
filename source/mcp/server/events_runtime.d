@@ -625,8 +625,8 @@ final class EventsRuntime
 				|| existing.descriptor.description != reg.descriptor.description
 				|| existing.descriptor.title != reg.descriptor.title
 				|| existing.disabledModes != reg.disabledModes
-				|| existing.emitOnly != reg.emitOnly
-				|| canonicalJsonString(existing.descriptor.meta) != canonicalJsonString(reg.descriptor.meta);
+				|| existing.emitOnly != reg.emitOnly || canonicalJsonString(
+						existing.descriptor.meta) != canonicalJsonString(reg.descriptor.meta);
 		}
 		types_[name] = reg;
 		if (descriptorChanged)
@@ -919,11 +919,13 @@ final class EventsRuntime
 		{
 			Json err = (cast(McpException) e) !is null ? toErrorJson(cast(McpException) e)
 				: toErrorJson(internalError(e.msg));
-			s.deliver(eventsErrorNotification, withSubscriptionId(eventErrorParams(err), s.subscriptionId));
+			s.deliver(eventsErrorNotification,
+					withSubscriptionId(eventErrorParams(err), s.subscriptionId));
 			return;
 		}
 		if (r.truncated)
-			s.deliver(eventsActiveNotification, withSubscriptionId(activeParams(r.cursor, true), s.subscriptionId));
+			s.deliver(eventsActiveNotification,
+					withSubscriptionId(activeParams(r.cursor, true), s.subscriptionId));
 		foreach (ev; r.events)
 			s.deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), s.subscriptionId));
 		if (!r.cursor.isNull)
@@ -940,7 +942,8 @@ final class EventsRuntime
 			return;
 		s.terminated = true;
 		try
-			s.deliver(eventsTerminatedNotification, withSubscriptionId(terminatedParams(error), s.subscriptionId));
+			s.deliver(eventsTerminatedNotification,
+					withSubscriptionId(terminatedParams(error), s.subscriptionId));
 		catch (Exception)
 		{
 			// The client is already gone; the stream is released regardless.
@@ -1158,8 +1161,8 @@ final class EventsRuntime
 	/// null cursor bootstraps: nothing is replayed and the subscription starts from
 	/// the current position. Returns whether delivery starts later than the
 	/// supplied cursor (the response's `truncated`).
-	private bool backfillWebhook(ref WebhookSubscription sub, EventRegistration* reg,
-			Nullable!long maxAgeMs) @safe
+	private bool backfillWebhook(ref WebhookSubscription sub,
+			EventRegistration* reg, Nullable!long maxAgeMs) @safe
 	{
 		EventResult er;
 		if (regIsEmitOnly(reg))
@@ -1238,8 +1241,8 @@ final class EventsRuntime
 	// `transform` when `shape` is set (broadcast emits; a check function has
 	// already applied the subscription's arguments), and tracking the position for
 	// the watermark. Returns false when the filter dropped the event.
-	private bool enqueueForWebhook(WebhookSubscription sub, EventRegistration* reg,
-			EventOccurrence occ, bool shape) @safe
+	private bool enqueueForWebhook(WebhookSubscription sub,
+			EventRegistration* reg, EventOccurrence occ, bool shape) @safe
 	{
 		EventOccurrence shaped = occ;
 		if (shape)
@@ -1795,7 +1798,8 @@ final class EventsRuntime
 		auto entry = origin in wellKnown_;
 		if (entry is null || now - entry.fetchedAtMs >= opts_.wellKnownCacheTtl.total!"msecs")
 		{
-			wellKnown_[origin] = WellKnownReceivers(fetchWellKnownReceivers(scheme, host, port), now);
+			wellKnown_[origin] = WellKnownReceivers(fetchWellKnownReceivers(scheme,
+					host, port), now);
 			entry = origin in wellKnown_;
 		}
 		foreach (prefix; entry.prefixes)
@@ -1827,7 +1831,8 @@ final class EventsRuntime
 			j = parseJsonString(res.body);
 		catch (Exception)
 			return null;
-		if (j.type != Json.Type.object || "receivers" !in j || j["receivers"].type != Json.Type.array)
+		if (j.type != Json.Type.object || "receivers" !in j || j["receivers"].type
+				!= Json.Type.array)
 			return null;
 		string[] prefixes;
 		foreach (i; 0 .. j["receivers"].length)
@@ -2003,7 +2008,8 @@ final class EventsRuntime
 		sub.windowFailures++;
 		const policy = opts_.webhookSuspension;
 		if (policy.minAttempts > 0 && sub.windowAttempts >= policy.minAttempts
-				&& sub.windowFailures * 100L >= sub.windowAttempts * cast(long) policy.failureRatePercent)
+				&& sub.windowFailures * 100L >= sub.windowAttempts * cast(
+					long) policy.failureRatePercent)
 			sub.active = false;
 		webhookStore_.put(sub);
 	}
@@ -2138,7 +2144,8 @@ bool isAdditiveSchemaChange(Json before, Json after, bool inputSchema) @safe
 	if (oldProps.type != Json.Type.object || newProps.type != Json.Type.object)
 		return false;
 	foreach (prop; objectKeys(oldProps))
-		if (prop !in newProps || canonicalJsonString(newProps[prop]) != canonicalJsonString(oldProps[prop]))
+		if (prop !in newProps
+				|| canonicalJsonString(newProps[prop]) != canonicalJsonString(oldProps[prop]))
 			return false;
 	if (!inputSchema)
 		return true;
@@ -2538,8 +2545,8 @@ unittest  // advancePushStream delivers a recoverable error frame when the check
 	rt.register(reg);
 	string[] methods;
 	Json[] params;
-	auto handle = rt.openPushStream("email.received", Json.emptyObject, "u", Json(7),
-			(string m, Json p) @safe { methods ~= m; params ~= p; });
+	auto handle = rt.openPushStream("email.received", Json.emptyObject, "u",
+			Json(7), (string m, Json p) @safe { methods ~= m; params ~= p; });
 	rt.advancePushStream(handle.stream);
 	assert(methods == [eventsErrorNotification]);
 	assert(params[0]["error"]["code"].get!int == -32603);
@@ -2563,8 +2570,8 @@ unittest  // advancePushStream re-sends active{truncated:true} with the fresh cu
 	rt.register(reg);
 	string[] methods;
 	Json[] params;
-	auto handle = rt.openPushStream("email.received", Json.emptyObject, "u", Json(1),
-			(string m, Json p) @safe { methods ~= m; params ~= p; });
+	auto handle = rt.openPushStream("email.received", Json.emptyObject, "u",
+			Json(1), (string m, Json p) @safe { methods ~= m; params ~= p; });
 	rt.advancePushStream(handle.stream);
 	assert(methods == [eventsActiveNotification, eventsEventNotification]);
 	assert(params[0]["truncated"].get!bool && params[0]["cursor"].get!string == "c9");
@@ -2582,8 +2589,8 @@ unittest  // terminatePush sends a terminated frame, releases the subscription, 
 	rt.register(reg);
 	string[] methods;
 	Json[] params;
-	auto handle = rt.openPushStream("incident.created", Json.emptyObject, "u", Json(3),
-			(string m, Json p) @safe { methods ~= m; params ~= p; });
+	auto handle = rt.openPushStream("incident.created", Json.emptyObject, "u",
+			Json(3), (string m, Json p) @safe { methods ~= m; params ~= p; });
 	bool hooked;
 	handle.stream.onTerminated = () @safe { hooked = true; };
 	rt.terminatePush(handle.stream, toErrorJson(forbidden("Access revoked")));
@@ -2602,8 +2609,9 @@ unittest  // terminateEventType ends push streams and webhook subscriptions for 
 	auto ft = new FakeWebhookTransport();
 	auto rt = engineRuntime(ft);
 	string[] methods;
-	auto handle = rt.openPushStream("n", Json.emptyObject, "u", Json(1),
-			(string m, Json p) @safe { methods ~= m; });
+	rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		methods ~= m;
+	});
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 	rt.terminateEventType("n", toErrorJson(notFound("removed", "event")));
 	assert(methods == [eventsTerminatedNotification]);
@@ -2619,8 +2627,12 @@ unittest  // terminatePrincipal ends only that principal's subscriptions
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
 	string[] a, b;
-	rt.openPushStream("n", Json.emptyObject, "alice", Json(1), (string m, Json p) @safe { a ~= m; });
-	rt.openPushStream("n", Json.emptyObject, "bob", Json(2), (string m, Json p) @safe { b ~= m; });
+	rt.openPushStream("n", Json.emptyObject, "alice", Json(1), (string m, Json p) @safe {
+		a ~= m;
+	});
+	rt.openPushStream("n", Json.emptyObject, "bob", Json(2), (string m, Json p) @safe {
+		b ~= m;
+	});
 	rt.terminatePrincipal("alice", "", toErrorJson(forbidden("revoked")));
 	assert(a == [eventsTerminatedNotification]);
 	assert(b.length == 0);
@@ -2790,11 +2802,14 @@ unittest  // lifecycle is refcounted across modes: fires once per (principal,nam
 
 unittest  // isAdditiveSchemaChange accepts a new optional property and rejects removal/retyping
 {
-	auto before = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}`);
+	auto before = parseJsonString(
+			`{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}`);
 	auto plusOptional = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"integer"}},"required":["a"]}`);
 	auto removed = parseJsonString(`{"type":"object","properties":{}}`);
-	auto retyped = parseJsonString(`{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]}`);
-	auto narrowed = parseJsonString(`{"type":"object","properties":{"a":{"type":"string","enum":["x"]}},"required":["a"]}`);
+	auto retyped = parseJsonString(
+			`{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]}`);
+	auto narrowed = parseJsonString(
+			`{"type":"object","properties":{"a":{"type":"string","enum":["x"]}},"required":["a"]}`);
 	assert(isAdditiveSchemaChange(before, plusOptional, true));
 	assert(isAdditiveSchemaChange(before, plusOptional, false));
 	assert(!isAdditiveSchemaChange(before, removed, false));
@@ -2836,7 +2851,8 @@ unittest  // unregister ends every subscription with NotFound{kind:event} and no
 
 	bool threw;
 	try
-		rt.poll("n", Json.emptyObject, "", Nullable!string.init, Nullable!long.init, Nullable!long.init);
+		rt.poll("n", Json.emptyObject, "", Nullable!string.init,
+				Nullable!long.init, Nullable!long.init);
 	catch (McpException e)
 		threw = e.code == ErrorCode.notFound;
 	assert(threw);
@@ -2848,7 +2864,8 @@ unittest  // re-registering with an incompatible payloadSchema terminates with U
 	int changed;
 	rt.onListChanged(() @safe { changed++; });
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
-	reg.descriptor.payloadSchema = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"}}}`);
+	reg.descriptor.payloadSchema = parseJsonString(
+			`{"type":"object","properties":{"a":{"type":"string"}}}`);
 	rt.register(reg);
 	assert(changed == 1); // a new type
 	string[] methods;
@@ -2860,7 +2877,8 @@ unittest  // re-registering with an incompatible payloadSchema terminates with U
 	rt.register(reg); // identical: nothing happens
 	assert(methods.length == 0 && changed == 1);
 
-	reg.descriptor.payloadSchema = parseJsonString(`{"type":"object","properties":{"a":{"type":"integer"}}}`);
+	reg.descriptor.payloadSchema = parseJsonString(
+			`{"type":"object","properties":{"a":{"type":"integer"}}}`);
 	rt.register(reg);
 	assert(methods == [eventsTerminatedNotification]);
 	assert(params[0]["error"]["code"].get!int == -32014);
@@ -2876,11 +2894,15 @@ unittest  // an additive schema change keeps subscriptions but still notifies li
 	int changed;
 	rt.onListChanged(() @safe { changed++; });
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
-	reg.descriptor.inputSchema = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"}}}`);
+	reg.descriptor.inputSchema = parseJsonString(
+			`{"type":"object","properties":{"a":{"type":"string"}}}`);
 	rt.register(reg);
 	string[] methods;
-	rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe { methods ~= m; });
-	reg.descriptor.inputSchema = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"boolean"}}}`);
+	rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		methods ~= m;
+	});
+	reg.descriptor.inputSchema = parseJsonString(
+			`{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"boolean"}}}`);
 	rt.register(reg);
 	assert(methods.length == 0);
 	assert(changed == 2);
@@ -3911,7 +3933,8 @@ unittest  // events sharing a batch cursor settle the watermark together
 		if (ctx.isBootstrap())
 			return EventResult.empty("h0");
 		return EventResult.of([
-			EventOccurrence("m1", "email.received", "t"), EventOccurrence("m2", "email.received", "t")
+			EventOccurrence("m1", "email.received", "t"),
+			EventOccurrence("m2", "email.received", "t")
 		], "h1");
 	};
 	rt.register(reg);

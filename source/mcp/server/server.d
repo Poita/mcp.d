@@ -1076,8 +1076,11 @@ final class McpServer : ServerCore
 		version (unittest)
 		{
 		}
-		else if (opts.workerInterval > Duration.zero)
-			eventsRuntime_.startDeliveryWorker(opts.workerInterval);
+		else
+		{
+			if (opts.workerInterval > Duration.zero)
+				eventsRuntime_.startDeliveryWorker(opts.workerInterval);
+		}
 		eventsEnabled_ = true;
 		Json settings = Json.emptyObject;
 		settings["listChanged"] = true;
@@ -6140,7 +6143,8 @@ unittest  // a server-terminated stdio stream gets the terminated frame, then th
 	const opened = lines.length;
 	rt.terminatePrincipal("", "n", toErrorJson(forbidden("Access revoked")));
 	assert(lines.length == opened + 2);
-	assert(lines[opened].canFind("notifications/events/terminated") && lines[opened].canFind("-32012"));
+	assert(lines[opened].canFind("notifications/events/terminated")
+			&& lines[opened].canFind("-32012"));
 	auto fin = parseJsonString(lines[opened + 1]);
 	assert(fin["id"].get!int == 1 && fin["result"]["_meta"].type == Json.Type.object);
 	// The stream is gone: a later tick sends it no heartbeat.

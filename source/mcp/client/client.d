@@ -554,8 +554,8 @@ final class McpClient : ClientProtocol
 	/// `settings.clientInfo` applies; the HTTP-only fields are ignored.
 	static McpClient spawn(string[] command, ClientSettings settings = ClientSettings.init) @safe
 	{
-		return (new McpClient(spawnStdioTransport(command), settings.clientInfo))
-			.applySettings(settings);
+		return (new McpClient(spawnStdioTransport(command), settings.clientInfo)).applySettings(
+				settings);
 	}
 
 	/// Launch an MCP server binary that ships *next to this executable* and build a
@@ -2130,8 +2130,8 @@ final class McpClient : ClientProtocol
 			p.cursor = opts.cursor;
 			p.maxAgeMs = opts.maxAgeMs;
 			p.delivery.url = cfg.url;
-			p.delivery.secret = cfg.secretProvider !is null ? cfg.secretProvider()
-				: generateWhsecSecret();
+			p.delivery.secret = cfg.secretProvider !is null
+				? cfg.secretProvider() : generateWhsecSecret();
 			if (cfg.ttl > Duration.zero)
 			{
 				p.ttlMsPresent = true;
@@ -2145,7 +2145,8 @@ final class McpClient : ClientProtocol
 	/// advertised and usable), otherwise the first preferred mode the type
 	/// advertises that this client can use. Webhook is usable only with a
 	/// configured `webhook.url` and receiver. Throws `NoCompatibleDeliveryMode`.
-	DeliveryMode selectDeliveryMode(const EventType type, Nullable!DeliveryMode forced = Nullable!DeliveryMode.init) @safe
+	DeliveryMode selectDeliveryMode(const EventType type,
+			Nullable!DeliveryMode forced = Nullable!DeliveryMode.init) @safe
 	{
 		import std.algorithm : canFind;
 
@@ -2160,13 +2161,14 @@ final class McpClient : ClientProtocol
 		{
 			if (usable(forced.get))
 				return forced.get;
-			throw new NoCompatibleDeliveryMode("delivery mode " ~ deliveryModeToWire(forced.get)
-					~ " is not available for event type " ~ type.name);
+			throw new NoCompatibleDeliveryMode("delivery mode " ~ deliveryModeToWire(
+					forced.get) ~ " is not available for event type " ~ type.name);
 		}
 		foreach (m; eventSettings_.preferredModes)
 			if (usable(m))
 				return m;
-		throw new NoCompatibleDeliveryMode("no compatible delivery mode for event type " ~ type.name);
+		throw new NoCompatibleDeliveryMode("no compatible delivery mode for event type " ~ type
+				.name);
 	}
 
 	/// Subscribe to an event type in POLL mode and have the SDK run the loop. Each
@@ -2369,7 +2371,9 @@ final class McpClient : ClientProtocol
 				return onEventNowForTest();
 		import core.time : MonoTime;
 
-		return () @trusted { return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000); }();
+		return () @trusted {
+			return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
+		}();
 	}
 
 	version (unittest) package void delegate(Duration) @safe onStreamWatchSleepForTest;
@@ -7175,7 +7179,9 @@ unittest  // the poll loop delivers a redelivered eventId only once
 unittest  // selectDeliveryMode prefers webhook, then push, then poll among advertised modes
 {
 	auto c = new McpClient(new RecordingClientTransport());
-	EventType all = EventType("t", "", "", [DeliveryMode.poll, DeliveryMode.push, DeliveryMode.webhook]);
+	EventType all = EventType("t", "", "", [
+		DeliveryMode.poll, DeliveryMode.push, DeliveryMode.webhook
+	]);
 	assert(c.selectDeliveryMode(all) == DeliveryMode.push); // no webhook config
 
 	EventClientSettings es;
@@ -7230,7 +7236,11 @@ unittest  // subscribeEvents looks the type up and opens a push stream for a pus
 	c.onRpcForTest = (string method, Json params) @safe {
 		assert(method == "events/list");
 		EventListResult r;
-		r.events = [EventType("incident.created", "", "", [DeliveryMode.poll, DeliveryMode.push])];
+		r.events = [
+			EventType("incident.created", "", "", [
+				DeliveryMode.poll, DeliveryMode.push
+			])
+		];
 		return r.toJson();
 	};
 	SubscribeOptions o;
@@ -7273,7 +7283,11 @@ unittest  // subscribeEvents in webhook mode mints a secret, registers the recei
 		if (method == "events/list")
 		{
 			EventListResult r;
-			r.events = [EventType("incident.created", "", "", [DeliveryMode.webhook, DeliveryMode.poll])];
+			r.events = [
+				EventType("incident.created", "", "", [
+					DeliveryMode.webhook, DeliveryMode.poll
+				])
+			];
 			return r.toJson();
 		}
 		assert(method == "events/subscribe");
@@ -7349,7 +7363,7 @@ unittest  // a managed push stream drops an occurrence whose eventId was already
 					"name": Json("incident.created"),
 					"timestamp": Json("t"),
 					"data": Json.emptyObject
-		]), Json(1)))));
+	]), Json(1)))));
 	assert(events == 1);
 	assert(sub.active);
 }
@@ -7424,7 +7438,9 @@ unittest  // reconnection is disabled by a zero streamDeadAfter
 	es.streamDeadAfter = Duration.zero;
 	c.eventSettings = es;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
-	c.onStreamWatchSleepForTest = (Duration d) @safe { assert(false, "must not sleep"); };
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		assert(false, "must not sleep");
+	};
 	c.runStreamWatchdog(sub);
 	assert(t.listens.length == 1 && sub.active);
 }
@@ -7529,13 +7545,18 @@ unittest  // disabling the health-check interval ends the loop for a no-expiry g
 	es.noExpiryRefreshInterval = Duration.zero;
 	c.eventSettings = es;
 	int subs;
-	c.onRpcForTest = (string method, Json params) @safe { subs++; return Json.emptyObject; };
+	c.onRpcForTest = (string method, Json params) @safe {
+		subs++;
+		return Json.emptyObject;
+	};
 	auto sub = new EventSubscription();
 	SubscribeParams sp;
 	sp.name = "incident.created";
 	SubscribeResult first;
 	first.id = "sub_x";
-	c.onWebhookRefreshSleepForTest = (SubscribeResult r) @safe { assert(false, "must not sleep"); };
+	c.onWebhookRefreshSleepForTest = (SubscribeResult r) @safe {
+		assert(false, "must not sleep");
+	};
 	c.runWebhookRefreshLoop(sub, sp, first);
 	assert(subs == 0 && sub.active);
 }
