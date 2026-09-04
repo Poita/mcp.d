@@ -191,6 +191,11 @@ struct EventClientSettings
 	/// Floor applied to the server's `nextPollMs`, so a misbehaving server cannot
 	/// drive a tight poll loop.
 	Duration pollFloor = 1.seconds;
+
+	/// How many recent `eventId`s each managed subscription remembers, so an
+	/// occurrence redelivered across a reconnect or replay reaches `onEvent` once.
+	/// Zero disables deduplication.
+	size_t dedupWindow = 10_000;
 }
 
 /// A Model Context Protocol client, transport-agnostic.
@@ -2036,6 +2041,7 @@ final class McpClient : ClientProtocol
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
 		auto sub = new EventSubscription();
+		sub.dedupCapacity(eventSettings_.dedupWindow);
 		sub.advanceCursor(p.cursor);
 		spawnEventTask(() @safe { runPollLoop(sub, p, onEvent, onControl); });
 		return sub;
@@ -2075,6 +2081,8 @@ final class McpClient : ClientProtocol
 			{
 				if (sub.isCancelled())
 					return;
+				if (sub.alreadySeen(occ.eventId))
+					continue;
 				if (onEvent !is null)
 					onEvent(occ);
 			}
@@ -2106,9 +2114,12 @@ final class McpClient : ClientProtocol
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
 		auto sub = new EventSubscription();
+		sub.dedupCapacity(eventSettings_.dedupWindow);
 		sub.advanceCursor(p.cursor);
 		auto stream = streamEvents(p.name, (EventOccurrence o) @safe {
 			sub.advanceCursor(o.cursor);
+			if (sub.alreadySeen(o.eventId))
+				return;
 			if (onEvent !is null)
 				onEvent(o);
 		}, (EventControl c) @safe {
@@ -6889,6 +6900,30 @@ unittest  // the poll floor is configurable via EventClientSettings
 	assert(slept == 5.seconds);
 }
 
+unittest  // the poll loop delivers a redelivered eventId only once
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		PollResult r;
+		r.events ~= EventOccurrence("e1", "incident.created", "t"); // same id every poll
+		r.cursor = "c";
+		return r.toJson();
+	};
+	int got;
+	auto sub = new EventSubscription();
+	sub.dedupCapacity(100);
+	c.onEventPollSleepForTest = (Duration d) @safe {
+		if (polls == 2)
+			sub.cancel();
+	};
+	c.runPollLoop(sub, PollParams("incident.created"), (EventOccurrence o) @safe {
+		got++;
+	}, null);
+	assert(polls == 2 && got == 1);
+}
+
 unittest  // subscribePoll surfaces a poll error as a typed control and ends the subscription
 {
 	auto c = new McpClient(new RecordingClientTransport());
@@ -6928,6 +6963,25 @@ unittest  // subscribeStream tracks the cursor and ends the handle on a terminat
 	c.dispatchInbound(Message(makeNotification(eventsTerminatedNotification,
 			withSubscriptionId(Json(["error": Json(["code": Json(-32012)])]), Json(1)))));
 	assert(!sub.active);
+}
+
+unittest  // a managed push stream drops an occurrence whose eventId was already delivered
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	int events;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
+		events++;
+	});
+	foreach (_; 0 .. 2)
+		c.dispatchInbound(Message(makeNotification(eventsEventNotification,
+				withSubscriptionId(Json([
+					"eventId": Json("dup"),
+					"name": Json("incident.created"),
+					"timestamp": Json("t"),
+					"data": Json.emptyObject
+		]), Json(1)))));
+	assert(events == 1);
+	assert(sub.active);
 }
 
 unittest  // cancelling a managed stream stops delivery

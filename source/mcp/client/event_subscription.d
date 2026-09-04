@@ -19,6 +19,12 @@ final class EventSubscription
 	private bool terminated_;
 	private Nullable!string cursor_;
 	private void delegate() @safe nothrow teardown_;
+	// Bounded `eventId` memory for deduplication: a fixed ring of the most recent
+	// ids plus a set for O(1) lookup. When the ring wraps, the id it overwrites is
+	// forgotten. A zero capacity disables deduplication.
+	private bool[string] seen_;
+	private string[] seenRing_;
+	private size_t seenHead_;
 
 	/// The latest safe-to-persist watermark seen on this subscription — from a poll
 	/// result, a delivered occurrence, or an `active`/`heartbeat`/`gap` control.
@@ -48,6 +54,33 @@ final class EventSubscription
 	}
 
 	// --- factory/loop seams (package-visible) ------------------------------
+
+	/// Size the dedup window: how many recent `eventId`s this subscription
+	/// remembers. Zero disables deduplication.
+	package void dedupCapacity(size_t cap) @safe
+	{
+		seenRing_ = new string[](cap);
+		seenHead_ = 0;
+		seen_ = null;
+	}
+
+	/// Whether `eventId` was already delivered on this subscription. A new id is
+	/// recorded (evicting the oldest once the window is full). An empty id is never
+	/// a duplicate — there is nothing to match on.
+	package bool alreadySeen(string eventId) @safe
+	{
+		if (eventId.length == 0 || seenRing_.length == 0)
+			return false;
+		if ((eventId in seen_) !is null)
+			return true;
+		const evicted = seenRing_[seenHead_];
+		if (evicted.length)
+			seen_.remove(evicted);
+		seenRing_[seenHead_] = eventId;
+		seenHead_ = (seenHead_ + 1) % seenRing_.length;
+		seen_[eventId] = true;
+		return false;
+	}
 
 	/// Advance the watermark, ignoring a null (a null cursor never regresses it).
 	package void advanceCursor(Nullable!string c) @safe
@@ -97,6 +130,34 @@ unittest  // cancel is idempotent and runs the teardown exactly once
 	s.cancel();
 	assert(!s.active);
 	assert(n == 1);
+}
+
+unittest  // alreadySeen reports a repeated eventId and ignores empty ids
+{
+	auto s = new EventSubscription();
+	s.dedupCapacity(8);
+	assert(!s.alreadySeen("e1"));
+	assert(s.alreadySeen("e1"));
+	assert(!s.alreadySeen(""));
+	assert(!s.alreadySeen(""));
+}
+
+unittest  // the dedup window forgets the oldest id once it wraps
+{
+	auto s = new EventSubscription();
+	s.dedupCapacity(2);
+	assert(!s.alreadySeen("a"));
+	assert(!s.alreadySeen("b"));
+	assert(!s.alreadySeen("c")); // evicts "a"
+	assert(!s.alreadySeen("a")); // forgotten, so delivered again
+	assert(s.alreadySeen("c"));
+}
+
+unittest  // a zero dedup capacity disables deduplication
+{
+	auto s = new EventSubscription();
+	assert(!s.alreadySeen("e1"));
+	assert(!s.alreadySeen("e1"));
 }
 
 unittest  // a terminated control ends the subscription without a cancel
