@@ -334,9 +334,10 @@ struct EventsOptions
 	string[] callbackAllowlist; /// callback URL prefixes treated as pre-verified
 	bool allowPrivateCallbackHosts; /// permit non-globally-routable callback IPs (tests/dev)
 	string assumePrincipal; /// when set, requests with no authenticated principal are treated as this one
-	int webhookMaxAttempts = 4; /// bounded delivery attempts per event
+	int webhookMaxAttempts = 5; /// bounded delivery attempts per event
+	size_t webhookMaxBodyBytes = 256 * 1024; /// delivery bodies over this are abandoned (with a gap signal), never POSTed
 	WebhookSuspension webhookSuspension; /// failure-rate policy that suspends delivery (active=false)
-	Duration webhookRetryBase = 2.seconds; /// exponential-backoff base between attempts
+	Duration webhookRetryBase = 30.seconds; /// exponential-backoff base between attempts (5 attempts span 7.5 min)
 	DeliveryQueue deliveryQueue; /// webhook outbox (default in-memory); shared/durable for multi-node
 	Duration deliveryLease = 1.minutes; /// how long a worker claims a leased delivery job
 	Duration webhookHttpTimeout = 10.seconds; /// per-attempt HTTP bound (default transport); also the worst-case-retry budget input
@@ -1267,6 +1268,16 @@ final class EventsRuntime
 		{
 			recordFailure(subId, DeliveryErrorCategory.challengeFailed);
 			return; // not acked: the endpoint may verify before the next lease
+		}
+		// A body over the delivery-profile ceiling would be rejected with 413 by a
+		// conformant receiver, so it is abandoned up front: its position settles
+		// for the watermark and a gap envelope tells the client it was skipped.
+		if (occ.toJson().toString().length > opts_.webhookMaxBodyBytes)
+		{
+			recordSuccess(subId, occ.cursor);
+			signalGap(s0.get, occ);
+			deliveryQueue_.ack(job.jobId);
+			return;
 		}
 		int attempt = job.attempt;
 		for (;;)
@@ -3003,7 +3014,7 @@ unittest  // a delivery to a non-globally-routable callback is rejected before a
 unittest  // a refresh after a delivery failure surfaces deliveryStatus.lastError
 {
 	auto ft = new FakeWebhookTransport();
-	ft.eventStatuses = [503, 503, 503, 503]; // exhaust the default 4 attempts
+	ft.eventStatuses = [503, 503, 503, 503, 503]; // exhaust the default 5 attempts
 	auto rt = engineRuntime(ft);
 	auto p = webhookSub("n", "https://proxy/hooks");
 	rt.subscribeWebhook(p, "user-1");
@@ -3277,21 +3288,47 @@ unittest  // attempt persistence: a job re-leased mid-retry does not restart att
 	rt.register(reg);
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 
-	// Enqueue a job that has already made 3 attempts on a prior (crashed) lease.
+	// Enqueue a job one attempt short of the cap on a prior (crashed) lease.
 	auto occ = EventOccurrence("evt_1", "n", "t");
 	occ.cursor = "5";
-	queue.enqueue(Delivery(r.id ~ "/evt_1", r.id, occ, 3));
+	queue.enqueue(Delivery(r.id ~ "/evt_1", r.id, occ, o.webhookMaxAttempts - 1));
 	rt.drainDeliveries();
-	// Resuming from attempt 3, only one more attempt is made before the cap (4).
+	// Resuming from the persisted count, only one more attempt is made before the cap.
 	assert(ft.eventPosts().length == 1);
 	// The job is settled (acked) and emits a gap, not retried forever.
+	assert(controlPostsOf(ft, "gap").length == 1);
+}
+
+unittest  // the default retry schedule is 3-5 attempts spread over at most 15 minutes
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	EventsOptions defaults;
+	assert(defaults.webhookMaxAttempts >= 3 && defaults.webhookMaxAttempts <= 5);
+	Duration total;
+	foreach (attempt; 1 .. defaults.webhookMaxAttempts)
+		total += rt.backoffFor(attempt);
+	assert(total <= 15.minutes && total >= 5.minutes);
+}
+
+unittest  // an oversize delivery body is abandoned with a gap signal, never POSTed
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	import std.array : replicate;
+
+	EventOccurrence big = EventOccurrence("evt_big", "n", "t");
+	big.data = Json(["blob": Json("a".replicate(300 * 1024))]);
+	rt.emit(big);
+	assert(ft.eventPosts().length == 0);
 	assert(controlPostsOf(ft, "gap").length == 1);
 }
 
 unittest  // gap-on-exhaustion: a signed gap envelope is posted when attempts run out
 {
 	auto ft = new FakeWebhookTransport();
-	ft.eventStatuses = [503, 503, 503, 503];
+	ft.eventStatuses = [503, 503, 503, 503, 503];
 	auto rt = engineRuntime(ft);
 	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
