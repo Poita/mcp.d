@@ -1,6 +1,6 @@
 module mcp.client.client;
 
-import core.time : Duration, seconds, msecs;
+import core.time : Duration, seconds, msecs, hours;
 import std.algorithm : canFind, startsWith;
 import std.datetime : Clock, SysTime;
 import std.typecons : Nullable, nullable;
@@ -196,6 +196,12 @@ struct EventClientSettings
 	/// occurrence redelivered across a reconnect or replay reaches `onEvent` once.
 	/// Zero disables deduplication.
 	size_t dedupWindow = 10_000;
+
+	/// How often a webhook subscription granted no expiry is still refreshed: the
+	/// refresh response is where the cursor advances during quiet periods and where
+	/// `deliveryStatus` surfaces delivery problems. Zero disables these
+	/// health-check refreshes.
+	Duration noExpiryRefreshInterval = 1.hours;
 }
 
 /// A Model Context Protocol client, transport-agnostic.
@@ -2136,8 +2142,9 @@ final class McpClient : ClientProtocol
 	/// Subscribe in WEBHOOK mode with the receiver wired automatically. Subscribes,
 	/// registers `rx` under the server-derived subscription id (so deliveries route
 	/// to `onEvent`/`onControl` without the placeholder-then-re-register dance), and
-	/// — when the grant expires — runs a background loop that re-subscribes before
-	/// `refreshBefore` so deliveries never lapse silently. `cancel()` unsubscribes,
+	/// runs a background loop that re-subscribes before `refreshBefore` so
+	/// deliveries never lapse silently — or, for a no-expiry grant, at the
+	/// `noExpiryRefreshInterval` health-check cadence. `cancel()` unsubscribes,
 	/// deregisters the receiver, and stops the refresh loop.
 	EventSubscription subscribeWebhook(WebhookReceiver rx, SubscribeParams p,
 			void delegate(EventOccurrence) @safe onEvent,
@@ -2158,15 +2165,15 @@ final class McpClient : ClientProtocol
 			{
 			}
 		});
-		// A null `refreshBefore` is a no-expiry grant — no refresh loop needed.
-		if (!res.refreshBefore.isNull)
-			spawnEventTask(() @safe { runWebhookRefreshLoop(sub, p, res); });
+		spawnEventTask(() @safe { runWebhookRefreshLoop(sub, p, res); });
 		return sub;
 	}
 
-	/// The webhook TTL-refresh loop: sleeps until shortly before the current grant
-	/// expires, re-subscribes (refreshing the TTL and advancing the watermark), and
-	/// repeats until cancelled or the grant becomes no-expiry. Seam-driven for tests.
+	/// The webhook refresh loop: sleeps until shortly before the current grant
+	/// expires (or, for a no-expiry grant, for the health-check interval),
+	/// re-subscribes (refreshing the TTL and advancing the watermark), and repeats
+	/// until cancelled. A no-expiry grant with health checks disabled ends the loop:
+	/// correctness no longer depends on refreshing. Seam-driven for tests.
 	package void runWebhookRefreshLoop(EventSubscription sub, SubscribeParams p,
 			SubscribeResult first) @safe
 	{
@@ -2174,6 +2181,8 @@ final class McpClient : ClientProtocol
 		auto res = first;
 		while (!sub.isCancelled())
 		{
+			if (res.refreshBefore.isNull && eventSettings_.noExpiryRefreshInterval <= Duration.zero)
+				return;
 			webhookRefreshSleep(res);
 			if (sub.isCancelled())
 				return;
@@ -2182,8 +2191,6 @@ final class McpClient : ClientProtocol
 				cur.cursor = sub.cursor();
 				res = subscribeWebhookEvents(cur);
 				sub.advanceCursor(res.cursor);
-				if (res.refreshBefore.isNull)
-					return; // grant is now no-expiry; stop refreshing
 			}
 			catch (Exception)
 			{
@@ -2250,13 +2257,14 @@ final class McpClient : ClientProtocol
 	}
 
 	/// How long to wait before refreshing a webhook grant: ~80% of the way to
-	/// `refreshBefore` (with a floor), or a default when the grant time is unparsable.
+	/// `refreshBefore` (with a floor), the health-check interval for a no-expiry
+	/// grant, or a default when the grant time is unparsable.
 	private Duration webhookRefreshDelay(SubscribeResult res) @safe
 	{
 		import std.datetime.systime : Clock, SysTime;
 
 		if (res.refreshBefore.isNull)
-			return defaultWebhookRefreshMs.msecs;
+			return eventSettings_.noExpiryRefreshInterval;
 		try
 		{
 			auto expiry = SysTime.fromISOExtString(res.refreshBefore.get);
@@ -7012,7 +7020,7 @@ unittest  // subscribeWebhook registers the receiver under the server id and tea
 		{
 			subs++;
 			SubscribeResult r;
-			r.id = "sub_x"; // null refreshBefore => no-expiry grant, no refresh loop
+			r.id = "sub_x"; // null refreshBefore => no-expiry grant
 			return r.toJson();
 		}
 		if (method == "events/unsubscribe")
@@ -7042,6 +7050,57 @@ unittest  // subscribeWebhook registers the receiver under the server id and tea
 	sub.cancel();
 	assert(unsubs == 1);
 	assert(rx.processDelivery("{}", known).status == 503); // deregistered
+}
+
+unittest  // a no-expiry grant still refreshes at the health-check cadence
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	int subs;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "events/subscribe")
+		{
+			subs++;
+			SubscribeResult r;
+			r.id = "sub_x"; // refreshBefore stays null: no expiry
+			r.cursor = "w" ~ (subs == 1 ? "1" : "2");
+			return r.toJson();
+		}
+		return Json.emptyObject;
+	};
+	auto sub = new EventSubscription();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+	SubscribeResult first;
+	first.id = "sub_x";
+	int sleeps;
+	c.onWebhookRefreshSleepForTest = (SubscribeResult r) @safe {
+		sleeps++;
+		if (sleeps == 3)
+			sub.cancel();
+	};
+	c.runWebhookRefreshLoop(sub, sp, first);
+	assert(subs == 2); // two health-check refreshes before the third sleep cancelled
+	assert(sub.cursor.get == "w2"); // the refresh response advanced the watermark
+	assert(c.webhookRefreshDelay(first) == 1.hours);
+}
+
+unittest  // disabling the health-check interval ends the loop for a no-expiry grant
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	EventClientSettings es;
+	es.noExpiryRefreshInterval = Duration.zero;
+	c.eventSettings = es;
+	int subs;
+	c.onRpcForTest = (string method, Json params) @safe { subs++; return Json.emptyObject; };
+	auto sub = new EventSubscription();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	SubscribeResult first;
+	first.id = "sub_x";
+	c.onWebhookRefreshSleepForTest = (SubscribeResult r) @safe { assert(false, "must not sleep"); };
+	c.runWebhookRefreshLoop(sub, sp, first);
+	assert(subs == 0 && sub.active);
 }
 
 unittest  // the webhook refresh loop re-subscribes before the grant expires
