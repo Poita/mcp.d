@@ -176,6 +176,21 @@ struct ClientSettings
 	/// shared (every client hits the same key). Empty (the default) treats the
 	/// store as per-client and is the right value for the default in-memory store.
 	string cachePartition = "";
+
+	/// Knobs for the managed Events-extension subscriptions (`subscribePoll`,
+	/// `subscribeStream`, `subscribeWebhook`, `subscribeEvents`).
+	EventClientSettings events;
+}
+
+/// Configuration for the client side of the MCP Events extension: how the
+/// managed poll loop paces itself, when a quiet push stream is declared dead,
+/// how often a no-expiry webhook grant is still refreshed, and how many
+/// `eventId`s each subscription remembers for deduplication.
+struct EventClientSettings
+{
+	/// Floor applied to the server's `nextPollMs`, so a misbehaving server cannot
+	/// drive a tight poll loop.
+	Duration pollFloor = 1.seconds;
 }
 
 /// A Model Context Protocol client, transport-agnostic.
@@ -425,13 +440,29 @@ final class McpClient : ClientProtocol
 	/// return it (for fluent use in the factories). A null `settings.cache` keeps
 	/// the constructor's default in-memory store; a non-null value (including
 	/// `noCache`) replaces it.
-	private McpClient applyCacheSettings(ClientSettings settings) @safe
+	private McpClient applySettings(ClientSettings settings) @safe
 	{
 		if (settings.cache !is null)
 			cacheStore_ = settings.cache;
 		defaultCacheTtl_ = settings.defaultCacheTtl;
 		cachePartition_ = settings.cachePartition;
+		eventSettings_ = settings.events;
 		return this;
+	}
+
+	private EventClientSettings eventSettings_;
+
+	/// The Events-extension knobs in force for this client's managed
+	/// subscriptions. Settable after construction; loops read it on each iteration.
+	EventClientSettings eventSettings() @safe
+	{
+		return eventSettings_;
+	}
+
+	/// ditto
+	void eventSettings(EventClientSettings s) @safe
+	{
+		eventSettings_ = s;
 	}
 
 	/// Build a client over the Streamable HTTP transport at `url`. `settings`
@@ -442,7 +473,7 @@ final class McpClient : ClientProtocol
 	{
 		auto transport = new HttpClientTransport(url, settings.maxInFlight);
 		transport.setConnectTimeout(settings.connectTimeout);
-		return (new McpClient(transport, settings.clientInfo)).applyCacheSettings(settings);
+		return (new McpClient(transport, settings.clientInfo)).applySettings(settings);
 	}
 
 	/// Build a client over the stdio transport, exchanging newline-delimited
@@ -455,7 +486,7 @@ final class McpClient : ClientProtocol
 			void delegate(string) @safe writeLine, ClientSettings settings = ClientSettings.init) @safe
 	{
 		return (new McpClient(new StdioClientTransport(readLine, writeLine), settings.clientInfo))
-			.applyCacheSettings(settings);
+			.applySettings(settings);
 	}
 
 	/// Launch an MCP server as a subprocess and build a client over its
@@ -467,7 +498,7 @@ final class McpClient : ClientProtocol
 	static McpClient spawn(string[] command, ClientSettings settings = ClientSettings.init) @safe
 	{
 		return (new McpClient(spawnStdioTransport(command), settings.clientInfo))
-			.applyCacheSettings(settings);
+			.applySettings(settings);
 	}
 
 	/// Launch an MCP server binary that ships *next to this executable* and build a
@@ -2173,13 +2204,14 @@ final class McpClient : ClientProtocol
 		}
 	}
 
-	/// Sleep between event polls, clamped to a floor so a misbehaving server can't
-	/// drive a hot loop. A test seam mirrors `taskPollSleep`.
+	/// Sleep between event polls, clamped to `eventSettings.pollFloor` so a
+	/// misbehaving server can't drive a hot loop. A test seam mirrors `taskPollSleep`.
 	private void eventPollSleep(long nextPollMs) @safe
 	{
-		long ms = nextPollMs > 0 ? nextPollMs : defaultEventPollMs;
-		if (ms < minEventPollMs)
-			ms = minEventPollMs;
+		const floorMs = eventSettings_.pollFloor.total!"msecs";
+		long ms = nextPollMs > 0 ? nextPollMs : floorMs;
+		if (ms < floorMs)
+			ms = floorMs;
 		version (unittest)
 			if (onEventPollSleepForTest !is null)
 			{
@@ -2230,8 +2262,6 @@ final class McpClient : ClientProtocol
 			return defaultWebhookRefreshMs.msecs;
 	}
 
-	private enum long minEventPollMs = 250;
-	private enum long defaultEventPollMs = 1000;
 	private enum long minWebhookRefreshMs = 1000;
 	private enum long defaultWebhookRefreshMs = 60_000;
 
@@ -6822,6 +6852,41 @@ unittest  // subscribePoll's loop: delivers events, advances the cursor, drains 
 	assert(got.length == 2 && got[0].eventId == "e1" && got[1].eventId == "e2");
 	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.gap);
 	assert(sub.cursor.get == "c2");
+}
+
+unittest  // the poll loop clamps a tiny nextPollMs up to the default 1000 ms floor
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.onRpcForTest = (string method, Json params) @safe {
+		PollResult r;
+		r.cursor = "c";
+		r.nextPollMs = 10;
+		return r.toJson();
+	};
+	Duration slept;
+	auto sub = new EventSubscription();
+	c.onEventPollSleepForTest = (Duration d) @safe { slept = d; sub.cancel(); };
+	c.runPollLoop(sub, PollParams("incident.created"), null, null);
+	assert(slept == 1.seconds);
+}
+
+unittest  // the poll floor is configurable via EventClientSettings
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	EventClientSettings es;
+	es.pollFloor = 5.seconds;
+	c.eventSettings = es;
+	c.onRpcForTest = (string method, Json params) @safe {
+		PollResult r;
+		r.cursor = "c";
+		r.nextPollMs = 2_000;
+		return r.toJson();
+	};
+	Duration slept;
+	auto sub = new EventSubscription();
+	c.onEventPollSleepForTest = (Duration d) @safe { slept = d; sub.cancel(); };
+	c.runPollLoop(sub, PollParams("incident.created"), null, null);
+	assert(slept == 5.seconds);
 }
 
 unittest  // subscribePoll surfaces a poll error as a typed control and ends the subscription
