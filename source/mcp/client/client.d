@@ -197,6 +197,12 @@ struct EventClientSettings
 	/// Zero disables deduplication.
 	size_t dedupWindow = 10_000;
 
+	/// How long a managed push stream may go without any frame (event or
+	/// heartbeat) before it is declared dead and reopened with the last cursor.
+	/// Servers heartbeat at least every 30 s, so twice that is the default. Zero
+	/// disables reconnection.
+	Duration streamDeadAfter = 60.seconds;
+
 	/// How often a webhook subscription granted no expiry is still refreshed: the
 	/// refresh response is where the cursor advances during quiet periods and where
 	/// `deliveryStatus` surfaces delivery problems. Zero disables these
@@ -2110,34 +2116,135 @@ final class McpClient : ClientProtocol
 
 	/// Subscribe to an event type in PUSH mode with the unified handle. Wraps
 	/// `streamEvents`, tracking the watermark from each occurrence and control frame
-	/// and ending the handle on a `terminated` control. `cancel()` closes the
-	/// stream and deregisters its handlers.
-	///
-	/// Resume-on-disconnect is intentionally not attempted here: the transport
-	/// exposes no end-of-stream signal yet, so a dropped stream simply goes quiet.
-	/// A future transport `onEnd` hook would let this re-open with `cursor()`.
+	/// and ending the handle on a `terminated` control. A stream that goes quiet
+	/// for `eventSettings.streamDeadAfter` (no event, no heartbeat) is treated as
+	/// dead and reopened with the last-known cursor, so a dropped connection resumes
+	/// without a gap. `cancel()` closes the stream and deregisters its handlers.
 	EventSubscription subscribeStream(StreamParams p, void delegate(EventOccurrence) @safe onEvent,
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
 		auto sub = new EventSubscription();
 		sub.dedupCapacity(eventSettings_.dedupWindow);
 		sub.advanceCursor(p.cursor);
-		auto stream = streamEvents(p.name, (EventOccurrence o) @safe {
+		auto ms = new ManagedStream(p, onEvent, onControl);
+		openManagedStream(sub, ms, p.cursor);
+		managedStreams_[sub] = ms;
+		sub.onTeardown(() @safe nothrow{
+			ms.stream.close();
+			try
+				managedStreams_.remove(sub);
+			catch (Exception)
+			{
+			}
+		});
+		spawnEventTask(() @safe { runStreamWatchdog(sub); });
+		return sub;
+	}
+
+	// The live managed push streams, keyed by their subscription handle, so the
+	// watchdog (and tests) can reach a stream's reconnect state by handle.
+	private ManagedStream[EventSubscription] managedStreams_;
+
+	/// The state of one managed push stream: its parameters and handlers (so the
+	/// watchdog can reopen it), the currently open stream, and when the last frame
+	/// arrived (the liveness signal).
+	private static final class ManagedStream
+	{
+		StreamParams params;
+		void delegate(EventOccurrence) @safe onEvent;
+		void delegate(EventControl) @safe onControl;
+		SubscriptionStream stream;
+		long lastFrameMs;
+
+		this(StreamParams p, void delegate(EventOccurrence) @safe onEvent,
+				void delegate(EventControl) @safe onControl) @safe
+		{
+			params = p;
+			this.onEvent = onEvent;
+			this.onControl = onControl;
+		}
+	}
+
+	/// Open (or reopen) the `events/stream` behind a managed subscription from
+	/// `cursor`, binding frames to the subscription's watermark, dedup, and
+	/// terminal state before the caller's handlers.
+	private void openManagedStream(EventSubscription sub, ManagedStream ms, Nullable!string cursor) @safe
+	{
+		ms.lastFrameMs = eventNowMs();
+		ms.stream = streamEvents(ms.params.name, (EventOccurrence o) @safe {
+			ms.lastFrameMs = eventNowMs();
 			sub.advanceCursor(o.cursor);
 			if (sub.alreadySeen(o.eventId))
 				return;
-			if (onEvent !is null)
-				onEvent(o);
+			if (ms.onEvent !is null)
+				ms.onEvent(o);
 		}, (EventControl c) @safe {
+			ms.lastFrameMs = eventNowMs();
 			sub.advanceCursor(c.cursor);
 			if (c.kind == EventControlKind.terminated)
 				sub.markTerminated();
-			if (onControl !is null)
-				onControl(c);
-		}, p.arguments, p.cursor, p.maxAgeMs);
-		sub.onTeardown(() @safe nothrow{ stream.close(); });
-		return sub;
+			if (ms.onControl !is null)
+				ms.onControl(c);
+		}, ms.params.arguments, cursor, ms.params.maxAgeMs);
 	}
+
+	/// The push-stream liveness watchdog: wakes every `streamDeadAfter`, and if no
+	/// frame arrived in that window closes the stream and reopens it from the
+	/// subscription's last cursor. Ends when the subscription is cancelled or
+	/// terminated, or when reconnection is disabled. Seam-driven for tests.
+	package void runStreamWatchdog(EventSubscription sub) @safe
+	{
+		auto msp = sub in managedStreams_;
+		if (msp is null)
+			return;
+		auto ms = *msp;
+		while (sub.active)
+		{
+			const dead = eventSettings_.streamDeadAfter;
+			if (dead <= Duration.zero)
+				return;
+			streamWatchSleep(dead);
+			if (!sub.active)
+				return;
+			if (eventNowMs() - ms.lastFrameMs < dead.total!"msecs")
+				continue;
+			ms.stream.close();
+			try
+				openManagedStream(sub, ms, sub.cursor());
+			catch (Exception)
+			{
+				// Reopen failed (server unreachable): the next wake-up retries.
+			}
+		}
+	}
+
+	/// Sleep between watchdog checks. A test seam runs the loop synchronously.
+	private void streamWatchSleep(Duration d) @safe
+	{
+		version (unittest)
+			if (onStreamWatchSleepForTest !is null)
+			{
+				onStreamWatchSleepForTest(d);
+				return;
+			}
+		import vibe.core.core : sleep;
+
+		() @trusted { sleep(d); }();
+	}
+
+	/// Monotonic milliseconds for stream liveness. A test seam supplies the clock.
+	private long eventNowMs() @safe
+	{
+		version (unittest)
+			if (onEventNowForTest !is null)
+				return onEventNowForTest();
+		import core.time : MonoTime;
+
+		return () @trusted { return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000); }();
+	}
+
+	version (unittest) package void delegate(Duration) @safe onStreamWatchSleepForTest;
+	version (unittest) package long delegate() @safe onEventNowForTest;
 
 	/// Subscribe in WEBHOOK mode with the receiver wired automatically. Subscribes,
 	/// registers `rx` under the server-derived subscription id (so deliveries route
@@ -6270,8 +6377,11 @@ version (unittest)
 			legacyFallbackCalled = true;
 		}
 
+		Json[] listens; // every message passed to openListen, in order
+
 		SubscriptionStream openListen(Json message) @safe
 		{
+			listens ~= message;
 			auto cancelled = () @trusted { return new shared bool(false); }();
 			return new SubscriptionStream(cancelled);
 		}
@@ -6990,6 +7100,81 @@ unittest  // a managed push stream drops an occurrence whose eventId was already
 		]), Json(1)))));
 	assert(events == 1);
 	assert(sub.active);
+}
+
+unittest  // a quiet managed stream is reopened from the last cursor after streamDeadAfter
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	int events;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
+		events++;
+	});
+	assert(t.listens.length == 1);
+	c.dispatchInbound(Message(makeNotification(eventsEventNotification,
+			withSubscriptionId(Json([
+				"eventId": Json("e1"),
+				"name": Json("incident.created"),
+				"timestamp": Json("t"),
+				"data": Json.emptyObject,
+				"cursor": Json("c9")
+	]), Json(1)))));
+	assert(events == 1);
+
+	// First wake-up: a heartbeat landed recently, so the stream is alive.
+	// Second wake-up: nothing for over 60 s, so it is reopened from "c9".
+	int wakes;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		wakes++;
+		if (wakes == 1)
+		{
+			now = 30_000;
+			c.dispatchInbound(Message(makeNotification(eventsHeartbeatNotification,
+					withSubscriptionId(heartbeatParams(nullable("c9")), Json(1)))));
+			now = 59_000;
+		}
+		else if (wakes == 2)
+			now = 200_000;
+		else
+		{
+			// The reopened stream (request id 2) is live; the dead one (id 1) is not.
+			c.dispatchInbound(Message(makeNotification(eventsEventNotification,
+					withSubscriptionId(Json([
+						"eventId": Json("e2"),
+						"name": Json("incident.created"),
+						"timestamp": Json("t"),
+						"data": Json.emptyObject
+			]), Json(2)))));
+			c.dispatchInbound(Message(makeNotification(eventsEventNotification,
+					withSubscriptionId(Json([
+						"eventId": Json("e3"),
+						"name": Json("incident.created"),
+						"timestamp": Json("t"),
+						"data": Json.emptyObject
+			]), Json(1)))));
+			sub.cancel();
+		}
+	};
+	c.runStreamWatchdog(sub);
+	assert(wakes == 3);
+	assert(t.listens.length == 2); // reopened exactly once
+	assert(t.listens[1]["params"]["cursor"].get!string == "c9");
+	assert(events == 2);
+}
+
+unittest  // reconnection is disabled by a zero streamDeadAfter
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	EventClientSettings es;
+	es.streamDeadAfter = Duration.zero;
+	c.eventSettings = es;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	c.onStreamWatchSleepForTest = (Duration d) @safe { assert(false, "must not sleep"); };
+	c.runStreamWatchdog(sub);
+	assert(t.listens.length == 1 && sub.active);
 }
 
 unittest  // cancelling a managed stream stops delivery
