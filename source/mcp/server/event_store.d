@@ -208,7 +208,9 @@ struct WebhookSubscription
 	long lastDeliveryAtMs; /// last successful delivery (0 = never)
 	int lastErrorCat = -1; /// last DeliveryErrorCategory (-1 = none)
 	long failedSinceMs; /// when the current failure streak began (0 = healthy)
-	int failedAttempts; /// consecutive failed deliveries since the last success (drives suspension)
+	long windowStartMs; /// start of the current failure-rate sample window
+	int windowAttempts; /// delivery attempts in the window
+	int windowFailures; /// failed attempts in the window (drives suspension)
 
 	/// Whether the subscription has lapsed at `nowMs` (always false for no-expiry).
 	bool isExpired(long nowMs) const @safe pure nothrow
@@ -242,8 +244,12 @@ struct WebhookSubscription
 			j["lastErrorCat"] = lastErrorCat;
 		if (failedSinceMs)
 			j["failedSinceMs"] = failedSinceMs;
-		if (failedAttempts)
-			j["failedAttempts"] = failedAttempts;
+		if (windowAttempts)
+		{
+			j["windowStartMs"] = windowStartMs;
+			j["windowAttempts"] = windowAttempts;
+			j["windowFailures"] = windowFailures;
+		}
 		return j;
 	}
 
@@ -268,7 +274,9 @@ struct WebhookSubscription
 		s.lastDeliveryAtMs = j.getOr("lastDeliveryAtMs", 0L);
 		s.lastErrorCat = j.getOr("lastErrorCat", -1);
 		s.failedSinceMs = j.getOr("failedSinceMs", 0L);
-		s.failedAttempts = j.getOr("failedAttempts", 0);
+		s.windowStartMs = j.getOr("windowStartMs", 0L);
+		s.windowAttempts = j.getOr("windowAttempts", 0);
+		s.windowFailures = j.getOr("windowFailures", 0);
 		return s;
 	}
 }

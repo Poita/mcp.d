@@ -305,6 +305,19 @@ final class EventHandle(A, P)
 	}
 }
 
+/// When a webhook subscription's delivery is suspended: once at least
+/// `minAttempts` deliveries were attempted in the current `window` and the share
+/// that failed reached `failureRatePercent`. A rate over a meaningful sample means
+/// a brief endpoint blip does not suspend a healthy subscription and a low-traffic
+/// one is not suspended on a handful of failures. A successful refresh
+/// reactivates a suspended subscription. `minAttempts == 0` never suspends.
+struct WebhookSuspension
+{
+	Duration window = 60.minutes;
+	int minAttempts = 100;
+	int failureRatePercent = 95;
+}
+
 /// Tuning for the events runtime. Bundled per the project's settings-struct
 /// convention rather than spread across the factory's parameters.
 struct EventsOptions
@@ -322,7 +335,7 @@ struct EventsOptions
 	bool allowPrivateCallbackHosts; /// permit non-globally-routable callback IPs (tests/dev)
 	string assumePrincipal; /// when set, requests with no authenticated principal are treated as this one
 	int webhookMaxAttempts = 4; /// bounded delivery attempts per event
-	int webhookSuspendAfterFailures = 20; /// consecutive failed deliveries before a subscription is suspended (active=false); 0 = never suspend
+	WebhookSuspension webhookSuspension; /// failure-rate policy that suspends delivery (active=false)
 	Duration webhookRetryBase = 2.seconds; /// exponential-backoff base between attempts
 	DeliveryQueue deliveryQueue; /// webhook outbox (default in-memory); shared/durable for multi-node
 	Duration deliveryLease = 1.minutes; /// how long a worker claims a leased delivery job
@@ -865,6 +878,7 @@ final class EventsRuntime
 		auto grant = grantTtl(p, now);
 		sub.noExpiry = grant.isNull;
 		sub.expiresAtMs = grant.isNull ? 0 : grant.get;
+		const reactivated = !sub.active;
 		sub.active = true;
 		if (!sub.verified && urlAllowlisted(p.delivery.url))
 			sub.verified = true;
@@ -872,6 +886,10 @@ final class EventsRuntime
 
 		if (isNew)
 			acquireLifecycle(*reg, p.name, p.arguments, principal, id);
+		// A successful refresh is the client's liveness signal: deliveries queued
+		// while suspended resume now rather than at the next worker pass.
+		if (reactivated)
+			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
 
 		SubscribeResult r;
 		r.id = id;
@@ -1128,8 +1146,9 @@ final class EventsRuntime
 		s.deliver(eventsEventNotification, params);
 	}
 
-	/// Fan an emitted event out to every live, active webhook subscription whose
-	/// name matches, applying the type's `match`/`transform` per subscription, by
+	/// Fan an emitted event out to every live webhook subscription whose name
+	/// matches (a suspended one included — its jobs wait for the refresh that
+	/// reactivates it), applying the type's `match`/`transform` per subscription, by
 	/// enqueuing a `Delivery` job per subscription and kicking a drain. Publish is
 	/// thus decoupled from delivery: the job lives in the (possibly shared/durable)
 	/// `DeliveryQueue`, so any node's worker can deliver it and a crashed node's
@@ -1142,7 +1161,7 @@ final class EventsRuntime
 		bool any;
 		foreach (sub; webhookStore_.all())
 		{
-			if (sub.name != occ.name || sub.isExpired(now) || !sub.active)
+			if (sub.name != occ.name || sub.isExpired(now))
 				continue;
 			auto ctx = new EventContext(sub.cursor, sub.arguments, sub.principal);
 			if (reg !is null && reg.match !is null && !reg.match(ctx, occ))
@@ -1235,6 +1254,13 @@ final class EventsRuntime
 		if (s0.isNull)
 		{
 			deliveryQueue_.ack(job.jobId); // subscription gone; nothing to deliver
+			return;
+		}
+		if (!s0.get.active)
+		{
+			// Delivery is suspended: leave the job queued (and immediately leasable)
+			// so the refresh that reactivates the subscription resumes it.
+			deliveryQueue_.touch(job.jobId, job.attempt, opts_.nowMs());
 			return;
 		}
 		if (!ensureVerified(s0.get))
@@ -1426,12 +1452,13 @@ final class EventsRuntime
 		if (sn.isNull)
 			return;
 		auto sub = sn.get;
-		sub.lastDeliveryAtMs = opts_.nowMs();
+		const now = opts_.nowMs();
+		sub.lastDeliveryAtMs = now;
 		sub.lastErrorCat = -1;
 		sub.failedSinceMs = 0;
-		sub.failedAttempts = 0;
-		sub.active = true;
-		clearExpiredRotation(sub, opts_.nowMs());
+		rollWindow(sub, now);
+		sub.windowAttempts++;
+		clearExpiredRotation(sub, now);
 		// Advance the safe watermark only when the acked position is strictly ahead
 		// of the stored one. An out-of-order or duplicate ack (a slow attempt landing
 		// after a newer one) must not regress the cursor — that would re-deliver the
@@ -1481,15 +1508,28 @@ final class EventsRuntime
 		sub.lastErrorCat = cast(int) cat;
 		if (sub.failedSinceMs == 0)
 			sub.failedSinceMs = now;
-		sub.failedAttempts++;
-		// Suspend after a run of consecutive failed deliveries. Keying off the
-		// accumulated failure count (not wall-clock elapsed) means suspension fires
-		// even on the single-node inline path, where the injected clock is fixed
-		// across an emit/drain. A later success resets the streak and re-activates.
-		if (opts_.webhookSuspendAfterFailures > 0
-				&& sub.failedAttempts >= opts_.webhookSuspendAfterFailures)
+		rollWindow(sub, now);
+		sub.windowAttempts++;
+		sub.windowFailures++;
+		const policy = opts_.webhookSuspension;
+		if (policy.minAttempts > 0 && sub.windowAttempts >= policy.minAttempts
+				&& sub.windowFailures * 100L >= sub.windowAttempts * cast(long) policy.failureRatePercent)
 			sub.active = false;
 		webhookStore_.put(sub);
+	}
+
+	// Start a fresh failure-rate sample window once the current one has elapsed
+	// (a tumbling window: cheap, persisted in three fields, and a close enough
+	// reading of "rolling" for a suspension heuristic).
+	private void rollWindow(ref WebhookSubscription sub, long now) @safe
+	{
+		const windowMs = opts_.webhookSuspension.window.total!"msecs";
+		if (sub.windowStartMs == 0 || now - sub.windowStartMs >= windowMs)
+		{
+			sub.windowStartMs = now;
+			sub.windowAttempts = 0;
+			sub.windowFailures = 0;
+		}
 	}
 
 	private Duration backoffFor(int attempt) @safe
@@ -2974,47 +3014,125 @@ unittest  // a refresh after a delivery failure surfaces deliveryStatus.lastErro
 	assert(refreshed.deliveryStatus.get.lastError.get == DeliveryErrorCategory.http5xx);
 }
 
-unittest  // sustained delivery failures suspend the subscription; a success re-activates it
+unittest  // a sustained failure rate over the minimum sample suspends the subscription
 {
-	// A FIXED clock (single node, inline delivery): suspension must still fire,
-	// because it keys off the accumulated consecutive-failure count, not elapsed
-	// wall-clock since the streak began.
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
-	o.nowMs = () @safe => 1_000_000L; // never advances
+	o.nowMs = () @safe => 1_000_000L;
 	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	o.deliverySleep = (Duration d) @safe {};
-	o.webhookMaxAttempts = 1; // one attempt per event => one recordFailure per emit
-	o.webhookSuspendAfterFailures = 2; // suspend after two consecutive failed deliveries
+	o.webhookMaxAttempts = 1; // one attempt per event => one outcome per emit
+	o.webhookSuspension.minAttempts = 2;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
 
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
-
-	// Two failing deliveries (the endpoint 500s). After the second, active flips false.
 	ft.eventStatuses = [500, 500];
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
-	assert(rt.webhookStore().get(r.id).get.active); // one failure: still active
+	assert(rt.webhookStore().get(r.id).get.active); // below the minimum sample
 	rt.emit(EventOccurrence("evt_2", "n", "t"));
 	auto suspended = rt.webhookStore().get(r.id).get;
-	assert(!suspended.active); // two consecutive failures: suspended
-	assert(suspended.failedAttempts >= 2);
+	assert(!suspended.active); // 2 of 2 failed: 100% over a sample of 2
+	assert(suspended.windowAttempts == 2 && suspended.windowFailures == 2);
+}
 
-	// A suspended subscription is skipped by the fan-out, so re-activation needs a
-	// direct delivery. Clear suspension and drive one successful delivery: a 2xx
-	// resets the streak and re-activates.
-	auto reactivate = suspended;
-	reactivate.active = true;
-	rt.webhookStore().put(reactivate);
-	ft.eventCount = cast(int) ft.eventStatuses.length; // subsequent deliveries succeed (200)
+unittest  // failures below the minimum sample never suspend
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft); // default policy: 100 attempts minimum
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	ft.eventStatuses = [500, 500, 500, 500, 500];
+	foreach (i; 0 .. 5)
+		rt.emit(EventOccurrence("evt_" ~ ['a', 'b', 'c', 'd', 'e'][i], "n", "t"));
+	assert(rt.webhookStore().get(r.id).get.active);
+}
+
+unittest  // a failure rate under the threshold never suspends, however large the sample
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	o.webhookMaxAttempts = 1;
+	o.webhookSuspension.minAttempts = 4;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	ft.eventStatuses = [500, 200, 500, 200]; // 50% failed
+	foreach (i; 0 .. 4)
+		rt.emit(EventOccurrence("evt_" ~ ['a', 'b', 'c', 'd'][i], "n", "t"));
+	auto sub = rt.webhookStore().get(r.id).get;
+	assert(sub.active && sub.windowAttempts == 4 && sub.windowFailures == 2);
+}
+
+unittest  // the sample window tumbles: an old streak does not count against a new window
+{
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	o.webhookMaxAttempts = 1;
+	o.webhookSuspension.minAttempts = 2;
+	o.webhookSuspension.window = 1.minutes;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	ft.eventStatuses = [500, 500];
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	now += 2 * 60 * 1000; // the window elapsed: the first failure is forgotten
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	auto sub = rt.webhookStore().get(r.id).get;
+	assert(sub.active && sub.windowAttempts == 1 && sub.windowFailures == 1);
+}
+
+unittest  // events emitted while suspended are queued and delivered once a refresh reactivates
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	o.webhookMaxAttempts = 1;
+	o.webhookSuspension.minAttempts = 2;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	ft.eventStatuses = [500, 500];
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	assert(!rt.webhookStore().get(r.id).get.active);
+	const before = ft.eventPosts().length;
+
+	// Suspended: the emit is queued, not attempted.
 	rt.emit(EventOccurrence("evt_3", "n", "t"));
-	auto healthy = rt.webhookStore().get(r.id).get;
-	assert(healthy.active);
-	assert(healthy.failedAttempts == 0);
+	assert(ft.eventPosts().length == before);
+
+	// The refresh reactivates delivery and the queued event goes out (200 now).
+	auto refreshed = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	assert(!refreshed.deliveryStatus.isNull && refreshed.deliveryStatus.get.active);
+	assert(ft.eventPosts().length == before + 1);
+	import std.algorithm : canFind;
+
+	assert(ft.eventPosts()[$ - 1].body.canFind("evt_3"));
 }
 
 unittest  // emitted webhook deliveries respect the type's match filter
