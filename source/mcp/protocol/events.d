@@ -631,6 +631,26 @@ Json eventErrorParams(Json error) @safe
 	return j;
 }
 
+/// Params for `notifications/events/terminated`: the same nested `error` shape
+/// as `notifications/events/error`, but the subscription has ended. The
+/// transport adds the subscription id `_meta`.
+Json terminatedParams(Json error) @safe
+{
+	Json j = Json.emptyObject;
+	j["error"] = error;
+	return j;
+}
+
+/// The `StreamEventsResult` a server sends as the final frame when it ends an
+/// `events/stream` itself: an empty typed result (`{"_meta": {}}`) that only
+/// satisfies JSON-RPC's one-response-per-request rule.
+Json streamEventsResult() @safe
+{
+	Json j = Json.emptyObject;
+	j["_meta"] = Json.emptyObject;
+	return j;
+}
+
 /// Attach the SEP-2575 subscription-id correlation `_meta` to a push
 /// notification's params. `subscriptionId` is the parent `events/stream`
 /// request's JSON-RPC id (an integer or string).
@@ -1114,6 +1134,20 @@ unittest  // activeParams / heartbeatParams emit cursor:null when null
 	assert(activeParams(nullable("c"), false)["cursor"].get!string == "c");
 	assert(heartbeatParams(nullable("h"))["cursor"].get!string == "h");
 	assert(heartbeatParams(Nullable!string.init)["cursor"].type == Json.Type.null_);
+}
+
+unittest  // terminatedParams nests the error like an error frame, without an envelope type
+{
+	auto p = terminatedParams(Json(["code": Json(-32011)]));
+	assert(p["error"]["code"].get!int == -32011);
+	assert("type" !in p);
+}
+
+unittest  // streamEventsResult is the empty typed result
+{
+	auto r = streamEventsResult();
+	assert(r["_meta"].type == Json.Type.object && r["_meta"].length == 0);
+	assert(r.length == 1);
 }
 
 unittest  // withSubscriptionId attaches the SEP-2575 correlation _meta (integer id)

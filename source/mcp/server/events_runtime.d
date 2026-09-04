@@ -13,7 +13,7 @@ import vibe.data.json : Json;
 
 import mcp.protocol.events;
 import mcp.protocol.errors : McpException, notFound, unsupported, invalidParams,
-	forbidden, resourceExhausted;
+	forbidden, resourceExhausted, internalError, toErrorJson;
 import mcp.server.event_context : EventContext, EventResult, Event, EventBatch,
 	FetchContext, SubContext;
 import mcp.server.event_store : EmitBuffer, EmitBufferOptions,
@@ -448,6 +448,8 @@ final class PushStream
 	Nullable!string cursor; /// last position delivered on this stream
 	long lastHeartbeatMs; /// when a heartbeat was last sent (used by the stdio ticker)
 	void delegate(string method, Json taggedParams) @safe deliver;
+	bool terminated; /// set once the server ended the stream (`terminatePush`)
+	void delegate() @safe onTerminated; /// transport hook run after the terminated frame: write the final result, drop the stream
 }
 
 /// Handle returned by `openPushStream`. `close()` unregisters the stream and fires
@@ -707,12 +709,22 @@ final class EventsRuntime
 
 		touchPollLease(*p, name, arguments, principal);
 
+		return runPoll(*p, name, arguments, principal, cursor, maxAgeMs, maxEvents);
+	}
+
+	// The poll body without lease bookkeeping: read the ring buffer (emit-only) or
+	// run the check function, and shape the result. Push streams advance through
+	// this too, so a stream never takes out a poll lease.
+	private PollResult runPoll(ref EventRegistration p, string name, Json arguments,
+			string principal, Nullable!string cursor, Nullable!long maxAgeMs,
+			Nullable!long maxEvents) @safe
+	{
 		auto ctx = new EventContext(cursor, arguments, principal, maxAgeMs);
 		PollResult out_;
 		if (p.emitOnly || p.check is null)
 		{
 			auto er = buffer_.readSince(name, cursor, maxAgeMs, maxEvents);
-			er.events = applyShaping(*p, ctx, er.events);
+			er.events = applyShaping(p, ctx, er.events);
 			out_.events = er.events;
 			out_.cursor = er.cursor;
 			out_.truncated = er.truncated;
@@ -726,7 +738,7 @@ final class EventsRuntime
 			out_.truncated = er.truncated;
 			out_.hasMore = er.hasMore;
 		}
-		out_.nextPollMs = nextPollMsFor(*p);
+		out_.nextPollMs = nextPollMsFor(p);
 		return out_;
 	}
 
@@ -822,6 +834,90 @@ final class EventsRuntime
 		pushStreams_ = pushStreams_[0 .. w];
 		if (removed)
 			releaseLifecycle(stream.name, stream.arguments, stream.principal);
+	}
+
+	/// Advance a push stream on a check-backed type: run the check function from
+	/// the stream's cursor and deliver what it returns. A gap (`truncated`) re-sends
+	/// `notifications/events/active` with `truncated: true` and the fresh cursor
+	/// before the events; a throwing check sends a recoverable
+	/// `notifications/events/error` and the stream stays open. Emit-only streams
+	/// receive their events live from `emit` and need no advancing. Both transports
+	/// call this on their poll cadence.
+	void advancePushStream(PushStream s) @safe
+	{
+		if (s.terminated)
+			return;
+		auto reg = s.name in types_;
+		if (regIsEmitOnly(reg))
+			return;
+		PollResult r;
+		try
+			r = runPoll(*reg, s.name, s.arguments, s.principal, s.cursor,
+					Nullable!long.init, Nullable!long.init);
+		catch (Exception e)
+		{
+			Json err = (cast(McpException) e) !is null ? toErrorJson(cast(McpException) e)
+				: toErrorJson(internalError(e.msg));
+			s.deliver(eventsErrorNotification, withSubscriptionId(eventErrorParams(err), s.subscriptionId));
+			return;
+		}
+		if (r.truncated)
+			s.deliver(eventsActiveNotification, withSubscriptionId(activeParams(r.cursor, true), s.subscriptionId));
+		foreach (ev; r.events)
+			s.deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), s.subscriptionId));
+		if (!r.cursor.isNull)
+			s.cursor = r.cursor;
+	}
+
+	/// End a push stream from the server side: deliver `notifications/events/
+	/// terminated` carrying `error`, release the subscription (firing
+	/// `on_unsubscribe`), and run the transport's `onTerminated` hook so it writes
+	/// the final `StreamEventsResult` and drops the stream. Idempotent.
+	void terminatePush(PushStream s, Json error) @safe
+	{
+		if (s.terminated)
+			return;
+		s.terminated = true;
+		try
+			s.deliver(eventsTerminatedNotification, withSubscriptionId(terminatedParams(error), s.subscriptionId));
+		catch (Exception)
+		{
+			// The client is already gone; the stream is released regardless.
+		}
+		closePushStream(s);
+		if (s.onTerminated !is null)
+			s.onTerminated();
+	}
+
+	/// End every subscription to event type `name` — push streams and webhook
+	/// subscriptions alike — with `error` (e.g. `NotFound {kind: "event"}` when
+	/// the type is removed). Poll holds no server-side subscription to end.
+	void terminateEventType(string name, Json error) @safe
+	{
+		terminateMatching((PushStream s) @safe => s.name == name,
+				(WebhookSubscription w) @safe => w.name == name, error);
+	}
+
+	/// End every subscription `principal` holds — to event type `name`, or to
+	/// every type when `name` is empty — with `error` (typically `-32012 Forbidden`
+	/// once access is revoked).
+	void terminatePrincipal(string principal, string name, Json error) @safe
+	{
+		terminateMatching((PushStream s) @safe => s.principal == principal
+				&& (name.length == 0 || s.name == name),
+				(WebhookSubscription w) @safe => w.principal == principal
+				&& (name.length == 0 || w.name == name), error);
+	}
+
+	private void terminateMatching(bool delegate(PushStream) @safe pushPred,
+			bool delegate(WebhookSubscription) @safe webhookPred, Json error) @safe
+	{
+		foreach (s; pushStreams_.dup)
+			if (pushPred(s))
+				terminatePush(s, error);
+		foreach (w; webhookStore_.all())
+			if (webhookPred(w))
+				terminateWebhook(w.id, error);
 	}
 
 	/// Expire poll leases whose window has elapsed, firing `on_unsubscribe` for
@@ -2309,6 +2405,110 @@ unittest  // emit fans out to a matching push stream
 	// the subscription id is carried in _meta
 	assert(deliveredParams["_meta"][subscriptionIdMetaKey].get!int == 1);
 	handle.close();
+}
+
+unittest  // advancePushStream delivers a recoverable error frame when the check throws, and stays open
+{
+	auto rt = testRuntime();
+	bool fail = true;
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		if (fail)
+			throw new Exception("Gmail API 503");
+		return EventResult.of([EventOccurrence("m1", "email.received", "t")], "c1");
+	};
+	rt.register(reg);
+	string[] methods;
+	Json[] params;
+	auto handle = rt.openPushStream("email.received", Json.emptyObject, "u", Json(7),
+			(string m, Json p) @safe { methods ~= m; params ~= p; });
+	rt.advancePushStream(handle.stream);
+	assert(methods == [eventsErrorNotification]);
+	assert(params[0]["error"]["code"].get!int == -32603);
+	assert(params[0]["error"]["message"].get!string == "Gmail API 503");
+	assert(params[0]["_meta"][subscriptionIdMetaKey].get!int == 7);
+	fail = false;
+	rt.advancePushStream(handle.stream); // still open: the next advance delivers
+	assert(methods[$ - 1] == eventsEventNotification);
+	assert(handle.stream.cursor.get == "c1");
+	handle.close();
+}
+
+unittest  // advancePushStream re-sends active{truncated:true} with the fresh cursor on a gap
+{
+	auto rt = testRuntime();
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		return EventResult.of([EventOccurrence("m9", "email.received", "t")], "c9", true);
+	};
+	rt.register(reg);
+	string[] methods;
+	Json[] params;
+	auto handle = rt.openPushStream("email.received", Json.emptyObject, "u", Json(1),
+			(string m, Json p) @safe { methods ~= m; params ~= p; });
+	rt.advancePushStream(handle.stream);
+	assert(methods == [eventsActiveNotification, eventsEventNotification]);
+	assert(params[0]["truncated"].get!bool && params[0]["cursor"].get!string == "c9");
+	handle.close();
+}
+
+unittest  // terminatePush sends a terminated frame, releases the subscription, and runs the transport hook
+{
+	auto rt = testRuntime();
+	int unsubs;
+	EventRegistration reg;
+	reg.descriptor.name = "incident.created";
+	reg.emitOnly = true;
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	rt.register(reg);
+	string[] methods;
+	Json[] params;
+	auto handle = rt.openPushStream("incident.created", Json.emptyObject, "u", Json(3),
+			(string m, Json p) @safe { methods ~= m; params ~= p; });
+	bool hooked;
+	handle.stream.onTerminated = () @safe { hooked = true; };
+	rt.terminatePush(handle.stream, toErrorJson(forbidden("Access revoked")));
+	assert(methods == [eventsTerminatedNotification]);
+	assert(params[0]["error"]["code"].get!int == -32012);
+	assert(params[0]["_meta"][subscriptionIdMetaKey].get!int == 3);
+	assert(unsubs == 1 && hooked && handle.stream.terminated);
+	rt.emit(EventOccurrence("evt", "incident.created", "t"));
+	assert(methods.length == 1); // nothing further is delivered
+	rt.terminatePush(handle.stream, Json.emptyObject); // idempotent
+	assert(methods.length == 1 && unsubs == 1);
+}
+
+unittest  // terminateEventType ends push streams and webhook subscriptions for the type
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	string[] methods;
+	auto handle = rt.openPushStream("n", Json.emptyObject, "u", Json(1),
+			(string m, Json p) @safe { methods ~= m; });
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.terminateEventType("n", toErrorJson(notFound("removed", "event")));
+	assert(methods == [eventsTerminatedNotification]);
+	assert(rt.webhookStore().get(r.id).isNull);
+	auto terms = controlPostsOf(ft, "terminated");
+	assert(terms.length == 1);
+	assert(parseJsonString(terms[0].body)["error"]["data"]["kind"].get!string == "event");
+}
+
+unittest  // terminatePrincipal ends only that principal's subscriptions
+{
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	string[] a, b;
+	rt.openPushStream("n", Json.emptyObject, "alice", Json(1), (string m, Json p) @safe { a ~= m; });
+	rt.openPushStream("n", Json.emptyObject, "bob", Json(2), (string m, Json p) @safe { b ~= m; });
+	rt.terminatePrincipal("alice", "", toErrorJson(forbidden("revoked")));
+	assert(a == [eventsTerminatedNotification]);
+	assert(b.length == 0);
+	rt.emit(EventOccurrence("evt", "n", "t"));
+	assert(a.length == 1 && b.length == 1); // bob still receives
 }
 
 unittest  // a closed push stream no longer receives events

@@ -1317,7 +1317,16 @@ final class McpServer : ServerCore
 			writeLine(makeErrorResponse(msg.id, e).toString());
 			return true;
 		}
-		stdioEventStreams_[rpcIdString(msg.id)] = handle;
+		const streamKey = rpcIdString(msg.id);
+		stdioEventStreams_[streamKey] = handle;
+		// A server-initiated close drops the stream and answers the request with
+		// the StreamEventsResult so the client's pending request completes.
+		handle.stream.onTerminated = () @safe {
+			import mcp.protocol.events : streamEventsResult;
+
+			stdioEventStreams_.remove(streamKey);
+			writeLine(makeResponse(msg.id, streamEventsResult()).toString());
+		};
 
 		// Leading active frame + any backlog from an initial poll.
 		try
@@ -1355,22 +1364,9 @@ final class McpServer : ServerCore
 		{
 			auto handle = kv.value;
 			auto s = handle.stream;
-			if (!eventsRuntime_.isEmitOnly(s.name))
-			{
-				try
-				{
-					auto r = eventsRuntime_.poll(s.name, s.arguments, s.principal,
-							s.cursor, Nullable!long.init, Nullable!long.init);
-					foreach (ev; r.events)
-						s.deliver(eventsEventNotification,
-								withSubscriptionId(ev.toJson(), s.subscriptionId));
-					if (!r.cursor.isNull)
-						s.cursor = r.cursor;
-				}
-				catch (Exception)
-				{
-				}
-			}
+			if (s.terminated)
+				continue;
+			eventsRuntime_.advancePushStream(s);
 			if (nowMs - s.lastHeartbeatMs >= 15_000)
 			{
 				s.lastHeartbeatMs = nowMs;
@@ -6119,6 +6115,37 @@ unittest  // a cancelled stdio events/stream stops receiving events
 	]))));
 	rt.emit(EventOccurrence("evt_2", "incident.created", "t"));
 	assert(lines.length == before); // no further delivery after cancellation
+}
+
+unittest  // a server-terminated stdio stream gets the terminated frame, then the final result, and stops ticking
+{
+	import std.algorithm : count, canFind;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : forbidden, toErrorJson;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableEvents();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	s.registerEventType(reg);
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "n";
+	s.tryServeStdioEventsStream(draftReq(1, "events/stream", params), &sink);
+	const opened = lines.length;
+	rt.terminatePrincipal("", "n", toErrorJson(forbidden("Access revoked")));
+	assert(lines.length == opened + 2);
+	assert(lines[opened].canFind("notifications/events/terminated") && lines[opened].canFind("-32012"));
+	auto fin = parseJsonString(lines[opened + 1]);
+	assert(fin["id"].get!int == 1 && fin["result"]["_meta"].type == Json.Type.object);
+	// The stream is gone: a later tick sends it no heartbeat.
+	s.tickStdioEventStreams(100_000);
+	assert(lines.length == opened + 2);
 }
 
 unittest  // tickStdioEventStreams iterates a snapshot, so a mid-tick cancel can't corrupt it

@@ -1333,6 +1333,16 @@ private void handleEventsStream(McpServer server, Message msg,
 	res.contentType = "text/event-stream";
 	applySseStreamHeaders(res, true);
 
+	// A server-initiated close (terminatePush) ends with the StreamEventsResult as
+	// the final frame; a client abort never gets one.
+	handle.stream.onTerminated = () @safe {
+		try
+			writeFrame("data: " ~ makeResponse(msg.id, streamEventsResult()).toString() ~ "\n\n");
+		catch (Exception)
+		{
+		}
+	};
+
 	const emitOnly = rt.isEmitOnly(p.name);
 	Nullable!string cursor = p.cursor;
 	long pollMs = 15_000;
@@ -1369,28 +1379,20 @@ private void handleEventsStream(McpServer server, Message msg,
 			sleep(sleepMs.msecs);
 		catch (Exception)
 			break;
+		if (handle.stream.terminated)
+			break; // the server ended the stream; its final frame is already written
 		const sinceHeartbeatMs = (MonoTime.currTime - lastHeartbeat).total!"msecs";
 		const tick = eventStreamTick(emitOnly, sinceHeartbeatMs);
 		if (tick.poll)
 		{
 			try
-			{
-				auto r = rt.poll(p.name, p.arguments, principal, cursor,
-						p.maxAgeMs, Nullable!long.init);
-				foreach (ev; r.events)
-					deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), subId));
-				if (!r.cursor.isNull)
-				{
-					cursor = r.cursor;
-					handle.stream.cursor = r.cursor;
-				}
-			}
+				rt.advancePushStream(handle.stream);
 			catch (Exception)
 			{
+				break; // client disconnected mid-delivery
 			}
 		}
-		else
-			cursor = handle.stream.cursor; // advanced by sink deliveries
+		cursor = handle.stream.cursor; // advanced by the check function or sink deliveries
 		if (!tick.heartbeat)
 			continue; // not yet due — avoid heartbeating every sub-15s poll iteration
 		try
