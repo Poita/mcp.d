@@ -1294,7 +1294,7 @@ final class EventsRuntime
 		const now = opts_.nowMs();
 		auto headers = signDeliveryHeaders(sub.secret, sub.previousSecret,
 				sub.previousSecretGraceUntilMs,
-				now, "msg_gap_" ~ occ.eventId, now / 1000, body, sub.id, opts_.v1aSigner);
+				now, controlMessageId("gap"), now / 1000, body, sub.id, opts_.v1aSigner);
 		postToCallback(sub.url, headers, body);
 	}
 
@@ -1361,7 +1361,7 @@ final class EventsRuntime
 		const 
 		body = verificationEnvelope(nonce).toString();
 		auto headers = signDeliveryHeaders(sub.secret, "", 0, now,
-				"msg_verification_" ~ nonce[0 .. 8], now / 1000, body, sub.id, opts_.v1aSigner);
+				controlMessageId("verification"), now / 1000, body, sub.id, opts_.v1aSigner);
 		auto res = postToCallback(sub.url, headers, body);
 		if (res.ok && challengeEchoed(res.body, nonce))
 		{
@@ -1400,7 +1400,7 @@ final class EventsRuntime
 		body = terminatedEnvelope(error).toString();
 		const now = opts_.nowMs();
 		auto headers = signDeliveryHeaders(sub.secret, "", 0, now,
-				"msg_terminated_" ~ sub.id[$ - 8 .. $], now / 1000, body, sub.id, opts_.v1aSigner);
+				controlMessageId("terminated"), now / 1000, body, sub.id, opts_.v1aSigner);
 		opts_.deliveryExecutor(() @safe {
 			postToCallback(sub.url, headers, body);
 		});
@@ -1709,6 +1709,13 @@ string randomNonce() @safe
 	return toHexString!(LetterCase.lower)(cryptoRandomBytes(16)).idup;
 }
 
+/// The `webhook-id` of a control envelope: `msg_<type>_<random>`, so a receiver
+/// can dedup a retried envelope without confusing it with an event delivery.
+string controlMessageId(string type) @safe
+{
+	return "msg_" ~ type ~ "_" ~ randomNonce();
+}
+
 /// The subscription id as a string, whether the JSON-RPC id was an integer or a
 /// string (used to label lifecycle-hook invocations).
 string subscriptionIdString(Json id) @safe
@@ -1754,6 +1761,16 @@ unittest  // sha256Hex is stable and lowercase hex
 	auto h = sha256Hex("abc");
 	assert(h.length == 64);
 	assert(h == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+unittest  // controlMessageId is msg_<type>_<random> and unique per call
+{
+	import std.algorithm : startsWith;
+
+	auto a = controlMessageId("gap");
+	auto b = controlMessageId("gap");
+	assert(a.startsWith("msg_gap_") && a.length == "msg_gap_".length + 32);
+	assert(a != b);
 }
 
 unittest  // randomEventId is prefixed and unique
