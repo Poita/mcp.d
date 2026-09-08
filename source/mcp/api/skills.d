@@ -1123,17 +1123,128 @@ unittest  // skills/list and skills/get do not exist below 2025-11-25
 	}
 }
 
-unittest  // a draft-session skills/list result carries no CacheableResult attributes
+unittest  // a modern-session skills/list result carries the required ttlMs/cacheScope
 {
 	auto s = pdfSkillServer();
 
 	auto result = s.handle(draftRequest(1, "skills/list", Json.emptyObject)).get["result"];
 	assert(result["skills"].length == 1);
-	// SEP-2549 list-caching attributes apply to skills/list only from protocol
-	// 2026-07-28, which this SDK does not implement yet; the draft session must
-	// not stamp its CacheableResult hint onto this extension's result.
-	assert("ttlMs" !in result);
-	assert("cacheScope" !in result);
+	// ListSkillsResult extends CacheableResult: both fields are REQUIRED, with the
+	// conservative do-not-cache default when the application configured no hint.
+	assert(result["ttlMs"].get!long == 0);
+	assert(result["cacheScope"].get!string == "public");
+	assert(result["resultType"].get!string == "complete");
+}
+
+unittest  // a modern-session skills/get result carries the required ttlMs/cacheScope
+{
+	auto s = pdfSkillServer();
+
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://office/pdf-forms/SKILL.md";
+	auto result = s.handle(draftRequest(1, "skills/get", p)).get["result"];
+	assert(result["skill"]["uri"].get!string == "skill://office/pdf-forms/SKILL.md");
+	assert(result["ttlMs"].get!long == 0);
+	assert(result["cacheScope"].get!string == "public");
+	assert(result["resultType"].get!string == "complete");
+	assert("nextCursor" !in result);
+}
+
+unittest  // setListCacheHint configures the skills/list and skills/get freshness hints
+{
+	import core.time : minutes;
+	import mcp.protocol.modern : CacheHint, CacheScope;
+
+	auto s = pdfSkillServer();
+	s.setListCacheHint("skills/list", CacheHint(5.minutes));
+	s.setListCacheHint("skills/get", CacheHint(1.minutes, CacheScope.private_));
+
+	auto listed = s.handle(draftRequest(1, "skills/list", Json.emptyObject)).get["result"];
+	assert(listed["ttlMs"].get!long == 300_000);
+	assert(listed["cacheScope"].get!string == "public");
+
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://office/pdf-forms/SKILL.md";
+	auto got = s.handle(draftRequest(2, "skills/get", p)).get["result"];
+	assert(got["ttlMs"].get!long == 60_000);
+	assert(got["cacheScope"].get!string == "private");
+}
+
+unittest  // a 2025-11-25 session's skills results carry no caching attributes
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	// The base protocol at 2025-11-25 has no CacheableResult, so the fields the
+	// extension inherits from it at 2026-07-28 and later are not written there.
+	auto s = pdfSkillServer();
+	auto listed = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"];
+	assert("ttlMs" !in listed && "cacheScope" !in listed && "resultType" !in listed);
+
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://office/pdf-forms/SKILL.md";
+	auto got = s.handle(Message(makeRequest(Json(2), "skills/get", p))).get["result"];
+	assert("ttlMs" !in got && "cacheScope" !in got && "resultType" !in got);
+}
+
+unittest  // a modern-session resources/directory/read result carries resultType:"complete"
+{
+	auto s = pdfSkillServer();
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://office/pdf-forms";
+	auto result = s.handle(draftRequest(1, "resources/directory/read", p)).get["result"];
+	assert(result["resultType"].get!string == "complete");
+}
+
+unittest  // declaring the skills extension also declares the resources capability
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.mrtr : MetaKey;
+
+	// Skill files are served through resources/read, and the base Resources spec
+	// requires a server that supports resources to declare the capability — even
+	// before the first skill (and so the first resource) is registered.
+	auto s = new McpServer("t", "1");
+	enableSkills(s);
+
+	Json params = Json.emptyObject;
+	Json m = Json.emptyObject;
+	m[MetaKey.protocolVersion] = "2026-07-28";
+	m[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	m[MetaKey.clientCapabilities] = Json.emptyObject;
+	params["_meta"] = m;
+	auto caps = s.handle(Message(makeRequest(Json(1), "server/discover",
+			params))).get["result"]["capabilities"];
+	assert(skillsExtensionKey in caps["extensions"]);
+	assert("resources" in caps);
+
+	// The same holds on the 2025-11-25 initialize handshake.
+	Json init = Json.emptyObject;
+	init["protocolVersion"] = "2025-11-25";
+	init["capabilities"] = Json.emptyObject;
+	init["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	auto legacyCaps = s.handle(Message(makeRequest(Json(2), "initialize",
+			init))).get["result"]["capabilities"];
+	assert("resources" in legacyCaps);
+}
+
+unittest  // the skills error messages name the offending uri the way the spec's examples do
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = pdfSkillServer();
+
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://acme/billing/chargebacks/SKILL.md";
+	auto missing = s.handle(Message(makeRequest(Json(1), "skills/get", p))).get["error"];
+	assert(missing["message"].get!string
+			== "No skill is served at skill://acme/billing/chargebacks/SKILL.md");
+
+	Json d = Json.emptyObject;
+	d["uri"] = "skill://office/pdf-forms/SKILL.md";
+	auto notDir = s.handle(draftRequest(2, "resources/directory/read", d)).get["error"];
+	assert(notDir["message"].get!string
+			== "skill://office/pdf-forms/SKILL.md is not a directory resource");
 }
 
 unittest  // registerDynamicSkill publishes an entry whose resources is the string "dynamic"
