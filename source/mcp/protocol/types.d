@@ -4018,14 +4018,38 @@ unittest  // Annotations.fromJson silently skips non-string audience elements in
 struct ReadResourceResult
 {
 	ResourceContents[] contents;
+	/// MRTR (SEP-2322): input requests the client must satisfy and resubmit as a
+	/// fresh `resources/read`. Non-empty only when the server returned an
+	/// `InputRequiredResult` instead of the resource contents. Mirrors the same
+	/// field on `CallToolResult` and `GetPromptResult`.
+	InputRequest[] inputRequests;
+	/// MRTR (SEP-2322): the opaque server-owned `requestState` to echo back
+	/// verbatim on the retried `resources/read`. Empty when the server sent none.
+	string requestState;
 	mixin MetaField;
-	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
+	/// `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
 	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
-	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
+	/// server sets this on modern sessions only, so legacy wire output is
+	/// unchanged. An input-required result carries no hint: interim results are
+	/// not cacheable.
 	Nullable!CacheHint cache;
+
+	/// Returns `true` when the server responded with an `InputRequiredResult`
+	/// instead of the resource contents.
+	bool isInputRequired() const @safe nothrow
+	{
+		return inputRequests.length > 0;
+	}
 
 	Json toJson() const @safe
 	{
+		if (isInputRequired)
+		{
+			Json j = Json.emptyObject;
+			j["resultType"] = "input_required";
+			emitInputRequired(j, inputRequests, requestState);
+			return j;
+		}
 		Json j = Json.emptyObject;
 		Json arr = Json.emptyArray;
 		foreach (c; contents)
@@ -4040,6 +4064,10 @@ struct ReadResourceResult
 	static ReadResourceResult fromJson(Json j) @safe
 	{
 		ReadResourceResult r;
+		// An InputRequiredResult carries `inputRequests` instead of `contents`.
+		parseInputRequired(j, r.inputRequests, r.requestState);
+		if (r.isInputRequired)
+			return r;
 		if ("contents" in j && j["contents"].type == Json.Type.array)
 		{
 			auto arr = j["contents"];
@@ -4057,6 +4085,42 @@ struct ReadResourceResult
 		meta = m;
 		return this;
 	}
+}
+
+unittest  // ReadResourceResult parses an InputRequiredResult (resources/read supports MRTR)
+{
+	import vibe.data.json : parseJsonString;
+
+	auto r = ReadResourceResult.fromJson(parseJsonString(`{"resultType":"input_required",
+		"inputRequests":{"date":{"method":"elicitation/create","params":{"message":"When?"}}},
+		"requestState":"s1"}`));
+	assert(r.isInputRequired);
+	assert(r.contents.length == 0);
+	assert(r.inputRequests.length == 1);
+	assert(r.inputRequests[0].id == "date");
+	assert(r.requestState == "s1");
+}
+
+unittest  // an input-required ReadResourceResult serialises with the input_required discriminator
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	ReadResourceResult r;
+	r.inputRequests = [InputRequest.elicitation("date", "When?")];
+	r.requestState = "s1";
+	auto j = r.toJson();
+	assert(j["resultType"].get!string == "input_required");
+	assert("date" in j["inputRequests"]);
+	assert(j["requestState"].get!string == "s1");
+	assert("contents" !in j);
+}
+
+unittest  // a plain ReadResourceResult is not input-required
+{
+	ReadResourceResult r;
+	r.contents = [ResourceContents.makeText("file://x", "text/plain", "hi")];
+	assert(!r.isInputRequired);
+	assert("inputRequests" !in r.toJson());
 }
 
 // ===========================================================================

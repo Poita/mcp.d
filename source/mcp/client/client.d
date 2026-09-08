@@ -381,6 +381,9 @@ final class McpClient : ClientProtocol
 	// "do not cache unhinted responses" (the default), so behavior against such
 	// servers matches the uncached client. A server hint always wins over this.
 	private Duration defaultCacheTtl_;
+	/// Raised by `mrtrLoop` when the result it just produced came from an MRTR
+	/// retry or is itself input-required, so `cachedFetch` skips storing it.
+	private bool lastResultUncacheable_;
 	// This client's cache partition: the namespace under which its `private`-scoped
 	// cacheable results are stored, so a SHARED `cacheStore_` keeps one principal's
 	// private entries from being served to another. `public` results ignore it and
@@ -1183,7 +1186,14 @@ final class McpClient : ClientProtocol
 			if (!hit.isNull)
 				return R.fromJson(hit.get.value);
 		}
+		lastResultUncacheable_ = false;
 		R result = fetch();
+		if (lastResultUncacheable_)
+		{
+			// Set by `mrtrLoop` for an interim or retried result (see there).
+			lastResultUncacheable_ = false;
+			return result;
+		}
 		const ttl = result.cache.isNull ? defaultCacheTtl_ : result.cache.get.ttl;
 		if (ttl > Duration.zero)
 		{
@@ -1330,6 +1340,12 @@ final class McpClient : ClientProtocol
 			// `setLogLevel` default). Empty -> no field.
 			auto params = withRequestLogLevel(buildParams(responses, requestState), logLevel);
 			result = R.fromJson(rpc(method, params));
+			// server/utilities/caching: an interim input_required result carries no
+			// caching hint, and a result produced by a retry carrying
+			// inputResponses/requestState MUST NOT be cached, because it depends on
+			// inputs outside the cache key. Only a first-round completed result may
+			// be stored by a caching caller.
+			lastResultUncacheable_ = round > 0 || result.isInputRequired;
 			if (!result.isInputRequired)
 				return result;
 			// Gather an answer for each requested input. If any cannot be
@@ -1783,10 +1799,20 @@ final class McpClient : ClientProtocol
 		return cachedFetch!ReadResourceResult(CacheKey("resources/read", uri),
 				opts.cacheMode, () @safe {
 			auto token = effectiveToken(opts);
-			auto params = withRequestLogLevel(buildReadResourceParams(uri, token), opts.logLevel);
 			return withPerCallProgress!ReadResourceResult(opts,
-				() @safe => ReadResourceResult.fromJson(rpc("resources/read", params)));
+				() @safe => readResourceLoop(uri, token, opts.logLevel));
 		});
+	}
+
+	/// `resources/read` through the MRTR loop; see `mrtrLoop`. A modern server MAY
+	/// answer a read with an `InputRequiredResult`, which the loop satisfies and
+	/// retries like a tool call.
+	private ReadResourceResult readResourceLoop(string uri,
+			ProgressToken progressToken, string logLevel = "") @safe
+	{
+		return mrtrLoop!ReadResourceResult("resources/read", logLevel, (responses,
+				requestState) => buildReadResourceParams(uri, progressToken,
+				responses, requestState));
 	}
 
 	/// Build the `resources/read` params, optionally attaching a progress token.
@@ -1795,6 +1821,17 @@ final class McpClient : ClientProtocol
 		Json p = Json.emptyObject;
 		p["uri"] = uri;
 		return withProgressToken(p, progressToken);
+	}
+
+	/// Build the `resources/read` params with any gathered MRTR (SEP-2322) input
+	/// responses attached as the top-level `params.inputResponses` map and the
+	/// opaque `requestState` echoed back, exactly as `buildToolCallParams` does.
+	package static Json buildReadResourceParams(string uri,
+			ProgressToken progressToken, InputResponse[] responses, string requestState = "") @safe
+	{
+		Json p = buildReadResourceParams(uri, progressToken);
+		p = withInputResponses(p, responses);
+		return withRequestState(p, requestState);
 	}
 
 	/// `resources/directory/read` (SEP-2640): the direct children of the directory
@@ -5932,6 +5969,114 @@ unittest  // listResourceTemplates calls resources/templates/list and auto-pagin
 	assert(templates.length == 2);
 	assert(templates[0].uriTemplate == "file:///a/{x}");
 	assert(templates[1].name == "b");
+}
+
+version (unittest)
+{
+	// A resources/read reply that asks for one elicitation before it can complete.
+	private Json inputRequiredRead() @safe
+	{
+		import vibe.data.json : parseJsonString;
+
+		return parseJsonString(`{"resultType":"input_required",
+			"inputRequests":{"date":{"method":"elicitation/create","params":{"message":"When?"}}},
+			"requestState":"s1"}`);
+	}
+
+	private Json completedRead(long ttlMs) @safe
+	{
+		Json c = Json.emptyObject;
+		c["uri"] = "file://r";
+		c["mimeType"] = "text/plain";
+		c["text"] = "hi";
+		Json r = Json.emptyObject;
+		r["contents"] = Json([c]);
+		r["ttlMs"] = ttlMs;
+		r["cacheScope"] = "public";
+		return r;
+	}
+}
+
+unittest  // readResource completes an MRTR round-trip, echoing inputResponses and requestState
+{
+	// basic/patterns/mrtr: servers MAY answer resources/read with an
+	// InputRequiredResult; the client satisfies the input requests and retries
+	// the read with `inputResponses` and the opaque `requestState`.
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	c.onElicitation = (ElicitParams params) @safe {
+		return ElicitResult.accept(Json(["day": Json("tuesday")]));
+	};
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "resources/read");
+		calls++;
+		if (calls == 1)
+		{
+			assert("inputResponses" !in params);
+			return inputRequiredRead();
+		}
+		assert(params["uri"].get!string == "file://r");
+		assert(params["requestState"].get!string == "s1");
+		assert(params["inputResponses"]["date"]["content"]["day"].get!string == "tuesday");
+		return completedRead(60_000);
+	};
+	auto res = c.readResource("file://r");
+	assert(calls == 2);
+	assert(!res.isInputRequired);
+	assert(res.contents.length == 1 && res.contents[0].text == "hi");
+}
+
+unittest  // a resources/read result produced by an MRTR retry is never cached
+{
+	// server/utilities/caching: results produced by retrying a request through
+	// MRTR (requests carrying inputResponses or requestState) MUST NOT be cached,
+	// as they depend on inputs that are not part of the cache key.
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	c.onElicitation = (ElicitParams params) @safe => ElicitResult.accept(Json.emptyObject);
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		calls++;
+		return ("inputResponses" in params) ? completedRead(60_000) : inputRequiredRead();
+	};
+	c.readResource("file://r");
+	assert(calls == 2);
+	// Nothing was cached, so the next read goes to the network again.
+	c.readResource("file://r");
+	assert(calls == 4);
+}
+
+unittest  // a direct resources/read result with a ttl is cached (control for the MRTR rule)
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		calls++;
+		return completedRead(60_000);
+	};
+	c.readResource("file://r");
+	c.readResource("file://r");
+	assert(calls == 1);
+}
+
+unittest  // an unresolvable input-required read is returned as such and not cached
+{
+	// No onElicitation handler: the client cannot answer, hands the
+	// input-required result back, and stores nothing.
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		calls++;
+		return inputRequiredRead();
+	};
+	auto res = c.readResource("file://r");
+	assert(res.isInputRequired);
+	assert(calls == 1);
+	c.readResource("file://r");
+	assert(calls == 2);
 }
 
 unittest  // a HeaderMismatch on tools/call refreshes tools/list and retries once
