@@ -419,36 +419,55 @@ final class OAuthClient
 	}
 
 	/// POST a minimal request to the MCP endpoint (optionally with a bearer
-	/// token); if it returns 401, return the `WWW-Authenticate` header value
+	/// token); if it returns 401/403, return the `WWW-Authenticate` header value
 	/// (else empty). Used to trigger discovery and detect step-up challenges.
-	string probeUnauthorized(string mcpEndpoint, string bearer = "") @safe
+	/// On a legacy server the probe is `tools/list` (a method every resource
+	/// server gates); on a modern server (`modern = true`) it is `server/discover`
+	/// carrying the required per-request `_meta` and standard headers, since
+	/// there is no `initialize` and a request without them is malformed.
+	string probeUnauthorized(string mcpEndpoint, string bearer = "", bool modern = false) @safe
 	{
-		string www;
-		try
-		{
-			secureRequestHTTP(mcpEndpoint, (scope HTTPClientRequest req) {
-				req.method = HTTPMethod.POST;
-				req.contentType = "application/json";
-				req.headers["Accept"] = "application/json, text/event-stream";
-				if (bearer.length)
-					req.headers["Authorization"] = "Bearer " ~ bearer;
-				req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}`);
-			}, (scope HTTPClientResponse res) {
-				if (res.statusCode == 401 || res.statusCode == 403)
-					www = res.headers.get("WWW-Authenticate", "");
-				res.dropBody();
-			});
-		}
-		catch (Exception)
-		{
-		}
-		return www;
+		return modern ? probeWith(mcpEndpoint, bearer, "server/discover", "",
+				`{"jsonrpc":"2.0","id":0,"method":"server/discover","params":{"_meta":{`
+				~ `"io.modelcontextprotocol/protocolVersion":"2026-07-28",`
+				~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`) : probeWith(mcpEndpoint,
+				bearer, "", "", `{"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}`);
 	}
 
-	/// POST a `tools/list` request with a bearer token; if the server challenges
+	/// POST a `tools/call` request with a bearer token; if the server challenges
 	/// with 401/403 (insufficient scope), return the `WWW-Authenticate` header.
-	/// Used to detect step-up authorization requirements.
-	string probeOperation(string mcpEndpoint, string bearer) @safe
+	/// Used to detect step-up authorization requirements. `toolName` is the tool
+	/// the call names; on a modern server (`modern = true`) the request carries
+	/// the required per-request `_meta` and standard headers.
+	string probeOperation(string mcpEndpoint, string bearer, bool modern = false,
+			string toolName = "step-up") @safe
+	{
+		import vibe.data.json : Json;
+
+		Json params = Json.emptyObject;
+		params["name"] = toolName;
+		params["arguments"] = Json.emptyObject;
+		if (modern)
+		{
+			Json meta = Json.emptyObject;
+			meta["io.modelcontextprotocol/protocolVersion"] = "2026-07-28";
+			meta["io.modelcontextprotocol/clientCapabilities"] = Json.emptyObject;
+			params["_meta"] = meta;
+		}
+		Json body_ = Json.emptyObject;
+		body_["jsonrpc"] = "2.0";
+		body_["id"] = 9;
+		body_["method"] = "tools/call";
+		body_["params"] = params;
+		return probeWith(mcpEndpoint, bearer, modern ? "tools/call" : "", modern
+				? toolName : "", body_.toString());
+	}
+
+	/// The shared probe: POST `body_` (with the modern standard headers when
+	/// `mcpMethod` is set) and return the `WWW-Authenticate` challenge of a 401 or
+	/// 403, or "" when the request was not challenged.
+	private string probeWith(string mcpEndpoint, string bearer, string mcpMethod,
+			string mcpName, string body_) @safe
 	{
 		string www;
 		try
@@ -457,9 +476,16 @@ final class OAuthClient
 				req.method = HTTPMethod.POST;
 				req.contentType = "application/json";
 				req.headers["Accept"] = "application/json, text/event-stream";
+				if (mcpMethod.length)
+				{
+					req.headers["MCP-Protocol-Version"] = "2026-07-28";
+					req.headers["Mcp-Method"] = mcpMethod;
+					if (mcpName.length)
+						req.headers["Mcp-Name"] = mcpName;
+				}
 				if (bearer.length)
 					req.headers["Authorization"] = "Bearer " ~ bearer;
-				req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"step-up","arguments":{}}}`);
+				req.writeBody(cast(const(ubyte)[]) body_);
 			}, (scope HTTPClientResponse res) {
 				if (res.statusCode == 401 || res.statusCode == 403)
 					www = res.headers.get("WWW-Authenticate", "");

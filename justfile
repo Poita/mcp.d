@@ -10,7 +10,9 @@
 
 # Pin the official conformance harness; matches CONFORMANCE_VERSION in
 # .github/workflows/conformance.yml. Bump deliberately, never `@latest`.
-conformance_version := "0.1.16"
+# The 0.2.0 alphas carry the 2026-07-28 scenarios and the frozen per-revision
+# requirement sets (`--requirements <revision>`); 0.1.x has neither.
+conformance_version := "0.2.0-alpha.11"
 
 # Show the list of available recipes (default when you run bare `just`).
 default:
@@ -32,27 +34,44 @@ fmt:
 lint:
     ./scripts/dscanner-lint.sh
 
-# Build + run the official MCP server conformance suite (server 39/39).
-conformance-server:
-    ulimit -n 65536 && dub build -c conformance-server
-    ./conformance-server --port 3000 & \
-      SERVER_PID=$!; \
-      trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT; \
-      for i in $(seq 1 30); do \
-        if curl -sf -o /dev/null "http://127.0.0.1:3000/mcp" \
-          -H 'Accept: application/json, text/event-stream' \
-          -H 'Content-Type: application/json' \
-          -X POST -d '{}'; then break; fi; \
-        sleep 1; \
-      done; \
-      npx --yes "@modelcontextprotocol/conformance@{{conformance_version}}" \
-        server --url http://127.0.0.1:3000/mcp
+# Build the two conformance harness targets.
+conformance-build:
+    ulimit -n 65536 && dub build -c conformance-server && dub build -c conformance-client
 
-# Build + run the official MCP client conformance suite (client 287/287).
-conformance-client:
-    ulimit -n 65536 && dub build -c conformance-client
+# 2025-11-25 runs the stateful server (initialize handshake); 2026-07-28 runs it
+# --stateless (per-request _meta). Each lane runs exactly the scenarios that
+# revision requires, at that revision's wire.
+# Server conformance for one revision, e.g. `just conformance-server-lane 2026-07-28`.
+conformance-server-lane revision: conformance-build
+    #!/usr/bin/env bash
+    set -uo pipefail
+    ulimit -n 65536
+    if [ "{{revision}}" = "2026-07-28" ]; then MODE="--stateless"; PORT=3001; else MODE=""; PORT=3000; fi
+    ./conformance-server --port "$PORT" $MODE &
+    SERVER_PID=$!
+    trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+    for i in $(seq 1 30); do
+      if curl -sf -o /dev/null "http://127.0.0.1:$PORT/mcp" \
+        -H 'Accept: application/json, text/event-stream' \
+        -H 'Content-Type: application/json' \
+        -X POST -d '{}'; then break; fi
+      sleep 1
+    done
     npx --yes "@modelcontextprotocol/conformance@{{conformance_version}}" \
-      client --command ./conformance-client --suite all
+      server --url "http://127.0.0.1:$PORT/mcp" --requirements "{{revision}}"
+
+# The harness forwards the revision to our client as
+# MCP_CONFORMANCE_PROTOCOL_VERSION, which selects the stateful or stateless lifecycle.
+# Client conformance for one revision, e.g. `just conformance-client-lane 2026-07-28`.
+conformance-client-lane revision: conformance-build
+    ulimit -n 65536 && npx --yes "@modelcontextprotocol/conformance@{{conformance_version}}" \
+      client --command ./conformance-client --requirements "{{revision}}"
+
+# Server conformance, both revisions.
+conformance-server: (conformance-server-lane "2025-11-25") (conformance-server-lane "2026-07-28")
+
+# Client conformance, both revisions.
+conformance-client: (conformance-client-lane "2025-11-25") (conformance-client-lane "2026-07-28")
 
 # Run both conformance suites (server then client).
 conformance: conformance-server conformance-client

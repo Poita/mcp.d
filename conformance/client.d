@@ -50,11 +50,20 @@ int main(string[] args)
 	return rc;
 }
 
+/// Whether the harness asked for the modern (2026-07-28) lifecycle. The runner
+/// forwards the resolved spec version as `MCP_CONFORMANCE_PROTOCOL_VERSION`
+/// (dated revisions through 2025-11-25 use the stateful initialize handshake,
+/// 2026-07-28 is stateless with per-request `_meta`); `MCP_MODERN=1` forces it
+/// for ad-hoc runs outside the harness.
 private bool modernRequested() @trusted
 {
 	import std.process : environment;
 
-	return environment.get("MCP_MODERN", "").length > 0;
+	if (environment.get("MCP_MODERN", "").length > 0)
+		return true;
+	ProtocolVersion v;
+	return tryParseVersion(environment.get("MCP_CONFORMANCE_PROTOCOL_VERSION", ""), v) && v
+		.isModern;
 }
 
 private int runScenario(string url, string scenario) @safe
@@ -66,31 +75,8 @@ private int runScenario(string url, string scenario) @safe
 	client.capabilities.sampling = true;
 	client.capabilities.elicitation = true;
 	client.capabilities.roots = true;
-
-	// Modern mode (stateless): MCP_MODERN=1 exercises server/discover + per-request
-	// _meta + standard headers against a modern-capable server.
-	if (modernRequested())
-	{
-		client.enableModern();
-		auto d = client.discover();
-		() @trusted {
-			import std.stdio : stderr;
-
-			stderr.writefln("modern discover: versions=%s server=%s",
-					d.protocolVersions, d.serverInfo.name);
-		}();
-		auto tools = client.listTools().tools;
-		// Exercise a plain request/response tool (the streaming/sampling tools use
-		// the older server-initiated mechanism, not modern MRTR).
-		foreach (t; tools)
-			if (t.name == "test_simple_text")
-				client.callTool(t.name, Json.emptyObject);
-		() @trusted { import std.stdio : stderr;
-
-		stderr.writeln("modern flow OK"); }();
-		return 0;
-	}
-
+	// The same handlers answer blocking server->client requests on a legacy
+	// session and MRTR input requests on a modern one.
 	client.onSampling = (CreateMessageRequest request) @safe => handleSampling(request);
 	client.onElicitation = (ElicitParams params) @safe => handleElicitation(params);
 	client.onListRoots = () @safe {
@@ -98,6 +84,9 @@ private int runScenario(string url, string scenario) @safe
 		result.roots = [Root("file:///workspace", nullable("Workspace"))];
 		return result;
 	};
+
+	if (modernRequested())
+		return runModernScenario(client);
 
 	client.initialize();
 
@@ -113,29 +102,164 @@ private int runScenario(string url, string scenario) @safe
 		client.startServerStream();
 		sleep(150.msecs); // let the GET stream connect before driving tools
 		auto tools = client.listTools().tools;
+		Json schema2020;
 		foreach (t; tools)
+			if (t.name == "json_schema_2020_12_tool")
+				schema2020 = t.inputSchema;
+		foreach (t; tools)
+		{
+			// json-schema-2020-12-preservation: echo the focal tool's inputSchema
+			// back verbatim; the focal tool itself is never called.
+			if (t.name == "json_schema_2020_12_tool")
+				continue;
+			if (t.name == "json_schema_echo")
+			{
+				if (schema2020.type == Json.Type.object)
+					tryCall(client, t.name, Json(["schema": schema2020]));
+				continue;
+			}
 			client.callTool(t.name, defaultArgs(t));
+		}
 	}
 	return 0;
 }
 
-/// Build minimal arguments for a tool from its input schema (empty unless the
-/// schema declares required string properties, which get placeholder values).
+/// The 2026-07-28 (stateless) flow: per-request `_meta` and standard headers on
+/// every POST, MRTR for server input, no handshake. Exercises every listed tool,
+/// resource, and prompt so the request-metadata, tools_call, MRTR, and header
+/// scenarios all observe the traffic they check.
+private int runModernScenario(McpClient client) @safe
+{
+	client.enableModern();
+	auto tools = listToolsRetryingVersion(client);
+
+	// http-custom-headers hands the exact tool calls to make via the scenario
+	// context; their argument values are what the header mirroring is checked on.
+	auto context = readContext();
+	if ("toolCalls" in context && context["toolCalls"].type == Json.Type.array)
+	{
+		auto calls = context["toolCalls"];
+		foreach (i; 0 .. calls.length)
+		{
+			auto c = calls[i];
+			if (c.type != Json.Type.object || "name" !in c)
+				continue;
+			tryCall(client, c["name"].get!string, ("arguments" in c)
+					? c["arguments"] : Json.emptyObject);
+		}
+		return 0;
+	}
+
+	// json-schema-2020-12-preservation: echo the focal tool's inputSchema back
+	// verbatim through json_schema_echo; the focal tool itself is never called.
+	Json schema2020;
+	foreach (t; tools)
+		if (t.name == "json_schema_2020_12_tool")
+			schema2020 = t.inputSchema;
+	foreach (t; tools)
+	{
+		if (t.name == "json_schema_2020_12_tool")
+			continue;
+		if (t.name == "json_schema_echo")
+		{
+			if (schema2020.type == Json.Type.object)
+				tryCall(client, t.name, Json(["schema": schema2020]));
+			continue;
+		}
+		tryCall(client, t.name, defaultArgs(t));
+	}
+
+	// http-standard-headers checks Mcp-Name on resources/read and prompts/get too.
+	try
+	{
+		foreach (r; client.listResources().resources)
+			try
+				client.readResource(r.uri);
+			catch (Exception)
+			{
+			}
+	}
+	catch (Exception)
+	{
+	}
+	try
+	{
+		foreach (pr; client.listPrompts().prompts)
+			try
+				client.getPrompt(pr.name, Json.emptyObject);
+			catch (Exception)
+			{
+			}
+	}
+	catch (Exception)
+	{
+	}
+	return 0;
+}
+
+/// `tools/list`, retrying once after an UnsupportedProtocolVersionError. The
+/// request-metadata scenario rejects the first request with -32022 to see the
+/// client retry with a version from `error.data.supported`; 2026-07-28 is the
+/// only modern version this client speaks, so the retry re-sends it.
+private Tool[] listToolsRetryingVersion(McpClient client) @safe
+{
+	try
+		return client.listTools().tools;
+	catch (McpException e)
+	{
+		if (e.code != ErrorCode.unsupportedProtocolVersion)
+			throw e;
+		return client.listTools().tools;
+	}
+}
+
+/// Call a tool, swallowing a JSON-RPC error: the scenarios judge the requests
+/// the client made, and one tool's failure must not stop the others.
+private void tryCall(McpClient client, string name, Json args) @safe
+{
+	try
+		client.callTool(name, args);
+	catch (Exception)
+	{
+	}
+}
+
+/// Build minimal arguments for a tool from its input schema: every required
+/// property gets a placeholder of its declared type (successive integers for
+/// numbers, `true` for booleans, "test" otherwise).
 private Json defaultArgs(Tool tool) @safe
 {
 	Json args = Json.emptyObject;
-	if (tool.inputSchema.type == Json.Type.object && "properties" in tool.inputSchema)
+	if (tool.inputSchema.type != Json.Type.object || "properties" !in tool.inputSchema)
+		return args;
+	auto props = tool.inputSchema["properties"];
+	string[] required;
+	if ("required" in tool.inputSchema && tool.inputSchema["required"].type == Json.Type.array)
 	{
-		auto props = tool.inputSchema["properties"];
-		string[] required;
-		if ("required" in tool.inputSchema && tool.inputSchema["required"].type == Json.Type.array)
+		auto req = tool.inputSchema["required"];
+		foreach (i; 0 .. req.length)
+			required ~= req[i].get!string;
+	}
+	int next = 2;
+	foreach (name; required)
+	{
+		string type;
+		if (props.type == Json.Type.object && name in props
+				&& props[name].type == Json.Type.object && "type" in props[name]
+				&& props[name]["type"].type == Json.Type.string)
+			type = props[name]["type"].get!string;
+		switch (type)
 		{
-			auto req = tool.inputSchema["required"];
-			foreach (i; 0 .. req.length)
-				required ~= req[i].get!string;
-		}
-		foreach (name; required)
+		case "integer":
+		case "number":
+			args[name] = next++;
+			break;
+		case "boolean":
+			args[name] = true;
+			break;
+		default:
 			args[name] = "test";
+		}
 	}
 	return args;
 }
@@ -169,20 +293,26 @@ private ElicitResult handleElicitation(ElicitParams params) @safe
 }
 
 /// Drive the OAuth 2.1 authorization flow for `auth/*` conformance scenarios:
-/// 401 probe -> metadata discovery -> Dynamic Client Registration -> (PKCE
-/// authorization-code or client-credentials) token acquisition -> retry the MCP
-/// request with the bearer token.
+/// 401 probe -> metadata discovery -> client identity (pre-registered, Client ID
+/// Metadata Document, or Dynamic Client Registration) -> (PKCE
+/// authorization-code or client-credentials) token acquisition -> handle any
+/// re-challenge (scope step-up, or an authorization-server change) -> the MCP
+/// requests with the bearer token.
 private int runAuthScenario(string url, string scenario) @safe
 {
 	import std.algorithm : canFind;
 
+	const modern = modernRequested();
 	auto oauth = new OAuthClient();
 	oauth.resource = canonicalResourceUri(url);
 	oauth.redirectUri = "http://localhost:8765/callback";
+	// The Client ID Metadata Document this client would host (SEP-991); used as
+	// the client_id whenever the authorization server advertises support.
+	oauth.clientIdMetadataUrl = "https://conformance-test.local/client-metadata.json";
 
 	auto context = readContext();
 
-	const www = oauth.probeUnauthorized(url);
+	const www = oauth.probeUnauthorized(url, "", modern);
 	ProtectedResourceMetadata prm;
 	bool havePrm;
 	try
@@ -210,39 +340,15 @@ private int runAuthScenario(string url, string scenario) @safe
 	}
 
 	bool issuerFromPrm;
-	const issuer = oauth.resolveIssuer(url, issuerFromPrm, www);
+	string issuer = oauth.resolveIssuer(url, issuerFromPrm, www);
 	auto as_ = oauth.discoverAuthServer(issuer, issuerFromPrm);
 
 	const w = parseWwwAuthenticate(www);
 	auto scopeStr = selectScope(w.scope_, prm.scopesSupported.length
 			? prm.scopesSupported : as_.scopesSupported);
 
-	// Client identity: a pre-registered client supplied via the scenario context,
-	// else Dynamic Client Registration.
-	RegisteredClient client;
-	if ("client_id" in context && context["client_id"].type == Json.Type.string)
-	{
-		client.clientId = context["client_id"].get!string;
-		if ("client_secret" in context && context["client_secret"].type == Json.Type.string)
-			client.clientSecret = context["client_secret"].get!string;
-	}
-	else
-	{
-		client = oauth.register(as_, "dlang-mcp-client", scopeStr);
-	}
-
-	// A private key in the context means private_key_jwt client authentication.
-	if ("private_key_pem" in context && context["private_key_pem"].type == Json.Type.string)
-	{
-		oauth.privateKeyPem = context["private_key_pem"].get!string;
-		oauth.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
-	}
-	else
-	{
-		// Choose the token-endpoint auth method: if we hold a secret and the AS
-		// supports a secret-based method, use it; otherwise prefer "none".
-		oauth.authMethod = chooseAuthMethod(as_, client.clientSecret.length > 0);
-	}
+	RegisteredClient client = obtainClient(oauth, as_, context, scopeStr);
+	configureAuthMethod(oauth, as_, client, context);
 
 	TokenSet tokens;
 	if ("idp_id_token" in context && context["idp_id_token"].type == Json.Type.string)
@@ -264,19 +370,47 @@ private int runAuthScenario(string url, string scenario) @safe
 	else
 		tokens = authCodeFlow(oauth, as_, client, scopeStr);
 
-	// Step-up: if the resource still challenges us for a broader scope, run the
-	// authorization flow again with the escalated scope.
+	// Re-challenge loop. A gated read first, then the privileged tools/call; a
+	// 401/403 on either is one of two things: the protected resource now names a
+	// different authorization server (SEP-2352: credentials are bound to the
+	// issuing server, so register afresh at the new one), or a step-up
+	// challenge for a broader scope (re-authorize with the union of what was
+	// granted and what is now required, so the prior grant is not dropped).
 	foreach (attempt; 0 .. 3)
 	{
 		if (tokens.accessToken.length == 0)
 			break;
-		const challenge = oauth.probeOperation(url, tokens.accessToken);
+		auto challenge = oauth.probeUnauthorized(url, tokens.accessToken, modern);
+		if (challenge.length == 0)
+			challenge = oauth.probeOperation(url, tokens.accessToken, modern, "test-tool");
 		if (challenge.length == 0)
 			break; // accepted
+
+		bool fromPrm2;
+		string issuer2 = issuer;
+		try
+			issuer2 = oauth.resolveIssuer(url, fromPrm2, challenge);
+		catch (Exception)
+		{
+		}
+		if (issuer2 != issuer)
+		{
+			issuer = issuer2;
+			issuerFromPrm = fromPrm2;
+			as_ = oauth.discoverAuthServer(issuer, issuerFromPrm);
+			client = obtainClient(oauth, as_, Json.emptyObject, scopeStr);
+			configureAuthMethod(oauth, as_, client, Json.emptyObject);
+			tokens = authCodeFlow(oauth, as_, client, scopeStr);
+			continue;
+		}
+
 		const newScope = parseWwwAuthenticate(challenge).scope_;
-		if (newScope.length == 0 || newScope == scopeStr)
+		if (newScope.length == 0)
 			break;
-		scopeStr = newScope;
+		const merged = unionScopes(scopeStr, newScope);
+		if (merged == scopeStr)
+			break;
+		scopeStr = merged;
 		tokens = authCodeFlow(oauth, as_, client, scopeStr);
 	}
 
@@ -285,12 +419,72 @@ private int runAuthScenario(string url, string scenario) @safe
 		auto mcp = McpClient.http(url);
 		mcp.setBearerToken(tokens.accessToken);
 		try
-			mcp.initialize();
+		{
+			if (modern)
+				mcp.enableModern();
+			else
+				mcp.initialize();
+			mcp.listTools();
+			mcp.callTool("test-tool", Json.emptyObject);
+		}
 		catch (Exception)
 		{
 		}
 	}
 	return 0;
+}
+
+/// The client identity for `as_`, in the spec's priority order: pre-registered
+/// credentials from the scenario context, then a Client ID Metadata Document
+/// when the authorization server advertises support, then Dynamic Client
+/// Registration.
+private RegisteredClient obtainClient(OAuthClient oauth,
+		AuthorizationServerMetadata as_, Json context, string scopeStr) @safe
+{
+	RegisteredClient client;
+	if ("client_id" in context && context["client_id"].type == Json.Type.string)
+	{
+		client.clientId = context["client_id"].get!string;
+		if ("client_secret" in context && context["client_secret"].type == Json.Type.string)
+			client.clientSecret = context["client_secret"].get!string;
+		return client;
+	}
+	if (oauth.registrationApproach(as_) == ClientRegistrationApproach.clientIdMetadataDocument)
+		return oauth.clientIdMetadataClient(as_);
+	return oauth.register(as_, "dlang-mcp-client", scopeStr);
+}
+
+/// Pick the token-endpoint auth method: private_key_jwt when the context
+/// supplies a key, else a secret-based method when we hold a secret and the AS
+/// supports one, else "none".
+private void configureAuthMethod(OAuthClient oauth,
+		AuthorizationServerMetadata as_, RegisteredClient client, Json context) @safe
+{
+	if ("private_key_pem" in context && context["private_key_pem"].type == Json.Type.string)
+	{
+		oauth.privateKeyPem = context["private_key_pem"].get!string;
+		oauth.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	}
+	else
+		oauth.authMethod = chooseAuthMethod(as_, client.clientSecret.length > 0);
+}
+
+/// The space-separated union of two scope strings, keeping `granted`'s order
+/// and appending the new scopes from `challenged`.
+private string unionScopes(string granted, string challenged) @safe
+{
+	import std.algorithm : canFind;
+	import std.array : join, split;
+
+	auto merged = granted.split(" ");
+	foreach (sc; challenged.split(" "))
+		if (sc.length && !merged.canFind(sc))
+			merged ~= sc;
+	string[] nonEmpty;
+	foreach (sc; merged)
+		if (sc.length)
+			nonEmpty ~= sc;
+	return nonEmpty.join(" ");
 }
 
 /// Run the PKCE authorization-code flow and return the resulting tokens.
@@ -299,7 +493,9 @@ private TokenSet authCodeFlow(OAuthClient oauth, AuthorizationServerMetadata as_
 {
 	auto pkce = generatePkce();
 	auto authzUrl = oauth.authorizationUrl(as_, client, pkce, scopeStr, "state-123");
-	const code = oauth.authorizeAndGetCode(authzUrl);
+	// The AS-aware overload validates the RFC 9207 `iss` parameter against the
+	// recorded issuer (and the echoed `state`), refusing the code on a mismatch.
+	const code = oauth.authorizeAndGetCode(as_, authzUrl, "state-123");
 	TokenSet tokens;
 	if (code.length)
 		tokens = oauth.exchangeCode(as_, client, code, pkce.verifier);

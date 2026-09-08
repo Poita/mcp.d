@@ -1,8 +1,12 @@
 name: Conformance
 
 # Gates spec conformance on every push/PR so regressions in the official
-# `@modelcontextprotocol/conformance` suite cannot land silently. This is what
-# keeps the "server 39/39 + client 287/287" claim in the README honest.
+# `@modelcontextprotocol/conformance` suite cannot land silently. Each protocol
+# revision the SDK claims is run against that revision's frozen requirement set
+# (`--requirements <revision>`), at that revision's wire: the dated revisions
+# through 2025-11-25 use the stateful initialize handshake, 2026-07-28 is
+# stateless with per-request _meta. Only required scenarios decide the exit
+# code; not-scored scenarios (extensions, added-after-release) are reported only.
 
 on:
   push:
@@ -11,14 +15,25 @@ on:
     branches: [main]
 
 # Pin the conformance harness for reproducibility. Bump deliberately (never
-# `@latest`) so a harness change is a reviewed, intentional commit.
+# `@latest`) so a harness change is a reviewed, intentional commit. Keep in sync
+# with `conformance_version` in the justfile.
 env:
-  CONFORMANCE_VERSION: "0.1.16"
+  CONFORMANCE_VERSION: "0.2.0-alpha.11"
 
 jobs:
   conformance:
-    name: MCP conformance suite (server + client)
+    name: MCP conformance (${{ matrix.revision }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - revision: "2025-11-25"
+            server_args: "--port 3000"
+            url: "http://127.0.0.1:3000/mcp"
+          - revision: "2026-07-28"
+            server_args: "--port 3001 --stateless"
+            url: "http://127.0.0.1:3001/mcp"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -40,17 +55,16 @@ jobs:
           dub build -c conformance-server
           dub build -c conformance-client
 
-      # The harness drives our Streamable HTTP server. It exits non-zero on any
-      # scenario failure, which fails the job. We additionally assert there are
-      # no reported failures in the captured summary so a "green" run that
-      # silently skipped scenarios is still caught.
-      - name: Server conformance suite
+      # The harness drives our Streamable HTTP server with exactly the scenarios
+      # this revision requires. It exits non-zero only when a required scenario
+      # fails; we additionally assert the summary line is present so a run that
+      # silently skipped everything is still caught.
+      - name: Server conformance (${{ matrix.revision }})
         run: |
-          ./conformance-server --port 3000 &
+          ./conformance-server ${{ matrix.server_args }} &
           SERVER_PID=$!
-          # Give the server a moment to bind the port.
           for i in $(seq 1 30); do
-            if curl -sf -o /dev/null "http://127.0.0.1:3000/mcp" \
+            if curl -sf -o /dev/null "${{ matrix.url }}" \
               -H 'Accept: application/json, text/event-stream' \
               -H 'Content-Type: application/json' \
               -X POST -d '{}'; then break; fi
@@ -58,41 +72,38 @@ jobs:
           done
           set +e
           npx --yes "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" \
-            server --url http://127.0.0.1:3000/mcp | tee server-conformance.log
+            server --url "${{ matrix.url }}" --requirements "${{ matrix.revision }}" \
+            | tee "server-conformance-${{ matrix.revision }}.log"
           STATUS=${PIPESTATUS[0]}
           set -e
           kill "$SERVER_PID" 2>/dev/null || true
-          # The harness also exits non-zero on advisory SHOULD warnings, so a
-          # non-zero exit alone is not a failure. Fail only if the suite did not
-          # complete (no summary line) or reported >=1 failed scenario.
-          if ! grep -q "Total:" server-conformance.log; then
+          if ! grep -q "Total:" "server-conformance-${{ matrix.revision }}.log"; then
             echo "::error::Server conformance did not complete (exit $STATUS)"
             exit 1
           fi
-          if grep -Eiq 'Total:.*[1-9][0-9]* failed' server-conformance.log; then
-            echo "::error::Server conformance reported failures"
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::Server conformance reported required-scenario failures (exit $STATUS)"
             exit 1
           fi
 
-      # Client mode: the harness spins up its own reference server and launches
-      # our client binary per scenario (URL appended, scenario in env). It exits
-      # non-zero on any failure; we also assert no reported failures.
-      - name: Client conformance suite
+      # Client mode: the harness spins up its own reference server per scenario
+      # and launches our client binary with the revision in
+      # MCP_CONFORMANCE_PROTOCOL_VERSION, which selects the stateful or the
+      # stateless lifecycle.
+      - name: Client conformance (${{ matrix.revision }})
         run: |
           set +e
           npx --yes "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" \
-            client --command ./conformance-client --suite all | tee client-conformance.log
+            client --command ./conformance-client --requirements "${{ matrix.revision }}" \
+            | tee "client-conformance-${{ matrix.revision }}.log"
           STATUS=${PIPESTATUS[0]}
           set -e
-          # The harness also exits non-zero on advisory SHOULD warnings, so a
-          # non-zero exit alone is not a failure. Fail only if the suite did not
-          # complete (no summary line) or reported >=1 failed scenario.
-          if ! grep -q "Total:" client-conformance.log; then
+          if ! grep -q "Total:" "client-conformance-${{ matrix.revision }}.log"; then
             echo "::error::Client conformance did not complete (exit $STATUS)"
             exit 1
           fi
-          if grep -Eiq 'Total:.*[1-9][0-9]* failed' client-conformance.log; then
-            echo "::error::Client conformance reported failures"
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::Client conformance reported required-scenario failures (exit $STATUS)"
             exit 1
           fi
 
@@ -100,8 +111,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: conformance-logs
+          name: conformance-logs-${{ matrix.revision }}
           path: |
-            server-conformance.log
-            client-conformance.log
+            server-conformance-${{ matrix.revision }}.log
+            client-conformance-${{ matrix.revision }}.log
           if-no-files-found: ignore
