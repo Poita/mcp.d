@@ -15,8 +15,10 @@ module mcp.api.skill_dir;
 import vibe.data.json : Json;
 
 import mcp.server.server : McpServer;
-import mcp.api.skills : SkillFile, SkillEntry, registerSkillResources, addSkillEntry, skillName,
-	skillFileUri, isValidSkillPath, isValidSkillName, skillDigest, verifyResourceDigest;
+import mcp.api.skills : SkillFile, SkillEntry, registerSkillResources,
+	addSkillEntry, skillName, skillFileUri, isValidSkillPath,
+	isValidSkillName, skillDigest,
+	verifyResourceDigest, resourceRef, maxSkillResources, maxSkillTotalBytes;
 
 @safe:
 
@@ -37,11 +39,15 @@ struct SkillDirOptions
 	/// filtered-out nested `SKILL.md` is neither served nor published as a
 	/// nested skill.
 	bool delegate(string relPath) @safe include;
-	/// Reject the directory if it holds more than this many files (a guard
-	/// against accidentally serving an enormous tree).
-	size_t maxFiles = 10_000;
-	/// Reject the directory if its files total more than this many bytes.
-	size_t maxTotalBytes = 64 * 1024 * 1024;
+	/// Reject the directory if the skill would carry more than this many
+	/// resources, `SKILL.md` included. Defaults to the extension's fixed per-skill
+	/// limit, which registration enforces regardless; lower it to reject a large
+	/// tree before its files are read into memory.
+	size_t maxFiles = maxSkillResources;
+	/// Reject the directory if its files, `SKILL.md` included, total more than
+	/// this many bytes. Defaults to the extension's fixed per-skill limit, which
+	/// registration enforces regardless; lower it to stop reading sooner.
+	size_t maxTotalBytes = maxSkillTotalBytes;
 }
 
 /// Register the skill directory `dir` on `server`. Reads `dir/SKILL.md` (served
@@ -86,7 +92,8 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 		throw new Exception("registerSkillDir: the final skill-path segment '" ~ skillName(
 				path) ~ "' must equal the SKILL.md frontmatter name '" ~ fmName ~ "'");
 
-	RawFile[] raws = collectFiles(dir, options.include, options.maxFiles, options.maxTotalBytes);
+	RawFile[] raws = collectFiles(dir, skillMd.length, options.include,
+			options.maxFiles, options.maxTotalBytes);
 
 	SkillFile[] files;
 	foreach (r; raws)
@@ -157,18 +164,13 @@ private Json[] buildNestedEntries(McpServer server, string path, RawFile[] raws)
 			throw new Exception("a skill at '" ~ uri ~ "' is already registered");
 
 		Json manifest = Json.emptyArray;
-		Json self = Json.emptyObject;
-		self["uri"] = uri;
-		self["digest"] = skillDigest(r.bytes);
-		manifest ~= self;
+		manifest ~= resourceRef(uri, skillDigest(r.bytes), r.bytes.length);
 		foreach (rr; raws)
 		{
 			if (rr.path == r.path || !rr.path.startsWith(dirRel ~ "/"))
 				continue;
-			Json m = Json.emptyObject;
-			m["uri"] = skillFileUri(path, rr.path);
-			m["digest"] = skillDigest(rr.bytes);
-			manifest ~= m;
+			manifest ~= resourceRef(skillFileUri(path, rr.path),
+					skillDigest(rr.bytes), rr.bytes.length);
 		}
 
 		Json entry = Json.emptyObject;
@@ -319,13 +321,18 @@ private struct RawFile
 	bool isText; /// served as text (vs base64 blob)
 }
 
-private RawFile[] collectFiles(string dir,
+/// Every file under `dir` except the root `SKILL.md`, whose byte length is
+/// `skillMdBytes`: the caps count the `SKILL.md` as one resource and its bytes
+/// toward the total, so they line up with the extension's per-skill limits.
+private RawFile[] collectFiles(string dir, size_t skillMdBytes,
 		scope bool delegate(string) @safe include, size_t maxFiles, size_t maxTotalBytes) @safe
 {
 	import std.algorithm : sort;
 
 	RawFile[] files;
-	size_t total;
+	size_t total = skillMdBytes;
+	if (total > maxTotalBytes)
+		throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
 	walkInto(dir, "", files, total, include, maxFiles, maxTotalBytes);
 	// Sort by path so the served order and the manifest order are deterministic.
 	sort!((a, b) => a.path < b.path)(files);
@@ -360,7 +367,8 @@ private void walkInto(string base, string rel, ref RawFile[] files, ref size_t t
 		if (include !is null && !include(childRel))
 			continue;
 
-		if (files.length + 1 > maxFiles)
+		// `files` excludes the root SKILL.md, which counts as a resource too.
+		if (files.length + 2 > maxFiles)
 			throw new Exception("registerSkillDir: skill directory exceeds maxFiles");
 		const fullPath = joinPath(base, childRel);
 		// Check the size against the cap BEFORE reading, so a single oversized
@@ -667,6 +675,51 @@ unittest  // registerSkillDir serves SKILL.md verbatim with authored, type-prese
 	assert(e["resources"][0]["digest"].get!string == skillDigestOf(md));
 }
 
+unittest  // a directory skill's manifest carries each file's byte length
+{
+	const root = tmpRoot("sizes");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+
+	const md = readResource(s, 1, "skill://pdf-forms/SKILL.md")["text"].get!string;
+	auto res = listedSkill(s, 2, 0)["resources"];
+	assert(res[0]["uri"].get!string == "skill://pdf-forms/SKILL.md");
+	assert(res[0]["size"].get!long == md.length);
+	assert(res[1]["uri"].get!string == "skill://pdf-forms/references/FORMS.md");
+	assert(res[1]["size"].get!long == "# Form Fields\n- applicant_name\n".length);
+}
+
+unittest  // SkillDirOptions caps default to the extension's fixed per-skill limits
+{
+	import mcp.api.skills : maxSkillResources, maxSkillTotalBytes;
+
+	SkillDirOptions opts;
+	assert(opts.maxFiles == maxSkillResources);
+	assert(opts.maxTotalBytes == maxSkillTotalBytes);
+}
+
+unittest  // maxFiles counts SKILL.md itself as one of the skill's resources
+{
+	import std.exception : assertThrown, assertNotThrown;
+
+	const root = tmpRoot("maxfiles");
+	writeSkillFixture(root); // SKILL.md + references/FORMS.md = 2 resources
+	scope (exit)
+		removeTree(root);
+
+	SkillDirOptions tight;
+	tight.maxFiles = 1;
+	assertThrown!Exception(registerSkillDir(new McpServer("t", "1"), root, tight));
+
+	SkillDirOptions exact;
+	exact.maxFiles = 2;
+	assertNotThrown!Exception(registerSkillDir(new McpServer("t", "1"), root, exact));
+}
+
 unittest  // registerSkillDir exposes supporting files as sibling resources
 {
 	const root = tmpRoot("files");
@@ -778,6 +831,7 @@ unittest  // a nested skill is additionally published as its own flat entry
 	assert(res[0]["uri"].get!string == nested["uri"].get!string);
 	assert(res[1]["uri"].get!string == "skill://outer/references/sub-skill/notes.md");
 	assert(res[1]["digest"].get!string == skillDigestOf("# Notes\n"));
+	assert(res[1]["size"].get!long == "# Notes\n".length);
 }
 
 unittest  // skills/get answers for a nested skill's uri
@@ -1051,7 +1105,7 @@ version (unittest)
 		e.uri = "skill://x/SKILL.md";
 		e.frontmatter = parseSkillFrontmatter(verifyMd);
 		e.resources = [
-			SkillResourceRef("skill://x/SKILL.md", skillDigestOf(verifyMd))
+			SkillResourceRef("skill://x/SKILL.md", skillDigestOf(verifyMd), verifyMd.length)
 		];
 		return e;
 	}
@@ -1062,14 +1116,24 @@ unittest  // verifySkillMarkdown passes for matching bytes and frontmatter
 	assert(verifySkillMarkdown(verifyEntry(), verifyMd) is null);
 }
 
-unittest  // verifySkillMarkdown reports a body mutation as a digest failure
+unittest  // verifySkillMarkdown reports a same-length body mutation as a digest failure
+{
+	const mutated = "---\nname: x\ndescription: d\n---\n\n# Bodx\n";
+	const reason = verifySkillMarkdown(verifyEntry(), mutated);
+	assert(reason !is null);
+	import std.algorithm : canFind;
+
+	assert(reason.canFind("digest mismatch"));
+}
+
+unittest  // verifySkillMarkdown reports a length-changing mutation as a size failure
 {
 	const mutated = "---\nname: x\ndescription: d\n---\n\n# Tampered\n";
 	const reason = verifySkillMarkdown(verifyEntry(), mutated);
 	assert(reason !is null);
 	import std.algorithm : canFind;
 
-	assert(reason.canFind("digest mismatch"));
+	assert(reason.canFind("size mismatch"));
 }
 
 unittest  // verifySkillMarkdown reports entry frontmatter that diverges from the file

@@ -30,6 +30,17 @@ enum string skillMimeType = "text/markdown";
 /// descend into (rather than a file to read).
 enum string skillDirectoryMimeType = "inode/directory";
 
+/// The most `resources` entries a single skill may carry, `SKILL.md` included.
+/// The Skills extension fixes this so servers know what every conforming host
+/// accepts; a skill over the limit is not guaranteed to be loadable anywhere,
+/// so registration rejects it.
+enum size_t maxSkillResources = 512;
+
+/// The largest total file size a single skill may carry: the sum of `size` over
+/// its `resources` entries, `SKILL.md` included (16 MiB). Registration rejects
+/// a skill over the limit for the same reason as `maxSkillResources`.
+enum size_t maxSkillTotalBytes = 16 * 1024 * 1024;
+
 /// A supporting file shipped alongside a skill's `SKILL.md` (a reference doc,
 /// template, example, or asset). Served as a sibling resource at
 /// `skill://<skill-path>/<path>`; `path` is relative to the skill root and may
@@ -287,8 +298,11 @@ void registerSkill(McpServer server, Skill skill) @safe
 /// reads them from a local directory) funnel into: serve `skillMd` verbatim at
 /// `skill://<path>/SKILL.md`, serve each supporting file resource, and add the
 /// conformant skill entry — verbatim `frontmatter`, the `SKILL.md` `uri`, and
-/// the complete per-file `resources` manifest of `{uri, digest}` pairs (the
-/// `SKILL.md`'s own entry first) — for `skills/list` / `skills/get` to serve.
+/// the complete per-file `resources` manifest of `{uri, digest, size}` entries
+/// (the `SKILL.md`'s own entry first) — for `skills/list` / `skills/get` to
+/// serve. Rejects a skill over the extension's fixed limits (`maxSkillResources`
+/// entries, `maxSkillTotalBytes` bytes), which no conforming host is required to
+/// load.
 /// `frontmatter` is the entry's `frontmatter` object — for a directory skill
 /// the authored YAML parsed to JSON, for a `Skill` the synthesized
 /// `{name, description, metadata}`. Throws if `path` is not a valid skill path
@@ -297,6 +311,7 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 		string skillMd, Json frontmatter, SkillFile[] files) @safe
 {
 	import std.base64 : Base64;
+	import std.conv : to;
 
 	if (!isValidSkillPath(path))
 		throw new Exception("invalid skill path '" ~ path
@@ -310,16 +325,23 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 	if (uri in server.ensureSkillIndex().byUri)
 		throw new Exception("a skill at '" ~ uri ~ "' is already registered");
 
+	if (files.length + 1 > maxSkillResources)
+		throw new Exception("skill '" ~ path ~ "' has " ~ (files.length + 1)
+				.to!string ~ " resources (SKILL.md included); the Skills extension "
+				~ "allows at most " ~ maxSkillResources.to!string);
+
 	// Build the complete per-file resources manifest — SKILL.md's own {uri,
-	// digest} first, then every supporting file, each digesting the bytes it
-	// serves (a blob file's digest covers its decoded bytes, not the base64
-	// transport form). Doing this up front keeps every throw-capable step (URI
-	// collisions, undecodable base64) ahead of any server mutation, so a failed
-	// registration can always roll back cleanly.
+	// digest, size} first, then every supporting file, each digesting and
+	// measuring the bytes it serves (a blob file's digest and size cover its
+	// decoded bytes, not the base64 transport form). Doing this up front keeps
+	// every throw-capable step (URI collisions, undecodable base64, the total
+	// size limit) ahead of any server mutation, so a failed registration can
+	// always roll back cleanly.
 	bool[string] localUris;
 	localUris[uri] = true;
 	Json manifest = Json.emptyArray;
-	manifest ~= resourceRef(uri, skillDigest(cast(const(ubyte)[]) skillMd));
+	manifest ~= resourceRef(uri, skillDigest(cast(const(ubyte)[]) skillMd), skillMd.length);
+	size_t total = skillMd.length;
 	foreach (file; files)
 	{
 		const fu = skillFileUri(path, file.path);
@@ -327,10 +349,15 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 			throw new Exception("duplicate skill resource uri '" ~ fu
 					~ "' (a supporting file path collides with another file or with SKILL.md)");
 		localUris[fu] = true;
-		const digest = file.isBlob
-			? skillDigest(Base64.decode(file.content)) : skillDigest(
-					cast(const(ubyte)[]) file.content);
-		manifest ~= resourceRef(fu, digest);
+		const(ubyte)[] bytes = file.isBlob
+			? Base64.decode(file.content) : cast(const(ubyte)[]) file.content;
+		total += bytes.length;
+		if (total > maxSkillTotalBytes)
+			throw new Exception(
+					"skill '" ~ path ~ "' totals more than " ~ maxSkillTotalBytes.to!string
+					~ " bytes across its files; the Skills "
+					~ "extension allows at most 16 MiB per skill");
+		manifest ~= resourceRef(fu, skillDigest(bytes), bytes.length);
 	}
 
 	enableSkills(server);
@@ -377,12 +404,15 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 	addSkillEntry(server, entry);
 }
 
-/// One `{uri, digest}` element of a skill entry's `resources` manifest.
-private Json resourceRef(string uri, string digest) @safe
+/// One `{uri, digest, size}` element of a skill entry's `resources` manifest:
+/// the file's URI, the `sha256:` digest of its raw bytes, and the byte length
+/// those same bytes have.
+package(mcp) Json resourceRef(string uri, string digest, size_t size) @safe
 {
 	Json r = Json.emptyObject;
 	r["uri"] = uri;
 	r["digest"] = digest;
+	r["size"] = cast(long) size;
 	return r;
 }
 
@@ -406,12 +436,14 @@ bool clientSupportsSkills(McpServer server) @safe
 
 import mcp.client.client : McpClient;
 
-/// One `{uri, digest}` pair from a skill entry's `resources` manifest: a file
-/// the skill serves and the sha256 of the bytes it serves.
+/// One `{uri, digest, size}` entry from a skill entry's `resources` manifest: a
+/// file the skill serves, the sha256 of the bytes it serves, and how many bytes
+/// those are.
 struct SkillResourceRef
 {
 	string uri; /// resource URI of the file
 	string digest; /// `sha256:<hex>` digest of the file's raw bytes
+	long size; /// byte length of the file's raw content (the bytes `digest` covers)
 
 	static SkillResourceRef fromJson(Json j) @safe
 	{
@@ -420,6 +452,8 @@ struct SkillResourceRef
 			r.uri = j["uri"].get!string;
 		if ("digest" in j && j["digest"].type == Json.Type.string)
 			r.digest = j["digest"].get!string;
+		if ("size" in j && j["size"].type == Json.Type.int_)
+			r.size = j["size"].get!long;
 		return r;
 	}
 }
@@ -436,7 +470,7 @@ struct SkillEntry
 {
 	string uri; /// resource URI of the `SKILL.md`
 	Json frontmatter; /// verbatim `SKILL.md` frontmatter as JSON
-	SkillResourceRef[] resources; /// complete `{uri, digest}` manifest of the skill's files
+	SkillResourceRef[] resources; /// complete `{uri, digest, size}` manifest of the skill's files
 
 	/// The skill `name` from the frontmatter, or empty if absent.
 	string name() const @safe
@@ -493,20 +527,26 @@ SkillEntry getSkill(McpClient client, string uri) @safe
 }
 
 /// Verify `bytes`, read from `uri`, against `entry`'s `resources` manifest, as
-/// SEP-2640 requires of hosts: the file must be listed in the manifest and its
-/// digest must match the bytes. Returns `null` on success, or a reason string
-/// on failure — an unlisted file is a verification failure equivalent to a
-/// digest mismatch, and a skill without `resources` offers no integrity at all.
-/// Whatever the cause, failed content must not be used; refresh the entry via
-/// `getSkill` and re-read.
+/// the Skills extension requires of hosts: the file must be listed in the
+/// manifest, its byte length must equal the entry's `size`, and its digest must
+/// match the bytes. Returns `null` on success, or a reason string on failure —
+/// an unlisted file or a length mismatch is a verification failure equivalent
+/// to a digest mismatch, and a skill without `resources` offers no integrity at
+/// all. Whatever the cause, failed content must not be used; refresh the entry
+/// via `getSkill` and re-read.
 string verifyResourceDigest(const SkillEntry entry, string uri, scope const(ubyte)[] bytes) @safe
 {
+	import std.conv : to;
+
 	if (entry.resources.length == 0)
 		return "the skill entry carries no resources manifest, so its content cannot be verified";
 	foreach (r; entry.resources)
 	{
 		if (r.uri != uri)
 			continue;
+		if (r.size != bytes.length)
+			return "size mismatch for " ~ uri ~ ": manifest lists " ~ r.size.to!string
+				~ " bytes but the content is " ~ bytes.length.to!string ~ " bytes";
 		const actual = skillDigest(bytes);
 		if (actual != r.digest)
 			return "digest mismatch for " ~ uri ~ ": manifest lists " ~ r.digest
@@ -514,6 +554,28 @@ string verifyResourceDigest(const SkillEntry entry, string uri, scope const(ubyt
 		return null;
 	}
 	return uri ~ " is not listed in the skill's resources manifest";
+}
+
+/// Check `entry` against the extension's fixed per-skill limits, which its
+/// complete `resources` manifest makes decidable before any file is fetched: at
+/// most `maxSkillResources` entries and at most `maxSkillTotalBytes` bytes in
+/// total. Returns `null` when the skill is within both limits (or has no
+/// manifest to count), else a reason a host can show the user for declining it.
+string checkSkillLimits(const SkillEntry entry) @safe
+{
+	import std.conv : to;
+
+	if (entry.resources.length > maxSkillResources)
+		return "the skill lists " ~ entry.resources.length.to!string
+			~ " resources; the Skills extension allows at most " ~ maxSkillResources.to!string;
+	long total;
+	foreach (r; entry.resources)
+		total += r.size;
+	if (total > maxSkillTotalBytes)
+		return "the skill's files total " ~ total.to!string
+			~ " bytes; the Skills extension allows at most 16 MiB ("
+			~ maxSkillTotalBytes.to!string ~ " bytes)";
+	return null;
 }
 
 /// Read a skill's `SKILL.md` by its resource URI — a wrapper over
@@ -771,6 +833,88 @@ unittest  // a skill's resources manifest lists every file exactly once with its
 	assert(digestFor("skill://pdf/references/FORMS.md") == skillDigest(
 			cast(const(ubyte)[]) "# Forms\n"));
 	assert(digestFor("skill://pdf/assets/logo.bin") == skillDigest(raw));
+}
+
+unittest  // every manifest entry carries the byte length of the content its digest covers
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import std.base64 : Base64;
+
+	auto s = new McpServer("t", "1");
+	const raw = cast(const(ubyte)[]) "\x00binary\xff";
+	Skill sk = {
+		path: "pdf", description: "Process PDFs", instructions: "# PDF\n",
+		files: [
+				SkillFile("references/FORMS.md", "text/markdown", "# Forms\n"),
+				SkillFile("assets/logo.bin", "application/octet-stream",
+						Base64.encode(raw).idup, true)
+		]
+	};
+	registerSkill(s, sk);
+
+	auto e = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"]["skills"][0];
+	auto res = e["resources"];
+
+	long sizeFor(string uri) @safe
+	{
+		foreach (i; 0 .. res.length)
+			if (res[i]["uri"].get!string == uri)
+				return res[i]["size"].get!long;
+		assert(false, "manifest is missing " ~ uri);
+	}
+
+	// SKILL.md's size is the length of the rendered markdown it serves.
+	Json rp = Json.emptyObject;
+	rp["uri"] = "skill://pdf/SKILL.md";
+	const md = s.handle(Message(makeRequest(Json(2), "resources/read", rp)))
+		.get["result"]["contents"][0]["text"].get!string;
+	assert(sizeFor("skill://pdf/SKILL.md") == md.length);
+	assert(sizeFor("skill://pdf/references/FORMS.md") == "# Forms\n".length);
+	// A blob's size counts the decoded bytes, not the base64 transport form.
+	assert(sizeFor("skill://pdf/assets/logo.bin") == raw.length);
+}
+
+unittest  // a skill with more than 512 resources (SKILL.md included) is rejected
+{
+	import std.exception : assertThrown, assertNotThrown;
+
+	assert(maxSkillResources == 512);
+
+	SkillFile[] files;
+	foreach (i; 0 .. maxSkillResources - 1) // + SKILL.md = exactly the limit
+	{
+		import std.conv : to;
+
+		files ~= SkillFile("f" ~ i.to!string ~ ".txt", "text/plain", "x");
+	}
+	Skill atLimit = {
+		path: "at-limit", description: "d", instructions: "# A\n", files: files
+	};
+	assertNotThrown!Exception(registerSkill(new McpServer("t", "1"), atLimit));
+
+	files ~= SkillFile("one-too-many.txt", "text/plain", "x");
+	Skill over = {
+		path: "over", description: "d", instructions: "# O\n", files: files
+	};
+	assertThrown!Exception(registerSkill(new McpServer("t", "1"), over));
+}
+
+unittest  // a skill whose files total more than 16 MiB is rejected
+{
+	import std.exception : assertThrown;
+
+	assert(maxSkillTotalBytes == 16_777_216);
+
+	// SKILL.md plus one file of exactly the limit exceeds it by the SKILL.md bytes.
+	import std.array : replicate;
+
+	Skill sk = {
+		path: "huge", description: "d", instructions: "# H\n", files: [
+			SkillFile("big.txt", "text/plain", "a".replicate(maxSkillTotalBytes))
+		]
+	};
+	assertThrown!Exception(registerSkill(new McpServer("t", "1"), sk));
 }
 
 unittest  // skills/list paginates whole entries with cursor/nextCursor
@@ -1112,14 +1256,96 @@ unittest  // SkillEntry.fromJson reads uri, frontmatter, and the resources manif
 	assert(e.resources[1].digest == "sha256:def");
 }
 
+unittest  // SkillEntry.fromJson reads each manifest entry's size
+{
+	import vibe.data.json : parseJsonString;
+
+	auto e = SkillEntry.fromJson(parseJsonString(`{
+		"uri": "skill://x/SKILL.md",
+		"frontmatter": {"name": "x", "description": "d"},
+		"resources": [
+			{"uri": "skill://x/SKILL.md", "digest": "sha256:abc", "size": 2314},
+			{"uri": "skill://x/a.md", "digest": "sha256:def", "size": 962}
+		]
+	}`));
+	assert(e.resources[0].size == 2314);
+	assert(e.resources[1].size == 962);
+}
+
+unittest  // verifyResourceDigest treats a byte-length mismatch as a verification failure
+{
+	const bytes = cast(const(ubyte)[]) "# Forms\n";
+	SkillEntry e;
+	e.uri = "skill://pdf/SKILL.md";
+	// The digest is right but the advertised size is not: still a failure, per the
+	// spec's rule that a read whose length differs from `size` fails verification.
+	e.resources = [
+		SkillResourceRef("skill://pdf/references/FORMS.md", skillDigest(bytes), 999)
+	];
+	const reason = verifyResourceDigest(e, "skill://pdf/references/FORMS.md", bytes);
+	assert(reason !is null);
+	import std.algorithm : canFind;
+
+	assert(reason.canFind("size"));
+}
+
+unittest  // verifyResourceDigest accepts bytes whose length and digest both match
+{
+	const bytes = cast(const(ubyte)[]) "# Forms\n";
+	SkillEntry e;
+	e.uri = "skill://pdf/SKILL.md";
+	e.resources = [
+		SkillResourceRef("skill://pdf/references/FORMS.md", skillDigest(bytes), bytes.length)
+	];
+	assert(verifyResourceDigest(e, "skill://pdf/references/FORMS.md", bytes) is null);
+}
+
+unittest  // checkSkillLimits passes an entry within both per-skill limits
+{
+	SkillEntry e;
+	e.uri = "skill://x/SKILL.md";
+	e.resources = [SkillResourceRef("skill://x/SKILL.md", "sha256:abc", 5120)];
+	assert(checkSkillLimits(e) is null);
+}
+
+unittest  // checkSkillLimits rejects more than 512 resources
+{
+	import std.conv : to;
+
+	SkillEntry e;
+	e.uri = "skill://x/SKILL.md";
+	foreach (i; 0 .. maxSkillResources + 1)
+		e.resources ~= SkillResourceRef("skill://x/f" ~ i.to!string, "sha256:abc", 1);
+	const reason = checkSkillLimits(e);
+	assert(reason !is null);
+	import std.algorithm : canFind;
+
+	assert(reason.canFind("512"));
+}
+
+unittest  // checkSkillLimits rejects a total size over 16 MiB, summing `size` alone
+{
+	SkillEntry e;
+	e.uri = "skill://x/SKILL.md";
+	e.resources = [
+		SkillResourceRef("skill://x/SKILL.md", "sha256:abc", 100),
+		SkillResourceRef("skill://x/big.bin", "sha256:def", maxSkillTotalBytes)
+	];
+	const reason = checkSkillLimits(e);
+	assert(reason !is null);
+	import std.algorithm : canFind;
+
+	assert(reason.canFind("16"));
+}
+
 unittest  // verifyResourceDigest accepts bytes matching the listed digest
 {
 	const bytes = cast(const(ubyte)[]) "# Forms\n";
 	SkillEntry e;
 	e.uri = "skill://pdf/SKILL.md";
 	e.resources = [
-		SkillResourceRef("skill://pdf/SKILL.md", "sha256:unused"),
-		SkillResourceRef("skill://pdf/references/FORMS.md", skillDigest(bytes))
+		SkillResourceRef("skill://pdf/SKILL.md", "sha256:unused", 0),
+		SkillResourceRef("skill://pdf/references/FORMS.md", skillDigest(bytes), bytes.length)
 	];
 	assert(verifyResourceDigest(e, "skill://pdf/references/FORMS.md", bytes) is null);
 }
@@ -1128,9 +1354,10 @@ unittest  // verifyResourceDigest reports a digest mismatch
 {
 	SkillEntry e;
 	e.uri = "skill://pdf/SKILL.md";
+	// Same length as the tampered bytes, so only the digest can catch the change.
 	e.resources = [
 		SkillResourceRef("skill://pdf/references/FORMS.md",
-				skillDigest(cast(const(ubyte)[]) "original"))
+				skillDigest(cast(const(ubyte)[]) "original"), "original".length)
 	];
 	const reason = verifyResourceDigest(e, "skill://pdf/references/FORMS.md",
 			cast(const(ubyte)[]) "tampered");
