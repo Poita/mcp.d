@@ -606,6 +606,11 @@ struct ClientRegistration
 	string tokenEndpointAuthMethod = "none";
 	string clientName;
 	string scope_;
+	/// The OpenID Connect `application_type` (`"native"` or `"web"`). MCP clients
+	/// MUST send one: an OIDC authorization server defaults an absent value to
+	/// `"web"` and then rejects the loopback redirect URIs native clients use.
+	/// Empty infers it from the first redirect URI (`applicationTypeFor`).
+	string applicationType;
 
 	Json toJson() const @safe
 	{
@@ -614,6 +619,8 @@ struct ClientRegistration
 		foreach (u; redirectUris)
 			ru ~= Json(u);
 		j["redirect_uris"] = ru;
+		j["application_type"] = applicationType.length ? applicationType
+			: applicationTypeFor(redirectUris.length ? redirectUris[0] : "");
 		Json gt = Json.emptyArray;
 		foreach (g; grantTypes)
 			gt ~= Json(g);
@@ -631,6 +638,39 @@ struct ClientRegistration
 	}
 }
 
+/// The OpenID Connect `application_type` a redirect URI implies: `"native"` for
+/// a loopback host (`localhost`, `127.0.0.1`, `[::1]`) or a non-HTTP custom
+/// scheme, which is how desktop, mobile, and CLI clients receive the redirect;
+/// `"web"` for an `http(s)` redirect on any other host.
+string applicationTypeFor(string redirectUri) @safe pure
+{
+	import std.algorithm : startsWith;
+	import std.string : indexOf;
+
+	const isHttp = redirectUri.startsWith("http://") || redirectUri.startsWith("https://");
+	if (!isHttp)
+		return "native";
+	auto rest = redirectUri[redirectUri.indexOf("://") + 3 .. $];
+	// Trim the path, then any port (a bracketed IPv6 host keeps its brackets).
+	const slash = rest.indexOf('/');
+	if (slash >= 0)
+		rest = rest[0 .. slash];
+	string host = rest;
+	if (host.startsWith("["))
+	{
+		const close = host.indexOf(']');
+		if (close >= 0)
+			host = host[0 .. close + 1];
+	}
+	else
+	{
+		const colon = host.indexOf(':');
+		if (colon >= 0)
+			host = host[0 .. colon];
+	}
+	return (host == "localhost" || host == "127.0.0.1" || host == "[::1]") ? "native" : "web";
+}
+
 /// The credentials returned by the registration endpoint.
 struct RegisteredClient
 {
@@ -644,6 +684,39 @@ struct RegisteredClient
 		c.clientSecret = strField(j, "client_secret");
 		return c;
 	}
+}
+
+unittest  // a registration request always names its application_type
+{
+	// basic/authorization/client-registration: MCP clients MUST specify an
+	// appropriate application_type during Dynamic Client Registration; omitting
+	// it defaults to "web" under OIDC, which conflicts with native redirect URIs.
+	ClientRegistration reg;
+	reg.redirectUris = ["http://127.0.0.1:8765/callback"];
+	auto j = reg.toJson();
+	assert(j["application_type"].get!string == "native");
+
+	reg.applicationType = "web";
+	assert(reg.toJson()["application_type"].get!string == "web");
+}
+
+unittest  // applicationTypeFor classifies loopback and custom-scheme redirects as native
+{
+	assert(applicationTypeFor("http://localhost:8080/cb") == "native");
+	assert(applicationTypeFor("http://127.0.0.1/cb") == "native");
+	assert(applicationTypeFor("http://[::1]:9000/cb") == "native");
+	assert(applicationTypeFor("com.example.app:/oauth") == "native");
+	assert(applicationTypeFor("https://app.example.com/callback") == "web");
+	assert(applicationTypeFor("http://app.example.com/callback") == "web");
+}
+
+unittest  // an explicit applicationType wins over the redirect-URI inference
+{
+	ClientRegistration reg;
+	reg.redirectUris = ["https://app.example.com/callback"];
+	assert(reg.toJson()["application_type"].get!string == "web");
+	reg.applicationType = "native";
+	assert(reg.toJson()["application_type"].get!string == "native");
 }
 
 // ===========================================================================
