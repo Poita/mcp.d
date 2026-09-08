@@ -70,6 +70,8 @@ private int runScenario(string url, string scenario) @safe
 {
 	if (scenario.startsWith("auth/"))
 		return runAuthScenario(url, scenario);
+	if (scenario.startsWith("sep-2640-client-"))
+		return runSkillsScenario(url, scenario);
 
 	auto client = McpClient.http(url);
 	client.capabilities.sampling = true;
@@ -122,6 +124,78 @@ private int runScenario(string url, string scenario) @safe
 		}
 	}
 	return 0;
+}
+
+/// The SEP-2640 host obligations the client scenarios observe on the wire: list
+/// skills without fetching anything (lazy retrieval); load a skill only after
+/// its `SKILL.md` verifies against the held entry (size, digest, frontmatter);
+/// and never put a read of an unlisted skill file on the wire. A verification
+/// failure exits non-zero before any supporting file is read, which is what the
+/// harness treats as the pass.
+private int runSkillsScenario(string url, string scenario) @safe
+{
+	auto client = McpClient.http(url);
+	if (modernRequested())
+		client.enableModern();
+	else
+		client.initialize();
+
+	auto skills = listSkills(client);
+	if (scenario == "sep-2640-client-no-prefetch" || skills.length == 0)
+		return 0; // the listing alone builds the registry; nothing is fetched
+
+	auto entry = skills[0];
+	if (!entry.isValid)
+	{
+		stderrLine("skills: entry for " ~ entry.uri ~ " has no valid resources; refusing to load");
+		return 1;
+	}
+	// Load: fetch SKILL.md and verify it against the held entry before use.
+	const md = readSkillUri(client, entry.uri);
+	if (auto reason = verifySkillMarkdown(entry, md))
+	{
+		stderrLine("skills: refusing to load " ~ entry.uri ~ ": " ~ reason);
+		return 1;
+	}
+
+	// Acting on the skill: reads resolve only to URIs the held entry lists.
+	string[] wanted;
+	foreach (r; entry.resources)
+		if (r.uri != entry.uri)
+			wanted ~= r.uri;
+	if (scenario == "sep-2640-client-verify-unlisted")
+		wanted ~= entry.uri[0 .. $ - "SKILL.md".length] ~ "scripts/extract.py";
+	foreach (uri; wanted)
+	{
+		if (!isListed(entry, uri))
+		{
+			stderrLine("skills: " ~ uri ~ " is not in the skill's manifest; not reading it");
+			continue;
+		}
+		auto contents = client.readResource(uri);
+		const text = contents.contents.length ? contents.contents[0].text : "";
+		if (auto reason = verifyResourceDigest(entry, uri, cast(const(ubyte)[]) text))
+		{
+			stderrLine("skills: " ~ uri ~ " failed verification: " ~ reason);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+private bool isListed(const SkillEntry entry, string uri) @safe
+{
+	foreach (r; entry.resources)
+		if (r.uri == uri)
+			return true;
+	return false;
+}
+
+private void stderrLine(string line) @trusted
+{
+	import std.stdio : stderr;
+
+	stderr.writeln(line);
 }
 
 /// The 2026-07-28 (stateless) flow: per-request `_meta` and standard headers on

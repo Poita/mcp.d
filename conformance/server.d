@@ -55,6 +55,7 @@ void main(string[] args)
 	registerElicitationSepFixtures(server);
 	registerModernFixtures(server);
 	registerMrtrFixtures(server);
+	registerSkillFixtures(server);
 	server.enableLogging();
 	// Resource subscriptions correlate HTTP calls and exist only on the stateful
 	// lane; the modern lane advertises the list-changed capabilities its
@@ -1022,4 +1023,29 @@ private void registerTaskFixtures(McpServer server) @safe
 		return server.startTask("test_tool_with_task", input, ctx);
 	});
 	server.setToolTaskSupport("test_tool_with_task", TaskSupport.required);
+}
+
+// ===========================================================================
+// SEP-2640 (Skills extension) fixtures: the sep-2640-skills-* scenarios.
+// ===========================================================================
+
+/// One static skill with a supporting file in a subdirectory (so a directory
+/// read sees both a file and a subdirectory child) and one dynamic skill, all
+/// published through skills/list and skills/get.
+private void registerSkillFixtures(McpServer server) @safe
+{
+	Skill pdf = {
+		path: "office/pdf-forms", description: "Fill in PDF forms using the field reference", instructions: "# PDF Forms\n\nConsult `references/FORMS.md`, then fill each field.\n",
+		metadata: ["version": "1.0.0"], files: [
+				SkillFile("references/FORMS.md", "text/markdown",
+						"# Form fields\n\n- applicant_name\n")
+		]
+	};
+	registerSkill(server, pdf);
+
+	DynamicSkill daily = {
+		path: "reports/daily", description: "Assemble today's operational report",
+		instructions: () @safe => "# Daily report\n\nGenerated on demand.\n"
+	};
+	registerDynamicSkill(server, daily);
 }
