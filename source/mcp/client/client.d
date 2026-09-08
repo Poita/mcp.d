@@ -1269,8 +1269,25 @@ final class McpClient : ClientProtocol
 	private CallToolResult callToolImpl(string name, Json arguments, RequestOptions opts) @safe
 	{
 		auto token = effectiveToken(opts);
-		return withPerCallProgress!CallToolResult(opts,
-				() @safe => callToolLoop(name, arguments, token, opts.logLevel));
+		return withPerCallProgress!CallToolResult(opts, () @safe {
+			try
+				return callToolLoop(name, arguments, token, opts.logLevel);
+			catch (McpException e)
+			{
+				// A modern server that rejects the call with HeaderMismatch is telling
+				// us the mirrored Mcp-Param-* headers no longer match the tool's
+				// inputSchema (basic/transports/streamable-http §Custom Headers from
+				// Tool Parameters): refresh tools/list so the header mirroring sees
+				// the current schema, then retry the call once. A second rejection
+				// propagates.
+				if (!useModern || e.code != ErrorCode.headerMismatch)
+					throw e;
+				RequestOptions refresh;
+				refresh.cacheMode = CacheMode.refresh;
+				cast(void) listTools(refresh);
+				return callToolLoop(name, arguments, token, opts.logLevel);
+			}
+		});
 	}
 
 	/// Convenience overload for the dominant single-callback case: route this
@@ -5915,6 +5932,70 @@ unittest  // listResourceTemplates calls resources/templates/list and auto-pagin
 	assert(templates.length == 2);
 	assert(templates[0].uriTemplate == "file:///a/{x}");
 	assert(templates[1].name == "b");
+}
+
+unittest  // a HeaderMismatch on tools/call refreshes tools/list and retries once
+{
+	// basic/transports/streamable-http: if the server rejects a request with
+	// HeaderMismatch because required Mcp-Param-* headers are missing or do not
+	// match the body, the client SHOULD call tools/list to check for changes to
+	// the tool's inputSchema, then retry the original request.
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	string[] methods;
+	c.onRpcForTest = (string method, Json params) @safe {
+		methods ~= method;
+		if (method == "tools/call" && methods.length == 1)
+			throw new McpException(ErrorCode.headerMismatch, "Missing Mcp-Param-Region header");
+		if (method == "tools/list")
+		{
+			Json t = Json.emptyObject;
+			t["name"] = "add";
+			t["inputSchema"] = Json(["type": Json("object")]);
+			Json r = Json.emptyObject;
+			r["tools"] = Json([t]);
+			return r;
+		}
+		Json r = Json.emptyObject;
+		r["content"] = Json([Json(["type": Json("text"), "text": Json("ok")])]);
+		return r;
+	};
+	auto res = c.callTool("add", Json.emptyObject);
+	assert(methods == ["tools/call", "tools/list", "tools/call"]);
+	assert(res.content.length == 1);
+}
+
+unittest  // a second HeaderMismatch after the refresh propagates rather than looping
+{
+	import std.exception : assertThrown;
+
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	string[] methods;
+	c.onRpcForTest = (string method, Json params) @safe {
+		methods ~= method;
+		if (method == "tools/call")
+			throw new McpException(ErrorCode.headerMismatch, "Missing Mcp-Param-Region header");
+		Json r = Json.emptyObject;
+		r["tools"] = Json.emptyArray;
+		return r;
+	};
+	assertThrown!McpException(c.callTool("add", Json.emptyObject));
+	assert(methods == ["tools/call", "tools/list", "tools/call"]);
+}
+
+unittest  // a HeaderMismatch on a legacy session is not retried (no header mirroring there)
+{
+	import std.exception : assertThrown;
+
+	auto c = McpClient.http("http://localhost");
+	string[] methods;
+	c.onRpcForTest = (string method, Json params) @safe {
+		methods ~= method;
+		throw new McpException(ErrorCode.headerMismatch, "x");
+	};
+	assertThrown!McpException(c.callTool("add", Json.emptyObject));
+	assert(methods == ["tools/call"]);
 }
 
 unittest  // notifyRootsListChanged is sent on a legacy session
