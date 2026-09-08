@@ -6733,7 +6733,7 @@ unittest  // a task tool that requires the extension rejects a client without it
 	desc.name = "must-task";
 	desc.inputSchema = Json(["type": Json("object")]);
 	s.registerTaskTool(desc, (TaskContext tc) @safe => Json([
-			"content": Json.emptyArray
+		"content": Json.emptyArray
 	]), Nullable!Duration.init, Nullable!Duration.init, TaskSupport.required);
 
 	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
