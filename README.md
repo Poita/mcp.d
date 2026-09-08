@@ -74,12 +74,27 @@ This always pulls the latest release (see the Dub version badge above). Then
 
 ## Status
 
-**All official conformance tests pass** (0 failures): **server 39/39**, **client 287/287**
-(one advisory `SHOULD` warning on the optional Client-ID-Metadata-Document flow).
+**Every scenario the official conformance harness requires passes, for both revisions
+the SDK claims, with no warnings.** The harness
+(`@modelcontextprotocol/conformance` 0.2.0-alpha.11) scores each protocol revision
+against its frozen requirement set, run at that revision's wire:
 
-- ✅ **All 39 server scenarios**: lifecycle, tools with every content type, resources +
+| Lane | Server | Client |
+|---|---|---|
+| `--requirements 2025-11-25` (stateful, `initialize` handshake) | 80 checks, 0 failed | 329 checks, 0 failed, 0 warnings |
+| `--requirements 2026-07-28` (stateless, per-request `_meta`) | 185 checks, 0 failed | 490 checks, 0 failed, 0 warnings |
+
+Unscored scenarios the harness also runs: DPoP and the workload-identity JWT-bearer grant
+(not implemented), and the Tasks extension suite, where every functional check passes and
+the one remaining check is the harness's own wire-schema validator rejecting any
+`CreateTaskResult` against the base `CallToolResult` schema.
+
+- ✅ **All server scenarios**: lifecycle, tools with every content type, resources +
   templates + subscribe, prompts, completion, logging, progress/logging streaming, sampling,
-  elicitation (incl. SEP-1034/1330), DNS-rebinding protection.
+  elicitation (incl. SEP-1034/1330), DNS-rebinding protection; on 2026-07-28 also the
+  stateless architecture checks (per-request `_meta`, `server/discover`, version
+  negotiation, header validation, `subscriptions/listen`), caching hints, JSON Schema
+  2020-12 preservation, and the full SEP-2322 input-required-result family.
 - ✅ **All client scenarios**, including the **complete OAuth 2.1** suite — token-endpoint
   auth (none/basic/post + **`private_key_jwt`** ES256), metadata discovery (all variants +
   2025-03-26 backcompat + endpoint fallback), scope selection/step-up/retry-limit,
@@ -937,25 +952,36 @@ for `runTask` and the Tasks extension, not a thread bridge.
 
 ## Running the conformance suite
 
-Server suite:
+Each protocol revision runs against its frozen requirement set, at that revision's
+wire: the dated revisions through `2025-11-25` use the stateful `initialize`
+handshake, `2026-07-28` is stateless with per-request `_meta`, so the server is
+started once per lane.
 
 ```bash
-dub build -c conformance-server
-./conformance-server --port 3000 &
-npx @modelcontextprotocol/conformance@0.1.16 server --url http://127.0.0.1:3000/mcp
+just conformance                       # all four lanes (server + client, both revisions)
+just conformance-server-lane 2026-07-28 # one lane: `conformance-server --stateless` + --requirements
+just conformance-client-lane 2025-11-25
 ```
 
-Client suite:
+By hand:
 
 ```bash
-dub build -c conformance-client
-npx @modelcontextprotocol/conformance@0.1.16 client --command ./conformance-client --suite all
+dub build -c conformance-server && dub build -c conformance-client
+./conformance-server --port 3000 &              # stateful: 2025-11-25 lane
+./conformance-server --port 3001 --stateless &  # modern:   2026-07-28 lane
+npx @modelcontextprotocol/conformance@0.2.0-alpha.11 server --url http://127.0.0.1:3000/mcp --requirements 2025-11-25
+npx @modelcontextprotocol/conformance@0.2.0-alpha.11 server --url http://127.0.0.1:3001/mcp --requirements 2026-07-28
+npx @modelcontextprotocol/conformance@0.2.0-alpha.11 client --command ./conformance-client --requirements 2025-11-25
+npx @modelcontextprotocol/conformance@0.2.0-alpha.11 client --command ./conformance-client --requirements 2026-07-28
 ```
 
-Both suites run automatically in CI on every push and pull request via the
+The client harness forwards the revision to `conformance-client` as
+`MCP_CONFORMANCE_PROTOCOL_VERSION`, which selects the stateful or the stateless
+lifecycle. All four lanes run in CI on every push and pull request via the
 [`Conformance`](.github/workflows/conformance.yml) workflow, with the harness
-version pinned for reproducibility. The job fails on any scenario failure,
-keeping the **server 39/39** and **client 287/287** baseline honest.
+version pinned for reproducibility; a lane fails on any required-scenario
+failure. Unscored scenarios (extensions, scenarios added after a revision
+shipped) are reported but never fail the job.
 
 ## Contributing
 

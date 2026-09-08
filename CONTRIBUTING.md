@@ -112,8 +112,9 @@ These conventions are enforced by review (and some by CI). Please follow them:
   match the authoritative schema for the relevant protocol version. **Revision-specific
   behavior must be gated on the negotiated protocol version** — a change for
   `2026-07-28` must not alter the wire output of earlier revisions (`2025-11-25`,
-  `2025-06-18`, …), and vice versa. Don't regress the conformance baseline (**server 39/39**,
-  **client 287/287**).
+  `2025-06-18`, …), and vice versa. Don't regress the conformance baseline: every
+  required scenario passes in all four lanes (server and client, `2025-11-25` and
+  `2026-07-28`), with no warnings.
 - **Keep new public API reachable.** Anything new and public should be exported
   via `source/mcp/package.d` and usable from `McpServer` / `McpClient` /
   `RequestContext` (or the UDA layer), with a runnable path for callers.
@@ -123,31 +124,50 @@ These conventions are enforced by review (and some by CI). Please follow them:
 
 The SDK is validated against the official
 [`@modelcontextprotocol/conformance`](https://www.npmjs.com/package/@modelcontextprotocol/conformance)
-suite. There are two harnesses — one tests our server, one tests our client.
+suite, pinned in the justfile and CI. There are two harnesses (one tests our
+server, one tests our client) and each runs once per protocol revision against
+that revision's frozen requirement set, at that revision's wire: `2025-11-25` is
+the stateful `initialize` handshake, `2026-07-28` is stateless with per-request
+`_meta`.
+
+```bash
+just conformance                          # all four lanes
+just conformance-server-lane 2026-07-28   # or one lane at a time
+just conformance-client-lane 2025-11-25
+```
 
 ### Server conformance
+
+The `2025-11-25` lane runs the stateful server; the `2026-07-28` lane runs it with
+`--stateless`:
 
 ```bash
 ulimit -n 65536
 dub build -c conformance-server
 ./conformance-server --port 3000 &
-npx @modelcontextprotocol/conformance server --url http://127.0.0.1:3000/mcp
+npx @modelcontextprotocol/conformance@0.2.0-alpha.11 server --url http://127.0.0.1:3000/mcp --requirements 2025-11-25
+./conformance-server --port 3001 --stateless &
+npx @modelcontextprotocol/conformance@0.2.0-alpha.11 server --url http://127.0.0.1:3001/mcp --requirements 2026-07-28
 ```
 
 ### Client conformance
 
 The client harness launches our `conformance-client` binary, appends the test
-server URL to its command line, and selects the scenario via the
-`MCP_CONFORMANCE_SCENARIO` environment variable:
+server URL to its command line, selects the scenario via the
+`MCP_CONFORMANCE_SCENARIO` environment variable, and passes the revision as
+`MCP_CONFORMANCE_PROTOCOL_VERSION` (which selects the lifecycle the driver
+speaks):
 
 ```bash
 ulimit -n 65536
 dub build -c conformance-client
-npx @modelcontextprotocol/conformance client --command "./conformance-client"
+npx @modelcontextprotocol/conformance@0.2.0-alpha.11 client --command ./conformance-client --requirements 2025-11-25
+npx @modelcontextprotocol/conformance@0.2.0-alpha.11 client --command ./conformance-client --requirements 2026-07-28
 ```
 
 The conformance entry points live in `conformance/server.d` and
-`conformance/client.d`.
+`conformance/client.d`. Only required scenarios decide the exit code; unscored
+ones (extensions, scenarios added after a revision shipped) are reported only.
 
 ## Pull-request flow
 
