@@ -19,8 +19,10 @@ import std.typecons : nullable;
 import vibe.data.json : Json;
 
 import mcp;
-import mcp.protocol.errors : invalidParams;
+import mcp.protocol.errors : invalidParams, internalError, McpException, ErrorCode;
 import mcp.protocol.mrtr : InputRequest;
+import mcp.protocol.tasks : TaskSupport;
+import mcp.server.task_context : TaskContext;
 import mcp.transport : StreamableHttpOptions, runStreamableHttp;
 
 void main(string[] args)
@@ -61,6 +63,10 @@ void main(string[] args)
 	{
 		server.enableToolsListChanged();
 		server.enablePromptsListChanged();
+		// The Tasks extension is modern-only; its fixtures run on an in-process
+		// fiber dispatcher so cancellation can be observed mid-run.
+		server.enableTasks();
+		registerTaskFixtures(server);
 	}
 	else
 		server.enableResourceSubscriptions();
@@ -316,7 +322,7 @@ private void registerPromptFixtures(McpServer server) @safe
 /// Streaming fixtures: progress, logging, sampling, elicitation.
 private void registerStreamingFixtures(McpServer server) @safe
 {
-	import core.time : msecs;
+	import core.time : Duration, msecs;
 	import vibe.core.core : sleep;
 	import std.typecons : nullable, Nullable;
 
@@ -760,7 +766,7 @@ private void registerMrtrFixtures(McpServer server) @safe
 		auto answers = ctx.inputResponses();
 		if ("client_roots" !in answers)
 			return ToolResponse.inputRequired([
-				InputRequest.roots("client_roots")
+			InputRequest.roots("client_roots")
 		]);
 		auto a = answers["client_roots"];
 		const n = (a.type == Json.Type.object && "roots" in a && a["roots"].type == Json.Type.array) ? a["roots"]
@@ -891,4 +897,129 @@ private void registerMrtrFixtures(McpServer server) @safe
 		];
 		return PromptResponse.complete(r);
 	});
+}
+
+// ===========================================================================
+// SEP-2663 (Tasks extension) fixtures: the tasks-* scenarios.
+// ===========================================================================
+
+private Json taskText(string text, bool isError = false) @safe
+{
+	Json r = Json.emptyObject;
+	r["content"] = Json([Json(["type": Json("text"), "text": Json(text)])]);
+	if (isError)
+		r["isError"] = true;
+	return r;
+}
+
+private void registerTaskFixtures(McpServer server) @safe
+{
+	import core.time : Duration, msecs;
+	import std.conv : to;
+	import std.typecons : Nullable;
+	import vibe.core.core : sleep;
+	import vibe.data.json : parseJsonString;
+
+	// greet: sync-only; a task-capable client still gets a plain result.
+	Tool greet = {
+		name: "greet", description: nullable("Greets by name"), inputSchema: parseJsonString(
+				`{"type":"object","properties":{"name":{"type":"string"}}}`)
+	};
+	server.registerTool(greet, (Json args) @safe {
+		const name = ("name" in args && args["name"].type == Json.Type.string) ? args["name"]
+			.get!string : "world";
+		return textResult("Hello, " ~ name ~ "!");
+	});
+
+	// slow_compute: sleeps `seconds`, polling for cancellation so a tasks/cancel
+	// while running settles the task as cancelled rather than completed.
+	Tool slow = {
+		name: "slow_compute", description: nullable("Sleeps then returns"), inputSchema: parseJsonString(
+				`{"type":"object","properties":{"seconds":{"type":"integer"}}}`)
+	};
+	server.registerTaskTool(slow, (TaskContext tc) @safe {
+		auto input = tc.inputJson();
+		const secs = (input.type == Json.Type.object && "seconds" in input
+			&& input["seconds"].type == Json.Type.int_) ? input["seconds"].get!int : 0;
+		foreach (i; 0 .. secs * 10)
+		{
+			if (tc.cancelRequested())
+				return Json.emptyObject; // the runner marks the task cancelled
+			sleep(100.msecs);
+		}
+		return taskText("computed after " ~ secs.to!string ~ "s");
+	});
+
+	// failing_job: a tool execution error (completed + isError), after ~1s. It
+	// requires the extension, so a client without it is answered with -32021.
+	Tool failing = {
+		name: "failing_job", description: nullable("Always fails as a tool error")
+	};
+	server.registerTaskTool(failing, (TaskContext tc) @safe {
+		sleep(1000.msecs);
+		return taskText("the job failed", true);
+	}, Nullable!Duration.init, Nullable!Duration.init, TaskSupport.required);
+
+	// protocol_error_job: a protocol-level failure (status failed + error).
+	Tool protoErr = {
+		name: "protocol_error_job", description: nullable("Fails with a protocol error")
+	};
+	server.registerTaskTool(protoErr, (TaskContext tc) @safe {
+		throw new McpException(ErrorCode.internalError, "protocol_error_job exploded");
+		return Json.emptyObject;
+	});
+
+	// confirm_delete: parks for one elicitation, resumes on tasks/update.
+	Tool confirm = {
+		name: "confirm_delete", description: nullable("Asks for confirmation before deleting")
+	};
+	server.registerTaskTool(confirm, (TaskContext tc) @safe {
+		if (!tc.hasInput("confirm"))
+			return tc.requireInput([
+			InputRequest.elicitation("confirm", "Confirm deletion?",
+				elicitSchema("ok", "boolean"))
+		]);
+		return taskText("deleted");
+	});
+
+	// multi_input: two simultaneous inputs; answering one at a time leaves only
+	// the unanswered key outstanding.
+	Tool multi = {name: "multi_input", description: nullable("Needs two inputs")};
+	server.registerTaskTool(multi, (TaskContext tc) @safe {
+		InputRequest[] missing;
+		if (!tc.hasInput("first"))
+			missing ~= InputRequest.elicitation("first", "First input?",
+				elicitSchema("value", "string"));
+		if (!tc.hasInput("second"))
+			missing ~= InputRequest.elicitation("second", "Second input?",
+				elicitSchema("value", "string"));
+		if (missing.length)
+			return tc.requireInput(missing);
+		return taskText("both inputs received");
+	});
+
+	// test_tool_with_task: an MRTR round gathers user_name, then the final round
+	// escalates to a task whose result carries the gathered name.
+	server.registerTaskExecutor("test_tool_with_task", (TaskContext tc) @safe {
+		auto input = tc.inputJson();
+		const name = (input.type == Json.Type.object && "user_name" in input
+			&& input["user_name"].type == Json.Type.string) ? input["user_name"].get!string : "";
+		return taskText("Hello, " ~ name ~ "! (from the task)");
+	});
+	Tool composed = {
+		name: "test_tool_with_task", description: nullable(
+				"Gathers a name via MRTR, then runs as a task")
+	};
+	server.registerTool(composed, (Json args, RequestContext ctx) @safe {
+		auto answers = ctx.inputResponses();
+		if ("user_name" !in answers)
+			return ToolResponse.inputRequired([
+			InputRequest.elicitation("user_name", "What is your name?",
+				elicitSchema("name", "string"))
+		]);
+		Json input = Json.emptyObject;
+		input["user_name"] = acceptedText(answers["user_name"], "name");
+		return server.startTask("test_tool_with_task", input, ctx);
+	});
+	server.setToolTaskSupport("test_tool_with_task", TaskSupport.required);
 }
