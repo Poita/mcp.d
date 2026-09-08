@@ -2756,11 +2756,16 @@ version (unittest) private final class TaskUdaApi
 
 version (unittest) private Json modernMeta() @safe
 {
+	import mcp.protocol.capabilities : tasksExtensionKey;
 	import mcp.protocol.mrtr : MetaKey;
 
+	// A client that declared the Tasks extension: the @task tests exercise the
+	// task surface, which the server serves only to such a client.
+	Json ext = Json.emptyObject;
+	ext[tasksExtensionKey] = Json.emptyObject;
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
-	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	meta[MetaKey.clientCapabilities] = Json(["extensions": ext]);
 	return meta;
 }
 

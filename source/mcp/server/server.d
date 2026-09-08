@@ -21,6 +21,7 @@ import mcp.server.request_state : RequestStateSecurity, RequestStateMode,
 import mcp.server.task_store : TaskStore, InMemoryTaskStore;
 import mcp.server.task_runtime : TaskRuntime, TaskOptions;
 import mcp.server.skill_index : SkillIndex;
+import mcp.protocol.tasks : TaskSupport;
 import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher,
 	InProcessTaskDispatcher, SyncTaskDispatcher, runTaskExecutor;
 import mcp.server.push : PushChannel, ListenFilter;
@@ -56,6 +57,11 @@ struct RegisteredTool
 	/// lists the unmet ones) when the request's declared client capabilities do
 	/// not cover these. Empty (the default) means no gating.
 	ClientCapabilities requiredClientCapabilities;
+	/// The tool's relationship to the Tasks extension: `none` for an ordinary
+	/// tool; `optional`/`required` for a task tool, which decides what a call
+	/// from a client that did not declare the extension gets (an inline run, or
+	/// -32021).
+	TaskSupport taskSupport;
 	/// Validators compiled once from `descriptor.inputSchema`/`outputSchema` at
 	/// registration, so request-time input/output validation reuses the compiled
 	/// form instead of recompiling the schema on every `tools/call`. `null` when
@@ -1019,30 +1025,133 @@ final class McpServer : ServerCore
 	/// Register a `@task` tool: a tool whose `tools/call` returns a task handle
 	/// immediately and runs `executor` asynchronously via the dispatcher. The
 	/// executor is stored by `descriptor.name` so the dispatcher can re-invoke it
-	/// on each `tasks/update`. `ttlMs` / `pollIntervalMs` seed the task's TTL and
-	/// suggested poll cadence (null inherits the runtime's defaults). Requires
+	/// on each `tasks/update`. `ttl` / `pollInterval` seed the task's TTL and
+	/// suggested poll cadence (null inherits the runtime's defaults). `support`
+	/// says what a client that did not declare the Tasks extension gets:
+	/// `optional` (the default) runs the executor inline and returns its result as
+	/// a plain tool result, `required` rejects the call with -32021. Requires
 	/// `enableTasks` to have been called first. Used by the UDA reflection layer;
 	/// callable directly for dynamic task tools.
 	void registerTaskTool(Tool descriptor, TaskExecutor executor,
 			Nullable!Duration ttl = Nullable!Duration.init,
-			Nullable!Duration pollInterval = Nullable!Duration.init) @safe
+			Nullable!Duration pollInterval = Nullable!Duration.init,
+			TaskSupport support = TaskSupport.optional) @safe
 	{
-		if (taskRuntime_ is null)
-			throw internalError("registerTaskTool requires enableTasks() first");
-		taskExecutors_[descriptor.name] = executor;
+		registerTaskExecutor(descriptor.name, executor);
 		const toolName = descriptor.name;
 		const ttlDur = ttl;
 		const pollDur = pollInterval;
 		registerTool(descriptor, (Json args, RequestContext ctx) @safe {
-			import mcp.protocol.tasks : makeCreateTaskResult;
-
-			// The task is bound to the creating request's authenticated principal
-			// (if any), so every later tasks/* request must come from the same one.
-			auto seed = taskRuntime_.createFor(toolName, args, ttlDur, pollDur,
-				requestPrincipal(ctx));
-			taskDispatcher_.dispatch(seed.taskId, &runTaskExecutorById);
-			return ToolResponse.task(makeCreateTaskResult(seed));
+			return startTask(toolName, args, ctx, ttlDur, pollDur);
 		});
+		setToolTaskSupport(descriptor.name, support == TaskSupport.none
+				? TaskSupport.optional : support);
+	}
+
+	/// Register the executor that drives tasks created under `name`, without
+	/// listing a tool of that name. `startTask(name, …)` then creates and
+	/// dispatches such a task; `registerTaskTool` registers the executor and the
+	/// tool together. Requires `enableTasks` to have been called first.
+	void registerTaskExecutor(string name, TaskExecutor executor) @safe
+	{
+		if (taskRuntime_ is null)
+			throw internalError("registerTaskExecutor requires enableTasks() first");
+		taskExecutors_[name] = executor;
+	}
+
+	/// Set how the registered tool `name` relates to the Tasks extension (see
+	/// `TaskSupport`). Returns false if no tool of that name is registered. A
+	/// tool that hands a request off to `startTask` from its own handler (for
+	/// instance after an MRTR round) declares `required` or `optional` here so a
+	/// client without the extension is answered per the extension's rules.
+	bool setToolTaskSupport(string name, TaskSupport support) @safe
+	{
+		auto entry = name in tools;
+		if (entry is null)
+			return false;
+		entry.taskSupport = support;
+		return true;
+	}
+
+	/// Create a task under the executor registered as `name`, bound to the
+	/// requesting principal, dispatch it, and return the `CreateTaskResult`
+	/// (`resultType: "task"`) as the tool response. The task is durably stored
+	/// before this returns, so a `tasks/get` for the returned id resolves at
+	/// once. `input` is the executor's durable input (`TaskContext.inputJson`).
+	/// Throws when `enableTasks` was not called or no executor is registered
+	/// under `name`.
+	ToolResponse startTask(string name, Json input, RequestContext ctx,
+			Nullable!Duration ttl = Nullable!Duration.init,
+			Nullable!Duration pollInterval = Nullable!Duration.init) @safe
+	{
+		import mcp.protocol.tasks : makeCreateTaskResult;
+
+		if (taskRuntime_ is null)
+			throw internalError("startTask requires enableTasks() first");
+		if ((name in taskExecutors_) is null)
+			throw internalError("startTask: no task executor registered under '" ~ name ~ "'");
+		// The task is bound to the creating request's authenticated principal
+		// (if any), so every later tasks/* request must come from the same one.
+		auto seed = taskRuntime_.createFor(name, input, ttl, pollInterval, requestPrincipal(ctx));
+		taskDispatcher_.dispatch(seed.taskId, &runTaskExecutorById);
+		return ToolResponse.task(makeCreateTaskResult(seed));
+	}
+
+	/// Run the executor registered under `name` to completion on the calling
+	/// fiber and return its result as an ordinary tool result: the synchronous
+	/// path a task tool takes for a client that did not declare the Tasks
+	/// extension. The task record is still created, so the executor sees the
+	/// same `TaskContext` as when dispatched. A failed task surfaces as its
+	/// JSON-RPC error; one that needs client input cannot proceed without the
+	/// task surface and is reported as the missing extension.
+	private CallToolResult runTaskToolInline(string name, Json args, RequestContext ctx) @safe
+	{
+		import mcp.protocol.tasks : TaskStatus;
+
+		auto exec = name in taskExecutors_;
+		if (exec is null)
+			throw missingRequiredClientCapability(tasksRequiredCapabilities());
+		auto seed = taskRuntime_.createFor(name, args, Nullable!Duration.init,
+				Nullable!Duration.init, requestPrincipal(ctx));
+		runTaskExecutor(taskRuntime_, seed.taskId, *exec);
+		auto detailed = taskRuntime_.getDetailed(seed.taskId);
+		const status = detailed["status"].get!string;
+		switch (status)
+		{
+		case "completed":
+			return CallToolResult.fromJson(detailed["result"]);
+		case "failed":
+			auto e = detailed["error"];
+			throw new McpException(("code" in e
+					&& e["code"].type == Json.Type.int_) ? e["code"].get!int : cast(
+					int) ErrorCode.internalError,
+					("message" in e && e["message"].type == Json.Type.string) ? e["message"]
+						.get!string : "task failed", ("data" in e) ? e["data"] : Json.undefined);
+		case "input_required":
+			throw missingRequiredClientCapability(tasksRequiredCapabilities(),
+					"The tool needs client input, which requires the Tasks extension");
+		default:
+			throw internalError(
+					"task '" ~ seed.taskId ~ "' did not settle synchronously (" ~ status ~ ")");
+		}
+	}
+
+	/// The `data.requiredCapabilities` of a -32021 for the Tasks extension:
+	/// `{ extensions: { "io.modelcontextprotocol/tasks": {} } }`.
+	private static ClientCapabilities tasksRequiredCapabilities() @safe
+	{
+		ClientCapabilities c;
+		Json ext = Json.emptyObject;
+		ext[tasksExtensionKey] = Json.emptyObject;
+		c.extensions = ext;
+		return c;
+	}
+
+	/// Whether `caps` declares the Tasks extension under `extensions`.
+	private static bool declaresTasksExtension(const ClientCapabilities caps) @safe
+	{
+		return caps.extensions.type == Json.Type.object
+			&& (tasksExtensionKey in caps.extensions) !is null;
 	}
 
 	/// Look up and run the executor bound to `taskId`'s tool, recording its outcome
@@ -2425,9 +2534,20 @@ final class McpServer : ServerCore
 		return params["taskId"].get!string;
 	}
 
+	/// SEP-2663: the task methods exist only for a client that declared the
+	/// extension in its per-request capabilities; otherwise they are answered
+	/// with -32021 naming it, like any other undeclared capability.
+	private void requireTasksDeclared(Json params) @safe
+	{
+		if (!declaresTasksExtension(RequestMeta.fromParams(params).clientCapabilities))
+			throw missingRequiredClientCapability(tasksRequiredCapabilities(),
+					"The tasks methods require the " ~ tasksExtensionKey ~ " extension");
+	}
+
 	private Json doTasksGet(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
 		requireTasks(ver);
+		requireTasksDeclared(params);
 		const id = requireTaskId(params);
 		taskRuntime_.requireAccess(id, requestPrincipal(ctx));
 		return taskRuntime_.getDetailed(id);
@@ -2438,6 +2558,7 @@ final class McpServer : ServerCore
 		import mcp.protocol.tasks : TaskStatus;
 
 		requireTasks(ver);
+		requireTasksDeclared(params);
 		const id = requireTaskId(params);
 		taskRuntime_.requireAccess(id, requestPrincipal(ctx));
 		Json responses = ("inputResponses" in params) ? params["inputResponses"] : Json.emptyObject;
@@ -2458,6 +2579,7 @@ final class McpServer : ServerCore
 	private Json doTasksCancel(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
 		requireTasks(ver);
+		requireTasksDeclared(params);
 		const id = requireTaskId(params);
 		taskRuntime_.requireAccess(id, requestPrincipal(ctx));
 		taskRuntime_.cancel(id); // throws -32602 for an unknown task
@@ -3149,6 +3271,18 @@ final class McpServer : ServerCore
 			throw missingRequiredClientCapability(missing.get);
 
 		Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
+
+		// Tasks extension (SEP-2663): the server decides whether a call creates a
+		// task, but only for a client that declared the extension. Without it a
+		// task-supporting tool falls through to a synchronous run, and a tool that
+		// requires the extension is rejected with -32021 naming it.
+		if (entry.taskSupport != TaskSupport.none && !declaresTasksExtension(declared))
+		{
+			if (entry.taskSupport == TaskSupport.required)
+				throw missingRequiredClientCapability(tasksRequiredCapabilities(),
+						"This tool requires the " ~ tasksExtensionKey ~ " extension");
+			return runTaskToolInline(name, args, ctx).forVersion(ver).toJson();
+		}
 		// Validate the supplied arguments against the tool's declared inputSchema
 		// before dispatch (spec: server/tools § Security Considerations,
 		// "Servers MUST: Validate all tool inputs"). Per § Error Handling, an
@@ -5943,9 +6077,24 @@ version (unittest)
 			"name": Json("c"),
 			"version": Json("1")
 		]);
-		meta[MetaKey.clientCapabilities] = Json.emptyObject;
+		// Declare the Tasks extension so the tasks/* tests reach their handlers;
+		// tests about the extension's gating build their own _meta.
+		Json ext = Json.emptyObject;
+		ext[tasksExtensionKey] = Json.emptyObject;
+		meta[MetaKey.clientCapabilities] = Json(["extensions": ext]);
 		if (logLevel.length)
 			meta[MetaKey.logLevel] = logLevel;
+		params["_meta"] = meta;
+		return Message(makeRequest(Json(id), method, params));
+	}
+
+	/// A modern request whose client capabilities do NOT declare the Tasks
+	/// extension (an ordinary client).
+	private Message modernReqNoTasks(long id, string method, Json params = Json.emptyObject) @safe
+	{
+		Json meta = Json.emptyObject;
+		meta[MetaKey.protocolVersion] = "2026-07-28";
+		meta[MetaKey.clientCapabilities] = Json.emptyObject;
 		params["_meta"] = meta;
 		return Message(makeRequest(Json(id), method, params));
 	}
@@ -6535,6 +6684,141 @@ unittest  // a task created without an authenticated principal is not principal-
 	]))).get);
 	assert("result" in s.handle(modernReq(3, "tasks/get",
 			Json(["taskId": Json(id)])), new OwnerCtx("alice")).get);
+}
+
+unittest  // tasks/get, tasks/update, tasks/cancel are -32021 for a client without the extension
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks();
+	foreach (m; ["tasks/get", "tasks/update", "tasks/cancel"])
+	{
+		auto resp = s.handle(modernReqNoTasks(1, m, Json(["taskId": Json("x")]))).get;
+		assert(resp["error"]["code"].get!int == cast(
+				int) ErrorCode.missingRequiredClientCapability, m);
+		assert(tasksExtensionKey in resp["error"]["data"]["requiredCapabilities"]["extensions"], m);
+	}
+}
+
+unittest  // a task tool called without the extension runs synchronously and returns a plain result
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	Tool desc;
+	desc.name = "dbl";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		auto n = tc.inputJson()["n"].get!int;
+		return Json([
+			"content": Json([
+				Json(["type": Json("text"), "text": Json("doubled")])
+			]),
+			"structuredContent": Json(["result": Json(n * 2)])
+		]);
+	});
+
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("dbl"), "arguments": Json(["n": Json(21)])]))).get;
+	assert("error" !in resp);
+	assert(resp["result"]["resultType"].get!string == "complete");
+	assert("taskId" !in resp["result"]);
+	assert(resp["result"]["structuredContent"]["result"].get!int == 42);
+	assert(resp["result"]["content"][0]["text"].get!string == "doubled");
+}
+
+unittest  // a task tool that requires the extension rejects a client without it with -32021
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	Tool desc;
+	desc.name = "must-task";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe => Json([
+			"content": Json.emptyArray
+	]), Nullable!Duration.init, Nullable!Duration.init, TaskSupport.required);
+
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("must-task"), "arguments": Json.emptyObject]))).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.missingRequiredClientCapability);
+	assert(tasksExtensionKey in resp["error"]["data"]["requiredCapabilities"]["extensions"]);
+
+	// The same call from a client that declared the extension creates a task.
+	auto ok = s.handle(modernReq(2, "tools/call",
+			Json(["name": Json("must-task"), "arguments": Json.emptyObject]))).get;
+	assert(ok["result"]["resultType"].get!string == "task");
+}
+
+unittest  // a synchronous fall-through surfaces a failed task as its JSON-RPC error
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	Tool desc;
+	desc.name = "boom";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		throw new McpException(ErrorCode.internalError, "boom");
+		return Json.emptyObject;
+	});
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("boom"), "arguments": Json.emptyObject]))).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.internalError);
+	assert(resp["error"]["message"].get!string == "boom");
+}
+
+unittest  // startTask lets an MRTR tool gather input and then escalate to a task
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.registerTaskExecutor("escalate", (TaskContext tc) @safe {
+		const name = tc.inputJson()["user_name"].get!string;
+		return Json([
+			"content": Json([
+				Json(["type": Json("text"), "text": Json("Hello, " ~ name)])
+			])
+		]);
+	});
+	Tool desc;
+	desc.name = "escalate";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTool(desc, (Json args, RequestContext ctx) @safe {
+		auto answers = ctx.inputResponses();
+		if ("user_name" !in answers)
+			return ToolResponse.inputRequired([
+			InputRequest.elicitation("user_name", "What is your name?")
+		], "round-1");
+		Json input = Json.emptyObject;
+		input["user_name"] = answers["user_name"]["content"]["name"];
+		return s.startTask("escalate", input, ctx);
+	});
+	s.setToolTaskSupport("escalate", TaskSupport.required);
+
+	// Round 1: an InputRequiredResult, no taskId.
+	auto r1 = s.handle(modernReq(1, "tools/call", Json([
+		"name": Json("escalate"),
+		"arguments": Json.emptyObject
+	]))).get["result"];
+	assert(r1["resultType"].get!string == "input_required");
+	assert("taskId" !in r1);
+	// Round 2: the answer echoed back escalates to a task carrying no requestState.
+	Json p2 = Json([
+		"name": Json("escalate"),
+		"arguments": Json.emptyObject,
+		"requestState": Json("round-1"),
+		"inputResponses": Json([
+			"user_name": Json([
+				"action": Json("accept"),
+				"content": Json(["name": Json("Alice")])
+			])
+		])
+	]);
+	auto r2 = s.handle(modernReq(2, "tools/call", p2)).get["result"];
+	assert(r2["resultType"].get!string == "task");
+	assert("requestState" !in r2);
+	const id = r2["taskId"].get!string;
+	auto got = s.handle(modernReq(3, "tasks/get", Json(["taskId": Json(id)]))).get["result"];
+	assert(got["status"].get!string == "completed");
+	assert(got["result"]["content"][0]["text"].get!string == "Hello, Alice");
 }
 
 unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update

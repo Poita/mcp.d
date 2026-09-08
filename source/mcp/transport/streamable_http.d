@@ -2121,6 +2121,14 @@ McpException validateModernHeaders(string protoHeader, string methodHeader,
 		if ("uri" in msg.params && msg.params["uri"].type == Json.Type.string)
 			bodyName = msg.params["uri"].get!string;
 		break;
+	case "tasks/get":
+	case "tasks/update":
+	case "tasks/cancel":
+		// The Tasks extension extends the routing headers to its methods:
+		// Mcp-Name mirrors params.taskId.
+		if ("taskId" in msg.params && msg.params["taskId"].type == Json.Type.string)
+			bodyName = msg.params["taskId"].get!string;
+		break;
 	default:
 		return null; // no Mcp-Name requirement for other methods
 	}
@@ -2859,6 +2867,21 @@ unittest  // a supported stable MCP-Protocol-Version header passes
 	assert(validateProtocolVersionHeader("2025-06-18") is null);
 	assert(validateProtocolVersionHeader("2025-11-25") is null);
 	assert(validateProtocolVersionHeader("2024-11-05") is null);
+}
+
+unittest  // the tasks methods carry Mcp-Name: <taskId>, validated like a tool name
+{
+	Json p = Json.emptyObject;
+	p["taskId"] = "task-1";
+	foreach (method; ["tasks/get", "tasks/update", "tasks/cancel"])
+	{
+		auto m = Message(makeRequest(Json(1), method, p));
+		assert(validateModernHeaders("2026-07-28", method, "task-1", m, true) is null, method);
+		auto mismatch = validateModernHeaders("2026-07-28", method, "task-2", m, true);
+		assert(mismatch !is null && mismatch.code == ErrorCode.headerMismatch, method);
+		auto missing = validateModernHeaders("2026-07-28", method, "", m, true);
+		assert(missing !is null && missing.code == ErrorCode.headerMismatch, method);
+	}
 }
 
 unittest  // optional whitespace around Mcp-Name / Mcp-Method is not part of the value

@@ -5,6 +5,20 @@ import vibe.data.json : Json;
 
 import mcp.protocol.jsonhelpers : getOr, tryGet;
 
+/// How a tool relates to the Tasks extension (SEP-2663 "task support"). The
+/// server decides whether a call creates a task; the client only declares the
+/// extension in its capabilities. A tool that supports tasks is called by a
+/// client that did not declare the extension either synchronously (`optional`:
+/// the executor runs inline and its result is returned as a plain tool result)
+/// or not at all (`required`: -32021 MissingRequiredClientCapability naming the
+/// extension).
+enum TaskSupport
+{
+	none, /// an ordinary tool: never creates a task
+	optional, /// creates a task when the client declared the extension, else runs inline
+	required /// needs the extension: a client without it is rejected with -32021
+}
+
 @safe:
 
 /// A task's lifecycle status (SEP-2663). `working` and `inputRequired` are
