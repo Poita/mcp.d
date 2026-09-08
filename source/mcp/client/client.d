@@ -2856,9 +2856,14 @@ final class McpClient : ClientProtocol
 	/// client's set of roots has changed. Per client/roots §Root List Changes,
 	/// a client that advertises the roots `listChanged` capability MUST send
 	/// this notification whenever its roots change. Call this after updating the
-	/// roots returned by `onListRoots` (or after `setRoots`).
+	/// roots returned by `onListRoots` (or after `setRoots`). A no-op on a modern
+	/// session: 2026-07-28 removed the notification (a modern server learns of
+	/// roots only through an MRTR `roots/list` request, which sees the current
+	/// list on each round).
 	void notifyRootsListChanged() @safe
 	{
+		if (useModern)
+			return;
 		notify("notifications/roots/list_changed", Json.emptyObject);
 	}
 
@@ -5910,6 +5915,27 @@ unittest  // listResourceTemplates calls resources/templates/list and auto-pagin
 	assert(templates.length == 2);
 	assert(templates[0].uriTemplate == "file:///a/{x}");
 	assert(templates[1].name == "b");
+}
+
+unittest  // notifyRootsListChanged is sent on a legacy session
+{
+	auto c = McpClient.http("http://localhost");
+	string[] sent;
+	c.onNotifyForTest = (Json m) @safe { sent ~= m["method"].get!string; };
+	c.notifyRootsListChanged();
+	assert(sent == ["notifications/roots/list_changed"]);
+}
+
+unittest  // notifyRootsListChanged is a no-op on a modern session (the notification was removed)
+{
+	// 2026-07-28 removes notifications/roots/list_changed along with ping and
+	// logging/setLevel; a modern server has no roots/list channel to refresh.
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	string[] sent;
+	c.onNotifyForTest = (Json m) @safe { sent ~= m["method"].get!string; };
+	c.notifyRootsListChanged();
+	assert(sent.length == 0);
 }
 
 unittest  // skillsList drains pagination into a single result
