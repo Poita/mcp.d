@@ -1481,6 +1481,12 @@ unittest  // a modern listen signalled by the header alone routes against the mo
 	notifications["toolsListChanged"] = true;
 	Json params = Json.emptyObject;
 	params["notifications"] = notifications;
+	// The version is signalled by the header alone, but every modern request still
+	// carries the required _meta pair (protocolVersion + clientCapabilities).
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	params["_meta"] = meta;
 	auto msg = Message(makeRequest(Json(7), "subscriptions/listen", params));
 
 	auto reqState = freshStatelessState("2026-07-28", params, server.negotiatedVersion);
@@ -1508,6 +1514,10 @@ unittest  // concurrent listens each keep their own per-stream filter
 		notifications[changeType] = true;
 		Json params = Json.emptyObject;
 		params["notifications"] = notifications;
+		Json meta = Json.emptyObject;
+		meta[MetaKey.protocolVersion] = "2026-07-28";
+		meta[MetaKey.clientCapabilities] = Json.emptyObject;
+		params["_meta"] = meta;
 		return params;
 	}
 
@@ -2069,6 +2079,8 @@ unittest  // released versions never suppress on disconnect (modern-only MUST)
 McpException validateModernHeaders(string protoHeader, string methodHeader,
 		string nameHeader, Message msg, bool modern) @safe
 {
+	import std.string : strip;
+
 	if (!modern)
 		return null; // not a modern request: do not enforce modern headers
 
@@ -2081,7 +2093,7 @@ McpException validateModernHeaders(string protoHeader, string methodHeader,
 
 	if (methodHeader.length == 0)
 		return new McpException(ErrorCode.headerMismatch, "Missing Mcp-Method header");
-	if (methodHeader != msg.method)
+	if (strip(methodHeader) != msg.method)
 		return new McpException(ErrorCode.headerMismatch,
 				"Mcp-Method header '" ~ methodHeader
 				~ "' does not match body method '" ~ msg.method ~ "'");
@@ -2117,7 +2129,9 @@ McpException validateModernHeaders(string protoHeader, string methodHeader,
 	// Mcp-Name carries the body value under the same Base64 sentinel encoding as the
 	// Mcp-Param-* headers, so a non-ASCII or reserved name survives the HTTP header.
 	// Decode before comparing (the empty-header check above stays on the raw value).
-	if (decodeHeaderValue(nameHeader) != bodyName)
+	// Optional whitespace around a header value is not part of the value (RFC 9110
+	// field-value OWS), so it is stripped before the comparison.
+	if (decodeHeaderValue(strip(nameHeader)) != bodyName)
 		return new McpException(ErrorCode.headerMismatch,
 				"Mcp-Name header '" ~ nameHeader ~ "' does not match body value '" ~ bodyName ~ "'");
 	return null;
@@ -2845,6 +2859,18 @@ unittest  // a supported stable MCP-Protocol-Version header passes
 	assert(validateProtocolVersionHeader("2025-06-18") is null);
 	assert(validateProtocolVersionHeader("2025-11-25") is null);
 	assert(validateProtocolVersionHeader("2024-11-05") is null);
+}
+
+unittest  // optional whitespace around Mcp-Name / Mcp-Method is not part of the value
+{
+	Json p = Json.emptyObject;
+	p["name"] = "add";
+	auto m = Message(makeRequest(Json(1), "tools/call", p));
+	// RFC 9110 field-value OWS: the padded header still names the body's tool.
+	assert(validateModernHeaders("2026-07-28", "tools/call", "  add  ", m, true) is null);
+	assert(validateModernHeaders("2026-07-28", " tools/call ", "add", m, true) is null);
+	// Case differences remain mismatches: header values are case-sensitive.
+	assert(validateModernHeaders("2026-07-28", "TOOLS/CALL", "add", m, true) !is null);
 }
 
 unittest  // a malformed-_meta rejection is 400 Bad Request on HTTP

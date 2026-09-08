@@ -557,6 +557,18 @@ final class McpServer : ServerCore
 		return true;
 	}
 
+	/// Unregister a previously registered prompt by name. Returns `true` if a
+	/// prompt was removed, `false` if none was registered under `name`. The mirror
+	/// of `registerPrompt`; pair with `notifyPromptsListChanged` to inform
+	/// connected clients that the available prompt set changed.
+	bool removePrompt(string name) @safe
+	{
+		if ((name in prompts) is null)
+			return false;
+		prompts.remove(name);
+		return true;
+	}
+
 	/// Advertise the tools `listChanged` capability so `capabilities()` emits
 	/// `tools: { listChanged: true }`. Declare this (before `initialize` /
 	/// `server/discover`) when the server may add or remove tools at runtime and
@@ -1795,15 +1807,6 @@ final class McpServer : ServerCore
 					// version is fixed at `initialize` and governs every request, so a
 					// per-request body version is ignored for version selection.
 					effective = mv;
-					// Every modern request MUST carry `clientCapabilities` alongside
-					// the version (basic/index `_meta`); a request without it is
-					// malformed, not a request with empty capabilities. Notifications
-					// carry no capabilities and are exempt.
-					if (msg.kind == MessageKind.request && !meta.hasClientCapabilities)
-						return nullable(makeErrorResponse(msg.id,
-								missingRequiredMeta([
-									cast(string) MetaKey.clientCapabilities
-					])));
 					// Per-request client capabilities (modern, stateless): not stored on the
 					// shared instance. clientCapabilities() reflects the negotiated session.
 					if (meta.logLevel.isNull)
@@ -1833,6 +1836,23 @@ final class McpServer : ServerCore
 				return nullable(makeErrorResponse(msg.id,
 						unsupportedVersionError(meta.protocolVersion)));
 			}
+		}
+
+		// Every modern request MUST carry `protocolVersion` and `clientCapabilities`
+		// in its `_meta` (basic/index `_meta`), whichever channel made the request
+		// modern: the body itself, the MCP-Protocol-Version header a stateless
+		// transport resolved, or a modern connection. A request missing either is
+		// malformed (-32602 naming the absent keys), not a request with empty
+		// capabilities. Notifications carry no capabilities and are exempt.
+		if (effective.isModern && msg.kind == MessageKind.request)
+		{
+			string[] missing;
+			if (meta.protocolVersion.length == 0)
+				missing ~= cast(string) MetaKey.protocolVersion;
+			if (!meta.hasClientCapabilities)
+				missing ~= cast(string) MetaKey.clientCapabilities;
+			if (missing.length)
+				return nullable(makeErrorResponse(msg.id, missingRequiredMeta(missing)));
 		}
 
 		// basic/lifecycle: a stateful server SHOULD NOT serve a non-`ping` request
@@ -2269,6 +2289,10 @@ final class McpServer : ServerCore
 		switch (method)
 		{
 		case "initialize":
+			// 2026-07-28 removed the handshake (SEP-2575): a modern request for it is
+			// an unknown method (-32601, 404 on HTTP) like ping and logging/setLevel.
+			if (ver.isModern)
+				throw methodNotFound(method);
 			return doInitialize(params, conn);
 		case "server/discover":
 			// `server/discover` is a modern-only RPC (the stable handshake uses
@@ -6984,6 +7008,93 @@ unittest  // a modern request without clientCapabilities is malformed: -32602 na
 	assert("error" in resp);
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
 	assert(resp["error"]["data"]["missingMeta"][0].get!string == MetaKey.clientCapabilities);
+}
+
+unittest  // a modern request with no _meta at all names both required keys
+{
+	import mcp.server.connection : ConnectionState;
+	import vibe.data.json : parseJsonString;
+
+	// The transport resolved the modern version from the MCP-Protocol-Version
+	// header (the connection state carries it), but the body has no _meta.
+	auto s = makeTestServer();
+	auto conn = new ConnectionState;
+	conn.negotiated = ProtocolVersion.v2026_07_28;
+	auto resp = parseJsonString(s.handleRaw(
+			`{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}`, conn));
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
+	auto missing = resp["error"]["data"]["missingMeta"];
+	assert(missing.length == 2);
+	assert(missing[0].get!string == MetaKey.protocolVersion);
+	assert(missing[1].get!string == MetaKey.clientCapabilities);
+}
+
+unittest  // a modern request whose _meta lacks only protocolVersion is -32602, not a header mismatch
+{
+	import mcp.server.connection : ConnectionState;
+	import vibe.data.json : parseJsonString;
+
+	auto s = makeTestServer();
+	auto conn = new ConnectionState;
+	conn.negotiated = ProtocolVersion.v2026_07_28;
+	auto resp = parseJsonString(s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"server/discover",`
+			~ `"params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{}}}}`, conn));
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
+	assert(resp["error"]["data"]["missingMeta"].length == 1);
+	assert(resp["error"]["data"]["missingMeta"][0].get!string == MetaKey.protocolVersion);
+}
+
+unittest  // a modern notification is exempt from the required-_meta check
+{
+	import mcp.server.connection : ConnectionState;
+
+	auto s = makeTestServer();
+	auto conn = new ConnectionState;
+	conn.negotiated = ProtocolVersion.v2026_07_28;
+	// Notifications get no reply at all; the check must not turn one into an error.
+	const outText = s.handleRaw(
+			`{"jsonrpc":"2.0","method":"notifications/cancelled",` ~ `"params":{"requestId":7}}`,
+			conn);
+	assert(outText.length == 0);
+}
+
+unittest  // initialize is an unknown method on a modern request (removed by 2026-07-28)
+{
+	auto s = makeTestServer();
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2026-07-28";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	auto resp = s.handle(modernReq(1, "initialize", params)).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.methodNotFound);
+}
+
+unittest  // removeTool unregisters a tool and reports whether one was removed
+{
+	auto s = new McpServer("t", "1");
+	Tool keep = {name: "keep"};
+	Tool temp = {name: "temp"};
+	s.registerTool(keep, (Json) @safe => CallToolResult());
+	s.registerTool(temp, (Json) @safe => CallToolResult());
+	assert(s.handle(req(1, "tools/list")).get["result"]["tools"].length == 2);
+	assert(s.removeTool("temp"));
+	assert(!s.removeTool("temp"));
+	auto tools = s.handle(req(2, "tools/list")).get["result"]["tools"];
+	assert(tools.length == 1 && tools[0]["name"].get!string == "keep");
+}
+
+unittest  // removePrompt unregisters a prompt and reports whether one was removed
+{
+	auto s = new McpServer("t", "1");
+	Prompt keep = {name: "keep"};
+	Prompt temp = {name: "temp"};
+	s.registerPrompt(keep, (Json) @safe => GetPromptResult());
+	s.registerPrompt(temp, (Json) @safe => GetPromptResult());
+	assert(s.handle(req(1, "prompts/list")).get["result"]["prompts"].length == 2);
+	assert(s.removePrompt("temp"));
+	assert(!s.removePrompt("temp"));
+	auto prompts = s.handle(req(2, "prompts/list")).get["result"]["prompts"];
+	assert(prompts.length == 1 && prompts[0]["name"].get!string == "keep");
 }
 
 unittest  // a modern request without clientInfo is served: the field is optional
