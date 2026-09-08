@@ -424,6 +424,84 @@ void registerSkill(McpServer server, string path, string description, string ins
 	registerSkill(server, Skill(path, description, instructions));
 }
 
+/// A skill whose `SKILL.md` body is generated on each read, so no stable digest
+/// can be published for it: its entry carries `resources: "dynamic"` instead of
+/// a manifest. The frontmatter is fixed — synthesized from `path`'s final
+/// segment, `description`, and `metadata` exactly as for a `Skill` — so the
+/// entry's `frontmatter` stays identical to what every read returns; only the
+/// body varies. Register it with `registerDynamicSkill`.
+///
+/// A dynamic skill offers hosts no content integrity and cannot be
+/// content-bound to an approval, so some hosts decline to load one; prefer a
+/// static `Skill` whenever the content can be fixed at registration. Supporting
+/// files, if any, are registered separately with `McpServer.registerResource`
+/// under `skill://<path>/…`; hosts discover them via `resources/directory/read`.
+struct DynamicSkill
+{
+	/// The skill path; final segment is the skill name (see `Skill.path`).
+	string path;
+	string description; /// one-line description of when to use the skill
+	/// Produces the `SKILL.md` body (Markdown, without frontmatter) for one read.
+	string delegate() @safe instructions;
+	/// Optional extra frontmatter under `metadata:` (see `Skill.metadata`).
+	string[string] metadata;
+
+	/// The skill name: the final segment of `path`.
+	string name() const @safe pure
+	{
+		return skillName(path);
+	}
+}
+
+/// Register `skill` on `server`: serve a `SKILL.md` at `skill://<path>/SKILL.md`
+/// whose body `skill.instructions` regenerates on every read beneath fixed,
+/// synthesized frontmatter, advertise the skills extension, and add an entry
+/// with `resources: "dynamic"` for `skills/list` / `skills/get` to serve. Throws
+/// if `path` is not a valid skill path, `instructions` is null, or a skill is
+/// already registered at that URI.
+void registerDynamicSkill(McpServer server, DynamicSkill skill) @safe
+{
+	if (!isValidSkillPath(skill.path))
+		throw new Exception("invalid skill path '" ~ skill.path
+				~ "': each '/'-separated segment must be non-empty and the final segment "
+				~ "must be a valid skill name (1..64 chars of lowercase letters, digits, "
+				~ "and single hyphens, no leading/trailing/consecutive hyphens)");
+	if (skill.instructions is null)
+		throw new Exception("registerDynamicSkill: '" ~ skill.path
+				~ "' has no instructions delegate");
+
+	const name = skill.name;
+	const uri = skillUri(skill.path);
+	if (uri in server.ensureSkillIndex().byUri)
+		throw new Exception("a skill at '" ~ uri ~ "' is already registered");
+
+	enableSkills(server);
+
+	Resource descriptor;
+	descriptor.uri = uri;
+	descriptor.name = name;
+	descriptor.description = nullable(skill.description);
+	descriptor.mimeType = nullable(skillMimeType);
+	// Copied into locals so the reader closure captures values, not the struct.
+	string description = skill.description;
+	string[string] metadata = skill.metadata;
+	auto body_ = skill.instructions;
+	server.registerResource(descriptor, () @safe {
+		return ResourceContents.makeText(uri, skillMimeType,
+			skillMarkdown(name, description, body_(), metadata));
+	});
+	// The entry is added last, after the resource is in place, so a throw here
+	// leaves no listed-but-unserved skill; the resource is rolled back to match.
+	scope (failure)
+		server.removeResource(uri);
+
+	Json entry = Json.emptyObject;
+	entry["uri"] = uri;
+	entry["frontmatter"] = frontmatterJson(name, description, metadata);
+	entry["resources"] = "dynamic";
+	addSkillEntry(server, entry);
+}
+
 /// Whether the connected client advertised the skills extension at
 /// initialization (valid after `initialize` / `server/discover`).
 bool clientSupportsSkills(McpServer server) @safe
@@ -461,9 +539,11 @@ struct SkillResourceRef
 /// One skill entry, as carried by `skills/list` and `skills/get`. `name` and
 /// `description` are read from the verbatim `frontmatter` object (always present
 /// per the Agent Skills spec); `uri` addresses the `SKILL.md` directly, and
-/// `resources` is the complete per-file manifest a host verifies reads against
-/// (empty only for dynamically generated skills, which offer no integrity).
-/// Within the frontmatter's `metadata` object, keys prefixed
+/// `resources` is the complete per-file manifest a host verifies reads against.
+/// A dynamically generated skill publishes the string `"dynamic"` in place of a
+/// manifest: `isDynamic` is set and `resources` is empty, and the skill offers
+/// no content integrity. An entry with neither (`!isValid`) is malformed and
+/// must not be loaded. Within the frontmatter's `metadata` object, keys prefixed
 /// `io.modelcontextprotocol/` are reserved for MCP extensions; ignore
 /// unrecognized keys under that prefix.
 struct SkillEntry
@@ -471,6 +551,15 @@ struct SkillEntry
 	string uri; /// resource URI of the `SKILL.md`
 	Json frontmatter; /// verbatim `SKILL.md` frontmatter as JSON
 	SkillResourceRef[] resources; /// complete `{uri, digest, size}` manifest of the skill's files
+	bool isDynamic; /// `resources` was the string `"dynamic"`: generated content, no digests
+
+	/// Whether `resources` took one of the two shapes the extension allows: a
+	/// manifest array (never legitimately empty, as it always lists `SKILL.md`)
+	/// or the string `"dynamic"`. A host must not load an entry that is not valid.
+	bool isValid() const @safe pure nothrow
+	{
+		return isDynamic || resources.length > 0;
+	}
 
 	/// The skill `name` from the frontmatter, or empty if absent.
 	string name() const @safe
@@ -500,6 +589,9 @@ struct SkillEntry
 		if ("resources" in j && j["resources"].type == Json.Type.array)
 			foreach (i; 0 .. j["resources"].length)
 				e.resources ~= SkillResourceRef.fromJson(j["resources"][i]);
+		else if ("resources" in j && j["resources"].type == Json.Type.string
+						&& j["resources"].get!string == "dynamic")
+					e.isDynamic = true;
 		return e;
 	}
 }
@@ -538,6 +630,8 @@ string verifyResourceDigest(const SkillEntry entry, string uri, scope const(ubyt
 {
 	import std.conv : to;
 
+	if (entry.isDynamic)
+		return "the skill is dynamic (its entry publishes no digests), so its content cannot be verified";
 	if (entry.resources.length == 0)
 		return "the skill entry carries no resources manifest, so its content cannot be verified";
 	foreach (r; entry.resources)
@@ -1042,6 +1136,87 @@ unittest  // a draft-session skills/list result carries no CacheableResult attri
 	assert("cacheScope" !in result);
 }
 
+unittest  // registerDynamicSkill publishes an entry whose resources is the string "dynamic"
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	DynamicSkill sk = {
+		path: "reports/daily", description: "Assemble today's operational report",
+		instructions: () @safe => "# Daily\n"
+	};
+	registerDynamicSkill(s, sk);
+
+	auto e = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"]["skills"][0];
+	assert(e["uri"].get!string == "skill://reports/daily/SKILL.md");
+	assert(e["frontmatter"]["name"].get!string == "daily");
+	assert(e["frontmatter"]["description"].get!string == "Assemble today's operational report");
+	assert(e["resources"].type == Json.Type.string);
+	assert(e["resources"].get!string == "dynamic");
+
+	// skills/get carries the identical entry.
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://reports/daily/SKILL.md";
+	auto got = s.handle(Message(makeRequest(Json(2), "skills/get", p))).get["result"]["skill"];
+	assert(got == e);
+}
+
+unittest  // a dynamic skill's SKILL.md is generated on each read, under fixed frontmatter
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import std.algorithm : canFind;
+	import std.conv : to;
+
+	auto s = new McpServer("t", "1");
+	int reads;
+	DynamicSkill sk = {
+		path: "counter", description: "Counts reads", metadata: ["version": "1"],
+		instructions: () @safe {
+			reads++;
+			return "# Read " ~ reads.to!string ~ "\n";
+		}
+	};
+	registerDynamicSkill(s, sk);
+
+	string read() @safe
+	{
+		Json rp = Json.emptyObject;
+		rp["uri"] = "skill://counter/SKILL.md";
+		auto c = s.handle(Message(makeRequest(Json(1), "resources/read", rp)))
+			.get["result"]["contents"][0];
+		assert(c["mimeType"].get!string == skillMimeType);
+		return c["text"].get!string;
+	}
+
+	const first = read();
+	const second = read();
+	assert(first.canFind("# Read 1") && second.canFind("# Read 2"));
+	// The frontmatter is fixed and identical to the entry's, however the body varies.
+	assert(first.canFind("name: counter") && second.canFind("name: counter"));
+	assert(first.canFind(`"version": "1"`));
+	auto e = s.handle(Message(makeRequest(Json(3), "skills/list",
+			Json.emptyObject))).get["result"]["skills"][0];
+	assert(e["frontmatter"]["metadata"]["version"].get!string == "1");
+}
+
+unittest  // registerDynamicSkill rejects an invalid path and a duplicate uri
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	DynamicSkill bad = {
+		path: "Bad Name", description: "d", instructions: () @safe => "x"
+	};
+	assertThrown!Exception(registerDynamicSkill(s, bad));
+
+	registerSkill(s, "taken", "First", "a");
+	DynamicSkill dup = {
+		path: "taken", description: "d", instructions: () @safe => "x"
+	};
+	assertThrown!Exception(registerDynamicSkill(s, dup));
+}
+
 unittest  // a prefixed skill path lists frontmatter.name as the final segment
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
@@ -1338,6 +1513,75 @@ unittest  // checkSkillLimits rejects a total size over 16 MiB, summing `size` a
 	assert(reason.canFind("16"));
 }
 
+unittest  // SkillEntry.fromJson marks a "dynamic" resources value as valid but unverifiable
+{
+	import vibe.data.json : parseJsonString;
+
+	auto e = SkillEntry.fromJson(parseJsonString(`{
+		"uri": "skill://reports/daily/SKILL.md",
+		"frontmatter": {"name": "daily", "description": "d"},
+		"resources": "dynamic"
+	}`));
+	assert(e.isDynamic);
+	assert(e.resources.length == 0);
+	assert(e.isValid);
+}
+
+unittest  // SkillEntry with an array manifest is valid and not dynamic
+{
+	import vibe.data.json : parseJsonString;
+
+	auto e = SkillEntry.fromJson(parseJsonString(`{
+		"uri": "skill://x/SKILL.md",
+		"frontmatter": {"name": "x", "description": "d"},
+		"resources": [{"uri": "skill://x/SKILL.md", "digest": "sha256:abc", "size": 1}]
+	}`));
+	assert(!e.isDynamic);
+	assert(e.isValid);
+}
+
+unittest  // an entry with no resources, or a non-array non-"dynamic" value, is invalid
+{
+	import vibe.data.json : parseJsonString;
+
+	auto missing = SkillEntry.fromJson(parseJsonString(`{
+		"uri": "skill://x/SKILL.md", "frontmatter": {"name": "x", "description": "d"}
+	}`));
+	assert(!missing.isValid && !missing.isDynamic);
+
+	auto wrongType = SkillEntry.fromJson(parseJsonString(`{
+		"uri": "skill://x/SKILL.md", "frontmatter": {"name": "x", "description": "d"},
+		"resources": 42
+	}`));
+	assert(!wrongType.isValid && !wrongType.isDynamic);
+
+	auto otherString = SkillEntry.fromJson(parseJsonString(`{
+		"uri": "skill://x/SKILL.md", "frontmatter": {"name": "x", "description": "d"},
+		"resources": "static"
+	}`));
+	assert(!otherString.isValid && !otherString.isDynamic);
+}
+
+unittest  // verifyResourceDigest reports a dynamic skill as offering no integrity
+{
+	SkillEntry e;
+	e.uri = "skill://reports/daily/SKILL.md";
+	e.isDynamic = true;
+	const reason = verifyResourceDigest(e, e.uri, cast(const(ubyte)[]) "x");
+	assert(reason !is null);
+	import std.algorithm : canFind;
+
+	assert(reason.canFind("dynamic"));
+}
+
+unittest  // checkSkillLimits has nothing to count for a dynamic skill
+{
+	SkillEntry e;
+	e.uri = "skill://reports/daily/SKILL.md";
+	e.isDynamic = true;
+	assert(checkSkillLimits(e) is null);
+}
+
 unittest  // verifyResourceDigest accepts bytes matching the listed digest
 {
 	const bytes = cast(const(ubyte)[]) "# Forms\n";
@@ -1534,6 +1778,22 @@ unittest  // getSkill returns the same typed entry the listing carries
 	// The fetched SKILL.md verifies against the entry it was retrieved under.
 	const md = readSkillUri(client, entry.uri);
 	assert(verifyResourceDigest(entry, entry.uri, cast(const(ubyte)[]) md) is null);
+}
+
+unittest  // listSkills surfaces a dynamic entry as isDynamic with an empty manifest
+{
+	auto s = new McpServer("t", "1");
+	registerSkill(s, "static-one", "Static", "# S\n");
+	DynamicSkill dyn = {
+		path: "dynamic-one", description: "Dynamic", instructions: () @safe => "# D\n"
+	};
+	registerDynamicSkill(s, dyn);
+	auto client = new McpClient(new ServerBackedTransport(s));
+
+	auto skills = listSkills(client);
+	assert(skills.length == 2);
+	assert(!skills[0].isDynamic && skills[0].resources.length == 1);
+	assert(skills[1].isDynamic && skills[1].resources.length == 0 && skills[1].isValid);
 }
 
 unittest  // getSkill surfaces the server's -32602 for a non-skill uri
