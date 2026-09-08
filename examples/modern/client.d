@@ -6,9 +6,9 @@
  *   dub run -c client -- --http http://127.0.0.1:8431/mcp   # HTTP
  *
  * Transport selection and event-loop wiring are delegated to the shared
- * `examples_common` scaffold: `connectFromArgs(args, "stateless-draft-server")`
+ * `examples_common` scaffold: `connectFromArgs(args, "modern-server")`
  * returns an `McpClient.http(url)` when `--http <url>` (or `--url <url>`) is
- * given, otherwise `McpClient.spawnSibling("stateless-draft-server")` — which
+ * given, otherwise `McpClient.spawnSibling("modern-server")` — which
  * launches the built server binary next to this client and talks
  * newline-delimited JSON-RPC over its stdin/stdout. `runClient(scenario)` drives
  * the vibe event loop uniformly so the IDENTICAL assertion body works over both
@@ -37,7 +37,7 @@
  * mismatch the shared `check`/`checkEq` print a `FAIL:` line and throw, so
  * `runClient` returns a non-zero exit code.
  */
-module stateless_draft_client;
+module modern_client;
 
 import std.algorithm : canFind, map;
 import std.array : array;
@@ -90,11 +90,11 @@ int main(string[] args) @safe
 	immutable overHttp = args.canFind("--http") || args.canFind("--url");
 	return runClient(() @safe {
 		// connectFromArgs picks HTTP (`--http <url>`/`--url <url>`) or spawns the
-		// sibling `stateless-draft-server` over stdio. The client is not yet
+		// sibling `modern-server` over stdio. The client is not yet
 		// initialized; the draft path uses enableModern()/connect() below.
 		McpClient makeClient() @safe
 		{
-			return connectFromArgs(args, "stateless-draft-server");
+			return connectFromArgs(args, "modern-server");
 		}
 
 		auto client = makeClient();
@@ -112,7 +112,7 @@ private int runE2E(McpClient client, McpClient delegate() @safe makeClient, bool
 	check(disc.protocolVersions.canFind("2026-07-28"),
 			"discover.supportedVersions should contain the draft 2026-07-28; got "
 			~ disc.protocolVersions.to!string);
-	checkEq(disc.serverInfo.name, "stateless-draft-server", "discover.serverInfo.name");
+	checkEq(disc.serverInfo.name, "modern-server", "discover.serverInfo.name");
 
 	// --- 2. connect() selects the stateless draft -----------------------------
 	auto negotiated = client.connect();
@@ -180,7 +180,7 @@ private int runE2E(McpClient client, McpClient delegate() @safe makeClient, bool
 	checkEq(second.protocolVersion(), ProtocolVersion.v2026_07_28,
 			"reconnected client.protocolVersion()");
 	// The adopted identity came straight from the persisted discovery (no network).
-	checkEq(second.serverInfo().name, "stateless-draft-server",
+	checkEq(second.serverInfo().name, "modern-server",
 			"reconnected serverInfo adopted from the persisted discovery");
 	// It serves a real call over the adopted draft session.
 	auto reAdd = second.callTool("add", addArgs(1, 1));
@@ -191,8 +191,8 @@ private int runE2E(McpClient client, McpClient delegate() @safe makeClient, bool
 	// shutdown sequence on the spawned subprocess), so don't close here.
 
 	immutable transport = overHttp ? "http" : "stdio";
-	printLine("OK: stateless-draft e2e passed over " ~ transport
-			~ " — discover(2026-07-28), connect()=draft, "
+	printLine(
+			"OK: modern e2e passed over " ~ transport ~ " — discover(2026-07-28), connect()=draft, "
 			~ "listTools[add] cache(5000/public), add->{\"sum\":42} (+structuredContent), "
 			~ "greeting resource cache(9000/private), unknown-tool=-32602, "
 			~ "zero-RTT reconnect via connect(discoverResult).");

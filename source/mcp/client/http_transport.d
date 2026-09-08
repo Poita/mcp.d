@@ -151,7 +151,7 @@ final class HttpClientTransport : ClientTransport
 	// The draft removed Last-Event-ID resumption and standalone GET SSE streams;
 	// postAndAwait skips resumeViaGet when this is set so the pointless 405
 	// round-trip to a draft server is avoided.
-	private bool draftProtocol;
+	private bool modernProtocol;
 	// Set by `close()` to ask the background stream readers to stop between reads;
 	// the held sockets are closed so a blocked read returns immediately.
 	private shared(bool) closeRequested;
@@ -243,9 +243,9 @@ final class HttpClientTransport : ClientTransport
 	/// Mark whether the negotiated protocol version is modern (2026-07-28 / draft).
 	/// When true, `postAndAwait` skips Last-Event-ID resumption via GET because the
 	/// draft removed SSE resumability; a draft server responds to such a GET with 405.
-	void setDraftProtocol(bool isDraft) @safe
+	void setModernProtocol(bool modern) @safe
 	{
-		draftProtocol = isDraft;
+		modernProtocol = modern;
 	}
 
 	/// A draft Streamable HTTP client cancels by closing the request's SSE response
@@ -253,7 +253,7 @@ final class HttpClientTransport : ClientTransport
 	/// (pre-draft) still uses the notification.
 	bool cancelsByStreamClose() @safe
 	{
-		return draftProtocol;
+		return modernProtocol;
 	}
 
 	/// Bound each raw `connectTCP` by `timeout`. A connect that cannot complete in
@@ -466,7 +466,7 @@ final class HttpClientTransport : ClientTransport
 		// (per Streamable HTTP resumability — not a re-POST of the request).
 		// The draft (2026-07-28) removed resumability; a draft server responds with
 		// 405, so skip the GET when the negotiated version is modern.
-		if (cursor.retryMs > 0 && !draftProtocol)
+		if (cursor.retryMs > 0 && !modernProtocol)
 		{
 			sleep(cursor.retryMs.msecs);
 			resumeViaGet(expectId, cursor.lastEventId, result, got, err);
@@ -2477,13 +2477,13 @@ unittest  // runServerStream GET includes Authorization: Bearer when a bearer to
 unittest  // postAndAwait skips resumeViaGet when the session is in draft/modern mode
 {
 	// The draft (2026-07-28) removed Last-Event-ID resumption; a draft server responds
-	// to the GET with 405. skipDraftResumption gates the resume on !draftProtocol so
+	// to the GET with 405. skipDraftResumption gates the resume on !modernProtocol so
 	// the pointless GET round-trip is avoided when the negotiated version is modern.
 	auto t = new HttpClientTransport("https://host:8080/mcp");
-	assert(!t.draftProtocol,
+	assert(!t.modernProtocol,
 			"transport starts in non-draft mode; resumeViaGet is allowed by default");
-	t.draftProtocol = true;
-	assert(t.draftProtocol, "after setDraftProtocol(true) the transport skips resumeViaGet");
+	t.modernProtocol = true;
+	assert(t.modernProtocol, "after setModernProtocol(true) the transport skips resumeViaGet");
 }
 
 unittest  // readSseBody handles a partial IOMode.once read without appending zero bytes

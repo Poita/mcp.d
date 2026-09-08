@@ -2098,7 +2098,7 @@ unittest  // @icon UDA: theme field propagates through collectIcons to tools/lis
 	assert(tools[0]["icons"][0]["theme"].get!string == "dark");
 }
 
-version (unittest) private auto draftRead(string uri) @safe
+version (unittest) private auto modernRead(string uri) @safe
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.mrtr : MetaKey;
@@ -2118,7 +2118,7 @@ unittest  // @cache UDA on a resource: draft resources/read carries CacheableRes
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new ExtApi);
 	// A draft request (carrying the protocol-version _meta) gets cache fields.
-	auto rr = s.handle(draftRead("ext://cached")).get;
+	auto rr = s.handle(modernRead("ext://cached")).get;
 	assert(rr["result"]["ttlMs"].get!long == 5000);
 	assert(rr["result"]["cacheScope"].get!string == "private");
 }
@@ -2754,7 +2754,7 @@ version (unittest) private final class TaskUdaApi
 	}
 }
 
-version (unittest) private Json draftMeta() @safe
+version (unittest) private Json modernMeta() @safe
 {
 	import mcp.protocol.mrtr : MetaKey;
 
@@ -2798,7 +2798,7 @@ unittest  // @task UDA: tools/call returns a task the executor completes
 	Json p = Json.emptyObject;
 	p["name"] = "async_double";
 	p["arguments"] = Json(["n": Json(21)]);
-	p["_meta"] = draftMeta();
+	p["_meta"] = modernMeta();
 	auto call = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
 	assert(call["result"]["resultType"].get!string == "task");
 	const id = call["result"]["taskId"].get!string;
@@ -2807,7 +2807,7 @@ unittest  // @task UDA: tools/call returns a task the executor completes
 	assert(call["result"]["pollIntervalMs"].get!long == 250);
 
 	Json gp = Json(["taskId": Json(id)]);
-	gp["_meta"] = draftMeta();
+	gp["_meta"] = modernMeta();
 	auto got = s.handle(Message(makeRequest(Json(3), "tasks/get", gp))).get;
 	assert(got["result"]["status"].get!string == "completed");
 	assert(got["result"]["result"]["structuredContent"]["value"].get!int == 42);
@@ -2826,12 +2826,12 @@ unittest  // @task UDA: a mid-task elicitation suspends and resumes via tasks/up
 	Json p = Json.emptyObject;
 	p["name"] = "approve";
 	p["arguments"] = Json(["topic": Json("deploy")]);
-	p["_meta"] = draftMeta();
+	p["_meta"] = modernMeta();
 	auto call = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
 	const id = call["result"]["taskId"].get!string;
 
 	Json gp = Json(["taskId": Json(id)]);
-	gp["_meta"] = draftMeta();
+	gp["_meta"] = modernMeta();
 	auto blocked = s.handle(Message(makeRequest(Json(3), "tasks/get", gp))).get;
 	assert(blocked["result"]["status"].get!string == "input_required");
 	assert(blocked["result"]["inputRequests"]["ok"]["method"].get!string == "elicitation/create");
@@ -2840,7 +2840,7 @@ unittest  // @task UDA: a mid-task elicitation suspends and resumes via tasks/up
 		"taskId": Json(id),
 		"inputResponses": Json(["ok": Json(true)])
 	]);
-	up["_meta"] = draftMeta();
+	up["_meta"] = modernMeta();
 	auto ack = s.handle(Message(makeRequest(Json(4), "tasks/update", up))).get;
 	assert("error" !in ack);
 
@@ -2887,7 +2887,7 @@ unittest  // @event derives input + payload schemas from its typed signature
 	registerHandlers(s, new EventUdaApi);
 
 	Json params = Json.emptyObject;
-	params["_meta"] = draftMeta();
+	params["_meta"] = modernMeta();
 	auto events = s.handle(Message(makeRequest(Json(1), "events/list",
 			params))).get["result"]["events"];
 	Json email;
@@ -2909,7 +2909,7 @@ unittest  // @event carries its title through to events/list
 	registerHandlers(s, new EventUdaApi);
 
 	Json params = Json.emptyObject;
-	params["_meta"] = draftMeta();
+	params["_meta"] = modernMeta();
 	auto events = s.handle(Message(makeRequest(Json(1), "events/list",
 			params))).get["result"]["events"];
 	Json email;
@@ -2930,7 +2930,7 @@ unittest  // @event fetch handler backs events/poll: bootstrap then deliver type
 	Json boot = Json.emptyObject;
 	boot["name"] = "email.received";
 	boot["arguments"] = Json(["from": Json("a@b.com")]);
-	boot["_meta"] = draftMeta();
+	boot["_meta"] = modernMeta();
 	auto b = s.handle(Message(makeRequest(Json(1), "events/poll", boot))).get;
 	assert(b["result"]["events"].length == 0 && b["result"]["cursor"].get!string == "c0");
 
@@ -2938,7 +2938,7 @@ unittest  // @event fetch handler backs events/poll: bootstrap then deliver type
 	next["name"] = "email.received";
 	next["arguments"] = Json(["from": Json("a@b.com")]);
 	next["cursor"] = "c0";
-	next["_meta"] = draftMeta();
+	next["_meta"] = modernMeta();
 	auto n = s.handle(Message(makeRequest(Json(2), "events/poll", next))).get;
 	assert(n["result"]["events"].length == 1);
 	assert(n["result"]["events"][0]["data"]["from"].get!string == "a@b.com");
@@ -2955,7 +2955,7 @@ unittest  // the typed builder defines a push type whose publish() feeds events/
 
 	Json boot = Json.emptyObject;
 	boot["name"] = "mail.pushed";
-	boot["_meta"] = draftMeta();
+	boot["_meta"] = modernMeta();
 	auto b = s.handle(Message(makeRequest(Json(1), "events/poll", boot))).get;
 	auto cursor = b["result"]["cursor"];
 
@@ -2964,7 +2964,7 @@ unittest  // the typed builder defines a push type whose publish() feeds events/
 	Json next = Json.emptyObject;
 	next["name"] = "mail.pushed";
 	next["cursor"] = cursor;
-	next["_meta"] = draftMeta();
+	next["_meta"] = modernMeta();
 	auto n = s.handle(Message(makeRequest(Json(2), "events/poll", next))).get;
 	assert(n["result"]["events"].length == 1);
 	assert(n["result"]["events"][0]["data"]["messageId"].get!string == "m1");

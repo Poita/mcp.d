@@ -24,7 +24,7 @@
  * `runServerFromArgs(server, args, 8431)` parses `--http`/`--port`/`--host` and
  * serves Streamable HTTP or stdio accordingly.
  */
-module stateless_draft_server;
+module modern_server;
 
 import std.typecons : nullable;
 import core.time : seconds;
@@ -44,7 +44,7 @@ struct SumResult
 }
 
 /// The server's tool + resource surface, declared in UDA style.
-final class StatelessDraftApi
+final class StatelessModernApi
 {
 	/// A plain `add` tool. On a draft (stateless) request the transport carries
 	/// the per-request `_meta`; the handler itself is protocol-agnostic.
@@ -74,14 +74,14 @@ final class StatelessDraftApi
 
 void main(string[] args) @safe
 {
-	auto server = new McpServer("stateless-draft-server", "1.0.0",
+	auto server = new McpServer("modern-server", "1.0.0",
 			nullable("A stateless (draft) demo server: server/discover + per-request _meta."));
 
 	// Register every @tool / @resource annotated method in one call; input
 	// schema, the SumResult-derived output schema + structuredContent, argument
 	// marshalling, and the resource's @cache freshness hint are all derived from
 	// the annotations and signatures.
-	registerHandlers(server, new StatelessDraftApi);
+	registerHandlers(server, new StatelessModernApi);
 
 	// Draft-only per-list freshness hint: a draft client's `listTools().cache`
 	// will carry these `ttlMs` / `cacheScope` values. Pre-draft wire output is

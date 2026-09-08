@@ -1,6 +1,6 @@
 {
-	"name": "stateless-draft",
-	"description": "Stateless (draft) MCP protocol over Streamable HTTP: server/discover, per-request _meta, enableModern()/connect(), CacheableResult freshness hints",
+	"name": "modern",
+	"description": "The modern (2026-07-28) MCP protocol over stdio and Streamable HTTP: server/discover, per-request _meta, enableModern()/connect(), CacheableResult freshness hints",
 	"license": "Apache-2.0",
 	"dependencies": {
 		"mcp-d": { "path": "../.." },
@@ -10,13 +10,13 @@
 		{
 			"name": "server",
 			"targetType": "executable",
-			"targetName": "stateless-draft-server",
+			"targetName": "modern-server",
 			"mainSourceFile": "server.d"
 		},
 		{
 			"name": "client",
 			"targetType": "executable",
-			"targetName": "stateless-draft-client",
+			"targetName": "modern-client",
 			"mainSourceFile": "client.d"
 		}
 	]

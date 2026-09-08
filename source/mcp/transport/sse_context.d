@@ -1758,7 +1758,7 @@ unittest  // retainedHistoryStreams acquires mtx: must not be const
 ///
 /// `Cache-Control: no-cache` applies on every protocol version.
 ///
-/// `isDraft` adds the draft-only `X-Accel-Buffering: no` header. The draft
+/// `modern` adds the draft-only `X-Accel-Buffering: no` header. The draft
 /// basic/transports §Receiving Messages rule states: "When initiating an SSE
 /// stream, servers SHOULD include the `X-Accel-Buffering: no` header in the HTTP
 /// response" (it instructs reverse proxies such as nginx to disable response
@@ -1766,11 +1766,11 @@ unittest  // retainedHistoryStreams acquires mtx: must not be const
 /// the draft (2026-07-28) and does NOT exist in 2025-03-26 / 2025-06-18 /
 /// 2025-11-25, so it must NOT be emitted on those versions — the stable wire
 /// output is unchanged.
-string[string] sseStreamHeaders(bool isDraft) @safe
+string[string] sseStreamHeaders(bool modern) @safe
 {
 	string[string] h;
 	h["Cache-Control"] = "no-cache";
-	if (isDraft)
+	if (modern)
 		h["X-Accel-Buffering"] = "no";
 	return h;
 }
@@ -1791,10 +1791,10 @@ unittest  // draft SSE streams add X-Accel-Buffering: no (draft SHOULD)
 
 /// Set the SSE upgrade headers (see `sseStreamHeaders`) on a response, leaving
 /// the caller to set `contentType`. Applies the draft-only `X-Accel-Buffering`
-/// header only when `isDraft` is true.
-void applySseStreamHeaders(HTTPServerResponse res, bool isDraft) @safe
+/// header only when `modern` is true.
+void applySseStreamHeaders(HTTPServerResponse res, bool modern) @safe
 {
-	foreach (k, v; sseStreamHeaders(isDraft))
+	foreach (k, v; sseStreamHeaders(modern))
 		res.headers[k] = v;
 }
 
@@ -1833,7 +1833,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// When true, an SSE upgrade emits the draft-only `X-Accel-Buffering: no`
 	// header (draft basic/transports §Receiving Messages SHOULD). Defaults to
 	// false so 2025-03-26 / 2025-06-18 / 2025-11-25 wire output is unchanged.
-	private bool isDraft_;
+	private bool modern_;
 	// The effective protocol version negotiated for this request. Drives the
 	// 2025-11-25-only priming event (see `beginStream`). Defaults to the latest
 	// stable version.
@@ -1872,7 +1872,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 
 	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
 			TokenInfo auth = TokenInfo.invalid(),
-			bool isDraft = false, ProtocolVersion negotiated = latestLegacy,
+			bool modern = false, ProtocolVersion negotiated = latestLegacy,
 			string connectionToken = "",
 			ConnectionState connState = null,
 			bool serverStateless = false, bool acceptsEventStream = true) @safe
@@ -1883,7 +1883,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		this.progressTok = progressToken;
 		this.streamId = coord.allocStream();
 		this.authInfo = auth;
-		this.isDraft_ = isDraft;
+		this.modern_ = modern;
 		this.version_ = negotiated;
 		this.token_ = connectionToken;
 		this.connState_ = connState;
@@ -1955,7 +1955,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	/// `RequestScope.isCancelled` surfaces it to a polling handler.
 	bool isCancelled() @safe
 	{
-		if (isDraft_ && connAlive_ !is null)
+		if (modern_ && connAlive_ !is null)
 			return !connAlive_();
 		return false;
 	}
@@ -1977,7 +1977,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		res.contentType = "text/event-stream";
 		// Cache-Control: no-cache on every version; X-Accel-Buffering: no only
 		// on the draft (basic/transports §Receiving Messages SHOULD).
-		applySseStreamHeaders(res, isDraft_);
+		applySseStreamHeaders(res, modern_);
 		streaming_ = true;
 		// 2025-11-25 basic/transports §Sending Messages item 6: "If the server
 		// initiates an SSE stream: the server SHOULD immediately send an SSE event
@@ -2787,7 +2787,7 @@ unittest  // released versions: a disconnect never reports cancelled (draft-only
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	auto coord = new StreamCoordinator;
 	ClientCapabilities caps;
-	// isDraft = false (default): the 2025-* transports track cancellation solely
+	// modern = false (default): the 2025-* transports track cancellation solely
 	// via notifications/cancelled, so the context itself stays never-cancelled
 	// even when the connection has dropped.
 	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined);

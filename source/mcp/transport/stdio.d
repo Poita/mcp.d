@@ -1537,7 +1537,7 @@ unittest  // background push: notify* with no request in flight reaches a stdio 
 
 	string[] outputs;
 	withServer(s, (ServerLink link) @safe {
-		link.feed(draftListenLine(5, () @safe {
+		link.feed(modernListenLine(5, () @safe {
 				Json f = Json.emptyObject;
 				f["toolsListChanged"] = true;
 				return f;
@@ -1565,7 +1565,7 @@ version (unittest)
 
 	// A draft `subscriptions/listen` request line carrying per-request _meta
 	// (protocolVersion draft) and a nested `notifications` ListenFilter.
-	private string draftListenLine(long id, Json filter) @safe
+	private string modernListenLine(long id, Json filter) @safe
 	{
 		import mcp.protocol.jsonrpc : makeRequest;
 
@@ -1589,7 +1589,7 @@ unittest  // draft subscriptions/listen over stdio sends the acknowledged notifi
 
 	string[] outputs;
 	withServer(s, (ServerLink link) @safe {
-		link.feed(draftListenLine(7, filter));
+		link.feed(modernListenLine(7, filter));
 		foreach (_; 0 .. 8)
 			yield();
 		outputs = link.outbound.dup;
@@ -1615,7 +1615,7 @@ unittest  // the stdio acknowledged notification is stamped with the listen id a
 
 	string[] outputs;
 	withServer(s, (ServerLink link) @safe {
-		link.feed(draftListenLine(42, filter));
+		link.feed(modernListenLine(42, filter));
 		foreach (_; 0 .. 8)
 			yield();
 		outputs = link.outbound.dup;
@@ -1639,7 +1639,7 @@ unittest  // after a stdio subscriptions/listen, notify* change notifications fl
 
 	string[] outputs;
 	withServer(s, (ServerLink link) @safe {
-		link.feed(draftListenLine(5, filter));
+		link.feed(modernListenLine(5, filter));
 		foreach (_; 0 .. 8)
 			yield();
 		const delivered = s.notifyToolsListChanged();
@@ -1668,7 +1668,7 @@ unittest  // a stdio subscriptions/listen returns a SubscriptionsListenResult on
 
 	string[] outputs;
 	withServer(s, (ServerLink link) @safe {
-		link.feed(draftListenLine(5, filter));
+		link.feed(modernListenLine(5, filter));
 		foreach (_; 0 .. 8)
 			yield();
 		// The client cancels the listen by notifications/cancelled referencing its id;

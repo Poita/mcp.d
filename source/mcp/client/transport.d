@@ -105,7 +105,7 @@ interface ClientTransport
 	/// Signal whether the negotiated protocol version is modern (2026-07-28 / draft).
 	/// The HTTP transport uses this to skip Last-Event-ID resumption (GET) that the
 	/// draft removed; a no-op on stdio and on transports where the flag is irrelevant.
-	void setDraftProtocol(bool isDraft) @safe;
+	void setModernProtocol(bool modern) @safe;
 
 	/// Whether this transport signals request cancellation by closing the request's
 	/// stream rather than by sending `notifications/cancelled`. True only for a draft

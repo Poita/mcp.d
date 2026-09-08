@@ -50,11 +50,11 @@ int main(string[] args)
 	return rc;
 }
 
-private bool draftRequested() @trusted
+private bool modernRequested() @trusted
 {
 	import std.process : environment;
 
-	return environment.get("MCP_DRAFT", "").length > 0;
+	return environment.get("MCP_MODERN", "").length > 0;
 }
 
 private int runScenario(string url, string scenario) @safe
@@ -67,9 +67,9 @@ private int runScenario(string url, string scenario) @safe
 	client.capabilities.elicitation = true;
 	client.capabilities.roots = true;
 
-	// Draft mode (stateless): MCP_DRAFT=1 exercises server/discover + per-request
+	// Draft mode (stateless): MCP_MODERN=1 exercises server/discover + per-request
 	// _meta + standard headers against a draft-capable server.
-	if (draftRequested())
+	if (modernRequested())
 	{
 		client.enableModern();
 		auto d = client.discover();

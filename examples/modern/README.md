@@ -1,4 +1,4 @@
-# stateless-draft — Stateless (draft) protocol, dual-transport (stdio + HTTP)
+# modern — The 2026-07-28 (modern) protocol, dual-transport (stdio + HTTP)
 
 A focused, self-contained example of the MCP **draft (2026-07-28) stateless
 protocol**, shown from both sides and runnable over **both** transports from a
@@ -65,9 +65,9 @@ example contains no transport boilerplate of its own:
   parses `--http` / `--port` / `--host` and serves Streamable HTTP or stdio;
 - the client's `main` calls **`runClient(...)`** (drives the vibe event loop
   uniformly for both transports) around
-  **`connectFromArgs(args, "stateless-draft-server")`**, which connects over
+  **`connectFromArgs(args, "modern-server")`**, which connects over
   HTTP for `--http <url>` (alias `--url <url>`) or otherwise spawns the sibling
-  `stateless-draft-server` binary over stdio via `McpClient.spawnSibling`;
+  `modern-server` binary over stdio via `McpClient.spawnSibling`;
 - the e2e assertions use the shared **`check`** / **`checkEq`** helpers, which
   print a `FAIL:` line and throw on mismatch so `runClient` returns a non-zero
   exit code.
@@ -94,7 +94,7 @@ The client spawns the server binary itself, so just build both and run the
 client:
 
 ```sh
-dub build -c server     # produces ./stateless-draft-server (also spawned by the client)
+dub build -c server     # produces ./modern-server (also spawned by the client)
 dub build -c client
 dub run -c client
 echo "exit code: $?"    # 0 = all assertions passed
@@ -118,7 +118,7 @@ echo "exit code: $?"    # 0 = all assertions passed
 Either way the client prints a line like:
 
 ```
-OK: stateless-draft e2e passed over <transport> — discover(2026-07-28), connect()=draft, listTools[add] cache(5000/public), add->{"sum":42} (+structuredContent), greeting resource cache(9000/private), unknown-tool=-32602, zero-RTT reconnect via connect(discoverResult).
+OK: modern e2e passed over <transport> — discover(2026-07-28), connect()=draft, listTools[add] cache(5000/public), add->{"sum":42} (+structuredContent), greeting resource cache(9000/private), unknown-tool=-32602, zero-RTT reconnect via connect(discoverResult).
 ```
 
 CI runs both: the stdio path (run the client, which spawns the server) and the

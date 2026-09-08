@@ -3690,7 +3690,7 @@ unittest  // server/discover (draft) emits the full stored serverInfo
 	};
 	auto s = new McpServer(info);
 	// server/discover is a draft-only RPC: dispatch it as a draft request.
-	auto resp = s.handle(draftReq(1, "server/discover")).get;
+	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	auto si = resp["result"]["_meta"][MetaKey.serverInfo];
 	assert(si["name"].get!string == "rich-srv");
 	assert(si["title"].get!string == "Rich Server");
@@ -3764,7 +3764,7 @@ unittest  // ping returns an empty result object
 unittest  // draft ping is -32601: the draft (SEP-2575) removed the ping method
 {
 	auto s = makeTestServer();
-	auto resp = s.handle(draftReq(2, "ping")).get;
+	auto resp = s.handle(modernReq(2, "ping")).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
@@ -5329,7 +5329,7 @@ unittest  // draft: logging/setLevel is method-not-found (removed in 2026-07-28)
 	s.enableLogging();
 	Json p = Json.emptyObject;
 	p["level"] = "debug";
-	auto resp = s.handle(draftReq(1, "logging/setLevel", p)).get;
+	auto resp = s.handle(modernReq(1, "logging/setLevel", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 	assert(s.currentLogLevel == "info");
 }
@@ -5409,8 +5409,8 @@ unittest  // draft request WITHOUT logLevel emits no notifications/message at al
 	auto ctx = new DraftLogCtx;
 	Json callP = Json.emptyObject;
 	callP["name"] = "noisy";
-	// draftReq with no logLevel argument => no io.modelcontextprotocol/logLevel.
-	s.handle(draftReq(2, "tools/call", callP), ctx);
+	// modernReq with no logLevel argument => no io.modelcontextprotocol/logLevel.
+	s.handle(modernReq(2, "tools/call", callP), ctx);
 
 	// The MUST-NOT-emit-without-the-field requirement: nothing was emitted.
 	assert(ctx.emitted.length == 0);
@@ -5422,7 +5422,7 @@ unittest  // draft request WITH logLevel emits only at or above that level
 	auto ctx = new DraftLogCtx;
 	Json callP = Json.emptyObject;
 	callP["name"] = "noisy";
-	s.handle(draftReq(2, "tools/call", callP, "error"), ctx);
+	s.handle(modernReq(2, "tools/call", callP, "error"), ctx);
 
 	assert(ctx.emitted == ["error", "emergency"]);
 }
@@ -5433,7 +5433,7 @@ unittest  // draft request with an unrecognised logLevel is rejected with -32602
 	auto ctx = new DraftLogCtx;
 	Json callP = Json.emptyObject;
 	callP["name"] = "noisy";
-	auto resp = s.handle(draftReq(2, "tools/call", callP, "verbose"), ctx).get;
+	auto resp = s.handle(modernReq(2, "tools/call", callP, "verbose"), ctx).get;
 
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 	// The handler must not have run / emitted anything.
@@ -5447,7 +5447,7 @@ unittest  // a draft request's logLevel does not leak into a later request
 	auto ctx1 = new DraftLogCtx;
 	Json call1 = Json.emptyObject;
 	call1["name"] = "noisy";
-	s.handle(draftReq(1, "tools/call", call1, "debug"), ctx1);
+	s.handle(modernReq(1, "tools/call", call1, "debug"), ctx1);
 	assert(ctx1.emitted == ["debug", "warning", "error", "emergency"]);
 
 	// A subsequent draft request without a logLevel must emit nothing — the
@@ -5455,7 +5455,7 @@ unittest  // a draft request's logLevel does not leak into a later request
 	auto ctx2 = new DraftLogCtx;
 	Json call2 = Json.emptyObject;
 	call2["name"] = "noisy";
-	s.handle(draftReq(2, "tools/call", call2), ctx2);
+	s.handle(modernReq(2, "tools/call", call2), ctx2);
 	assert(ctx2.emitted.length == 0);
 }
 
@@ -5505,7 +5505,7 @@ unittest  // draft: no notifications/message when the logging capability was nev
 	auto ctx = new DraftLogCtx;
 	Json callP = Json.emptyObject;
 	callP["name"] = "noisy";
-	s.handle(draftReq(2, "tools/call", callP, "debug"), ctx);
+	s.handle(modernReq(2, "tools/call", callP, "debug"), ctx);
 
 	assert(ctx.emitted.length == 0);
 }
@@ -5531,7 +5531,7 @@ unittest  // advertised extensions appear in server/discover capabilities under 
 
 	// The Tasks extension is draft-only; a draft client discovers it via
 	// `server/discover`, not the `initialize` handshake.
-	auto resp = s.handle(draftReq(1, "server/discover")).get;
+	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	auto ext = resp["result"]["capabilities"]["extensions"];
 	assert(ext.type == Json.Type.object);
 	assert(ext["io.modelcontextprotocol/tasks"]["maxConcurrent"].get!int == 4);
@@ -5739,7 +5739,7 @@ unittest  // draft: resources/subscribe is method-not-found (subscriptions/liste
 	auto s = new McpServer("t", "1");
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
-	auto resp = s.handle(draftReq(1, "resources/subscribe", p)).get;
+	auto resp = s.handle(modernReq(1, "resources/subscribe", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 	assert(!s.isSubscribed("test://w"));
 }
@@ -5759,7 +5759,7 @@ unittest  // draft: resources/unsubscribe is method-not-found (removed for subsc
 	auto s = new McpServer("t", "1");
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
-	auto resp = s.handle(draftReq(2, "resources/unsubscribe", p)).get;
+	auto resp = s.handle(modernReq(2, "resources/unsubscribe", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
@@ -5777,7 +5777,7 @@ unittest  // server/discover is draft-only: a non-draft session gets -32601
 unittest  // server/discover under draft still serves the discover result
 {
 	auto s = new McpServer("disc-srv", "1.0");
-	auto resp = s.handle(draftReq(1, "server/discover")).get;
+	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	assert("error" !in resp);
 	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "disc-srv");
 }
@@ -5910,7 +5910,7 @@ unittest  // subscribe capability is advertised only when enabled (on a stateful
 version (unittest)
 {
 	// A request carrying draft per-request _meta (protocolVersion 2026-07-28).
-	private Message draftReq(long id, string method,
+	private Message modernReq(long id, string method,
 			Json params = Json.emptyObject, string logLevel = null) @safe
 	{
 		Json meta = Json.emptyObject;
@@ -5931,7 +5931,7 @@ unittest  // enableTasks advertises the tasks extension under draft server/disco
 {
 	auto s = new McpServer("t", "1");
 	s.enableTasks();
-	auto resp = s.handle(draftReq(1, "server/discover")).get;
+	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	auto caps = resp["result"]["capabilities"];
 	assert("tasks" !in caps, "no top-level tasks capability under the extension model");
 	assert("io.modelcontextprotocol/tasks" in caps["extensions"]);
@@ -5943,7 +5943,7 @@ unittest  // tasks/* are -32601 when the server never enabled tasks
 	foreach (m; ["tasks/get", "tasks/update", "tasks/cancel"])
 	{
 		Json p = Json(["taskId": Json("x")]);
-		auto resp = s.handle(draftReq(1, m, p)).get;
+		auto resp = s.handle(modernReq(1, m, p)).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
 	}
 }
@@ -5966,7 +5966,7 @@ unittest  // tasks/list and tasks/result do not exist in the extension (always -
 	s.enableTasks();
 	foreach (m; ["tasks/list", "tasks/result"])
 	{
-		auto resp = s.handle(draftReq(1, m, Json(["taskId": Json("x")]))).get;
+		auto resp = s.handle(modernReq(1, m, Json(["taskId": Json("x")]))).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
 	}
 }
@@ -5975,7 +5975,7 @@ unittest  // tasks/get for an unknown taskId is -32602 with the taskId echoed
 {
 	auto s = new McpServer("t", "1");
 	s.enableTasks();
-	auto resp = s.handle(draftReq(1, "tasks/get", Json(["taskId": Json("nope")]))).get;
+	auto resp = s.handle(modernReq(1, "tasks/get", Json(["taskId": Json("nope")]))).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 	assert(resp["error"]["data"]["taskId"].get!string == "nope");
 }
@@ -6000,7 +6000,7 @@ unittest  // enableEvents advertises the events extension (with listChanged) und
 {
 	auto s = new McpServer("t", "1");
 	s.enableEvents();
-	auto resp = s.handle(draftReq(1, "server/discover")).get;
+	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	auto caps = resp["result"]["capabilities"];
 	assert("io.modelcontextprotocol/events" in caps["extensions"]);
 	assert(caps["extensions"]["io.modelcontextprotocol/events"]["listChanged"].get!bool);
@@ -6013,7 +6013,7 @@ unittest  // events/* are -32601 when the server never enabled events
 		"events/list", "events/poll", "events/subscribe", "events/unsubscribe"
 	])
 	{
-		auto resp = s.handle(draftReq(1, m, Json(["name": Json("x")]))).get;
+		auto resp = s.handle(modernReq(1, m, Json(["name": Json("x")]))).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
 	}
 }
@@ -6036,7 +6036,7 @@ unittest  // events/list returns registered event types with computed delivery m
 	auto s = new McpServer("t", "1");
 	s.enableEvents();
 	registerDemoEvent(s);
-	auto resp = s.handle(draftReq(1, "events/list")).get;
+	auto resp = s.handle(modernReq(1, "events/list")).get;
 	auto events = resp["result"]["events"];
 	assert(events.length == 1);
 	assert(events[0]["name"].get!string == "incident.created");
@@ -6049,7 +6049,7 @@ unittest  // events/poll bootstraps then drains an emitted event
 	auto rt = s.enableEvents();
 	registerDemoEvent(s);
 
-	auto boot = s.handle(draftReq(1, "events/poll", Json([
+	auto boot = s.handle(modernReq(1, "events/poll", Json([
 		"name": Json("incident.created")
 	]))).get;
 	auto cursor = boot["result"]["cursor"];
@@ -6062,7 +6062,7 @@ unittest  // events/poll bootstraps then drains an emitted event
 	Json pollParams = Json.emptyObject;
 	pollParams["name"] = "incident.created";
 	pollParams["cursor"] = cursor;
-	auto next = s.handle(draftReq(2, "events/poll", pollParams)).get;
+	auto next = s.handle(modernReq(2, "events/poll", pollParams)).get;
 	assert(next["result"]["events"].length == 1);
 	assert(next["result"]["events"][0]["data"]["severity"].get!string == "P1");
 }
@@ -6071,7 +6071,7 @@ unittest  // events/poll on an unknown event type is -32011 NotFound
 {
 	auto s = new McpServer("t", "1");
 	s.enableEvents();
-	auto resp = s.handle(draftReq(1, "events/poll", Json(["name": Json("nope")]))).get;
+	auto resp = s.handle(modernReq(1, "events/poll", Json(["name": Json("nope")]))).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.notFound);
 }
 
@@ -6087,7 +6087,7 @@ unittest  // events/subscribe without an authenticated principal is -32012 Forbi
 	d["url"] = "https://proxy/hooks";
 	d["secret"] = "whsec_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 	p["delivery"] = d;
-	auto resp = s.handle(draftReq(1, "events/subscribe", p)).get;
+	auto resp = s.handle(modernReq(1, "events/subscribe", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.forbidden);
 }
 
@@ -6108,7 +6108,7 @@ unittest  // stdio events/stream opens with an active frame, then delivers emitt
 
 	Json params = Json.emptyObject;
 	params["name"] = "incident.created";
-	assert(s.tryServeStdioEventsStream(draftReq(9, "events/stream", params), &sink));
+	assert(s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink));
 	// first frame is notifications/events/active stamped with the request id
 	auto active = parseJsonString(lines[0]);
 	assert(active["method"].get!string == "notifications/events/active");
@@ -6139,7 +6139,7 @@ unittest  // a cancelled stdio events/stream stops receiving events
 
 	Json params = Json.emptyObject;
 	params["name"] = "incident.created";
-	s.tryServeStdioEventsStream(draftReq(9, "events/stream", params), &sink);
+	s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink);
 	const before = lines.length;
 	// cancel the stream by its request id, then emit
 	s.handle(Message(makeNotification("notifications/cancelled", Json([
@@ -6168,7 +6168,7 @@ unittest  // a server-terminated stdio stream gets the terminated frame, then th
 
 	Json params = Json.emptyObject;
 	params["name"] = "n";
-	s.tryServeStdioEventsStream(draftReq(1, "events/stream", params), &sink);
+	s.tryServeStdioEventsStream(modernReq(1, "events/stream", params), &sink);
 	const opened = lines.length;
 	rt.terminatePrincipal("", "n", toErrorJson(forbidden("Access revoked")));
 	assert(lines.length == opened + 2);
@@ -6211,8 +6211,8 @@ unittest  // tickStdioEventStreams iterates a snapshot, so a mid-tick cancel can
 
 	Json params = Json.emptyObject;
 	params["name"] = "email.received";
-	s.tryServeStdioEventsStream(draftReq(1, "events/stream", params), &sink);
-	s.tryServeStdioEventsStream(draftReq(2, "events/stream", params), &sink);
+	s.tryServeStdioEventsStream(modernReq(1, "events/stream", params), &sink);
+	s.tryServeStdioEventsStream(modernReq(2, "events/stream", params), &sink);
 	cancelDuringTick = true;
 
 	// The tick removes stream 1 from the AA while iterating; a live foreach over the
@@ -6256,7 +6256,7 @@ unittest  // tickStdioEventStreams polls a check-backed stream and heartbeats on
 
 	Json params = Json.emptyObject;
 	params["name"] = "email.received";
-	s.tryServeStdioEventsStream(draftReq(1, "events/stream", params), &sink);
+	s.tryServeStdioEventsStream(modernReq(1, "events/stream", params), &sink);
 	// The leading active frame seeds lastHeartbeatMs at 0 (the stream's birth time).
 	const afterOpen = lines.length;
 
@@ -6296,7 +6296,7 @@ unittest  // a created task is served via tasks/get, progressing working -> comp
 	auto rt = s.enableTasks();
 	auto t = rt.create();
 
-	auto working = s.handle(draftReq(1, "tasks/get", Json([
+	auto working = s.handle(modernReq(1, "tasks/get", Json([
 		"taskId": Json(t.taskId)
 	]))).get;
 	assert(working["result"]["status"].get!string == "working");
@@ -6306,7 +6306,7 @@ unittest  // a created task is served via tasks/get, progressing working -> comp
 		"content": Json([Json(["type": Json("text"), "text": Json("done")])])
 	]);
 	rt.complete(t.taskId, result);
-	auto done = s.handle(draftReq(2, "tasks/get", Json([
+	auto done = s.handle(modernReq(2, "tasks/get", Json([
 		"taskId": Json(t.taskId)
 	]))).get;
 	assert(done["result"]["status"].get!string == "completed");
@@ -6322,7 +6322,7 @@ unittest  // input_required surfaces inputRequests and tasks/update is acknowled
 			"k1": Json(["method": Json("elicitation/create")])
 	]));
 
-	auto blocked = s.handle(draftReq(1, "tasks/get", Json([
+	auto blocked = s.handle(modernReq(1, "tasks/get", Json([
 		"taskId": Json(t.taskId)
 	]))).get;
 	assert(blocked["result"]["status"].get!string == "input_required");
@@ -6332,7 +6332,7 @@ unittest  // input_required surfaces inputRequests and tasks/update is acknowled
 		"taskId": Json(t.taskId),
 		"inputResponses": Json(["k1": Json(["answer": Json("yes")])])
 	]);
-	auto ack = s.handle(draftReq(2, "tasks/update", up)).get;
+	auto ack = s.handle(modernReq(2, "tasks/update", up)).get;
 	assert("error" !in ack);
 	assert(ack["result"].type == Json.Type.object);
 	assert(rt.takenInput(t.taskId)["k1"]["answer"].get!string == "yes");
@@ -6343,12 +6343,14 @@ unittest  // tasks/cancel acknowledges and cancels a task
 	auto s = new McpServer("t", "1");
 	auto rt = s.enableTasks();
 	auto t = rt.create();
-	auto ack = s.handle(draftReq(1, "tasks/cancel", Json([
+	auto ack = s.handle(modernReq(1, "tasks/cancel", Json([
 		"taskId": Json(t.taskId)
 	]))).get;
 	assert("error" !in ack);
 	assert(ack["result"].type == Json.Type.object);
-	auto got = s.handle(draftReq(2, "tasks/get", Json(["taskId": Json(t.taskId)]))).get;
+	auto got = s.handle(modernReq(2, "tasks/get", Json([
+				"taskId": Json(t.taskId)
+	]))).get;
 	assert(got["result"]["status"].get!string == "cancelled");
 }
 
@@ -6357,7 +6359,7 @@ unittest  // tasks/update for an unknown taskId is -32602
 	auto s = new McpServer("t", "1");
 	s.enableTasks();
 	Json up = Json(["taskId": Json("nope"), "inputResponses": Json.emptyObject]);
-	auto resp = s.handle(draftReq(1, "tasks/update", up)).get;
+	auto resp = s.handle(modernReq(1, "tasks/update", up)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
@@ -6373,7 +6375,7 @@ unittest  // registerTaskTool: tools/call returns a task handle the executor com
 		return Json(["structuredContent": Json(["result": Json(n * 2)])]);
 	});
 
-	auto call = s.handle(draftReq(1, "tools/call", Json([
+	auto call = s.handle(modernReq(1, "tools/call", Json([
 		"name": Json("dbl"),
 		"arguments": Json(["n": Json(21)])
 	]))).get;
@@ -6382,7 +6384,7 @@ unittest  // registerTaskTool: tools/call returns a task handle the executor com
 
 	// The synchronous dispatcher ran the executor inline, so the task is already
 	// completed by the time we poll.
-	auto got = s.handle(draftReq(2, "tasks/get", Json(["taskId": Json(id)]))).get;
+	auto got = s.handle(modernReq(2, "tasks/get", Json(["taskId": Json(id)]))).get;
 	assert(got["result"]["status"].get!string == "completed");
 	assert(got["result"]["result"]["structuredContent"]["result"].get!int == 42);
 }
@@ -6436,10 +6438,13 @@ version (unittest)
 
 	private string startGateTask(McpServer s, RequestContext ctx) @safe
 	{
-		auto call = ctx is null ? s.handle(draftReq(1, "tools/call",
+		auto call = ctx is null ? s.handle(modernReq(1, "tools/call",
 				Json(["name": Json("gate"), "arguments": Json.emptyObject]))).get
-			: s.handle(draftReq(1, "tools/call",
-					Json(["name": Json("gate"), "arguments": Json.emptyObject])), ctx).get;
+			: s.handle(modernReq(1,
+					"tools/call", Json([
+						"name": Json("gate"),
+						"arguments": Json.emptyObject
+		])), ctx).get;
 		return call["result"]["taskId"].get!string;
 	}
 }
@@ -6452,18 +6457,18 @@ unittest  // a task is bound to the principal that created it: another principal
 	auto s = taskOwnershipServer();
 	const id = startGateTask(s, new OwnerCtx("alice"));
 
-	auto mine = s.handle(draftReq(2, "tasks/get", Json(["taskId": Json(id)])),
+	auto mine = s.handle(modernReq(2, "tasks/get", Json(["taskId": Json(id)])),
 			new OwnerCtx("alice")).get;
 	assert("result" in mine);
 	assert(mine["result"]["status"].get!string == "input_required");
 
 	// A different principal, or an unauthenticated request, is answered exactly
 	// like an unknown task, so the task's existence is not disclosed.
-	auto theirs = s.handle(draftReq(3, "tasks/get",
+	auto theirs = s.handle(modernReq(3, "tasks/get",
 			Json(["taskId": Json(id)])), new OwnerCtx("bob")).get;
 	assert(theirs["error"]["code"].get!int == ErrorCode.invalidParams);
 	assert(theirs["error"]["data"]["taskId"].get!string == id);
-	auto anon = s.handle(draftReq(4, "tasks/get", Json(["taskId": Json(id)]))).get;
+	auto anon = s.handle(modernReq(4, "tasks/get", Json(["taskId": Json(id)]))).get;
 	assert(anon["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
@@ -6476,20 +6481,20 @@ unittest  // tasks/update and tasks/cancel are bound to the creating principal t
 		"taskId": Json(id),
 		"inputResponses": Json(["ok": Json(["action": Json("accept")])])
 	]);
-	auto bobUpdate = s.handle(draftReq(2, "tasks/update", up), new OwnerCtx("bob")).get;
+	auto bobUpdate = s.handle(modernReq(2, "tasks/update", up), new OwnerCtx("bob")).get;
 	assert(bobUpdate["error"]["code"].get!int == ErrorCode.invalidParams);
-	auto bobCancel = s.handle(draftReq(3, "tasks/cancel",
+	auto bobCancel = s.handle(modernReq(3, "tasks/cancel",
 			Json(["taskId": Json(id)])), new OwnerCtx("bob")).get;
 	assert(bobCancel["error"]["code"].get!int == ErrorCode.invalidParams);
 
 	// The owner's update goes through and the executor completes the task.
-	auto aliceUpdate = s.handle(draftReq(4, "tasks/update", up), new OwnerCtx("alice")).get;
+	auto aliceUpdate = s.handle(modernReq(4, "tasks/update", up), new OwnerCtx("alice")).get;
 	assert("result" in aliceUpdate);
-	auto got = s.handle(draftReq(5, "tasks/get", Json(["taskId": Json(id)])),
+	auto got = s.handle(modernReq(5, "tasks/get", Json(["taskId": Json(id)])),
 			new OwnerCtx("alice")).get;
 	assert(got["result"]["status"].get!string == "completed");
 	// A terminal task stays bound: the other principal still sees "not found".
-	auto bobGet = s.handle(draftReq(6, "tasks/get",
+	auto bobGet = s.handle(modernReq(6, "tasks/get",
 			Json(["taskId": Json(id)])), new OwnerCtx("bob")).get;
 	assert(bobGet["error"]["code"].get!int == ErrorCode.invalidParams);
 }
@@ -6501,10 +6506,10 @@ unittest  // a task created without an authenticated principal is not principal-
 	// request, authenticated or not.
 	auto s = taskOwnershipServer();
 	const id = startGateTask(s, null);
-	assert("result" in s.handle(draftReq(2, "tasks/get", Json([
+	assert("result" in s.handle(modernReq(2, "tasks/get", Json([
 		"taskId": Json(id)
 	]))).get);
-	assert("result" in s.handle(draftReq(3, "tasks/get",
+	assert("result" in s.handle(modernReq(3, "tasks/get",
 			Json(["taskId": Json(id)])), new OwnerCtx("alice")).get);
 }
 
@@ -6523,24 +6528,24 @@ unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
 		return Json(["structuredContent": Json(["approved": tc.input("ok")])]);
 	});
 
-	auto call = s.handle(draftReq(1, "tools/call", Json([
+	auto call = s.handle(modernReq(1, "tools/call", Json([
 		"name": Json("gate"),
 		"arguments": Json.emptyObject
 	]))).get;
 	const id = call["result"]["taskId"].get!string;
 
 	// Inline run suspended into input_required, surfacing the elicitation.
-	auto blocked = s.handle(draftReq(2, "tasks/get", Json(["taskId": Json(id)]))).get;
+	auto blocked = s.handle(modernReq(2, "tasks/get", Json(["taskId": Json(id)]))).get;
 	assert(blocked["result"]["status"].get!string == "input_required");
 	assert(blocked["result"]["inputRequests"]["ok"]["method"].get!string == "elicitation/create");
 
 	// The answer resumes the executor (re-dispatched inline) to completion.
-	auto ack = s.handle(draftReq(3, "tasks/update", Json([
+	auto ack = s.handle(modernReq(3, "tasks/update", Json([
 		"taskId": Json(id),
 		"inputResponses": Json(["ok": Json(true)])
 	]))).get;
 	assert("error" !in ack);
-	auto done = s.handle(draftReq(4, "tasks/get", Json(["taskId": Json(id)]))).get;
+	auto done = s.handle(modernReq(4, "tasks/get", Json(["taskId": Json(id)]))).get;
 	assert(done["result"]["status"].get!string == "completed");
 	assert(done["result"]["result"]["structuredContent"]["approved"].get!bool);
 }
@@ -6552,9 +6557,9 @@ unittest  // draft tools/call rejects with -32021 when a required client cap is 
 	ClientCapabilities req;
 	req.sampling = true;
 	assert(s.setToolRequiredClientCapabilities("add", req));
-	// draftReq declares empty clientCapabilities -> sampling is missing.
+	// modernReq declares empty clientCapabilities -> sampling is missing.
 	Json p = Json(["name": Json("add"), "arguments": Json.emptyObject]);
-	auto resp = s.handle(draftReq(7, "tools/call", p)).get;
+	auto resp = s.handle(modernReq(7, "tools/call", p)).get;
 	assert(resp["error"]["code"].get!long == -32021);
 	assert("requiredCapabilities" in resp["error"]["data"]);
 	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
@@ -6588,7 +6593,7 @@ unittest  // a tool without a declared requirement is never gated on draft
 		"name": Json("add"),
 		"arguments": Json(["a": Json(1), "b": Json(1)])
 	]);
-	auto resp = s.handle(draftReq(9, "tools/call", p)).get;
+	auto resp = s.handle(modernReq(9, "tools/call", p)).get;
 	assert("error" !in resp);
 	assert(resp["result"]["structuredContent"]["result"].get!int == 2);
 }
@@ -6629,9 +6634,9 @@ unittest  // draft prompts/get rejects with -32021 when a required client cap is
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
 	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
-	// draftReq declares empty clientCapabilities -> sampling is missing.
+	// modernReq declares empty clientCapabilities -> sampling is missing.
 	Json p = Json(["name": Json("greet")]);
-	auto resp = s.handle(draftReq(1, "prompts/get", p)).get;
+	auto resp = s.handle(modernReq(1, "prompts/get", p)).get;
 	assert(resp["error"]["code"].get!long == -32021);
 	assert("requiredCapabilities" in resp["error"]["data"]);
 	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
@@ -6693,9 +6698,9 @@ unittest  // draft resources/read rejects with -32021 when a required client cap
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
 	assert(s.setResourceRequiredClientCapabilities("res://x", reqCap));
-	// draftReq declares empty clientCapabilities -> sampling is missing.
+	// modernReq declares empty clientCapabilities -> sampling is missing.
 	Json p = Json(["uri": Json("res://x")]);
-	auto resp = s.handle(draftReq(1, "resources/read", p)).get;
+	auto resp = s.handle(modernReq(1, "resources/read", p)).get;
 	assert(resp["error"]["code"].get!long == -32021);
 	assert("requiredCapabilities" in resp["error"]["data"]);
 	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
@@ -6761,7 +6766,7 @@ unittest  // draft resources/read via template rejects with -32021 when cap unde
 	reqCap.sampling = true;
 	assert(s.setResourceTemplateRequiredClientCapabilities("res://{id}", reqCap));
 	Json p = Json(["uri": Json("res://42")]);
-	auto resp = s.handle(draftReq(1, "resources/read", p)).get;
+	auto resp = s.handle(modernReq(1, "resources/read", p)).get;
 	assert(resp["error"]["code"].get!long == -32021);
 	assert("requiredCapabilities" in resp["error"]["data"]);
 }
@@ -6777,18 +6782,18 @@ unittest  // setResourceTemplateRequiredClientCapabilities returns false for unk
 unittest  // server/discover advertises all supported versions + identity
 {
 	auto s = makeTestServer();
-	auto resp = s.handle(draftReq(1, "server/discover")).get;
+	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	assert(resp["result"]["resultType"].get!string == "complete");
 	auto pv = resp["result"]["supportedVersions"];
-	bool hasDraft, hasFirst;
+	bool hasModern, hasFirst;
 	foreach (i; 0 .. pv.length)
 	{
 		if (pv[i].get!string == "2026-07-28")
-			hasDraft = true;
+			hasModern = true;
 		if (pv[i].get!string == "2024-11-05")
 			hasFirst = true;
 	}
-	assert(hasDraft && hasFirst);
+	assert(hasModern && hasFirst);
 	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "test-srv");
 }
 
@@ -6796,7 +6801,7 @@ unittest  // per-list setListCacheHint: draft tools/list carries CacheableResult
 {
 	auto s = makeTestServer();
 	s.setListCacheHint("tools/list", CacheHint(5.seconds, CacheScope.private_));
-	auto resp = s.handle(draftReq(2, "tools/list")).get;
+	auto resp = s.handle(modernReq(2, "tools/list")).get;
 	assert(resp["result"]["ttlMs"].get!long == 5000);
 	assert(resp["result"]["cacheScope"].get!string == "private");
 }
@@ -6816,7 +6821,7 @@ unittest  // per-list hint only emits on the matching list, not on others
 	// tools/list has no explicit hint, so it carries the mandatory draft default
 	// (ttlMs:0) rather than the resources/list value: the per-list hint does
 	// not leak across methods.
-	auto tools = s.handle(draftReq(2, "tools/list")).get;
+	auto tools = s.handle(modernReq(2, "tools/list")).get;
 	assert(tools["result"]["ttlMs"].get!long == 0);
 	assert(tools["result"]["ttlMs"].get!long != 7000);
 }
@@ -6834,7 +6839,7 @@ unittest  // setListCacheHint: draft server/discover carries the configured Cach
 {
 	auto s = makeTestServer();
 	s.setListCacheHint("server/discover", CacheHint(30.seconds, CacheScope.private_));
-	auto resp = s.handle(draftReq(2, "server/discover")).get;
+	auto resp = s.handle(modernReq(2, "server/discover")).get;
 	assert(resp["result"]["ttlMs"].get!long == 30_000);
 	assert(resp["result"]["cacheScope"].get!string == "private");
 }
@@ -6842,7 +6847,7 @@ unittest  // setListCacheHint: draft server/discover carries the configured Cach
 unittest  // server/discover with no configured hint emits the mandatory ttlMs:0 default
 {
 	auto s = makeTestServer();
-	auto resp = s.handle(draftReq(2, "server/discover")).get;
+	auto resp = s.handle(modernReq(2, "server/discover")).get;
 	assert(resp["result"]["ttlMs"].get!long == 0);
 }
 
@@ -6854,7 +6859,7 @@ unittest  // per-resource registerResource hint emits ttlMs/cacheScope on a draf
 			"text/plain", "x"), nullable(CacheHint(9.seconds, CacheScope.private_)));
 	Json p = Json.emptyObject;
 	p["uri"] = "test://r";
-	auto resp = s.handle(draftReq(2, "resources/read", p)).get;
+	auto resp = s.handle(modernReq(2, "resources/read", p)).get;
 	assert(resp["result"]["ttlMs"].get!long == 9000);
 	assert(resp["result"]["cacheScope"].get!string == "private");
 }
@@ -6880,7 +6885,7 @@ unittest  // per-template registerResourceTemplate hint emits on a matching draf
 	}, nullable(CacheHint(4200.msecs)));
 	Json p = Json.emptyObject;
 	p["uri"] = "test://abc";
-	auto resp = s.handle(draftReq(2, "resources/read", p)).get;
+	auto resp = s.handle(modernReq(2, "resources/read", p)).get;
 	assert(resp["result"]["ttlMs"].get!long == 4200);
 	assert(resp["result"]["cacheScope"].get!string == "public");
 }
@@ -6891,7 +6896,7 @@ unittest  // draft tools/list defaults to the mandatory ttlMs:0 cache hint
 	// list results. With no explicit hint configured, the server MUST still emit a
 	// conservative default (ttlMs:0, public scope) rather than omitting it.
 	auto s = makeTestServer();
-	auto resp = s.handle(draftReq(2, "tools/list")).get;
+	auto resp = s.handle(modernReq(2, "tools/list")).get;
 	assert(resp["result"]["ttlMs"].get!long == 0);
 	assert(resp["result"]["cacheScope"].get!string == "public");
 }
@@ -6908,7 +6913,7 @@ unittest  // draft resources/list, templates/list, prompts/list default to ttlMs
 	s.registerPrompt(Prompt("p"), (Json) @safe { GetPromptResult r; return r; });
 	foreach (m; ["resources/list", "resources/templates/list", "prompts/list"])
 	{
-		auto resp = s.handle(draftReq(2, m)).get;
+		auto resp = s.handle(modernReq(2, m)).get;
 		assert("error" !in resp, m);
 		assert(resp["result"]["ttlMs"].get!long == 0, m);
 	}
@@ -6921,7 +6926,7 @@ unittest  // draft resources/read defaults to ttlMs:0 when the resource has no h
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://r", "text/plain", "x")); // no explicit CacheHint
 	Json p = Json.emptyObject;
 	p["uri"] = "test://r";
-	auto resp = s.handle(draftReq(2, "resources/read", p)).get;
+	auto resp = s.handle(modernReq(2, "resources/read", p)).get;
 	assert(resp["result"]["ttlMs"].get!long == 0);
 	assert(resp["result"]["cacheScope"].get!string == "public");
 }
@@ -6955,7 +6960,7 @@ unittest
 		return r;
 	});
 	// Outer request is on the draft protocol (per-request _meta).
-	auto outer = s.handle(draftCall(1, "yielder", [])).get;
+	auto outer = s.handle(modernCall(1, "yielder", [])).get;
 	assert("error" !in outer);
 	// The outer draft response keeps its own effective version: resultType present.
 	assert(outer["result"]["resultType"].get!string == "complete");
@@ -7007,7 +7012,7 @@ unittest  // draft results carry the mandatory resultType:"complete" discriminat
 {
 	auto s = makeTestServer();
 	// A representative success result built through the central dispatch path.
-	auto resp = s.handle(draftReq(2, "tools/list")).get;
+	auto resp = s.handle(modernReq(2, "tools/list")).get;
 	assert("error" !in resp);
 	assert(resp["result"]["resultType"].get!string == "complete");
 }
@@ -7015,7 +7020,7 @@ unittest  // draft results carry the mandatory resultType:"complete" discriminat
 unittest  // draft results identify the server in `_meta`
 {
 	auto s = makeTestServer();
-	auto resp = s.handle(draftReq(2, "tools/list")).get;
+	auto resp = s.handle(modernReq(2, "tools/list")).get;
 	assert("error" !in resp);
 	auto info = resp["result"]["_meta"][MetaKey.serverInfo];
 	assert(info["name"].get!string == "test-srv");
@@ -7025,7 +7030,7 @@ unittest  // draft results identify the server in `_meta`
 unittest  // server/discover carries identity in `_meta`, not a top-level field
 {
 	auto s = makeTestServer();
-	auto resp = s.handle(draftReq(2, "server/discover")).get;
+	auto resp = s.handle(modernReq(2, "server/discover")).get;
 	assert("error" !in resp);
 	assert("serverInfo" !in resp["result"]);
 	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "test-srv");
@@ -7051,7 +7056,7 @@ unittest  // draft InputRequiredResult is stamped resultType:"input_required", n
 {
 	auto s = new McpServer("t", "1");
 	registerBookTool(s);
-	auto resp = s.handle(draftCall(1, "book", [])).get;
+	auto resp = s.handle(modernCall(1, "book", [])).get;
 	assert("error" !in resp);
 	assert(resp["result"]["resultType"].get!string == "input_required");
 }
@@ -7074,7 +7079,7 @@ unittest  // draft: a raw CallToolResult carrying inputRequests is stamped "inpu
 		return r;
 	});
 	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
-	auto resp = s.handle(draftReq(1, "tools/call", p)).get;
+	auto resp = s.handle(modernReq(1, "tools/call", p)).get;
 	assert("error" !in resp);
 	// The draft base Result discriminator MUST be "input_required" for an
 	// InputRequiredResult-shaped body, not the default "complete".
@@ -7090,7 +7095,7 @@ unittest  // draft resources/read unknown uri uses invalidParams (-32602)
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
 	Json p = Json.emptyObject;
 	p["uri"] = "test://missing";
-	auto resp = s.handle(draftReq(3, "resources/read", p)).get;
+	auto resp = s.handle(modernReq(3, "resources/read", p)).get;
 	assert(resp["error"]["code"].get!int == -32602);
 }
 
@@ -7107,7 +7112,7 @@ unittest  // subscriptions/listen reads the spec-shaped filter nested under para
 	filter["resourceSubscriptions"] = Json([Json("file:///project/config.json")]);
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	s.handle(draftReq(4, "subscriptions/listen", p)).get;
+	s.handle(modernReq(4, "subscriptions/listen", p)).get;
 	auto f = s.cs().listenFilter;
 	assert(f.toolsListChanged);
 	assert(f.resourceSubscriptions);
@@ -7125,7 +7130,7 @@ unittest  // subscriptions/listen accepts the flat (top-level) filter shape
 	Json p = Json.emptyObject;
 	p["toolsListChanged"] = true;
 	p["resourceSubscriptions"] = true;
-	s.handle(draftReq(4, "subscriptions/listen", p)).get;
+	s.handle(modernReq(4, "subscriptions/listen", p)).get;
 	auto f = s.cs().listenFilter;
 	assert(f.toolsListChanged);
 	assert(f.resourceSubscriptions);
@@ -7139,7 +7144,7 @@ unittest  // subscriptions/listen with an empty resourceSubscriptions array does
 	filter["resourceSubscriptions"] = Json.emptyArray;
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	s.handle(draftReq(4, "subscriptions/listen", p));
+	s.handle(modernReq(4, "subscriptions/listen", p));
 	assert(!s.cs().listenFilter.resourceSubscriptions);
 }
 
@@ -7159,7 +7164,7 @@ unittest  // the per-stream ack reflects exactly the opted-in change types
 	filter["promptsListChanged"] = false; // explicitly not opted in
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	s.handle(draftReq(7, "subscriptions/listen", p));
+	s.handle(modernReq(7, "subscriptions/listen", p));
 
 	auto subset = s.acknowledgedSubsetFor(s.cs().listenFilter);
 	assert(subset["toolsListChanged"].get!bool);
@@ -7182,7 +7187,7 @@ unittest  // ack echoes every opted-in resourceSubscriptions URI in request orde
 	]);
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	s.handle(draftReq(8, "subscriptions/listen", p));
+	s.handle(modernReq(8, "subscriptions/listen", p));
 
 	auto subset = s.acknowledgedSubsetFor(s.cs().listenFilter);
 	assert(subset["resourceSubscriptions"].type == Json.Type.array);
@@ -7250,7 +7255,7 @@ unittest  // per-stream ack does not leak a concurrent stream's opt-in
 	fa["toolsListChanged"] = true;
 	Json pa = Json.emptyObject;
 	pa["notifications"] = fa;
-	s.handle(draftReq(1, "subscriptions/listen", pa));
+	s.handle(modernReq(1, "subscriptions/listen", pa));
 	auto ackA = s.acknowledgedSubsetFor(s.cs().listenFilter);
 	assert(ackA["toolsListChanged"].get!bool);
 	assert("resourceSubscriptions" !in ackA);
@@ -7259,7 +7264,7 @@ unittest  // per-stream ack does not leak a concurrent stream's opt-in
 	fb["resourceSubscriptions"] = Json([Json("file:///b.txt")]);
 	Json pb = Json.emptyObject;
 	pb["notifications"] = fb;
-	s.handle(draftReq(2, "subscriptions/listen", pb));
+	s.handle(modernReq(2, "subscriptions/listen", pb));
 	auto ackB = s.acknowledgedSubsetFor(s.cs().listenFilter);
 	// B requested resourceSubscriptions ONLY — its ack must not carry A's tools opt-in.
 	assert("toolsListChanged" !in ackB);
@@ -7276,7 +7281,7 @@ unittest  // draft is stateless: tools/call works without a prior initialize
 	Json p = Json.emptyObject;
 	p["name"] = "add";
 	p["arguments"] = Json(["a": Json(20), "b": Json(22)]);
-	auto resp = s.handle(draftReq(5, "tools/call", p)).get;
+	auto resp = s.handle(modernReq(5, "tools/call", p)).get;
 	assert(resp["result"]["structuredContent"]["result"].get!int == 42);
 }
 
@@ -7291,7 +7296,7 @@ unittest  // subscriptions/listen ack omits a list-changed type the server does 
 	filter["toolsListChanged"] = true;
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	s.handle(draftReq(4, "subscriptions/listen", p)).get;
+	s.handle(modernReq(4, "subscriptions/listen", p)).get;
 	assert(!s.cs().listenFilter.toolsListChanged);
 	assert("toolsListChanged" !in s.acknowledgedSubsetFor(s.cs().listenFilter));
 }
@@ -7304,7 +7309,7 @@ unittest  // subscriptions/listen ack keeps a list-changed type once the server 
 	filter["toolsListChanged"] = true;
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	s.handle(draftReq(4, "subscriptions/listen", p));
+	s.handle(modernReq(4, "subscriptions/listen", p));
 	assert(s.cs().listenFilter.toolsListChanged);
 	assert(s.acknowledgedSubsetFor(s.cs().listenFilter)["toolsListChanged"].get!bool);
 }
@@ -7317,7 +7322,7 @@ unittest  // subscriptions/listen ack omits promptsListChanged when unsupported
 	filter["promptsListChanged"] = true;
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	s.handle(draftReq(4, "subscriptions/listen", p));
+	s.handle(modernReq(4, "subscriptions/listen", p));
 	assert(!s.cs().listenFilter.promptsListChanged);
 	assert("promptsListChanged" !in s.acknowledgedSubsetFor(s.cs().listenFilter));
 }
@@ -7329,7 +7334,7 @@ unittest  // subscriptions/listen ack omits resourcesListChanged when unsupporte
 	filter["resourcesListChanged"] = true;
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	s.handle(draftReq(4, "subscriptions/listen", p));
+	s.handle(modernReq(4, "subscriptions/listen", p));
 	assert(!s.cs().listenFilter.resourcesListChanged);
 	assert("resourcesListChanged" !in s.acknowledgedSubsetFor(s.cs().listenFilter));
 }
@@ -7345,7 +7350,7 @@ unittest  // subscriptions/listen ack omits resourceSubscriptions when subscript
 	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	s.handle(draftReq(4, "subscriptions/listen", p));
+	s.handle(modernReq(4, "subscriptions/listen", p));
 	assert(!s.cs().listenFilter.resourceSubscriptions);
 	assert("resourceSubscriptions" !in s.acknowledgedSubsetFor(s.cs().listenFilter));
 	assert(!s.isSubscribed("file:///x"));
@@ -7361,7 +7366,7 @@ unittest  // a stateless/draft server honours a subscriptions/listen resourceSub
 	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	s.handle(draftReq(4, "subscriptions/listen", p));
+	s.handle(modernReq(4, "subscriptions/listen", p));
 	assert(s.cs().listenFilter.resourceSubscriptions);
 	assert(s.acknowledgedSubsetFor(s.cs().listenFilter)["resourceSubscriptions"].length == 1);
 }
@@ -7375,7 +7380,7 @@ unittest  // subscriptions/listen ack keeps resourceSubscriptions once enabled
 	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	s.handle(draftReq(4, "subscriptions/listen", p));
+	s.handle(modernReq(4, "subscriptions/listen", p));
 	assert(s.cs().listenFilter.resourceSubscriptions);
 	assert(s.acknowledgedSubsetFor(s.cs().listenFilter)["resourceSubscriptions"].length == 1);
 	assert(s.isSubscribed("file:///x"));
@@ -7402,11 +7407,11 @@ unittest  // draft negotiation: unsupported version -> UnsupportedProtocolVersio
 	assert(resp["error"]["data"]["requested"].get!string == "1900-01-01");
 	// The supported list advertises our versions, including the draft revision.
 	auto sup = resp["error"]["data"]["supported"];
-	bool hasDraft;
+	bool hasModern;
 	foreach (i; 0 .. sup.length)
 		if (sup[i].get!string == "2026-07-28")
-			hasDraft = true;
-	assert(hasDraft);
+			hasModern = true;
+	assert(hasModern);
 }
 
 unittest  // draft negotiation: a supported version is accepted (no error)
@@ -7509,7 +7514,7 @@ version (unittest)
 	// A draft tools/call carrying the given input responses in the top-level
 	// params.inputResponses map (SEP-2322), with per-request _meta for the
 	// stateless handshake fields.
-	private Message draftCall(long id, string tool, InputResponse[] responses) @safe
+	private Message modernCall(long id, string tool, InputResponse[] responses) @safe
 	{
 		Json meta = Json.emptyObject;
 		meta[MetaKey.protocolVersion] = "2026-07-28";
@@ -7538,7 +7543,7 @@ unittest  // draft (stateless) first round: handler returns an InputRequiredResu
 {
 	auto s = new McpServer("t", "1");
 	registerBookTool(s);
-	auto resp = s.handle(draftCall(1, "book", [])).get;
+	auto resp = s.handle(modernCall(1, "book", [])).get;
 	assert("error" !in resp);
 	// The MRTR `inputRequests` payload is a map keyed by the server id.
 	assert(resp["result"]["inputRequests"].type == Json.Type.object);
@@ -7553,7 +7558,7 @@ unittest  // draft (stateless) retry with input responses: handler completes
 	auto answer = InputResponse("date", Json([
 			"content": Json(["day": Json("monday")])
 	]));
-	auto resp = s.handle(draftCall(2, "book", [answer])).get;
+	auto resp = s.handle(modernCall(2, "book", [answer])).get;
 	assert("inputRequests" !in resp["result"]);
 	assert(resp["result"]["content"][0]["text"].get!string == "booked monday");
 }
@@ -7584,7 +7589,7 @@ unittest  // SEP-2322: a stateless server emits requestState and reads it back o
 	});
 
 	// First round: the server attaches requestState onto the InputRequiredResult.
-	auto first = s.handle(draftCall(10, "statebook", [])).get;
+	auto first = s.handle(modernCall(10, "statebook", [])).get;
 	assert(first["result"]["requestState"].get!string == "awaiting-date");
 
 	// Retry: client echoes both the input responses and the opaque requestState.
@@ -7647,7 +7652,7 @@ version (unittest) private McpServer secureStatebookServer() @safe
 unittest  // secureRequestState: outgoing requestState is wrapped, not plaintext
 {
 	auto s = secureStatebookServer();
-	auto first = s.handle(draftCall(20, "statebook", [])).get;
+	auto first = s.handle(modernCall(20, "statebook", [])).get;
 	const wire = first["result"]["requestState"].get!string;
 	// The handler stored "awaiting-date"; the wire MUST be the codec blob, not
 	// the plaintext.
@@ -7661,7 +7666,7 @@ unittest  // secureRequestState: outgoing requestState is wrapped, not plaintext
 unittest  // secureRequestState: a full MRTR round verifies the wrapped blob transparently
 {
 	auto s = secureStatebookServer();
-	auto first = s.handle(draftCall(21, "statebook", [])).get;
+	auto first = s.handle(modernCall(21, "statebook", [])).get;
 	const wire = first["result"]["requestState"].get!string;
 
 	// Retry: the client echoes the wrapped blob verbatim; the handler must see
@@ -7687,7 +7692,7 @@ unittest  // secureRequestState: a full MRTR round verifies the wrapped blob tra
 unittest  // secureRequestState: a tampered echoed blob re-elicits instead of resuming
 {
 	auto s = secureStatebookServer();
-	auto first = s.handle(draftCall(23, "statebook", [])).get;
+	auto first = s.handle(modernCall(23, "statebook", [])).get;
 	auto wire = first["result"]["requestState"].get!string.dup;
 	wire[5] = wire[5] == 'A' ? 'B' : 'A'; // corrupt the payload segment
 
@@ -7723,7 +7728,7 @@ unittest  // no codec configured: outgoing requestState stays plaintext (wire un
 			InputRequest("date", "elicitation", ep)
 		], "awaiting-date");
 	});
-	auto first = s.handle(draftCall(25, "statebook", [])).get;
+	auto first = s.handle(modernCall(25, "statebook", [])).get;
 	assert(first["result"]["requestState"].get!string == "awaiting-date");
 }
 
@@ -7743,9 +7748,9 @@ unittest  // a draft InputRequiredResult drops an elicitation request the client
 			InputRequest("q1", "elicitation", ep)
 		]);
 	});
-	// draftReq declares empty clientCapabilities -> elicitation unsupported.
+	// modernReq declares empty clientCapabilities -> elicitation unsupported.
 	Json p = Json(["name": Json("ask")]);
-	auto resp = s.handle(draftReq(70, "tools/call", p)).get;
+	auto resp = s.handle(modernReq(70, "tools/call", p)).get;
 	assert("error" in resp, "an unsatisfiable lone inputRequest must surface a server error");
 	// And crucially, no elicitation/create leaked into a result.
 	assert("result" !in resp || "inputRequests" !in resp["result"]
@@ -7815,7 +7820,7 @@ unittest  // elicit() is rejected on a stateless (draft) request
 		return ToolResponse.complete(r);
 	});
 	Json p = Json.emptyObject;
-	auto resp = s.handle(draftReq(3, "tools/call", buildName(p, "bad"))).get;
+	auto resp = s.handle(modernReq(3, "tools/call", buildName(p, "bad"))).get;
 	assert("error" in resp);
 	// Invoking a blocking server->client API on a stateless (MRTR) request is a
 	// server-author fault, so it surfaces as internalError (-32603) rather than
@@ -7838,7 +7843,7 @@ version (unittest)
 	// A draft prompts/get carrying the given input responses in the top-level
 	// params.inputResponses map (SEP-2322), plus the per-request _meta stateless
 	// handshake fields. `requestState` is echoed when non-empty.
-	private Message draftGetPrompt(long id, string prompt,
+	private Message modernGetPrompt(long id, string prompt,
 			InputResponse[] responses, string requestState = "") @safe
 	{
 		Json meta = Json.emptyObject;
@@ -7893,7 +7898,7 @@ unittest  // draft prompts/get: handler can return an InputRequiredResult
 {
 	auto s = new McpServer("t", "1");
 	registerTopicPrompt(s);
-	auto resp = s.handle(draftGetPrompt(1, "draftprompt", [])).get;
+	auto resp = s.handle(modernGetPrompt(1, "draftprompt", [])).get;
 	assert("error" !in resp);
 	// The draft GetPromptResultResponse.result is GetPromptResult | InputRequiredResult;
 	// here it is the input_required variant with an InputRequests map (SEP-2322).
@@ -7911,7 +7916,7 @@ unittest  // draft prompts/get retry with input responses: handler completes
 	auto answer = InputResponse("topic", Json([
 			"content": Json(["t": Json("birds")])
 	]));
-	auto resp = s.handle(draftGetPrompt(2, "draftprompt", [answer])).get;
+	auto resp = s.handle(modernGetPrompt(2, "draftprompt", [answer])).get;
 	assert("error" !in resp);
 	assert("inputRequests" !in resp["result"]);
 	// A completed draft result is stamped resultType:"complete", not "input_required".
@@ -7940,14 +7945,14 @@ unittest  // draft prompts/get reads back the echoed opaque requestState (SEP-23
 	});
 
 	// First round: the server attaches requestState onto the InputRequiredResult.
-	auto first = s.handle(draftGetPrompt(10, "stateprompt", [])).get;
+	auto first = s.handle(modernGetPrompt(10, "stateprompt", [])).get;
 	assert(first["result"]["requestState"].get!string == "awaiting-topic");
 
 	// Retry: client echoes the opaque requestState; the handler reads it back.
 	auto answer = InputResponse("topic", Json([
 			"content": Json(["t": Json("x")])
 	]));
-	auto retry = s.handle(draftGetPrompt(11, "stateprompt", [answer], "awaiting-topic")).get;
+	auto retry = s.handle(modernGetPrompt(11, "stateprompt", [answer], "awaiting-topic")).get;
 	assert("inputRequests" !in retry["result"]);
 	assert(retry["result"]["messages"][0]["content"]["text"].get!string == "resumed:awaiting-topic");
 }
@@ -8420,7 +8425,7 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	nb["resourceSubscriptions"] = Json([Json("file:///b")]);
 	Json pb = Json.emptyObject;
 	pb["notifications"] = nb;
-	s.handle(draftReq(10, "subscriptions/listen", pb));
+	s.handle(modernReq(10, "subscriptions/listen", pb));
 	string bFrame;
 	push.addListener((string f) @safe { bFrame = f; }, Json("10"), s.cs().listenFilter);
 
@@ -8429,7 +8434,7 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 	na["toolsListChanged"] = true;
 	Json pa = Json.emptyObject;
 	pa["notifications"] = na;
-	s.handle(draftReq(11, "subscriptions/listen", pa));
+	s.handle(modernReq(11, "subscriptions/listen", pa));
 	string aFrame;
 	push.addListener((string f) @safe { aFrame = f; }, Json("11"), s.cs().listenFilter);
 
@@ -8539,7 +8544,7 @@ unittest  // stdio listen sink is per-URI filtered (subscribed delivered, other 
 	na["resourceSubscriptions"] = Json([Json("note:///a")]);
 	Json p = Json.emptyObject;
 	p["notifications"] = na;
-	auto served = s.tryServeStdioListen(draftReq(1, "subscriptions/listen", p), (string line) @safe {
+	auto served = s.tryServeStdioListen(modernReq(1, "subscriptions/listen", p), (string line) @safe {
 		sink ~= line;
 	});
 	assert(served, "draft subscriptions/listen must be served over stdio");

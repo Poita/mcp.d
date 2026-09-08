@@ -141,8 +141,7 @@ final class MrtrApi
 		{
 			// Typed elicitation builder: the `requestedSchema` is derived from the
 			// flat `MeetingDate` struct via jsonSchemaOf!T.
-			auto dateReq = elicitationRequest!MeetingDate(dateId,
-					"On what date should we meet?");
+			auto dateReq = elicitationRequest!MeetingDate(dateId, "On what date should we meet?");
 
 			// Typed sampling builder: build a CreateMessageRequest from a typed
 			// SamplingMessage + Content, then hand it to InputRequest.sampling.

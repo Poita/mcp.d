@@ -1127,7 +1127,7 @@ unittest  // a modern-session skills/list result carries the required ttlMs/cach
 {
 	auto s = pdfSkillServer();
 
-	auto result = s.handle(draftRequest(1, "skills/list", Json.emptyObject)).get["result"];
+	auto result = s.handle(modernRequest(1, "skills/list", Json.emptyObject)).get["result"];
 	assert(result["skills"].length == 1);
 	// ListSkillsResult extends CacheableResult: both fields are REQUIRED, with the
 	// conservative do-not-cache default when the application configured no hint.
@@ -1142,7 +1142,7 @@ unittest  // a modern-session skills/get result carries the required ttlMs/cache
 
 	Json p = Json.emptyObject;
 	p["uri"] = "skill://office/pdf-forms/SKILL.md";
-	auto result = s.handle(draftRequest(1, "skills/get", p)).get["result"];
+	auto result = s.handle(modernRequest(1, "skills/get", p)).get["result"];
 	assert(result["skill"]["uri"].get!string == "skill://office/pdf-forms/SKILL.md");
 	assert(result["ttlMs"].get!long == 0);
 	assert(result["cacheScope"].get!string == "public");
@@ -1159,13 +1159,13 @@ unittest  // setListCacheHint configures the skills/list and skills/get freshnes
 	s.setListCacheHint("skills/list", CacheHint(5.minutes));
 	s.setListCacheHint("skills/get", CacheHint(1.minutes, CacheScope.private_));
 
-	auto listed = s.handle(draftRequest(1, "skills/list", Json.emptyObject)).get["result"];
+	auto listed = s.handle(modernRequest(1, "skills/list", Json.emptyObject)).get["result"];
 	assert(listed["ttlMs"].get!long == 300_000);
 	assert(listed["cacheScope"].get!string == "public");
 
 	Json p = Json.emptyObject;
 	p["uri"] = "skill://office/pdf-forms/SKILL.md";
-	auto got = s.handle(draftRequest(2, "skills/get", p)).get["result"];
+	auto got = s.handle(modernRequest(2, "skills/get", p)).get["result"];
 	assert(got["ttlMs"].get!long == 60_000);
 	assert(got["cacheScope"].get!string == "private");
 }
@@ -1192,7 +1192,7 @@ unittest  // a modern-session resources/directory/read result carries resultType
 	auto s = pdfSkillServer();
 	Json p = Json.emptyObject;
 	p["uri"] = "skill://office/pdf-forms";
-	auto result = s.handle(draftRequest(1, "resources/directory/read", p)).get["result"];
+	auto result = s.handle(modernRequest(1, "resources/directory/read", p)).get["result"];
 	assert(result["resultType"].get!string == "complete");
 }
 
@@ -1242,7 +1242,7 @@ unittest  // the skills error messages name the offending uri the way the spec's
 
 	Json d = Json.emptyObject;
 	d["uri"] = "skill://office/pdf-forms/SKILL.md";
-	auto notDir = s.handle(draftRequest(2, "resources/directory/read", d)).get["error"];
+	auto notDir = s.handle(modernRequest(2, "resources/directory/read", d)).get["error"];
 	assert(notDir["message"].get!string
 			== "skill://office/pdf-forms/SKILL.md is not a directory resource");
 }
@@ -1807,7 +1807,7 @@ version (unittest)
 		{
 		}
 
-		void setDraftProtocol(bool) @safe
+		void setModernProtocol(bool) @safe
 		{
 		}
 
@@ -1822,8 +1822,8 @@ version (unittest)
 	}
 
 	// Build a draft-version request so `resources/directory/read` (draft-gated)
-	// is routed; mirrors the server's own `draftReq` test helper.
-	private Message draftRequest(long id, string method, Json params) @safe
+	// is routed; mirrors the server's own `modernReq` test helper.
+	private Message modernRequest(long id, string method, Json params) @safe
 	{
 		import mcp.protocol.mrtr : MetaKey;
 
@@ -1923,7 +1923,7 @@ unittest  // resources/directory/read lists a skill root's files and subdirector
 
 	Json p = Json.emptyObject;
 	p["uri"] = "skill://office/pdf-forms";
-	auto res = s.handle(draftRequest(1, "resources/directory/read", p)).get["result"]["resources"];
+	auto res = s.handle(modernRequest(1, "resources/directory/read", p)).get["result"]["resources"];
 	assert(res.length == 2);
 
 	bool sawSkillMd, sawReferencesDir;
@@ -1951,7 +1951,7 @@ unittest  // resources/directory/read descends into a subdirectory
 
 	Json p = Json.emptyObject;
 	p["uri"] = "skill://office/pdf-forms/references";
-	auto res = s.handle(draftRequest(1, "resources/directory/read", p)).get["result"]["resources"];
+	auto res = s.handle(modernRequest(1, "resources/directory/read", p)).get["result"]["resources"];
 	assert(res.length == 1);
 	assert(res[0]["uri"].get!string == "skill://office/pdf-forms/references/FORMS.md");
 	assert(res[0]["name"].get!string == "FORMS.md");
@@ -1966,7 +1966,7 @@ unittest  // resources/directory/read on a file (not a directory) is -32602
 
 	Json p = Json.emptyObject;
 	p["uri"] = "skill://office/pdf-forms/SKILL.md";
-	auto resp = s.handle(draftRequest(1, "resources/directory/read", p)).get;
+	auto resp = s.handle(modernRequest(1, "resources/directory/read", p)).get;
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
 	assert(resp["error"]["data"]["uri"].get!string == "skill://office/pdf-forms/SKILL.md");
 }
@@ -1978,7 +1978,7 @@ unittest  // resources/directory/read is -32601 when skills (and the method) are
 	auto s = new McpServer("t", "1");
 	Json p = Json.emptyObject;
 	p["uri"] = "skill://anything";
-	auto resp = s.handle(draftRequest(1, "resources/directory/read", p)).get;
+	auto resp = s.handle(modernRequest(1, "resources/directory/read", p)).get;
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.methodNotFound);
 }
 

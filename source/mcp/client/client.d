@@ -632,7 +632,7 @@ final class McpClient : ClientProtocol
 	{
 		useModern = true;
 		negotiated = ProtocolVersion.v2026_07_28;
-		transport.setDraftProtocol(true);
+		transport.setModernProtocol(true);
 	}
 
 	/// `server/discover` (draft): fetch the server's supported versions,
@@ -787,7 +787,7 @@ final class McpClient : ClientProtocol
 		{
 			useModern = true;
 			negotiated = chosen;
-			transport.setDraftProtocol(true);
+			transport.setModernProtocol(true);
 			// No initialize handshake follows on the stateless draft path, so
 			// capture what `server/discover` advertised; otherwise the caller
 			// would have no way to inspect the server's capabilities/identity.
@@ -849,7 +849,7 @@ final class McpClient : ClientProtocol
 		{
 			useModern = true;
 			negotiated = chosen;
-			transport.setDraftProtocol(true);
+			transport.setModernProtocol(true);
 			// No `initialize` follows on the stateless draft path, so adopt what the
 			// prior discovery advertised directly — no `server/discover` round-trip.
 			serverCapabilities_ = prior.capabilities;
@@ -2993,12 +2993,12 @@ final class McpClient : ClientProtocol
 	/// helper so the mirroring can be unit-tested without a live server.
 	package static string[string] paramHeaders(Json inputSchema, Json arguments) @safe
 	{
-		import mcp.protocol.mrtr : draftParamHeaders = paramHeaders;
+		import mcp.protocol.mrtr : modernParamHeaders = paramHeaders;
 
 		string[string] headers;
 		if (arguments.type != Json.Type.object)
 			return headers;
-		foreach (ph; draftParamHeaders(inputSchema))
+		foreach (ph; modernParamHeaders(inputSchema))
 		{
 			// Descend the path into the arguments object. Any missing / null /
 			// non-object intermediate node means the value is not present -> no header.
@@ -3543,8 +3543,8 @@ unittest  // enableTasks advertises the tasks extension (draft only)
 	c.enableTasks();
 	auto caps = c.effectiveCapabilities();
 	assert("io.modelcontextprotocol/tasks" in caps.extensions);
-	auto draftJson = caps.forVersion(ProtocolVersion.v2026_07_28).toJson();
-	assert("io.modelcontextprotocol/tasks" in draftJson["extensions"]);
+	auto modernJson = caps.forVersion(ProtocolVersion.v2026_07_28).toJson();
+	assert("io.modelcontextprotocol/tasks" in modernJson["extensions"]);
 	auto stableJson = caps.forVersion(ProtocolVersion.v2025_06_18).toJson();
 	assert("extensions" !in stableJson);
 }
@@ -4673,7 +4673,7 @@ unittest  // a draft Streamable-HTTP client cancels by closing the stream, not v
 {
 	auto t = new HttpClientTransport("http://localhost", 8);
 	auto c = new McpClient(t);
-	t.setDraftProtocol(true); // negotiated the draft (modern) protocol
+	t.setModernProtocol(true); // negotiated the draft (modern) protocol
 	bool postedCancelled;
 	c.onNotifyForTest = (Json message) @safe {
 		if (message["method"].get!string == "notifications/cancelled")
@@ -6782,7 +6782,7 @@ version (unittest)
 		{
 		}
 
-		void setDraftProtocol(bool isDraft) @safe
+		void setModernProtocol(bool modern) @safe
 		{
 		}
 

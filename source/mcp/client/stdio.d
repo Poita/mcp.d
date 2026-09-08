@@ -95,7 +95,7 @@ final class StdioClientTransport : ClientTransport
 	}
 
 	/// No-op: the draft-protocol flag has no effect on stdio (no SSE GET streams).
-	void setDraftProtocol(bool isDraft) @safe
+	void setModernProtocol(bool modern) @safe
 	{
 	}
 

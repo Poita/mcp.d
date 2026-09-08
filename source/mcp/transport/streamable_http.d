@@ -1221,9 +1221,9 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 }
 
 /// Whether `method` opens a draft `events/stream` push response.
-bool opensEventsStream(string method, bool isDraft) @safe
+bool opensEventsStream(string method, bool modern) @safe
 {
-	return isDraft && method == "events/stream";
+	return modern && method == "events/stream";
 }
 
 /// The JSON-RPC error surfaced (under a 406 Not Acceptable) when a POST that would
@@ -1533,17 +1533,17 @@ unittest  // concurrent listens each keep their own per-stream filter
 /// the first error (caller emits it as a 400) or null when they pass. The
 /// MCP-Protocol-Version header is already validated by `postProtocolVersionGate`.
 private McpException validatePostRequestHeaders(HTTPServerRequest req,
-		ref Message msg, bool isDraftReq, McpServer server) @safe
+		ref Message msg, bool isModernReq, McpServer server) @safe
 {
 	// Draft: validate the standard request headers against the body.
-	if (auto hdrErr = validateDraftHeaders(req.headers.get(HttpHeader.protocolVersion,
+	if (auto hdrErr = validateModernHeaders(req.headers.get(HttpHeader.protocolVersion,
 			""), req.headers.get(HttpHeader.method, ""),
-			req.headers.get(HttpHeader.name, ""), msg, isDraftReq))
+			req.headers.get(HttpHeader.name, ""), msg, isModernReq))
 		return hdrErr;
 
 	// Draft x-mcp-header: validate Mcp-Param-* headers against the tool's
 	// declared header parameters and the body arguments.
-	if (msg.method == "tools/call" && isDraftReq)
+	if (msg.method == "tools/call" && isModernReq)
 	{
 		const tname = ("name" in msg.params && msg.params["name"].type == Json.Type.string) ? msg
 			.params["name"].get!string : "";
@@ -1761,9 +1761,9 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// request as draft on header OR body — the same precedence the rest of this
 		// handler (opensListenStream, httpStatusForResponse, freshStatelessState)
 		// uses. All draft-gated header validation below keys off this single value.
-		const isDraftReq = tryDraft(req.headers.get(HttpHeader.protocolVersion, ""))
-			|| tryDraft(RequestMeta.fromParams(msg.params).protocolVersion);
-		if (auto hdrErr = validatePostRequestHeaders(req, msg, isDraftReq, server))
+		const isModernReq = tryModern(req.headers.get(HttpHeader.protocolVersion, ""))
+			|| tryModern(RequestMeta.fromParams(msg.params).protocolVersion);
+		if (auto hdrErr = validatePostRequestHeaders(req, msg, isModernReq, server))
 		{
 			// Roll back a session minted above for an initialize that fails header
 			// validation: it never reached a successful InitializeResult, so it must
@@ -1779,7 +1779,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// subscriptions). Record the opted-in filters, open the stream, send the
 		// acknowledgement as the first event, then hold it open — wired to the
 		// server-push channel so notify*/notifyResourceUpdated reach it.
-		if (opensListenStream(msg.method, isDraftReq))
+		if (opensListenStream(msg.method, isModernReq))
 		{
 			// subscriptions/listen is a DRAFT RPC and the draft protocol is
 			// stateless-only, so it MUST work on a stateless server too. It is a single
@@ -1811,7 +1811,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// long-lived SSE response that streams `notifications/events/*` for one
 		// subscription until the client disconnects. It is self-contained (no
 		// session, no inbound correlation), so it works on a stateless server too.
-		if (opensEventsStream(msg.method, isDraftReq))
+		if (opensEventsStream(msg.method, isModernReq))
 		{
 			// As above: the response is text/event-stream, so a POST whose Accept
 			// provably excludes it is refused with 406 rather than upgraded anyway.
@@ -1846,7 +1846,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		const reqAcceptsSse = acceptsEventStream(req.headers.get("Accept", ""));
 		auto ctx = new HttpStreamContext(res, coord, clientCapsFor(server, reqState),
 				extractProgressToken(msg.params),
-				token, isDraftReq, effVersion, connToken, reqState,
+				token, isModernReq, effVersion, connToken, reqState,
 				server.mode == ServerMode.stateless, reqAcceptsSse);
 		auto resp = server.handle(msg, ctx);
 		// Draft basic/utilities/cancellation §Transport-Specific Cancellation: on
@@ -1857,7 +1857,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// cancellation: emit no response, exactly as `notifications/cancelled` would
 		// suppress it. Released versions (2025-*) keep their behaviour: a dropped
 		// connection still completes the write, which is a harmless no-op there.
-		if (suppressOnDisconnect(isDraftReq, res.connected))
+		if (suppressOnDisconnect(isModernReq, res.connected))
 		{
 			// The draft is stateless-only, so it never mints a session; the rollback
 			// is a no-op there. Kept for symmetry: a suppressed initialize must not
@@ -1914,7 +1914,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			// Map reserved JSON-RPC errors onto their required HTTP statuses
 			// (400 for unsupported-version/header-mismatch, draft 404 for
 			// method-not-found); everything else rides on 200.
-			res.statusCode = httpStatusForResponse(j, isDraftReq);
+			res.statusCode = httpStatusForResponse(j, isModernReq);
 			res.writeBody(j.toString(), "application/json");
 		}
 		return;
@@ -1980,7 +1980,7 @@ unittest  // the standalone GET SSE stream uses the same session gate as POST/DE
 ///   - `Method not found` (-32601) -> `404` on draft requests, which lets a client
 ///     tell a modern MCP endpoint apart from a legacy HTTP+SSE `404`. Pre-draft
 ///     versions keep the legacy JSON-RPC-error-over-`200` shape.
-int httpStatusForResponse(Json resp, bool isDraft) @safe
+int httpStatusForResponse(Json resp, bool modern) @safe
 {
 	if ("error" !in resp || resp["error"].type != Json.Type.object)
 		return 200;
@@ -1995,7 +1995,7 @@ int httpStatusForResponse(Json resp, bool isDraft) @safe
 	// that -32602 to 400, unlike an ordinary invalid-params error.
 	if (isMissingRequiredMetaError(resp))
 		return 400;
-	if (isDraft && code == ErrorCode.methodNotFound)
+	if (modern && code == ErrorCode.methodNotFound)
 		return 404;
 	return 200;
 }
@@ -2036,9 +2036,9 @@ unittest  // a successful InitializeResult commits; an error response does not
 /// So when the connection has dropped on a draft request, the response is
 /// suppressed. Released versions (2025-*) never suppress on this basis: that MUST
 /// is draft-only, so their wire behaviour is unchanged.
-bool suppressOnDisconnect(bool isDraft, bool connected) @safe pure nothrow @nogc
+bool suppressOnDisconnect(bool modern, bool connected) @safe pure nothrow @nogc
 {
-	return isDraft && !connected;
+	return modern && !connected;
 }
 
 unittest  // draft: a disconnected client cancels the request -> response suppressed
@@ -2062,14 +2062,14 @@ unittest  // released versions never suppress on disconnect (draft-only MUST)
 /// request is valid — or when the request is not a draft request (older versions
 /// did not define these headers, so they are not enforced).
 ///
-/// `isDraft` is the effective draft signal for the request (header OR body
+/// `modern` is the effective draft signal for the request (header OR body
 /// `_meta.protocolVersion`), matching how the rest of the POST handler classifies
 /// the request: the draft protocol is stateless-only and may negotiate via the
 /// body alone, so a body-only-draft request still has its draft headers enforced.
-McpException validateDraftHeaders(string protoHeader, string methodHeader,
-		string nameHeader, Message msg, bool isDraft) @safe
+McpException validateModernHeaders(string protoHeader, string methodHeader,
+		string nameHeader, Message msg, bool modern) @safe
 {
-	if (!isDraft)
+	if (!modern)
 		return null; // not a draft request: do not enforce draft headers
 
 	// Header requirements for notification POSTs are not defined by this revision
@@ -2709,7 +2709,7 @@ unittest  // localhost origins are accepted, foreign origins rejected
 
 version (unittest)
 {
-	private Message draftMsg(string method, Json params) @safe
+	private Message modernMsg(string method, Json params) @safe
 	{
 		Json meta = Json.emptyObject;
 		meta[MetaKey.protocolVersion] = "2026-07-28";
@@ -2718,7 +2718,7 @@ version (unittest)
 		return Message(makeRequest(Json(1), method, params));
 	}
 
-	private Message draftNote(string method, Json params) @safe
+	private Message modernNote(string method, Json params) @safe
 	{
 		Json meta = Json.emptyObject;
 		meta[MetaKey.protocolVersion] = "2026-07-28";
@@ -2731,39 +2731,39 @@ unittest  // pre-draft requests skip draft header enforcement
 {
 	auto m = Message(makeRequest(Json(1), "tools/list", Json.emptyObject));
 	// protocol header empty / older -> no enforcement
-	assert(validateDraftHeaders("", "", "", m, false) is null);
-	assert(validateDraftHeaders("2025-11-25", "", "", m, false) is null);
+	assert(validateModernHeaders("", "", "", m, false) is null);
+	assert(validateModernHeaders("2025-11-25", "", "", m, false) is null);
 }
 
 unittest  // draft request missing Mcp-Method is a header mismatch
 {
-	auto m = draftMsg("tools/list", Json.emptyObject);
-	auto e = validateDraftHeaders("2026-07-28", "", "", m, true);
+	auto m = modernMsg("tools/list", Json.emptyObject);
+	auto e = validateModernHeaders("2026-07-28", "", "", m, true);
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
 unittest  // draft request with mismatched Mcp-Method fails
 {
-	auto m = draftMsg("tools/list", Json.emptyObject);
-	auto e = validateDraftHeaders("2026-07-28", "tools/call", "", m, true);
+	auto m = modernMsg("tools/list", Json.emptyObject);
+	auto e = validateModernHeaders("2026-07-28", "tools/call", "", m, true);
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
 unittest  // draft tools/list with correct headers passes
 {
-	auto m = draftMsg("tools/list", Json.emptyObject);
-	assert(validateDraftHeaders("2026-07-28", "tools/list", "", m, true) is null);
+	auto m = modernMsg("tools/list", Json.emptyObject);
+	assert(validateModernHeaders("2026-07-28", "tools/list", "", m, true) is null);
 }
 
 unittest  // draft tools/call requires matching Mcp-Name
 {
 	Json p = Json.emptyObject;
 	p["name"] = "add";
-	auto m = draftMsg("tools/call", p);
-	assert(validateDraftHeaders("2026-07-28", "tools/call", "add", m, true) is null);
-	auto e = validateDraftHeaders("2026-07-28", "tools/call", "wrong", m, true);
+	auto m = modernMsg("tools/call", p);
+	assert(validateModernHeaders("2026-07-28", "tools/call", "add", m, true) is null);
+	auto e = validateModernHeaders("2026-07-28", "tools/call", "wrong", m, true);
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
-	auto e2 = validateDraftHeaders("2026-07-28", "tools/call", "", m, true);
+	auto e2 = validateModernHeaders("2026-07-28", "tools/call", "", m, true);
 	assert(e2 !is null); // missing name
 }
 
@@ -2771,9 +2771,9 @@ unittest  // draft resources/read mirrors uri into Mcp-Name
 {
 	Json p = Json.emptyObject;
 	p["uri"] = "test://x";
-	auto m = draftMsg("resources/read", p);
-	assert(validateDraftHeaders("2026-07-28", "resources/read", "test://x", m, true) is null);
-	assert(validateDraftHeaders("2026-07-28", "resources/read", "test://y", m, true) !is null);
+	auto m = modernMsg("resources/read", p);
+	assert(validateModernHeaders("2026-07-28", "resources/read", "test://x", m, true) is null);
+	assert(validateModernHeaders("2026-07-28", "resources/read", "test://y", m, true) !is null);
 }
 
 unittest  // draft Mcp-Name is sentinel-decoded before matching the body value
@@ -2784,12 +2784,12 @@ unittest  // draft Mcp-Name is sentinel-decoded before matching the body value
 	// (=?base64?...?=) in the Mcp-Name header; the server decodes before comparing.
 	Json p = Json.emptyObject;
 	p["uri"] = "test://café/dat a";
-	auto m = draftMsg("resources/read", p);
+	auto m = modernMsg("resources/read", p);
 	const enc = encodeHeaderValue("test://café/dat a");
 	assert(enc != "test://café/dat a"); // it really was encoded
-	assert(validateDraftHeaders("2026-07-28", "resources/read", enc, m, true) is null);
+	assert(validateModernHeaders("2026-07-28", "resources/read", enc, m, true) is null);
 	// A wrong encoded name still mismatches.
-	assert(validateDraftHeaders("2026-07-28", "resources/read",
+	assert(validateModernHeaders("2026-07-28", "resources/read",
 			encodeHeaderValue("test://other"), m, true) !is null);
 }
 
@@ -2798,11 +2798,11 @@ unittest  // draft notification POST is accepted regardless of Mcp-Method (heade
 	// basic/transports §Sending Messages (Note): header requirements for
 	// notification POSTs are not defined by this revision, so a notification is
 	// accepted whether Mcp-Method is correct, absent, or mismatched.
-	auto m = draftNote("notifications/initialized", Json.emptyObject);
-	assert(validateDraftHeaders("2026-07-28", "notifications/initialized", "", m, true) is null);
-	assert(validateDraftHeaders("2026-07-28", "", "", m, true) is null); // missing Mcp-Method
-	auto mismatched = draftNote("notifications/cancelled", Json.emptyObject);
-	assert(validateDraftHeaders("2026-07-28", "notifications/initialized", "",
+	auto m = modernNote("notifications/initialized", Json.emptyObject);
+	assert(validateModernHeaders("2026-07-28", "notifications/initialized", "", m, true) is null);
+	assert(validateModernHeaders("2026-07-28", "", "", m, true) is null); // missing Mcp-Method
+	auto mismatched = modernNote("notifications/cancelled", Json.emptyObject);
+	assert(validateModernHeaders("2026-07-28", "notifications/initialized", "",
 			mismatched, true) is null); // mismatched Mcp-Method
 }
 
@@ -2813,9 +2813,9 @@ unittest  // body-only draft (absent MCP-Protocol-Version header) still enforces
 	// rejected, even though the MCP-Protocol-Version header is absent.
 	Json p = Json.emptyObject;
 	p["name"] = "add";
-	auto m = draftMsg("tools/call", p); // body _meta carries the draft version
+	auto m = modernMsg("tools/call", p); // body _meta carries the draft version
 	// absent proto header, but effective-draft flag true: a wrong Mcp-Method fails.
-	auto e = validateDraftHeaders("", "tools/call", "wrong", m, true);
+	auto e = validateModernHeaders("", "tools/call", "wrong", m, true);
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
@@ -2825,14 +2825,14 @@ unittest  // body-only draft with absent header but correct headers passes (no f
 	// valid negotiation: it must not be flagged as a header/_meta version mismatch.
 	Json p = Json.emptyObject;
 	p["name"] = "add";
-	auto m = draftMsg("tools/call", p);
-	assert(validateDraftHeaders("", "tools/call", "add", m, true) is null);
+	auto m = modernMsg("tools/call", p);
+	assert(validateModernHeaders("", "tools/call", "add", m, true) is null);
 }
 
 unittest  // pre-draft notification skips draft header enforcement
 {
 	auto m = Message(makeNotification("notifications/initialized", Json.emptyObject));
-	assert(validateDraftHeaders("2025-11-25", "", "", m, false) is null);
+	assert(validateModernHeaders("2025-11-25", "", "", m, false) is null);
 }
 
 unittest  // absent MCP-Protocol-Version header is permitted (falls back to negotiated)
@@ -2939,7 +2939,7 @@ unittest  // DELETE is version-gated like POST/GET: bad version -> 400, not 204/
 }
 
 /// True if the protocol-version header denotes a draft+ request.
-private bool tryDraft(string protoHeader) @safe
+private bool tryModern(string protoHeader) @safe
 {
 	ProtocolVersion pv;
 	return tryParseVersion(protoHeader, pv) && pv.isModern;
@@ -3020,14 +3020,14 @@ private ClientCapabilities clientCapsFor(McpServer server, ConnectionState reqSt
 /// model held in `activeConnection` (the server falls back to it on null). The
 /// effective version is the body `_meta.protocolVersion`, then the
 /// `MCP-Protocol-Version` header, then the server default. When both the header
-/// and `_meta.protocolVersion` are present, `validateDraftHeaders` already
+/// and `_meta.protocolVersion` are present, `validateModernHeaders` already
 /// ensures they agree, so the final overwrite is always a no-op in practice.
 private ConnectionState freshStatelessState(string protoHeader, Json params,
 		ProtocolVersion serverDefault) @safe
 {
 	// Effective version: _meta.protocolVersion wins over the header when present;
 	// the header (via effectivePostVersion) is the fallback before the server
-	// default. validateDraftHeaders rejects any request where both are present but
+	// default. validateModernHeaders rejects any request where both are present but
 	// disagree, so when both exist they are equal and the overwrite is benign.
 	auto meta = RequestMeta.fromParams(params);
 	ProtocolVersion eff = effectivePostVersion(protoHeader, serverDefault);
@@ -3178,9 +3178,9 @@ unittest  // an unparseable / non-envelope POST body throws so handlePost answer
 /// itself an SSE stream that stays open and delivers the change notifications."
 /// Pre-draft versions never defined `subscriptions/listen`, so they answer
 /// normally.
-bool opensListenStream(string method, bool isDraft) @safe
+bool opensListenStream(string method, bool modern) @safe
 {
-	return isDraft && method == "subscriptions/listen";
+	return modern && method == "subscriptions/listen";
 }
 
 unittest  // only a draft subscriptions/listen opens the long-lived stream
@@ -3680,7 +3680,7 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
 	// mirroring what handleListenStream does: record the opted-in filters.
 	Json listenParams = Json.emptyObject;
 	listenParams["toolsListChanged"] = true;
-	auto m = draftMsg("subscriptions/listen", listenParams);
+	auto m = modernMsg("subscriptions/listen", listenParams);
 	auto reqState = freshStatelessState("2026-07-28", m.params, server.negotiatedVersion);
 	assert(routeListenRequest(server, m, reqState, "").isNull);
 	assert(reqState.listenFilter.toolsListChanged);
