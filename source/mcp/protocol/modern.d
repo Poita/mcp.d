@@ -1,5 +1,6 @@
 module mcp.protocol.modern;
 
+import mcp.protocol.errors : McpException, ErrorCode;
 import std.typecons : Nullable, nullable;
 import core.time : Duration, msecs, seconds;
 import vibe.data.json : Json;
@@ -10,13 +11,17 @@ import mcp.protocol.jsonhelpers : tryGet;
 
 @safe:
 
-/// Per-request metadata that the draft carries in `params._meta` instead of a
+/// Per-request metadata that 2026-07-28 carries in `params._meta` instead of a
 /// once-per-connection `initialize` handshake.
 struct RequestMeta
 {
 	string protocolVersion;
 	Implementation clientInfo;
 	ClientCapabilities clientCapabilities;
+	/// Whether `_meta` carried a `clientCapabilities` object at all. The field is
+	/// REQUIRED on every modern request, and an empty object is a valid (if
+	/// minimal) declaration, so presence is tracked separately from the value.
+	bool hasClientCapabilities;
 	Nullable!string logLevel;
 
 	/// Extract request metadata from a request's `params` object.
@@ -35,11 +40,73 @@ struct RequestMeta
 			m.clientInfo = Implementation.fromJson(meta[MetaKey.clientInfo]);
 		if (MetaKey.clientCapabilities in meta
 				&& meta[MetaKey.clientCapabilities].type == Json.Type.object)
+		{
 			m.clientCapabilities = ClientCapabilities.fromJson(meta[MetaKey.clientCapabilities]);
+			m.hasClientCapabilities = true;
+		}
 		if (MetaKey.logLevel in meta && meta[MetaKey.logLevel].type == Json.Type.string)
 			m.logLevel = meta[MetaKey.logLevel].get!string;
 		return m;
 	}
+}
+
+/// The `error.data` key under which a malformed-`_meta` rejection lists the
+/// required `_meta` fields the request omitted. Transports key their HTTP status
+/// on it: the spec makes this particular -32602 a `400 Bad Request`, while an
+/// ordinary invalid-params error (an unknown tool, say) stays `200`.
+enum string missingMetaDataKey = "missingMeta";
+
+/// The -32602 (Invalid params) error for a modern request whose `_meta` omits
+/// one or more REQUIRED fields (`io.modelcontextprotocol/protocolVersion`,
+/// `io.modelcontextprotocol/clientCapabilities`): the request is malformed, and
+/// `data.missingMeta` names the absent keys so the client need not parse the
+/// message.
+McpException missingRequiredMeta(string[] keys) @safe
+{
+	import std.array : join;
+
+	Json data = Json.emptyObject;
+	Json arr = Json.emptyArray;
+	foreach (k; keys)
+		arr ~= Json(k);
+	data[missingMetaDataKey] = arr;
+	return new McpException(ErrorCode.invalidParams,
+			"Malformed request: _meta is missing required field(s) " ~ keys.join(", "), data);
+}
+
+/// Whether `resp` is the malformed-`_meta` rejection built by
+/// `missingRequiredMeta`: a -32602 whose `data` names the missing keys.
+bool isMissingRequiredMetaError(Json resp) @safe
+{
+	if (resp.type != Json.Type.object || "error" !in resp || resp["error"].type != Json.Type.object)
+		return false;
+	auto err = resp["error"];
+	if ("code" !in err || err["code"].type != Json.Type.int_
+			|| err["code"].get!int != cast(int) ErrorCode.invalidParams)
+		return false;
+	return "data" in err && err["data"].type == Json.Type.object && missingMetaDataKey in err["data"];
+}
+
+unittest  // missingRequiredMeta is -32602 and names the absent keys in data
+{
+	auto e = missingRequiredMeta([cast(string) MetaKey.clientCapabilities]);
+	assert(e.code == cast(int) ErrorCode.invalidParams);
+	assert(e.data[missingMetaDataKey][0].get!string == MetaKey.clientCapabilities);
+	import std.algorithm : canFind;
+
+	assert(e.msg.canFind(cast(string) MetaKey.clientCapabilities));
+}
+
+unittest  // RequestMeta.fromParams records whether clientCapabilities was present
+{
+	Json p = Json.emptyObject;
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	p["_meta"] = meta;
+	assert(!RequestMeta.fromParams(p).hasClientCapabilities);
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	p["_meta"] = meta;
+	assert(RequestMeta.fromParams(p).hasClientCapabilities);
 }
 
 /// Result of `server/discover`: advertises supported versions, capabilities,
@@ -53,22 +120,22 @@ struct DiscoverResult
 	/// `serverInfo` field), and omitted entirely when unset.
 	Implementation serverInfo;
 	Nullable!string instructions;
-	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`):
-	/// `DiscoverResult extends CacheableResult` in the draft schema, so a client
+	/// Modern `CacheableResult` freshness hint (`ttlMs`/`cacheScope`):
+	/// `DiscoverResult extends CacheableResult` in the 2026-07-28 schema, so a client
 	/// may cache the discovery response. Round-trips symmetrically; the server
-	/// sets it (draft-gated), leaving pre-draft wire output unchanged.
+	/// sets it (modern-gated), leaving legacy wire output unchanged.
 	Nullable!CacheHint cache;
 
 	Json toJson() const @safe
 	{
 		Json j = Json.emptyObject;
-		// Base draft Result mandates a `resultType` discriminator on every
+		// The 2026-07-28 base Result mandates a `resultType` discriminator on every
 		// result; a complete discover response uses "complete".
 		j["resultType"] = "complete";
 		Json pv = Json.emptyArray;
 		foreach (v; protocolVersions)
 			pv ~= Json(v);
-		// Spec wire field name is `supportedVersions` (draft server/discover
+		// Spec wire field name is `supportedVersions` (2026-07-28 server/discover
 		// Response Fields table), even though the D member is `protocolVersions`.
 		j["supportedVersions"] = pv;
 		j["capabilities"] = capabilities.toJson();
@@ -140,7 +207,7 @@ enum CacheScope : string
 	private_ = "private",
 }
 
-/// A per-result freshness hint (draft `CacheableResult`): how long a result may
+/// A per-result freshness hint (modern `CacheableResult`): how long a result may
 /// be cached (`ttl`) and by whom (`cacheScope`). Supplied per result by the
 /// user and surfaced to client consumers. The wire field stays `ttlMs`
 /// (milliseconds); `ttl` is the typed SDK-facing value.
@@ -190,7 +257,7 @@ Implementation readServerInfo(Json result) @safe
 	return Implementation.fromJson(info);
 }
 
-/// Attach the draft `CacheableResult` fields (`ttlMs`, `cacheScope`) to a result
+/// Attach the modern `CacheableResult` fields (`ttlMs`, `cacheScope`) to a result
 /// object from a `CacheHint` and return it, leaving the original untouched (matching
 /// the sibling `withSubscriptionId`). A freshness hint for clients/intermediaries
 /// that complements `listChanged` notifications.
@@ -211,7 +278,7 @@ Json withCache(Json result, CacheHint hint) @safe
 	return out_;
 }
 
-/// Parse a draft `CacheableResult` freshness hint from a result object. Reads
+/// Parse a modern `CacheableResult` freshness hint from a result object. Reads
 /// `ttlMs` (accepting an integer or a float) and `cacheScope` (a string mapped to
 /// the `CacheScope` enum, defaulting to `public`). Returns null when no `ttlMs`
 /// field is present.
@@ -331,7 +398,7 @@ unittest  // DiscoverResult.toJson emits the spec wire field `supportedVersions`
 	d.protocolVersions = ["2026-07-28", "2025-11-25"];
 	d.serverInfo = Implementation("srv", "1.0");
 	auto j = d.toJson();
-	// draft server/discover Response Fields table requires `supportedVersions`,
+	// 2026-07-28 server/discover Response Fields table requires `supportedVersions`,
 	// not the internal name `protocolVersions`.
 	assert("supportedVersions" in j);
 	assert("protocolVersions" !in j);
@@ -357,7 +424,7 @@ unittest  // DiscoverResult.toJson carries the required resultType discriminator
 	DiscoverResult d;
 	d.protocolVersions = ["2026-07-28"];
 	auto j = d.toJson();
-	// Base draft Result mandates a resultType discriminator on every result;
+	// The 2026-07-28 base Result mandates a resultType discriminator on every result;
 	// a complete discover response uses "complete".
 	assert("resultType" in j);
 	assert(j["resultType"].get!string == "complete");

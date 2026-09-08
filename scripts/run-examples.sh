@@ -29,7 +29,7 @@ port_for() {
     resources) echo 8349 ;;
     sampling) echo 9354 ;;
     skills) echo 8645 ;;
-    stateless-draft) echo 8431 ;;
+    modern) echo 8431 ;;
     stickynotes) echo 8537 ;;
     streaming) echo 9357 ;;
     tasks) echo 8643 ;;

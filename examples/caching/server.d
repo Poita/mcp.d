@@ -1,7 +1,7 @@
 /**
  * Caching (CacheableResult) example — server side, UDA style, DUAL TRANSPORT.
  *
- * Demonstrates the draft `CacheableResult` freshness hints from the server's
+ * Demonstrates the modern `CacheableResult` freshness hints from the server's
  * point of view, using the ergonomic UDA API (`@resource` + `@cache` +
  * `registerHandlers`):
  *
@@ -13,8 +13,8 @@
  *     It rides on the `resources/list` result. (This is a server-level list hint,
  *     not a per-resource registration, so there is no per-method UDA for it.)
  *
- * Both are draft-gated: the server only emits the `ttlMs` / `cacheScope`
- * fields when the negotiated protocol is the stateless draft (2026-07-28).
+ * Both are modern-gated: the server only emits the `ttlMs` / `cacheScope`
+ * fields when the negotiated protocol is the modern protocol (2026-07-28).
  *
  * ONE BINARY, EITHER TRANSPORT. The transport is selected by flags via the
  * shared `runServerFromArgs` scaffold helper:
@@ -52,7 +52,7 @@ enum Duration ListTtl = 5.seconds;
 
 /// The annotated resources of the caching example. `registerHandlers` registers
 /// each `@resource` method; the `@cache` UDA declares the per-resource freshness
-/// hint that rides on the matching draft `resources/read`.
+/// hint that rides on the matching modern `resources/read`.
 final class CachingApi
 {
 	/// A direct resource carrying a PER-RESOURCE cache hint. The body rarely
@@ -77,7 +77,7 @@ final class CachingApi
 void main(string[] args) @safe
 {
 	auto server = new McpServer("caching-example", "1.0.0",
-			nullable("Demonstrates draft CacheableResult freshness hints."));
+			nullable("Demonstrates modern CacheableResult freshness hints."));
 
 	// Register the @resource methods (with their @cache hints) in one call.
 	registerHandlers(server, new CachingApi);

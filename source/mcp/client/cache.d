@@ -1,5 +1,5 @@
 /**
- * Client-side response cache for the draft `CacheableResult` freshness hints.
+ * Client-side response cache for the modern `CacheableResult` freshness hints.
  *
  * The six read-only MCP operations that carry a server TTL hint — `tools/list`,
  * `prompts/list`, `resources/list`, `resources/templates/list`,

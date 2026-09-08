@@ -89,10 +89,12 @@ final class TaskRuntime
 	/// on each dispatch. The returned `Task` seeds a `CreateTaskResult`. The
 	/// generated ID is guaranteed unique against the store. `ttl`/`pollInterval`
 	/// default to the runtime options when null; both are serialized to integer
-	/// milliseconds on the wire `Task`.
+	/// milliseconds on the wire `Task`. A non-empty `owner` (the creating
+	/// request's authenticated principal) binds the task: `requireAccess` then
+	/// admits only that principal.
 	Task createFor(string toolName, Json executorInput,
 			Nullable!Duration ttl = Nullable!Duration.init,
-			Nullable!Duration pollInterval = Nullable!Duration.init) @safe
+			Nullable!Duration pollInterval = Nullable!Duration.init, string owner = "") @safe
 	{
 		string id;
 		// Defend against a misbehaving custom generator returning a duplicate.
@@ -119,21 +121,39 @@ final class TaskRuntime
 		r.meta.ttlMs = nullable(ttlDur.total!"msecs");
 		r.meta.pollIntervalMs = nullable(pollDur.total!"msecs");
 		r.toolName = toolName;
+		r.owner = owner;
 		r.executorInput = executorInput;
 		store_.put(r);
 		return r.meta;
+	}
+
+	/// Enforce the task's principal binding for a tasks/* request made by
+	/// `principal` ("" when unauthenticated). A task created by an authenticated
+	/// principal is reachable only by that principal; one created without a
+	/// principal is open to every request. A mismatch throws the same
+	/// `-32602 Task not found` as an unknown id, so a foreign principal cannot
+	/// learn that the task exists.
+	void requireAccess(string id, string principal) @safe
+	{
+		auto r = require(id);
+		if (r.owner.length && r.owner != principal)
+			throw taskNotFound(id);
 	}
 
 	private TaskRecord require(string id) @safe
 	{
 		auto r = store_.get(id);
 		if (r.isNull)
-		{
-			Json data = Json.emptyObject;
-			data["taskId"] = id;
-			throw new McpException(ErrorCode.invalidParams, "Task not found", data);
-		}
+			throw taskNotFound(id);
 		return r.get;
+	}
+
+	/// The `-32602 Task not found` error, with the offending `taskId` in `data`.
+	private static McpException taskNotFound(string id) @safe
+	{
+		Json data = Json.emptyObject;
+		data["taskId"] = id;
+		return new McpException(ErrorCode.invalidParams, "Task not found", data);
 	}
 
 	private void touchAndStore(ref TaskRecord r) @safe

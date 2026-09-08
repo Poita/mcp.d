@@ -33,9 +33,9 @@
  *     stream mid-flight (the Streamable HTTP cancellation signal); a later,
  *     fresh client reads this tool to confirm the server honored it.
  *
- * This example is STATELESS (the default). Its HTTP path exercises the draft
+ * This example is STATELESS (the default). Its HTTP path exercises 2026-07-28
  * transport's client-disconnect cancellation, which a stateful server cannot
- * serve (the draft is excluded from stateful negotiation). Server->client
+ * serve (2026-07-28 is excluded from stateful negotiation). Server->client
  * features (elicit/sample/roots) require a stateful server and are demonstrated
  * by the dedicated `examples/elicitation` and `examples/sampling` examples.
  *
@@ -128,7 +128,7 @@ final class StreamingApi
 			}
 
 			// Emit progress + a log line for this step. On Streamable HTTP the
-			// cancellation signal is the client closing its response stream (draft
+			// cancellation signal is the client closing its response stream (modern
 			// basic/utilities/cancellation §Transport-Specific Cancellation). A
 			// closed stream surfaces here as a FAILED SSE write, which we treat as
 			// cancellation: stop the work and record it.

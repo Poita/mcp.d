@@ -10,13 +10,13 @@ dependency on the root `mcp` SDK (it does not modify the root `dub.json`).
 Server side (`server.d`), written in the ergonomic **UDA style**
 (`@resource` / `@resourceTemplate` / `@tool` + `registerHandlers`):
 
-- **Direct resource** — a static `@resource` `config://app`, carrying a draft
+- **Direct resource** — a static `@resource` `config://app`, carrying a modern
   `CacheableResult` freshness hint declared with `@cache(ttl, scope)` (a
   `core.time.Duration`) that rides on `resources/read` (serialized on the wire as
   `ttlMs` milliseconds).
 - **Resource template** — `@resourceTemplate("note:///{id}")`; the reader
   receives the captured `{id}` as a typed argument.
-- **Subscriptions** — the draft `subscriptions/listen` stream delivers
+- **Subscriptions** — the modern `subscriptions/listen` stream delivers
   `notifyResourceUpdated(uri)` pushes (`notifications/resources/updated`) per its
   own per-URI filter, so it works on this stateless server. The 2025-era
   `resources/subscribe` capability instead requires a stateful server
@@ -41,7 +41,7 @@ dub run -c server -- --http --port 8349 # Streamable HTTP on 127.0.0.1:8349/mcp
 
 Client side (`client.d`) — also a **self-verifying end-to-end test**. The SAME
 client verifies the server over both transports; the assertions are
-transport-agnostic. It speaks the stateless **draft** protocol for two reasons:
+transport-agnostic. It speaks the stateless **modern** protocol for two reasons:
 the `CacheableResult` hint rides inline on every `resources/read`, and a
 `subscriptions/listen` stream is the one push mechanism the SDK supports over
 **both** transports (the legacy standalone GET SSE stream is HTTP-only).
@@ -53,11 +53,11 @@ It asserts:
 3. Reading `config://app` returns the expected JSON text.
 4. Reading `note:///welcome` (template expansion) returns the seeded body with
    `mimeType: text/plain`.
-5. Reading an unknown URI raises an error. **Note:** the draft aligns the
+5. Reading an unknown URI raises an error. **Note:** 2026-07-28 aligns the
    `resources/read` not-found code to `invalidParams` (**-32602**); the stable
-   revisions used `resourceNotFound` (**-32002**). We speak draft, so we expect
+   revisions used `resourceNotFound` (**-32002**). We speak the modern protocol, so we expect
    `-32602`.
-6. The draft read of `config://app` surfaces the freshness hint
+6. The modern read of `config://app` surfaces the freshness hint
    (`ttlMs == 60000`, `cacheScope == public`).
 7. After `subscriptions/listen`, calling `set_note` delivers a
    `notifications/resources/updated` for the subscribed URI **and** a

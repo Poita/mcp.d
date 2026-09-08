@@ -111,10 +111,10 @@ private struct SseCursor
 /// the standalone server->client GET SSE stream, the `subscriptions/listen`
 /// stream, session-id capture, the OAuth bearer token, and the legacy
 /// 2024-11-05 HTTP+SSE two-endpoint fallback (`legacyMode`). The owning
-/// `McpClient` supplies the protocol-derived request headers (version / draft
+/// `McpClient` supplies the protocol-derived request headers (version / modern
 /// method+name / `Mcp-Param-*`) and the cancelled-response predicate through the
 /// `ClientProtocol` it installs via `setProtocol`, so this transport never needs
-/// the tool inputSchema cache or draft state.
+/// the tool inputSchema cache or modern state.
 final class HttpClientTransport : ClientTransport
 {
 	private string url;
@@ -147,11 +147,11 @@ final class HttpClientTransport : ClientTransport
 	// next request `deliver()` throws a clear "session expired" error rather than
 	// silently issuing requests under a dead session.
 	private bool sessionExpired;
-	// True when the negotiated protocol version is modern (2026-07-28 / draft).
-	// The draft removed Last-Event-ID resumption and standalone GET SSE streams;
+	// True when the negotiated protocol version is modern (2026-07-28 / modern).
+	// The modern removed Last-Event-ID resumption and standalone GET SSE streams;
 	// postAndAwait skips resumeViaGet when this is set so the pointless 405
-	// round-trip to a draft server is avoided.
-	private bool draftProtocol;
+	// round-trip to a modern server is avoided.
+	private bool modernProtocol;
 	// Set by `close()` to ask the background stream readers to stop between reads;
 	// the held sockets are closed so a blocked read returns immediately.
 	private shared(bool) closeRequested;
@@ -203,7 +203,7 @@ final class HttpClientTransport : ClientTransport
 	/// The owning client's `ClientProtocol`, installed via `setProtocol`. Supplies
 	/// the protocol-derived request headers (`headersFor`) and the
 	/// cancelled-response predicate (`isCancelled`), so this transport never needs
-	/// the tool inputSchema cache or draft state.
+	/// the tool inputSchema cache or modern state.
 	private ClientProtocol protocol;
 
 	// Optional cap on the number of POSTs in flight at once. Zero (the default)
@@ -228,7 +228,7 @@ final class HttpClientTransport : ClientTransport
 
 	/// Install the owning client's `ClientProtocol`, through which this transport
 	/// obtains the protocol-derived request headers and the cancelled-response
-	/// predicate, so the draft header/schema logic and the cancellation set stay in
+	/// predicate, so the modern header/schema logic and the cancellation set stay in
 	/// the client.
 	void setProtocol(ClientProtocol p) @safe
 	{
@@ -240,20 +240,20 @@ final class HttpClientTransport : ClientTransport
 		bearerToken = token;
 	}
 
-	/// Mark whether the negotiated protocol version is modern (2026-07-28 / draft).
+	/// Mark whether the negotiated protocol version is modern (2026-07-28 / modern).
 	/// When true, `postAndAwait` skips Last-Event-ID resumption via GET because the
-	/// draft removed SSE resumability; a draft server responds to such a GET with 405.
-	void setDraftProtocol(bool isDraft) @safe
+	/// modern removed SSE resumability; a modern server responds to such a GET with 405.
+	void setModernProtocol(bool modern) @safe
 	{
-		draftProtocol = isDraft;
+		modernProtocol = modern;
 	}
 
-	/// A draft Streamable HTTP client cancels by closing the request's SSE response
-	/// stream; the draft sends no `notifications/cancelled` over HTTP. Legacy HTTP
-	/// (pre-draft) still uses the notification.
+	/// A modern Streamable HTTP client cancels by closing the request's SSE response
+	/// stream; the modern sends no `notifications/cancelled` over HTTP. Legacy HTTP
+	/// (legacy) still uses the notification.
 	bool cancelsByStreamClose() @safe
 	{
-		return draftProtocol;
+		return modernProtocol;
 	}
 
 	/// Bound each raw `connectTCP` by `timeout`. A connect that cannot complete in
@@ -464,9 +464,9 @@ final class HttpClientTransport : ClientTransport
 		// Premature stream close with an SSE `retry:` hint: wait the prescribed
 		// delay, then RESUME the stream with a GET carrying `Last-Event-ID`
 		// (per Streamable HTTP resumability — not a re-POST of the request).
-		// The draft (2026-07-28) removed resumability; a draft server responds with
+		// The 2026-07-28 removed resumability; a modern server responds with
 		// 405, so skip the GET when the negotiated version is modern.
-		if (cursor.retryMs > 0 && !draftProtocol)
+		if (cursor.retryMs > 0 && !modernProtocol)
 		{
 			sleep(cursor.retryMs.msecs);
 			resumeViaGet(expectId, cursor.lastEventId, result, got, err);
@@ -911,7 +911,7 @@ final class HttpClientTransport : ClientTransport
 	/// When `includeAuth` is set and a bearer token is present, an
 	/// `Authorization: Bearer` header is emitted; the `Mcp-Session-Id` header
 	/// follows whenever a session id is known. `extraHeaders` (the protocol-derived
-	/// version/draft headers) are appended, skipping any unsafe value. A non-empty
+	/// version/modern headers) are appended, skipping any unsafe value. A non-empty
 	/// `lastEventId` adds `Last-Event-ID` for SSE resumption, and a non-empty `body`
 	/// adds `Content-Length` and the payload. The terminating blank line is always
 	/// written.
@@ -1252,7 +1252,7 @@ final class HttpClientTransport : ClientTransport
 		// Resolve + pin the user-configured endpoint host to a numeric address.
 		const pinnedHost = pinnedEndpointHost(ep);
 
-		// Protocol-derived headers (version + draft method) for this POST.
+		// Protocol-derived headers (version + modern method) for this POST.
 		auto reqHeaders = requestHeaders(message);
 		const 
 		body = message.toString();
@@ -1718,7 +1718,7 @@ bool isLegacyFallbackStatus(int status) pure nothrow @safe @nogc
 
 /// Whether a JSON-RPC error `code` carried in a 400/404/405 response body
 /// proves the peer speaks a *modern* MCP version (so the client should retry /
-/// correct rather than fall back to the legacy HTTP+SSE transport). Per draft
+/// correct rather than fall back to the legacy HTTP+SSE transport). Per modern
 /// basic/transports §Backward Compatibility the disambiguating modern errors a
 /// 4xx body may carry are `UnsupportedProtocolVersionError` (-32022),
 /// `HeaderMismatch` (-32020, header-validation failure),
@@ -1732,7 +1732,7 @@ bool isModernRpcErrorCode(int code) pure nothrow @safe @nogc
 }
 
 /// Inspect a 400/404/405 response `body` for a recognized modern JSON-RPC
-/// error before deciding whether to fall back to legacy HTTP+SSE. Per draft
+/// error before deciding whether to fall back to legacy HTTP+SSE. Per modern
 /// basic/transports §Backward Compatibility: "If the body contains a recognized
 /// modern JSON-RPC error, the server speaks a modern version of MCP — retry ...
 /// rather than falling back. If the body is empty or is not a recognized modern
@@ -1977,7 +1977,7 @@ unittest  // isLegacyFallbackStatus ignores success and other errors
 
 unittest  // isModernRpcErrorCode recognises the modern-vs-legacy disambiguators
 {
-	// Per draft basic/transports §Backward Compatibility, these are the
+	// Per 2026-07-28 basic/transports §Backward Compatibility, these are the
 	// JSON-RPC error codes a 400/404/405 body may carry to prove the server
 	// speaks a modern MCP version rather than being a legacy HTTP+SSE server.
 	assert(isModernRpcErrorCode(ErrorCode.unsupportedProtocolVersion)); // -32022
@@ -2474,16 +2474,16 @@ unittest  // runServerStream GET includes Authorization: Bearer when a bearer to
 			"standalone server-stream GET must include Authorization header when bearer token is set");
 }
 
-unittest  // postAndAwait skips resumeViaGet when the session is in draft/modern mode
+unittest  // postAndAwait skips resumeViaGet when the session is in modern mode
 {
-	// The draft (2026-07-28) removed Last-Event-ID resumption; a draft server responds
-	// to the GET with 405. skipDraftResumption gates the resume on !draftProtocol so
+	// The 2026-07-28 removed Last-Event-ID resumption; a modern server responds
+	// to the GET with 405. the resume is gated on !modernProtocol so
 	// the pointless GET round-trip is avoided when the negotiated version is modern.
 	auto t = new HttpClientTransport("https://host:8080/mcp");
-	assert(!t.draftProtocol,
-			"transport starts in non-draft mode; resumeViaGet is allowed by default");
-	t.draftProtocol = true;
-	assert(t.draftProtocol, "after setDraftProtocol(true) the transport skips resumeViaGet");
+	assert(!t.modernProtocol,
+			"transport starts in legacy mode; resumeViaGet is allowed by default");
+	t.modernProtocol = true;
+	assert(t.modernProtocol, "after setModernProtocol(true) the transport skips resumeViaGet");
 }
 
 unittest  // readSseBody handles a partial IOMode.once read without appending zero bytes

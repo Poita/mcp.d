@@ -31,6 +31,10 @@ struct TaskRecord
 	Json[string] inputResponses; /// answers delivered via tasks/update, keyed by request id
 	bool cancelRequested; /// cooperative cancel flag, honored by the executor
 	string toolName; /// executor key — which registered task executor drives this task
+	/// The authenticated principal (token subject) whose request created the
+	/// task; every later tasks/* request must come from the same principal. Empty
+	/// when the creating request was unauthenticated, which leaves the task open.
+	string owner;
 	Json executorInput = Json.undefined; /// durable input, reconstituted on each dispatch
 	Json[string] checkpoints; /// re-entry state persisted via TaskContext.checkpoint
 
@@ -52,6 +56,8 @@ struct TaskRecord
 		j["inputResponses"] = ir;
 		j["cancelRequested"] = cancelRequested;
 		j["toolName"] = toolName;
+		if (owner.length)
+			j["owner"] = owner;
 		if (executorInput.type != Json.Type.undefined)
 			j["executorInput"] = executorInput;
 		Json cp = Json.emptyObject;
@@ -83,6 +89,8 @@ struct TaskRecord
 			&& j["cancelRequested"].type == Json.Type.bool_ && j["cancelRequested"].get!bool;
 		if ("toolName" in j && j["toolName"].type == Json.Type.string)
 			r.toolName = j["toolName"].get!string;
+		if ("owner" in j && j["owner"].type == Json.Type.string)
+			r.owner = j["owner"].get!string;
 		r.executorInput = ("executorInput" in j) ? cloneJson(j["executorInput"]) : Json.undefined;
 		if ("checkpoints" in j && j["checkpoints"].type == Json.Type.object)
 			() @trusted {

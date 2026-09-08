@@ -4,7 +4,7 @@
  * Demonstrates the server side of MCP Resources, written in the ergonomic
  * UDA style (`@resource` / `@resourceTemplate` / `@tool` annotated methods
  * registered with `registerHandlers`):
- *   - a static `@resource` direct resource (`config://app`) with a draft
+ *   - a static `@resource` direct resource (`config://app`) with a modern
  *     `CacheableResult` freshness hint declared via `@cache(ttl, scope)`,
  *   - a `@resourceTemplate` (`note:///{id}`) whose reader receives the matched
  *     `{id}` as a typed argument,
@@ -70,9 +70,9 @@ final class ResourcesApi
 		notes["welcome"] = "Hello from the resources example.";
 	}
 
-	/// A static (direct) resource with a draft freshness hint. The hint
-	/// (ttlMs/cacheScope) is emitted on the draft `resources/read` response so a
-	/// draft client can cache the contents.
+	/// A static (direct) resource with a modern freshness hint. The hint
+	/// (ttlMs/cacheScope) is emitted on the modern `resources/read` response so a
+	/// modern client can cache the contents.
 	@resource("config://app", "App config", "application/json")
 	@cache(60.seconds, "public")
 	string config() @safe
@@ -123,9 +123,9 @@ final class ResourcesApi
 void main(string[] args) @safe
 {
 	// This example is STATELESS (the default) because its client
-	// speaks the draft (inline resources/read cache hints + the draft
+	// speaks the modern (inline resources/read cache hints + 2026-07-28
 	// subscriptions/listen push mechanism), and a stateful server excludes the
-	// draft from negotiation. Its push flow (subscriptions/listen + push
+	// modern from negotiation. Its push flow (subscriptions/listen + push
 	// notifications/resources/updated) correlates more than one HTTP call, so it is
 	// available only over STDIO here (a single implicit connection). Over HTTP a
 	// stateless server correctly forbids subscriptions/listen, so the client skips
@@ -136,7 +136,7 @@ void main(string[] args) @safe
 	registerHandlers(server, new ResourcesApi(server));
 
 	// Advertise the resources listChanged capability so the client learns it may
-	// receive list-changed notifications. The draft `subscriptions/listen` push of
+	// receive list-changed notifications. The modern `subscriptions/listen` push of
 	// `notifications/resources/updated` is driven by each listen stream's own
 	// per-URI filter, so it works on this stateless server without (and indeed
 	// cannot use) `enableResourceSubscriptions()`, which is stateful-only.

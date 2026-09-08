@@ -10,7 +10,7 @@ import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
 import mcp.protocol.schema : jsonSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
 import mcp.protocol.jsonrpc : makeNotification;
-import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
+import mcp.protocol.versions : ProtocolVersion, latestLegacy, supportsProgressMessage;
 import mcp.server.connection : ConnectionState;
 
 @safe:
@@ -139,7 +139,7 @@ interface RequestContext
 	/// Whether the connected client advertised `cap`.
 	bool clientSupports(ClientCapability cap) @safe;
 
-	/// True when this request is on a stateless (MRTR) protocol — the draft
+	/// True when this request is on a stateless (MRTR) protocol — 2026-07-28
 	/// revision, where there is no server->client channel. On such requests a
 	/// tool handler must NOT call `elicit`/`sample` (they throw); instead it
 	/// returns `ToolResponse.inputRequired(...)` and reads the client's answers
@@ -481,7 +481,7 @@ final class StdioContext : RequestContext
 	/// 2025-03-26 onward). This overload wires no server->client request channel
 	/// (`sendRequest` throws, `clientSupports` is false).
 	this(void delegate(string) @safe sink, Json progressToken = Json.undefined,
-			ProtocolVersion negotiated = latestStable) @safe
+			ProtocolVersion negotiated = latestLegacy) @safe
 	{
 		this.sink = sink;
 		this.progressTok = progressToken;
@@ -498,7 +498,7 @@ final class StdioContext : RequestContext
 	/// connection to carry the round-trip), exactly as on the HTTP transport.
 	this(void delegate(string) @safe sink, Json delegate(string, Json) @safe serverRequest,
 			ClientCapabilities clientCaps, Json progressToken = Json.undefined,
-			ProtocolVersion negotiated = latestStable, bool serverStateless = false) @safe
+			ProtocolVersion negotiated = latestLegacy, bool serverStateless = false) @safe
 	{
 		this.sink = sink;
 		this.serverRequestFn = serverRequest;
@@ -628,7 +628,7 @@ final class RequestScope : RequestContext, ConnectionScoped
 
 	this(RequestContext inner, bool stateless, Json[string] responses, string minLevel = "info",
 			bool loggingRequested = true, CancellationToken cancellation = null,
-			string requestState = "", ProtocolVersion effectiveVersion = latestStable) @safe
+			string requestState = "", ProtocolVersion effectiveVersion = latestLegacy) @safe
 	{
 		this.inner = inner;
 		this.stateless = stateless;
@@ -642,7 +642,7 @@ final class RequestScope : RequestContext, ConnectionScoped
 
 	/// The protocol version in effect for THIS request (negotiated version on the
 	/// stateful 2025-era protocols; the per-request `_meta.protocolVersion` on the
-	/// stateless draft). Request-scoped so a concurrent request that yields mid-
+	/// modern). Request-scoped so a concurrent request that yields mid-
 	/// handle cannot have its effective version flipped by another in-flight
 	/// request: the dispatcher reads it from here, not from a mutable field on the
 	/// shared server instance.
@@ -695,7 +695,7 @@ final class RequestScope : RequestContext, ConnectionScoped
 	/// client-configured minimum (`logging/setLevel`) per the RFC 5424 ordering.
 	/// This is where the server honours "Only sends error level and above".
 	///
-	/// On the draft (stateless) protocol the server MUST NOT emit
+	/// On the modern (stateless) protocol the server MUST NOT emit
 	/// `notifications/message` for a request that did not carry
 	/// `_meta["io.modelcontextprotocol/logLevel"]`; the server signals that by
 	/// constructing this scope with `loggingRequested = false`, in which case
@@ -1161,7 +1161,7 @@ unittest  // a stateless server's StdioContext refuses server->client requests o
 	// connection to carry the round-trip, so elicit/sample/roots are refused —
 	// matching the HTTP transport rather than special-casing stdio.
 	auto ctx = new StdioContext((string) @safe {}, (string m, Json p) @safe => Json.emptyObject,
-			ClientCapabilities.init, Json.undefined, latestStable, true);
+			ClientCapabilities.init, Json.undefined, latestLegacy, true);
 	assertThrown!McpException(ctx.sampleRaw(Json.emptyObject));
 	assertThrown!McpException(ctx.elicitRaw(Json.emptyObject));
 	assertThrown!McpException(ctx.listRootsRaw());
@@ -1173,7 +1173,7 @@ unittest  // a stateful StdioContext issues server->client requests through the 
 	auto ctx = new StdioContext((string) @safe {}, (string m, Json p) @safe {
 		called = true;
 		return Json.emptyObject;
-	}, ClientCapabilities.init, Json.undefined, latestStable, false);
+	}, ClientCapabilities.init, Json.undefined, latestLegacy, false);
 	ctx.listRootsRaw();
 	assert(called);
 }

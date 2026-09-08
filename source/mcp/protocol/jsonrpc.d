@@ -234,7 +234,7 @@ Json makeRequest(Json id, string method, Json params = Json.undefined) @safe
 
 /// Render a JSON-RPC request id (a string or a number per the spec) to a stable
 /// string form. Used where an id must be carried as a string value — e.g. the
-/// draft `subscriptions/listen` id stamped into outbound notifications'
+/// modern `subscriptions/listen` id stamped into outbound notifications'
 /// `_meta["io.modelcontextprotocol/subscriptionId"]`. A string id is returned
 /// verbatim; a numeric id is rendered as its decimal text; anything else (null /
 /// absent) yields an empty string.

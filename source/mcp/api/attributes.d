@@ -326,7 +326,7 @@ struct describeParam
 /// `parameter` names the tool argument and `name` is the header suffix, so the
 /// argument is mirrored into the `Mcp-Param-<name>` request header.
 ///
-/// Per the MCP draft (`server/tools` #x-mcp-header), a server MAY designate tool
+/// Per the MCP modern (`server/tools` #x-mcp-header), a server MAY designate tool
 /// parameters to be mirrored into headers via an `x-mcp-header` extension
 /// property in the parameter's `inputSchema`. The reflection layer emits the
 /// corresponding `x-mcp-header` property (carrying `name`) onto the named
@@ -420,11 +420,11 @@ struct meta
 public import jsonschema : fieldDescription, minimum, maximum, title, format,
 	minLength, maxLength, pattern, minItems, maxItems, SchemaDefault, schemaDefault;
 
-/// UDA declaring a per-resource / per-template draft `CacheableResult` freshness
+/// UDA declaring a per-resource / per-template modern `CacheableResult` freshness
 /// hint for a `@resource`- or `@resourceTemplate`-annotated method. The reflection
-/// layer plumbs it through to the matching low-level registration so a draft
-/// `resources/read` carries `ttlMs` / `cacheScope`. Has no effect on pre-draft
-/// protocol versions (the server only emits cache fields when negotiated to draft).
+/// layer plumbs it through to the matching low-level registration so a modern
+/// `resources/read` carries `ttlMs` / `cacheScope`. Has no effect on legacy
+/// protocol versions (the server only emits cache fields when negotiated to the modern protocol).
 ///
 /// `scope_` is `"public"` (the default) or `"private"`.
 ///

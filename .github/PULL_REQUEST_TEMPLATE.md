@@ -8,7 +8,7 @@ Closes #
 
 <!-- The MCP spec rule, field/shape/error code, or behavior this matches. Cite the
      authoritative schema (schema.ts line) or modelcontextprotocol.io section where
-     relevant. For draft-only changes, confirm released-version wire output is unchanged. -->
+     relevant. For revision-specific changes, confirm the other revisions' wire output is unchanged. -->
 
 ## Checklist
 
@@ -16,6 +16,6 @@ Closes #
 - [ ] **`dub test` passes** — all modules green locally (`ulimit -n 65536 && dub test`).
 - [ ] **`dfmt` clean** — ran `dub run dfmt -- --inplace source/ conformance/`; `git diff --exit-code` is clean.
 - [ ] **`dscanner` clean** — ran `./scripts/dscanner-lint.sh`.
-- [ ] **Conformance unaffected** — server **39/39** and client **287/287** baseline not regressed.
-- [ ] **Draft-only behavior gated** — any draft-only change does NOT alter `2025-11-25` / `2025-06-18` wire output.
+- [ ] **Conformance unaffected** — all four `--requirements` lanes (server + client, `2025-11-25` + `2026-07-28`) still pass with no warnings.
+- [ ] **Revision-specific behavior gated** — a `2026-07-28` change does NOT alter `2025-11-25` / `2025-06-18` wire output (and vice versa).
 - [ ] **Public API reachable** — new public API is exported via `source/mcp/package.d` and usable from `McpServer` / `McpClient` / `RequestContext` (or the UDA layer).

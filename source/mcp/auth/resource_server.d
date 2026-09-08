@@ -106,6 +106,29 @@ struct ResourceServerConfig
 	/// means no scope requirement.
 	string requiredScope;
 
+	/// The server's scope hierarchy: returns true when a token that was granted
+	/// `granted` thereby also holds `required` (for example an `admin` scope that
+	/// subsumes `read`). Null means scopes are flat and only an exact grant
+	/// satisfies a requirement. The spec requires servers to account for their
+	/// scope hierarchies when judging whether a token is sufficient, so a server
+	/// whose authorization server defines one sets this.
+	bool delegate(string granted, string required) @safe scopeImplies;
+
+	/// Whether `token` satisfies the scope requirement `required`: an exact grant
+	/// always does, and otherwise any granted scope that `scopeImplies` says
+	/// subsumes it.
+	bool satisfiesScope(const TokenInfo token, string required) const @safe
+	{
+		if (token.hasScope(required))
+			return true;
+		if (scopeImplies is null)
+			return false;
+		foreach (granted; token.scopes)
+			if (scopeImplies(granted, required))
+				return true;
+		return false;
+	}
+
 	/// Whether auth enforcement is active.
 	bool enabled() const @safe
 	{
@@ -203,8 +226,10 @@ AuthFailure authorize(ResourceServerConfig cfg, string authHeader, out TokenInfo
 		return AuthFailure.invalidToken;
 	}
 
-	// Scope enforcement comes after authentication (RFC 6750 §3.1).
-	if (cfg.requiredScope.length && !ti.hasScope(cfg.requiredScope))
+	// Scope enforcement comes after authentication (RFC 6750 §3.1), honouring
+	// the server's scope hierarchy: a broader granted scope may imply the
+	// required one.
+	if (cfg.requiredScope.length && !cfg.satisfiesScope(ti, cfg.requiredScope))
 	{
 		info = ti;
 		return AuthFailure.insufficientScope;
@@ -299,6 +324,62 @@ unittest  // disabled config authorizes everything
 	TokenInfo info;
 	assert(authorize(cfg, "", info) == AuthFailure.none);
 	assert(authorize(cfg, "Bearer whatever", info) == AuthFailure.none);
+}
+
+version (unittest) private ResourceServerConfig adminOnlyScopeConfig() @safe
+{
+	ResourceServerConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.requiredScope = "mcp:read";
+	cfg.validator = (string t) {
+		TokenInfo ti;
+		ti.valid = true;
+		ti.subject = "user-1";
+		ti.scopes = ["mcp:admin"]; // a broader scope that does NOT literally name mcp:read
+		return ti;
+	};
+	return cfg;
+}
+
+unittest  // without a hierarchy, a broader scope does not satisfy a narrower requirement
+{
+	auto cfg = adminOnlyScopeConfig();
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer t", info) == AuthFailure.insufficientScope);
+}
+
+unittest  // scopeImplies lets a server honour its scope hierarchy when judging sufficiency
+{
+	// basic/authorization: servers MUST account for scope hierarchies, where a
+	// broader scope implies narrower ones, when deciding whether a token is
+	// sufficient for an operation.
+	auto cfg = adminOnlyScopeConfig();
+	cfg.scopeImplies = (string granted, string required) @safe {
+		return granted == "mcp:admin" && required == "mcp:read";
+	};
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer t", info) == AuthFailure.none);
+	assert(info.subject == "user-1");
+
+	// The hierarchy only widens: a token whose scopes imply nothing still fails.
+	cfg.validator = (string t) {
+		TokenInfo ti;
+		ti.valid = true;
+		ti.scopes = ["mcp:write"];
+		return ti;
+	};
+	assert(authorize(cfg, "Bearer t", info) == AuthFailure.insufficientScope);
+}
+
+unittest  // satisfiesScope: an exact grant always satisfies, with or without a hierarchy
+{
+	ResourceServerConfig cfg;
+	TokenInfo ti;
+	ti.scopes = ["mcp:read"];
+	assert(cfg.satisfiesScope(ti, "mcp:read"));
+	cfg.scopeImplies = (string granted, string required) @safe => false;
+	assert(cfg.satisfiesScope(ti, "mcp:read"));
+	assert(!cfg.satisfiesScope(ti, "mcp:write"));
 }
 
 unittest  // a missing token is rejected when auth is enabled

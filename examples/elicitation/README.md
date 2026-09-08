@@ -73,7 +73,7 @@ call. Its `destination` argument is marshalled from the inferred input schema an
 
 ### Contrast with MRTR (`examples/mrtr`)
 
-MRTR (SEP-2322) is the **stateless draft** input flow: there is no
+MRTR (SEP-2322) is the **modern** input flow: there is no
 server->client channel, so a tool that needs input ENDS the call with
 `ToolResponse.inputRequired(...)` and the client resubmits a fresh `tools/call`
 carrying the answers in `inputResponses` (plus an opaque `requestState`). Here,

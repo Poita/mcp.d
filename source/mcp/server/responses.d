@@ -49,7 +49,7 @@ mixin template InputRequiredPart()
 	}
 
 	/// As `inputRequired`, but also attaches an opaque `requestState`
-	/// (SEP-2322): a stateless draft server encodes whatever context it needs
+	/// (SEP-2322): a modern server encodes whatever context it needs
 	/// to resume the call into this blob, which the client echoes verbatim on
 	/// the retry and the handler reads back via `RequestContext.requestState`.
 	static typeof(this) inputRequired(InputRequest[] requests, string requestState) @safe
@@ -152,7 +152,7 @@ struct ToolResponse
 
 	/// The handler created an asynchronous task: `j` is the `CreateTaskResult`
 	/// (`resultType:"task"`) returned verbatim in lieu of a `CallToolResult`. Task
-	/// results are draft-only; `forVersion` rejects them on a non-draft session.
+	/// results are modern-only; `forVersion` rejects them on a legacy session.
 	static ToolResponse task(Json j) @safe
 	{
 		ToolResponse t;
@@ -183,7 +183,7 @@ struct ToolResponse
 	/// Project the final `CallToolResult` to the negotiated protocol version so
 	/// version-gated fields are not emitted to peers that don't understand them.
 	/// `CallToolResult.structuredContent` is a 2025-06-18+ field and is stripped
-	/// for 2024-11-05 / 2025-03-26. An `InputRequiredResult` is draft-only (MRTR):
+	/// for 2024-11-05 / 2025-03-26. An `InputRequiredResult` is modern-only (MRTR):
 	/// its `{inputRequests, [requestState]}` shape carries no `content` and exists
 	/// only on versions whose schema permits it. Emitting it to a non-MRTR peer,
 	/// whose `CallToolResult` requires `content`, is a programming error (a handler
@@ -194,8 +194,7 @@ struct ToolResponse
 		if (isTask_)
 		{
 			if (!v.isModern)
-				throw internalError(
-						"tools/call handler returned a task result on a non-draft session");
+				throw internalError("tools/call handler returned a task result on a legacy session");
 			return ToolResponse.task(taskResult_);
 		}
 		if (needsInput_)
@@ -209,9 +208,9 @@ struct ToolResponse
 }
 
 /// The outcome of a `prompts/get` call: either the final `GetPromptResult`, or
-/// — on a stateless (MRTR) draft request — a set of `InputRequest`s the client
+/// — on a stateless (MRTR) modern request — a set of `InputRequest`s the client
 /// must satisfy and resubmit. This mirrors `ToolResponse` for the prompts path:
-/// the draft schema types `GetPromptResultResponse.result` as
+/// the 2026-07-28 schema types `GetPromptResultResponse.result` as
 /// `GetPromptResult | InputRequiredResult`, so a prompt handler that needs more
 /// input ends the request with `inputRequired(...)` and the client opens a fresh
 /// `prompts/get` carrying the matching `inputResponses` (and any `requestState`).
@@ -233,7 +232,7 @@ struct PromptResponse
 	/// version-gated message content (audio/resource_link/tool_use/tool_result
 	/// plus content-level `_meta`/`lastModified`) is not emitted to peers that do
 	/// not understand it. Mirrors `ToolResponse.forVersion`: an
-	/// `InputRequiredResult` is draft-only (MRTR) and carries no version-gated
+	/// `InputRequiredResult` is modern-only (MRTR) and carries no version-gated
 	/// content, so it is returned unchanged.
 	PromptResponse forVersion(ProtocolVersion v) const @safe
 	{
@@ -244,6 +243,6 @@ struct PromptResponse
 	}
 }
 
-/// A prompt handler that may, on a stateless (MRTR) draft request, ask the client
+/// A prompt handler that may, on a stateless (MRTR) modern request, ask the client
 /// for more input instead of returning a final result. See `PromptResponse`.
 alias MrtrPromptHandler = PromptResponse delegate(Json arguments, RequestContext ctx) @safe;

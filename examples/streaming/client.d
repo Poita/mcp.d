@@ -95,7 +95,7 @@ struct CancelStats
 int main(string[] args) @safe
 {
 	// Detect the HTTP URL (if any) up front: phase D (mid-flight cancellation) is
-	// HTTP-only and needs to open its OWN draft-mode client to the same URL. The
+	// HTTP-only and needs to open its OWN modern-mode client to the same URL. The
 	// transport for phases A/C is chosen by the scaffold's `connectFromArgs`.
 	string httpUrl;
 	(() @trusted {
@@ -255,9 +255,9 @@ private void phaseErrorCode(McpClient client) @safe
 private int phaseCancellation(string url, int cancelledBefore) @trusted
 {
 	auto client = McpClient.http(url);
-	// Draft mode: on Streamable HTTP the cancellation signal is the client
-	// closing its response stream (draft basic/utilities/cancellation
-	// §Transport-Specific Cancellation). connect() negotiates the draft revision.
+	// Modern mode: on Streamable HTTP the cancellation signal is the client
+	// closing its response stream (2026-07-28 basic/utilities/cancellation
+	// §Transport-Specific Cancellation). connect() negotiates the 2026-07-28 revision.
 	client.enableModern();
 	client.connect();
 

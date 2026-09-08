@@ -19,7 +19,7 @@
  *      `onInputRequired` callback; the client answers via `respondTaskInput`
  *      (`tasks/update`) and keeps polling until the resumed task completes.
  *
- * The tasks extension is draft-only, so the client enables the draft protocol
+ * The tasks extension is modern-only, so the client enables the modern protocol
  * (`enableModern`) and declares the extension (`enableTasks`) before negotiation.
  *
  * Assertions verified:
@@ -77,7 +77,7 @@ int main(string[] args) @safe
 		scope (exit)
 			client.close();
 
-		// The tasks extension is draft-only: switch to the draft protocol and
+		// The tasks extension is modern-only: switch to the modern protocol and
 		// declare the extension (plus elicitation, which labeled_count needs to
 		// answer its mid-task input request) before version negotiation.
 		client.enableModern();
@@ -98,7 +98,7 @@ int main(string[] args) @safe
 			"discover capabilities.extensions should contain the tasks extension key");
 
 		auto negotiated = client.connect();
-		checkEq(negotiated, ProtocolVersion.modern, "connect() should negotiate draft");
+		checkEq(negotiated, ProtocolVersion.v2026_07_28, "connect() should negotiate 2026-07-28");
 
 		// --- 2. word_count (plain async task) -------------------------------
 		{

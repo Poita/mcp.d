@@ -94,8 +94,8 @@ final class StdioClientTransport : ClientTransport
 	{
 	}
 
-	/// No-op: the draft-protocol flag has no effect on stdio (no SSE GET streams).
-	void setDraftProtocol(bool isDraft) @safe
+	/// No-op: the modern-protocol flag has no effect on stdio (no SSE GET streams).
+	void setModernProtocol(bool modern) @safe
 	{
 	}
 
@@ -131,18 +131,18 @@ final class StdioClientTransport : ClientTransport
 		return channel;
 	}
 
-	/// Open a draft `subscriptions/listen` stream over stdio. Unlike Streamable
+	/// Open a modern `subscriptions/listen` stream over stdio. Unlike Streamable
 	/// HTTP — where the listen stream is a separate long-lived SSE response — stdio
 	/// shares one channel, so opening a subscription is just writing the
 	/// `subscriptions/listen` request line; the server delivers the leading
 	/// `notifications/subscriptions/acknowledged` and every subsequent change
 	/// notification on the same stdout channel, each stamped with
 	/// `io.modelcontextprotocol/subscriptionId` (the listen request id), and they
-	/// reach the client's inbound dispatcher through the channel's read loop (draft
+	/// reach the client's inbound dispatcher through the channel's read loop (modern
 	/// basic/utilities/subscriptions: "On stdio ... clients MUST use this field to
 	/// correlate notifications"). The returned handle's `cancel()`/`close()` ends
 	/// the subscription by sending `notifications/cancelled` referencing the listen
-	/// request id, per the draft stdio cancellation rule.
+	/// request id, per the modern stdio cancellation rule.
 	SubscriptionStream openListen(Json message) @safe
 	{
 		// Write the listen request on the single channel.
@@ -582,9 +582,9 @@ version (unittest) private void inLoop(scope void delegate() @safe body) @truste
 	runEventLoop();
 }
 
-unittest  // stdio openListen writes the subscriptions/listen request to the server (draft)
+unittest  // stdio openListen writes the subscriptions/listen request to the server (2026-07-28)
 {
-	// Per draft basic/utilities/subscriptions, a stdio client opens a subscription
+	// Per 2026-07-28 basic/utilities/subscriptions, a stdio client opens a subscription
 	// by sending a real `subscriptions/listen` request on the single stdin channel.
 	string[] toServer;
 

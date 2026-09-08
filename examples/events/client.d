@@ -20,7 +20,7 @@
  *      (The server uses a fixed "fake auth" principal so webhook subscribe is
  *      permitted; the spec forbids webhook on unauthenticated servers.)
  *
- * Events is draft-only, so the client switches to the draft protocol
+ * Events is modern-only, so the client switches to the modern protocol
  * (`enableModern`) before negotiation.
  */
 module events_client;
@@ -48,7 +48,7 @@ int main(string[] args) @safe
 		scope (exit)
 			client.close();
 
-		// Events is draft-only: switch to the draft protocol before negotiation.
+		// Events is modern-only: switch to the modern protocol before negotiation.
 		client.enableModern();
 
 		// --- 1. server/discover advertises the events extension --------------

@@ -617,7 +617,7 @@ version (unittest)
 		return buildPath(tempDir, "mcp_d_skilldir_" ~ suffix);
 	}
 
-	private Message draftRequest(long id, string method, Json params) @safe
+	private Message modernRequest(long id, string method, Json params) @safe
 	{
 		import mcp.protocol.mrtr : MetaKey;
 
@@ -748,7 +748,7 @@ unittest  // registerSkillDir auto-exposes subdirectories via resources/director
 
 	Json p = Json.emptyObject;
 	p["uri"] = "skill://pdf-forms";
-	auto res = s.handle(draftRequest(1, "resources/directory/read", p)).get["result"]["resources"];
+	auto res = s.handle(modernRequest(1, "resources/directory/read", p)).get["result"]["resources"];
 
 	bool sawSkillMd, sawReferencesDir;
 	foreach (i; 0 .. res.length)

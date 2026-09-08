@@ -82,7 +82,7 @@ unittest
 	static assert(visibleFromMcp!"elicitationRequest");
 }
 
-// User-facing draft result/hint types referenced by lean-surface members
+// User-facing modern result/hint types referenced by lean-surface members
 // (`McpServer.setListCacheHint(string, CacheHint)` and `McpClient.discover()`
 // returning `DiscoverResult`) must be usable with `import mcp;` alone.
 unittest
@@ -115,7 +115,7 @@ unittest
 
 	DiscoverResult r;
 	r.protocolVersions = ["2025-11-25"];
-	// Spec wire field is `supportedVersions` (draft DiscoverResult).
+	// Spec wire field is `supportedVersions` (modern DiscoverResult).
 	assert(r.toJson()["supportedVersions"][0].get!string == "2025-11-25");
 }
 
@@ -155,7 +155,7 @@ unittest
 	static assert(!visibleFromMcp!"formatSseEvent");
 }
 
-// draft's internal transport helpers are NOT dumped at the top level.
+// the modern protocol's internal transport helpers are NOT dumped at the top level.
 unittest
 {
 	static assert(!visibleFromMcp!"encodeHeaderValue");

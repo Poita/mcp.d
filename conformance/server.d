@@ -5,8 +5,10 @@
  * `@modelcontextprotocol/conformance` harness can test it:
  *
  *   dub build -c conformance-server
- *   ./conformance-server --port 3000 &
- *   npx @modelcontextprotocol/conformance server --url http://127.0.0.1:3000/mcp
+ *   ./conformance-server --port 3000 &              # stateful: 2025-11-25 lane
+ *   ./conformance-server --port 3001 --stateless &  # modern:   2026-07-28 lane
+ *   npx @modelcontextprotocol/conformance server --url http://127.0.0.1:3000/mcp --requirements 2025-11-25
+ *   npx @modelcontextprotocol/conformance server --url http://127.0.0.1:3001/mcp --requirements 2026-07-28
  */
 module conformance_server;
 
@@ -17,20 +19,32 @@ import std.typecons : nullable;
 import vibe.data.json : Json;
 
 import mcp;
+import mcp.protocol.errors : invalidParams, internalError, McpException, ErrorCode;
+import mcp.protocol.mrtr : InputRequest;
+import mcp.protocol.tasks : TaskSupport;
+import mcp.server.task_context : TaskContext;
 import mcp.transport : StreamableHttpOptions, runStreamableHttp;
 
 void main(string[] args)
 {
 	ushort port = 3000;
 	string host = "127.0.0.1";
+	bool stateless;
 	getopt(args, "port|p", "Port to listen on (default 3000)", &port,
-			"host|h", "Address to bind (default 127.0.0.1)", &host);
+			"host|h", "Address to bind (default 127.0.0.1)", &host, "stateless",
+			"Serve the modern (2026-07-28) stateless lifecycle instead of the "
+			~ "stateful initialize handshake the dated revisions use", &stateless);
 
-	// The conformance harness is a correlated multi-call client that
-	// exercises subscribe + elicitation + sampling and echoes Mcp-Session-Id, so
-	// the conformance server runs in STATEFUL mode (those features require it).
-	auto server = McpServer.stateful("dlang-mcp-conformance", "0.1.0",
-			nullable("Conformance test server for dlang-mcp-sdk."));
+	// Two lanes, matching the harness's per-revision requirement sets. The dated
+	// revisions through 2025-11-25 are a correlated multi-call client that
+	// exercises subscribe + blocking elicitation + sampling and echoes
+	// Mcp-Session-Id, so that lane runs STATEFUL. 2026-07-28 has no initialize
+	// handshake: per-request _meta, server/discover, MRTR input, so that lane runs
+	// the (default) stateless server.
+	auto server = stateless ? new McpServer("dlang-mcp-conformance", "0.1.0",
+			nullable("Conformance test server for dlang-mcp-sdk.")) : McpServer.stateful(
+			"dlang-mcp-conformance",
+			"0.1.0", nullable("Conformance test server for dlang-mcp-sdk."));
 
 	registerEchoTool(server);
 	registerAddTool(server);
@@ -39,8 +53,24 @@ void main(string[] args)
 	registerPromptFixtures(server);
 	registerStreamingFixtures(server);
 	registerElicitationSepFixtures(server);
+	registerModernFixtures(server);
+	registerMrtrFixtures(server);
+	registerSkillFixtures(server);
 	server.enableLogging();
-	server.enableResourceSubscriptions();
+	// Resource subscriptions correlate HTTP calls and exist only on the stateful
+	// lane; the modern lane advertises the list-changed capabilities its
+	// subscriptions/listen checks exercise instead.
+	if (stateless)
+	{
+		server.enableToolsListChanged();
+		server.enablePromptsListChanged();
+		// The Tasks extension is modern-only; its fixtures run on an in-process
+		// fiber dispatcher so cancellation can be observed mid-run.
+		server.enableTasks();
+		registerTaskFixtures(server);
+	}
+	else
+		server.enableResourceSubscriptions();
 	server.setCompletionRequestHandler((CompleteRequest request) @safe {
 		CompleteResult r;
 		r.values = ["paris", "park", "party"];
@@ -94,8 +124,10 @@ private void registerAddTool(McpServer server) @safe
 	server.registerTool(add, (Json args) @safe {
 		import std.conv : to;
 
-		const a = args["a"].get!int;
-		const b = args["b"].get!int;
+		// Tolerate absent operands: the http-header-validation scenario calls the
+		// alphabetically first tool with no arguments and expects a result.
+		const a = ("a" in args && args["a"].type == Json.Type.int_) ? args["a"].get!int : 0;
+		const b = ("b" in args && args["b"].type == Json.Type.int_) ? args["b"].get!int : 0;
 		CallToolResult r;
 		r.content = [Content.makeText((a + b).to!string)];
 		return r;
@@ -291,7 +323,7 @@ private void registerPromptFixtures(McpServer server) @safe
 /// Streaming fixtures: progress, logging, sampling, elicitation.
 private void registerStreamingFixtures(McpServer server) @safe
 {
-	import core.time : msecs;
+	import core.time : Duration, msecs;
 	import vibe.core.core : sleep;
 	import std.typecons : nullable, Nullable;
 
@@ -485,4 +517,535 @@ private CallToolResult elicitationResultText(Json result) @safe
 				"Elicitation completed: action=" ~ action ~ ", content=" ~ content.toString())
 	];
 	return r;
+}
+
+// ===========================================================================
+// 2026-07-28 (modern) fixtures: server-stateless, http header validation,
+// JSON Schema 2020-12 preservation.
+// ===========================================================================
+
+private CallToolResult textResult(string text) @safe
+{
+	CallToolResult r;
+	r.content = [Content.makeText(text)];
+	return r;
+}
+
+/// Tools the `server-stateless`, `http-header-validation`,
+/// `http-custom-header-server-validation`, and `json-schema-2020-12` scenarios
+/// name.
+private void registerModernFixtures(McpServer server) @safe
+{
+	import vibe.data.json : parseJsonString;
+
+	// server-stateless: a tool that requires the `sampling` client capability, so a
+	// call whose _meta declares none is -32021 with data.requiredCapabilities.
+	Tool missingCap = {
+		name: "test_missing_capability", description: nullable(
+				"Requires the sampling client capability")
+	};
+	server.registerTool(missingCap, (Json args) @safe => textResult("capability present"));
+	ClientCapabilities needsSampling;
+	needsSampling.sampling = true;
+	server.setToolRequiredClientCapabilities("test_missing_capability", needsSampling);
+
+	// server-stateless: an elicitation that MUST travel as an InputRequiredResult
+	// (MRTR), never as a server->client request on the response stream.
+	Tool streamingElicit = {
+		name: "test_streaming_elicitation", description: nullable("Asks for confirmation via MRTR")
+	};
+	server.registerTool(streamingElicit, (Json args, RequestContext ctx) @safe {
+		if ("answer" in ctx.inputResponses())
+			return ToolResponse.complete(textResult("confirmed"));
+		return ToolResponse.inputRequired([
+			InputRequest.elicitation("answer", "Please confirm")
+		]);
+	});
+
+	// server-stateless: logs during execution; on a modern request that set no
+	// _meta logLevel the server MUST NOT emit notifications/message.
+	Tool loggingTool = {
+		name: "test_logging_tool", description: nullable("Logs while it runs")
+	};
+	server.registerTool(loggingTool, (Json args, RequestContext ctx) @safe {
+		ctx.log("info", Json("test_logging_tool ran"));
+		return textResult("logged");
+	});
+
+	// server-stateless: mutate the tool / prompt lists so a subscriptions/listen
+	// stream opted into the matching list-changed type receives the notification.
+	Tool triggerTool = {
+		name: "test_trigger_tool_change", description: nullable("Adds or removes test_dynamic_tool")
+	};
+	server.registerTool(triggerTool, (Json args) @safe {
+		if (!server.removeTool("test_dynamic_tool"))
+		{
+			Tool dynamic = {
+				name: "test_dynamic_tool", description: nullable("Appears and disappears")
+			};
+			server.registerTool(dynamic, (Json) @safe => textResult("dynamic"));
+		}
+		server.notifyToolsListChanged();
+		return textResult("tool list changed");
+	});
+	Tool triggerPrompt = {
+		name: "test_trigger_prompt_change", description: nullable(
+				"Adds or removes test_dynamic_prompt")
+	};
+	server.registerTool(triggerPrompt, (Json args) @safe {
+		if (!server.removePrompt("test_dynamic_prompt"))
+		{
+			Prompt dynamic = {
+				name: "test_dynamic_prompt", description: nullable("Appears and disappears")
+			};
+			server.registerPrompt(dynamic, (Json) @safe {
+				GetPromptResult r;
+				r.messages = [
+					PromptMessage("user", Content.makeText("dynamic"))
+				];
+				return r;
+			});
+		}
+		server.notifyPromptsListChanged();
+		return textResult("prompt list changed");
+	});
+
+	// http-custom-header-server-validation: the only tool with an x-mcp-header
+	// annotation, on a string property.
+	Tool customHeader = {
+		name: "test_custom_header_tool", description: nullable("Mirrors its tenant argument into Mcp-Param-Tenant"),
+		inputSchema: parseJsonString(`{"type":"object","properties":{`
+					~ `"tenant":{"type":"string","x-mcp-header":"Tenant"}}}`)
+	};
+	server.registerTool(customHeader, (Json args) @safe {
+		const tenant = ("tenant" in args && args["tenant"].type == Json.Type.string) ? args["tenant"]
+			.get!string : "";
+		return textResult("tenant: " ~ tenant);
+	});
+
+	// json-schema-2020-12: the inputSchema must reach tools/list verbatim, every
+	// 2020-12 keyword intact. The tool is listed, never called.
+	Tool schemaTool = {
+		name: "json_schema_2020_12_tool", description: nullable(
+				"Tool with JSON Schema 2020-12 features"), inputSchema: parseJsonString(`{
+			"$schema": "https://json-schema.org/draft/2020-12/schema",
+			"type": "object",
+			"$defs": {"address": {"$anchor": "addressDef", "type": "object",
+				"properties": {"street": {"type": "string"}, "city": {"type": "string"}}}},
+			"properties": {
+				"name": {"type": "string"},
+				"address": {"$ref": "#/$defs/address"},
+				"contactMethod": {"type": "string", "enum": ["phone", "email"]},
+				"phone": {"type": "string"},
+				"email": {"type": "string"}
+			},
+			"allOf": [{"anyOf": [{"required": ["phone"]}, {"required": ["email"]}]}],
+			"if": {"properties": {"contactMethod": {"const": "phone"}}, "required": ["contactMethod"]},
+			"then": {"required": ["phone"]},
+			"else": {"required": ["email"]},
+			"additionalProperties": false
+		}`)
+	};
+	server.registerTool(schemaTool, (Json args) @safe => textResult("schema ok"));
+}
+
+// ===========================================================================
+// SEP-2322 (MRTR) fixtures: the input-required-result-* scenarios.
+// ===========================================================================
+
+/// Sign a request-state payload so a tampered echo is detected: the wire value
+/// is `base64(payload) "." hmac-sha256-hex`. The harness appends a suffix to the
+/// echoed state and expects the retry to be rejected.
+private string signState(string payload) @safe
+{
+	import std.base64 : Base64;
+	import std.digest.hmac : hmac;
+	import std.digest.sha : SHA256;
+	import std.digest : toHexString, LetterCase;
+	import std.string : representation;
+
+	auto mac = hmac!SHA256("conformance-fixture-secret".representation);
+	mac.put(payload.representation);
+	return Base64.encode(payload.representation)
+		.idup ~ "." ~ toHexString!(LetterCase.lower)(mac.finish()).idup;
+}
+
+/// The payload of a state produced by `signState`, or throw -32602 when the
+/// value is absent, malformed, or fails its signature.
+private string verifyState(string state) @safe
+{
+	import std.base64 : Base64;
+	import std.string : lastIndexOf;
+
+	const dot = state.lastIndexOf('.');
+	if (dot <= 0)
+		throw invalidParams("requestState is malformed");
+	string payload;
+	try
+		payload = () @trusted { return cast(string) Base64.decode(state[0 .. dot]); }();
+	catch (Exception)
+		throw invalidParams("requestState is malformed");
+	if (signState(payload) != state)
+		throw invalidParams("requestState failed integrity verification");
+	return payload;
+}
+
+private Json elicitSchema(string field, string type) @safe
+{
+	Json props = Json.emptyObject;
+	props[field] = Json(["type": Json(type)]);
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	schema["properties"] = props;
+	schema["required"] = Json([Json(field)]);
+	return schema;
+}
+
+private InputRequest samplingRequest(string id, string prompt, int maxTokens) @safe
+{
+	Json msg = Json.emptyObject;
+	msg["role"] = "user";
+	msg["content"] = Json(["type": Json("text"), "text": Json(prompt)]);
+	Json params = Json.emptyObject;
+	params["messages"] = Json([msg]);
+	params["maxTokens"] = maxTokens;
+	return InputRequest(id, "sampling", params);
+}
+
+/// The `content.<field>` string of an accepted elicitation answer, or throw
+/// -32602 when the answer is not a well-formed ElicitResult (validate-input).
+private string acceptedText(Json answer, string field) @safe
+{
+	if (answer.type != Json.Type.object || "action" !in answer
+			|| answer["action"].type != Json.Type.string)
+		throw invalidParams("inputResponses entry is not an ElicitResult");
+	if ("content" in answer && answer["content"].type == Json.Type.object
+			&& field in answer["content"] && answer["content"][field].type == Json.Type.string)
+		return answer["content"][field].get!string;
+	return "";
+}
+
+private void registerMrtrFixtures(McpServer server) @safe
+{
+	Tool elicit = {
+		name: "test_input_required_result_elicitation", description: nullable(
+				"Asks for the user's name via MRTR")
+	};
+	server.registerTool(elicit, (Json args, RequestContext ctx) @safe {
+		auto answers = ctx.inputResponses();
+		if ("user_name" !in answers)
+			return ToolResponse.inputRequired([
+			InputRequest.elicitation("user_name", "What is your name?",
+				elicitSchema("name", "string"))
+		]);
+		return ToolResponse.complete(textResult("Hello, " ~ acceptedText(answers["user_name"],
+			"name") ~ "!"));
+	});
+
+	Tool sampling = {
+		name: "test_input_required_result_sampling", description: nullable(
+				"Asks the client's model a question via MRTR")
+	};
+	server.registerTool(sampling, (Json args, RequestContext ctx) @safe {
+		auto answers = ctx.inputResponses();
+		if ("capital_question" !in answers)
+			return ToolResponse.inputRequired([
+			samplingRequest("capital_question", "What is the capital of France?", 100)
+		]);
+		auto a = answers["capital_question"];
+		const text = (a.type == Json.Type.object && "content" in a
+			&& a["content"].type == Json.Type.object && "text" in a["content"]) ? a["content"]["text"]
+			.get!string : "";
+		return ToolResponse.complete(textResult("Model said: " ~ text));
+	});
+
+	Tool roots = {
+		name: "test_input_required_result_list_roots", description: nullable(
+				"Asks for the client's roots via MRTR")
+	};
+	server.registerTool(roots, (Json args, RequestContext ctx) @safe {
+		auto answers = ctx.inputResponses();
+		if ("client_roots" !in answers)
+			return ToolResponse.inputRequired([
+			InputRequest.roots("client_roots")
+		]);
+		auto a = answers["client_roots"];
+		const n = (a.type == Json.Type.object && "roots" in a && a["roots"].type == Json.Type.array) ? a["roots"]
+			.length : 0;
+		import std.conv : to;
+
+		return ToolResponse.complete(textResult("roots: " ~ n.to!string));
+	});
+
+	Tool state = {
+		name: "test_input_required_result_request_state", description: nullable(
+				"Round-trips a signed requestState")
+	};
+	server.registerTool(state, (Json args, RequestContext ctx) @safe {
+		auto answers = ctx.inputResponses();
+		if ("confirm" !in answers)
+			return ToolResponse.inputRequired([
+			InputRequest.elicitation("confirm", "Please confirm", elicitSchema("ok", "boolean"))
+		], signState("request-state"));
+		verifyState(ctx.requestState());
+		return ToolResponse.complete(textResult("state-ok"));
+	});
+
+	Tool multiple = {
+		name: "test_input_required_result_multiple_inputs", description: nullable(
+				"Asks for three inputs at once via MRTR")
+	};
+	server.registerTool(multiple, (Json args, RequestContext ctx) @safe {
+		auto answers = ctx.inputResponses();
+		if ("user_name" !in answers || "greeting" !in answers || "client_roots" !in answers)
+			return ToolResponse.inputRequired([
+			InputRequest.elicitation("user_name", "What is your name?",
+				elicitSchema("name", "string")),
+			samplingRequest("greeting", "Generate a greeting", 50),
+			InputRequest.roots("client_roots")
+		], signState("multiple"));
+		verifyState(ctx.requestState());
+		return ToolResponse.complete(textResult("all inputs received"));
+	});
+
+	Tool multiRound = {
+		name: "test_input_required_result_multi_round", description: nullable(
+				"Two sequential MRTR rounds with distinct requestState")
+	};
+	server.registerTool(multiRound, (Json args, RequestContext ctx) @safe {
+		import std.algorithm : startsWith;
+
+		// Each retry carries only the answers to the previous round's requests, so
+		// the round is tracked in the signed requestState: round 1 asks step1 and
+		// stores the name in the state for round 2, which asks step2.
+		auto answers = ctx.inputResponses();
+		const state = ctx.requestState();
+		if (state.length == 0)
+		{
+			if ("step1" in answers)
+				throw invalidParams("a step1 answer requires the round-1 requestState");
+			return ToolResponse.inputRequired([
+				InputRequest.elicitation("step1", "Step 1: What is your name?",
+					elicitSchema("name", "string"))
+			], signState("round-1"));
+		}
+		const payload = verifyState(state);
+		if (payload == "round-1")
+		{
+			if ("step1" !in answers)
+				throw invalidParams("round 2 requires the step1 answer");
+			return ToolResponse.inputRequired([
+				InputRequest.elicitation("step2", "Step 2: What is your favorite color?",
+					elicitSchema("color", "string"))
+			], signState("round-2:" ~ acceptedText(answers["step1"], "name")));
+		}
+		if (!payload.startsWith("round-2:") || "step2" !in answers)
+			throw invalidParams("round 3 requires the step2 answer");
+		return ToolResponse.complete(textResult(
+			"Hello, " ~ payload["round-2:".length .. $] ~ "; your favorite color is " ~ acceptedText(
+			answers["step2"], "color")));
+	});
+
+	Tool tampered = {
+		name: "test_input_required_result_tampered_state", description: nullable(
+				"Rejects a modified requestState")
+	};
+	server.registerTool(tampered, (Json args, RequestContext ctx) @safe {
+		auto answers = ctx.inputResponses();
+		if ("confirm" !in answers)
+			return ToolResponse.inputRequired([
+			InputRequest.elicitation("confirm", "Please confirm", elicitSchema("ok", "boolean"))
+		], signState("tamper-check"));
+		verifyState(ctx.requestState()); // throws -32602 on any modification
+		return ToolResponse.complete(textResult("state intact"));
+	});
+
+	Tool caps = {
+		name: "test_input_required_result_capabilities", description: nullable(
+				"Requests only the inputs the client can answer")
+	};
+	server.registerTool(caps, (Json args, RequestContext ctx) @safe {
+		auto answers = ctx.inputResponses();
+		InputRequest[] wanted;
+		if (ctx.clientSupports(ClientCapability.elicitation) && "user_name" !in answers)
+			wanted ~= InputRequest.elicitation("user_name",
+				"What is your name?", elicitSchema("name", "string"));
+		if (ctx.clientSupports(ClientCapability.sampling) && "greeting" !in answers)
+			wanted ~= samplingRequest("greeting", "Generate a greeting", 50);
+		if (ctx.clientSupports(ClientCapability.roots) && "client_roots" !in answers)
+			wanted ~= InputRequest.roots("client_roots");
+		if (wanted.length)
+			return ToolResponse.inputRequired(wanted);
+		return ToolResponse.complete(textResult("inputs satisfied"));
+	});
+
+	// non-tool-request: prompts/get may also answer with an InputRequiredResult.
+	Prompt prompt = {
+		name: "test_input_required_result_prompt", description: nullable(
+				"A prompt that asks for its context via MRTR")
+	};
+	server.registerPrompt(prompt, (Json args, RequestContext ctx) @safe {
+		auto answers = ctx.inputResponses();
+		if ("user_context" !in answers)
+			return PromptResponse.inputRequired([
+			InputRequest.elicitation("user_context",
+				"What context should the prompt use?", elicitSchema("context", "string"))
+		]);
+		GetPromptResult r;
+		r.messages = [
+			PromptMessage("user",
+				Content.makeText("Context: " ~ acceptedText(answers["user_context"], "context")))
+		];
+		return PromptResponse.complete(r);
+	});
+}
+
+// ===========================================================================
+// SEP-2663 (Tasks extension) fixtures: the tasks-* scenarios.
+// ===========================================================================
+
+private Json taskText(string text, bool isError = false) @safe
+{
+	Json r = Json.emptyObject;
+	r["content"] = Json([Json(["type": Json("text"), "text": Json(text)])]);
+	if (isError)
+		r["isError"] = true;
+	return r;
+}
+
+private void registerTaskFixtures(McpServer server) @safe
+{
+	import core.time : Duration, msecs;
+	import std.conv : to;
+	import std.typecons : Nullable;
+	import vibe.core.core : sleep;
+	import vibe.data.json : parseJsonString;
+
+	// greet: sync-only; a task-capable client still gets a plain result.
+	Tool greet = {
+		name: "greet", description: nullable("Greets by name"), inputSchema: parseJsonString(
+				`{"type":"object","properties":{"name":{"type":"string"}}}`)
+	};
+	server.registerTool(greet, (Json args) @safe {
+		const name = ("name" in args && args["name"].type == Json.Type.string) ? args["name"]
+			.get!string : "world";
+		return textResult("Hello, " ~ name ~ "!");
+	});
+
+	// slow_compute: sleeps `seconds`, polling for cancellation so a tasks/cancel
+	// while running settles the task as cancelled rather than completed.
+	Tool slow = {
+		name: "slow_compute", description: nullable("Sleeps then returns"), inputSchema: parseJsonString(
+				`{"type":"object","properties":{"seconds":{"type":"integer"}}}`)
+	};
+	server.registerTaskTool(slow, (TaskContext tc) @safe {
+		auto input = tc.inputJson();
+		const secs = (input.type == Json.Type.object && "seconds" in input
+			&& input["seconds"].type == Json.Type.int_) ? input["seconds"].get!int : 0;
+		foreach (i; 0 .. secs * 10)
+		{
+			if (tc.cancelRequested())
+				return Json.emptyObject; // the runner marks the task cancelled
+			sleep(100.msecs);
+		}
+		return taskText("computed after " ~ secs.to!string ~ "s");
+	});
+
+	// failing_job: a tool execution error (completed + isError), after ~1s. It
+	// requires the extension, so a client without it is answered with -32021.
+	Tool failing = {
+		name: "failing_job", description: nullable("Always fails as a tool error")
+	};
+	server.registerTaskTool(failing, (TaskContext tc) @safe {
+		sleep(1000.msecs);
+		return taskText("the job failed", true);
+	}, Nullable!Duration.init, Nullable!Duration.init, TaskSupport.required);
+
+	// protocol_error_job: a protocol-level failure (status failed + error).
+	Tool protoErr = {
+		name: "protocol_error_job", description: nullable("Fails with a protocol error")
+	};
+	server.registerTaskTool(protoErr, (TaskContext tc) @safe {
+		throw new McpException(ErrorCode.internalError, "protocol_error_job exploded");
+		return Json.emptyObject;
+	});
+
+	// confirm_delete: parks for one elicitation, resumes on tasks/update.
+	Tool confirm = {
+		name: "confirm_delete", description: nullable("Asks for confirmation before deleting")
+	};
+	server.registerTaskTool(confirm, (TaskContext tc) @safe {
+		if (!tc.hasInput("confirm"))
+			return tc.requireInput([
+			InputRequest.elicitation("confirm", "Confirm deletion?",
+				elicitSchema("ok", "boolean"))
+		]);
+		return taskText("deleted");
+	});
+
+	// multi_input: two simultaneous inputs; answering one at a time leaves only
+	// the unanswered key outstanding.
+	Tool multi = {name: "multi_input", description: nullable("Needs two inputs")};
+	server.registerTaskTool(multi, (TaskContext tc) @safe {
+		InputRequest[] missing;
+		if (!tc.hasInput("first"))
+			missing ~= InputRequest.elicitation("first", "First input?",
+				elicitSchema("value", "string"));
+		if (!tc.hasInput("second"))
+			missing ~= InputRequest.elicitation("second", "Second input?",
+				elicitSchema("value", "string"));
+		if (missing.length)
+			return tc.requireInput(missing);
+		return taskText("both inputs received");
+	});
+
+	// test_tool_with_task: an MRTR round gathers user_name, then the final round
+	// escalates to a task whose result carries the gathered name.
+	server.registerTaskExecutor("test_tool_with_task", (TaskContext tc) @safe {
+		auto input = tc.inputJson();
+		const name = (input.type == Json.Type.object && "user_name" in input
+			&& input["user_name"].type == Json.Type.string) ? input["user_name"].get!string : "";
+		return taskText("Hello, " ~ name ~ "! (from the task)");
+	});
+	Tool composed = {
+		name: "test_tool_with_task", description: nullable(
+				"Gathers a name via MRTR, then runs as a task")
+	};
+	server.registerTool(composed, (Json args, RequestContext ctx) @safe {
+		auto answers = ctx.inputResponses();
+		if ("user_name" !in answers)
+			return ToolResponse.inputRequired([
+			InputRequest.elicitation("user_name", "What is your name?",
+				elicitSchema("name", "string"))
+		]);
+		Json input = Json.emptyObject;
+		input["user_name"] = acceptedText(answers["user_name"], "name");
+		return server.startTask("test_tool_with_task", input, ctx);
+	});
+	server.setToolTaskSupport("test_tool_with_task", TaskSupport.required);
+}
+
+// ===========================================================================
+// SEP-2640 (Skills extension) fixtures: the sep-2640-skills-* scenarios.
+// ===========================================================================
+
+/// One static skill with a supporting file in a subdirectory (so a directory
+/// read sees both a file and a subdirectory child) and one dynamic skill, all
+/// published through skills/list and skills/get.
+private void registerSkillFixtures(McpServer server) @safe
+{
+	Skill pdf = {
+		path: "office/pdf-forms", description: "Fill in PDF forms using the field reference", instructions: "# PDF Forms\n\nConsult `references/FORMS.md`, then fill each field.\n",
+		metadata: ["version": "1.0.0"], files: [
+				SkillFile("references/FORMS.md", "text/markdown",
+						"# Form fields\n\n- applicant_name\n")
+		]
+	};
+	registerSkill(server, pdf);
+
+	DynamicSkill daily = {
+		path: "reports/daily", description: "Assemble today's operational report",
+		instructions: () @safe => "# Daily report\n\nGenerated on demand.\n"
+	};
+	registerDynamicSkill(server, daily);
 }

@@ -24,8 +24,8 @@
  *   6. resources/directory/read scope-lists the release-helper tree: files plus
  *      subdirectories (marked inode/directory), descended one level at a time.
  *
- * The example calls the draft-only server/discover, so the client enables the
- * draft protocol (`enableModern`) up front. The skills extension itself
+ * The example calls the modern-only server/discover, so the client enables the
+ * modern protocol (`enableModern`) up front. The skills extension itself
  * negotiates from 2025-11-25 (the stable spec is written against 2026-07-28,
  * where its results carry ttlMs/cacheScope); the resource reads work on any
  * protocol version.
@@ -48,7 +48,7 @@ int main(string[] args) @safe
 		scope (exit)
 			client.close();
 
-		// server/discover (used below) exists only on the draft protocol, so
+		// server/discover (used below) exists only on the modern protocol, so
 		// negotiate it. The skills extension itself is visible from 2025-11-25.
 		client.enableModern();
 
@@ -64,7 +64,7 @@ int main(string[] args) @safe
 			"the skills capability should advertise directoryRead");
 
 		auto negotiated = client.connect();
-		checkEq(negotiated, ProtocolVersion.modern, "connect() should negotiate draft");
+		checkEq(negotiated, ProtocolVersion.v2026_07_28, "connect() should negotiate 2026-07-28");
 
 		// --- 2. listSkills(): skills/list enumerates every registered skill ---
 		// The raw result carries the CacheableResult fields the stable spec

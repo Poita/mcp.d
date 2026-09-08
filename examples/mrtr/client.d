@@ -97,7 +97,7 @@ int main(string[] args) @safe
 /// function runs over stdio and HTTP.
 private int runE2E(McpClient client) @safe
 {
-	// Stateless draft (2026-07-28): MRTR is the input mechanism. Every request
+	// Stateless 2026-07-28: MRTR is the input mechanism. Every request
 	// carries per-request `_meta`.
 	client.enableModern();
 
@@ -111,7 +111,7 @@ private int runE2E(McpClient client) @safe
 	client.capabilities.elicitationForm = true;
 	client.capabilities.sampling = true;
 
-	// ---- discovery: the server advertises the draft version + its identity ----
+	// ---- discovery: the server advertises the modern version + its identity ----
 	auto disc = client.discover();
 	check(disc.serverInfo.name == "mrtr-example",
 			"server name: expected 'mrtr-example', got '" ~ disc.serverInfo.name ~ "'");

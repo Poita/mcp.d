@@ -1,7 +1,7 @@
 /// End-to-end coverage for the `HttpClientTransport` SSE/streaming flows that the
 /// modern POST-and-await round-trip (see `mcp.transport.peer_roundtrip_test`) does
 /// not exercise: the legacy 2024-11-05 HTTP+SSE two-endpoint fallback, the
-/// standalone server->client GET SSE stream, the draft `subscriptions/listen`
+/// standalone server->client GET SSE stream, the modern `subscriptions/listen`
 /// stream, and Last-Event-ID resumption of a dropped POST response stream.
 ///
 /// Each test drives a real `McpClient.http` against a real HTTP server over a
@@ -14,8 +14,8 @@
 ///   - Legacy HTTP+SSE two-endpoint transport is the 2024-11-05 transport.
 ///   - The standalone GET SSE stream and Last-Event-ID resumability exist in the
 ///     Streamable HTTP revisions 2025-03-26 / 2025-06-18 / 2025-11-25, and were
-///     REMOVED in the draft/modern (2026-07-28) redesign.
-///   - `subscriptions/listen` is a draft/modern feature; it does not exist before.
+///     REMOVED in the modern (2026-07-28) redesign.
+///   - `subscriptions/listen` is a modern feature; it does not exist before.
 module mcp.client.http_streaming_test;
 
 version (unittest)
@@ -127,7 +127,7 @@ unittest
 // broadcast notification (`notifications/tools/list_changed`) must arrive on that
 // stream and reach the client's inbound `onNotification` handler. This stream is a
 // stable-revision feature gated by `getOpensSseStream` (2025-03-26 / 2025-06-18 /
-// 2025-11-25) and requires a stateful server; the draft removed it.
+// 2025-11-25) and requires a stateful server; 2026-07-28 removed it.
 unittest
 {
 	// `getOpensSseStream` requires a stateful server: a stateless one answers the
@@ -189,12 +189,12 @@ unittest
 			"client never received the server-initiated notification on the standalone GET stream");
 }
 
-// Draft `subscriptions/listen` stream (draft/modern, 2026-07-28): the client POSTs
+// Modern `subscriptions/listen` stream (modern, 2026-07-28): the client POSTs
 // `subscriptions/listen`, the server upgrades the response to a long-lived SSE
 // stream whose FIRST event is `notifications/subscriptions/acknowledged`, and
 // every subsequent opted-in change notification streams down the SAME response.
 // Both must reach the client's `onNotification`. This RPC does not exist before
-// the draft, so the client negotiates draft via `connect()`. The draft transport
+// 2026-07-28, so the client negotiates modern via `connect()`. The modern transport
 // is stateless-only, so the server is stateless.
 unittest
 {
@@ -236,8 +236,8 @@ unittest
 					changed = true;
 			};
 
-			// Auto-negotiate: a draft-framed server/discover probe resolves to the
-			// modern (draft) revision, the only one that implements this RPC.
+			// Auto-negotiate: a modern-framed server/discover probe resolves to the
+			// modern (2026-07-28) revision, the only one that implements this RPC.
 			negotiated = client.connect();
 
 			SubscriptionFilter filter;
@@ -265,8 +265,8 @@ unittest
 	runEventLoop();
 
 	assert(failure.length == 0, "subscriptions/listen test failed: " ~ failure);
-	assert(negotiated == ProtocolVersion.modern,
-			"expected to negotiate the draft/modern revision for subscriptions/listen");
+	assert(negotiated == ProtocolVersion.v2026_07_28,
+			"expected to negotiate the modern revision for subscriptions/listen");
 	assert(acked,
 			"client never received the leading subscriptions/acknowledged event on the listen stream");
 	assert(changed, "client never received a change notification on the listen stream");
@@ -351,8 +351,8 @@ unittest
 // GET carrying `Last-Event-ID`; the server replays the response on that stream
 // (basic/transports §Resumability and Redelivery). Resumability exists only in the
 // stable Streamable HTTP revisions (2025-03-26 / 2025-06-18 / 2025-11-25) and was
-// removed in the draft; `postAndAwait` skips the GET resume when the negotiated
-// version is draft. Driven against a purpose-built fake server: the SDK's own
+// removed in 2026-07-28; `postAndAwait` skips the GET resume when the negotiated
+// version is modern. Driven against a purpose-built fake server: the SDK's own
 // server never drops a POST stream mid-response, so it cannot exercise this path.
 unittest
 {
@@ -433,7 +433,7 @@ unittest
 			scope (exit)
 				closeQuietly(client);
 
-			// A stable revision: the draft skips Last-Event-ID resume entirely.
+			// A stable revision: the modern skips Last-Event-ID resume entirely.
 			client.initialize("2025-11-25");
 			// The POST for this request is dropped mid-stream; the result can only
 			// arrive via the client's Last-Event-ID GET resume.
