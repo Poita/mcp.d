@@ -1804,33 +1804,27 @@ final class McpClient : ClientProtocol
 		return acc;
 	}
 
-	/// `skills/list` (SEP-2640): the skill entries the connected server publishes,
-	/// following pagination cursors to completion. Only valid against a server
-	/// that declared the `io.modelcontextprotocol/skills` extension; otherwise the
-	/// server answers -32601 (method not found). The result MAY be empty or
-	/// partial — per the SEP that is not proof the server has no skills. Not
-	/// cached: the SEP attaches no caching attributes to this method on the
-	/// protocol versions this SDK implements, and the per-entry `resources`
-	/// digests already give hosts a content-level caching signal.
+	/// `skills/list` (Skills extension): the skill entries the connected server
+	/// publishes, following pagination cursors to completion. Only valid against
+	/// a server that declared the `io.modelcontextprotocol/skills` extension;
+	/// otherwise the server answers -32601 (method not found). The result MAY be
+	/// empty or partial — per the extension that is not proof the server has no
+	/// skills. `cache` carries the first page's `ttlMs`/`cacheScope` (a modern
+	/// server always sends them); the listing is not served from the response
+	/// cache, since the per-entry digests are the signal hosts act on.
 	ListSkillsResult skillsList() @safe
 	{
-		ListSkillsResult acc;
-		paginate((Nullable!string cursor) @safe {
-			Json p = Json.emptyObject;
-			if (!cursor.isNull)
-				p["cursor"] = cursor.get;
-			auto res = ListSkillsResult.fromJson(rpc("skills/list", p));
-			acc.skills ~= res.skills;
-			return res.nextCursor;
-		});
-		acc.nextCursor = Nullable!string.init;
-		return acc;
+		return drainList!ListSkillsResult("skills/list", (ref ListSkillsResult a,
+				ref ListSkillsResult r) @safe { a.skills ~= r.skills; });
 	}
 
-	/// `skills/get` (SEP-2640): the entry for the single skill whose `SKILL.md`
-	/// URI is `uri`, whether or not any listing mentioned it. The server answers
-	/// -32602 (Invalid params) for a URI it does not serve as a skill. Not cached:
-	/// the point of the call is a fresh snapshot of the skill's digests.
+	/// `skills/get` (Skills extension): the entry for the single skill whose
+	/// `SKILL.md` URI is `uri`, whether or not any listing mentioned it. The
+	/// server answers -32602 (Invalid params) for a URI it does not serve as a
+	/// skill. `cache` carries the server's `ttlMs`/`cacheScope` (a modern server
+	/// always sends them): how long the entry may be treated as current before
+	/// re-calling. Never served from the response cache: the point of the call is
+	/// a fresh snapshot of the skill's digests.
 	GetSkillResult skillsGet(string uri) @safe
 	{
 		Json p = Json.emptyObject;
@@ -5948,8 +5942,34 @@ unittest  // skillsList drains pagination into a single result
 	assert(res.nextCursor.isNull);
 }
 
-unittest  // skillsGet sends the uri and returns the entry
+unittest  // skillsList carries the first page's ttlMs/cacheScope on the drained result
 {
+	import mcp.protocol.modern : CacheScope;
+
+	auto c = McpClient.http("http://localhost");
+	int call;
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		r["skills"] = Json.emptyArray;
+		// Only the first page's hint is kept; a later page's differing hint is ignored.
+		r["ttlMs"] = call == 0 ? 300_000 : 1;
+		r["cacheScope"] = call == 0 ? "private" : "public";
+		if (call == 0)
+			r["nextCursor"] = "p2";
+		call++;
+		return r;
+	};
+
+	auto res = c.skillsList();
+	assert(!res.cache.isNull);
+	assert(res.cache.get.ttl.total!"msecs" == 300_000);
+	assert(res.cache.get.cacheScope == CacheScope.private_);
+}
+
+unittest  // skillsGet sends the uri and returns the entry with its caching attributes
+{
+	import mcp.protocol.modern : CacheScope;
+
 	auto c = McpClient.http("http://localhost");
 	c.onRpcForTest = (string method, Json params) @safe {
 		assert(method == "skills/get");
@@ -5957,10 +5977,26 @@ unittest  // skillsGet sends the uri and returns the entry
 		e["uri"] = params["uri"];
 		Json r = Json.emptyObject;
 		r["skill"] = e;
+		r["ttlMs"] = 60_000;
+		r["cacheScope"] = "public";
 		return r;
 	};
 	auto res = c.skillsGet("skill://a/SKILL.md");
 	assert(res.skill["uri"].get!string == "skill://a/SKILL.md");
+	assert(!res.cache.isNull);
+	assert(res.cache.get.ttl.total!"msecs" == 60_000);
+	assert(res.cache.get.cacheScope == CacheScope.public_);
+}
+
+unittest  // skillsGet against a 2025-11-25 server leaves the cache hint unset
+{
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		r["skill"] = Json.emptyObject;
+		return r;
+	};
+	assert(c.skillsGet("skill://a/SKILL.md").cache.isNull);
 }
 
 unittest  // listTools throws (rather than looping) when the server never advances the cursor

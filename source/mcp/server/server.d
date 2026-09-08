@@ -1553,8 +1553,12 @@ final class McpServer : ServerCore
 		ServerCapabilities caps;
 		if (tools.length > 0 || toolListChangedEnabled)
 			caps.tools = ListChangedCapability(toolListChangedEnabled);
+		// A server declaring the Skills extension serves skill files through
+		// resources/read, so it declares `resources` even before its first skill
+		// (and so its first resource) is registered.
+		const skillsEnabled = skillIndex_ !is null && skillIndex_.enabled;
 		if (resources.length > 0 || templates.length > 0
-				|| effectiveResourceSubscriptions() || resourcesListChangedEnabled)
+				|| effectiveResourceSubscriptions() || resourcesListChangedEnabled || skillsEnabled)
 			caps.resources = ResourcesCapability(effectiveResourceSubscriptions(),
 					resourcesListChangedEnabled);
 		if (prompts.length > 0 || promptsListChangedEnabled)
@@ -2019,14 +2023,19 @@ final class McpServer : ServerCore
 	/// Configure the draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`)
 	/// emitted on a specific cacheable result when speaking the draft protocol.
 	/// `listMethod` MUST be one of `tools/list`, `resources/list`,
-	/// `resources/templates/list`, `prompts/list`, or `server/discover`
-	/// (`DiscoverResult extends CacheableResult` in the draft schema). Per-resource
+	/// `resources/templates/list`, `prompts/list`, `server/discover`
+	/// (`DiscoverResult extends CacheableResult` in the draft schema), or the
+	/// Skills extension's `skills/list` and `skills/get` (both extend
+	/// `CacheableResult`; for `skills/get` the hint says how long a host may
+	/// treat one skill's entry as current before re-fetching it). Per-resource
 	/// and per-template hints are supplied at registration time instead.
 	void setListCacheHint(string listMethod, CacheHint hint) @safe
 	{
 		if (listMethod != "tools/list" && listMethod != "resources/list"
 				&& listMethod != "resources/templates/list"
-				&& listMethod != "prompts/list" && listMethod != "server/discover")
+				&& listMethod != "prompts/list"
+				&& listMethod != "server/discover"
+				&& listMethod != "skills/list" && listMethod != "skills/get")
 			throw new Exception("setListCacheHint: unknown list method '" ~ listMethod ~ "'");
 		listCacheHints[listMethod] = nullable(hint);
 	}
@@ -2315,7 +2324,7 @@ final class McpServer : ServerCore
 			// answers -32601 (method not found).
 			if (ver < ProtocolVersion.v2025_11_25 || skillIndex_ is null || !skillIndex_.enabled)
 				throw methodNotFound(method);
-			return method == "skills/list" ? doListSkills(params) : doGetSkill(params);
+			return method == "skills/list" ? doListSkills(params, ver) : doGetSkill(params, ver);
 		case "resources/subscribe":
 			// The draft has no resources/subscribe RPC; subscriptions/listen takes
 			// its place (the ListenFilter "Replaces the former
@@ -2764,8 +2773,8 @@ final class McpServer : ServerCore
 		{
 			Json data = Json.emptyObject;
 			data["uri"] = dir;
-			throw new McpException(ErrorCode.invalidParams, "Not a directory resource: " ~ dir,
-					data);
+			throw new McpException(ErrorCode.invalidParams,
+					dir ~ " is not a directory resource", data);
 		}
 
 		sort!((a, b) => a.uri < b.uri)(children);
@@ -2773,14 +2782,14 @@ final class McpServer : ServerCore
 				children, (Resource r) => r, params, ver);
 	}
 
-	/// Serve `skills/list` (SEP-2640): the registered skill entries in
+	/// Serve `skills/list` (Skills extension): the registered skill entries in
 	/// registration order, paginated like the base `*/list` methods. Entries are
-	/// atomic — a skill's `resources` manifest is never split across pages.
-	/// Deliberately NOT routed through `paginatedList`/`maybeCache`: entries are
-	/// raw extension-defined Json (no `forVersion` projection), and SEP-2549
-	/// list-caching attributes apply to this method only from protocol
-	/// 2026-07-28, which this SDK does not implement yet.
-	private Json doListSkills(Json params) @safe
+	/// atomic — a skill's `resources` manifest is never split across pages. Not
+	/// routed through `paginatedList` because entries are raw extension-defined
+	/// Json with no `forVersion` projection, but it shares `maybeCache`: the
+	/// result extends `CacheableResult`, so a modern session gets the required
+	/// `ttlMs`/`cacheScope` (configured via `setListCacheHint("skills/list")`).
+	private Json doListSkills(Json params, ProtocolVersion ver) @safe
 	{
 		size_t begin, end;
 		Nullable!string next;
@@ -2790,14 +2799,16 @@ final class McpServer : ServerCore
 		foreach (uri; skillIndex_.order[begin .. end])
 			result.skills ~= skillIndex_.byUri[uri];
 		result.nextCursor = next;
-		return result.toJson();
+		return maybeCache(result, listHint("skills/list"), ver);
 	}
 
-	/// Serve `skills/get` (SEP-2640): the entry for the single skill whose
-	/// `SKILL.md` URI is `params.uri`, answering for every skill this server
-	/// serves whether or not a listing mentioned it (this SDK lists everything it
-	/// serves, so the index is that complete record).
-	private Json doGetSkill(Json params) @safe
+	/// Serve `skills/get` (Skills extension): the entry for the single skill
+	/// whose `SKILL.md` URI is `params.uri`, answering for every skill this
+	/// server serves whether or not a listing mentioned it (this SDK lists
+	/// everything it serves, so the index is that complete record). The result
+	/// extends `CacheableResult`, so a modern session gets the required
+	/// `ttlMs`/`cacheScope` (configured via `setListCacheHint("skills/get")`).
+	private Json doGetSkill(Json params, ProtocolVersion ver) @safe
 	{
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("skills/get requires a string 'uri'");
@@ -2805,16 +2816,16 @@ final class McpServer : ServerCore
 		auto entry = uri in skillIndex_.byUri;
 		if (entry is null)
 		{
-			// SEP-2640 pins the miss to -32602 (Invalid params) on every protocol
-			// version, so this deliberately does NOT route through the
+			// The extension pins the miss to -32602 (Invalid params) on every
+			// protocol version, so this deliberately does NOT route through the
 			// version-dependent resourceNotFound helper (-32002 on 2025-11-25).
 			Json data = Json.emptyObject;
 			data["uri"] = uri;
-			throw new McpException(ErrorCode.invalidParams, "Unknown skill: " ~ uri, data);
+			throw new McpException(ErrorCode.invalidParams, "No skill is served at " ~ uri, data);
 		}
 		GetSkillResult result;
 		result.skill = *entry;
-		return result.toJson();
+		return maybeCache(result, listHint("skills/get"), ver);
 	}
 
 	private Json doSubscribe(Json params, ConnectionState conn) @safe

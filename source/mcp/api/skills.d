@@ -30,6 +30,17 @@ enum string skillMimeType = "text/markdown";
 /// descend into (rather than a file to read).
 enum string skillDirectoryMimeType = "inode/directory";
 
+/// The most `resources` entries a single skill may carry, `SKILL.md` included.
+/// The Skills extension fixes this so servers know what every conforming host
+/// accepts; a skill over the limit is not guaranteed to be loadable anywhere,
+/// so registration rejects it.
+enum size_t maxSkillResources = 512;
+
+/// The largest total file size a single skill may carry: the sum of `size` over
+/// its `resources` entries, `SKILL.md` included (16 MiB). Registration rejects
+/// a skill over the limit for the same reason as `maxSkillResources`.
+enum size_t maxSkillTotalBytes = 16 * 1024 * 1024;
+
 /// A supporting file shipped alongside a skill's `SKILL.md` (a reference doc,
 /// template, example, or asset). Served as a sibling resource at
 /// `skill://<skill-path>/<path>`; `path` is relative to the skill root and may
@@ -287,8 +298,11 @@ void registerSkill(McpServer server, Skill skill) @safe
 /// reads them from a local directory) funnel into: serve `skillMd` verbatim at
 /// `skill://<path>/SKILL.md`, serve each supporting file resource, and add the
 /// conformant skill entry — verbatim `frontmatter`, the `SKILL.md` `uri`, and
-/// the complete per-file `resources` manifest of `{uri, digest}` pairs (the
-/// `SKILL.md`'s own entry first) — for `skills/list` / `skills/get` to serve.
+/// the complete per-file `resources` manifest of `{uri, digest, size}` entries
+/// (the `SKILL.md`'s own entry first) — for `skills/list` / `skills/get` to
+/// serve. Rejects a skill over the extension's fixed limits (`maxSkillResources`
+/// entries, `maxSkillTotalBytes` bytes), which no conforming host is required to
+/// load.
 /// `frontmatter` is the entry's `frontmatter` object — for a directory skill
 /// the authored YAML parsed to JSON, for a `Skill` the synthesized
 /// `{name, description, metadata}`. Throws if `path` is not a valid skill path
@@ -297,6 +311,7 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 		string skillMd, Json frontmatter, SkillFile[] files) @safe
 {
 	import std.base64 : Base64;
+	import std.conv : to;
 
 	if (!isValidSkillPath(path))
 		throw new Exception("invalid skill path '" ~ path
@@ -310,16 +325,23 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 	if (uri in server.ensureSkillIndex().byUri)
 		throw new Exception("a skill at '" ~ uri ~ "' is already registered");
 
+	if (files.length + 1 > maxSkillResources)
+		throw new Exception("skill '" ~ path ~ "' has " ~ (files.length + 1)
+				.to!string ~ " resources (SKILL.md included); the Skills extension "
+				~ "allows at most " ~ maxSkillResources.to!string);
+
 	// Build the complete per-file resources manifest — SKILL.md's own {uri,
-	// digest} first, then every supporting file, each digesting the bytes it
-	// serves (a blob file's digest covers its decoded bytes, not the base64
-	// transport form). Doing this up front keeps every throw-capable step (URI
-	// collisions, undecodable base64) ahead of any server mutation, so a failed
-	// registration can always roll back cleanly.
+	// digest, size} first, then every supporting file, each digesting and
+	// measuring the bytes it serves (a blob file's digest and size cover its
+	// decoded bytes, not the base64 transport form). Doing this up front keeps
+	// every throw-capable step (URI collisions, undecodable base64, the total
+	// size limit) ahead of any server mutation, so a failed registration can
+	// always roll back cleanly.
 	bool[string] localUris;
 	localUris[uri] = true;
 	Json manifest = Json.emptyArray;
-	manifest ~= resourceRef(uri, skillDigest(cast(const(ubyte)[]) skillMd));
+	manifest ~= resourceRef(uri, skillDigest(cast(const(ubyte)[]) skillMd), skillMd.length);
+	size_t total = skillMd.length;
 	foreach (file; files)
 	{
 		const fu = skillFileUri(path, file.path);
@@ -327,10 +349,15 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 			throw new Exception("duplicate skill resource uri '" ~ fu
 					~ "' (a supporting file path collides with another file or with SKILL.md)");
 		localUris[fu] = true;
-		const digest = file.isBlob
-			? skillDigest(Base64.decode(file.content)) : skillDigest(
-					cast(const(ubyte)[]) file.content);
-		manifest ~= resourceRef(fu, digest);
+		const(ubyte)[] bytes = file.isBlob
+			? Base64.decode(file.content) : cast(const(ubyte)[]) file.content;
+		total += bytes.length;
+		if (total > maxSkillTotalBytes)
+			throw new Exception(
+					"skill '" ~ path ~ "' totals more than " ~ maxSkillTotalBytes.to!string
+					~ " bytes across its files; the Skills "
+					~ "extension allows at most 16 MiB per skill");
+		manifest ~= resourceRef(fu, skillDigest(bytes), bytes.length);
 	}
 
 	enableSkills(server);
@@ -377,12 +404,15 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 	addSkillEntry(server, entry);
 }
 
-/// One `{uri, digest}` element of a skill entry's `resources` manifest.
-private Json resourceRef(string uri, string digest) @safe
+/// One `{uri, digest, size}` element of a skill entry's `resources` manifest:
+/// the file's URI, the `sha256:` digest of its raw bytes, and the byte length
+/// those same bytes have.
+package(mcp) Json resourceRef(string uri, string digest, size_t size) @safe
 {
 	Json r = Json.emptyObject;
 	r["uri"] = uri;
 	r["digest"] = digest;
+	r["size"] = cast(long) size;
 	return r;
 }
 
@@ -392,6 +422,84 @@ private Json resourceRef(string uri, string digest) @safe
 void registerSkill(McpServer server, string path, string description, string instructions) @safe
 {
 	registerSkill(server, Skill(path, description, instructions));
+}
+
+/// A skill whose `SKILL.md` body is generated on each read, so no stable digest
+/// can be published for it: its entry carries `resources: "dynamic"` instead of
+/// a manifest. The frontmatter is fixed — synthesized from `path`'s final
+/// segment, `description`, and `metadata` exactly as for a `Skill` — so the
+/// entry's `frontmatter` stays identical to what every read returns; only the
+/// body varies. Register it with `registerDynamicSkill`.
+///
+/// A dynamic skill offers hosts no content integrity and cannot be
+/// content-bound to an approval, so some hosts decline to load one; prefer a
+/// static `Skill` whenever the content can be fixed at registration. Supporting
+/// files, if any, are registered separately with `McpServer.registerResource`
+/// under `skill://<path>/…`; hosts discover them via `resources/directory/read`.
+struct DynamicSkill
+{
+	/// The skill path; final segment is the skill name (see `Skill.path`).
+	string path;
+	string description; /// one-line description of when to use the skill
+	/// Produces the `SKILL.md` body (Markdown, without frontmatter) for one read.
+	string delegate() @safe instructions;
+	/// Optional extra frontmatter under `metadata:` (see `Skill.metadata`).
+	string[string] metadata;
+
+	/// The skill name: the final segment of `path`.
+	string name() const @safe pure
+	{
+		return skillName(path);
+	}
+}
+
+/// Register `skill` on `server`: serve a `SKILL.md` at `skill://<path>/SKILL.md`
+/// whose body `skill.instructions` regenerates on every read beneath fixed,
+/// synthesized frontmatter, advertise the skills extension, and add an entry
+/// with `resources: "dynamic"` for `skills/list` / `skills/get` to serve. Throws
+/// if `path` is not a valid skill path, `instructions` is null, or a skill is
+/// already registered at that URI.
+void registerDynamicSkill(McpServer server, DynamicSkill skill) @safe
+{
+	if (!isValidSkillPath(skill.path))
+		throw new Exception("invalid skill path '" ~ skill.path
+				~ "': each '/'-separated segment must be non-empty and the final segment "
+				~ "must be a valid skill name (1..64 chars of lowercase letters, digits, "
+				~ "and single hyphens, no leading/trailing/consecutive hyphens)");
+	if (skill.instructions is null)
+		throw new Exception("registerDynamicSkill: '" ~ skill.path
+				~ "' has no instructions delegate");
+
+	const name = skill.name;
+	const uri = skillUri(skill.path);
+	if (uri in server.ensureSkillIndex().byUri)
+		throw new Exception("a skill at '" ~ uri ~ "' is already registered");
+
+	enableSkills(server);
+
+	Resource descriptor;
+	descriptor.uri = uri;
+	descriptor.name = name;
+	descriptor.description = nullable(skill.description);
+	descriptor.mimeType = nullable(skillMimeType);
+	// Copied into locals so the reader closure captures values, not the struct.
+	string description = skill.description;
+	string[string] metadata = skill.metadata;
+	auto body_ = skill.instructions;
+	server.registerResource(descriptor, () @safe {
+		return ResourceContents.makeText(uri, skillMimeType,
+			skillMarkdown(name, description, body_(), metadata));
+	});
+	// The entry is added last, after the resource is in place, so a throw here
+	// leaves no listed-but-unserved skill; the resource is rolled back to match.
+	scope (failure)
+		server.removeResource(uri);
+
+	Json entry = Json.emptyObject;
+	entry["uri"] = uri;
+	entry["frontmatter"] = frontmatterJson(name, description, metadata);
+	entry["resources"] = "dynamic";
+	addSkillEntry(server, entry);
 }
 
 /// Whether the connected client advertised the skills extension at
@@ -406,12 +514,14 @@ bool clientSupportsSkills(McpServer server) @safe
 
 import mcp.client.client : McpClient;
 
-/// One `{uri, digest}` pair from a skill entry's `resources` manifest: a file
-/// the skill serves and the sha256 of the bytes it serves.
+/// One `{uri, digest, size}` entry from a skill entry's `resources` manifest: a
+/// file the skill serves, the sha256 of the bytes it serves, and how many bytes
+/// those are.
 struct SkillResourceRef
 {
 	string uri; /// resource URI of the file
 	string digest; /// `sha256:<hex>` digest of the file's raw bytes
+	long size; /// byte length of the file's raw content (the bytes `digest` covers)
 
 	static SkillResourceRef fromJson(Json j) @safe
 	{
@@ -420,6 +530,8 @@ struct SkillResourceRef
 			r.uri = j["uri"].get!string;
 		if ("digest" in j && j["digest"].type == Json.Type.string)
 			r.digest = j["digest"].get!string;
+		if ("size" in j && j["size"].type == Json.Type.int_)
+			r.size = j["size"].get!long;
 		return r;
 	}
 }
@@ -427,16 +539,27 @@ struct SkillResourceRef
 /// One skill entry, as carried by `skills/list` and `skills/get`. `name` and
 /// `description` are read from the verbatim `frontmatter` object (always present
 /// per the Agent Skills spec); `uri` addresses the `SKILL.md` directly, and
-/// `resources` is the complete per-file manifest a host verifies reads against
-/// (empty only for dynamically generated skills, which offer no integrity).
-/// Within the frontmatter's `metadata` object, keys prefixed
+/// `resources` is the complete per-file manifest a host verifies reads against.
+/// A dynamically generated skill publishes the string `"dynamic"` in place of a
+/// manifest: `isDynamic` is set and `resources` is empty, and the skill offers
+/// no content integrity. An entry with neither (`!isValid`) is malformed and
+/// must not be loaded. Within the frontmatter's `metadata` object, keys prefixed
 /// `io.modelcontextprotocol/` are reserved for MCP extensions; ignore
 /// unrecognized keys under that prefix.
 struct SkillEntry
 {
 	string uri; /// resource URI of the `SKILL.md`
 	Json frontmatter; /// verbatim `SKILL.md` frontmatter as JSON
-	SkillResourceRef[] resources; /// complete `{uri, digest}` manifest of the skill's files
+	SkillResourceRef[] resources; /// complete `{uri, digest, size}` manifest of the skill's files
+	bool isDynamic; /// `resources` was the string `"dynamic"`: generated content, no digests
+
+	/// Whether `resources` took one of the two shapes the extension allows: a
+	/// manifest array (never legitimately empty, as it always lists `SKILL.md`)
+	/// or the string `"dynamic"`. A host must not load an entry that is not valid.
+	bool isValid() const @safe pure nothrow
+	{
+		return isDynamic || resources.length > 0;
+	}
 
 	/// The skill `name` from the frontmatter, or empty if absent.
 	string name() const @safe
@@ -466,6 +589,9 @@ struct SkillEntry
 		if ("resources" in j && j["resources"].type == Json.Type.array)
 			foreach (i; 0 .. j["resources"].length)
 				e.resources ~= SkillResourceRef.fromJson(j["resources"][i]);
+		else if ("resources" in j && j["resources"].type == Json.Type.string
+						&& j["resources"].get!string == "dynamic")
+					e.isDynamic = true;
 		return e;
 	}
 }
@@ -493,20 +619,28 @@ SkillEntry getSkill(McpClient client, string uri) @safe
 }
 
 /// Verify `bytes`, read from `uri`, against `entry`'s `resources` manifest, as
-/// SEP-2640 requires of hosts: the file must be listed in the manifest and its
-/// digest must match the bytes. Returns `null` on success, or a reason string
-/// on failure — an unlisted file is a verification failure equivalent to a
-/// digest mismatch, and a skill without `resources` offers no integrity at all.
-/// Whatever the cause, failed content must not be used; refresh the entry via
-/// `getSkill` and re-read.
+/// the Skills extension requires of hosts: the file must be listed in the
+/// manifest, its byte length must equal the entry's `size`, and its digest must
+/// match the bytes. Returns `null` on success, or a reason string on failure —
+/// an unlisted file or a length mismatch is a verification failure equivalent
+/// to a digest mismatch, and a skill without `resources` offers no integrity at
+/// all. Whatever the cause, failed content must not be used; refresh the entry
+/// via `getSkill` and re-read.
 string verifyResourceDigest(const SkillEntry entry, string uri, scope const(ubyte)[] bytes) @safe
 {
+	import std.conv : to;
+
+	if (entry.isDynamic)
+		return "the skill is dynamic (its entry publishes no digests), so its content cannot be verified";
 	if (entry.resources.length == 0)
 		return "the skill entry carries no resources manifest, so its content cannot be verified";
 	foreach (r; entry.resources)
 	{
 		if (r.uri != uri)
 			continue;
+		if (r.size != bytes.length)
+			return "size mismatch for " ~ uri ~ ": manifest lists " ~ r.size.to!string
+				~ " bytes but the content is " ~ bytes.length.to!string ~ " bytes";
 		const actual = skillDigest(bytes);
 		if (actual != r.digest)
 			return "digest mismatch for " ~ uri ~ ": manifest lists " ~ r.digest
@@ -514,6 +648,28 @@ string verifyResourceDigest(const SkillEntry entry, string uri, scope const(ubyt
 		return null;
 	}
 	return uri ~ " is not listed in the skill's resources manifest";
+}
+
+/// Check `entry` against the extension's fixed per-skill limits, which its
+/// complete `resources` manifest makes decidable before any file is fetched: at
+/// most `maxSkillResources` entries and at most `maxSkillTotalBytes` bytes in
+/// total. Returns `null` when the skill is within both limits (or has no
+/// manifest to count), else a reason a host can show the user for declining it.
+string checkSkillLimits(const SkillEntry entry) @safe
+{
+	import std.conv : to;
+
+	if (entry.resources.length > maxSkillResources)
+		return "the skill lists " ~ entry.resources.length.to!string
+			~ " resources; the Skills extension allows at most " ~ maxSkillResources.to!string;
+	long total;
+	foreach (r; entry.resources)
+		total += r.size;
+	if (total > maxSkillTotalBytes)
+		return "the skill's files total " ~ total.to!string
+			~ " bytes; the Skills extension allows at most 16 MiB ("
+			~ maxSkillTotalBytes.to!string ~ " bytes)";
+	return null;
 }
 
 /// Read a skill's `SKILL.md` by its resource URI — a wrapper over
@@ -773,6 +929,88 @@ unittest  // a skill's resources manifest lists every file exactly once with its
 	assert(digestFor("skill://pdf/assets/logo.bin") == skillDigest(raw));
 }
 
+unittest  // every manifest entry carries the byte length of the content its digest covers
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import std.base64 : Base64;
+
+	auto s = new McpServer("t", "1");
+	const raw = cast(const(ubyte)[]) "\x00binary\xff";
+	Skill sk = {
+		path: "pdf", description: "Process PDFs", instructions: "# PDF\n",
+		files: [
+				SkillFile("references/FORMS.md", "text/markdown", "# Forms\n"),
+				SkillFile("assets/logo.bin", "application/octet-stream",
+						Base64.encode(raw).idup, true)
+		]
+	};
+	registerSkill(s, sk);
+
+	auto e = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"]["skills"][0];
+	auto res = e["resources"];
+
+	long sizeFor(string uri) @safe
+	{
+		foreach (i; 0 .. res.length)
+			if (res[i]["uri"].get!string == uri)
+				return res[i]["size"].get!long;
+		assert(false, "manifest is missing " ~ uri);
+	}
+
+	// SKILL.md's size is the length of the rendered markdown it serves.
+	Json rp = Json.emptyObject;
+	rp["uri"] = "skill://pdf/SKILL.md";
+	const md = s.handle(Message(makeRequest(Json(2), "resources/read", rp)))
+		.get["result"]["contents"][0]["text"].get!string;
+	assert(sizeFor("skill://pdf/SKILL.md") == md.length);
+	assert(sizeFor("skill://pdf/references/FORMS.md") == "# Forms\n".length);
+	// A blob's size counts the decoded bytes, not the base64 transport form.
+	assert(sizeFor("skill://pdf/assets/logo.bin") == raw.length);
+}
+
+unittest  // a skill with more than 512 resources (SKILL.md included) is rejected
+{
+	import std.exception : assertThrown, assertNotThrown;
+
+	assert(maxSkillResources == 512);
+
+	SkillFile[] files;
+	foreach (i; 0 .. maxSkillResources - 1) // + SKILL.md = exactly the limit
+	{
+		import std.conv : to;
+
+		files ~= SkillFile("f" ~ i.to!string ~ ".txt", "text/plain", "x");
+	}
+	Skill atLimit = {
+		path: "at-limit", description: "d", instructions: "# A\n", files: files
+	};
+	assertNotThrown!Exception(registerSkill(new McpServer("t", "1"), atLimit));
+
+	files ~= SkillFile("one-too-many.txt", "text/plain", "x");
+	Skill over = {
+		path: "over", description: "d", instructions: "# O\n", files: files
+	};
+	assertThrown!Exception(registerSkill(new McpServer("t", "1"), over));
+}
+
+unittest  // a skill whose files total more than 16 MiB is rejected
+{
+	import std.exception : assertThrown;
+
+	assert(maxSkillTotalBytes == 16_777_216);
+
+	// SKILL.md plus one file of exactly the limit exceeds it by the SKILL.md bytes.
+	import std.array : replicate;
+
+	Skill sk = {
+		path: "huge", description: "d", instructions: "# H\n", files: [
+			SkillFile("big.txt", "text/plain", "a".replicate(maxSkillTotalBytes))
+		]
+	};
+	assertThrown!Exception(registerSkill(new McpServer("t", "1"), sk));
+}
+
 unittest  // skills/list paginates whole entries with cursor/nextCursor
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
@@ -885,17 +1123,209 @@ unittest  // skills/list and skills/get do not exist below 2025-11-25
 	}
 }
 
-unittest  // a draft-session skills/list result carries no CacheableResult attributes
+unittest  // a modern-session skills/list result carries the required ttlMs/cacheScope
 {
 	auto s = pdfSkillServer();
 
 	auto result = s.handle(draftRequest(1, "skills/list", Json.emptyObject)).get["result"];
 	assert(result["skills"].length == 1);
-	// SEP-2549 list-caching attributes apply to skills/list only from protocol
-	// 2026-07-28, which this SDK does not implement yet; the draft session must
-	// not stamp its CacheableResult hint onto this extension's result.
-	assert("ttlMs" !in result);
-	assert("cacheScope" !in result);
+	// ListSkillsResult extends CacheableResult: both fields are REQUIRED, with the
+	// conservative do-not-cache default when the application configured no hint.
+	assert(result["ttlMs"].get!long == 0);
+	assert(result["cacheScope"].get!string == "public");
+	assert(result["resultType"].get!string == "complete");
+}
+
+unittest  // a modern-session skills/get result carries the required ttlMs/cacheScope
+{
+	auto s = pdfSkillServer();
+
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://office/pdf-forms/SKILL.md";
+	auto result = s.handle(draftRequest(1, "skills/get", p)).get["result"];
+	assert(result["skill"]["uri"].get!string == "skill://office/pdf-forms/SKILL.md");
+	assert(result["ttlMs"].get!long == 0);
+	assert(result["cacheScope"].get!string == "public");
+	assert(result["resultType"].get!string == "complete");
+	assert("nextCursor" !in result);
+}
+
+unittest  // setListCacheHint configures the skills/list and skills/get freshness hints
+{
+	import core.time : minutes;
+	import mcp.protocol.modern : CacheHint, CacheScope;
+
+	auto s = pdfSkillServer();
+	s.setListCacheHint("skills/list", CacheHint(5.minutes));
+	s.setListCacheHint("skills/get", CacheHint(1.minutes, CacheScope.private_));
+
+	auto listed = s.handle(draftRequest(1, "skills/list", Json.emptyObject)).get["result"];
+	assert(listed["ttlMs"].get!long == 300_000);
+	assert(listed["cacheScope"].get!string == "public");
+
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://office/pdf-forms/SKILL.md";
+	auto got = s.handle(draftRequest(2, "skills/get", p)).get["result"];
+	assert(got["ttlMs"].get!long == 60_000);
+	assert(got["cacheScope"].get!string == "private");
+}
+
+unittest  // a 2025-11-25 session's skills results carry no caching attributes
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	// The base protocol at 2025-11-25 has no CacheableResult, so the fields the
+	// extension inherits from it at 2026-07-28 and later are not written there.
+	auto s = pdfSkillServer();
+	auto listed = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"];
+	assert("ttlMs" !in listed && "cacheScope" !in listed && "resultType" !in listed);
+
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://office/pdf-forms/SKILL.md";
+	auto got = s.handle(Message(makeRequest(Json(2), "skills/get", p))).get["result"];
+	assert("ttlMs" !in got && "cacheScope" !in got && "resultType" !in got);
+}
+
+unittest  // a modern-session resources/directory/read result carries resultType:"complete"
+{
+	auto s = pdfSkillServer();
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://office/pdf-forms";
+	auto result = s.handle(draftRequest(1, "resources/directory/read", p)).get["result"];
+	assert(result["resultType"].get!string == "complete");
+}
+
+unittest  // declaring the skills extension also declares the resources capability
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.mrtr : MetaKey;
+
+	// Skill files are served through resources/read, and the base Resources spec
+	// requires a server that supports resources to declare the capability — even
+	// before the first skill (and so the first resource) is registered.
+	auto s = new McpServer("t", "1");
+	enableSkills(s);
+
+	Json params = Json.emptyObject;
+	Json m = Json.emptyObject;
+	m[MetaKey.protocolVersion] = "2026-07-28";
+	m[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	m[MetaKey.clientCapabilities] = Json.emptyObject;
+	params["_meta"] = m;
+	auto caps = s.handle(Message(makeRequest(Json(1), "server/discover",
+			params))).get["result"]["capabilities"];
+	assert(skillsExtensionKey in caps["extensions"]);
+	assert("resources" in caps);
+
+	// The same holds on the 2025-11-25 initialize handshake.
+	Json init = Json.emptyObject;
+	init["protocolVersion"] = "2025-11-25";
+	init["capabilities"] = Json.emptyObject;
+	init["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	auto legacyCaps = s.handle(Message(makeRequest(Json(2), "initialize",
+			init))).get["result"]["capabilities"];
+	assert("resources" in legacyCaps);
+}
+
+unittest  // the skills error messages name the offending uri the way the spec's examples do
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = pdfSkillServer();
+
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://acme/billing/chargebacks/SKILL.md";
+	auto missing = s.handle(Message(makeRequest(Json(1), "skills/get", p))).get["error"];
+	assert(missing["message"].get!string
+			== "No skill is served at skill://acme/billing/chargebacks/SKILL.md");
+
+	Json d = Json.emptyObject;
+	d["uri"] = "skill://office/pdf-forms/SKILL.md";
+	auto notDir = s.handle(draftRequest(2, "resources/directory/read", d)).get["error"];
+	assert(notDir["message"].get!string
+			== "skill://office/pdf-forms/SKILL.md is not a directory resource");
+}
+
+unittest  // registerDynamicSkill publishes an entry whose resources is the string "dynamic"
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	DynamicSkill sk = {
+		path: "reports/daily", description: "Assemble today's operational report",
+		instructions: () @safe => "# Daily\n"
+	};
+	registerDynamicSkill(s, sk);
+
+	auto e = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"]["skills"][0];
+	assert(e["uri"].get!string == "skill://reports/daily/SKILL.md");
+	assert(e["frontmatter"]["name"].get!string == "daily");
+	assert(e["frontmatter"]["description"].get!string == "Assemble today's operational report");
+	assert(e["resources"].type == Json.Type.string);
+	assert(e["resources"].get!string == "dynamic");
+
+	// skills/get carries the identical entry.
+	Json p = Json.emptyObject;
+	p["uri"] = "skill://reports/daily/SKILL.md";
+	auto got = s.handle(Message(makeRequest(Json(2), "skills/get", p))).get["result"]["skill"];
+	assert(got == e);
+}
+
+unittest  // a dynamic skill's SKILL.md is generated on each read, under fixed frontmatter
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import std.algorithm : canFind;
+	import std.conv : to;
+
+	auto s = new McpServer("t", "1");
+	int reads;
+	DynamicSkill sk = {
+		path: "counter", description: "Counts reads", metadata: ["version": "1"],
+		instructions: () @safe {
+			reads++;
+			return "# Read " ~ reads.to!string ~ "\n";
+		}
+	};
+	registerDynamicSkill(s, sk);
+
+	string read() @safe
+	{
+		Json rp = Json.emptyObject;
+		rp["uri"] = "skill://counter/SKILL.md";
+		auto c = s.handle(Message(makeRequest(Json(1), "resources/read", rp)))
+			.get["result"]["contents"][0];
+		assert(c["mimeType"].get!string == skillMimeType);
+		return c["text"].get!string;
+	}
+
+	const first = read();
+	const second = read();
+	assert(first.canFind("# Read 1") && second.canFind("# Read 2"));
+	// The frontmatter is fixed and identical to the entry's, however the body varies.
+	assert(first.canFind("name: counter") && second.canFind("name: counter"));
+	assert(first.canFind(`"version": "1"`));
+	auto e = s.handle(Message(makeRequest(Json(3), "skills/list",
+			Json.emptyObject))).get["result"]["skills"][0];
+	assert(e["frontmatter"]["metadata"]["version"].get!string == "1");
+}
+
+unittest  // registerDynamicSkill rejects an invalid path and a duplicate uri
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	DynamicSkill bad = {
+		path: "Bad Name", description: "d", instructions: () @safe => "x"
+	};
+	assertThrown!Exception(registerDynamicSkill(s, bad));
+
+	registerSkill(s, "taken", "First", "a");
+	DynamicSkill dup = {
+		path: "taken", description: "d", instructions: () @safe => "x"
+	};
+	assertThrown!Exception(registerDynamicSkill(s, dup));
 }
 
 unittest  // a prefixed skill path lists frontmatter.name as the final segment
@@ -1112,14 +1542,165 @@ unittest  // SkillEntry.fromJson reads uri, frontmatter, and the resources manif
 	assert(e.resources[1].digest == "sha256:def");
 }
 
+unittest  // SkillEntry.fromJson reads each manifest entry's size
+{
+	import vibe.data.json : parseJsonString;
+
+	auto e = SkillEntry.fromJson(parseJsonString(`{
+		"uri": "skill://x/SKILL.md",
+		"frontmatter": {"name": "x", "description": "d"},
+		"resources": [
+			{"uri": "skill://x/SKILL.md", "digest": "sha256:abc", "size": 2314},
+			{"uri": "skill://x/a.md", "digest": "sha256:def", "size": 962}
+		]
+	}`));
+	assert(e.resources[0].size == 2314);
+	assert(e.resources[1].size == 962);
+}
+
+unittest  // verifyResourceDigest treats a byte-length mismatch as a verification failure
+{
+	const bytes = cast(const(ubyte)[]) "# Forms\n";
+	SkillEntry e;
+	e.uri = "skill://pdf/SKILL.md";
+	// The digest is right but the advertised size is not: still a failure, per the
+	// spec's rule that a read whose length differs from `size` fails verification.
+	e.resources = [
+		SkillResourceRef("skill://pdf/references/FORMS.md", skillDigest(bytes), 999)
+	];
+	const reason = verifyResourceDigest(e, "skill://pdf/references/FORMS.md", bytes);
+	assert(reason !is null);
+	import std.algorithm : canFind;
+
+	assert(reason.canFind("size"));
+}
+
+unittest  // verifyResourceDigest accepts bytes whose length and digest both match
+{
+	const bytes = cast(const(ubyte)[]) "# Forms\n";
+	SkillEntry e;
+	e.uri = "skill://pdf/SKILL.md";
+	e.resources = [
+		SkillResourceRef("skill://pdf/references/FORMS.md", skillDigest(bytes), bytes.length)
+	];
+	assert(verifyResourceDigest(e, "skill://pdf/references/FORMS.md", bytes) is null);
+}
+
+unittest  // checkSkillLimits passes an entry within both per-skill limits
+{
+	SkillEntry e;
+	e.uri = "skill://x/SKILL.md";
+	e.resources = [SkillResourceRef("skill://x/SKILL.md", "sha256:abc", 5120)];
+	assert(checkSkillLimits(e) is null);
+}
+
+unittest  // checkSkillLimits rejects more than 512 resources
+{
+	import std.conv : to;
+
+	SkillEntry e;
+	e.uri = "skill://x/SKILL.md";
+	foreach (i; 0 .. maxSkillResources + 1)
+		e.resources ~= SkillResourceRef("skill://x/f" ~ i.to!string, "sha256:abc", 1);
+	const reason = checkSkillLimits(e);
+	assert(reason !is null);
+	import std.algorithm : canFind;
+
+	assert(reason.canFind("512"));
+}
+
+unittest  // checkSkillLimits rejects a total size over 16 MiB, summing `size` alone
+{
+	SkillEntry e;
+	e.uri = "skill://x/SKILL.md";
+	e.resources = [
+		SkillResourceRef("skill://x/SKILL.md", "sha256:abc", 100),
+		SkillResourceRef("skill://x/big.bin", "sha256:def", maxSkillTotalBytes)
+	];
+	const reason = checkSkillLimits(e);
+	assert(reason !is null);
+	import std.algorithm : canFind;
+
+	assert(reason.canFind("16"));
+}
+
+unittest  // SkillEntry.fromJson marks a "dynamic" resources value as valid but unverifiable
+{
+	import vibe.data.json : parseJsonString;
+
+	auto e = SkillEntry.fromJson(parseJsonString(`{
+		"uri": "skill://reports/daily/SKILL.md",
+		"frontmatter": {"name": "daily", "description": "d"},
+		"resources": "dynamic"
+	}`));
+	assert(e.isDynamic);
+	assert(e.resources.length == 0);
+	assert(e.isValid);
+}
+
+unittest  // SkillEntry with an array manifest is valid and not dynamic
+{
+	import vibe.data.json : parseJsonString;
+
+	auto e = SkillEntry.fromJson(parseJsonString(`{
+		"uri": "skill://x/SKILL.md",
+		"frontmatter": {"name": "x", "description": "d"},
+		"resources": [{"uri": "skill://x/SKILL.md", "digest": "sha256:abc", "size": 1}]
+	}`));
+	assert(!e.isDynamic);
+	assert(e.isValid);
+}
+
+unittest  // an entry with no resources, or a non-array non-"dynamic" value, is invalid
+{
+	import vibe.data.json : parseJsonString;
+
+	auto missing = SkillEntry.fromJson(parseJsonString(`{
+		"uri": "skill://x/SKILL.md", "frontmatter": {"name": "x", "description": "d"}
+	}`));
+	assert(!missing.isValid && !missing.isDynamic);
+
+	auto wrongType = SkillEntry.fromJson(parseJsonString(`{
+		"uri": "skill://x/SKILL.md", "frontmatter": {"name": "x", "description": "d"},
+		"resources": 42
+	}`));
+	assert(!wrongType.isValid && !wrongType.isDynamic);
+
+	auto otherString = SkillEntry.fromJson(parseJsonString(`{
+		"uri": "skill://x/SKILL.md", "frontmatter": {"name": "x", "description": "d"},
+		"resources": "static"
+	}`));
+	assert(!otherString.isValid && !otherString.isDynamic);
+}
+
+unittest  // verifyResourceDigest reports a dynamic skill as offering no integrity
+{
+	SkillEntry e;
+	e.uri = "skill://reports/daily/SKILL.md";
+	e.isDynamic = true;
+	const reason = verifyResourceDigest(e, e.uri, cast(const(ubyte)[]) "x");
+	assert(reason !is null);
+	import std.algorithm : canFind;
+
+	assert(reason.canFind("dynamic"));
+}
+
+unittest  // checkSkillLimits has nothing to count for a dynamic skill
+{
+	SkillEntry e;
+	e.uri = "skill://reports/daily/SKILL.md";
+	e.isDynamic = true;
+	assert(checkSkillLimits(e) is null);
+}
+
 unittest  // verifyResourceDigest accepts bytes matching the listed digest
 {
 	const bytes = cast(const(ubyte)[]) "# Forms\n";
 	SkillEntry e;
 	e.uri = "skill://pdf/SKILL.md";
 	e.resources = [
-		SkillResourceRef("skill://pdf/SKILL.md", "sha256:unused"),
-		SkillResourceRef("skill://pdf/references/FORMS.md", skillDigest(bytes))
+		SkillResourceRef("skill://pdf/SKILL.md", "sha256:unused", 0),
+		SkillResourceRef("skill://pdf/references/FORMS.md", skillDigest(bytes), bytes.length)
 	];
 	assert(verifyResourceDigest(e, "skill://pdf/references/FORMS.md", bytes) is null);
 }
@@ -1128,9 +1709,10 @@ unittest  // verifyResourceDigest reports a digest mismatch
 {
 	SkillEntry e;
 	e.uri = "skill://pdf/SKILL.md";
+	// Same length as the tampered bytes, so only the digest can catch the change.
 	e.resources = [
 		SkillResourceRef("skill://pdf/references/FORMS.md",
-				skillDigest(cast(const(ubyte)[]) "original"))
+				skillDigest(cast(const(ubyte)[]) "original"), "original".length)
 	];
 	const reason = verifyResourceDigest(e, "skill://pdf/references/FORMS.md",
 			cast(const(ubyte)[]) "tampered");
@@ -1307,6 +1889,22 @@ unittest  // getSkill returns the same typed entry the listing carries
 	// The fetched SKILL.md verifies against the entry it was retrieved under.
 	const md = readSkillUri(client, entry.uri);
 	assert(verifyResourceDigest(entry, entry.uri, cast(const(ubyte)[]) md) is null);
+}
+
+unittest  // listSkills surfaces a dynamic entry as isDynamic with an empty manifest
+{
+	auto s = new McpServer("t", "1");
+	registerSkill(s, "static-one", "Static", "# S\n");
+	DynamicSkill dyn = {
+		path: "dynamic-one", description: "Dynamic", instructions: () @safe => "# D\n"
+	};
+	registerDynamicSkill(s, dyn);
+	auto client = new McpClient(new ServerBackedTransport(s));
+
+	auto skills = listSkills(client);
+	assert(skills.length == 2);
+	assert(!skills[0].isDynamic && skills[0].resources.length == 1);
+	assert(skills[1].isDynamic && skills[1].resources.length == 0 && skills[1].isValid);
 }
 
 unittest  // getSkill surfaces the server's -32602 for a non-skill uri

@@ -4,16 +4,16 @@ import vibe.data.json : Json;
 
 @safe:
 
-/// Mutable state backing a server's SEP-2640 skills (the
-/// `io.modelcontextprotocol/skills` extension). A neutral data holder living in
-/// the server package so `McpServer` can own one without depending on the
-/// `mcp.api.skills` helper layer; all skills semantics live in `mcp.api.skills`,
-/// which adds entries here, while the server's `skills/list` and `skills/get`
-/// handlers read them.
+/// Mutable state backing a server's skills (the `io.modelcontextprotocol/skills`
+/// extension). A neutral data holder living in the server package so
+/// `McpServer` can own one without depending on the `mcp.api.skills` helper
+/// layer; all skills semantics live in `mcp.api.skills`, which adds entries
+/// here, while the server's `skills/list` and `skills/get` handlers read them.
 ///
-/// Each entry is one already-built skill entry per SEP-2640: the `SKILL.md`
-/// resource `uri`, a verbatim `frontmatter` object, and the complete per-file
-/// `resources` manifest of `{uri, digest}` pairs.
+/// Each entry is one already-built skill entry per the extension: the
+/// `SKILL.md` resource `uri`, a verbatim `frontmatter` object, and either the
+/// complete per-file `resources` manifest of `{uri, digest, size}` entries or
+/// the string `"dynamic"` for a skill whose content is generated on demand.
 final class SkillIndex
 {
 	/// Skill entries keyed by their `SKILL.md` resource URI — the identity

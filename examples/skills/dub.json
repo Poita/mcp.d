@@ -1,6 +1,6 @@
 {
 	"name": "skills",
-	"description": "MCP Skills example (server + self-verifying client e2e) for mcp.d — SEP-2640 Agent Skills over resources",
+	"description": "MCP Skills example (server + self-verifying client e2e) for mcp.d — the MCP Skills extension (Agent Skills over resources)",
 	"license": "Apache-2.0",
 	"dependencies": {
 		"mcp-d": { "path": "../.." },

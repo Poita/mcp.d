@@ -3152,15 +3152,20 @@ struct ListResourcesResult
 	}
 }
 
-/// Result of the SEP-2640 `skills/list` method. Entries are carried as raw
-/// `Json`: their shape (`{uri, frontmatter, resources}`) is defined by the
-/// Skills extension and passed through verbatim. Deliberately NOT a
-/// `CacheableResult`: SEP-2549 list-caching attributes apply to this method
-/// only from protocol 2026-07-28, which this SDK does not implement yet.
+/// Result of the Skills extension's `skills/list` method. Entries are carried
+/// as raw `Json`: their shape (`{uri, frontmatter, resources}`) is defined by
+/// the extension and passed through verbatim. `ListSkillsResult extends
+/// PaginatedResult, CacheableResult`, so on the modern protocol it carries the
+/// same required `ttlMs`/`cacheScope` as `tools/list` and `resources/list`: a
+/// freshness hint for the listing, never an integrity property.
 struct ListSkillsResult
 {
 	Json[] skills;
 	Nullable!string nextCursor;
+	/// `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
+	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
+	/// server sets it on modern sessions only, so 2025-11-25 output is unchanged.
+	Nullable!CacheHint cache;
 	/// Optional result-level `_meta` object, reserved by MCP on every `Result`.
 	mixin MetaField;
 
@@ -3173,6 +3178,8 @@ struct ListSkillsResult
 		j["skills"] = arr;
 		if (!nextCursor.isNull)
 			j["nextCursor"] = nextCursor.get;
+		if (!cache.isNull)
+			j = withCache(j, cache.get);
 		emitMetaField(j);
 		return j;
 	}
@@ -3187,17 +3194,26 @@ struct ListSkillsResult
 				r.skills ~= arr[i];
 		}
 		tryGet(j, "nextCursor", r.nextCursor);
+		r.cache = parseCacheHint(j);
 		r.parseMetaField(j);
 		return r;
 	}
 }
 
-/// Result of the SEP-2640 `skills/get` method: the entry for a single skill,
-/// identical in shape and meaning to an entry of `skills/list`. A snapshot of
-/// one skill, so it carries no pagination cursor and no caching attributes.
+/// Result of the Skills extension's `skills/get` method: the entry for a single
+/// skill, identical in shape and meaning to an entry of `skills/list`. A
+/// snapshot of one skill, so it carries no pagination cursor. `GetSkillResult
+/// extends CacheableResult`, so on the modern protocol it carries the same
+/// required `ttlMs`/`cacheScope` as `resources/read`: `ttlMs` is the server's
+/// hint for how long a host may treat the entry as current before re-calling
+/// `skills/get`. Neither field is an integrity property.
 struct GetSkillResult
 {
 	Json skill;
+	/// `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
+	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
+	/// server sets it on modern sessions only, so 2025-11-25 output is unchanged.
+	Nullable!CacheHint cache;
 	/// Optional result-level `_meta` object, reserved by MCP on every `Result`.
 	mixin MetaField;
 
@@ -3205,6 +3221,8 @@ struct GetSkillResult
 	{
 		Json j = Json.emptyObject;
 		j["skill"] = skill;
+		if (!cache.isNull)
+			j = withCache(j, cache.get);
 		emitMetaField(j);
 		return j;
 	}
@@ -3214,6 +3232,7 @@ struct GetSkillResult
 		GetSkillResult r;
 		if ("skill" in j)
 			r.skill = j["skill"];
+		r.cache = parseCacheHint(j);
 		r.parseMetaField(j);
 		return r;
 	}
