@@ -1021,10 +1021,13 @@ final class McpServer : ServerCore
 		const toolName = descriptor.name;
 		const ttlDur = ttl;
 		const pollDur = pollInterval;
-		registerTool(descriptor, (Json args, RequestContext) @safe {
+		registerTool(descriptor, (Json args, RequestContext ctx) @safe {
 			import mcp.protocol.tasks : makeCreateTaskResult;
 
-			auto seed = taskRuntime_.createFor(toolName, args, ttlDur, pollDur);
+			// The task is bound to the creating request's authenticated principal
+			// (if any), so every later tasks/* request must come from the same one.
+			auto seed = taskRuntime_.createFor(toolName, args, ttlDur, pollDur,
+				requestPrincipal(ctx));
 			taskDispatcher_.dispatch(seed.taskId, &runTaskExecutorById);
 			return ToolResponse.task(makeCreateTaskResult(seed));
 		});
@@ -2361,11 +2364,11 @@ final class McpServer : ServerCore
 		case "logging/setLevel":
 			return doSetLevel(params, ver, conn);
 		case "tasks/get":
-			return doTasksGet(params, ver);
+			return doTasksGet(params, ctx, ver);
 		case "tasks/update":
-			return doTasksUpdate(params, ver);
+			return doTasksUpdate(params, ctx, ver);
 		case "tasks/cancel":
-			return doTasksCancel(params, ver);
+			return doTasksCancel(params, ctx, ver);
 		case "events/list":
 			return doEventsList(params, ver);
 		case "events/poll":
@@ -2398,18 +2401,21 @@ final class McpServer : ServerCore
 		return params["taskId"].get!string;
 	}
 
-	private Json doTasksGet(Json params, ProtocolVersion ver) @safe
+	private Json doTasksGet(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
 		requireTasks(ver);
-		return taskRuntime_.getDetailed(requireTaskId(params));
+		const id = requireTaskId(params);
+		taskRuntime_.requireAccess(id, requestPrincipal(ctx));
+		return taskRuntime_.getDetailed(id);
 	}
 
-	private Json doTasksUpdate(Json params, ProtocolVersion ver) @safe
+	private Json doTasksUpdate(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
 		import mcp.protocol.tasks : TaskStatus;
 
 		requireTasks(ver);
 		const id = requireTaskId(params);
+		taskRuntime_.requireAccess(id, requestPrincipal(ctx));
 		Json responses = ("inputResponses" in params) ? params["inputResponses"] : Json.emptyObject;
 		taskRuntime_.deliverInput(id, responses); // throws -32602 for an unknown task
 		// Resume an executor-backed task that was waiting on this input: move it
@@ -2425,10 +2431,11 @@ final class McpServer : ServerCore
 		return Json.emptyObject; // empty acknowledgement
 	}
 
-	private Json doTasksCancel(Json params, ProtocolVersion ver) @safe
+	private Json doTasksCancel(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
 		requireTasks(ver);
 		const id = requireTaskId(params);
+		taskRuntime_.requireAccess(id, requestPrincipal(ctx));
 		taskRuntime_.cancel(id); // throws -32602 for an unknown task
 		return Json.emptyObject; // empty acknowledgement
 	}
@@ -2443,9 +2450,11 @@ final class McpServer : ServerCore
 			throw methodNotFound("events");
 	}
 
-	// The authenticated principal for an events request, or "" when the request is
-	// unauthenticated. Webhook subscribe/unsubscribe require a non-empty principal.
-	private static string eventsPrincipal(RequestContext ctx) @safe
+	// The authenticated principal behind a request (the validated token's
+	// subject), or "" when the request is unauthenticated. Tasks are bound to the
+	// principal that created them, and webhook subscribe/unsubscribe require a
+	// non-empty principal.
+	private static string requestPrincipal(RequestContext ctx) @safe
 	{
 		if (ctx is null)
 			return "";
@@ -2465,7 +2474,7 @@ final class McpServer : ServerCore
 		auto p = PollParams.fromJson(params);
 		if (p.name.length == 0)
 			throw invalidParams("events/poll requires a string 'name'");
-		return eventsRuntime_.poll(p.name, p.arguments, eventsPrincipal(ctx),
+		return eventsRuntime_.poll(p.name, p.arguments, requestPrincipal(ctx),
 				p.cursor, p.maxAgeMs, p.maxEvents).toJson();
 	}
 
@@ -2475,7 +2484,7 @@ final class McpServer : ServerCore
 		auto p = SubscribeParams.fromJson(params);
 		if (p.name.length == 0)
 			throw invalidParams("events/subscribe requires a string 'name'");
-		return eventsRuntime_.subscribeWebhook(p, eventsPrincipal(ctx)).toJson();
+		return eventsRuntime_.subscribeWebhook(p, requestPrincipal(ctx)).toJson();
 	}
 
 	private Json doEventsUnsubscribe(Json params, RequestContext ctx, ProtocolVersion ver) @safe
@@ -2484,7 +2493,7 @@ final class McpServer : ServerCore
 		auto p = UnsubscribeParams.fromJson(params);
 		if (p.name.length == 0)
 			throw invalidParams("events/unsubscribe requires a string 'name'");
-		eventsRuntime_.unsubscribeWebhook(p, eventsPrincipal(ctx));
+		eventsRuntime_.unsubscribeWebhook(p, requestPrincipal(ctx));
 		return Json.emptyObject;
 	}
 
@@ -6376,6 +6385,127 @@ unittest  // registerTaskTool: tools/call returns a task handle the executor com
 	auto got = s.handle(draftReq(2, "tasks/get", Json(["taskId": Json(id)]))).get;
 	assert(got["result"]["status"].get!string == "completed");
 	assert(got["result"]["result"]["structuredContent"]["result"].get!int == 42);
+}
+
+version (unittest)
+{
+	import mcp.auth.resource_server : TokenInfo;
+
+	// A request context authenticated as `subject`, for exercising per-principal
+	// task binding without a transport.
+	private final class OwnerCtx : BaseRequestContext
+	{
+		private string subject_;
+
+		this(string subject) @safe
+		{
+			subject_ = subject;
+		}
+
+		override TokenInfo auth() @safe
+		{
+			TokenInfo t;
+			t.valid = true;
+			t.subject = subject_;
+			return t;
+		}
+	}
+
+	// A server with one task tool whose executor waits for input, so the task
+	// stays alive across the tasks/get, tasks/update, and tasks/cancel checks.
+	private McpServer taskOwnershipServer() @safe
+	{
+		import mcp.protocol.mrtr : InputRequest;
+
+		auto s = new McpServer("t", "1");
+		s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+		Tool desc;
+		desc.name = "gate";
+		desc.inputSchema = Json(["type": Json("object")]);
+		s.registerTaskTool(desc, (TaskContext tc) @safe {
+			if (!tc.hasInput("ok"))
+				return tc.requireInput([
+				InputRequest.elicitation("ok", "Proceed?")
+			]);
+			return Json([
+				"structuredContent": Json(["approved": tc.input("ok")])
+			]);
+		});
+		return s;
+	}
+
+	private string startGateTask(McpServer s, RequestContext ctx) @safe
+	{
+		auto call = ctx is null ? s.handle(draftReq(1, "tools/call",
+				Json(["name": Json("gate"), "arguments": Json.emptyObject]))).get
+			: s.handle(draftReq(1, "tools/call",
+					Json(["name": Json("gate"), "arguments": Json.emptyObject])), ctx).get;
+		return call["result"]["taskId"].get!string;
+	}
+}
+
+unittest  // a task is bound to the principal that created it: another principal cannot read it
+{
+	// ext-tasks (2026-07-28) Security Considerations, auth binding: servers MUST
+	// perform authentication and authorization checks on each task-related
+	// request to ensure the client has permission to access a task.
+	auto s = taskOwnershipServer();
+	const id = startGateTask(s, new OwnerCtx("alice"));
+
+	auto mine = s.handle(draftReq(2, "tasks/get", Json(["taskId": Json(id)])),
+			new OwnerCtx("alice")).get;
+	assert("result" in mine);
+	assert(mine["result"]["status"].get!string == "input_required");
+
+	// A different principal, or an unauthenticated request, is answered exactly
+	// like an unknown task, so the task's existence is not disclosed.
+	auto theirs = s.handle(draftReq(3, "tasks/get",
+			Json(["taskId": Json(id)])), new OwnerCtx("bob")).get;
+	assert(theirs["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(theirs["error"]["data"]["taskId"].get!string == id);
+	auto anon = s.handle(draftReq(4, "tasks/get", Json(["taskId": Json(id)]))).get;
+	assert(anon["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // tasks/update and tasks/cancel are bound to the creating principal too
+{
+	auto s = taskOwnershipServer();
+	const id = startGateTask(s, new OwnerCtx("alice"));
+
+	Json up = Json([
+		"taskId": Json(id),
+		"inputResponses": Json(["ok": Json(["action": Json("accept")])])
+	]);
+	auto bobUpdate = s.handle(draftReq(2, "tasks/update", up), new OwnerCtx("bob")).get;
+	assert(bobUpdate["error"]["code"].get!int == ErrorCode.invalidParams);
+	auto bobCancel = s.handle(draftReq(3, "tasks/cancel",
+			Json(["taskId": Json(id)])), new OwnerCtx("bob")).get;
+	assert(bobCancel["error"]["code"].get!int == ErrorCode.invalidParams);
+
+	// The owner's update goes through and the executor completes the task.
+	auto aliceUpdate = s.handle(draftReq(4, "tasks/update", up), new OwnerCtx("alice")).get;
+	assert("result" in aliceUpdate);
+	auto got = s.handle(draftReq(5, "tasks/get", Json(["taskId": Json(id)])),
+			new OwnerCtx("alice")).get;
+	assert(got["result"]["status"].get!string == "completed");
+	// A terminal task stays bound: the other principal still sees "not found".
+	auto bobGet = s.handle(draftReq(6, "tasks/get",
+			Json(["taskId": Json(id)])), new OwnerCtx("bob")).get;
+	assert(bobGet["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // a task created without an authenticated principal is not principal-bound
+{
+	// Single-tenant and stdio servers authenticate outside the SDK (or not at
+	// all): a task created by an unauthenticated request stays reachable by any
+	// request, authenticated or not.
+	auto s = taskOwnershipServer();
+	const id = startGateTask(s, null);
+	assert("result" in s.handle(draftReq(2, "tasks/get", Json([
+		"taskId": Json(id)
+	]))).get);
+	assert("result" in s.handle(draftReq(3, "tasks/get",
+			Json(["taskId": Json(id)])), new OwnerCtx("alice")).get);
 }
 
 unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
