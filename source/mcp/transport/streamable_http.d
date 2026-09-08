@@ -1991,6 +1991,10 @@ int httpStatusForResponse(Json resp, bool isDraft) @safe
 	if (code == ErrorCode.unsupportedProtocolVersion || code == ErrorCode.headerMismatch
 			|| code == ErrorCode.missingRequiredClientCapability)
 		return 400;
+	// A request whose `_meta` omits a required field is malformed: the spec pins
+	// that -32602 to 400, unlike an ordinary invalid-params error.
+	if (isMissingRequiredMetaError(resp))
+		return 400;
 	if (isDraft && code == ErrorCode.methodNotFound)
 		return 404;
 	return 200;
@@ -2709,6 +2713,7 @@ version (unittest)
 	{
 		Json meta = Json.emptyObject;
 		meta[MetaKey.protocolVersion] = "2026-07-28";
+		meta[MetaKey.clientCapabilities] = Json.emptyObject;
 		params["_meta"] = meta;
 		return Message(makeRequest(Json(1), method, params));
 	}
@@ -2840,6 +2845,19 @@ unittest  // a supported stable MCP-Protocol-Version header passes
 	assert(validateProtocolVersionHeader("2025-06-18") is null);
 	assert(validateProtocolVersionHeader("2025-11-25") is null);
 	assert(validateProtocolVersionHeader("2024-11-05") is null);
+}
+
+unittest  // a malformed-_meta rejection is 400 Bad Request on HTTP
+{
+	// basic/index `_meta`: "On HTTP, the response status MUST be 400 Bad Request"
+	// for a request missing a required _meta field. Only that -32602 maps to 400;
+	// an ordinary invalid-params error (say, an unknown tool) stays 200.
+	Json data = Json.emptyObject;
+	data["missingMeta"] = Json([Json(MetaKey.clientCapabilities)]);
+	auto malformed = errResponse(ErrorCode.invalidParams);
+	malformed["error"]["data"] = data;
+	assert(httpStatusForResponse(malformed, true) == 400);
+	assert(httpStatusForResponse(errResponse(ErrorCode.invalidParams), true) == 200);
 }
 
 unittest  // the 2026-07-28 MCP-Protocol-Version header passes; "draft" is not a version

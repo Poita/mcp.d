@@ -1792,6 +1792,15 @@ final class McpServer : ServerCore
 					// version is fixed at `initialize` and governs every request, so a
 					// per-request body version is ignored for version selection.
 					effective = mv;
+					// Every modern request MUST carry `clientCapabilities` alongside
+					// the version (basic/index `_meta`); a request without it is
+					// malformed, not a request with empty capabilities. Notifications
+					// carry no capabilities and are exempt.
+					if (msg.kind == MessageKind.request && !meta.hasClientCapabilities)
+						return nullable(makeErrorResponse(msg.id,
+								missingRequiredMeta([
+									cast(string) MetaKey.clientCapabilities
+					])));
 					// Per-request client capabilities (draft, stateless): not stored on the
 					// shared instance. clientCapabilities() reflects the negotiated session.
 					if (meta.logLevel.isNull)
@@ -6823,6 +6832,45 @@ unittest
 	// The reentrant pre-draft response is independent: no draft stamping leaked in.
 	assert("error" !in innerResp);
 	assert("resultType" !in innerResp["result"]);
+}
+
+unittest  // a modern request without clientCapabilities is malformed: -32602 naming the key
+{
+	// basic/index `_meta`: protocolVersion and clientCapabilities are REQUIRED on
+	// every request; a request missing a required field is malformed and the
+	// server MUST reject it with -32602 (Invalid params).
+	auto s = makeTestServer();
+	Json params = Json.emptyObject;
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	params["_meta"] = meta;
+	auto resp = s.handle(Message(makeRequest(Json(1), "tools/list", params))).get;
+	assert("error" in resp);
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
+	assert(resp["error"]["data"]["missingMeta"][0].get!string == MetaKey.clientCapabilities);
+}
+
+unittest  // a modern request without clientInfo is served: the field is optional
+{
+	// RequestMetaObject: clientInfo is a SHOULD (self-reported, for display and
+	// logging only); protocolVersion and clientCapabilities are the required pair.
+	auto s = makeTestServer();
+	Json params = Json.emptyObject;
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	params["_meta"] = meta;
+	auto resp = s.handle(Message(makeRequest(Json(1), "tools/list", params))).get;
+	assert("error" !in resp);
+	assert(resp["result"]["resultType"].get!string == "complete");
+}
+
+unittest  // a legacy request carries no per-request _meta and is not subject to the check
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(req(1, "tools/list")).get;
+	assert("error" !in resp);
 }
 
 unittest  // draft results carry the mandatory resultType:"complete" discriminator

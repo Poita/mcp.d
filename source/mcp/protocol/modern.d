@@ -1,5 +1,6 @@
 module mcp.protocol.modern;
 
+import mcp.protocol.errors : McpException, ErrorCode;
 import std.typecons : Nullable, nullable;
 import core.time : Duration, msecs, seconds;
 import vibe.data.json : Json;
@@ -17,6 +18,10 @@ struct RequestMeta
 	string protocolVersion;
 	Implementation clientInfo;
 	ClientCapabilities clientCapabilities;
+	/// Whether `_meta` carried a `clientCapabilities` object at all. The field is
+	/// REQUIRED on every modern request, and an empty object is a valid (if
+	/// minimal) declaration, so presence is tracked separately from the value.
+	bool hasClientCapabilities;
 	Nullable!string logLevel;
 
 	/// Extract request metadata from a request's `params` object.
@@ -35,11 +40,73 @@ struct RequestMeta
 			m.clientInfo = Implementation.fromJson(meta[MetaKey.clientInfo]);
 		if (MetaKey.clientCapabilities in meta
 				&& meta[MetaKey.clientCapabilities].type == Json.Type.object)
+		{
 			m.clientCapabilities = ClientCapabilities.fromJson(meta[MetaKey.clientCapabilities]);
+			m.hasClientCapabilities = true;
+		}
 		if (MetaKey.logLevel in meta && meta[MetaKey.logLevel].type == Json.Type.string)
 			m.logLevel = meta[MetaKey.logLevel].get!string;
 		return m;
 	}
+}
+
+/// The `error.data` key under which a malformed-`_meta` rejection lists the
+/// required `_meta` fields the request omitted. Transports key their HTTP status
+/// on it: the spec makes this particular -32602 a `400 Bad Request`, while an
+/// ordinary invalid-params error (an unknown tool, say) stays `200`.
+enum string missingMetaDataKey = "missingMeta";
+
+/// The -32602 (Invalid params) error for a modern request whose `_meta` omits
+/// one or more REQUIRED fields (`io.modelcontextprotocol/protocolVersion`,
+/// `io.modelcontextprotocol/clientCapabilities`): the request is malformed, and
+/// `data.missingMeta` names the absent keys so the client need not parse the
+/// message.
+McpException missingRequiredMeta(string[] keys) @safe
+{
+	import std.array : join;
+
+	Json data = Json.emptyObject;
+	Json arr = Json.emptyArray;
+	foreach (k; keys)
+		arr ~= Json(k);
+	data[missingMetaDataKey] = arr;
+	return new McpException(ErrorCode.invalidParams,
+			"Malformed request: _meta is missing required field(s) " ~ keys.join(", "), data);
+}
+
+/// Whether `resp` is the malformed-`_meta` rejection built by
+/// `missingRequiredMeta`: a -32602 whose `data` names the missing keys.
+bool isMissingRequiredMetaError(Json resp) @safe
+{
+	if (resp.type != Json.Type.object || "error" !in resp || resp["error"].type != Json.Type.object)
+		return false;
+	auto err = resp["error"];
+	if ("code" !in err || err["code"].type != Json.Type.int_
+			|| err["code"].get!int != cast(int) ErrorCode.invalidParams)
+		return false;
+	return "data" in err && err["data"].type == Json.Type.object && missingMetaDataKey in err["data"];
+}
+
+unittest  // missingRequiredMeta is -32602 and names the absent keys in data
+{
+	auto e = missingRequiredMeta([cast(string) MetaKey.clientCapabilities]);
+	assert(e.code == cast(int) ErrorCode.invalidParams);
+	assert(e.data[missingMetaDataKey][0].get!string == MetaKey.clientCapabilities);
+	import std.algorithm : canFind;
+
+	assert(e.msg.canFind(cast(string) MetaKey.clientCapabilities));
+}
+
+unittest  // RequestMeta.fromParams records whether clientCapabilities was present
+{
+	Json p = Json.emptyObject;
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	p["_meta"] = meta;
+	assert(!RequestMeta.fromParams(p).hasClientCapabilities);
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	p["_meta"] = meta;
+	assert(RequestMeta.fromParams(p).hasClientCapabilities);
 }
 
 /// Result of `server/discover`: advertises supported versions, capabilities,
