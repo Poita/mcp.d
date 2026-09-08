@@ -122,7 +122,7 @@ private int run(McpClient client) @safe
 	};
 
 	// Pin a stable (2025-era) version so the BLOCKING sampling path is exercised.
-	// (The draft revision would route sampling through MRTR / inputRequired
+	// (The 2026-07-28 revision would route sampling through MRTR / inputRequired
 	// instead of the synchronous server->client request this example demos.)
 	client.initialize("2025-11-25");
 

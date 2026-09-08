@@ -67,8 +67,8 @@ private int runScenario(string url, string scenario) @safe
 	client.capabilities.elicitation = true;
 	client.capabilities.roots = true;
 
-	// Draft mode (stateless): MCP_MODERN=1 exercises server/discover + per-request
-	// _meta + standard headers against a draft-capable server.
+	// Modern mode (stateless): MCP_MODERN=1 exercises server/discover + per-request
+	// _meta + standard headers against a modern-capable server.
 	if (modernRequested())
 	{
 		client.enableModern();
@@ -76,18 +76,18 @@ private int runScenario(string url, string scenario) @safe
 		() @trusted {
 			import std.stdio : stderr;
 
-			stderr.writefln("draft discover: versions=%s server=%s",
+			stderr.writefln("modern discover: versions=%s server=%s",
 					d.protocolVersions, d.serverInfo.name);
 		}();
 		auto tools = client.listTools().tools;
 		// Exercise a plain request/response tool (the streaming/sampling tools use
-		// the older server-initiated mechanism, not draft MRTR).
+		// the older server-initiated mechanism, not modern MRTR).
 		foreach (t; tools)
 			if (t.name == "test_simple_text")
 				client.callTool(t.name, Json.emptyObject);
 		() @trusted { import std.stdio : stderr;
 
-		stderr.writeln("draft flow OK"); }();
+		stderr.writeln("modern flow OK"); }();
 		return 0;
 	}
 

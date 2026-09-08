@@ -166,8 +166,8 @@ McpException callbackEndpointError(string message, string reason) @safe
 
 /// Build a "resource not found" error using the legacy MCP-specific code
 /// (-32002). Kept for backwards compatibility; this form always emits -32002.
-/// Draft connections should instead use the version-aware overload below, which
-/// selects the version-appropriate code (draft aligns it to invalidParams /
+/// Modern connections should instead use the version-aware overload below, which
+/// selects the version-appropriate code (modern aligns it to invalidParams /
 /// -32602).
 McpException resourceNotFound(string uri, Json data = Json.undefined) @safe pure nothrow
 {
@@ -175,7 +175,7 @@ McpException resourceNotFound(string uri, Json data = Json.undefined) @safe pure
 }
 
 /// Build a "resource not found" error whose code is selected for the negotiated
-/// protocol version: draft aligns it to invalidParams (-32602), while earlier
+/// protocol version: modern aligns it to invalidParams (-32602), while earlier
 /// versions use the MCP-specific -32002 (see `versions.resourceNotFoundCode`).
 McpException resourceNotFound(string uri, ProtocolVersion v, Json data = Json.undefined) @safe pure nothrow
 {
@@ -338,8 +338,8 @@ McpException userRejected(string message = "User rejected sampling request",
 
 /// Build the `-32021` `MissingRequiredClientCapabilityError` a server returns
 /// when processing a request requires a client capability that was not declared
-/// in the peer's `clientCapabilities` (draft basic/lifecycle,
-/// draft/schema MissingRequiredClientCapabilityError). HTTP transports MUST map
+/// in the peer's `clientCapabilities` (2026-07-28 basic/lifecycle,
+/// modern/schema MissingRequiredClientCapabilityError). HTTP transports MUST map
 /// this onto a `400 Bad Request`. The error's `data.requiredCapabilities` carries
 /// a ClientCapabilities object describing the capabilities the request needs.
 McpException missingRequiredClientCapability(const ClientCapabilities requiredCapabilities,
@@ -372,7 +372,7 @@ unittest  // resourceNotFound (no-version) keeps the legacy -32002 code
 	assert(e.msg == "Resource not found: file:///x");
 }
 
-unittest  // resourceNotFound(version) selects -32602 for draft, -32002 otherwise
+unittest  // resourceNotFound(version) selects -32602 for modern, -32002 otherwise
 {
 	assert(resourceNotFound("file:///x", ProtocolVersion.v2026_07_28).code == -32602);
 	assert(resourceNotFound("file:///x", ProtocolVersion.v2025_11_25).code == -32002);
@@ -415,7 +415,7 @@ unittest  // toErrorJson includes data when present
 	assert(j["data"]["field"].get!string == "name");
 }
 
-unittest  // draft spec finalizes the MCP-allocated error codes in the -32020.. range
+unittest  // 2026-07-28 spec finalizes the MCP-allocated error codes in the -32020.. range
 {
 	// The spec allocates `-32020`..`-32099` for MCP-defined codes (sequential from
 	// -32020). The Streamable-HTTP/MRTR codes — emitted only to modern peers — take

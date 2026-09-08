@@ -9,14 +9,14 @@ public import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 /// The protocol-side collaborator an `McpClient` hands to its transport at
 /// construction (`ClientTransport.setProtocol`). It lets the transport pull the
 /// protocol-derived request headers and consult the cancelled-request set
-/// without knowing anything about the client's draft state, tool inputSchema
+/// without knowing anything about the client's modern state, tool inputSchema
 /// cache, or cancellation bookkeeping — and without the transport having to be a
 /// concrete `HttpClientTransport` the client downcasts to. `McpClient`
 /// implements this interface.
 interface ClientProtocol
 {
 	/// The protocol-derived headers for an outgoing `message`: the
-	/// `MCP-Protocol-Version` header plus, for a draft client, the standard
+	/// `MCP-Protocol-Version` header plus, for a modern client, the standard
 	/// `Mcp-Method` / `Mcp-Name` headers and any `Mcp-Param-*` mirrored tool
 	/// arguments. Called with `Json.undefined` (no message — e.g. the GET server
 	/// stream) it returns only the version header. Never includes Accept /
@@ -102,14 +102,14 @@ interface ClientTransport
 	/// no-op on stdio. An empty string clears it.
 	void setBearerToken(string token) @safe;
 
-	/// Signal whether the negotiated protocol version is modern (2026-07-28 / draft).
+	/// Signal whether the negotiated protocol version is modern (2026-07-28 / modern).
 	/// The HTTP transport uses this to skip Last-Event-ID resumption (GET) that the
-	/// draft removed; a no-op on stdio and on transports where the flag is irrelevant.
+	/// modern removed; a no-op on stdio and on transports where the flag is irrelevant.
 	void setModernProtocol(bool modern) @safe;
 
 	/// Whether this transport signals request cancellation by closing the request's
-	/// stream rather than by sending `notifications/cancelled`. True only for a draft
-	/// Streamable HTTP transport: the draft (basic/transports §Sending Messages, Note)
+	/// stream rather than by sending `notifications/cancelled`. True only for a modern
+	/// Streamable HTTP transport: the modern (basic/transports §Sending Messages, Note)
 	/// defines no client-to-server `notifications/cancelled` over Streamable HTTP —
 	/// closing the SSE response stream is itself the cancellation signal. stdio and
 	/// legacy HTTP send the notification, so they return false.

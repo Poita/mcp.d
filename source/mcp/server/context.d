@@ -139,7 +139,7 @@ interface RequestContext
 	/// Whether the connected client advertised `cap`.
 	bool clientSupports(ClientCapability cap) @safe;
 
-	/// True when this request is on a stateless (MRTR) protocol — the draft
+	/// True when this request is on a stateless (MRTR) protocol — 2026-07-28
 	/// revision, where there is no server->client channel. On such requests a
 	/// tool handler must NOT call `elicit`/`sample` (they throw); instead it
 	/// returns `ToolResponse.inputRequired(...)` and reads the client's answers
@@ -642,7 +642,7 @@ final class RequestScope : RequestContext, ConnectionScoped
 
 	/// The protocol version in effect for THIS request (negotiated version on the
 	/// stateful 2025-era protocols; the per-request `_meta.protocolVersion` on the
-	/// stateless draft). Request-scoped so a concurrent request that yields mid-
+	/// modern). Request-scoped so a concurrent request that yields mid-
 	/// handle cannot have its effective version flipped by another in-flight
 	/// request: the dispatcher reads it from here, not from a mutable field on the
 	/// shared server instance.
@@ -695,7 +695,7 @@ final class RequestScope : RequestContext, ConnectionScoped
 	/// client-configured minimum (`logging/setLevel`) per the RFC 5424 ordering.
 	/// This is where the server honours "Only sends error level and above".
 	///
-	/// On the draft (stateless) protocol the server MUST NOT emit
+	/// On the modern (stateless) protocol the server MUST NOT emit
 	/// `notifications/message` for a request that did not carry
 	/// `_meta["io.modelcontextprotocol/logLevel"]`; the server signals that by
 	/// constructing this scope with `loggingRequested = false`, in which case

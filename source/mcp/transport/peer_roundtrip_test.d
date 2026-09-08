@@ -100,7 +100,7 @@ unittest
 				return r;
 			};
 			// Pin a stable (2025-era) version so the BLOCKING sampling path is
-			// exercised (the draft would route through MRTR / inputRequired).
+			// exercised (the modern would route through MRTR / inputRequired).
 			client.initialize("2025-11-25");
 
 			auto res = client.callTool("echo_sample", Json.emptyObject);

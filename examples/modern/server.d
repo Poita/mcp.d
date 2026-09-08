@@ -1,5 +1,5 @@
 /**
- * Stateless (draft) protocol — server side, DUAL TRANSPORT.
+ * Modern (2026-07-28) protocol — server side, DUAL TRANSPORT.
  *
  * One binary, either transport:
  *
@@ -7,16 +7,16 @@
  *   dub run -c server -- --http --port 8431    # Streamable HTTP
  *
  * The same server object speaks every protocol revision this SDK supports; the
- * *draft* (2026-07-28) stateless model is engaged per-request by the client (no
+ * *modern* (2026-07-28) stateless model is engaged per-request by the client (no
  * `initialize` handshake, per-request `_meta`, `server/discover` for version
- * negotiation). Because the draft model is purely message-level (carried in
+ * negotiation). Because 2026-07-28 model is purely message-level (carried in
  * `params._meta`), it rides identically over stdio and HTTP — so the very same
  * client e2e verifies both transports.
  *
  * The tool and resource are declared in the ergonomic UDA style: a `@tool`
  * method returning a TYPED struct (its input schema is inferred from the typed
  * parameters and its `structuredContent` is inferred from the returned struct),
- * and a `@resource` method carrying its draft freshness hint via `@cache`.
+ * and a `@resource` method carrying its modern freshness hint via `@cache`.
  * `registerHandlers` wires both onto the server. There is no hand-built
  * request/response Json anywhere in this file.
  *
@@ -46,7 +46,7 @@ struct SumResult
 /// The server's tool + resource surface, declared in UDA style.
 final class StatelessModernApi
 {
-	/// A plain `add` tool. On a draft (stateless) request the transport carries
+	/// A plain `add` tool. On a modern (stateless) request the transport carries
 	/// the per-request `_meta`; the handler itself is protocol-agnostic.
 	///
 	/// The argument schema (`a`, `b` as integers, both required) is inferred from
@@ -59,23 +59,23 @@ final class StatelessModernApi
 		return SumResult(a + b);
 	}
 
-	/// A static greeting resource. The draft-only per-resource `CacheableResult`
-	/// freshness hint is declared via `@cache`; a draft client's
+	/// A static greeting resource. The modern-only per-resource `CacheableResult`
+	/// freshness hint is declared via `@cache`; a modern client's
 	/// `readResource("demo://greeting").cache` will carry exactly these values
-	/// (ttl=9.seconds, wire ttlMs=9000, scope=private). Pre-draft peers see no
+	/// (ttl=9.seconds, wire ttlMs=9000, scope=private). Legacy peers see no
 	/// cache fields.
 	@resource("demo://greeting", "greeting", "text/plain")
 	@cache(9.seconds, "private")
 	string greeting() @safe
 	{
-		return "hello from the stateless draft server";
+		return "hello from the modern protocol server";
 	}
 }
 
 void main(string[] args) @safe
 {
 	auto server = new McpServer("modern-server", "1.0.0",
-			nullable("A stateless (draft) demo server: server/discover + per-request _meta."));
+			nullable("A modern (2026-07-28) demo server: server/discover + per-request _meta."));
 
 	// Register every @tool / @resource annotated method in one call; input
 	// schema, the SumResult-derived output schema + structuredContent, argument
@@ -83,14 +83,14 @@ void main(string[] args) @safe
 	// the annotations and signatures.
 	registerHandlers(server, new StatelessModernApi);
 
-	// Draft-only per-list freshness hint: a draft client's `listTools().cache`
-	// will carry these `ttlMs` / `cacheScope` values. Pre-draft wire output is
+	// Modern-only per-list freshness hint: a modern client's `listTools().cache`
+	// will carry these `ttlMs` / `cacheScope` values. Legacy wire output is
 	// unchanged (no cache fields emitted). This is a server-level list hint, not
 	// a per-tool one, so it stays a direct server call.
 	server.setListCacheHint("tools/list", CacheHint(5.seconds, CacheScope.public_));
 
 	// Transport selection (stdio default; `--http` + `--port`/`--host` for
-	// Streamable HTTP) comes from the shared scaffold. The draft stateless model
+	// Streamable HTTP) comes from the shared scaffold. The modern stateless model
 	// rides identically over either channel.
 	runServerFromArgs(server, args, 8431);
 }

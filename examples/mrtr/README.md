@@ -1,6 +1,6 @@
 # MRTR — Multi Round-Trip Requests (SEP-2322)
 
-A self-contained example of the **stateless draft input flow** in the D MCP SDK,
+A self-contained example of the **modern input flow** in the D MCP SDK,
 running and e2e-tested over **both stdio and Streamable HTTP**. It is its own dub
 package (a `path` dependency on the root `mcp`), so it builds and runs
 independently of the SDK's root build.
@@ -9,7 +9,7 @@ independently of the SDK's root build.
 
 On the 2025-era protocols a server gathers extra input by opening a
 *server→client* request (`elicitation/create`, `sampling/createMessage`,
-`roots/list`) and blocking on the answer. The **draft** revision is stateless and
+`roots/list`) and blocking on the answer. The **modern** revision is stateless and
 has **no server→client channel**, so it uses **Multi Round-Trip Requests**
 instead:
 

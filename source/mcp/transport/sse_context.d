@@ -394,8 +394,8 @@ final class ServerPushChannel : PushChannel
 	/// JSON-RPC id of the `subscriptions/listen` request that opened this stream;
 	/// every notification delivered to the listener is stamped with it in
 	/// `params._meta["io.modelcontextprotocol/subscriptionId"]` so the client can
-	/// correlate notifications with the listen request (draft basic/utilities/
-	/// subscriptions). `filter` is the per-stream opt-in (draft §Notification
+	/// correlate notifications with the listen request (2026-07-28 basic/utilities/
+	/// subscriptions). `filter` is the per-stream opt-in (modern §Notification
 	/// Filter): an active filter receives only the change-notification types this
 	/// stream explicitly requested, so a notification is never delivered to a
 	/// concurrent stream that did not request it.
@@ -727,7 +727,7 @@ final class ServerPushChannel : PushChannel
 
 	/// The per-stream eligibility decision shared by every delivery mode: an
 	/// *active* `subscriptions/listen` filter is consulted directly (the stream
-	/// receives a type only if it explicitly opted in, honouring the draft
+	/// receives a type only if it explicitly opted in, honouring 2026-07-28
 	/// basic/utilities/subscriptions MUST NOT — "The server MUST NOT send
 	/// notification types the client has not explicitly requested"); an *inactive*
 	/// filter (a plain GET stream) falls back to the listener's own per-session
@@ -801,7 +801,7 @@ final class ServerPushChannel : PushChannel
 	/// filtering) and per-session gate via the shared `listenerEligible` decision,
 	/// so a session's update reaches only a stream that opted into this `method`
 	/// (and, for `resources/updated`, this `uri`). An empty `sessionToken` is the
-	/// unscoped path: every listener is a candidate (the draft self-contained
+	/// unscoped path: every listener is a candidate (the modern self-contained
 	/// `subscriptions/listen` stream and the stateless/no-session case), matching
 	/// the prior single-stream filtered delivery. Returns 1 if delivered, else 0.
 	size_t pushToSession(string sessionToken, string method, Json params,
@@ -1054,7 +1054,7 @@ final class ServerPushChannel : PushChannel
 
 	/// Frame `msg` and write it to a single listener (identified by `listenerId`),
 	/// rather than broadcasting to all. Used to deliver a per-stream leading event
-	/// — e.g. the `notifications/subscriptions/acknowledged` the draft
+	/// — e.g. the `notifications/subscriptions/acknowledged` 2026-07-28
 	/// `subscriptions/listen` stream sends only to its own client. Returns true if
 	/// the listener received it; false if the id is unknown or its write failed
 	/// (in which case the listener is dropped).
@@ -1298,7 +1298,7 @@ unittest  // emit delivers to exactly ONE stream, never broadcasting to all
 
 unittest  // pushToSession delivers a change notification ONLY to a stream that opted in
 {
-	// draft basic/utilities/subscriptions: "The server MUST NOT send notification
+	// 2026-07-28 basic/utilities/subscriptions: "The server MUST NOT send notification
 	// types the client has not explicitly requested." Two concurrent listen streams:
 	// A opted into toolsListChanged only, B into resourceSubscriptions only. A
 	// tools/list_changed must reach A and never B, regardless of registration order.
@@ -1758,12 +1758,12 @@ unittest  // retainedHistoryStreams acquires mtx: must not be const
 ///
 /// `Cache-Control: no-cache` applies on every protocol version.
 ///
-/// `modern` adds the draft-only `X-Accel-Buffering: no` header. The draft
+/// `modern` adds the modern-only `X-Accel-Buffering: no` header. The modern
 /// basic/transports §Receiving Messages rule states: "When initiating an SSE
 /// stream, servers SHOULD include the `X-Accel-Buffering: no` header in the HTTP
 /// response" (it instructs reverse proxies such as nginx to disable response
 /// buffering so events are flushed immediately). This SHOULD was introduced in
-/// the draft (2026-07-28) and does NOT exist in 2025-03-26 / 2025-06-18 /
+/// the 2026-07-28 and does NOT exist in 2025-03-26 / 2025-06-18 /
 /// 2025-11-25, so it must NOT be emitted on those versions — the stable wire
 /// output is unchanged.
 string[string] sseStreamHeaders(bool modern) @safe
@@ -1782,7 +1782,7 @@ unittest  // stable SSE streams: no-cache only, never X-Accel-Buffering
 	assert("X-Accel-Buffering" !in h);
 }
 
-unittest  // draft SSE streams add X-Accel-Buffering: no (draft SHOULD)
+unittest  // modern SSE streams add X-Accel-Buffering: no (modern SHOULD)
 {
 	auto h = sseStreamHeaders(true);
 	assert(h["Cache-Control"] == "no-cache");
@@ -1790,7 +1790,7 @@ unittest  // draft SSE streams add X-Accel-Buffering: no (draft SHOULD)
 }
 
 /// Set the SSE upgrade headers (see `sseStreamHeaders`) on a response, leaving
-/// the caller to set `contentType`. Applies the draft-only `X-Accel-Buffering`
+/// the caller to set `contentType`. Applies the modern-only `X-Accel-Buffering`
 /// header only when `modern` is true.
 void applySseStreamHeaders(HTTPServerResponse res, bool modern) @safe
 {
@@ -1830,8 +1830,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	private long streamId;
 	private long eventSeq;
 	private TokenInfo authInfo;
-	// When true, an SSE upgrade emits the draft-only `X-Accel-Buffering: no`
-	// header (draft basic/transports §Receiving Messages SHOULD). Defaults to
+	// When true, an SSE upgrade emits the modern-only `X-Accel-Buffering: no`
+	// header (2026-07-28 basic/transports §Receiving Messages SHOULD). Defaults to
 	// false so 2025-03-26 / 2025-06-18 / 2025-11-25 wire output is unchanged.
 	private bool modern_;
 	// The effective protocol version negotiated for this request. Drives the
@@ -1841,8 +1841,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// Set once the leading priming event has been written, so it is emitted at
 	// most once per stream.
 	private bool primed_;
-	// Connection-liveness probe. On the draft Streamable HTTP transport a client
-	// disconnect IS the cancellation signal (draft basic/utilities/cancellation
+	// Connection-liveness probe. On the modern Streamable HTTP transport a client
+	// disconnect IS the cancellation signal (2026-07-28 basic/utilities/cancellation
 	// §Transport-Specific Cancellation: "Closing the SSE response stream is the
 	// cancellation signal. The server MUST treat a client disconnect as
 	// cancellation of that request"). Defaults to the live HTTP connection state;
@@ -1920,7 +1920,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		return connState_;
 	}
 
-	/// Override the connection-liveness probe used by `isCancelled` on the draft
+	/// Override the connection-liveness probe used by `isCancelled` on 2026-07-28
 	/// transport. Lets the transport or tests supply a disconnect signal in place
 	/// of the live `HTTPServerResponse.connected` reading.
 	void setConnectionProbe(bool delegate() @safe alive) @safe
@@ -1948,8 +1948,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	/// (2025-03-26 / 2025-06-18 / 2025-11-25) cancellation is tracked solely by the
 	/// server's `RequestScope` (the shared token flipped by `notifications/
 	/// cancelled`), so the transport context itself reports never-cancelled. On the
-	/// draft Streamable HTTP transport a client disconnect IS the cancellation
-	/// signal (draft basic/utilities/cancellation §Transport-Specific
+	/// modern Streamable HTTP transport a client disconnect IS the cancellation
+	/// signal (2026-07-28 basic/utilities/cancellation §Transport-Specific
 	/// Cancellation: "The server MUST treat a client disconnect as cancellation of
 	/// that request"), so a dropped connection reports cancelled and the wrapping
 	/// `RequestScope.isCancelled` surfaces it to a polling handler.
@@ -1976,7 +1976,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		}
 		res.contentType = "text/event-stream";
 		// Cache-Control: no-cache on every version; X-Accel-Buffering: no only
-		// on the draft (basic/transports §Receiving Messages SHOULD).
+		// on the modern (basic/transports §Receiving Messages SHOULD).
 		applySseStreamHeaders(res, modern_);
 		streaming_ = true;
 		// 2025-11-25 basic/transports §Sending Messages item 6: "If the server
@@ -1984,7 +1984,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		// consisting of an event ID and an empty data field in order to prime the
 		// client to reconnect (using that event ID as Last-Event-ID)." This SHOULD
 		// is unique to 2025-11-25 — 2025-03-26 / 2025-06-18 never defined it and the
-		// draft drops Last-Event-ID resumability entirely — so the priming event is
+		// modern drops Last-Event-ID resumability entirely — so the priming event is
 		// emitted ONLY when the effective version is exactly 2025-11-25, leaving
 		// every other version's wire output unchanged.
 		writePrimingEventIfNeeded();
@@ -2185,7 +2185,7 @@ unittest  // parseEventId round-trips a well-formed cursor and rejects junk
 /// Whether a POST-initiated SSE stream must lead with the priming event (an
 /// event id + empty `data` field) for the given negotiated version. This is a
 /// 2025-11-25-only SHOULD (basic/transports §Sending Messages item 6): it did
-/// not exist in 2025-03-26 / 2025-06-18, and the draft removed Last-Event-ID
+/// not exist in 2025-03-26 / 2025-06-18, and 2026-07-28 removed Last-Event-ID
 /// resumability altogether, so the priming event must NOT alter those versions'
 /// wire output. Gated here as a single pure predicate so the version boundary is
 /// directly testable.
@@ -2200,7 +2200,7 @@ unittest  // the priming event is sent ONLY on 2025-11-25
 	assert(!sendsPrimingEvent(ProtocolVersion.v2025_06_18));
 	assert(!sendsPrimingEvent(ProtocolVersion.v2025_03_26));
 	assert(!sendsPrimingEvent(ProtocolVersion.v2024_11_05));
-	// The draft drops Last-Event-ID resumability, so no priming event there.
+	// 2026-07-28 drops Last-Event-ID resumability, so no priming event there.
 	assert(!sendsPrimingEvent(ProtocolVersion.v2026_07_28));
 }
 
@@ -2212,7 +2212,7 @@ unittest  // the priming event is sent ONLY on 2025-11-25
 /// it SHOULD send an SSE event with a standard `retry` field before closing the
 /// connection." It builds on the 2025-11-25 connection/stream split (reconnect
 /// via Last-Event-ID), which does not exist in 2025-03-26 / 2025-06-18, and the
-/// draft dropped Last-Event-ID resumability — so this MUST NOT alter those
+/// modern dropped Last-Event-ID resumability — so this MUST NOT alter those
 /// versions' wire output. Gated here as a single pure predicate so the version
 /// boundary is directly testable.
 bool sendsRetryOnClose(ProtocolVersion v) @safe pure nothrow
@@ -2226,7 +2226,7 @@ unittest  // the retry-on-close hint is sent ONLY on 2025-11-25
 	assert(!sendsRetryOnClose(ProtocolVersion.v2025_06_18));
 	assert(!sendsRetryOnClose(ProtocolVersion.v2025_03_26));
 	assert(!sendsRetryOnClose(ProtocolVersion.v2024_11_05));
-	// The draft drops Last-Event-ID resumability, so no reconnect hint there.
+	// 2026-07-28 drops Last-Event-ID resumability, so no reconnect hint there.
 	assert(!sendsRetryOnClose(ProtocolVersion.v2026_07_28));
 }
 
@@ -2754,7 +2754,7 @@ unittest  // history retains at most maxHistoryStreams ordinals (bounded memory)
 	assert(ch.retainedHistoryStreams() <= 64);
 }
 
-unittest  // draft HttpStreamContext: a disconnected client reports cancelled
+unittest  // modern HttpStreamContext: a disconnected client reports cancelled
 {
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
 	import vibe.stream.memory : createMemoryOutputStream;
@@ -2771,14 +2771,14 @@ unittest  // draft HttpStreamContext: a disconnected client reports cancelled
 	ctx.setConnectionProbe(() @safe => true);
 	assert(!ctx.isCancelled);
 
-	// Client closed the SSE stream -> the draft transport treats it as
-	// cancellation of the in-flight request (draft basic/utilities/cancellation
+	// Client closed the SSE stream -> the modern transport treats it as
+	// cancellation of the in-flight request (2026-07-28 basic/utilities/cancellation
 	// §Transport-Specific Cancellation).
 	ctx.setConnectionProbe(() @safe => false);
 	assert(ctx.isCancelled);
 }
 
-unittest  // released versions: a disconnect never reports cancelled (draft-only MUST)
+unittest  // released versions: a disconnect never reports cancelled (modern-only MUST)
 {
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
 	import vibe.stream.memory : createMemoryOutputStream;

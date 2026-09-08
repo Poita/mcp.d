@@ -55,8 +55,8 @@ reference:
 | `2024-11-05`          | `2024-11-05`    | Supported (legacy)        |
 | `2025-03-26`          | `2025-03-26`    | Supported                 |
 | `2025-06-18`          | `2025-06-18`    | Supported                 |
-| `2025-11-25`          | `2025-11-25`    | Supported (latest stable) |
-| `draft`               | `2026-07-28`    | Supported (experimental)  |
+| `2025-11-25`          | `2025-11-25`    | Supported (latest legacy) |
+| `2026-07-28`          | `2026-07-28`    | Supported (latest stable) |
 
 Only the most recent commit on the default branch (`main`) receives security
 updates. Users are encouraged to track `main` and update promptly when an

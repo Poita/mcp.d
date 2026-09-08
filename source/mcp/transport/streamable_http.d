@@ -61,12 +61,12 @@ struct StreamableHttpOptions
 	/// respect the `retry` field"). This is a 2025-11-25-only SHOULD: it is built
 	/// on the connection/stream split and Last-Event-ID reconnect that only that
 	/// revision defines, so it never alters 2025-06-18 / 2025-03-26 / 2024-11-05
-	/// or draft wire output. When zero (the default) no `retry:` hint is sent.
+	/// or modern wire output. When zero (the default) no `retry:` hint is sent.
 	uint reconnectDelayMs = 0;
 
 	/// Opt-in backwards compatibility with the deprecated 2024-11-05 HTTP+SSE
 	/// two-endpoint transport (basic/transports §HTTP with SSE; and the
-	/// 2025-06-18 / 2025-11-25 / draft §Backwards Compatibility guidance:
+	/// 2025-06-18 / 2025-11-25 / modern §Backwards Compatibility guidance:
 	/// "Servers wanting to support older clients should: Continue to host both the
 	/// SSE and POST endpoints of the old transport, alongside the new MCP
 	/// endpoint"). This is a SHOULD, so it is off by default. When enabled,
@@ -105,7 +105,7 @@ enum ProtectedResourceMetadataPath = "/.well-known/oauth-protected-resource";
 /// Validate that an auth-enabled `ResourceServerConfig` can publish a
 /// spec-compliant Protected Resource Metadata document before the transport
 /// starts serving it. basic/authorization §Authorization Server Location (all
-/// of 2025-06-18 / 2025-11-25 / draft) makes RFC 9728 a MUST: "The Protected
+/// of 2025-06-18 / 2025-11-25 / modern) makes RFC 9728 a MUST: "The Protected
 /// Resource Metadata document returned by the MCP server MUST include the
 /// `authorization_servers` field containing at least one authorization server."
 /// An operator who sets `auth.validator` but forgets `auth.authorizationServers`
@@ -160,8 +160,8 @@ unittest  // a disabled (no-validator) config is never rejected, even with no AS
 ///     or `202 Accepted` with no body when the payload needs no reply.
 ///   - GET:  on the stable revisions, opens a standalone server->client SSE
 ///     stream wired to the server-push channel (`McpServer.notify`); on the
-///     draft, which drops the standalone stream, GET -> 405.
-///   - DELETE: the draft has no protocol-level sessions to tear down -> 405.
+///     modern, which drops the standalone stream, GET -> 405.
+///   - DELETE: 2026-07-28 has no protocol-level sessions to tear down -> 405.
 void mountMcp(URLRouter router, McpServer server,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
@@ -233,8 +233,8 @@ void mountMcp(URLRouter router, McpServer server,
 			// Session Management: a client signals it no longer needs the
 			// session via DELETE with the Mcp-Session-Id header. Terminate it
 			// and reply 204; an absent header is 400, an unknown/already-
-			// terminated session is 404. The draft removed protocol-level
-			// sessions, so this branch is version-gated: a draft-negotiated
+			// terminated session is 404. The modern removed protocol-level
+			// sessions, so this branch is version-gated: a modern-negotiated
 			// server falls through to the 405 below even when sessions are
 			// enabled (mirroring the GET getOpensSseStream gate).
 			const sid = req.headers.get(SessionHeader, "");
@@ -255,11 +255,11 @@ void mountMcp(URLRouter router, McpServer server,
 			return;
 		}
 		// No protocol-level session to tear down (stateless mode, or a
-		// draft-negotiated session which removed sessions entirely): per the
+		// modern-negotiated session which removed sessions entirely): per the
 		// backward-compatibility rules, DELETE -> 405. The Allow header MUST list
 		// every method the endpoint actually supports (RFC 9110 §10.2.1): on the
 		// stable revisions that is GET (the standalone SSE stream) and POST, while
-		// the draft drops the GET stream so only POST remains.
+		// 2026-07-28 drops the GET stream so only POST remains.
 		res.statusCode = HTTPStatus.methodNotAllowed;
 		res.headers["Allow"] = allowedMethodsHeader(server.negotiatedVersion,
 			server.mode == ServerMode.stateful);
@@ -772,7 +772,7 @@ unittest  // resourceOrigin strips the path from a configured resource identifie
 ///
 /// Returns true when the GET should open a standalone server->client SSE stream,
 /// false when it must be answered with 405. The standalone stream is offered for
-/// the stable revisions (2025-03-26 / 2025-06-18 / 2025-11-25); on the draft,
+/// the stable revisions (2025-03-26 / 2025-06-18 / 2025-11-25); on 2026-07-28,
 /// which drops the standalone GET stream in favour of POST-response SSE, GET ->
 /// 405 is the correct answer.
 bool getOpensSseStream(ProtocolVersion negotiated) @safe
@@ -780,7 +780,7 @@ bool getOpensSseStream(ProtocolVersion negotiated) @safe
 	return !negotiated.isModern;
 }
 
-unittest  // stable revisions open the GET SSE stream; the draft does not
+unittest  // stable revisions open the GET SSE stream; 2026-07-28 does not
 {
 	assert(getOpensSseStream(ProtocolVersion.v2025_11_25));
 	assert(getOpensSseStream(ProtocolVersion.v2025_06_18));
@@ -791,20 +791,20 @@ unittest  // stable revisions open the GET SSE stream; the draft does not
 /// Decide how to answer an HTTP DELETE to the MCP endpoint
 /// (basic/transports §Session Management / §Backward Compatibility). The stable
 /// revisions (2025-03-26 / 2025-06-18 / 2025-11-25) carry protocol-level sessions
-/// a client tears down via DELETE + `Mcp-Session-Id`. The draft removed
+/// a client tears down via DELETE + `Mcp-Session-Id`. The modern removed
 /// protocol-level sessions ("Removal of protocol-level sessions"), so there is
-/// nothing to terminate: a draft-negotiated server "SHOULD respond as follows:
+/// nothing to terminate: a modern-negotiated server "SHOULD respond as follows:
 /// HTTP GET or DELETE to the MCP endpoint: respond with 405 Method Not Allowed."
 ///
 /// Returns true when DELETE should drive session termination (stable revisions),
-/// false when it must be answered with 405 (the draft) — mirroring the version
+/// false when it must be answered with 405 (2026-07-28) — mirroring the version
 /// gate `getOpensSseStream` already applies to GET.
 bool deleteTerminatesSession(ProtocolVersion negotiated) @safe
 {
 	return !negotiated.isModern;
 }
 
-unittest  // stable revisions terminate sessions on DELETE; the draft answers 405
+unittest  // stable revisions terminate sessions on DELETE; the modern answers 405
 {
 	assert(deleteTerminatesSession(ProtocolVersion.v2025_11_25));
 	assert(deleteTerminatesSession(ProtocolVersion.v2025_06_18));
@@ -817,13 +817,13 @@ unittest  // stable revisions terminate sessions on DELETE; the draft answers 40
 /// Revisions). The stable revisions (2025-03-26 / 2025-06-18 / 2025-11-25) carry
 /// protocol-level sessions: the server mints an `Mcp-Session-Id` on the
 /// `InitializeResult` and requires the client to echo it on every later request.
-/// The draft removed protocol-level sessions (revision 2026-07-28: "Removal of
-/// protocol-level sessions"), so a draft-only server "SHOULD respond as follows:
+/// The modern removed protocol-level sessions (revision 2026-07-28: "Removal of
+/// protocol-level sessions"), so a modern-only server "SHOULD respond as follows:
 /// ... An `Mcp-Session-Id` header on a request: ignore it, and do not mint or echo
 /// session IDs."
 ///
 /// Returns true when POST session minting/requiring applies (stable revisions),
-/// false when the server must neither mint nor require a session id (the draft) —
+/// false when the server must neither mint nor require a session id (2026-07-28) —
 /// mirroring the version gates `getOpensSseStream` (GET) and
 /// `deleteTerminatesSession` (DELETE) already apply.
 bool sessionsApply(ProtocolVersion negotiated) @safe
@@ -831,7 +831,7 @@ bool sessionsApply(ProtocolVersion negotiated) @safe
 	return !negotiated.isModern;
 }
 
-unittest  // stable revisions mint/require Mcp-Session-Id on POST; the draft does not
+unittest  // stable revisions mint/require Mcp-Session-Id on POST; 2026-07-28 does not
 {
 	assert(sessionsApply(ProtocolVersion.v2025_11_25));
 	assert(sessionsApply(ProtocolVersion.v2025_06_18));
@@ -846,7 +846,7 @@ unittest  // stable revisions mint/require Mcp-Session-Id on POST; the draft doe
 /// POST and GET methods" (basic/transports §Streamable HTTP) — the standalone
 /// server->client SSE stream is mounted on GET (getOpensSseStream is true) — so a
 /// 405 (e.g. to a DELETE the server does not honour) MUST advertise `GET, POST`.
-/// On the draft the standalone GET stream and protocol-level DELETE are both
+/// On the modern the standalone GET stream and protocol-level DELETE are both
 /// dropped, leaving POST as the only supported method, so the header is `POST`.
 ///
 /// The GET stream is, however, only actually mounted on a stateful server: a
@@ -865,7 +865,7 @@ unittest  // 405 Allow header enumerates every supported method (RFC 9110 §10.2
 	assert(allowedMethodsHeader(ProtocolVersion.v2025_11_25) == "GET, POST");
 	assert(allowedMethodsHeader(ProtocolVersion.v2025_06_18) == "GET, POST");
 	assert(allowedMethodsHeader(ProtocolVersion.v2025_03_26) == "GET, POST");
-	// The draft drops the standalone GET stream and protocol-level DELETE, so POST
+	// 2026-07-28 drops the standalone GET stream and protocol-level DELETE, so POST
 	// is the only supported method and the 405 advertises only POST.
 	assert(allowedMethodsHeader(ProtocolVersion.v2026_07_28) == "POST");
 }
@@ -1026,7 +1026,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// is subject to the same rule as the POST path: an invalid or unsupported
 	// MCP-Protocol-Version MUST be answered with 400 Bad Request rather than a
 	// 200 text/event-stream or a 405. This precedes the mode/getOpensSseStream
-	// gate so a stateless or draft-negotiated server still rejects a bad version
+	// gate so a stateless or modern-negotiated server still rejects a bad version
 	// with 400 rather than masking it behind a 405.
 	if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
 	{
@@ -1042,14 +1042,14 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// server (sessions keyed on Mcp-Session-Id) opens the stream.
 	//
 	// Per the transport: the server MUST either open a text/event-stream or
-	// answer 405. The draft drops the standalone GET stream (server->client
+	// answer 405. 2026-07-28 drops the standalone GET stream (server->client
 	// traffic rides the POST-response SSE), so it keeps the 405 alternative.
 	if (server.mode != ServerMode.stateful || !getOpensSseStream(server.negotiatedVersion))
 	{
 		res.statusCode = HTTPStatus.methodNotAllowed;
 		res.headers["Allow"] = "POST";
 		// A stateless server has no session to anchor the unsolicited push stream;
-		// name the remedy. The draft (stateful or not) simply has no standalone GET
+		// name the remedy. The modern (stateful or not) simply has no standalone GET
 		// stream, so its 405 stays bodiless.
 		res.writeBody(server.mode != ServerMode.stateful
 				? "The standalone GET SSE stream requires a stateful server;"
@@ -1107,7 +1107,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	res.contentType = "text/event-stream";
 	// The standalone GET stream is offered only on the stable revisions
 	// (getOpensSseStream gated above); the X-Accel-Buffering: no SHOULD is a
-	// draft-only rule, so it is not emitted here.
+	// modern-only rule, so it is not emitted here.
 	applySseStreamHeaders(res, false);
 
 	auto writeFrame = sseFrameWriter(res);
@@ -1117,7 +1117,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// the channel so it resumes the disconnected stream — replaying the events
 	// emitted after that id on the same stream ordinal — instead of opening a fresh
 	// one. The header is honoured only on the stable revisions that mount the GET
-	// stream (gated by getOpensSseStream above); the draft never reaches here.
+	// stream (gated by getOpensSseStream above); the modern never reaches here.
 	const lastEventId = req.headers.get("Last-Event-ID", "");
 	const listenerId = push.addListener((string frame) @safe {
 		writeFrame(frame);
@@ -1146,8 +1146,8 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	runSseHeartbeat(writeFrame);
 }
 
-/// Serve a draft `subscriptions/listen` request as a long-lived SSE notification
-/// stream (draft basic/transports / basic/utilities/subscriptions): "subscriptions/
+/// Serve a modern `subscriptions/listen` request as a long-lived SSE notification
+/// stream (2026-07-28 basic/transports / basic/utilities/subscriptions): "subscriptions/
 /// listen opens a long-lived notification stream from the server to the client ...
 /// the stream stays open and delivers notifications until the client cancels it."
 ///
@@ -1165,8 +1165,8 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	// Record the opted-in filters (route -> doSubscribeListen). The one-shot JSON
 	// result is discarded on success: the acknowledgement is delivered as the
 	// first SSE event instead. A routing error (e.g. the version gate rejected
-	// the request) is surfaced as a JSON-RPC error response — listen is draft-only,
-	// so a method-not-found rides the draft 404 — rather than opening the stream
+	// the request) is surfaced as a JSON-RPC error response — listen is modern-only,
+	// so a method-not-found rides the modern 404 — rather than opening the stream
 	// with a stale filter. The state is built the same way the regular POST path
 	// builds it (`freshStatelessState`: header, then body `_meta`, then the
 	// server default).
@@ -1180,14 +1180,14 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	}
 	// THIS request's parsed filter, read back from its own per-request state, so
 	// both the per-stream listener and its acknowledgement reflect exactly this
-	// listen request's opt-in (draft basic/utilities/subscriptions §Multiple
+	// listen request's opt-in (2026-07-28 basic/utilities/subscriptions §Multiple
 	// Concurrent Subscriptions: each subscription is independent) — a concurrent
 	// listen on the shared McpServer dispatches on a different state and cannot
 	// overwrite it.
 	auto streamFilter = reqState.listenFilter;
 
 	res.contentType = "text/event-stream";
-	// subscriptions/listen is a draft-only stream; emit the draft SHOULD header
+	// subscriptions/listen is a modern-only stream; emit the modern SHOULD header
 	// X-Accel-Buffering: no alongside Cache-Control (basic/transports
 	// §Receiving Messages).
 	applySseStreamHeaders(res, true);
@@ -1198,7 +1198,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	// The listen request's id becomes the stream's subscriptionId: every
 	// notification delivered to this listener (including the leading
 	// acknowledgement) is stamped with it in
-	// `params._meta["io.modelcontextprotocol/subscriptionId"]` (draft
+	// `params._meta["io.modelcontextprotocol/subscriptionId"]` (modern
 	// basic/utilities/subscriptions).
 	const listenerId = push.addListener((string frame) @safe {
 		writeFrame(frame);
@@ -1211,7 +1211,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	// delivered only to this stream (not broadcast to any other open listen stream).
 	// Built from this stream's filter — not the server-wide accumulator — so a
 	// concurrent (or already-closed) stream's opt-in cannot leak into this ack
-	// (draft basic/utilities/subscriptions Acknowledgment). It is stamped with the
+	// (2026-07-28 basic/utilities/subscriptions Acknowledgment). It is stamped with the
 	// subscriptionId by the push channel, so it carries the listen id in `_meta`
 	// like every subsequent notification on the stream.
 	push.emitTo(listenerId,
@@ -1220,7 +1220,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	runSseHeartbeat(writeFrame);
 }
 
-/// Whether `method` opens a draft `events/stream` push response.
+/// Whether `method` opens a modern `events/stream` push response.
 bool opensEventsStream(string method, bool modern) @safe
 {
 	return modern && method == "events/stream";
@@ -1273,7 +1273,7 @@ EventStreamTick eventStreamTick(bool emitOnly, long sinceHeartbeatMs) @safe pure
 	return t;
 }
 
-/// Serve a draft `events/stream` (push) request as a long-lived SSE response that
+/// Serve a modern `events/stream` (push) request as a long-lived SSE response that
 /// carries `notifications/events/*` for one subscription. The subscription is
 /// validated via the events runtime (an invalid one yields a JSON-RPC error and
 /// no stream); then the response is upgraded to `text/event-stream`, the leading
@@ -1407,8 +1407,8 @@ private void handleEventsStream(McpServer server, Message msg,
 /// Streamable HTTP transport that carry a per-connection token and
 /// `ConnectionState` but never stream server->client traffic. Two paths use it:
 /// an inbound `notifications/cancelled` (which reads the token to scope the
-/// in-flight cancellation key), and the draft `subscriptions/listen` route (which
-/// reads the `ConnectionState` so dispatch resolves the draft effective version
+/// in-flight cancellation key), and the modern `subscriptions/listen` route (which
+/// reads the `ConnectionState` so dispatch resolves the modern effective version
 /// before the long-lived stream is wired up on the push channel separately). It
 /// has no server->client channel — it never emits progress/logging or
 /// server-initiated requests — inheriting the no-op member bodies from
@@ -1420,9 +1420,9 @@ private final class HttpScopedContext : BaseRequestContext, ConnectionScoped
 	// The request's ConnectionState. For an inbound `notifications/cancelled` this
 	// is the session's state, so the cancellation flips the token in the SAME
 	// per-session in-flight registry the request side used (null in stateless mode,
-	// which has no cross-POST cancellation correlation). For the draft listen route
-	// it is the per-request draft state, so dispatch resolves the draft effective
-	// version and serves the draft-only listen RPC.
+	// which has no cross-POST cancellation correlation). For the modern listen route
+	// it is the per-request modern state, so dispatch resolves the modern effective
+	// version and serves the modern-only listen RPC.
 	private ConnectionState connState_;
 
 	this(string token, ConnectionState connState = null) @safe
@@ -1447,10 +1447,10 @@ private final class HttpScopedContext : BaseRequestContext, ConnectionScoped
 	}
 }
 
-/// Route a draft `subscriptions/listen` through `server.handle` with the
-/// caller's draft-aware per-request `ConnectionState`, so dispatch resolves the
-/// draft effective version — and thus the draft-only listen RPC — even when the
-/// draft was signalled by the `MCP-Protocol-Version` header alone (no body
+/// Route a modern `subscriptions/listen` through `server.handle` with the
+/// caller's modern-aware per-request `ConnectionState`, so dispatch resolves the
+/// modern effective version — and thus the modern-only listen RPC — even when the
+/// modern was signalled by the `MCP-Protocol-Version` header alone (no body
 /// `_meta.protocolVersion`). On success the server has recorded this request's
 /// per-stream filter on `reqState.listenFilter` and `null` is returned; when
 /// routing rejects the request the JSON-RPC error response is returned for the
@@ -1464,13 +1464,13 @@ private Nullable!Json routeListenRequest(McpServer server, Message msg,
 	return Nullable!Json.init;
 }
 
-unittest  // a draft listen signalled by the header alone routes against the draft version
+unittest  // a modern listen signalled by the header alone routes against the modern version
 {
 	import mcp.protocol.jsonrpc : makeRequest, Message;
 
-	// A draft client may signal the draft via the MCP-Protocol-Version header
+	// A modern client may signal the modern via the MCP-Protocol-Version header
 	// alone, with no `_meta.protocolVersion` in the body. The listen routing must
-	// still dispatch against the draft effective version so the draft-only
+	// still dispatch against the modern effective version so the modern-only
 	// subscriptions/listen RPC is served (not -32601 methodNotFound) and THIS
 	// request's opt-in filter is recorded — not dropped on an error path that
 	// would open the stream with a stale filter.
@@ -1485,7 +1485,7 @@ unittest  // a draft listen signalled by the header alone routes against the dra
 
 	auto reqState = freshStatelessState("2026-07-28", params, server.negotiatedVersion);
 	auto routed = routeListenRequest(server, msg, reqState, "");
-	assert(routed.isNull, "a header-signalled draft listen must route, not error");
+	assert(routed.isNull, "a header-signalled modern listen must route, not error");
 	assert(reqState.listenFilter.active);
 	assert(reqState.listenFilter.toolsListChanged);
 }
@@ -1529,19 +1529,19 @@ unittest  // concurrent listens each keep their own per-stream filter
 			"stream B must keep its own promptsListChanged opt-in");
 }
 
-/// Validate the draft-only request headers on a POSTed JSON-RPC request, returning
+/// Validate the modern-only request headers on a POSTed JSON-RPC request, returning
 /// the first error (caller emits it as a 400) or null when they pass. The
 /// MCP-Protocol-Version header is already validated by `postProtocolVersionGate`.
 private McpException validatePostRequestHeaders(HTTPServerRequest req,
 		ref Message msg, bool isModernReq, McpServer server) @safe
 {
-	// Draft: validate the standard request headers against the body.
+	// Modern: validate the standard request headers against the body.
 	if (auto hdrErr = validateModernHeaders(req.headers.get(HttpHeader.protocolVersion,
 			""), req.headers.get(HttpHeader.method, ""),
 			req.headers.get(HttpHeader.name, ""), msg, isModernReq))
 		return hdrErr;
 
-	// Draft x-mcp-header: validate Mcp-Param-* headers against the tool's
+	// Modern x-mcp-header: validate Mcp-Param-* headers against the tool's
 	// declared header parameters and the body arguments.
 	if (msg.method == "tools/call" && isModernReq)
 	{
@@ -1612,7 +1612,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		.headers.get(SessionHeader, "") : "";
 
 	// JSON-RPC batching (an array body) was introduced in 2025-03-26 and removed
-	// in every later revision: 2025-06-18 / 2025-11-25 / draft all require the
+	// in every later revision: 2025-06-18 / 2025-11-25 / modern all require the
 	// POST body to be a SINGLE request, notification, or response
 	// (basic/transports §Sending Messages). The MCP-Protocol-Version header is
 	// first validated by postProtocolVersionGate (so an invalid/unsupported
@@ -1755,12 +1755,12 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 				return;
 			}
 		}
-		// The effective draft signal for this request: the draft protocol is
+		// The effective modern signal for this request: the modern protocol is
 		// stateless-only and may negotiate via the body `_meta.protocolVersion`
-		// alone (absent/non-draft MCP-Protocol-Version header), so classify the
-		// request as draft on header OR body — the same precedence the rest of this
+		// alone (absent/legacy MCP-Protocol-Version header), so classify the
+		// request as modern on header OR body — the same precedence the rest of this
 		// handler (opensListenStream, httpStatusForResponse, freshStatelessState)
-		// uses. All draft-gated header validation below keys off this single value.
+		// uses. All modern-gated header validation below keys off this single value.
 		const isModernReq = tryModern(req.headers.get(HttpHeader.protocolVersion, ""))
 			|| tryModern(RequestMeta.fromParams(msg.params).protocolVersion);
 		if (auto hdrErr = validatePostRequestHeaders(req, msg, isModernReq, server))
@@ -1773,15 +1773,15 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			res.writeBody(makeErrorResponse(msg.id, hdrErr).toString(), "application/json");
 			return;
 		}
-		// Draft subscriptions/listen: the response is itself a long-lived SSE
+		// Modern subscriptions/listen: the response is itself a long-lived SSE
 		// stream that stays open and delivers change notifications until the
-		// client closes it (draft basic/transports / basic/utilities/
+		// client closes it (2026-07-28 basic/transports / basic/utilities/
 		// subscriptions). Record the opted-in filters, open the stream, send the
 		// acknowledgement as the first event, then hold it open — wired to the
 		// server-push channel so notify*/notifyResourceUpdated reach it.
 		if (opensListenStream(msg.method, isModernReq))
 		{
-			// subscriptions/listen is a DRAFT RPC and the draft protocol is
+			// subscriptions/listen is a DRAFT RPC and the modern protocol is
 			// stateless-only, so it MUST work on a stateless server too. It is a single
 			// self-contained long-lived HTTP request: this POST opens the SSE response
 			// stream, and notify*/notifyResourceUpdated stream
@@ -1790,7 +1790,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			// It needs NO session, NO Mcp-Session-Id, NO inbound correlation; delivery
 			// is driven by this stream's own per-URI `ListenFilter` at the push
 			// channel. (The 2025-era resources/subscribe RPC and the standalone GET
-			// stream stay gated in stateless; only this draft listen path is opened.)
+			// stream stay gated in stateless; only this modern listen path is opened.)
 			//
 			// The response is always text/event-stream. A client whose Accept provably
 			// excludes it could not read the stream, so refuse with 406 rather than
@@ -1807,7 +1807,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 					req.headers.get(HttpHeader.protocolVersion, ""), connToken);
 			return;
 		}
-		// Draft events/stream (push): like subscriptions/listen, this POST opens a
+		// Modern events/stream (push): like subscriptions/listen, this POST opens a
 		// long-lived SSE response that streams `notifications/events/*` for one
 		// subscription until the client disconnects. It is self-contained (no
 		// session, no inbound correlation), so it works on a stateless server too.
@@ -1849,7 +1849,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 				token, isModernReq, effVersion, connToken, reqState,
 				server.mode == ServerMode.stateless, reqAcceptsSse);
 		auto resp = server.handle(msg, ctx);
-		// Draft basic/utilities/cancellation §Transport-Specific Cancellation: on
+		// Modern basic/utilities/cancellation §Transport-Specific Cancellation: on
 		// Streamable HTTP "Closing the SSE response stream is the cancellation
 		// signal. The server MUST treat a client disconnect as cancellation of that
 		// request. No notifications/cancelled message is required or expected." If the
@@ -1859,14 +1859,14 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// connection still completes the write, which is a harmless no-op there.
 		if (suppressOnDisconnect(isModernReq, res.connected))
 		{
-			// The draft is stateless-only, so it never mints a session; the rollback
+			// 2026-07-28 is stateless-only, so it never mints a session; the rollback
 			// is a no-op there. Kept for symmetry: a suppressed initialize must not
 			// leave a session behind.
 			sessions !is null && sessions.terminate(mintedSessionId);
 			return;
 		}
 		// A request whose handling was cancelled mid-flight (e.g. a
-		// `notifications/cancelled` arrived on a sibling POST, or the draft
+		// `notifications/cancelled` arrived on a sibling POST, or 2026-07-28
 		// client-disconnect cancellation) returns a NULL response: the spec says no
 		// response is sent for a cancelled request. Guard the dereference exactly as
 		// the stdio path does (`resp.isNull ? <no response> : resp.get`) so a
@@ -1912,7 +1912,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		else
 		{
 			// Map reserved JSON-RPC errors onto their required HTTP statuses
-			// (400 for unsupported-version/header-mismatch, draft 404 for
+			// (400 for unsupported-version/header-mismatch, modern 404 for
 			// method-not-found); everything else rides on 200.
 			res.statusCode = httpStatusForResponse(j, isModernReq);
 			res.writeBody(j.toString(), "application/json");
@@ -1972,13 +1972,13 @@ unittest  // the standalone GET SSE stream uses the same session gate as POST/DE
 
 /// Map a JSON-RPC response to the HTTP status the Streamable HTTP transport must
 /// surface. Successful results and ordinary application errors ride on `200`.
-/// The draft reserves specific statuses so intermediaries — and clients probing
+/// The modern reserves specific statuses so intermediaries — and clients probing
 /// modern-vs-legacy servers — can act without parsing the body:
 ///   - `UnsupportedProtocolVersionError` (-32022) -> `400` (all modern versions),
 ///   - `HeaderMismatch` (-32020) -> `400`,
 ///   - `MissingRequiredClientCapability` (-32021) -> `400` (all modern versions),
-///   - `Method not found` (-32601) -> `404` on draft requests, which lets a client
-///     tell a modern MCP endpoint apart from a legacy HTTP+SSE `404`. Pre-draft
+///   - `Method not found` (-32601) -> `404` on modern requests, which lets a client
+///     tell a modern MCP endpoint apart from a legacy HTTP+SSE `404`. Legacy
 ///     versions keep the legacy JSON-RPC-error-over-`200` shape.
 int httpStatusForResponse(Json resp, bool modern) @safe
 {
@@ -2028,52 +2028,52 @@ unittest  // a successful InitializeResult commits; an error response does not
 }
 
 /// Decide whether a finished POST response must be suppressed because the client
-/// disconnected mid-request. On the draft Streamable HTTP transport a client
-/// disconnect IS the cancellation signal (draft basic/utilities/cancellation
+/// disconnected mid-request. On the modern Streamable HTTP transport a client
+/// disconnect IS the cancellation signal (2026-07-28 basic/utilities/cancellation
 /// §Transport-Specific Cancellation: "Closing the SSE response stream is the
 /// cancellation signal. The server MUST treat a client disconnect as cancellation
 /// of that request. No notifications/cancelled message is required or expected.").
-/// So when the connection has dropped on a draft request, the response is
+/// So when the connection has dropped on a modern request, the response is
 /// suppressed. Released versions (2025-*) never suppress on this basis: that MUST
-/// is draft-only, so their wire behaviour is unchanged.
+/// is modern-only, so their wire behaviour is unchanged.
 bool suppressOnDisconnect(bool modern, bool connected) @safe pure nothrow @nogc
 {
 	return modern && !connected;
 }
 
-unittest  // draft: a disconnected client cancels the request -> response suppressed
+unittest  // modern: a disconnected client cancels the request -> response suppressed
 {
 	assert(suppressOnDisconnect(true, false));
 }
 
-unittest  // draft: a still-connected client gets its response (no suppression)
+unittest  // modern: a still-connected client gets its response (no suppression)
 {
 	assert(!suppressOnDisconnect(true, true));
 }
 
-unittest  // released versions never suppress on disconnect (draft-only MUST)
+unittest  // released versions never suppress on disconnect (modern-only MUST)
 {
 	assert(!suppressOnDisconnect(false, false));
 	assert(!suppressOnDisconnect(false, true));
 }
 
-/// Validate the draft Streamable HTTP request headers against the JSON-RPC body.
+/// Validate the modern Streamable HTTP request headers against the JSON-RPC body.
 /// Returns a `HeaderMismatch` (-32020) exception on failure, or null when the
-/// request is valid — or when the request is not a draft request (older versions
+/// request is valid — or when the request is not a modern request (older versions
 /// did not define these headers, so they are not enforced).
 ///
-/// `modern` is the effective draft signal for the request (header OR body
+/// `modern` is the effective modern signal for the request (header OR body
 /// `_meta.protocolVersion`), matching how the rest of the POST handler classifies
-/// the request: the draft protocol is stateless-only and may negotiate via the
-/// body alone, so a body-only-draft request still has its draft headers enforced.
+/// the request: the modern protocol is stateless-only and may negotiate via the
+/// body alone, so a body-only-modern request still has its modern headers enforced.
 McpException validateModernHeaders(string protoHeader, string methodHeader,
 		string nameHeader, Message msg, bool modern) @safe
 {
 	if (!modern)
-		return null; // not a draft request: do not enforce draft headers
+		return null; // not a modern request: do not enforce modern headers
 
 	// Header requirements for notification POSTs are not defined by this revision
-	// (basic/transports §Sending Messages, Note): a draft notification POST is
+	// (basic/transports §Sending Messages, Note): a modern notification POST is
 	// accepted regardless of its request-metadata headers, so Mcp-Method/Mcp-Name
 	// are not enforced for it.
 	if (msg.kind == MessageKind.notification)
@@ -2087,8 +2087,8 @@ McpException validateModernHeaders(string protoHeader, string methodHeader,
 				~ "' does not match body method '" ~ msg.method ~ "'");
 
 	// When the MCP-Protocol-Version header IS present it must match the body's
-	// _meta protocol version. A body-only-draft request (absent header) is a valid
-	// draft negotiation, so an empty header is not a mismatch.
+	// _meta protocol version. A body-only-modern request (absent header) is a valid
+	// modern negotiation, so an empty header is not a mismatch.
 	auto bodyMeta = RequestMeta.fromParams(msg.params);
 	if (protoHeader.length && bodyMeta.protocolVersion.length
 			&& bodyMeta.protocolVersion != protoHeader)
@@ -2727,7 +2727,7 @@ version (unittest)
 	}
 }
 
-unittest  // pre-draft requests skip draft header enforcement
+unittest  // legacy requests skip modern header enforcement
 {
 	auto m = Message(makeRequest(Json(1), "tools/list", Json.emptyObject));
 	// protocol header empty / older -> no enforcement
@@ -2735,27 +2735,27 @@ unittest  // pre-draft requests skip draft header enforcement
 	assert(validateModernHeaders("2025-11-25", "", "", m, false) is null);
 }
 
-unittest  // draft request missing Mcp-Method is a header mismatch
+unittest  // modern request missing Mcp-Method is a header mismatch
 {
 	auto m = modernMsg("tools/list", Json.emptyObject);
 	auto e = validateModernHeaders("2026-07-28", "", "", m, true);
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
-unittest  // draft request with mismatched Mcp-Method fails
+unittest  // modern request with mismatched Mcp-Method fails
 {
 	auto m = modernMsg("tools/list", Json.emptyObject);
 	auto e = validateModernHeaders("2026-07-28", "tools/call", "", m, true);
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
-unittest  // draft tools/list with correct headers passes
+unittest  // modern tools/list with correct headers passes
 {
 	auto m = modernMsg("tools/list", Json.emptyObject);
 	assert(validateModernHeaders("2026-07-28", "tools/list", "", m, true) is null);
 }
 
-unittest  // draft tools/call requires matching Mcp-Name
+unittest  // modern tools/call requires matching Mcp-Name
 {
 	Json p = Json.emptyObject;
 	p["name"] = "add";
@@ -2767,7 +2767,7 @@ unittest  // draft tools/call requires matching Mcp-Name
 	assert(e2 !is null); // missing name
 }
 
-unittest  // draft resources/read mirrors uri into Mcp-Name
+unittest  // modern resources/read mirrors uri into Mcp-Name
 {
 	Json p = Json.emptyObject;
 	p["uri"] = "test://x";
@@ -2776,7 +2776,7 @@ unittest  // draft resources/read mirrors uri into Mcp-Name
 	assert(validateModernHeaders("2026-07-28", "resources/read", "test://y", m, true) !is null);
 }
 
-unittest  // draft Mcp-Name is sentinel-decoded before matching the body value
+unittest  // modern Mcp-Name is sentinel-decoded before matching the body value
 {
 	import mcp.protocol.mrtr : encodeHeaderValue;
 
@@ -2793,7 +2793,7 @@ unittest  // draft Mcp-Name is sentinel-decoded before matching the body value
 			encodeHeaderValue("test://other"), m, true) !is null);
 }
 
-unittest  // draft notification POST is accepted regardless of Mcp-Method (headers not defined)
+unittest  // modern notification POST is accepted regardless of Mcp-Method (headers not defined)
 {
 	// basic/transports §Sending Messages (Note): header requirements for
 	// notification POSTs are not defined by this revision, so a notification is
@@ -2806,22 +2806,22 @@ unittest  // draft notification POST is accepted regardless of Mcp-Method (heade
 			mismatched, true) is null); // mismatched Mcp-Method
 }
 
-unittest  // body-only draft (absent MCP-Protocol-Version header) still enforces Mcp-Method
+unittest  // body-only modern (absent MCP-Protocol-Version header) still enforces Mcp-Method
 {
-	// The draft is stateless-only and may negotiate via params._meta.protocolVersion
+	// 2026-07-28 is stateless-only and may negotiate via params._meta.protocolVersion
 	// alone. A mismatched Mcp-Method/Mcp-Name on such a request MUST still be
 	// rejected, even though the MCP-Protocol-Version header is absent.
 	Json p = Json.emptyObject;
 	p["name"] = "add";
-	auto m = modernMsg("tools/call", p); // body _meta carries the draft version
-	// absent proto header, but effective-draft flag true: a wrong Mcp-Method fails.
+	auto m = modernMsg("tools/call", p); // body _meta carries the modern version
+	// absent proto header, but effective-modern flag true: a wrong Mcp-Method fails.
 	auto e = validateModernHeaders("", "tools/call", "wrong", m, true);
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
-unittest  // body-only draft with absent header but correct headers passes (no false version mismatch)
+unittest  // body-only modern with absent header but correct headers passes (no false version mismatch)
 {
-	// An absent MCP-Protocol-Version header against a body-only-draft request is a
+	// An absent MCP-Protocol-Version header against a body-only-modern request is a
 	// valid negotiation: it must not be flagged as a header/_meta version mismatch.
 	Json p = Json.emptyObject;
 	p["name"] = "add";
@@ -2829,7 +2829,7 @@ unittest  // body-only draft with absent header but correct headers passes (no f
 	assert(validateModernHeaders("", "tools/call", "add", m, true) is null);
 }
 
-unittest  // pre-draft notification skips draft header enforcement
+unittest  // legacy notification skips modern header enforcement
 {
 	auto m = Message(makeNotification("notifications/initialized", Json.emptyObject));
 	assert(validateModernHeaders("2025-11-25", "", "", m, false) is null);
@@ -2909,7 +2909,7 @@ unittest  // the standalone GET stream is version-gated like a POST: bad version
 	// than opening a 200 text/event-stream or a 405. handleGet runs
 	// postProtocolVersionGate (the same gate every POST kind runs) ahead of the
 	// mode/getOpensSseStream 405 gate and before setting Content-Type, so the
-	// rejecting McpException maps to HTTP 400 even for a stateless/draft server.
+	// rejecting McpException maps to HTTP 400 even for a stateless/modern server.
 	auto bad = postProtocolVersionGate("1.0.0");
 	assert(bad !is null, "an invalid version on the standalone GET must be rejected");
 	assert(bad.code == ErrorCode.unsupportedProtocolVersion);
@@ -2938,7 +2938,7 @@ unittest  // DELETE is version-gated like POST/GET: bad version -> 400, not 204/
 	assert(postProtocolVersionGate("") is null);
 }
 
-/// True if the protocol-version header denotes a draft+ request.
+/// True if the protocol-version header denotes a modern+ request.
 private bool tryModern(string protoHeader) @safe
 {
 	ProtocolVersion pv;
@@ -2963,7 +2963,7 @@ private ProtocolVersion effectivePostVersion(string protoHeader, ProtocolVersion
 /// (`mintedSessionId`), otherwise the `Mcp-Session-Id` header (`connToken`).
 ///
 /// Stateless HTTP:
-///   - A MODERN-stateless (draft / MRTR) request is fully self-describing: its
+///   - A MODERN-stateless (modern / MRTR) request is fully self-describing: its
 ///     protocol version, client capabilities, and log level all travel in the
 ///     request's own `_meta` on EVERY call (there is no `initialize` handshake to
 ///     remember). So a FRESH per-request `ConnectionState` (`freshStatelessState`)
@@ -2971,7 +2971,7 @@ private ProtocolVersion effectivePostVersion(string protoHeader, ProtocolVersion
 ///     and two such requests can never observe each other's state. This is the
 ///     structural "no shared state across HTTP calls" guarantee for the stateless
 ///     protocol that was designed for it.
-///   - A pre-draft (stable-version) stateless request belongs to the SDK's single
+///   - A legacy (stable-version) stateless request belongs to the SDK's single
 ///     implicit-peer model: a stable client still performs an `initialize`
 ///     handshake whose negotiated capabilities the server MUST honour on the later
 ///     `tools/call` over the same connection. There is no per-request `_meta`
@@ -2993,9 +2993,9 @@ private ConnectionState postState(McpServer server, SessionManager sessions,
 /// The client capabilities a `HttpStreamContext` should advertise for a request,
 /// taken from the request's resolved `ConnectionState`: the
 /// session's negotiated caps (stateful) or the per-request `_meta` caps
-/// (modern-stateless draft), so `ctx.clientSupports` reflects THIS connection
+/// (modern-modern), so `ctx.clientSupports` reflects THIS connection
 /// rather than a sibling's. Falls back to the server's bound view when no state
-/// was resolved (pre-draft stateless single-peer / stateful fallback).
+/// was resolved (legacy stateless single-peer / stateful fallback).
 private ClientCapabilities clientCapsFor(McpServer server, ConnectionState reqState) @safe
 {
 	if (reqState !is null)
@@ -3003,18 +3003,18 @@ private ClientCapabilities clientCapsFor(McpServer server, ConnectionState reqSt
 	return server.clientCapabilities;
 }
 
-/// Build the FRESH per-request `ConnectionState` for a MODERN-stateless (draft /
-/// MRTR) HTTP POST, or return `null` for a pre-draft stateless request.
+/// Build the FRESH per-request `ConnectionState` for a MODERN-stateless (modern /
+/// MRTR) HTTP POST, or return `null` for a legacy stateless request.
 ///
-/// Only the draft (stateless) protocol is fully self-describing — every request
+/// Only the modern (stateless) protocol is fully self-describing — every request
 /// carries its own protocol version, capabilities, and log level in `_meta`, with
 /// no `initialize` handshake to remember — so only there can a request be served
 /// from a transient state the server retains nowhere. The fresh state is seeded
 /// from the request's `_meta` (the per-request
 /// `io.modelcontextprotocol/clientCapabilities` / `logLevel`), mirroring how the
-/// draft dispatch path already reads them.
+/// modern dispatch path already reads them.
 ///
-/// For a pre-draft (stable-version) request this returns `null`: a stable client
+/// For a legacy (stable-version) request this returns `null`: a stable client
 /// negotiates capabilities once at `initialize` that the server must honour on
 /// later requests over the same connection, which is the single implicit-peer
 /// model held in `activeConnection` (the server falls back to it on null). The
@@ -3034,7 +3034,7 @@ private ConnectionState freshStatelessState(string protoHeader, Json params,
 	ProtocolVersion mv;
 	if (meta.protocolVersion.length && tryParseVersion(meta.protocolVersion, mv))
 		eff = mv;
-	// Pre-draft stateless: defer to the single implicit-peer `activeConnection`
+	// Legacy stateless: defer to the single implicit-peer `activeConnection`
 	// (return null) so an initialize-negotiated capability survives to tools/call.
 	if (!eff.isModern)
 		return null;
@@ -3046,7 +3046,7 @@ private ConnectionState freshStatelessState(string protoHeader, Json params,
 	return conn;
 }
 
-unittest  // a pre-draft stateless request defers to activeConnection (null)
+unittest  // a legacy stateless request defers to activeConnection (null)
 {
 	import vibe.data.json : Json;
 
@@ -3058,12 +3058,12 @@ unittest  // a pre-draft stateless request defers to activeConnection (null)
 	assert(freshStatelessState("", Json.emptyObject, ProtocolVersion.v2025_11_25) is null);
 }
 
-unittest  // a modern (draft/MRTR) stateless request gets a FRESH state from _meta
+unittest  // a modern (modern/MRTR) stateless request gets a FRESH state from _meta
 {
 	import vibe.data.json : parseJsonString;
 	import mcp.protocol.mrtr : MetaKey;
 
-	// The draft request carries its capabilities + log level in _meta; the fresh
+	// The modern request carries its capabilities + log level in _meta; the fresh
 	// per-request state is built from them and retained nowhere.
 	auto params = parseJsonString(
 			`{"_meta":{` ~ `"io.modelcontextprotocol/clientCapabilities":{"sampling":{}},`
@@ -3079,7 +3079,7 @@ unittest  // two modern-stateless requests resolve to INDEPENDENT states
 {
 	import vibe.data.json : parseJsonString;
 
-	// Two draft requests with different _meta capabilities must yield distinct
+	// Two modern requests with different _meta capabilities must yield distinct
 	// ConnectionState objects: there is no shared state across the two HTTP calls.
 	auto pA = parseJsonString(
 			`{"_meta":{"io.modelcontextprotocol/clientCapabilities":{"sampling":{}}}}`);
@@ -3097,7 +3097,7 @@ unittest  // two modern-stateless requests resolve to INDEPENDENT states
 /// POST endpoint for the given effective protocol version.
 ///
 /// JSON-RPC batching was introduced in 2025-03-26 and REMOVED thereafter:
-/// 2025-06-18 / 2025-11-25 / draft all state "The body of the POST request MUST
+/// 2025-06-18 / 2025-11-25 / modern all state "The body of the POST request MUST
 /// be a single JSON-RPC request, notification, or response" (basic/transports
 /// §Sending Messages), and their `JSONRPCMessage` schema no longer includes the
 /// batch union members. So batches are accepted ONLY for 2025-03-26 back-compat;
@@ -3173,17 +3173,17 @@ unittest  // an unparseable / non-envelope POST body throws so handlePost answer
 
 /// Decide whether a request must be answered with a long-lived `text/event-stream`
 /// notification stream rather than the ordinary one-shot JSON response
-/// (draft basic/transports / basic/utilities/subscriptions). Only the draft
+/// (2026-07-28 basic/transports / basic/utilities/subscriptions). Only 2026-07-28
 /// `subscriptions/listen` request takes this path: "The server's response is
 /// itself an SSE stream that stays open and delivers the change notifications."
-/// Pre-draft versions never defined `subscriptions/listen`, so they answer
+/// Legacy versions never defined `subscriptions/listen`, so they answer
 /// normally.
 bool opensListenStream(string method, bool modern) @safe
 {
 	return modern && method == "subscriptions/listen";
 }
 
-unittest  // only a draft subscriptions/listen opens the long-lived stream
+unittest  // only a modern subscriptions/listen opens the long-lived stream
 {
 	assert(opensListenStream("subscriptions/listen", true));
 	assert(!opensListenStream("subscriptions/listen", false));
@@ -3191,7 +3191,7 @@ unittest  // only a draft subscriptions/listen opens the long-lived stream
 	assert(!opensListenStream("initialize", true));
 }
 
-unittest  // only a draft events/stream opens the push response
+unittest  // only a modern events/stream opens the push response
 {
 	assert(opensEventsStream("events/stream", true));
 	assert(!opensEventsStream("events/stream", false));
@@ -3282,7 +3282,7 @@ unittest  // an initialize that fails header validation mints no surviving sessi
 	auto router = new URLRouter;
 	mountMcp(router, server);
 
-	// A draft-tagged initialize whose Mcp-Method header mismatches the body method
+	// A modern-tagged initialize whose Mcp-Method header mismatches the body method
 	// fails validatePostRequestHeaders -> 400, exercising the rollback path: the
 	// minted session must be terminated and NO Mcp-Session-Id stamped on the error.
 	auto sink = createMemoryOutputStream();
@@ -3351,12 +3351,12 @@ unittest  // an events/stream POST whose Accept excludes text/event-stream is 40
 /// Build the leading event the transport sends when it opens a
 /// `subscriptions/listen` stream: a `notifications/subscriptions/acknowledged`
 /// notification carrying the agreed-upon subset of change-notification types the
-/// server will deliver on the stream (draft basic/utilities/subscriptions). The
+/// server will deliver on the stream (2026-07-28 basic/utilities/subscriptions). The
 /// `subset` is what `McpServer.acknowledgedSubsetFor` reported for that one
 /// stream's filter (each subscription is independent — §Multiple Concurrent
 /// Subscriptions).
 ///
-/// Per the draft spec the agreed subset is nested under `params.notifications`
+/// Per the 2026-07-28 spec the agreed subset is nested under `params.notifications`
 /// (mirroring the `notifications` filter the client sent in the listen request);
 /// the matching `io.modelcontextprotocol/subscriptionId` is stamped into
 /// `params._meta` by the push channel when the event is delivered to the stream.
@@ -3373,7 +3373,7 @@ unittest  // the acknowledgement nests the agreed subset under params.notificati
 	subset["toolsListChanged"] = true;
 	auto n = subscriptionsAcknowledgedNotification(subset);
 	assert(n["method"].get!string == "notifications/subscriptions/acknowledged");
-	// draft basic/utilities/subscriptions: the agreed subset is wrapped under
+	// 2026-07-28 basic/utilities/subscriptions: the agreed subset is wrapped under
 	// `params.notifications`, not placed at the top level of params.
 	assert(n["params"]["notifications"]["toolsListChanged"].get!bool);
 	assert("toolsListChanged" !in n["params"]);
@@ -3389,7 +3389,7 @@ unittest  // an empty agreed subset still produces an empty params.notifications
 }
 
 /// Render a primitive JSON value as its `Mcp-Param-*` header string. Per the
-/// draft `x-mcp-header` constraints, only `integer`, `string`, and `boolean` are
+/// modern `x-mcp-header` constraints, only `integer`, `string`, and `boolean` are
 /// permitted; `number` (float) and any other type are NOT mirror-able and are
 /// reported via `ok = false` so the caller can reject the request rather than
 /// silently stringify them.
@@ -3432,11 +3432,11 @@ private Json resolveArgPath(Json args, const(string)[] path, out bool present) @
 	return cur;
 }
 
-/// Validate draft `x-mcp-header` mirroring: every parameter annotated with
+/// Validate modern `x-mcp-header` mirroring: every parameter annotated with
 /// `x-mcp-header` (at any nesting depth) whose value is present in `args` MUST
 /// have a matching (decoded) `Mcp-Param-*` header; absent parameters MUST NOT
 /// carry the header. The annotation set itself is also validated against the
-/// draft value constraints (non-empty, HTTP token syntax, no CR/LF, primitive
+/// modern value constraints (non-empty, HTTP token syntax, no CR/LF, primitive
 /// types only with `number` forbidden, case-insensitive uniqueness). Returns a
 /// `HeaderMismatch` exception on violation, else null.
 McpException validateParamHeaders(Json inputSchema, Json args,
@@ -3444,7 +3444,7 @@ McpException validateParamHeaders(Json inputSchema, Json args,
 {
 	import std.array : join;
 
-	// Reject malformed x-mcp-header annotations up front per the draft.
+	// Reject malformed x-mcp-header annotations up front per 2026-07-28.
 	auto schemaErr = validateInputSchemaHeaders(inputSchema);
 	if (schemaErr !is null)
 		return new McpException(ErrorCode.headerMismatch, schemaErr);
@@ -3646,13 +3646,13 @@ unittest  // MissingRequiredClientCapability maps to HTTP 400 on any modern vers
 	assert(httpStatusForResponse(r, false) == 400);
 }
 
-unittest  // draft Method-not-found maps to HTTP 404 (distinguishes modern endpoint from legacy)
+unittest  // modern Method-not-found maps to HTTP 404 (distinguishes modern endpoint from legacy)
 {
 	auto r = errResponse(ErrorCode.methodNotFound);
 	assert(httpStatusForResponse(r, true) == 404);
 }
 
-unittest  // pre-draft Method-not-found stays on HTTP 200 (legacy JSON-RPC-over-200 shape)
+unittest  // legacy Method-not-found stays on HTTP 200 (legacy JSON-RPC-over-200 shape)
 {
 	auto r = errResponse(ErrorCode.methodNotFound);
 	assert(httpStatusForResponse(r, false) == 200);
@@ -3665,7 +3665,7 @@ unittest  // ordinary application errors (e.g. invalidParams) ride on HTTP 200
 	assert(httpStatusForResponse(r, false) == 200);
 }
 
-unittest  // draft subscriptions/listen: ack first, then opted-in change notifications flow
+unittest  // modern subscriptions/listen: ack first, then opted-in change notifications flow
 {
 	import mcp.transport.sse_context : StreamCoordinator, ServerPushChannel;
 	import mcp.protocol.mrtr : MetaKey;
@@ -3673,10 +3673,10 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
 
 	auto server = new McpServer("t", "1");
 	// The server must advertise the tools list-changed capability for the
-	// toolsListChanged opt-in to be honored (draft basic/utilities/subscriptions).
+	// toolsListChanged opt-in to be honored (2026-07-28 basic/utilities/subscriptions).
 	server.enableToolsListChanged();
 
-	// Drive the server onto the draft via a draft subscriptions/listen request,
+	// Drive the server onto the modern via a modern subscriptions/listen request,
 	// mirroring what handleListenStream does: record the opted-in filters.
 	Json listenParams = Json.emptyObject;
 	listenParams["toolsListChanged"] = true;
@@ -3701,7 +3701,7 @@ unittest  // draft subscriptions/listen: ack first, then opted-in change notific
 			server.acknowledgedSubsetFor(reqState.listenFilter)));
 	assert(frames.length == 1);
 	assert(frames[0].canFind("notifications/subscriptions/acknowledged"));
-	// The agreed subset is nested under params.notifications (draft spec shape).
+	// The agreed subset is nested under params.notifications (2026-07-28 spec shape).
 	assert(frames[0].canFind("\"notifications\""));
 	assert(frames[0].canFind("toolsListChanged"));
 	// The ack is the FIRST message and carries the subscriptionId (the listen id).

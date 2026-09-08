@@ -2,15 +2,15 @@
  * Caching (CacheableResult) example — client side AND self-verifying e2e test,
  * over BOTH stdio and Streamable HTTP.
  *
- * Connects to the caching server (draft / stateless), then asserts the server's
+ * Connects to the caching server (modern / stateless), then asserts the server's
  * cache behavior matches exactly what server.d set:
  *
  *   1. resources/list carries the PER-LIST hint (ttlMs=5000, scope=public)
  *      and lists both registered resources.
  *   2. reading config://app carries the PER-RESOURCE hint
  *      (ttlMs=60000, scope=private) and the expected body.
- *   3. reading status://live (no @cache) carries the draft-mandatory do-not-cache
- *      default hint (ttlMs:0, public) — the draft CacheableResult schema requires
+ *   3. reading status://live (no @cache) carries the modern-mandatory do-not-cache
+ *      default hint (ttlMs:0, public) — the modern CacheableResult schema requires
  *      ttlMs on every cacheable result.
  *
  * Transport selection (same assertions either way) is handled by the shared
@@ -58,7 +58,7 @@ int main(string[] args) @safe
 		scope (exit)
 			client.close();
 
-		// Cache hints are a draft-only feature: speak the stateless draft
+		// Cache hints are a modern-only feature: speak the modern protocol
 		// protocol (no initialize handshake). Transport-agnostic — the same call
 		// works over stdio and HTTP.
 		client.enableModern();
@@ -81,13 +81,13 @@ int main(string[] args) @safe
 		checkEq(cfg.cache.get.ttl, ExpectConfigTtl, "config://app ttl");
 		checkEq(cfg.cache.get.cacheScope, CacheScope.private_, "config://app cacheScope");
 
-		// --- 3. status://live has no @cache UDA, so under the draft protocol it
+		// --- 3. status://live has no @cache UDA, so under the modern protocol it
 		//        still carries the MANDATORY freshness hint as the conservative
-		//        do-not-cache default (ttlMs:0, public scope) — the draft
+		//        do-not-cache default (ttlMs:0, public scope) — 2026-07-28
 		//        CacheableResult schema requires ttlMs on every cacheable result.
 		auto st = client.readResource("status://live");
 		check(!st.cache.isNull,
-			"status://live read should carry the draft do-not-cache default hint (ttlMs:0)");
+			"status://live read should carry the modern do-not-cache default hint (ttlMs:0)");
 		checkEq(st.cache.get.ttl, Duration.zero,
 			"status://live ttl should be zero (do-not-cache default)");
 		checkEq(st.cache.get.cacheScope, CacheScope.public_,

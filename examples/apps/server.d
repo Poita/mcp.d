@@ -7,7 +7,7 @@
 ///   - `registerUiResource` to publish the linked `ui://` HTML resource with the
 ///     `text/html;profile=mcp-app` MIME type and a `_meta.ui` carrying CSP /
 ///     border hints;
-///   - `enableApps` to declare the extension capability (surfaced to draft
+///   - `enableApps` to declare the extension capability (surfaced to modern
 ///     clients via the `extensions` negotiation map).
 ///
 /// MCP Apps is, on the server side, metadata plus a resource convention: the
@@ -68,7 +68,7 @@ void main(string[] args) @safe
 	// Register the @tool/@ui free function(s) in this module.
 	registerModule!(apps_server)(server);
 
-	// Declare MCP Apps support (visible to draft clients via the extensions map).
+	// Declare MCP Apps support (visible to modern clients via the extensions map).
 	enableApps(server);
 
 	// Publish the ui:// resource the tool links to, with CSP + border hints.

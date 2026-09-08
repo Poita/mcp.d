@@ -2,8 +2,8 @@ module mcp.client.subscription;
 
 import core.atomic : atomicLoad, cas;
 
-/// The set of change-notification types a draft client opts into when opening a
-/// `subscriptions/listen` stream (draft basic/utilities/subscriptions). The three
+/// The set of change-notification types a modern client opts into when opening a
+/// `subscriptions/listen` stream (2026-07-28 basic/utilities/subscriptions). The three
 /// list-changed booleans request `notifications/tools|prompts|resources/list_changed`;
 /// `resourceSubscriptions` lists the resource URIs the client wants
 /// `notifications/resources/updated` for. This is serialised under
@@ -31,7 +31,7 @@ final class SubscriptionStream
 	private shared(bool)* cancelled_;
 	// Optional transport-supplied action run exactly once on the first cancel().
 	// The stdio transport uses it to emit `notifications/cancelled` referencing
-	// the listen request id (draft basic/utilities/subscriptions Cancellation,
+	// the listen request id (2026-07-28 basic/utilities/subscriptions Cancellation,
 	// stdio); the HTTP transport uses it to force-close the listen stream's socket
 	// so a blocked read unblocks immediately.
 	private void delegate() @safe nothrow onCancel_;

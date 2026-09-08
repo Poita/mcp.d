@@ -128,7 +128,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 	// (correctly) refuse to elicit later.
 	// NOTE: this example deliberately uses the stable initialize() handshake, not
 	// connect(): server->client elicitation needs a stateful session, and
-	// connect() against this SDK server would negotiate the stateless draft
+	// connect() against this SDK server would negotiate the modern protocol
 	// (where ctx.elicit is unavailable and tools surface inputRequired instead).
 	client.onElicitation = (ElicitParams p) @safe { return ElicitResult.cancel(); };
 	client.initialize();

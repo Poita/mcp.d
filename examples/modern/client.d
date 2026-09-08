@@ -1,5 +1,5 @@
 /**
- * Stateless (draft) protocol — client side AND the example's e2e test.
+ * Modern (2026-07-28) protocol — client side AND the example's e2e test.
  * DUAL TRANSPORT: the SAME assertions run over BOTH stdio and HTTP.
  *
  *   dub run -c client                                       # stdio: spawns the server
@@ -12,21 +12,21 @@
  * launches the built server binary next to this client and talks
  * newline-delimited JSON-RPC over its stdin/stdout. `runClient(scenario)` drives
  * the vibe event loop uniformly so the IDENTICAL assertion body works over both
- * channels. The draft (2026-07-28) stateless model is engaged the same way on
+ * channels. The 2026-07-28 stateless model is engaged the same way on
  * either channel — `enableModern()` + per-request `_meta`.
  *
  * It ASSERTS the consumer's-eye view:
  *
- *   - `server/discover` advertises the draft version "2026-07-28" and the
+ *   - `server/discover` advertises the modern version "2026-07-28" and the
  *     server's identity (no `initialize` handshake);
- *   - `connect()` selects the stateless draft as the negotiated version;
- *   - `listTools()` contains the expected tool, and its draft `CacheableResult`
+ *   - `connect()` selects the modern protocol as the negotiated version;
+ *   - `listTools()` contains the expected tool, and its modern `CacheableResult`
  *     freshness hint (`cache.ttl` / `cache.cacheScope`) matches the server's
  *     per-list hint;
  *   - a `tools/call` returns the expected (typed-struct-derived)
  *     `structuredContent` — read back via `structuredContentAs!SumResult` — and
  *     the JSON text mirror;
- *   - `readResource()` returns the expected text and the per-resource draft
+ *   - `readResource()` returns the expected text and the per-resource modern
  *     cache hint (`ttl` / `cacheScope`);
  *   - a bad `tools/call` returns the expected JSON-RPC error code;
  *   - a second client reconnects with ZERO round trips via
@@ -91,7 +91,7 @@ int main(string[] args) @safe
 	return runClient(() @safe {
 		// connectFromArgs picks HTTP (`--http <url>`/`--url <url>`) or spawns the
 		// sibling `modern-server` over stdio. The client is not yet
-		// initialized; the draft path uses enableModern()/connect() below.
+		// initialized; the modern path uses enableModern()/connect() below.
 		McpClient makeClient() @safe
 		{
 			return connectFromArgs(args, "modern-server");
@@ -110,20 +110,20 @@ private int runE2E(McpClient client, McpClient delegate() @safe makeClient, bool
 	client.enableModern();
 	auto disc = client.discover();
 	check(disc.protocolVersions.canFind("2026-07-28"),
-			"discover.supportedVersions should contain the draft 2026-07-28; got "
+			"discover.supportedVersions should contain the modern 2026-07-28; got "
 			~ disc.protocolVersions.to!string);
 	checkEq(disc.serverInfo.name, "modern-server", "discover.serverInfo.name");
 
-	// --- 2. connect() selects the stateless draft -----------------------------
+	// --- 2. connect() selects the modern protocol -----------------------------
 	auto negotiated = client.connect();
 	checkEq(negotiated, ProtocolVersion.v2026_07_28, "connect() negotiated version");
 	checkEq(client.protocolVersion(), ProtocolVersion.v2026_07_28, "client.protocolVersion()");
 
-	// --- 3. listTools + per-list draft CacheableResult hint -------------------
+	// --- 3. listTools + per-list modern CacheableResult hint -------------------
 	auto tools = client.listTools();
 	auto names = tools.tools.map!(t => t.name).array;
 	check(names.canFind("add"), "listTools should contain 'add'; got " ~ names.to!string);
-	check(!tools.cache.isNull, "listTools result should carry a draft cache hint");
+	check(!tools.cache.isNull, "listTools result should carry a modern cache hint");
 	checkEq(tools.cache.get.ttl, 5.seconds, "tools/list cache.ttl");
 	checkEq(tools.cache.get.cacheScope, CacheScope.public_, "tools/list cache.cacheScope");
 
@@ -139,12 +139,12 @@ private int runE2E(McpClient client, McpClient delegate() @safe makeClient, bool
 	auto sum = res.structuredContentAs!SumResult;
 	checkEq(sum.sum, 42L, "add structuredContent.sum (typed)");
 
-	// --- 5. readResource + per-resource draft cache hint ----------------------
+	// --- 5. readResource + per-resource modern cache hint ----------------------
 	auto rr = client.readResource("demo://greeting");
 	checkEq(rr.contents.length, 1UL, "greeting content block count");
-	checkEq(rr.contents[0].text, "hello from the stateless draft server",
+	checkEq(rr.contents[0].text, "hello from the modern protocol server",
 			"greeting resource text");
-	check(!rr.cache.isNull, "greeting resources/read should carry a draft cache hint");
+	check(!rr.cache.isNull, "greeting resources/read should carry a modern cache hint");
 	checkEq(rr.cache.get.ttl, 9.seconds, "resources/read cache.ttl");
 	checkEq(rr.cache.get.cacheScope, CacheScope.private_, "resources/read cache.cacheScope");
 
@@ -182,7 +182,7 @@ private int runE2E(McpClient client, McpClient delegate() @safe makeClient, bool
 	// The adopted identity came straight from the persisted discovery (no network).
 	checkEq(second.serverInfo().name, "modern-server",
 			"reconnected serverInfo adopted from the persisted discovery");
-	// It serves a real call over the adopted draft session.
+	// It serves a real call over the adopted modern session.
 	auto reAdd = second.callTool("add", addArgs(1, 1));
 	check(!reAdd.isError, "reconnected client should serve a tools/call");
 	checkEq(reAdd.structuredContentAs!SumResult.sum, 2L, "reconnected add(1,1) should be 2");
@@ -191,8 +191,8 @@ private int runE2E(McpClient client, McpClient delegate() @safe makeClient, bool
 	// shutdown sequence on the spawned subprocess), so don't close here.
 
 	immutable transport = overHttp ? "http" : "stdio";
-	printLine(
-			"OK: modern e2e passed over " ~ transport ~ " — discover(2026-07-28), connect()=draft, "
+	printLine("OK: modern e2e passed over " ~ transport
+			~ " — discover(2026-07-28), connect()=2026-07-28, "
 			~ "listTools[add] cache(5000/public), add->{\"sum\":42} (+structuredContent), "
 			~ "greeting resource cache(9000/private), unknown-tool=-32602, "
 			~ "zero-RTT reconnect via connect(discoverResult).");

@@ -19,7 +19,7 @@ import mcp.server.push : ListenFilter;
 ///   - stateful: exactly one `ConnectionState` per session, owned by the
 ///     transport's `SessionManager` keyed by `Mcp-Session-Id`.
 ///   - stateless: the transport builds a transient `ConnectionState` per
-///     request (from the draft `_meta`, or from the `MCP-Protocol-Version`
+///     request (from the modern `_meta`, or from the `MCP-Protocol-Version`
 ///     header / default plus empty capabilities for the legacy path) and
 ///     discards it; nothing is stored across calls.
 ///   - stdio: a single implicit `ConnectionState` for the process.
@@ -34,19 +34,19 @@ final class ConnectionState
 	ProtocolVersion negotiated = latestLegacy;
 
 	/// The client capabilities declared at `initialize` (stateful) or carried in
-	/// the request's `_meta` (stateless draft). Empty when unknown (legacy
+	/// the request's `_meta` (modern). Empty when unknown (legacy
 	/// stateless): a handler that needs a client capability then errors.
 	ClientCapabilities clientCaps;
 
 	/// The minimum log level the client asked for via `logging/setLevel`
-	/// (stateful) or the per-request `_meta` log level (stateless draft).
+	/// (stateful) or the per-request `_meta` log level (modern).
 	string logLevel = "info";
 
 	/// The resource URIs this connection has subscribed to (stateful only).
 	bool[string] subscriptions;
 
 	/// The per-stream opt-in parsed from a `subscriptions/listen` request
-	/// dispatched with this state (draft basic/utilities/subscriptions
+	/// dispatched with this state (2026-07-28 basic/utilities/subscriptions
 	/// §Notification Filter). The HTTP transport builds a fresh per-request state
 	/// for each listen request and reads the filter back from it, so two
 	/// concurrent listen streams can never observe each other's opt-in;

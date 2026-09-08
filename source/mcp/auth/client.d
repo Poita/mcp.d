@@ -505,7 +505,7 @@ final class OAuthClient
 	/// `code` from the redirect `Location` header, and validate the RFC 9207
 	/// `iss` authorization-response parameter against the selected authorization
 	/// server's recorded issuer (mix-up attack protection required by the MCP
-	/// 2025-11-25 / draft authorization spec). Throws when `iss` is missing while
+	/// 2025-11-25 / modern authorization spec). Throws when `iss` is missing while
 	/// `authorization_response_iss_parameter_supported` is true, or when it does
 	/// not match the recorded issuer (simple string comparison, no
 	/// normalization). The authorization code is NOT returned on rejection.

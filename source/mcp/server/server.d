@@ -50,7 +50,7 @@ struct RegisteredTool
 {
 	Tool descriptor;
 	MrtrToolHandler handler;
-	/// Client capabilities this tool's handler requires to run. On the draft
+	/// Client capabilities this tool's handler requires to run. On 2026-07-28
 	/// protocol, `tools/call` rejects with a `-32021`
 	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
 	/// lists the unmet ones) when the request's declared client capabilities do
@@ -69,9 +69,9 @@ struct RegisteredResource
 {
 	Resource descriptor;
 	ResourceContents delegate() @safe reader;
-	/// Per-resource draft `CacheableResult` freshness hint for `resources/read`.
+	/// Per-resource modern `CacheableResult` freshness hint for `resources/read`.
 	Nullable!CacheHint cache;
-	/// Client capabilities this resource's reader requires to run. On the draft
+	/// Client capabilities this resource's reader requires to run. On 2026-07-28
 	/// protocol, `resources/read` rejects with a `-32021`
 	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
 	/// lists the unmet ones) when the request's declared client capabilities do
@@ -91,9 +91,9 @@ struct RegisteredTemplate
 {
 	ResourceTemplate descriptor;
 	TemplateReader reader;
-	/// Per-template draft `CacheableResult` freshness hint for `resources/read`.
+	/// Per-template modern `CacheableResult` freshness hint for `resources/read`.
 	Nullable!CacheHint cache;
-	/// Client capabilities this template's reader requires to run. On the draft
+	/// Client capabilities this template's reader requires to run. On 2026-07-28
 	/// protocol, `resources/read` rejects with a `-32021`
 	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
 	/// lists the unmet ones) when the request's declared client capabilities do
@@ -108,7 +108,7 @@ struct RegisteredPrompt
 {
 	Prompt descriptor;
 	MrtrPromptHandler handler;
-	/// Client capabilities this prompt's handler requires to run. On the draft
+	/// Client capabilities this prompt's handler requires to run. On 2026-07-28
 	/// protocol, `prompts/get` rejects with a `-32021`
 	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
 	/// lists the unmet ones) when the request's declared client capabilities do
@@ -121,17 +121,17 @@ struct RegisteredPrompt
 /// full feature-gating matrix.
 enum ServerMode
 {
-	/// No per-connection state is stored across calls. On the draft protocol
+	/// No per-connection state is stored across calls. On the modern protocol
 	/// this is "modern stateless" (per-request `_meta`, MRTR, no blocking
-	/// server->client requests); on pre-draft protocols this is "legacy
+	/// server->client requests); on legacy protocols this is "legacy
 	/// stateless" (`initialize`/`notifications/initialized` are no-ops, no
 	/// session id is minted, correlation features error). This is the default.
 	stateless,
 
-	/// Opt-in pre-draft session management: `initialize` mints an
+	/// Opt-in legacy session management: `initialize` mints an
 	/// `Mcp-Session-Id`, per-session state is isolated, and the full feature set
 	/// (elicitation, GET stream, subscriptions, `logging/setLevel`) is available.
-	/// The draft is excluded from negotiation in this mode.
+	/// 2026-07-28 is excluded from negotiation in this mode.
 	stateful
 }
 
@@ -213,7 +213,7 @@ final class McpServer : ServerCore
 	// by transports at wire-up via `bindConnection`. HTTP requests instead carry
 	// their own per-session `ConnectionState` resolved per `Mcp-Session-Id`.
 	private ConnectionState activeConnection;
-	// Per-list draft `CacheableResult` freshness hints, keyed by the list method
+	// Per-list modern `CacheableResult` freshness hints, keyed by the list method
 	// ("tools/list", "resources/list", "resources/templates/list", "prompts/list").
 	// Set via `setListCacheHint`; applied by the matching `do*` handler.
 	private Nullable!CacheHint[string] listCacheHints;
@@ -225,13 +225,13 @@ final class McpServer : ServerCore
 	// `doSubscribeListen`), never on the shared server, so concurrent listen
 	// streams cannot observe each other's opt-in.
 	private PushChannel pushChannel;
-	// The stdio `subscriptions/listen` delivery channel (draft only). On the
+	// The stdio `subscriptions/listen` delivery channel (modern only). On the
 	// stdio transport every message shares the single stdout channel, so there
-	// is no separate SSE push stream: when a draft `subscriptions/listen`
+	// is no separate SSE push stream: when a modern `subscriptions/listen`
 	// arrives, the transport installs a raw-JSON-line sink here and the listen
 	// request's id becomes the stream's subscriptionId. `notify` then writes
 	// each opted-in change notification (stamped with that subscriptionId in
-	// `params._meta`, per draft basic/utilities/subscriptions) onto stdout in
+	// `params._meta`, per 2026-07-28 basic/utilities/subscriptions) onto stdout in
 	// addition to any HTTP push channel. Null when no stdio listen is active,
 	// keeping the HTTP-only behaviour unchanged.
 	private void delegate(string) @safe stdioListenSink;
@@ -321,8 +321,8 @@ final class McpServer : ServerCore
 			activeConnection = conn;
 	}
 
-	/// Construct a `stateless` server (the default mode). On the draft protocol
-	/// this is modern stateless (per-request `_meta`, MRTR); on pre-draft it is
+	/// Construct a `stateless` server (the default mode). On the modern protocol
+	/// this is modern stateless (per-request `_meta`, MRTR); on legacy it is
 	/// legacy stateless (no-op `initialize`, no session id, correlation features
 	/// error). No `Mcp-Session-Id` is ever minted. See the README "Statefulness"
 	/// section.
@@ -343,8 +343,8 @@ final class McpServer : ServerCore
 		return s;
 	}
 
-	/// Construct a `stateful` server (opt-in, pre-draft only). `initialize` mints
-	/// an `Mcp-Session-Id` and creates per-session state; the draft is excluded
+	/// Construct a `stateful` server (opt-in, legacy revisions only). `initialize` mints
+	/// an `Mcp-Session-Id` and creates per-session state; 2026-07-28 is excluded
 	/// from negotiation; the full feature set (elicitation, GET stream,
 	/// subscriptions, `logging/setLevel`) is available, all session-isolated.
 	static McpServer stateful(string name, string version_,
@@ -441,12 +441,12 @@ final class McpServer : ServerCore
 
 	/// Declare the client capabilities a registered tool's handler requires.
 	///
-	/// On the draft protocol (which carries the caller's `clientCapabilities`
+	/// On the modern protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `tools/call` for this tool is rejected up front
 	/// with a `-32021` `MissingRequiredClientCapabilityError` — whose
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
 	/// exactly the unmet capabilities — when the request's declared capabilities
-	/// do not cover `caps` (draft basic/lifecycle: "A server MUST NOT rely on
+	/// do not cover `caps` (2026-07-28 basic/lifecycle: "A server MUST NOT rely on
 	/// capabilities the client has not declared"). On the stateful 2025-era
 	/// protocols the gate uses the session capabilities negotiated at
 	/// `initialize`. Passing a default-constructed `ClientCapabilities` clears the
@@ -462,7 +462,7 @@ final class McpServer : ServerCore
 
 	/// Declare the client capabilities a registered prompt's handler requires.
 	///
-	/// On the draft protocol (which carries the caller's `clientCapabilities`
+	/// On the modern protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `prompts/get` for this prompt is rejected up
 	/// front with a `-32021` `MissingRequiredClientCapabilityError` — whose
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
@@ -483,7 +483,7 @@ final class McpServer : ServerCore
 	/// Declare the client capabilities a registered resource (direct or template)
 	/// requires to be read.
 	///
-	/// On the draft protocol (which carries the caller's `clientCapabilities`
+	/// On the modern protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `resources/read` for a URI matching this
 	/// resource is rejected up front with a `-32021`
 	/// `MissingRequiredClientCapabilityError` — whose
@@ -507,7 +507,7 @@ final class McpServer : ServerCore
 	/// Declare the client capabilities a registered resource template requires
 	/// to be read.
 	///
-	/// On the draft protocol (which carries the caller's `clientCapabilities`
+	/// On the modern protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `resources/read` for a URI matching this
 	/// template is rejected up front with a `-32021`
 	/// `MissingRequiredClientCapabilityError` — whose
@@ -662,7 +662,7 @@ final class McpServer : ServerCore
 	/// on the standalone GET SSE stream, informing them the set of available
 	/// tools changed (per the server/tools List Changed Notification). Returns
 	/// the number of listeners reached; `0` when no GET stream is open. Call
-	/// after a runtime `registerTool` / `removeTool`. For the draft protocol,
+	/// after a runtime `registerTool` / `removeTool`. For the modern protocol,
 	/// the notification is suppressed unless a client opted in via
 	/// `subscriptions/listen` with `toolsListChanged:true`.
 	size_t notifyToolsListChanged() @safe
@@ -675,7 +675,7 @@ final class McpServer : ServerCore
 	/// available resources changed (per the server/resources List Changed
 	/// Notification). Returns the number of listeners reached; `0` when no GET
 	/// stream is open. Call after a runtime `registerResource` /
-	/// `registerResourceTemplate` (or a removal). For the draft protocol, the
+	/// `registerResourceTemplate` (or a removal). For the modern protocol, the
 	/// notification is suppressed unless a client opted in via
 	/// `subscriptions/listen` with `resourcesListChanged:true`.
 	size_t notifyResourcesListChanged() @safe
@@ -687,7 +687,7 @@ final class McpServer : ServerCore
 	/// on the standalone GET SSE stream, informing them the set of available
 	/// prompts changed (per the server/prompts List Changed Notification).
 	/// Returns the number of listeners reached; `0` when no GET stream is open.
-	/// Call after a runtime `registerPrompt` (or a removal). For the draft
+	/// Call after a runtime `registerPrompt` (or a removal). For 2026-07-28
 	/// protocol, the notification is suppressed unless a client opted in via
 	/// `subscriptions/listen` with `promptsListChanged:true`.
 	size_t notifyPromptsListChanged() @safe
@@ -700,19 +700,19 @@ final class McpServer : ServerCore
 	/// server/resources Subscriptions: "Server delivers
 	/// notifications/resources/updated ... whenever a watched resource
 	/// changes"). Per `ResourceUpdatedNotificationParams` in every spec version
-	/// (2024-11-05 .. 2025-11-25 .. draft) the params carry exactly `{ "uri": ... }`
+	/// (2024-11-05 .. 2025-11-25 .. modern) the params carry exactly `{ "uri": ... }`
 	/// (plus the inherited optional `_meta`); there is no `title` field on this
 	/// notification (a resource's title lives on the `Resource` object in
 	/// `resources/list`). It is delivered only when a client is currently
 	/// subscribed to `uri` (via `resources/subscribe`); for an unsubscribed URI
-	/// it is a no-op returning `0`. For the draft protocol the notification is
+	/// it is a no-op returning `0`. For the modern protocol the notification is
 	/// additionally suppressed unless a client opted in via `subscriptions/listen`
 	/// with `resourceSubscriptions:true`. Returns the number of GET-stream
 	/// listeners reached; `0` when no GET stream is open.
 	size_t notifyResourceUpdated(string uri) @safe
 	{
 		// Delivery eligibility is driven by the OPEN LISTENERS' own filters, not the
-		// caller's connection state: a draft `subscriptions/listen` stream is a
+		// caller's connection state: a modern `subscriptions/listen` stream is a
 		// single self-contained long-lived request whose per-URI `ListenFilter`
 		// decides whether it receives this URI, and it must work even on a stateless
 		// server (where the tool handler that calls this runs against a fresh
@@ -736,7 +736,7 @@ final class McpServer : ServerCore
 	/// not on a Streamable HTTP transport). Throws `invalidParams` on an empty
 	/// `elicitationId`.
 	///
-	/// The draft (modern) protocol removed this notification: a draft client tracks
+	/// The modern (modern) protocol removed this notification: a modern client tracks
 	/// URL-mode completion through the MRTR request-state retry, not a server push.
 	/// On a negotiated modern session this is therefore a no-op returning `0`; it
 	/// remains in effect for 2025-11-25 and earlier, where the notification is valid.
@@ -761,7 +761,7 @@ final class McpServer : ServerCore
 
 	/// The effective input schema of a registered tool (the default empty-object
 	/// schema if none was provided), or `Json.undefined` if the tool is unknown.
-	/// Used by the transport for draft `x-mcp-header` validation.
+	/// Used by the transport for modern `x-mcp-header` validation.
 	package(mcp) Json toolInputSchema(string name) @safe
 	{
 		if (auto t = name in tools)
@@ -770,8 +770,8 @@ final class McpServer : ServerCore
 	}
 
 	/// Register a direct resource with a reader for its contents. An optional
-	/// per-resource draft `CacheableResult` freshness hint is emitted on this
-	/// resource's `resources/read` response (draft protocol only).
+	/// per-resource modern `CacheableResult` freshness hint is emitted on this
+	/// resource's `resources/read` response (modern protocol only).
 	void registerResource(Resource descriptor, ResourceContents delegate() @safe reader,
 			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
@@ -781,8 +781,8 @@ final class McpServer : ServerCore
 	}
 
 	/// Register a resource template with a reader receiving the matched URI and
-	/// captured `{var}` parameters. An optional per-template draft `CacheableResult`
-	/// freshness hint is emitted on a matching `resources/read` (draft only).
+	/// captured `{var}` parameters. An optional per-template modern `CacheableResult`
+	/// freshness hint is emitted on a matching `resources/read` (modern only).
 	///
 	/// This is the context-less form; for a reader that needs the per-request
 	/// `RequestContext` (logging, cancellation, elicitation) use the overload
@@ -839,7 +839,7 @@ final class McpServer : ServerCore
 			throw new Exception("a prompt named '" ~ name ~ "' is already registered");
 	}
 
-	/// Register a *dynamic* prompt whose handler may, on a stateless (MRTR) draft
+	/// Register a *dynamic* prompt whose handler may, on a stateless (MRTR) modern
 	/// request, ask the client for more input instead of returning a final result.
 	///
 	/// This is the prompts counterpart of the MRTR `registerTool` overload:
@@ -847,9 +847,9 @@ final class McpServer : ServerCore
 	/// `RequestContext`, and returns a `PromptResponse` — either
 	/// `PromptResponse.complete(result)` or, when it needs the client to gather
 	/// more input, `PromptResponse.inputRequired(requests)` (optionally with an
-	/// opaque `requestState`). On the draft protocol the handler reads the client's
+	/// opaque `requestState`). On the modern protocol the handler reads the client's
 	/// answers from `ctx.inputResponses()` and the echoed `ctx.requestState()` when
-	/// the request is resubmitted. The draft schema types
+	/// the request is resubmitted. The 2026-07-28 schema types
 	/// `GetPromptResultResponse.result` as `GetPromptResult | InputRequiredResult`,
 	/// which this enables; on the 2025-era protocols a handler simply always
 	/// `complete`s, so its wire output carries only a plain `GetPromptResult`.
@@ -955,7 +955,7 @@ final class McpServer : ServerCore
 	/// `enableResourceSubscriptions()` AND the server is `stateful`. A `stateless`
 	/// server keeps no per-peer state across HTTP calls, so the `subscribe`
 	/// capability is neither advertised nor honoured even if opted in. Gated on
-	/// the server MODE, not the protocol version, so modern-draft and
+	/// the server MODE, not the protocol version, so modern and
 	/// legacy stateless are treated identically.
 	private bool effectiveResourceSubscriptions() const @safe
 	{
@@ -983,7 +983,7 @@ final class McpServer : ServerCore
 	}
 
 	/// Enable the SEP-2663 MCP Tasks extension (`io.modelcontextprotocol/tasks`).
-	/// Advertises the extension in `server/discover` capabilities (draft only) and
+	/// Advertises the extension in `server/discover` capabilities (modern only) and
 	/// routes `tasks/get` / `tasks/update` / `tasks/cancel` against `store`
 	/// (default: in-memory). `opts` tunes the ID generator, default TTL / poll
 	/// interval, and TTL sweep cadence. `dispatcher` decides where a `@task`
@@ -1060,7 +1060,7 @@ final class McpServer : ServerCore
 	}
 
 	/// Enable the MCP Events extension (`io.modelcontextprotocol/events`), a
-	/// draft-only feature: a client subscribes to event types the server declares
+	/// modern-only feature: a client subscribes to event types the server declares
 	/// and receives occurrences over poll, push, or webhook delivery. `store` holds
 	/// webhook subscriptions (default in-memory; supply a durable store to grant
 	/// long or no-expiry TTLs); `opts` tunes the emit buffer, TTL negotiation, poll
@@ -1114,7 +1114,7 @@ final class McpServer : ServerCore
 	/// appear in the `extensions` field of the server capabilities sent during
 	/// `initialize` / `server/discover`, per the Extension Negotiation rules, but
 	/// only once the negotiated version meets the extension's `extensionMinVersion`
-	/// floor (Apps/Skills from 2025-11-25, Tasks draft-only). `settings` defaults
+	/// floor (Apps/Skills from 2025-11-25, Tasks modern-only). `settings` defaults
 	/// to an empty object.
 	void enableExtension(string identifier, Json settings = Json.emptyObject) @safe
 	{
@@ -1194,15 +1194,15 @@ final class McpServer : ServerCore
 	/// `notifications/tools/list_changed`. Returns the number of listeners the
 	/// notification was delivered to; `0` when no GET stream is open (or the
 	/// server is not on a Streamable HTTP transport). On a stdio server with an
-	/// active draft `subscriptions/listen` it is additionally written to stdout
+	/// active modern `subscriptions/listen` it is additionally written to stdout
 	/// (stamped with the listen subscriptionId), since that transport shares one
 	/// channel for all server->client traffic.
 	size_t notify(string method, Json params = Json.undefined) @safe
 	{
 		size_t delivered;
-		// Stdio `subscriptions/listen` channel (draft): the single stdout channel
+		// Stdio `subscriptions/listen` channel (2026-07-28): the single stdout channel
 		// carries notifications too, stamped with the listen request's id as the
-		// subscriptionId so the client can correlate them (draft basic/utilities/
+		// subscriptionId so the client can correlate them (2026-07-28 basic/utilities/
 		// subscriptions). This is in addition to any HTTP push channel below.
 		if (stdioListenSink !is null)
 		{
@@ -1216,11 +1216,11 @@ final class McpServer : ServerCore
 		return delivered;
 	}
 
-	/// If `msg` is a draft `subscriptions/listen` request, serve it on the stdio
+	/// If `msg` is a modern `subscriptions/listen` request, serve it on the stdio
 	/// transport's single channel and return `true`; otherwise return `false`
 	/// (the caller dispatches it normally). On the stdio transport every message
 	/// shares one stdout channel, so — unlike Streamable HTTP — there is no
-	/// separate SSE stream to open. Per the draft, a `subscriptions/listen`
+	/// separate SSE stream to open. Per 2026-07-28, a `subscriptions/listen`
 	/// reply is NOT a `{ acknowledged: true }` JSON-RPC result (the schema defines
 	/// no such Result); the acknowledgement is a
 	/// `notifications/subscriptions/acknowledged` notification that MUST be the
@@ -1228,7 +1228,7 @@ final class McpServer : ServerCore
 	/// filters, installs `writeLine` as the delivery sink (so subsequent
 	/// `notify*`/`notifyResourceUpdated` are written to stdout, each stamped with
 	/// the listen id as `io.modelcontextprotocol/subscriptionId`), and writes the
-	/// stamped acknowledgement as that leading message. Pre-draft versions never
+	/// stamped acknowledgement as that leading message. Legacy versions never
 	/// defined `subscriptions/listen`, so they take the normal path (returns
 	/// `false`) and the request is answered conventionally.
 	bool tryServeStdioListen(Message msg, void delegate(string) @safe writeLine) @safe
@@ -1241,8 +1241,8 @@ final class McpServer : ServerCore
 				|| !tryParseVersion(meta.protocolVersion, mv) || !mv.isModern)
 			return false;
 
-		// Do NOT overwrite the shared session `clientCaps` here: the draft
-		// listen request's _meta capabilities are per-request and the draft
+		// Do NOT overwrite the shared session `clientCaps` here: 2026-07-28
+		// listen request's _meta capabilities are per-request and 2026-07-28
 		// `tools/call` gate already reads them from RequestMeta.fromParams(params);
 		// clobbering the field would wipe the capabilities a prior/concurrent
 		// stateful initialize negotiated. (Delivery on this stream is governed by
@@ -1264,7 +1264,7 @@ final class McpServer : ServerCore
 		stdioListenFilter_ = cs().listenFilter;
 
 		// First message on the stream: the acknowledgement carrying the agreed-upon
-		// subset for THIS listen request only (draft basic/utilities/subscriptions
+		// subset for THIS listen request only (2026-07-28 basic/utilities/subscriptions
 		// §Multiple Concurrent Subscriptions: each subscription is independent), built
 		// from the just-parsed per-stream filter so concurrent (or already-closed)
 		// streams' opt-ins do not leak into this ack. Stamped with the subscriptionId.
@@ -1276,7 +1276,7 @@ final class McpServer : ServerCore
 		return true;
 	}
 
-	/// Serve a draft `events/stream` (push) request over stdio. Like the listen
+	/// Serve a modern `events/stream` (push) request over stdio. Like the listen
 	/// stream it is sink-driven: it opens the subscription, writes the leading
 	/// `notifications/events/active` (and any backlog), and registers the stream so
 	/// `emit()` delivers `notifications/events/event` on stdout — each stamped with
@@ -1390,10 +1390,10 @@ final class McpServer : ServerCore
 	}
 
 	/// Deliver a change notification on the standalone GET / `subscriptions/listen`
-	/// push channel. On the draft, delivery is per-stream filtered: the notification
+	/// push channel. On 2026-07-28, delivery is per-stream filtered: the notification
 	/// reaches only a stream whose `subscriptions/listen` filter explicitly requested
 	/// this type (and, for `notifications/resources/updated`, this `uri`), honouring
-	/// draft basic/utilities/subscriptions "The server MUST NOT send notification
+	/// 2026-07-28 basic/utilities/subscriptions "The server MUST NOT send notification
 	/// types the client has not explicitly requested" under Multiple Concurrent
 	/// Subscriptions. On 2025-11-25 / 2025-06-18 / 2025-03-26 (no `subscriptions/
 	/// listen`) it is an ordinary single-stream `notify`. Returns the number of
@@ -1401,7 +1401,7 @@ final class McpServer : ServerCore
 	private size_t notifyChange(string method, Json params, string uri) @safe
 	{
 		size_t delivered;
-		// Stdio `subscriptions/listen` channel (draft): the single stdout channel
+		// Stdio `subscriptions/listen` channel (2026-07-28): the single stdout channel
 		// carries change notifications too, stamped with the listen subscriptionId.
 		// Delivery is driven by the stdio listen stream's OWN recorded filter
 		// (`stdioListenFilter_`, the single stdio connection) via `accepts(method, uri)`
@@ -1425,11 +1425,11 @@ final class McpServer : ServerCore
 			// consults that filter directly and ignores `plainEligible`, so the path is
 			// self-contained and never gated on the caller's (possibly stale)
 			// `activeConnection`. A plain GET listener (inactive filter — only the
-			// 2025-era standalone GET stream, never present in stateless/draft) falls
-			// back to `plainEligible` for non-draft delivery:
+			// 2025-era standalone GET stream, never present in stateless/modern) falls
+			// back to `plainEligible` for legacy delivery:
 			// list-changed broadcasts unconditionally, while `resources/updated` honours
 			// the 2025-era subscribe-then-deliver gate (`isSubscribed(uri)`). On the
-			// draft single-connection path the global opt-in still gates that fallback.
+			// modern single-connection path the global opt-in still gates that fallback.
 			const plainEligible = plainGetEligible(method, uri);
 			// The three list-changed notifications are genuine broadcasts (MODE 1):
 			// every connected session MUST be told the list changed, not just the first
@@ -1439,7 +1439,7 @@ final class McpServer : ServerCore
 			// (MODE 2) — delivered on one stream, per-session gated via
 			// `plainGetEligibleFor` / the stream's own `ListenFilter`. The empty
 			// session token here keeps the unscoped fan-out (a list-changed reaches all
-			// sessions) and the unscoped single-stream filtered delivery for the draft
+			// sessions) and the unscoped single-stream filtered delivery for 2026-07-28
 			// self-contained listen path; per-session attribution lives in each
 			// listener's own `ownerToken` and gate.
 			if (isListChangedBroadcast(method))
@@ -1469,12 +1469,12 @@ final class McpServer : ServerCore
 	/// Eligibility for a plain (2025-era standalone GET) listener whose
 	/// `ListenFilter` is inactive — the fallback `emitFiltered` applies only to
 	/// such listeners (an active `subscriptions/listen` stream decides via its own
-	/// filter and ignores this). This preserves the pre-draft delivery semantics: the
+	/// filter and ignores this). This preserves the legacy delivery semantics: the
 	/// three list-changed notifications broadcast unconditionally, while
 	/// `notifications/resources/updated` is delivered only for a URI the client
 	/// subscribed to via `resources/subscribe` (`isSubscribed`). A plain GET stream
-	/// only exists on a non-draft connection (the draft answers GET with 405), so
-	/// there is no draft branch here — draft delivery is entirely per-stream-filter
+	/// only exists on a legacy connection (the modern answers GET with 405), so
+	/// there is no modern branch here — modern delivery is entirely per-stream-filter
 	/// driven.
 	private bool plainGetEligible(string method, string uri) @safe
 	{
@@ -1746,7 +1746,7 @@ final class McpServer : ServerCore
 
 	private Nullable!Json handleRequest(Message msg, RequestContext ctx) @safe
 	{
-		// Determine the version in effect for THIS request. Draft+ is stateless:
+		// Determine the version in effect for THIS request. Modern+ is stateless:
 		// each request carries its protocol version, client identity, and
 		// capabilities in `params._meta` rather than relying on `initialize`.
 		// Computed into a request-local (and the per-request RequestScope) rather
@@ -1768,7 +1768,7 @@ final class McpServer : ServerCore
 		auto meta = RequestMeta.fromParams(msg.params);
 		// On stateful (2025-era) protocols logging is governed once-per-session by
 		// `logging/setLevel`, so emission is always permitted (and filtered by the
-		// stored minimum). The draft is stateless: the server MUST NOT emit
+		// stored minimum). 2026-07-28 is stateless: the server MUST NOT emit
 		// `notifications/message` for a request that did not carry
 		// `_meta["io.modelcontextprotocol/logLevel"]`, and a request whose level is
 		// unrecognised SHOULD be rejected with -32602.
@@ -1776,7 +1776,7 @@ final class McpServer : ServerCore
 		// capability (enableLogging() not called -> capabilities().logging false)
 		// MUST NOT emit notifications/message. Seed loggingRequested from
 		// loggingEnabled so the per-request scope drops every log on such a server,
-		// on BOTH the stateful protocols and the draft (where the per-request
+		// on BOTH the stateful protocols and the modern (where the per-request
 		// io.modelcontextprotocol/logLevel must not re-enable emission). When
 		// logging IS enabled this defaults to true, so compliant servers emit
 		// their log notifications.
@@ -1789,8 +1789,8 @@ final class McpServer : ServerCore
 			{
 				if (mv.isModern)
 				{
-					// Per-request body `_meta.protocolVersion` is the stateless/draft
-					// negotiation channel: only on the draft model does it select the
+					// Per-request body `_meta.protocolVersion` is the stateless/modern
+					// negotiation channel: only on 2026-07-28 model does it select the
 					// effective version. On a stateful 2025-era session the negotiated
 					// version is fixed at `initialize` and governs every request, so a
 					// per-request body version is ignored for version selection.
@@ -1804,7 +1804,7 @@ final class McpServer : ServerCore
 								missingRequiredMeta([
 									cast(string) MetaKey.clientCapabilities
 					])));
-					// Per-request client capabilities (draft, stateless): not stored on the
+					// Per-request client capabilities (modern, stateless): not stored on the
 					// shared instance. clientCapabilities() reflects the negotiated session.
 					if (meta.logLevel.isNull)
 					{
@@ -1823,7 +1823,7 @@ final class McpServer : ServerCore
 			}
 			else if (mode_ == ServerMode.stateless || conn.negotiated.isModern)
 			{
-				// Per-request protocol-version negotiation (draft/stateless): the
+				// Per-request protocol-version negotiation (modern/stateless): the
 				// client declared a version we do not support -> reject with the
 				// list of versions we do support so it can retry with a compatible
 				// one. On a stateful, already-negotiated 2025-era session the
@@ -1886,7 +1886,7 @@ final class McpServer : ServerCore
 				readRequestState(msg.params), msg.method, msg.params, ctx);
 
 		// Install the per-request scope so handlers see the right statelessness
-		// (MRTR vs blocking), the input responses carried on a retried draft
+		// (MRTR vs blocking), the input responses carried on a retried modern
 		// request, and the cancellation token, regardless of which transport
 		// supplied the base context.
 		auto scoped = new RequestScope(ctx, effective.usesMRTR, readInputResponses(msg.params),
@@ -2032,11 +2032,11 @@ final class McpServer : ServerCore
 		return response;
 	}
 
-	/// Configure the draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`)
-	/// emitted on a specific cacheable result when speaking the draft protocol.
+	/// Configure the modern `CacheableResult` freshness hint (`ttlMs`/`cacheScope`)
+	/// emitted on a specific cacheable result when speaking the modern protocol.
 	/// `listMethod` MUST be one of `tools/list`, `resources/list`,
 	/// `resources/templates/list`, `prompts/list`, `server/discover`
-	/// (`DiscoverResult extends CacheableResult` in the draft schema), or the
+	/// (`DiscoverResult extends CacheableResult` in the 2026-07-28 schema), or the
 	/// Skills extension's `skills/list` and `skills/get` (both extend
 	/// `CacheableResult`; for `skills/get` the hint says how long a host may
 	/// treat one skill's entry as current before re-fetching it). Per-resource
@@ -2065,28 +2065,28 @@ final class McpServer : ServerCore
 		pageSize_ = size;
 	}
 
-	/// Set a per-result draft cacheable-result hint on the typed result, then
+	/// Set a per-result modern cacheable-result hint on the typed result, then
 	/// serialize via the single symmetric `toJson` emission path. The hint is set
-	/// only when the effective version is draft+ AND a hint was supplied, so the
+	/// only when the effective version is modern+ AND a hint was supplied, so the
 	/// result's `cache` stays null for earlier versions and 2025-11-25, which emit
 	/// no cache hint. `toJson` emits `ttlMs`/`cacheScope`, `fromJson` parses them.
 	private Json maybeCache(R)(R result, Nullable!CacheHint hint, ProtocolVersion ver) @safe
 	{
-		// The draft `CacheableResult` schema makes the freshness hint mandatory on
-		// the cacheable list/read results: a draft client must always be told how
+		// The modern `CacheableResult` schema makes the freshness hint mandatory on
+		// the cacheable list/read results: a modern client must always be told how
 		// long a result may be cached. When the application configured no explicit
 		// per-list/per-resource hint, emit a conservative default of `ttlMs:0`
 		// (do-not-cache, public scope) rather than omitting the field. On the
-		// pre-draft (2025-era) protocols `cacheableResults` is false, so the field
+		// legacy (2025-era) protocols `cacheableResults` is false, so the field
 		// is never written.
 		if (ver.cacheableResults)
 			result.cache = hint.isNull ? nullable(CacheHint(Duration.zero)) : hint;
 		return result.toJson();
 	}
 
-	/// Stamp the mandatory draft `resultType` discriminator onto a result.
+	/// Stamp the mandatory modern `resultType` discriminator onto a result.
 	///
-	/// The draft base `Result` requires a `resultType` field on every result
+	/// The modern base `Result` requires a `resultType` field on every result
 	/// ("complete" for a finished response, "input_required" for an
 	/// `InputRequiredResult`). We add the discriminator here, centralized in
 	/// the dispatch path, for any object result that does not already declare
@@ -2099,7 +2099,7 @@ final class McpServer : ServerCore
 	/// `inputRequests` directly (rather than via `ToolResponse.inputRequired`)
 	/// serialises to that same shape but reaches here without a `resultType`,
 	/// so we discriminate it as "input_required" rather than the default
-	/// "complete". A no-op for pre-draft versions, which carry no `resultType`.
+	/// "complete". A no-op for legacy versions, which carry no `resultType`.
 	private Json stampResultType(Json result, ProtocolVersion ver) @safe
 	{
 		if (!ver.isModern)
@@ -2122,7 +2122,7 @@ final class McpServer : ServerCore
 	///
 	/// Modern revisions have no `initialize` handshake to carry identity, so
 	/// every result advertises it instead. Centralized in the dispatch path so
-	/// each result type stays identity-agnostic. A no-op for pre-draft versions,
+	/// each result type stays identity-agnostic. A no-op for legacy versions,
 	/// whose identity travels in the `initialize` reply.
 	private Json stampServerInfo(Json result, ProtocolVersion ver) @safe
 	{
@@ -2154,7 +2154,7 @@ final class McpServer : ServerCore
 		return maybeCache(result, listHint(listMethod), ver);
 	}
 
-	/// Build the draft `UnsupportedProtocolVersionError` (-32022) listing the
+	/// Build the modern `UnsupportedProtocolVersionError` (-32022) listing the
 	/// versions this server supports and the one the client requested.
 	private McpException unsupportedVersionError(string requested) @safe
 	{
@@ -2229,7 +2229,7 @@ final class McpServer : ServerCore
 				&& rpcIdString(params["requestId"]) == rpcIdString(stdioListenSubscriptionId))
 		{
 			// Graceful teardown: the long-lived listen request returns its single
-			// response now — the `SubscriptionsListenResult` (draft
+			// response now — the `SubscriptionsListenResult` (modern
 			// basic/utilities/subscriptions) — before the stream closes.
 			stdioListenSink(subscriptionsListenResult(stdioListenSubscriptionId).toString());
 			stdioListenSink = null;
@@ -2271,28 +2271,28 @@ final class McpServer : ServerCore
 		case "initialize":
 			return doInitialize(params, conn);
 		case "server/discover":
-			// `server/discover` is a draft-only RPC (the stable handshake uses
-			// `initialize`). On a non-draft negotiated session it MUST be reported
+			// `server/discover` is a modern-only RPC (the stable handshake uses
+			// `initialize`). On a legacy negotiated session it MUST be reported
 			// as unknown rather than served, mirroring the resources/subscribe and
-			// logging/setLevel draft gating.
+			// logging/setLevel modern gating.
 			if (!ver.supportsDiscover)
 				throw methodNotFound(method);
 			return doDiscover();
 		case "subscriptions/listen":
-			// `subscriptions/listen` is a draft-only RPC (it replaces the former
-			// `resources/subscribe`); on a non-draft negotiated session it does not
+			// `subscriptions/listen` is a modern-only RPC (it replaces the former
+			// `resources/subscribe`); on a legacy negotiated session it does not
 			// exist and MUST be reported as -32601 rather than answered with a
 			// non-spec `{acknowledged:true}` result, mirroring the resources/subscribe
-			// and logging/setLevel draft gating. The genuine draft stdio listen stream
+			// and logging/setLevel modern gating. The genuine modern stdio listen stream
 			// is served before `route()` by `tryServeStdioListen`; this normal-path
-			// case only handles a draft listen reaching `route()` directly (in-process
+			// case only handles a modern listen reaching `route()` directly (in-process
 			// / stateless HTTP), recording its opted-in per-stream filter.
 			if (!ver.usesSubscriptionsListen)
 				throw methodNotFound(method);
 			return doSubscribeListen(params, conn);
 		case "ping":
-			// The draft (2026-07-28) removed `ping` (SEP-2575), so on a
-			// draft-negotiated session the method does not exist and MUST answer
+			// The 2026-07-28 removed `ping` (SEP-2575), so on a
+			// modern-negotiated session the method does not exist and MUST answer
 			// -32601 (method not found), mirroring its co-removed siblings
 			// logging/setLevel and resources/subscribe. Stable (<= 2025-11-25)
 			// versions still answer with an empty-success result.
@@ -2338,9 +2338,9 @@ final class McpServer : ServerCore
 				throw methodNotFound(method);
 			return method == "skills/list" ? doListSkills(params, ver) : doGetSkill(params, ver);
 		case "resources/subscribe":
-			// The draft has no resources/subscribe RPC; subscriptions/listen takes
+			// 2026-07-28 has no resources/subscribe RPC; subscriptions/listen takes
 			// its place (the ListenFilter "Replaces the former
-			// resources/subscribe RPC"). On the draft the method does not exist,
+			// resources/subscribe RPC"). On the modern the method does not exist,
 			// so it MUST return -32601 rather than an empty-success result,
 			// mirroring logging/setLevel. Stable (<= 2025-11-25) versions honour
 			// the RPC.
@@ -2383,7 +2383,7 @@ final class McpServer : ServerCore
 	}
 
 	// The SEP-2663 `io.modelcontextprotocol/tasks` extension RPCs. The extension
-	// is draft-only and opt-in via `enableTasks()`; a session that is not draft or
+	// is modern-only and opt-in via `enableTasks()`; a session that is not modern or
 	// a server that never enabled tasks does not expose these methods and MUST
 	// answer -32601 (method not found). SEP-2663 defines exactly tasks/get,
 	// tasks/update, and tasks/cancel — there is no tasks/list or tasks/result.
@@ -2441,7 +2441,7 @@ final class McpServer : ServerCore
 	}
 
 	// The `io.modelcontextprotocol/events` extension RPCs. Like Tasks, the
-	// extension is draft-only and opt-in via `enableEvents()`; a non-draft session
+	// extension is modern-only and opt-in via `enableEvents()`; a legacy session
 	// or a server that never enabled events answers -32601. `events/stream` (push)
 	// is long-lived and handled by the transports, not routed here.
 	private void requireEvents(ProtocolVersion ver) @safe
@@ -2497,7 +2497,7 @@ final class McpServer : ServerCore
 		return Json.emptyObject;
 	}
 
-	/// `server/discover` (draft): advertise supported versions, capabilities,
+	/// `server/discover` (2026-07-28): advertise supported versions, capabilities,
 	/// and identity for stateless, up-front version selection.
 	private Json doDiscover() @safe
 	{
@@ -2508,16 +2508,16 @@ final class McpServer : ServerCore
 		// Identity is stamped into `_meta` by the dispatch path, along with every
 		// other modern result.
 		d.instructions = instructions;
-		// `server/discover` is draft-only, so the version is always modern here;
+		// `server/discover` is modern-only, so the version is always modern here;
 		// emit the configured discover hint (or the conservative ttlMs:0 default).
 		return maybeCache(d, listHint("server/discover"), ProtocolVersion.v2026_07_28);
 	}
 
-	/// `subscriptions/listen` (draft): record the opted-in change-notification
+	/// `subscriptions/listen` (2026-07-28): record the opted-in change-notification
 	/// types and acknowledge. The long-lived delivery stream is provided by the
 	/// transport; this records the filter and returns the acknowledgement.
 	///
-	/// Per draft basic/utilities/subscriptions the filter is nested under
+	/// Per 2026-07-28 basic/utilities/subscriptions the filter is nested under
 	/// `params.notifications` (a `ListenFilter`): the `toolsListChanged`,
 	/// `promptsListChanged` and `resourcesListChanged` flags are booleans, while
 	/// `resourceSubscriptions` is a `string[]` of resource URIs the client wants
@@ -2601,7 +2601,7 @@ final class McpServer : ServerCore
 
 	/// Whether the server actually supports (advertises) a given
 	/// `subscriptions/listen` notification type, per its declared capabilities.
-	/// Per draft basic/utilities/subscriptions Acknowledgment, notification types
+	/// Per 2026-07-28 basic/utilities/subscriptions Acknowledgment, notification types
 	/// the server does not support are omitted from the recorded filter and the
 	/// acknowledged subset. The list-changed types map to the corresponding
 	/// `listChanged` capability flags; `resourceSubscriptions` maps to the
@@ -2617,9 +2617,9 @@ final class McpServer : ServerCore
 		case "resourcesListChanged":
 			return resourcesListChangedEnabled;
 		case "resourceSubscriptions":
-			// The draft `subscriptions/listen` stream is a self-contained channel
+			// The modern `subscriptions/listen` stream is a self-contained channel
 			// whose per-stream filter IS the client's resource-update opt-in, so on a
-			// stateless (draft) server the listen filter alone drives delivery — the
+			// modern (2026-07-28) server the listen filter alone drives delivery — the
 			// stateful-only `enableResourceSubscriptions()` (which throws on a
 			// stateless server) is neither required nor callable there. The stateless
 			// HTTP transport refuses subscriptions/listen BEFORE it reaches the server
@@ -2637,7 +2637,7 @@ final class McpServer : ServerCore
 	}
 
 	/// The acknowledged subset for a single `subscriptions/listen` request's filter,
-	/// built from exactly that one stream's opt-in (draft basic/utilities/subscriptions
+	/// built from exactly that one stream's opt-in (2026-07-28 basic/utilities/subscriptions
 	/// Acknowledgment). Each subscription is independent — identified by its own listen
 	/// request id (§Multiple Concurrent Subscriptions) — so the ack a transport sends as
 	/// the first event on a stream MUST reflect only THAT request's opt-in, never the
@@ -2691,7 +2691,7 @@ final class McpServer : ServerCore
 		if (auto direct = uri in resources)
 		{
 			// Capability gating: mirrors doCallTool — uses per-request
-			// _meta.clientCapabilities on the stateless draft, or the session caps
+			// _meta.clientCapabilities on the modern protocol, or the session caps
 			// negotiated at initialize on stateful 2025-era protocols.
 			const ClientCapabilities declared = ver.isModern
 				? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
@@ -2717,7 +2717,7 @@ final class McpServer : ServerCore
 				return maybeCache(result, t.cache, ver);
 			}
 		}
-		// Draft aligns the code to invalidParams (-32602); older versions -32002.
+		// Modern aligns the code to invalidParams (-32602); older versions -32002.
 		// The spec's not-found example carries structured data {"uri": ...} so
 		// clients can read the offending URI without parsing the message string.
 		Json data = Json.emptyObject;
@@ -2904,7 +2904,7 @@ final class McpServer : ServerCore
 				names, (string name) => prompts[name].descriptor, params, ver);
 	}
 
-	/// The per-list draft cache hint configured for `listMethod`, or null if none.
+	/// The per-list modern cache hint configured for `listMethod`, or null if none.
 	private Nullable!CacheHint listHint(string listMethod) @safe
 	{
 		if (auto h = listMethod in listCacheHints)
@@ -2923,7 +2923,7 @@ final class McpServer : ServerCore
 			throw invalidParams("Unknown prompt: " ~ name);
 
 		// Capability gating: mirrors doCallTool — uses per-request
-		// _meta.clientCapabilities on the stateless draft, or the session caps
+		// _meta.clientCapabilities on the modern protocol, or the session caps
 		// negotiated at initialize on stateful 2025-era protocols.
 		const ClientCapabilities declared = ver.isModern
 			? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
@@ -2946,15 +2946,15 @@ final class McpServer : ServerCore
 						~ "' for prompt: " ~ name);
 		}
 		// The handler returns a `PromptResponse`: either a final `GetPromptResult`
-		// or — on a stateless (MRTR) draft request — an `InputRequiredResult`
+		// or — on a stateless (MRTR) modern request — an `InputRequiredResult`
 		// asking the client to gather input and resubmit. `ctx.inputResponses()`
 		// and `ctx.requestState()` already carry any answers/echoed state the
 		// client attached to this (retried) request. The `resultType`
-		// discriminator (and statelessness) is draft-gated by the dispatch path,
+		// discriminator (and statelessness) is modern-gated by the dispatch path,
 		// so the 2025-era protocols never see it.
 		auto response = entry.handler(args, ctx);
 		// MRTR: mirror doCallTool — never ask the client for an input kind
-		// it did not declare. MRTR is draft-only (`usesMRTR`); reuse the
+		// it did not declare. MRTR is modern-only (`usesMRTR`); reuse the
 		// `declared` set already resolved above for capability gating.
 		if (ver.usesMRTR && response.needsInput)
 			response = filterInputRequests(response, declared, "prompts/get");
@@ -2996,9 +2996,9 @@ final class McpServer : ServerCore
 
 	private Json doSetLevel(Json params, ProtocolVersion ver, ConnectionState conn) @safe
 	{
-		// The draft (2026-07-28) removed the `logging/setLevel` RPC: log level is
+		// The 2026-07-28 removed the `logging/setLevel` RPC: log level is
 		// now configured purely per-request via `_meta["io.modelcontextprotocol/
-		// logLevel"]` (SEP-2575/2577). The method does not exist on the draft, so
+		// logLevel"]` (SEP-2575/2577). The method does not exist on 2026-07-28, so
 		// it MUST be answered with -32601 (method not found) rather than accepted,
 		// regardless of whether the logging capability is enabled.
 		if (ver.isModern)
@@ -3010,13 +3010,13 @@ final class McpServer : ServerCore
 		// rather than pretend to accept it; a stateful server stores the level on
 		// its session, and log emission still works per-request regardless of mode.
 		// The -32601's data names McpServer.stateful() (the session-scoped remedy)
-		// and the draft per-request _meta logging alternative.
+		// and the modern per-request _meta logging alternative.
 		if (mode_ == ServerMode.stateless)
 		{
 			Json data = Json.emptyObject;
 			data["reason"] = "logging/setLevel needs a session to store the level;"
 				~ " construct the server with McpServer.stateful(), or set the level"
-				~ " per-request via _meta[\"io.modelcontextprotocol/logLevel\"] on the draft";
+				~ " per-request via _meta[\"io.modelcontextprotocol/logLevel\"] on the modern";
 			throw methodNotFound("logging/setLevel", data);
 		}
 		// On stable (<= 2025-11-25) versions the logging feature is gated on the
@@ -3066,13 +3066,13 @@ final class McpServer : ServerCore
 
 		auto p = InitializeParams.fromJson(params);
 		conn.negotiated = negotiate(p.protocolVersion);
-		// The draft revision defines NO `initialize`/`InitializeResult`: draft
+		// The 2026-07-28 revision defines NO `initialize`/`InitializeResult`: modern
 		// peers establish the session via `server/discover` plus per-request
 		// `_meta`, never the stateful `initialize` handshake. So the `initialize`
-		// channel does not actually "support" draft. Per the Version Negotiation
+		// channel does not actually "support" modern. Per the Version Negotiation
 		// rule ("if the server supports the requested version it MUST respond with
 		// the same version, otherwise it MUST respond with another version it
-		// supports — SHOULD be the latest"), clamp a draft negotiation down to the
+		// supports — SHOULD be the latest"), clamp a modern negotiation down to the
 		// latest stable rather than emitting an InitializeResult that claims a
 		// version with no initialize semantics.
 		if (conn.negotiated.isModern)
@@ -3111,13 +3111,13 @@ final class McpServer : ServerCore
 		if (entry is null)
 			throw invalidParams("Unknown tool: " ~ name);
 
-		// Capability gating (draft basic/lifecycle): a server MUST NOT rely on a
+		// Capability gating (2026-07-28 basic/lifecycle): a server MUST NOT rely on a
 		// capability the client did not declare. When this tool declares required
 		// client capabilities, reject the call with a `-32021`
 		// `MissingRequiredClientCapabilityError` listing the unmet ones in
 		// `data.requiredCapabilities`. The set the client actually declared is
 		// taken from this request's `_meta.clientCapabilities` on the stateless
-		// draft protocol, or from the session capabilities negotiated at
+		// modern protocol, or from the session capabilities negotiated at
 		// `initialize` on the stateful 2025-era protocols.
 		const ClientCapabilities declared = ver.isModern
 			? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
@@ -3157,9 +3157,9 @@ final class McpServer : ServerCore
 			// that leaves no requests AND no requestState, the result violates the
 			// spec ("at least one of inputRequests/requestState"), so surface it as
 			// an internal error rather than emitting an unfulfillable round trip.
-			// MRTR exists only on the draft (stateless) protocol — `usesMRTR` —
+			// MRTR exists only on the modern (stateless) protocol — `usesMRTR` —
 			// where `declared` is the request's own _meta.clientCapabilities; a
-			// non-draft InputRequiredResult is left untouched.
+			// legacy InputRequiredResult is left untouched.
 			if (ver.usesMRTR && response.needsInput)
 				response = filterInputRequests(response, declared, "tools/call");
 			// Validate the handler's (un-projected) output against the tool's
@@ -3566,7 +3566,7 @@ unittest  // requireInitialized is OFF by default: a pre-initialized request is 
 	assert("error" !in resp, "the initialized gate must be opt-in (lenient by default)");
 }
 
-unittest  // non-draft subscriptions/listen on the normal route path is method-not-found
+unittest  // legacy subscriptions/listen on the normal route path is method-not-found
 {
 	auto s = makeTestServer();
 	s.enableToolsListChanged();
@@ -3679,7 +3679,7 @@ unittest  // the (name, version) constructor emits a minimal serverInfo
 	assert("description" !in si);
 }
 
-unittest  // server/discover (draft) emits the full stored serverInfo
+unittest  // server/discover (2026-07-28) emits the full stored serverInfo
 {
 	Implementation info = {
 		name: "rich-srv", version_: "2.0", title: nullable("Rich Server"),
@@ -3689,7 +3689,7 @@ unittest  // server/discover (draft) emits the full stored serverInfo
 		]
 	};
 	auto s = new McpServer(info);
-	// server/discover is a draft-only RPC: dispatch it as a draft request.
+	// server/discover is a modern-only RPC: dispatch it as a modern request.
 	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	auto si = resp["result"]["_meta"][MetaKey.serverInfo];
 	assert(si["name"].get!string == "rich-srv");
@@ -3708,14 +3708,14 @@ unittest  // initialize falls back to latest stable for an unknown version
 	assert(resp["result"]["protocolVersion"].get!string == latestLegacy.toWire);
 }
 
-unittest  // initialize MUST NOT negotiate draft: it has no InitializeResult
+unittest  // initialize MUST NOT negotiate 2026-07-28: it has no InitializeResult
 {
-	// The draft schema (2026-07-28) defines server/discover + per-request _meta,
+	// The 2026-07-28 schema (2026-07-28) defines server/discover + per-request _meta,
 	// NOT an initialize/InitializeResult handshake. A (non-conformant) client
-	// that sends the draft wire version over `initialize` must receive a version
+	// that sends the modern wire version over `initialize` must receive a version
 	// the `initialize` channel actually supports — the latest stable — per the
 	// Version Negotiation rule ("the server MUST respond with another protocol
-	// version it supports"), never the draft version.
+	// version it supports"), never the modern version.
 	auto s = makeTestServer();
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = ProtocolVersion.v2026_07_28.toWire; // "2026-07-28"
@@ -3761,7 +3761,7 @@ unittest  // ping returns an empty result object
 	assert(resp["result"].length == 0);
 }
 
-unittest  // draft ping is -32601: the draft (SEP-2575) removed the ping method
+unittest  // modern ping is -32601: the modern (SEP-2575) removed the ping method
 {
 	auto s = makeTestServer();
 	auto resp = s.handle(modernReq(2, "ping")).get;
@@ -5319,11 +5319,11 @@ unittest  // logging/setLevel is rejected when the logging capability was never 
 	assert(s.currentLogLevel == "info");
 }
 
-unittest  // draft: logging/setLevel is method-not-found (removed in 2026-07-28)
+unittest  // modern: logging/setLevel is method-not-found (removed in 2026-07-28)
 {
-	// The draft (2026-07-28) removed the logging/setLevel RPC in favour of the
+	// The 2026-07-28 removed the logging/setLevel RPC in favour of the
 	// per-request `_meta["io.modelcontextprotocol/logLevel"]` field (SEP-2575/2577).
-	// On the draft the method does not exist, so it MUST return -32601 even when
+	// On the modern the method does not exist, so it MUST return -32601 even when
 	// the logging capability is enabled, and MUST NOT mutate session state.
 	auto s = makeTestServer();
 	s.enableLogging();
@@ -5376,7 +5376,7 @@ unittest  // after setLevel(error), a handler's sub-error logs are dropped
 	assert(ctx.emitted == ["error", "emergency"]);
 }
 
-version (unittest) private final class DraftLogCtx : BaseRequestContext
+version (unittest) private final class ModernLogCtx : BaseRequestContext
 {
 	string[] emitted;
 
@@ -5403,10 +5403,10 @@ version (unittest) private McpServer makeNoisyLogServer() @safe
 	return s;
 }
 
-unittest  // draft request WITHOUT logLevel emits no notifications/message at all
+unittest  // modern request WITHOUT logLevel emits no notifications/message at all
 {
 	auto s = makeNoisyLogServer();
-	auto ctx = new DraftLogCtx;
+	auto ctx = new ModernLogCtx;
 	Json callP = Json.emptyObject;
 	callP["name"] = "noisy";
 	// modernReq with no logLevel argument => no io.modelcontextprotocol/logLevel.
@@ -5416,10 +5416,10 @@ unittest  // draft request WITHOUT logLevel emits no notifications/message at al
 	assert(ctx.emitted.length == 0);
 }
 
-unittest  // draft request WITH logLevel emits only at or above that level
+unittest  // modern request WITH logLevel emits only at or above that level
 {
 	auto s = makeNoisyLogServer();
-	auto ctx = new DraftLogCtx;
+	auto ctx = new ModernLogCtx;
 	Json callP = Json.emptyObject;
 	callP["name"] = "noisy";
 	s.handle(modernReq(2, "tools/call", callP, "error"), ctx);
@@ -5427,10 +5427,10 @@ unittest  // draft request WITH logLevel emits only at or above that level
 	assert(ctx.emitted == ["error", "emergency"]);
 }
 
-unittest  // draft request with an unrecognised logLevel is rejected with -32602
+unittest  // modern request with an unrecognised logLevel is rejected with -32602
 {
 	auto s = makeNoisyLogServer();
-	auto ctx = new DraftLogCtx;
+	auto ctx = new ModernLogCtx;
 	Json callP = Json.emptyObject;
 	callP["name"] = "noisy";
 	auto resp = s.handle(modernReq(2, "tools/call", callP, "verbose"), ctx).get;
@@ -5440,19 +5440,19 @@ unittest  // draft request with an unrecognised logLevel is rejected with -32602
 	assert(ctx.emitted.length == 0);
 }
 
-unittest  // a draft request's logLevel does not leak into a later request
+unittest  // a modern request's logLevel does not leak into a later request
 {
 	auto s = makeNoisyLogServer();
-	// First, a draft request that requests debug-level logging.
-	auto ctx1 = new DraftLogCtx;
+	// First, a modern request that requests debug-level logging.
+	auto ctx1 = new ModernLogCtx;
 	Json call1 = Json.emptyObject;
 	call1["name"] = "noisy";
 	s.handle(modernReq(1, "tools/call", call1, "debug"), ctx1);
 	assert(ctx1.emitted == ["debug", "warning", "error", "emergency"]);
 
-	// A subsequent draft request without a logLevel must emit nothing — the
+	// A subsequent modern request without a logLevel must emit nothing — the
 	// previous request's level must not have been stored as shared state.
-	auto ctx2 = new DraftLogCtx;
+	auto ctx2 = new ModernLogCtx;
 	Json call2 = Json.emptyObject;
 	call2["name"] = "noisy";
 	s.handle(modernReq(2, "tools/call", call2), ctx2);
@@ -5486,7 +5486,7 @@ unittest  // stateful: no notifications/message when the logging capability was 
 	auto s = makeNoisyLogServerNoLogging();
 	assert(!s.capabilities().logging);
 
-	auto ctx = new DraftLogCtx; // recording context (reused; records every log level)
+	auto ctx = new ModernLogCtx; // recording context (reused; records every log level)
 	Json callP = Json.emptyObject;
 	callP["name"] = "noisy";
 	s.handle(req(2, "tools/call", callP), ctx);
@@ -5494,15 +5494,15 @@ unittest  // stateful: no notifications/message when the logging capability was 
 	assert(ctx.emitted.length == 0);
 }
 
-unittest  // draft: no notifications/message when the logging capability was never declared
+unittest  // modern: no notifications/message when the logging capability was never declared
 {
-	// The same MUST applies on the draft. Even a draft request that carries
+	// The same MUST applies on 2026-07-28. Even a modern request that carries
 	// `_meta["io.modelcontextprotocol/logLevel"]` MUST NOT trigger emission when
 	// the server never declared the (deprecated-but-required) logging capability.
 	auto s = makeNoisyLogServerNoLogging();
 	assert(!s.capabilities().logging);
 
-	auto ctx = new DraftLogCtx;
+	auto ctx = new ModernLogCtx;
 	Json callP = Json.emptyObject;
 	callP["name"] = "noisy";
 	s.handle(modernReq(2, "tools/call", callP, "debug"), ctx);
@@ -5522,14 +5522,14 @@ unittest  // capabilities reflect registered features
 	assert(caps.prompts.isNull);
 }
 
-unittest  // advertised extensions appear in server/discover capabilities under draft
+unittest  // advertised extensions appear in server/discover capabilities under the modern protocol
 {
 	auto s = new McpServer("t", "1");
 	Json settings = Json.emptyObject;
 	settings["maxConcurrent"] = 4;
 	s.enableExtension("io.modelcontextprotocol/tasks", settings);
 
-	// The Tasks extension is draft-only; a draft client discovers it via
+	// The Tasks extension is modern-only; a modern client discovers it via
 	// `server/discover`, not the `initialize` handshake.
 	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	auto ext = resp["result"]["capabilities"]["extensions"];
@@ -5537,7 +5537,7 @@ unittest  // advertised extensions appear in server/discover capabilities under 
 	assert(ext["io.modelcontextprotocol/tasks"]["maxConcurrent"].get!int == 4);
 }
 
-unittest  // the Tasks extension is NOT advertised for pre-draft negotiated versions
+unittest  // the Tasks extension is NOT advertised for legacy negotiated versions
 {
 	auto s = new McpServer("t", "1");
 	s.enableExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
@@ -5728,12 +5728,12 @@ unittest  // resources/subscribe is rejected with -32601 when capability not adv
 	assert(!s.isSubscribed("test://w"));
 }
 
-unittest  // draft: resources/subscribe is method-not-found (subscriptions/listen takes its place)
+unittest  // modern: resources/subscribe is method-not-found (subscriptions/listen takes its place)
 {
-	// The draft has no resources/subscribe RPC; subscriptions/listen with a
-	// resourceSubscriptions string[] takes its place (the draft
+	// 2026-07-28 has no resources/subscribe RPC; subscriptions/listen with a
+	// resourceSubscriptions string[] takes its place (2026-07-28
 	// ListenFilter "Replaces the former resources/subscribe RPC"). On the
-	// draft (stateless) the method does not exist, so it MUST be answered with
+	// modern (stateless) the method does not exist, so it MUST be answered with
 	// -32601 and MUST NOT record the URI. (A stateless server cannot even opt into
 	// subscriptions — enableResourceSubscriptions() throws — so none is enabled.)
 	auto s = new McpServer("t", "1");
@@ -5754,7 +5754,7 @@ unittest  // resources/unsubscribe is rejected with -32601 when capability not a
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
-unittest  // draft: resources/unsubscribe is method-not-found (removed for subscriptions/listen)
+unittest  // modern: resources/unsubscribe is method-not-found (removed for subscriptions/listen)
 {
 	auto s = new McpServer("t", "1");
 	Json p = Json.emptyObject;
@@ -5763,9 +5763,9 @@ unittest  // draft: resources/unsubscribe is method-not-found (removed for subsc
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
-unittest  // server/discover is draft-only: a non-draft session gets -32601
+unittest  // server/discover is modern-only: a legacy session gets -32601
 {
-	// `server/discover` is a draft RPC (stable peers handshake via `initialize`).
+	// `server/discover` is a modern RPC (stable peers handshake via `initialize`).
 	// A request whose effective version is the default stable negotiated version
 	// MUST be answered with -32601 rather than being served the discover result.
 	auto s = new McpServer("t", "1");
@@ -5774,7 +5774,7 @@ unittest  // server/discover is draft-only: a non-draft session gets -32601
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
-unittest  // server/discover under draft still serves the discover result
+unittest  // server/discover under the modern protocol still serves the discover result
 {
 	auto s = new McpServer("disc-srv", "1.0");
 	auto resp = s.handle(modernReq(1, "server/discover")).get;
@@ -5786,7 +5786,7 @@ unittest  // stdio subscriptions/listen is cancellable via notifications/cancell
 {
 	import std.algorithm : canFind;
 
-	// Open a stdio draft `subscriptions/listen` stream opting into toolsListChanged.
+	// Open a stdio modern `subscriptions/listen` stream opting into toolsListChanged.
 	auto s = new McpServer("t", "1");
 	s.enableToolsListChanged();
 	string[] frames;
@@ -5857,9 +5857,9 @@ unittest  // stdio subscriptions/listen cancellation matches a string requestId 
 unittest  // stdio subscriptions/listen does not wipe negotiated session clientCaps
 {
 	// A stateful initialize negotiates sampling for the session. A subsequent stdio
-	// draft `subscriptions/listen` carries its own (empty) _meta capabilities; it
+	// modern `subscriptions/listen` carries its own (empty) _meta capabilities; it
 	// must NOT clobber the shared negotiated clientCaps a concurrent/subsequent
-	// stateful request would observe. The draft per-request gate already reads the
+	// stateful request would observe. The modern per-request gate already reads the
 	// listen request's own _meta, so dropping the overwrite is free.
 	auto s = new McpServer("t", "1");
 	s.enableToolsListChanged();
@@ -5873,7 +5873,7 @@ unittest  // stdio subscriptions/listen does not wipe negotiated session clientC
 	s.handle(req(1, "initialize", initParams));
 	assert(s.clientCapabilities().sampling);
 
-	// Draft listen with empty clientCapabilities in _meta.
+	// Modern listen with empty clientCapabilities in _meta.
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
 	meta[MetaKey.clientCapabilities] = Json.emptyObject;
@@ -5909,7 +5909,7 @@ unittest  // subscribe capability is advertised only when enabled (on a stateful
 
 version (unittest)
 {
-	// A request carrying draft per-request _meta (protocolVersion 2026-07-28).
+	// A request carrying modern per-request _meta (protocolVersion 2026-07-28).
 	private Message modernReq(long id, string method,
 			Json params = Json.emptyObject, string logLevel = null) @safe
 	{
@@ -5927,7 +5927,7 @@ version (unittest)
 	}
 }
 
-unittest  // enableTasks advertises the tasks extension under draft server/discover
+unittest  // enableTasks advertises the tasks extension under 2026-07-28 server/discover
 {
 	auto s = new McpServer("t", "1");
 	s.enableTasks();
@@ -5948,7 +5948,7 @@ unittest  // tasks/* are -32601 when the server never enabled tasks
 	}
 }
 
-unittest  // tasks/* are -32601 on a non-draft session even when enabled (extension is draft-only)
+unittest  // tasks/* are -32601 on a legacy session even when enabled (extension is modern-only)
 {
 	auto s = new McpServer("t", "1");
 	s.enableTasks();
@@ -5996,7 +5996,7 @@ version (unittest)
 	}
 }
 
-unittest  // enableEvents advertises the events extension (with listChanged) under draft discover
+unittest  // enableEvents advertises the events extension (with listChanged) under the modern protocol discover
 {
 	auto s = new McpServer("t", "1");
 	s.enableEvents();
@@ -6018,7 +6018,7 @@ unittest  // events/* are -32601 when the server never enabled events
 	}
 }
 
-unittest  // events/* are -32601 on a non-draft session even when enabled (draft-only)
+unittest  // events/* are -32601 on a legacy session even when enabled (modern-only)
 {
 	auto s = new McpServer("t", "1");
 	s.enableEvents();
@@ -6349,7 +6349,7 @@ unittest  // tasks/cancel acknowledges and cancels a task
 	assert("error" !in ack);
 	assert(ack["result"].type == Json.Type.object);
 	auto got = s.handle(modernReq(2, "tasks/get", Json([
-				"taskId": Json(t.taskId)
+		"taskId": Json(t.taskId)
 	]))).get;
 	assert(got["result"]["status"].get!string == "cancelled");
 }
@@ -6550,7 +6550,7 @@ unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
 	assert(done["result"]["result"]["structuredContent"]["approved"].get!bool);
 }
 
-unittest  // draft tools/call rejects with -32021 when a required client cap is undeclared
+unittest  // modern tools/call rejects with -32021 when a required client cap is undeclared
 {
 	auto s = makeTestServer();
 	// The "add" tool now requires the client to support sampling.
@@ -6565,13 +6565,13 @@ unittest  // draft tools/call rejects with -32021 when a required client cap is 
 	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
 }
 
-unittest  // draft tools/call proceeds when the client declared the required cap
+unittest  // modern tools/call proceeds when the client declared the required cap
 {
 	auto s = makeTestServer();
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
 	assert(s.setToolRequiredClientCapabilities("add", reqCap));
-	// Build a draft request whose _meta declares sampling.
+	// Build a modern request whose _meta declares sampling.
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
 	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
@@ -6586,7 +6586,7 @@ unittest  // draft tools/call proceeds when the client declared the required cap
 	assert(resp["result"]["structuredContent"]["result"].get!int == 5);
 }
 
-unittest  // a tool without a declared requirement is never gated on draft
+unittest  // a tool without a declared requirement is never gated on the modern protocol
 {
 	auto s = makeTestServer();
 	Json p = Json([
@@ -6626,7 +6626,7 @@ unittest  // stateful (2025-era) tools/call gates on negotiated session capabili
 	assert(resp["error"]["code"].get!long == -32021);
 }
 
-unittest  // draft prompts/get rejects with -32021 when a required client cap is undeclared
+unittest  // modern prompts/get rejects with -32021 when a required client cap is undeclared
 {
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet"};
@@ -6642,7 +6642,7 @@ unittest  // draft prompts/get rejects with -32021 when a required client cap is
 	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
 }
 
-unittest  // draft prompts/get proceeds when the required cap is declared
+unittest  // modern prompts/get proceeds when the required cap is declared
 {
 	auto s = new McpServer("t", "1");
 	Prompt pr = {name: "greet"};
@@ -6650,7 +6650,7 @@ unittest  // draft prompts/get proceeds when the required cap is declared
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
 	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
-	// Build a draft request declaring the sampling capability.
+	// Build a modern request declaring the sampling capability.
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
 	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
@@ -6688,7 +6688,7 @@ unittest  // stateful (2025-era) prompts/get gates on negotiated session capabil
 	assert(resp["error"]["code"].get!long == -32021);
 }
 
-unittest  // draft resources/read rejects with -32021 when a required client cap is undeclared
+unittest  // modern resources/read rejects with -32021 when a required client cap is undeclared
 {
 	auto s = new McpServer("t", "1");
 	s.registerResource(Resource("res://x", "x"), () @safe {
@@ -6706,7 +6706,7 @@ unittest  // draft resources/read rejects with -32021 when a required client cap
 	assert("sampling" in resp["error"]["data"]["requiredCapabilities"]);
 }
 
-unittest  // draft resources/read proceeds when the required cap is declared
+unittest  // modern resources/read proceeds when the required cap is declared
 {
 	auto s = new McpServer("t", "1");
 	s.registerResource(Resource("res://x", "x"), () @safe {
@@ -6754,7 +6754,7 @@ unittest  // stateful (2025-era) resources/read gates on negotiated session capa
 	assert(resp["error"]["code"].get!long == -32021);
 }
 
-unittest  // draft resources/read via template rejects with -32021 when cap undeclared
+unittest  // modern resources/read via template rejects with -32021 when cap undeclared
 {
 	auto s = new McpServer("t", "1");
 	ResourceTemplate tmpl = {uriTemplate: "res://{id}", name: "item"};
@@ -6797,7 +6797,7 @@ unittest  // server/discover advertises all supported versions + identity
 	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "test-srv");
 }
 
-unittest  // per-list setListCacheHint: draft tools/list carries CacheableResult fields
+unittest  // per-list setListCacheHint: modern tools/list carries CacheableResult fields
 {
 	auto s = makeTestServer();
 	s.setListCacheHint("tools/list", CacheHint(5.seconds, CacheScope.private_));
@@ -6806,11 +6806,11 @@ unittest  // per-list setListCacheHint: draft tools/list carries CacheableResult
 	assert(resp["result"]["cacheScope"].get!string == "private");
 }
 
-unittest  // per-list setListCacheHint: pre-draft tools/list has no cache fields
+unittest  // per-list setListCacheHint: legacy tools/list has no cache fields
 {
 	auto s = makeTestServer();
 	s.setListCacheHint("tools/list", CacheHint(5.seconds));
-	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestLegacy
+	auto resp = s.handle(req(2, "tools/list")).get; // no modern _meta -> latestLegacy
 	assert("ttlMs" !in resp["result"]);
 }
 
@@ -6818,7 +6818,7 @@ unittest  // per-list hint only emits on the matching list, not on others
 {
 	auto s = makeTestServer();
 	s.setListCacheHint("resources/list", CacheHint(7.seconds));
-	// tools/list has no explicit hint, so it carries the mandatory draft default
+	// tools/list has no explicit hint, so it carries the mandatory modern default
 	// (ttlMs:0) rather than the resources/list value: the per-list hint does
 	// not leak across methods.
 	auto tools = s.handle(modernReq(2, "tools/list")).get;
@@ -6835,7 +6835,7 @@ unittest  // setListCacheHint rejects unknown method names in release builds
 	assertThrown!Exception(s.setListCacheHint("bogus", CacheHint(5.seconds)));
 }
 
-unittest  // setListCacheHint: draft server/discover carries the configured CacheableResult fields
+unittest  // setListCacheHint: 2026-07-28 server/discover carries the configured CacheableResult fields
 {
 	auto s = makeTestServer();
 	s.setListCacheHint("server/discover", CacheHint(30.seconds, CacheScope.private_));
@@ -6851,7 +6851,7 @@ unittest  // server/discover with no configured hint emits the mandatory ttlMs:0
 	assert(resp["result"]["ttlMs"].get!long == 0);
 }
 
-unittest  // per-resource registerResource hint emits ttlMs/cacheScope on a draft resources/read
+unittest  // per-resource registerResource hint emits ttlMs/cacheScope on a modern resources/read
 {
 	auto s = new McpServer("t", "1");
 	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
@@ -6864,7 +6864,7 @@ unittest  // per-resource registerResource hint emits ttlMs/cacheScope on a draf
 	assert(resp["result"]["cacheScope"].get!string == "private");
 }
 
-unittest  // per-resource hint is NOT emitted on a non-draft (2025-11-25) resources/read
+unittest  // per-resource hint is NOT emitted on a legacy (2025-11-25) resources/read
 {
 	auto s = new McpServer("t", "1");
 	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
@@ -6872,11 +6872,11 @@ unittest  // per-resource hint is NOT emitted on a non-draft (2025-11-25) resour
 			"text/plain", "x"), nullable(CacheHint(9.seconds, CacheScope.private_)));
 	Json p = Json.emptyObject;
 	p["uri"] = "test://r";
-	auto resp = s.handle(req(2, "resources/read", p)).get; // no draft _meta -> latestLegacy
+	auto resp = s.handle(req(2, "resources/read", p)).get; // no modern _meta -> latestLegacy
 	assert("ttlMs" !in resp["result"]);
 }
 
-unittest  // per-template registerResourceTemplate hint emits on a matching draft resources/read
+unittest  // per-template registerResourceTemplate hint emits on a matching modern resources/read
 {
 	auto s = new McpServer("t", "1");
 	ResourceTemplate t = {uriTemplate: "test://{id}", name: "tmpl"};
@@ -6890,9 +6890,9 @@ unittest  // per-template registerResourceTemplate hint emits on a matching draf
 	assert(resp["result"]["cacheScope"].get!string == "public");
 }
 
-unittest  // draft tools/list defaults to the mandatory ttlMs:0 cache hint
+unittest  // modern tools/list defaults to the mandatory ttlMs:0 cache hint
 {
-	// The draft CacheableResult schema requires a freshness hint on the cacheable
+	// The modern CacheableResult schema requires a freshness hint on the cacheable
 	// list results. With no explicit hint configured, the server MUST still emit a
 	// conservative default (ttlMs:0, public scope) rather than omitting it.
 	auto s = makeTestServer();
@@ -6901,7 +6901,7 @@ unittest  // draft tools/list defaults to the mandatory ttlMs:0 cache hint
 	assert(resp["result"]["cacheScope"].get!string == "public");
 }
 
-unittest  // draft resources/list, templates/list, prompts/list default to ttlMs:0
+unittest  // modern resources/list, templates/list, prompts/list default to ttlMs:0
 {
 	auto s = makeTestServer();
 	s.registerResource(Resource("res://x", "x"), () @safe {
@@ -6919,7 +6919,7 @@ unittest  // draft resources/list, templates/list, prompts/list default to ttlMs
 	}
 }
 
-unittest  // draft resources/read defaults to ttlMs:0 when the resource has no hint
+unittest  // modern resources/read defaults to ttlMs:0 when the resource has no hint
 {
 	auto s = new McpServer("t", "1");
 	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
@@ -6931,20 +6931,20 @@ unittest  // draft resources/read defaults to ttlMs:0 when the resource has no h
 	assert(resp["result"]["cacheScope"].get!string == "public");
 }
 
-unittest  // pre-draft list/read never emit the default cache hint
+unittest  // legacy list/read never emit the default cache hint
 {
 	auto s = makeTestServer();
-	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestLegacy
+	auto resp = s.handle(req(2, "tools/list")).get; // no modern _meta -> latestLegacy
 	assert("ttlMs" !in resp["result"]);
 }
 
 // A concurrent (reentrant) request must not corrupt the effective protocol
-// version of an in-flight request. A draft tools/call whose handler dispatches
-// a pre-draft request mid-flight (standing in for a handler that yields while
+// version of an in-flight request. A modern tools/call whose handler dispatches
+// a legacy request mid-flight (standing in for a handler that yields while
 // another request is dispatched on the shared server) must still have ITS
-// result stamped per the draft (resultType:"complete"), and the reentrant
-// pre-draft request must stay unstamped. The effective version is request-local,
-// so the inner pre-draft request cannot flip the outer draft response's
+// result stamped per the modern (resultType:"complete"), and the reentrant
+// legacy request must stay unstamped. The effective version is request-local,
+// so the inner legacy request cannot flip the outer modern response's
 // resultType.
 unittest
 {
@@ -6954,17 +6954,17 @@ unittest
 	s.registerTool(yielder, (Json args, RequestContext ctx) @safe {
 		// Mid-handle: dispatch a DIFFERENT-version request on the same server.
 		// This is the interleave a yielding handler would expose under concurrency.
-		innerResp = s.handle(req(99, "tools/list")).get; // pre-draft (latestLegacy)
+		innerResp = s.handle(req(99, "tools/list")).get; // legacy (latestLegacy)
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
 	});
-	// Outer request is on the draft protocol (per-request _meta).
+	// Outer request is on the modern protocol (per-request _meta).
 	auto outer = s.handle(modernCall(1, "yielder", [])).get;
 	assert("error" !in outer);
-	// The outer draft response keeps its own effective version: resultType present.
+	// The outer modern response keeps its own effective version: resultType present.
 	assert(outer["result"]["resultType"].get!string == "complete");
-	// The reentrant pre-draft response is independent: no draft stamping leaked in.
+	// The reentrant legacy response is independent: no modern stamping leaked in.
 	assert("error" !in innerResp);
 	assert("resultType" !in innerResp["result"]);
 }
@@ -7008,7 +7008,7 @@ unittest  // a legacy request carries no per-request _meta and is not subject to
 	assert("error" !in resp);
 }
 
-unittest  // draft results carry the mandatory resultType:"complete" discriminator
+unittest  // modern results carry the mandatory resultType:"complete" discriminator
 {
 	auto s = makeTestServer();
 	// A representative success result built through the central dispatch path.
@@ -7017,7 +7017,7 @@ unittest  // draft results carry the mandatory resultType:"complete" discriminat
 	assert(resp["result"]["resultType"].get!string == "complete");
 }
 
-unittest  // draft results identify the server in `_meta`
+unittest  // modern results identify the server in `_meta`
 {
 	auto s = makeTestServer();
 	auto resp = s.handle(modernReq(2, "tools/list")).get;
@@ -7036,7 +7036,7 @@ unittest  // server/discover carries identity in `_meta`, not a top-level field
 	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "test-srv");
 }
 
-unittest  // pre-draft results never carry the `_meta` serverInfo key
+unittest  // legacy results never carry the `_meta` serverInfo key
 {
 	auto s = makeTestServer();
 	auto resp = s.handle(req(2, "tools/list")).get;
@@ -7044,15 +7044,15 @@ unittest  // pre-draft results never carry the `_meta` serverInfo key
 	assert("_meta" !in resp["result"] || MetaKey.serverInfo !in resp["result"]["_meta"]);
 }
 
-unittest  // pre-draft results never emit resultType
+unittest  // legacy results never emit resultType
 {
 	auto s = makeTestServer();
-	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestLegacy
+	auto resp = s.handle(req(2, "tools/list")).get; // no modern _meta -> latestLegacy
 	assert("error" !in resp);
 	assert("resultType" !in resp["result"]);
 }
 
-unittest  // draft InputRequiredResult is stamped resultType:"input_required", not "complete"
+unittest  // modern InputRequiredResult is stamped resultType:"input_required", not "complete"
 {
 	auto s = new McpServer("t", "1");
 	registerBookTool(s);
@@ -7061,7 +7061,7 @@ unittest  // draft InputRequiredResult is stamped resultType:"input_required", n
 	assert(resp["result"]["resultType"].get!string == "input_required");
 }
 
-unittest  // draft: a raw CallToolResult carrying inputRequests is stamped "input_required"
+unittest  // modern: a raw CallToolResult carrying inputRequests is stamped "input_required"
 {
 	import mcp.protocol.mrtr : InputRequest;
 
@@ -7081,14 +7081,14 @@ unittest  // draft: a raw CallToolResult carrying inputRequests is stamped "inpu
 	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
 	auto resp = s.handle(modernReq(1, "tools/call", p)).get;
 	assert("error" !in resp);
-	// The draft base Result discriminator MUST be "input_required" for an
+	// The modern base Result discriminator MUST be "input_required" for an
 	// InputRequiredResult-shaped body, not the default "complete".
 	assert(resp["result"]["resultType"].get!string == "input_required");
 	assert("inputRequests" in resp["result"]);
 	assert("content" !in resp["result"]);
 }
 
-unittest  // draft resources/read unknown uri uses invalidParams (-32602)
+unittest  // modern resources/read unknown uri uses invalidParams (-32602)
 {
 	auto s = new McpServer("t", "1");
 	Resource r = {uri: "test://x", name: "x"};
@@ -7104,7 +7104,7 @@ unittest  // subscriptions/listen reads the spec-shaped filter nested under para
 	// resourceSubscriptions opt-in requires a stateful server.
 	auto s = makeStatefulTestServer();
 	// The server must support the requested notification types for them to be
-	// recorded/acknowledged (draft basic/utilities/subscriptions Acknowledgment).
+	// recorded/acknowledged (2026-07-28 basic/utilities/subscriptions Acknowledgment).
 	s.enableToolsListChanged();
 	s.enableResourceSubscriptions();
 	Json filter = Json.emptyObject;
@@ -7169,7 +7169,7 @@ unittest  // the per-stream ack reflects exactly the opted-in change types
 	auto subset = s.acknowledgedSubsetFor(s.cs().listenFilter);
 	assert(subset["toolsListChanged"].get!bool);
 	// `resourceSubscriptions` is the agreed string[] of URIs (a ListenFilter),
-	// not a boolean (draft basic/utilities/subscriptions Acknowledgment).
+	// not a boolean (2026-07-28 basic/utilities/subscriptions Acknowledgment).
 	assert(subset["resourceSubscriptions"].type == Json.Type.array);
 	assert(subset["resourceSubscriptions"].length == 1);
 	assert(subset["resourceSubscriptions"][0].get!string == "file:///project/config.json");
@@ -7199,7 +7199,7 @@ unittest  // ack echoes every opted-in resourceSubscriptions URI in request orde
 unittest  // acknowledgedSubsetFor serialises exactly one filter's opt-in
 {
 	// The ack the transport emits on a stream MUST reflect only THAT request's
-	// filter (draft basic/utilities/subscriptions Acknowledgment), not the global
+	// filter (2026-07-28 basic/utilities/subscriptions Acknowledgment), not the global
 	// accumulator. Build the subset straight from a per-stream ListenFilter.
 	auto s = makeTestServer();
 	ListenFilter f;
@@ -7241,7 +7241,7 @@ unittest  // per-stream ack does not leak a concurrent stream's opt-in
 {
 	// Regression for the cross-subscription leak: one shared McpServer handles two
 	// concurrent subscriptions/listen requests. Stream A opts into toolsListChanged
-	// only; stream B opts into resourceSubscriptions only. Per draft §Multiple
+	// only; stream B opts into resourceSubscriptions only. Per modern §Multiple
 	// Concurrent Subscriptions each subscription is independent, so B's ack must NOT
 	// report toolsListChanged (and A's must NOT report resourceSubscriptions). The
 	// fix builds each ack from the per-stream filter the transport captured right
@@ -7275,7 +7275,7 @@ unittest  // per-stream ack does not leak a concurrent stream's opt-in
 	assert(ackB["resourceSubscriptions"].length == 1);
 }
 
-unittest  // draft is stateless: tools/call works without a prior initialize
+unittest  // modern is stateless: tools/call works without a prior initialize
 {
 	auto s = makeTestServer();
 	Json p = Json.emptyObject;
@@ -7287,7 +7287,7 @@ unittest  // draft is stateless: tools/call works without a prior initialize
 
 unittest  // subscriptions/listen ack omits a list-changed type the server does not support
 {
-	// Server has NOT declared the tools list-changed capability, so per draft
+	// Server has NOT declared the tools list-changed capability, so per modern
 	// basic/utilities/subscriptions Acknowledgment ("notification types the
 	// server does not support are omitted") a toolsListChanged opt-in must be
 	// dropped from both the recorded filter and the acknowledged subset.
@@ -7343,7 +7343,7 @@ unittest  // subscriptions/listen ack omits resourceSubscriptions when subscript
 {
 	// On a stateful server that never opted into resource subscriptions, the listen
 	// gate (resourceSubscriptionsEnabled) is closed, so the agreed subset omits the
-	// URIs. (On a stateless/draft server the listen filter itself is the opt-in, so
+	// URIs. (On a stateless/modern server the listen filter itself is the opt-in, so
 	// that case is covered separately.)
 	auto s = McpServer.stateful("t", "1");
 	Json filter = Json.emptyObject;
@@ -7356,10 +7356,10 @@ unittest  // subscriptions/listen ack omits resourceSubscriptions when subscript
 	assert(!s.isSubscribed("file:///x"));
 }
 
-unittest  // a stateless/draft server honours a subscriptions/listen resourceSubscriptions filter
+unittest  // a stateless/modern server honours a subscriptions/listen resourceSubscriptions filter
 {
-	// The draft `subscriptions/listen` filter is the client's own resource-update
-	// opt-in; a stateless (draft) server honours it without (and cannot use)
+	// The modern `subscriptions/listen` filter is the client's own resource-update
+	// opt-in; a modern (2026-07-28) server honours it without (and cannot use)
 	// `enableResourceSubscriptions()`.
 	auto s = McpServer.stateless("t", "1");
 	Json filter = Json.emptyObject;
@@ -7399,13 +7399,13 @@ version (unittest)
 	}
 }
 
-unittest  // draft negotiation: unsupported version -> UnsupportedProtocolVersionError
+unittest  // modern negotiation: unsupported version -> UnsupportedProtocolVersionError
 {
 	auto s = makeTestServer();
 	auto resp = s.handle(versionedReq(1, "tools/list", "1900-01-01")).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
 	assert(resp["error"]["data"]["requested"].get!string == "1900-01-01");
-	// The supported list advertises our versions, including the draft revision.
+	// The supported list advertises our versions, including the 2026-07-28 revision.
 	auto sup = resp["error"]["data"]["supported"];
 	bool hasModern;
 	foreach (i; 0 .. sup.length)
@@ -7414,7 +7414,7 @@ unittest  // draft negotiation: unsupported version -> UnsupportedProtocolVersio
 	assert(hasModern);
 }
 
-unittest  // draft negotiation: a supported version is accepted (no error)
+unittest  // modern negotiation: a supported version is accepted (no error)
 {
 	auto s = makeTestServer();
 	auto resp = s.handle(versionedReq(2, "tools/list", "2025-11-25")).get;
@@ -7430,7 +7430,7 @@ unittest  // requests without a per-request version use the negotiated session v
 }
 
 // ---------------------------------------------------------------------------
-// MRTR (draft) tool handling: the handler branches on ctx.isStateless and either
+// MRTR (2026-07-28) tool handling: the handler branches on ctx.isStateless and either
 // returns ToolResponse.inputRequired(...) (stateless) or calls ctx.elicit()
 // (2025-era). No framework version-dispatch and no replay.
 // ---------------------------------------------------------------------------
@@ -7511,7 +7511,7 @@ version (unittest)
 		});
 	}
 
-	// A draft tools/call carrying the given input responses in the top-level
+	// A modern tools/call carrying the given input responses in the top-level
 	// params.inputResponses map (SEP-2322), with per-request _meta for the
 	// stateless handshake fields.
 	private Message modernCall(long id, string tool, InputResponse[] responses) @safe
@@ -7539,7 +7539,7 @@ version (unittest)
 	}
 }
 
-unittest  // draft (stateless) first round: handler returns an InputRequiredResult
+unittest  // modern (stateless) first round: handler returns an InputRequiredResult
 {
 	auto s = new McpServer("t", "1");
 	registerBookTool(s);
@@ -7551,7 +7551,7 @@ unittest  // draft (stateless) first round: handler returns an InputRequiredResu
 	assert(resp["result"]["inputRequests"]["date"]["method"].get!string == "elicitation/create");
 }
 
-unittest  // draft (stateless) retry with input responses: handler completes
+unittest  // modern (stateless) retry with input responses: handler completes
 {
 	auto s = new McpServer("t", "1");
 	registerBookTool(s);
@@ -7732,9 +7732,9 @@ unittest  // no codec configured: outgoing requestState stays plaintext (wire un
 	assert(first["result"]["requestState"].get!string == "awaiting-date");
 }
 
-unittest  // a draft InputRequiredResult drops an elicitation request the client cannot satisfy
+unittest  // a modern InputRequiredResult drops an elicitation request the client cannot satisfy
 {
-	// The handler asks for elicitation, but this draft request's
+	// The handler asks for elicitation, but this modern request's
 	// _meta.clientCapabilities omits elicitation. The server MUST NOT
 	// emit an inputRequest whose kind the client never declared. With no other
 	// request and no requestState, the result is a server-side error rather than
@@ -7810,7 +7810,7 @@ unittest  // a mixed InputRequiredResult drops only the unsupported kinds
 			"the unsupported roots request must be dropped");
 }
 
-unittest  // elicit() is rejected on a stateless (draft) request
+unittest  // elicit() is rejected on a modern (2026-07-28) request
 {
 	auto s = new McpServer("t", "1");
 	Tool bad = {name: "bad"};
@@ -7840,7 +7840,7 @@ unittest  // 2025-era request: ctx.elicit() blocks and the handler completes
 
 version (unittest)
 {
-	// A draft prompts/get carrying the given input responses in the top-level
+	// A modern prompts/get carrying the given input responses in the top-level
 	// params.inputResponses map (SEP-2322), plus the per-request _meta stateless
 	// handshake fields. `requestState` is echoed when non-empty.
 	private Message modernGetPrompt(long id, string prompt,
@@ -7873,7 +7873,7 @@ version (unittest)
 	// on a stateless first round it asks via MRTR, on retry it reads the answer.
 	private void registerTopicPrompt(McpServer s) @safe
 	{
-		Prompt descriptor = {name: "draftprompt"};
+		Prompt descriptor = {name: "mrtrprompt"};
 		s.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
 			auto answers = ctx.inputResponses();
 			if ("topic" !in answers)
@@ -7894,13 +7894,13 @@ version (unittest)
 	}
 }
 
-unittest  // draft prompts/get: handler can return an InputRequiredResult
+unittest  // modern prompts/get: handler can return an InputRequiredResult
 {
 	auto s = new McpServer("t", "1");
 	registerTopicPrompt(s);
-	auto resp = s.handle(modernGetPrompt(1, "draftprompt", [])).get;
+	auto resp = s.handle(modernGetPrompt(1, "mrtrprompt", [])).get;
 	assert("error" !in resp);
-	// The draft GetPromptResultResponse.result is GetPromptResult | InputRequiredResult;
+	// The modern GetPromptResultResponse.result is GetPromptResult | InputRequiredResult;
 	// here it is the input_required variant with an InputRequests map (SEP-2322).
 	assert(resp["result"]["resultType"].get!string == "input_required");
 	assert(resp["result"]["inputRequests"].type == Json.Type.object);
@@ -7909,22 +7909,22 @@ unittest  // draft prompts/get: handler can return an InputRequiredResult
 	assert("messages" !in resp["result"]);
 }
 
-unittest  // draft prompts/get retry with input responses: handler completes
+unittest  // modern prompts/get retry with input responses: handler completes
 {
 	auto s = new McpServer("t", "1");
 	registerTopicPrompt(s);
 	auto answer = InputResponse("topic", Json([
 			"content": Json(["t": Json("birds")])
 	]));
-	auto resp = s.handle(modernGetPrompt(2, "draftprompt", [answer])).get;
+	auto resp = s.handle(modernGetPrompt(2, "mrtrprompt", [answer])).get;
 	assert("error" !in resp);
 	assert("inputRequests" !in resp["result"]);
-	// A completed draft result is stamped resultType:"complete", not "input_required".
+	// A completed modern result is stamped resultType:"complete", not "input_required".
 	assert(resp["result"]["resultType"].get!string == "complete");
 	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "about birds");
 }
 
-unittest  // draft prompts/get reads back the echoed opaque requestState (SEP-2322)
+unittest  // modern prompts/get reads back the echoed opaque requestState (SEP-2322)
 {
 	auto s = new McpServer("t", "1");
 	Prompt descriptor = {name: "stateprompt"};
@@ -7957,7 +7957,7 @@ unittest  // draft prompts/get reads back the echoed opaque requestState (SEP-23
 	assert(retry["result"]["messages"][0]["content"]["text"].get!string == "resumed:awaiting-topic");
 }
 
-unittest  // non-draft prompts/get is unaffected: no resultType, plain GetPromptResult
+unittest  // legacy prompts/get is unaffected: no resultType, plain GetPromptResult
 {
 	auto s = new McpServer("t", "1");
 	Prompt descriptor = {name: "plainprompt"};
@@ -7966,8 +7966,8 @@ unittest  // non-draft prompts/get is unaffected: no resultType, plain GetPrompt
 		r.messages = [PromptMessage("user", Content.makeText("hi"))];
 		return PromptResponse.complete(r);
 	});
-	// A 2025-era prompts/get (no draft _meta) must keep its exact wire shape: a
-	// GetPromptResult with no draft-only resultType/inputRequests fields.
+	// A 2025-era prompts/get (no modern _meta) must keep its exact wire shape: a
+	// GetPromptResult with no modern-only resultType/inputRequests fields.
 	Json params = Json.emptyObject;
 	params["name"] = "plainprompt";
 	auto resp = s.handle(Message(makeRequest(Json(1), "prompts/get", params))).get;
@@ -8122,9 +8122,9 @@ unittest  // notifyElicitationComplete is a no-op before a push channel exists
 	assert(s.notifyElicitationComplete("elic-1") == 0);
 }
 
-unittest  // notifyElicitationComplete is a no-op on a draft (modern) session
+unittest  // notifyElicitationComplete is a no-op on a modern (modern) session
 {
-	// The draft removed `notifications/elicitation/complete`; even with an open
+	// The modern removed `notifications/elicitation/complete`; even with an open
 	// push channel a modern session must emit nothing.
 	auto s = new McpServer("t", "1");
 	s.activeConnection.negotiated = ProtocolVersion.v2026_07_28;
@@ -8404,9 +8404,9 @@ unittest  // enableToolsListChanged is the consistent name and advertises listCh
 	assert(caps.toJson()["tools"]["listChanged"].get!bool);
 }
 
-unittest  // draft: concurrent listen streams only receive the type each opted into
+unittest  // modern: concurrent listen streams only receive the type each opted into
 {
-	// Regression for per-stream notification filtering (draft basic/utilities/
+	// Regression for per-stream notification filtering (2026-07-28 basic/utilities/
 	// subscriptions): "The server MUST NOT send notification types the client has not
 	// explicitly requested." Two concurrent subscriptions/listen streams: A opted into
 	// toolsListChanged only, B into resourceSubscriptions only. notifyToolsListChanged
@@ -8457,8 +8457,8 @@ unittest  // draft: concurrent listen streams only receive the type each opted i
 
 unittest  // STATELESS HTTP subscriptions/listen delivers resources/updated per-URI
 {
-	// The draft subscriptions/listen RPC is a single self-contained long-lived HTTP
-	// request; the draft protocol is stateless-only, so it MUST work on a stateless
+	// The modern subscriptions/listen RPC is a single self-contained long-lived HTTP
+	// request; the modern protocol is stateless-only, so it MUST work on a stateless
 	// server. notifyResourceUpdated is invoked from a tool handler whose per-request
 	// state is NOT the listen stream's state and NOT the stale activeConnection;
 	// delivery eligibility must therefore come from the OPEN LISTENER's own filter,
@@ -8475,7 +8475,7 @@ unittest  // STATELESS HTTP subscriptions/listen delivers resources/updated per-
 
 	// Simulate handleListenStream attaching the listen stream's own per-URI filter
 	// (note:///a only) on the push channel. The server's activeConnection (what cs()
-	// returns) is the stale default: NOT draft, NOT subscribed to note:///a.
+	// returns) is the stale default: NOT modern, NOT subscribed to note:///a.
 	ListenFilter f;
 	f.active = true;
 	f.resourceSubscriptions = true;
@@ -8539,7 +8539,7 @@ unittest  // stdio listen sink is per-URI filtered (subscribed delivered, other 
 	auto s = new McpServer("t", "1");
 
 	string[] sink;
-	// Open a draft stdio listen subscribed to note:///a only.
+	// Open a modern stdio listen subscribed to note:///a only.
 	Json na = Json.emptyObject;
 	na["resourceSubscriptions"] = Json([Json("note:///a")]);
 	Json p = Json.emptyObject;
@@ -8547,7 +8547,7 @@ unittest  // stdio listen sink is per-URI filtered (subscribed delivered, other 
 	auto served = s.tryServeStdioListen(modernReq(1, "subscriptions/listen", p), (string line) @safe {
 		sink ~= line;
 	});
-	assert(served, "draft subscriptions/listen must be served over stdio");
+	assert(served, "modern subscriptions/listen must be served over stdio");
 	// First sink line is the acknowledgement.
 	assert(sink.length == 1);
 	assert(sink[0].canFind("notifications/subscriptions/acknowledged"));
@@ -8565,12 +8565,12 @@ unittest  // stdio listen sink is per-URI filtered (subscribed delivered, other 
 	assert(sink.length == 2);
 }
 
-unittest  // draft subscriptions/listen: a stream gets list_changed only if its own filter opted in
+unittest  // modern subscriptions/listen: a stream gets list_changed only if its own filter opted in
 {
 	// Delivery is listener-driven: an active `subscriptions/listen` stream receives
 	// `notifications/prompts/list_changed` only when its OWN per-stream
 	// `ListenFilter` opted into promptsListChanged — no connection-level
-	// version is consulted, since a draft connection never has a plain GET stream.
+	// version is consulted, since a modern connection never has a plain GET stream.
 	auto s = new McpServer("t", "1");
 	s.enablePromptsListChanged();
 	auto coord = new StreamCoordinator;
@@ -8968,7 +8968,7 @@ unittest  // the Implementation-based factories preserve the requested mode
 	assert(b.mode == ServerMode.stateful);
 }
 
-unittest  // a stateful server negotiates a draft request DOWN to latest stable
+unittest  // a stateful server negotiates a modern request DOWN to latest stable
 {
 	import vibe.data.json : parseJsonString;
 
@@ -8980,16 +8980,16 @@ unittest  // a stateful server negotiates a draft request DOWN to latest stable
 	auto resp = s.handle(msg);
 	assert(!resp.isNull);
 	const ver = resp.get["result"]["protocolVersion"].get!string;
-	assert(ver != "2026-07-28", "stateful must not negotiate the draft");
+	assert(ver != "2026-07-28", "stateful must not negotiate 2026-07-28");
 	assert(ver == latestLegacy.toWire);
 }
 
-unittest  // a stateful server does not serve server/discover (draft-only RPC)
+unittest  // a stateful server does not serve server/discover (modern-only RPC)
 {
 	import vibe.data.json : parseJsonString;
 
-	// A stateful server's negotiated version is pre-draft, so server/discover —
-	// which is gated on the draft — is unknown (-32601 method not found).
+	// A stateful server's negotiated version is legacy, so server/discover —
+	// which is gated on the modern — is unknown (-32601 method not found).
 	auto s = McpServer.stateful("t", "1");
 	auto disc = parseJsonString(`{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}}`);
 	auto resp = s.handle(Message(disc));

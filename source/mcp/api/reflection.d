@@ -164,9 +164,9 @@ private string describeFor(alias func, string pname)() @safe
 }
 
 /// Whether `P` is an admissible `@mcpHeader` parameter type: one whose
-/// `jsonSchemaOf` yields a draft primitive header type (integer/string/boolean).
+/// `jsonSchemaOf` yields a modern primitive header type (integer/string/boolean).
 /// `Nullable!T` is unwrapped to its inner type. Mirrors the runtime check
-/// `draft.isPrimitiveHeaderType` so detection is symmetric at compile time.
+/// `modern.isPrimitiveHeaderType` so detection is symmetric at compile time.
 private template isPrimitiveHeaderParam(P)
 {
 	import std.traits : isIntegral;
@@ -222,11 +222,11 @@ private Json parametersSchema(alias func)() @safe
 				auto psNode = genParamNode!(P, paramSettings)();
 				applyUdaFacets!(__traits(getAttributes, types[i .. i + 1]))(psNode);
 				Json ps = nodeToVibeJson(psNode);
-				// Draft x-mcp-header: a method-level @mcpHeader(parameter, name)
+				// Modern x-mcp-header: a method-level @mcpHeader(parameter, name)
 				// naming this parameter mirrors it into an `Mcp-Param-<name>`
 				// request header; emit the extension property so the transport can
-				// validate it (see draft.paramHeaders). The header name and the
-				// named parameter's type are checked against the draft
+				// validate it (see modern.paramHeaders). The header name and the
+				// named parameter's type are checked against 2026-07-28
 				// `x-mcp-header` constraints at compile time: the value MUST be a
 				// valid HTTP token (non-empty, 1*tchar, no CR/LF) and the parameter
 				// MUST be a primitive type (string/integral/bool); `number`
@@ -239,12 +239,12 @@ private Json parametersSchema(alias func)() @safe
 									"@mcpHeader(\"" ~ attr.parameter ~ "\", \"" ~ attr.name
 									~ "\") is not a valid x-mcp-header value: " ~ validateHeaderName(
 										attr.name));
-							// The draft permits only primitive x-mcp-header value
+							// The modern permits only primitive x-mcp-header value
 							// types (integer/string/boolean). Whitelist exactly those
 							// (plus the `Nullable` thereof) so a struct/array/AA/
 							// `number` parameter is rejected at the registration site
 							// rather than per-request via the transport's
-							// `headerMismatch` (see draft.isPrimitiveHeaderType).
+							// `headerMismatch` (see modern.isPrimitiveHeaderType).
 							static assert(isPrimitiveHeaderParam!P, "@mcpHeader cannot be applied to parameter '" ~ names[i] ~ "' of type " ~ P
 									.stringof ~ "; x-mcp-header permits only integer/string/boolean (or Nullable thereof)");
 							ps["x-mcp-header"] = attr.name;
@@ -1925,8 +1925,8 @@ unittest  // MRTR UDA tool: returning ToolResponse.inputRequired surfaces inputR
 	registerHandlers(s, new ExtApi);
 
 	// Empty seed -> the tool asks for more input (MRTR InputRequiredResult). MRTR
-	// exists only on the draft (stateless) protocol, so the request must negotiate
-	// the draft version via `_meta`; otherwise the projection layer rejects an
+	// exists only on the modern (stateless) protocol, so the request must negotiate
+	// the modern version via `_meta`; otherwise the projection layer rejects an
 	// input-required result for a non-MRTR peer.
 	Json p = Json.emptyObject;
 	p["name"] = "ask";
@@ -1941,7 +1941,7 @@ unittest  // MRTR UDA tool: returning ToolResponse.inputRequired surfaces inputR
 	assert(r["result"]["inputRequests"]["req1"]["method"].get!string == "elicitation/create");
 }
 
-unittest  // MRTR on a non-draft session: an input-required result is rejected, not emitted off-schema
+unittest  // MRTR on a legacy session: an input-required result is rejected, not emitted off-schema
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.errors : ErrorCode;
@@ -1949,9 +1949,9 @@ unittest  // MRTR on a non-draft session: an input-required result is rejected, 
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new ExtApi);
 
-	// No draft `_meta.protocolVersion` -> the session is non-draft (no MRTR). A
+	// No modern `_meta.protocolVersion` -> the session is legacy (no MRTR). A
 	// handler that nonetheless returns ToolResponse.inputRequired would emit the
-	// draft-only `{inputRequests}` shape (no `content`) to a peer whose
+	// modern-only `{inputRequests}` shape (no `content`) to a peer whose
 	// CallToolResult schema requires content; the projection layer rejects this
 	// programming error with an internal error rather than letting it reach the wire.
 	Json p = Json.emptyObject;
@@ -2113,23 +2113,23 @@ version (unittest) private auto modernRead(string uri) @safe
 	return Message(makeRequest(Json(1), "resources/read", params));
 }
 
-unittest  // @cache UDA on a resource: draft resources/read carries CacheableResult fields
+unittest  // @cache UDA on a resource: modern resources/read carries CacheableResult fields
 {
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new ExtApi);
-	// A draft request (carrying the protocol-version _meta) gets cache fields.
+	// A modern request (carrying the protocol-version _meta) gets cache fields.
 	auto rr = s.handle(modernRead("ext://cached")).get;
 	assert(rr["result"]["ttlMs"].get!long == 5000);
 	assert(rr["result"]["cacheScope"].get!string == "private");
 }
 
-unittest  // @cache UDA: pre-draft resources/read has NO cache fields (no wire regression)
+unittest  // @cache UDA: legacy resources/read has NO cache fields (no wire regression)
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new ExtApi);
-	// A plain (non-draft) request must NOT carry any cache fields.
+	// A plain (legacy) request must NOT carry any cache fields.
 	Json rp = Json.emptyObject;
 	rp["uri"] = "ext://cached";
 	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;

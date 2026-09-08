@@ -66,7 +66,7 @@ This always pulls the latest release (see the Dub version badge above). Then
 
 ## Goals
 
-- Full MCP support across every protocol version (`2024-11-05` → `draft`) with negotiation.
+- Full MCP support across every protocol version (`2024-11-05` → `2026-07-28`) with negotiation.
 - Both transports: **stdio** and **Streamable HTTP**.
 - FastMCP-style ergonomic server API via D attributes (`@tool`, `@resource`, `@prompt`).
 - Batteries included: OAuth 2.1, SSE resumability, all protocol utilities.
@@ -87,14 +87,14 @@ This always pulls the latest release (see the Dub version badge above). Then
   (token-exchange → JWT-bearer); **elicitation** with schema defaults; and **SSE
   resumption** (`retry:` + `Last-Event-ID`).
 - ✅ **FastMCP-style UDA API** — `@tool` / `@resource` / `@prompt` / `@task` / `@skill` with auto JSON-Schema.
-- ✅ **DRAFT (2026-07-28)** — stateless per-request `_meta`, `server/discover`,
+- ✅ **2026-07-28 (modern)** — stateless per-request `_meta`, `server/discover`,
   `subscriptions/listen`, `CacheableResult` (`ttlMs`/`cacheScope`), MRTR types, the standard
   request headers (`Mcp-Method`/`Mcp-Name`/`MCP-Protocol-Version`) with `HeaderMismatch`
   validation, and `x-mcp-header` mirroring — on both client and server.
   `callTool` transparently drives the full MRTR (SEP-2322) round-trip loop via an internal
   `callToolLoop`, satisfying each `InputRequest` and resubmitting until a completed result is
   returned (capped at 16 rounds to guard against misbehaving servers).
-- ✅ **MCP Events extension** (`io.modelcontextprotocol/events`, draft-only) — the
+- ✅ **MCP Events extension** (`io.modelcontextprotocol/events`, a draft extension on 2026-07-28+) — the
   `@event` UDA, `events/list`, and all three delivery modes (poll/push/webhook)
   with cursors, the emit ring buffer, poll-lease lifecycle hooks, and the full
   webhook-security surface (Standard Webhooks signing + rotation, SSRF hardening,
@@ -219,7 +219,7 @@ a stateless server must not keep. The gating depends only on `server.mode`
 (`ServerMode.stateless`), **not** on the negotiated protocol version.
 
 A *self-contained* long-lived stream is fine, because it never correlates a second
-HTTP call: the draft `subscriptions/listen` works in stateless mode. Its POST opens
+HTTP call: the modern `subscriptions/listen` works in stateless mode. Its POST opens
 an SSE response and the server streams `notifications/resources/updated` /
 `list_changed` down that same response, filtered by the stream's own subscription
 set — exactly like a tool call emitting progress on its own SSE stream. (Whether a
@@ -242,8 +242,8 @@ is re-leased) — mirroring the `TaskStore`/`TaskDispatcher` split.
 > **Guidance:** if your tools initiate elicitation/sampling/roots, or use the
 > 2025-era `resources/subscribe` push over HTTP, construct the server with
 > `McpServer.stateful()`. Stateless is correct for plain request/response tools,
-> resources, prompts, progress, the draft `subscriptions/listen` stream, and the
-> draft MRTR (more-requests-then-respond) input flow.
+> resources, prompts, progress, the modern `subscriptions/listen` stream, and the
+> modern MRTR (more-requests-then-respond) input flow.
 
 **stdio note:** stdio is a single implicit connection for the life of the process
 (it negotiates protocol `2025-11-25` by default). Statefulness (`server.mode`),
@@ -257,14 +257,14 @@ protocol.
 
 | | Resolution of per-connection state | Notes |
 |---|---|---|
-| **Modern stateless** (stateless + request >= draft) | Per-request `_meta` (protocolVersion + clientCapabilities + logLevel) | No `initialize` (uses `server/discover`); input via MRTR; `subscriptions/listen` is supported (a self-contained stream); **no** blocking server->client elicitation/sampling on any transport (see the feature-gating matrix) |
-| **Legacy stateless** (stateless + request < draft) | `MCP-Protocol-Version` header (default `2025-03-26`; stdio assumes `2025-11-25`); client capabilities **unknown** (assumed none) | `initialize`/`notifications/initialized` are no-ops (no session id minted); a `tools/call` may be the first request with no prior `initialize`; correlation features are forbidden |
-| **Stateful** (opt-in, pre-draft only) | `ConnectionState` resolved by `Mcp-Session-Id`, created at `initialize` | The draft is **excluded** from negotiation (clamped down to `<= 2025-11-25`); `server/discover` is not served; DELETE terminates the session |
+| **Modern stateless** (stateless + request >= 2026-07-28) | Per-request `_meta` (protocolVersion + clientCapabilities + logLevel) | No `initialize` (uses `server/discover`); input via MRTR; `subscriptions/listen` is supported (a self-contained stream); **no** blocking server->client elicitation/sampling on any transport (see the feature-gating matrix) |
+| **Legacy stateless** (stateless + request < 2026-07-28) | `MCP-Protocol-Version` header (default `2025-03-26`; stdio assumes `2025-11-25`); client capabilities **unknown** (assumed none) | `initialize`/`notifications/initialized` are no-ops (no session id minted); a `tools/call` may be the first request with no prior `initialize`; correlation features are forbidden |
+| **Stateful** (opt-in, legacy revisions only) | `ConnectionState` resolved by `Mcp-Session-Id`, created at `initialize` | 2026-07-28 is **excluded** from negotiation (it has no `initialize`; a request for it is clamped down to `<= 2025-11-25`); `server/discover` is not served; DELETE terminates the session |
 
 ### Feature-gating matrix
 
 The gating is keyed on `server.mode`, not the protocol version, so the two
-stateless eras (modern-draft and legacy) forbid the same correlation features
+stateless eras (modern and legacy) forbid the same correlation features
 regardless of transport — they differ only in how each request's `ConnectionState`
 is resolved.
 
@@ -274,7 +274,7 @@ is resolved.
 | Per-request `_meta` version/caps | yes | n/a (header + empty caps) | n/a (session-negotiated) |
 | Standalone GET SSE stream | forbidden (405) | forbidden (405) | yes |
 | `resources/subscribe` / `unsubscribe` | forbidden (-32601) | forbidden (-32601) | yes |
-| `subscriptions/listen` (draft) | yes (self-contained stream) | n/a (draft-only) | yes |
+| `subscriptions/listen` (2026-07-28) | yes (self-contained stream) | n/a (modern-only) | yes |
 | Server->client `elicit`/`sample`/`roots` | forbidden (error; MRTR instead) | forbidden (error) | yes |
 | `logging/setLevel` | n/a (per-request `_meta`) | forbidden (-32601) | yes (session-scoped) |
 | Session id minted | never | never | yes |
@@ -346,7 +346,7 @@ in `mcp.transport.*`.
 
 ## Client response cache
 
-`McpClient` caches the six read-only operations the draft marks `CacheableResult`
+`McpClient` caches the six read-only operations 2026-07-28 marks `CacheableResult`
 — `listTools`, `listResources`, `listResourceTemplates`, `listPrompts`,
 `readResource`, and `discover` — so a repeat call within the server's freshness
 window is served locally with **no round-trip**. `callTool` and `getPrompt` are
@@ -354,8 +354,8 @@ never cached (the spec excludes them).
 
 **On by default, byte-identical when idle.** A client built via
 `McpClient.http`/`stdio`/`spawn` ships an in-memory store. Caching engages only
-when a result carries a positive `ttlMs` hint, so against pre-draft servers (or a
-draft server sending `ttlMs:0`) behaviour matches the uncached client exactly.
+when a result carries a positive `ttlMs` hint, so against legacy servers (or a
+modern server sending `ttlMs:0`) behaviour matches the uncached client exactly.
 The stored entry's lifetime is the server's `ttlMs`; its `cacheScope`
 (`public`/`private`) is recorded for shared backends.
 
@@ -440,7 +440,7 @@ Streamable HTTP.
 | Tools | `@tool` handlers with typed args/results | [server](examples/tools/server.d) | [client](examples/tools/client.d) |
 | Prompts | `@prompt` templates | [server](examples/prompts/server.d) | [client](examples/prompts/client.d) |
 | Resources | resources + templates + `subscriptions/listen` push | [server](examples/resources/server.d) | [client](examples/resources/client.d) |
-| Caching | draft `CacheableResult` hints (`ttlMs`/`cacheScope`) | [server](examples/caching/server.d) | [client](examples/caching/client.d) |
+| Caching | modern `CacheableResult` hints (`ttlMs`/`cacheScope`) | [server](examples/caching/server.d) | [client](examples/caching/client.d) |
 | Modern | the 2026-07-28 protocol end to end (`server/discover`, per-request `_meta`, `connect()`) | [server](examples/modern/server.d) | [client](examples/modern/client.d) |
 | Streaming | progress notifications from a long-running tool | [server](examples/streaming/server.d) | [client](examples/streaming/client.d) |
 | MRTR | multi-round-trip tool input (carried in the result) | [server](examples/mrtr/server.d) | [client](examples/mrtr/client.d) |
@@ -590,12 +590,12 @@ else
 > the per-request `task` parameter) was a stopgap the spec has since replaced with
 > this extension. It is **intentionally not implemented** — those methods answer
 > `-32601` and no `tasks` capability is advertised. Only the SEP-2663 extension
-> above is supported, and only under the draft protocol version.
+> above is supported, and only on 2026-07-28 and later.
 
 ## MCP Events (triggers)
 
-The **MCP Events** extension (`io.modelcontextprotocol/events`, a draft-only
-proposal) lets a client subscribe to things happening upstream — a Slack message,
+The **MCP Events** extension (`io.modelcontextprotocol/events`, an extension still in
+draft) lets a client subscribe to things happening upstream — a Slack message,
 a GitHub push, a PagerDuty incident — and have the agent react when they occur. A
 server declares event types; a client subscribes with `(name, arguments)` and
 receives `EventOccurrence` records over one of three delivery modes, advertised
@@ -722,10 +722,10 @@ example drives webhook delivery to its local receiver. Production multi-tenant
 servers use real auth so the subscription key isolates tenants, and `https`-only
 callbacks.
 
-> **Status: draft-only.** Like Tasks, the Events extension is confined to the
-> draft protocol version — every `events/*` method answers `-32601` on a
-> pre-draft session, and the capability is advertised only under draft. This is a
-> design-sketch proposal ([experimental-ext-triggers-events](https://github.com/modelcontextprotocol/experimental-ext-triggers-events));
+> **Status: draft extension.** Like Tasks, the Events extension requires the
+> modern protocol — every `events/*` method answers `-32601` on a legacy
+> session, and the capability is advertised only from 2026-07-28. The extension
+> itself is a design-sketch proposal ([experimental-ext-triggers-events](https://github.com/modelcontextprotocol/experimental-ext-triggers-events));
 > the wire surface may change as it moves through WG review.
 
 ## Skills

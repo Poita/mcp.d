@@ -129,7 +129,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 	// ---- A. DISCOVERY -----------------------------------------------------
 	// This example deliberately uses the stable initialize() handshake, not
 	// connect(): server->client elicitation needs a stateful session, and
-	// connect() against this SDK server would negotiate the stateless draft
+	// connect() against this SDK server would negotiate the modern protocol
 	// (where ctx.elicit is unavailable and tools surface inputRequired instead).
 	{
 		auto client = makeClient();

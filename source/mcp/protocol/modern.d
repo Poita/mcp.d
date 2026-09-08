@@ -11,7 +11,7 @@ import mcp.protocol.jsonhelpers : tryGet;
 
 @safe:
 
-/// Per-request metadata that the draft carries in `params._meta` instead of a
+/// Per-request metadata that 2026-07-28 carries in `params._meta` instead of a
 /// once-per-connection `initialize` handshake.
 struct RequestMeta
 {
@@ -120,22 +120,22 @@ struct DiscoverResult
 	/// `serverInfo` field), and omitted entirely when unset.
 	Implementation serverInfo;
 	Nullable!string instructions;
-	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`):
-	/// `DiscoverResult extends CacheableResult` in the draft schema, so a client
+	/// Modern `CacheableResult` freshness hint (`ttlMs`/`cacheScope`):
+	/// `DiscoverResult extends CacheableResult` in the 2026-07-28 schema, so a client
 	/// may cache the discovery response. Round-trips symmetrically; the server
-	/// sets it (draft-gated), leaving pre-draft wire output unchanged.
+	/// sets it (modern-gated), leaving legacy wire output unchanged.
 	Nullable!CacheHint cache;
 
 	Json toJson() const @safe
 	{
 		Json j = Json.emptyObject;
-		// Base draft Result mandates a `resultType` discriminator on every
+		// The 2026-07-28 base Result mandates a `resultType` discriminator on every
 		// result; a complete discover response uses "complete".
 		j["resultType"] = "complete";
 		Json pv = Json.emptyArray;
 		foreach (v; protocolVersions)
 			pv ~= Json(v);
-		// Spec wire field name is `supportedVersions` (draft server/discover
+		// Spec wire field name is `supportedVersions` (2026-07-28 server/discover
 		// Response Fields table), even though the D member is `protocolVersions`.
 		j["supportedVersions"] = pv;
 		j["capabilities"] = capabilities.toJson();
@@ -207,7 +207,7 @@ enum CacheScope : string
 	private_ = "private",
 }
 
-/// A per-result freshness hint (draft `CacheableResult`): how long a result may
+/// A per-result freshness hint (modern `CacheableResult`): how long a result may
 /// be cached (`ttl`) and by whom (`cacheScope`). Supplied per result by the
 /// user and surfaced to client consumers. The wire field stays `ttlMs`
 /// (milliseconds); `ttl` is the typed SDK-facing value.
@@ -257,7 +257,7 @@ Implementation readServerInfo(Json result) @safe
 	return Implementation.fromJson(info);
 }
 
-/// Attach the draft `CacheableResult` fields (`ttlMs`, `cacheScope`) to a result
+/// Attach the modern `CacheableResult` fields (`ttlMs`, `cacheScope`) to a result
 /// object from a `CacheHint` and return it, leaving the original untouched (matching
 /// the sibling `withSubscriptionId`). A freshness hint for clients/intermediaries
 /// that complements `listChanged` notifications.
@@ -278,7 +278,7 @@ Json withCache(Json result, CacheHint hint) @safe
 	return out_;
 }
 
-/// Parse a draft `CacheableResult` freshness hint from a result object. Reads
+/// Parse a modern `CacheableResult` freshness hint from a result object. Reads
 /// `ttlMs` (accepting an integer or a float) and `cacheScope` (a string mapped to
 /// the `CacheScope` enum, defaulting to `public`). Returns null when no `ttlMs`
 /// field is present.
@@ -398,7 +398,7 @@ unittest  // DiscoverResult.toJson emits the spec wire field `supportedVersions`
 	d.protocolVersions = ["2026-07-28", "2025-11-25"];
 	d.serverInfo = Implementation("srv", "1.0");
 	auto j = d.toJson();
-	// draft server/discover Response Fields table requires `supportedVersions`,
+	// 2026-07-28 server/discover Response Fields table requires `supportedVersions`,
 	// not the internal name `protocolVersions`.
 	assert("supportedVersions" in j);
 	assert("protocolVersions" !in j);
@@ -424,7 +424,7 @@ unittest  // DiscoverResult.toJson carries the required resultType discriminator
 	DiscoverResult d;
 	d.protocolVersions = ["2026-07-28"];
 	auto j = d.toJson();
-	// Base draft Result mandates a resultType discriminator on every result;
+	// The 2026-07-28 base Result mandates a resultType discriminator on every result;
 	// a complete discover response uses "complete".
 	assert("resultType" in j);
 	assert(j["resultType"].get!string == "complete");

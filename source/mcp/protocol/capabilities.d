@@ -13,7 +13,7 @@ import mcp.protocol.jsonhelpers : getOr, tryGet;
 enum string tasksExtensionKey = "io.modelcontextprotocol/tasks";
 
 /// The Extension Negotiation identifier under which event support is declared
-/// (the MCP Events extension). Carried in the draft `extensions` capability map;
+/// (the MCP Events extension). Carried in the modern `extensions` capability map;
 /// the settings object MAY carry `{listChanged, delivery}` describing the
 /// supported delivery modes.
 enum string eventsExtensionKey = "io.modelcontextprotocol/events";
@@ -21,8 +21,8 @@ enum string eventsExtensionKey = "io.modelcontextprotocol/events";
 /// The minimum protocol version at which an Extension Negotiation identifier
 /// may be advertised in the `extensions` capability map. Apps
 /// (`io.modelcontextprotocol/ui`) and Skills (`io.modelcontextprotocol/skills`)
-/// negotiate from 2025-11-25; Tasks (SEP-2663) and Events are draft-only. An
-/// identifier with no declared floor defaults to draft-only — the conservative
+/// negotiate from 2025-11-25; Tasks (SEP-2663) and Events are modern-only. An
+/// identifier with no declared floor defaults to modern-only — the conservative
 /// choice for an extension whose version policy this SDK does not yet know.
 ProtocolVersion extensionMinVersion(string identifier) pure nothrow @safe @nogc
 {
@@ -31,8 +31,8 @@ ProtocolVersion extensionMinVersion(string identifier) pure nothrow @safe @nogc
 	case "io.modelcontextprotocol/ui": // Apps
 	case "io.modelcontextprotocol/skills": // Skills (SEP-2640)
 		return ProtocolVersion.v2025_11_25;
-	case tasksExtensionKey: // Tasks (SEP-2663) — draft only
-	case eventsExtensionKey: // Events — draft only
+	case tasksExtensionKey: // Tasks (SEP-2663) — modern only
+	case eventsExtensionKey: // Events — modern only
 		return ProtocolVersion.v2026_07_28;
 	default:
 		return ProtocolVersion.v2026_07_28;
@@ -256,7 +256,7 @@ struct ServerCapabilities
 	bool logging; /// presence-only ({} when set)
 	bool completions; /// presence-only ({} when set)
 	Json experimental = Json.undefined;
-	/// draft Extension Negotiation: map of extension identifiers (e.g.
+	/// modern Extension Negotiation: map of extension identifiers (e.g.
 	/// "io.modelcontextprotocol/tasks") to per-extension settings objects.
 	/// Distinct from `experimental`.
 	Json extensions = Json.undefined;
@@ -301,7 +301,7 @@ struct ServerCapabilities
 		if (v >= ProtocolVersion.v2025_03_26)
 			projected.completions = completions;
 		// Each extension carries its own version floor (see extensionMinVersion):
-		// Apps/Skills from 2025-11-25, Tasks draft-only.
+		// Apps/Skills from 2025-11-25, Tasks modern-only.
 		projected.extensions = projectExtensions(extensions, v);
 		return projected;
 	}
@@ -366,7 +366,7 @@ struct ClientCapabilities
 	/// URL-mode elicitation requests unless this is advertised.
 	bool elicitationUrl;
 	Json experimental = Json.undefined;
-	/// draft Extension Negotiation: map of extension identifiers (e.g.
+	/// modern Extension Negotiation: map of extension identifiers (e.g.
 	/// "io.modelcontextprotocol/ui") to per-extension settings objects.
 	/// Distinct from `experimental`.
 	Json extensions = Json.undefined;
@@ -440,7 +440,7 @@ struct ClientCapabilities
 			projected.elicitationUrl = elicitationUrl;
 		}
 		// Each extension carries its own version floor (see extensionMinVersion):
-		// Apps/Skills from 2025-11-25, Tasks draft-only.
+		// Apps/Skills from 2025-11-25, Tasks modern-only.
 		projected.extensions = projectExtensions(extensions, v);
 		return projected;
 	}
@@ -727,7 +727,7 @@ unittest  // forVersion keeps title from 2025-06-18 but strips 2025-11-25 fields
 	assert("icons" !in j);
 }
 
-unittest  // forVersion keeps every field for 2025-11-25 and draft
+unittest  // forVersion keeps every field for 2025-11-25 and modern
 {
 	Implementation impl = {
 		name: "srv", version_: "1", title: nullable("My Server"), description: nullable("does things"), websiteUrl: nullable(
@@ -771,7 +771,7 @@ unittest  // Icon.fromJson leaves theme null when absent
 	assert("theme" !in back.toJson());
 }
 
-unittest  // Implementation.forVersion carries icon theme for 2025-11-25 and draft
+unittest  // Implementation.forVersion carries icon theme for 2025-11-25 and modern
 {
 	Implementation impl = {
 		name: "srv", version_: "1", icons: [
@@ -806,7 +806,7 @@ unittest  // ServerCapabilities.forVersion keeps completions from 2025-03-26
 		assert("completions" in caps.forVersion(v).toJson());
 }
 
-unittest  // ServerCapabilities.forVersion strips extensions for non-draft
+unittest  // ServerCapabilities.forVersion strips extensions for legacy
 {
 	ServerCapabilities caps;
 	Json ext = Json.emptyObject;
@@ -819,7 +819,7 @@ unittest  // ServerCapabilities.forVersion strips extensions for non-draft
 		assert("extensions" !in caps.forVersion(v).toJson());
 }
 
-unittest  // ServerCapabilities.forVersion keeps extensions for draft
+unittest  // ServerCapabilities.forVersion keeps extensions for modern
 {
 	ServerCapabilities caps;
 	Json ext = Json.emptyObject;
@@ -857,7 +857,7 @@ unittest  // ServerCapabilities.forVersion: Apps/Skills stripped below 2025-11-2
 		assert("extensions" !in caps.forVersion(v).toJson());
 }
 
-unittest  // ServerCapabilities.forVersion: Tasks stays draft-only at 2025-11-25
+unittest  // ServerCapabilities.forVersion: Tasks stays modern-only at 2025-11-25
 {
 	ServerCapabilities caps;
 	Json ext = Json.emptyObject;
@@ -881,7 +881,7 @@ unittest  // ServerCapabilities.forVersion: a mixed map drops Tasks but keeps Ap
 	assert("io.modelcontextprotocol/skills" in j["extensions"]);
 }
 
-unittest  // ClientCapabilities.forVersion: Apps/Skills ride extensions from 2025-11-25, Tasks stays draft-only
+unittest  // ClientCapabilities.forVersion: Apps/Skills ride extensions from 2025-11-25, Tasks stays modern-only
 {
 	ClientCapabilities caps;
 	Json ext = Json.emptyObject;
@@ -955,7 +955,7 @@ unittest  // ClientCapabilities nests roots.listChanged and presence flags
 	assert(back.roots && back.rootsListChanged && back.sampling && !back.elicitation);
 }
 
-unittest  // ServerCapabilities advertises and round-trips the draft `extensions` map
+unittest  // ServerCapabilities advertises and round-trips the modern `extensions` map
 {
 	ServerCapabilities caps;
 	Json ext = Json.emptyObject;
@@ -977,7 +977,7 @@ unittest  // ServerCapabilities omits `extensions` when unset
 	assert("extensions" !in caps.toJson());
 }
 
-unittest  // ClientCapabilities advertises and round-trips the draft `extensions` map
+unittest  // ClientCapabilities advertises and round-trips the modern `extensions` map
 {
 	ClientCapabilities caps;
 	Json ext = Json.emptyObject;

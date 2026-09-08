@@ -10,7 +10,7 @@ import mcp.protocol.jsonhelpers : tryGet;
 
 @safe:
 
-/// Reserved `_meta` keys defined by the draft (2026-07-28) revision.
+/// Reserved `_meta` keys defined by the 2026-07-28 revision.
 enum MetaKey : string
 {
 	protocolVersion = "io.modelcontextprotocol/protocolVersion",
@@ -143,12 +143,12 @@ private bool isAlphaNum(char c) @safe pure nothrow
 }
 
 /// Whether a `_meta` key's prefix is reserved for MCP use, applying the rule for
-/// the 2025-11-25 / draft revisions: the SECOND dot-separated label of the prefix
+/// the 2025-11-25 / modern revisions: the SECOND dot-separated label of the prefix
 /// is `modelcontextprotocol` or `mcp` (e.g. `io.modelcontextprotocol/`, `com.mcp/`).
 /// `com.example.mcp/` is NOT reserved. Such prefixes MUST NOT be used by
 /// non-protocol code.
 ///
-/// This version-agnostic overload preserves the 2025-11-25 / draft semantics. Use
+/// This version-agnostic overload preserves the 2025-11-25 / modern semantics. Use
 /// the `(string, ProtocolVersion)` overload when an effective protocol version is
 /// known, since 2025-06-18 uses a broader rule (see below).
 bool isReservedMetaPrefix(string key) @safe pure nothrow
@@ -177,11 +177,11 @@ bool isReservedMetaPrefix(string key) @safe pure nothrow
 ///   reserved. Earlier versions (2024-11-05, 2025-03-26) had no formal `_meta`
 ///   reserved-prefix rule; this same any-position rule is applied to them as a
 ///   safe superset.
-/// - 2025-11-25 / draft: the narrower "second label" rule (see the
+/// - 2025-11-25 / modern: the narrower "second label" rule (see the
 ///   single-argument overload), where `com.example.mcp/` is NOT reserved.
 bool isReservedMetaPrefix(string key, ProtocolVersion v) @safe pure nothrow
 {
-	// 2025-11-25 and the draft use the narrower "second label" rule.
+	// 2025-11-25 and the modern use the narrower "second label" rule.
 	if (v >= ProtocolVersion.v2025_11_25)
 		return isReservedMetaPrefix(key);
 
@@ -206,7 +206,7 @@ bool isReservedMetaPrefix(string key, ProtocolVersion v) @safe pure nothrow
 /// Validate a user-supplied `_meta` key for attachment: it MUST be a
 /// well-formed key (`isValidMetaKey`) and MUST NOT use an MCP-reserved prefix
 /// (`isReservedMetaPrefix`). Returns `true` if the key is safe to use. Uses the
-/// 2025-11-25 / draft "second label" reserved-prefix rule; pass a
+/// 2025-11-25 / modern "second label" reserved-prefix rule; pass a
 /// `ProtocolVersion` to apply the rule for a specific connection.
 bool isUserMetaKeyAllowed(string key) @safe pure nothrow
 {
@@ -221,9 +221,9 @@ bool isUserMetaKeyAllowed(string key, ProtocolVersion v) @safe pure nothrow
 	return isValidMetaKey(key) && !isReservedMetaPrefix(key, v);
 }
 
-/// Stamp the draft `io.modelcontextprotocol/subscriptionId` (`MetaKey.subscriptionId`)
+/// Stamp the modern `io.modelcontextprotocol/subscriptionId` (`MetaKey.subscriptionId`)
 /// into `params._meta` of a JSON-RPC notification and return it, leaving the
-/// original untouched. Per draft basic/utilities/subscriptions every notification
+/// original untouched. Per 2026-07-28 basic/utilities/subscriptions every notification
 /// delivered on a `subscriptions/listen` stream MUST carry the listen request's id
 /// as `subscriptionId` in `_meta`, so clients can correlate the notification with
 /// the listen request that established the stream — this is the producer for that
@@ -252,7 +252,7 @@ Json withListenSubscriptionId(Json notification, Json subscriptionId) @safe
 }
 
 /// Build the JSON-RPC response for a `subscriptions/listen` request the server is
-/// gracefully tearing down (draft basic/utilities/subscriptions
+/// gracefully tearing down (2026-07-28 basic/utilities/subscriptions
 /// `SubscriptionsListenResult`). The long-lived listen stream emits this single
 /// response only on graceful teardown — e.g. server shutdown or an accepted
 /// cancellation; an abrupt transport close carries no response. The result body is
@@ -340,7 +340,7 @@ unittest  // withListenSubscriptionId with an empty id is a no-op
 	assert("params" !in same);
 }
 
-/// Standard Streamable HTTP request headers introduced by the draft.
+/// Standard Streamable HTTP request headers introduced by 2026-07-28.
 enum HttpHeader : string
 {
 	protocolVersion = "MCP-Protocol-Version",
@@ -410,7 +410,7 @@ bool isHeaderValueUnsafe(string value) @safe nothrow @nogc
 	return false;
 }
 
-/// Whether a JSON Schema `type` value is one the draft permits an `x-mcp-header`
+/// Whether a JSON Schema `type` value is one the modern permits an `x-mcp-header`
 /// annotation to be applied to. Per `server/tools` #x-mcp-header, only the
 /// primitive types `integer`, `string`, and `boolean` are allowed; `number` is
 /// explicitly NOT permitted (its value may not round-trip through a header).
@@ -420,7 +420,7 @@ bool isPrimitiveHeaderType(string jsonSchemaType) @safe pure nothrow
 }
 
 /// Validate a single `x-mcp-header` value (the name portion of the resulting
-/// `Mcp-Param-{name}` header) against the draft constraints, returning a
+/// `Mcp-Param-{name}` header) against the modern constraints, returning a
 /// human-readable reason on violation or `null` when valid.
 ///
 /// Per `server/tools` #x-mcp-header an `x-mcp-header` value:
@@ -468,7 +468,7 @@ struct ParamHeader
 }
 
 /// Collect every valid `x-mcp-header` annotation in a tool `inputSchema`,
-/// recursing only through chains of `object` `properties` keys. The draft
+/// recursing only through chains of `object` `properties` keys. The modern
 /// requires an annotated property to be _statically reachable_ from the schema
 /// root via `properties` alone — never through `items` (or any array keyword),
 /// composition (`oneOf`/`anyOf`/`allOf`/`not`), conditional (`if`/`then`/`else`),
@@ -511,7 +511,7 @@ ParamHeader[] paramHeaders(Json inputSchema) @safe
 }
 
 /// Validate every `x-mcp-header` annotation in a tool `inputSchema` against the
-/// draft constraints (`server/tools` #x-mcp-header): non-empty, HTTP token
+/// modern constraints (`server/tools` #x-mcp-header): non-empty, HTTP token
 /// syntax, no CR/LF, primitive-only (`number` forbidden), and case-insensitive
 /// uniqueness across the whole schema. The annotation MUST also sit on a property
 /// that is _statically reachable_ from the root via a chain of `properties` keys
@@ -716,9 +716,9 @@ struct InputRequest
 
 	/// Build a url-mode `elicitation` input-request: instead of a `requestedSchema`
 	/// form, the client is directed to a `url` to gather input out-of-band. The
-	/// draft `ElicitRequestURLParams` is `{mode:"url", message, url}` — correlation
+	/// modern `ElicitRequestURLParams` is `{mode:"url", message, url}` — correlation
 	/// is the MRTR `InputRequest.id`, so the request carries no `elicitationId`
-	/// (removed from the draft). `url` MUST be a non-empty valid absolute URI.
+	/// (removed from 2026-07-28). `url` MUST be a non-empty valid absolute URI.
 	static InputRequest elicitationUrl(string id, string message, string url) @safe
 	{
 		if (url.length == 0)
@@ -852,7 +852,7 @@ struct InputRequiredResult
 	Json toJson() const @safe
 	{
 		Json j = Json.emptyObject;
-		// Base draft Result mandates a `resultType` discriminator on every
+		// The 2026-07-28 base Result mandates a `resultType` discriminator on every
 		// result; an InputRequiredResult declares "input_required" so the
 		// client knows to gather input and retry rather than treat this as a
 		// completed response.
@@ -899,7 +899,7 @@ void parseInputRequired(Json j, ref InputRequest[] requests, ref string requestS
 
 /// Serialize a list of `InputRequest`s as a spec `InputRequests` object: a map
 /// keyed by each request's server-assigned `id`, with `{ method, params }`
-/// request objects as values (SEP-2322, draft basic/utilities/mrtr).
+/// request objects as values (SEP-2322, 2026-07-28 basic/utilities/mrtr).
 Json inputRequestsToJson(const(InputRequest)[] requests) @safe
 {
 	Json obj = Json.emptyObject;
@@ -936,7 +936,7 @@ struct InputResponse
 /// whose keys are the originating `InputRequest.id`s and whose values are the
 /// *bare* client results (e.g. `{action, content}` or
 /// `{role, content, model, stopReason}`) — not `{id, result}` wrappers and not a
-/// JSON array (SEP-2322, draft basic/utilities/mrtr).
+/// JSON array (SEP-2322, 2026-07-28 basic/utilities/mrtr).
 Json inputResponsesToJson(const(InputResponse)[] responses) @safe
 {
 	Json obj = Json.emptyObject;
@@ -984,7 +984,7 @@ unittest  // InputRequiredResult.toJson carries resultType:"input_required"
 	InputRequiredResult r;
 	r.inputRequests = [InputRequest("date", "elicitation", Json.emptyObject)];
 	auto j = r.toJson();
-	// Base draft Result mandates a resultType discriminator on every result;
+	// The 2026-07-28 base Result mandates a resultType discriminator on every result;
 	// an InputRequiredResult uses "input_required".
 	assert("resultType" in j);
 	assert(j["resultType"].get!string == "input_required");
@@ -1379,12 +1379,12 @@ unittest  // isReservedMetaPrefix(2025-06-18): not reserved without a trailing l
 	assert(!isReservedMetaPrefix("plainkey", ProtocolVersion.v2025_06_18));
 }
 
-unittest  // isReservedMetaPrefix(2025-11-25/draft): keeps the narrower second-label rule
+unittest  // isReservedMetaPrefix(2025-11-25/modern): keeps the narrower second-label rule
 {
 	import mcp.protocol.versions : ProtocolVersion;
 
-	// First-position token is NOT reserved under 2025-11-25/draft (only the
-	// second label counts), so the draft/2025-11-25 wire behaviour is unchanged.
+	// First-position token is NOT reserved under 2025-11-25/modern (only the
+	// second label counts), so the modern/2025-11-25 wire behaviour is unchanged.
 	assert(!isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
 	assert(!isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2026_07_28));
 	// `com.example.mcp/` has `mcp` as its THIRD label, so it is NOT reserved under
@@ -1399,7 +1399,7 @@ unittest  // isReservedMetaPrefix(2025-11-25/draft): keeps the narrower second-l
 	// label is `io`).
 	assert(isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_06_18)
 			&& !isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
-	// The version-agnostic overload must match the 2025-11-25/draft rule exactly.
+	// The version-agnostic overload must match the 2025-11-25/modern rule exactly.
 	assert(isReservedMetaPrefix("io.modelcontextprotocol/key",
 			ProtocolVersion.v2025_11_25) == isReservedMetaPrefix("io.modelcontextprotocol/key"));
 	assert(isReservedMetaPrefix("modelcontextprotocol.io/key",
@@ -1414,7 +1414,7 @@ unittest  // isUserMetaKeyAllowed(2025-06-18) rejects first-position mcp-token p
 	// label not an mcp-token) -> disallowed on a 2025-06-18 connection.
 	assert(!isUserMetaKeyAllowed("modelcontextprotocol.io/key", ProtocolVersion.v2025_06_18));
 	assert(!isUserMetaKeyAllowed("mcp.dev/key", ProtocolVersion.v2025_06_18));
-	// But allowed under 2025-11-25/draft, where those prefixes are not reserved
+	// But allowed under 2025-11-25/modern, where those prefixes are not reserved
 	// (their second label is `io` / `dev`, not an mcp-token).
 	assert(isUserMetaKeyAllowed("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
 	assert(isUserMetaKeyAllowed("mcp.dev/key", ProtocolVersion.v2026_07_28));
@@ -1516,7 +1516,7 @@ deprecated unittest  // paramHeaderMap silently drops nested annotations (use pa
 	assert(paramHeaderMap(schema).length == 0);
 }
 
-unittest  // validateHeaderName: empty value rejected (draft x-mcp-header MUST NOT be empty)
+unittest  // validateHeaderName: empty value rejected (modern x-mcp-header MUST NOT be empty)
 {
 	assert(validateHeaderName("") !is null);
 }
@@ -1657,7 +1657,7 @@ unittest  // paramHeaders: recurses into nested object properties (any nesting d
 
 unittest  // x-mcp-header under array items is not statically reachable: rejected and not surfaced
 {
-	// The draft requires annotated properties to be reachable via a chain of
+	// 2026-07-28 requires annotated properties to be reachable via a chain of
 	// `properties` keys only; a chain through `items` (an array keyword) is invalid.
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
@@ -1845,7 +1845,7 @@ unittest  // validateInputSchemaHeaders: rejects number-typed header on prefixIt
 	assert(validateInputSchemaHeaders(schema) !is null);
 }
 
-unittest  // InputRequest.elicitationUrl builds draft url-mode params (no elicitationId)
+unittest  // InputRequest.elicitationUrl builds modern url-mode params (no elicitationId)
 {
 	auto ir = InputRequest.elicitationUrl("e1", "Authorize access", "https://example.com/consent");
 	assert(ir.type == "elicitation");
@@ -1853,7 +1853,7 @@ unittest  // InputRequest.elicitationUrl builds draft url-mode params (no elicit
 	assert(ir.params["mode"].get!string == "url");
 	assert(ir.params["message"].get!string == "Authorize access");
 	assert(ir.params["url"].get!string == "https://example.com/consent");
-	// The draft removed elicitationId from url-mode requests; correlation is the
+	// The modern removed elicitationId from url-mode requests; correlation is the
 	// MRTR request id.
 	assert("elicitationId" !in ir.params);
 }

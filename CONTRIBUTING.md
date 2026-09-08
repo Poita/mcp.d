@@ -109,10 +109,10 @@ These conventions are enforced by review (and some by CI). Please follow them:
   (and `conformance/` if you touched it) and `./scripts/dscanner-lint.sh` so the
   CI format/lint gates stay green.
 - **Match the MCP spec exactly.** Field names, JSON shapes, and error codes must
-  match the authoritative schema for the relevant protocol version. **Draft-only
-  behavior must apply only when the negotiated protocol version is `draft`** — it
-  must not change the wire output of released versions (`2025-11-25`,
-  `2025-06-18`, …). Don't regress the conformance baseline (**server 39/39**,
+  match the authoritative schema for the relevant protocol version. **Revision-specific
+  behavior must be gated on the negotiated protocol version** — a change for
+  `2026-07-28` must not alter the wire output of earlier revisions (`2025-11-25`,
+  `2025-06-18`, …), and vice versa. Don't regress the conformance baseline (**server 39/39**,
   **client 287/287**).
 - **Keep new public API reachable.** Anything new and public should be exported
   via `source/mcp/package.d` and usable from `McpServer` / `McpClient` /

@@ -1821,7 +1821,7 @@ version (unittest)
 		}
 	}
 
-	// Build a draft-version request so `resources/directory/read` (draft-gated)
+	// Build a modern-version request so `resources/directory/read` (modern-gated)
 	// is routed; mirrors the server's own `modernReq` test helper.
 	private Message modernRequest(long id, string method, Json params) @safe
 	{

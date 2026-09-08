@@ -1207,7 +1207,7 @@ unittest  // CIMD document round-trips through toJson/fromJson
 
 /// The client-registration approach an MCP client should use for an
 /// authorization server, per the spec priority order ("Client Registration
-/// Approaches", 2025-11-25 / draft).
+/// Approaches", 2025-11-25 / modern).
 enum ClientRegistrationApproach
 {
 	/// Use pre-registered client information the client already has.
@@ -1750,7 +1750,7 @@ unittest  // extractQueryParam strips URI fragment before parsing query paramete
 
 /// Validate the RFC 9207 `iss` authorization-response parameter against the
 /// recorded issuer of the selected authorization server, per RFC 9207
-/// Section 2.4 (the MCP 2025-11-25 / draft "Authorization Response Validation"
+/// Section 2.4 (the MCP 2025-11-25 / modern "Authorization Response Validation"
 /// requirement, mitigating authorization-server mix-up attacks).
 ///
 /// `responseIss` is the raw `iss` value extracted from the authorization
@@ -1807,7 +1807,7 @@ unittest  // iss absent and not advertised is accepted (nothing to validate)
 /// the `state` value the client sent in the authorization request.
 ///
 /// Per the MCP authorization spec (basic/authorization, "Open Redirection",
-/// 2025-06-18 / 2025-11-25 / draft): "MCP clients SHOULD use and verify state
+/// 2025-06-18 / 2025-11-25 / modern): "MCP clients SHOULD use and verify state
 /// parameters in the authorization code flow and discard any results that do
 /// not include or have a mismatch with the original state."
 ///

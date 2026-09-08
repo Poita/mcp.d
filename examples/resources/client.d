@@ -10,7 +10,7 @@
  *   - http (`--http <url>` / `--url <url>`): `connectFromArgs` connects with
  *     `McpClient.http(url)`.
  *
- * It speaks the stateless draft protocol (`enableModern`) for two reasons: the
+ * It speaks the modern protocol protocol (`enableModern`) for two reasons: the
  * `CacheableResult` freshness hint rides inline on every `resources/read`, and a
  * `subscriptions/listen` stream is the ONE push mechanism the SDK supports over
  * both transports (the standalone GET SSE stream is HTTP-only).
@@ -21,9 +21,9 @@
  *   3. resources/read of `config://app` returns the expected JSON text.
  *   4. resources/read of `note:///welcome` (template expansion) returns the
  *      seeded body, with mimeType text/plain.
- *   5. resources/read of an unknown URI fails with an error (the draft maps
+ *   5. resources/read of an unknown URI fails with an error (the modern maps
  *      not-found to invalidParams -32602).
- *   6. the draft read of `config://app` surfaces the server's CacheableResult
+ *   6. the modern read of `config://app` surfaces the server's CacheableResult
  *      freshness hint (ttl == 60.seconds, wire ttlMs == 60000, cacheScope == public).
  *   7. after subscriptions/listen, calling `set_note` delivers a
  *      notifications/resources/updated for the subscribed URI AND a
@@ -90,7 +90,7 @@ int main(string[] args) @safe
 int run(string[] args) @safe
 {
 	// The push phase (subscriptions/listen + notifications/resources/updated)
-	// runs over BOTH transports. subscriptions/listen is a DRAFT RPC and the draft is
+	// runs over BOTH transports. subscriptions/listen is a DRAFT RPC and 2026-07-28 is
 	// stateless-only, so it works on this STATELESS server: the POST opens one
 	// long-lived SSE stream and set_note -> notifyResourceUpdated streams
 	// notifications/resources/updated (+ resources/list_changed) down THAT same
@@ -104,7 +104,7 @@ int run(string[] args) @safe
 	scope (exit)
 		client.close();
 
-	// Speak the stateless draft: cache hints ride inline on resources/read, and
+	// Speak the modern protocol: cache hints ride inline on resources/read, and
 	// subscriptions/listen is the cross-transport push mechanism.
 	client.enableModern();
 	auto disc = client.discover();
@@ -132,8 +132,8 @@ int run(string[] args) @safe
 	const cfgText = cfg.contents.length ? cfg.contents[0].text : "";
 	checkEq(cfgText, expectedConfig, "config text");
 
-	// (6) draft read surfaces the CacheableResult freshness hint (inline).
-	check(!cfg.cache.isNull, "draft read: expected a cache hint on config://app");
+	// (6) modern read surfaces the CacheableResult freshness hint (inline).
+	check(!cfg.cache.isNull, "modern read: expected a cache hint on config://app");
 	if (!cfg.cache.isNull)
 	{
 		checkEq(cfg.cache.get.ttl, expectedTtl, "cache ttl");
@@ -149,7 +149,7 @@ int run(string[] args) @safe
 	check(note.contents.length && note.contents[0].mimeType == "text/plain",
 			"note:///welcome mimeType mismatch");
 
-	// (5) unknown resource read raises an error. The draft protocol maps the
+	// (5) unknown resource read raises an error. The modern protocol maps the
 	// resources/read not-found code to invalidParams (-32602). Pick a URI that
 	// matches neither the direct resource nor the note template.
 	bool threw;
@@ -159,7 +159,7 @@ int run(string[] args) @safe
 	{
 		threw = true;
 		check(e.code == ErrorCode.invalidParams,
-				format("unknown read: expected -32602 (draft not-found), got %d", e.code));
+				format("unknown read: expected -32602 (modern not-found), got %d", e.code));
 	}
 	check(threw, "unknown resource read did not raise an error");
 
@@ -234,7 +234,7 @@ int run(string[] args) @safe
 			"new note resource did not read back the pushed body");
 
 	writeln("OK [resources]: list+templates+read+template-expand"
-			~ "+notfound(-32602 draft)+draft-cache(ttl=60000,public)+subscribe/updated+list_changed"
+			~ "+notfound(-32602 modern)+modern-cache(ttl=60000,public)+subscribe/updated+list_changed"
 			~ " verified");
 	return 0;
 }

@@ -1,9 +1,9 @@
 /**
  * MRTR (Multi Round-Trip Requests, SEP-2322) example server — dual transport.
  *
- * Demonstrates the *stateless* draft input flow: instead of opening a
+ * Demonstrates the *stateless* modern input flow: instead of opening a
  * server->client `elicitation/create` or `sampling/createMessage` request (which
- * the draft revision has no channel for), a tool that needs more input simply
+ * the 2026-07-28 revision has no channel for), a tool that needs more input simply
  * ENDS the current `tools/call` with `ToolResponse.inputRequired(...)`. The
  * client gathers the answers and resubmits a fresh `tools/call` carrying them in
  * `params.inputResponses`, echoing back the opaque `requestState` the server
@@ -147,7 +147,7 @@ final class MrtrApi
 			// SamplingMessage + Content, then hand it to InputRequest.sampling.
 			CreateMessageRequest sreq;
 			sreq.messages = [
-				SamplingMessage("user", Content.makeText("Draft a one-line agenda for: " ~ topic))
+				SamplingMessage("user", Content.makeText("Modern a one-line agenda for: " ~ topic))
 			];
 			sreq.maxTokens = Nullable!long(64);
 			auto agendaReq = InputRequest.sampling(agendaId, sreq);

@@ -53,7 +53,7 @@ enum CacheMode
 /// - `progressToken`: attached as `params._meta.progressToken` so the server may
 ///   emit `notifications/progress` for the request (basic/utilities/progress).
 /// - `logLevel`: minimum `notifications/message` severity for this request,
-///   carried in `params._meta["io.modelcontextprotocol/logLevel"]` (draft
+///   carried in `params._meta["io.modelcontextprotocol/logLevel"]` (modern
 ///   server/utilities/logging, SEP-2575/2577); ignored on a released protocol,
 ///   empty attaches nothing.
 /// - `onProgress`: a per-call progress sink. When non-null and no explicit
@@ -101,14 +101,14 @@ Json withProgressToken(Json params, ProgressToken token) @safe
 
 /// Merge a per-request log level into a request's
 /// `params._meta["io.modelcontextprotocol/logLevel"]` (`MetaKey.logLevel`), per
-/// the draft (2026-07-28) server/utilities/logging rule that "Clients control
+/// the 2026-07-28 server/utilities/logging rule that "Clients control
 /// logging verbosity per-request via `_meta`" (SEP-2575/2577, which removed the
-/// `logging/setLevel` RPC). A conformant draft server MUST NOT emit
+/// `logging/setLevel` RPC). A conformant modern server MUST NOT emit
 /// `notifications/message` for a request that omits this field, so attaching it
-/// is the only way a draft client can opt in to log messages for the request.
+/// is the only way a modern client can opt in to log messages for the request.
 /// An empty `level` leaves `params` unchanged. Any existing `_meta` keys are
 /// preserved. Exposed so callers can attach a log level to a hand-built params
-/// object; only meaningful on a draft-negotiated session.
+/// object; only meaningful on a modern-negotiated session.
 Json withRequestLogLevel(Json params, string level) @safe
 {
 	if (level.length == 0)
@@ -152,13 +152,13 @@ struct ClientSettings
 	/// in-memory store, so caching is on by default — a repeat call within a
 	/// server's `ttlMs` hint is served locally with no round-trip. Assign your own
 	/// `CacheStore` to share or persist entries (and pre-seed them), or `noCache`
-	/// to disable caching entirely. Against pre-draft servers (or any response
+	/// to disable caching entirely. Against legacy servers (or any response
 	/// with no hint) nothing is cached unless `defaultCacheTtl` is positive, so the
 	/// default-on behavior is byte-identical to the uncached client there.
 	CacheStore cache = null;
 
 	/// Fallback freshness applied to a cacheable result when the server attaches
-	/// no `ttlMs` hint (pre-draft servers, or a draft server that omits it). Zero
+	/// no `ttlMs` hint (legacy servers, or a modern server that omits it). Zero
 	/// (the default) means "do not cache unhinted responses", preserving exact
 	/// pre-cache behavior; a positive value caches even unhinted responses for
 	/// this long. A server-supplied hint always takes precedence over this.
@@ -310,13 +310,13 @@ final class McpClient : ClientProtocol
 	private CacheKey toolIndexKey_;
 	private SysTime toolIndexStamp_;
 	private bool toolIndexValid_;
-	// Draft (2026-07-28) per-request logging opt-in. The draft removed the
+	// Modern (2026-07-28) per-request logging opt-in. The modern removed the
 	// `logging/setLevel` RPC; a client instead controls verbosity by stamping
 	// `_meta["io.modelcontextprotocol/logLevel"]` on each request, and a
 	// conformant server emits no `notifications/message` for a request that
 	// omits it (server/utilities/logging, SEP-2575/2577). This is the sticky
-	// default level applied to every draft request by `injectModernMeta`; empty
-	// means "no opt-in" (no field stamped). Set via `setLogLevel` on a draft
+	// default level applied to every modern request by `injectModernMeta`; empty
+	// means "no opt-in" (no field stamped). Set via `setLogLevel` on a modern
 	// session. Per-request overrides go through `RequestOptions.logLevel` /
 	// `withRequestLogLevel` and are NOT stored here.
 	private string requestLogLevel_;
@@ -348,7 +348,7 @@ final class McpClient : ClientProtocol
 	private EventStreamHandlers[string] eventStreams_;
 	// Server identity/capabilities discovered at connect/initialize, exposed via
 	// the `serverCapabilities`/`serverInfo`/`serverInstructions` accessors. Both
-	// the stable initialize handshake and the stateless draft `server/discover`
+	// the stable initialize handshake and the modern protocol `server/discover`
 	// path populate these so a connected caller can inspect what the peer
 	// advertised without re-issuing discovery.
 	private ServerCapabilities serverCapabilities_;
@@ -377,7 +377,7 @@ final class McpClient : ClientProtocol
 	// it on the server's `*/list_changed` and `resources/updated` notifications.
 	private CacheStore cacheStore_;
 	// Fallback freshness used when a cacheable result carries no server `ttlMs`
-	// hint (pre-draft servers, or a draft server that omits it). Zero means
+	// hint (legacy servers, or a modern server that omits it). Zero means
 	// "do not cache unhinted responses" (the default), so behavior against such
 	// servers matches the uncached client. A server hint always wins over this.
 	private Duration defaultCacheTtl_;
@@ -404,7 +404,7 @@ final class McpClient : ClientProtocol
 	/// `onListRoots` auto-advertises `sampling`/`elicitation`/`roots`.
 	ClientCapabilities capabilities;
 	/// When true (the default), the capabilities advertised at `initialize`
-	/// (and in every draft per-request `_meta`) are derived from which handlers
+	/// (and in every modern per-request `_meta`) are derived from which handlers
 	/// are installed: `onSampling` implies `sampling`, `onElicitation` implies
 	/// `elicitation` (form submode), `onListRoots` implies `roots`. Anything
 	/// already set on `capabilities` is preserved (e.g. submodes, `listChanged`,
@@ -490,7 +490,7 @@ final class McpClient : ClientProtocol
 		transport.setInboundHandler(&dispatchInbound);
 		// Hand the transport this client as its `ClientProtocol`: it pulls the
 		// protocol-derived request headers (`headersFor`) and the cancelled-response
-		// predicate (`isCancelled`) through that single seam, so the draft-header /
+		// predicate (`isCancelled`) through that single seam, so the modern-header /
 		// schema-lookup logic and the cancellation set stay here and no transport has
 		// to be a concrete type the client downcasts to.
 		transport.setProtocol(this);
@@ -635,7 +635,7 @@ final class McpClient : ClientProtocol
 		transport.setModernProtocol(true);
 	}
 
-	/// `server/discover` (draft): fetch the server's supported versions,
+	/// `server/discover` (2026-07-28): fetch the server's supported versions,
 	/// capabilities, and identity. `DiscoverResult` is a `CacheableResult`, so a
 	/// still-fresh response is served from the cache without a round-trip;
 	/// `opts.cacheMode` overrides.
@@ -647,16 +647,16 @@ final class McpClient : ClientProtocol
 		return result;
 	}
 
-	/// `server/discover` self-advertising draft framing, used by `connect()` to
-	/// auto-detect a draft/stateless server before any version is negotiated.
+	/// `server/discover` self-advertising modern framing, used by `connect()` to
+	/// auto-detect a modern/stateless server before any version is negotiated.
 	///
-	/// `route()`/`freshStatelessState` gate `server/discover` on a draft effective
-	/// version, which a stateless server only resolves when the probe carries draft
-	/// framing (the `MCP-Protocol-Version` draft header and a draft
+	/// `route()`/`freshStatelessState` gate `server/discover` on a modern effective
+	/// version, which a stateless server only resolves when the probe carries modern
+	/// framing (the `MCP-Protocol-Version` modern header and a modern
 	/// `_meta.protocolVersion`). Without it the server falls back to its stable
 	/// default and answers methodNotFound, so an undecorated probe can never select
-	/// draft. This temporarily stamps draft framing on the single probe request and
-	/// restores the prior (unnegotiated) state on any non-draft outcome, so a
+	/// modern. This temporarily stamps modern framing on the single probe request and
+	/// restores the prior (unnegotiated) state on any legacy outcome, so a
 	/// genuine legacy server is still detected by the caller.
 	private DiscoverResult discoverProbe() @safe
 	{
@@ -672,8 +672,8 @@ final class McpClient : ClientProtocol
 				negotiated = priorNegotiated;
 			}
 		auto result = DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject));
-		// The probe succeeded as draft; leave the framing in place so `connect`'s
-		// version selection runs against a draft-capable peer.
+		// The probe succeeded as modern; leave the framing in place so `connect`'s
+		// version selection runs against a modern-capable peer.
 		keepModernFraming = true;
 		return result;
 	}
@@ -700,8 +700,8 @@ final class McpClient : ClientProtocol
 		InitializeParams params;
 		params.protocolVersion = requestedVersion;
 		// Advertise capabilities in the wire shape for the requested version:
-		// e.g. for draft, `tasks` is folded into the `extensions` map rather than
-		// emitted as a top-level capability the draft schema does not define.
+		// e.g. for modern, `tasks` is folded into the `extensions` map rather than
+		// emitted as a top-level capability the 2026-07-28 schema does not define.
 		ProtocolVersion reqVer;
 		if (!tryParseVersion(requestedVersion, reqVer))
 			reqVer = latestLegacy;
@@ -719,8 +719,8 @@ final class McpClient : ClientProtocol
 		// under a version the server did not agree to.
 		negotiated = resolveNegotiatedVersion(init.protocolVersion);
 		// Record what the server advertised so `serverCapabilities`/`serverInfo`/
-		// `serverInstructions` work uniformly across the initialize and draft
-		// discovery paths (symmetry with `connect`'s draft branch).
+		// `serverInstructions` work uniformly across the initialize and modern
+		// discovery paths (symmetry with `connect`'s modern branch).
 		serverCapabilities_ = init.capabilities;
 		serverInfo_ = init.serverInfo;
 		serverInstructions_ = init.instructions;
@@ -732,7 +732,7 @@ final class McpClient : ClientProtocol
 	/// Connect to a server whose protocol era is unknown, per the transport
 	/// backward-compatibility rules. Probes `server/discover` first:
 	///   - success → modern server; switch to the newest mutually-supported
-	///     version (stateless draft mode if that version uses per-request
+	///     version (modern mode if that version uses per-request
 	///     `_meta`, otherwise an `initialize` handshake for that stable version);
 	///   - `Method not found` (-32601) → legacy server; fall back to the
 	///     `initialize` handshake;
@@ -747,8 +747,8 @@ final class McpClient : ClientProtocol
 		bool haveDisc;
 		try
 		{
-			// Probe with draft framing so a stateless/draft server resolves the
-			// request to draft and serves `server/discover`; an undecorated probe
+			// Probe with modern framing so a stateless/modern server resolves the
+			// request to the modern protocol and serves `server/discover`; an undecorated probe
 			// would fall back to the server's stable default and be rejected.
 			disc = discoverProbe();
 			haveDisc = true;
@@ -788,7 +788,7 @@ final class McpClient : ClientProtocol
 			useModern = true;
 			negotiated = chosen;
 			transport.setModernProtocol(true);
-			// No initialize handshake follows on the stateless draft path, so
+			// No initialize handshake follows on the modern protocol path, so
 			// capture what `server/discover` advertised; otherwise the caller
 			// would have no way to inspect the server's capabilities/identity.
 			// When the probe succeeded (haveDisc), the result is already in hand;
@@ -811,12 +811,12 @@ final class McpClient : ClientProtocol
 		}
 		else
 		{
-			// The draft-framed probe left draft framing set; the mutually-chosen
+			// The modern-framed probe left modern framing set; the mutually-chosen
 			// version is stable, so clear it before the `initialize` handshake runs
 			// under that stable version.
 			useModern = false;
 			negotiated = chosen;
-			initialize(chosen.toWire); // modern discovery, pre-draft version
+			initialize(chosen.toWire); // modern discovery, legacy version
 		}
 		return negotiated;
 	}
@@ -828,7 +828,7 @@ final class McpClient : ClientProtocol
 	/// `DiscoverResult.toJson`/`fromJson`) can rehydrate it and reconnect without
 	/// re-issuing `server/discover`.
 	///
-	/// When the mutually-chosen version is modern, modern (stateless draft) framing
+	/// When the mutually-chosen version is modern, modern (modern) framing
 	/// is enabled and `prior`'s capabilities/serverInfo/instructions are adopted
 	/// directly — zero round trips. When the chosen version is stable, modern
 	/// framing is cleared and a single `initialize(chosen.toWire)` handshake runs
@@ -850,7 +850,7 @@ final class McpClient : ClientProtocol
 			useModern = true;
 			negotiated = chosen;
 			transport.setModernProtocol(true);
-			// No `initialize` follows on the stateless draft path, so adopt what the
+			// No `initialize` follows on the modern protocol path, so adopt what the
 			// prior discovery advertised directly — no `server/discover` round-trip.
 			serverCapabilities_ = prior.capabilities;
 			serverInfo_ = prior.serverInfo;
@@ -960,7 +960,7 @@ final class McpClient : ClientProtocol
 
 	/// `tools/list`, following pagination cursors to completion. Returns the
 	/// drained `ListToolsResult`: `tools` aggregates every page's items,
-	/// `nextCursor` is null, and `cache` carries the first page's parsed draft
+	/// `nextCursor` is null, and `cache` carries the first page's parsed modern
 	/// `CacheableResult` freshness hint (if any). A still-fresh result is served
 	/// from the response cache without a round-trip; `opts.cacheMode` overrides.
 	ListToolsResult listTools(RequestOptions opts = RequestOptions.init) @safe
@@ -970,11 +970,11 @@ final class McpClient : ClientProtocol
 				(ref ListToolsResult x, ref ListToolsResult r) @safe {
 				x.tools ~= r.tools;
 			});
-			// On a draft session over HTTP (the x-mcp-header feature), the client MUST
+			// On a modern session over HTTP (the x-mcp-header feature), the client MUST
 			// exclude from tools/list any tool whose inputSchema carries an invalid
-			// `x-mcp-header` annotation (draft server/tools #x-mcp-header). Validate each
+			// `x-mcp-header` annotation (2026-07-28 server/tools #x-mcp-header). Validate each
 			// tool's schema and drop offenders before the result is cached, keeping
-			// siblings. stdio / non-draft sessions MAY ignore x-mcp-header, so they are
+			// siblings. stdio / legacy sessions MAY ignore x-mcp-header, so they are
 			// unaffected.
 			if (useModern)
 				a.tools = excludeInvalidHeaderTools(a.tools);
@@ -984,12 +984,12 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Filter out any tool whose `inputSchema` has an invalid `x-mcp-header`
-	/// annotation, per the draft requirement that a client MUST exclude such tools
+	/// annotation, per the modern requirement that a client MUST exclude such tools
 	/// from `tools/list` (`server/tools` #x-mcp-header). Each excluded tool is
 	/// reported via `logWarn` (tool name + the validation reason). Valid tools pass
 	/// through unchanged and in order. Separated as a pure static helper so the
 	/// exclusion can be unit-tested without a live server; `listTools` calls it only
-	/// for a draft session (the feature is draft-only and HTTP-transport-specific).
+	/// for a modern session (the feature is modern-only and HTTP-transport-specific).
 	package static Tool[] excludeInvalidHeaderTools(Tool[] tools) @safe
 	{
 		import mcp.protocol.mrtr : validateInputSchemaHeaders;
@@ -1238,7 +1238,7 @@ final class McpClient : ClientProtocol
 	/// `tools/call`. Per-request `progressToken` / `logLevel` / `onProgress` are
 	/// carried in `opts` (see `RequestOptions`).
 	///
-	/// Against a draft (MRTR / SEP-2322) server this transparently completes a
+	/// Against a modern (MRTR / SEP-2322) server this transparently completes a
 	/// Multi Round-Trip Request: if the server answers with an
 	/// `InputRequiredResult` (the result carries `inputRequests`), each request is
 	/// dispatched to the matching `onSampling` / `onElicitation` / `onListRoots`
@@ -1246,7 +1246,7 @@ final class McpClient : ClientProtocol
 	/// the top-level `params.inputResponses` map (and the server's opaque
 	/// `requestState` echoed back), looping until the server returns a completed
 	/// `CallToolResult`. The loop only
-	/// engages when draft mode is enabled (see `enableModern`/`connect`); other
+	/// engages when modern mode is enabled (see `enableModern`/`connect`); other
 	/// protocol versions never see `inputRequests`.
 	///
 	/// When output-schema validation is enabled (see
@@ -1309,7 +1309,7 @@ final class McpClient : ClientProtocol
 		return callTool(name, arguments, RequestOptions.withProgress(onProgress));
 	}
 
-	/// Issue `method` and, against a draft server, complete any MRTR (SEP-2322)
+	/// Issue `method` and, against a modern server, complete any MRTR (SEP-2322)
 	/// round-trips by satisfying each `InputRequest` and resubmitting the
 	/// request with the answers. Returns the first completed result. `R` is the
 	/// typed result (`CallToolResult`/`GetPromptResult`); `buildParams` rebuilds
@@ -1335,7 +1335,7 @@ final class McpClient : ClientProtocol
 		R result;
 		foreach (round; 0 .. maxRounds)
 		{
-			// Per-request draft logging opt-in: stamp the explicit level so
+			// Per-request modern logging opt-in: stamp the explicit level so
 			// `injectModernMeta` carries it (and leaves it to win over any sticky
 			// `setLogLevel` default). Empty -> no field.
 			auto params = withRequestLogLevel(buildParams(responses, requestState), logLevel);
@@ -1567,8 +1567,8 @@ final class McpClient : ClientProtocol
 	/// Opt in to the SEP-2663 MCP Tasks extension by advertising
 	/// `io.modelcontextprotocol/tasks` in the client's capabilities. A server only
 	/// returns a `CreateTaskResult` to a client that declared this, so call it
-	/// before `initialize`/`connect`. The extension is carried in the draft
-	/// `extensions` capability map; on a non-draft session it is simply not
+	/// before `initialize`/`connect`. The extension is carried in 2026-07-28
+	/// `extensions` capability map; on a legacy session it is simply not
 	/// emitted.
 	void enableTasks() @safe
 	{
@@ -1900,7 +1900,7 @@ final class McpClient : ClientProtocol
 		});
 	}
 
-	/// `prompts/get`. Against a draft (MRTR / SEP-2322) server this transparently
+	/// `prompts/get`. Against a modern (MRTR / SEP-2322) server this transparently
 	/// completes a full retry loop: when the server responds with an
 	/// `InputRequiredResult` (the result carries `inputRequests`), each request is
 	/// dispatched to the matching client handler (`onElicitation`, `onSampling`,
@@ -2007,7 +2007,7 @@ final class McpClient : ClientProtocol
 		rpc("resources/unsubscribe", p);
 	}
 
-	/// Open a draft `subscriptions/listen` notification stream (draft
+	/// Open a modern `subscriptions/listen` notification stream (modern
 	/// basic/utilities/subscriptions). This replaces the removed
 	/// `resources/subscribe` RPC and the standalone HTTP GET notification
 	/// endpoint: it POSTs `subscriptions/listen` with a `{notifications:{...}}`
@@ -2018,8 +2018,8 @@ final class McpClient : ClientProtocol
 	/// (and `onProgress` for progress). Returns a `SubscriptionStream` handle;
 	/// call its `cancel()`/`close()` to stop listening and close the stream.
 	///
-	/// Only meaningful for draft servers (call `enableModern`/`connect` first);
-	/// pre-draft servers do not implement `subscriptions/listen`.
+	/// Only meaningful for modern servers (call `enableModern`/`connect` first);
+	/// legacy servers do not implement `subscriptions/listen`.
 	SubscriptionStream subscriptionsListen(SubscriptionFilter filter) @safe
 	{
 		const id = nextId++;
@@ -2030,10 +2030,10 @@ final class McpClient : ClientProtocol
 		return transport.openListen(message);
 	}
 
-	// --- MCP Events extension (draft) --------------------------------------
+	// --- MCP Events extension (2026-07-28) --------------------------------------
 
 	/// Whether the connected server advertised the Events extension. Only true on
-	/// a draft session whose `server/discover`/`initialize` capabilities carried
+	/// a modern session whose `server/discover`/`initialize` capabilities carried
 	/// `io.modelcontextprotocol/events` in the `extensions` map.
 	bool eventsSupported() @safe
 	{
@@ -2577,7 +2577,7 @@ final class McpClient : ClientProtocol
 	version (unittest) package void delegate(SubscribeResult) @safe onWebhookRefreshSleepForTest;
 
 	/// Build the `subscriptions/listen` params, nesting the filter under
-	/// `params.notifications` exactly as the draft spec's `SubscriptionFilter`
+	/// `params.notifications` exactly as the 2026-07-28 spec's `SubscriptionFilter`
 	/// requires (boolean list-changed flags emitted only when set;
 	/// `resourceSubscriptions` as a string array of URIs). Separated so the param
 	/// shaping can be unit-tested without a live server.
@@ -2606,15 +2606,15 @@ final class McpClient : ClientProtocol
 	/// emit to this client.
 	///
 	/// On a released protocol (<= 2025-11-25) this sends the `logging/setLevel`
-	/// RPC. The draft (2026-07-28) REMOVED that RPC (SEP-2575/2577): a conformant
-	/// draft server answers `logging/setLevel` with -32601 and emits no
+	/// RPC. The 2026-07-28 REMOVED that RPC (SEP-2575/2577): a conformant
+	/// modern server answers `logging/setLevel` with -32601 and emits no
 	/// `notifications/message` for any request that does not carry
-	/// `_meta["io.modelcontextprotocol/logLevel"]`. So on a draft-negotiated
+	/// `_meta["io.modelcontextprotocol/logLevel"]`. So on a modern-negotiated
 	/// session this does NOT send the removed RPC; instead it records `level` as
 	/// the sticky per-request opt-in that `injectModernMeta` stamps onto every
 	/// subsequent request's `_meta` (see `withRequestLogLevel` and
 	/// `RequestOptions.logLevel` for a single-request override). Passing
-	/// an empty `level` clears the draft opt-in.
+	/// an empty `level` clears the modern opt-in.
 	///
 	/// Typed entry point: pass a `LogLevel` for compile-time safety, so an invalid
 	/// level name can never reach the wire. Forwards to the string overload (whose
@@ -2624,13 +2624,13 @@ final class McpClient : ClientProtocol
 		setLogLevel(cast(string) level);
 	}
 
-	/// an empty `level` clears the draft opt-in.
+	/// an empty `level` clears the modern opt-in.
 	void setLogLevel(string level) @safe
 	{
 		// Reject an unrecognised level locally rather than POSTing it to a server
 		// that will reject it (released protocol) or silently stamping it into
-		// every draft request's `_meta` (draft). The empty string is the documented
-		// draft-opt-in clear and is left to pass through. Mirrors the server-side
+		// every modern request's `_meta` (2026-07-28). The empty string is the documented
+		// modern-opt-in clear and is left to pass through. Mirrors the server-side
 		// guard at server.d:1118.
 		if (level.length && logLevelRank(level) < 0)
 			throw new McpException(ErrorCode.invalidParams, "Invalid log level: " ~ level);
@@ -2656,7 +2656,7 @@ final class McpClient : ClientProtocol
 	///
 	/// When the server answers with a `URLElicitationRequiredError`
 	/// (`-32042`, client/elicitation Â§"URL Elicitation Required Error",
-	/// 2025-11-25 / draft), its `data.elicitations[]` carries URL-mode
+	/// 2025-11-25 / modern), its `data.elicitations[]` carries URL-mode
 	/// elicitations the server has begun out-of-band. Per SEP-1036 the client
 	/// MUST treat such an error as equivalent to an `elicitation/create` request,
 	/// so we register every announced `elicitationId` before rethrowing. This is
@@ -2688,7 +2688,7 @@ final class McpClient : ClientProtocol
 	/// (`-32042`) so a subsequent `notifications/elicitation/complete` correlates
 	/// and is forwarded. `error` is the JSON-RPC error object; the URL-mode
 	/// elicitations live under `error.data.elicitations[]`, each an
-	/// `ElicitRequestURLParams` carrying an `elicitationId` (2025-11-25 / draft
+	/// `ElicitRequestURLParams` carrying an `elicitationId` (2025-11-25 / modern
 	/// schema `URLElicitationRequiredError`). Ids already tracked are left as-is so
 	/// an in-flight completion state is not reset; malformed entries are skipped.
 	package void registerUrlElicitations(Json error) @safe
@@ -2720,7 +2720,7 @@ final class McpClient : ClientProtocol
 	/// declared), and `onListRoots` advertises `roots`. Explicit flags already set
 	/// on `capabilities` are never cleared. When `autoAdvertiseCapabilities` is
 	/// false, `capabilities` is returned verbatim. Drives both the `initialize`
-	/// handshake and the draft per-request `_meta`.
+	/// handshake and the modern per-request `_meta`.
 	ClientCapabilities effectiveCapabilities() const @safe
 	{
 		ClientCapabilities caps = capabilities;
@@ -2741,7 +2741,7 @@ final class McpClient : ClientProtocol
 		return caps;
 	}
 
-	/// Add the draft per-request `_meta` (protocol version, client identity,
+	/// Add the modern per-request `_meta` (protocol version, client identity,
 	/// capabilities) to a request's params.
 	private Json injectModernMeta(Json params) @safe
 	{
@@ -2751,10 +2751,10 @@ final class McpClient : ClientProtocol
 			.emptyObject;
 		meta[MetaKey.protocolVersion] = negotiated.toWire;
 		meta[MetaKey.clientInfo] = clientInfo.toJson();
-		// Project to the negotiated (draft) wire shape: draft has no top-level
+		// Project to the negotiated (2026-07-28) wire shape: modern has no top-level
 		// client `tasks` capability, so it is folded into the `extensions` map.
 		meta[MetaKey.clientCapabilities] = effectiveCapabilities().forVersion(negotiated).toJson();
-		// Draft per-request logging opt-in: stamp the sticky default level (set via
+		// Modern per-request logging opt-in: stamp the sticky default level (set via
 		// `setLogLevel`) unless this request already carries an explicit
 		// `MetaKey.logLevel` (a per-request override via `withRequestLogLevel` / an
 		// overload), which must win. server/utilities/logging (SEP-2575/2577).
@@ -2764,7 +2764,7 @@ final class McpClient : ClientProtocol
 		return params;
 	}
 
-	/// Test seam: run `injectModernMeta` from a unittest so the per-request draft
+	/// Test seam: run `injectModernMeta` from a unittest so the per-request modern
 	/// `_meta` (including the logging opt-in) can be asserted without a live
 	/// server. Production code never calls this.
 	version (unittest) package Json injectModernMetaForTest(Json params) @safe
@@ -2800,7 +2800,7 @@ final class McpClient : ClientProtocol
 	}
 
 	/// The server capabilities advertised at connect time. Populated by both the
-	/// stable `initialize` handshake and the stateless draft `server/discover`
+	/// stable `initialize` handshake and the modern protocol `server/discover`
 	/// path; default-constructed before either has run.
 	ServerCapabilities serverCapabilities() @safe nothrow
 	{
@@ -2808,7 +2808,7 @@ final class McpClient : ClientProtocol
 	}
 
 	/// The server's identity (`name`/`version`) advertised at connect time.
-	/// Populated by both the `initialize` handshake and draft discovery;
+	/// Populated by both the `initialize` handshake and modern discovery;
 	/// default-constructed before either has run.
 	Implementation serverInfo() @safe nothrow
 	{
@@ -2817,7 +2817,7 @@ final class McpClient : ClientProtocol
 
 	/// The optional server `instructions` advertised at connect time (null when
 	/// the server sent none, or before connecting). Populated by both the
-	/// `initialize` handshake and draft discovery.
+	/// `initialize` handshake and modern discovery.
 	Nullable!string serverInstructions() @safe nothrow
 	{
 		return serverInstructions_;
@@ -2876,7 +2876,7 @@ final class McpClient : ClientProtocol
 			cancelledRequests_[requestId] = true;
 			cancelledOrder_ ~= requestId;
 		}
-		// Over a draft Streamable HTTP transport, closing the request's SSE response
+		// Over a modern Streamable HTTP transport, closing the request's SSE response
 		// stream is itself the cancellation signal and no `notifications/cancelled`
 		// is sent (basic/transports §Sending Messages, Note); the local tracking
 		// above still drops a late response. stdio and legacy HTTP send the
@@ -2923,12 +2923,12 @@ final class McpClient : ClientProtocol
 
 	/// `ClientProtocol.headersFor`: compute the protocol-derived request headers
 	/// for an outgoing `message`, which the transport pulls through the
-	/// `ClientProtocol` seam. For a draft client this is the `MCP-Protocol-Version`
+	/// `ClientProtocol` seam. For a modern client this is the `MCP-Protocol-Version`
 	/// header plus the standard `Mcp-Method` / `Mcp-Name` headers and any
-	/// `Mcp-Param-*` mirrored tool arguments (draft basic/transports). For a stable
+	/// `Mcp-Param-*` mirrored tool arguments (2026-07-28 basic/transports). For a stable
 	/// client it is just `MCP-Protocol-Version` after initialize. Called with
 	/// `Json.undefined` (no message — e.g. the GET server stream) it returns only
-	/// the version header. Keeps the draft-header logic and the tool inputSchema
+	/// the version header. Keeps the modern-header logic and the tool inputSchema
 	/// cache in the client rather than the transport.
 	string[string] headersFor(Json message) @safe
 	{
@@ -2956,7 +2956,7 @@ final class McpClient : ClientProtocol
 				headers[HttpHeader.name] = encodeHeaderValue(name);
 
 			// Mirror x-mcp-header-annotated tool arguments into Mcp-Param-{Name}
-			// headers (draft basic/transports, "Custom Headers from Tool
+			// headers (2026-07-28 basic/transports, "Custom Headers from Tool
 			// Parameters"): clients MUST inspect the tool's inputSchema and append a
 			// header for each annotated argument that is present and non-null.
 			if (method == "tools/call" && name.length)
@@ -2986,7 +2986,7 @@ final class McpClient : ClientProtocol
 	/// bigInt / bool — `number`/float is already excluded by header validation), the
 	/// value is encoded with `encodeHeaderValue` and emitted under
 	/// `ParamHeader.header`. This preserves the spec's absent/null omission
-	/// semantics (draft basic/transports mirroring table). Array-item paths (which
+	/// semantics (2026-07-28 basic/transports mirroring table). Array-item paths (which
 	/// cross an `items` schema) are not mirrored: a single repeated header name
 	/// cannot unambiguously represent per-element values, so they are skipped — only
 	/// the well-defined object-nesting case is handled. Separated as a pure static
@@ -3163,7 +3163,7 @@ final class McpClient : ClientProtocol
 				onPromptsListChanged();
 			break;
 		case "notifications/resources/list_changed":
-			// The draft has no separate templates/list_changed; a resource-set change
+			// 2026-07-28 has no separate templates/list_changed; a resource-set change
 			// can move templates too, so drop both resource list caches.
 			invalidateLogical("resources/list", "");
 			invalidateLogical("resources/templates/list", "");
@@ -3396,7 +3396,7 @@ bool selectMutualVersion(const string[] serverVersions, out ProtocolVersion chos
 {
 	import std.range : retro;
 
-	foreach (cand; supportedVersions.retro) // newest (draft) first
+	foreach (cand; supportedVersions.retro) // newest (2026-07-28) first
 	{
 		foreach (s; serverVersions)
 		{
@@ -3490,9 +3490,9 @@ unittest  // selectMutualVersion reports no overlap
 	assert(!selectMutualVersion([], v));
 }
 
-unittest  // withRequestLogLevel stamps the draft per-request logLevel meta key
+unittest  // withRequestLogLevel stamps the modern per-request logLevel meta key
 {
-	// draft server/utilities/logging (SEP-2575/2577): the per-request opt-in is
+	// 2026-07-28 server/utilities/logging (SEP-2575/2577): the per-request opt-in is
 	// `_meta["io.modelcontextprotocol/logLevel"]`.
 	Json p = Json.emptyObject;
 	p["name"] = "tool";
@@ -3520,10 +3520,10 @@ unittest  // withRequestLogLevel preserves existing _meta entries
 	assert(stamped["_meta"][MetaKey.logLevel].get!string == "warning");
 }
 
-unittest  // draft setLogLevel does NOT send the removed logging/setLevel RPC
+unittest  // modern setLogLevel does NOT send the removed logging/setLevel RPC
 {
-	// The draft (2026-07-28) removed logging/setLevel (SEP-2575/2577); a conformant
-	// draft server answers it with -32601. So on a draft session setLogLevel must
+	// The 2026-07-28 removed logging/setLevel (SEP-2575/2577); a conformant
+	// modern server answers it with -32601. So on a modern session setLogLevel must
 	// NOT POST that RPC — it records the sticky per-request opt-in instead.
 	auto c = McpClient.http("http://localhost");
 	c.enableModern();
@@ -3537,7 +3537,7 @@ unittest  // draft setLogLevel does NOT send the removed logging/setLevel RPC
 	assert(!sentRpc);
 }
 
-unittest  // enableTasks advertises the tasks extension (draft only)
+unittest  // enableTasks advertises the tasks extension (modern only)
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableTasks();
@@ -3787,13 +3787,13 @@ unittest  // cancelTask issues a tasks/cancel for the given id
 	assert(seen == "tasks/cancel");
 }
 
-unittest  // draft setLogLevel makes injectModernMeta stamp the per-request logLevel
+unittest  // modern setLogLevel makes injectModernMeta stamp the per-request logLevel
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableModern();
 	c.setLogLevel("info");
 	auto meta = c.injectModernMetaForTest(Json.emptyObject);
-	// Every subsequent draft request carries the opt-in field the server needs
+	// Every subsequent modern request carries the opt-in field the server needs
 	// before it may emit notifications/message.
 	assert(meta["_meta"][MetaKey.logLevel].get!string == "info");
 }
@@ -3820,7 +3820,7 @@ unittest  // an explicit per-request logLevel wins over the sticky setLogLevel d
 
 unittest  // released-protocol setLogLevel still sends logging/setLevel
 {
-	// On a non-draft session the RPC still exists; setLogLevel must POST it.
+	// On a legacy session the RPC still exists; setLogLevel must POST it.
 	auto c = McpClient.http("http://localhost");
 	string sentMethod;
 	Json sentParams = Json.undefined;
@@ -3850,14 +3850,14 @@ unittest  // setLogLevel rejects an invalid level locally (released protocol)
 	assert(!sent, "an invalid level must not reach the wire");
 }
 
-unittest  // setLogLevel rejects an invalid level locally (draft) without storing it
+unittest  // setLogLevel rejects an invalid level locally (2026-07-28) without storing it
 {
 	import std.exception : assertThrown;
 
 	auto c = McpClient.http("http://localhost");
 	c.enableModern();
 	assertThrown!McpException(c.setLogLevel("verbose"));
-	// The bad level must not be stamped into subsequent draft requests' _meta.
+	// The bad level must not be stamped into subsequent modern requests' _meta.
 	auto meta = c.injectModernMetaForTest(Json.emptyObject);
 	assert(MetaKey.logLevel !in meta["_meta"], "an invalid level must not be stored");
 }
@@ -3880,7 +3880,7 @@ unittest  // a valid string level still passes
 	assert(meta["_meta"][MetaKey.logLevel].get!string == "debug");
 }
 
-unittest  // empty level clears the draft opt-in
+unittest  // empty level clears the modern opt-in
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableModern();
@@ -4061,7 +4061,7 @@ unittest  // the tool index re-derives when the underlying cache entry changes
 	assert("Mcp-Param-Zone" in headers, "re-derived index must reflect the new cache entry");
 }
 
-unittest  // listTools excludes a tool whose x-mcp-header value is empty (draft)
+unittest  // listTools excludes a tool whose x-mcp-header value is empty (2026-07-28)
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableModern();
@@ -4146,7 +4146,7 @@ unittest  // listTools excludes a tool with case-insensitively duplicate header 
 	assert(res.tools.length == 0, "duplicate header values must be excluded");
 }
 
-unittest  // a non-draft session does NOT exclude tools (x-mcp-header MAY be ignored)
+unittest  // a legacy session does NOT exclude tools (x-mcp-header MAY be ignored)
 {
 	auto c = McpClient.http("http://localhost");
 	// no enableModern() -> released session
@@ -4161,7 +4161,7 @@ unittest  // a non-draft session does NOT exclude tools (x-mcp-header MAY be ign
 		return r;
 	};
 	auto res = c.listTools();
-	assert(res.tools.length == 1, "non-draft session must not exclude on x-mcp-header");
+	assert(res.tools.length == 1, "legacy session must not exclude on x-mcp-header");
 }
 
 unittest  // paramHeaders mirrors a nested annotated object property
@@ -4214,7 +4214,7 @@ unittest  // an absent nested intermediate node emits no header
 	assert(HttpHeader.paramPrefix ~ "Region" !in headers);
 }
 
-unittest  // callTool RequestOptions.logLevel attaches the draft per-request opt-in
+unittest  // callTool RequestOptions.logLevel attaches the modern per-request opt-in
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableModern();
@@ -4234,7 +4234,7 @@ unittest  // callTool RequestOptions.logLevel attaches the draft per-request opt
 	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
 }
 
-unittest  // readResource RequestOptions.logLevel attaches the draft per-request opt-in
+unittest  // readResource RequestOptions.logLevel attaches the modern per-request opt-in
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableModern();
@@ -4250,7 +4250,7 @@ unittest  // readResource RequestOptions.logLevel attaches the draft per-request
 	assert(seen["_meta"][MetaKey.logLevel].get!string == "notice");
 }
 
-unittest  // getPrompt RequestOptions.logLevel attaches the draft per-request opt-in
+unittest  // getPrompt RequestOptions.logLevel attaches the modern per-request opt-in
 {
 	auto c = McpClient.http("http://localhost");
 	c.enableModern();
@@ -4669,11 +4669,11 @@ unittest  // cancel() without a reason omits the reason field
 	assert("reason" !in sent["params"]);
 }
 
-unittest  // a draft Streamable-HTTP client cancels by closing the stream, not via notifications/cancelled
+unittest  // a modern Streamable-HTTP client cancels by closing the stream, not via notifications/cancelled
 {
 	auto t = new HttpClientTransport("http://localhost", 8);
 	auto c = new McpClient(t);
-	t.setModernProtocol(true); // negotiated the draft (modern) protocol
+	t.setModernProtocol(true); // negotiated the modern (modern) protocol
 	bool postedCancelled;
 	c.onNotifyForTest = (Json message) @safe {
 		if (message["method"].get!string == "notifications/cancelled")
@@ -4682,7 +4682,7 @@ unittest  // a draft Streamable-HTTP client cancels by closing the stream, not v
 
 	c.cancel(7, "user aborted");
 
-	assert(!postedCancelled, "draft HTTP must not POST notifications/cancelled");
+	assert(!postedCancelled, "modern HTTP must not POST notifications/cancelled");
 	// The id is still tracked locally so a late response for it is dropped.
 	assert(c.isCancelled(7));
 }
@@ -4992,7 +4992,7 @@ unittest  // elicitation/complete for an unknown id is ignored
 	assert(!forwarded);
 }
 
-unittest  // -32042 URLElicitationRequiredError registers its elicitationIds (client/elicitation, 2025-11-25/draft)
+unittest  // -32042 URLElicitationRequiredError registers its elicitationIds (client/elicitation, 2025-11-25/modern)
 {
 	auto c = McpClient.http("http://localhost");
 
@@ -6838,7 +6838,7 @@ unittest  // McpClient installs its ClientProtocol collaborator on an arbitrary 
 	auto c = new McpClient(transport);
 	assert(c !is null);
 	assert(transport.protocol !is null);
-	// Default (non-draft, pre-initialize) headers are empty for an arbitrary
+	// Default (legacy, pre-initialize) headers are empty for an arbitrary
 	// outgoing message — the same logic the HTTP transport reads.
 	assert(transport.protocol.headersFor(Json.undefined).length == 0);
 }
@@ -6852,7 +6852,7 @@ unittest  // a custom transport reads cancellation state through ClientProtocol
 	assert(transport.protocol.isCancelled(7));
 }
 
-unittest  // a draft client's ClientProtocol yields the MCP-Protocol-Version header
+unittest  // a modern client's ClientProtocol yields the MCP-Protocol-Version header
 {
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
@@ -6938,19 +6938,19 @@ unittest  // connect() routes a legacy HTTP+SSE fallback through the transport s
 	assert(transport.legacyFallbackCalled);
 }
 
-unittest  // connect() auto-detect probes server/discover with draft framing and selects draft
+unittest  // connect() auto-detect probes server/discover with modern framing and selects modern
 {
-	// A stateless/draft server only serves `server/discover` when the probe is
-	// itself draft-framed; an undecorated probe would resolve to the server's
-	// stable default and be rejected. The probe must carry the draft
-	// `_meta.protocolVersion` and the draft `MCP-Protocol-Version` header, and
-	// connect() must end up on draft.
+	// A stateless/modern server only serves `server/discover` when the probe is
+	// itself modern-framed; an undecorated probe would resolve to the server's
+	// stable default and be rejected. The probe must carry 2026-07-28
+	// `_meta.protocolVersion` and the modern `MCP-Protocol-Version` header, and
+	// connect() must end up on the modern protocol.
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
 	bool sawModernFramedDiscover;
 	transport.responder = (Json message, long expectId) @safe {
 		assert(message["method"].get!string == "server/discover");
-		// The probe self-advertises draft in the body...
+		// The probe self-advertises modern in the body...
 		assert(message["params"]["_meta"][MetaKey.protocolVersion].get!string
 				== ProtocolVersion.v2026_07_28.toWire);
 		// ...and in the protocol-derived headers the transport would send.
@@ -6962,7 +6962,7 @@ unittest  // connect() auto-detect probes server/discover with draft framing and
 		r["protocolVersions"] ~= Json(ProtocolVersion.v2026_07_28.toWire);
 		r["capabilities"] = Json.emptyObject;
 		Json info = Json.emptyObject;
-		info["name"] = "draft-srv";
+		info["name"] = "modern-srv";
 		info["version"] = "1.0";
 		Json meta = Json.emptyObject;
 		meta[MetaKey.serverInfo] = info;
@@ -6974,11 +6974,11 @@ unittest  // connect() auto-detect probes server/discover with draft framing and
 	assert(chosen == ProtocolVersion.v2026_07_28);
 }
 
-unittest  // connect() still falls back to initialize when even a draft-framed probe is methodNotFound
+unittest  // connect() still falls back to initialize when even a modern-framed probe is methodNotFound
 {
 	// A genuine legacy server rejects `server/discover` with -32601 regardless of
-	// draft framing; connect() must then run the legacy initialize handshake and
-	// must not be left in draft mode by the probe.
+	// modern framing; connect() must then run the legacy initialize handshake and
+	// must not be left in the modern protocol mode by the probe.
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
 	transport.responder = (Json message, long expectId) @safe {
@@ -7013,7 +7013,7 @@ unittest  // connect() populates serverCapabilities/serverInfo/serverInstruction
 		callCount++;
 		if (method == "server/discover" && callCount == 1)
 		{
-			// First probe: server rejects our draft version and advertises modern.
+			// First probe: server rejects our modern version and advertises modern.
 			Json errData = Json.emptyObject;
 			errData["supported"] = Json.emptyArray;
 			errData["supported"] ~= Json(ProtocolVersion.v2026_07_28.toWire);
@@ -7059,7 +7059,7 @@ version (unittest)
 	}
 }
 
-unittest  // connect(DiscoverResult) adopts a draft session with zero round trips
+unittest  // connect(DiscoverResult) adopts a modern session with zero round trips
 {
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
@@ -7073,7 +7073,7 @@ unittest  // connect(DiscoverResult) adopts a draft session with zero round trip
 	assert(chosen == ProtocolVersion.v2026_07_28);
 	assert(c.protocolVersion() == ProtocolVersion.v2026_07_28);
 	// No server/discover (or any) round-trip was made: the prior result was adopted.
-	assert(calls == 0, "draft adoption must not hit the network");
+	assert(calls == 0, "modern adoption must not hit the network");
 	// The prior discovery's identity/instructions were adopted directly.
 	assert(c.serverInfo().name == "cached-srv");
 	assert(c.serverInfo().version_ == "3.1");

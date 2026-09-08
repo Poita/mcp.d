@@ -1,6 +1,6 @@
 # Caching (`CacheableResult`) example — dual transport
 
-A focused, self-contained example showing the draft MCP **`CacheableResult`**
+A focused, self-contained example showing the modern MCP **`CacheableResult`**
 freshness hints (`ttlMs` / `cacheScope`) from *both* sides — a server that
 attaches them (in ergonomic **UDA style**) and a client that reads them — over
 **both** the **stdio** and **Streamable HTTP** transports from a single binary
@@ -13,8 +13,8 @@ does **not** modify the root `dub.json`.
 
 Cache hints let a server tell clients and intermediaries how long a result may
 be reused and by whom (`public` shared cache vs `private` per-client cache).
-They are **draft-only** (protocol `2026-07-28`): the server only emits the
-fields when the negotiated protocol is the stateless draft, and the client must
+They are **modern-only** (protocol `2026-07-28`): the server only emits the
+fields when the negotiated protocol is the modern protocol, and the client must
 opt in with `client.enableModern()`.
 
 - **Per-resource hint** — `server.d` declares it with the `@cache(ttl, scope)`
@@ -30,7 +30,7 @@ opt in with `client.enableModern()`.
   `server.setListCacheHint("resources/list", CacheHint(5.seconds, CacheScope.public_))`.
   It rides on the `resources/list` result. (Valid list methods: `tools/list`,
   `resources/list`, `resources/templates/list`, `prompts/list`.)
-- **Consumer's-eye view** — `client.d` enables draft mode
+- **Consumer's-eye view** — `client.d` enables modern mode
   (`client.enableModern()`), then reads `list.cache.ttl` / `cacheScope` and
   `readResource(uri).cache.ttl` / `cacheScope` (each `.ttl` a `Duration`).
 

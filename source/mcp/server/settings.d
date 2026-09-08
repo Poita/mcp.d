@@ -54,7 +54,7 @@ struct ServerSettings
 
 	/// Advertise the `logging` capability and accept `logging/setLevel` (calls
 	/// `enableLogging`). Off by default. Valid in either statefulness mode (the
-	/// draft per-request `_meta` logging path uses it on a stateless server).
+	/// modern per-request `_meta` logging path uses it on a stateless server).
 	bool logging;
 
 	/// Advertise the resources `subscribe` capability (calls

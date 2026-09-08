@@ -15,7 +15,7 @@ import mcp.protocol.modern : CacheHint, parseCacheHint, withCache;
 /// The kind of a content block.
 ///
 /// `toolUse`/`toolResult` are the sampling content blocks added by the
-/// 2025-11-25 / draft tool-enabled sampling revisions (`ToolUseContent` /
+/// 2025-11-25 / modern tool-enabled sampling revisions (`ToolUseContent` /
 /// `ToolResultContent` in the schema); they appear inside
 /// `sampling/createMessage` messages and results, not in tool/prompt content.
 enum ContentKind
@@ -559,7 +559,7 @@ struct Content
 	/// A `tool_use` content block (sampling): the model's request to call a
 	/// tool. `id` is the model-assigned call id, `name` the tool name, and
 	/// `input` the arguments object. Per `ToolUseContent` in the 2025-11-25 /
-	/// draft schema.
+	/// 2026-07-28 schema.
 	static Content makeToolUse(string id, string name, Json input = Json.emptyObject) @safe
 	{
 		return Content(ToolUseContent(id, name, input));
@@ -567,7 +567,7 @@ struct Content
 
 	/// A `tool_result` content block (sampling): the result of a tool call,
 	/// answering the `tool_use` whose id is `toolUseId`. `content` is the nested
-	/// result content blocks. Per `ToolResultContent` in the 2025-11-25 / draft
+	/// result content blocks. Per `ToolResultContent` in the 2025-11-25 / modern
 	/// schema.
 	static Content makeToolResult(string toolUseId, Content[] content = null) @safe
 	{
@@ -975,7 +975,7 @@ struct Tool
 			projected.meta = meta;
 		}
 		// `Tool.icons` was introduced by 2025-11-25; absent from every earlier
-		// version (and present in draft, which is >= 2025-11-25).
+		// version (and present in the modern protocol, which is >= 2025-11-25).
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
 			foreach (icon; icons)
@@ -1055,7 +1055,7 @@ struct CallToolResult
 	bool isError;
 	Json structuredContent = Json.undefined;
 	mixin MetaField;
-	/// Multi Round-Trip Requests (MRTR / SEP-2322): when the draft server needs
+	/// Multi Round-Trip Requests (MRTR / SEP-2322): when the modern server needs
 	/// more input to complete the call, it answers `tools/call` with an
 	/// `InputRequiredResult` instead of a `CallToolResult` — a set of
 	/// `InputRequest`s the client must satisfy (via its sampling / elicitation /
@@ -1176,14 +1176,14 @@ struct CallToolResult
 			projected.content ~= c.forVersion(v);
 		projected.isError = isError;
 		projected.meta = meta;
-		// `inputRequests`/`requestState` form the draft-only MRTR
-		// `InputRequiredResult` shape; a non-draft `CallToolResult` schema has no
-		// such fields, so drop them when projecting below the draft.
+		// `inputRequests`/`requestState` form the modern-only MRTR
+		// `InputRequiredResult` shape; a legacy `CallToolResult` schema has no
+		// such fields, so drop them when projecting below 2026-07-28.
 		if (v >= ProtocolVersion.v2026_07_28)
 		{
 			projected.inputRequests = inputRequests.dup;
 			projected.requestState = requestState;
-			// The SEP-2663 task handle is likewise a draft-only result shape.
+			// The SEP-2663 task handle is likewise a modern-only result shape.
 			projected.task = task;
 		}
 		// `structuredContent` is a 2025-06-18+ field: absent from 2025-03-26 and
@@ -1378,9 +1378,9 @@ struct ListToolsResult
 {
 	Tool[] tools;
 	Nullable!string nextCursor;
-	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
+	/// Modern `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
 	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
-	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
+	/// server sets this (modern-gated) so legacy wire output is unchanged.
 	Nullable!CacheHint cache;
 	/// Optional result-level `_meta` object. Reserved by MCP on every `Result`
 	/// (the base interface all paginated list results extend), so it round-trips
@@ -2267,7 +2267,7 @@ unittest  // Resource.forVersion keeps icons for 2025-11-25 (introduced here)
 	assert("icons" in j && j["icons"].length == 1);
 }
 
-unittest  // Resource.forVersion keeps icons for draft (>= 2025-11-25)
+unittest  // Resource.forVersion keeps icons for modern (>= 2025-11-25)
 {
 	Resource r = {uri: "test://x", name: "x"};
 	r.icons ~= Icon("https://example.com/i.png");
@@ -2381,7 +2381,7 @@ unittest  // ResourceTemplate.forVersion keeps icons for 2025-11-25 (introduced 
 	assert("icons" in j && j["icons"].length == 1);
 }
 
-unittest  // ResourceTemplate.forVersion keeps icons for draft (>= 2025-11-25)
+unittest  // ResourceTemplate.forVersion keeps icons for modern (>= 2025-11-25)
 {
 	ResourceTemplate t = {uriTemplate: "test://{id}", name: "x"};
 	t.icons ~= Icon("https://example.com/i.png");
@@ -2503,7 +2503,7 @@ unittest  // CallToolResult.forVersion drops structuredContent on 2024-11-05 (in
 	assert(j["content"].length == 1);
 }
 
-unittest  // CallToolResult.forVersion drops draft-only MRTR fields below the draft
+unittest  // CallToolResult.forVersion drops modern-only MRTR fields below 2026-07-28
 {
 	CallToolResult r;
 	r.content = [Content.makeText("ok")];
@@ -2511,11 +2511,11 @@ unittest  // CallToolResult.forVersion drops draft-only MRTR fields below the dr
 	r.requestState = "blob";
 	auto projected = r.forVersion(ProtocolVersion.v2025_11_25);
 	assert(projected.inputRequests.length == 0,
-			"inputRequests is a draft-only MRTR field and must not project below the draft");
+			"inputRequests is a modern-only MRTR field and must not project below the modern");
 	assert(projected.requestState.length == 0);
 }
 
-unittest  // CallToolResult.forVersion keeps MRTR fields on the draft
+unittest  // CallToolResult.forVersion keeps MRTR fields on 2026-07-28
 {
 	CallToolResult r;
 	r.inputRequests = [InputRequest("req1", "elicitation", Json.emptyObject)];
@@ -2558,7 +2558,7 @@ unittest  // CallToolResult.forVersion keeps structuredContent on 2025-11-25
 	assert("structuredContent" in j);
 }
 
-unittest  // CallToolResult.forVersion keeps structuredContent on draft
+unittest  // CallToolResult.forVersion keeps structuredContent on the modern protocol
 {
 	CallToolResult r;
 	Json sc = Json.emptyObject;
@@ -2598,7 +2598,7 @@ unittest  // CallToolResult.forVersion leaves the original unmodified (returns a
 
 unittest  // CallToolResult.fromJson detects an MRTR InputRequiredResult
 {
-	// SEP-2322: a real draft server emits `inputRequests` as a map keyed by the
+	// SEP-2322: a real modern server emits `inputRequests` as a map keyed by the
 	// server-assigned id, with `{ method, params }` request-object values.
 	Json reqObj = Json.emptyObject;
 	reqObj["method"] = "elicitation/create";
@@ -2801,7 +2801,7 @@ struct Resource
 	/// are version-gated: `BaseMetadata.title` and `Resource.size` were introduced
 	/// by 2025-06-18 / 2025-03-26 respectively (both absent from 2024-11-05), and
 	/// `Resource.icons` by 2025-11-25 (absent from every earlier version, present
-	/// in draft which is >= 2025-11-25). Annotation sub-fields are themselves
+	/// in the modern protocol which is >= 2025-11-25). Annotation sub-fields are themselves
 	/// version-gated: `audience`/`priority` existed in 2024-11-05 but
 	/// `Annotations.lastModified` was introduced in 2025-06-18, so annotations are
 	/// projected via `Annotations.forVersion`. Mirrors `Tool.forVersion` /
@@ -2889,7 +2889,7 @@ struct ResourceTemplate
 	/// Return a copy of this `ResourceTemplate` with any fields newer than the
 	/// negotiated protocol version stripped. `BaseMetadata.title` was
 	/// introduced by 2025-06-18; `ResourceTemplate.icons` was introduced by
-	/// 2025-11-25 (present in draft which is >= 2025-11-25).
+	/// 2025-11-25 (present in the modern protocol which is >= 2025-11-25).
 	/// `uriTemplate`/`name`/`description`/`mimeType`/`annotations`/`_meta` all
 	/// existed in 2024-11-05 and are preserved unchanged. Mirrors
 	/// `Tool.forVersion` / `Prompt.forVersion`.
@@ -3111,9 +3111,9 @@ struct ListResourcesResult
 {
 	Resource[] resources;
 	Nullable!string nextCursor;
-	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
+	/// Modern `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
 	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
-	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
+	/// server sets this (modern-gated) so legacy wire output is unchanged.
 	Nullable!CacheHint cache;
 	/// Optional result-level `_meta` object. Reserved by MCP on every `Result`
 	/// (the base interface all paginated list results extend), so it round-trips
@@ -3243,9 +3243,9 @@ struct ListResourceTemplatesResult
 {
 	ResourceTemplate[] resourceTemplates;
 	Nullable!string nextCursor;
-	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
+	/// Modern `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
 	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
-	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
+	/// server sets this (modern-gated) so legacy wire output is unchanged.
 	Nullable!CacheHint cache;
 	/// Optional result-level `_meta` object. Reserved by MCP on every `Result`
 	/// (the base interface all paginated list results extend), so it round-trips
@@ -3288,7 +3288,7 @@ struct ListResourceTemplatesResult
 ///
 /// `uri` MUST be a `file://` URI identifying the root directory; `name` is an
 /// optional human-readable label. `_meta` carries optional implementation
-/// metadata per the draft schema.
+/// metadata per the 2026-07-28 schema.
 struct Root
 {
 	string uri; /// MUST be a `file://` URI
@@ -4199,7 +4199,7 @@ unittest  // PromptArgument.forVersion keeps title for 2025-06-18 (title introdu
 	assert(j["title"].get!string == "Arg");
 }
 
-unittest  // PromptArgument.forVersion keeps title for draft
+unittest  // PromptArgument.forVersion keeps title for modern
 {
 	PromptArgument a = {name: "arg"};
 	a.title = "Arg";
@@ -4275,7 +4275,7 @@ struct Prompt
 	/// protocol version stripped, so the wire output stays valid for the peer's
 	/// version. `BaseMetadata.title` was introduced by 2025-06-18 (absent from
 	/// 2025-03-26 and 2024-11-05); `Prompt.icons` was introduced by 2025-11-25
-	/// (absent from every earlier version, present in draft which is
+	/// (absent from every earlier version, present in the modern protocol which is
 	/// >= 2025-11-25). Mirrors `Tool.forVersion`.
 	Prompt forVersion(ProtocolVersion v) const @safe
 	{
@@ -4328,7 +4328,7 @@ unittest  // Prompt.forVersion keeps title for 2025-11-25
 	assert(j["title"].get!string == "Greeting");
 }
 
-unittest  // Prompt.forVersion keeps title for draft
+unittest  // Prompt.forVersion keeps title for modern
 {
 	Prompt p = {name: "greet"};
 	p.title = "Greeting";
@@ -4361,7 +4361,7 @@ unittest  // Prompt.forVersion keeps icons for 2025-11-25 (Prompt.icons introduc
 	assert(j["icons"][0]["src"].get!string == "https://e/p.png");
 }
 
-unittest  // Prompt.forVersion keeps icons for draft (draft >= 2025-11-25)
+unittest  // Prompt.forVersion keeps icons for modern (modern >= 2025-11-25)
 {
 	Prompt p = {name: "greet"};
 	p.icons = [Icon("https://e/p.png", nullable("image/png"), ["16x16"])];
@@ -4460,9 +4460,9 @@ struct ListPromptsResult
 {
 	Prompt[] prompts;
 	Nullable!string nextCursor;
-	/// Draft `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
+	/// Modern `CacheableResult` freshness hint (`ttlMs`/`cacheScope`). Round-trips
 	/// symmetrically: `toJson` emits it when set and `fromJson` parses it. The
-	/// server sets this (draft-gated) so pre-draft wire output is unchanged.
+	/// server sets this (modern-gated) so legacy wire output is unchanged.
 	Nullable!CacheHint cache;
 	/// Optional result-level `_meta` object. Reserved by MCP on every `Result`
 	/// (the base interface all paginated list results extend), so it round-trips

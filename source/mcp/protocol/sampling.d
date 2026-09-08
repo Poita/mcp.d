@@ -191,7 +191,7 @@ struct ModelPreferences
 /// Controls the tool-use ability of the model during tool-enabled sampling.
 /// `mode` is one of "auto" (model decides, the default), "required" (model MUST
 /// use at least one tool before completing), or "none" (model MUST NOT use any
-/// tools). Added by the 2025-11-25 / draft revisions; see client/sampling
+/// tools). Added by the 2025-11-25 / modern revisions; see client/sampling
 /// Tool Choice Modes.
 struct ToolChoice
 {
@@ -233,7 +233,7 @@ struct CreateMessageRequest
 	Nullable!long maxTokens;
 	string[] stopSequences;
 	Json metadata = Json.undefined; /// opaque provider-specific metadata
-	Tool[] tools; /// tools the model may call during sampling (2025-11-25 / draft)
+	Tool[] tools; /// tools the model may call during sampling (2025-11-25 / modern)
 	ToolChoice toolChoice; /// optional tool-choice mode; omitted when unset
 
 	Json toJson() const @safe

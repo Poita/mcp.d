@@ -35,9 +35,9 @@ private __gshared bool _ranStdio;
 ///     is handled inline; an inbound `notifications/cancelled` flips the matching
 ///     in-flight request's `CancellationToken` concurrently with its running
 ///     handler task, which then observes `ctx.isCancelled()` and has its response
-///     suppressed (basic/utilities/cancellation, draft Transport-Specific
+///     suppressed (basic/utilities/cancellation, modern Transport-Specific
 ///     Cancellation over stdio);
-///   - a draft `subscriptions/listen` request is served on the single channel
+///   - a modern `subscriptions/listen` request is served on the single channel
 ///     (its acknowledgement and subsequent change notifications go through
 ///     `channel.send`).
 ///
@@ -85,7 +85,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 		final switch (m.kind)
 		{
 		case MessageKind.request:
-			// Draft `subscriptions/listen` shares the single stdout channel: the
+			// Modern `subscriptions/listen` shares the single stdout channel: the
 			// server records the opted-in filters and writes a leading
 			// `notifications/subscriptions/acknowledged` (the spec's first message,
 			// stamped with the listen id as the subscriptionId) instead of a
@@ -94,7 +94,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			// normal concurrent request/reply path.
 			if (server.tryServeStdioListen(m, &sink))
 				return;
-			// Draft `events/stream` (push) shares the single stdout channel like
+			// Modern `events/stream` (push) shares the single stdout channel like
 			// listen: the server opens the subscription, writes the leading
 			// `notifications/events/active`, and routes subsequent
 			// `notifications/events/*` to the same sink (demuxed by the request id
@@ -163,7 +163,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 
 	channel = new DuplexChannel(readLine, writeLine, &onInbound, &onInboundBatch);
 
-	// Background ticker for draft `events/stream` push: poll-driven event types and
+	// Background ticker for modern `events/stream` push: poll-driven event types and
 	// per-stream heartbeats are advanced here (emit-only types deliver live via the
 	// sink). Runs only while events are enabled; stops when the read loop ends.
 	bool tickerRunning = server.hasStdioEventStreams();
@@ -1563,8 +1563,8 @@ version (unittest)
 {
 	import mcp.protocol.mrtr : MetaKey;
 
-	// A draft `subscriptions/listen` request line carrying per-request _meta
-	// (protocolVersion draft) and a nested `notifications` ListenFilter.
+	// A modern `subscriptions/listen` request line carrying per-request _meta
+	// (protocolVersion modern) and a nested `notifications` ListenFilter.
 	private string modernListenLine(long id, Json filter) @safe
 	{
 		import mcp.protocol.jsonrpc : makeRequest;
@@ -1579,7 +1579,7 @@ version (unittest)
 	}
 }
 
-unittest  // draft subscriptions/listen over stdio sends the acknowledged notification, not a {acknowledged:true} result
+unittest  // modern subscriptions/listen over stdio sends the acknowledged notification, not a {acknowledged:true} result
 {
 	auto s = new McpServer("listen-srv", "1.0");
 	s.enableToolsListChanged();
@@ -1688,12 +1688,12 @@ unittest  // a stdio subscriptions/listen returns a SubscriptionsListenResult on
 	assert(res["result"]["_meta"][MetaKey.subscriptionId].get!long == 5);
 }
 
-unittest  // a pre-draft (no protocolVersion) subscriptions/listen is method-not-found on the normal request/reply path over stdio
+unittest  // a legacy (no protocolVersion) subscriptions/listen is method-not-found on the normal request/reply path over stdio
 {
-	// `subscriptions/listen` is a draft-only RPC. The genuine draft stdio listen
+	// `subscriptions/listen` is a modern-only RPC. The genuine modern stdio listen
 	// stream is served before route() by tryServeStdioListen; a request carrying no
-	// (or a non-draft) protocol version is not a draft listen, so it falls through
-	// to the normal request/reply path where the non-draft negotiated session
+	// (or a legacy) protocol version is not a modern listen, so it falls through
+	// to the normal request/reply path where the legacy negotiated session
 	// reports the method as -32601 rather than answering {acknowledged:true}.
 	auto s = new McpServer("listen-srv", "1.0");
 	s.enableToolsListChanged();

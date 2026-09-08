@@ -15,8 +15,8 @@ import vibe.data.json : Json;
 
 @safe:
 
-/// The per-stream opt-in a client expressed when it opened a draft
-/// `subscriptions/listen` stream (draft basic/utilities/subscriptions §Notification
+/// The per-stream opt-in a client expressed when it opened a modern
+/// `subscriptions/listen` stream (2026-07-28 basic/utilities/subscriptions §Notification
 /// Filter). It records exactly which change-notification types this one stream asked
 /// for, so the server can honour the MUST NOT: "The server MUST NOT send notification
 /// types the client has not explicitly requested." With Multiple Concurrent
@@ -24,7 +24,7 @@ import vibe.data.json : Json;
 /// request id), so a notification is delivered only to streams that opted into it —
 /// never to a concurrent stream that requested a different type.
 ///
-/// `active` distinguishes a real listen-stream filter (an opted-in draft stream) from
+/// `active` distinguishes a real listen-stream filter (an opted-in modern stream) from
 /// the zero value used for plain GET streams that did not go through `subscriptions/
 /// listen`; an inactive filter accepts everything, so the plain GET stream still obeys
 /// only the transport's Multiple Connections rule.
@@ -42,7 +42,7 @@ struct ListenFilter
 	/// explicitly requested. An inactive filter (a plain GET stream) accepts every
 	/// notification; an active filter accepts only its opted-in types. Notification
 	/// methods that are not subscription-gated (progress, logging, elicitation
-	/// completion, server->client requests, etc.) are always accepted — the draft
+	/// completion, server->client requests, etc.) are always accepted — 2026-07-28
 	/// filter governs only the four list/subscription change types.
 	bool accepts(string method, string uri = "") const @safe
 	{
