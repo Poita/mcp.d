@@ -1386,14 +1386,14 @@ unittest  // isReservedMetaPrefix(2025-11-25/draft): keeps the narrower second-l
 	// First-position token is NOT reserved under 2025-11-25/draft (only the
 	// second label counts), so the draft/2025-11-25 wire behaviour is unchanged.
 	assert(!isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
-	assert(!isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.modern));
+	assert(!isReservedMetaPrefix("modelcontextprotocol.io/key", ProtocolVersion.v2026_07_28));
 	// `com.example.mcp/` has `mcp` as its THIRD label, so it is NOT reserved under
 	// the second-label rule (the 2025-11-25 spec's own counter-example).
 	assert(!isReservedMetaPrefix("com.example.mcp/key", ProtocolVersion.v2025_11_25));
-	assert(!isReservedMetaPrefix("com.example.mcp/key", ProtocolVersion.modern));
+	assert(!isReservedMetaPrefix("com.example.mcp/key", ProtocolVersion.v2026_07_28));
 	// Second-label token IS reserved under both.
 	assert(isReservedMetaPrefix("io.modelcontextprotocol/key", ProtocolVersion.v2025_11_25));
-	assert(isReservedMetaPrefix("com.mcp/key", ProtocolVersion.modern));
+	assert(isReservedMetaPrefix("com.mcp/key", ProtocolVersion.v2026_07_28));
 	// The clean divergence: `modelcontextprotocol.io/` is reserved under 2025-06-18
 	// (first-position token + trailing label) but NOT under 2025-11-25 (second
 	// label is `io`).
@@ -1403,7 +1403,7 @@ unittest  // isReservedMetaPrefix(2025-11-25/draft): keeps the narrower second-l
 	assert(isReservedMetaPrefix("io.modelcontextprotocol/key",
 			ProtocolVersion.v2025_11_25) == isReservedMetaPrefix("io.modelcontextprotocol/key"));
 	assert(isReservedMetaPrefix("modelcontextprotocol.io/key",
-			ProtocolVersion.modern) == isReservedMetaPrefix("modelcontextprotocol.io/key"));
+			ProtocolVersion.v2026_07_28) == isReservedMetaPrefix("modelcontextprotocol.io/key"));
 }
 
 unittest  // isUserMetaKeyAllowed(2025-06-18) rejects first-position mcp-token prefixes
@@ -1417,7 +1417,7 @@ unittest  // isUserMetaKeyAllowed(2025-06-18) rejects first-position mcp-token p
 	// But allowed under 2025-11-25/draft, where those prefixes are not reserved
 	// (their second label is `io` / `dev`, not an mcp-token).
 	assert(isUserMetaKeyAllowed("modelcontextprotocol.io/key", ProtocolVersion.v2025_11_25));
-	assert(isUserMetaKeyAllowed("mcp.dev/key", ProtocolVersion.modern));
+	assert(isUserMetaKeyAllowed("mcp.dev/key", ProtocolVersion.v2026_07_28));
 	// A genuine vendor key is allowed on every version.
 	assert(isUserMetaKeyAllowed("com.example/myKey", ProtocolVersion.v2025_06_18));
 	assert(isUserMetaKeyAllowed("com.example/myKey", ProtocolVersion.v2025_11_25));

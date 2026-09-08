@@ -785,7 +785,7 @@ unittest  // stable revisions open the GET SSE stream; the draft does not
 	assert(getOpensSseStream(ProtocolVersion.v2025_11_25));
 	assert(getOpensSseStream(ProtocolVersion.v2025_06_18));
 	assert(getOpensSseStream(ProtocolVersion.v2025_03_26));
-	assert(!getOpensSseStream(ProtocolVersion.modern));
+	assert(!getOpensSseStream(ProtocolVersion.v2026_07_28));
 }
 
 /// Decide how to answer an HTTP DELETE to the MCP endpoint
@@ -809,7 +809,7 @@ unittest  // stable revisions terminate sessions on DELETE; the draft answers 40
 	assert(deleteTerminatesSession(ProtocolVersion.v2025_11_25));
 	assert(deleteTerminatesSession(ProtocolVersion.v2025_06_18));
 	assert(deleteTerminatesSession(ProtocolVersion.v2025_03_26));
-	assert(!deleteTerminatesSession(ProtocolVersion.modern));
+	assert(!deleteTerminatesSession(ProtocolVersion.v2026_07_28));
 }
 
 /// Decide whether protocol-level sessions apply to a POST request
@@ -836,7 +836,7 @@ unittest  // stable revisions mint/require Mcp-Session-Id on POST; the draft doe
 	assert(sessionsApply(ProtocolVersion.v2025_11_25));
 	assert(sessionsApply(ProtocolVersion.v2025_06_18));
 	assert(sessionsApply(ProtocolVersion.v2025_03_26));
-	assert(!sessionsApply(ProtocolVersion.modern));
+	assert(!sessionsApply(ProtocolVersion.v2026_07_28));
 }
 
 /// The value of the `Allow` header a 405 Method Not Allowed response must carry
@@ -867,7 +867,7 @@ unittest  // 405 Allow header enumerates every supported method (RFC 9110 §10.2
 	assert(allowedMethodsHeader(ProtocolVersion.v2025_03_26) == "GET, POST");
 	// The draft drops the standalone GET stream and protocol-level DELETE, so POST
 	// is the only supported method and the 405 advertises only POST.
-	assert(allowedMethodsHeader(ProtocolVersion.modern) == "POST");
+	assert(allowedMethodsHeader(ProtocolVersion.v2026_07_28) == "POST");
 }
 
 unittest  // a stateless server (no GET stream) advertises only POST, matching its own GET 405
@@ -877,7 +877,7 @@ unittest  // a stateless server (no GET stream) advertises only POST, matching i
 	assert(allowedMethodsHeader(ProtocolVersion.v2025_11_25, false) == "POST");
 	assert(allowedMethodsHeader(ProtocolVersion.v2025_06_18, false) == "POST");
 	assert(allowedMethodsHeader(ProtocolVersion.v2025_03_26, false) == "POST");
-	assert(allowedMethodsHeader(ProtocolVersion.modern, false) == "POST");
+	assert(allowedMethodsHeader(ProtocolVersion.v2026_07_28, false) == "POST");
 }
 
 /// Whether the given `Accept` request-header value admits a `text/event-stream`
@@ -2842,10 +2842,10 @@ unittest  // a supported stable MCP-Protocol-Version header passes
 	assert(validateProtocolVersionHeader("2024-11-05") is null);
 }
 
-unittest  // the draft MCP-Protocol-Version header passes
+unittest  // the 2026-07-28 MCP-Protocol-Version header passes; "draft" is not a version
 {
 	assert(validateProtocolVersionHeader("2026-07-28") is null);
-	assert(validateProtocolVersionHeader("draft") is null);
+	assert(validateProtocolVersionHeader("draft") !is null);
 }
 
 unittest  // an unsupported/invalid MCP-Protocol-Version header is rejected with -32022 (HTTP 400)
@@ -3097,7 +3097,7 @@ unittest  // batches are accepted only on 2025-03-26, rejected on every newer ve
 	assert(streamableBatchAllowed(ProtocolVersion.v2025_03_26));
 	assert(!streamableBatchAllowed(ProtocolVersion.v2025_06_18));
 	assert(!streamableBatchAllowed(ProtocolVersion.v2025_11_25));
-	assert(!streamableBatchAllowed(ProtocolVersion.modern));
+	assert(!streamableBatchAllowed(ProtocolVersion.v2026_07_28));
 }
 
 unittest  // a 2024-11-05 fallback (no batching in HTTP+SSE era) also rejects arrays

@@ -98,7 +98,7 @@ int main(string[] args) @safe
 			"discover capabilities.extensions should contain the tasks extension key");
 
 		auto negotiated = client.connect();
-		checkEq(negotiated, ProtocolVersion.modern, "connect() should negotiate draft");
+		checkEq(negotiated, ProtocolVersion.v2026_07_28, "connect() should negotiate draft");
 
 		// --- 2. word_count (plain async task) -------------------------------
 		{

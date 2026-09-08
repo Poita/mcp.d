@@ -33,9 +33,9 @@ ProtocolVersion extensionMinVersion(string identifier) pure nothrow @safe @nogc
 		return ProtocolVersion.v2025_11_25;
 	case tasksExtensionKey: // Tasks (SEP-2663) — draft only
 	case eventsExtensionKey: // Events — draft only
-		return ProtocolVersion.modern;
+		return ProtocolVersion.v2026_07_28;
 	default:
-		return ProtocolVersion.modern;
+		return ProtocolVersion.v2026_07_28;
 	}
 }
 
@@ -735,7 +735,7 @@ unittest  // forVersion keeps every field for 2025-11-25 and draft
 			Icon("https://example.com/i.png")
 		]
 	};
-	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.modern])
+	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.v2026_07_28])
 	{
 		auto j = impl.forVersion(v).toJson();
 		assert(j["title"].get!string == "My Server");
@@ -778,7 +778,7 @@ unittest  // Implementation.forVersion carries icon theme for 2025-11-25 and dra
 			Icon("https://example.com/i.png", Nullable!string.init, [], nullable("dark"))
 		]
 	};
-	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.modern])
+	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.v2026_07_28])
 	{
 		auto projected = impl.forVersion(v);
 		assert(projected.icons.length == 1);
@@ -801,7 +801,7 @@ unittest  // ServerCapabilities.forVersion keeps completions from 2025-03-26
 	caps.completions = true;
 	foreach (v; [
 		ProtocolVersion.v2025_03_26, ProtocolVersion.v2025_06_18,
-		ProtocolVersion.v2025_11_25, ProtocolVersion.modern
+		ProtocolVersion.v2025_11_25, ProtocolVersion.v2026_07_28
 	])
 		assert("completions" in caps.forVersion(v).toJson());
 }
@@ -825,7 +825,7 @@ unittest  // ServerCapabilities.forVersion keeps extensions for draft
 	Json ext = Json.emptyObject;
 	ext["io.modelcontextprotocol/tasks"] = Json.emptyObject;
 	caps.extensions = ext;
-	assert("extensions" in caps.forVersion(ProtocolVersion.modern).toJson());
+	assert("extensions" in caps.forVersion(ProtocolVersion.v2026_07_28).toJson());
 }
 
 unittest  // ServerCapabilities.forVersion: Apps/Skills ride extensions from 2025-11-25
@@ -835,7 +835,7 @@ unittest  // ServerCapabilities.forVersion: Apps/Skills ride extensions from 202
 	ext["io.modelcontextprotocol/ui"] = Json.emptyObject;
 	ext["io.modelcontextprotocol/skills"] = Json.emptyObject;
 	caps.extensions = ext;
-	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.modern])
+	foreach (v; [ProtocolVersion.v2025_11_25, ProtocolVersion.v2026_07_28])
 	{
 		auto j = caps.forVersion(v).toJson();
 		assert("io.modelcontextprotocol/ui" in j["extensions"]);
@@ -864,7 +864,7 @@ unittest  // ServerCapabilities.forVersion: Tasks stays draft-only at 2025-11-25
 	ext["io.modelcontextprotocol/tasks"] = Json.emptyObject;
 	caps.extensions = ext;
 	assert("extensions" !in caps.forVersion(ProtocolVersion.v2025_11_25).toJson());
-	assert("extensions" in caps.forVersion(ProtocolVersion.modern).toJson());
+	assert("extensions" in caps.forVersion(ProtocolVersion.v2026_07_28).toJson());
 }
 
 unittest  // ServerCapabilities.forVersion: a mixed map drops Tasks but keeps Apps/Skills at 2025-11-25
@@ -898,8 +898,8 @@ unittest  // extensionMinVersion: known floors and conservative default
 {
 	assert(extensionMinVersion("io.modelcontextprotocol/ui") == ProtocolVersion.v2025_11_25);
 	assert(extensionMinVersion("io.modelcontextprotocol/skills") == ProtocolVersion.v2025_11_25);
-	assert(extensionMinVersion(tasksExtensionKey) == ProtocolVersion.modern);
-	assert(extensionMinVersion("io.example/future") == ProtocolVersion.modern);
+	assert(extensionMinVersion(tasksExtensionKey) == ProtocolVersion.v2026_07_28);
+	assert(extensionMinVersion("io.example/future") == ProtocolVersion.v2026_07_28);
 }
 
 unittest  // ServerCapabilities.forVersion always keeps base capabilities
@@ -1257,7 +1257,7 @@ unittest  // ClientCapabilities.forVersion keeps roots/rootsListChanged uncondit
 	foreach (v; [
 		ProtocolVersion.v2024_11_05, ProtocolVersion.v2025_03_26,
 		ProtocolVersion.v2025_06_18, ProtocolVersion.v2025_11_25,
-		ProtocolVersion.modern
+		ProtocolVersion.v2026_07_28
 	])
 		assert(caps.forVersion(v).toJson()["roots"]["listChanged"].get!bool);
 }

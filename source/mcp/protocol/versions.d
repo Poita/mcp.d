@@ -9,18 +9,26 @@ enum ProtocolVersion
 	v2025_03_26,
 	v2025_06_18,
 	v2025_11_25,
-	modern
+	v2026_07_28
 }
 
-/// The newest stable (legacy) version this SDK speaks. Versions before
-/// `modern` (2026-07-28) are "legacy"; `modern` and later are "modern".
-enum ProtocolVersion latestStable = ProtocolVersion.v2025_11_25;
+/// The newest protocol version this SDK speaks: 2026-07-28, the first "modern"
+/// revision (stateless per-request `_meta`, `server/discover`, MRTR,
+/// `subscriptions/listen`, cacheable results).
+enum ProtocolVersion latestStable = ProtocolVersion.v2026_07_28;
 
-/// All versions this SDK can speak, oldest to newest (modern last).
+/// The newest "legacy" version: the last revision negotiated through the
+/// `initialize` handshake. Every code path that exists only for that
+/// handshake (the `initialize` fallback, a stateful connection's default, a
+/// session with no per-request `_meta`) defaults to this, never to a modern
+/// version, because a modern revision has no `InitializeResult` to answer with.
+enum ProtocolVersion latestLegacy = ProtocolVersion.v2025_11_25;
+
+/// All versions this SDK can speak, oldest to newest.
 immutable ProtocolVersion[] supportedVersions = [
 	ProtocolVersion.v2024_11_05, ProtocolVersion.v2025_03_26,
 	ProtocolVersion.v2025_06_18, ProtocolVersion.v2025_11_25,
-	ProtocolVersion.modern
+	ProtocolVersion.v2026_07_28
 ];
 
 /// Convert a version to its on-the-wire date string.
@@ -36,8 +44,8 @@ string toWire(ProtocolVersion v) pure nothrow
 		return "2025-06-18";
 	case ProtocolVersion.v2025_11_25:
 		return "2025-11-25";
-	case ProtocolVersion.modern:
-		return "2026-07-28"; // wire token for the modern revision (spec labels it "draft")
+	case ProtocolVersion.v2026_07_28:
+		return "2026-07-28";
 	}
 }
 
@@ -50,16 +58,11 @@ ProtocolVersion parseVersion(string s) pure
 	return v;
 }
 
-/// Parse a wire string; returns false (without throwing) if unknown.
+/// Parse a wire string; returns false (without throwing) if unknown. Only
+/// dated tokens are versions: the spec's "draft" label names whatever the next
+/// unreleased revision currently is, never a version a peer can negotiate.
 bool tryParseVersion(string s, out ProtocolVersion v) pure nothrow
 {
-	// The spec labels the modern revision's wire token "draft"; accept it as
-	// an alias for the dated "2026-07-28" token.
-	if (s == "draft")
-	{
-		v = ProtocolVersion.modern;
-		return true;
-	}
 	foreach (candidate; supportedVersions)
 	{
 		if (candidate.toWire == s)
@@ -71,12 +74,13 @@ bool tryParseVersion(string s, out ProtocolVersion v) pure nothrow
 	return false;
 }
 
-/// Server-side negotiation: accept the client's version if supported,
-/// otherwise offer our latest stable version.
+/// `initialize`-handshake negotiation: accept the client's version if
+/// supported, otherwise offer the latest legacy version (the handshake itself
+/// only exists on legacy revisions, so a modern fallback could not be answered).
 ProtocolVersion negotiate(string clientRequested) pure nothrow
 {
 	ProtocolVersion v;
-	return tryParseVersion(clientRequested, v) ? v : latestStable;
+	return tryParseVersion(clientRequested, v) ? v : latestLegacy;
 }
 
 /// Whether elicitation (client feature) is available at this version.
@@ -101,13 +105,13 @@ bool supportsProgressMessage(ProtocolVersion v) pure nothrow
 /// versions keep their session/handshake-based behavior.
 bool isModern(ProtocolVersion v) pure nothrow
 {
-	return v >= ProtocolVersion.modern;
+	return v >= ProtocolVersion.v2026_07_28;
 }
 
 /// Whether a version predates the modern redesign (< 2026-07-28).
 bool isLegacy(ProtocolVersion v) pure nothrow
 {
-	return v < ProtocolVersion.modern;
+	return v < ProtocolVersion.v2026_07_28;
 }
 
 /// Modern uses per-request `_meta` (protocolVersion/clientInfo/clientCapabilities)
@@ -138,10 +142,9 @@ unittest  // wire string round-trips for every version
 	import std.exception : assertThrown;
 
 	assert(ProtocolVersion.v2024_11_05.toWire == "2024-11-05");
-	assert(ProtocolVersion.modern.toWire == "2026-07-28");
+	assert(ProtocolVersion.v2026_07_28.toWire == "2026-07-28");
 	assert("2025-06-18".parseVersion == ProtocolVersion.v2025_06_18);
-	assert("draft".parseVersion == ProtocolVersion.modern);
-	assert("2026-07-28".parseVersion == ProtocolVersion.modern);
+	assert("2026-07-28".parseVersion == ProtocolVersion.v2026_07_28);
 	assertThrown("1999-01-01".parseVersion);
 }
 
@@ -156,33 +159,32 @@ unittest  // tryParseVersion does not throw on unknown
 unittest  // negotiation: client version supported -> echo it back
 {
 	assert(negotiate("2025-06-18") == ProtocolVersion.v2025_06_18);
-	// both wire tokens for the modern revision must echo back modern, not fall through to latestStable
-	assert(negotiate("draft") == ProtocolVersion.modern);
-	assert(negotiate("2026-07-28") == ProtocolVersion.modern);
+	// The modern revision echoes back too; the handshake path clamps it afterwards.
+	assert(negotiate("2026-07-28") == ProtocolVersion.v2026_07_28);
 }
 
-unittest  // negotiation: client version unknown/newer -> fall back to latest stable
+unittest  // negotiation: client version unknown/newer -> fall back to the latest legacy version
 {
-	assert(negotiate("2099-01-01") == latestStable);
-	assert(negotiate("garbage") == latestStable);
+	assert(negotiate("2099-01-01") == latestLegacy);
+	assert(negotiate("garbage") == latestLegacy);
 }
 
 unittest  // feature gating: elicitation introduced in 2025-06-18
 {
 	assert(!ProtocolVersion.v2025_03_26.supportsElicitation);
 	assert(ProtocolVersion.v2025_06_18.supportsElicitation);
-	assert(ProtocolVersion.modern.supportsElicitation);
+	assert(ProtocolVersion.v2026_07_28.supportsElicitation);
 }
 
 unittest  // modern feature gates and resource-not-found code
 {
-	assert(ProtocolVersion.modern.isModern);
+	assert(ProtocolVersion.v2026_07_28.isModern);
 	assert(!ProtocolVersion.v2025_11_25.isModern);
-	assert(ProtocolVersion.modern.supportsDiscover);
-	assert(ProtocolVersion.modern.usesMRTR);
-	assert(ProtocolVersion.modern.usesSubscriptionsListen);
-	assert(ProtocolVersion.modern.cacheableResults);
-	assert(ProtocolVersion.modern.resourceNotFoundCode == -32602);
+	assert(ProtocolVersion.v2026_07_28.supportsDiscover);
+	assert(ProtocolVersion.v2026_07_28.usesMRTR);
+	assert(ProtocolVersion.v2026_07_28.usesSubscriptionsListen);
+	assert(ProtocolVersion.v2026_07_28.cacheableResults);
+	assert(ProtocolVersion.v2026_07_28.resourceNotFoundCode == -32602);
 	assert(ProtocolVersion.v2025_11_25.resourceNotFoundCode == -32002);
 }
 
@@ -192,11 +194,26 @@ unittest  // isLegacy: every pre-modern version is legacy, modern is not
 	assert(ProtocolVersion.v2025_03_26.isLegacy);
 	assert(ProtocolVersion.v2025_06_18.isLegacy);
 	assert(ProtocolVersion.v2025_11_25.isLegacy);
-	assert(!ProtocolVersion.modern.isLegacy);
+	assert(!ProtocolVersion.v2026_07_28.isLegacy);
 }
 
-unittest  // both wire tokens for the modern revision still parse
+unittest  // 2026-07-28 is the latest stable version; 2025-11-25 the latest legacy one
 {
-	assert("draft".parseVersion == ProtocolVersion.modern);
-	assert("2026-07-28".parseVersion == ProtocolVersion.modern);
+	assert(latestStable == ProtocolVersion.v2026_07_28);
+	assert(latestStable.toWire == "2026-07-28");
+	assert(latestLegacy == ProtocolVersion.v2025_11_25);
+	assert(latestLegacy.isLegacy && latestStable.isModern);
+	assert(supportedVersions[$ - 1] == latestStable);
+}
+
+unittest  // "draft" is not a wire token: the released revision is addressed by its date only
+{
+	import std.exception : assertThrown;
+
+	ProtocolVersion v;
+	assert(!"draft".tryParseVersion(v));
+	assertThrown("draft".parseVersion);
+	// An initialize handshake naming "draft" is an unknown version and falls back
+	// to the latest legacy revision, like any other unknown token.
+	assert(negotiate("draft") == latestLegacy);
 }

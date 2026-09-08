@@ -10,7 +10,7 @@ import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
 import mcp.protocol.schema : jsonSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
 import mcp.protocol.jsonrpc : makeNotification;
-import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
+import mcp.protocol.versions : ProtocolVersion, latestLegacy, supportsProgressMessage;
 import mcp.server.connection : ConnectionState;
 
 @safe:
@@ -481,7 +481,7 @@ final class StdioContext : RequestContext
 	/// 2025-03-26 onward). This overload wires no server->client request channel
 	/// (`sendRequest` throws, `clientSupports` is false).
 	this(void delegate(string) @safe sink, Json progressToken = Json.undefined,
-			ProtocolVersion negotiated = latestStable) @safe
+			ProtocolVersion negotiated = latestLegacy) @safe
 	{
 		this.sink = sink;
 		this.progressTok = progressToken;
@@ -498,7 +498,7 @@ final class StdioContext : RequestContext
 	/// connection to carry the round-trip), exactly as on the HTTP transport.
 	this(void delegate(string) @safe sink, Json delegate(string, Json) @safe serverRequest,
 			ClientCapabilities clientCaps, Json progressToken = Json.undefined,
-			ProtocolVersion negotiated = latestStable, bool serverStateless = false) @safe
+			ProtocolVersion negotiated = latestLegacy, bool serverStateless = false) @safe
 	{
 		this.sink = sink;
 		this.serverRequestFn = serverRequest;
@@ -628,7 +628,7 @@ final class RequestScope : RequestContext, ConnectionScoped
 
 	this(RequestContext inner, bool stateless, Json[string] responses, string minLevel = "info",
 			bool loggingRequested = true, CancellationToken cancellation = null,
-			string requestState = "", ProtocolVersion effectiveVersion = latestStable) @safe
+			string requestState = "", ProtocolVersion effectiveVersion = latestLegacy) @safe
 	{
 		this.inner = inner;
 		this.stateless = stateless;
@@ -1161,7 +1161,7 @@ unittest  // a stateless server's StdioContext refuses server->client requests o
 	// connection to carry the round-trip, so elicit/sample/roots are refused —
 	// matching the HTTP transport rather than special-casing stdio.
 	auto ctx = new StdioContext((string) @safe {}, (string m, Json p) @safe => Json.emptyObject,
-			ClientCapabilities.init, Json.undefined, latestStable, true);
+			ClientCapabilities.init, Json.undefined, latestLegacy, true);
 	assertThrown!McpException(ctx.sampleRaw(Json.emptyObject));
 	assertThrown!McpException(ctx.elicitRaw(Json.emptyObject));
 	assertThrown!McpException(ctx.listRootsRaw());
@@ -1173,7 +1173,7 @@ unittest  // a stateful StdioContext issues server->client requests through the 
 	auto ctx = new StdioContext((string) @safe {}, (string m, Json p) @safe {
 		called = true;
 		return Json.emptyObject;
-	}, ClientCapabilities.init, Json.undefined, latestStable, false);
+	}, ClientCapabilities.init, Json.undefined, latestLegacy, false);
 	ctx.listRootsRaw();
 	assert(called);
 }

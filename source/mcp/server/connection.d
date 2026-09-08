@@ -1,6 +1,6 @@
 module mcp.server.connection;
 
-import mcp.protocol.versions : ProtocolVersion, latestStable;
+import mcp.protocol.versions : ProtocolVersion, latestLegacy;
 import mcp.protocol.capabilities : ClientCapabilities;
 import mcp.server.context : CancellationToken;
 import mcp.server.push : ListenFilter;
@@ -31,7 +31,7 @@ final class ConnectionState
 	/// each open listener's own `ListenFilter`, not by a separate
 	/// connection-level version (`subscriptions/listen` is an ordinary
 	/// request and is not special-cased).
-	ProtocolVersion negotiated = latestStable;
+	ProtocolVersion negotiated = latestLegacy;
 
 	/// The client capabilities declared at `initialize` (stateful) or carried in
 	/// the request's `_meta` (stateless draft). Empty when unknown (legacy
@@ -115,13 +115,13 @@ unittest  // subscriptions are per-connection
 
 unittest  // a fresh ConnectionState carries spec defaults
 {
-	import mcp.protocol.versions : latestStable;
+	import mcp.protocol.versions : latestLegacy;
 
 	auto c = new ConnectionState;
 	assert(c.logLevel == "info");
 	assert(!c.initialized);
 	assert(!c.initializeProcessed);
-	assert(c.negotiated == latestStable);
+	assert(c.negotiated == latestLegacy);
 	assert(c.subscriptions.length == 0);
 	assert(c.inFlight.length == 0);
 }

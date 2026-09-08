@@ -2486,13 +2486,13 @@ final class McpServer : ServerCore
 		DiscoverResult d;
 		foreach (v; supportedVersions)
 			d.protocolVersions ~= v.toWire;
-		d.capabilities = capabilities().forVersion(ProtocolVersion.modern);
+		d.capabilities = capabilities().forVersion(ProtocolVersion.v2026_07_28);
 		// Identity is stamped into `_meta` by the dispatch path, along with every
 		// other modern result.
 		d.instructions = instructions;
 		// `server/discover` is draft-only, so the version is always modern here;
 		// emit the configured discover hint (or the conservative ttlMs:0 default).
-		return maybeCache(d, listHint("server/discover"), ProtocolVersion.modern);
+		return maybeCache(d, listHint("server/discover"), ProtocolVersion.v2026_07_28);
 	}
 
 	/// `subscriptions/listen` (draft): record the opted-in change-notification
@@ -3058,7 +3058,7 @@ final class McpServer : ServerCore
 		// latest stable rather than emitting an InitializeResult that claims a
 		// version with no initialize semantics.
 		if (conn.negotiated.isModern)
-			conn.negotiated = latestStable;
+			conn.negotiated = latestLegacy;
 		conn.clientCaps = p.capabilities;
 		// Record that this stateful session has processed its `initialize`, so the
 		// re-init guard above rejects a second one even if it arrives before the
@@ -3687,7 +3687,7 @@ unittest  // initialize falls back to latest stable for an unknown version
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = "2099-01-01";
 	auto resp = s.handle(req(1, "initialize", params)).get;
-	assert(resp["result"]["protocolVersion"].get!string == latestStable.toWire);
+	assert(resp["result"]["protocolVersion"].get!string == latestLegacy.toWire);
 }
 
 unittest  // initialize MUST NOT negotiate draft: it has no InitializeResult
@@ -3700,16 +3700,16 @@ unittest  // initialize MUST NOT negotiate draft: it has no InitializeResult
 	// version it supports"), never the draft version.
 	auto s = makeTestServer();
 	Json params = Json.emptyObject;
-	params["protocolVersion"] = ProtocolVersion.modern.toWire; // "2026-07-28"
+	params["protocolVersion"] = ProtocolVersion.v2026_07_28.toWire; // "2026-07-28"
 	params["capabilities"] = Json.emptyObject;
 	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
 	auto resp = s.handle(req(1, "initialize", params)).get;
 	assert("result" in resp);
-	assert(resp["result"]["protocolVersion"].get!string == latestStable.toWire);
-	assert(resp["result"]["protocolVersion"].get!string != ProtocolVersion.modern.toWire);
+	assert(resp["result"]["protocolVersion"].get!string == latestLegacy.toWire);
+	assert(resp["result"]["protocolVersion"].get!string != ProtocolVersion.v2026_07_28.toWire);
 }
 
-unittest  // initialize MUST NOT negotiate draft via the "draft" alias
+unittest  // initialize with the spec's "draft" label is an unknown version: latest legacy
 {
 	auto s = makeTestServer();
 	Json params = Json.emptyObject;
@@ -3717,21 +3717,21 @@ unittest  // initialize MUST NOT negotiate draft via the "draft" alias
 	params["capabilities"] = Json.emptyObject;
 	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
 	auto resp = s.handle(req(1, "initialize", params)).get;
-	assert(resp["result"]["protocolVersion"].get!string == latestStable.toWire);
+	assert(resp["result"]["protocolVersion"].get!string == latestLegacy.toWire);
 }
 
-unittest  // initialize draft clamp does not pin the connection to draft
+unittest  // the initialize modern clamp also fixes the connection's negotiated version
 {
 	// Clamping must also fix the negotiated/connection version so subsequent
 	// unsolicited server->client gating and serverInfo projection behave as the
-	// stable version, not draft.
+	// legacy version, not the modern one.
 	auto s = makeTestServer();
 	Json params = Json.emptyObject;
-	params["protocolVersion"] = "draft";
+	params["protocolVersion"] = "2026-07-28";
 	params["capabilities"] = Json.emptyObject;
 	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
 	s.handle(req(1, "initialize", params));
-	assert(s.negotiatedVersion == latestStable);
+	assert(s.negotiatedVersion == latestLegacy);
 	assert(!s.negotiatedVersion.isModern);
 }
 
@@ -6666,7 +6666,7 @@ unittest  // per-list setListCacheHint: pre-draft tools/list has no cache fields
 {
 	auto s = makeTestServer();
 	s.setListCacheHint("tools/list", CacheHint(5.seconds));
-	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestStable
+	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestLegacy
 	assert("ttlMs" !in resp["result"]);
 }
 
@@ -6728,7 +6728,7 @@ unittest  // per-resource hint is NOT emitted on a non-draft (2025-11-25) resour
 			"text/plain", "x"), nullable(CacheHint(9.seconds, CacheScope.private_)));
 	Json p = Json.emptyObject;
 	p["uri"] = "test://r";
-	auto resp = s.handle(req(2, "resources/read", p)).get; // no draft _meta -> latestStable
+	auto resp = s.handle(req(2, "resources/read", p)).get; // no draft _meta -> latestLegacy
 	assert("ttlMs" !in resp["result"]);
 }
 
@@ -6790,7 +6790,7 @@ unittest  // draft resources/read defaults to ttlMs:0 when the resource has no h
 unittest  // pre-draft list/read never emit the default cache hint
 {
 	auto s = makeTestServer();
-	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestStable
+	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestLegacy
 	assert("ttlMs" !in resp["result"]);
 }
 
@@ -6810,7 +6810,7 @@ unittest
 	s.registerTool(yielder, (Json args, RequestContext ctx) @safe {
 		// Mid-handle: dispatch a DIFFERENT-version request on the same server.
 		// This is the interleave a yielding handler would expose under concurrency.
-		innerResp = s.handle(req(99, "tools/list")).get; // pre-draft (latestStable)
+		innerResp = s.handle(req(99, "tools/list")).get; // pre-draft (latestLegacy)
 		CallToolResult r;
 		r.content = [Content.makeText("ok")];
 		return r;
@@ -6864,7 +6864,7 @@ unittest  // pre-draft results never carry the `_meta` serverInfo key
 unittest  // pre-draft results never emit resultType
 {
 	auto s = makeTestServer();
-	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestStable
+	auto resp = s.handle(req(2, "tools/list")).get; // no draft _meta -> latestLegacy
 	assert("error" !in resp);
 	assert("resultType" !in resp["result"]);
 }
@@ -7944,7 +7944,7 @@ unittest  // notifyElicitationComplete is a no-op on a draft (modern) session
 	// The draft removed `notifications/elicitation/complete`; even with an open
 	// push channel a modern session must emit nothing.
 	auto s = new McpServer("t", "1");
-	s.activeConnection.negotiated = ProtocolVersion.modern;
+	s.activeConnection.negotiated = ProtocolVersion.v2026_07_28;
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
@@ -8798,7 +8798,7 @@ unittest  // a stateful server negotiates a draft request DOWN to latest stable
 	assert(!resp.isNull);
 	const ver = resp.get["result"]["protocolVersion"].get!string;
 	assert(ver != "2026-07-28", "stateful must not negotiate the draft");
-	assert(ver == latestStable.toWire);
+	assert(ver == latestLegacy.toWire);
 }
 
 unittest  // a stateful server does not serve server/discover (draft-only RPC)

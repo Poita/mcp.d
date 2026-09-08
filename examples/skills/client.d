@@ -64,7 +64,7 @@ int main(string[] args) @safe
 			"the skills capability should advertise directoryRead");
 
 		auto negotiated = client.connect();
-		checkEq(negotiated, ProtocolVersion.modern, "connect() should negotiate draft");
+		checkEq(negotiated, ProtocolVersion.v2026_07_28, "connect() should negotiate draft");
 
 		// --- 2. listSkills(): skills/list enumerates every registered skill ---
 		// The raw result carries the CacheableResult fields the stable spec

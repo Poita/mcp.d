@@ -116,8 +116,8 @@ private int runE2E(McpClient client, McpClient delegate() @safe makeClient, bool
 
 	// --- 2. connect() selects the stateless draft -----------------------------
 	auto negotiated = client.connect();
-	checkEq(negotiated, ProtocolVersion.modern, "connect() negotiated version");
-	checkEq(client.protocolVersion(), ProtocolVersion.modern, "client.protocolVersion()");
+	checkEq(negotiated, ProtocolVersion.v2026_07_28, "connect() negotiated version");
+	checkEq(client.protocolVersion(), ProtocolVersion.v2026_07_28, "client.protocolVersion()");
 
 	// --- 3. listTools + per-list draft CacheableResult hint -------------------
 	auto tools = client.listTools();
@@ -175,8 +175,9 @@ private int runE2E(McpClient client, McpClient delegate() @safe makeClient, bool
 	// No enableModern(), no discover(): connect(prior) selects the version from the
 	// persisted result alone and adopts modern framing with zero round trips.
 	auto reNegotiated = second.connect(persisted);
-	checkEq(reNegotiated, ProtocolVersion.modern, "connect(DiscoverResult) negotiated version");
-	checkEq(second.protocolVersion(), ProtocolVersion.modern,
+	checkEq(reNegotiated, ProtocolVersion.v2026_07_28,
+			"connect(DiscoverResult) negotiated version");
+	checkEq(second.protocolVersion(), ProtocolVersion.v2026_07_28,
 			"reconnected client.protocolVersion()");
 	// The adopted identity came straight from the persisted discovery (no network).
 	checkEq(second.serverInfo().name, "stateless-draft-server",

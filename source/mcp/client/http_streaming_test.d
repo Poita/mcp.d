@@ -265,7 +265,7 @@ unittest
 	runEventLoop();
 
 	assert(failure.length == 0, "subscriptions/listen test failed: " ~ failure);
-	assert(negotiated == ProtocolVersion.modern,
+	assert(negotiated == ProtocolVersion.v2026_07_28,
 			"expected to negotiate the draft/modern revision for subscriptions/listen");
 	assert(acked,
 			"client never received the leading subscriptions/acknowledged event on the listen stream");

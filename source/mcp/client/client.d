@@ -263,7 +263,7 @@ final class McpClient : ClientProtocol
 {
 	// The byte transport (HTTP/stdio). All JSON-RPC I/O routes through it.
 	private ClientTransport transport;
-	private ProtocolVersion negotiated = latestStable;
+	private ProtocolVersion negotiated = latestLegacy;
 	private bool didInitialize;
 	private bool useModern;
 	private long nextId = 1;
@@ -628,7 +628,7 @@ final class McpClient : ClientProtocol
 	void enableModern() @safe
 	{
 		useModern = true;
-		negotiated = ProtocolVersion.modern;
+		negotiated = ProtocolVersion.v2026_07_28;
 		transport.setDraftProtocol(true);
 	}
 
@@ -660,7 +660,7 @@ final class McpClient : ClientProtocol
 		const priorUseModern = useModern;
 		const priorNegotiated = negotiated;
 		useModern = true;
-		negotiated = ProtocolVersion.modern;
+		negotiated = ProtocolVersion.v2026_07_28;
 		bool keepModernFraming;
 		scope (exit)
 			if (!keepModernFraming)
@@ -692,7 +692,7 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Perform the initialize handshake and send `notifications/initialized`.
-	InitializeResult initialize(string requestedVersion = latestStable.toWire) @safe
+	InitializeResult initialize(string requestedVersion = latestLegacy.toWire) @safe
 	{
 		InitializeParams params;
 		params.protocolVersion = requestedVersion;
@@ -701,7 +701,7 @@ final class McpClient : ClientProtocol
 		// emitted as a top-level capability the draft schema does not define.
 		ProtocolVersion reqVer;
 		if (!tryParseVersion(requestedVersion, reqVer))
-			reqVer = latestStable;
+			reqVer = latestLegacy;
 		params.capabilities = effectiveCapabilities().forVersion(reqVer);
 		params.clientInfo = clientInfo;
 
@@ -3410,8 +3410,9 @@ unittest  // resolveNegotiatedVersion rejects a modern version in an initialize 
 	import std.exception : assertThrown;
 
 	// A conformant modern server uses server/discover, not initialize.
-	// Echoing "2026-07-28" or "draft" in an initialize response is invalid;
-	// accepting it would leave useModern unset and create split-brain state.
+	// Echoing "2026-07-28" in an initialize response is invalid; accepting it
+	// would leave useModern unset and create split-brain state. "draft" is not
+	// a version at all and is rejected as unknown.
 	assertThrown!McpException(resolveNegotiatedVersion("2026-07-28"));
 	assertThrown!McpException(resolveNegotiatedVersion("draft"));
 }
@@ -3419,7 +3420,7 @@ unittest  // resolveNegotiatedVersion rejects a modern version in an initialize 
 unittest  // selectMutualVersion prefers the newest mutually-supported version
 {
 	ProtocolVersion v;
-	assert(selectMutualVersion(["2025-11-25", "2026-07-28"], v) && v == ProtocolVersion.modern);
+	assert(selectMutualVersion(["2025-11-25", "2026-07-28"], v) && v == ProtocolVersion.v2026_07_28);
 	assert(selectMutualVersion(["2024-11-05", "2025-03-26"], v) && v == ProtocolVersion.v2025_03_26);
 }
 
@@ -3483,7 +3484,7 @@ unittest  // enableTasks advertises the tasks extension (draft only)
 	c.enableTasks();
 	auto caps = c.effectiveCapabilities();
 	assert("io.modelcontextprotocol/tasks" in caps.extensions);
-	auto draftJson = caps.forVersion(ProtocolVersion.modern).toJson();
+	auto draftJson = caps.forVersion(ProtocolVersion.v2026_07_28).toJson();
 	assert("io.modelcontextprotocol/tasks" in draftJson["extensions"]);
 	auto stableJson = caps.forVersion(ProtocolVersion.v2025_06_18).toJson();
 	assert("extensions" !in stableJson);
@@ -4548,7 +4549,7 @@ unittest  // initialize advertises capabilities derived from installed handlers
 			initParams = params;
 		// Minimal initialize result so the handshake completes.
 		Json res = Json.emptyObject;
-		res["protocolVersion"] = latestStable.toWire;
+		res["protocolVersion"] = latestLegacy.toWire;
 		res["capabilities"] = Json.emptyObject;
 		Json info = Json.emptyObject;
 		info["name"] = "srv";
@@ -6071,7 +6072,7 @@ unittest  // initialize records the server's advertised capabilities/info/instru
 	c.onNotifyForTest = (Json message) @safe {}; // swallow notifications/initialized
 	c.onRpcForTest = (string method, Json params) @safe {
 		Json res = Json.emptyObject;
-		res["protocolVersion"] = latestStable.toWire;
+		res["protocolVersion"] = latestLegacy.toWire;
 		Json caps = Json.emptyObject;
 		caps["logging"] = Json.emptyObject;
 		res["capabilities"] = caps;
@@ -6082,7 +6083,7 @@ unittest  // initialize records the server's advertised capabilities/info/instru
 		res["instructions"] = "be nice";
 		return res;
 	};
-	c.initialize(latestStable.toWire);
+	c.initialize(latestLegacy.toWire);
 	assert(c.serverInfo().name == "demo-server");
 	assert(c.serverInfo().version_ == "9.9.9");
 	assert(!c.serverInstructions().isNull);
@@ -6605,7 +6606,7 @@ unittest  // a draft client's ClientProtocol yields the MCP-Protocol-Version hea
 	auto c = new McpClient(transport);
 	c.enableModern();
 	auto headers = transport.protocol.headersFor(Json.undefined);
-	assert(headers["MCP-Protocol-Version"] == ProtocolVersion.modern.toWire);
+	assert(headers["MCP-Protocol-Version"] == ProtocolVersion.v2026_07_28.toWire);
 }
 
 unittest  // a resources/read URI is encoded in Mcp-Name, never placed raw (no CR/LF injection)
@@ -6699,14 +6700,14 @@ unittest  // connect() auto-detect probes server/discover with draft framing and
 		assert(message["method"].get!string == "server/discover");
 		// The probe self-advertises draft in the body...
 		assert(message["params"]["_meta"][MetaKey.protocolVersion].get!string
-				== ProtocolVersion.modern.toWire);
+				== ProtocolVersion.v2026_07_28.toWire);
 		// ...and in the protocol-derived headers the transport would send.
 		auto headers = c.headersFor(message);
-		assert(headers[HttpHeader.protocolVersion] == ProtocolVersion.modern.toWire);
+		assert(headers[HttpHeader.protocolVersion] == ProtocolVersion.v2026_07_28.toWire);
 		sawModernFramedDiscover = true;
 		Json r = Json.emptyObject;
 		r["protocolVersions"] = Json.emptyArray;
-		r["protocolVersions"] ~= Json(ProtocolVersion.modern.toWire);
+		r["protocolVersions"] ~= Json(ProtocolVersion.v2026_07_28.toWire);
 		r["capabilities"] = Json.emptyObject;
 		Json info = Json.emptyObject;
 		info["name"] = "draft-srv";
@@ -6718,7 +6719,7 @@ unittest  // connect() auto-detect probes server/discover with draft framing and
 	};
 	auto chosen = c.connect();
 	assert(sawModernFramedDiscover);
-	assert(chosen == ProtocolVersion.modern);
+	assert(chosen == ProtocolVersion.v2026_07_28);
 }
 
 unittest  // connect() still falls back to initialize when even a draft-framed probe is methodNotFound
@@ -6733,7 +6734,7 @@ unittest  // connect() still falls back to initialize when even a draft-framed p
 			throw new McpException(ErrorCode.methodNotFound, "Method not found");
 		// The legacy initialize handshake.
 		Json r = Json.emptyObject;
-		r["protocolVersion"] = latestStable.toWire;
+		r["protocolVersion"] = latestLegacy.toWire;
 		r["capabilities"] = Json.emptyObject;
 		Json info = Json.emptyObject;
 		info["name"] = "legacy-srv";
@@ -6742,7 +6743,7 @@ unittest  // connect() still falls back to initialize when even a draft-framed p
 		return r;
 	};
 	auto chosen = c.connect();
-	assert(chosen == latestStable);
+	assert(chosen == latestLegacy);
 	assert(!chosen.isModern);
 }
 
@@ -6763,7 +6764,7 @@ unittest  // connect() populates serverCapabilities/serverInfo/serverInstruction
 			// First probe: server rejects our draft version and advertises modern.
 			Json errData = Json.emptyObject;
 			errData["supported"] = Json.emptyArray;
-			errData["supported"] ~= Json(ProtocolVersion.modern.toWire);
+			errData["supported"] ~= Json(ProtocolVersion.v2026_07_28.toWire);
 			throw new McpException(ErrorCode.unsupportedProtocolVersion,
 					"Unsupported protocol version", errData);
 		}
@@ -6771,7 +6772,7 @@ unittest  // connect() populates serverCapabilities/serverInfo/serverInstruction
 		assert(method == "server/discover", "expected server/discover, got " ~ method);
 		Json r = Json.emptyObject;
 		r["supportedVersions"] = Json.emptyArray;
-		r["supportedVersions"] ~= Json(ProtocolVersion.modern.toWire);
+		r["supportedVersions"] ~= Json(ProtocolVersion.v2026_07_28.toWire);
 		Json caps = Json.emptyObject;
 		caps["logging"] = Json.emptyObject;
 		r["capabilities"] = caps;
@@ -6785,7 +6786,7 @@ unittest  // connect() populates serverCapabilities/serverInfo/serverInstruction
 		return r;
 	};
 	auto chosen = c.connect();
-	assert(chosen == ProtocolVersion.modern);
+	assert(chosen == ProtocolVersion.v2026_07_28);
 	assert(c.serverInfo().name == "modern-srv");
 	assert(c.serverInfo().version_ == "2.0");
 	assert(!c.serverInstructions().isNull);
@@ -6816,9 +6817,9 @@ unittest  // connect(DiscoverResult) adopts a draft session with zero round trip
 		return Json.emptyObject;
 	};
 
-	auto chosen = c.connect(fixtureDiscover([ProtocolVersion.modern.toWire]));
-	assert(chosen == ProtocolVersion.modern);
-	assert(c.protocolVersion() == ProtocolVersion.modern);
+	auto chosen = c.connect(fixtureDiscover([ProtocolVersion.v2026_07_28.toWire]));
+	assert(chosen == ProtocolVersion.v2026_07_28);
+	assert(c.protocolVersion() == ProtocolVersion.v2026_07_28);
 	// No server/discover (or any) round-trip was made: the prior result was adopted.
 	assert(calls == 0, "draft adoption must not hit the network");
 	// The prior discovery's identity/instructions were adopted directly.
@@ -6828,7 +6829,7 @@ unittest  // connect(DiscoverResult) adopts a draft session with zero round trip
 	// The adopted result is exposed via discoverResult().
 	assert(!c.discoverResult().isNull);
 	assert(c.discoverResult().get.protocolVersions == [
-		ProtocolVersion.modern.toWire
+		ProtocolVersion.v2026_07_28.toWire
 	]);
 }
 

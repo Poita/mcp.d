@@ -12,7 +12,7 @@ import mcp.protocol.errors;
 import mcp.transport.coordinator : throwOrReturn;
 import mcp.protocol.capabilities;
 import mcp.protocol.mrtr : withListenSubscriptionId;
-import mcp.protocol.versions : ProtocolVersion, latestStable, supportsProgressMessage;
+import mcp.protocol.versions : ProtocolVersion, latestLegacy, supportsProgressMessage;
 import mcp.server.context;
 import mcp.server.connection : ConnectionState;
 import mcp.server.push : PushChannel, ListenFilter;
@@ -1872,7 +1872,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 
 	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
 			TokenInfo auth = TokenInfo.invalid(),
-			bool isDraft = false, ProtocolVersion negotiated = latestStable,
+			bool isDraft = false, ProtocolVersion negotiated = latestLegacy,
 			string connectionToken = "",
 			ConnectionState connState = null,
 			bool serverStateless = false, bool acceptsEventStream = true) @safe
@@ -2201,7 +2201,7 @@ unittest  // the priming event is sent ONLY on 2025-11-25
 	assert(!sendsPrimingEvent(ProtocolVersion.v2025_03_26));
 	assert(!sendsPrimingEvent(ProtocolVersion.v2024_11_05));
 	// The draft drops Last-Event-ID resumability, so no priming event there.
-	assert(!sendsPrimingEvent(ProtocolVersion.modern));
+	assert(!sendsPrimingEvent(ProtocolVersion.v2026_07_28));
 }
 
 /// Whether the server SHOULD emit an SSE `retry:` field before closing a
@@ -2227,7 +2227,7 @@ unittest  // the retry-on-close hint is sent ONLY on 2025-11-25
 	assert(!sendsRetryOnClose(ProtocolVersion.v2025_03_26));
 	assert(!sendsRetryOnClose(ProtocolVersion.v2024_11_05));
 	// The draft drops Last-Event-ID resumability, so no reconnect hint there.
-	assert(!sendsRetryOnClose(ProtocolVersion.modern));
+	assert(!sendsRetryOnClose(ProtocolVersion.v2026_07_28));
 }
 
 /// Frame a standalone Server-Sent Events `retry:` event carrying the
@@ -2765,7 +2765,7 @@ unittest  // draft HttpStreamContext: a disconnected client reports cancelled
 	auto coord = new StreamCoordinator;
 	ClientCapabilities caps;
 	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
-			TokenInfo.invalid(), true, ProtocolVersion.modern);
+			TokenInfo.invalid(), true, ProtocolVersion.v2026_07_28);
 
 	// Connection alive -> not cancelled.
 	ctx.setConnectionProbe(() @safe => true);
@@ -2809,7 +2809,7 @@ unittest  // HttpStreamContext exposes its per-connection token via ConnectionSc
 	// the Mcp-Session-Id, so connectionTokenOf scopes the cancellation registry per
 	// session rather than collapsing every connection onto the shared "" key.
 	auto scoped = new HttpStreamContext(res, coord, caps, Json.undefined,
-			TokenInfo.invalid(), false, latestStable, "sess-XYZ");
+			TokenInfo.invalid(), false, latestLegacy, "sess-XYZ");
 	assert(cast(ConnectionScoped) scoped !is null,
 			"HttpStreamContext must implement ConnectionScoped");
 	assert(scoped.connectionToken() == "sess-XYZ");
@@ -2843,7 +2843,7 @@ unittest  // a cancellation scoped to session B must not suppress session A's sa
 	// Build the cancellation context for session B exactly as the transport does:
 	// an HttpStreamContext carrying session B's token.
 	auto ctxB = new HttpStreamContext(resB, coord, caps, Json.undefined,
-			TokenInfo.invalid(), false, latestStable, "sess-B");
+			TokenInfo.invalid(), false, latestLegacy, "sess-B");
 
 	Tool slow = {name: "slow"};
 	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
@@ -2862,7 +2862,7 @@ unittest  // a cancellation scoped to session B must not suppress session A's sa
 	Json callP = Json.emptyObject;
 	callP["name"] = "slow";
 	auto ctxA = new HttpStreamContext(resA, coord, caps, Json.undefined,
-			TokenInfo.invalid(), false, latestStable, "sess-A");
+			TokenInfo.invalid(), false, latestLegacy, "sess-A");
 	auto resp = s.handle(Message(makeRequest(Json(1), "tools/call", callP)), ctxA);
 	// A's response is delivered (not suppressed): cancellation matched only B.
 	assert(!resp.isNull);
@@ -2912,7 +2912,7 @@ unittest  // a stateless HttpStreamContext FORBIDS server->client requests
 
 	// Construct the context exactly as the stateless HTTP transport does: serverStateless = true.
 	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
-			TokenInfo.invalid(), false, latestStable, "", null, true);
+			TokenInfo.invalid(), false, latestLegacy, "", null, true);
 	Json callP = Json.emptyObject;
 	callP["name"] = "ask";
 	auto resp = s.handle(Message(makeRequest(Json(1), "tools/call", callP)), ctx);
