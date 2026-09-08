@@ -2952,6 +2952,13 @@ final class McpClient : ClientProtocol
 				if ("uri" in params && params["uri"].type == Json.Type.string)
 					name = params["uri"].get!string;
 			}
+			else if (method == "tasks/get" || method == "tasks/update" || method == "tasks/cancel")
+			{
+				// The Tasks extension extends the routing headers to its methods:
+				// Mcp-Name mirrors params.taskId.
+				if ("taskId" in params && params["taskId"].type == Json.Type.string)
+					name = params["taskId"].get!string;
+			}
 			if (name.length)
 				headers[HttpHeader.name] = encodeHeaderValue(name);
 
@@ -6905,6 +6912,22 @@ unittest  // a benign reserved-character resource URI still survives Mcp-Name en
 
 	auto headers = transport.protocol.headersFor(msg);
 	assert(decodeHeaderValue(headers[HttpHeader.name]) == uri);
+}
+
+unittest  // the task methods mirror params.taskId into Mcp-Name on a modern session
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	c.enableModern();
+	foreach (method; ["tasks/get", "tasks/update", "tasks/cancel"])
+	{
+		Json msg = Json.emptyObject;
+		msg["method"] = method;
+		msg["params"] = Json(["taskId": Json("task-7")]);
+		auto headers = transport.protocol.headersFor(msg);
+		assert(headers[HttpHeader.method] == method);
+		assert(headers[HttpHeader.name] == "task-7", method);
+	}
 }
 
 unittest  // connect() routes a legacy HTTP+SSE fallback through the transport seam, not a downcast
