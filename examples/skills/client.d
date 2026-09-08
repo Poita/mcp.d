@@ -11,7 +11,9 @@
  *
  *   1. server/discover advertises the skills extension under `capabilities`.
  *   2. listSkills() calls skills/list and returns conformant entries
- *      (verbatim frontmatter, SKILL.md uri, per-file resources manifest).
+ *      (verbatim frontmatter, SKILL.md uri, per-file resources manifest with
+ *      digest + size), plus the required ttlMs/cacheScope on the result. The
+ *      dynamic reports/daily skill carries `resources: "dynamic"` instead.
  *   3. readSkill("git-workflow") reads a @skill skill: synthesized frontmatter.
  *   4. The @skillDir-sourced team/release-helper skill carries its AUTHORED
  *      frontmatter and a references/CHECKLIST.md file, and its nested
@@ -24,7 +26,9 @@
  *
  * The example calls the draft-only server/discover, so the client enables the
  * draft protocol (`enableModern`) up front. The skills extension itself
- * negotiates from 2025-11-25; the resource reads work on any protocol version.
+ * negotiates from 2025-11-25 (the stable spec is written against 2026-07-28,
+ * where its results carry ttlMs/cacheScope); the resource reads work on any
+ * protocol version.
  */
 module skills_client;
 
@@ -63,22 +67,46 @@ int main(string[] args) @safe
 		checkEq(negotiated, ProtocolVersion.modern, "connect() should negotiate draft");
 
 		// --- 2. listSkills(): skills/list enumerates every registered skill ---
+		// The raw result carries the CacheableResult fields the stable spec
+		// requires on a 2026-07-28 session; the typed helper drains the pages.
+		auto raw = client.skillsList();
+		check(!raw.cache.isNull, "skills/list on a modern session should carry ttlMs/cacheScope");
 		auto skills = listSkills(client);
 		auto names = skills.map!(s => s.name).array;
-		checkEq(skills.length, 4, "skills/list should carry four entries");
+		checkEq(skills.length, 5, "skills/list should carry five entries");
 		check(names.canFind("git-workflow"), "listing should carry git-workflow");
 		check(names.canFind("code-review"), "listing should carry code-review");
 		check(names.canFind("release-helper"), "listing should carry release-helper");
 		check(names.canFind("hotfix-helper"),
 			"the nested skill should be published as its own flat entry");
+		check(names.canFind("daily"), "listing should carry the dynamic reports/daily skill");
 		foreach (s; skills)
 		{
 			check(s.uri.length > 0, "entry should carry a SKILL.md uri");
+			check(s.isValid, "entry should carry a manifest array or \"dynamic\"");
+			check(checkSkillLimits(s) is null, "entry should be within the per-skill limits");
+			if (s.isDynamic)
+			{
+				check(s.resources.length == 0, "a dynamic entry has no manifest to list");
+				continue;
+			}
 			check(s.resources.length > 0, "entry should carry a resources manifest");
 			check(s.resources[0].uri == s.uri, "the manifest should list the SKILL.md itself first");
-			check(s.resources[0].digest.canFind("sha256:"),
-				"manifest entries should carry sha256 digests");
+			foreach (r; s.resources)
+			{
+				check(r.digest.canFind("sha256:"), "manifest entries should carry sha256 digests");
+				check(r.size > 0, "manifest entries should carry the file's byte length");
+			}
 		}
+
+		// The dynamic skill reads fine (fresh body each time) but cannot be verified.
+		auto daily = skills.filter!(s => s.name == "daily").front;
+		check(daily.isDynamic, "reports/daily should be published as dynamic");
+		auto dailyMd = readSkillUri(client, daily.uri);
+		check(dailyMd.canFind("# Daily report") && dailyMd.canFind("Generated at"),
+			"the dynamic SKILL.md should carry a generated body");
+		check(verifySkillMarkdown(daily, dailyMd) !is null,
+			"a dynamic skill offers no content integrity, so verification must fail");
 
 		// --- 3. a @skill skill: synthesized frontmatter ---------------------
 		auto md = readSkill(client, "git-workflow");
@@ -103,6 +131,9 @@ int main(string[] args) @safe
 			"the supporting references/CHECKLIST.md should be readable");
 
 		// --- 5. skills/get + host-side verification --------------------------
+		auto fetchedRaw = client.skillsGet("skill://team/release-helper/SKILL.md");
+		check(!fetchedRaw.cache.isNull,
+			"skills/get on a modern session should carry ttlMs/cacheScope");
 		auto fetched = getSkill(client, "skill://team/release-helper/SKILL.md");
 		checkEq(fetched.name, "release-helper", "skills/get should return the entry by uri");
 		auto relMd = readSkillUri(client, fetched.uri);
@@ -136,9 +167,10 @@ int main(string[] args) @safe
 			? "http" : "stdio",
 			" — skills extension advertised (directoryRead); skills/list carries",
 			" git-workflow/code-review/release-helper plus the nested hotfix-helper,",
-			" each with verbatim frontmatter and a per-file sha256 manifest; skills/get",
-			" fetches entries by uri and the fetched content verifies (digest +",
-			" frontmatter); resources/directory/read walks the tree.");
+			" each with verbatim frontmatter and a per-file sha256+size manifest, and",
+			" the dynamic reports/daily; skills/get fetches entries by uri and the",
+			" fetched content verifies (size + digest + frontmatter); both results",
+			" carry ttlMs/cacheScope; resources/directory/read walks the tree.");
 		return 0;
 	});
 }

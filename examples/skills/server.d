@@ -6,7 +6,7 @@
  * `SKILL.md` of instructions plus optional supporting files — served over the
  * existing Resources primitive.
  *
- * Two ways to declare a skill are shown:
+ * Three ways to declare a skill are shown:
  *
  *   - `@skill` — the method returns the `SKILL.md` body; the SDK synthesizes the
  *     frontmatter. Used for git-workflow and code-review (single-file skills).
@@ -16,6 +16,9 @@
  *     team/release-helper, served from `assets/release-helper/` — which also
  *     contains a NESTED skill (`hotfix-helper/SKILL.md`), published as its own
  *     flat entry alongside the enclosing skill's.
+ *   - `registerDynamicSkill` — the `SKILL.md` body is generated on every read,
+ *     so the entry carries `resources: "dynamic"` instead of a digest manifest.
+ *     Used for reports/daily.
  *
  * Transport selection is delegated to `runServerFromArgs`:
  *   stdio (default):  ./skills-server
@@ -75,5 +78,21 @@ void main(string[] args) @safe
 	// resources/directory/read.
 	registerHandlers(server, new SkillsApi);
 
+	// A fifth, dynamic skill: its body is rendered per read from live state, so
+	// no stable digest can be published and the entry says `"resources": "dynamic"`.
+	DynamicSkill daily = {
+		path: "reports/daily", description: "Assemble today's operational report from live data",
+		instructions: () @safe => "# Daily report\n\nGenerated at " ~ nowIso() ~ ".\n"
+	};
+	registerDynamicSkill(server, daily);
+
 	runServerFromArgs(server, args, defaultPort);
+}
+
+/// The current UTC time as ISO-8601, the "live data" the dynamic skill embeds.
+private string nowIso() @safe
+{
+	import std.datetime.systime : Clock;
+
+	return Clock.currTime.toUTC.toISOExtString;
 }

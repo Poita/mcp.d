@@ -451,7 +451,7 @@ Streamable HTTP.
 | Auth | OAuth 2.1 protected HTTP resource server (HTTP only) | [server](examples/auth/server.d) | [client](examples/auth/client.d) |
 | Apps | MCP Apps extension: `@ui` tool link + a `ui://` HTML resource | [server](examples/apps/server.d) | [client](examples/apps/client.d) |
 | Tasks | MCP Tasks extension (SEP-2663): `@task` async tasks with progress, cancellation, and `input_required` | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
-| Skills | MCP Skills extension (SEP-2640): `@skill` Agent Skills served as resources, `skills/list` / `skills/get` discovery | [server](examples/skills/server.d) | [client](examples/skills/client.d) |
+| Skills | MCP Skills extension: `@skill` / `@skillDir` / dynamic Agent Skills served as resources, `skills/list` / `skills/get` discovery with digest + size manifests | [server](examples/skills/server.d) | [client](examples/skills/client.d) |
 | Events | MCP Events extension: `@event` types delivered over poll, push, **and** server-signed webhook (to a client `WebhookReceiver`) | [server](examples/events/server.d) | [client](examples/events/client.d) |
 
 Annotate plain typed D functions with `@tool` / `@resource` / `@prompt` and register
@@ -728,10 +728,11 @@ callbacks.
 > design-sketch proposal ([experimental-ext-triggers-events](https://github.com/modelcontextprotocol/experimental-ext-triggers-events));
 > the wire surface may change as it moves through WG review.
 
-## Skills (SEP-2640)
+## Skills
 
-The [MCP Skills extension](https://modelcontextprotocol.io/community/skills-over-mcp/charter)
-(`io.modelcontextprotocol/skills`, [SEP-2640](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640))
+The official [MCP Skills extension](https://github.com/modelcontextprotocol/ext-skills/blob/main/specification/stable/skills.mdx)
+(`io.modelcontextprotocol/skills`, originally
+[SEP-2640](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640))
 serves [Agent Skills](https://agentskills.io) — a `SKILL.md` of instructions plus
 optional supporting files — over MCP. Skill content rides on the existing
 Resources primitive, so any host that treats resources as a virtual filesystem
@@ -743,12 +744,14 @@ tools it describes and they version and travel together.
 
 Mark a no-argument method `@skill` and it returns the `SKILL.md` body; the SDK
 synthesizes the YAML frontmatter from the path/description, serves it at
-`skill://<path>/SKILL.md` as `text/markdown`, advertises the extension, and
-publishes a conformant entry — the SKILL.md `uri`, the verbatim `frontmatter`,
-and a complete `resources` manifest listing every file of the skill with the
-`sha256` digest of the bytes it serves — via `skills/list` and `skills/get`.
-The skill path's final segment is the skill name; a leading prefix
-(`acme/billing/refunds`) is an optional organizational namespace.
+`skill://<path>/SKILL.md` as `text/markdown`, advertises the extension (and,
+because skill files are served through `resources/read`, the `resources`
+capability), and publishes a conformant entry — the SKILL.md `uri`, the verbatim
+`frontmatter`, and a complete `resources` manifest listing every file of the
+skill with the `sha256` digest and byte `size` of the content it serves — via
+`skills/list` and `skills/get`. The skill path's final segment is the skill
+name; a leading prefix (`acme/billing/refunds`) is an optional organizational
+namespace.
 
 ```d
 final class Skills
@@ -777,9 +780,29 @@ registerSkill(server, pdf);   // skill://office/pdf-forms/SKILL.md + references/
 ```
 
 Every file — the `SKILL.md` itself included — appears in the entry's `resources`
-manifest as a `{uri, digest}` pair. The manifest is the unit a host verifies
-reads against and binds a user's approval to: a changed, added, or unlisted file
-is a verification failure, so content cannot rotate under a persisted approval.
+manifest as a `{uri, digest, size}` entry. The manifest is the unit a host
+verifies reads against and binds a user's approval to: a changed, added, or
+unlisted file is a verification failure, so content cannot rotate under a
+persisted approval. The extension fixes two per-skill limits that every
+conforming host accepts — `maxSkillResources` (512 entries, `SKILL.md`
+included) and `maxSkillTotalBytes` (16 MiB summed over `size`) — and
+registration rejects a skill over either, since no host is required to load it.
+
+A skill whose `SKILL.md` is generated on demand cannot publish stable digests.
+Register it as a `DynamicSkill` and its entry carries `resources: "dynamic"`
+instead of a manifest; the body delegate runs on every read beneath fixed,
+synthesized frontmatter. Such a skill offers hosts no content integrity and
+cannot be content-bound to an approval, so some hosts decline to load one —
+prefer a static `Skill` whenever the content can be fixed at registration:
+
+```d
+DynamicSkill daily = {
+    path: "reports/daily",
+    description: "Assemble today's operational report from live data",
+    instructions: () @safe => renderTodaysReport(),
+};
+registerDynamicSkill(server, daily);   // skills/list: {..., "resources": "dynamic"}
+```
 
 ### Serving a skill from a local directory
 
@@ -816,21 +839,33 @@ exactly its subtree — validated by the same rules as a top-level skill.
 On the client, `listSkills(client)` calls `skills/list` (paginating to
 completion) and returns the typed entries; `getSkill(client, uri)` calls
 `skills/get` to fetch one skill's entry by its `SKILL.md` URI — including skills
-absent from the listing, which MAY be empty or partial. `readSkill(client,
-"git-workflow")` / `readSkillUri(client, uri)` read a `SKILL.md` via plain
-`resources/read`, and `verifyResourceDigest` / `verifySkillMarkdown` implement
-the host-side integrity checks the SEP requires (digest match, unlisted-file
-rejection, field-by-field frontmatter comparison). Note that no URI scheme marks
-a resource as a skill — a resource is known to be a skill only through a
+absent from the listing, which MAY be empty or partial. A `SkillEntry` exposes
+its `resources` manifest, `isDynamic` for a `"dynamic"` entry, and `isValid`
+(an entry with neither shape is malformed and must not be loaded).
+`readSkill(client, "git-workflow")` / `readSkillUri(client, uri)` read a
+`SKILL.md` via plain `resources/read`, and `verifyResourceDigest` /
+`verifySkillMarkdown` implement the host-side integrity checks the extension
+requires (byte-length and digest match, unlisted-file rejection, field-by-field
+frontmatter comparison); `checkSkillLimits` decides from the entry alone whether
+a skill exceeds the fixed per-skill limits. Note that no URI scheme marks a
+resource as a skill — a resource is known to be a skill only through a
 `skills/list` entry or a `skills/get` answer. When a skill's instructions point
 at a directory ("pick a template from `templates/`"), `readDirectory(client,
 uri)` scope-lists that directory's direct children via
 `resources/directory/read` (files plus `inode/directory` subdirectories) —
 enabled automatically by `enableSkills`, which advertises `directoryRead: true`.
-The extension is advertised from 2025-11-25 onward (its entry in the
-`extensions` negotiation map carries that version floor), so it appears for
-clients on the latest stable version or the draft; the resource reads themselves
-work on any version. See [`examples/skills`](examples/skills/) for the full e2e.
+
+The stable specification is written against protocol revision 2026-07-28, where
+`ListSkillsResult` and `GetSkillResult` extend `CacheableResult`: on a modern
+session both carry the required `ttlMs`/`cacheScope` (configure them with
+`setListCacheHint("skills/list", …)` / `setListCacheHint("skills/get", …)`; the
+default is `ttlMs: 0`), and every result carries `resultType: "complete"`. They
+are a freshness hint, not an integrity property — the manifest governs what a
+host may read regardless. The extension is also advertised on 2025-11-25 (its
+entry in the `extensions` negotiation map carries that floor), where the base
+protocol has no `CacheableResult` and the results carry neither field; the
+resource reads themselves work on any version. See
+[`examples/skills`](examples/skills/) for the full e2e.
 
 ## Concurrency model
 
