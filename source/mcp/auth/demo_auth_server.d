@@ -216,7 +216,19 @@ final class DemoAuthServer
 		auto capped = requestedRedirectUris.dup;
 		if (capped.length > maxRedirectUrisPerRegistration)
 			capped = capped[0 .. maxRedirectUrisPerRegistration];
-		registry_.register(clientId, capped);
+		// RFC 8252 §7.3: a loopback redirect URI matches on ANY port (native
+		// clients bind an ephemeral port at authorization time), so alongside
+		// each exact URI record its port-stripped loopback form; validation
+		// falls back to it. The registration response echoes only the exact
+		// URIs the client asked for.
+		auto recorded = capped.dup;
+		foreach (u; capped)
+		{
+			const pl = loopbackPortless(u);
+			if (pl !is null && pl != u)
+				recorded ~= pl;
+		}
+		registry_.register(clientId, recorded);
 
 		Json j = Json.emptyObject;
 		j["client_id"] = clientId;
@@ -238,7 +250,7 @@ final class DemoAuthServer
 			return "response_type must be code";
 		if (redirectUri.length == 0)
 			return "redirect_uri is required";
-		if (!registry_.isRegistered(redirectUri))
+		if (!redirectUriAllowed(redirectUri))
 			return "redirect_uri is not registered (register the client first)";
 		if (codeChallenge.length == 0)
 			return "code_challenge is required";
@@ -294,6 +306,17 @@ final class DemoAuthServer
 		return TokenOutcome(200, mintTokens(rg.clientId, rg.subject, rg.scope_));
 	}
 
+	// Whether a presented redirect_uri is acceptable: an exact-registered URI,
+	// or (RFC 8252 §7.3) a loopback URI whose port-stripped form was recorded
+	// at registration — the port is the only part the waiver relaxes.
+	private bool redirectUriAllowed(string redirectUri)
+	{
+		if (registry_.isRegistered(redirectUri))
+			return true;
+		const pl = loopbackPortless(redirectUri);
+		return pl !is null && registry_.isRegistered(pl);
+	}
+
 	// Mint the access + refresh pair for a grant and build the RFC 6749 §5.1
 	// token response.
 	private Json mintTokens(string clientId, string subject, string scope_)
@@ -322,6 +345,40 @@ final class DemoAuthServer
 		j["scope"] = grantedScope;
 		return j;
 	}
+}
+
+/// The port-stripped canonical form of an http loopback redirect URI
+/// (`http://127.0.0.1`, `http://localhost`, `http://[::1]`), or null when the
+/// URI is not a loopback http URI. Only the port is normalized away — scheme,
+/// host form, and path must still match exactly (RFC 8252 §7.3).
+private string loopbackPortless(string uri)
+{
+	import std.string : indexOf;
+
+	enum prefix = "http://";
+	if (!uri.startsWith(prefix))
+		return null;
+	auto rest = uri[prefix.length .. $];
+	const slash = rest.indexOf('/');
+	auto authority = slash >= 0 ? rest[0 .. slash] : rest;
+	const path = slash >= 0 ? rest[slash .. $] : "";
+
+	string host;
+	if (authority.startsWith("["))
+	{
+		const close = authority.indexOf(']');
+		if (close < 0)
+			return null;
+		host = authority[0 .. close + 1];
+	}
+	else
+	{
+		const colon = authority.indexOf(':');
+		host = colon >= 0 ? authority[0 .. colon] : authority;
+	}
+	if (host != "127.0.0.1" && host != "localhost" && host != "[::1]")
+		return null;
+	return prefix ~ host ~ path;
 }
 
 /// The S256 PKCE challenge for a verifier: `base64url(sha256(verifier))`,
@@ -469,6 +526,37 @@ unittest  // validateAuthorize: unregistered redirect_uri is refused
 {
 	auto as = testServer();
 	assert(as.validateAuthorize("http://evil.example.com/cb", "code", "chal", "S256") !is null);
+}
+
+unittest  // RFC 8252 §7.3: loopback redirect URIs match on ANY port
+{
+	// A native client registers a fixed loopback redirect at DCR time but binds
+	// an ephemeral port at authorization time; the AS MUST match loopback
+	// redirect URIs ignoring the port.
+	auto as = testServer();
+	registeredClient(as, "http://localhost:8765/callback");
+	assert(as.validateAuthorize("http://localhost:65236/callback", "code", "chal", "S256") is null);
+	assert(as.validateAuthorize("http://localhost/callback", "code", "chal", "S256") is null);
+
+	registeredClient(as, "http://127.0.0.1:5000/cb");
+	assert(as.validateAuthorize("http://127.0.0.1:60000/cb", "code", "chal", "S256") is null);
+
+	registeredClient(as, "http://[::1]:5000/cb");
+	assert(as.validateAuthorize("http://[::1]:60001/cb", "code", "chal", "S256") is null);
+}
+
+unittest  // the loopback port waiver changes ONLY the port
+{
+	auto as = testServer();
+	registeredClient(as, "http://localhost:8765/callback");
+	// Different path: refused.
+	assert(as.validateAuthorize("http://localhost:8765/other", "code", "chal", "S256") !is null);
+	// Different loopback host form than registered: refused (exact host match).
+	assert(as.validateAuthorize("http://127.0.0.1:8765/callback", "code", "chal", "S256") !is null);
+
+	// Non-loopback hosts stay exact-match, port included.
+	registeredClient(as, "https://app.example.com:8443/cb");
+	assert(as.validateAuthorize("https://app.example.com:9443/cb", "code", "chal", "S256") !is null);
 }
 
 unittest  // validateAuthorize: missing code_challenge / wrong method are refused
