@@ -48,12 +48,19 @@ enum string AuthorizationServerMetadataPath = "/.well-known/oauth-authorization-
 /// principal the token will carry, and Approve/Deny submit to `consentPath`
 /// with the opaque pending `state` in hidden+POST form (never a URL, so it
 /// cannot leak via Referer/history and cannot be fired by link prefetch).
+///
+/// The subject defaults to a RANDOM per-browser id persisted in localStorage
+/// (edits are saved back), mirroring the official example server's mock IdP:
+/// the same browser keeps its principal across re-authorizations, different
+/// browsers/devices get distinct principals, and nobody collides on a shared
+/// default name. With scripting unavailable the field submits empty and the
+/// consent handler mints a random subject server-side.
 string demoApproveScreenHtml(string clientRedirectUri, string consentPath, string state)
 {
 	const safeUri = htmlEscape(clientRedirectUri);
 	const safeAction = htmlEscape(consentPath);
 	const safeState = htmlEscape(state);
-	return "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" ~ "<meta name=\"referrer\" content=\"no-referrer\">" ~ "<title>Demo authorization</title></head><body>" ~ "<h1>Demo authorization</h1>" ~ "<p>This is a DEMO authorization server: it verifies no identity." ~ " Pick the name this session will act as.</p>" ~ "<p>Redirect URI: <code>" ~ safeUri ~ "</code></p>" ~ "<form method=\"post\" action=\"" ~ safeAction ~ "\">" ~ "<input type=\"hidden\" name=\"state\" value=\"" ~ safeState ~ "\">" ~ "<label>Your name: <input type=\"text\" name=\"subject\" value=\"demo-user\"></label> " ~ "<button type=\"submit\" name=\"action\" value=\"approve\">Approve</button> " ~ "<button type=\"submit\" name=\"action\" value=\"deny\">Deny</button>" ~ "</form></body></html>";
+	return "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" ~ "<meta name=\"referrer\" content=\"no-referrer\">" ~ "<title>Demo authorization</title></head><body>" ~ "<h1>Demo authorization</h1>" ~ "<p>This is a DEMO authorization server: it verifies no identity." ~ " The name below is this browser's identity — edit it to act as someone else." ~ " Different browsers (or incognito windows) get their own identity.</p>" ~ "<p>Redirect URI: <code>" ~ safeUri ~ "</code></p>" ~ "<form method=\"post\" action=\"" ~ safeAction ~ "\" " ~ "onsubmit=\"try{localStorage.setItem('mcpDemoSubject',document.getElementById('subject').value)}catch(e){}\">" ~ "<input type=\"hidden\" name=\"state\" value=\"" ~ safeState ~ "\">" ~ "<label>Your name: <input type=\"text\" name=\"subject\" id=\"subject\" value=\"\"></label> " ~ "<button type=\"submit\" name=\"action\" value=\"approve\">Approve</button> " ~ "<button type=\"submit\" name=\"action\" value=\"deny\">Deny</button>" ~ "</form>" ~ "<script>(function(){var el=document.getElementById('subject');" ~ "var id='';try{id=localStorage.getItem('mcpDemoSubject')||''}catch(e){}" ~ "if(!id){id='user-'+Math.random().toString(36).slice(2,8);" ~ "try{localStorage.setItem('mcpDemoSubject',id)}catch(e){}}" ~ "el.value=id;})();</script>" ~ "</body></html>";
 }
 
 /// Append OAuth response parameters to a client redirect URI, respecting any
@@ -161,7 +168,10 @@ in (as !is null)
 			return;
 		}
 
-		const subject = sanitizeSubject(req.form.get("subject", ""));
+		// An empty or unusable subject (no-script client, or the field
+		// cleared) gets a random one rather than a shared default, so distinct
+		// callers never silently collapse into one principal.
+		const subject = sanitizeSubject(req.form.get("subject", ""), randomSubject());
 		const code = as.issueCode(st.clientId, st.clientRedirectUri,
 			st.codeChallenge, st.scope_, subject);
 		string[2][] params = [["code", code]];
@@ -217,6 +227,16 @@ private string pathOf(string url)
 		s = slash >= 0 ? s[slash .. $] : "/";
 	}
 	return s.startsWith("/") ? s : "/" ~ s;
+}
+
+/// Mint a random subject for a consent POST that carried no usable name, so
+/// no two anonymous approvals share a principal.
+private string randomSubject()
+{
+	import mcp.auth.csprng : cryptoRandomBytes;
+	import mcp.auth.oauth : base64UrlNoPad;
+
+	return "user-" ~ base64UrlNoPad(cryptoRandomBytes(4));
 }
 
 /// Mint the unguessable single-use pending-authorization key (CSPRNG; it is
@@ -456,6 +476,42 @@ unittest  // the pending state is single-use: a replayed consent POST is refused
 	assert(status == 400);
 }
 
+unittest  // an empty subject gets a RANDOM principal, not a shared default
+{
+	import mcp.auth.demo_auth_server : s256ChallengeOf;
+
+	auto t = mountedTestAs();
+	int status;
+	string location;
+	routerPost(t.router, "https://demo.example.com/register",
+			`{"redirect_uris":["http://localhost:5000/cb"]}`, "application/json", status, location);
+
+	// Run the approve->token flow twice with no subject; the two minted tokens
+	// must carry distinct random subjects (no cross-caller collapse).
+	string subjectOf(string verifier) @safe
+	{
+		int st;
+		string loc;
+		const html = routerGet(t.router,
+				"https://demo.example.com/authorize?code_challenge=" ~ s256ChallengeOf(
+					verifier) ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb", st);
+		routerPost(t.router, "https://demo.example.com/consent",
+				"state=" ~ pendingStateOf(html) ~ "&action=approve",
+				"application/x-www-form-urlencoded", st, loc);
+		const tokenBody = routerPost(t.router, "https://demo.example.com/token",
+				"grant_type=authorization_code&code=" ~ queryParam(loc,
+					"code") ~ "&code_verifier="
+				~ verifier ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb",
+				"application/x-www-form-urlencoded", st, loc);
+		return t.as.validator()(parseJsonString(tokenBody)["access_token"].get!string).subject;
+	}
+
+	const a = subjectOf("anon-verifier-anon-verifier-anon-verifier-1");
+	const b = subjectOf("anon-verifier-anon-verifier-anon-verifier-2");
+	assert(a.startsWith("user-") && b.startsWith("user-"));
+	assert(a != b);
+}
+
 unittest  // an unsupported grant_type is refused per RFC 6749 §5.2
 {
 	auto t = mountedTestAs();
@@ -476,7 +532,11 @@ unittest  // appendQueryParams respects an existing query string
 
 unittest  // the approve screen HTML-escapes attacker-controlled values
 {
+	// The page carries its own legitimate inline script (the localStorage
+	// subject default), so assert the INJECTED sequences stay escaped rather
+	// than banning script tags wholesale.
 	const html = demoApproveScreenHtml(`http://x/cb?"><script>`, "/consent", `"><b>`);
-	assert(!html.canFind("<script>"));
+	assert(!html.canFind(`"><script>`));
+	assert(html.canFind("&quot;&gt;&lt;script&gt;"));
 	assert(!html.canFind(`value=""><b>`));
 }

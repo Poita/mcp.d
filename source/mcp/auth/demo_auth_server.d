@@ -335,8 +335,8 @@ string s256ChallengeOf(string verifier)
 
 /// Normalize the subject a user typed on the approve screen into a stable
 /// principal name: trimmed, `[A-Za-z0-9._-]` only (others become `-`), capped
-/// at 64 chars, falling back to "demo-user" when nothing usable remains.
-string sanitizeSubject(string raw)
+/// at 64 chars, falling back to `fallback` when nothing usable remains.
+string sanitizeSubject(string raw, string fallback = "demo-user")
 {
 	import std.ascii : isAlphaNum;
 
@@ -352,7 +352,7 @@ string sanitizeSubject(string raw)
 	foreach (ch; s)
 		if (ch != '-')
 			meaningful = true;
-	return meaningful ? s : "demo-user";
+	return meaningful ? s : fallback;
 }
 
 /// An RFC 6749 §5.2 token-endpoint error outcome.
@@ -600,4 +600,11 @@ unittest  // sanitizeSubject: trims, filters, caps, and falls back
 	assert(sanitizeSubject("") == "demo-user");
 	assert(sanitizeSubject("///") == "demo-user");
 	assert(sanitizeSubject("p.eter_1-x") == "p.eter_1-x");
+}
+
+unittest  // sanitizeSubject: a caller-supplied fallback replaces the default
+{
+	assert(sanitizeSubject("", "user-abc123") == "user-abc123");
+	assert(sanitizeSubject("///", "user-abc123") == "user-abc123");
+	assert(sanitizeSubject("alice", "user-abc123") == "alice");
 }
