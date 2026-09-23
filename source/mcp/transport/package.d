@@ -20,6 +20,7 @@ public import mcp.transport.streamable_http;
 public import mcp.transport.session;
 public import mcp.transport.sse_context;
 public import mcp.transport.oauth_proxy_mount;
+public import mcp.transport.demo_auth_mount;
 
 // The modern transport plumbing (header encoding, param-header extraction,
 // request-state parsing, `_meta` key validation, MRTR shapes) lives in
