@@ -13,6 +13,8 @@ import vibe.data.json : Json;
 
 import mcp.protocol.events;
 import mcp.protocol.jsonhelpers : getOr;
+import mcp.protocol.schema : makeValidator, validationError;
+import jsonschema : Validator;
 import mcp.protocol.errors : McpException, notFound, unsupported, invalidParams,
 	forbidden, resourceExhausted, internalError, toErrorJson;
 import mcp.server.event_context : EventContext, EventResult, Event, EventBatch,
@@ -60,6 +62,7 @@ struct EventRegistration
 	bool emitOnly; /// true => no check function; poll reads the ring buffer
 	Nullable!Duration pollInterval; /// suggested client poll cadence
 	DeliveryMode[] disabledModes; /// modes the author opted out of
+	Validator inputValidator; /// compiled from `descriptor.inputSchema` by `register`; null = unconstrained
 }
 
 /// A strongly-typed handle to an event type defined via `EventsRuntime.define`.
@@ -282,8 +285,15 @@ final class EventHandle(A, P)
 			static foreach (f; FieldNameTuple!A)
 				() @trusted {
 					if (auto p = f in j)
-						__traits(getMember, result, f) = deserializeWithPolicy!(JsonSerializer,
-								EnumByNamePolicy, typeof(__traits(getMember, result, f)))(*p);
+						{
+						try
+							__traits(getMember, result, f) = deserializeWithPolicy!(JsonSerializer,
+									EnumByNamePolicy, typeof(__traits(getMember, result, f)))(*p);
+						catch (McpException e)
+							throw e;
+						catch (Exception e)
+							throw invalidParams("argument '" ~ f ~ "': " ~ e.msg);
+					}
 				}();
 		return result;
 	}
@@ -628,9 +638,31 @@ final class EventsRuntime
 				|| existing.emitOnly != reg.emitOnly || canonicalJsonString(
 						existing.descriptor.meta) != canonicalJsonString(reg.descriptor.meta);
 		}
+		reg.inputValidator = compileInputValidator(reg.descriptor.inputSchema);
 		types_[name] = reg;
 		if (descriptorChanged)
 			notifyListChanged();
+	}
+
+	// Compile an event type's `inputSchema` once at registration. A malformed
+	// schema throws here, where the author registered it, rather than silently
+	// under-validating every request.
+	private static Validator compileInputValidator(Json schema) @safe
+	{
+		return makeValidator(schema);
+	}
+
+	/// Reject `arguments` that do not conform to the type's `inputSchema` with
+	/// `-32602 InvalidParams`, the sketch's code for a statically invalid request.
+	/// A type with no input schema accepts any arguments.
+	private static void validateArguments(ref EventRegistration reg, Json arguments) @safe
+	{
+		if (reg.inputValidator is null)
+			return;
+		const value = arguments.type == Json.Type.object ? arguments : Json.emptyObject;
+		const msg = validationError(reg.inputValidator, value);
+		if (msg.length)
+			throw invalidParams("arguments do not match inputSchema: " ~ msg);
 	}
 
 	/// Remove an event type: every subscription to it ends with `-32011 NotFound
@@ -677,7 +709,12 @@ final class EventsRuntime
 		reg.descriptor.name = name;
 		reg.descriptor.description = description;
 		reg.descriptor.title = title;
+		// Subscription arguments are filters: an absent field means "no filter" and
+		// deserializes to the field's default, so the advertised schema declares
+		// every field optional rather than the generator's non-Nullable => required.
 		reg.descriptor.inputSchema = jsonSchemaOf!A;
+		if (reg.descriptor.inputSchema.type == Json.Type.object)
+			reg.descriptor.inputSchema.remove("required");
 		reg.descriptor.payloadSchema = jsonSchemaOf!P;
 		reg.emitOnly = true;
 		register(reg);
@@ -767,6 +804,7 @@ final class EventsRuntime
 		auto p = name in types_;
 		if (p is null)
 			throw notFound("Unknown event type: " ~ name, "event");
+		validateArguments(*p, arguments);
 
 		touchPollLease(*p, name, arguments, principal);
 
@@ -865,6 +903,7 @@ final class EventsRuntime
 		if (!pushOffered)
 			throw unsupported("Event type does not offer push delivery: " ~ name,
 					"deliveryMode", "push");
+		validateArguments(*p, arguments);
 
 		auto s = new PushStream();
 		s.name = name;
@@ -1020,6 +1059,7 @@ final class EventsRuntime
 		if (!offersWebhook(p.name))
 			throw unsupported("Event type does not offer webhook delivery: " ~ p.name,
 					"deliveryMode", "webhook");
+		validateArguments(*reg, p.arguments);
 		validateCallbackUrl(p.delivery.url);
 		validateWhsecSecret(p.delivery.secret);
 
@@ -2448,6 +2488,95 @@ unittest  // poll on an unknown event type throws NotFound
 	auto rt = testRuntime();
 	assertThrown!McpException(rt.poll("nope", Json.emptyObject, "",
 			Nullable!string.init, Nullable!long.init, Nullable!long.init));
+}
+
+unittest  // a typed event's derived inputSchema declares every argument optional
+{
+	static struct Args
+	{
+		string severity;
+		Nullable!int limit;
+	}
+
+	static struct Payload
+	{
+		string id;
+	}
+
+	auto rt = testRuntime();
+	rt.define!(Args, Payload)("incident.created");
+	auto schema = rt.list().events[0].inputSchema;
+	assert("required" !in schema);
+	assert("severity" in schema["properties"]);
+	// empty arguments (no filter) are accepted
+	rt.poll("incident.created", Json.emptyObject, "", Nullable!string.init,
+			Nullable!long.init, Nullable!long.init);
+}
+
+unittest  // arguments that violate the typed inputSchema are rejected with -32602 InvalidParams
+{
+	import mcp.protocol.errors : ErrorCode;
+
+	static struct Args
+	{
+		string severity;
+	}
+
+	static struct Payload
+	{
+		string id;
+	}
+
+	auto rt = testRuntime();
+	rt.define!(Args, Payload)("incident.created").onFetch((Args a,
+			scope FetchContext ctx) @safe => EventBatch!Payload.empty("c0"));
+	int code;
+	try
+		rt.poll("incident.created", Json(["severity": Json(123)]), "",
+				Nullable!string.init, Nullable!long.init, Nullable!long.init);
+	catch (McpException e)
+		code = e.code;
+	assert(code == ErrorCode.invalidParams);
+}
+
+unittest  // a raw registration's inputSchema is enforced on poll, stream, and subscribe
+{
+	import mcp.protocol.errors : ErrorCode;
+
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.descriptor.inputSchema = parseJsonString(`{"type":"object","properties":{"severity":{"type":"string","enum":["P1","P2"]}},"required":["severity"]}`);
+	rt.register(reg);
+	auto bad = Json(["severity": Json("P9")]);
+	auto missing = Json.emptyObject;
+
+	int codeOf(void delegate() @safe f) @safe
+	{
+		try
+			f();
+		catch (McpException e)
+			return e.code;
+		return 0;
+	}
+
+	assert(codeOf(() @safe {
+			rt.poll("n", bad, "", Nullable!string.init, Nullable!long.init, Nullable!long.init);
+		}) == ErrorCode.invalidParams);
+	assert(codeOf(() @safe {
+			rt.poll("n", missing, "", Nullable!string.init,
+			Nullable!long.init, Nullable!long.init);
+		}) == ErrorCode.invalidParams);
+	assert(codeOf(() @safe {
+			rt.openPushStream("n", bad, "", Json(1), (string m, Json p) @safe {});
+		}) == ErrorCode.invalidParams);
+	assert(codeOf(() @safe {
+			rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks", bad), "u");
+		}) == ErrorCode.invalidParams);
+	// conforming arguments still work
+	assert(codeOf(() @safe {
+			rt.poll("n", Json(["severity": Json("P1")]), "",
+			Nullable!string.init, Nullable!long.init, Nullable!long.init);
+		}) == 0);
 }
 
 unittest  // poll carries nextPollMs even when hasMore requests an immediate re-poll
