@@ -6322,6 +6322,26 @@ unittest  // a cancelled stdio events/stream stops receiving events
 	assert(lines.length == before); // no further delivery after cancellation
 }
 
+unittest  // events/poll answers -32602 InvalidParams on the wire when arguments violate inputSchema
+{
+	import std.algorithm : canFind;
+	import vibe.data.json : parseJsonString;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.descriptor.inputSchema = parseJsonString(
+			`{"type":"object","properties":{"severity":{"type":"string"}}}`);
+	s.registerEventType(reg);
+	Json params = Json.emptyObject;
+	params["name"] = "n";
+	params["arguments"] = Json(["severity": Json(123)]);
+	auto resp = s.handle(modernReq(1, "events/poll", params)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams, resp.toString());
+	assert(resp["error"]["message"].get!string.canFind("inputSchema"));
+}
+
 unittest  // a server-terminated stdio stream gets the terminated frame, then the final result, and stops ticking
 {
 	import std.algorithm : count, canFind;

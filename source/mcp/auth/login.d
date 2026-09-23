@@ -836,41 +836,23 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 				store, oauth.resource, cached);
 	}
 
-	// Select / obtain a client registration.
-	RegisteredClient rc;
-	const havePre = opts.clientId.length > 0;
-	const approach = oauth.registrationApproach(as_, havePre);
-	final switch (approach)
-	{
-	case ClientRegistrationApproach.preRegistered:
-		rc = RegisteredClient(opts.clientId, opts.clientSecret);
-		break;
-	case ClientRegistrationApproach.clientIdMetadataDocument:
-		rc = oauth.clientIdMetadataClient(as_);
-		break;
-	case ClientRegistrationApproach.dynamicClientRegistration:
-		rc = oauth.register(as_, opts.clientName, opts.scopeString());
-		break;
-	case ClientRegistrationApproach.promptUser:
-		throw internalError(
-				"Authorization server requires manual client registration; supply OAuthLogin.clientId");
-	}
-
-	// If we have a cached refresh token (but no usable access token), try the
-	// refresh grant before falling back to the full browser flow.
-	if (cached.refreshToken.length)
+	// A refresh token is bound to the client that obtained it (RFC 6749 §6), so
+	// try it under that client id — persisted from the first login, or the
+	// pre-registered one — before registering anything new.
+	auto prior = cacheHitClient(cached, opts);
+	if (cached.refreshToken.length && prior.clientId.length)
 	{
 		try
 		{
-			auto ts = oauth.refresh(as_, rc, cached.refreshToken);
+			auto ts = oauth.refresh(as_, prior, cached.refreshToken);
 			if (ts.accessToken.length)
 			{
 				auto refreshed = StoredToken.fromTokenSet(ts, oauth.resource,
 						now, cached.refreshToken);
-				refreshed.clientId = rc.clientId;
+				refreshed.clientId = prior.clientId;
 				store.save(oauth.resource, refreshed);
 				client.setBearerToken(refreshed.accessToken);
-				return new OAuthSession(oauth, as_, rc, store, oauth.resource, refreshed);
+				return new OAuthSession(oauth, as_, prior, store, oauth.resource, refreshed);
 			}
 		}
 		catch (Exception)
@@ -879,10 +861,29 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 		}
 	}
 
-	// Run the interactive authorization-code + PKCE flow on a loopback listener.
+	// Select / obtain a client registration. Runs once the loopback listener
+	// is bound, so a dynamic registration names the real redirect URI.
+	RegisteredClient resolveClient(string redirectUri) @safe
+	{
+		const havePre = opts.clientId.length > 0;
+		final switch (oauth.registrationApproach(as_, havePre))
+		{
+		case ClientRegistrationApproach.preRegistered:
+			return RegisteredClient(opts.clientId, opts.clientSecret);
+		case ClientRegistrationApproach.clientIdMetadataDocument:
+			return oauth.clientIdMetadataClient(as_);
+		case ClientRegistrationApproach.dynamicClientRegistration:
+			return oauth.register(as_, opts.clientName, opts.scopeString());
+		case ClientRegistrationApproach.promptUser:
+			throw internalError(
+					"Authorization server requires manual client registration; supply OAuthLogin.clientId");
+		}
+	}
+
 	auto pkce = generatePkce();
 	const state = generateLoginState();
-	const captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, state);
+	RegisteredClient rc;
+	const captured = runBrowserLoopbackFlow(oauth, as_, &resolveClient, rc, pkce, opts, state);
 	if (!captured.ok)
 		throw internalError("OAuth loopback capture failed: " ~ (captured.error.length
 				? captured.error : "no authorization code received"));
@@ -940,9 +941,31 @@ private bool isLoopbackCallbackPath(string reqPath, string callbackPath) @safe p
 private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationServerMetadata as_,
 		RegisteredClient rc, PkcePair pkce, OAuthLogin opts, string state) @safe
 {
+	RegisteredClient used;
+	return runBrowserLoopbackFlow(oauth, as_, (string redirectUri) @safe => rc,
+			used, pkce, opts, state);
+}
+
+/// As above, but the client registration is resolved by `resolveClient` only
+/// once the listener is bound and `oauth.redirectUri` names the actual loopback
+/// port, so a Dynamic Client Registration carries the redirect URI the
+/// authorization request will use. The resolved client is returned in `rc`.
+/// May run from inside a vibe task (the wait then yields to that task's loop)
+/// or from a plain thread context (the wait drives the event loop).
+private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth,
+		AuthorizationServerMetadata as_, RegisteredClient delegate(
+			string redirectUri) @safe resolveClient,
+		out RegisteredClient rc, PkcePair pkce, OAuthLogin opts, string state) @safe
+{
+	import core.time : msecs;
 	import vibe.http.server : HTTPServerSettings, HTTPServerRequest,
 		HTTPServerResponse, HTTPListener, listenHTTP;
-	import vibe.core.core : runEventLoop, exitEventLoop, setTimer, Timer;
+	import vibe.core.core : runEventLoop, exitEventLoop, setTimer, sleep, Timer;
+	import vibe.core.task : Task;
+
+	// Inside a task, a nested runEventLoop() is not allowed; the wait below
+	// yields instead, and the handlers must not tear down the host's loop.
+	const inTask = Task.getThis() != Task.init;
 
 	// Bind the loopback listener. Port 0 lets the OS pick an ephemeral port,
 	// which we then read back to form the exact redirect URI.
@@ -983,7 +1006,8 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationS
 		}
 		res.contentType = "text/html; charset=utf-8";
 		res.writeBody(loopbackResponseHtml(cap.ok));
-		() @trusted { exitEventLoop(); }();
+		if (!inTask)
+			() @trusted { exitEventLoop(); }();
 	}
 
 	HTTPListener listener;
@@ -996,6 +1020,7 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationS
 		() @trusted { listener.stopListening(); }();
 
 	oauth.redirectUri = loopbackRedirectUri(boundPort, opts.callbackPath);
+	rc = resolveClient(oauth.redirectUri);
 	const authzUrl = oauth.authorizationUrl(as_, rc, pkce, opts.scopeString(), state);
 
 	void delegate(string) @safe opener = opts.openBrowser;
@@ -1013,13 +1038,20 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth, AuthorizationS
 				= "no authorization redirect arrived before the callback timeout";
 			done = true;
 		}
-		() @trusted { exitEventLoop(); }();
+		if (!inTask)
+			() @trusted { exitEventLoop(); }();
 	}
 
 	timeoutTimer = () @trusted {
 		return setTimer(opts.callbackTimeout, &onTimeout);
 	}();
-	() @trusted { runEventLoop(); }();
+	scope (exit)
+		() @trusted { timeoutTimer.stop(); }();
+	if (inTask)
+		while (!done)
+			sleep(10.msecs);
+	else
+		() @trusted { runEventLoop(); }();
 	return result;
 }
 
@@ -1891,4 +1923,211 @@ unittest  // openSystemBrowser reports success and passes the URL to the launche
 	});
 	assert(ok);
 	assert(seen.length && seen[$ - 1] == "https://example.com/x");
+}
+
+unittest  // useOAuth refreshes under the stored client_id before registering anything
+{
+	import core.time : seconds;
+	import std.algorithm : canFind;
+	import vibe.http.server : HTTPServerSettings, HTTPServerRequest,
+		HTTPServerResponse, HTTPListener, listenHTTP;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	// A loopback AS: PRM + metadata for discovery, a /register that must not be
+	// hit, and a /token that only honours the refresh token under the client
+	// that obtained it (refresh tokens are bound to their client, RFC 6749 §6).
+	int registerCalls;
+	HTTPListener listener;
+	string base;
+	auto settings = new HTTPServerSettings;
+	settings.bindAddresses = ["127.0.0.1"];
+	settings.port = 0;
+	listener = () @trusted {
+		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+			if (req.path.canFind("oauth-protected-resource"))
+				res.writeBody(
+					`{"resource":"` ~ base ~ `/mcp","authorization_servers":["` ~ base ~ `"]}`,
+					"application/json");
+			else if (req.path.canFind("authorization-server"))
+				res.writeBody(`{"issuer":"http://` ~ req.host ~ `","authorization_endpoint":"` ~ base
+					~ `/authorize","token_endpoint":"` ~ base ~ `/token","registration_endpoint":"`
+					~ base ~ `/register","code_challenge_methods_supported":["S256"]}`,
+					"application/json");
+			else if (req.path == "/register")
+			{
+				registerCalls++;
+				res.writeBody(
+					`{"client_id":"fresh-id","redirect_uris":["http://localhost:8765/callback"]}`,
+					"application/json");
+			}
+			else if (req.path == "/token")
+			{
+				if (req.form.get("grant_type", "") == "refresh_token"
+					&& req.form.get("refresh_token", "") == "rt"
+					&& req.form.get("client_id", "") == "abc123")
+					res.writeBody(`{"access_token":"new-access","token_type":"Bearer","expires_in":3600,"refresh_token":"rt2"}`,
+						"application/json");
+				else
+				{
+					res.statusCode = 400;
+					res.writeBody(`{"error":"invalid_grant"}`, "application/json");
+				}
+			}
+			else
+			{
+				res.statusCode = 404;
+				res.writeBody("", "text/plain");
+			}
+		});
+	}();
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
+	import std.conv : to;
+
+	base = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string;
+	const endpoint = base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt";
+	t.clientId = "abc123"; // registered on the first run and persisted
+	t.expiresAt = 1; // long expired
+	t.resource = resource;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.callbackTimeout = 1.seconds;
+	bool browserOpened;
+	opts.openBrowser = (string url) @safe { browserOpened = true; };
+
+	auto client = McpClient.http(endpoint);
+	auto sess = useOAuth(client, endpoint, opts);
+	assert(registerCalls == 0, "a stored refresh token must be tried before re-registering");
+	assert(!browserOpened);
+	assert(sess.token.accessToken == "new-access");
+	assert(store.load(resource).clientId == "abc123");
+	assert(store.load(resource).refreshToken == "rt2");
+}
+
+unittest  // the loopback flow completes when invoked from inside a vibe task
+{
+	import core.time : msecs, seconds;
+	import std.datetime.stopwatch : StopWatch, AutoStart;
+	import vibe.core.core : runTask, sleep;
+	import vibe.http.client : requestHTTP;
+
+	auto oauth = new OAuthClient();
+	oauth.resource = "https://mcp.example.com/mcp";
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "https://as.example.com/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto rc = RegisteredClient("cid", "");
+	auto pkce = generatePkce();
+
+	OAuthLogin opts;
+	opts.callbackTimeout = 5.seconds;
+	opts.openBrowser = (string url) @safe {
+		auto redirectUri = extractQueryParam(url, "redirect_uri");
+		import std.string : indexOf;
+
+		auto hostStart = redirectUri.indexOf("localhost:");
+		assert(hostStart >= 0);
+		auto rest = redirectUri[hostStart + "localhost:".length .. $];
+		auto slash = rest.indexOf('/');
+		auto baseUrl = "http://127.0.0.1:" ~ (slash >= 0 ? rest[0 .. slash] : rest);
+		() @trusted {
+			runTask(() nothrow{
+				try
+				{
+					sleep(50.msecs);
+					requestHTTP(baseUrl ~ "/callback?code=in-task-code&state=state-xyz", (scope req) {
+					}, (scope res) { res.dropBody(); });
+				}
+				catch (Exception)
+				{
+				}
+			});
+		}();
+	};
+
+	// Hosts such as a worker loop call the login from a task; the wait must
+	// yield to that loop rather than nest an event loop (which asserts).
+	bool finished;
+	LoopbackCapture captured;
+	() @trusted {
+		runTask(() nothrow{
+			try
+				captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, "state-xyz");
+			catch (Exception)
+			{
+			}
+			finished = true;
+		});
+	}();
+	auto sw = StopWatch(AutoStart.yes);
+	while (!finished && sw.peek < 8.seconds)
+		sleep(10.msecs);
+	assert(finished, "the in-task loopback flow never completed");
+	assert(captured.ok);
+	assert(captured.code == "in-task-code");
+}
+
+unittest  // the client is registered with the redirect URI the listener actually bound
+{
+	import core.time : msecs, seconds;
+	import vibe.core.core : runTask, sleep;
+	import vibe.http.client : requestHTTP;
+
+	auto oauth = new OAuthClient();
+	oauth.resource = "https://mcp.example.com/mcp";
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "https://as.example.com/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto pkce = generatePkce();
+
+	OAuthLogin opts;
+	opts.callbackTimeout = 5.seconds;
+	string registeredWith;
+	string openedWith;
+	bool registeredBeforeOpen;
+	opts.openBrowser = (string url) @safe {
+		openedWith = extractQueryParam(url, "redirect_uri");
+		registeredBeforeOpen = registeredWith.length > 0;
+		import std.string : indexOf;
+
+		auto hostStart = openedWith.indexOf("localhost:");
+		assert(hostStart >= 0);
+		auto rest = openedWith[hostStart + "localhost:".length .. $];
+		auto slash = rest.indexOf('/');
+		auto baseUrl = "http://127.0.0.1:" ~ (slash >= 0 ? rest[0 .. slash] : rest);
+		() @trusted {
+			runTask(() nothrow{
+				try
+				{
+					sleep(50.msecs);
+					requestHTTP(baseUrl ~ "/callback?code=c&state=state-xyz", (scope req) {
+					}, (scope res) { res.dropBody(); });
+				}
+				catch (Exception)
+				{
+				}
+			});
+		}();
+	};
+
+	RegisteredClient rc;
+	auto captured = runBrowserLoopbackFlow(oauth, as_, (string redirectUri) @safe {
+		registeredWith = redirectUri;
+		return RegisteredClient("registered-id", "");
+	}, rc, pkce, opts, "state-xyz");
+
+	assert(captured.ok);
+	assert(rc.clientId == "registered-id");
+	assert(registeredBeforeOpen, "registration must precede the browser hand-off");
+	assert(registeredWith == openedWith,
+			"registered redirect_uri must match the authorization request");
+	assert(registeredWith == oauth.redirectUri);
 }
