@@ -2802,12 +2802,9 @@ final class McpServer : ServerCore
 			// whose per-stream filter IS the client's resource-update opt-in, so on a
 			// modern (2026-07-28) server the listen filter alone drives delivery — the
 			// stateful-only `enableResourceSubscriptions()` (which throws on a
-			// stateless server) is neither required nor callable there. The stateless
-			// HTTP transport refuses subscriptions/listen BEFORE it reaches the server
-			// core (handlePost -> -32601), so this is only consulted on the stdio
-			// listen path (a single implicit connection where resource-update push is
-			// allowed in any mode — the requirement's stdio carve-out). On a stateful
-			// server the 2025-era `resources/subscribe` opt-in
+			// stateless server) is neither required nor callable there; this holds on
+			// both the stateless HTTP listen stream and the stdio listen path. On a
+			// stateful server the 2025-era `resources/subscribe` opt-in
 			// (`resourceSubscriptionsEnabled`) gates it, and the `subscribe`
 			// CAPABILITY advertisement is mode-gated in `capabilities()` /
 			// `effectiveResourceSubscriptions`.

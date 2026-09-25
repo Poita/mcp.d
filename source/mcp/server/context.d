@@ -53,11 +53,11 @@ final class CancellationToken
 /// token), the behaviour for stdio, in-process, and any transport that does not
 /// distinguish connections.
 ///
-/// The McpServer's other per-client state — the negotiated protocol version, the
-/// client capabilities, the logging level, and resource subscriptions — lives in
-/// shared instance fields, so the supported deployment for stateful HTTP is one
-/// McpServer per connection. This `ConnectionScoped` hook isolates the
-/// cancellation registry.
+/// The rest of the per-client state — the negotiated protocol version, the client
+/// capabilities, the logging level, and resource subscriptions — lives in the
+/// `ConnectionState` returned by `connectionState`, so one McpServer serves many
+/// isolated sessions (stateful HTTP: one state per `Mcp-Session-Id`; stateless
+/// HTTP: a fresh state per request).
 interface ConnectionScoped
 {
 	/// A stable, non-empty identifier for this request's connection / session.
