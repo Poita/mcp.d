@@ -558,22 +558,46 @@ private string pkeyToPem(EVP_PKEY* pkey) @trusted
 
 /// A TTL cache for a JWKS document, refetched on demand. Selects keys by `kid`;
 /// when a token's `kid` is unknown, every JWKS key is offered as a candidate.
+///
+/// The document is refetched when the TTL lapses and when a token names a `kid`
+/// the cache does not hold (the IdP may have rotated in a new key). Fetch
+/// attempts, successful or not, are spaced at least `minRefetchInterval` apart
+/// and single-flighted, so neither an unreachable IdP nor a stream of tokens
+/// with made-up `kid`s can turn every request into an outbound fetch.
 package final class JwksCache : KeySource
 {
+	import vibe.core.sync : TaskMutex;
+
+	/// Minimum spacing between JWKS fetch attempts. Also how long a failed fetch
+	/// is remembered before the next attempt.
+	enum Duration minRefetchInterval = 10.seconds;
+
 	private string uri;
 	private Duration ttl;
 	private string[string] pemByKid; // kid -> PEM
 	private string[] allPems;
 	private long fetchedAt = -1;
+	private long lastAttemptAt = -1;
 	private bool loaded = false;
+	private TaskMutex fetchLock;
+
+	/// Fetches the JWKS document at a URI, returning its body or null on
+	/// failure. Null selects the SSRF-guarded HTTP fetch; tests script it.
+	package string delegate(string uri) @safe fetcher;
+
+	/// The current Unix time in seconds. Null selects the wall clock; tests
+	/// drive it by hand.
+	package long delegate() @safe clock;
 
 	this(string uri, Duration ttl) @safe
 	{
 		this.uri = uri;
 		this.ttl = ttl;
+		this.fetchLock = new TaskMutex;
 	}
 
-	/// Candidate PEM keys for a `kid`. Triggers a (re)fetch when stale.
+	/// Candidate PEM keys for a `kid`. Triggers a (re)fetch when the cache is
+	/// stale or does not hold `kid`.
 	string[] keysFor(string kid) @safe
 	{
 		if (uri.length == 0)
@@ -582,8 +606,16 @@ package final class JwksCache : KeySource
 				return kidKeys(kid);
 			return null;
 		}
-		refreshIfStale();
+		const stale = !loaded || now() - fetchedAt >= cast(long) ttl.total!"seconds";
+		const unknownKid = kid.length && (kid in pemByKid) is null;
+		if (stale || unknownKid)
+			refetch();
 		return kidKeys(kid);
+	}
+
+	private long now() @safe
+	{
+		return clock !is null ? clock() : currentUnixTime();
 	}
 
 	private string[] kidKeys(string kid) @safe
@@ -595,12 +627,19 @@ package final class JwksCache : KeySource
 		return allPems.dup;
 	}
 
-	private void refreshIfStale() @safe
+	/// Fetch the document unless an attempt happened within
+	/// `minRefetchInterval`. Holding `fetchLock` for the fetch makes concurrent
+	/// callers wait for the one in flight and then find the attempt recent.
+	private void refetch() @safe
 	{
-		const now = currentUnixTime();
-		if (loaded && fetchedAt >= 0 && now - fetchedAt < cast(long) ttl.total!"seconds")
+		fetchLock.lock();
+		scope (exit)
+			fetchLock.unlock();
+		const t = now();
+		if (lastAttemptAt >= 0 && t - lastAttemptAt < minRefetchInterval.total!"seconds")
 			return;
-		const doc = fetchJwks(uri);
+		lastAttemptAt = t;
+		const doc = fetcher !is null ? fetcher(uri) : fetchJwks(uri);
 		if (doc.length)
 			load(doc);
 	}
@@ -628,9 +667,13 @@ package final class JwksCache : KeySource
 		pemByKid = newPemByKid;
 		allPems = newAllPems;
 		loaded = true;
-		fetchedAt = currentUnixTime();
+		fetchedAt = now();
 	}
 }
+
+/// Upper bound on a fetched JWKS document. A larger response is rejected rather
+/// than buffered.
+private enum size_t maxJwksBytes = 256 * 1024;
 
 /// Fetch a JWKS document over HTTP(S). Returns the body, or empty on failure.
 private string fetchJwks(string uri) @trusted
@@ -651,7 +694,7 @@ private string fetchJwks(string uri) @trusted
 			req.method = HTTPMethod.GET;
 		}, (scope HTTPClientResponse res) {
 			if (res.statusCode / 100 == 2)
-				body_ = res.bodyReader.readAllUTF8();
+				body_ = res.bodyReader.readAllUTF8(false, maxJwksBytes);
 		});
 	}
 	catch (Exception)
@@ -1403,16 +1446,18 @@ unittest  // fetchJwks discards non-2xx bodies so a 503 does not mark the cache 
 			const uri = "http://127.0.0.1:" ~ port.to!string ~ "/jwks";
 
 			// First fetch: server returns 503. The cache should NOT be marked fresh.
+			long clock = 1_000;
 			auto cache = new JwksCache(uri, 300.seconds);
+			cache.clock = () @safe => clock;
 			assert(cache.keysFor("rsa-1").length == 0);
 
 			// Switch server to serve a valid JWKS.
 			serveValid = true;
 
-			// Second fetch immediately (well within 300-second TTL). With the bug,
-			// the first 503 body was passed to load(), marking the cache as fresh
-			// with 0 keys, and this call returns 0. With the fix, the 503 did not
-			// mark the cache fresh, so this call re-fetches and returns 1 key.
+			// The next attempt, once the failed fetch's back-off has passed but well
+			// within the 300-second TTL, re-fetches: the 503 body was never loaded,
+			// so the cache was not marked fresh with zero keys.
+			clock += JwksCache.minRefetchInterval.total!"seconds";
 			assert(cache.keysFor("rsa-1").length == 1);
 
 			passed = true;
@@ -1427,6 +1472,47 @@ unittest  // fetchJwks discards non-2xx bodies so a 503 does not mark the cache 
 
 	assert(failure.length == 0, "fetchJwks HTTP status test failed: " ~ failure);
 	assert(passed);
+}
+
+unittest  // fetchJwks refuses a JWKS response larger than maxJwksBytes
+{
+	import std.array : replicate;
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.router : URLRouter;
+	import vibe.http.server : HTTPServerResponse, HTTPServerRequest,
+		HTTPServerSettings, listenHTTP;
+
+	// A valid document padded past the cap: it would load one key if read whole.
+	const oversized = `{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN
+		~ `","e":"` ~ testRsaE ~ `"}],"pad":"` ~ "x".replicate(maxJwksBytes) ~ `"}`;
+
+	string failure;
+	size_t keys = size_t.max;
+	runTask(() @safe nothrow{
+		try
+		{
+			auto router = new URLRouter;
+			router.get("/jwks", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+				res.writeBody(oversized, "application/json");
+			});
+			auto settings = new HTTPServerSettings;
+			settings.port = 0;
+			settings.bindAddresses = ["127.0.0.1"];
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				() @trusted { listener.stopListening(); }();
+			const uri = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/jwks";
+			keys = new JwksCache(uri, 300.seconds).keysFor("rsa-1").length;
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(failure.length == 0, failure);
+	assert(keys == 0, "an oversized JWKS body must not be loaded");
 }
 
 unittest  // ecJwkToPem produces a parseable PEM for P-384 and P-521 EC JWKs (RFC 7518)
@@ -1452,6 +1538,102 @@ unittest  // ecJwkToPem produces a parseable PEM for P-384 and P-521 EC JWKs (RF
 		= "AegUPdPnBttrFflQ9wJbUurLisEyJu-PZW-PnJomKpiFt9D2o0Ve0uXpqSqLHZTVhWpXu3ddF3Kw9JoO2hsNDE0q";
 	auto pem521 = jwkToPem(j521);
 	assert(pem521.indexOf("BEGIN PUBLIC KEY") >= 0, "P-521 JWK must produce a PEM");
+}
+
+version (unittest)
+{
+	private enum rsaOnlyJwks = `{"keys":[{"kty":"RSA","kid":"rsa-1","n":"`
+		~ testRsaN ~ `","e":"` ~ testRsaE ~ `"}]}`;
+	private enum rotatedJwks = `{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN
+		~ `","e":"` ~ testRsaE ~ `"},{"kty":"EC","kid":"ec-new","crv":"P-256","x":"`
+		~ testEcX ~ `","y":"` ~ testEcY ~ `"}]}`;
+
+	/// A JWKS cache over a scripted fetcher and a hand-driven clock.
+	private final class ScriptedJwks
+	{
+		int fetches;
+		long clock = 1_000;
+		string served;
+		JwksCache cache;
+
+		this(string served, void delegate() @safe duringFetch = null) @safe
+		{
+			this.served = served;
+			cache = new JwksCache("https://as.example.com/jwks", 300.seconds);
+			cache.fetcher = (string uri) @safe {
+				++fetches;
+				if (duringFetch !is null)
+					duringFetch();
+				return this.served;
+			};
+			cache.clock = () @safe => clock;
+		}
+	}
+}
+
+unittest  // JwksCache refetches on an unknown kid so a rotated-in key verifies before the TTL expires
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+	assert(s.fetches == 1);
+
+	// The IdP rotates in a new key; a token naming it arrives well inside the TTL.
+	s.served = rotatedJwks;
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	auto keys = s.cache.keysFor("ec-new");
+	assert(s.fetches == 2);
+	assert(keys.length == 1, "the rotated-in key must be selected by its kid");
+}
+
+unittest  // JwksCache rate-limits unknown-kid refetches (junk kids cannot drive outbound fetches)
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+	foreach (i; 0 .. 5)
+		s.cache.keysFor("junk-kid");
+	assert(s.fetches == 1);
+}
+
+unittest  // JwksCache negative-caches a failed fetch instead of refetching on every request
+{
+	auto s = new ScriptedJwks(null);
+	foreach (i; 0 .. 5)
+		assert(s.cache.keysFor("rsa-1").length == 0);
+	assert(s.fetches == 1);
+
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	s.cache.keysFor("rsa-1");
+	assert(s.fetches == 2);
+}
+
+unittest  // JwksCache single-flights concurrent fetches
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep;
+
+	// The fetch yields to other tasks while in flight.
+	auto s = new ScriptedJwks(rsaOnlyJwks, () @safe { sleep(30.msecs); });
+	auto cache = s.cache;
+
+	size_t a, b;
+	auto ta = runTask(() nothrow{
+		try
+			a = cache.keysFor("rsa-1").length;
+		catch (Exception)
+		{
+		}
+	});
+	auto tb = runTask(() nothrow{
+		try
+			b = cache.keysFor("rsa-1").length;
+		catch (Exception)
+		{
+		}
+	});
+	ta.join();
+	tb.join();
+	assert(s.fetches == 1);
+	assert(a == 1 && b == 1);
 }
 
 unittest  // JwksCache.load() retains previous keys when parsing a malformed JWKS document throws
