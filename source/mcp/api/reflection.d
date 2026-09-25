@@ -85,14 +85,36 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 			{
 				static foreach (attr; __traits(getAttributes, overload))
 				{
-					static if (is(typeof(attr) == tool))
+					static if (is(attr))
+						static assert(!isHandlerUda!attr,
+								"@" ~ attr.stringof ~ " on '" ~ memberName
+								~ "' is missing its argument list (e.g. @" ~ attr.stringof
+								~ "(\"name\", \"description\")); a bare @" ~ attr.stringof
+								~ " attaches the type, not a value, and registers nothing");
+					else static if (is(typeof(attr) == tool))
+					{
+						static assert(attr.name.length,
+								"@tool on '" ~ memberName ~ "' has an empty name");
 						registerToolMethod!(memberName, overload, parent)(server, attr);
+					}
 					else static if (is(typeof(attr) == task))
+					{
+						static assert(attr.name.length,
+								"@task on '" ~ memberName ~ "' has an empty name");
 						registerTaskMethod!(memberName, overload, parent)(server, attr);
+					}
 					else static if (is(typeof(attr) == event))
+					{
+						static assert(attr.name.length,
+								"@event on '" ~ memberName ~ "' has an empty name");
 						registerEventMethod!(memberName, overload, parent)(server, attr);
+					}
 					else static if (is(typeof(attr) == prompt))
+					{
+						static assert(attr.name.length,
+								"@prompt on '" ~ memberName ~ "' has an empty name");
 						registerPromptMethod!(memberName, overload, parent)(server, attr);
+					}
 					else static if (is(typeof(attr) == resource))
 						registerResourceMethod!(memberName, overload, parent)(server, attr);
 					else static if (is(typeof(attr) == resourceTemplate))
@@ -106,6 +128,12 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 		}
 	}
 }
+
+/// Whether the type `A` is one of the handler UDAs that must be applied with an
+/// argument list; a bare `@tool` attaches the type itself rather than a value.
+private enum isHandlerUda(A) = is(A == tool) || is(A == task) || is(A == event)
+	|| is(A == prompt) || is(A == resource) || is(A == resourceTemplate)
+	|| is(A == skill) || is(A == skillDir);
 
 /// Convenience variadic form of `registerModule`: register the annotated free
 /// functions of several modules in one call.
@@ -1693,6 +1721,81 @@ version (unittest) private class CtxHeaderParamApi
 	{
 		return region;
 	}
+}
+
+version (unittest)
+{
+	private class BareToolApi
+	{
+		@tool string f() @safe
+		{
+			return "";
+		}
+	}
+
+	private class BarePromptApi
+	{
+		@prompt string f() @safe
+		{
+			return "";
+		}
+	}
+
+	private class BareResourceApi
+	{
+		@resource string f() @safe
+		{
+			return "";
+		}
+	}
+
+	private class EmptyToolNameApi
+	{
+		@tool("", "Nameless")
+		string f() @safe
+		{
+			return "";
+		}
+	}
+
+	private class EmptyPromptNameApi
+	{
+		@prompt("", "Nameless")
+		string f() @safe
+		{
+			return "";
+		}
+	}
+}
+
+unittest  // a bare @tool (without its argument list) is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new BareToolApi)));
+}
+
+unittest  // a bare @prompt (without its argument list) is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new BarePromptApi)));
+}
+
+unittest  // a bare @resource (without its argument list) is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new BareResourceApi)));
+}
+
+unittest  // a @tool with an empty name is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new EmptyToolNameApi)));
+}
+
+unittest  // a @prompt with an empty name is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new EmptyPromptNameApi)));
 }
 
 unittest  // @mcpHeader: a struct-typed parameter is rejected at compile time
