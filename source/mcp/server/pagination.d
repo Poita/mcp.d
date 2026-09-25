@@ -51,15 +51,19 @@ package size_t decodeCursor(string cursor) @safe
 /// remain after `end`, `next` is set to the cursor for the following page
 /// (otherwise left null). With pagination disabled (`pageSize == 0`) the whole
 /// list is returned and `next` stays null. Throws `invalidParams` for a
-/// malformed or out-of-range cursor.
+/// malformed, non-string, or out-of-range cursor; an explicit `null` cursor is
+/// read as absent.
 package void pageBounds(Json params, size_t total, size_t pageSize,
 		out size_t begin, out size_t end, out Nullable!string next) @safe
 {
 	begin = 0;
-	if (params.type == Json.Type.object && "cursor" in params
-			&& params["cursor"].type == Json.Type.string)
+	const cursor = (params.type == Json.Type.object && "cursor" in params) ? params["cursor"]
+		: Json.undefined;
+	if (cursor.type != Json.Type.undefined && cursor.type != Json.Type.null_)
 	{
-		begin = decodeCursor(params["cursor"].get!string);
+		if (cursor.type != Json.Type.string)
+			throw invalidParams("Invalid pagination cursor");
+		begin = decodeCursor(cursor.get!string);
 		// A cursor pointing past the end of the (now possibly shorter) list
 		// is invalid rather than silently returning an empty final page.
 		if (begin > total)
@@ -75,4 +79,28 @@ package void pageBounds(Json params, size_t total, size_t pageSize,
 		end = begin + pageSize;
 		next = encodeCursor(end);
 	}
+}
+
+unittest  // a non-string cursor is rejected with -32602
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	foreach (bad; [Json(5), Json.emptyObject, Json(true)])
+	{
+		size_t b, e;
+		Nullable!string next;
+		auto ex = cast(McpException) collectException(pageBounds(Json([
+					"cursor": bad
+		]), 10, 3, b, e, next));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, bad.toString());
+	}
+}
+
+unittest  // an explicit null cursor is treated as absent (first page)
+{
+	size_t b, e;
+	Nullable!string next;
+	pageBounds(Json(["cursor": Json(null)]), 10, 3, b, e, next);
+	assert(b == 0 && e == 3 && !next.isNull);
 }
