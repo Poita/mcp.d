@@ -360,6 +360,8 @@ struct EventsOptions
 	WebhookTransport webhookTransport; /// outbound HTTP (default SSRF-hardened); tests inject a fake
 	void delegate(void delegate() @safe job) @safe deliveryExecutor; /// runs a delivery (default: a fiber)
 	void delegate(Duration d) @safe deliverySleep; /// inter-attempt sleep (default: vibe sleep)
+	void delegate(void delegate() @safe job) @safe pushExecutor; /// runs a push stream's writer (default: a fiber)
+	size_t pushMaxQueuedEvents = 1000; /// events a push stream may fall behind before it is terminated as a slow consumer (0 = unlimited)
 	V1aSigner v1aSigner; /// optional asymmetric (`v1a,`) signer; auto-wired from `webhookSigningKey`
 	string webhookSigningKey; /// `whsk_` ed25519 signing key — requires the `library-ed25519` build
 	Json webhookSigningJwks = Json.undefined; /// JWKS published at the server-identity well-known path
@@ -488,7 +490,9 @@ final class PushStream
 	bool terminated; /// set once the server ended the stream (`terminatePush`)
 	void delegate() @safe onTerminated; /// transport hook run after the terminated frame: write the final result, drop the stream
 	private bool started_; // `startPushStream` has written the leading frames; live events flow
-	private EventOccurrence[] pending_; // live events that arrived before the stream started
+	private EventOccurrence[] pending_; // live events not yet written, in arrival order
+	private bool writerScheduled_; // a writer is draining (or about to drain) `pending_`
+	private bool overflowed_; // fell too far behind; being terminated
 }
 
 /// Handle returned by `openPushStream`. `close()` unregisters the stream and fires
@@ -570,6 +574,25 @@ final class EventsRuntime
 					job();
 				catch (Exception e)
 					logEventsError("delivery task threw", e);
+			});
+		};
+		if (opts_.pushExecutor is null)
+			opts_.pushExecutor = (void delegate() @safe job) @safe {
+			import vibe.core.core : runTask;
+			import vibe.core.task : Task;
+
+			// Outside any task there is no scheduler to hand the writer to (a
+			// plain thread with no event loop), so it runs inline.
+			if (Task.getThis() == Task.init)
+			{
+				job();
+				return;
+			}
+			runTask(() nothrow @safe {
+				try
+					job();
+				catch (Exception e)
+					logEventsError("push stream writer threw", e);
 			});
 		};
 		if (opts_.deliverySleep is null)
@@ -972,19 +995,41 @@ final class EventsRuntime
 				s.deliver(eventsEventNotification,
 						withSubscriptionId(ev.toJson(), s.subscriptionId));
 		s.cursor = read && !first.cursor.isNull ? first.cursor : cursor;
-		// Release held live events in arrival order. Each write can yield, and an
-		// emit landing meanwhile is appended here rather than overtaking them.
-		const emitOnly = regIsEmitOnly(reg);
-		while (s.pending_.length)
+		// Release held live events in arrival order, dropping those the backlog
+		// already carried. This task is the stream's writer until they are out:
+		// each write can yield, and an emit landing meanwhile queues behind them.
+		if (regIsEmitOnly(reg))
+		{
+			EventOccurrence[] fresh;
+			foreach (occ; s.pending_)
+				if (seqAfter(occ.cursor, s.cursor))
+					fresh ~= occ;
+			s.pending_ = fresh;
+		}
+		s.writerScheduled_ = true;
+		s.started_ = true;
+		writePending(s);
+		return read ? first.nextPollMs : nextPollMsFor(*reg);
+	}
+
+	// Write a push stream's queued events in order until none remain. A write
+	// that throws (the client is gone) closes the stream.
+	private void writePending(PushStream s) @safe
+	{
+		scope (exit)
+			s.writerScheduled_ = false;
+		while (s.pending_.length && !s.terminated && !s.overflowed_)
 		{
 			auto occ = s.pending_[0];
 			s.pending_ = s.pending_[1 .. $];
-			if (emitOnly && !seqAfter(occ.cursor, s.cursor))
-				continue; // already delivered in the backlog
-			deliverToStream(reg, s, occ);
+			try
+				deliverToStream(s.name in types_, s, occ);
+			catch (Exception)
+			{
+				closePushStream(s);
+				return;
+			}
 		}
-		s.started_ = true;
-		return read ? first.nextPollMs : nextPollMsFor(*reg);
 	}
 
 	// Whether ring-buffer position `a` is after `b` (true when either is absent
@@ -1636,20 +1681,30 @@ final class EventsRuntime
 		return reg is null || reg.emitOnly || reg.check is null;
 	}
 
-	// Deliver to one stream, swallowing a throwing/disconnected subscriber so it can
-	// neither abort the fan-out to its siblings nor skip the subsequent webhook
-	// enqueue. The failing stream is scheduled for removal after the loop.
+	// Queue an event for one stream and make sure its writer runs. The publisher
+	// never writes to the stream itself, so a slow or stalled consumer can hold up
+	// neither the emit nor its sibling streams and webhooks. Before the stream has
+	// started, events wait for `startPushStream`. A stream that falls more than
+	// `pushMaxQueuedEvents` behind is terminated as a slow consumer.
 	private void deliverToStreamSafely(EventRegistration* reg, PushStream s, EventOccurrence occ) @safe
 	{
-		if (!s.started_)
+		if (s.terminated || s.overflowed_)
+			return;
+		s.pending_ ~= occ;
+		const cap = opts_.pushMaxQueuedEvents;
+		if (cap > 0 && s.pending_.length > cap)
 		{
-			s.pending_ ~= occ; // written once `startPushStream` has sent the leading frames
+			s.overflowed_ = true;
+			s.pending_ = null;
+			const error = toErrorJson(resourceExhausted("Push stream consumer is too slow",
+					"pushQueuedEvents", cap));
+			opts_.pushExecutor(() @safe { terminatePush(s, error); });
 			return;
 		}
-		try
-			deliverToStream(reg, s, occ);
-		catch (Exception)
-			closePushStream(s);
+		if (!s.started_ || s.writerScheduled_)
+			return;
+		s.writerScheduled_ = true;
+		opts_.pushExecutor(() @safe { writePending(s); });
 	}
 
 	private void deliverToStream(EventRegistration* reg, PushStream s, EventOccurrence occ) @safe
@@ -2747,6 +2802,7 @@ version (unittest)
 		long t = 1_000_000;
 		o.nowMs = (nowMs is null) ? (() @safe => t) : nowMs;
 		o.nowIso = () @safe => "2026-02-19T15:30:00Z";
+		o.pushExecutor = (void delegate() @safe job) @safe { job(); };
 		return new EventsRuntime(null, o);
 	}
 
@@ -3089,6 +3145,57 @@ unittest  // an event emitted while a push stream starts is delivered once, afte
 	]);
 	assert(handle.stream.cursor.get == "3"); // the live event's position, never rolled back
 	handle.close();
+}
+
+unittest  // emit hands push frames to a per-stream writer instead of writing them itself
+{
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	void delegate() @safe[] writers;
+	o.pushExecutor = (void delegate() @safe job) @safe { writers ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	string[] ids;
+	auto handle = openLive(rt, "n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		ids ~= p["eventId"].get!string;
+	});
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	assert(ids.length == 0); // the publisher did not block on the stream's writes
+	assert(writers.length == 1); // one writer per stream
+	writers[0]();
+	assert(ids == ["evt_1", "evt_2"]);
+	handle.close();
+}
+
+unittest  // a push stream that falls too far behind is terminated as a slow consumer
+{
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.pushMaxQueuedEvents = 2;
+	void delegate() @safe[] jobs;
+	o.pushExecutor = (void delegate() @safe job) @safe { jobs ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	int unsubs;
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	rt.register(reg);
+	string[] methods;
+	Json[] params;
+	auto handle = openLive(rt, "n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		methods ~= m;
+		params ~= p;
+	});
+	foreach (id; ["evt_1", "evt_2", "evt_3", "evt_4"])
+		rt.emit(EventOccurrence(id, "n", "t"));
+	for (size_t i = 0; i < jobs.length; i++)
+		jobs[i]();
+	assert(methods == [eventsTerminatedNotification]);
+	assert(params[0]["error"]["code"].get!int == -32013);
+	assert(handle.stream.terminated && unsubs == 1);
 }
 
 unittest  // advancePushStream delivers a recoverable error frame when the check throws, and stays open
