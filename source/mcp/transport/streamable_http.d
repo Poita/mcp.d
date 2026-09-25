@@ -1346,9 +1346,9 @@ private void handleListenStream(McpServer server, StreamCoordinator coord, Messa
 	// the request) is surfaced as a JSON-RPC error response — listen is modern-only,
 	// so a method-not-found rides the modern 404 — rather than opening the stream
 	// with a stale filter. The state is built the same way the regular POST path
-	// builds it (`freshStatelessState`: header, then body `_meta`, then the
-	// server default).
-	auto reqState = freshStatelessState(protoHeader, msg.params, server.negotiatedVersion);
+	// builds it (`freshStatelessState`: body `_meta`, then header, then
+	// 2025-03-26).
+	auto reqState = freshStatelessState(protoHeader, msg.params);
 	auto routed = routeListenRequest(server, msg, reqState, connToken);
 	if (!routed.isNull)
 	{
@@ -1661,7 +1661,7 @@ unittest  // a modern listen signalled by the header alone routes against the mo
 	params["_meta"] = meta;
 	auto msg = Message(makeRequest(Json(7), "subscriptions/listen", params));
 
-	auto reqState = freshStatelessState("2026-07-28", params, server.negotiatedVersion);
+	auto reqState = freshStatelessState("2026-07-28", params);
 	auto routed = routeListenRequest(server, msg, reqState, "");
 	assert(routed.isNull, "a header-signalled modern listen must route, not error");
 	assert(reqState.listenFilter.active);
@@ -1698,8 +1698,8 @@ unittest  // concurrent listens each keep their own per-stream filter
 	auto msgA = Message(makeRequest(Json(1), "subscriptions/listen", paramsA));
 	auto msgB = Message(makeRequest(Json(2), "subscriptions/listen", paramsB));
 
-	auto a = freshStatelessState("2026-07-28", paramsA, server.negotiatedVersion);
-	auto b = freshStatelessState("2026-07-28", paramsB, server.negotiatedVersion);
+	auto a = freshStatelessState("2026-07-28", paramsA);
+	auto b = freshStatelessState("2026-07-28", paramsB);
 	assert(routeListenRequest(server, msgA, a, "").isNull);
 	assert(routeListenRequest(server, msgB, b, "").isNull);
 
@@ -3387,14 +3387,11 @@ private ProtocolVersion effectivePostVersion(string protoHeader, ProtocolVersion
 ///     and two such requests can never observe each other's state. This is the
 ///     structural "no shared state across HTTP calls" guarantee for the stateless
 ///     protocol that was designed for it.
-///   - A legacy (stable-version) stateless request belongs to the SDK's single
-///     implicit-peer model: a stable client still performs an `initialize`
-///     handshake whose negotiated capabilities the server MUST honour on the later
-///     `tools/call` over the same connection. There is no per-request `_meta`
-///     handshake to rebuild that from, so this path returns `null` and the server
-///     falls back to its single bound `activeConnection` — exactly the supported
-///     single-client-per-mount deployment (documented in `mcp.transport.session`).
-///     Isolating *distinct* stable clients still requires `stateful` mode.
+///   - A legacy (stable-version) stateless request likewise gets a fresh state:
+///     its version comes from the `MCP-Protocol-Version` header (2025-03-26 when
+///     absent) and its capabilities are empty, since stateless legacy has no
+///     session to carry an `initialize` handshake across requests. Features that
+///     need the client's capabilities or later correlation require `stateful`.
 private ConnectionState postState(McpServer server, SessionManager sessions,
 		string mintedSessionId, string connToken, string protoHeader, Json params) @safe
 {
@@ -3404,7 +3401,7 @@ private ConnectionState postState(McpServer server, SessionManager sessions,
 			return sessions.stateFor(mintedSessionId, false);
 		return sessions.stateFor(connToken);
 	}
-	return freshStatelessState(protoHeader, params, server.negotiatedVersion);
+	return freshStatelessState(protoHeader, params);
 }
 
 /// The client capabilities a `HttpStreamContext` should advertise for a request,
@@ -3412,7 +3409,7 @@ private ConnectionState postState(McpServer server, SessionManager sessions,
 /// session's negotiated caps (stateful) or the per-request `_meta` caps
 /// (modern-modern), so `ctx.clientSupports` reflects THIS connection
 /// rather than a sibling's. Falls back to the server's bound view when no state
-/// was resolved (legacy stateless single-peer / stateful fallback).
+/// was resolved.
 private ClientCapabilities clientCapsFor(McpServer server, ConnectionState reqState) @safe
 {
 	if (reqState !is null)
@@ -3420,59 +3417,78 @@ private ClientCapabilities clientCapsFor(McpServer server, ConnectionState reqSt
 	return server.clientCapabilities;
 }
 
-/// Build the FRESH per-request `ConnectionState` for a MODERN-stateless (modern /
-/// MRTR) HTTP POST, or return `null` for a legacy stateless request.
+/// Build the FRESH per-request `ConnectionState` for a stateless HTTP POST. The
+/// server retains it nowhere, so two stateless requests never observe each
+/// other's version, capabilities, or log level.
 ///
-/// Only the modern (stateless) protocol is fully self-describing — every request
-/// carries its own protocol version, capabilities, and log level in `_meta`, with
-/// no `initialize` handshake to remember — so only there can a request be served
-/// from a transient state the server retains nowhere. The fresh state is seeded
-/// from the request's `_meta` (the per-request
-/// `io.modelcontextprotocol/clientCapabilities` / `logLevel`), mirroring how the
-/// modern dispatch path already reads them.
-///
-/// For a legacy (stable-version) request this returns `null`: a stable client
-/// negotiates capabilities once at `initialize` that the server must honour on
-/// later requests over the same connection, which is the single implicit-peer
-/// model held in `activeConnection` (the server falls back to it on null). The
-/// effective version is the body `_meta.protocolVersion`, then the
-/// `MCP-Protocol-Version` header, then the server default. When both the header
-/// and `_meta.protocolVersion` are present, `validateModernHeaders` already
-/// ensures they agree, so the final overwrite is always a no-op in practice.
-private ConnectionState freshStatelessState(string protoHeader, Json params,
-		ProtocolVersion serverDefault) @safe
+/// A modern request is self-describing: its version, client capabilities, and
+/// log level come from its `_meta`. A legacy request's version comes from the
+/// `MCP-Protocol-Version` header, or 2025-03-26 when the header is absent
+/// (basic/transports §Protocol Version Header); its capabilities are empty
+/// because stateless legacy has no session to carry the `initialize` handshake.
+/// When both the header and `_meta.protocolVersion` are present,
+/// `validateModernHeaders` ensures they agree.
+private ConnectionState freshStatelessState(string protoHeader, Json params) @safe
 {
-	// Effective version: _meta.protocolVersion wins over the header when present;
-	// the header (via effectivePostVersion) is the fallback before the server
-	// default. validateModernHeaders rejects any request where both are present but
-	// disagree, so when both exist they are equal and the overwrite is benign.
 	auto meta = RequestMeta.fromParams(params);
-	ProtocolVersion eff = effectivePostVersion(protoHeader, serverDefault);
+	ProtocolVersion eff = effectivePostVersion(protoHeader, ProtocolVersion.v2025_03_26);
 	ProtocolVersion mv;
 	if (meta.protocolVersion.length && tryParseVersion(meta.protocolVersion, mv))
 		eff = mv;
-	// Legacy stateless: defer to the single implicit-peer `activeConnection`
-	// (return null) so an initialize-negotiated capability survives to tools/call.
-	if (!eff.isModern)
-		return null;
 	auto conn = new ConnectionState;
 	conn.negotiated = eff;
+	if (!eff.isModern)
+		return conn;
 	conn.clientCaps = meta.clientCapabilities;
 	if (!meta.logLevel.isNull)
 		conn.logLevel = meta.logLevel.get;
 	return conn;
 }
 
-unittest  // a legacy stateless request defers to activeConnection (null)
+unittest  // a legacy stateless request gets a fresh state versioned by its header
 {
 	import vibe.data.json : Json;
 
-	// A stable-version request has no per-request _meta handshake to rebuild a
-	// transient state from, so freshStatelessState returns null and dispatch falls
-	// back to the single bound activeConnection (the supported single-peer model).
-	assert(freshStatelessState("2025-11-25", Json.emptyObject, ProtocolVersion.v2025_11_25) is null);
-	// Absent header + no _meta version -> server default (stable) -> still null.
-	assert(freshStatelessState("", Json.emptyObject, ProtocolVersion.v2025_11_25) is null);
+	auto conn = freshStatelessState("2025-06-18", Json.emptyObject);
+	assert(conn !is null, "a legacy stateless request must not share mutable server state");
+	assert(conn.negotiated == ProtocolVersion.v2025_06_18);
+	assert(!conn.clientCaps.sampling && !conn.clientCaps.roots
+			&& !conn.clientCaps.elicitation, "stateless legacy requests carry no capabilities");
+}
+
+unittest  // a legacy stateless request without a version header assumes 2025-03-26
+{
+	import vibe.data.json : Json;
+
+	auto conn = freshStatelessState("", Json.emptyObject);
+	assert(conn !is null);
+	assert(conn.negotiated == ProtocolVersion.v2025_03_26);
+}
+
+unittest  // concurrent legacy stateless clients never observe each other's initialize
+{
+	import vibe.data.json : Json;
+
+	auto server = new McpServer("t", "1");
+	string initialize(string ver) @safe
+	{
+		return `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"` ~ ver
+			~ `","capabilities":{"sampling":{}},"clientInfo":{"name":"c","version":"1"}}}`;
+	}
+
+	auto a = freshStatelessState("", Json.undefined);
+	server.handleRaw(initialize("2025-03-26"), a);
+	auto b = freshStatelessState("", Json.undefined);
+	server.handleRaw(initialize("2025-11-25"), b);
+
+	// Client A's next request (no header, so 2025-03-26) resolves to its own
+	// state: B's initialize must not change the version or caps A is served with.
+	auto next = freshStatelessState("", Json.undefined);
+	assert(next !is a && next !is b);
+	assert(next.negotiated == ProtocolVersion.v2025_03_26);
+	assert(!next.clientCaps.sampling);
+	assert(server.negotiatedVersion == latestLegacy,
+			"a stateless HTTP initialize must not write the shared fallback state");
 }
 
 unittest  // a modern (modern/MRTR) stateless request gets a FRESH state from _meta
@@ -3485,7 +3501,7 @@ unittest  // a modern (modern/MRTR) stateless request gets a FRESH state from _m
 	auto params = parseJsonString(
 			`{"_meta":{` ~ `"io.modelcontextprotocol/clientCapabilities":{"sampling":{}},`
 			~ `"io.modelcontextprotocol/logLevel":"warning"}}`);
-	auto conn = freshStatelessState("2026-07-28", params, ProtocolVersion.v2025_11_25);
+	auto conn = freshStatelessState("2026-07-28", params);
 	assert(conn !is null);
 	assert(conn.negotiated.isModern);
 	assert(conn.clientCaps.sampling, "modern-stateless caps must come from the request _meta");
@@ -3502,8 +3518,8 @@ unittest  // two modern-stateless requests resolve to INDEPENDENT states
 			`{"_meta":{"io.modelcontextprotocol/clientCapabilities":{"sampling":{}}}}`);
 	auto pB = parseJsonString(
 			`{"_meta":{"io.modelcontextprotocol/clientCapabilities":{"elicitation":{}}}}`);
-	auto a = freshStatelessState("2026-07-28", pA, ProtocolVersion.v2025_11_25);
-	auto b = freshStatelessState("2026-07-28", pB, ProtocolVersion.v2025_11_25);
+	auto a = freshStatelessState("2026-07-28", pA);
+	auto b = freshStatelessState("2026-07-28", pB);
 	assert(a !is b, "each stateless request must get its own ConnectionState");
 	assert(a.clientCaps.sampling && !a.clientCaps.elicitation);
 	assert(b.clientCaps.elicitation && !b.clientCaps.sampling,
@@ -4098,7 +4114,7 @@ unittest  // modern subscriptions/listen: ack first, then opted-in change notifi
 	Json listenParams = Json.emptyObject;
 	listenParams["toolsListChanged"] = true;
 	auto m = modernMsg("subscriptions/listen", listenParams);
-	auto reqState = freshStatelessState("2026-07-28", m.params, server.negotiatedVersion);
+	auto reqState = freshStatelessState("2026-07-28", m.params);
 	assert(routeListenRequest(server, m, reqState, "").isNull);
 	assert(reqState.listenFilter.toolsListChanged);
 	assert(!reqState.listenFilter.resourcesListChanged);

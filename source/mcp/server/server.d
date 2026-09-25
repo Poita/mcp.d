@@ -261,8 +261,7 @@ final class McpServer : ServerCore
 	// it has received `notifications/initialized`. Because this is a SHOULD (and
 	// real clients send `initialized` immediately) the gate is OFF by default to
 	// preserve lenient behaviour; opt in with requireInitialized(). Only a stateful
-	// session has an `initialized` handshake — the stateless path (one shared
-	// fallback state across sequential single-peer clients) is always exempt.
+	// session has an `initialized` handshake — the stateless path is always exempt.
 	private bool requireInitialized_;
 	// The opt-in MRTR `requestState` codec installed by `secureRequestState`.
 	// Null (the default) means plaintext passthrough — the wire and behaviour are
@@ -1969,8 +1968,7 @@ final class McpServer : ServerCore
 		// basic/lifecycle: a stateful server SHOULD NOT serve a non-`ping` request
 		// before the client has sent `notifications/initialized`. Enforced only when
 		// opted in via requireInitialized(); the stateless path has no per-session
-		// initialized handshake (one shared fallback state serves sequential
-		// single-peer clients) and is exempt, and `initialize`/`ping` are always
+		// initialized handshake and is exempt, and `initialize`/`ping` are always
 		// allowed (the former establishes the session, the latter is a liveness
 		// probe permitted at any time).
 		if (requireInitialized_ && mode_ == ServerMode.stateful
@@ -3193,9 +3191,8 @@ final class McpServer : ServerCore
 		// and replace the client capabilities mid-session, desyncing version-gated
 		// projection and the `tools/call` capability gate. Reject it with -32600,
 		// leaving the established `negotiated`/`clientCaps` untouched. A stateless
-		// server shares one fallback `ConnectionState` across its sequential
-		// single-peer clients, each of which legitimately performs its own
-		// `initialize` handshake, so the guard applies only to stateful sessions.
+		// server has no session, and each of its clients legitimately performs its
+		// own `initialize` handshake, so the guard applies only to stateful sessions.
 		if (mode_ == ServerMode.stateful && conn.initializeProcessed)
 			throw invalidRequest("Session already initialized");
 
