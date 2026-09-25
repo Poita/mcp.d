@@ -1113,8 +1113,8 @@ final class McpServer : ServerCore
 	/// Run the executor registered under `name` to completion on the calling
 	/// fiber and return its result as an ordinary tool result: the synchronous
 	/// path a task tool takes for a client that did not declare the Tasks
-	/// extension. The task record is still created, so the executor sees the
-	/// same `TaskContext` as when dispatched. A failed task surfaces as its
+	/// extension. A task record exists for the duration of the call, so the
+	/// executor sees the same `TaskContext` as when dispatched. A failed task surfaces as its
 	/// JSON-RPC error; one that needs client input cannot proceed without the
 	/// task surface and is reported as the missing extension.
 	private CallToolResult runTaskToolInline(string name, Json args, RequestContext ctx) @safe
@@ -1126,6 +1126,9 @@ final class McpServer : ServerCore
 			throw missingRequiredClientCapability(tasksRequiredCapabilities());
 		auto seed = taskRuntime_.createFor(name, args, Nullable!Duration.init,
 				Nullable!Duration.init, requestPrincipal(ctx));
+		// The client never learns this task's id, so the record dies with the call.
+		scope (exit)
+			taskRuntime_.store.remove(seed.taskId);
 		runTaskExecutor(taskRuntime_, seed.taskId, *exec);
 		auto detailed = taskRuntime_.getDetailed(seed.taskId);
 		const status = detailed["status"].get!string;
@@ -6749,6 +6752,34 @@ unittest  // a task tool called without the extension runs synchronously and ret
 	assert("taskId" !in resp["result"]);
 	assert(resp["result"]["structuredContent"]["result"].get!int == 42);
 	assert(resp["result"]["content"][0]["text"].get!string == "doubled");
+}
+
+unittest  // a synchronous task-tool call leaves no task record behind
+{
+	TaskOptions o;
+	o.idGenerator = () @safe => "inline-1";
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, o, new SyncTaskDispatcher());
+	Tool desc;
+	desc.name = "noop";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe => Json([
+		"content": Json.emptyArray
+	]));
+	auto ok = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("noop"), "arguments": Json.emptyObject]))).get;
+	assert("result" in ok);
+	assert(s.tasks.store.get("inline-1").isNull);
+
+	desc.name = "boom";
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		throw new McpException(ErrorCode.internalError, "boom");
+		return Json.emptyObject;
+	});
+	auto failed = s.handle(modernReqNoTasks(2, "tools/call",
+			Json(["name": Json("boom"), "arguments": Json.emptyObject]))).get;
+	assert("error" in failed);
+	assert(s.tasks.store.get("inline-1").isNull);
 }
 
 unittest  // a task tool that requires the extension rejects a client without it with -32021
