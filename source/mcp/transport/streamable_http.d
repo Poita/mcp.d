@@ -16,10 +16,10 @@ import mcp.protocol.events;
 import mcp.transport.sse_context;
 import mcp.transport.session;
 import mcp.auth.resource_server;
-import mcp.server.context : RequestContext, BaseRequestContext, ConnectionScoped;
+import mcp.server.context : RequestContext, BaseRequestContext, ConnectionScoped, StdioContext;
 import mcp.server.connection : ConnectionState;
 import mcp.server.push : ListenFilter;
-import mcp.protocol.capabilities : ClientCapabilities;
+import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
 
 /// The HTTP header carrying the session id (basic/transports §Session Management).
 enum SessionHeader = "Mcp-Session-Id";
@@ -311,12 +311,21 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		const payload = req.bodyReader.readAllUTF8();
 		// The per-stream session token the client echoes from its `endpoint` event
 		// correlates this POST with the GET stream that should receive the reply, so
-		// a response never leaks onto another client's stream.
+		// a response never leaks onto another client's stream. A POST without one,
+		// or for a stream that is not open, has nowhere to deliver its response.
 		const sessionId = req.query.get("sessionId", "");
-		// Resolve the per-stream ConnectionState so each client's dispatch runs
-		// against its own isolated state rather than the shared fallback.
-		auto connState = channel.connStateFor(sessionId);
-		cast(void) handleLegacyPostBody(server, channel, sessionId, payload, connState);
+		if (sessionId.length == 0)
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeBody("Missing sessionId query parameter", "text/plain");
+			return;
+		}
+		if (!handleLegacyPostBody(server, channel, sessionId, payload, token))
+		{
+			res.statusCode = HTTPStatus.notFound;
+			res.writeBody("Unknown or closed session", "text/plain");
+			return;
+		}
 		// All subsequent client messages are POSTed here; the response (if any)
 		// is delivered on the GET SSE stream, so the POST itself just acknowledges
 		// receipt with 202 Accepted and no body.
@@ -390,7 +399,7 @@ final class LegacySseChannel
 
 	/// The per-stream `ConnectionState` for the stream whose session token is
 	/// `sessionId`, or null when no matching open stream exists. The POST handler
-	/// passes this to `handleRaw` so each client's JSON-RPC dispatch runs against
+	/// dispatches against it so each client's JSON-RPC dispatch runs against
 	/// its own isolated state (negotiated version, client capabilities, etc.).
 	ConnectionState connStateFor(string sessionId) @safe
 	{
@@ -516,46 +525,43 @@ private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @
 	runSseHeartbeat(writeFrame);
 }
 
-/// Process a single JSON-RPC message POSTed to the legacy message endpoint and
-/// route any response back onto the originating client's legacy GET SSE stream as a
-/// `message` event. `sessionId` is the per-stream token the client echoed from its
-/// `endpoint` event, so the response is delivered ONLY to the stream that issued
-/// this POST — never broadcast across concurrently-connected clients. `conn` is the
-/// per-stream `ConnectionState` owned by the originating GET listener. Returns true
-/// (the server accepts every well-formed POST on this transport; a parse failure
-/// still yields a JSON-RPC error response delivered on the stream). A notification
-/// produces no response, so nothing is delivered. A client response/errorResponse
-/// (the client's reply to a server->client request) is routed to the channel's
+/// Process a single JSON-RPC message (or 2024-11-05 batch) POSTed to the legacy
+/// message endpoint and route any response back onto the originating client's
+/// legacy GET SSE stream as a `message` event. `sessionId` is the per-stream token
+/// the client echoed from its `endpoint` event, so the response is delivered ONLY
+/// to the stream that issued this POST. Dispatch runs against that stream's own
+/// `ConnectionState`, so each legacy client initializes and negotiates
+/// independently. Returns false — dispatching nothing — when no open stream owns
+/// `sessionId`; otherwise true (a parse failure still yields a JSON-RPC error
+/// response delivered on the stream). A client response/errorResponse (the
+/// client's reply to a server->client request) is routed to the channel's
 /// coordinator so a handler blocked in ctx.sample/ctx.elicit/ctx.listRoots is
-/// unblocked. Exposed (package-level) so the two-endpoint flow can be exercised
-/// without a live socket.
+/// unblocked. `token` is the request's validated bearer token, surfaced to
+/// handlers as `ctx.auth()`.
 bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
-		string sessionId, string payload, ConnectionState conn = null) @safe
+		string sessionId, string payload, TokenInfo token = TokenInfo.invalid()) @safe
 {
-	// Parse the message to distinguish client responses (replies to a server->client
-	// request) from client requests and notifications. A parse failure falls through
-	// to handleRaw which produces a JSON-RPC error response on the SSE stream.
+	auto conn = channel.connStateFor(sessionId);
+	if (conn is null)
+		return false;
+
+	ParsedInput input;
 	try
+		input = parseAny(payload);
+	catch (McpException e)
 	{
-		const msg = parseMessage(payload);
-		if (msg.kind == MessageKind.response || msg.kind == MessageKind.errorResponse)
-		{
-			// Route the client's reply to whatever handler task is awaiting it.
-			// The coordinator key is (sessionId, requestId) so a reply for one session
-			// cannot wake a waiter registered under a different session token.
-			channel.coord.resolve(msg.id, msg.result, msg.error, sessionId);
-			return true;
-		}
+		channel.deliverTo(sessionId, makeErrorResponse(Json(null), e).toString());
+		return true;
 	}
-	catch (Exception)
+	catch (Exception e)
 	{
-		// Parse failure: fall through so handleRaw returns the protocol error.
+		channel.deliverTo(sessionId, makeErrorResponse(Json(null), parseError(e.msg)).toString());
+		return true;
 	}
 
-	// Wire a sink that pushes any out-of-band server frame (progress, log,
-	// server->client request) onto the originating SSE stream, and a serverRequest
-	// delegate that issues a server->client request through the channel coordinator
-	// and blocks until the client's reply POST arrives.
+	// Push any out-of-band server frame (progress, log, server->client request)
+	// onto the originating SSE stream, and issue server->client requests through
+	// the channel coordinator, blocking until the client's reply POST arrives.
 	void sink(string frame) @safe
 	{
 		channel.deliverTo(sessionId, frame);
@@ -577,9 +583,144 @@ bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 		return channel.coord.await(id, 60.seconds, sessionId);
 	}
 
-	const responseText = server.handleRaw(payload, &sink, &serverRequest);
-	channel.deliverTo(sessionId, responseText);
+	Nullable!Json dispatch(Message msg) @safe
+	{
+		// The coordinator key is (sessionId, requestId), so a reply for one
+		// session cannot wake a waiter registered under another session token.
+		if (msg.kind == MessageKind.response || msg.kind == MessageKind.errorResponse)
+		{
+			channel.coord.resolve(msg.id, msg.result, msg.error, sessionId);
+			return Nullable!Json.init;
+		}
+		auto inner = new StdioContext(&sink, &serverRequest, conn.clientCaps,
+				legacyProgressToken(msg.params), conn.negotiated,
+				server.mode == ServerMode.stateless);
+		return server.handle(msg, new LegacySseContext(inner, sessionId, conn, token));
+	}
+
+	if (!input.isBatch)
+	{
+		auto resp = dispatch(input.messages[0]);
+		if (!resp.isNull)
+			channel.deliverTo(sessionId, resp.get.toString());
+		return true;
+	}
+
+	Json responses = Json.emptyArray;
+	if (conn.negotiated >= ProtocolVersion.v2025_06_18)
+		responses = makeErrorResponse(Json(null),
+				invalidRequest("JSON-RPC batching is not supported on this protocol version"));
+	else
+	{
+		foreach (m; input.messages)
+		{
+			auto resp = dispatch(m);
+			if (!resp.isNull)
+				responses ~= resp.get;
+		}
+		foreach (err; input.errors)
+			responses ~= makeErrorResponse(Json(null), err.error);
+	}
+	if (responses.type == Json.Type.object || responses.length)
+		channel.deliverTo(sessionId, responses.toString());
 	return true;
+}
+
+/// The `_meta.progressToken` of a request's params, or `Json.undefined`.
+private Json legacyProgressToken(Json params) @safe
+{
+	if (params.type == Json.Type.object && "_meta" in params)
+	{
+		auto meta = params["_meta"];
+		if (meta.type == Json.Type.object && "progressToken" in meta)
+			return meta["progressToken"];
+	}
+	return Json.undefined;
+}
+
+/// The `RequestContext` for one message on a legacy HTTP+SSE stream: it streams
+/// server->client traffic onto that stream through the wrapped `StdioContext`,
+/// and scopes dispatch to the stream's own token and `ConnectionState`.
+private final class LegacySseContext : RequestContext, ConnectionScoped
+{
+	private StdioContext inner;
+	private string token_;
+	private ConnectionState conn_;
+	private TokenInfo auth_;
+
+	this(StdioContext inner, string token, ConnectionState conn, TokenInfo auth) @safe
+	{
+		this.inner = inner;
+		this.token_ = token;
+		this.conn_ = conn;
+		this.auth_ = auth;
+	}
+
+	string connectionToken() @safe
+	{
+		return token_;
+	}
+
+	ConnectionState connectionState() @safe
+	{
+		return conn_;
+	}
+
+	bool isCancelled() @safe
+	{
+		return inner.isCancelled();
+	}
+
+	void reportProgress(double progress,
+			Nullable!double total = Nullable!double.init, string message = null) @safe
+	{
+		inner.reportProgress(progress, total, message);
+	}
+
+	void log(string level, Json data, string logger = null) @safe
+	{
+		inner.log(level, data, logger);
+	}
+
+	Json sampleRaw(Json params) @safe
+	{
+		return inner.sampleRaw(params);
+	}
+
+	Json elicitRaw(Json params) @safe
+	{
+		return inner.elicitRaw(params);
+	}
+
+	Json listRootsRaw() @safe
+	{
+		return inner.listRootsRaw();
+	}
+
+	bool clientSupports(ClientCapability cap) @safe
+	{
+		return inner.clientSupports(cap);
+	}
+
+	bool isStateless() @safe
+	{
+		return inner.isStateless();
+	}
+
+	Json[string] inputResponses() @safe
+	{
+		return inner.inputResponses();
+	}
+
+	string requestState() @safe
+	{
+		return inner.requestState();
+	}
+
+	TokenInfo auth() @safe
+	{
+		return auth_;
+	}
 }
 
 /// Frame the legacy `endpoint` SSE event (2024-11-05 basic/transports §HTTP with
@@ -2546,6 +2687,65 @@ unittest  // legacy POST: a handler that calls ctx.listRoots() sends the request
 	// The tool-call response must now appear on the SSE stream.
 	assert(frames.length == 3, "expected tool-call response on SSE stream");
 	assert(frames[2].canFind("\"id\":10"), "tool response must echo the original request id");
+}
+
+unittest  // legacy POST: each stream initializes its own connection on a stateful server
+{
+	import std.algorithm : canFind;
+
+	auto server = McpServer.stateful("t", "1");
+	auto ch = new LegacySseChannel("/message");
+	string[] framesA, framesB;
+	const sidA = ch.sessionIdFor(ch.addListener((string f) @safe { framesA ~= f; }));
+	const sidB = ch.sessionIdFor(ch.addListener((string f) @safe { framesB ~= f; }));
+
+	assert(handleLegacyPostBody(server, ch, sidA, initializeBody("2024-11-05")));
+	assert(handleLegacyPostBody(server, ch, sidB, initializeBody("2025-03-26")));
+	assert(framesA.length == 2 && framesA[1].canFind("\"result\""));
+	assert(framesB.length == 2 && framesB[1].canFind("\"result\""),
+			"a second legacy client must be able to initialize");
+	assert(ch.connStateFor(sidA).negotiated == ProtocolVersion.v2024_11_05);
+	assert(ch.connStateFor(sidB).negotiated == ProtocolVersion.v2025_03_26);
+}
+
+unittest  // legacy POST: an unknown sessionId is rejected and nothing is dispatched
+{
+	auto server = McpServer.stateful("t", "1");
+	auto ch = new LegacySseChannel("/message");
+	assert(!handleLegacyPostBody(server, ch, "no-such-session", initializeBody("2024-11-05")));
+	assert(!handleLegacyPostBody(server, ch, "", initializeBody("2024-11-05")));
+}
+
+unittest  // legacy POST route: missing sessionId is 400, unknown sessionId is 404
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.common : HTTPMethod;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryStream, createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	mountLegacyHttpSse(router, server, opts);
+
+	int post(string url) @safe
+	{
+		auto buf = () @trusted {
+			return cast(ubyte[]) initializeBody("2024-11-05").dup;
+		}();
+		auto req = createTestHTTPServerRequest(URL(url), HTTPMethod.POST,
+				createMemoryStream(buf, false));
+		req.headers["Host"] = "127.0.0.1";
+		req.headers["Content-Type"] = "application/json";
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		return res.statusCode;
+	}
+
+	assert(post("http://127.0.0.1/message") == 400);
+	assert(post("http://127.0.0.1/message?sessionId=bogus") == 404);
 }
 
 unittest  // legacy channel: a response routes only to the originating stream, not all clients
