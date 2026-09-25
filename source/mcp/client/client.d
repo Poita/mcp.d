@@ -2654,10 +2654,25 @@ final class McpClient : ClientProtocol
 	{
 		auto sub = new EventSubscription();
 		sub.setMode(DeliveryMode.webhook);
+		sub.dedupCapacity(eventSettings_.dedupWindow);
 		auto res = subscribeWebhookEvents(p);
 		const id = res.id;
 		sub.advanceCursor(res.cursor);
-		rx.register(id, p.delivery.secret, onEvent, onControl);
+		// Bind deliveries to the subscription's watermark, dedup, and terminal
+		// state before the caller's handlers, as the poll and stream modes do.
+		rx.register(id, p.delivery.secret, (EventOccurrence o) @safe {
+			sub.advanceCursor(o.cursor);
+			if (sub.alreadySeen(o.eventId))
+				return;
+			if (onEvent !is null)
+				onEvent(o);
+		}, (EventControl c) @safe {
+			sub.advanceCursor(c.cursor);
+			if (c.kind == EventControlKind.terminated)
+				sub.markTerminated();
+			if (onControl !is null)
+				onControl(c);
+		});
 		sub.onTeardown(() @safe nothrow{
 			try
 			{
@@ -2675,19 +2690,20 @@ final class McpClient : ClientProtocol
 	/// The webhook refresh loop: sleeps until shortly before the current grant
 	/// expires (or, for a no-expiry grant, for the health-check interval),
 	/// re-subscribes (refreshing the TTL and advancing the watermark), and repeats
-	/// until cancelled. A no-expiry grant with health checks disabled ends the loop:
-	/// correctness no longer depends on refreshing. Seam-driven for tests.
+	/// until the subscription is cancelled or the server terminates it. A no-expiry
+	/// grant with health checks disabled ends the loop: correctness no longer
+	/// depends on refreshing. Seam-driven for tests.
 	package void runWebhookRefreshLoop(EventSubscription sub, SubscribeParams p,
 			SubscribeResult first) @safe
 	{
 		auto cur = p;
 		auto res = first;
-		while (!sub.isCancelled())
+		while (sub.active)
 		{
 			if (res.refreshBefore.isNull && eventSettings_.noExpiryRefreshInterval <= Duration.zero)
 				return;
 			webhookRefreshSleep(res);
-			if (sub.isCancelled())
+			if (!sub.active)
 				return;
 			try
 			{
@@ -8302,6 +8318,112 @@ unittest  // subscribeWebhook registers the receiver under the server id and tea
 	sub.cancel();
 	assert(unsubs == 1);
 	assert(rx.processDelivery("{}", known).status == 503); // deregistered
+}
+
+version (unittest)
+{
+	/// A webhook-mode subscription (server id "sub_x", receiver timestamps
+	/// unchecked) plus a helper that delivers a signed envelope to it.
+	private struct WebhookHarness
+	{
+		McpClient client;
+		WebhookReceiver rx;
+		EventSubscription sub;
+		EventControl[] controls;
+		EventOccurrence[] events;
+
+		void deliver(Json envelope, string msgId) @safe
+		{
+			import mcp.server.webhook_delivery : signDeliveryHeaders;
+
+			const 
+			body = envelope.toString();
+			auto headers = signDeliveryHeaders(managedTestWhsec, "", 0, 1000,
+					msgId, 1700, body, "sub_x", null);
+			assert(rx.processDelivery(body, headers).status == 200);
+		}
+	}
+
+	private WebhookHarness* webhookHarness() @safe
+	{
+		auto h = new WebhookHarness;
+		h.client = new McpClient(new RecordingClientTransport());
+		h.client.onRpcForTest = (string method, Json params) @safe {
+			SubscribeResult r;
+			r.id = "sub_x";
+			r.cursor = "c0";
+			return method == "events/subscribe" ? r.toJson() : Json.emptyObject;
+		};
+		h.rx = new WebhookReceiver();
+		h.rx.verifyTimestamp = false;
+		SubscribeParams sp;
+		sp.name = "incident.created";
+		sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+		h.sub = h.client.subscribeWebhook(h.rx, sp, (EventOccurrence o) @safe {
+			h.events ~= o;
+		}, (EventControl c) @safe { h.controls ~= c; });
+		return h;
+	}
+}
+
+unittest  // a webhook `terminated` envelope ends the managed subscription
+{
+	import mcp.protocol.events : terminatedEnvelope;
+
+	auto h = webhookHarness();
+	assert(h.sub.active);
+	h.deliver(terminatedEnvelope(Json([
+				"code": Json(-32012),
+				"message": Json("revoked")
+	])), "m1");
+	assert(h.controls.length == 1 && h.controls[0].kind == EventControlKind.terminated);
+	assert(!h.sub.active, "a terminated subscription must no longer report active");
+}
+
+unittest  // the webhook refresh loop stops once the subscription is terminated
+{
+	import mcp.protocol.events : terminatedEnvelope;
+
+	auto h = webhookHarness();
+	int subs;
+	h.client.onRpcForTest = (string method, Json params) @safe {
+		subs++;
+		SubscribeResult r;
+		r.id = "sub_x";
+		r.refreshBefore = "2000-01-01T00:00:00Z"; // already past: refresh at the floor
+		return r.toJson();
+	};
+	h.deliver(terminatedEnvelope(Json([
+				"code": Json(-32012),
+				"message": Json("revoked")
+	])), "m1");
+	SubscribeResult first;
+	first.id = "sub_x";
+	first.refreshBefore = "2000-01-01T00:00:00Z";
+	int sleeps;
+	h.client.onWebhookRefreshSleepForTest = (SubscribeResult r) @safe {
+		if (++sleeps > 3)
+			h.sub.cancel(); // backstop so a broken loop still ends
+	};
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	h.client.runWebhookRefreshLoop(h.sub, sp, first);
+	assert(subs == 0, "a terminated subscription must not be re-subscribed");
+}
+
+unittest  // webhook `gap` envelopes and occurrences advance the subscription cursor
+{
+	import mcp.protocol.events : gapEnvelope;
+
+	auto h = webhookHarness();
+	assert(h.sub.cursor.get == "c0");
+	h.deliver(gapEnvelope("c7"), "m1");
+	assert(h.sub.cursor.get == "c7", "a gap control must advance the watermark");
+	auto occ = EventOccurrence("e1", "incident.created", "t", Json.emptyObject);
+	occ.cursor = "c8";
+	h.deliver(occ.toJson(), "m2");
+	assert(h.sub.cursor.get == "c8");
+	assert(h.events.length == 1);
 }
 
 unittest  // a no-expiry grant still refreshes at the health-check cadence
