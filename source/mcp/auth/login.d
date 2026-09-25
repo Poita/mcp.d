@@ -13,9 +13,11 @@ module mcp.auth.login;
  * `TokenStore` (default: file-backed), and transparently refreshes the access
  * token on expiry before each request.
  *
- * Loopback redirect URIs (`http://localhost:<port>/callback`) are explicitly
+ * Loopback redirect URIs (`http://127.0.0.1:<port>/callback`) are explicitly
  * permitted by the MCP authorization spec: "All redirect URIs MUST be either
- * `localhost` or use HTTPS." PKCE S256 is enforced by the underlying
+ * `localhost` or use HTTPS." The `127.0.0.1` literal is used rather than
+ * `localhost` because that is the address the listener binds (RFC 8252 §8.3).
+ * PKCE S256 is enforced by the underlying
  * `OAuthClient`, and the RFC 8707 `resource` parameter is sent on both the
  * authorization and token requests.
  */
@@ -595,7 +597,9 @@ struct OAuthLogin
 	}
 }
 
-/// The default loopback redirect URI for a given port and path.
+/// The default loopback redirect URI for a given port and path. It names the
+/// `127.0.0.1` literal the callback listener binds (RFC 8252 §8.3): `localhost`
+/// may resolve to `::1` first, where nothing is listening.
 string loopbackRedirectUri(ushort port, string path = "/callback") @safe pure
 {
 	import std.conv : to;
@@ -603,7 +607,7 @@ string loopbackRedirectUri(ushort port, string path = "/callback") @safe pure
 	auto p = path.length ? path : "/callback";
 	if (p[0] != '/')
 		p = "/" ~ p;
-	return "http://localhost:" ~ port.to!string ~ p;
+	return "http://127.0.0.1:" ~ port.to!string ~ p;
 }
 
 /// The default token-store path under the user's config directory:
@@ -1052,6 +1056,16 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth,
 		}
 
 		auto cap = parseLoopbackCallback(req.requestURI, state);
+		// A response without this flow's state did not come from the authorization
+		// request this flow made (any web page can make the browser hit the
+		// loopback port), so it neither completes nor aborts the login.
+		if (!validateAuthorizationResponseState(cap.state, state))
+		{
+			res.statusCode = 400;
+			res.contentType = "text/plain; charset=utf-8";
+			res.writeBody("Unknown authorization state");
+			return;
+		}
 		// RFC 9207 mix-up protection: validate the `iss` authorization-response
 		// parameter against the selected AS's recorded issuer BEFORE the token
 		// exchange (the spec requires this regardless of whether an error param
@@ -1264,11 +1278,11 @@ unittest  // MemoryTokenStore persists and loads per resource
 	assert(!store.load("https://b").hasToken);
 }
 
-unittest  // loopbackRedirectUri formats a localhost URI for the bound port
+unittest  // loopbackRedirectUri names the 127.0.0.1 literal the listener binds (RFC 8252 §8.3)
 {
-	assert(loopbackRedirectUri(8765) == "http://localhost:8765/callback");
-	assert(loopbackRedirectUri(1234, "/cb") == "http://localhost:1234/cb");
-	assert(loopbackRedirectUri(1234, "cb") == "http://localhost:1234/cb");
+	assert(loopbackRedirectUri(8765) == "http://127.0.0.1:8765/callback");
+	assert(loopbackRedirectUri(1234, "/cb") == "http://127.0.0.1:1234/cb");
+	assert(loopbackRedirectUri(1234, "cb") == "http://127.0.0.1:1234/cb");
 }
 
 unittest  // scopeString space-joins the requested scopes
@@ -1912,10 +1926,10 @@ unittest  // a stray non-callback request does not abort the loopback flow
 		auto redirectUri = extractQueryParam(url, "redirect_uri");
 		import std.string : indexOf;
 
-		// redirect_uri looks like http://localhost:<port>/callback
-		auto hostStart = redirectUri.indexOf("localhost:");
+		// redirect_uri looks like http://127.0.0.1:<port>/callback
+		auto hostStart = redirectUri.indexOf("127.0.0.1:");
 		assert(hostStart >= 0);
-		auto rest = redirectUri[hostStart + "localhost:".length .. $];
+		auto rest = redirectUri[hostStart + "127.0.0.1:".length .. $];
 		auto slash = rest.indexOf('/');
 		auto portStr = slash >= 0 ? rest[0 .. slash] : rest;
 		auto baseUrl = "http://127.0.0.1:" ~ portStr;
@@ -1942,6 +1956,58 @@ unittest  // a stray non-callback request does not abort the loopback flow
 	auto captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, "state-xyz");
 
 	assert(captured.ok, "genuine callback should be captured despite the stray request");
+	assert(captured.code == "real-code");
+}
+
+unittest  // a callback with the wrong state is refused (400) and the flow keeps waiting for the real one
+{
+	import core.time : msecs, seconds;
+	import std.string : indexOf;
+	import vibe.core.core : runTask, sleep;
+	import vibe.http.client : requestHTTP;
+
+	auto oauth = new OAuthClient();
+	oauth.resource = "https://mcp.example.com/mcp";
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "https://as.example.com/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto rc = RegisteredClient("cid", "");
+	auto pkce = generatePkce();
+
+	OAuthLogin opts;
+	opts.callbackTimeout = 5.seconds;
+	int forgedStatus;
+	opts.openBrowser = (string url) @safe {
+		auto redirectUri = extractQueryParam(url, "redirect_uri");
+		auto rest = redirectUri[redirectUri.indexOf("127.0.0.1:") + "127.0.0.1:".length .. $];
+		auto baseUrl = "http://127.0.0.1:" ~ rest[0 .. rest.indexOf('/')];
+		() @trusted {
+			runTask(() nothrow{
+				try
+				{
+					// Any web page can make the browser hit the loopback callback; one
+					// without the flow's state must not end the login.
+					sleep(50.msecs);
+					requestHTTP(baseUrl ~ "/callback?error=access_denied&state=forged", (scope req) {
+					}, (scope res) {
+						forgedStatus = res.statusCode;
+						res.dropBody();
+					});
+					sleep(50.msecs);
+					requestHTTP(baseUrl ~ "/callback?code=real-code&state=state-xyz", (scope req) {
+					}, (scope res) { res.dropBody(); });
+				}
+				catch (Exception)
+				{
+				}
+			});
+		}();
+	};
+
+	auto captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, "state-xyz");
+
+	assert(forgedStatus == 400);
+	assert(captured.ok, "the genuine callback must still be captured");
 	assert(captured.code == "real-code");
 }
 
@@ -2155,9 +2221,9 @@ unittest  // the loopback flow completes when invoked from inside a vibe task
 		auto redirectUri = extractQueryParam(url, "redirect_uri");
 		import std.string : indexOf;
 
-		auto hostStart = redirectUri.indexOf("localhost:");
+		auto hostStart = redirectUri.indexOf("127.0.0.1:");
 		assert(hostStart >= 0);
-		auto rest = redirectUri[hostStart + "localhost:".length .. $];
+		auto rest = redirectUri[hostStart + "127.0.0.1:".length .. $];
 		auto slash = rest.indexOf('/');
 		auto baseUrl = "http://127.0.0.1:" ~ (slash >= 0 ? rest[0 .. slash] : rest);
 		() @trusted {
@@ -2220,9 +2286,9 @@ unittest  // the client is registered with the redirect URI the listener actuall
 		registeredBeforeOpen = registeredWith.length > 0;
 		import std.string : indexOf;
 
-		auto hostStart = openedWith.indexOf("localhost:");
+		auto hostStart = openedWith.indexOf("127.0.0.1:");
 		assert(hostStart >= 0);
-		auto rest = openedWith[hostStart + "localhost:".length .. $];
+		auto rest = openedWith[hostStart + "127.0.0.1:".length .. $];
 		auto slash = rest.indexOf('/');
 		auto baseUrl = "http://127.0.0.1:" ~ (slash >= 0 ? rest[0 .. slash] : rest);
 		() @trusted {
