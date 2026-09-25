@@ -250,6 +250,15 @@ struct ClientSettings
 	/// `requestTimeout`, so a long-running request that keeps reporting progress
 	/// is not cut off (basic/utilities/progress).
 	bool resetTimeoutOnProgress = true;
+
+	/// How long `awaitTask` waits between `tasks/get` polls when the server gives
+	/// no `pollIntervalMs`.
+	Duration taskPollInterval = 1.seconds;
+
+	/// Upper bound on how long `awaitTask` / `callToolAwait` poll a task before
+	/// failing with `RequestTimeoutException` (the task itself is left running;
+	/// `cancelTask` stops it). `Duration.zero` polls until the task finishes.
+	Duration taskTimeout = Duration.zero;
 }
 
 /// Thrown by a request that received no response within
@@ -611,8 +620,13 @@ final class McpClient : ClientProtocol
 		eventSettings_ = settings.events;
 		requestTimeout_ = settings.requestTimeout;
 		resetTimeoutOnProgress_ = settings.resetTimeoutOnProgress;
+		taskPollInterval_ = settings.taskPollInterval;
+		taskTimeout_ = settings.taskTimeout;
 		return this;
 	}
+
+	private Duration taskPollInterval_ = ClientSettings.init.taskPollInterval;
+	private Duration taskTimeout_ = ClientSettings.init.taskTimeout;
 
 	private Duration requestTimeout_ = ClientSettings.init.requestTimeout;
 	private bool resetTimeoutOnProgress_ = ClientSettings.init.resetTimeoutOnProgress;
@@ -1768,15 +1782,20 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Poll `tasks/get` until the task reaches a terminal status, honoring the
-	/// server's `pollIntervalMs`. Returns the final `CallToolResult` on
-	/// `completed`; throws on `failed`/`cancelled`. While the task is
-	/// `input_required`, `onInputRequired` (if provided) is invoked with the raw
-	/// `inputRequests` map so the caller can answer via `respondTaskInput`; with no
-	/// handler the poll continues. Works from a bare `taskId` string, so a client
-	/// can resume a task persisted across a restart.
+	/// server's `pollIntervalMs` (`ClientSettings.taskPollInterval` when it gives
+	/// none). Returns the final `CallToolResult` on `completed`; throws on
+	/// `failed`/`cancelled`, and `RequestTimeoutException` once
+	/// `ClientSettings.taskTimeout` (when set) elapses. While the task is
+	/// `input_required`, `onInputRequired` is invoked with the raw `inputRequests`
+	/// map so the caller can answer via `respondTaskInput`; with no handler the task
+	/// can never progress, so this throws. Works from a bare `taskId` string, so a
+	/// client can resume a task persisted across a restart.
 	CallToolResult awaitTask(string taskId, void delegate(string taskId,
 			Json inputRequests) @safe onInputRequired = null) @safe
 	{
+		import core.time : MonoTime;
+
+		const start = MonoTime.currTime;
 		for (;;)
 		{
 			auto state = getTaskState(taskId);
@@ -1792,9 +1811,12 @@ final class McpClient : ClientProtocol
 			case "cancelled":
 				throw new McpException(ErrorCode.invalidRequest, "Task was cancelled: " ~ taskId);
 			case "input_required":
-				if (onInputRequired !is null)
-					onInputRequired(taskId, ("inputRequests" in state)
-							? state["inputRequests"] : Json.emptyObject);
+				if (onInputRequired is null)
+					throw new McpException(ErrorCode.internalError,
+							"Task " ~ taskId
+							~ " requires input but no onInputRequired handler was given");
+				onInputRequired(taskId, ("inputRequests" in state)
+						? state["inputRequests"] : Json.emptyObject);
 				break;
 			case "working":
 				break;
@@ -1802,10 +1824,14 @@ final class McpClient : ClientProtocol
 				throw new McpException(ErrorCode.internalError,
 						"Task " ~ taskId ~ " reported an unrecognized status: " ~ status);
 			}
-			long pollMs;
-			if ("pollIntervalMs" in state && state["pollIntervalMs"].type == Json.Type.int_)
-				pollMs = state["pollIntervalMs"].get!long;
-			taskPollSleep(pollMs.msecs);
+			if (taskTimeout_ > Duration.zero && MonoTime.currTime - start >= taskTimeout_)
+				throw new RequestTimeoutException(
+						"Task " ~ taskId ~ " did not finish within " ~ taskTimeout_.toString());
+			auto interval = taskPollInterval_;
+			if ("pollIntervalMs" in state && state["pollIntervalMs"].type == Json.Type.int_
+					&& state["pollIntervalMs"].get!long > 0)
+				interval = state["pollIntervalMs"].get!long.msecs;
+			taskPollSleep(interval);
 		}
 	}
 
@@ -4068,6 +4094,61 @@ unittest  // awaitTask throws on a status it does not recognize instead of polli
 	auto ex = cast(McpException) collectException(c.awaitTask("t1"));
 	assert(ex !is null);
 	assert(polls == 1);
+}
+
+unittest  // awaitTask waits the default poll interval when the server gives none
+{
+	auto c = McpClient.http("http://localhost");
+	Duration[] sleeps;
+	c.onTaskSleepForTest = (Duration d) @safe { sleeps ~= d; };
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (++polls < 3)
+			return Json(["taskId": Json("t1"), "status": Json("working")]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json(["content": Json.emptyArray])
+		]);
+	};
+	c.awaitTask("t1");
+	assert(sleeps == [1.seconds, 1.seconds], "a missing pollIntervalMs must not poll back-to-back");
+}
+
+unittest  // awaitTask fails fast on input_required when no handler is given
+{
+	import std.exception : collectException;
+
+	auto c = McpClient.http("http://localhost");
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("input_required"),
+			"inputRequests": Json.emptyObject
+		]);
+	};
+	auto ex = cast(McpException) collectException(c.awaitTask("t1"));
+	assert(ex !is null, "input_required with no handler must throw, not poll forever");
+	assert(polls == 1);
+}
+
+unittest  // awaitTask gives up once ClientSettings.taskTimeout elapses
+{
+	import std.exception : collectException;
+	import core.thread : Thread;
+
+	ClientSettings s;
+	s.taskTimeout = 30.msecs;
+	auto c = McpClient.http("http://localhost", s);
+	c.onTaskSleepForTest = (Duration d) @trusted { Thread.sleep(10.msecs); };
+	c.onRpcForTest = (string method, Json params) @safe {
+		return Json(["taskId": Json("t1"), "status": Json("working")]);
+	};
+	auto ex = collectException(c.awaitTask("t1"));
+	assert(cast(RequestTimeoutException) ex !is null, "a task past its deadline must time out");
 }
 
 unittest  // callToolAwait returns a synchronous CallToolResult unchanged
