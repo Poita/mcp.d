@@ -155,14 +155,14 @@ tightens file permissions via ACLs rather than POSIX modes.
 ```bash
 ulimit -n 65536        # required: dub misbehaves under ghostty's `ulimit -n unlimited`
 dub build              # build the library
-dub test               # run all unit tests (42 modules, ~1900 tests)
+dub test               # run all unit tests
 ```
 
-Formatting and linting:
+Formatting and linting (the same gates CI runs; `just fmt` / `just lint` wrap them):
 
 ```bash
-dub run dfmt -- --inplace source/
-dub run dscanner -- --styleCheck source/
+dub run dfmt -- --inplace source/ conformance/
+./scripts/dscanner-lint.sh     # D-Scanner with the project config and documented filters
 ```
 
 ## Deploying
@@ -447,10 +447,11 @@ re-authenticated session never reads the previous identity's `private` results.
 
 ## Examples
 
-The repository ships fourteen runnable, self-verifying server/client pairs in
-[`examples/`](examples/). Each `client.d` is an end-to-end test that asserts the
-matching server's behaviour, and CI runs every pair over **both** stdio and
-Streamable HTTP.
+The repository ships fifteen runnable, self-verifying server/client pairs in
+[`examples/`](examples/) (plus `examples/common`, a small shared helper package).
+Each `client.d` is an end-to-end test that asserts the matching server's
+behaviour, and CI runs every pair over **both** stdio and Streamable HTTP, except
+Auth, which is HTTP-only.
 
 | Example | What it shows | Server | Client |
 | --- | --- | --- | --- |
@@ -461,13 +462,12 @@ Streamable HTTP.
 | Modern | the 2026-07-28 protocol end to end (`server/discover`, per-request `_meta`, `connect()`) | [server](examples/modern/server.d) | [client](examples/modern/client.d) |
 | Streaming | progress notifications from a long-running tool | [server](examples/streaming/server.d) | [client](examples/streaming/client.d) |
 | MRTR | multi-round-trip tool input (carried in the result) | [server](examples/mrtr/server.d) | [client](examples/mrtr/client.d) |
-| Tasks | async `@task` tools (progress, cancellation, mid-task input) | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
+| Tasks | MCP Tasks extension (SEP-2663): async `@task` tools with progress, cancellation, and `input_required` | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
 | Sampling | server-initiated LLM sampling (`ctx.sample`) | [server](examples/sampling/server.d) | [client](examples/sampling/client.d) |
 | Elicitation | server-initiated, typed user input (`ctx.elicit!T`) | [server](examples/elicitation/server.d) | [client](examples/elicitation/client.d) |
 | Sticky notes | stateful tools + a resource per note + elicitation-confirmed clear | [server](examples/stickynotes/server.d) | [client](examples/stickynotes/client.d) |
 | Auth | OAuth 2.1 protected HTTP resource server (HTTP only) | [server](examples/auth/server.d) | [client](examples/auth/client.d) |
 | Apps | MCP Apps extension: `@ui` tool link + a `ui://` HTML resource | [server](examples/apps/server.d) | [client](examples/apps/client.d) |
-| Tasks | MCP Tasks extension (SEP-2663): `@task` async tasks with progress, cancellation, and `input_required` | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
 | Skills | MCP Skills extension: `@skill` / `@skillDir` / dynamic Agent Skills served as resources, `skills/list` / `skills/get` discovery with digest + size manifests | [server](examples/skills/server.d) | [client](examples/skills/client.d) |
 | Events | MCP Events extension: `@event` types delivered over poll, push, **and** server-signed webhook (to a client `WebhookReceiver`) | [server](examples/events/server.d) | [client](examples/events/client.d) |
 
@@ -494,7 +494,8 @@ is predictable when porting a hand-built server):
 | `enum` | `{"type": "string", "enum": [members…]}` |
 | `T[]` | `{"type": "array", "items": <T>}` |
 | `V[string]` | `{"type": "object", "additionalProperties": <V>}` |
-| `struct` | `{"type": "object", "properties": …, "required": […]}` |
+| `struct` | `{"type": "object", "properties": …, "required": […]}`, keyed by the serialized field name (vibe's `@name`, else the field name minus one trailing `_`); a `Nullable`, vibe-`@optional`, or defaulted field is not required |
+| `Json` | `{}` (any JSON value) |
 | `std.datetime` `SysTime` / `Date` | `{"type": "string", "format": "date-time"/"date"}` |
 | `std.datetime` `DateTime` / `TimeOfDay` | `{"type": "string", "pattern": …}` matching `YYYY-MM-DDTHH:MM:SS` / `HH:MM:SS` (no UTC offset, so not the RFC 3339 `date-time`/`time` formats) |
 | `SumType!(A, B, …)` | `{"anyOf": [<A>, <B>, …]}` |
@@ -848,6 +849,12 @@ registerSkillDir(server, "skills/release-helper", SkillDirOptions(
     path: "team/release-helper",            // empty derives it from the frontmatter name
 ));
 ```
+
+A relative directory is resolved against the server process's current working
+directory, not the source file or the executable, so a server launched from
+elsewhere (e.g. spawned over stdio by a host) will not find it. Return an
+absolute path when the working directory is not fixed, for example one built
+from `std.file.thisExePath`.
 
 The directory's final path segment must equal the frontmatter `name`
 ([dyaml](https://code.dlang.org/packages/dyaml) parses the frontmatter). A
