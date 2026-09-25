@@ -351,6 +351,9 @@ struct Delivery
 	string subscriptionId;
 	EventOccurrence occ; /// the event to deliver (carries its watermark cursor)
 	int attempt; /// attempts already made
+	/// A `gap` control envelope rather than an event: `occ.cursor` is the position
+	/// the client should persist, `occ.eventId` the envelope's message id.
+	bool gap;
 
 	Json toJson() const @safe
 	{
@@ -359,6 +362,8 @@ struct Delivery
 		j["subscriptionId"] = subscriptionId;
 		j["occ"] = occ.toJson();
 		j["attempt"] = attempt;
+		if (gap)
+			j["gap"] = true;
 		return j;
 	}
 
@@ -370,6 +375,7 @@ struct Delivery
 		if ("occ" in j)
 			d.occ = EventOccurrence.fromJson(j["occ"]);
 		d.attempt = j.getOr("attempt", 0);
+		d.gap = j.getOr("gap", false);
 		return d;
 	}
 }

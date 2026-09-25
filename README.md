@@ -697,9 +697,13 @@ Fetch-handler types are served over webhook by the periodic worker `enableEvents
 starts, which also sweeps lapsed subscriptions and expires poll leases. The
 watermark advances to a position only once every earlier in-flight delivery has
 settled. Delivery is suspended on a sustained failure rate (`WebhookSuspension`:
-95 % over a 60-minute window with a 100-attempt minimum), events emitted while
-suspended queue until the refresh that reactivates it, retries are 5 attempts over
-about 7.5 minutes, and bodies over 256 KiB are abandoned with a `gap` envelope.
+95 % over a 60-minute window with a 100-attempt minimum); events emitted while
+suspended are not queued, and the refresh that reactivates it sends a `gap`
+envelope for the missed positions. A subscription's backlog is bounded
+(`webhookMaxPendingPerSubscription`, default 1000) with the overflow likewise
+signalled by a `gap`; deliveries to an endpoint that never verifies are dropped
+after the attempt bound. Retries are 5 attempts over about 7.5 minutes, and bodies
+over 256 KiB are abandoned with a `gap` envelope.
 
 **Webhook security** is implemented in full: `https`-only callback URLs;
 delivery-time SSRF hardening (the resolved IP is validated against the IANA

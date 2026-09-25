@@ -348,6 +348,7 @@ struct EventsOptions
 	bool allowPrivateCallbackHosts; /// permit non-globally-routable callback IPs (tests/dev)
 	string assumePrincipal; /// when set, requests with no authenticated principal are treated as this one
 	int webhookMaxAttempts = 5; /// bounded delivery attempts per event
+	int webhookMaxPendingPerSubscription = 1000; /// cap on one subscription's undelivered jobs on this node; the overflow is signalled with a gap (0 = unlimited)
 	size_t webhookMaxBodyBytes = 256 * 1024; /// delivery bodies over this are abandoned (with a gap signal), never POSTed
 	WebhookSuspension webhookSuspension; /// failure-rate policy that suspends delivery (active=false)
 	Duration webhookRetryBase = 30.seconds; /// exponential-backoff base between attempts (5 attempts span 7.5 min)
@@ -521,11 +522,13 @@ final class EventsRuntime
 	private PushStream[] pushStreams_;
 	private PollLease[string] pollLeases_; // lease key -> lease record
 	private LifeRef[string] lifeRefs_; // (principal\0name\0args) -> live-subscription refcount
-	private bool[string] verifiedEndpoints_; // (principal\0url) -> verified, in-memory cache
+	private long[string] verifiedEndpoints_; // (principal\0url) -> when last verified or used
 	private WellKnownReceivers[string] wellKnown_; // callback origin -> cached receiver document
 	private OutstandingCursor[][string] outstanding_; // subscription id -> in-flight positions, enqueue order
 	private long[string] nextFetchAt_; // subscription id -> when the poll-driven loop next fetches
 	private VerifyBackoff[string] pendingVerification_; // (principal\0url) -> next-probe backoff
+	private int[string] pendingCount_; // subscription id -> tracked, unsettled deliveries on this node
+	private string[string] missed_; // subscription id -> furthest position dropped undelivered, owed a gap
 
 	this(WebhookSubscriptionStore webhookStore = null, EventsOptions opts = EventsOptions.init) @safe
 	{
@@ -1136,7 +1139,10 @@ final class EventsRuntime
 		// A successful refresh is the client's liveness signal: deliveries queued
 		// while suspended resume now rather than at the next worker pass.
 		if (reactivated)
+		{
+			flushMissed(sub);
 			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
+		}
 
 		SubscribeResult r;
 		r.id = id;
@@ -1187,6 +1193,34 @@ final class EventsRuntime
 		foreach (sub; webhookStore_.all())
 			if (sub.isExpired(now))
 				removeWebhookState(sub);
+		evictEndpointCaches(now);
+	}
+
+	// Drop endpoint-verification and well-known cache entries nothing has used
+	// recently, so the caches track live callbacks rather than every URL ever seen.
+	// An evicted endpoint is simply verified again on its next delivery.
+	private void evictEndpointCaches(long now) @safe
+	{
+		const verifiedTtl = opts_.webhookTtlCap.total!"msecs";
+		string[] stale;
+		foreach (key, at; verifiedEndpoints_)
+			if (now - at >= verifiedTtl)
+				stale ~= key;
+		foreach (key; stale)
+			verifiedEndpoints_.remove(key);
+		stale = null;
+		foreach (key, b; pendingVerification_)
+			if (now - b.nextProbeMs >= verifyBackoffCapMs)
+				stale ~= key;
+		foreach (key; stale)
+			pendingVerification_.remove(key);
+		stale = null;
+		const wellKnownTtl = opts_.wellKnownCacheTtl.total!"msecs";
+		foreach (origin, doc; wellKnown_)
+			if (now - doc.fetchedAtMs >= wellKnownTtl)
+				stale ~= origin;
+		foreach (origin; stale)
+			wellKnown_.remove(origin);
 	}
 
 	// Forget a webhook subscription everywhere: the store, the lifecycle refcount
@@ -1196,6 +1230,8 @@ final class EventsRuntime
 	{
 		webhookStore_.remove(sub.id);
 		outstanding_.remove(sub.id);
+		pendingCount_.remove(sub.id);
+		missed_.remove(sub.id);
 		nextFetchAt_.remove(sub.id);
 		releaseLifecycle(sub.name, sub.arguments, sub.principal);
 	}
@@ -1311,6 +1347,14 @@ final class EventsRuntime
 				return false;
 			if (reg !is null && reg.transform !is null)
 				shaped = reg.transform(ctx, occ);
+		}
+		// Past the per-subscription bound the event is dropped rather than queued
+		// behind a backlog the endpoint is not draining; a gap covers it later.
+		const cap = opts_.webhookMaxPendingPerSubscription;
+		if (cap > 0 && pendingCount_.get(sub.id, 0) >= cap)
+		{
+			noteMissed(sub.id, shaped.cursor);
+			return false;
 		}
 		// Track before enqueueing (a shared queue's enqueue can yield to a drain
 		// that settles the job), and untrack when the job id is already queued:
@@ -1540,8 +1584,9 @@ final class EventsRuntime
 	}
 
 	/// Fan an emitted event out to every live webhook subscription whose name
-	/// matches (a suspended one included — its jobs wait for the refresh that
-	/// reactivates it), applying the type's `match`/`transform` per subscription, by
+	/// matches (a suspended one only records the position it missed, signalled
+	/// with a gap once a refresh reactivates it), applying the type's
+	/// `match`/`transform` per subscription, by
 	/// enqueuing a `Delivery` job per subscription and kicking a drain. Publish is
 	/// thus decoupled from delivery: the job lives in the (possibly shared/durable)
 	/// `DeliveryQueue`, so any node's worker can deliver it and a crashed node's
@@ -1556,6 +1601,13 @@ final class EventsRuntime
 		{
 			if (sub.name != occ.name || sub.isExpired(now))
 				continue;
+			if (!sub.active)
+			{
+				auto ctx = new EventContext(sub.cursor, sub.arguments, sub.principal);
+				if (reg is null || reg.match is null || reg.match(ctx, occ))
+					noteMissed(sub.id, occ.cursor);
+				continue;
+			}
 			any |= enqueueForWebhook(sub, reg, occ, true);
 		}
 		// Kick a drain on this node so the just-enqueued jobs deliver promptly
@@ -1680,20 +1732,29 @@ final class EventsRuntime
 		}
 		if (!s0.get.active)
 		{
-			// Delivery is suspended: leave the job queued (and immediately leasable)
-			// so the refresh that reactivates the subscription resumes it.
-			deliveryQueue_.touch(job.jobId, job.attempt, opts_.nowMs());
+			// Delivery is suspended: the job is dropped rather than re-leased on
+			// every drain, and the refresh that reactivates the subscription
+			// signals the missed position with a gap.
+			abandonUndelivered(job);
 			return;
 		}
 		if (!ensureVerified(s0.get))
 		{
 			recordFailure(subId, DeliveryErrorCategory.challengeFailed);
-			return; // not acked: the endpoint may verify before the next lease
+			// The endpoint may verify later: retry after a backoff, counting the
+			// attempt so a never-verifying endpoint's jobs are eventually dropped.
+			const attempt = job.attempt + 1;
+			if (attempt >= opts_.webhookMaxAttempts)
+				abandonUndelivered(job);
+			else
+				deliveryQueue_.touch(job.jobId, attempt,
+						opts_.nowMs() + backoffFor(attempt).total!"msecs");
+			return;
 		}
 		// A body over the delivery-profile ceiling would be rejected with 413 by a
 		// conformant receiver, so it is abandoned up front: its position settles
 		// for the watermark and a gap envelope tells the client it was skipped.
-		if (occ.toJson().toString().length > opts_.webhookMaxBodyBytes)
+		if (!job.gap && occ.toJson().toString().length > opts_.webhookMaxBodyBytes)
 		{
 			settlePosition(subId, occ.cursor);
 			signalGap(s0.get, occ);
@@ -1711,11 +1772,13 @@ final class EventsRuntime
 				deliveryQueue_.ack(job.jobId);
 				return;
 			}
-			auto res = attemptDelivery(sn.get, occ);
+			auto res = attemptDelivery(sn.get, job);
 			if (res.ok)
 			{
 				recordSuccess(subId, occ.cursor);
 				deliveryQueue_.ack(job.jobId);
+				// The endpoint is taking deliveries again: send any gap it is owed.
+				flushMissed(sn.get);
 				return;
 			}
 			// A receiver that rejects with 410 Gone or 413 too-large does not want a
@@ -1731,7 +1794,8 @@ final class EventsRuntime
 				const cat = res.error.isNull ? DeliveryErrorCategory.http5xx : res.error.get;
 				recordFailure(subId, cat);
 				settlePosition(subId, occ.cursor); // abandoned for watermark purposes
-				signalGap(sn.get, occ); // tell the client the event was lost
+				if (!job.gap)
+					signalGap(sn.get, occ); // tell the client the event was lost
 				deliveryQueue_.ack(job.jobId);
 				return;
 			}
@@ -1763,16 +1827,73 @@ final class EventsRuntime
 		postToCallback(sub.url, headers, body);
 	}
 
-	/// Sign and POST one delivery attempt for `occ` to `sub`'s callback.
-	private WebhookHttpResult attemptDelivery(WebhookSubscription sub, EventOccurrence occ) @safe
+	/// Sign and POST one delivery attempt for `job` to `sub`'s callback: the
+	/// event, or for a gap job the `gap` envelope carrying its cursor.
+	private WebhookHttpResult attemptDelivery(WebhookSubscription sub, Delivery job) @safe
 	{
+		const occ = job.occ;
 		const 
-		body = occ.toJson().toString();
+		body = job.gap ? gapEnvelope(occ.cursor.isNull ? "" : occ.cursor.get)
+			.toString() : occ.toJson().toString();
 		const now = opts_.nowMs();
 		auto headers = signDeliveryHeaders(sub.secret, sub.previousSecret,
 				sub.previousSecretGraceUntilMs,
 				now, occ.eventId, now / 1000, body, sub.id, opts_.v1aSigner);
 		return postToCallback(sub.url, headers, body);
+	}
+
+	// Drop a job that will not be delivered (its subscription is suspended, or
+	// its endpoint never verified): settle its position so the watermark is not
+	// held behind it, and remember it as missed so the client is sent a gap once
+	// the endpoint takes deliveries again. No POST is made to the endpoint here.
+	private void abandonUndelivered(Delivery job) @safe
+	{
+		if (!job.gap)
+			noteMissed(job.subscriptionId, job.occ.cursor);
+		settlePosition(job.subscriptionId, job.occ.cursor);
+		deliveryQueue_.ack(job.jobId);
+	}
+
+	// Record `cursor` as a position `subId` missed. Only the furthest one is kept:
+	// the gap it produces tells the client to resume from there.
+	private void noteMissed(string subId, Nullable!string cursor) @safe
+	{
+		import mcp.server.event_store : tryParseSeq;
+
+		if (cursor.isNull)
+			return;
+		if (auto prev = subId in missed_)
+		{
+			long prevSeq, candSeq;
+			if (tryParseSeq(*prev, prevSeq) && tryParseSeq(cursor.get, candSeq) && candSeq <= prevSeq)
+				return;
+		}
+		missed_[subId] = cursor.get;
+	}
+
+	// Queue a `gap` job for the furthest position `sub` missed, if any. It is
+	// tracked like an event, so the watermark reaches that position only once the
+	// gap is delivered, through the same verified, signed path as events.
+	private void flushMissed(WebhookSubscription sub) @safe
+	{
+		auto p = sub.id in missed_;
+		if (p is null)
+			return;
+		const cursor = *p;
+		missed_.remove(sub.id);
+		EventOccurrence occ;
+		occ.eventId = controlMessageId("gap");
+		occ.name = sub.name;
+		occ.cursor = cursor;
+		trackOutstanding(sub.id, occ.cursor);
+		Delivery job = Delivery(sub.id ~ "/gap/" ~ cursor, sub.id, occ, 0);
+		job.gap = true;
+		if (!deliveryQueue_.enqueue(job))
+		{
+			untrackOutstanding(sub.id, occ.cursor);
+			return;
+		}
+		opts_.deliveryExecutor(() @safe { drainDeliveries(); });
 	}
 
 	/// Single chokepoint for every callback POST: a delivery-time SSRF host check
@@ -1810,17 +1931,18 @@ final class EventsRuntime
 		if (sub.verified)
 			return true;
 		const key = sub.principal ~ "\0" ~ sub.url;
-		if ((key in verifiedEndpoints_) !is null)
+		const now = opts_.nowMs();
+		if (auto at = key in verifiedEndpoints_)
 		{
+			*at = now;
 			markVerified(sub.id);
 			return true;
 		}
-		const now = opts_.nowMs();
 		// A receiver that publishes its accepting paths at the callback origin has
 		// already consented: no challenge POST is needed.
 		if (opts_.wellKnownReceiverVerification && wellKnownCovers(sub.url, now))
 		{
-			verifiedEndpoints_[key] = true;
+			verifiedEndpoints_[key] = now;
 			pendingVerification_.remove(key);
 			markVerified(sub.id);
 			return true;
@@ -1839,7 +1961,7 @@ final class EventsRuntime
 		auto res = postToCallback(sub.url, headers, body);
 		if (res.ok && challengeEchoed(res.body, nonce))
 		{
-			verifiedEndpoints_[key] = true;
+			verifiedEndpoints_[key] = now;
 			pendingVerification_.remove(key);
 			markVerified(sub.id);
 			return true;
@@ -2010,6 +2132,7 @@ final class EventsRuntime
 	{
 		if (cursor.isNull)
 			return;
+		pendingCount_[subId] = pendingCount_.get(subId, 0) + 1;
 		auto list = subId in outstanding_;
 		if (list !is null && (*list).length && (*list)[$ - 1].cursor == cursor.get)
 		{
@@ -2032,12 +2155,20 @@ final class EventsRuntime
 		foreach_reverse (i, ref e; *list)
 			if (e.cursor == cursor.get)
 			{
+				decrementPending(subId);
 				if (--e.remaining <= 0)
 					*list = (*list)[0 .. i] ~ (*list)[i + 1 .. $];
 				break;
 			}
 		if ((*list).length == 0)
 			outstanding_.remove(subId);
+	}
+
+	private void decrementPending(string subId) @safe
+	{
+		if (auto n = subId in pendingCount_)
+			if (--*n <= 0)
+				pendingCount_.remove(subId);
 	}
 
 	// Settle one in-flight delivery at `cursor`. Returns false when the position is
@@ -2057,6 +2188,8 @@ final class EventsRuntime
 			}
 		if (idx == size_t.max)
 			return false;
+		if ((*list)[idx].remaining > 0)
+			decrementPending(subId);
 		(*list)[idx].remaining--;
 		while ((*list).length && (*list)[0].remaining <= 0)
 		{
@@ -4610,14 +4743,16 @@ unittest  // the sample window tumbles: an old streak does not count against a n
 	assert(sub.active && sub.windowAttempts == 1 && sub.windowFailures == 1);
 }
 
-unittest  // events emitted while suspended are queued and delivered once a refresh reactivates
+unittest  // events missed while suspended are signalled with a gap once a refresh reactivates
 {
 	auto ft = new FakeWebhookTransport();
+	auto queue = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
 	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
+	o.deliveryQueue = queue;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	o.deliverySleep = (Duration d) @safe {};
 	o.webhookMaxAttempts = 1;
@@ -4630,19 +4765,136 @@ unittest  // events emitted while suspended are queued and delivered once a refr
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	rt.emit(EventOccurrence("evt_2", "n", "t"));
 	assert(!rt.webhookStore().get(r.id).get.active);
-	const before = ft.eventPosts().length;
+	const posts = ft.eventPosts().length;
+	const gaps = controlPostsOf(ft, "gap").length;
 
-	// Suspended: the emit is queued, not attempted.
+	// Suspended: nothing is attempted or queued for the missed event.
 	rt.emit(EventOccurrence("evt_3", "n", "t"));
-	assert(ft.eventPosts().length == before);
+	assert(ft.eventPosts().length == posts);
+	assert(queue.lease(1_000_000L, 1000).length == 0);
 
-	// The refresh reactivates delivery and the queued event goes out (200 now).
+	// The refresh reactivates delivery and a gap tells the client what it missed.
 	auto refreshed = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 	assert(!refreshed.deliveryStatus.isNull && refreshed.deliveryStatus.get.active);
-	assert(ft.eventPosts().length == before + 1);
-	import std.algorithm : canFind;
+	assert(ft.eventPosts().length == posts);
+	auto gapPosts = controlPostsOf(ft, "gap");
+	assert(gapPosts.length == gaps + 1);
+	assert(parseJsonString(gapPosts[$ - 1].body)["cursor"].get!string == "3");
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "3");
+}
 
-	assert(ft.eventPosts()[$ - 1].body.canFind("evt_3"));
+unittest  // a job queued before its subscription was suspended is not re-leased on every drain
+{
+	auto ft = new FakeWebhookTransport();
+	auto queue = new InMemoryDeliveryQueue();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryQueue = queue;
+	o.deliverySleep = (Duration d) @safe {};
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	auto sub = rt.webhookStore().get(r.id).get;
+	sub.active = false;
+	rt.webhookStore().put(sub);
+	for (size_t i = 0; i < deferred.length; i++)
+		deferred[i]();
+	assert(ft.eventPosts().length == 0);
+	assert(queue.lease(1_000_000L, 1000).length == 0);
+}
+
+unittest  // deliveries to an endpoint that never verifies are dead-lettered after the attempt bound
+{
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	ft.echoChallenge = false;
+	auto queue = new InMemoryDeliveryQueue();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryQueue = queue;
+	o.webhookMaxAttempts = 2;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	foreach (_; 0 .. 4)
+	{
+		now += 60 * 60 * 1000;
+		rt.drainDeliveries();
+	}
+	assert(queue.lease(now, 1000).length == 0);
+	assert(ft.eventPosts().length == 0);
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "1");
+}
+
+unittest  // a subscription's queued deliveries are bounded; the overflow is signalled with a gap
+{
+	auto ft = new FakeWebhookTransport();
+	auto queue = new InMemoryDeliveryQueue();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryQueue = queue;
+	o.webhookMaxPendingPerSubscription = 2;
+	o.deliverySleep = (Duration d) @safe {};
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	foreach (id; ["evt_1", "evt_2", "evt_3"])
+		rt.emit(EventOccurrence(id, "n", "t"));
+	for (size_t i = 0; i < deferred.length; i++)
+		deferred[i]();
+	assert(ft.eventPosts().length == 2);
+	auto gaps = controlPostsOf(ft, "gap");
+	assert(gaps.length == 1 && parseJsonString(gaps[0].body)["cursor"].get!string == "3");
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "3");
+}
+
+unittest  // endpoint verification and well-known caches are evicted once stale
+{
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	ft.wellKnownBody = `{"receivers": ["/hooks/"]}`;
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks/a"), "user-1");
+	ft.echoChallenge = false;
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/other"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(rt.verifiedEndpoints_.length == 1);
+	assert(rt.wellKnown_.length == 1);
+	assert(rt.pendingVerification_.length == 1);
+	now += 24 * 60 * 60 * 1000;
+	rt.tick();
+	assert(rt.verifiedEndpoints_.length == 0);
+	assert(rt.wellKnown_.length == 0);
+	assert(rt.pendingVerification_.length == 0);
 }
 
 unittest  // emitted webhook deliveries respect the type's match filter
