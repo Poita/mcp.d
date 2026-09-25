@@ -36,6 +36,25 @@ enum FetchResult
 	error
 }
 
+/// Whether a protected-resource metadata document's `resource` identifies the
+/// MCP server at `mcpEndpoint` (RFC 9728 §3.3). After canonicalizing both, the
+/// resource must equal the endpoint or be a same-origin path prefix of it ending
+/// on a `/` boundary — the latter covers a document served at the root
+/// well-known URL that names the whole origin (or a parent path) as the
+/// resource. A missing `resource` never matches.
+package bool prmResourceMatches(string prmResource, string mcpEndpoint) @safe
+{
+	import std.string : startsWith;
+
+	if (prmResource.length == 0)
+		return false;
+	const want = canonicalResourceUri(mcpEndpoint);
+	const have = canonicalResourceUri(prmResource);
+	if (have == want)
+		return true;
+	return want.length > have.length && want.startsWith(have) && want[have.length] == '/';
+}
+
 /// A production OAuth 2.1 client for MCP: drives protected-resource and
 /// authorization-server metadata discovery (RFC 9728 / RFC 8414), Dynamic Client
 /// Registration (RFC 7591), and the token endpoint (authorization-code + PKCE,
@@ -110,7 +129,14 @@ final class OAuthClient
 			final switch (tryGetJson(u, j))
 			{
 			case FetchResult.ok:
-				return ProtectedResourceMetadata.fromJson(j);
+				auto prm = ProtectedResourceMetadata.fromJson(j);
+				// RFC 9728 §3.3: a document describing some other resource MUST NOT
+				// be used (it could steer the client to an attacker's AS).
+				if (!prmResourceMatches(prm.resource, mcpEndpoint))
+					throw internalError("Protected-resource metadata names resource '"
+							~ prm.resource
+							~ "', which does not match the MCP endpoint " ~ mcpEndpoint);
+				return prm;
 			case FetchResult.error:
 				anyError = true;
 				break;
@@ -1301,6 +1327,51 @@ unittest  // discovery: protected-resource (well-known + same-origin WWW-Authent
 	assert(issuer == srv.base);
 	// Convenience overload discards the discovery-source signal.
 	assert(c.resolveIssuer(endpoint) == srv.base);
+}
+
+unittest  // discoverProtectedResource rejects a PRM document whose resource names another server (RFC 9728 §3.3)
+{
+	import std.algorithm : canFind;
+	import std.exception : assertThrown;
+
+	LoopbackServer srv;
+	srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		if (req.path.canFind("oauth-protected-resource"))
+			res.writeBody(`{"resource":"https://other.example/mcp",`
+				~ `"authorization_servers":["https://attacker-as.example"]}`, "application/json");
+		else
+		{
+			res.statusCode = 404;
+			res.writeBody("", "text/plain");
+		}
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	assertThrown(c.discoverProtectedResource(srv.base ~ "/mcp"));
+	bool fromPrm;
+	assertThrown(c.resolveIssuer(srv.base ~ "/mcp", fromPrm));
+}
+
+unittest  // prmResourceMatches accepts the endpoint itself or a path prefix of it on the same origin
+{
+	assert(prmResourceMatches("https://mcp.example.com/mcp", "https://mcp.example.com/mcp"));
+	assert(prmResourceMatches("https://MCP.example.com/mcp/", "https://mcp.example.com/mcp"));
+	assert(prmResourceMatches("https://mcp.example.com", "https://mcp.example.com/mcp"));
+	assert(prmResourceMatches("https://mcp.example.com/", "https://mcp.example.com/mcp"));
+	assert(prmResourceMatches("https://mcp.example.com/tenant",
+			"https://mcp.example.com/tenant/mcp"));
+}
+
+unittest  // prmResourceMatches rejects another origin, a sibling path, and a missing resource
+{
+	assert(!prmResourceMatches("https://other.example/mcp", "https://mcp.example.com/mcp"));
+	assert(!prmResourceMatches("https://mcp.example.com:8443/mcp", "https://mcp.example.com/mcp"));
+	assert(!prmResourceMatches("http://mcp.example.com/mcp", "https://mcp.example.com/mcp"));
+	assert(!prmResourceMatches("https://mcp.example.com/mc", "https://mcp.example.com/mcp"));
+	assert(!prmResourceMatches("https://mcp.example.com/mcp/admin", "https://mcp.example.com/mcp"));
+	assert(!prmResourceMatches("", "https://mcp.example.com/mcp"));
 }
 
 unittest  // discoverAuthServer falls back to synthesized endpoints when no document exists
