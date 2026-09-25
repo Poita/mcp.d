@@ -288,11 +288,13 @@ void runStdio(McpServer server, StdioOptions opts)
 /// channel's serialized writer.
 ///
 /// `maxLineBytes` bounds a single inbound line; an oversized frame is dropped (its
-/// bytes are skipped up to the next newline) and the loop continues so one
-/// misbehaving frame neither exhausts memory nor kills the server.
+/// bytes are skipped up to the next newline) and answered with a -32600 error
+/// carrying its id when one is found in its first bytes (else null), and the loop
+/// continues so one misbehaving frame neither exhausts memory nor kills the server.
 void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 {
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.core.sync : TaskMutex;
 
 	// Enforce the documented "at most once per process" invariant explicitly, so it
 	// holds for both a concurrent second call and a sequential one and does not
@@ -312,14 +314,15 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 	auto outFD = adopted.outFD;
 
 	auto reader = StdinLineReader(inFD, maxLineBytes);
-
-	string readLine() @safe
-	{
-		return reader.next();
-	}
+	// Serializes whole-frame writes: the channel's writer and the read loop's
+	// over-long-line error reply both write stdout.
+	auto writeMtx = new TaskMutex;
 
 	void writeLine(string s) @safe
 	{
+		() @trusted { writeMtx.lock(); }();
+		scope (exit)
+			() @trusted { writeMtx.unlock(); }();
 		auto bytes = cast(const(ubyte)[])(s ~ "\n");
 		// Write the whole frame (IOMode.all loops internally until done). Inspect
 		// the result symmetrically with readLine: a status that is neither ok nor
@@ -332,6 +335,31 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 		auto res = outFD.writeAll(bytes);
 		if (writeFailed(res.status, res.nbytes, bytes.length))
 			throw new Exception("runStdio: write to stdout failed (peer closed its read end?)");
+	}
+
+	string readLine() @safe
+	{
+		import std.conv : to;
+		import mcp.protocol.errors : invalidRequest;
+		import mcp.protocol.jsonrpc : makeErrorResponse;
+
+		for (;;)
+		{
+			auto line = reader.next();
+			Json id;
+			if (!reader.takeOversized(id))
+				return line;
+			// Answer the dropped frame so the peer's request does not hang.
+			try
+				writeLine(makeErrorResponse(id, invalidRequest(
+						"message exceeds the " ~ maxLineBytes.to!string ~ "-byte line limit"))
+						.toString());
+			catch (Exception)
+			{
+			}
+			if (line is null)
+				return null;
+		}
 	}
 
 	() @trusted {
@@ -788,6 +816,9 @@ private struct StdinLineReader
 	private enum size_t chunk = 64 * 1024;
 	private ubyte[] buf; // bytes read but not yet consumed
 	private size_t bufPos; // index of the next unconsumed byte in `buf`
+	private enum size_t idScanBytes = 4096;
+	private bool oversized_; // an over-long line was dropped since the last takeOversized
+	private Json oversizedId_; // its top-level JSON-RPC id, or null when unknown
 
 	this(StdioEnd inEnd, size_t maxLineBytes) @safe
 	{
@@ -818,13 +849,30 @@ private struct StdinLineReader
 
 	// Async, cooperative line read over stdin: return the next line (without its
 	// '\n', stripping a trailing '\r'); a 0-byte read (disconnected) is EOF -> null.
-	// A partial, unterminated fragment accumulated before EOF is unrecoverable and
-	// is discarded (null is returned) rather than forwarded as a malformed line.
-	// An over-long line (> maxLineBytes) is dropped and reading resumes after the
-	// next newline.
+	// A final line left unterminated at EOF is returned before the null. An
+	// over-long line (> maxLineBytes) is dropped — `next` returns "" and
+	// `takeOversized` reports it so the caller can answer the peer — and reading
+	// resumes after the next newline.
 	string next() @safe
 	{
 		return nextWith(&refill);
+	}
+
+	// Whether an over-long line was dropped since the last call; if so `id` is its
+	// top-level JSON-RPC id (null when not found in the line's first bytes).
+	bool takeOversized(out Json id) @safe
+	{
+		if (!oversized_)
+			return false;
+		oversized_ = false;
+		id = oversizedId_;
+		return true;
+	}
+
+	private void markOversized(const(ubyte)[] prefix) @safe
+	{
+		oversized_ = true;
+		oversizedId_ = topLevelJsonRpcId(prefix);
 	}
 
 	// The pure line-assembly state machine, parameterised on the buffer-refill
@@ -839,9 +887,18 @@ private struct StdinLineReader
 		{
 			if (bufPos >= buf.length)
 			{
-				// Refill from the pipe.
+				// Refill from the pipe. At EOF a final unterminated line is still a
+				// complete message; the next call then reports EOF.
 				if (!refillFn())
-					return null; // EOF — partial fragment is unrecoverable
+				{
+					if (dropping)
+						return null;
+					if (acc.length && acc[$ - 1] == '\r')
+						acc = acc[0 .. $ - 1];
+					return acc.length ? () @trusted {
+						return cast(string) acc.idup;
+					}() : null;
+				}
 			}
 
 			// Scan the filled region for a newline.
@@ -862,6 +919,7 @@ private struct StdinLineReader
 					acc ~= rest;
 					if (acc.length > maxLineBytes)
 					{
+						markOversized(acc[0 .. $ < idScanBytes ? $ : idScanBytes]);
 						acc = null;
 						dropping = true;
 					}
@@ -880,15 +938,108 @@ private struct StdinLineReader
 			// dropping, or only now over the cap) is discarded and a fresh one started.
 			if (dropping || acc.length > maxLineBytes)
 			{
-				dropping = false;
-				acc = null;
-				continue;
+				if (!dropping)
+					markOversized(acc[0 .. $ < idScanBytes ? $ : idScanBytes]);
+				return "";
 			}
 			if (acc.length && acc[$ - 1] == '\r')
 				acc = acc[0 .. $ - 1];
 			return () @trusted { return cast(string) acc.idup; }();
 		}
 	}
+}
+
+/// Extract the top-level `"id"` of a JSON-RPC object from a (possibly
+/// truncated) prefix of its text: a number or string value at object depth 1,
+/// skipping nested objects/arrays and string contents. Returns JSON null when no
+/// such id appears in the prefix.
+private Json topLevelJsonRpcId(const(ubyte)[] text) @safe
+{
+	import std.conv : to, ConvException;
+	import vibe.data.json : parseJsonString, JSONException;
+
+	size_t i;
+	int depth;
+	bool expectValueForId;
+	bool afterKey; // the last depth-1 string was a key whose ':' is pending
+	string lastKey;
+
+	// Scan one JSON string starting at text[i] == '"'; returns its raw contents
+	// (escapes left as-is) and leaves i after the closing quote, or null if cut off.
+	string scanString() @safe
+	{
+		const start = ++i;
+		while (i < text.length)
+		{
+			if (text[i] == '\\')
+				i += 2;
+			else if (text[i] == '"')
+				return () @trusted { return cast(string) text[start .. i++]; }();
+			else
+				i++;
+		}
+		return null;
+	}
+
+	while (i < text.length)
+	{
+		const c = text[i];
+		if (c == '"')
+		{
+			const startQuote = i;
+			auto str = scanString();
+			if (str is null)
+				break;
+			if (expectValueForId)
+			{
+				try
+					return parseJsonString(() @trusted {
+						return cast(string) text[startQuote .. i];
+					}());
+				catch (JSONException)
+					return Json(null);
+			}
+			if (depth == 1)
+			{
+				lastKey = str;
+				afterKey = true;
+			}
+			continue;
+		}
+		if (expectValueForId && (c == '-' || (c >= '0' && c <= '9')))
+		{
+			const start = i;
+			while (i < text.length && (text[i] == '-' || text[i] == '+'
+					|| text[i] == '.' || text[i] == 'e' || text[i] == 'E'
+					|| (text[i] >= '0' && text[i] <= '9')))
+				i++;
+			if (i >= text.length)
+				break; // cut off mid-number
+			try
+				return Json(() @trusted { return cast(string) text[start .. i]; }().to!long);
+			catch (ConvException)
+				return Json(null);
+		}
+		if (c == ':' && depth == 1 && afterKey)
+		{
+			expectValueForId = lastKey == "id";
+			afterKey = false;
+		}
+		else if (c == '{' || c == '[')
+		{
+			if (expectValueForId)
+				return Json(null);
+			depth++;
+		}
+		else if (c == '}' || c == ']')
+			depth--;
+		else if (c == ',' && depth == 1)
+			expectValueForId = false;
+		else if (expectValueForId && c > ' ')
+			return Json(null); // true/false/null are not valid ids
+		i++;
+	}
+	return Json(null);
 }
 
 /// Decide whether a stdout write is a failure the channel must surface. A status
@@ -921,7 +1072,7 @@ version (unittest)
 	// event loop): each refill hands the reader the next pre-chunked slice, and
 	// returns false (EOF) once the chunks are exhausted -- exactly the contract
 	// StdinLineReader.refill has. Lets the line-assembly edge cases be unit-tested.
-	private string[] drainLineReader(size_t maxLineBytes, ubyte[][] chunks) @safe
+	private string[] drainLineReader(size_t maxLineBytes, ubyte[][] chunks, ref Json[] oversizedIds) @safe
 	{
 		auto reader = StdinLineReader.init;
 		reader.maxLineBytes = maxLineBytes;
@@ -943,11 +1094,21 @@ version (unittest)
 		for (;;)
 		{
 			auto s = reader.nextWith(&refill);
+			Json id;
+			if (reader.takeOversized(id))
+				oversizedIds ~= id;
 			if (s is null)
 				break;
-			lines ~= s;
+			if (s.length)
+				lines ~= s;
 		}
 		return lines;
+	}
+
+	private string[] drainLineReader(size_t maxLineBytes, ubyte[][] chunks) @safe
+	{
+		Json[] ignored;
+		return drainLineReader(maxLineBytes, chunks, ignored);
 	}
 }
 
@@ -989,14 +1150,40 @@ unittest  // StdinLineReader reassembles a line split across two refills
 	assert(lines == ["hello", "world"], "a line spanning two refills is reassembled");
 }
 
-unittest  // StdinLineReader discards a partial (unterminated) fragment at EOF and returns null
+unittest  // StdinLineReader returns a final unterminated line at EOF
 {
-	// A newline-less fragment at EOF is unrecoverable: passing it to the line
-	// dispatcher would trigger a malformed-JSON parse error and a spurious
-	// null-id error-response write to the already-closed peer. null is returned
-	// to signal end-of-input cleanly.
-	auto lines = drainLineReader(64, [cast(ubyte[]) "noeol".dup]);
-	assert(lines == [], "a trailing line without a newline must be discarded at EOF");
+	auto lines = drainLineReader(64, [cast(ubyte[]) "first\nlast\r".dup]);
+	assert(lines == ["first", "last"], "a final line without a newline must still be processed");
+}
+
+unittest  // StdinLineReader reports an over-long line with its top-level id
+{
+	Json[] ids;
+	auto lines = drainLineReader(24,
+			[
+				cast(ubyte[]) `{"params":{"id":9,"x":"aaaaaaaaaaaaaaaa"},"id":42,"method":"m"}`.dup,
+				cast(ubyte[]) "\ntail\n".dup
+	], ids);
+	assert(lines == ["tail"]);
+	assert(ids.length == 1);
+	assert(ids[0].type == Json.Type.int_ && ids[0].get!long == 42,
+			"the reported id is the request's own, not a nested params id");
+}
+
+unittest  // StdinLineReader reports an over-long line whose id is unknown as null
+{
+	Json[] ids;
+	drainLineReader(8, [cast(ubyte[]) "aaaaaaaaaaaa\ntail\n".dup], ids);
+	assert(ids.length == 1);
+	assert(ids[0].type == Json.Type.null_);
+}
+
+unittest  // StdinLineReader reports an over-long line cut off by EOF
+{
+	Json[] ids;
+	drainLineReader(8, [cast(ubyte[]) `{"id":"abc","method":"xxxxxxxx"`.dup], ids);
+	assert(ids.length == 1);
+	assert(ids[0].get!string == "abc");
 }
 
 version (Posix) unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with its O_NONBLOCK bit unchanged
