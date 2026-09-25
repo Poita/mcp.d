@@ -564,24 +564,49 @@ final class HttpClientTransport : ClientTransport
 		if (got)
 			return result;
 
-		// Premature stream close with an SSE `retry:` hint: wait the prescribed
-		// delay, then RESUME the stream with a GET carrying `Last-Event-ID`
-		// (per Streamable HTTP resumability — not a re-POST of the request).
-		// The 2026-07-28 removed resumability; a modern server responds with
-		// 405, so skip the GET when the negotiated version is modern.
-		if (cursor.retryMs > 0 && !modernProtocol)
+		// The stream closed before the response. When it carried an event id, wait
+		// the server's `retry:` delay (or a growing backoff) and RESUME it with a GET
+		// carrying `Last-Event-ID` (basic/transports §Resumability and Redelivery —
+		// not a re-POST), repeating from the latest id each time the resumed stream
+		// closes too. Resumption stops when the server refuses the GET or after
+		// `maxIdleResumes` resumes that deliver no new event; the client's request
+		// timeout bounds it overall. The 2026-07-28 removed resumability (a modern
+		// server answers the GET with 405), so a modern session never resumes.
+		enum maxIdleResumes = 3;
+		string failure;
+		if (!modernProtocol)
 		{
-			sleep(cursor.retryMs.msecs);
-			if (req.aborted is null)
-				resumeViaGet(expectId, cursor.lastEventId, result, got, err, req);
-			if (req.aborted !is null)
-				throw req.aborted;
-			if (err !is null)
-				throw err;
-			if (got)
-				return result;
+			auto backoff = 250.msecs;
+			size_t idle;
+			while (cursor.lastEventId.length && idle < maxIdleResumes)
+			{
+				sleep(cursor.retryMs > 0 ? cursor.retryMs.msecs : backoff);
+				backoff = nextBackoff(backoff, 5.seconds);
+				if (req.aborted !is null)
+					throw req.aborted;
+				const before = cursor.lastEventId;
+				const opened = resumeViaGet(expectId, cursor, result, got, err, failure, req);
+				if (req.aborted !is null)
+					throw req.aborted;
+				if (err !is null)
+					throw err;
+				if (got)
+					return result;
+				if (!opened)
+					break;
+				idle = cursor.lastEventId == before ? idle + 1 : 0;
+			}
 		}
-		throw internalError("No response received for request " ~ idStr(expectId));
+		throw internalError("No response received for request " ~ idStr(expectId) ~ (failure.length
+				? ": " ~ failure : ""));
+	}
+
+	/// Double `current`, capped at `cap`: the reconnect delay after another
+	/// attempt that made no progress.
+	private static Duration nextBackoff(Duration current, Duration cap) @safe pure nothrow
+	{
+		const doubled = current * 2;
+		return doubled > cap ? cap : doubled;
 	}
 
 	/// Open a raw TCP connection to `host:port`, bounding the attempt by
@@ -867,8 +892,13 @@ final class HttpClientTransport : ClientTransport
 
 	/// Resume a closed response stream via `GET` with `Last-Event-ID`, reading
 	/// the resumed SSE stream until the awaited response (`expectId`) arrives.
-	private void resumeViaGet(long expectId, string lastEventId, ref Json result,
-			ref bool got, ref McpException err, PostRequest req = null) @safe
+	///
+	/// The GET carries `cursor.lastEventId` and the resumed stream's `id:`/`retry:`
+	/// fields update `cursor`, so a further resume continues from the latest event.
+	/// Returns false when the stream could not be (re)opened — the server refused
+	/// the GET or the connection failed (its message is left in `failure`).
+	private bool resumeViaGet(long expectId, ref SseCursor cursor, ref Json result,
+			ref bool got, ref McpException err, ref string failure, PostRequest req = null) @safe
 	{
 		const ep = parseHttpEndpoint(url);
 		// Resolve + pin the user-configured endpoint host to a numeric address.
@@ -893,6 +923,7 @@ final class HttpClientTransport : ClientTransport
 			serverStreamSlots = serverStreamSlots.remove!(s => s is slot);
 		}
 
+		bool opened;
 		() @trusted {
 			try
 			{
@@ -904,16 +935,16 @@ final class HttpClientTransport : ClientTransport
 					return;
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, ep.host);
-				const getReq = buildHttpRequest("GET", ep.path, ep.host,
-						"text/event-stream", "keep-alive", true, verHeaders, lastEventId, null);
+				const getReq = buildHttpRequest("GET", ep.path, ep.host, "text/event-stream",
+						"keep-alive", true, verHeaders, cursor.lastEventId, null);
 				conn.write(cast(const(ubyte)[]) getReq);
 
 				bool chunked;
 				if (!readSseResponseHead(conn, chunked))
 					return;
+				opened = true;
 
 				bool done;
-				SseCursor cursor;
 				readSseBody(conn, chunked, cursor, () @safe => done,
 						(string eventType, string data) @safe {
 					// Reuse the POST-path dispatcher: it isolates parseJsonString
@@ -927,10 +958,9 @@ final class HttpClientTransport : ClientTransport
 				});
 			}
 			catch (Exception e)
-			{
-				recordTransportFailure(e.msg, got, err);
-			}
+				failure = e.msg;
 		}();
+		return opened;
 	}
 
 	private static bool isInitialize(Json message) @safe
@@ -1233,8 +1263,11 @@ final class HttpClientTransport : ClientTransport
 
 	/// Open the standalone server->client SSE stream over a raw TCP connection
 	/// (vibe's pooled `requestHTTP` does not reliably surface a long-lived,
-	/// idle-then-active SSE body). Honors the SSE `retry:` field and resumes with
-	/// `Last-Event-ID` on reconnect, up to a few attempts.
+	/// idle-then-active SSE body). Whenever the stream closes or the connection
+	/// fails it reconnects — after the server's SSE `retry:` delay, else a
+	/// backoff that grows while attempts make no progress — resuming with the
+	/// latest `Last-Event-ID`, until `close()`. A server that refuses the GET
+	/// (e.g. 405: it offers no standalone stream) ends the reader.
 	private void runServerStream() @safe
 	{
 		import core.time : msecs;
@@ -1258,11 +1291,10 @@ final class HttpClientTransport : ClientTransport
 		// (not a shared transport field) prevents a concurrent POST/listen reader from
 		// clobbering this stream's Last-Event-ID resume on reconnect.
 		SseCursor cursor;
-		foreach (attempt; 0 .. 2)
+		auto backoff = 250.msecs;
+		while (!closing)
 		{
-			if (closing)
-				break;
-			cursor.retryMs = 0;
+			bool refused;
 			bool sawData;
 			// Register a slot so `close()` can force-close this connection's socket
 			// even while the reader is parked on a long-lived SSE read.
@@ -1293,7 +1325,10 @@ final class HttpClientTransport : ClientTransport
 
 					bool chunked;
 					if (!readSseResponseHead(conn, chunked))
+					{
+						refused = true;
 						return;
+					}
 
 					readSseBody(conn, chunked, cursor, () @safe => closing,
 							(string eventType, string data) @safe {
@@ -1310,13 +1345,13 @@ final class HttpClientTransport : ClientTransport
 				}
 			}();
 
-			if (closing)
+			if (closing || refused)
 				break;
-			// Reconnect honoring the server-provided retry delay (SSE `retry:`).
-			if (cursor.retryMs > 0)
-				sleep(cursor.retryMs.msecs);
-			else if (!sawData)
-				break; // stream unavailable and no retry hint: stop
+			// A stream that delivered events was healthy: restart the backoff.
+			if (sawData)
+				backoff = 250.msecs;
+			sleep(cursor.retryMs > 0 ? cursor.retryMs.msecs : backoff);
+			backoff = nextBackoff(backoff, 30.seconds);
 		}
 	}
 
@@ -3283,4 +3318,151 @@ unittest  // cancelling a modern HTTP request closes its response stream and fai
 	assert(streamClosed, "cancellation must close the request's response stream");
 	assert(!sawCancelledNotification,
 			"modern HTTP cancels by closing the stream, not by notification");
+}
+
+version (unittest)
+{
+	/// A 2025-11-25 fake whose `tools/list` POST stream carries only the SSE
+	/// prelude `postPrelude` before closing; each resume GET is answered by
+	/// `onGet(lastEventId, requestId, res)`. Other POSTs behave as in
+	/// `answeringRouter`.
+	private URLRouter droppingRouter(string postPrelude, void delegate(string lastEventId,
+			long requestId, HTTPServerResponse res) @safe onGet) @safe
+	{
+		long droppedId = -1;
+		auto r = answeringRouter((Json req, HTTPServerResponse res) @safe {
+			droppedId = req["id"].get!long;
+			res.contentType = "text/event-stream";
+			() @trusted {
+				res.bodyWriter.write(cast(const(ubyte)[]) postPrelude);
+				res.bodyWriter.flush();
+			}();
+		});
+		r.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+			onGet(req.headers.get("Last-Event-ID", ""), droppedId, res);
+		});
+		return r;
+	}
+
+	private void writeSse(HTTPServerResponse res, string frames) @safe
+	{
+		res.contentType = "text/event-stream";
+		() @trusted {
+			res.bodyWriter.write(cast(const(ubyte)[]) frames);
+			res.bodyWriter.flush();
+		}();
+	}
+
+	private string toolsListFrame(long id) @safe
+	{
+		auto resp = parseJsonString(`{"jsonrpc":"2.0","result":{"tools":[]}}`);
+		resp["id"] = Json(id);
+		return "data: " ~ resp.toString() ~ "\n\n";
+	}
+}
+
+unittest  // a POST stream that closes after an event id resumes via GET even without a retry hint
+{
+	import mcp.client.client : McpClient;
+
+	string[] getIds;
+	auto router = droppingRouter("id: evt-1\n\n", (string lastId, long reqId,
+			HTTPServerResponse res) @safe {
+		getIds ~= lastId;
+		writeSse(res, "id: evt-2\n" ~ toolsListFrame(reqId));
+	});
+	size_t tools = size_t.max;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		tools = client.listTools().tools.length;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(getIds == ["evt-1"]);
+	assert(tools == 0);
+}
+
+unittest  // a resumed stream that closes again is resumed from the latest event id
+{
+	import mcp.client.client : McpClient;
+
+	string[] getIds;
+	auto router = droppingRouter("retry: 20\nid: evt-1\n\n", (string lastId,
+			long reqId, HTTPServerResponse res) @safe {
+		getIds ~= lastId;
+		if (lastId == "evt-1")
+			writeSse(res, "id: evt-2\n: still working\n\n");
+		else
+			writeSse(res, toolsListFrame(reqId));
+	});
+	size_t tools = size_t.max;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		tools = client.listTools().tools.length;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(getIds == ["evt-1", "evt-2"], "each resume must carry the latest event id");
+	assert(tools == 0);
+}
+
+unittest  // a POST stream with a retry hint but no event id is not resumed with a cursor-less GET
+{
+	import mcp.client.client : McpClient;
+
+	bool sawGet;
+	auto router = droppingRouter("retry: 20\n\n", (string lastId, long reqId,
+			HTTPServerResponse res) @safe {
+		sawGet = true;
+		writeSse(res, toolsListFrame(reqId));
+	});
+	bool failed;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		try
+			client.listTools();
+		catch (McpException)
+			failed = true;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(!sawGet, "without an event id there is nothing to resume");
+	assert(failed);
+}
+
+unittest  // the standalone server stream keeps reconnecting after repeated closes, carrying the latest event id
+{
+	import core.time : msecs, MonoTime;
+	import std.conv : to;
+	import vibe.core.core : sleep;
+	import mcp.client.client : McpClient;
+
+	string[] getIds;
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		res.statusCode = 500;
+		res.writeBody("", "text/plain");
+	});
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		getIds ~= req.headers.get("Last-Event-ID", "");
+		writeSse(res, "retry: 20\nid: s" ~ getIds.length.to!string ~ "\n: tick\n\n");
+	});
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		client.startServerStream();
+		const until = MonoTime.currTime + 3.seconds;
+		while (getIds.length < 4 && MonoTime.currTime < until)
+			sleep(20.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(getIds.length >= 4, "the standalone stream must keep reconnecting");
+	assert(getIds[0 .. 4] == ["", "s1", "s2", "s3"]);
 }
