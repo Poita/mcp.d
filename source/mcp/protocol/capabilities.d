@@ -320,10 +320,8 @@ struct ServerCapabilities
 			c.resources = ResourcesCapability.fromJson(j["resources"]);
 		if ("prompts" in j && j["prompts"].type == Json.Type.object)
 			c.prompts = ListChangedCapability.fromJson(j["prompts"]);
-		if ("logging" in j)
-			c.logging = true;
-		if ("completions" in j)
-			c.completions = true;
+		c.logging = declaresObject(j, "logging");
+		c.completions = declaresObject(j, "completions");
 		if ("experimental" in j)
 			c.experimental = j["experimental"];
 		if ("extensions" in j)
@@ -345,6 +343,14 @@ enum ClientCapability
 	elicitationForm,
 	elicitationUrl,
 	roots,
+}
+
+/// Whether `j` declares the capability `key`: the schema models every
+/// capability as an object, so a `null`, boolean, or other scalar value does not
+/// count as a declaration.
+private bool declaresObject(Json j, string key) @safe
+{
+	return j.type == Json.Type.object && key in j && j[key].type == Json.Type.object;
 }
 
 /// Capabilities a client advertises during initialization.
@@ -460,31 +466,24 @@ struct ClientCapabilities
 			if ("listChanged" in r && r["listChanged"].type == Json.Type.bool_)
 				c.rootsListChanged = r["listChanged"].get!bool;
 		}
-		if ("sampling" in j)
+		if (declaresObject(j, "sampling"))
 		{
 			c.sampling = true;
-			if (j["sampling"].type == Json.Type.object)
-			{
-				if ("tools" in j["sampling"])
-					c.samplingTools = true;
-				if ("context" in j["sampling"])
-					c.samplingContext = true;
-			}
+			c.samplingTools = declaresObject(j["sampling"], "tools");
+			c.samplingContext = declaresObject(j["sampling"], "context");
 		}
-		if ("elicitation" in j)
+		if (declaresObject(j, "elicitation"))
 		{
 			c.elicitation = true;
-			if (j["elicitation"].type == Json.Type.object && j["elicitation"].length > 0)
+			if (j["elicitation"].length > 0)
 			{
-				if ("form" in j["elicitation"])
-					c.elicitationForm = true;
-				if ("url" in j["elicitation"])
-					c.elicitationUrl = true;
+				c.elicitationForm = declaresObject(j["elicitation"], "form");
+				c.elicitationUrl = declaresObject(j["elicitation"], "url");
 			}
 			else
 			{
-				// An empty (or non-object) elicitation declaration is equivalent
-				// to declaring form mode only.
+				// An empty elicitation declaration is equivalent to declaring
+				// form mode only.
 				c.elicitationForm = true;
 			}
 		}
@@ -1304,4 +1303,35 @@ unittest  // Icon.fromJson rejects a non-object icon with -32602
 
 	auto ex = cast(McpException) collectException(Icon.fromJson(Json(5)));
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // ClientCapabilities.fromJson ignores null and non-object capability values
+{
+	auto c = ClientCapabilities.fromJson(Json([
+		"sampling": Json(null),
+		"elicitation": Json(null),
+		"roots": Json(true)
+	]));
+	assert(!c.sampling && !c.elicitation && !c.elicitationForm && !c.roots);
+
+	auto d = ClientCapabilities.fromJson(Json([
+			"sampling": Json(["tools": Json(null), "context": Json.emptyObject]),
+			"elicitation": Json(["form": Json(false), "url": Json.emptyObject])
+	]));
+	assert(d.sampling && !d.samplingTools && d.samplingContext);
+	assert(d.elicitation && !d.elicitationForm && d.elicitationUrl);
+}
+
+unittest  // ServerCapabilities.fromJson ignores null and non-object logging/completions
+{
+	auto c = ServerCapabilities.fromJson(Json([
+		"logging": Json(null),
+		"completions": Json(false)
+	]));
+	assert(!c.logging && !c.completions);
+	auto d = ServerCapabilities.fromJson(Json([
+		"logging": Json.emptyObject,
+		"completions": Json.emptyObject
+	]));
+	assert(d.logging && d.completions);
 }
