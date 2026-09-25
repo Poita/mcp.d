@@ -14,7 +14,10 @@ import mcp.server.task_runtime : TaskRuntime;
 /// and outstanding `inputRequests` before this is thrown; the dispatcher catches
 /// it and simply stops the current dispatch. The executor is re-invoked (from the
 /// top) once the answers arrive via `tasks/update`. Do not catch this in executor
-/// code.
+/// code; an executor that does anyway (e.g. with a blanket `catch (Exception)`)
+/// still ends the dispatch suspended, since the dispatcher also records the
+/// suspension on the `TaskContext`. It derives from `Exception` rather than
+/// `Throwable` so `finally` / `scope(exit)` cleanup in the executor always runs.
 final class TaskSuspended : Exception
 {
 	this(string taskId) @safe nothrow
@@ -27,7 +30,8 @@ final class TaskSuspended : Exception
 /// work off to be completed out of band. Unlike `TaskSuspended`, the task is left
 /// `working` (no `inputRequests`): the dispatcher catches this and stops the
 /// current dispatch, and an external signal later calls `rt.complete` / `rt.fail`.
-/// Do not catch this in executor code.
+/// Do not catch this in executor code; as with `TaskSuspended`, a swallowed
+/// detach still ends the dispatch with the task left `working`.
 final class TaskDetached : Exception
 {
 	this(string taskId) @safe nothrow
@@ -50,11 +54,13 @@ struct TaskContext
 {
 	private TaskRuntime rt_;
 	private string taskId_;
+	private DispatchOutcome outcome_;
 
 	this(TaskRuntime rt, string taskId) @safe
 	{
 		rt_ = rt;
 		taskId_ = taskId;
+		outcome_ = new DispatchOutcome();
 	}
 
 	/// The task's stable identifier.
@@ -136,6 +142,8 @@ struct TaskContext
 	noreturn requireInput(const(InputRequest)[] requests) @safe
 	{
 		rt_.requireInput(taskId_, inputRequestsToJson(requests));
+		if (outcome_ !is null)
+			outcome_.unwound = true;
 		throw new TaskSuspended(taskId_);
 	}
 
@@ -158,6 +166,8 @@ struct TaskContext
 	noreturn detach() @safe
 	{
 		rt_.markDetached(taskId_);
+		if (outcome_ !is null)
+			outcome_.unwound = true;
 		throw new TaskDetached(taskId_);
 	}
 
@@ -170,6 +180,14 @@ struct TaskContext
 	}
 }
 
+/// Shared by every copy of a `TaskContext`, so the dispatcher sees that the
+/// executor suspended or detached even if the executor swallowed the unwinding
+/// exception.
+private final class DispatchOutcome
+{
+	bool unwound;
+}
+
 /// A registered task executor: given its `TaskContext`, it produces the final
 /// `CallToolResult`-shaped result JSON, or calls `tc.requireInput(...)` to suspend.
 /// The runtime stores the executor key (`toolName`) on the task so the dispatcher
@@ -179,15 +197,19 @@ alias TaskExecutor = Json delegate(TaskContext tc) @safe;
 /// Drives the task lifecycle for one dispatch: build the context, run `executor`,
 /// and record the outcome on the durable task. A normal return completes the task
 /// (or marks it `cancelled` if a cancel was requested during the run);
-/// `TaskSuspended` leaves it `input_required`; any other exception fails it. Pure
-/// over the store, so it is correct whether invoked in-process or by a remote
-/// worker.
+/// `TaskSuspended` leaves it `input_required`; any other exception fails it. Once
+/// the executor has suspended or detached, the dispatch ends there whatever it
+/// does afterwards. Pure over the store, so it is correct whether invoked
+/// in-process or by a remote worker. Throws only when the outcome cannot be
+/// recorded (e.g. the store is unreachable).
 void runTaskExecutor(TaskRuntime rt, string taskId, TaskExecutor executor) @safe
 {
 	auto tc = TaskContext(rt, taskId);
 	try
 	{
 		auto result = executor(tc);
+		if (tc.outcome_.unwound)
+			return;
 		if (rt.cancelRequested(taskId))
 			rt.markCancelled(taskId);
 		else
@@ -203,11 +225,13 @@ void runTaskExecutor(TaskRuntime rt, string taskId, TaskExecutor executor) @safe
 	}
 	catch (McpException e)
 	{
-		rt.fail(taskId, e);
+		if (!tc.outcome_.unwound)
+			rt.fail(taskId, e);
 	}
 	catch (Exception e)
 	{
-		rt.fail(taskId, Json([
+		if (!tc.outcome_.unwound)
+			rt.fail(taskId, Json([
 			"code": Json(cast(int) ErrorCode.internalError),
 			"message": Json(e.msg)
 		]));
@@ -228,7 +252,8 @@ interface TaskDispatcher
 /// for single-node or sticky-routed deployments (where `Mcp-Name: <taskId>` keeps
 /// a task's requests on the node holding its fiber). Not durable across restarts —
 /// production deployments that need durability supply their own dispatcher backed
-/// by a queue / durable execution engine.
+/// by a queue / durable execution engine. A dispatch that could not record its
+/// outcome is logged, since the fiber has no caller to report it to.
 final class InProcessTaskDispatcher : TaskDispatcher
 {
 	import vibe.core.core : runTask;
@@ -238,11 +263,12 @@ final class InProcessTaskDispatcher : TaskDispatcher
 		auto id = taskId;
 		auto r = run;
 		runTask(() @safe nothrow{
+			import vibe.core.log : logError;
+
 			try
 				r(id);
-			catch (Exception)
-			{
-			}
+			catch (Exception e)
+				logError("task %s: dispatch failed to record its outcome: %s", id, e.msg);
 		});
 	}
 }
@@ -426,6 +452,42 @@ unittest  // detach after a cancel was requested cancels instead of detaching
 		return tc.detach();
 	});
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
+}
+
+unittest  // an executor that swallows its suspension still leaves the task input_required
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
+		try
+			tc.requireInput([InputRequest.elicitation("ok", "Proceed?")]);
+		catch (Exception)
+		{
+		}
+		return Json(["structuredContent": Json.emptyObject]);
+	});
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "input_required");
+}
+
+unittest  // an executor that swallows its detach leaves the task working
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("deploy", Json.undefined);
+	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
+		try
+			tc.detach();
+		catch (Exception)
+		{
+		}
+		throw new Exception("after detach");
+	});
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 }
 
 unittest  // checkpoint state survives a suspension and is restored on re-run
