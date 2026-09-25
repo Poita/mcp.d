@@ -83,22 +83,63 @@ ResourceServerConfig resourceServer(JwtVerifierConfig vc) @safe
 /// `tenant` must be a concrete tenant GUID or a registered domain name.
 /// The pseudo-tenants `"common"`, `"organizations"`, and `"consumers"` are
 /// rejected because Entra ID never stamps them in the `iss` claim of a real
-/// token — every token would fail the issuer check at runtime. For multi-tenant
-/// validation without a pinned issuer, use `jwtResourceServer` with an empty
-/// `issuer` and rely on `audience` binding alone.
+/// token — every token would fail the issuer check at runtime. For a
+/// multi-tenant app, list the tenants it serves with `entraIdTenants`.
 ResourceServerConfig entraId(string tenant, string audience, string[] scopes = [
 ]) @safe
 {
-	enforce(tenant.length > 0,
-			"entraId: tenant must be a concrete tenant GUID or domain name, not an empty string.");
-	enforce(tenant != "common" && tenant != "organizations" && tenant != "consumers",
-			"entraId: pseudo-tenants (\"common\", \"organizations\", \"consumers\") are not "
-			~ "supported — Entra ID never stamps them in the iss claim, so every token "
-			~ "would be rejected. Pass a concrete tenant GUID or domain, or use "
-			~ "jwtResourceServer with an empty issuer for multi-tenant validation.");
+	requireConcreteEntraTenant(tenant, "entraId");
 	const issuer = "https://login.microsoftonline.com/" ~ tenant ~ "/v2.0";
 	const jwks = "https://login.microsoftonline.com/" ~ tenant ~ "/discovery/v2.0/keys";
 	return jwtResourceServer(issuer, jwks, audience, scopes);
+}
+
+/// Microsoft Entra ID for a multi-tenant app: accepts tokens from any of the
+/// allowed `tenants` (GUIDs or registered domain names) and no other. Each
+/// tenant's v2.0 issuer is pinned as in `entraId`, and a token is valid when it
+/// verifies against one of them, so the `iss` check is never dropped — with
+/// audience binding alone, a token minted by any Entra tenant for the same
+/// audience would be accepted.
+ResourceServerConfig entraIdTenants(string[] tenants, string audience, string[] scopes = [
+]) @safe
+{
+	import mcp.auth.resource_server : TokenInfo, TokenValidator;
+
+	enforce(tenants.length > 0, "entraIdTenants: list at least one allowed tenant.");
+	TokenValidator[] validators;
+	string[] issuers;
+	foreach (tenant; tenants)
+	{
+		requireConcreteEntraTenant(tenant, "entraIdTenants");
+		auto one = entraId(tenant, audience, scopes);
+		validators ~= one.validator;
+		issuers ~= one.authorizationServers;
+	}
+	ResourceServerConfig cfg;
+	cfg.validator = (string token) @safe {
+		foreach (v; validators)
+		{
+			auto info = v(token);
+			if (info.valid)
+				return info;
+		}
+		return TokenInfo.invalid();
+	};
+	cfg.resource = audience;
+	cfg.authorizationServers = issuers;
+	cfg.scopesSupported = scopes.dup;
+	return cfg;
+}
+
+private void requireConcreteEntraTenant(string tenant, string fn) @safe
+{
+	enforce(tenant.length > 0,
+			fn ~ ": tenant must be a concrete tenant GUID or domain name, not an empty string.");
+	enforce(tenant != "common" && tenant != "organizations" && tenant != "consumers",
+			fn ~ ": pseudo-tenants (\"common\", \"organizations\", \"consumers\") are not "
+			~ "supported — Entra ID never stamps them in the iss claim, so every token "
+			~ "would be rejected. Pass a concrete tenant GUID or domain; for a multi-tenant "
+			~ "app, list the tenants it serves with entraIdTenants.");
 }
 
 /// Auth0. Pins the issuer `https://{domain}/` (Auth0 issuers carry the trailing
@@ -299,6 +340,39 @@ unittest  // entraId rejects pseudo-tenant "consumers" at call time
 	import std.exception : assertThrown;
 
 	assertThrown(entraId("consumers", "api://my-app"));
+}
+
+unittest  // entraId's pseudo-tenant error points at an issuer-checked multi-tenant option, not an empty issuer
+{
+	import std.algorithm : canFind;
+	import std.exception : collectExceptionMsg;
+
+	const msg = collectExceptionMsg(entraId("common", "api://my-app"));
+	assert(!msg.canFind("empty issuer"));
+	assert(msg.canFind("entraIdTenants"));
+}
+
+unittest  // entraIdTenants pins one v2.0 issuer per allowed tenant
+{
+	auto cfg = entraIdTenants(["tenant-a", "tenant-b"], "api://my-mcp-server", [
+		"mcp.read"
+	]);
+	assert(cfg.enabled);
+	assert(cfg.resource == "api://my-mcp-server");
+	assert(cfg.authorizationServers == [
+		"https://login.microsoftonline.com/tenant-a/v2.0",
+		"https://login.microsoftonline.com/tenant-b/v2.0"
+	]);
+	assert(cfg.scopesSupported == ["mcp.read"]);
+	assert(!cfg.validator("not-a-jwt").valid);
+}
+
+unittest  // entraIdTenants rejects an empty allowlist and pseudo-tenants
+{
+	import std.exception : assertThrown;
+
+	assertThrown(entraIdTenants([], "api://my-app"));
+	assertThrown(entraIdTenants(["tenant-a", "common"], "api://my-app"));
 }
 
 unittest  // entraId rejects an empty tenant string at call time
