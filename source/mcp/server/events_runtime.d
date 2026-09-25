@@ -336,6 +336,7 @@ struct EventsOptions
 	EmitBufferOptions emitBuffer; /// ring-buffer retention for emit-only poll
 	Duration defaultPollInterval = 30.seconds; /// seeds `nextPollMs` when a type sets none
 	Duration pollLeaseTtl = 5.minutes; /// poll subscription lease window (drives on_unsubscribe)
+	int pollMaxLeasesPerPrincipal = 1000; /// cap on distinct live poll subscriptions one principal may hold (0 = unlimited)
 	Duration webhookTtlCap = 30.minutes; /// max granted webhook TTL (clamps suggestions down)
 	Duration webhookMinTtl = 1.minutes; /// min granted webhook TTL (clamps tiny suggestions up)
 	bool allowNoExpiry; /// permit `ttlMs:null` no-expiry grants (requires a durable store)
@@ -529,6 +530,7 @@ final class EventsRuntime
 	private void delegate() @safe onListChanged_;
 	private PushStream[] pushStreams_;
 	private PollLease[string] pollLeases_; // lease key -> lease record
+	private int[string] pollLeaseCount_; // principal -> live poll leases it holds
 	private LifeRef[string] lifeRefs_; // (principal\0name\0args) -> live-subscription refcount
 	private long[string] verifiedEndpoints_; // (principal\0url) -> when last verified or used
 	private WellKnownReceivers[string] wellKnown_; // callback origin -> cached receiver document
@@ -1055,6 +1057,9 @@ final class EventsRuntime
 		foreach (lease; expired)
 		{
 			pollLeases_.remove(leaseKey(lease.name, lease.arguments, lease.principal));
+			if (auto n = lease.principal in pollLeaseCount_)
+				if (--*n <= 0)
+					pollLeaseCount_.remove(lease.principal);
 			releaseLifecycle(lease.name, lease.arguments, lease.principal);
 		}
 	}
@@ -2376,12 +2381,21 @@ final class EventsRuntime
 		const now = opts_.nowMs();
 		const fresh = (key in pollLeases_) is null;
 		const subId = pollSubscriptionId(name, arguments);
+		// Each distinct (name, arguments) a principal polls holds a lease and may
+		// provision an upstream via on_subscribe, so the number it may hold at once
+		// is capped. A renewal reuses its slot and is never rejected.
+		const cap = opts_.pollMaxLeasesPerPrincipal;
+		if (fresh && cap > 0 && pollLeaseCount_.get(principal, 0) >= cap)
+			throw resourceExhausted("Too many poll subscriptions for this principal",
+					"pollSubscriptions", cap);
 		// on_subscribe runs before the lease is recorded, so a throwing hook is
 		// retried by the next poll rather than never firing again.
 		if (fresh)
 			acquireLifecycle(reg, name, arguments, principal, subId);
 		pollLeases_[key] = PollLease(name, principal, arguments, subId,
 				now + opts_.pollLeaseTtl.total!"msecs");
+		if (fresh)
+			pollLeaseCount_[principal] = pollLeaseCount_.get(principal, 0) + 1;
 	}
 
 	// Acquire a lifecycle reference for `(principal, name, arguments)`. `onSubscribe`
@@ -3242,6 +3256,41 @@ unittest  // a throwing on_unsubscribe does not stop the sweep expiring the othe
 	now += 10 * 60 * 1000;
 	rt.sweepPollLeases();
 	assert(unsubs == 2);
+}
+
+unittest  // poll leases are capped per principal with resourceExhausted
+{
+	import std.exception : assertNotThrown, collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	long now = 1_000_000;
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.pollMaxLeasesPerPrincipal = 2;
+	auto rt = new EventsRuntime(null, o);
+	int subs;
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c");
+	reg.onSubscribe = (EventContext ctx, string id) @safe { subs++; };
+	rt.register(reg);
+	PollResult poll(int i, string principal) @safe
+	{
+		return rt.poll("n", Json(["i": Json(i)]), principal,
+				Nullable!string.init, Nullable!long.init, Nullable!long.init);
+	}
+
+	poll(1, "user-1");
+	poll(2, "user-1");
+	auto e = collectException!McpException(poll(3, "user-1"));
+	assert(e !is null && e.code == ErrorCode.resourceExhausted);
+	assert(subs == 2); // the rejected poll provisioned nothing
+	assertNotThrown!McpException(poll(1, "user-1")); // a renewal reuses its slot
+	assertNotThrown!McpException(poll(3, "user-2")); // another principal's own budget
+	now += 10 * 60 * 1000;
+	rt.sweepPollLeases(); // expired leases free their slots
+	assertNotThrown!McpException(poll(3, "user-1"));
 }
 
 unittest  // lifecycle is refcounted across modes: fires once per (principal,name,args)
@@ -4576,10 +4625,10 @@ unittest  // concurrent deliveries to one unverified endpoint send a single chal
 	rt.register(reg);
 	// Two subscriptions sharing (principal, url): one endpoint to verify.
 	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks", Json([
-				"a": Json(1)
+		"a": Json(1)
 	])), "user-1");
 	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks", Json([
-				"a": Json(2)
+		"a": Json(2)
 	])), "user-1");
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	ft.duringPost = () @safe { runPending(); }; // the first challenge yields to the others
