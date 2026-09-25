@@ -492,9 +492,15 @@ interface RedirectUriRegistry
 /// A simple in-memory `RedirectUriRegistry` bounded against unauthenticated
 /// growth: each `/register` call is scoped under its server-issued
 /// `registrationHandle`, and when the number of live registrations exceeds the
-/// cap the oldest registration (and all its redirect URIs) is evicted as a unit.
-/// The cap is what keeps an unauthenticated `POST /register` flood from growing
-/// process memory without bound.
+/// cap one registration (and all its redirect URIs) is evicted as a unit. The cap
+/// is what keeps an unauthenticated `POST /register` flood from growing process
+/// memory without bound.
+///
+/// Eviction prefers the oldest registration none of whose redirect URIs has been
+/// looked up by `isRegistered` (i.e. never used at `/authorize`), and falls back
+/// to the oldest registration only when every older one is in use. A flood of
+/// anonymous registrations therefore displaces other never-used registrations
+/// before a client that is actually signing users in.
 ///
 /// NOTE: even bounded, the unbounded-default in-memory backing is unsuitable for
 /// an internet-exposed multi-process proxy: state is per-process and lost on
@@ -503,12 +509,13 @@ interface RedirectUriRegistry
 final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 {
 	/// Maximum number of live registrations (one per `/register` call). When
-	/// exceeded on `register`, the oldest registration is evicted as a whole.
+	/// exceeded on `register`, one registration is evicted as a whole.
 	enum size_t defaultMaxRegistrations = 10_000;
 
 	private string[][string] byHandle;
 	private string[] order;
-	private size_t[string] refCount;
+	private string[][string] handlesByUri;
+	private bool[string] usedHandles;
 	private const size_t maxRegistrations;
 
 	this() @safe
@@ -517,7 +524,7 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 	}
 
 	/// Construct with an explicit registration cap (used by tests to drive
-	/// oldest-first eviction deterministically).
+	/// eviction deterministically).
 	this(size_t maxRegistrations) @safe
 	{
 		this.maxRegistrations = maxRegistrations;
@@ -525,71 +532,74 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 
 	override void register(string registrationHandle, const string[] redirectUris) @safe
 	{
-		// If the handle already exists, decrement refCounts for its current URIs
-		// and remove it from the order queue before re-registering, so stale URIs
-		// do not remain visible via isRegistered after the handle is overwritten.
-		if (auto existing = registrationHandle in byHandle)
-		{
-			foreach (u; *existing)
-			{
-				if (auto c = u in refCount)
-				{
-					if (*c <= 1)
-						refCount.remove(u);
-					else
-						*c = *c - 1;
-				}
-			}
-			byHandle.remove(registrationHandle);
-			// Remove the handle from the order queue (keep only the first occurrence,
-			// removing it so the re-registration gets a fresh slot at the back).
-			size_t found = size_t.max;
-			foreach (i, h; order)
-			{
-				if (h == registrationHandle)
-				{
-					found = i;
-					break;
-				}
-			}
-			if (found != size_t.max)
-				order = (order[0 .. found] ~ order[found + 1 .. $]).dup;
-		}
+		// Re-registering a handle replaces its URIs and gives it a fresh slot at the
+		// back of the eviction order.
+		if (registrationHandle in byHandle)
+			removeHandle(registrationHandle);
 		string[] uris;
 		foreach (u; redirectUris)
 			uris ~= u;
 		byHandle[registrationHandle] = uris;
 		order ~= registrationHandle;
 		foreach (u; uris)
-			refCount[u] = (u in refCount ? refCount[u] : 0) + 1;
+			handlesByUri[u] ~= registrationHandle;
 		enforceCap();
 	}
 
+	/// Whether `redirectUri` belongs to a live registration. A hit marks every
+	/// registration holding it as in use, which shields it from eviction ahead of
+	/// never-used registrations.
 	override bool isRegistered(string redirectUri) @safe
 	{
-		return (redirectUri in refCount) !is null;
+		auto hs = redirectUri in handlesByUri;
+		if (hs is null)
+			return false;
+		foreach (h; *hs)
+			usedHandles[h] = true;
+		return true;
+	}
+
+	private void removeHandle(string handle) @safe
+	{
+		import std.algorithm : countUntil, remove;
+
+		if (auto p = handle in byHandle)
+		{
+			foreach (u; *p)
+			{
+				if (auto hs = u in handlesByUri)
+				{
+					const i = (*hs).countUntil(handle);
+					if (i >= 0)
+						*hs = (*hs).dup.remove(i);
+					if ((*hs).length == 0)
+						handlesByUri.remove(u);
+				}
+			}
+			byHandle.remove(handle);
+		}
+		usedHandles.remove(handle);
+		const at = order.countUntil(handle);
+		if (at >= 0)
+			order = order.dup.remove(at);
 	}
 
 	private void enforceCap() @safe
 	{
 		while (order.length > maxRegistrations)
 		{
-			const oldest = order[0];
-			order = order[1 .. $].dup;
-			if (auto p = oldest in byHandle)
+			// The newest registration is exempt, so a registry full of in-use
+			// clients still admits a new one (evicting the oldest).
+			string victim = order[0];
+			foreach (h; order[0 .. $ - 1])
 			{
-				foreach (u; *p)
+				if (h !in usedHandles)
 				{
-					if (auto c = u in refCount)
-					{
-						if (*c <= 1)
-							refCount.remove(u);
-						else
-							*c = *c - 1;
-					}
+					victim = h;
+					break;
 				}
-				byHandle.remove(oldest);
 			}
+			removeHandle(victim);
 		}
 	}
 }
@@ -2002,6 +2012,34 @@ unittest  // REDIRECT REGISTRY: the registry caps live registrations, evicting t
 	assert(reg.isRegistered("https://c/cb"));
 }
 
+unittest  // REDIRECT REGISTRY: a /register flood evicts never-used registrations before one in use
+{
+	auto reg = new InMemoryRedirectUriRegistry(2);
+	reg.register("legit", ["https://app.example/cb"]);
+	// The legitimate client goes on to authorize with its redirect_uri.
+	assert(reg.isRegistered("https://app.example/cb"));
+	// Anonymous registrations flood past the cap.
+	foreach (i; 0 .. 5)
+		reg.register("flood-" ~ cast(char)('0' + i),
+				["https://flood.example/cb" ~ cast(char)('0' + i)]);
+	assert(reg.isRegistered("https://app.example/cb"));
+	assert(reg.isRegistered("https://flood.example/cb4"));
+	assert(!reg.isRegistered("https://flood.example/cb0"));
+}
+
+unittest  // REDIRECT REGISTRY: when every registration is in use the oldest is evicted
+{
+	auto reg = new InMemoryRedirectUriRegistry(2);
+	reg.register("h1", ["https://a/cb"]);
+	reg.register("h2", ["https://b/cb"]);
+	assert(reg.isRegistered("https://a/cb"));
+	assert(reg.isRegistered("https://b/cb"));
+	reg.register("h3", ["https://c/cb"]);
+	assert(!reg.isRegistered("https://a/cb"));
+	assert(reg.isRegistered("https://b/cb"));
+	assert(reg.isRegistered("https://c/cb"));
+}
+
 unittest  // REDIRECT REGISTRY: a redirect_uri shared by two registrations survives evicting one
 {
 	auto reg = new InMemoryRedirectUriRegistry(2);
@@ -2117,11 +2155,11 @@ unittest  // CONSTRUCTOR SECURITY: a loopback http baseUrl is accepted for local
 	assert(proxy !is null);
 }
 
-unittest  // REDIRECT REGISTRY: re-registering the same handle drops old URIs from refCount
+unittest  // REDIRECT REGISTRY: re-registering the same handle drops its old URIs
 {
-	// A duplicate-handle registration must decrement refCounts for the old URIs
-	// before overwriting the handle entry, so that isRegistered never returns true
-	// for a URI whose registration no longer exists.
+	// A duplicate-handle registration must drop the old URIs before overwriting
+	// the handle entry, so that isRegistered never returns true for a URI whose
+	// registration no longer exists.
 	auto reg = new InMemoryRedirectUriRegistry(2);
 	reg.register("same-handle", ["https://old.example.com/cb"]);
 	reg.register("same-handle", ["https://new.example.com/cb"]);
