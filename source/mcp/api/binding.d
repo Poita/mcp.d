@@ -221,6 +221,7 @@ private JsonNode anyOfNode(JsonNode[] members...) pure
 package(mcp) T bindJson(T)(Json v, string path = "")
 {
 	import std.conv : to;
+	import std.sumtype : isSumType;
 
 	static if (is(T == Json))
 		return v;
@@ -229,6 +230,18 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 		if (v.type == Json.Type.null_ || v.type == Json.Type.undefined)
 			return T.init;
 		return T(bindJson!(TemplateArgsOf!T[0])(v, path));
+	}
+	else static if (isSumType!T)
+	{
+		static foreach (V; TemplateArgsOf!T)
+		{
+			try
+				return T(bindJson!V(v, path));
+			catch (BindException)
+			{
+			}
+		}
+		throw new BindException(located(path, "matches none of the types in " ~ T.stringof));
 	}
 	else static if (isFieldwiseStruct!T)
 	{
@@ -245,7 +258,7 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 					const fieldPath = path.length ? path ~ "." ~ key : key;
 					auto p = key in v;
 					if (isPresent!FT(p))
-						__traits(getMember, result, field) = bindJson!FT(*p, fieldPath);
+						setBound(__traits(getMember, result, field), bindJson!FT(*p, fieldPath));
 					else static if (isRequiredField!(T, field))
 						throw new BindException("missing required field '" ~ fieldPath ~ "'");
 				}
@@ -285,6 +298,19 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 	}
 	else
 		return bindLeaf!T(v, path);
+}
+
+/// Assign a freshly bound `value` into `dst`, a default-initialized slot being
+/// filled. Some types' assignment is `@system` (a `SumType` over types with
+/// indirections, and aggregates containing one) because overwriting a live value
+/// could leave a dangling reference into it; a default-initialized slot has no
+/// such references, so the assignment is trusted when it is not already `@safe`.
+package(mcp) void setBound(X)(ref X dst, X value)
+{
+	static if (__traits(compiles, ()@safe { dst = value; }))
+		dst = value;
+	else
+		() @trusted { dst = value; }();
 }
 
 /// Whether a struct member's JSON value `p` counts as supplied. JSON `null`
@@ -388,6 +414,15 @@ unittest  // bindString rejects a string that does not parse as the target type
 
 	assertThrown!BindException(bindString!int("abc"));
 	assertThrown!BindException(bindString!bool("yes"));
+}
+
+unittest  // bindJson binds a SumType to the first member type the value fits
+{
+	import std.sumtype : SumType, match;
+
+	alias U = SumType!(int, string);
+	assert(bindJson!U(Json(3)).match!((int n) => n == 3, (string _) => false));
+	assert(bindJson!U(Json("a")).match!((int _) => false, (string t) => t == "a"));
 }
 
 unittest  // bindJson reports the dotted path of a missing nested field

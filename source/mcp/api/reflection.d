@@ -19,7 +19,7 @@ import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
 import mcp.api.skills : Skill, registerSkill;
-import mcp.api.binding : bindJson, bindString, schemaNode, schemaOf;
+import mcp.api.binding : bindJson, bindString, schemaNode, schemaOf, setBound;
 import mcp.protocol.schema;
 
 @safe:
@@ -587,9 +587,9 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 				try
 				{
 					static if (is(defs[i] == void))
-						argv[i] = marshalArg!P(args, names[i]);
+						setBound(argv[i], marshalArg!P(args, names[i]));
 					else
-						argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
+						setBound(argv[i], marshalArgDefault!(P, defs[i])(args, names[i]));
 				}
 				catch (McpException e)
 					throw e;
@@ -695,9 +695,9 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 			static if (is(P == TaskContext))
 				argv[i] = tc;
 			else static if (is(defs[i] == void))
-				argv[i] = marshalArg!P(args, names[i]);
+				setBound(argv[i], marshalArg!P(args, names[i]));
 			else
-				argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
+				setBound(argv[i], marshalArgDefault!(P, defs[i])(args, names[i]));
 		}
 		static if (is(ReturnType!overload == void))
 		{
@@ -821,7 +821,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 				// marshaller are passed through unchanged so an inner
 				// invalidParams is not double-wrapped.
 				try
-					argv[i] = marshalArg!(P, true)(args, names[i]);
+					setBound(argv[i], marshalArg!(P, true)(args, names[i]));
 				catch (McpException e)
 					throw e;
 				catch (Exception e)
@@ -830,7 +830,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 			else
 			{
 				try
-					argv[i] = marshalArgDefault!(P, defs[i], true)(args, names[i]);
+					setBound(argv[i], marshalArgDefault!(P, defs[i], true)(args, names[i]));
 				catch (McpException e)
 					throw e;
 				catch (Exception e)
@@ -911,13 +911,13 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 				if (auto pv = names[i] in params)
 				{
 					try
-						argv[i] = bindString!P(*pv);
+						setBound(argv[i], bindString!P(*pv));
 					catch (Exception e)
 						throw invalidParams("resource template parameter '" ~ names[i]
 							~ "' could not be parsed as " ~ P.stringof ~ ": " ~ e.msg);
 				}
 				else
-					argv[i] = P.init;
+					setBound(argv[i], P.init);
 			}
 		}
 		auto ret = __traits(getMember, parent, memberName)(argv.expand);
@@ -2583,6 +2583,72 @@ unittest  // Json parameters and struct fields bind the argument value verbatim
 	auto w = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
 	assert("error" !in w, w.toString);
 	assert(w["result"]["structuredContent"]["body"] == parseJsonString(`[true,null]`));
+}
+
+version (unittest)
+{
+	import std.sumtype : SumType;
+
+	private alias IntOrText = SumType!(int, string);
+
+	private struct Tagged
+	{
+		IntOrText value;
+	}
+
+	private final class SumTypeApi
+	{
+		@tool("either", "Tool taking a SumType parameter")
+		string either(IntOrText v) @safe
+		{
+			import std.sumtype : match;
+
+			return v.match!((int n) => "int", (string s) => "string:" ~ s);
+		}
+
+		@tool("tagged", "Tool taking a struct with a SumType field")
+		string tagged(Tagged t) @safe
+		{
+			import std.sumtype : match;
+
+			return t.value.match!((int n) => "int", (string s) => "string:" ~ s);
+		}
+	}
+
+	private string callSumType(string tool, string args) @safe
+	{
+		import mcp.protocol.jsonrpc : Message, makeRequest;
+
+		auto s = new McpServer("t", "1");
+		registerHandlers(s, new SumTypeApi);
+		Json p = Json.emptyObject;
+		p["name"] = tool;
+		p["arguments"] = parseJsonString(args);
+		auto r = s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+		assert("isError" !in r, r.toString);
+		return r["content"][0]["text"].get!string;
+	}
+}
+
+unittest  // a SumType parameter is described by anyOf over its members
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new SumTypeApi);
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	auto v = tools[0]["inputSchema"]["properties"]["v"];
+	assert(v["anyOf"].length == 2, v.toString);
+}
+
+unittest  // a SumType parameter binds whichever member the argument matches
+{
+	assert(callSumType("either", `{"v":5}`) == "int");
+	assert(callSumType("either", `{"v":"x"}`) == "string:x");
+}
+
+unittest  // a SumType struct field binds whichever member the value matches
+{
+	assert(callSumType("tagged", `{"t":{"value":7}}`) == "int");
+	assert(callSumType("tagged", `{"t":{"value":"y"}}`) == "string:y");
 }
 
 unittest  // argsAs honours struct field defaults and Nullable fields
