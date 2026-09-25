@@ -1283,7 +1283,7 @@ final class EventsRuntime
 	/// type whose cadence has come round, run the check function from the
 	/// subscription's fetch position and enqueue what it returns. A quiet fetch
 	/// with nothing in flight advances the watermark (so the client's cursor moves
-	/// during quiet periods); a fetch that reports `truncated` posts a `gap`
+	/// during quiet periods); a fetch that reports `truncated` queues a `gap`
 	/// envelope. Emit-only types are not polled — `emit` routes them live.
 	void pollWebhookSubscriptions() @safe
 	{
@@ -1319,14 +1319,17 @@ final class EventsRuntime
 					|| !fresh.get.active || fresh.get.fetchCursor != sub.fetchCursor)
 				continue;
 			auto cur = fresh.get;
+			const gap = er.truncated && !er.cursor.isNull;
 			cur.fetchCursor = er.cursor;
-			if (er.events.length == 0 && (cur.id in outstanding_) is null)
+			if (!gap && er.events.length == 0 && (cur.id in outstanding_) is null)
 				cur.cursor = er.cursor;
 			webhookStore_.put(cur);
-			if (er.truncated && !er.cursor.isNull)
-				postGap(cur, er.cursor.get);
 			foreach (occ; er.events)
 				any |= enqueueForWebhook(cur, reg, occ, false);
+			// The gap is queued behind the batch, so the watermark reaches its
+			// position only after the batch settles and the endpoint is verified.
+			if (gap)
+				any |= enqueueGap(cur, er.cursor.get);
 		}
 		if (any)
 			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
@@ -1871,9 +1874,7 @@ final class EventsRuntime
 		missed_[subId] = cursor.get;
 	}
 
-	// Queue a `gap` job for the furthest position `sub` missed, if any. It is
-	// tracked like an event, so the watermark reaches that position only once the
-	// gap is delivered, through the same verified, signed path as events.
+	// Queue a `gap` job for the furthest position `sub` missed, if any.
 	private void flushMissed(WebhookSubscription sub) @safe
 	{
 		auto p = sub.id in missed_;
@@ -1881,6 +1882,16 @@ final class EventsRuntime
 			return;
 		const cursor = *p;
 		missed_.remove(sub.id);
+		if (enqueueGap(sub, cursor))
+			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
+	}
+
+	// Queue a `gap` job telling `sub`'s client to resume from `cursor`. It is
+	// tracked like an event, so the watermark reaches that position only once the
+	// gap is delivered, through the same verified, signed path as events. Returns
+	// false when an identical gap is already queued.
+	private bool enqueueGap(WebhookSubscription sub, string cursor) @safe
+	{
 		EventOccurrence occ;
 		occ.eventId = controlMessageId("gap");
 		occ.name = sub.name;
@@ -1891,9 +1902,9 @@ final class EventsRuntime
 		if (!deliveryQueue_.enqueue(job))
 		{
 			untrackOutstanding(sub.id, occ.cursor);
-			return;
+			return false;
 		}
-		opts_.deliveryExecutor(() @safe { drainDeliveries(); });
+		return true;
 	}
 
 	/// Single chokepoint for every callback POST: a delivery-time SSRF host check
@@ -4262,6 +4273,44 @@ unittest  // a check-backed type is served over webhook by replaying from the cu
 	rt.pollWebhookSubscriptions();
 	assert(seen.length == 3);
 	assert(ft.eventPosts().length == 1); // quiet polls deliver nothing
+}
+
+unittest  // a poll-driven gap goes through verification: an unverified endpoint is sent no gap
+{
+	auto ft = new FakeWebhookTransport();
+	ft.echoChallenge = false;
+	auto rt = engineRuntime(ft);
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		if (ctx.isBootstrap())
+			return EventResult.empty("h0");
+		return EventResult.empty("h9", true);
+	};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("email.received", "https://proxy/hooks"), "user-1");
+	rt.pollWebhookSubscriptions();
+	assert(controlPostsOf(ft, "gap").length == 0);
+	assert(controlPostsOf(ft, "verification").length == 1);
+}
+
+unittest  // a poll-driven gap is delivered to a verified endpoint and settles the watermark
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		if (ctx.isBootstrap())
+			return EventResult.empty("h0");
+		return EventResult.empty("h9", true);
+	};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("email.received", "https://proxy/hooks"), "user-1");
+	rt.pollWebhookSubscriptions();
+	auto gaps = controlPostsOf(ft, "gap");
+	assert(gaps.length == 1 && parseJsonString(gaps[0].body)["cursor"].get!string == "h9");
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "h9");
 }
 
 unittest  // an unsubscribe while the poll-driven check runs is not undone by the pass
