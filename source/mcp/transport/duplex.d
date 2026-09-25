@@ -31,8 +31,8 @@ enum size_t defaultMaxLineBytes = 16 * 1024 * 1024;
 ///     `await` (so several requests can be in flight concurrently and replies may
 ///     arrive out of order);
 ///   - a *request* / *notification* line is handed to `onInbound` (the client's
-///     or server's inbound dispatcher), which a peer typically runs in its own
-///     task so multiple inbound requests are handled concurrently.
+///     or server's inbound dispatcher) on its own task, so a handler that blocks
+///     never stalls the read loop and inbound requests run concurrently.
 ///
 /// The read loop is a plain cooperative vibe task over an async `readLine`
 /// delegate — there is NO dedicated OS reader thread, so there is no OS-thread ⇄
@@ -115,9 +115,8 @@ final class DuplexChannel
 				handleLine(line);
 			catch (Exception e)
 			{
-				// One malformed/erroring line — or a notification handler that throws —
-				// must not kill the loop; log the failure so it is visible rather than
-				// silently discarded, then continue with the next line.
+				// One malformed/erroring line must not kill the loop; log the failure so
+				// it is visible rather than silently discarded, then continue.
 				import std.stdio : stderr;
 
 				() @trusted nothrow{
@@ -197,9 +196,38 @@ final class DuplexChannel
 			// error responses are always correlated by the coordinator above and never
 			// reach the delegate.
 			if (onInbound !is null)
-				onInbound(m);
+				dispatchInbound(m);
 			break;
 		}
+	}
+
+	/// Run `onInbound` for `m` on its own task so a handler that blocks — on user
+	/// work, or on a reply to a request it sends back over this channel — never
+	/// stalls the read loop that must deliver that reply. `runTask` switches to the
+	/// new task immediately, so a handler that does not block runs to completion
+	/// before the next line is read and arrival order is preserved (e.g.
+	/// `notifications/initialized` is handled before the request that follows it).
+	private void dispatchInbound(Message m) @safe
+	{
+		runTask((Message msg) nothrow{
+			try
+				onInbound(msg);
+			catch (Exception e)
+				logHandlerError(e);
+		}, m);
+	}
+
+	private static void logHandlerError(Exception e) @safe nothrow
+	{
+		import std.stdio : stderr;
+
+		() @trusted nothrow{
+			try
+				stderr.writeln("[mcp.transport.duplex] inbound handler: ", e.message);
+			catch (Exception)
+			{
+			}
+		}();
 	}
 
 	/// Send a request whose id was already chosen by the caller (the CLIENT path:
@@ -947,4 +975,121 @@ unittest  // deliver() after close() fails fast
 	});
 	runEventLoop();
 	assert(threw, "deliver() after close() must throw immediately");
+}
+
+unittest  // an inbound request handler that calls back into the channel does not stall the read loop
+{
+	// The handler for an inbound request issues its own outbound request and
+	// awaits the reply. That reply arrives on the same read loop, so the handler
+	// must run off the read loop or the two wait on each other until the timeout.
+	auto toResponder = new LineLink;
+	auto toClient = new LineLink;
+	bool handlerGotReply;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			DuplexChannel channel;
+			channel = new DuplexChannel(() @safe { return toClient.take(); }, (string s) @safe {
+				toResponder.put(s);
+			}, (Message m) @safe {
+				if (m.kind != MessageKind.request)
+					return;
+				auto r = channel.deliver(makeRequest(Json(7L), "ping",
+				Json.emptyObject), 7, 2.seconds);
+				handlerGotReply = r["ok"].get!bool;
+			});
+			channel.start();
+			toClient.put(`{"jsonrpc":"2.0","id":"s1","method":"sampling/createMessage"}`);
+			// The peer answers the handler's nested request.
+			auto nested = toResponder.take();
+			import vibe.data.json : parseJsonString;
+
+			Json reply = Json.emptyObject;
+			reply["jsonrpc"] = "2.0";
+			reply["id"] = parseJsonString(nested)["id"];
+			reply["result"] = Json(["ok": Json(true)]);
+			toClient.put(reply.toString());
+			foreach (_; 0 .. 16)
+				yield();
+			toClient.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(handlerGotReply, "a request handler must be able to await a reply read by the same loop");
+}
+
+unittest  // an inbound notification handler that blocks does not stall the read loop
+{
+	auto toResponder = new LineLink;
+	auto toClient = new LineLink;
+	bool handlerGotReply;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			DuplexChannel channel;
+			channel = new DuplexChannel(() @safe { return toClient.take(); }, (string s) @safe {
+				toResponder.put(s);
+			}, (Message m) @safe {
+				if (m.kind != MessageKind.notification)
+					return;
+				auto r = channel.request("roots/list", Json.emptyObject, 2.seconds);
+				handlerGotReply = r["ok"].get!bool;
+			});
+			channel.start();
+			toClient.put(`{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`);
+			auto nested = toResponder.take();
+			import vibe.data.json : parseJsonString;
+
+			Json reply = Json.emptyObject;
+			reply["jsonrpc"] = "2.0";
+			reply["id"] = parseJsonString(nested)["id"];
+			reply["result"] = Json(["ok": Json(true)]);
+			toClient.put(reply.toString());
+			foreach (_; 0 .. 16)
+				yield();
+			toClient.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(handlerGotReply,
+			"a notification handler must be able to await a reply read by the same loop");
+}
+
+unittest  // inbound messages whose handlers do not block are handled in arrival order
+{
+	auto inbound = new LineLink;
+	string[] seen;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+			}, (Message m) @safe { seen ~= m.method; });
+			channel.start();
+			inbound.put(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+			inbound.put(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`);
+			inbound.put(`{"jsonrpc":"2.0","method":"notifications/b"}`);
+			inbound.closeEnd();
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(seen == [
+		"notifications/initialized", "tools/list", "notifications/b"
+	]);
 }

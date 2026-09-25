@@ -121,9 +121,9 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			}, m);
 			break;
 		case MessageKind.notification:
-			// Notifications (initialized / cancelled / roots-changed / progress) are
-			// handled inline; they are quick and a cancellation must flip its token
-			// promptly for any concurrently-running handler task to observe.
+			// The channel already runs this on its own task, started immediately, so
+			// initialized / cancelled take effect before the next line is read while
+			// an observer that blocks (e.g. re-listing roots) does not stall the loop.
 			server.handle(m);
 			break;
 		case MessageKind.response:
