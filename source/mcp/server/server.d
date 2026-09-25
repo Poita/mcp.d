@@ -3278,15 +3278,14 @@ final class McpServer : ServerCore
 
 		// Tasks extension (SEP-2663): the server decides whether a call creates a
 		// task, but only for a client that declared the extension. Without it a
-		// task-supporting tool falls through to a synchronous run, and a tool that
-		// requires the extension is rejected with -32021 naming it.
-		if (entry.taskSupport != TaskSupport.none && !declaresTasksExtension(declared))
-		{
-			if (entry.taskSupport == TaskSupport.required)
-				throw missingRequiredClientCapability(tasksRequiredCapabilities(),
-						"This tool requires the " ~ tasksExtensionKey ~ " extension");
-			return runTaskToolInline(name, args, ctx).forVersion(ver).toJson();
-		}
+		// task-supporting tool falls through to a synchronous run (below, after
+		// input validation), and a tool that requires the extension is rejected
+		// with -32021 naming it.
+		const runInline = entry.taskSupport != TaskSupport.none
+			&& !declaresTasksExtension(declared);
+		if (runInline && entry.taskSupport == TaskSupport.required)
+			throw missingRequiredClientCapability(tasksRequiredCapabilities(),
+					"This tool requires the " ~ tasksExtensionKey ~ " extension");
 		// Validate the supplied arguments against the tool's declared inputSchema
 		// before dispatch (spec: server/tools § Security Considerations,
 		// "Servers MUST: Validate all tool inputs"). Per § Error Handling, an
@@ -3308,6 +3307,13 @@ final class McpServer : ServerCore
 				err.isError = true;
 				return err.toJson();
 			}
+		}
+		if (runInline)
+		{
+			auto result = runTaskToolInline(name, args, ctx);
+			if (validateOutputSchema_)
+				checkOutputSchema(entry.outputValidator, entry.descriptor.name, result.toJson());
+			return result.forVersion(ver).toJson();
 		}
 		try
 		{
@@ -6747,6 +6753,50 @@ unittest  // a task tool called without the extension runs synchronously and ret
 	assert("taskId" !in resp["result"]);
 	assert(resp["result"]["structuredContent"]["result"].get!int == 42);
 	assert(resp["result"]["content"][0]["text"].get!string == "doubled");
+}
+
+unittest  // a synchronous task-tool call validates arguments before running the executor
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	Tool desc;
+	desc.name = "dbl";
+	desc.inputSchema = Json([
+		"type": Json("object"),
+		"properties": Json(["n": Json(["type": Json("integer")])]),
+		"required": Json([Json("n")])
+	]);
+	bool ran;
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		ran = true;
+		return Json(["content": Json.emptyArray]);
+	});
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("dbl"), "arguments": Json(["n": Json("x")])]))).get;
+	assert(!ran, "the executor must not see arguments that violate inputSchema");
+	assert(resp["result"]["isError"].get!bool);
+}
+
+unittest  // a synchronous task-tool result is checked against the outputSchema
+{
+	auto s = new McpServer("t", "1");
+	s.enableOutputSchemaValidation();
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	Tool desc;
+	desc.name = "typed";
+	desc.inputSchema = Json(["type": Json("object")]);
+	desc.outputSchema = Json([
+		"type": Json("object"),
+		"properties": Json(["v": Json(["type": Json("integer")])]),
+		"required": Json([Json("v")])
+	]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe => Json([
+		"content": Json.emptyArray,
+		"structuredContent": Json(["v": Json("not an integer")])
+	]));
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("typed"), "arguments": Json.emptyObject]))).get;
+	assert("error" in resp);
 }
 
 unittest  // a synchronous task-tool call leaves no task record behind
