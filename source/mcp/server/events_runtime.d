@@ -2380,7 +2380,7 @@ final class EventsRuntime
 		const key = leaseKey(name, arguments, principal);
 		const now = opts_.nowMs();
 		const fresh = (key in pollLeases_) is null;
-		const subId = pollSubscriptionId(name, arguments);
+		const subId = pollSubscriptionId(name, arguments, principal);
 		// Each distinct (name, arguments) a principal polls holds a lease and may
 		// provision an upstream via on_subscribe, so the number it may hold at once
 		// is capped. A renewal reuses its slot and is never rejected.
@@ -2453,9 +2453,12 @@ final class EventsRuntime
 		return principal ~ "\0" ~ name ~ "\0" ~ canonicalJsonString(arguments);
 	}
 
-	private string pollSubscriptionId(string name, Json arguments) @safe
+	// Keyed like the lifecycle refcount, principal included, so two principals
+	// sharing arguments never share the id an author keys an upstream by.
+	private string pollSubscriptionId(string name, Json arguments, string principal) @safe
 	{
-		return "poll_" ~ sha256Hex(name ~ "\0" ~ canonicalJsonString(arguments))[0 .. 16];
+		return "poll_" ~ sha256Hex(
+				principal ~ "\0" ~ name ~ "\0" ~ canonicalJsonString(arguments))[0 .. 16];
 	}
 }
 
@@ -3256,6 +3259,21 @@ unittest  // a throwing on_unsubscribe does not stop the sweep expiring the othe
 	now += 10 * 60 * 1000;
 	rt.sweepPollLeases();
 	assert(unsubs == 2);
+}
+
+unittest  // two principals polling the same arguments get distinct subscription ids
+{
+	auto rt = testRuntime();
+	string[] ids;
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c");
+	reg.onSubscribe = (EventContext ctx, string id) @safe { ids ~= id; };
+	rt.register(reg);
+	foreach (principal; ["alice", "bob"])
+		rt.poll("n", Json.emptyObject, principal, Nullable!string.init,
+				Nullable!long.init, Nullable!long.init);
+	assert(ids.length == 2 && ids[0] != ids[1]);
 }
 
 unittest  // poll leases are capped per principal with resourceExhausted
