@@ -19,6 +19,7 @@ import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
 import mcp.api.skills : Skill, registerSkill;
+import mcp.api.binding : bindJson;
 import mcp.protocol.schema;
 
 @safe:
@@ -311,13 +312,13 @@ private P marshalArg(P)(Json args, string name) @safe
 	{
 		alias Inner = TemplateArgsOf!P[0];
 		if (argPresent(args, name))
-			return P(marshalScalar!Inner(args[name]));
+			return P(bindJson!Inner(args[name]));
 		return P.init;
 	}
 	else
 	{
 		if (argPresent(args, name))
-			return marshalScalar!P(args[name]);
+			return bindJson!P(args[name]);
 		return P.init;
 	}
 }
@@ -339,19 +340,8 @@ private P marshalTemplateVar(P)(string raw) @safe
 		// document and deserialize through the enum-aware policy.
 		import vibe.data.json : parseJsonString;
 
-		return marshalScalar!P(parseJsonString(raw));
+		return bindJson!P(parseJsonString(raw));
 	}
-}
-
-private P marshalScalar(P)(Json v) @safe
-{
-	// Deserialize through EnumByNamePolicy so any enum — whether `P` itself or
-	// an enum field nested inside a struct/array — is read from its schema-
-	// declared string member name rather than vibe's default integer base
-	// value. Non-enum types are unaffected by the policy.
-	return () @trusted {
-		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, P)(v);
-	}();
 }
 
 /// Deserialize a dynamic handler's raw wire `arguments` into a typed value `T`.
@@ -371,7 +361,7 @@ T argsAs(T)(Json arguments) @safe
 	import mcp.protocol.errors : McpException, invalidParams;
 
 	try
-		return marshalScalar!T(arguments);
+		return bindJson!T(arguments);
 	catch (McpException e)
 		throw e;
 	catch (Exception e)
@@ -2375,6 +2365,71 @@ unittest  // omitting a defaulted arg passes the declared default, not P.init
 	auto r = s.handle(Message(makeRequest(Json(6), "tools/call", p))).get;
 	// limit defaults to 7, so 3 + 7 = 10 (not 3 + 0 = 3 from int.init).
 	assert(r["result"]["structuredContent"]["result"].get!int == 10);
+}
+
+version (unittest)
+{
+	private struct PagedQuery
+	{
+		string q;
+		int limit = 10;
+		Nullable!int offset;
+	}
+
+	private final class PagedApi
+	{
+		@tool("page", "Tool taking a struct with defaulted and Nullable fields")
+		string page(PagedQuery o) @safe
+		{
+			import std.conv : to;
+
+			return o.q ~ ":" ~ o.limit.to!string ~ ":" ~ (o.offset.isNull
+					? "none" : o.offset.get.to!string);
+		}
+	}
+
+	private Json callPage(Json arguments) @safe
+	{
+		import mcp.protocol.jsonrpc : Message, makeRequest;
+
+		auto s = new McpServer("t", "1");
+		s.disableInputSchemaValidation();
+		registerHandlers(s, new PagedApi);
+		Json p = Json.emptyObject;
+		p["name"] = "page";
+		p["arguments"] = arguments;
+		return s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+	}
+}
+
+unittest  // struct param fields the schema marks optional bind to their defaults when omitted
+{
+	auto r = callPage(parseJsonString(`{"o":{"q":"x"}}`));
+	assert("isError" !in r, r.toString);
+	assert(r["content"][0]["text"].get!string == "x:10:none");
+}
+
+unittest  // struct param defaulted and Nullable fields bind supplied values
+{
+	auto r = callPage(parseJsonString(`{"o":{"q":"x","limit":3,"offset":4}}`));
+	assert(r["content"][0]["text"].get!string == "x:3:4");
+}
+
+unittest  // struct param missing a required field names the field without serializer internals
+{
+	import std.algorithm : canFind;
+
+	auto r = callPage(parseJsonString(`{"o":{"limit":3}}`));
+	assert(r["isError"].get!bool);
+	const msg = r["content"][0]["text"].get!string;
+	assert(msg.canFind("'q'"), msg);
+	assert(!msg.canFind("Policy"), msg);
+}
+
+unittest  // argsAs honours struct field defaults and Nullable fields
+{
+	auto a = argsAs!PagedQuery(parseJsonString(`{"q":"x"}`));
+	assert(a.q == "x" && a.limit == 10 && a.offset.isNull);
 }
 
 unittest  // a required tool arg missing (schema validation disabled) is an isError, not a default value
