@@ -1479,7 +1479,8 @@ final class McpServer : ServerCore
 			writeLine(makeErrorResponse(msg.id, e).toString());
 			return true;
 		}
-		const streamKey = rpcIdString(msg.id);
+		// Keyed like in-flight requests, so string id "9" and numeric 9 stay distinct.
+		const streamKey = cancellationKey(msg.id);
 		stdioEventStreams_[streamKey] = handle;
 		// A server-initiated close drops the stream and answers the request with
 		// the StreamEventsResult so the client's pending request completes.
@@ -2387,10 +2388,11 @@ final class McpServer : ServerCore
 		// Stdio `events/stream` teardown: a push stream returns no JSON-RPC response,
 		// so the client cancels it by `notifications/cancelled` referencing the
 		// stream's request id. Close the handle (fires on_unsubscribe) and drop it.
-		if (auto h = rpcIdString(params["requestId"]) in stdioEventStreams_)
+		const streamKey = cancellationKey(params["requestId"]);
+		if (auto h = streamKey in stdioEventStreams_)
 		{
 			h.close();
-			stdioEventStreams_.remove(rpcIdString(params["requestId"]));
+			stdioEventStreams_.remove(streamKey);
 			return;
 		}
 
@@ -6330,6 +6332,30 @@ unittest  // a cancelled stdio events/stream stops receiving events
 	]))));
 	rt.emit(EventOccurrence("evt_2", "incident.created", "t"));
 	assert(lines.length == before); // no further delivery after cancellation
+}
+
+unittest  // cancelling string request id "9" leaves the stdio events/stream with numeric id 9 open
+{
+	import mcp.protocol.events : EventOccurrence;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableEvents();
+	registerDemoEvent(s);
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "incident.created";
+	s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink);
+	const before = lines.length;
+	s.handle(Message(makeNotification("notifications/cancelled", Json([
+		"requestId": Json("9")
+	]))));
+	rt.emit(EventOccurrence("evt_3", "incident.created", "t"));
+	assert(lines.length > before, "a different request id must not tear the stream down");
 }
 
 unittest  // events/poll answers -32602 InvalidParams on the wire when arguments violate inputSchema
