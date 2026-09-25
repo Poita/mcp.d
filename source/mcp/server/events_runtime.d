@@ -487,6 +487,8 @@ final class PushStream
 	void delegate(string method, Json taggedParams) @safe deliver;
 	bool terminated; /// set once the server ended the stream (`terminatePush`)
 	void delegate() @safe onTerminated; /// transport hook run after the terminated frame: write the final result, drop the stream
+	private bool started_; // `startPushStream` has written the leading frames; live events flow
+	private EventOccurrence[] pending_; // live events that arrived before the stream started
 }
 
 /// Handle returned by `openPushStream`. `close()` unregisters the stream and fires
@@ -909,7 +911,9 @@ final class EventsRuntime
 
 	/// Open a push stream for a subscription: validate it, fire `on_subscribe`,
 	/// register it for emit routing, and return a handle whose `close()` tears it
-	/// down. The transport supplies `deliver` and drives the heartbeat/poll loop.
+	/// down. Nothing is written yet: live events are held until the transport,
+	/// having sent its response headers, calls `startPushStream`. The transport
+	/// supplies `deliver` and drives the heartbeat/poll loop.
 	PushHandle openPushStream(string name, Json arguments, string principal,
 			Json subscriptionId, void delegate(string method, Json taggedParams) @safe deliver) @safe
 	{
@@ -936,6 +940,63 @@ final class EventsRuntime
 		acquireLifecycle(*p, name, s.arguments, principal, subscriptionIdString(subscriptionId));
 		pushStreams_ ~= s;
 		return new PushHandle(this, s);
+	}
+
+	/// Start an opened push stream: write the leading `notifications/events/active`
+	/// frame and the backlog since `cursor` (bounded by `maxAgeMs`), then release
+	/// the live events held since `openPushStream`, skipping any the backlog already
+	/// carried. The backlog is read without a poll lease — the stream's own
+	/// lifecycle reference covers it — and the stream's cursor only moves forward.
+	/// A backlog that cannot be read (a throwing check) still sends `active` at
+	/// the client's cursor. Returns the suggested poll cadence in milliseconds.
+	long startPushStream(PushStream s, Nullable!string cursor, Nullable!long maxAgeMs) @safe
+	{
+		auto reg = s.name in types_;
+		if (s.terminated || reg is null)
+			return 0;
+		PollResult first;
+		bool read;
+		try
+		{
+			first = runPoll(*reg, s.name, s.arguments, s.principal, cursor,
+					maxAgeMs, Nullable!long.init);
+			read = true;
+		}
+		catch (Exception)
+		{
+		}
+		s.deliver(eventsActiveNotification, withSubscriptionId(activeParams(read
+				? first.cursor : cursor, read && first.truncated), s.subscriptionId));
+		if (read)
+			foreach (ev; first.events)
+				s.deliver(eventsEventNotification,
+						withSubscriptionId(ev.toJson(), s.subscriptionId));
+		s.cursor = read && !first.cursor.isNull ? first.cursor : cursor;
+		// Release held live events in arrival order. Each write can yield, and an
+		// emit landing meanwhile is appended here rather than overtaking them.
+		const emitOnly = regIsEmitOnly(reg);
+		while (s.pending_.length)
+		{
+			auto occ = s.pending_[0];
+			s.pending_ = s.pending_[1 .. $];
+			if (emitOnly && !seqAfter(occ.cursor, s.cursor))
+				continue; // already delivered in the backlog
+			deliverToStream(reg, s, occ);
+		}
+		s.started_ = true;
+		return read ? first.nextPollMs : nextPollMsFor(*reg);
+	}
+
+	// Whether ring-buffer position `a` is after `b` (true when either is absent
+	// or not a sequence, so an event is never dropped on a cursor it cannot order).
+	private static bool seqAfter(Nullable!string a, Nullable!string b) @safe
+	{
+		import mcp.server.event_store : tryParseSeq;
+
+		long x, y;
+		if (a.isNull || b.isNull || !tryParseSeq(a.get, x) || !tryParseSeq(b.get, y))
+			return true;
+		return x > y;
 	}
 
 	/// Remove a push stream and fire its `on_unsubscribe`. Called by `PushHandle.close`.
@@ -966,7 +1027,7 @@ final class EventsRuntime
 	/// call this on their poll cadence.
 	void advancePushStream(PushStream s) @safe
 	{
-		if (s.terminated)
+		if (s.terminated || !s.started_)
 			return;
 		auto reg = s.name in types_;
 		if (regIsEmitOnly(reg))
@@ -1580,6 +1641,11 @@ final class EventsRuntime
 	// enqueue. The failing stream is scheduled for removal after the loop.
 	private void deliverToStreamSafely(EventRegistration* reg, PushStream s, EventOccurrence occ) @safe
 	{
+		if (!s.started_)
+		{
+			s.pending_ ~= occ; // written once `startPushStream` has sent the leading frames
+			return;
+		}
 		try
 			deliverToStream(reg, s, occ);
 		catch (Exception)
@@ -2683,6 +2749,16 @@ version (unittest)
 		o.nowIso = () @safe => "2026-02-19T15:30:00Z";
 		return new EventsRuntime(null, o);
 	}
+
+	// Open a push stream already started (no leading frames), so a test sees
+	// only the frames its own emits produce.
+	private PushHandle openLive(EventsRuntime rt, string name, Json arguments, string principal,
+			Json subscriptionId, void delegate(string method, Json taggedParams) @safe deliver) @safe
+	{
+		auto h = rt.openPushStream(name, arguments, principal, subscriptionId, deliver);
+		h.stream.started_ = true;
+		return h;
+	}
 }
 
 unittest  // canonicalJsonString is key-order independent
@@ -2871,7 +2947,8 @@ unittest  // a raw registration's inputSchema is enforced on poll, stream, and s
 			Nullable!long.init, Nullable!long.init);
 		}) == ErrorCode.invalidParams);
 	assert(codeOf(() @safe {
-			rt.openPushStream("n", bad, "", Json(1), (string m, Json p) @safe {});
+			cast(void) openLive(rt, "n", bad, "", Json(1), (string m, Json p) @safe {
+			});
 		}) == ErrorCode.invalidParams);
 	assert(codeOf(() @safe {
 			rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks", bad), "u");
@@ -2951,8 +3028,8 @@ unittest  // emit fans out to a matching push stream
 
 	string deliveredMethod;
 	Json deliveredParams;
-	auto handle = rt.openPushStream("incident.created", Json.emptyObject,
-			"user-1", Json(1), (string method, Json params) @safe {
+	auto handle = openLive(rt, "incident.created", Json.emptyObject, "user-1",
+			Json(1), (string method, Json params) @safe {
 		deliveredMethod = method;
 		deliveredParams = params;
 	});
@@ -2961,6 +3038,56 @@ unittest  // emit fans out to a matching push stream
 	assert(deliveredParams["eventId"].get!string == "evt1");
 	// the subscription id is carried in _meta
 	assert(deliveredParams["_meta"][subscriptionIdMetaKey].get!int == 1);
+	handle.close();
+}
+
+unittest  // starting a push stream sends active, then the backlog, and takes no poll lease
+{
+	long now = 1_000_000;
+	auto rt = testRuntime(() @safe => now);
+	int unsubs;
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	rt.register(reg);
+	const from = rt.buffer_.headCursor();
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	string[] methods;
+	auto handle = rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		methods ~= m;
+	});
+	assert(methods.length == 0); // nothing is written until the transport starts it
+	rt.startPushStream(handle.stream, nullable(from), Nullable!long.init);
+	assert(methods == [eventsActiveNotification, eventsEventNotification]);
+	handle.close();
+	assert(unsubs == 1); // no lease outlives the stream
+	now += 10 * 60 * 1000;
+	rt.sweepPollLeases();
+	assert(unsubs == 1);
+}
+
+unittest  // an event emitted while a push stream starts is delivered once, after the backlog
+{
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	const from = rt.buffer_.headCursor();
+	rt.emit(EventOccurrence("evt_backlog", "n", "t"));
+	string[] frames;
+	bool emitted;
+	auto handle = rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		frames ~= m == eventsEventNotification ? p["eventId"].get!string : m;
+		if (!emitted)
+		{
+			emitted = true; // the first write yields; another fiber emits meanwhile
+			rt.emit(EventOccurrence("evt_live", "n", "t"));
+		}
+	});
+	rt.emit(EventOccurrence("evt_before_start", "n", "t"));
+	rt.startPushStream(handle.stream, nullable(from), Nullable!long.init);
+	assert(frames == [
+		eventsActiveNotification, "evt_backlog", "evt_before_start", "evt_live"
+	]);
+	assert(handle.stream.cursor.get == "3"); // the live event's position, never rolled back
 	handle.close();
 }
 
@@ -2978,7 +3105,7 @@ unittest  // advancePushStream delivers a recoverable error frame when the check
 	rt.register(reg);
 	string[] methods;
 	Json[] params;
-	auto handle = rt.openPushStream("email.received", Json.emptyObject, "u",
+	auto handle = openLive(rt, "email.received", Json.emptyObject, "u",
 			Json(7), (string m, Json p) @safe { methods ~= m; params ~= p; });
 	rt.advancePushStream(handle.stream);
 	assert(methods == [eventsErrorNotification]);
@@ -3003,7 +3130,7 @@ unittest  // advancePushStream re-sends active{truncated:true} with the fresh cu
 	rt.register(reg);
 	string[] methods;
 	Json[] params;
-	auto handle = rt.openPushStream("email.received", Json.emptyObject, "u",
+	auto handle = openLive(rt, "email.received", Json.emptyObject, "u",
 			Json(1), (string m, Json p) @safe { methods ~= m; params ~= p; });
 	rt.advancePushStream(handle.stream);
 	assert(methods == [eventsActiveNotification, eventsEventNotification]);
@@ -3022,7 +3149,7 @@ unittest  // terminatePush sends a terminated frame, releases the subscription, 
 	rt.register(reg);
 	string[] methods;
 	Json[] params;
-	auto handle = rt.openPushStream("incident.created", Json.emptyObject, "u",
+	auto handle = openLive(rt, "incident.created", Json.emptyObject, "u",
 			Json(3), (string m, Json p) @safe { methods ~= m; params ~= p; });
 	bool hooked;
 	handle.stream.onTerminated = () @safe { hooked = true; };
@@ -3042,7 +3169,7 @@ unittest  // terminateEventType ends push streams and webhook subscriptions for 
 	auto ft = new FakeWebhookTransport();
 	auto rt = engineRuntime(ft);
 	string[] methods;
-	rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+	cast(void) openLive(rt, "n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
 		methods ~= m;
 	});
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
@@ -3060,10 +3187,10 @@ unittest  // terminatePrincipal ends only that principal's subscriptions
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
 	string[] a, b;
-	rt.openPushStream("n", Json.emptyObject, "alice", Json(1), (string m, Json p) @safe {
+	cast(void) openLive(rt, "n", Json.emptyObject, "alice", Json(1), (string m, Json p) @safe {
 		a ~= m;
 	});
-	rt.openPushStream("n", Json.emptyObject, "bob", Json(2), (string m, Json p) @safe {
+	cast(void) openLive(rt, "n", Json.emptyObject, "bob", Json(2), (string m, Json p) @safe {
 		b ~= m;
 	});
 	rt.terminatePrincipal("alice", "", toErrorJson(forbidden("revoked")));
@@ -3079,7 +3206,7 @@ unittest  // a closed push stream no longer receives events
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
 	int count;
-	auto handle = rt.openPushStream("n", Json.emptyObject, "", Json(1), (string m, Json p) @safe {
+	auto handle = openLive(rt, "n", Json.emptyObject, "", Json(1), (string m, Json p) @safe {
 		count++;
 	});
 	rt.emit(EventOccurrence("a", "n", "t"));
@@ -3105,13 +3232,13 @@ unittest  // broadcast match/transform shape per-subscription push delivery
 	rt.register(reg);
 
 	int p1Count, p2Count;
-	rt.openPushStream("incident.created", Json(["severity": Json("P1")]), "u",
-			Json(1), (string m, Json params) @safe {
+	cast(void) openLive(rt, "incident.created", Json(["severity": Json("P1")]),
+			"u", Json(1), (string m, Json params) @safe {
 		p1Count++;
 		assert(params["data"]["shaped"].get!bool);
 	});
-	rt.openPushStream("incident.created", Json(["severity": Json("P2")]), "u",
-			Json(2), (string m, Json p) @safe { p2Count++; });
+	cast(void) openLive(rt, "incident.created", Json(["severity": Json("P2")]),
+			"u", Json(2), (string m, Json p) @safe { p2Count++; });
 
 	rt.emit(EventOccurrence("e", "incident.created", "t", Json([
 		"severity": Json("P1")
@@ -3127,12 +3254,10 @@ unittest  // targeted emit delivers to a single subscription by id
 	};
 	rt.register(reg);
 	int s1, s2;
-	rt.openPushStream("slack.message", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
-		s1++;
-	});
-	rt.openPushStream("slack.message", Json.emptyObject, "u", Json(2), (string m, Json p) @safe {
-		s2++;
-	});
+	cast(void) openLive(rt, "slack.message", Json.emptyObject, "u", Json(1),
+			(string m, Json p) @safe { s1++; });
+	cast(void) openLive(rt, "slack.message", Json.emptyObject, "u", Json(2),
+			(string m, Json p) @safe { s2++; });
 	rt.emit(EventOccurrence("e", "slack.message", "t"), Json(2));
 	assert(s1 == 0 && s2 == 1);
 }
@@ -3146,7 +3271,7 @@ unittest  // emit does not pollute a check-backed type's push-stream cursor with
 	reg.check = (EventContext ctx) @safe => EventResult.empty("c-author");
 	rt.register(reg);
 
-	auto handle = rt.openPushStream("email.received", Json.emptyObject, "u",
+	auto handle = openLive(rt, "email.received", Json.emptyObject, "u",
 			Json(1), (string m, Json p) @safe {});
 	// Seed the stream with the author's own cursor, as the leading poll would.
 	handle.stream.cursor = nullable("c-author");
@@ -3165,10 +3290,10 @@ unittest  // a throwing push stream neither aborts a sibling stream nor the webh
 
 	bool siblingGotEvent;
 	// A disconnected subscriber whose deliver throws.
-	rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+	cast(void) openLive(rt, "n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
 		throw new Exception("client disconnected");
 	});
-	rt.openPushStream("n", Json.emptyObject, "u", Json(2), (string m, Json p) @safe {
+	cast(void) openLive(rt, "n", Json.emptyObject, "u", Json(2), (string m, Json p) @safe {
 		siblingGotEvent = true;
 	});
 
@@ -3234,8 +3359,8 @@ unittest  // a throwing on_subscribe does not leave a push stream registered
 	int delivered;
 	import std.exception : assertThrown;
 
-	assertThrown!Exception(rt.openPushStream("n", Json.emptyObject, "u",
-			Json(1), (string m, Json p) @safe { delivered++; }));
+	assertThrown!Exception(openLive(rt, "n", Json.emptyObject, "u", Json(1),
+			(string m, Json p) @safe { delivered++; }));
 	rt.emit(EventOccurrence("e", "n", "t"));
 	assert(delivered == 0);
 }
@@ -3326,9 +3451,9 @@ unittest  // lifecycle is refcounted across modes: fires once per (principal,nam
 
 	auto args = Json(["channel": Json("general")]);
 	// two push streams with the same (principal, args), plus a poll — one upstream.
-	auto h1 = rt.openPushStream("slack.message", args, "u", Json(1), (string m, Json p) @safe {
+	auto h1 = openLive(rt, "slack.message", args, "u", Json(1), (string m, Json p) @safe {
 	});
-	auto h2 = rt.openPushStream("slack.message", args, "u", Json(2), (string m, Json p) @safe {
+	auto h2 = openLive(rt, "slack.message", args, "u", Json(2), (string m, Json p) @safe {
 	});
 	rt.poll("slack.message", args, "u", Nullable!string.init,
 			Nullable!long.init, Nullable!long.init);
@@ -3376,7 +3501,7 @@ unittest  // unregister ends every subscription with NotFound{kind:event} and no
 	rt.onListChanged(() @safe { changed++; });
 	string[] methods;
 	Json[] params;
-	rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+	cast(void) openLive(rt, "n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
 		methods ~= m;
 		params ~= p;
 	});
@@ -3413,7 +3538,7 @@ unittest  // re-registering with an incompatible payloadSchema terminates with U
 	assert(changed == 1); // a new type
 	string[] methods;
 	Json[] params;
-	rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+	cast(void) openLive(rt, "n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
 		methods ~= m;
 		params ~= p;
 	});
@@ -3441,7 +3566,7 @@ unittest  // an additive schema change keeps subscriptions but still notifies li
 			`{"type":"object","properties":{"a":{"type":"string"}}}`);
 	rt.register(reg);
 	string[] methods;
-	rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+	cast(void) openLive(rt, "n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
 		methods ~= m;
 	});
 	reg.descriptor.inputSchema = parseJsonString(
@@ -3493,7 +3618,7 @@ unittest  // typed publish marshals the payload and fans out to a push stream
 	auto rt = testRuntime();
 	auto ev = rt.define!(DemoArgs, DemoPayload)("incident.created");
 	Json delivered;
-	rt.openPushStream("incident.created", Json.emptyObject, "u", Json(1),
+	cast(void) openLive(rt, "incident.created", Json.emptyObject, "u", Json(1),
 			(string m, Json params) @safe { delivered = params; });
 	ev.publish(DemoPayload("INC-1", "P1"));
 	assert(delivered["data"]["id"].get!string == "INC-1");
@@ -3505,7 +3630,7 @@ unittest  // typed publish(payload, id, timestamp) preserves an upstream identit
 	auto rt = testRuntime();
 	auto ev = rt.define!(DemoArgs, DemoPayload)("incident.created");
 	Json delivered;
-	rt.openPushStream("incident.created", Json.emptyObject, "u", Json(1),
+	cast(void) openLive(rt, "incident.created", Json.emptyObject, "u", Json(1),
 			(string m, Json params) @safe { delivered = params; });
 	ev.publish(DemoPayload("INC-1", "P1"), "upstream-42", "2026-02-19T15:30:00Z");
 	assert(delivered["eventId"].get!string == "upstream-42");
@@ -3555,10 +3680,10 @@ unittest  // typed match filters typed publish fan-out per subscription
 		return args.severity.length == 0 || p.severity == args.severity;
 	});
 	int p1, p2;
-	rt.openPushStream("incident.created", Json(["severity": Json("P1")]), "u",
-			Json(1), (string m, Json params) @safe { p1++; });
-	rt.openPushStream("incident.created", Json(["severity": Json("P2")]), "u",
-			Json(2), (string m, Json params) @safe { p2++; });
+	cast(void) openLive(rt, "incident.created", Json(["severity": Json("P1")]),
+			"u", Json(1), (string m, Json params) @safe { p1++; });
+	cast(void) openLive(rt, "incident.created", Json(["severity": Json("P2")]),
+			"u", Json(2), (string m, Json params) @safe { p2++; });
 	ev.publish(DemoPayload("INC-1", "P1"));
 	assert(p1 == 1 && p2 == 0);
 }
@@ -3574,7 +3699,7 @@ unittest  // typed transform shapes the delivered payload per subscription
 		return ev.fromPayload(p);
 	});
 	Json delivered;
-	rt.openPushStream("incident.created", Json.emptyObject, "u", Json(1),
+	cast(void) openLive(rt, "incident.created", Json.emptyObject, "u", Json(1),
 			(string m, Json params) @safe { delivered = params; });
 	ev.publish(DemoPayload("INC-1", "P1"));
 	// The shaped payload is delivered; the runtime-owned identity fields survive.
@@ -3621,14 +3746,14 @@ unittest  // enum fields in A and P round-trip by NAME across poll/publish/match
 	});
 
 	int high, low;
-	rt.openPushStream("alert.raised", Json(["minSeverity": Json("high")]), "u",
-			Json(1), (string m, Json params) @safe {
+	cast(void) openLive(rt, "alert.raised", Json(["minSeverity": Json("high")]),
+			"u", Json(1), (string m, Json params) @safe {
 		high++;
 		// the payload enum is delivered as its name, matching the schema
 		assert(params["data"]["severity"].get!string == "high");
 	});
-	rt.openPushStream("alert.raised", Json(["minSeverity": Json("low")]), "u",
-			Json(2), (string m, Json params) @safe { low++; });
+	cast(void) openLive(rt, "alert.raised", Json(["minSeverity": Json("low")]),
+			"u", Json(2), (string m, Json params) @safe { low++; });
 
 	ev.publish(EnumPayload("INC-1", Severity.high));
 	// the high payload clears both subscriptions' thresholds
@@ -3672,8 +3797,8 @@ unittest  // openPushStream throws Unsupported when push is disabled for the typ
 	reg.emitOnly = true;
 	reg.disabledModes = [DeliveryMode.push];
 	rt.register(reg);
-	assertThrown!McpException(rt.openPushStream("x", Json.emptyObject, "",
-			Json(1), (string m, Json p) @safe {}));
+	assertThrown!McpException(openLive(rt, "x", Json.emptyObject, "", Json(1),
+			(string m, Json p) @safe {}));
 }
 
 version (unittest)

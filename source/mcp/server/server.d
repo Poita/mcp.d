@@ -1441,8 +1441,7 @@ final class McpServer : ServerCore
 	/// Returns true when the message was an `events/stream` request it handled.
 	bool tryServeStdioEventsStream(Message msg, void delegate(string) @safe writeLine) @safe
 	{
-		import mcp.protocol.events : StreamParams, eventsActiveNotification,
-			eventsEventNotification, activeParams, withSubscriptionId, subscriptionIdMetaKey;
+		import mcp.protocol.events : StreamParams;
 
 		if (msg.kind != MessageKind.request || msg.method != "events/stream")
 			return false;
@@ -1491,20 +1490,13 @@ final class McpServer : ServerCore
 			writeLine(makeResponse(msg.id, streamEventsResult()).toString());
 		};
 
-		// Leading active frame + any backlog from an initial poll.
+		// Leading active frame + any backlog, then the live events held since open.
 		try
-		{
-			auto first = eventsRuntime_.poll(p.name, p.arguments, "", p.cursor,
-					p.maxAgeMs, Nullable!long.init);
-			deliver(eventsActiveNotification,
-					withSubscriptionId(activeParams(first.cursor, first.truncated), subId));
-			foreach (ev; first.events)
-				deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), subId));
-			handle.stream.cursor = first.cursor;
-		}
+			eventsRuntime_.startPushStream(handle.stream, p.cursor, p.maxAgeMs);
 		catch (Exception)
-			deliver(eventsActiveNotification,
-					withSubscriptionId(activeParams(p.cursor, false), subId));
+		{
+			// stdout is gone; the transport's shutdown drops the stream.
+		}
 		return true;
 	}
 

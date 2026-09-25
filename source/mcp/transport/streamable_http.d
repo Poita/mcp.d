@@ -1493,7 +1493,8 @@ private void handleEventsStream(McpServer server, Message msg,
 	}
 
 	// Validate (and register the emit sink + fire on_subscribe) BEFORE upgrading
-	// the response, so an invalid subscription returns a JSON-RPC error.
+	// the response, so an invalid subscription returns a JSON-RPC error. The
+	// runtime holds live events until `startPushStream`, after the headers.
 	import mcp.server.events_runtime : PushHandle;
 
 	PushHandle handle;
@@ -1522,25 +1523,18 @@ private void handleEventsStream(McpServer server, Message msg,
 	};
 
 	const emitOnly = rt.isEmitOnly(p.name);
-	Nullable!string cursor = p.cursor;
 	long pollMs = 15_000;
 
-	// Leading active frame + any backlog, from an initial poll.
+	// Leading active frame + any backlog, then the live events held since open.
 	try
 	{
-		auto first = rt.poll(p.name, p.arguments, principal, p.cursor,
-				p.maxAgeMs, Nullable!long.init);
-		deliver(eventsActiveNotification,
-				withSubscriptionId(activeParams(first.cursor, first.truncated), subId));
-		foreach (ev; first.events)
-			deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), subId));
-		cursor = first.cursor;
-		handle.stream.cursor = first.cursor;
-		if (first.nextPollMs > 0)
-			pollMs = first.nextPollMs;
+		const next = rt.startPushStream(handle.stream, p.cursor, p.maxAgeMs);
+		if (next > 0)
+			pollMs = next;
 	}
 	catch (Exception)
-		deliver(eventsActiveNotification, withSubscriptionId(activeParams(p.cursor, false), subId));
+		return; // client disconnected
+	Nullable!string cursor = handle.stream.cursor;
 
 	// Hold open: poll-driven check types pull events on a cadence; emit-driven
 	// types receive them via the sink. Either way a heartbeat carries the cursor.
