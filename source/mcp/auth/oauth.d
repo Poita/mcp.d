@@ -1492,6 +1492,11 @@ private TokenSet parseTokenResponse(int status, string responseBody) @safe
 	return TokenSet.fromJson(parseJsonString(responseBody));
 }
 
+/// Upper bound on an OAuth/discovery response body (metadata documents, DCR and
+/// token responses) read from the network. A larger response is refused rather
+/// than buffered, so a hostile or misbehaving endpoint cannot exhaust memory.
+package(mcp) enum size_t maxAuthResponseBytes = 256 * 1024;
+
 /// POST an `application/x-www-form-urlencoded` body to a token endpoint over the
 /// SDK's SSRF-safe transport (https, or http to loopback for dev) and return the
 /// parsed `TokenSet`. `authHeader`, when non-empty, is sent as `Authorization`.
@@ -1513,7 +1518,7 @@ private TokenSet postTokenRequest(string tokenEndpoint, string body_, string aut
 			creq.writeBody(cast(const(ubyte)[]) body_);
 		}, (scope HTTPClientResponse cres) {
 			status = cres.statusCode;
-			responseBody = cres.bodyReader.readAllUTF8();
+			responseBody = cres.bodyReader.readAllUTF8(false, maxAuthResponseBytes);
 		});
 	}();
 	return parseTokenResponse(status, responseBody);
@@ -1685,6 +1690,30 @@ unittest  // parseTokenResponse decodes a 2xx body into a populated TokenSet
 	assert(ts.expiresIn == 3600);
 	assert(ts.refreshToken == "RT");
 	assert(ts.scope_ == "a b");
+}
+
+unittest  // exchangeAuthCode refuses a token response larger than maxAuthResponseBytes
+{
+	import std.array : replicate;
+	import std.conv : to;
+	import std.exception : assertThrown;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	auto settings = new HTTPServerSettings;
+	settings.bindAddresses = ["127.0.0.1"];
+	settings.port = 0;
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"at","token_type":"Bearer","pad":"` ~ "x".replicate(
+			maxAuthResponseBytes) ~ `"}`, "application/json");
+	});
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
+	const endpoint = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/token";
+
+	assertThrown(exchangeAuthCode(endpoint, "CODE", "http://127.0.0.1:1/cb",
+			"client1", "", "VERIFIER"));
 }
 
 unittest  // exchangeAuthCode refuses a plaintext (non-loopback) token endpoint

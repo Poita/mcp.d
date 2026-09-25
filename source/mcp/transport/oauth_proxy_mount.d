@@ -839,23 +839,28 @@ private string pathOf(string url) @safe
 	return slash >= 0 ? rest[slash .. $] : "/";
 }
 
-/// Read the request body as JSON, distinguishing a malformed body (returns
-/// false, so the caller can reply 400) from an absent body (permitted; yields an
-/// empty object). A malformed body is logged rather than silently treated as
-/// empty, which would let an unparseable `/register` request succeed with no
-/// redirect URIs.
+/// Upper bound on a request body read by the proxy's unauthenticated endpoints
+/// (`/register`, `/consent`, `/token`). Legitimate bodies are a few hundred
+/// bytes; a larger one is refused rather than buffered.
+package enum size_t maxProxyRequestBodyBytes = 64 * 1024;
+
+/// Read the request body as JSON, distinguishing a malformed or oversized body
+/// (returns false, so the caller can reply 400) from an absent body (permitted;
+/// yields an empty object). A malformed body is logged rather than silently
+/// treated as empty, which would let an unparseable `/register` request succeed
+/// with no redirect URIs.
 private bool tryReadJsonBody(scope HTTPServerRequest req, out Json body_) @safe
 {
 	import vibe.stream.operations : readAllUTF8;
 
-	const payload = req.bodyReader.readAllUTF8();
-	if (payload.length == 0)
-	{
-		body_ = Json.emptyObject;
-		return true;
-	}
 	try
 	{
+		const payload = req.bodyReader.readAllUTF8(false, maxProxyRequestBodyBytes);
+		if (payload.length == 0)
+		{
+			body_ = Json.emptyObject;
+			return true;
+		}
 		body_ = parseJsonString(payload);
 		return true;
 	}
@@ -863,16 +868,21 @@ private bool tryReadJsonBody(scope HTTPServerRequest req, out Json body_) @safe
 	{
 		import vibe.core.log : logWarn;
 
-		logWarn("/register: rejecting malformed JSON body: %s", e.msg);
+		logWarn("/register: rejecting malformed or oversized body: %s", e.msg);
 		return false;
 	}
 }
 
+/// Read an `application/x-www-form-urlencoded` request body; an oversized body
+/// reads as empty, so the handler rejects it as missing its fields.
 private string readFormString(scope HTTPServerRequest req) @safe
 {
 	import vibe.stream.operations : readAllUTF8;
 
-	return req.bodyReader.readAllUTF8();
+	try
+		return req.bodyReader.readAllUTF8(false, maxProxyRequestBodyBytes);
+	catch (Exception)
+		return "";
 }
 
 /// Parse a JSON token-response body into a `Json` object, tolerating an empty or
@@ -922,7 +932,7 @@ void exchangeUpstream(string endpoint, string body_, string authHeader,
 {
 	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 	import vibe.stream.operations : readAllUTF8;
-	import mcp.auth.oauth : secureRequestHTTP;
+	import mcp.auth.oauth : maxAuthResponseBytes, secureRequestHTTP;
 
 	// secureRequestHTTP throws on an unsafe or unresolvable host and pins the
 	// connect to the pre-vetted resolved address, so the upstream client_secret
@@ -938,7 +948,7 @@ void exchangeUpstream(string endpoint, string body_, string authHeader,
 		creq.writeBody(cast(const(ubyte)[]) body_);
 	}, (scope HTTPClientResponse cres) {
 		st = cres.statusCode;
-		rb = cres.bodyReader.readAllUTF8();
+		rb = cres.bodyReader.readAllUTF8(false, maxAuthResponseBytes);
 	});
 	status = st;
 	responseBody = rb;
@@ -1187,6 +1197,46 @@ unittest  // exchangeUpstream refuses a plaintext (non-loopback) upstream endpoi
 	string rb;
 	int st;
 	assertThrown(exchangeUpstream("http://upstream.example.com/token", "grant_type=x", "", rb, st));
+}
+
+unittest  // exchangeUpstream refuses an upstream response larger than maxAuthResponseBytes
+{
+	import std.array : replicate;
+	import std.conv : to;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : maxAuthResponseBytes;
+	import vibe.http.server : HTTPServerSettings, listenHTTP;
+
+	auto settings = new HTTPServerSettings;
+	settings.bindAddresses = ["127.0.0.1"];
+	settings.port = 0;
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"at","pad":"` ~ "x".replicate(maxAuthResponseBytes) ~ `"}`,
+			"application/json");
+	});
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
+
+	string rb;
+	int st;
+	assertThrown(exchangeUpstream(
+			"http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/token",
+			"grant_type=x", "", rb, st));
+}
+
+unittest  // /register refuses an oversized request body with 400
+{
+	import std.array : replicate;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthRegister(router, proxy);
+
+	const res = browserPost(router, "https://mcp.example.com/register",
+			`{"redirect_uris":["http://localhost:5000/cb"],"pad":"` ~ "x".replicate(
+				maxProxyRequestBodyBytes) ~ `"}`, "");
+	assert(res.status == 400);
 }
 
 unittest  // exchangeUpstream fails CLOSED for an https host that cannot be resolved

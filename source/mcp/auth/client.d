@@ -623,7 +623,7 @@ final class OAuthClient
 				req.method = HTTPMethod.GET;
 				req.headers["Accept"] = "application/json";
 			}, (scope HTTPClientResponse res) {
-				auto body = res.bodyReader.readAllUTF8();
+				auto body = res.bodyReader.readAllUTF8(false, maxAuthResponseBytes);
 				if (res.statusCode / 100 == 2 && body.length)
 				{
 					parsed = parseJsonString(body); // a throw here is a fetch error, caught below
@@ -661,7 +661,7 @@ final class OAuthClient
 				req.headers["Authorization"] = authHeader;
 			req.writeBody(payload);
 		}, (scope HTTPClientResponse res) {
-			auto body = res.bodyReader.readAllUTF8();
+			auto body = res.bodyReader.readAllUTF8(false, maxAuthResponseBytes);
 			if (res.statusCode / 100 != 2)
 				throw internalError("Token endpoint returned HTTP " ~ res.statusCode.to!string ~ (
 					body.length ? ": " ~ body : ""));
@@ -1384,6 +1384,46 @@ unittest  // prmResourceMatches rejects another origin, a sibling path, and a mi
 	assert(!prmResourceMatches("https://mcp.example.com/mc", "https://mcp.example.com/mcp"));
 	assert(!prmResourceMatches("https://mcp.example.com/mcp/admin", "https://mcp.example.com/mcp"));
 	assert(!prmResourceMatches("", "https://mcp.example.com/mcp"));
+}
+
+unittest  // discovery refuses an oversized metadata document instead of buffering it
+{
+	import std.algorithm : canFind;
+	import std.array : replicate;
+	import std.exception : assertThrown;
+
+	LoopbackServer srv;
+	srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		if (req.path.canFind("oauth-protected-resource"))
+			res.writeBody(`{"resource":"` ~ srv.base ~ `/mcp","authorization_servers":["` ~ srv.base
+				~ `"],"pad":"` ~ "x".replicate(maxAuthResponseBytes) ~ `"}`, "application/json");
+		else
+		{
+			res.statusCode = 404;
+			res.writeBody("", "text/plain");
+		}
+	});
+	scope (exit)
+		srv.stop();
+
+	assertThrown(new OAuthClient().discoverProtectedResource(srv.base ~ "/mcp"));
+}
+
+unittest  // a registration/token response larger than the cap is refused
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"client_id":"cid","pad":"` ~ "x".replicate(maxAuthResponseBytes) ~ `"}`,
+			"application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	AuthorizationServerMetadata as_;
+	as_.registrationEndpoint = srv.base ~ "/register";
+	assertThrown(new OAuthClient().register(as_, "client"));
 }
 
 unittest  // discoverAuthServer falls back to synthesized endpoints when no document exists
