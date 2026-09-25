@@ -823,13 +823,15 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 	{
 		static if (!is(P : RequestContext))
 		{
-			// Populate PromptArgument.description from the @describeParam UDA.
-			enum d = describeFor!(overload, names[i]);
-			// A prompt argument is required only when it is neither Nullable nor
-			// carries a declared D-level default, matching the tool path.
-			descriptor.arguments ~= PromptArgument(names[i], d.length
-					? nullable(d) : Nullable!string.init,
-					!isInstanceOf!(Nullable, P) && is(defs[i] == void));
+			{
+				// Populate PromptArgument.description from the @describeParam UDA.
+				enum d = describeFor!(overload, names[i]);
+				// A prompt argument is required only when it is neither Nullable nor
+				// carries a declared D-level default, matching the tool path.
+				descriptor.arguments ~= PromptArgument(names[i], d.length
+						? nullable(d) : Nullable!string.init,
+						!isInstanceOf!(Nullable, P) && is(defs[i] == void));
+			}
 		}
 	}
 
@@ -1832,6 +1834,36 @@ unittest  // @describeParam UDA: prompt argument descriptions appear in prompts/
 		if (prompts[i]["name"].get!string == "intro")
 			intro = prompts[i];
 	assert("description" !in intro["arguments"][0]);
+}
+
+unittest  // @prompt with several non-context parameters registers and dispatches
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class TwoArgPromptApi
+	{
+		@prompt("pair", "Prompt taking two arguments")
+		@describeParam("left", "the first word")
+		string pair(string left, string right, RequestContext ctx) @safe
+		{
+			return left ~ "+" ~ right;
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new TwoArgPromptApi);
+
+	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
+			Json.emptyObject))).get["result"]["prompts"];
+	assert(prompts[0]["arguments"].length == 2);
+	assert(prompts[0]["arguments"][0]["description"].get!string == "the first word");
+	assert("description" !in prompts[0]["arguments"][1]);
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "pair";
+	pp["arguments"] = Json(["left": Json("a"), "right": Json("b")]);
+	auto pr = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
+	assert(pr["result"]["messages"][0]["content"]["text"].get!string == "a+b");
 }
 
 unittest  // ToolAnnotations: typed struct round-trips through JSON
