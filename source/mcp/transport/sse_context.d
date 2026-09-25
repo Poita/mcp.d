@@ -573,6 +573,16 @@ final class ServerPushChannel : PushChannel
 					// buffered event after the cursor in sequence order, and continue
 					// from the next seq. Touch the ordinal so its history is treated as
 					// most-recently used.
+					// A listener still attached to the ordinal is the client's previous,
+					// now half-closed connection (a disconnect is otherwise noticed only
+					// by the next heartbeat): evict it so delivery goes to the live
+					// stream and the ordinal keeps one id sequence.
+					long[] superseded;
+					foreach (lid, ord; streamOf)
+						if (ord == resumeOrdinal)
+							superseded ~= lid;
+					foreach (lid; superseded)
+						removeListenerLocked(lid);
 					streamOf[id] = resumeOrdinal;
 					touchHistory(resumeOrdinal);
 					long maxSeq = resumeSeq;
@@ -1267,6 +1277,29 @@ unittest  // a GET carrying Last-Event-ID replays events emitted after that curs
 	assert(resumed.length == 2);
 	assert(resumed[1].canFind("\"n\":3"));
 	assert(resumed[1].startsWith("id: " ~ idLine[0 .. idLine.indexOf("-")] ~ "-"));
+}
+
+unittest  // resuming a stream evicts the stale listener still attached to it
+{
+	import std.string : indexOf;
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string[] stale;
+	ch.addListener((string f) @safe { stale ~= f; }, Json.init, ListenFilter.init, "", null, "S");
+	ch.notify("notifications/message", Json(["n": Json(1)]));
+	const cursor = stale[0]["id: ".length .. stale[0].indexOf("\n")];
+
+	// The client reconnects before the half-closed stream has been detected.
+	string[] fresh;
+	ch.addListener((string f) @safe { fresh ~= f; }, Json.init,
+			ListenFilter.init, cursor, null, "S");
+	assert(ch.listenerCount == 1, "the stale listener must be evicted on resume");
+
+	ch.notify("notifications/message", Json(["n": Json(2)]));
+	assert(stale.length == 1);
+	assert(fresh.length == 1 && fresh[0].canFind("\"n\":2"));
 }
 
 unittest  // an unknown / empty Last-Event-ID falls back to a fresh stream ordinal
