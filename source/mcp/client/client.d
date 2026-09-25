@@ -737,7 +737,10 @@ final class McpClient : ClientProtocol
 	///   - `Method not found` (-32601) → legacy server; fall back to the
 	///     `initialize` handshake;
 	///   - `UnsupportedProtocolVersionError` (-32022) → modern server; pick from
-	///     the advertised `supported` list rather than falling back.
+	///     the advertised `supported` list rather than falling back;
+	///   - HTTP 400/404/405 without a recognised modern error → an older server;
+	///     try a Streamable HTTP `initialize`, and only if that is rejected the
+	///     same way fall back to the 2024-11-05 HTTP+SSE transport.
 	/// Returns the negotiated protocol version. Throws if there is no mutually
 	/// supported version, or on any other error.
 	ProtocolVersion connect() @safe
@@ -757,10 +760,20 @@ final class McpClient : ClientProtocol
 		}
 		catch (LegacyFallbackException)
 		{
-			// Modern POST rejected with 400/404/405: this is (or may be) an old
-			// HTTP+SSE server. Ask the transport to open its backward-compatibility
-			// fallback (HTTP: the legacy two-endpoint GET-SSE transport; a no-op on
-			// transports without one), then run the legacy initialize handshake.
+			// Modern POST rejected with 400/404/405 and no recognised modern error:
+			// the peer speaks an older version. Per basic/transports §Backward
+			// Compatibility, fall back to a Streamable HTTP `initialize` first; only
+			// when that is rejected the same way is the peer a 2024-11-05 HTTP+SSE
+			// server, so open the transport's legacy two-endpoint fallback (a no-op
+			// on transports without one) and run the legacy handshake.
+			try
+			{
+				initialize();
+				return negotiated;
+			}
+			catch (LegacyFallbackException)
+			{
+			}
 			transport.startLegacyFallback();
 			initialize(ProtocolVersion.v2024_11_05.toWire);
 			return negotiated;
@@ -6963,13 +6976,11 @@ unittest  // connect() routes a legacy HTTP+SSE fallback through the transport s
 
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
-	bool firstCall = true;
 	transport.responder = (Json message, long expectId) @safe {
-		if (firstCall)
-		{
-			firstCall = false;
+		// Both the modern probe and the Streamable HTTP initialize are rejected;
+		// only the handshake after the fallback opens succeeds.
+		if (!transport.legacyFallbackCalled)
 			throw new LegacyFallbackException(404);
-		}
 		// The legacy initialize handshake: echo a minimal initialize result.
 		Json r = Json.emptyObject;
 		r["protocolVersion"] = ProtocolVersion.v2024_11_05.toWire;

@@ -2722,3 +2722,101 @@ unittest  // failOutstandingLegacyWaiters fails every still-pending waiter with 
 	assert(pending.err !is null && pending.err.msg == "stream failed");
 	assert(done.err is null); // an already-resolved waiter is left untouched
 }
+
+version (unittest)
+{
+	import vibe.http.router : URLRouter;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse;
+
+	/// Serve `router` on an ephemeral loopback port and run `scenario` against its
+	/// `/mcp` URL inside the event loop, returning the scenario's failure message
+	/// (empty on success).
+	private string runAgainstFakeServer(URLRouter router, void delegate(string url) @safe scenario)
+	{
+		import std.conv : to;
+		import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+		import vibe.http.server : HTTPServerSettings, listenHTTP;
+
+		auto settings = new HTTPServerSettings;
+		settings.port = 0;
+		settings.bindAddresses = ["127.0.0.1"];
+		string failure;
+		runTask(() nothrow{
+			scope (exit)
+				exitEventLoop();
+			try
+			{
+				auto listener = listenHTTP(settings, router);
+				scope (exit)
+					() @trusted { listener.stopListening(); }();
+				scenario("http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/mcp");
+			}
+			catch (Exception e)
+				failure = e.msg.length ? e.msg : "exception";
+		});
+		runEventLoop();
+		return failure;
+	}
+
+	/// Read a POST body as JSON inside a fake-server handler.
+	private Json requestJson(HTTPServerRequest req) @safe
+	{
+		return parseJsonString(() @trusted { return req.bodyReader.readAllUTF8(); }());
+	}
+
+	/// A minimal initialize result for protocol `version_`, echoing the request id.
+	private Json initializeReply(Json request, string version_) @safe
+	{
+		auto resp = parseJsonString(`{"jsonrpc":"2.0","result":{"capabilities":{},`
+				~ `"serverInfo":{"name":"fake","version":"1.0"}}}`);
+		resp["id"] = request["id"];
+		resp["result"]["protocolVersion"] = version_;
+		return resp;
+	}
+}
+
+unittest  // connect() tries a Streamable HTTP initialize before legacy HTTP+SSE when a 2025-11-25 server rejects the modern probe
+{
+	import mcp.client.client : McpClient;
+	import mcp.protocol.versions : ProtocolVersion;
+
+	// A conformant 2025-11-25 server answers the 2026-07-28 probe with a plain 400
+	// whose body is not a recognised modern error, serves initialize normally, and
+	// offers no legacy GET SSE stream.
+	bool sawLegacyGet;
+	auto router = new URLRouter;
+	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auto j = requestJson(req);
+		if (req.headers.get("MCP-Protocol-Version", "") == "2026-07-28")
+		{
+			res.statusCode = 400;
+			res.writeBody(`{"jsonrpc":"2.0","id":null,"error":{"code":-32000,`
+				~ `"message":"Bad Request: Unsupported protocol version"}}`, "application/json");
+			return;
+		}
+		const method = ("method" in j) ? j["method"].get!string : "";
+		if (method == "initialize")
+		{
+			res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+			return;
+		}
+		res.statusCode = 202;
+		res.writeBody("", "text/plain");
+	});
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		sawLegacyGet = true;
+		res.statusCode = 405;
+		res.writeBody("", "text/plain");
+	});
+
+	ProtocolVersion negotiated;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		negotiated = client.connect();
+	});
+	assert(failure.length == 0, "connect failed: " ~ failure);
+	assert(negotiated == ProtocolVersion.v2025_11_25);
+	assert(!sawLegacyGet, "a Streamable HTTP server must not be treated as legacy HTTP+SSE");
+}
