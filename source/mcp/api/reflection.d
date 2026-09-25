@@ -19,7 +19,7 @@ import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
 import mcp.api.skills : Skill, registerSkill;
-import mcp.api.binding : bindJson, schemaNode, schemaOf;
+import mcp.api.binding : bindJson, bindString, schemaNode, schemaOf;
 import mcp.protocol.schema;
 
 @safe:
@@ -302,8 +302,6 @@ private P marshalArgDefault(P, alias def, bool stringArgs = false)(Json args, st
 /// protocol types as strings) a JSON string is parsed into `P` from its text.
 private P marshalArg(P, bool stringArgs = false)(Json args, string name) @safe
 {
-	import mcp.api.binding : bindString;
-
 	static if (is(P : RequestContext))
 	{
 		assert(false, "context parameters are injected, not marshalled");
@@ -316,27 +314,6 @@ private P marshalArg(P, bool stringArgs = false)(Json args, string name) @safe
 			if (args[name].type == Json.Type.string)
 				return bindString!P(args[name].get!string);
 		return bindJson!P(args[name]);
-	}
-}
-
-/// Convert a captured resource-template URI variable (always a string) into the
-/// declared parameter type `P`. Enums are parsed by member name, other scalars
-/// via `std.conv.to`; conversion failure throws (caller maps it to InvalidParams).
-private P marshalTemplateVar(P)(string raw) @safe
-{
-	import std.conv : to;
-
-	static if (is(P == string))
-		return raw;
-	else static if (is(P == enum) || isIntegral!P || isFloatingPoint!P || is(P == bool))
-		return to!P(raw);
-	else
-	{
-		// Aggregate / Nullable etc.: interpret the captured string as a JSON
-		// document and deserialize through the enum-aware policy.
-		import vibe.data.json : parseJsonString;
-
-		return bindJson!P(parseJsonString(raw));
 	}
 }
 
@@ -928,14 +905,13 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 				argv[i] = (names[i] in params) ? params[names[i]] : "";
 			else
 			{
-				// A captured URI variable is always a string; convert it into the
-				// declared parameter type instead of silently defaulting it to
-				// `P.init`. Surface a conversion failure as InvalidParams
-				// rather than throwing a raw exception.
+				// A captured URI variable is always a string; parse it into the
+				// declared parameter type and surface a conversion failure as
+				// InvalidParams.
 				if (auto pv = names[i] in params)
 				{
 					try
-						argv[i] = marshalTemplateVar!P(*pv);
+						argv[i] = bindString!P(*pv);
 					catch (Exception e)
 						throw invalidParams("resource template parameter '" ~ names[i]
 							~ "' could not be parsed as " ~ P.stringof ~ ": " ~ e.msg);
@@ -2588,6 +2564,28 @@ unittest  // resource-template enum param is parsed by member name
 	rp["uri"] = "hue://green";
 	auto rr = s.handle(Message(makeRequest(Json(2), "resources/read", rp))).get;
 	assert(rr["result"]["contents"][0]["text"].get!string == "hue-green");
+}
+
+unittest  // resource-template Nullable!string param receives the plain captured value
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class NullableTemplateApi
+	{
+		@resourceTemplate("opt://{x}", "Opt", "text/plain")
+		string opt(Nullable!string x) @safe
+		{
+			return x.isNull ? "null" : "got " ~ x.get;
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullableTemplateApi);
+	Json rp = Json.emptyObject;
+	rp["uri"] = "opt://hello";
+	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	assert("error" !in rr, rr.toString);
+	assert(rr["result"]["contents"][0]["text"].get!string == "got hello");
 }
 
 unittest  // resource-template invalid scalar yields an InvalidParams error
