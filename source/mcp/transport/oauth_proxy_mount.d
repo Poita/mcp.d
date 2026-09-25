@@ -793,7 +793,26 @@ in (exchange !is null)
 		// body to the client verbatim.
 		if (proxy.brokerEnabled() && !isRefresh && status >= 200 && status < 300)
 		{
-			const upstream = TokenSet.fromJson(parseJsonBody(responseBody));
+			// Some IdPs (GitHub) report a failed exchange as a 2xx with an OAuth
+			// `error` body, so a token is minted only for a response that carries
+			// an access_token and no error.
+			const upstreamJson = parseJsonBody(responseBody);
+			const upstreamError = upstreamJson.type == Json.Type.object
+				&& "error" in upstreamJson ? upstreamJson["error"] : Json.undefined;
+			const upstream = TokenSet.fromJson(upstreamJson);
+			if (upstreamError.type != Json.Type.undefined || upstream.accessToken.length == 0)
+			{
+				Json err = Json.emptyObject;
+				const errorCode = upstreamError.type == Json.Type.string
+					? upstreamError.get!string : "";
+				err["error"] = errorCode.length ? errorCode : "server_error";
+				if (auto d = "error_description" in upstreamJson)
+					if (d.type == Json.Type.string)
+						err["error_description"] = *d;
+				res.statusCode = errorCode.length ? HTTPStatus.badRequest : HTTPStatus.badGateway;
+				res.writeJsonBody(err);
+				return;
+			}
 			const brokered = proxy.issueClientToken(upstream);
 			res.statusCode = HTTPStatus.ok;
 			res.writeJsonBody(brokerTokenResponseJson(brokered.token,
@@ -2457,6 +2476,35 @@ unittest  // BROKER MOUNT: the upstream token is retrievable server-side from th
 	auto info = validate(issuedToken);
 	assert(info.valid);
 	assert(info.claims["upstream_access_token"].get!string == "gho_upstream_secret");
+}
+
+unittest  // BROKER MOUNT: a 200 upstream response carrying an OAuth error mints no token
+{
+	auto store = new ReferenceTokenStore();
+	auto proxy = brokerMountProxy(store);
+	auto router = new URLRouter;
+	// GitHub reports a bad code as HTTP 200 with an error body.
+	mountOAuthToken(router, proxy, fixedUpstream(`{"error":"bad_verification_code",`
+			~ `"error_description":"The code passed is incorrect or expired."}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 400);
+	assert(res.body_.canFind("bad_verification_code"));
+	assert(!res.body_.canFind("access_token"));
+}
+
+unittest  // BROKER MOUNT: a 200 upstream response with no access_token mints no token
+{
+	auto store = new ReferenceTokenStore();
+	auto proxy = brokerMountProxy(store);
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy, fixedUpstream(`{"token_type":"bearer"}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status >= 400);
+	assert(!res.body_.canFind("access_token"));
 }
 
 unittest  // PASSTHROUGH REGRESSION: with no issueToken/tokenStore the upstream body is relayed verbatim

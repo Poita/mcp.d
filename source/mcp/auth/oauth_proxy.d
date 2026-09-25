@@ -1166,12 +1166,17 @@ final class OAuthProxy
 	/// issued token's claims so the server can call the upstream API on the user's
 	/// behalf, store it, and return the opaque token to hand the client. The
 	/// audience is bound to the proxy's `resource` so the issued token validates
-	/// against this server. Only valid in broker mode (`brokerEnabled`).
+	/// against this server. Only valid in broker mode (`brokerEnabled`). Throws
+	/// when `upstream` carries no access token, so a failed upstream exchange can
+	/// never yield a client token.
 	BrokeredToken issueClientToken(TokenSet upstream) @safe
 	in (cfg.issueToken !is null && cfg.tokenStore !is null)
 	{
 		import std.algorithm : canFind;
+		import std.exception : enforce;
 
+		enforce(upstream.accessToken.length,
+				"upstream token response carries no access_token; refusing to mint a client token");
 		auto issued = cfg.issueToken(upstream);
 		if (cfg.resource.length && !issued.audience.canFind(cfg.resource))
 			issued.audience ~= cfg.resource;
@@ -2171,6 +2176,15 @@ unittest  // BROKER: issuing a client token does NOT return the upstream token
 	const issued = proxy.issueClientToken(upstream);
 	assert(issued.token.length > 0);
 	assert(issued.token != "gho_upstream_secret");
+}
+
+unittest  // BROKER: an upstream response without an access token mints nothing
+{
+	import std.exception : assertThrown;
+
+	auto proxy = new OAuthProxy(brokerConfig());
+	TokenSet upstream;
+	assertThrown(proxy.issueClientToken(upstream));
 }
 
 unittest  // BROKER: the resource server accepts the issued token, rejects the raw upstream token
