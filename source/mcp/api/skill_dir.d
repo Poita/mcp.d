@@ -259,7 +259,15 @@ private Json nodeToJson(N)(N node) @safe
 		case NodeType.integer:
 			return Json(node.as!long);
 		case NodeType.decimal:
-			return Json(node.as!double);
+			import std.math : isInfinity, isNaN;
+
+			const d = node.as!double;
+			// JSON has no non-finite numbers; keep YAML's spelling as a string.
+			if (isNaN(d))
+				return Json(".nan");
+			if (isInfinity(d))
+				return Json(d > 0 ? ".inf" : "-.inf");
+			return Json(d);
 		case NodeType.null_:
 			return Json(null);
 		case NodeType.timestamp:
@@ -301,12 +309,58 @@ string verifySkillMarkdown(const SkillEntry entry, string skillMd) @safe
 		parsed = parseSkillFrontmatter(skillMd);
 	catch (Exception e)
 		return "the fetched SKILL.md has no parseable frontmatter: " ~ e.msg;
-	// vibe Json equality is deep, so one comparison covers every field the
-	// author wrote, in both directions (a missing field and an added field are
-	// both discrepancies).
-	if (parsed != entry.frontmatter)
+	// One deep comparison covers every field the author wrote, in both
+	// directions (a missing field and an added field are both discrepancies).
+	if (!sameJsonContent(parsed, entry.frontmatter))
 		return "the fetched SKILL.md frontmatter does not match the entry's frontmatter";
 	return null;
+}
+
+/// Deep JSON equality that compares numbers by value: a whole-number YAML float
+/// such as `1.0` is serialized as `1` and parsed back as an integer, so an
+/// integer and a float of equal value must match.
+private bool sameJsonContent(const Json a, const Json b) @safe
+{
+	static bool isNumber(const Json j)
+	{
+		return j.type == Json.Type.int_ || j.type == Json.Type.float_;
+	}
+
+	static double asDouble(const Json j)
+	{
+		return j.type == Json.Type.int_ ? cast(double) j.get!long : j.get!double;
+	}
+
+	if (isNumber(a) && isNumber(b))
+	{
+		if (a.type == Json.Type.int_ && b.type == Json.Type.int_)
+			return a.get!long == b.get!long;
+		return asDouble(a) == asDouble(b);
+	}
+	if (a.type != b.type)
+		return false;
+	if (a.type == Json.Type.object)
+	{
+		if (a.length != b.length)
+			return false;
+		foreach (kv; a.byKeyValue)
+		{
+			const other = kv.key in b;
+			if (other is null || !sameJsonContent(kv.value, *other))
+				return false;
+		}
+		return true;
+	}
+	if (a.type == Json.Type.array)
+	{
+		if (a.length != b.length)
+			return false;
+		foreach (i; 0 .. a.length)
+			if (!sameJsonContent(a[i], b[i]))
+				return false;
+		return true;
+	}
+	return a == b;
 }
 
 // --- Filesystem walk -------------------------------------------------------
@@ -1148,4 +1202,49 @@ unittest  // verifySkillMarkdown reports entry frontmatter that diverges from th
 	import std.algorithm : canFind;
 
 	assert(reason.canFind("frontmatter"));
+}
+
+version (unittest)
+{
+	private SkillEntry wireEntryFor(string md) @safe
+	{
+		import vibe.data.json : parseJsonString;
+
+		SkillEntry e;
+		e.uri = "skill://x/SKILL.md";
+		// The entry's frontmatter as a client sees it: serialized onto the wire
+		// and parsed back.
+		e.frontmatter = parseJsonString(parseSkillFrontmatter(md).toString());
+		e.resources = [
+			SkillResourceRef("skill://x/SKILL.md", skillDigestOf(md), md.length)
+		];
+		return e;
+	}
+}
+
+unittest  // verifySkillMarkdown accepts a whole-number YAML float that crossed the wire as an integer
+{
+	enum md = "---\nname: x\ndescription: d\nversion: 1.0\n---\n\n# Body\n";
+	const reason = verifySkillMarkdown(wireEntryFor(md), md);
+	assert(reason is null, reason);
+}
+
+unittest  // non-finite YAML floats in frontmatter render as valid JSON strings
+{
+	import vibe.data.json : parseJsonString;
+
+	auto fm = parseSkillFrontmatter(
+			"---\nname: x\ndescription: d\nhi: .inf\nlo: -.inf\nnope: .nan\n---\n");
+	auto wire = parseJsonString(fm.toString());
+	assert(wire["hi"].get!string == ".inf");
+	assert(wire["lo"].get!string == "-.inf");
+	assert(wire["nope"].get!string == ".nan");
+}
+
+unittest  // verifySkillMarkdown still rejects a numerically different frontmatter value
+{
+	enum md = "---\nname: x\ndescription: d\nversion: 1.5\n---\n\n# Body\n";
+	auto e = wireEntryFor(md);
+	e.frontmatter["version"] = Json(2);
+	assert(verifySkillMarkdown(e, md) !is null);
 }
