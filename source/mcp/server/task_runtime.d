@@ -1,6 +1,7 @@
 module mcp.server.task_runtime;
 
 import core.time : Duration, seconds, msecs;
+import std.datetime.systime : SysTime;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
@@ -14,7 +15,8 @@ import mcp.server.task_store : TaskStore, TaskRecord, InMemoryTaskStore,
 /// Tuning for the task runtime. `idGenerator` mints task IDs (default
 /// `defaultTaskIdGenerator`). `defaultTtl` / `defaultPollInterval` seed a task's
 /// TTL / suggested poll cadence when a creator does not specify them.
-/// `sweepInterval` is how often the (fiber-layer) TTL sweep runs. `nowIso` is an
+/// `sweepInterval` is how often `enableTasks`'s background sweep removes expired
+/// tasks (zero disables it; expired tasks are still hidden on access). `nowIso` is an
 /// injectable clock returning an ISO-8601 timestamp; null uses the system clock.
 struct TaskOptions
 {
@@ -143,10 +145,79 @@ final class TaskRuntime
 
 	private TaskRecord require(string id) @safe
 	{
-		auto r = store_.get(id);
+		auto r = fetch(id);
 		if (r.isNull)
 			throw taskNotFound(id);
 		return r.get;
+	}
+
+	/// The stored record for `id`, or null when unknown or expired. An expired
+	/// record is removed on sight, so expiry holds between sweeps.
+	private Nullable!TaskRecord fetch(string id) @safe
+	{
+		auto r = store_.get(id);
+		if (!r.isNull && isExpired(r.get, currentTime()))
+		{
+			store_.remove(id);
+			return Nullable!TaskRecord.init;
+		}
+		return r;
+	}
+
+	/// The injected clock as a `SysTime`, falling back to the system clock when
+	/// it does not yield an ISO-8601 extended timestamp.
+	private SysTime currentTime() @safe
+	{
+		import std.datetime.systime : Clock;
+
+		try
+			return SysTime.fromISOExtString(opts_.nowIso());
+		catch (Exception)
+			return Clock.currTime();
+	}
+
+	/// Whether `r` has outlived its TTL at `now`. Only a terminal task expires,
+	/// and its TTL runs from when it settled (`lastUpdatedAt`, which is frozen
+	/// once terminal), so a client always has the full TTL to collect a result
+	/// even when the work itself ran longer. A null TTL never expires.
+	private static bool isExpired(const TaskRecord r, SysTime now) @safe
+	{
+		if (!isTerminal(r.meta.status) || r.meta.ttlMs.isNull)
+			return false;
+		try
+			return now >= SysTime.fromISOExtString(r.meta.lastUpdatedAt) + r.meta.ttlMs.get.msecs;
+		catch (Exception)
+			return false;
+	}
+
+	/// Remove every expired task from the store, returning how many were removed.
+	/// `enableTasks` runs this every `TaskOptions.sweepInterval`.
+	size_t sweepExpired() @safe
+	{
+		const now = currentTime();
+		return store_.removeIf((const TaskRecord r) @safe => isExpired(r, now));
+	}
+
+	/// Run `sweepExpired` every `interval` in a background fiber for the life of
+	/// the process.
+	void startSweeper(Duration interval) @safe
+	{
+		import vibe.core.core : runTask, sleep;
+		import vibe.core.log : logError;
+
+		runTask(() nothrow @safe {
+			while (true)
+			{
+				try
+					sleep(interval);
+				catch (Exception)
+					return; // interrupted: the event loop is shutting down
+				try
+					sweepExpired();
+				catch (Exception e)
+					logError("task TTL sweep failed: %s", e.msg);
+			}
+		});
 	}
 
 	/// The `-32602 Task not found` error, with the offending `taskId` in `data`.
@@ -265,7 +336,7 @@ final class TaskRuntime
 	/// running handler).
 	bool cancelRequested(string id) @safe
 	{
-		auto r = store_.get(id);
+		auto r = fetch(id);
 		return !r.isNull && r.get.cancelRequested;
 	}
 
@@ -286,28 +357,28 @@ final class TaskRuntime
 	/// The responses delivered so far for a task (keyed by input-request key).
 	Json[string] takenInput(string id) @safe
 	{
-		auto r = store_.get(id);
+		auto r = fetch(id);
 		return r.isNull ? null : r.get.inputResponses;
 	}
 
 	/// The durable executor input recorded at creation, or `undefined`.
 	Json executorInput(string id) @safe
 	{
-		auto r = store_.get(id);
+		auto r = fetch(id);
 		return r.isNull ? Json.undefined : r.get.executorInput;
 	}
 
 	/// The registered executor key (`toolName`) bound to a task, or empty.
 	string toolName(string id) @safe
 	{
-		auto r = store_.get(id);
+		auto r = fetch(id);
 		return r.isNull ? "" : r.get.toolName;
 	}
 
 	/// The current status of a task, or null if unknown.
 	Nullable!TaskStatus statusOf(string id) @safe
 	{
-		auto r = store_.get(id);
+		auto r = fetch(id);
 		return r.isNull ? Nullable!TaskStatus.init : nullable(r.get.meta.status);
 	}
 
@@ -322,7 +393,7 @@ final class TaskRuntime
 	/// Read a previously stored checkpoint value, or `undefined` if absent.
 	Json getCheckpoint(string id, string key) @safe
 	{
-		auto r = store_.get(id);
+		auto r = fetch(id);
 		if (r.isNull)
 			return Json.undefined;
 		if (auto p = key in r.get.checkpoints)
@@ -538,4 +609,71 @@ unittest  // STATELESSNESS: two runtimes sharing one store see each other's stat
 	auto done = nodeB.getDetailed(t.taskId);
 	assert(done["status"].get!string == "completed");
 	assert(done["result"]["structuredContent"]["ok"].get!bool);
+}
+
+unittest  // a terminal task expires ttl after it settled: tasks/get then reports not found
+{
+	import std.exception : collectException;
+
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	auto store = new InMemoryTaskStore();
+	auto rt = new TaskRuntime(store, o);
+	auto t = rt.create(nullable(1_000.msecs));
+	now = "2026-06-07T10:00:05Z";
+	rt.complete(t.taskId, Json.emptyObject);
+	now = "2026-06-07T10:00:05.5Z";
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
+	now = "2026-06-07T10:00:06Z";
+	auto ex = cast(McpException) collectException(rt.getDetailed(t.taskId));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	assert(store.get(t.taskId).isNull, "an expired record is removed from the store");
+}
+
+unittest  // a non-terminal task is retained past its ttl
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	auto t = rt.create(nullable(1_000.msecs));
+	now = "2026-06-07T11:00:00Z";
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
+}
+
+unittest  // sweepExpired removes expired terminal records and keeps the rest
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	auto store = new InMemoryTaskStore();
+	auto rt = new TaskRuntime(store, o);
+	auto done = rt.create(nullable(1_000.msecs));
+	auto fresh = rt.create(nullable(60_000.msecs));
+	auto running = rt.create(nullable(1_000.msecs));
+	rt.complete(done.taskId, Json.emptyObject);
+	rt.complete(fresh.taskId, Json.emptyObject);
+	now = "2026-06-07T10:00:02Z";
+	assert(rt.sweepExpired() == 1);
+	assert(store.get(done.taskId).isNull);
+	assert(!store.get(fresh.taskId).isNull);
+	assert(!store.get(running.taskId).isNull);
+}
+
+unittest  // a task with an unlimited ttl never expires
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	auto store = new InMemoryTaskStore();
+	auto rt = new TaskRuntime(store, o);
+	auto t = rt.create();
+	TaskRecord r = store.get(t.taskId).get;
+	r.meta.ttlMs = Nullable!long.init;
+	r.meta.status = TaskStatus.completed;
+	store.put(r);
+	now = "2100-01-01T00:00:00Z";
+	assert(rt.sweepExpired() == 0);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
 }

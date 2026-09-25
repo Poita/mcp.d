@@ -134,10 +134,15 @@ interface TaskStore
 
 	/// Drop the record identified by `taskId`. A no-op if unknown.
 	void remove(string taskId) @safe;
+
+	/// Drop every record for which `pred` returns true, returning how many were
+	/// removed. The runtime's TTL sweep uses it to expire settled tasks; a store
+	/// with native key expiry may apply the same rule itself.
+	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe;
 }
 
 /// In-memory `TaskStore` backed by an associative array. The default store; it
-/// keeps task records for the lifetime of the server process. Records are stored
+/// keeps task records until the runtime expires them. Records are stored
 /// as serialized JSON and re-parsed on read, so a returned record never aliases
 /// stored state — the same isolation a networked store provides for free, which
 /// makes the in-memory store a faithful single-process stand-in for a shared one.
@@ -166,6 +171,17 @@ final class InMemoryTaskStore : TaskStore
 	void remove(string taskId) @safe
 	{
 		records.remove(taskId);
+	}
+
+	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe
+	{
+		string[] doomed;
+		foreach (id, j; records)
+			if (pred(TaskRecord.fromJson(j)))
+				doomed ~= id;
+		foreach (id; doomed)
+			records.remove(id);
+		return doomed.length;
 	}
 }
 
@@ -269,4 +285,18 @@ unittest  // defaultTaskIdGenerator yields distinct 32-char hex ids
 	assert(a != b, "two generated task ids must differ");
 	foreach (c; a)
 		assert((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'), "id must be lowercase hex");
+}
+
+unittest  // removeIf drops exactly the records matching the predicate
+{
+	auto s = new InMemoryTaskStore();
+	foreach (id; ["a", "b", "c"])
+	{
+		TaskRecord r;
+		r.meta.taskId = id;
+		s.put(r);
+	}
+	assert(s.removeIf((const TaskRecord r) @safe => r.meta.taskId != "b") == 2);
+	assert(s.get("a").isNull && s.get("c").isNull);
+	assert(!s.get("b").isNull);
 }

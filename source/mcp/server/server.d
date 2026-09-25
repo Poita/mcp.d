@@ -1021,6 +1021,15 @@ final class McpServer : ServerCore
 		taskRuntime_.onStatusChange((Json detailed, string owner) @safe {
 			notifyPrincipal(owner, "notifications/tasks", detailed);
 		});
+		// Unit tests drive `sweepExpired` directly.
+		version (unittest)
+		{
+		}
+		else
+		{
+			if (opts.sweepInterval > Duration.zero)
+				taskRuntime_.startSweeper(opts.sweepInterval);
+		}
 		tasksEnabled_ = true;
 		enableExtension(tasksExtensionKey, Json.emptyObject);
 		return taskRuntime_;
