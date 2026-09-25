@@ -31,6 +31,7 @@
 /// are unit-testable with a mocked upstream.
 module mcp.auth.oauth_proxy;
 
+import core.time : Duration, minutes;
 import std.string : endsWith, indexOf, startsWith;
 
 import vibe.data.json : Json;
@@ -43,6 +44,7 @@ import mcp.auth.oauth : AuthorizationServerMetadata, ClientIdMetadataDocument,
 	buildRefreshTokenForm, isValidClientIdMetadataUrl, requireSecureUrl, secureRequestHTTP;
 import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore, referenceTokenValidator;
 import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidator;
+import mcp.transport.session : BoundedExpiringMap;
 
 @safe:
 
@@ -820,6 +822,18 @@ class ConsentRequiredException : Exception
 // The proxy provider
 // ===========================================================================
 
+/// What an authorization code the proxy relayed to a client is bound to: the
+/// client's PKCE S256 `code_challenge`, the client `redirect_uri` the code was
+/// delivered to, and the SEP-991 CIMD `client_id` URL (empty for a DCR client,
+/// whose `client_id` is the shared upstream one). `OAuthProxy.redeemCode`
+/// checks a `/token` request against it.
+struct RelayedCodeBinding
+{
+	string codeChallenge; /// the client's PKCE S256 `code_challenge`
+	string clientRedirectUri; /// the client `redirect_uri` the code was relayed to
+	string clientId; /// the CIMD `client_id` URL; empty for a DCR client
+}
+
 /// Fetches and parses the OAuth Client ID Metadata Document (SEP-991) hosted at a
 /// URL-formatted `client_id`. The default fetcher is the SSRF-guarded HTTP fetch
 /// (`OAuthProxy.fetchClientIdMetadata`); inject a custom one (e.g. a caching
@@ -842,6 +856,14 @@ final class OAuthProxy
 	private ConsentStore consentStore;
 	private RedirectUriRegistry redirectRegistry;
 	private ClientIdMetadataFetcher cimdFetcher;
+	private BoundedExpiringMap!RelayedCodeBinding relayedCodes = BoundedExpiringMap!RelayedCodeBinding(
+			relayedCodeTtl, maxRelayedCodes, null);
+
+	/// How long a relayed authorization code stays redeemable at `/token`.
+	enum Duration relayedCodeTtl = 10.minutes;
+
+	/// Maximum number of relayed-but-unredeemed codes retained.
+	enum size_t maxRelayedCodes = 10_000;
 
 	this(OAuthProxyConfig cfg) @safe
 	{
@@ -1067,6 +1089,44 @@ final class OAuthProxy
 		if (!consentStore.hasConsent(consentSession, clientIdUrl))
 			throw new ConsentRequiredException(clientIdUrl);
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
+	}
+
+	/// Record that the upstream authorization `code` is being relayed to a client
+	/// under `binding`. Call this at the upstream callback, before redirecting the
+	/// code to the client, so a later `/token` can be checked by `redeemCode`.
+	void recordRelayedCode(string code, RelayedCodeBinding binding) @safe
+	{
+		synchronized (this)
+			relayedCodes.put(code, binding);
+	}
+
+	/// Check an authorization-code `/token` request against the binding recorded
+	/// by `recordRelayedCode`, consuming it (a code is redeemable once, and a
+	/// failed attempt burns it). Returns true only when the code was relayed by
+	/// this proxy and not yet redeemed, `codeVerifier` satisfies the recorded
+	/// S256 `code_challenge` (RFC 7636 §4.6), `redirectUri` equals the one the code
+	/// was delivered to (RFC 6749 §4.1.3), and `clientId` is the client that
+	/// started the flow (the CIMD `client_id` URL, or the shared upstream
+	/// `client_id` for a DCR client). The proxy enforces this itself so the code
+	/// stays bound to its client even when the upstream ignores PKCE.
+	bool redeemCode(string code, string codeVerifier, string clientId, string redirectUri) @safe
+	{
+		import std.digest.sha : sha256Of;
+		import mcp.auth.oauth : base64UrlNoPad, constantTimeEquals;
+
+		if (code.length == 0 || codeVerifier.length == 0)
+			return false;
+		bool found;
+		RelayedCodeBinding binding;
+		synchronized (this)
+			binding = relayedCodes.take(code, found);
+		if (!found || binding.codeChallenge.length == 0)
+			return false;
+		const expectedClientId = binding.clientId.length ? binding.clientId : cfg.upstreamClientId;
+		if (clientId != expectedClientId || redirectUri != binding.clientRedirectUri)
+			return false;
+		const challenge = base64UrlNoPad(sha256Of(cast(const(ubyte)[]) codeVerifier)[]);
+		return constantTimeEquals(challenge, binding.codeChallenge);
 	}
 
 	/// Build the upstream token-exchange form for a proxied `/token`.
@@ -1737,6 +1797,45 @@ unittest  // InMemoryConsentStore records and reports per-redirect-uri consent
 	store.grantConsent("browser-1", "http://a/cb");
 	assert(store.hasConsent("browser-1", "http://a/cb"));
 	assert(!store.hasConsent("browser-1", "http://b/cb"));
+}
+
+unittest  // CODE BINDING: a DCR client redeems a relayed code with its verifier, the shared client_id and its redirect_uri
+{
+	import mcp.auth.oauth : makePkce;
+
+	auto proxy = new OAuthProxy(sampleConfig());
+	const pkce = makePkce(cast(const(ubyte)[]) "0123456789abcdef0123456789abcdef");
+	proxy.recordRelayedCode("CODE", RelayedCodeBinding(pkce.challenge,
+			"http://localhost:5000/cb", ""));
+	assert(proxy.redeemCode("CODE", pkce.verifier, "Iv1.upstream", "http://localhost:5000/cb"));
+	assert(!proxy.redeemCode("CODE", pkce.verifier, "Iv1.upstream", "http://localhost:5000/cb"));
+}
+
+unittest  // CODE BINDING: a CIMD code must be redeemed by the client_id URL that started the flow
+{
+	import mcp.auth.oauth : makePkce;
+
+	auto proxy = new OAuthProxy(sampleConfig());
+	const pkce = makePkce(cast(const(ubyte)[]) "0123456789abcdef0123456789abcdef");
+	const cimd = "https://app.example.com/oauth/client.json";
+	proxy.recordRelayedCode("A", RelayedCodeBinding(pkce.challenge,
+			"http://127.0.0.1:8765/cb", cimd));
+	assert(!proxy.redeemCode("A", pkce.verifier, "Iv1.upstream", "http://127.0.0.1:8765/cb"));
+	proxy.recordRelayedCode("B", RelayedCodeBinding(pkce.challenge,
+			"http://127.0.0.1:8765/cb", cimd));
+	assert(proxy.redeemCode("B", pkce.verifier, cimd, "http://127.0.0.1:8765/cb"));
+}
+
+unittest  // CODE BINDING: a failed redemption burns the code
+{
+	import mcp.auth.oauth : makePkce;
+
+	auto proxy = new OAuthProxy(sampleConfig());
+	const pkce = makePkce(cast(const(ubyte)[]) "0123456789abcdef0123456789abcdef");
+	proxy.recordRelayedCode("CODE", RelayedCodeBinding(pkce.challenge,
+			"http://localhost:5000/cb", ""));
+	assert(!proxy.redeemCode("CODE", "guess", "Iv1.upstream", "http://localhost:5000/cb"));
+	assert(!proxy.redeemCode("CODE", pkce.verifier, "Iv1.upstream", "http://localhost:5000/cb"));
 }
 
 unittest  // CONFUSED DEPUTY: consent granted in one browser does not cover another browser

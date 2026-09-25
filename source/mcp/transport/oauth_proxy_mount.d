@@ -32,7 +32,9 @@
 ///     302s the upstream code straight back to the client (transparent PKCE: the
 ///     client's `code_challenge` was forwarded upstream, so the client redeems
 ///     the relayed code with its own `code_verifier`).
-///   * `POST /token` — exchanges the (relayed upstream) `code` + the client's
+///   * `POST /token` — checks the relayed `code` against what the callback bound
+///     it to (the client's S256 `code_challenge`, `client_id` and `redirect_uri`;
+///     `proxy.redeemCode`), then exchanges the `code` + the client's
 ///     `code_verifier` at the upstream token endpoint using the fixed upstream
 ///     credentials (`proxy.tokenForm`/`proxy.tokenAuthHeader`). By default
 ///     (passthrough) it relays the upstream token response to the client
@@ -54,7 +56,7 @@ import vibe.http.common : HTTPMethod;
 
 import mcp.auth.oauth : isValidClientIdMetadataUrl, TokenSet;
 import mcp.auth.oauth_proxy : ConsentRequiredException, InvalidClientIdMetadataException,
-	InvalidRedirectUriException, OAuthProxy, OAuthProxyConfig;
+	InvalidRedirectUriException, OAuthProxy, OAuthProxyConfig, RelayedCodeBinding;
 
 @safe:
 
@@ -669,6 +671,8 @@ void mountOAuthCallback(URLRouter router, OAuthProxy proxy, ProxyStateStore stor
 			res.redirect(location, HTTPStatus.found);
 			return;
 		}
+		proxy.recordRelayedCode(code, RelayedCodeBinding(st.codeChallenge,
+			st.clientRedirectUri, st.clientId));
 		const location = buildClientCallbackRedirect(st.clientRedirectUri, code, st.clientState);
 		res.redirect(location, HTTPStatus.found);
 	});
@@ -765,6 +769,16 @@ in (exchange !is null)
 		{
 			const code = formField(form, "code");
 			const verifier = formField(form, "code_verifier");
+			if (!proxy.redeemCode(code, verifier, formField(form,
+				"client_id"), formField(form, "redirect_uri")))
+			{
+				Json err = Json.emptyObject;
+				err["error"] = "invalid_grant";
+				err["error_description"] = "authorization code, code_verifier, client_id or redirect_uri is invalid";
+				res.statusCode = HTTPStatus.badRequest;
+				res.writeJsonBody(err);
+				return;
+			}
 			upstreamBody = proxy.tokenForm(code, verifier);
 		}
 		const authHeader = proxy.tokenAuthHeader();
@@ -2206,6 +2220,19 @@ version (unittest)
 		return new OAuthProxy(cfg);
 	}
 
+	/// Record a relayed code "C" for the verifier "V" and return a `/token` form
+	/// that redeems it.
+	private string redeemableCodeForm(OAuthProxy proxy) @safe
+	{
+		import std.digest.sha : sha256Of;
+		import mcp.auth.oauth : base64UrlNoPad;
+
+		proxy.recordRelayedCode("C", RelayedCodeBinding(base64UrlNoPad(sha256Of("V")[]),
+				"http://localhost:5000/cb", ""));
+		return "grant_type=authorization_code&code=C&code_verifier=V"
+			~ "&client_id=Iv1.upstream&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb";
+	}
+
 	private UpstreamExchange fixedUpstream(string responseBody) @safe
 	{
 		return (string endpoint, string body_, string authHeader, out string rb, out int status) @safe {
@@ -2213,6 +2240,118 @@ version (unittest)
 			status = 200;
 		};
 	}
+}
+
+version (unittest)
+{
+	/// Drive a consented browser through /authorize and the upstream callback so
+	/// the proxy relays upstream code `code` to the client; returns the router.
+	private URLRouter relayedCodeRouter(OAuthProxy proxy, string code,
+			string codeChallenge, UpstreamExchange exchange) @safe
+	{
+		proxy.register(["http://localhost:5000/cb"]);
+		proxy.grantConsent("browser-1", "http://localhost:5000/cb");
+		auto router = new URLRouter;
+		auto store = new ProxyStateStore;
+		mountOAuthAuthorize(router, proxy, store);
+		mountOAuthCallback(router, proxy, store);
+		mountOAuthToken(router, proxy, exchange);
+
+		const upstream = browserGet(router,
+				"https://mcp.example.com/authorize?code_challenge=" ~ codeChallenge
+				~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "browser-1");
+		assert(upstream.status == 302);
+		const proxyState = upstream.location[upstream.location.indexOf("state=") + 6 .. $];
+		const relayed = browserGet(router,
+				"https://mcp.example.com/auth/callback?code=" ~ code ~ "&state=" ~ proxyState, "");
+		assert(relayed.location.startsWith("http://localhost:5000/cb?code=" ~ code));
+		return router;
+	}
+}
+
+unittest  // PKCE: /token refuses a relayed code redeemed with the wrong code_verifier
+{
+	import mcp.auth.oauth : makePkce;
+
+	auto proxy = mountSampleProxy();
+	const pkce = makePkce(cast(const(ubyte)[]) "0123456789abcdef0123456789abcdef");
+	bool upstreamCalled;
+	auto router = relayedCodeRouter(proxy, "UPCODE", pkce.challenge, (string endpoint,
+			string body_, string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		rb = `{"access_token":"gho_upstream","token_type":"bearer"}`;
+		status = 200;
+	});
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			"grant_type=authorization_code&code=UPCODE&code_verifier=attacker-verifier"
+			~ "&client_id=Iv1.upstream&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb", "");
+	assert(res.status == 400);
+	assert(res.body_.canFind("invalid_grant"));
+	assert(!upstreamCalled);
+}
+
+unittest  // PKCE: /token refuses a relayed code presented with a different redirect_uri
+{
+	import mcp.auth.oauth : makePkce;
+
+	auto proxy = mountSampleProxy();
+	const pkce = makePkce(cast(const(ubyte)[]) "0123456789abcdef0123456789abcdef");
+	bool upstreamCalled;
+	auto router = relayedCodeRouter(proxy, "UPCODE", pkce.challenge, (string endpoint,
+			string body_, string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		status = 200;
+	});
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			"grant_type=authorization_code&code=UPCODE&code_verifier=" ~ pkce.verifier
+			~ "&client_id=Iv1.upstream&redirect_uri=https%3A%2F%2Fother.example%2Fcb", "");
+	assert(res.status == 400);
+	assert(res.body_.canFind("invalid_grant"));
+	assert(!upstreamCalled);
+}
+
+unittest  // PKCE: /token refuses a code the proxy never relayed
+{
+	bool upstreamCalled;
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		status = 200;
+	});
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			"grant_type=authorization_code&code=FORGED&code_verifier=V"
+			~ "&client_id=Iv1.upstream&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb", "");
+	assert(res.status == 400);
+	assert(res.body_.canFind("invalid_grant"));
+	assert(!upstreamCalled);
+}
+
+unittest  // PKCE: /token exchanges a relayed code upstream once the verifier, client and redirect match
+{
+	import mcp.auth.oauth : makePkce;
+
+	auto proxy = mountSampleProxy();
+	const pkce = makePkce(cast(const(ubyte)[]) "0123456789abcdef0123456789abcdef");
+	string sentUpstream;
+	auto router = relayedCodeRouter(proxy, "UPCODE", pkce.challenge, (string endpoint,
+			string body_, string authHeader, out string rb, out int status) @safe {
+		sentUpstream = body_;
+		rb = `{"access_token":"gho_upstream","token_type":"bearer"}`;
+		status = 200;
+	});
+
+	const form = "grant_type=authorization_code&code=UPCODE&code_verifier=" ~ pkce.verifier
+		~ "&client_id=Iv1.upstream&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb";
+	const res = browserPost(router, "https://mcp.example.com/token", form, "");
+	assert(res.status == 200);
+	assert(sentUpstream.canFind("code=UPCODE"));
+	// The code is single use.
+	assert(browserPost(router, "https://mcp.example.com/token", form, "").status == 400);
 }
 
 unittest  // BROKER MOUNT: /token returns OUR opaque token, never the upstream token
@@ -2231,7 +2370,7 @@ unittest  // BROKER MOUNT: /token returns OUR opaque token, never the upstream t
 			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
 
 	auto formBody = () @trusted {
-		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
+		return cast(ubyte[]) redeemableCodeForm(proxy).dup;
 	}();
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
@@ -2266,7 +2405,7 @@ unittest  // BROKER MOUNT: the resource server accepts the issued token and reje
 			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
 
 	auto formBody = () @trusted {
-		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
+		return cast(ubyte[]) redeemableCodeForm(proxy).dup;
 	}();
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
@@ -2301,7 +2440,7 @@ unittest  // BROKER MOUNT: the upstream token is retrievable server-side from th
 			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
 
 	auto formBody = () @trusted {
-		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
+		return cast(ubyte[]) redeemableCodeForm(proxy).dup;
 	}();
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
@@ -2335,7 +2474,7 @@ unittest  // PASSTHROUGH REGRESSION: with no issueToken/tokenStore the upstream 
 			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
 
 	auto formBody = () @trusted {
-		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
+		return cast(ubyte[]) redeemableCodeForm(proxy).dup;
 	}();
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
