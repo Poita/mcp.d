@@ -2785,7 +2785,7 @@ unittest  // a session GET stream keeps its session alive and ends when the sess
 	import core.time : msecs;
 	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
 
-	auto sessions = new SessionManager(60.msecs, 0);
+	auto sessions = new SessionManager(300.msecs, 0);
 	const sid = sessions.create();
 	auto push = new ServerPushChannel(new StreamCoordinator);
 	const lid = push.addListener((string) @safe {}, Json.init, ListenFilter.init, "", null, sid);
@@ -2803,7 +2803,7 @@ unittest  // a session GET stream keeps its session alive and ends when the sess
 		try
 		{
 			// Several idle TTLs pass with no POST: the open stream keeps it alive.
-			sleep(200.msecs);
+			sleep(900.msecs);
 			aliveAfterIdle = sessions.isActive(sid);
 			assert(!ended);
 			// DELETE ends the session and closes its stream.
