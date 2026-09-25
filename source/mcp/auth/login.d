@@ -738,8 +738,43 @@ final class OAuthSession
 /// inject a stub to exercise the success and failure branches deterministically.
 alias BrowserSpawn = void delegate(string[] cmd) @safe;
 
+/// The platform families `browserLaunchCommand` knows how to target.
+enum LauncherPlatform
+{
+	macOS,
+	windows,
+	other, /// Linux/BSD and anything else with `xdg-open`
+}
+
+/// The platform this build targets.
+enum LauncherPlatform hostLauncherPlatform = () {
+	version (OSX)
+		return LauncherPlatform.macOS;
+	else version (Windows)
+		return LauncherPlatform.windows;
+	else
+		return LauncherPlatform.other;
+}();
+
+/// The argv that opens `url` in the default browser on `platform`. The URL is
+/// always a single argument and never passes through a shell: on Windows it
+/// goes to `rundll32 url.dll,FileProtocolHandler`, because `cmd /c start` would
+/// treat the `&` separating query parameters as a command separator.
+string[] browserLaunchCommand(string url, LauncherPlatform platform) @safe pure nothrow
+{
+	final switch (platform)
+	{
+	case LauncherPlatform.macOS:
+		return ["open", url];
+	case LauncherPlatform.windows:
+		return ["rundll32", "url.dll,FileProtocolHandler", url];
+	case LauncherPlatform.other:
+		return ["xdg-open", url];
+	}
+}
+
 /// Open `url` in the user's default browser using the platform launcher
-/// (`open` on macOS, `xdg-open` on Linux/BSD, `cmd /c start` on Windows).
+/// (see `browserLaunchCommand`).
 /// Returns true if the launcher started. On failure (no launcher on a headless
 /// host, spawn error) it does not throw — the loopback flow can still complete
 /// if the user opens the URL manually — but it logs the URL so the user is not
@@ -749,13 +784,7 @@ bool openSystemBrowser(string url, scope BrowserSpawn spawn = null) @safe
 {
 	import std.process : spawnProcess, Config;
 
-	string[] cmd;
-	version (OSX)
-		cmd = ["open", url];
-	else version (Windows)
-		cmd = ["cmd", "/c", "start", "", url];
-	else
-		cmd = ["xdg-open", url];
+	auto cmd = browserLaunchCommand(url, hostLauncherPlatform);
 
 	try
 	{
@@ -1902,6 +1931,22 @@ version (Posix) unittest  // stillGroupOrOtherAccessible flags any lingering gro
 	assert(!FileTokenStore.stillGroupOrOtherAccessible(S_IRUSR | S_IWUSR));
 	assert(FileTokenStore.stillGroupOrOtherAccessible(S_IRUSR | S_IWUSR | S_IRGRP));
 	assert(FileTokenStore.stillGroupOrOtherAccessible(S_IRUSR | S_IWUSR | S_IROTH));
+}
+
+unittest  // browserLaunchCommand on Windows hands the URL to rundll32, never to a cmd shell
+{
+	const url = "https://idp.example/authorize?client_id=c&state=s&code_challenge=x";
+	const cmd = browserLaunchCommand(url, LauncherPlatform.windows);
+	assert(cmd == ["rundll32", "url.dll,FileProtocolHandler", url]);
+}
+
+unittest  // browserLaunchCommand uses open on macOS and xdg-open elsewhere, URL as one argument
+{
+	const url = "https://idp.example/authorize?a=1&b=2";
+	assert(browserLaunchCommand(url, LauncherPlatform.macOS) == ["open", url]);
+	assert(browserLaunchCommand(url, LauncherPlatform.other) == [
+		"xdg-open", url
+	]);
 }
 
 unittest  // openSystemBrowser reports a launcher failure instead of swallowing it into a hang
