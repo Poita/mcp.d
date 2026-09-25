@@ -1540,8 +1540,8 @@ final class McpServer : ServerCore
 	/// 2026-07-28 basic/utilities/subscriptions "The server MUST NOT send notification
 	/// types the client has not explicitly requested" under Multiple Concurrent
 	/// Subscriptions. On 2025-11-25 / 2025-06-18 / 2025-03-26 (no `subscriptions/
-	/// listen`) it is an ordinary single-stream `notify`. Returns the number of
-	/// streams reached (0 or 1).
+	/// listen`) it reaches every eligible session once. Returns the number of
+	/// sessions / listen streams reached.
 	private size_t notifyChange(string method, Json params, string uri) @safe
 	{
 		size_t delivered;
@@ -1575,39 +1575,13 @@ final class McpServer : ServerCore
 			// the 2025-era subscribe-then-deliver gate (`isSubscribed(uri)`). On the
 			// modern single-connection path the global opt-in still gates that fallback.
 			const plainEligible = plainGetEligible(method, uri);
-			// The three list-changed notifications are genuine broadcasts (MODE 1):
-			// every connected session MUST be told the list changed, not just the first
-			// eligible stream. `broadcast` fans them out once per distinct session
-			// (still one stream per session, honouring Multiple Connections within a
-			// session). `notifications/resources/updated` is a session-scoped push
-			// (MODE 2) — delivered on one stream, per-session gated via
-			// `plainGetEligibleFor` / the stream's own `ListenFilter`. The empty
-			// session token here keeps the unscoped fan-out (a list-changed reaches all
-			// sessions) and the unscoped single-stream filtered delivery for 2026-07-28
-			// self-contained listen path; per-session attribution lives in each
-			// listener's own `ownerToken` and gate.
-			if (isListChangedBroadcast(method))
-				delivered += pushChannel.broadcast(method, params, uri, plainEligible);
-			else
-				delivered += pushChannel.pushToSession("", method, params, uri, plainEligible);
+			// Every change notification fans out once per session and once per
+			// listen stream (one stream per session, honouring Multiple
+			// Connections), each gated by its own filter / per-session subscription
+			// set, so every subscriber of a resource is told it changed.
+			delivered += pushChannel.broadcast(method, params, uri, plainEligible);
 		}
 		return delivered;
-	}
-
-	/// Whether `method` is one of the three list-changed notifications that are
-	/// genuine broadcasts (every connected session must receive them), as opposed to
-	/// the per-session `notifications/resources/updated`.
-	private static bool isListChangedBroadcast(string method) @safe
-	{
-		switch (method)
-		{
-		case "notifications/tools/list_changed":
-		case "notifications/prompts/list_changed":
-		case "notifications/resources/list_changed":
-			return true;
-		default:
-			return false;
-		}
 	}
 
 	/// Eligibility for a plain (2025-era standalone GET) listener whose
@@ -8523,6 +8497,54 @@ unittest  // notifyResourceUpdated has no title overload (title is not a spec pa
 	// A `title` argument is NOT part of any spec version, so the two-argument
 	// overload must NOT exist.
 	static assert(!__traits(compiles, s.notifyResourceUpdated("test://w", nullable("X"))));
+}
+
+unittest  // notifyResourceUpdated reaches every listen stream subscribed to the uri
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	string a, b, other;
+	ListenFilter f;
+	f.active = true;
+	f.resourceSubscriptions = true;
+	f.resourceUris = ["file:///x"];
+	ListenFilter g = f;
+	g.resourceUris = ["file:///y"];
+	ch.addListener((string fr) @safe { a = fr; }, Json("l-a"), f);
+	ch.addListener((string fr) @safe { b = fr; }, Json("l-b"), f);
+	ch.addListener((string fr) @safe { other = fr; }, Json("l-o"), g);
+
+	assert(s.notifyResourceUpdated("file:///x") == 2);
+	assert(a.canFind("file:///x"));
+	assert(b.canFind("file:///x"));
+	assert(other.length == 0);
+}
+
+unittest  // notifyResourceUpdated reaches every session subscribed to the uri
+{
+	import std.algorithm : canFind;
+
+	auto s = McpServer.stateful("t", "1");
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	auto connA = new ConnectionState;
+	auto connB = new ConnectionState;
+	auto connC = new ConnectionState;
+	connA.subscriptions["file:///x"] = true;
+	connB.subscriptions["file:///x"] = true;
+	string a, b, c;
+	ch.addListener((string fr) @safe { a = fr; }, Json.init, ListenFilter.init,
+			"", s.sessionPushEligibility(connA), "sess-A");
+	ch.addListener((string fr) @safe { b = fr; }, Json.init, ListenFilter.init,
+			"", s.sessionPushEligibility(connB), "sess-B");
+	ch.addListener((string fr) @safe { c = fr; }, Json.init, ListenFilter.init,
+			"", s.sessionPushEligibility(connC), "sess-C");
+
+	assert(s.notifyResourceUpdated("file:///x") == 2);
+	assert(a.canFind("file:///x"));
+	assert(b.canFind("file:///x"));
+	assert(c.length == 0, "an unsubscribed session must not be notified");
 }
 
 unittest  // notifyResourceUpdated is a no-op before a push channel exists
