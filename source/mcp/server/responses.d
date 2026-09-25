@@ -31,7 +31,7 @@ alias MrtrToolHandler = ToolResponse delegate(Json arguments, RequestContext ctx
 /// types carry an `InputRequiredResult required_` plus a `result_` final result
 /// of their respective type; `toJson` switches on `needsInput_`. The mixin keeps
 /// these in lockstep so MRTR edits land on both. The genuine divergences —
-/// `forVersion` (throw vs return on a non-MRTR peer) and `ToolResponse`'s typed
+/// `ToolResponse`'s task outcome and typed
 /// `complete(T)`/`inputRequired(T)` helpers — stay per-struct.
 mixin template InputRequiredPart()
 {
@@ -232,13 +232,17 @@ struct PromptResponse
 	/// version-gated message content (audio/resource_link/tool_use/tool_result
 	/// plus content-level `_meta`/`lastModified`) is not emitted to peers that do
 	/// not understand it. Mirrors `ToolResponse.forVersion`: an
-	/// `InputRequiredResult` is modern-only (MRTR) and carries no version-gated
-	/// content, so it is returned unchanged.
+	/// `InputRequiredResult` is modern-only (MRTR) and has no `messages`, so
+	/// emitting it to a non-MRTR peer is rejected rather than sent off-schema.
 	PromptResponse forVersion(ProtocolVersion v) const @safe
 	{
 		if (needsInput_)
+		{
+			if (!v.usesMRTR)
+				throw internalError("prompts/get handler returned an input-required result on a session that does not support MRTR");
 			return PromptResponse.inputRequired(required_.inputRequests.dup,
 					required_.requestState);
+		}
 		return PromptResponse.complete(result_.forVersion(v));
 	}
 }
@@ -246,3 +250,15 @@ struct PromptResponse
 /// A prompt handler that may, on a stateless (MRTR) modern request, ask the client
 /// for more input instead of returning a final result. See `PromptResponse`.
 alias MrtrPromptHandler = PromptResponse delegate(Json arguments, RequestContext ctx) @safe;
+
+unittest  // PromptResponse.forVersion rejects an input-required result on a non-MRTR session
+{
+	import std.exception : assertThrown, assertNotThrown;
+	import mcp.protocol.errors : McpException;
+
+	auto pr = PromptResponse.inputRequired([
+		InputRequest("q1", "elicitation", Json.emptyObject)
+	]);
+	assertThrown!McpException(pr.forVersion(ProtocolVersion.v2025_11_25));
+	assertNotThrown(pr.forVersion(ProtocolVersion.v2026_07_28));
+}
