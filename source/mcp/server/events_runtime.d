@@ -386,6 +386,22 @@ string isoFromMs(long ms) @safe
 	return t.toISOExtString();
 }
 
+/// Log an exception the events runtime contains rather than propagates, so a
+/// swallowed failure (a delivery task, a worker step, a teardown hook) still
+/// leaves a trace.
+private void logEventsError(string what, Exception e) @safe nothrow
+{
+	try
+		() @trusted {
+		import std.stdio : stderr;
+
+		stderr.writeln("[mcp.events] ", what, ": ", e.msg);
+	}();
+	catch (Exception)
+	{
+	}
+}
+
 /// A poll subscription's ephemeral lease: poll has no explicit goodbye, so the
 /// SDK leases `(principal, name, arguments)` to drive `on_subscribe` (first sight)
 /// and `on_unsubscribe` (lease expiry without renewal). Never persisted.
@@ -534,19 +550,7 @@ final class EventsRuntime
 				try
 					job();
 				catch (Exception e)
-				{
-					// Log rather than discard: a swallowed delivery exception otherwise
-					// vanishes with no trace of why a webhook never arrived.
-					try
-						() @trusted {
-						import std.stdio : stderr;
-
-						stderr.writeln("[mcp.events] delivery task threw: ", e.msg);
-					}();
-					catch (Exception)
-					{
-					}
-				}
+					logEventsError("delivery task threw", e);
 			});
 		};
 		if (opts_.deliverySleep is null)
@@ -911,9 +915,9 @@ final class EventsRuntime
 		s.principal = principal;
 		s.subscriptionId = subscriptionId;
 		s.deliver = deliver;
-		pushStreams_ ~= s;
-
+		// on_subscribe runs first: when it throws, no stream is left registered.
 		acquireLifecycle(*p, name, s.arguments, principal, subscriptionIdString(subscriptionId));
+		pushStreams_ ~= s;
 		return new PushHandle(this, s);
 	}
 
@@ -1121,10 +1125,11 @@ final class EventsRuntime
 		sub.active = true;
 		if (!sub.verified && urlAllowlisted(p.delivery.url))
 			sub.verified = true;
-		webhookStore_.put(sub);
-
+		// on_subscribe runs before the subscription is stored, so a throwing hook
+		// leaves nothing behind that delivers to a client that got an error.
 		if (isNew)
 			acquireLifecycle(*reg, p.name, p.arguments, principal, id);
+		webhookStore_.put(sub);
 		// A fresh subscription replays from its cursor (or bootstraps a fresh one);
 		// the backfill reports whether delivery starts later than that cursor.
 		const truncated = isNew ? backfillWebhook(sub, reg, p.maxAgeMs) : false;
@@ -1618,13 +1623,23 @@ final class EventsRuntime
 		});
 	}
 
-	/// One pass of the periodic work the worker loop performs.
+	/// One pass of the periodic work the worker loop performs. Each step is
+	/// guarded independently, so a throwing store or author hook in one step is
+	/// logged and neither skips the others nor ends the worker loop.
 	void tick() @safe
 	{
-		sweepPollLeases();
-		sweepWebhookSubscriptions();
-		pollWebhookSubscriptions();
-		drainDeliveries();
+		guarded("poll-lease sweep", &sweepPollLeases);
+		guarded("webhook sweep", &sweepWebhookSubscriptions);
+		guarded("poll-driven webhook pass", &pollWebhookSubscriptions);
+		guarded("delivery drain", &drainDeliveries);
+	}
+
+	private static void guarded(string what, void delegate() @safe step) @safe
+	{
+		try
+			step();
+		catch (Exception e)
+			logEventsError(what ~ " threw", e);
 	}
 
 	/// Deliver one queued job to its subscription, verifying the endpoint first (if
@@ -2114,10 +2129,12 @@ final class EventsRuntime
 		const now = opts_.nowMs();
 		const fresh = (key in pollLeases_) is null;
 		const subId = pollSubscriptionId(name, arguments);
-		pollLeases_[key] = PollLease(name, principal, arguments, subId,
-				now + opts_.pollLeaseTtl.total!"msecs");
+		// on_subscribe runs before the lease is recorded, so a throwing hook is
+		// retried by the next poll rather than never firing again.
 		if (fresh)
 			acquireLifecycle(reg, name, arguments, principal, subId);
+		pollLeases_[key] = PollLease(name, principal, arguments, subId,
+				now + opts_.pollLeaseTtl.total!"msecs");
 	}
 
 	// Acquire a lifecycle reference for `(principal, name, arguments)`. `onSubscribe`
@@ -2133,6 +2150,8 @@ final class EventsRuntime
 			return;
 		}
 		lifeRefs_[key] = LifeRef(1, name, principal, arguments, subId);
+		scope (failure)
+			lifeRefs_.remove(key);
 		fireLifecycle(reg.onSubscribe, arguments, principal, subId);
 	}
 
@@ -2149,8 +2168,14 @@ final class EventsRuntime
 		const rec = *p;
 		lifeRefs_.remove(key);
 		auto reg = name in types_;
-		if (reg !is null)
+		if (reg is null)
+			return;
+		// The subscription is gone regardless; a failing teardown hook is logged
+		// rather than aborting the caller (a sweep, an unsubscribe, a stream close).
+		try
 			fireLifecycle(reg.onUnsubscribe, rec.arguments, rec.principal, rec.subscriptionId);
+		catch (Exception e)
+			logEventsError("on_unsubscribe hook threw", e);
 	}
 
 	private void fireLifecycle(EventLifecycle hook, Json arguments,
@@ -2912,6 +2937,66 @@ unittest  // poll lease fires on_subscribe on first sight and on_unsubscribe on 
 	assert(unsubs == 1);
 }
 
+unittest  // a throwing on_subscribe leaves no poll lease behind, so the next poll retries it
+{
+	auto rt = testRuntime();
+	int calls;
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c");
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		if (++calls == 1)
+			throw new Exception("upstream unavailable");
+	};
+	rt.register(reg);
+	import std.exception : assertThrown;
+
+	assertThrown!Exception(rt.poll("n", Json.emptyObject, "u",
+			Nullable!string.init, Nullable!long.init, Nullable!long.init));
+	rt.poll("n", Json.emptyObject, "u", Nullable!string.init,
+			Nullable!long.init, Nullable!long.init);
+	assert(calls == 2);
+}
+
+unittest  // a throwing on_subscribe does not leave a push stream registered
+{
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		throw new Exception("upstream unavailable");
+	};
+	rt.register(reg);
+	int delivered;
+	import std.exception : assertThrown;
+
+	assertThrown!Exception(rt.openPushStream("n", Json.emptyObject, "u",
+			Json(1), (string m, Json p) @safe { delivered++; }));
+	rt.emit(EventOccurrence("e", "n", "t"));
+	assert(delivered == 0);
+}
+
+unittest  // a throwing on_unsubscribe does not stop the sweep expiring the other leases
+{
+	long now = 1_000_000;
+	auto rt = testRuntime(() @safe => now);
+	int unsubs;
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c");
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe {
+		unsubs++;
+		throw new Exception("teardown failed");
+	};
+	rt.register(reg);
+	rt.poll("n", Json(["a": Json(1)]), "u", Nullable!string.init,
+			Nullable!long.init, Nullable!long.init);
+	rt.poll("n", Json(["a": Json(2)]), "u", Nullable!string.init,
+			Nullable!long.init, Nullable!long.init);
+	now += 10 * 60 * 1000;
+	rt.sweepPollLeases();
+	assert(unsubs == 2);
+}
+
 unittest  // lifecycle is refcounted across modes: fires once per (principal,name,args)
 {
 	long now = 1_000_000;
@@ -3472,6 +3557,62 @@ unittest  // unsubscribeWebhook removes the subscription and fires on_unsubscrib
 	u.url = "https://proxy/hooks";
 	rt.unsubscribeWebhook(u, "user-1");
 	assert(rt.webhookStore().get(r.id).isNull && unsubs == 1);
+}
+
+unittest  // a throwing on_subscribe stores no webhook subscription
+{
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		throw new Exception("upstream unavailable");
+	};
+	rt.register(reg);
+	import std.exception : assertThrown;
+
+	assertThrown!Exception(rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1"));
+	assert(rt.webhookStore().all().length == 0);
+}
+
+unittest  // the delivery worker keeps running when a pass throws
+{
+	static final class FailingAllStore : WebhookSubscriptionStore
+	{
+		InMemoryWebhookSubscriptionStore inner;
+		this() @safe
+		{
+			inner = new InMemoryWebhookSubscriptionStore();
+		}
+
+		void put(WebhookSubscription sub) @safe
+		{
+			inner.put(sub);
+		}
+
+		Nullable!WebhookSubscription get(string id) @safe
+		{
+			return inner.get(id);
+		}
+
+		void remove(string id) @safe
+		{
+			inner.remove(id);
+		}
+
+		WebhookSubscription[] all() @safe
+		{
+			throw new Exception("store unavailable");
+		}
+	}
+
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	auto rt = new EventsRuntime(new FailingAllStore(), o);
+	int passes;
+	rt.startDeliveryWorker(0.seconds, () @safe => ++passes > 3);
+	assert(passes == 4);
 }
 
 unittest  // unsubscribeWebhook throws NotFound for an unknown subscription
