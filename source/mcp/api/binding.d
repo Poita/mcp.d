@@ -111,7 +111,8 @@ private enum ctValue(alias v) = v;
 /// `isRequiredField`, and carry their `@fieldDescription` and facet UDAs. With
 /// `omitNull` a `Nullable!U` is described by the bare schema of `U` (an input
 /// models optionality through `required`); otherwise it is `anyOf: [U, null]`.
-/// Scalars, enums, and custom-serialized types come from the `jsonschema`
+/// `TimeOfDay` and `DateTime` are strings constrained by a pattern. Other
+/// scalars, enums, and custom-serialized types come from the `jsonschema`
 /// generator.
 package(mcp) Json schemaOf(T, bool omitNull)()
 {
@@ -125,11 +126,17 @@ package(mcp) Json schemaOf(T, bool omitNull)()
 /// reject recursive types, which an inlined schema cannot describe.
 package(mcp) JsonNode schemaNode(T, bool omitNull, Ancestors...)()
 {
+	import std.datetime.date : DateTime, TimeOfDay;
 	import std.meta : staticIndexOf;
 	import std.sumtype : isSumType;
 
 	static if (is(T == Json))
 		return JsonNode.emptyObject();
+	else static if (is(T == TimeOfDay))
+		return patternNode(timeOfDayPattern);
+	else static if (is(T == DateTime))
+		return patternNode(
+				`^-?[0-9]{4,}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T` ~ timeOfDayPattern[1 .. $]);
 	else static if (isInstanceOf!(Nullable, T))
 	{
 		auto inner = schemaNode!(TemplateArgsOf!T[0], omitNull, Ancestors)();
@@ -196,6 +203,18 @@ package(mcp) JsonNode schemaNode(T, bool omitNull, Ancestors...)()
 		enum settings = GeneratorSettings(false, true, omitNull);
 		return generate!(T, settings)();
 	}
+}
+
+/// The `HH:MM:SS` form vibe reads and writes a `TimeOfDay` in. `TimeOfDay` and
+/// `DateTime` carry no UTC offset, so they are described by patterns rather
+/// than the RFC 3339 `time` / `date-time` formats, which require one.
+private enum timeOfDayPattern = `^([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$`;
+
+private JsonNode patternNode(string pattern) pure
+{
+	auto s = typeNode("string");
+	s.set("pattern", JsonNode(pattern));
+	return s;
 }
 
 private JsonNode typeNode(string type) pure

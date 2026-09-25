@@ -495,7 +495,8 @@ is predictable when porting a hand-built server):
 | `T[]` | `{"type": "array", "items": <T>}` |
 | `V[string]` | `{"type": "object", "additionalProperties": <V>}` |
 | `struct` | `{"type": "object", "properties": …, "required": […]}` |
-| `std.datetime` `SysTime`/`DateTime`/`Date`/`TimeOfDay` | `{"type": "string", "format": "date-time"/"date"/"time"}` |
+| `std.datetime` `SysTime` / `Date` | `{"type": "string", "format": "date-time"/"date"}` |
+| `std.datetime` `DateTime` / `TimeOfDay` | `{"type": "string", "pattern": …}` matching `YYYY-MM-DDTHH:MM:SS` / `HH:MM:SS` (no UTC offset, so not the RFC 3339 `date-time`/`time` formats) |
 | `SumType!(A, B, …)` | `{"anyOf": [<A>, <B>, …]}` |
 | `Nullable!T` (tool parameter) | `<T>`, made optional by omission from `required` |
 | `Nullable!T` (output / elicitation schema) | `{"anyOf": [<T>, {"type": "null"}]}` |

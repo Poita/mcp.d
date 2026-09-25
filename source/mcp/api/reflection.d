@@ -2739,6 +2739,54 @@ unittest  // a SumType struct field binds whichever member the value matches
 	assert(callSumType("tagged", `{"t":{"value":"y"}}`) == "string:y");
 }
 
+version (unittest)
+{
+	import std.datetime.date : DateTime, TimeOfDay;
+
+	private struct Slot
+	{
+		TimeOfDay at;
+		DateTime when;
+	}
+
+	private final class ClockApi
+	{
+		@tool("slot", "Tool taking and returning local times")
+		Slot slot(TimeOfDay at, DateTime when) @safe
+		{
+			return Slot(at, when);
+		}
+	}
+}
+
+unittest  // TimeOfDay/DateTime schemas describe the offset-less form they bind, not RFC 3339 formats
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ClockApi);
+	auto props = s.handle(MakeListMessage()).get["result"]["tools"][0]["inputSchema"]["properties"];
+	assert("format" !in props["at"] && "pattern" in props["at"], props.toString);
+	assert("format" !in props["when"] && "pattern" in props["when"], props.toString);
+}
+
+unittest  // TimeOfDay/DateTime values round-trip under input and output schema validation
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableOutputSchemaValidation();
+	registerHandlers(s, new ClockApi);
+	Json p = Json.emptyObject;
+	p["name"] = "slot";
+	p["arguments"] = parseJsonString(`{"at":"10:00:00","when":"2026-09-25T10:00:00"}`);
+	auto r = s.handle(Message(makeRequest(Json(1), "tools/call", p))).get;
+	assert("error" !in r && "isError" !in r["result"], r.toString);
+	assert(r["result"]["structuredContent"]["at"].get!string == "10:00:00");
+
+	p["arguments"] = parseJsonString(`{"at":"10:00","when":"2026-09-25T10:00:00"}`);
+	auto bad = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
+	assert(bad["result"]["isError"].get!bool, bad.toString);
+}
+
 unittest  // argsAs honours struct field defaults and Nullable fields
 {
 	auto a = argsAs!PagedQuery(parseJsonString(`{"q":"x"}`));
