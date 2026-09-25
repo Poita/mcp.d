@@ -748,17 +748,19 @@ final class McpServer : ServerCore
 	/// `RequestContext.elicitUrl`) has finished, so the client can stop waiting on
 	/// it (basic/utilities/elicitation §"Completion Notifications for URL Mode
 	/// Elicitation"). Per spec the notification MUST carry the `elicitationId` that
-	/// correlates it with the original request. It is delivered on the standalone
-	/// GET SSE stream (the unsolicited server->client channel); returns the number
-	/// of listeners reached, or `0` when no GET stream is open (or the server is
-	/// not on a Streamable HTTP transport). Throws `invalidParams` on an empty
+	/// correlates it with the original request. It is delivered on a standalone GET
+	/// SSE stream of `sessionId` only — the session that received the elicitation,
+	/// i.e. `connectionTokenOf(ctx)` of the request that called `elicitUrl` ("" on
+	/// a server without sessions). Returns the number of streams reached, or `0`
+	/// when that session has no GET stream open (or the server is not on a
+	/// Streamable HTTP transport). Throws `invalidParams` on an empty
 	/// `elicitationId`.
 	///
 	/// The modern (modern) protocol removed this notification: a modern client tracks
 	/// URL-mode completion through the MRTR request-state retry, not a server push.
 	/// On a negotiated modern session this is therefore a no-op returning `0`; it
 	/// remains in effect for 2025-11-25 and earlier, where the notification is valid.
-	size_t notifyElicitationComplete(string elicitationId) @safe
+	size_t notifyElicitationComplete(string sessionId, string elicitationId) @safe
 	{
 		if (negotiatedVersion().isModern)
 			return 0;
@@ -767,7 +769,9 @@ final class McpServer : ServerCore
 					"notifications/elicitation/complete requires a non-empty elicitationId");
 		Json params = Json.emptyObject;
 		params["elicitationId"] = elicitationId;
-		return notify("notifications/elicitation/complete", params);
+		if (pushChannel is null)
+			return 0;
+		return pushChannel.pushToSession(sessionId, "notifications/elicitation/complete", params);
 	}
 
 	/// The capabilities advertised by the connected client (valid after
@@ -1014,8 +1018,8 @@ final class McpServer : ServerCore
 	{
 		taskRuntime_ = new TaskRuntime((store is null) ? new InMemoryTaskStore() : store, opts);
 		taskDispatcher_ = (dispatcher is null) ? new InProcessTaskDispatcher() : dispatcher;
-		taskRuntime_.onStatusChange((Json detailed) @safe {
-			notify("notifications/tasks", detailed);
+		taskRuntime_.onStatusChange((Json detailed, string owner) @safe {
+			notifyPrincipal(owner, "notifications/tasks", detailed);
 		});
 		tasksEnabled_ = true;
 		enableExtension(tasksExtensionKey, Json.emptyObject);
@@ -1309,12 +1313,13 @@ final class McpServer : ServerCore
 	}
 
 	/// Send an *unsolicited* JSON-RPC notification to every client currently
-	/// listening on the standalone GET SSE stream. This is the public entry point
-	/// for server-initiated traffic outside an in-flight request — e.g. a
-	/// `notifications/resources/updated` for a subscribed resource, or a
-	/// `notifications/tools/list_changed`. Returns the number of listeners the
-	/// notification was delivered to; `0` when no GET stream is open (or the
-	/// server is not on a Streamable HTTP transport). On a stdio server with an
+	/// listening on the standalone GET SSE stream or a `subscriptions/listen`
+	/// stream: once per session (on one of its streams) and once per listen
+	/// stream, skipping listen streams whose filter did not request this type.
+	/// This is the public entry point for server-initiated traffic outside an
+	/// in-flight request. Returns the number of sessions / listen streams reached;
+	/// `0` when none is open (or the server is not on a Streamable HTTP
+	/// transport). On a stdio server with an
 	/// active modern `subscriptions/listen` it is additionally written to stdout
 	/// (stamped with the listen subscriptionId), since that transport shares one
 	/// channel for all server->client traffic.
@@ -1334,6 +1339,24 @@ final class McpServer : ServerCore
 		}
 		if (pushChannel !is null)
 			delivered += pushChannel.notify(method, params);
+		return delivered;
+	}
+
+	/// `notify`, restricted to the streams opened by `principal` (the
+	/// authenticated token subject, "" for unauthenticated streams), for
+	/// notifications whose payload belongs to one principal.
+	private size_t notifyPrincipal(string principal, string method, Json params) @safe
+	{
+		size_t delivered;
+		if (stdioListenSink !is null)
+		{
+			auto note = withListenSubscriptionId(makeNotification(method,
+					params), stdioListenSubscriptionId);
+			stdioListenSink(note.toString());
+			delivered++;
+		}
+		if (pushChannel !is null)
+			delivered += pushChannel.notifyPrincipal(principal, method, params);
 		return delivered;
 	}
 
@@ -8521,7 +8544,7 @@ unittest  // notifyElicitationComplete emits notifications/elicitation/complete 
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
 
-	const n = s.notifyElicitationComplete("elic-123");
+	const n = s.notifyElicitationComplete("", "elic-123");
 	assert(n == 1);
 	import std.algorithm : canFind;
 
@@ -8534,7 +8557,7 @@ unittest  // notifyElicitationComplete emits notifications/elicitation/complete 
 unittest  // notifyElicitationComplete is a no-op before a push channel exists
 {
 	auto s = new McpServer("t", "1");
-	assert(s.notifyElicitationComplete("elic-1") == 0);
+	assert(s.notifyElicitationComplete("", "elic-1") == 0);
 }
 
 unittest  // notifyElicitationComplete is a no-op on a modern (modern) session
@@ -8548,7 +8571,7 @@ unittest  // notifyElicitationComplete is a no-op on a modern (modern) session
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
 
-	assert(s.notifyElicitationComplete("elic-123") == 0);
+	assert(s.notifyElicitationComplete("", "elic-123") == 0);
 	assert(received.length == 0);
 }
 
@@ -8557,7 +8580,43 @@ unittest  // notifyElicitationComplete rejects an empty elicitationId
 	import std.exception : assertThrown;
 
 	auto s = new McpServer("t", "1");
-	assertThrown!McpException(s.notifyElicitationComplete(""));
+	assertThrown!McpException(s.notifyElicitationComplete("", ""));
+}
+
+unittest  // notifyElicitationComplete reaches only the session that received the elicitation
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	string a, b;
+	ch.addListener((string f) @safe { a = f; }, Json(""), ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { b = f; }, Json(""), ListenFilter.init, "", null, "sess-B");
+
+	assert(s.notifyElicitationComplete("sess-B", "elic-9") == 1);
+	assert(b.canFind("elic-9"));
+	assert(a.length == 0, "another session must not learn of the elicitation");
+}
+
+unittest  // notifications/tasks reaches only the task owner's streams
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks();
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	string alice, bob;
+	ListenFilter f;
+	f.active = true;
+	ch.addListener((string fr) @safe { alice = fr; }, Json("l-a"), f, "", null, "", "alice");
+	ch.addListener((string fr) @safe { bob = fr; }, Json("l-b"), f, "", null, "", "bob");
+
+	auto t = rt.createFor("", Json.undefined, Nullable!Duration.init,
+			Nullable!Duration.init, "alice");
+	rt.complete(t.taskId, Json(["secret": Json("s3cr3t")]));
+	assert(alice.canFind("notifications/tasks"));
+	assert(alice.canFind("s3cr3t"));
+	assert(bob.length == 0, "a task's result must not reach another principal's stream");
 }
 
 unittest  // tools listChanged is not advertised by default

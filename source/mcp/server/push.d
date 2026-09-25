@@ -133,18 +133,24 @@ unittest  // a per-URI filter must reject a notification that carries no URI
 /// counts return the number of streams reached.
 interface PushChannel
 {
-	/// Deliver an unsolicited notification on one live stream (the transport's
-	/// Multiple Connections rule: each message goes to exactly one stream).
+	/// Deliver an unsolicited notification once per connected session and once
+	/// per independent listen stream (within a session it lands on exactly one
+	/// stream, per the transport's Multiple Connections rule), honouring each
+	/// stream's own opt-in filter.
 	size_t notify(string method, Json params = Json.undefined) @safe;
 
-	/// Fan a change notification out once per distinct connected session (the
-	/// list-changed broadcasts), honouring each stream's own opt-in filter;
-	/// `plainEligible` gates delivery to plain (non-listen) streams.
+	/// Fan a change notification out once per connected session and listen
+	/// stream, honouring each stream's own opt-in filter; `plainEligible` gates
+	/// delivery to plain (non-listen) streams.
 	size_t broadcast(string method, Json params, string uri = "", bool plainEligible = true) @safe;
 
-	/// Deliver a change notification to a single stream of one session
-	/// (`sessionToken` empty: any session), honouring each stream's own opt-in
-	/// filter; `plainEligible` gates delivery to plain (non-listen) streams.
+	/// Like `notify`, but only to streams opened by `principal` (the authenticated
+	/// token subject; "" selects unauthenticated streams).
+	size_t notifyPrincipal(string principal, string method, Json params) @safe;
+
+	/// Deliver a notification to a single stream of the session `sessionToken`
+	/// (empty: any stream, for a server without sessions), honouring each stream's own
+	/// opt-in filter; `plainEligible` gates delivery to plain (non-listen) streams.
 	size_t pushToSession(string sessionToken, string method, Json params,
 			string uri = "", bool plainEligible = true) @safe;
 

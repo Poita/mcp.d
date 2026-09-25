@@ -353,14 +353,14 @@ unittest  // failPending is idempotent and leaves the awaiter to clean the table
 /// stream a client opens with an HTTP GET to the MCP endpoint (basic/transports
 /// §Listening for Messages from the Server). One instance is shared across a
 /// server mount. Unlike `HttpStreamContext`, which is bound to one in-flight
-/// POST, `emit` frames the JSON-RPC message as an SSE event with a globally-unique
-/// id (via the shared `StreamCoordinator` ordinal scheme) and writes it to exactly
-/// ONE live GET listener, honouring the transport's Multiple Connections rule:
-/// "The server MUST send each of its JSON-RPC messages on only one of the
-/// connected streams; that is, it MUST NOT broadcast the same message across
-/// multiple streams." A listener that fails to write (a disconnected client) is
-/// skipped and dropped, so the channel self-heals and the message still lands on a
-/// live stream.
+/// POST, it frames each JSON-RPC message as an SSE event with a globally-unique
+/// id (via the shared `StreamCoordinator` ordinal scheme) and writes it to ONE
+/// live stream per session (or per independent listen subscription), honouring
+/// the transport's Multiple Connections rule: "The server MUST send each of its
+/// JSON-RPC messages on only one of the connected streams; that is, it MUST NOT
+/// broadcast the same message across multiple streams." A listener that fails to
+/// write (a disconnected client) is skipped and dropped, so the channel self-heals
+/// and the message still lands on a live stream of that session.
 ///
 /// The channel serializes delivery and listener-list mutation internally with a
 /// vibe `TaskMutex`, so concurrent fibers cannot interleave the bytes of two SSE
@@ -431,6 +431,16 @@ final class ServerPushChannel : PushChannel
 		/// stays per-stream-monotonic and globally unique. Allocated per listener in
 		/// `addListener`.
 		TaskMutex writeMtx;
+		/// The authenticated principal (token subject) that opened this stream, or
+		/// "" when unauthenticated. Principal-scoped notifications such as
+		/// `notifications/tasks` reach only streams whose principal owns the task.
+		string principal;
+		/// The delivery group this stream belongs to. A fan-out delivers each
+		/// message on exactly one stream per group: a session's streams share the
+		/// session token as their group (Multiple Connections: one stream per
+		/// session), while every `subscriptions/listen` stream is its own group,
+		/// since each listen subscription is independent.
+		string group;
 	}
 
 	private StreamCoordinator coord;
@@ -522,8 +532,8 @@ final class ServerPushChannel : PushChannel
 	/// honoured because replay is keyed strictly on the id's ordinal.
 	long addListener(void delegate(string frame) @safe write, Json subscriptionId = Json.init,
 			ListenFilter filter = ListenFilter.init, string resumeFrom = "",
-			bool delegate(string method, string uri) @safe plainEligible = null,
-			string ownerToken = "") @safe
+			bool delegate(string method,
+				string uri) @safe plainEligible = null, string ownerToken = "", string principal = "") @safe
 	{
 		return () @trusted {
 			auto lWriteMtx = new TaskMutex;
@@ -536,9 +546,12 @@ final class ServerPushChannel : PushChannel
 			// blocking socket write must not run under the channel mutex.
 			synchronized (mtx)
 			{
+				import std.conv : to;
+
 				id = nextListenerId++;
+				const group = filter.active ? "\0listen-" ~ id.to!string : ownerToken;
 				listeners ~= Listener(id, write, subscriptionId, filter,
-						plainEligible, ownerToken, lWriteMtx);
+						plainEligible, ownerToken, lWriteMtx, principal, group);
 
 				long resumeOrdinal, resumeSeq;
 				// A resume is honoured only when the ordinal exists AND its recorded
@@ -711,20 +724,6 @@ final class ServerPushChannel : PushChannel
 		}();
 	}
 
-	/// Frame `msg` as an SSE event (with a per-stream globally-unique id) and
-	/// deliver it on exactly ONE connected stream, honouring the transport's
-	/// Multiple Connections rule that the server "MUST send each of its JSON-RPC
-	/// messages on only one of the connected streams ... it MUST NOT broadcast the
-	/// same message across multiple streams." Listeners are tried in registration
-	/// order; one whose write throws (a disconnected client) is dropped and the
-	/// next live listener is tried, so the message still lands on a healthy stream
-	/// and the channel self-heals. Returns 1 if the message was delivered, or 0
-	/// when no live listener could receive it.
-	size_t emit(Json msg) @safe
-	{
-		return deliver(msg, (ref const Listener) @safe => true) >= 0 ? 1 : 0;
-	}
-
 	/// The per-stream eligibility decision shared by every delivery mode: an
 	/// *active* `subscriptions/listen` filter is consulted directly (the stream
 	/// receives a type only if it explicitly opted in, honouring 2026-07-28
@@ -746,47 +745,57 @@ final class ServerPushChannel : PushChannel
 		return plainEligible;
 	}
 
-	/// MODE 1 — BROADCAST. Deliver a notification to EVERY connected session's GET
-	/// listener (the `notifications/*/list_changed` fan-out): each distinct session
-	/// MUST be told the list changed, not just the first eligible stream. Listeners
-	/// are grouped by their session token and the single-stream `deliver` runs once
-	/// per distinct token, so the transport's Multiple Connections rule ("MUST NOT
-	/// broadcast the same message across multiple streams") is still honoured WITHIN
-	/// a session (only one of a session's streams receives it) while distinct
-	/// sessions each get their own copy. The session token is otherwise IGNORED:
-	/// broadcast reaches all sessions, including the unscoped/stateless one.
-	/// Eligibility per listener is the shared `listenerEligible` decision. Returns
-	/// the number of distinct sessions reached.
+	/// MODE 1 — BROADCAST. Deliver a notification to every connected session and
+	/// every independent `subscriptions/listen` stream: each distinct delivery
+	/// group (see `Listener.group`) receives exactly one copy on one of its
+	/// eligible streams, so the transport's Multiple Connections rule ("MUST NOT
+	/// broadcast the same message across multiple streams") holds within a session
+	/// while distinct sessions and listen subscriptions each get their own copy.
+	/// Eligibility per listener is the shared `listenerEligible` decision, so an
+	/// active listen filter only receives the types it requested. Returns the
+	/// number of groups reached.
 	size_t broadcast(string method, Json params, string uri = "", bool plainEligible = true) @safe
 	{
-		auto msg = makeNotification(method, params);
-		scope eligible = (ref const Listener l) @safe => listenerEligible(l,
-				method, uri, plainEligible);
+		return fanOut(makeNotification(method, params),
+				(ref const Listener l) @safe => listenerEligible(l, method, uri, plainEligible));
+	}
 
-		// Snapshot the distinct session tokens that currently have at least one
-		// eligible live listener, under the lock, so the listener list cannot mutate
-		// while we enumerate; the actual writes happen off the lock inside `deliver`.
-		string[] owners;
+	/// Broadcast a notification to only the streams opened by `principal` (the
+	/// authenticated token subject; "" selects unauthenticated streams), once per
+	/// delivery group. Used for notifications whose payload belongs to one
+	/// principal, such as `notifications/tasks` carrying a task's result.
+	size_t notifyPrincipal(string principal, string method, Json params) @safe
+	{
+		return fanOut(makeNotification(method, params),
+				(ref const Listener l) @safe => l.principal == principal
+				&& listenerEligible(l, method, notificationUri(method, params), true));
+	}
+
+	/// Deliver `msg` once per delivery group that has at least one eligible live
+	/// listener, returning the number of groups reached.
+	private size_t fanOut(Json msg, scope bool delegate(ref const Listener) @safe eligible) @safe
+	{
+		// Snapshot the groups under the lock so the listener list cannot mutate
+		// while we enumerate; the writes happen off the lock inside `deliver`.
+		string[] groups;
 		() @trusted {
 			synchronized (mtx)
 			{
 				bool[string] seen;
 				foreach (l; listeners)
-					if (l.id in seqOf && (l.ownerToken in seen) is null && eligible(l))
+					if (l.id in seqOf && (l.group in seen) is null && eligible(l))
 					{
-						seen[l.ownerToken] = true;
-						owners ~= l.ownerToken;
+						seen[l.group] = true;
+						groups ~= l.group;
 					}
 			}
 		}();
 
 		size_t delivered;
-		foreach (owner; owners)
+		foreach (group; groups)
 		{
-			// One single-stream delivery per session: only listeners owned by this
-			// token are candidates, so each distinct session receives exactly one copy.
 			const landed = deliver(msg, (ref const Listener l) @safe {
-				return l.ownerToken == owner && eligible(l);
+				return l.group == group && eligible(l);
 			});
 			if (landed >= 0)
 				delivered++;
@@ -795,15 +804,10 @@ final class ServerPushChannel : PushChannel
 	}
 
 	/// MODE 2 — PUSH TO SESSION. Deliver a notification on exactly ONE connected
-	/// stream of the ONE session named by `sessionToken`, used by
-	/// `notifications/resources/updated` to a subscriber. The chosen stream still
-	/// applies its own per-stream `ListenFilter` (resource-updated URI/type
-	/// filtering) and per-session gate via the shared `listenerEligible` decision,
-	/// so a session's update reaches only a stream that opted into this `method`
-	/// (and, for `resources/updated`, this `uri`). An empty `sessionToken` is the
-	/// unscoped path: every listener is a candidate (the modern self-contained
-	/// `subscriptions/listen` stream and the stateless/no-session case), matching
-	/// the prior single-stream filtered delivery. Returns 1 if delivered, else 0.
+	/// stream owned by `sessionToken` (the empty token makes every stream a
+	/// candidate, for a server without sessions). The chosen stream still applies
+	/// its own per-stream `ListenFilter` and per-session gate via the shared
+	/// `listenerEligible` decision. Returns 1 if delivered, else 0.
 	size_t pushToSession(string sessionToken, string method, Json params,
 			string uri = "", bool plainEligible = true) @safe
 	{
@@ -984,10 +988,21 @@ final class ServerPushChannel : PushChannel
 		}
 	}
 
-	/// Convenience: broadcast a JSON-RPC notification to every listener.
+	/// Broadcast a JSON-RPC notification to every connected session and listen
+	/// stream (see `broadcast`).
 	size_t notify(string method, Json params = Json.undefined) @safe
 	{
-		return emit(makeNotification(method, params));
+		return broadcast(method, params, notificationUri(method, params));
+	}
+
+	/// The resource URI a `notifications/resources/updated` carries in its params,
+	/// which per-URI listen filters and per-session gates match against.
+	private static string notificationUri(string method, Json params) @safe
+	{
+		if (method != "notifications/resources/updated" || params.type != Json.Type.object)
+			return "";
+		auto u = "uri" in params;
+		return (u !is null && u.type == Json.Type.string) ? u.get!string : "";
 	}
 
 	/// MODE 3 — REQUEST ON SESSION. Send a server->client JSON-RPC *request*
@@ -1442,6 +1457,78 @@ unittest  // MODE 2 pushToSession reaches only the named session's listener
 	assert(reached == 1);
 	assert(a.canFind("file:///x"), "session A's stream must receive its update");
 	assert(b.length == 0, "session B's stream must NOT receive session A's update");
+}
+
+unittest  // notify reaches every connected session once, not only the oldest one
+{
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string a, b;
+	int a2;
+	ch.addListener((string f) @safe { a = f; }, Json(""), ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string) @safe { a2++; }, Json(""), ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { b = f; }, Json(""), ListenFilter.init, "", null, "sess-B");
+
+	assert(ch.notify("notifications/message") == 2);
+	assert(a.canFind("notifications/message"));
+	assert(a2 == 0, "within one session the message lands on a single stream");
+	assert(b.canFind("notifications/message"));
+}
+
+unittest  // notify honours an active listen filter
+{
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string frame;
+	ListenFilter f;
+	f.active = true;
+	f.promptsListChanged = true;
+	ch.addListener((string fr) @safe { frame = fr; }, Json("listen-1"), f);
+
+	assert(ch.notify("notifications/tools/list_changed") == 0);
+	assert(frame.length == 0, "a listen stream must not receive a type it did not request");
+}
+
+unittest  // every independent listen stream receives its own copy
+{
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string a, b;
+	ListenFilter f;
+	f.active = true;
+	f.toolsListChanged = true;
+	ch.addListener((string fr) @safe { a = fr; }, Json("listen-A"), f);
+	ch.addListener((string fr) @safe { b = fr; }, Json("listen-B"), f);
+
+	assert(ch.broadcast("notifications/tools/list_changed", Json.undefined) == 2);
+	assert(a.canFind("listen-A"));
+	assert(b.canFind("listen-B"));
+	assert(ch.notify("notifications/message") == 2);
+}
+
+unittest  // notifyPrincipal reaches only the streams authenticated as that principal
+{
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string alice, bob, anon;
+	ListenFilter f;
+	f.active = true;
+	ch.addListener((string fr) @safe { alice = fr; }, Json("l-alice"), f, "", null, "", "alice");
+	ch.addListener((string fr) @safe { bob = fr; }, Json("l-bob"), f, "", null, "", "bob");
+	ch.addListener((string fr) @safe { anon = fr; }, Json("l-anon"), f);
+
+	assert(ch.notifyPrincipal("alice", "notifications/tasks", Json([
+		"taskId": Json("t1")
+	])) == 1);
+	assert(alice.canFind("t1"));
+	assert(bob.length == 0, "another principal's stream must not see the task");
+	assert(anon.length == 0, "an unauthenticated stream must not see an owned task");
 }
 
 unittest  // MODE 3 requestOnSession: a reply on session B does NOT resolve session A's pending request

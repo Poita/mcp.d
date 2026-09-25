@@ -209,7 +209,7 @@ void mountMcp(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		handleGet(server, push, sessions, opts.reconnectDelayMs, req, res);
+		handleGet(server, push, sessions, opts.reconnectDelayMs, principalOf(token), req, res);
 	});
 	router.match(HTTPMethod.DELETE, opts.path, (HTTPServerRequest req,
 			HTTPServerResponse res) @safe {
@@ -1019,8 +1019,15 @@ unittest  // a POST Accept admitting either media type is accepted; one excludin
 	assert(!postAccepted("application/xml"));
 }
 
+/// The authenticated principal (token subject) behind a request, or "" when it
+/// is unauthenticated.
+private string principalOf(TokenInfo token) @safe
+{
+	return token.valid ? token.subject : "";
+}
+
 private void handleGet(McpServer server, ServerPushChannel push, SessionManager sessions,
-		uint reconnectDelayMs, HTTPServerRequest req, HTTPServerResponse res) @safe
+		uint reconnectDelayMs, string principal, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 	// The GET that opens the standalone stream is a subsequent HTTP request and
 	// is subject to the same rule as the POST path: an invalid or unsupported
@@ -1122,7 +1129,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	const listenerId = push.addListener((string frame) @safe {
 		writeFrame(frame);
 	}, Json.init, ListenFilter.init, lastEventId, getConn !is null
-			? server.sessionPushEligibility(getConn) : null, ownerToken);
+			? server.sessionPushEligibility(getConn) : null, ownerToken, principal);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
@@ -1159,8 +1166,8 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 /// existing `notify*` / `notifyResourceUpdated` APIs deliver opted-in change
 /// notifications onto it. The connection is held open (with SSE comment
 /// heartbeats) until the client disconnects.
-private void handleListenStream(McpServer server, StreamCoordinator coord,
-		Message msg, HTTPServerResponse res, string protoHeader, string connToken) @safe
+private void handleListenStream(McpServer server, StreamCoordinator coord, Message msg,
+		HTTPServerResponse res, string protoHeader, string connToken, string principal) @safe
 {
 	// Record the opted-in filters (route -> doSubscribeListen). The one-shot JSON
 	// result is discarded on success: the acknowledgement is delivered as the
@@ -1202,7 +1209,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	// basic/utilities/subscriptions).
 	const listenerId = push.addListener((string frame) @safe {
 		writeFrame(frame);
-	}, msg.id, streamFilter);
+	}, msg.id, streamFilter, "", null, "", principal);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
@@ -1814,7 +1821,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 				return;
 			}
 			handleListenStream(server, coord, msg, res,
-					req.headers.get(HttpHeader.protocolVersion, ""), connToken);
+					req.headers.get(HttpHeader.protocolVersion, ""), connToken, principalOf(token));
 			return;
 		}
 		// Modern events/stream (push): like subscriptions/listen, this POST opens a

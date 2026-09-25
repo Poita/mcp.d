@@ -50,7 +50,7 @@ final class TaskRuntime
 {
 	private TaskStore store_;
 	private TaskOptions opts_;
-	private void delegate(Json detailed) @safe onStatusChange_;
+	private void delegate(Json detailed, string owner) @safe onStatusChange_;
 
 	this(TaskStore store, TaskOptions opts) @safe
 	{
@@ -68,9 +68,10 @@ final class TaskRuntime
 		return store_;
 	}
 
-	/// Register a callback invoked with the full `DetailedTask` JSON whenever a
-	/// task's status changes, so the server can push `notifications/tasks`.
-	void onStatusChange(void delegate(Json detailed) @safe cb) @safe
+	/// Register a callback invoked with the full `DetailedTask` JSON and the task's
+	/// owning principal whenever a task's status changes, so the server can push
+	/// `notifications/tasks` to that principal only.
+	void onStatusChange(void delegate(Json detailed, string owner) @safe cb) @safe
 	{
 		onStatusChange_ = cb;
 	}
@@ -161,7 +162,7 @@ final class TaskRuntime
 		r.meta.lastUpdatedAt = opts_.nowIso();
 		store_.update(r);
 		if (onStatusChange_ !is null)
-			onStatusChange_(getDetailed(r.meta.taskId));
+			onStatusChange_(getDetailed(r.meta.taskId), r.owner);
 	}
 
 	/// Whether a status is terminal (`completed`/`failed`/`cancelled`).
@@ -483,7 +484,7 @@ unittest  // onStatusChange fires with the DetailedTask on each transition
 	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
 	int calls;
 	string lastStatus;
-	rt.onStatusChange((Json d) @safe {
+	rt.onStatusChange((Json d, string owner) @safe {
 		calls++;
 		lastStatus = d["status"].get!string;
 	});
