@@ -446,7 +446,11 @@ final class ServerPushChannel : PushChannel
 	private StreamCoordinator coord;
 	private Listener[] listeners;
 	private long[long] streamOf; /// listener id -> its allocated stream ordinal
-	private long[long] seqOf; /// listener id -> its monotonic event sequence
+	private bool[long] live; /// ids of the listeners that are still connected
+	/// Stream ordinal -> the sequence number its next event carries. Kept per
+	/// ordinal rather than per listener so a resumed stream, and a POST-initiated
+	/// stream that a GET resumes, continue one monotonic id sequence.
+	private long[long] nextSeq;
 	private long nextListenerId = 1;
 
 	/// Stream ordinal -> the session/connection token that owns it. A Last-Event-ID
@@ -458,7 +462,7 @@ final class ServerPushChannel : PushChannel
 	/// attribution exists.
 	private string[long] streamOwner;
 
-	/// Guards the channel's shared state: the listener list, `streamOf`/`seqOf`,
+	/// Guards the channel's shared state: the listener list, `streamOf`/`live`/`nextSeq`,
 	/// `requestListener`, and the replay history. Held only for short,
 	/// non-blocking critical sections — the candidate scan, the seq read, and the
 	/// seq/history commit — and explicitly RELEASED across the blocking `l.write`
@@ -580,14 +584,17 @@ final class ServerPushChannel : PushChannel
 						if (e.seq > maxSeq)
 							maxSeq = e.seq;
 					}
-					seqOf[id] = maxSeq + 1;
+					live[id] = true;
+					if (nextSeq.get(resumeOrdinal, 0) < maxSeq + 1)
+						nextSeq[resumeOrdinal] = maxSeq + 1;
 				}
 				else
 				{
 					const ord = coord.allocStream();
 					streamOf[id] = ord;
 					streamOwner[ord] = ownerToken;
-					seqOf[id] = 0;
+					live[id] = true;
+					nextSeq[ord] = 0;
 				}
 			}
 
@@ -639,8 +646,11 @@ final class ServerPushChannel : PushChannel
 		import std.algorithm : remove;
 
 		listeners = listeners.remove!(l => l.id == id);
+		if (auto ord = id in streamOf)
+			if (*ord !in history)
+				nextSeq.remove(*ord);
 		streamOf.remove(id);
-		seqOf.remove(id);
+		live.remove(id);
 
 		// Fail exactly the in-flight server->client requests bound to this listener
 		// (not every pending waiter): other requests may be bound to surviving
@@ -783,7 +793,7 @@ final class ServerPushChannel : PushChannel
 			{
 				bool[string] seen;
 				foreach (l; listeners)
-					if (l.id in seqOf && (l.group in seen) is null && eligible(l))
+					if (l.id in live && (l.group in seen) is null && eligible(l))
 					{
 						seen[l.group] = true;
 						groups ~= l.group;
@@ -851,7 +861,7 @@ final class ServerPushChannel : PushChannel
 			synchronized (mtx)
 			{
 				foreach (l; listeners)
-					if (eligible(l) && l.id in seqOf)
+					if (eligible(l) && l.id in live)
 						candidates ~= l;
 			}
 		}();
@@ -885,11 +895,11 @@ final class ServerPushChannel : PushChannel
 				bool present;
 				synchronized (mtx)
 				{
-					if (l.id in seqOf)
+					if (l.id in live)
 					{
 						present = true;
-						seq = seqOf[l.id];
 						ordinal = streamOf[l.id];
+						seq = nextSeq[ordinal];
 						// Commit the request->listener binding here, under `mtx` and
 						// before the blocking write, so a concurrent disconnect's
 						// `removeListenerLocked` scan observes the in-flight request and
@@ -921,14 +931,14 @@ final class ServerPushChannel : PushChannel
 					return false;
 				}
 				// Brief lock: commit. Because this whole body holds l.writeMtx, no
-				// other write to this stream interleaved, so seqOf[l.id] is still the
-				// `seq` we framed with — assign history + bump in write order.
+				// other write to this stream interleaved, so nextSeq[ordinal] is still
+				// the `seq` we framed with — assign history + bump in write order.
 				synchronized (mtx)
 				{
-					if (l.id !in seqOf)
+					if (l.id !in live)
 						return true; // removed during the write; do not resurrect
 					recordHistory(ordinal, seq, frame);
-					seqOf[l.id]++;
+					nextSeq[ordinal] = seq + 1;
 				}
 				return true;
 			}
@@ -985,7 +995,100 @@ final class ServerPushChannel : PushChannel
 			// Drop the ordinal's owner attribution alongside its evicted history so
 			// the scoping map stays bounded with the history it guards.
 			streamOwner.remove(victim);
+			bool attached;
+			foreach (lid, ord; streamOf)
+				if (ord == victim)
+					attached = true;
+			if (!attached)
+				nextSeq.remove(victim);
 		}
+	}
+
+	/// Register the POST-initiated SSE stream `ordinal` (owned by session `owner`)
+	/// for Last-Event-ID resumption and return the id of its priming event, so a
+	/// client whose POST stream drops can reconnect with a GET carrying that id
+	/// and receive every later event of the stream (basic/transports
+	/// §Resumability and Redelivery).
+	string primeStream(long ordinal, string owner) @safe
+	{
+		import std.conv : to;
+
+		return () @trusted {
+			synchronized (mtx)
+			{
+				streamOwner[ordinal] = owner;
+				if (ordinal !in history)
+				{
+					history[ordinal] = null;
+					touchHistory(ordinal);
+					evictOldHistory();
+				}
+				const seq = nextSeq.get(ordinal, 0);
+				nextSeq[ordinal] = seq + 1;
+				return ordinal.to!string ~ "-" ~ seq.to!string;
+			}
+		}();
+	}
+
+	/// Frame `msg` as the next event of the POST-initiated stream `ordinal`,
+	/// record it for replay, and forward it to a GET listener that has resumed the
+	/// stream. Returns the frame for the caller to write to the POST response. The
+	/// frame is recorded before the POST write is attempted, so an event produced
+	/// after the client dropped the POST stream is still replayed on resume.
+	string publishStreamEvent(long ordinal, string owner, Json msg) @safe
+	{
+		import std.conv : to;
+
+		string allocate()
+		{
+			streamOwner[ordinal] = owner;
+			const seq = nextSeq.get(ordinal, 0);
+			nextSeq[ordinal] = seq + 1;
+			const frame = formatSseEvent(ordinal.to!string ~ "-" ~ seq.to!string, msg);
+			recordHistory(ordinal, seq, frame);
+			return frame;
+		}
+
+		return () @trusted {
+			while (true)
+			{
+				// Allocate directly when no listener has resumed this stream; otherwise
+				// allocate and write under that listener's write lock so its own
+				// events and the forwarded ones share one ordered id sequence.
+				Nullable!Listener target;
+				synchronized (mtx)
+				{
+					foreach (l; listeners)
+						if (l.id in live && streamOf[l.id] == ordinal)
+						{
+							target = l;
+							break;
+						}
+					if (target.isNull)
+						return allocate();
+				}
+				auto l = target.get;
+				synchronized (l.writeMtx)
+				{
+					string frame;
+					synchronized (mtx)
+					{
+						if (l.id in live && streamOf[l.id] == ordinal)
+							frame = allocate();
+					}
+					if (frame.length == 0)
+						continue; // the listener left meanwhile; re-evaluate
+					try
+						l.write(frame);
+					catch (Exception)
+					{
+						synchronized (mtx)
+							removeListenerLocked(l.id);
+					}
+					return frame;
+				}
+			}
+		}();
 	}
 
 	/// Broadcast a JSON-RPC notification to every connected session and listen
@@ -1085,7 +1188,7 @@ final class ServerPushChannel : PushChannel
 			synchronized (mtx)
 			{
 				foreach (l; listeners)
-					if (l.id == listenerId && l.id in seqOf)
+					if (l.id == listenerId && l.id in live)
 					{
 						target = l;
 						break;
@@ -1956,6 +2059,9 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// excludes `text/event-stream`. The transport reads it after `server.handle`
 	// returns to surface a 406 Not Acceptable instead of the would-be SSE body.
 	private bool streamRefused_;
+	// The push channel this stream's events are recorded on for resumption, or
+	// null when the stream is not resumable.
+	private ServerPushChannel replay_;
 
 	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
 			TokenInfo auth = TokenInfo.invalid(),
@@ -2025,6 +2131,14 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		return streamId.to!string ~ "-" ~ eventSeq.to!string;
 	}
 
+	/// Record this stream's events on `channel` so a client whose POST stream
+	/// drops can resume it with a GET carrying `Last-Event-ID`; the events keep
+	/// their ids and the ones produced after the drop reach the resumed stream.
+	void enableReplay(ServerPushChannel channel) @safe
+	{
+		replay_ = channel;
+	}
+
 	/// Whether the response has been upgraded to an SSE stream.
 	bool streaming() const @safe
 	{
@@ -2087,7 +2201,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		if (primed_ || !sendsPrimingEvent(version_))
 			return;
 		primed_ = true;
-		const frame = formatPrimingEvent(nextEventId());
+		const frame = formatPrimingEvent(replay_ !is null
+				? replay_.primeStream(streamId, token_) : nextEventId());
 		eventSeq++;
 		() @trusted {
 			res.bodyWriter.write(cast(const(ubyte)[]) frame);
@@ -2098,7 +2213,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	private void writeEvent(Json msg) @safe
 	{
 		beginStream();
-		const frame = formatSseEvent(nextEventId(), msg);
+		const frame = replay_ !is null ? replay_.publishStreamEvent(streamId,
+				token_, msg) : formatSseEvent(nextEventId(), msg);
 		eventSeq++;
 		() @trusted {
 			res.bodyWriter.write(cast(const(ubyte)[]) frame);
@@ -2839,6 +2955,45 @@ unittest  // history retains at most maxHistoryStreams ordinals (bounded memory)
 	}
 	// The retained history must not grow to one-ordinal-per-stream; it is capped.
 	assert(ch.retainedHistoryStreams() <= 64);
+}
+
+unittest  // a POST-initiated stream is resumable via GET Last-Event-ID
+{
+	import std.algorithm : canFind;
+	import std.string : indexOf;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.versions : ProtocolVersion;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
+			TokenInfo.invalid(), false, ProtocolVersion.v2025_11_25, "sess-A");
+	ctx.enableReplay(ch);
+	const primingId = ctx.nextEventId();
+	ctx.log("info", Json("before-drop"));
+
+	// The client drops the POST stream after the priming event and reconnects
+	// with a GET carrying the priming id.
+	string[] resumed;
+	ch.addListener((string f) @safe { resumed ~= f; }, Json.init,
+			ListenFilter.init, primingId, null, "sess-A");
+	assert(resumed.length == 1 && resumed[0].canFind("before-drop"));
+
+	// The pending response, produced after the reconnect, reaches the resumed stream.
+	ctx.finishWith(makeResponse(Json(7), Json(["ok": Json(true)])));
+	assert(resumed.length == 2 && resumed[1].canFind("\"id\":7"));
+	const ordinal = primingId[0 .. primingId.indexOf("-")];
+	assert(resumed[1].canFind("id: " ~ ordinal ~ "-"));
+
+	// Another session cannot resume it.
+	string[] other;
+	ch.addListener((string f) @safe { other ~= f; }, Json.init,
+			ListenFilter.init, primingId, null, "sess-B");
+	assert(other.length == 0);
 }
 
 unittest  // modern HttpStreamContext: a disconnected client reports cancelled

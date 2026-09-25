@@ -2006,6 +2006,10 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 				extractProgressToken(msg.params),
 				token, isModernReq, effVersion, connToken, reqState,
 				server.mode == ServerMode.stateless, reqAcceptsSse);
+		// A session-bound 2025-11-25 stream advertises resumability with its
+		// priming event, so record its events for a GET Last-Event-ID resume.
+		if (sessions !is null && sendsPrimingEvent(effVersion))
+			ctx.enableReplay(ensurePushChannel(server, coord));
 		auto resp = server.handle(msg, ctx);
 		// Modern basic/utilities/cancellation §Transport-Specific Cancellation: on
 		// Streamable HTTP "Closing the SSE response stream is the cancellation
