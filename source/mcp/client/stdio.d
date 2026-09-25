@@ -939,11 +939,11 @@ unittest  // progress for a stdio request resets its timeout
 	bool completed;
 	const failure = inLoopCapturing(() @safe {
 		ClientSettings s;
-		s.requestTimeout = 250.msecs;
+		s.requestTimeout = 500.msecs;
 		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
 			toServer.put(l);
 		}, s);
-		// The server reports progress every 100ms for 600ms, then answers.
+		// The server reports progress every 200ms for 1.2s, then answers.
 		runTask(() nothrow{
 			try
 			{
@@ -951,7 +951,7 @@ unittest  // progress for a stdio request resets its timeout
 				auto token = req["params"]["_meta"]["progressToken"];
 				foreach (i; 0 .. 6)
 				{
-					sleep(100.msecs);
+					sleep(200.msecs);
 					Json p = Json.emptyObject;
 					p["progressToken"] = token;
 					p["progress"] = i;
