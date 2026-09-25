@@ -22,14 +22,24 @@ enum TaskSupport
 @safe:
 
 /// A task's lifecycle status (SEP-2663). `working` and `inputRequired` are
-/// non-terminal; `completed`, `failed`, and `cancelled` are terminal.
+/// non-terminal; `completed`, `failed`, and `cancelled` are terminal. `unknown`
+/// stands for a wire status this SDK does not recognize; it is treated as
+/// terminal so a poller stops rather than waiting on a state it cannot
+/// interpret. The server never produces it.
 enum TaskStatus
 {
 	working,
 	inputRequired,
 	completed,
 	failed,
-	cancelled
+	cancelled,
+	unknown
+}
+
+/// Whether `s` is terminal: `completed`, `failed`, `cancelled`, or `unknown`.
+bool isTerminal(TaskStatus s) @safe pure nothrow @nogc
+{
+	return s != TaskStatus.working && s != TaskStatus.inputRequired;
 }
 
 /// The wire string for a `TaskStatus` (e.g. `inputRequired` -> "input_required").
@@ -47,15 +57,19 @@ string taskStatusToWire(TaskStatus s) @safe pure nothrow
 		return "failed";
 	case TaskStatus.cancelled:
 		return "cancelled";
+	case TaskStatus.unknown:
+		return "unknown";
 	}
 }
 
-/// Parse a wire status string into a `TaskStatus`. Unknown strings map to
-/// `working` (the seed status), keeping a forward-compatible default.
+/// Parse a wire status string into a `TaskStatus`. An unrecognized string maps
+/// to `TaskStatus.unknown`.
 TaskStatus taskStatusFromWire(string s) @safe pure nothrow
 {
 	switch (s)
 	{
+	case "working":
+		return TaskStatus.working;
 	case "input_required":
 		return TaskStatus.inputRequired;
 	case "completed":
@@ -65,7 +79,7 @@ TaskStatus taskStatusFromWire(string s) @safe pure nothrow
 	case "cancelled":
 		return TaskStatus.cancelled;
 	default:
-		return TaskStatus.working;
+		return TaskStatus.unknown;
 	}
 }
 
@@ -334,4 +348,15 @@ unittest  // makeDetailedTask(none) carries no status-specific payload (working)
 	auto j = makeDetailedTask(t, DetailedTaskPayload.none());
 	assert(j["resultType"].get!string == "complete");
 	assert("result" !in j && "error" !in j && "inputRequests" !in j);
+}
+
+unittest  // an unrecognized wire status parses as unknown, which is terminal
+{
+	assert(taskStatusFromWire("expired") == TaskStatus.unknown);
+	assert(isTerminal(TaskStatus.unknown));
+	assert(isTerminal(TaskStatus.completed) && isTerminal(TaskStatus.failed)
+			&& isTerminal(TaskStatus.cancelled));
+	assert(!isTerminal(TaskStatus.working) && !isTerminal(TaskStatus.inputRequired));
+	assert(Task.fromJson(Json(["taskId": Json("x"),
+				"status": Json("expired")])).status == TaskStatus.unknown);
 }

@@ -261,12 +261,6 @@ final class TaskRuntime
 		throw internalError("task '" ~ id ~ "' is contended; the update was not applied");
 	}
 
-	/// Whether a status is terminal (`completed`/`failed`/`cancelled`).
-	private static bool isTerminal(TaskStatus s) @safe pure nothrow
-	{
-		return s == TaskStatus.completed || s == TaskStatus.failed || s == TaskStatus.cancelled;
-	}
-
 	/// Update a `working`/`input_required` task's human-readable status message.
 	/// A no-op if the task is already terminal.
 	void progress(string id, string statusMessage) @safe
@@ -497,6 +491,7 @@ final class TaskRuntime
 		{
 		case TaskStatus.working:
 		case TaskStatus.cancelled:
+		case TaskStatus.unknown:
 			return makeDetailedTask(r.meta, DetailedTaskPayload.none());
 		case TaskStatus.inputRequired:
 			return makeDetailedTask(r.meta,

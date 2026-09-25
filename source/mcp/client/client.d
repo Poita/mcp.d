@@ -1651,8 +1651,11 @@ final class McpClient : ClientProtocol
 					onInputRequired(taskId, ("inputRequests" in state)
 							? state["inputRequests"] : Json.emptyObject);
 				break;
-			default: // working
+			case "working":
 				break;
+			default:
+				throw new McpException(ErrorCode.internalError,
+						"Task " ~ taskId ~ " reported an unrecognized status: " ~ status);
 			}
 			long pollMs;
 			if ("pollIntervalMs" in state && state["pollIntervalMs"].type == Json.Type.int_)
@@ -3739,6 +3742,26 @@ unittest  // awaitTask throws on a failed task carrying a JSON-RPC error
 	};
 	auto ex = cast(McpException) collectException(c.awaitTask("t1"));
 	assert(ex !is null && ex.msg == "boom");
+}
+
+unittest  // awaitTask throws on a status it does not recognize instead of polling forever
+{
+	import std.exception : collectException;
+
+	auto c = McpClient.http("http://localhost");
+	int polls;
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(++polls < 5, "awaitTask kept polling an unrecognized status");
+		return Json([
+			"resultType": Json("complete"),
+			"taskId": Json("t1"),
+			"status": Json("expired")
+		]);
+	};
+	auto ex = cast(McpException) collectException(c.awaitTask("t1"));
+	assert(ex !is null);
+	assert(polls == 1);
 }
 
 unittest  // callToolAwait returns a synchronous CallToolResult unchanged
