@@ -74,8 +74,9 @@ enum RequestStateBinding
 	none,
 	/// Bind to the authenticated subject (`ctx.auth().subject`).
 	authSubject,
-	/// Bind to the authenticated subject AND the tool/prompt name, so a blob
-	/// issued by one tool cannot be replayed into another.
+	/// Bind to the authenticated subject AND the request method plus tool/prompt
+	/// name, so a blob issued by one tool cannot be replayed into another tool,
+	/// nor into a prompt that shares its name.
 	authSubjectAndTool,
 }
 
@@ -275,14 +276,16 @@ package string requestStateSubject(RequestContext ctx) @safe
 	return ctx.auth().subject;
 }
 
-/// The tool/prompt name (the top-level `params.name`) an MRTR `requestState`
-/// blob binds to under the `authSubjectAndTool` binding.
-package string requestStateToolName(Json params) @safe
+/// The target an MRTR `requestState` blob binds to under the
+/// `authSubjectAndTool` binding: the request method and the tool/prompt name (the
+/// top-level `params.name`), NUL-separated so neither part can absorb the other.
+package string requestStateTarget(string method, Json params) @safe
 {
+	string name;
 	if (params.type == Json.Type.object && "name" in params
 			&& params["name"].type == Json.Type.string)
-		return params["name"].get!string;
-	return "";
+		name = params["name"].get!string;
+	return method ~ "\0" ~ name;
 }
 
 /// Verify an incoming (echoed) MRTR `requestState`. With no codec configured
@@ -300,7 +303,7 @@ package string verifyIncomingRequestState(RequestStateCodec codec, string raw,
 
 	if (codec is null || raw.length == 0)
 		return raw;
-	auto decoded = codec.decode(raw, requestStateSubject(ctx), requestStateToolName(params));
+	auto decoded = codec.decode(raw, requestStateSubject(ctx), requestStateTarget(method, params));
 	if (decoded.isNull)
 	{
 		logWarn("secureRequestState: rejected an echoed requestState on %s "
@@ -328,7 +331,7 @@ package Json secureOutgoingRequestState(RequestStateCodec codec, Json result,
 	if (plain.length == 0)
 		return result;
 	result["requestState"] = codec.encode(plain, requestStateSubject(ctx),
-			requestStateToolName(params));
+			requestStateTarget(method, params));
 	return result;
 }
 
@@ -661,4 +664,30 @@ unittest  // encrypted: AES and bind-HMAC keys are independent (no key reuse)
 	// otherwise recovering one key compromises the other.
 	auto codec = encryptedCodec();
 	assert(codec.aesKey() != codec.macKey());
+}
+
+unittest  // authSubjectAndTool rejects a requestState minted for another method with the same name
+{
+	import mcp.auth.resource_server : TokenInfo;
+	import mcp.server.context : BaseRequestContext;
+
+	static final class AliceCtx : BaseRequestContext
+	{
+		override TokenInfo auth() @safe
+		{
+			TokenInfo t;
+			t.valid = true;
+			t.subject = "alice";
+			return t;
+		}
+	}
+
+	auto codec = signedCodec(RequestStateBinding.authSubjectAndTool);
+	auto ctx = new AliceCtx();
+	Json params = Json(["name": Json("x")]);
+	Json result = Json(["requestState": Json(`{"step":1}`)]);
+	const wire = secureOutgoingRequestState(codec, result, "prompts/get", params, ctx)["requestState"]
+		.get!string;
+	assert(verifyIncomingRequestState(codec, wire, "tools/call", params, ctx) == "");
+	assert(verifyIncomingRequestState(codec, wire, "prompts/get", params, ctx) == `{"step":1}`);
 }
