@@ -853,6 +853,16 @@ final class McpClient : ClientProtocol
 			cacheStore_.invalidatePartition(cachePartition_);
 	}
 
+	/// Attach an OAuth bearer provider, called for every request so a token that
+	/// is refreshed between requests (e.g. `OAuthSession.bearer`) is always the
+	/// one sent. Replaces any token set by `setBearerToken`; a no-op over stdio.
+	void setBearerProvider(string delegate() @safe provider) @safe
+	{
+		transport.setBearerProvider(provider);
+		if (cacheStore_ !is null)
+			cacheStore_.invalidatePartition(cachePartition_);
+	}
+
 	/// Perform the initialize handshake and send `notifications/initialized`.
 	InitializeResult initialize(string requestedVersion = latestLegacy.toWire) @safe
 	{
@@ -7285,6 +7295,10 @@ version (unittest)
 		}
 
 		void setBearerToken(string token) @safe
+		{
+		}
+
+		void setBearerProvider(string delegate() @safe provider) @safe
 		{
 		}
 

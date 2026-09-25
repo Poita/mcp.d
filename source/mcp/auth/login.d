@@ -22,6 +22,7 @@ module mcp.auth.login;
 
 import core.time : Duration, minutes;
 
+import vibe.core.sync : TaskMutex;
 import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.errors;
@@ -666,6 +667,7 @@ final class OAuthSession
 	// overridable (see the secondary constructor) so the refresh-on-expiry path
 	// is unit-testable without network access.
 	private TokenSet delegate(string refreshToken) @safe refreshFn_;
+	private TaskMutex refreshLock_;
 
 	/// `oauth` must already carry the canonical `resource`. `token` is the
 	/// initial (possibly empty) stored token for `resource`.
@@ -679,6 +681,7 @@ final class OAuthSession
 		this.resource_ = resource;
 		this.token_ = token;
 		this.refreshFn_ = (string rt) @safe => oauth.refresh(as_, client, rt);
+		this.refreshLock_ = new TaskMutex;
 	}
 
 	/// Test/advanced constructor: inject a refresh function (the
@@ -690,6 +693,7 @@ final class OAuthSession
 		this.token_ = token;
 		this.store_ = store;
 		this.refreshFn_ = refreshFn;
+		this.refreshLock_ = new TaskMutex;
 	}
 
 	/// The current stored token (for inspection / persistence).
@@ -698,13 +702,32 @@ final class OAuthSession
 		return token_;
 	}
 
+	/// `bearerForRequest` at the current wall-clock time. `useOAuth` installs this
+	/// as the client's bearer provider, so every request carries a fresh token.
+	string bearer() @safe
+	{
+		import std.datetime.systime : Clock;
+
+		return bearerForRequest(() @trusted {
+			return Clock.currTime().toUnixTime();
+		}());
+	}
+
 	/// Return a valid bearer access token for use at `now` (Unix seconds),
 	/// refreshing via the refresh-token grant first when the current token has
 	/// expired (or is within the skew window). The refreshed token is persisted
 	/// through the `TokenStore`. Throws when no valid token can be produced
 	/// (e.g. expired with no refresh token).
+	///
+	/// Refreshes are single-flighted: concurrent callers (fibers or threads) wait
+	/// for one in-flight refresh and share its result, so a rotating refresh token
+	/// is never presented twice (which an AS answers with `invalid_grant` and may
+	/// treat as token theft, revoking the whole token family).
 	string bearerForRequest(long now) @safe
 	{
+		refreshLock_.lock();
+		scope (exit)
+			refreshLock_.unlock();
 		if (needsRefresh(token_, now, skew_))
 		{
 			if (token_.refreshToken.length == 0)
@@ -830,11 +853,12 @@ RegisteredClient cacheHitClient(StoredToken cached, OAuthLogin opts) @safe pure 
 /// 4. Run the authorization-code + PKCE flow: open the browser at the
 ///    authorization URL and capture the redirect `code` on a localhost loopback
 ///    listener; verify `state`.
-/// 5. Exchange the code for tokens, persist them, and set the bearer on the
-///    client.
+/// 5. Exchange the code for tokens, persist them, and install the session as
+///    the client's bearer provider.
 ///
-/// Returns the live `OAuthSession` so callers can refresh on later requests via
-/// `session.bearerForRequest(now)`.
+/// The client then asks the session for its bearer on every request
+/// (`OAuthSession.bearer`), which refreshes the access token when it nears
+/// expiry, so refresh is transparent. Returns the live `OAuthSession`.
 OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @safe
 {
 	import std.datetime.systime : Clock;
@@ -860,9 +884,8 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	auto cached = store.load(oauth.resource);
 	if (cached.hasToken && !needsRefresh(cached, now))
 	{
-		client.setBearerToken(cached.accessToken);
-		return new OAuthSession(oauth, as_, cacheHitClient(cached, opts),
-				store, oauth.resource, cached);
+		return attachSession(client, new OAuthSession(oauth, as_,
+				cacheHitClient(cached, opts), store, oauth.resource, cached));
 	}
 
 	// A refresh token is bound to the client that obtained it (RFC 6749 §6), so
@@ -880,8 +903,8 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 						now, cached.refreshToken);
 				refreshed.clientId = prior.clientId;
 				store.save(oauth.resource, refreshed);
-				client.setBearerToken(refreshed.accessToken);
-				return new OAuthSession(oauth, as_, prior, store, oauth.resource, refreshed);
+				return attachSession(client, new OAuthSession(oauth, as_, prior,
+						store, oauth.resource, refreshed));
 			}
 		}
 		catch (Exception)
@@ -928,8 +951,15 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	auto stored = StoredToken.fromTokenSet(ts, oauth.resource, issuedAt);
 	stored.clientId = rc.clientId;
 	store.save(oauth.resource, stored);
-	client.setBearerToken(stored.accessToken);
-	return new OAuthSession(oauth, as_, rc, store, oauth.resource, stored);
+	return attachSession(client, new OAuthSession(oauth, as_, rc, store, oauth.resource, stored));
+}
+
+/// Install `session` as `client`'s bearer provider, so each request carries a
+/// token refreshed on demand, and return it.
+private OAuthSession attachSession(McpClient client, OAuthSession session) @safe
+{
+	client.setBearerProvider(&session.bearer);
+	return session;
 }
 
 /// Apply the RFC 9207 `iss` authorization-response validation to a captured
@@ -1354,6 +1384,53 @@ unittest  // OAuthSession refreshes an expired token via the injected refresh fn
 	assert(saved.accessToken == "new-access");
 	assert(saved.refreshToken == "rotated-refresh");
 	assert(saved.expiresAt == 5000 + 3600);
+}
+
+unittest  // concurrent bearerForRequest calls share a single refresh (rotating refresh tokens)
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep;
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old-access";
+	t.refreshToken = "single-use-refresh";
+	t.expiresAt = 1000;
+
+	int calls;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		++calls;
+		// A rotating AS rejects a second use of the same refresh token.
+		assert(rt == "single-use-refresh", "refresh token replayed");
+		sleep(30.msecs); // the token request yields to other tasks
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		ts.expiresIn = 3600;
+		ts.refreshToken = "rotated-refresh";
+		return ts;
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+
+	string a, b;
+	auto ta = runTask(() nothrow{
+		try
+			a = sess.bearerForRequest(5000);
+		catch (Exception)
+		{
+		}
+	});
+	auto tb = runTask(() nothrow{
+		try
+			b = sess.bearerForRequest(5000);
+		catch (Exception)
+		{
+		}
+	});
+	ta.join();
+	tb.join();
+
+	assert(calls == 1);
+	assert(a == "new-access" && b == "new-access");
 }
 
 unittest  // OAuthSession does not refresh when the cached token is still valid

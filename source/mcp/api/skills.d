@@ -1885,6 +1885,10 @@ version (unittest)
 		{
 		}
 
+		void setBearerProvider(string delegate() @safe) @safe
+		{
+		}
+
 		void setModernProtocol(bool) @safe
 		{
 		}

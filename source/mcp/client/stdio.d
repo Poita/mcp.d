@@ -94,6 +94,11 @@ final class StdioClientTransport : ClientTransport
 	{
 	}
 
+	/// No-op: there is no OAuth bearer token over stdio.
+	void setBearerProvider(string delegate() @safe provider) @safe
+	{
+	}
+
 	/// No-op: the modern-protocol flag has no effect on stdio (no SSE GET streams).
 	void setModernProtocol(bool modern) @safe
 	{

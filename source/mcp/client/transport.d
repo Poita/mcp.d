@@ -109,6 +109,11 @@ interface ClientTransport
 	/// no-op on stdio. An empty string clears it.
 	void setBearerToken(string token) @safe;
 
+	/// Attach a bearer provider consulted for every request, so a token that is
+	/// refreshed between requests is always the one sent. Replaces any static
+	/// token set by `setBearerToken` (and vice versa); a no-op on stdio.
+	void setBearerProvider(string delegate() @safe provider) @safe;
+
 	/// Signal whether the negotiated protocol version is modern (2026-07-28 / modern).
 	/// The HTTP transport uses this to skip Last-Event-ID resumption (GET) that the
 	/// modern removed; a no-op on stdio and on transports where the flag is irrelevant.

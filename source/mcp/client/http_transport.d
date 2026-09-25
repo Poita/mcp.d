@@ -189,6 +189,7 @@ final class HttpClientTransport : ClientTransport
 	private string url;
 	private string sessionId;
 	private string bearerToken;
+	private string delegate() @safe bearerProvider;
 	// Set after the first plaintext-bearer warning so the cleartext-credential
 	// notice is logged at most once per transport instead of on every request.
 	private bool warnedInsecureBearer;
@@ -308,6 +309,22 @@ final class HttpClientTransport : ClientTransport
 	void setBearerToken(string token) @safe
 	{
 		bearerToken = token;
+		bearerProvider = null;
+	}
+
+	void setBearerProvider(string delegate() @safe provider) @safe
+	{
+		bearerProvider = provider;
+		bearerToken = null;
+	}
+
+	/// The bearer to attach to the request being built: the provider's current
+	/// token when one is installed, else the static token.
+	private string currentBearer() @safe
+	{
+		if (bearerProvider !is null)
+			bearerToken = bearerProvider();
+		return bearerToken;
 	}
 
 	/// Mark whether the negotiated protocol version is modern (2026-07-28 / modern).
@@ -1044,10 +1061,14 @@ final class HttpClientTransport : ClientTransport
 		// `legacyEndpoint`; if a future change ever let a cross-origin value reach
 		// here, the credential still must not leave the configured origin.
 		const target = legacyMode ? legacyEndpoint : url;
-		if (bearerToken.length && sameOrigin(url, target))
+		if (sameOrigin(url, target))
 		{
-			warnIfInsecureBearer();
-			req.headers["Authorization"] = "Bearer " ~ bearerToken;
+			const bearer = currentBearer();
+			if (bearer.length)
+			{
+				warnIfInsecureBearer();
+				req.headers["Authorization"] = "Bearer " ~ bearer;
+			}
 		}
 		if (sessionId.length)
 			req.headers["Mcp-Session-Id"] = sessionId;
@@ -1132,10 +1153,11 @@ final class HttpClientTransport : ClientTransport
 		if (body.length)
 			req ~= "Content-Type: application/json\r\n";
 		req ~= "Connection: " ~ connection ~ "\r\n";
-		if (includeAuth && bearerToken.length)
+		const bearer = includeAuth ? currentBearer() : null;
+		if (bearer.length)
 		{
 			warnIfInsecureBearer();
-			req ~= "Authorization: Bearer " ~ bearerToken ~ "\r\n";
+			req ~= "Authorization: Bearer " ~ bearer ~ "\r\n";
 		}
 		if (sessionId.length)
 			req ~= "Mcp-Session-Id: " ~ sessionId ~ "\r\n";
@@ -2664,6 +2686,35 @@ unittest  // resumeViaGet GET includes Authorization: Bearer when a bearer token
 			"keep-alive", true, (string[string]).init, "last-id", null);
 	assert(req.canFind("Authorization: Bearer my-token"),
 			"GET resume path must include Authorization header when bearer token is set");
+}
+
+unittest  // a bearer provider is consulted on every request, so a refreshed token is sent
+{
+	import std.algorithm : canFind;
+
+	auto t = new HttpClientTransport("https://host:8080/mcp");
+	int calls;
+	t.setBearerProvider(() @safe {
+		return ++calls == 1 ? "first-token" : "refreshed-token";
+	});
+	auto first = t.buildHttpRequest("GET", "/mcp", "host:8080",
+			"text/event-stream", "keep-alive", true, (string[string]).init, null, null);
+	auto second = t.buildHttpRequest("GET", "/mcp", "host:8080",
+			"text/event-stream", "keep-alive", true, (string[string]).init, null, null);
+	assert(first.canFind("Authorization: Bearer first-token"));
+	assert(second.canFind("Authorization: Bearer refreshed-token"));
+}
+
+unittest  // setBearerToken replaces an installed bearer provider
+{
+	import std.algorithm : canFind;
+
+	auto t = new HttpClientTransport("https://host:8080/mcp");
+	t.setBearerProvider(() @safe => "provided");
+	t.setBearerToken("static");
+	const req = t.buildHttpRequest("GET", "/mcp", "host:8080",
+			"text/event-stream", "keep-alive", true, (string[string]).init, null, null);
+	assert(req.canFind("Authorization: Bearer static"));
 }
 
 unittest  // runServerStream GET includes Authorization: Bearer when a bearer token is set
