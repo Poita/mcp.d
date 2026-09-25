@@ -341,6 +341,7 @@ final class HttpClientTransport : ClientTransport
 	/// `SubscriptionStream` handle and torn down through `cancel()`.
 	void close() @safe
 	{
+		endSession();
 		() @trusted {
 			import core.atomic : atomicStore;
 
@@ -366,6 +367,36 @@ final class HttpClientTransport : ClientTransport
 				w.err = internalError("legacy HTTP+SSE transport closing");
 		// Wake both the per-request waiters and any pending endpoint-discovery wait.
 		notifyLegacy();
+	}
+
+	/// Tell a stateful Streamable HTTP server the session is over: `DELETE` the
+	/// endpoint with its `Mcp-Session-Id` (basic/transports §Session Management:
+	/// clients that no longer need a session SHOULD). Best-effort — a server may
+	/// answer 405 (it does not let clients end sessions) and any failure is ignored.
+	private void endSession() @safe nothrow
+	{
+		import mcp.protocol.ssrf : secureRequestHTTP, SsrfPolicy;
+
+		if (sessionId.length == 0 || legacyMode || modernProtocol)
+			return;
+		const sid = sessionId;
+		sessionId = null;
+		try
+		{
+			auto versionHeaders = requestHeaders(Json.undefined);
+			secureRequestHTTP(url, SsrfPolicy.allowUserConfigured, (scope HTTPClientRequest req) {
+				req.method = HTTPMethod.DELETE;
+				req.headers["Mcp-Session-Id"] = sid;
+				if (bearerToken.length)
+					req.headers["Authorization"] = "Bearer " ~ bearerToken;
+				foreach (k, v; versionHeaders)
+					if (!isHeaderValueUnsafe(v))
+						req.headers[k] = v;
+			}, (scope HTTPClientResponse res) { res.dropBody(); }, connectTimeout);
+		}
+		catch (Exception)
+		{
+		}
 	}
 
 	private bool closing() @safe
@@ -3511,4 +3542,46 @@ unittest  // a legacy HTTP+SSE request whose POST is rejected fails at once with
 	auto h = cast(HttpStatusException) thrown;
 	assert(h !is null && h.status == 500,
 			"a rejected legacy POST must fail its waiter with the status");
+}
+
+unittest  // close() ends a stateful session with DELETE carrying its Mcp-Session-Id
+{
+	import mcp.client.client : McpClient;
+
+	auto srv = new SessionFakeServer;
+	auto router = srv.router();
+	string[] deleted;
+	router.delete_("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		deleted ~= req.headers.get("Mcp-Session-Id", "");
+		res.statusCode = 204;
+		res.writeVoidBody();
+	});
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		client.initialize("2025-11-25");
+		client.close();
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(deleted == ["s1"], "close() must DELETE the live session");
+}
+
+unittest  // close() tolerates a server that answers the session DELETE with 405
+{
+	import mcp.client.client : McpClient;
+
+	auto srv = new SessionFakeServer;
+	auto router = srv.router();
+	bool sawDelete;
+	router.delete_("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		sawDelete = true;
+		res.statusCode = 405;
+		res.writeBody("", "text/plain");
+	});
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		client.initialize("2025-11-25");
+		client.close();
+	});
+	assert(failure.length == 0, "close() must not throw on 405: " ~ failure);
+	assert(sawDelete);
 }
