@@ -92,7 +92,7 @@ unittest
 			const port = listener.bindAddresses[0].port;
 			// Point the client at the LEGACY SSE endpoint. A POST to /sse has no
 			// route (only GET), so the server answers 404 -> the client's modern
-			// POST-and-await raises LegacyFallbackException -> connect() opens the
+			// POST-and-await raises HttpStatusException(404) -> connect() opens the
 			// legacy two-endpoint transport.
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/sse";
 

@@ -52,6 +52,7 @@ public import mcp.client.client;
 public import mcp.client.runner;
 public import mcp.client.subscription;
 public import mcp.client.cache;
+public import mcp.client.http_transport : HttpStatusException;
 public import mcp.client.events : WebhookReceiver, ReceiverResponse, generateWhsecSecret;
 public import mcp.client.event_subscription : EventSubscription;
 

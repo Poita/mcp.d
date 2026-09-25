@@ -17,7 +17,8 @@ import mcp.protocol.sampling : validateSamplingMessages, CreateMessageRequest, C
 import mcp.protocol.modern;
 import mcp.protocol.mrtr;
 import mcp.client.transport : ClientTransport, ClientProtocol;
-import mcp.client.http_transport : HttpClientTransport, LegacyFallbackException;
+import mcp.client.http_transport : HttpClientTransport, HttpStatusException,
+	isLegacyFallbackStatus;
 import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
 import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 import mcp.client.cache : CacheStore, InMemoryCacheStore, CacheKey, CacheEntry, noCache;
@@ -758,8 +759,10 @@ final class McpClient : ClientProtocol
 			discoverResult_ = disc;
 			serverVersions = disc.protocolVersions;
 		}
-		catch (LegacyFallbackException)
+		catch (HttpStatusException e)
 		{
+			if (!isLegacyFallbackStatus(e.status))
+				throw e;
 			// Modern POST rejected with 400/404/405 and no recognised modern error:
 			// the peer speaks an older version. Per basic/transports §Backward
 			// Compatibility, fall back to a Streamable HTTP `initialize` first; only
@@ -771,8 +774,10 @@ final class McpClient : ClientProtocol
 				initialize();
 				return negotiated;
 			}
-			catch (LegacyFallbackException)
+			catch (HttpStatusException e)
 			{
+				if (!isLegacyFallbackStatus(e.status))
+					throw e;
 			}
 			transport.startLegacyFallback();
 			initialize(ProtocolVersion.v2024_11_05.toWire);
@@ -6968,11 +6973,11 @@ unittest  // the task methods mirror params.taskId into Mcp-Name on a modern ses
 
 unittest  // connect() routes a legacy HTTP+SSE fallback through the transport seam, not a downcast
 {
-	// When discover() raises LegacyFallbackException, the client must initiate the
+	// When discover() is rejected with HTTP 404, the client must initiate the
 	// fallback via ClientTransport.startLegacyFallback(), with no cast to
 	// HttpClientTransport. A custom transport observes the call and then answers
 	// the subsequent legacy initialize handshake.
-	import mcp.client.http_transport : LegacyFallbackException;
+	import mcp.client.http_transport : HttpStatusException;
 
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
@@ -6980,7 +6985,7 @@ unittest  // connect() routes a legacy HTTP+SSE fallback through the transport s
 		// Both the modern probe and the Streamable HTTP initialize are rejected;
 		// only the handshake after the fallback opens succeeds.
 		if (!transport.legacyFallbackCalled)
-			throw new LegacyFallbackException(404);
+			throw new HttpStatusException(404, "not found");
 		// The legacy initialize handshake: echo a minimal initialize result.
 		Json r = Json.emptyObject;
 		r["protocolVersion"] = ProtocolVersion.v2024_11_05.toWire;

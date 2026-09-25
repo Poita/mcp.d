@@ -19,17 +19,19 @@ import mcp.protocol.mrtr : isHeaderValueUnsafe;
 import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.subscription : SubscriptionStream;
 
-/// Internal signal that the modern single-endpoint POST returned an HTTP
-/// 400/404/405, the trigger for the legacy HTTP+SSE (2024-11-05) fallback.
-/// Surfaced to `McpClient.connect` so it can drive the fallback.
-final class LegacyFallbackException : Exception
+/// A request rejected at the HTTP layer: the server answered with a non-success
+/// status and no JSON-RPC response for the request. `status` is the HTTP status
+/// code. A 400/404/405 raised while `McpClient.connect` probes the server is the
+/// backward-compatibility trigger; a 404 on a request that carried an
+/// `Mcp-Session-Id` means the session expired (the transport drops the id so the
+/// next `initialize` starts a new session).
+class HttpStatusException : McpException
 {
 	int status;
-	this(int status) @safe
-	{
-		import std.conv : to;
 
-		super("legacy HTTP+SSE fallback (HTTP " ~ status.to!string ~ ")");
+	this(int status, string message) @safe
+	{
+		super(ErrorCode.internalError, message);
 		this.status = status;
 	}
 }
@@ -134,9 +136,6 @@ final class HttpClientTransport : ClientTransport
 	// but rejected" from "endpoint not yet received", so `startLegacyFallback` can
 	// break its wait loop immediately instead of stalling until the 10s deadline.
 	private bool legacyEndpointRejected;
-	// The most recent HTTP status seen on a POST, so the lifecycle code can
-	// detect the 400/404/405 backward-compatibility trigger.
-	private int lastPostStatus;
 	// Per-request waiters for responses arriving on the legacy GET SSE stream,
 	// keyed by request id. Each in-flight `legacyRpc` registers a waiter and polls
 	// its own slot, so overlapping or reentrant legacy requests never clobber one
@@ -145,7 +144,8 @@ final class HttpClientTransport : ClientTransport
 	// Set when a oneway send (notification / server->client reply) is rejected
 	// with a session-gone status (404/410): the session no longer exists, so the
 	// next request `deliver()` throws a clear "session expired" error rather than
-	// silently issuing requests under a dead session.
+	// silently issuing requests under a dead session. An `initialize` clears it,
+	// since it starts a new session.
 	private bool sessionExpired;
 	// True when the negotiated protocol version is modern (2026-07-28 / modern).
 	// The modern removed Last-Event-ID resumption and standalone GET SSE streams;
@@ -350,8 +350,10 @@ final class HttpClientTransport : ClientTransport
 
 	Json deliver(Json message, long expectId) @safe
 	{
-		if (sessionExpired)
-			throw internalError(
+		if (isInitialize(message))
+			sessionExpired = false;
+		else if (sessionExpired)
+			throw new HttpStatusException(404,
 					"MCP session expired (server rejected a prior request with HTTP 404/410)");
 		if (legacyMode)
 			return legacyRpc(message, expectId);
@@ -403,13 +405,15 @@ final class HttpClientTransport : ClientTransport
 			status = res.statusCode;
 			res.dropBody();
 		});
-		lastPostStatus = status;
 		// A oneway send carries no awaited reply, so a rejection would otherwise be
-		// invisible: 404/410 means the session is gone (mark it so the next request
-		// surfaces a clear error); any other non-2xx is logged so the rejection is
-		// at least observable.
-		if (status == 404 || status == 410)
+		// invisible: 404/410 under a session means the session is gone (drop its id
+		// and mark it so the next non-initialize request surfaces a clear error);
+		// any other non-2xx is logged so the rejection is at least observable.
+		if ((status == 404 || status == 410) && sessionId.length)
+		{
 			sessionExpired = true;
+			sessionId = null;
+		}
 		else if (status != 0 && (status < 200 || status >= 300))
 			() @trusted {
 			import vibe.core.log : logWarn;
@@ -448,13 +452,23 @@ final class HttpClientTransport : ClientTransport
 		// approach `runServerStream`/`resumeViaGet` use for long-lived SSE)
 		// delivers each event immediately, so the client can reply and the
 		// round-trip completes.
-		postAndAwaitRaw(message, expectId, cursor, result, got, err);
+		const sentSession = sessionId.length > 0;
+		int status;
+		postAndAwaitRaw(message, expectId, cursor, result, got, err, status);
 
-		// An HTTP 400/404/405 on the modern single endpoint is the signal to try
-		// the legacy HTTP+SSE (2024-11-05) transport. Surface it as a typed
-		// exception so the lifecycle code (`connect`) can drive the fallback.
-		if (isLegacyFallbackStatus(lastPostStatus) && !got && err is null)
-			throw new LegacyFallbackException(lastPostStatus);
+		// A 404 under a session means the session is gone: drop the id so the
+		// next `initialize` starts a new session without it.
+		if (status == 404 && sentSession && !got && err is null)
+		{
+			sessionId = null;
+			throw new HttpStatusException(status,
+					"MCP session expired (server answered HTTP 404 for the session)");
+		}
+		// Any other 400/404/405 without a recognised modern error is the signal
+		// `McpClient.connect` uses to fall back to an older transport.
+		if (isLegacyFallbackStatus(status) && !got && err is null)
+			throw new HttpStatusException(status,
+					"HTTP " ~ idStr(status) ~ " from the MCP endpoint with no JSON-RPC response");
 
 		if (err !is null)
 			throw err;
@@ -509,7 +523,7 @@ final class HttpClientTransport : ClientTransport
 	/// `postAndAwait`). Mirrors the chunked-decode SSE parser of
 	/// `runServerStream`/`resumeViaGet`.
 	private void postAndAwaitRaw(Json message, long expectId, ref SseCursor cursor,
-			ref Json result, ref bool got, ref McpException err) @safe
+			ref Json result, ref bool got, ref McpException err, out int status) @safe
 	{
 		import vibe.stream.operations : readLine;
 		import std.string : indexOf, startsWith, strip, toLower;
@@ -561,7 +575,7 @@ final class HttpClientTransport : ClientTransport
 
 				// Status line + response headers.
 				auto statusLine = cast(string) readLine(conn).idup;
-				lastPostStatus = parseHttpStatus(statusLine);
+				status = parseHttpStatus(statusLine);
 				bool chunked;
 				bool sse;
 				foreach (h; readHeaderLines(conn))
@@ -578,7 +592,7 @@ final class HttpClientTransport : ClientTransport
 
 				// A 400/404/405 is the legacy-fallback signal: read the (small) body
 				// and surface a recognised modern JSON-RPC error if present.
-				if (isLegacyFallbackStatus(lastPostStatus))
+				if (isLegacyFallbackStatus(status))
 				{
 					const b = readRemaining(conn, chunked);
 					McpException modernErr;
@@ -795,6 +809,13 @@ final class HttpClientTransport : ClientTransport
 				recordTransportFailure(e.msg, got, err);
 			}
 		}();
+	}
+
+	private static bool isInitialize(Json message) @safe
+	{
+		return message.type == Json.Type.object && "method" in message
+			&& message["method"].type == Json.Type.string
+			&& message["method"].get!string == "initialize";
 	}
 
 	private static string idStr(long id) @safe
@@ -2819,4 +2840,106 @@ unittest  // connect() tries a Streamable HTTP initialize before legacy HTTP+SSE
 	assert(failure.length == 0, "connect failed: " ~ failure);
 	assert(negotiated == ProtocolVersion.v2025_11_25);
 	assert(!sawLegacyGet, "a Streamable HTTP server must not be treated as legacy HTTP+SSE");
+}
+
+version (unittest)
+{
+	/// A stateful 2025-11-25 fake server: `initialize` mints a fresh
+	/// `Mcp-Session-Id`, any other POST under an unknown/expired id gets 404, and
+	/// `tools/list` answers an empty list. `expire()` drops the live session.
+	private final class SessionFakeServer
+	{
+		import std.conv : to;
+
+		string live;
+		int minted;
+		string[] initializeSessionHeaders; // the Mcp-Session-Id each initialize carried
+
+		void expire() @safe
+		{
+			live = null;
+		}
+
+		URLRouter router() @safe
+		{
+			auto r = new URLRouter;
+			r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+				auto j = requestJson(req);
+				const method = ("method" in j) ? j["method"].get!string : "";
+				const sid = req.headers.get("Mcp-Session-Id", "");
+				if (method == "initialize")
+				{
+					initializeSessionHeaders ~= sid;
+					live = "s" ~ (++minted).to!string;
+					res.headers["Mcp-Session-Id"] = live;
+					res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+					return;
+				}
+				if (sid != live || live.length == 0)
+				{
+					res.statusCode = 404;
+					res.writeBody("", "text/plain");
+					return;
+				}
+				if (method == "tools/list")
+				{
+					auto resp = parseJsonString(`{"jsonrpc":"2.0","result":{"tools":[]}}`);
+					resp["id"] = j["id"];
+					res.writeBody(resp.toString(), "application/json");
+					return;
+				}
+				res.statusCode = 202;
+				res.writeBody("", "text/plain");
+			});
+			return r;
+		}
+	}
+}
+
+unittest  // a mid-session 404 surfaces as a typed McpException and a fresh initialize starts a new session
+{
+	import mcp.client.client : McpClient;
+
+	auto srv = new SessionFakeServer;
+	bool typed;
+	size_t tools = size_t.max;
+	const failure = runAgainstFakeServer(srv.router(), (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		srv.expire();
+		try
+			client.listTools();
+		catch (McpException)
+			typed = true;
+		client.initialize("2025-11-25");
+		tools = client.listTools().tools.length;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(typed, "a mid-session 404 must raise an McpException");
+	assert(srv.initializeSessionHeaders == ["", ""],
+			"the re-initialize must not carry the expired session id");
+	assert(tools == 0);
+}
+
+unittest  // a oneway 404 does not poison the transport: a fresh initialize still succeeds
+{
+	import mcp.client.client : McpClient;
+
+	auto srv = new SessionFakeServer;
+	size_t tools = size_t.max;
+	const failure = runAgainstFakeServer(srv.router(), (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		srv.expire();
+		client.sendNotification("notifications/roots/list_changed");
+		client.initialize("2025-11-25");
+		tools = client.listTools().tools.length;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(srv.initializeSessionHeaders == ["", ""]);
+	assert(tools == 0);
 }
