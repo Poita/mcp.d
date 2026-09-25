@@ -196,7 +196,7 @@ final class McpServer : ServerCore
 	/// Per-argument completers keyed by "<ref-key>\0<argumentName>", so a consumer
 	/// can register one completer per (reference, argument) instead of hand-routing
 	/// inside a single global delegate. Consulted by `doComplete` when no global
-	/// `typedCompletionHandler` matched.
+	/// `typedCompletionHandler` is set or it returned no values.
 	private string[]delegate(string prefix) @safe[string] argumentCompleters;
 	private bool loggingEnabled;
 	private bool resourceSubscriptionsEnabled;
@@ -901,8 +901,8 @@ final class McpServer : ServerCore
 	/// them in a `CompleteResult` (use `CompleteResult.prefixMatch` for the common
 	/// prefix-matching case). Declaring any completer advertises the `completions`
 	/// capability. `completion/complete` dispatch tries the global handler first
-	/// (when set) and falls back to a matching per-argument completer, then to an
-	/// empty `CompleteResult`.
+	/// (when set) and, when it returns no values, falls back to a matching
+	/// per-argument completer, then to an empty `CompleteResult`.
 	void setArgumentCompleter(CompletionReference reference, string argumentName,
 			string[]delegate(string prefix) @safe completer) @safe
 	{
@@ -3100,10 +3100,15 @@ final class McpServer : ServerCore
 	private Json doComplete(Json params) @safe
 	{
 		auto request = CompleteRequest.fromJson(params);
-		// The global handler takes precedence (advanced/dynamic routing), then a
-		// per-argument completer registered via `setArgumentCompleter`.
+		// The global handler takes precedence (advanced/dynamic routing); an empty
+		// result from it falls back to a per-argument completer registered via
+		// `setArgumentCompleter`.
 		if (typedCompletionHandler !is null)
-			return typedCompletionHandler(request).toJson();
+		{
+			auto global = typedCompletionHandler(request);
+			if (global.values.length || argumentCompleters.length == 0)
+				return global.toJson();
+		}
 		if (argumentCompleters.length)
 		{
 			const key = argumentCompleterKey(request.reference, request.argumentName);
@@ -5577,6 +5582,35 @@ unittest  // a per-argument completer is dispatched on its (reference, argument)
 	assert(values.length == 2);
 	assert(values[0].get!string == "java");
 	assert(values[1].get!string == "javascript");
+}
+
+unittest  // an empty global completion result falls back to a per-argument completer
+{
+	auto s = new McpServer("t", "1");
+	s.setCompletionRequestHandler((CompleteRequest r) @safe {
+		CompleteResult result;
+		if (r.argumentName == "owner")
+			result.values = ["poita"];
+		return result;
+	});
+	s.setArgumentCompleter(CompletionReference.forPrompt("code_review"),
+			"language", (string prefix) @safe => ["d"]);
+
+	Json p = Json.emptyObject;
+	p["ref"] = CompletionReference.forPrompt("code_review").toJson();
+	Json arg = Json.emptyObject;
+	arg["name"] = "language";
+	arg["value"] = "";
+	p["argument"] = arg;
+	auto resp = s.handle(req(1, "completion/complete", p)).get;
+	assert(resp["result"]["completion"]["values"].length == 1);
+	assert(resp["result"]["completion"]["values"][0].get!string == "d");
+
+	arg["name"] = "owner";
+	p["argument"] = arg;
+	resp = s.handle(req(2, "completion/complete", p)).get;
+	assert(resp["result"]["completion"]["values"][0].get!string == "poita",
+			"a non-empty global result takes precedence");
 }
 
 unittest  // a per-argument completer surface answers a non-matching request with empty
