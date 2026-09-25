@@ -68,6 +68,7 @@ final class EmitBuffer
 	}
 
 	private Entry[][string] byName_;
+	private long[string] evictedThrough_; // name -> highest sequence evicted for it
 	private long seqCounter_;
 	private EmitBufferOptions opts_;
 
@@ -122,9 +123,10 @@ final class EmitBuffer
 		auto entries = byName_.get(name, null);
 		bool truncated;
 
-		// Gap from eviction: the cursor points before the earliest retained
-		// event (and at least one event between them was dropped).
-		if (entries.length && entries[0].seq > fromSeq + 1)
+		// Gap from eviction: an event of this name after the cursor was dropped.
+		// Sequence numbers are shared across names, so this is judged against the
+		// name's own eviction point rather than the distance to its oldest entry.
+		if (evictedThrough_.get(name, 0) > fromSeq)
 			truncated = true;
 
 		const hasFloor = !maxAgeMs.isNull;
@@ -175,6 +177,8 @@ final class EmitBuffer
 			start++;
 		if (entries.length - start > opts_.maxEvents)
 			start = entries.length - opts_.maxEvents;
+		if (start > 0)
+			evictedThrough_[name] = entries[start - 1].seq;
 		byName_[name] = entries[start .. $];
 	}
 
@@ -609,6 +613,47 @@ unittest  // EmitBuffer evicts by maxEvents so the buffer stays bounded
 	auto r = buf.readSince("n", nullable(start), Nullable!long.init, Nullable!long.init);
 	// only the last 3 are retained; the earlier ones were evicted -> truncated
 	assert(r.events.length == 3 && r.truncated);
+}
+
+unittest  // events of other names between two of one name are not reported as a gap
+{
+	auto buf = new EmitBuffer();
+	const c1 = buf.append("a", EventOccurrence("a1", "a", "t"));
+	buf.append("b", EventOccurrence("b1", "b", "t"));
+	buf.append("b", EventOccurrence("b2", "b", "t"));
+	buf.append("a", EventOccurrence("a2", "a", "t"));
+	auto r = buf.readSince("a", nullable(c1), Nullable!long.init, Nullable!long.init);
+	assert(r.events.length == 1 && r.events[0].eventId == "a2");
+	assert(!r.truncated);
+}
+
+unittest  // eviction of one name's events is a gap only for cursors before the evicted ones
+{
+	auto buf = new EmitBuffer(EmitBufferOptions(10.minutes, 1));
+	const start = buf.headCursor();
+	const c1 = buf.append("a", EventOccurrence("a1", "a", "t"));
+	buf.append("b", EventOccurrence("b1", "b", "t"));
+	buf.append("a", EventOccurrence("a2", "a", "t")); // evicts a1
+	auto fromStart = buf.readSince("a", nullable(start), Nullable!long.init, Nullable!long.init);
+	assert(fromStart.truncated && fromStart.events.length == 1);
+	auto fromC1 = buf.readSince("a", nullable(c1), Nullable!long.init, Nullable!long.init);
+	assert(!fromC1.truncated && fromC1.events.length == 1);
+	// the other name is unaffected by a's eviction
+	auto b = buf.readSince("b", nullable(start), Nullable!long.init, Nullable!long.init);
+	assert(!b.truncated && b.events.length == 1);
+}
+
+unittest  // age eviction followed by other names' events still reports a gap only when one exists
+{
+	long now = 1_000_000;
+	auto buf = new EmitBuffer(EmitBufferOptions(1.minutes, 100));
+	buf.nowMs = () @safe => now;
+	const c1 = buf.append("a", EventOccurrence("a1", "a", "t"));
+	now += 2 * 60 * 1000;
+	buf.append("b", EventOccurrence("b1", "b", "t"));
+	buf.append("a", EventOccurrence("a2", "a", "t")); // a1 aged out, but c1 already saw it
+	auto r = buf.readSince("a", nullable(c1), Nullable!long.init, Nullable!long.init);
+	assert(!r.truncated && r.events.length == 1);
 }
 
 unittest  // WebhookSubscription round-trips through JSON
