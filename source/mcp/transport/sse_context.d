@@ -2162,8 +2162,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	private bool serverStateless_;
 	// Whether THIS request's `Accept` header admits `text/event-stream` (the
 	// transport resolves it from the POST's Accept via `acceptsEventStream`). When
-	// false the client provably cannot consume an SSE body, so an attempt to
-	// upgrade this response to a stream (progress/log/server-initiated request) is
+	// false the client provably cannot consume an SSE body, so progress/log
+	// notifications are dropped and a server-initiated request's upgrade is
 	// refused rather than emitting a stream the client declared it cannot read
 	// (basic/transports §Sending Messages content negotiation). Defaults to true
 	// so every existing caller (and the GET/listen paths) keep streaming.
@@ -2335,10 +2335,17 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		}();
 	}
 
+	// Progress and log notifications are optional: a client whose Accept excludes
+	// text/event-stream gets the plain JSON result without them rather than a 406.
+	private bool dropsNotifications() const @safe
+	{
+		return !acceptsEventStream_ && !streaming_;
+	}
+
 	void reportProgress(double progress,
 			Nullable!double total = Nullable!double.init, string message = null) @safe
 	{
-		if (progressTok.type == Json.Type.undefined)
+		if (progressTok.type == Json.Type.undefined || dropsNotifications())
 			return;
 		Json p = Json.emptyObject;
 		p["progressToken"] = progressTok;
@@ -2354,6 +2361,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 
 	void log(string level, Json data, string logger = null) @safe
 	{
+		if (dropsNotifications())
+			return;
 		Json p = Json.emptyObject;
 		p["level"] = level;
 		if (logger.length)

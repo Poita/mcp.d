@@ -2022,9 +2022,9 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		ConnectionState reqState = postState(server, sessions, mintedSessionId,
 				connToken, req.headers.get(HttpHeader.protocolVersion, ""), msg.params);
 		// Whether this POST's Accept admits text/event-stream. When it provably does
-		// not, an attempt by the handler to stream (progress/log/server-initiated
-		// request) is refused inside the context and surfaced as 406 below, rather
-		// than emitting an SSE body the client declared it cannot read.
+		// not, progress/log notifications are dropped and a server-initiated request
+		// is refused inside the context and surfaced as 406 below, rather than
+		// emitting an SSE body the client declared it cannot read.
 		const reqAcceptsSse = acceptsEventStream(req.headers.get("Accept", ""));
 		auto ctx = new HttpStreamContext(res, coord, clientCapsFor(server, reqState),
 				extractProgressToken(msg.params),
@@ -3752,6 +3752,40 @@ unittest  // a POST request whose Accept excludes both media types is rejected w
 
 	assert(res.statusCode == HTTPStatus.notAcceptable);
 	assert(SessionHeader !in res.headers);
+}
+
+unittest  // a JSON-only POST drops a handler's log/progress notifications and returns the result
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.types : Tool, CallToolResult, Content;
+	import mcp.server.context : RequestContext;
+
+	auto server = new McpServer("t", "1");
+	server.enableLogging();
+	Tool noisy = {name: "noisy"};
+	server.registerTool(noisy, (Json args, RequestContext ctx) @safe {
+		ctx.log("info", Json("working"));
+		ctx.reportProgress(0.5);
+		CallToolResult r;
+		r.content = [Content.makeText("done")];
+		return r;
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto req = makeInitPostReq(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":`
+			~ `{"name":"noisy","_meta":{"progressToken":"p1"}}}`,
+			["Accept": "application/json", "MCP-Protocol-Version": "2025-11-25"]);
+	router.handleRequest(req, res);
+
+	assert(res.statusCode == HTTPStatus.ok);
+	auto body_ = parseJsonString(() @trusted { return cast(string) sink.data; }());
+	assert(body_["result"]["content"][0]["text"].get!string == "done");
 }
 
 unittest  // an events/stream POST whose Accept excludes text/event-stream is 406
