@@ -97,6 +97,14 @@ struct StreamableHttpOptions
 	/// When `accessLog` is enabled, write the access-log lines to this file path
 	/// instead of the console. Ignored unless `accessLog` is set.
 	string accessLogFile = "";
+
+	/// Stateful servers only: a session with no request and no open GET stream
+	/// for this long is expired (`Duration.zero` disables expiry).
+	Duration sessionIdleTtl = SessionManager.defaultIdleTtl;
+	/// Stateful servers only: the most sessions kept at once. Past it, creating a
+	/// session evicts the least-recently-active never-used session first, then
+	/// the least-recently-active one (`0` disables the cap).
+	size_t maxSessions = SessionManager.defaultMaxActive;
 }
 
 /// The well-known path (RFC 9728 §3) at which a protected resource server
@@ -169,7 +177,8 @@ void mountMcp(URLRouter router, McpServer server,
 	auto coord = new StreamCoordinator;
 	// Session minting is derived from the server's mode: a `stateful`
 	// server mints/tracks an `Mcp-Session-Id`; a `stateless` server never does.
-	auto sessions = server.mode == ServerMode.stateful ? new SessionManager : null;
+	auto sessions = server.mode == ServerMode.stateful
+		? new SessionManager(opts.sessionIdleTtl, opts.maxSessions) : null;
 
 	// This mount owns a single fallback `ConnectionState`, which the server core
 	// threads through dispatch and reads back for the notify/push path. It is the
@@ -3340,8 +3349,9 @@ private ConnectionState postState(McpServer server, SessionManager sessions,
 {
 	if (sessions !is null && sessionsApply(server.negotiatedVersion))
 	{
-		const id = mintedSessionId.length ? mintedSessionId : connToken;
-		return sessions.stateFor(id);
+		if (mintedSessionId.length)
+			return sessions.stateFor(mintedSessionId, false);
+		return sessions.stateFor(connToken);
 	}
 	return freshStatelessState(protoHeader, params, server.negotiatedVersion);
 }

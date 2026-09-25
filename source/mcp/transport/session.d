@@ -27,6 +27,11 @@ version (Windows)
 /// and the parallel timestamp map together so the "remove from both" invariant
 /// lives in one place, and runs the TTL sweep + LRU cap eviction internally.
 ///
+/// A lookup checks only its own key's expiry; the full TTL sweep runs at most
+/// once per quarter-TTL, so per-request cost stays constant as the table grows.
+/// Past the cap, entries never marked used (`markUsed`) are evicted before used
+/// ones, so a burst of fresh entries cannot push out the ones in active use.
+///
 /// `ttl == Duration.zero` disables the sweep; `maxEntries == 0` disables the
 /// cap. `clock` is injectable (`null` => `MonoTime.currTime`) so callers can
 /// drive expiry deterministically in tests. The container does no locking; the
@@ -36,6 +41,8 @@ struct BoundedExpiringMap(V)
 {
 	private V[string] values;
 	private MonoTime[string] stamps;
+	private bool[string] used;
+	private MonoTime lastSweep;
 	private Duration ttl;
 	private size_t maxEntries;
 	private MonoTime delegate() @safe clock;
@@ -57,7 +64,7 @@ struct BoundedExpiringMap(V)
 	void put(string key, V value) @safe
 	{
 		const t = now();
-		sweep(t);
+		sweepDue(t);
 		if (maxEntries != 0 && (key in values) is null)
 			while (values.length >= maxEntries && evictOldest())
 			{
@@ -70,8 +77,9 @@ struct BoundedExpiringMap(V)
 	/// setting `found`. The entry is removed (single use).
 	V take(string key, out bool found) @safe
 	{
-		sweep(now());
-		if (auto p = key in values)
+		const t = now();
+		sweepDue(t);
+		if (auto p = live(key, t))
 		{
 			found = true;
 			auto v = *p;
@@ -88,22 +96,31 @@ struct BoundedExpiringMap(V)
 	/// future idle sweeps.
 	V* get(string key, bool refresh) @safe
 	{
-		sweep(now());
-		if (auto p = key in values)
+		const t = now();
+		sweepDue(t);
+		if (auto p = live(key, t))
 		{
 			if (refresh)
-				stamps[key] = now();
+				stamps[key] = t;
 			return p;
 		}
 		return null;
 	}
 
-	/// Whether `key` has a live entry. Sweeps expired entries first so that a
-	/// session past its idle TTL is not reported as present.
+	/// Whether `key` has a live entry; an entry past its idle TTL is dropped and
+	/// reported absent.
 	bool contains(string key) @safe
 	{
-		sweep(now());
-		return (key in values) !is null;
+		const t = now();
+		sweepDue(t);
+		return live(key, t) !is null;
+	}
+
+	/// Record that `key` has been used, so cap eviction prefers other entries.
+	void markUsed(string key) @safe
+	{
+		if ((key in values) !is null)
+			used[key] = true;
 	}
 
 	/// Remove the entry for `key` from both maps. Returns whether it existed.
@@ -125,6 +142,30 @@ struct BoundedExpiringMap(V)
 	{
 		values.remove(key);
 		stamps.remove(key);
+		used.remove(key);
+	}
+
+	/// The value for `key` if present and within its TTL; an expired entry is
+	/// dropped.
+	private V* live(string key, MonoTime t) @safe
+	{
+		auto p = key in values;
+		if (p is null)
+			return null;
+		if (ttl > Duration.zero && t - stamps[key] >= ttl)
+		{
+			drop(key);
+			return null;
+		}
+		return p;
+	}
+
+	private void sweepDue(MonoTime t) @safe
+	{
+		if (ttl <= Duration.zero || t - lastSweep < ttl / 4)
+			return;
+		lastSweep = t;
+		sweep(t);
 	}
 
 	private void sweep(MonoTime t) @safe
@@ -139,21 +180,31 @@ struct BoundedExpiringMap(V)
 			drop(k);
 	}
 
+	/// Evict the least-recently-active never-used entry, or the
+	/// least-recently-active entry when every entry has been used.
 	private bool evictOldest() @safe
 	{
-		string oldest;
-		MonoTime oldestTs;
-		bool found;
+		string oldest, oldestUnused;
+		MonoTime oldestTs, oldestUnusedTs;
+		bool found, foundUnused;
 		foreach (k, ts; stamps)
+		{
 			if (!found || ts < oldestTs)
 			{
 				oldest = k;
 				oldestTs = ts;
 				found = true;
 			}
+			if ((k in used) is null && (!foundUnused || ts < oldestUnusedTs))
+			{
+				oldestUnused = k;
+				oldestUnusedTs = ts;
+				foundUnused = true;
+			}
+		}
 		if (!found)
 			return false;
-		drop(oldest);
+		drop(foundUnused ? oldestUnused : oldest);
 		return true;
 	}
 }
@@ -290,7 +341,8 @@ final class SessionManager
 		this(defaultIdleTtl, defaultMaxActive);
 	}
 
-	/// Construct with an explicit idle TTL and active-session cap. `idleTtl`
+	/// Construct with an explicit idle TTL and active-session cap (see
+	/// `StreamableHttpOptions.sessionIdleTtl` / `maxSessions`). `idleTtl`
 	/// `Duration.zero` disables the idle sweep; `maxActive` `0` disables the cap.
 	this(Duration idleTtl, size_t maxActive) @safe
 	{
@@ -336,13 +388,19 @@ final class SessionManager
 	/// `null` when the id is empty, unknown, or already terminated. The request
 	/// path puts this on the request context so dispatch reads/writes only this
 	/// session's per-connection state. Resolving a session refreshes its
-	/// last-activity timestamp so an in-use session is never swept as idle.
-	ConnectionState stateFor(string id) @safe
+	/// last-activity timestamp so an in-use session is never swept as idle, and,
+	/// unless `countsAsUse` is false (the `initialize` that minted it), marks it
+	/// used so cap eviction removes never-used sessions first.
+	ConnectionState stateFor(string id, bool countsAsUse = true) @safe
 	{
 		if (id.length == 0)
 			return null;
 		if (auto p = sessions.get(id, true))
+		{
+			if (countsAsUse)
+				sessions.markUsed(id);
 			return *p;
+		}
 		return null;
 	}
 
@@ -674,4 +732,57 @@ unittest  // terminate cancels the session's in-flight requests
 	mgr.stateFor(id).inFlight["i:1"] = tok;
 	assert(mgr.terminate(id));
 	assert(tok.cancelled, "a terminated session's in-flight request must be cancelled");
+}
+
+unittest  // BoundedExpiringMap lookups check only their own key between sweeps
+{
+	import core.time : MonoTime, minutes, seconds;
+
+	auto clk = MonoTime.currTime;
+	auto m = BoundedExpiringMap!int(10.minutes, 0, () @safe => clk);
+	m.put("a", 1);
+	clk += 9.minutes;
+	m.put("b", 2);
+	clk += 61.seconds; // "a" is now past its TTL
+	assert(m.contains("b"));
+	assert(m.length == 2, "a lookup of one key must not sweep the whole table");
+	assert(!m.contains("a"), "an expired key is never reported present");
+	assert(m.length == 1);
+}
+
+unittest  // past the cap, never-used sessions are evicted before used ones
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	auto mgr = new SessionManager(Duration.zero, 3);
+	const used = mgr.create();
+	assert(mgr.stateFor(used) !is null);
+	Thread.sleep(2.msecs);
+	string[] flood;
+	foreach (_; 0 .. 5)
+	{
+		flood ~= mgr.create();
+		Thread.sleep(2.msecs);
+	}
+	assert(mgr.activeCount() == 3);
+	assert(mgr.isActive(used), "an initialize flood must not evict a session in use");
+	assert(mgr.isActive(flood[$ - 1]) && mgr.isActive(flood[$ - 2]));
+}
+
+unittest  // resolving a just-minted session for its initialize does not count as use
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	auto mgr = new SessionManager(Duration.zero, 2);
+	const a = mgr.create();
+	assert(mgr.stateFor(a, false) !is null);
+	Thread.sleep(2.msecs);
+	const b = mgr.create();
+	assert(mgr.stateFor(b) !is null);
+	Thread.sleep(2.msecs);
+	mgr.create();
+	assert(!mgr.isActive(a), "a never-used session is the first eviction victim");
+	assert(mgr.isActive(b));
 }
