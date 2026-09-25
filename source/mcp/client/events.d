@@ -64,6 +64,17 @@ final class WebhookReceiver
 	// subscriptions as deliveries sharing a webhook-id, so the key must include
 	// the subscription id or one subscription's copy would swallow the others'.
 	private long[string] seen_;
+	// `seen_` keys in arrival order (with their timestamps), consumed from
+	// `seenHead_`, so eviction pops the oldest arrivals instead of scanning.
+	private SeenEntry[] seenOrder_;
+	private size_t seenHead_;
+	private long newestSeenTs_;
+
+	private static struct SeenEntry
+	{
+		string key;
+		long ts;
+	}
 
 	/// Dedup entries older than this many seconds (relative to the newest
 	/// webhook-timestamp seen) are evicted, and `seen_` is hard-capped at
@@ -125,10 +136,19 @@ final class WebhookReceiver
 			const key = subId ~ "\0" ~ wid;
 			if ((key in seen_) !is null)
 				return ReceiverResponse(200, ""); // already processed
-			seen_[key] = ts;
-			evictSeen(ts);
+			// Recorded only once the delivery is handled: a callback that throws
+			// (the adapter answers 5xx) leaves the server's retry to be processed.
+			auto resp = route(body, *reg);
+			if (resp.status == 200)
+				recordSeen(key, ts);
+			return resp;
 		}
+		return route(body, *reg);
+	}
 
+	// Parse a verified delivery and hand it to the subscription's callbacks.
+	private ReceiverResponse route(string body, ref Reg reg) @safe
+	{
 		Json j;
 		try
 			j = parseJsonString(body);
@@ -151,30 +171,35 @@ final class WebhookReceiver
 		return ReceiverResponse(200, "");
 	}
 
-	// Bound the dedup set: drop entries older than `seenWindowSeconds` behind the
-	// newest delivery, then, if still over `seenCapacity`, drop the oldest entries
-	// until within cap. Webhook timestamps move forward, so anything far behind the
-	// freshness window will never be retried.
-	private void evictSeen(long newestTs) @safe
+	private void recordSeen(string key, long ts) @safe
 	{
-		import std.algorithm : sort;
-		import std.array : array;
+		seen_[key] = ts;
+		seenOrder_ ~= SeenEntry(key, ts);
+		if (ts > newestSeenTs_)
+			newestSeenTs_ = ts;
+		evictSeen();
+	}
 
-		if (seenWindowSeconds > 0 && newestTs > 0)
+	// Bound the dedup set, oldest arrivals first: drop entries older than
+	// `seenWindowSeconds` behind the newest delivery (webhook timestamps move
+	// forward, so anything far behind the freshness window will never be
+	// retried), and any beyond `seenCapacity`. Amortized O(1) per delivery.
+	private void evictSeen() @safe
+	{
+		const windowed = seenWindowSeconds > 0 && newestSeenTs_ > 0;
+		const cutoff = newestSeenTs_ - seenWindowSeconds;
+		while (seenHead_ < seenOrder_.length)
 		{
-			const cutoff = newestTs - seenWindowSeconds;
-			foreach (k; seen_.keys)
-				if (seen_[k] < cutoff)
-					seen_.remove(k);
+			const e = seenOrder_[seenHead_];
+			if (!(seen_.length > seenCapacity || (windowed && e.ts < cutoff)))
+				break;
+			seen_.remove(e.key);
+			seenHead_++;
 		}
-
-		if (seen_.length > seenCapacity)
+		if (seenHead_ > 64 && seenHead_ * 2 > seenOrder_.length)
 		{
-			auto byAge = seen_.byKeyValue.array;
-			byAge.sort!((a, b) => a.value < b.value);
-			const drop = seen_.length - seenCapacity;
-			foreach (kv; byAge[0 .. drop])
-				seen_.remove(kv.key);
+			seenOrder_ = seenOrder_[seenHead_ .. $].dup;
+			seenHead_ = 0;
 		}
 	}
 
@@ -373,6 +398,59 @@ unittest  // the dedup set is hard-capped so it cannot grow without bound
 		assert(rx.processDelivery(body, headers).status == 200);
 	}
 	assert(rx.seen_.length <= 10);
+}
+
+unittest  // a delivery whose callback throws is not recorded, so the retry is processed
+{
+	import std.exception : assertThrown;
+
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	int calls;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {
+		if (++calls == 1)
+			throw new Exception("database down");
+	});
+	const 
+	body = EventOccurrence("evt_1", "n", "t").toJson().toString();
+	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "evt_1",
+			1700, body, "sub_1", null);
+	assertThrown!Exception(rx.processDelivery(body, headers));
+	assert(rx.processDelivery(body, headers).status == 200); // the server's retry
+	assert(calls == 2);
+	assert(rx.processDelivery(body, headers).status == 200); // now a true duplicate
+	assert(calls == 2);
+}
+
+unittest  // at capacity the oldest dedup entries go first, the newest are kept
+{
+	import std.conv : to;
+
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	rx.seenWindowSeconds = 0;
+	rx.seenCapacity = 3;
+	int count;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe { count++; });
+	string[string][] sent;
+	string[] bodies;
+	foreach (i; 0 .. 5)
+	{
+		const wid = "wid_" ~ i.to!string;
+		const 
+		body = EventOccurrence("evt_" ~ i.to!string, "n", "t").toJson().toString();
+		// Timestamps out of insertion order: eviction follows arrival order.
+		auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, wid,
+				1700 - i, body, "sub_1", null);
+		assert(rx.processDelivery(body, headers).status == 200);
+		sent ~= headers;
+		bodies ~= body;
+	}
+	assert(count == 5 && rx.seen_.length == 3);
+	rx.processDelivery(bodies[4], sent[4]); // newest: still a duplicate
+	assert(count == 5);
+	rx.processDelivery(bodies[0], sent[0]); // oldest arrival: evicted, processed again
+	assert(count == 6);
 }
 
 unittest  // a terminated control envelope is routed to onControl
