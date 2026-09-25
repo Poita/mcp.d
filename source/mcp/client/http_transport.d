@@ -25,15 +25,56 @@ import mcp.client.subscription : SubscriptionStream;
 /// backward-compatibility trigger; a 404 on a request that carried an
 /// `Mcp-Session-Id` means the session expired (the transport drops the id so the
 /// next `initialize` starts a new session).
+///
+/// When the body carried a JSON-RPC error, `code`/`msg`/`data` are that error's;
+/// otherwise `code` is `internalError`. `wwwAuthenticate` is the response's
+/// `WWW-Authenticate` challenge (empty when absent), which a 401/403 carries so
+/// the caller can refresh or step up its token.
 class HttpStatusException : McpException
 {
 	int status;
+	string wwwAuthenticate;
 
-	this(int status, string message) @safe
+	this(int status, string message, string wwwAuthenticate = null) @safe
 	{
-		super(ErrorCode.internalError, message);
-		this.status = status;
+		this(status, ErrorCode.internalError, message, Json.undefined, wwwAuthenticate);
 	}
+
+	this(int status, int code, string message, Json data, string wwwAuthenticate) @safe
+	{
+		super(code, message, data);
+		this.status = status;
+		this.wwwAuthenticate = wwwAuthenticate;
+	}
+}
+
+/// Build the `HttpStatusException` for a non-success HTTP `status` whose response
+/// `body` is not a usable JSON-RPC response: a JSON-RPC error in the body keeps its
+/// code, message and data; any other body yields a generic HTTP error.
+HttpStatusException httpStatusError(int status, string body, string wwwAuthenticate) @safe
+{
+	import std.conv : to;
+
+	try
+	{
+		auto m = parseMessage(body);
+		if (m.kind == MessageKind.errorResponse && m.error.type == Json.Type.object)
+		{
+			auto e = m.error;
+			const code = ("code" in e && e["code"].type == Json.Type.int_) ? e["code"]
+				.get!int : ErrorCode.internalError;
+			const msg = ("message" in e && e["message"].type == Json.Type.string) ? e["message"]
+				.get!string : "HTTP " ~ status.to!string;
+			return new HttpStatusException(status, code, msg, ("data" in e)
+					? e["data"] : Json.undefined, wwwAuthenticate);
+		}
+	}
+	catch (Exception)
+	{
+	}
+	return new HttpStatusException(status,
+			"HTTP " ~ status.to!string ~ " from the MCP endpoint with no JSON-RPC response",
+			wwwAuthenticate);
 }
 
 /// A handle to the live socket of a `subscriptions/listen` background stream,
@@ -578,6 +619,7 @@ final class HttpClientTransport : ClientTransport
 				status = parseHttpStatus(statusLine);
 				bool chunked;
 				bool sse;
+				string wwwAuthenticate;
 				foreach (h; readHeaderLines(conn))
 				{
 					const lower = h.toLower;
@@ -588,6 +630,8 @@ final class HttpClientTransport : ClientTransport
 					const c = h.indexOf(':');
 					if (c > 0 && h[0 .. c].toLower == "mcp-session-id")
 						sessionId = h[c + 1 .. $].strip;
+					if (c > 0 && h[0 .. c].toLower == "www-authenticate")
+						wwwAuthenticate = h[c + 1 .. $].strip;
 				}
 
 				// A 400/404/405 is the legacy-fallback signal: read the (small) body
@@ -601,18 +645,40 @@ final class HttpClientTransport : ClientTransport
 					return;
 				}
 
+				// Any other non-success status (401/403/5xx, ...) carries no result;
+				// keep the HTTP status and challenge so the caller can act on them.
+				if (status < 200 || status >= 300)
+				{
+					err = httpStatusError(status, readRemaining(conn, chunked), wwwAuthenticate);
+					return;
+				}
+
 				if (!sse)
 				{
-					// A single JSON body (the common non-streaming response).
+					// A single JSON body (the common non-streaming response): it must be
+					// the response to this request.
 					const b = readRemaining(conn, chunked);
-					auto m = parseMessage(b);
-					if (m.kind == MessageKind.errorResponse)
+					Message m;
+					try
+						m = parseMessage(b);
+					catch (Exception)
+					{
+						err = httpStatusError(status, b, wwwAuthenticate);
+						return;
+					}
+					const forUs = m.id.type == Json.Type.int_ && m.id.get!long == expectId;
+					if (m.kind == MessageKind.errorResponse && (forUs || m.id.type
+							== Json.Type.null_))
 						err = errorFrom(m.error);
-					else
+					else if (m.kind == MessageKind.response && forUs)
 					{
 						result = m.result;
 						got = true;
 					}
+					else
+						err = internalError(
+								"HTTP response body is not the response to request " ~ idStr(
+								expectId));
 					return;
 				}
 
@@ -2942,4 +3008,111 @@ unittest  // a oneway 404 does not poison the transport: a fresh initialize stil
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(srv.initializeSessionHeaders == ["", ""]);
 	assert(tools == 0);
+}
+
+version (unittest)
+{
+	/// A stateless 2025-11-25 fake server that answers `initialize` normally and
+	/// every other request through `answer`.
+	private URLRouter answeringRouter(void delegate(Json request, HTTPServerResponse res) @safe answer) @safe
+	{
+		auto r = new URLRouter;
+		r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+			auto j = requestJson(req);
+			const method = ("method" in j) ? j["method"].get!string : "";
+			if (method == "initialize")
+			{
+				res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+				return;
+			}
+			if ("id" !in j)
+			{
+				res.statusCode = 202;
+				res.writeBody("", "text/plain");
+				return;
+			}
+			answer(j, res);
+		});
+		return r;
+	}
+
+	/// Run `listTools` against a server answering it through `answer` and return
+	/// what it threw (null when it returned).
+	private Exception listToolsFailure(void delegate(Json request, HTTPServerResponse res) @safe answer)
+	{
+		import mcp.client.client : McpClient;
+
+		Exception thrown;
+		const failure = runAgainstFakeServer(answeringRouter(answer), (string url) @safe {
+			auto client = McpClient.http(url);
+			scope (exit)
+				client.close();
+			client.initialize("2025-11-25");
+			try
+				client.listTools();
+			catch (Exception e)
+				thrown = e;
+		});
+		assert(failure.length == 0, "scenario failed: " ~ failure);
+		return thrown;
+	}
+}
+
+unittest  // a 401 surfaces as an HttpStatusException carrying the status and WWW-Authenticate challenge
+{
+	enum challenge = `Bearer resource_metadata="http://127.0.0.1/.well-known/oauth-protected-resource"`;
+	auto e = listToolsFailure((Json req, HTTPServerResponse res) @safe {
+		res.statusCode = 401;
+		res.headers["WWW-Authenticate"] = challenge;
+		res.writeBody(`{"error":"invalid_token"}`, "application/json");
+	});
+	auto h = cast(HttpStatusException) e;
+	assert(h !is null, "a 401 must raise HttpStatusException");
+	assert(h.status == 401);
+	assert(h.wwwAuthenticate == challenge);
+}
+
+unittest  // a 500 with an HTML body surfaces its HTTP status rather than a JSON parse error
+{
+	auto e = listToolsFailure((Json req, HTTPServerResponse res) @safe {
+		res.statusCode = 500;
+		res.writeBody("<html>oops</html>", "text/html");
+	});
+	auto h = cast(HttpStatusException) e;
+	assert(h !is null, "a 500 must raise HttpStatusException");
+	assert(h.status == 500);
+}
+
+unittest  // a 202 with no body for a request is an error, not a JSON parse failure
+{
+	auto e = listToolsFailure((Json req, HTTPServerResponse res) @safe {
+		res.statusCode = 202;
+		res.writeBody("", "text/plain");
+	});
+	auto h = cast(HttpStatusException) e;
+	assert(h !is null, "a bodiless 202 for a request must raise HttpStatusException");
+	assert(h.status == 202);
+}
+
+unittest  // a JSON-RPC error body on a 5xx keeps its code alongside the HTTP status
+{
+	auto e = listToolsFailure((Json req, HTTPServerResponse res) @safe {
+		auto resp = parseJsonString(`{"jsonrpc":"2.0","error":{"code":-32001,"message":"busy"}}`);
+		resp["id"] = req["id"];
+		res.statusCode = 503;
+		res.writeBody(resp.toString(), "application/json");
+	});
+	auto h = cast(HttpStatusException) e;
+	assert(h !is null);
+	assert(h.status == 503 && h.code == -32001 && h.msg == "busy");
+}
+
+unittest  // a 200 JSON body whose id does not match the request is rejected
+{
+	auto e = listToolsFailure((Json req, HTTPServerResponse res) @safe {
+		auto resp = parseJsonString(`{"jsonrpc":"2.0","result":{"tools":[]}}`);
+		resp["id"] = req["id"].get!long + 1000;
+		res.writeBody(resp.toString(), "application/json");
+	});
+	assert(cast(McpException) e !is null, "a mismatched response id must be rejected");
 }
