@@ -382,8 +382,10 @@ struct Delivery
 /// (Redis/SQS/DB) makes delivery node-agnostic. Mirrors the `TaskStore` seam.
 interface DeliveryQueue
 {
-	/// Add a job to the queue (initially unleased).
-	void enqueue(Delivery job) @safe;
+	/// Add a job to the queue (initially unleased). A job whose `jobId` is
+	/// already queued is left untouched — its payload, attempt count, and lease
+	/// stand — and false is returned; true means the job was added.
+	bool enqueue(Delivery job) @safe;
 
 	/// Claim and return the jobs that are ready at `nowMs` — unleased, or leased
 	/// with an expired lease — marking each leased until `nowMs + leaseMs`.
@@ -419,9 +421,12 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 	private Entry[string] entries_;
 	private ulong nextSeq_;
 
-	void enqueue(Delivery job) @safe
+	bool enqueue(Delivery job) @safe
 	{
+		if ((job.jobId in entries_) !is null)
+			return false;
 		entries_[job.jobId] = Entry(job.toJson(), 0, nextSeq_++);
+		return true;
 	}
 
 	Delivery[] lease(long nowMs, long leaseMs) @safe
@@ -476,6 +481,15 @@ unittest  // the in-memory delivery queue leases ready jobs in enqueue order
 	auto leased = q.lease(0, 1000);
 	assert(leased.length == 3);
 	assert(leased[0].jobId == "c" && leased[1].jobId == "a" && leased[2].jobId == "b");
+}
+
+unittest  // enqueueing a job id already queued neither replaces it nor releases its lease
+{
+	auto q = new InMemoryDeliveryQueue();
+	assert(q.enqueue(Delivery("j", "s", EventOccurrence("a", "n", "t"), 0)));
+	assert(q.lease(0, 1000).length == 1);
+	assert(!q.enqueue(Delivery("j", "s", EventOccurrence("a", "n", "t"), 0)));
+	assert(q.lease(10, 1000).length == 0); // still leased by the first claim
 }
 
 unittest  // EmitBuffer bootstrap returns no events and the head cursor

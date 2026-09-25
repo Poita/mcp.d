@@ -1312,8 +1312,15 @@ final class EventsRuntime
 			if (reg !is null && reg.transform !is null)
 				shaped = reg.transform(ctx, occ);
 		}
+		// Track before enqueueing (a shared queue's enqueue can yield to a drain
+		// that settles the job), and untrack when the job id is already queued:
+		// that one job settles once, so it must be counted once.
 		trackOutstanding(sub.id, shaped.cursor);
-		deliveryQueue_.enqueue(Delivery(sub.id ~ "/" ~ shaped.eventId, sub.id, shaped, 0));
+		if (!deliveryQueue_.enqueue(Delivery(sub.id ~ "/" ~ shaped.eventId, sub.id, shaped, 0)))
+		{
+			untrackOutstanding(sub.id, shaped.cursor);
+			return false;
+		}
 		return true;
 	}
 
@@ -1600,7 +1607,15 @@ final class EventsRuntime
 			return;
 		const attempt = job.attempt + 1;
 		if (attempt >= opts_.webhookMaxAttempts)
-			deliveryQueue_.ack(job.jobId); // dead-letter: bound total attempts
+		{
+			// Dead-letter: bound total attempts, and settle the position so the
+			// watermark is not held behind a job that will never be acked.
+			try
+				settlePosition(job.subscriptionId, job.occ.cursor);
+			catch (Exception e)
+				logEventsError("settling a dead-lettered delivery threw", e);
+			deliveryQueue_.ack(job.jobId);
+		}
 		else
 			deliveryQueue_.touch(job.jobId, attempt,
 					opts_.nowMs() + opts_.deliveryLease.total!"msecs");
@@ -2002,6 +2017,27 @@ final class EventsRuntime
 			return;
 		}
 		outstanding_[subId] ~= OutstandingCursor(cursor.get, 1);
+	}
+
+	// Withdraw a position `trackOutstanding` just recorded for a job that was
+	// never queued. It is the newest entry for `cursor`, so the latest match is
+	// decremented; an entry left at zero is dropped without settling anything.
+	private void untrackOutstanding(string subId, Nullable!string cursor) @safe
+	{
+		if (cursor.isNull)
+			return;
+		auto list = subId in outstanding_;
+		if (list is null)
+			return;
+		foreach_reverse (i, ref e; *list)
+			if (e.cursor == cursor.get)
+			{
+				if (--e.remaining <= 0)
+					*list = (*list)[0 .. i] ~ (*list)[i + 1 .. $];
+				break;
+			}
+		if ((*list).length == 0)
+			outstanding_.remove(subId);
 	}
 
 	// Settle one in-flight delivery at `cursor`. Returns false when the position is
@@ -3809,6 +3845,7 @@ version (unittest)
 		bool echoChallenge = true;
 		int[] eventStatuses; // statuses for successive event deliveries (default 200)
 		int eventCount;
+		int throwEvents; // this many event deliveries throw instead of answering
 
 		WebhookHttpResult post(string url, string[string] headers, string body, bool allowPrivate) @safe
 		{
@@ -3827,6 +3864,11 @@ version (unittest)
 						200, `{}`);
 			if (isControl)
 				return WebhookHttpResult.success(200);
+			if (throwEvents > 0)
+			{
+				throwEvents--;
+				throw new Exception("transport failure");
+			}
 			int status = (eventCount < eventStatuses.length) ? eventStatuses[eventCount] : 200;
 			eventCount++;
 			if (status / 100 == 2)
@@ -4925,4 +4967,49 @@ unittest  // a delivery whose store throws is dead-lettered, not looped invisibl
 	store.throwOnGet = false;
 	now += rt.opts_.deliveryLease.total!"msecs" + 1;
 	assert(queue.lease(now, 1000).length == 0);
+}
+
+unittest  // a dead-lettered delivery settles its position so the watermark keeps advancing
+{
+	auto ft = new FakeWebhookTransport();
+	ft.throwEvents = 1;
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.webhookMaxAttempts = 1;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t")); // seq 1: the transport throws
+	rt.emit(EventOccurrence("evt_2", "n", "t")); // seq 2: delivered
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "2");
+}
+
+unittest  // re-publishing an event id already queued does not wedge the watermark
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliverySleep = (Duration d) @safe {};
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("dup", "n", "t")); // seq 1
+	rt.emit(EventOccurrence("dup", "n", "t")); // seq 2, same event id
+	rt.emit(EventOccurrence("evt_3", "n", "t")); // seq 3
+	for (size_t i = 0; i < deferred.length; i++)
+		deferred[i]();
+	assert(ft.eventPosts().length == 2);
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "3");
 }
