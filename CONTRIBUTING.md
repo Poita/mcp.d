@@ -7,8 +7,9 @@ expected to follow, and the pull-request flow.
 
 ## Prerequisites
 
-- A D toolchain with frontend **2.100+** — DMD 2.100+, or LDC 1.30+ — and
-  [`dub`](https://dub.pm) (ships with the compiler).
+- A D toolchain with frontend **2.111+** — DMD 2.111+, or LDC 1.41+ (the
+  `toolchainRequirements` floor in `dub.json`) — and [`dub`](https://dub.pm)
+  (ships with the compiler).
 - **OpenSSL 3.x** on the system. The `openssl` / `vibe-d:tls` dependency links
   against it for TLS (HTTPS transport, OAuth 2.1).
   - **Ubuntu/Debian:** ships with OpenSSL 3.x (`apt install libssl-dev` if the
@@ -69,17 +70,32 @@ just conformance-client   # build + run the client conformance suite
 just conformance          # both suites
 ```
 
-CI (`.github/workflows/ci.yml`) runs three gates on every push and PR, and your
+CI (`.github/workflows/ci.yml`) runs these jobs on every push and PR, and your
 change must pass all of them:
 
 1. **dfmt format check** — `dub run dfmt -- --inplace source/ conformance/`
    followed by `git diff --exit-code` (dfmt has no `--check` flag, so the idiom
    is format-in-place then fail if the tree changed). Run dfmt before you commit.
-2. **dscanner lint** — `./scripts/dscanner-lint.sh`. The dub config lives in
-   `dscanner.ini`; the wrapper documents the one libdparse false-positive that
-   is filtered out.
-3. **build-and-test** — `dub build` + `dub test` on `{ldc-latest, dmd-latest}` ×
-   `{ubuntu-latest, macos-latest}`.
+2. **dscanner lint** — `./scripts/dscanner-lint.sh` (the dub config lives in
+   `dscanner.ini`; the wrapper documents the false positives it filters out),
+   plus `./scripts/check-readme-versions.sh`, which fails if the README's
+   DMD/LDC minimums drift from `dub.json`.
+3. **build-and-test** — `dub build` + `dub test` with `ldc-latest` on
+   `ubuntu-latest`, `macos-latest`, and `windows-latest`, and with `dmd-latest`
+   on `ubuntu-latest` (DMD has no Apple Silicon build, and Windows is gated on
+   LDC).
+4. **ed25519** — build and test the `library-ed25519` configuration (links
+   libsodium) on Ubuntu.
+5. **coverage** — `dub test --coverage` on Ubuntu, uploaded to Codecov
+   (non-blocking upload).
+6. **examples** — `./scripts/run-examples.sh` builds every example and runs each
+   client as a self-verifying end-to-end test on Ubuntu; **examples-windows**
+   runs the stdio examples end to end on `windows-latest`.
+
+Separate workflows run the official conformance suites
+(`.github/workflows/conformance.yml`), build the reference deploy Dockerfile
+(`.github/workflows/deploy-dockerfile.yml`), and build the API docs
+(`.github/workflows/docs.yml`).
 
 ### API documentation
 
