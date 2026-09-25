@@ -139,16 +139,41 @@ bool isValidSkillPath(string path) @safe pure nothrow
 	return isValidSkillName(last);
 }
 
-/// The `skill://<path>/SKILL.md` resource URI for a skill.
-string skillUri(string path) @safe pure
+/// The `skill://<path>/SKILL.md` resource URI for a skill. Each `/`-separated
+/// segment of `path` is percent-encoded.
+string skillUri(string path) @safe
 {
-	return "skill://" ~ path ~ "/SKILL.md";
+	return "skill://" ~ encodeSegments(path) ~ "/SKILL.md";
 }
 
-/// The `skill://<path>/<file>` resource URI for a skill's supporting file.
-string skillFileUri(string path, string file) @safe pure
+/// The `skill://<path>/<file>` resource URI for a skill's supporting file. Each
+/// `/`-separated segment of `path` and `file` is percent-encoded, so a file
+/// name containing a space, `#`, `?`, or `%` still yields a URI naming it.
+string skillFileUri(string path, string file) @safe
 {
-	return "skill://" ~ path ~ "/" ~ file;
+	return "skill://" ~ encodeSegments(path) ~ "/" ~ encodeSegments(file);
+}
+
+/// Percent-encode every `/`-separated segment of `path`, keeping the separators.
+private string encodeSegments(string path) @safe
+{
+	import std.algorithm : joiner, map, splitter;
+	import std.conv : to;
+	import std.uri : encodeComponent;
+
+	return path.splitter('/').map!(seg => encodeComponent(seg)).joiner("/").to!string;
+}
+
+/// Whether `path` is an admissible supporting-file path: relative to the skill
+/// root, `/`-separated, with no empty, `.`, or `..` segments and no
+/// backslashes, so it can neither escape the skill nor alias another file.
+bool isValidSkillFilePath(string path) @safe pure
+{
+	import std.algorithm : any, canFind, splitter;
+
+	if (path.length == 0 || path.canFind('\\'))
+		return false;
+	return !path.splitter('/').any!(seg => seg.length == 0 || seg == "." || seg == "..");
 }
 
 /// A `sha256:<hex>` digest of `bytes`, the integrity form SEP-2640 requires for
@@ -345,6 +370,10 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 	size_t total = skillMd.length;
 	foreach (file; files)
 	{
+		if (!isValidSkillFilePath(file.path))
+			throw new Exception("invalid supporting file path '" ~ file.path ~ "' in skill '"
+					~ path ~ "': it must be relative to the skill root, '/'-separated, "
+					~ "with no empty, '.', or '..' segments and no backslashes");
 		const fu = skillFileUri(path, file.path);
 		if (fu in localUris)
 			throw new Exception("duplicate skill resource uri '" ~ fu
@@ -738,6 +767,41 @@ unittest  // the extension key and discovery constants carry the SEP-2640 litera
 	assert(skillMimeType == "text/markdown");
 	assert(skillUri("git-workflow") == "skill://git-workflow/SKILL.md");
 	assert(skillFileUri("pdf", "references/FORMS.md") == "skill://pdf/references/FORMS.md");
+}
+
+unittest  // skillFileUri percent-encodes each file path segment
+{
+	assert(skillFileUri("pdf", "my docs/a#b?c%d.md") == "skill://pdf/my%20docs/a%23b%3Fc%25d.md");
+	assert(skillFileUri("pdf", "ref/über.md") == "skill://pdf/ref/%C3%BCber.md");
+}
+
+unittest  // a supporting file with URI-reserved characters is served at its encoded URI
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerSkill(s, Skill("pdf", "PDF help", "# PDF", null,
+			[SkillFile("notes/a b#1.md", "text/markdown", "hello")]));
+	Json rp = Json.emptyObject;
+	rp["uri"] = "skill://pdf/notes/a%20b%231.md";
+	auto r = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	assert("error" !in r, r.toString);
+	assert(r["result"]["contents"][0]["text"].get!string == "hello");
+}
+
+unittest  // registerSkill rejects supporting file paths that escape or are not skill-relative
+{
+	import std.exception : assertThrown;
+
+	foreach (bad; [
+			"../secret.md", "a/../../b.md", "./a.md", "/abs.md", "a\\b.md",
+			"a//b.md", "", "dir/"
+		])
+	{
+		auto s = new McpServer("t", "1");
+		assertThrown(registerSkill(s, Skill("pdf", "PDF help", "# PDF", null,
+				[SkillFile(bad, "text/plain", "x")])), bad);
+	}
 }
 
 unittest  // the Skills extension negotiates from 2025-11-25
