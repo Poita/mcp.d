@@ -80,6 +80,35 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 		return channel.request(method, params);
 	}
 
+	// Background ticker for modern `events/stream` push: poll-driven event types and
+	// per-stream heartbeats are advanced here (emit-only types deliver live via the
+	// sink). Started when the first stream opens, so events enabled after the
+	// transport starts are still ticked; stops when the read loop ends.
+	bool tickerStarted;
+	bool readLoopDone;
+	void startTicker() @safe
+	{
+		if (tickerStarted)
+			return;
+		tickerStarted = true;
+		runTask(() nothrow{
+			import vibe.core.core : sleep;
+			import core.time : seconds;
+			import mcp.server.event_store : nowUnixMs;
+
+			while (!readLoopDone)
+			{
+				try
+				{
+					sleep(1.seconds);
+					server.tickStdioEventStreams(nowUnixMs());
+				}
+				catch (Exception)
+					break;
+			}
+		});
+	}
+
 	void onInbound(Message m) @safe
 	{
 		final switch (m.kind)
@@ -100,7 +129,11 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			// `notifications/events/*` to the same sink (demuxed by the request id
 			// in `_meta`). A background ticker advances poll-driven types + heartbeats.
 			if (server.tryServeStdioEventsStream(m, &sink))
+			{
+				if (server.hasStdioEventStreams())
+					startTicker();
 				return;
+			}
 			// Dispatch the request in its own task so a blocking/long-running handler
 			// (server->client request, cancellation poll loop) does not stall the
 			// read loop. The handler's notifications + reply ride `channel.send`.
@@ -163,30 +196,8 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 
 	channel = new DuplexChannel(readLine, writeLine, &onInbound, &onInboundBatch);
 
-	// Background ticker for modern `events/stream` push: poll-driven event types and
-	// per-stream heartbeats are advanced here (emit-only types deliver live via the
-	// sink). Runs only while events are enabled; stops when the read loop ends.
-	bool tickerRunning = server.hasStdioEventStreams();
-	if (tickerRunning)
-		runTask(() nothrow{
-			import vibe.core.core : sleep;
-			import core.time : seconds;
-			import mcp.server.event_store : nowUnixMs;
-
-			while (tickerRunning)
-			{
-				try
-				{
-					sleep(1.seconds);
-					server.tickStdioEventStreams(nowUnixMs());
-				}
-				catch (Exception)
-					break;
-			}
-		});
-
 	channel.runReadLoop();
-	tickerRunning = false;
+	readLoopDone = true;
 
 	// The read loop has ended at stdin EOF. failPending (inside runReadLoop) already
 	// released any handler blocked in a server->client request, but a handler that

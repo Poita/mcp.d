@@ -1577,11 +1577,10 @@ final class McpServer : ServerCore
 		}
 	}
 
-	/// Whether any stdio push streams are open (the transport's ticker runs only
-	/// while events are enabled).
+	/// Whether any stdio `events/stream` push streams are open.
 	bool hasStdioEventStreams() @safe
 	{
-		return eventsRuntime_ !is null;
+		return stdioEventStreams_.length > 0;
 	}
 
 	/// Deliver a change notification on the standalone GET / `subscriptions/listen`
@@ -6829,6 +6828,26 @@ unittest  // a server-terminated stdio stream gets the terminated frame, then th
 	// The stream is gone: a later tick sends it no heartbeat.
 	s.tickStdioEventStreams(100_000);
 	assert(lines.length == opened + 2);
+}
+
+unittest  // hasStdioEventStreams reports open stdio push streams, not merely enabled events
+{
+	import mcp.server.event_context : EventContext, EventResult;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	assert(!s.hasStdioEventStreams());
+
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c0");
+	s.registerEventType(reg);
+	Json params = Json.emptyObject;
+	params["name"] = "email.received";
+	assert(s.tryServeStdioEventsStream(modernReq(1, "events/stream", params), (string) @safe {
+		}));
+	assert(s.hasStdioEventStreams());
 }
 
 unittest  // tickStdioEventStreams iterates a snapshot, so a mid-tick cancel can't corrupt it
