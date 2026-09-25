@@ -127,19 +127,26 @@ private final class ListenSocketSlot
 }
 
 /// The abortable state of one in-flight Streamable HTTP request: the socket
-/// currently carrying its response (the POST, then any resume GET) and the reason
-/// it was aborted, if it was. Aborting closes that socket so a read parked on a
-/// silent stream returns at once.
+/// currently carrying its response (the POST, then any resume GET), the task
+/// awaiting it, and the reason it was aborted, if it was. Aborting closes that
+/// socket and interrupts the awaiting task, so a read parked on a silent stream
+/// returns at once even where closing a socket does not wake a pending read
+/// (the Windows event driver).
 private final class PostRequest
 {
+	import vibe.core.task : Task;
+
 	ListenSocketSlot slot;
 	McpException aborted;
+	Task owner;
 
 	void abort(McpException reason) @safe nothrow
 	{
 		aborted = reason;
 		if (slot !is null)
 			slot.closeSocket();
+		if (owner != Task.init && owner != Task.getThis() && owner.running)
+			owner.interrupt();
 	}
 
 	/// Make `s` the socket carrying the response, closing it at once when the
@@ -561,6 +568,27 @@ final class HttpClientTransport : ClientTransport
 	/// the Streamable HTTP resumability rules.
 	private Json postAndAwait(Json message, long expectId) @safe
 	{
+		import vibe.core.task : InterruptException, Task;
+
+		auto req = new PostRequest;
+		req.owner = Task.getThis();
+		inflightPosts[expectId] = req;
+		scope (exit)
+			inflightPosts.remove(expectId);
+		try
+			return awaitPostResponse(message, expectId, req);
+		catch (InterruptException e)
+		{
+			if (req.aborted !is null)
+				throw req.aborted;
+			throw e;
+		}
+	}
+
+	/// Send `message` and read the response with id `expectId` for `postAndAwait`,
+	/// resuming a dropped 2025-era stream; `req` carries the request's abort state.
+	private Json awaitPostResponse(Json message, long expectId, PostRequest req) @safe
+	{
 		import core.time : msecs;
 		import vibe.core.core : sleep;
 
@@ -584,11 +612,6 @@ final class HttpClientTransport : ClientTransport
 		// approach `runServerStream`/`resumeViaGet` use for long-lived SSE)
 		// delivers each event immediately, so the client can reply and the
 		// round-trip completes.
-		auto req = new PostRequest;
-		inflightPosts[expectId] = req;
-		scope (exit)
-			inflightPosts.remove(expectId);
-
 		const sentSession = sessionId.length > 0;
 		int status;
 		postAndAwaitRaw(message, expectId, cursor, result, got, err, status, req);
