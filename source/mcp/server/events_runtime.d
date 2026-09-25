@@ -1218,6 +1218,12 @@ final class EventsRuntime
 				if (occ.cursor.isNull)
 					occ.cursor = er.cursor; // a batch-cursor event settles with its batch
 		}
+		// The check can yield: apply the backfill's cursors to the current record
+		// rather than the pre-check copy, and stop if it was removed meanwhile.
+		auto fresh = webhookStore_.get(sub.id);
+		if (fresh.isNull)
+			return false;
+		sub = fresh.get;
 		sub.fetchCursor = er.cursor;
 		// With nothing to replay the reported position is already safe to persist;
 		// otherwise the watermark stays put until the replayed deliveries settle.
@@ -1264,14 +1270,22 @@ final class EventsRuntime
 			foreach (ref occ; er.events)
 				if (occ.cursor.isNull)
 					occ.cursor = er.cursor;
-			sub.fetchCursor = er.cursor;
-			if (er.events.length == 0 && (sub.id in outstanding_) is null)
-				sub.cursor = er.cursor;
-			webhookStore_.put(sub);
+			// The check can yield, so the subscription may have been removed,
+			// refreshed, or advanced meanwhile: apply this pass's cursors to the
+			// current record, and drop the batch if another pass already fetched it.
+			auto fresh = webhookStore_.get(sub.id);
+			if (fresh.isNull || fresh.get.isExpired(opts_.nowMs())
+					|| !fresh.get.active || fresh.get.fetchCursor != sub.fetchCursor)
+				continue;
+			auto cur = fresh.get;
+			cur.fetchCursor = er.cursor;
+			if (er.events.length == 0 && (cur.id in outstanding_) is null)
+				cur.cursor = er.cursor;
+			webhookStore_.put(cur);
 			if (er.truncated && !er.cursor.isNull)
-				postGap(sub, er.cursor.get);
+				postGap(cur, er.cursor.get);
 			foreach (occ; er.events)
-				any |= enqueueForWebhook(sub, reg, occ, false);
+				any |= enqueueForWebhook(cur, reg, occ, false);
 		}
 		if (any)
 			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
@@ -3932,6 +3946,93 @@ unittest  // a check-backed type is served over webhook by replaying from the cu
 	rt.pollWebhookSubscriptions();
 	assert(seen.length == 3);
 	assert(ft.eventPosts().length == 1); // quiet polls deliver nothing
+}
+
+unittest  // an unsubscribe while the poll-driven check runs is not undone by the pass
+{
+	auto ft = new FakeWebhookTransport();
+	long now = 1_000_000;
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	auto rt = new EventsRuntime(null, o);
+	void delegate() @safe duringCheck;
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		if (duringCheck !is null)
+			duringCheck();
+		if (ctx.isBootstrap())
+			return EventResult.empty("h0");
+		return EventResult.of([EventOccurrence("m1", "email.received", "t")], "h1");
+	};
+	rt.register(reg);
+	auto p = webhookSub("email.received", "https://proxy/hooks");
+	auto r = rt.subscribeWebhook(p, "user-1");
+	UnsubscribeParams u;
+	u.name = p.name;
+	u.arguments = p.arguments;
+	u.url = p.delivery.url;
+	duringCheck = () @safe { rt.unsubscribeWebhook(u, "user-1"); };
+	rt.pollWebhookSubscriptions();
+	assert(rt.webhookStore().get(r.id).isNull);
+	assert(ft.eventPosts().length == 0);
+}
+
+unittest  // a secret rotated while the poll-driven check runs survives the pass
+{
+	enum secretB = "whsec_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA=";
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	void delegate() @safe duringCheck;
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		if (duringCheck !is null)
+			duringCheck();
+		return EventResult.empty(ctx.isBootstrap() ? "h0" : ctx.cursor.get);
+	};
+	rt.register(reg);
+	auto p = webhookSub("email.received", "https://proxy/hooks");
+	auto r = rt.subscribeWebhook(p, "user-1");
+	auto rotate = p;
+	rotate.delivery = WebhookDelivery("https://proxy/hooks", secretB);
+	duringCheck = () @safe {
+		duringCheck = null;
+		rt.subscribeWebhook(rotate, "user-1");
+	};
+	rt.pollWebhookSubscriptions();
+	assert(rt.webhookStore().get(r.id).get.secret == secretB);
+}
+
+unittest  // an unsubscribe while the backfill check runs leaves no subscription behind
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	void delegate() @safe duringCheck;
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		if (duringCheck !is null)
+			duringCheck();
+		return EventResult.empty("h0");
+	};
+	rt.register(reg);
+	auto p = webhookSub("email.received", "https://proxy/hooks");
+	UnsubscribeParams u;
+	u.name = p.name;
+	u.arguments = p.arguments;
+	u.url = p.delivery.url;
+	duringCheck = () @safe {
+		duringCheck = null;
+		rt.unsubscribeWebhook(u, "user-1");
+	};
+	auto r = rt.subscribeWebhook(p, "user-1");
+	assert(rt.webhookStore().get(r.id).isNull);
 }
 
 unittest  // a check function that bootstraps a webhook subscription settles the fresh cursor
