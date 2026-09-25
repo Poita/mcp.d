@@ -492,6 +492,42 @@ private Nullable!CacheHint collectCache(alias overload)() @safe
 	return hint;
 }
 
+/// Bind every non-injected parameter of the tool or task method `overload`
+/// from the call's `args` into `argv`, leaving injected context slots untouched.
+/// Returns `null` on success, or an attributed message for a required argument
+/// that is missing (checked even when input-schema validation is disabled) or a
+/// value that cannot be converted; the caller reports it as an `isError` result,
+/// the classification this SDK uses for tool input failures. An `McpException`
+/// raised while binding propagates unchanged.
+private string bindToolArgs(alias overload)(Json args, ref Tuple!(Parameters!overload) argv) @safe
+{
+	import mcp.protocol.errors : McpException;
+
+	alias names = ParameterIdentifierTuple!overload;
+	alias defs = ParameterDefaultValueTuple!overload;
+	static foreach (i, P; Parameters!overload)
+	{
+		static if (!is(P : RequestContext) && !is(P == TaskContext))
+		{
+			static if (is(defs[i] == void) && !isInstanceOf!(Nullable, P))
+				if (!argPresent(args, names[i]))
+					return "argument '" ~ names[i] ~ "': required argument is missing";
+			try
+			{
+				static if (is(defs[i] == void))
+					setBound(argv[i], marshalArg!P(args, names[i]));
+				else
+					setBound(argv[i], marshalArgDefault!(P, defs[i])(args, names[i]));
+			}
+			catch (McpException e)
+				throw e;
+			catch (Exception e)
+				return "argument '" ~ names[i] ~ "': " ~ e.msg;
+		}
+	}
+	return null;
+}
+
 private void registerToolMethod(string memberName, alias overload, alias parent)(
 		McpServer server, tool attr) @safe
 {
@@ -545,62 +581,16 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 	}
 
 	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
-		import mcp.protocol.errors : McpException;
-
-		alias names = ParameterIdentifierTuple!overload;
-		alias defs = ParameterDefaultValueTuple!overload;
-		// A malformed argument that the coarse input-schema check admits (e.g. when
-		// schema validation is disabled, or a conversion the type-check cannot rule
-		// out) must surface as a clean, attributed tool-execution error rather than
-		// a raw std.conv/vibe exception string. This SDK classifies tool input
-		// failures as `isError:true` results (not -32602), so the marshalling
-		// failure is returned as an error CallToolResult, wrapped to the handler's
-		// return type. Protocol errors thrown by the marshaller are re-thrown so an
-		// inner McpException is not swallowed (mirrors the prompt path's pass-through).
-		static CallToolResult marshalError(string argName, string msg) @safe
-		{
-			return CallToolResult.error("argument '" ~ argName ~ "': " ~ msg);
-		}
-
 		Tuple!(Parameters!overload) argv;
 		static foreach (i, P; Parameters!overload)
-		{
 			static if (is(P : RequestContext))
 				argv[i] = ctx;
+		if (auto failure = bindToolArgs!overload(args, argv))
+		{
+			static if (is(ReturnType!overload == ToolResponse))
+				return ToolResponse.complete(CallToolResult.error(failure));
 			else
-			{
-				// A required parameter (neither Nullable nor carrying a D-level
-				// default) must be present even when input-schema validation is
-				// disabled; a missing one is a tool input error, not a silently
-				// default-constructed value.
-				static if (is(defs[i] == void) && !isInstanceOf!(Nullable, P))
-				{
-					if (!argPresent(args, names[i]))
-					{
-						static if (is(ReturnType!overload == ToolResponse))
-							return ToolResponse.complete(marshalError(names[i],
-								"required argument is missing"));
-						else
-							return marshalError(names[i], "required argument is missing");
-					}
-				}
-				try
-				{
-					static if (is(defs[i] == void))
-						setBound(argv[i], marshalArg!P(args, names[i]));
-					else
-						setBound(argv[i], marshalArgDefault!(P, defs[i])(args, names[i]));
-				}
-				catch (McpException e)
-					throw e;
-				catch (Exception e)
-				{
-					static if (is(ReturnType!overload == ToolResponse))
-						return ToolResponse.complete(marshalError(names[i], e.msg));
-					else
-						return marshalError(names[i], e.msg);
-				}
-			}
+				return CallToolResult.error(failure);
 		}
 		// An MRTR-capable tool returns a ToolResponse directly, so it may answer
 		// `inputRequired` (stateless elicitation) as well as `complete`; any other
@@ -683,22 +673,17 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 	// The executor runs on each dispatch: it reconstitutes the typed arguments
 	// from the task's durable input, injects the TaskContext, invokes the method,
 	// and wraps the return value into a CallToolResult-shaped result JSON. A
-	// marshalling failure or a thrown exception propagates to runTaskExecutor,
-	// which fails the task; a `tc.requireInput(...)` suspends it.
+	// missing or malformed argument completes the task with an `isError` result,
+	// as the same input would for a plain tool call; a thrown exception
+	// propagates to runTaskExecutor, which fails the task; a
+	// `tc.requireInput(...)` suspends it.
 	server.registerTaskTool(descriptor, (TaskContext tc) @safe {
-		alias names = ParameterIdentifierTuple!overload;
-		alias defs = ParameterDefaultValueTuple!overload;
-		Json args = tc.inputJson();
 		Tuple!(Parameters!overload) argv;
 		static foreach (i, P; Parameters!overload)
-		{
 			static if (is(P == TaskContext))
 				argv[i] = tc;
-			else static if (is(defs[i] == void))
-				setBound(argv[i], marshalArg!P(args, names[i]));
-			else
-				setBound(argv[i], marshalArgDefault!(P, defs[i])(args, names[i]));
-		}
+		if (auto failure = bindToolArgs!overload(tc.inputJson(), argv))
+			return CallToolResult.error(failure).toJson();
 		static if (is(ReturnType!overload == void))
 		{
 			__traits(getMember, parent, memberName)(argv.expand);
@@ -3151,6 +3136,32 @@ unittest  // @task UDA: tools/call returns a task the executor completes
 	assert(got["result"]["status"].get!string == "completed");
 	assert(got["result"]["result"]["structuredContent"]["value"].get!int == 42);
 	assert(got["result"]["pollIntervalMs"].get!long == 250);
+}
+
+unittest  // @task UDA: a missing required argument (schema validation off) completes as an isError result
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.server.task_context : SyncTaskDispatcher;
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.disableInputSchemaValidation();
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	registerHandlers(s, new TaskUdaApi);
+
+	Json p = Json.emptyObject;
+	p["name"] = "async_double";
+	p["arguments"] = Json.emptyObject;
+	p["_meta"] = modernMeta();
+	auto call = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
+	const id = call["result"]["taskId"].get!string;
+
+	Json gp = Json(["taskId": Json(id)]);
+	gp["_meta"] = modernMeta();
+	auto got = s.handle(Message(makeRequest(Json(3), "tasks/get", gp))).get["result"];
+	assert(got["status"].get!string == "completed", got.toString);
+	assert(got["result"]["isError"].get!bool, got.toString);
+	assert(got["result"]["content"][0]["text"].get!string.canFind("'n'"));
 }
 
 unittest  // @task UDA: a mid-task elicitation suspends and resumes via tasks/update
