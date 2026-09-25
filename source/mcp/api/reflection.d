@@ -2522,6 +2522,69 @@ unittest  // a struct return using vibe field UDAs passes its own outputSchema v
 	assert(r["result"]["structuredContent"]["type"].get!string == "t");
 }
 
+version (unittest)
+{
+	private struct Envelope
+	{
+		string kind;
+		Json body_;
+	}
+
+	private final class JsonParamApi
+	{
+		@tool("raw", "Tool taking an arbitrary JSON parameter")
+		string raw(Json payload) @safe
+		{
+			return payload.toString();
+		}
+
+		@tool("wrap", "Tool taking and returning a struct with a Json field")
+		Envelope wrap(Envelope e) @safe
+		{
+			return e;
+		}
+	}
+}
+
+unittest  // a Json parameter or struct field is described by the empty (any-value) schema
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new JsonParamApi);
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	Json raw, wrap;
+	foreach (i; 0 .. tools.length)
+	{
+		if (tools[i]["name"].get!string == "raw")
+			raw = tools[i];
+		else if (tools[i]["name"].get!string == "wrap")
+			wrap = tools[i];
+	}
+	assert(raw["inputSchema"]["properties"]["payload"] == Json.emptyObject);
+	assert(wrap["inputSchema"]["properties"]["e"]["properties"]["body"] == Json.emptyObject);
+	assert(wrap["outputSchema"]["properties"]["body"] == Json.emptyObject);
+}
+
+unittest  // Json parameters and struct fields bind the argument value verbatim
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableOutputSchemaValidation();
+	registerHandlers(s, new JsonParamApi);
+
+	Json p = Json.emptyObject;
+	p["name"] = "raw";
+	p["arguments"] = parseJsonString(`{"payload":{"a":[1,2]}}`);
+	auto r = s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+	assert(parseJsonString(r["content"][0]["text"].get!string) == parseJsonString(`{"a":[1,2]}`));
+
+	p["name"] = "wrap";
+	p["arguments"] = parseJsonString(`{"e":{"kind":"k","body":[true,null]}}`);
+	auto w = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
+	assert("error" !in w, w.toString);
+	assert(w["result"]["structuredContent"]["body"] == parseJsonString(`[true,null]`));
+}
+
 unittest  // argsAs honours struct field defaults and Nullable fields
 {
 	auto a = argsAs!PagedQuery(parseJsonString(`{"q":"x"}`));
