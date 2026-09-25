@@ -75,12 +75,15 @@ interface WebhookTransport
 final class SecureWebhookTransport : WebhookTransport
 {
 	import core.time : Duration, seconds;
+	import vibe.http.common : HTTPMethod;
 
 	private Duration requestTimeout_;
 
-	/// `requestTimeout` bounds each HTTP attempt (connect + read). The runtime keeps
-	/// it well under the delivery lease so a slow callback can never hold a leased
-	/// job open past its lease (which would let another worker re-deliver it).
+	/// `requestTimeout` bounds each HTTP attempt as a whole — connect, send, and
+	/// reading the response — however slowly the callback trickles bytes. The
+	/// runtime keeps it well under the delivery lease so a slow callback can never
+	/// hold a leased job open past its lease (which would let another worker
+	/// re-deliver it).
 	this(Duration requestTimeout = 10.seconds) @safe
 	{
 		requestTimeout_ = requestTimeout;
@@ -88,60 +91,103 @@ final class SecureWebhookTransport : WebhookTransport
 
 	WebhookHttpResult post(string url, string[string] headers, string body, bool allowPrivate) @safe
 	{
-		import vibe.http.client : HTTPClientRequest, HTTPClientResponse, HTTPMethod;
-		import vibe.stream.operations : readAllUTF8;
-		import mcp.protocol.ssrf : secureRequestHTTP, SsrfPolicy;
-
-		const policy = allowPrivate ? SsrfPolicy.allowUserConfigured : SsrfPolicy.blockInternal;
-		WebhookHttpResult result;
-		try
-		{
-			secureRequestHTTP(url, policy, (scope HTTPClientRequest req) {
-				req.method = HTTPMethod.POST;
-				req.contentType = "application/json";
-				foreach (k, v; headers)
-					req.headers[k] = v;
-				req.writeBody(cast(const(ubyte)[])
-					body);
-			}, (scope HTTPClientResponse res) {
-				auto rbody = res.bodyReader.readAllUTF8();
-				if (res.statusCode / 100 == 2)
-					result = WebhookHttpResult.success(res.statusCode, rbody);
-				else
-					result = WebhookHttpResult.failure(categoryForStatus(res.statusCode),
-						res.statusCode);
-			}, requestTimeout_);
-		}
-		catch (Exception e)
-			result = WebhookHttpResult.failure(categoryForException(e.msg));
-		return result;
+		return request(url, HTTPMethod.POST, headers, body, allowPrivate);
 	}
 
 	WebhookHttpResult get(string url, bool allowPrivate) @safe
 	{
-		import vibe.http.client : HTTPClientRequest, HTTPClientResponse, HTTPMethod;
-		import vibe.stream.operations : readAllUTF8;
+		return request(url, HTTPMethod.GET, null, null, allowPrivate);
+	}
+
+	// One request under an overall deadline: a timer interrupts the calling task
+	// when `requestTimeout_` elapses, so a drip-fed response cannot outlive it.
+	// Only the status decides the outcome; the body is read raw (no UTF-8
+	// validation) and at most `maxWebhookResponseBytes` of it, the rest dropped
+	// with the connection.
+	private WebhookHttpResult request(string url, HTTPMethod method,
+			string[string] headers, string body, bool allowPrivate) @safe
+	{
+		import vibe.core.core : setTimer;
+		import vibe.core.task : Task, InterruptException;
+		import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 		import mcp.protocol.ssrf : secureRequestHTTP, SsrfPolicy;
 
 		const policy = allowPrivate ? SsrfPolicy.allowUserConfigured : SsrfPolicy.blockInternal;
 		WebhookHttpResult result;
+		bool answered, done;
+		auto self = Task.getThis();
+		auto deadline = setTimer(requestTimeout_, () @safe nothrow{
+			if (!done && self != Task.init)
+				self.interrupt();
+		});
+		scope (exit)
+		{
+			done = true;
+			deadline.stop();
+		}
 		try
 		{
 			secureRequestHTTP(url, policy, (scope HTTPClientRequest req) {
-				req.method = HTTPMethod.GET;
+				req.method = method;
+				if (method == HTTPMethod.POST)
+				{
+					req.contentType = "application/json";
+					foreach (k, v; headers)
+						req.headers[k] = v;
+					req.writeBody(cast(const(ubyte)[])
+						body);
+				}
 			}, (scope HTTPClientResponse res) {
-				auto rbody = res.bodyReader.readAllUTF8();
+				bool truncated;
+				auto rbody = readBoundedBody(res.bodyReader, maxWebhookResponseBytes, truncated);
+				if (truncated)
+					res.disconnect();
 				if (res.statusCode / 100 == 2)
 					result = WebhookHttpResult.success(res.statusCode, rbody);
 				else
 					result = WebhookHttpResult.failure(categoryForStatus(res.statusCode),
 						res.statusCode);
+				answered = true;
 			}, requestTimeout_);
 		}
+		catch (InterruptException)
+		{
+			if (!answered)
+				result = WebhookHttpResult.failure(DeliveryErrorCategory.timeout);
+		}
 		catch (Exception e)
-			result = WebhookHttpResult.failure(categoryForException(e.msg));
+		{
+			if (!answered)
+				result = WebhookHttpResult.failure(categoryForException(e.msg));
+		}
 		return result;
 	}
+}
+
+/// The most of a callback's response body a delivery reads: ample for a
+/// verification echo or a well-known receiver document.
+enum size_t maxWebhookResponseBytes = 64 * 1024;
+
+/// Read at most `cap` bytes of `stream` as raw bytes (no UTF-8 validation),
+/// setting `truncated` when more remained unread.
+string readBoundedBody(S)(S stream, size_t cap, out bool truncated) @trusted
+{
+	import std.algorithm : min;
+
+	ubyte[] buf;
+	ubyte[4096] chunk;
+	while (!stream.empty)
+	{
+		if (buf.length >= cap)
+		{
+			truncated = true;
+			break;
+		}
+		const n = cast(size_t) min(stream.leastSize, chunk.length, cap - buf.length);
+		stream.read(chunk[0 .. n]);
+		buf ~= chunk[0 .. n];
+	}
+	return cast(string) buf;
 }
 
 /// Map an HTTP status to its delivery-error category.
@@ -331,6 +377,122 @@ unittest  // an asymmetric signer appends a v1a, signature alongside the v1, HMA
 			body, "sub", (string id, long ts, string p) @safe => "v1a,ZmFrZQ==");
 	assert(headers["webhook-signature"].canFind("v1a,ZmFrZQ=="));
 	assert(headers["webhook-signature"].canFind("v1,"));
+}
+
+version (unittest)
+{
+	// Serve one canned HTTP response per connection on a loopback port and run
+	// `client` against it inside the event loop. `respond` writes the response.
+	private void withLoopbackServer(void delegate(scope TCPConnection conn) @safe respond,
+			void delegate(ushort port) @safe client) @trusted
+	{
+		import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+		import vibe.core.net : listenTCP;
+
+		auto listener = listenTCP(0, (TCPConnection conn) @safe nothrow{
+			try
+			{
+				// Consume the request head and body before answering.
+				ubyte[1] b;
+				string head;
+				while (!head.endsWith("\r\n\r\n"))
+				{
+					conn.read(b[]);
+					head ~= cast(char) b[0];
+				}
+				auto cl = head.toLower.findSplitAfter("content-length:")[1];
+				const len = cl.length ? cl.until("\r").to!string
+					.strip
+					.to!size_t : 0;
+				foreach (_; 0 .. len)
+					conn.read(b[]);
+				respond(conn);
+			}
+			catch (Exception)
+			{
+			}
+		}, "127.0.0.1");
+		const port = listener.bindAddress.port;
+		runTask(() nothrow{
+			try
+			{
+				client(port);
+				listener.stopListening();
+			}
+			catch (Exception)
+			{
+			}
+			exitEventLoop();
+		});
+		runEventLoop();
+	}
+
+	import vibe.core.net : TCPConnection;
+	import std.algorithm : endsWith, findSplitAfter, until;
+	import std.string : strip;
+	import std.uni : toLower;
+	import std.conv : to;
+}
+
+unittest  // a drip-fed response body is cut off at the request deadline
+{
+	import core.time : Duration, msecs, MonoTime, seconds;
+	import vibe.core.core : sleep;
+
+	WebhookHttpResult result;
+	Duration took;
+	withLoopbackServer((scope TCPConnection conn) @safe {
+		conn.write("HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n");
+		foreach (_; 0 .. 100_000)
+		{
+			conn.write("x");
+			conn.flush();
+			sleep(20.msecs);
+		}
+	}, (ushort port) @safe {
+		auto t = new SecureWebhookTransport(300.msecs);
+		const start = MonoTime.currTime;
+		result = t.post("http://127.0.0.1:" ~ port.to!string ~ "/hook", null, "{}", true);
+		took = MonoTime.currTime - start;
+	});
+	assert(took < 3.seconds);
+	assert(!result.ok && result.error.get == DeliveryErrorCategory.timeout);
+}
+
+unittest  // a 2xx response whose body is not UTF-8 still counts as delivered
+{
+	WebhookHttpResult result;
+	withLoopbackServer((scope TCPConnection conn) @safe {
+		conn.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n");
+		conn.write(cast(const(ubyte)[])[0xff, 0xfe]);
+		conn.flush();
+	}, (ushort port) @safe {
+		import core.time : seconds;
+
+		auto t = new SecureWebhookTransport(5.seconds);
+		result = t.post("http://127.0.0.1:" ~ port.to!string ~ "/hook", null, "{}", true);
+	});
+	assert(result.ok && result.statusCode == 200);
+}
+
+unittest  // a response body is read only up to the cap
+{
+	import core.time : seconds;
+	import std.array : replicate;
+
+	WebhookHttpResult result;
+	withLoopbackServer((scope TCPConnection conn) @safe {
+		enum size = 4 * 1024 * 1024;
+		conn.write("HTTP/1.1 200 OK\r\nContent-Length: " ~ size.to!string ~ "\r\n\r\n");
+		const chunk = "y".replicate(64 * 1024);
+		foreach (_; 0 .. size / chunk.length)
+			conn.write(chunk);
+		conn.flush();
+	}, (ushort port) @safe {
+		auto t = new SecureWebhookTransport(5.seconds);
+		result = t.post("http://127.0.0.1:" ~ port.to!string ~ "/hook", null, "{}", true);
+	});
+	assert(result.ok && result.body.length <= maxWebhookResponseBytes);
 }
 
 unittest  // categoryForStatus splits 4xx and 5xx
