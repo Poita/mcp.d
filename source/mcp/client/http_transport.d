@@ -11,6 +11,8 @@ import vibe.stream.operations : readAllUTF8, readLine;
 import vibe.core.net : TCPConnection, connectTCP;
 import vibe.stream.tls : createTLSContext, createTLSStream, TLSContextKind, TLSPeerValidationMode;
 import vibe.stream.wrapper : ProxyStream, createProxyStream;
+import vibe.core.stream : Stream;
+import vibe.internal.interfaceproxy : InterfaceProxy, interfaceProxy;
 import vibe.core.sync : LocalManualEvent, createManualEvent, LocalTaskSemaphore;
 
 import mcp.protocol.jsonrpc;
@@ -761,6 +763,8 @@ final class HttpClientTransport : ClientTransport
 					return;
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, ep.host);
+				scope (exit)
+					conn.release();
 
 				const req = buildHttpRequest("POST", ep.path, ep.host,
 						"application/json, text/event-stream", "close", true, hdrs, null, payload);
@@ -1008,6 +1012,8 @@ final class HttpClientTransport : ClientTransport
 					return;
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, ep.host);
+				scope (exit)
+					conn.release();
 				const getReq = buildHttpRequest("GET", ep.path, ep.host, "text/event-stream",
 						"keep-alive", true, verHeaders, cursor.lastEventId, null);
 				conn.write(cast(const(ubyte)[]) getReq);
@@ -1396,6 +1402,8 @@ final class HttpClientTransport : ClientTransport
 						return;
 					// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 					auto conn = openClientStream(sock, ep.tls, ep.host);
+					scope (exit)
+						conn.release();
 
 					const req = buildHttpRequest("GET", ep.path, ep.host, "text/event-stream",
 							"keep-alive", true, verHeaders, cursor.lastEventId, null);
@@ -1543,6 +1551,8 @@ final class HttpClientTransport : ClientTransport
 				return;
 			// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 			auto conn = openClientStream(sock, ep.tls, ep.host);
+			scope (exit)
+				conn.release();
 
 			const req = buildHttpRequest("POST", ep.path, ep.host,
 					"text/event-stream", "keep-alive", true, reqHeaders, null, body);
@@ -1700,6 +1710,8 @@ final class HttpClientTransport : ClientTransport
 				}
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, ep.host);
+				scope (exit)
+					conn.release();
 
 				const req = buildHttpRequest("GET", ep.path, ep.host,
 						"text/event-stream", "keep-alive", true, null, null, null);
@@ -1943,18 +1955,50 @@ string unbracketHost(string host) pure nothrow @safe @nogc
 	return host;
 }
 
-private ProxyStream openClientStream(TCPConnection conn, bool tls, string host) @trusted
+/// A byte stream (plaintext or TLS) over a raw client socket. Each stream layer
+/// holds its own reference to the socket, and on Windows the socket is closed
+/// (so the server sees the connection end) only once every reference is gone;
+/// `release` drops this stream's references at once instead of when the GC
+/// collects it.
+private final class ClientStream : ProxyStream
+{
+	private ProxyStream socketLayer;
+
+	this(InterfaceProxy!Stream stream, ProxyStream socketLayer) @safe
+	{
+		super(stream, true);
+		this.socketLayer = socketLayer;
+	}
+
+	void release() @trusted nothrow
+	{
+		try
+		{
+			if (socketLayer !is null)
+				socketLayer.underlying = InterfaceProxy!Stream.init;
+			underlying = InterfaceProxy!Stream.init;
+		}
+		catch (Exception)
+		{
+		}
+	}
+}
+
+private ClientStream openClientStream(TCPConnection conn, bool tls, string host) @trusted
 {
 	if (tls)
 	{
 		auto ctx = createTLSContext(TLSContextKind.client);
 		ctx.peerValidationMode = TLSPeerValidationMode.checkPeer;
+		// The TLS layer reads the socket through `plain`, so releasing `plain`
+		// drops every reference the stream holds.
+		auto plain = createProxyStream(conn);
 		// vibe's TLS layer wants the bare peer name; an IPv6 literal reaches here
 		// bracketed (the form the `Host` header needs), so strip the brackets.
-		auto t = createTLSStream(conn, ctx, unbracketHost(host));
-		return createProxyStream(t);
+		auto t = createTLSStream(plain, ctx, unbracketHost(host));
+		return new ClientStream(interfaceProxy!Stream(t), plain);
 	}
-	return createProxyStream(conn);
+	return new ClientStream(interfaceProxy!Stream(conn), null);
 }
 
 /// Whether an HTTP status from the initial modern POST should trigger the
