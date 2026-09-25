@@ -19,7 +19,7 @@ import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
 import mcp.api.skills : Skill, registerSkill;
-import mcp.api.binding : bindJson;
+import mcp.api.binding : bindJson, schemaNode, schemaOf;
 import mcp.protocol.schema;
 
 @safe:
@@ -28,7 +28,7 @@ import mcp.protocol.schema;
 /// member *name* (string), rather than vibe's default numeric base value.
 ///
 /// The reflection layer emits enum schemas as `{type:"string", enum:[names…]}`
-/// (see `jsonSchemaOf`), so both directions of marshalling must agree: struct
+/// (see `mcp.api.binding.schemaOf`), so both directions of marshalling must agree: struct
 /// params/returns and bare-enum values are (de)serialized by-name. The policy
 /// only defines `toRepresentation`/`fromRepresentation` for enums, so vibe's
 /// `isPolicySerializable` is false for every other type and the default
@@ -201,26 +201,22 @@ private Json parametersSchema(alias func)() @safe
 		static if (!is(P : RequestContext) && !is(P == TaskContext) && !is(P == EventContext))
 		{
 			{
-				// Generate the parameter's schema and fold in the field-level
-				// facet UDAs (@minimum, @maximum, @title, @format, @minLength,
-				// @maxLength, @pattern, @minItems, @maxItems, @schemaDefault)
-				// attached directly to the parameter. Both the generator and
-				// applyUdaFacets are jsonschema's, operating in its JsonNode IR;
-				// render to vibe Json once the facets are applied, then layer the
-				// MCP-specific extensions (x-mcp-header, description) on below.
+				// Generate the parameter's schema and fold in the facet UDAs
+				// (@minimum, @maximum, @title, @format, @minLength, @maxLength,
+				// @pattern, @minItems, @maxItems, @schemaDefault) attached directly
+				// to the parameter, in the jsonschema JsonNode IR; render to vibe
+				// Json once the facets are applied, then layer the MCP-specific
+				// extensions (x-mcp-header, description) on below.
 				//
-				// nullableOmitsNull: a tool input models an optional parameter as a
-				// bare type absent from `required` (the convention the MCP reference
-				// servers use), not as a union with null. So a `Nullable!T` parameter
-				// emits the bare schema for T rather than anyOf:[T,null]; optionality
-				// is carried by `required` below. (Output and elicitation schemas use
-				// the mcp.protocol.schema adapter, which keeps the honest anyOf:[T,null].)
-				import jsonschema : genParamNode = jsonSchemaOf, applyUdaFacets, GeneratorSettings;
+				// A tool input models an optional parameter as a bare type absent
+				// from `required` (the convention the MCP reference servers use),
+				// not as a union with null, so a `Nullable!T` emits the bare schema
+				// for T; optionality is carried by `required` below. Output schemas
+				// keep the honest anyOf:[T,null].
+				import jsonschema : applyUdaFacets;
 				import jsonschema.vibejson : nodeToVibeJson;
 
-				// (emitSchemaKeyword: false, inlineSubschemas: true, nullableOmitsNull: true)
-				enum GeneratorSettings paramSettings = GeneratorSettings(false, true, true);
-				auto psNode = genParamNode!(P, paramSettings)();
+				auto psNode = schemaNode!(P, true)();
 				applyUdaFacets!(__traits(getAttributes, types[i .. i + 1]))(psNode);
 				Json ps = nodeToVibeJson(psNode);
 				// Modern x-mcp-header: a method-level @mcpHeader(parameter, name)
@@ -378,13 +374,13 @@ private Json outputSchemaOf(R)() @safe
 	static if (is(R == CallToolResult) || is(R == ToolResponse) || isSomeString!R || is(R == void))
 		return Json.undefined;
 	else static if (is(R == struct))
-		return jsonSchemaOf!R;
+		return schemaOf!(R, false);
 	else
 	{
 		Json s = Json.emptyObject;
 		s["type"] = "object";
 		Json props = Json.emptyObject;
-		props["result"] = jsonSchemaOf!R;
+		props["result"] = schemaOf!(R, false);
 		s["properties"] = props;
 		s["required"] = Json([Json("result")]);
 		return s;
@@ -2424,6 +2420,86 @@ unittest  // struct param missing a required field names the field without seria
 	const msg = r["content"][0]["text"].get!string;
 	assert(msg.canFind("'q'"), msg);
 	assert(!msg.canFind("Policy"), msg);
+}
+
+version (unittest)
+{
+	import vibe.data.serialization : vibeName = name, vibeOptional = optional;
+
+	private struct Renamed
+	{
+		@vibeName("type") string type_;
+		@vibeOptional int opt;
+		string class_;
+	}
+
+	private final class RenamedApi
+	{
+		@tool("renamed", "Tool whose struct param uses vibe field UDAs")
+		string renamed(Renamed o) @safe
+		{
+			return o.type_ ~ "/" ~ o.class_;
+		}
+
+		@tool("echoRenamed", "Tool returning a struct that uses vibe field UDAs")
+		Renamed echoRenamed() @safe
+		{
+			return Renamed("t", 1, "c");
+		}
+	}
+
+	private Json renamedTool(string toolName) @safe
+	{
+		auto s = new McpServer("t", "1");
+		registerHandlers(s, new RenamedApi);
+		auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+		foreach (i; 0 .. tools.length)
+			if (tools[i]["name"].get!string == toolName)
+				return tools[i];
+		assert(false, "tool not listed: " ~ toolName);
+	}
+}
+
+unittest  // struct param schema keys fields by their serialized name
+{
+	auto props = renamedTool("renamed")["inputSchema"]["properties"]["o"]["properties"];
+	assert("type" in props && "type_" !in props, props.toString);
+	assert("class" in props && "class_" !in props, props.toString);
+}
+
+unittest  // struct param schema does not require an @optional field
+{
+	auto req = renamedTool("renamed")["inputSchema"]["properties"]["o"]["required"];
+	assert(req == Json([Json("type"), Json("class")]), req.toString);
+}
+
+unittest  // a struct param using vibe field UDAs is callable under input-schema validation
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new RenamedApi);
+	Json p = Json.emptyObject;
+	p["name"] = "renamed";
+	p["arguments"] = parseJsonString(`{"o":{"type":"x","class":"y"}}`);
+	auto r = s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+	assert("isError" !in r, r.toString);
+	assert(r["content"][0]["text"].get!string == "x/y");
+}
+
+unittest  // a struct return using vibe field UDAs passes its own outputSchema validation
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableOutputSchemaValidation();
+	registerHandlers(s, new RenamedApi);
+	Json p = Json.emptyObject;
+	p["name"] = "echoRenamed";
+	p["arguments"] = Json.emptyObject;
+	auto r = s.handle(Message(makeRequest(Json(1), "tools/call", p))).get;
+	assert("error" !in r, r.toString);
+	assert(r["result"]["structuredContent"]["type"].get!string == "t");
 }
 
 unittest  // argsAs honours struct field defaults and Nullable fields

@@ -1,6 +1,7 @@
-/// JSON → D argument binding for the reflection layer.
+/// JSON Schema derivation and JSON → D argument binding for the reflection
+/// layer, kept in one module so the two always agree.
 ///
-/// `bindJson!T` converts an inbound JSON value into `T` following the same
+/// `schemaOf!T` describes `T` the way vibe serializes it, and `bindJson!T` converts an inbound JSON value into `T` following the same
 /// optionality rules the reflected input schema advertises: a struct field is
 /// required unless it is `Nullable`, carries vibe's `@optional`, or has a
 /// declared default (a `@schemaDefault` UDA or an initializer differing from its
@@ -13,6 +14,7 @@ module mcp.api.binding;
 import std.traits;
 import std.typecons : Nullable;
 
+import jsonschema.node : JsonNode;
 import vibe.data.json : Json;
 
 @safe:
@@ -101,138 +103,249 @@ package(mcp) template isRequiredField(T, string field)
 			enum staticIndexOfField = staticIndexOf!(field, FieldNameTuple!T);
 		}
 
-		/// Bind the JSON value `v` to `T`. `path` is the location of `v` relative to the
-		/// top-level value (empty at the top) and prefixes error messages. Throws
-		/// `BindException` for a shape or value that does not fit `T`.
-		package(mcp) T bindJson(T)(Json v, string path = "")
+		/// The JSON Schema for `T` as vibe (de)serializes it, fully inlined. Struct
+		/// fields are keyed by `wireFieldName`, listed in `required` per
+		/// `isRequiredField`, and carry their `@fieldDescription` and facet UDAs. With
+		/// `omitNull` a `Nullable!U` is described by the bare schema of `U` (an input
+		/// models optionality through `required`); otherwise it is `anyOf: [U, null]`.
+		/// Scalars, enums, and custom-serialized types come from the `jsonschema`
+		/// generator.
+		package(mcp) Json schemaOf(T, bool omitNull)()
 		{
+			import jsonschema.vibejson : nodeToVibeJson;
+
+			return nodeToVibeJson(schemaNode!(T, omitNull)());
+		}
+
+		/// `schemaOf` in the `jsonschema` IR, so facet UDAs can be folded onto the
+		/// result before rendering. `Ancestors` are the enclosing struct types, used to
+		/// reject recursive types, which an inlined schema cannot describe.
+		package(mcp) JsonNode schemaNode(T, bool omitNull, Ancestors...)()
+		{
+			import std.meta : staticIndexOf;
 			import std.sumtype : isSumType;
 
 			static if (is(T == Json))
-				return v;
+				return JsonNode.emptyObject();
 			else static if (isInstanceOf!(Nullable, T))
 				{
-				if (v.type == Json.Type.null_ || v.type == Json.Type.undefined)
-					return T.init;
-				return T(bindJson!(TemplateArgsOf!T[0])(v, path));
+				auto inner = schemaNode!(TemplateArgsOf!T[0], omitNull, Ancestors)();
+				static if (omitNull)
+					return inner;
+				else
+					{
+					auto anyOf = JsonNode.emptyArray();
+					anyOf.append(inner);
+					anyOf.append(typeNode("null"));
+					auto s = JsonNode.emptyObject();
+					s.set("anyOf", anyOf);
+					return s;
+				}
+			}
+			else static if (isSumType!T)
+				{
+				auto anyOf = JsonNode.emptyArray();
+				static foreach (V; TemplateArgsOf!T)
+					anyOf.append(schemaNode!(V, omitNull, Ancestors)());
+				auto s = JsonNode.emptyObject();
+				s.set("anyOf", anyOf);
+				return s;
 			}
 			else static if (isFieldwiseStruct!T)
 				{
-				if (v.type != Json.Type.object)
-					throw new BindException(located(path, "expected a JSON object"));
-				T result = T.init;
+				import jsonschema : applyUdaFacets, fieldDescription;
+
+				static assert(staticIndexOf!(T, Ancestors) < 0,
+					"cannot derive an inline JSON Schema for the recursive type " ~ T.stringof);
+				auto s = typeNode("object");
+				auto props = JsonNode.emptyObject();
+				auto required = JsonNode.emptyArray();
 				static foreach (field; FieldNameTuple!T)
 					{
 					static if (isBoundField!(T, field))
 						{
 						{
-							alias FT = typeof(__traits(getMember, T, field));
-							enum key = wireFieldName!(T, field);
-							const fieldPath = path.length ? path ~ "." ~ key : key;
-							auto p = key in v;
-							static if (is(FT == Json))
-								const present = p !is null && p.type != Json.Type.undefined;
-							else
-								const present = p !is null && p.type != Json.Type.null_
-									&& p.type != Json.Type.undefined;
-							if (present)
-								__traits(getMember, result, field) = bindJson!FT(*p, fieldPath);
-							else static if (isRequiredField!(T, field))
-								throw new BindException("missing required field '" ~ fieldPath ~ "'");
+							alias member = __traits(getMember, T, field);
+							auto prop = schemaNode!(typeof(member), omitNull, Ancestors, T)();
+							static if (hasUDA!(member, fieldDescription))
+								prop.set("description", JsonNode(getUDAs!(member,
+									fieldDescription)[0].value));
+							applyUdaFacets!(__traits(getAttributes, member))(prop);
+							props.set(wireFieldName!(T, field), prop);
+							static if (isRequiredField!(T, field))
+								required.append(JsonNode(wireFieldName!(T, field)));
 						}
 					}
 				}
-				return result;
+				s.set("properties", props);
+				if (required.array_.length)
+					s.set("required", required);
+				return s;
 			}
 			else static if (isArray!T && !isSomeString!T)
 				{
-				import std.conv : to;
-
-				if (v.type != Json.Type.array)
-					throw new BindException(located(path, "expected a JSON array"));
-				alias E = typeof(T.init[0]);
-				static if (isStaticArray!T)
-					{
-					if (v.length != T.length)
-						throw new BindException(located(path, "expected "
-							~ T.length.to!string ~ " elements, got " ~ v.length.to!string));
-					T result;
-				}
-				else
-					auto result = new E[v.length];
-				foreach (idx; 0 .. v.length)
-					result[idx] = bindJson!E(v[idx], path ~ "[" ~ idx.to!string ~ "]");
-				return result;
+				auto s = typeNode("array");
+				s.set("items", schemaNode!(typeof(T.init[0]), omitNull, Ancestors)());
+				return s;
 			}
 			else static if (isAssociativeArray!T && isSomeString!(KeyType!T))
 				{
-				if (v.type != Json.Type.object)
-					throw new BindException(located(path, "expected a JSON object"));
-				import std.conv : to;
-
-				T result;
-				foreach (kv; v.byKeyValue)
-					result[kv.key.to!(KeyType!T)] = bindJson!(ValueType!T)(kv.value,
-						path.length ? path ~ "." ~ kv.key : kv.key);
-				return result;
+				auto s = typeNode("object");
+				s.set("additionalProperties", schemaNode!(ValueType!T, omitNull, Ancestors)());
+				return s;
 			}
 			else
-				return bindLeaf!T(v, path);
-		}
+				{
+				import jsonschema : generate = jsonSchemaOf, GeneratorSettings;
 
-		/// Bind a scalar, enum, or vibe-custom-serialized value through vibe with enums
-		/// read by member name.
-		private T bindLeaf(T)(Json v, string path)
-		{
-			import mcp.api.reflection : EnumByNamePolicy;
-			import vibe.data.json : JsonSerializer;
-			import vibe.data.serialization : deserializeWithPolicy;
-
-			try
-				return () @trusted {
-				return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(v);
-			}();
-			catch (Exception e)
-				throw new BindException(located(path, e.msg));
-		}
-
-		private string located(string path, string msg) pure nothrow
-		{
-			return path.length ? "field '" ~ path ~ "': " ~ msg : msg;
-		}
-
-		unittest  // bindJson fills omitted defaulted and Nullable fields from the struct's defaults
-		{
-			import vibe.data.json : parseJsonString;
-
-			static struct S
-			{
-				string q;
-				int limit = 10;
-				Nullable!int offset;
+				enum GeneratorSettings settings = {
+					inlineSubschemas: true,
+					nullableOmitsNull: omitNull
+					};
+					return generate!(T, settings)();
+				}
 			}
 
-			auto s = bindJson!S(parseJsonString(`{"q":"x"}`));
-			assert(s.q == "x" && s.limit == 10 && s.offset.isNull);
-		}
-
-		unittest  // bindJson reports the dotted path of a missing nested field
-		{
-			import std.exception : collectException;
-			import vibe.data.json : parseJsonString;
-
-			static struct Inner
+			private JsonNode typeNode(string type) pure
 			{
-				int n;
+				auto s = JsonNode.emptyObject();
+				s.set("type", JsonNode(type));
+				return s;
 			}
 
-			static struct Outer
+			/// Bind the JSON value `v` to `T`. `path` is the location of `v` relative to the
+			/// top-level value (empty at the top) and prefixes error messages. Throws
+			/// `BindException` for a shape or value that does not fit `T`.
+			package(mcp) T bindJson(T)(Json v, string path = "")
 			{
-				Inner[] items;
+				import std.sumtype : isSumType;
+
+				static if (is(T == Json))
+					return v;
+				else static if (isInstanceOf!(Nullable, T))
+					{
+					if (v.type == Json.Type.null_ || v.type == Json.Type.undefined)
+						return T.init;
+					return T(bindJson!(TemplateArgsOf!T[0])(v, path));
+				}
+				else static if (isFieldwiseStruct!T)
+					{
+					if (v.type != Json.Type.object)
+						throw new BindException(located(path, "expected a JSON object"));
+					T result = T.init;
+					static foreach (field; FieldNameTuple!T)
+						{
+						static if (isBoundField!(T, field))
+							{
+							{
+								alias FT = typeof(__traits(getMember, T, field));
+								enum key = wireFieldName!(T, field);
+								const fieldPath = path.length ? path ~ "." ~ key : key;
+								auto p = key in v;
+								static if (is(FT == Json))
+									const present = p !is null && p.type != Json.Type.undefined;
+								else
+									const present = p !is null && p.type != Json.Type.null_
+										&& p.type != Json.Type.undefined;
+								if (present)
+									__traits(getMember, result, field) = bindJson!FT(*p, fieldPath);
+								else static if (isRequiredField!(T, field))
+									throw new BindException(
+										"missing required field '" ~ fieldPath ~ "'");
+							}
+						}
+					}
+					return result;
+				}
+				else static if (isArray!T && !isSomeString!T)
+					{
+					import std.conv : to;
+
+					if (v.type != Json.Type.array)
+						throw new BindException(located(path, "expected a JSON array"));
+					alias E = typeof(T.init[0]);
+					static if (isStaticArray!T)
+						{
+						if (v.length != T.length)
+							throw new BindException(located(path, "expected "
+								~ T.length.to!string ~ " elements, got " ~ v.length.to!string));
+						T result;
+					}
+					else
+						auto result = new E[v.length];
+					foreach (idx; 0 .. v.length)
+						result[idx] = bindJson!E(v[idx], path ~ "[" ~ idx.to!string ~ "]");
+					return result;
+				}
+				else static if (isAssociativeArray!T && isSomeString!(KeyType!T))
+					{
+					if (v.type != Json.Type.object)
+						throw new BindException(located(path, "expected a JSON object"));
+					import std.conv : to;
+
+					T result;
+					foreach (kv; v.byKeyValue)
+						result[kv.key.to!(KeyType!T)] = bindJson!(ValueType!T)(kv.value,
+							path.length ? path ~ "." ~ kv.key : kv.key);
+					return result;
+				}
+				else
+					return bindLeaf!T(v, path);
 			}
 
-			auto e = collectException!BindException(
-				bindJson!Outer(parseJsonString(`{"items":[{"n":1},{}]}`)));
-			assert(e !is null);
-			assert(e.msg == "missing required field 'items[1].n'", e.msg);
-		}
+			/// Bind a scalar, enum, or vibe-custom-serialized value through vibe with enums
+			/// read by member name.
+			private T bindLeaf(T)(Json v, string path)
+			{
+				import mcp.api.reflection : EnumByNamePolicy;
+				import vibe.data.json : JsonSerializer;
+				import vibe.data.serialization : deserializeWithPolicy;
+
+				try
+					return () @trusted {
+					return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(v);
+				}();
+				catch (Exception e)
+					throw new BindException(located(path, e.msg));
+			}
+
+			private string located(string path, string msg) pure nothrow
+			{
+				return path.length ? "field '" ~ path ~ "': " ~ msg : msg;
+			}
+
+			unittest  // bindJson fills omitted defaulted and Nullable fields from the struct's defaults
+			{
+				import vibe.data.json : parseJsonString;
+
+				static struct S
+				{
+					string q;
+					int limit = 10;
+					Nullable!int offset;
+				}
+
+				auto s = bindJson!S(parseJsonString(`{"q":"x"}`));
+				assert(s.q == "x" && s.limit == 10 && s.offset.isNull);
+			}
+
+			unittest  // bindJson reports the dotted path of a missing nested field
+			{
+				import std.exception : collectException;
+				import vibe.data.json : parseJsonString;
+
+				static struct Inner
+				{
+					int n;
+				}
+
+				static struct Outer
+				{
+					Inner[] items;
+				}
+
+				auto e = collectException!BindException(
+					bindJson!Outer(parseJsonString(`{"items":[{"n":1},{}]}`)));
+				assert(e !is null);
+				assert(e.msg == "missing required field 'items[1].n'", e.msg);
+			}
