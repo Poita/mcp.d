@@ -263,6 +263,11 @@ void runStdio(McpServer server, StdioOptions opts)
 /// and never closed, so a caller that keeps running after `runStdio` returns
 /// inherits an open, blocking stdin/stdout.
 ///
+/// On POSIX, while the transport runs fd 1 points at stderr (the transport writes
+/// through its own dup), so a stray `writeln` or a stdout logger in a handler
+/// shows up on stderr rather than corrupting the JSON-RPC stream. fd 1 is pointed
+/// back at the real stdout on return.
+///
 /// stdin (fd 0) and stdout (fd 1) are adopted as vibe-async pipes
 /// (`eventDriver.pipes.adopt`, the same mechanism `vibe.core.process` uses for a
 /// spawned child), so the read loop is a plain cooperative vibe task — there is
@@ -580,6 +585,46 @@ else version (Windows)
 	}
 }
 
+/// Points a descriptor at another open file for the duration of the transport and
+/// puts it back afterwards. runStdio diverts fd 1 to fd 2 once it holds its own
+/// dup of stdout, so any stray stdout write (a logger, a `writeln` in a handler)
+/// lands on stderr instead of corrupting the JSON-RPC stream.
+version (Posix) private struct FdDiversion
+{
+	private int fd = -1;
+	private int saved = -1;
+
+	/// Save a dup of `fd`, then make `fd` refer to the file `to` refers to.
+	static FdDiversion divert(int fd, int to) @safe
+	{
+		import core.sys.posix.unistd : dup, dup2, close;
+
+		FdDiversion d;
+		const saved = () @trusted { return dup(fd); }();
+		if (saved == -1)
+			return d;
+		if (()@trusted { return dup2(to, fd); }() == -1)
+		{
+			() @trusted { close(saved); }();
+			return d;
+		}
+		d.fd = fd;
+		d.saved = saved;
+		return d;
+	}
+
+	/// Point the diverted descriptor back at its original file.
+	void restore() @safe
+	{
+		import core.sys.posix.unistd : dup2, close;
+
+		if (saved == -1)
+			return;
+		() @trusted { dup2(saved, fd); close(saved); }();
+		saved = -1;
+	}
+}
+
 /// Owns the dup()'d, vibe-adopted copies of fd 0/1 plus the saved descriptor flags
 /// of the real fd 0/1, encapsulating runStdio's fd lifecycle ceremony.
 ///
@@ -594,6 +639,7 @@ version (Posix)
 	StdioEnd outFD;
 	private int inFlags;
 	private int outFlags;
+	private FdDiversion stdoutDiversion;
 
 	/// Adopt dup()'d copies of fd 0/1 rather than fd 0/1 themselves. `releaseRef`
 	/// close()s the adopted fd on return; by adopting dups we close only the dups,
@@ -648,6 +694,13 @@ version (Posix)
 				() @trusted { close(out2); }();
 			throw new Exception("runStdio: failed to adopt stdin/stdout dups");
 		}
+
+		// The transport now writes through its own dup of stdout; everything else
+		// that writes to fd 1 goes to stderr so it cannot corrupt the stream.
+		() @trusted { import core.stdc.stdio : fflush, stdout;
+
+		fflush(stdout); }();
+		a.stdoutDiversion = FdDiversion.divert(1, 2);
 		return a;
 	}
 
@@ -659,6 +712,10 @@ version (Posix)
 	{
 		import core.sys.posix.fcntl : fcntl, F_SETFL;
 
+		() @trusted { import core.stdc.stdio : fflush, stdout;
+
+		fflush(stdout); }();
+		stdoutDiversion.restore();
 		() @trusted {
 			if (inFlags != -1)
 				fcntl(0, F_SETFL, inFlags);
@@ -975,6 +1032,39 @@ version (Posix) unittest  // runStdio's adopt/releaseRef cycle leaves the origin
 	const postNonBlock = (postFlags & O_NONBLOCK) != 0;
 	assert(postNonBlock == preNonBlock,
 			"original fd's O_NONBLOCK bit changed across the adopt/releaseRef cycle");
+}
+
+version (Posix) unittest  // FdDiversion sends writes on the diverted fd elsewhere, then restores it
+{
+	import core.sys.posix.unistd : close, dup, pipe, read, write;
+
+	int[2] protocol, diag;
+	assert(() @trusted { return pipe(protocol) == 0 && pipe(diag) == 0; }());
+	// `fd` models fd 1: a descriptor that initially writes to the protocol pipe.
+	const fd = () @trusted { return dup(protocol[1]); }();
+	scope (exit)
+		() @trusted {
+		close(fd);
+		close(protocol[0]);
+		close(protocol[1]);
+		close(diag[0]);
+		close(diag[1]);
+	}();
+
+	string readSome(int from) @trusted
+	{
+		char[16] buf;
+		const n = read(from, buf.ptr, buf.length);
+		return n > 0 ? buf[0 .. n].idup : "";
+	}
+
+	auto diversion = FdDiversion.divert(fd, diag[1]);
+	() @trusted { write(fd, "stray".ptr, 5); }();
+	assert(readSome(diag[0]) == "stray", "a diverted write must reach the diagnostic fd");
+
+	diversion.restore();
+	() @trusted { write(fd, "frame".ptr, 5); }();
+	assert(readSome(protocol[0]) == "frame", "restore must point the fd back at its original");
 }
 
 version (Posix) unittest  // StdioEnd.adopt routes a socket fd through the sockets driver, a pipe fd through pipes
