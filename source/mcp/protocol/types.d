@@ -1207,7 +1207,8 @@ struct CallToolResult
 	/// untrusted/possibly non-conforming server, so — mirroring the inbound
 	/// `argsAs!T` accessor — a deserialization failure on a shape that does not
 	/// match `T` is likewise mapped to `invalidParams` (rather than leaking a raw
-	/// vibe exception); an `McpException` propagates unchanged.
+	/// vibe exception); an `McpException` propagates unchanged. Enum fields are
+	/// read by member name, as `structured` and the reflection layer write them.
 	T structuredContentAs(T)() const @safe
 	{
 		import mcp.protocol.errors : invalidParams;
@@ -1216,8 +1217,14 @@ struct CallToolResult
 			throw invalidParams("structuredContent: expected a JSON object, got " ~ (
 					structuredContent.type == Json.Type.undefined
 					? "no structuredContent" : "a non-object value"));
+		import mcp.api.reflection : EnumByNamePolicy;
+		import vibe.data.json : JsonSerializer;
+		import vibe.data.serialization : deserializeWithPolicy;
+
 		try
-			return () @trusted { return deserializeJson!T(structuredContent); }();
+			return () @trusted {
+			return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(structuredContent);
+		}();
 		catch (McpException e)
 			throw e;
 		catch (Exception e)
@@ -1268,15 +1275,22 @@ struct CallToolResult
 				: "Tool call returned an error result");
 	}
 
-	/// Build a `CallToolResult` whose `structuredContent` is `value` serialized via
-	/// vibe's `serializeToJson`. When `content` is null it defaults to a single
+	/// Build a `CallToolResult` whose `structuredContent` is `value` serialized
+	/// with enums written by member name, matching the reflected output schema and
+	/// `structuredContentAs!T`. When `content` is null it defaults to a single
 	/// text block carrying the JSON string of `value`, mirroring the reflection
 	/// layer's `toToolResult` behaviour so a structured result also has a
 	/// human-readable content fallback for clients that ignore `structuredContent`.
 	static CallToolResult structured(T)(T value, Content[] content = null) @safe
 	{
+		import mcp.api.reflection : EnumByNamePolicy;
+		import vibe.data.json : JsonSerializer;
+		import vibe.data.serialization : serializeWithPolicy;
+
 		CallToolResult r;
-		auto sc = () @trusted { return serializeToJson(value); }();
+		auto sc = () @trusted {
+			return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(value);
+		}();
 		r.structuredContent = sc;
 		r.content = content !is null ? content : [
 			Content.makeText(sc.toString())
@@ -1345,6 +1359,33 @@ unittest  // CallToolResult.structured!T round-trips via structuredContentAs!T
 	auto back = r.structuredContentAs!Weather;
 	assert(back.city == "Paris");
 	assert(back.tempC == 18);
+}
+
+version (unittest)
+{
+	private enum StructuredLevel
+	{
+		low,
+		high
+	}
+
+	private struct LevelReport
+	{
+		StructuredLevel lv;
+	}
+}
+
+unittest  // CallToolResult.structured!T emits enum fields by member name
+{
+	auto r = CallToolResult.structured(LevelReport(StructuredLevel.high));
+	assert(r.structuredContent["lv"].get!string == "high");
+}
+
+unittest  // structuredContentAs!T decodes enum fields from their member names
+{
+	CallToolResult r;
+	r.structuredContent = parseJsonString(`{"lv":"high"}`);
+	assert(r.structuredContentAs!LevelReport.lv == StructuredLevel.high);
 }
 
 unittest  // CallToolResult.structured!T defaults content to a JSON text block
