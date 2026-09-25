@@ -1398,6 +1398,14 @@ final class McpServer : ServerCore
 		if (!meta.protocolVersion.length
 				|| !tryParseVersion(meta.protocolVersion, mv) || !mv.isModern)
 			return false;
+		if (auto err = stdioStreamRequestError(meta))
+		{
+			writeLine(makeErrorResponse(msg.id, err).toString());
+			return true;
+		}
+		// Stdio carries one listen stream: a new listen replaces the open one,
+		// which is answered with its result so the client's request completes.
+		closeStdioListen(cs());
 
 		// Do NOT overwrite the shared session `clientCaps` here: 2026-07-28
 		// listen request's _meta capabilities are per-request and 2026-07-28
@@ -1434,6 +1442,37 @@ final class McpServer : ServerCore
 		return true;
 	}
 
+	/// The error a modern stdio stream request (`subscriptions/listen`,
+	/// `events/stream`) is answered with instead of opening its stream, applying
+	/// the same gates `handleRequest` applies to every other request: the required
+	/// `_meta` client capabilities, and the opt-in stateful lifecycle gate. Null
+	/// when the stream may open.
+	private McpException stdioStreamRequestError(RequestMeta meta) @safe
+	{
+		if (!meta.hasClientCapabilities)
+			return missingRequiredMeta([cast(string) MetaKey.clientCapabilities]);
+		if (requireInitialized_ && mode_ == ServerMode.stateful && !cs().initialized)
+			return new McpException(-32002, "Server not initialized");
+		return null;
+	}
+
+	/// Close the open stdio `subscriptions/listen` stream, if any: answer the
+	/// listen request with its `SubscriptionsListenResult`, then drop the sink,
+	/// the per-stream filter, and the per-URI subscriptions it recorded on `conn`,
+	/// so a later notify writes nothing. Returns whether a stream was open.
+	private bool closeStdioListen(ConnectionState conn) @safe
+	{
+		if (stdioListenSink is null)
+			return false;
+		stdioListenSink(subscriptionsListenResult(stdioListenSubscriptionId).toString());
+		stdioListenSink = null;
+		stdioListenSubscriptionId = Json.init;
+		foreach (u; stdioListenFilter_.resourceUris)
+			conn.subscriptions.remove(u);
+		stdioListenFilter_ = ListenFilter.init;
+		return true;
+	}
+
 	/// Serve a modern `events/stream` (push) request over stdio. Like the listen
 	/// stream it is sink-driven: it opens the subscription, writes the leading
 	/// `notifications/events/active` (and any backlog), and registers the stream so
@@ -1452,6 +1491,11 @@ final class McpServer : ServerCore
 		if (!meta.protocolVersion.length
 				|| !tryParseVersion(meta.protocolVersion, mv) || !mv.isModern)
 			return false;
+		if (auto err = stdioStreamRequestError(meta))
+		{
+			writeLine(makeErrorResponse(msg.id, err).toString());
+			return true;
+		}
 		if (eventsRuntime_ is null)
 		{
 			writeLine(makeErrorResponse(msg.id, methodNotFound("events")).toString());
@@ -2367,18 +2411,7 @@ final class McpServer : ServerCore
 			// Graceful teardown: the long-lived listen request returns its single
 			// response now — the `SubscriptionsListenResult` (modern
 			// basic/utilities/subscriptions) — before the stream closes.
-			stdioListenSink(subscriptionsListenResult(stdioListenSubscriptionId).toString());
-			stdioListenSink = null;
-			stdioListenSubscriptionId = Json.init;
-			// Drop every piece of listen state this single stdio stream recorded so
-			// a later notify*/notifyResourceUpdated writes nothing: the per-URI
-			// resource `subscriptions` (keyed by the URIs the per-stream filter
-			// opted into) and the stdio delivery filter `stdioListenFilter_`.
-			// Stdio is single-connection, so the caller is the only listener and
-			// clearing all of it is correct.
-			foreach (u; stdioListenFilter_.resourceUris)
-				conn.subscriptions.remove(u);
-			stdioListenFilter_ = ListenFilter.init;
+			closeStdioListen(conn);
 			return;
 		}
 
@@ -6257,6 +6290,87 @@ unittest  // server/discover under the modern protocol still serves the discover
 	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "disc-srv");
 }
 
+version (unittest) private Message stdioListenReq(long id, Json meta = Json.undefined) @safe
+{
+	if (meta.type == Json.Type.undefined)
+	{
+		meta = Json.emptyObject;
+		meta[MetaKey.protocolVersion] = "2026-07-28";
+		meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	}
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	return Message(makeRequest(Json(id), "subscriptions/listen", params));
+}
+
+unittest  // a second stdio subscriptions/listen closes the first with its result
+{
+	import vibe.data.json : parseJsonString;
+
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	assert(s.tryServeStdioListen(stdioListenReq(1), &sink));
+	assert(s.tryServeStdioListen(stdioListenReq(2), &sink));
+	// The first stream gets its SubscriptionsListenResult response (id 1).
+	bool firstClosed;
+	foreach (f; frames)
+	{
+		auto j = parseJsonString(f);
+		if ("id" in j && j["id"].get!long == 1 && "result" in j)
+			firstClosed = true;
+	}
+	assert(firstClosed, "the replaced listen must be answered with its result");
+
+	const before = frames.length;
+	assert(s.notifyToolsListChanged() == 1);
+	assert(frames[before].canFind(`subscriptionId":2`),
+			"notifications flow to the newest listen stream");
+}
+
+unittest  // a stdio subscriptions/listen missing _meta clientCapabilities is -32602
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	assert(s.tryServeStdioListen(stdioListenReq(1, meta), (string l) @safe {
+			frames ~= l;
+		}));
+	assert(frames.length == 1);
+	auto j = parseJsonString(frames[0]);
+	assert(j["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(s.notifyToolsListChanged() == 0, "a rejected listen must not open a stream");
+}
+
+unittest  // a stdio events/stream missing _meta clientCapabilities is -32602
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	string[] frames;
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	Json params = Json.emptyObject;
+	params["name"] = "x";
+	params["_meta"] = meta;
+	assert(s.tryServeStdioEventsStream(Message(makeRequest(Json(1),
+			"events/stream", params)), (string l) @safe { frames ~= l; }));
+	assert(frames.length == 1);
+	assert(parseJsonString(frames[0])["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
 unittest  // stdio subscriptions/listen is cancellable via notifications/cancelled
 {
 	import std.algorithm : canFind;
@@ -6272,6 +6386,7 @@ unittest  // stdio subscriptions/listen is cancellable via notifications/cancell
 
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
 	Json params = Json.emptyObject;
@@ -6313,6 +6428,7 @@ unittest  // stdio subscriptions/listen cancellation matches a string requestId 
 
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
 	Json params = Json.emptyObject;
