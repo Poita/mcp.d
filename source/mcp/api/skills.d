@@ -794,9 +794,9 @@ unittest  // registerSkill rejects supporting file paths that escape or are not 
 	import std.exception : assertThrown;
 
 	foreach (bad; [
-			"../secret.md", "a/../../b.md", "./a.md", "/abs.md", "a\\b.md",
-			"a//b.md", "", "dir/"
-		])
+		"../secret.md", "a/../../b.md", "./a.md", "/abs.md", "a\\b.md", "a//b.md",
+		"", "dir/"
+	])
 	{
 		auto s = new McpServer("t", "1");
 		assertThrown(registerSkill(s, Skill("pdf", "PDF help", "# PDF", null,

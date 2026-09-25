@@ -5883,7 +5883,7 @@ unittest  // Content.fromJson rejects a non-string type with -32602
 	import std.exception : collectException;
 
 	auto ex = cast(McpException) collectException(Content.fromJson(Json([
-				"type": Json(1)
+		"type": Json(1)
 	])));
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }
