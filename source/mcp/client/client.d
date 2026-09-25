@@ -1155,8 +1155,9 @@ final class McpClient : ClientProtocol
 			// exclude from tools/list any tool whose inputSchema carries an invalid
 			// `x-mcp-header` annotation (2026-07-28 server/tools #x-mcp-header). Validate each
 			// tool's schema and drop offenders before the result is cached, keeping
-			// siblings. stdio / legacy sessions MAY ignore x-mcp-header, so they are
-			// unaffected.
+			// siblings. A modern stdio session MAY ignore x-mcp-header; it applies the
+			// same exclusion so a server's tool set does not depend on the transport.
+			// Legacy sessions predate the annotation and are left unfiltered.
 			if (useModern)
 				a.tools = excludeInvalidHeaderTools(a.tools);
 			return a;
@@ -8373,8 +8374,8 @@ unittest  // a webhook `terminated` envelope ends the managed subscription
 	auto h = webhookHarness();
 	assert(h.sub.active);
 	h.deliver(terminatedEnvelope(Json([
-				"code": Json(-32012),
-				"message": Json("revoked")
+		"code": Json(-32012),
+		"message": Json("revoked")
 	])), "m1");
 	assert(h.controls.length == 1 && h.controls[0].kind == EventControlKind.terminated);
 	assert(!h.sub.active, "a terminated subscription must no longer report active");
@@ -8394,8 +8395,8 @@ unittest  // the webhook refresh loop stops once the subscription is terminated
 		return r.toJson();
 	};
 	h.deliver(terminatedEnvelope(Json([
-				"code": Json(-32012),
-				"message": Json("revoked")
+		"code": Json(-32012),
+		"message": Json("revoked")
 	])), "m1");
 	SubscribeResult first;
 	first.id = "sub_x";
