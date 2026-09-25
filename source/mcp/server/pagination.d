@@ -91,7 +91,7 @@ unittest  // a non-string cursor is rejected with -32602
 		size_t b, e;
 		Nullable!string next;
 		auto ex = cast(McpException) collectException(pageBounds(Json([
-					"cursor": bad
+			"cursor": bad
 		]), 10, 3, b, e, next));
 		assert(ex !is null && ex.code == ErrorCode.invalidParams, bad.toString());
 	}
