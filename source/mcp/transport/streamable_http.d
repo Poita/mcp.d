@@ -5,6 +5,7 @@ import vibe.http.router : URLRouter;
 import vibe.stream.operations : readAllUTF8;
 import vibe.data.json : Json;
 import std.typecons : Nullable;
+import core.time : Duration, seconds;
 
 import mcp.server.server;
 import mcp.protocol.jsonrpc;
@@ -250,6 +251,7 @@ void mountMcp(URLRouter router, McpServer server,
 				res.writeBody("Unknown or terminated session", "text/plain");
 				return;
 			}
+			push.closeSession(sid);
 			res.statusCode = HTTPStatus.noContent;
 			res.writeBody("", "text/plain");
 			return;
@@ -496,6 +498,25 @@ private void runSseHeartbeat(void delegate(string) @safe writeFrame) @safe
 	while (true)
 	{
 		sleep(15.seconds);
+		try
+			writeFrame(": ping\n\n");
+		catch (Exception)
+			break;
+	}
+}
+
+/// Hold a standalone GET SSE stream open until its listener is closed (the
+/// session was terminated), its session has expired or been evicted, or the
+/// client disconnects. Every `interval` it writes a comment heartbeat, which
+/// detects a disconnect, and refreshes the session's idle timer, so a client that
+/// only listens keeps its session alive.
+private void holdSessionStream(void delegate(string) @safe writeFrame, ServerPushChannel push,
+		long listenerId, SessionManager sessions, string sid, Duration interval) @safe
+{
+	while (!push.awaitClosed(listenerId, interval))
+	{
+		if (sessions !is null && sessions.stateFor(sid) is null)
+			break;
 		try
 			writeFrame(": ping\n\n");
 		catch (Exception)
@@ -1291,7 +1312,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 		}
 	}
 
-	runSseHeartbeat(writeFrame);
+	holdSessionStream(writeFrame, push, listenerId, sessions, ownerToken, 15.seconds);
 }
 
 /// Serve a modern `subscriptions/listen` request as a long-lived SSE notification
@@ -2691,6 +2712,81 @@ unittest  // legacy POST: a handler that calls ctx.listRoots() sends the request
 	// The tool-call response must now appear on the SSE stream.
 	assert(frames.length == 3, "expected tool-call response on SSE stream");
 	assert(frames[2].canFind("\"id\":10"), "tool response must echo the original request id");
+}
+
+unittest  // a session GET stream keeps its session alive and ends when the session does
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+
+	auto sessions = new SessionManager(60.msecs, 0);
+	const sid = sessions.create();
+	auto push = new ServerPushChannel(new StreamCoordinator);
+	const lid = push.addListener((string) @safe {}, Json.init, ListenFilter.init, "", null, sid);
+
+	bool ended, aliveAfterIdle;
+	runTask(() @safe nothrow{
+		try
+			holdSessionStream((string) @safe {}, push, lid, sessions, sid, 10.msecs);
+		catch (Exception)
+		{
+		}
+		ended = true;
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			// Several idle TTLs pass with no POST: the open stream keeps it alive.
+			sleep(200.msecs);
+			aliveAfterIdle = sessions.isActive(sid);
+			assert(!ended);
+			// DELETE ends the session and closes its stream.
+			sessions.terminate(sid);
+			push.closeSession(sid);
+			sleep(50.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(aliveAfterIdle, "an open GET stream must count as session activity");
+	assert(ended, "terminating the session must end its GET stream");
+}
+
+unittest  // a session GET stream ends once its session has been evicted
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+
+	auto sessions = new SessionManager;
+	const sid = sessions.create();
+	auto push = new ServerPushChannel(new StreamCoordinator);
+	const lid = push.addListener((string) @safe {}, Json.init, ListenFilter.init, "", null, sid);
+
+	bool ended;
+	runTask(() @safe nothrow{
+		try
+			holdSessionStream((string) @safe {}, push, lid, sessions, sid, 10.msecs);
+		catch (Exception)
+		{
+		}
+		ended = true;
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sessions.terminate(sid); // no closeSession: the stream notices on its own
+			sleep(80.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(ended, "a stream whose session is gone must end");
 }
 
 unittest  // legacy POST: each stream initializes its own connection on a stateful server

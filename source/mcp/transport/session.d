@@ -346,12 +346,17 @@ final class SessionManager
 		return null;
 	}
 
-	/// Terminate `id`. Returns true if the session existed (and was removed,
-	/// dropping its `ConnectionState`), false if it was unknown/already terminated.
+	/// Terminate `id`, cancelling its in-flight requests so their handlers stop
+	/// work nobody will receive. Returns true if the session existed (and was
+	/// removed, dropping its `ConnectionState`), false if it was unknown/already
+	/// terminated.
 	bool terminate(string id) @safe
 	{
 		if (id.length == 0)
 			return false;
+		if (auto p = sessions.get(id, false))
+			foreach (tok; (*p).inFlight)
+				tok.cancel();
 		return sessions.remove(id);
 	}
 
@@ -657,4 +662,16 @@ version (McpForceCsprngFailure) unittest  // create()/generateSessionId fail clo
 
 	auto mgr = new SessionManager;
 	assertThrown!McpException(mgr.create());
+}
+
+unittest  // terminate cancels the session's in-flight requests
+{
+	import mcp.server.context : CancellationToken;
+
+	auto mgr = new SessionManager;
+	const id = mgr.create();
+	auto tok = new CancellationToken;
+	mgr.stateFor(id).inFlight["i:1"] = tok;
+	assert(mgr.terminate(id));
+	assert(tok.cancelled, "a terminated session's in-flight request must be cancelled");
 }

@@ -441,6 +441,20 @@ final class ServerPushChannel : PushChannel
 		/// session), while every `subscriptions/listen` stream is its own group,
 		/// since each listen subscription is independent.
 		string group;
+		/// Signalled when the listener is removed, so the handler holding its
+		/// response open can end it promptly.
+		ListenerClosed closed;
+	}
+
+	private static final class ListenerClosed
+	{
+		LocalManualEvent evt;
+		bool done;
+
+		this() @safe
+		{
+			evt = createManualEvent();
+		}
 	}
 
 	private StreamCoordinator coord;
@@ -554,8 +568,8 @@ final class ServerPushChannel : PushChannel
 
 				id = nextListenerId++;
 				const group = filter.active ? "\0listen-" ~ id.to!string : ownerToken;
-				listeners ~= Listener(id, write, subscriptionId, filter,
-						plainEligible, ownerToken, lWriteMtx, principal, group);
+				listeners ~= Listener(id, write, subscriptionId, filter, plainEligible,
+						ownerToken, lWriteMtx, principal, group, new ListenerClosed);
 
 				long resumeOrdinal, resumeSeq;
 				// A resume is honoured only when the ordinal exists AND its recorded
@@ -655,6 +669,12 @@ final class ServerPushChannel : PushChannel
 	{
 		import std.algorithm : remove;
 
+		foreach (l; listeners)
+			if (l.id == id && !l.closed.done)
+			{
+				l.closed.done = true;
+				l.closed.evt.emit();
+			}
 		listeners = listeners.remove!(l => l.id == id);
 		if (auto ord = id in streamOf)
 			if (*ord !in history)
@@ -678,6 +698,49 @@ final class ServerPushChannel : PushChannel
 					internalError("GET SSE listener disconnected before the client responded"),
 					key.token);
 		}
+	}
+
+	/// Close every stream owned by session `token` (it was terminated or
+	/// expired): the listeners are dropped, so no further message reaches them,
+	/// and their `awaitClosed` waiters wake so the stream handlers end the
+	/// responses. Returns the number of streams closed.
+	size_t closeSession(string token) @safe
+	{
+		return () @trusted {
+			synchronized (mtx)
+			{
+				long[] ids;
+				foreach (l; listeners)
+					if (l.ownerToken == token)
+						ids ~= l.id;
+				foreach (id; ids)
+					removeListenerLocked(id);
+				return ids.length;
+			}
+		}();
+	}
+
+	/// Wait up to `timeout` for listener `id` to be removed from the channel.
+	/// Returns true once it is gone (immediately if it is not registered), false
+	/// if it is still connected when the timeout elapses.
+	bool awaitClosed(long id, Duration timeout) @safe
+	{
+		ListenerClosed closed;
+		() @trusted {
+			synchronized (mtx)
+			{
+				foreach (l; listeners)
+					if (l.id == id)
+					{
+						closed = l.closed;
+						break;
+					}
+			}
+		}();
+		if (closed is null || closed.done)
+			return true;
+		closed.evt.wait(timeout, closed.evt.emitCount);
+		return closed.done;
 	}
 
 	/// Number of currently-connected listeners.
@@ -1277,6 +1340,23 @@ unittest  // a GET carrying Last-Event-ID replays events emitted after that curs
 	assert(resumed.length == 2);
 	assert(resumed[1].canFind("\"n\":3"));
 	assert(resumed[1].startsWith("id: " ~ idLine[0 .. idLine.indexOf("-")] ~ "-"));
+}
+
+unittest  // closeSession drops only that session's streams and wakes their waiters
+{
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	const a1 = ch.addListener((string) @safe {}, Json.init, ListenFilter.init, "", null, "A");
+	const a2 = ch.addListener((string) @safe {}, Json.init, ListenFilter.init, "", null, "A");
+	const b = ch.addListener((string) @safe {}, Json.init, ListenFilter.init, "", null, "B");
+
+	assert(!ch.awaitClosed(a1, 1.msecs));
+	assert(ch.closeSession("A") == 2);
+	assert(ch.listenerCount == 1);
+	assert(ch.awaitClosed(a1, 1.seconds));
+	assert(ch.awaitClosed(a2, 1.seconds));
+	assert(!ch.awaitClosed(b, 1.msecs));
+	assert(ch.notify("notifications/message") == 1);
 }
 
 unittest  // resuming a stream evicts the stale listener still attached to it
