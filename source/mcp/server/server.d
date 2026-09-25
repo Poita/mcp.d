@@ -836,7 +836,25 @@ final class McpServer : ServerCore
 			if (tmpl[i - 2 .. i] == "}{" && uriTemplatePrefixOps.indexOf(tmpl[i]) < 0)
 				throw new Exception("resource template '" ~ descriptor.name
 						~ "' has adjacent variables that can never match: " ~ tmpl);
+		foreach (ref t; templates)
+			if (t.descriptor.uriTemplate == tmpl)
+				throw new Exception("a resource template '" ~ tmpl ~ "' is already registered");
 		templates ~= RegisteredTemplate(descriptor, reader, cache);
+	}
+
+	/// Unregister a previously registered resource template by its `uriTemplate`.
+	/// Returns `true` if a template was removed, `false` if none was registered
+	/// under that template. The mirror of `registerResourceTemplate`; pair with
+	/// `notifyResourcesListChanged` to inform connected clients.
+	bool removeResourceTemplate(string uriTemplate) @safe
+	{
+		import std.algorithm : countUntil, remove;
+
+		const i = templates.countUntil!(t => t.descriptor.uriTemplate == uriTemplate);
+		if (i < 0)
+			return false;
+		templates = templates.remove(i);
+		return true;
 	}
 
 	/// Register a *dynamic* prompt with the handler that produces its messages.
@@ -3694,6 +3712,34 @@ unittest  // an exploded {/var*} takes the remaining path segments
 	string[string] params;
 	assert(matchUriTemplate("res://x{/path*}", "res://x/a/b/c", params));
 	assert(params["path"] == "a/b/c");
+}
+
+unittest  // registerResourceTemplate rejects a duplicate uriTemplate
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	ResourceTemplate t = {uriTemplate: "res://items/{id}", name: "items"};
+	auto reader = delegate(string uri, string[string] params) @safe => ResourceContents.makeText(
+			uri, "text/plain", "x");
+	s.registerResourceTemplate(t, reader);
+	assertThrown!Exception(s.registerResourceTemplate(t, reader));
+}
+
+unittest  // removeResourceTemplate unregisters a template by its uriTemplate
+{
+	auto s = new McpServer("t", "1");
+	ResourceTemplate t = {uriTemplate: "res://items/{id}", name: "items"};
+	auto reader = delegate(string uri, string[string] params) @safe => ResourceContents.makeText(
+			uri, "text/plain", "x");
+	s.registerResourceTemplate(t, reader);
+	assert(s.removeResourceTemplate("res://items/{id}"));
+	assert(!s.removeResourceTemplate("res://items/{id}"));
+	Json p = Json.emptyObject;
+	p["uri"] = "res://items/7";
+	auto resp = s.handle(req(1, "resources/read", p)).get;
+	assert("error" in resp, "a removed template must no longer serve reads");
+	s.registerResourceTemplate(t, reader);
 }
 
 unittest  // registerResourceTemplate accepts a path variable followed by a query expression
