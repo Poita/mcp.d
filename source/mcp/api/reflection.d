@@ -283,7 +283,7 @@ private bool argPresent(Json args, string name) @safe
 /// Convert one JSON argument value into the parameter type `P`, falling back to
 /// the parameter's declared D-level default `def` when the argument is absent.
 /// `def` is the value from `ParameterDefaultValueTuple` for this slot.
-private P marshalArgDefault(P, alias def)(Json args, string name) @safe
+private P marshalArgDefault(P, alias def, bool stringArgs = false)(Json args, string name) @safe
 {
 	static if (is(P : RequestContext))
 	{
@@ -293,29 +293,29 @@ private P marshalArgDefault(P, alias def)(Json args, string name) @safe
 	{
 		if (!argPresent(args, name))
 			return def;
-		return marshalArg!P(args, name);
+		return marshalArg!(P, stringArgs)(args, name);
 	}
 }
 
-/// Convert one JSON argument value into the parameter type `P`.
-private P marshalArg(P)(Json args, string name) @safe
+/// Convert one JSON argument value into the parameter type `P`; an absent
+/// argument yields `P.init`. With `stringArgs` (prompt arguments, which the
+/// protocol types as strings) a JSON string is parsed into `P` from its text.
+private P marshalArg(P, bool stringArgs = false)(Json args, string name) @safe
 {
+	import mcp.api.binding : bindString;
+
 	static if (is(P : RequestContext))
 	{
 		assert(false, "context parameters are injected, not marshalled");
 	}
-	else static if (isInstanceOf!(Nullable, P))
-	{
-		alias Inner = TemplateArgsOf!P[0];
-		if (argPresent(args, name))
-			return P(bindJson!Inner(args[name]));
-		return P.init;
-	}
 	else
 	{
-		if (argPresent(args, name))
-			return bindJson!P(args[name]);
-		return P.init;
+		if (!argPresent(args, name))
+			return P.init;
+		static if (stringArgs)
+			if (args[name].type == Json.Type.string)
+				return bindString!P(args[name].get!string);
+		return bindJson!P(args[name]);
 	}
 }
 
@@ -844,7 +844,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 				// marshaller are passed through unchanged so an inner
 				// invalidParams is not double-wrapped.
 				try
-					argv[i] = marshalArg!P(args, names[i]);
+					argv[i] = marshalArg!(P, true)(args, names[i]);
 				catch (McpException e)
 					throw e;
 				catch (Exception e)
@@ -853,7 +853,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 			else
 			{
 				try
-					argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
+					argv[i] = marshalArgDefault!(P, defs[i], true)(args, names[i]);
 				catch (McpException e)
 					throw e;
 				catch (Exception e)
@@ -1395,6 +1395,50 @@ unittest  // @prompt integer arg given a non-numeric string -> InvalidParams (-3
 	assert("error" in resp, "expected an error for a non-numeric integer prompt argument");
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams,
 			"non-numeric integer prompt arg must map to -32602, not -32603");
+}
+
+unittest  // @prompt integer arg given its wire-form string is parsed into the D type
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DemoApi);
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "repeat";
+	pp["arguments"] = Json(["count": Json("5")]);
+	auto resp = s.handle(Message(makeRequest(Json(3), "prompts/get", pp))).get;
+	assert("error" !in resp, resp.toString);
+	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "count pos");
+}
+
+unittest  // @prompt bool, floating-point, and Nullable args are parsed from their string forms
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class TypedPromptApi
+	{
+		@prompt("typed", "Prompt with several typed arguments")
+		string typed(bool loud, double ratio, Nullable!long limit) @safe
+		{
+			import std.conv : to;
+
+			return loud.to!string ~ " " ~ ratio.to!string ~ " " ~ limit.get.to!string;
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new TypedPromptApi);
+	Json pp = Json.emptyObject;
+	pp["name"] = "typed";
+	pp["arguments"] = Json([
+		"loud": Json("true"),
+		"ratio": Json("0.5"),
+		"limit": Json("7")
+	]);
+	auto resp = s.handle(Message(makeRequest(Json(3), "prompts/get", pp))).get;
+	assert("error" !in resp, resp.toString);
+	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "true 0.5 7");
 }
 
 unittest  // @prompt string arg given JSON null -> clean InvalidParams, not vibe deserialization error

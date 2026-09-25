@@ -293,6 +293,48 @@ package(mcp) template isRequiredField(T, string field)
 					return bindLeaf!T(v, path);
 			}
 
+			/// Bind a string-typed wire value — a `prompts/get` argument or a captured URI
+			/// template variable — to `T`. Strings pass through; enums (by member name),
+			/// integers, floating-point numbers, and booleans are parsed with `std.conv.to`;
+			/// `Nullable!U` binds `U`; `std.datetime` and other string-serialized types are
+			/// read from the string itself; structs, arrays, associative arrays, and
+			/// `SumType`s are read from the string as a JSON document. Throws
+			/// `BindException` when the string does not parse as `T`.
+			package(mcp) T bindString(T)(string raw, string path = "")
+			{
+				import std.conv : to;
+				import std.sumtype : isSumType;
+				import vibe.data.json : parseJsonString;
+
+				static if (isSomeString!T)
+					return raw.to!T;
+				else static if (isInstanceOf!(Nullable, T))
+					return T(bindString!(TemplateArgsOf!T[0])(raw, path));
+				else static if (is(T == Json))
+					return Json(raw);
+				else static if (is(T == enum) || isIntegral!T || isFloatingPoint!T || is(T == bool))
+					{
+					try
+						return raw.to!T;
+					catch (Exception e)
+						throw new BindException(located(path,
+							"cannot parse '" ~ raw ~ "' as " ~ T.stringof));
+				}
+				else static if (isFieldwiseStruct!T || isSumType!T
+					|| (isArray!T && !isSomeString!T) || isAssociativeArray!T)
+					{
+					Json doc;
+					try
+						doc = parseJsonString(raw);
+					catch (Exception e)
+						throw new BindException(located(path,
+							"expected a JSON document for " ~ T.stringof));
+					return bindJson!T(doc, path);
+				}
+				else
+					return bindJson!T(Json(raw), path);
+			}
+
 			/// Bind a scalar, enum, or vibe-custom-serialized value through vibe with enums
 			/// read by member name.
 			private T bindLeaf(T)(Json v, string path)
@@ -327,6 +369,22 @@ package(mcp) template isRequiredField(T, string field)
 
 				auto s = bindJson!S(parseJsonString(`{"q":"x"}`));
 				assert(s.q == "x" && s.limit == 10 && s.offset.isNull);
+			}
+
+			unittest  // bindString parses scalars from their string forms
+			{
+				assert(bindString!int("42") == 42);
+				assert(bindString!bool("false") == false);
+				assert(bindString!(Nullable!double)("1.5").get == 1.5);
+				assert(bindString!string("5") == "5");
+			}
+
+			unittest  // bindString rejects a string that does not parse as the target type
+			{
+				import std.exception : assertThrown;
+
+				assertThrown!BindException(bindString!int("abc"));
+				assertThrown!BindException(bindString!bool("yes"));
 			}
 
 			unittest  // bindJson reports the dotted path of a missing nested field
