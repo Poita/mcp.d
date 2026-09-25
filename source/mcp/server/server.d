@@ -2564,8 +2564,6 @@ final class McpServer : ServerCore
 
 	private Json doTasksUpdate(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
-		import mcp.protocol.tasks : TaskStatus;
-
 		requireTasks(ver);
 		requireTasksDeclared(params);
 		const id = requireTaskId(params);
@@ -2574,14 +2572,11 @@ final class McpServer : ServerCore
 		taskRuntime_.deliverInput(id, responses); // throws -32602 for an unknown task
 		// Resume an executor-backed task that was waiting on this input: move it
 		// back to `working` and re-dispatch so the executor re-runs and consumes
-		// the delivered answers. Manual (executor-less) tasks are left as-is.
-		auto st = taskRuntime_.statusOf(id);
-		if (!st.isNull && st.get == TaskStatus.inputRequired
-				&& taskRuntime_.toolName(id).length > 0 && taskDispatcher_ !is null)
-		{
-			taskRuntime_.resumeWorking(id);
+		// the delivered answers. Manual (executor-less) tasks are left as-is. Of
+		// concurrent updates, only the one that wins the resume re-dispatches.
+		if (taskRuntime_.toolName(id).length > 0 && taskDispatcher_ !is null
+				&& taskRuntime_.resumeWorking(id))
 			taskDispatcher_.dispatch(id, &runTaskExecutorById);
-		}
 		return Json.emptyObject; // empty acknowledgement
 	}
 

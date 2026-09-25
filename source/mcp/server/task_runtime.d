@@ -228,12 +228,37 @@ final class TaskRuntime
 		return new McpException(ErrorCode.invalidParams, "Task not found", data);
 	}
 
-	private void touchAndStore(ref TaskRecord r) @safe
+	/// What a `modify` mutation changed.
+	private enum Change
 	{
-		r.meta.lastUpdatedAt = opts_.nowIso();
-		store_.update(r);
-		if (onStatusChange_ !is null)
-			onStatusChange_(getDetailed(r.meta.taskId), r.owner);
+		none, /// nothing: leave the record as is
+		state, /// internal state only: store it
+		status /// wire-visible state: also stamp `lastUpdatedAt` and notify
+	}
+
+	/// Atomically apply `mutate` to the stored record for `id`: read it, let
+	/// `mutate` change it, and write it back only if no other writer changed it
+	/// in between, re-reading and retrying on a lost race. Returns whether a
+	/// change was committed; throws `-32602 Task not found` for an unknown task.
+	private bool modify(string id, scope Change delegate(ref TaskRecord) @safe mutate) @safe
+	{
+		enum maxAttempts = 64;
+		foreach (_; 0 .. maxAttempts)
+		{
+			auto r = require(id);
+			const expected = r.revision;
+			const change = mutate(r);
+			if (change == Change.none)
+				return false;
+			if (change == Change.status)
+				r.meta.lastUpdatedAt = opts_.nowIso();
+			if (!store_.compareAndSwap(r, expected))
+				continue;
+			if (change == Change.status && onStatusChange_ !is null)
+				onStatusChange_(getDetailed(id), r.owner);
+			return true;
+		}
+		throw internalError("task '" ~ id ~ "' is contended; the update was not applied");
 	}
 
 	/// Whether a status is terminal (`completed`/`failed`/`cancelled`).
@@ -246,37 +271,40 @@ final class TaskRuntime
 	/// A no-op if the task is already terminal.
 	void progress(string id, string statusMessage) @safe
 	{
-		auto r = require(id);
-		if (isTerminal(r.meta.status))
-			return;
-		r.meta.statusMessage = nullable(statusMessage);
-		touchAndStore(r);
+		modify(id, (ref TaskRecord r) @safe {
+			if (isTerminal(r.meta.status))
+				return Change.none;
+			r.meta.statusMessage = nullable(statusMessage);
+			return Change.status;
+		});
 	}
 
 	/// Move a task to `completed`, storing the final result for `tasks/get`. A
 	/// no-op if the task is already terminal (e.g. a cancel landed first).
 	void complete(string id, Json result) @safe
 	{
-		auto r = require(id);
-		if (isTerminal(r.meta.status))
-			return;
-		r.meta.status = TaskStatus.completed;
-		r.result = nullable(result);
-		r.inputRequests = Json.emptyObject;
-		touchAndStore(r);
+		modify(id, (ref TaskRecord r) @safe {
+			if (isTerminal(r.meta.status))
+				return Change.none;
+			r.meta.status = TaskStatus.completed;
+			r.result = nullable(result);
+			r.inputRequests = Json.emptyObject;
+			return Change.status;
+		});
 	}
 
 	/// Move a task to `failed`, storing the JSON-RPC error for `tasks/get`. A
 	/// no-op if the task is already terminal.
 	void fail(string id, Json error) @safe
 	{
-		auto r = require(id);
-		if (isTerminal(r.meta.status))
-			return;
-		r.meta.status = TaskStatus.failed;
-		r.error = nullable(error);
-		r.inputRequests = Json.emptyObject;
-		touchAndStore(r);
+		modify(id, (ref TaskRecord r) @safe {
+			if (isTerminal(r.meta.status))
+				return Change.none;
+			r.meta.status = TaskStatus.failed;
+			r.error = nullable(error);
+			r.inputRequests = Json.emptyObject;
+			return Change.status;
+		});
 	}
 
 	/// `fail` from an `McpException`, recording its JSON-RPC `code`/`message`/`data`.
@@ -294,21 +322,22 @@ final class TaskRuntime
 	/// no-op if the task is already terminal.
 	void requireInput(string id, Json inputRequests) @safe
 	{
-		auto r = require(id);
-		if (isTerminal(r.meta.status))
-			return;
-		if (r.cancelRequested)
-		{
-			r.meta.status = TaskStatus.cancelled;
-			r.inputRequests = Json.emptyObject;
-		}
-		else
-		{
-			r.meta.status = TaskStatus.inputRequired;
-			r.inputRequests = (inputRequests.type == Json.Type.object)
-				? inputRequests : Json.emptyObject;
-		}
-		touchAndStore(r);
+		modify(id, (ref TaskRecord r) @safe {
+			if (isTerminal(r.meta.status))
+				return Change.none;
+			if (r.cancelRequested)
+			{
+				r.meta.status = TaskStatus.cancelled;
+				r.inputRequests = Json.emptyObject;
+			}
+			else
+			{
+				r.meta.status = TaskStatus.inputRequired;
+				r.inputRequests = (inputRequests.type == Json.Type.object)
+					? inputRequests : Json.emptyObject;
+			}
+			return Change.status;
+		});
 	}
 
 	/// Record that the executor handed the task off to finish out of band
@@ -317,30 +346,32 @@ final class TaskRuntime
 	/// requested cancels it now. A no-op if already terminal.
 	void markDetached(string id) @safe
 	{
-		auto r = require(id);
-		if (isTerminal(r.meta.status))
-			return;
-		if (r.cancelRequested)
-		{
-			r.meta.status = TaskStatus.cancelled;
-			touchAndStore(r);
-			return;
-		}
-		r.detached = true;
-		store_.update(r);
+		modify(id, (ref TaskRecord r) @safe {
+			if (isTerminal(r.meta.status))
+				return Change.none;
+			if (r.cancelRequested)
+			{
+				r.meta.status = TaskStatus.cancelled;
+				return Change.status;
+			}
+			r.detached = true;
+			return Change.state;
+		});
 	}
 
-	/// Move a task back to `working` (e.g. after its required input arrived). A
-	/// no-op if the task is already terminal.
-	void resumeWorking(string id) @safe
+	/// Move an `input_required` task back to `working` (e.g. after its required
+	/// input arrived). Returns whether this call made the transition, so when
+	/// several resumers race exactly one of them re-dispatches the executor.
+	bool resumeWorking(string id) @safe
 	{
-		auto r = require(id);
-		if (isTerminal(r.meta.status))
-			return;
-		r.meta.status = TaskStatus.working;
-		r.inputRequests = Json.emptyObject;
-		r.detached = false;
-		touchAndStore(r);
+		return modify(id, (ref TaskRecord r) @safe {
+			if (r.meta.status != TaskStatus.inputRequired)
+				return Change.none;
+			r.meta.status = TaskStatus.working;
+			r.inputRequests = Json.emptyObject;
+			r.detached = false;
+			return Change.status;
+		});
 	}
 
 	/// Request cancellation. Always records the cooperative `cancelRequested`
@@ -351,27 +382,29 @@ final class TaskRuntime
 	/// terminal state (cancellation is cooperative).
 	void cancel(string id) @safe
 	{
-		auto r = require(id);
-		if (isTerminal(r.meta.status))
-			return;
-		r.cancelRequested = true;
-		if (r.toolName.length == 0 || r.detached || r.meta.status == TaskStatus.inputRequired)
-		{
-			r.meta.status = TaskStatus.cancelled;
-			r.inputRequests = Json.emptyObject;
-		}
-		touchAndStore(r);
+		modify(id, (ref TaskRecord r) @safe {
+			if (isTerminal(r.meta.status))
+				return Change.none;
+			r.cancelRequested = true;
+			if (r.toolName.length == 0 || r.detached || r.meta.status == TaskStatus.inputRequired)
+			{
+				r.meta.status = TaskStatus.cancelled;
+				r.inputRequests = Json.emptyObject;
+			}
+			return Change.status;
+		});
 	}
 
 	/// Mark a task `cancelled` (used by an executor that honored a cancel
 	/// request). A no-op if already terminal.
 	void markCancelled(string id) @safe
 	{
-		auto r = require(id);
-		if (isTerminal(r.meta.status))
-			return;
-		r.meta.status = TaskStatus.cancelled;
-		touchAndStore(r);
+		modify(id, (ref TaskRecord r) @safe {
+			if (isTerminal(r.meta.status))
+				return Change.none;
+			r.meta.status = TaskStatus.cancelled;
+			return Change.status;
+		});
 	}
 
 	/// Whether cancellation was requested for `id` (cooperative check for a
@@ -386,14 +419,14 @@ final class TaskRuntime
 	/// are accepted silently (the runtime keeps the latest value per key).
 	void deliverInput(string id, Json inputResponses) @safe
 	{
-		auto r = require(id); // throws if unknown task
+		require(id); // throws if unknown task
 		if (inputResponses.type != Json.Type.object)
 			return;
-		() @trusted {
+		modify(id, (ref TaskRecord r) @trusted {
 			foreach (string k, v; inputResponses)
 				r.inputResponses[k] = v;
-		}();
-		store_.update(r);
+			return Change.state;
+		});
 	}
 
 	/// The responses delivered so far for a task (keyed by input-request key).
@@ -427,9 +460,10 @@ final class TaskRuntime
 	/// Persist a re-entry checkpoint value under `key`.
 	void putCheckpoint(string id, string key, Json value) @safe
 	{
-		auto r = require(id);
-		r.checkpoints[key] = value;
-		store_.update(r);
+		modify(id, (ref TaskRecord r) @safe {
+			r.checkpoints[key] = value;
+			return Change.state;
+		});
 	}
 
 	/// Read a previously stored checkpoint value, or `undefined` if absent.
@@ -744,4 +778,92 @@ unittest  // progress, requireInput, and resumeWorking leave a terminal task unt
 	assert("statusMessage" !in d);
 	assert(d["lastUpdatedAt"].get!string == "2026-06-07T10:00:00Z");
 	assert(notified == 0);
+}
+
+version (unittest) private final class RacingTaskStore : TaskStore
+{
+	InMemoryTaskStore inner;
+	/// Runs once, just before the next compareAndSwap, to simulate a concurrent
+	/// writer on another fiber or node.
+	void delegate() @safe beforeNextSwap;
+
+	this() @safe
+	{
+		inner = new InMemoryTaskStore();
+	}
+
+	void put(TaskRecord r) @safe
+	{
+		inner.put(r);
+	}
+
+	Nullable!TaskRecord get(string id) @safe
+	{
+		return inner.get(id);
+	}
+
+	bool compareAndSwap(TaskRecord r, ulong expected) @safe
+	{
+		if (auto hook = beforeNextSwap)
+		{
+			beforeNextSwap = null;
+			hook();
+		}
+		return inner.compareAndSwap(r, expected);
+	}
+
+	void remove(string id) @safe
+	{
+		inner.remove(id);
+	}
+
+	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe
+	{
+		return inner.removeIf(pred);
+	}
+}
+
+unittest  // a cancel racing a completion does not overwrite the stored result
+{
+	auto store = new RacingTaskStore();
+	auto rt = new TaskRuntime(store, TaskOptions.init);
+	auto t = rt.createFor("slow", Json.undefined);
+	store.beforeNextSwap = () @safe {
+		rt.complete(t.taskId, Json([
+				"structuredContent": Json(["ok": Json(true)])
+		]));
+	};
+	rt.cancel(t.taskId);
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "completed");
+	assert(d["result"]["structuredContent"]["ok"].get!bool);
+}
+
+unittest  // concurrent tasks/update deliveries both keep their answers
+{
+	auto store = new RacingTaskStore();
+	auto rt = new TaskRuntime(store, TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	rt.requireInput(t.taskId, Json([
+			"a": Json(["method": Json("elicitation/create")]),
+			"b": Json(["method": Json("elicitation/create")])
+	]));
+	store.beforeNextSwap = () @safe {
+		rt.deliverInput(t.taskId, Json(["b": Json("second")]));
+	};
+	rt.deliverInput(t.taskId, Json(["a": Json("first")]));
+	auto got = rt.takenInput(t.taskId);
+	assert(got["a"].get!string == "first");
+	assert(got["b"].get!string == "second");
+}
+
+unittest  // only one of two racing resumers moves the task back to working
+{
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	rt.requireInput(t.taskId, Json([
+			"a": Json(["method": Json("elicitation/create")])
+	]));
+	assert(rt.resumeWorking(t.taskId));
+	assert(!rt.resumeWorking(t.taskId));
 }

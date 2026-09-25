@@ -149,8 +149,9 @@ void main(string[] args) @safe
 	//   final class RedisTaskStore : TaskStore {
 	//       void put(TaskRecord r)               { redis.set(r.meta.taskId, r.toJson.toString); }
 	//       Nullable!TaskRecord get(string id)   { ... TaskRecord.fromJson(...) ... }
-	//       void update(TaskRecord r)            { redis.set(r.meta.taskId, r.toJson.toString); }
+	//       bool compareAndSwap(TaskRecord r, ulong expected) { /* WATCH id; check revision; MULTI; SET */ }
 	//       void remove(string id)               { redis.del(id); }
+	//       size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) { /* SCAN + DEL */ }
 	//   }
 	//   // A dispatcher that enqueues the task ID; a worker process running the same
 	//   // server + @task registration picks it up and runs the executor.

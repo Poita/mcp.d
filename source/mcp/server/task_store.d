@@ -38,6 +38,10 @@ struct TaskRecord
 	/// task; every later tasks/* request must come from the same principal. Empty
 	/// when the creating request was unauthenticated, which leaves the task open.
 	string owner;
+	/// Incremented by the store on every successful `compareAndSwap`; the
+	/// optimistic-concurrency token that lets writers on different fibers or
+	/// nodes detect a concurrent change instead of overwriting it.
+	ulong revision;
 	Json executorInput = Json.undefined; /// durable input, reconstituted on each dispatch
 	Json[string] checkpoints; /// re-entry state persisted via TaskContext.checkpoint
 
@@ -61,6 +65,7 @@ struct TaskRecord
 		if (detached)
 			j["detached"] = true;
 		j["toolName"] = toolName;
+		j["revision"] = revision;
 		if (owner.length)
 			j["owner"] = owner;
 		if (executorInput.type != Json.Type.undefined)
@@ -96,6 +101,8 @@ struct TaskRecord
 			&& j["detached"].get!bool;
 		if ("toolName" in j && j["toolName"].type == Json.Type.string)
 			r.toolName = j["toolName"].get!string;
+		if ("revision" in j && j["revision"].type == Json.Type.int_)
+			r.revision = j["revision"].get!ulong;
 		if ("owner" in j && j["owner"].type == Json.Type.string)
 			r.owner = j["owner"].get!string;
 		r.executorInput = ("executorInput" in j) ? cloneJson(j["executorInput"]) : Json.undefined;
@@ -135,9 +142,14 @@ interface TaskStore
 	/// The record with `taskId`, or null if unknown (or already removed/expired).
 	Nullable!TaskRecord get(string taskId) @safe;
 
-	/// Replace the stored record identified by `record.meta.taskId`. A no-op if
-	/// unknown.
-	void update(TaskRecord record) @safe;
+	/// Replace the stored record identified by `record.meta.taskId` only if its
+	/// stored `revision` still equals `expectedRevision`, storing `record` with
+	/// `revision = expectedRevision + 1`. Returns false, changing nothing, when
+	/// the record is unknown or another writer changed it first; the runtime then
+	/// re-reads and retries. A shared store implements this as one atomic
+	/// conditional write (e.g. a Redis WATCH/MULTI or a SQL `UPDATE ... WHERE
+	/// revision = ?`).
+	bool compareAndSwap(TaskRecord record, ulong expectedRevision) @safe;
 
 	/// Drop the record identified by `taskId`. A no-op if unknown.
 	void remove(string taskId) @safe;
@@ -169,10 +181,14 @@ final class InMemoryTaskStore : TaskStore
 		return Nullable!TaskRecord.init;
 	}
 
-	void update(TaskRecord record) @safe
+	bool compareAndSwap(TaskRecord record, ulong expectedRevision) @safe
 	{
-		if (record.meta.taskId in records)
-			records[record.meta.taskId] = record.toJson();
+		auto p = record.meta.taskId in records;
+		if (p is null || TaskRecord.fromJson(*p).revision != expectedRevision)
+			return false;
+		record.revision = expectedRevision + 1;
+		*p = record.toJson();
+		return true;
 	}
 
 	void remove(string taskId) @safe
@@ -244,17 +260,18 @@ unittest  // InMemoryTaskStore stores, fetches, updates, and removes a record
 
 	r.meta.status = TaskStatus.completed;
 	r.result = nullable(Json(["content": Json.emptyArray]));
-	s.update(r);
+	assert(s.compareAndSwap(r, 0));
 	auto got = s.get("id1").get;
 	assert(got.meta.status == TaskStatus.completed);
 	assert(!got.result.isNull);
+	assert(got.revision == 1);
 
 	assert(s.get("missing").isNull);
 	s.remove("id1");
 	assert(s.get("id1").isNull);
 }
 
-unittest  // update on an unknown taskId is a no-op (does not insert)
+unittest  // compareAndSwap on an unknown taskId fails and does not insert
 {
 	import mcp.protocol.tasks : TaskStatus;
 
@@ -262,8 +279,26 @@ unittest  // update on an unknown taskId is a no-op (does not insert)
 	TaskRecord r;
 	r.meta.taskId = "ghost";
 	r.meta.status = TaskStatus.working;
-	s.update(r);
+	assert(!s.compareAndSwap(r, 0));
 	assert(s.get("ghost").isNull);
+}
+
+unittest  // compareAndSwap rejects a write based on a stale revision
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	auto s = new InMemoryTaskStore();
+	TaskRecord r;
+	r.meta.taskId = "cas";
+	r.meta.status = TaskStatus.working;
+	s.put(r);
+	auto a = s.get("cas").get;
+	auto b = s.get("cas").get;
+	a.meta.status = TaskStatus.completed;
+	assert(s.compareAndSwap(a, a.revision));
+	b.meta.status = TaskStatus.cancelled;
+	assert(!s.compareAndSwap(b, b.revision));
+	assert(s.get("cas").get.meta.status == TaskStatus.completed);
 }
 
 unittest  // a returned record does not alias stored state (store boundary isolation)
@@ -277,7 +312,7 @@ unittest  // a returned record does not alias stored state (store boundary isola
 	r.inputResponses["k"] = Json("first");
 	s.put(r);
 
-	// Mutate a fetched copy; the store must be unaffected until update() is called.
+	// Mutate a fetched copy; the store must be unaffected until it is written back.
 	auto fetched = s.get("iso").get;
 	fetched.inputResponses["k"] = Json("mutated");
 	assert(s.get("iso").get.inputResponses["k"].get!string == "first");
