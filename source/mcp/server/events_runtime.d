@@ -459,6 +459,14 @@ private struct OutstandingCursor
 /// a callback origin accept MCP webhook deliveries.
 enum string wellKnownReceiverPath = "/.well-known/mcp-webhook-receiver.json";
 
+/// The outcome of checking a callback endpoint's verification before a delivery.
+private enum Verification
+{
+	verified, /// deliver now
+	failed, /// not verified; the probe failed or is backing off
+	inProgress, /// another delivery's probe for the same endpoint is in flight
+}
+
 /// The verification backoff bounds: the first probe after a failure waits this long,
 /// doubling on each failure up to the cap.
 private enum long verifyBackoffBaseMs = 30 * 1000;
@@ -527,6 +535,10 @@ final class EventsRuntime
 	private OutstandingCursor[][string] outstanding_; // subscription id -> in-flight positions, enqueue order
 	private long[string] nextFetchAt_; // subscription id -> when the poll-driven loop next fetches
 	private VerifyBackoff[string] pendingVerification_; // (principal\0url) -> next-probe backoff
+	private bool[string] verifying_; // (principal\0url) -> a challenge is in flight
+	private Delivery[][string] subscriptionRuns_; // subscription id -> leased jobs awaiting this node's run
+	private bool[string] runningSubscriptions_; // subscription ids with a delivery run in progress
+	private bool[string] localJobs_; // job ids waiting in or being delivered by a run on this node
 	private int[string] pendingCount_; // subscription id -> tracked, unsettled deliveries on this node
 	private string[string] missed_; // subscription id -> furthest position dropped undelivered, owed a gap
 
@@ -1627,19 +1639,59 @@ final class EventsRuntime
 		const leaseMs = opts_.deliveryLease.total!"msecs";
 		foreach (job; deliveryQueue_.lease(opts_.nowMs(), leaseMs))
 		{
-			// Deliver each leased job in its own task so a slow job can't expire its
-			// siblings' leases (they wait sequentially otherwise). Each task renews
-			// its own lease around every attempt.
-			opts_.deliveryExecutor(deliveryTask(job));
+			// A job already waiting in this node's run for its subscription (its
+			// lease lapsed while it queued behind siblings) is not queued twice.
+			if ((job.jobId in localJobs_) !is null)
+				continue;
+			localJobs_[job.jobId] = true;
+			subscriptionRuns_[job.subscriptionId] ~= job;
+			if ((job.subscriptionId in runningSubscriptions_) is null)
+			{
+				runningSubscriptions_[job.subscriptionId] = true;
+				opts_.deliveryExecutor(subscriptionTask(job.subscriptionId));
+			}
 		}
 	}
 
-	// A delegate delivering `job`. Built by a call so each task closes over its own
-	// copy: a closure created inside the lease loop would share the loop variable
-	// and every deferred task would deliver the last leased job.
-	private void delegate() @safe deliveryTask(Delivery job) @safe
+	// A delegate running `subId`'s delivery queue. Built by a call so each task
+	// closes over its own id rather than the lease loop's variable.
+	private void delegate() @safe subscriptionTask(string subId) @safe
 	{
-		return () @safe { deliverGuarded(job); };
+		return () @safe { runSubscription(subId); };
+	}
+
+	// Deliver `subId`'s locally leased jobs one at a time, in lease (enqueue)
+	// order, so a subscription's events never race or overtake one another and a
+	// burst of jobs for an unverified endpoint makes one verification attempt.
+	// Concurrency is thus one task per subscription with work. A job's lease is
+	// renewed as it starts, since it waited behind its siblings.
+	private void runSubscription(string subId) @safe
+	{
+		const leaseMs = opts_.deliveryLease.total!"msecs";
+		scope (exit)
+			runningSubscriptions_.remove(subId);
+		scope (failure)
+		{
+			if (auto rest = subId in subscriptionRuns_)
+				foreach (j; *rest)
+					localJobs_.remove(j.jobId);
+			subscriptionRuns_.remove(subId);
+		}
+		for (;;)
+		{
+			auto q = subId in subscriptionRuns_;
+			if (q is null || (*q).length == 0)
+			{
+				subscriptionRuns_.remove(subId);
+				return;
+			}
+			auto job = (*q)[0];
+			*q = (*q)[1 .. $];
+			scope (exit)
+				localJobs_.remove(job.jobId);
+			deliveryQueue_.renew(job.jobId, opts_.nowMs() + leaseMs);
+			deliverGuarded(job);
+		}
 	}
 
 	// Run one job's bounded retry loop, settling it even when `deliverWithRetry`
@@ -1741,7 +1793,15 @@ final class EventsRuntime
 			abandonUndelivered(job);
 			return;
 		}
-		if (!ensureVerified(s0.get))
+		const verification = ensureVerified(s0.get);
+		if (verification == Verification.inProgress)
+		{
+			// Another delivery is verifying this endpoint: retry once it has had
+			// time to finish, without counting an attempt against this job.
+			deliveryQueue_.touch(job.jobId, job.attempt, opts_.nowMs() + verifyBackoffBaseMs);
+			return;
+		}
+		if (verification == Verification.failed)
 		{
 			recordFailure(subId, DeliveryErrorCategory.challengeFailed);
 			// The endpoint may verify later: retry after a backoff, counting the
@@ -1937,18 +1997,25 @@ final class EventsRuntime
 	/// unverified endpoint is not POSTed a fresh challenge on every matching emit
 	/// (the window doubles per failure, capped) — bounding the verification flood an
 	/// attacker-supplied unresponsive URL would otherwise drive.
-	private bool ensureVerified(WebhookSubscription sub) @safe
+	private Verification ensureVerified(WebhookSubscription sub) @safe
 	{
 		if (sub.verified)
-			return true;
+			return Verification.verified;
 		const key = sub.principal ~ "\0" ~ sub.url;
 		const now = opts_.nowMs();
 		if (auto at = key in verifiedEndpoints_)
 		{
 			*at = now;
 			markVerified(sub.id);
-			return true;
+			return Verification.verified;
 		}
+		// Single-flight per endpoint: while one delivery's probe is in flight,
+		// the others wait for its outcome rather than sending their own.
+		if ((key in verifying_) !is null)
+			return Verification.inProgress;
+		verifying_[key] = true;
+		scope (exit)
+			verifying_.remove(key);
 		// A receiver that publishes its accepting paths at the callback origin has
 		// already consented: no challenge POST is needed.
 		if (opts_.wellKnownReceiverVerification && wellKnownCovers(sub.url, now))
@@ -1956,13 +2023,13 @@ final class EventsRuntime
 			verifiedEndpoints_[key] = now;
 			pendingVerification_.remove(key);
 			markVerified(sub.id);
-			return true;
+			return Verification.verified;
 		}
 		// Honour the negative-cache backoff: skip the probe (and the POST) until the
 		// window elapses, so a never-verifying endpoint is not challenged every emit.
 		if (auto b = key in pendingVerification_)
 			if (now < b.nextProbeMs)
-				return false;
+				return Verification.failed;
 
 		const nonce = randomNonce();
 		const 
@@ -1975,10 +2042,10 @@ final class EventsRuntime
 			verifiedEndpoints_[key] = now;
 			pendingVerification_.remove(key);
 			markVerified(sub.id);
-			return true;
+			return Verification.verified;
 		}
 		recordVerifyFailure(key, now);
-		return false;
+		return Verification.failed;
 	}
 
 	// Advance the verification negative-cache backoff for a `(principal, url)` after a
@@ -3990,10 +4057,18 @@ version (unittest)
 		int[] eventStatuses; // statuses for successive event deliveries (default 200)
 		int eventCount;
 		int throwEvents; // this many event deliveries throw instead of answering
+		void delegate() @safe duringPost; // run once inside the next POST, as a yield would
+		int eventDepth, maxEventDepth; // event POSTs in progress at once
 
 		WebhookHttpResult post(string url, string[string] headers, string body, bool allowPrivate) @safe
 		{
 			posts ~= Req(url, headers, body);
+			if (duringPost !is null)
+			{
+				auto hook = duringPost;
+				duringPost = null;
+				hook();
+			}
 			Json j;
 			try
 				j = parseJsonString(body);
@@ -4013,6 +4088,11 @@ version (unittest)
 				throwEvents--;
 				throw new Exception("transport failure");
 			}
+			eventDepth++;
+			scope (exit)
+				eventDepth--;
+			if (eventDepth > maxEventDepth)
+				maxEventDepth = eventDepth;
 			int status = (eventCount < eventStatuses.length) ? eventStatuses[eventCount] : 200;
 			eventCount++;
 			if (status / 100 == 2)
@@ -4417,6 +4497,20 @@ unittest  // a check function that bootstraps a webhook subscription settles the
 
 unittest  // the watermark advances to a position only once every earlier one has settled
 {
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.trackOutstanding(r.id, nullable("1"));
+	rt.trackOutstanding(r.id, nullable("2"));
+	rt.recordSuccess(r.id, nullable("2")); // position 2 settles first
+	assert(rt.webhookStore().get(r.id).get.cursor == r.cursor); // 1 still in flight: unchanged
+	rt.recordSuccess(r.id, nullable("1"));
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "2"); // now both are safe
+}
+
+unittest  // a delivery yielding mid-POST does not let a sibling job of the subscription overtake it
+{
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
@@ -4426,21 +4520,71 @@ unittest  // the watermark advances to a position only once every earlier one ha
 	o.deliverySleep = (Duration d) @safe {};
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	void runPending() @safe
+	{
+		while (deferred.length)
+		{
+			auto job = deferred[0];
+			deferred = deferred[1 .. $];
+			job();
+		}
+	}
+
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
-	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
-	rt.emit(EventOccurrence("evt_1", "n", "t")); // seq 1
-	rt.emit(EventOccurrence("evt_2", "n", "t")); // seq 2
-	// Two drain kicks are queued; run them so each job gets its own deferred task.
-	deferred[0]();
-	deferred[1]();
-	auto jobs = deferred[2 .. $];
-	assert(jobs.length == 2);
-	jobs[1](); // evt_2 acks first
-	assert(rt.webhookStore().get(r.id).get.cursor == r.cursor); // evt_1 still in flight: unchanged
-	jobs[0](); // evt_1 acks
-	assert(rt.webhookStore().get(r.id).get.cursor.get == "2"); // now both are safe
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	// Every POST runs whatever else is pending, as a yielding HTTP request would.
+	void delegate() @safe yieldHook;
+	yieldHook = () @safe { ft.duringPost = yieldHook; runPending(); };
+	ft.duringPost = yieldHook;
+	runPending();
+	ft.duringPost = null;
+	import std.algorithm : canFind;
+
+	auto posts = ft.eventPosts();
+	assert(posts.length == 2 && posts[0].body.canFind("evt_1") && posts[1].body.canFind("evt_2"));
+	assert(ft.maxEventDepth == 1);
+}
+
+unittest  // concurrent deliveries to one unverified endpoint send a single challenge
+{
+	auto ft = new FakeWebhookTransport();
+	ft.echoChallenge = false;
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliverySleep = (Duration d) @safe {};
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	void runPending() @safe
+	{
+		while (deferred.length)
+		{
+			auto job = deferred[0];
+			deferred = deferred[1 .. $];
+			job();
+		}
+	}
+
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	// Two subscriptions sharing (principal, url): one endpoint to verify.
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks", Json([
+				"a": Json(1)
+	])), "user-1");
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks", Json([
+				"a": Json(2)
+	])), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	ft.duringPost = () @safe { runPending(); }; // the first challenge yields to the others
+	runPending();
+	assert(controlPostsOf(ft, "verification").length == 1);
 }
 
 unittest  // a refresh of a live subscription does not replay from the client's older cursor
@@ -4513,15 +4657,7 @@ unittest  // sweepWebhookSubscriptions drops lapsed subscriptions and fires on_u
 unittest  // events sharing a batch cursor settle the watermark together
 {
 	auto ft = new FakeWebhookTransport();
-	EventsOptions o;
-	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
-	o.allowPrivateCallbackHosts = true;
-	o.webhookTransport = ft;
-	o.deliverySleep = (Duration d) @safe {};
-	void delegate() @safe[] deferred;
-	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
-	auto rt = new EventsRuntime(null, o);
+	auto rt = engineRuntime(ft);
 	EventRegistration reg;
 	reg.descriptor.name = "email.received";
 	reg.check = (EventContext ctx) @safe {
@@ -4535,18 +4671,22 @@ unittest  // events sharing a batch cursor settle the watermark together
 	rt.register(reg);
 	auto p = webhookSub("email.received", "https://proxy/hooks");
 	p.cursor = "h0";
+	string duringSecond;
+	string id = rt.webhookId("user-1", p.delivery.url, p.name, p.arguments);
+	void delegate() @safe watch;
+	watch = () @safe {
+		ft.duringPost = watch;
+		if (ft.eventPosts().length == 2 && duringSecond.length == 0)
+			duringSecond = rt.webhookStore().get(id).get.cursor.get;
+	};
+	ft.duringPost = watch;
 	auto r = rt.subscribeWebhook(p, "user-1");
-	assert(rt.webhookStore().get(r.id).get.cursor.get == "h0"); // replay in flight
-	deferred[0](); // the drain: two per-job tasks
-	auto jobs = deferred[1 .. $];
-	assert(jobs.length == 2);
-	jobs[0]();
-	assert(rt.webhookStore().get(r.id).get.cursor.get == "h0"); // m2 still in flight
-	jobs[1]();
+	ft.duringPost = null;
+	assert(duringSecond == "h0"); // m1 acked, m2 in flight: still h0
 	assert(rt.webhookStore().get(r.id).get.cursor.get == "h1");
 }
 
-unittest  // a deferred drain delivers every leased job, each to its own task
+unittest  // a deferred drain delivers every leased job
 {
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
