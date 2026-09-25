@@ -254,7 +254,7 @@ void mountMcp(URLRouter router, McpServer server,
 				res.writeBody("Missing Mcp-Session-Id header", "text/plain");
 				return;
 			}
-			if (!sessions.terminate(sid))
+			if (!sessions.ownedBy(sid, principalOf(token)) || !sessions.terminate(sid))
 			{
 				res.statusCode = HTTPStatus.notFound;
 				res.writeBody("Unknown or terminated session", "text/plain");
@@ -1267,7 +1267,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	if (sessions !is null)
 	{
 		const sid = req.headers.get(SessionHeader, "");
-		const status = sessionStatus(sessions, sid);
+		const status = sessionStatus(sessions, sid, principal);
 		if (status != 0)
 		{
 			res.statusCode = cast(HTTPStatus) status;
@@ -1776,7 +1776,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		if (!isInit)
 		{
 			const sid = req.headers.get(SessionHeader, "");
-			const status = sessionStatus(sessions, sid);
+			const status = sessionStatus(sessions, sid, principalOf(token));
 			if (status != 0)
 			{
 				res.statusCode = cast(HTTPStatus) status;
@@ -1935,7 +1935,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 				&& msg.method == "initialize")
 		{
 			try
-				mintedSessionId = sessions.create();
+				mintedSessionId = sessions.create(principalOf(token));
 			catch (McpException e)
 			{
 				res.statusCode = HTTPStatus.internalServerError;
@@ -2120,12 +2120,13 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 ///             session ID SHOULD respond to requests without an Mcp-Session-Id
 ///             header (other than initialization) with HTTP 400 Bad Request").
 ///   - `404` — the id names an unknown or already-terminated session ("after
-///             [termination] it MUST respond ... with HTTP 404 Not Found").
-int sessionStatus(SessionManager sessions, string sessionId) @safe
+///             [termination] it MUST respond ... with HTTP 404 Not Found"), or a
+///             session created under a different authenticated `principal`.
+int sessionStatus(SessionManager sessions, string sessionId, string principal = "") @safe
 {
 	if (sessionId.length == 0)
 		return 400;
-	if (!sessions.isActive(sessionId))
+	if (!sessions.ownedBy(sessionId, principal))
 		return 404;
 	return 0;
 }
@@ -2139,6 +2140,62 @@ unittest  // missing session id -> 400, unknown -> 404, active -> 0
 	assert(sessionStatus(mgr, id) == 0);
 	mgr.terminate(id);
 	assert(sessionStatus(mgr, id) == 404);
+}
+
+unittest  // a session presented under another principal's token is unknown (404)
+{
+	auto mgr = new SessionManager;
+	const id = mgr.create("alice");
+	assert(sessionStatus(mgr, id, "alice") == 0);
+	assert(sessionStatus(mgr, id, "bob") == 404);
+	assert(sessionStatus(mgr, id, "") == 404);
+}
+
+unittest  // with auth on, a session id only works with its creator's token
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.common : HTTPMethod;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	StreamableHttpOptions opts;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = t == "tok-alice" || t == "tok-bob";
+		info.subject = t == "tok-alice" ? "alice" : "bob";
+		return info;
+	};
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server, opts);
+
+	HTTPServerResponse send(string body_, string bearer, string sid,
+			HTTPMethod method = HTTPMethod.POST) @safe
+	{
+		string[string] h = [
+			"Accept": "application/json, text/event-stream",
+			"Authorization": "Bearer " ~ bearer,
+			"MCP-Protocol-Version": "2025-11-25"
+		];
+		if (sid.length)
+			h[SessionHeader] = sid;
+		auto req = makeInitPostReq(body_, h);
+		req.method = method;
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		return res;
+	}
+
+	auto init = send(initializeBody(), "tok-alice", "");
+	const sid = init.headers[SessionHeader];
+	const ping = `{"jsonrpc":"2.0","id":2,"method":"ping"}`;
+	assert(send(ping, "tok-bob", sid).statusCode == 404,
+			"another principal must not use alice's session");
+	assert(send("", "tok-bob", sid, HTTPMethod.DELETE).statusCode == 404,
+			"another principal must not terminate alice's session");
+	assert(send(ping, "tok-alice", sid).statusCode == 200);
 }
 
 unittest  // the standalone GET SSE stream uses the same session gate as POST/DELETE

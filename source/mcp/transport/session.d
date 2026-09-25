@@ -324,7 +324,15 @@ final class SessionManager
 	// ids can never be observed through another's. The container bounds residency
 	// by idle TTL and active-session cap, evicting least-recently-active sessions
 	// so a never-DELETE client cannot grow the table without bound.
-	private BoundedExpiringMap!ConnectionState sessions;
+	private BoundedExpiringMap!Session sessions;
+
+	/// A session's state together with the authenticated principal (token
+	/// subject, "" when unauthenticated) that created it.
+	private static struct Session
+	{
+		ConnectionState state;
+		string principal;
+	}
 
 	/// Default idle TTL applied when none is configured: a stateful session left
 	/// untouched for this long is swept on the next `create`.
@@ -346,12 +354,13 @@ final class SessionManager
 	/// `Duration.zero` disables the idle sweep; `maxActive` `0` disables the cap.
 	this(Duration idleTtl, size_t maxActive) @safe
 	{
-		sessions = BoundedExpiringMap!ConnectionState(idleTtl, maxActive, null);
+		sessions = BoundedExpiringMap!Session(idleTtl, maxActive, null);
 	}
 
 	/// Generate a new cryptographically-secure session id, create and store the
-	/// per-session `ConnectionState` it owns, record it as active, and return the
-	/// id. The id is a 256-bit value rendered as lowercase hex, which satisfies the
+	/// per-session `ConnectionState` it owns, bind it to `principal` (the
+	/// authenticated subject of the `initialize` request, "" when unauthenticated),
+	/// record it as active, and return the id. The id is a 256-bit value rendered as lowercase hex, which satisfies the
 	/// spec requirement that the id "MUST only contain visible ASCII characters
 	/// (ranging from 0x21 to 0x7E)".
 	///
@@ -367,13 +376,25 @@ final class SessionManager
 	/// returning an id. vibe.d converts an escaping `McpException` to an HTTP 500;
 	/// `handlePost` additionally maps it to a JSON-RPC error response so the wire
 	/// shape matches every other error path.
-	string create() @safe
+	string create(string principal = "") @safe
 	{
 		const id = generateSessionId();
 		// put() runs the lazy idle sweep and cap eviction before inserting, so an
 		// abandoned session is reclaimed the next time any client initializes.
-		sessions.put(id, new ConnectionState);
+		sessions.put(id, Session(new ConnectionState, principal));
 		return id;
+	}
+
+	/// Whether `id` is an active session created by `principal`. A session id
+	/// presented under a different principal's token must be treated as unknown,
+	/// so possessing another client's session id does not grant use of it.
+	bool ownedBy(string id, string principal) @safe
+	{
+		if (id.length == 0)
+			return false;
+		if (auto p = sessions.get(id, false))
+			return p.principal == principal;
+		return false;
 	}
 
 	/// Whether `id` names a currently-active (non-terminated) session.
@@ -399,7 +420,7 @@ final class SessionManager
 		{
 			if (countsAsUse)
 				sessions.markUsed(id);
-			return *p;
+			return p.state;
 		}
 		return null;
 	}
@@ -413,7 +434,7 @@ final class SessionManager
 		if (id.length == 0)
 			return false;
 		if (auto p = sessions.get(id, false))
-			foreach (tok; (*p).inFlight)
+			foreach (tok; p.state.inFlight)
 				tok.cancel();
 		return sessions.remove(id);
 	}
@@ -732,6 +753,19 @@ unittest  // terminate cancels the session's in-flight requests
 	mgr.stateFor(id).inFlight["i:1"] = tok;
 	assert(mgr.terminate(id));
 	assert(tok.cancelled, "a terminated session's in-flight request must be cancelled");
+}
+
+unittest  // a session is bound to the principal that created it
+{
+	auto mgr = new SessionManager;
+	const id = mgr.create("alice");
+	assert(mgr.ownedBy(id, "alice"));
+	assert(!mgr.ownedBy(id, "bob"));
+	assert(!mgr.ownedBy(id, ""));
+	assert(!mgr.ownedBy("unknown", "alice"));
+	const anon = mgr.create();
+	assert(mgr.ownedBy(anon, ""));
+	assert(!mgr.ownedBy(anon, "alice"));
 }
 
 unittest  // BoundedExpiringMap lookups check only their own key between sweeps
