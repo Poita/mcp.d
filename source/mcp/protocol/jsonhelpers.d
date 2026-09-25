@@ -76,6 +76,35 @@ bool tryGet(T)(Json j, string key, ref T val) @safe if (!is(T : Nullable!U, U))
 	return true;
 }
 
+/// `v` as a JSON number (integer or float), for the spec `number` field `what`.
+/// Throws -32602 for any other JSON type, including a numeric string.
+double numberOrThrow(Json v, string what) @safe
+{
+	import mcp.protocol.errors : invalidParams;
+
+	switch (v.type)
+	{
+	case Json.Type.int_:
+		return cast(double) v.get!long;
+	case Json.Type.bigInt:
+		return v.to!double;
+	case Json.Type.float_:
+		return v.get!double;
+	default:
+		throw invalidParams("'" ~ what ~ "' must be a number");
+	}
+}
+
+/// `v` as a string, for the field `what`. Throws -32602 for any other JSON type.
+string stringOrThrow(Json v, string what) @safe
+{
+	import mcp.protocol.errors : invalidParams;
+
+	if (v.type != Json.Type.string)
+		throw invalidParams("'" ~ what ~ "' must be a string");
+	return v.get!string;
+}
+
 /// `Nullable` overload: assigns the unwrapped value into `val` (leaving it
 /// untouched — preserving any pre-set default — on a missing/mismatched field),
 /// so a struct's `Nullable!T` field can be filled directly without a temporary.

@@ -3,7 +3,7 @@ module mcp.protocol.capabilities;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 import mcp.protocol.versions : ProtocolVersion;
-import mcp.protocol.jsonhelpers : getOr, tryGet;
+import mcp.protocol.jsonhelpers : getOr, tryGet, stringOrThrow;
 
 @safe:
 
@@ -88,14 +88,19 @@ struct Icon
 		return j;
 	}
 
+	/// Throws -32602 when `j` is not an object or a `sizes` entry is not a string.
 	static Icon fromJson(Json j) @safe
 	{
+		import mcp.protocol.errors : invalidParams;
+
+		if (j.type != Json.Type.object)
+			throw invalidParams("an icon must be an object");
 		Icon icon;
 		icon.src = j.getOr("src", "");
 		tryGet(j, "mimeType", icon.mimeType);
 		if ("sizes" in j && j["sizes"].type == Json.Type.array)
 			foreach (i; 0 .. j["sizes"].length)
-				icon.sizes ~= j["sizes"][i].get!string;
+				icon.sizes ~= stringOrThrow(j["sizes"][i], "sizes");
 		tryGet(j, "theme", icon.theme);
 		return icon;
 	}
@@ -1280,4 +1285,23 @@ unittest  // ClientCapabilities.forVersion: sampling sub-cap only still projects
 		assert(j["sampling"].type == Json.Type.object && j["sampling"].length == 0);
 		assert("tools" !in j["sampling"]);
 	}
+}
+
+unittest  // Icon.fromJson rejects a non-string size with -32602
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	Json j = Json(["src": Json("https://x/i.png"), "sizes": Json([Json(48)])]);
+	auto ex = cast(McpException) collectException(Icon.fromJson(j));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // Icon.fromJson rejects a non-object icon with -32602
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto ex = cast(McpException) collectException(Icon.fromJson(Json(5)));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }

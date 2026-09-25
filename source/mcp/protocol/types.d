@@ -688,9 +688,15 @@ struct Content
 		return copy;
 	}
 
+	/// Throws -32602 when `j` is not an object or its `type` is not a string.
 	static Content fromJson(Json j) @safe
 	{
-		const t = ("type" in j) ? j["type"].get!string : "text";
+		import mcp.protocol.errors : invalidParams;
+		import mcp.protocol.jsonhelpers : stringOrThrow;
+
+		if (j.type != Json.Type.object)
+			throw invalidParams("a content block must be an object");
+		const t = ("type" in j) ? stringOrThrow(j["type"], "type") : "text";
 		switch (t)
 		{
 		case "text":
@@ -5829,4 +5835,22 @@ unittest  // ListResourceTemplatesResult.fromJson tolerates a missing array
 	ListResourceTemplatesResult back = ListResourceTemplatesResult.fromJson(Json.emptyObject);
 	assert(back.resourceTemplates.length == 0);
 	assert(back.nextCursor.isNull);
+}
+
+unittest  // Content.fromJson rejects a non-string type with -32602
+{
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(Content.fromJson(Json([
+				"type": Json(1)
+	])));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // Content.fromJson rejects a non-object block with -32602
+{
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(Content.fromJson(Json("text")));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }

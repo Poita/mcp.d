@@ -16,7 +16,7 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 import mcp.protocol.types : Content, ContentKind, Tool;
 import mcp.protocol.errors : McpException, invalidParams;
-import mcp.protocol.jsonhelpers : getOr, tryGet;
+import mcp.protocol.jsonhelpers : getOr, tryGet, numberOrThrow, stringOrThrow;
 
 @safe:
 
@@ -169,13 +169,14 @@ struct ModelPreferences
 				p.hints ~= ModelHint.fromJson(j["hints"][i]);
 		if ("costPriority" in j && j["costPriority"].type != Json.Type.undefined
 				&& j["costPriority"].type != Json.Type.null_)
-			p.costPriority = j["costPriority"].to!double;
+			p.costPriority = numberOrThrow(j["costPriority"], "costPriority");
 		if ("speedPriority" in j && j["speedPriority"].type != Json.Type.undefined
 				&& j["speedPriority"].type != Json.Type.null_)
-			p.speedPriority = j["speedPriority"].to!double;
+			p.speedPriority = numberOrThrow(j["speedPriority"], "speedPriority");
 		if ("intelligencePriority" in j && j["intelligencePriority"].type != Json.Type.undefined
 				&& j["intelligencePriority"].type != Json.Type.null_)
-			p.intelligencePriority = j["intelligencePriority"].to!double;
+			p.intelligencePriority = numberOrThrow(j["intelligencePriority"],
+					"intelligencePriority");
 		return p;
 	}
 
@@ -291,16 +292,16 @@ struct CreateMessageRequest
 		tryGet(j, "includeContext", r.includeContext);
 		if ("temperature" in j && j["temperature"].type != Json.Type.undefined
 				&& j["temperature"].type != Json.Type.null_)
-			r.temperature = j["temperature"].to!double;
+			r.temperature = numberOrThrow(j["temperature"], "temperature");
 		// `maxTokens` is a spec `number` (schema.ts: `maxTokens: number;`), so accept
 		// any non-null numeric representation (int, bigInt, or float) and not just an
 		// integer literal: a conformant sender may emit e.g. 100.0 (Json.Type.float_).
 		if ("maxTokens" in j && j["maxTokens"].type != Json.Type.undefined
 				&& j["maxTokens"].type != Json.Type.null_)
-			r.maxTokens = j["maxTokens"].to!long;
+			r.maxTokens = cast(long) numberOrThrow(j["maxTokens"], "maxTokens");
 		if ("stopSequences" in j && j["stopSequences"].type == Json.Type.array)
 			foreach (i; 0 .. j["stopSequences"].length)
-				r.stopSequences ~= j["stopSequences"][i].get!string;
+				r.stopSequences ~= stringOrThrow(j["stopSequences"][i], "stopSequences");
 		if ("tools" in j && j["tools"].type == Json.Type.array)
 			foreach (i; 0 .. j["tools"].length)
 				r.tools ~= Tool.fromJson(j["tools"][i]);
@@ -1296,4 +1297,37 @@ unittest  // duplicate tool_use ids with one matching tool_result are rejected
 		assert(e.code == ErrorCode.invalidParams);
 	}
 	assert(threw, "duplicate tool_use ids must be rejected");
+}
+
+unittest  // CreateMessageRequest.fromJson rejects non-numeric temperature and maxTokens with -32602
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : ErrorCode;
+
+	foreach (bad; [
+			Json(["maxTokens": Json(10), "temperature": Json("hot")]),
+			Json(["maxTokens": Json(10), "temperature": Json("0.5")]),
+			Json(["maxTokens": Json("100")]),
+			Json(["maxTokens": Json(10), "stopSequences": Json([Json(1)])])
+		])
+	{
+		auto ex = cast(McpException) collectException(CreateMessageRequest.fromJson(bad));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, bad.toString());
+	}
+	auto ok = CreateMessageRequest.fromJson(Json([
+		"maxTokens": Json(100.0),
+		"temperature": Json(1)
+	]));
+	assert(ok.maxTokens.get == 100 && ok.temperature.get == 1.0);
+}
+
+unittest  // ModelPreferences.fromJson rejects a non-numeric priority with -32602
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : ErrorCode;
+
+	auto ex = cast(McpException) collectException(
+			ModelPreferences.fromJson(Json(["costPriority": Json("high")])));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	assert(ModelPreferences.fromJson(Json(["speedPriority": Json(1)])).speedPriority.get == 1.0);
 }
