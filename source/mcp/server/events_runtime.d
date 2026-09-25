@@ -2191,7 +2191,8 @@ final class EventsRuntime
 			return;
 		string[] safe;
 		string candidate;
-		if (settleOutstanding(subId, cursor.get, safe))
+		const tracked = settleOutstanding(subId, cursor.get, safe);
+		if (tracked)
 		{
 			if (safe.length == 0)
 				return; // an earlier position is still in flight
@@ -2203,7 +2204,7 @@ final class EventsRuntime
 		if (sn.isNull)
 			return;
 		auto sub = sn.get;
-		if (cursorAdvances(sub.cursor, candidate))
+		if (cursorAdvances(sub.cursor, candidate, tracked))
 		{
 			sub.cursor = candidate;
 			webhookStore_.put(sub);
@@ -2296,22 +2297,22 @@ final class EventsRuntime
 		}
 	}
 
-	// Whether `candidate` is strictly ahead of the stored watermark `current`, by
-	// the ring-buffer sequence the cursors encode. An absent current advances to any
-	// parseable candidate; a candidate that does not parse (e.g. a foreign cursor
-	// scheme) is treated as advancing so author-supplied watermarks still settle.
-	private bool cursorAdvances(Nullable!string current, string candidate) @safe
+	// Whether settling `candidate` moves the stored watermark `current` forward.
+	// Two ring-buffer sequence cursors compare numerically. Otherwise the order is
+	// known only for a position this node `tracked` (its enqueue order places it
+	// after everything already settled), so such a position advances; an untracked
+	// one (a job from another node, or from before a restart) in a scheme that
+	// cannot be compared is ignored rather than risk moving the watermark back.
+	private bool cursorAdvances(Nullable!string current, string candidate, bool tracked) @safe
 	{
 		import mcp.server.event_store : tryParseSeq;
 
 		if (current.isNull)
 			return true;
 		long curSeq, candSeq;
-		if (!tryParseSeq(candidate, candSeq))
-			return true;
-		if (!tryParseSeq(current.get, curSeq))
-			return true;
-		return candSeq > curSeq;
+		if (tryParseSeq(candidate, candSeq) && tryParseSeq(current.get, curSeq))
+			return candSeq > curSeq;
+		return tracked;
 	}
 
 	private void recordFailure(string subId, DeliveryErrorCategory cat) @safe
@@ -5365,6 +5366,17 @@ unittest  // monotonic watermark: an out-of-order older ack does not regress the
 	// a strictly-greater ack still advances
 	rt.recordSuccess(r.id, nullable("11"));
 	assert(rt.webhookStore().get(r.id).get.cursor.get == "11");
+}
+
+unittest  // an untracked position that cannot be ordered never moves the watermark
+{
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	const before = rt.webhookStore().get(r.id).get.cursor;
+	rt.recordSuccess(r.id, nullable("cursor-from-another-node"));
+	assert(rt.webhookStore().get(r.id).get.cursor == before);
 }
 
 unittest  // no double-delivery: a concurrent drain cannot re-lease an in-flight job
