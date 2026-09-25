@@ -705,9 +705,9 @@ ClientIdMetadataDocument parseClientIdMetadataDocument(string clientIdUrl, strin
 // Consent gate (confused-deputy mitigation)
 // ===========================================================================
 
-/// Records that a user has approved a particular dynamically-registered client
-/// to be forwarded to the upstream identity provider, and answers whether a
-/// given client has already been approved.
+/// Records that a user, in one particular browser, has approved a particular
+/// client to be forwarded to the upstream identity provider, and answers whether
+/// that browser has already approved that client.
 ///
 /// Because the proxy hands every DCR client the SAME fixed upstream
 /// `client_id`, the upstream IdP can see only one client and may auto-skip its
@@ -719,23 +719,27 @@ ClientIdMetadataDocument parseClientIdMetadataDocument(string clientIdUrl, strin
 ///    each dynamically registered client before forwarding to third-party
 ///    authorization servers (which may require additional consent)."
 ///
-/// The proxy distinguishes dynamically-registered clients by their
-/// client-supplied `redirect_uri` (the only per-client identity it holds, since
-/// the `client_id` is shared). An integrator records consent for a
-/// `redirect_uri` once the user has approved that client on the proxy's own
-/// consent screen; `OAuthProxy.authorize` then refuses to build the upstream
-/// redirect until consent for that `redirect_uri` is present.
+/// Consent is keyed on two parts:
+///   * `consentSession` — an unguessable per-browser identifier the HTTP mount
+///     keeps in a cookie. Binding consent to it means an approval recorded in one
+///     browser (e.g. an attacker approving their own redirect_uri) never lets a
+///     different browser skip the consent screen.
+///   * `client` — the per-client identity: the client-supplied `redirect_uri`
+///     for a DCR client (the `client_id` is shared), or the stable `client_id`
+///     URL for a SEP-991 CIMD client.
+///
+/// An empty `consentSession` never has consent.
 interface ConsentStore
 {
-	bool hasConsent(string clientRedirectUri) @safe;
+	bool hasConsent(string consentSession, string client) @safe;
 
-	void grantConsent(string clientRedirectUri) @safe;
+	void grantConsent(string consentSession, string client) @safe;
 }
 
 /// A simple in-memory `ConsentStore` bounded against unauthenticated growth: the
-/// number of approved clients is capped, evicting the oldest approval first when
-/// the cap is reached, so the (otherwise insert-only) consent map cannot grow
-/// process memory without bound.
+/// number of approvals is capped, evicting the oldest approval first when the cap
+/// is reached, so the (otherwise insert-only) consent map cannot grow process
+/// memory without bound.
 ///
 /// NOTE: even bounded, this in-memory default is unsuitable for an
 /// internet-exposed multi-process proxy: consent is per-process and lost on
@@ -743,12 +747,18 @@ interface ConsentStore
 /// such deployments.
 final class InMemoryConsentStore : ConsentStore
 {
-	/// Maximum number of approved clients retained. When exceeded on
-	/// `grantConsent`, the oldest approval is evicted.
+	/// Maximum number of approvals retained. When exceeded on `grantConsent`, the
+	/// oldest approval is evicted.
 	enum size_t defaultMaxApprovals = 10_000;
 
-	private bool[string] approved;
-	private string[] order;
+	private static struct Key
+	{
+		string consentSession;
+		string client;
+	}
+
+	private bool[Key] approved;
+	private Key[] order;
 	private const size_t maxApprovals;
 
 	this() @safe
@@ -763,17 +773,22 @@ final class InMemoryConsentStore : ConsentStore
 		this.maxApprovals = maxApprovals;
 	}
 
-	override bool hasConsent(string clientRedirectUri) @safe
+	override bool hasConsent(string consentSession, string client) @safe
 	{
-		return (clientRedirectUri in approved) !is null;
+		if (consentSession.length == 0)
+			return false;
+		return (Key(consentSession, client) in approved) !is null;
 	}
 
-	override void grantConsent(string clientRedirectUri) @safe
+	override void grantConsent(string consentSession, string client) @safe
 	{
-		if (clientRedirectUri in approved)
+		if (consentSession.length == 0)
 			return;
-		approved[clientRedirectUri] = true;
-		order ~= clientRedirectUri;
+		const k = Key(consentSession, client);
+		if (k in approved)
+			return;
+		approved[k] = true;
+		order ~= k;
 		while (order.length > maxApprovals)
 		{
 			const oldest = order[0];
@@ -834,9 +849,9 @@ final class OAuthProxy
 	}
 
 	/// Construct with an explicit `ConsentStore` (e.g. a shared-storage backed
-	/// store for a multi-process deployment). The store records which
-	/// dynamically-registered clients (keyed by their `redirect_uri`) the user
-	/// has approved, so `authorize` can enforce the confused-deputy consent MUST.
+	/// store for a multi-process deployment). The store records which clients
+	/// each browser has approved, so `authorize` can enforce the confused-deputy
+	/// consent MUST.
 	this(OAuthProxyConfig cfg, ConsentStore consentStore) @safe
 	in (consentStore !is null)
 	{
@@ -911,21 +926,23 @@ final class OAuthProxy
 					"redirect_uri is not registered for any client");
 	}
 
-	/// Whether the dynamically-registered client identified by its
-	/// `clientRedirectUri` has already been granted user consent to be forwarded
-	/// to the upstream identity provider.
-	bool hasConsent(string clientRedirectUri) @safe
+	/// Whether the browser identified by `consentSession` has already approved
+	/// `client` (a DCR client's `redirect_uri`, or a CIMD `client_id` URL) to be
+	/// forwarded to the upstream identity provider.
+	bool hasConsent(string consentSession, string client) @safe
 	{
-		return consentStore.hasConsent(clientRedirectUri);
+		return consentStore.hasConsent(consentSession, client);
 	}
 
-	/// Record that the user has approved the dynamically-registered client
-	/// identified by its `clientRedirectUri`. Call this once the user approves on
-	/// the proxy's own consent screen; subsequent `authorize` calls for that
-	/// client will then be allowed to forward to the upstream IdP.
-	void grantConsent(string clientRedirectUri) @safe
+	/// Record that the user in the browser identified by `consentSession` has
+	/// approved `client` (a DCR client's `redirect_uri`, or a CIMD `client_id`
+	/// URL). Call this once the user approves on the proxy's own consent screen,
+	/// after verifying the approval came from that browser; subsequent
+	/// `authorize` calls from that browser for that client are then forwarded to
+	/// the upstream IdP. Other browsers still see the consent screen.
+	void grantConsent(string consentSession, string client) @safe
 	{
-		consentStore.grantConsent(clientRedirectUri);
+		consentStore.grantConsent(consentSession, client);
 	}
 
 	/// Build the upstream authorization redirect for a proxied `/authorize`,
@@ -935,14 +952,15 @@ final class OAuthProxy
 	/// `client_id` obtain user consent for EACH dynamically-registered client
 	/// before forwarding it to the third-party authorization server. This
 	/// overload enforces that: it throws `ConsentRequiredException` unless the
-	/// client (identified by its `clientRedirectUri`, the per-client identity the
-	/// proxy holds since the `client_id` is shared) has been approved via
-	/// `grantConsent`. The integrator presents a consent screen, records approval,
-	/// then retries.
-	string authorize(string clientRedirectUri, string codeChallenge, string scopeStr, string state) @safe
+	/// browser identified by `consentSession` has approved the client (identified
+	/// by its `clientRedirectUri`, the per-client identity the proxy holds since
+	/// the `client_id` is shared) via `grantConsent`. The integrator presents a
+	/// consent screen, records approval, then retries.
+	string authorize(string consentSession, string clientRedirectUri,
+			string codeChallenge, string scopeStr, string state) @safe
 	{
 		validateRedirectUri(clientRedirectUri);
-		if (!consentStore.hasConsent(clientRedirectUri))
+		if (!consentStore.hasConsent(consentSession, clientRedirectUri))
 			throw new ConsentRequiredException(clientRedirectUri);
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
 	}
@@ -1030,21 +1048,23 @@ final class OAuthProxy
 	///
 	/// The document and `clientRedirectUri` are validated against the SEP-991
 	/// AS-side MUSTs (`validateClientIdMetadata`) before anything is forwarded;
-	/// the request is then gated on per-client user consent — keyed on the stable
-	/// `client_id` URL rather than the redirect_uri, since CIMD gives the client a
-	/// durable identity — to satisfy the confused-deputy MUST (the proxy still
-	/// collapses every client onto one upstream `client_id`). Throws
-	/// `InvalidClientIdMetadataException` when CIMD is not enabled on this proxy or
-	/// the document fails validation, and `ConsentRequiredException` when the
-	/// client_id URL has not been approved via `grantConsent`.
-	string authorizeWithClientIdMetadata(string clientIdUrl, const ClientIdMetadataDocument doc,
+	/// the request is then gated on the browser's consent for the client — keyed
+	/// on the stable `client_id` URL rather than the redirect_uri, since CIMD
+	/// gives the client a durable identity — to satisfy the confused-deputy MUST
+	/// (the proxy still collapses every client onto one upstream `client_id`).
+	/// Throws `InvalidClientIdMetadataException` when CIMD is not enabled on this
+	/// proxy or the document fails validation, and `ConsentRequiredException` when
+	/// the browser identified by `consentSession` has not approved the client_id
+	/// URL via `grantConsent`.
+	string authorizeWithClientIdMetadata(string consentSession,
+			string clientIdUrl, const ClientIdMetadataDocument doc,
 			string clientRedirectUri, string codeChallenge, string scopeStr, string state) @safe
 	{
 		if (!cfg.clientIdMetadataDocumentSupported)
 			throw new InvalidClientIdMetadataException(clientIdUrl,
 					"Client ID Metadata Documents are not enabled on this proxy");
 		validateClientIdMetadata(clientIdUrl, doc, clientRedirectUri);
-		if (!consentStore.hasConsent(clientIdUrl))
+		if (!consentStore.hasConsent(consentSession, clientIdUrl))
 			throw new ConsentRequiredException(clientIdUrl);
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
 	}
@@ -1268,8 +1288,9 @@ unittest  // CIMD AUTHORIZE: with a valid doc + consent on the client_id URL, fo
 	cfg.clientIdMetadataDocumentSupported = true;
 	auto proxy = new OAuthProxy(cfg);
 	auto doc = sampleCimdDoc();
-	proxy.grantConsent("https://app.example.com/oauth/client.json");
-	auto url = proxy.authorizeWithClientIdMetadata("https://app.example.com/oauth/client.json",
+	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json");
+	auto url = proxy.authorizeWithClientIdMetadata("browser-1",
+			"https://app.example.com/oauth/client.json",
 			doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S");
 	assert(url.startsWith("https://github.com/login/oauth/authorize?"));
 	assert(url.canFind("client_id=Iv1.upstream"));
@@ -1283,7 +1304,7 @@ unittest  // CIMD AUTHORIZE: confused-deputy gate — an un-consented client_id 
 	cfg.clientIdMetadataDocumentSupported = true;
 	auto proxy = new OAuthProxy(cfg);
 	auto doc = sampleCimdDoc();
-	assertThrown!ConsentRequiredException(proxy.authorizeWithClientIdMetadata(
+	assertThrown!ConsentRequiredException(proxy.authorizeWithClientIdMetadata("browser-1",
 			"https://app.example.com/oauth/client.json",
 			doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S"));
 }
@@ -1297,9 +1318,9 @@ unittest  // CIMD AUTHORIZE: an invalid document is rejected before the consent 
 	auto proxy = new OAuthProxy(cfg);
 	auto doc = sampleCimdDoc();
 	doc.clientId = "https://app.example.com/oauth/OTHER.json"; // mismatch
-	proxy.grantConsent("https://app.example.com/oauth/client.json");
-	assertThrown!InvalidClientIdMetadataException(
-			proxy.authorizeWithClientIdMetadata("https://app.example.com/oauth/client.json",
+	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json");
+	assertThrown!InvalidClientIdMetadataException(proxy.authorizeWithClientIdMetadata("browser-1",
+			"https://app.example.com/oauth/client.json",
 			doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S"));
 }
 
@@ -1310,9 +1331,9 @@ unittest  // CIMD AUTHORIZE: refused when the proxy is not configured to support
 	auto cfg = sampleConfig(); // clientIdMetadataDocumentSupported defaults to false
 	auto proxy = new OAuthProxy(cfg);
 	auto doc = sampleCimdDoc();
-	proxy.grantConsent("https://app.example.com/oauth/client.json");
-	assertThrown!InvalidClientIdMetadataException(
-			proxy.authorizeWithClientIdMetadata("https://app.example.com/oauth/client.json",
+	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json");
+	assertThrown!InvalidClientIdMetadataException(proxy.authorizeWithClientIdMetadata("browser-1",
+			"https://app.example.com/oauth/client.json",
 			doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S"));
 }
 
@@ -1659,8 +1680,8 @@ unittest  // CONFUSED DEPUTY: gated authorize refuses to forward an un-consented
 	auto proxy = new OAuthProxy(cfg);
 	proxy.register(["http://localhost:5000/callback"]);
 	// No consent recorded yet for this dynamically-registered client.
-	assertThrown!ConsentRequiredException(
-			proxy.authorize("http://localhost:5000/callback", "CH", "read:user", "S"));
+	assertThrown!ConsentRequiredException(proxy.authorize("browser-1",
+			"http://localhost:5000/callback", "CH", "read:user", "S"));
 }
 
 unittest  // CONFUSED DEPUTY: after grantConsent the gated authorize forwards upstream
@@ -1670,8 +1691,9 @@ unittest  // CONFUSED DEPUTY: after grantConsent the gated authorize forwards up
 	auto cfg = sampleConfig();
 	auto proxy = new OAuthProxy(cfg);
 	proxy.register(["http://localhost:5000/callback"]);
-	proxy.grantConsent("http://localhost:5000/callback");
-	auto url = proxy.authorize("http://localhost:5000/callback", "CH", "read:user", "S");
+	proxy.grantConsent("browser-1", "http://localhost:5000/callback");
+	auto url = proxy.authorize("browser-1", "http://localhost:5000/callback",
+			"CH", "read:user", "S");
 	assert(url.startsWith("https://github.com/login/oauth/authorize?"));
 	assert(url.canFind("client_id=Iv1.upstream"));
 }
@@ -1685,11 +1707,11 @@ unittest  // CONFUSED DEPUTY: consent is per-client (one approval does not cover
 	proxy.register([
 		"http://localhost:5000/callback", "http://localhost:6000/callback"
 	]);
-	proxy.grantConsent("http://localhost:5000/callback");
-	assert(proxy.hasConsent("http://localhost:5000/callback"));
-	assert(!proxy.hasConsent("http://localhost:6000/callback"));
-	assertThrown!ConsentRequiredException(
-			proxy.authorize("http://localhost:6000/callback", "CH", "read:user", "S"));
+	proxy.grantConsent("browser-1", "http://localhost:5000/callback");
+	assert(proxy.hasConsent("browser-1", "http://localhost:5000/callback"));
+	assert(!proxy.hasConsent("browser-1", "http://localhost:6000/callback"));
+	assertThrown!ConsentRequiredException(proxy.authorize("browser-1",
+			"http://localhost:6000/callback", "CH", "read:user", "S"));
 }
 
 unittest  // CONFUSED DEPUTY: the exception names the client redirect_uri needing consent
@@ -1699,7 +1721,7 @@ unittest  // CONFUSED DEPUTY: the exception names the client redirect_uri needin
 	proxy.register(["http://localhost:7000/cb"]);
 	bool threw = false;
 	try
-		proxy.authorize("http://localhost:7000/cb", "CH", "s", "S");
+		proxy.authorize("browser-1", "http://localhost:7000/cb", "CH", "s", "S");
 	catch (ConsentRequiredException e)
 	{
 		threw = true;
@@ -1711,10 +1733,29 @@ unittest  // CONFUSED DEPUTY: the exception names the client redirect_uri needin
 unittest  // InMemoryConsentStore records and reports per-redirect-uri consent
 {
 	ConsentStore store = new InMemoryConsentStore();
-	assert(!store.hasConsent("http://a/cb"));
-	store.grantConsent("http://a/cb");
-	assert(store.hasConsent("http://a/cb"));
-	assert(!store.hasConsent("http://b/cb"));
+	assert(!store.hasConsent("browser-1", "http://a/cb"));
+	store.grantConsent("browser-1", "http://a/cb");
+	assert(store.hasConsent("browser-1", "http://a/cb"));
+	assert(!store.hasConsent("browser-1", "http://b/cb"));
+}
+
+unittest  // CONFUSED DEPUTY: consent granted in one browser does not cover another browser
+{
+	import std.exception : assertThrown;
+
+	auto proxy = new OAuthProxy(sampleConfig());
+	proxy.register(["https://evil.example/cb"]);
+	proxy.grantConsent("attacker-browser", "https://evil.example/cb");
+	assert(!proxy.hasConsent("victim-browser", "https://evil.example/cb"));
+	assertThrown!ConsentRequiredException(proxy.authorize("victim-browser",
+			"https://evil.example/cb", "CH", "read:user", "S"));
+}
+
+unittest  // InMemoryConsentStore never records or reports consent for an empty browser session
+{
+	ConsentStore store = new InMemoryConsentStore();
+	store.grantConsent("", "http://a/cb");
+	assert(!store.hasConsent("", "http://a/cb"));
 }
 
 unittest  // a custom ConsentStore can be injected and is consulted by authorize
@@ -1723,10 +1764,10 @@ unittest  // a custom ConsentStore can be injected and is consulted by authorize
 
 	auto cfg = sampleConfig();
 	auto store = new InMemoryConsentStore();
-	store.grantConsent("http://localhost:9000/cb");
+	store.grantConsent("browser-1", "http://localhost:9000/cb");
 	auto proxy = new OAuthProxy(cfg, store);
 	proxy.register(["http://localhost:9000/cb"]);
-	auto url = proxy.authorize("http://localhost:9000/cb", "CH", "read:user", "S");
+	auto url = proxy.authorize("browser-1", "http://localhost:9000/cb", "CH", "read:user", "S");
 	assert(url.canFind("client_id=Iv1.upstream"));
 }
 
@@ -1736,10 +1777,10 @@ unittest  // REDIRECT VALIDATION: gated authorize rejects an unregistered redire
 
 	auto cfg = sampleConfig();
 	auto proxy = new OAuthProxy(cfg);
-	proxy.grantConsent("https://attacker.example/cb");
+	proxy.grantConsent("browser-1", "https://attacker.example/cb");
 	// Consent alone must not let an unregistered redirect_uri through.
-	assertThrown!InvalidRedirectUriException(
-			proxy.authorize("https://attacker.example/cb", "CH", "read:user", "S"));
+	assertThrown!InvalidRedirectUriException(proxy.authorize("browser-1",
+			"https://attacker.example/cb", "CH", "read:user", "S"));
 }
 
 unittest  // REDIRECT VALIDATION: ungated authorizeWithoutConsent rejects an unregistered redirect_uri
@@ -1884,24 +1925,24 @@ unittest  // REDIRECT REGISTRY: an oversized redirect_uris array is truncated at
 unittest  // CONSENT STORE: the consent store caps approvals, evicting the oldest first
 {
 	auto store = new InMemoryConsentStore(2);
-	store.grantConsent("http://a/cb");
-	store.grantConsent("http://b/cb");
+	store.grantConsent("browser-1", "http://a/cb");
+	store.grantConsent("browser-1", "http://b/cb");
 	// Third approval exceeds the cap of 2: the oldest ("a") is evicted.
-	store.grantConsent("http://c/cb");
-	assert(!store.hasConsent("http://a/cb"));
-	assert(store.hasConsent("http://b/cb"));
-	assert(store.hasConsent("http://c/cb"));
+	store.grantConsent("browser-1", "http://c/cb");
+	assert(!store.hasConsent("browser-1", "http://a/cb"));
+	assert(store.hasConsent("browser-1", "http://b/cb"));
+	assert(store.hasConsent("browser-1", "http://c/cb"));
 }
 
 unittest  // CONSENT STORE: re-granting an existing consent does not consume cap headroom
 {
 	auto store = new InMemoryConsentStore(2);
-	store.grantConsent("http://a/cb");
-	store.grantConsent("http://a/cb"); // duplicate: no new slot used
-	store.grantConsent("http://b/cb");
+	store.grantConsent("browser-1", "http://a/cb");
+	store.grantConsent("browser-1", "http://a/cb"); // duplicate: no new slot used
+	store.grantConsent("browser-1", "http://b/cb");
 	// "a" must still be present: the duplicate did not push it out of the cap.
-	assert(store.hasConsent("http://a/cb"));
-	assert(store.hasConsent("http://b/cb"));
+	assert(store.hasConsent("browser-1", "http://a/cb"));
+	assert(store.hasConsent("browser-1", "http://b/cb"));
 }
 
 unittest  // REDIRECT REGISTRY: a custom registry can be injected and is consulted by authorize

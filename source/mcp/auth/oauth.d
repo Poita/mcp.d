@@ -1837,7 +1837,7 @@ bool validateAuthorizationResponseState(string responseState, string expectedSta
 /// Length-independent constant-time byte comparison. The running time depends
 /// only on the longer input's length, never on the position of the first
 /// differing byte, so it leaks no information through a timing side channel.
-private bool constantTimeEquals(scope const(char)[] a, scope const(char)[] b) @safe pure nothrow @nogc
+package(mcp) bool constantTimeEquals(scope const(char)[] a, scope const(char)[] b) @safe pure nothrow @nogc
 {
 	const n = a.length > b.length ? a.length : b.length;
 	uint diff = cast(uint)(a.length ^ b.length);

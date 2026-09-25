@@ -21,9 +21,11 @@
 ///     authorization endpoint; for an un-consented dynamically-registered client
 ///     it instead renders the proxy's own consent screen (no upstream forward).
 ///   * `POST /consent` — the consent-approval action reached from the consent
-///     screen's form submission: records user consent for the pending client
-///     (`proxy.grantConsent`) and resumes the upstream authorize 302 with the
-///     stored PKCE `code_challenge` + `scope`. A POST (not GET) so a state-changing
+///     screen's form submission: after checking the post comes from the browser
+///     that was shown the screen (consent cookie + anti-CSRF token), records that
+///     browser's consent for the pending client (`proxy.grantConsent`) and
+///     resumes the upstream authorize 302 with the stored PKCE `code_challenge`
+///     + `scope`. A POST (not GET) so a state-changing
 ///     grant cannot be auto-fired by link prefetch/preload.
 ///   * the fixed callback path (default `/auth/callback`) — receives the upstream
 ///     `code` + proxy `state`, looks up the stored client `redirect_uri`, and
@@ -162,6 +164,8 @@ struct ProxyAuthState
 	string codeChallenge; /// the client's PKCE S256 `code_challenge`, forwarded upstream
 	string scope_; /// the client's requested `scope`, forwarded upstream
 	string clientId; /// the SEP-991 CIMD `client_id` URL (empty for DCR clients); the consent identity for CIMD
+	string consentSession; /// the consent-cookie value of the browser that started this authorization
+	string csrfToken; /// the anti-CSRF token the consent form must echo back
 }
 
 /// Build the minimal HTML consent screen presented when a dynamically-registered
@@ -171,9 +175,9 @@ struct ProxyAuthState
 /// static upstream `client_id` to obtain user consent for EACH dynamically
 /// registered client before forwarding it upstream. The screen offers a single
 /// approval action: a `<form method="POST">` targeting `consentPath` and carrying
-/// the opaque proxy `state` as a hidden field. Posting it records consent and
-/// resumes the upstream redirect. Using a form POST (rather than a hyperlink GET)
-/// means link prefetch/preload cannot auto-fire the state-changing grant and the
+/// the opaque proxy `state` and the pending authorization's anti-CSRF token as
+/// hidden fields. Posting it records consent and resumes the upstream redirect.
+/// Using a form POST (rather than a hyperlink GET) means link prefetch/preload cannot auto-fire the state-changing grant and the
 /// opaque `state` is not carried in a URL that could leak via Referer/history/logs.
 ///
 /// `clientName` is the verified human-readable name from a SEP-991 Client ID
@@ -183,15 +187,16 @@ struct ProxyAuthState
 /// the spec requires the redirect URI hostname be clearly displayed during
 /// authorization, since under CIMD a localhost redirect cannot be attested.
 string consentScreenHtml(string clientName, string clientRedirectUri,
-		string consentPath, string proxyState) @safe
+		string consentPath, string proxyState, string csrfToken) @safe
 {
 	const safeName = htmlEscape(clientName);
 	const safeUri = htmlEscape(clientRedirectUri);
 	const safeAction = htmlEscape(consentPath);
 	const safeState = htmlEscape(proxyState);
+	const safeCsrf = htmlEscape(csrfToken);
 	const nameSection = clientName.length
 		? "<p>Application: <strong>" ~ safeName ~ "</strong></p>" : "";
-	return "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" ~ "<meta name=\"referrer\" content=\"no-referrer\">" ~ "<title>Authorize application</title></head><body>" ~ "<h1>Authorize application</h1>" ~ "<p>An application is requesting to sign in via this server and be" ~ " forwarded to the upstream identity provider.</p>" ~ nameSection ~ "<p>Redirect URI: <code>" ~ safeUri ~ "</code></p>" ~ "<form method=\"post\" action=\"" ~ safeAction ~ "\">" ~ "<input type=\"hidden\" name=\"state\" value=\"" ~ safeState ~ "\">" ~ "<button type=\"submit\">Approve and continue</button></form>" ~ "</body></html>";
+	return "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" ~ "<meta name=\"referrer\" content=\"no-referrer\">" ~ "<title>Authorize application</title></head><body>" ~ "<h1>Authorize application</h1>" ~ "<p>An application is requesting to sign in via this server and be" ~ " forwarded to the upstream identity provider.</p>" ~ nameSection ~ "<p>Redirect URI: <code>" ~ safeUri ~ "</code></p>" ~ "<form method=\"post\" action=\"" ~ safeAction ~ "\">" ~ "<input type=\"hidden\" name=\"state\" value=\"" ~ safeState ~ "\">" ~ "<input type=\"hidden\" name=\"csrf\" value=\"" ~ safeCsrf ~ "\">" ~ "<button type=\"submit\">Approve and continue</button></form>" ~ "</body></html>";
 }
 
 private string htmlEscape(string s) @safe
@@ -259,6 +264,49 @@ final class ProxyStateStore
 		synchronized (this)
 			return entries.length;
 	}
+}
+
+/// The cookie that identifies a browser to the consent gate when the proxy is
+/// served over https. Its value is an unguessable random handle; consent recorded
+/// under it lets only that browser skip the consent screen for an approved client.
+/// The `__Host-` prefix makes the browser reject the cookie unless it is Secure,
+/// host-only and scoped to `/`, so a sibling subdomain cannot plant one.
+enum string consentCookieName = "__Host-mcp_proxy_consent";
+
+/// The consent cookie name used when the proxy is served over plain http (a
+/// loopback development deployment), where a `__Host-` cookie cannot be set.
+enum string insecureConsentCookieName = "mcp_proxy_consent";
+
+/// How long a browser's consent cookie lives. A browser whose cookie has expired
+/// is shown the consent screen again.
+private enum long consentCookieMaxAgeSeconds = 30L * 24 * 60 * 60;
+
+private string consentCookieNameFor(bool secure) @safe
+{
+	return secure ? consentCookieName : insecureConsentCookieName;
+}
+
+private void setConsentCookie(scope HTTPServerResponse res, string value, bool secure) @safe
+{
+	import vibe.http.common : Cookie;
+
+	auto c = res.setCookie(consentCookieNameFor(secure), value, "/");
+	c.httpOnly = true;
+	c.secure = secure;
+	// Lax: the cookie must accompany the top-level GET /authorize navigation a
+	// client starts from another site; the consent POST itself is same-site.
+	c.sameSite = Cookie.SameSite.lax;
+	c.maxAge = consentCookieMaxAgeSeconds;
+}
+
+/// Headers that keep the consent screen from being cached, leaking the proxy
+/// state via Referer, or being framed by another site (clickjacking).
+private void setConsentPageHeaders(scope HTTPServerResponse res) @safe
+{
+	res.headers["Cache-Control"] = "no-store";
+	res.headers["Referrer-Policy"] = "no-referrer";
+	res.headers["X-Frame-Options"] = "DENY";
+	res.headers["Content-Security-Policy"] = "frame-ancestors 'none'";
 }
 
 /// Mint a fresh, unguessable proxy `state` value (the only `state` sent
@@ -364,6 +412,7 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 	auto cfg = proxy.config();
 	const authorizePath = pathOf(cfg.authorizeEndpoint());
 	const consentPath = pathOf(cfg.consentEndpoint());
+	const secureCookie = cfg.baseUrl.startsWith("https://");
 
 	router.get(authorizePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const codeChallenge = req.query.get("code_challenge", "");
@@ -397,6 +446,15 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 			return;
 		}
 
+		// Consent is recorded per browser: the consent cookie names this browser,
+		// and a browser without one is given a fresh, unguessable handle (set only
+		// if the consent screen is shown).
+		string consentSession = req.cookies.get(consentCookieNameFor(secureCookie), "");
+		const newConsentSession = consentSession.length == 0;
+		if (newConsentSession)
+			consentSession = mintState();
+		const csrfToken = mintState();
+
 		void renderConsent(string clientNameForDisplay, string redirectForDisplay, string proxyState) @safe
 		{
 			// Un-consented client: present the consent screen rather than forwarding
@@ -405,11 +463,12 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 			// than a URL, so it cannot leak via Referer/history and cannot be auto-fired
 			// by link prefetch/preload. `clientNameForDisplay` is the verified CIMD
 			// client_name (empty for a DCR client, which has no attested name).
-			res.headers["Cache-Control"] = "no-store";
-			res.headers["Referrer-Policy"] = "no-referrer";
+			setConsentPageHeaders(res);
+			if (newConsentSession)
+				setConsentCookie(res, consentSession, secureCookie);
 			res.statusCode = HTTPStatus.ok;
 			res.writeBody(consentScreenHtml(clientNameForDisplay, redirectForDisplay,
-				consentPath, proxyState), "text/html; charset=utf-8");
+				consentPath, proxyState, csrfToken), "text/html; charset=utf-8");
 		}
 
 		if (isCimd)
@@ -431,11 +490,11 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 
 			const proxyState = mintState();
 			store.put(proxyState, ProxyAuthState(clientRedirect, clientState,
-				codeChallenge, scope_, clientId));
+				codeChallenge, scope_, clientId, consentSession, csrfToken));
 			try
 			{
-				const location = proxy.authorizeWithClientIdMetadata(clientId,
-					doc, clientRedirect, codeChallenge, scope_, proxyState);
+				const location = proxy.authorizeWithClientIdMetadata(consentSession,
+					clientId, doc, clientRedirect, codeChallenge, scope_, proxyState);
 				res.redirect(location, HTTPStatus.found);
 			}
 			catch (ConsentRequiredException)
@@ -462,11 +521,13 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 		}
 
 		const proxyState = mintState();
-		store.put(proxyState, ProxyAuthState(clientRedirect, clientState, codeChallenge, scope_));
+		store.put(proxyState, ProxyAuthState(clientRedirect, clientState,
+			codeChallenge, scope_, "", consentSession, csrfToken));
 
 		try
 		{
-			const location = proxy.authorize(clientRedirect, codeChallenge, scope_, proxyState);
+			const location = proxy.authorize(consentSession, clientRedirect,
+				codeChallenge, scope_, proxyState);
 			res.redirect(location, HTTPStatus.found);
 		}
 		catch (ConsentRequiredException)
@@ -481,6 +542,12 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 /// re-stored under the same proxy state so the eventual upstream callback can
 /// still relay the code.
 ///
+/// The approval is honoured only when it comes from the browser that was shown
+/// the consent screen: the request must carry that browser's consent cookie and
+/// echo the pending authorization's anti-CSRF token. Anything else is refused
+/// with 403, so a cross-site form post cannot grant consent on a user's behalf,
+/// and consent is recorded for that browser only.
+///
 /// Registered as POST (not GET): granting consent is a state change, so it is
 /// driven by the consent screen's form submission. A GET cannot trigger it, which
 /// keeps link prefetch/preload from auto-firing the grant and keeps the opaque
@@ -489,7 +556,10 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 /// The `store` MUST be the one `mountOAuthAuthorize` writes to.
 void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store) @safe
 {
+	import mcp.auth.oauth : constantTimeEquals;
+
 	const consentPath = pathOf(proxy.config().consentEndpoint());
+	const secureCookie = proxy.config().baseUrl.startsWith("https://");
 	router.post(consentPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const form = readFormString(req);
 		const proxyState = formField(form, "state");
@@ -499,6 +569,19 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 		{
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeBody("Unknown or expired authorization state", "text/plain");
+			return;
+		}
+		const browserSession = req.cookies.get(consentCookieNameFor(secureCookie), "");
+		const fromSameBrowser = st.consentSession.length
+			&& constantTimeEquals(browserSession, st.consentSession);
+		const csrfOk = st.csrfToken.length && constantTimeEquals(formField(form,
+			"csrf"), st.csrfToken);
+		if (!fromSameBrowser || !csrfOk)
+		{
+			res.statusCode = HTTPStatus.forbidden;
+			res.writeBody(
+				"Consent must be approved from the browser that was shown the consent screen",
+				"text/plain");
 			return;
 		}
 
@@ -518,12 +601,13 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
 				return;
 			}
-			proxy.grantConsent(st.clientId);
+			proxy.grantConsent(st.consentSession, st.clientId);
 			store.put(proxyState, st);
 			try
 			{
-				const location = proxy.authorizeWithClientIdMetadata(st.clientId, doc,
-					st.clientRedirectUri, st.codeChallenge, st.scope_, proxyState);
+				const location = proxy.authorizeWithClientIdMetadata(st.consentSession,
+					st.clientId, doc, st.clientRedirectUri, st.codeChallenge,
+					st.scope_, proxyState);
 				res.redirect(location, HTTPStatus.found);
 			}
 			catch (InvalidClientIdMetadataException)
@@ -544,11 +628,11 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 			res.writeJsonBody(invalidRequestJson("invalid redirect_uri"));
 			return;
 		}
-		proxy.grantConsent(st.clientRedirectUri);
+		proxy.grantConsent(st.consentSession, st.clientRedirectUri);
 		// Re-store the pending authorization so the upstream callback can relay it.
 		store.put(proxyState, st);
-		const location = proxy.authorize(st.clientRedirectUri,
-			st.codeChallenge, st.scope_, proxyState);
+		const location = proxy.authorize(st.consentSession,
+			st.clientRedirectUri, st.codeChallenge, st.scope_, proxyState);
 		res.redirect(location, HTTPStatus.found);
 	});
 }
@@ -1102,7 +1186,7 @@ unittest  // CONSENT SCREEN: HTML names the client redirect_uri and a POST appro
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc");
+	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc", "tok");
 	assert(html.canFind("Authorize application"));
 	assert(html.canFind("http://localhost:5000/cb"));
 	assert(html.canFind("method=\"post\""));
@@ -1114,7 +1198,7 @@ unittest  // CONSENT SCREEN: the approve control is a form POST, not a GET hyper
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc");
+	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc", "tok");
 	// No hyperlink that link prefetch/preload could auto-fire as a GET grant, and the
 	// opaque state is in a hidden field rather than a URL that could leak.
 	assert(!html.canFind("<a href"));
@@ -1125,7 +1209,7 @@ unittest  // CONSENT SCREEN: the untrusted client redirect_uri and proxy state a
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml("", `http://x/cb?a=1&b="<script>`, "/consent", `"><b>`);
+	const html = consentScreenHtml("", `http://x/cb?a=1&b="<script>`, "/consent", `"><b>`, "tok");
 	assert(html.canFind("&amp;"));
 	assert(html.canFind("&lt;script&gt;"));
 	assert(html.canFind("&quot;"));
@@ -1138,7 +1222,8 @@ unittest  // CONSENT SCREEN: a CIMD client_name is displayed (verified identity)
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml(`Acme <Client>`, "http://localhost:5000/cb", "/consent", "abc");
+	const html = consentScreenHtml(`Acme <Client>`, "http://localhost:5000/cb",
+			"/consent", "abc", "tok");
 	// The verified client_name from the metadata document is surfaced to the user.
 	assert(html.canFind("Acme &lt;Client&gt;"));
 	assert(!html.canFind("<Client>"));
@@ -1148,7 +1233,7 @@ unittest  // CONSENT SCREEN: an empty client_name (DCR client) renders no name s
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc");
+	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc", "tok");
 	// The redirect_uri is still shown; there is no empty "Application:" label.
 	assert(html.canFind("http://localhost:5000/cb"));
 	assert(!html.canFind("Application:"));
@@ -1186,62 +1271,216 @@ unittest  // CONFUSED DEPUTY: an un-consented client gets the consent screen, NO
 	assert(body_.canFind("Authorize application"));
 	assert(body_.canFind("http://localhost:5000/cb"));
 	// The client has NOT been forwarded upstream yet.
-	assert(!proxy.hasConsent("http://localhost:5000/cb"));
+	assert(res.statusCode != 302);
 }
 
 unittest  // CONFUSED DEPUTY: after the user approves, POST /consent records consent + 302s upstream
 {
-	import std.algorithm : canFind, startsWith;
-	import vibe.http.server : createTestHTTPServerRequest,
-		createTestHTTPServerResponse, TestHTTPResponseMode;
-	import vibe.http.common : HTTPMethod;
-	import vibe.inet.url : URL;
-	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
-
-	OAuthProxyConfig cfg;
-	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
-	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
-	cfg.upstreamClientId = "Iv1.upstream";
-	cfg.baseUrl = "https://mcp.example.com";
-	cfg.resource = "https://mcp.example.com/mcp";
-
-	auto proxy = new OAuthProxy(cfg);
+	auto proxy = new OAuthProxy(consentMountConfig());
 	proxy.register(["http://localhost:5000/cb"]);
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
-	// 1) /authorize renders the consent screen and stashes the pending auth under a
-	//    proxy state we can read back from the form's hidden state field.
-	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
-	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
-	router.handleRequest(req, res);
-	const html = () @trusted { return cast(string) sink.data; }();
+	// 1) /authorize renders the consent screen, stashing the pending auth under the
+	//    proxy state carried in the form, and sets this browser's consent cookie.
+	const page = browserGet(router, "https://mcp.example.com/authorize?code_challenge=CH"
+			~ "&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+	assert(hiddenField(page.body_, "state").length > 0);
+	assert(page.setCookie.length > 0);
 
-	// Extract the hidden state value (name="state" value="...").
-	import std.string : indexOf;
+	// 2) POSTing the form from the same browser grants consent and 302s upstream.
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie);
+	assert(proxy.hasConsent(page.setCookie, "http://localhost:5000/cb"));
+	assert(approved.status == 302);
+	assert(approved.location.startsWith("https://github.com/login/oauth/authorize?"));
+	assert(approved.location.canFind("client_id=Iv1.upstream"));
+	assert(approved.location.canFind("code_challenge=CH"));
+}
 
-	const stateMark = `name="state" value="`;
-	const hi = html.indexOf(stateMark);
-	assert(hi >= 0);
-	const rest = html[hi + stateMark.length .. $];
-	const close = rest.indexOf('"');
-	const proxyState = rest[0 .. close];
-	assert(proxyState.length > 0);
+version (unittest)
+{
+	import std.algorithm : canFind;
 
-	// 2) POSTing the form to /consent grants consent and 302s to the upstream authorize.
-	auto res2 = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
-	auto formBody = () @trusted { return cast(ubyte[])("state=" ~ proxyState).dup; }();
-	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/consent"),
-			HTTPMethod.POST, createMemoryStream(formBody, false));
-	req2.headers["Content-Type"] = "application/x-www-form-urlencoded";
-	router.handleRequest(req2, res2);
+	private OAuthProxyConfig consentMountConfig() @safe
+	{
+		OAuthProxyConfig cfg;
+		cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+		cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+		cfg.upstreamClientId = "Iv1.upstream";
+		cfg.baseUrl = "https://mcp.example.com";
+		cfg.resource = "https://mcp.example.com/mcp";
+		return cfg;
+	}
 
-	assert(proxy.hasConsent("http://localhost:5000/cb"));
-	assert(res2.statusCode == 302);
-	assert(res2.headers["Location"].startsWith("https://github.com/login/oauth/authorize?"));
-	assert(res2.headers["Location"].canFind("client_id=Iv1.upstream"));
-	assert(res2.headers["Location"].canFind("code_challenge=CH"));
+	/// The outcome of one browser request against the mounted proxy.
+	private struct BrowserHit
+	{
+		int status;
+		string location;
+		string body_;
+		string setCookie; /// the consent-session cookie value set by the response, if any
+		string xFrameOptions;
+		string csp;
+	}
+
+	private BrowserHit browserGet(URLRouter router, string url, string cookie) @safe
+	{
+		import vibe.http.server : createTestHTTPServerRequest,
+			createTestHTTPServerResponse, TestHTTPResponseMode;
+		import vibe.inet.url : URL;
+		import vibe.stream.memory : createMemoryOutputStream;
+
+		auto sink = createMemoryOutputStream();
+		auto req = createTestHTTPServerRequest(URL(url));
+		if (cookie.length)
+			req.headers["Cookie"] = consentCookieName ~ "=" ~ cookie;
+		auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		return browserHitOf(res, () @trusted { return cast(string) sink.data; }());
+	}
+
+	private BrowserHit browserPost(URLRouter router, string url, string form, string cookie) @safe
+	{
+		import vibe.http.common : HTTPMethod;
+		import vibe.http.server : createTestHTTPServerRequest,
+			createTestHTTPServerResponse, TestHTTPResponseMode;
+		import vibe.inet.url : URL;
+		import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+		auto formBody = () @trusted { return cast(ubyte[]) form.dup; }();
+		auto req = createTestHTTPServerRequest(URL(url), HTTPMethod.POST,
+				createMemoryStream(formBody, false));
+		req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+		if (cookie.length)
+			req.headers["Cookie"] = consentCookieName ~ "=" ~ cookie;
+		auto sink = createMemoryOutputStream();
+		auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		return browserHitOf(res, () @trusted { return cast(string) sink.data; }());
+	}
+
+	private BrowserHit browserHitOf(HTTPServerResponse res, string body_) @safe
+	{
+		BrowserHit h;
+		h.status = res.statusCode;
+		h.location = res.headers.get("Location", "");
+		h.body_ = body_;
+		h.xFrameOptions = res.headers.get("X-Frame-Options", "");
+		h.csp = res.headers.get("Content-Security-Policy", "");
+		if (auto c = consentCookieName in res.cookies)
+			h.setCookie = c.value;
+		return h;
+	}
+
+	/// Read a hidden form field's value out of the consent screen HTML.
+	private string hiddenField(string html, string name) @safe
+	{
+		import std.string : indexOf;
+
+		const mark = `name="` ~ name ~ `" value="`;
+		const i = html.indexOf(mark);
+		if (i < 0)
+			return "";
+		const rest = html[i + mark.length .. $];
+		return rest[0 .. rest.indexOf('"')];
+	}
+
+	private string consentForm(string html) @safe
+	{
+		return "state=" ~ encodeComponent(hiddenField(html,
+				"state")) ~ "&csrf=" ~ encodeComponent(hiddenField(html, "csrf"));
+	}
+}
+
+unittest  // CONSENT BINDING: one browser's approval does not let another browser skip the consent screen
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	// The attacker registers their own redirect_uri and approves it in their browser.
+	proxy.register(["https://evil.example/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const authorizeUrl = "https://mcp.example.com/authorize?code_challenge=ATTACKER"
+		~ "&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&state=x";
+	const attackerPage = browserGet(router, authorizeUrl, "");
+	assert(attackerPage.body_.canFind("Authorize application"));
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(attackerPage.body_), attackerPage.setCookie);
+	assert(approved.status == 302);
+
+	// A victim lured to the same /authorize URL, with no consent of their own, is
+	// shown the consent screen rather than being forwarded upstream.
+	const victim = browserGet(router, authorizeUrl, "");
+	assert(victim.status != 302);
+	assert(victim.body_.canFind("Authorize application"));
+
+	// Nor does presenting some other browser's session cookie value help.
+	const other = browserGet(router, authorizeUrl, "victim-session");
+	assert(other.status != 302);
+}
+
+unittest  // CONSENT BINDING: the approving browser skips the consent screen on its next authorization
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const authorizeUrl = "https://mcp.example.com/authorize?code_challenge=CH"
+		~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs";
+	const page = browserGet(router, authorizeUrl, "");
+	assert(page.setCookie.length);
+	assert(browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie).status == 302);
+
+	const again = browserGet(router, authorizeUrl, page.setCookie);
+	assert(again.status == 302);
+	assert(again.location.startsWith("https://github.com/login/oauth/authorize?"));
+}
+
+unittest  // CONSENT CSRF: a POST /consent from a browser other than the one shown the screen is refused
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const page = browserGet(router, "https://mcp.example.com/authorize?code_challenge=CH"
+			~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+	// A cross-site form auto-submitted from the victim's browser carries the
+	// victim's cookie (or none), not the one bound to this pending authorization.
+	const forged = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), "");
+	assert(forged.status == 403);
+	assert(forged.location.length == 0);
+}
+
+unittest  // CONSENT CSRF: a POST /consent without the anti-CSRF token is refused
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const page = browserGet(router, "https://mcp.example.com/authorize?code_challenge=CH"
+			~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+	const noToken = browserPost(router, "https://mcp.example.com/consent",
+			"state=" ~ encodeComponent(hiddenField(page.body_, "state")), page.setCookie);
+	assert(noToken.status == 403);
+}
+
+unittest  // CONSENT HARDENING: the consent screen cannot be framed (clickjacking)
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const page = browserGet(router, "https://mcp.example.com/authorize?code_challenge=CH"
+			~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+	assert(page.xFrameOptions == "DENY");
+	assert(page.csp.canFind("frame-ancestors 'none'"));
 }
 
 unittest  // CONSENT HARDENING: a GET to /consent cannot grant consent (no auto-fire by prefetch)
@@ -1286,7 +1525,7 @@ unittest  // CONSENT HARDENING: a GET to /consent cannot grant consent (no auto-
 			URL("https://mcp.example.com/consent?state=" ~ proxyState));
 	router.handleRequest(req2, res2);
 
-	assert(!proxy.hasConsent("http://localhost:5000/cb"));
+	assert(!proxy.hasConsent(res.cookies[consentCookieName].value, "http://localhost:5000/cb"));
 }
 
 unittest  // CONSENT HARDENING: the consent screen sets no-store + no-referrer headers
@@ -1334,13 +1573,14 @@ unittest  // UPSTREAM ERROR: /callback relays an upstream error to the client, n
 
 	auto proxy = new OAuthProxy(cfg);
 	proxy.register(["http://localhost:5000/cb"]);
-	proxy.grantConsent("http://localhost:5000/cb");
+	proxy.grantConsent("browser-1", "http://localhost:5000/cb");
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
 	// Drive /authorize to mint a proxy state and stash the pending authorization.
 	auto sink = createMemoryOutputStream();
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	req.headers["Cookie"] = consentCookieName ~ "=browser-1";
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 	assert(res.statusCode == 302);
@@ -1413,7 +1653,7 @@ unittest  // CIMD MOUNT: /authorize with a URL client_id + prior consent 302s up
 
 	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
 	// Consent is keyed on the stable client_id URL for CIMD clients.
-	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json");
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
@@ -1421,6 +1661,7 @@ unittest  // CIMD MOUNT: /authorize with a URL client_id + prior consent 302s up
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?"
 			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
 			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs"));
+	req.headers["Cookie"] = consentCookieName ~ "=browser-1";
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 
@@ -1453,48 +1694,26 @@ unittest  // CIMD MOUNT: /authorize with a URL client_id and no consent renders 
 	assert(body_.canFind("http://127.0.0.1:8765/cb"));
 	// The verified client_name from the metadata document is shown to the user.
 	assert(body_.canFind("Example MCP Client"));
-	assert(!proxy.hasConsent("https://app.example.com/oauth/client.json"));
+	assert(res.statusCode != 302);
 }
 
 unittest  // CIMD MOUNT: POST /consent for a CIMD client grants consent on the client_id URL + 302s upstream
 {
-	import std.algorithm : canFind, startsWith;
-	import std.string : indexOf;
-	import vibe.http.common : HTTPMethod;
-	import vibe.http.server : createTestHTTPServerRequest,
-		createTestHTTPServerResponse, TestHTTPResponseMode;
-	import vibe.inet.url : URL;
-	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
-
 	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
-	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?"
+	const page = browserGet(router, "https://mcp.example.com/authorize?"
 			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
-			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs"));
-	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
-	router.handleRequest(req, res);
-	const html = () @trusted { return cast(string) sink.data; }();
+			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs",
+			"");
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie);
 
-	const stateMark = `name="state" value="`;
-	const hi = html.indexOf(stateMark);
-	assert(hi >= 0);
-	const rest = html[hi + stateMark.length .. $];
-	const proxyState = rest[0 .. rest.indexOf('"')];
-
-	auto res2 = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
-	auto formBody = () @trusted { return cast(ubyte[])("state=" ~ proxyState).dup; }();
-	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/consent"),
-			HTTPMethod.POST, createMemoryStream(formBody, false));
-	req2.headers["Content-Type"] = "application/x-www-form-urlencoded";
-	router.handleRequest(req2, res2);
-
-	assert(proxy.hasConsent("https://app.example.com/oauth/client.json"));
-	assert(res2.statusCode == 302);
-	assert(res2.headers["Location"].startsWith("https://github.com/login/oauth/authorize?"));
-	assert(res2.headers["Location"].canFind("code_challenge=CH"));
+	assert(proxy.hasConsent(page.setCookie, "https://app.example.com/oauth/client.json"));
+	assert(approved.status == 302);
+	assert(approved.location.startsWith("https://github.com/login/oauth/authorize?"));
+	assert(approved.location.canFind("code_challenge=CH"));
 }
 
 unittest  // CIMD MOUNT: a document whose client_id does not match the URL yields 400 invalid_request
@@ -1508,7 +1727,7 @@ unittest  // CIMD MOUNT: a document whose client_id does not match the URL yield
 	auto badDoc = cimdMountDoc();
 	badDoc.clientId = "https://app.example.com/oauth/DIFFERENT.json"; // mismatch
 	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), badDoc);
-	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json");
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
@@ -1534,7 +1753,7 @@ unittest  // CIMD MOUNT: a redirect_uri not listed in the document yields 400 in
 	import vibe.stream.memory : createMemoryOutputStream;
 
 	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
-	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json");
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
@@ -1588,7 +1807,6 @@ unittest  // OPEN REDIRECT: /authorize 400s an unregistered redirect_uri and doe
 	assert(body_.canFind("invalid_request"));
 	// The consent screen is NOT rendered for an unregistered redirect_uri.
 	assert(!body_.canFind("Authorize application"));
-	assert(!proxy.hasConsent("https://attacker.example/cb"));
 }
 
 unittest  // OPEN REDIRECT: /authorize 400s an http non-loopback redirect_uri even if registered
@@ -1737,10 +1955,11 @@ unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent 
 
 	// POST /consent: with the redirect_uri evicted, proxy.authorize throws
 	// InvalidRedirectUriException. The handler must catch it and return 400.
-	auto formBody = () @trusted { return cast(ubyte[])("state=" ~ proxyState).dup; }();
+	auto formBody = () @trusted { return cast(ubyte[]) consentForm(html).dup; }();
 	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/consent"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req2.headers["Content-Type"] = "application/x-www-form-urlencoded";
+	req2.headers["Cookie"] = consentCookieName ~ "=" ~ res.cookies[consentCookieName].value;
 	auto sink2 = createMemoryOutputStream();
 	auto res2 = createTestHTTPServerResponse(sink2, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req2, res2);
@@ -1896,20 +2115,16 @@ unittest  // COMPOSE: the authorize/consent/callback legs share a state store an
 	router.handleRequest(req, res);
 	const html = () @trusted { return cast(string) sink.data; }();
 	assert(html.canFind("Authorize application"));
-
-	const stateMark = `name="state" value="`;
-	const hi = html.indexOf(stateMark);
-	assert(hi >= 0);
-	const rest = html[hi + stateMark.length .. $];
-	const proxyState = rest[0 .. rest.indexOf('"')];
+	assert(hiddenField(html, "state").length > 0);
 
 	// POST /consent grants consent and 302s upstream (proving the consent leg sees
 	// the SAME store the authorize leg wrote to).
 	auto res2 = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
-	auto formBody = () @trusted { return cast(ubyte[])("state=" ~ proxyState).dup; }();
+	auto formBody = () @trusted { return cast(ubyte[]) consentForm(html).dup; }();
 	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/consent"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req2.headers["Content-Type"] = "application/x-www-form-urlencoded";
+	req2.headers["Cookie"] = consentCookieName ~ "=" ~ res.cookies[consentCookieName].value;
 	router.handleRequest(req2, res2);
 	assert(res2.statusCode == 302);
 	assert(res2.headers["Location"].startsWith("https://github.com/login/oauth/authorize?"));
