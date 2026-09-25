@@ -825,14 +825,17 @@ final class McpServer : ServerCore
 	void registerResourceTemplate(ResourceTemplate descriptor,
 			TemplateReader reader, Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
-		// Two adjacent variables ("{a}{b}") can never be reverse-matched against a
+		// Two adjacent expressions ("{a}{b}") can never be reverse-matched against a
 		// concrete URI (there is no boundary between them), so such a template would
 		// silently never match; reject it at registration rather than shadowing it.
+		// An expression whose operator emits its own prefix ("{id}{?q}") is bounded.
 		import std.string : indexOf;
 
-		if (descriptor.uriTemplate.indexOf("}{") >= 0)
-			throw new Exception("resource template '" ~ descriptor.name
-					~ "' has adjacent variables that can never match: " ~ descriptor.uriTemplate);
+		const tmpl = descriptor.uriTemplate;
+		foreach (i; 2 .. tmpl.length)
+			if (tmpl[i - 2 .. i] == "}{" && uriTemplatePrefixOps.indexOf(tmpl[i]) < 0)
+				throw new Exception("resource template '" ~ descriptor.name
+						~ "' has adjacent variables that can never match: " ~ tmpl);
 		templates ~= RegisteredTemplate(descriptor, reader, cache);
 	}
 
@@ -3403,67 +3406,31 @@ final class McpServer : ServerCore
 	}
 }
 
-/// Match a concrete `uri` against an RFC 6570-style template containing
-/// `{var}` placeholders (each capturing a non-empty run up to the next literal).
-/// On success, fills `params` with the captured values and returns true.
+/// Match a concrete `uri` against an RFC 6570 URI template. On success, fills
+/// `params` with the captured variable values and returns true.
 ///
-/// Captured values are percent-decoded per RFC 3986 (RFC 6570 expansion
-/// percent-encodes reserved characters during URI construction, so the reverse
-/// is required to recover the original variable value); a URI carrying a
-/// malformed percent escape does not match. A single leading RFC 6570 operator
-/// (`+`, `#`, `.`, `/`, `;`, `?`, `&`) on a placeholder is recognised and
-/// stripped, so `{+path}` binds the variable `path`.
+/// Each expression is bound according to its operator:
+///   - `{var}` (simple): a non-empty value that contains no `/`, `?` or `#`,
+///     neither raw nor percent-encoded (simple expansion encodes them, so a
+///     value carrying one could only be a path-traversal attempt).
+///   - `{+var}` (reserved): a non-empty value that may contain `/`.
+///   - `{#var}`: an optional `#`-prefixed fragment, which may contain `/`.
+///   - `{/var}` / `{.var}`: optional `/`- or `.`-prefixed segments, one per
+///     variable, none containing `/`.
+///   - `{;var}` / `{?var}` / `{&var}`: optional `name=value` pairs, only for the
+///     variables the expression names, in any order.
+/// Values are percent-decoded per RFC 3986; a malformed escape does not match.
+/// Comma-separated variable lists are supported; prefix (`:n`) and explode (`*`)
+/// modifiers are accepted, with an exploded last variable of a `/` or `.`
+/// expression taking the remaining segments.
 bool matchUriTemplate(string tmpl, string uri, out string[string] params) @safe
 {
 	import std.string : indexOf;
-	import std.uri : decodeComponent, URIException;
 
 	size_t ti = 0, ui = 0;
 	while (ti < tmpl.length)
 	{
-		if (tmpl[ti] == '{')
-		{
-			const close = tmpl[ti .. $].indexOf('}');
-			if (close < 0)
-				return false;
-			auto varName = tmpl[ti + 1 .. ti + close];
-			// RFC 6570 operator prefix (e.g. {+path}, {#frag}, {?query}); the
-			// operator only affects expansion semantics, not the variable name.
-			if (varName.length && indexOf("+#./;?&", varName[0]) >= 0)
-				varName = varName[1 .. $];
-			ti += close + 1;
-
-			const litStart = ti;
-			while (ti < tmpl.length && tmpl[ti] != '{')
-				ti++;
-			const lit = tmpl[litStart .. ti];
-
-			string captured;
-			if (lit.length == 0)
-			{
-				captured = uri[ui .. $];
-				ui = uri.length;
-			}
-			else
-			{
-				const pos = uri[ui .. $].indexOf(lit);
-				if (pos < 0)
-					return false;
-				captured = uri[ui .. ui + pos];
-				ui += pos + lit.length;
-			}
-			if (captured.length == 0)
-				return false;
-			// Reverse RFC 6570/3986 percent-encoding to recover the original
-			// variable value; a malformed escape means the URI does not match.
-			string decoded;
-			try
-				decoded = decodeComponent(captured);
-			catch (URIException)
-				return false;
-			params[varName] = decoded;
-		}
-		else
+		if (tmpl[ti] != '{')
 		{
 			const litStart = ti;
 			while (ti < tmpl.length && tmpl[ti] != '{')
@@ -3472,9 +3439,154 @@ bool matchUriTemplate(string tmpl, string uri, out string[string] params) @safe
 			if (ui + lit.length > uri.length || uri[ui .. ui + lit.length] != lit)
 				return false;
 			ui += lit.length;
+			continue;
 		}
+		const close = tmpl[ti .. $].indexOf('}');
+		if (close < 0)
+			return false;
+		const expr = tmpl[ti + 1 .. ti + close];
+		ti += close + 1;
+
+		// The expression's extent ends at the next literal, or — when another
+		// expression follows directly — at that expression's operator prefix.
+		size_t litEnd = ti;
+		while (litEnd < tmpl.length && tmpl[litEnd] != '{')
+			litEnd++;
+		const lit = tmpl[ti .. litEnd];
+		size_t end = uri.length;
+		if (lit.length)
+		{
+			const pos = uri[ui .. $].indexOf(lit);
+			if (pos < 0)
+				return false;
+			end = ui + pos;
+		}
+		else if (ti + 1 < tmpl.length && uriTemplatePrefixOps.indexOf(tmpl[ti + 1]) >= 0)
+		{
+			const pos = uri[ui .. $].indexOf(tmpl[ti + 1]);
+			if (pos >= 0)
+				end = ui + pos;
+		}
+		if (!bindUriExpression(expr, uri[ui .. end], params))
+			return false;
+		ui = end;
 	}
 	return ui == uri.length;
+}
+
+/// RFC 6570 operators whose expansion begins with the operator character itself.
+private enum uriTemplatePrefixOps = "#./;?&";
+
+/// Bind one template expression (`expr`, the text between the braces) against
+/// the URI substring `s` it spans; see `matchUriTemplate` for the rules.
+private bool bindUriExpression(string expr, string s, ref string[string] params) @safe
+{
+	import std.algorithm : canFind;
+	import std.array : join, split;
+	import std.string : indexOf;
+
+	char op = 0;
+	if (expr.length && "+#./;?&".indexOf(expr[0]) >= 0)
+	{
+		op = expr[0];
+		expr = expr[1 .. $];
+	}
+	string[] names;
+	bool explodeLast;
+	foreach (spec; expr.split(','))
+	{
+		const colon = spec.indexOf(':');
+		if (colon >= 0)
+			spec = spec[0 .. colon];
+		explodeLast = spec.length && spec[$ - 1] == '*';
+		if (explodeLast)
+			spec = spec[0 .. $ - 1];
+		if (spec.length == 0)
+			return false;
+		names ~= spec;
+	}
+	if (names.length == 0)
+		return false;
+
+	bool bindList(string[] parts, bool allowSlash) @safe
+	{
+		bool mergedPath;
+		if (parts.length > names.length)
+		{
+			if (!explodeLast)
+				return false;
+			const sep = op == '.' ? "." : op == '/' ? "/" : ",";
+			auto merged = parts[0 .. names.length].dup;
+			merged[$ - 1] ~= sep ~ parts[names.length .. $].join(sep);
+			parts = merged;
+			// An exploded `{/var*}` deliberately spans several path segments.
+			mergedPath = op == '/';
+		}
+		foreach (i, raw; parts)
+		{
+			string v;
+			if (!decodeUriValue(raw, allowSlash || (mergedPath && i + 1 == parts.length), v))
+				return false;
+			params[names[i]] = v;
+		}
+		return true;
+	}
+
+	switch (op)
+	{
+	case 0:
+	case '+':
+		if (s.length == 0)
+			return false;
+		return bindList(names.length > 1 ? s.split(',') : [s], op == '+');
+	case '#':
+		if (s.length == 0)
+			return true;
+		if (s[0] != '#' || s.length == 1)
+			return false;
+		return bindList(names.length > 1 ? s[1 .. $].split(',') : [s[1 .. $]], true);
+	case '/':
+	case '.':
+		if (s.length == 0)
+			return true;
+		if (s[0] != op)
+			return false;
+		return bindList(s[1 .. $].split(op), false);
+	default: // ';', '?', '&'
+		if (s.length == 0)
+			return true;
+		if (s[0] != op)
+			return false;
+		foreach (pair; s[1 .. $].split(op == ';' ? ';' : '&'))
+		{
+			const eq = pair.indexOf('=');
+			const name = eq < 0 ? pair : pair[0 .. eq];
+			if (!names.canFind(name))
+				return false;
+			string v;
+			if (!decodeUriValue(eq < 0 ? "" : pair[eq + 1 .. $], true, v))
+				return false;
+			params[name] = v;
+		}
+		return true;
+	}
+}
+
+/// Percent-decode a captured template value. Unless `allowSlash`, a value whose
+/// raw or decoded form contains `/` — or whose raw form contains `?` or `#` — is
+/// rejected. Returns false on a malformed escape.
+private bool decodeUriValue(string raw, bool allowSlash, out string value) @safe
+{
+	import std.string : indexOf;
+	import std.uri : decodeComponent, URIException;
+
+	if (!allowSlash && (raw.indexOf('/') >= 0 || raw.indexOf('?') >= 0 || raw.indexOf('#') >= 0))
+		return false;
+	try
+		value = decodeComponent(raw);
+	catch (URIException)
+		return false;
+	return allowSlash || value.indexOf('/') < 0;
 }
 
 unittest  // template matching captures a single parameter
@@ -3494,8 +3606,22 @@ unittest  // template matching rejects non-matching URIs
 unittest  // template matching captures a trailing parameter
 {
 	string[string] params;
-	assert(matchUriTemplate("file:///{path}", "file:///a/b/c", params));
-	assert(params["path"] == "a/b/c");
+	assert(matchUriTemplate("file:///{name}", "file:///notes.txt", params));
+	assert(params["name"] == "notes.txt");
+}
+
+unittest  // a simple {var} never captures a '/' (no path traversal)
+{
+	string[string] params;
+	assert(!matchUriTemplate("file:///{path}", "file:///a/b/c", params));
+	assert(!matchUriTemplate("file:///docs/{name}", "file:///docs/../../etc/passwd", params));
+}
+
+unittest  // a simple {var} rejects a percent-encoded '/' (no encoded traversal)
+{
+	string[string] params;
+	assert(!matchUriTemplate("file:///docs/{name}", "file:///docs/%2e%2e%2fetc%2fpasswd", params));
+	assert(!matchUriTemplate("file:///{path}", "file:///a%20b%2Fc", params));
 }
 
 unittest  // captured variables are RFC 6570/3986 percent-decoded
@@ -3504,8 +3630,76 @@ unittest  // captured variables are RFC 6570/3986 percent-decoded
 	// during URI construction; the matcher must reverse that so the reader
 	// delegate receives the original value, not the still-encoded form.
 	string[string] params;
-	assert(matchUriTemplate("file:///{path}", "file:///a%20b%2Fc", params));
-	assert(params["path"] == "a b/c");
+	assert(matchUriTemplate("file:///{name}", "file:///a%20b%3Fc", params));
+	assert(params["name"] == "a b?c");
+}
+
+unittest  // {?q} binds the value from the query form, not the raw "?q=" text
+{
+	string[string] params;
+	assert(matchUriTemplate("res://x{?q}", "res://x?q=1", params));
+	assert(params["q"] == "1");
+}
+
+unittest  // {?a,b} binds several query variables and tolerates absent ones
+{
+	string[string] params;
+	assert(matchUriTemplate("res://x{?a,b}", "res://x?b=2&a=hello%20world", params));
+	assert(params["a"] == "hello world");
+	assert(params["b"] == "2");
+	string[string] none;
+	assert(matchUriTemplate("res://x{?a,b}", "res://x", none));
+	assert(none.length == 0);
+}
+
+unittest  // a query expression may directly follow a path variable
+{
+	string[string] params;
+	assert(matchUriTemplate("res://items/{id}{?fields}", "res://items/7?fields=name", params));
+	assert(params["id"] == "7");
+	assert(params["fields"] == "name");
+}
+
+unittest  // {&q} continues an existing query
+{
+	string[string] params;
+	assert(matchUriTemplate("res://x?fixed=1{&q}", "res://x?fixed=1&q=z", params));
+	assert(params["q"] == "z");
+}
+
+unittest  // a query variable not named by the template does not match
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://x{?q}", "res://x?other=1", params));
+}
+
+unittest  // {/var} and {#var} require their prefix character
+{
+	string[string] params;
+	assert(matchUriTemplate("res://x{/seg}", "res://x/abc", params));
+	assert(params["seg"] == "abc");
+	assert(!matchUriTemplate("res://x{/seg}", "res://x/a/b", params));
+	string[string] frag;
+	assert(matchUriTemplate("res://x{#frag}", "res://x#part/1", frag));
+	assert(frag["frag"] == "part/1");
+}
+
+unittest  // an exploded {/var*} takes the remaining path segments
+{
+	string[string] params;
+	assert(matchUriTemplate("res://x{/path*}", "res://x/a/b/c", params));
+	assert(params["path"] == "a/b/c");
+}
+
+unittest  // registerResourceTemplate accepts a path variable followed by a query expression
+{
+	auto s = new McpServer("t", "1");
+	ResourceTemplate t = {
+		uriTemplate: "res://items/{id}{?fields}", name: "items"
+	};
+	s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
+		return ResourceContents.makeText(uri, "text/plain", "x");
+	});
 }
 
 unittest  // a delimited captured variable is percent-decoded
