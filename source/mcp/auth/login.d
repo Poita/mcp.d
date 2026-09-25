@@ -220,11 +220,13 @@ class FileTokenStore : TokenStore
 
 	override void save(string resource, StoredToken token) @safe
 	{
-		import std.file : mkdirRecurse, rename;
+		import std.file : exists, isDir, mkdirRecurse, rename;
 		import std.path : dirName;
 
 		auto dir = dirName(path);
-		if (dir.length && dir != ".")
+		// Only a directory the store creates is made owner-only; an existing one
+		// (e.g. the user's home directory) is the user's to manage.
+		if (dir.length && dir != "." && !(dir.exists && dir.isDir))
 		{
 			try
 				() @trusted { mkdirRecurse(dir); }();
@@ -1640,6 +1642,52 @@ version (Posix) unittest  // FileTokenStore creates the token file 0600 (never a
 	// The file must end up owner-only (0600): no group/other bits set.
 	const fileMode = getAttributes(file) & (S_IRWXU | S_IRWXG | S_IRWXO);
 	assert((fileMode & (S_IRWXG | S_IRWXO)) == 0, "token file is group/other accessible");
+}
+
+version (Posix) unittest  // FileTokenStore leaves the permissions of an existing directory it did not create alone
+{
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse, getAttributes, setAttributes;
+	import std.path : buildPath;
+	import std.conv : octal, to;
+	import core.sys.posix.sys.stat : S_IRWXU, S_IRWXG, S_IRWXO;
+	import std.datetime.systime : Clock;
+
+	// e.g. a token file placed directly in the user's home directory.
+	auto root = buildPath(tempDir, "mcp-login-owndir-" ~ Clock.currTime().toUnixTime().to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		() @trusted { rmdirRecurse(root); }();
+	() @trusted { setAttributes(root, octal!755); }();
+
+	auto store = new FileTokenStore(buildPath(root, "tokens.json"));
+	StoredToken t;
+	t.accessToken = "secret-access";
+	store.save("https://mcp.example.com", t);
+
+	assert((getAttributes(root) & (S_IRWXU | S_IRWXG | S_IRWXO)) == octal!755,
+			"an existing directory must not be chmod-ed by the token store");
+}
+
+version (Posix) unittest  // FileTokenStore makes a directory it creates owner-only
+{
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse, getAttributes;
+	import std.path : buildPath;
+	import std.conv : to;
+	import core.sys.posix.sys.stat : S_IRWXU, S_IRWXG, S_IRWXO;
+	import std.datetime.systime : Clock;
+
+	auto root = buildPath(tempDir, "mcp-login-newdir-" ~ Clock.currTime().toUnixTime().to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		() @trusted { rmdirRecurse(root); }();
+
+	auto dir = buildPath(root, "dlang-mcp");
+	auto store = new FileTokenStore(buildPath(dir, "tokens.json"));
+	StoredToken t;
+	t.accessToken = "secret-access";
+	store.save("https://mcp.example.com", t);
+
+	assert((getAttributes(dir) & (S_IRWXU | S_IRWXG | S_IRWXO)) == S_IRWXU);
 }
 
 version (Windows) unittest  // FileTokenStore restricts the token file to the current user (no inherited broad ACEs)
