@@ -243,9 +243,12 @@ final class TaskRuntime
 	}
 
 	/// Update a `working`/`input_required` task's human-readable status message.
+	/// A no-op if the task is already terminal.
 	void progress(string id, string statusMessage) @safe
 	{
 		auto r = require(id);
+		if (isTerminal(r.meta.status))
+			return;
 		r.meta.statusMessage = nullable(statusMessage);
 		touchAndStore(r);
 	}
@@ -287,10 +290,13 @@ final class TaskRuntime
 	/// Move a task to `input_required`, surfacing `inputRequests` on the next
 	/// `tasks/get`. `inputRequests` follows the MRTR shape (a map of unique keys
 	/// to server-to-client requests). A task whose cancellation was already
-	/// requested is cancelled instead, since no dispatch would ever resume it.
+	/// requested is cancelled instead, since no dispatch would ever resume it. A
+	/// no-op if the task is already terminal.
 	void requireInput(string id, Json inputRequests) @safe
 	{
 		auto r = require(id);
+		if (isTerminal(r.meta.status))
+			return;
 		if (r.cancelRequested)
 		{
 			r.meta.status = TaskStatus.cancelled;
@@ -324,10 +330,13 @@ final class TaskRuntime
 		store_.update(r);
 	}
 
-	/// Move a task back to `working` (e.g. after its required input arrived).
+	/// Move a task back to `working` (e.g. after its required input arrived). A
+	/// no-op if the task is already terminal.
 	void resumeWorking(string id) @safe
 	{
 		auto r = require(id);
+		if (isTerminal(r.meta.status))
+			return;
 		r.meta.status = TaskStatus.working;
 		r.inputRequests = Json.emptyObject;
 		r.detached = false;
@@ -709,4 +718,30 @@ unittest  // a task with an unlimited ttl never expires
 	now = "2100-01-01T00:00:00Z";
 	assert(rt.sweepExpired() == 0);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
+}
+
+unittest  // progress, requireInput, and resumeWorking leave a terminal task untouched
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	auto t = rt.create();
+	rt.cancel(t.taskId);
+	int notified;
+	rt.onStatusChange((Json d, string owner) @safe { notified++; });
+	now = "2026-06-07T10:00:01Z";
+
+	rt.progress(t.taskId, "still going");
+	rt.requireInput(t.taskId, Json([
+			"k": Json(["method": Json("elicitation/create")])
+	]));
+	rt.resumeWorking(t.taskId);
+	rt.complete(t.taskId, Json.emptyObject);
+
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "cancelled");
+	assert("statusMessage" !in d);
+	assert(d["lastUpdatedAt"].get!string == "2026-06-07T10:00:00Z");
+	assert(notified == 0);
 }
