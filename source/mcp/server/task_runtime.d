@@ -286,14 +286,42 @@ final class TaskRuntime
 
 	/// Move a task to `input_required`, surfacing `inputRequests` on the next
 	/// `tasks/get`. `inputRequests` follows the MRTR shape (a map of unique keys
-	/// to server-to-client requests).
+	/// to server-to-client requests). A task whose cancellation was already
+	/// requested is cancelled instead, since no dispatch would ever resume it.
 	void requireInput(string id, Json inputRequests) @safe
 	{
 		auto r = require(id);
-		r.meta.status = TaskStatus.inputRequired;
-		r.inputRequests = (inputRequests.type == Json.Type.object) ? inputRequests
-			: Json.emptyObject;
+		if (r.cancelRequested)
+		{
+			r.meta.status = TaskStatus.cancelled;
+			r.inputRequests = Json.emptyObject;
+		}
+		else
+		{
+			r.meta.status = TaskStatus.inputRequired;
+			r.inputRequests = (inputRequests.type == Json.Type.object)
+				? inputRequests : Json.emptyObject;
+		}
 		touchAndStore(r);
+	}
+
+	/// Record that the executor handed the task off to finish out of band
+	/// (`TaskContext.detach`). The task stays `working`, but no dispatch is
+	/// running any more, so a later cancel settles it at once; a cancel already
+	/// requested cancels it now. A no-op if already terminal.
+	void markDetached(string id) @safe
+	{
+		auto r = require(id);
+		if (isTerminal(r.meta.status))
+			return;
+		if (r.cancelRequested)
+		{
+			r.meta.status = TaskStatus.cancelled;
+			touchAndStore(r);
+			return;
+		}
+		r.detached = true;
+		store_.update(r);
 	}
 
 	/// Move a task back to `working` (e.g. after its required input arrived).
@@ -302,22 +330,27 @@ final class TaskRuntime
 		auto r = require(id);
 		r.meta.status = TaskStatus.working;
 		r.inputRequests = Json.emptyObject;
+		r.detached = false;
 		touchAndStore(r);
 	}
 
 	/// Request cancellation. Always records the cooperative `cancelRequested`
-	/// flag. For a task with no executor to honor it (`toolName` empty), the
-	/// runtime transitions to `cancelled` immediately; for an executor-backed
-	/// task it leaves the status untouched so the running executor can observe the
-	/// flag and decide its own terminal state (cancellation is cooperative).
+	/// flag. A task with no executor running to honor it — a manual task
+	/// (`toolName` empty), one suspended in `input_required`, or one the executor
+	/// detached — transitions to `cancelled` immediately; for a running executor
+	/// the status is left untouched so it can observe the flag and decide its own
+	/// terminal state (cancellation is cooperative).
 	void cancel(string id) @safe
 	{
 		auto r = require(id);
 		if (isTerminal(r.meta.status))
 			return;
 		r.cancelRequested = true;
-		if (r.toolName.length == 0)
+		if (r.toolName.length == 0 || r.detached || r.meta.status == TaskStatus.inputRequired)
+		{
 			r.meta.status = TaskStatus.cancelled;
+			r.inputRequests = Json.emptyObject;
+		}
 		touchAndStore(r);
 	}
 

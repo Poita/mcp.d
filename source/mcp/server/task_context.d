@@ -130,8 +130,8 @@ struct TaskContext
 	}
 
 	/// Suspend the executor pending client input. Persists `requests` as the
-	/// task's outstanding `inputRequests` (status `input_required`) and throws
-	/// `TaskSuspended`. Never returns — its `noreturn` result type lets an executor
+	/// task's outstanding `inputRequests` (status `input_required`, or
+	/// `cancelled` if a cancel was already requested) and throws `TaskSuspended`. Never returns — its `noreturn` result type lets an executor
 	/// write `return tc.requireInput(...);` from a value-returning method.
 	noreturn requireInput(const(InputRequest)[] requests) @safe
 	{
@@ -157,6 +157,7 @@ struct TaskContext
 	/// `return tc.detach();` from a value-returning method.
 	noreturn detach() @safe
 	{
+		rt_.markDetached(taskId_);
 		throw new TaskDetached(taskId_);
 	}
 
@@ -165,7 +166,7 @@ struct TaskContext
 	noreturn detach(string statusMessage) @safe
 	{
 		rt_.progress(taskId_, statusMessage);
-		throw new TaskDetached(taskId_);
+		return detach();
 	}
 }
 
@@ -363,6 +364,66 @@ unittest  // a cancel observed during the run marks the task cancelled, not comp
 	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
 		// Executor returns a result, but a cancel was requested.
 		return Json(["structuredContent": Json.emptyObject]);
+	});
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
+}
+
+unittest  // cancelling a task suspended for input cancels it at once
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
+		return tc.requireInput([InputRequest.elicitation("ok", "Proceed?")]);
+	});
+	rt.cancel(t.taskId);
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "cancelled");
+	assert("inputRequests" !in d);
+}
+
+unittest  // cancelling a detached task cancels it at once; a later completion is ignored
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("deploy", Json.undefined);
+	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
+		return tc.detach("deploying");
+	});
+	rt.cancel(t.taskId);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
+	rt.complete(t.taskId, Json.emptyObject);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
+}
+
+unittest  // requireInput after a cancel was requested cancels instead of suspending
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
+		rt.cancel(tc.taskId); // arrives while the executor is running
+		return tc.requireInput([InputRequest.elicitation("ok", "Proceed?")]);
+	});
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
+}
+
+unittest  // detach after a cancel was requested cancels instead of detaching
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("deploy", Json.undefined);
+	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
+		rt.cancel(tc.taskId);
+		return tc.detach();
 	});
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
 }

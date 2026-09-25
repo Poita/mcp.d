@@ -30,6 +30,9 @@ struct TaskRecord
 	Json inputRequests = Json.emptyObject; /// outstanding requests when input_required
 	Json[string] inputResponses; /// answers delivered via tasks/update, keyed by request id
 	bool cancelRequested; /// cooperative cancel flag, honored by the executor
+	/// The executor handed the task off via `TaskContext.detach`: no dispatch is
+	/// running, so a cancel settles the task at once.
+	bool detached;
 	string toolName; /// executor key — which registered task executor drives this task
 	/// The authenticated principal (token subject) whose request created the
 	/// task; every later tasks/* request must come from the same principal. Empty
@@ -55,6 +58,8 @@ struct TaskRecord
 			ir[k] = v;
 		j["inputResponses"] = ir;
 		j["cancelRequested"] = cancelRequested;
+		if (detached)
+			j["detached"] = true;
 		j["toolName"] = toolName;
 		if (owner.length)
 			j["owner"] = owner;
@@ -87,6 +92,8 @@ struct TaskRecord
 		}();
 		r.cancelRequested = ("cancelRequested" in j)
 			&& j["cancelRequested"].type == Json.Type.bool_ && j["cancelRequested"].get!bool;
+		r.detached = ("detached" in j) && j["detached"].type == Json.Type.bool_
+			&& j["detached"].get!bool;
 		if ("toolName" in j && j["toolName"].type == Json.Type.string)
 			r.toolName = j["toolName"].get!string;
 		if ("owner" in j && j["owner"].type == Json.Type.string)
