@@ -171,7 +171,17 @@ final class StdioClientTransport : ClientTransport
 	/// multiple `deliver` calls may be in flight at once.
 	Json deliver(Json message, long expectId) @safe
 	{
-		return chan().deliver(message, expectId);
+		import core.time : Duration;
+
+		// `McpClient` owns the request deadline (and aborts through `abort`), so the
+		// channel waits without a timeout of its own.
+		return chan().deliver(message, expectId, Duration.max);
+	}
+
+	void abort(long expectId, McpException reason) @safe
+	{
+		if (channel !is null)
+			channel.abort(expectId, reason);
 	}
 
 	/// Send a message that expects no correlated reply (notification, or a
@@ -739,8 +749,7 @@ version (Posix) unittest  // an over-long newline-less stream ends the read loop
 		// The child floods stdout with newline-less bytes. With a small
 		// maxLineBytes the reader must hit the bound and return null (EOF to the
 		// duplex loop), so the in-flight deliver fails via failPending ("channel
-		// closed") promptly — NOT by accumulating without limit until the 60s
-		// deliver timeout.
+		// closed") promptly — NOT by accumulating without limit.
 		auto transport = spawnStdioTransport([
 			"sh", "-c", "yes A | tr -d \"\\n\""
 		], 4096);
@@ -757,8 +766,7 @@ version (Posix) unittest  // an over-long newline-less stream ends the read loop
 		// The bound must have closed the channel (failPending), not timed out.
 		assert(msg.canFind("closed"),
 			"over-long newline-less stream must end the read loop via channel close, got: " ~ msg);
-		assert(sw.peek < 30.seconds,
-			"the over-long-line bound must trip promptly, well under the 60s deliver timeout");
+		assert(sw.peek < 30.seconds, "the over-long-line bound must trip promptly");
 		transport.closeProcess(200.msecs, 200.msecs);
 	});
 }
@@ -817,4 +825,149 @@ version (Posix) unittest  // partial fragment at EOF closes the channel cleanly,
 			"partial EOF fragment must close the channel cleanly, got: " ~ msg);
 		transport.closeProcess(200.msecs, 200.msecs);
 	});
+}
+
+// An in-memory server->client line queue so a test can play the server side of
+// a stdio client without a subprocess.
+version (unittest) private final class TestLines
+{
+	import vibe.core.sync : LocalManualEvent, createManualEvent;
+
+	string[] queue;
+	LocalManualEvent evt;
+	bool closed;
+
+	this() @safe
+	{
+		evt = createManualEvent();
+	}
+
+	void put(string s) @safe
+	{
+		queue ~= s;
+		evt.emit();
+	}
+
+	void closeEnd() @safe
+	{
+		closed = true;
+		evt.emit();
+	}
+
+	string take() @safe
+	{
+		while (queue.length == 0 && !closed)
+		{
+			auto ec = evt.emitCount;
+			() @trusted { evt.wait(ec); }();
+		}
+		if (queue.length == 0)
+			return null;
+		auto s = queue[0];
+		queue = queue[1 .. $];
+		return s;
+	}
+}
+
+// Run `body` inside a vibe task + event loop and return what it threw (empty
+// when it completed).
+version (unittest) private string inLoopCapturing(scope void delegate() @safe body) @trusted
+{
+	string failure;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+			body();
+		catch (Exception e)
+			failure = e.msg.length ? e.msg : "exception";
+	});
+	runEventLoop();
+	return failure;
+}
+
+unittest  // a stdio request with no reply fails after ClientSettings.requestTimeout and sends notifications/cancelled
+{
+	import core.time : msecs, seconds, MonoTime, Duration;
+	import mcp.client.client : ClientSettings, RequestTimeoutException;
+
+	auto toClient = new TestLines;
+	string[] toServer;
+	bool timedOut;
+	Duration took;
+	const failure = inLoopCapturing(() @safe {
+		ClientSettings s;
+		s.requestTimeout = 200.msecs;
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			toServer ~= l;
+		}, s);
+		const start = MonoTime.currTime;
+		try
+			client.ping();
+		catch (RequestTimeoutException)
+			timedOut = true;
+		took = MonoTime.currTime - start;
+		foreach (_; 0 .. 8)
+			yield();
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(timedOut, "an unanswered request must fail with RequestTimeoutException");
+	assert(took < 5.seconds);
+	assert(toServer.length == 2, "the timeout must send notifications/cancelled");
+	auto req = parseJsonString(toServer[0]);
+	auto cancelled = parseJsonString(toServer[1]);
+	assert(cancelled["method"].get!string == "notifications/cancelled");
+	assert(cancelled["params"]["requestId"] == req["id"]);
+}
+
+unittest  // progress for a stdio request resets its timeout
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+	import mcp.client.client : ClientSettings, RequestOptions;
+	import mcp.protocol.types : ProgressNotification;
+
+	auto toClient = new TestLines;
+	auto toServer = new TestLines;
+	int progressSeen;
+	bool completed;
+	const failure = inLoopCapturing(() @safe {
+		ClientSettings s;
+		s.requestTimeout = 250.msecs;
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			toServer.put(l);
+		}, s);
+		// The server reports progress every 100ms for 600ms, then answers.
+		runTask(() nothrow{
+			try
+			{
+				auto req = parseJsonString(toServer.take());
+				auto token = req["params"]["_meta"]["progressToken"];
+				foreach (i; 0 .. 6)
+				{
+					sleep(100.msecs);
+					Json p = Json.emptyObject;
+					p["progressToken"] = token;
+					p["progress"] = i;
+					toClient.put(makeNotification("notifications/progress", p).toString());
+				}
+				Json result = Json.emptyObject;
+				result["content"] = Json.emptyArray;
+				toClient.put(makeResponse(req["id"], result).toString());
+			}
+			catch (Exception)
+			{
+			}
+		});
+		client.callTool("slow", Json.emptyObject,
+			RequestOptions.withProgress((ProgressNotification n) @safe {
+				progressSeen++;
+			}));
+		completed = true;
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(completed);
+	assert(progressSeen == 6);
 }

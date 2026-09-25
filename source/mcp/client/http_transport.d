@@ -126,6 +126,32 @@ private final class ListenSocketSlot
 	}
 }
 
+/// The abortable state of one in-flight Streamable HTTP request: the socket
+/// currently carrying its response (the POST, then any resume GET) and the reason
+/// it was aborted, if it was. Aborting closes that socket so a read parked on a
+/// silent stream returns at once.
+private final class PostRequest
+{
+	ListenSocketSlot slot;
+	McpException aborted;
+
+	void abort(McpException reason) @safe nothrow
+	{
+		aborted = reason;
+		if (slot !is null)
+			slot.closeSocket();
+	}
+
+	/// Make `s` the socket carrying the response, closing it at once when the
+	/// request was already aborted.
+	void use(ListenSocketSlot s) @safe nothrow
+	{
+		slot = s;
+		if (aborted !is null)
+			s.closeSocket();
+	}
+}
+
 /// A single in-flight legacy (2024-11-05) request's response slot, owned by the
 /// `legacyRpc` call that registered it under its request id. The legacy GET-SSE
 /// reader fills `result`/`err` and sets `got` on the matching id; any unmatched
@@ -215,6 +241,9 @@ final class HttpClientTransport : ClientTransport
 	// `attach`/`closeSocket` are order-independent, closing the window where a
 	// `close()` races the `connectTCP` yield.
 	private ListenSocketSlot[] postSockets;
+	// The abortable state of each in-flight Streamable HTTP request, keyed by its
+	// JSON-RPC id, so `abort` can close the socket carrying its response.
+	private PostRequest[long] inflightPosts;
 	// True while the legacy GET-SSE reader task is running. A `legacyRpc` issued
 	// after the reader has exited fails its waiter at once instead of polling for
 	// the full timeout, since no response can ever arrive on a dead stream.
@@ -406,6 +435,18 @@ final class HttpClientTransport : ClientTransport
 		post(message);
 	}
 
+	void abort(long expectId, McpException reason) @safe
+	{
+		if (auto w = expectId in legacyWaiters)
+		{
+			if (!(*w).got && (*w).err is null)
+				(*w).err = reason;
+			notifyLegacy();
+		}
+		if (auto r = expectId in inflightPosts)
+			(*r).abort(reason);
+	}
+
 	/// False: a reply to a server->client request travels on a *different* HTTP
 	/// request than the one whose inbound stream delivered it, and a nested
 	/// synchronous POST from inside an awaiting read loop could deadlock the
@@ -493,9 +534,16 @@ final class HttpClientTransport : ClientTransport
 		// approach `runServerStream`/`resumeViaGet` use for long-lived SSE)
 		// delivers each event immediately, so the client can reply and the
 		// round-trip completes.
+		auto req = new PostRequest;
+		inflightPosts[expectId] = req;
+		scope (exit)
+			inflightPosts.remove(expectId);
+
 		const sentSession = sessionId.length > 0;
 		int status;
-		postAndAwaitRaw(message, expectId, cursor, result, got, err, status);
+		postAndAwaitRaw(message, expectId, cursor, result, got, err, status, req);
+		if (req.aborted !is null)
+			throw req.aborted;
 
 		// A 404 under a session means the session is gone: drop the id so the
 		// next `initialize` starts a new session without it.
@@ -524,7 +572,10 @@ final class HttpClientTransport : ClientTransport
 		if (cursor.retryMs > 0 && !modernProtocol)
 		{
 			sleep(cursor.retryMs.msecs);
-			resumeViaGet(expectId, cursor.lastEventId, result, got, err);
+			if (req.aborted is null)
+				resumeViaGet(expectId, cursor.lastEventId, result, got, err, req);
+			if (req.aborted !is null)
+				throw req.aborted;
 			if (err !is null)
 				throw err;
 			if (got)
@@ -564,7 +615,8 @@ final class HttpClientTransport : ClientTransport
 	/// `postAndAwait`). Mirrors the chunked-decode SSE parser of
 	/// `runServerStream`/`resumeViaGet`.
 	private void postAndAwaitRaw(Json message, long expectId, ref SseCursor cursor,
-			ref Json result, ref bool got, ref McpException err, out int status) @safe
+			ref Json result, ref bool got, ref McpException err, out int status,
+			PostRequest req = null) @safe
 	{
 		import vibe.stream.operations : readLine;
 		import std.string : indexOf, startsWith, strip, toLower;
@@ -590,6 +642,8 @@ final class HttpClientTransport : ClientTransport
 		// it is parked reading a long-lived SSE response stream.
 		auto slot = new ListenSocketSlot;
 		postSockets ~= slot;
+		if (req !is null)
+			req.use(slot);
 		scope (exit)
 		{
 			import std.algorithm : remove;
@@ -814,7 +868,7 @@ final class HttpClientTransport : ClientTransport
 	/// Resume a closed response stream via `GET` with `Last-Event-ID`, reading
 	/// the resumed SSE stream until the awaited response (`expectId`) arrives.
 	private void resumeViaGet(long expectId, string lastEventId, ref Json result,
-			ref bool got, ref McpException err) @safe
+			ref bool got, ref McpException err, PostRequest req = null) @safe
 	{
 		const ep = parseHttpEndpoint(url);
 		// Resolve + pin the user-configured endpoint host to a numeric address.
@@ -829,6 +883,8 @@ final class HttpClientTransport : ClientTransport
 		// interrupt a parked resume read and the socket would leak.
 		auto slot = new ListenSocketSlot;
 		serverStreamSlots ~= slot;
+		if (req !is null)
+			req.use(slot);
 		scope (exit)
 		{
 			import std.algorithm : remove;
@@ -848,9 +904,9 @@ final class HttpClientTransport : ClientTransport
 					return;
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, ep.host);
-				const req = buildHttpRequest("GET", ep.path, ep.host,
+				const getReq = buildHttpRequest("GET", ep.path, ep.host,
 						"text/event-stream", "keep-alive", true, verHeaders, lastEventId, null);
-				conn.write(cast(const(ubyte)[]) req);
+				conn.write(cast(const(ubyte)[]) getReq);
 
 				bool chunked;
 				if (!readSseResponseHead(conn, chunked))
@@ -1459,8 +1515,6 @@ final class HttpClientTransport : ClientTransport
 	/// arrives asynchronously on the standalone GET SSE stream.
 	private Json legacyRpc(Json message, long expectId) @safe
 	{
-		import core.time : msecs, MonoTime;
-
 		auto waiter = new LegacyWaiter;
 		waiter.result = Json.undefined;
 		legacyWaiters[expectId] = waiter;
@@ -1478,23 +1532,15 @@ final class HttpClientTransport : ClientTransport
 		if (!legacyStreamAlive && !waiter.got && waiter.err is null)
 			throw internalError("legacy HTTP+SSE stream is not active");
 
-		// Wait (bounded, ~60s ceiling) for the correlated response, woken by the
-		// reader's `notifyLegacy` (or `close()`) rather than polling on a timer.
-		const deadline = MonoTime.currTime + 60_000.msecs;
+		// Wait for the correlated response, woken by the reader's `notifyLegacy`,
+		// `close()`, or `abort` (through which `McpClient` enforces its deadline).
 		while (!waiter.got && waiter.err is null && !closing)
-		{
-			const now = MonoTime.currTime;
-			if (now >= deadline)
-				break;
-			ec = legacyCompletionEvent().waitUninterruptible(deadline - now, ec);
-		}
+			ec = legacyCompletionEvent().waitUninterruptible(Duration.max, ec);
 		if (waiter.err !is null)
 			throw waiter.err;
 		if (waiter.got)
 			return waiter.result;
-		if (closing)
-			throw internalError("legacy HTTP+SSE transport closing");
-		throw internalError("No legacy HTTP+SSE response for request " ~ idStr(expectId));
+		throw internalError("legacy HTTP+SSE transport closing");
 	}
 
 	/// Read the legacy GET SSE stream over a raw TCP connection, dispatching
@@ -3014,7 +3060,8 @@ version (unittest)
 {
 	/// A stateless 2025-11-25 fake server that answers `initialize` normally and
 	/// every other request through `answer`.
-	private URLRouter answeringRouter(void delegate(Json request, HTTPServerResponse res) @safe answer) @safe
+	private URLRouter answeringRouter(void delegate(Json request, HTTPServerResponse res) @safe answer,
+			void delegate(Json notification) @safe onNotification = null) @safe
 	{
 		auto r = new URLRouter;
 		r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
@@ -3027,6 +3074,8 @@ version (unittest)
 			}
 			if ("id" !in j)
 			{
+				if (onNotification !is null)
+					onNotification(j);
 				res.statusCode = 202;
 				res.writeBody("", "text/plain");
 				return;
@@ -3115,4 +3164,54 @@ unittest  // a 200 JSON body whose id does not match the request is rejected
 		res.writeBody(resp.toString(), "application/json");
 	});
 	assert(cast(McpException) e !is null, "a mismatched response id must be rejected");
+}
+
+unittest  // an HTTP request whose SSE stream goes silent fails after requestTimeout and sends notifications/cancelled
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+	import mcp.client.client : McpClient, ClientSettings, RequestTimeoutException;
+
+	bool release;
+	long cancelledId = -1;
+	long silentId = -2;
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		silentId = req["id"].get!long;
+		res.contentType = "text/event-stream";
+		() @trusted {
+			res.bodyWriter.write(cast(const(ubyte)[]) ": open\n\n");
+			res.bodyWriter.flush();
+		}();
+		const until = MonoTime.currTime + 5.seconds;
+		while (!release && MonoTime.currTime < until)
+			sleep(20.msecs);
+	}, (Json n) @safe {
+		if (n["method"].get!string == "notifications/cancelled")
+			cancelledId = n["params"]["requestId"].get!long;
+	});
+
+	bool timedOut;
+	Duration took;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		ClientSettings s;
+		s.requestTimeout = 300.msecs;
+		auto client = McpClient.http(url, s);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		const start = MonoTime.currTime;
+		try
+			client.listTools();
+		catch (RequestTimeoutException)
+			timedOut = true;
+		took = MonoTime.currTime - start;
+		const until = MonoTime.currTime + 2.seconds;
+		while (cancelledId < 0 && MonoTime.currTime < until)
+			sleep(20.msecs);
+		release = true;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(timedOut, "a silent SSE stream must fail with RequestTimeoutException");
+	assert(took < 3.seconds);
+	assert(cancelledId == silentId, "the timeout must send notifications/cancelled for the request");
 }

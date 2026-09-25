@@ -249,6 +249,14 @@ final class DuplexChannel
 		return coord.await(expectId, timeout);
 	}
 
+	/// Wake the task blocked awaiting request `id` with `reason` as its error, as
+	/// if the peer had replied with it. A later reply for `id` is then ignored.
+	/// A no-op when `id` is not pending.
+	void abort(long id, McpException reason) @safe
+	{
+		coord.resolve(Json(id), Json.undefined, toErrorJson(reason));
+	}
+
 	/// Originate a server->client request (the SERVER path: sampling / elicitation
 	/// / roots / ping), allocating a fresh id, and block until the peer replies.
 	/// Returns its result, or throws `McpException` on an error reply / timeout /

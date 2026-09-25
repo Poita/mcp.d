@@ -2,6 +2,7 @@ module mcp.client.transport;
 
 import vibe.data.json : Json;
 
+import mcp.protocol.errors : McpException;
 import mcp.protocol.jsonrpc : Message;
 
 public import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
@@ -49,6 +50,12 @@ interface ClientTransport
 	/// `expectId`. Interleaved notifications and server->client requests seen
 	/// while awaiting are dispatched to the inbound handler.
 	Json deliver(Json requestMessage, long expectId) @safe;
+
+	/// Stop waiting for the in-flight request `expectId`: wake its blocked
+	/// `deliver` (which then throws; `McpClient` substitutes `reason`) and release
+	/// any stream dedicated to that request. `McpClient` calls this when a request
+	/// times out or is cancelled. A no-op when no such request is in flight.
+	void abort(long expectId, McpException reason) @safe;
 
 	/// Send a message that expects no correlated reply: a notification, or a
 	/// response to a server->client request.

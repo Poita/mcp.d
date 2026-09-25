@@ -1746,6 +1746,7 @@ version (unittest)
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.client.transport : ClientTransport, SubscriptionStream, ClientProtocol;
+	import mcp.protocol.errors : McpException;
 
 	// A client transport that hands each request straight to an in-process
 	// McpServer, so the typed client helpers can be exercised end-to-end
@@ -1775,6 +1776,10 @@ version (unittest)
 		void sendOneway(Json message) @safe
 		{
 			server_.handle(Message(message));
+		}
+
+		void abort(long, McpException) @safe
+		{
 		}
 
 		bool repliesSynchronously() @safe

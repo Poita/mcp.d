@@ -181,6 +181,40 @@ struct ClientSettings
 	/// Knobs for the managed Events-extension subscriptions (`subscribePoll`,
 	/// `subscribeStream`, `subscribeWebhook`, `subscribeEvents`).
 	EventClientSettings events;
+
+	/// How long a request may wait for its response before it fails with
+	/// `RequestTimeoutException`; on expiry the client also cancels it on the
+	/// server (`notifications/cancelled`, or by closing a modern HTTP request's
+	/// stream). Applies to every transport. `Duration.zero` disables the limit.
+	Duration requestTimeout = 60.seconds;
+
+	/// Whether each `notifications/progress` for a request restarts its
+	/// `requestTimeout`, so a long-running request that keeps reporting progress
+	/// is not cut off (basic/utilities/progress).
+	bool resetTimeoutOnProgress = true;
+}
+
+/// Thrown by a request that received no response within
+/// `ClientSettings.requestTimeout` (restarted by progress when
+/// `resetTimeoutOnProgress` is set). The client has already cancelled the request
+/// on the server.
+class RequestTimeoutException : McpException
+{
+	this(string message) @safe
+	{
+		super(ErrorCode.internalError, message);
+	}
+}
+
+/// The client-side bookkeeping of one request awaiting its response.
+private final class InFlightRequest
+{
+	import vibe.core.core : Timer;
+
+	Timer timer;
+	bool armed;
+	string progressKey; // the request's progress token rendered as JSON, or empty
+	McpException abortReason;
 }
 
 /// Configuration for the client side of the MCP Events extension: how the
@@ -336,6 +370,11 @@ final class McpClient : ClientProtocol
 	// by token (not stacked on a single mutable field) so overlapping concurrent
 	// calls never clobber each other's sink or leave a stale wrapper installed.
 	private void delegate(ProgressNotification) @safe[string] perCallProgress_;
+	// Every request awaiting its response, keyed by JSON-RPC id: its deadline
+	// timer, the progress token that restarts it, and the reason it was aborted
+	// (timed out / cancelled), which `rpc` throws in place of the transport's
+	// wake-up error.
+	private InFlightRequest[long] inFlight_;
 	// Per-subscription push handlers, keyed by the `events/stream` request id (the
 	// subscriptionId stamped on every `notifications/events/*` frame). streamEvents
 	// registers; the stream's cleanup hook and a `terminated` frame deregister, so
@@ -508,7 +547,26 @@ final class McpClient : ClientProtocol
 		defaultCacheTtl_ = settings.defaultCacheTtl;
 		cachePartition_ = settings.cachePartition;
 		eventSettings_ = settings.events;
+		requestTimeout_ = settings.requestTimeout;
+		resetTimeoutOnProgress_ = settings.resetTimeoutOnProgress;
 		return this;
+	}
+
+	private Duration requestTimeout_ = ClientSettings.init.requestTimeout;
+	private bool resetTimeoutOnProgress_ = ClientSettings.init.resetTimeoutOnProgress;
+
+	/// How long a request may wait for its response; see
+	/// `ClientSettings.requestTimeout`. Settable after construction; applies to
+	/// requests issued afterwards.
+	Duration requestTimeout() const @safe
+	{
+		return requestTimeout_;
+	}
+
+	/// ditto
+	void requestTimeout(Duration timeout) @safe
+	{
+		requestTimeout_ = timeout;
 	}
 
 	private EventClientSettings eventSettings_;
@@ -2695,7 +2753,21 @@ final class McpClient : ClientProtocol
 			if (useModern)
 				params = injectModernMeta(params);
 			auto message = makeRequest(Json(id), method, params);
-			return transport.deliver(message, id);
+			auto req = beginRequest(id, params);
+			scope (exit)
+				endRequest(id, req);
+			Json result;
+			try
+				result = transport.deliver(message, id);
+			catch (Exception e)
+			{
+				if (req.abortReason !is null)
+					throw req.abortReason;
+				throw e;
+			}
+			if (req.abortReason !is null)
+				throw req.abortReason;
+			return result;
 		}
 		catch (McpException e)
 		{
@@ -2703,6 +2775,76 @@ final class McpClient : ClientProtocol
 				registerUrlElicitations(e.data);
 			throw e;
 		}
+	}
+
+	/// Track request `id` as in flight and, when a `requestTimeout` is set, arm
+	/// its deadline timer.
+	private InFlightRequest beginRequest(long id, Json params) @safe
+	{
+		import vibe.core.core : createTimer;
+
+		auto req = new InFlightRequest;
+		if (params.type == Json.Type.object && "_meta" in params
+				&& params["_meta"].type == Json.Type.object && "progressToken" in params["_meta"])
+			req.progressKey = params["_meta"]["progressToken"].toString();
+		if (requestTimeout_ > Duration.zero)
+		{
+			req.timer = createTimer(() @safe nothrow{
+				try
+					onRequestTimeout(id);
+				catch (Exception)
+				{
+				}
+			});
+			req.timer.rearm(requestTimeout_);
+			req.armed = true;
+		}
+		inFlight_[id] = req;
+		return req;
+	}
+
+	private void endRequest(long id, InFlightRequest req) @safe nothrow
+	{
+		if (req.armed)
+			req.timer.stop();
+		inFlight_.remove(id);
+	}
+
+	/// The deadline of request `id` passed: fail its waiter with a
+	/// `RequestTimeoutException` and cancel it on the server.
+	private void onRequestTimeout(long id) @safe
+	{
+		import std.conv : to;
+
+		auto r = id in inFlight_;
+		if (r is null || (*r).abortReason !is null)
+			return;
+		abortRequest(id, new RequestTimeoutException(
+				"Request " ~ id.to!string ~ " timed out after " ~ requestTimeout_.toString()),
+				"Request timed out");
+	}
+
+	/// Abort in-flight request `id`: wake its waiter with `reason`, then signal
+	/// the cancellation to the server (never for `initialize`, which clients MUST
+	/// NOT cancel).
+	private void abortRequest(long id, McpException reason, string cancelReason) @safe
+	{
+		if (auto r = id in inFlight_)
+			(*r).abortReason = reason;
+		transport.abort(id, reason);
+		if (id != initializeRequestId || initializeRequestId == 0)
+			signalCancellation(id, cancelReason);
+	}
+
+	/// Restart the deadline of every in-flight request whose progress token
+	/// renders as `progressKey`.
+	private void restartDeadlines(string progressKey) @safe
+	{
+		if (!resetTimeoutOnProgress_ || progressKey.length == 0)
+			return;
+		foreach (r; inFlight_.byValue)
+			if (r.armed && r.progressKey == progressKey && r.abortReason is null)
+				r.timer.rearm(requestTimeout_);
 	}
 
 	/// Register the `elicitationId`s announced by a `URLElicitationRequiredError`
@@ -2873,6 +3015,14 @@ final class McpClient : ClientProtocol
 	{
 		if (requestId == initializeRequestId && initializeRequestId != 0)
 			throw invalidRequest("The initialize request MUST NOT be cancelled by clients");
+		signalCancellation(requestId, reason);
+	}
+
+	/// Record `requestId` as cancelled (so a late response is dropped) and signal
+	/// it to the server: `notifications/cancelled`, or nothing more over a modern
+	/// Streamable HTTP transport, where closing the request's stream is the signal.
+	private void signalCancellation(long requestId, string reason) @safe
+	{
 		// Already tracked: nothing to add (and avoid a duplicate order entry).
 		if (requestId !in cancelledRequests_)
 		{
@@ -3097,6 +3247,8 @@ final class McpClient : ClientProtocol
 		// global observer.
 		if (method == "notifications/progress")
 		{
+			if (params.type == Json.Type.object && "progressToken" in params)
+				restartDeadlines(params["progressToken"].toString());
 			auto pn = ProgressNotification.fromJson(params);
 			auto perCall = pn.progressToken.toString() in perCallProgress_;
 			if (perCall !is null)
@@ -6864,6 +7016,13 @@ version (unittest)
 
 		void sendOneway(Json message) @safe
 		{
+		}
+
+		long[] aborted; // every id passed to abort, in order
+
+		void abort(long expectId, McpException reason) @safe
+		{
+			aborted ~= expectId;
 		}
 
 		bool repliesSynchronously() @safe
