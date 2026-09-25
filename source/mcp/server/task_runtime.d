@@ -416,13 +416,24 @@ final class TaskRuntime
 	}
 
 	/// Record `tasks/update` input responses for a task. Unknown/satisfied keys
-	/// are accepted silently (the runtime keeps the latest value per key).
+	/// are accepted silently (the runtime keeps the latest value per key). Throws
+	/// `-32602` when `inputResponses` is not an object, when the task is unknown,
+	/// or when it is already terminal (no executor will ever read the answers).
 	void deliverInput(string id, Json inputResponses) @safe
 	{
-		require(id); // throws if unknown task
+		import mcp.protocol.errors : invalidParams;
+
+		require(id);
 		if (inputResponses.type != Json.Type.object)
-			return;
+			throw invalidParams("tasks/update 'inputResponses' must be an object");
 		modify(id, (ref TaskRecord r) @trusted {
+			if (isTerminal(r.meta.status))
+			{
+				Json data = Json.emptyObject;
+				data["taskId"] = id;
+				throw new McpException(ErrorCode.invalidParams,
+					"Task is already " ~ taskStatusToWire(r.meta.status), data);
+			}
 			foreach (string k, v; inputResponses)
 				r.inputResponses[k] = v;
 			return Change.state;
@@ -866,4 +877,31 @@ unittest  // only one of two racing resumers moves the task back to working
 	]));
 	assert(rt.resumeWorking(t.taskId));
 	assert(!rt.resumeWorking(t.taskId));
+}
+
+unittest  // deliverInput rejects non-object inputResponses with -32602
+{
+	import std.exception : collectException;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	rt.requireInput(t.taskId, Json([
+			"a": Json(["method": Json("elicitation/create")])
+	]));
+	auto ex = cast(McpException) collectException(rt.deliverInput(t.taskId, Json("x")));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // deliverInput rejects answers for a terminal task with -32602
+{
+	import std.exception : collectException;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.create();
+	rt.complete(t.taskId, Json.emptyObject);
+	auto ex = cast(McpException) collectException(rt.deliverInput(t.taskId,
+			Json(["a": Json("late")])));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	assert(ex.data["taskId"].get!string == t.taskId);
+	assert(rt.takenInput(t.taskId).length == 0);
 }
