@@ -527,15 +527,17 @@ final class OAuthClient
 	/// GET an authorization URL (without following redirects) and extract the
 	/// `code` query parameter from the `Location` response header.
 	///
-	/// When `expectedState` is non-empty, the `state` parameter returned in the
-	/// redirect is verified against it (MCP authorization "Open Redirection":
-	/// "MCP clients SHOULD use and verify state parameters in the authorization
-	/// code flow and discard any results that do not include or have a mismatch
-	/// with the original state"). The authorization code is NOT returned (empty
-	/// string) when the returned state is missing or does not match. Passing an
-	/// empty `expectedState` (the default) skips state verification.
-	string authorizeAndGetCode(string authzUrl, string expectedState = "") @safe
+	/// The `state` parameter returned in the redirect is verified against
+	/// `expectedState` (MCP authorization "Open Redirection": "MCP clients SHOULD
+	/// use and verify state parameters in the authorization code flow and discard
+	/// any results that do not include or have a mismatch with the original
+	/// state"); a missing or mismatched state throws. An empty `expectedState` is
+	/// refused, since it would accept any response. This overload has no issuer to
+	/// check RFC 9207 `iss` against; prefer the overload taking the authorization
+	/// server metadata, which also validates `iss`.
+	string authorizeAndGetCode(string authzUrl, string expectedState) @safe
 	{
+		requireExpectedState(expectedState);
 		// SSRF guard: never issue the outbound GET to a plaintext-http (non-loopback)
 		// or internal/link-local authorization endpoint; the connect is pinned to a
 		// pre-vetted resolved address.
@@ -549,8 +551,17 @@ final class OAuthClient
 			res.dropBody();
 		});
 		if (!validateAuthorizationResponseState(state, expectedState))
-			return "";
+			throw invalidRequest(
+					"Authorization response failed 'state' validation (missing or mismatched state)");
 		return code;
+	}
+
+	private static void requireExpectedState(string expectedState) @safe
+	{
+		if (expectedState.length == 0)
+			throw invalidRequest(
+					"authorizeAndGetCode requires the state sent in the authorization "
+					~ "request, so the response can be verified");
 	}
 
 	/// GET an authorization URL (without following redirects), extract the
@@ -561,15 +572,16 @@ final class OAuthClient
 	/// `authorization_response_iss_parameter_supported` is true, or when it does
 	/// not match the recorded issuer (simple string comparison, no
 	/// normalization). The authorization code is NOT returned on rejection.
-	/// When `expectedState` is non-empty, the redirect `state` parameter is also
-	/// verified against it and the authorization code is discarded (a throw)
-	/// when it is missing or mismatched, per the MCP "Open Redirection" guidance
-	/// ("MCP clients SHOULD use and verify state parameters ... and discard any
-	/// results that do not include or have a mismatch with the original state").
-	/// Passing an empty `expectedState` (the default) skips state verification.
+	/// The redirect `state` parameter is also verified against `expectedState`
+	/// and the authorization code is discarded (a throw) when it is missing or
+	/// mismatched, per the MCP "Open Redirection" guidance ("MCP clients SHOULD
+	/// use and verify state parameters ... and discard any results that do not
+	/// include or have a mismatch with the original state"). An empty
+	/// `expectedState` is refused.
 	string authorizeAndGetCode(AuthorizationServerMetadata as_, string authzUrl,
-			string expectedState = "") @safe
+			string expectedState) @safe
 	{
+		requireExpectedState(expectedState);
 		// SSRF guard (see overload above); the connect is pinned to a pre-vetted
 		// resolved address.
 		string code, iss, state;
@@ -1107,14 +1119,14 @@ unittest  // authorizeAndGetCode refuses an internal/plaintext authorize URL bef
 
 	auto c = new OAuthClient();
 	// Both overloads must guard the outbound GET.
-	assertThrown(c.authorizeAndGetCode("http://169.254.169.254/authorize?x=1"));
-	assertThrown(c.authorizeAndGetCode("http://as.example.com/authorize?x=1"));
-	assertThrown(c.authorizeAndGetCode("https://[fd00::1]/authorize?x=1"));
+	assertThrown(c.authorizeAndGetCode("http://169.254.169.254/authorize?x=1", "st"));
+	assertThrown(c.authorizeAndGetCode("http://as.example.com/authorize?x=1", "st"));
+	assertThrown(c.authorizeAndGetCode("https://[fd00::1]/authorize?x=1", "st"));
 
 	AuthorizationServerMetadata as_;
 	as_.issuer = "https://as.example.com";
-	assertThrown(c.authorizeAndGetCode(as_, "http://169.254.169.254/authorize?x=1"));
-	assertThrown(c.authorizeAndGetCode(as_, "https://[::ffff:10.0.0.1]/authorize?x=1"));
+	assertThrown(c.authorizeAndGetCode(as_, "http://169.254.169.254/authorize?x=1", "st"));
+	assertThrown(c.authorizeAndGetCode(as_, "https://[::ffff:10.0.0.1]/authorize?x=1", "st"));
 }
 
 unittest  // discoverProtectedResource ignores a cross-origin resource_metadata URL
@@ -1551,10 +1563,8 @@ unittest  // authorizeAndGetCode extracts the code from the redirect Location he
 	auto c = new OAuthClient();
 	const authzUrl = srv.base ~ "/authorize?client_id=cid";
 
-	// Overload 1: state is verified when expectedState is non-empty.
+	// Overload 1: state is verified.
 	assert(c.authorizeAndGetCode(authzUrl, "st-1") == "auth-code-xyz");
-	// A mismatched expected state discards the code.
-	assert(c.authorizeAndGetCode(authzUrl, "wrong") == "");
 
 	// Overload 2: validates the RFC 9207 iss against the recorded issuer.
 	AuthorizationServerMetadata as_;
@@ -1572,4 +1582,40 @@ unittest  // authorizeAndGetCode extracts the code from the redirect Location he
 	assertThrown(c.authorizeAndGetCode(wrongIss, authzUrl, "st-1"));
 	// A state mismatch on the validating overload is likewise rejected.
 	assertThrown(c.authorizeAndGetCode(as_, authzUrl, "wrong-state"));
+}
+
+unittest  // authorizeAndGetCode throws on a mismatched state rather than returning an empty code
+{
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 302;
+		res.headers["Location"] = "http://localhost:8765/callback?code=auth-code-xyz&state=st-1";
+		res.writeBody("", "text/plain");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	assertThrown(c.authorizeAndGetCode(srv.base ~ "/authorize?client_id=cid", "wrong"));
+}
+
+unittest  // authorizeAndGetCode refuses to skip state verification (an empty expected state)
+{
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 302;
+		res.headers["Location"] = "http://localhost:8765/callback?code=injected-code";
+		res.writeBody("", "text/plain");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	const authzUrl = srv.base ~ "/authorize?client_id=cid";
+	assertThrown(c.authorizeAndGetCode(authzUrl, ""));
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	assertThrown(c.authorizeAndGetCode(as_, authzUrl, ""));
 }
