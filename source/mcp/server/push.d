@@ -41,9 +41,10 @@ struct ListenFilter
 	/// `notifications/resources/updated`, this resource `uri`) is one this stream
 	/// explicitly requested. An inactive filter (a plain GET stream) accepts every
 	/// notification; an active filter accepts only its opted-in types. Notification
-	/// methods that are not subscription-gated (progress, logging, elicitation
-	/// completion, server->client requests, etc.) are always accepted — 2026-07-28
-	/// filter governs only the four list/subscription change types.
+	/// methods that are not subscription-gated (progress, logging, server->client
+	/// requests, etc.) are always accepted — 2026-07-28 filter governs only the
+	/// four list/subscription change types — except
+	/// `notifications/elicitation/complete`, which 2026-07-28 removed.
 	bool accepts(string method, string uri = "") const @safe
 	{
 		if (!active)
@@ -64,6 +65,9 @@ struct ListenFilter
 			// A blanket boolean opt-in (no per-URI list) accepts any URI;
 			// otherwise only the explicitly named URIs are accepted.
 			return resourceUris.length == 0 || resourceUris.canFind(uri);
+		case "notifications/elicitation/complete":
+			// Removed in 2026-07-28; an active filter marks a modern stream.
+			return false;
 		default:
 			// Not a subscription-gated change notification: always deliverable.
 			return true;

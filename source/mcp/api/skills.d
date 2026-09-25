@@ -4,6 +4,7 @@ import std.typecons : nullable;
 import vibe.data.json : Json;
 
 import mcp.server.server : McpServer;
+import mcp.server.context : RequestContext;
 import mcp.server.skill_index : SkillIndex;
 import mcp.protocol.types : Resource, ResourceContents;
 
@@ -502,11 +503,11 @@ void registerDynamicSkill(McpServer server, DynamicSkill skill) @safe
 	addSkillEntry(server, entry);
 }
 
-/// Whether the connected client advertised the skills extension at
-/// initialization (valid after `initialize` / `server/discover`).
-bool clientSupportsSkills(McpServer server) @safe
+/// Whether the client behind `ctx` advertised the skills extension (at
+/// `initialize` for its session, or in the request's `_meta` on 2026-07-28).
+bool clientSupportsSkills(RequestContext ctx) @safe
 {
-	auto ext = server.clientExtensions();
+	auto ext = ctx.clientCapabilities.extensions;
 	return ext.type == Json.Type.object && (skillsExtensionKey in ext) !is null;
 }
 
@@ -1493,32 +1494,40 @@ unittest  // multiple skills accumulate in the listing in registration order
 	assert(result["skills"][1]["frontmatter"]["name"].get!string == "beta");
 }
 
-unittest  // clientSupportsSkills reflects what the client advertised at initialize
+version (unittest) private bool probeClientSupportsSkills(Json initCaps) @safe
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.types : Tool, CallToolResult;
 
 	auto s = new McpServer("t", "1");
+	bool seen;
+	Tool probe = {name: "probe"};
+	s.registerTool(probe, (Json args, RequestContext ctx) @safe {
+		seen = clientSupportsSkills(ctx);
+		return CallToolResult.init;
+	});
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-06-18";
+	params["capabilities"] = initCaps;
+	s.handle(Message(makeRequest(Json(1), "initialize", params)));
+	Json call = Json.emptyObject;
+	call["name"] = "probe";
+	s.handle(Message(makeRequest(Json(2), "tools/call", call)));
+	return seen;
+}
+
+unittest  // clientSupportsSkills reflects what the request's client advertised
+{
 	Json caps = Json.emptyObject;
 	Json ext = Json.emptyObject;
 	ext[skillsExtensionKey] = Json.emptyObject;
 	caps["extensions"] = ext;
-	Json params = Json.emptyObject;
-	params["protocolVersion"] = "2025-06-18";
-	params["capabilities"] = caps;
-	s.handle(Message(makeRequest(Json(1), "initialize", params)));
-	assert(clientSupportsSkills(s));
+	assert(probeClientSupportsSkills(caps));
 }
 
 unittest  // clientSupportsSkills is false when the client did not advertise it
 {
-	import mcp.protocol.jsonrpc : Message, makeRequest;
-
-	auto s = new McpServer("t", "1");
-	Json params = Json.emptyObject;
-	params["protocolVersion"] = "2025-06-18";
-	params["capabilities"] = Json.emptyObject;
-	s.handle(Message(makeRequest(Json(1), "initialize", params)));
-	assert(!clientSupportsSkills(s));
+	assert(!probeClientSupportsSkills(Json.emptyObject));
 }
 
 unittest  // SkillEntry.fromJson reads uri, frontmatter, and the resources manifest

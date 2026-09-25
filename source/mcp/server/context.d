@@ -139,6 +139,27 @@ interface RequestContext
 	/// Whether the connected client advertised `cap`.
 	bool clientSupports(ClientCapability cap) @safe;
 
+	/// The protocol version in effect for this request: the version the
+	/// request's session negotiated at `initialize` on the 2025-era protocols, or
+	/// the request's own `_meta.protocolVersion` on 2026-07-28. `latestLegacy` for
+	/// a context the server core did not dispatch.
+	final ProtocolVersion protocolVersion() @safe
+	{
+		if (auto s = cast(RequestScope) this)
+			return s.effectiveVersion;
+		return latestLegacy;
+	}
+
+	/// The capabilities this request's client declared: at `initialize` for its
+	/// session on the 2025-era protocols, or in the request's own `_meta` on
+	/// 2026-07-28. Empty for a context the server core did not dispatch.
+	final ClientCapabilities clientCapabilities() @safe
+	{
+		if (auto s = cast(RequestScope) this)
+			return s.requestClientCaps;
+		return ClientCapabilities.init;
+	}
+
 	/// True when this request is on a stateless (MRTR) protocol — 2026-07-28
 	/// revision, where there is no server->client channel. On such requests a
 	/// tool handler must NOT call `elicit`/`sample` (they throw); instead it
@@ -625,11 +646,15 @@ final class RequestScope : RequestContext, ConnectionScoped
 	private bool loggingRequested;
 	private CancellationToken cancellation;
 	private ProtocolVersion effectiveVersion_;
+	private ClientCapabilities clientCaps_;
 
 	this(RequestContext inner, bool stateless, Json[string] responses, string minLevel = "info",
 			bool loggingRequested = true, CancellationToken cancellation = null,
-			string requestState = "", ProtocolVersion effectiveVersion = latestLegacy) @safe
+			string requestState = "",
+			ProtocolVersion effectiveVersion = latestLegacy,
+			ClientCapabilities clientCaps = ClientCapabilities.init) @safe
 	{
+		this.clientCaps_ = clientCaps;
 		this.inner = inner;
 		this.stateless = stateless;
 		this.responses = responses;
@@ -649,6 +674,13 @@ final class RequestScope : RequestContext, ConnectionScoped
 	ProtocolVersion effectiveVersion() @safe
 	{
 		return effectiveVersion_;
+	}
+
+	/// The client capabilities in effect for THIS request (the session's
+	/// `initialize` capabilities, or the modern request's `_meta` capabilities).
+	ClientCapabilities requestClientCaps() @safe
+	{
+		return clientCaps_;
 	}
 
 	/// Delegate the connection token to the wrapped transport context: the

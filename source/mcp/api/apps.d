@@ -4,6 +4,7 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
 import mcp.server.server : McpServer;
+import mcp.server.context : RequestContext;
 import mcp.protocol.types : Tool, Resource, ResourceContents;
 
 @safe:
@@ -217,12 +218,12 @@ void enableApps(McpServer server, string[] mimeTypes = null) @safe
 	server.enableExtension(mcpAppsExtensionKey, settings);
 }
 
-/// Whether the connected client advertised the MCP Apps extension at
-/// initialization (valid after `initialize` / `server/discover`). A tool handler
-/// can branch on this to decide whether to return a UI-linked result.
-bool clientSupportsApps(McpServer server) @safe
+/// Whether the client behind `ctx` advertised the MCP Apps extension (at
+/// `initialize` for its session, or in the request's `_meta` on 2026-07-28). A
+/// tool handler can branch on this to decide whether to return a UI-linked result.
+bool clientSupportsApps(RequestContext ctx) @safe
 {
-	auto ext = server.clientExtensions();
+	auto ext = ctx.clientCapabilities.extensions;
 	return ext.type == Json.Type.object && (mcpAppsExtensionKey in ext) !is null;
 }
 
@@ -395,34 +396,41 @@ unittest  // enableApps surfaces the extension with its mimeTypes (2026-07-28)
 	assert(settings["mimeTypes"][0].get!string == mcpAppMimeType);
 }
 
-unittest  // clientSupportsApps reflects what the client advertised at initialize
+version (unittest) private bool probeClientSupportsApps(Json initCaps) @safe
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.types : CallToolResult;
+	import mcp.server.context : RequestContext;
 
 	auto s = new McpServer("t", "1");
+	bool seen;
+	Tool probe = {name: "probe"};
+	s.registerTool(probe, (Json args, RequestContext ctx) @safe {
+		seen = clientSupportsApps(ctx);
+		return CallToolResult.init;
+	});
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-06-18";
+	params["capabilities"] = initCaps;
+	s.handle(Message(makeRequest(Json(1), "initialize", params)));
+	Json call = Json.emptyObject;
+	call["name"] = "probe";
+	s.handle(Message(makeRequest(Json(2), "tools/call", call)));
+	return seen;
+}
+
+unittest  // clientSupportsApps reflects what the request's client advertised
+{
 	Json caps = Json.emptyObject;
 	Json ext = Json.emptyObject;
 	ext[mcpAppsExtensionKey] = Json(["mimeTypes": Json([Json(mcpAppMimeType)])]);
 	caps["extensions"] = ext;
-	Json params = Json.emptyObject;
-	params["protocolVersion"] = "2025-06-18";
-	params["capabilities"] = caps;
-	s.handle(Message(makeRequest(Json(1), "initialize", params)));
-
-	assert(clientSupportsApps(s));
+	assert(probeClientSupportsApps(caps));
 }
 
 unittest  // clientSupportsApps is false for a client that did not advertise it
 {
-	import mcp.protocol.jsonrpc : Message, makeRequest;
-
-	auto s = new McpServer("t", "1");
-	Json params = Json.emptyObject;
-	params["protocolVersion"] = "2025-06-18";
-	params["capabilities"] = Json.emptyObject;
-	s.handle(Message(makeRequest(Json(1), "initialize", params)));
-
-	assert(!clientSupportsApps(s));
+	assert(!probeClientSupportsApps(Json.emptyObject));
 }
 
 unittest  // registerUiResource serves HTML with the app mime type and _meta.ui

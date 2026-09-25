@@ -376,8 +376,10 @@ final class McpServer : ServerCore
 		return mode_;
 	}
 
-	/// The protocol version negotiated with the client (valid after `initialize`).
-	ProtocolVersion negotiatedVersion() const @safe
+	/// The protocol version negotiated on the single bound connection (stdio /
+	/// in-process). Per-request code reads `RequestContext.protocolVersion`, which
+	/// reflects the request's own session or `_meta`.
+	package(mcp) ProtocolVersion negotiatedVersion() const @safe
 	{
 		return activeConnection.negotiated;
 	}
@@ -735,7 +737,7 @@ final class McpServer : ServerCore
 		// server (where the tool handler that calls this runs against a fresh
 		// per-request state, NOT the listen stream's state nor the stale
 		// `activeConnection`). The 2025-era subscribe-then-deliver-on-GET path runs
-		// through `notifyChange`'s plain-GET fallback (`isSubscribed(uri)`), so
+		// through `notifyChange`'s plain-GET fallback (`plainGetEligibleFor`), so
 		// no caller-`cs` gate is applied here.
 		Json params = Json.emptyObject;
 		params["uri"] = uri;
@@ -755,27 +757,26 @@ final class McpServer : ServerCore
 	/// Streamable HTTP transport). Throws `invalidParams` on an empty
 	/// `elicitationId`.
 	///
-	/// The modern (modern) protocol removed this notification: a modern client tracks
+	/// The 2026-07-28 protocol removed this notification: a modern client tracks
 	/// URL-mode completion through the MRTR request-state retry, not a server push.
-	/// On a negotiated modern session this is therefore a no-op returning `0`; it
-	/// remains in effect for 2025-11-25 and earlier, where the notification is valid.
+	/// It is therefore never delivered on a modern `subscriptions/listen` stream
+	/// (HTTP or stdio); only 2025-era GET streams receive it.
 	size_t notifyElicitationComplete(string sessionId, string elicitationId) @safe
 	{
-		if (negotiatedVersion().isModern)
-			return 0;
+		enum method = "notifications/elicitation/complete";
 		if (elicitationId.length == 0)
-			throw invalidParams(
-					"notifications/elicitation/complete requires a non-empty elicitationId");
+			throw invalidParams(method ~ " requires a non-empty elicitationId");
 		Json params = Json.emptyObject;
 		params["elicitationId"] = elicitationId;
 		if (pushChannel is null)
 			return 0;
-		return pushChannel.pushToSession(sessionId, "notifications/elicitation/complete", params);
+		return pushChannel.pushToSession(sessionId, method, params);
 	}
 
-	/// The capabilities advertised by the connected client (valid after
-	/// `initialize`).
-	ClientCapabilities clientCapabilities() const @safe
+	/// The client capabilities declared on the single bound connection (stdio /
+	/// in-process). Per-request code reads `RequestContext.clientCapabilities`,
+	/// which reflects the request's own session or `_meta`.
+	package(mcp) ClientCapabilities clientCapabilities() const @safe
 	{
 		return activeConnection.clientCaps;
 	}
@@ -1259,13 +1260,6 @@ final class McpServer : ServerCore
 		extensions[identifier] = settings;
 	}
 
-	/// The extension identifiers and settings the connected client advertised
-	/// (valid after `initialize`). `Json.undefined` if the client advertised none.
-	Json clientExtensions() const @safe
-	{
-		return activeConnection.clientCaps.extensions;
-	}
-
 	/// The SEP-2640 skills index, created on first `enableSkills` / `registerSkill`
 	/// (`mcp.api.skills`), or null if no skill has been registered. The skills
 	/// helper layer adds entries here and the server's `skills/list` /
@@ -1288,18 +1282,6 @@ final class McpServer : ServerCore
 	void enableDirectoryRead() @safe
 	{
 		directoryReadEnabled_ = true;
-	}
-
-	/// Whether a client is currently subscribed to updates for `uri`.
-	bool isSubscribed(string uri) const @safe
-	{
-		return (uri in activeConnection.subscriptions) !is null;
-	}
-
-	/// The most recently set log level (default "info").
-	string currentLogLevel() const @safe
-	{
-		return activeConnection.logLevel;
 	}
 
 	/// Attach the server->client push channel for *unsolicited* traffic — the
@@ -1576,7 +1558,7 @@ final class McpServer : ServerCore
 			// 2025-era standalone GET stream, never present in stateless/modern) falls
 			// back to `plainEligible` for legacy delivery:
 			// list-changed broadcasts unconditionally, while `resources/updated` honours
-			// the 2025-era subscribe-then-deliver gate (`isSubscribed(uri)`). On the
+			// the 2025-era subscribe-then-deliver gate (`plainGetEligibleFor`). On the
 			// modern single-connection path the global opt-in still gates that fallback.
 			const plainEligible = plainGetEligible(method, uri);
 			// Every change notification fans out once per session and once per
@@ -1594,7 +1576,7 @@ final class McpServer : ServerCore
 	/// filter and ignores this). This preserves the legacy delivery semantics: the
 	/// three list-changed notifications broadcast unconditionally, while
 	/// `notifications/resources/updated` is delivered only for a URI the client
-	/// subscribed to via `resources/subscribe` (`isSubscribed`). A plain GET stream
+	/// subscribed to via `resources/subscribe` (`plainGetEligibleFor`). A plain GET stream
 	/// only exists on a legacy connection (the modern answers GET with 405), so
 	/// there is no modern branch here — modern delivery is entirely per-stream-filter
 	/// driven.
@@ -1611,6 +1593,8 @@ final class McpServer : ServerCore
 	{
 		if (method == "notifications/resources/updated")
 			return conn !is null && (uri in conn.subscriptions) !is null;
+		if (method == "notifications/elicitation/complete")
+			return conn is null || !conn.negotiated.isModern;
 		return true;
 	}
 
@@ -1917,8 +1901,8 @@ final class McpServer : ServerCore
 					// version is fixed at `initialize` and governs every request, so a
 					// per-request body version is ignored for version selection.
 					effective = mv;
-					// Per-request client capabilities (modern, stateless): not stored on the
-					// shared instance. clientCapabilities() reflects the negotiated session.
+					// Per-request client capabilities (modern, stateless) are not stored
+					// on the shared instance; the request scope carries them.
 					if (meta.logLevel.isNull)
 					{
 						// No logLevel field -> the client did not request logging.
@@ -2018,8 +2002,10 @@ final class McpServer : ServerCore
 		// (MRTR vs blocking), the input responses carried on a retried modern
 		// request, and the cancellation token, regardless of which transport
 		// supplied the base context.
-		auto scoped = new RequestScope(ctx, effective.usesMRTR, readInputResponses(msg.params),
-				requestLogLevel, loggingRequested, token, incomingState, effective);
+		auto scoped = new RequestScope(ctx, effective.usesMRTR,
+				readInputResponses(msg.params), requestLogLevel,
+				loggingRequested, token, incomingState,
+				effective, effective.isModern ? meta.clientCapabilities : conn.clientCaps);
 
 		try
 		{
@@ -2664,7 +2650,7 @@ final class McpServer : ServerCore
 	/// `promptsListChanged` and `resourcesListChanged` flags are booleans, while
 	/// `resourceSubscriptions` is a `string[]` of resource URIs the client wants
 	/// `notifications/resources/updated` for. Those URIs are recorded as per-URI
-	/// subscriptions (so `isSubscribed`/`notifyResourceUpdated` honour them) and
+	/// subscriptions (so `notifyResourceUpdated` honours them) and
 	/// the `resourceSubscriptions` opt-in is flagged when the array is non-empty.
 	/// A flat top-level filter is also accepted when no `notifications` object is
 	/// present.
@@ -4746,6 +4732,62 @@ unittest  // a cancellation on connection B must not suppress connection A's sam
 	assert(resp.get["result"]["content"][0]["text"].get!string == "done");
 }
 
+unittest  // a handler reads its own session's version and capabilities from ctx
+{
+	auto s = McpServer.stateful("t", "1");
+	auto stateA = new ConnectionState;
+	auto stateB = new ConnectionState;
+
+	ProtocolVersion seenVersion;
+	bool seenSampling;
+	Tool probe = {name: "probe"};
+	s.registerTool(probe, (Json args, RequestContext ctx) @safe {
+		seenVersion = ctx.protocolVersion;
+		seenSampling = ctx.clientCapabilities.sampling;
+		return CallToolResult.init;
+	});
+
+	Json initA = Json.emptyObject;
+	initA["protocolVersion"] = "2025-03-26";
+	initA["capabilities"] = Json(["sampling": Json.emptyObject]);
+	s.handle(req(1, "initialize", initA), new ConnCtx("A", stateA));
+	Json initB = Json.emptyObject;
+	initB["protocolVersion"] = "2025-11-25";
+	initB["capabilities"] = Json.emptyObject;
+	s.handle(req(1, "initialize", initB), new ConnCtx("B", stateB));
+
+	Json call = Json.emptyObject;
+	call["name"] = "probe";
+	s.handle(req(2, "tools/call", call), new ConnCtx("A", stateA));
+	assert(seenVersion == ProtocolVersion.v2025_03_26);
+	assert(seenSampling);
+	s.handle(req(2, "tools/call", call), new ConnCtx("B", stateB));
+	assert(seenVersion == ProtocolVersion.v2025_11_25);
+	assert(!seenSampling);
+}
+
+unittest  // a modern handler reads the request's own _meta capabilities from ctx
+{
+	auto s = new McpServer("t", "1");
+	bool seenSampling;
+	ProtocolVersion seenVersion;
+	Tool probe = {name: "probe"};
+	s.registerTool(probe, (Json args, RequestContext ctx) @safe {
+		seenVersion = ctx.protocolVersion;
+		seenSampling = ctx.clientCapabilities.sampling;
+		return CallToolResult.init;
+	});
+	Json call = Json.emptyObject;
+	call["name"] = "probe";
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json(["sampling": Json.emptyObject]);
+	call["_meta"] = meta;
+	s.handle(req(1, "tools/call", call));
+	assert(seenVersion == ProtocolVersion.v2026_07_28);
+	assert(seenSampling);
+}
+
 unittest  // a cancellation on the SAME connection still cancels
 {
 	auto s = new McpServer("t", "1");
@@ -5428,7 +5470,7 @@ unittest  // logging/setLevel is refused on a stateless server (no session-scope
 	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 	// The default level is untouched by the rejected request.
-	assert(s.currentLogLevel == "info");
+	assert(s.activeConnection.logLevel == "info");
 }
 
 unittest  // logging/setLevel stores the level and returns an empty object
@@ -5439,7 +5481,7 @@ unittest  // logging/setLevel stores the level and returns an empty object
 	p["level"] = "debug";
 	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
 	assert(resp["result"].type == Json.Type.object && resp["result"].length == 0);
-	assert(s.currentLogLevel == "debug");
+	assert(s.activeConnection.logLevel == "debug");
 }
 
 unittest  // logging/setLevel rejects an unrecognised level with -32602
@@ -5451,7 +5493,7 @@ unittest  // logging/setLevel rejects an unrecognised level with -32602
 	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 	// The invalid level must not have been stored.
-	assert(s.currentLogLevel == "info");
+	assert(s.activeConnection.logLevel == "info");
 }
 
 unittest  // logging/setLevel requires a string 'level' param
@@ -5475,7 +5517,7 @@ unittest  // logging/setLevel is rejected when the logging capability was never 
 	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 	// The level must not have been mutated by the rejected request.
-	assert(s.currentLogLevel == "info");
+	assert(s.activeConnection.logLevel == "info");
 }
 
 unittest  // modern: logging/setLevel is method-not-found (removed in 2026-07-28)
@@ -5490,7 +5532,7 @@ unittest  // modern: logging/setLevel is method-not-found (removed in 2026-07-28
 	p["level"] = "debug";
 	auto resp = s.handle(modernReq(1, "logging/setLevel", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
-	assert(s.currentLogLevel == "info");
+	assert(s.activeConnection.logLevel == "info");
 }
 
 unittest  // after setLevel(error), a handler's sub-error logs are dropped
@@ -5851,8 +5893,8 @@ unittest  // server reads the extensions a client advertises at initialize
 	params["capabilities"] = caps;
 	s.handle(req(1, "initialize", params));
 
-	assert(s.clientExtensions.type == Json.Type.object);
-	assert("io.modelcontextprotocol/ui" in s.clientExtensions);
+	assert(s.activeConnection.clientCaps.extensions.type == Json.Type.object);
+	assert("io.modelcontextprotocol/ui" in s.activeConnection.clientCaps.extensions);
 	assert("io.modelcontextprotocol/ui" in s.clientCapabilities.extensions);
 }
 
@@ -5866,11 +5908,11 @@ unittest  // resources/subscribe and unsubscribe track URIs and return {}
 	p["uri"] = "test://w";
 	auto sub = s.handle(req(1, "resources/subscribe", p)).get;
 	assert(sub["result"].type == Json.Type.object && sub["result"].length == 0);
-	assert(s.isSubscribed("test://w"));
+	assert(("test://w" in s.activeConnection.subscriptions));
 
 	auto unsub = s.handle(req(2, "resources/unsubscribe", p)).get;
 	assert(unsub["result"].length == 0);
-	assert(!s.isSubscribed("test://w"));
+	assert(("test://w" !in s.activeConnection.subscriptions));
 }
 
 unittest  // resources/subscribe is rejected with -32601 when capability not advertised
@@ -5884,7 +5926,7 @@ unittest  // resources/subscribe is rejected with -32601 when capability not adv
 	auto resp = s.handle(req(1, "resources/subscribe", p)).get;
 	assert("error" in resp);
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
-	assert(!s.isSubscribed("test://w"));
+	assert(("test://w" !in s.activeConnection.subscriptions));
 }
 
 unittest  // modern: resources/subscribe is method-not-found (subscriptions/listen takes its place)
@@ -5900,7 +5942,7 @@ unittest  // modern: resources/subscribe is method-not-found (subscriptions/list
 	p["uri"] = "test://w";
 	auto resp = s.handle(modernReq(1, "resources/subscribe", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
-	assert(!s.isSubscribed("test://w"));
+	assert(("test://w" !in s.activeConnection.subscriptions));
 }
 
 unittest  // resources/unsubscribe is rejected with -32601 when capability not advertised
@@ -7630,7 +7672,7 @@ unittest  // subscriptions/listen reads the spec-shaped filter nested under para
 	assert(f.resourceSubscriptions);
 	assert(!f.promptsListChanged);
 	// resourceSubscriptions URIs are tracked as per-URI subscriptions.
-	assert(s.isSubscribed("file:///project/config.json"));
+	assert(("file:///project/config.json" in s.activeConnection.subscriptions));
 }
 
 unittest  // subscriptions/listen accepts the flat (top-level) filter shape
@@ -7865,7 +7907,7 @@ unittest  // subscriptions/listen ack omits resourceSubscriptions when subscript
 	s.handle(modernReq(4, "subscriptions/listen", p));
 	assert(!s.cs().listenFilter.resourceSubscriptions);
 	assert("resourceSubscriptions" !in s.acknowledgedSubsetFor(s.cs().listenFilter));
-	assert(!s.isSubscribed("file:///x"));
+	assert(("file:///x" !in s.activeConnection.subscriptions));
 }
 
 unittest  // a stateless/modern server honours a subscriptions/listen resourceSubscriptions filter
@@ -7895,7 +7937,7 @@ unittest  // subscriptions/listen ack keeps resourceSubscriptions once enabled
 	s.handle(modernReq(4, "subscriptions/listen", p));
 	assert(s.cs().listenFilter.resourceSubscriptions);
 	assert(s.acknowledgedSubsetFor(s.cs().listenFilter)["resourceSubscriptions"].length == 1);
-	assert(s.isSubscribed("file:///x"));
+	assert(("file:///x" in s.activeConnection.subscriptions));
 }
 
 version (unittest)
@@ -8682,19 +8724,45 @@ unittest  // notifyElicitationComplete is a no-op before a push channel exists
 	assert(s.notifyElicitationComplete("", "elic-1") == 0);
 }
 
-unittest  // notifyElicitationComplete is a no-op on a modern (modern) session
+unittest  // notifyElicitationComplete never reaches a modern subscriptions/listen stream
 {
-	// The modern removed `notifications/elicitation/complete`; even with an open
-	// push channel a modern session must emit nothing.
+	// 2026-07-28 removed `notifications/elicitation/complete`; a modern listen
+	// stream (an active filter) must not receive it.
 	auto s = new McpServer("t", "1");
-	s.activeConnection.negotiated = ProtocolVersion.v2026_07_28;
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
-	ch.addListener((string f) @safe { received ~= f; });
+	ListenFilter modern;
+	modern.active = true;
+	modern.toolsListChanged = true;
+	ch.addListener((string f) @safe { received ~= f; }, Json(1), modern);
 
 	assert(s.notifyElicitationComplete("", "elic-123") == 0);
 	assert(received.length == 0);
+}
+
+unittest  // notifyElicitationComplete never reaches a stdio subscriptions/listen stream
+{
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+			"subscriptions/listen", params)), &sink));
+	const before = frames.length;
+
+	assert(s.notifyElicitationComplete("", "elic-123") == 0);
+	assert(frames.length == before);
 }
 
 unittest  // notifyElicitationComplete rejects an empty elicitationId
@@ -9730,11 +9798,13 @@ unittest  // a STATEFUL server advertises + honours subscribe
 	sub["uri"] = "res://x";
 	auto resp = s.handle(req(1, "resources/subscribe", sub)).get;
 	assert("error" !in resp, "stateful resources/subscribe must succeed");
-	assert(s.isSubscribed("res://x"), "stateful subscribe must record the subscription");
+	assert(("res://x" in s.activeConnection.subscriptions),
+			"stateful subscribe must record the subscription");
 
 	auto resp2 = s.handle(req(2, "resources/unsubscribe", sub)).get;
 	assert("error" !in resp2, "stateful resources/unsubscribe must succeed");
-	assert(!s.isSubscribed("res://x"), "stateful unsubscribe must drop the subscription");
+	assert(("res://x" !in s.activeConnection.subscriptions),
+			"stateful unsubscribe must drop the subscription");
 }
 
 unittest  // stateless requests get INDEPENDENT ConnectionState; the server keeps no reference

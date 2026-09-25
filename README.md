@@ -529,7 +529,7 @@ registerUiResource(server, "ui://weather/dashboard", "weather_dashboard",
 
 A `@tool` carries its UI link via `@ui(resourceUri, visibility…)` (folded into the
 tool's `_meta.ui`); the dynamic path uses `setUiToolMeta(tool, UiToolMeta(...))`.
-`clientSupportsApps(server)` reports whether the connected client opted into the
+`clientSupportsApps(ctx)` reports whether the calling client opted into the
 extension. The runnable [Apps example](examples/apps/) verifies the whole surface
 over both transports.
 
