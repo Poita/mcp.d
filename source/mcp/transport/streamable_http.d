@@ -2,7 +2,6 @@ module mcp.transport.streamable_http;
 
 import vibe.http.server;
 import vibe.http.router : URLRouter;
-import vibe.stream.operations : readAllUTF8;
 import vibe.data.json : Json;
 import std.typecons : Nullable;
 import core.time : Duration, seconds;
@@ -94,6 +93,10 @@ struct StreamableHttpOptions
 	/// process. Lines are written through vibe.core.log to the console, unless
 	/// `accessLogFile` directs them to a file instead.
 	bool accessLog = false;
+
+	/// The largest POST body (in bytes) the MCP and legacy message endpoints
+	/// accept. A larger body is answered with 413 and a JSON-RPC error.
+	size_t maxRequestBytes = 2 * 1024 * 1024;
 	/// When `accessLog` is enabled, write the access-log lines to this file path
 	/// instead of the console. Ignored unless `accessLog` is set.
 	string accessLogFile = "";
@@ -210,7 +213,16 @@ void mountMcp(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		handlePost(server, coord, sessions, token, req, res);
+		if (!isJsonContentType(req.headers.get("Content-Type", "")))
+		{
+			writeJsonRpcError(res, HTTPStatus.unsupportedMediaType,
+				invalidRequest("POST Content-Type must be application/json"));
+			return;
+		}
+		string payload;
+		if (!readPostBody(req, res, opts.maxRequestBytes, payload))
+			return;
+		handlePost(server, coord, sessions, token, payload, req, res);
 	});
 	auto push = ensurePushChannel(server, coord);
 	router.get(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
@@ -319,7 +331,9 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		const payload = req.bodyReader.readAllUTF8();
+		string payload;
+		if (!readPostBody(req, res, opts.maxRequestBytes, payload))
+			return;
 		// The per-stream session token the client echoes from its `endpoint` event
 		// correlates this POST with the GET stream that should receive the reply, so
 		// a response never leaks onto another client's stream. A POST without one,
@@ -1737,10 +1751,75 @@ private McpException validatePostRequestHeaders(HTTPServerRequest req,
 	return null;
 }
 
-private void handlePost(McpServer server, StreamCoordinator coord,
-		SessionManager sessions, TokenInfo token, HTTPServerRequest req, HTTPServerResponse res) @safe
+/// Whether a POST `Content-Type` names `application/json` (case-insensitive,
+/// parameters such as `charset` allowed).
+private bool isJsonContentType(string contentType) @safe
 {
-	const payload = req.bodyReader.readAllUTF8();
+	import std.string : indexOf, strip;
+	import std.uni : sicmp;
+
+	const semi = contentType.indexOf(';');
+	const media = (semi < 0 ? contentType : contentType[0 .. semi]).strip;
+	return sicmp(media, "application/json") == 0;
+}
+
+/// Write `e` as a null-id JSON-RPC error response with HTTP `status`.
+private void writeJsonRpcError(HTTPServerResponse res, HTTPStatus status, McpException e) @safe
+{
+	res.statusCode = status;
+	res.writeBody(makeErrorResponse(Json(null), e).toString(), "application/json");
+}
+
+/// Read a POST body of at most `maxBytes` as UTF-8. On failure a JSON-RPC error
+/// response has already been written — 413 for an oversized body, 400 with
+/// -32700 for invalid UTF-8 — and false is returned.
+private bool readPostBody(HTTPServerRequest req, HTTPServerResponse res,
+		size_t maxBytes, out string payload) @safe
+{
+	import std.conv : to, ConvException;
+	import std.utf : validate, UTFException;
+	import vibe.stream.operations : readAll;
+	import vibe.utils.string : stripUTF8Bom;
+
+	auto tooLarge = invalidRequest("request body exceeds " ~ maxBytes.to!string ~ " bytes");
+	const declared = req.headers.get("Content-Length", "");
+	if (declared.length)
+	{
+		ulong n;
+		try
+			n = declared.to!ulong;
+		catch (ConvException)
+			n = ulong.max;
+		if (n > maxBytes)
+		{
+			writeJsonRpcError(res, HTTPStatus.requestEntityTooLarge, tooLarge);
+			return false;
+		}
+	}
+	ubyte[] raw;
+	try
+		raw = req.bodyReader.readAll(maxBytes);
+	catch (Exception)
+	{
+		writeJsonRpcError(res, HTTPStatus.requestEntityTooLarge, tooLarge);
+		return false;
+	}
+	auto text = () @trusted { return cast(string) raw; }();
+	try
+		validate(text);
+	catch (UTFException)
+	{
+		writeJsonRpcError(res, HTTPStatus.badRequest,
+				parseError("request body is not valid UTF-8"));
+		return false;
+	}
+	payload = stripUTF8Bom(text);
+	return true;
+}
+
+private void handlePost(McpServer server, StreamCoordinator coord, SessionManager sessions,
+		TokenInfo token, string payload, HTTPServerRequest req, HTTPServerResponse res) @safe
+{
 
 	ParsedInput input;
 	try
@@ -2493,6 +2572,9 @@ private HTTPServerSettings buildStreamableHttpSettings(ushort port, StreamableHt
 	auto settings = new HTTPServerSettings;
 	settings.port = port;
 	settings.bindAddresses = opts.bindAddresses;
+	// Every body-reading route enforces `opts.maxRequestBytes` itself so an
+	// oversized body gets a JSON-RPC error instead of vibe's plain-text 400.
+	settings.maxRequestSize = ulong.max;
 	if (opts.accessLog)
 	{
 		if (opts.accessLogFile.length)
@@ -3752,6 +3834,73 @@ unittest  // a POST request whose Accept excludes both media types is rejected w
 
 	assert(res.statusCode == HTTPStatus.notAcceptable);
 	assert(SessionHeader !in res.headers);
+}
+
+version (unittest) private HTTPServerResponse postToMount(string body_,
+		string[string] headers, StreamableHttpOptions opts, out string responseBody) @safe
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto router = new URLRouter;
+	mountMcp(router, new McpServer("t", "1"), opts);
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(body_, headers), res);
+	responseBody = () @trusted { return cast(string) sink.data.idup; }();
+	return res;
+}
+
+unittest  // a POST body that is not valid UTF-8 is a 400 JSON-RPC parse error
+{
+	import vibe.data.json : parseJsonString;
+
+	string reply;
+	auto res = postToMount("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"x\":\"\xff\"}",
+			null, StreamableHttpOptions.init, reply);
+	assert(res.statusCode == HTTPStatus.badRequest);
+	assert(parseJsonString(reply)["error"]["code"].get!int == ErrorCode.parseError);
+}
+
+unittest  // a POST body over maxRequestBytes is a 413 with a JSON-RPC error
+{
+	import vibe.data.json : parseJsonString;
+
+	StreamableHttpOptions opts;
+	opts.maxRequestBytes = 16;
+	string reply;
+	auto res = postToMount(initializeBody(), null, opts, reply);
+	assert(res.statusCode == HTTPStatus.requestEntityTooLarge);
+	assert(parseJsonString(reply)["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // a POST whose Content-Type is not application/json is a 415 with a JSON-RPC error
+{
+	import vibe.data.json : parseJsonString;
+
+	string reply;
+	auto res = postToMount(initializeBody(), ["Content-Type": "text/plain"],
+			StreamableHttpOptions.init, reply);
+	assert(res.statusCode == HTTPStatus.unsupportedMediaType);
+	assert(parseJsonString(reply)["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // a POST Content-Type of application/json with parameters is accepted
+{
+	string reply;
+	auto res = postToMount(initializeBody(),
+			["Content-Type": "Application/JSON; charset=utf-8"], StreamableHttpOptions.init, reply);
+	assert(res.statusCode == HTTPStatus.ok);
+}
+
+unittest  // runStreamableHttp's listener leaves body limits to the transport
+{
+	StreamableHttpOptions opts;
+	opts.maxRequestBytes = 64;
+	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
+	assert(settings.maxRequestSize == ulong.max,
+			"vibe must not reject an oversized body with a plain-text 400 first");
 }
 
 unittest  // a JSON-only POST drops a handler's log/progress notifications and returns the result
