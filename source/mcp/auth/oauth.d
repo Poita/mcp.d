@@ -1087,11 +1087,15 @@ unittest  // isSecureFetchUrlResolved rejects the '?@' / '#@' authority differen
 	assert(!isSecureFetchUrlResolved("https://public#@10.0.0.5/jwks"));
 }
 
-unittest  // isSecureFetchUrlResolved accepts lexically-safe loopback without resolving (dev)
+unittest  // isSecureFetchUrlResolved accepts plain-http loopback without resolving (dev)
 {
-	assert(isSecureFetchUrlResolved("https://127.0.0.1/jwks"));
 	assert(isSecureFetchUrlResolved("http://127.0.0.1:8765/jwks"));
 	assert(isSecureFetchUrlResolved("http://[::1]:9000/jwks"));
+}
+
+unittest  // isSecureFetchUrlResolved rejects loopback over https (local TLS services)
+{
+	assert(!isSecureFetchUrlResolved("https://127.0.0.1/jwks"));
 }
 
 unittest  // valid CIMD client_id: https with a path component

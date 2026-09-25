@@ -662,13 +662,14 @@ struct PinnedConnect
 /// Vet a `host` (authority host, optionally bracketed / with a `:port` suffix)
 /// against `policy` for a raw-TCP connect, returning the address to connect to
 /// and the SNI/Host name to present. `tls` records whether the connection uses
-/// TLS; the http-vs-loopback scheme restriction itself is enforced by the
-/// caller's scheme gate (`secureRequestHTTP`), not here.
+/// TLS.
 ///
 /// `blockInternal`: public hosts pass; an explicit literal-loopback host
-/// (`localhost`, `127.x` in any encoding, `[::1]`) passes as the dev-loopback
-/// allowance; everything else — including a registered name that DNS-resolves to
-/// loopback — is rejected (`classifyHost` demotes resolved loopback to private).
+/// (`localhost`, `127.x` in any encoding, `[::1]`) passes only over plain http,
+/// as the dev-loopback allowance; everything else — including loopback over TLS
+/// and a registered name that DNS-resolves to loopback — is rejected
+/// (`classifyHost` demotes resolved loopback to private). A caller that must
+/// reach a loopback TLS service uses `allowUserConfigured`.
 /// `allowUserConfigured`: every classifiable host passes (loopback and private
 /// included); only a fail-closed classification (unresolvable / malformed)
 /// is rejected.
@@ -693,9 +694,12 @@ PinnedConnect pinnedConnectAddress(string host, bool tls, SsrfPolicy policy) @sa
 	case SsrfPolicy.blockInternal:
 		if (cls == AddressClass.public_)
 			break;
-		if (cls == AddressClass.loopback)
-			break; // literal-loopback dev allowance; the caller's scheme gate restricts http to it
-		return r; // private/link-local -> reject
+		// Literal loopback is the plain-http dev allowance only: over TLS it would
+		// reach local TLS services (admin consoles, sidecars) from an
+		// attacker-chosen URL.
+		if (cls == AddressClass.loopback && !tls)
+			break;
+		return r; // loopback over TLS, private/link-local -> reject
 	case SsrfPolicy.allowUserConfigured:
 		break; // any classifiable host is permitted
 	}
@@ -1049,12 +1053,33 @@ unittest  // blockInternal accepts a public host over https and pins it
 	assert(r.ok && r.pinnedIp == "8.8.8.8" && r.sniHost == "8.8.8.8");
 }
 
-unittest  // blockInternal permits the explicit loopback dev allowance (http and https)
+unittest  // blockInternal permits the explicit loopback dev allowance over plain http
 {
 	assert(pinnedConnectAddress("127.0.0.1", false, SsrfPolicy.blockInternal).ok);
-	assert(pinnedConnectAddress("127.0.0.1", true, SsrfPolicy.blockInternal).ok);
 	assert(pinnedConnectAddress("localhost", false, SsrfPolicy.blockInternal).ok);
 	assert(pinnedConnectAddress("[::1]", false, SsrfPolicy.blockInternal).ok);
+}
+
+unittest  // blockInternal rejects loopback over https (local TLS services are not reachable)
+{
+	assert(!pinnedConnectAddress("127.0.0.1", true, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("2130706433", true, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("localhost", true, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("[::1]", true, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("[64:ff9b::7f00:1]", true, SsrfPolicy.blockInternal).ok);
+}
+
+unittest  // allowUserConfigured still reaches loopback over https
+{
+	assert(pinnedConnectAddress("127.0.0.1", true, SsrfPolicy.allowUserConfigured).ok);
+}
+
+unittest  // secureRequestHTTP(blockInternal) refuses an https loopback URL before connecting
+{
+	import std.exception : assertThrown;
+
+	assertThrown(secureRequestHTTP("https://127.0.0.1:8443/client.json",
+			SsrfPolicy.blockInternal, null, null));
 }
 
 unittest  // blockInternal rejects private/link-local hosts
