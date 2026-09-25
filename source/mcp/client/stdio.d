@@ -971,3 +971,123 @@ unittest  // progress for a stdio request resets its timeout
 	assert(completed);
 	assert(progressSeen == 6);
 }
+
+unittest  // cancelling a call's CancellationToken fails it at once and sends notifications/cancelled
+{
+	import core.time : msecs, seconds, MonoTime, Duration;
+	import vibe.core.core : sleep;
+	import mcp.client.client : ClientSettings, RequestOptions, CancellationToken;
+	import mcp.protocol.errors : ErrorCode;
+
+	auto toClient = new TestLines;
+	auto toServer = new TestLines;
+	int code;
+	Duration took;
+	Json cancelled;
+	const failure = inLoopCapturing(() @safe {
+		ClientSettings s;
+		s.requestTimeout = Duration.zero;
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			toServer.put(l);
+		}, s);
+		auto token = new CancellationToken;
+		RequestOptions opts;
+		opts.cancellation = token;
+		runTask(() nothrow{
+			try
+			{
+				sleep(100.msecs);
+				token.cancel("user aborted");
+			}
+			catch (Exception)
+			{
+			}
+		});
+		const start = MonoTime.currTime;
+		try
+			client.callTool("slow", Json.emptyObject, opts);
+		catch (McpException e)
+			code = e.code;
+		took = MonoTime.currTime - start;
+		auto req = parseJsonString(toServer.take());
+		cancelled = parseJsonString(toServer.take());
+		assert(cancelled["params"]["requestId"] == req["id"]);
+		// A late response for the cancelled request is ignored.
+		Json result = Json.emptyObject;
+		result["content"] = Json.emptyArray;
+		toClient.put(makeResponse(req["id"], result).toString());
+		foreach (_; 0 .. 4)
+			yield();
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(code == ErrorCode.requestCancelled, "a cancelled call must fail with requestCancelled");
+	assert(took < 5.seconds);
+	assert(cancelled["method"].get!string == "notifications/cancelled");
+	assert(cancelled["params"]["reason"].get!string == "user aborted");
+}
+
+unittest  // a call whose CancellationToken is already cancelled sends nothing
+{
+	import mcp.client.client : RequestOptions, CancellationToken;
+	import mcp.protocol.errors : ErrorCode;
+
+	string[] toServer;
+	int code;
+	const failure = inLoopCapturing(() @safe {
+		auto client = McpClient.stdio(() @safe => cast(string) null, (string l) @safe {
+			toServer ~= l;
+		});
+		auto token = new CancellationToken;
+		token.cancel();
+		RequestOptions opts;
+		opts.cancellation = token;
+		try
+			client.listTools(opts);
+		catch (McpException e)
+			code = e.code;
+	});
+	assert(failure.length == 0, failure);
+	assert(code == ErrorCode.requestCancelled);
+	assert(toServer.length == 0);
+}
+
+unittest  // cancel(id) on an in-flight stdio request wakes its caller at once
+{
+	import core.time : msecs, seconds, MonoTime, Duration;
+	import vibe.core.core : sleep;
+	import mcp.client.client : ClientSettings;
+	import mcp.protocol.errors : ErrorCode;
+
+	auto toClient = new TestLines;
+	auto toServer = new TestLines;
+	int code;
+	Duration took;
+	const failure = inLoopCapturing(() @safe {
+		ClientSettings s;
+		s.requestTimeout = Duration.zero;
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			toServer.put(l);
+		}, s);
+		runTask(() nothrow{
+			try
+			{
+				auto req = parseJsonString(toServer.take());
+				client.cancel(req["id"].get!long);
+			}
+			catch (Exception)
+			{
+			}
+		});
+		const start = MonoTime.currTime;
+		try
+			client.ping();
+		catch (McpException e)
+			code = e.code;
+		took = MonoTime.currTime - start;
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(code == ErrorCode.requestCancelled);
+	assert(took < 5.seconds);
+}

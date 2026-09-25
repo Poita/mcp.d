@@ -62,12 +62,16 @@ enum CacheMode
 ///   of the call, progress correlated to that token is routed here while
 ///   progress for other tokens still reaches the global `onProgress`.
 /// - `cacheMode`: per-call override of the response cache (default `use`).
+/// - `cancellation`: a `CancellationToken` another task can `cancel()` to abort
+///   the call: its in-flight request fails at once with `requestCancelled` and
+///   is cancelled on the server.
 struct RequestOptions
 {
 	ProgressToken progressToken;
 	string logLevel;
 	void delegate(ProgressNotification) @safe onProgress;
 	CacheMode cacheMode = CacheMode.use;
+	CancellationToken cancellation;
 
 	/// Convenience factory for the dominant per-call case: route this request's
 	/// progress to `cb` (the verb mints a unique token), leaving `progressToken`
@@ -79,6 +83,60 @@ struct RequestOptions
 		opts.onProgress = cb;
 		return opts;
 	}
+}
+
+/// A handle for cancelling a call from another task: pass it in
+/// `RequestOptions.cancellation`, then `cancel()` it. The request the call has in
+/// flight fails at once with an `McpException` of code `requestCancelled` and is
+/// cancelled on the server (`notifications/cancelled`, or by closing a modern
+/// Streamable HTTP request's stream); a call started after the token was
+/// cancelled fails without sending anything. A token is single-use.
+final class CancellationToken
+{
+	private bool cancelled_;
+	private string reason_;
+	private void delegate(string reason) @safe[long] hooks_;
+
+	/// Cancel the call(s) using this token. `reason` is sent to the server when
+	/// non-empty. Idempotent.
+	void cancel(string reason = null) @safe
+	{
+		if (cancelled_)
+			return;
+		cancelled_ = true;
+		reason_ = reason;
+		foreach (hook; hooks_.dup.byValue)
+			hook(reason);
+	}
+
+	/// Whether `cancel` has been called.
+	bool isCancelled() const @safe nothrow
+	{
+		return cancelled_;
+	}
+
+	/// The reason given to `cancel`, if any.
+	string reason() const @safe nothrow
+	{
+		return reason_;
+	}
+
+	private void bind(long id, void delegate(string reason) @safe hook) @safe nothrow
+	{
+		hooks_[id] = hook;
+	}
+
+	private void unbind(long id) @safe nothrow
+	{
+		hooks_.remove(id);
+	}
+}
+
+/// The error a cancelled request fails with.
+private McpException cancelledError(string reason) @safe
+{
+	return new McpException(ErrorCode.requestCancelled, reason.length
+			? "Request cancelled: " ~ reason : "Request cancelled");
 }
 
 /// Merge `progressToken` into a request's `params._meta.progressToken`, per
@@ -375,6 +433,10 @@ final class McpClient : ClientProtocol
 	// (timed out / cancelled), which `rpc` throws in place of the transport's
 	// wake-up error.
 	private InFlightRequest[long] inFlight_;
+	// The `RequestOptions.cancellation` of the call running on each task, keyed by
+	// that task's fiber, so `rpc` (reached through the paging / MRTR / cache
+	// helpers) binds every request the call issues to the caller's token.
+	private CancellationToken[void* ] callTokens_;
 	// Per-subscription push handlers, keyed by the `events/stream` request id (the
 	// subscriptionId stamped on every `notifications/events/*` frame). streamEvents
 	// registers; the stream's cleanup hook and a `terminated` frame deregister, so
@@ -700,8 +762,10 @@ final class McpClient : ClientProtocol
 	/// `opts.cacheMode` overrides.
 	DiscoverResult discover(RequestOptions opts = RequestOptions.init) @safe
 	{
-		auto result = cachedFetch!DiscoverResult(CacheKey("server/discover", ""), opts.cacheMode,
-				() @safe => DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject)));
+		auto result = withCancellation!DiscoverResult(opts.cancellation,
+				() @safe => cachedFetch!DiscoverResult(CacheKey("server/discover",
+					""), opts.cacheMode, () @safe => DiscoverResult.fromJson(rpc("server/discover",
+					Json.emptyObject))));
 		discoverResult_ = result;
 		return result;
 	}
@@ -1040,6 +1104,11 @@ final class McpClient : ClientProtocol
 	/// `CacheableResult` freshness hint (if any). A still-fresh result is served
 	/// from the response cache without a round-trip; `opts.cacheMode` overrides.
 	ListToolsResult listTools(RequestOptions opts = RequestOptions.init) @safe
+	{
+		return withCancellation!ListToolsResult(opts.cancellation, () @safe => listToolsImpl(opts));
+	}
+
+	private ListToolsResult listToolsImpl(RequestOptions opts) @safe
 	{
 		auto acc = cachedFetch!ListToolsResult(CacheKey("tools/list", ""), opts.cacheMode, () @safe {
 			auto a = drainList!ListToolsResult("tools/list",
@@ -1492,12 +1561,12 @@ final class McpClient : ClientProtocol
 	private R withPerCallProgress(R)(RequestOptions opts, scope R delegate() @safe body_) @safe
 	{
 		if (opts.onProgress is null)
-			return body_();
+			return withCancellation!R(opts.cancellation, body_);
 		const key = opts.progressToken.toJson().toString();
 		perCallProgress_[key] = opts.onProgress;
 		scope (exit)
 			perCallProgress_.remove(key);
-		return body_();
+		return withCancellation!R(opts.cancellation, body_);
 	}
 
 	/// The elicitation `mode` carried in a request's `params`. Per
@@ -1844,6 +1913,12 @@ final class McpClient : ClientProtocol
 	/// still-fresh result is served from the cache; `opts.cacheMode` overrides.
 	ListResourcesResult listResources(RequestOptions opts = RequestOptions.init) @safe
 	{
+		return withCancellation!ListResourcesResult(opts.cancellation,
+				() @safe => listResourcesImpl(opts));
+	}
+
+	private ListResourcesResult listResourcesImpl(RequestOptions opts) @safe
+	{
 		return cachedFetch!ListResourcesResult(CacheKey("resources/list", ""),
 				opts.cacheMode, () @safe {
 			return drainList!ListResourcesResult("resources/list",
@@ -1859,6 +1934,12 @@ final class McpClient : ClientProtocol
 	/// is null, and `cache` carries the first page's parsed freshness hint. A
 	/// still-fresh result is served from the cache; `opts.cacheMode` overrides.
 	ListResourceTemplatesResult listResourceTemplates(RequestOptions opts = RequestOptions.init) @safe
+	{
+		return withCancellation!ListResourceTemplatesResult(opts.cancellation,
+				() @safe => listResourceTemplatesImpl(opts));
+	}
+
+	private ListResourceTemplatesResult listResourceTemplatesImpl(RequestOptions opts) @safe
 	{
 		return cachedFetch!ListResourceTemplatesResult(CacheKey("resources/templates/list",
 				""), opts.cacheMode, () @safe {
@@ -1970,6 +2051,12 @@ final class McpClient : ClientProtocol
 	/// the first page's parsed freshness hint. A still-fresh result is served from
 	/// the cache; `opts.cacheMode` overrides.
 	ListPromptsResult listPrompts(RequestOptions opts = RequestOptions.init) @safe
+	{
+		return withCancellation!ListPromptsResult(opts.cancellation,
+				() @safe => listPromptsImpl(opts));
+	}
+
+	private ListPromptsResult listPromptsImpl(RequestOptions opts) @safe
 	{
 		return cachedFetch!ListPromptsResult(CacheKey("prompts/list", ""), opts.cacheMode, () @safe {
 			return drainList!ListPromptsResult("prompts/list",
@@ -2753,9 +2840,21 @@ final class McpClient : ClientProtocol
 			if (useModern)
 				params = injectModernMeta(params);
 			auto message = makeRequest(Json(id), method, params);
+			auto token = callTokens_.get(currentFiberKey(), null);
+			if (token !is null && token.isCancelled)
+				throw cancelledError(token.reason);
 			auto req = beginRequest(id, params);
 			scope (exit)
 				endRequest(id, req);
+			if (token !is null)
+			{
+				token.bind(id, (string reason) @safe {
+					abortRequest(id, cancelledError(reason), reason);
+				});
+			}
+			scope (exit)
+				if (token !is null)
+					token.unbind(id);
 			Json result;
 			try
 				result = transport.deliver(message, id);
@@ -2845,6 +2944,37 @@ final class McpClient : ClientProtocol
 		foreach (r; inFlight_.byValue)
 			if (r.armed && r.progressKey == progressKey && r.abortReason is null)
 				r.timer.rearm(requestTimeout_);
+	}
+
+	/// Identity of the running task for `callTokens_` (its fiber; null outside
+	/// any fiber).
+	private static void* currentFiberKey() @trusted nothrow
+	{
+		import core.thread : Fiber;
+
+		return cast(void*) Fiber.getThis();
+	}
+
+	/// Run `body_` with `token` as the cancellation of the requests it issues on
+	/// this task. A null `token` runs `body_` directly (inheriting any enclosing
+	/// call's token).
+	private R withCancellation(R)(CancellationToken token, scope R delegate() @safe body_) @safe
+	{
+		if (token is null)
+			return body_();
+		if (token.isCancelled)
+			throw cancelledError(token.reason);
+		auto key = currentFiberKey();
+		auto prev = callTokens_.get(key, null);
+		callTokens_[key] = token;
+		scope (exit)
+		{
+			if (prev is null)
+				callTokens_.remove(key);
+			else
+				callTokens_[key] = prev;
+		}
+		return body_();
 	}
 
 	/// Register the `elicitationId`s announced by a `URLElicitationRequiredError`
@@ -3007,7 +3137,10 @@ final class McpClient : ClientProtocol
 	/// sends for `requestId` is ignored, per "The sender of the cancellation
 	/// notification SHOULD ignore any response to the request that arrives
 	/// afterward". `reason` is an optional free-form explanation included in the
-	/// notification when non-empty.
+	/// notification when non-empty. When `requestId` is still in flight, the call
+	/// waiting on it fails at once with `requestCancelled`. To cancel a call
+	/// without knowing its request ids, pass a `CancellationToken` in its
+	/// `RequestOptions.cancellation` instead.
 	///
 	/// Per spec, the `initialize` request MUST NOT be cancelled by clients;
 	/// attempting to cancel the id of the `initialize` request throws.
@@ -3015,7 +3148,10 @@ final class McpClient : ClientProtocol
 	{
 		if (requestId == initializeRequestId && initializeRequestId != 0)
 			throw invalidRequest("The initialize request MUST NOT be cancelled by clients");
-		signalCancellation(requestId, reason);
+		if (requestId in inFlight_)
+			abortRequest(requestId, cancelledError(reason), reason);
+		else
+			signalCancellation(requestId, reason);
 	}
 
 	/// Record `requestId` as cancelled (so a late response is dropped) and signal

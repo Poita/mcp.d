@@ -3215,3 +3215,72 @@ unittest  // an HTTP request whose SSE stream goes silent fails after requestTim
 	assert(took < 3.seconds);
 	assert(cancelledId == silentId, "the timeout must send notifications/cancelled for the request");
 }
+
+unittest  // cancelling a modern HTTP request closes its response stream and fails the call at once
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : runTask, sleep;
+	import mcp.client.client : McpClient, ClientSettings, RequestOptions, CancellationToken;
+
+	bool streamClosed;
+	bool sawCancelledNotification;
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		res.contentType = "text/event-stream";
+		const until = MonoTime.currTime + 5.seconds;
+		try
+		{
+			while (MonoTime.currTime < until)
+			{
+				() @trusted {
+					res.bodyWriter.write(cast(const(ubyte)[]) ": keep-alive\n\n");
+					res.bodyWriter.flush();
+				}();
+				sleep(30.msecs);
+			}
+		}
+		catch (Exception)
+			streamClosed = true;
+	}, (Json n) @safe {
+		if (n["method"].get!string == "notifications/cancelled")
+			sawCancelledNotification = true;
+	});
+
+	int code;
+	Duration took;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		ClientSettings s;
+		s.requestTimeout = Duration.zero;
+		auto client = McpClient.http(url, s);
+		scope (exit)
+			client.close();
+		client.enableModern();
+		auto token = new CancellationToken;
+		RequestOptions opts;
+		opts.cancellation = token;
+		runTask(() nothrow{
+			try
+			{
+				sleep(150.msecs);
+				token.cancel();
+			}
+			catch (Exception)
+			{
+			}
+		});
+		const start = MonoTime.currTime;
+		try
+			client.listTools(opts);
+		catch (McpException e)
+			code = e.code;
+		took = MonoTime.currTime - start;
+		const until = MonoTime.currTime + 2.seconds;
+		while (!streamClosed && MonoTime.currTime < until)
+			sleep(20.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(code == ErrorCode.requestCancelled);
+	assert(took < 3.seconds);
+	assert(streamClosed, "cancellation must close the request's response stream");
+	assert(!sawCancelledNotification,
+			"modern HTTP cancels by closing the stream, not by notification");
+}
