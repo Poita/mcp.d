@@ -406,7 +406,9 @@ hits the same entry** — the point of a shared cache. A `private` result is
 namespaced under the requesting client's `cachePartition` (a stable principal /
 tenant id you set in `ClientSettings`), so it is never served to another
 identity. The default per-client store leaves `cachePartition` empty and the
-distinction is moot.
+distinction is moot. Every entry is also keyed by server (`CacheKey.server`: the
+endpoint URL, the `spawn` command, or `ClientSettings.cacheServer`), so clients of
+different servers sharing one store never read each other's results.
 
 ```d
 auto store = new MyRedisStore;

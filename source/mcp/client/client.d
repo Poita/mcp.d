@@ -236,6 +236,14 @@ struct ClientSettings
 	/// store as per-client and is the right value for the default in-memory store.
 	string cachePartition = "";
 
+	/// The server identity this client's cache entries are keyed under, so a
+	/// `cache` shared by clients of different servers never mixes their results.
+	/// Empty (the default) derives it from the transport: the endpoint URL for
+	/// HTTP, the command line for `spawn`, and a per-client value for any other
+	/// transport (which then shares nothing). Set the same value on clients that
+	/// reach one server by different routes to let them share entries.
+	string cacheServer;
+
 	/// Knobs for the managed Events-extension subscriptions (`subscribePoll`,
 	/// `subscribeStream`, `subscribeWebhook`, `subscribeEvents`).
 	EventClientSettings events;
@@ -502,6 +510,8 @@ final class McpClient : ClientProtocol
 	// (the default) means the store is treated as per-client: public and private
 	// both land under "" and the distinction is moot.
 	private string cachePartition_;
+	// The server identity every physical cache key carries (`CacheKey.server`).
+	private string cacheServer_;
 	// Clock seam behind the cache's freshness check: `cachedFetch` stamps an entry
 	// with `now_() + ttl` and treats it as a hit while `now_() < expiresAt`.
 	// Defaults to the wall clock; tests substitute a controllable clock to make
@@ -597,6 +607,11 @@ final class McpClient : ClientProtocol
 		// Factories override the store from `ClientSettings`; `setCache`/
 		// `setDefaultCacheTtl`/`setCacheClock` adjust them at runtime.
 		cacheStore_ = new InMemoryCacheStore();
+		cacheServer_ = () @trusted {
+			import std.conv : to;
+
+			return "client:" ~ (cast(size_t) cast(void*) this).to!string;
+		}();
 		now_ = () @safe => Clock.currTime();
 		transport.setInboundHandler(&dispatchInbound);
 		// Hand the transport this client as its `ClientProtocol`: it pulls the
@@ -617,6 +632,8 @@ final class McpClient : ClientProtocol
 			cacheStore_ = settings.cache;
 		defaultCacheTtl_ = settings.defaultCacheTtl;
 		cachePartition_ = settings.cachePartition;
+		if (settings.cacheServer.length)
+			cacheServer_ = settings.cacheServer;
 		eventSettings_ = settings.events;
 		requestTimeout_ = settings.requestTimeout;
 		resetTimeoutOnProgress_ = settings.resetTimeoutOnProgress;
@@ -668,7 +685,9 @@ final class McpClient : ClientProtocol
 	{
 		auto transport = new HttpClientTransport(url, settings.maxInFlight);
 		transport.setConnectTimeout(settings.connectTimeout);
-		return (new McpClient(transport, settings.clientInfo)).applySettings(settings);
+		auto c = new McpClient(transport, settings.clientInfo);
+		c.cacheServer_ = url;
+		return c.applySettings(settings);
 	}
 
 	/// Build a client over the stdio transport, exchanging newline-delimited
@@ -692,8 +711,11 @@ final class McpClient : ClientProtocol
 	/// `settings.clientInfo` applies; the HTTP-only fields are ignored.
 	static McpClient spawn(string[] command, ClientSettings settings = ClientSettings.init) @safe
 	{
-		return (new McpClient(spawnStdioTransport(command), settings.clientInfo)).applySettings(
-				settings);
+		import std.array : join;
+
+		auto c = new McpClient(spawnStdioTransport(command), settings.clientInfo);
+		c.cacheServer_ = "stdio:" ~ command.join(" ");
+		return c.applySettings(settings);
 	}
 
 	/// Launch an MCP server binary that ships *next to this executable* and build a
@@ -1229,7 +1251,7 @@ final class McpClient : ClientProtocol
 	private CacheKey scopedKey(CacheKey logical, CacheScope scope_) @safe
 	{
 		return CacheKey(logical.method, logical.key,
-				scope_ == CacheScope.private_ ? cachePartition_ : "");
+				scope_ == CacheScope.private_ ? cachePartition_ : "", cacheServer_);
 	}
 
 	/// A still-fresh entry under `key`, or null if absent or expired.
@@ -1255,7 +1277,7 @@ final class McpClient : ClientProtocol
 	{
 		if (cacheStore_ is null)
 			return Nullable!CacheEntry.init;
-		const ownKey = CacheKey(logical.method, logical.key, cachePartition_);
+		const ownKey = CacheKey(logical.method, logical.key, cachePartition_, cacheServer_);
 		auto own = requireFresh ? freshEntry(ownKey) : cacheStore_.get(ownKey);
 		if (!own.isNull)
 		{
@@ -1337,7 +1359,7 @@ final class McpClient : ClientProtocol
 		if (cacheStore_ is null || mode == CacheMode.bypass)
 			return fetch();
 		const sharedKey = scopedKey(logical, CacheScope.public_); // partition ""
-		const ownKey = CacheKey(logical.method, logical.key, cachePartition_);
+		const ownKey = CacheKey(logical.method, logical.key, cachePartition_, cacheServer_);
 		if (mode == CacheMode.use)
 		{
 			CacheKey hitKey;
@@ -1389,9 +1411,9 @@ final class McpClient : ClientProtocol
 	{
 		if (cacheStore_ is null)
 			return;
-		cacheStore_.invalidate(CacheKey(method, key, ""));
+		cacheStore_.invalidate(CacheKey(method, key, "", cacheServer_));
 		if (cachePartition_.length)
-			cacheStore_.invalidate(CacheKey(method, key, cachePartition_));
+			cacheStore_.invalidate(CacheKey(method, key, cachePartition_, cacheServer_));
 	}
 
 	/// `tools/call`. Per-request `progressToken` / `logLevel` / `onProgress` are
@@ -4338,7 +4360,8 @@ unittest  // a pre-seeded tools/list cache drives x-mcp-header mirroring with no
 	// Pre-seed a shared store as if another process (or a prior session) had
 	// already fetched tools/list; this client never calls listTools itself.
 	auto store = new InMemoryCacheStore();
-	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
 	c.setCache(store);
 
 	Json msg = Json.emptyObject;
@@ -4369,7 +4392,8 @@ unittest  // a stale-but-present tools/list entry still drives mirroring (schema
 	// expiresAt in the past: stale for *serving* a cached listTools, but schema
 	// lookups deliberately ignore serving-freshness — the schema is still valid
 	// until tools/list_changed evicts the entry.
-	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2000, 1, 1))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lr.toJson(), SysTime(DateTime(2000, 1, 1))));
 	c.setCache(store);
 
 	Json msg = Json.emptyObject;
@@ -4395,7 +4419,8 @@ unittest  // evicting the tools/list entry (e.g. tools/list_changed) stops heade
 	ListToolsResult lr;
 	lr.tools = [t];
 	auto store = new InMemoryCacheStore();
-	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
 	c.setCache(store);
 
 	Json msg = Json.emptyObject;
@@ -4462,7 +4487,8 @@ unittest  // the tool index re-derives when the underlying cache entry changes
 	]);
 	ListToolsResult lrA;
 	lrA.tools = [a];
-	store.put(CacheKey("tools/list", ""), CacheEntry(lrA.toJson(), SysTime(DateTime(2999, 1, 1))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lrA.toJson(), SysTime(DateTime(2999, 1, 1))));
 	assert("Mcp-Param-Region" in c.headersFor(msg)); // builds the index
 
 	// Replace the entry (new expiry) with the same tool annotated differently;
@@ -4472,7 +4498,8 @@ unittest  // the tool index re-derives when the underlying cache entry changes
 	]);
 	ListToolsResult lrB;
 	lrB.tools = [b];
-	store.put(CacheKey("tools/list", ""), CacheEntry(lrB.toJson(), SysTime(DateTime(2999, 1, 2))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lrB.toJson(), SysTime(DateTime(2999, 1, 2))));
 	auto headers = c.headersFor(msg);
 	assert("Mcp-Param-Region" !in headers, "stale memoized schema must not survive a cache change");
 	assert("Mcp-Param-Zone" in headers, "re-derived index must reflect the new cache entry");
@@ -4843,7 +4870,8 @@ unittest  // a pre-seeded tools/list cache drives output validation with no loca
 	ListToolsResult lr;
 	lr.tools = [t];
 	auto store = new InMemoryCacheStore();
-	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
 	c.setCache(store);
 	c.onRpcForTest = (string method, Json params) @safe {
 		return Json(["structuredContent": Json(["result": Json("oops")])]);
@@ -4876,7 +4904,8 @@ unittest  // a pre-seeded tools/list cache accepts a conforming result with no l
 	ListToolsResult lr;
 	lr.tools = [t];
 	auto store = new InMemoryCacheStore();
-	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
 	c.setCache(store);
 	c.onRpcForTest = (string method, Json params) @safe {
 		return Json(["structuredContent": Json(["result": Json(5)])]);
@@ -7102,13 +7131,14 @@ version (unittest)
 {
 	// A `tools/list` client over a SHARED store, bound to `partition`, whose
 	// canned response declares the given `cacheScope` and counts its wire hits.
-	private McpClient sharedCacheClient(CacheStore store, string partition,
-			string cacheScope, ref int calls) @safe
+	private McpClient sharedCacheClient(CacheStore store, string partition, string cacheScope,
+			ref int calls, string url = "http://localhost", string cacheServer = null) @safe
 	{
 		ClientSettings s;
 		s.cache = store;
 		s.cachePartition = partition;
-		auto c = McpClient.http("http://localhost", s);
+		s.cacheServer = cacheServer;
+		auto c = McpClient.http(url, s);
 		c.onRpcForTest = (string m, Json p) @safe {
 			Json r = Json.emptyObject;
 			if (m == "tools/list")
@@ -7170,6 +7200,48 @@ unittest  // a partitioned client's setBearerToken spares shared public entries
 	a.setBearerToken("rotated"); // evicts partition "alice", not the shared ""
 	a.listTools(); // shared public entry still fresh -> hit (aCalls == 1)
 	assert(aCalls == 1, "public entries survive an own-partition eviction");
+}
+
+unittest  // clients of different servers sharing a store never see each other's entries
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	auto a = sharedCacheClient(store, "", "public", aCalls, "http://server-a/mcp");
+	auto b = sharedCacheClient(store, "", "public", bCalls, "http://server-b/mcp");
+	a.listTools();
+	b.listTools(); // server B's tools are not server A's: must fetch
+	assert(aCalls == 1 && bCalls == 1, "a shared store must be namespaced by server");
+}
+
+unittest  // clients over custom transports sharing a store are isolated unless they name a cacheServer
+{
+	auto store = new InMemoryCacheStore();
+	int calls;
+	McpClient make() @safe
+	{
+		auto c = new McpClient(new RecordingClientTransport());
+		c.setCache(store);
+		c.onRpcForTest = (string m, Json p) @safe {
+			calls++;
+			return Json(["tools": Json.emptyArray, "ttlMs": Json(5000)]);
+		};
+		return c;
+	}
+
+	make().listTools();
+	make().listTools();
+	assert(calls == 2, "an unidentifiable transport must not share another client's entries");
+}
+
+unittest  // an explicit cacheServer lets clients of one server share entries across URLs
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	auto a = sharedCacheClient(store, "", "public", aCalls, "http://10.0.0.1/mcp", "svc");
+	auto b = sharedCacheClient(store, "", "public", bCalls, "http://10.0.0.2/mcp", "svc");
+	a.listTools();
+	b.listTools();
+	assert(aCalls == 1 && bCalls == 0);
 }
 
 version (unittest)

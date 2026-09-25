@@ -30,12 +30,18 @@ import mcp.protocol.modern : CacheScope;
 /// of a shared cache), while a `private` result is stored under the owning
 /// client's `cachePartition` (its principal id) so it is never served to another
 /// identity. A per-client store leaves `partition` empty and the distinction is
-/// moot. The whole struct is used directly as an associative-array key.
+/// moot.
+///
+/// `server` names the server the response came from (the client's endpoint URL,
+/// spawn command, or `ClientSettings.cacheServer`), so clients of different
+/// servers sharing one store never read each other's entries. The whole struct
+/// is used directly as an associative-array key.
 struct CacheKey
 {
 	string method;
 	string key;
 	string partition;
+	string server;
 }
 
 /// A stored response plus the freshness metadata needed to decide a hit.
