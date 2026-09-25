@@ -459,9 +459,10 @@ final class HttpClientTransport : ClientTransport
 
 	// --- POST helpers --------------------------------------------------------
 
-	/// POST a message that expects no correlated reply (notification/response).
-	/// In legacy HTTP+SSE mode, messages go to the server-supplied endpoint URI.
-	private void post(Json message) @safe
+	/// POST a message whose reply (if any) does not come back on this response: a
+	/// notification or response, or a legacy HTTP+SSE request. In legacy mode,
+	/// messages go to the server-supplied endpoint URI. Returns the HTTP status.
+	private int post(Json message) @safe
 	{
 		import std.conv : to;
 
@@ -502,6 +503,7 @@ final class HttpClientTransport : ClientTransport
 
 			logWarn("MCP oneway HTTP send rejected with status %d", status);
 		}();
+		return status;
 	}
 
 	/// POST a request and await the response with id `expectId`, processing any
@@ -1560,7 +1562,12 @@ final class HttpClientTransport : ClientTransport
 		// delivers immediately after cannot be missed.
 		auto ec = legacyCompletionEvent().emitCount;
 
-		post(message); // POST to legacyEndpoint; server replies on the GET stream
+		// POST to legacyEndpoint; the server replies on the GET stream, unless it
+		// rejects the POST outright, in which case no reply will ever come.
+		const status = post(message);
+		if (status < 200 || status >= 300)
+			throw new HttpStatusException(status,
+					"legacy HTTP+SSE server rejected the request with HTTP " ~ idStr(status));
 
 		// If the reader has already exited, no response can arrive on the stream:
 		// fail fast rather than waiting out the timeout.
@@ -3465,4 +3472,43 @@ unittest  // the standalone server stream keeps reconnecting after repeated clos
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(getIds.length >= 4, "the standalone stream must keep reconnecting");
 	assert(getIds[0 .. 4] == ["", "s1", "s2", "s3"]);
+}
+
+unittest  // a legacy HTTP+SSE request whose POST is rejected fails at once with the HTTP status
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep;
+
+	auto router = new URLRouter;
+	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.statusCode = 500;
+		res.writeBody("", "text/plain");
+	});
+	Exception thrown;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		t.legacyMode = true;
+		t.legacyEndpoint = url;
+		t.legacyStreamAlive = true;
+		// Backstop so a waiter left pending still ends the test.
+		runTask(() nothrow{
+			try
+			{
+				sleep(2.seconds);
+				t.abort(1, internalError("left waiting"));
+			}
+			catch (Exception)
+			{
+			}
+		});
+		try
+			t.deliver(makeRequest(Json(1L), "tools/list", Json.emptyObject), 1);
+		catch (Exception e)
+			thrown = e;
+		t.close();
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	auto h = cast(HttpStatusException) thrown;
+	assert(h !is null && h.status == 500,
+			"a rejected legacy POST must fail its waiter with the status");
 }
