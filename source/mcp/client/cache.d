@@ -92,11 +92,27 @@ interface CacheStore
 /// access means no locking is needed.
 final class InMemoryCacheStore : CacheStore
 {
-	private CacheEntry[CacheKey] entries_;
-	// Insertion order of live keys, used to evict the oldest when at capacity.
-	// May name keys already removed by `invalidate`/`invalidateMethod`; those
-	// are skipped during eviction.
-	private CacheKey[] order_;
+	// Each live entry with the insertion stamp of its current incarnation.
+	private struct Slot
+	{
+		CacheEntry entry;
+		ulong stamp;
+	}
+
+	// One insertion in `order_`: the key and the stamp it was inserted with. It
+	// is stale once the key is removed or re-inserted under a newer stamp.
+	private struct Insertion
+	{
+		CacheKey key;
+		ulong stamp;
+	}
+
+	private Slot[CacheKey] entries_;
+	// Insertion order used to evict the oldest live entry when at capacity. Only
+	// kept when the store is bounded; stale insertions are skipped on eviction and
+	// reclaimed once they outnumber the live entries.
+	private Insertion[] order_;
+	private ulong nextStamp_;
 	private size_t cap_;
 
 	/// `capacity` bounds the number of held entries (0 disables the bound). The
@@ -110,24 +126,29 @@ final class InMemoryCacheStore : CacheStore
 	override Nullable!CacheEntry get(CacheKey key) @safe
 	{
 		if (auto e = key in entries_)
-			return nullable(*e);
+			return nullable(e.entry);
 		return Nullable!CacheEntry.init;
 	}
 
 	override void put(CacheKey key, CacheEntry entry) @safe
 	{
-		const isNew = (key in entries_) is null;
-		if (isNew)
+		if (auto e = key in entries_)
 		{
-			evictIfNeeded();
-			order_ ~= key;
+			e.entry = entry;
+			return;
 		}
-		entries_[key] = entry;
+		evictIfNeeded();
+		const stamp = ++nextStamp_;
+		if (cap_ != 0)
+			order_ ~= Insertion(key, stamp);
+		entries_[key] = Slot(entry, stamp);
+		compactOrder();
 	}
 
 	override void invalidate(CacheKey key) @safe
 	{
 		entries_.remove(key);
+		compactOrder();
 	}
 
 	override void invalidateMethod(string method) @safe
@@ -135,6 +156,7 @@ final class InMemoryCacheStore : CacheStore
 		foreach (k; entries_.keys)
 			if (k.method == method)
 				entries_.remove(k);
+		compactOrder();
 	}
 
 	override void invalidatePartition(string partition) @safe
@@ -142,6 +164,7 @@ final class InMemoryCacheStore : CacheStore
 		foreach (k; entries_.keys)
 			if (k.partition == partition)
 				entries_.remove(k);
+		compactOrder();
 	}
 
 	override void clear() @safe
@@ -150,9 +173,14 @@ final class InMemoryCacheStore : CacheStore
 		order_ = null;
 	}
 
-	/// Evict the oldest still-present entry when adding a new key would exceed
-	/// the cap. Stale names left in `order_` by prior removals are discarded
-	/// until a live one is found and dropped.
+	private bool isLive(Insertion i) @safe
+	{
+		auto e = i.key in entries_;
+		return e !is null && e.stamp == i.stamp;
+	}
+
+	/// Evict the oldest live entry when adding a new key would exceed the cap,
+	/// discarding stale insertions on the way.
 	private void evictIfNeeded() @safe
 	{
 		if (cap_ == 0 || entries_.length < cap_)
@@ -161,12 +189,23 @@ final class InMemoryCacheStore : CacheStore
 		{
 			const oldest = order_[0];
 			order_ = order_[1 .. $];
-			if (oldest in entries_)
+			if (isLive(oldest))
 			{
-				entries_.remove(oldest);
+				entries_.remove(oldest.key);
 				break;
 			}
 		}
+	}
+
+	/// Drop stale insertions once they outnumber the live entries, keeping
+	/// `order_` proportional to the store's size.
+	private void compactOrder() @safe
+	{
+		import std.algorithm : filter;
+		import std.array : array;
+
+		if (order_.length > 2 * entries_.length + 16)
+			order_ = order_.filter!(i => isLive(i)).array;
 	}
 }
 
@@ -312,6 +351,44 @@ CacheStore noCache() @safe nothrow
 	assert(s.get(CacheKey("tools/list", "", "alice")).isNull);
 	assert(!s.get(CacheKey("tools/list", "", "")).isNull, "shared public entry survives");
 	assert(!s.get(CacheKey("tools/list", "", "bob")).isNull, "other principal survives");
+}
+
+@safe unittest  // eviction never drops a re-put key through the stale order slot of its earlier incarnation
+{
+	auto s = new InMemoryCacheStore(2);
+	s.put(CacheKey("resources/read", "a"), CacheEntry(Json("a1")));
+	s.invalidate(CacheKey("resources/read", "a"));
+	s.put(CacheKey("resources/read", "b"), CacheEntry(Json("b")));
+	s.put(CacheKey("resources/read", "a"), CacheEntry(Json("a2")));
+	s.put(CacheKey("resources/read", "c"), CacheEntry(Json("c")));
+	// 'b' is the oldest live entry; the re-put 'a' is newer than it.
+	assert(s.get(CacheKey("resources/read", "b")).isNull, "the oldest live entry is evicted");
+	assert(!s.get(CacheKey("resources/read", "a")).isNull, "the re-put entry survives");
+	assert(!s.get(CacheKey("resources/read", "c")).isNull);
+}
+
+@safe unittest  // put/invalidate churn does not grow the eviction bookkeeping without bound
+{
+	auto s = new InMemoryCacheStore(4);
+	foreach (i; 0 .. 1000)
+	{
+		s.put(CacheKey("resources/read", "x"), CacheEntry(Json(i)));
+		s.invalidate(CacheKey("resources/read", "x"));
+	}
+	assert(s.order_.length <= 64, "stale order slots must be reclaimed");
+}
+
+@safe unittest  // an unbounded store keeps no eviction bookkeeping
+{
+	auto s = new InMemoryCacheStore(0);
+	foreach (i; 0 .. 100)
+		s.put(CacheKey("tools/list", ""), CacheEntry(Json(i)));
+	foreach (i; 0 .. 100)
+	{
+		s.put(CacheKey("prompts/list", ""), CacheEntry(Json(i)));
+		s.invalidate(CacheKey("prompts/list", ""));
+	}
+	assert(s.order_.length == 0);
 }
 
 @safe unittest  // noCache stores nothing and returns the same singleton
