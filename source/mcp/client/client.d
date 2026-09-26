@@ -2979,8 +2979,14 @@ final class McpClient : ClientProtocol
 
 	private void endRequest(long id, InFlightRequest req) @safe nothrow
 	{
+		// Release the timer now, while the event driver is alive; left to the GC it
+		// is destroyed at process exit after the driver, which can crash.
 		if (req.armed)
+		{
 			req.timer.stop();
+			req.timer = typeof(req.timer).init;
+			req.armed = false;
+		}
 		inFlight_.remove(id);
 	}
 
@@ -4123,6 +4129,16 @@ unittest  // awaitTask throws on a failed task carrying a JSON-RPC error
 	};
 	auto ex = cast(McpException) collectException(c.awaitTask("t1"));
 	assert(ex !is null && ex.msg == "boom");
+}
+
+unittest  // a finished request releases its deadline timer
+{
+	auto c = McpClient.http("http://localhost");
+	auto req = c.beginRequest(1, Json.emptyObject);
+	assert(cast(bool) req.timer);
+	c.endRequest(1, req);
+	assert(!cast(bool) req.timer,
+			"an ended request must release its timer while the event driver is alive");
 }
 
 unittest  // awaitTask throws on a status it does not recognize instead of polling forever
