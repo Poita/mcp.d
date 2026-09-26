@@ -137,7 +137,9 @@ enum ServerMode
 	/// Opt-in legacy session management: `initialize` mints an
 	/// `Mcp-Session-Id`, per-session state is isolated, and the full feature set
 	/// (elicitation, GET stream, subscriptions, `logging/setLevel`) is available.
-	/// 2026-07-28 is excluded from negotiation in this mode.
+	/// 2026-07-28 is stateless-only, so this mode does not serve it: a request
+	/// declaring it (including `subscriptions/listen` and `events/stream`) is
+	/// refused with -32022 listing the legacy versions.
 	stateful
 }
 
@@ -374,6 +376,19 @@ final class McpServer : ServerCore
 	ServerMode mode() const @safe
 	{
 		return mode_;
+	}
+
+	/// The protocol versions this server serves: every supported version on a
+	/// `stateless` server, and only the `initialize`-based (pre-2026-07-28)
+	/// versions on a `stateful` one.
+	const(ProtocolVersion)[] servedVersions() const @safe
+	{
+		import std.algorithm : filter;
+		import std.array : array;
+
+		static immutable ProtocolVersion[] legacy = supportedVersions.filter!(
+				v => !v.isModern).array;
+		return mode_ == ServerMode.stateful ? legacy : supportedVersions;
 	}
 
 	/// The protocol version negotiated on the single bound connection (stdio /
@@ -1449,6 +1464,8 @@ final class McpServer : ServerCore
 	/// when the stream may open.
 	private McpException stdioStreamRequestError(RequestMeta meta) @safe
 	{
+		if (mode_ == ServerMode.stateful)
+			return unsupportedVersionError(meta.protocolVersion);
 		if (!meta.hasClientCapabilities)
 			return missingRequiredMeta([cast(string) MetaKey.clientCapabilities]);
 		if (requireInitialized_ && mode_ == ServerMode.stateful && !cs().initialized)
@@ -1959,6 +1976,9 @@ final class McpServer : ServerCore
 			{
 				if (mv.isModern)
 				{
+					if (mode_ == ServerMode.stateful)
+						return nullable(makeErrorResponse(msg.id,
+								unsupportedVersionError(meta.protocolVersion)));
 					// Per-request body `_meta.protocolVersion` is the stateless/modern
 					// negotiation channel: only on 2026-07-28 model does it select the
 					// effective version. On a stateful 2025-era session the negotiated
@@ -2335,10 +2355,10 @@ final class McpServer : ServerCore
 
 	/// Build the modern `UnsupportedProtocolVersionError` (-32022) listing the
 	/// versions this server supports and the one the client requested.
-	private McpException unsupportedVersionError(string requested) @safe
+	package(mcp) McpException unsupportedVersionError(string requested) @safe
 	{
 		Json supported = Json.emptyArray;
-		foreach (v; supportedVersions)
+		foreach (v; servedVersions)
 			supported ~= Json(v.toWire);
 		Json data = Json.emptyObject;
 		data["supported"] = supported;
@@ -2683,7 +2703,7 @@ final class McpServer : ServerCore
 	private Json doDiscover() @safe
 	{
 		DiscoverResult d;
-		foreach (v; supportedVersions)
+		foreach (v; servedVersions)
 			d.protocolVersions ~= v.toWire;
 		d.capabilities = capabilities().forVersion(ProtocolVersion.v2026_07_28);
 		// Identity is stamped into `_meta` by the dispatch path, along with every
@@ -2798,17 +2818,10 @@ final class McpServer : ServerCore
 		case "resourcesListChanged":
 			return resourcesListChangedEnabled;
 		case "resourceSubscriptions":
-			// The modern `subscriptions/listen` stream is a self-contained channel
-			// whose per-stream filter IS the client's resource-update opt-in, so on a
-			// modern (2026-07-28) server the listen filter alone drives delivery — the
-			// stateful-only `enableResourceSubscriptions()` (which throws on a
-			// stateless server) is neither required nor callable there; this holds on
-			// both the stateless HTTP listen stream and the stdio listen path. On a
-			// stateful server the 2025-era `resources/subscribe` opt-in
-			// (`resourceSubscriptionsEnabled`) gates it, and the `subscribe`
-			// CAPABILITY advertisement is mode-gated in `capabilities()` /
-			// `effectiveResourceSubscriptions`.
-			return resourceSubscriptionsEnabled || mode_ == ServerMode.stateless;
+			// The `subscriptions/listen` stream's per-stream filter IS the client's
+			// resource-update opt-in, so the listen filter alone drives delivery. Only
+			// a stateless server serves 2026-07-28, so only it serves listen.
+			return mode_ == ServerMode.stateless;
 		default:
 			return false;
 		}
@@ -3814,7 +3827,7 @@ version (unittest)
 	}
 
 	// A stateful variant for tests that exercise correlation
-	// features (resources/subscribe, subscriptions/listen resourceSubscriptions,
+	// features (resources/subscribe,
 	// notifyResourceUpdated) — these are only available on a stateful server.
 	private McpServer makeStatefulTestServer() @safe
 	{
@@ -8061,12 +8074,10 @@ unittest  // modern resources/read unknown uri uses invalidParams (-32602)
 
 unittest  // subscriptions/listen reads the spec-shaped filter nested under params.notifications
 {
-	// resourceSubscriptions opt-in requires a stateful server.
-	auto s = makeStatefulTestServer();
+	auto s = makeTestServer();
 	// The server must support the requested notification types for them to be
 	// recorded/acknowledged (2026-07-28 basic/utilities/subscriptions Acknowledgment).
 	s.enableToolsListChanged();
-	s.enableResourceSubscriptions();
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
 	filter["resourceSubscriptions"] = Json([Json("file:///project/config.json")]);
@@ -8083,10 +8094,8 @@ unittest  // subscriptions/listen reads the spec-shaped filter nested under para
 
 unittest  // subscriptions/listen accepts the flat (top-level) filter shape
 {
-	// resourceSubscriptions opt-in requires a stateful server.
-	auto s = makeStatefulTestServer();
+	auto s = makeTestServer();
 	s.enableToolsListChanged();
-	s.enableResourceSubscriptions();
 	Json p = Json.emptyObject;
 	p["toolsListChanged"] = true;
 	p["resourceSubscriptions"] = true;
@@ -8110,10 +8119,8 @@ unittest  // subscriptions/listen with an empty resourceSubscriptions array does
 
 unittest  // the per-stream ack reflects exactly the opted-in change types
 {
-	// resourceSubscriptions opt-in requires a stateful server.
-	auto s = makeStatefulTestServer();
+	auto s = makeTestServer();
 	s.enableToolsListChanged();
-	s.enableResourceSubscriptions();
 	// Nothing opted in yet -> empty object.
 	assert(s.acknowledgedSubsetFor(s.cs().listenFilter).type == Json.Type.object);
 	assert(s.acknowledgedSubsetFor(s.cs().listenFilter).length == 0);
@@ -8138,9 +8145,7 @@ unittest  // the per-stream ack reflects exactly the opted-in change types
 
 unittest  // ack echoes every opted-in resourceSubscriptions URI in request order
 {
-	// resourceSubscriptions opt-in requires a stateful server.
-	auto s = makeStatefulTestServer();
-	s.enableResourceSubscriptions();
+	auto s = makeTestServer();
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json([
 		Json("file:///a.txt"), Json("file:///b.txt")
@@ -8206,10 +8211,8 @@ unittest  // per-stream ack does not leak a concurrent stream's opt-in
 	// report toolsListChanged (and A's must NOT report resourceSubscriptions). The
 	// fix builds each ack from the per-stream filter the transport captured right
 	// after routing that listen request — never the server-wide accumulator.
-	// resourceSubscriptions opt-in requires a stateful server.
-	auto s = makeStatefulTestServer();
+	auto s = makeTestServer();
 	s.enableToolsListChanged();
-	s.enableResourceSubscriptions();
 
 	Json fa = Json.emptyObject;
 	fa["toolsListChanged"] = true;
@@ -8299,23 +8302,6 @@ unittest  // subscriptions/listen ack omits resourcesListChanged when unsupporte
 	assert("resourcesListChanged" !in s.acknowledgedSubsetFor(s.cs().listenFilter));
 }
 
-unittest  // subscriptions/listen ack omits resourceSubscriptions when subscriptions disabled
-{
-	// On a stateful server that never opted into resource subscriptions, the listen
-	// gate (resourceSubscriptionsEnabled) is closed, so the agreed subset omits the
-	// URIs. (On a stateless/modern server the listen filter itself is the opt-in, so
-	// that case is covered separately.)
-	auto s = McpServer.stateful("t", "1");
-	Json filter = Json.emptyObject;
-	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
-	Json p = Json.emptyObject;
-	p["notifications"] = filter;
-	s.handle(modernReq(4, "subscriptions/listen", p));
-	assert(!s.cs().listenFilter.resourceSubscriptions);
-	assert("resourceSubscriptions" !in s.acknowledgedSubsetFor(s.cs().listenFilter));
-	assert(("file:///x" !in s.activeConnection.subscriptions));
-}
-
 unittest  // a stateless/modern server honours a subscriptions/listen resourceSubscriptions filter
 {
 	// The modern `subscriptions/listen` filter is the client's own resource-update
@@ -8331,19 +8317,54 @@ unittest  // a stateless/modern server honours a subscriptions/listen resourceSu
 	assert(s.acknowledgedSubsetFor(s.cs().listenFilter)["resourceSubscriptions"].length == 1);
 }
 
-unittest  // subscriptions/listen ack keeps resourceSubscriptions once enabled
+unittest  // a stateful server refuses a 2026-07-28 request with -32022 listing only legacy versions
 {
-	// resourceSubscriptions opt-in requires a stateful server.
+	auto s = McpServer.stateful("t", "1");
+	auto resp = s.handle(modernReq(1, "tools/list")).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
+	foreach (v; resp["error"]["data"]["supported"].get!(Json[]))
+		assert(v.get!string != "2026-07-28", "a stateful server must not offer 2026-07-28");
+}
+
+unittest  // a stateful server refuses subscriptions/listen
+{
 	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	s.handle(modernReq(4, "subscriptions/listen", p));
-	assert(s.cs().listenFilter.resourceSubscriptions);
-	assert(s.acknowledgedSubsetFor(s.cs().listenFilter)["resourceSubscriptions"].length == 1);
-	assert(("file:///x" in s.activeConnection.subscriptions));
+	auto resp = s.handle(modernReq(4, "subscriptions/listen", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
+	assert(!s.cs().listenFilter.active);
+	assert("file:///x" !in s.activeConnection.subscriptions);
+}
+
+unittest  // a stateful stdio server refuses subscriptions/listen
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = McpServer.stateful("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+			"subscriptions/listen", params)), &sink));
+	assert(frames.length == 1);
+	auto resp = parseJsonString(frames[0]);
+	assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
+	assert(s.notifyToolsListChanged() == 0 && frames.length == 1,
+			"a refused listen must not receive notifications");
 }
 
 version (unittest)
@@ -9483,10 +9504,8 @@ unittest  // modern: concurrent listen streams only receive the type each opted 
 	// MUST reach A and never B, even though B registered first.
 	import std.algorithm : canFind;
 
-	// resourceSubscriptions opt-in requires a stateful server.
-	auto s = makeStatefulTestServer();
+	auto s = makeTestServer();
 	s.enableToolsListChanged();
-	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
 	auto push = ensurePushChannel(s, coord);
 

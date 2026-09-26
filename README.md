@@ -289,7 +289,7 @@ is resolved.
 | Per-request `_meta` version/caps | yes | n/a (header + empty caps) | n/a (session-negotiated) |
 | Standalone GET SSE stream | forbidden (405) | forbidden (405) | yes |
 | `resources/subscribe` / `unsubscribe` | forbidden (-32601) | forbidden (-32601) | yes |
-| `subscriptions/listen` (2026-07-28) | yes (self-contained stream) | n/a (modern-only) | yes |
+| `subscriptions/listen` (2026-07-28) | yes (self-contained stream) | n/a (modern-only) | no (2026-07-28 refused with -32022) |
 | Server->client `elicit`/`sample`/`roots` | forbidden (error; MRTR instead) | forbidden (error) | yes |
 | `logging/setLevel` | n/a (per-request `_meta`) | forbidden (-32601) | yes (session-scoped) |
 | Session id minted | never | never | yes |

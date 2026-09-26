@@ -244,7 +244,8 @@ void mountMcp(URLRouter router, McpServer server,
 		// rule as the POST and GET paths: an invalid or unsupported
 		// MCP-Protocol-Version MUST be answered with 400 Bad Request (a null-id
 		// JSON-RPC error) rather than proceeding to a 204 terminate or a 405.
-		if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
+		if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion,
+			""), server.servedVersions))
 		{
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
@@ -1220,7 +1221,8 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// 200 text/event-stream or a 405. This precedes the mode/getOpensSseStream
 	// gate so a stateless or modern-negotiated server still rejects a bad version
 	// with 400 rather than masking it behind a 405.
-	if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
+	if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion,
+			""), server.servedVersions))
 	{
 		res.statusCode = HTTPStatus.badRequest;
 		res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
@@ -1660,7 +1662,7 @@ unittest  // a modern listen signalled by the header alone routes against the mo
 	// subscriptions/listen RPC is served (not -32601 methodNotFound) and THIS
 	// request's opt-in filter is recorded — not dropped on an error path that
 	// would open the stream with a stale filter.
-	auto server = McpServer.stateful("t", "1");
+	auto server = McpServer.stateless("t", "1");
 	server.enableToolsListChanged();
 
 	Json notifications = Json.emptyObject;
@@ -1690,7 +1692,7 @@ unittest  // concurrent listens each keep their own per-stream filter
 	// concurrent HTTP listen streams race). Each stream's opt-in must be recorded
 	// on its own request state: a server-global "last filter" field would hand
 	// the first stream the second stream's filter.
-	auto server = McpServer.stateful("t", "1");
+	auto server = McpServer.stateless("t", "1");
 	server.enableToolsListChanged();
 	server.enablePromptsListChanged();
 
@@ -1881,7 +1883,8 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 	// decides batch acceptance: only 2025-03-26 keeps the legacy batch path.
 	if (input.isBatch)
 	{
-		if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
+		if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion,
+				""), server.servedVersions))
 		{
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
@@ -1932,7 +1935,8 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 	// per-kind switch so all branches are covered. A notification/response error
 	// body carries no id (basic/transports: "a JSON-RPC error response that has
 	// no id"); a request error echoes the request id.
-	if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
+	if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion,
+			""), server.servedVersions))
 	{
 		const errId = (msg.kind == MessageKind.request) ? msg.id : Json(null);
 		res.statusCode = HTTPStatus.badRequest;
@@ -2024,6 +2028,19 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		// uses. All modern-gated header validation below keys off this single value.
 		const isModernReq = tryModern(req.headers.get(HttpHeader.protocolVersion, ""))
 			|| tryModern(RequestMeta.fromParams(msg.params).protocolVersion);
+		// 2026-07-28 is stateless-only: a stateful server refuses it, listing the
+		// versions it serves, before any modern-only route (listen, events/stream).
+		if (isModernReq && server.mode == ServerMode.stateful)
+		{
+			sessions !is null && sessions.terminate(mintedSessionId);
+			const requested = RequestMeta.fromParams(msg.params).protocolVersion;
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeBody(makeErrorResponse(msg.id,
+					server.unsupportedVersionError(requested.length
+					? requested : req.headers.get(HttpHeader.protocolVersion, ""))).toString(),
+					"application/json");
+			return;
+		}
 		if (auto hdrErr = validatePostRequestHeaders(req, msg, isModernReq, server))
 		{
 			// Roll back a session minted above for an initialize that fails header
@@ -2042,8 +2059,8 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		// server-push channel so notify*/notifyResourceUpdated reach it.
 		if (opensListenStream(msg.method, isModernReq))
 		{
-			// subscriptions/listen is a DRAFT RPC and the modern protocol is
-			// stateless-only, so it MUST work on a stateless server too. It is a single
+			// Only a stateless server reaches here (a stateful one refused 2026-07-28
+			// above), and subscriptions/listen needs no session. It is a single
 			// self-contained long-lived HTTP request: this POST opens the SSE response
 			// stream, and notify*/notifyResourceUpdated stream
 			// `notifications/resources/updated` and `.../list_changed` down THAT SAME
@@ -2465,16 +2482,18 @@ McpException validateModernHeaders(string protoHeader, string methodHeader,
 ///
 /// An absent header is permitted: older clients omit it, and the request then
 /// proceeds under the previously negotiated version.
-McpException validateProtocolVersionHeader(string protoHeader) @safe
+McpException validateProtocolVersionHeader(string protoHeader, const(ProtocolVersion)[] served) @safe
 {
+	import std.algorithm : canFind;
+
 	if (protoHeader.length == 0)
 		return null; // header optional; fall back to negotiated version
 	ProtocolVersion pv;
-	if (tryParseVersion(protoHeader, pv))
-		return null; // a known, supported version
+	if (tryParseVersion(protoHeader, pv) && served.canFind(pv))
+		return null; // a version this server serves
 	Json data = Json.emptyObject;
 	Json supported = Json.emptyArray;
-	foreach (v; supportedVersions)
+	foreach (v; served)
 		supported ~= Json(v.toWire);
 	data["supported"] = supported;
 	data["requested"] = Json(protoHeader);
@@ -2490,9 +2509,9 @@ McpException validateProtocolVersionHeader(string protoHeader) @safe
 /// rejecting McpException (mapped to HTTP 400) or null when the header is absent
 /// or names a supported version. This is just `validateProtocolVersionHeader`,
 /// named to make explicit that it runs before the per-kind routing switch.
-McpException postProtocolVersionGate(string protoHeader) @safe
+McpException postProtocolVersionGate(string protoHeader, const(ProtocolVersion)[] served) @safe
 {
-	return validateProtocolVersionHeader(protoHeader);
+	return validateProtocolVersionHeader(protoHeader, served);
 }
 
 /// Whether a `Host` header value (e.g. "127.0.0.1:3000") is localhost or listed.
@@ -3308,14 +3327,14 @@ unittest  // legacy notification skips modern header enforcement
 
 unittest  // absent MCP-Protocol-Version header is permitted (falls back to negotiated)
 {
-	assert(validateProtocolVersionHeader("") is null);
+	assert(validateProtocolVersionHeader("", supportedVersions) is null);
 }
 
 unittest  // a supported stable MCP-Protocol-Version header passes
 {
-	assert(validateProtocolVersionHeader("2025-06-18") is null);
-	assert(validateProtocolVersionHeader("2025-11-25") is null);
-	assert(validateProtocolVersionHeader("2024-11-05") is null);
+	assert(validateProtocolVersionHeader("2025-06-18", supportedVersions) is null);
+	assert(validateProtocolVersionHeader("2025-11-25", supportedVersions) is null);
+	assert(validateProtocolVersionHeader("2024-11-05", supportedVersions) is null);
 }
 
 unittest  // the tasks methods carry Mcp-Name: <taskId>, validated like a tool name
@@ -3360,13 +3379,13 @@ unittest  // a malformed-_meta rejection is 400 Bad Request on HTTP
 
 unittest  // the 2026-07-28 MCP-Protocol-Version header passes; "draft" is not a version
 {
-	assert(validateProtocolVersionHeader("2026-07-28") is null);
-	assert(validateProtocolVersionHeader("draft") !is null);
+	assert(validateProtocolVersionHeader("2026-07-28", supportedVersions) is null);
+	assert(validateProtocolVersionHeader("draft", supportedVersions) !is null);
 }
 
 unittest  // an unsupported/invalid MCP-Protocol-Version header is rejected with -32022 (HTTP 400)
 {
-	auto e = validateProtocolVersionHeader("1.0.0");
+	auto e = validateProtocolVersionHeader("1.0.0", supportedVersions);
 	assert(e !is null);
 	assert(e.code == ErrorCode.unsupportedProtocolVersion);
 	// maps to HTTP 400 in the transport
@@ -3380,7 +3399,7 @@ unittest  // an unsupported/invalid MCP-Protocol-Version header is rejected with
 
 unittest  // a garbage MCP-Protocol-Version header is rejected
 {
-	assert(validateProtocolVersionHeader("not-a-version") !is null);
+	assert(validateProtocolVersionHeader("not-a-version", supportedVersions) !is null);
 }
 
 unittest  // the version gate applies to EVERY POST kind, not just requests
@@ -3389,14 +3408,14 @@ unittest  // the version gate applies to EVERY POST kind, not just requests
 	// POST carrying an invalid/unsupported MCP-Protocol-Version MUST be rejected
 	// with 400 regardless of whether the body is a request, notification, or
 	// response.
-	auto bad = postProtocolVersionGate("1.0.0");
+	auto bad = postProtocolVersionGate("1.0.0", supportedVersions);
 	assert(bad !is null, "bad header must be rejected for all POST kinds");
 	assert(bad.code == ErrorCode.unsupportedProtocolVersion);
 	auto j = makeErrorResponse(Json(null), bad);
 	assert(httpStatusForResponse(j, false) == 400);
 	// a supported / absent header is fine for every kind
-	assert(postProtocolVersionGate("2025-11-25") is null);
-	assert(postProtocolVersionGate("") is null);
+	assert(postProtocolVersionGate("2025-11-25", supportedVersions) is null);
+	assert(postProtocolVersionGate("", supportedVersions) is null);
 }
 
 unittest  // the standalone GET stream is version-gated like a POST: bad version -> 400, not a 200 stream
@@ -3408,14 +3427,14 @@ unittest  // the standalone GET stream is version-gated like a POST: bad version
 	// postProtocolVersionGate (the same gate every POST kind runs) ahead of the
 	// mode/getOpensSseStream 405 gate and before setting Content-Type, so the
 	// rejecting McpException maps to HTTP 400 even for a stateless/modern server.
-	auto bad = postProtocolVersionGate("1.0.0");
+	auto bad = postProtocolVersionGate("1.0.0", supportedVersions);
 	assert(bad !is null, "an invalid version on the standalone GET must be rejected");
 	assert(bad.code == ErrorCode.unsupportedProtocolVersion);
 	auto j = makeErrorResponse(Json(null), bad);
 	assert(httpStatusForResponse(j, false) == 400);
 	// a supported / absent header opens the stream (gate returns null)
-	assert(postProtocolVersionGate("2025-11-25") is null);
-	assert(postProtocolVersionGate("") is null);
+	assert(postProtocolVersionGate("2025-11-25", supportedVersions) is null);
+	assert(postProtocolVersionGate("", supportedVersions) is null);
 }
 
 unittest  // DELETE is version-gated like POST/GET: bad version -> 400, not 204/405
@@ -3426,14 +3445,14 @@ unittest  // DELETE is version-gated like POST/GET: bad version -> 400, not 204/
 	// rather than proceeding to a 204 terminate or a 405. The DELETE route runs
 	// postProtocolVersionGate after the origin/auth guards and before the
 	// deleteTerminatesSession branch, so the rejecting McpException maps to 400.
-	auto bad = postProtocolVersionGate("1.0.0");
+	auto bad = postProtocolVersionGate("1.0.0", supportedVersions);
 	assert(bad !is null, "an invalid version on a DELETE must be rejected");
 	assert(bad.code == ErrorCode.unsupportedProtocolVersion);
 	auto j = makeErrorResponse(Json(null), bad);
 	assert(httpStatusForResponse(j, false) == 400);
 	// a supported / absent header lets the DELETE proceed (gate returns null)
-	assert(postProtocolVersionGate("2025-11-25") is null);
-	assert(postProtocolVersionGate("") is null);
+	assert(postProtocolVersionGate("2025-11-25", supportedVersions) is null);
+	assert(postProtocolVersionGate("", supportedVersions) is null);
 }
 
 /// True if the protocol-version header denotes a modern+ request.
@@ -3787,6 +3806,56 @@ unittest  // a successful stateful initialize commits the Mcp-Session-Id header
 	assert(res.headers[SessionHeader].length > 0);
 }
 
+unittest  // the version gate rejects a version the server does not serve
+{
+	const legacyOnly = [ProtocolVersion.v2025_11_25];
+	auto e = postProtocolVersionGate("2026-07-28", legacyOnly);
+	assert(e !is null && e.code == ErrorCode.unsupportedProtocolVersion);
+	assert(e.data["supported"].length == 1);
+	assert(postProtocolVersionGate("2025-11-25", legacyOnly) is null);
+}
+
+unittest  // a stateful server answers a body-signalled 2026-07-28 subscriptions/listen with 400
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	server.enableToolsListChanged();
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	auto body_ = makeRequest(Json(1), "subscriptions/listen", params).toString();
+
+	auto initSink = createMemoryOutputStream();
+	auto initRes = createTestHTTPServerResponse(initSink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(initializeBody(),
+			["Accept": "application/json, text/event-stream"]), initRes);
+	const sessionId = initRes.headers.get(SessionHeader, "");
+	assert(sessionId.length, "initialize must mint a session");
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json, text/event-stream",
+		HttpHeader.method: "subscriptions/listen",
+		SessionHeader: sessionId,
+	]);
+	router.handleRequest(req, res);
+
+	assert(res.statusCode == HTTPStatus.badRequest);
+	auto resp = parseJsonString(() @trusted { return cast(string) sink.data.idup; }());
+	assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
+}
+
 unittest  // an initialize that fails header validation mints no surviving session and no header
 {
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
@@ -3797,9 +3866,8 @@ unittest  // an initialize that fails header validation mints no surviving sessi
 	auto router = new URLRouter;
 	mountMcp(router, server);
 
-	// A modern-tagged initialize whose Mcp-Method header mismatches the body method
-	// fails validatePostRequestHeaders -> 400, exercising the rollback path: the
-	// minted session must be terminated and NO Mcp-Session-Id stamped on the error.
+	// A stateful server does not serve 2026-07-28, so a modern-tagged initialize is
+	// refused with 400 and NO Mcp-Session-Id is stamped on the error.
 	auto sink = createMemoryOutputStream();
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	auto req = makeInitPostReq(initializeBody("2026-07-28"),
