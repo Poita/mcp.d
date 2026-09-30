@@ -641,8 +641,8 @@ incidents.publish(Incident("INC-1", "P1"));   // fans out to streams/poll + the 
 `publish(P)` is the single push verb; its reach is the scope of the injected
 registries (stream/poll are always node-local; webhook is as wide as the
 `SubscriptionStore`). The handle also carries typed `onSubscribe`/`onUnsubscribe`
-lifecycle hooks (`SubContext.runUntilUnsubscribe` hosts an author-owned live source
-loop) and `pollInterval`. The hooks fire **exactly once per `(principal, name,
+lifecycle hooks (start an author-owned live source task in `onSubscribe` that
+`publish`es, and stop it in `onUnsubscribe`) and `pollInterval`. The hooks fire **exactly once per `(principal, name,
 arguments)` per node**: the lifecycle refcount is node-local, so on a multi-node
 deployment (where webhook subscriptions are shared via the `SubscriptionStore`) the
 hooks fire once per node that first/last sees the key, not once cluster-wide — write
