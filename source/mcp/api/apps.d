@@ -17,6 +17,16 @@ enum string mcpAppsExtensionKey = "io.modelcontextprotocol/ui";
 /// The MIME type a UI resource declares for HTML app content.
 enum string mcpAppMimeType = "text/html;profile=mcp-app";
 
+/// The string elements of the JSON array `arr`, skipping any non-string entry.
+private string[] stringElements(Json arr) @safe
+{
+	string[] result;
+	foreach (i; 0 .. arr.length)
+		if (arr[i].type == Json.Type.string)
+			result ~= arr[i].get!string;
+	return result;
+}
+
 /// A tool's link to a UI resource, serialized under the tool's `_meta.ui`.
 /// `resourceUri` points at the `ui://` resource the host renders; `visibility`
 /// names who may invoke the tool ("model" and/or "app"). An empty `visibility`
@@ -43,11 +53,12 @@ struct UiToolMeta
 	static UiToolMeta fromJson(Json j) @safe
 	{
 		UiToolMeta m;
+		if (j.type != Json.Type.object)
+			return m;
 		if ("resourceUri" in j && j["resourceUri"].type == Json.Type.string)
 			m.resourceUri = j["resourceUri"].get!string;
 		if ("visibility" in j && j["visibility"].type == Json.Type.array)
-			foreach (i; 0 .. j["visibility"].length)
-				m.visibility ~= j["visibility"][i].get!string;
+			m.visibility = stringElements(j["visibility"]);
 		return m;
 	}
 }
@@ -85,13 +96,13 @@ struct UiResourceCsp
 	static UiResourceCsp fromJson(Json j) @safe
 	{
 		UiResourceCsp c;
+		if (j.type != Json.Type.object)
+			return c;
 		static string[] read(Json o, string key) @safe
 		{
-			string[] result;
 			if (key in o && o[key].type == Json.Type.array)
-				foreach (i; 0 .. o[key].length)
-					result ~= o[key][i].get!string;
-			return result;
+				return stringElements(o[key]);
+			return null;
 		}
 
 		c.connectDomains = read(j, "connectDomains");
@@ -136,6 +147,8 @@ struct UiResourcePermissions
 	static UiResourcePermissions fromJson(Json j) @safe
 	{
 		UiResourcePermissions p;
+		if (j.type != Json.Type.object)
+			return p;
 		p.camera = ("camera" in j) !is null;
 		p.microphone = ("microphone" in j) !is null;
 		p.geolocation = ("geolocation" in j) !is null;
@@ -178,6 +191,8 @@ struct UiResourceMeta
 	static UiResourceMeta fromJson(Json j) @safe
 	{
 		UiResourceMeta m;
+		if (j.type != Json.Type.object)
+			return m;
 		if ("csp" in j && j["csp"].type == Json.Type.object)
 			m.csp = UiResourceCsp.fromJson(j["csp"]);
 		if ("permissions" in j && j["permissions"].type == Json.Type.object)
@@ -290,6 +305,40 @@ unittest  // UiToolMeta round-trips through fromJson
 	auto back = UiToolMeta.fromJson(ui.toJson());
 	assert(back.resourceUri == "ui://x/y");
 	assert(back.visibility == ["app"]);
+}
+
+unittest  // UiToolMeta.fromJson skips non-string visibility entries
+{
+	import vibe.data.json : parseJsonString;
+
+	auto m = UiToolMeta.fromJson(parseJsonString(
+			`{"resourceUri":"ui://a","visibility":["app",3,null,"model"]}`));
+	assert(m.resourceUri == "ui://a");
+	assert(m.visibility == ["app", "model"]);
+}
+
+unittest  // UiResourceCsp.fromJson skips non-string domain entries
+{
+	import vibe.data.json : parseJsonString;
+
+	auto c = UiResourceCsp.fromJson(parseJsonString(
+			`{"connectDomains":["https://a",{},"https://b"],"frameDomains":[1]}`));
+	assert(c.connectDomains == ["https://a", "https://b"]);
+	assert(c.frameDomains.length == 0);
+}
+
+unittest  // Ui*.fromJson yields an empty value for non-object input
+{
+	foreach (j; [
+			Json(null), Json(5), Json("x"), Json.emptyArray, Json.undefined
+		])
+	{
+		assert(UiToolMeta.fromJson(j) == UiToolMeta.init);
+		assert(UiResourceCsp.fromJson(j).empty);
+		assert(UiResourcePermissions.fromJson(j).empty);
+		auto m = UiResourceMeta.fromJson(j);
+		assert(m.csp.empty && m.permissions.empty && m.domain.isNull && m.prefersBorder.isNull);
+	}
 }
 
 unittest  // mcp-app constants carry the spec's literal strings
