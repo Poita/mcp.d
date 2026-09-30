@@ -2,6 +2,7 @@ module mcp.protocol.ssrf;
 
 import core.time : Duration;
 import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
+import vibe.stream.tls : TLSContext;
 
 @safe:
 
@@ -728,6 +729,112 @@ PinnedConnect pinnedConnectAddress(string host, bool tls, SsrfPolicy policy) @sa
 	return r;
 }
 
+/// How outbound TLS connections validate the server certificate.
+struct TlsTrust
+{
+	/// A PEM file of CA certificates to trust in place of the system store — a
+	/// private CA, or the certificate of a self-signed development server. Empty
+	/// (the default) trusts the system CA bundle: the file named by
+	/// `SSL_CERT_FILE` when set, else OpenSSL's default bundle, else a
+	/// well-known platform location. Where no system bundle exists (e.g.
+	/// Windows) set this or `SSL_CERT_FILE`; TLS connections fail otherwise.
+	string caFile;
+
+	/// Accept any server certificate without verifying its chain or host name.
+	/// For local development and tests against self-signed servers only: it
+	/// leaves every TLS connection open to interception.
+	bool insecureSkipVerify;
+}
+
+/// Per-request knobs for `secureRequestHTTP`.
+struct FetchOptions
+{
+	/// Bound on the connect and on each read. Zero leaves vibe's defaults.
+	Duration timeout;
+
+	/// Certificate validation for `https` URLs.
+	TlsTrust tls;
+}
+
+/// The system CA bundle: the file `SSL_CERT_FILE` names, else OpenSSL's
+/// compiled-in default, else the first well-known platform bundle that exists.
+/// Empty when none is found. Resolved once per thread.
+private string systemCaBundle() @trusted
+{
+	import deimos.openssl.x509 : X509_get_default_cert_file, X509_get_default_cert_file_env;
+	import std.file : exists, isFile;
+	import std.process : environment;
+	import std.string : fromStringz;
+
+	static bool resolved;
+	static string bundle;
+	if (resolved)
+		return bundle;
+	resolved = true;
+
+	string[] candidates = [
+		environment.get(fromStringz(X509_get_default_cert_file_env()).idup, ""),
+		fromStringz(X509_get_default_cert_file()).idup,
+		"/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt",
+		"/etc/pki/tls/certs/ca-bundle.crt",
+		"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+		"/etc/ssl/ca-bundle.pem", "/usr/local/etc/openssl/cert.pem",
+		"/usr/local/share/certs/ca-root-nss.crt",
+	];
+	foreach (c; candidates)
+	{
+		try
+		{
+			if (c.length && exists(c) && isFile(c))
+			{
+				bundle = c;
+				break;
+			}
+		}
+		catch (Exception)
+		{
+		}
+	}
+	return bundle;
+}
+
+/// Build the setup for a client TLS context that validates servers under
+/// `trust`: the full chain against the trusted CAs plus the host name, or
+/// nothing when `trust.insecureSkipVerify` is set. The CA bundle is resolved
+/// here, so a missing bundle throws before any connection is attempted rather
+/// than letting one proceed unverified.
+void delegate(TLSContext) @safe nothrow tlsContextSetup(TlsTrust trust) @safe
+{
+	import mcp.protocol.errors : internalError;
+	import vibe.stream.tls : TLSPeerValidationMode;
+
+	if (trust.insecureSkipVerify)
+		return (TLSContext ctx) @safe nothrow{
+		try
+			ctx.peerValidationMode = TLSPeerValidationMode.none;
+		catch (Exception)
+		{
+		}
+	};
+
+	const caFile = trust.caFile.length ? trust.caFile : systemCaBundle();
+	if (caFile.length == 0)
+		throw internalError("No CA bundle is available to verify TLS server certificates; "
+				~ "set SSL_CERT_FILE or TlsTrust.caFile");
+	return (TLSContext ctx) @safe nothrow{
+		// A bundle that fails to load leaves the trust store empty, so every
+		// handshake is refused.
+		try
+		{
+			ctx.peerValidationMode = TLSPeerValidationMode.trustedCert;
+			ctx.useTrustedCertificateFile(caFile);
+		}
+		catch (Exception)
+		{
+		}
+	};
+}
+
 /// SSRF-safe HTTP fetch. Parses `url` with vibe's `URL` — the exact parser the
 /// connector uses — so the host vetted is the host connected to (no parser
 /// differential). The host is classified ONCE via `classifyHost`; under
@@ -737,6 +844,9 @@ PinnedConnect pinnedConnectAddress(string host, bool tls, SsrfPolicy policy) @sa
 /// it, while the original hostname is preserved for the `Host` header and TLS
 /// SNI (no TOCTOU re-resolution).
 ///
+/// An `https` server must present a certificate chaining to a trusted CA and
+/// matching the original host name; `options.tls` selects the trusted CAs.
+///
 /// Throws `invalidRequest` when the URL is unsafe under `policy` (insecure
 /// scheme for `blockInternal`, an internal IP-literal/resolved address, or an
 /// unresolvable host — fail CLOSED). `@trusted` because the vibe HTTP client API
@@ -744,7 +854,7 @@ PinnedConnect pinnedConnectAddress(string host, bool tls, SsrfPolicy policy) @sa
 void secureRequestHTTP(string url, SsrfPolicy policy,
 		scope void delegate(scope HTTPClientRequest) requester,
 		scope void delegate(scope HTTPClientResponse) responder,
-		Duration requestTimeout = Duration.zero) @trusted
+		FetchOptions options = FetchOptions.init) @trusted
 {
 	import mcp.protocol.errors : invalidRequest;
 	import std.string : indexOf;
@@ -798,12 +908,12 @@ void secureRequestHTTP(string url, SsrfPolicy policy,
 
 	auto settings = new HTTPClientSettings;
 	settings.tlsPeerName = originalHost;
-	// Bound the whole request (connect + read) so one slow callback can't hold a
-	// delivery worker — and its lease — open indefinitely.
-	if (requestTimeout > Duration.zero)
+	if (tls)
+		settings.tlsContextSetup = tlsContextSetup(options.tls);
+	if (options.timeout > Duration.zero)
 	{
-		settings.connectTimeout = requestTimeout;
-		settings.readTimeout = requestTimeout;
+		settings.connectTimeout = options.timeout;
+		settings.readTimeout = options.timeout;
 	}
 
 	// vibe derives the Host header from u.host; restore the original host so the
@@ -1220,4 +1330,125 @@ unittest  // malformed IPv6 literals fail closed; an IPv4-mapped public address 
 	// A fully-specified (no "::") public global-unicast literal fills the entire
 	// hextet area and classifies public.
 	assert(classifyHostLexical("[2606:4700:4700:1:2:3:4:5]") == AddressClass.public_);
+}
+
+// ---------------------------------------------------------------------------
+// TLS peer validation against a local server whose certificate no trusted CA
+// vouches for.
+// ---------------------------------------------------------------------------
+
+version (unittest)
+{
+	import vibe.http.server : HTTPListener;
+
+	/// A self-signed certificate for `localhost` / `127.0.0.1` (valid until
+	/// 2126) and its private key.
+	package(mcp) enum string selfSignedTestCertPem = `-----BEGIN CERTIFICATE-----
+MIIBmjCCAUGgAwIBAgIUAovDwvpLlQMt8gK+erC9S5I42yIwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkzMDIzMzkzNloYDzIxMjYwOTA2
+MjMzOTM2WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAARK4ceRzW/TvRDjH6cserBLy70rdIJd/O+iiA11+NVcrtBaf1RXgENx
+PtEo4dB2AjfdyjZG2bkI3tMjdREfJS6Go28wbTAdBgNVHQ4EFgQUzK5LlfqR4ye2
+dOlo7ZCfU7rIWAUwHwYDVR0jBBgwFoAUzK5LlfqR4ye2dOlo7ZCfU7rIWAUwGgYD
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZI
+zj0EAwIDRwAwRAIgRiBXZ0iBHYlwFM1lvIDVuGHIAhQ6PeWnIM3O2IVLTmECIFg1
+KwQhpZaxyjtic6lb644+zasZ1FhrQxH85bL68vNc
+-----END CERTIFICATE-----
+`;
+
+	/// ditto
+	package(mcp) enum string selfSignedTestKeyPem = `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgyac0Dphvj23tfCMC
+9gshddtbn//XQZ9+DFg/hs80DCKhRANCAARK4ceRzW/TvRDjH6cserBLy70rdIJd
+/O+iiA11+NVcrtBaf1RXgENxPtEo4dB2AjfdyjZG2bkI3tMjdREfJS6G
+-----END PRIVATE KEY-----
+`;
+
+	/// Write `pem` to a fresh temporary file and return its path.
+	package(mcp) string writeTestPemFile(string pem) @trusted
+	{
+		import std.conv : to;
+		import std.file : tempDir, write;
+		import std.path : buildPath;
+		import std.random : uniform;
+
+		const path = buildPath(tempDir(), "mcp-d-test-" ~ uniform!ulong().to!string ~ ".pem");
+		write(path, pem);
+		return path;
+	}
+
+	/// Listen for HTTPS on an ephemeral `127.0.0.1` port presenting the
+	/// self-signed test certificate, answering every request with 200 "ok".
+	package(mcp) HTTPListener startSelfSignedTlsServer() @trusted
+	{
+		import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+			HTTPServerSettings, listenHTTP;
+		import vibe.stream.tls : createTLSContext, TLSContextKind;
+
+		auto settings = new HTTPServerSettings();
+		settings.bindAddresses = ["127.0.0.1"];
+		settings.port = 0;
+		settings.tlsContext = createTLSContext(TLSContextKind.server);
+		settings.tlsContext.useCertificateChainFile(writeTestPemFile(selfSignedTestCertPem));
+		settings.tlsContext.usePrivateKeyFile(writeTestPemFile(selfSignedTestKeyPem));
+		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+			res.writeBody("ok", "text/plain");
+		});
+	}
+}
+
+unittest  // secureRequestHTTP refuses a server whose certificate no trusted CA vouches for
+{
+	import std.conv : to;
+
+	auto listener = startSelfSignedTlsServer();
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
+	const url = "https://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
+
+	bool reached;
+	try
+		secureRequestHTTP(url, SsrfPolicy.allowUserConfigured, null, (scope HTTPClientResponse res) {
+			reached = true;
+		});
+	catch (Exception)
+	{
+	}
+	assert(!reached, "an untrusted server certificate must fail the TLS handshake");
+}
+
+unittest  // secureRequestHTTP trusts a server certificate issued by the configured caFile
+{
+	import std.conv : to;
+
+	auto listener = startSelfSignedTlsServer();
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
+	const url = "https://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
+
+	int status;
+	FetchOptions opts;
+	opts.tls.caFile = writeTestPemFile(selfSignedTestCertPem);
+	secureRequestHTTP(url, SsrfPolicy.allowUserConfigured, null, (scope HTTPClientResponse res) {
+		status = res.statusCode;
+	}, opts);
+	assert(status == 200);
+}
+
+unittest  // secureRequestHTTP skips certificate verification only when insecureSkipVerify is set
+{
+	import std.conv : to;
+
+	auto listener = startSelfSignedTlsServer();
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
+	const url = "https://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
+
+	int status;
+	FetchOptions opts;
+	opts.tls.insecureSkipVerify = true;
+	secureRequestHTTP(url, SsrfPolicy.allowUserConfigured, null, (scope HTTPClientResponse res) {
+		status = res.statusCode;
+	}, opts);
+	assert(status == 200);
 }

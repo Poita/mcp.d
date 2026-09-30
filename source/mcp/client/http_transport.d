@@ -9,7 +9,7 @@ import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 import vibe.http.common : HTTPMethod;
 import vibe.stream.operations : readAllUTF8, readLine;
 import vibe.core.net : TCPConnection, connectTCP;
-import vibe.stream.tls : createTLSContext, createTLSStream, TLSContextKind, TLSPeerValidationMode;
+import vibe.stream.tls : createTLSContext, createTLSStream, TLSContext, TLSContextKind;
 import vibe.stream.wrapper : ProxyStream, createProxyStream;
 import vibe.core.stream : Stream;
 import vibe.internal.interfaceproxy : InterfaceProxy, interfaceProxy;
@@ -18,6 +18,7 @@ import vibe.core.sync : LocalManualEvent, createManualEvent, LocalTaskSemaphore;
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.mrtr : isHeaderValueUnsafe;
+import mcp.protocol.ssrf : FetchOptions, TlsTrust;
 import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.subscription : SubscriptionStream, ListenGate;
 
@@ -300,6 +301,11 @@ final class HttpClientTransport : ClientTransport
 	// Configurable via `setMaxMessageBytes`.
 	private size_t maxMessageBytes = defaultMaxMessageBytes;
 
+	// How https/wss servers are validated, and the client TLS context built from
+	// it on first use and shared by every connection.
+	private TlsTrust tlsTrust;
+	private TLSContext tlsContext_;
+
 	/// Inbound dispatcher installed by `McpClient` (its `dispatchInbound`),
 	/// invoked for notifications and server->client requests on any stream.
 	private void delegate(Message) @safe inbound;
@@ -390,6 +396,30 @@ final class HttpClientTransport : ClientTransport
 		maxMessageBytes = limit;
 	}
 
+	/// Validate https/wss servers under `trust` (trusted CAs, or no verification
+	/// for development). Applies to connections opened afterwards.
+	void setTlsTrust(TlsTrust trust) @safe
+	{
+		tlsTrust = trust;
+		tlsContext_ = null;
+	}
+
+	/// The client TLS context for this transport's https/wss connections: it
+	/// requires a server certificate chaining to a trusted CA and matching the
+	/// endpoint host name, unless `tlsTrust` disables verification.
+	private TLSContext tlsContext() @trusted
+	{
+		import mcp.protocol.ssrf : tlsContextSetup;
+
+		if (tlsContext_ is null)
+		{
+			auto ctx = createTLSContext(TLSContextKind.client);
+			tlsContextSetup(tlsTrust)(ctx);
+			tlsContext_ = ctx;
+		}
+		return tlsContext_;
+	}
+
 	/// Stop the transport: signal the background stream readers
 	/// (server->client, legacy GET, `subscriptions/listen` / `events/stream`) to
 	/// stop between reads and force-close their held sockets so any blocked
@@ -450,7 +480,8 @@ final class HttpClientTransport : ClientTransport
 				foreach (k, v; versionHeaders)
 					if (!isHeaderValueUnsafe(v))
 						req.headers[k] = v;
-			}, (scope HTTPClientResponse res) { res.dropBody(); }, connectTimeout);
+			}, (scope HTTPClientResponse res) { res.dropBody(); },
+					FetchOptions(connectTimeout, tlsTrust));
 		}
 		catch (Exception)
 		{
@@ -576,7 +607,7 @@ final class HttpClientTransport : ClientTransport
 			captureSession(res);
 			status = res.statusCode;
 			res.dropBody();
-		});
+		}, FetchOptions(Duration.zero, tlsTrust));
 		// A oneway send carries no awaited reply, so a rejection would otherwise be
 		// invisible: 404/410 under a session means the session is gone (drop its id
 		// and mark it so the next non-initialize request surfaces a clear error);
@@ -794,7 +825,7 @@ final class HttpClientTransport : ClientTransport
 				if (closing)
 					return;
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
-				auto conn = openClientStream(sock, ep.tls, ep.host);
+				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
 				scope (exit)
 					conn.release();
 
@@ -1058,7 +1089,7 @@ final class HttpClientTransport : ClientTransport
 				if (closing)
 					return;
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
-				auto conn = openClientStream(sock, ep.tls, ep.host);
+				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
 				scope (exit)
 					conn.release();
 				const getReq = buildHttpRequest("GET", ep.path, ep.host, "text/event-stream",
@@ -1455,7 +1486,7 @@ final class HttpClientTransport : ClientTransport
 					if (closing)
 						return;
 					// Wrap in TLS for https/wss; plaintext is returned unwrapped.
-					auto conn = openClientStream(sock, ep.tls, ep.host);
+					auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
 					scope (exit)
 						conn.release();
 
@@ -1629,7 +1660,7 @@ final class HttpClientTransport : ClientTransport
 				if (isCancelled())
 					return;
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
-				auto conn = openClientStream(sock, ep.tls, ep.host);
+				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
 				scope (exit)
 					conn.release();
 
@@ -1840,7 +1871,7 @@ final class HttpClientTransport : ClientTransport
 					sock.close();
 				}
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
-				auto conn = openClientStream(sock, ep.tls, ep.host);
+				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
 				scope (exit)
 					conn.release();
 
@@ -2066,15 +2097,6 @@ string pinnedEndpointHost(HttpEndpoint ep) @safe
 	return pin.pinnedIp;
 }
 
-/// Open a client byte stream to `ep`, wrapping the raw TCP connection in a vibe
-/// TLS tunnel when `ep.tls` is set (https/wss). Returns a `ProxyStream` so the
-/// five raw-TCP request paths share ONE TLS-handling site and treat the plaintext
-/// and TLS cases uniformly. The TLS context uses
-/// `TLSContextKind.client` with peer-certificate verification (`checkPeer`) and
-/// sets the SNI/peer name to `ep.host`, so the server certificate and hostname are
-/// validated; the underlying `conn` must outlive the returned stream (callers keep
-/// it in scope and `close()` it). On a plaintext endpoint the raw connection is
-/// returned unwrapped (still as a `ProxyStream` for a single static type).
 /// Remove the surrounding brackets from a bracketed IPv6 literal host
 /// (`[::1]` -> `::1`), leaving any other host untouched. The TLS SNI/peer name
 /// and the SSRF/connect resolver both want the bare address, while the `Host`
@@ -2115,18 +2137,22 @@ private final class ClientStream : ProxyStream
 	}
 }
 
-private ClientStream openClientStream(TCPConnection conn, bool tls, string host) @trusted
+/// Open a client byte stream over `conn`, wrapped in a TLS tunnel when `ctx`
+/// is set (https/wss) and returned unwrapped otherwise, so every raw-TCP
+/// request path shares one TLS-handling site. `host` is the TLS peer name the
+/// server certificate is validated against under `ctx`. `conn` must outlive
+/// the returned stream.
+private ClientStream openClientStream(TCPConnection conn, TLSContext ctx, string host) @trusted
 {
-	if (tls)
+	if (ctx !is null)
 	{
-		auto ctx = createTLSContext(TLSContextKind.client);
-		ctx.peerValidationMode = TLSPeerValidationMode.checkPeer;
 		// The TLS layer reads the socket through `plain`, so releasing `plain`
 		// drops every reference the stream holds.
 		auto plain = createProxyStream(conn);
 		// vibe's TLS layer wants the bare peer name; an IPv6 literal reaches here
-		// bracketed (the form the `Host` header needs), so strip the brackets.
-		auto t = createTLSStream(plain, ctx, unbracketHost(host));
+		// bracketed (the form the `Host` header needs), so strip the brackets. The
+		// connected address lets an IP-literal host match an IP-address SAN.
+		auto t = createTLSStream(plain, ctx, unbracketHost(host), conn.remoteAddress);
 		return new ClientStream(interfaceProxy!Stream(t), plain);
 	}
 	return new ClientStream(interfaceProxy!Stream(conn), null);
@@ -2360,7 +2386,7 @@ unittest  // an https URL constructs (TLS supported)
 {
 	// The streaming HTTP client transport wires real TLS through every raw-TCP
 	// path (openClientStream wraps the connection in a vibe TLS tunnel with
-	// SNI = host and peer-certificate verification, port 443 by default). An
+	// SNI = host and trusted-chain + host-name verification, port 443 by default). An
 	// https/wss URL constructs successfully and the TLS handshake happens on
 	// first connect.
 	auto https = new HttpClientTransport("https://example.com/mcp");
@@ -2373,12 +2399,38 @@ unittest  // an https URL constructs (TLS supported)
 	assert(ok !is null);
 }
 
+unittest  // the transport's TLS refuses an untrusted server certificate unless its CA is configured
+{
+	import std.conv : to;
+	import std.exception : assertThrown;
+	import mcp.protocol.ssrf : selfSignedTestCertPem, startSelfSignedTlsServer, writeTestPemFile;
+
+	auto listener = startSelfSignedTlsServer();
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
+	const port = listener.bindAddresses[0].port;
+	auto t = new HttpClientTransport("https://127.0.0.1:" ~ port.to!string ~ "/mcp");
+
+	auto untrusted = connectTCP("127.0.0.1", port);
+	scope (exit)
+		untrusted.close();
+	assertThrown(openClientStream(untrusted, t.tlsContext(), "127.0.0.1"));
+
+	TlsTrust trust;
+	trust.caFile = writeTestPemFile(selfSignedTestCertPem);
+	t.setTlsTrust(trust);
+	auto trusted = connectTCP("127.0.0.1", port);
+	scope (exit)
+		trusted.close();
+	auto s = openClientStream(trusted, t.tlsContext(), "127.0.0.1");
+	s.release();
+}
+
 unittest  // openClientStream returns a usable stream for plaintext (TLS path needs a live peer)
 {
 	// The plaintext branch returns the raw connection boxed in a ProxyStream so the
-	// five request paths share one static stream type. We cannot complete a TLS
-	// handshake without a live peer here, but we can assert the helper is wired (the
-	// TLS branch is exercised end-to-end by the integration paths / conformance).
+	// five request paths share one static stream type; the TLS branch is exercised
+	// against a live self-signed peer above.
 	auto ep = parseHttpEndpoint("https://example.com/mcp");
 	assert(ep.tls && ep.port == 443 && ep.host == "example.com");
 	auto plain = parseHttpEndpoint("http://example.com/mcp");

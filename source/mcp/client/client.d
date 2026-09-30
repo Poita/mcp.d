@@ -25,6 +25,7 @@ import mcp.client.cache : CacheStore, InMemoryCacheStore, CacheKey, CacheEntry, 
 import mcp.client.event_subscription : EventSubscription;
 import mcp.client.events : WebhookReceiver, NoCompatibleDeliveryMode, generateWhsecSecret;
 import mcp.protocol.events;
+import mcp.protocol.ssrf : TlsTrust;
 
 /// How a cacheable request verb interacts with the client's response cache.
 /// Only meaningful on the six cacheable reads (`listTools`, `listResources`,
@@ -210,6 +211,13 @@ struct ClientSettings
 	/// accepts from the server. A larger one fails the request it belongs to, so a
 	/// hostile or broken server cannot make the client allocate without bound.
 	size_t maxMessageBytes = defaultMaxMessageBytes;
+
+	/// HTTP transport only: how https/wss servers are validated. The default
+	/// requires a certificate chaining to a CA in the system store and matching
+	/// the endpoint host name. Set `tls.caFile` to trust a private CA or a local
+	/// server's self-signed certificate; `tls.insecureSkipVerify` disables
+	/// verification entirely and is for local development only.
+	TlsTrust tls;
 
 	/// Response cache for the six cacheable reads (the four `*/list` verbs,
 	/// `resources/read`, and `server/discover`). `null` (the default) installs an
@@ -693,6 +701,7 @@ final class McpClient : ClientProtocol
 		auto transport = new HttpClientTransport(url, settings.maxInFlight);
 		transport.setConnectTimeout(settings.connectTimeout);
 		transport.setMaxMessageBytes(settings.maxMessageBytes);
+		transport.setTlsTrust(settings.tls);
 		auto c = new McpClient(transport, settings.clientInfo);
 		c.cacheServer_ = url;
 		return c.applySettings(settings);

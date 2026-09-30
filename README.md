@@ -402,6 +402,22 @@ is per-client and bounded by an LRU-style size cap. `client.setCache`,
 `setDefaultCacheTtl`, and `clearCache` adjust this at runtime; `cache()` exposes
 the live store for pre-seeding.
 
+**TLS.** Every outbound `https` connection the SDK makes (the HTTP client
+transport, OAuth discovery/token/JWKS/introspection fetches, webhook delivery)
+requires a server certificate that chains to a trusted CA and matches the host
+name. The system CA bundle is used by default (`SSL_CERT_FILE` overrides it; on
+platforms without a PEM bundle, such as Windows, set it or `caFile`). For the
+client transport, `ClientSettings.tls` trusts a private CA or a local
+server's self-signed certificate, or — for local development only — disables
+verification:
+
+```d
+ClientSettings s;
+s.tls.caFile = "dev-ca.pem";        // trust this CA in place of the system store
+// s.tls.insecureSkipVerify = true; // development only: no certificate checks
+auto c = McpClient.http("https://localhost:8443/mcp", s);
+```
+
 **`public` vs `private` scope (shared caches).** The server's `cacheScope`
 controls *where* an entry is stored, which only matters when several clients
 share one backend. A `public` result lives under a shared key, so **every client

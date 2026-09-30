@@ -110,7 +110,7 @@ final class SecureWebhookTransport : WebhookTransport
 		import vibe.core.core : setTimer;
 		import vibe.core.task : Task, InterruptException;
 		import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
-		import mcp.protocol.ssrf : secureRequestHTTP, SsrfPolicy;
+		import mcp.protocol.ssrf : FetchOptions, secureRequestHTTP, SsrfPolicy;
 
 		const policy = allowPrivate ? SsrfPolicy.allowUserConfigured : SsrfPolicy.blockInternal;
 		WebhookHttpResult result;
@@ -148,7 +148,7 @@ final class SecureWebhookTransport : WebhookTransport
 					result = WebhookHttpResult.failure(categoryForStatus(res.statusCode),
 						res.statusCode);
 				answered = true;
-			}, requestTimeout_);
+			}, FetchOptions(requestTimeout_));
 		}
 		catch (InterruptException)
 		{
