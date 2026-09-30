@@ -63,11 +63,14 @@ jobs:
         run: |
           ./conformance-server ${{ matrix.server_args }} &
           SERVER_PID=$!
+          # Any HTTP status means the server is listening; curl reports 000 when
+          # the connection is refused.
           for i in $(seq 1 30); do
-            if curl -sf -o /dev/null "${{ matrix.url }}" \
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "${{ matrix.url }}" \
               -H 'Accept: application/json, text/event-stream' \
               -H 'Content-Type: application/json' \
-              -X POST -d '{}'; then break; fi
+              -X POST -d '{}' || true)
+            if [ "$CODE" != "000" ]; then break; fi
             sleep 1
           done
           set +e

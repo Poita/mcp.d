@@ -50,11 +50,14 @@ conformance-server-lane revision: conformance-build
     ./conformance-server --port "$PORT" $MODE &
     SERVER_PID=$!
     trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+    # Any HTTP status means the server is listening; curl reports 000 when
+    # the connection is refused.
     for i in $(seq 1 30); do
-      if curl -sf -o /dev/null "http://127.0.0.1:$PORT/mcp" \
+      CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/mcp" \
         -H 'Accept: application/json, text/event-stream' \
         -H 'Content-Type: application/json' \
-        -X POST -d '{}'; then break; fi
+        -X POST -d '{}' || true)
+      if [ "$CODE" != "000" ]; then break; fi
       sleep 1
     done
     npx --yes "@modelcontextprotocol/conformance@{{conformance_version}}" \
