@@ -850,6 +850,13 @@ final class EventsRuntime
 		auto p = name in types_;
 		if (p is null)
 			throw notFound("Unknown event type: " ~ name, "event");
+		bool pollOffered;
+		foreach (m; effectiveDelivery(name))
+			if (m == DeliveryMode.poll)
+				pollOffered = true;
+		if (!pollOffered)
+			throw unsupported("Event type does not offer poll delivery: " ~ name,
+					"deliveryMode", "poll");
 		validateArguments(*p, arguments);
 
 		touchPollLease(*p, name, arguments, principal);
@@ -2924,6 +2931,25 @@ unittest  // poll on an unknown event type throws NotFound
 	auto rt = testRuntime();
 	assertThrown!McpException(rt.poll("nope", Json.emptyObject, "",
 			Nullable!string.init, Nullable!long.init, Nullable!long.init));
+}
+
+unittest  // poll on a type with poll delivery disabled is Unsupported and fires no on_subscribe
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto rt = testRuntime();
+	int subscribed;
+	rt.define!(DemoArgs, DemoPayload)("x").disable(DeliveryMode.poll)
+		.onFetch((DemoArgs a, scope FetchContext ctx) @safe => EventBatch!DemoPayload.empty("c0"))
+		.onSubscribe((DemoArgs a, scope SubContext ctx) @safe { subscribed++; });
+	int code;
+	try
+		rt.poll("x", Json.emptyObject, "", Nullable!string.init,
+				Nullable!long.init, Nullable!long.init);
+	catch (McpException e)
+		code = e.code;
+	assert(code == ErrorCode.unsupported);
+	assert(subscribed == 0);
 }
 
 unittest  // a typed event's derived inputSchema declares every argument optional
