@@ -210,6 +210,24 @@ struct EventOccurrence
 	}
 }
 
+/// Read the optional non-negative integer field `key` of a request's params into
+/// `val`. Absent or null leaves `val` null; any other non-integer or a negative
+/// value throws -32602 InvalidParams, so a malformed bound is refused rather than
+/// silently ignored.
+private void readNonNegative(Json j, string key, ref Nullable!long val) @safe
+{
+	import mcp.protocol.errors : invalidParams;
+
+	if (j.type != Json.Type.object)
+		return;
+	auto v = key in j;
+	if (v is null || v.type == Json.Type.null_ || v.type == Json.Type.undefined)
+		return;
+	if (v.type != Json.Type.int_ || v.get!long < 0)
+		throw invalidParams("'" ~ key ~ "' must be a non-negative integer");
+	val = v.get!long;
+}
+
 /// Parameters of an `events/poll` request. `cursor: null` means "from now".
 struct PollParams
 {
@@ -240,8 +258,8 @@ struct PollParams
 			p.arguments = j["arguments"];
 		if ("cursor" in j && j["cursor"].type == Json.Type.string)
 			p.cursor = j["cursor"].get!string;
-		tryGet(j, "maxAgeMs", p.maxAgeMs);
-		tryGet(j, "maxEvents", p.maxEvents);
+		readNonNegative(j, "maxAgeMs", p.maxAgeMs);
+		readNonNegative(j, "maxEvents", p.maxEvents);
 		return p;
 	}
 }
@@ -314,7 +332,7 @@ struct StreamParams
 			p.arguments = j["arguments"];
 		if ("cursor" in j && j["cursor"].type == Json.Type.string)
 			p.cursor = j["cursor"].get!string;
-		tryGet(j, "maxAgeMs", p.maxAgeMs);
+		readNonNegative(j, "maxAgeMs", p.maxAgeMs);
 		return p;
 	}
 }
@@ -385,12 +403,11 @@ struct SubscribeParams
 			p.delivery = WebhookDelivery.fromJson(j["delivery"]);
 		if ("cursor" in j && j["cursor"].type == Json.Type.string)
 			p.cursor = j["cursor"].get!string;
-		tryGet(j, "maxAgeMs", p.maxAgeMs);
+		readNonNegative(j, "maxAgeMs", p.maxAgeMs);
 		if ("ttlMs" in j)
 		{
 			p.ttlMsPresent = true;
-			if (j["ttlMs"].type != Json.Type.null_)
-				tryGet(j, "ttlMs", p.ttlMs);
+			readNonNegative(j, "ttlMs", p.ttlMs);
 		}
 		return p;
 	}
@@ -940,6 +957,101 @@ unittest  // PollParams emits cursor:null for "from now" and round-trips a curso
 	assert(j2["maxAgeMs"].get!long == 300_000 && j2["maxEvents"].get!long == 50);
 	auto back2 = PollParams.fromJson(j2);
 	assert(back2.cursor.get == "c1" && back2.maxAgeMs.get == 300_000 && back2.maxEvents.get == 50);
+}
+
+unittest  // PollParams rejects a non-integer maxEvents with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			PollParams.fromJson(parseJsonString(`{"name":"n","maxEvents":"10"}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // PollParams rejects a negative maxEvents with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			PollParams.fromJson(parseJsonString(`{"name":"n","maxEvents":-1}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // PollParams rejects a negative maxAgeMs with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			PollParams.fromJson(parseJsonString(`{"name":"n","maxAgeMs":-5}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // PollParams treats null maxAgeMs/maxEvents as absent
+{
+	import vibe.data.json : parseJsonString;
+
+	auto p = PollParams.fromJson(parseJsonString(`{"name":"n","maxAgeMs":null,"maxEvents":null}`));
+	assert(p.maxAgeMs.isNull && p.maxEvents.isNull);
+}
+
+unittest  // StreamParams rejects a fractional maxAgeMs with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			StreamParams.fromJson(parseJsonString(`{"name":"n","maxAgeMs":1.5}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // SubscribeParams rejects a non-integer ttlMs rather than treating it as no expiry
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			SubscribeParams.fromJson(parseJsonString(`{"name":"n","ttlMs":"forever"}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // SubscribeParams rejects a negative ttlMs with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			SubscribeParams.fromJson(parseJsonString(`{"name":"n","ttlMs":-1}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // SubscribeParams rejects a negative maxAgeMs with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			SubscribeParams.fromJson(parseJsonString(`{"name":"n","maxAgeMs":-1}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // SubscribeParams keeps ttlMs null as an explicit no-expiry request
+{
+	import vibe.data.json : parseJsonString;
+
+	auto p = SubscribeParams.fromJson(parseJsonString(`{"name":"n","ttlMs":null}`));
+	assert(p.ttlMsPresent && p.ttlMs.isNull);
+	auto q = SubscribeParams.fromJson(parseJsonString(`{"name":"n","ttlMs":60000}`));
+	assert(q.ttlMsPresent && q.ttlMs.get == 60_000);
 }
 
 unittest  // PollResult round-trips events + flags

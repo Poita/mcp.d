@@ -1519,11 +1519,16 @@ final class McpServer : ServerCore
 			return true;
 		}
 
-		auto p = StreamParams.fromJson(msg.params);
-		if (p.name.length == 0)
+		StreamParams p;
+		try
 		{
-			writeLine(makeErrorResponse(msg.id,
-					invalidParams("events/stream requires a string 'name'")).toString());
+			p = StreamParams.fromJson(msg.params);
+			if (p.name.length == 0)
+				throw invalidParams("events/stream requires a string 'name'");
+		}
+		catch (McpException e)
+		{
+			writeLine(makeErrorResponse(msg.id, e).toString());
 			return true;
 		}
 
@@ -6737,6 +6742,28 @@ unittest  // stdio events/stream opens with an active frame, then delivers emitt
 	assert(ev["method"].get!string == "notifications/events/event");
 	assert(ev["params"]["eventId"].get!string == "evt_1");
 	assert(ev["params"]["_meta"][subscriptionIdMetaKey].get!long == 9);
+}
+
+unittest  // stdio events/stream answers a negative maxAgeMs with InvalidParams
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	registerDemoEvent(s);
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "incident.created";
+	params["maxAgeMs"] = -1;
+	assert(s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink));
+	assert(lines.length == 1);
+	auto resp = parseJsonString(lines[0]);
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
 unittest  // a cancelled stdio events/stream stops receiving events

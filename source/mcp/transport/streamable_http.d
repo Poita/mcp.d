@@ -1492,10 +1492,15 @@ private void handleEventsStream(McpServer server, Message msg,
 		return;
 	}
 
-	auto p = StreamParams.fromJson(msg.params);
-	if (p.name.length == 0)
+	StreamParams p;
+	try
 	{
-		auto e = invalidParams("events/stream requires a string 'name'");
+		p = StreamParams.fromJson(msg.params);
+		if (p.name.length == 0)
+			throw invalidParams("events/stream requires a string 'name'");
+	}
+	catch (McpException e)
+	{
 		res.statusCode = httpStatusForResponse(makeErrorResponse(msg.id, e), true);
 		res.writeBody(makeErrorResponse(msg.id, e).toString(), "application/json");
 		return;
@@ -4030,6 +4035,32 @@ unittest  // an events/stream POST whose Accept excludes text/event-stream is 40
 	]);
 	router.handleRequest(req, res);
 	assert(res.statusCode == HTTPStatus.notAcceptable);
+}
+
+unittest  // an events/stream POST with a negative maxAgeMs answers InvalidParams
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableEvents();
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
+		~ `"name":"x","maxAgeMs":-1,"_meta":{"protocolVersion":"2026-07-28"}}}`;
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json, text/event-stream",
+		"MCP-Protocol-Version": "2026-07-28",
+		"Mcp-Method": "events/stream"
+	]);
+	router.handleRequest(req, res);
+	auto resp = parseJsonString(() @trusted { return cast(string) sink.data; }());
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
 /// Build the leading event the transport sends when it opens a
