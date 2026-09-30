@@ -903,7 +903,7 @@ final class ServerPushChannel : PushChannel
 	}
 
 	/// Shared single-stream delivery: try eligible listeners (those for which
-	/// `eligible` is true) in registration order, writing `msg` to the first live one
+	/// `eligible` is true) newest first, writing `msg` to the first live one
 	/// and stopping there (the Multiple Connections rule: never broadcast the same
 	/// message across multiple streams). Listeners whose write throws are dropped so
 	/// the channel self-heals. Returns the listener id the message landed on, or -1
@@ -939,7 +939,10 @@ final class ServerPushChannel : PushChannel
 			}
 		}();
 
-		foreach (l; candidates)
+		// Newest first: an older stream of the same session may be a half-open
+		// connection the client already replaced, whose writes still land in the
+		// socket buffer without error until a heartbeat detects the disconnect.
+		foreach_reverse (l; candidates)
 		{
 			if (writeToListener(l, msg, bindRequestId, bindToken))
 				return l.id; // single-stream delivery: stop at the first success
@@ -1382,6 +1385,23 @@ unittest  // resuming a stream evicts the stale listener still attached to it
 	assert(fresh.length == 1 && fresh[0].canFind("\"n\":2"));
 }
 
+unittest  // a session's newest stream receives its messages, not a half-open older one
+{
+	// A client that reconnects without Last-Event-ID leaves its previous stream
+	// registered until a heartbeat notices the disconnect; writes to that stream
+	// still "succeed" into the socket buffer, so delivery must prefer the newest.
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string[] stale, fresh;
+	ch.addListener((string f) @safe { stale ~= f; }, Json.init, ListenFilter.init, "", null, "S");
+	ch.addListener((string f) @safe { fresh ~= f; }, Json.init, ListenFilter.init, "", null, "S");
+
+	assert(ch.pushToSession("S", "notifications/message", Json.emptyObject) == 1);
+	assert(ch.notify("notifications/message") == 1);
+	assert(stale.length == 0, "the older stream must not swallow the session's messages");
+	assert(fresh.length == 2);
+}
+
 unittest  // an unknown / empty Last-Event-ID falls back to a fresh stream ordinal
 {
 	// basic/transports §Resumability and Redelivery: replay is a MAY keyed on a
@@ -1682,14 +1702,14 @@ unittest  // notify reaches every connected session once, not only the oldest on
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 	string a, b;
-	int a2;
+	int aOld;
+	ch.addListener((string) @safe { aOld++; }, Json(""), ListenFilter.init, "", null, "sess-A");
 	ch.addListener((string f) @safe { a = f; }, Json(""), ListenFilter.init, "", null, "sess-A");
-	ch.addListener((string) @safe { a2++; }, Json(""), ListenFilter.init, "", null, "sess-A");
 	ch.addListener((string f) @safe { b = f; }, Json(""), ListenFilter.init, "", null, "sess-B");
 
 	assert(ch.notify("notifications/message") == 2);
 	assert(a.canFind("notifications/message"));
-	assert(a2 == 0, "within one session the message lands on a single stream");
+	assert(aOld == 0, "within one session the message lands on a single stream");
 	assert(b.canFind("notifications/message"));
 }
 
@@ -1896,9 +1916,9 @@ unittest  // emit self-heals: it skips a broken stream and delivers on a live on
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
 	int aCount;
-	// The first listener always throws (a disconnected client); the second is healthy.
-	ch.addListener((string) @safe { throw new Exception("closed"); });
+	// The newest listener always throws (a disconnected client); the older is healthy.
 	ch.addListener((string) @safe { aCount++; });
+	ch.addListener((string) @safe { throw new Exception("closed"); });
 	assert(ch.listenerCount == 2);
 
 	const delivered = ch.notify("notifications/message");
