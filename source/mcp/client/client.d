@@ -1819,8 +1819,10 @@ final class McpClient : ClientProtocol
 	/// none). Returns the final `CallToolResult` on `completed`; throws on
 	/// `failed`/`cancelled`, and `RequestTimeoutException` once
 	/// `ClientSettings.taskTimeout` (when set) elapses. While the task is
-	/// `input_required`, `onInputRequired` is invoked with the raw `inputRequests`
-	/// map so the caller can answer via `respondTaskInput`; with no handler the task
+	/// `input_required`, `onInputRequired` is invoked with the `inputRequests`
+	/// entries it has not yet been given in that phase (each key is delivered once,
+	/// even while it stays pending across polls) so the caller can answer via
+	/// `respondTaskInput`; with no handler the task
 	/// can never progress, so this throws. Works from a bare `taskId` string, so a
 	/// client can resume a task persisted across a restart.
 	CallToolResult awaitTask(string taskId, void delegate(string taskId,
@@ -1829,6 +1831,11 @@ final class McpClient : ClientProtocol
 		import core.time : MonoTime;
 
 		const start = MonoTime.currTime;
+		// The inputRequests keys already handed to `onInputRequired` during the
+		// current input_required phase, so a request still pending on the next poll
+		// is not answered twice.
+		bool[string] handledInputs;
+		bool inInputPhase;
 		for (;;)
 		{
 			auto state = getTaskState(taskId);
@@ -1848,10 +1855,14 @@ final class McpClient : ClientProtocol
 					throw new McpException(ErrorCode.internalError,
 							"Task " ~ taskId
 							~ " requires input but no onInputRequired handler was given");
-				onInputRequired(taskId, ("inputRequests" in state)
-						? state["inputRequests"] : Json.emptyObject);
+				auto fresh = takeUnhandledInputRequests(state, handledInputs);
+				if (fresh.length || !inInputPhase)
+					onInputRequired(taskId, fresh);
+				inInputPhase = true;
 				break;
 			case "working":
+				handledInputs = null;
+				inInputPhase = false;
 				break;
 			default:
 				throw new McpException(ErrorCode.internalError,
@@ -1866,6 +1877,26 @@ final class McpClient : ClientProtocol
 				interval = state["pollIntervalMs"].get!long.msecs;
 			taskPollSleep(interval);
 		}
+	}
+
+	/// The entries of a task state's `inputRequests` whose keys are not yet in
+	/// `handled`, recording each returned key as handled. A missing or non-object
+	/// `inputRequests` yields an empty object.
+	private static Json takeUnhandledInputRequests(Json state, ref bool[string] handled) @safe
+	{
+		Json fresh = Json.emptyObject;
+		if ("inputRequests" !in state || state["inputRequests"].type != Json.Type.object)
+			return fresh;
+		foreach (key, value; ()@trusted {
+				return state["inputRequests"].get!(Json[string]);
+			}())
+		{
+			if (key in handled)
+				continue;
+			handled[key] = true;
+			fresh[key] = value;
+		}
+		return fresh;
 	}
 
 	/// Call a tool and transparently drive the task flow: if the server answers
@@ -4111,6 +4142,76 @@ unittest  // awaitTask surfaces input_required to the callback and continues to 
 	});
 	assert(sawInput && polls == 2);
 	assert(result.content.length == 0);
+}
+
+unittest  // awaitTask hands each inputRequests key to onInputRequired only once
+{
+	auto c = McpClient.http("http://localhost");
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	int polls;
+	string[][] seen;
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		if (polls <= 2)
+			return Json([
+			"taskId": Json("t1"),
+			"status": Json("input_required"),
+			"inputRequests": Json([
+				"k1": Json(["method": Json("elicitation/create")])
+			])
+		]);
+		if (polls == 3)
+			return Json([
+			"taskId": Json("t1"),
+			"status": Json("input_required"),
+			"inputRequests": Json([
+				"k1": Json(["method": Json("elicitation/create")]),
+				"k2": Json(["method": Json("sampling/createMessage")])
+			])
+		]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json(["content": Json.emptyArray])
+		]);
+	};
+	c.awaitTask("t1", (string id, Json reqs) @safe {
+		import std.algorithm : sort;
+
+		auto keys = () @trusted { return reqs.get!(Json[string]).keys; }();
+		sort(keys);
+		seen ~= keys;
+	});
+	assert(seen == [["k1"], ["k2"]],
+			"a pending input request must not be re-delivered on every poll");
+}
+
+unittest  // awaitTask re-delivers an input request key after the task leaves input_required
+{
+	auto c = McpClient.http("http://localhost");
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	int polls;
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		if (polls == 1 || polls == 3)
+			return Json([
+			"taskId": Json("t1"),
+			"status": Json("input_required"),
+			"inputRequests": Json([
+				"k1": Json(["method": Json("elicitation/create")])
+			])
+		]);
+		if (polls == 2)
+			return Json(["taskId": Json("t1"), "status": Json("working")]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json(["content": Json.emptyArray])
+		]);
+	};
+	c.awaitTask("t1", (string id, Json reqs) @safe { calls++; });
+	assert(calls == 2);
 }
 
 unittest  // awaitTask throws on a failed task carrying a JSON-RPC error
