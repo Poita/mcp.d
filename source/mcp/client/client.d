@@ -500,9 +500,6 @@ final class McpClient : ClientProtocol
 	// "do not cache unhinted responses" (the default), so behavior against such
 	// servers matches the uncached client. A server hint always wins over this.
 	private Duration defaultCacheTtl_;
-	/// Raised by `mrtrLoop` when the result it just produced came from an MRTR
-	/// retry or is itself input-required, so `cachedFetch` skips storing it.
-	private bool lastResultUncacheable_;
 	// This client's cache partition: the namespace under which its `private`-scoped
 	// cacheable results are stored, so a SHARED `cacheStore_` keeps one principal's
 	// private entries from being served to another. `public` results ignore it and
@@ -1367,8 +1364,20 @@ final class McpClient : ClientProtocol
 	private R cachedFetch(R)(CacheKey logical, CacheMode mode,
 			scope R delegate() @safe fetch, bool retainForSchema = false) @safe
 	{
+		return cachedFetch!R(logical, mode, (out bool uncacheable) @safe => fetch(),
+				retainForSchema);
+	}
+
+	/// `cachedFetch` over a `fetch` that reports, through `uncacheable`, a result
+	/// that must never be stored (an MRTR interim or retried result; see
+	/// `mrtrLoop`). The flag travels with the call rather than through client
+	/// state, so concurrent requests on other tasks cannot affect it.
+	private R cachedFetch(R)(CacheKey logical, CacheMode mode,
+			scope R delegate(out bool uncacheable) @safe fetch, bool retainForSchema = false) @safe
+	{
+		bool uncacheable;
 		if (cacheStore_ is null || mode == CacheMode.bypass)
-			return fetch();
+			return fetch(uncacheable);
 		const sharedKey = scopedKey(logical, CacheScope.public_); // partition ""
 		const ownKey = CacheKey(logical.method, logical.key, cachePartition_, cacheServer_);
 		if (mode == CacheMode.use)
@@ -1378,14 +1387,9 @@ final class McpClient : ClientProtocol
 			if (!hit.isNull)
 				return R.fromJson(hit.get.value);
 		}
-		lastResultUncacheable_ = false;
-		R result = fetch();
-		if (lastResultUncacheable_)
-		{
-			// Set by `mrtrLoop` for an interim or retried result (see there).
-			lastResultUncacheable_ = false;
+		R result = fetch(uncacheable);
+		if (uncacheable)
 			return result;
-		}
 		const ttl = result.cache.isNull ? defaultCacheTtl_ : result.cache.get.ttl;
 		if (ttl > Duration.zero)
 		{
@@ -1512,9 +1516,10 @@ final class McpClient : ClientProtocol
 	/// keeps asking for input cannot loop forever. If a handler for a requested
 	/// input type is missing, or the loop bound is exceeded, the (still
 	/// `inputRequired`) result is returned so the caller can inspect it via
-	/// `R.isInputRequired`.
-	private R mrtrLoop(R)(string method, string logLevel,
-			scope Json delegate(InputResponse[] responses, string requestState) @safe buildParams) @safe
+	/// `R.isInputRequired`. `uncacheable` is set when the returned result came from
+	/// a retry or is itself input-required, so a caching caller must not store it.
+	private R mrtrLoop(R)(string method, string logLevel, scope Json delegate(InputResponse[] responses,
+			string requestState) @safe buildParams, out bool uncacheable) @safe
 	{
 		enum maxRounds = 16;
 		InputResponse[] responses;
@@ -1537,7 +1542,7 @@ final class McpClient : ClientProtocol
 			// inputResponses/requestState MUST NOT be cached, because it depends on
 			// inputs outside the cache key. Only a first-round completed result may
 			// be stored by a caching caller.
-			lastResultUncacheable_ = round > 0 || result.isInputRequired;
+			uncacheable = round > 0 || result.isInputRequired;
 			if (!result.isInputRequired)
 				return result;
 			// Gather an answer for each requested input. If any cannot be
@@ -1565,9 +1570,10 @@ final class McpClient : ClientProtocol
 	private CallToolResult callToolLoop(string name, Json arguments,
 			ProgressToken progressToken, string logLevel = "") @safe
 	{
+		bool uncacheable;
 		return mrtrLoop!CallToolResult("tools/call", logLevel, (responses,
 				requestState) => buildToolCallParams(name,
-				arguments, progressToken, responses, requestState));
+				arguments, progressToken, responses, requestState), uncacheable);
 	}
 
 	/// Mint a process-unique string `ProgressToken` for a per-call progress sink.
@@ -2047,10 +2053,13 @@ final class McpClient : ClientProtocol
 	ReadResourceResult readResource(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
 		return cachedFetch!ReadResourceResult(CacheKey("resources/read", uri),
-				opts.cacheMode, () @safe {
+				opts.cacheMode, (out bool uncacheable) @safe {
 			auto token = effectiveToken(opts);
-			return withPerCallProgress!ReadResourceResult(opts,
-				() @safe => readResourceLoop(uri, token, opts.logLevel));
+			bool fromMrtr;
+			auto result = withPerCallProgress!ReadResourceResult(opts,
+				() @safe => readResourceLoop(uri, token, fromMrtr, opts.logLevel));
+			uncacheable = fromMrtr;
+			return result;
 		});
 	}
 
@@ -2058,11 +2067,11 @@ final class McpClient : ClientProtocol
 	/// answer a read with an `InputRequiredResult`, which the loop satisfies and
 	/// retries like a tool call.
 	private ReadResourceResult readResourceLoop(string uri,
-			ProgressToken progressToken, string logLevel = "") @safe
+			ProgressToken progressToken, out bool uncacheable, string logLevel = "") @safe
 	{
 		return mrtrLoop!ReadResourceResult("resources/read", logLevel, (responses,
-				requestState) => buildReadResourceParams(uri, progressToken,
-				responses, requestState));
+				requestState) => buildReadResourceParams(uri,
+				progressToken, responses, requestState), uncacheable);
 	}
 
 	/// Build the `resources/read` params, optionally attaching a progress token.
@@ -2177,9 +2186,10 @@ final class McpClient : ClientProtocol
 	private GetPromptResult getPromptLoop(string name, Json arguments,
 			ProgressToken progressToken, string logLevel = "") @safe
 	{
+		bool uncacheable;
 		return mrtrLoop!GetPromptResult("prompts/get", logLevel, (responses,
 				requestState) => buildGetPromptParams(name,
-				arguments, progressToken, responses, requestState));
+				arguments, progressToken, responses, requestState), uncacheable);
 	}
 
 	/// Build the `prompts/get` params, optionally attaching a progress token.
@@ -6668,6 +6678,25 @@ unittest  // a direct resources/read result with a ttl is cached (control for th
 	c.readResource("file://r");
 	c.readResource("file://r");
 	assert(calls == 1);
+}
+
+unittest  // an MRTR call on another task does not stop a concurrent cacheable fetch from being cached
+{
+	// The nested callTool stands in for a request on another fiber that
+	// completes while this fetch is awaiting its reply.
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	int lists;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tools/call")
+			return inputRequiredRead();
+		lists++;
+		c.callTool("t", Json.emptyObject);
+		return Json(["tools": Json.emptyArray, "ttlMs": Json(60_000)]);
+	};
+	c.listTools();
+	c.listTools();
+	assert(lists == 1, "a concurrent MRTR call must not mark this fetch's result uncacheable");
 }
 
 unittest  // an unresolvable input-required read is returned as such and not cached
