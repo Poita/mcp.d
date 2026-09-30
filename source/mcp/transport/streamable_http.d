@@ -1327,6 +1327,14 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	scope (exit)
 		push.removeListener(listenerId);
 
+	// vibe.d sends the response headers with the first body write; an SSE comment
+	// flushes them now so the client sees the stream open without waiting for the
+	// first message or heartbeat.
+	try
+		writeFrame(": open\n\n");
+	catch (Exception)
+		return;
+
 	// 2025-11-25 basic/transports §Listening for Messages item 4 / §Sending
 	// Messages item 6: if the server closes the connection without terminating
 	// the stream, it SHOULD send a standard SSE `retry:` field first so the
@@ -3849,6 +3857,69 @@ unittest  // a successful stateful initialize commits the Mcp-Session-Id header
 	// The session id is committed only on a successful InitializeResult.
 	assert(SessionHeader in res.headers, "a successful initialize MUST carry Mcp-Session-Id");
 	assert(res.headers[SessionHeader].length > 0);
+}
+
+unittest  // the standalone GET stream writes its first bytes as soon as it opens
+{
+	import core.time : msecs;
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto initRes = createTestHTTPServerResponse(createMemoryOutputStream(),
+			null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(initializeBody(),
+			["Accept": "application/json, text/event-stream"]), initRes);
+	const sid = initRes.headers[SessionHeader];
+
+	auto getReq(HTTPMethod method) @safe
+	{
+		auto req = makeInitPostReq("", [
+			"Accept": "text/event-stream",
+			"MCP-Protocol-Version": "2025-11-25",
+			SessionHeader: sid
+		]);
+		req.method = method;
+		return req;
+	}
+
+	auto sink = createMemoryOutputStream();
+	bool ended;
+	runTask(() @safe nothrow{
+		try
+			router.handleRequest(getReq(HTTPMethod.GET),
+				createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly));
+		catch (Exception)
+		{
+		}
+		ended = true;
+	});
+	string early;
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(500.msecs);
+			early = () @trusted { return cast(string) sink.data.idup; }();
+			router.handleRequest(getReq(HTTPMethod.DELETE),
+				createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly));
+			sleep(200.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(early.canFind(": open\n\n"), "the GET stream must flush a first frame at once: " ~ early);
+	assert(ended, "DELETE must end the GET stream");
 }
 
 unittest  // the version gate rejects a version the server does not serve
