@@ -294,11 +294,11 @@ interface RequestContext
 		if (!clientSupports(ClientCapability.elicitationUrl))
 			throw invalidRequest("Client does not support url-mode elicitation");
 		if (url.length == 0)
-			throw invalidParams("URL-mode elicitation requires a non-empty url");
+			throw internalError("URL-mode elicitation requires a non-empty url");
 		if (!isValidElicitationUrl(url))
-			throw invalidParams("URL-mode elicitation requires a valid url (absolute URI): " ~ url);
+			throw internalError("URL-mode elicitation requires a valid url (absolute URI): " ~ url);
 		if (elicitationId.length == 0)
-			throw invalidParams("URL-mode elicitation requires a non-empty elicitationId");
+			throw internalError("URL-mode elicitation requires a non-empty elicitationId");
 		Json params = Json.emptyObject;
 		params["mode"] = "url";
 		params["message"] = message;
@@ -435,7 +435,7 @@ abstract class BaseRequestContext : RequestContext
 	/// message while inheriting the three throwing primitives.
 	protected Json noChannel() @safe
 	{
-		throw invalidRequest("This transport has no server-to-client channel");
+		throw internalError("This transport has no server-to-client channel");
 	}
 
 	bool clientSupports(ClientCapability) @safe
@@ -592,9 +592,9 @@ final class StdioContext : RequestContext
 		// `McpServer.stateful()`; on the modern stateless protocol, return
 		// `ToolResponse.inputRequired` (MRTR) instead.
 		if (serverStateless_)
-			throw invalidRequest("server-initiated requests (elicitation/sampling/roots) require a stateful server; construct with McpServer.stateful()");
+			throw internalError("server-initiated requests (elicitation/sampling/roots) require a stateful server; construct with McpServer.stateful()");
 		if (serverRequestFn is null)
-			throw invalidRequest("The stdio transport has no server-to-client request channel");
+			throw internalError("The stdio transport has no server-to-client request channel");
 		return serverRequestFn(method, params);
 	}
 
@@ -904,40 +904,28 @@ unittest  // form-mode elicit() does not set a mode field
 	assert(probe.lastParams["message"].get!string == "Pick one");
 }
 
-unittest  // elicitUrl() rejects an empty url
+unittest  // elicitUrl() rejects an empty url with an internalError (server fault)
 {
-	import std.exception : assertThrown;
-	import mcp.protocol.errors : McpException;
-
 	auto probe = new ElicitProbe;
-	assertThrown!McpException(probe.elicitUrl("msg", "", "elic-1"));
+	assertInternalError(probe.elicitUrl("msg", "", "elic-1"));
 }
 
-unittest  // elicitUrl() rejects an empty elicitationId
+unittest  // elicitUrl() rejects an empty elicitationId with an internalError (server fault)
 {
-	import std.exception : assertThrown;
-	import mcp.protocol.errors : McpException;
-
 	auto probe = new ElicitProbe;
-	assertThrown!McpException(probe.elicitUrl("msg", "https://example.com", ""));
+	assertInternalError(probe.elicitUrl("msg", "https://example.com", ""));
 }
 
-unittest  // elicitUrl() rejects a malformed (non-URI) url
+unittest  // elicitUrl() rejects a malformed (non-URI) url with an internalError (server fault)
 {
-	import std.exception : assertThrown;
-	import mcp.protocol.errors : McpException;
-
 	auto probe = new ElicitProbe;
-	assertThrown!McpException(probe.elicitUrl("msg", "not a url", "elic-1"));
+	assertInternalError(probe.elicitUrl("msg", "not a url", "elic-1"));
 }
 
-unittest  // elicitUrl() rejects a relative url without a scheme/authority
+unittest  // elicitUrl() rejects a relative url without a scheme/authority with an internalError (server fault)
 {
-	import std.exception : assertThrown;
-	import mcp.protocol.errors : McpException;
-
 	auto probe = new ElicitProbe;
-	assertThrown!McpException(probe.elicitUrl("msg", "example.com/path", "elic-1"));
+	assertInternalError(probe.elicitUrl("msg", "example.com/path", "elic-1"));
 }
 
 unittest  // elicitUrl() throws when the client does not support elicitation
@@ -1185,18 +1173,15 @@ unittest  // NullContext reports never-cancelled (no out-of-band channel)
 
 unittest  // a stateless server's StdioContext refuses server->client requests on every transport
 {
-	import mcp.protocol.errors : McpException;
-	import std.exception : assertThrown;
-
 	// serverStateless = true mirrors McpServer.stateless(): even though the stdio
 	// channel is physically bidirectional, a stateless server has no per-peer
 	// connection to carry the round-trip, so elicit/sample/roots are refused —
 	// matching the HTTP transport rather than special-casing stdio.
 	auto ctx = new StdioContext((string) @safe {}, (string m, Json p) @safe => Json.emptyObject,
 			ClientCapabilities.init, Json.undefined, latestLegacy, true);
-	assertThrown!McpException(ctx.sampleRaw(Json.emptyObject));
-	assertThrown!McpException(ctx.elicitRaw(Json.emptyObject));
-	assertThrown!McpException(ctx.listRootsRaw());
+	assertInternalError(ctx.sampleRaw(Json.emptyObject));
+	assertInternalError(ctx.elicitRaw(Json.emptyObject));
+	assertInternalError(ctx.listRootsRaw());
 }
 
 unittest  // a stateful StdioContext issues server->client requests through the channel
@@ -1307,19 +1292,38 @@ unittest  // StdioContext.reportProgress is a no-op without a progress token
 	assert(frames.length == 0);
 }
 
-unittest  // StdioContext has no server->client request channel
+unittest  // StdioContext without a request channel refuses server->client requests with an internalError
 {
-	import mcp.protocol.errors : McpException;
-
 	auto ctx = new StdioContext((string) @safe {});
 	assert(!ctx.clientSupports(ClientCapability.sampling));
 	assert(!ctx.isCancelled);
+	assertInternalError(ctx.sampleRaw(Json.emptyObject));
+}
+
+unittest  // a context with no server->client channel refuses requests with an internalError
+{
+	auto ctx = new NullContext;
+	assertInternalError(ctx.sampleRaw(Json.emptyObject));
+	assertInternalError(ctx.elicitRaw(Json.emptyObject));
+	assertInternalError(ctx.listRootsRaw());
+}
+
+/// Assert that evaluating `expr` throws an `McpException` carrying
+/// `internalError`: a handler's misuse of the context is a server fault, not a
+/// client error.
+version (unittest) private void assertInternalError(T)(lazy T expr) @safe
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+
 	bool threw;
 	try
-		ctx.sampleRaw(Json.emptyObject);
-	catch (McpException)
+		cast(void) expr;
+	catch (McpException e)
+	{
 		threw = true;
-	assert(threw);
+		assert(e.code == ErrorCode.internalError, e.msg);
+	}
+	assert(threw, "expected an internalError McpException");
 }
 
 version (unittest) private Nullable!double nullableProgress(double v) @safe
