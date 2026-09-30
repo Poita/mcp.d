@@ -253,7 +253,7 @@ subscription, and the periodic worker `enableEvents` starts (every
 `EventsOptions.workerInterval`) leases/delivers/acks — the same pass also expires
 poll leases, sweeps lapsed webhook subscriptions, and runs poll-driven webhook
 delivery for fetch-handler types. The in-memory default is single-node; injecting
-a shared, durable queue (Redis/SQS/DB) plus a `SubscriptionStore` makes webhook
+a shared, durable queue (Redis/SQS/DB) plus a `WebhookSubscriptionStore` makes webhook
 delivery node-agnostic (any node's worker delivers; a crashed node's leased job
 is re-leased) — mirroring the `TaskStore`/`TaskDispatcher` split.
 
@@ -691,11 +691,11 @@ incidents.publish(Incident("INC-1", "P1"));   // fans out to streams/poll + the 
 
 `publish(P)` is the single push verb; its reach is the scope of the injected
 registries (stream/poll are always node-local; webhook is as wide as the
-`SubscriptionStore`). The handle also carries typed `onSubscribe`/`onUnsubscribe`
+`WebhookSubscriptionStore`). The handle also carries typed `onSubscribe`/`onUnsubscribe`
 lifecycle hooks (start an author-owned live source task in `onSubscribe` that
 `publish`es, and stop it in `onUnsubscribe`) and `pollInterval`. The hooks fire **exactly once per `(principal, name,
 arguments)` per node**: the lifecycle refcount is node-local, so on a multi-node
-deployment (where webhook subscriptions are shared via the `SubscriptionStore`) the
+deployment (where webhook subscriptions are shared via the `WebhookSubscriptionStore`) the
 hooks fire once per node that first/last sees the key, not once cluster-wide — write
 them to be idempotent across nodes. A cluster-coherent shared-store atomic refcount
 is future work.
