@@ -118,7 +118,7 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 					else static if (is(typeof(attr) == resource))
 						registerResourceMethod!(memberName, overload, parent)(server, attr);
 					else static if (is(typeof(attr) == resourceTemplate))
-						registerTemplateMethod!(memberName, overload, parent)(server, attr);
+						registerTemplateMethod!(memberName, overload, parent, attr)(server);
 					else static if (is(typeof(attr) == skill))
 						registerSkillMethod!(memberName, overload, parent)(server, attr);
 					else static if (is(typeof(attr) == skillDir))
@@ -886,9 +886,45 @@ private void registerResourceMethod(string memberName, alias overload, alias par
 	}, collectCache!overload());
 }
 
-private void registerTemplateMethod(string memberName, alias overload, alias parent)(
-		McpServer server, resourceTemplate attr) @safe
+/// The variable names of an RFC 6570 URI template, in order, with expression
+/// operators (`+#./;?&`) and value modifiers (`*`, `:N`) removed.
+private string[] uriTemplateVars(string tmpl) @safe pure
 {
+	import std.algorithm.iteration : splitter;
+	import std.string : indexOf;
+
+	string[] vars;
+	while (true)
+	{
+		immutable open = tmpl.indexOf('{');
+		if (open < 0)
+			break;
+		immutable close = tmpl[open .. $].indexOf('}');
+		if (close < 0)
+			break;
+		auto expr = tmpl[open + 1 .. open + close];
+		tmpl = tmpl[open + close + 1 .. $];
+		if (expr.length && "+#./;?&".indexOf(expr[0]) >= 0)
+			expr = expr[1 .. $];
+		foreach (spec; expr.splitter(','))
+		{
+			immutable colon = spec.indexOf(':');
+			if (colon >= 0)
+				spec = spec[0 .. colon];
+			if (spec.length && spec[$ - 1] == '*')
+				spec = spec[0 .. $ - 1];
+			if (spec.length)
+				vars ~= spec;
+		}
+	}
+	return vars;
+}
+
+private void registerTemplateMethod(string memberName, alias overload,
+		alias parent, resourceTemplate attr)(McpServer server) @safe
+{
+	import std.algorithm.searching : canFind;
+
 	ResourceTemplate descriptor;
 	descriptor.uriTemplate = attr.uriTemplate;
 	descriptor.name = attr.name;
@@ -898,6 +934,20 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 		descriptor.description = nullable(attr.description);
 	if (attr.title.length)
 		descriptor.title = nullable(attr.title);
+
+	// Every bound parameter must name a template variable; any other name would
+	// silently receive an empty or default value on every read.
+	static foreach (i, P; Parameters!overload)
+	{
+		static if (!is(P : RequestContext))
+		{
+			static assert(canFind(uriTemplateVars(attr.uriTemplate),
+					ParameterIdentifierTuple!overload[i]),
+					"@resourceTemplate method '" ~ memberName ~ "' parameter '"
+					~ ParameterIdentifierTuple!overload[i]
+					~ "' does not appear in URI template \"" ~ attr.uriTemplate ~ "\"");
+		}
+	}
 
 	applyResourceMetadata!overload(descriptor);
 
@@ -1766,6 +1816,46 @@ version (unittest)
 			return "";
 		}
 	}
+}
+
+version (unittest) private class UnknownTemplateParamApi
+{
+	@resourceTemplate("item://{id}", "Item", "text/plain")
+	string item(string id, string idd) @safe
+	{
+		return id ~ idd;
+	}
+}
+
+version (unittest) private class OperatorTemplateApi
+{
+	@resourceTemplate("doc://{+path}/v{.ext}{/seg*}{?q,limit:3}{&extra}{#frag}",
+			"Doc", "text/plain")
+	string doc(string path, string ext, string seg, string q, int limit,
+			string extra, string frag, RequestContext ctx) @safe
+	{
+		return path;
+	}
+}
+
+unittest  // uriTemplateVars extracts variable names, stripping operators and modifiers
+{
+	static assert(uriTemplateVars("a://{x}/{+y}{?p,q*}{&r:4}") == [
+		"x", "y", "p", "q", "r"
+	]);
+	static assert(uriTemplateVars("plain://no/vars").length == 0);
+}
+
+unittest  // a @resourceTemplate parameter not named in the URI template is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new UnknownTemplateParamApi)));
+}
+
+unittest  // @resourceTemplate parameters may bind any operator-prefixed or modified template variable
+{
+	auto s = new McpServer("t", "1");
+	assert(__traits(compiles, registerHandlers(s, new OperatorTemplateApi)));
 }
 
 unittest  // a bare @tool (without its argument list) is rejected at compile time
