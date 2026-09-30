@@ -3712,3 +3712,30 @@ unittest  // close() tolerates a server that answers the session DELETE with 405
 	assert(failure.length == 0, "close() must not throw on 405: " ~ failure);
 	assert(sawDelete);
 }
+
+unittest  // a throwing onNotification callback does not fail the request whose stream carried the notification
+{
+	import mcp.client.client : McpClient;
+
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		writeSse(res, `data: {"jsonrpc":"2.0","method":"notifications/message",`
+			~ `"params":{"level":"info","data":"hi"}}` ~ "\n\n" ~ toolsListFrame(
+			req["id"].get!long));
+	});
+	bool notified;
+	size_t tools = size_t.max;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		client.onNotification = (string method, Json params) @safe {
+			notified = true;
+			throw new Exception("callback failed");
+		};
+		tools = client.listTools().tools.length;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(notified);
+	assert(tools == 0);
+}

@@ -3623,12 +3623,31 @@ final class McpClient : ClientProtocol
 			handleServerRequest(msg);
 			break;
 		case MessageKind.notification:
-			dispatchNotification(msg.method, msg.params);
+			// A notification shares its stream with unrelated responses, so a
+			// throwing application callback is logged rather than propagated into
+			// the transport's read loop, where it would fail the request in flight.
+			try
+				dispatchNotification(msg.method, msg.params);
+			catch (Exception e)
+				logNotificationHandlerError(msg.method, e);
 			break;
 		case MessageKind.response:
 		case MessageKind.errorResponse:
 			break; // not expected on the listening stream
 		}
+	}
+
+	private static void logNotificationHandlerError(string method, Exception e) @safe nothrow
+	{
+		import std.stdio : stderr;
+
+		() @trusted nothrow{
+			try
+				stderr.writeln("[mcp.client] notification handler for ", method, ": ", e.msg);
+			catch (Exception)
+			{
+			}
+		}();
 	}
 
 	/// Open the standalone server->client stream (HTTP GET SSE), so the server
