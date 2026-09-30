@@ -1045,8 +1045,9 @@ final class McpServer : ServerCore
 	/// interval, and TTL sweep cadence. `dispatcher` decides where a `@task`
 	/// executor runs (default: an in-process fiber; supply a queue-backed
 	/// dispatcher for a durable, multi-node deployment). The runtime emits
-	/// `notifications/tasks` on status changes via the server's notify path.
-	/// Returns the `TaskRuntime` so tools can create and resolve tasks.
+	/// `notifications/tasks` on status changes to the task owner's streams (for
+	/// a task created without an authenticated principal, only over stdio; HTTP
+	/// clients poll `tasks/get`). Returns the `TaskRuntime` so tools can create and resolve tasks.
 	TaskRuntime enableTasks(TaskStore store = null,
 			TaskOptions opts = TaskOptions.init, TaskDispatcher dispatcher = null) @safe
 	{
@@ -1370,8 +1371,10 @@ final class McpServer : ServerCore
 	}
 
 	/// `notify`, restricted to the streams opened by `principal` (the
-	/// authenticated token subject, "" for unauthenticated streams), for
-	/// notifications whose payload belongs to one principal.
+	/// authenticated token subject), for notifications whose payload belongs to
+	/// one principal. With no principal only the stdio listen stream is reached:
+	/// anonymous HTTP streams cannot be told apart, and an ownerless task's id is
+	/// the only key to its result, so it must not reach other clients.
 	private size_t notifyPrincipal(string principal, string method, Json params) @safe
 	{
 		size_t delivered;
@@ -1382,7 +1385,7 @@ final class McpServer : ServerCore
 			stdioListenSink(note.toString());
 			delivered++;
 		}
-		if (pushChannel !is null)
+		if (pushChannel !is null && principal.length)
 			delivered += pushChannel.notifyPrincipal(principal, method, params);
 		return delivered;
 	}
@@ -9294,6 +9297,47 @@ unittest  // notifications/tasks reaches only the task owner's streams
 	assert(alice.canFind("notifications/tasks"));
 	assert(alice.canFind("s3cr3t"));
 	assert(bob.length == 0, "a task's result must not reach another principal's stream");
+}
+
+unittest  // notifications/tasks for an ownerless task reaches no anonymous HTTP stream
+{
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks();
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	string anon;
+	ListenFilter f;
+	f.active = true;
+	ch.addListener((string fr) @safe { anon = fr; }, Json("l-x"), f, "", null, "", "");
+
+	auto t = rt.createFor("", Json.undefined);
+	rt.complete(t.taskId, Json(["secret": Json("s3cr3t")]));
+	assert(anon.length == 0, "an ownerless task's id must not reach other anonymous clients");
+}
+
+unittest  // notifications/tasks for an ownerless task reaches the stdio listen stream
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks();
+	string[] frames;
+	void sink(string f) @safe
+	{
+		frames ~= f;
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+			"subscriptions/listen", params)), &sink));
+
+	auto t = rt.createFor("", Json.undefined);
+	rt.complete(t.taskId, Json(["v": Json("done")]));
+	assert(frames.canFind!(fr => fr.canFind("notifications/tasks") && fr.canFind("done")));
 }
 
 unittest  // tools listChanged is not advertised by default
