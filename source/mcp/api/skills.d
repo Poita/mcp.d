@@ -193,18 +193,46 @@ private string yamlQuote(string s) @safe pure
 {
 	import std.array : Appender;
 
+	import std.format : formattedWrite;
+
 	Appender!string a;
 	a ~= '"';
-	foreach (c; s)
+	foreach (dchar c; s)
 	{
-		if (c == '\\' || c == '"')
-			a ~= '\\';
-		if (c == '\n')
+		switch (c)
 		{
-			a ~= "\\n";
-			continue;
+		case '\\':
+			a ~= `\\`;
+			break;
+		case '"':
+			a ~= `\"`;
+			break;
+		case '\n':
+			a ~= `\n`;
+			break;
+		case '\r':
+			a ~= `\r`;
+			break;
+		case '\t':
+			a ~= `\t`;
+			break;
+			// YAML treats NEL, LS and PS as line breaks and rejects them raw in a
+			// flow scalar, so they use YAML's dedicated escapes.
+		case '\u0085':
+			a ~= `\N`;
+			break;
+		case '\u2028':
+			a ~= `\L`;
+			break;
+		case '\u2029':
+			a ~= `\P`;
+			break;
+		default:
+			if (c < 0x20 || c == 0x7F)
+				a.formattedWrite!`\x%02X`(cast(uint) c);
+			else
+				a ~= c;
 		}
-		a ~= c;
 	}
 	a ~= '"';
 	return a.data;
@@ -874,6 +902,27 @@ unittest  // skillMarkdown quotes/escapes a description with special characters
 	import std.algorithm : canFind;
 
 	assert(md.canFind(`description: "He said \"hi\""`));
+}
+
+unittest  // skillMarkdown round-trips control and line-separator characters through the frontmatter parser
+{
+	import mcp.api.skill_dir : parseSkillFrontmatter;
+
+	const desc = "a\rb\tc\x01d\x1Fe\x7Ff\u0085g\u2028h\u2029i\\j\"k\nl";
+	auto fm = parseSkillFrontmatter(skillMarkdown("x", desc, "body", [
+			"k\r": "v\x02"
+	]));
+	assert(fm["description"].get!string == desc);
+	assert(fm["metadata"]["k\r"].get!string == "v\x02");
+}
+
+unittest  // skillMarkdown frontmatter lines contain no raw control characters
+{
+	import std.algorithm : any;
+
+	auto md = skillMarkdown("x", "a\rb\x01c\x7F", "body");
+	auto front = md[0 .. md.length - "body".length];
+	assert(!front.any!(c => c != '\n' && (c < 0x20 || c == 0x7F)));
 }
 
 unittest  // skillMarkdown emits metadata in a deterministic sorted order
