@@ -1944,6 +1944,11 @@ final class McpServer : ServerCore
 
 	private Nullable!Json handleRequest(Message msg, RequestContext ctx) @safe
 	{
+		// Every MCP request's params is an object; JSON-RPC by-position (array)
+		// or scalar params are malformed.
+		if (msg.params.type != Json.Type.object)
+			return nullable(makeErrorResponse(msg.id, invalidParams("params must be an object")));
+
 		// Determine the version in effect for THIS request. Modern+ is stateless:
 		// each request carries its protocol version, client identity, and
 		// capabilities in `params._meta` rather than relying on `initialize`.
@@ -3904,6 +3909,22 @@ unittest  // a stateful session ignores a body _meta.protocolVersion naming an e
 	assert("error" !in resp, "body _meta.protocolVersion must not down-gate a stateful session");
 	assert(resp["result"]["tools"].type == Json.Type.array);
 	assert(s.negotiatedVersion == ProtocolVersion.v2025_11_25);
+}
+
+unittest  // a request whose params is an array is rejected with invalidParams
+{
+	auto s = McpServer.stateful("t", "1");
+	Tool t = {name: "noop"};
+	s.registerTool(t, (Json) @safe => CallToolResult());
+	auto resp = s.handle(req(1, "tools/call", Json.emptyArray)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // a request whose params is a scalar is rejected with invalidParams
+{
+	auto s = McpServer.stateful("t", "1");
+	auto resp = s.handle(req(1, "resources/read", Json("file:///x"))).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
 unittest  // initialize negotiates the requested version and reports server info
