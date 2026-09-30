@@ -183,6 +183,22 @@ private struct SseCursor
 	long retryMs;
 }
 
+/// Default bound on a single response body or SSE event (16 MiB).
+enum size_t defaultMaxMessageBytes = 16 * 1024 * 1024;
+
+// Bounds on the HTTP framing lines read ahead of a body: one status, header or
+// chunk-size line, and the whole header block.
+private enum size_t maxHeaderLineBytes = 8 * 1024;
+private enum size_t maxHeaderBlockBytes = 64 * 1024;
+
+/// The error raised when the server sends more than `limit` bytes in one message.
+private McpException messageTooLarge(size_t limit) @safe
+{
+	import std.conv : to;
+
+	return internalError("HTTP response exceeds the " ~ limit.to!string ~ "-byte message limit");
+}
+
 /// A `ClientTransport` over the MCP Streamable HTTP transport.
 ///
 /// Owns the HTTP/SSE machinery: the POST-and-await loop (with SSE resumability),
@@ -276,6 +292,10 @@ final class HttpClientTransport : ClientTransport
 	// cannot allocate a source port) fails with a typed error instead of parking
 	// the calling fiber forever. Configurable via `setConnectTimeout`.
 	private Duration connectTimeout = 30.seconds;
+	// Upper bound on any single response body or SSE event read from the server,
+	// so a hostile or broken server cannot make the client allocate without limit.
+	// Configurable via `setMaxMessageBytes`.
+	private size_t maxMessageBytes = defaultMaxMessageBytes;
 
 	/// Inbound dispatcher installed by `McpClient` (its `dispatchInbound`),
 	/// invoked for notifications and server->client requests on any stream.
@@ -358,6 +378,13 @@ final class HttpClientTransport : ClientTransport
 	void setConnectTimeout(Duration timeout) @safe
 	{
 		connectTimeout = timeout;
+	}
+
+	/// Bound every response body and SSE event read from the server to `limit`
+	/// bytes; a larger one fails the request it belongs to with an `McpException`.
+	void setMaxMessageBytes(size_t limit) @safe
+	{
+		maxMessageBytes = limit;
 	}
 
 	/// Stop the transport: signal the background stream readers
@@ -771,7 +798,7 @@ final class HttpClientTransport : ClientTransport
 				conn.write(cast(const(ubyte)[]) req);
 
 				// Status line + response headers.
-				auto statusLine = cast(string) readLine(conn).idup;
+				auto statusLine = cast(string) readLine(conn, maxHeaderLineBytes).idup;
 				status = parseHttpStatus(statusLine);
 				bool chunked;
 				bool sse;
@@ -794,7 +821,7 @@ final class HttpClientTransport : ClientTransport
 				// and surface a recognised modern JSON-RPC error if present.
 				if (isLegacyFallbackStatus(status))
 				{
-					const b = readRemaining(conn, chunked);
+					const b = readRemaining(conn, chunked, maxMessageBytes);
 					McpException modernErr;
 					if (modernErrorFromBody(b, modernErr))
 						err = modernErr;
@@ -805,7 +832,8 @@ final class HttpClientTransport : ClientTransport
 				// keep the HTTP status and challenge so the caller can act on them.
 				if (status < 200 || status >= 300)
 				{
-					err = httpStatusError(status, readRemaining(conn, chunked), wwwAuthenticate);
+					err = httpStatusError(status, readRemaining(conn, chunked,
+							maxMessageBytes), wwwAuthenticate);
 					return;
 				}
 
@@ -813,7 +841,7 @@ final class HttpClientTransport : ClientTransport
 				{
 					// A single JSON body (the common non-streaming response): it must be
 					// the response to this request.
-					const b = readRemaining(conn, chunked);
+					const b = readRemaining(conn, chunked, maxMessageBytes);
 					Message m;
 					try
 						m = parseMessage(b);
@@ -873,15 +901,23 @@ final class HttpClientTransport : ClientTransport
 	}
 
 	/// Read the response header block from `conn` (up to the blank line),
-	/// returning each header line with its trailing CR stripped.
+	/// returning each header line with its trailing CR stripped. Each line is
+	/// bounded by `maxHeaderLineBytes` and the block by `maxHeaderBlockBytes`.
 	private static string[] readHeaderLines(Conn)(Conn conn) @trusted
 	{
 		import vibe.stream.operations : readLine;
+		import std.conv : to;
 
 		string[] headers;
+		size_t total;
 		for (;;)
 		{
-			auto h = cast(string) readLine(conn).idup;
+			auto h = cast(string) readLine(conn, maxHeaderLineBytes).idup;
+			total += h.length;
+			if (total > maxHeaderBlockBytes)
+				throw internalError(
+						"HTTP response header block exceeds "
+						~ maxHeaderBlockBytes.to!string ~ " bytes");
 			if (h.length && h[$ - 1] == '\r')
 				h = h[0 .. $ - 1];
 			if (h.length == 0)
@@ -897,7 +933,8 @@ final class HttpClientTransport : ClientTransport
 	/// zero-size chunk, a malformed/unparseable size line, or end-of-stream. The
 	/// single chunk-framing primitive shared by `readRemaining` and `readSseBody`,
 	/// so size parsing and trailing-CRLF consumption live in exactly one place.
-	private static bool readChunk(Conn)(Conn conn, out string data) @trusted
+	/// A chunk declaring more than `maxBytes` fails before anything is allocated.
+	private static bool readChunk(Conn)(Conn conn, size_t maxBytes, out string data) @trusted
 	{
 		import vibe.stream.operations : readLine;
 		import vibe.core.stream : IOMode;
@@ -908,26 +945,28 @@ final class HttpClientTransport : ClientTransport
 		{
 			string sizeLine;
 			try
-				sizeLine = (cast(string) readLine(conn).idup).strip;
+				sizeLine = (cast(string) readLine(conn, maxHeaderLineBytes).idup).strip;
 			catch (Exception)
 				return false;
 			if (sizeLine.length == 0)
 				continue; // tolerate a stray blank line before the size
-			uint sz;
+			ulong sz;
 			try
 			{
 				auto sl = sizeLine;
-				sz = parse!uint(sl, 16);
+				sz = parse!ulong(sl, 16);
 			}
 			catch (Exception)
 				return false;
 			if (sz == 0)
 				return false; // last chunk
-			auto chunk = new ubyte[sz];
+			if (sz > maxBytes)
+				throw messageTooLarge(maxBytes);
+			auto chunk = new ubyte[cast(size_t) sz];
 			conn.read(chunk, IOMode.all);
 			data = cast(string) chunk.idup;
 			try
-				readLine(conn); // trailing CRLF after the chunk data
+				readLine(conn, maxHeaderLineBytes); // trailing CRLF after the chunk data
 			catch (Exception)
 			{
 			}
@@ -937,8 +976,9 @@ final class HttpClientTransport : ClientTransport
 
 	/// Read the remaining response body from `conn` to end-of-stream, decoding
 	/// chunked transfer-encoding when `chunked` is true. Used for the small
-	/// non-streaming JSON body and the 4xx legacy-fallback body.
-	private static string readRemaining(Conn)(Conn conn, bool chunked) @trusted
+	/// non-streaming JSON body and the 4xx legacy-fallback body. A body longer than
+	/// `maxBytes` fails with an `McpException`.
+	private static string readRemaining(Conn)(Conn conn, bool chunked, size_t maxBytes) @trusted
 	{
 		import vibe.core.stream : IOMode;
 
@@ -946,7 +986,7 @@ final class HttpClientTransport : ClientTransport
 		if (chunked)
 		{
 			string chunk;
-			while (readChunk(conn, chunk))
+			while (readChunk(conn, maxBytes - acc.length, chunk))
 				acc ~= chunk;
 		}
 		else
@@ -961,6 +1001,8 @@ final class HttpClientTransport : ClientTransport
 					break;
 				if (n == 0)
 					break;
+				if (n > maxBytes - acc.length)
+					throw messageTooLarge(maxBytes);
 				acc ~= cast(string) buf[0 .. n].idup;
 			}
 		}
@@ -1213,7 +1255,7 @@ final class HttpClientTransport : ClientTransport
 		import vibe.stream.operations : readLine;
 		import std.string : indexOf, toLower;
 
-		auto statusLine = cast(string) readLine(conn).idup;
+		auto statusLine = cast(string) readLine(conn, maxHeaderLineBytes).idup;
 		const ok = statusLine.indexOf(" 200") >= 0;
 		foreach (h; readHeaderLines(conn))
 		{
@@ -1253,7 +1295,12 @@ final class HttpClientTransport : ClientTransport
 			{
 				const nl = acc.indexOf('\n');
 				if (nl < 0)
+				{
+					// `acc` holds one incomplete line; it may not outgrow a message.
+					if (acc.length > maxMessageBytes)
+						throw messageTooLarge(maxMessageBytes);
 					break;
+				}
 				auto line = acc[0 .. nl];
 				acc = acc[nl + 1 .. $];
 				if (line.length && line[$ - 1] == '\r')
@@ -1277,6 +1324,8 @@ final class HttpClientTransport : ClientTransport
 					auto d = line["data:".length .. $];
 					if (d.startsWith(" "))
 						d = d[1 .. $];
+					if (data.length + d.length + 1 > maxMessageBytes)
+						throw messageTooLarge(maxMessageBytes);
 					data ~= (data.length ? "\n" : "") ~ d;
 				}
 				else if (line.startsWith("id:"))
@@ -1301,7 +1350,7 @@ final class HttpClientTransport : ClientTransport
 			if (chunked)
 			{
 				string chunk;
-				if (!readChunk(conn, chunk))
+				if (!readChunk(conn, maxMessageBytes, chunk))
 					break;
 				acc ~= chunk;
 				tokenize();
@@ -2670,7 +2719,7 @@ unittest  // readChunk decodes a multi-frame chunked body via readRemaining
 				body.dup, false);
 	}();
 	auto got = () @trusted {
-		return HttpClientTransport.readRemaining(stream, true);
+		return HttpClientTransport.readRemaining(stream, true, defaultMaxMessageBytes);
 	}();
 	assert(got == "hello world");
 }
@@ -2688,9 +2737,151 @@ unittest  // readChunk consumes the per-chunk trailing CRLF so framing stays ali
 				body.dup, false);
 	}();
 	auto got = () @trusted {
-		return HttpClientTransport.readRemaining(stream, true);
+		return HttpClientTransport.readRemaining(stream, true, defaultMaxMessageBytes);
 	}();
 	assert(got == "abcdef");
+}
+
+unittest  // readRemaining rejects a chunk whose declared size exceeds the message limit before allocating it
+{
+	import std.exception : collectException;
+	import vibe.stream.memory : createMemoryStream;
+
+	auto body = "7fffffff\r\nabc\r\n0\r\n\r\n";
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[])
+				body.dup, false);
+	}();
+	auto e = collectException(() @trusted {
+		return HttpClientTransport.readRemaining(stream, true, 1024);
+	}());
+	assert(cast(McpException) e !is null, "an oversized chunk must fail the read");
+}
+
+unittest  // readRemaining rejects a chunked body whose total exceeds the message limit
+{
+	import std.array : replicate;
+	import std.exception : collectException;
+	import vibe.stream.memory : createMemoryStream;
+
+	string body;
+	foreach (i; 0 .. 8)
+		body ~= "100\r\n" ~ "x".replicate(256) ~ "\r\n";
+	body ~= "0\r\n\r\n";
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[])
+				body.dup, false);
+	}();
+	auto e = collectException(() @trusted {
+		return HttpClientTransport.readRemaining(stream, true, 1024);
+	}());
+	assert(cast(McpException) e !is null, "a chunked body past the limit must fail the read");
+}
+
+unittest  // readRemaining rejects a raw body that exceeds the message limit
+{
+	import std.array : replicate;
+	import std.exception : collectException;
+	import vibe.stream.memory : createMemoryStream;
+
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[]) "x".replicate(4096).dup, false);
+	}();
+	auto e = collectException(() @trusted {
+		return HttpClientTransport.readRemaining(stream, false, 1024);
+	}());
+	assert(cast(McpException) e !is null, "a raw body past the limit must fail the read");
+}
+
+unittest  // readHeaderLines rejects a header line longer than the header line limit
+{
+	import std.array : replicate;
+	import std.exception : collectException;
+	import vibe.stream.memory : createMemoryStream;
+
+	auto head = "X-Big: " ~ "x".replicate(64 * 1024) ~ "\r\n\r\n";
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[]) head.dup, false);
+	}();
+	auto e = collectException(() @trusted {
+		return HttpClientTransport.readHeaderLines(stream);
+	}());
+	assert(e !is null, "an unbounded header line must fail the read");
+}
+
+unittest  // readSseBody rejects an SSE line that grows past the message limit without a newline
+{
+	import std.array : replicate;
+	import std.exception : collectException;
+	import vibe.stream.memory : createMemoryStream;
+
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	t.setMaxMessageBytes(1024);
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[])("data: " ~ "x".replicate(4096)).dup, false);
+	}();
+	SseCursor cursor;
+	auto e = collectException(() @trusted {
+		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+		});
+	}());
+	assert(cast(McpException) e !is null,
+			"an unterminated SSE line past the limit must fail the read");
+}
+
+unittest  // readSseBody rejects an SSE event whose joined data lines exceed the message limit
+{
+	import std.array : replicate;
+	import std.exception : collectException;
+	import vibe.stream.memory : createMemoryStream;
+
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	t.setMaxMessageBytes(1024);
+	string body;
+	foreach (i; 0 .. 16)
+		body ~= "data: " ~ "x".replicate(200) ~ "\n";
+	body ~= "\n";
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[])
+				body.dup, false);
+	}();
+	SseCursor cursor;
+	bool delivered;
+	auto e = collectException(() @trusted {
+		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+			delivered = true;
+		});
+	}());
+	assert(cast(McpException) e !is null, "an SSE event past the limit must fail the read");
+	assert(!delivered);
+}
+
+unittest  // a response body larger than ClientSettings.maxMessageBytes fails the request
+{
+	import std.array : replicate;
+	import mcp.client.client : McpClient, ClientSettings;
+
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		auto resp = parseJsonString(`{"jsonrpc":"2.0","result":{"tools":[]}}`);
+		resp["id"] = req["id"];
+		resp["result"]["padding"] = "x".replicate(8192);
+		res.writeBody(resp.toString(), "application/json");
+	});
+	Exception thrown;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		ClientSettings s;
+		s.maxMessageBytes = 4096;
+		auto client = McpClient.http(url, s);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		try
+			client.listTools();
+		catch (Exception e)
+			thrown = e;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(cast(McpException) thrown !is null, "an oversized response must fail the request");
 }
 
 unittest  // readSseBody decodes events delivered across chunked frames

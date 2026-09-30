@@ -18,7 +18,7 @@ import mcp.protocol.modern;
 import mcp.protocol.mrtr;
 import mcp.client.transport : ClientTransport, ClientProtocol;
 import mcp.client.http_transport : HttpClientTransport, HttpStatusException,
-	isLegacyFallbackStatus;
+	isLegacyFallbackStatus, defaultMaxMessageBytes;
 import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
 import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 import mcp.client.cache : CacheStore, InMemoryCacheStore, CacheKey, CacheEntry, noCache;
@@ -205,6 +205,11 @@ struct ClientSettings
 	/// cap above the round-trip nesting depth so an awaiting request POST and its
 	/// reply POST can both hold a permit.
 	uint maxInFlight = 0;
+
+	/// HTTP transport only: the largest response body or SSE event the client
+	/// accepts from the server. A larger one fails the request it belongs to, so a
+	/// hostile or broken server cannot make the client allocate without bound.
+	size_t maxMessageBytes = defaultMaxMessageBytes;
 
 	/// Response cache for the six cacheable reads (the four `*/list` verbs,
 	/// `resources/read`, and `server/discover`). `null` (the default) installs an
@@ -682,6 +687,7 @@ final class McpClient : ClientProtocol
 	{
 		auto transport = new HttpClientTransport(url, settings.maxInFlight);
 		transport.setConnectTimeout(settings.connectTimeout);
+		transport.setMaxMessageBytes(settings.maxMessageBytes);
 		auto c = new McpClient(transport, settings.clientInfo);
 		c.cacheServer_ = url;
 		return c.applySettings(settings);
