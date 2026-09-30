@@ -2275,12 +2275,19 @@ final class EventsRuntime
 
 	/// Terminate a subscription (e.g. authorization revoked): POST a signed
 	/// `terminated` control envelope to the callback, then drop the subscription.
+	/// A callback that never verified has not consented to receive POSTs, so it
+	/// is dropped without one.
 	void terminateWebhook(string subId, Json error) @safe
 	{
 		auto sn = webhookStore_.get(subId);
 		if (sn.isNull)
 			return;
 		auto sub = sn.get;
+		if (!sub.verified && (sub.principal ~ "\0" ~ sub.url) !in verifiedEndpoints_)
+		{
+			removeWebhookState(sub);
+			return;
+		}
 		const 
 		body = terminatedEnvelope(error).toString();
 		const now = opts_.nowMs();
@@ -3321,12 +3328,24 @@ unittest  // terminateEventType ends push streams and webhook subscriptions for 
 		methods ~= m;
 	});
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.markVerified(r.id);
 	rt.terminateEventType("n", toErrorJson(notFound("removed", "event")));
 	assert(methods == [eventsTerminatedNotification]);
 	assert(rt.webhookStore().get(r.id).isNull);
 	auto terms = controlPostsOf(ft, "terminated");
 	assert(terms.length == 1);
 	assert(parseJsonString(terms[0].body)["error"]["data"]["kind"].get!string == "event");
+}
+
+unittest  // terminating a never-verified webhook drops it without POSTing to its callback
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	assert(!rt.webhookStore().get(r.id).get.verified);
+	rt.terminateEventType("n", toErrorJson(notFound("removed", "event")));
+	assert(rt.webhookStore().get(r.id).isNull);
+	assert(ft.posts.length == 0);
 }
 
 unittest  // terminatePrincipal ends only that principal's subscriptions
@@ -3654,6 +3673,7 @@ unittest  // unregister ends every subscription with NotFound{kind:event} and no
 		params ~= p;
 	});
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.markVerified(r.id);
 	assert(rt.unregister("n"));
 	assert(methods == [eventsTerminatedNotification]);
 	assert(params[0]["error"]["code"].get!int == -32011);
