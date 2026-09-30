@@ -2168,6 +2168,15 @@ string resolveEndpointUri(string baseUrl, string endpoint) @safe
 	return origin ~ dir ~ endpoint;
 }
 
+unittest  // httpStatusError keeps the code and message of a null-id JSON-RPC error body
+{
+	auto e = httpStatusError(400,
+			`{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Bad session"}}`, null);
+	assert(e.status == 400);
+	assert(e.code == -32_600);
+	assert(e.msg == "Bad session");
+}
+
 unittest  // parseHttpEndpoint defaults the port per scheme (443 for TLS)
 {
 	// https/wss default to 443; http and a bare host to 80. An explicit port wins.

@@ -96,14 +96,18 @@ private void validateEnvelope(Json j) @safe
 			throw invalidRequest("JSON-RPC id MUST NOT have a fractional part");
 	}
 	// Every JSON-RPC 2.0 message is exactly one of: request (has method + non-null id),
-	// notification (has method, no id), or response (no method, has non-null id).
-	// A message with neither method nor a non-null id fits no category and must be
-	// rejected so that truncated or malformed frames never reach the dispatcher.
+	// notification (has method, no id), response (no method, has non-null id), or an
+	// error response with `id:null`, which JSON-RPC 2.0 §5 prescribes when the
+	// request id could not be determined (e.g. a parse error). Any other method-less
+	// message fits no category and is rejected so that truncated or malformed frames
+	// never reach the dispatcher.
 	const hasNonNullId = ("id" in j) && j["id"].type != Json.Type.null_
 		&& j["id"].type != Json.Type.undefined;
-	if (("method" !in j) && !hasNonNullId)
-		throw invalidRequest("Message must have either method (request/notification) "
-				~ "or a non-null id with result/error (response)");
+	const isNullIdError = ("method" !in j) && ("id" in j)
+		&& j["id"].type == Json.Type.null_ && ("error" in j) && ("result" !in j);
+	if (("method" !in j) && !hasNonNullId && !isNullIdError)
+		throw invalidRequest("Message must have either method (request/notification), "
+				~ "a non-null id with result/error (response), or a null id with error");
 	// A `method`-less message with a non-null `id` is a response. JSON-RPC 2.0 §5
 	// requires a response to carry exactly one of `result`/`error`; otherwise
 	// `Message.kind` would silently classify a both-present reply as an error (the
@@ -482,6 +486,23 @@ unittest  // method with explicit null id is rejected, not treated as notificati
 	import std.exception : assertThrown;
 
 	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":null,"method":"tools/list"}`));
+}
+
+unittest  // an error response with a null id is accepted as an errorResponse
+{
+	auto m = parseMessage(`{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"bad"}}`);
+	assert(m.kind == MessageKind.errorResponse);
+	assert(m.id.type == Json.Type.null_);
+	assert(m.error["code"].get!int == -32700);
+}
+
+unittest  // a success response with a null id is rejected
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":null,"result":{}}`));
+	assertThrown!McpException(parseMessage(
+			`{"jsonrpc":"2.0","id":null,"result":{},"error":{"code":-1,"message":"x"}}`));
 }
 
 unittest  // a genuine notification (no id) is still accepted
