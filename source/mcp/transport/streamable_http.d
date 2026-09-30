@@ -226,6 +226,8 @@ void mountMcp(URLRouter router, McpServer server,
 		handlePost(server, coord, sessions, token, payload, req, res);
 	});
 	auto push = ensurePushChannel(server, coord);
+	if (sessions !is null)
+		sessions.onExpire = (string sid) @safe { push.closeSession(sid); };
 	router.get(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		if (!guardOrigin(req, res, opts))
 			return;
@@ -3920,6 +3922,68 @@ unittest  // the standalone GET stream writes its first bytes as soon as it open
 	runEventLoop();
 	assert(early.canFind(": open\n\n"), "the GET stream must flush a first frame at once: " ~ early);
 	assert(ended, "DELETE must end the GET stream");
+}
+
+unittest  // evicting a session past the cap closes its open GET stream at once
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.maxSessions = 1;
+	mountMcp(router, server, opts);
+
+	string initialize() @safe
+	{
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(makeInitPostReq(initializeBody(),
+				["Accept": "application/json, text/event-stream"]), res);
+		return res.headers[SessionHeader];
+	}
+
+	const sid = initialize();
+	bool ended;
+	runTask(() @safe nothrow{
+		try
+		{
+			auto req = makeInitPostReq("", [
+				"Accept": "text/event-stream",
+				"MCP-Protocol-Version": "2025-11-25",
+				SessionHeader: sid
+			]);
+			req.method = HTTPMethod.GET;
+			router.handleRequest(req, createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly));
+		}
+		catch (Exception)
+		{
+		}
+		ended = true;
+	});
+	bool endedBeforeEviction;
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(200.msecs);
+			endedBeforeEviction = ended;
+			initialize();
+			sleep(1000.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(!endedBeforeEviction, "the GET stream must stay open while its session lives");
+	assert(ended, "evicting the session must close its GET stream promptly");
 }
 
 unittest  // the version gate rejects a version the server does not serve

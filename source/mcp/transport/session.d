@@ -47,6 +47,11 @@ struct BoundedExpiringMap(V)
 	private size_t maxEntries;
 	private MonoTime delegate() @safe clock;
 
+	/// Called with an entry's key and value after the TTL sweep or cap eviction
+	/// removes it, so the owner can release resources tied to the entry. Not
+	/// called for `take` or `remove`.
+	void delegate(string key, V value) @safe onEvict;
+
 	this(Duration ttl, size_t maxEntries, MonoTime delegate() @safe clock) @safe
 	{
 		this.ttl = ttl;
@@ -145,6 +150,15 @@ struct BoundedExpiringMap(V)
 		used.remove(key);
 	}
 
+	/// Drop `key` as expired or evicted and report it to `onEvict`.
+	private void evict(string key) @safe
+	{
+		auto v = values[key];
+		drop(key);
+		if (onEvict !is null)
+			onEvict(key, v);
+	}
+
 	/// The value for `key` if present and within its TTL; an expired entry is
 	/// dropped.
 	private V* live(string key, MonoTime t) @safe
@@ -154,7 +168,7 @@ struct BoundedExpiringMap(V)
 			return null;
 		if (ttl > Duration.zero && t - stamps[key] >= ttl)
 		{
-			drop(key);
+			evict(key);
 			return null;
 		}
 		return p;
@@ -177,7 +191,7 @@ struct BoundedExpiringMap(V)
 			if (t - ts >= ttl)
 				expired ~= k;
 		foreach (k; expired)
-			drop(k);
+			evict(k);
 	}
 
 	/// Evict the least-recently-active never-used entry, or the
@@ -204,7 +218,7 @@ struct BoundedExpiringMap(V)
 		}
 		if (!found)
 			return false;
-		drop(foundUnused ? oldestUnused : oldest);
+		evict(foundUnused ? oldestUnused : oldest);
 		return true;
 	}
 }
@@ -355,6 +369,22 @@ final class SessionManager
 	this(Duration idleTtl, size_t maxActive) @safe
 	{
 		sessions = BoundedExpiringMap!Session(idleTtl, maxActive, null);
+		sessions.onEvict = &evicted;
+	}
+
+	/// Called with a session's id after the idle sweep or the active-session cap
+	/// removes it, so the transport can close the session's open streams. Not
+	/// called for `terminate`.
+	void delegate(string id) @safe onExpire;
+
+	/// Cancel an expired or evicted session's in-flight requests, whose responses
+	/// can no longer be delivered, and report its end.
+	private void evicted(string id, Session s) @safe
+	{
+		foreach (tok; s.state.inFlight)
+			tok.cancel();
+		if (onExpire !is null)
+			onExpire(id);
 	}
 
 	/// Generate a new cryptographically-secure session id, create and store the
@@ -753,6 +783,52 @@ unittest  // terminate cancels the session's in-flight requests
 	mgr.stateFor(id).inFlight["i:1"] = tok;
 	assert(mgr.terminate(id));
 	assert(tok.cancelled, "a terminated session's in-flight request must be cancelled");
+}
+
+unittest  // a session evicted past the cap has its in-flight cancelled and its end reported
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+	import mcp.server.context : CancellationToken;
+
+	auto mgr = new SessionManager(Duration.zero, 1);
+	string[] ended;
+	mgr.onExpire = (string id) @safe { ended ~= id; };
+	const a = mgr.create();
+	auto tok = new CancellationToken;
+	mgr.stateFor(a).inFlight["i:1"] = tok;
+	Thread.sleep(2.msecs);
+	mgr.create();
+	assert(!mgr.isActive(a));
+	assert(tok.cancelled, "an evicted session's in-flight request must be cancelled");
+	assert(ended == [a], "an evicted session's end must be reported");
+}
+
+unittest  // a session swept past its idle TTL has its in-flight cancelled and its end reported
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+	import mcp.server.context : CancellationToken;
+
+	auto mgr = new SessionManager(5.msecs, 0);
+	string[] ended;
+	mgr.onExpire = (string id) @safe { ended ~= id; };
+	const a = mgr.create();
+	auto tok = new CancellationToken;
+	mgr.stateFor(a).inFlight["i:1"] = tok;
+	Thread.sleep(20.msecs);
+	assert(!mgr.isActive(a));
+	assert(tok.cancelled, "an expired session's in-flight request must be cancelled");
+	assert(ended == [a], "an expired session's end must be reported");
+}
+
+unittest  // terminate is not reported as an expiry
+{
+	auto mgr = new SessionManager;
+	string[] ended;
+	mgr.onExpire = (string id) @safe { ended ~= id; };
+	assert(mgr.terminate(mgr.create()));
+	assert(ended.length == 0);
 }
 
 unittest  // a session is bound to the principal that created it
