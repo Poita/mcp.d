@@ -165,14 +165,17 @@ final class EventContext
 	private Json arguments_;
 	private string principal_;
 	private Nullable!long maxAgeMs_;
+	private Nullable!long maxEvents_;
 
 	this(Nullable!string cursor, Json arguments, string principal,
-			Nullable!long maxAgeMs = Nullable!long.init) @safe
+			Nullable!long maxAgeMs = Nullable!long.init,
+			Nullable!long maxEvents = Nullable!long.init) @safe
 	{
 		cursor_ = cursor;
 		arguments_ = (arguments.type == Json.Type.object) ? arguments : Json.emptyObject;
 		principal_ = principal;
 		maxAgeMs_ = maxAgeMs;
+		maxEvents_ = maxEvents;
 	}
 
 	/// The cursor the client supplied — the position to resume from. Null means
@@ -206,6 +209,13 @@ final class EventContext
 	Nullable!long maxAgeMs() const @safe nothrow
 	{
 		return maxAgeMs_;
+	}
+
+	/// The optional cap on events returned in one batch (`maxEvents`). Null when
+	/// the client did not bound the batch.
+	Nullable!long maxEvents() const @safe nothrow
+	{
+		return maxEvents_;
 	}
 }
 
@@ -248,6 +258,13 @@ unittest  // EventContext normalizes non-object arguments to an empty object
 {
 	auto ctx = new EventContext(Nullable!string.init, Json("not-an-object"), "p");
 	assert(ctx.arguments.type == Json.Type.object && ctx.arguments.length == 0);
+}
+
+unittest  // EventContext carries the maxEvents cap when supplied
+{
+	auto ctx = new EventContext(nullable("c"), Json.emptyObject, "p",
+			Nullable!long.init, nullable(25L));
+	assert(ctx.maxEvents.get == 25);
 }
 
 unittest  // EventContext carries the maxAgeMs replay floor when supplied

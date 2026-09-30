@@ -124,6 +124,7 @@ final class EventHandle(A, P)
 			FetchContext fc;
 			fc.cursor = ctx.cursor;
 			fc.maxAgeMs = ctx.maxAgeMs;
+			fc.maxEvents = ctx.maxEvents;
 			fc.principal = ctx.principal;
 			return toResult(fetch(argsOf(ctx.arguments), fc));
 		};
@@ -871,7 +872,7 @@ final class EventsRuntime
 			string principal, Nullable!string cursor, Nullable!long maxAgeMs,
 			Nullable!long maxEvents) @safe
 	{
-		auto ctx = new EventContext(cursor, arguments, principal, maxAgeMs);
+		auto ctx = new EventContext(cursor, arguments, principal, maxAgeMs, maxEvents);
 		PollResult out_;
 		if (p.emitOnly || p.check is null)
 		{
@@ -889,6 +890,20 @@ final class EventsRuntime
 			out_.cursor = er.cursor;
 			out_.truncated = er.truncated;
 			out_.hasMore = er.hasMore;
+			// Enforce maxEvents on a check that returned more. The batch can only be
+			// cut where the last kept event carries its own cursor to resume from;
+			// otherwise the remainder would be skipped, so the batch goes out whole.
+			if (!maxEvents.isNull && maxEvents.get >= 1 && out_.events.length > maxEvents.get)
+			{
+				const n = cast(size_t) maxEvents.get;
+				auto resume = out_.events[n - 1].cursor;
+				if (!resume.isNull)
+				{
+					out_.events = out_.events[0 .. n];
+					out_.cursor = resume;
+					out_.hasMore = true;
+				}
+			}
 		}
 		out_.nextPollMs = nextPollMsFor(p);
 		return out_;
@@ -3803,6 +3818,53 @@ unittest  // typed onFetch backs events/poll with strongly-typed events
 	assert(next.events[0].data["id"].get!string == "INC-1");
 	assert(next.events[0].data["severity"].get!string == "P1");
 	assert(next.events[0].eventId.length > 0); // stamped
+}
+
+unittest  // typed onFetch receives the poll's maxEvents cap
+{
+	auto rt = testRuntime();
+	Nullable!long seen;
+	rt.define!(DemoArgs, DemoPayload)("incident.created")
+		.onFetch((DemoArgs args, scope FetchContext ctx) @safe {
+			seen = ctx.maxEvents;
+			return EventBatch!DemoPayload.empty("c0");
+		});
+	rt.poll("incident.created", Json.emptyObject, "", nullable("c0"),
+			Nullable!long.init, nullable(7L));
+	assert(!seen.isNull && seen.get == 7);
+}
+
+unittest  // a check that ignores maxEvents is capped, resuming after the last delivered event
+{
+	auto rt = testRuntime();
+	rt.define!(DemoArgs, DemoPayload)("incident.created")
+		.onFetch((DemoArgs args, scope FetchContext ctx) @safe {
+			return EventBatch!DemoPayload.of([
+				Event!DemoPayload(DemoPayload("INC-1"), "c1"),
+				Event!DemoPayload(DemoPayload("INC-2"), "c2"),
+				Event!DemoPayload(DemoPayload("INC-3"), "c3")
+			], "c3");
+		});
+	auto r = rt.poll("incident.created", Json.emptyObject, "", nullable("c0"),
+			Nullable!long.init, nullable(2L));
+	assert(r.events.length == 2);
+	assert(r.events[1].data["id"].get!string == "INC-2");
+	assert(r.cursor.get == "c2" && r.hasMore);
+}
+
+unittest  // a check's over-long batch without per-event cursors is returned whole
+{
+	auto rt = testRuntime();
+	rt.define!(DemoArgs, DemoPayload)("incident.created")
+		.onFetch((DemoArgs args, scope FetchContext ctx) @safe {
+			return EventBatch!DemoPayload.of([
+				Event!DemoPayload(DemoPayload("INC-1")),
+				Event!DemoPayload(DemoPayload("INC-2"))
+			], "c2");
+		});
+	auto r = rt.poll("incident.created", Json.emptyObject, "", nullable("c0"),
+			Nullable!long.init, nullable(1L));
+	assert(r.events.length == 2 && r.cursor.get == "c2" && !r.hasMore);
 }
 
 unittest  // typed match filters typed publish fan-out per subscription
