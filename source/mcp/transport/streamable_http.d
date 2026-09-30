@@ -324,7 +324,7 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		handleLegacyGet(channel, res);
+		handleLegacyGet(channel, principalOf(token), res);
 	});
 
 	router.post(opts.legacyMessagePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
@@ -382,6 +382,7 @@ final class LegacySseChannel
 		string sessionId;
 		void delegate(string frame) @safe write;
 		ConnectionState connState;
+		string principal;
 	}
 
 	private string endpointPath;
@@ -403,13 +404,15 @@ final class LegacySseChannel
 	/// receives the leading `endpoint` event (basic/transports §HTTP with SSE:
 	/// the server MUST send it "When a client connects") whose URI carries that
 	/// token, so a later POST can be correlated back to exactly this stream.
+	/// `principal` is the authenticated subject that opened the stream ("" when
+	/// unauthenticated); only POSTs from the same principal may use the stream.
 	/// Returns the listener id.
-	long addListener(void delegate(string frame) @safe write) @safe
+	long addListener(void delegate(string frame) @safe write, string principal = "") @safe
 	{
 		const id = nextId++;
 		const sessionId = generateSessionId();
 		write(formatLegacyEndpointEvent(endpointWithSession(endpointPath, sessionId)));
-		listeners ~= Listener(id, sessionId, write, new ConnectionState);
+		listeners ~= Listener(id, sessionId, write, new ConnectionState, principal);
 		return id;
 	}
 
@@ -425,14 +428,15 @@ final class LegacySseChannel
 	}
 
 	/// The per-stream `ConnectionState` for the stream whose session token is
-	/// `sessionId`, or null when no matching open stream exists. The POST handler
-	/// dispatches against it so each client's JSON-RPC dispatch runs against
-	/// its own isolated state (negotiated version, client capabilities, etc.).
-	ConnectionState connStateFor(string sessionId) @safe
+	/// `sessionId`, or null when no matching open stream exists or the stream was
+	/// opened by a principal other than `principal`. The POST handler dispatches
+	/// against it so each client's JSON-RPC dispatch runs against its own isolated
+	/// state (negotiated version, client capabilities, etc.).
+	ConnectionState connStateFor(string sessionId, string principal = "") @safe
 	{
 		foreach (l; listeners)
 			if (l.sessionId == sessionId)
-				return l.connState;
+				return l.principal == principal ? l.connState : null;
 		return null;
 	}
 
@@ -552,7 +556,8 @@ private void holdSessionStream(void delegate(string) @safe writeFrame, ServerPus
 /// Open a legacy GET SSE stream: register it on `channel` (which emits the
 /// leading `endpoint` event), then hold the connection open with SSE comment
 /// heartbeats so a client disconnect terminates the loop and drops the listener.
-private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @safe
+/// The stream is bound to `principal`, the authenticated subject of the GET.
+private void handleLegacyGet(LegacySseChannel channel, string principal, HTTPServerResponse res) @safe
 {
 	res.contentType = "text/event-stream";
 	applySseStreamHeaders(res, false);
@@ -564,7 +569,7 @@ private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @
 
 	const listenerId = channel.addListener((string frame) @safe {
 		writeFrame(frame);
-	});
+	}, principal);
 	scope (exit)
 		channel.removeListener(listenerId);
 
@@ -587,7 +592,7 @@ private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @
 bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 		string sessionId, string payload, TokenInfo token = TokenInfo.invalid()) @safe
 {
-	auto conn = channel.connStateFor(sessionId);
+	auto conn = channel.connStateFor(sessionId, principalOf(token));
 	if (conn is null)
 		return false;
 
@@ -2991,6 +2996,30 @@ unittest  // legacy POST: an unknown sessionId is rejected and nothing is dispat
 	auto ch = new LegacySseChannel("/message");
 	assert(!handleLegacyPostBody(server, ch, "no-such-session", initializeBody("2024-11-05")));
 	assert(!handleLegacyPostBody(server, ch, "", initializeBody("2024-11-05")));
+}
+
+unittest  // legacy POST: a stream opened under one principal rejects another principal's POSTs
+{
+	auto server = McpServer.stateful("t", "1");
+	auto ch = new LegacySseChannel("/message");
+	string[] frames;
+	const sid = ch.sessionIdFor(ch.addListener((string f) @safe { frames ~= f; }, "alice"));
+
+	TokenInfo tokenFor(string subject) @safe
+	{
+		TokenInfo t;
+		t.valid = true;
+		t.subject = subject;
+		return t;
+	}
+
+	assert(!handleLegacyPostBody(server, ch, sid, initializeBody("2024-11-05"),
+			tokenFor("bob")), "another principal must not use alice's legacy stream");
+	assert(!handleLegacyPostBody(server, ch, sid, initializeBody("2024-11-05")),
+			"an unauthenticated POST must not use alice's legacy stream");
+	assert(frames.length == 1, "nothing may be dispatched for a foreign principal");
+	assert(handleLegacyPostBody(server, ch, sid, initializeBody("2024-11-05"), tokenFor("alice")));
+	assert(frames.length == 2);
 }
 
 unittest  // legacy POST route: missing sessionId is 400, unknown sessionId is 404
