@@ -2,7 +2,7 @@
 
 A self-contained example of the **modern input flow** in the D MCP SDK,
 running and e2e-tested over **both stdio and Streamable HTTP**. It is its own dub
-package (a `path` dependency on the root `mcp`), so it builds and runs
+package (a `path` dependency on the root `mcp-d`), so it builds and runs
 independently of the SDK's root build.
 
 ## What MRTR is (and what it teaches)
@@ -39,7 +39,7 @@ Round 1 returns both requests and stashes the topic into `requestState`. Round 2
 reads the answers + the echoed topic and returns the confirmation (text +
 structured content).
 
-### Typed APIs exercised (SEP-2322 / #436 / #437)
+### Typed APIs exercised (SEP-2322)
 
 The server is UDA style (`@tool` + `registerHandlers`) and builds **no hand-built
 MRTR `Json`** — it uses the typed builders and decoders throughout:
@@ -78,17 +78,17 @@ structured result:
 - **`callTool("book_meeting", bookMeetingArgs("Q3 roadmap"))`** — the wire
   `{topic}` object is built as a JSON object (the client request surface is
   untyped — see the repo-root `DESIGN.md`).
-- **typed inbound `InputRequest` readers** (#503) — the surfaced requests are read
+- **typed inbound `InputRequest` readers** — the surfaced requests are read
   via `req.elicitationMessage()` / `req.requestedSchema()` (the elicitation) and
   `req.asSampling()` (the sampling, decoded back into a typed
   `CreateMessageRequest`) instead of raw `req.params[...]` indexing.
-- **`ElicitResult.accept(MeetingDate("2026-06-15"))`** (#466) and
-  **`CreateMessageResult.text("mock-llm", "...")`** (#467) — the mock
+- **`ElicitResult.accept(MeetingDate("2026-06-15"))`** and
+  **`CreateMessageResult.text("mock-llm", "...")`** — the mock
   `onElicitation` / `onSampling` replies are built from the typed convenience
   constructors instead of assembling the result structs field by field.
-- **`CallToolResult.structuredContentAs!Booking`** (#464) — the structured
-  result is decoded in one shot into a typed `Booking` struct, replacing the
-  field-by-field raw-`Json` reads.
+- **`CallToolResult.structuredContentAs!Booking`** — the structured
+  result is decoded in one shot into a typed `Booking` struct rather than read
+  field by field from raw `Json`.
 
 Installing `onElicitation` / `onSampling` alone now auto-advertises the matching
 capabilities (`effectiveCapabilities`), so no raw capability-flag setting is

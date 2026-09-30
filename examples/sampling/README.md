@@ -1,7 +1,7 @@
 # examples/sampling — server-initiated LLM Sampling (dual-transport)
 
 A self-contained MCP example showing **Sampling** from both sides, over BOTH
-the stdio and Streamable HTTP transports (issue #354).
+the stdio and Streamable HTTP transports.
 
 Sampling inverts the usual MCP direction: instead of the client driving the
 server, the *server* borrows the *client's* LLM. Inside a tool the server sends
@@ -10,8 +10,7 @@ it with its own model via an `onSampling` handler. The server never holds an API
 key — it just asks the client to run the model.
 
 The MCP stdio transport is bidirectional, so this server→client hop works over
-**both** transports. (The Streamable-HTTP keep-alive deadlock that used to bite
-this path was fixed in #377.)
+**both** transports.
 
 ## What it teaches
 

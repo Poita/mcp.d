@@ -3,7 +3,7 @@
 A focused, runnable demonstration of **MCP Resources** from both sides, over
 **BOTH transports** — stdio and Streamable HTTP — from a single server binary
 and a single self-verifying client. It is its own dub package with a path
-dependency on the root `mcp` SDK (it does not modify the root `dub.json`).
+dependency on the root `mcp-d` SDK (it does not modify the root `dub.json`).
 
 ## What it teaches
 

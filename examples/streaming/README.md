@@ -6,10 +6,10 @@ stdio and Streamable HTTP. One server binary serves either transport; one client
 verifies both.
 
 - **Progress** — `ctx.reportProgress(done, total, message)` (integer-step
-  convenience, #501) → `notifications/progress`, observed via a per-call
-  progress sink, `callTool(name, args, onProgress)` (#494).
+  convenience) → `notifications/progress`, observed via a per-call
+  progress sink, `callTool(name, args, onProgress)`.
 - **Logging** — `ctx.log(LogLevel.info, message, logger)` (typed-level, plain
-  string payload, #501) → `notifications/message`, observed via
+  string payload) → `notifications/message`, observed via
   `McpClient.onLogMessage`.
 - **Cancellation** — a long-running handler polls `ctx.isCancelled` and stops
   early; on Streamable HTTP the cancellation signal is the client closing its
@@ -117,8 +117,8 @@ A non-zero client exit code means a behavioral regression — the client prints
   handshake, the authorization-server flow) is defined over HTTP request
   headers; the stdio transport has no header channel, so authentication is not
   applicable to the stdio path. See `examples/auth` for the HTTP auth example.
-- The example is its own dub package with path dependencies on the root `mcp`
-  SDK (`"mcp": { "path": "../.." }`) and on the shared `examples/common` scaffold
+- The example is its own dub package with path dependencies on the root `mcp-d`
+  SDK (`"mcp-d": { "path": "../.." }`) and on the shared `examples/common` scaffold
   (`"examples-common": { "path": "../common" }`), which supplies the `check`
   assertion helper, the `runClient` event-loop driver, and the
   `connectFromArgs` / `runServerFromArgs` transport pickers. It does not modify

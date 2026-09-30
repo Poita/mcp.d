@@ -5,7 +5,7 @@ the D MCP SDK from **both sides** — a server that exposes prompts, and a clien
 that drives it *and doubles as an end-to-end regression test* — over **both**
 the stdio and Streamable HTTP transports.
 
-This directory is its own dub package: it depends on the root `mcp` library and
+This directory is its own dub package: it depends on the root `mcp-d` library and
 on the shared `examples-common` scaffold (`../common`) via path dependencies; it
 does not modify the root `dub.json`. The scaffold supplies the `check`/`checkEq`
 assertion helpers, the `runClient` event-loop wiring, and the

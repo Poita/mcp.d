@@ -90,8 +90,8 @@ int main(string[] args) @safe
 int run(string[] args) @safe
 {
 	// The push phase (subscriptions/listen + notifications/resources/updated)
-	// runs over BOTH transports. subscriptions/listen is a DRAFT RPC and 2026-07-28 is
-	// stateless-only, so it works on this STATELESS server: the POST opens one
+	// runs over BOTH transports. subscriptions/listen is a 2026-07-28 RPC, and
+	// 2026-07-28 is stateless-only, so it works on this STATELESS server: the POST opens one
 	// long-lived SSE stream and set_note -> notifyResourceUpdated streams
 	// notifications/resources/updated (+ resources/list_changed) down THAT same
 	// stream, in-process — no session, no second correlated HTTP call. stdio behaves

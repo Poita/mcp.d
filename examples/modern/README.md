@@ -3,7 +3,7 @@
 A focused, self-contained example of the MCP **2026-07-28 stateless
 protocol**, shown from both sides and runnable over **both** transports from a
 single server binary and a single client e2e. It is its own dub package with a
-path-dependency on the root `mcp` library, so it does not touch the root
+path-dependency on the root `mcp-d` library, so it does not touch the root
 `dub.json`.
 
 ## What it teaches

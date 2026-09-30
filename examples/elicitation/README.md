@@ -1,11 +1,11 @@
 # examples/elicitation — 2025-era blocking elicitation (dual-transport, typed APIs)
 
 A self-contained dub package demonstrating **blocking elicitation** on the
-released (2025-*) MCP protocol (issue #355). The server is one binary that runs
+released (2025-*) MCP protocol. The server is one binary that runs
 over **either** transport — newline-delimited JSON-RPC on **stdio** (the
 default) or **Streamable HTTP** (`--http`) — and the bundled client is a
 self-verifying e2e test that drives and asserts the same behavior over whichever
-transport it connects on. It depends on the root `mcp` package via a path
+transport it connects on. It depends on the root `mcp-d` package via a path
 dependency and does **not** modify the root `dub.json`.
 
 ## What it teaches
@@ -34,7 +34,7 @@ schema is a flat object of primitive fields, optionally with `enum`, `default`,
 The handler branches on the user's decision (`accept` / `decline` / `cancel`)
 and, on `accept`, applies the schema defaults for any field the user omitted.
 
-### Typed-API adoption (#436 / #437 / #464 / #465 / #466 / #468 / #470)
+### Typed APIs
 
 This example uses the SDK's **typed elicitation APIs** rather than hand-built
 Json, on both sides of the wire:
@@ -44,27 +44,27 @@ Json, on both sides of the wire:
   `required` set and the `cabin` enum members come from reflection, while the
   rich facets (field titles, the `travelers` integer bounds, the `cabin` enum
   default, the `insurance` boolean default) are declared as field UDAs
-  (`@title`/`@minimum`/`@maximum`/`@schemaDefault`, #465) that `jsonSchemaOf`
-  now emits — so the server builds **no schema Json by hand** (SEP-1034/1330);
+  (`@title`/`@minimum`/`@maximum`/`@schemaDefault`) that `jsonSchemaOf`
+  emits — so the server builds **no schema Json by hand** (SEP-1034/1330);
 - `ctx.elicit!T` returns a typed `ElicitResult`; the handler branches on
   `.action` and, on `accept`, decodes the collected values with
   `result.contentAs!TripDetails` instead of hand-reading the `content` Json;
 - `plan_trip` returns a `TripPlan` struct, so the SDK infers the output schema
   and emits `structuredContent` the client decodes with
-  `result.structuredContentAs!TripPlan` (#464);
+  `result.structuredContentAs!TripPlan`;
 - the server's transport selection (stdio vs. `--http`/`--port`/`--host`) and
   the client's transport selection + event-loop wiring are delegated to the
-  shared `examples/common` scaffold (#505): the server calls
+  shared `examples/common` scaffold: the server calls
   `runServerFromArgs(server, args, 9355)`, while the client connects with
   `connectFromArgs(args, "elicitation-server")` (stdio spawns the sibling server
-  binary via `McpClient.spawnSibling` + `scope(exit) client.close()`, #470 — no
+  binary via `McpClient.spawnSibling` + `scope(exit) client.close()` — no
   hand-rolled `ProcessPipes` plumbing) and runs its self-verifying body inside
   `runClient(...)`. Its assertions use the scaffold's `check`/`checkEq` helpers;
 - the client passes tool arguments as a JSON object (`planArgs(destination)`;
   the client request surface is untyped — see the repo-root `DESIGN.md`), and
-  answers `accept` with `ElicitResult.accept(AcceptForm(3))` (#466).
+  answers `accept` with `ElicitResult.accept(AcceptForm(3))`.
   Installing `onElicitation` alone advertises form elicitation (the inbound gate
-  honours `effectiveCapabilities()`, #463), so no raw capability flags are set.
+  honours `effectiveCapabilities()`), so no raw capability flags are set.
 
 The server is written in the SDK's ergonomic **UDA style**: `plan_trip` is an
 annotated typed method on `TripApi`, wired up with a single `registerHandlers`
@@ -79,14 +79,13 @@ server->client channel, so a tool that needs input ENDS the call with
 carrying the answers in `inputResponses` (plus an opaque `requestState`). Here,
 on the 2025 released protocol, elicitation is a **single blocking** `tools/call`
 with a real `elicitation/create` round-trip inside it — no resubmission, no
-`requestState`. (The server->client blocking deadlock over Streamable HTTP was
-fixed in #377; over stdio the reply is answered inline on the same channel,
-#448/#449.)
+`requestState`. Over stdio the client's reply is answered inline on the same
+channel.
 
 ## Files
 
 - `dub.json` — package with `server` and `client` configurations; depends on
-  the root `mcp` package and the shared `examples-common` scaffold (`../common`).
+  the root `mcp-d` package and the shared `examples-common` scaffold (`../common`).
 - `server.d` — the `elicitation-server`; one binary, stdio (default) or HTTP.
 - `client.d` — the `elicitation-client`; a self-verifying e2e test over either
   transport.

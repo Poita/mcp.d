@@ -6,7 +6,7 @@ attaches them (in ergonomic **UDA style**) and a client that reads them — over
 **both** the **stdio** and **Streamable HTTP** transports from a single binary
 each.
 
-It is its own dub package (depends on the root `mcp` via a path dependency) and
+It is its own dub package (depends on the root `mcp-d` via a path dependency) and
 does **not** modify the root `dub.json`.
 
 ## What it teaches
