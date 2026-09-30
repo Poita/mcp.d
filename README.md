@@ -127,9 +127,12 @@ the one remaining check is the harness's own wire-schema validator rejecting any
   screen surfaces the verified `client_name` and the redirect-URI hostname. DCR remains as the
   deprecated fallback.
 
-Optional follow-ups (not required for conformance): a built-in loopback redirect listener for
-the interactive auth-code flow, and a localhost-redirect impersonation warning on the proxy's
-CIMD consent screen (a spec `SHOULD`).
+- ✅ **Interactive client login** — `useOAuth` runs the full browser authorization-code flow
+  with a loopback redirect listener, persists tokens, and refreshes them transparently. See
+  [Client authentication](#client-authentication-oauth-login).
+
+Optional follow-up (not required for conformance): a localhost-redirect impersonation warning
+on the proxy's CIMD consent screen (a spec `SHOULD`).
 
 ## Requirements
 
@@ -444,6 +447,54 @@ also fires a typed callback (`onToolsListChanged`, `onPromptsListChanged`,
 `onResourcesListChanged`, `onResourceUpdated(uri)`) in addition to the generic
 `onNotification`. `setBearerToken` evicts the client's own partition so a
 re-authenticated session never reads the previous identity's `private` results.
+
+## Client authentication (OAuth login)
+
+`useOAuth(client, endpoint, opts)` (from `import mcp.auth;`) logs an HTTP client in
+to an OAuth-protected MCP server interactively and attaches the result as the
+client's bearer provider. Call it before `connect()`:
+
+```d
+import mcp;
+import mcp.auth : useOAuth, OAuthLogin;
+
+runWithEventLoop(() @safe {
+    enum endpoint = "https://mcp.example.com/mcp";
+    auto client = McpClient.http(endpoint);
+    scope (exit) client.close();
+
+    OAuthLogin login;
+    login.scopes = ["mcp:read"];
+    useOAuth(client, endpoint, login);
+
+    client.connect();
+    auto tools = client.listTools();
+});
+```
+
+It discovers the protected-resource and authorization-server metadata, then:
+
+- **Reuses a stored token** for the endpoint when one is still valid, or redeems
+  its refresh token, without opening a browser.
+- Otherwise **registers the client** — a pre-registered `OAuthLogin.clientId`, a
+  Client ID Metadata Document (`clientIdMetadataUrl`, when the AS supports it), or
+  Dynamic Client Registration — and **runs authorization-code + PKCE** in the system
+  browser. The redirect is captured on a loopback listener at
+  `http://127.0.0.1:<callbackPort><callbackPath>` (an ephemeral port by default);
+  `state` and RFC 9207 `iss` are verified, and the wait is bounded by
+  `callbackTimeout` (5 minutes by default).
+- **Persists tokens** through `OAuthLogin.store`. The default is a `FileTokenStore`
+  at `$XDG_CONFIG_HOME/dlang-mcp/tokens.json` (or `~/.config/dlang-mcp/tokens.json`),
+  written owner-only; subclass it and override `serialize`/`deserialize` to encrypt
+  at rest, or supply `MemoryTokenStore` or your own `TokenStore`.
+- **Refreshes transparently**: every request asks the returned `OAuthSession` for
+  its bearer, which runs the refresh-token grant when the access token is within
+  30 seconds of expiry and saves the new token. Concurrent refreshes are
+  single-flighted.
+
+`OAuthLogin.openBrowser` replaces the platform browser launcher (for example, to
+print the URL instead). For non-interactive flows (client credentials, token
+exchange) use the lower-level `OAuthClient` and `setBearerToken`.
 
 ## Examples
 
