@@ -1490,11 +1490,18 @@ final class EventsRuntime
 		EventOccurrence shaped = occ;
 		if (shape)
 		{
+			// A throwing author callback costs only this subscription this event.
 			auto ctx = new EventContext(sub.cursor, sub.arguments, sub.principal);
-			if (reg !is null && reg.match !is null && !reg.match(ctx, occ))
+			try
+			{
+				if (!shapeFor(reg, ctx, shaped))
+					return false;
+			}
+			catch (Exception e)
+			{
+				logEventsError("match/transform threw", e);
 				return false;
-			if (reg !is null && reg.transform !is null)
-				shaped = reg.transform(ctx, occ);
+			}
 		}
 		// Past the per-subscription bound the event is dropped rather than queued
 		// behind a backlog the endpoint is not draining; a gap covers it later.
@@ -1689,11 +1696,35 @@ final class EventsRuntime
 		EventOccurrence[] result;
 		foreach (e; events)
 		{
-			if (reg.match !is null && !reg.match(ctx, e))
-				continue;
-			result ~= (reg.transform !is null) ? reg.transform(ctx, e) : e;
+			// An event the author's callback throws on is dropped rather than failing
+			// the whole batch, so the cursor still moves past it.
+			try
+			{
+				if (shapeFor(reg, ctx, e))
+					result ~= e;
+			}
+			catch (Exception ex)
+				logEventsError("match/transform threw", ex);
 		}
 		return result;
+	}
+
+	// Apply the type's `match`/`transform` to `occ` for the subscription `ctx`
+	// describes, in place. Returns false when `match` drops it. Exceptions from
+	// the author's callbacks propagate.
+	private static bool shapeFor(EventRegistration* reg, EventContext ctx, ref EventOccurrence occ) @safe
+	{
+		return reg is null || shapeFor(*reg, ctx, occ);
+	}
+
+	private static bool shapeFor(ref EventRegistration reg, EventContext ctx,
+			ref EventOccurrence occ) @safe
+	{
+		if (reg.match !is null && !reg.match(ctx, occ))
+			return false;
+		if (reg.transform !is null)
+			occ = reg.transform(ctx, occ);
+		return true;
 	}
 
 	// True for an emit-only (buffer-backed) registration. A null registration is
@@ -1732,10 +1763,22 @@ final class EventsRuntime
 	private void deliverToStream(EventRegistration* reg, PushStream s, EventOccurrence occ) @safe
 	{
 		auto ctx = new EventContext(s.cursor, s.arguments, s.principal);
-		if (reg !is null && reg.match !is null && !reg.match(ctx, occ))
+		EventOccurrence shaped = occ;
+		// A throwing author callback costs this subscriber this one event, reported
+		// as a recoverable error; the stream stays open for the events after it.
+		try
+		{
+			if (!shapeFor(reg, ctx, shaped))
+				return;
+		}
+		catch (Exception e)
+		{
+			logEventsError("match/transform threw", e);
+			s.deliver(eventsErrorNotification, withSubscriptionId(eventErrorParams(
+					toErrorJson(internalError("Event could not be shaped for this subscription"))),
+					s.subscriptionId));
 			return;
-		EventOccurrence shaped = (reg !is null && reg.transform !is null) ? reg.transform(ctx,
-				occ) : occ;
+		}
 		// Only advance the stream cursor for buffer-backed types. For a check-backed
 		// type the ring-buffer seq is foreign to the author's check(), and the stdio
 		// ticker resumes that check() from s.cursor — so leave s.cursor for the
@@ -1767,7 +1810,13 @@ final class EventsRuntime
 			if (!sub.active)
 			{
 				auto ctx = new EventContext(sub.cursor, sub.arguments, sub.principal);
-				if (reg is null || reg.match is null || reg.match(ctx, occ))
+				bool matched = true;
+				// A throwing match counts as a miss, so the gap signal still covers it.
+				try
+					matched = reg is null || reg.match is null || reg.match(ctx, occ);
+				catch (Exception e)
+					logEventsError("match threw", e);
+				if (matched)
 					noteMissed(sub.id, occ.cursor);
 				continue;
 			}
@@ -3411,6 +3460,72 @@ unittest  // broadcast match/transform shape per-subscription push delivery
 		"severity": Json("P1")
 	])));
 	assert(p1Count == 1 && p2Count == 0); // only the P1 subscription matched
+}
+
+unittest  // a throwing match on a push stream reports an error and the stream keeps delivering
+{
+	auto rt = testRuntime();
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.emitOnly = true;
+	reg.match = (EventContext ctx, EventOccurrence ev) @safe {
+		if (ev.eventId == "bad")
+			throw new Exception("match failed");
+		return true;
+	};
+	rt.register(reg);
+	string[] methods;
+	auto handle = openLive(rt, "n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		methods ~= m;
+	});
+	rt.emit(EventOccurrence("bad", "n", "t"));
+	rt.emit(EventOccurrence("good", "n", "t"));
+	assert(methods == [eventsErrorNotification, eventsEventNotification]);
+	assert(!handle.stream.terminated);
+	assert(rt.pushStreams_.length == 1);
+}
+
+unittest  // a throwing transform on a push stream reports an error and the stream keeps delivering
+{
+	auto rt = testRuntime();
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.emitOnly = true;
+	reg.transform = (EventContext ctx, EventOccurrence ev) @safe {
+		if (ev.eventId == "bad")
+			throw new Exception("transform failed");
+		return ev;
+	};
+	rt.register(reg);
+	string[] methods;
+	cast(void) openLive(rt, "n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		methods ~= m;
+	});
+	rt.emit(EventOccurrence("bad", "n", "t"));
+	rt.emit(EventOccurrence("good", "n", "t"));
+	assert(methods == [eventsErrorNotification, eventsEventNotification]);
+	assert(rt.pushStreams_.length == 1);
+}
+
+unittest  // a throwing match drops only that event from an emit-only poll
+{
+	auto rt = testRuntime();
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.emitOnly = true;
+	reg.match = (EventContext ctx, EventOccurrence ev) @safe {
+		if (ev.eventId == "bad")
+			throw new Exception("match failed");
+		return true;
+	};
+	rt.register(reg);
+	auto boot = rt.poll("n", Json.emptyObject, "", Nullable!string.init,
+			Nullable!long.init, Nullable!long.init);
+	rt.emit(EventOccurrence("bad", "n", "t"));
+	rt.emit(EventOccurrence("good", "n", "t"));
+	auto r = rt.poll("n", Json.emptyObject, "", boot.cursor,
+			Nullable!long.init, Nullable!long.init);
+	assert(r.events.length == 1 && r.events[0].eventId == "good");
 }
 
 unittest  // targeted emit delivers to a single subscription by id
@@ -5525,6 +5640,39 @@ unittest  // emitted webhook deliveries respect the type's match filter
 		"severity": Json("P1")
 	])));
 	assert(ft.eventPosts().length == 1);
+}
+
+unittest  // a match throwing for one webhook subscription neither escapes emit nor skips the others
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.emitOnly = true;
+	reg.match = (EventContext ctx, EventOccurrence ev) @safe {
+		if (ctx.arguments["k"].get!string == "a")
+			throw new Exception("match failed");
+		return true;
+	};
+	reg.transform = (EventContext ctx, EventOccurrence ev) @safe {
+		if (ctx.arguments["k"].get!string == "b")
+			throw new Exception("transform failed");
+		return ev;
+	};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/a", Json(["k": Json("a")])), "user-1");
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/b", Json(["k": Json("b")])), "user-1");
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/c", Json(["k": Json("c")])), "user-1");
+	rt.emit(EventOccurrence("e", "n", "t"));
+	auto delivered = ft.eventPosts();
+	assert(delivered.length == 1 && delivered[0].url == "https://proxy/c");
 }
 
 unittest  // publish enqueues a webhook delivery; delivery happens on a queue drain
