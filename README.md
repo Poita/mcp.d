@@ -933,6 +933,7 @@ exception on your side:
 
 ```d
 import mcp; // re-exports runWithEventLoop
+import vibe.data.json : parseJsonString;
 
 void main()
 {
