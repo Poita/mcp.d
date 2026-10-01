@@ -721,8 +721,9 @@ final class McpClient : ClientProtocol
 	/// JSON-RPC over the supplied `readLine`/`writeLine` channel (symmetric to
 	/// `mcp.transport.stdio.serveStdio`). `readLine` returns the next server line
 	/// (without its terminator) or `null` at end-of-input; `writeLine` emits one
-	/// message line (the sink appends the terminator). Only `settings.clientInfo`
-	/// applies to stdio; the HTTP-only fields are ignored.
+	/// message line (the sink appends the terminator). Every `settings` field
+	/// applies except the HTTP transport knobs (`connectTimeout`, `maxInFlight`,
+	/// `maxMessageBytes`, `tls`), which are ignored.
 	static McpClient stdio(string delegate() @safe readLine,
 			void delegate(string) @safe writeLine, ClientSettings settings = ClientSettings.init) @safe
 	{
@@ -734,8 +735,9 @@ final class McpClient : ClientProtocol
 	/// stdin/stdout (stderr inherited for logging). `command` is the command line
 	/// (`command[0]` is the executable). The returned client is NOT yet
 	/// initialized — call `initialize()` (or `ping()` for a stateless probe).
-	/// `close()` runs the MCP stdio shutdown sequence on the subprocess. Only
-	/// `settings.clientInfo` applies; the HTTP-only fields are ignored.
+	/// `close()` runs the MCP stdio shutdown sequence on the subprocess. Every
+	/// `settings` field applies except the HTTP transport knobs (`connectTimeout`,
+	/// `maxInFlight`, `maxMessageBytes`, `tls`), which are ignored.
 	static McpClient spawn(string[] command, ClientSettings settings = ClientSettings.init) @safe
 	{
 		import std.array : join;
