@@ -119,9 +119,8 @@ unittest
 	assert(r.toJson()["supportedVersions"][0].get!string == "2025-11-25");
 }
 
-// Handler-outcome DTOs and handler aliases are reachable from `import mcp;`.
-// server.d re-exports these from mcp.server.responses; package.d reaches them
-// transitively through `public import mcp.server.server`.
+// Handler-outcome DTOs and handler aliases are reachable from `import mcp;`,
+// which re-exports them from their one home, `mcp.server.responses`.
 unittest
 {
 	static assert(visibleFromMcp!"ToolResponse");
@@ -130,6 +129,22 @@ unittest
 	static assert(visibleFromMcp!"MrtrToolHandler");
 	static assert(visibleFromMcp!"MrtrPromptHandler");
 	static assert(visibleFromMcp!"InputRequiredPart");
+}
+
+// `mcp.server.server` does not re-export the handler-outcome DTOs; each symbol
+// has one home.
+unittest
+{
+	static assert(!__traits(compiles, {
+			import mcp.server.server;
+
+			alias _ = ToolResponse;
+		}));
+	static assert(!__traits(compiles, {
+			import mcp.server.server;
+
+			alias _ = ToolHandler;
+		}));
 }
 
 // Auth verifier internals are NOT dumped at the top level.
@@ -199,14 +214,18 @@ unittest
 unittest
 {
 	static assert(visibleFromTransport!"ServerCore");
-	static assert(visibleFromTransport!"ServerTransport");
 }
 
-// `ServerCore` / `ServerTransport` must NOT appear on the lean top-level surface.
+// The server-side transport seam has the single name `ServerCore`.
+unittest
+{
+	static assert(!visibleFromTransport!"ServerTransport");
+}
+
+// `ServerCore` must NOT appear on the lean top-level surface.
 unittest
 {
 	static assert(!visibleFromMcp!"ServerCore");
-	static assert(!visibleFromMcp!"ServerTransport");
 }
 
 // Auth plumbing is reachable behind the opt-in `mcp.auth` import.

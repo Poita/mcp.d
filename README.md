@@ -312,7 +312,7 @@ The Streamable HTTP transport derives session minting purely from
 ## Implementing a custom server transport
 
 The server side has a named transport seam symmetric to the client's
-`ClientTransport`: the `ServerCore` interface (also exported as `ServerTransport`)
+`ClientTransport`: the `ServerCore` interface
 in `mcp.server.transport`, reachable from `import mcp.transport;`. `McpServer`
 implements it, so a transport can hold its server through the interface and drive
 it without depending on the concrete class.
@@ -325,7 +325,7 @@ Two directions make up the contract:
   notification):
 
   ```d
-  import mcp.transport; // ServerCore / ServerTransport + the wire transports
+  import mcp.transport; // ServerCore + the wire transports
 
   void pump(ServerCore core, string requestText, void delegate(string) @safe reply)
   {

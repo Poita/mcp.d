@@ -10,7 +10,8 @@ import vibe.data.serialization : serializeWithPolicy, deserializeWithPolicy;
 import mcp.protocol.types;
 import mcp.protocol.capabilities : Icon;
 import mcp.protocol.modern : CacheHint, CacheScope;
-import mcp.server.server : McpServer, ToolResponse;
+import mcp.server.server : McpServer;
+import mcp.server.responses : ToolResponse;
 import mcp.server.context;
 import mcp.server.task_context : TaskContext;
 import mcp.server.task_runtime : TaskOptions;
@@ -815,7 +816,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 
 	server.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
 		import mcp.protocol.errors : McpException, invalidParams;
-		import mcp.server.server : PromptResponse;
+		import mcp.server.responses : PromptResponse;
 
 		Tuple!(Parameters!overload) argv;
 		static foreach (i, P; Parameters!overload)
@@ -1142,7 +1143,7 @@ version (unittest)
 	}
 
 	import vibe.data.json : parseJsonString;
-	import mcp.server.server : ToolResponse;
+	import mcp.server.responses : ToolResponse;
 	import mcp.protocol.mrtr : InputRequest;
 
 	// Fixture exercising icons, _meta, annotation title, per-resource cache

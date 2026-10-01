@@ -3,8 +3,7 @@
 /// `ToolResponse` and `PromptResponse` are the values a handler returns: either
 /// a final result, or — on a stateless (MRTR) request — a set of `InputRequest`s
 /// the client must satisfy and resubmit. They form part of the `api.reflection`
-/// registration contract and are re-exported from `mcp.server.server` so the
-/// public surface reaching them through `McpServer` is unchanged.
+/// registration contract and are re-exported by the top-level `mcp` module.
 module mcp.server.responses;
 
 import vibe.data.json : Json;

@@ -32,10 +32,8 @@ import mcp.server.event_store : WebhookSubscriptionStore;
 import mcp.server.events_runtime : EventsRuntime, EventsOptions,
 	EventRegistration, PushHandle, PushStream;
 
-// The handler outcome DTOs live in their own module (part of the api.reflection
-// contract); re-export them so they stay reachable through `mcp.server.server`.
-public import mcp.server.responses : ToolHandler, MrtrToolHandler,
-	InputRequiredPart, ToolResponse, PromptResponse, MrtrPromptHandler;
+import mcp.server.responses : ToolHandler, MrtrToolHandler, InputRequiredPart,
+	ToolResponse, PromptResponse, MrtrPromptHandler;
 
 // The push-integration unittests below exercise the server seam against the
 // real Streamable HTTP channel; the library build itself has no transport
@@ -175,7 +173,7 @@ private final class ConnectionScopedContext : BaseRequestContext, ConnectionScop
 /// parsed messages via `handle` (or raw text via `handleRaw`) and it returns the
 /// response to write back. Transports (stdio, HTTP) are thin drivers over this.
 ///
-/// It satisfies `mcp.server.transport.ServerCore` (aka `ServerTransport`), the
+/// It satisfies `mcp.server.transport.ServerCore`, the
 /// named server-side transport seam symmetric to the client's `ClientTransport`.
 /// A transport can hold its server through that interface and drives it via the
 /// `handle` / `handleRaw` family; `RequestContext` is the outbound companion the

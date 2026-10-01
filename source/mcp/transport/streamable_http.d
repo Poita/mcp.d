@@ -2820,6 +2820,7 @@ unittest  // legacy POST: a handler that calls ctx.listRoots() sends the request
 	import vibe.core.core : runTask, yield;
 	import vibe.data.json : parseJsonString;
 	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
 
 	auto server = McpServer.stateful("t", "1");
 	// Register a tool whose handler issues a roots/list server->client request.

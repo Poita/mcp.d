@@ -90,11 +90,6 @@ interface ServerCore
 			scope Json delegate(string, Json) @safe serverRequest) @safe;
 }
 
-/// `ServerTransport` is published as an alias for `ServerCore`: the core is the
-/// object a transport drives, named from the transport's point of view. The two
-/// names refer to the same interface so either import reads naturally.
-alias ServerTransport = ServerCore;
-
 version (unittest)
 {
 	import mcp.server.server : McpServer;
