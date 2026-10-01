@@ -1201,15 +1201,13 @@ final class OAuthProxy
 		return BrokeredToken(token, issued);
 	}
 
-	/// A `TokenValidator` that validates an incoming MCP bearer token (an
-	/// upstream access token) via the configured `tokenVerifier`. Plug into
-	/// `ResourceServerConfig.validator`.
+	/// A `TokenValidator` for the MCP bearer token clients present: in broker
+	/// mode the proxy's own reference token (looked up in `tokenStore`),
+	/// otherwise the upstream access token (via `tokenVerifier`, rejecting every
+	/// token when none is set). Plug into `ResourceServerConfig.validator`.
 	TokenValidator validator() @safe
 	{
-		auto verifier = cfg.tokenVerifier;
-		if (verifier is null)
-			return (string t) => TokenInfo.invalid();
-		return verifier;
+		return cfg.toResourceServer().validator;
 	}
 }
 
@@ -2290,4 +2288,22 @@ unittest  // BROKER: AS metadata omits the refresh_token grant (opaque tokens ar
 	auto m = authorizationServerMetadata(cfg);
 	assert(m.grantTypesSupported.canFind("authorization_code"));
 	assert(!m.grantTypesSupported.canFind("refresh_token"));
+}
+
+unittest  // BROKER: OAuthProxy.validator accepts the issued opaque token, rejects the upstream token
+{
+	auto cfg = brokerConfig();
+	cfg.tokenVerifier = (string t) {
+		TokenInfo ti;
+		ti.valid = t == "gho_upstream_secret";
+		return ti;
+	};
+	auto proxy = new OAuthProxy(cfg);
+	TokenSet upstream;
+	upstream.accessToken = "gho_upstream_secret";
+	const issued = proxy.issueClientToken(upstream);
+
+	auto v = proxy.validator();
+	assert(v(issued.token).valid);
+	assert(!v("gho_upstream_secret").valid);
 }
