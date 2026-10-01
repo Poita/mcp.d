@@ -142,13 +142,18 @@ private final class PostRequest
 	ListenSocketSlot slot;
 	McpException aborted;
 	Task owner;
+	/// Nonzero while the owning task runs the client's handler for a
+	/// server->client request read off this stream. The abort then only closes
+	/// the socket, so application code is never interrupted; the read loop
+	/// observes `aborted` once the handler returns.
+	uint inHandler;
 
 	void abort(McpException reason) @safe nothrow
 	{
 		aborted = reason;
 		if (slot !is null)
 			slot.closeSocket();
-		if (owner != Task.init && owner != Task.getThis() && owner.running)
+		if (inHandler == 0 && owner != Task.init && owner != Task.getThis() && owner.running)
 			owner.interrupt();
 	}
 
@@ -1222,9 +1227,14 @@ final class HttpClientTransport : ClientTransport
 				err = errorFrom(msg.error);
 			break;
 		case MessageKind.request:
-			dispatch(msg);
-			break;
 		case MessageKind.notification:
+			auto slot = expectId in inflightPosts;
+			PostRequest req = slot is null ? null : *slot;
+			if (req !is null)
+				req.inHandler++;
+			scope (exit)
+				if (req !is null)
+					req.inHandler--;
 			dispatch(msg);
 			break;
 		}

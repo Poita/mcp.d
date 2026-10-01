@@ -543,3 +543,71 @@ unittest
 			"observed concurrency exceeded the cap: peak=" ~ peak.to!string
 			~ " cap=" ~ cap.to!string);
 }
+
+// A 2025-era server->client request (here `roots/list`) arrives on the response
+// stream of the `tools/call` that triggered it, and the server withholds the call's
+// result until the client answers. The time the client's own handler spends
+// answering must not count against the outer request's `requestTimeout`, and the
+// handler must run to completion rather than being interrupted by an abort.
+unittest
+{
+	import mcp.protocol.types : ListRootsResult, Root;
+
+	auto server = McpServer.stateful("handler-timeout", "1.0.0");
+	Tool tool;
+	tool.name = "roots";
+	tool.description = "Asks the client for its roots";
+	server.registerTool(tool, (Json args, RequestContext ctx) @safe {
+		const n = ctx.listRoots().roots.length;
+		return CallToolResult([Content.makeText(n.to!string)]);
+	});
+
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	bool handlerFinished;
+	string text;
+	string failure;
+
+	void delegate() @safe nothrow body_ = () @safe nothrow{
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				() @trusted { listener.stopListening(); }();
+			const port = listener.bindAddresses[0].port;
+			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
+
+			ClientSettings s;
+			s.requestTimeout = 300.msecs;
+			auto client = McpClient.http(url, s);
+			scope (exit)
+				closeQuietly(client);
+			client.onListRoots = () @safe {
+				sleep(700.msecs);
+				handlerFinished = true;
+				ListRootsResult r;
+				r.roots = [Root("file:///a")];
+				return r;
+			};
+			client.initialize("2025-11-25");
+			auto res = client.callTool("roots", Json.emptyObject);
+			if (res.content.length)
+				text = res.content[0].text;
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	};
+
+	runTask(body_);
+	runEventLoop();
+
+	assert(handlerFinished, "the roots handler was interrupted");
+	assert(failure.length == 0, "the call failed while the client handler ran: " ~ failure);
+	assert(text == "1", "unexpected tool result: " ~ text);
+}

@@ -303,6 +303,8 @@ private final class InFlightRequest
 	bool armed;
 	string progressKey; // the request's progress token rendered as JSON, or empty
 	McpException abortReason;
+	void* owner; // the fiber awaiting the response
+	uint paused; // server->client handlers currently running on this request's behalf
 }
 
 /// Configuration for the client side of the MCP Events extension: how the
@@ -3127,6 +3129,7 @@ final class McpClient : ClientProtocol
 		import vibe.core.core : createTimer;
 
 		auto req = new InFlightRequest;
+		req.owner = currentFiberKey();
 		if (params.type == Json.Type.object && "_meta" in params
 				&& params["_meta"].type == Json.Type.object && "progressToken" in params["_meta"])
 			req.progressKey = params["_meta"]["progressToken"].toString();
@@ -3166,7 +3169,7 @@ final class McpClient : ClientProtocol
 		import std.conv : to;
 
 		auto r = id in inFlight_;
-		if (r is null || (*r).abortReason !is null)
+		if (r is null || (*r).abortReason !is null || (*r).paused)
 			return;
 		abortRequest(id, new RequestTimeoutException(
 				"Request " ~ id.to!string ~ " timed out after " ~ requestTimeout_.toString()),
@@ -3192,7 +3195,41 @@ final class McpClient : ClientProtocol
 		if (!resetTimeoutOnProgress_ || progressKey.length == 0)
 			return;
 		foreach (r; inFlight_.byValue)
-			if (r.armed && r.progressKey == progressKey && r.abortReason is null)
+			if (r.armed && r.progressKey == progressKey && r.abortReason is null && !r.paused)
+				r.timer.rearm(requestTimeout_);
+	}
+
+	/// Stop the deadlines of the requests a server->client request may belong to
+	/// while the client's handler answers it, since the server withholds those
+	/// requests' responses until it gets the reply. A request awaited on the
+	/// current task is the one whose response stream carried the server request
+	/// (HTTP); when there is none (a shared read loop, as on stdio) the server
+	/// request cannot be attributed, so every in-flight request is paused.
+	/// Returns the paused requests for `resumeDeadlines`.
+	private InFlightRequest[] pauseDeadlines() @safe nothrow
+	{
+		InFlightRequest[] related;
+		const self = currentFiberKey();
+		foreach (r; inFlight_.byValue)
+			if (r.owner is self)
+				related ~= r;
+		if (related.length == 0)
+			foreach (r; inFlight_.byValue)
+				related ~= r;
+		foreach (r; related)
+		{
+			if (r.paused++ == 0 && r.armed)
+				r.timer.stop();
+		}
+		return related;
+	}
+
+	/// Restart, with a full `requestTimeout`, the deadlines `pauseDeadlines`
+	/// stopped once no handler holds them paused.
+	private void resumeDeadlines(InFlightRequest[] paused) @safe nothrow
+	{
+		foreach (r; paused)
+			if (--r.paused == 0 && r.armed && r.abortReason is null)
 				r.timer.rearm(requestTimeout_);
 	}
 
@@ -3808,6 +3845,9 @@ final class McpClient : ClientProtocol
 		import vibe.core.core : runTask;
 
 		Json response;
+		auto paused = pauseDeadlines();
+		scope (exit)
+			resumeDeadlines(paused);
 		try
 		{
 			Json result = dispatchServerMethod(msg.method, msg.params);
