@@ -17,8 +17,10 @@ enum ErrorCode : int
 	// MCP-specific
 	resourceNotFound = -32002,
 	requestCancelled = -32800,
-	// MCP-allocated codes live in -32020..-32099 (sequential from -32020). The
-	// values below are emitted only to modern peers.
+	// MCP-allocated codes sit in JSON-RPC's implementation-defined server range
+	// [-32000,-32099]. Core modern-protocol codes are allocated sequentially from
+	// -32020 and are emitted only to modern peers; the Events extension's
+	// general-purpose codes below use -32011..-32015.
 	// Streamable HTTP: header/body validation failure.
 	headerMismatch = -32020,
 	// basic/lifecycle (MissingRequiredClientCapabilityError): processing a request
@@ -36,11 +38,10 @@ enum ErrorCode : int
 	// server's `sampling/createMessage` request. Not a JSON-RPC reserved code;
 	// the spec assigns this conventional value.
 	userRejected = -1,
-	// General-purpose codes introduced by the MCP Events extension, carried in
-	// the JSON-RPC implementation-defined server range [-32000,-32099] alongside
-	// -32001/-32003/-32004. Each spans a family of conditions, conveying the
-	// specifics through a typed `data` payload (the -32004 pattern). Named for
-	// reuse across MCP rather than scoped to events.
+	// General-purpose codes introduced by the MCP Events extension. Each spans a
+	// family of conditions, conveying the specifics through a typed `data`
+	// payload (the -32004 pattern). Named for reuse across MCP rather than scoped
+	// to events.
 	notFound = -32011, /// referenced entity does not exist (data.kind disambiguates)
 	forbidden = -32012, /// principal not permitted, or access revoked
 	resourceExhausted = -32013, /// a server-imposed limit/quota was reached
