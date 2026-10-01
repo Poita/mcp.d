@@ -330,10 +330,11 @@ void runStdio(McpServer server, ServerSettings settings)
 /// and never closed, so a caller that keeps running after `runStdio` returns
 /// inherits an open, blocking stdin/stdout.
 ///
-/// On POSIX, while the transport runs fd 1 points at stderr (the transport writes
-/// through its own dup), so a stray `writeln` or a stdout logger in a handler
-/// shows up on stderr rather than corrupting the JSON-RPC stream. fd 1 is pointed
-/// back at the real stdout on return.
+/// While the transport runs, fd 1 points at stderr (the transport writes through
+/// its own dup; on Windows the process standard output handle is redirected too),
+/// so a stray `writeln` or a stdout logger in a handler shows up on stderr rather
+/// than corrupting the JSON-RPC stream. fd 1 is pointed back at the real stdout on
+/// return.
 ///
 /// stdin (fd 0) and stdout (fd 1) are adopted as vibe-async pipes
 /// (`eventDriver.pipes.adopt`, the same mechanism `vibe.core.process` uses for a
@@ -722,6 +723,75 @@ version (Posix) private struct FdDiversion
 	}
 }
 
+// The C runtime's descriptor calls, declared at module scope so they get C linkage.
+version (Windows)
+{
+	private extern (C) nothrow @nogc
+	{
+		int _dup(int fd) @trusted;
+		int _dup2(int fd1, int fd2) @trusted;
+		int _close(int fd) @trusted;
+		ptrdiff_t _get_osfhandle(int fd) @trusted;
+	}
+}
+
+/// Windows counterpart of the POSIX `FdDiversion`: points C runtime descriptor
+/// `fd` at the file `to` refers to and updates the matching process standard
+/// handle, so both CRT writes (`writeln`, loggers) and `GetStdHandle` users are
+/// diverted. `restore` points both back at the original file.
+version (Windows) private struct FdDiversion
+{
+	private int fd = -1;
+	private int saved = -1;
+
+	/// Save a dup of `fd`, then make `fd` refer to the file `to` refers to.
+	static FdDiversion divert(int fd, int to) @safe
+	{
+		FdDiversion d;
+		const saved = _dup(fd);
+		if (saved == -1)
+			return d;
+		if (_dup2(to, fd) == -1)
+		{
+			cast(void) _close(saved);
+			return d;
+		}
+		d.fd = fd;
+		d.saved = saved;
+		syncStdHandle(fd);
+		return d;
+	}
+
+	/// Point the diverted descriptor back at its original file.
+	void restore() @safe
+	{
+		if (saved == -1)
+			return;
+		cast(void) _dup2(saved, fd);
+		cast(void) _close(saved);
+		saved = -1;
+		syncStdHandle(fd);
+	}
+
+	/// Make the process standard handle for CRT descriptor `fd` (0-2) match the
+	/// OS handle the descriptor now holds.
+	private static void syncStdHandle(int fd) @safe
+	{
+		import core.sys.windows.windef : HANDLE, DWORD;
+		import core.sys.windows.winbase : SetStdHandle, STD_INPUT_HANDLE,
+			STD_OUTPUT_HANDLE, STD_ERROR_HANDLE;
+
+		if (fd < 0 || fd > 2)
+			return;
+		const DWORD[3] ids = [
+			STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+		];
+		const h = _get_osfhandle(fd);
+		if (h != -1)
+			() @trusted { SetStdHandle(ids[fd], cast(HANDLE) h); }();
+	}
+}
+
 /// Owns the dup()'d, vibe-adopted copies of fd 0/1 plus the saved descriptor flags
 /// of the real fd 0/1, encapsulating runStdio's fd lifecycle ceremony.
 ///
@@ -830,33 +900,71 @@ version (Posix)
 /// pump thread); `release` closes the read channel so the read loop ends. The
 /// real stdin/stdout handles are never closed, so code running after `runStdio`
 /// still inherits them.
+///
+/// The transport writes through its own duplicate of the stdout handle while
+/// stdout itself (CRT fd 1 and the process standard handle) points at stderr, so
+/// a stray `writeln` or a stdout logger in a handler shows up on stderr rather
+/// than corrupting the JSON-RPC stream. Both are pointed back on `release`.
 else version (Windows)
 	private struct AdoptedStdio
 {
+	import core.sys.windows.windef : HANDLE;
+
 	StdioEnd inFD;
 	StdioEnd outFD;
+	private HANDLE outDup;
+	private FdDiversion stdoutDiversion;
 
 	static AdoptedStdio acquire() @safe
 	{
-		import core.sys.windows.winbase : GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE;
+		import core.sys.windows.windef : FALSE;
+		import core.sys.windows.winbase : GetStdHandle, GetCurrentProcess,
+			DuplicateHandle, CloseHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE;
+		import core.sys.windows.winnt : DUPLICATE_SAME_ACCESS;
 
 		AdoptedStdio a;
 		auto hIn = () @trusted { return GetStdHandle(STD_INPUT_HANDLE); }();
 		auto hOut = () @trusted { return GetStdHandle(STD_OUTPUT_HANDLE); }();
+		// Diverting fd 1 closes the handle it held, which is `hOut` itself, so
+		// the transport needs its own duplicate to keep writing to the real stdout.
+		const duplicated = () @trusted {
+			auto proc = GetCurrentProcess();
+			return DuplicateHandle(proc, hOut, proc, &a.outDup, 0, FALSE, DUPLICATE_SAME_ACCESS) != 0;
+		}();
 		a.inFD = StdioEnd.adoptRead(hIn);
-		a.outFD = StdioEnd.adoptWrite(hOut);
+		a.outFD = StdioEnd.adoptWrite(duplicated ? a.outDup : hOut);
 		if (!a.inFD.valid() || !a.outFD.valid())
 		{
 			a.inFD.releaseRef();
+			if (duplicated)
+				() @trusted { CloseHandle(a.outDup); }();
 			throw new Exception("runStdio: failed to acquire Windows stdin/stdout handles");
 		}
+		if (duplicated)
+		{
+			() @trusted { import core.stdc.stdio : fflush, stdout;
+
+			fflush(stdout); }();
+			a.stdoutDiversion = FdDiversion.divert(1, 2);
+		}
+		else
+			a.outDup = null;
 		return a;
 	}
 
 	void release() @safe
 	{
+		import core.sys.windows.winbase : CloseHandle;
+
+		() @trusted { import core.stdc.stdio : fflush, stdout;
+
+		fflush(stdout); }();
+		stdoutDiversion.restore();
 		inFD.releaseRef();
 		outFD.releaseRef();
+		if (outDup !is null)
+			() @trusted { CloseHandle(outDup); }();
+		outDup = null;
 	}
 }
 
@@ -1320,6 +1428,50 @@ version (Posix) unittest  // FdDiversion sends writes on the diverted fd elsewhe
 
 	diversion.restore();
 	() @trusted { write(fd, "frame".ptr, 5); }();
+	assert(readSome(protocol[0]) == "frame", "restore must point the fd back at its original");
+}
+
+version (Windows) version (unittest)
+{
+	private extern (C) nothrow @nogc
+	{
+		int _pipe(int* pfds, uint psize, int textmode);
+		int _read(int fd, void* buf, uint count);
+		int _write(int fd, const(void)* buf, uint count);
+	}
+}
+
+version (Windows) unittest  // FdDiversion sends writes on the diverted fd elsewhere, then restores it
+{
+	enum O_BINARY = 0x8000;
+	int[2] protocol, diag;
+	assert(() @trusted {
+		return _pipe(protocol.ptr, 256, O_BINARY) == 0 && _pipe(diag.ptr, 256, O_BINARY) == 0;
+	}());
+	// `fd` models fd 1: a descriptor that initially writes to the protocol pipe.
+	const fd = _dup(protocol[1]);
+	scope (exit)
+	{
+		cast(void) _close(fd);
+		cast(void) _close(protocol[0]);
+		cast(void) _close(protocol[1]);
+		cast(void) _close(diag[0]);
+		cast(void) _close(diag[1]);
+	}
+
+	string readSome(int from) @trusted
+	{
+		char[16] buf;
+		const n = _read(from, buf.ptr, cast(uint) buf.length);
+		return n > 0 ? buf[0 .. n].idup : "";
+	}
+
+	auto diversion = FdDiversion.divert(fd, diag[1]);
+	assert(() @trusted { return _write(fd, "stray".ptr, 5); }() == 5);
+	assert(readSome(diag[0]) == "stray", "a diverted write must reach the diagnostic fd");
+
+	diversion.restore();
+	assert(() @trusted { return _write(fd, "frame".ptr, 5); }() == 5);
 	assert(readSome(protocol[0]) == "frame", "restore must point the fd back at its original");
 }
 
