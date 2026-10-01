@@ -288,19 +288,25 @@ Nullable!CacheHint parseCacheHint(Json result) @safe
 		return Nullable!CacheHint.init;
 	auto ttl = result["ttlMs"];
 	CacheHint hint;
-	long ttlMs;
-	if (ttl.type == Json.Type.int_)
-		ttlMs = ttl.get!long;
-	else if (ttl.type == Json.Type.float_)
-		ttlMs = cast(long) ttl.get!double;
-	else
-		return Nullable!CacheHint.init;
 	// Spec (`CacheableResult`): `ttlMs` MUST be >= 0; clamp defensively on read
 	// so values round-tripped through this SDK honour the constraint even if a
-	// non-conforming peer emitted a negative value. The wire field is
-	// milliseconds; store as a typed Duration.
-	if (ttlMs < 0)
-		ttlMs = 0;
+	// non-conforming peer emitted a negative value. The upper clamp keeps the
+	// millisecond-to-Duration conversion from overflowing into a negative TTL.
+	enum long maxTtlMs = Duration.max.total!"msecs";
+	long ttlMs;
+	if (ttl.type == Json.Type.int_)
+	{
+		const v = ttl.get!long;
+		ttlMs = v < 0 ? 0 : v > maxTtlMs ? maxTtlMs : v;
+	}
+	else if (ttl.type == Json.Type.float_)
+	{
+		const v = ttl.get!double;
+		// `!(v > 0)` also catches NaN.
+		ttlMs = !(v > 0) ? 0 : v >= maxTtlMs ? maxTtlMs : cast(long) v;
+	}
+	else
+		return Nullable!CacheHint.init;
 	hint.ttl = ttlMs.msecs;
 	if ("cacheScope" in result && result["cacheScope"].type == Json.Type.string)
 	{
@@ -485,6 +491,24 @@ unittest  // parseCacheHint clamps a negative ttlMs to a zero Duration on read
 	auto h = parseCacheHint(r);
 	assert(!h.isNull);
 	assert(h.get.ttl == Duration.zero);
+}
+
+unittest  // parseCacheHint clamps a huge integer ttlMs to the largest Duration
+{
+	Json r = Json.emptyObject;
+	r["ttlMs"] = long.max;
+	auto h = parseCacheHint(r);
+	assert(!h.isNull);
+	assert(h.get.ttl > Duration.zero);
+}
+
+unittest  // parseCacheHint clamps a huge float ttlMs to the largest Duration
+{
+	Json r = Json.emptyObject;
+	r["ttlMs"] = 1e30;
+	auto h = parseCacheHint(r);
+	assert(!h.isNull);
+	assert(h.get.ttl > Duration.zero);
 }
 
 unittest  // parseCacheHint clamps a negative float ttlMs to a zero Duration on read
