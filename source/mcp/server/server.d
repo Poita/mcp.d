@@ -196,6 +196,12 @@ final class McpServer : ServerCore
 	private RegisteredResource[string] resources;
 	private RegisteredTemplate[] templates;
 	private RegisteredPrompt[string] prompts;
+	// Set once a tool / resource / prompt has been removed, so the capability a
+	// client may already have seen stays advertised (and its methods answer with
+	// an empty list) after the registry empties.
+	private bool toolsDeclared_;
+	private bool resourcesDeclared_;
+	private bool promptsDeclared_;
 	private CompleteResult delegate(CompleteRequest request) @safe typedCompletionHandler;
 	/// Per-argument completers keyed by "<ref-key>\0<argumentName>", so a consumer
 	/// can register one completer per (reference, argument) instead of hand-routing
@@ -565,6 +571,7 @@ final class McpServer : ServerCore
 		if ((name in tools) is null)
 			return false;
 		tools.remove(name);
+		toolsDeclared_ = true;
 		return true;
 	}
 
@@ -578,6 +585,7 @@ final class McpServer : ServerCore
 		if ((uri in resources) is null)
 			return false;
 		resources.remove(uri);
+		resourcesDeclared_ = true;
 		return true;
 	}
 
@@ -590,6 +598,7 @@ final class McpServer : ServerCore
 		if ((name in prompts) is null)
 			return false;
 		prompts.remove(name);
+		promptsDeclared_ = true;
 		return true;
 	}
 
@@ -871,6 +880,7 @@ final class McpServer : ServerCore
 		if (i < 0)
 			return false;
 		templates = templates.remove(i);
+		resourcesDeclared_ = true;
 		return true;
 	}
 
@@ -1778,17 +1788,17 @@ final class McpServer : ServerCore
 	ServerCapabilities capabilities() const @safe
 	{
 		ServerCapabilities caps;
-		if (tools.length > 0 || toolListChangedEnabled)
+		if (tools.length > 0 || toolListChangedEnabled || toolsDeclared_)
 			caps.tools = ListChangedCapability(toolListChangedEnabled);
 		// A server declaring the Skills extension serves skill files through
 		// resources/read, so it declares `resources` even before its first skill
 		// (and so its first resource) is registered.
 		const skillsEnabled = skillIndex_ !is null && skillIndex_.enabled;
-		if (resources.length > 0 || templates.length > 0
+		if (resources.length > 0 || templates.length > 0 || resourcesDeclared_
 				|| effectiveResourceSubscriptions() || resourcesListChangedEnabled || skillsEnabled)
 			caps.resources = ResourcesCapability(effectiveResourceSubscriptions(),
 					resourcesListChangedEnabled);
-		if (prompts.length > 0 || promptsListChangedEnabled)
+		if (prompts.length > 0 || promptsListChangedEnabled || promptsDeclared_)
 			caps.prompts = ListChangedCapability(promptsListChangedEnabled);
 		if (typedCompletionHandler !is null || argumentCompleters.length)
 			caps.completions = true;
@@ -6446,6 +6456,25 @@ version (unittest) private Message stdioListenReq(long id, Json meta = Json.unde
 	return Message(makeRequest(Json(id), "subscriptions/listen", params));
 }
 
+unittest  // removing the last tool, resource or prompt keeps its capability and list method
+{
+	auto s = makeTestServer();
+	Resource r = {uri: "u", name: "u"};
+	s.registerResource(r, () @safe => ResourceContents.makeText("u", "text/plain", "x"));
+	Prompt pr = {name: "p"};
+	s.registerPrompt(pr, (Json) @safe => GetPromptResult.init);
+	assert(s.removeTool("add"));
+	assert(s.removeResource("u"));
+	assert(s.removePrompt("p"));
+	auto caps = s.capabilities();
+	assert(!caps.tools.isNull && !caps.resources.isNull && !caps.prompts.isNull);
+	foreach (i, m; ["tools/list", "resources/list", "prompts/list"])
+	{
+		auto resp = s.handle(req(i, m)).get;
+		assert("error" !in resp, m);
+	}
+}
+
 unittest  // notify() on stdio honours the listen stream's filter
 {
 	auto s = new McpServer("t", "1");
@@ -6457,7 +6486,7 @@ unittest  // notify() on stdio honours the listen stream's filter
 	assert(sink.length == 1); // the acknowledgement
 	assert(s.notify("notifications/prompts/list_changed") == 0);
 	assert(s.notify("notifications/resources/updated", Json([
-				"uri": Json("note:///x")
+		"uri": Json("note:///x")
 	])) == 0);
 	assert(sink.length == 1);
 	assert(s.notify("notifications/tools/list_changed") == 1);
