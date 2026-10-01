@@ -118,15 +118,15 @@ McpClient connectFromArgs(string[] args, string siblingServerName) @safe
 
 /// Run the example `server` with the transport selected by command-line `args`.
 /// If `--http` (a bool flag) is present, serve Streamable HTTP via
-/// `runStreamableHttp(server, port, host)` using `--port` (default
-/// `defaultPort`) and `--host` (default `defaultHost`); otherwise serve stdio
-/// via `runStdio(server)`. Blocks until the chosen transport exits.
+/// `runStreamableHttp` on `--port` (default `defaultPort`) and `--host`
+/// (default `defaultHost`); otherwise serve stdio via `runStdio(server)`.
+/// Blocks until the chosen transport exits.
 void runServerFromArgs(McpServer server, string[] args, ushort defaultPort,
 		string defaultHost = "127.0.0.1") @safe
 {
 	import std.getopt : getopt;
 	import mcp.transport.stdio : runStdio;
-	import mcp.transport.streamable_http : runStreamableHttp;
+	import mcp.transport.streamable_http : runStreamableHttp, StreamableHttpOptions;
 
 	bool http;
 	ushort port = defaultPort;
@@ -139,13 +139,18 @@ void runServerFromArgs(McpServer server, string[] args, ushort defaultPort,
 	})();
 
 	if (http)
-		runStreamableHttp(server, port, host);
+	{
+		StreamableHttpOptions opts;
+		opts.port = port;
+		opts.bindAddresses = [host];
+		runStreamableHttp(server, opts);
+	}
 	else
 		runStdio(server);
 }
 
 /// Parse the HTTP-only `--port`/`--host` surface from `args`, returning the bind
-/// host/port through `port`/`host`. When the caller left `opts.bindAddresses` at
+/// host/port through `port`/`host` and setting `opts.port`. When the caller left `opts.bindAddresses` at
 /// the SDK default (`["127.0.0.1"]`) or empty, the parsed `--host` is written
 /// into `opts.bindAddresses` so the `--host` flag actually drives the bind; an
 /// explicitly customised `bindAddresses` is left untouched. Split out from
@@ -166,6 +171,7 @@ void parseHttpServerArgs(string[] args, ushort defaultPort, ref StreamableHttpOp
 		getopt(args, "port|p", "Streamable HTTP listen port.", &port,
 			"host|h", "Streamable HTTP bind host.", &host);
 	})();
+	opts.port = port;
 
 	// Honour `--host` unless the caller pinned a non-default bind set: a default or
 	// empty `bindAddresses` is replaced by the parsed host so the flag takes effect.
@@ -180,7 +186,7 @@ void parseHttpServerArgs(string[] args, ushort defaultPort, ref StreamableHttpOp
 /// Parses just `--port`/`--host` (via `parseHttpServerArgs`), lets the parsed
 /// host drive `opts.bindAddresses`, writes the resolved bind host/port back
 /// through `port`/`host` (so the caller can derive its RFC 8707 resource audience
-/// from the actual socket), then calls `runStreamableHttp(server, port, opts)`.
+/// from the actual socket), then calls `runStreamableHttp(server, opts)`.
 /// Blocks until the transport exits.
 void runHttpServerFromArgs(McpServer server, string[] args, ushort defaultPort,
 		ref StreamableHttpOptions opts, out ushort port, out string host,
@@ -189,7 +195,7 @@ void runHttpServerFromArgs(McpServer server, string[] args, ushort defaultPort,
 	import mcp.transport.streamable_http : runStreamableHttp;
 
 	parseHttpServerArgs(args, defaultPort, opts, port, host, defaultHost);
-	runStreamableHttp(server, port, opts);
+	runStreamableHttp(server, opts);
 }
 
 @safe unittest

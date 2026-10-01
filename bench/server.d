@@ -22,7 +22,7 @@ import vibe.http.server : HTTPServerSettings, HTTPServerOption, listenHTTP;
 import mcp.api.attributes : tool;
 import mcp.api.reflection : registerModule;
 import mcp.server.server : McpServer;
-import mcp.transport.streamable_http : mountMcp, runStreamableHttp;
+import mcp.transport.streamable_http : mountMcp, runStreamableHttp, StreamableHttpOptions;
 
 /// The smallest possible tool: add two integers. Keeps the handler cost near
 /// zero so the benchmark isolates client+server transport throughput.
@@ -49,7 +49,10 @@ void main(string[] args) @safe
 	{
 		auto server = new McpServer("bench-server", "1.0.0");
 		registerModule!(bench_server)(server);
-		runStreamableHttp(server, port, host);
+		StreamableHttpOptions opts;
+		opts.port = port;
+		opts.bindAddresses = [host];
+		runStreamableHttp(server, opts);
 		return;
 	}
 

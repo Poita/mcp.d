@@ -101,7 +101,7 @@ the HTTP transport from `--url`. On the server side the scaffold's HTTP-only
 `StreamableHttpOptions.bindAddresses`) and hands back the resolved host/port so
 `main` can derive the RFC 8707 resource audience from the actual socket; `main`
 then sets `StreamableHttpOptions.auth` and calls `runStreamableHttp(server,
-port, opts)` directly. There is deliberately no stdio fallback: an OAuth
+opts)` directly. There is deliberately no stdio fallback: an OAuth
 resource server must never silently degrade to an unauthenticated transport.
 
 ## Run it (two terminals / CI two-step)

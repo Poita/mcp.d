@@ -79,11 +79,12 @@ void main(string[] args)
 	});
 
 	StreamableHttpOptions opts;
+	opts.port = port;
 	opts.bindAddresses = [host];
 	() @trusted {
 		stderr.writefln("conformance-server listening on http://%s:%d/mcp", host, port);
 	}();
-	runStreamableHttp(server, port, opts);
+	runStreamableHttp(server, opts);
 }
 
 /// A tool that echoes its `text` argument back as text content.

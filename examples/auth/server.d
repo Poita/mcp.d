@@ -144,5 +144,5 @@ void main(string[] args)
 		stderr.writefln("auth-example server listening on http://%s:%d/mcp", host, port);
 		stderr.writefln("  PRM: http://%s:%d/.well-known/oauth-protected-resource", host, port);
 	}();
-	runStreamableHttp(server, port, opts);
+	runStreamableHttp(server, opts);
 }

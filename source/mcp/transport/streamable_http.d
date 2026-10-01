@@ -2443,13 +2443,53 @@ McpException postProtocolVersionGate(string protoHeader, const(ProtocolVersion)[
 }
 
 /// Whether a `Host` header value (e.g. "127.0.0.1:3000") is localhost or listed.
+/// Host names compare case-insensitively. A listed entry without a port accepts
+/// its host on any port, as the loopback check does; an entry with a port
+/// accepts only that port.
 package bool hostAllowed(string host, const string[] extra) @safe
 {
-	import std.algorithm : canFind;
+	import std.uni : sicmp;
 
-	if (extra.canFind(host))
-		return true;
-	return isLoopbackHostname(stripPort(host));
+	string name, port;
+	splitHostPort(host, name, port);
+	foreach (entry; extra)
+	{
+		string entryName, entryPort;
+		splitHostPort(entry, entryName, entryPort);
+		if (entryName.length && sicmp(entryName, name) == 0
+				&& (entryPort.length == 0 || entryPort == port))
+			return true;
+	}
+	return isLoopbackHostname(name);
+}
+
+/// Split a `host[:port]` value into its host name and port ("" when absent). A
+/// bracketed IPv6 literal loses its brackets; an unbracketed value with more
+/// than one colon is a bare IPv6 address with no port.
+private void splitHostPort(string value, out string name, out string port) @safe
+{
+	import std.algorithm : count;
+	import std.string : indexOf, lastIndexOf;
+
+	if (value.length && value[0] == '[')
+	{
+		const close = value.indexOf(']');
+		if (close >= 0)
+		{
+			name = value[1 .. close];
+			if (close + 1 < value.length && value[close + 1] == ':')
+				port = value[close + 2 .. $];
+			return;
+		}
+	}
+	const colon = value.lastIndexOf(':');
+	if (colon >= 0 && value.count(':') == 1)
+	{
+		name = value[0 .. colon];
+		port = value[colon + 1 .. $];
+		return;
+	}
+	name = value;
 }
 
 /// Whether an `Origin` header value (e.g. "http://localhost:3000") is localhost
@@ -2494,7 +2534,9 @@ private string stripPort(string hostport) @safe
 
 private bool isLoopbackHostname(string h) @safe
 {
-	return h == "localhost" || h == "127.0.0.1" || h == "::1";
+	import std.uni : sicmp;
+
+	return sicmp(h, "localhost") == 0 || h == "127.0.0.1" || h == "::1";
 }
 
 /// Whether the server is bound to a public (non-loopback) address while accepting
@@ -2511,13 +2553,13 @@ private bool publicBindWithoutAllowlist(const string[] bindAddresses, const stri
 }
 
 /// Translate the transport-level `opts` into a vibe.d `HTTPServerSettings`:
-/// listen address, plus access logging when `opts.accessLog` is set (to
-/// `opts.accessLogFile` if given, otherwise the console). Access logging stays
-/// off unless explicitly opted in.
-private HTTPServerSettings buildStreamableHttpSettings(ushort port, StreamableHttpOptions opts) @safe
+/// listen port and addresses, plus access logging when `opts.accessLog` is set
+/// (to `opts.accessLogFile` if given, otherwise the console). Access logging
+/// stays off unless explicitly opted in.
+private HTTPServerSettings buildStreamableHttpSettings(StreamableHttpOptions opts) @safe
 {
 	auto settings = new HTTPServerSettings;
-	settings.port = port;
+	settings.port = opts.port;
 	settings.bindAddresses = opts.bindAddresses;
 	// Every body-reading route enforces `opts.maxRequestBytes` itself so an
 	// oversized body gets a JSON-RPC error instead of vibe's plain-text 400. The
@@ -2534,10 +2576,10 @@ private HTTPServerSettings buildStreamableHttpSettings(ushort port, StreamableHt
 	return settings;
 }
 
-/// Start a standalone Streamable HTTP server for `server` on `port` and run the
-/// vibe.d event loop. Blocks until the application exits.
-void runStreamableHttp(McpServer server, ushort port,
-		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
+/// Start a standalone Streamable HTTP server for `server` fully described by
+/// `opts` (listening on `opts.port`) and run the vibe.d event loop. Blocks until
+/// the application exits.
+void runStreamableHttp(McpServer server, StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
 	import vibe.core.core : runEventLoop, lowerPrivileges;
 	import vibe.core.log : logWarn;
@@ -2552,7 +2594,7 @@ void runStreamableHttp(McpServer server, ushort port,
 	auto router = new URLRouter;
 	mountMcp(router, server, opts);
 
-	auto settings = buildStreamableHttpSettings(port, opts);
+	auto settings = buildStreamableHttpSettings(opts);
 	auto listener = listenHTTP(settings, router);
 	scope (exit)
 		listener.stopListening();
@@ -2561,22 +2603,13 @@ void runStreamableHttp(McpServer server, ushort port,
 	runEventLoop();
 }
 
-/// Convenience: start a Streamable HTTP server for `server` on `port`, bound to
-/// a single `host`. Sets `StreamableHttpOptions.bindAddresses = [host]` and
-/// forwards to `runStreamableHttp(server, port, opts)`. Blocks until exit.
-void runStreamableHttp(McpServer server, ushort port, string host) @safe
+/// Convenience: serve `server` on `port` with every other option at its
+/// default. Blocks until exit.
+void runStreamableHttp(McpServer server, ushort port) @safe
 {
 	StreamableHttpOptions opts;
-	opts.bindAddresses = [host];
-	runStreamableHttp(server, port, opts);
-}
-
-/// Start a Streamable HTTP server fully described by `opts` (listening on
-/// `opts.port`). The single-struct form of `runStreamableHttp`, used by the
-/// `ServerSettings`-based entry point. Blocks until exit.
-void runStreamableHttp(McpServer server, StreamableHttpOptions opts) @safe
-{
-	runStreamableHttp(server, opts.port, opts);
+	opts.port = port;
+	runStreamableHttp(server, opts);
 }
 
 /// Serve `server` over Streamable HTTP using `settings.http`. Blocks until exit.
@@ -2610,7 +2643,7 @@ unittest  // accessLog routes per-request lines to the console
 {
 	StreamableHttpOptions opts;
 	opts.accessLog = true;
-	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
+	auto settings = buildStreamableHttpSettings(opts);
 	assert(settings.accessLogToConsole);
 	assert(settings.accessLogFile == "");
 }
@@ -2620,7 +2653,7 @@ unittest  // accessLogFile sends lines to the file instead of the console
 	StreamableHttpOptions opts;
 	opts.accessLog = true;
 	opts.accessLogFile = "/var/log/mcp.log";
-	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
+	auto settings = buildStreamableHttpSettings(opts);
 	assert(!settings.accessLogToConsole);
 	assert(settings.accessLogFile == "/var/log/mcp.log");
 }
@@ -2629,7 +2662,7 @@ unittest  // accessLogFile alone (without accessLog) emits nothing
 {
 	StreamableHttpOptions opts;
 	opts.accessLogFile = "/var/log/mcp.log";
-	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
+	auto settings = buildStreamableHttpSettings(opts);
 	assert(!settings.accessLogToConsole);
 	assert(settings.accessLogFile == "");
 }
@@ -2637,23 +2670,36 @@ unittest  // accessLogFile alone (without accessLog) emits nothing
 unittest  // port and bind addresses still flow through unchanged
 {
 	StreamableHttpOptions opts;
+	opts.port = 9090;
 	opts.bindAddresses = ["0.0.0.0"];
-	auto settings = buildStreamableHttpSettings(cast(ushort) 9090, opts);
+	auto settings = buildStreamableHttpSettings(opts);
 	assert(settings.port == 9090);
 	assert(settings.bindAddresses == ["0.0.0.0"]);
 }
 
-unittest  // runStreamableHttp(server, port, host) overload exists and forwards
+unittest  // runStreamableHttp takes its port from the options, never a separate argument
 {
-	// Compile-only: a full run blocks on the event loop and isn't unit-testable.
-	// Assert the single-host overload is callable (and that the existing
-	// options overload still is, so we didn't shadow it).
+	// Compile-only: a full run blocks on the event loop. A port passed next to
+	// options would silently shadow `opts.port`, so no such overload exists.
 	static assert(__traits(compiles, (McpServer s) {
-			runStreamableHttp(s, cast(ushort) 8080, "0.0.0.0");
+			runStreamableHttp(s, StreamableHttpOptions.init);
 		}));
 	static assert(__traits(compiles, (McpServer s) {
+			runStreamableHttp(s, cast(ushort) 8080);
+		}));
+	static assert(!__traits(compiles, (McpServer s) {
 			runStreamableHttp(s, cast(ushort) 8080, StreamableHttpOptions.init);
 		}));
+	static assert(!__traits(compiles, (McpServer s) {
+			runStreamableHttp(s, cast(ushort) 8080, "0.0.0.0");
+		}));
+}
+
+unittest  // the listener binds the port named in the options
+{
+	StreamableHttpOptions opts;
+	opts.port = 9123;
+	assert(buildStreamableHttpSettings(opts).port == 9123);
 }
 
 unittest  // legacy endpoint event: `event: endpoint` carrying the message-POST URI
@@ -3140,6 +3186,27 @@ unittest  // localhost hosts are accepted, foreign hosts rejected
 	assert(hostAllowed("[::1]:8080", []));
 	assert(!hostAllowed("evil.example.com", []));
 	assert(hostAllowed("myhost", ["myhost"]));
+}
+
+unittest  // allowedHosts entries match case-insensitively
+{
+	assert(hostAllowed("MyApp.Example.com", ["myapp.example.com"]));
+	assert(hostAllowed("myapp.example.com", ["MYAPP.EXAMPLE.COM"]));
+	assert(hostAllowed("LOCALHOST:3000", []));
+}
+
+unittest  // a port-less allowedHosts entry accepts the host on any port
+{
+	assert(hostAllowed("myapp.example.com:8443", ["myapp.example.com"]));
+	assert(hostAllowed("[2001:db8::1]:8443", ["2001:db8::1"]));
+	assert(!hostAllowed("other.example.com:8443", ["myapp.example.com"]));
+}
+
+unittest  // an allowedHosts entry with a port matches only that port
+{
+	assert(hostAllowed("myapp.example.com:8443", ["myapp.example.com:8443"]));
+	assert(!hostAllowed("myapp.example.com:9000", ["myapp.example.com:8443"]));
+	assert(!hostAllowed("myapp.example.com", ["myapp.example.com:8443"]));
 }
 
 unittest  // an empty Host is rejected (closes the no-Host/no-Origin guard bypass)
@@ -4108,7 +4175,7 @@ unittest  // the listener's body cap sits above the transport's own limit
 {
 	StreamableHttpOptions opts;
 	opts.maxRequestBytes = 64;
-	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
+	auto settings = buildStreamableHttpSettings(opts);
 	assert(settings.maxRequestSize > opts.maxRequestBytes,
 			"vibe must not reject a body the transport would answer with a JSON-RPC 413");
 }
@@ -4116,7 +4183,7 @@ unittest  // the listener's body cap sits above the transport's own limit
 unittest  // the listener bounds how much of a rejected body it will drain
 {
 	StreamableHttpOptions opts;
-	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
+	auto settings = buildStreamableHttpSettings(opts);
 	assert(settings.maxRequestSize < ulong.max);
 	assert(settings.maxRequestSize <= 4 * opts.maxRequestBytes);
 }
