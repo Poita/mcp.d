@@ -99,32 +99,19 @@ final class SecureWebhookTransport : WebhookTransport
 		return request(url, HTTPMethod.GET, null, null, allowPrivate);
 	}
 
-	// One request under an overall deadline: a timer interrupts the calling task
-	// when `requestTimeout_` elapses, so a drip-fed response cannot outlive it.
-	// Only the status decides the outcome; the body is read raw (no UTF-8
-	// validation) and at most `maxWebhookResponseBytes` of it, the rest dropped
-	// with the connection.
+	// One request under the connector's overall `requestTimeout_` deadline, so a
+	// drip-fed response cannot outlive it. Only the status decides the outcome;
+	// the body is read raw (no UTF-8 validation) and at most
+	// `maxWebhookResponseBytes` of it, the rest dropped with the connection.
 	private WebhookHttpResult request(string url, HTTPMethod method,
 			string[string] headers, string body, bool allowPrivate) @safe
 	{
-		import vibe.core.core : setTimer;
-		import vibe.core.task : Task, InterruptException;
 		import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 		import mcp.protocol.ssrf : FetchOptions, secureRequestHTTP, SsrfPolicy;
 
 		const policy = allowPrivate ? SsrfPolicy.allowUserConfigured : SsrfPolicy.blockInternal;
 		WebhookHttpResult result;
-		bool answered, done;
-		auto self = Task.getThis();
-		auto deadline = setTimer(requestTimeout_, () @safe nothrow{
-			if (!done && self != Task.init)
-				self.interrupt();
-		});
-		scope (exit)
-		{
-			done = true;
-			deadline.stop();
-		}
+		bool answered;
 		try
 		{
 			secureRequestHTTP(url, policy, (scope HTTPClientRequest req) {
@@ -149,11 +136,6 @@ final class SecureWebhookTransport : WebhookTransport
 						res.statusCode);
 				answered = true;
 			}, FetchOptions(requestTimeout_));
-		}
-		catch (InterruptException)
-		{
-			if (!answered)
-				result = WebhookHttpResult.failure(DeliveryErrorCategory.timeout);
 		}
 		catch (Exception e)
 		{

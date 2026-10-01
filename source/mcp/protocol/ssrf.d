@@ -574,8 +574,6 @@ private string stripPortAndBrackets(string host) @safe pure nothrow @nogc
 /// `@safe` (DNS resolution is `@system` in `std.socket`; wrapped here).
 AddressClass classifyHost(string host, out string pinnedIp) @safe
 {
-	import std.socket : getAddressInfo, AddressFamily, SocketException;
-
 	pinnedIp = "";
 	if (host.length == 0)
 		return AddressClass.privateOrLinkLocal; // fail closed
@@ -611,41 +609,65 @@ AddressClass classifyHost(string host, out string pinnedIp) @safe
 	}
 
 	// A registered hostname: resolve and vet every returned address.
+	const res = resolveHostAddresses(bare);
+	if (res.failed || res.addresses.length == 0)
+		return AddressClass.privateOrLinkLocal; // unresolved / no usable record -> fail CLOSED
+	AddressClass worst = AddressClass.public_;
+	foreach (addr; res.addresses)
+	{
+		auto cls = classifyResolvedAddress(addr);
+		// A resolved loopback address is demoted to private/link-local: the
+		// literal-loopback dev allowance applies only to literal hosts
+		// (localhost/127.x/[::1], handled above before this DNS branch), never to
+		// a registered name an attacker can point at 127.x via DNS.
+		if (cls == AddressClass.loopback)
+			cls = AddressClass.privateOrLinkLocal;
+		// A single internal address taints the whole host (DNS-rebinding guard).
+		if (cls != AddressClass.public_)
+			worst = cls;
+	}
+	pinnedIp = res.addresses[0];
+	return worst;
+}
+
+/// The numeric A/AAAA addresses a name resolves to, or `failed` when the
+/// resolver reported an error.
+private struct Resolution
+{
+	string[] addresses;
+	bool failed;
+}
+
+/// Resolve `host` with the system resolver (`getaddrinfo`), keeping every
+/// IPv4/IPv6 address. Blocks the calling thread.
+private Resolution systemResolve(string host) @trusted nothrow
+{
+	import std.socket : getAddressInfo, AddressFamily;
+
+	Resolution r;
 	try
 	{
-		auto infos = getAddressInfo(bare);
-		string chosen;
-		AddressClass worst = AddressClass.public_;
-		bool any;
-		foreach (info; infos)
-		{
-			if (info.family != AddressFamily.INET && info.family != AddressFamily.INET6)
-				continue;
-			const addr = info.address.toAddrString();
-			auto cls = classifyResolvedAddress(addr);
-			any = true;
-			// A resolved loopback address is demoted to private/link-local: the
-			// literal-loopback dev allowance applies only to literal hosts
-			// (localhost/127.x/[::1], handled above before this DNS branch), never to
-			// a registered name an attacker can point at 127.x via DNS.
-			if (cls == AddressClass.loopback)
-				cls = AddressClass.privateOrLinkLocal;
-			// A single internal address taints the whole host (DNS-rebinding guard).
-			if (cls != AddressClass.public_)
-				worst = cls;
-			if (chosen.length == 0)
-				chosen = addr;
-		}
-		if (!any || chosen.length == 0)
-			return AddressClass.privateOrLinkLocal; // no usable record -> fail closed
-		pinnedIp = chosen;
-		return worst;
+		foreach (info; getAddressInfo(host))
+			if (info.family == AddressFamily.INET || info.family == AddressFamily.INET6)
+				r.addresses ~= info.address.toAddrString();
 	}
-	catch (SocketException)
-	{
-		pinnedIp = "";
-		return AddressClass.privateOrLinkLocal; // unresolved -> fail CLOSED
-	}
+	catch (Exception)
+		r.failed = true;
+	return r;
+}
+
+/// The resolver `classifyHost` uses for registered names.
+private __gshared Resolution function(string) @safe nothrow hostResolver = &systemResolve;
+
+/// Resolve `host` through `hostResolver` on a worker thread: the system
+/// resolver blocks, and running it on the caller's event loop would stall every
+/// other task there until it returns. The caller waits without blocking its
+/// thread.
+private Resolution resolveHostAddresses(string host) @trusted
+{
+	import vibe.core.concurrency : asyncWork;
+
+	return asyncWork(hostResolver, host).getResult();
 }
 
 // ---------------------------------------------------------------------------
@@ -789,8 +811,13 @@ struct TlsTrust
 /// Per-request knobs for `secureRequestHTTP`.
 struct FetchOptions
 {
-	/// Bound on the connect and on each read. Zero leaves vibe's defaults.
-	Duration timeout;
+	import core.time : seconds;
+
+	/// Overall bound on the request — name resolution, connect, sending, and
+	/// reading the response, however slowly the server trickles bytes — so an
+	/// unresponsive endpoint cannot hold the calling task indefinitely. Zero
+	/// removes the bound.
+	Duration timeout = 30.seconds;
 
 	/// Certificate validation for `https` URLs.
 	TlsTrust tls;
@@ -887,18 +914,56 @@ void delegate(TLSContext) @safe nothrow tlsContextSetup(TlsTrust trust) @safe
 ///
 /// An `https` server must present a certificate chaining to a trusted CA and
 /// matching the original host name; `options.tls` selects the trusted CAs.
+/// `options.timeout` bounds the whole request.
 ///
 /// Throws `invalidRequest` when the URL is unsafe under `policy` (insecure
 /// scheme for `blockInternal`/`allowLoopback`, an internal IP-literal/resolved address, or an
-/// unresolvable host — fail CLOSED). `@trusted` because the vibe HTTP client API
-/// is `@system`.
+/// unresolvable host — fail CLOSED), and `internalError` when the request
+/// times out. `@trusted` because the vibe HTTP client API is `@system`.
 void secureRequestHTTP(string url, SsrfPolicy policy,
 		scope void delegate(scope HTTPClientRequest) requester,
 		scope void delegate(scope HTTPClientResponse) responder,
 		FetchOptions options = FetchOptions.init) @trusted
 {
+	import mcp.protocol.errors : internalError;
+	import vibe.core.core : setTimer, Timer;
+	import vibe.core.task : InterruptException, Task;
+
+	// The deadline interrupts the calling task when it elapses, cutting short
+	// whichever step (resolution, connect, or a drip-fed read) is in progress.
+	// Outside a task the per-operation connect/read timeouts still apply.
+	auto self = Task.getThis();
+	bool finished, expired;
+	Timer deadline;
+	if (options.timeout > Duration.zero && self != Task.init)
+		deadline = setTimer(options.timeout, () @safe nothrow{
+			if (finished)
+				return;
+			expired = true;
+			self.interrupt();
+		});
+	scope (exit)
+	{
+		finished = true;
+		if (deadline)
+			deadline.stop();
+	}
+	try
+		fetchPinned(url, policy, requester, responder, options);
+	catch (InterruptException e)
+	{
+		if (!expired)
+			throw e;
+		throw internalError("Request timed out after " ~ options.timeout.toString());
+	}
+}
+
+/// The body of `secureRequestHTTP`: vet, pin and perform the request.
+private void fetchPinned(string url, SsrfPolicy policy,
+		scope void delegate(scope HTTPClientRequest) requester,
+		scope void delegate(scope HTTPClientResponse) responder, FetchOptions options) @trusted
+{
 	import mcp.protocol.errors : invalidRequest;
-	import std.string : indexOf;
 	import vibe.inet.url : URL;
 	import vibe.http.client : requestHTTP, HTTPClientSettings;
 
@@ -1230,6 +1295,60 @@ unittest  // classifyHost fails closed for an unresolvable hostname
 	assert(pin.length == 0);
 }
 
+unittest  // classifyHost resolves a name without stalling other tasks on the event loop
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep;
+
+	static Resolution slowResolve(string host) @trusted nothrow
+	{
+		Thread.sleep(300.msecs);
+		return Resolution(["93.184.216.34"], false);
+	}
+
+	auto saved = () @trusted { return hostResolver; }();
+	() @trusted { hostResolver = &slowResolve; }();
+	scope (exit)
+		() @trusted { hostResolver = saved; }();
+
+	int ticks;
+	bool done;
+	auto ticker = runTask(() nothrow{
+		while (!done)
+		{
+			ticks++;
+			try
+				sleep(10.msecs);
+			catch (Exception)
+			{
+			}
+		}
+	});
+	string pin;
+	const cls = classifyHost("slow.example", pin);
+	done = true;
+	ticker.join();
+	assert(cls == AddressClass.public_ && pin == "93.184.216.34");
+	assert(ticks >= 5, "other tasks must keep running while a name resolves");
+}
+
+unittest  // classifyHost fails closed when any resolved address is internal
+{
+	static Resolution mixedResolve(string host) @safe nothrow
+	{
+		return Resolution(["93.184.216.34", "10.0.0.5"], false);
+	}
+
+	auto saved = () @trusted { return hostResolver; }();
+	() @trusted { hostResolver = &mixedResolve; }();
+	scope (exit)
+		() @trusted { hostResolver = saved; }();
+
+	string pin;
+	assert(classifyHost("rebind.example", pin) == AddressClass.privateOrLinkLocal);
+}
+
 unittest  // classifyHost fails closed for an empty host
 {
 	string pin = "stale";
@@ -1448,6 +1567,75 @@ unittest  // malformed IPv6 literals fail closed; an IPv4-mapped public address 
 	// A fully-specified (no "::") public global-unicast literal fills the entire
 	// hextet area and classifies public.
 	assert(classifyHostLexical("[2606:4700:4700:1:2:3:4:5]") == AddressClass.public_);
+}
+
+unittest  // secureRequestHTTP enforces an overall deadline on a server that drip-feeds its response
+{
+	import core.time : msecs, seconds;
+	import std.conv : to;
+	import std.datetime.stopwatch : StopWatch, AutoStart;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+	import vibe.stream.operations : readAllUTF8;
+
+	string failure;
+	bool timedOut, stopDripping, handlerDone;
+	Duration elapsed;
+	runTask(() nothrow{
+		try
+		{
+			auto settings = new HTTPServerSettings();
+			settings.bindAddresses = ["127.0.0.1"];
+			settings.port = 0;
+			auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+				scope HTTPServerResponse res) @safe {
+				scope (exit)
+					handlerDone = true;
+				res.contentType = "text/plain";
+				// Each byte arrives well inside a per-read timeout; the whole body
+				// takes far longer than the request may.
+				while (!stopDripping)
+				{
+					res.bodyWriter.write("x");
+					res.bodyWriter.flush();
+					sleep(50.msecs);
+				}
+			});
+			scope (exit)
+				listener.stopListening();
+			const url = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
+
+			FetchOptions opts;
+			opts.timeout = 400.msecs;
+			auto sw = StopWatch(AutoStart.yes);
+			try
+				secureRequestHTTP(url, SsrfPolicy.allowLoopback, null,
+					(scope HTTPClientResponse res) {
+					res.bodyReader.readAllUTF8();
+				}, opts);
+			catch (Exception e)
+				timedOut = true;
+			elapsed = sw.peek();
+			// Let the server handler finish before the listener and loop go away.
+			stopDripping = true;
+			while (!handlerDone)
+				sleep(10.msecs);
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(failure.length == 0, failure);
+	assert(timedOut, "a drip-fed response must not outlive the request timeout");
+	assert(elapsed < 3.seconds, "the deadline must cut the request short");
+}
+
+unittest  // outbound fetches are bounded by a timeout unless a caller sets its own
+{
+	assert(FetchOptions.init.timeout > Duration.zero);
 }
 
 // ---------------------------------------------------------------------------
