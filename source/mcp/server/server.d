@@ -1370,21 +1370,31 @@ final class McpServer : ServerCore
 	/// channel for all server->client traffic.
 	size_t notify(string method, Json params = Json.undefined) @safe
 	{
-		size_t delivered;
-		// Stdio `subscriptions/listen` channel (2026-07-28): the single stdout channel
-		// carries notifications too, stamped with the listen request's id as the
-		// subscriptionId so the client can correlate them (2026-07-28 basic/utilities/
-		// subscriptions). This is in addition to any HTTP push channel below.
-		if (stdioListenSink !is null)
-		{
-			auto note = withListenSubscriptionId(makeNotification(method,
-					params), stdioListenSubscriptionId);
-			stdioListenSink(note.toString());
-			delivered++;
-		}
+		size_t delivered = writeStdioListen(method, params);
 		if (pushChannel !is null)
 			delivered += pushChannel.notify(method, params);
 		return delivered;
+	}
+
+	/// Write `method` to the stdio `subscriptions/listen` stream, if one is open
+	/// and its filter accepts it, stamped with the listen request's id as the
+	/// subscriptionId so the client can correlate it (2026-07-28 basic/utilities/
+	/// subscriptions). Returns the number of streams reached (0 or 1).
+	private size_t writeStdioListen(string method, Json params) @safe
+	{
+		if (stdioListenSink is null)
+			return 0;
+		string uri;
+		if (method == "notifications/resources/updated" && params.type == Json.Type.object)
+			if (auto u = "uri" in params)
+				if (u.type == Json.Type.string)
+					uri = u.get!string;
+		if (!stdioListenFilter_.accepts(method, uri))
+			return 0;
+		auto note = withListenSubscriptionId(makeNotification(method, params),
+				stdioListenSubscriptionId);
+		stdioListenSink(note.toString());
+		return 1;
 	}
 
 	/// `notify`, restricted to the streams opened by `principal` (the
@@ -1394,14 +1404,7 @@ final class McpServer : ServerCore
 	/// the only key to its result, so it must not reach other clients.
 	private size_t notifyPrincipal(string principal, string method, Json params) @safe
 	{
-		size_t delivered;
-		if (stdioListenSink !is null)
-		{
-			auto note = withListenSubscriptionId(makeNotification(method,
-					params), stdioListenSubscriptionId);
-			stdioListenSink(note.toString());
-			delivered++;
-		}
+		size_t delivered = writeStdioListen(method, params);
 		if (pushChannel !is null && principal.length)
 			delivered += pushChannel.notifyPrincipal(principal, method, params);
 		return delivered;
@@ -6441,6 +6444,24 @@ version (unittest) private Message stdioListenReq(long id, Json meta = Json.unde
 	params["notifications"] = Json(["toolsListChanged": Json(true)]);
 	params["_meta"] = meta;
 	return Message(makeRequest(Json(id), "subscriptions/listen", params));
+}
+
+unittest  // notify() on stdio honours the listen stream's filter
+{
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] sink;
+	assert(s.tryServeStdioListen(stdioListenReq(1), (string line) @safe {
+			sink ~= line;
+		}));
+	assert(sink.length == 1); // the acknowledgement
+	assert(s.notify("notifications/prompts/list_changed") == 0);
+	assert(s.notify("notifications/resources/updated", Json([
+				"uri": Json("note:///x")
+	])) == 0);
+	assert(sink.length == 1);
+	assert(s.notify("notifications/tools/list_changed") == 1);
+	assert(sink.length == 2);
 }
 
 unittest  // a second stdio subscriptions/listen closes the first with its result
