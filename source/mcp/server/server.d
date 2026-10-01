@@ -1094,13 +1094,17 @@ final class McpServer : ServerCore
 			Nullable!Duration pollInterval = Nullable!Duration.init,
 			TaskSupport support = TaskSupport.optional) @safe
 	{
-		registerTaskExecutor(descriptor.name, executor);
+		if (taskRuntime_ is null)
+			throw internalError("registerTaskTool requires enableTasks() first");
 		const toolName = descriptor.name;
 		const ttlDur = ttl;
 		const pollDur = pollInterval;
+		// The tool is registered first so a name clash throws before the
+		// executor map changes.
 		registerTool(descriptor, (Json args, RequestContext ctx) @safe {
 			return startTask(toolName, args, ctx, ttlDur, pollDur);
 		});
+		registerTaskExecutor(descriptor.name, executor);
 		setToolTaskSupport(descriptor.name, support == TaskSupport.none
 				? TaskSupport.optional : support);
 	}
@@ -7650,6 +7654,31 @@ unittest  // startTask for a 2025-era client runs inline and leaves no orphaned 
 	assert("error" !in r);
 	assert(r["result"]["content"][0]["text"].get!string == "Hello, Bob");
 	assert(storedTaskCount(s) == 0);
+}
+
+unittest  // registerTaskTool with a clashing name leaves the existing executor in place
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	Tool desc;
+	desc.name = "dup";
+	s.registerTaskTool(desc,
+			(TaskContext tc) @safe => Json([
+				"content": Json([
+					Json(["type": Json("text"), "text": Json("first")])
+				])
+	]));
+	assertThrown(s.registerTaskTool(desc,
+			(TaskContext tc) @safe => Json([
+				"content": Json([
+					Json(["type": Json("text"), "text": Json("second")])
+				])
+	])));
+	auto r = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("dup"), "arguments": Json.emptyObject]))).get;
+	assert(r["result"]["content"][0]["text"].get!string == "first");
 }
 
 unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
