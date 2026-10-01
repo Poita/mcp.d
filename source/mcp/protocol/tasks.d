@@ -85,9 +85,9 @@ TaskStatus taskStatusFromWire(string s) @safe pure nothrow
 
 /// Operational metadata about an asynchronous task (SEP-2663 `Task`).
 ///
-/// `ttlMs` is the time-to-live from creation in integer milliseconds; a null
-/// `ttlMs` means unlimited, and the field is always emitted (as `null` when
-/// unlimited). `pollIntervalMs` is the suggested polling interval and is omitted
+/// `ttlMs` is the time-to-live from creation in integer milliseconds, after
+/// which the server may delete the task whatever its status; a null `ttlMs`
+/// means unlimited, and the field is always emitted (as `null` when unlimited). `pollIntervalMs` is the suggested polling interval and is omitted
 /// when unset. `statusMessage` is an optional human-readable description of the
 /// current state.
 struct Task
