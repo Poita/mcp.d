@@ -148,8 +148,7 @@ struct ResourceLink
 		Json j = Json.emptyObject;
 		j["type"] = "resource_link";
 		j["uri"] = uri;
-		if (name.length)
-			j["name"] = name;
+		j["name"] = name; // required (`ResourceLink` extends `Resource`)
 		if (!title.isNull)
 			j["title"] = title.get;
 		if (!description.isNull)
@@ -3840,6 +3839,12 @@ unittest  // ElicitResult.accept!T serializes a struct and contentAs!T round-tri
 	assert(r.action == ElicitAction.accept);
 	auto back = r.contentAs!Booking;
 	assert(back == orig);
+}
+
+unittest  // a resource_link always carries its required name, even when empty
+{
+	auto j = Content.makeResourceLink("file:///a", "").toJson();
+	assert("name" in j && j["name"].get!string == "");
 }
 
 unittest  // ElicitResult.accept!T writes enum fields by member name
