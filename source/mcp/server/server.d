@@ -985,7 +985,10 @@ final class McpServer : ServerCore
 		onRootsListChanged_ = handler;
 	}
 
-	/// Advertise the logging capability and accept `logging/setLevel`.
+	/// Advertise the logging capability so `ctx.log` emits `notifications/message`.
+	/// A stateful server also accepts `logging/setLevel`; a stateless one has no
+	/// session to hold the level and answers it with -32601, logging at the
+	/// default `info` minimum or the modern request's `_meta` log level.
 	void enableLogging() @safe
 	{
 		loggingEnabled = true;

@@ -52,9 +52,12 @@ struct ServerSettings
 	/// `enablePromptsListChanged`). Off by default.
 	bool promptsListChanged;
 
-	/// Advertise the `logging` capability and accept `logging/setLevel` (calls
-	/// `enableLogging`). Off by default. Valid in either statefulness mode (the
-	/// modern per-request `_meta` logging path uses it on a stateless server).
+	/// Advertise the `logging` capability so handlers' `ctx.log` emits
+	/// `notifications/message` (calls `enableLogging`). Off by default. Valid in
+	/// either statefulness mode, but only a stateful server accepts
+	/// `logging/setLevel`: a stateless server has no session to hold the level,
+	/// so it answers that RPC with -32601 and logs at the default `info` minimum
+	/// (or the modern request's `_meta` log level).
 	bool logging;
 
 	/// Advertise the resources `subscribe` capability (calls
