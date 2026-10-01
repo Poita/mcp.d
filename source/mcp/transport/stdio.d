@@ -277,9 +277,18 @@ private final class StdioContextFactoryReply
 
 	void run(DuplexChannel channel) @safe
 	{
-		auto reply = server.handleRaw(msg.raw.toString(), sink, serverRequest);
-		if (reply.length)
-			channel.sendRaw(reply);
+		import mcp.server.context : StdioContext;
+		import mcp.transport.sse_context : extractProgressToken;
+
+		// The channel has already parsed and classified `msg`, so it is dispatched
+		// directly against the bound connection rather than re-serialised for
+		// `handleRaw` to parse again.
+		auto ctx = new StdioContext(sink, serverRequest, server.clientCapabilities,
+				extractProgressToken(msg.params),
+				server.negotiatedVersion, server.mode == ServerMode.stateless);
+		auto reply = server.handle(msg, ctx);
+		if (!reply.isNull)
+			channel.sendRaw(reply.get.toString());
 	}
 }
 
@@ -427,8 +436,17 @@ void runStdio(McpServer server, StdioOptions opts)
 				exitEventLoop();
 			try
 				serveStdio(server, &readLine, &writeLine, opts);
-			catch (Exception)
+			catch (Exception e)
 			{
+				// stdout carries only MCP messages, so a failure that ends the
+				// server is reported on stderr.
+				import std.stdio : stderr;
+
+				try
+					stderr.writeln("[mcp.transport.stdio] runStdio: fatal: ", e.msg);
+				catch (Exception)
+				{
+				}
 			}
 		});
 		runEventLoop();

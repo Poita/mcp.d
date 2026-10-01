@@ -54,6 +54,29 @@ final class DuplexChannel
 	private TaskMutex writeMutex;
 	private bool closed_;
 
+	/// Receives a description of each failure the read loop survives or ends on
+	/// (an unreadable input, a line whose handling threw). Defaults to stderr, the
+	/// stdio transport's logging channel, when null.
+	void delegate(string) @safe nothrow onError;
+
+	private void reportError(string msg) @safe nothrow
+	{
+		import std.stdio : stderr;
+
+		if (onError !is null)
+		{
+			onError(msg);
+			return;
+		}
+		() @trusted nothrow{
+			try
+				stderr.writeln("[mcp.transport.duplex] ", msg);
+			catch (Exception)
+			{
+			}
+		}();
+	}
+
 	/// `readLine` returns the next inbound line (without terminator) or `null` at
 	/// EOF (and the read loop ends). `writeLine` emits one outbound line. `onInbound`
 	/// is invoked for every inbound request / notification line (never for a
@@ -102,12 +125,16 @@ final class DuplexChannel
 		for (;;)
 		{
 			string line;
-			bool eof;
 			try
 				line = readLineDg();
-			catch (Exception)
-				eof = true; // a read error is treated as end-of-input
-			if (eof || line is null)
+			catch (Exception e)
+			{
+				// An unreadable input cannot recover, so the loop ends as at
+				// end-of-input, but the failure is reported rather than hidden.
+				reportError("readLoop: read failed: " ~ e.msg);
+				break;
+			}
+			if (line is null)
 				break;
 			if (line.length == 0)
 				continue; // blank line, ignore
@@ -115,17 +142,9 @@ final class DuplexChannel
 				handleLine(line);
 			catch (Exception e)
 			{
-				// One malformed/erroring line must not kill the loop; log the failure so
-				// it is visible rather than silently discarded, then continue.
-				import std.stdio : stderr;
-
-				() @trusted nothrow{
-					try
-						stderr.writeln("[mcp.transport.duplex] readLoop: ", e.message);
-					catch (Exception)
-					{
-					}
-				}();
+				// One malformed/erroring line must not kill the loop; report the failure
+				// so it is visible rather than silently discarded, then continue.
+				reportError("readLoop: " ~ e.msg);
 			}
 		}
 		closed_ = true;
@@ -1100,4 +1119,29 @@ unittest  // inbound messages whose handlers do not block are handled in arrival
 	assert(seen == [
 		"notifications/initialized", "tools/list", "notifications/b"
 	]);
+}
+
+unittest  // a failed read ends the loop and is reported rather than passed off as EOF
+{
+	import std.algorithm : canFind;
+
+	auto ch = new DuplexChannel(() @safe {
+		throw new Exception("input/output error");
+		return "";
+	}, (string) @safe {}, (Message) @safe {});
+	string[] reported;
+	ch.onError = (string msg) @safe nothrow{ reported ~= msg; };
+	ch.runReadLoop();
+	assert(ch.closed);
+	assert(reported.length == 1 && reported[0].canFind("input/output error"));
+}
+
+unittest  // reaching end-of-input reports nothing
+{
+	auto ch = new DuplexChannel(() @safe => cast(string) null, (string) @safe {}, (Message) @safe {
+	});
+	string[] reported;
+	ch.onError = (string msg) @safe nothrow{ reported ~= msg; };
+	ch.runReadLoop();
+	assert(reported.length == 0);
 }

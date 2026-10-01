@@ -442,19 +442,19 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 	// Async, cooperative line read over the child's stdout: accumulate bytes until
 	// '\n' (stripping a trailing '\r'). (The byte source is already buffered by
 	// vibe's PipeInputStream, so single-byte reads here do not hit the OS per byte.)
-	// EOF surfaces as an exception from pipes.stdout.read: vibe-core's
-	// PipeInputStream calls enforce(waitForData(), ...) when nbytes==0, which throws
-	// rather than returning 0. That exception propagates to DuplexChannel.readLoop's
-	// catch(Exception) handler, which sets eof=true and ends the read loop. If a
-	// single line exceeds `maxLineBytes` the child is producing an unbounded,
-	// newline-less stream — return null to end the duplex read loop rather than grow
-	// the accumulator without limit.
+	// End-of-input returns null (ending the duplex read loop) once `empty` reports
+	// the child closed its stdout, so only a genuine read failure surfaces as an
+	// exception. If a single line exceeds `maxLineBytes` the child is producing an
+	// unbounded, newline-less stream — return null to end the duplex read loop
+	// rather than grow the accumulator without limit.
 	string readLine() @safe
 	{
 		ubyte[1] one;
 		ubyte[] acc;
 		for (;;)
 		{
+			if (()@trusted { return pipes.stdout.empty; }())
+				return null;
 			() @trusted { pipes.stdout.read(one[], IOMode.once); }();
 			if (one[0] == '\n')
 				break;
