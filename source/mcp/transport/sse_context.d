@@ -2419,7 +2419,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		// state on Mcp-Session-Id). stdio is a single implicit connection and is
 		// unaffected (it uses StdioContext, not this class).
 		if (serverStateless_)
-			throw invalidRequest("server-initiated requests (elicitation/sampling/roots) require a stateful server; construct with McpServer.stateful()");
+			throw internalError("server-initiated requests (elicitation/sampling/roots) require a stateful server; construct with McpServer.stateful()");
 		const id = coord.alloc();
 		// Bind the outbound id to this request's session token (keyed `(token, id)`)
 		// so only a response arriving on the same session can resolve it.
@@ -3304,6 +3304,26 @@ unittest  // a stateless HttpStreamContext FORBIDS server->client requests
 	assert(!resp.isNull);
 	// The tool-call returns an error result rather than hanging.
 	assert(resp.get["result"]["isError"].get!bool);
+}
+
+unittest  // the stateless gate reports the handler's misuse as an internal error
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, new StreamCoordinator, caps,
+			Json.undefined, TokenInfo.invalid(), false, latestLegacy, "", null, true);
+	try
+	{
+		ctx.elicitRaw(Json.emptyObject);
+		assert(false, "elicitRaw must throw on a stateless server");
+	}
+	catch (McpException e)
+		assert(e.code == ErrorCode.internalError, "expected -32603, got " ~ e.msg);
 }
 
 unittest  // a stateful HttpStreamContext does NOT gate sendRequest
