@@ -14,7 +14,7 @@ import core.time : Duration;
 /// class Calc
 /// {
 ///     @tool("add", "Add two integers")
-///     int add(int a, int b) { return a + b; }
+///     int add(int a, int b) @safe { return a + b; }
 /// }
 /// ---
 ///
@@ -134,7 +134,7 @@ struct eventPollInterval
 /// ---
 /// @tool("search", "Search records")
 /// @readOnly
-/// string[] search(string q) { ... }
+/// string[] search(string q) @safe { ... }
 /// ---
 enum readOnly;
 
@@ -158,7 +158,7 @@ enum openWorld;
 /// ---
 /// @tool("erase", "Erase a record")
 /// @destructive @idempotent @hintTitle("Erase Record")
-/// void erase(string id) { ... }
+/// void erase(string id) @safe { ... }
 /// ---
 struct hintTitle
 {
@@ -263,7 +263,7 @@ struct resourceTemplate
 /// ---
 /// @resource("file:///readme", "Readme", "text/markdown")
 /// @priority(0.9) @audience("user")
-/// string readme() { return "..."; }
+/// string readme() @safe { return "..."; }
 /// ---
 struct audience
 {
@@ -313,7 +313,7 @@ struct lastModified
 /// @tool("annotate", "Annotate a document")
 /// @describeParam("id", "the document id")
 /// @describeParam("count", "how many copies")
-/// string annotate(string id, int count) { ... }
+/// string annotate(string id, int count) @safe { ... }
 /// ---
 struct describeParam
 {
@@ -341,7 +341,7 @@ struct describeParam
 /// ---
 /// @tool("query", "Query a region")
 /// @mcpHeader("region", "Region")
-/// string query(string region) { ... }
+/// string query(string region) @safe { ... }
 /// ---
 struct mcpHeader
 {
@@ -359,7 +359,7 @@ struct mcpHeader
 /// ---
 /// @tool("draw", "Draw something")
 /// @icon("https://example.com/draw.png", "image/png", ["48x48"], "dark")
-/// string draw(string spec) { ... }
+/// string draw(string spec) @safe { ... }
 /// ---
 struct icon
 {
@@ -379,7 +379,7 @@ struct icon
 /// ---
 /// @tool("get_weather", "Show the weather dashboard")
 /// @ui("ui://weather/dashboard", "model", "app")
-/// WeatherData getWeather(string city) { ... }
+/// WeatherData getWeather(string city) @safe { ... }
 /// ---
 struct ui
 {
@@ -403,7 +403,7 @@ struct ui
 /// import vibe.data.json : parseJsonString;
 /// @tool("x", "X")
 /// @meta(parseJsonString(`{"category":"math"}`))
-/// int x() { ... }
+/// int x() @safe { ... }
 /// ---
 struct meta
 {
@@ -434,7 +434,7 @@ public import jsonschema : fieldDescription, minimum, maximum, title, schemaForm
 /// ---
 /// @resource("file:///data", "Data", "application/json")
 /// @cacheable(5.seconds, "private")
-/// string data() { ... }
+/// string data() @safe { ... }
 /// ---
 struct cacheable
 {

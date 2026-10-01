@@ -84,6 +84,8 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 		{
 			static foreach (overload; __traits(getOverloads, root, memberName))
 			{
+				static if (hasHandlerUda!overload())
+					checkHandlerSafety!(memberName, overload)();
 				static foreach (attr; __traits(getAttributes, overload))
 				{
 					static if (is(attr))
@@ -128,6 +130,25 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 			}
 		}
 	}
+}
+
+/// Whether `f` carries a handler UDA value (`@tool(...)`, `@prompt(...)`, ...).
+private bool hasHandlerUda(alias f)()
+{
+	bool found;
+	static foreach (a; __traits(getAttributes, f))
+		static if (!is(a) && isHandlerUda!(typeof(a)))
+			found = true;
+	return found;
+}
+
+/// Reject a handler that is not `@safe` (or `@trusted`): the registered
+/// callbacks are `@safe`, so calling it would otherwise fail deep inside a
+/// generated lambda instead of at the annotated method.
+private void checkHandlerSafety(string memberName, alias f)()
+{
+	static assert(isSafe!f, "handler '" ~ memberName ~ "' must be @safe (or @trusted); "
+			~ "annotate it, e.g. `string " ~ memberName ~ "(...) @safe { ... }`");
 }
 
 /// Whether the type `A` is one of the handler UDAs that must be applied with an
@@ -3660,4 +3681,30 @@ unittest  // a Json return is wrapped under `result` so structuredContent is an 
 	assert(r.structuredContent.type == Json.Type.object);
 	assert(r.structuredContent["result"].get!long == 5);
 	assert("result" in outputSchemaOf!Json()["properties"]);
+}
+
+version (unittest) private final class SystemToolApi
+{
+	@tool("t", "A tool whose method is not @safe")
+	string t(string msg) @system
+	{
+		return msg;
+	}
+}
+
+unittest  // a non-@safe handler method is rejected with a diagnostic naming it
+{
+	static assert(!__traits(compiles, checkHandlerSafety!("t", SystemToolApi.t)()));
+	static assert(__traits(compiles, checkHandlerSafety!("echo", EchoSafeApi.echo)()));
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new SystemToolApi)));
+}
+
+version (unittest) private final class EchoSafeApi
+{
+	@tool("echo", "Echo")
+	string echo(string msg) @safe
+	{
+		return msg;
+	}
 }
