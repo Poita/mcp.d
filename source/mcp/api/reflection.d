@@ -227,7 +227,7 @@ private Json parametersSchema(alias func)() @safe
 	Json required = Json.emptyArray;
 	static foreach (i, P; types)
 	{
-		static if (!is(P : RequestContext) && !is(P == TaskContext) && !is(P == EventContext))
+		static if (!is(P : RequestContext) && !is(P == TaskContext))
 		{
 			{
 				// Generate the parameter's schema and fold in the facet UDAs
@@ -562,6 +562,14 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 {
 	import std.traits : ReturnType;
 
+	static foreach (P; Parameters!overload)
+	{
+		static assert(!is(P == TaskContext), "@tool method '" ~ memberName
+				~ "' must not take a TaskContext; declare it with @task to run as a task.");
+		static assert(!is(P == EventContext), "@tool method '" ~ memberName
+				~ "' must not take an EventContext; only event handlers receive one.");
+	}
+
 	Tool descriptor;
 	descriptor.name = attr.name;
 	if (attr.description.length)
@@ -646,9 +654,13 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 	// already returned a task handle — there is no live RequestContext to inject.
 	// Task methods observe progress/cancellation/input through a TaskContext.
 	static foreach (P; Parameters!overload)
+	{
 		static assert(!is(P : RequestContext),
 				"@task method '" ~ memberName ~ "' must not take a RequestContext "
 				~ "(the request has already returned); take a TaskContext instead.");
+		static assert(!is(P == EventContext), "@task method '" ~ memberName
+				~ "' must not take an EventContext; only event handlers receive one.");
+	}
 	static assert(!is(ReturnType!overload == ToolResponse),
 			"@task method '" ~ memberName ~ "' must return a value (or void), not ToolResponse");
 
@@ -3560,4 +3572,49 @@ unittest  // the typed builder defines a push type whose publish() feeds events/
 	auto n = s.handle(Message(makeRequest(Json(2), "events/poll", next))).get;
 	assert(n["result"]["events"].length == 1);
 	assert(n["result"]["events"][0]["data"]["messageId"].get!string == "m1");
+}
+
+version (unittest) private final class TaskCtxToolApi
+{
+	@tool("t", "A plain tool that wrongly takes a TaskContext")
+	string t(string msg, TaskContext tc) @safe
+	{
+		return msg;
+	}
+}
+
+version (unittest) private final class EventCtxToolApi
+{
+	@tool("t", "A plain tool that wrongly takes an EventContext")
+	string t(string msg, EventContext ec) @safe
+	{
+		return msg;
+	}
+}
+
+version (unittest) private final class EventCtxTaskApi
+{
+	@task("t", "A task that wrongly takes an EventContext")
+	string t(string msg, EventContext ec) @safe
+	{
+		return msg;
+	}
+}
+
+unittest  // a @tool method taking a TaskContext is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TaskCtxToolApi)));
+}
+
+unittest  // a @tool method taking an EventContext is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new EventCtxToolApi)));
+}
+
+unittest  // a @task method taking an EventContext is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new EventCtxTaskApi)));
 }
