@@ -370,7 +370,11 @@ struct ClientCapabilities
 	/// sampling.context sub-capability (soft-deprecated): gates the
 	/// `includeContext` values `thisServer`/`allServers`. Implies `sampling`.
 	bool samplingContext;
-	bool elicitation; /// presence (>= 2025-06-18); empty object => form mode only
+	/// Elicitation presence (>= 2025-06-18). Following the spec's bare `{}`, it
+	/// declares form mode: on its own it serializes as `{}`, and alongside
+	/// `elicitationUrl` it serializes as `{"form":{},"url":{}}`. A url-only
+	/// client sets just `elicitationUrl`, which also implies presence.
+	bool elicitation;
 	/// elicitation.form submode (2025-11-25): declares support for schema-driven
 	/// form elicitation. Implies `elicitation`. An empty `elicitation` object is
 	/// equivalent to declaring form mode only, so this is treated as set when a
@@ -410,7 +414,8 @@ struct ClientCapabilities
 			Json e = Json.emptyObject;
 			// Emit explicit submodes only when set; a bare `{}` is equivalent to
 			// declaring form mode only (backwards compatible with 2025-06-18).
-			if (elicitationForm)
+			// `elicitation` declares form mode, so pairing it with url lists both.
+			if (elicitationForm || (elicitation && elicitationUrl))
 				e["form"] = Json.emptyObject;
 			if (elicitationUrl)
 				e["url"] = Json.emptyObject;
@@ -444,7 +449,11 @@ struct ClientCapabilities
 		// `elicitationForm`/`elicitationUrl` as implying elicitation presence, so a
 		// client that set only a submode must still project a bare `elicitation`
 		// here; the sub-flags themselves are gated to 2025-11-25 below.
-		if (v >= ProtocolVersion.v2025_06_18)
+		// From 2025-11-25 the flag passes through unchanged so a url-only client
+		// is not widened to form mode.
+		if (v >= ProtocolVersion.v2025_11_25)
+			projected.elicitation = elicitation;
+		else if (v >= ProtocolVersion.v2025_06_18)
 			projected.elicitation = elicitation || elicitationForm || elicitationUrl;
 		// sampling/elicitation sub-objects apply from 2025-11-25.
 		if (v >= ProtocolVersion.v2025_11_25)
@@ -479,16 +488,19 @@ struct ClientCapabilities
 		}
 		if (declaresObject(j, "elicitation"))
 		{
-			c.elicitation = true;
 			if (j["elicitation"].length > 0)
 			{
 				c.elicitationForm = declaresObject(j["elicitation"], "form");
 				c.elicitationUrl = declaresObject(j["elicitation"], "url");
+				// A url-only declaration leaves `elicitation` unset: that flag
+				// declares form mode, and `elicitationUrl` alone implies presence.
+				c.elicitation = c.elicitationForm || !c.elicitationUrl;
 			}
 			else
 			{
 				// An empty elicitation declaration is equivalent to declaring
 				// form mode only.
+				c.elicitation = true;
 				c.elicitationForm = true;
 			}
 		}
@@ -1083,11 +1095,39 @@ unittest  // ClientCapabilities advertises elicitation form/url submodes (2025-1
 unittest  // ClientCapabilities advertises URL-only elicitation mode
 {
 	ClientCapabilities caps;
-	caps.elicitation = true;
 	caps.elicitationUrl = true;
 	auto j = caps.toJson();
 	assert(j["elicitation"]["url"].type == Json.Type.object);
 	assert("form" !in j["elicitation"]);
+}
+
+unittest  // ClientCapabilities elicitation plus elicitationUrl advertises both modes
+{
+	ClientCapabilities caps;
+	caps.elicitation = true;
+	caps.elicitationUrl = true;
+	auto j = caps.toJson();
+	assert(j["elicitation"]["form"].type == Json.Type.object);
+	assert(j["elicitation"]["url"].type == Json.Type.object);
+}
+
+unittest  // ClientCapabilities url-only elicitation round-trips without gaining form
+{
+	import vibe.data.json : parseJsonString;
+
+	auto j = `{"elicitation":{"url":{}}}`.parseJsonString;
+	auto back = ClientCapabilities.fromJson(j);
+	assert(back.toJson()["elicitation"] == `{"url":{}}`.parseJsonString);
+	auto projected = back.forVersion(ProtocolVersion.v2025_11_25).toJson();
+	assert(projected["elicitation"] == `{"url":{}}`.parseJsonString);
+}
+
+unittest  // ClientCapabilities url-only elicitation projects to a bare declaration on 2025-06-18
+{
+	ClientCapabilities caps;
+	caps.elicitationUrl = true;
+	auto j = caps.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert(j["elicitation"] == Json.emptyObject);
 }
 
 unittest  // ClientCapabilities round-trips elicitation submodes
@@ -1130,7 +1170,8 @@ unittest  // ClientCapabilities parses url-only elicitation from peer payload
 	e["url"] = Json.emptyObject;
 	j["elicitation"] = e;
 	auto back = ClientCapabilities.fromJson(j);
-	assert(back.elicitation && !back.elicitationForm && back.elicitationUrl);
+	assert(!back.elicitation && !back.elicitationForm && back.elicitationUrl);
+	assert(back.supports(ClientCapability.elicitation));
 }
 
 unittest  // ClientCapabilities elicitation submodes imply elicitation presence
@@ -1324,7 +1365,8 @@ unittest  // ClientCapabilities.fromJson ignores null and non-object capability 
 			"elicitation": Json(["form": Json(false), "url": Json.emptyObject])
 	]));
 	assert(d.sampling && !d.samplingTools && d.samplingContext);
-	assert(d.elicitation && !d.elicitationForm && d.elicitationUrl);
+	assert(!d.elicitation && !d.elicitationForm && d.elicitationUrl);
+	assert(d.supports(ClientCapability.elicitation));
 }
 
 unittest  // ServerCapabilities.fromJson ignores null and non-object logging/completions

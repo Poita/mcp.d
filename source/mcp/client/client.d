@@ -1690,17 +1690,16 @@ final class McpClient : ClientProtocol
 	/// Whether `advertised` client capabilities declare support for elicitation
 	/// `mode`, per client/elicitation §Error Handling (2025-11-25): a request
 	/// whose `mode` was not declared in client capabilities must be rejected.
-	/// A bare `elicitation` declaration is parsed as form-capable
-	/// (elicitationForm=true). An explicit url-only declaration (`{"url":{}}` =>
-	/// elicitation=true, elicitationUrl=true, elicitationForm=false) does NOT
-	/// declare form mode, so it must not satisfy the form case.
+	/// `elicitation` declares form mode (a bare `{}` parses as
+	/// elicitation=true, elicitationForm=true). An explicit url-only declaration
+	/// (`{"url":{}}` => elicitationUrl=true only) does NOT declare form mode, so
+	/// it must not satisfy the form case.
 	private static bool supportsElicitationMode(ClientCapabilities advertised, string mode) @safe
 	{
 		switch (mode)
 		{
 		case "form":
-			return advertised.elicitationForm || (advertised.elicitation
-					&& !advertised.elicitationUrl);
+			return advertised.elicitationForm || advertised.elicitation;
 		case "url":
 			return advertised.elicitationUrl;
 		default:
@@ -3272,13 +3271,12 @@ final class McpClient : ClientProtocol
 			return caps;
 		if (onSampling !is null)
 			caps.sampling = true;
-		if (onElicitation !is null)
+		// A bare `elicitation` object means form mode only; declare it unless the
+		// caller has already advertised a submode explicitly.
+		if (onElicitation !is null && !caps.elicitationForm && !caps.elicitationUrl)
 		{
 			caps.elicitation = true;
-			// A bare `elicitation` object means form mode only; declare the form
-			// submode unless the caller has already advertised a submode explicitly.
-			if (!caps.elicitationForm && !caps.elicitationUrl)
-				caps.elicitationForm = true;
+			caps.elicitationForm = true;
 		}
 		if (onListRoots !is null)
 			caps.roots = true;
@@ -5323,7 +5321,6 @@ unittest  // installing onListRoots auto-advertises the roots capability
 unittest  // auto-advertise preserves explicitly declared submodes (url)
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationUrl = true; // explicit url-only advertisement
 	c.onElicitation = (ElicitParams params) @safe { return ElicitResult.init; };
 	auto caps = c.effectiveCapabilities();
@@ -5602,9 +5599,8 @@ unittest  // elicitation/create forwards an advertised mode to the delegate
 unittest  // url-only client rejects a form-mode elicitation/create (-32602)
 {
 	auto c = McpClient.http("http://localhost");
-	// A url-only client is the canonical shape parsed from `{"url":{}}`:
-	// elicitation present + url submode, but no form submode.
-	c.capabilities.elicitation = true;
+	// A url-only client is the canonical shape parsed from `{"url":{}}`: the
+	// url submode alone.
 	c.capabilities.elicitationUrl = true;
 
 	bool delegateCalled;
@@ -5632,7 +5628,6 @@ unittest  // url-only client rejects a form-mode elicitation/create (-32602)
 unittest  // url-only client rejects a mode-absent (defaults to form) elicitation/create (-32602)
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationUrl = true;
 
 	bool delegateCalled;
