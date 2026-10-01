@@ -2404,22 +2404,23 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		// is unique to 2025-11-25 — 2025-03-26 / 2025-06-18 never defined it and the
 		// modern drops Last-Event-ID resumability entirely — so the priming event is
 		// emitted ONLY when the effective version is exactly 2025-11-25, leaving
-		// every other version's wire output unchanged.
+		// every other version's wire output unchanged. A stream that cannot be
+		// resumed (no replay channel, e.g. a stateless server) skips it, since it
+		// would invite a reconnect the server cannot serve.
 		writePrimingEventIfNeeded();
 	}
 
 	/// Emit the leading priming event (an event id + empty `data` field) on a
-	/// freshly-opened POST-initiated SSE stream when, and only when, the negotiated
+	/// freshly-opened, resumable POST-initiated SSE stream when the negotiated
 	/// version is 2025-11-25 (basic/transports §Sending Messages item 6). Consumes
 	/// the next event id so subsequent frames advance from it, exactly as the SSE
 	/// `Last-Event-ID` cursor requires. Emitted at most once per stream.
 	private void writePrimingEventIfNeeded() @safe
 	{
-		if (primed_ || !sendsPrimingEvent(version_))
+		if (primed_ || replay_ is null || !sendsPrimingEvent(version_))
 			return;
 		primed_ = true;
-		const frame = formatPrimingEvent(replay_ !is null
-				? replay_.primeStream(streamId, token_) : nextEventId());
+		const frame = formatPrimingEvent(replay_.primeStream(streamId, token_));
 		eventSeq++;
 		writeFrame(frame);
 	}
@@ -3615,4 +3616,22 @@ unittest  // events after a POST stream drops are still recorded for Last-Event-
 	assert(resumed.length == 2);
 	assert(resumed[0].canFind("after-drop"));
 	assert(resumed[1].canFind("\"id\":9"));
+}
+
+unittest  // a 2025-11-25 stream that cannot be resumed sends no priming event
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.versions : ProtocolVersion;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, new StreamCoordinator, caps,
+			Json.undefined, TokenInfo.invalid(), false, ProtocolVersion.v2025_11_25);
+	ctx.log("info", Json("hello"));
+	const body_ = () @trusted { return cast(string) sink.data.idup; }();
+	assert(body_.canFind("hello"));
+	assert(!body_.canFind("data: \n\n"), "priming invites a resume the server cannot serve");
 }
