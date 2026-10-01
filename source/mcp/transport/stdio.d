@@ -1,5 +1,6 @@
 module mcp.transport.stdio;
 
+import core.time : Duration, seconds;
 import vibe.data.json : Json;
 
 import mcp.server.server;
@@ -43,11 +44,12 @@ private __gshared bool _ranStdio;
 ///     `channel.send`).
 ///
 /// Requires a running vibe event loop; `serveStdio` runs the read loop on the
-/// CURRENT task and blocks until end-of-input.
+/// CURRENT task and blocks until end-of-input, then waits up to
+/// `opts.drainTimeout` for request handlers still running to write their replies.
 void serveStdio(McpServer server, string delegate() @safe readLine,
-		void delegate(string) @safe writeLine)
+		void delegate(string) @safe writeLine, StdioOptions opts = StdioOptions.init)
 {
-	import vibe.core.core : runTask, yield;
+	import vibe.core.core : runTask;
 	import vibe.data.json : Json;
 	import mcp.protocol.jsonrpc : Message, MessageKind;
 	import mcp.server.connection : ConnectionState;
@@ -67,7 +69,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	// finally) needs no atomics. After the read loop ends at EOF we drain this to
 	// zero under a bounded grace period so an already-computed reply still flushes
 	// through channel.sendRaw before the loop tears down.
-	size_t inflight;
+	auto inflight = new InflightCount;
 
 	// The server->client write sink and request channel both go through the one
 	// serialized writer on `channel`.
@@ -140,7 +142,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			// read loop. The handler's notifications + reply ride `channel.send`.
 			// Track it as in-flight so EOF cannot abandon a handler that has computed
 			// its reply but not yet written it.
-			++inflight;
+			inflight.start();
 			runTask((Message msg) nothrow{
 				try
 				{
@@ -151,7 +153,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 				{
 				}
 				finally
-					--inflight;
+					inflight.finish();
 			}, m);
 			break;
 		case MessageKind.notification:
@@ -179,7 +181,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	// stall the read loop, and `handleRaw` returns the one aggregated array frame.
 	void onInboundBatch(string raw) @safe
 	{
-		++inflight;
+		inflight.start();
 		runTask((string text) nothrow{
 			try
 			{
@@ -191,7 +193,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			{
 			}
 			finally
-				--inflight;
+				inflight.finish();
 		}, raw);
 	}
 
@@ -202,12 +204,53 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 
 	// The read loop has ended at stdin EOF. failPending (inside runReadLoop) already
 	// released any handler blocked in a server->client request, but a handler that
-	// has computed its reply still needs to be scheduled so its sendRaw runs. Yield
-	// until every dispatched handler task has finished, bounded so a handler stuck
-	// in unbounded local work cannot hold the process open forever.
-	enum size_t drainYields = 4096;
-	for (size_t i = 0; i < drainYields && inflight > 0; ++i)
-		yield();
+	// has computed its reply still needs to be scheduled so its sendRaw runs. Wait
+	// until every dispatched handler task has finished, bounded by
+	// `opts.drainTimeout` so a stuck handler cannot hold the process open forever.
+	inflight.awaitIdle(opts.drainTimeout);
+}
+
+/// Count of running request handler tasks, signalling each time it returns to
+/// zero so the EOF drain can wait for it. A class so the handler tasks that
+/// outlive a timed-out drain still reference live state.
+private final class InflightCount
+{
+	import vibe.core.sync : LocalManualEvent, createManualEvent;
+
+	private size_t count;
+	private LocalManualEvent idle;
+
+	this() @safe
+	{
+		idle = createManualEvent();
+	}
+
+	void start() @safe nothrow
+	{
+		++count;
+	}
+
+	void finish() @safe nothrow
+	{
+		if (--count == 0)
+			idle.emit();
+	}
+
+	/// Wait until no handler is running or `timeout` elapses.
+	void awaitIdle(Duration timeout) @safe
+	{
+		import core.time : MonoTime;
+
+		const deadline = MonoTime.currTime + timeout;
+		while (count > 0)
+		{
+			const now = MonoTime.currTime;
+			if (now >= deadline)
+				break;
+			const ec = idle.emitCount;
+			() @trusted { idle.wait(deadline - now, ec); }();
+		}
+	}
 }
 
 /// Helper that dispatches one inbound stdio request through the server with a
@@ -249,13 +292,19 @@ struct StdioOptions
 	/// skipped up to the next newline) so one misbehaving frame cannot exhaust
 	/// memory.
 	size_t maxLineBytes = defaultMaxLineBytes;
+
+	/// How long the transport waits, once stdin reaches end-of-input, for request
+	/// handlers still running to finish and write their replies before it returns.
+	Duration drainTimeout = 5.seconds;
 }
 
-/// Serve `server` over stdio with the options in `opts`. The single-struct form
-/// of `runStdio`, used by the `ServerSettings`-based entry point.
-void runStdio(McpServer server, StdioOptions opts)
+/// Serve `server` over stdio with default options except for `maxLineBytes`
+/// (see `StdioOptions.maxLineBytes`).
+void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 {
-	runStdio(server, opts.maxLineBytes);
+	StdioOptions opts;
+	opts.maxLineBytes = maxLineBytes;
+	runStdio(server, opts);
 }
 
 /// Serve `server` over stdio using `settings.stdio`. Blocks until stdin closes.
@@ -294,12 +343,14 @@ void runStdio(McpServer server, ServerSettings settings)
 /// and concurrent tool handlers work because every write goes through the
 /// channel's serialized writer.
 ///
-/// `maxLineBytes` bounds a single inbound line; an oversized frame is dropped (its
-/// bytes are skipped up to the next newline) and answered with a -32600 error
+/// `opts.maxLineBytes` bounds a single inbound line; an oversized frame is dropped
+/// (its bytes are skipped up to the next newline) and answered with a -32600 error
 /// carrying its id when one is found in its first bytes (else null), and the loop
 /// continues so one misbehaving frame neither exhausts memory nor kills the server.
-void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
+/// At end-of-input, handlers still running get up to `opts.drainTimeout` to reply.
+void runStdio(McpServer server, StdioOptions opts)
 {
+	const maxLineBytes = opts.maxLineBytes;
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 	import vibe.core.sync : TaskMutex;
 
@@ -374,7 +425,7 @@ void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
 			scope (exit)
 				exitEventLoop();
 			try
-				serveStdio(server, &readLine, &writeLine);
+				serveStdio(server, &readLine, &writeLine, opts);
 			catch (Exception)
 			{
 			}
@@ -1709,6 +1760,112 @@ unittest  // a handler still running when stdin EOFs is drained: its reply is no
 	auto resp = parseJsonString(outputs[0]);
 	assert(resp["id"].get!int == 1);
 	assert(resp["result"]["content"][0]["text"].get!string == "late");
+}
+
+unittest  // the EOF drain waits for a handler that finishes on a timer after stdin closes
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+
+	auto s = new McpServer("eof-drain-timer", "1.0");
+	auto entered = createManualEvent();
+	Tool slow = {name: "slow"};
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
+		entered.emit();
+		sleep(1500.msecs);
+		CallToolResult r;
+		r.content = [Content.makeText("late")];
+		return r;
+	});
+
+	auto link = new ServerLink;
+	string[] outputs;
+	() @trusted {
+		runTask(() nothrow{
+			scope (exit)
+				exitEventLoop();
+			try
+				serveStdio(s, &link.readLine, &link.writeLine);
+			catch (Exception)
+			{
+			}
+		});
+		runTask(() nothrow{
+			try
+			{
+				link.feed(
+					`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}`);
+				auto ec = entered.emitCount;
+				entered.wait(ec);
+				link.closeInput();
+			}
+			catch (Exception)
+			{
+			}
+		});
+		runEventLoop();
+		outputs = link.outbound.dup;
+	}();
+
+	assert(outputs.length == 1, "a handler finishing shortly after EOF must still reply");
+}
+
+unittest  // the EOF drain gives up on a stuck handler once its deadline passes
+{
+	import core.time : msecs, seconds, MonoTime;
+
+	auto s = new McpServer("eof-drain-stuck", "1.0");
+	auto never = createManualEvent();
+	auto entered = createManualEvent();
+	Tool stuck = {name: "stuck"};
+	s.registerTool(stuck, (Json args, RequestContext ctx) @safe {
+		entered.emit();
+		auto ec = never.emitCount;
+		() @trusted { never.wait(ec); }();
+		return CallToolResult.init;
+	});
+
+	auto link = new ServerLink;
+	StdioOptions opts;
+	opts.drainTimeout = 200.msecs;
+	MonoTime eofAt;
+	Duration drained;
+	bool returned;
+	() @trusted {
+		runTask(() nothrow{
+			try
+			{
+				link.feed(
+					`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stuck"}}`);
+				auto ec = entered.emitCount;
+				entered.wait(ec);
+				eofAt = MonoTime.currTime;
+				link.closeInput();
+			}
+			catch (Exception)
+			{
+			}
+		});
+		runTask(() nothrow{
+			scope (exit)
+				exitEventLoop();
+			try
+			{
+				serveStdio(s, &link.readLine, &link.writeLine, opts);
+				drained = MonoTime.currTime - eofAt;
+				returned = true;
+			}
+			catch (Exception)
+			{
+			}
+			// Release the stuck handler so its task does not outlive the test.
+			never.emit();
+		});
+		runEventLoop();
+	}();
+	assert(returned, "serveStdio must return despite a stuck handler");
+	assert(drained >= 150.msecs, "the drain must wait for in-flight handlers");
+	assert(drained < 5.seconds, "the drain must stop at its deadline");
 }
 
 unittest  // a tool handler's ctx.log() is delivered as a notifications/message frame over stdio
