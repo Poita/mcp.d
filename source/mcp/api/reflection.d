@@ -304,6 +304,18 @@ private Json parametersSchema(alias func)() @safe
 					static if (d.length)
 						ps["description"] = d;
 				}
+				// A declared D-level default is advertised as the JSON Schema
+				// `default` unless an explicit @schemaDefault already set one.
+				static if (!is(defs[i] == void))
+					if ("default" !in ps)
+						{
+						auto d = () @trusted {
+							return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(
+									cast(P) defs[i]);
+						}();
+						if (d.type != Json.Type.null_ && d.type != Json.Type.undefined)
+							ps["default"] = d;
+					}
 				props[names[i]] = ps;
 			}
 			// A parameter is required only when it is neither Nullable nor carries a
@@ -3756,4 +3768,49 @@ unittest  // @tool methods returning Content and Content[] register
 {
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new ContentToolApi);
+}
+
+version (unittest) private final class DefaultParamApi
+{
+	enum Order
+	{
+		asc,
+		desc
+	}
+
+	@tool("list", "List with defaults")
+	string list(string q, int page = 1, Order order = Order.desc, @schemaDefault(5) int limit = 7)@safe
+	{
+		return q;
+	}
+}
+
+unittest  // a D default parameter value is emitted as the property's JSON Schema default
+{
+	auto s = parametersSchema!(DefaultParamApi.list)();
+	auto props = s["properties"];
+	assert("default" !in props["q"]);
+	assert(props["page"]["default"].get!long == 1, s.toString());
+	assert(props["order"]["default"].get!string == "desc", s.toString());
+}
+
+unittest  // an explicit @schemaDefault wins over the D default value
+{
+	auto s = parametersSchema!(DefaultParamApi.list)();
+	assert(s["properties"]["limit"]["default"].get!long == 5, s.toString());
+}
+
+version (unittest) private final class NullDefaultParamApi
+{
+	@tool("f", "Nullable parameter with a null default")
+	string f(Nullable!int n = Nullable!int.init) @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a default that serializes to null emits no JSON Schema default
+{
+	auto s = parametersSchema!(NullDefaultParamApi.f)();
+	assert("default" !in s["properties"]["n"], s.toString());
 }

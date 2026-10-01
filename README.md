@@ -573,9 +573,11 @@ Integer types map to `"integer"` (not `"number"`) deliberately — it is the mor
 precise constraint; use `double` for a field that should accept fractional values.
 An optional tool parameter is modelled as a bare type left out of `required` (the
 convention used by the MCP reference servers); declare it `Nullable!T` or give it a
-D default value (`int page = 1`). Field/parameter constraints are added with UDAs:
-`@minimum` / `@maximum`, `@minLength` / `@maxLength`, `@pattern`, `@minItems` /
-`@maxItems`, `@schemaFormat` (JSON Schema `format`), `@title`, `@schemaDefault`, and `@fieldDescription`.
+D default value (`int page = 1`), which is also emitted as the property's
+`"default"`. Field/parameter constraints are added with UDAs: `@minimum` /
+`@maximum`, `@minLength` / `@maxLength`, `@pattern`, `@minItems` / `@maxItems`,
+`@schemaFormat` (JSON Schema `format`), `@title`, `@schemaDefault`, and
+`@fieldDescription`.
 
 ## MCP Apps (interactive UI)
 
