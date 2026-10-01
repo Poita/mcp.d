@@ -53,6 +53,10 @@ struct StoredToken
 	/// DCR-issued). Persisted so a later refresh can authenticate at the token
 	/// endpoint even when no `client_id` was statically configured.
 	string clientId;
+	/// The issuer of the authorization server that issued this token. `useOAuth`
+	/// reuses or refreshes the token only with that same server, so a record
+	/// with a different or empty issuer is treated as absent.
+	string issuer;
 
 	/// Whether this record holds a usable access token.
 	bool hasToken() const @safe pure nothrow @nogc
@@ -86,6 +90,7 @@ struct StoredToken
 		j["scope"] = scope_;
 		j["resource"] = resource;
 		j["client_id"] = clientId;
+		j["issuer"] = issuer;
 		return j;
 	}
 
@@ -108,6 +113,8 @@ struct StoredToken
 			s.resource = p.type == Json.Type.string ? p.get!string : "";
 		if (auto p = "client_id" in j)
 			s.clientId = p.type == Json.Type.string ? p.get!string : "";
+		if (auto p = "issuer" in j)
+			s.issuer = p.type == Json.Type.string ? p.get!string : "";
 		return s;
 	}
 }
@@ -747,11 +754,14 @@ final class OAuthSession
 			auto ts = refreshFn_(token_.refreshToken);
 			if (ts.accessToken.length == 0)
 				throw internalError("OAuth token refresh returned no access token");
-			// Carry the registered client_id forward so the persisted record can
-			// authenticate a later refresh (the refresh response omits it).
+			// Carry the registered client_id and the issuer forward so the persisted
+			// record can authenticate a later refresh at the same AS (the refresh
+			// response carries neither).
 			auto clientId = token_.clientId.length ? token_.clientId : client_.clientId;
+			auto issuer = token_.issuer.length ? token_.issuer : as_.issuer;
 			token_ = StoredToken.fromTokenSet(ts, resource_, now, token_.refreshToken);
 			token_.clientId = clientId;
+			token_.issuer = issuer;
 			if (store_ !is null)
 				store_.save(resource_, token_);
 		}
@@ -886,8 +896,13 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	const issuer = oauth.resolveIssuer(mcpEndpoint, issuerFromPrm);
 	auto as_ = oauth.discoverAuthServer(issuer, issuerFromPrm);
 
-	// Reuse a cached, still-valid token when present.
+	// Reuse a cached, still-valid token when present. A record from another
+	// authorization server (or one that never recorded its issuer) is ignored:
+	// its access token is not meant for this AS, and its refresh token and
+	// client credentials must never be sent to a server that did not issue them.
 	auto cached = store.load(oauth.resource);
+	if (cached.issuer.length == 0 || cached.issuer != as_.issuer)
+		cached = StoredToken.init;
 	if (cached.hasToken && !needsRefresh(cached, now))
 	{
 		return attachSession(client, new OAuthSession(oauth, as_,
@@ -908,6 +923,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 				auto refreshed = StoredToken.fromTokenSet(ts, oauth.resource,
 						now, cached.refreshToken);
 				refreshed.clientId = prior.clientId;
+				refreshed.issuer = as_.issuer;
 				store.save(oauth.resource, refreshed);
 				return attachSession(client, new OAuthSession(oauth, as_, prior,
 						store, oauth.resource, refreshed));
@@ -956,6 +972,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	const long issuedAt = () @trusted { return Clock.currTime().toUnixTime(); }();
 	auto stored = StoredToken.fromTokenSet(ts, oauth.resource, issuedAt);
 	stored.clientId = rc.clientId;
+	stored.issuer = as_.issuer;
 	store.save(oauth.resource, stored);
 	return attachSession(client, new OAuthSession(oauth, as_, rc, store, oauth.resource, stored));
 }
@@ -1927,6 +1944,194 @@ unittest  // StoredToken persists the registered client_id across JSON round-tri
 	assert(back.clientId == "abc123");
 }
 
+unittest  // StoredToken persists the issuing authorization server across JSON round-trips
+{
+	StoredToken t;
+	t.accessToken = "tok";
+	t.issuer = "https://as.example.com";
+	assert(StoredToken.fromJson(t.toJson()).issuer == "https://as.example.com");
+}
+
+version (unittest)
+{
+	import vibe.http.server : HTTPListener;
+
+	/// A loopback MCP authorization setup for `useOAuth`: PRM naming the
+	/// loopback AS, AS metadata (issuer = `base`), DCR, and a token endpoint
+	/// that counts every refresh-token grant it receives.
+	private final class IssuerTestAuthServer
+	{
+		HTTPListener listener;
+		string base;
+		int refreshCalls;
+
+		void stop() @trusted
+		{
+			listener.stopListening();
+		}
+	}
+
+	/// ditto
+	private IssuerTestAuthServer startIssuerTestAuthServer() @trusted
+	{
+		import std.algorithm : canFind;
+		import std.conv : to;
+		import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+			HTTPServerSettings, listenHTTP;
+
+		auto srv = new IssuerTestAuthServer;
+		auto settings = new HTTPServerSettings;
+		settings.bindAddresses = ["127.0.0.1"];
+		settings.port = 0;
+		srv.listener = listenHTTP(settings, (scope HTTPServerRequest req,
+				scope HTTPServerResponse res) @safe {
+			const b = srv.base;
+			if (req.path.canFind("oauth-protected-resource"))
+				res.writeBody(`{"resource":"` ~ b ~ `/mcp","authorization_servers":["` ~ b ~ `"]}`,
+					"application/json");
+			else if (req.path.canFind("authorization-server"))
+				res.writeBody(`{"issuer":"` ~ b ~ `","authorization_endpoint":"` ~ b
+					~ `/authorize","token_endpoint":"` ~ b ~ `/token","registration_endpoint":"`
+					~ b ~ `/register","code_challenge_methods_supported":["S256"]}`,
+					"application/json");
+			else if (req.path == "/register")
+				res.writeBody(
+					`{"client_id":"fresh-id","redirect_uris":["http://localhost:8765/callback"]}`,
+					"application/json");
+			else if (req.path == "/token")
+			{
+				if (req.form.get("grant_type", "") == "refresh_token")
+					srv.refreshCalls++;
+				res.writeBody(
+					`{"access_token":"new-access","token_type":"Bearer","expires_in":3600}`,
+					"application/json");
+			}
+			else
+			{
+				res.statusCode = 404;
+				res.writeBody("", "text/plain");
+			}
+		});
+		srv.base = "http://127.0.0.1:" ~ srv.listener.bindAddresses[0].port.to!string;
+		return srv;
+	}
+}
+
+unittest  // useOAuth never sends a refresh token to an authorization server other than its issuer
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt-from-old-as";
+	t.clientId = "abc123";
+	t.expiresAt = 1; // expired, so a refresh would be attempted
+	t.resource = resource;
+	t.issuer = "https://old-as.example.com";
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe {};
+
+	// The interactive flow runs (and times out) instead of the refresh.
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert(srv.refreshCalls == 0, "a refresh token must only ever go to the AS that issued it");
+}
+
+unittest  // useOAuth does not reuse a cached access token issued by another authorization server
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "token-for-old-as";
+	t.resource = resource;
+	t.issuer = "https://old-as.example.com";
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe {};
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+}
+
+unittest  // useOAuth treats a stored token that records no issuer as absent
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "unbound";
+	t.refreshToken = "rt-unbound";
+	t.clientId = "abc123";
+	t.expiresAt = 1;
+	t.resource = resource;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe {};
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert(srv.refreshCalls == 0);
+}
+
+unittest  // useOAuth reuses a cached token whose issuer matches the discovered authorization server
+{
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "still-valid";
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.openBrowser = (string url) @safe {
+		assert(0, "no interactive login expected");
+	};
+
+	assert(useOAuth(McpClient.http(endpoint), endpoint, opts).token.accessToken == "still-valid");
+}
+
 unittest  // refreshing an expired token preserves the registered client_id for later refreshes
 {
 	auto store = new MemoryTokenStore();
@@ -1948,6 +2153,27 @@ unittest  // refreshing an expired token preserves the registered client_id for 
 	// The persisted token still carries the registered client_id so a subsequent
 	// refresh (e.g. after a process restart) can authenticate at the AS.
 	assert(store.load("https://mcp.example.com").clientId == "abc123");
+}
+
+unittest  // refreshing an expired token keeps the issuer it is bound to
+{
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt";
+	t.expiresAt = 1000;
+	t.issuer = "https://as.example.com";
+
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		TokenSet ts;
+		ts.accessToken = "new";
+		ts.expiresIn = 3600;
+		return ts;
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+	sess.bearerForRequest(5000);
+
+	assert(store.load("https://mcp.example.com").issuer == "https://as.example.com");
 }
 
 unittest  // a stray non-callback request does not abort the loopback flow
@@ -2231,6 +2457,7 @@ unittest  // useOAuth refreshes under the stored client_id before registering an
 	t.clientId = "abc123"; // registered on the first run and persisted
 	t.expiresAt = 1; // long expired
 	t.resource = resource;
+	t.issuer = base; // issued by this AS
 	store.save(resource, t);
 
 	OAuthLogin opts;
