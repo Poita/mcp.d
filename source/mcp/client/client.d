@@ -519,6 +519,9 @@ final class McpClient : ClientProtocol
 	private Duration defaultCacheTtl_;
 	// Set by `close()`; a closed client opens no new streams or subscriptions.
 	private bool closed_;
+	// Set once `close()` has torn down its subscriptions and streams: from then
+	// on no request or notification is sent.
+	private bool released_;
 	// The open listen streams and managed event subscriptions `close()` cancels.
 	private bool[SubscriptionStream] liveStreams_;
 	private bool[EventSubscription] liveSubscriptions_;
@@ -778,7 +781,8 @@ final class McpClient : ClientProtocol
 	/// stops any background streams), first cancelling every managed event
 	/// subscription and every stream opened by `subscriptionsListen` /
 	/// `streamEvents`, so no background loop outlives the client. A closed client
-	/// opens no new streams.
+	/// opens no new streams, and every later request or notification fails with
+	/// an `McpException` ("the client is closed") without being sent.
 	void close() @safe
 	{
 		closed_ = true;
@@ -788,6 +792,9 @@ final class McpClient : ClientProtocol
 		foreach (stream; liveStreams_.keys)
 			stream.cancel();
 		liveStreams_ = null;
+		// Teardown above may still unsubscribe or cancel on the server; every
+		// request and notification after this point is refused.
+		released_ = true;
 		transport.close();
 	}
 
@@ -815,6 +822,14 @@ final class McpClient : ClientProtocol
 	private void ensureOpen() @safe
 	{
 		if (closed_)
+			throw internalError("the client is closed");
+	}
+
+	/// Throw when `close()` has released the transport, so a request or
+	/// notification fails clearly instead of reaching a closed transport.
+	private void ensureNotReleased() @safe
+	{
+		if (released_)
 			throw internalError("the client is closed");
 	}
 
@@ -3164,6 +3179,7 @@ final class McpClient : ClientProtocol
 	/// rather than dropped as "unknown".
 	private Json rpc(string method, Json params) @safe
 	{
+		ensureNotReleased();
 		try
 		{
 			version (unittest)
@@ -3446,6 +3462,7 @@ final class McpClient : ClientProtocol
 	/// Send a notification (no reply expected).
 	private void notify(string method, Json params) @safe
 	{
+		ensureNotReleased();
 		auto message = makeNotification(method, params);
 		version (unittest)
 			if (onNotifyForTest !is null)
@@ -8268,6 +8285,38 @@ unittest  // MRTR: getPrompt stops at maxRounds prompts/get requests
 	// result is returned without an extra round-trip.
 	assert(calls == 16);
 	assert(result.isInputRequired);
+}
+
+unittest  // a request on a closed client is refused without reaching the transport
+{
+	auto c = McpClient.http("http://localhost");
+	int sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		sent++;
+		return Json(["tools": Json.emptyArray]);
+	};
+	c.close();
+	string msg;
+	try
+		c.listTools();
+	catch (McpException e)
+		msg = e.msg;
+	assert(sent == 0, "a closed client must not send requests");
+	assert(msg == "the client is closed", "unexpected error: " ~ msg);
+}
+
+unittest  // a notification on a closed client is refused without being sent
+{
+	auto c = McpClient.http("http://localhost");
+	int sent;
+	c.onNotifyForTest = (Json message) @safe { sent++; };
+	c.close();
+	bool refused;
+	try
+		c.sendNotification("notifications/roots/list_changed");
+	catch (McpException)
+		refused = true;
+	assert(refused && sent == 0, "a closed client must not send notifications");
 }
 
 unittest  // test-only RPC/notify hooks are guarded behind version(unittest)
