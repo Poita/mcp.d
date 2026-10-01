@@ -94,9 +94,34 @@ package(mcp) template isRequiredField(T, string field)
 			OptionalAttribute) || hasUDA!(member, SchemaDefault))
 		enum isRequiredField = false;
 	else static if (hasCtInitializer!(T, field))
-		enum isRequiredField = __traits(getMember, T.init, field) == FT.init;
+		enum isRequiredField = isInitValue(__traits(getMember, T.init, field));
 	else
 		enum isRequiredField = true;
+}
+
+/// Whether `v` equals its type's `.init`. Floating-point values are compared
+/// bitwise so a `.init` of NaN matches itself, and fieldwise structs and static
+/// arrays are compared member by member so a NaN inside them does too.
+private bool isInitValue(V)(const V v)
+{
+	static if (isFloatingPoint!V)
+		return v is V.init;
+	else static if (isStaticArray!V)
+	{
+		foreach (ref e; v)
+			if (!isInitValue(e))
+				return false;
+		return true;
+	}
+	else static if (isFieldwiseStruct!V)
+	{
+		static foreach (i; 0 .. V.tupleof.length)
+			if (!isInitValue(v.tupleof[i]))
+				return false;
+		return true;
+	}
+	else
+		return v == V.init;
 }
 
 /// Whether the declared initializer of field `field` of `T` is readable at
@@ -463,4 +488,49 @@ unittest  // bindJson reports the dotted path of a missing nested field
 			bindJson!Outer(parseJsonString(`{"items":[{"n":1},{}]}`)));
 	assert(e !is null);
 	assert(e.msg == "missing required field 'items[1].n'", e.msg);
+}
+
+unittest  // an undefaulted floating-point field is required, and a defaulted one is optional
+{
+	static struct S
+	{
+		double x;
+		float y;
+		double z = 2.5;
+	}
+
+	static assert(isRequiredField!(S, "x"));
+	static assert(isRequiredField!(S, "y"));
+	static assert(!isRequiredField!(S, "z"));
+}
+
+unittest  // an undefaulted struct field holding floating-point members is required
+{
+	static struct Vec2
+	{
+		double x;
+		double y;
+	}
+
+	static struct S
+	{
+		Vec2 v;
+		Vec2 w = Vec2(1, 2);
+	}
+
+	static assert(isRequiredField!(S, "v"));
+	static assert(!isRequiredField!(S, "w"));
+}
+
+unittest  // bindJson rejects an object missing an undefaulted floating-point field
+{
+	import std.exception : assertThrown;
+	import vibe.data.json : parseJsonString;
+
+	static struct S
+	{
+		double x;
+	}
+
+	assertThrown!BindException(bindJson!S(parseJsonString(`{}`)));
 }
