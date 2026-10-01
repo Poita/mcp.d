@@ -1546,6 +1546,11 @@ final class McpServer : ServerCore
 			writeLine(makeErrorResponse(msg.id, e).toString());
 			return true;
 		}
+		catch (Exception e)
+		{
+			writeLine(makeErrorResponse(msg.id, internalError(e.msg)).toString());
+			return true;
+		}
 		// Keyed like in-flight requests, so string id "9" and numeric 9 stay distinct.
 		const streamKey = cancellationKey(msg.id);
 		stdioEventStreams_[streamKey] = handle;
@@ -6764,6 +6769,36 @@ unittest  // stdio events/stream answers a negative maxAgeMs with InvalidParams
 	assert(lines.length == 1);
 	auto resp = parseJsonString(lines[0]);
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // stdio events/stream answers InternalError when on_subscribe throws a plain Exception
+{
+	import vibe.data.json : parseJsonString;
+	import mcp.server.event_context : EventContext;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.emitOnly = true;
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		throw new Exception("upstream unavailable");
+	};
+	s.registerEventType(reg);
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "n";
+	assert(s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink));
+	assert(lines.length == 1);
+	auto resp = parseJsonString(lines[0]);
+	assert(resp["id"].get!long == 9);
+	assert(resp["error"]["code"].get!int == ErrorCode.internalError);
 }
 
 unittest  // a cancelled stdio events/stream stops receiving events

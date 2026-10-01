@@ -1521,8 +1521,11 @@ private void handleEventsStream(McpServer server, Message msg,
 	PushHandle handle;
 	try
 		handle = rt.openPushStream(p.name, p.arguments, principal, subId, &deliver);
-	catch (McpException e)
+	catch (Exception ex)
 	{
+		auto e = cast(McpException) ex;
+		if (e is null)
+			e = internalError(ex.msg);
 		res.statusCode = httpStatusForResponse(makeErrorResponse(msg.id, e), true);
 		res.writeBody(makeErrorResponse(msg.id, e).toString(), "application/json");
 		return;
@@ -4061,6 +4064,42 @@ unittest  // an events/stream POST with a negative maxAgeMs answers InvalidParam
 	router.handleRequest(req, res);
 	auto resp = parseJsonString(() @trusted { return cast(string) sink.data; }());
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // an events/stream POST whose on_subscribe throws a plain Exception answers InternalError
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.server.event_context : EventContext;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableEvents();
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.emitOnly = true;
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		throw new Exception("upstream unavailable");
+	};
+	server.registerEventType(reg);
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
+		~ `"name":"n","_meta":{"protocolVersion":"2026-07-28"}}}`;
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json, text/event-stream",
+		"MCP-Protocol-Version": "2026-07-28",
+		"Mcp-Method": "events/stream"
+	]);
+	router.handleRequest(req, res);
+	auto resp = parseJsonString(() @trusted { return cast(string) sink.data; }());
+	assert(resp["id"].get!long == 1);
+	assert(resp["error"]["code"].get!int == ErrorCode.internalError);
 }
 
 /// Build the leading event the transport sends when it opens a
