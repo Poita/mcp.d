@@ -242,19 +242,26 @@ bool clientSupportsApps(RequestContext ctx) @safe
 	return ext.type == Json.Type.object && (mcpAppsExtensionKey in ext) !is null;
 }
 
+/// Optional settings for `registerUiResource`.
+struct UiResourceOptions
+{
+	string description; /// the resource's description (empty = unset)
+	UiResourceMeta meta; /// the `_meta.ui` hints (CSP, border, domain, ...)
+}
+
 /// Register a `ui://` HTML resource an MCP App tool can render. The resource is
-/// served with the `text/html;profile=mcp-app` MIME type and, when `meta`
+/// served with the `text/html;profile=mcp-app` MIME type and, when `opts.meta`
 /// carries any field, a `_meta.ui` object on both the listing and the read
 /// contents. Throws if `uri` is not in the `ui://` scheme.
 void registerUiResource(McpServer server, string uri, string name, string html,
-		UiResourceMeta meta = UiResourceMeta.init, string description = null) @safe
+		UiResourceOptions opts = UiResourceOptions.init) @safe
 {
 	import std.algorithm.searching : startsWith;
 
 	if (!uri.startsWith("ui://"))
 		throw new Exception("a UI resource uri must start with \"ui://\", got: " ~ uri);
 
-	const uiMeta = meta.toJson();
+	const uiMeta = opts.meta.toJson();
 	Json wrapped = Json.undefined;
 	if (uiMeta.length)
 	{
@@ -266,8 +273,8 @@ void registerUiResource(McpServer server, string uri, string name, string html,
 	descriptor.uri = uri;
 	descriptor.name = name;
 	descriptor.mimeType = nullable(mcpAppMimeType);
-	if (description.length)
-		descriptor.description = nullable(description);
+	if (opts.description.length)
+		descriptor.description = nullable(opts.description);
 	if (wrapped.type == Json.Type.object)
 		descriptor.meta = wrapped;
 
@@ -330,8 +337,8 @@ unittest  // UiResourceCsp.fromJson skips non-string domain entries
 unittest  // Ui*.fromJson yields an empty value for non-object input
 {
 	foreach (j; [
-			Json(null), Json(5), Json("x"), Json.emptyArray, Json.undefined
-		])
+		Json(null), Json(5), Json("x"), Json.emptyArray, Json.undefined
+	])
 	{
 		assert(UiToolMeta.fromJson(j) == UiToolMeta.init);
 		assert(UiResourceCsp.fromJson(j).empty);
@@ -487,9 +494,9 @@ unittest  // registerUiResource serves HTML with the app mime type and _meta.ui
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	UiResourceMeta meta;
-	meta.csp.connectDomains = ["https://api.example.com"];
-	registerUiResource(s, "ui://demo/widget", "widget", "<h1>hi</h1>", meta);
+	UiResourceOptions opts;
+	opts.meta.csp.connectDomains = ["https://api.example.com"];
+	registerUiResource(s, "ui://demo/widget", "widget", "<h1>hi</h1>", opts);
 
 	Json rp = Json.emptyObject;
 	rp["uri"] = "ui://demo/widget";
@@ -507,9 +514,9 @@ unittest  // registerUiResource lists the resource with mime type and _meta.ui
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	UiResourceMeta meta;
-	meta.prefersBorder = nullable(true);
-	registerUiResource(s, "ui://demo/widget", "widget", "<h1>hi</h1>", meta);
+	UiResourceOptions opts;
+	opts.meta.prefersBorder = nullable(true);
+	registerUiResource(s, "ui://demo/widget", "widget", "<h1>hi</h1>", opts);
 
 	auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
 			Json.emptyObject))).get["result"]["resources"][0];
@@ -605,4 +612,20 @@ unittest  // @ui UDA attaches _meta.ui to a reflected @tool
 	assert(renderTool["_meta"]["ui"]["visibility"][1].get!string == "app");
 	// A tool without @ui carries no _meta.
 	assert("_meta" !in plainTool);
+}
+
+unittest  // registerUiResource takes its description and _meta.ui through UiResourceOptions
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	UiResourceOptions opts;
+	opts.description = "A demo widget";
+	opts.meta.prefersBorder = nullable(true);
+	registerUiResource(s, "ui://demo/widget", "widget", "<h1>hi</h1>", opts);
+
+	auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
+			Json.emptyObject))).get["result"]["resources"][0];
+	assert(res["description"].get!string == "A demo widget");
+	assert(res["_meta"]["ui"]["prefersBorder"].get!bool == true);
 }

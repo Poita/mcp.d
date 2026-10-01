@@ -24,7 +24,7 @@ the same assertions over either transport.
   the rendered app.
 - **`registerUiResource`** publishes the `ui://weather/dashboard` HTML with the
   `text/html;profile=mcp-app` MIME type (`mcpAppMimeType`) and a `_meta.ui`
-  built from `UiResourceMeta`: a CSP `connectDomains` allowlist and the
+  built from `UiResourceOptions.meta` (a `UiResourceMeta`): a CSP `connectDomains` allowlist and the
   `prefersBorder` hint.
 - **`enableApps(server)`** declares the extension capability, surfaced to modern
   clients in the `extensions` map.

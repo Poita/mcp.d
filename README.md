@@ -590,9 +590,9 @@ auto server = new McpServer("weather", "1.0.0");
 registerModule!(my.module)(server);     // a @tool tagged @ui("ui://weather/dashboard", "model", "app")
 enableApps(server);               // declare the extension capability
 
-UiResourceMeta ui;
-ui.csp.connectDomains = ["https://api.open-meteo.com"];
-ui.prefersBorder = nullable(true);
+UiResourceOptions ui;
+ui.meta.csp.connectDomains = ["https://api.open-meteo.com"];
+ui.meta.prefersBorder = nullable(true);
 registerUiResource(server, "ui://weather/dashboard", "weather_dashboard",
         dashboardHtml, ui);             // serve the ui:// HTML with text/html;profile=mcp-app
 ```
