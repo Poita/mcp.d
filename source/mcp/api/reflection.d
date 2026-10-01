@@ -928,6 +928,9 @@ private ResourceContents toResourceContents(R)(R ret, string uri, string mimeTyp
 private void registerResourceMethod(string memberName, alias overload, alias parent)(
 		McpServer server, resource attr) @safe
 {
+	static assert(Parameters!overload.length == 0, "@resource method '" ~ memberName
+			~ "' must take no parameters; use @resourceTemplate for a URI with variables.");
+
 	Resource descriptor;
 	descriptor.uri = attr.uri;
 	descriptor.name = attr.name;
@@ -3813,4 +3816,19 @@ unittest  // a default that serializes to null emits no JSON Schema default
 {
 	auto s = parametersSchema!(NullDefaultParamApi.f)();
 	assert("default" !in s["properties"]["n"], s.toString());
+}
+
+version (unittest) private final class ParamResourceApi
+{
+	@resource("file:///x", "X")
+	string x(string id) @safe
+	{
+		return id;
+	}
+}
+
+unittest  // a @resource method that takes parameters is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ParamResourceApi)));
 }
