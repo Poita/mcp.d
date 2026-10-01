@@ -5,6 +5,7 @@
 module mcp.protocol.jsonhelpers;
 
 import std.traits : isIntegral, isFloatingPoint;
+import std.bigint : BigInt;
 import std.typecons : Nullable;
 import vibe.data.json : Json;
 
@@ -105,23 +106,37 @@ bool tryGet(T)(Json j, string key, ref T val) @safe if (!is(T : Nullable!U, U))
 	return true;
 }
 
+/// Read `v` as a JSON number into `result`, widening an integer (`int_` or
+/// `bigInt`) to `double`. Returns false, leaving `result` untouched, for any
+/// other JSON type, including a numeric string. Never throws.
+bool tryNumber(Json v, ref double result) @safe
+{
+	switch (v.type)
+	{
+	case Json.Type.int_:
+		result = cast(double) v.get!long;
+		return true;
+	case Json.Type.bigInt:
+		result = cast(double) v.get!BigInt;
+		return true;
+	case Json.Type.float_:
+		result = v.get!double;
+		return true;
+	default:
+		return false;
+	}
+}
+
 /// `v` as a JSON number (integer or float), for the spec `number` field `what`.
 /// Throws -32602 for any other JSON type, including a numeric string.
 double numberOrThrow(Json v, string what) @safe
 {
 	import mcp.protocol.errors : invalidParams;
 
-	switch (v.type)
-	{
-	case Json.Type.int_:
-		return cast(double) v.get!long;
-	case Json.Type.bigInt:
-		return v.to!double;
-	case Json.Type.float_:
-		return v.get!double;
-	default:
+	double d;
+	if (!tryNumber(v, d))
 		throw invalidParams("'" ~ what ~ "' must be a number");
-	}
+	return d;
 }
 
 /// Throw -32602 unless `j` is a JSON object. `what` names the value in the

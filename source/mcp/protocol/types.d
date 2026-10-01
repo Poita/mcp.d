@@ -5,7 +5,7 @@ import vibe.data.json : Json, parseJsonString, deserializeJson, serializeToJson;
 import mcp.protocol.capabilities;
 import mcp.protocol.errors : ErrorCode, McpException;
 import mcp.protocol.versions : ProtocolVersion, toWire;
-import mcp.protocol.jsonhelpers : getOr, tryGet, requireObject;
+import mcp.protocol.jsonhelpers : getOr, tryGet, requireObject, tryNumber;
 import mcp.protocol.tasks : Task, makeCreateTaskResult, isCreateTaskResult;
 import mcp.protocol.mrtr : InputRequest, emitInputRequired, parseInputRequired;
 import mcp.protocol.modern : CacheHint, parseCacheHint, withCache;
@@ -1030,13 +1030,12 @@ Json emptyObjectSchema() @safe
 /// serializes a whole-valued `double` (e.g. `5.0`) as a JSON integer, so a value
 /// the producer intended as a number can arrive as `Json.Type.int_`; clients that
 /// expect a `double` would otherwise have to re-derive this widening themselves.
-/// Returns `j.get!double` for a float, `cast(double) j.get!long` for an integer,
-/// and throws for any non-numeric `Json`.
+/// Throws `McpException(invalidParams)` for any non-numeric `Json`.
 double asNumber(Json j) @safe
 {
-	if (j.type == Json.Type.int_)
-		return cast(double) j.get!long;
-	return j.get!double;
+	import mcp.protocol.jsonhelpers : numberOrThrow;
+
+	return numberOrThrow(j, "value");
 }
 
 unittest  // asNumber reads a float-encoded JSON number
@@ -1049,11 +1048,19 @@ unittest  // asNumber widens an integer-encoded JSON number to double
 	assert(asNumber(Json(5)) == 5.0);
 }
 
-unittest  // asNumber throws on a non-numeric JSON value
+unittest  // asNumber throws invalidParams on a non-numeric JSON value
 {
-	import std.exception : assertThrown;
+	import std.exception : collectException;
 
-	assertThrown(asNumber(Json("not a number")));
+	auto ex = cast(McpException) collectException(asNumber(Json("not a number")));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // asNumber reads an integer too large for long
+{
+	import vibe.data.json : parseJsonString;
+
+	assert(asNumber(parseJsonString("100000000000000000000")) == 1e20);
 }
 
 /// Result of `tools/call`.
@@ -5250,22 +5257,13 @@ struct ProgressNotification
 		if ("progressToken" in params)
 			n.progressToken = params["progressToken"];
 		if ("progress" in params)
-			n.progress = toDouble(params["progress"]);
-		if ("total" in params && (params["total"].type == Json.Type.int_
-				|| params["total"].type == Json.Type.float_))
-			n.total = toDouble(params["total"]);
+			tryNumber(params["progress"], n.progress);
+		double total;
+		if ("total" in params && tryNumber(params["total"], total))
+			n.total = total;
 		if ("message" in params && params["message"].type == Json.Type.string)
 			n.message = params["message"].get!string;
 		return n;
-	}
-
-	private static double toDouble(Json v) @safe
-	{
-		if (v.type == Json.Type.float_)
-			return v.get!double;
-		if (v.type == Json.Type.int_)
-			return cast(double) v.get!long;
-		return 0;
 	}
 
 	/// The progress token rendered as a string, or `""` when it is absent or not a
