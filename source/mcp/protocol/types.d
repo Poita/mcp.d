@@ -3453,12 +3453,19 @@ struct ElicitResult
 	/// Convenience constructor for an `accept` whose collected `content` is built
 	/// by serializing a typed struct `T` (symmetric with `contentAs!T`). The struct
 	/// fields become the `{name: value}` content map, so `accept!T(v).contentAs!T`
-	/// round-trips.
+	/// round-trips. Enum fields are written by member name, matching the string
+	/// `enum` schema the reflection layer derives for them.
 	static ElicitResult accept(T)(T value) @safe
 	{
+		import mcp.api.reflection : EnumByNamePolicy;
+		import vibe.data.json : JsonSerializer;
+		import vibe.data.serialization : serializeWithPolicy;
+
 		ElicitResult r;
 		r.action = ElicitAction.accept;
-		r.content = () @trusted { return serializeToJson(value); }();
+		r.content = () @trusted {
+			return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(value);
+		}();
 		return r;
 	}
 
@@ -3543,12 +3550,26 @@ struct ElicitResult
 	/// into a typed struct `T`. Pairs with `RequestContext.elicit!T`, whose
 	/// `requestedSchema` is derived from the same `T`. Only meaningful for an
 	/// `accept`; on a `decline`/`cancel` (no content) this returns `T.init`, so
-	/// callers should branch on `action` first.
+	/// callers should branch on `action` first. Enum fields are read by member
+	/// name. The content comes from the peer, so a value that does not fit `T`
+	/// throws `McpException(invalidParams)`.
 	T contentAs(T)() const @safe
 	{
+		import mcp.api.reflection : EnumByNamePolicy;
+		import mcp.protocol.errors : invalidParams;
+		import vibe.data.json : JsonSerializer;
+		import vibe.data.serialization : deserializeWithPolicy;
+
 		if (content.type != Json.Type.object)
 			return T.init;
-		return () @trusted { return deserializeJson!T(content); }();
+		try
+			return () @trusted {
+			return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(content);
+		}();
+		catch (McpException e)
+			throw e;
+		catch (Exception e)
+			throw invalidParams("elicitation content: " ~ e.msg);
 	}
 }
 
@@ -3795,6 +3816,58 @@ unittest  // ElicitResult.accept!T serializes a struct and contentAs!T round-tri
 	assert(r.action == ElicitAction.accept);
 	auto back = r.contentAs!Booking;
 	assert(back == orig);
+}
+
+unittest  // ElicitResult.accept!T writes enum fields by member name
+{
+	enum Seat
+	{
+		aisle,
+		window
+	}
+
+	static struct Pref
+	{
+		Seat seat;
+	}
+
+	auto r = ElicitResult.accept(Pref(Seat.window));
+	assert(r.content["seat"].type == Json.Type.string);
+	assert(r.content["seat"].get!string == "window");
+}
+
+unittest  // ElicitResult.contentAs!T reads enum fields by member name
+{
+	enum Seat
+	{
+		aisle,
+		window
+	}
+
+	static struct Pref
+	{
+		Seat seat;
+	}
+
+	auto r = ElicitResult.accept(`{"seat":"window"}`.parseJsonString);
+	assert(r.contentAs!Pref.seat == Seat.window);
+}
+
+unittest  // ElicitResult.contentAs!T maps malformed peer content to invalidParams
+{
+	static struct Pref
+	{
+		int count;
+	}
+
+	auto r = ElicitResult.accept(`{"count":"lots"}`.parseJsonString);
+	try
+	{
+		cast(void) r.contentAs!Pref;
+		assert(false, "expected McpException");
+	}
+	catch (McpException e)
+		assert(e.code == ErrorCode.invalidParams);
 }
 
 unittest  // CallToolResult.structuredContentAs!T decodes structuredContent into a struct
