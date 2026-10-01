@@ -77,7 +77,14 @@ struct IntrospectionConfig
 /// concurrency contract in `mcp.transport.session`).
 TokenValidator introspectionVerifier(IntrospectionConfig cfg) @safe
 {
-	auto introspector = new HttpIntrospector(cfg);
+	return introspectionValidator(cfg, new HttpIntrospector(cfg));
+}
+
+/// `introspectionVerifier` over an arbitrary `Introspector`, so the validation
+/// path can be driven without HTTP. A failed introspection call is logged and
+/// rejects the token.
+package TokenValidator introspectionValidator(IntrospectionConfig cfg, Introspector introspector) @safe
+{
 	auto cache = cfg.cacheTtl > Duration.zero ? new PositiveCache(cfg.cacheTtl) : null;
 	return (string token) @safe {
 		if (token.length == 0)
@@ -91,8 +98,14 @@ TokenValidator introspectionVerifier(IntrospectionConfig cfg) @safe
 			const doc = introspector.introspect(token);
 			ti = introspectionResult(cfg, doc);
 		}
-		catch (Exception)
+		catch (Exception e)
+		{
+			import vibe.core.log : logWarn;
+
+			logWarn("Token introspection at %s failed; rejecting the token: %s",
+					cfg.introspectionEndpoint, e.msg);
 			return TokenInfo.invalid();
+		}
 		if (ti.valid && cache !is null)
 			cache.put(token, ti, currentUnixTime());
 		return ti;
@@ -119,8 +132,13 @@ TokenInfo introspectionResult(IntrospectionConfig cfg, string responseJson) @saf
 	Json doc;
 	try
 		doc = parseJsonString(responseJson);
-	catch (Exception)
+	catch (Exception e)
+	{
+		import vibe.core.log : logWarn;
+
+		logWarn("Token introspection returned a malformed response; rejecting the token: %s", e.msg);
 		return TokenInfo.invalid();
+	}
 
 	if (doc.type != Json.Type.object)
 		return TokenInfo.invalid();
@@ -385,18 +403,11 @@ version (unittest)
 		}
 	}
 
-	// Build a TokenValidator over a stub introspector (mirrors the production
-	// wiring in introspectionVerifier, minus the real HTTP).
+	// Build a TokenValidator over a stub introspector through the production
+	// wiring, minus the real HTTP.
 	private TokenValidator stubVerifier(IntrospectionConfig cfg, Introspector introspector) @safe
 	{
-		return (string token) @safe {
-			if (token.length == 0)
-				return TokenInfo.invalid();
-			try
-				return introspectionResult(cfg, introspector.introspect(token));
-			catch (Exception)
-				return TokenInfo.invalid();
-		};
+		return introspectionValidator(cfg, introspector);
 	}
 }
 
@@ -701,4 +712,51 @@ unittest  // PositiveCache skips storing a token whose exp claim is already in t
 	// The entry must not be stored — length stays 0 and a get returns null.
 	assert(cache.length == 0);
 	assert(cache.get("tok", 1000) is null);
+}
+
+version (unittest)
+{
+	import vibe.core.log : LogLevel, Logger, LogLine;
+
+	// Records the text of every warning-or-higher log line.
+	private final class CaptureLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.warn;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	private final class ThrowingIntrospector : Introspector
+	{
+		string introspect(string token) @safe
+		{
+			throw new Exception("introspection endpoint unreachable");
+		}
+	}
+}
+
+unittest  // a failed introspection call is logged rather than silently rejected
+{
+	import std.algorithm : any, canFind;
+	import vibe.core.log : deregisterLogger, registerLogger;
+
+	auto logger = new CaptureLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+
+	IntrospectionConfig cfg;
+	cfg.introspectionEndpoint = "https://as.example.com/introspect";
+	auto v = introspectionValidator(cfg, new ThrowingIntrospector);
+	assert(!v("tok").valid);
+	auto lines = () @trusted { return (cast() logger).lines; }();
+	assert(lines.any!(l => l.canFind("introspection endpoint unreachable")));
 }
