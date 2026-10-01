@@ -2195,6 +2195,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// The push channel this stream's events are recorded on for resumption, or
 	// null when the stream is not resumable.
 	private ServerPushChannel replay_;
+	// Set once a write to the response fails; later frames skip the socket.
+	private bool disconnected_;
 
 	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
 			TokenInfo auth = TokenInfo.invalid(),
@@ -2337,10 +2339,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		const frame = formatPrimingEvent(replay_ !is null
 				? replay_.primeStream(streamId, token_) : nextEventId());
 		eventSeq++;
-		() @trusted {
-			res.bodyWriter.write(cast(const(ubyte)[]) frame);
-			res.bodyWriter.flush();
-		}();
+		writeFrame(frame);
 	}
 
 	private void writeEvent(Json msg) @safe
@@ -2349,10 +2348,25 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		const frame = replay_ !is null ? replay_.publishStreamEvent(streamId,
 				token_, msg) : formatSseEvent(nextEventId(), msg);
 		eventSeq++;
-		() @trusted {
+		writeFrame(frame);
+	}
+
+	// A client disconnect does not cancel the request (basic/transports
+	// §Resumability: disconnection SHOULD NOT be interpreted as cancellation), so a
+	// failed write marks the stream disconnected and later frames are skipped
+	// rather than thrown into the handler. Frames are still recorded by the replay
+	// channel (if any) before reaching here, so a resuming GET receives them.
+	private void writeFrame(string frame) @safe
+	{
+		if (disconnected_)
+			return;
+		try
+			() @trusted {
 			res.bodyWriter.write(cast(const(ubyte)[]) frame);
 			res.bodyWriter.flush();
 		}();
+		catch (Exception)
+			disconnected_ = true;
 	}
 
 	// Progress and log notifications are optional: a client whose Accept excludes
@@ -2424,15 +2438,20 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		// Bind the outbound id to this request's session token (keyed `(token, id)`)
 		// so only a response arriving on the same session can resolve it.
 		coord.register(id, token_);
-		// A failed SSE write (broken pipe on the priming-event or request frame)
-		// must deregister the waiter before propagating, otherwise the mount-global
-		// coordinator retains a pending entry for the life of the mount.
+		// A refused upgrade or a dropped stream must deregister the waiter before
+		// failing, otherwise the mount-global coordinator retains a pending entry for
+		// the life of the mount.
 		try
 			writeEvent(makeRequest(Json(id), method, params));
 		catch (Exception e)
 		{
 			coord.cancel(id, token_);
 			throw e;
+		}
+		if (disconnected_)
+		{
+			coord.cancel(id, token_);
+			throw internalError("client disconnected before the request could be sent");
 		}
 		// Bind the awaiting fiber to this connection's liveness. The response to
 		// this server->client request arrives on a SEPARATE POST, so a disconnect of
@@ -3453,4 +3472,65 @@ unittest  // addListener cleans up its Phase 1 registration when Phase 2 replay 
 	assert(threw, "exception from write must propagate out of addListener");
 	// The listener registered in Phase 1 must have been removed when Phase 2 threw.
 	assert(ch.listenerCount == 0, "orphaned listener must be cleaned up when replay write throws");
+}
+
+version (unittest) import vibe.core.stream : OutputStream, IOMode;
+
+version (unittest) private final class BrokenPipeSink : OutputStream
+{
+	size_t write(scope const(ubyte)[], IOMode) @safe
+	{
+		throw new Exception("broken pipe");
+	}
+
+	void flush() @safe
+	{
+		throw new Exception("broken pipe");
+	}
+
+	void finalize() @safe
+	{
+	}
+}
+
+unittest  // a dropped POST stream does not abort the handler's progress/log/final writes
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto res = createTestHTTPServerResponse(new BrokenPipeSink, null,
+			TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, coord, caps, Json("tok"));
+	ctx.log("info", Json("first"));
+	ctx.reportProgress(1);
+	ctx.log("info", Json("second"));
+	ctx.finishWith(makeResponse(Json(1), Json.emptyObject));
+	assert(ctx.streaming);
+}
+
+unittest  // events after a POST stream drops are still recorded for Last-Event-ID resume
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import mcp.protocol.versions : ProtocolVersion;
+
+	auto res = createTestHTTPServerResponse(new BrokenPipeSink, null,
+			TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
+			TokenInfo.invalid(), false, ProtocolVersion.v2025_11_25, "sess-A");
+	ctx.enableReplay(ch);
+	const primingId = ctx.nextEventId();
+	ctx.log("info", Json("after-drop"));
+	ctx.finishWith(makeResponse(Json(9), Json.emptyObject));
+
+	string[] resumed;
+	ch.addListener((string f) @safe { resumed ~= f; }, Json.init,
+			ListenFilter.init, primingId, null, "sess-A");
+	assert(resumed.length == 2);
+	assert(resumed[0].canFind("after-drop"));
+	assert(resumed[1].canFind("\"id\":9"));
 }
