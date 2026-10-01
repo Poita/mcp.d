@@ -17,13 +17,13 @@ They are **modern-only** (protocol `2026-07-28`): the server only emits the
 fields when the negotiated protocol is the modern protocol, and the client must
 opt in with `client.enableModern()`.
 
-- **Per-resource hint** — `server.d` declares it with the `@cache(ttl, scope)`
+- **Per-resource hint** — `server.d` declares it with the `@cacheable(ttl, scope)`
   UDA (a `core.time.Duration`) on a `@resource` method; `registerHandlers` plumbs
   it onto that resource's `resources/read` result (serialized on the wire as
   `ttlMs` milliseconds).
   ```d
   @resource("config://app", "Application configuration", "application/json")
-  @cache(60.seconds, "private")
+  @cacheable(60.seconds, "private")
   string config() @safe { return `{"theme":"dark","retries":3}`; }
   ```
 - **Per-list hint** — `server.d` calls
@@ -40,7 +40,7 @@ reported faithfully.
 
 ## Typed APIs used
 
-The server stays in the ergonomic UDA style (`@resource` + `@cache` +
+The server stays in the ergonomic UDA style (`@resource` + `@cacheable` +
 `registerHandlers`) — no low-level raw-Json registration. Cache hints are passed
 as typed `CacheHint` / `CacheScope` values, and the client consumes typed
 `listResources()` / `readResource()` results whose `.cache` field is a typed

@@ -499,18 +499,18 @@ private void applyResourceMetadata(alias overload, D)(ref D descriptor) @safe
 	applyIconsAndMeta!overload(descriptor);
 }
 
-/// Collect a `@cache` UDA into a `Nullable!CacheHint` for resource/template
+/// Collect a `@cacheable` UDA into a `Nullable!CacheHint` for resource/template
 /// registration; null when absent.
 private Nullable!CacheHint collectCache(alias overload)() @safe
 {
 	Nullable!CacheHint hint;
 	static foreach (a; __traits(getAttributes, overload))
 	{
-		static if (is(typeof(a) == cache))
+		static if (is(typeof(a) == cacheable))
 		{
 			{
 				static assert(a.scope_ == "public" || a.scope_ == "private",
-						"@cache scope_ must be \"public\" or \"private\", got: " ~ a.scope_);
+						"@cacheable scope_ must be \"public\" or \"private\", got: " ~ a.scope_);
 				CacheHint h;
 				h.ttl = a.ttl;
 				h.cacheScope = (a.scope_ == "private") ? CacheScope.private_ : CacheScope.public_;
@@ -1173,7 +1173,7 @@ version (unittest)
 		@resource("ext://cached", "Cached", "application/json")
 		@icon("https://example.com/res.svg")
 		@meta(parseJsonString(`{"origin":"db"}`))
-		@cache(5.seconds, "private")
+		@cacheable(5.seconds, "private")
 		string cached() @safe
 		{
 			return "{}";
@@ -2330,7 +2330,7 @@ version (unittest) private auto modernRead(string uri) @safe
 	return Message(makeRequest(Json(1), "resources/read", params));
 }
 
-unittest  // @cache UDA on a resource: modern resources/read carries CacheableResult fields
+unittest  // @cacheable UDA on a resource: modern resources/read carries CacheableResult fields
 {
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new ExtApi);
@@ -2340,7 +2340,7 @@ unittest  // @cache UDA on a resource: modern resources/read carries CacheableRe
 	assert(rr["result"]["cacheScope"].get!string == "private");
 }
 
-unittest  // @cache UDA: legacy resources/read has NO cache fields (no wire regression)
+unittest  // @cacheable UDA: legacy resources/read has NO cache fields (no wire regression)
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -2357,14 +2357,14 @@ unittest  // @cache UDA: legacy resources/read has NO cache fields (no wire regr
 version (unittest) private class InvalidCacheScopeApi
 {
 	@resource("ext://bad", "Bad", "application/json")
-	@cache(5.seconds, "Private")
+	@cacheable(5.seconds, "Private")
 	string bad() @safe
 	{
 		return "{}";
 	}
 }
 
-unittest  // @cache: an unrecognised scope_ value is rejected at compile time
+unittest  // @cacheable: an unrecognised scope_ value is rejected at compile time
 {
 	auto s = new McpServer("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new InvalidCacheScopeApi)));
@@ -3161,7 +3161,7 @@ version (unittest) private final class FacetParamApi
 	}
 
 	@tool("email", "Send to an email address")
-	string email(@format("email") string address)@safe
+	string email(@schemaFormat("email") string address)@safe
 	{
 		return address;
 	}

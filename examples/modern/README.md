@@ -42,7 +42,7 @@ hand-built request/response Json on the server:
   (plus a JSON text mirror) from the returned struct — no hand-built
   `CallToolResult`.
 - The `@resource` `greeting` method's modern freshness hint is declared with the
-  `@cache(ttl, scope)` UDA (a `core.time.Duration`), and `registerHandlers` wires
+  `@cacheable(ttl, scope)` UDA (a `core.time.Duration`), and `registerHandlers` wires
   everything up.
 
 The client side keeps types where they belong — on the *result*:

@@ -575,7 +575,7 @@ An optional tool parameter is modelled as a bare type left out of `required` (th
 convention used by the MCP reference servers); declare it `Nullable!T` or give it a
 D default value (`int page = 1`). Field/parameter constraints are added with UDAs:
 `@minimum` / `@maximum`, `@minLength` / `@maxLength`, `@pattern`, `@minItems` /
-`@maxItems`, `@format`, `@title`, `@schemaDefault`, and `@fieldDescription`.
+`@maxItems`, `@schemaFormat` (JSON Schema `format`), `@title`, `@schemaDefault`, and `@fieldDescription`.
 
 ## MCP Apps (interactive UI)
 

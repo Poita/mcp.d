@@ -2,10 +2,10 @@
  * Caching (CacheableResult) example — server side, UDA style, DUAL TRANSPORT.
  *
  * Demonstrates the modern `CacheableResult` freshness hints from the server's
- * point of view, using the ergonomic UDA API (`@resource` + `@cache` +
+ * point of view, using the ergonomic UDA API (`@resource` + `@cacheable` +
  * `registerHandlers`):
  *
- *   - a PER-RESOURCE hint, declared with the `@cache(ttl, "public"|"private")`
+ *   - a PER-RESOURCE hint, declared with the `@cacheable(ttl, "public"|"private")`
  *     UDA (a `core.time.Duration`) on a `@resource` method. The reflection layer
  *     plumbs it through so it rides on this resource's `resources/read` result as
  *     `ttlMs` / `cacheScope`.
@@ -36,7 +36,7 @@
 module caching_server;
 
 import mcp;
-import mcp.api.attributes : resource, cache;
+import mcp.api.attributes : resource, cacheable;
 import mcp.api.reflection : registerHandlers;
 import mcp.protocol.modern : CacheHint, CacheScope;
 
@@ -51,15 +51,15 @@ enum Duration ConfigTtl = 60.seconds;
 enum Duration ListTtl = 5.seconds;
 
 /// The annotated resources of the caching example. `registerHandlers` registers
-/// each `@resource` method; the `@cache` UDA declares the per-resource freshness
+/// each `@resource` method; the `@cacheable` UDA declares the per-resource freshness
 /// hint that rides on the matching modern `resources/read`.
 final class CachingApi
 {
 	/// A direct resource carrying a PER-RESOURCE cache hint. The body rarely
 	/// changes, so we tell consumers/intermediaries it may be cached privately
-	/// for 60s — declared with `@cache(ConfigTtl, "private")`.
+	/// for 60s — declared with `@cacheable(ConfigTtl, "private")`.
 	@resource("config://app", "Application configuration", "application/json")
-	@cache(ConfigTtl, "private")
+	@cacheable(ConfigTtl, "private")
 	string config() @safe
 	{
 		return `{"theme":"dark","retries":3}`;
@@ -79,7 +79,7 @@ void main(string[] args) @safe
 	auto server = new McpServer("caching-example", "1.0.0",
 			nullable("Demonstrates modern CacheableResult freshness hints."));
 
-	// Register the @resource methods (with their @cache hints) in one call.
+	// Register the @resource methods (with their @cacheable hints) in one call.
 	registerHandlers(server, new CachingApi);
 
 	// A PER-LIST cache hint on resources/list: the catalogue itself is stable

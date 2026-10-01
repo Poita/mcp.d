@@ -16,7 +16,7 @@
  * The tool and resource are declared in the ergonomic UDA style: a `@tool`
  * method returning a TYPED struct (its input schema is inferred from the typed
  * parameters and its `structuredContent` is inferred from the returned struct),
- * and a `@resource` method carrying its modern freshness hint via `@cache`.
+ * and a `@resource` method carrying its modern freshness hint via `@cacheable`.
  * `registerHandlers` wires both onto the server. There is no hand-built
  * request/response Json anywhere in this file.
  *
@@ -60,12 +60,12 @@ final class StatelessModernApi
 	}
 
 	/// A static greeting resource. The modern-only per-resource `CacheableResult`
-	/// freshness hint is declared via `@cache`; a modern client's
+	/// freshness hint is declared via `@cacheable`; a modern client's
 	/// `readResource("demo://greeting").cache` will carry exactly these values
 	/// (ttl=9.seconds, wire ttlMs=9000, scope=private). Legacy peers see no
 	/// cache fields.
 	@resource("demo://greeting", "greeting", "text/plain")
-	@cache(9.seconds, "private")
+	@cacheable(9.seconds, "private")
 	string greeting() @safe
 	{
 		return "hello from the modern protocol server";
@@ -79,7 +79,7 @@ void main(string[] args) @safe
 
 	// Register every @tool / @resource annotated method in one call; input
 	// schema, the SumResult-derived output schema + structuredContent, argument
-	// marshalling, and the resource's @cache freshness hint are all derived from
+	// marshalling, and the resource's @cacheable freshness hint are all derived from
 	// the annotations and signatures.
 	registerHandlers(server, new StatelessModernApi);
 

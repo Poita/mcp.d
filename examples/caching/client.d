@@ -9,7 +9,7 @@
  *      and lists both registered resources.
  *   2. reading config://app carries the PER-RESOURCE hint
  *      (ttlMs=60000, scope=private) and the expected body.
- *   3. reading status://live (no @cache) carries the modern-mandatory do-not-cache
+ *   3. reading status://live (no @cacheable) carries the modern-mandatory do-not-cache
  *      default hint (ttlMs:0, public) — the modern CacheableResult schema requires
  *      ttlMs on every cacheable result.
  *
@@ -81,7 +81,7 @@ int main(string[] args) @safe
 		checkEq(cfg.cache.get.ttl, ExpectConfigTtl, "config://app ttl");
 		checkEq(cfg.cache.get.cacheScope, CacheScope.private_, "config://app cacheScope");
 
-		// --- 3. status://live has no @cache UDA, so under the modern protocol it
+		// --- 3. status://live has no @cacheable UDA, so under the modern protocol it
 		//        still carries the MANDATORY freshness hint as the conservative
 		//        do-not-cache default (ttlMs:0, public scope) — 2026-07-28
 		//        CacheableResult schema requires ttlMs on every cacheable result.

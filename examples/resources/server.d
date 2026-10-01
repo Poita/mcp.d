@@ -5,7 +5,7 @@
  * UDA style (`@resource` / `@resourceTemplate` / `@tool` annotated methods
  * registered with `registerHandlers`):
  *   - a static `@resource` direct resource (`config://app`) with a modern
- *     `CacheableResult` freshness hint declared via `@cache(ttl, scope)`,
+ *     `CacheableResult` freshness hint declared via `@cacheable(ttl, scope)`,
  *   - a `@resourceTemplate` (`note:///{id}`) whose reader receives the matched
  *     `{id}` as a typed argument,
  *   - `subscriptions/listen` + push `notifications/resources/updated` (via
@@ -74,7 +74,7 @@ final class ResourcesApi
 	/// (ttlMs/cacheScope) is emitted on the modern `resources/read` response so a
 	/// modern client can cache the contents.
 	@resource("config://app", "App config", "application/json")
-	@cache(60.seconds, "public")
+	@cacheable(60.seconds, "public")
 	string config() @safe
 	{
 		return `{"name":"resources-example","featureFlags":["resources","subscribe"]}`;

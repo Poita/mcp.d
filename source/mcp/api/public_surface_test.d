@@ -316,3 +316,23 @@ unittest
 	static assert(__traits(getProtection, __traits(getMember, McpServer,
 			"toolInputSchema")) == "package");
 }
+
+unittest  // `import mcp;` alongside std.format leaves `format` unambiguous
+{
+	static assert(__traits(compiles, {
+			import mcp;
+			import std.format;
+
+			string s = format("%s", 1);
+		}));
+}
+
+unittest  // `import mcp;` alongside std.algorithm leaves `cache` unambiguous
+{
+	static assert(__traits(compiles, {
+			import mcp;
+			import std.algorithm;
+
+			auto r = [1, 2].cache;
+		}));
+}

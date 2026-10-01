@@ -411,13 +411,15 @@ struct meta
 }
 
 /// The JSON Schema constraint UDAs (`@fieldDescription`, `@minimum`, `@maximum`,
-/// `@title`, `@format`, `@minLength`, `@maxLength`, `@pattern`, `@minItems`,
+/// `@title`, `@schemaFormat`, `@minLength`, `@maxLength`, `@pattern`, `@minItems`,
 /// `@maxItems`, `@schemaDefault`/`SchemaDefault`) are owned by the `jsonschema`
 /// package, which also owns the schema generation (`jsonSchemaOf`) and facet
 /// application (`applyUdaFacets`) that consume them. They are re-exported here so
 /// MCP users get them from `mcp.api.attributes` alongside the MCP-specific UDAs,
-/// and so the type identity matches what `jsonschema` matches against.
-public import jsonschema : fieldDescription, minimum, maximum, title, format,
+/// and so the type identity matches what `jsonschema` matches against. The
+/// `format` facet is re-exported as `schemaFormat` so `import mcp;` does not
+/// collide with `std.format.format`.
+public import jsonschema : fieldDescription, minimum, maximum, title, schemaFormat = format,
 	minLength, maxLength, pattern, minItems, maxItems, SchemaDefault, schemaDefault;
 
 /// UDA declaring a per-resource / per-template modern `CacheableResult` freshness
@@ -431,10 +433,10 @@ public import jsonschema : fieldDescription, minimum, maximum, title, format,
 /// Example:
 /// ---
 /// @resource("file:///data", "Data", "application/json")
-/// @cache(5.seconds, "private")
+/// @cacheable(5.seconds, "private")
 /// string data() { ... }
 /// ---
-struct cache
+struct cacheable
 {
 	Duration ttl; /// how long the result may be cached
 	string scope_ = "public"; /// "public" (default) | "private"
