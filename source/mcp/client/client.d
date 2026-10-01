@@ -2734,14 +2734,16 @@ final class McpClient : ClientProtocol
 		auto ms = new ManagedStream(p, onEvent, onControl);
 		openManagedStream(sub, ms, p.cursor);
 		managedStreams_[sub] = ms;
-		sub.onTeardown(() @safe nothrow{
+		auto release = () @safe nothrow{
 			ms.stream.close();
 			try
 				managedStreams_.remove(sub);
 			catch (Exception)
 			{
 			}
-		});
+		};
+		sub.onTeardown(release);
+		sub.onEnd(release);
 		trackSubscription(sub);
 		spawnEventTask(() @safe { runStreamWatchdog(sub); });
 		return sub;
@@ -2947,6 +2949,13 @@ final class McpClient : ClientProtocol
 				unsubscribeWebhookEvents(p.name, p.arguments, p.delivery.url);
 				rx.unregister(id);
 			}
+			catch (Exception)
+			{
+			}
+		});
+		sub.onEnd(() @safe nothrow{
+			try
+				rx.unregister(id);
 			catch (Exception)
 			{
 			}
@@ -8754,6 +8763,29 @@ unittest  // subscribeStream tracks the cursor and ends the handle on a terminat
 	assert(!sub.active);
 }
 
+unittest  // an events stream the server ends drops its handlers
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.streamEvents("incident.created", (EventOccurrence o) @safe {});
+	assert(c.eventStreams_.length == 1);
+	t.streams[0].finish();
+	assert(c.eventStreams_.length == 0, "a server-ended stream must not keep its handlers");
+}
+
+unittest  // a terminated managed push subscription releases its stream
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
+	});
+	c.dispatchInbound(Message(makeNotification(eventsTerminatedNotification,
+			withSubscriptionId(Json(["error": Json(["code": Json(-32012)])]), Json(1)))));
+	assert(!sub.active);
+	assert(c.managedStreams_.length == 0, "a terminated subscription must leave the registry");
+	assert(t.streams[0].ended, "a terminated subscription must close its stream");
+}
+
 unittest  // a managed push stream drops an occurrence whose eventId was already delivered
 {
 	auto c = new McpClient(new RecordingClientTransport());
@@ -9089,6 +9121,19 @@ unittest  // a webhook `terminated` envelope ends the managed subscription
 	])), "m1");
 	assert(h.controls.length == 1 && h.controls[0].kind == EventControlKind.terminated);
 	assert(!h.sub.active, "a terminated subscription must no longer report active");
+}
+
+unittest  // a terminated webhook subscription unregisters from the receiver
+{
+	import mcp.protocol.events : terminatedEnvelope;
+
+	auto h = webhookHarness();
+	h.deliver(terminatedEnvelope(Json([
+		"code": Json(-32012),
+		"message": Json("revoked")
+	])), "m1");
+	assert(h.rx.processDelivery("{}", ["X-MCP-Subscription-Id": "sub_x"]).status == 503,
+			"a terminated subscription must no longer be routed by the receiver");
 }
 
 unittest  // the webhook refresh loop stops once the subscription is terminated

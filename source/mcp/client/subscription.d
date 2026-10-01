@@ -43,10 +43,12 @@ final class SubscriptionStream
 	// stdio); the HTTP transport uses it to force-close the listen stream's socket
 	// so a blocked read unblocks immediately.
 	private void delegate() @safe nothrow onCancel_;
-	// Optional client-supplied cleanup, run once on the first cancel() after the
-	// transport's own teardown. `McpClient.streamEvents` uses it to deregister the
-	// stream's per-subscription event/control handlers when the stream ends.
+	// Optional client-supplied cleanup, run once when the stream ends: on the
+	// first cancel() (after the transport's own teardown) or when the server ends
+	// it. `McpClient.streamEvents` uses it to deregister the stream's
+	// per-subscription event/control handlers.
 	private void delegate() @safe nothrow cleanup_;
+	private bool cleanedUp_;
 
 	/// Construct a handle wrapping a shared cancellation flag. Created by a
 	/// `ClientTransport` when it opens the listen stream. `onCancel`, when
@@ -70,14 +72,22 @@ final class SubscriptionStream
 		{
 			if (onCancel_ !is null)
 				onCancel_();
-			if (cleanup_ !is null)
-				cleanup_();
+			runCleanup();
 		}
 	}
 
-	/// Attach a cleanup run exactly once on the first `cancel()`/`close()`, after
-	/// the transport's own teardown. Set immediately after the stream is opened
-	/// (before any cancel can race), so a later cancel deregisters client state.
+	private void runCleanup() @safe nothrow
+	{
+		if (cleanedUp_ || cleanup_ is null)
+			return;
+		cleanedUp_ = true;
+		cleanup_();
+	}
+
+	/// Attach a cleanup run exactly once when the stream ends: on the first
+	/// `cancel()`/`close()` (after the transport's own teardown) or when the server
+	/// ends it. Set immediately after the stream is opened (before any end can
+	/// race), so client state is always deregistered.
 	void addCleanup(void delegate() @safe nothrow cleanup) @safe nothrow
 	{
 		cleanup_ = cleanup;
@@ -109,14 +119,16 @@ final class SubscriptionStream
 		return error_;
 	}
 
-	/// Record that the server ended the stream, with `error` when it failed. Only
-	/// the first end is kept, and an end after a local cancel is ignored.
-	package void finish(McpException error = null) @safe nothrow @nogc
+	/// Record that the server ended the stream, with `error` when it failed, and
+	/// run the cleanup. Only the first end is kept, and an end after a local
+	/// cancel is ignored.
+	package void finish(McpException error = null) @safe nothrow
 	{
 		if (finished_ || cancelled)
 			return;
 		finished_ = true;
 		error_ = error;
+		runCleanup();
 	}
 }
 

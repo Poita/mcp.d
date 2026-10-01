@@ -22,6 +22,7 @@ final class EventSubscription
 	private DeliveryMode mode_;
 	private Nullable!string cursor_;
 	private void delegate() @safe nothrow teardown_;
+	private void delegate() @safe nothrow onEnd_;
 	// Bounded `eventId` memory for deduplication: a fixed ring of the most recent
 	// ids plus a set for O(1) lookup. When the ring wraps, the id it overwrites is
 	// forgotten. A zero capacity disables deduplication.
@@ -104,10 +105,23 @@ final class EventSubscription
 			cursor_ = c;
 	}
 
-	/// Mark the subscription ended by a `terminated` control (no more occurrences).
+	/// Mark the subscription ended by the server (a `terminated` control, or a
+	/// failure that ends it): no more occurrences. Runs the `onEnd` release once.
 	package void markTerminated() @safe
 	{
+		if (terminated_)
+			return;
 		terminated_ = true;
+		if (!cancelled_ && onEnd_ !is null)
+			onEnd_();
+	}
+
+	/// Wire the release of delivery resources (stream, receiver registration) run
+	/// once when the server ends the subscription; `cancel()` runs the teardown
+	/// instead.
+	package void onEnd(void delegate() @safe nothrow e) @safe
+	{
+		onEnd_ = e;
 	}
 
 	/// Whether `cancel()` has been called — the loop/refresh task polls this to exit.
