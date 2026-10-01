@@ -6,6 +6,7 @@ import vibe.http.common : HTTPMethod;
 import vibe.stream.operations : readAllUTF8;
 
 import mcp.protocol.errors;
+import mcp.protocol.ssrf : SsrfPolicy;
 import mcp.auth.oauth;
 
 @safe:
@@ -86,6 +87,35 @@ final class OAuthClient
 	/// `client_id` (no Dynamic Client Registration needed).
 	string clientIdMetadataUrl;
 
+	/// The SSRF policy for a URL the MCP server or its authorization server
+	/// names (discovered metadata, token, registration and authorization
+	/// endpoints). Plain-http loopback is permitted only when the MCP endpoint
+	/// the user configured (`resource`) is itself on loopback, so a remote server
+	/// can never steer the client — and its codes, tokens and secrets — to a
+	/// local service.
+	private SsrfPolicy namedUrlPolicy() const @safe
+	{
+		return policyAnchoredAt(resource);
+	}
+
+	/// `allowLoopback` when `userUrl` (a URL the user configured) targets an
+	/// explicit loopback host, else `blockInternal`.
+	private static SsrfPolicy policyAnchoredAt(string userUrl) @safe
+	{
+		import mcp.protocol.ssrf : AddressClass, classifyHostLexical;
+		import vibe.inet.url : URL;
+
+		try
+		{
+			if (classifyHostLexical(URL(userUrl).host) == AddressClass.loopback)
+				return SsrfPolicy.allowLoopback;
+		}
+		catch (Exception)
+		{
+		}
+		return SsrfPolicy.blockInternal;
+	}
+
 	/// Build the `client_assertion_type` + `client_assertion` form fields for
 	/// `private_key_jwt` token-endpoint authentication (RFC 7523), or "".
 	private string clientAssertionParams(string clientId, string audience) @safe
@@ -113,20 +143,24 @@ final class OAuthClient
 		{
 			const w = parseWwwAuthenticate(wwwAuthenticateHeader);
 			// RFC 9728: the attacker-influenced resource_metadata URL from the
-			// WWW-Authenticate challenge must be HTTPS (or loopback for dev), must
-			// not target an internal/link-local address, and its origin MUST match
+			// WWW-Authenticate challenge must be HTTPS (or plain-http loopback when
+			// the endpoint itself is on loopback), must not target an
+			// internal/link-local address, and its origin MUST match
 			// the MCP endpoint's origin before we fetch it.
-			if (w.resourceMetadata.length && isSecureFetchUrl(w.resourceMetadata)
+			if (w.resourceMetadata.length && isSecureFetchUrl(w.resourceMetadata,
+					policyAnchoredAt(mcpEndpoint))
 					&& originOf(w.resourceMetadata) == originOf(mcpEndpoint))
 				urls ~= w.resourceMetadata;
 		}
 		urls ~= protectedResourceMetadataUrls(mcpEndpoint);
+		// Every candidate shares the user-configured endpoint's origin.
+		const prmPolicy = policyAnchoredAt(mcpEndpoint);
 
 		bool anyError;
 		foreach (u; urls)
 		{
 			Json j;
-			final switch (tryGetJson(u, j))
+			final switch (tryGetJson(u, prmPolicy, j))
 			{
 			case FetchResult.ok:
 				auto prm = ProtectedResourceMetadata.fromJson(j);
@@ -174,7 +208,7 @@ final class OAuthClient
 			// and then to the 2025-03-26 default-endpoint fallback below; the
 			// synthesized endpoints derive from the already-validated issuer, not
 			// from attacker-influenced data, so the lenient fallback is safe here.
-			if (tryGetJson(u, j) == FetchResult.ok)
+			if (tryGetJson(u, namedUrlPolicy(), j) == FetchResult.ok)
 				return bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
 						issuer, enforceIssuerMatch);
 		}
@@ -397,7 +431,7 @@ final class OAuthClient
 		// SSRF guard at the source: the authorization endpoint comes from discovered
 		// AS metadata; reject a plaintext-http (non-loopback) or internal/link-local
 		// endpoint before constructing a URL any consumer might fetch.
-		requireSecureUrl(as_.authorizationEndpoint);
+		requireSecureUrl(as_.authorizationEndpoint, namedUrlPolicy());
 		return buildAuthorizationUrl(as_.authorizationEndpoint, client.clientId,
 				redirectUri, pkce.challenge, scopeStr, resource, state);
 	}
@@ -498,7 +532,8 @@ final class OAuthClient
 		string www;
 		try
 		{
-			secureRequestHTTP(mcpEndpoint, (scope HTTPClientRequest req) {
+			secureRequestHTTP(mcpEndpoint, policyAnchoredAt(mcpEndpoint),
+					(scope HTTPClientRequest req) {
 				req.method = HTTPMethod.POST;
 				req.contentType = "application/json";
 				req.headers["Accept"] = "application/json, text/event-stream";
@@ -542,7 +577,7 @@ final class OAuthClient
 		// or internal/link-local authorization endpoint; the connect is pinned to a
 		// pre-vetted resolved address.
 		string code, state;
-		secureRequestHTTP(authzUrl, (scope HTTPClientRequest req) {
+		secureRequestHTTP(authzUrl, namedUrlPolicy(), (scope HTTPClientRequest req) {
 			req.method = HTTPMethod.GET;
 		}, (scope HTTPClientResponse res) {
 			const loc = res.headers.get("Location", "");
@@ -585,7 +620,7 @@ final class OAuthClient
 		// SSRF guard (see overload above); the connect is pinned to a pre-vetted
 		// resolved address.
 		string code, iss, state;
-		secureRequestHTTP(authzUrl, (scope HTTPClientRequest req) {
+		secureRequestHTTP(authzUrl, namedUrlPolicy(), (scope HTTPClientRequest req) {
 			req.method = HTTPMethod.GET;
 		}, (scope HTTPClientResponse res) {
 			const loc = res.headers.get("Location", "");
@@ -606,11 +641,12 @@ final class OAuthClient
 
 	// --- HTTP helpers --------------------------------------------------------
 
-	private FetchResult tryGetJson(string url, out Json result) @safe
+	private FetchResult tryGetJson(string url, SsrfPolicy policy, out Json result) @safe
 	{
-		// Never fetch a discovery URL that is not HTTPS (or loopback for dev) or
-		// that targets an internal/link-local address — including a hostname that
-		// resolves to one (DNS-rebinding SSRF mitigation, pinned at connect time).
+		// Never fetch a discovery URL that `policy` rejects: not HTTPS (plain-http
+		// loopback aside, under `allowLoopback`), or targeting an internal/link-local
+		// address — including a hostname that resolves to one (DNS-rebinding SSRF
+		// mitigation, pinned at connect time).
 		Json parsed;
 		// A reachable response that is not a usable 2xx-with-body means "no document
 		// here"; an exception (SSRF block, TLS/DNS/network failure, or a malformed
@@ -619,7 +655,7 @@ final class OAuthClient
 		auto outcome = FetchResult.notFound;
 		try
 		{
-			secureRequestHTTP(url, (scope HTTPClientRequest req) {
+			secureRequestHTTP(url, policy, (scope HTTPClientRequest req) {
 				req.method = HTTPMethod.GET;
 				req.headers["Accept"] = "application/json";
 			}, (scope HTTPClientResponse res) {
@@ -653,7 +689,7 @@ final class OAuthClient
 		import std.conv : to;
 
 		Json result;
-		secureRequestHTTP(url, (scope HTTPClientRequest req) {
+		secureRequestHTTP(url, namedUrlPolicy(), (scope HTTPClientRequest req) {
 			req.method = HTTPMethod.POST;
 			req.contentType = contentType;
 			req.headers["Accept"] = "application/json";
@@ -1169,7 +1205,7 @@ unittest  // postParse treats a non-2xx token-endpoint response as an error
 	const tokenUrl = "http://127.0.0.1:" ~ port.to!string ~ "/token";
 
 	auto c = new OAuthClient();
-	c.resource = "https://mcp.example.com/mcp";
+	c.resource = "http://127.0.0.1:3000/mcp";
 	AuthorizationServerMetadata as_;
 	as_.tokenEndpoint = tokenUrl;
 	// A non-2xx response from the token endpoint must surface as an exception,
@@ -1229,7 +1265,7 @@ unittest  // refresh() sends client_secret in the POST body for client_secret_po
 	const tokenUrl = "http://127.0.0.1:" ~ port.to!string ~ "/token";
 
 	auto c = new OAuthClient();
-	c.resource = "https://mcp.example.com/mcp";
+	c.resource = "http://127.0.0.1:3000/mcp";
 	c.authMethod = TokenEndpointAuthMethod.clientSecretPost;
 	AuthorizationServerMetadata as_;
 	as_.tokenEndpoint = tokenUrl;
@@ -1240,11 +1276,64 @@ unittest  // refresh() sends client_secret in the POST body for client_secret_po
 			~ capturedBody);
 }
 
+unittest  // a remote MCP server cannot steer the client to a plain-http loopback token endpoint
+{
+	import std.conv : to;
+	import std.exception : assertThrown;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	int hits;
+	auto settings = new HTTPServerSettings();
+	settings.bindAddresses = ["127.0.0.1"];
+	settings.port = 0;
+	auto listener = () @trusted {
+		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+			hits++;
+			res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+		});
+	}();
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
+
+	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/token";
+	assertThrown!McpException(c.refresh(as_, RegisteredClient("cid", "secret"), "rt"));
+	assert(hits == 0, "the refresh token must never reach a loopback service");
+}
+
+unittest  // a loopback MCP server may name a plain-http loopback authorization server (local dev)
+{
+	import std.conv : to;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	auto settings = new HTTPServerSettings();
+	settings.bindAddresses = ["127.0.0.1"];
+	settings.port = 0;
+	auto listener = () @trusted {
+		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+			res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+		});
+	}();
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
+
+	auto c = new OAuthClient();
+	c.resource = "http://localhost:3000/mcp";
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/token";
+	assert(c.refresh(as_, RegisteredClient("cid", ""), "rt").accessToken == "at");
+}
+
 // ===========================================================================
 // Loopback-server tests for the HTTP-network discovery / registration / token /
-// probe / redirect paths. secureRequestHTTP permits a loopback (127.0.0.1) host
-// over plaintext http for local development, so a bound `listenHTTP` on
-// 127.0.0.1 exercises the real fetch/parse code that pure in-memory tests cannot.
+// probe / redirect paths. With a loopback `resource` (MCP endpoint) the client
+// permits a loopback (127.0.0.1) authorization server over plaintext http, so a
+// bound `listenHTTP` on 127.0.0.1 exercises the real fetch/parse code that pure
+// in-memory tests cannot.
 // ===========================================================================
 
 version (unittest)
@@ -1315,6 +1404,7 @@ unittest  // discovery: protected-resource (well-known + same-origin WWW-Authent
 
 	auto c = new OAuthClient();
 	const endpoint = srv.base ~ "/mcp";
+	c.resource = endpoint;
 
 	// Well-known RFC 9728 discovery (no WWW-Authenticate hint).
 	auto prm = c.discoverProtectedResource(endpoint);
@@ -1423,7 +1513,9 @@ unittest  // a registration/token response larger than the cap is refused
 
 	AuthorizationServerMetadata as_;
 	as_.registrationEndpoint = srv.base ~ "/register";
-	assertThrown(new OAuthClient().register(as_, "client"));
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	assertThrown(c.register(as_, "client"));
 }
 
 unittest  // discoverAuthServer falls back to synthesized endpoints when no document exists
@@ -1439,6 +1531,7 @@ unittest  // discoverAuthServer falls back to synthesized endpoints when no docu
 		srv.stop();
 
 	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
 	auto as_ = c.discoverAuthServer(srv.base ~ "/");
 	assert(as_.issuer == srv.base ~ "/");
 	assert(as_.authorizationEndpoint == srv.base ~ "/authorize");
@@ -1461,6 +1554,7 @@ unittest  // register() POSTs an RFC 7591 request and parses the returned creden
 		srv.stop();
 
 	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
 	c.redirectUri = "http://localhost:8765/callback";
 	AuthorizationServerMetadata as_;
 	as_.registrationEndpoint = srv.base ~ "/register";
@@ -1492,7 +1586,7 @@ unittest  // token grants POST their forms and parse the token response (loopbac
 		srv.stop();
 
 	auto c = new OAuthClient();
-	c.resource = "https://mcp.example.com/mcp";
+	c.resource = "http://127.0.0.1:3000/mcp";
 	AuthorizationServerMetadata as_;
 	as_.issuer = "https://as.example.com";
 	as_.tokenEndpoint = srv.base ~ "/token";
@@ -1551,7 +1645,7 @@ unittest  // private_key_jwt: token requests carry a client_assertion (RFC 7523)
 		~ "-----END PRIVATE KEY-----\n";
 
 	auto c = new OAuthClient();
-	c.resource = "https://mcp.example.com/mcp";
+	c.resource = "http://127.0.0.1:3000/mcp";
 	c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
 	c.privateKeyPem = pem;
 	AuthorizationServerMetadata as_;
@@ -1601,6 +1695,7 @@ unittest  // authorizeAndGetCode extracts the code from the redirect Location he
 		srv.stop();
 
 	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
 	const authzUrl = srv.base ~ "/authorize?client_id=cid";
 
 	// Overload 1: state is verified.
@@ -1637,6 +1732,7 @@ unittest  // authorizeAndGetCode throws on a mismatched state rather than return
 		srv.stop();
 
 	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
 	assertThrown(c.authorizeAndGetCode(srv.base ~ "/authorize?client_id=cid", "wrong"));
 }
 
@@ -1653,6 +1749,7 @@ unittest  // authorizeAndGetCode refuses to skip state verification (an empty ex
 		srv.stop();
 
 	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
 	const authzUrl = srv.base ~ "/authorize?client_id=cid";
 	assertThrown(c.authorizeAndGetCode(authzUrl, ""));
 	AuthorizationServerMetadata as_;

@@ -4,6 +4,8 @@ import std.typecons : Nullable;
 import vibe.data.json : Json;
 import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 
+import mcp.protocol.ssrf : SsrfPolicy;
+
 @safe:
 
 // ===========================================================================
@@ -741,21 +743,12 @@ bool isValidClientIdMetadataUrl(string clientId) @safe pure nothrow @nogc
 	return slash + 1 < rest.length;
 }
 
-/// Whether `url` is safe to fetch for OAuth/discovery: it MUST use the `https`
-/// scheme, OR target an explicit loopback host (`localhost`, `127.0.0.1`,
-/// `[::1]`, and their numeric encodings) over `http` for local development.
-/// Plaintext `http` to any other host is rejected, as are URLs whose host is a
-/// private/link-local IPv4 or IPv6 literal (including alternate numeric IPv4
-/// encodings and IPv4-mapped/compatible IPv6). Purely lexical (no DNS): it is a
-/// coarse pre-filter on the attacker-influenced `resource_metadata` URL. The
-/// authoritative, TOCTOU-safe SSRF guard for an actual fetch is
-/// `secureRequestHTTP`, which resolves, classifies and pins via the connector.
-bool isSecureFetchUrl(string url) @safe
+/// Parse `url` with vibe's parser (the one the connector uses) into its
+/// scheme and host; false when it does not parse or carries no host.
+private bool parseSchemeHost(string url, out string scheme, out string host) @safe
 {
-	import mcp.protocol.ssrf : classifyHostLexical, AddressClass;
 	import vibe.inet.url : URL;
 
-	string scheme, host;
 	try
 	{
 		auto u = URL(url);
@@ -763,192 +756,141 @@ bool isSecureFetchUrl(string url) @safe
 		host = u.host;
 	}
 	catch (Exception)
-	{
 		return false;
-	}
-	if (host.length == 0)
-		return false;
-
-	// Lexical pre-filter only (no DNS): IP-literal/loopback ranges are classified,
-	// a registered name is treated as public. The resolve-and-pin connector makes
-	// the authoritative call when the URL is actually fetched.
-	const cls = classifyHostLexical(host);
-
-	bool eqScheme(string sc) @safe nothrow @nogc
-	{
-		if (scheme.length != sc.length)
-			return false;
-		foreach (k, ch; scheme)
-		{
-			char c = ch;
-			if (c >= 'A' && c <= 'Z')
-				c = cast(char)(c + 32);
-			if (c != sc[k])
-				return false;
-		}
-		return true;
-	}
-
-	if (cls == AddressClass.privateOrLinkLocal)
-		return false;
-	if (eqScheme("https"))
-		return true;
-	if (eqScheme("http") && cls == AddressClass.loopback)
-		return true;
-	return false;
+	return host.length != 0;
 }
 
-/// Throw `invalidRequest` when `url` is not safe to fetch under the
-/// block-internal policy. Parses with vibe's own parser (the single source of
-/// truth) and classifies the host once. A check-time scheme/host gate (no
-/// fetch) suitable for paths that VALIDATE a URL without fetching it (e.g.
-/// building the authorization-request URL the host will open). The TOCTOU-safe
-/// resolve-and-pin connect for an actual fetch is performed by
-/// `secureRequestHTTP`.
-void requireSecureUrl(string url) @safe
+/// Case-insensitive ASCII scheme compare.
+private bool isScheme(string scheme, string want) @safe pure nothrow @nogc
+{
+	if (scheme.length != want.length)
+		return false;
+	foreach (k, ch; scheme)
+	{
+		char c = ch;
+		if (c >= 'A' && c <= 'Z')
+			c = cast(char)(c + 32);
+		if (c != want[k])
+			return false;
+	}
+	return true;
+}
+
+/// The lexical (no DNS) scheme/host gate of `policy`: `https` to a host that is
+/// not a private/link-local literal (`blockInternal` also rejects loopback),
+/// plus plain `http` to an explicit loopback host under `allowLoopback`, and
+/// either scheme to any host under `allowUserConfigured`.
+private bool passesLexicalGate(string scheme, string host, SsrfPolicy policy) @safe
+{
+	import mcp.protocol.ssrf : classifyHostLexical, AddressClass;
+
+	const https = isScheme(scheme, "https");
+	const http = isScheme(scheme, "http");
+	const cls = classifyHostLexical(host);
+	final switch (policy)
+	{
+	case SsrfPolicy.blockInternal:
+		return https && cls == AddressClass.public_;
+	case SsrfPolicy.allowLoopback:
+		if (cls == AddressClass.privateOrLinkLocal)
+			return false;
+		return https || (http && cls == AddressClass.loopback);
+	case SsrfPolicy.allowUserConfigured:
+		return https || http;
+	}
+}
+
+/// Whether `url` passes `policy`'s scheme/host gate for an OAuth/discovery
+/// fetch: `https` to a public host, plus (under `allowLoopback`) plain `http`
+/// to an explicit loopback host (`localhost`, `127.0.0.1`, `[::1]`, and their
+/// numeric encodings). Private/link-local literals — including alternate
+/// numeric IPv4 encodings and IPv4-mapped/compatible IPv6 — are rejected.
+/// Purely lexical (no DNS): a coarse pre-filter on an attacker-influenced URL.
+/// The authoritative, TOCTOU-safe SSRF guard for an actual fetch is
+/// `secureRequestHTTP`, which resolves, classifies and pins via the connector.
+bool isSecureFetchUrl(string url, SsrfPolicy policy) @safe
+{
+	string scheme, host;
+	return parseSchemeHost(url, scheme, host) && passesLexicalGate(scheme, host, policy);
+}
+
+/// Throw `invalidRequest` when `url` fails `policy`'s scheme/host gate (see
+/// `isSecureFetchUrl`). A check-time gate (no fetch) for paths that VALIDATE a
+/// URL without fetching it (e.g. building the authorization-request URL the
+/// host will open). The TOCTOU-safe resolve-and-pin connect for an actual fetch
+/// is performed by `secureRequestHTTP`.
+void requireSecureUrl(string url, SsrfPolicy policy) @safe
 {
 	import mcp.protocol.errors : invalidRequest;
-	import mcp.protocol.ssrf : classifyHostLexical, AddressClass;
-	import vibe.inet.url : URL;
 
 	string scheme, host;
-	try
-	{
-		auto u = URL(url);
-		scheme = u.schema;
-		host = u.host;
-	}
-	catch (Exception)
+	if (!parseSchemeHost(url, scheme, host))
 		throw invalidRequest("Refusing to fetch URL with no parseable host: " ~ url);
-
-	// A URL that parsed but carries no host is just as unfetchable; report it as
-	// such rather than letting it fall through to the misleading "insecure" branch.
-	if (host.length == 0)
-		throw invalidRequest("Refusing to fetch URL with no parseable host: " ~ url);
-
-	// Lexical only (no DNS): a registered name is treated as public here; the
-	// resolve-and-pin connector enforces the resolved-address policy at fetch.
-	const cls = classifyHostLexical(host);
-
-	bool eqScheme(string sc) @safe nothrow @nogc
-	{
-		if (scheme.length != sc.length)
-			return false;
-		foreach (k, ch; scheme)
-		{
-			char c = ch;
-			if (c >= 'A' && c <= 'Z')
-				c = cast(char)(c + 32);
-			if (c != sc[k])
-				return false;
-		}
-		return true;
-	}
-
-	bool secure;
-	if (cls == AddressClass.privateOrLinkLocal)
-		secure = false;
-	else if (eqScheme("https"))
-		secure = true;
-	else if (eqScheme("http") && cls == AddressClass.loopback)
-		secure = true;
-	else
-		secure = false;
-
-	if (!secure)
-		throw invalidRequest(
-				"Refusing to fetch insecure OAuth/discovery URL (must be https, or http to an "
-				~ "explicit loopback host; private/link-local addresses are rejected): " ~ url);
+	if (!passesLexicalGate(scheme, host, policy))
+		throw invalidRequest(policy == SsrfPolicy.blockInternal
+				? "Refusing to fetch insecure OAuth/discovery URL (must be https to a public host): "
+				~ url : "Refusing to fetch insecure OAuth/discovery URL (must be https, or http to "
+				~ "an explicit loopback host; private/link-local addresses are rejected): " ~ url);
 }
 
-/// Non-throwing scheme/host + resolution gate (block-internal policy). Returns
-/// true only when the vibe-parsed scheme/host pass the lexical guard AND the
-/// host resolves only to safe addresses (fail CLOSED on a resolution error).
+/// Non-throwing scheme/host + resolution gate. Returns true only when the
+/// vibe-parsed scheme/host pass `policy`'s lexical gate AND the host resolves
+/// only to addresses `policy` permits (fail CLOSED on a resolution error).
 /// Loopback and IP-literal hosts short-circuit without resolving. `@safe`.
-bool isSecureFetchUrlResolved(string url) @safe
+bool isSecureFetchUrlResolved(string url, SsrfPolicy policy) @safe
 {
-	import mcp.protocol.ssrf : classifyHostLexical, AddressClass,
-		pinnedConnectAddress, SsrfPolicy;
-	import vibe.inet.url : URL;
+	import mcp.protocol.ssrf : pinnedConnectAddress;
 
 	string scheme, host;
-	try
-	{
-		auto u = URL(url);
-		scheme = u.schema;
-		host = u.host;
-	}
-	catch (Exception)
-	{
+	if (!parseSchemeHost(url, scheme, host) || !passesLexicalGate(scheme, host, policy))
 		return false;
-	}
-	if (host.length == 0)
-		return false;
-
-	bool eqScheme(string sc) @safe nothrow @nogc
-	{
-		if (scheme.length != sc.length)
-			return false;
-		foreach (k, ch; scheme)
-		{
-			char c = ch;
-			if (c >= 'A' && c <= 'Z')
-				c = cast(char)(c + 32);
-			if (c != sc[k])
-				return false;
-		}
-		return true;
-	}
-
-	const isHttps = eqScheme("https");
-	const isHttp = eqScheme("http");
-	if (!isHttps && !isHttp)
-		return false;
-
-	// Scheme gate: https to any host, or http only to an explicit loopback host
-	// (matches the connector's block-internal scheme policy). Use the lexical
-	// class so http-to-a-registered-name is rejected without a DNS round-trip.
-	const lex = classifyHostLexical(host);
-	if (isHttp && lex != AddressClass.loopback)
-		return false;
-
-	// Resolve + classify + pin under the block-internal policy; the connector's
-	// verdict is the single source of truth for the resolved address.
-	const pin = pinnedConnectAddress(host, isHttps, SsrfPolicy.blockInternal);
-	return pin.ok;
+	return pinnedConnectAddress(host, isScheme(scheme, "https"), policy).ok;
 }
 
 /// Consolidated SSRF-safe HTTP fetch used by every outbound OAuth/discovery
-/// request. Delegates to the connector's `secureRequestHTTP` with the
-/// block-internal policy: parse once with vibe's `URL`, classify the host once,
-/// resolve + pin to a vetted numeric address (preserving Host header + TLS SNI),
-/// and fail CLOSED on any internal/unresolvable target. Throws `invalidRequest`
-/// when the URL is unsafe.
-void secureRequestHTTP(string url, scope void delegate(scope HTTPClientRequest) requester,
-		scope void delegate(scope HTTPClientResponse) responder) @safe
+/// request. Delegates to the connector's `secureRequestHTTP` under `policy`:
+/// parse once with vibe's `URL`, classify the host once, resolve + pin to a
+/// vetted numeric address (preserving Host header + TLS SNI), and fail CLOSED
+/// on any target `policy` rejects. Throws `invalidRequest` when the URL is
+/// unsafe.
+void secureRequestHTTP(string url, SsrfPolicy policy, scope void delegate(
+		scope HTTPClientRequest) requester, scope void delegate(scope HTTPClientResponse) responder) @safe
 {
-	import mcp.protocol.ssrf : connectorRequest = secureRequestHTTP, SsrfPolicy;
+	import mcp.protocol.ssrf : connectorRequest = secureRequestHTTP;
 
-	connectorRequest(url, SsrfPolicy.blockInternal, requester, responder);
+	connectorRequest(url, policy, requester, responder);
 }
 
 unittest  // requireSecureUrl throws on an insecure URL and passes a secure loopback one
 {
 	import std.exception : assertThrown;
 
-	assertThrown(requireSecureUrl("http://as.example.com/token"));
-	assertThrown(requireSecureUrl("https://169.254.169.254/"));
+	assertThrown(requireSecureUrl("http://as.example.com/token", SsrfPolicy.allowLoopback));
+	assertThrown(requireSecureUrl("https://169.254.169.254/", SsrfPolicy.allowLoopback));
 	// Loopback hosts skip DNS resolution, so these are network-independent.
-	requireSecureUrl("https://127.0.0.1/token"); // does not throw
-	requireSecureUrl("http://127.0.0.1:8765/callback"); // loopback dev ok
+	requireSecureUrl("https://127.0.0.1/token", SsrfPolicy.allowLoopback); // does not throw
+	requireSecureUrl("http://127.0.0.1:8765/callback", SsrfPolicy.allowLoopback); // loopback dev ok
+}
+
+unittest  // blockInternal gates admit only https to a public host
+{
+	import std.exception : assertThrown;
+
+	assert(isSecureFetchUrl("https://as.example.com/token", SsrfPolicy.blockInternal));
+	assert(!isSecureFetchUrl("http://127.0.0.1:8765/token", SsrfPolicy.blockInternal));
+	assert(!isSecureFetchUrl("http://localhost/token", SsrfPolicy.blockInternal));
+	assert(!isSecureFetchUrl("https://127.0.0.1/token", SsrfPolicy.blockInternal));
+	assert(!isSecureFetchUrlResolved("http://127.0.0.1:8765/jwks", SsrfPolicy.blockInternal));
+	assertThrown(requireSecureUrl("http://127.0.0.1:8765/authorize", SsrfPolicy.blockInternal));
+	assertThrown(requireSecureUrl("https://[::1]/authorize", SsrfPolicy.blockInternal));
 }
 
 unittest  // requireSecureUrl rejects the '?@' / '#@' authority differential (SSRF)
 {
 	import std.exception : assertThrown;
 
-	assertThrown(requireSecureUrl("https://public?@169.254.169.254/jwks"));
-	assertThrown(requireSecureUrl("https://public#@10.0.0.5/jwks"));
+	assertThrown(requireSecureUrl("https://public?@169.254.169.254/jwks", SsrfPolicy.allowLoopback));
+	assertThrown(requireSecureUrl("https://public#@10.0.0.5/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // requireSecureUrl reports an unparseable URL accurately, not as merely "insecure"
@@ -958,7 +900,7 @@ unittest  // requireSecureUrl reports an unparseable URL accurately, not as mere
 	bool threw;
 	string msg;
 	try
-		requireSecureUrl("http://");
+		requireSecureUrl("http://", SsrfPolicy.allowLoopback);
 	catch (Exception e)
 	{
 		threw = true;
@@ -970,132 +912,139 @@ unittest  // requireSecureUrl reports an unparseable URL accurately, not as mere
 
 unittest  // isSecureFetchUrl accepts https and rejects plaintext http to a remote host
 {
-	assert(isSecureFetchUrl("https://as.example.com/.well-known/oauth-authorization-server"));
-	assert(!isSecureFetchUrl("http://as.example.com/.well-known/oauth-authorization-server"));
+	assert(isSecureFetchUrl("https://as.example.com/.well-known/oauth-authorization-server",
+			SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("http://as.example.com/.well-known/oauth-authorization-server",
+			SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl permits http only to explicit loopback hosts (dev)
 {
-	assert(isSecureFetchUrl("http://localhost:8765/jwks"));
-	assert(isSecureFetchUrl("http://127.0.0.1/jwks"));
-	assert(isSecureFetchUrl("http://[::1]:9000/jwks"));
-	assert(!isSecureFetchUrl("http://internal.local/jwks"));
+	assert(isSecureFetchUrl("http://localhost:8765/jwks", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("http://127.0.0.1/jwks", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("http://[::1]:9000/jwks", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("http://internal.local/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl rejects private/link-local IPv4 literals (SSRF)
 {
-	assert(!isSecureFetchUrl("https://169.254.169.254/latest/meta-data"));
-	assert(!isSecureFetchUrl("https://10.0.0.5/x"));
-	assert(!isSecureFetchUrl("https://192.168.1.1/x"));
-	assert(!isSecureFetchUrl("https://172.16.0.1/x"));
-	assert(!isSecureFetchUrl("http://169.254.169.254/x"));
+	assert(!isSecureFetchUrl("https://169.254.169.254/latest/meta-data", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://10.0.0.5/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://192.168.1.1/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://172.16.0.1/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("http://169.254.169.254/x", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl rejects private/ULA/link-local IPv6 literals (SSRF)
 {
-	assert(!isSecureFetchUrl("https://[fd00::1]/x"));
-	assert(!isSecureFetchUrl("https://[fc00::1]/x"));
-	assert(!isSecureFetchUrl("https://[fe80::1]/x"));
-	assert(!isSecureFetchUrl("https://[::]/x"));
-	assert(!isSecureFetchUrl("https://[::ffff:169.254.169.254]/latest/meta-data"));
-	assert(!isSecureFetchUrl("https://[::ffff:10.0.0.5]/x"));
-	assert(!isSecureFetchUrl("https://[::ffff:127.0.0.1]/x"));
-	assert(!isSecureFetchUrl("https://[::ffff:0a00:0001]/x"));
-	assert(!isSecureFetchUrl("https://[fe80::1]:443/x"));
+	assert(!isSecureFetchUrl("https://[fd00::1]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[fc00::1]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[fe80::1]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[::]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[::ffff:169.254.169.254]/latest/meta-data",
+			SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[::ffff:10.0.0.5]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[::ffff:127.0.0.1]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[::ffff:0a00:0001]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[fe80::1]:443/x", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl accepts a public/global-unicast IPv6 literal
 {
-	assert(isSecureFetchUrl("https://[2606:4700:4700::1111]/x"));
-	assert(isSecureFetchUrl("https://[2606:4700::1]/x"));
-	assert(isSecureFetchUrl("http://[::1]:9000/jwks"));
+	assert(isSecureFetchUrl("https://[2606:4700:4700::1111]/x", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("https://[2606:4700::1]/x", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("http://[::1]:9000/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl rejects schemeless / file / non-loopback http
 {
-	assert(!isSecureFetchUrl("as.example.com/x"));
-	assert(!isSecureFetchUrl("file:///etc/passwd"));
-	assert(!isSecureFetchUrl(""));
+	assert(!isSecureFetchUrl("as.example.com/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("file:///etc/passwd", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl strips userinfo before private IPv4 literal checks (SSRF)
 {
-	assert(!isSecureFetchUrl("https://user@169.254.169.254/"));
-	assert(!isSecureFetchUrl("https://x@10.0.0.1/"));
-	assert(!isSecureFetchUrl("https://user:pass@192.168.1.1/x"));
+	assert(!isSecureFetchUrl("https://user@169.254.169.254/", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://x@10.0.0.1/", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://user:pass@192.168.1.1/x", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl strips userinfo before bracketed IPv6 literal checks (SSRF)
 {
-	assert(!isSecureFetchUrl("https://a@[fe80::1]/"));
-	assert(!isSecureFetchUrl("https://a@[fd00::1]/x"));
-	assert(!isSecureFetchUrl("https://user@[::ffff:169.254.169.254]/latest/meta-data"));
+	assert(!isSecureFetchUrl("https://a@[fe80::1]/", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://a@[fd00::1]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://user@[::ffff:169.254.169.254]/latest/meta-data",
+			SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl still accepts a public host carrying userinfo
 {
-	assert(isSecureFetchUrl("https://user@public.example.com/"));
-	assert(isSecureFetchUrl("https://user:pass@as.example.com/token"));
-	assert(isSecureFetchUrl("https://user@[2606:4700:4700::1111]/x"));
+	assert(isSecureFetchUrl("https://user@public.example.com/", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("https://user:pass@as.example.com/token", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("https://user@[2606:4700:4700::1111]/x", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl treats numeric loopback encodings as loopback (https + dev http)
 {
-	assert(isSecureFetchUrl("https://2130706433/x")); // 127.0.0.1
-	assert(isSecureFetchUrl("https://127.1/x"));
-	assert(isSecureFetchUrl("https://0x7f000001/x"));
-	assert(isSecureFetchUrl("https://0177.0.0.1/x"));
+	assert(isSecureFetchUrl("https://2130706433/x", SsrfPolicy.allowLoopback)); // 127.0.0.1
+	assert(isSecureFetchUrl("https://127.1/x", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("https://0x7f000001/x", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("https://0177.0.0.1/x", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl rejects numeric encodings of the cloud metadata address (SSRF)
 {
-	assert(!isSecureFetchUrl("https://0xa9fea9fe/latest/meta-data")); // 169.254.169.254
-	assert(!isSecureFetchUrl("https://2852039166/latest/meta-data"));
-	assert(!isSecureFetchUrl("https://169.254.169.254/latest/meta-data"));
+	assert(!isSecureFetchUrl("https://0xa9fea9fe/latest/meta-data", SsrfPolicy.allowLoopback)); // 169.254.169.254
+	assert(!isSecureFetchUrl("https://2852039166/latest/meta-data", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://169.254.169.254/latest/meta-data", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl rejects octal/hex encodings of RFC1918 ranges (SSRF)
 {
-	assert(!isSecureFetchUrl("https://0xa000005/x")); // 10.0.0.5
-	assert(!isSecureFetchUrl("https://192.0xa8.0.1/x")); // 192.168.0.1
-	assert(!isSecureFetchUrl("https://10.0/x")); // 10.0.0.0
+	assert(!isSecureFetchUrl("https://0xa000005/x", SsrfPolicy.allowLoopback)); // 10.0.0.5
+	assert(!isSecureFetchUrl("https://192.0xa8.0.1/x", SsrfPolicy.allowLoopback)); // 192.168.0.1
+	assert(!isSecureFetchUrl("https://10.0/x", SsrfPolicy.allowLoopback)); // 10.0.0.0
 }
 
 unittest  // isSecureFetchUrl permits http loopback via numeric encodings (dev)
 {
-	assert(isSecureFetchUrl("http://2130706433/jwks")); // 127.0.0.1
-	assert(isSecureFetchUrl("http://127.1/jwks"));
-	assert(isSecureFetchUrl("http://0x7f000001/jwks"));
+	assert(isSecureFetchUrl("http://2130706433/jwks", SsrfPolicy.allowLoopback)); // 127.0.0.1
+	assert(isSecureFetchUrl("http://127.1/jwks", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("http://0x7f000001/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl still accepts genuine public numeric IPv4 literals
 {
-	assert(isSecureFetchUrl("https://8.8.8.8/x"));
-	assert(isSecureFetchUrl("https://1.1.1.1/x"));
+	assert(isSecureFetchUrl("https://8.8.8.8/x", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("https://1.1.1.1/x", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrlResolved rejects what the lexical guard rejects (GET-path SSRF)
 {
-	assert(!isSecureFetchUrlResolved("http://as.example.com/.well-known/jwks"));
-	assert(!isSecureFetchUrlResolved("https://169.254.169.254/latest/meta-data"));
-	assert(!isSecureFetchUrlResolved("https://10.0.0.5/jwks"));
+	assert(!isSecureFetchUrlResolved("http://as.example.com/.well-known/jwks",
+			SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrlResolved("https://169.254.169.254/latest/meta-data",
+			SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrlResolved("https://10.0.0.5/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrlResolved rejects the '?@' / '#@' authority differential (SSRF)
 {
-	assert(!isSecureFetchUrlResolved("https://public?@169.254.169.254/jwks"));
-	assert(!isSecureFetchUrlResolved("https://public#@10.0.0.5/jwks"));
+	assert(!isSecureFetchUrlResolved("https://public?@169.254.169.254/jwks",
+			SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrlResolved("https://public#@10.0.0.5/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrlResolved accepts plain-http loopback without resolving (dev)
 {
-	assert(isSecureFetchUrlResolved("http://127.0.0.1:8765/jwks"));
-	assert(isSecureFetchUrlResolved("http://[::1]:9000/jwks"));
+	assert(isSecureFetchUrlResolved("http://127.0.0.1:8765/jwks", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrlResolved("http://[::1]:9000/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrlResolved rejects loopback over https (local TLS services)
 {
-	assert(!isSecureFetchUrlResolved("https://127.0.0.1/jwks"));
+	assert(!isSecureFetchUrlResolved("https://127.0.0.1/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // valid CIMD client_id: https with a path component
@@ -1509,7 +1458,7 @@ private TokenSet postTokenRequest(string tokenEndpoint, string body_, string aut
 		import vibe.http.common : HTTPMethod;
 		import vibe.stream.operations : readAllUTF8;
 
-		secureRequestHTTP(tokenEndpoint, (scope HTTPClientRequest creq) {
+		secureRequestHTTP(tokenEndpoint, SsrfPolicy.allowLoopback, (scope HTTPClientRequest creq) {
 			creq.method = HTTPMethod.POST;
 			creq.headers["Content-Type"] = "application/x-www-form-urlencoded";
 			creq.headers["Accept"] = "application/json";

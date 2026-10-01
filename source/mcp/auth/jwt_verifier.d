@@ -682,6 +682,7 @@ private string fetchJwks(string uri) @trusted
 	import vibe.http.common : HTTPMethod;
 	import vibe.stream.operations : readAllUTF8;
 	import mcp.auth.oauth : secureRequestHTTP;
+	import mcp.protocol.ssrf : SsrfPolicy;
 
 	// Refuse to fetch a JWKS over an insecure transport (must be https, or http
 	// to a loopback host for dev) or from an internal/link-local address. The
@@ -690,7 +691,7 @@ private string fetchJwks(string uri) @trusted
 	string body_;
 	try
 	{
-		secureRequestHTTP(uri, (scope HTTPClientRequest req) {
+		secureRequestHTTP(uri, SsrfPolicy.allowLoopback, (scope HTTPClientRequest req) {
 			req.method = HTTPMethod.GET;
 		}, (scope HTTPClientResponse res) {
 			if (res.statusCode / 100 == 2)

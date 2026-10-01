@@ -22,11 +22,12 @@ import vibe.stream.tls : TLSContext;
 // resolution of every A/AAAA record, failing CLOSED to `privateOrLinkLocal` on
 // a resolution error or when any resolved address is internal.
 //
-// `SsrfPolicy.blockInternal` rejects loopback/private/link-local hosts (the
-// dev-loopback-over-http allowance excepted) and is used for every
-// attacker-influenceable fetch. `SsrfPolicy.allowUserConfigured` resolves and
-// pins the address for stability but permits internal/loopback targets, for the
-// user-chosen client transport endpoint.
+// `SsrfPolicy.blockInternal` rejects loopback/private/link-local hosts and is
+// used for every URL an untrusted party names. `SsrfPolicy.allowLoopback` adds
+// a plain-http allowance for explicit loopback hosts, for URLs the operator or
+// user configured (local development). `SsrfPolicy.allowUserConfigured`
+// resolves and pins the address for stability but permits internal/loopback
+// targets, for the user-chosen client transport endpoint.
 // ===========================================================================
 
 /// The trust class of a host or resolved address.
@@ -47,11 +48,17 @@ enum AddressClass
 /// How a fetch treats internal targets.
 enum SsrfPolicy
 {
-	/// Reject loopback/private/link-local hosts. The only internal targets
-	/// permitted are explicit loopback hosts reached over plaintext `http`
-	/// (the local-development allowance). Used for every attacker-influenceable
-	/// fetch (OAuth/discovery, JWKS, introspection, proxy upstream).
+	/// Require `https` to a public host: loopback, private and link-local
+	/// targets are all rejected. Used for every URL an untrusted party names
+	/// (endpoints from discovered OAuth metadata of a remote server, Client ID
+	/// Metadata Document URLs, webhook callbacks).
 	blockInternal,
+	/// As `blockInternal`, but an explicit literal loopback host (`localhost`,
+	/// `127.0.0.0/8` in any encoding, `[::1]`) is also permitted over plain
+	/// `http` — the local-development allowance. Used only for URLs the operator
+	/// or user configured (JWKS, introspection, upstream OAuth endpoints) or that
+	/// a user-configured loopback MCP endpoint names.
+	allowLoopback,
 	/// Resolve and pin the address (TOCTOU-stable) but do NOT reject internal or
 	/// loopback targets. Used for the user-chosen MCP client transport endpoint.
 	allowUserConfigured,
@@ -364,7 +371,8 @@ private ptrdiff_t parseHextets(string seg, ubyte[] dst) @safe pure nothrow @nogc
 // ---------------------------------------------------------------------------
 
 /// Range-check four IPv4 octets. Returns the class: loopback (127/8), private/
-/// link-local/this-host (RFC 1918, 169.254/16, 0/8), or public. `@safe pure
+/// link-local/this-host/special-purpose (RFC 1918, 169.254/16, 0/8, CGNAT,
+/// IETF-assigned, benchmarking, documentation, multicast, reserved), or public. `@safe pure
 /// nothrow @nogc`.
 private AddressClass classifyIpv4Octets(ubyte a, ubyte b, ubyte c, ubyte d) @safe pure nothrow @nogc
 {
@@ -381,6 +389,14 @@ private AddressClass classifyIpv4Octets(ubyte a, ubyte b, ubyte c, ubyte d) @saf
 	if (a == 100 && b >= 64 && b <= 127) // 100.64.0.0/10 RFC 6598 carrier-grade-NAT shared space (not globally routable)
 		return AddressClass.privateOrLinkLocal;
 	if (a == 0) // 0.0.0.0/8 "this host"
+		return AddressClass.privateOrLinkLocal;
+	if (a == 192 && b == 0 && (c == 0 || c == 2)) // 192.0.0.0/24 IETF protocol assignments, 192.0.2.0/24 TEST-NET-1
+		return AddressClass.privateOrLinkLocal;
+	if (a == 198 && (b == 18 || b == 19)) // 198.18.0.0/15 benchmarking
+		return AddressClass.privateOrLinkLocal;
+	if (a == 198 && b == 51 && c == 100) // 198.51.100.0/24 TEST-NET-2
+		return AddressClass.privateOrLinkLocal;
+	if (a == 203 && b == 0 && c == 113) // 203.0.113.0/24 TEST-NET-3
 		return AddressClass.privateOrLinkLocal;
 	if (a >= 224 && a <= 239) // 224.0.0.0/4 multicast (not a unicast destination)
 		return AddressClass.privateOrLinkLocal;
@@ -426,6 +442,10 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 	// Link-local fe80::/10 (0xFE 0x80..0xBF).
 	if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80)
 		return AddressClass.privateOrLinkLocal;
+	// Deprecated site-local fec0::/10 (0xFE 0xC0..0xFF), still routed internally
+	// by some networks.
+	if (b[0] == 0xFE && (b[1] & 0xC0) == 0xC0)
+		return AddressClass.privateOrLinkLocal;
 	// Multicast ff00::/8 (first byte 0xFF) — not a unicast destination.
 	if (b[0] == 0xFF)
 		return AddressClass.privateOrLinkLocal;
@@ -441,6 +461,22 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 		}
 	if (mapped && ((b[10] == 0xFF && b[11] == 0xFF) || (b[10] == 0 && b[11] == 0)))
 		return classifyIpv4Octets(b[12], b[13], b[14], b[15]);
+
+	// IPv4-translated ::ffff:0:a.b.c.d/96 (RFC 2765 SIIT): bytes 0..7 zero,
+	// then ff ff 00 00, then the IPv4 a translator routes to.
+	bool translated = true;
+	foreach (k; 0 .. 8)
+		if (b[k] != 0)
+		{
+			translated = false;
+			break;
+		}
+	if (translated && b[8] == 0xFF && b[9] == 0xFF && b[10] == 0 && b[11] == 0)
+		return classifyIpv4Octets(b[12], b[13], b[14], b[15]);
+
+	// 6to4 2002::/16 (RFC 3056) carries the relay-routed IPv4 in bytes 2..5.
+	if (b[0] == 0x20 && b[1] == 0x02)
+		return classifyIpv4Octets(b[2], b[3], b[4], b[5]);
 
 	// NAT64 prefixes carry an embedded IPv4 in the low 32 bits that a NAT64
 	// gateway translates and routes, so classify that IPv4 the same as ::ffff:.
@@ -665,12 +701,13 @@ struct PinnedConnect
 /// and the SNI/Host name to present. `tls` records whether the connection uses
 /// TLS.
 ///
-/// `blockInternal`: public hosts pass; an explicit literal-loopback host
-/// (`localhost`, `127.x` in any encoding, `[::1]`) passes only over plain http,
-/// as the dev-loopback allowance; everything else — including loopback over TLS
-/// and a registered name that DNS-resolves to loopback — is rejected
-/// (`classifyHost` demotes resolved loopback to private). A caller that must
-/// reach a loopback TLS service uses `allowUserConfigured`.
+/// `blockInternal`: only public hosts pass.
+/// `allowLoopback`: public hosts pass, and an explicit literal-loopback host
+/// (`localhost`, `127.x` in any encoding, `[::1]`) passes over plain http as
+/// the dev-loopback allowance; loopback over TLS and a registered name that
+/// DNS-resolves to loopback are rejected (`classifyHost` demotes resolved
+/// loopback to private). A caller that must reach a loopback TLS service uses
+/// `allowUserConfigured`.
 /// `allowUserConfigured`: every classifiable host passes (loopback and private
 /// included); only a fail-closed classification (unresolvable / malformed)
 /// is rejected.
@@ -695,9 +732,12 @@ PinnedConnect pinnedConnectAddress(string host, bool tls, SsrfPolicy policy) @sa
 	case SsrfPolicy.blockInternal:
 		if (cls == AddressClass.public_)
 			break;
+		return r; // loopback, private/link-local -> reject
+	case SsrfPolicy.allowLoopback:
+		if (cls == AddressClass.public_)
+			break;
 		// Literal loopback is the plain-http dev allowance only: over TLS it would
-		// reach local TLS services (admin consoles, sidecars) from an
-		// attacker-chosen URL.
+		// reach local TLS services (admin consoles, sidecars).
 		if (cls == AddressClass.loopback && !tls)
 			break;
 		return r; // loopback over TLS, private/link-local -> reject
@@ -838,8 +878,9 @@ void delegate(TLSContext) @safe nothrow tlsContextSetup(TlsTrust trust) @safe
 /// SSRF-safe HTTP fetch. Parses `url` with vibe's `URL` — the exact parser the
 /// connector uses — so the host vetted is the host connected to (no parser
 /// differential). The host is classified ONCE via `classifyHost`; under
-/// `policy` an internal target is rejected (`blockInternal`, dev-loopback-over-
-/// http excepted) or pinned-but-permitted (`allowUserConfigured`). The request
+/// `policy` an internal target is rejected (`blockInternal`; `allowLoopback`
+/// excepts plain-http literal loopback) or pinned-but-permitted
+/// (`allowUserConfigured`). The request
 /// URL's host is rewritten to the vetted numeric IP and the connection pinned to
 /// it, while the original hostname is preserved for the `Host` header and TLS
 /// SNI (no TOCTOU re-resolution).
@@ -848,7 +889,7 @@ void delegate(TLSContext) @safe nothrow tlsContextSetup(TlsTrust trust) @safe
 /// matching the original host name; `options.tls` selects the trusted CAs.
 ///
 /// Throws `invalidRequest` when the URL is unsafe under `policy` (insecure
-/// scheme for `blockInternal`, an internal IP-literal/resolved address, or an
+/// scheme for `blockInternal`/`allowLoopback`, an internal IP-literal/resolved address, or an
 /// unresolvable host — fail CLOSED). `@trusted` because the vibe HTTP client API
 /// is `@system`.
 void secureRequestHTTP(string url, SsrfPolicy policy,
@@ -875,23 +916,25 @@ void secureRequestHTTP(string url, SsrfPolicy policy,
 	if (host.length == 0)
 		throw invalidRequest("Refusing to fetch URL with no parseable host: " ~ url);
 
-	// Scheme gate (only meaningful for blockInternal): https to any host, or http
-	// to an explicit loopback host for dev. allowUserConfigured leaves the scheme
-	// to the caller (the transport already enforces its own scheme rules).
+	// Scheme gate: https to any host, plus (allowLoopback only) http to an
+	// explicit loopback host for dev. allowUserConfigured leaves the scheme to
+	// the caller (the transport already enforces its own scheme rules).
 	const isHttps = eqSchemeAscii(scheme, "https");
 	const isHttp = eqSchemeAscii(scheme, "http");
 	const tls = isHttps;
 
-	if (policy == SsrfPolicy.blockInternal)
+	if (policy == SsrfPolicy.blockInternal && !isHttps)
+		throw invalidRequest(
+				"Refusing to fetch insecure URL (must be https to a public host): " ~ url);
+	if (policy == SsrfPolicy.allowLoopback)
 	{
-		// Scheme gate uses the lexical class (no DNS): https to any host, or http
-		// only to an explicit loopback host. The resolved-address verdict comes from
-		// pinnedConnectAddress below.
+		// The lexical class (no DNS) decides the scheme; the resolved-address
+		// verdict comes from pinnedConnectAddress below.
 		const loopback = classifyHostLexical(host) == AddressClass.loopback;
 		if (!(isHttps || (isHttp && loopback)))
 			throw invalidRequest(
-					"Refusing to fetch insecure OAuth/discovery URL (must be https, or http to an "
-					~ "explicit loopback host; private/link-local addresses are rejected): " ~ url);
+					"Refusing to fetch insecure URL (must be https, or http to an explicit "
+					~ "loopback host; private/link-local addresses are rejected): " ~ url);
 	}
 
 	const pin = pinnedConnectAddress(host, tls, policy);
@@ -1071,6 +1114,43 @@ unittest  // classifyIpv4Octets classes 240.0.0.0/4 reserved (incl. broadcast) a
 	assert(classifyIpv4Octets(255, 255, 255, 255) == AddressClass.privateOrLinkLocal);
 }
 
+unittest  // classifyIpv4Octets classes IETF protocol-assignment, benchmarking and documentation ranges as internal
+{
+	assert(classifyIpv4Octets(192, 0, 0, 1) == AddressClass.privateOrLinkLocal); // 192.0.0.0/24
+	assert(classifyIpv4Octets(192, 0, 0, 170) == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv4Octets(198, 18, 0, 1) == AddressClass.privateOrLinkLocal); // 198.18.0.0/15
+	assert(classifyIpv4Octets(198, 19, 255, 255) == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv4Octets(192, 0, 2, 1) == AddressClass.privateOrLinkLocal); // TEST-NET-1
+	assert(classifyIpv4Octets(198, 51, 100, 1) == AddressClass.privateOrLinkLocal); // TEST-NET-2
+	assert(classifyIpv4Octets(203, 0, 113, 1) == AddressClass.privateOrLinkLocal); // TEST-NET-3
+	// Neighbours of those ranges stay public.
+	assert(classifyIpv4Octets(192, 0, 1, 1) == AddressClass.public_);
+	assert(classifyIpv4Octets(198, 17, 255, 255) == AddressClass.public_);
+	assert(classifyIpv4Octets(198, 20, 0, 1) == AddressClass.public_);
+	assert(classifyIpv4Octets(203, 0, 114, 1) == AddressClass.public_);
+}
+
+unittest  // classifyIpv6Literal classifies the IPv4 embedded in a 6to4 2002::/16 address
+{
+	assert(classifyIpv6Literal("2002:7f00:1::1") == AddressClass.loopback); // 127.0.0.1
+	assert(classifyIpv6Literal("2002:a9fe:a9fe::") == AddressClass.privateOrLinkLocal); // 169.254.169.254
+	assert(classifyIpv6Literal("2002:a00:5::1") == AddressClass.privateOrLinkLocal); // 10.0.0.5
+	assert(classifyIpv6Literal("2002:808:808::1") == AddressClass.public_); // 8.8.8.8
+}
+
+unittest  // classifyIpv6Literal classifies the IPv4 in an IPv4-translated ::ffff:0:0:0/96 address
+{
+	assert(classifyIpv6Literal("::ffff:0:7f00:1") == AddressClass.loopback); // 127.0.0.1
+	assert(classifyIpv6Literal("::ffff:0:a9fe:a9fe") == AddressClass.privateOrLinkLocal); // 169.254.169.254
+	assert(classifyIpv6Literal("::ffff:0:808:808") == AddressClass.public_); // 8.8.8.8
+}
+
+unittest  // classifyIpv6Literal classes deprecated site-local fec0::/10 as private
+{
+	assert(classifyIpv6Literal("fec0::1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("feff::1") == AddressClass.privateOrLinkLocal);
+}
+
 unittest  // classifyIpv4Octets keeps a public unicast control public
 {
 	assert(classifyIpv4Octets(8, 8, 8, 8) == AddressClass.public_);
@@ -1163,11 +1243,49 @@ unittest  // blockInternal accepts a public host over https and pins it
 	assert(r.ok && r.pinnedIp == "8.8.8.8" && r.sniHost == "8.8.8.8");
 }
 
-unittest  // blockInternal permits the explicit loopback dev allowance over plain http
+unittest  // blockInternal rejects a literal loopback host even over plain http
 {
-	assert(pinnedConnectAddress("127.0.0.1", false, SsrfPolicy.blockInternal).ok);
-	assert(pinnedConnectAddress("localhost", false, SsrfPolicy.blockInternal).ok);
-	assert(pinnedConnectAddress("[::1]", false, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("127.0.0.1", false, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("localhost", false, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("[::1]", false, SsrfPolicy.blockInternal).ok);
+}
+
+unittest  // secureRequestHTTP(blockInternal) refuses a plain-http loopback URL before connecting
+{
+	import std.exception : assertThrown;
+	import mcp.protocol.errors : McpException;
+
+	assertThrown!McpException(secureRequestHTTP("http://127.0.0.1:1/token",
+			SsrfPolicy.blockInternal, null, null));
+	assertThrown!McpException(secureRequestHTTP("http://localhost:1/token",
+			SsrfPolicy.blockInternal, null, null));
+}
+
+unittest  // allowLoopback permits the explicit loopback dev allowance over plain http
+{
+	assert(pinnedConnectAddress("127.0.0.1", false, SsrfPolicy.allowLoopback).ok);
+	assert(pinnedConnectAddress("localhost", false, SsrfPolicy.allowLoopback).ok);
+	assert(pinnedConnectAddress("[::1]", false, SsrfPolicy.allowLoopback).ok);
+}
+
+unittest  // allowLoopback still rejects loopback over https and private/link-local hosts
+{
+	assert(!pinnedConnectAddress("127.0.0.1", true, SsrfPolicy.allowLoopback).ok);
+	assert(!pinnedConnectAddress("10.0.0.5", false, SsrfPolicy.allowLoopback).ok);
+	assert(!pinnedConnectAddress("169.254.169.254", true, SsrfPolicy.allowLoopback).ok);
+	assert(!pinnedConnectAddress("LOCALHOST", false, SsrfPolicy.allowLoopback).ok);
+	assert(pinnedConnectAddress("8.8.8.8", true, SsrfPolicy.allowLoopback).ok);
+}
+
+unittest  // allowLoopback refuses plain http to anything but an explicit loopback host
+{
+	import std.exception : assertThrown;
+	import mcp.protocol.errors : McpException;
+
+	assertThrown!McpException(secureRequestHTTP("http://as.example.com/token",
+			SsrfPolicy.allowLoopback, null, null));
+	assertThrown!McpException(secureRequestHTTP("http://8.8.8.8/token",
+			SsrfPolicy.allowLoopback, null, null));
 }
 
 unittest  // blockInternal rejects loopback over https (local TLS services are not reachable)

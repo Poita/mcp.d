@@ -21,6 +21,7 @@ import vibe.data.json : Json, parseJsonString;
 import mcp.auth.jwt_verifier : audiences, currentUnixTime, jsonStr, splitScopes;
 import mcp.auth.oauth : TokenEndpointAuthMethod, basicAuthHeader, secureRequestHTTP;
 import mcp.auth.resource_server : TokenInfo, TokenValidator;
+import mcp.protocol.ssrf : SsrfPolicy;
 
 @safe:
 
@@ -195,7 +196,8 @@ private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
 	const body_ = introspectionBody(cfg, token);
 	string responseBody;
 	bool ok = false;
-	secureRequestHTTP(cfg.introspectionEndpoint, (scope HTTPClientRequest req) {
+	secureRequestHTTP(cfg.introspectionEndpoint, SsrfPolicy.allowLoopback,
+			(scope HTTPClientRequest req) {
 		req.method = HTTPMethod.POST;
 		req.headers["Content-Type"] = "application/x-www-form-urlencoded";
 		req.headers["Accept"] = "application/json";

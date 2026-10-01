@@ -43,6 +43,7 @@ import mcp.auth.oauth : AuthorizationServerMetadata, ClientIdMetadataDocument,
 	buildAuthorizationUrl,
 	buildRefreshTokenForm, isValidClientIdMetadataUrl, requireSecureUrl, secureRequestHTTP;
 import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore, referenceTokenValidator;
+import mcp.protocol.ssrf : SsrfPolicy;
 import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidator;
 import mcp.transport.session : BoundedExpiringMap;
 
@@ -898,9 +899,10 @@ final class OAuthProxy
 	in (consentStore !is null)
 	in (redirectRegistry !is null)
 	{
-		requireSecureUrl(cfg.upstreamAuthorizationEndpoint);
-		requireSecureUrl(cfg.upstreamTokenEndpoint);
-		requireSecureUrl(cfg.callbackUrl());
+		// Operator-configured endpoints: a loopback upstream is a dev setup.
+		requireSecureUrl(cfg.upstreamAuthorizationEndpoint, SsrfPolicy.allowLoopback);
+		requireSecureUrl(cfg.upstreamTokenEndpoint, SsrfPolicy.allowLoopback);
+		requireSecureUrl(cfg.callbackUrl(), SsrfPolicy.allowLoopback);
 		this.cfg = cfg;
 		this.consentStore = consentStore;
 		this.redirectRegistry = redirectRegistry;
@@ -1050,7 +1052,7 @@ final class OAuthProxy
 		bool ok = false;
 		try
 		{
-			secureRequestHTTP(clientIdUrl, (scope HTTPClientRequest req) {
+			secureRequestHTTP(clientIdUrl, SsrfPolicy.blockInternal, (scope HTTPClientRequest req) {
 				req.method = HTTPMethod.GET;
 				req.headers["Accept"] = "application/json";
 			}, (scope HTTPClientResponse res) {
