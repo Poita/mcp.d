@@ -1896,7 +1896,36 @@ final class McpClient : ClientProtocol
 	CallToolResult awaitTask(string taskId, void delegate(string taskId,
 			Json inputRequests) @safe onInputRequired = null) @safe
 	{
+		return awaitTaskImpl(taskId, onInputRequired, null);
+	}
+
+	/// `awaitTask`, stopping once `cancellation` (when non-null) is cancelled: the
+	/// task is then cancelled on the server (best effort) and this throws the
+	/// cancellation error.
+	private CallToolResult awaitTaskImpl(string taskId, void delegate(string taskId,
+			Json inputRequests) @safe onInputRequired, CancellationToken cancellation) @safe
+	{
 		import core.time : MonoTime;
+
+		void checkCancelled() @safe
+		{
+			if (cancellation is null || !cancellation.isCancelled)
+				return;
+			// Send tasks/cancel outside the cancelled token, which would otherwise
+			// refuse the request before it is sent.
+			const key = currentFiberKey();
+			auto bound = callTokens_.get(key, null);
+			callTokens_.remove(key);
+			scope (exit)
+				if (bound !is null)
+					callTokens_[key] = bound;
+			try
+				cancelTask(taskId);
+			catch (Exception)
+			{
+			}
+			throw cancelledError(cancellation.reason);
+		}
 
 		const start = MonoTime.currTime;
 		// The inputRequests keys already handed to `onInputRequired` during the
@@ -1906,7 +1935,15 @@ final class McpClient : ClientProtocol
 		bool inInputPhase;
 		for (;;)
 		{
-			auto state = getTaskState(taskId);
+			checkCancelled();
+			Json state;
+			try
+				state = getTaskState(taskId);
+			catch (McpException e)
+			{
+				checkCancelled();
+				throw e;
+			}
 			const status = ("status" in state && state["status"].type == Json.Type.string) ? state["status"]
 				.get!string : "working";
 			switch (status)
@@ -1972,8 +2009,10 @@ final class McpClient : ClientProtocol
 	/// the final `CallToolResult`; otherwise return the synchronous result. Lets a
 	/// caller treat task and non-task tools identically. Requires `enableTasks`.
 	///
-	/// Built on `callTool`, so any MRTR (SEP-2322) round-trips and per-call progress
-	/// are handled before the task handle is observed. A caller that instead needs
+	/// Built on `callTool`, so any MRTR (SEP-2322) round-trips are handled before
+	/// the task handle is observed. `opts.onProgress` keeps receiving the call's
+	/// progress while the task is polled, and cancelling `opts.cancellation` stops
+	/// polling and cancels the task on the server. A caller that instead needs
 	/// to persist the task and resume after a restart should call `callTool`
 	/// directly, store `result.task.taskId` when `result.isTask`, and later resume
 	/// with `awaitTask`.
@@ -1982,10 +2021,15 @@ final class McpClient : ClientProtocol
 				Json inputRequests) @safe onInputRequired = null,
 			RequestOptions opts = RequestOptions.init) @safe
 	{
+		// Mint the progress token up front so the task phase routes the same
+		// token's progress to `opts.onProgress` as the initial call did.
+		effectiveToken(opts);
 		auto r = callTool(name, arguments, opts);
-		if (r.isTask())
-			return awaitTask(r.task.taskId, onInputRequired);
-		return r;
+		if (!r.isTask())
+			return r;
+		return withPerCallProgress!CallToolResult(opts, () @safe {
+			return awaitTaskImpl(r.task.taskId, onInputRequired, opts.cancellation);
+		});
 	}
 
 	private McpException taskFailedError(string taskId, Json state) @safe
@@ -4555,6 +4599,76 @@ unittest  // callToolAwait drives a task reply to completion
 	};
 	auto r = c.callToolAwait("deploy");
 	assert(r.content[0].text == "async");
+}
+
+unittest  // callToolAwait routes progress to opts.onProgress while it polls the task
+{
+	import mcp.protocol.types : ProgressNotification;
+
+	auto c = McpClient.http("http://localhost");
+	Json token;
+	int progressSeen;
+	int polls;
+	c.onTaskSleepForTest = (Duration d) @safe {
+		Json p = Json.emptyObject;
+		p["progressToken"] = token;
+		p["progress"] = polls;
+		c.dispatchNotification("notifications/progress", p);
+	};
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tools/call")
+		{
+			token = params["_meta"]["progressToken"];
+			return Json([
+				"resultType": Json("task"),
+				"taskId": Json("t1"),
+				"status": Json("working")
+			]);
+		}
+		assert(method == "tasks/get");
+		if (++polls < 3)
+			return Json(["taskId": Json("t1"), "status": Json("working")]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json(["content": Json.emptyArray])
+		]);
+	};
+	c.callToolAwait("slow", Json.emptyObject, null,
+			RequestOptions.withProgress((ProgressNotification n) @safe {
+				progressSeen++;
+			}));
+	assert(progressSeen == 2, "progress during task polling must reach opts.onProgress");
+}
+
+unittest  // cancelling callToolAwait's token stops polling and cancels the task
+{
+	auto c = McpClient.http("http://localhost");
+	auto cancel = new CancellationToken;
+	string[] methods;
+	c.onTaskSleepForTest = (Duration d) @safe { cancel.cancel(); };
+	c.onRpcForTest = (string method, Json params) @safe {
+		methods ~= method;
+		if (method == "tools/call")
+			return Json([
+			"resultType": Json("task"),
+			"taskId": Json("t1"),
+			"status": Json("working")
+		]);
+		if (method == "tasks/cancel")
+			return Json.emptyObject;
+		return Json(["taskId": Json("t1"), "status": Json("working")]);
+	};
+	RequestOptions opts;
+	opts.cancellation = cancel;
+	int code;
+	try
+		c.callToolAwait("slow", Json.emptyObject, null, opts);
+	catch (McpException e)
+		code = e.code;
+	assert(code == ErrorCode.requestCancelled, "a cancelled await must fail as cancelled");
+	assert(methods == ["tools/call", "tasks/get", "tasks/cancel"],
+			"cancellation must stop polling and cancel the task on the server");
 }
 
 unittest  // cancelTask issues a tasks/cancel for the given id
