@@ -383,9 +383,8 @@ private P marshalArg(P, bool stringArgs = false)(Json args, string name) @safe
 ///
 /// The UDA-driven registration overloads marshal each argument from the method
 /// signature for you, but the dynamic `registerTool`/`registerPrompt`
-/// overloads hand the handler the raw `Json arguments`. This is the inbound
-/// counterpart of the client's `callTool!T`: it deserializes `arguments` through
-/// the same enum-by-name policy the UDA layer uses (so any `enum` leaf is read
+/// overloads hand the handler the raw `Json arguments`. `argsAs` deserializes
+/// `arguments` through the same enum-by-name policy the UDA layer uses (so any `enum` leaf is read
 /// from its schema-declared member name, at any nesting depth) and maps a vibe
 /// conversion failure to `invalidParams` (-32602), matching how the reflection
 /// layer reports a malformed argument. A handler can then write

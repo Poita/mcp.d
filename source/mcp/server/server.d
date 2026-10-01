@@ -416,7 +416,7 @@ final class McpServer : ServerCore
 	/// `inputSchema` is built at runtime and therefore have no compile-time D
 	/// type: the handler receives the raw `Json arguments` as they arrived on the
 	/// wire. For a statically-typed tool, prefer the UDA layer
-	/// (`@tool`-annotated methods registered via `registerTools`), which marshals
+	/// (`@tool`-annotated methods registered via `registerHandlers` / `registerModule`), which marshals
 	/// typed parameters for you and dispatches through this same dynamic path.
 	void registerTool(Tool descriptor, ToolHandler handler) @safe
 	{
