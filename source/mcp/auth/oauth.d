@@ -461,10 +461,9 @@ unittest  // generatePkce produces a valid, unique pair from the OS CSPRNG
 
 unittest  // generatePkce's entropy source is the OS CSPRNG, not the default rndGen
 {
-	// The old implementation drew verifier bytes from a default-seeded
-	// std.random Mersenne Twister. Reproduce that exact predictable sequence and
-	// assert the real generator does not reproduce it (it would, with
-	// overwhelming probability, if it had regressed to rndGen).
+	// Reproduce the predictable sequence a default-seeded std.random Mersenne
+	// Twister yields and assert the real generator does not reproduce it (it
+	// would, with overwhelming probability, if it drew from rndGen).
 	import std.random : rndGen, uniform;
 
 	auto gen = rndGen;

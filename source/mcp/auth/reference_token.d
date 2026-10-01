@@ -196,13 +196,11 @@ private long nowUnixSeconds() @safe
 // Tests
 // ===========================================================================
 
-@safe unittest
+@safe unittest  // the validator measures "now" in Unix seconds, matching IssuedToken.expiresAt
 {
-	// REGRESSION: IssuedToken.expiresAt is documented as absolute Unix time, so a
-	// token expiring an hour from now (real unix seconds) MUST validate. This fails
-	// when the validator's notion of "now" is not actually unix seconds (e.g.
-	// seconds since 1 AD), which makes every realistically-dated token read as
-	// already expired and rejects it.
+	// A token expiring an hour from now (real Unix seconds) must validate; a
+	// clock in any other epoch (e.g. seconds since 1 AD) would read every
+	// realistically-dated token as already expired.
 	import std.datetime.systime : Clock;
 
 	auto store = new ReferenceTokenStore();

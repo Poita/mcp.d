@@ -488,7 +488,7 @@ unittest  // mintJwtEs256 fails closed on control characters in a claim
 	assertThrown(mintJwtEs256(testEcPem, claims));
 }
 
-unittest  // auto-generated jti values are unique even when now is identical across calls (#1160)
+unittest  // auto-generated jti values are unique even when now is identical across calls
 {
 	import std.algorithm : startsWith;
 	import std.array : split;
