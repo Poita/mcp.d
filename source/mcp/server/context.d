@@ -756,8 +756,13 @@ final class RequestScope : RequestContext, ConnectionScoped
 		return inner.listRootsRaw();
 	}
 
+	/// A stateless (MRTR) request declares its capabilities in its own `_meta`,
+	/// so those are authoritative; a session request delegates to the transport
+	/// context, which also knows whether a server->client channel exists.
 	bool clientSupports(ClientCapability cap) @safe
 	{
+		if (stateless)
+			return clientCaps_.supports(cap);
 		return inner.clientSupports(cap);
 	}
 
@@ -1153,6 +1158,19 @@ unittest  // RequestScope exposes the shared cancellation token via isCancelled
 	assert(!scope_.isCancelled);
 	token.cancel();
 	assert(scope_.isCancelled);
+}
+
+unittest  // a stateless RequestScope answers clientSupports from the request's own capabilities
+{
+	import mcp.protocol.versions : latestStable;
+
+	Json[string] empty;
+	ClientCapabilities caps;
+	caps.elicitation = true;
+	auto scope_ = new RequestScope(new LogProbe, true, empty, "info", true,
+			null, "", latestStable, caps);
+	assert(scope_.clientSupports(ClientCapability.elicitation));
+	assert(!scope_.clientSupports(ClientCapability.sampling));
 }
 
 unittest  // a CancellationToken starts uncancelled and cancel() is idempotent
