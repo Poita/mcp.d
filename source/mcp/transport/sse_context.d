@@ -2279,6 +2279,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	private ServerPushChannel replay_;
 	// Set once a write to the response fails; later frames skip the socket.
 	private bool disconnected_;
+	private TaskMutex writeMtx_;
 
 	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
 			TokenInfo auth = TokenInfo.invalid(),
@@ -2300,6 +2301,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		this.serverStateless_ = serverStateless;
 		this.acceptsEventStream_ = acceptsEventStream;
 		this.connAlive_ = () @safe => res.connected;
+		this.writeMtx_ = new TaskMutex;
 	}
 
 	/// Whether an SSE upgrade was refused for this request because the client's
@@ -2425,13 +2427,21 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		writeFrame(frame);
 	}
 
+	// Handler tasks may log or report progress concurrently, and a socket write
+	// can yield mid-frame, so each event is framed and written under `writeMtx_`
+	// to keep frames whole and their ids in order.
 	private void writeEvent(Json msg) @safe
 	{
-		beginStream();
-		const frame = replay_ !is null ? replay_.publishStreamEvent(streamId,
-				token_, msg) : formatSseEvent(nextEventId(), msg);
-		eventSeq++;
-		writeFrame(frame);
+		() @trusted {
+			synchronized (writeMtx_)
+			{
+				beginStream();
+				const frame = replay_ !is null ? replay_.publishStreamEvent(streamId,
+						token_, msg) : formatSseEvent(nextEventId(), msg);
+				eventSeq++;
+				writeFrame(frame);
+			}
+		}();
 	}
 
 	// A client disconnect does not cancel the request (basic/transports
@@ -3634,4 +3644,63 @@ unittest  // a 2025-11-25 stream that cannot be resumed sends no priming event
 	const body_ = () @trusted { return cast(string) sink.data.idup; }();
 	assert(body_.canFind("hello"));
 	assert(!body_.canFind("data: \n\n"), "priming invites a resume the server cannot serve");
+}
+
+version (unittest) private final class ChunkedYieldingSink : OutputStream
+{
+	import vibe.core.core : yield;
+
+	string data;
+
+	size_t write(scope const(ubyte)[] bytes, IOMode) @safe
+	{
+		foreach (b; bytes)
+		{
+			data ~= cast(char) b;
+			yield();
+		}
+		return bytes.length;
+	}
+
+	void flush() @safe
+	{
+	}
+
+	void finalize() @safe
+	{
+	}
+}
+
+unittest  // concurrent writes on one POST stream never interleave their frames
+{
+	import std.algorithm : splitter, filter;
+	import std.array : array;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto sink = new ChunkedYieldingSink;
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, new StreamCoordinator, caps, Json.undefined);
+	int done;
+	foreach (i; 0 .. 3)
+		runTask((int n) nothrow{
+			try
+				ctx.log("info", Json("writer-" ~ cast(char)('0' + n)));
+			catch (Exception)
+			{
+			}
+			if (++done == 3)
+				exitEventLoop();
+		}, i);
+	runEventLoop();
+	auto frames = sink.data.splitter("\n\n").filter!(f => f.length > 0).array;
+	assert(frames.length == 3);
+	foreach (f; frames)
+	{
+		import std.algorithm : startsWith, count;
+
+		assert(f.startsWith("id: "), f);
+		assert(f.count("data: ") == 1, f);
+	}
 }
