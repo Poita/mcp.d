@@ -5258,9 +5258,9 @@ struct ProgressNotification
 			n.progressToken = params["progressToken"];
 		if ("progress" in params)
 			tryNumber(params["progress"], n.progress);
-		double total;
-		if ("total" in params && tryNumber(params["total"], total))
-			n.total = total;
+		double totalValue;
+		if ("total" in params && tryNumber(params["total"], totalValue))
+			n.total = totalValue;
 		if ("message" in params && params["message"].type == Json.Type.string)
 			n.message = params["message"].get!string;
 		return n;

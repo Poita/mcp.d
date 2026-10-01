@@ -556,7 +556,7 @@ unittest  // a notification with primitive params is rejected
 
 unittest  // object, array and absent params are accepted
 {
-	parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}`);
-	parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping","params":[]}`);
-	parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+	cast(void) parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}`);
+	cast(void) parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping","params":[]}`);
+	cast(void) parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
 }
