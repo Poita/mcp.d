@@ -1507,6 +1507,10 @@ final class McpClient : ClientProtocol
 	/// `CallToolResult`. The loop only
 	/// engages when modern mode is enabled (see `enableModern`/`connect`); other
 	/// protocol versions never see `inputRequests`.
+	/// If an input request has no matching handler installed, or the server keeps
+	/// asking past the round limit, the loop stops and the still-unfinished result
+	/// is returned as-is rather than thrown: check `isInputRequired` before using
+	/// it, and inspect `inputRequests` / `requestState` to answer it yourself.
 	///
 	/// When output-schema validation is enabled (see
 	/// `enableOutputSchemaValidation`) and the cached `tools/list` response carries
@@ -2156,6 +2160,8 @@ final class McpClient : ClientProtocol
 	/// are carried in `opts` (see `RequestOptions`). A still-fresh result (keyed by
 	/// `uri`) is served from the cache without a round-trip — and so fires no
 	/// progress callbacks; `opts.cacheMode` overrides.
+	/// A modern server's input requests are completed as for `callTool`; one the
+	/// client cannot answer is returned unfinished (`isInputRequired`).
 	ReadResourceResult readResource(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
 		return cachedFetch!ReadResourceResult(CacheKey("resources/read", uri),
@@ -2278,6 +2284,10 @@ final class McpClient : ClientProtocol
 	/// `onListRoots`) and the call is resubmitted with the answers. Returns the
 	/// first completed `GetPromptResult`. Against stable-protocol servers the loop
 	/// never fires (stable-protocol servers never emit `inputRequests`).
+	/// If an input request has no matching handler installed, or the server keeps
+	/// asking past the round limit, the loop stops and the still-unfinished result
+	/// is returned as-is rather than thrown: check `isInputRequired` before using
+	/// it, and inspect `inputRequests` / `requestState` to answer it yourself.
 	/// Per-request `progressToken` / `logLevel` / `onProgress` are carried in
 	/// `opts` (see `RequestOptions`).
 	GetPromptResult getPrompt(string name, Json arguments = Json.emptyObject,
