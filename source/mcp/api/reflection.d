@@ -20,7 +20,7 @@ import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
 import mcp.api.skills : Skill, registerSkill;
-import mcp.api.binding : bindJson, bindString, schemaNode, schemaOf, setBound;
+import mcp.api.binding : bindJson, bindString, isFieldwiseStruct, schemaNode, schemaOf, setBound;
 import mcp.protocol.schema;
 
 @safe:
@@ -372,14 +372,16 @@ T argsAs(T)(Json arguments) @safe
 
 /// The JSON Schema describing a tool's structured output, derived from its
 /// return type — or `Json.undefined` when the tool produces unstructured text
-/// (a `string`) or supplies its own `CallToolResult`. Aggregate (`struct`)
-/// returns map to their object schema directly; scalar/array/enum returns are
-/// wrapped under a `result` property so `structuredContent` is always an object.
+/// (a `string`) or supplies its own `CallToolResult`. Fieldwise-serialized
+/// structs map to their object schema directly; every other return (scalars,
+/// arrays, enums, `Nullable`, `Json`, `SumType`, and custom-serialized structs
+/// such as `SysTime`) is wrapped under a `result` property so
+/// `structuredContent` is always an object.
 private Json outputSchemaOf(R)() @safe
 {
 	static if (is(R == CallToolResult) || is(R == ToolResponse) || isSomeString!R || is(R == void))
 		return Json.undefined;
-	else static if (is(R == struct))
+	else static if (isFieldwiseStruct!R)
 		return schemaOf!(R, false);
 	else
 	{
@@ -394,8 +396,8 @@ private Json outputSchemaOf(R)() @safe
 }
 
 /// Wrap a tool method's return value into a `CallToolResult`. The structured
-/// result mirrors `outputSchemaOf!R`: structs serialize to an object; scalars,
-/// arrays, and enums are wrapped under a `result` key; strings become text
+/// result mirrors `outputSchemaOf!R`: fieldwise structs serialize to an object;
+/// every other value is wrapped under a `result` key; strings become text
 /// content with no structured output.
 private CallToolResult toToolResult(R)(R ret) @safe if (!is(R == void))
 {
@@ -413,7 +415,7 @@ private CallToolResult toToolResult(R)(R ret) @safe if (!is(R == void))
 		// Serialize through EnumByNamePolicy so enum leaves (the value itself, or
 		// enums nested in structs/arrays) emit their schema-declared string member
 		// name, matching the tool's outputSchema instead of an integer base value.
-		static if (is(R == struct))
+		static if (isFieldwiseStruct!R)
 			auto structured = () @trusted {
 				return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(ret);
 			}();
@@ -3617,4 +3619,45 @@ unittest  // a @task method taking an EventContext is rejected at compile time
 {
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new EventCtxTaskApi)));
+}
+
+unittest  // a Nullable return is wrapped under `result` in an object output schema
+{
+	auto s = outputSchemaOf!(Nullable!int)();
+	assert(s["type"].get!string == "object", s.toString());
+	assert("result" in s["properties"]);
+
+	auto r = toToolResult(Nullable!int(3));
+	assert(r.structuredContent.type == Json.Type.object);
+	assert(r.structuredContent["result"].get!long == 3);
+}
+
+unittest  // a null Nullable return still yields an object structuredContent
+{
+	auto r = toToolResult(Nullable!int.init);
+	assert(r.structuredContent.type == Json.Type.object);
+	assert(r.structuredContent["result"].type == Json.Type.null_);
+}
+
+unittest  // a SysTime return is wrapped under `result` in an object output schema
+{
+	import std.datetime.systime : SysTime;
+	import std.datetime.timezone : UTC;
+	import std.datetime.date : DateTime;
+
+	auto s = outputSchemaOf!SysTime();
+	assert(s["type"].get!string == "object", s.toString());
+	assert("result" in s["properties"]);
+
+	auto r = toToolResult(SysTime(DateTime(2026, 1, 2, 3, 4, 5), UTC()));
+	assert(r.structuredContent.type == Json.Type.object);
+	assert(r.structuredContent["result"].type == Json.Type.string);
+}
+
+unittest  // a Json return is wrapped under `result` so structuredContent is an object
+{
+	auto r = toToolResult(Json(5));
+	assert(r.structuredContent.type == Json.Type.object);
+	assert(r.structuredContent["result"].get!long == 5);
+	assert("result" in outputSchemaOf!Json()["properties"]);
 }
