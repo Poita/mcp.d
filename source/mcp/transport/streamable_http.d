@@ -1939,7 +1939,7 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		// 2025-03-26 back-compat: the non-streaming batch path (no in-flight
 		// server->client traffic), dispatched against the resolved state so the
 		// legacy path is actually reachable for a session that negotiated 2025-03-26.
-		const txt = server.handleRaw(payload, reqState);
+		const txt = server.handleRaw(payload, reqState, connToken);
 		if (txt.length == 0)
 		{
 			res.statusCode = HTTPStatus.accepted;
@@ -3633,9 +3633,9 @@ unittest  // concurrent legacy stateless clients never observe each other's init
 	}
 
 	auto a = freshStatelessState("", Json.undefined);
-	server.handleRaw(initialize("2025-03-26"), a);
+	server.handleRaw(initialize("2025-03-26"), a, "");
 	auto b = freshStatelessState("", Json.undefined);
-	server.handleRaw(initialize("2025-11-25"), b);
+	server.handleRaw(initialize("2025-11-25"), b, "");
 
 	// Client A's next request (no header, so 2025-03-26) resolves to its own
 	// state: B's initialize must not change the version or caps A is served with.

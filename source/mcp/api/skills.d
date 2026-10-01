@@ -910,7 +910,7 @@ unittest  // skillMarkdown round-trips control and line-separator characters thr
 
 	const desc = "a\rb\tc\x01d\x1Fe\x7Ff\u0085g\u2028h\u2029i\\j\"k\nl";
 	auto fm = parseSkillFrontmatter(skillMarkdown("x", desc, "body", [
-			"k\r": "v\x02"
+		"k\r": "v\x02"
 	]));
 	assert(fm["description"].get!string == desc);
 	assert(fm["metadata"]["k\r"].get!string == "v\x02");
@@ -1231,7 +1231,7 @@ unittest  // skills/list and skills/get do not exist below 2025-11-25
 	foreach (method; ["skills/list", "skills/get"])
 	{
 		auto outText = s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"` ~ method
-				~ `","params":{"uri":"skill://office/pdf-forms/SKILL.md"}}`, conn);
+				~ `","params":{"uri":"skill://office/pdf-forms/SKILL.md"}}`, conn, "");
 		auto resp = parseJsonString(outText);
 		assert(resp["error"]["code"].get!int == cast(int) ErrorCode.methodNotFound);
 	}
@@ -2139,7 +2139,7 @@ unittest  // resources/directory/read does not exist below 2025-11-25
 	auto conn = new ConnectionState;
 	conn.negotiated = ProtocolVersion.v2025_06_18;
 	auto outText = s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"resources/directory/read",`
-			~ `"params":{"uri":"skill://office/pdf-forms"}}`, conn);
+			~ `"params":{"uri":"skill://office/pdf-forms"}}`, conn, "");
 	auto resp = parseJsonString(outText);
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.methodNotFound);
 }

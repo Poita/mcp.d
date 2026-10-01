@@ -348,7 +348,7 @@ Two directions make up the contract:
   and issue server->client requests. A transport that multiplexes many sessions
   over one server also implements `ConnectionScoped` on its `RequestContext` so
   the core scopes per-connection state (the cancellation registry) per session,
-  and threads each request's own `ConnectionState` via `handleRaw(text, conn)`.
+  and threads each request's own `ConnectionState` via `handleRaw(text, conn, token)`.
 
 **Connection / session ownership is in-package only.** The fallback
 `ConnectionState` hook the out-of-request notify/push path uses
@@ -358,7 +358,7 @@ This is a deliberate pre-1.0 choice: the seam stays narrow rather than exposing
 connection internals that would be hard to evolve. An out-of-package transport can
 fully drive request/response and per-request state through `ServerCore` +
 `RequestContext` (building its own `ConnectionState` and passing it to
-`handleRaw(text, conn)`), but it cannot own the fallback connection the
+`handleRaw(text, conn, token)`), but it cannot own the fallback connection the
 out-of-request notify/push path reads. Transports that need that ownership belong
 in `mcp.transport.*`.
 
