@@ -120,6 +120,10 @@ struct RegisteredPrompt
 	ClientCapabilities requiredClientCapabilities;
 }
 
+/// The most `resources/subscribe` URIs one connection may hold, bounding the
+/// per-session state a client can make the server keep.
+private enum maxResourceSubscriptions = 1024;
+
 /// How a server manages per-connection state. The author chooses;
 /// `stateless` is the default. See the README "Statefulness" section for the
 /// full feature-gating matrix.
@@ -2555,7 +2559,7 @@ final class McpServer : ServerCore
 			// the RPC.
 			if (ver.isModern)
 				throw methodNotFound(method);
-			return doSubscribe(params, conn);
+			return doSubscribe(params, conn, ver);
 		case "resources/unsubscribe":
 			if (ver.isModern)
 				throw methodNotFound(method);
@@ -3053,7 +3057,7 @@ final class McpServer : ServerCore
 		return maybeCache(result, listHint("skills/get"), ver);
 	}
 
-	private Json doSubscribe(Json params, ConnectionState conn) @safe
+	private Json doSubscribe(Json params, ConnectionState conn, ProtocolVersion ver) @safe
 	{
 		// `subscribe` is an optional resources capability (server/resources:
 		// "whether the client can subscribe to be notified of changes to individual
@@ -3067,8 +3071,32 @@ final class McpServer : ServerCore
 			throw methodNotFound("resources/subscribe", subscriptionRejectionHint());
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/subscribe requires a string 'uri'");
-		conn.subscriptions[params["uri"].get!string] = true;
+		const uri = params["uri"].get!string;
+		if (!resourceExists(uri))
+		{
+			Json data = Json.emptyObject;
+			data["uri"] = uri;
+			throw new McpException(ver.resourceNotFoundCode, "Resource not found: " ~ uri, data);
+		}
+		if ((uri in conn.subscriptions) is null
+				&& conn.subscriptions.length >= maxResourceSubscriptions)
+			throw invalidParams("Too many resource subscriptions on this connection");
+		conn.subscriptions[uri] = true;
 		return Json.emptyObject;
+	}
+
+	/// Whether `uri` names a registered resource or matches a resource template.
+	private bool resourceExists(string uri) @safe
+	{
+		if (uri in resources)
+			return true;
+		foreach (t; templates)
+		{
+			string[string] captured;
+			if (matchUriTemplate(t.descriptor.uriTemplate, uri, captured))
+				return true;
+		}
+		return false;
 	}
 
 	/// The `data` payload accompanying a -32601 for resources/subscribe or
@@ -6246,12 +6274,20 @@ unittest  // server reads the extensions a client advertises at initialize
 	assert("io.modelcontextprotocol/ui" in s.clientCapabilities.extensions);
 }
 
+/// Register an empty resource at each of `uris`, so tests can subscribe to them.
+version (unittest) private void registerStubResources(McpServer s, string[] uris...) @safe
+{
+	foreach (uri; uris)
+		s.registerResource(Resource(uri, uri), () @safe => ResourceContents.init);
+}
+
 unittest  // resources/subscribe and unsubscribe track URIs and return {}
 {
 	// resources/subscribe correlates more than one HTTP call, so it is
 	// only available on a STATEFUL server (a stateless server answers -32601).
 	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
+	registerStubResources(s, "test://w");
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
 	auto sub = s.handle(req(1, "resources/subscribe", p)).get;
@@ -6261,6 +6297,54 @@ unittest  // resources/subscribe and unsubscribe track URIs and return {}
 	auto unsub = s.handle(req(2, "resources/unsubscribe", p)).get;
 	assert(unsub["result"].length == 0);
 	assert(("test://w" !in s.activeConnection.subscriptions));
+}
+
+unittest  // resources/subscribe to an unknown uri is rejected with resource-not-found
+{
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	Json p = Json.emptyObject;
+	p["uri"] = "test://nowhere";
+	auto resp = s.handle(req(1, "resources/subscribe", p)).get;
+	assert(resp["error"]["code"].get!int == -32002);
+	assert(resp["error"]["data"]["uri"].get!string == "test://nowhere");
+	assert(("test://nowhere" !in s.activeConnection.subscriptions));
+}
+
+unittest  // resources/subscribe accepts a uri matching a resource template
+{
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	s.registerResourceTemplate(ResourceTemplate("file:///{name}", "f"),
+			(string uri, string[string] vars) @safe => ResourceContents.init);
+	Json p = Json.emptyObject;
+	p["uri"] = "file:///a";
+	auto resp = s.handle(req(1, "resources/subscribe", p)).get;
+	assert("error" !in resp);
+	assert(("file:///a" in s.activeConnection.subscriptions));
+}
+
+unittest  // resources/subscribe caps the number of subscriptions per connection
+{
+	import std.conv : to;
+
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	s.registerResourceTemplate(ResourceTemplate("file:///{name}", "f"),
+			(string uri, string[string] vars) @safe => ResourceContents.init);
+	Json p = Json.emptyObject;
+	foreach (i; 0 .. maxResourceSubscriptions)
+	{
+		p["uri"] = "file:///" ~ i.to!string;
+		assert("error" !in s.handle(req(i, "resources/subscribe", p)).get);
+	}
+	p["uri"] = "file:///0";
+	assert("error" !in s.handle(req(-1, "resources/subscribe", p)).get,
+			"re-subscribing an existing uri at the cap succeeds");
+	p["uri"] = "file:///over";
+	auto resp = s.handle(req(-2, "resources/subscribe", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(s.activeConnection.subscriptions.length == maxResourceSubscriptions);
 }
 
 unittest  // resources/subscribe is rejected with -32601 when capability not advertised
@@ -9083,6 +9167,7 @@ unittest  // notifyResourceUpdated emits resources/updated for a subscribed uri
 	// resources/subscribe + notifyResourceUpdated require a stateful server.
 	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
+	registerStubResources(s, "test://w");
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
@@ -9124,6 +9209,7 @@ unittest  // notifyResourceUpdated emits params that are exactly { uri } (no non
 	// resources/subscribe + notifyResourceUpdated require a stateful server.
 	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
+	registerStubResources(s, "test://w");
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
@@ -9205,6 +9291,7 @@ unittest  // notifyResourceUpdated is a no-op before a push channel exists
 	// resources/subscribe requires a stateful server.
 	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
+	registerStubResources(s, "test://w");
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
 	s.handle(req(1, "resources/subscribe", p));
@@ -10244,6 +10331,7 @@ unittest  // cross-talk: two contexts on ONE server keep independent state
 	auto s = McpServer.stateful("t", "1");
 	s.enableLogging();
 	s.enableResourceSubscriptions();
+	registerStubResources(s, "res://a");
 	auto stateA = new ConnectionState;
 	auto stateB = new ConnectionState;
 
@@ -10401,6 +10489,7 @@ unittest  // two stateful sessions on ONE server cannot observe each other's sta
 	auto s = McpServer.stateful("t", "1");
 	s.enableLogging();
 	s.enableResourceSubscriptions();
+	registerStubResources(s, "res://a", "res://b");
 
 	auto mgr = new SessionManager;
 	const idA = mgr.create();
