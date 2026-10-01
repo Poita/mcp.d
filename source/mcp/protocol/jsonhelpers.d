@@ -124,6 +124,18 @@ double numberOrThrow(Json v, string what) @safe
 	}
 }
 
+/// Throw -32602 unless `j` is a JSON object. `what` names the value in the
+/// error message. Every `fromJson` for an object-shaped type calls this first,
+/// so a peer sending e.g. a number where an object belongs gets invalidParams
+/// rather than an internal JSON type error.
+void requireObject(Json j, string what) @safe
+{
+	import mcp.protocol.errors : invalidParams;
+
+	if (j.type != Json.Type.object)
+		throw invalidParams("'" ~ what ~ "' must be a JSON object");
+}
+
 /// `v` as a string, for the field `what`. Throws -32602 for any other JSON type.
 string stringOrThrow(Json v, string what) @safe
 {
@@ -292,4 +304,20 @@ bool tryGet(N : Nullable!T, T)(Json j, string key, ref N val) @safe
 	bool assigned = tryGet(j, "code", val);
 	assert(!assigned);
 	assert(val == 99);
+}
+
+@safe unittest  // requireObject throws -32602 naming the field for a non-object value
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+	import std.algorithm.searching : canFind;
+
+	auto ex = cast(McpException) collectException(requireObject(Json(5), "capabilities"));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	assert(ex.msg.canFind("capabilities"));
+}
+
+@safe unittest  // requireObject accepts a JSON object
+{
+	requireObject(Json.emptyObject, "x");
 }

@@ -16,7 +16,7 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 import mcp.protocol.types : Content, ContentKind, Tool;
 import mcp.protocol.errors : McpException, invalidParams;
-import mcp.protocol.jsonhelpers : getOr, tryGet, numberOrThrow, stringOrThrow;
+import mcp.protocol.jsonhelpers : getOr, tryGet, numberOrThrow, stringOrThrow, requireObject;
 
 @safe:
 
@@ -90,6 +90,7 @@ struct SamplingMessage
 
 	static SamplingMessage fromJson(Json j) @safe
 	{
+		requireObject(j, "SamplingMessage");
 		SamplingMessage m;
 		m.role = j.getOr("role", "");
 		// `content` may be a single block (object) or an array of blocks; accept
@@ -163,6 +164,7 @@ struct ModelPreferences
 
 	static ModelPreferences fromJson(Json j) @safe
 	{
+		requireObject(j, "ModelPreferences");
 		ModelPreferences p;
 		if ("hints" in j && j["hints"].type == Json.Type.array)
 			foreach (i; 0 .. j["hints"].length)
@@ -208,6 +210,7 @@ struct ToolChoice
 
 	static ToolChoice fromJson(Json j) @safe
 	{
+		requireObject(j, "ToolChoice");
 		ToolChoice c;
 		if (j.type == Json.Type.object && "mode" in j && j["mode"].type == Json.Type.string)
 			c.mode = j["mode"].get!string;
@@ -282,6 +285,7 @@ struct CreateMessageRequest
 
 	static CreateMessageRequest fromJson(Json j) @safe
 	{
+		requireObject(j, "CreateMessageRequest");
 		CreateMessageRequest r;
 		if ("messages" in j && j["messages"].type == Json.Type.array)
 			foreach (i; 0 .. j["messages"].length)
@@ -559,6 +563,7 @@ struct CreateMessageResult
 
 	static CreateMessageResult fromJson(Json j) @safe
 	{
+		requireObject(j, "CreateMessageResult");
 		CreateMessageResult r;
 		r.role = j.getOr("role", "");
 		// `content` may be a single block (object) or an array of blocks; accept
@@ -1330,4 +1335,20 @@ unittest  // ModelPreferences.fromJson rejects a non-numeric priority with -3260
 			ModelPreferences.fromJson(Json(["costPriority": Json("high")])));
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 	assert(ModelPreferences.fromJson(Json(["speedPriority": Json(1)])).speedPriority.get == 1.0);
+}
+
+unittest  // every sampling fromJson rejects a non-object value with -32602
+{
+	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
+	import std.meta : AliasSeq;
+
+	static foreach (T; AliasSeq!(SamplingMessage, ModelPreferences, ToolChoice,
+			CreateMessageRequest, CreateMessageResult))
+	{
+		{
+			auto ex = cast(McpException) collectException(T.fromJson(Json(5)));
+			assert(ex !is null && ex.code == ErrorCode.invalidParams, T.stringof);
+		}
+	}
 }

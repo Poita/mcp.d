@@ -3,7 +3,7 @@ module mcp.protocol.tasks;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
-import mcp.protocol.jsonhelpers : getOr, tryGet;
+import mcp.protocol.jsonhelpers : getOr, tryGet, requireObject;
 
 /// How a tool relates to the Tasks extension (SEP-2663 "task support"). The
 /// server decides whether a call creates a task; the client only declares the
@@ -117,6 +117,7 @@ struct Task
 
 	static Task fromJson(Json j) @safe
 	{
+		requireObject(j, "Task");
 		Task t;
 		t.taskId = j.getOr("taskId", "");
 		t.status = taskStatusFromWire(j.getOr("status", "working"));
@@ -359,4 +360,13 @@ unittest  // an unrecognized wire status parses as unknown, which is terminal
 	assert(!isTerminal(TaskStatus.working) && !isTerminal(TaskStatus.inputRequired));
 	assert(Task.fromJson(Json(["taskId": Json("x"),
 				"status": Json("expired")])).status == TaskStatus.unknown);
+}
+
+unittest  // Task.fromJson rejects a non-object value with -32602
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(Task.fromJson(Json(5)));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }

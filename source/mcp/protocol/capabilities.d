@@ -3,7 +3,7 @@ module mcp.protocol.capabilities;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 import mcp.protocol.versions : ProtocolVersion;
-import mcp.protocol.jsonhelpers : getOr, tryGet, stringOrThrow;
+import mcp.protocol.jsonhelpers : getOr, tryGet, stringOrThrow, requireObject;
 
 @safe:
 
@@ -167,6 +167,7 @@ struct Implementation
 
 	static Implementation fromJson(Json j) @safe
 	{
+		requireObject(j, "Implementation");
 		Implementation impl;
 		impl.name = j.getOr("name", "");
 		impl.version_ = j.getOr("version", "");
@@ -218,6 +219,7 @@ struct ListChangedCapability
 
 	static ListChangedCapability fromJson(Json j) @safe
 	{
+		requireObject(j, "ListChangedCapability");
 		ListChangedCapability c;
 		if ("listChanged" in j && j["listChanged"].type == Json.Type.bool_)
 			c.listChanged = j["listChanged"].get!bool;
@@ -243,6 +245,7 @@ struct ResourcesCapability
 
 	static ResourcesCapability fromJson(Json j) @safe
 	{
+		requireObject(j, "ResourcesCapability");
 		ResourcesCapability c;
 		if ("subscribe" in j && j["subscribe"].type == Json.Type.bool_)
 			c.subscribe = j["subscribe"].get!bool;
@@ -313,6 +316,7 @@ struct ServerCapabilities
 
 	static ServerCapabilities fromJson(Json j) @safe
 	{
+		requireObject(j, "ServerCapabilities");
 		ServerCapabilities c;
 		if ("tools" in j && j["tools"].type == Json.Type.object)
 			c.tools = ListChangedCapability.fromJson(j["tools"]);
@@ -458,6 +462,7 @@ struct ClientCapabilities
 
 	static ClientCapabilities fromJson(Json j) @safe
 	{
+		requireObject(j, "ClientCapabilities");
 		ClientCapabilities c;
 		if ("roots" in j && j["roots"].type == Json.Type.object)
 		{
@@ -1334,4 +1339,20 @@ unittest  // ServerCapabilities.fromJson ignores null and non-object logging/com
 		"completions": Json.emptyObject
 	]));
 	assert(d.logging && d.completions);
+}
+
+unittest  // every capabilities fromJson rejects a non-object value with -32602
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+	import std.meta : AliasSeq;
+
+	static foreach (T; AliasSeq!(Implementation, ListChangedCapability,
+			ResourcesCapability, ServerCapabilities, ClientCapabilities))
+	{
+		{
+			auto ex = cast(McpException) collectException(T.fromJson(Json(5)));
+			assert(ex !is null && ex.code == ErrorCode.invalidParams, T.stringof);
+		}
+	}
 }

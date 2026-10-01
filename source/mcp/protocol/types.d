@@ -5,7 +5,7 @@ import vibe.data.json : Json, parseJsonString, deserializeJson, serializeToJson;
 import mcp.protocol.capabilities;
 import mcp.protocol.errors : ErrorCode, McpException;
 import mcp.protocol.versions : ProtocolVersion, toWire;
-import mcp.protocol.jsonhelpers : getOr, tryGet;
+import mcp.protocol.jsonhelpers : getOr, tryGet, requireObject;
 import mcp.protocol.tasks : Task, makeCreateTaskResult, isCreateTaskResult;
 import mcp.protocol.mrtr : InputRequest, emitInputRequired, parseInputRequired;
 import mcp.protocol.modern : CacheHint, parseCacheHint, withCache;
@@ -809,6 +809,7 @@ struct Annotations
 
 	static Annotations fromJson(Json j) @safe
 	{
+		requireObject(j, "Annotations");
 		Annotations a;
 		if ("audience" in j && j["audience"].type == Json.Type.array)
 			foreach (i; 0 .. j["audience"].length)
@@ -880,6 +881,7 @@ struct ToolAnnotations
 
 	static ToolAnnotations fromJson(Json j) @safe
 	{
+		requireObject(j, "ToolAnnotations");
 		ToolAnnotations a;
 		tryGet(j, "title", a.title);
 		if ("readOnlyHint" in j && j["readOnlyHint"].type == Json.Type.bool_)
@@ -939,6 +941,7 @@ struct Tool
 
 	static Tool fromJson(Json j) @safe
 	{
+		requireObject(j, "Tool");
 		Tool t;
 		t.name = j.getOr("name", "");
 		tryGet(j, "title", t.title);
@@ -1113,6 +1116,7 @@ struct CallToolResult
 
 	static CallToolResult fromJson(Json j) @safe
 	{
+		requireObject(j, "CallToolResult");
 		CallToolResult r;
 		// SEP-2663: the server returned a task handle (`CreateTaskResult`) instead
 		// of a final result. Capture the seed `Task`; `content`/`structuredContent`
@@ -1452,6 +1456,7 @@ struct ListToolsResult
 
 	static ListToolsResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ListToolsResult");
 		ListToolsResult r;
 		if ("tools" in j && j["tools"].type == Json.Type.array)
 		{
@@ -1583,6 +1588,7 @@ struct InitializeParams
 
 	static InitializeParams fromJson(Json j) @safe
 	{
+		requireObject(j, "InitializeParams");
 		InitializeParams p;
 		p.protocolVersion = j.getOr("protocolVersion", "");
 		if ("capabilities" in j)
@@ -1614,6 +1620,7 @@ struct InitializeResult
 
 	static InitializeResult fromJson(Json j) @safe
 	{
+		requireObject(j, "InitializeResult");
 		InitializeResult r;
 		r.protocolVersion = j.getOr("protocolVersion", "");
 		if ("capabilities" in j)
@@ -2824,6 +2831,7 @@ struct Resource
 
 	static Resource fromJson(Json j) @safe
 	{
+		requireObject(j, "Resource");
 		Resource r;
 		r.uri = j.getOr("uri", "");
 		r.name = j.getOr("name", "");
@@ -2918,6 +2926,7 @@ struct ResourceTemplate
 
 	static ResourceTemplate fromJson(Json j) @safe
 	{
+		requireObject(j, "ResourceTemplate");
 		ResourceTemplate t;
 		t.uriTemplate = j.getOr("uriTemplate", "");
 		t.name = j.getOr("name", "");
@@ -3007,6 +3016,7 @@ struct ResourceContents
 
 	static ResourceContents fromJson(Json j) @safe
 	{
+		requireObject(j, "ResourceContents");
 		ResourceContents c;
 		c.uri = j.getOr("uri", "");
 		tryGet(j, "mimeType", c.mimeType);
@@ -3185,6 +3195,7 @@ struct ListResourcesResult
 
 	static ListResourcesResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ListResourcesResult");
 		ListResourcesResult r;
 		if ("resources" in j && j["resources"].type == Json.Type.array)
 		{
@@ -3233,6 +3244,7 @@ struct ListSkillsResult
 
 	static ListSkillsResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ListSkillsResult");
 		ListSkillsResult r;
 		if ("skills" in j && j["skills"].type == Json.Type.array)
 		{
@@ -3276,6 +3288,7 @@ struct GetSkillResult
 
 	static GetSkillResult fromJson(Json j) @safe
 	{
+		requireObject(j, "GetSkillResult");
 		GetSkillResult r;
 		if ("skill" in j)
 			r.skill = j["skill"];
@@ -3317,6 +3330,7 @@ struct ListResourceTemplatesResult
 
 	static ListResourceTemplatesResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ListResourceTemplatesResult");
 		ListResourceTemplatesResult r;
 		if ("resourceTemplates" in j && j["resourceTemplates"].type == Json.Type.array)
 		{
@@ -3592,6 +3606,7 @@ struct ListRootsResult
 
 	static ListRootsResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ListRootsResult");
 		ListRootsResult r;
 		if ("roots" in j && j["roots"].type == Json.Type.array)
 		{
@@ -4183,6 +4198,7 @@ struct ReadResourceResult
 
 	static ReadResourceResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ReadResourceResult");
 		ReadResourceResult r;
 		// An InputRequiredResult carries `inputRequests` instead of `contents`.
 		parseInputRequired(j, r.inputRequests, r.requestState);
@@ -4270,6 +4286,7 @@ struct PromptArgument
 
 	static PromptArgument fromJson(Json j) @safe
 	{
+		requireObject(j, "PromptArgument");
 		PromptArgument a;
 		a.name = j.getOr("name", "");
 		tryGet(j, "title", a.title);
@@ -4374,6 +4391,7 @@ struct Prompt
 
 	static Prompt fromJson(Json j) @safe
 	{
+		requireObject(j, "Prompt");
 		Prompt p;
 		p.name = j.getOr("name", "");
 		tryGet(j, "title", p.title);
@@ -4556,6 +4574,7 @@ struct PromptMessage
 
 	static PromptMessage fromJson(Json j) @safe
 	{
+		requireObject(j, "PromptMessage");
 		PromptMessage m;
 		m.role = j.getOr("role", "");
 		if ("content" in j)
@@ -4607,6 +4626,7 @@ struct ListPromptsResult
 
 	static ListPromptsResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ListPromptsResult");
 		ListPromptsResult r;
 		if ("prompts" in j && j["prompts"].type == Json.Type.array)
 		{
@@ -4665,6 +4685,7 @@ struct GetPromptResult
 
 	static GetPromptResult fromJson(Json j) @safe
 	{
+		requireObject(j, "GetPromptResult");
 		GetPromptResult r;
 		// An InputRequiredResult carries `inputRequests` instead of `messages`.
 		parseInputRequired(j, r.inputRequests, r.requestState);
@@ -5967,4 +5988,31 @@ unittest  // Content.fromJson rejects a non-object block with -32602
 
 	auto ex = cast(McpException) collectException(Content.fromJson(Json("text")));
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // initialize with a non-object capabilities value is rejected with -32602
+{
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(InitializeParams.fromJson(
+			`{"protocolVersion":"2025-11-25","capabilities":5}`.parseJsonString));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // every object-shaped fromJson rejects a non-object value with -32602
+{
+	import std.exception : collectException;
+	import std.meta : AliasSeq;
+
+	static foreach (T; AliasSeq!(Annotations, ToolAnnotations, Tool, CallToolResult,
+			ListToolsResult, InitializeParams, InitializeResult, Resource, ResourceTemplate,
+			ResourceContents, ListResourcesResult, ListSkillsResult, GetSkillResult,
+			ListResourceTemplatesResult, ListRootsResult, ReadResourceResult,
+			PromptArgument, Prompt, PromptMessage, ListPromptsResult, GetPromptResult))
+	{
+		{
+			auto ex = cast(McpException) collectException(T.fromJson(Json(5)));
+			assert(ex !is null && ex.code == ErrorCode.invalidParams, T.stringof);
+		}
+	}
 }

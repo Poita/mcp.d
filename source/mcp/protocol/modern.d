@@ -7,7 +7,7 @@ import vibe.data.json : Json;
 
 import mcp.protocol.capabilities;
 import mcp.protocol.mrtr : MetaKey;
-import mcp.protocol.jsonhelpers : tryGet;
+import mcp.protocol.jsonhelpers : tryGet, requireObject;
 
 @safe:
 
@@ -154,6 +154,7 @@ struct DiscoverResult
 
 	static DiscoverResult fromJson(Json j) @safe
 	{
+		requireObject(j, "DiscoverResult");
 		DiscoverResult r;
 		// Spec wire field is `supportedVersions`; accept the legacy
 		// `protocolVersions` name as a fallback for older peers.
@@ -556,4 +557,12 @@ unittest  // parseCacheHint returns null when ttlMs is absent
 	Json r = Json.emptyObject;
 	r["tools"] = Json.emptyArray;
 	assert(parseCacheHint(r).isNull);
+}
+
+unittest  // DiscoverResult.fromJson rejects a non-object value with -32602
+{
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(DiscoverResult.fromJson(Json(5)));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }

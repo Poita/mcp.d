@@ -10,7 +10,7 @@ module mcp.protocol.events;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
-import mcp.protocol.jsonhelpers : getOr, tryGet;
+import mcp.protocol.jsonhelpers : getOr, tryGet, requireObject;
 
 @safe:
 
@@ -111,6 +111,7 @@ struct EventType
 
 	static EventType fromJson(Json j) @safe
 	{
+		requireObject(j, "EventType");
 		EventType e;
 		e.name = j.getOr("name", "");
 		e.description = j.getOr("description", "");
@@ -155,6 +156,7 @@ struct EventListResult
 
 	static EventListResult fromJson(Json j) @safe
 	{
+		requireObject(j, "EventListResult");
 		EventListResult r;
 		if ("events" in j && j["events"].type == Json.Type.array)
 			foreach (i; 0 .. j["events"].length)
@@ -194,6 +196,7 @@ struct EventOccurrence
 
 	static EventOccurrence fromJson(Json j) @safe
 	{
+		requireObject(j, "EventOccurrence");
 		EventOccurrence e;
 		e.eventId = j.getOr("eventId", "");
 		e.name = j.getOr("name", "");
@@ -252,6 +255,7 @@ struct PollParams
 
 	static PollParams fromJson(Json j) @safe
 	{
+		requireObject(j, "PollParams");
 		PollParams p;
 		p.name = j.getOr("name", "");
 		if ("arguments" in j && j["arguments"].type == Json.Type.object)
@@ -292,6 +296,7 @@ struct PollResult
 
 	static PollResult fromJson(Json j) @safe
 	{
+		requireObject(j, "PollResult");
 		PollResult r;
 		if ("events" in j && j["events"].type == Json.Type.array)
 			foreach (i; 0 .. j["events"].length)
@@ -326,6 +331,7 @@ struct StreamParams
 
 	static StreamParams fromJson(Json j) @safe
 	{
+		requireObject(j, "StreamParams");
 		StreamParams p;
 		p.name = j.getOr("name", "");
 		if ("arguments" in j && j["arguments"].type == Json.Type.object)
@@ -395,6 +401,7 @@ struct SubscribeParams
 
 	static SubscribeParams fromJson(Json j) @safe
 	{
+		requireObject(j, "SubscribeParams");
 		SubscribeParams p;
 		p.name = j.getOr("name", "");
 		if ("arguments" in j && j["arguments"].type == Json.Type.object)
@@ -437,6 +444,7 @@ struct SubscribeResult
 
 	static SubscribeResult fromJson(Json j) @safe
 	{
+		requireObject(j, "SubscribeResult");
 		SubscribeResult r;
 		r.id = j.getOr("id", "");
 		if ("refreshBefore" in j && j["refreshBefore"].type == Json.Type.string)
@@ -471,6 +479,7 @@ struct UnsubscribeParams
 
 	static UnsubscribeParams fromJson(Json j) @safe
 	{
+		requireObject(j, "UnsubscribeParams");
 		UnsubscribeParams p;
 		p.name = j.getOr("name", "");
 		if ("arguments" in j && j["arguments"].type == Json.Type.object)
@@ -566,6 +575,7 @@ struct DeliveryStatus
 
 	static DeliveryStatus fromJson(Json j) @safe
 	{
+		requireObject(j, "DeliveryStatus");
 		DeliveryStatus s;
 		s.active = j.getOr("active", false);
 		tryGet(j, "lastDeliveryAt", s.lastDeliveryAt);
@@ -1351,4 +1361,21 @@ unittest  // a webhook verification envelope is not surfaced as control
 {
 	EventControl c;
 	assert(!controlFromWebhookEnvelope(verificationEnvelope("nonce"), c));
+}
+
+unittest  // every events fromJson rejects a non-object value with -32602
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+	import std.meta : AliasSeq;
+
+	static foreach (T; AliasSeq!(EventType, EventListResult, EventOccurrence,
+			PollParams, PollResult,
+			StreamParams, SubscribeParams, SubscribeResult, UnsubscribeParams, DeliveryStatus))
+	{
+		{
+			auto ex = cast(McpException) collectException(T.fromJson(Json(5)));
+			assert(ex !is null && ex.code == ErrorCode.invalidParams, T.stringof);
+		}
+	}
 }
