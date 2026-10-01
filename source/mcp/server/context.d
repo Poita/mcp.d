@@ -196,7 +196,8 @@ interface RequestContext
 					~ " return ToolResponse.inputRequired instead, or construct the server with"
 					~ " McpServer.stateful() for a blocking server->client round-trip");
 		if (!clientSupports(ClientCapability.sampling))
-			throw invalidRequest("Client does not support sampling");
+			throw missingClientCapability(ClientCapability.sampling,
+					"Client does not support sampling");
 		// Per spec, servers MUST NOT send tool-enabled sampling requests to
 		// clients that have not declared the `sampling.tools` sub-capability.
 		// This covers both the `tools` list and a `toolChoice` directive, since
@@ -204,7 +205,8 @@ interface RequestContext
 		// `tools` still exercises the tool-use sampling surface.
 		if (params.type == Json.Type.object && ("tools" in params
 				|| "toolChoice" in params) && !clientSupports(ClientCapability.samplingTools))
-			throw invalidRequest("Client does not support tool use in sampling (sampling.tools)");
+			throw missingClientCapability(ClientCapability.samplingTools,
+					"Client does not support tool use in sampling (sampling.tools)");
 		// The soft-deprecated `sampling.context` sub-capability gates the
 		// `includeContext` values `thisServer`/`allServers`.
 		if (params.type == Json.Type.object && "includeContext" in params
@@ -213,7 +215,7 @@ interface RequestContext
 			const inc = params["includeContext"].get!string;
 			if ((inc == "thisServer" || inc == "allServers")
 					&& !clientSupports(ClientCapability.samplingContext))
-				throw invalidRequest(
+				throw missingClientCapability(ClientCapability.samplingContext,
 						"Client does not support context-enabled sampling (sampling.context)");
 		}
 		return sampleRaw(params);
@@ -248,7 +250,8 @@ interface RequestContext
 		// with modes the client does not support. A bare `elicitation:{}` is
 		// form-only, so a generic declaration already sets the form submode.
 		if (!clientSupports(ClientCapability.elicitationForm))
-			throw invalidRequest("Client does not support form-mode elicitation");
+			throw missingClientCapability(ClientCapability.elicitationForm,
+					"Client does not support form-mode elicitation");
 		Json params = Json.emptyObject;
 		params["message"] = message;
 		params["requestedSchema"] = requestedSchema;
@@ -292,7 +295,8 @@ interface RequestContext
 		// Per client/elicitation: servers MUST NOT send a url-mode request to a
 		// client that only declared form mode (e.g. a bare `elicitation:{}`).
 		if (!clientSupports(ClientCapability.elicitationUrl))
-			throw invalidRequest("Client does not support url-mode elicitation");
+			throw missingClientCapability(ClientCapability.elicitationUrl,
+					"Client does not support url-mode elicitation");
 		if (url.length == 0)
 			throw internalError("URL-mode elicitation requires a non-empty url");
 		if (!isValidElicitationUrl(url))
@@ -320,7 +324,7 @@ interface RequestContext
 					~ " return ToolResponse.inputRequired instead, or construct the server with"
 					~ " McpServer.stateful() for a blocking server->client round-trip");
 		if (!clientSupports(ClientCapability.roots))
-			throw invalidRequest("Client does not support roots");
+			throw missingClientCapability(ClientCapability.roots, "Client does not support roots");
 		return ListRootsResult.fromJson(listRootsRaw());
 	}
 
@@ -627,6 +631,39 @@ final class StdioContext : RequestContext
 	{
 		return TokenInfo.invalid();
 	}
+}
+
+/// The -32021 `MissingRequiredClientCapabilityError` a server->client request
+/// is refused with when the client did not declare `cap`, naming it in
+/// `data.requiredCapabilities` like the server's other capability gates.
+private McpException missingClientCapability(ClientCapability cap, string message) @safe
+{
+	ClientCapabilities c;
+	final switch (cap)
+	{
+	case ClientCapability.sampling:
+		c.sampling = true;
+		break;
+	case ClientCapability.samplingTools:
+		c.samplingTools = true;
+		break;
+	case ClientCapability.samplingContext:
+		c.samplingContext = true;
+		break;
+	case ClientCapability.elicitation:
+		c.elicitation = true;
+		break;
+	case ClientCapability.elicitationForm:
+		c.elicitationForm = true;
+		break;
+	case ClientCapability.elicitationUrl:
+		c.elicitationUrl = true;
+		break;
+	case ClientCapability.roots:
+		c.roots = true;
+		break;
+	}
+	return missingRequiredClientCapability(c, message);
 }
 
 /// Wraps a transport-supplied `RequestContext` with the per-request protocol
@@ -1158,6 +1195,35 @@ unittest  // RequestScope exposes the shared cancellation token via isCancelled
 	assert(!scope_.isCancelled);
 	token.cancel();
 	assert(scope_.isCancelled);
+}
+
+unittest  // an undeclared client capability is reported as -32021 naming it
+{
+	auto e = new ElicitProbe;
+	e.supportsUrl = false;
+	try
+	{
+		e.elicitUrl("m", "https://example.com", "id");
+		assert(false, "elicitUrl must throw");
+	}
+	catch (McpException ex)
+	{
+		assert(ex.code == ErrorCode.missingRequiredClientCapability);
+		assert("url" in ex.data["requiredCapabilities"]["elicitation"]);
+	}
+
+	auto r = new RootsProbe;
+	r.supportsRoots = false;
+	try
+	{
+		r.listRoots();
+		assert(false, "listRoots must throw");
+	}
+	catch (McpException ex)
+	{
+		assert(ex.code == ErrorCode.missingRequiredClientCapability);
+		assert("roots" in ex.data["requiredCapabilities"]);
+	}
 }
 
 unittest  // a stateless RequestScope answers clientSupports from the request's own capabilities
