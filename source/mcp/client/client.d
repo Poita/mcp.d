@@ -505,6 +505,11 @@ final class McpClient : ClientProtocol
 	// "do not cache unhinted responses" (the default), so behavior against such
 	// servers matches the uncached client. A server hint always wins over this.
 	private Duration defaultCacheTtl_;
+	// Set by `close()`; a closed client opens no new streams or subscriptions.
+	private bool closed_;
+	// The open listen streams and managed event subscriptions `close()` cancels.
+	private bool[SubscriptionStream] liveStreams_;
+	private bool[EventSubscription] liveSubscriptions_;
 	// This client's cache partition: the namespace under which its `private`-scoped
 	// cacheable results are stored, so a SHARED `cacheStore_` keeps one principal's
 	// private entries from being served to another. `public` results ignore it and
@@ -755,10 +760,47 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Release the underlying transport (stdio terminates the subprocess; HTTP
-	/// stops any background streams).
+	/// stops any background streams), first cancelling every managed event
+	/// subscription and every stream opened by `subscriptionsListen` /
+	/// `streamEvents`, so no background loop outlives the client. A closed client
+	/// opens no new streams.
 	void close() @safe
 	{
+		closed_ = true;
+		foreach (sub; liveSubscriptions_.keys)
+			sub.cancel();
+		liveSubscriptions_ = null;
+		foreach (stream; liveStreams_.keys)
+			stream.cancel();
+		liveStreams_ = null;
 		transport.close();
+	}
+
+	/// Remember an opened listen stream so `close()` can cancel it, dropping
+	/// any already-ended ones.
+	private void trackStream(SubscriptionStream stream) @safe
+	{
+		foreach (s; liveStreams_.keys)
+			if (s.ended)
+				liveStreams_.remove(s);
+		liveStreams_[stream] = true;
+	}
+
+	/// Remember a managed event subscription so `close()` can cancel it, dropping
+	/// any that already ended.
+	private void trackSubscription(EventSubscription sub) @safe
+	{
+		foreach (s; liveSubscriptions_.keys)
+			if (!s.active)
+				liveSubscriptions_.remove(s);
+		liveSubscriptions_[sub] = true;
+	}
+
+	/// Throw when the client has been closed, so nothing new is opened on it.
+	private void ensureOpen() @safe
+	{
+		if (closed_)
+			throw internalError("the client is closed");
 	}
 
 	/// The protocol version negotiated with the server (valid after initialize).
@@ -2302,7 +2344,10 @@ final class McpClient : ClientProtocol
 		if (useModern)
 			params = injectModernMeta(params);
 		auto message = makeRequest(Json(id), "subscriptions/listen", params);
-		return transport.openListen(message);
+		ensureOpen();
+		auto stream = transport.openListen(message);
+		trackStream(stream);
+		return stream;
 	}
 
 	// --- MCP Events extension (2026-07-28) --------------------------------------
@@ -2378,6 +2423,7 @@ final class McpClient : ClientProtocol
 		auto message = makeRequest(Json(id), "events/stream", params);
 		const key = id.to!string;
 		// Register before opening so an occurrence racing the open is routable.
+		ensureOpen();
 		eventStreams_[key] = EventStreamHandlers(onEvent, onControl);
 		SubscriptionStream stream;
 		try
@@ -2388,6 +2434,7 @@ final class McpClient : ClientProtocol
 			throw e;
 		}
 		stream.addCleanup(() @safe nothrow{ eventStreams_.remove(key); });
+		trackStream(stream);
 		return stream;
 	}
 
@@ -2516,6 +2563,8 @@ final class McpClient : ClientProtocol
 		sub.setMode(DeliveryMode.poll);
 		sub.dedupCapacity(eventSettings_.dedupWindow);
 		sub.advanceCursor(p.cursor);
+		ensureOpen();
+		trackSubscription(sub);
 		spawnEventTask(() @safe { runPollLoop(sub, p, onEvent, onControl); });
 		return sub;
 	}
@@ -2601,6 +2650,7 @@ final class McpClient : ClientProtocol
 			{
 			}
 		});
+		trackSubscription(sub);
 		spawnEventTask(() @safe { runStreamWatchdog(sub); });
 		return sub;
 	}
@@ -2673,7 +2723,7 @@ final class McpClient : ClientProtocol
 			if (dead <= Duration.zero)
 				return;
 			streamWatchSleep(dead * (1L << (failures < 5 ? failures : 5)));
-			if (!sub.active)
+			if (!sub.active || closed_)
 				return;
 			if (!ms.stream.ended && eventNowMs() - ms.lastFrameMs < dead.total!"msecs")
 				continue;
@@ -2772,6 +2822,7 @@ final class McpClient : ClientProtocol
 			void delegate(EventOccurrence) @safe onEvent,
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
+		ensureOpen();
 		auto sub = new EventSubscription();
 		sub.setMode(DeliveryMode.webhook);
 		sub.dedupCapacity(eventSettings_.dedupWindow);
@@ -2803,6 +2854,7 @@ final class McpClient : ClientProtocol
 			{
 			}
 		});
+		trackSubscription(sub);
 		spawnEventTask(() @safe { runWebhookRefreshLoop(sub, p, res); });
 		return sub;
 	}
@@ -8585,6 +8637,43 @@ unittest  // transient reopen failures back off between attempts
 	assert(sleeps[1] > sleeps[0] && sleeps[2] > sleeps[1] && sleeps[3] > sleeps[2],
 			"consecutive failures must back off");
 	assert(sleeps[4] == sleeps[0], "a successful reopen must reset the backoff");
+}
+
+unittest  // close() cancels every open subscriptions/listen stream
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	auto a = c.subscriptionsListen(SubscriptionFilter.init);
+	auto b = c.streamEvents("incident.created", null);
+	c.close();
+	assert(a.cancelled && b.cancelled, "close() must stop the client's listen streams");
+}
+
+unittest  // close() cancels managed subscriptions and their watchdog does not reopen
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	auto pushed = c.subscribeStream(StreamParams("incident.created"), null);
+	auto polled = c.subscribePoll(PollParams("incident.created"), null);
+	c.close();
+	assert(!pushed.active && !polled.active, "close() must cancel managed subscriptions");
+	assert(t.streams[0].cancelled);
+	c.onStreamWatchSleepForTest = (Duration d) @safe { now += 200_000; };
+	c.runStreamWatchdog(pushed);
+	assert(t.listens.length == 1, "a closed client must not reopen a managed stream");
+}
+
+unittest  // a closed client refuses to open a new listen stream
+{
+	import std.exception : collectException;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.close();
+	assert(collectException(c.subscriptionsListen(SubscriptionFilter.init)) !is null);
+	assert(t.listens.length == 0);
 }
 
 unittest  // reconnection is disabled by a zero streamDeadAfter

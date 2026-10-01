@@ -267,6 +267,9 @@ final class HttpClientTransport : ClientTransport
 	// `attach`/`closeSocket` are order-independent, closing the window where a
 	// `close()` races the `connectTCP` yield.
 	private ListenSocketSlot[] postSockets;
+	// The sockets of the open `subscriptions/listen` / `events/stream` streams, so
+	// `close()` ends them along with the transport.
+	private ListenSocketSlot[] listenSockets;
 	// The abortable state of each in-flight Streamable HTTP request, keyed by its
 	// JSON-RPC id, so `abort` can close the socket carrying its response.
 	private PostRequest[long] inflightPosts;
@@ -388,10 +391,10 @@ final class HttpClientTransport : ClientTransport
 	}
 
 	/// Stop the transport: signal the background stream readers
-	/// (server->client, legacy GET) to stop between reads and force-close their
-	/// held sockets so any blocked `conn.read` unblocks immediately, terminating
-	/// the spawned tasks. A `subscriptions/listen` stream is owned by its
-	/// `SubscriptionStream` handle and torn down through `cancel()`.
+	/// (server->client, legacy GET, `subscriptions/listen` / `events/stream`) to
+	/// stop between reads and force-close their held sockets so any blocked
+	/// `conn.read` unblocks immediately, terminating the spawned tasks. A listen
+	/// stream ended this way reports `ended` with no `error`.
 	void close() @safe
 	{
 		endSession();
@@ -412,6 +415,8 @@ final class HttpClientTransport : ClientTransport
 		// Force-close every in-flight POST socket so a POST parked reading a
 		// long-lived SSE response stream unblocks at once.
 		foreach (slot; postSockets)
+			slot.closeSocket();
+		foreach (slot; listenSockets)
 			slot.closeSocket();
 		// Fail any in-flight legacy waiter at once so its `legacyRpc` wait returns
 		// immediately instead of waiting out the timeout on a closing transport.
@@ -1502,6 +1507,10 @@ final class HttpClientTransport : ClientTransport
 		// the stream's onCancel delegate force-closes it so a blocked readLine /
 		// conn.read returns immediately rather than parking until the next event.
 		auto slot = new ListenSocketSlot;
+		// A slot registered after close() is born closed, so the stream ends at once.
+		if (closing)
+			slot.closeSocket();
+		listenSockets ~= slot;
 		auto onCancel = () @safe nothrow{
 			try
 				slot.closeSocket();
@@ -1524,6 +1533,12 @@ final class HttpClientTransport : ClientTransport
 		// which is thrown here.
 		auto gate = new ListenGate;
 		runTask(() nothrow{
+			scope (exit)
+			{
+				import std.algorithm : remove;
+
+				listenSockets = listenSockets.remove!(s => s is slot);
+			}
 			try
 				runListenStream(message, cancelled, slot, stream, &gate.signal);
 			catch (Exception)
@@ -1563,7 +1578,11 @@ final class HttpClientTransport : ClientTransport
 		body = message.toString();
 		const listenId = ("id" in message) ? message["id"] : Json(null);
 
-		auto isCancelled = () @safe => () @trusted { return *cancelled; }();
+		// A local cancel and the transport's close() both end the stream without
+		// it counting as a server failure.
+		auto isCancelled = () @safe => closing || () @trusted {
+			return *cancelled;
+		}();
 
 		// Fire the establishment signal at most once: on the first dispatched frame
 		// (the stream is now confirmed open server-side) and, as a fallback, on any
@@ -1600,14 +1619,14 @@ final class HttpClientTransport : ClientTransport
 			}
 			try
 			{
-				if (*cancelled)
+				if (isCancelled())
 					return;
 				auto sock = connectTimed(pinnedHost, ep.port);
 				slot.attach(sock);
 				scope (exit)
 					slot.closeSocket();
 				// A cancel() that raced ahead of attach must still tear the socket down.
-				if (*cancelled)
+				if (isCancelled())
 					return;
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls, ep.host);
@@ -4089,4 +4108,37 @@ unittest  // a listen stream the server fails after acknowledging records the er
 	assert(e is null, "an acknowledged listen must open");
 	assert(ended, "the server's error must end the stream");
 	assert(streamError !is null && streamError.code == -32603);
+}
+
+unittest  // closing the transport ends its open listen streams
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	bool release;
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		writeSse(res,
+			`data: {"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",`
+			~ `"params":{"notifications":{}}}` ~ "\n\n");
+		const until = MonoTime.currTime + 5.seconds;
+		while (!release && MonoTime.currTime < until)
+			sleep(20.msecs);
+	});
+	bool ended;
+	bool cancelled;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		scope (exit)
+			release = true;
+		auto t = new HttpClientTransport(url);
+		auto stream = t.openListen(makeRequest(Json(1), "subscriptions/listen", Json.emptyObject));
+		t.close();
+		const until = MonoTime.currTime + 3.seconds;
+		while (!stream.ended && MonoTime.currTime < until)
+			sleep(20.msecs);
+		ended = stream.ended;
+		cancelled = stream.cancelled;
+		assert(stream.error is null, "a stream ended by close() is not a server failure");
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(ended && !cancelled, "close() must end the transport's listen streams");
 }
