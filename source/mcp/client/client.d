@@ -2785,7 +2785,7 @@ final class McpClient : ClientProtocol
 				return;
 			if (!ms.stream.ended && eventNowMs() - ms.lastFrameMs < dead.total!"msecs")
 				continue;
-			if (ms.stream.error !is null && !isTransientStreamFailure(ms.stream.error))
+			if (ms.stream.error !is null && !isTransientEventFailure(ms.stream.error))
 			{
 				endManagedStream(sub, ms, ms.stream.error);
 				return;
@@ -2798,7 +2798,7 @@ final class McpClient : ClientProtocol
 			}
 			catch (McpException e)
 			{
-				if (!isTransientStreamFailure(e))
+				if (!isTransientEventFailure(e))
 				{
 					endManagedStream(sub, ms, e);
 					return;
@@ -2810,14 +2810,28 @@ final class McpClient : ClientProtocol
 		}
 	}
 
-	/// Whether a push-stream failure may clear on its own, so reopening the stream
+	/// Whether a managed-subscription failure may clear on its own, so retrying
 	/// is worthwhile: a lost connection or internal error, or an HTTP 5xx / 408 /
 	/// 429. A JSON-RPC rejection or any other HTTP 4xx will repeat on every retry.
-	private static bool isTransientStreamFailure(McpException e) @safe
+	private static bool isTransientEventFailure(McpException e) @safe
 	{
 		if (auto h = cast(HttpStatusException) e)
 			return h.status >= 500 || h.status == 408 || h.status == 429;
 		return e.code == ErrorCode.internalError;
+	}
+
+	/// Report `e` to `onControl` (when set) as an `error` control.
+	private static void reportEventError(void delegate(EventControl) @safe onControl, McpException e) @safe
+	{
+		if (onControl is null)
+			return;
+		EventControl c;
+		c.kind = EventControlKind.error;
+		EventError err;
+		err.code = e.code;
+		err.message = e.msg;
+		c.error = err;
+		onControl(c);
 	}
 
 	/// End a managed push subscription the server refused or failed with `e`:
@@ -2827,16 +2841,7 @@ final class McpClient : ClientProtocol
 		ms.stream.close();
 		managedStreams_.remove(sub);
 		sub.markTerminated();
-		if (ms.onControl !is null)
-		{
-			EventControl c;
-			c.kind = EventControlKind.error;
-			EventError err;
-			err.code = e.code;
-			err.message = e.msg;
-			c.error = err;
-			ms.onControl(c);
-		}
+		reportEventError(ms.onControl, e);
 	}
 
 	/// Sleep between watchdog checks. A test seam runs the loop synchronously.
@@ -2913,26 +2918,32 @@ final class McpClient : ClientProtocol
 			}
 		});
 		trackSubscription(sub);
-		spawnEventTask(() @safe { runWebhookRefreshLoop(sub, p, res); });
+		spawnEventTask(() @safe { runWebhookRefreshLoop(sub, p, res, onControl); });
 		return sub;
 	}
 
 	/// The webhook refresh loop: sleeps until shortly before the current grant
 	/// expires (or, for a no-expiry grant, for the health-check interval),
 	/// re-subscribes (refreshing the TTL and advancing the watermark), and repeats
-	/// until the subscription is cancelled or the server terminates it. A no-expiry
-	/// grant with health checks disabled ends the loop: correctness no longer
-	/// depends on refreshing. Seam-driven for tests.
+	/// until the subscription is cancelled or the server terminates it. A
+	/// transient refresh failure is retried with exponential backoff; any other
+	/// failure (the server rejecting the refresh) ends the subscription and is
+	/// reported to `onControl` as an `error` control. A no-expiry grant with health
+	/// checks disabled ends the loop: correctness no longer depends on refreshing.
+	/// Seam-driven for tests.
 	package void runWebhookRefreshLoop(EventSubscription sub, SubscribeParams p,
-			SubscribeResult first) @safe
+			SubscribeResult first, void delegate(EventControl) @safe onControl) @safe
 	{
 		auto cur = p;
 		auto res = first;
+		uint failures; // consecutive failed refreshes
 		while (sub.active)
 		{
-			if (res.refreshBefore.isNull && eventSettings_.noExpiryRefreshInterval <= Duration.zero)
+			if (failures == 0 && res.refreshBefore.isNull
+					&& eventSettings_.noExpiryRefreshInterval <= Duration.zero)
 				return;
-			webhookRefreshSleep(res);
+			webhookRefreshSleep(failures == 0 ? webhookRefreshDelay(
+					res) : minWebhookRefreshMs.msecs * (1L << (failures < 6 ? failures : 6)));
 			if (!sub.active)
 				return;
 			try
@@ -2940,11 +2951,20 @@ final class McpClient : ClientProtocol
 				cur.cursor = sub.cursor();
 				res = subscribeWebhookEvents(cur);
 				sub.advanceCursor(res.cursor);
+				failures = 0;
+			}
+			catch (McpException e)
+			{
+				if (!isTransientEventFailure(e))
+				{
+					sub.markTerminated();
+					reportEventError(onControl, e);
+					return;
+				}
+				failures++;
 			}
 			catch (Exception)
-			{
-				// Transient refresh failure: retry on the next cycle.
-			}
+				failures++;
 		}
 	}
 
@@ -2990,19 +3010,19 @@ final class McpClient : ClientProtocol
 		() @trusted { sleep(ms.msecs); }();
 	}
 
-	/// Sleep until shortly before `res.refreshBefore`. A test seam runs the loop
+	/// Sleep `d` before the next webhook refresh. A test seam runs the loop
 	/// synchronously and lets a test end it.
-	private void webhookRefreshSleep(SubscribeResult res) @safe
+	private void webhookRefreshSleep(Duration d) @safe
 	{
 		version (unittest)
 			if (onWebhookRefreshSleepForTest !is null)
 			{
-				onWebhookRefreshSleepForTest(res);
+				onWebhookRefreshSleepForTest(d);
 				return;
 			}
 		import vibe.core.core : sleep;
 
-		() @trusted { sleep(webhookRefreshDelay(res)); }();
+		() @trusted { sleep(d); }();
 	}
 
 	/// How long to wait before refreshing a webhook grant: ~80% of the way to
@@ -3034,7 +3054,7 @@ final class McpClient : ClientProtocol
 	private enum long defaultWebhookRefreshMs = 60_000;
 
 	version (unittest) package void delegate(Duration) @safe onEventPollSleepForTest;
-	version (unittest) package void delegate(SubscribeResult) @safe onWebhookRefreshSleepForTest;
+	version (unittest) package void delegate(Duration) @safe onWebhookRefreshSleepForTest;
 
 	/// Build the `subscriptions/listen` params, nesting the filter under
 	/// `params.notifications` exactly as the 2026-07-28 spec's `SubscriptionFilter`
@@ -8994,13 +9014,13 @@ unittest  // the webhook refresh loop stops once the subscription is terminated
 	first.id = "sub_x";
 	first.refreshBefore = "2000-01-01T00:00:00Z";
 	int sleeps;
-	h.client.onWebhookRefreshSleepForTest = (SubscribeResult r) @safe {
+	h.client.onWebhookRefreshSleepForTest = (Duration d) @safe {
 		if (++sleeps > 3)
 			h.sub.cancel(); // backstop so a broken loop still ends
 	};
 	SubscribeParams sp;
 	sp.name = "incident.created";
-	h.client.runWebhookRefreshLoop(h.sub, sp, first);
+	h.client.runWebhookRefreshLoop(h.sub, sp, first, null);
 	assert(subs == 0, "a terminated subscription must not be re-subscribed");
 }
 
@@ -9041,12 +9061,12 @@ unittest  // a no-expiry grant still refreshes at the health-check cadence
 	SubscribeResult first;
 	first.id = "sub_x";
 	int sleeps;
-	c.onWebhookRefreshSleepForTest = (SubscribeResult r) @safe {
+	c.onWebhookRefreshSleepForTest = (Duration d) @safe {
 		sleeps++;
 		if (sleeps == 3)
 			sub.cancel();
 	};
-	c.runWebhookRefreshLoop(sub, sp, first);
+	c.runWebhookRefreshLoop(sub, sp, first, null);
 	assert(subs == 2); // two health-check refreshes before the third sleep cancelled
 	assert(sub.cursor.get == "w2"); // the refresh response advanced the watermark
 	assert(c.webhookRefreshDelay(first) == 1.hours);
@@ -9068,11 +9088,65 @@ unittest  // disabling the health-check interval ends the loop for a no-expiry g
 	sp.name = "incident.created";
 	SubscribeResult first;
 	first.id = "sub_x";
-	c.onWebhookRefreshSleepForTest = (SubscribeResult r) @safe {
+	c.onWebhookRefreshSleepForTest = (Duration d) @safe {
 		assert(false, "must not sleep");
 	};
-	c.runWebhookRefreshLoop(sub, sp, first);
+	c.runWebhookRefreshLoop(sub, sp, first, null);
 	assert(subs == 0 && sub.active);
+}
+
+unittest  // a webhook refresh the server rejects ends the subscription and reports the error
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	int subs;
+	c.onRpcForTest = (string method, Json params) @safe {
+		subs++;
+		throw new McpException(ErrorCode.invalidParams, "unknown subscription");
+	};
+	auto sub = new EventSubscription();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	SubscribeResult first;
+	first.id = "sub_x";
+	first.refreshBefore = "2000-01-01T00:00:00Z";
+	int sleeps;
+	c.onWebhookRefreshSleepForTest = (Duration d) @safe {
+		if (++sleeps > 3)
+			sub.cancel(); // backstop so a broken loop still ends
+	};
+	EventControl[] controls;
+	c.runWebhookRefreshLoop(sub, sp, first, (EventControl ctl) @safe {
+		controls ~= ctl;
+	});
+	assert(subs == 1, "a rejected refresh must not be retried");
+	assert(!sub.active, "a rejected refresh must end the subscription");
+	assert(controls.length == 1 && controls[0].kind == EventControlKind.error);
+	assert(controls[0].error.get.code == ErrorCode.invalidParams);
+}
+
+unittest  // transient webhook refresh failures back off between attempts
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.onRpcForTest = (string method, Json params) @safe {
+		throw new McpException(ErrorCode.internalError, "connection lost");
+	};
+	auto sub = new EventSubscription();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	SubscribeResult first;
+	first.id = "sub_x";
+	first.refreshBefore = "2000-01-01T00:00:00Z";
+	Duration[] delays;
+	c.onWebhookRefreshSleepForTest = (Duration d) @safe {
+		delays ~= d;
+		if (delays.length == 4)
+			sub.cancel();
+	};
+	c.runWebhookRefreshLoop(sub, sp, first, null);
+	assert(delays.length == 4);
+	assert(delays[1] < delays[2] && delays[2] < delays[3],
+			"consecutive transient failures must back off");
+	assert(sub.isCancelled);
 }
 
 unittest  // the webhook refresh loop re-subscribes before the grant expires
@@ -9098,10 +9172,10 @@ unittest  // the webhook refresh loop re-subscribes before the grant expires
 	SubscribeResult first;
 	first.id = "sub_x";
 	first.refreshBefore = "2999-01-01T00:00:00Z";
-	c.onWebhookRefreshSleepForTest = (SubscribeResult r) @safe {
+	c.onWebhookRefreshSleepForTest = (Duration d) @safe {
 		if (subs >= 1)
 			sub.cancel(); // end the loop after one refresh
 	};
-	c.runWebhookRefreshLoop(sub, sp, first);
+	c.runWebhookRefreshLoop(sub, sp, first, null);
 	assert(subs == 1);
 }
