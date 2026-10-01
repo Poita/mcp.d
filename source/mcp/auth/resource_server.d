@@ -74,7 +74,7 @@ enum AuthFailure
 struct ResourceServerConfig
 {
 	/// Validates a presented bearer token. Required to enable auth; when null the
-	/// transport performs no token checks (back-compatible default).
+	/// transport performs no token checks (the default).
 	TokenValidator validator;
 
 	/// The canonical resource identifier for this server (RFC 8707). When set,
@@ -94,9 +94,9 @@ struct ResourceServerConfig
 	/// it disables the SDK's audience check and is NOT spec compliant on its own.
 	bool allowAnyAudience;
 
-	/// The authorization server issuer URLs advertised in the metadata document
-	/// and (first entry) ignored by validation — they are informational for
-	/// clients discovering where to obtain a token.
+	/// The authorization server issuer URLs advertised in the metadata document.
+	/// Validation does not consult them; they tell clients where to obtain a
+	/// token.
 	string[] authorizationServers;
 
 	/// The scopes advertised in the metadata document.
