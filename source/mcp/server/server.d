@@ -1439,7 +1439,13 @@ final class McpServer : ServerCore
 		// the per-stream filter captured below, not a connection-level version.)
 		// Record the opted-in filters; the one-shot {acknowledged:true} result is
 		// discarded (the spec defines no such Result — the ack is a notification).
-		doSubscribeListen(msg.params, cs());
+		try
+			doSubscribeListen(msg.params, cs());
+		catch (McpException e)
+		{
+			writeLine(makeErrorResponse(msg.id, e).toString());
+			return true;
+		}
 
 		// The listen request's id is the stream's subscriptionId; every
 		// notification on this channel (starting with the acknowledgement) is
@@ -2753,8 +2759,6 @@ final class McpServer : ServerCore
 	/// present.
 	private Json doSubscribeListen(Json params, ConnectionState conn) @safe
 	{
-		import std.algorithm : canFind;
-
 		Json filter = Json.undefined;
 		if (params.type == Json.Type.object && "notifications" in params
 				&& params["notifications"].type == Json.Type.object)
@@ -2788,20 +2792,27 @@ final class McpServer : ServerCore
 				auto rs = filter["resourceSubscriptions"];
 				if (rs.type == Json.Type.array)
 				{
-					bool any;
+					// Preserve the agreed URI list so the acknowledgement can
+					// echo `resourceSubscriptions` as the spec's string[]
+					// (deduplicated, request order kept). The whole list is
+					// validated before any URI is recorded so an over-cap
+					// request leaves the connection untouched.
+					bool[string] seen;
 					foreach (i; 0 .. rs.length)
 						if (rs[i].type == Json.Type.string)
 						{
 							const u = rs[i].get!string;
-							conn.subscriptions[u] = true;
-							// Preserve the agreed URI list so the acknowledgement
-							// can echo `resourceSubscriptions` as the spec's
-							// string[] (deduplicated, request order kept).
-							if (!perStream.resourceUris.canFind(u))
-								perStream.resourceUris ~= u;
-							any = true;
+							if (u in seen)
+								continue;
+							if (seen.length >= maxResourceSubscriptions)
+								throw invalidParams(
+										"Too many resourceSubscriptions URIs in one listen request");
+							seen[u] = true;
+							perStream.resourceUris ~= u;
 						}
-					if (any)
+					foreach (u; perStream.resourceUris)
+						conn.subscriptions[u] = true;
+					if (perStream.resourceUris.length)
 						perStream.resourceSubscriptions = true;
 				}
 				else if (rs.type == Json.Type.bool_ && rs.get!bool)
@@ -8313,6 +8324,60 @@ unittest  // the per-stream ack reflects exactly the opted-in change types
 	assert(subset["resourceSubscriptions"].length == 1);
 	assert(subset["resourceSubscriptions"][0].get!string == "file:///project/config.json");
 	assert("promptsListChanged" !in subset);
+}
+
+unittest  // subscriptions/listen rejects more resourceSubscriptions URIs than the per-connection cap
+{
+	import std.conv : to;
+
+	auto s = makeTestServer();
+	Json uris = Json.emptyArray;
+	foreach (i; 0 .. maxResourceSubscriptions + 1)
+		uris ~= Json("file:///" ~ i.to!string);
+	Json filter = Json.emptyObject;
+	filter["resourceSubscriptions"] = uris;
+	Json p = Json.emptyObject;
+	p["notifications"] = filter;
+	auto resp = s.handle(modernReq(1, "subscriptions/listen", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(s.activeConnection.subscriptions.length == 0);
+}
+
+unittest  // subscriptions/listen deduplicates repeated URIs
+{
+	auto s = makeTestServer();
+	Json uris = Json.emptyArray;
+	foreach (i; 0 .. maxResourceSubscriptions * 4)
+		uris ~= Json(i % 2 ? "file:///a" : "file:///b");
+	Json filter = Json.emptyObject;
+	filter["resourceSubscriptions"] = uris;
+	Json p = Json.emptyObject;
+	p["notifications"] = filter;
+	s.handle(modernReq(1, "subscriptions/listen", p)).get;
+	assert(s.cs().listenFilter.resourceUris == ["file:///b", "file:///a"]);
+}
+
+unittest  // stdio subscriptions/listen over the URI cap answers an error instead of opening
+{
+	import std.algorithm : canFind;
+	import std.conv : to;
+
+	auto s = new McpServer("t", "1");
+	Json uris = Json.emptyArray;
+	foreach (i; 0 .. maxResourceSubscriptions + 1)
+		uris ~= Json("note:///" ~ i.to!string);
+	Json na = Json.emptyObject;
+	na["resourceSubscriptions"] = uris;
+	Json p = Json.emptyObject;
+	p["notifications"] = na;
+	string[] sink;
+	assert(s.tryServeStdioListen(modernReq(1, "subscriptions/listen", p), (string line) @safe {
+			sink ~= line;
+		}));
+	assert(sink.length == 1);
+	assert(sink[0].canFind("-32602"));
+	assert(s.notifyResourceUpdated("note:///0") == 0);
+	assert(s.activeConnection.subscriptions.length == 0);
 }
 
 unittest  // ack echoes every opted-in resourceSubscriptions URI in request order
