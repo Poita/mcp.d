@@ -1135,8 +1135,10 @@ final class McpServer : ServerCore
 	/// (`resultType: "task"`) as the tool response. The task is durably stored
 	/// before this returns, so a `tasks/get` for the returned id resolves at
 	/// once. `input` is the executor's durable input (`TaskContext.inputJson`).
-	/// Throws when `enableTasks` was not called or no executor is registered
-	/// under `name`.
+	/// A request whose client did not declare the Tasks extension cannot receive
+	/// a task handle, so the executor instead runs to completion on the calling
+	/// fiber and its result is returned as an ordinary tool result. Throws when
+	/// `enableTasks` was not called or no executor is registered under `name`.
 	ToolResponse startTask(string name, Json input, RequestContext ctx,
 			Nullable!Duration ttl = Nullable!Duration.init,
 			Nullable!Duration pollInterval = Nullable!Duration.init) @safe
@@ -1147,6 +1149,8 @@ final class McpServer : ServerCore
 			throw internalError("startTask requires enableTasks() first");
 		if ((name in taskExecutors_) is null)
 			throw internalError("startTask: no task executor registered under '" ~ name ~ "'");
+		if (!declaresTasksExtension(ctx.clientCapabilities()))
+			return ToolResponse.complete(runTaskToolInline(name, input, ctx));
 		// The task is bound to the creating request's authenticated principal
 		// (if any), so every later tasks/* request must come from the same one.
 		auto seed = taskRuntime_.createFor(name, input, ttl, pollInterval, requestPrincipal(ctx));
@@ -1156,7 +1160,7 @@ final class McpServer : ServerCore
 
 	/// Run the executor registered under `name` to completion on the calling
 	/// fiber and return its result as an ordinary tool result: the synchronous
-	/// path a task tool takes for a client that did not declare the Tasks
+	/// path `startTask` takes for a client that did not declare the Tasks
 	/// extension. A task record exists for the duration of the call, so the
 	/// executor sees the same `TaskContext` as when dispatched. A failed task surfaces as its
 	/// JSON-RPC error; one that needs client input cannot proceed without the
@@ -1166,8 +1170,6 @@ final class McpServer : ServerCore
 		import mcp.protocol.tasks : TaskStatus;
 
 		auto exec = name in taskExecutors_;
-		if (exec is null)
-			throw missingRequiredClientCapability(tasksRequiredCapabilities());
 		auto seed = taskRuntime_.createFor(name, args, Nullable!Duration.init,
 				Nullable!Duration.init, requestPrincipal(ctx));
 		// The client never learns this task's id, so the record dies with the call.
@@ -3385,12 +3387,9 @@ final class McpServer : ServerCore
 
 		// Tasks extension (SEP-2663): the server decides whether a call creates a
 		// task, but only for a client that declared the extension. Without it a
-		// task-supporting tool falls through to a synchronous run (below, after
-		// input validation), and a tool that requires the extension is rejected
-		// with -32021 naming it.
-		const runInline = entry.taskSupport != TaskSupport.none
-			&& !declaresTasksExtension(declared);
-		if (runInline && entry.taskSupport == TaskSupport.required)
+		// tool that requires the extension is rejected with -32021 naming it; any
+		// other tool's handler runs, and `startTask` runs its executor inline.
+		if (entry.taskSupport == TaskSupport.required && !declaresTasksExtension(declared))
 			throw missingRequiredClientCapability(tasksRequiredCapabilities(),
 					"This tool requires the " ~ tasksExtensionKey ~ " extension");
 		// Validate the supplied arguments against the tool's declared inputSchema
@@ -3414,13 +3413,6 @@ final class McpServer : ServerCore
 				err.isError = true;
 				return err.toJson();
 			}
-		}
-		if (runInline)
-		{
-			auto result = runTaskToolInline(name, args, ctx);
-			if (validateOutputSchema_)
-				checkOutputSchema(entry.outputValidator, entry.descriptor.name, result.toJson());
-			return result.forVersion(ver).toJson();
 		}
 		try
 		{
@@ -7583,6 +7575,81 @@ unittest  // startTask lets an MRTR tool gather input and then escalate to a tas
 	auto got = s.handle(modernReq(3, "tasks/get", Json(["taskId": Json(id)]))).get["result"];
 	assert(got["status"].get!string == "completed");
 	assert(got["result"]["content"][0]["text"].get!string == "Hello, Alice");
+}
+
+version (unittest) private McpServer makeEscalatingServer(TaskSupport support) @safe
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.registerTaskExecutor("greet", (TaskContext tc) @safe {
+		const name = tc.inputJson()["user_name"].get!string;
+		return Json([
+			"content": Json([
+				Json(["type": Json("text"), "text": Json("Hello, " ~ name)])
+			])
+		]);
+	});
+	Tool desc;
+	desc.name = "escalate";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTool(desc, (Json args, RequestContext ctx) @safe {
+		auto answers = ctx.inputResponses();
+		if (ctx.isStateless && "user_name" !in answers)
+			return ToolResponse.inputRequired([
+			InputRequest.elicitation("user_name", "What is your name?")
+		], "round-1");
+		Json input = Json.emptyObject;
+		input["user_name"] = ctx.isStateless ? answers["user_name"]["content"]["name"] : Json("Bob");
+		return s.startTask("greet", input, ctx);
+	});
+	if (support != TaskSupport.none)
+		s.setToolTaskSupport("escalate", support);
+	return s;
+}
+
+version (unittest) private size_t storedTaskCount(McpServer s) @safe
+{
+	size_t n;
+	s.taskRuntime_.store.removeIf((const TaskRecord) @safe { n++; return false; });
+	return n;
+}
+
+unittest  // an optional task tool with its own handler keeps its MRTR rounds for a client without the extension
+{
+	auto s = makeEscalatingServer(TaskSupport.optional);
+	auto r1 = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("escalate"), "arguments": Json.emptyObject]))).get;
+	assert(r1["result"]["resultType"].get!string == "input_required");
+	Json p2 = Json([
+		"name": Json("escalate"),
+		"arguments": Json.emptyObject,
+		"requestState": Json("round-1"),
+		"inputResponses": Json([
+			"user_name": Json([
+				"action": Json("accept"),
+				"content": Json(["name": Json("Alice")])
+			])
+		])
+	]);
+	auto r2 = s.handle(modernReqNoTasks(2, "tools/call", p2)).get;
+	assert("error" !in r2);
+	assert("taskId" !in r2["result"]);
+	assert(r2["result"]["content"][0]["text"].get!string == "Hello, Alice");
+	assert(storedTaskCount(s) == 0);
+}
+
+unittest  // startTask for a 2025-era client runs inline and leaves no orphaned task
+{
+	auto s = makeEscalatingServer(TaskSupport.none);
+	auto r = s.handle(req(1, "tools/call", Json([
+		"name": Json("escalate"),
+		"arguments": Json.emptyObject
+	]))).get;
+	assert("error" !in r);
+	assert(r["result"]["content"][0]["text"].get!string == "Hello, Bob");
+	assert(storedTaskCount(s) == 0);
 }
 
 unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
