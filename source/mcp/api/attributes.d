@@ -203,11 +203,6 @@ struct resource
 /// (1..64 chars), per the Agent Skills spec. Preceding segments are an optional
 /// organizational prefix (e.g. `acme/billing/refunds`).
 ///
-/// The directory is read eagerly at `registerHandlers` time (a skill is a static
-/// value — its frontmatter and content digest must be stable), so a missing
-/// directory, absent `SKILL.md`, symlink, or oversized tree throws from
-/// registration rather than per request.
-///
 /// Example:
 /// ---
 /// @skill("git-workflow", "Follow this team's Git conventions")
@@ -229,6 +224,11 @@ struct skill
 /// leave it empty to derive the path from that name. For finer control (read
 /// filters, size caps) use the imperative `registerSkillDir` with
 /// `SkillDirOptions`.
+///
+/// The directory is read eagerly at `registerHandlers` time (a skill is a static
+/// value — its frontmatter and content digest must be stable), so a missing
+/// directory, absent `SKILL.md`, symlink, or oversized tree throws from
+/// registration rather than per request.
 ///
 /// Example:
 /// ---
