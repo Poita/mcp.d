@@ -173,9 +173,14 @@ private final class PostRequest
 /// message falls through to the inbound dispatcher.
 private struct LegacyWaiter
 {
+	import vibe.core.task : Task;
+
 	Json result;
 	McpException err;
 	bool got;
+	/// The task sending the request's POST, while it is being sent, so an abort
+	/// can interrupt a POST the server never answers.
+	Task poster;
 }
 
 /// Per-reader SSE resumption cursor: the most recent `id:`/`retry:` seen while
@@ -301,6 +306,7 @@ final class HttpClientTransport : ClientTransport
 	// cannot allocate a source port) fails with a typed error instead of parking
 	// the calling fiber forever. Configurable via `setConnectTimeout`.
 	private Duration connectTimeout = 30.seconds;
+	private Duration sendTimeout = 30.seconds;
 	// Upper bound on any single response body or SSE event read from the server,
 	// so a hostile or broken server cannot make the client allocate without limit.
 	// Configurable via `setMaxMessageBytes`.
@@ -392,6 +398,15 @@ final class HttpClientTransport : ClientTransport
 	void setConnectTimeout(Duration timeout) @safe
 	{
 		connectTimeout = timeout;
+	}
+
+	/// Bound each one-way POST (a notification, a reply to a server->client
+	/// request, or a legacy HTTP+SSE request) by `timeout`, so an unresponsive
+	/// server cannot hold the sending task or its in-flight permit indefinitely.
+	/// Zero removes the bound.
+	void setSendTimeout(Duration timeout) @safe
+	{
+		sendTimeout = timeout;
 	}
 
 	/// Bound every response body and SSE event read from the server to `limit`
@@ -567,6 +582,10 @@ final class HttpClientTransport : ClientTransport
 			if (!(*w).got && (*w).err is null)
 				(*w).err = reason;
 			notifyLegacy();
+			auto poster = (*w).poster;
+			if (poster != typeof(poster).init && poster != typeof(poster).getThis()
+					&& poster.running)
+				poster.interrupt();
 		}
 		if (auto r = expectId in inflightPosts)
 			(*r).abort(reason);
@@ -612,7 +631,7 @@ final class HttpClientTransport : ClientTransport
 			captureSession(res);
 			status = res.statusCode;
 			res.dropBody();
-		}, FetchOptions(Duration.zero, tlsTrust));
+		}, FetchOptions(sendTimeout, tlsTrust));
 		// A oneway send carries no awaited reply, so a rejection would otherwise be
 		// invisible: 404/410 under a session means the session is gone (drop its id
 		// and mark it so the next non-initialize request surfaces a clear error);
@@ -1810,6 +1829,8 @@ final class HttpClientTransport : ClientTransport
 	/// arrives asynchronously on the standalone GET SSE stream.
 	private Json legacyRpc(Json message, long expectId) @safe
 	{
+		import vibe.core.task : InterruptException, Task;
+
 		auto waiter = new LegacyWaiter;
 		waiter.result = Json.undefined;
 		legacyWaiters[expectId] = waiter;
@@ -1822,7 +1843,20 @@ final class HttpClientTransport : ClientTransport
 
 		// POST to legacyEndpoint; the server replies on the GET stream, unless it
 		// rejects the POST outright, in which case no reply will ever come.
-		const status = post(message);
+		int status;
+		waiter.poster = Task.getThis();
+		try
+			status = post(message);
+		catch (InterruptException e)
+		{
+			if (waiter.err !is null)
+				throw waiter.err;
+			throw e;
+		}
+		finally
+			waiter.poster = Task.init;
+		if (waiter.err !is null)
+			throw waiter.err;
 		if (status < 200 || status >= 300)
 			throw new HttpStatusException(status,
 					"legacy HTTP+SSE server rejected the request with HTTP " ~ idStr(status));
@@ -4004,6 +4038,83 @@ unittest  // a legacy HTTP+SSE request whose POST is rejected fails at once with
 	auto h = cast(HttpStatusException) thrown;
 	assert(h !is null && h.status == 500,
 			"a rejected legacy POST must fail its waiter with the status");
+}
+
+unittest  // a one-way POST to an unresponsive server gives up after the send timeout
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	bool release;
+	auto router = new URLRouter;
+	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		const until = MonoTime.currTime + 5.seconds;
+		while (!release && MonoTime.currTime < until)
+			sleep(20.msecs);
+		res.statusCode = 202;
+		res.writeBody("", "text/plain");
+	});
+	Duration took;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		t.setSendTimeout(200.msecs);
+		const start = MonoTime.currTime;
+		try
+			t.sendOneway(makeNotification("notifications/initialized", Json.emptyObject));
+		catch (Exception)
+		{
+		}
+		took = MonoTime.currTime - start;
+		release = true;
+		t.close();
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(took < 2.seconds, "a hung one-way POST must be bounded by the send timeout");
+}
+
+unittest  // aborting a legacy HTTP+SSE request interrupts its pending POST
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : runTask, sleep;
+
+	bool release;
+	auto router = new URLRouter;
+	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		const until = MonoTime.currTime + 5.seconds;
+		while (!release && MonoTime.currTime < until)
+			sleep(20.msecs);
+		res.statusCode = 202;
+		res.writeBody("", "text/plain");
+	});
+	Exception thrown;
+	Duration took;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		t.legacyMode = true;
+		t.legacyEndpoint = url;
+		t.legacyStreamAlive = true;
+		runTask(() nothrow{
+			try
+			{
+				sleep(200.msecs);
+				t.abort(1, internalError("aborted"));
+			}
+			catch (Exception)
+			{
+			}
+		});
+		const start = MonoTime.currTime;
+		try
+			t.deliver(makeRequest(Json(1L), "tools/list", Json.emptyObject), 1);
+		catch (Exception e)
+			thrown = e;
+		took = MonoTime.currTime - start;
+		release = true;
+		t.close();
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(thrown !is null && thrown.msg == "aborted", "the abort reason must fail the request");
+	assert(took < 2.seconds, "an abort must not wait for the POST to finish");
 }
 
 unittest  // close() ends a stateful session with DELETE carrying its Mcp-Session-Id

@@ -265,6 +265,8 @@ struct ClientSettings
 	/// `RequestTimeoutException`; on expiry the client also cancels it on the
 	/// server (`notifications/cancelled`, or by closing a modern HTTP request's
 	/// stream). Applies to every transport. `Duration.zero` disables the limit.
+	/// Over HTTP it also bounds each one-way POST (notifications and replies to
+	/// server requests), which otherwise default to a 30-second bound.
 	Duration requestTimeout = 60.seconds;
 
 	/// Whether each `notifications/progress` for a request restarts its
@@ -702,6 +704,8 @@ final class McpClient : ClientProtocol
 	{
 		auto transport = new HttpClientTransport(url, settings.maxInFlight);
 		transport.setConnectTimeout(settings.connectTimeout);
+		if (settings.requestTimeout > Duration.zero)
+			transport.setSendTimeout(settings.requestTimeout);
 		transport.setMaxMessageBytes(settings.maxMessageBytes);
 		transport.setTlsTrust(settings.tls);
 		auto c = new McpClient(transport, settings.clientInfo);
