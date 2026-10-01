@@ -120,7 +120,9 @@ struct Task
 		requireObject(j, "Task");
 		Task t;
 		t.taskId = j.getOr("taskId", "");
-		t.status = taskStatusFromWire(j.getOr("status", "working"));
+		// A missing or non-string status parses as `unknown` (terminal), so a
+		// poller stops instead of waiting forever on a state it cannot read.
+		t.status = taskStatusFromWire(j.getOr("status", ""));
 		tryGet(j, "statusMessage", t.statusMessage);
 		t.createdAt = j.getOr("createdAt", "");
 		t.lastUpdatedAt = j.getOr("lastUpdatedAt", "");
@@ -360,6 +362,18 @@ unittest  // an unrecognized wire status parses as unknown, which is terminal
 	assert(!isTerminal(TaskStatus.working) && !isTerminal(TaskStatus.inputRequired));
 	assert(Task.fromJson(Json(["taskId": Json("x"),
 				"status": Json("expired")])).status == TaskStatus.unknown);
+}
+
+unittest  // Task.fromJson treats a missing status as unknown, which is terminal
+{
+	auto t = Task.fromJson(Json(["taskId": Json("x")]));
+	assert(t.status == TaskStatus.unknown && isTerminal(t.status));
+}
+
+unittest  // Task.fromJson treats a non-string status as unknown, which is terminal
+{
+	auto t = Task.fromJson(Json(["taskId": Json("x"), "status": Json(3)]));
+	assert(t.status == TaskStatus.unknown && isTerminal(t.status));
 }
 
 unittest  // Task.fromJson rejects a non-object value with -32602
