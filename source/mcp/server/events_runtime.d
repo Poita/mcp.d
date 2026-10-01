@@ -2083,8 +2083,21 @@ final class EventsRuntime
 			opts_.deliverySleep(backoffFor(attempt));
 			// Renew the lease after the inter-attempt sleep so a long retry loop never
 			// lets its claim lapse (which would let a concurrent drain re-lease it).
-			deliveryQueue_.renew(job.jobId, opts_.nowMs() + leaseMs);
+			// The jobs queued behind this one are renewed too: they wait out the
+			// whole retry loop, and a lapsed claim would let another node deliver
+			// them out of order and again when their turn comes here.
+			const until = opts_.nowMs() + leaseMs;
+			deliveryQueue_.renew(job.jobId, until);
+			renewWaiting(subId, until);
 		}
+	}
+
+	// Extend the lease of every job waiting in this node's run for `subId`.
+	private void renewWaiting(string subId, long leasedUntilMs) @safe
+	{
+		if (auto q = subId in subscriptionRuns_)
+			foreach (waiting; *q)
+				deliveryQueue_.renew(waiting.jobId, leasedUntilMs);
 	}
 
 	/// POST a signed `gap` control envelope to a subscription's callback so the
@@ -4411,6 +4424,48 @@ unittest  // the delivery worker keeps running when a pass throws
 	rt = new EventsRuntime(new FailingAllStore(), o);
 	rt.startDeliveryWorker(0.seconds);
 	assert(passes == 4);
+}
+
+unittest  // jobs queued behind a retrying job keep their lease, so another node cannot take them
+{
+	import mcp.server.event_store : InMemoryDeliveryQueue;
+
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	auto q = new InMemoryDeliveryQueue();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryQueue = q;
+	o.webhookRetryBase = 1.msecs;
+	o.webhookHttpTimeout = 1.msecs;
+	o.deliveryLease = 1000.msecs;
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	int sleeps;
+	size_t stolen;
+	o.deliverySleep = (Duration d) @safe {
+		now += 600; // each backoff outlasts half the lease
+		if (++sleeps == 3)
+			stolen = q.lease(now, 1000).length; // another node's drain
+	};
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	ft.eventStatuses = [500, 500, 500, 500, 500];
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	while (deferred.length)
+	{
+		auto job = deferred[0];
+		deferred = deferred[1 .. $];
+		job();
+	}
+	assert(sleeps >= 3);
+	assert(stolen == 0, "a queued job's lease lapsed while it waited");
 }
 
 unittest  // restarting the delivery worker stops the loop it replaces
