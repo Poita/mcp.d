@@ -1094,11 +1094,11 @@ struct CallToolResult
 		if (isTask())
 			return makeCreateTaskResult(task);
 		// An `InputRequiredResult` is a distinct result shape (only `inputRequests`),
-		// not a `CallToolResult` with content — serialise it as such. The
-		// `resultType` discriminator is stamped at the server's response layer, so
-		// emit only the shared MRTR glue here.
+		// not a `CallToolResult` with content — serialise it as such, tagged with
+		// its `resultType` discriminator like the other input-required results.
 		if (inputRequests.length)
 		{
+			j["resultType"] = "input_required";
 			emitInputRequired(j, inputRequests, requestState);
 			return j;
 		}
@@ -2686,6 +2686,15 @@ unittest  // CallToolResult.toJson serializes inputRequests as a map keyed by id
 	assert(back.isInputRequired());
 	assert(back.inputRequests[0].id == "date");
 	assert(back.inputRequests[0].type == "elicitation");
+}
+
+unittest  // an input-required CallToolResult serialises with the input_required discriminator
+{
+	CallToolResult r;
+	r.inputRequests = [
+		InputRequest("date", "elicitation", Json(["message": Json("When?")]))
+	];
+	assert(r.toJson()["resultType"].get!string == "input_required");
 }
 
 unittest  // a completed CallToolResult is not an InputRequiredResult
