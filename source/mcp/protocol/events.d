@@ -678,11 +678,15 @@ Json streamEventsResult() @safe
 	return j;
 }
 
-/// Attach the SEP-2575 subscription-id correlation `_meta` to a push
-/// notification's params. `subscriptionId` is the parent `events/stream`
-/// request's JSON-RPC id (an integer or string).
+/// Attach the `io.modelcontextprotocol/subscriptionId` correlation `_meta` to
+/// a notification's params, returning a copy. `subscriptionId` is the JSON-RPC
+/// id of the request that opened the stream (`events/stream` or
+/// `subscriptions/listen`), carried verbatim so a numeric id stays numeric. An
+/// absent (`undefined`) or `null` id is a no-op and returns `params` unchanged.
 Json withSubscriptionId(Json params, Json subscriptionId) @safe
 {
+	if (subscriptionId.type == Json.Type.undefined || subscriptionId.type == Json.Type.null_)
+		return params;
 	Json p = params.type == Json.Type.object ? params.clone() : Json.emptyObject;
 	Json meta = ("_meta" in p && p["_meta"].type == Json.Type.object) ? p["_meta"]
 		: Json.emptyObject;
@@ -1288,6 +1292,19 @@ unittest  // withSubscriptionId merges into an existing _meta and supports strin
 	auto tagged = withSubscriptionId(params, Json("sub-7"));
 	assert(tagged["_meta"]["existing"].get!string == "keep");
 	assert(tagged["_meta"][subscriptionIdMetaKey].get!string == "sub-7");
+}
+
+unittest  // withSubscriptionId leaves params untagged when the id is absent or null
+{
+	Json params = Json(["uri": Json("file:///x")]);
+	assert("_meta" !in withSubscriptionId(params, Json.undefined));
+	assert("_meta" !in withSubscriptionId(params, Json(null)));
+}
+
+unittest  // withSubscriptionId stamps an empty-string id, which JSON-RPC allows
+{
+	auto tagged = withSubscriptionId(Json.emptyObject, Json(""));
+	assert(tagged["_meta"][subscriptionIdMetaKey].get!string == "");
 }
 
 unittest  // EventError round-trips code/message/data and tolerates a non-object

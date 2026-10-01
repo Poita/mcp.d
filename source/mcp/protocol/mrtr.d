@@ -230,24 +230,18 @@ bool isUserMetaKeyAllowed(string key, ProtocolVersion v) @safe pure nothrow
 /// key. `subscriptionId` is the originating `subscriptions/listen` request's
 /// JSON-RPC id, carried verbatim so its wire type is preserved (the spec types it
 /// as `RequestId = string | number`, so a numeric listen id stays numeric). An
-/// absent id — `undefined`, `null`, or an empty string — is a no-op (the
-/// notification is returned unchanged). Notifications carry their payload under
-/// `params`, so the key is nested as `params._meta.<subscriptionId>`.
+/// absent (`undefined`) or `null` id is a no-op (the notification is returned
+/// unchanged). Notifications carry their payload under `params`, so the key is
+/// stamped into `params._meta` by `withSubscriptionId`.
 Json withListenSubscriptionId(Json notification, Json subscriptionId) @safe
 {
-	if (subscriptionId.type == Json.Type.undefined
-			|| subscriptionId.type == Json.Type.null_
-			|| (subscriptionId.type == Json.Type.string && subscriptionId.get!string.length == 0))
+	import mcp.protocol.events : withSubscriptionId;
+
+	if (subscriptionId.type == Json.Type.undefined || subscriptionId.type == Json.Type.null_)
 		return notification;
 
 	Json n = notification.clone();
-	Json params = ("params" in n && n["params"].type == Json.Type.object) ? n["params"]
-		: Json.emptyObject;
-	Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"]
-		: Json.emptyObject;
-	meta[MetaKey.subscriptionId] = subscriptionId;
-	params["_meta"] = meta;
-	n["params"] = params;
+	n["params"] = withSubscriptionId(("params" in n) ? n["params"] : Json.undefined, subscriptionId);
 	return n;
 }
 
@@ -330,14 +324,24 @@ unittest  // withListenSubscriptionId preserves an existing params payload and _
 	assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "id-42");
 }
 
-unittest  // withListenSubscriptionId with an empty id is a no-op
+unittest  // withListenSubscriptionId with an absent or null id is a no-op
 {
 	auto n = Json([
 		"jsonrpc": Json("2.0"),
 		"method": Json("notifications/message")
 	]);
-	auto same = withListenSubscriptionId(n, Json(""));
-	assert("params" !in same);
+	assert("params" !in withListenSubscriptionId(n, Json.undefined));
+	assert("params" !in withListenSubscriptionId(n, Json(null)));
+}
+
+unittest  // withListenSubscriptionId stamps an empty-string id, which JSON-RPC allows
+{
+	auto n = Json([
+		"jsonrpc": Json("2.0"),
+		"method": Json("notifications/message")
+	]);
+	auto stamped = withListenSubscriptionId(n, Json(""));
+	assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "");
 }
 
 /// Standard Streamable HTTP request headers introduced by 2026-07-28.
