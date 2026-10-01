@@ -198,20 +198,36 @@ final class OAuthClient
 	/// and OpenID Connect Discovery well-known locations in order.
 	///
 	/// `enforceIssuerMatch` selects how a discovered document's `issuer` is treated;
-	/// the issuer enforcement rule is documented on `bindDiscoveredIssuer`.
+	/// the issuer enforcement rule is documented on `bindDiscoveredIssuer`. Only
+	/// the lenient path (`enforceIssuerMatch` false) falls back to synthesized
+	/// default endpoints, and only when every candidate reported no document.
 	AuthorizationServerMetadata discoverAuthServer(string issuer, bool enforceIssuerMatch = true) @safe
 	{
+		bool anyError;
 		foreach (u; authServerMetadataCandidates(issuer))
 		{
 			Json j;
-			// Both a not-found and a fetch error fall through to the next candidate
-			// and then to the 2025-03-26 default-endpoint fallback below; the
-			// synthesized endpoints derive from the already-validated issuer, not
-			// from attacker-influenced data, so the lenient fallback is safe here.
-			if (tryGetJson(u, namedUrlPolicy(), j) == FetchResult.ok)
+			final switch (tryGetJson(u, namedUrlPolicy(), j))
+			{
+			case FetchResult.ok:
 				return bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
 						issuer, enforceIssuerMatch);
+			case FetchResult.error:
+				anyError = true;
+				break;
+			case FetchResult.notFound:
+				break;
+			}
 		}
+		// Synthesized endpoints carry no PKCE or RFC 9207 metadata, so they are
+		// only acceptable for a genuine 2025-03-26 server: one reached without
+		// protected-resource metadata whose candidates all reported no document.
+		if (enforceIssuerMatch)
+			throw internalError("No authorization server metadata document for issuer " ~ issuer);
+		if (anyError)
+			throw internalError(
+					"Authorization server metadata discovery failed (a candidate could "
+					~ "not be fetched); refusing to synthesize default endpoints");
 		// 2025-03-26 fallback: no metadata document — use default endpoints
 		// derived from the issuer.
 		import std.string : endsWith;
@@ -1532,12 +1548,43 @@ unittest  // discoverAuthServer falls back to synthesized endpoints when no docu
 
 	auto c = new OAuthClient();
 	c.resource = srv.base ~ "/mcp";
-	auto as_ = c.discoverAuthServer(srv.base ~ "/");
+	auto as_ = c.discoverAuthServer(srv.base ~ "/", false);
 	assert(as_.issuer == srv.base ~ "/");
 	assert(as_.authorizationEndpoint == srv.base ~ "/authorize");
 	assert(as_.tokenEndpoint == srv.base ~ "/token");
 	assert(as_.registrationEndpoint == srv.base ~ "/register");
 	assert(!as_.metadataDocumentDiscovered);
+}
+
+unittest  // discoverAuthServer on the PRM path refuses to synthesize endpoints when no document exists
+{
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 404;
+		res.writeBody("", "text/plain");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	assertThrown(c.discoverAuthServer(srv.base, true));
+}
+
+unittest  // discoverAuthServer on the legacy path refuses to synthesize endpoints after a fetch error
+{
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody("{not json", "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	assertThrown(c.discoverAuthServer(srv.base, false));
 }
 
 unittest  // register() POSTs an RFC 7591 request and parses the returned credentials
