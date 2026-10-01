@@ -2520,8 +2520,10 @@ private HTTPServerSettings buildStreamableHttpSettings(ushort port, StreamableHt
 	settings.port = port;
 	settings.bindAddresses = opts.bindAddresses;
 	// Every body-reading route enforces `opts.maxRequestBytes` itself so an
-	// oversized body gets a JSON-RPC error instead of vibe's plain-text 400.
-	settings.maxRequestSize = ulong.max;
+	// oversized body gets a JSON-RPC error instead of vibe's plain-text 400. The
+	// listener's own cap sits above that limit with headroom, bounding how much
+	// of a rejected body vibe drains before reusing the connection.
+	settings.maxRequestSize = cast(ulong) opts.maxRequestBytes * 2 + 64 * 1024;
 	if (opts.accessLog)
 	{
 		if (opts.accessLogFile.length)
@@ -4102,13 +4104,21 @@ unittest  // a POST Content-Type of application/json with parameters is accepted
 	assert(res.statusCode == HTTPStatus.ok);
 }
 
-unittest  // runStreamableHttp's listener leaves body limits to the transport
+unittest  // the listener's body cap sits above the transport's own limit
 {
 	StreamableHttpOptions opts;
 	opts.maxRequestBytes = 64;
 	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
-	assert(settings.maxRequestSize == ulong.max,
-			"vibe must not reject an oversized body with a plain-text 400 first");
+	assert(settings.maxRequestSize > opts.maxRequestBytes,
+			"vibe must not reject a body the transport would answer with a JSON-RPC 413");
+}
+
+unittest  // the listener bounds how much of a rejected body it will drain
+{
+	StreamableHttpOptions opts;
+	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
+	assert(settings.maxRequestSize < ulong.max);
+	assert(settings.maxRequestSize <= 4 * opts.maxRequestBytes);
 }
 
 unittest  // a JSON-only POST drops a handler's log/progress notifications and returns the result
