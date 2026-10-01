@@ -1065,9 +1065,15 @@ final class McpServer : ServerCore
 	/// `notifications/tasks` on status changes to the task owner's streams (for
 	/// a task created without an authenticated principal, only over stdio; HTTP
 	/// clients poll `tasks/get`). Returns the `TaskRuntime` so tools can create and resolve tasks.
+	/// Throws on a `stateful` server, which never negotiates the modern protocol
+	/// the extension requires.
 	TaskRuntime enableTasks(TaskStore store = null,
 			TaskOptions opts = TaskOptions.init, TaskDispatcher dispatcher = null) @safe
 	{
+		if (mode_ == ServerMode.stateful)
+			throw new Exception("enableTasks() is not available on a stateful server: the"
+					~ " Tasks extension is modern-only and a stateful server never speaks"
+					~ " 2026-07-28. Construct the server with new McpServer(...) (stateless).");
 		if (taskRuntime_ !is null)
 			taskRuntime_.stopSweeper();
 		taskRuntime_ = new TaskRuntime((store is null) ? new InMemoryTaskStore() : store, opts);
@@ -1263,9 +1269,15 @@ final class McpServer : ServerCore
 	/// long or no-expiry TTLs); `opts` tunes the emit buffer, TTL negotiation, poll
 	/// lease, and webhook security. Returns the `EventsRuntime` so the author can
 	/// `emit()` events and the reflection layer can register `@event` types.
+	/// Throws on a `stateful` server, which never negotiates the modern protocol
+	/// the extension requires.
 	EventsRuntime enableEvents(WebhookSubscriptionStore store = null,
 			EventsOptions opts = EventsOptions.init) @safe
 	{
+		if (mode_ == ServerMode.stateful)
+			throw new Exception("enableEvents() is not available on a stateful server: the"
+					~ " Events extension is modern-only and a stateful server never speaks"
+					~ " 2026-07-28. Construct the server with new McpServer(...) (stateless).");
 		if (eventsRuntime_ !is null)
 			eventsRuntime_.stopDeliveryWorker();
 		eventsRuntime_ = new EventsRuntime(store, opts);
@@ -6454,6 +6466,24 @@ version (unittest) private Message stdioListenReq(long id, Json meta = Json.unde
 	params["notifications"] = Json(["toolsListChanged": Json(true)]);
 	params["_meta"] = meta;
 	return Message(makeRequest(Json(id), "subscriptions/listen", params));
+}
+
+unittest  // enableTasks throws on a stateful server (Tasks is modern-only)
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateful("t", "1");
+	assertThrown(s.enableTasks());
+	assert(s.tasks() is null);
+}
+
+unittest  // enableEvents throws on a stateful server (Events is modern-only)
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateful("t", "1");
+	assertThrown(s.enableEvents());
+	assert("extensions" !in s.capabilities().toJson());
 }
 
 unittest  // removing the last tool, resource or prompt keeps its capability and list method
