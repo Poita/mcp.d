@@ -490,6 +490,48 @@ unittest  // an executor that swallows its detach leaves the task working
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 }
 
+unittest  // re-requesting an input key discards its earlier answer, so only a fresh one satisfies it
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("retry", Json.undefined);
+	TaskExecutor exec = (TaskContext tc) @safe {
+		if (!tc.hasInput("x"))
+			return tc.requireInput([InputRequest.elicitation("x", "x?")]);
+		if (tc.inputAs!int("x") < 0) // invalid: ask again
+			return tc.requireInput([InputRequest.elicitation("x", "x again?")]);
+		return Json([
+			"structuredContent": Json(["x": Json(tc.inputAs!int("x"))])
+		]);
+	};
+	runTaskExecutor(rt, t.taskId, exec);
+	rt.deliverInput(t.taskId, Json(["x": Json(-1)]));
+	rt.resumeWorking(t.taskId);
+	runTaskExecutor(rt, t.taskId, exec);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "input_required");
+	assert(("x" in rt.takenInput(t.taskId)) is null, "the stale answer was discarded");
+	rt.deliverInput(t.taskId, Json(["x": Json(5)]));
+	rt.resumeWorking(t.taskId);
+	runTaskExecutor(rt, t.taskId, exec);
+	assert(rt.getDetailed(t.taskId)["result"]["structuredContent"]["x"].get!int == 5);
+}
+
+unittest  // re-requesting one key keeps the answers to other keys from earlier rounds
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("two", Json.undefined);
+	rt.deliverInput(t.taskId, Json(["a": Json(1)]));
+	rt.requireInput(t.taskId, Json([
+			"b": Json(["method": Json("elicitation/create")])
+	]));
+	assert(("a" in rt.takenInput(t.taskId)) !is null);
+}
+
 unittest  // checkpoint state survives a suspension and is restored on re-run
 {
 	import mcp.server.task_store : InMemoryTaskStore;

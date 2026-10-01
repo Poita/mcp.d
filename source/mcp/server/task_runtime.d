@@ -330,7 +330,8 @@ final class TaskRuntime
 
 	/// Move a task to `input_required`, surfacing `inputRequests` on the next
 	/// `tasks/get`. `inputRequests` follows the MRTR shape (a map of unique keys
-	/// to server-to-client requests). A task whose cancellation was already
+	/// to server-to-client requests); an earlier answer to a key requested again
+	/// is discarded, so only a fresh answer satisfies it. A task whose cancellation was already
 	/// requested is cancelled instead, since no dispatch would ever resume it. A
 	/// no-op if the task is already terminal.
 	void requireInput(string id, Json inputRequests) @safe
@@ -348,6 +349,11 @@ final class TaskRuntime
 				r.meta.status = TaskStatus.inputRequired;
 				r.inputRequests = (inputRequests.type == Json.Type.object)
 					? inputRequests : Json.emptyObject;
+				// A key asked for again needs a fresh answer: drop the earlier one
+				// so it cannot satisfy the new request. Other keys' answers stay,
+				// since a re-run executor passes its earlier gates with them.
+				foreach (k; r.inputRequests.get!(Json[string]).byKey)
+					r.inputResponses.remove(k);
 			}
 			return Change.status;
 		});
