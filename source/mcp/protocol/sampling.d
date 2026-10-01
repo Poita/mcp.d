@@ -252,6 +252,8 @@ struct CreateMessageRequest
 		// request that would omit it rather than silently emit spec-invalid params.
 		if (maxTokens.isNull)
 			throw invalidParams("CreateMessageRequest.maxTokens is required and must be set");
+		if (maxTokens.get < 0)
+			throw invalidParams("CreateMessageRequest.maxTokens must not be negative");
 		if (!modelPreferences.empty)
 			j["modelPreferences"] = modelPreferences.toJson();
 		if (!systemPrompt.isNull)
@@ -260,8 +262,7 @@ struct CreateMessageRequest
 			j["includeContext"] = includeContext.get;
 		if (!temperature.isNull)
 			j["temperature"] = temperature.get;
-		if (!maxTokens.isNull)
-			j["maxTokens"] = maxTokens.get;
+		j["maxTokens"] = maxTokens.get;
 		if (stopSequences.length)
 		{
 			Json s = Json.emptyArray;
@@ -302,7 +303,14 @@ struct CreateMessageRequest
 		// integer literal: a conformant sender may emit e.g. 100.0 (Json.Type.float_).
 		if ("maxTokens" in j && j["maxTokens"].type != Json.Type.undefined
 				&& j["maxTokens"].type != Json.Type.null_)
-			r.maxTokens = cast(long) numberOrThrow(j["maxTokens"], "maxTokens");
+		{
+			const v = numberOrThrow(j["maxTokens"], "maxTokens");
+			// `!(v >= 0)` also rejects NaN; the upper bound keeps the cast defined.
+			if (!(v >= 0) || v >= 0x1p63)
+				throw invalidParams(
+						"'maxTokens' must be a non-negative number within the integer range");
+			r.maxTokens = cast(long) v;
+		}
 		if ("stopSequences" in j && j["stopSequences"].type == Json.Type.array)
 			foreach (i; 0 .. j["stopSequences"].length)
 				r.stopSequences ~= stringOrThrow(j["stopSequences"][i], "stopSequences");
@@ -841,6 +849,30 @@ unittest  // CreateMessageRequest.fromJson still accepts an integer-valued maxTo
 	auto r = CreateMessageRequest.fromJson(j);
 	assert(!r.maxTokens.isNull);
 	assert(r.maxTokens.get == 256);
+}
+
+unittest  // CreateMessageRequest.fromJson rejects a negative or out-of-range maxTokens with -32602
+{
+	import std.exception : collectException;
+
+	foreach (bad; [Json(-1L), Json(-0.5), Json(1e300)])
+	{
+		Json j = Json.emptyObject;
+		j["messages"] = Json.emptyArray;
+		j["maxTokens"] = bad;
+		auto ex = cast(McpException) collectException(CreateMessageRequest.fromJson(j));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, bad.toString);
+	}
+}
+
+unittest  // CreateMessageRequest.toJson rejects a negative maxTokens with -32602
+{
+	import std.exception : collectException;
+
+	CreateMessageRequest req;
+	req.maxTokens = -5;
+	auto ex = cast(McpException) collectException(req.toJson());
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }
 
 unittest  // CreateMessageRequest emits tools and toolChoice; omits when unset
