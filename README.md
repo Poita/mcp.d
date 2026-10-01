@@ -205,9 +205,8 @@ repository).
 ## Statefulness
 
 A server chooses one of two statefulness models at construction. **Stateless is
-the default.** The author picks the mode via factories; the existing
-`new McpServer(name, version)` constructors keep working and default to
-stateless.
+the default.** The author picks the mode via factories; the
+`new McpServer(name, version)` constructors build a stateless server.
 
 ```d
 auto s1 = McpServer.stateless("my-server", "1.0.0"); // default; same as `new McpServer(...)`

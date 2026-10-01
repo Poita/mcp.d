@@ -10,7 +10,7 @@ relitigated without new information.
 their arguments as `vibe.data.json.Json`, not as statically-typed parameter
 structs. There is intentionally **no** typed-argument overload such as
 `callTool(T)(string name, T args)`. This decision is final: do not revisit it by
-re-adding a typed request surface.
+adding a typed request surface.
 
 **Rationale.**
 
@@ -19,10 +19,10 @@ re-adding a typed request surface.
   arguments back from the model — which it forwards verbatim. The arguments are
   never known to the host at compile time, so a statically-typed argument struct
   only ever serves *tests*, not the production call path it purports to ergonomize.
-- The removed typed overload silently **mis-serialized enum fields**. vibe's
+- A typed overload silently **mis-serializes enum fields**. vibe's
   default serialization writes an enum numerically (by ordinal), while the
   server's reflected input schemas declare string enums by member *name*. A typed
-  `callTool("calc", CalcArgs(Op.add, …))` would therefore send `"op": 0` against a
+  `callTool("calc", CalcArgs(Op.add, …))` would send `"op": 0` against a
   schema that requires `"op": "add"` — a class of bug the typed surface actively
   invites and hides. Building the `arguments` JSON explicitly makes the wire shape
   the thing the caller sees and controls.

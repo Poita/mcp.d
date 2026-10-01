@@ -75,7 +75,7 @@ public import mcp.api.skill_dir;
 // hint codec). They are referenced by members already on the lean public
 // surface — `McpServer.setListCacheHint(string, CacheHint)` and
 // `McpClient.discover()` returning `DiscoverResult` — so the whole module is
-// safe to re-export. The transport/wire plumbing now lives in
+// safe to re-export. The transport/wire plumbing lives in
 // `mcp.protocol.mrtr`, reachable via `import mcp.transport;`.
 public import mcp.protocol.modern;
 
