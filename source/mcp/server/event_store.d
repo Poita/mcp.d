@@ -92,6 +92,27 @@ final class EmitBuffer
 		return occ.cursor.get;
 	}
 
+	/// Forget every event retained for `name` (its type was removed).
+	void drop(string name) @safe
+	{
+		byName_.remove(name);
+		evictedThrough_.remove(name);
+	}
+
+	/// Evict aged events for every type, including those no longer emitted
+	/// (which `append` alone would never revisit).
+	void evictExpired() @safe
+	{
+		foreach (name; byName_.keys)
+			evict(name);
+	}
+
+	/// The number of events currently retained for `name`.
+	size_t retained(string name) @safe
+	{
+		return byName_.get(name, null).length;
+	}
+
 	/// The current head cursor — the position a bootstrap (`cursor: null`) poll
 	/// resumes "from now" against.
 	string headCursor() @safe

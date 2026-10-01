@@ -727,6 +727,7 @@ final class EventsRuntime
 			return false;
 		terminateEventType(name, toErrorJson(notFound("Event type removed: " ~ name, "event")));
 		types_.remove(name);
+		buffer_.drop(name);
 		notifyListChanged();
 		return true;
 	}
@@ -924,7 +925,8 @@ final class EventsRuntime
 		// Only emit-only types are buffer-backed: stamp the ring-buffer seq cursor for
 		// them. A check-backed type owns its own cursor scheme, so a buffer seq must
 		// never reach its streams (the stdio ticker feeds s.cursor back to check()).
-		if (regIsEmitOnly(reg))
+		// An unregistered type is never buffered: nothing could poll it.
+		if (reg !is null && regIsEmitOnly(reg))
 		{
 			const cursor = buffer_.append(occ.name, occ);
 			occ.cursor = cursor;
@@ -946,7 +948,7 @@ final class EventsRuntime
 	{
 		stamp(occ);
 		auto reg = occ.name in types_;
-		if (regIsEmitOnly(reg))
+		if (reg !is null && regIsEmitOnly(reg))
 		{
 			const cursor = buffer_.append(occ.name, occ);
 			occ.cursor = cursor;
@@ -1967,7 +1969,7 @@ final class EventsRuntime
 	}
 
 	/// Run the periodic worker until `stopDeliveryWorker` is called: every
-	/// `interval` it expires poll leases, sweeps lapsed webhook subscriptions,
+	/// `interval` it evicts aged emit-buffer events, expires poll leases, sweeps lapsed webhook subscriptions,
 	/// runs the poll-driven webhook pass, and drains the delivery queue.
 	/// `enableEvents` starts one per server at `workerInterval`; starting again
 	/// replaces (and stops) a worker already running. A multi-node deployment
@@ -2011,6 +2013,7 @@ final class EventsRuntime
 	/// logged and neither skips the others nor ends the worker loop.
 	void tick() @safe
 	{
+		guarded("emit buffer eviction", &buffer_.evictExpired);
 		guarded("poll-lease sweep", &sweepPollLeases);
 		guarded("webhook sweep", &sweepWebhookSubscriptions);
 		guarded("poll-driven webhook pass", &pollWebhookSubscriptions);
@@ -3328,6 +3331,30 @@ unittest  // an event emitted while a push stream starts is delivered once, afte
 	]);
 	assert(handle.stream.cursor.get == "3"); // the live event's position, never rolled back
 	handle.close();
+}
+
+unittest  // emitting an unregistered type buffers nothing
+{
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.unregister("n");
+	assert(rt.buffer_.retained("n") == 0, "unregister drops the type's buffered events");
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	assert(rt.buffer_.retained("n") == 0, "an emit after unregister is not buffered");
+}
+
+unittest  // the worker pass evicts aged events of a type that is no longer emitted
+{
+	long now = 1_000_000;
+	auto rt = testRuntime(() @safe => now);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	now += 11 * 60 * 1000; // past the default 10-minute retention
+	rt.tick();
+	assert(rt.buffer_.retained("n") == 0);
 }
 
 unittest  // a bootstrapping push stream delivers events emitted between open and start
