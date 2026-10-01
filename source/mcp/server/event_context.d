@@ -89,9 +89,10 @@ struct EventBatch(P)
 	bool hasMore;
 	bool truncated;
 
-	/// A batch with a fresh cursor (the common replayable case).
-	static EventBatch of(Event!P[] events, string cursor, bool hasMore = false,
-			bool truncated = false) @safe
+	/// A batch with a fresh cursor (the common replayable case). The flags
+	/// follow the same order as `EventResult.of`.
+	static EventBatch of(Event!P[] events, string cursor, bool truncated = false,
+			bool hasMore = false) @safe
 	{
 		EventBatch b;
 		b.events = events;
@@ -224,6 +225,14 @@ unittest  // EventResult.of carries events + cursor and clears flags by default
 	auto r = EventResult.of([EventOccurrence("e1", "n", "t")], "c1");
 	assert(r.events.length == 1 && r.cursor.get == "c1");
 	assert(!r.truncated && !r.hasMore);
+}
+
+unittest  // EventBatch.of takes truncated before hasMore, the same order as EventResult.of
+{
+	auto b = EventBatch!int.of([], "c1", true, false);
+	assert(b.truncated && !b.hasMore);
+	auto r = EventResult.of([], "c1", true, false);
+	assert(r.truncated == b.truncated && r.hasMore == b.hasMore);
 }
 
 unittest  // EventResult.empty advances the cursor with no events
