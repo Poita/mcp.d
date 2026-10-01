@@ -251,8 +251,8 @@ final class HttpClientTransport : ClientTransport
 	// silently issuing requests under a dead session. An `initialize` clears it,
 	// since it starts a new session.
 	private bool sessionExpired;
-	// True when the negotiated protocol version is modern (2026-07-28 / modern).
-	// The modern removed Last-Event-ID resumption and standalone GET SSE streams;
+	// True when the negotiated protocol version is modern (2026-07-28), which has
+	// no Last-Event-ID resumption or standalone GET SSE streams;
 	// postAndAwait skips resumeViaGet when this is set so the pointless 405
 	// round-trip to a modern server is avoided.
 	private bool modernProtocol;
@@ -328,7 +328,7 @@ final class HttpClientTransport : ClientTransport
 
 	// Optional cap on the number of POSTs in flight at once. Zero (the default)
 	// means unlimited: no semaphore is created and every request issues its POST
-	// immediately, so existing callers see no behavior change. When positive, a
+	// immediately. When positive, a
 	// `LocalTaskSemaphore` admits at most this many concurrent POSTs and an excess
 	// caller awaits a permit instead of minting another socket, bounding the
 	// ephemeral-port / TIME_WAIT pressure a burst of concurrent requests creates.
@@ -376,9 +376,10 @@ final class HttpClientTransport : ClientTransport
 		return bearerToken;
 	}
 
-	/// Mark whether the negotiated protocol version is modern (2026-07-28 / modern).
+	/// Mark whether the negotiated protocol version is modern (2026-07-28).
 	/// When true, `postAndAwait` skips Last-Event-ID resumption via GET because the
-	/// modern removed SSE resumability; a modern server responds to such a GET with 405.
+	/// modern protocol has no SSE resumability; a modern server responds to such a
+	/// GET with 405.
 	void setModernProtocol(bool modern) @safe
 	{
 		modernProtocol = modern;
@@ -732,8 +733,8 @@ final class HttpClientTransport : ClientTransport
 		// not a re-POST), repeating from the latest id each time the resumed stream
 		// closes too. Resumption stops when the server refuses the GET or after
 		// `maxIdleResumes` resumes that deliver no new event; the client's request
-		// timeout bounds it overall. The 2026-07-28 removed resumability (a modern
-		// server answers the GET with 405), so a modern session never resumes.
+		// timeout bounds it overall. The 2026-07-28 protocol has no resumability (a
+		// modern server answers the GET with 405), so a modern session never resumes.
 		enum maxIdleResumes = 3;
 		string failure;
 		if (!modernProtocol)
@@ -2787,7 +2788,7 @@ unittest  // close() sets closing(), which the post-connect re-check in the stre
 
 unittest  // a slot registered after close() is born-closed, so resumeViaGet's race-window socket is torn down
 {
-	// resumeViaGet now registers its retry-resume socket in `serverStreamSlots`
+	// resumeViaGet registers its retry-resume socket in `serverStreamSlots`
 	// (the same teardown contract runServerStream/postAndAwaitRaw use), so a
 	// `close()` racing the connect closes the socket on arrival rather than leaking
 	// a parked SSE read. Model the connectTCP-yield race: close() first, then a slot
@@ -3178,9 +3179,9 @@ unittest  // runServerStream GET includes Authorization: Bearer when a bearer to
 
 unittest  // postAndAwait skips resumeViaGet when the session is in modern mode
 {
-	// The 2026-07-28 removed Last-Event-ID resumption; a modern server responds
-	// to the GET with 405. the resume is gated on !modernProtocol so
-	// the pointless GET round-trip is avoided when the negotiated version is modern.
+	// The 2026-07-28 protocol has no Last-Event-ID resumption; a modern server
+	// responds to the GET with 405. The resume is gated on !modernProtocol so the
+	// pointless GET round-trip is avoided when the negotiated version is modern.
 	auto t = new HttpClientTransport("https://host:8080/mcp");
 	assert(!t.modernProtocol,
 			"transport starts in legacy mode; resumeViaGet is allowed by default");

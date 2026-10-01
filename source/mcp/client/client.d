@@ -187,7 +187,7 @@ Json withRequestLogLevel(Json params, string level) @safe
 /// factories stay stable as options accumulate (rather than growing a positional
 /// argument per knob). Fields scoped to a particular transport are documented as
 /// such; other transports ignore them. Pass it to `McpClient.http` / `stdio` /
-/// `spawn` / `spawnSibling`; the defaults reproduce the previous behavior.
+/// `spawn` / `spawnSibling`.
 struct ClientSettings
 {
 	/// Client identity advertised to the server during initialization.
@@ -438,7 +438,7 @@ final class McpClient : ClientProtocol
 	private CacheKey toolIndexKey_;
 	private SysTime toolIndexStamp_;
 	private bool toolIndexValid_;
-	// Modern (2026-07-28) per-request logging opt-in. The modern removed the
+	// Modern (2026-07-28) per-request logging opt-in. The modern protocol has no
 	// `logging/setLevel` RPC; a client instead controls verbosity by stamping
 	// `_meta["io.modelcontextprotocol/logLevel"]` on each request, and a
 	// conformant server emits no `notifications/message` for a request that
@@ -702,8 +702,7 @@ final class McpClient : ClientProtocol
 
 	/// Build a client over the Streamable HTTP transport at `url`. `settings`
 	/// carries the client identity plus the HTTP transport knobs (connect timeout
-	/// and in-flight cap); see `ClientSettings`. The defaults reproduce the
-	/// previous behavior.
+	/// and in-flight cap); see `ClientSettings`.
 	static McpClient http(string url, ClientSettings settings = ClientSettings.init) @safe
 	{
 		auto transport = new HttpClientTransport(url, settings.maxInFlight);
@@ -1092,7 +1091,7 @@ final class McpClient : ClientProtocol
 	/// `DiscoverResult.toJson`/`fromJson`) can rehydrate it and reconnect without
 	/// re-issuing `server/discover`.
 	///
-	/// When the mutually-chosen version is modern, modern (modern) framing
+	/// When the mutually-chosen version is modern (2026-07-28), modern framing
 	/// is enabled and `prior`'s capabilities/serverInfo/instructions are adopted
 	/// directly — zero round trips. When the chosen version is stable, modern
 	/// framing is cleared and a single `initialize(chosen.toWire)` handshake runs
@@ -3808,7 +3807,8 @@ final class McpClient : ClientProtocol
 	/// registered for its `_meta` subscriptionId. Returns true when the frame was
 	/// an event-stream frame addressed to a live stream (and was delivered), so the
 	/// caller skips the generic `onNotification`. A frame with no/unknown
-	/// subscriptionId falls through (returns false) for back-compat.
+	/// subscriptionId falls through (returns false) so it still reaches
+	/// `onNotification`.
 	private bool dispatchEventStream(string method, Json params) @safe
 	{
 		if (method != eventsEventNotification && method != eventsActiveNotification
@@ -4256,7 +4256,7 @@ unittest  // withRequestLogLevel preserves existing _meta entries
 
 unittest  // modern setLogLevel does NOT send the removed logging/setLevel RPC
 {
-	// The 2026-07-28 removed logging/setLevel (SEP-2575/2577); a conformant
+	// The 2026-07-28 protocol has no logging/setLevel (SEP-2575/2577); a conformant
 	// modern server answers it with -32601. So on a modern session setLogLevel must
 	// NOT POST that RPC — it records the sticky per-request opt-in instead.
 	auto c = McpClient.http("http://localhost");
@@ -5638,7 +5638,7 @@ unittest  // a modern Streamable-HTTP client cancels by closing the stream, not 
 {
 	auto t = new HttpClientTransport("http://localhost", 8);
 	auto c = new McpClient(t);
-	t.setModernProtocol(true); // negotiated the modern (modern) protocol
+	t.setModernProtocol(true); // negotiated the modern (2026-07-28) protocol
 	bool postedCancelled;
 	c.onNotifyForTest = (Json message) @safe {
 		if (message["method"].get!string == "notifications/cancelled")
@@ -5715,7 +5715,7 @@ unittest  // sampling dispatch forwards a valid request to the delegate
 	string seenText;
 	c.onSampling = (CreateMessageRequest request) @safe {
 		delegateCalled = true;
-		// The handler now receives the typed request, parsed from the wire.
+		// The handler receives the typed request, parsed from the wire.
 		if (request.messages.length)
 			seenText = request.messages[0].content.text;
 		return CreateMessageResult.text("test-model", "reply");

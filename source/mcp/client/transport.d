@@ -114,9 +114,10 @@ interface ClientTransport
 	/// token set by `setBearerToken` (and vice versa); a no-op on stdio.
 	void setBearerProvider(string delegate() @safe provider) @safe;
 
-	/// Signal whether the negotiated protocol version is modern (2026-07-28 / modern).
-	/// The HTTP transport uses this to skip Last-Event-ID resumption (GET) that the
-	/// modern removed; a no-op on stdio and on transports where the flag is irrelevant.
+	/// Signal whether the negotiated protocol version is modern (2026-07-28).
+	/// The HTTP transport uses this to skip Last-Event-ID resumption (GET), which
+	/// the modern protocol does not have; a no-op on stdio and on transports where
+	/// the flag is irrelevant.
 	void setModernProtocol(bool modern) @safe;
 
 	/// Whether this transport signals request cancellation by closing the request's
