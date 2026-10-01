@@ -164,16 +164,6 @@ McpException callbackEndpointError(string message, string reason) @safe
 	return new McpException(ErrorCode.callbackEndpointError, message, data);
 }
 
-/// Build a "resource not found" error using the legacy MCP-specific code
-/// (-32002). Kept for backwards compatibility; this form always emits -32002.
-/// Modern connections should instead use the version-aware overload below, which
-/// selects the version-appropriate code (modern aligns it to invalidParams /
-/// -32602).
-McpException resourceNotFound(string uri, Json data = Json.undefined) @safe pure nothrow
-{
-	return new McpException(ErrorCode.resourceNotFound, "Resource not found: " ~ uri, data);
-}
-
 /// Build a "resource not found" error whose code is selected for the negotiated
 /// protocol version: modern aligns it to invalidParams (-32602), while earlier
 /// versions use the MCP-specific -32002 (see `versions.resourceNotFoundCode`).
@@ -361,15 +351,11 @@ unittest  // convenience constructors set the right code
 {
 	assert(methodNotFound("nope").code == ErrorCode.methodNotFound);
 	assert(invalidParams("x").code == ErrorCode.invalidParams);
-	assert(resourceNotFound("file:///x").code == ErrorCode.resourceNotFound);
 }
 
-unittest  // resourceNotFound (no-version) keeps the legacy -32002 code
+unittest  // resourceNotFound requires the negotiated version to pick its code
 {
-	auto e = resourceNotFound("file:///x");
-	assert(e.code == -32002);
-	assert(e.code == ErrorCode.resourceNotFound);
-	assert(e.msg == "Resource not found: file:///x");
+	static assert(!__traits(compiles, resourceNotFound("file:///x")));
 }
 
 unittest  // resourceNotFound(version) selects -32602 for modern, -32002 otherwise

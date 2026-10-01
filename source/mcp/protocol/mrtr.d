@@ -635,24 +635,6 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 	return err;
 }
 
-/// Extract the `x-mcp-header` annotations from a tool `inputSchema`, returning a
-/// map of (top-level) parameter name -> header name (`Mcp-Param-{name}`).
-///
-/// Retained for backward compatibility; only top-level, primitive-typed, valid
-/// annotations appear. Nested annotations (which `validateInputSchemaHeaders`
-/// accepts and `paramHeaders` surfaces) are silently omitted, so a schema whose
-/// only annotations are nested validates yet yields an empty map. Prefer
-/// `paramHeaders` (path-aware, any nesting depth) for new code.
-deprecated("nested x-mcp-header annotations are dropped; use paramHeaders") string[string] paramHeaderMap(
-		Json inputSchema) @safe
-{
-	string[string] map;
-	foreach (ph; paramHeaders(inputSchema))
-		if (ph.path.length == 1)
-			map[ph.path[0]] = ph.header;
-	return map;
-}
-
 // ===========================================================================
 // Multi Round-Trip Requests (MRTR) — SEP-2322
 // ===========================================================================
@@ -1480,40 +1462,9 @@ unittest  // metaLabels splits dot-separated labels, preserving empties
 	assert(metaLabels("solo") == ["solo"]);
 }
 
-deprecated unittest  // paramHeaderMap reads x-mcp-header annotations
+unittest  // paramHeaderMap is not part of the API; paramHeaders is the one extractor
 {
-	Json schema = Json.emptyObject;
-	schema["type"] = "object";
-	Json props = Json.emptyObject;
-	props["region"] = Json([
-		"type": Json("string"),
-		"x-mcp-header": Json("Region")
-	]);
-	props["query"] = Json(["type": Json("string")]);
-	schema["properties"] = props;
-
-	auto m = paramHeaderMap(schema);
-	assert("region" in m);
-	assert(m["region"] == "Mcp-Param-Region");
-	assert("query" !in m);
-}
-
-deprecated unittest  // paramHeaderMap silently drops nested annotations (use paramHeaders)
-{
-	Json schema = Json.emptyObject;
-	schema["type"] = "object";
-	Json nested = Json.emptyObject;
-	nested["type"] = "object";
-	nested["properties"] = Json([
-		"region": Json(["type": Json("string"), "x-mcp-header": Json("Region")])
-	]);
-	schema["properties"] = Json(["filter": nested]);
-
-	// The schema is valid and the annotation is path-aware-visible, ...
-	assert(validateInputSchemaHeaders(schema) is null);
-	assert(paramHeaders(schema).length == 1);
-	// ... but the legacy map form drops the nested annotation entirely.
-	assert(paramHeaderMap(schema).length == 0);
+	static assert(!__traits(compiles, paramHeaderMap(Json.emptyObject)));
 }
 
 unittest  // validateHeaderName: empty value rejected (modern x-mcp-header MUST NOT be empty)

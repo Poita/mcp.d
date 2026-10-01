@@ -142,25 +142,6 @@ Message parseMessage(string text) @safe
 	return Message(j);
 }
 
-/// Parse a JSON-RPC batch (array) from text.
-///
-/// Throws `McpException` when the input is not valid JSON, is not an array,
-/// is an empty array, or when every member fails `validateEnvelope` (all-malformed
-/// batch). For mixed batches the well-formed members are returned and malformed
-/// members are silently dropped.
-///
-/// Deprecated: Use `parseBatchTolerant` or `parseAny` to preserve per-member error
-/// information, which is required to produce the JSON-RPC 2.0 §6 `id:null` error
-/// response for each malformed member.
-deprecated("Use parseBatchTolerant or parseAny to preserve per-member error information") Message[] parseBatch(
-		string text) @safe
-{
-	auto result = parseBatchTolerant(text);
-	if (result.messages.length == 0 && result.errors.length > 0)
-		throw invalidRequest("All batch members are malformed");
-	return result.messages;
-}
-
 /// A malformed batch member: its position in the array, the raw member item, and
 /// the validation error. The raw `item` is retained so a dispatcher can recover the
 /// member's `id` (which may still be present even when the envelope is invalid) and
@@ -172,15 +153,17 @@ struct BatchMemberError
 	McpException error;
 }
 
-/// `parseBatch` result that keeps malformed members rather than discarding the
-/// whole batch.
+/// `parseBatchTolerant` result: the well-formed members plus each malformed one.
 struct BatchResult
 {
 	Message[] messages;
 	BatchMemberError[] errors;
 }
 
-/// As `parseBatch`, but tolerant of individual malformed members (see `parseBatch`).
+/// Parse a JSON-RPC batch (array) from text, keeping well-formed members and
+/// recording each malformed one in `errors` rather than failing the whole batch.
+/// Throws `McpException` when the input is not valid JSON, is not an array, or is
+/// an empty array.
 BatchResult parseBatchTolerant(string text) @safe
 {
 	Json arr;
@@ -471,12 +454,9 @@ unittest  // an unrecognizable batch (empty / non-array) still throws
 	assertThrown!McpException(parseBatchTolerant(`{"jsonrpc":"2.0"}`));
 }
 
-unittest  // parseBatch throws when every batch member is malformed (no silent empty return)
+unittest  // parseBatch is not part of the API; parseBatchTolerant is the one batch parser
 {
-	import std.exception : assertThrown;
-
-	// All members malformed — parseBatch must not silently return [] with no signal.
-	assertThrown!McpException(parseBatch(`[{"id":1,"method":"ping"},{"jsonrpc":"1.0"}]`));
+	static assert(!__traits(compiles, parseBatch(`[]`)));
 }
 
 unittest  // a message with no method and no id is rejected as unclassifiable

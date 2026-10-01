@@ -2937,7 +2937,7 @@ final class McpServer : ServerCore
 		// clients can read the offending URI without parsing the message string.
 		Json data = Json.emptyObject;
 		data["uri"] = uri;
-		throw new McpException(ver.resourceNotFoundCode, "Resource not found: " ~ uri, data);
+		throw resourceNotFound(uri, ver, data);
 	}
 
 	// The MIME type SEP-2640 assigns to a directory resource. A directory is
@@ -3080,7 +3080,7 @@ final class McpServer : ServerCore
 		{
 			Json data = Json.emptyObject;
 			data["uri"] = uri;
-			throw new McpException(ver.resourceNotFoundCode, "Resource not found: " ~ uri, data);
+			throw resourceNotFound(uri, ver, data);
 		}
 		if ((uri in conn.subscriptions) is null
 				&& conn.subscriptions.length >= maxResourceSubscriptions)

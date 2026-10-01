@@ -7803,8 +7803,8 @@ unittest  // connect() auto-detect probes server/discover with modern framing an
 		assert(headers[HttpHeader.protocolVersion] == ProtocolVersion.v2026_07_28.toWire);
 		sawModernFramedDiscover = true;
 		Json r = Json.emptyObject;
-		r["protocolVersions"] = Json.emptyArray;
-		r["protocolVersions"] ~= Json(ProtocolVersion.v2026_07_28.toWire);
+		r["supportedVersions"] = Json.emptyArray;
+		r["supportedVersions"] ~= Json(ProtocolVersion.v2026_07_28.toWire);
 		r["capabilities"] = Json.emptyObject;
 		Json info = Json.emptyObject;
 		info["name"] = "modern-srv";

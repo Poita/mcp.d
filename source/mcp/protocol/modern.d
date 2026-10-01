@@ -156,12 +156,9 @@ struct DiscoverResult
 	{
 		requireObject(j, "DiscoverResult");
 		DiscoverResult r;
-		// Spec wire field is `supportedVersions`; accept the legacy
-		// `protocolVersions` name as a fallback for older peers.
-		auto verKey = ("supportedVersions" in j) ? "supportedVersions" : "protocolVersions";
-		if (verKey in j && j[verKey].type == Json.Type.array)
+		if ("supportedVersions" in j && j["supportedVersions"].type == Json.Type.array)
 		{
-			auto arr = j[verKey];
+			auto arr = j["supportedVersions"];
 			foreach (i; 0 .. arr.length)
 				if (arr[i].type == Json.Type.string)
 					r.protocolVersions ~= arr[i].get!string;
@@ -411,6 +408,14 @@ unittest  // DiscoverResult.toJson emits the spec wire field `supportedVersions`
 	assert("protocolVersions" !in j);
 	assert(j["supportedVersions"].length == 2);
 	assert(j["supportedVersions"][0].get!string == "2026-07-28");
+}
+
+unittest  // DiscoverResult.fromJson reads versions only from the spec supportedVersions field
+{
+	import vibe.data.json : parseJsonString;
+
+	auto r = DiscoverResult.fromJson(parseJsonString(`{"protocolVersions": ["2026-07-28"]}`));
+	assert(r.protocolVersions.length == 0);
 }
 
 unittest  // DiscoverResult.fromJson skips non-string entries in supportedVersions
