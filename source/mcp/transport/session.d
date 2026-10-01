@@ -52,6 +52,11 @@ struct BoundedExpiringMap(V)
 	/// called for `take` or `remove`.
 	void delegate(string key, V value) @safe onEvict;
 
+	/// When set, an entry for which this returns true is busy: the TTL never
+	/// expires it, and its idle clock restarts whenever it is seen busy, so it
+	/// stays live for a full TTL after its work ends.
+	bool delegate(ref V value) @safe busy;
+
 	this(Duration ttl, size_t maxEntries, MonoTime delegate() @safe clock) @safe
 	{
 		this.ttl = ttl;
@@ -166,12 +171,25 @@ struct BoundedExpiringMap(V)
 		auto p = key in values;
 		if (p is null)
 			return null;
-		if (ttl > Duration.zero && t - stamps[key] >= ttl)
+		if (expired(key, t))
 		{
 			evict(key);
 			return null;
 		}
 		return p;
+	}
+
+	/// Whether `key` is past its idle TTL. A busy entry is restamped instead.
+	private bool expired(string key, MonoTime t) @safe
+	{
+		if (ttl <= Duration.zero)
+			return false;
+		if (busy !is null && busy(values[key]))
+		{
+			stamps[key] = t;
+			return false;
+		}
+		return t - stamps[key] >= ttl;
 	}
 
 	private void sweepDue(MonoTime t) @safe
@@ -186,11 +204,11 @@ struct BoundedExpiringMap(V)
 	{
 		if (ttl <= Duration.zero || values.length == 0)
 			return;
-		string[] expired;
-		foreach (k, ts; stamps)
-			if (t - ts >= ttl)
-				expired ~= k;
-		foreach (k; expired)
+		string[] stale;
+		foreach (k; stamps.keys)
+			if (expired(k, t))
+				stale ~= k;
+		foreach (k; stale)
 			evict(k);
 	}
 
@@ -370,6 +388,7 @@ final class SessionManager
 	{
 		sessions = BoundedExpiringMap!Session(idleTtl, maxActive, null);
 		sessions.onEvict = &evicted;
+		sessions.busy = (ref Session s) @safe => s.state.inFlight.length > 0;
 	}
 
 	/// Called with a session's id after the idle sweep or the active-session cap
@@ -542,6 +561,40 @@ unittest  // an idle session past the TTL is swept on the next create()
 	const fresh = mgr.create();
 	assert(!mgr.isActive(stale), "an idle session past the TTL must be swept");
 	assert(mgr.isActive(fresh));
+}
+
+unittest  // a session with an in-flight request is not swept as idle
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+	import mcp.server.context : CancellationToken;
+
+	auto mgr = new SessionManager(5.msecs, 0);
+	const busy = mgr.create();
+	auto tok = new CancellationToken;
+	mgr.stateFor(busy).inFlight["i:1"] = tok;
+	Thread.sleep(20.msecs);
+	mgr.create();
+	assert(mgr.isActive(busy), "a session running a request must outlive the idle TTL");
+	assert(!tok.cancelled);
+}
+
+unittest  // a session's idle clock restarts when its last in-flight request ends
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+	import mcp.server.context : CancellationToken;
+
+	auto mgr = new SessionManager(30.msecs, 0);
+	const id = mgr.create();
+	auto state = mgr.stateFor(id);
+	state.inFlight["i:1"] = new CancellationToken;
+	Thread.sleep(40.msecs);
+	assert(mgr.isActive(id));
+	state.inFlight.remove("i:1");
+	assert(mgr.isActive(id), "a just-finished request leaves the session freshly active");
+	Thread.sleep(40.msecs);
+	assert(!mgr.isActive(id));
 }
 
 unittest  // isActive sweeps expired entries without needing a create() to trigger the sweep
@@ -804,21 +857,17 @@ unittest  // a session evicted past the cap has its in-flight cancelled and its 
 	assert(ended == [a], "an evicted session's end must be reported");
 }
 
-unittest  // a session swept past its idle TTL has its in-flight cancelled and its end reported
+unittest  // a session swept past its idle TTL has its end reported
 {
 	import core.thread : Thread;
 	import core.time : msecs;
-	import mcp.server.context : CancellationToken;
 
 	auto mgr = new SessionManager(5.msecs, 0);
 	string[] ended;
 	mgr.onExpire = (string id) @safe { ended ~= id; };
 	const a = mgr.create();
-	auto tok = new CancellationToken;
-	mgr.stateFor(a).inFlight["i:1"] = tok;
 	Thread.sleep(20.msecs);
 	assert(!mgr.isActive(a));
-	assert(tok.cancelled, "an expired session's in-flight request must be cancelled");
 	assert(ended == [a], "an expired session's end must be reported");
 }
 
