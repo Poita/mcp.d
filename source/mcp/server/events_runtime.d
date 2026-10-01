@@ -2049,10 +2049,16 @@ final class EventsRuntime
 				deliveryQueue_.ack(job.jobId);
 				return;
 			}
+			// Each failed attempt is one sample for the suspension policy, so an
+			// endpoint that never answers reaches the threshold within the window.
+			const cat = res.error.isNull ? DeliveryErrorCategory.http5xx : res.error.get;
+			if (!recordFailure(subId, cat))
+			{
+				abandonUndelivered(job);
+				return;
+			}
 			if (attempt >= opts_.webhookMaxAttempts)
 			{
-				const cat = res.error.isNull ? DeliveryErrorCategory.http5xx : res.error.get;
-				recordFailure(subId, cat);
 				settlePosition(subId, occ.cursor); // abandoned for watermark purposes
 				if (!job.gap)
 					signalGap(sn.get, occ); // tell the client the event was lost
@@ -2514,11 +2520,13 @@ final class EventsRuntime
 		return tracked;
 	}
 
-	private void recordFailure(string subId, DeliveryErrorCategory cat) @safe
+	// Record one failed delivery attempt against `subId`'s health and suspension
+	// window. Returns whether the subscription is still active afterwards.
+	private bool recordFailure(string subId, DeliveryErrorCategory cat) @safe
 	{
 		auto sn = webhookStore_.get(subId);
 		if (sn.isNull)
-			return;
+			return false;
 		auto sub = sn.get;
 		const now = opts_.nowMs();
 		sub.lastErrorCat = cast(int) cat;
@@ -2533,6 +2541,7 @@ final class EventsRuntime
 					long) policy.failureRatePercent)
 			sub.active = false;
 		webhookStore_.put(sub);
+		return sub.active;
 	}
 
 	// Start a fresh failure-rate sample window once the current one has elapsed
@@ -5393,6 +5402,55 @@ unittest  // a sustained failure rate over the minimum sample suspends the subsc
 	auto suspended = rt.webhookStore().get(r.id).get;
 	assert(!suspended.active); // 2 of 2 failed: 100% over a sample of 2
 	assert(suspended.windowAttempts == 2 && suspended.windowFailures == 2);
+}
+
+unittest  // every failed retry attempt counts toward suspension, so a dead endpoint suspends
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	o.webhookMaxAttempts = 5;
+	o.webhookSuspension.minAttempts = 3;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	ft.eventStatuses = [500, 500, 500, 500, 500];
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	auto sub = rt.webhookStore().get(r.id).get;
+	assert(!sub.active); // 3 failed attempts reached the minimum sample
+	assert(sub.windowAttempts == 3 && sub.windowFailures == 3);
+	assert(ft.eventPosts().length == 3); // retries stop once suspended
+}
+
+unittest  // the first failed attempt records lastError and failedSince before any retry
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	EventsRuntime rt;
+	string subId;
+	bool sawError;
+	o.deliverySleep = (Duration d) @safe {
+		auto s = rt.webhookStore().get(subId).get;
+		sawError = s.lastErrorCat == cast(int) DeliveryErrorCategory.http5xx && s.failedSinceMs != 0;
+	};
+	rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	subId = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1").id;
+	ft.eventStatuses = [503, 200];
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(sawError);
 }
 
 unittest  // failures below the minimum sample never suspend
