@@ -2628,34 +2628,43 @@ final class McpClient : ClientProtocol
 	}
 
 	/// The poll loop body, factored out and seam-driven so it runs synchronously
-	/// under `unittest` without a live event loop (mirrors `awaitTask`). Exits when
-	/// the subscription is cancelled or the server reports the subscription gone.
+	/// under `unittest` without a live event loop (mirrors `awaitTask`). A
+	/// transient poll failure is retried with exponential backoff from the poll
+	/// floor; the loop exits when the subscription is cancelled or the server
+	/// rejects the poll, which is reported to `onControl` as an `error` control.
 	package void runPollLoop(EventSubscription sub, PollParams p,
 			void delegate(EventOccurrence) @safe onEvent, void delegate(EventControl) @safe onControl) @safe
 	{
 		auto cur = p;
+		uint failures; // consecutive failed polls
 		while (!sub.isCancelled())
 		{
 			cur.cursor = sub.cursor();
 			PollResult res;
 			try
+			{
 				res = PollResult.fromJson(rpc("events/poll", cur.toJson()));
+				failures = 0;
+			}
 			catch (McpException e)
 			{
-				// A poll error ends the managed subscription; surface it as a typed
-				// control so the caller learns why rather than seeing silence.
-				if (onControl !is null)
+				// A server rejection ends the managed subscription; surface it as a
+				// typed control so the caller learns why rather than seeing silence.
+				if (!isTransientEventFailure(e))
 				{
-					EventControl c;
-					c.kind = EventControlKind.error;
-					EventError err;
-					err.code = e.code;
-					err.message = e.msg;
-					c.error = err;
-					onControl(c);
+					reportEventError(onControl, e);
+					sub.markTerminated();
+					return;
 				}
-				sub.markTerminated();
-				return;
+				failures++;
+			}
+			catch (Exception)
+				failures++;
+			if (failures)
+			{
+				eventPollSleep(eventSettings_.pollFloor.total!"msecs" << (failures < 6 ? failures
+						: 6));
+				continue;
 			}
 			foreach (occ; res.events)
 			{
@@ -8629,6 +8638,36 @@ unittest  // subscribePoll surfaces a poll error as a typed control and ends the
 	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
 	assert(ctrls[0].error.get.code == ErrorCode.invalidRequest);
 	assert(!sub.active);
+}
+
+unittest  // a transient poll failure is retried with backoff instead of ending the subscription
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (++polls <= 3)
+			throw new McpException(ErrorCode.internalError, "connection lost");
+		PollResult r;
+		r.events ~= EventOccurrence("e1", "incident.created", "t");
+		r.cursor = "c1";
+		return r.toJson();
+	};
+	EventOccurrence[] got;
+	EventControl[] ctrls;
+	Duration[] delays;
+	auto sub = new EventSubscription();
+	c.onEventPollSleepForTest = (Duration d) @safe {
+		delays ~= d;
+		if (polls > 3)
+			sub.cancel();
+	};
+	c.runPollLoop(sub, PollParams("incident.created"), (EventOccurrence o) @safe {
+		got ~= o;
+	}, (EventControl ctrl) @safe { ctrls ~= ctrl; });
+	assert(got.length == 1, "the poll after the transient failures must deliver");
+	assert(ctrls.length == 0, "a transient failure is not reported as an error");
+	assert(delays.length == 4);
+	assert(delays[0] < delays[1] && delays[1] < delays[2], "retries must back off");
 }
 
 unittest  // subscribeStream tracks the cursor and ends the handle on a terminated control
