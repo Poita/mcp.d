@@ -330,7 +330,8 @@ RegisteredClient registrationResult(const OAuthProxyConfig cfg) @safe
 
 /// Serialize the DCR registration response document (RFC 7591 §3.2.1). Always
 /// carries `client_id` and echoes the requested `redirect_uris` and
-/// `token_endpoint_auth_method=none` (public client).
+/// `token_endpoint_auth_method=none` (public client). `grant_types` matches
+/// the `grant_types_supported` the AS metadata advertises.
 Json registrationResponseJson(const OAuthProxyConfig cfg, const string[] requestedRedirectUris) @safe
 {
 	Json j = Json.emptyObject;
@@ -341,8 +342,8 @@ Json registrationResponseJson(const OAuthProxyConfig cfg, const string[] request
 		ru ~= Json(u);
 	j["redirect_uris"] = ru;
 	Json gt = Json.emptyArray;
-	gt ~= Json("authorization_code");
-	gt ~= Json("refresh_token");
+	foreach (g; authorizationServerMetadata(cfg).grantTypesSupported)
+		gt ~= Json(g);
 	j["grant_types"] = gt;
 	Json rt = Json.emptyArray;
 	rt ~= Json("code");
@@ -2306,4 +2307,19 @@ unittest  // BROKER: OAuthProxy.validator accepts the issued opaque token, rejec
 	auto v = proxy.validator();
 	assert(v(issued.token).valid);
 	assert(!v("gho_upstream_secret").valid);
+}
+
+unittest  // BROKER: the DCR response grants only what the AS metadata advertises (no refresh_token)
+{
+	import std.algorithm : canFind, map;
+	import std.array : array;
+
+	auto j = registrationResponseJson(brokerConfig(), [
+		"http://localhost:5000/callback"
+	]);
+	auto grants = j["grant_types"].get!(Json[])
+		.map!(g => g.get!string)
+		.array;
+	assert(grants.canFind("authorization_code"));
+	assert(!grants.canFind("refresh_token"));
 }
