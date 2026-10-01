@@ -495,6 +495,7 @@ final class PushStream
 	private EventOccurrence[] pending_; // live events not yet written, in arrival order
 	private bool writerScheduled_; // a writer is draining (or about to drain) `pending_`
 	private bool overflowed_; // fell too far behind; being terminated
+	private Nullable!string openHead_; // emit buffer head when an emit-only stream opened
 }
 
 /// Handle returned by `openPushStream`. `close()` unregisters the stream and fires
@@ -983,6 +984,8 @@ final class EventsRuntime
 		s.principal = principal;
 		s.subscriptionId = subscriptionId;
 		s.deliver = deliver;
+		if (regIsEmitOnly(p))
+			s.openHead_ = buffer_.headCursor();
 		// on_subscribe runs first: when it throws, no stream is left registered.
 		acquireLifecycle(*p, name, s.arguments, principal, subscriptionIdString(subscriptionId));
 		pushStreams_ ~= s;
@@ -1001,6 +1004,10 @@ final class EventsRuntime
 		auto reg = s.name in types_;
 		if (s.terminated || reg is null)
 			return 0;
+		// A bootstrap on an emit-only type starts from the buffer head as it was
+		// when the stream opened, so events emitted before `start` are delivered.
+		if (cursor.isNull && !s.openHead_.isNull)
+			cursor = s.openHead_;
 		PollResult first;
 		bool read;
 		try
@@ -3288,6 +3295,23 @@ unittest  // an event emitted while a push stream starts is delivered once, afte
 		eventsActiveNotification, "evt_backlog", "evt_before_start", "evt_live"
 	]);
 	assert(handle.stream.cursor.get == "3"); // the live event's position, never rolled back
+	handle.close();
+}
+
+unittest  // a bootstrapping push stream delivers events emitted between open and start
+{
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.emit(EventOccurrence("evt_old", "n", "t"));
+	string[] frames;
+	auto handle = rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		frames ~= m == eventsEventNotification ? p["eventId"].get!string : m;
+	});
+	rt.emit(EventOccurrence("evt_before_start", "n", "t"));
+	rt.startPushStream(handle.stream, Nullable!string.init, Nullable!long.init);
+	assert(frames == [eventsActiveNotification, "evt_before_start"]);
+	assert(handle.stream.cursor.get == "2");
 	handle.close();
 }
 
