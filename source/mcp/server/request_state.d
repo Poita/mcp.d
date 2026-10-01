@@ -318,8 +318,8 @@ package string verifyIncomingRequestState(RequestStateCodec codec, string raw,
 /// (plaintext, no wire change). With the codec enabled, a non-empty top-level
 /// `requestState` string is replaced by an integrity-protected (and optionally
 /// encrypted), expiry-stamped, user-bound blob bound to the same subject/tool
-/// the incoming seam will verify against. Tool, prompt, and task input-required
-/// results all share this single top-level field, so one seam covers all three.
+/// the incoming seam will verify against. Tool and prompt input-required results
+/// share this single top-level field, so one seam covers both.
 package Json secureOutgoingRequestState(RequestStateCodec codec, Json result,
 		string method, Json params, RequestContext ctx) @safe
 {

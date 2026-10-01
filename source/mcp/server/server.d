@@ -512,8 +512,8 @@ final class McpServer : ServerCore
 		return true;
 	}
 
-	/// Declare the client capabilities a registered resource (direct or template)
-	/// requires to be read.
+	/// Declare the client capabilities a registered direct resource requires to
+	/// be read (see `setResourceTemplateRequiredClientCapabilities` for templates).
 	///
 	/// On the modern protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `resources/read` for a URI matching this
@@ -670,7 +670,7 @@ final class McpServer : ServerCore
 
 	/// Enable the opt-in secure codec for the MRTR (SEP-2322) `requestState`. Once
 	/// enabled, the dispatch path transparently wraps every outgoing
-	/// `requestState` (tool, prompt, and task input-required results) and verifies
+	/// `requestState` (tool and prompt input-required results) and verifies
 	/// every echoed incoming one — handlers keep calling `inputRequired!T` /
 	/// `requestStateAs!T` against plaintext. This delivers the three SEP-2322
 	/// protections at once: integrity (the client cannot tamper with the opaque
@@ -1509,18 +1509,16 @@ final class McpServer : ServerCore
 	}
 
 	/// The error a modern stdio stream request (`subscriptions/listen`,
-	/// `events/stream`) is answered with instead of opening its stream, applying
-	/// the same gates `handleRequest` applies to every other request: the required
-	/// `_meta` client capabilities, and the opt-in stateful lifecycle gate. Null
-	/// when the stream may open.
+	/// `events/stream`) is answered with instead of opening its stream: a stateful
+	/// server never speaks the modern protocol these streams belong to, and a
+	/// stateless one requires the `_meta` client capabilities. Null when the stream
+	/// may open.
 	private McpException stdioStreamRequestError(RequestMeta meta) @safe
 	{
 		if (mode_ == ServerMode.stateful)
 			return unsupportedVersionError(meta.protocolVersion);
 		if (!meta.hasClientCapabilities)
 			return missingRequiredMeta([cast(string) MetaKey.clientCapabilities]);
-		if (requireInitialized_ && mode_ == ServerMode.stateful && !cs().initialized)
-			return new McpException(-32002, "Server not initialized");
 		return null;
 	}
 
@@ -1875,40 +1873,8 @@ final class McpServer : ServerCore
 	{
 		if (conn is null)
 			return handleRaw(text);
-
-		ParsedInput input;
-		try
-			input = parseAny(text);
-		catch (McpException e)
-			return makeErrorResponse(Json(null), e).toString();
-		catch (Exception e)
-			return makeErrorResponse(Json(null), parseError(e.msg)).toString();
-
-		auto dispatch = (Message m) @safe {
-			return handle(m, new ConnectionScopedContext(conn, connectionToken));
-		};
-
-		if (!input.isBatch)
-		{
-			auto resp = dispatch(input.messages[0]);
-			return resp.isNull ? "" : resp.get.toString();
-		}
-
-		if (conn.negotiated >= ProtocolVersion.v2025_06_18)
-			return makeErrorResponse(Json(null),
-					invalidRequest("JSON-RPC batching is not supported on this protocol version"))
-				.toString();
-
-		Json responses = Json.emptyArray;
-		foreach (m; input.messages)
-		{
-			auto resp = dispatch(m);
-			if (!resp.isNull)
-				responses ~= resp.get;
-		}
-		foreach (err; input.errors)
-			responses ~= makeErrorResponse(Json(null), err.error);
-		return responses.length == 0 ? "" : responses.toString();
+		return dispatchRaw(text, conn, (Message m) @safe => handle(m,
+				new ConnectionScopedContext(conn, connectionToken)));
 	}
 
 	/// As `handleRaw`, but with a server->client write `sink` for transports (such
@@ -1932,8 +1898,23 @@ final class McpServer : ServerCore
 	string handleRaw(string text, scope void delegate(string) @safe sink,
 			scope Json delegate(string, Json) @safe serverRequest) @safe
 	{
-		import vibe.data.json : parseJsonString;
+		return dispatchRaw(text, cs, (Message m) @safe {
+			if (sink is null)
+				return handle(m);
+			if (serverRequest is null)
+				return handle(m, new StdioContext(sink,
+					readProgressToken(m.params), cs.negotiated));
+			return handle(m, new StdioContext(sink, serverRequest, cs.clientCaps,
+				readProgressToken(m.params), cs.negotiated, mode_ == ServerMode.stateless));
+		});
+	}
 
+	/// Parse a raw wire payload and run each message through `dispatch`, gating a
+	/// batch on `conn`'s negotiated version. Returns the raw response text, or ""
+	/// when there is nothing to send back.
+	private string dispatchRaw(string text, ConnectionState conn,
+			scope Nullable!Json delegate(Message) @safe dispatch) @safe
+	{
 		ParsedInput input;
 		try
 			input = parseAny(text);
@@ -1941,16 +1922,6 @@ final class McpServer : ServerCore
 			return makeErrorResponse(Json(null), e).toString();
 		catch (Exception e)
 			return makeErrorResponse(Json(null), parseError(e.msg)).toString();
-
-		auto dispatch = (Message m) @safe {
-			if (sink is null)
-				return handle(m);
-			if (serverRequest is null)
-				return handle(m, new StdioContext(sink,
-						readProgressToken(m.params), cs.negotiated));
-			return handle(m, new StdioContext(sink, serverRequest, cs.clientCaps,
-					readProgressToken(m.params), cs.negotiated, mode_ == ServerMode.stateless));
-		};
 
 		if (!input.isBatch)
 		{
@@ -1963,7 +1934,7 @@ final class McpServer : ServerCore
 		// negotiated 2025-06-18 or later, reject a batch with a single
 		// invalidRequest (-32600) error carrying a null id rather than processing
 		// the array.
-		if (cs.negotiated >= ProtocolVersion.v2025_06_18)
+		if (conn.negotiated >= ProtocolVersion.v2025_06_18)
 			return makeErrorResponse(Json(null),
 					invalidRequest("JSON-RPC batching is not supported on this protocol version"))
 				.toString();
