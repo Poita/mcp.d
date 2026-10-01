@@ -196,8 +196,9 @@ alias TaskExecutor = Json delegate(TaskContext tc) @safe;
 
 /// Drives the task lifecycle for one dispatch: build the context, run `executor`,
 /// and record the outcome on the durable task. A normal return completes the task
-/// (or marks it `cancelled` if a cancel was requested during the run);
-/// `TaskSuspended` leaves it `input_required`; any other exception fails it. Once
+/// and any other exception fails it, except that either marks it `cancelled` when
+/// a cancel was requested during the run (an executor may abort by throwing);
+/// `TaskSuspended` leaves it `input_required`. Once
 /// the executor has suspended or detached, the dispatch ends there whatever it
 /// does afterwards. Pure over the store, so it is correct whether invoked
 /// in-process or by a remote worker. Throws only when the outcome cannot be
@@ -225,12 +226,20 @@ void runTaskExecutor(TaskRuntime rt, string taskId, TaskExecutor executor) @safe
 	}
 	catch (McpException e)
 	{
-		if (!tc.outcome_.unwound)
+		if (tc.outcome_.unwound)
+			return;
+		if (rt.cancelRequested(taskId))
+			rt.markCancelled(taskId);
+		else
 			rt.fail(taskId, e);
 	}
 	catch (Exception e)
 	{
-		if (!tc.outcome_.unwound)
+		if (tc.outcome_.unwound)
+			return;
+		if (rt.cancelRequested(taskId))
+			rt.markCancelled(taskId);
+		else
 			rt.fail(taskId, Json([
 			"code": Json(cast(int) ErrorCode.internalError),
 			"message": Json(e.msg)
@@ -390,6 +399,35 @@ unittest  // a cancel observed during the run marks the task cancelled, not comp
 	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
 		// Executor returns a result, but a cancel was requested.
 		return Json(["structuredContent": Json.emptyObject]);
+	});
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
+}
+
+unittest  // an executor that throws after a cancel was requested ends the task cancelled
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("slow", Json.undefined);
+	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
+		rt.cancel(tc.taskId);
+		throw new Exception("aborted on cancel");
+	});
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
+}
+
+unittest  // an executor that throws an McpException after a cancel ends the task cancelled
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+	import mcp.protocol.errors : internalError;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("slow", Json.undefined);
+	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
+		rt.cancel(tc.taskId);
+		throw internalError("aborted on cancel");
 	});
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
 }
