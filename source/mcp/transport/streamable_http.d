@@ -254,15 +254,12 @@ void mountMcp(URLRouter router, McpServer server,
 			res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
 			return;
 		}
-		if (sessions !is null && deleteTerminatesSession(server.negotiatedVersion))
+		if (sessions !is null)
 		{
 			// Session Management: a client signals it no longer needs the
 			// session via DELETE with the Mcp-Session-Id header. Terminate it
 			// and reply 204; an absent header is 400, an unknown/already-
-			// terminated session is 404. The modern removed protocol-level
-			// sessions, so this branch is version-gated: a modern-negotiated
-			// server falls through to the 405 below even when sessions are
-			// enabled (mirroring the GET getOpensSseStream gate).
+			// terminated session is 404.
 			const sid = req.headers.get(SessionHeader, "");
 			if (sid.length == 0)
 			{
@@ -281,15 +278,11 @@ void mountMcp(URLRouter router, McpServer server,
 			res.writeBody("", "text/plain");
 			return;
 		}
-		// No protocol-level session to tear down (stateless mode, or a
-		// modern-negotiated session which removed sessions entirely): per the
-		// backward-compatibility rules, DELETE -> 405. The Allow header MUST list
-		// every method the endpoint actually supports (RFC 9110 §10.2.1): on the
-		// stable revisions that is GET (the standalone SSE stream) and POST, while
-		// 2026-07-28 drops the GET stream so only POST remains.
+		// A stateless server has no session to tear down, so DELETE -> 405. The
+		// Allow header MUST list every method the endpoint supports (RFC 9110
+		// §10.2.1); a stateless server also answers GET with 405, leaving POST.
 		res.statusCode = HTTPStatus.methodNotAllowed;
-		res.headers["Allow"] = allowedMethodsHeader(server.negotiatedVersion,
-			server.mode == ServerMode.stateful);
+		res.headers["Allow"] = "POST";
 		res.writeBody("", "text/plain");
 	});
 
@@ -996,121 +989,6 @@ unittest  // resourceOrigin strips the path from a configured resource identifie
 	assert(resourceOrigin("no-scheme") is null);
 }
 
-/// Decide how to answer an HTTP GET to the MCP endpoint
-/// (basic/transports §Listening for Messages from the Server): the server "MUST
-/// either return Content-Type: text/event-stream in response to this HTTP GET,
-/// or else return HTTP 405 Method Not Allowed".
-///
-/// Returns true when the GET should open a standalone server->client SSE stream,
-/// false when it must be answered with 405. The standalone stream is offered for
-/// the stable revisions (2025-03-26 / 2025-06-18 / 2025-11-25); on 2026-07-28,
-/// which drops the standalone GET stream in favour of POST-response SSE, GET ->
-/// 405 is the correct answer.
-bool getOpensSseStream(ProtocolVersion negotiated) @safe
-{
-	return !negotiated.isModern;
-}
-
-unittest  // stable revisions open the GET SSE stream; 2026-07-28 does not
-{
-	assert(getOpensSseStream(ProtocolVersion.v2025_11_25));
-	assert(getOpensSseStream(ProtocolVersion.v2025_06_18));
-	assert(getOpensSseStream(ProtocolVersion.v2025_03_26));
-	assert(!getOpensSseStream(ProtocolVersion.v2026_07_28));
-}
-
-/// Decide how to answer an HTTP DELETE to the MCP endpoint
-/// (basic/transports §Session Management / §Backward Compatibility). The stable
-/// revisions (2025-03-26 / 2025-06-18 / 2025-11-25) carry protocol-level sessions
-/// a client tears down via DELETE + `Mcp-Session-Id`. The modern removed
-/// protocol-level sessions ("Removal of protocol-level sessions"), so there is
-/// nothing to terminate: a modern-negotiated server "SHOULD respond as follows:
-/// HTTP GET or DELETE to the MCP endpoint: respond with 405 Method Not Allowed."
-///
-/// Returns true when DELETE should drive session termination (stable revisions),
-/// false when it must be answered with 405 (2026-07-28) — mirroring the version
-/// gate `getOpensSseStream` already applies to GET.
-bool deleteTerminatesSession(ProtocolVersion negotiated) @safe
-{
-	return !negotiated.isModern;
-}
-
-unittest  // stable revisions terminate sessions on DELETE; the modern answers 405
-{
-	assert(deleteTerminatesSession(ProtocolVersion.v2025_11_25));
-	assert(deleteTerminatesSession(ProtocolVersion.v2025_06_18));
-	assert(deleteTerminatesSession(ProtocolVersion.v2025_03_26));
-	assert(!deleteTerminatesSession(ProtocolVersion.v2026_07_28));
-}
-
-/// Decide whether protocol-level sessions apply to a POST request
-/// (basic/transports §Backward Compatibility / §Earlier Streamable HTTP
-/// Revisions). The stable revisions (2025-03-26 / 2025-06-18 / 2025-11-25) carry
-/// protocol-level sessions: the server mints an `Mcp-Session-Id` on the
-/// `InitializeResult` and requires the client to echo it on every later request.
-/// The modern removed protocol-level sessions (revision 2026-07-28: "Removal of
-/// protocol-level sessions"), so a modern-only server "SHOULD respond as follows:
-/// ... An `Mcp-Session-Id` header on a request: ignore it, and do not mint or echo
-/// session IDs."
-///
-/// Returns true when POST session minting/requiring applies (stable revisions),
-/// false when the server must neither mint nor require a session id (2026-07-28) —
-/// mirroring the version gates `getOpensSseStream` (GET) and
-/// `deleteTerminatesSession` (DELETE) already apply.
-bool sessionsApply(ProtocolVersion negotiated) @safe
-{
-	return !negotiated.isModern;
-}
-
-unittest  // stable revisions mint/require Mcp-Session-Id on POST; 2026-07-28 does not
-{
-	assert(sessionsApply(ProtocolVersion.v2025_11_25));
-	assert(sessionsApply(ProtocolVersion.v2025_06_18));
-	assert(sessionsApply(ProtocolVersion.v2025_03_26));
-	assert(!sessionsApply(ProtocolVersion.v2026_07_28));
-}
-
-/// The value of the `Allow` header a 405 Method Not Allowed response must carry
-/// at the MCP endpoint. Per RFC 9110 §10.2.1 the `Allow` header MUST enumerate
-/// the set of methods the resource actually supports. On the stable revisions
-/// (2025-03-26 / 2025-06-18 / 2025-11-25) the single MCP endpoint "supports both
-/// POST and GET methods" (basic/transports §Streamable HTTP) — the standalone
-/// server->client SSE stream is mounted on GET (getOpensSseStream is true) — so a
-/// 405 (e.g. to a DELETE the server does not honour) MUST advertise `GET, POST`.
-/// On the modern the standalone GET stream and protocol-level DELETE are both
-/// dropped, leaving POST as the only supported method, so the header is `POST`.
-///
-/// The GET stream is, however, only actually mounted on a stateful server: a
-/// stateless server answers GET with 405 `Allow: POST` (handleGet) regardless of
-/// version. `getSupported` carries that mode gate so the DELETE 405 cannot
-/// advertise a GET the same endpoint provably rejects with its own 405.
-string allowedMethodsHeader(ProtocolVersion negotiated, bool getSupported = true) @safe
-{
-	return (getSupported && getOpensSseStream(negotiated)) ? "GET, POST" : "POST";
-}
-
-unittest  // 405 Allow header enumerates every supported method (RFC 9110 §10.2.1)
-{
-	// Stable revisions mount both GET (standalone SSE stream) and POST on the MCP
-	// endpoint, so a 405 there MUST advertise both — not just POST.
-	assert(allowedMethodsHeader(ProtocolVersion.v2025_11_25) == "GET, POST");
-	assert(allowedMethodsHeader(ProtocolVersion.v2025_06_18) == "GET, POST");
-	assert(allowedMethodsHeader(ProtocolVersion.v2025_03_26) == "GET, POST");
-	// 2026-07-28 drops the standalone GET stream and protocol-level DELETE, so POST
-	// is the only supported method and the 405 advertises only POST.
-	assert(allowedMethodsHeader(ProtocolVersion.v2026_07_28) == "POST");
-}
-
-unittest  // a stateless server (no GET stream) advertises only POST, matching its own GET 405
-{
-	// handleGet answers a stateless GET with 405 Allow: POST, so the DELETE 405 on
-	// the same endpoint MUST NOT advertise GET — even on a stable revision.
-	assert(allowedMethodsHeader(ProtocolVersion.v2025_11_25, false) == "POST");
-	assert(allowedMethodsHeader(ProtocolVersion.v2025_06_18, false) == "POST");
-	assert(allowedMethodsHeader(ProtocolVersion.v2025_03_26, false) == "POST");
-	assert(allowedMethodsHeader(ProtocolVersion.v2026_07_28, false) == "POST");
-}
-
 /// Whether the given `Accept` request-header value admits a `text/event-stream`
 /// response. The standalone GET stream the MCP endpoint opens is always an SSE
 /// stream, so a client whose `Accept` provably excludes that media type cannot
@@ -1263,9 +1141,9 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// The GET that opens the standalone stream is a subsequent HTTP request and
 	// is subject to the same rule as the POST path: an invalid or unsupported
 	// MCP-Protocol-Version MUST be answered with 400 Bad Request rather than a
-	// 200 text/event-stream or a 405. This precedes the mode/getOpensSseStream
-	// gate so a stateless or modern-negotiated server still rejects a bad version
-	// with 400 rather than masking it behind a 405.
+	// 200 text/event-stream or a 405. This precedes the stateless 405 gate so a
+	// stateless server still rejects a bad version with 400 rather than masking
+	// it behind a 405.
 	if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion,
 			""), server.servedVersions))
 	{
@@ -1278,21 +1156,15 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// push channel — shared state correlating more than one HTTP call. A stateless
 	// server keeps no such state, so it MUST answer 405 (no unsolicited push
 	// without a session) regardless of the negotiated version. Only a stateful
-	// server (sessions keyed on Mcp-Session-Id) opens the stream.
-	//
-	// Per the transport: the server MUST either open a text/event-stream or
-	// answer 405. 2026-07-28 drops the standalone GET stream (server->client
-	// traffic rides the POST-response SSE), so it keeps the 405 alternative.
-	if (server.mode != ServerMode.stateful || !getOpensSseStream(server.negotiatedVersion))
+	// server (sessions keyed on Mcp-Session-Id) opens the stream. A stateful
+	// server never speaks 2026-07-28 (which drops the GET stream): the version
+	// gate above already refused it.
+	if (server.mode != ServerMode.stateful)
 	{
 		res.statusCode = HTTPStatus.methodNotAllowed;
 		res.headers["Allow"] = "POST";
-		// A stateless server has no session to anchor the unsolicited push stream;
-		// name the remedy. The modern (stateful or not) simply has no standalone GET
-		// stream, so its 405 stays bodiless.
-		res.writeBody(server.mode != ServerMode.stateful
-				? "The standalone GET SSE stream requires a stateful server;"
-				~ " construct it with McpServer.stateful()." : "", "text/plain");
+		res.writeBody("The standalone GET SSE stream requires a stateful server;"
+				~ " construct it with McpServer.stateful().", "text/plain");
 		return;
 	}
 
@@ -1344,9 +1216,8 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// Open a long-lived SSE stream wired to the server-push channel, so the
 	// server can deliver unsolicited notifications/requests outside any POST.
 	res.contentType = "text/event-stream";
-	// The standalone GET stream is offered only on the stable revisions
-	// (getOpensSseStream gated above); the X-Accel-Buffering: no SHOULD is a
-	// modern-only rule, so it is not emitted here.
+	// The standalone GET stream is offered only on the stable revisions; the
+	// X-Accel-Buffering: no SHOULD is a modern-only rule, so it is not emitted here.
 	applySseStreamHeaders(res, false);
 
 	auto writeFrame = sseFrameWriter(res);
@@ -1355,8 +1226,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// if the reconnecting client supplied the `Last-Event-ID` header, hand it to
 	// the channel so it resumes the disconnected stream — replaying the events
 	// emitted after that id on the same stream ordinal — instead of opening a fresh
-	// one. The header is honoured only on the stable revisions that mount the GET
-	// stream (gated by getOpensSseStream above); the modern never reaches here.
+	// one. Only the stable revisions reach here, all of which mount the GET stream.
 	const lastEventId = req.headers.get("Last-Event-ID", "");
 	const listenerId = push.addListener((string frame) @safe {
 		writeFrame(frame);
@@ -1381,7 +1251,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// after opening) when configured, so the client has cached the reconnect
 	// delay before any server-initiated close. Version-gated to 2025-11-25 only,
 	// so other revisions' wire output is unchanged.
-	if (reconnectDelayMs > 0 && sendsRetryOnClose(server.negotiatedVersion))
+	if (reconnectDelayMs > 0 && getConn !is null && sendsRetryOnClose(getConn.negotiated))
 	{
 		try
 			writeFrame(formatRetryEvent(reconnectDelayMs));
@@ -1905,7 +1775,7 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 	// `initialize` (which receives a freshly-minted Mcp-Session-Id); every
 	// later request MUST carry that id (400 when absent, 404 when unknown or
 	// terminated). The id is also issued for the InitializeResult below.
-	if (sessions !is null && sessionsApply(server.negotiatedVersion))
+	if (sessions !is null)
 	{
 		const isInit = !input.isBatch && input.messages.length == 1
 			&& input.messages[0].method == "initialize";
@@ -1932,8 +1802,7 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 	// token, in which case bare-id cancellation is unscoped across connections
 	// (documented in `mcp.transport.session` -- stateful sessions are required for
 	// cross-client cancellation isolation).
-	const connToken = (sessions !is null && sessionsApply(server.negotiatedVersion)) ? req
-		.headers.get(SessionHeader, "") : "";
+	const connToken = (sessions !is null) ? req.headers.get(SessionHeader, "") : "";
 
 	// JSON-RPC batching (an array body) was introduced in 2025-03-26 and removed
 	// in every later revision: 2025-06-18 / 2025-11-25 / modern all require the
@@ -1962,7 +1831,7 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		// (`connToken`).
 		ConnectionState reqState = postState(server, sessions, "", connToken,
 				req.headers.get(HttpHeader.protocolVersion, ""), Json.undefined);
-		const ver = (reqState !is null) ? reqState.negotiated : server.negotiatedVersion;
+		const ver = (reqState !is null) ? reqState.negotiated : latestLegacy;
 		if (!streamableBatchAllowed(ver))
 		{
 			// Single-message-only: reject the array body with -32600 on HTTP 400.
@@ -2033,8 +1902,8 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		// `notifications/cancelled` flips the cancellation token in the SAME
 		// per-session in-flight registry the request side used. Stateful only —
 		// stateless has no cross-POST correlation, so the state is null there.
-		ConnectionState noteState = (sessions !is null
-				&& sessionsApply(server.negotiatedVersion)) ? sessions.stateFor(connToken) : null;
+		ConnectionState noteState = sessions !is null
+			? sessions.stateFor(connToken) : null;
 		server.handle(msg, new HttpScopedContext(connToken, noteState));
 		res.statusCode = HTTPStatus.accepted;
 		res.writeBody("", "text/plain");
@@ -2069,8 +1938,7 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		// the same shape as every other error path in handlePost -- instead of
 		// letting it escape to vibe's generic error page.
 		string mintedSessionId;
-		if (sessions !is null && sessionsApply(server.negotiatedVersion)
-				&& msg.method == "initialize")
+		if (sessions !is null && msg.method == "initialize")
 		{
 			try
 				mintedSessionId = sessions.create(principalOf(token));
@@ -2165,11 +2033,6 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 			handleEventsStream(server, msg, res, token.valid ? token.subject : "");
 			return;
 		}
-		// The effective version for this POST decides whether a server-initiated
-		// SSE stream must lead with the 2025-11-25 priming event (event id + empty
-		// data field; basic/transports §Sending Messages item 6).
-		const effVersion = effectivePostVersion(req.headers.get(HttpHeader.protocolVersion,
-				""), server.negotiatedVersion);
 		// Resolve THIS request's per-connection state and hand it to
 		// the context so the server core dispatches against it (never the single
 		// bound `activeConnection`). Stateful HTTP -> the SessionManager-owned state
@@ -2178,6 +2041,10 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		// seeded from the effective version + `_meta`, retained nowhere.
 		ConnectionState reqState = postState(server, sessions, mintedSessionId,
 				connToken, req.headers.get(HttpHeader.protocolVersion, ""), msg.params);
+		// This request's version (its session's, or the stateless request's own)
+		// decides whether a server-initiated SSE stream leads with the
+		// 2025-11-25 priming event (basic/transports §Sending Messages item 6).
+		const effVersion = reqState !is null ? reqState.negotiated : latestLegacy;
 		// Whether this POST's Accept admits text/event-stream. When it provably does
 		// not, progress/log notifications are dropped and a server-initiated request
 		// is refused inside the context and surfaced as 406 below, rather than
@@ -3517,8 +3384,8 @@ unittest  // the standalone GET stream is version-gated like a POST: bad version
 	// invalid/unsupported MCP-Protocol-Version MUST yield 400 Bad Request rather
 	// than opening a 200 text/event-stream or a 405. handleGet runs
 	// postProtocolVersionGate (the same gate every POST kind runs) ahead of the
-	// mode/getOpensSseStream 405 gate and before setting Content-Type, so the
-	// rejecting McpException maps to HTTP 400 even for a stateless/modern server.
+	// stateless 405 gate and before setting Content-Type, so the rejecting
+	// McpException maps to HTTP 400 even for a stateless server.
 	auto bad = postProtocolVersionGate("1.0.0", supportedVersions);
 	assert(bad !is null, "an invalid version on the standalone GET must be rejected");
 	assert(bad.code == ErrorCode.unsupportedProtocolVersion);
@@ -3536,7 +3403,7 @@ unittest  // DELETE is version-gated like POST/GET: bad version -> 400, not 204/
 	// MCP-Protocol-Version MUST yield 400 Bad Request (a null-id JSON-RPC error)
 	// rather than proceeding to a 204 terminate or a 405. The DELETE route runs
 	// postProtocolVersionGate after the origin/auth guards and before the
-	// deleteTerminatesSession branch, so the rejecting McpException maps to 400.
+	// session-termination branch, so the rejecting McpException maps to 400.
 	auto bad = postProtocolVersionGate("1.0.0", supportedVersions);
 	assert(bad !is null, "an invalid version on a DELETE must be rejected");
 	assert(bad.code == ErrorCode.unsupportedProtocolVersion);
@@ -3588,7 +3455,7 @@ private ProtocolVersion effectivePostVersion(string protoHeader, ProtocolVersion
 private ConnectionState postState(McpServer server, SessionManager sessions,
 		string mintedSessionId, string connToken, string protoHeader, Json params) @safe
 {
-	if (sessions !is null && sessionsApply(server.negotiatedVersion))
+	if (sessions !is null)
 	{
 		if (mintedSessionId.length)
 			return sessions.stateFor(mintedSessionId, false);
@@ -3896,6 +3763,62 @@ unittest  // a successful stateful initialize commits the Mcp-Session-Id header
 	// The session id is committed only on a successful InitializeResult.
 	assert(SessionHeader in res.headers, "a successful initialize MUST carry Mcp-Session-Id");
 	assert(res.headers[SessionHeader].length > 0);
+}
+
+version (unittest) private string streamedToolCall(string initVersion, string[string] callHeaders) @safe
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	Tool descriptor;
+	descriptor.name = "progress";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		ctx.reportProgress(1);
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto initRes = createTestHTTPServerResponse(createMemoryOutputStream(),
+			null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(initializeBody(initVersion),
+			["Accept": "application/json, text/event-stream"]), initRes);
+	callHeaders["Accept"] = "application/json, text/event-stream";
+	callHeaders[SessionHeader] = initRes.headers[SessionHeader];
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(`{"jsonrpc":"2.0","id":2,"method":"tools/call",`
+			~ `"params":{"name":"progress","arguments":{},"_meta":{"progressToken":"p"}}}`,
+			callHeaders), res);
+	return () @trusted { return cast(string) sink.data.idup; }();
+}
+
+unittest  // a 2025-03-26 session's streamed POST carries no priming event
+{
+	import std.algorithm : canFind;
+
+	string[string] headers;
+	const body_ = streamedToolCall("2025-03-26", headers);
+	assert(body_.canFind("notifications/progress"));
+	assert(!body_.canFind("data: \n\n"), "priming is a 2025-11-25-only event");
+}
+
+unittest  // a 2025-11-25 session's streamed POST leads with the priming event
+{
+	import std.algorithm : startsWith;
+	import std.string : indexOf;
+
+	const body_ = streamedToolCall("2025-11-25", [
+		"MCP-Protocol-Version": "2025-11-25"
+	]);
+	assert(body_.startsWith("id: "));
+	assert(body_.startsWith(body_[0 .. body_.indexOf("\n")] ~ "\ndata: \n\n"));
 }
 
 unittest  // the standalone GET stream writes its first bytes as soon as it opens

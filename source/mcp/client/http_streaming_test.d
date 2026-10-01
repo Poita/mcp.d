@@ -126,12 +126,12 @@ unittest
 // initialize, the client opens a standalone GET SSE stream; a server-initiated
 // broadcast notification (`notifications/tools/list_changed`) must arrive on that
 // stream and reach the client's inbound `onNotification` handler. This stream is a
-// stable-revision feature gated by `getOpensSseStream` (2025-03-26 / 2025-06-18 /
-// 2025-11-25) and requires a stateful server; 2026-07-28 removed it.
+// stable-revision feature (2025-03-26 / 2025-06-18 / 2025-11-25) and requires a
+// stateful server; 2026-07-28 removed it.
 unittest
 {
-	// `getOpensSseStream` requires a stateful server: a stateless one answers the
-	// standalone GET with 405, so there is no stream to push onto.
+	// A stateless server answers the standalone GET with 405, so there is no
+	// stream to push onto.
 	auto server = McpServer.stateful("server-stream-e2e", "1.0.0");
 
 	auto router = new URLRouter;
