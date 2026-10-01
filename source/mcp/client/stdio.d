@@ -7,8 +7,9 @@ import vibe.data.json : Json, parseJsonString;
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.client.transport : ClientTransport, ClientProtocol;
-import mcp.client.subscription : SubscriptionStream;
+import mcp.client.subscription : SubscriptionStream, ListenGate;
 import mcp.transport.duplex : DuplexChannel, defaultMaxLineBytes;
+import mcp.protocol.events : subscriptionIdMetaKey;
 
 @safe:
 
@@ -47,6 +48,10 @@ final class StdioClientTransport : ClientTransport
 	private DuplexChannel channel;
 	private bool started;
 	private bool closed_;
+	// Listen streams awaiting their leading frame, keyed by the listen request id
+	// (rendered as JSON): the action run when a notification stamped with that
+	// subscriptionId arrives.
+	private void delegate() @safe nothrow[string] pendingListens_;
 	// Counts how many times the child-shutdown sequence ran; exists so the
 	// idempotency of `close()` is directly observable. The sequence must run at
 	// most once per transport.
@@ -125,6 +130,7 @@ final class StdioClientTransport : ClientTransport
 	{
 		if (channel is null)
 			channel = new DuplexChannel(readLine, writeLine, (Message m) @safe {
+				noteListenFrame(m);
 				if (inbound !is null)
 					inbound(m);
 			});
@@ -147,14 +153,18 @@ final class StdioClientTransport : ClientTransport
 	/// basic/utilities/subscriptions: "On stdio ... clients MUST use this field to
 	/// correlate notifications"). The returned handle's `cancel()`/`close()` ends
 	/// the subscription by sending `notifications/cancelled` referencing the listen
-	/// request id, per the modern stdio cancellation rule.
+	/// request id, per the modern stdio cancellation rule. The server answers the
+	/// listen request only when the stream ends: an error reply before the leading
+	/// frame is thrown from here, and a later reply ends the handle (`ended`,
+	/// `error`).
 	SubscriptionStream openListen(Json message) @safe
 	{
-		// Write the listen request on the single channel.
-		send(message);
+		import vibe.core.core : runTask;
 
 		// The listen request id is the subscriptionId; cancel() references it.
 		Json listenId = ("id" in message) ? message["id"] : Json(null);
+		const key = listenId.toString();
+		auto ch = chan();
 		auto cancelled = () @trusted { return new shared bool(false); }();
 		void delegate() @safe nothrow onCancel = () @safe nothrow{
 			try
@@ -162,12 +172,65 @@ final class StdioClientTransport : ClientTransport
 				Json params = Json.emptyObject;
 				params["requestId"] = listenId;
 				sendOneway(makeNotification("notifications/cancelled", params));
+				// Release the task awaiting the listen reply; the server sends none
+				// for a cancelled stream.
+				if (listenId.type == Json.Type.int_)
+					ch.abort(listenId.get!long, internalError("subscription cancelled"));
 			}
 			catch (Exception)
 			{
 			}
 		};
-		return new SubscriptionStream(cancelled, onCancel);
+		auto stream = new SubscriptionStream(cancelled, onCancel);
+
+		// Await the listen request's reply on a background task: the server
+		// answers it only when the stream ends, with an error when it refuses or
+		// fails the stream. Return once the stream's leading frame (stamped with
+		// the listen id) arrives, or it ends first — then throw its error. The wait
+		// is bounded so a server that never sends a leading frame degrades to
+		// returning rather than hanging.
+		auto gate = new ListenGate;
+		pendingListens_[key] = () @safe nothrow{ gate.signal(true); };
+		scope (exit)
+			pendingListens_.remove(key);
+		if (listenId.type == Json.Type.int_)
+		{
+			runTask(() nothrow{
+				McpException failure;
+				try
+					ch.deliver(message, listenId.get!long, Duration.max);
+				catch (McpException e)
+					failure = e;
+				catch (Exception e)
+					failure = internalError(e.msg);
+				stream.finish(failure);
+				gate.signal(false);
+			});
+		}
+		else
+			send(message);
+		if (!gate.wait(10.seconds) && stream.error !is null)
+			throw stream.error;
+		return stream;
+	}
+
+	/// Mark the listen stream a notification belongs to (by its subscriptionId)
+	/// as established, waking the `openListen` awaiting its leading frame.
+	private void noteListenFrame(Message m) @safe
+	{
+		if (pendingListens_.length == 0 || m.kind != MessageKind.notification
+				|| m.params.type != Json.Type.object || "_meta" !in m.params)
+			return;
+		auto meta = m.params["_meta"];
+		if (meta.type != Json.Type.object || subscriptionIdMetaKey !in meta)
+			return;
+		const key = meta[subscriptionIdMetaKey].toString();
+		if (auto action = key in pendingListens_)
+		{
+			auto run = *action;
+			pendingListens_.remove(key);
+			run();
+		}
 	}
 
 	/// Send a request and return its result (or throw `McpException`). The channel
@@ -602,18 +665,21 @@ unittest  // stdio openListen writes the subscriptions/listen request to the ser
 	// Per 2026-07-28 basic/utilities/subscriptions, a stdio client opens a subscription
 	// by sending a real `subscriptions/listen` request on the single stdin channel.
 	string[] toServer;
+	auto toClient = new TestLines;
 
-	inLoop(() @safe {
-		auto client = McpClient.stdio(() @safe { return cast(string) null; }, (string s) @safe {
+	const failure = inLoopCapturing(() @safe {
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string s) @safe {
 			toServer ~= s;
+			acknowledgeListen(toClient, s);
 		});
 		client.enableModern();
 
 		SubscriptionFilter filter = {toolsListChanged: true};
 		client.subscriptionsListen(filter);
-		foreach (_; 0 .. 4)
-			yield();
+		toClient.closeEnd();
 	});
+
+	assert(failure.length == 0, failure);
 
 	assert(toServer.length == 1, "listen request must be written to the server");
 	auto m = parseJsonString(toServer[0]);
@@ -625,17 +691,17 @@ unittest  // stdio openListen writes the subscriptions/listen request to the ser
 unittest  // stdio listen cancel() emits notifications/cancelled referencing the listen request id
 {
 	string[] toServer;
+	auto toClient = new TestLines;
 
-	inLoop(() @safe {
-		auto client = McpClient.stdio(() @safe { return cast(string) null; }, (string s) @safe {
+	const failure = inLoopCapturing(() @safe {
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string s) @safe {
 			toServer ~= s;
+			acknowledgeListen(toClient, s);
 		});
 		client.enableModern();
 
 		SubscriptionFilter filter = {resourcesListChanged: true};
 		auto stream = client.subscriptionsListen(filter);
-		foreach (_; 0 .. 4)
-			yield();
 
 		auto listenMsg = parseJsonString(toServer[0]);
 		auto listenId = listenMsg["id"].get!long;
@@ -657,7 +723,83 @@ unittest  // stdio listen cancel() emits notifications/cancelled referencing the
 		foreach (_; 0 .. 2)
 			yield();
 		assert(toServer.length == 1);
+		toClient.closeEnd();
 	});
+	assert(failure.length == 0, failure);
+}
+
+version (unittest)
+{
+	/// Answer a `subscriptions/listen` request line with the leading
+	/// `notifications/subscriptions/acknowledged` a server sends when it opens
+	/// the stream, stamped with the listen id; other lines are ignored.
+	private void acknowledgeListen(TestLines toClient, string line) @safe
+	{
+		import mcp.protocol.events : subscriptionIdMetaKey;
+
+		auto m = parseJsonString(line);
+		if ("method" !in m || m["method"].get!string != "subscriptions/listen")
+			return;
+		Json meta = Json.emptyObject;
+		meta[subscriptionIdMetaKey] = m["id"];
+		Json params = Json.emptyObject;
+		params["notifications"] = Json.emptyObject;
+		params["_meta"] = meta;
+		toClient.put(makeNotification("notifications/subscriptions/acknowledged",
+				params).toString());
+	}
+}
+
+unittest  // a stdio subscriptions/listen answered with an error reply fails subscriptionsListen
+{
+	auto toClient = new TestLines;
+	int code;
+	const failure = inLoopCapturing(() @safe {
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string s) @safe {
+			auto m = parseJsonString(s);
+			if ("id" in m)
+				toClient.put(makeErrorResponse(m["id"],
+				new McpException(-32601, "no listen")).toString());
+		});
+		client.enableModern();
+		SubscriptionFilter filter = {toolsListChanged: true};
+		try
+			client.subscriptionsListen(filter);
+		catch (McpException e)
+			code = e.code;
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(code == -32601, "an error reply to the listen request must fail subscriptionsListen");
+}
+
+unittest  // a stdio listen stream the server ends with an error records it on the handle
+{
+	auto toClient = new TestLines;
+	McpException streamError;
+	bool ended;
+	const failure = inLoopCapturing(() @safe {
+		long listenId;
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string s) @safe {
+			acknowledgeListen(toClient, s);
+			auto m = parseJsonString(s);
+			if ("id" in m)
+				listenId = m["id"].get!long;
+		});
+		client.enableModern();
+		SubscriptionFilter filter = {toolsListChanged: true};
+		auto stream = client.subscriptionsListen(filter);
+		toClient.put(makeErrorResponse(Json(listenId), new McpException(-32603,
+			"gone")).toString());
+		foreach (_; 0 .. 8)
+			yield();
+		ended = stream.ended;
+		streamError = stream.error;
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(ended, "the server's error reply must end the stream");
+	assert(streamError !is null && streamError.code == -32603);
 }
 
 version (Posix) unittest  // close() escalates to SIGTERM when the child ignores stdin EOF

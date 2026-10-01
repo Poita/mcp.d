@@ -2,6 +2,8 @@ module mcp.client.subscription;
 
 import core.atomic : atomicLoad, cas;
 
+import mcp.protocol.errors : McpException;
+
 /// The set of change-notification types a modern client opts into when opening a
 /// `subscriptions/listen` stream (2026-07-28 basic/utilities/subscriptions). The three
 /// list-changed booleans request `notifications/tools|prompts|resources/list_changed`;
@@ -25,10 +27,16 @@ struct SubscriptionFilter
 /// `notifications/subscriptions/acknowledged` and every subsequent opted-in
 /// change notification to the client's `onNotification` (and `onProgress`).
 /// Call `cancel()` (alias `close()`) to stop listening; the background task then
-/// closes the connection and terminates.
+/// closes the connection and terminates. When the server ends the stream instead —
+/// closing it, answering the listen request, or failing it with an error — `ended`
+/// turns true and `error` carries the failure, if any.
 final class SubscriptionStream
 {
 	private shared(bool)* cancelled_;
+	// Set by the transport when the server ends the stream (the stream's reader
+	// runs on the owning thread's event loop, so no synchronization is needed).
+	private bool finished_;
+	private McpException error_;
 	// Optional transport-supplied action run exactly once on the first cancel().
 	// The stdio transport uses it to emit `notifications/cancelled` referencing
 	// the listen request id (2026-07-28 basic/utilities/subscriptions Cancellation,
@@ -85,6 +93,101 @@ final class SubscriptionStream
 	bool cancelled() const @safe nothrow @nogc
 	{
 		return cancelled_ !is null && atomicLoad(*cancelled_);
+	}
+
+	/// Whether the stream is over: cancelled locally, or ended by the server.
+	bool ended() const @safe nothrow @nogc
+	{
+		return finished_ || cancelled;
+	}
+
+	/// The error the server ended the stream with (an HTTP or JSON-RPC error
+	/// response to the listen request, or a broken connection); null while the
+	/// stream is open, after a clean end, or after a local cancel.
+	McpException error() @safe nothrow @nogc
+	{
+		return error_;
+	}
+
+	/// Record that the server ended the stream, with `error` when it failed. Only
+	/// the first end is kept, and an end after a local cancel is ignored.
+	package void finish(McpException error = null) @safe nothrow @nogc
+	{
+		if (finished_ || cancelled)
+			return;
+		finished_ = true;
+		error_ = error;
+	}
+}
+
+unittest  // finish records the server's end and its error once
+{
+	auto s = new SubscriptionStream(() @trusted { return new shared bool(false); }());
+	assert(!s.ended && s.error is null);
+	auto e = new McpException(-32601, "no listen");
+	s.finish(e);
+	assert(s.ended && s.error is e && !s.cancelled);
+	s.finish(null);
+	assert(s.error is e, "only the first end is kept");
+}
+
+unittest  // an end reported after a local cancel is ignored
+{
+	auto s = new SubscriptionStream(() @trusted { return new shared bool(false); }());
+	s.cancel();
+	s.finish(new McpException(-32603, "aborted"));
+	assert(s.ended && s.error is null);
+}
+
+/// The rendezvous between a transport's `openListen` and the background task
+/// reading the stream it opened: the task signals once the stream's leading frame
+/// arrives or the stream ends first, and `openListen` waits (bounded) for that.
+/// A heap object so the event outlives an `openListen` that has already returned.
+package final class ListenGate
+{
+	import core.time : Duration;
+	import vibe.core.sync : LocalManualEvent, createManualEvent;
+
+	private LocalManualEvent event_;
+	private int emitCount_;
+	private bool waiting_ = true;
+	private bool established_;
+
+	this() @safe
+	{
+		event_ = createManualEvent();
+		emitCount_ = event_.emitCount;
+	}
+
+	/// Signal the waiter: `frame` is true when the stream's leading frame arrived,
+	/// false when the stream ended before one. Only the first signal counts.
+	void signal(bool frame) @safe nothrow
+	{
+		if (!waiting_)
+			return;
+		waiting_ = false;
+		established_ = frame;
+		try
+			event_.emit();
+		catch (Exception)
+		{
+		}
+	}
+
+	/// Wait up to `timeout` for `signal`, returning whether the leading frame
+	/// arrived. Later signals are ignored.
+	bool wait(Duration timeout) @safe
+	{
+		if (waiting_)
+			() @trusted {
+			try
+				event_.waitUninterruptible(timeout, emitCount_);
+			catch (Exception)
+			{
+			}
+		}();
+		waiting_ = false;
+		return established_;
 	}
 }
 

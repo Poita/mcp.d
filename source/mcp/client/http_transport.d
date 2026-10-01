@@ -19,7 +19,7 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.mrtr : isHeaderValueUnsafe;
 import mcp.client.transport : ClientTransport, ClientProtocol;
-import mcp.client.subscription : SubscriptionStream;
+import mcp.client.subscription : SubscriptionStream, ListenGate;
 
 /// A request rejected at the HTTP layer: the server answered with a non-success
 /// status and no JSON-RPC response for the request. `status` is the HTTP status
@@ -1518,49 +1518,41 @@ final class HttpClientTransport : ClientTransport
 		// occurrence published immediately after this call cannot race ahead of the
 		// registration and be missed. Capture the emit count before spawning the
 		// reader so an establishment that lands before we wait is not lost. The wait
-		// is bounded: a server that never sends a leading frame (or a connect
-		// failure, signalled on the reader's exit) degrades to returning rather than
-		// hanging.
-		auto established = createManualEvent();
-		const ec = established.emitCount;
-		auto signal = () @safe nothrow{
-			try
-				established.emit();
-			catch (Exception)
-			{
-			}
-		};
+		// is bounded: a server that never sends a leading frame degrades to
+		// returning rather than hanging. A stream the server refuses before any
+		// frame (HTTP error, JSON-RPC error, connect failure) ends with an error,
+		// which is thrown here.
+		auto gate = new ListenGate;
 		runTask(() nothrow{
 			try
-				runListenStream(message, cancelled, slot, signal);
+				runListenStream(message, cancelled, slot, stream, &gate.signal);
 			catch (Exception)
 			{
 			}
 		});
-		() @trusted {
-			if (*cancelled)
-				return;
-			try
-				established.waitUninterruptible(10.seconds, ec);
-			catch (Exception)
-			{
-			}
-		}();
+		if (!gate.wait(10.seconds) && stream.error !is null)
+			throw stream.error;
 		return stream;
 	}
 
-	/// Drive a `subscriptions/listen` stream over a raw TCP connection: POST the
-	/// listen request, read the server's long-lived `text/event-stream` response,
-	/// and dispatch every inbound message (the leading
-	/// `notifications/subscriptions/acknowledged` and subsequent change
+	/// Drive a `subscriptions/listen` (or `events/stream`) stream over a raw TCP
+	/// connection: POST the request, read the server's long-lived
+	/// `text/event-stream` response, and dispatch every inbound message (the
+	/// leading `notifications/subscriptions/acknowledged` and subsequent change
 	/// notifications) via the inbound handler. The loop checks `*cancelled`
 	/// between reads and on each SSE event, closing the connection promptly once
-	/// the caller cancels. A raw TCP POST is used (rather than vibe's pooled
-	/// `requestHTTP`) for the same reason as `runServerStream`: a long-lived,
-	/// idle-then-active SSE body is not reliably surfaced by the pooled client.
-	private void runListenStream(Json message, shared(bool)* cancelled,
-			ListenSocketSlot slot, void delegate() @safe nothrow onEstablished = null) @safe
+	/// the caller cancels. When the server ends the stream — closing it, refusing
+	/// the POST with an HTTP or JSON-RPC error, or answering the request — the end
+	/// and any error are recorded on `stream`. A raw TCP POST is used (rather than
+	/// vibe's pooled `requestHTTP`) for the same reason as `runServerStream`: a
+	/// long-lived, idle-then-active SSE body is not reliably surfaced by the pooled
+	/// client. `onEstablished(true)` fires on the first dispatched frame;
+	/// `onEstablished(false)` fires if the stream ends before one.
+	private void runListenStream(Json message, shared(bool)* cancelled, ListenSocketSlot slot,
+			SubscriptionStream stream, void delegate(bool frame) @safe nothrow onEstablished) @safe
 	{
+		import std.string : indexOf, startsWith, toLower, strip;
+
 		const ep = parseHttpEndpoint(url);
 		// Resolve + pin the user-configured endpoint host to a numeric address.
 		const pinnedHost = pinnedEndpointHost(ep);
@@ -1569,59 +1561,130 @@ final class HttpClientTransport : ClientTransport
 		auto reqHeaders = requestHeaders(message);
 		const 
 		body = message.toString();
+		const listenId = ("id" in message) ? message["id"] : Json(null);
 
 		auto isCancelled = () @safe => () @trusted { return *cancelled; }();
 
 		// Fire the establishment signal at most once: on the first dispatched frame
 		// (the stream is now confirmed open server-side) and, as a fallback, on any
-		// exit before that frame (connect/head failure) so a waiter in `openListen`
-		// returns promptly instead of blocking the full bound.
+		// exit before that frame so a waiter in `openListen` returns promptly
+		// instead of blocking the full bound.
 		bool established;
-		void markEstablished() @safe nothrow
+		void markEstablished(bool frame) @safe nothrow
 		{
 			if (established)
 				return;
 			established = true;
-			if (onEstablished !is null)
-				onEstablished();
+			onEstablished(frame);
+		}
+
+		McpException failure;
+		// Whether `m` answers the listen request itself, which ends the stream; an
+		// error response records the failure.
+		bool endsStream(Message m) @safe
+		{
+			if (m.kind != MessageKind.response && m.kind != MessageKind.errorResponse)
+				return false;
+			if (m.id != listenId && m.id.type != Json.Type.null_)
+				return false;
+			if (m.kind == MessageKind.errorResponse)
+				failure = errorFrom(m.error);
+			return true;
 		}
 
 		() @trusted {
 			scope (exit)
-				markEstablished();
-			if (*cancelled)
-				return;
-			auto sock = connectTimed(pinnedHost, ep.port);
-			slot.attach(sock);
-			scope (exit)
-				slot.closeSocket();
-			// A cancel() that raced ahead of attach must still tear the socket down.
-			if (*cancelled)
-				return;
-			// Wrap in TLS for https/wss; plaintext is returned unwrapped.
-			auto conn = openClientStream(sock, ep.tls, ep.host);
-			scope (exit)
-				conn.release();
+			{
+				stream.finish(failure);
+				markEstablished(false);
+			}
+			try
+			{
+				if (*cancelled)
+					return;
+				auto sock = connectTimed(pinnedHost, ep.port);
+				slot.attach(sock);
+				scope (exit)
+					slot.closeSocket();
+				// A cancel() that raced ahead of attach must still tear the socket down.
+				if (*cancelled)
+					return;
+				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
+				auto conn = openClientStream(sock, ep.tls, ep.host);
+				scope (exit)
+					conn.release();
 
-			const req = buildHttpRequest("POST", ep.path, ep.host,
-					"text/event-stream", "keep-alive", true, reqHeaders, null, body);
-			conn.write(cast(const(ubyte)[]) req);
+				// One response per connection: `close` lets a non-streamed answer
+				// (an error body) be read to end-of-stream.
+				const req = buildHttpRequest("POST", ep.path, ep.host,
+						"text/event-stream", "close", true, reqHeaders, null, body);
+				conn.write(cast(const(ubyte)[]) req);
 
-			bool chunked;
-			if (!readSseResponseHead(conn, chunked))
-				return;
-
-			// This stream consumes no resumption state; give the decoder its own
-			// throwaway cursor rather than a shared field.
-			SseCursor cursor;
-			readSseBody(conn, chunked, cursor, isCancelled, (string eventType, string data) @safe {
-				markEstablished();
-				try
-					dispatch(Message(parseJsonString(data)));
-				catch (Exception)
+				const status = parseHttpStatus(cast(string) readLine(conn, maxHeaderLineBytes).idup);
+				bool chunked;
+				bool sse;
+				string wwwAuthenticate;
+				foreach (h; readHeaderLines(conn))
 				{
+					const lower = h.toLower;
+					if (lower.startsWith("transfer-encoding:") && lower.indexOf("chunked") >= 0)
+						chunked = true;
+					if (lower.startsWith("content-type:") && lower.indexOf("text/event-stream") >= 0)
+						sse = true;
+					const c = h.indexOf(':');
+					if (c > 0 && h[0 .. c].toLower == "www-authenticate")
+						wwwAuthenticate = h[c + 1 .. $].strip;
 				}
-			});
+				if (status < 200 || status >= 300)
+				{
+					failure = httpStatusError(status, readRemaining(conn,
+							chunked, maxMessageBytes), wwwAuthenticate);
+					return;
+				}
+				if (!sse)
+				{
+					// A plain JSON answer: the server answered the request outright
+					// instead of opening a stream.
+					const b = readRemaining(conn, chunked, maxMessageBytes);
+					try
+					{
+						if (!endsStream(parseMessage(b)))
+							failure = httpStatusError(status, b, wwwAuthenticate);
+					}
+					catch (Exception)
+						failure = httpStatusError(status, b, wwwAuthenticate);
+					return;
+				}
+
+				// This stream consumes no resumption state; give the decoder its own
+				// throwaway cursor rather than a shared field.
+				SseCursor cursor;
+				bool answered;
+				readSseBody(conn, chunked, cursor, () @safe => answered
+						|| isCancelled(), (string eventType, string data) @safe {
+					Message m;
+					try
+						m = Message(parseJsonString(data));
+					catch (Exception)
+						return; // not a JSON-RPC message (keep-alive or comment)
+					if (endsStream(m))
+					{
+						answered = true;
+						return;
+					}
+					markEstablished(true);
+					try
+						dispatch(m);
+					catch (Exception)
+					{
+					}
+				});
+			}
+			catch (Exception e)
+			{
+				if (!isCancelled())
+					failure = internalError("subscription stream failed: " ~ e.msg);
+			}
 		}();
 	}
 
@@ -3929,4 +3992,101 @@ unittest  // a throwing onNotification callback does not fail the request whose 
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(notified);
 	assert(tools == 0);
+}
+
+version (unittest)
+{
+	/// Open a `subscriptions/listen` stream on a modern client against a server
+	/// answering the listen POST through `answer`; returns what `subscriptionsListen`
+	/// threw (null when it returned a stream, which is passed to `onStream`).
+	private Exception listenFailure(void delegate(Json request,
+			HTTPServerResponse res) @safe answer,
+			void delegate(SubscriptionStream) @safe onStream = null)
+	{
+		import mcp.client.client : McpClient;
+		import mcp.client.subscription : SubscriptionFilter;
+
+		Exception thrown;
+		const failure = runAgainstFakeServer(answeringRouter(answer), (string url) @safe {
+			auto client = McpClient.http(url);
+			scope (exit)
+				client.close();
+			client.enableModern();
+			SubscriptionFilter filter = {toolsListChanged: true};
+			SubscriptionStream stream;
+			try
+				stream = client.subscriptionsListen(filter);
+			catch (Exception e)
+				thrown = e;
+			if (stream !is null && onStream !is null)
+				onStream(stream);
+		});
+		assert(failure.length == 0, "scenario failed: " ~ failure);
+		return thrown;
+	}
+}
+
+unittest  // a subscriptions/listen POST refused with an HTTP error fails subscriptionsListen
+{
+	auto e = listenFailure((Json req, HTTPServerResponse res) @safe {
+		auto resp = parseJsonString(
+			`{"jsonrpc":"2.0","error":{"code":-32601,"message":"no listen"}}`);
+		resp["id"] = req["id"];
+		res.statusCode = 400;
+		res.writeBody(resp.toString(), "application/json");
+	});
+	auto h = cast(HttpStatusException) e;
+	assert(h !is null, "a refused listen must throw HttpStatusException");
+	assert(h.status == 400 && h.code == -32601);
+}
+
+unittest  // a subscriptions/listen answered with a JSON-RPC error body fails subscriptionsListen
+{
+	auto e = listenFailure((Json req, HTTPServerResponse res) @safe {
+		auto resp = parseJsonString(
+			`{"jsonrpc":"2.0","error":{"code":-32602,"message":"bad filter"}}`);
+		resp["id"] = req["id"];
+		res.writeBody(resp.toString(), "application/json");
+	});
+	auto m = cast(McpException) e;
+	assert(m !is null, "a JSON-RPC error answer to listen must throw");
+	assert(m.code == -32602);
+}
+
+unittest  // a subscriptions/listen stream whose first event is an error response fails subscriptionsListen
+{
+	auto e = listenFailure((Json req, HTTPServerResponse res) @safe {
+		auto resp = parseJsonString(
+			`{"jsonrpc":"2.0","error":{"code":-32602,"message":"bad filter"}}`);
+		resp["id"] = req["id"];
+		writeSse(res, "data: " ~ resp.toString() ~ "\n\n");
+	});
+	auto m = cast(McpException) e;
+	assert(m !is null, "an error response on the listen stream must throw");
+	assert(m.code == -32602);
+}
+
+unittest  // a listen stream the server fails after acknowledging records the error on the handle
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	McpException streamError;
+	bool ended;
+	auto e = listenFailure((Json req, HTTPServerResponse res) @safe {
+		auto err = parseJsonString(`{"jsonrpc":"2.0","error":{"code":-32603,"message":"gone"}}`);
+		err["id"] = req["id"];
+		writeSse(res,
+			`data: {"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",`
+			~ `"params":{"notifications":{}}}` ~ "\n\n" ~ "data: " ~ err.toString() ~ "\n\n");
+	}, (SubscriptionStream stream) @safe {
+		const until = MonoTime.currTime + 3.seconds;
+		while (!stream.ended && MonoTime.currTime < until)
+			sleep(20.msecs);
+		ended = stream.ended;
+		streamError = stream.error;
+	});
+	assert(e is null, "an acknowledged listen must open");
+	assert(ended, "the server's error must end the stream");
+	assert(streamError !is null && streamError.code == -32603);
 }

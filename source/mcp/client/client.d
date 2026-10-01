@@ -2289,6 +2289,9 @@ final class McpClient : ClientProtocol
 	/// and every subsequent opted-in change notification to `onNotification`
 	/// (and `onProgress` for progress). Returns a `SubscriptionStream` handle;
 	/// call its `cancel()`/`close()` to stop listening and close the stream.
+	/// Throws `McpException` (an `HttpStatusException` for an HTTP error status)
+	/// when the server refuses the stream; a stream the server ends later reports
+	/// it through the handle's `ended`/`error`.
 	///
 	/// Only meaningful for modern servers (call `enableModern`/`connect` first);
 	/// legacy servers do not implement `subscriptions/listen`.
@@ -2354,7 +2357,8 @@ final class McpClient : ClientProtocol
 	/// The SDK demuxes internally by the stream's
 	/// `params._meta["io.modelcontextprotocol/subscriptionId"]`; the client never
 	/// sees raw notifications. `cancel()`/`close()` ends the stream and drops its
-	/// handlers; a `terminated` control also drops them.
+	/// handlers; a `terminated` control also drops them. Throws `McpException`
+	/// when the server refuses the stream, as `subscriptionsListen` does.
 	SubscriptionStream streamEvents(string name, void delegate(EventOccurrence) @safe onEvent,
 			void delegate(EventControl) @safe onControl = null, Json arguments = Json.emptyObject,
 			Nullable!string cursor = Nullable!string.init,
@@ -2375,7 +2379,14 @@ final class McpClient : ClientProtocol
 		const key = id.to!string;
 		// Register before opening so an occurrence racing the open is routable.
 		eventStreams_[key] = EventStreamHandlers(onEvent, onControl);
-		auto stream = transport.openListen(message);
+		SubscriptionStream stream;
+		try
+			stream = transport.openListen(message);
+		catch (Exception e)
+		{
+			eventStreams_.remove(key);
+			throw e;
+		}
 		stream.addCleanup(() @safe nothrow{ eventStreams_.remove(key); });
 		return stream;
 	}
@@ -2569,7 +2580,9 @@ final class McpClient : ClientProtocol
 	/// and ending the handle on a `terminated` control. A stream that goes quiet
 	/// for `eventSettings.streamDeadAfter` (no event, no heartbeat) is treated as
 	/// dead and reopened with the last-known cursor, so a dropped connection resumes
-	/// without a gap. `cancel()` closes the stream and deregisters its handlers.
+	/// without a gap; a stream the server refuses or fails ends the handle instead
+	/// (see `runStreamWatchdog`). `cancel()` closes the stream and deregisters its
+	/// handlers.
 	EventSubscription subscribeStream(StreamParams p, void delegate(EventOccurrence) @safe onEvent,
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
@@ -2639,9 +2652,13 @@ final class McpClient : ClientProtocol
 		}, ms.params.arguments, cursor, ms.params.maxAgeMs);
 	}
 
-	/// The push-stream liveness watchdog: wakes every `streamDeadAfter`, and if no
-	/// frame arrived in that window closes the stream and reopens it from the
-	/// subscription's last cursor. Ends when the subscription is cancelled or
+	/// The push-stream liveness watchdog: wakes every `streamDeadAfter`, and if the
+	/// stream ended or no frame arrived in that window closes it and reopens it from
+	/// the subscription's last cursor. A transient failure (connection loss, HTTP
+	/// 5xx/408/429, internal error) is retried, backing off exponentially across
+	/// consecutive failed reopens; any other failure — the server refusing or
+	/// failing the stream — ends the subscription and is reported to `onControl`
+	/// as an `error` control. Ends when the subscription is cancelled or
 	/// terminated, or when reconnection is disabled. Seam-driven for tests.
 	package void runStreamWatchdog(EventSubscription sub) @safe
 	{
@@ -2649,23 +2666,68 @@ final class McpClient : ClientProtocol
 		if (msp is null)
 			return;
 		auto ms = *msp;
+		uint failures; // consecutive failed reopens
 		while (sub.active)
 		{
 			const dead = eventSettings_.streamDeadAfter;
 			if (dead <= Duration.zero)
 				return;
-			streamWatchSleep(dead);
+			streamWatchSleep(dead * (1L << (failures < 5 ? failures : 5)));
 			if (!sub.active)
 				return;
-			if (eventNowMs() - ms.lastFrameMs < dead.total!"msecs")
+			if (!ms.stream.ended && eventNowMs() - ms.lastFrameMs < dead.total!"msecs")
 				continue;
+			if (ms.stream.error !is null && !isTransientStreamFailure(ms.stream.error))
+			{
+				endManagedStream(sub, ms, ms.stream.error);
+				return;
+			}
 			ms.stream.close();
 			try
-				openManagedStream(sub, ms, sub.cursor());
-			catch (Exception)
 			{
-				// Reopen failed (server unreachable): the next wake-up retries.
+				openManagedStream(sub, ms, sub.cursor());
+				failures = 0;
 			}
+			catch (McpException e)
+			{
+				if (!isTransientStreamFailure(e))
+				{
+					endManagedStream(sub, ms, e);
+					return;
+				}
+				failures++;
+			}
+			catch (Exception)
+				failures++;
+		}
+	}
+
+	/// Whether a push-stream failure may clear on its own, so reopening the stream
+	/// is worthwhile: a lost connection or internal error, or an HTTP 5xx / 408 /
+	/// 429. A JSON-RPC rejection or any other HTTP 4xx will repeat on every retry.
+	private static bool isTransientStreamFailure(McpException e) @safe
+	{
+		if (auto h = cast(HttpStatusException) e)
+			return h.status >= 500 || h.status == 408 || h.status == 429;
+		return e.code == ErrorCode.internalError;
+	}
+
+	/// End a managed push subscription the server refused or failed with `e`:
+	/// close its stream, report `e` as an `error` control, and mark it terminated.
+	private void endManagedStream(EventSubscription sub, ManagedStream ms, McpException e) @safe
+	{
+		ms.stream.close();
+		managedStreams_.remove(sub);
+		sub.markTerminated();
+		if (ms.onControl !is null)
+		{
+			EventControl c;
+			c.kind = EventControlKind.error;
+			EventError err;
+			err.code = e.code;
+			err.message = e.msg;
+			c.error = err;
+			ms.onControl(c);
 		}
 	}
 
@@ -7492,12 +7554,22 @@ version (unittest)
 		}
 
 		Json[] listens; // every message passed to openListen, in order
+		SubscriptionStream[] streams; // every stream openListen returned, in order
+		// Failures thrown by the next openListen calls, consumed front first.
+		McpException[] listenFailures;
 
 		SubscriptionStream openListen(Json message) @safe
 		{
 			listens ~= message;
+			if (listenFailures.length)
+			{
+				auto e = listenFailures[0];
+				listenFailures = listenFailures[1 .. $];
+				throw e;
+			}
 			auto cancelled = () @trusted { return new shared bool(false); }();
-			return new SubscriptionStream(cancelled);
+			streams ~= new SubscriptionStream(cancelled);
+			return streams[$ - 1];
 		}
 
 		Json deliver(Json message, long expectId) @safe
@@ -8429,6 +8501,90 @@ unittest  // a quiet managed stream is reopened from the last cursor after strea
 	assert(t.listens.length == 2); // reopened exactly once
 	assert(t.listens[1]["params"]["cursor"].get!string == "c9");
 	assert(events == 2);
+}
+
+unittest  // a managed stream whose reopen is refused with a non-transient error stops reconnecting
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	EventControl[] ctrls;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null, (EventControl ctrl) @safe {
+		ctrls ~= ctrl;
+	});
+	t.listenFailures = [
+		new McpException(ErrorCode.methodNotFound, "no events/stream")
+	];
+	int wakes;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		assert(++wakes < 10, "the watchdog kept reopening a refused stream");
+		now += 200_000;
+	};
+	c.runStreamWatchdog(sub);
+	assert(t.listens.length == 2, "a refused reopen must not be retried");
+	assert(!sub.active);
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
+	assert(ctrls[0].error.get.code == ErrorCode.methodNotFound);
+}
+
+unittest  // a managed stream the server ended with a non-transient error stops at the next wake
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	t.streams[0].finish(new McpException(ErrorCode.invalidParams, "bad arguments"));
+	int wakes;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		assert(++wakes < 10, "the watchdog kept reopening a failed stream");
+	};
+	c.runStreamWatchdog(sub);
+	assert(wakes == 1);
+	assert(t.listens.length == 1, "a stream failed with a non-transient error must not be reopened");
+	assert(!sub.active);
+}
+
+unittest  // a managed stream the server closed cleanly is reopened at the next wake
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	t.streams[0].finish();
+	int wakes;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		if (++wakes == 2)
+			sub.cancel();
+	};
+	c.runStreamWatchdog(sub);
+	assert(t.listens.length == 2,
+			"a stream the server closed must be reopened without waiting to go quiet");
+}
+
+unittest  // transient reopen failures back off between attempts
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	foreach (_; 0 .. 3)
+		t.listenFailures ~= new HttpStatusException(503, "unavailable");
+	Duration[] sleeps;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		sleeps ~= d;
+		now += d.total!"msecs" + 1;
+		if (sleeps.length == 5)
+			sub.cancel();
+	};
+	c.runStreamWatchdog(sub);
+	assert(t.listens.length == 5, "a transient failure must be retried");
+	assert(sleeps[1] > sleeps[0] && sleeps[2] > sleeps[1] && sleeps[3] > sleeps[2],
+			"consecutive failures must back off");
+	assert(sleeps[4] == sleeps[0], "a successful reopen must reset the backoff");
 }
 
 unittest  // reconnection is disabled by a zero streamDeadAfter
