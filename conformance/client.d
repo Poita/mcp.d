@@ -435,7 +435,7 @@ private int runAuthScenario(string url, string scenario) @safe
 		const idpClientId = ("idp_client_id" in context) ? context["idp_client_id"].get!string : "";
 		auto jag = oauth.tokenExchange(idpEndpoint, idpToken,
 				"urn:ietf:params:oauth:token-type:id_token",
-				"urn:ietf:params:oauth:token-type:id-jag", issuer, idpClientId);
+				"urn:ietf:params:oauth:token-type:id-jag", issuer, RegisteredClient(idpClientId));
 		const assertion = jag.accessToken.length ? jag.accessToken : idpToken;
 		tokens = oauth.jwtBearerGrant(as_, client, assertion, scopeStr);
 	}

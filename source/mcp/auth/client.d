@@ -78,7 +78,8 @@ final class OAuthClient
 	string redirectUri = "http://localhost:8765/callback";
 	/// How to authenticate at the token endpoint.
 	TokenEndpointAuthMethod authMethod = TokenEndpointAuthMethod.none;
-	/// EC private key (PKCS#8 PEM) for `private_key_jwt` client assertions.
+	/// RSA or EC (P-256) private key (PKCS#8 PEM) for `private_key_jwt` client
+	/// assertions. Required when `authMethod` is `privateKeyJwt`.
 	string privateKeyPem;
 	/// SEP-991: this client's OAuth Client ID Metadata Document URL — an
 	/// HTTPS URL (with a path component) at which the client hosts its metadata
@@ -117,19 +118,39 @@ final class OAuthClient
 	}
 
 	/// Build the `client_assertion_type` + `client_assertion` form fields for
-	/// `private_key_jwt` token-endpoint authentication (RFC 7523), or "".
+	/// `private_key_jwt` token-endpoint authentication (RFC 7523), or "" for any
+	/// other method. Throws when `private_key_jwt` is selected without a
+	/// `privateKeyPem`, rather than sending an unauthenticated request.
 	private string clientAssertionParams(string clientId, string audience) @safe
 	{
 		import std.uri : encodeComponent;
 		import std.datetime.systime : Clock;
 		import mcp.auth.jwt : makeClientAssertion, jwtBearerAssertionType;
 
-		if (authMethod != TokenEndpointAuthMethod.privateKeyJwt || privateKeyPem.length == 0)
+		if (authMethod != TokenEndpointAuthMethod.privateKeyJwt)
 			return "";
+		if (privateKeyPem.length == 0)
+			throw invalidRequest(
+					"OAuthClient.privateKeyPem must be set when authMethod is " ~ "private_key_jwt");
 		const now = () @trusted { return Clock.currTime().toUnixTime(); }();
 		const jwt = makeClientAssertion(clientId, audience, privateKeyPem, now);
 		return "&client_assertion_type=" ~ encodeComponent(
 				jwtBearerAssertionType) ~ "&client_assertion=" ~ encodeComponent(jwt);
+	}
+
+	/// The token-endpoint client-authentication form fields for grants whose
+	/// form builders do not carry them: `client_secret` under
+	/// `client_secret_post`, or a client assertion (audience `assertionAudience`)
+	/// under `private_key_jwt`. `client_secret_basic` travels in the
+	/// `Authorization` header instead (see `postForm`).
+	private string clientAuthParams(RegisteredClient client, string assertionAudience) @safe
+	{
+		import std.uri : encodeComponent;
+
+		string s;
+		if (authMethod == TokenEndpointAuthMethod.clientSecretPost && client.clientSecret.length)
+			s = "&client_secret=" ~ encodeComponent(client.clientSecret);
+		return s ~ clientAssertionParams(client.clientId, assertionAudience);
 	}
 
 	/// Discover the protected-resource metadata for an MCP endpoint, using the
@@ -409,13 +430,15 @@ final class OAuthClient
 	/// RFC 8693 token exchange: swap a subject token (e.g. an IdP id_token) for
 	/// a requested token type (e.g. an ID-JAG assertion) at `tokenEndpoint`.
 	/// Rejects an empty `resource` — see the class docstring for the rationale.
-	TokenSet tokenExchange(string tokenEndpoint, string subjectToken,
-			string subjectTokenType, string requestedTokenType, string audience, string clientId) @safe
+	/// The request authenticates as `client` under the configured `authMethod`.
+	TokenSet tokenExchange(string tokenEndpoint, string subjectToken, string subjectTokenType,
+			string requestedTokenType, string audience, RegisteredClient client) @safe
 	{
 		requireResource();
 		auto form = buildTokenExchangeForm(subjectToken, subjectTokenType,
-				requestedTokenType, audience, resource, clientId);
-		return TokenSet.fromJson(postForm(tokenEndpoint, form, RegisteredClient(clientId, "")));
+				requestedTokenType, audience, resource, client.clientId) ~ clientAuthParams(client,
+				tokenEndpoint);
+		return TokenSet.fromJson(postForm(tokenEndpoint, form, client));
 	}
 
 	/// RFC 7523 JWT-bearer grant: exchange an assertion JWT for an access token.
@@ -423,7 +446,8 @@ final class OAuthClient
 			RegisteredClient client, string assertion, string scopeStr) @safe
 	{
 		requireResource();
-		auto form = buildJwtBearerForm(assertion, scopeStr, resource, client.clientId);
+		auto form = buildJwtBearerForm(assertion, scopeStr, resource, client.clientId)
+			~ clientAuthParams(client, as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
 		return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
 	}
 
@@ -1241,7 +1265,7 @@ unittest  // tokenExchange refuses when the RFC 8707 resource indicator is unset
 	try
 		c.tokenExchange("https://as.example.com/token", "subj_token",
 				"urn:ietf:params:oauth:token-type:id_token",
-				"urn:ietf:params:oauth:token-type:access_token", "aud", "cid");
+				"urn:ietf:params:oauth:token-type:access_token", "aud", RegisteredClient("cid"));
 	catch (McpException e)
 	{
 		caught = e.msg.indexOf("resource indicator") >= 0;
@@ -1659,7 +1683,7 @@ unittest  // token grants POST their forms and parse the token response (loopbac
 	assert(lastForm.canFind("assertion=the-assertion"));
 
 	auto t5 = c.tokenExchange(srv.base ~ "/token", "subj", "urn:t:id_token",
-			"urn:t:access_token", "aud", "cid");
+			"urn:t:access_token", "aud", client);
 	assert(t5.accessToken == "at-123");
 	assert(lastForm.canFind(
 			"grant_type=" ~ "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange"));
@@ -1703,6 +1727,75 @@ unittest  // private_key_jwt: token requests carry a client_assertion (RFC 7523)
 	c.exchangeCode(as_, RegisteredClient("cid", ""), "code", "verifier");
 	assert(lastForm.canFind("client_assertion_type="));
 	assert(lastForm.canFind("client_assertion="));
+}
+
+version (unittest)
+{
+	// A throwaway P-256 PKCS#8 key (shared with the jwt module's own test).
+	private enum testEcPem = "-----BEGIN PRIVATE KEY-----\n"
+		~ "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7K6+stITLYsQjC9o\n"
+		~ "hyL925dgd6gNWRcGOl5RPvIpye+hRANCAATSBYPkHq12VDW5un1kub6zkBc4ieZ9\n"
+		~ "nurGMu+tLzJ6+6syOZsQCGlazcSOGsopLyl1QZMIFh9atUYaDfUjJxMq\n"
+		~ "-----END PRIVATE KEY-----\n";
+}
+
+unittest  // private_key_jwt without a configured key refuses instead of sending no client auth
+{
+	import std.algorithm : canFind;
+	import std.exception : collectExceptionMsg;
+
+	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
+	c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.tokenEndpoint = "https://as.example.com/token";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	const msg = collectExceptionMsg(c.clientCredentials(as_, RegisteredClient("cid", ""), ""));
+	assert(msg.canFind("privateKeyPem"), msg);
+}
+
+unittest  // private_key_jwt: the JWT-bearer grant carries a client_assertion
+{
+	import std.algorithm : canFind;
+
+	string lastForm;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		lastForm = req.bodyReader.readAllUTF8();
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	c.privateKeyPem = testEcPem;
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.tokenEndpoint = srv.base ~ "/token";
+	c.jwtBearerGrant(as_, RegisteredClient("cid", ""), "the-assertion", "");
+	assert(lastForm.canFind("client_assertion="));
+}
+
+unittest  // client_secret_post: token exchange carries the client secret
+{
+	import std.algorithm : canFind;
+
+	string lastForm;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		lastForm = req.bodyReader.readAllUTF8();
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	c.authMethod = TokenEndpointAuthMethod.clientSecretPost;
+	c.tokenExchange(srv.base ~ "/token", "subj", "urn:t:id_token",
+			"urn:t:access_token", "aud", RegisteredClient("cid", "shh"));
+	assert(lastForm.canFind("client_secret=shh"));
 }
 
 unittest  // probeUnauthorized / probeOperation return the WWW-Authenticate challenge on 401

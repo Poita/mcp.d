@@ -163,8 +163,11 @@ private bool containsControlChar(string s) @safe pure nothrow
 	return false;
 }
 
-/// Build a signed ES256 JWT client assertion (RFC 7523) for OAuth client
-/// authentication: `iss`/`sub` = client id, `aud` = the token endpoint.
+/// Build a signed JWT client assertion (RFC 7523) for OAuth client
+/// authentication, signed RS256 or ES256 according to the key type:
+/// `iss`/`sub` = client id, `aud` = `audience`. `OAuthClient` passes the
+/// authorization server's issuer identifier as `audience`, or its token
+/// endpoint when no issuer is known.
 string makeClientAssertion(string clientId, string audience, string privateKeyPem,
 		long now, long lifetimeSeconds = 300, string jti = "") @safe
 {
