@@ -403,8 +403,9 @@ final class TaskRuntime
 			{
 				r.meta.status = TaskStatus.cancelled;
 				r.inputRequests = Json.emptyObject;
+				return Change.status;
 			}
-			return Change.status;
+			return Change.state;
 		});
 	}
 
@@ -770,6 +771,22 @@ unittest  // sweepExpired removes expired records, terminal or not, and keeps th
 	assert(!store.get(fresh.taskId).isNull);
 	assert(store.get(running.taskId).isNull);
 	assert(!store.get(longRunning.taskId).isNull);
+}
+
+unittest  // cancelling a running executor's task records the request without a status notification
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	int notified;
+	rt.onStatusChange((Json detailed, string owner) @safe { notified++; });
+	auto t = rt.createFor("tool", Json.emptyObject);
+	now = "2026-06-07T10:00:01Z";
+	rt.cancel(t.taskId);
+	assert(rt.cancelRequested(t.taskId));
+	assert(notified == 0);
+	assert(rt.getDetailed(t.taskId)["lastUpdatedAt"].get!string == "2026-06-07T10:00:00Z");
 }
 
 unittest  // stopSweeper ends the sweep loop, including one a restart replaced
