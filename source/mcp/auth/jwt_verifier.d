@@ -260,7 +260,7 @@ package bool verifyJws(string alg, const(ubyte)[] signingInput,
 	}
 	else if (alg == "ES256")
 	{
-		if (baseId != EVP_PKEY_EC)
+		if (baseId != EVP_PKEY_EC || !isP256Key(pkey))
 			return false;
 	}
 	else
@@ -287,6 +287,19 @@ package bool verifyJws(string alg, const(ubyte)[] signingInput,
 	const rc = EVP_DigestVerify(ctx, derSig.ptr, derSig.length,
 			signingInput.ptr, signingInput.length);
 	return rc == 1;
+}
+
+/// Whether the EC public key `pkey` lies on P-256, the only curve ES256 permits
+/// (RFC 7518 §3.4).
+private bool isP256Key(EVP_PKEY* pkey) @trusted
+{
+	auto ec = EVP_PKEY_get1_EC_KEY(pkey);
+	if (ec is null)
+		return false;
+	scope (exit)
+		EC_KEY_free(ec);
+	auto group = EC_KEY_get0_group(ec);
+	return group !is null && EC_GROUP_get_curve_name(group) == NID_X9_62_prime256v1;
 }
 
 /// Convert a raw 64-byte ECDSA P-256 signature (R||S) to the DER encoding
@@ -401,21 +414,26 @@ package Jwk[] parseJwks(string jwksJson) @safe
 	return result;
 }
 
-/// Whether a JWK may be used to verify signatures (RFC 7517 4.2/4.3): a key
-/// declaring `use` must declare `use=="sig"`, and a key declaring `key_ops` must
-/// include `"verify"`. Keys that declare neither are usable (the members are
-/// optional). Keys declaring an incompatible use/op are excluded as candidates.
+/// Whether a JWK may be used to verify signatures (RFC 7517 4.2/4.3/4.4): a key
+/// declaring `use` must declare `use=="sig"`, a key declaring `key_ops` must
+/// include `"verify"`, and a key declaring `alg` must name a supported algorithm
+/// of its own family (RS256 for RSA, ES256 for EC). Keys that declare none of
+/// these are usable (the members are optional).
 package bool jwkUsableForSig(Jwk jwk) @safe
 {
 	if (jwk.use.length && jwk.use != "sig")
 		return false;
 	if (jwk.keyOps.length && !jwk.keyOps.canFind("verify"))
 		return false;
+	if (jwk.alg.length && !(jwk.alg == "RS256" && jwk.kty == "RSA")
+			&& !(jwk.alg == "ES256" && jwk.kty == "EC"))
+		return false;
 	return true;
 }
 
 /// Convert a JWK to a PEM SubjectPublicKeyInfo public key. Supports RSA (n/e)
-/// and EC P-256/P-384/P-521 (crv/x/y, RFC 7518). Returns null for unsupported keys.
+/// and EC P-256 (crv/x/y, RFC 7518), the key types RS256 and ES256 verify with.
+/// Returns null for unsupported keys.
 package string jwkToPem(Jwk jwk) @trusted
 {
 	if (jwk.kty == "RSA")
@@ -481,15 +499,9 @@ private string ecJwkToPem(Jwk jwk) @trusted
 {
 	if (jwk.x.length == 0 || jwk.y.length == 0)
 		return null;
-	int nid;
-	if (jwk.crv == "P-256")
-		nid = NID_X9_62_prime256v1;
-	else if (jwk.crv == "P-384")
-		nid = NID_secp384r1;
-	else if (jwk.crv == "P-521")
-		nid = NID_secp521r1;
-	else
+	if (jwk.crv != "P-256")
 		return null;
+	const nid = NID_X9_62_prime256v1;
 	auto eckey = EC_KEY_new_by_curve_name(nid);
 	if (eckey is null)
 		return null;
@@ -1516,18 +1528,15 @@ unittest  // fetchJwks refuses a JWKS response larger than maxJwksBytes
 	assert(keys == 0, "an oversized JWKS body must not be loaded");
 }
 
-unittest  // ecJwkToPem produces a parseable PEM for P-384 and P-521 EC JWKs (RFC 7518)
+unittest  // jwkToPem rejects P-384 and P-521 EC JWKs, which no supported alg can verify
 {
-	import std.string : indexOf;
-
 	// P-384 key coordinates (secp384r1, generated with openssl ecparam -name secp384r1)
 	Jwk j384;
 	j384.kty = "EC";
 	j384.crv = "P-384";
 	j384.x = "nAPaQ-Yp5yOfUbCoua-9vveg8CN2xGZcC0pwleiN32_13F8e5ucb4TDIECm7HNHF";
 	j384.y = "50RD8Uk-e11KLEhoe67lPP-XrPZNz_BTJ8Mc4Pw9fzfEp_Bx3kfvopo3CvsqMx9M";
-	auto pem384 = jwkToPem(j384);
-	assert(pem384.indexOf("BEGIN PUBLIC KEY") >= 0, "P-384 JWK must produce a PEM");
+	assert(jwkToPem(j384).length == 0);
 
 	// P-521 key coordinates (secp521r1, generated with openssl ecparam -name secp521r1)
 	Jwk j521;
@@ -1537,8 +1546,39 @@ unittest  // ecJwkToPem produces a parseable PEM for P-384 and P-521 EC JWKs (RF
 		= "AdsIuUmbV1MADf8_U1vxvq7HgqY7rSroFHKSdrgoX20IJxB8WqbDiT5VUe9peyobeRWX5BxmsDvUWBjCGG_0gutA";
 	j521.y
 		= "AegUPdPnBttrFflQ9wJbUurLisEyJu-PZW-PnJomKpiFt9D2o0Ve0uXpqSqLHZTVhWpXu3ddF3Kw9JoO2hsNDE0q";
-	auto pem521 = jwkToPem(j521);
-	assert(pem521.indexOf("BEGIN PUBLIC KEY") >= 0, "P-521 JWK must produce a PEM");
+	assert(jwkToPem(j521).length == 0);
+}
+
+unittest  // jwkUsableForSig rejects a JWK whose declared alg is not supported
+{
+	Jwk j;
+	j.kty = "EC";
+	j.alg = "ES384";
+	assert(!jwkUsableForSig(j));
+}
+
+unittest  // jwkUsableForSig rejects a JWK whose declared alg belongs to another key family
+{
+	Jwk ec;
+	ec.kty = "EC";
+	ec.alg = "RS256";
+	assert(!jwkUsableForSig(ec));
+
+	Jwk rsa;
+	rsa.kty = "RSA";
+	rsa.alg = "RS256";
+	assert(jwkUsableForSig(rsa));
+}
+
+unittest  // verifyJws refuses ES256 with an EC key on a curve other than P-256
+{
+	const p384Pem = "-----BEGIN PUBLIC KEY-----\n"
+		~ "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEZAuOASCn4YZGvdnwJ3n0ClX1Nr40mK3R\n"
+		~ "l3CMCJKLvzbEENtB0aX9r4yomSv+138yyeKGkV3HALqfLI4e8OVx0ifDIIepwuiL\n"
+		~ "4kXRpDjft3Urv/CmTZHxxGeBZ3mOQiXk\n" ~ "-----END PUBLIC KEY-----\n";
+	auto sig = new ubyte[64];
+	sig[] = 1;
+	assert(!verifyJws("ES256", cast(const(ubyte)[]) "a.b", sig, p384Pem));
 }
 
 version (unittest)
