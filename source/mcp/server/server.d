@@ -3257,6 +3257,12 @@ final class McpServer : ServerCore
 
 	private Json doComplete(Json params) @safe
 	{
+		// No handler registered => the `completions` capability is not advertised.
+		// The spec directs servers to answer with -32601 (Capability not
+		// supported) rather than a success result in this case.
+		if (typedCompletionHandler is null && argumentCompleters.length == 0)
+			throw methodNotFound("completion/complete");
+		validateCompleteParams(params);
 		auto request = CompleteRequest.fromJson(params);
 		// The global handler takes precedence (advanced/dynamic routing); an empty
 		// result from it falls back to a per-argument completer registered via
@@ -3267,25 +3273,53 @@ final class McpServer : ServerCore
 			if (global.values.length || argumentCompleters.length == 0)
 				return global.toJson();
 		}
-		if (argumentCompleters.length)
+		const key = argumentCompleterKey(request.reference, request.argumentName);
+		if (auto completer = key in argumentCompleters)
 		{
-			const key = argumentCompleterKey(request.reference, request.argumentName);
-			if (auto completer = key in argumentCompleters)
-			{
-				CompleteResult result;
-				auto values = (*completer)(request.argumentValue);
-				result.values = values;
-				result.total = values.length;
-				return result.toJson();
-			}
-			// A registered (reference, argument) surface exists but this request
-			// matched none of them: an empty completion is the spec-compliant answer.
-			return CompleteResult.init.toJson();
+			CompleteResult result;
+			auto values = (*completer)(request.argumentValue);
+			result.values = values;
+			result.total = values.length;
+			return result.toJson();
 		}
-		// No handler registered => the `completions` capability is not advertised.
-		// The spec directs servers to answer with -32601 (Capability not
-		// supported) rather than a success result in this case.
-		throw methodNotFound("completion/complete");
+		// A registered (reference, argument) surface exists but this request
+		// matched none of them: an empty completion is the spec-compliant answer.
+		return CompleteResult.init.toJson();
+	}
+
+	/// Reject a `completion/complete` whose params do not match
+	/// `CompleteRequestParams`: a `ref` that is a `ref/prompt` with a string
+	/// `name` or a `ref/resource` with a string `uri`, and an `argument` with
+	/// string `name` and `value`.
+	private static void validateCompleteParams(Json params) @safe
+	{
+		bool isString(Json obj, string key) @safe
+		{
+			return obj.type == Json.Type.object && key in obj && obj[key].type == Json.Type.string;
+		}
+
+		if (params.type != Json.Type.object)
+			throw invalidParams("completion/complete requires params");
+		auto reference = ("ref" in params) ? params["ref"] : Json.undefined;
+		if (!isString(reference, "type"))
+			throw invalidParams("completion/complete requires a 'ref' with a string 'type'");
+		const refType = reference["type"].get!string;
+		if (refType == "ref/prompt")
+		{
+			if (!isString(reference, "name"))
+				throw invalidParams("a ref/prompt reference requires a string 'name'");
+		}
+		else if (refType == "ref/resource")
+		{
+			if (!isString(reference, "uri"))
+				throw invalidParams("a ref/resource reference requires a string 'uri'");
+		}
+		else
+			throw invalidParams("Unknown completion reference type: " ~ refType);
+		auto argument = ("argument" in params) ? params["argument"] : Json.undefined;
+		if (!isString(argument, "name") || !isString(argument, "value"))
+			throw invalidParams(
+					"completion/complete requires an 'argument' with string 'name' and 'value'");
 	}
 
 	private Json doSetLevel(Json params, ProtocolVersion ver, ConnectionState conn) @safe
@@ -5717,8 +5751,42 @@ unittest  // completion/complete uses the registered typed handler
 		r.values = ["paris", "park"];
 		return r;
 	});
-	auto resp = s.handle(req(1, "completion/complete", Json.emptyObject)).get;
+	Json p = Json.emptyObject;
+	p["ref"] = CompletionReference.forPrompt("greet").toJson();
+	p["argument"] = Json(["name": Json("city"), "value": Json("pa")]);
+	auto resp = s.handle(req(1, "completion/complete", p)).get;
 	assert(resp["result"]["completion"]["values"].length == 2);
+}
+
+unittest  // completion/complete rejects params missing a valid ref or argument with -32602
+{
+	auto s = new McpServer("t", "1");
+	bool called;
+	s.setCompletionRequestHandler((CompleteRequest) @safe {
+		called = true;
+		return CompleteResult.init;
+	});
+	Json goodRef = CompletionReference.forPrompt("greet").toJson();
+	Json goodArg = Json(["name": Json("city"), "value": Json("pa")]);
+	Json[] bad = [
+		Json.emptyObject, Json(["argument": goodArg]), Json(["ref": goodRef]),
+		Json([
+			"ref": Json(["type": Json("ref/other"), "name": Json("x")]),
+			"argument": goodArg
+		]), Json([
+			"ref": Json(["type": Json("ref/prompt")]),
+			"argument": goodArg
+		]),
+		Json(["ref": Json(["type": Json("ref/resource")]),
+			"argument": goodArg]),
+		Json(["ref": goodRef, "argument": Json(["name": Json("city")])]),
+	];
+	foreach (i, p; bad)
+	{
+		auto resp = s.handle(req(i, "completion/complete", p)).get;
+		assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	}
+	assert(!called);
 }
 
 unittest  // typed completion handler receives a parsed CompleteRequest
