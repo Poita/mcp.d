@@ -1162,7 +1162,7 @@ final class McpClient : ClientProtocol
 	///
 	/// Guards against a peer that never makes forward progress: a returned
 	/// `nextCursor` equal to the one just sent, or any cursor already seen on a
-	/// prior page (a cycle), throws `McpException(invalidParams)` rather than
+	/// prior page (a cycle), throws `McpException(internalError)` rather than
 	/// looping; a configurable `maxListPages_` cap throws
 	/// `McpException(internalError)` once exceeded. Without these checks a
 	/// malicious or buggy server could make the client loop forever, growing the
@@ -1183,10 +1183,10 @@ final class McpClient : ClientProtocol
 			{
 				const advanced = next.get;
 				if (!cursor.isNull && advanced == cursor.get)
-					throw new McpException(ErrorCode.invalidParams,
+					throw new McpException(ErrorCode.internalError,
 							"Server returned a non-progressing pagination cursor");
 				if (advanced in seenCursors)
-					throw new McpException(ErrorCode.invalidParams,
+					throw new McpException(ErrorCode.internalError,
 							"Server returned a cycling pagination cursor");
 				seenCursors[advanced] = true;
 			}
@@ -2465,17 +2465,8 @@ final class McpClient : ClientProtocol
 	/// One `events/poll` round-trip for a single subscription. The low-level
 	/// primitive; a poll-mode subscription loops this at the server-recommended
 	/// `nextPollMs`, persisting the returned `cursor` and passing it back.
-	PollResult pollEvents(string name, Json arguments = Json.emptyObject,
-			Nullable!string cursor = Nullable!string.init,
-			Nullable!long maxAgeMs = Nullable!long.init,
-			Nullable!long maxEvents = Nullable!long.init) @safe
+	PollResult pollEvents(PollParams p) @safe
 	{
-		PollParams p;
-		p.name = name;
-		p.arguments = arguments;
-		p.cursor = cursor;
-		p.maxAgeMs = maxAgeMs;
-		p.maxEvents = maxEvents;
 		return PollResult.fromJson(rpc("events/poll", p.toJson()));
 	}
 
@@ -2488,20 +2479,13 @@ final class McpClient : ClientProtocol
 	/// sees raw notifications. `cancel()`/`close()` ends the stream and drops its
 	/// handlers; a `terminated` control also drops them. Throws `McpException`
 	/// when the server refuses the stream, as `subscriptionsListen` does.
-	SubscriptionStream streamEvents(string name, void delegate(EventOccurrence) @safe onEvent,
-			void delegate(EventControl) @safe onControl = null, Json arguments = Json.emptyObject,
-			Nullable!string cursor = Nullable!string.init,
-			Nullable!long maxAgeMs = Nullable!long.init) @safe
+	SubscriptionStream streamEvents(StreamParams p, void delegate(EventOccurrence) @safe onEvent,
+			void delegate(EventControl) @safe onControl = null) @safe
 	{
 		import std.conv : to;
 
 		const id = nextId++;
-		StreamParams sp;
-		sp.name = name;
-		sp.arguments = arguments;
-		sp.cursor = cursor;
-		sp.maxAgeMs = maxAgeMs;
-		Json params = sp.toJson();
+		Json params = p.toJson();
 		if (useModern)
 			params = injectModernMeta(params);
 		auto message = makeRequest(Json(id), "events/stream", params);
@@ -2787,7 +2771,9 @@ final class McpClient : ClientProtocol
 	{
 		ms.lastFrameMs = eventNowMs();
 		ms.wakeCount = ms.wake.emitCount;
-		ms.stream = streamEvents(ms.params.name, (EventOccurrence o) @safe {
+		auto sp = ms.params;
+		sp.cursor = cursor;
+		ms.stream = streamEvents(sp, (EventOccurrence o) @safe {
 			ms.lastFrameMs = eventNowMs();
 			sub.advanceCursor(o.cursor);
 			if (sub.alreadySeen(o.eventId))
@@ -2801,7 +2787,7 @@ final class McpClient : ClientProtocol
 				sub.markTerminated();
 			if (ms.onControl !is null)
 				ms.onControl(c);
-		}, ms.params.arguments, cursor, ms.params.maxAgeMs);
+		});
 		ms.stream.addCleanup(() @safe nothrow{ ms.wake.emit(); });
 	}
 
@@ -3546,13 +3532,13 @@ final class McpClient : ClientProtocol
 	/// notification SHOULD ignore any response to the request that arrives
 	/// afterward". `reason` is an optional free-form explanation included in the
 	/// notification when non-empty. When `requestId` is still in flight, the call
-	/// waiting on it fails at once with `requestCancelled`. To cancel a call
-	/// without knowing its request ids, pass a `CancellationToken` in its
-	/// `RequestOptions.cancellation` instead.
+	/// waiting on it fails at once with `requestCancelled`. Request ids are
+	/// internal, so applications cancel a call through the `CancellationToken` in
+	/// its `RequestOptions.cancellation`.
 	///
 	/// Per spec, the `initialize` request MUST NOT be cancelled by clients;
 	/// attempting to cancel the id of the `initialize` request throws.
-	void cancel(long requestId, string reason = null) @safe
+	package void cancel(long requestId, string reason = null) @safe
 	{
 		if (requestId == initializeRequestId && initializeRequestId != 0)
 			throw invalidRequest("The initialize request MUST NOT be cancelled by clients");
@@ -7276,6 +7262,58 @@ unittest  // listResources throws when the server cycles the pagination cursor
 	assertThrown!McpException(c.listResources());
 }
 
+unittest  // a non-converging pagination cursor is reported as a server fault, not invalid params
+{
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		r["tools"] = Json.emptyArray;
+		r["nextCursor"] = "stuck";
+		return r;
+	};
+	int code;
+	try
+		c.listTools();
+	catch (McpException e)
+		code = e.code;
+	assert(code == ErrorCode.internalError);
+}
+
+unittest  // pollEvents sends every field of its PollParams
+{
+	auto c = McpClient.http("http://localhost");
+	Json sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "events/poll");
+		sent = params;
+		PollResult r;
+		r.cursor = "c2";
+		return r.toJson();
+	};
+	PollParams p;
+	p.name = "incident.created";
+	p.cursor = "c1";
+	p.maxEvents = 5;
+	auto res = c.pollEvents(p);
+	assert(sent["name"].get!string == "incident.created");
+	assert(sent["cursor"].get!string == "c1");
+	assert(sent["maxEvents"].get!long == 5);
+	assert(res.cursor.get == "c2");
+}
+
+unittest  // streamEvents opens events/stream from its StreamParams
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	StreamParams p;
+	p.name = "incident.created";
+	p.cursor = "c1";
+	c.streamEvents(p, (EventOccurrence o) @safe {});
+	assert(t.listens.length == 1);
+	assert(t.listens[0]["method"].get!string == "events/stream");
+	assert(t.listens[0]["params"]["cursor"].get!string == "c1");
+}
+
 unittest  // a cancelled-request id is evicted once its late response has been dropped
 {
 	auto transport = new RecordingClientTransport();
@@ -8389,12 +8427,12 @@ unittest  // concurrent push streams for one event type each get only their own 
 	int aCount, bCount;
 	string aSev, bSev;
 	// nextId starts at 1, so the first stream is subscriptionId 1, the second 2.
-	cast(void) c.streamEvents("incident.created", (EventOccurrence o) @safe {
+	cast(void) c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		aCount++;
 		if ("severity" in o.data)
 			aSev = o.data["severity"].get!string;
 	});
-	cast(void) c.streamEvents("incident.created", (EventOccurrence o) @safe {
+	cast(void) c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		bCount++;
 		if ("severity" in o.data)
 			bSev = o.data["severity"].get!string;
@@ -8427,7 +8465,7 @@ unittest  // a push terminated control is delivered typed and drops the stream's
 	int events;
 	EventControl gotCtrl;
 	bool gotControl;
-	cast(void) c.streamEvents("incident.created", (EventOccurrence o) @safe {
+	cast(void) c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		events++;
 	}, (EventControl ctrl) @safe { gotCtrl = ctrl; gotControl = true; });
 
@@ -8454,7 +8492,7 @@ unittest  // cancelling a stream deregisters its handlers (later occurrences ign
 	auto c = new McpClient(transport);
 
 	int events;
-	auto s = c.streamEvents("incident.created", (EventOccurrence o) @safe {
+	auto s = c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		events++;
 	});
 	s.close();
@@ -8776,7 +8814,7 @@ unittest  // an events stream the server ends drops its handlers
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
-	c.streamEvents("incident.created", (EventOccurrence o) @safe {});
+	c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {});
 	assert(c.eventStreams_.length == 1);
 	t.streams[0].finish();
 	assert(c.eventStreams_.length == 0, "a server-ended stream must not keep its handlers");
@@ -9007,7 +9045,7 @@ unittest  // close() cancels every open subscriptions/listen stream
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
 	auto a = c.subscriptionsListen(SubscriptionFilter.init);
-	auto b = c.streamEvents("incident.created", null);
+	auto b = c.streamEvents(StreamParams("incident.created"), null);
 	c.close();
 	assert(a.cancelled && b.cancelled, "close() must stop the client's listen streams");
 }

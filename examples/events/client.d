@@ -75,13 +75,16 @@ int main(string[] args) @safe
 
 		// --- 3. POLL: bootstrap, raise, then drain the occurrence ------------
 		{
-			auto boot = client.pollEvents("incident.created");
+			auto boot = client.pollEvents(PollParams("incident.created"));
 			check(boot.events.length == 0, "bootstrap poll returns no events");
 			auto cursor = boot.cursor;
 
 			client.callTool("raise_incident", Json(["severity": Json("P1")]));
 
-			auto polled = client.pollEvents("incident.created", Json.emptyObject, cursor);
+			PollParams next;
+			next.name = "incident.created";
+			next.cursor = cursor;
+			auto polled = client.pollEvents(next);
 			check(polled.events.length >= 1, "poll after raise should drain the incident");
 			checkEq(polled.events[0].data["severity"].get!string, "P1",
 				"polled incident severity");
@@ -94,7 +97,8 @@ int main(string[] args) @safe
 			// Occurrences and control frames arrive on this stream's own handlers,
 			// already typed — no global onNotification, no manual subscriptionId
 			// routing.
-			auto stream = client.streamEvents("incident.created", (EventOccurrence occ) @safe {
+			auto stream = client.streamEvents(StreamParams("incident.created"),
+				(EventOccurrence occ) @safe {
 				eventCount++;
 				if ("severity" in occ.data)
 					lastEventSeverity = occ.data["severity"].get!string;
