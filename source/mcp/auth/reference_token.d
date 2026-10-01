@@ -1,11 +1,9 @@
 module mcp.auth.reference_token;
 
-import core.time : Duration, MonoTime, dur;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
 import mcp.auth.resource_server : TokenInfo, TokenValidator;
-import mcp.transport.session : BoundedExpiringMap;
 
 @safe:
 
@@ -27,28 +25,45 @@ struct IssuedToken
 	long expiresAt;
 }
 
+/// Settings for a `ReferenceTokenStore`.
+struct ReferenceTokenStoreOptions
+{
+	/// The most tokens held at once; issuing past it evicts the oldest-issued
+	/// token. 0 disables the cap.
+	size_t maxEntries = 100_000;
+	/// How often (in seconds) `issue` sweeps out tokens past their `expiresAt`.
+	long sweepIntervalSeconds = 60;
+	/// The current Unix time in seconds (`null` => the system clock); injectable
+	/// so tests can drive expiry deterministically.
+	long delegate() @safe clock;
+}
+
 /// Mints opaque bearer tokens and resolves them back to the `IssuedToken` they
-/// represent. Backed by a bounded, lazily-expiring map so an insert-only token
-/// table cannot grow without limit; the cap evicts the oldest entry and the
-/// idle TTL sweeps stale ones. Bound to the single-threaded event loop, so it
-/// does no locking. The map's TTL governs storage hygiene; per-token validity
-/// is decided by each token's own `expiresAt` at lookup.
+/// represent. Each token lives until its own `expiresAt`: expired tokens are
+/// dropped on lookup and swept periodically on `issue`, and the
+/// `maxEntries` cap evicts the oldest-issued token so the table cannot grow
+/// without limit. Bound to the single-threaded event loop, so it does no
+/// locking.
 final class ReferenceTokenStore
 {
-	private BoundedExpiringMap!IssuedToken tokens;
+	private IssuedToken[string] tokens;
+	// Issue order for cap eviction. Keys already removed are skipped when
+	// evicting and dropped when the queue is compacted.
+	private string[] order;
+	private size_t orderHead;
+	private long lastSweep;
+	private ReferenceTokenStoreOptions opts;
 
-	/// A store with no idle TTL sweep and no entry cap.
+	/// A store with the default `ReferenceTokenStoreOptions`.
 	this() @safe
 	{
-		this(Duration.zero, 0, null);
+		this(ReferenceTokenStoreOptions.init);
 	}
 
-	/// A store bounded by an idle `ttl` and a `maxEntries` cap. `clock`
-	/// (`null` => `MonoTime.currTime`) drives the map's idle sweep and is
-	/// injectable so tests can exercise eviction deterministically.
-	this(Duration ttl, size_t maxEntries, MonoTime delegate() @safe clock) @safe
+	/// A store configured by `opts`.
+	this(ReferenceTokenStoreOptions opts) @safe
 	{
-		tokens = BoundedExpiringMap!IssuedToken(ttl, maxEntries, clock);
+		this.opts = opts;
 	}
 
 	/// Mint a fresh opaque token (256 bits of CSPRNG entropy, base64url, no
@@ -58,8 +73,14 @@ final class ReferenceTokenStore
 		import mcp.auth.csprng : cryptoRandomBytes;
 		import mcp.auth.oauth : base64UrlNoPad;
 
+		sweepDue(now());
+		if (opts.maxEntries != 0)
+			while (tokens.length >= opts.maxEntries && evictOldest())
+			{
+			}
 		const token = base64UrlNoPad(cryptoRandomBytes(32));
-		tokens.put(token, t);
+		tokens[token] = t;
+		order ~= token;
 		return token;
 	}
 
@@ -68,7 +89,7 @@ final class ReferenceTokenStore
 	/// token; an expired entry is dropped from the store.
 	Nullable!IssuedToken lookup(string token, long now) @safe
 	{
-		auto p = tokens.get(token, false);
+		auto p = token in tokens;
 		if (p is null)
 			return Nullable!IssuedToken.init;
 		if (now >= p.expiresAt)
@@ -77,6 +98,60 @@ final class ReferenceTokenStore
 			return Nullable!IssuedToken.init;
 		}
 		return nullable(*p);
+	}
+
+	/// The number of tokens currently held, including any expired ones not yet
+	/// swept.
+	size_t length() const @safe
+	{
+		return tokens.length;
+	}
+
+	private long now() @safe
+	{
+		return opts.clock !is null ? opts.clock() : nowUnixSeconds();
+	}
+
+	private void sweepDue(long t) @safe
+	{
+		if (t - lastSweep < opts.sweepIntervalSeconds)
+			return;
+		lastSweep = t;
+		string[] expired;
+		foreach (k, ref v; tokens)
+			if (t >= v.expiresAt)
+				expired ~= k;
+		foreach (k; expired)
+			tokens.remove(k);
+		compactOrder();
+	}
+
+	private bool evictOldest() @safe
+	{
+		while (orderHead < order.length)
+		{
+			const k = order[orderHead++];
+			if (tokens.remove(k))
+			{
+				compactOrder();
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Rebuild the issue-order queue once removed keys dominate it, keeping its
+	// size proportional to the live table.
+	private void compactOrder() @safe
+	{
+		if (order.length - orderHead <= 2 * tokens.length + 16)
+			return;
+		string[] live;
+		foreach (k; order[orderHead .. $])
+			if ((k in tokens) !is null)
+				live ~= k;
+		order = live;
+		orderHead = 0;
 	}
 }
 
@@ -241,18 +316,74 @@ unittest  // referenceTokenValidator rejects an expired token
 
 unittest  // the store evicts the oldest entry once the bound is exceeded
 {
-	MonoTime clk = MonoTime.currTime;
-	auto store = new ReferenceTokenStore(Duration.zero, 2, () @safe => clk);
+	ReferenceTokenStoreOptions o;
+	o.maxEntries = 2;
+	auto store = new ReferenceTokenStore(o);
 
 	IssuedToken t;
 	t.expiresAt = long.max;
 	const a = store.issue(t);
-	clk += 1.dur!"seconds";
 	const b = store.issue(t);
-	clk += 1.dur!"seconds";
 	const c = store.issue(t); // exceeds the cap of 2, evicting `a`
 
 	assert(store.lookup(a, 0).isNull);
 	assert(!store.lookup(b, 0).isNull);
 	assert(!store.lookup(c, 0).isNull);
+}
+
+unittest  // a default-constructed store is bounded
+{
+	assert(ReferenceTokenStoreOptions.init.maxEntries > 0);
+}
+
+unittest  // issue sweeps out tokens past their own expiresAt
+{
+	long clk = 1000;
+	ReferenceTokenStoreOptions o;
+	o.clock = () @safe => clk;
+	auto store = new ReferenceTokenStore(o);
+
+	IssuedToken shortLived;
+	shortLived.expiresAt = 1010;
+	store.issue(shortLived);
+	clk = 2000;
+	IssuedToken t;
+	t.expiresAt = long.max;
+	store.issue(t);
+	assert(store.length == 1);
+}
+
+unittest  // a token stays valid until its own expiresAt however long ago it was issued
+{
+	long clk = 1000;
+	ReferenceTokenStoreOptions o;
+	o.clock = () @safe => clk;
+	auto store = new ReferenceTokenStore(o);
+
+	IssuedToken t;
+	t.expiresAt = 10_000_000;
+	const tok = store.issue(t);
+	clk = 9_000_000;
+	store.issue(t); // triggers a sweep
+	assert(!store.lookup(tok, clk).isNull);
+}
+
+unittest  // cap eviction skips tokens already removed by expiry
+{
+	ReferenceTokenStoreOptions o;
+	o.maxEntries = 2;
+	auto store = new ReferenceTokenStore(o);
+
+	IssuedToken dead;
+	dead.expiresAt = 1;
+	const a = store.issue(dead);
+	assert(store.lookup(a, 5).isNull); // dropped on lookup
+	IssuedToken t;
+	t.expiresAt = long.max;
+	const b = store.issue(t);
+	const c = store.issue(t);
+	const d = store.issue(t); // evicts `b`, the oldest live token
+	assert(store.lookup(b, 0).isNull);
+	assert(!store.lookup(c, 0).isNull);
+	assert(!store.lookup(d, 0).isNull);
 }
