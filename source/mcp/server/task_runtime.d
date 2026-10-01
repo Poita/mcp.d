@@ -231,7 +231,7 @@ final class TaskRuntime
 	}
 
 	/// Stop the background sweeper started by `startSweeper`, if any.
-	void stopSweeper() @safe
+	void stopSweeper() @safe nothrow
 	{
 		if (sweeper_ is null)
 			return;

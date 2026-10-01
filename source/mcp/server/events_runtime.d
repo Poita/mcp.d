@@ -1933,23 +1933,33 @@ final class EventsRuntime
 	/// `enableEvents` starts one per server at `workerInterval`; starting again
 	/// replaces (and stops) a worker already running. A multi-node deployment
 	/// shares a durable `DeliveryQueue` so any node's worker delivers (and
-	/// re-leases a dead node's jobs).
+	/// re-leases a dead node's jobs). The worker runs in its own fiber on the
+	/// event loop, independent of `deliveryExecutor` / `deliverySleep`, so those
+	/// per-delivery hooks may be synchronous without blocking or spinning it.
 	void startDeliveryWorker(Duration interval) @safe
 	{
+		import vibe.core.core : runTask, sleep;
+
 		stopDeliveryWorker();
 		auto loop = new BackgroundLoop;
 		worker_ = loop;
-		opts_.deliveryExecutor(() @safe {
+		loop.task = runTask(() nothrow @safe {
 			while (!loop.stopped)
 			{
-				tick();
-				opts_.deliverySleep(interval);
+				try
+					tick();
+				catch (Exception e)
+					logEventsError("worker pass threw", e);
+				try
+					sleep(interval);
+				catch (Exception)
+					return; // interrupted: stopped, or the event loop is shutting down
 			}
 		});
 	}
 
 	/// Stop the periodic worker started by `startDeliveryWorker`, if any.
-	void stopDeliveryWorker() @safe
+	void stopDeliveryWorker() @safe nothrow
 	{
 		if (worker_ is null)
 			return;
@@ -4411,19 +4421,29 @@ unittest  // the delivery worker keeps running when a pass throws
 		}
 	}
 
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop, sleep;
+
 	EventsOptions o;
-	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
-	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	EventsRuntime rt;
 	int passes;
-	o.deliverySleep = (Duration d) @safe {
-		if (++passes == 4)
-			rt.stopDeliveryWorker();
-	};
-	rt = new EventsRuntime(new FailingAllStore(), o);
-	rt.startDeliveryWorker(0.seconds);
-	assert(passes == 4);
+	// Each pass starts with the poll-lease sweep, which reads the clock once.
+	o.nowMs = () @safe { passes++; return 1_000_000L; };
+	o.nowIso = () @safe => "t";
+	auto rt = new EventsRuntime(new FailingAllStore(), o);
+	const constructed = passes;
+	runTask(() nothrow @safe {
+		try
+		{
+			rt.startDeliveryWorker(1.msecs);
+			sleep(30.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		rt.stopDeliveryWorker();
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(passes - constructed >= 4, "the worker kept running past failing passes");
 }
 
 unittest  // jobs queued behind a retrying job keep their lease, so another node cannot take them
@@ -4470,24 +4490,51 @@ unittest  // jobs queued behind a retrying job keep their lease, so another node
 
 unittest  // restarting the delivery worker stops the loop it replaces
 {
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop, sleep;
+
+	EventsOptions o;
+	int clockReads;
+	o.nowMs = () @safe { clockReads++; return 1_000_000L; };
+	o.nowIso = () @safe => "t";
+	auto rt = new EventsRuntime(null, o);
+	int beforeStop, afterStop;
+	runTask(() nothrow @safe {
+		try
+		{
+			rt.startDeliveryWorker(1.msecs);
+			rt.startDeliveryWorker(1.msecs);
+			sleep(30.msecs);
+			rt.stopDeliveryWorker();
+			sleep(1.msecs);
+			beforeStop = clockReads;
+			sleep(30.msecs);
+			afterStop = clockReads;
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(beforeStop > 0, "the worker ran");
+	assert(afterStop == beforeStop, "no worker pass runs after stopDeliveryWorker");
+}
+
+unittest  // the worker does not run on the delivery hooks: a synchronous executor never blocks its start
+{
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
 	o.nowIso = () @safe => "t";
-	void delegate() @safe[] deferred;
-	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
-	EventsRuntime rt;
-	int passes;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	int sleeps;
 	o.deliverySleep = (Duration d) @safe {
-		if (++passes > 5)
-			rt.stopDeliveryWorker(); // bound a loop that failed to stop
+		if (++sleeps > 3)
+			throw new Exception("the worker looped inline on the delivery hooks");
 	};
-	rt = new EventsRuntime(null, o);
-	rt.startDeliveryWorker(0.seconds);
-	rt.startDeliveryWorker(0.seconds);
+	auto rt = new EventsRuntime(null, o);
+	rt.startDeliveryWorker(1.seconds);
 	rt.stopDeliveryWorker();
-	foreach (job; deferred)
-		job();
-	assert(passes == 0);
+	assert(sleeps == 0);
 }
 
 unittest  // unsubscribeWebhook throws NotFound for an unknown subscription
