@@ -678,14 +678,29 @@ struct RegisteredClient
 {
 	string clientId;
 	string clientSecret;
+	/// RFC 7591 `client_secret_expires_at` (absolute unix seconds); 0 means the
+	/// secret does not expire.
+	long clientSecretExpiresAt;
 
 	static RegisteredClient fromJson(Json j) @safe
 	{
 		RegisteredClient c;
 		c.clientId = strField(j, "client_id");
 		c.clientSecret = strField(j, "client_secret");
+		if (auto p = "client_secret_expires_at" in j)
+			c.clientSecretExpiresAt = p.type == Json.Type.int_ ? p.get!long : 0;
 		return c;
 	}
+}
+
+unittest  // RegisteredClient parses client_secret_expires_at from a registration response
+{
+	import vibe.data.json : parseJsonString;
+
+	auto rc = RegisteredClient.fromJson(parseJsonString(
+			`{"client_id":"cid","client_secret":"s","client_secret_expires_at":1900000000}`));
+	assert(rc.clientSecret == "s");
+	assert(rc.clientSecretExpiresAt == 1_900_000_000);
 }
 
 unittest  // a registration request always names its application_type

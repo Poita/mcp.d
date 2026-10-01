@@ -53,10 +53,31 @@ struct StoredToken
 	/// DCR-issued). Persisted so a later refresh can authenticate at the token
 	/// endpoint even when no `client_id` was statically configured.
 	string clientId;
+	/// The client secret issued alongside a dynamically registered `clientId`,
+	/// persisted so a later refresh can authenticate as that client.
+	string clientSecret;
+	/// RFC 7591 `client_secret_expires_at` for `clientSecret` (absolute unix
+	/// seconds); 0 means it does not expire.
+	long clientSecretExpiresAt;
 	/// The issuer of the authorization server that issued this token. `useOAuth`
 	/// reuses or refreshes the token only with that same server, so a record
 	/// with a different or empty issuer is treated as absent.
 	string issuer;
+
+	/// Record the client registration this token was obtained under.
+	void setClient(RegisteredClient rc) @safe pure nothrow @nogc
+	{
+		clientId = rc.clientId;
+		clientSecret = rc.clientSecret;
+		clientSecretExpiresAt = rc.clientSecretExpiresAt;
+	}
+
+	/// Whether the recorded client secret has expired at `now`, leaving the
+	/// registration unusable for authenticating a refresh.
+	bool clientSecretExpired(long now) const @safe pure nothrow @nogc
+	{
+		return clientSecretExpiresAt != 0 && now >= clientSecretExpiresAt;
+	}
 
 	/// Whether this record holds a usable access token.
 	bool hasToken() const @safe pure nothrow @nogc
@@ -90,6 +111,8 @@ struct StoredToken
 		j["scope"] = scope_;
 		j["resource"] = resource;
 		j["client_id"] = clientId;
+		j["client_secret"] = clientSecret;
+		j["client_secret_expires_at"] = Json(clientSecretExpiresAt);
 		j["issuer"] = issuer;
 		return j;
 	}
@@ -113,6 +136,10 @@ struct StoredToken
 			s.resource = p.type == Json.Type.string ? p.get!string : "";
 		if (auto p = "client_id" in j)
 			s.clientId = p.type == Json.Type.string ? p.get!string : "";
+		if (auto p = "client_secret" in j)
+			s.clientSecret = p.type == Json.Type.string ? p.get!string : "";
+		if (auto p = "client_secret_expires_at" in j)
+			s.clientSecretExpiresAt = p.type == Json.Type.int_ ? p.get!long : 0;
 		if (auto p = "issuer" in j)
 			s.issuer = p.type == Json.Type.string ? p.get!string : "";
 		return s;
@@ -760,13 +787,20 @@ final class OAuthSession
 			auto ts = refreshFn_(token_.refreshToken);
 			if (ts.accessToken.length == 0)
 				throw internalError("OAuth token refresh returned no access token");
-			// Carry the registered client_id and the issuer forward so the persisted
+			// Carry the registered client and the issuer forward so the persisted
 			// record can authenticate a later refresh at the same AS (the refresh
 			// response carries neither).
-			auto clientId = token_.clientId.length ? token_.clientId : client_.clientId;
-			auto issuer = token_.issuer.length ? token_.issuer : as_.issuer;
-			token_ = StoredToken.fromTokenSet(ts, resource_, now, token_.refreshToken);
-			token_.clientId = clientId;
+			auto prev = token_;
+			auto issuer = prev.issuer.length ? prev.issuer : as_.issuer;
+			token_ = StoredToken.fromTokenSet(ts, resource_, now, prev.refreshToken);
+			if (prev.clientId.length)
+			{
+				token_.clientId = prev.clientId;
+				token_.clientSecret = prev.clientSecret;
+				token_.clientSecretExpiresAt = prev.clientSecretExpiresAt;
+			}
+			else
+				token_.clientId = client_.clientId;
 			token_.issuer = issuer;
 			if (store_ !is null)
 				store_.save(resource_, token_);
@@ -853,15 +887,25 @@ bool openSystemBrowser(string url, scope BrowserSpawn spawn = null) @safe
 // The one-call flow
 // ===========================================================================
 
-/// The `RegisteredClient` to use on the cache fast-path. The `client_id` is
-/// read from the persisted token (so DCR/CIMD users, who have no statically
-/// configured `client_id`, still carry the AS-issued one needed to refresh),
-/// falling back to the configured `opts.clientId` for records that predate
-/// persisting it. The secret comes from `opts` (it is not persisted).
+/// The `RegisteredClient` to use on the cache fast-path. The `client_id` and
+/// secret are read from the persisted token (so DCR/CIMD users, who have no
+/// statically configured credentials, still carry the AS-issued ones needed to
+/// refresh), falling back to the configured `opts.clientId`/`opts.clientSecret`
+/// for the pre-registered client or a record without a client.
 RegisteredClient cacheHitClient(StoredToken cached, OAuthLogin opts) @safe pure nothrow
 {
-	const id = cached.clientId.length ? cached.clientId : opts.clientId;
-	return RegisteredClient(id, opts.clientSecret);
+	if (cached.clientId.length == 0 || cached.clientId == opts.clientId)
+		return RegisteredClient(opts.clientId, opts.clientSecret);
+	return RegisteredClient(cached.clientId, cached.clientSecret, cached.clientSecretExpiresAt);
+}
+
+/// The client registration to persist with a token: the configured
+/// pre-registered secret stays in `opts` and is not written to the store.
+RegisteredClient persistedClient(RegisteredClient rc, OAuthLogin opts) @safe pure nothrow
+{
+	if (rc.clientId.length && rc.clientId == opts.clientId)
+		return RegisteredClient(rc.clientId);
+	return rc;
 }
 
 /// Perform the full interactive OAuth login for `client` and attach the
@@ -909,6 +953,10 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	auto cached = store.load(oauth.resource);
 	if (cached.issuer.length == 0 || cached.issuer != as_.issuer)
 		cached = StoredToken.init;
+	// An expired client secret can no longer authenticate a refresh, so the
+	// registration (and the tokens bound to it) must be replaced.
+	if (cached.clientSecretExpired(now))
+		cached = StoredToken.init;
 	if (cached.hasToken && !needsRefresh(cached, now))
 	{
 		return attachSession(client, new OAuthSession(oauth, as_,
@@ -928,7 +976,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 			{
 				auto refreshed = StoredToken.fromTokenSet(ts, oauth.resource,
 						now, cached.refreshToken);
-				refreshed.clientId = prior.clientId;
+				refreshed.setClient(persistedClient(prior, opts));
 				refreshed.issuer = as_.issuer;
 				store.save(oauth.resource, refreshed);
 				return attachSession(client, new OAuthSession(oauth, as_, prior,
@@ -977,7 +1025,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	// interactive browser wait by however long the user took to authenticate).
 	const long issuedAt = () @trusted { return Clock.currTime().toUnixTime(); }();
 	auto stored = StoredToken.fromTokenSet(ts, oauth.resource, issuedAt);
-	stored.clientId = rc.clientId;
+	stored.setClient(persistedClient(rc, opts));
 	stored.issuer = as_.issuer;
 	store.save(oauth.resource, stored);
 	return attachSession(client, new OAuthSession(oauth, as_, rc, store, oauth.resource, stored));
@@ -1950,6 +1998,61 @@ unittest  // the cache fast-path falls back to the pre-registered client_id when
 	cached.accessToken = "valid";
 	auto rc = cacheHitClient(cached, opts);
 	assert(rc.clientId == "pre-reg");
+}
+
+unittest  // the cache fast-path carries the persisted DCR client_secret
+{
+	OAuthLogin opts; // DCR: no static client credentials
+	StoredToken cached;
+	cached.accessToken = "valid";
+	cached.clientId = "abc123";
+	cached.clientSecret = "dcr-secret";
+	auto rc = cacheHitClient(cached, opts);
+	assert(rc.clientId == "abc123");
+	assert(rc.clientSecret == "dcr-secret");
+}
+
+unittest  // the cache fast-path uses the configured secret for the pre-registered client
+{
+	OAuthLogin opts;
+	opts.clientId = "pre-reg";
+	opts.clientSecret = "configured";
+	StoredToken cached;
+	cached.accessToken = "valid";
+	cached.clientId = "pre-reg";
+	auto rc = cacheHitClient(cached, opts);
+	assert(rc.clientSecret == "configured");
+}
+
+unittest  // the configured pre-registered secret is not persisted with the token
+{
+	OAuthLogin opts;
+	opts.clientId = "pre-reg";
+	opts.clientSecret = "configured";
+	assert(persistedClient(RegisteredClient("pre-reg", "configured"), opts).clientSecret.length == 0);
+	assert(persistedClient(RegisteredClient("dcr-id", "dcr-secret"), opts)
+			.clientSecret == "dcr-secret");
+}
+
+unittest  // StoredToken persists the DCR client_secret and its expiry across JSON round-trips
+{
+	StoredToken t;
+	t.accessToken = "tok";
+	t.setClient(RegisteredClient("abc123", "dcr-secret", 1_900_000_000));
+	auto back = StoredToken.fromJson(t.toJson());
+	assert(back.clientId == "abc123");
+	assert(back.clientSecret == "dcr-secret");
+	assert(back.clientSecretExpiresAt == 1_900_000_000);
+}
+
+unittest  // a stored client secret past its client_secret_expires_at is reported expired
+{
+	StoredToken t;
+	t.setClient(RegisteredClient("abc123", "dcr-secret", 100));
+	assert(t.clientSecretExpired(100));
+	assert(!t.clientSecretExpired(99));
+	t.clientSecretExpiresAt = 0; // RFC 7591: 0 means the secret never expires
+	assert(!t.clientSecretExpired(long.max));
 }
 
 unittest  // StoredToken persists the registered client_id across JSON round-trips
