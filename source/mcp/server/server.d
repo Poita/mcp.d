@@ -1055,6 +1055,8 @@ final class McpServer : ServerCore
 	TaskRuntime enableTasks(TaskStore store = null,
 			TaskOptions opts = TaskOptions.init, TaskDispatcher dispatcher = null) @safe
 	{
+		if (taskRuntime_ !is null)
+			taskRuntime_.stopSweeper();
 		taskRuntime_ = new TaskRuntime((store is null) ? new InMemoryTaskStore() : store, opts);
 		taskDispatcher_ = (dispatcher is null) ? new InProcessTaskDispatcher() : dispatcher;
 		taskRuntime_.onStatusChange((Json detailed, string owner) @safe {
@@ -1245,6 +1247,8 @@ final class McpServer : ServerCore
 	EventsRuntime enableEvents(WebhookSubscriptionStore store = null,
 			EventsOptions opts = EventsOptions.init) @safe
 	{
+		if (eventsRuntime_ !is null)
+			eventsRuntime_.stopDeliveryWorker();
 		eventsRuntime_ = new EventsRuntime(store, opts);
 		eventsRuntime_.onListChanged(() @safe {
 			notify(eventsListChangedNotification);

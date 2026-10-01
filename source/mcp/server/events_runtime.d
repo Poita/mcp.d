@@ -11,6 +11,7 @@ import std.typecons : Nullable, nullable;
 import std.algorithm : sort;
 import vibe.data.json : Json;
 
+import mcp.internal.background_loop : BackgroundLoop;
 import mcp.protocol.events;
 import mcp.protocol.jsonhelpers : getOr;
 import mcp.protocol.schema : makeValidator, validationError;
@@ -550,6 +551,7 @@ final class EventsRuntime
 	private bool[string] localJobs_; // job ids waiting in or being delivered by a run on this node
 	private int[string] pendingCount_; // subscription id -> tracked, unsettled deliveries on this node
 	private string[string] missed_; // subscription id -> furthest position dropped undelivered, owed a gap
+	private BackgroundLoop worker_; // the periodic worker `startDeliveryWorker` runs
 
 	this(WebhookSubscriptionStore webhookStore = null, EventsOptions opts = EventsOptions.init) @safe
 	{
@@ -1925,21 +1927,34 @@ final class EventsRuntime
 					opts_.nowMs() + opts_.deliveryLease.total!"msecs");
 	}
 
-	/// Run the periodic worker until `stop()` returns true: every `interval` it
-	/// expires poll leases, sweeps lapsed webhook subscriptions, runs the
-	/// poll-driven webhook pass, and drains the delivery queue. `enableEvents`
-	/// starts one per server at `workerInterval`; a multi-node deployment shares a
-	/// durable `DeliveryQueue` so any node's worker delivers (and re-leases a dead
-	/// node's jobs).
-	void startDeliveryWorker(Duration interval, bool delegate() @safe stop = null) @safe
+	/// Run the periodic worker until `stopDeliveryWorker` is called: every
+	/// `interval` it expires poll leases, sweeps lapsed webhook subscriptions,
+	/// runs the poll-driven webhook pass, and drains the delivery queue.
+	/// `enableEvents` starts one per server at `workerInterval`; starting again
+	/// replaces (and stops) a worker already running. A multi-node deployment
+	/// shares a durable `DeliveryQueue` so any node's worker delivers (and
+	/// re-leases a dead node's jobs).
+	void startDeliveryWorker(Duration interval) @safe
 	{
+		stopDeliveryWorker();
+		auto loop = new BackgroundLoop;
+		worker_ = loop;
 		opts_.deliveryExecutor(() @safe {
-			while (stop is null || !stop())
+			while (!loop.stopped)
 			{
 				tick();
 				opts_.deliverySleep(interval);
 			}
 		});
+	}
+
+	/// Stop the periodic worker started by `startDeliveryWorker`, if any.
+	void stopDeliveryWorker() @safe
+	{
+		if (worker_ is null)
+			return;
+		worker_.stop();
+		worker_ = null;
 	}
 
 	/// One pass of the periodic work the worker loop performs. Each step is
@@ -4387,11 +4402,37 @@ unittest  // the delivery worker keeps running when a pass throws
 	o.nowMs = () @safe => 1_000_000L;
 	o.nowIso = () @safe => "t";
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
-	auto rt = new EventsRuntime(new FailingAllStore(), o);
+	EventsRuntime rt;
 	int passes;
-	rt.startDeliveryWorker(0.seconds, () @safe => ++passes > 3);
+	o.deliverySleep = (Duration d) @safe {
+		if (++passes == 4)
+			rt.stopDeliveryWorker();
+	};
+	rt = new EventsRuntime(new FailingAllStore(), o);
+	rt.startDeliveryWorker(0.seconds);
 	assert(passes == 4);
+}
+
+unittest  // restarting the delivery worker stops the loop it replaces
+{
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	EventsRuntime rt;
+	int passes;
+	o.deliverySleep = (Duration d) @safe {
+		if (++passes > 5)
+			rt.stopDeliveryWorker(); // bound a loop that failed to stop
+	};
+	rt = new EventsRuntime(null, o);
+	rt.startDeliveryWorker(0.seconds);
+	rt.startDeliveryWorker(0.seconds);
+	rt.stopDeliveryWorker();
+	foreach (job; deferred)
+		job();
+	assert(passes == 0);
 }
 
 unittest  // unsubscribeWebhook throws NotFound for an unknown subscription

@@ -5,6 +5,7 @@ import std.datetime.systime : SysTime;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
+import mcp.internal.background_loop : BackgroundLoop;
 import mcp.protocol.tasks;
 import mcp.protocol.errors : McpException, ErrorCode, toErrorJson, internalError;
 import mcp.server.task_store : TaskStore, TaskRecord, InMemoryTaskStore,
@@ -53,6 +54,7 @@ final class TaskRuntime
 	private TaskStore store_;
 	private TaskOptions opts_;
 	private void delegate(Json detailed, string owner) @safe onStatusChange_;
+	private BackgroundLoop sweeper_;
 
 	this(TaskStore store, TaskOptions opts) @safe
 	{
@@ -200,26 +202,41 @@ final class TaskRuntime
 		return store_.removeIf((const TaskRecord r) @safe => isExpired(r, now));
 	}
 
-	/// Run `sweepExpired` every `interval` in a background fiber for the life of
-	/// the process.
+	/// Run `sweepExpired` every `interval` in a background fiber until
+	/// `stopSweeper` is called or the event loop exits. Starting again replaces
+	/// (and stops) a sweeper already running.
 	void startSweeper(Duration interval) @safe
 	{
 		import vibe.core.core : runTask, sleep;
 		import vibe.core.log : logError;
 
-		runTask(() nothrow @safe {
-			while (true)
+		stopSweeper();
+		auto loop = new BackgroundLoop;
+		sweeper_ = loop;
+		loop.task = runTask(() nothrow @safe {
+			while (!loop.stopped)
 			{
 				try
 					sleep(interval);
 				catch (Exception)
-					return; // interrupted: the event loop is shutting down
+					return; // interrupted: stopped, or the event loop is shutting down
+				if (loop.stopped)
+					return;
 				try
 					sweepExpired();
 				catch (Exception e)
 					logError("task TTL sweep failed: %s", e.msg);
 			}
 		});
+	}
+
+	/// Stop the background sweeper started by `startSweeper`, if any.
+	void stopSweeper() @safe
+	{
+		if (sweeper_ is null)
+			return;
+		sweeper_.stop();
+		sweeper_ = null;
 	}
 
 	/// The `-32602 Task not found` error, with the offending `taskId` in `data`.
@@ -753,6 +770,37 @@ unittest  // sweepExpired removes expired records, terminal or not, and keeps th
 	assert(!store.get(fresh.taskId).isNull);
 	assert(store.get(running.taskId).isNull);
 	assert(!store.get(longRunning.taskId).isNull);
+}
+
+unittest  // stopSweeper ends the sweep loop, including one a restart replaced
+{
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop, sleep;
+
+	int clockReads;
+	TaskOptions o;
+	o.nowIso = () @safe { clockReads++; return "2026-06-07T10:00:00Z"; };
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	int beforeStop, afterStop;
+	runTask(() nothrow @safe {
+		try
+		{
+			rt.startSweeper(1.msecs);
+			rt.startSweeper(1.msecs);
+			sleep(30.msecs);
+			rt.stopSweeper();
+			sleep(1.msecs);
+			beforeStop = clockReads;
+			sleep(30.msecs);
+			afterStop = clockReads;
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(beforeStop > 0, "the sweeper ran");
+	assert(afterStop == beforeStop, "no sweep runs after stopSweeper");
 }
 
 unittest  // a task with an unlimited ttl never expires
