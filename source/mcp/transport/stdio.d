@@ -3,6 +3,7 @@ module mcp.transport.stdio;
 import vibe.data.json : Json;
 
 import mcp.server.server;
+import mcp.server.settings : ServerSettings;
 import mcp.transport.duplex : DuplexChannel, defaultMaxLineBytes;
 
 @safe:
@@ -255,6 +256,12 @@ struct StdioOptions
 void runStdio(McpServer server, StdioOptions opts)
 {
 	runStdio(server, opts.maxLineBytes);
+}
+
+/// Serve `server` over stdio using `settings.stdio`. Blocks until stdin closes.
+void runStdio(McpServer server, ServerSettings settings)
+{
+	runStdio(server, settings.stdio);
 }
 
 /// Serve `server` over the process's standard input/output: read JSON-RPC

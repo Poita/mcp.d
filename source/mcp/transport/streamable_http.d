@@ -7,6 +7,7 @@ import std.typecons : Nullable;
 import core.time : Duration, seconds;
 
 import mcp.server.server;
+import mcp.server.settings : ServerSettings;
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.versions;
@@ -2655,6 +2656,12 @@ void runStreamableHttp(McpServer server, ushort port, string host) @safe
 void runStreamableHttp(McpServer server, StreamableHttpOptions opts) @safe
 {
 	runStreamableHttp(server, opts.port, opts);
+}
+
+/// Serve `server` over Streamable HTTP using `settings.http`. Blocks until exit.
+void runStreamableHttp(McpServer server, ServerSettings settings) @safe
+{
+	runStreamableHttp(server, settings.http);
 }
 
 unittest  // a public bind with no allowedHosts is flagged (would 403 external hosts)

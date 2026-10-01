@@ -5,15 +5,15 @@
 /// entry points stay stable as options accumulate instead of growing a positional
 /// argument per knob. Build the server from the settings with `newServer`, then
 /// serve it with the `ServerSettings` overloads of `runStreamableHttp` / `runStdio`
-/// (which read the nested `http` / `stdio` options).
+/// from `mcp.transport` (which read the nested `http` / `stdio` options).
 module mcp.server.settings;
 
 import std.typecons : Nullable;
 
 import mcp.protocol.capabilities : Implementation;
 import mcp.server.server : McpServer, ServerMode;
-import mcp.transport.streamable_http : StreamableHttpOptions, runStreamableHttp;
-import mcp.transport.stdio : StdioOptions, runStdio;
+import mcp.transport.streamable_http : StreamableHttpOptions;
+import mcp.transport.stdio : StdioOptions;
 
 /// Static configuration for an MCP server, and the primary documented path for
 /// declaring it. `newServer` constructs an `McpServer` from the identity + mode
@@ -133,18 +133,6 @@ struct ServerSettings
 	}
 }
 
-/// Serve `server` over Streamable HTTP using `settings.http`. Blocks until exit.
-void runStreamableHttp(McpServer server, ServerSettings settings) @safe
-{
-	runStreamableHttp(server, settings.http);
-}
-
-/// Serve `server` over stdio using `settings.stdio`. Blocks until exit.
-void runStdio(McpServer server, ServerSettings settings)
-{
-	runStdio(server, settings.stdio);
-}
-
 @safe unittest
 {
 	// newServer honors the stateless default.
@@ -166,17 +154,13 @@ void runStdio(McpServer server, ServerSettings settings)
 
 @safe unittest
 {
-	// The nested transport options carry through and the run overloads are callable.
+	// The nested transport options carry through.
 	ServerSettings s;
 	s.serverInfo = Implementation("settings-srv", "1.0");
 	s.http.port = 9100;
 	s.stdio.maxLineBytes = 4096;
 	assert(s.http.port == 9100);
 	assert(s.stdio.maxLineBytes == 4096);
-	static assert(__traits(compiles, (McpServer srv, ServerSettings cfg) {
-			runStreamableHttp(srv, cfg);
-			runStdio(srv, cfg);
-		}));
 }
 
 version (unittest)

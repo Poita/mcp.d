@@ -216,6 +216,38 @@ unittest
 	static assert(visibleFromTransport!"ServerCore");
 }
 
+// Importing both `mcp` and `mcp.transport` leaves each `run*` entry point
+// unambiguous, including the `ServerSettings` overloads.
+unittest
+{
+	static assert(__traits(compiles, {
+			import mcp;
+			import mcp.transport;
+
+			McpServer srv;
+			ServerSettings cfg;
+			runStdio(srv);
+			runStdio(srv, cfg);
+			runStreamableHttp(srv, ushort(0));
+			runStreamableHttp(srv, cfg);
+		}));
+}
+
+// `import mcp.transport;` alone reaches the `ServerSettings` run overloads.
+unittest
+{
+	static assert(__traits(compiles, {
+			import mcp.server.server : McpServer;
+			import mcp.server.settings : ServerSettings;
+			import mcp.transport;
+
+			McpServer srv;
+			ServerSettings cfg;
+			runStdio(srv, cfg);
+			runStreamableHttp(srv, cfg);
+		}));
+}
+
 // The server-side transport seam has the single name `ServerCore`.
 unittest
 {
