@@ -349,7 +349,7 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 			res.writeBody("Missing sessionId query parameter", "text/plain");
 			return;
 		}
-		if (!handleLegacyPostBody(server, channel, sessionId, payload, token))
+		if (!dispatchLegacyPost(server, channel, sessionId, payload, token))
 		{
 			res.statusCode = HTTPStatus.notFound;
 			res.writeBody("Unknown or closed session", "text/plain");
@@ -440,6 +440,15 @@ final class LegacySseChannel
 			if (l.sessionId == sessionId)
 				return l.principal == principal ? l.connState : null;
 		return null;
+	}
+
+	/// Whether a stream with the session token `sessionId` is still open.
+	bool isOpen(string sessionId) @safe
+	{
+		foreach (l; listeners)
+			if (l.sessionId == sessionId)
+				return true;
+		return false;
 	}
 
 	/// Drop a listener (its GET stream closed).
@@ -622,7 +631,7 @@ bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 
 	Json serverRequest(string method, Json params) @safe
 	{
-		import core.time : seconds;
+		import core.time : seconds, msecs;
 
 		const id = channel.coord.alloc();
 		channel.coord.register(id, sessionId);
@@ -633,7 +642,11 @@ bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 			channel.coord.cancel(id, sessionId);
 			throw e;
 		}
-		return channel.coord.await(id, 60.seconds, sessionId);
+		// Closing the GET stream leaves nowhere for the reply to come from, so the
+		// waiter fails as soon as the stream is gone rather than at the timeout.
+		return channel.coord.awaitLive(id, () @safe => channel.isOpen(sessionId),
+				internalError("client disconnected before responding"),
+				60.seconds, 250.msecs, sessionId);
 	}
 
 	Nullable!Json dispatch(Message msg) @safe
@@ -676,6 +689,30 @@ bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 	}
 	if (responses.type == Json.Type.object || responses.length)
 		channel.deliverTo(sessionId, responses.toString());
+	return true;
+}
+
+/// Accept a message POSTed to the legacy message endpoint and dispatch it on a
+/// separate task, returning as soon as the owning stream is known. Responses
+/// travel over the GET stream, so the POST is acknowledged without waiting for
+/// the handler: a client that sends POSTs one at a time can then answer a
+/// server->client request (elicitation, sampling, roots) the handler blocks on.
+/// Returns false — dispatching nothing — when no open stream owned by `token`'s
+/// principal has `sessionId`.
+bool dispatchLegacyPost(McpServer server, LegacySseChannel channel,
+		string sessionId, string payload, TokenInfo token = TokenInfo.invalid()) @safe
+{
+	import vibe.core.core : runTask;
+	import vibe.core.log : logError;
+
+	if (channel.connStateFor(sessionId, principalOf(token)) is null)
+		return false;
+	runTask(() nothrow{
+		try
+			cast(void) handleLegacyPostBody(server, channel, sessionId, payload, token);
+		catch (Exception e)
+			logError("legacy HTTP+SSE dispatch failed: %s", e.msg);
+	});
 	return true;
 }
 
@@ -4646,4 +4683,104 @@ unittest  // modern subscriptions/listen: ack first, then opted-in change notifi
 	server.enableResourcesListChanged();
 	assert(server.notifyResourcesListChanged() == 0);
 	assert(frames.length == 2);
+}
+
+unittest  // legacy POST acknowledges before a blocking handler finishes
+{
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, yield;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	bool release;
+	Tool descriptor;
+	descriptor.name = "slow";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		while (!release)
+			yield();
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+
+	auto ch = new LegacySseChannel("/message");
+	string[] frames;
+	const sid = ch.sessionIdFor(ch.addListener((string f) @safe { frames ~= f; }));
+
+	bool accepted;
+	bool returned;
+	runTask(() nothrow{
+		try
+			accepted = dispatchLegacyPost(server, ch, sid, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"slow","arguments":{}}}`);
+		catch (Exception)
+		{
+		}
+		returned = true;
+	});
+	foreach (_; 0 .. 16)
+		yield();
+	assert(returned && accepted, "the POST must be acknowledged while its handler still runs");
+	assert(frames.length == 1);
+
+	release = true;
+	foreach (_; 0 .. 4096)
+	{
+		if (frames.length == 2)
+			break;
+		yield();
+	}
+	assert(frames.length == 2 && frames[1].canFind("\"id\":3"));
+}
+
+unittest  // legacy POST for an unknown stream is rejected without dispatching
+{
+	auto server = McpServer.stateful("t", "1");
+	auto ch = new LegacySseChannel("/message");
+	assert(!dispatchLegacyPost(server, ch, "no-such-session", initializeBody("2024-11-05")));
+}
+
+unittest  // closing a legacy GET stream fails the server->client request awaiting it
+{
+	import core.time : MonoTime;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	bool failed;
+	Tool descriptor;
+	descriptor.name = "roottool";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		try
+			ctx.listRootsRaw();
+		catch (McpException)
+			failed = true;
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+
+	auto ch = new LegacySseChannel("/message");
+	const lid = ch.addListener((string) @safe {});
+	const sid = ch.sessionIdFor(lid);
+
+	const started = MonoTime.currTime;
+	runTask(() nothrow{
+		try
+			cast(void) handleLegacyPostBody(server, ch, sid, `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"roottool","arguments":{}}}`);
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runTask(() nothrow{
+		try
+			ch.removeListener(lid);
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(failed);
+	assert(MonoTime.currTime - started < 5.seconds,
+			"the waiter must fail promptly once its stream closes");
 }
