@@ -646,7 +646,7 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 /// The `store` MUST be the one `mountOAuthAuthorize` writes to.
 void mountOAuthCallback(URLRouter router, OAuthProxy proxy, ProxyStateStore store) @safe
 {
-	const callbackPath = proxy.config().redirectPath;
+	const callbackPath = pathOf(proxy.config().callbackUrl());
 	router.get(callbackPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const code = req.query.get("code", "");
 		const upstreamError = req.query.get("error", "");
@@ -1167,6 +1167,31 @@ unittest  // mountOAuthProxy registers the full client-facing OAuth surface
 	// Must wire without throwing; the routes are exercised end-to-end by the
 	// transport conformance harness.
 	mountOAuthProxy(router, proxy);
+}
+
+unittest  // the upstream callback route is registered on the normalized redirect path
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com";
+	cfg.resource = "https://mcp.example.com/mcp";
+	cfg.redirectPath = "cb";
+
+	auto proxy = new OAuthProxy(cfg);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	auto res = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(
+			createTestHTTPServerRequest(URL(cfg.callbackUrl() ~ "?state=unknown")), res);
+	// The route exists (an unknown state is a 400), rather than falling through to a 404.
+	assert(res.statusCode == 400);
 }
 
 unittest  // mintState yields unique, non-empty values

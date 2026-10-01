@@ -613,10 +613,16 @@ string loopbackRedirectUri(ushort port, string path = "/callback") @safe pure
 {
 	import std.conv : to;
 
-	auto p = path.length ? path : "/callback";
-	if (p[0] != '/')
-		p = "/" ~ p;
-	return "http://127.0.0.1:" ~ port.to!string ~ p;
+	return "http://127.0.0.1:" ~ port.to!string ~ normalizeCallbackPath(path);
+}
+
+/// The loopback callback path as it appears in the redirect URI: `/callback`
+/// when empty, and always with a leading slash.
+package string normalizeCallbackPath(string path) @safe pure nothrow
+{
+	if (path.length == 0)
+		return "/callback";
+	return path[0] == '/' ? path : "/" ~ path;
 }
 
 /// The default token-store path under the user's config directory:
@@ -1004,13 +1010,14 @@ LoopbackCapture enforceIssOnCapture(LoopbackCapture cap, AuthorizationServerMeta
 	return cap;
 }
 
-/// Returns true when `reqPath` matches `callbackPath` exactly, meaning the
-/// request should be processed as an OAuth callback. Requests on any other path
-/// are always rejected with 404, regardless of query parameters — a request
-/// carrying `code=` or `error=` on the wrong path must not abort the flow.
-private bool isLoopbackCallbackPath(string reqPath, string callbackPath) @safe pure nothrow @nogc
+/// Returns true when `reqPath` matches the normalized `callbackPath` (the path
+/// the redirect URI names) exactly, meaning the request should be processed as
+/// an OAuth callback. Requests on any other path are always rejected with 404,
+/// regardless of query parameters — a request carrying `code=` or `error=` on
+/// the wrong path must not abort the flow.
+private bool isLoopbackCallbackPath(string reqPath, string callbackPath) @safe pure nothrow
 {
-	return reqPath == callbackPath;
+	return reqPath == normalizeCallbackPath(callbackPath);
 }
 
 /// Open the browser at the authorization URL and run a localhost loopback HTTP
@@ -1599,6 +1606,16 @@ unittest  // isLoopbackCallbackPath rejects a different path even when it carrie
 unittest  // isLoopbackCallbackPath rejects a different path even with an error= parameter
 {
 	assert(!isLoopbackCallbackPath("/favicon.ico", "/callback"));
+}
+
+unittest  // isLoopbackCallbackPath matches a callback path configured without a leading slash
+{
+	assert(isLoopbackCallbackPath("/callback", "callback"));
+}
+
+unittest  // isLoopbackCallbackPath matches the default path when the configured path is empty
+{
+	assert(isLoopbackCallbackPath("/callback", ""));
 }
 
 version (Posix) unittest  // FileTokenStore.writeSecretFile does not draw from the Mersenne Twister (std.random)
