@@ -38,34 +38,51 @@ private string stripTrailingSlash(string s) @safe
 	return s.endsWith("/") ? s[0 .. $ - 1] : s;
 }
 
+/// Settings shared by the JWT/JWKS presets. `resource` and `audience` are
+/// distinct: `resource` is what the protected-resource metadata publishes and
+/// MCP clients match against the URL they connect to, while `audience` is the
+/// `aud` value the IdP stamps in access tokens, which for many IdPs is an API
+/// identifier (an App ID URI, a client id) rather than the MCP server URL.
+struct JwtPresetOptions
+{
+	/// The canonical MCP server URL (e.g. `https://mcp.example.com/mcp`),
+	/// published as the RFC 9728 `resource`. Required.
+	string resource;
+	/// The JWT audience tokens must carry. Defaults to `resource` when empty,
+	/// for IdPs that honor the RFC 8707 resource indicator.
+	string audience;
+	/// Scopes required on every token, also advertised as `scopes_supported`.
+	string[] scopes;
+}
+
 /// Build a `ResourceServerConfig` for a JWT/JWKS IdP in one call: pins `issuer` +
-/// `jwksUri` + `audience` + `requiredScopes` on a `jwtVerifier`, and mirrors the
+/// `jwksUri` + the audience + required scopes on a `jwtVerifier`, and fills the
 /// public metadata fields (`resource`, `authorizationServers`, `scopesSupported`)
-/// so the audience/resource/scopes are never re-typed. The result is the single
-/// `auth` object the transport accepts (`StreamableHttpOptions.auth` /
-/// `mountMcp`), the D analogue of FastMCP's `auth=JWTVerifier(...)`.
-ResourceServerConfig jwtResourceServer(string issuer, string jwksUri,
-		string audience, string[] scopes = []) @safe
+/// from the same options. The result is the single `auth` object the transport
+/// accepts (`StreamableHttpOptions.auth` / `mountMcp`), the D analogue of
+/// FastMCP's `auth=JWTVerifier(...)`.
+ResourceServerConfig jwtResourceServer(string issuer, string jwksUri, JwtPresetOptions opts) @safe
 {
 	JwtVerifierConfig vc;
 	vc.issuer = issuer;
 	vc.jwksUri = jwksUri;
-	vc.audience = audience;
-	vc.requiredScopes = scopes.dup;
-	return resourceServer(vc);
+	vc.audience = opts.audience.length ? opts.audience : opts.resource;
+	vc.requiredScopes = opts.scopes.dup;
+	return resourceServer(vc, opts.resource);
 }
 
 /// Build a `ResourceServerConfig` directly from a `JwtVerifierConfig`, so a
 /// hand-tuned verifier (custom clock skew, pinned PEM keys, extra scopes) flows
-/// through the single `auth` entry without re-typing its `audience`/`issuer`/
-/// `requiredScopes` as the resource-server metadata. Derives `resource` from
-/// `vc.audience`, `authorizationServers` from `vc.issuer`, and `scopesSupported`
-/// from `vc.requiredScopes`.
-ResourceServerConfig resourceServer(JwtVerifierConfig vc) @safe
+/// through the single `auth` entry. `resource` is the canonical MCP server URL
+/// published in the protected-resource metadata; `authorizationServers` comes
+/// from `vc.issuer` and `scopesSupported` from `vc.requiredScopes`.
+ResourceServerConfig resourceServer(JwtVerifierConfig vc, string resource) @safe
 {
+	enforce(resource.length > 0,
+			"resourceServer: resource (the canonical MCP server URL) must be set.");
 	ResourceServerConfig cfg;
 	cfg.validator = jwtVerifier(vc);
-	cfg.resource = vc.audience;
+	cfg.resource = resource;
 	if (vc.issuer.length)
 		cfg.authorizationServers = [vc.issuer];
 	cfg.scopesSupported = vc.requiredScopes.dup;
@@ -78,20 +95,20 @@ ResourceServerConfig resourceServer(JwtVerifierConfig vc) @safe
 
 /// Microsoft Entra ID (Azure AD). Pins the v2.0 issuer
 /// `https://login.microsoftonline.com/{tenant}/v2.0` and the matching JWKS
-/// (`/discovery/v2.0/keys`). `audience` is the API's App ID URI or client id.
+/// (`/discovery/v2.0/keys`). `opts.audience` is typically the API's App ID URI
+/// or client id.
 ///
 /// `tenant` must be a concrete tenant GUID or a registered domain name.
 /// The pseudo-tenants `"common"`, `"organizations"`, and `"consumers"` are
 /// rejected because Entra ID never stamps them in the `iss` claim of a real
 /// token — every token would fail the issuer check at runtime. For a
 /// multi-tenant app, list the tenants it serves with `entraIdTenants`.
-ResourceServerConfig entraId(string tenant, string audience, string[] scopes = [
-]) @safe
+ResourceServerConfig entraId(string tenant, JwtPresetOptions opts) @safe
 {
 	requireConcreteEntraTenant(tenant, "entraId");
 	const issuer = "https://login.microsoftonline.com/" ~ tenant ~ "/v2.0";
 	const jwks = "https://login.microsoftonline.com/" ~ tenant ~ "/discovery/v2.0/keys";
-	return jwtResourceServer(issuer, jwks, audience, scopes);
+	return jwtResourceServer(issuer, jwks, opts);
 }
 
 /// Microsoft Entra ID for a multi-tenant app: accepts tokens from any of the
@@ -100,8 +117,7 @@ ResourceServerConfig entraId(string tenant, string audience, string[] scopes = [
 /// verifies against one of them, so the `iss` check is never dropped — with
 /// audience binding alone, a token minted by any Entra tenant for the same
 /// audience would be accepted.
-ResourceServerConfig entraIdTenants(string[] tenants, string audience, string[] scopes = [
-]) @safe
+ResourceServerConfig entraIdTenants(string[] tenants, JwtPresetOptions opts) @safe
 {
 	import mcp.auth.resource_server : TokenInfo, TokenValidator;
 
@@ -111,7 +127,7 @@ ResourceServerConfig entraIdTenants(string[] tenants, string audience, string[] 
 	foreach (tenant; tenants)
 	{
 		requireConcreteEntraTenant(tenant, "entraIdTenants");
-		auto one = entraId(tenant, audience, scopes);
+		auto one = entraId(tenant, opts);
 		validators ~= one.validator;
 		issuers ~= one.authorizationServers;
 	}
@@ -125,9 +141,11 @@ ResourceServerConfig entraIdTenants(string[] tenants, string audience, string[] 
 		}
 		return TokenInfo.invalid();
 	};
-	cfg.resource = audience;
+	enforce(opts.resource.length > 0,
+			"entraIdTenants: resource (the canonical MCP server URL) must be set.");
+	cfg.resource = opts.resource;
 	cfg.authorizationServers = issuers;
-	cfg.scopesSupported = scopes.dup;
+	cfg.scopesSupported = opts.scopes.dup;
 	return cfg;
 }
 
@@ -144,42 +162,39 @@ private void requireConcreteEntraTenant(string tenant, string fn) @safe
 
 /// Auth0. Pins the issuer `https://{domain}/` (Auth0 issuers carry the trailing
 /// slash) and JWKS `https://{domain}/.well-known/jwks.json`.
-ResourceServerConfig auth0(string domain, string audience, string[] scopes = []) @safe
+ResourceServerConfig auth0(string domain, JwtPresetOptions opts) @safe
 {
 	const d = stripTrailingSlash(domain);
 	const issuer = "https://" ~ d ~ "/";
 	const jwks = "https://" ~ d ~ "/.well-known/jwks.json";
-	return jwtResourceServer(issuer, jwks, audience, scopes);
+	return jwtResourceServer(issuer, jwks, opts);
 }
 
 /// WorkOS AuthKit. The `issuer` is the AuthKit domain
 /// (e.g. `https://your-app.authkit.app`); JWKS is at `{issuer}/oauth2/jwks`.
-ResourceServerConfig workosAuthKit(string issuer, string audience, string[] scopes = [
-]) @safe
+ResourceServerConfig workosAuthKit(string issuer, JwtPresetOptions opts) @safe
 {
 	const iss = stripTrailingSlash(issuer);
 	const jwks = iss ~ "/oauth2/jwks";
-	return jwtResourceServer(iss, jwks, audience, scopes);
+	return jwtResourceServer(iss, jwks, opts);
 }
 
 /// Descope. The issuer is `https://api.descope.com/{projectId}`; JWKS is at
 /// `https://api.descope.com/{projectId}/.well-known/jwks.json`.
-ResourceServerConfig descope(string projectId, string audience, string[] scopes = [
-]) @safe
+ResourceServerConfig descope(string projectId, JwtPresetOptions opts) @safe
 {
 	const issuer = "https://api.descope.com/" ~ projectId;
 	const jwks = issuer ~ "/.well-known/jwks.json";
-	return jwtResourceServer(issuer, jwks, audience, scopes);
+	return jwtResourceServer(issuer, jwks, opts);
 }
 
 /// Scalekit. The `envUrl` is the environment's issuer
 /// (e.g. `https://your-env.scalekit.dev`); JWKS is at `{envUrl}/keys`.
-ResourceServerConfig scalekit(string envUrl, string audience, string[] scopes = [
-]) @safe
+ResourceServerConfig scalekit(string envUrl, JwtPresetOptions opts) @safe
 {
 	const iss = stripTrailingSlash(envUrl);
 	const jwks = iss ~ "/keys";
-	return jwtResourceServer(iss, jwks, audience, scopes);
+	return jwtResourceServer(iss, jwks, opts);
 }
 
 // ===========================================================================
@@ -243,13 +258,27 @@ OAuthProxyConfig google(string clientId, string clientSecret, string[] scopes = 
 // Tests — per-provider known constants, no live network.
 // ===========================================================================
 
+version (unittest) private enum mcpUrl = "https://mcp.example.com/mcp";
+
+unittest  // a preset publishes the MCP server URL as resource while pinning a distinct audience
+{
+	auto cfg = auth0("tenant.auth0.com", JwtPresetOptions(mcpUrl, "https://api.example.com"));
+	assert(cfg.resource == mcpUrl);
+}
+
+unittest  // a preset refuses to build without the MCP server URL as resource
+{
+	import std.exception : assertThrown;
+
+	assertThrown(auth0("tenant.auth0.com", JwtPresetOptions("", "https://api.example.com")));
+}
+
 unittest  // Entra ID pins the v2.0 issuer, the discovery JWKS, and audience/scopes
 {
-	auto cfg = entraId("11111111-2222-3333-4444-555555555555", "api://my-mcp-server", [
-		"mcp.read"
-	]);
+	auto cfg = entraId("11111111-2222-3333-4444-555555555555",
+			JwtPresetOptions(mcpUrl, "api://my-mcp-server", ["mcp.read"]));
 	assert(cfg.enabled);
-	assert(cfg.resource == "api://my-mcp-server");
+	assert(cfg.resource == mcpUrl);
 	assert(cfg.authorizationServers
 			== [
 				"https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0"
@@ -259,43 +288,43 @@ unittest  // Entra ID pins the v2.0 issuer, the discovery JWKS, and audience/sco
 
 unittest  // Auth0 pins the trailing-slash issuer and the /.well-known/jwks.json URI
 {
-	auto cfg = auth0("my-tenant.us.auth0.com", "https://api.example.com");
+	auto cfg = auth0("my-tenant.us.auth0.com", JwtPresetOptions(mcpUrl,
+			"https://api.example.com"));
 	assert(cfg.enabled);
-	assert(cfg.resource == "https://api.example.com");
+	assert(cfg.resource == mcpUrl);
 	assert(cfg.authorizationServers == ["https://my-tenant.us.auth0.com/"]);
 }
 
 unittest  // Auth0 tolerates a domain supplied with a trailing slash
 {
-	auto cfg = auth0("my-tenant.us.auth0.com/", "https://api.example.com");
+	auto cfg = auth0("my-tenant.us.auth0.com/", JwtPresetOptions(mcpUrl));
 	assert(cfg.authorizationServers == ["https://my-tenant.us.auth0.com/"]);
 }
 
 unittest  // WorkOS AuthKit uses the AuthKit domain as the issuer
 {
-	auto cfg = workosAuthKit("https://example.authkit.app", "client-abc", [
-		"openid"
-	]);
+	auto cfg = workosAuthKit("https://example.authkit.app",
+			JwtPresetOptions(mcpUrl, "client-abc", ["openid"]));
 	assert(cfg.enabled);
-	assert(cfg.resource == "client-abc");
+	assert(cfg.resource == mcpUrl);
 	assert(cfg.authorizationServers == ["https://example.authkit.app"]);
 	assert(cfg.scopesSupported == ["openid"]);
 }
 
 unittest  // Descope builds the api.descope.com project issuer
 {
-	auto cfg = descope("P2abc123", "my-audience");
+	auto cfg = descope("P2abc123", JwtPresetOptions(mcpUrl, "my-audience"));
 	assert(cfg.enabled);
 	assert(cfg.authorizationServers == ["https://api.descope.com/P2abc123"]);
-	assert(cfg.resource == "my-audience");
+	assert(cfg.resource == mcpUrl);
 }
 
 unittest  // Scalekit uses the environment URL as the issuer
 {
-	auto cfg = scalekit("https://myenv.scalekit.dev", "skc_audience");
+	auto cfg = scalekit("https://myenv.scalekit.dev", JwtPresetOptions(mcpUrl, "skc_audience"));
 	assert(cfg.enabled);
 	assert(cfg.authorizationServers == ["https://myenv.scalekit.dev"]);
-	assert(cfg.resource == "skc_audience");
+	assert(cfg.resource == mcpUrl);
 }
 
 unittest  // GitHub fills in the fixed OAuth-app endpoints + credentials
@@ -325,21 +354,21 @@ unittest  // entraId rejects pseudo-tenant "common" at call time to prevent sile
 {
 	import std.exception : assertThrown;
 
-	assertThrown(entraId("common", "api://my-app"));
+	assertThrown(entraId("common", JwtPresetOptions(mcpUrl, "api://my-app")));
 }
 
 unittest  // entraId rejects pseudo-tenant "organizations" at call time
 {
 	import std.exception : assertThrown;
 
-	assertThrown(entraId("organizations", "api://my-app"));
+	assertThrown(entraId("organizations", JwtPresetOptions(mcpUrl, "api://my-app")));
 }
 
 unittest  // entraId rejects pseudo-tenant "consumers" at call time
 {
 	import std.exception : assertThrown;
 
-	assertThrown(entraId("consumers", "api://my-app"));
+	assertThrown(entraId("consumers", JwtPresetOptions(mcpUrl, "api://my-app")));
 }
 
 unittest  // entraId's pseudo-tenant error points at an issuer-checked multi-tenant option, not an empty issuer
@@ -347,18 +376,17 @@ unittest  // entraId's pseudo-tenant error points at an issuer-checked multi-ten
 	import std.algorithm : canFind;
 	import std.exception : collectExceptionMsg;
 
-	const msg = collectExceptionMsg(entraId("common", "api://my-app"));
+	const msg = collectExceptionMsg(entraId("common", JwtPresetOptions(mcpUrl, "api://my-app")));
 	assert(!msg.canFind("empty issuer"));
 	assert(msg.canFind("entraIdTenants"));
 }
 
 unittest  // entraIdTenants pins one v2.0 issuer per allowed tenant
 {
-	auto cfg = entraIdTenants(["tenant-a", "tenant-b"], "api://my-mcp-server", [
-		"mcp.read"
-	]);
+	auto cfg = entraIdTenants(["tenant-a", "tenant-b"],
+			JwtPresetOptions(mcpUrl, "api://my-mcp-server", ["mcp.read"]));
 	assert(cfg.enabled);
-	assert(cfg.resource == "api://my-mcp-server");
+	assert(cfg.resource == mcpUrl);
 	assert(cfg.authorizationServers == [
 		"https://login.microsoftonline.com/tenant-a/v2.0",
 		"https://login.microsoftonline.com/tenant-b/v2.0"
@@ -371,15 +399,15 @@ unittest  // entraIdTenants rejects an empty allowlist and pseudo-tenants
 {
 	import std.exception : assertThrown;
 
-	assertThrown(entraIdTenants([], "api://my-app"));
-	assertThrown(entraIdTenants(["tenant-a", "common"], "api://my-app"));
+	assertThrown(entraIdTenants([], JwtPresetOptions(mcpUrl)));
+	assertThrown(entraIdTenants(["tenant-a", "common"], JwtPresetOptions(mcpUrl)));
 }
 
 unittest  // entraId rejects an empty tenant string at call time
 {
 	import std.exception : assertThrown;
 
-	assertThrown(entraId("", "api://my-app"));
+	assertThrown(entraId("", JwtPresetOptions(mcpUrl, "api://my-app")));
 }
 
 unittest  // BROKER: github(...).brokered(...) reaches issue-own-token mode through the preset
@@ -419,7 +447,7 @@ unittest  // BROKER: google(...).brokered(...) reaches issue-own-token mode thro
 unittest  // a JWT preset wires a working validator that rejects garbage tokens
 {
 	// No live network: the validator parses the bearer and fails closed on junk.
-	auto cfg = entraId("tenant", "api://x");
+	auto cfg = entraId("tenant", JwtPresetOptions(mcpUrl, "api://x"));
 	assert(cfg.validator !is null);
 	assert(!cfg.validator("not-a-jwt").valid);
 }
@@ -432,7 +460,7 @@ unittest  // resourceServer(JwtVerifierConfig) bundles validator + metadata in o
 	vc.audience = "https://mcp.example.com/mcp";
 	vc.requiredScopes = ["mcp:read", "mcp:write"];
 
-	auto cfg = resourceServer(vc);
+	auto cfg = resourceServer(vc, "https://mcp.example.com/mcp");
 	assert(cfg.enabled);
 	assert(cfg.resource == "https://mcp.example.com/mcp");
 	assert(cfg.authorizationServers == ["https://as.example.com"]);
@@ -445,18 +473,18 @@ unittest  // resourceServer omits authorizationServers when no issuer is pinned
 {
 	JwtVerifierConfig vc;
 	vc.audience = "api://x";
-	auto cfg = resourceServer(vc);
+	auto cfg = resourceServer(vc, mcpUrl);
 	assert(cfg.enabled);
-	assert(cfg.resource == "api://x");
+	assert(cfg.resource == mcpUrl);
 	assert(cfg.authorizationServers.length == 0);
 }
 
 unittest  // the public jwtResourceServer one-liner produces a protected config
 {
 	auto cfg = jwtResourceServer("https://issuer.example",
-			"https://issuer.example/jwks", "https://mcp.example.com/mcp", [
+			"https://issuer.example/jwks", JwtPresetOptions(mcpUrl, "", [
 				"mcp:read"
-	]);
+	]));
 	assert(cfg.enabled);
 	assert(cfg.resource == "https://mcp.example.com/mcp");
 	assert(cfg.authorizationServers == ["https://issuer.example"]);
