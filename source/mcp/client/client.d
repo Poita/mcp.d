@@ -5,6 +5,7 @@ import std.algorithm : canFind, startsWith;
 import std.datetime : Clock, SysTime;
 import std.typecons : Nullable, nullable;
 
+import vibe.core.sync : LocalManualEvent, createManualEvent;
 import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
@@ -2763,6 +2764,11 @@ final class McpClient : ClientProtocol
 		void delegate(EventControl) @safe onControl;
 		SubscriptionStream stream;
 		long lastFrameMs;
+		// Emitted when `stream` ends, so the watchdog wakes at once rather than at
+		// its next scheduled check; `wakeCount` is its emit count when `stream`
+		// was opened.
+		LocalManualEvent wake;
+		int wakeCount;
 
 		this(StreamParams p, void delegate(EventOccurrence) @safe onEvent,
 				void delegate(EventControl) @safe onControl) @safe
@@ -2770,6 +2776,7 @@ final class McpClient : ClientProtocol
 			params = p;
 			this.onEvent = onEvent;
 			this.onControl = onControl;
+			wake = createManualEvent();
 		}
 	}
 
@@ -2779,6 +2786,7 @@ final class McpClient : ClientProtocol
 	private void openManagedStream(EventSubscription sub, ManagedStream ms, Nullable!string cursor) @safe
 	{
 		ms.lastFrameMs = eventNowMs();
+		ms.wakeCount = ms.wake.emitCount;
 		ms.stream = streamEvents(ms.params.name, (EventOccurrence o) @safe {
 			ms.lastFrameMs = eventNowMs();
 			sub.advanceCursor(o.cursor);
@@ -2794,10 +2802,12 @@ final class McpClient : ClientProtocol
 			if (ms.onControl !is null)
 				ms.onControl(c);
 		}, ms.params.arguments, cursor, ms.params.maxAgeMs);
+		ms.stream.addCleanup(() @safe nothrow{ ms.wake.emit(); });
 	}
 
-	/// The push-stream liveness watchdog: wakes every `streamDeadAfter`, and if the
-	/// stream ended or no frame arrived in that window closes it and reopens it from
+	/// The push-stream liveness watchdog: wakes every `streamDeadAfter` (or at
+	/// once when the stream ends), and if the stream ended or no frame arrived in
+	/// that window closes it and reopens it from
 	/// the subscription's last cursor. A transient failure (connection loss, HTTP
 	/// 5xx/408/429, internal error) is retried, backing off exponentially across
 	/// consecutive failed reopens; any other failure — the server refusing or
@@ -2816,7 +2826,7 @@ final class McpClient : ClientProtocol
 			const dead = eventSettings_.streamDeadAfter;
 			if (dead <= Duration.zero)
 				return;
-			streamWatchSleep(dead * (1L << (failures < 5 ? failures : 5)));
+			streamWatchSleep(ms, dead * (1L << (failures < 5 ? failures : 5)));
 			if (!sub.active || closed_)
 				return;
 			if (!ms.stream.ended && eventNowMs() - ms.lastFrameMs < dead.total!"msecs")
@@ -2880,8 +2890,9 @@ final class McpClient : ClientProtocol
 		reportEventError(ms.onControl, e);
 	}
 
-	/// Sleep between watchdog checks. A test seam runs the loop synchronously.
-	private void streamWatchSleep(Duration d) @safe
+	/// Wait up to `d` between watchdog checks, returning early once `ms`'s
+	/// current stream ends. A test seam runs the loop synchronously.
+	private void streamWatchSleep(ManagedStream ms, Duration d) @safe
 	{
 		version (unittest)
 			if (onStreamWatchSleepForTest !is null)
@@ -2889,9 +2900,7 @@ final class McpClient : ClientProtocol
 				onStreamWatchSleepForTest(d);
 				return;
 			}
-		import vibe.core.core : sleep;
-
-		() @trusted { sleep(d); }();
+		ms.wake.wait(d, ms.wakeCount);
 	}
 
 	/// Monotonic milliseconds for stream liveness. A test seam supplies the clock.
@@ -8926,6 +8935,48 @@ unittest  // a managed stream the server closed cleanly is reopened at the next 
 	c.runStreamWatchdog(sub);
 	assert(t.listens.length == 2,
 			"a stream the server closed must be reopened without waiting to go quiet");
+}
+
+unittest  // the watchdog reopens a stream the server closed without waiting out streamDeadAfter
+{
+	import core.time : MonoTime;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	EventClientSettings es;
+	es.streamDeadAfter = 10.seconds;
+	c.eventSettings = es;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	Duration took = Duration.max;
+	runTask(() nothrow{
+		try
+			c.runStreamWatchdog(sub);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			sleep(50.msecs);
+			const start = MonoTime.currTime;
+			t.streams[0].finish();
+			while (t.listens.length < 2 && MonoTime.currTime - start < 3.seconds)
+				sleep(10.msecs);
+			if (t.listens.length >= 2)
+				took = MonoTime.currTime - start;
+			sub.cancel();
+			sleep(20.msecs);
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(took < 1.seconds, "a server-closed stream must be reopened promptly");
 }
 
 unittest  // transient reopen failures back off between attempts

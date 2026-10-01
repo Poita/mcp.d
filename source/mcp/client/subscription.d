@@ -47,7 +47,7 @@ final class SubscriptionStream
 	// first cancel() (after the transport's own teardown) or when the server ends
 	// it. `McpClient.streamEvents` uses it to deregister the stream's
 	// per-subscription event/control handlers.
-	private void delegate() @safe nothrow cleanup_;
+	private void delegate() @safe nothrow[] cleanups_;
 	private bool cleanedUp_;
 
 	/// Construct a handle wrapping a shared cancellation flag. Created by a
@@ -78,19 +78,20 @@ final class SubscriptionStream
 
 	private void runCleanup() @safe nothrow
 	{
-		if (cleanedUp_ || cleanup_ is null)
+		if (cleanedUp_)
 			return;
 		cleanedUp_ = true;
-		cleanup_();
+		foreach (cleanup; cleanups_)
+			cleanup();
 	}
 
-	/// Attach a cleanup run exactly once when the stream ends: on the first
+	/// Add a cleanup run exactly once when the stream ends: on the first
 	/// `cancel()`/`close()` (after the transport's own teardown) or when the server
 	/// ends it. Set immediately after the stream is opened (before any end can
 	/// race), so client state is always deregistered.
 	void addCleanup(void delegate() @safe nothrow cleanup) @safe nothrow
 	{
-		cleanup_ = cleanup;
+		cleanups_ ~= cleanup;
 	}
 
 	/// Alias for `cancel()`.
