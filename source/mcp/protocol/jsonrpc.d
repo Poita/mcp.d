@@ -70,6 +70,12 @@ private void validateEnvelope(Json j) @safe
 	// yielding a clean -32600 across every transport.
 	if (("method" in j) && j["method"].type != Json.Type.string)
 		throw invalidRequest("`method` must be a string");
+	// JSON-RPC 2.0 §4.2: `params`, when present, MUST be a structured value
+	// (object or array). Rejecting primitives here keeps every handler from
+	// having to guard against reading fields off a number or string.
+	if (("params" in j) && j["params"].type != Json.Type.object
+			&& j["params"].type != Json.Type.array)
+		throw invalidRequest("`params` must be an object or array");
 	// A message bearing a `method` with an explicit `id:null` is neither a valid
 	// request (the spec requires a request id that is not null) nor a
 	// notification (which omits `id` entirely). Reject it so the peer receives a
@@ -546,4 +552,31 @@ unittest  // array id is rejected (JSON-RPC 2.0 §5: id must be string, number, 
 	import std.exception : assertThrown;
 
 	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":[],"method":"ping"}`));
+}
+
+unittest  // a request with primitive params is rejected (JSON-RPC 2.0 §4.2: params is structured)
+{
+	import std.exception : collectException;
+
+	foreach (p; [`5`, `"x"`, `true`, `null`])
+	{
+		auto ex = collectException!McpException(parseMessage(
+				`{"jsonrpc":"2.0","id":1,"method":"ping","params":` ~ p ~ `}`));
+		assert(ex !is null && ex.code == ErrorCode.invalidRequest, p);
+	}
+}
+
+unittest  // a notification with primitive params is rejected
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(
+			`{"jsonrpc":"2.0","method":"notifications/initialized","params":7}`));
+}
+
+unittest  // object, array and absent params are accepted
+{
+	parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}`);
+	parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping","params":[]}`);
+	parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
 }
