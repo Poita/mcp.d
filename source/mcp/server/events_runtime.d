@@ -551,6 +551,7 @@ final class EventsRuntime
 	private bool[string] runningSubscriptions_; // subscription ids with a delivery run in progress
 	private bool[string] localJobs_; // job ids waiting in or being delivered by a run on this node
 	private int[string] pendingCount_; // subscription id -> tracked, unsettled deliveries on this node
+	private string[string] cursorlessJobs_; // job id -> subscription id, for queued jobs with no cursor
 	private string[string] missed_; // subscription id -> furthest position dropped undelivered, owed a gap
 	private BackgroundLoop worker_; // the periodic worker `startDeliveryWorker` runs
 
@@ -1385,6 +1386,9 @@ final class EventsRuntime
 		webhookStore_.remove(sub.id);
 		outstanding_.remove(sub.id);
 		pendingCount_.remove(sub.id);
+		foreach (jobId, subId; cursorlessJobs_.dup)
+			if (subId == sub.id)
+				cursorlessJobs_.remove(jobId);
 		missed_.remove(sub.id);
 		nextFetchAt_.remove(sub.id);
 		releaseLifecycle(sub.name, sub.arguments, sub.principal);
@@ -1523,13 +1527,41 @@ final class EventsRuntime
 		// Track before enqueueing (a shared queue's enqueue can yield to a drain
 		// that settles the job), and untrack when the job id is already queued:
 		// that one job settles once, so it must be counted once.
+		const jobId = sub.id ~ "/" ~ shaped.eventId;
 		trackOutstanding(sub.id, shaped.cursor);
-		if (!deliveryQueue_.enqueue(Delivery(sub.id ~ "/" ~ shaped.eventId, sub.id, shaped, 0)))
+		// A job with no cursor has no position to settle, so it is counted
+		// against the bound by job id and released when it is acked.
+		const countById = shaped.cursor.isNull && (jobId in cursorlessJobs_) is null;
+		if (countById)
+		{
+			cursorlessJobs_[jobId] = sub.id;
+			pendingCount_[sub.id] = pendingCount_.get(sub.id, 0) + 1;
+		}
+		if (!deliveryQueue_.enqueue(Delivery(jobId, sub.id, shaped, 0)))
 		{
 			untrackOutstanding(sub.id, shaped.cursor);
+			if (countById)
+				releaseCursorless(jobId);
 			return false;
 		}
 		return true;
+	}
+
+	// Remove a delivery job from the queue, releasing its slot under the pending
+	// bound when it was counted by job id.
+	private void ackJob(string jobId) @safe
+	{
+		deliveryQueue_.ack(jobId);
+		releaseCursorless(jobId);
+	}
+
+	private void releaseCursorless(string jobId) @safe
+	{
+		if (auto subId = jobId in cursorlessJobs_)
+		{
+			decrementPending(*subId);
+			cursorlessJobs_.remove(jobId);
+		}
 	}
 
 	/// The deterministic subscription id for a key — a truncated SHA-256 of the
@@ -1927,7 +1959,7 @@ final class EventsRuntime
 				settlePosition(job.subscriptionId, job.occ.cursor);
 			catch (Exception e)
 				logEventsError("settling a dead-lettered delivery threw", e);
-			deliveryQueue_.ack(job.jobId);
+			ackJob(job.jobId);
 		}
 		else
 			deliveryQueue_.touch(job.jobId, attempt,
@@ -2011,7 +2043,7 @@ final class EventsRuntime
 		auto s0 = webhookStore_.get(subId);
 		if (s0.isNull)
 		{
-			deliveryQueue_.ack(job.jobId); // subscription gone; nothing to deliver
+			ackJob(job.jobId); // subscription gone; nothing to deliver
 			return;
 		}
 		if (!s0.get.active)
@@ -2050,7 +2082,7 @@ final class EventsRuntime
 		{
 			settlePosition(subId, occ.cursor);
 			signalGap(s0.get, occ);
-			deliveryQueue_.ack(job.jobId);
+			ackJob(job.jobId);
 			return;
 		}
 		int attempt = job.attempt;
@@ -2061,14 +2093,14 @@ final class EventsRuntime
 			auto sn = webhookStore_.get(subId);
 			if (sn.isNull)
 			{
-				deliveryQueue_.ack(job.jobId);
+				ackJob(job.jobId);
 				return;
 			}
 			auto res = attemptDelivery(sn.get, job);
 			if (res.ok)
 			{
 				recordSuccess(subId, occ.cursor);
-				deliveryQueue_.ack(job.jobId);
+				ackJob(job.jobId);
 				// The endpoint is taking deliveries again: send any gap it is owed.
 				flushMissed(sn.get);
 				return;
@@ -2078,7 +2110,7 @@ final class EventsRuntime
 			if (res.statusCode == 410 || res.statusCode == 413)
 			{
 				recordSuccess(subId, occ.cursor); // settled (abandoned), watermark advances
-				deliveryQueue_.ack(job.jobId);
+				ackJob(job.jobId);
 				return;
 			}
 			// Each failed attempt is one sample for the suspension policy, so an
@@ -2094,7 +2126,7 @@ final class EventsRuntime
 				settlePosition(subId, occ.cursor); // abandoned for watermark purposes
 				if (!job.gap)
 					signalGap(sn.get, occ); // tell the client the event was lost
-				deliveryQueue_.ack(job.jobId);
+				ackJob(job.jobId);
 				return;
 			}
 			opts_.deliverySleep(backoffFor(attempt));
@@ -2162,7 +2194,7 @@ final class EventsRuntime
 		if (!job.gap)
 			noteMissed(job.subscriptionId, job.occ.cursor);
 		settlePosition(job.subscriptionId, job.occ.cursor);
-		deliveryQueue_.ack(job.jobId);
+		ackJob(job.jobId);
 	}
 
 	// Record `cursor` as a position `subId` missed. Only the furthest one is kept:
@@ -5803,6 +5835,76 @@ unittest  // a subscription's queued deliveries are bounded; the overflow is sig
 	auto gaps = controlPostsOf(ft, "gap");
 	assert(gaps.length == 1 && parseJsonString(gaps[0].body)["cursor"].get!string == "3");
 	assert(rt.webhookStore().get(r.id).get.cursor.get == "3");
+}
+
+unittest  // the pending bound also holds for deliveries that carry no cursor
+{
+	import std.conv : to;
+
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	auto queue = new InMemoryDeliveryQueue();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryQueue = queue;
+	o.webhookMaxPendingPerSubscription = 2;
+	o.deliverySleep = (Duration d) @safe {};
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	int n;
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.pollInterval = 1.seconds;
+	reg.check = (EventContext ctx) @safe {
+		EventOccurrence[] batch;
+		foreach (_; 0 .. 3)
+			batch ~= EventOccurrence("m" ~ (++n).to!string, "email.received", "t");
+		return EventResult.noReplay(batch);
+	};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("email.received", "https://proxy/hooks"), "user-1");
+	now += 1_000;
+	rt.pollWebhookSubscriptions();
+	assert(queue.lease(now, 1000).length == 2);
+}
+
+unittest  // a delivered cursor-less job frees its slot under the pending bound
+{
+	import std.conv : to;
+
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.webhookMaxPendingPerSubscription = 1;
+	o.deliverySleep = (Duration d) @safe {};
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	auto rt = new EventsRuntime(null, o);
+	int n;
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.pollInterval = 1.seconds;
+	reg.check = (EventContext ctx) @safe {
+		return EventResult.noReplay([
+			EventOccurrence("m" ~ (++n).to!string, "email.received", "t")
+		]);
+	};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("email.received", "https://proxy/hooks"), "user-1");
+	const before = ft.eventPosts().length;
+	foreach (_; 0 .. 3)
+	{
+		now += 1_000;
+		rt.pollWebhookSubscriptions();
+	}
+	assert(ft.eventPosts().length == before + 3);
 }
 
 unittest  // endpoint verification and well-known caches are evicted once stale
