@@ -20,10 +20,6 @@ final class SkillIndex
 	/// `skills/get` looks up and duplicate registration checks against.
 	Json[string] byUri;
 
-	/// Entry URIs in registration order: the stable order `skills/list` pages
-	/// over.
-	string[] order;
-
 	/// Whether the skills extension has been enabled on the owning server, so
 	/// repeated `enableSkills` / `registerSkill` calls configure it at most once.
 	bool enabled;

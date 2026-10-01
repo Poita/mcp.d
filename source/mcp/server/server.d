@@ -2400,23 +2400,28 @@ final class McpServer : ServerCore
 	}
 
 	/// Shared `*/list` tail for `doListResources`/`doListResourceTemplates`/
-	/// `doListPrompts`/`doListTools`. Runs `pageBounds` over `keys` (already in the
-	/// handler's intended order), projects each item in the page via
+	/// `doListPrompts`/`doListTools`. Runs `pageBounds` over `items` (already
+	/// sorted ascending by `keyOf`, which must be unique per item, so a cursor
+	/// can resume after the last-seen key), projects each item in the page via
 	/// `getDesc(key).forVersion(ver)` onto `ResultT`'s `field`, sets `nextCursor`,
 	/// and returns `maybeCache(result, listHint(listMethod), ver)`. Keeping the
 	/// cursor/cache wiring in one place means a change to pagination or cache
 	/// gating lands on all four lists at once. `ResultT` is one of the four
 	/// structurally-identical list-result structs; `field` is its leading
 	/// collection field ("resources", "resourceTemplates", "prompts", "tools").
-	private Json paginatedList(ResultT, string field, K, Desc)(string listMethod,
-			K[] keys, scope Desc delegate(K) @safe getDesc, Json params, ProtocolVersion ver) @safe
+	private Json paginatedList(ResultT, string field, K, Desc)(string listMethod, K[] items,
+			scope string delegate(K) @safe keyOf,
+			scope Desc delegate(K) @safe getDesc, Json params, ProtocolVersion ver) @safe
 	{
+		import std.algorithm : map;
+		import std.array : array;
+
 		size_t begin, end;
 		Nullable!string next;
-		pageBounds(params, keys.length, pageSize_, begin, end, next);
+		pageBounds(params, items.map!keyOf.array, pageSize_, begin, end, next);
 
 		ResultT result;
-		foreach (key; keys[begin .. end])
+		foreach (key; items[begin .. end])
 			__traits(getMember, result, field) ~= getDesc(key).forVersion(ver);
 		result.nextCursor = next;
 		return maybeCache(result, listHint(listMethod), ver);
@@ -2935,15 +2940,20 @@ final class McpServer : ServerCore
 
 		auto uris = resources.keys;
 		sort(uris);
-		return paginatedList!(ListResourcesResult, "resources")("resources/list",
-				uris, (string uri) => resources[uri].descriptor, params, ver);
+		return paginatedList!(ListResourcesResult, "resources")("resources/list", uris,
+				(string uri) => uri, (string uri) => resources[uri].descriptor, params, ver);
 	}
 
 	private Json doListResourceTemplates(Json params, ProtocolVersion ver) @safe
 	{
+		import std.algorithm : sort;
+
+		auto sorted = templates.dup;
+		sort!((a, b) => a.descriptor.uriTemplate < b.descriptor.uriTemplate)(sorted);
 		return paginatedList!(ListResourceTemplatesResult, "resourceTemplates")(
-				"resources/templates/list",
-				templates, (RegisteredTemplate t) => t.descriptor, params, ver);
+				"resources/templates/list", sorted,
+				(RegisteredTemplate t) => t.descriptor.uriTemplate,
+				(RegisteredTemplate t) => t.descriptor, params, ver);
 	}
 
 	private Json doReadResource(Json params, RequestContext ctx,
@@ -3062,11 +3072,11 @@ final class McpServer : ServerCore
 
 		sort!((a, b) => a.uri < b.uri)(children);
 		return paginatedList!(ListResourcesResult, "resources")("resources/directory/read",
-				children, (Resource r) => r, params, ver);
+				children, (Resource r) => r.uri, (Resource r) => r, params, ver);
 	}
 
 	/// Serve `skills/list` (Skills extension): the registered skill entries in
-	/// registration order, paginated like the base `*/list` methods. Entries are
+	/// `SKILL.md` URI order, paginated like the base `*/list` methods. Entries are
 	/// atomic — a skill's `resources` manifest is never split across pages. Not
 	/// routed through `paginatedList` because entries are raw extension-defined
 	/// Json with no `forVersion` projection, but it shares `maybeCache`: the
@@ -3074,12 +3084,16 @@ final class McpServer : ServerCore
 	/// `ttlMs`/`cacheScope` (configured via `setListCacheHint("skills/list")`).
 	private Json doListSkills(Json params, ProtocolVersion ver) @safe
 	{
+		import std.algorithm : sort;
+
+		auto uris = skillIndex_.byUri.keys;
+		sort(uris);
 		size_t begin, end;
 		Nullable!string next;
-		pageBounds(params, skillIndex_.order.length, pageSize_, begin, end, next);
+		pageBounds(params, uris, pageSize_, begin, end, next);
 
 		ListSkillsResult result;
-		foreach (uri; skillIndex_.order[begin .. end])
+		foreach (uri; uris[begin .. end])
 			result.skills ~= skillIndex_.byUri[uri];
 		result.nextCursor = next;
 		return maybeCache(result, listHint("skills/list"), ver);
@@ -3189,8 +3203,8 @@ final class McpServer : ServerCore
 		// to peers that don't understand them. `BaseMetadata.title` was introduced
 		// by 2025-06-18 and `Prompt.icons` by 2025-11-25; forVersion strips each on
 		// older versions.
-		return paginatedList!(ListPromptsResult, "prompts")("prompts/list",
-				names, (string name) => prompts[name].descriptor, params, ver);
+		return paginatedList!(ListPromptsResult, "prompts")("prompts/list", names,
+				(string name) => name, (string name) => prompts[name].descriptor, params, ver);
 	}
 
 	/// The per-list modern cache hint configured for `listMethod`, or null if none.
@@ -3424,8 +3438,8 @@ final class McpServer : ServerCore
 		// Each tool is projected to the negotiated protocol version (via
 		// `paginatedList` -> `forVersion`) so version-gated fields are not emitted
 		// to peers that don't understand them.
-		return paginatedList!(ListToolsResult, "tools")("tools/list",
-				sortedToolNames(), (string name) => tools[name].descriptor, params, ver);
+		return paginatedList!(ListToolsResult, "tools")("tools/list", sortedToolNames(),
+				(string name) => name, (string name) => tools[name].descriptor, params, ver);
 	}
 
 	private Json doCallTool(Json params, RequestContext ctx,
@@ -10287,6 +10301,47 @@ unittest  // setPageSize paginates tools/list across cursor-following pages
 	assert("nextCursor" !in page3["result"]);
 }
 
+unittest  // a tools/list cursor resumes after the last-seen tool when earlier tools are removed
+{
+	auto s = new McpServer("t", "1");
+	foreach (name; ["a", "b", "c", "d", "e"])
+	{
+		Tool tool = {name: name};
+		s.registerTool(tool, (Json) @safe => CallToolResult.init);
+	}
+	s.setPageSize(2);
+	auto page1 = s.handle(req(1, "tools/list")).get["result"];
+	assert(page1["tools"][1]["name"].get!string == "b");
+	s.removeTool("a");
+	Tool late = {name: "bb"};
+	s.registerTool(late, (Json) @safe => CallToolResult.init);
+	auto page2 = s.handle(req(2, "tools/list",
+			Json(["cursor": page1["nextCursor"]]))).get["result"];
+	assert(page2["tools"][0]["name"].get!string == "bb");
+	assert(page2["tools"][1]["name"].get!string == "c");
+}
+
+unittest  // a resources/templates/list cursor survives removal of an earlier template
+{
+	auto s = new McpServer("t", "1");
+	foreach (name; ["test://c/{id}", "test://a/{id}", "test://b/{id}"])
+	{
+		ResourceTemplate t = {uriTemplate: name, name: "t"};
+		s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
+			return ResourceContents.makeText(uri, "text/plain", "x");
+		});
+	}
+	s.setPageSize(1);
+	auto page1 = s.handle(req(1, "resources/templates/list")).get["result"];
+	const first = page1["resourceTemplates"][0]["uriTemplate"].get!string;
+	assert(s.removeResourceTemplate(first));
+	auto page2 = s.handle(req(2, "resources/templates/list",
+			Json(["cursor": page1["nextCursor"]]))).get["result"];
+	assert(page2["resourceTemplates"].length == 1);
+	assert(page2["resourceTemplates"][0]["uriTemplate"].get!string > first);
+	assert("nextCursor" in page2);
+}
+
 unittest  // without setPageSize, tools/list returns everything in one page (no cursor)
 {
 	import std.conv : to;
@@ -10395,7 +10450,7 @@ unittest  // an invalid pagination cursor yields invalidParams (-32602)
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
-unittest  // a stale cursor pointing past the end of the list yields invalidParams (-32602)
+unittest  // a well-formed cursor the server never issued yields invalidParams (-32602)
 {
 	import std.string : representation;
 	import mcp.auth.oauth : base64UrlNoPad;
@@ -10408,10 +10463,8 @@ unittest  // a stale cursor pointing past the end of the list yields invalidPara
 		return r;
 	});
 	s.setPageSize(1);
-	// A well-formed cursor encoding an offset far beyond the single registered
-	// tool: the client may be replaying a stale cursor from a longer, earlier
-	// result set. This MUST be rejected with -32602 rather than silently
-	// returning an empty final page.
+	// Valid base64 that does not decode to a server-issued cursor is rejected
+	// rather than read as a position in the list.
 	Json p = Json.emptyObject;
 	p["cursor"] = base64UrlNoPad("999".representation);
 	auto resp = s.handle(req(1, "tools/list", p)).get;

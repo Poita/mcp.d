@@ -320,7 +320,6 @@ package(mcp) void addSkillEntry(McpServer server, Json entry) @safe
 	if (uri in index.byUri)
 		throw new Exception("a skill entry for '" ~ uri ~ "' is already registered");
 	index.byUri[uri] = entry;
-	index.order ~= uri;
 }
 
 // Build a resource reader that closes over its file/uri by PARAMETER. Capturing a
@@ -1592,13 +1591,13 @@ unittest  // a supporting file named SKILL.md collides with the skill markdown a
 	assertThrown!Exception(registerSkill(s, bad));
 }
 
-unittest  // multiple skills accumulate in the listing in registration order
+unittest  // multiple skills accumulate in the listing in SKILL.md URI order
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	registerSkill(s, "alpha", "First", "a");
 	registerSkill(s, "beta", "Second", "b");
+	registerSkill(s, "alpha", "First", "a");
 
 	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
 			Json.emptyObject))).get["result"];
@@ -2034,8 +2033,9 @@ unittest  // listSkills surfaces a dynamic entry as isDynamic with an empty mani
 
 	auto skills = listSkills(client);
 	assert(skills.length == 2);
-	assert(!skills[0].isDynamic && skills[0].resources.length == 1);
-	assert(skills[1].isDynamic && skills[1].resources.length == 0 && skills[1].isValid);
+	// Listed in SKILL.md URI order: dynamic-one sorts before static-one.
+	assert(skills[0].isDynamic && skills[0].resources.length == 0 && skills[0].isValid);
+	assert(!skills[1].isDynamic && skills[1].resources.length == 1);
 }
 
 unittest  // getSkill surfaces the server's -32602 for a non-skill uri
