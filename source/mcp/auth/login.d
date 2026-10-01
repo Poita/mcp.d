@@ -531,12 +531,6 @@ struct LoopbackCapture
 	}
 }
 
-/// Parse the path+query of an inbound loopback HTTP request (e.g.
-/// `/callback?code=abc&state=xyz`) and extract the OAuth authorization response
-/// parameters. When `expectedState` is non-empty, a missing or mismatched
-/// `state` clears the captured `code` and records an error (MCP "Open
-/// Redirection": clients SHOULD verify the state parameter and discard
-/// mismatched results).
 /// Extract just the path component of an inbound HTTP request target, dropping
 /// any `?query` and `#fragment`. An empty target yields an empty path.
 string requestTargetPath(string requestTarget) @safe pure nothrow
@@ -551,6 +545,12 @@ string requestTargetPath(string requestTarget) @safe pure nothrow
 	return path;
 }
 
+/// Parse the path+query of an inbound loopback HTTP request (e.g.
+/// `/callback?code=abc&state=xyz`) and extract the OAuth authorization response
+/// parameters. When `expectedState` is non-empty, a missing or mismatched
+/// `state` clears the captured `code` and records an error (MCP "Open
+/// Redirection": clients SHOULD verify the state parameter and discard
+/// mismatched results).
 LoopbackCapture parseLoopbackCallback(string requestTarget, string expectedState = "") @safe
 {
 	LoopbackCapture c;
