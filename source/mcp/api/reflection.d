@@ -392,15 +392,17 @@ T argsAs(T)(Json arguments) @safe
 }
 
 /// The JSON Schema describing a tool's structured output, derived from its
-/// return type — or `Json.undefined` when the tool produces unstructured text
-/// (a `string`) or supplies its own `CallToolResult`. Fieldwise-serialized
+/// return type — or `Json.undefined` when the tool produces unstructured
+/// content (a `string`, `Content`, or `Content[]`) or supplies its own
+/// `CallToolResult`. Fieldwise-serialized
 /// structs map to their object schema directly; every other return (scalars,
 /// arrays, enums, `Nullable`, `Json`, `SumType`, and custom-serialized structs
 /// such as `SysTime`) is wrapped under a `result` property so
 /// `structuredContent` is always an object.
 private Json outputSchemaOf(R)() @safe
 {
-	static if (is(R == CallToolResult) || is(R == ToolResponse) || isSomeString!R || is(R == void))
+	static if (is(R == CallToolResult) || is(R == ToolResponse)
+			|| isSomeString!R || is(R == void) || is(R == Content) || is(R == Content[]))
 		return Json.undefined;
 	else static if (isFieldwiseStruct!R)
 		return schemaOf!(R, false);
@@ -419,11 +421,21 @@ private Json outputSchemaOf(R)() @safe
 /// Wrap a tool method's return value into a `CallToolResult`. The structured
 /// result mirrors `outputSchemaOf!R`: fieldwise structs serialize to an object;
 /// every other value is wrapped under a `result` key; strings become text
-/// content with no structured output.
+/// content and `Content` / `Content[]` become the content itself, with no
+/// structured output.
 private CallToolResult toToolResult(R)(R ret) @safe if (!is(R == void))
 {
 	static if (is(R == CallToolResult))
 		return ret;
+	else static if (is(R == Content) || is(R == Content[]))
+	{
+		CallToolResult r;
+		static if (is(R == Content))
+			r.content = [ret];
+		else
+			r.content = ret;
+		return r;
+	}
 	else static if (isSomeString!R)
 	{
 		CallToolResult r;
@@ -3707,4 +3719,41 @@ version (unittest) private final class EchoSafeApi
 	{
 		return msg;
 	}
+}
+
+version (unittest) private final class ContentToolApi
+{
+	@tool("one", "Return a single content block")
+	Content one() @safe
+	{
+		return Content.makeText("hi");
+	}
+
+	@tool("many", "Return several content blocks")
+	Content[] many() @safe
+	{
+		return [Content.makeText("a"), Content.makeText("b")];
+	}
+}
+
+unittest  // a Content return becomes the result's content with no structured output
+{
+	assert(outputSchemaOf!Content().type == Json.Type.undefined);
+	auto r = toToolResult(Content.makeText("hi"));
+	assert(r.content.length == 1);
+	assert(r.structuredContent.type == Json.Type.undefined);
+}
+
+unittest  // a Content[] return becomes the result's content with no structured output
+{
+	assert(outputSchemaOf!(Content[])().type == Json.Type.undefined);
+	auto r = toToolResult([Content.makeText("a"), Content.makeText("b")]);
+	assert(r.content.length == 2);
+	assert(r.structuredContent.type == Json.Type.undefined);
+}
+
+unittest  // @tool methods returning Content and Content[] register
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ContentToolApi);
 }
