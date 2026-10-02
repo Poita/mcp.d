@@ -94,7 +94,9 @@ final class EventHandle(A, P)
 
 	/// Publish a typed payload: fans out to node-local stream/poll subscribers and
 	/// enqueues webhook deliveries. Reach is the scope of the injected registries
-	/// (stream/poll are always node-local; webhook is as wide as the store).
+	/// (stream/poll are always node-local; webhook is as wide as the store). On a
+	/// type with an `onFetch` handler, poll reads from the handler, so a published
+	/// event reaches live streams and webhook subscribers but no poller.
 	void publish(P payload) @safe
 	{
 		EventOccurrence occ;
@@ -919,6 +921,9 @@ final class EventsRuntime
 	/// cursor) and fan it out to every active push stream whose subscription
 	/// matches, applying the type's `match`/`transform` per subscription. The
 	/// webhook engine additionally enqueues deliveries (see the webhook section).
+	/// Only an emit-only type is buffered: a check-backed type's poll is served by
+	/// its check function, so an event emitted for it reaches live push streams
+	/// and webhook subscribers but never `events/poll`.
 	void emit(EventOccurrence occ) @safe
 	{
 		stamp(occ);

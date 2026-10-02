@@ -761,7 +761,9 @@ incidents.publish(Incident("INC-1", "P1"));   // fans out to streams/poll + the 
 
 `publish(P)` is the single push verb; its reach is the scope of the injected
 registries (stream/poll are always node-local; webhook is as wide as the
-`WebhookSubscriptionStore`). The handle also carries typed `onSubscribe`/`onUnsubscribe`
+`WebhookSubscriptionStore`). Poll sees published events only on a type without a
+fetch handler: once `onFetch` is set, poll reads from the handler, so `publish`
+reaches live streams and webhook subscribers but never a poller. The handle also carries typed `onSubscribe`/`onUnsubscribe`
 lifecycle hooks (start an author-owned live source task in `onSubscribe` that
 `publish`es, and stop it in `onUnsubscribe`) and `pollInterval`. The hooks fire **exactly once per `(principal, name,
 arguments)` per node**: the lifecycle refcount is node-local, so on a multi-node
