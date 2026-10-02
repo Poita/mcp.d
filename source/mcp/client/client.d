@@ -438,6 +438,11 @@ final class McpClient : ClientProtocol
 	// It is re-derived whenever the underlying entry changes (a different
 	// physical key or expiry) and dropped when the entry is gone.
 	private Tool[string] storeToolIndex_;
+	// Invalidation count per logical cache entry (method + key). `cachedFetch`
+	// stores a result only when no invalidation for its entry arrived while the
+	// fetch was in flight, so a change notification is never overwritten by the
+	// stale response it raced with.
+	private ulong[string] cacheGenerations_;
 	private CacheKey storeToolIndexKey_;
 	private SysTime storeToolIndexStamp_;
 	private bool storeToolIndexValid_;
@@ -1239,6 +1244,7 @@ final class McpClient : ClientProtocol
 
 	private ListToolsResult listToolsImpl(RequestOptions opts) @safe
 	{
+		const generation = cacheGeneration("tools/list", "");
 		auto acc = cachedFetch!ListToolsResult(CacheKey("tools/list", ""), opts.cacheMode, () @safe {
 			auto a = drainList!ListToolsResult("tools/list",
 				(ref ListToolsResult x, ref ListToolsResult r) @safe {
@@ -1255,10 +1261,13 @@ final class McpClient : ClientProtocol
 				a.tools = excludeInvalidHeaderTools(a.tools);
 			return a;
 		});
-		listedTools_ = null;
-		foreach (t; acc.tools)
-			listedTools_[t.name] = t;
-		haveListedTools_ = true;
+		if (cacheGeneration("tools/list", "") == generation)
+		{
+			listedTools_ = null;
+			foreach (t; acc.tools)
+				listedTools_[t.name] = t;
+			haveListedTools_ = true;
+		}
 		return acc;
 	}
 
@@ -1481,8 +1490,9 @@ final class McpClient : ClientProtocol
 			if (!hit.isNull)
 				return R.fromJson(hit.get.value);
 		}
+		const generation = cacheGeneration(logical.method, logical.key);
 		R result = fetch(uncacheable);
-		if (uncacheable)
+		if (uncacheable || cacheGeneration(logical.method, logical.key) != generation)
 			return result;
 		const ttl = result.cache.isNull ? defaultCacheTtl_ : result.cache.get.ttl;
 		if (ttl > Duration.zero)
@@ -1497,14 +1507,33 @@ final class McpClient : ClientProtocol
 				cacheStore_.invalidate(otherKey);
 		}
 		else
-			invalidateLogical(logical.method, logical.key); // do-not-cache: drop any stale entry
+			evictLogical(logical.method, logical.key); // do-not-cache: drop any stale entry
 		return result;
+	}
+
+	private static string generationKey(string method, string key) @safe pure nothrow
+	{
+		return method ~ "\0" ~ key;
+	}
+
+	/// How many times the logical entry `method`/`key` has been invalidated.
+	private ulong cacheGeneration(string method, string key) @safe
+	{
+		return cacheGenerations_.get(generationKey(method, key), 0);
+	}
+
+	/// Handle a server change notification for a logical entry: evict it and
+	/// advance its generation so an in-flight fetch does not re-store it.
+	private void invalidateLogical(string method, string key) @safe
+	{
+		cacheGenerations_[generationKey(method, key)]++;
+		evictLogical(method, key);
 	}
 
 	/// Evict a logical cacheable entry from both this client's own partition and
 	/// the shared partition (the only two places a given client could have stored
-	/// it). Used on do-not-cache results and on the server's change notifications.
-	private void invalidateLogical(string method, string key) @safe
+	/// it).
+	private void evictLogical(string method, string key) @safe
 	{
 		if (cacheStore_ is null)
 			return;
@@ -5055,6 +5084,21 @@ unittest  // a private-scoped tools/list with no freshness is not left in the sh
 	]);
 	c.listTools();
 	assert(store.get(CacheKey("tools/list", "", "", "http://localhost")).isNull);
+}
+
+unittest  // a list_changed that arrives while tools/list is in flight is not overwritten by the stale result
+{
+	auto c = McpClient.http("http://localhost");
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		calls++;
+		if (calls == 1)
+			c.dispatchNotification("notifications/tools/list_changed", Json.emptyObject);
+		return Json(["tools": Json.emptyArray, "ttlMs": Json(60_000)]);
+	};
+	c.listTools();
+	c.listTools();
+	assert(calls == 2, "the result fetched before list_changed must not be cached");
 }
 
 unittest  // tools/list_changed clears the tool index built by listTools
