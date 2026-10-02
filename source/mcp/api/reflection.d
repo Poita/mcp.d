@@ -54,9 +54,22 @@ template EnumByNamePolicy(T) if (is(T == enum))
 /// Register every `@tool` / `@prompt` / `@resource` / `@resourceTemplate`
 /// annotated method of `obj` on `server`, deriving JSON schemas and argument
 /// marshalling from the method signatures (FastMCP-style ergonomics).
+///
+/// `obj` is a class instance, an interface, or a pointer to a struct: the
+/// registered handlers call its methods for the server's lifetime, so a struct
+/// passed by value is rejected — they would act on a copy.
 void registerHandlers(T)(McpServer server, T obj) @safe
 {
-	registerAnnotatedMembers!(T, obj)(server);
+	static if (is(T == U*, U) && is(U == struct))
+		registerAnnotatedMembers!(U, obj)(server);
+	else
+	{
+		static assert(is(T == class) || is(T == interface),
+				"registerHandlers needs a class instance or a pointer to a struct, not "
+				~ T.stringof ~ "; a struct passed by value is copied, so its handlers would not "
+				~ "see or update the original (allocate it with new and pass the pointer)");
+		registerAnnotatedMembers!(T, obj)(server);
+	}
 }
 
 /// Register every `@tool` / `@prompt` / `@resource` / `@resourceTemplate`
@@ -4323,4 +4336,32 @@ unittest  // a tool without @strictArgs ignores an unknown argument
 	registerHandlers(s, new StrictArgsApi);
 	auto r = callToolArgs(s, "lenient", `{"q":"x","extra":true}`);
 	assert("isError" !in r, r.toString);
+}
+
+version (unittest) private struct CounterApi
+{
+	int calls;
+
+	@tool("bump", "Count a call")
+	int bump() @safe
+	{
+		return ++calls;
+	}
+}
+
+unittest  // registerHandlers rejects a struct value, whose handlers would mutate a copy
+{
+	auto s = new McpServer("t", "1");
+	CounterApi api;
+	static assert(!__traits(compiles, registerHandlers(s, api)));
+}
+
+unittest  // registerHandlers with a pointer to a struct dispatches to that struct
+{
+	auto s = new McpServer("t", "1");
+	auto api = new CounterApi;
+	registerHandlers(s, api);
+	callToolArgs(s, "bump", `{}`);
+	callToolArgs(s, "bump", `{}`);
+	assert(api.calls == 2);
 }
