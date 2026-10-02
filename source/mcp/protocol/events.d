@@ -214,11 +214,13 @@ struct EventOccurrence
 }
 
 /// Read the optional non-negative integer field `key` of a request's params into
-/// `val`. Absent or null leaves `val` null; any other non-integer or a negative
-/// value throws -32602 InvalidParams, so a malformed bound is refused rather than
-/// silently ignored.
+/// `val`. Absent or null leaves `val` null. A whole-number float (`60000.0`) is
+/// accepted, and an integer beyond `long.max` clamps to `long.max`. Any other
+/// value, a fraction, or a negative number throws -32602 InvalidParams, so a
+/// malformed bound is refused rather than silently ignored.
 private void readNonNegative(Json j, string key, ref Nullable!long val) @safe
 {
+	import std.bigint : BigInt;
 	import mcp.protocol.errors : invalidParams;
 
 	if (j.type != Json.Type.object)
@@ -226,9 +228,39 @@ private void readNonNegative(Json j, string key, ref Nullable!long val) @safe
 	auto v = key in j;
 	if (v is null || v.type == Json.Type.null_ || v.type == Json.Type.undefined)
 		return;
-	if (v.type != Json.Type.int_ || v.get!long < 0)
-		throw invalidParams("'" ~ key ~ "' must be a non-negative integer");
-	val = v.get!long;
+	auto bad = () => invalidParams("'" ~ key ~ "' must be a non-negative integer");
+	switch (v.type)
+	{
+	case Json.Type.int_:
+		if (v.get!long < 0)
+			throw bad();
+		val = v.get!long;
+		break;
+	case Json.Type.bigInt:
+		// vibe parses only out-of-`long`-range integers as bigInt.
+		if (v.get!BigInt < 0)
+			throw bad();
+		val = long.max;
+		break;
+	case Json.Type.float_:
+		const d = v.get!double;
+		// `!(d >= 0)` also rejects NaN.
+		if (!(d >= 0))
+			throw bad();
+		// Every double this large is a whole number; clamp like a bigInt.
+		if (d >= 0x1p63)
+		{
+			val = long.max;
+			break;
+		}
+		const l = cast(long) d;
+		if (l != d)
+			throw bad();
+		val = l;
+		break;
+	default:
+		throw bad();
+	}
 }
 
 /// Parameters of an `events/poll` request. `cursor: null` means "from now".
@@ -893,8 +925,8 @@ unittest  // EventType carries an optional title and round-trips it
 unittest  // EventType leaves an absent title/description null on parse
 {
 	auto e = EventType.fromJson(Json([
-			"name": Json("x"),
-			"delivery": Json.emptyArray
+		"name": Json("x"),
+		"delivery": Json.emptyArray
 	]));
 	assert(e.title.isNull && e.description.isNull);
 }
@@ -1027,6 +1059,39 @@ unittest  // PollParams rejects a negative maxAgeMs with InvalidParams
 	auto e = collectException!McpException(
 			PollParams.fromJson(parseJsonString(`{"name":"n","maxAgeMs":-5}`)));
 	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // PollParams accepts a whole-number float maxAgeMs/maxEvents
+{
+	import vibe.data.json : parseJsonString;
+
+	auto p = PollParams.fromJson(
+			parseJsonString(`{"name":"n","maxAgeMs":60000.0,"maxEvents":5.0}`));
+	assert(p.maxAgeMs.get == 60_000 && p.maxEvents.get == 5);
+}
+
+unittest  // PollParams clamps a maxAgeMs beyond long.max to long.max
+{
+	import vibe.data.json : parseJsonString;
+
+	auto p = PollParams.fromJson(parseJsonString(`{"name":"n","maxAgeMs":99999999999999999999}`));
+	assert(p.maxAgeMs.get == long.max);
+}
+
+unittest  // PollParams rejects a negative bigInt or out-of-range float maxAgeMs
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	foreach (s; [
+		`{"name":"n","maxAgeMs":-99999999999999999999}`,
+		`{"name":"n","maxAgeMs":-1.0}`, `{"name":"n","maxAgeMs":"5"}`
+	])
+	{
+		auto e = collectException!McpException(PollParams.fromJson(parseJsonString(s)));
+		assert(e !is null && e.code == ErrorCode.invalidParams, s);
+	}
 }
 
 unittest  // PollParams treats null maxAgeMs/maxEvents as absent
