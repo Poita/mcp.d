@@ -544,9 +544,11 @@ interface DeliveryQueue
 	/// stand — and false is returned; true means the job was added.
 	bool enqueue(Delivery job) @safe;
 
-	/// Claim and return the jobs that are ready at `nowMs` — unleased, or leased
-	/// with an expired lease — marking each leased until `nowMs + leaseMs`.
-	Delivery[] lease(long nowMs, long leaseMs) @safe;
+	/// Claim and return up to `maxJobs` (0 = no limit) of the jobs that are ready
+	/// at `nowMs` — unleased, or leased with an expired lease — oldest first,
+	/// marking each leased until `nowMs + leaseMs`. The limit keeps one node from
+	/// claiming a whole backlog that other nodes could be delivering.
+	Delivery[] lease(long nowMs, long leaseMs, size_t maxJobs) @safe;
 
 	/// Persist a job's `attempt` count and extend its lease to `leasedUntilMs`, so
 	/// the retry count survives a re-lease (crash recovery bounds total attempts)
@@ -579,34 +581,56 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 		ulong seq; /// enqueue order, so a lease hands jobs out first-in first-out
 	}
 
+	private struct Slot
+	{
+		string jobId;
+		ulong seq;
+	}
+
 	private Entry[string] entries_;
 	private ulong nextSeq_;
+	// Enqueue order. A slot whose job was acked (or re-enqueued under a newer
+	// seq) is dead and skipped; dead slots are compacted away once they
+	// outnumber the live ones, so a lease walks jobs in order without sorting.
+	private Slot[] order_;
 
 	bool enqueue(Delivery job) @safe
 	{
 		if ((job.jobId in entries_) !is null)
 			return false;
-		entries_[job.jobId] = Entry(job.toJson(), 0, nextSeq_++);
+		const seq = nextSeq_++;
+		entries_[job.jobId] = Entry(job.toJson(), 0, seq);
+		order_ ~= Slot(job.jobId, seq);
 		return true;
 	}
 
-	Delivery[] lease(long nowMs, long leaseMs) @safe
+	Delivery[] lease(long nowMs, long leaseMs, size_t maxJobs) @safe
 	{
-		import std.algorithm : sort;
-
-		string[] ready;
-		foreach (id, ref e; entries_)
-			if (e.leasedUntilMs <= nowMs)
-				ready ~= id;
-		ready.sort!((a, b) => entries_[a].seq < entries_[b].seq);
 		Delivery[] result;
-		foreach (id; ready)
+		foreach (slot; order_)
 		{
-			auto e = id in entries_;
+			auto e = slot.jobId in entries_;
+			if (e is null || e.seq != slot.seq || e.leasedUntilMs > nowMs)
+				continue;
 			e.leasedUntilMs = nowMs + leaseMs;
 			result ~= Delivery.fromJson(e.job);
+			if (maxJobs > 0 && result.length >= maxJobs)
+				break;
 		}
 		return result;
+	}
+
+	private void compact() @safe
+	{
+		if (order_.length < 2 * entries_.length + 16)
+			return;
+		Slot[] live;
+		live.reserve(entries_.length);
+		foreach (slot; order_)
+			if (auto e = slot.jobId in entries_)
+				if (e.seq == slot.seq)
+					live ~= slot;
+		order_ = live;
 	}
 
 	void touch(string jobId, int attempt, long leasedUntilMs) @safe
@@ -627,6 +651,7 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 	void ack(string jobId) @safe
 	{
 		entries_.remove(jobId);
+		compact();
 	}
 
 	bool contains(string jobId) @safe
@@ -640,7 +665,7 @@ unittest  // the in-memory delivery queue reports a job queued until it is acked
 	auto q = new InMemoryDeliveryQueue();
 	q.enqueue(Delivery("j", "s", EventOccurrence("a", "n", "t"), 0));
 	assert(q.contains("j") && !q.contains("other"));
-	q.lease(0, 1000);
+	q.lease(0, 1000, 0);
 	assert(q.contains("j"));
 	q.ack("j");
 	assert(!q.contains("j"));
@@ -655,18 +680,43 @@ unittest  // the in-memory delivery queue leases ready jobs in enqueue order
 	auto q = new InMemoryDeliveryQueue();
 	foreach (id; ["c", "a", "b"])
 		q.enqueue(Delivery(id, "s", EventOccurrence(id, "n", "t"), 0));
-	auto leased = q.lease(0, 1000);
+	auto leased = q.lease(0, 1000, 0);
 	assert(leased.length == 3);
 	assert(leased[0].jobId == "c" && leased[1].jobId == "a" && leased[2].jobId == "b");
+}
+
+unittest  // the in-memory delivery queue leases at most maxJobs, oldest first
+{
+	auto q = new InMemoryDeliveryQueue();
+	foreach (id; ["c", "a", "b", "d"])
+		q.enqueue(Delivery(id, "s", EventOccurrence(id, "n", "t"), 0));
+	auto first = q.lease(0, 1000, 2);
+	assert(first.length == 2 && first[0].jobId == "c" && first[1].jobId == "a");
+	auto rest = q.lease(0, 1000, 2);
+	assert(rest.length == 2 && rest[0].jobId == "b" && rest[1].jobId == "d");
+	assert(q.lease(0, 1000, 2).length == 0);
+}
+
+unittest  // a job acked or re-leased keeps the remaining jobs in enqueue order
+{
+	auto q = new InMemoryDeliveryQueue();
+	foreach (id; ["a", "b", "c"])
+		q.enqueue(Delivery(id, "s", EventOccurrence(id, "n", "t"), 0));
+	assert(q.lease(0, 1000, 1)[0].jobId == "a");
+	q.ack("a");
+	q.enqueue(Delivery("a", "s", EventOccurrence("a", "n", "t"), 0)); // re-enqueued: now newest
+	auto all = q.lease(0, 1000, 0);
+	assert(all.length == 3);
+	assert(all[0].jobId == "b" && all[1].jobId == "c" && all[2].jobId == "a");
 }
 
 unittest  // enqueueing a job id already queued neither replaces it nor releases its lease
 {
 	auto q = new InMemoryDeliveryQueue();
 	assert(q.enqueue(Delivery("j", "s", EventOccurrence("a", "n", "t"), 0)));
-	assert(q.lease(0, 1000).length == 1);
+	assert(q.lease(0, 1000, 0).length == 1);
 	assert(!q.enqueue(Delivery("j", "s", EventOccurrence("a", "n", "t"), 0)));
-	assert(q.lease(10, 1000).length == 0); // still leased by the first claim
+	assert(q.lease(10, 1000, 0).length == 0); // still leased by the first claim
 }
 
 unittest  // EmitBuffer bootstrap returns no events and the head cursor

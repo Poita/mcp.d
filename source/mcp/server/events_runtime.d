@@ -372,6 +372,7 @@ struct EventsOptions
 	/// `webhookHttpTimeout` plus the backoff after the second-to-last attempt), so
 	/// with the defaults the effective lease is 500 seconds.
 	Duration deliveryLease = 1.minutes;
+	size_t deliveryLeaseBatch = 100; /// most jobs one drain claims from the queue, leaving the rest to other nodes and later passes (0 = unlimited)
 	Duration webhookHttpTimeout = 10.seconds; /// per-attempt HTTP bound (default transport); also the worst-case-retry budget input
 	WebhookTransport webhookTransport; /// outbound HTTP (default SSRF-hardened); tests inject a fake
 	void delegate(void delegate() @safe job) @safe deliveryExecutor; /// runs a delivery (default: a fiber)
@@ -581,6 +582,7 @@ final class EventsRuntime
 	private WebhookRef[string] heldWebhookRefs_; // subscription id -> lifecycle key acquired on this node
 	private Nullable!string[string] missed_; // subscription id -> furthest position dropped undelivered (null: none known), owed a gap
 	private BackgroundLoop worker_; // the periodic worker `startDeliveryWorker` runs
+	private bool backlogged_; // the last drain claimed a full batch, so more may be ready
 
 	this(WebhookSubscriptionStore webhookStore = null, EventsOptions opts = EventsOptions.init) @safe
 	{
@@ -2046,7 +2048,11 @@ final class EventsRuntime
 	void drainDeliveries() @safe
 	{
 		const leaseMs = opts_.deliveryLease.total!"msecs";
-		foreach (job; deliveryQueue_.lease(opts_.nowMs(), leaseMs))
+		const batch = opts_.deliveryLeaseBatch;
+		auto jobs = deliveryQueue_.lease(opts_.nowMs(), leaseMs, batch);
+		// A full batch may have left jobs behind: claim more once a run drains.
+		backlogged_ = batch > 0 && jobs.length >= batch;
+		foreach (job; jobs)
 		{
 			// A job already waiting in this node's run for its subscription (its
 			// lease lapsed while it queued behind siblings) is not queued twice.
@@ -2092,6 +2098,14 @@ final class EventsRuntime
 			if (q is null || (*q).length == 0)
 			{
 				subscriptionRuns_.remove(subId);
+				// Marked idle first, so the drain starts a fresh run for this
+				// subscription's next jobs rather than queueing them behind this one.
+				runningSubscriptions_.remove(subId);
+				if (backlogged_)
+				{
+					backlogged_ = false;
+					opts_.deliveryExecutor(() @safe { drainDeliveries(); });
+				}
 				return;
 			}
 			auto job = (*q)[0];
@@ -3287,6 +3301,62 @@ unittest  // the delivery lease is clamped to twice the longest wait between ren
 	o.deliveryLease = 60.minutes; // a longer configured lease is kept
 	rt = new EventsRuntime(null, o);
 	assert(rt.opts_.deliveryLease == 60.minutes);
+}
+
+unittest  // a delivery drain claims at most deliveryLeaseBatch jobs from the queue
+{
+	auto ft = new FakeWebhookTransport();
+	auto queue = new InMemoryDeliveryQueue();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryQueue = queue;
+	o.deliveryLeaseBatch = 2;
+	o.deliveryExecutor = (void delegate() @safe job) @safe {}; // nothing runs
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	foreach (id; ["evt_1", "evt_2", "evt_3"])
+		rt.emit(EventOccurrence(id, "n", "t"));
+	rt.drainDeliveries();
+	// Two were claimed by the drain; the third is still free for another node.
+	assert(queue.lease(1_000_000L, 1000, 0).length == 1);
+}
+
+unittest  // a node that claimed a full batch claims the next once its runs finish
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryLeaseBatch = 2;
+	o.deliverySleep = (Duration d) @safe {};
+	bool running;
+	void delegate() @safe[] tasks;
+	o.deliveryExecutor = (void delegate() @safe job) @safe {
+		if (running)
+			tasks ~= job;
+	};
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	foreach (id; ["evt_1", "evt_2", "evt_3", "evt_4", "evt_5"])
+		rt.emit(EventOccurrence(id, "n", "t"));
+	running = true;
+	rt.drainDeliveries();
+	while (tasks.length)
+	{
+		auto t = tasks[0];
+		tasks = tasks[1 .. $];
+		t();
+	}
+	assert(ft.eventPosts().length == 5);
 }
 
 unittest  // canonicalJsonString is key-order independent
@@ -5193,7 +5263,7 @@ unittest  // jobs queued behind a retrying job keep their lease, so another node
 	o.deliverySleep = (Duration d) @safe {
 		now += 600; // each backoff outlasts half the lease
 		if (++sleeps == 3)
-			stolen = q.lease(now, 1000).length; // another node's drain
+			stolen = q.lease(now, 1000, 0).length; // another node's drain
 	};
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -5242,7 +5312,7 @@ unittest  // jobs queued behind slow successful deliveries keep their lease
 	slowPost = () @safe {
 		now += 600; // each delivery outlasts half the lease
 		if (++posts == 2)
-			stolen = q.lease(now, 1000).length; // another node's drain
+			stolen = q.lease(now, 1000, 0).length; // another node's drain
 		else
 			ft.duringPost = slowPost;
 	};
@@ -6616,7 +6686,7 @@ unittest  // events missed while suspended are signalled with a gap once a refre
 	// Suspended: nothing is attempted or queued for the missed event.
 	rt.emit(EventOccurrence("evt_3", "n", "t"));
 	assert(ft.eventPosts().length == posts);
-	assert(queue.lease(1_000_000L, 1000).length == 0);
+	assert(queue.lease(1_000_000L, 1000, 0).length == 0);
 
 	// The refresh reactivates delivery and a gap tells the client what it missed.
 	auto refreshed = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
@@ -6652,7 +6722,7 @@ unittest  // a job queued before its subscription was suspended is not re-leased
 	for (size_t i = 0; i < deferred.length; i++)
 		deferred[i]();
 	assert(ft.eventPosts().length == 0);
-	assert(queue.lease(1_000_000L, 1000).length == 0);
+	assert(queue.lease(1_000_000L, 1000, 0).length == 0);
 }
 
 unittest  // deliveries to an endpoint that never verifies are dead-lettered after the attempt bound
@@ -6680,7 +6750,7 @@ unittest  // deliveries to an endpoint that never verifies are dead-lettered aft
 		now += 5 * 60 * 1000;
 		rt.drainDeliveries();
 	}
-	assert(queue.lease(now, 1000).length == 0);
+	assert(queue.lease(now, 1000, 0).length == 0);
 	assert(ft.eventPosts().length == 0);
 	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(1));
 }
@@ -6745,7 +6815,7 @@ unittest  // the pending bound also holds for deliveries that carry no cursor
 	rt.subscribeWebhook(webhookSub("email.received", "https://proxy/hooks"), "user-1");
 	now += 1_000;
 	rt.pollWebhookSubscriptions();
-	assert(queue.lease(now, 1000).length == 2);
+	assert(queue.lease(now, 1000, 0).length == 2);
 }
 
 unittest  // a delivered cursor-less job frees its slot under the pending bound
@@ -6964,7 +7034,7 @@ unittest  // a job for a subscription that lapsed before delivery is acked witho
 	for (size_t i = 0; i < deferred.length; i++)
 		deferred[i]();
 	assert(ft.posts.length == 0);
-	assert(queue.lease(now + 10 * 60 * 60 * 1000, 1000).length == 0);
+	assert(queue.lease(now + 10 * 60 * 60 * 1000, 1000, 0).length == 0);
 	assert(rt.webhookStore().get(r.id).isNull);
 }
 
@@ -7178,7 +7248,7 @@ unittest  // attempt persistence: a job re-leased mid-retry does not restart att
 	// Resuming from the persisted count, only one more attempt is made before the cap.
 	assert(ft.eventPosts().length == 1);
 	// The job is settled (acked) and owes a gap, not retried forever.
-	assert(queue.lease(2_000_000, 1000).length == 0);
+	assert(queue.lease(2_000_000, 1000, 0).length == 0);
 	assert(rt.missed_[r.id].get == "5");
 }
 
@@ -7358,7 +7428,7 @@ unittest  // a delivery whose store throws is dead-lettered, not looped invisibl
 	// forever: a later drain finds nothing to lease.
 	store.throwOnGet = false;
 	now += rt.opts_.deliveryLease.total!"msecs" + 1;
-	assert(queue.lease(now, 1000).length == 0);
+	assert(queue.lease(now, 1000, 0).length == 0);
 }
 
 unittest  // a dead-lettered delivery settles its position so the watermark keeps advancing
