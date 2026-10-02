@@ -416,6 +416,21 @@ class TransportClosedException : McpException
 	}
 }
 
+/// Thrown when output-schema validation is enabled and a tool result's
+/// `structuredContent` does not conform to the tool's `outputSchema`: the server
+/// answered, but with a result that breaks its own declared contract.
+///
+/// `code` is `ErrorCode.internalError`; catch this type to tell it apart from a
+/// server's JSON-RPC rejection of the call (such as `invalidParams` for bad
+/// arguments).
+class OutputSchemaViolation : McpException
+{
+	this(string message) @safe pure nothrow
+	{
+		super(ErrorCode.internalError, message);
+	}
+}
+
 /// The client-side bookkeeping of one request awaiting its response.
 private final class InFlightRequest
 {
@@ -1730,8 +1745,8 @@ final class McpClient : ClientProtocol
 	/// `enableOutputSchemaValidation`) and the cached `tools/list` response carries
 	/// this tool's `outputSchema` (from any source — a local `listTools`, or a
 	/// shared/pre-seeded `CacheStore`), the returned `structuredContent` is
-	/// validated against it and a non-conforming result raises an `invalidParams`
-	/// `McpException` — the same guarantee as `callTool(Tool, ...)`, without the
+	/// validated against it and a non-conforming result raises an
+	/// `OutputSchemaViolation` — the same guarantee as `callTool(Tool, ...)`, without the
 	/// caller holding the descriptor.
 	CallToolResult callTool(string name, Json arguments = Json.emptyObject,
 			RequestOptions opts = RequestOptions.init) @safe
@@ -2036,8 +2051,8 @@ final class McpClient : ClientProtocol
 	/// schema validation enabled (see `enableOutputSchemaValidation`) and `tool`
 	/// carries an `outputSchema`, the returned `structuredContent` is validated
 	/// against it: per the spec, "Clients SHOULD validate structured results
-	/// against this schema." A non-conforming result raises a clear
-	/// `McpException` rather than being accepted silently.
+	/// against this schema." A non-conforming result raises an
+	/// `OutputSchemaViolation` rather than being accepted silently.
 	CallToolResult callTool(const Tool tool, Json arguments = Json.emptyObject,
 			RequestOptions opts = RequestOptions.init) @safe
 	{
@@ -2365,14 +2380,14 @@ final class McpClient : ClientProtocol
 		return validateAgainstSchema(result.structuredContent, outputSchema);
 	}
 
-	/// Throw an `invalidParams` `McpException` if `result`'s `structuredContent`
-	/// does not conform to `outputSchema`; a no-op when it conforms.
+	/// Throw an `OutputSchemaViolation` if `result`'s `structuredContent` does not
+	/// conform to `outputSchema`; a no-op when it conforms.
 	private static void enforceOutputSchema(string name, Json outputSchema,
 			const CallToolResult result) @safe
 	{
 		const msg = validateStructured(result, outputSchema);
 		if (msg.length)
-			throw new McpException(ErrorCode.invalidParams, "Tool '" ~ name
+			throw new OutputSchemaViolation("Tool '" ~ name
 					~ "' returned structuredContent that does not conform to its outputSchema: "
 					~ msg);
 	}
@@ -5317,13 +5332,12 @@ unittest  // callToolAwait validates the awaited task result against the listed 
 		]);
 	};
 	c.listTools();
-	int code;
+	bool violated;
 	try
 		c.callToolAwait("add");
-	catch (McpException e)
-		code = e.code;
-	assert(code == ErrorCode.invalidParams,
-			"a non-conforming awaited result must fail output-schema validation");
+	catch (OutputSchemaViolation)
+		violated = true;
+	assert(violated, "a non-conforming awaited result must fail output-schema validation");
 }
 
 unittest  // cancelling callToolAwait's token stops polling and cancels the task
@@ -6101,7 +6115,8 @@ unittest  // string-name callTool validates against the listTools-cached outputS
 	catch (McpException e)
 	{
 		threw = true;
-		assert(e.code == ErrorCode.invalidParams);
+		assert(cast(OutputSchemaViolation) e !is null,
+				"a local schema violation must not look like a server rejection");
 	}
 	assert(threw, "string-name callTool must reject a result that violates the cached outputSchema");
 }
@@ -6191,7 +6206,7 @@ unittest  // a pre-seeded tools/list cache drives output validation with no loca
 	catch (McpException e)
 	{
 		threw = true;
-		assert(e.code == ErrorCode.invalidParams);
+		assert(cast(OutputSchemaViolation) e !is null);
 	}
 	assert(threw, "output validation must work from a pre-seeded cache without a local listTools");
 }
