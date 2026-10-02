@@ -281,24 +281,27 @@ final class TaskRuntime
 			if (!store_.compareAndSwap(r, expected))
 				continue;
 			if (change == Change.status)
-				notifyStatusChange(id, r.owner);
+				notifyStatusChange(r);
 			return true;
 		}
 		throw internalError("task '" ~ id ~ "' is contended; the update was not applied");
 	}
 
-	/// Push a committed status change to the `onStatusChange` sink. Best-effort:
+	/// Push a committed status change to the `onStatusChange` sink, built from the
+	/// record as committed: a re-read could observe a later writer's state, so a
+	/// state another transition superseded would never be reported. Best-effort:
 	/// the transition is already stored and visible via `tasks/get`, so a failing
 	/// sink (e.g. a closed output stream) is logged rather than propagated into
 	/// the caller, which would otherwise fail or abort a healthy task.
-	private void notifyStatusChange(string id, string owner) @safe
+	private void notifyStatusChange(const TaskRecord r) @safe
 	{
 		import vibe.core.log : logWarn;
 
+		const id = r.meta.taskId;
 		if (onStatusChange_ is null || id in silenced_)
 			return;
 		try
-			onStatusChange_(getDetailed(id), owner);
+			onStatusChange_(detailedOf(r), r.owner);
 		catch (Exception e)
 			logWarn("task %s: status notification failed: %s", id, e.msg);
 	}
@@ -549,7 +552,12 @@ final class TaskRuntime
 	/// `-32602 Task not found` (with the taskId in `data`) for an unknown task.
 	Json getDetailed(string id) @safe
 	{
-		auto r = require(id);
+		return detailedOf(require(id));
+	}
+
+	/// The `DetailedTask` JSON for record `r`.
+	private static Json detailedOf(const TaskRecord r) @safe
+	{
 		final switch (r.meta.status)
 		{
 		case TaskStatus.working:
@@ -991,6 +999,10 @@ version (unittest) private final class RacingTaskStore : TaskStore
 		return inner.get(id);
 	}
 
+	/// Runs once, just after the next successful compareAndSwap, to simulate a
+	/// writer landing between a commit and anything that reads it back.
+	void delegate() @safe afterNextSwap;
+
 	bool compareAndSwap(TaskRecord r, ulong expected) @safe
 	{
 		if (auto hook = beforeNextSwap)
@@ -998,7 +1010,14 @@ version (unittest) private final class RacingTaskStore : TaskStore
 			beforeNextSwap = null;
 			hook();
 		}
-		return inner.compareAndSwap(r, expected);
+		const swapped = inner.compareAndSwap(r, expected);
+		if (swapped)
+			if (auto hook = afterNextSwap)
+			{
+				afterNextSwap = null;
+				hook();
+			}
+		return swapped;
 	}
 
 	void remove(string id) @safe
@@ -1026,6 +1045,25 @@ unittest  // a cancel racing a completion does not overwrite the stored result
 	auto d = rt.getDetailed(t.taskId);
 	assert(d["status"].get!string == "completed");
 	assert(d["result"]["structuredContent"]["ok"].get!bool);
+}
+
+unittest  // each status notification carries the state its own transition committed
+{
+	import std.algorithm : sort;
+
+	auto store = new RacingTaskStore();
+	auto rt = new TaskRuntime(store, TaskOptions.init);
+	string[] seen;
+	rt.onStatusChange((Json d, string owner) @safe {
+		seen ~= d["status"].get!string;
+	});
+	auto t = rt.createFor("gate", Json.undefined);
+	store.afterNextSwap = () @safe { rt.complete(t.taskId, Json.emptyObject); };
+	rt.requireInput(t.taskId, Json([
+			"a": Json(["method": Json("elicitation/create")])
+	]));
+	seen.sort();
+	assert(seen == ["completed", "input_required"]);
 }
 
 unittest  // concurrent tasks/update deliveries both keep their answers
