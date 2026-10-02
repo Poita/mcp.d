@@ -129,9 +129,6 @@ struct DiscoverResult
 	Json toJson() const @safe
 	{
 		Json j = Json.emptyObject;
-		// The 2026-07-28 base Result mandates a `resultType` discriminator on every
-		// result; a complete discover response uses "complete".
-		j["resultType"] = "complete";
 		Json pv = Json.emptyArray;
 		foreach (v; supportedVersions)
 			pv ~= Json(v);
@@ -441,15 +438,11 @@ unittest  // DiscoverResult.fromJson skips non-string entries in supportedVersio
 	assert(r.supportedVersions[1] == "2025-11-25");
 }
 
-unittest  // DiscoverResult.toJson carries the required resultType discriminator
+unittest  // DiscoverResult.toJson leaves resultType to the server's dispatch path
 {
 	DiscoverResult d;
 	d.supportedVersions = ["2026-07-28"];
-	auto j = d.toJson();
-	// The 2026-07-28 base Result mandates a resultType discriminator on every result;
-	// a complete discover response uses "complete".
-	assert("resultType" in j);
-	assert(j["resultType"].get!string == "complete");
+	assert("resultType" !in d.toJson());
 }
 
 unittest  // DiscoverResult.fromJson reads the spec wire field `supportedVersions`

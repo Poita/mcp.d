@@ -2525,8 +2525,8 @@ final class McpServer : ServerCore
 	/// ("complete" for a finished response, "input_required" for an
 	/// `InputRequiredResult`). We add the discriminator here, centralized in
 	/// the dispatch path, for any object result that does not already declare
-	/// one — so an `InputRequiredResult` ("input_required") and `DiscoverResult`
-	/// (which set their own) are left untouched.
+	/// one — so a result that sets its own (an `InputRequiredResult`'s
+	/// "input_required", a task handle's "task") is left untouched.
 	///
 	/// An `InputRequiredResult` is shaped `{ inputRequests, requestState }`
 	/// (schema: at least one of `inputRequests`/`requestState` is present, and
