@@ -583,6 +583,10 @@ final class McpClient : ClientProtocol
 	// fetch was in flight, so a change notification is never overwritten by the
 	// stale response it raced with.
 	private ulong[string] cacheGenerations_;
+	// Advanced whenever the identity behind requests changes (`setBearerToken`,
+	// `setBearerProvider`), so a cacheable read sent under the previous identity
+	// that completes afterwards is neither cached nor indexed for the new one.
+	private ulong identityEpoch_;
 	private CacheKey storeToolIndexKey_;
 	private SysTime storeToolIndexStamp_;
 	private bool storeToolIndexValid_;
@@ -1070,6 +1074,7 @@ final class McpClient : ClientProtocol
 	void setBearerToken(string token) @safe
 	{
 		transport.setBearerToken(token);
+		identityEpoch_++;
 		// The identity behind requests just changed; evict this client's own
 		// partition so a re-authenticated session cannot read the previous
 		// identity's `private` results. For the default per-client store the
@@ -1089,6 +1094,7 @@ final class McpClient : ClientProtocol
 	void setBearerProvider(BearerProvider provider) @safe
 	{
 		transport.setBearerProvider(provider);
+		identityEpoch_++;
 		if (cacheStore_ !is null)
 			cacheStore_.invalidatePartition(cachePartition_);
 		clearToolIndex();
@@ -1402,6 +1408,7 @@ final class McpClient : ClientProtocol
 	private ListToolsResult listToolsImpl(RequestOptions opts) @safe
 	{
 		const generation = cacheGeneration("tools/list", "");
+		const epoch = identityEpoch_;
 		auto acc = cachedFetch!ListToolsResult(CacheKey("tools/list", ""), opts.cacheMode, () @safe {
 			auto a = drainList!ListToolsResult("tools/list",
 				(ref ListToolsResult x, ref ListToolsResult r) @safe {
@@ -1418,7 +1425,7 @@ final class McpClient : ClientProtocol
 				a.tools = excludeInvalidHeaderTools(a.tools);
 			return a;
 		});
-		if (cacheGeneration("tools/list", "") == generation)
+		if (cacheGeneration("tools/list", "") == generation && identityEpoch_ == epoch)
 		{
 			listedTools_ = null;
 			foreach (t; acc.tools)
@@ -1648,8 +1655,10 @@ final class McpClient : ClientProtocol
 				return R.fromJson(hit.get.value);
 		}
 		const generation = cacheGeneration(logical.method, logical.key);
+		const epoch = identityEpoch_;
 		R result = fetch(uncacheable);
-		if (uncacheable || cacheGeneration(logical.method, logical.key) != generation)
+		if (uncacheable || cacheGeneration(logical.method,
+				logical.key) != generation || identityEpoch_ != epoch)
 			return result;
 		const ttl = result.cache.isNull ? defaultCacheTtl_ : result.cache.get.ttl;
 		if (ttl > Duration.zero)
@@ -9198,6 +9207,24 @@ unittest  // connect() populates serverCapabilities/serverInfo/serverInstruction
 	assert(c.serverInfo().version_ == "2.0");
 	assert(!c.serverInstructions().isNull);
 	assert(c.serverInstructions().get == "hello");
+}
+
+unittest  // a cacheable read that completes after a bearer switch is neither cached nor indexed
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.setDefaultCacheTtl(1.minutes);
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (++calls == 1)
+			c.setBearerToken("identity-b"); // the identity changes mid-flight
+		ListToolsResult r;
+		r.tools = [Tool("alice-only")];
+		return r.toJson();
+	};
+	c.listTools();
+	assert(!c.haveListedTools_, "identity A's tool list must not be indexed for identity B");
+	c.listTools();
+	assert(calls == 2, "identity A's response must not be served to identity B");
 }
 
 unittest  // a client over a custom transport applies every ClientSettings knob
