@@ -487,7 +487,8 @@ enum string wellKnownReceiverPath = "/.well-known/mcp-webhook-receiver.json";
 private enum Verification
 {
 	verified, /// deliver now
-	failed, /// not verified; the probe failed or is backing off
+	failed, /// not verified; the challenge POST failed
+	backingOff, /// not verified; a recent failure defers the next probe, so none was sent
 	inProgress, /// another delivery's probe for the same endpoint is in flight
 }
 
@@ -2166,9 +2167,12 @@ final class EventsRuntime
 			deliveryQueue_.touch(job.jobId, job.attempt, opts_.nowMs() + verifyBackoffBaseMs);
 			return;
 		}
-		if (verification == Verification.failed)
+		if (verification == Verification.failed || verification == Verification.backingOff)
 		{
-			recordFailure(subId, DeliveryErrorCategory.challengeFailed);
+			// Only a challenge actually sent is a sample for the suspension policy;
+			// a burst queued behind one failed probe must not suspend on its own.
+			if (verification == Verification.failed)
+				recordFailure(subId, DeliveryErrorCategory.challengeFailed);
 			// The endpoint may verify later: retry after a backoff, counting the
 			// attempt so a never-verifying endpoint's jobs are eventually dropped.
 			const attempt = job.attempt + 1;
@@ -2409,7 +2413,7 @@ final class EventsRuntime
 		// window elapses, so a never-verifying endpoint is not challenged every emit.
 		if (auto b = key in pendingVerification_)
 			if (now < b.nextProbeMs)
-				return Verification.failed;
+				return Verification.backingOff;
 
 		const nonce = randomNonce();
 		const 
@@ -5544,6 +5548,31 @@ unittest  // an endpoint that fails the challenge handshake receives no event de
 	// the failure was recorded as challenge_failed
 	assert(rt.webhookStore().get(r.id)
 			.get.lastErrorCat == cast(int) DeliveryErrorCategory.challengeFailed);
+}
+
+unittest  // deliveries skipped by the verification backoff are not counted toward suspension
+{
+	auto ft = new FakeWebhookTransport();
+	ft.echoChallenge = false;
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	o.webhookSuspension.minAttempts = 3;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	foreach (id; ["evt_1", "evt_2", "evt_3", "evt_4", "evt_5"])
+		rt.emit(EventOccurrence(id, "n", "t"));
+	// One challenge was POSTed; the rest backed off without contacting the endpoint.
+	assert(ft.posts.length == 1);
+	auto sub = rt.webhookStore().get(r.id).get;
+	assert(sub.active);
+	assert(sub.windowAttempts == 1 && sub.windowFailures == 1);
 }
 
 unittest  // a fresh webhook subscription replays the retained events after its cursor
