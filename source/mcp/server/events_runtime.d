@@ -783,7 +783,8 @@ final class EventsRuntime
 
 	/// Remove an event type: every subscription to it ends with `-32011 NotFound
 	/// {kind: "event"}` (push streams get `notifications/events/terminated`,
-	/// webhook subscriptions a `terminated` envelope), the type leaves
+	/// webhook subscriptions a `terminated` envelope), its poll leases are dropped,
+	/// `on_unsubscribe` fires for every key still subscribed, the type leaves
 	/// `events/list`, and `notifications/events/list_changed` is sent. Returns
 	/// false when no such type is registered.
 	bool unregister(string name) @safe
@@ -791,6 +792,20 @@ final class EventsRuntime
 		if ((name in types_) is null)
 			return false;
 		terminateEventType(name, toErrorJson(notFound("Event type removed: " ~ name, "event")));
+		dropPollLeases(name);
+		// Tear down any key still referenced while the registration (and its
+		// on_unsubscribe hook) is still present, so no upstream source outlives it.
+		foreach (key, rec; lifeRefs_.dup)
+		{
+			if (rec.name != name)
+				continue;
+			lifeRefs_.remove(key);
+			try
+				fireLifecycle(types_[name].onUnsubscribe, rec.arguments,
+						rec.principal, rec.subscriptionId);
+			catch (Exception e)
+				logEventsError("on_unsubscribe hook threw", e);
+		}
 		types_.remove(name);
 		buffer_.drop(name);
 		notifyListChanged();
@@ -1272,6 +1287,27 @@ final class EventsRuntime
 				terminateWebhook(w.id, error);
 	}
 
+	// End every poll lease on event type `name`, releasing each one's lifecycle
+	// reference.
+	private void dropPollLeases(string name) @safe
+	{
+		PollLease[] dropped;
+		foreach (key, lease; pollLeases_)
+			if (lease.name == name)
+				dropped ~= lease;
+		foreach (lease; dropped)
+			endPollLease(lease);
+	}
+
+	private void endPollLease(PollLease lease) @safe
+	{
+		pollLeases_.remove(leaseKey(lease.name, lease.arguments, lease.principal));
+		if (auto n = lease.principal in pollLeaseCount_)
+			if (--*n <= 0)
+				pollLeaseCount_.remove(lease.principal);
+		releaseLifecycle(lease.name, lease.arguments, lease.principal);
+	}
+
 	/// Expire poll leases whose window has elapsed, firing `on_unsubscribe` for
 	/// each. The transport/timer calls this periodically; a well-behaved poller
 	/// renews its lease before it lapses.
@@ -1283,13 +1319,7 @@ final class EventsRuntime
 			if (now >= lease.expiresAtMs)
 				expired ~= lease;
 		foreach (lease; expired)
-		{
-			pollLeases_.remove(leaseKey(lease.name, lease.arguments, lease.principal));
-			if (auto n = lease.principal in pollLeaseCount_)
-				if (--*n <= 0)
-					pollLeaseCount_.remove(lease.principal);
-			releaseLifecycle(lease.name, lease.arguments, lease.principal);
-		}
+			endPollLease(lease);
 	}
 
 	// --- webhook subscription management -----------------------------------
@@ -4037,6 +4067,35 @@ unittest  // a throwing push stream neither aborts a sibling stream nor the webh
 	assert(ft.eventPosts().length == 1);
 }
 
+unittest  // unregister ends a type's poll leases, firing on_unsubscribe, so re-registering provisions again
+{
+	long now = 1_000_000;
+	auto rt = testRuntime(() @safe => now);
+	int subs, unsubs;
+	EventRegistration reg;
+	reg.descriptor.name = "slack.message";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c");
+	reg.onSubscribe = (EventContext ctx, string id) @safe { subs++; };
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	rt.register(reg);
+
+	auto args = Json(["channel": Json("general")]);
+	rt.poll("slack.message", args, "u", Nullable!string.init,
+			Nullable!long.init, Nullable!long.init);
+	assert(subs == 1);
+	assert(rt.unregister("slack.message"));
+	assert(unsubs == 1);
+
+	rt.register(reg);
+	rt.poll("slack.message", args, "u", Nullable!string.init,
+			Nullable!long.init, Nullable!long.init);
+	assert(subs == 2);
+	// The old lease is gone: expiry tears down only the new one.
+	now += 24 * 60 * 60 * 1000L;
+	rt.sweepPollLeases();
+	assert(unsubs == 2);
+}
+
 unittest  // poll lease fires on_subscribe on first sight and on_unsubscribe on expiry
 {
 	long now = 1_000_000;
@@ -4977,10 +5036,10 @@ unittest  // a runtime over a store holding webhook subscriptions fires on_subsc
 	auto r = first.subscribeWebhook(webhookSub("n", "https://proxy/hooks",
 			Json(["k": Json(1)])), "user-1");
 	first.subscribeWebhook(webhookSub("n", "https://proxy/other", Json([
-				"k": Json(1)
+		"k": Json(1)
 	])), "user-1");
 	first.subscribeWebhook(webhookSub("n", "https://proxy/hooks", Json([
-				"k": Json(2)
+		"k": Json(2)
 	])), "user-1");
 
 	// A restarted node over the same store provisions each live key once.
