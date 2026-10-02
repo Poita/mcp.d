@@ -2301,18 +2301,23 @@ final class McpServer : ServerCore
 		// in-process) and the tool/prompt name. On any verification failure the
 		// handler observes NO requestState (empty) and re-elicits; see
 		// `verifyIncomingRequestState`. When no codec is configured the raw value
-		// passes through unchanged.
-		const incomingState = verifyIncomingRequestState(requestStateCodec_,
-				readRequestState(msg.params), msg.method, msg.params, ctx);
+		// passes through unchanged. A request on a protocol without MRTR carries
+		// no retry state, so whatever the client put in those params is ignored.
+		const mrtr = effective.usesMRTR;
+		const incomingState = mrtr ? verifyIncomingRequestState(requestStateCodec_,
+				readRequestState(msg.params), msg.method, msg.params, ctx) : "";
+		Json[string] inputResponses;
+		if (mrtr)
+			inputResponses = readInputResponses(msg.params);
 
 		// Install the per-request scope so handlers see the right statelessness
 		// (MRTR vs blocking), the input responses carried on a retried modern
 		// request, and the cancellation token, regardless of which transport
 		// supplied the base context.
-		auto scoped = new RequestScope(ctx, effective.usesMRTR,
-				readInputResponses(msg.params), requestLogLevel,
-				loggingRequested, token, incomingState,
-				effective, effective.isModern ? meta.clientCapabilities : conn.clientCaps);
+		auto scoped = new RequestScope(ctx, mrtr, inputResponses,
+				requestLogLevel, loggingRequested, token,
+				incomingState, effective, effective.isModern
+				? meta.clientCapabilities : conn.clientCaps);
 
 		try
 		{
@@ -8334,6 +8339,29 @@ version (unittest) private Message legacyInitDeclaringTasks() @safe
 		]),
 		"clientInfo": Json(["name": Json("c"), "version": Json("1")])
 	]));
+}
+
+unittest  // a 2025-era request never exposes MRTR inputResponses or requestState
+{
+	auto s = new McpServer("t", "1");
+	size_t seenResponses = size_t.max;
+	string seenState = "unset";
+	Tool desc;
+	desc.name = "peek";
+	s.registerTool(desc, (Json args, RequestContext ctx) @safe {
+		seenResponses = ctx.inputResponses().length;
+		seenState = ctx.requestState();
+		return ToolResponse.complete(CallToolResult.init);
+	});
+	auto r = s.handle(req(1, "tools/call", Json([
+		"name": Json("peek"),
+		"arguments": Json.emptyObject,
+		"requestState": Json("forged"),
+		"inputResponses": Json(["q": Json(["action": Json("accept")])])
+	]))).get;
+	assert("error" !in r);
+	assert(seenResponses == 0);
+	assert(seenState == "");
 }
 
 unittest  // startTask runs inline for a 2025-era client even when it declares the tasks extension
