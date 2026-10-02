@@ -1194,7 +1194,7 @@ final class McpServer : ServerCore
 		if (mode_ == ServerMode.stateful)
 			throw new Exception("enableTasks() is not available on a stateful server: the"
 					~ " Tasks extension is modern-only and a stateful server never speaks"
-					~ " 2026-07-28. Construct the server with new McpServer(...) (stateless).");
+					~ " 2026-07-28. Construct the server with McpServer.stateless() instead.");
 		if (taskRuntime_ !is null)
 			taskRuntime_.stopSweeper();
 		taskRuntime_ = new TaskRuntime((store is null) ? new InMemoryTaskStore() : store, opts);
@@ -1411,7 +1411,7 @@ final class McpServer : ServerCore
 		if (mode_ == ServerMode.stateful)
 			throw new Exception("enableEvents() is not available on a stateful server: the"
 					~ " Events extension is modern-only and a stateful server never speaks"
-					~ " 2026-07-28. Construct the server with new McpServer(...) (stateless).");
+					~ " 2026-07-28. Construct the server with McpServer.stateless() instead.");
 		if (eventsRuntime_ !is null)
 			eventsRuntime_.stopDeliveryWorker();
 		eventsRuntime_ = new EventsRuntime(store, opts);
