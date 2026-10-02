@@ -845,7 +845,8 @@ final class McpServer : ServerCore
 	/// a server without sessions). Returns the number of streams reached, or `0`
 	/// when that session has no GET stream open (or the server is not on a
 	/// Streamable HTTP transport). Throws `invalidParams` on an empty
-	/// `elicitationId`.
+	/// `elicitationId`, and on an empty `sessionId` from a stateful server with
+	/// a push channel attached.
 	///
 	/// The 2026-07-28 protocol removed this notification: a modern client tracks
 	/// URL-mode completion through the MRTR request-state retry, not a server push.
@@ -856,6 +857,11 @@ final class McpServer : ServerCore
 		enum method = "notifications/elicitation/complete";
 		if (elicitationId.length == 0)
 			throw invalidParams(method ~ " requires a non-empty elicitationId");
+		// Every stream of a stateful HTTP server belongs to a session, and an
+		// empty token would let the notification land on an arbitrary one.
+		if (sessionId.length == 0 && mode_ == ServerMode.stateful && pushChannel !is null)
+			throw invalidParams(method ~ " on a stateful server requires the sessionId"
+					~ " of the session that received the elicitation");
 		Json params = Json.emptyObject;
 		params["elicitationId"] = elicitationId;
 		// stdio carries one implicit peer whose connection token is "".
@@ -8658,7 +8664,7 @@ unittest  // an unexpected handler exception reaches the client as a generic int
 		return ResourceContents.init;
 	});
 	auto resp = s.handle(req(1, "resources/read", Json([
-				"uri": Json("test://boom")
+		"uri": Json("test://boom")
 	]))).get;
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.internalError);
 	assert(resp["error"]["message"].get!string == "Internal error");
@@ -8675,7 +8681,7 @@ unittest  // exposeInternalErrors sends an unexpected exception's message to the
 		return ResourceContents.init;
 	});
 	auto resp = s.handle(req(1, "resources/read", Json([
-				"uri": Json("test://boom")
+		"uri": Json("test://boom")
 	]))).get;
 	assert(resp["error"]["message"].get!string == "disk full");
 }
@@ -10529,6 +10535,18 @@ unittest  // notifyElicitationComplete rejects an empty elicitationId
 
 	auto s = new McpServer("t", "1");
 	assertThrown!McpException(s.notifyElicitationComplete("", ""));
+}
+
+unittest  // a stateful HTTP server rejects notifyElicitationComplete without a session id
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateful("t", "1");
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	string a;
+	ch.addListener((string f) @safe { a = f; }, Json(""), ListenFilter.init, "", null, "sess-A");
+	assertThrown!McpException(s.notifyElicitationComplete("", "elic-1"));
+	assert(a.length == 0, "an unnamed session must not reach some other session's stream");
 }
 
 unittest  // notifyElicitationComplete reaches only the session that received the elicitation

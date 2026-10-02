@@ -149,14 +149,17 @@ interface PushChannel
 	/// token subject; "" selects unauthenticated streams).
 	size_t notifyPrincipal(string principal, string method, Json params) @safe;
 
-	/// Deliver a notification to a single stream of the session `sessionToken`
-	/// (empty: any stream, for a server without sessions), honouring each stream's own
-	/// opt-in filter; `plainEligible` gates delivery to plain (non-listen) streams.
+	/// Deliver a notification to a single stream of the session `sessionToken`,
+	/// honouring each stream's own opt-in filter; `plainEligible` gates delivery
+	/// to plain (non-listen) streams. An empty `sessionToken` makes every stream
+	/// a candidate (the newest eligible one receives it), which is only
+	/// meaningful on a server without sessions.
 	size_t pushToSession(string sessionToken, string method, Json params,
 			string uri = "", bool plainEligible = true) @safe;
 
-	/// Issue a `ping` request on the channel and wait up to `timeout` for the
-	/// client's response (`sessionToken` empty: any session's stream).
+	/// Issue a `ping` request on a stream of the session `sessionToken` and wait
+	/// up to `timeout` for the client's response. An empty `sessionToken` selects
+	/// only streams opened without a session (a server without sessions).
 	void ping(Duration timeout = 60.seconds, string sessionToken = "") @safe;
 
 	/// The distinct owner (session) tokens of all currently-connected streams.
