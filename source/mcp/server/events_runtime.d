@@ -2742,8 +2742,14 @@ final class EventsRuntime
 			return;
 		}
 		lifeRefs_[key] = LifeRef(1, name, principal, arguments, subId);
+		// on_subscribe may yield, and a concurrent acquire of the key then holds a
+		// reference too; a failure drops only this call's reference.
 		scope (failure)
-			lifeRefs_.remove(key);
+		{
+			if (auto p = key in lifeRefs_)
+				if (--p.refs == 0)
+					lifeRefs_.remove(key);
+		}
 		fireLifecycle(reg.onSubscribe, arguments, principal, subId);
 	}
 
@@ -3898,6 +3904,33 @@ unittest  // a throwing on_subscribe does not leave a push stream registered
 			(string m, Json p) @safe { delivered++; }));
 	rt.emit(EventOccurrence("e", "n", "t"));
 	assert(delivered == 0);
+}
+
+unittest  // a throwing first on_subscribe keeps the reference a concurrent subscriber took
+{
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	PushHandle second;
+	int subs, unsubs;
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		if (++subs == 1)
+		{
+			// A concurrent subscriber of the same key arrives while the first
+			// on_subscribe is still running, then the first one fails.
+			second = openLive(rt, "n", Json.emptyObject, "u", Json(2), (string m, Json p) @safe {
+			});
+			throw new Exception("upstream unavailable");
+		}
+	};
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	rt.register(reg);
+	import std.exception : assertThrown;
+
+	assertThrown!Exception(openLive(rt, "n", Json.emptyObject, "u", Json(1),
+			(string m, Json p) @safe {}));
+	assert(second !is null);
+	second.close();
+	assert(unsubs == 1, "the surviving subscriber's release must reach on_unsubscribe");
 }
 
 unittest  // a throwing on_unsubscribe does not stop the sweep expiring the other leases
