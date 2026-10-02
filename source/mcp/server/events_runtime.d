@@ -24,8 +24,8 @@ import mcp.server.event_context : EventContext, EventResult, Event, EventBatch,
 import mcp.server.event_store : EmitBuffer, EmitBufferOptions,
 	WebhookSubscription, WebhookSubscriptionStore,
 	InMemoryWebhookSubscriptionStore, Delivery, DeliveryQueue, InMemoryDeliveryQueue, nowUnixMs;
-import mcp.server.webhook_delivery : WebhookTransport, SecureWebhookTransport,
-	WebhookHttpResult, V1aSigner, signDeliveryHeaders, callbackHostAllowed, challengeEchoed;
+import mcp.server.webhook_delivery : WebhookTransport, SecureWebhookTransport, WebhookHttpResult,
+	V1aSigner, DeliverySigning, signDeliveryHeaders, callbackHostAllowed, challengeEchoed;
 
 /// Grace window during which a rotated webhook secret is dual-signed alongside
 /// the new one (Standard Webhooks multi-signature), so a receiver still holding
@@ -2388,9 +2388,13 @@ final class EventsRuntime
 		const 
 		body = job.gap ? gapEnvelope(occ.cursor).toString() : occ.toJson().toString();
 		const now = opts_.nowMs();
-		auto headers = signDeliveryHeaders(sub.secret, sub.previousSecret,
-				sub.previousSecretGraceUntilMs,
-				now, occ.eventId, now / 1000, body, sub.id, opts_.v1aSigner);
+		DeliverySigning signing = {
+			secret: sub.secret, previousSecret: sub.previousSecret,
+			previousSecretGraceUntilMs: sub.previousSecretGraceUntilMs,
+			nowMs: now, messageId: occ.eventId, timestamp: now / 1000,
+			subscriptionId: sub.id, v1aSigner: opts_.v1aSigner
+		};
+		auto headers = signDeliveryHeaders(signing, body);
 		return postToCallback(sub.url, headers, body);
 	}
 
@@ -2523,8 +2527,11 @@ final class EventsRuntime
 		const nonce = randomNonce();
 		const 
 		body = verificationEnvelope(nonce).toString();
-		auto headers = signDeliveryHeaders(sub.secret, "", 0, now,
-				controlMessageId("verification"), now / 1000, body, sub.id, opts_.v1aSigner);
+		DeliverySigning signing = {
+			secret: sub.secret, messageId: controlMessageId("verification"), timestamp: now / 1000,
+			subscriptionId: sub.id, v1aSigner: opts_.v1aSigner
+		};
+		auto headers = signDeliveryHeaders(signing, body);
 		auto res = postToCallback(sub.url, headers, body);
 		if (res.ok && challengeEchoed(res.body, nonce))
 		{
@@ -2630,8 +2637,11 @@ final class EventsRuntime
 		const 
 		body = terminatedEnvelope(error).toString();
 		const now = opts_.nowMs();
-		auto headers = signDeliveryHeaders(sub.secret, "", 0, now,
-				controlMessageId("terminated"), now / 1000, body, sub.id, opts_.v1aSigner);
+		DeliverySigning signing = {
+			secret: sub.secret, messageId: controlMessageId("terminated"), timestamp: now / 1000,
+			subscriptionId: sub.id, v1aSigner: opts_.v1aSigner
+		};
+		auto headers = signDeliveryHeaders(signing, body);
 		opts_.deliveryExecutor(() @safe {
 			postToCallback(sub.url, headers, body);
 		});
@@ -5577,8 +5587,11 @@ version (MCPWebhookEd25519)
 		// `v1,` HMAC rides alongside; here we verify only the appended `v1a,` token.
 		const 
 		body = `{"eventId":"evt_1","name":"n","timestamp":"t","data":{}}`;
-		auto headers = signDeliveryHeaders(testSecret, "", 0, 0, "evt_1",
-				1_614_265_330, body, "sub_abc", rt.opts_.v1aSigner);
+		DeliverySigning signing = {
+			secret: testSecret, messageId: "evt_1", timestamp: 1_614_265_330,
+			subscriptionId: "sub_abc", v1aSigner: rt.opts_.v1aSigner
+		};
+		auto headers = signDeliveryHeaders(signing, body);
 
 		const xB64Url = rt.webhookJwks()["keys"][0]["x"].get!string;
 		auto pub = () @trusted {

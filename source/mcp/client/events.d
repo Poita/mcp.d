@@ -222,7 +222,7 @@ final class WebhookReceiver
 
 version (unittest)
 {
-	import mcp.server.webhook_delivery : signDeliveryHeaders;
+	import mcp.server.webhook_delivery : DeliverySigning, signDeliveryHeaders;
 	import mcp.protocol.events : verificationEnvelope;
 
 	private enum testSecret = "whsec_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -254,8 +254,10 @@ unittest  // the receiver verifies a signed event delivery and routes the occurr
 	body = EventOccurrence("evt_1", "incident.created", "t", Json([
 		"severity": Json("P1")
 	])).toJson().toString();
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "evt_1",
-			1700, body, "sub_1", null);
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	auto resp = rx.processDelivery(body, headers);
 	assert(resp.status == 200);
 	assert(delivered && got.eventId == "evt_1");
@@ -270,8 +272,10 @@ unittest  // the receiver answers a verification challenge by echoing the nonce
 
 	const 
 	body = verificationEnvelope("nonce-123").toString();
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "msg_verif",
-			1700, body, "sub_1", null);
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "msg_verif", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	auto resp = rx.processDelivery(body, headers);
 	assert(resp.status == 200);
 	assert(parseJsonString(resp.body)["challenge"].get!string == "nonce-123");
@@ -291,7 +295,10 @@ unittest  // a tampered body fails signature verification with 400
 	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {});
 	const 
 	body = `{"eventId":"e","name":"n","timestamp":"t","data":{}}`;
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "e", 1700, body, "sub_1", null);
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "e", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	auto resp = rx.processDelivery(body ~ "tampered", headers);
 	assert(resp.status == 400);
 }
@@ -304,8 +311,10 @@ unittest  // a retried delivery (same webhook-id) is deduplicated, callback fire
 	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe { count++; });
 	const 
 	body = EventOccurrence("evt_dup", "n", "t").toJson().toString();
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "evt_dup",
-			1700, body, "sub_1", null);
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_dup", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	assert(rx.processDelivery(body, headers).status == 200);
 	assert(rx.processDelivery(body, headers).status == 200); // retry
 	assert(count == 1); // routed only once
@@ -323,10 +332,14 @@ unittest  // the same eventId fanned to two subscriptions reaches each subscript
 	// deliveries that share the webhook-id but carry distinct subscription ids.
 	const 
 	body = EventOccurrence("evt_fan", "n", "t").toJson().toString();
-	auto ha = signDeliveryHeaders(testSecret, "", 0, 1000, "wid_shared",
-			1700, body, "sub_a", null);
-	auto hb = signDeliveryHeaders(testSecret, "", 0, 1000, "wid_shared",
-			1700, body, "sub_b", null);
+	DeliverySigning haSigning = {
+		secret: testSecret, messageId: "wid_shared", timestamp: 1700, subscriptionId: "sub_a"
+	};
+	auto ha = signDeliveryHeaders(haSigning, body);
+	DeliverySigning hbSigning = {
+		secret: testSecret, messageId: "wid_shared", timestamp: 1700, subscriptionId: "sub_b"
+	};
+	auto hb = signDeliveryHeaders(hbSigning, body);
 	assert(rx.processDelivery(body, ha).status == 200);
 	assert(rx.processDelivery(body, hb).status == 200);
 	assert(a == 1 && b == 1); // each subscription got its own copy
@@ -342,10 +355,14 @@ unittest  // a true retry (same subscription + webhook-id) is still deduplicated
 
 	const 
 	body = EventOccurrence("evt_fan", "n", "t").toJson().toString();
-	auto ha = signDeliveryHeaders(testSecret, "", 0, 1000, "wid_shared",
-			1700, body, "sub_a", null);
-	auto hb = signDeliveryHeaders(testSecret, "", 0, 1000, "wid_shared",
-			1700, body, "sub_b", null);
+	DeliverySigning haSigning = {
+		secret: testSecret, messageId: "wid_shared", timestamp: 1700, subscriptionId: "sub_a"
+	};
+	auto ha = signDeliveryHeaders(haSigning, body);
+	DeliverySigning hbSigning = {
+		secret: testSecret, messageId: "wid_shared", timestamp: 1700, subscriptionId: "sub_b"
+	};
+	auto hb = signDeliveryHeaders(hbSigning, body);
 	assert(rx.processDelivery(body, ha).status == 200);
 	assert(rx.processDelivery(body, hb).status == 200); // other subscription, not a dup
 	assert(rx.processDelivery(body, ha).status == 200); // sub_a retry, deduped
@@ -362,13 +379,17 @@ unittest  // stale dedup entries are evicted once deliveries advance past the wi
 
 	// An old delivery, then one far enough ahead to evict the old key.
 	const oldBody = EventOccurrence("evt_old", "n", "t").toJson().toString();
-	auto oldHeaders = signDeliveryHeaders(testSecret, "", 0, 1000, "wid_old",
-			1000, oldBody, "sub_1", null);
+	DeliverySigning oldHeadersSigning = {
+		secret: testSecret, messageId: "wid_old", timestamp: 1000, subscriptionId: "sub_1"
+	};
+	auto oldHeaders = signDeliveryHeaders(oldHeadersSigning, oldBody);
 	assert(rx.processDelivery(oldBody, oldHeaders).status == 200);
 
 	const newBody = EventOccurrence("evt_new", "n", "t").toJson().toString();
-	auto newHeaders = signDeliveryHeaders(testSecret, "", 0, 1000, "wid_new",
-			5000, newBody, "sub_1", null);
+	DeliverySigning newHeadersSigning = {
+		secret: testSecret, messageId: "wid_new", timestamp: 5000, subscriptionId: "sub_1"
+	};
+	auto newHeaders = signDeliveryHeaders(newHeadersSigning, newBody);
 	assert(rx.processDelivery(newBody, newHeaders).status == 200);
 
 	// The old key has aged out, so a redelivery of it routes again rather than
@@ -393,8 +414,10 @@ unittest  // the dedup set is hard-capped so it cannot grow without bound
 		const wid = "wid_" ~ i.to!string;
 		const 
 		body = EventOccurrence("evt_" ~ i.to!string, "n", "t").toJson().toString();
-		auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, wid,
-				1700 + i, body, "sub_1", null);
+		DeliverySigning signing = {
+			secret: testSecret, messageId: wid, timestamp: 1700 + i, subscriptionId: "sub_1"
+		};
+		auto headers = signDeliveryHeaders(signing, body);
 		assert(rx.processDelivery(body, headers).status == 200);
 	}
 	assert(rx.seen_.length <= 10);
@@ -413,8 +436,10 @@ unittest  // a delivery whose callback throws is not recorded, so the retry is p
 	});
 	const 
 	body = EventOccurrence("evt_1", "n", "t").toJson().toString();
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "evt_1",
-			1700, body, "sub_1", null);
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	assertThrown!Exception(rx.processDelivery(body, headers));
 	assert(rx.processDelivery(body, headers).status == 200); // the server's retry
 	assert(calls == 2);
@@ -440,8 +465,10 @@ unittest  // at capacity the oldest dedup entries go first, the newest are kept
 		const 
 		body = EventOccurrence("evt_" ~ i.to!string, "n", "t").toJson().toString();
 		// Timestamps out of insertion order: eviction follows arrival order.
-		auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, wid,
-				1700 - i, body, "sub_1", null);
+		DeliverySigning signing = {
+			secret: testSecret, messageId: wid, timestamp: 1700 - i, subscriptionId: "sub_1"
+		};
+		auto headers = signDeliveryHeaders(signing, body);
 		assert(rx.processDelivery(body, headers).status == 200);
 		sent ~= headers;
 		bodies ~= body;
@@ -467,8 +494,10 @@ unittest  // a terminated control envelope is routed to onControl
 	});
 	const 
 	body = terminatedEnvelope(Json(["code": Json(-32012)])).toString();
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "msg_term",
-			1700, body, "sub_1", null);
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "msg_term", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	assert(rx.processDelivery(body, headers).status == 200);
 	assert(got);
 	assert(gotControl.kind == EventControlKind.terminated);

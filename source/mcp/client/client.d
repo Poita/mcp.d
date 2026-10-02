@@ -10302,12 +10302,15 @@ version (unittest)
 
 		void deliver(Json envelope, string msgId) @safe
 		{
-			import mcp.server.webhook_delivery : signDeliveryHeaders;
+			import mcp.server.webhook_delivery : DeliverySigning, signDeliveryHeaders;
 
 			const 
 			body = envelope.toString();
-			auto headers = signDeliveryHeaders(managedTestWhsec, "", 0, 1000,
-					msgId, 1700, body, "sub_x", null);
+			DeliverySigning signing = {
+				secret: managedTestWhsec, messageId: msgId, timestamp: 1700,
+				subscriptionId: "sub_x"
+			};
+			auto headers = signDeliveryHeaders(signing, body);
 			assert(rx.processDelivery(body, headers).status == 200);
 		}
 	}
@@ -10409,7 +10412,7 @@ unittest  // webhook `gap` envelopes and occurrences advance the subscription cu
 
 unittest  // a webhook occurrence whose handler throws does not advance the cursor
 {
-	import mcp.server.webhook_delivery : signDeliveryHeaders;
+	import mcp.server.webhook_delivery : DeliverySigning, signDeliveryHeaders;
 
 	auto c = new McpClient(new RecordingClientTransport());
 	c.onRpcForTest = (string method, Json params) @safe {
@@ -10430,8 +10433,10 @@ unittest  // a webhook occurrence whose handler throws does not advance the curs
 	occ.cursor = "c8";
 	const 
 	body = occ.toJson().toString();
-	auto headers = signDeliveryHeaders(managedTestWhsec, "", 0, 1000, "m1",
-			1700, body, "sub_x", null);
+	DeliverySigning signing = {
+		secret: managedTestWhsec, messageId: "m1", timestamp: 1700, subscriptionId: "sub_x"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	try
 		rx.processDelivery(body, headers);
 	catch (Exception)
@@ -10442,7 +10447,7 @@ unittest  // a webhook occurrence whose handler throws does not advance the curs
 
 unittest  // a webhook occurrence whose handler throws is handled again on redelivery
 {
-	import mcp.server.webhook_delivery : signDeliveryHeaders;
+	import mcp.server.webhook_delivery : DeliverySigning, signDeliveryHeaders;
 
 	auto c = new McpClient(new RecordingClientTransport());
 	c.onRpcForTest = (string method, Json params) @safe {
@@ -10466,8 +10471,10 @@ unittest  // a webhook occurrence whose handler throws is handled again on redel
 	auto occ = EventOccurrence("e1", "incident.created", "t", Json.emptyObject);
 	const 
 	body = occ.toJson().toString();
-	auto headers = signDeliveryHeaders(managedTestWhsec, "", 0, 1000, "m1",
-			1700, body, "sub_x", null);
+	DeliverySigning signing = {
+		secret: managedTestWhsec, messageId: "m1", timestamp: 1700, subscriptionId: "sub_x"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	try
 		rx.processDelivery(body, headers);
 	catch (Exception)

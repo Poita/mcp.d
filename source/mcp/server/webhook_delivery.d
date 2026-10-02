@@ -196,26 +196,40 @@ DeliveryErrorCategory categoryForException(string msg) @safe
 	return DeliveryErrorCategory.connectionRefused;
 }
 
-/// Build the signed Standard Webhooks request headers for a delivery: the
-/// `webhook-id`/`-timestamp`/`-signature` triplet (symmetric `v1,` HMAC over the
-/// raw body), the MCP `X-MCP-Subscription-Id` header, plus — during a secret
+/// The keys, identity and clock a delivery is signed with.
+struct DeliverySigning
+{
+	string secret; /// current Standard Webhooks `whsec_` secret
+	string previousSecret; /// rotated-out secret, also signed with during its grace window ("" if none)
+	long previousSecretGraceUntilMs; /// end of the rotation grace window (ms since epoch)
+	long nowMs; /// current time (ms since epoch), checked against the grace window
+	string messageId; /// `webhook-id`
+	long timestamp; /// `webhook-timestamp` (seconds since epoch)
+	string subscriptionId; /// sent as `X-MCP-Subscription-Id`
+	V1aSigner v1aSigner; /// optional asymmetric signer appending a `v1a,` signature
+}
+
+/// Build the signed Standard Webhooks request headers for a delivery of `body`:
+/// the `webhook-id`/`-timestamp`/`-signature` triplet (symmetric `v1,` HMAC over
+/// the raw body), the MCP `X-MCP-Subscription-Id` header, plus — during a secret
 /// rotation grace window — a second `v1,` signature under the previous secret,
 /// and — when an asymmetric signer is supplied — an appended `v1a,` signature.
-string[string] signDeliveryHeaders(string secret, string previousSecret, long graceUntilMs,
-		long nowMs, string msgId, long ts, string body, string subscriptionId, V1aSigner v1aSigner) @safe
+string[string] signDeliveryHeaders(DeliverySigning signing, string body) @safe
 {
 	import standardwebhooks : Webhook;
 
-	auto wh = Webhook(secret);
+	const msgId = signing.messageId;
+	const ts = signing.timestamp;
+	auto wh = Webhook(signing.secret);
 	auto headers = wh.signHeaders(msgId, ts, body);
 	string sig = headers["webhook-signature"];
 
 	// Secret rotation: dual-sign with the prior secret during the grace window so
 	// a receiver not yet updated verifies under either (Standard Webhooks
 	// multi-signature).
-	if (previousSecret.length && nowMs < graceUntilMs)
+	if (signing.previousSecret.length && signing.nowMs < signing.previousSecretGraceUntilMs)
 	{
-		auto prev = Webhook(previousSecret);
+		auto prev = Webhook(signing.previousSecret);
 		auto ph = prev.signHeaders(msgId, ts, body);
 		sig = sig ~ " " ~ ph["webhook-signature"];
 	}
@@ -224,15 +238,15 @@ string[string] signDeliveryHeaders(string secret, string previousSecret, long gr
 	// (over the same signed content). The signer mirrors Standard Webhooks'
 	// `sign(msgId, ts, payload)`, so `standardwebhooks.ed25519.AsymmetricWebhook`
 	// drops straight in (wired by the events-ed25519 build configuration).
-	if (v1aSigner !is null)
+	if (signing.v1aSigner !is null)
 	{
-		const token = v1aSigner(msgId, ts, body);
+		const token = signing.v1aSigner(msgId, ts, body);
 		if (token.length)
 			sig = sig ~ " " ~ token;
 	}
 
 	headers["webhook-signature"] = sig;
-	headers[subscriptionIdHeader] = subscriptionId;
+	headers[subscriptionIdHeader] = signing.subscriptionId;
 	return headers;
 }
 
@@ -313,8 +327,11 @@ unittest  // signDeliveryHeaders produces verifiable Standard Webhooks headers
 
 	const 
 	body = `{"eventId":"evt_1","name":"n","timestamp":"t","data":{}}`;
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1_000_000, "evt_1",
-			1_739_980_800, body, "sub_abc", null);
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1_739_980_800,
+		subscriptionId: "sub_abc"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	assert(headers["webhook-id"] == "evt_1");
 	assert(headers[subscriptionIdHeader] == "sub_abc");
 	// An off-the-shelf Standard Webhooks verifier accepts the signed delivery.
@@ -330,8 +347,11 @@ unittest  // a rotated secret dual-signs so either secret verifies during the gr
 	enum prev = "whsec_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA=";
 	const 
 	body = `{"x":1}`;
-	auto headers = signDeliveryHeaders(testSecret, prev, 2_000_000, 1_000_000,
-			"evt", 1700, body, "sub", null);
+	DeliverySigning signing = {
+		secret: testSecret, previousSecret: prev, previousSecretGraceUntilMs: 2_000_000,
+		nowMs: 1_000_000, messageId: "evt", timestamp: 1700, subscriptionId: "sub"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	// both the new and the previous secret verify the delivery
 	assert(Webhook(testSecret).verifyIgnoringTimestamp(body, headers) == body);
 	assert(Webhook(prev).verifyIgnoringTimestamp(body, headers) == body);
@@ -346,8 +366,11 @@ unittest  // the rotation dual-signature is dropped once the grace window has pa
 	const 
 	body = `{"x":1}`;
 	// nowMs (3_000_000) is past graceUntilMs (2_000_000): only the new secret signs.
-	auto headers = signDeliveryHeaders(testSecret, prev, 2_000_000, 3_000_000,
-			"evt", 1700, body, "sub", null);
+	DeliverySigning signing = {
+		secret: testSecret, previousSecret: prev, previousSecretGraceUntilMs: 2_000_000,
+		nowMs: 3_000_000, messageId: "evt", timestamp: 1700, subscriptionId: "sub"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	assert(Webhook(testSecret).verifyIgnoringTimestamp(body, headers) == body);
 	// a single signature (no space-delimited second one)
 	assert(!headers["webhook-signature"].canFind(' '));
@@ -359,8 +382,11 @@ unittest  // an asymmetric signer appends a v1a, signature alongside the v1, HMA
 
 	const 
 	body = `{"x":1}`;
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "evt", 1700,
-			body, "sub", (string id, long ts, string p) @safe => "v1a,ZmFrZQ==");
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt", timestamp: 1700, subscriptionId: "sub",
+		v1aSigner: (string id, long ts, string p) @safe => "v1a,ZmFrZQ=="
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	assert(headers["webhook-signature"].canFind("v1a,ZmFrZQ=="));
 	assert(headers["webhook-signature"].canFind("v1,"));
 }
