@@ -769,10 +769,7 @@ struct Content
 	}
 }
 
-// `Icon` is defined in mcp.protocol.capabilities (a shared BaseMetadata building
-// block used by `Implementation` there and by `Tool`/`Resource`/etc. here) and
-// re-exported below so existing `Icon` references in this module resolve.
-public import mcp.protocol.capabilities : Icon;
+import mcp.protocol.capabilities : Icon;
 
 /// Optional annotations attached to resources, resource templates, and content
 /// blocks, per the MCP spec's `Annotations` shape. All fields are optional and
