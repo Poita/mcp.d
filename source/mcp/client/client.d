@@ -2738,8 +2738,9 @@ final class McpClient : ClientProtocol
 	/// The poll loop body, factored out and seam-driven so it runs synchronously
 	/// under `unittest` without a live event loop (mirrors `awaitTask`). A
 	/// transient poll failure is retried with exponential backoff from the poll
-	/// floor; the loop exits when the subscription is cancelled or the server
-	/// rejects the poll, which is reported to `onControl` as an `error` control.
+	/// floor; the loop exits when the subscription is cancelled, or when the server
+	/// rejects the poll or `onEvent` throws, either of which ends the subscription
+	/// and is reported to `onControl` as an `error` control.
 	package void runPollLoop(EventSubscription sub, PollParams p,
 			void delegate(EventOccurrence) @safe onEvent, void delegate(EventControl) @safe onControl) @safe
 	{
@@ -2778,10 +2779,12 @@ final class McpClient : ClientProtocol
 			{
 				if (sub.isCancelled())
 					return;
-				if (sub.alreadySeen(occ.eventId))
-					continue;
-				if (onEvent !is null)
-					onEvent(occ);
+				if (!deliverManagedEvent(sub, occ, onEvent))
+				{
+					sub.markTerminated();
+					reportEventError(onControl, handlerFailure(occ));
+					return;
+				}
 			}
 			if (res.truncated && onControl !is null)
 			{
@@ -2873,11 +2876,10 @@ final class McpClient : ClientProtocol
 		sp.cursor = cursor;
 		ms.stream = streamEvents(sp, (EventOccurrence o) @safe {
 			ms.lastFrameMs = eventNowMs();
-			sub.advanceCursor(o.cursor);
-			if (sub.alreadySeen(o.eventId))
+			if (!sub.active)
 				return;
-			if (ms.onEvent !is null)
-				ms.onEvent(o);
+			if (!deliverManagedEvent(sub, o, ms.onEvent))
+				endManagedStream(sub, ms, handlerFailure(o));
 		}, (EventControl c) @safe {
 			ms.lastFrameMs = eventNowMs();
 			sub.advanceCursor(c.cursor);
@@ -2938,6 +2940,40 @@ final class McpClient : ClientProtocol
 			catch (Exception)
 				failures++;
 		}
+	}
+
+	/// Hand `occ` to a managed subscription's `onEvent`, recording it as delivered
+	/// and moving the watermark past it only once the handler returns, so the
+	/// cursor never passes an occurrence that was not handled. Returns false when
+	/// the handler threw, which the caller answers by ending the subscription;
+	/// true when the occurrence was handled or skipped as a duplicate.
+	private bool deliverManagedEvent(EventSubscription sub, EventOccurrence occ,
+			void delegate(EventOccurrence) @safe onEvent) @safe
+	{
+		if (sub.isSeen(occ.eventId))
+			return true;
+		if (onEvent !is null)
+		{
+			try
+				onEvent(occ);
+			catch (Exception e)
+			{
+				import vibe.core.log : logWarn;
+
+				logWarn("[mcp.client] event handler for %s threw: %s", occ.name, e.msg);
+				return false;
+			}
+		}
+		sub.markSeen(occ.eventId);
+		sub.advanceCursor(occ.cursor);
+		return true;
+	}
+
+	/// The error a managed subscription reports when its `onEvent` threw on `occ`.
+	private static McpException handlerFailure(EventOccurrence occ) @safe
+	{
+		return new McpException(ErrorCode.internalError,
+				"onEvent threw on event " ~ occ.eventId ~ "; the subscription has ended");
 	}
 
 	/// Whether a managed-subscription failure may clear on its own, so retrying
@@ -9385,6 +9421,65 @@ unittest  // subscribePoll surfaces a poll error as a typed control and ends the
 	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
 	assert(ctrls[0].error.get.code == ErrorCode.invalidRequest);
 	assert(!sub.active);
+}
+
+unittest  // a throwing poll onEvent ends the subscription with an error control at the last handled cursor
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.onRpcForTest = (string method, Json params) @safe {
+		PollResult r;
+		auto ok = EventOccurrence("e1", "incident.created", "t");
+		ok.cursor = "c1";
+		auto bad = EventOccurrence("e2", "incident.created", "t");
+		bad.cursor = "c2";
+		r.events = [ok, bad];
+		r.cursor = "c3";
+		return r.toJson();
+	};
+	EventControl[] ctrls;
+	auto sub = new EventSubscription();
+	sub.dedupCapacity(100);
+	c.onEventPollSleepForTest = (Duration d) @safe { sub.cancel(); };
+	bool escaped;
+	try
+		c.runPollLoop(sub, PollParams("incident.created"), (EventOccurrence o) @safe {
+			if (o.eventId == "e2")
+				throw new Exception("handler failed");
+		}, (EventControl ctrl) @safe { ctrls ~= ctrl; });
+	catch (Exception)
+		escaped = true;
+	assert(!escaped, "a handler failure must not escape the poll loop");
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
+	assert(!sub.active, "a handler failure must end the subscription");
+	assert(sub.cursor.get == "c1", "the cursor must stay at the last handled event");
+	assert(!sub.isSeen("e2"), "the failed event must not be recorded as delivered");
+}
+
+unittest  // a throwing stream onEvent ends the subscription without advancing past the event
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	EventControl[] ctrls;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
+		throw new Exception("handler failed");
+	}, (EventControl ctrl) @safe { ctrls ~= ctrl; });
+	try
+		c.dispatchInbound(Message(makeNotification(eventsEventNotification,
+				withSubscriptionId(Json([
+					"eventId": Json("e"),
+					"name": Json("incident.created"),
+					"timestamp": Json("t"),
+					"data": Json.emptyObject,
+					"cursor": Json("c9")
+	]), Json(1)))));
+	catch (Exception)
+	{
+	}
+	assert(sub.cursor.isNull, "the cursor must not move past an unhandled event");
+	assert(!sub.isSeen("e"), "the failed event must not be recorded as delivered");
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
+	assert(!sub.active, "a handler failure must end the subscription");
+	assert(t.streams[0].ended, "the ended subscription must close its stream");
 }
 
 unittest  // a transient poll failure is retried with backoff instead of ending the subscription
