@@ -554,7 +554,7 @@ is predictable when porting a hand-built server):
 | D type | JSON Schema |
 | --- | --- |
 | `bool` | `{"type": "boolean"}` |
-| `int` / `long` / `short` / `byte` (and `uint`/`ulong`/… ) | `{"type": "integer"}` (unsigned also gets `"minimum": 0`) |
+| `int` / `long` / `short` / `byte` (and `uint`/`ulong`/… ) | `{"type": "integer"}`; `byte`/`ubyte`/`short`/`ushort`/`uint` also get their type's `minimum` and `maximum`, and `ulong` gets `"minimum": 0` |
 | `float` / `double` | `{"type": "number"}` |
 | `string` | `{"type": "string"}` |
 | `enum` | `{"type": "string", "enum": [members…]}` |

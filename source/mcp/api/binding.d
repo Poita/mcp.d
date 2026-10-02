@@ -232,7 +232,16 @@ package(mcp) JsonNode schemaNode(T, bool omitNull, Ancestors...)()
 
 		// (emitSchemaKeyword: false, inlineSubschemas: true, nullableOmitsNull)
 		enum settings = GeneratorSettings(false, true, omitNull);
-		return generate!(T, settings)();
+		auto s = generate!(T, settings)();
+		// Binding rejects a value outside an integer type's range, so a type
+		// narrower than `int`, and `uint`, advertise that range. `int` and the
+		// 64-bit types are left as a plain integer.
+		static if (isIntegral!T && !is(T == enum) && (T.sizeof < 4 || is(T == uint)))
+		{
+			s.set("minimum", JsonNode(long(T.min)));
+			s.set("maximum", JsonNode(long(T.max)));
+		}
+		return s;
 	}
 }
 
@@ -539,6 +548,29 @@ unittest  // bindJson rejects an object missing an undefaulted floating-point fi
 	}
 
 	assertThrown!BindException(bindJson!S(parseJsonString(`{}`)));
+}
+
+unittest  // a bounded integer schema carries its type's minimum and maximum
+{
+	auto u8 = schemaOf!(ubyte, true)();
+	assert(u8["minimum"].get!long == 0 && u8["maximum"].get!long == 255, u8.toString);
+	auto u16 = schemaOf!(ushort, true)();
+	assert(u16["maximum"].get!long == ushort.max, u16.toString);
+	auto i8 = schemaOf!(byte, true)();
+	assert(i8["minimum"].get!long == -128 && i8["maximum"].get!long == 127, i8.toString);
+	auto i16 = schemaOf!(short, true)();
+	assert(i16["minimum"].get!long == short.min
+			&& i16["maximum"].get!long == short.max, i16.toString);
+	auto u32 = schemaOf!(uint, true)();
+	assert(u32["maximum"].get!long == uint.max, u32.toString);
+}
+
+unittest  // a value outside a bounded integer type's range does not bind
+{
+	import std.exception : assertThrown;
+
+	assertThrown!BindException(bindJson!ubyte(Json(256)));
+	assertThrown!BindException(bindJson!byte(Json(-129)));
 }
 
 unittest  // a static array schema pins its length with minItems and maxItems
