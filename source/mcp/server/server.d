@@ -306,6 +306,7 @@ final class McpServer : ServerCore
 	// preserve lenient behaviour; opt in with requireInitialized(). Only a stateful
 	// session has an `initialized` handshake — the stateless path is always exempt.
 	private bool requireInitialized_;
+	private bool exposeInternalErrors_;
 	// The opt-in MRTR `requestState` codec installed by `secureRequestState`.
 	// Null (the default) means plaintext passthrough — the wire and behaviour are
 	// exactly as if no codec existed. When set, the dispatch path wraps outgoing
@@ -697,6 +698,27 @@ final class McpServer : ServerCore
 	void requireInitialized() @safe
 	{
 		requireInitialized_ = true;
+	}
+
+	/// Send an unexpected (non-`McpException`) handler exception's message to the
+	/// client as the JSON-RPC internal error's `message`. Off by default: such a
+	/// message can carry file paths, SQL or other internals, so the client gets a
+	/// generic "Internal error" and the real message is logged server-side. Useful
+	/// in development.
+	void exposeInternalErrors() @safe
+	{
+		exposeInternalErrors_ = true;
+	}
+
+	/// The JSON-RPC error a non-`McpException` thrown while serving `method`
+	/// becomes: logged in full, and sent as a generic internal error unless
+	/// `exposeInternalErrors` was called.
+	private McpException unexpectedFailure(string method, Exception e) @safe
+	{
+		import vibe.core.log : logError;
+
+		logError("%s: unhandled %s: %s", method, typeid(e).name, e.msg);
+		return internalError(exposeInternalErrors_ ? e.msg : "Internal error");
 	}
 
 	/// Enable the opt-in secure codec for the MRTR (SEP-2322) `requestState`. Once
@@ -1813,7 +1835,7 @@ final class McpServer : ServerCore
 		}
 		catch (Exception e)
 		{
-			writeLine(makeErrorResponse(msg.id, internalError(e.msg)).toString());
+			writeLine(makeErrorResponse(msg.id, unexpectedFailure(msg.method, e)).toString());
 			return true;
 		}
 		stdioEventStreams_[streamKey] = handle;
@@ -2357,7 +2379,7 @@ final class McpServer : ServerCore
 		{
 			if (token.cancelled)
 				return Nullable!Json.init;
-			return nullable(makeErrorResponse(msg.id, internalError(e.msg)));
+			return nullable(makeErrorResponse(msg.id, unexpectedFailure(msg.method, e)));
 		}
 	}
 
@@ -8623,6 +8645,39 @@ unittest  // stateful (2025-era) prompts/get gates on negotiated session capabil
 	Json p = Json(["name": Json("greet")]);
 	auto resp = s.handle(req(2, "prompts/get", p)).get;
 	assert(resp["error"]["code"].get!long == -32021);
+}
+
+unittest  // an unexpected handler exception reaches the client as a generic internal error
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	Resource r = {uri: "test://boom", name: "boom"};
+	s.registerResource(r, () @safe {
+		throw new Exception("open /srv/secret.db failed");
+		return ResourceContents.init;
+	});
+	auto resp = s.handle(req(1, "resources/read", Json([
+				"uri": Json("test://boom")
+	]))).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.internalError);
+	assert(resp["error"]["message"].get!string == "Internal error");
+	assert(!resp.toString().canFind("secret"));
+}
+
+unittest  // exposeInternalErrors sends an unexpected exception's message to the client
+{
+	auto s = new McpServer("t", "1");
+	s.exposeInternalErrors();
+	Resource r = {uri: "test://boom", name: "boom"};
+	s.registerResource(r, () @safe {
+		throw new Exception("disk full");
+		return ResourceContents.init;
+	});
+	auto resp = s.handle(req(1, "resources/read", Json([
+				"uri": Json("test://boom")
+	]))).get;
+	assert(resp["error"]["message"].get!string == "disk full");
 }
 
 unittest  // modern resources/read rejects with -32021 when a required client cap is undeclared

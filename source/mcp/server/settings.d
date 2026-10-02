@@ -82,6 +82,11 @@ struct ServerSettings
 	/// Off by default: the lifecycle rule is a SHOULD.
 	bool requireInitialized;
 
+	/// Send an unexpected handler exception's message to the client instead of a
+	/// generic "Internal error" (calls `exposeInternalErrors`). Off by default,
+	/// since such messages can leak internals; useful in development.
+	bool exposeInternalErrors;
+
 	/// The most items one page of a paginated list method returns (calls
 	/// `setPageSize`). `0` (the default) returns every item in a single page.
 	size_t pageSize;
@@ -135,6 +140,8 @@ struct ServerSettings
 			server.disableInputSchemaValidation();
 		if (requireInitialized)
 			server.requireInitialized();
+		if (exposeInternalErrors)
+			server.exposeInternalErrors();
 		if (pageSize > 0)
 			server.setPageSize(pageSize);
 		if (!requestStateSecurity.isNull)
