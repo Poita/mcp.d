@@ -608,7 +608,7 @@ is predictable when porting a hand-built server):
 | `Json` | `{}` (any JSON value) |
 | `std.datetime` `SysTime` / `Date` | `{"type": "string", "format": "date-time"/"date"}` |
 | `std.datetime` `DateTime` / `TimeOfDay` | `{"type": "string", "pattern": …}` matching `YYYY-MM-DDTHH:MM:SS` / `HH:MM:SS` (no UTC offset, so not the RFC 3339 `date-time`/`time` formats) |
-| `SumType!(A, B, …)` | `{"anyOf": [<A>, <B>, …]}` |
+| `SumType!(A, B, …)` | `{"anyOf": [<A>, <B>, …]}`; an argument binds to the member its JSON type natively matches (an integer to `int` over `double`), else the first member that accepts it |
 | `Nullable!T` (tool parameter / input field) | `<T>` widened to admit `null` (`"type": [<T's type>, "null"]`, plus `null` in an `enum`), made optional by omission from `required`; an explicit `null` binds as unset |
 | `Nullable!T` (elicitation field) | `<T>`, made optional by omission from `required` |
 | `Nullable!T` (output schema) | `{"anyOf": [<T>, {"type": "null"}]}` |

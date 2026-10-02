@@ -349,6 +349,20 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 	}
 	else static if (isSumType!T)
 	{
+		// A member the JSON value is natively written as wins over an earlier one
+		// that would merely convert it (an integer binds to `int`, not `double`);
+		// failing that, the first member that accepts the value does.
+		static foreach (V; TemplateArgsOf!T)
+		{
+			if (isNativeJsonType!V(v.type))
+			{
+				try
+					return T(bindJson!V(v, path));
+				catch (BindException)
+				{
+				}
+			}
+		}
 		static foreach (V; TemplateArgsOf!T)
 		{
 			try
@@ -416,6 +430,28 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 	}
 	else
 		return bindLeaf!T(v, path);
+}
+
+/// Whether vibe serializes a `V` as a JSON value of type `t`, so a value of
+/// that type binds to `V` without conversion.
+private bool isNativeJsonType(V)(Json.Type t) pure nothrow
+{
+	static if (isInstanceOf!(Nullable, V))
+		return t == Json.Type.null_ || isNativeJsonType!(TemplateArgsOf!V[0])(t);
+	else static if (is(V == bool))
+		return t == Json.Type.bool_;
+	else static if (is(V == enum) || isSomeString!V)
+		return t == Json.Type.string;
+	else static if (isIntegral!V)
+		return t == Json.Type.int_ || t == Json.Type.bigInt;
+	else static if (isFloatingPoint!V)
+		return t == Json.Type.float_;
+	else static if (isArray!V)
+		return t == Json.Type.array;
+	else static if (isFieldwiseStruct!V || isAssociativeArray!V)
+		return t == Json.Type.object;
+	else
+		return false;
 }
 
 /// Assign a freshly bound `value` into `dst`, a default-initialized slot being
@@ -696,4 +732,24 @@ unittest  // every field of an @allOptional struct is optional and keeps its def
 	auto s = bindJson!S(parseJsonString(`{"depth":2}`));
 	assert(!s.verbose && s.depth == 2 && s.name == "x");
 	assert("required" !in schemaOf!(S, SchemaUse.input)());
+}
+
+unittest  // bindJson binds a SumType to the member matching the JSON value's own type first
+{
+	import std.sumtype : SumType, has, match;
+
+	alias N = SumType!(double, int);
+	assert(bindJson!N(Json(3)).has!int);
+	assert(bindJson!N(Json(1.5)).has!double);
+
+	alias S = SumType!(string, bool);
+	assert(bindJson!S(Json(true)).match!((string _) => false, (bool b) => b));
+}
+
+unittest  // bindJson falls back to a converting SumType member when none matches exactly
+{
+	import std.sumtype : SumType, match;
+
+	alias N = SumType!(string, double);
+	assert(bindJson!N(Json(3)).match!((string _) => false, (double d) => d == 3));
 }
