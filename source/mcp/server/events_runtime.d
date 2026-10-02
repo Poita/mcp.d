@@ -2037,11 +2037,11 @@ final class EventsRuntime
 	/// attempt count. The attempt count is persisted on the queued job, so a job
 	/// re-leased after a crash resumes from where it left off and total attempts stay
 	/// bounded across leases/nodes. The lease is renewed around each attempt. On
-	/// success the subscription's watermark cursor advances; on exhaustion a signed
-	/// `gap` envelope is posted so the client learns of the lost event. The job is
-	/// acked (removed) only once its position is settled — success, 410/413
-	/// abandonment, or after the gap signal — never on a mere transient failure (so
-	/// it survives to be re-leased).
+	/// success the subscription's watermark cursor advances; on exhaustion the lost
+	/// position is recorded as missed, and a signed `gap` envelope is queued for it
+	/// once the endpoint takes deliveries again. The job is acked (removed) only
+	/// once its position is settled — success, 410/413 abandonment, or exhaustion —
+	/// never on a mere transient failure (so it survives to be re-leased).
 	private void deliverWithRetry(Delivery job) @safe
 	{
 		const subId = job.subscriptionId;
@@ -2087,9 +2087,10 @@ final class EventsRuntime
 		// for the watermark and a gap envelope tells the client it was skipped.
 		if (!job.gap && occ.toJson().toString().length > opts_.webhookMaxBodyBytes)
 		{
+			noteMissed(subId, occ.cursor);
 			settlePosition(subId, occ.cursor);
-			signalGap(s0.get, occ);
 			ackJob(job.jobId);
+			flushMissed(s0.get);
 			return;
 		}
 		int attempt = job.attempt;
@@ -2130,10 +2131,7 @@ final class EventsRuntime
 			}
 			if (attempt >= opts_.webhookMaxAttempts)
 			{
-				settlePosition(subId, occ.cursor); // abandoned for watermark purposes
-				if (!job.gap)
-					signalGap(sn.get, occ); // tell the client the event was lost
-				ackJob(job.jobId);
+				abandonUndelivered(job);
 				return;
 			}
 			opts_.deliverySleep(backoffFor(attempt));
@@ -2156,27 +2154,6 @@ final class EventsRuntime
 				deliveryQueue_.renew(waiting.jobId, leasedUntilMs);
 	}
 
-	/// POST a signed `gap` control envelope to a subscription's callback so the
-	/// client learns its watermark skipped `occ` (delivery was exhausted). Uses the
-	/// same signing + SSRF-guarded path as a normal delivery.
-	private void signalGap(WebhookSubscription sub, EventOccurrence occ) @safe
-	{
-		postGap(sub, occ.cursor.isNull ? "" : occ.cursor.get);
-	}
-
-	/// POST a signed `gap` control envelope carrying `cursor`, the fresh position
-	/// the client should persist and treat as truncated.
-	private void postGap(WebhookSubscription sub, string cursor) @safe
-	{
-		const 
-		body = gapEnvelope(cursor).toString();
-		const now = opts_.nowMs();
-		auto headers = signDeliveryHeaders(sub.secret, sub.previousSecret,
-				sub.previousSecretGraceUntilMs,
-				now, controlMessageId("gap"), now / 1000, body, sub.id, opts_.v1aSigner);
-		postToCallback(sub.url, headers, body);
-	}
-
 	/// Sign and POST one delivery attempt for `job` to `sub`'s callback: the
 	/// event, or for a gap job the `gap` envelope carrying its cursor.
 	private WebhookHttpResult attemptDelivery(WebhookSubscription sub, Delivery job) @safe
@@ -2192,14 +2169,15 @@ final class EventsRuntime
 		return postToCallback(sub.url, headers, body);
 	}
 
-	// Drop a job that will not be delivered (its subscription is suspended, or
-	// its endpoint never verified): settle its position so the watermark is not
-	// held behind it, and remember it as missed so the client is sent a gap once
-	// the endpoint takes deliveries again. No POST is made to the endpoint here.
+	// Drop a job that will not be delivered (its subscription is suspended, its
+	// endpoint never verified, or its attempts ran out): settle its position so
+	// the watermark is not held behind it, and remember it as missed so the
+	// client is sent a gap once the endpoint takes deliveries again. A gap job is
+	// remembered the same way, so the gap it carried is not lost. No POST is made
+	// to the endpoint here.
 	private void abandonUndelivered(Delivery job) @safe
 	{
-		if (!job.gap)
-			noteMissed(job.subscriptionId, job.occ.cursor);
+		noteMissed(job.subscriptionId, job.occ.cursor);
 		settlePosition(job.subscriptionId, job.occ.cursor);
 		ackJob(job.jobId);
 	}
@@ -4851,6 +4829,8 @@ version (unittest)
 		int throwEvents; // this many event deliveries throw instead of answering
 		void delegate() @safe duringPost; // run once inside the next POST, as a yield would
 		int eventDepth, maxEventDepth; // event POSTs in progress at once
+		bool failGaps; // answer gap envelopes with 503
+		Json[] acceptedGaps; // gap envelopes answered with success, in order
 
 		WebhookHttpResult post(string url, string[string] headers, string body, bool allowPrivate) @safe
 		{
@@ -4873,8 +4853,14 @@ version (unittest)
 				return echoChallenge ? WebhookHttpResult.success(200,
 						`{"challenge":"` ~ j["challenge"].get!string ~ `"}`) : WebhookHttpResult.success(
 						200, `{}`);
+			if (isControl && failGaps && j["type"].get!string == "gap")
+				return WebhookHttpResult.failure(DeliveryErrorCategory.http5xx, 503);
 			if (isControl)
+			{
+				if (j["type"].get!string == "gap")
+					acceptedGaps ~= j;
 				return WebhookHttpResult.success(200);
+			}
 			if (throwEvents > 0)
 			{
 				throwEvents--;
@@ -5744,7 +5730,8 @@ unittest  // a failure rate under the threshold never suspends, however large th
 	foreach (i; 0 .. 4)
 		rt.emit(EventOccurrence("evt_" ~ ['a', 'b', 'c', 'd'][i], "n", "t"));
 	auto sub = rt.webhookStore().get(r.id).get;
-	assert(sub.active && sub.windowAttempts == 4 && sub.windowFailures == 2);
+	// Each success after a failure also delivers the gap owed for it.
+	assert(sub.active && sub.windowAttempts == 6 && sub.windowFailures == 2);
 }
 
 unittest  // the sample window tumbles: an old streak does not count against a new window
@@ -6179,8 +6166,9 @@ unittest  // attempt persistence: a job re-leased mid-retry does not restart att
 	rt.drainDeliveries();
 	// Resuming from the persisted count, only one more attempt is made before the cap.
 	assert(ft.eventPosts().length == 1);
-	// The job is settled (acked) and emits a gap, not retried forever.
-	assert(controlPostsOf(ft, "gap").length == 1);
+	// The job is settled (acked) and owes a gap, not retried forever.
+	assert(queue.lease(2_000_000, 1000).length == 0);
+	assert(rt.missed_.get(r.id, "") == "5");
 }
 
 unittest  // the default retry schedule is 3-5 attempts spread over at most 15 minutes
@@ -6209,13 +6197,14 @@ unittest  // an oversize delivery body is abandoned with a gap signal, never POS
 	assert(controlPostsOf(ft, "gap").length == 1);
 }
 
-unittest  // gap-on-exhaustion: a signed gap envelope is posted when attempts run out
+unittest  // gap-on-exhaustion: a signed gap envelope is posted once the endpoint recovers
 {
 	auto ft = new FakeWebhookTransport();
 	ft.eventStatuses = [503, 503, 503, 503, 503];
 	auto rt = engineRuntime(ft);
 	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
 	auto gaps = controlPostsOf(ft, "gap");
 	assert(gaps.length == 1);
 	// the gap envelope carries the lost event's watermark cursor and is signed +
@@ -6225,6 +6214,22 @@ unittest  // gap-on-exhaustion: a signed gap envelope is posted when attempts ru
 	assert(j["cursor"].get!string.length > 0);
 	assert("webhook-signature" in gaps[0].headers);
 	assert(gaps[0].headers["X-MCP-Subscription-Id"].length > 0);
+}
+
+unittest  // a gap owed after retries run out is delivered once the endpoint takes deliveries again
+{
+	auto ft = new FakeWebhookTransport();
+	ft.eventStatuses = [503, 503, 503, 503, 503];
+	ft.failGaps = true;
+	auto rt = engineRuntime(ft);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(ft.acceptedGaps.length == 0);
+	const lost = rt.buffer_.headCursor();
+	ft.failGaps = false;
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	assert(ft.acceptedGaps.length == 1);
+	assert(ft.acceptedGaps[0]["cursor"].get!string == lost);
 }
 
 unittest  // monotonic watermark: an out-of-order older ack does not regress the cursor
