@@ -453,11 +453,11 @@ final class HttpClientTransport : ClientTransport
 	/// Stop the transport: signal the background stream readers
 	/// (server->client, legacy GET, `subscriptions/listen` / `events/stream`) to
 	/// stop between reads and force-close their held sockets so any blocked
-	/// `conn.read` unblocks immediately, terminating the spawned tasks. A listen
-	/// stream ended this way reports `ended` with no `error`.
+	/// `conn.read` unblocks immediately, terminating the spawned tasks, then end a
+	/// stateful session (`endSession`). A listen stream ended this way reports
+	/// `ended` with no `error`.
 	void close() @safe
 	{
-		endSession();
 		() @trusted {
 			import core.atomic : atomicStore;
 
@@ -485,6 +485,9 @@ final class HttpClientTransport : ClientTransport
 				w.err = internalError("legacy HTTP+SSE transport closing");
 		// Wake both the per-request waiters and any pending endpoint-discovery wait.
 		notifyLegacy();
+		// The readers are stopped first, so none reconnects without the session id
+		// while this DELETE is outstanding.
+		endSession();
 	}
 
 	/// Tell a stateful Streamable HTTP server the session is over: `DELETE` the
@@ -502,11 +505,12 @@ final class HttpClientTransport : ClientTransport
 		try
 		{
 			auto versionHeaders = requestHeaders(Json.undefined);
+			const bearer = currentBearer();
 			secureRequestHTTP(url, SsrfPolicy.allowUserConfigured, (scope HTTPClientRequest req) {
 				req.method = HTTPMethod.DELETE;
 				req.headers["Mcp-Session-Id"] = sid;
-				if (bearerToken.length)
-					req.headers["Authorization"] = "Bearer " ~ bearerToken;
+				if (bearer.length)
+					req.headers["Authorization"] = "Bearer " ~ bearer;
 				foreach (k, v; versionHeaders)
 					if (!isHeaderValueUnsafe(v))
 						req.headers[k] = v;
@@ -4712,6 +4716,71 @@ unittest  // readSseBody keeps the resume cursor across a dispatched event witho
 		});
 	}();
 	assert(cursor.lastEventId == "prev");
+}
+
+unittest  // close() DELETEs the session with a bearer fetched from the provider
+{
+	import mcp.client.client : McpClient;
+	import std.conv : to;
+
+	auto srv = new SessionFakeServer;
+	auto router = srv.router();
+	string deleteAuth;
+	router.delete_("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		deleteAuth = req.headers.get("Authorization", "");
+		res.statusCode = 204;
+		res.writeVoidBody();
+	});
+	int calls;
+	int callsBeforeClose;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		client.setBearerProvider(() @safe => "t" ~ (++calls).to!string);
+		client.initialize("2025-11-25");
+		callsBeforeClose = calls;
+		client.close();
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(calls == callsBeforeClose + 1, "the DELETE must consult the bearer provider");
+	assert(deleteAuth == "Bearer t" ~ calls.to!string, deleteAuth);
+}
+
+unittest  // close() stops the server stream before the session DELETE, so it never reconnects without the session
+{
+	import core.time : msecs, MonoTime;
+	import mcp.client.client : McpClient;
+	import std.conv : to;
+	import vibe.core.core : sleep;
+
+	auto srv = new SessionFakeServer;
+	auto router = srv.router();
+	string[] getSessions;
+	bool ended;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		getSessions ~= req.headers.get("Mcp-Session-Id", "");
+		writeSse(res, "retry: 10\n\n");
+		const until = MonoTime.currTime + 3.seconds;
+		while (!ended && MonoTime.currTime < until)
+			sleep(10.msecs);
+	});
+	router.delete_("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		ended = true;
+		sleep(300.msecs);
+		res.statusCode = 204;
+		res.writeVoidBody();
+	});
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		client.initialize("2025-11-25");
+		client.startServerStream();
+		const until = MonoTime.currTime + 3.seconds;
+		while (getSessions.length == 0 && MonoTime.currTime < until)
+			sleep(10.msecs);
+		client.close();
+		sleep(100.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(getSessions == ["s1"], "server stream GETs: " ~ getSessions.to!string);
 }
 
 unittest  // HttpEndpoint.hostHeader omits only the scheme's default port
