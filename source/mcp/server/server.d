@@ -72,7 +72,7 @@ struct RegisteredTool
 struct RegisteredResource
 {
 	Resource descriptor;
-	ResourceContents delegate() @safe reader;
+	ResourceReader reader;
 	/// Per-resource modern `CacheableResult` freshness hint for `resources/read`.
 	Nullable!CacheHint cache;
 	/// Client capabilities this resource's reader requires to run. On 2026-07-28
@@ -82,6 +82,15 @@ struct RegisteredResource
 	/// not cover these. Empty (the default) means no gating.
 	ClientCapabilities requiredClientCapabilities;
 }
+
+/// A direct resource reader receiving the per-request `RequestContext` (so it
+/// can log, observe cancellation, or elicit through the real request channel).
+alias ResourceReader = ResourceContents delegate(RequestContext ctx) @safe;
+
+/// A prompt handler receiving the raw `Json arguments` and the per-request
+/// `RequestContext`, always producing a final result. See `MrtrPromptHandler`
+/// for one that may ask the client for more input.
+alias PromptHandler = GetPromptResult delegate(Json arguments, RequestContext ctx) @safe;
 
 /// A resource template reader receiving the concrete URI, the captured `{var}`
 /// parameters, and the per-request `RequestContext` (so a template handler can
@@ -829,7 +838,18 @@ final class McpServer : ServerCore
 	/// Register a direct resource with a reader for its contents. An optional
 	/// per-resource modern `CacheableResult` freshness hint is emitted on this
 	/// resource's `resources/read` response (modern protocol only).
+	///
+	/// This is the context-less form; for a reader that needs the per-request
+	/// `RequestContext` use the overload taking a `ResourceReader`.
 	void registerResource(Resource descriptor, ResourceContents delegate() @safe reader,
+			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
+	{
+		registerResource(descriptor, (RequestContext) => reader(), cache);
+	}
+
+	/// Register a direct resource whose reader also receives the per-request
+	/// `RequestContext`. Otherwise identical to the context-less overload.
+	void registerResource(Resource descriptor, ResourceReader reader,
 			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
 		if (descriptor.uri in resources)
@@ -902,12 +922,17 @@ final class McpServer : ServerCore
 	/// marshals typed parameters and dispatches through this same dynamic path.
 	void registerPrompt(Prompt descriptor, GetPromptResult delegate(Json) @safe handler) @safe
 	{
-		// Adapt the simple handler — which always produces a final result — to the
-		// `PromptResponse`-returning form, ignoring the per-request context. Prompts
-		// registered this way never emit an `InputRequiredResult`.
+		registerPrompt(descriptor, (Json args, RequestContext) => handler(args));
+	}
+
+	/// As the context-less overload, but the handler also receives the
+	/// per-request `RequestContext`. It always produces a final result, so a
+	/// prompt registered this way never emits an `InputRequiredResult`.
+	void registerPrompt(Prompt descriptor, PromptHandler handler) @safe
+	{
 		requirePromptNameAvailable(descriptor.name);
 		prompts[descriptor.name] = RegisteredPrompt(descriptor, (Json args,
-				RequestContext ctx) => PromptResponse.complete(handler(args)));
+				RequestContext ctx) => PromptResponse.complete(handler(args, ctx)));
 	}
 
 	/// Throw when a prompt with `name` is already registered, mirroring the tool
@@ -2964,7 +2989,7 @@ final class McpServer : ServerCore
 			if (auto missing = direct.requiredClientCapabilities.missingFrom(declared))
 				throw missingRequiredClientCapability(missing.get);
 			ReadResourceResult result;
-			result.contents = [direct.reader().forVersion(ver)];
+			result.contents = [direct.reader(ctx).forVersion(ver)];
 			return maybeCache(result, direct.cache, ver);
 		}
 
@@ -4155,7 +4180,7 @@ unittest  // a connection-scoped batch context reports the connection's declared
 {
 	auto conn = new ConnectionState;
 	conn.clientCaps = ClientCapabilities.fromJson(Json([
-			"elicitation": Json.emptyObject
+		"elicitation": Json.emptyObject
 	]));
 	auto ctx = new ConnectionScopedContext(conn, "sess");
 	assert(ctx.clientSupports(ClientCapability.elicitationForm));
@@ -8678,6 +8703,33 @@ unittest  // modern: a requestState-only input-required result bypasses output-s
 	assert("error" !in resp);
 	assert(resp["result"]["resultType"].get!string == "input_required");
 	assert(resp["result"]["requestState"].get!string == "resume-here");
+}
+
+unittest  // a direct resource reader can receive the per-request RequestContext
+{
+	auto s = new McpServer("t", "1");
+	Resource r = {uri: "s://ctx", name: "ctx"};
+	s.registerResource(r, (RequestContext ctx) @safe => ResourceContents.makeText("s://ctx",
+			"text/plain", ctx.isStateless ? "stateless" : "session"));
+	auto res = s.handle(modernReq(1, "resources/read", Json([
+				"uri": Json("s://ctx")
+	]))).get;
+	assert(res["result"]["contents"][0]["text"].get!string == "stateless");
+}
+
+unittest  // a prompt handler returning a final result can receive the per-request RequestContext
+{
+	auto s = new McpServer("t", "1");
+	Prompt p = {name: "greet"};
+	s.registerPrompt(p, (Json args, RequestContext ctx) @safe {
+		GetPromptResult g;
+		g.messages = [
+			PromptMessage("user", Content.makeText(ctx.isStateless ? "stateless" : "session"))
+		];
+		return g;
+	});
+	auto res = s.handle(modernReq(1, "prompts/get", Json(["name": Json("greet")]))).get;
+	assert(res["result"]["messages"][0]["content"]["text"].get!string == "stateless");
 }
 
 unittest  // resources/directory/read reports a URI that is both a file and a subdirectory once
