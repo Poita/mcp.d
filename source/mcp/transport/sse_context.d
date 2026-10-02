@@ -1443,8 +1443,10 @@ final class ServerPushChannel : PushChannel
 	/// the session, the request frame is delivered only on a listener whose
 	/// `Listener.ownerToken` matches, and only a response POSTed under the SAME
 	/// session resolves it — so a reply arriving on another session can never
-	/// resolve this one's pending request. The empty token is the stateless /
-	/// shared path (any unscoped listener, resolvable only by an unscoped reply).
+	/// resolve this one's pending request. The empty token is the unscoped path
+	/// (any unscoped GET listener, resolvable only by an unscoped reply). A
+	/// `subscriptions/listen` stream is never a target: it carries notifications
+	/// only.
 	///
 	/// Returns the client's result, or throws `McpException` on a client error.
 	/// Throws `internalError` if no matching GET listener is connected (there is
@@ -1464,7 +1466,7 @@ final class ServerPushChannel : PushChannel
 		// seen by `removeListenerLocked`'s scan, which fails this awaiter immediately
 		// rather than stranding it for the full timeout.
 		const listenerId = deliver(makeRequest(Json(id), method, params),
-				(ref const Listener l) @safe => l.ownerToken == sessionToken, id, sessionToken);
+				(ref const Listener l) @safe => answersRequests(l, sessionToken), id, sessionToken);
 		if (listenerId < 0)
 		{
 			coord.cancel(id, sessionToken);
@@ -1487,9 +1489,17 @@ final class ServerPushChannel : PushChannel
 		catch (RequestTimeoutException e)
 		{
 			deliver(cancelledNotification(id, "request timed out"),
-					(ref const Listener l) @safe => l.ownerToken == sessionToken);
+					(ref const Listener l) @safe => answersRequests(l, sessionToken));
 			throw e;
 		}
+	}
+
+	/// Whether `l` can carry a server->client request for `sessionToken`: a GET
+	/// stream owned by that session. A `subscriptions/listen` stream carries only
+	/// notifications, so it never receives a request.
+	private static bool answersRequests(ref const Listener l, string sessionToken) @safe
+	{
+		return l.ownerToken == sessionToken && !l.filter.active;
 	}
 
 	/// Initiate a `ping` toward the client on the session's GET SSE stream and
@@ -3078,6 +3088,28 @@ unittest  // push-channel requestOnSession with no listener throws (nobody to an
 		assert(e.code == ErrorCode.internalError);
 	}
 	assert(threw);
+}
+
+unittest  // push-channel requestOnSession never writes a request onto a subscriptions/listen stream
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	ListenFilter listen;
+	listen.active = true;
+	string[] frames;
+	ch.addListener((string f) @safe { frames ~= f; }, Json(7), listen, "", null, "", "", false);
+	bool threw;
+	try
+		ch.requestOnSession("", "ping", Json.emptyObject, 50.msecs);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.internalError);
+	}
+	assert(threw, "a notification-only listen stream cannot answer a request");
+	assert(frames.length == 0, "no request frame may reach the listen stream");
 }
 
 unittest  // push-channel ping() with no listener throws

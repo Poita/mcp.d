@@ -1947,34 +1947,19 @@ final class McpServer : ServerCore
 		return (string method, string uri) @safe => plainGetEligibleFor(conn, method, uri);
 	}
 
-	/// Initiate a server->client `ping` on the standalone GET SSE push channel
-	/// and block until a connected client acknowledges with the spec-mandated
-	/// empty result (basic/utilities/ping: "Either the client or server can
-	/// initiate a ping by sending a `ping` request"). This is the server-side
-	/// counterpart to `McpClient.ping()`, exposing the SHOULD-periodic
-	/// connection-health probe the spec describes for either party. The probe
-	/// rides the same push channel `notify` uses, and the client's reply is
-	/// correlated via the shared `StreamCoordinator` when it POSTs the response.
+	/// Initiate a server->client `ping` on the standalone GET SSE stream owned by
+	/// the stateful HTTP session `sessionId` (its `Mcp-Session-Id`) and block until
+	/// the client acknowledges with the spec-mandated empty result
+	/// (basic/utilities/ping: "Either the client or server can initiate a ping by
+	/// sending a `ping` request"). This is the server-side counterpart to
+	/// `McpClient.ping()`. The waiter is scoped to `sessionId`, so only a response
+	/// POSTed under the same session resolves it; `connectedSessions` lists the
+	/// sessions that can be probed.
 	///
 	/// Throws `internalError` when the server is not mounted on a Streamable HTTP
-	/// transport (no push channel) or no client is listening on a GET stream, or
-	/// on a client error / timeout (treat a timeout as a stale connection per the
-	/// spec). The request carries no params, exactly as the spec requires.
-	void pingClient(Duration timeout = 60.seconds) @safe
-	{
-		if (pushChannel is null)
-			throw internalError("No server->client push channel; the server is not mounted on a Streamable HTTP transport");
-		pushChannel.ping(timeout);
-	}
-
-	/// Initiate a server->client `ping` on the GET SSE stream owned by the session
-	/// `sessionId` (its `Mcp-Session-Id`). On a stateful HTTP server every per-session
-	/// GET stream is registered under its session id as the listener's owner token, so
-	/// the probe must be scoped to that token to reach the right stream — an empty
-	/// token (the no-arg `pingClient`) matches no session-scoped listener and would
-	/// always fail. The waiter is likewise scoped to `sessionId`, so only a response
-	/// POSTed under the same session resolves it. Throws as the no-arg form does, plus
-	/// when no GET stream is connected for that session.
+	/// transport (no push channel) or no GET stream is connected for that session,
+	/// or on a client error / timeout (treat a timeout as a stale connection per
+	/// the spec). The request carries no params, exactly as the spec requires.
 	void pingClient(string sessionId, Duration timeout = 60.seconds) @safe
 	{
 		if (pushChannel is null)
@@ -4667,7 +4652,7 @@ unittest  // pingClient throws when there is no server->client push channel
 	auto s = makeTestServer();
 	bool threw;
 	try
-		s.pingClient();
+		s.pingClient("sess-A");
 	catch (McpException e)
 	{
 		threw = true;
@@ -4687,45 +4672,6 @@ unittest  // attachPushChannel refuses a second, different channel
 	assertNotThrown(srv.attachPushChannel(first));
 	assertThrown(srv.attachPushChannel(new ServerPushChannel(new StreamCoordinator)));
 	assert(srv.serverPushChannel() is first);
-}
-
-unittest  // pingClient drives a ping on the push channel and awaits the empty reply
-{
-	import std.algorithm : canFind;
-	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
-
-	auto srv = makeTestServer();
-	auto coord = new StreamCoordinator;
-	auto ch = ensurePushChannel(srv, coord); // create + attach the GET push channel
-	string frame;
-	ch.addListener((string f) @safe { frame = f; });
-
-	bool pinged;
-	void delegate() @safe nothrow initiator = () @safe nothrow{
-		try
-			srv.pingClient(); // blocks until the simulated client resolves the request
-		catch (Exception)
-			assert(false, "pingClient threw");
-		pinged = true;
-		exitEventLoop();
-	};
-	void delegate() @safe nothrow responder = () @safe nothrow{
-		// The server emitted a JSON-RPC `ping` request on the GET stream.
-		assert(frame.canFind("\"method\":\"ping\""));
-		assert(frame.canFind("\"id\":1"));
-		// Client answers id 1 with the empty result object, via the coordinator.
-		bool matched;
-		try
-			matched = coord.resolve(Json(1), Json.emptyObject, Json.undefined);
-		catch (Exception)
-			assert(false, "resolve threw");
-		assert(matched);
-	};
-	runTask(initiator);
-	runTask(responder);
-	runEventLoop();
-
-	assert(pinged);
 }
 
 unittest  // pingClient(sessionId) reaches a session-scoped GET listener (non-empty owner token)
@@ -4776,10 +4722,10 @@ unittest  // pingClient with an empty/mismatched token cannot reach a session-sc
 	auto ch = ensurePushChannel(srv, coord);
 	ch.addListener((string) @safe {}, Json(""), ListenFilter.init, "", null, "sess-A");
 
-	// The empty-token no-arg form matches no session-scoped listener.
+	// The empty token matches no session-scoped listener.
 	bool threwEmpty;
 	try
-		srv.pingClient();
+		srv.pingClient("");
 	catch (McpException)
 		threwEmpty = true;
 	assert(threwEmpty, "empty owner token must not reach a session-scoped GET listener");
