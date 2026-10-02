@@ -383,16 +383,17 @@ void runStdio(McpServer server, StdioOptions opts)
 
 	// Enforce the documented "at most once per process" invariant explicitly, so it
 	// holds for both a concurrent second call and a sequential one and does not
-	// depend on eventcore's adopt()/refCount side effects.
+	// depend on eventcore's adopt()/refCount side effects. The guard is set only
+	// once fd 0/1 are adopted, so a failed start leaves runStdio callable.
+	AdoptedStdio adopted;
 	synchronized
 	{
 		if (()@trusted { return _ranStdio; }())
 			throw new Exception("runStdio: must be called at most once per process");
+		// dup-then-adopt fd 0/1 and save their flags; restored + released on scope exit.
+		adopted = AdoptedStdio.acquire();
 		() @trusted { _ranStdio = true; }();
 	}
-
-	// dup-then-adopt fd 0/1 and save their flags; restored + released on scope exit.
-	auto adopted = AdoptedStdio.acquire();
 	scope (exit)
 		adopted.release();
 	auto inFD = adopted.inFD;
@@ -1726,6 +1727,34 @@ version (Posix) unittest  // StdioEnd.adopt routes a socket fd through the socke
 		pipeEnd.releaseRef();
 	assert(pipeEnd.valid(), "adopting a pipe end should yield a valid handle");
 	assert(!pipeEnd.isSocket_, "a pipe fd must be detected and adopted as a pipe");
+}
+
+version (Posix) unittest  // a runStdio whose stdio adoption fails does not use up the once-per-process guard
+{
+	import core.sys.posix.sys.resource : getrlimit, setrlimit, rlimit, RLIMIT_NOFILE;
+
+	const saved = () @trusted { return _ranStdio; }();
+	scope (exit)
+		() @trusted { _ranStdio = saved; }();
+	() @trusted { _ranStdio = false; }();
+
+	// With the descriptor limit at 3, fd 0-2 are the only slots, so dup(0) fails.
+	rlimit lim;
+	() @trusted { getrlimit(RLIMIT_NOFILE, &lim); }();
+	auto low = lim;
+	low.rlim_cur = 3;
+	bool threw;
+	{
+		() @trusted { setrlimit(RLIMIT_NOFILE, &low); }();
+		scope (exit)
+			() @trusted { setrlimit(RLIMIT_NOFILE, &lim); }();
+		try
+			runStdio(new McpServer("dup-fail", "1.0"));
+		catch (Exception)
+			threw = true;
+	}
+	assert(threw, "runStdio must fail when it cannot dup stdin/stdout");
+	assert(!(() @trusted => _ranStdio)(), "a failed start must leave runStdio callable again");
 }
 
 unittest  // runStdio enforces its "at most once per process" invariant via the module guard
