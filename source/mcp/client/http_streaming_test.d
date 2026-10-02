@@ -381,13 +381,13 @@ unittest
 		}
 		if (method == "tools/list")
 		{
-			// Open an SSE response, emit a `retry:` delay and an event `id:`, then
-			// close the connection WITHOUT the JSON-RPC response — the trigger for
-			// the client's Last-Event-ID resume.
+			// Open an SSE response, emit a priming event carrying a `retry:` delay
+			// and an event `id:`, then close the connection WITHOUT the JSON-RPC
+			// response — the trigger for the client's Last-Event-ID resume.
 			droppedId = j["id"].get!long;
 			res.contentType = "text/event-stream";
 			() @trusted {
-				res.bodyWriter.write(cast(const(ubyte)[]) "retry: 50\r\nid: evt-1\r\n");
+				res.bodyWriter.write(cast(const(ubyte)[]) "retry: 50\r\nid: evt-1\r\n\r\n");
 				res.bodyWriter.flush();
 			}();
 			return; // handler returns -> stream closes (EOF) with no response

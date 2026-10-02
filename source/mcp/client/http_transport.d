@@ -1349,11 +1349,13 @@ final class HttpClientTransport : ClientTransport
 	/// chunked/raw read loops.
 	///
 	/// Frames the body (chunked transfer-encoding when `chunked`, else raw reads to
-	/// EOF via `leastSize`) and runs the SSE line tokenizer over it, accumulating
-	/// `data:` (joined with `\n`, one leading space stripped) and `event:` and
-	/// flushing a complete event to `onEvent(eventType, data)` on each blank line.
-	/// `id:`/`retry:` fields are handled uniformly here — updating the caller-owned
-	/// `cursor` resumption state — so every caller gets `event:`/`id:`/`retry:`
+	/// EOF via `leastSize`) and runs the SSE line tokenizer over it (lines end in
+	/// CRLF, LF or CR), accumulating `data:` (joined with `\n`, one leading space
+	/// stripped) and `event:` and flushing a complete event to
+	/// `onEvent(eventType, data)` on each blank line. `id:`/`retry:` fields are
+	/// handled uniformly here — updating the caller-owned `cursor` resumption
+	/// state, with an `id:` taking effect when its event is dispatched — so every
+	/// caller gets `event:`/`id:`/`retry:`
 	/// support whether or not it consumes them, while keeping that state per-reader
 	/// (no shared mutable resumption fields across concurrent streams). The loop
 	/// stops between reads (and after each flushed event) once `shouldStop()`
@@ -1363,28 +1365,50 @@ final class HttpClientTransport : ClientTransport
 			scope void delegate(string eventType, string data) @safe onEvent) @trusted
 	{
 		import vibe.core.stream : IOMode;
-		import std.string : indexOf, startsWith, strip;
+		import std.string : indexOfAny, startsWith, strip;
 		import std.conv : to;
 
 		string acc, data, eventType;
+		// The `id:` of the event being read; it becomes the resume cursor only when
+		// that event is dispatched, so a stream cut mid-event resumes before it.
+		string idBuffer = cursor.lastEventId;
+		// The previous line ended in CR at the end of a read, so a LF opening the
+		// next read completes that CRLF rather than ending an empty line.
+		bool pendingCr;
 		void tokenize()
 		{
 			for (;;)
 			{
-				const nl = acc.indexOf('\n');
-				if (nl < 0)
+				if (pendingCr && acc.length)
+				{
+					if (acc[0] == '\n')
+						acc = acc[1 .. $];
+					pendingCr = false;
+				}
+				const eol = acc.indexOfAny("\r\n");
+				if (eol < 0)
 				{
 					// `acc` holds one incomplete line; it may not outgrow a message.
 					if (acc.length > maxMessageBytes)
 						throw messageTooLarge(maxMessageBytes);
 					break;
 				}
-				auto line = acc[0 .. nl];
-				acc = acc[nl + 1 .. $];
-				if (line.length && line[$ - 1] == '\r')
-					line = line[0 .. $ - 1];
+				auto line = acc[0 .. eol];
+				size_t next = eol + 1;
+				if (acc[eol] == '\r')
+				{
+					if (next < acc.length)
+					{
+						if (acc[next] == '\n')
+							++next;
+					}
+					else
+						pendingCr = true;
+				}
+				acc = acc[next .. $];
 				if (line.length == 0)
 				{
+					cursor.lastEventId = idBuffer;
 					if (data.length)
 						onEvent(eventType, data);
 					data = null;
@@ -1407,7 +1431,7 @@ final class HttpClientTransport : ClientTransport
 					data ~= (data.length ? "\n" : "") ~ d;
 				}
 				else if (line.startsWith("id:"))
-					cursor.lastEventId = line["id:".length .. $].strip;
+					idBuffer = line["id:".length .. $].strip;
 				else if (line.startsWith("retry:"))
 				{
 					try
@@ -4442,6 +4466,80 @@ unittest  // a subscriptions/listen POST accepts both JSON and SSE responses
 	});
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(accept == "application/json, text/event-stream", "Accept was: " ~ accept);
+}
+
+unittest  // readSseBody frames events on bare CR line endings
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[]) "id: 1\rdata: a\rdata: b\r\rdata: c\r\r".dup, false);
+	}();
+	SseCursor cursor;
+	string[] events;
+	() @trusted {
+		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+			events ~= d;
+		});
+	}();
+	assert(events == ["a\nb", "c"]);
+	assert(cursor.lastEventId == "1");
+}
+
+unittest  // readSseBody treats a CRLF split across two reads as one line ending
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto stream = () @trusted {
+		return createMemoryStream(cast(
+				ubyte[]) "8\r\ndata: a\r\r\nc\r\n\ndata: b\r\n\r\n\r\n0\r\n\r\n".dup, false);
+	}();
+	SseCursor cursor;
+	string[] events;
+	() @trusted {
+		t.readSseBody(stream, true, cursor, () @safe => false, (string e, string d) @safe {
+			events ~= d;
+		});
+	}();
+	assert(events == ["a\nb"]);
+}
+
+unittest  // readSseBody commits an event id only when its event is dispatched
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[]) "id: 1\ndata: x\n\nid: 2\ndata: y\n".dup, false);
+	}();
+	SseCursor cursor;
+	string[] events;
+	() @trusted {
+		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+			events ~= d;
+		});
+	}();
+	assert(events == ["x"]);
+	assert(cursor.lastEventId == "1", "an undelivered event's id must not become the resume cursor");
+}
+
+unittest  // readSseBody keeps the resume cursor across a dispatched event without an id
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[]) "data: x\n\n".dup, false);
+	}();
+	SseCursor cursor;
+	cursor.lastEventId = "prev";
+	() @trusted {
+		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+		});
+	}();
+	assert(cursor.lastEventId == "prev");
 }
 
 unittest  // HttpEndpoint.hostHeader omits only the scheme's default port
