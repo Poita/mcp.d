@@ -947,8 +947,9 @@ private void handleLegacyGet(McpServer server, LegacySseChannel channel,
 /// client's reply to a server->client request) is routed to the channel's
 /// coordinator so a handler blocked in ctx.sample/ctx.elicit/ctx.listRoots is
 /// unblocked. `token` is the request's validated bearer token, surfaced to
-/// handlers as `ctx.auth()`.
-bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
+/// handlers as `ctx.auth()`. Drives the legacy dispatch directly in tests,
+/// without an HTTP request.
+version (unittest) private bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 		string sessionId, string payload, TokenInfo token = TokenInfo.invalid()) @safe
 {
 	auto conn = channel.connStateFor(sessionId, principalOf(token));
