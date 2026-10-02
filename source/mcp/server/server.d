@@ -3432,7 +3432,7 @@ final class McpServer : ServerCore
 		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
 			throw missingRequiredClientCapability(missing.get);
 
-		Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
+		Json args = requestArguments(params, "prompts/get");
 		// Validate declared required arguments before invoking the handler so a
 		// missing required argument yields -32602 instead of a default-valued
 		// prompt (spec: server/prompts § Error Handling / Implementation
@@ -3632,6 +3632,19 @@ final class McpServer : ServerCore
 				(string name) => name, (string name) => tools[name].descriptor, params, ver);
 	}
 
+	/// The `arguments` object of a `tools/call` / `prompts/get` request: an empty
+	/// object when absent. Any other non-object value makes the request
+	/// malformed (-32602).
+	private static Json requestArguments(Json params, string method) @safe
+	{
+		auto a = "arguments" in params;
+		if (a is null)
+			return Json.emptyObject;
+		if (a.type != Json.Type.object)
+			throw invalidParams(method ~ " 'arguments' must be an object");
+		return *a;
+	}
+
 	private Json doCallTool(Json params, RequestContext ctx,
 			ProtocolVersion ver, ConnectionState conn) @safe
 	{
@@ -3654,7 +3667,7 @@ final class McpServer : ServerCore
 		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
 			throw missingRequiredClientCapability(missing.get);
 
-		Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
+		Json args = requestArguments(params, "tools/call");
 
 		// Tasks extension (SEP-2663): the server decides whether a call creates a
 		// task, but only for a client that declared the extension. Without it a
@@ -8645,6 +8658,43 @@ unittest  // stateful (2025-era) prompts/get gates on negotiated session capabil
 	Json p = Json(["name": Json("greet")]);
 	auto resp = s.handle(req(2, "prompts/get", p)).get;
 	assert(resp["error"]["code"].get!long == -32021);
+}
+
+unittest  // tools/call rejects non-object arguments with -32602 before the handler runs
+{
+	auto s = makeTestServer();
+	bool ran;
+	Tool t = {name: "probe"};
+	s.registerTool(t, (Json args) @safe { ran = true; return CallToolResult.init; });
+	foreach (bad; [Json(null), Json("x"), Json([Json(1)])])
+	{
+		auto resp = s.handle(req(1, "tools/call", Json([
+			"name": Json("probe"),
+			"arguments": bad
+		]))).get;
+		assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
+	}
+	assert(!ran);
+}
+
+unittest  // prompts/get rejects non-object arguments with -32602 before the handler runs
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	bool ran;
+	Prompt pr = {name: "greet"};
+	s.registerPrompt(pr, (Json) @safe { ran = true; return GetPromptResult(); });
+	foreach (bad; [Json(null), Json("x"), Json([Json(1)])])
+	{
+		auto resp = s.handle(req(1, "prompts/get", Json([
+			"name": Json("greet"),
+			"arguments": bad
+		]))).get;
+		assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
+		assert(!resp["error"]["message"].get!string.canFind("Missing required argument"));
+	}
+	assert(!ran);
 }
 
 unittest  // an unexpected handler exception reaches the client as a generic internal error
