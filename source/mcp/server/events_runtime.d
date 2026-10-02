@@ -367,7 +367,11 @@ struct EventsOptions
 	Duration webhookRetryBase = 30.seconds; /// exponential-backoff base between attempts (5 attempts span 7.5 min)
 	DeliveryQueue deliveryQueue; /// webhook outbox (default in-memory); shared/durable for multi-node
 	Duration workerInterval = 5.seconds; /// cadence of the periodic worker `enableEvents` starts (0 = the author runs it)
-	Duration deliveryLease = 1.minutes; /// how long a worker claims a leased delivery job
+	/// How long a worker claims a leased delivery job. Raised at construction to at
+	/// least twice the longest stretch between lease renewals (one
+	/// `webhookHttpTimeout` plus the backoff after the second-to-last attempt), so
+	/// with the defaults the effective lease is 500 seconds.
+	Duration deliveryLease = 1.minutes;
 	Duration webhookHttpTimeout = 10.seconds; /// per-attempt HTTP bound (default transport); also the worst-case-retry budget input
 	WebhookTransport webhookTransport; /// outbound HTTP (default SSRF-hardened); tests inject a fake
 	void delegate(void delegate() @safe job) @safe deliveryExecutor; /// runs a delivery (default: a fiber)
@@ -639,15 +643,17 @@ final class EventsRuntime
 	}
 
 	// A delivery worker holds one lease across a job's whole bounded retry loop,
-	// renewing it around each attempt. The lease must comfortably exceed the
-	// worst-case single attempt — one max backoff plus one HTTP timeout — or a
-	// concurrent drain could re-lease the job mid-attempt and double-deliver.
-	// Clamp the lease up to that worst case (with headroom) rather than trusting a
-	// too-short configured value.
+	// renewing it before each attempt and after each inter-attempt sleep. The
+	// lease must comfortably exceed the longest stretch between renewals — one
+	// HTTP timeout plus the longest sleep, which follows the second-to-last
+	// attempt — or a concurrent drain could re-lease the job mid-attempt and
+	// double-deliver. Clamp the lease up to that worst case (with headroom) rather
+	// than trusting a too-short configured value.
 	private void clampDeliveryLease() @safe
 	{
-		const worstAttemptMs = backoffFor(opts_.webhookMaxAttempts).total!"msecs"
-			+ opts_.webhookHttpTimeout.total!"msecs";
+		const longestSleepMs = opts_.webhookMaxAttempts > 1
+			? backoffFor(opts_.webhookMaxAttempts - 1).total!"msecs" : 0;
+		const worstAttemptMs = longestSleepMs + opts_.webhookHttpTimeout.total!"msecs";
 		// Two attempts' worth of headroom so a renewal that lands late still holds.
 		const floorMs = worstAttemptMs * 2;
 		if (opts_.deliveryLease.total!"msecs" < floorMs)
@@ -3261,6 +3267,26 @@ version (unittest)
 		h.stream.started_ = true;
 		return h;
 	}
+}
+
+unittest  // the delivery lease is clamped to twice the longest wait between renewals
+{
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	// Defaults: 5 attempts, 30 s base, 10 s HTTP timeout. The longest sleep before
+	// a renewal follows attempt 4 (30 s * 2^3 = 240 s), so the floor is 2 * 250 s.
+	auto rt = new EventsRuntime(null, o);
+	assert(rt.opts_.deliveryLease == 500.seconds);
+
+	o.webhookMaxAttempts = 1; // no retry, so no sleep: only the HTTP bound counts
+	rt = new EventsRuntime(null, o);
+	assert(rt.opts_.deliveryLease == 1.minutes);
+
+	o.webhookMaxAttempts = 5;
+	o.deliveryLease = 60.minutes; // a longer configured lease is kept
+	rt = new EventsRuntime(null, o);
+	assert(rt.opts_.deliveryLease == 60.minutes);
 }
 
 unittest  // canonicalJsonString is key-order independent
@@ -6353,9 +6379,9 @@ unittest  // subscribeWebhook rejects a non-globally-routable callback host
 	reg.onSubscribe = (EventContext ctx, string id) @safe { subs++; };
 	rt.register(reg);
 	foreach (url; [
-			"https://169.254.169.254/x", "https://10.0.0.1/hooks",
-			"https://[::1]/hooks"
-		])
+		"https://169.254.169.254/x", "https://10.0.0.1/hooks",
+		"https://[::1]/hooks"
+	])
 	{
 		int code;
 		try
