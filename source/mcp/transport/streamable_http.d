@@ -1869,7 +1869,6 @@ EventStreamTick eventStreamTick(bool emitOnly, long sinceHeartbeatMs) @safe pure
 private void handleEventsStream(McpServer server, Message msg,
 		HTTPServerResponse res, string principal, size_t maxQueued) @safe
 {
-	import vibe.core.core : sleep;
 	import core.time : msecs;
 
 	if (auto e = server.modernStreamRequestError(RequestMeta.fromParams(msg.params)))
@@ -1934,13 +1933,18 @@ private void handleEventsStream(McpServer server, Message msg,
 	applySseStreamHeaders(res, true);
 
 	// A server-initiated close (terminatePush) ends with the StreamEventsResult as
-	// the final frame; a client abort never gets one.
+	// the final frame; a client abort never gets one. It also wakes the hold loop
+	// below so the socket and stream slot are released at once.
+	import vibe.core.sync : createManualEvent;
+
+	auto terminatedEvt = createManualEvent();
 	handle.stream.onTerminated = () @safe {
 		try
 			writeFrame("data: " ~ makeResponse(msg.id, streamEventsResult()).toString() ~ "\n\n");
 		catch (Exception)
 		{
 		}
+		terminatedEvt.emit();
 	};
 
 	const emitOnly = rt.isEmitOnly(p.name);
@@ -1966,10 +1970,13 @@ private void handleEventsStream(McpServer server, Message msg,
 
 	const sleepMs = eventStreamSleepMs(emitOnly, pollMs);
 	auto lastHeartbeat = MonoTime.currTime;
-	while (true)
+	while (!handle.stream.terminated)
 	{
 		try
-			sleep(sleepMs.msecs);
+		{
+			const ec = terminatedEvt.emitCount;
+			() @trusted { terminatedEvt.wait(sleepMs.msecs, ec); }();
+		}
 		catch (Exception)
 			break;
 		if (handle.stream.terminated)
@@ -5372,6 +5379,72 @@ unittest  // an events/stream POST whose on_subscribe throws a plain Exception a
 	auto resp = parseJsonString(() @trusted { return cast(string) sink.data; }());
 	assert(resp["id"].get!long == 1);
 	assert(resp["error"]["code"].get!int == ErrorCode.internalError);
+}
+
+unittest  // a server-terminated emit-only events/stream ends promptly, not after its heartbeat sleep
+{
+	import core.time : MonoTime, msecs, seconds;
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableEvents();
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.emitOnly = true;
+	server.registerEventType(reg);
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
+		~ `"name":"n","_meta":{"protocolVersion":"2026-07-28",`
+		~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json, text/event-stream",
+		"MCP-Protocol-Version": "2026-07-28",
+		"Mcp-Method": "events/stream"
+	]);
+
+	bool ended;
+	Duration afterTerminate = Duration.max;
+	() @trusted {
+		runTask(() nothrow{
+			try
+				router.handleRequest(req, res);
+			catch (Exception)
+			{
+			}
+			ended = true;
+		});
+		runTask(() nothrow{
+			scope (exit)
+				exitEventLoop();
+			try
+			{
+				const opened = MonoTime.currTime;
+				while (!(cast(string) sink.data).canFind("notifications/events/active")
+					&& MonoTime.currTime - opened < 5.seconds)
+					sleep(5.msecs);
+				const t0 = MonoTime.currTime;
+				server.events().terminateEventType("n", Json.emptyObject);
+				while (!ended && MonoTime.currTime - t0 < 20.seconds)
+					sleep(5.msecs);
+				afterTerminate = MonoTime.currTime - t0;
+			}
+			catch (Exception)
+			{
+			}
+		});
+		runEventLoop();
+	}();
+	assert(ended, "the stream handler must return after a server-side termination");
+	assert(afterTerminate < 2.seconds, "the hold loop must wake on termination");
 }
 
 /// Build the leading event the transport sends when it opens a
