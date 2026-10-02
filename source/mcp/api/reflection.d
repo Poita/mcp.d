@@ -948,8 +948,11 @@ private ResourceContents toResourceContents(R)(R ret, string uri, string mimeTyp
 private void registerResourceMethod(string memberName, alias overload, alias parent)(
 		McpServer server, resource attr) @safe
 {
-	static assert(Parameters!overload.length == 0, "@resource method '" ~ memberName
-			~ "' must take no parameters; use @resourceTemplate for a URI with variables.");
+	enum takesContext = Parameters!overload.length == 1
+		&& is(Parameters!overload[0] : RequestContext);
+	static assert(Parameters!overload.length == 0 || takesContext,
+			"@resource method '" ~ memberName ~ "' may take only a RequestContext parameter; "
+			~ "use @resourceTemplate to read values from a URI with variables.");
 
 	Resource descriptor;
 	descriptor.uri = attr.uri;
@@ -963,9 +966,12 @@ private void registerResourceMethod(string memberName, alias overload, alias par
 
 	applyResourceMetadata!overload(descriptor);
 
-	server.registerResource(descriptor, () @safe {
-		return toResourceContents(__traits(getMember, parent, memberName)(),
-			attr.uri, attr.mimeType);
+	server.registerResource(descriptor, (RequestContext ctx) @safe {
+		static if (takesContext)
+			auto ret = __traits(getMember, parent, memberName)(ctx);
+		else
+			auto ret = __traits(getMember, parent, memberName)();
+		return toResourceContents(ret, attr.uri, attr.mimeType);
 	}, collectCache!overload());
 }
 
@@ -4137,4 +4143,40 @@ unittest  // a resource template parameter matches its URI variable without the 
 	rp["uri"] = "pkg://3";
 	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
 	assert(rr["result"]["contents"][0]["text"].get!string == "pkg 3", rr.toString);
+}
+
+version (unittest) private final class ContextResourceApi
+{
+	@resource("ctx://doc", "Doc")
+	string doc(RequestContext ctx) @safe
+	{
+		return ctx is null ? "no context" : "with context";
+	}
+}
+
+version (unittest) private final class ArgResourceApi
+{
+	@resource("arg://doc", "Doc")
+	string doc(string id) @safe
+	{
+		return id;
+	}
+}
+
+unittest  // a @resource method may take the per-request RequestContext
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ContextResourceApi);
+	Json rp = Json.emptyObject;
+	rp["uri"] = "ctx://doc";
+	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	assert(rr["result"]["contents"][0]["text"].get!string == "with context", rr.toString);
+}
+
+unittest  // a @resource method taking a non-context parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ArgResourceApi)));
 }

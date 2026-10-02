@@ -193,8 +193,9 @@ struct prompt
 	string title; /// optional human-readable display name (empty = unset)
 }
 
-/// UDA marking a method as a static MCP resource. The method takes no arguments
-/// and returns the resource contents (`string`, or a `ResourceContents`).
+/// UDA marking a method as a static MCP resource. The method takes no arguments,
+/// or only the per-request `RequestContext`, and returns the resource contents
+/// (`string`, or a `ResourceContents`).
 ///
 /// An optional human-readable `title` may be supplied for display purposes; it
 /// is independent of the programmatic `name`.
