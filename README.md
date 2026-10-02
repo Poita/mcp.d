@@ -537,8 +537,10 @@ It discovers the protected-resource and authorization-server metadata, then:
   `state` and RFC 9207 `iss` are verified, and the wait is bounded by
   `callbackTimeout` (5 minutes by default).
 - **Persists tokens** through `OAuthLogin.store`. The default is a `FileTokenStore`
-  at `$XDG_CONFIG_HOME/dlang-mcp/tokens.json` (or `~/.config/dlang-mcp/tokens.json`),
-  written owner-only; subclass it and override `serialize`/`deserialize` to encrypt
+  at `$XDG_CONFIG_HOME/dlang-mcp/tokens.json` (or `~/.config/dlang-mcp/tokens.json`;
+  `%APPDATA%\dlang-mcp\tokens.json`, else `%LOCALAPPDATA%`, on Windows),
+  written owner-only. With no per-user directory `useOAuth` throws rather than
+  writing tokens to the working directory. Subclass it and override `serialize`/`deserialize` to encrypt
   at rest, or supply `MemoryTokenStore` or your own `TokenStore`.
 - **Refreshes transparently**: every request asks the returned `OAuthSession` for
   its bearer, which runs the refresh-token grant when the access token is within

@@ -652,30 +652,53 @@ package string normalizeCallbackPath(string path) @safe pure nothrow
 	return path[0] == '/' ? path : "/" ~ path;
 }
 
-/// The default token-store path under the user's config directory:
-/// `$XDG_CONFIG_HOME/dlang-mcp/tokens.json` (or `~/.config/...`), falling back
-/// to `./.dlang-mcp-tokens.json` when no home directory is known.
+/// The default token-store path under the current user's config directory (see
+/// `tokenStorePathFor`). Throws `McpException` when the environment names no
+/// per-user directory.
 string defaultTokenStorePath() @safe
 {
 	import std.process : environment;
+
+	version (Windows)
+		enum windows = true;
+	else
+		enum windows = false;
+	return tokenStorePathFor((string name) @safe {
+		try
+			return environment.get(name, "");
+		catch (Exception)
+			return "";
+	}, windows);
+}
+
+/// The token-store path for an environment read through `getEnv`:
+/// `%APPDATA%\dlang-mcp\tokens.json` (else `%LOCALAPPDATA%`) on Windows, and
+/// `$XDG_CONFIG_HOME/dlang-mcp/tokens.json` (else `~/.config/...`) elsewhere.
+/// Tokens are secrets, so when no per-user directory is known this throws
+/// `McpException` rather than writing them into the working directory.
+string tokenStorePathFor(scope string delegate(string name) @safe getEnv, bool windows) @safe
+{
 	import std.path : buildPath;
 
 	string base;
-	try
+	if (windows)
 	{
-		base = environment.get("XDG_CONFIG_HOME", "");
+		base = getEnv("APPDATA");
+		if (base.length == 0)
+			base = getEnv("LOCALAPPDATA");
+	}
+	else
+	{
+		base = getEnv("XDG_CONFIG_HOME");
 		if (base.length == 0)
 		{
-			auto home = environment.get("HOME", "");
+			const home = getEnv("HOME");
 			if (home.length)
 				base = buildPath(home, ".config");
 		}
 	}
-	catch (Exception)
-	{
-	}
 	if (base.length == 0)
-		return ".dlang-mcp-tokens.json";
+		throw internalError(windows ? "no per-user directory for the OAuth token store: neither APPDATA nor LOCALAPPDATA is set; supply OAuthLogin.store" : "no per-user directory for the OAuth token store: neither XDG_CONFIG_HOME nor HOME is set; supply OAuthLogin.store");
 	return buildPath(base, "dlang-mcp", "tokens.json");
 }
 
@@ -1494,6 +1517,54 @@ unittest  // invalidating a token that has already been replaced keeps the curre
 	sess.invalidate("stale-access");
 	assert(sess.bearerForRequest(5000) == "current-access");
 	assert(refreshes == 0);
+}
+
+version (unittest) private string delegate(string) @safe fakeEnv(string[string] vars) @safe
+{
+	return (string name) @safe => vars.get(name, "");
+}
+
+unittest  // the Windows token store lives under %APPDATA%
+{
+	import std.path : buildPath;
+
+	assert(tokenStorePathFor(fakeEnv(["APPDATA": `C:\Users\u\AppData\Roaming`]),
+			true) == buildPath(`C:\Users\u\AppData\Roaming`, "dlang-mcp", "tokens.json"));
+}
+
+unittest  // the Windows token store falls back to %LOCALAPPDATA%
+{
+	import std.path : buildPath;
+
+	assert(tokenStorePathFor(fakeEnv([
+				"LOCALAPPDATA": `C:\Users\u\AppData\Local`
+	]), true) == buildPath(`C:\Users\u\AppData\Local`, "dlang-mcp", "tokens.json"));
+}
+
+unittest  // the Windows token store ignores HOME-style variables and never uses the working directory
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(tokenStorePathFor(fakeEnv(["HOME": "/home/u"]), true));
+}
+
+unittest  // the POSIX token store lives under XDG_CONFIG_HOME, else ~/.config
+{
+	import std.path : buildPath;
+
+	assert(tokenStorePathFor(fakeEnv([
+				"XDG_CONFIG_HOME": "/xdg",
+				"HOME": "/home/u"
+	]), false) == buildPath("/xdg", "dlang-mcp", "tokens.json"));
+	assert(tokenStorePathFor(fakeEnv(["HOME": "/home/u"]),
+			false) == buildPath("/home/u", ".config", "dlang-mcp", "tokens.json"));
+}
+
+unittest  // with no per-user directory the token store path is refused, not put in the working directory
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(tokenStorePathFor(fakeEnv(null), false));
 }
 
 unittest  // loopbackResponseHtml differs for success and failure
