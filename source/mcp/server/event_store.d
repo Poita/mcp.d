@@ -371,6 +371,11 @@ struct WebhookSubscription
 /// subscription must survive restarts (its client never refreshes).
 interface WebhookSubscriptionStore
 {
+	/// Whether stored subscriptions survive a restart. A no-expiry grant is
+	/// permitted only over a durable store: its client never refreshes, so a
+	/// subscription lost on restart would silently stop delivering.
+	bool durable() @safe;
+
 	/// Insert or replace the subscription identified by `sub.id`.
 	void put(WebhookSubscription sub) @safe;
 
@@ -392,6 +397,11 @@ interface WebhookSubscriptionStore
 final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 {
 	private Json[string] records_;
+
+	bool durable() @safe
+	{
+		return false;
+	}
 
 	void put(WebhookSubscription sub) @safe
 	{

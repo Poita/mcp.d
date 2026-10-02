@@ -350,7 +350,7 @@ struct EventsOptions
 	int pollMaxAnonymousLeases = 10_000; /// cap on distinct live poll subscriptions all unauthenticated callers hold together (0 = unlimited)
 	Duration webhookTtlCap = 30.minutes; /// max granted webhook TTL (clamps suggestions down)
 	Duration webhookMinTtl = 1.minutes; /// min granted webhook TTL (clamps tiny suggestions up)
-	bool allowNoExpiry; /// permit `ttlMs:null` no-expiry grants (requires a durable store)
+	bool allowNoExpiry; /// permit `ttlMs:null` no-expiry grants (construction throws unless the store is `durable`)
 	bool webhookEnabled = true; /// advertise/serve webhook delivery
 	DeliveryMode[] disabledModes; /// modes disabled for ALL types (a type may narrow further, not re-enable)
 	int webhookMaxSubscriptionsPerPrincipal = 1000; /// cap on live webhook subscriptions one principal may hold (0 = unlimited)
@@ -561,6 +561,10 @@ final class EventsRuntime
 		webhookStore_ = (webhookStore is null) ? new InMemoryWebhookSubscriptionStore()
 			: webhookStore;
 		opts_ = opts;
+		if (opts_.allowNoExpiry && !webhookStore_.durable())
+			throw new Exception("EventsOptions.allowNoExpiry requires a durable "
+					~ "WebhookSubscriptionStore: a no-expiry subscription is never refreshed, "
+					~ "so one lost on restart would silently stop delivering.");
 		if (opts_.deliveryQueue is null)
 			opts_.deliveryQueue = new InMemoryDeliveryQueue();
 		deliveryQueue_ = opts_.deliveryQueue;
@@ -1695,8 +1699,9 @@ final class EventsRuntime
 			return nullable(now + capMs); // server default
 		if (p.ttlMs.isNull)
 		{
-			// No-expiry requested: granted only when the server allows it (a durable
-			// store); otherwise the server returns a finite grant.
+			// No-expiry requested: granted only when the server allows it (which
+			// construction confines to a durable store); otherwise the server
+			// returns a finite grant.
 			if (opts_.allowNoExpiry)
 				return Nullable!long.init;
 			return nullable(now + capMs);
@@ -4582,11 +4587,46 @@ unittest  // subscribeWebhook clamps a suggested TTL down to the cap
 
 unittest  // subscribeWebhook grants no-expiry only when allowed
 {
+	// Stands in for a store that persists across restarts.
+	static final class DurableStore : WebhookSubscriptionStore
+	{
+		InMemoryWebhookSubscriptionStore inner;
+		this() @safe
+		{
+			inner = new InMemoryWebhookSubscriptionStore();
+		}
+
+		bool durable() @safe
+		{
+			return true;
+		}
+
+		void put(WebhookSubscription sub) @safe
+		{
+			inner.put(sub);
+		}
+
+		Nullable!WebhookSubscription get(string id) @safe
+		{
+			return inner.get(id);
+		}
+
+		void remove(string id) @safe
+		{
+			inner.remove(id);
+		}
+
+		WebhookSubscription[] all() @safe
+		{
+			return inner.all();
+		}
+	}
+
 	EventsOptions o;
 	o.nowMs = () @safe => 0L;
 	o.nowIso = () @safe => "t";
 	o.allowNoExpiry = true;
-	auto rt = new EventsRuntime(null, o);
+	auto rt = new EventsRuntime(new DurableStore(), o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
 	auto p = webhookSub("n", "https://proxy/hooks");
@@ -4603,6 +4643,16 @@ unittest  // subscribeWebhook grants no-expiry only when allowed
 	rt2.register(reg);
 	auto r2 = rt2.subscribeWebhook(p, "user-1");
 	assert(!r2.refreshBefore.isNull);
+}
+
+unittest  // allowNoExpiry over a store that is not durable is rejected at construction
+{
+	import std.exception : collectException;
+
+	EventsOptions o;
+	o.allowNoExpiry = true;
+	assert(collectException(new EventsRuntime(null, o)) !is null);
+	assert(collectException(new EventsRuntime(new InMemoryWebhookSubscriptionStore(), o)) !is null);
 }
 
 unittest  // subscribeWebhook rotates the secret with a grace window
@@ -4750,6 +4800,11 @@ unittest  // the delivery worker keeps running when a pass throws
 		this() @safe
 		{
 			inner = new InMemoryWebhookSubscriptionStore();
+		}
+
+		bool durable() @safe
+		{
+			return false;
 		}
 
 		void put(WebhookSubscription sub) @safe
@@ -6726,6 +6781,11 @@ unittest  // a delivery whose store throws is dead-lettered, not looped invisibl
 		this() @safe
 		{
 			inner = new InMemoryWebhookSubscriptionStore();
+		}
+
+		bool durable() @safe
+		{
+			return false;
 		}
 
 		void put(WebhookSubscription sub) @safe
