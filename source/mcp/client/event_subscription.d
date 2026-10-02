@@ -98,10 +98,11 @@ final class EventSubscription
 		mode_ = m;
 	}
 
-	/// Advance the watermark, ignoring a null (a null cursor never regresses it).
+	/// Advance the watermark, ignoring a null or empty cursor (neither names a
+	/// position, so neither regresses it).
 	package void advanceCursor(Nullable!string c) @safe
 	{
-		if (!c.isNull)
+		if (!c.isNull && c.get.length)
 			cursor_ = c;
 	}
 
@@ -147,6 +148,14 @@ unittest  // cursor advances only on a non-null value
 	assert(s.cursor.get == "c1");
 	s.advanceCursor(Nullable!string.init);
 	assert(s.cursor.get == "c1"); // null never regresses the watermark
+}
+
+unittest  // an empty cursor is never adopted as the watermark
+{
+	auto s = new EventSubscription();
+	s.advanceCursor(Nullable!string("c1"));
+	s.advanceCursor(Nullable!string(""));
+	assert(s.cursor.get == "c1");
 }
 
 unittest  // cancel is idempotent and runs the teardown exactly once

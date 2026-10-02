@@ -594,12 +594,13 @@ struct DeliveryStatus
 // ---------------------------------------------------------------------------
 
 /// A `gap` control envelope: a gap was detected between refreshes; the client
-/// persists `cursor` and treats it as `truncated: true`.
-Json gapEnvelope(string cursor) @safe
+/// persists `cursor` and treats it as `truncated: true`. A null `cursor` reports
+/// a loss with no position to resume from, so the client keeps its own.
+Json gapEnvelope(Nullable!string cursor) @safe
 {
 	Json j = Json.emptyObject;
 	j["type"] = "gap";
-	j["cursor"] = cursor;
+	j["cursor"] = cursor.isNull ? Json(null) : Json(cursor.get);
 	return j;
 }
 
@@ -786,7 +787,9 @@ string controlKindToWire(EventControlKind k) @safe pure nothrow
 
 private void readCursorInto(Json j, ref Nullable!string cursor) @safe
 {
-	if (j.type == Json.Type.object && "cursor" in j && j["cursor"].type == Json.Type.string)
+	// An empty string names no position, so it is never adopted as a watermark.
+	if (j.type == Json.Type.object && "cursor" in j
+			&& j["cursor"].type == Json.Type.string && j["cursor"].get!string.length)
 		cursor = j["cursor"].get!string;
 }
 
@@ -1240,15 +1243,15 @@ unittest  // DeliveryStatus carries throttling fields when set
 
 unittest  // control envelopes carry the right discriminator
 {
-	assert(gapEnvelope("c")["type"].get!string == "gap");
-	assert(gapEnvelope("c")["cursor"].get!string == "c");
+	assert(gapEnvelope(nullable("c"))["type"].get!string == "gap");
+	assert(gapEnvelope(nullable("c"))["cursor"].get!string == "c");
 	assert(terminatedEnvelope(Json(["code": Json(-32012)]))["type"].get!string == "terminated");
 	assert(verificationEnvelope("nonce")["challenge"].get!string == "nonce");
 }
 
 unittest  // isControlEnvelope distinguishes control bodies from event occurrences
 {
-	assert(isControlEnvelope(gapEnvelope("c")));
+	assert(isControlEnvelope(gapEnvelope(nullable("c"))));
 	auto occ = EventOccurrence("e", "n", "t").toJson();
 	assert(!isControlEnvelope(occ));
 }
@@ -1359,9 +1362,21 @@ unittest  // a non-control push method (the event itself) is rejected
 unittest  // a webhook gap envelope parses to a typed gap with its cursor
 {
 	EventControl c;
-	assert(controlFromWebhookEnvelope(gapEnvelope("cur-3"), c));
+	assert(controlFromWebhookEnvelope(gapEnvelope(nullable("cur-3")), c));
 	assert(c.kind == EventControlKind.gap);
 	assert(c.cursor.get == "cur-3");
+}
+
+unittest  // a gap envelope with an empty or null cursor parses to a gap with no cursor
+{
+	import vibe.data.json : parseJsonString;
+
+	EventControl c;
+	assert(controlFromWebhookEnvelope(parseJsonString(`{"type":"gap","cursor":""}`), c));
+	assert(c.kind == EventControlKind.gap && c.cursor.isNull);
+	EventControl d;
+	assert(controlFromWebhookEnvelope(parseJsonString(`{"type":"gap","cursor":null}`), d));
+	assert(d.kind == EventControlKind.gap && d.cursor.isNull);
 }
 
 unittest  // a webhook terminated envelope carries its typed error

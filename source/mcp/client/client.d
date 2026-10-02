@@ -9764,7 +9764,7 @@ unittest  // webhook `gap` envelopes and occurrences advance the subscription cu
 
 	auto h = webhookHarness();
 	assert(h.sub.cursor.get == "c0");
-	h.deliver(gapEnvelope("c7"), "m1");
+	h.deliver(gapEnvelope(nullable("c7")), "m1");
 	assert(h.sub.cursor.get == "c7", "a gap control must advance the watermark");
 	auto occ = EventOccurrence("e1", "incident.created", "t", Json.emptyObject);
 	occ.cursor = "c8";

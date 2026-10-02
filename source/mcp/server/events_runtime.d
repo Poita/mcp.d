@@ -552,7 +552,7 @@ final class EventsRuntime
 	private bool[string] localJobs_; // job ids waiting in or being delivered by a run on this node
 	private int[string] pendingCount_; // subscription id -> tracked, unsettled deliveries on this node
 	private string[string] cursorlessJobs_; // job id -> subscription id, for queued jobs with no cursor
-	private string[string] missed_; // subscription id -> furthest position dropped undelivered, owed a gap
+	private Nullable!string[string] missed_; // subscription id -> furthest position dropped undelivered (null: none known), owed a gap
 	private BackgroundLoop worker_; // the periodic worker `startDeliveryWorker` runs
 
 	this(WebhookSubscriptionStore webhookStore = null, EventsOptions opts = EventsOptions.init) @safe
@@ -1512,7 +1512,7 @@ final class EventsRuntime
 			// The gap is queued behind the batch, so the watermark reaches its
 			// position only after the batch settles and the endpoint is verified.
 			if (gap)
-				any |= enqueueGap(cur, er.cursor.get);
+				any |= enqueueGap(cur, er.cursor);
 		}
 		if (any)
 			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
@@ -2186,8 +2186,7 @@ final class EventsRuntime
 	{
 		const occ = job.occ;
 		const 
-		body = job.gap ? gapEnvelope(occ.cursor.isNull ? "" : occ.cursor.get)
-			.toString() : occ.toJson().toString();
+		body = job.gap ? gapEnvelope(occ.cursor).toString() : occ.toJson().toString();
 		const now = opts_.nowMs();
 		auto headers = signDeliveryHeaders(sub.secret, sub.previousSecret,
 				sub.previousSecretGraceUntilMs,
@@ -2209,20 +2208,23 @@ final class EventsRuntime
 	}
 
 	// Record `cursor` as a position `subId` missed. Only the furthest one is kept:
-	// the gap it produces tells the client to resume from there.
+	// the gap it produces tells the client to resume from there. A miss with no
+	// cursor is still owed a gap, which carries a null cursor unless a position
+	// is also missed.
 	private void noteMissed(string subId, Nullable!string cursor) @safe
 	{
 		import mcp.server.event_store : tryParseSeq;
 
-		if (cursor.isNull)
-			return;
 		if (auto prev = subId in missed_)
 		{
+			if (cursor.isNull)
+				return;
 			long prevSeq, candSeq;
-			if (tryParseSeq(*prev, prevSeq) && tryParseSeq(cursor.get, candSeq) && candSeq <= prevSeq)
+			if (!prev.isNull && tryParseSeq(prev.get, prevSeq)
+					&& tryParseSeq(cursor.get, candSeq) && candSeq <= prevSeq)
 				return;
 		}
-		missed_[subId] = cursor.get;
+		missed_[subId] = cursor;
 	}
 
 	// Queue a `gap` job for the furthest position `sub` missed, if any.
@@ -2237,18 +2239,20 @@ final class EventsRuntime
 			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
 	}
 
-	// Queue a `gap` job telling `sub`'s client to resume from `cursor`. It is
-	// tracked like an event, so the watermark reaches that position only once the
-	// gap is delivered, through the same verified, signed path as events. Returns
-	// false when an identical gap is already queued.
-	private bool enqueueGap(WebhookSubscription sub, string cursor) @safe
+	// Queue a `gap` job telling `sub`'s client to resume from `cursor` (or, when
+	// null, only that something was lost). It is tracked like an event, so the
+	// watermark reaches that position only once the gap is delivered, through
+	// the same verified, signed path as events. Returns false when an identical
+	// gap is already queued.
+	private bool enqueueGap(WebhookSubscription sub, Nullable!string cursor) @safe
 	{
 		EventOccurrence occ;
 		occ.eventId = controlMessageId("gap");
 		occ.name = sub.name;
 		occ.cursor = cursor;
 		trackOutstanding(sub.id, occ.cursor);
-		Delivery job = Delivery(sub.id ~ "/gap/" ~ cursor, sub.id, occ, 0);
+		const key = cursor.isNull ? occ.eventId : cursor.get;
+		Delivery job = Delivery(sub.id ~ "/gap/" ~ key, sub.id, occ, 0);
 		job.gap = true;
 		if (!deliveryQueue_.enqueue(job))
 		{
@@ -5672,6 +5676,23 @@ unittest  // a 410 Gone response is not retried (single event attempt)
 	assert(ft.eventPosts().length == 1); // no retry after 410
 }
 
+unittest  // a lost event with no cursor is signalled by a gap whose cursor is null
+{
+	auto ft = new FakeWebhookTransport();
+	ft.eventStatuses = [503, 503, 503, 503, 503];
+	auto rt = engineRuntime(ft);
+	EventRegistration reg;
+	reg.descriptor.name = "m";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c0");
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("m", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "m", "t"));
+	rt.emit(EventOccurrence("evt_2", "m", "t"));
+	auto gaps = controlPostsOf(ft, "gap");
+	assert(gaps.length == 1);
+	assert(parseJsonString(gaps[0].body)["cursor"].type == Json.Type.null_);
+}
+
 unittest  // a 410 Gone response ends the subscription and fires on_unsubscribe
 {
 	auto ft = new FakeWebhookTransport();
@@ -6311,7 +6332,7 @@ unittest  // attempt persistence: a job re-leased mid-retry does not restart att
 	assert(ft.eventPosts().length == 1);
 	// The job is settled (acked) and owes a gap, not retried forever.
 	assert(queue.lease(2_000_000, 1000).length == 0);
-	assert(rt.missed_.get(r.id, "") == "5");
+	assert(rt.missed_[r.id].get == "5");
 }
 
 unittest  // the default retry schedule is 3-5 attempts spread over at most 15 minutes
