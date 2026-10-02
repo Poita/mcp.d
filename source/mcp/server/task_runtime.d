@@ -9,6 +9,7 @@ import mcp.internal.background_loop : BackgroundLoop;
 import mcp.internal.clock : systemNowIso;
 import mcp.protocol.tasks;
 import mcp.protocol.errors : McpException, ErrorCode, toErrorJson, internalError;
+import mcp.server.context : RequestContext;
 import mcp.server.task_store : TaskStore, TaskRecord, InMemoryTaskStore,
 	TaskIdGenerator, defaultTaskIdGenerator;
 
@@ -39,6 +40,21 @@ struct TaskOptions
 	Duration sweepInterval = 30.seconds;
 	Duration maxUnsettledAge = 24.hours;
 	string delegate() @safe nowIso;
+}
+
+/// Per-task settings for `TaskRuntime.create` / `createFor`.
+struct TaskCreateOptions
+{
+	/// How long the record is kept once the task settles; null inherits
+	/// `TaskOptions.defaultTtl`. `unlimitedTaskTtl` keeps it forever.
+	Nullable!Duration ttl;
+	/// The suggested `tasks/get` poll cadence; null inherits
+	/// `TaskOptions.defaultPollInterval`.
+	Nullable!Duration pollInterval;
+	/// The authenticated principal the task is bound to: `requireAccess` then
+	/// admits only that principal, and its status notifications reach only that
+	/// principal's streams. Empty leaves the task open to every request.
+	string owner;
 }
 
 /// Server-side task lifecycle over a `TaskStore`. Every piece of task state —
@@ -99,26 +115,37 @@ final class TaskRuntime
 	}
 
 	/// Create a fresh `working` task with no associated executor (the manual path,
-	/// where the caller drives the lifecycle itself). `ttl`/`pollInterval` default
-	/// to the runtime options when null.
-	Task create(Nullable!Duration ttl = Nullable!Duration.init,
-			Nullable!Duration pollInterval = Nullable!Duration.init) @safe
+	/// where the caller drives the lifecycle itself), bound to `ctx`'s
+	/// authenticated principal (unbound when `ctx` is null or unauthenticated).
+	/// This is the form a request handler uses, so the task is reachable only by
+	/// the principal that asked for it; `opts.owner` is replaced.
+	Task create(RequestContext ctx, TaskCreateOptions opts = TaskCreateOptions.init) @safe
 	{
-		return createFor("", Json.undefined, ttl, pollInterval);
+		opts.owner = "";
+		if (ctx !is null)
+		{
+			auto info = ctx.auth();
+			if (info.valid)
+				opts.owner = info.subject;
+		}
+		return create(opts);
+	}
+
+	/// Create a fresh `working` task with no associated executor, bound to
+	/// `opts.owner` (if any).
+	Task create(TaskCreateOptions opts = TaskCreateOptions.init) @safe
+	{
+		return createFor("", Json.undefined, opts);
 	}
 
 	/// Create a fresh `working` task bound to a registered executor (`toolName`),
 	/// persisting `executorInput` as the durable input the executor reconstitutes
 	/// on each dispatch. The returned `Task` seeds a `CreateTaskResult`. The
-	/// generated ID is guaranteed unique against the store. `ttl`/`pollInterval`
-	/// default to the runtime options when null; both are serialized to integer
-	/// milliseconds on the wire `Task`, except `unlimitedTaskTtl`, which is
-	/// `ttlMs: null` and keeps the settled record forever. A non-empty `owner` (the creating
-	/// request's authenticated principal) binds the task: `requireAccess` then
-	/// admits only that principal.
+	/// generated ID is guaranteed unique against the store. The TTL and poll
+	/// interval are serialized to integer milliseconds on the wire `Task`, except
+	/// `unlimitedTaskTtl`, which is `ttlMs: null`.
 	Task createFor(string toolName, Json executorInput,
-			Nullable!Duration ttl = Nullable!Duration.init,
-			Nullable!Duration pollInterval = Nullable!Duration.init, string owner = "") @safe
+			TaskCreateOptions opts = TaskCreateOptions.init) @safe
 	{
 		string id;
 		// Defend against a misbehaving custom generator returning a duplicate.
@@ -133,8 +160,9 @@ final class TaskRuntime
 			throw new McpException(ErrorCode.internalError,
 					"task id generator failed to produce a unique id");
 
-		const ttlDur = ttl.isNull ? opts_.defaultTtl : ttl.get;
-		const pollDur = pollInterval.isNull ? opts_.defaultPollInterval : pollInterval.get;
+		const ttlDur = opts.ttl.isNull ? opts_.defaultTtl : opts.ttl.get;
+		const pollDur = opts.pollInterval.isNull ? opts_.defaultPollInterval : opts
+			.pollInterval.get;
 
 		TaskRecord r;
 		r.meta.taskId = id;
@@ -146,7 +174,7 @@ final class TaskRuntime
 			: nullable(ttlDur.total!"msecs");
 		r.meta.pollIntervalMs = nullable(pollDur.total!"msecs");
 		r.toolName = toolName;
-		r.owner = owner;
+		r.owner = opts.owner;
 		r.executorInput = executorInput;
 		store_.put(r);
 		return r.meta;
@@ -690,7 +718,7 @@ unittest  // create yields a working task with seeded ttl/poll and timestamps
 unittest  // create honors explicit ttl/poll overrides
 {
 	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
-	auto t = rt.create(nullable(1_000.msecs), nullable(250.msecs));
+	auto t = rt.create(TaskCreateOptions(nullable(1_000.msecs), nullable(250.msecs)));
 	assert(t.ttlMs.get == 1_000 && t.pollIntervalMs.get == 250);
 }
 
@@ -925,7 +953,7 @@ unittest  // a terminal task expires ttl after it settled: tasks/get then report
 	o.nowIso = () @safe => now;
 	auto store = new InMemoryTaskStore();
 	auto rt = new TaskRuntime(store, o);
-	auto t = rt.create(nullable(10_000.msecs));
+	auto t = rt.create(TaskCreateOptions(nullable(10_000.msecs)));
 	now = "2026-06-07T10:00:05Z";
 	rt.complete(t.taskId, Json.emptyObject);
 	now = "2026-06-07T10:00:14.5Z"; // past createdAt + ttl, within settledAt + ttl
@@ -943,7 +971,7 @@ unittest  // a non-terminal task never expires; its ttl starts once it settles
 	o.nowIso = () @safe => now;
 	auto store = new InMemoryTaskStore();
 	auto rt = new TaskRuntime(store, o);
-	auto t = rt.create(nullable(1_000.msecs));
+	auto t = rt.create(TaskCreateOptions(nullable(1_000.msecs)));
 	now = "2026-06-07T12:00:00Z";
 	assert(rt.sweepExpired() == 0);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
@@ -972,9 +1000,9 @@ unittest  // sweepExpired removes settled records past their ttl and keeps the r
 	o.nowIso = () @safe => now;
 	auto store = new InMemoryTaskStore();
 	auto rt = new TaskRuntime(store, o);
-	auto done = rt.create(nullable(1_000.msecs));
-	auto fresh = rt.create(nullable(60_000.msecs));
-	auto running = rt.create(nullable(1_000.msecs));
+	auto done = rt.create(TaskCreateOptions(nullable(1_000.msecs)));
+	auto fresh = rt.create(TaskCreateOptions(nullable(60_000.msecs)));
+	auto running = rt.create(TaskCreateOptions(nullable(1_000.msecs)));
 	rt.complete(done.taskId, Json.emptyObject);
 	rt.complete(fresh.taskId, Json.emptyObject);
 	now = "2026-06-07T10:00:02Z";
@@ -1055,7 +1083,7 @@ unittest  // a task created with unlimitedTaskTtl has a null ttl and is kept for
 	o.nowIso = () @safe => now;
 	auto store = new InMemoryTaskStore();
 	auto rt = new TaskRuntime(store, o);
-	auto t = rt.create(nullable(unlimitedTaskTtl));
+	auto t = rt.create(TaskCreateOptions(nullable(unlimitedTaskTtl)));
 	assert(t.ttlMs.isNull);
 	rt.complete(t.taskId, Json.emptyObject);
 	now = "2100-01-01T00:00:00Z";
@@ -1069,7 +1097,7 @@ unittest  // a defaultTtl of unlimitedTaskTtl makes tasks unlimited unless a ttl
 	o.defaultTtl = unlimitedTaskTtl;
 	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
 	assert(rt.create().ttlMs.isNull);
-	assert(rt.create(nullable(1_000.msecs)).ttlMs.get == 1_000);
+	assert(rt.create(TaskCreateOptions(nullable(1_000.msecs))).ttlMs.get == 1_000);
 }
 
 unittest  // a task unsettled past maxUnsettledAge fails, stops its executor, then expires by ttl
@@ -1086,7 +1114,7 @@ unittest  // a task unsettled past maxUnsettledAge fails, stops its executor, th
 	rt.onStatusChange((Json d, string owner) @safe {
 		seen ~= d["status"].get!string;
 	});
-	auto t = rt.createFor("slow", Json.undefined, nullable(10_000.msecs));
+	auto t = rt.createFor("slow", Json.undefined, TaskCreateOptions(nullable(10_000.msecs)));
 	now = "2026-06-07T10:59:59Z";
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 	now = "2026-06-07T11:00:00Z";

@@ -20,7 +20,7 @@ import mcp.server.request_state : RequestStateSecurity, RequestStateMode,
 	RequestStateBinding, RequestStateCodec,
 	generateEphemeralKey, verifyIncomingRequestState, secureOutgoingRequestState;
 import mcp.server.task_store : TaskStore, InMemoryTaskStore;
-import mcp.server.task_runtime : TaskRuntime, TaskOptions;
+import mcp.server.task_runtime : TaskRuntime, TaskOptions, TaskCreateOptions;
 import mcp.server.skill_index : SkillIndex;
 import mcp.protocol.tasks : TaskSupport;
 import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher, InProcessTaskDispatcher,
@@ -1290,7 +1290,8 @@ final class McpServer : ServerCore
 			return ToolResponse.complete(runTaskToolInline(name, input, ctx));
 		// The task is bound to the creating request's authenticated principal
 		// (if any), so every later tasks/* request must come from the same one.
-		auto seed = taskRuntime_.createFor(name, input, ttl, pollInterval, requestPrincipal(ctx));
+		auto seed = taskRuntime_.createFor(name, input, TaskCreateOptions(ttl,
+				pollInterval, requestPrincipal(ctx)));
 		taskDispatcher_.dispatch(seed.taskId, &runTaskExecutorById);
 		return ToolResponse.task(makeCreateTaskResult(seed));
 	}
@@ -1308,8 +1309,9 @@ final class McpServer : ServerCore
 		import mcp.protocol.tasks : TaskStatus;
 
 		auto exec = name in taskExecutors_;
-		auto seed = taskRuntime_.createFor(name, args, Nullable!Duration.init,
-				Nullable!Duration.init, requestPrincipal(ctx));
+		TaskCreateOptions copts;
+		copts.owner = requestPrincipal(ctx);
+		auto seed = taskRuntime_.createFor(name, args, copts);
 		// The client never learns this task's id, so the record dies with the call
 		// and its status changes are not pushed as notifications/tasks.
 		taskRuntime_.setSilent(seed.taskId, true);
@@ -1375,7 +1377,8 @@ final class McpServer : ServerCore
 	}
 
 	/// The task runtime created by `enableTasks`, or null if tasks are not enabled.
-	/// Tool handlers use it to create (`create`) and resolve (`complete`/`fail`/
+	/// Tool handlers use it to create (`create(ctx)`, which binds the task to the
+	/// request's authenticated principal) and resolve (`complete`/`fail`/
 	/// `requireInput`/`cancel`) tasks.
 	TaskRuntime tasks() @safe
 	{
@@ -8069,6 +8072,29 @@ version (unittest)
 	}
 }
 
+unittest  // a manual task a handler creates from its request is bound to that request's principal
+{
+	import mcp.protocol.tasks : makeCreateTaskResult;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks();
+	Tool desc = {name: "manual"};
+	s.registerTool(desc, (Json args,
+			RequestContext ctx) @safe => ToolResponse.task(makeCreateTaskResult(rt.create(ctx))));
+	auto call = s.handle(modernReq(1, "tools/call", Json([
+		"name": Json("manual"),
+		"arguments": Json.emptyObject
+	])), new OwnerCtx("alice")).get;
+	const id = call["result"]["taskId"].get!string;
+
+	auto foreign = s.handle(modernReq(2, "tasks/get",
+			Json(["taskId": Json(id)])), new OwnerCtx("bob")).get;
+	assert(foreign["error"]["code"].get!int == ErrorCode.invalidParams);
+	auto own = s.handle(modernReq(3, "tasks/get", Json(["taskId": Json(id)])),
+			new OwnerCtx("alice")).get;
+	assert(own["result"]["status"].get!string == "working");
+}
+
 unittest  // a task is bound to the principal that created it: another principal cannot read it
 {
 	// ext-tasks (2026-07-28) Security Considerations, auth binding: servers MUST
@@ -10758,8 +10784,9 @@ unittest  // notifications/tasks reaches only the task owner's streams
 	ch.addListener((string fr) @safe { alice = fr; }, Json("l-a"), f, "", null, "", "alice");
 	ch.addListener((string fr) @safe { bob = fr; }, Json("l-b"), f, "", null, "", "bob");
 
-	auto t = rt.createFor("", Json.undefined, Nullable!Duration.init,
-			Nullable!Duration.init, "alice");
+	TaskCreateOptions copts;
+	copts.owner = "alice";
+	auto t = rt.createFor("", Json.undefined, copts);
 	rt.complete(t.taskId, Json(["secret": Json("s3cr3t")]));
 	assert(alice.canFind("notifications/tasks"));
 	assert(alice.canFind("s3cr3t"));
