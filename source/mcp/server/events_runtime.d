@@ -942,22 +942,26 @@ final class EventsRuntime
 		routeToWebhooks(reg, occ);
 	}
 
-	/// Emit an event to a single subscription by its push-stream id. Used when the
-	/// server already knows which subscription the event belongs to.
-	void emit(EventOccurrence occ, Json subscriptionId) @safe
+	/// Emit an event to the one push stream `target` controls, for an event the
+	/// server knows belongs to that subscription alone. The event is not written
+	/// to the ring buffer, so no poller, backlog, or other stream ever reads it,
+	/// and it carries no cursor. A closed stream, or one for another event type,
+	/// receives nothing.
+	void emit(EventOccurrence occ, PushHandle target) @safe
 	{
+		if (target is null || target.closed_)
+			return;
+		auto s = target.stream_;
+		if (s.name != occ.name)
+			return;
 		stamp(occ);
-		auto reg = occ.name in types_;
-		if (reg !is null && regIsEmitOnly(reg))
-		{
-			const cursor = buffer_.append(occ.name, occ);
-			occ.cursor = cursor;
-		}
-		foreach (s; pushStreams_.dup)
-		{
-			if (s.name == occ.name && s.subscriptionId == subscriptionId)
-				deliverToStreamSafely(reg, s, occ);
-		}
+		occ.cursor = Nullable!string.init;
+		foreach (live; pushStreams_)
+			if (live is s)
+			{
+				deliverToStreamSafely(occ.name in types_, s, occ);
+				return;
+			}
 	}
 
 	/// Open a push stream for a subscription: validate it, fire `on_subscribe`,
@@ -1826,7 +1830,7 @@ final class EventsRuntime
 		// type the ring-buffer seq is foreign to the author's check(), and the stdio
 		// ticker resumes that check() from s.cursor — so leave s.cursor for the
 		// ticker's poll() to advance from check results.
-		if (regIsEmitOnly(reg))
+		if (regIsEmitOnly(reg) && !shaped.cursor.isNull)
 			s.cursor = shaped.cursor;
 		auto params = withSubscriptionId(shaped.toJson(), s.subscriptionId);
 		s.deliver(eventsEventNotification, params);
@@ -3658,7 +3662,7 @@ unittest  // a throwing match drops only that event from an emit-only poll
 	assert(r.events.length == 1 && r.events[0].eventId == "good");
 }
 
-unittest  // targeted emit delivers to a single subscription by id
+unittest  // targeted emit delivers to the single push stream its handle controls
 {
 	auto rt = testRuntime();
 	EventRegistration reg = {
@@ -3668,10 +3672,40 @@ unittest  // targeted emit delivers to a single subscription by id
 	int s1, s2;
 	cast(void) openLive(rt, "slack.message", Json.emptyObject, "u", Json(1),
 			(string m, Json p) @safe { s1++; });
-	cast(void) openLive(rt, "slack.message", Json.emptyObject, "u", Json(2),
+	auto h2 = openLive(rt, "slack.message", Json.emptyObject, "u", Json(2),
 			(string m, Json p) @safe { s2++; });
-	rt.emit(EventOccurrence("e", "slack.message", "t"), Json(2));
+	rt.emit(EventOccurrence("e", "slack.message", "t"), h2);
 	assert(s1 == 0 && s2 == 1);
+	h2.close();
+	rt.emit(EventOccurrence("e2", "slack.message", "t"), h2);
+	assert(s2 == 1);
+}
+
+unittest  // a targeted emit is neither buffered for pollers nor sent to another connection's stream
+{
+	auto rt = testRuntime();
+	EventRegistration reg = {
+		descriptor: EventType("slack.message"), emitOnly: true
+	};
+	rt.register(reg);
+	auto boot = rt.poll("slack.message", Json.emptyObject, "other",
+			Nullable!string.init, Nullable!long.init, Nullable!long.init);
+	int mine, theirs;
+	Nullable!string mineCursor = nullable("unset");
+	auto h = openLive(rt, "slack.message", Json.emptyObject, "me", Json(1),
+			(string m, Json p) @safe {
+		mine++;
+		mineCursor = "cursor" in p ? nullable(p["cursor"].get!string) : Nullable!string.init;
+	});
+	// Another connection's stream reusing the same client-chosen JSON-RPC id.
+	cast(void) openLive(rt, "slack.message", Json.emptyObject, "other",
+			Json(1), (string m, Json p) @safe { theirs++; });
+	rt.emit(EventOccurrence("e", "slack.message", "t"), h);
+	assert(mine == 1 && theirs == 0);
+	assert(mineCursor.isNull);
+	auto r = rt.poll("slack.message", Json.emptyObject, "other", boot.cursor,
+			Nullable!long.init, Nullable!long.init);
+	assert(r.events.length == 0);
 }
 
 unittest  // emit does not pollute a check-backed type's push-stream cursor with a buffer seq
