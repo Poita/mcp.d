@@ -1537,7 +1537,7 @@ unittest  // the Windows token store falls back to %LOCALAPPDATA%
 	import std.path : buildPath;
 
 	assert(tokenStorePathFor(fakeEnv([
-				"LOCALAPPDATA": `C:\Users\u\AppData\Local`
+		"LOCALAPPDATA": `C:\Users\u\AppData\Local`
 	]), true) == buildPath(`C:\Users\u\AppData\Local`, "dlang-mcp", "tokens.json"));
 }
 
@@ -1553,8 +1553,8 @@ unittest  // the POSIX token store lives under XDG_CONFIG_HOME, else ~/.config
 	import std.path : buildPath;
 
 	assert(tokenStorePathFor(fakeEnv([
-				"XDG_CONFIG_HOME": "/xdg",
-				"HOME": "/home/u"
+		"XDG_CONFIG_HOME": "/xdg",
+		"HOME": "/home/u"
 	]), false) == buildPath("/xdg", "dlang-mcp", "tokens.json"));
 	assert(tokenStorePathFor(fakeEnv(["HOME": "/home/u"]),
 			false) == buildPath("/home/u", ".config", "dlang-mcp", "tokens.json"));

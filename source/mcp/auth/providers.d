@@ -21,6 +21,8 @@ module mcp.auth.providers;
 import std.exception : enforce;
 import std.string : endsWith;
 
+import vibe.data.json : Json;
+
 import mcp.auth.jwt_verifier : JwtVerifierConfig, jwtVerifier;
 import mcp.auth.oauth : TokenEndpointAuthMethod;
 import mcp.auth.oauth_proxy : IssueTokenHook, OAuthProxyConfig;
@@ -110,8 +112,16 @@ ResourceServerConfig resourceServer(JwtVerifierConfig vc, string resource) @safe
 
 /// Microsoft Entra ID (Azure AD). Pins the v2.0 issuer
 /// `https://login.microsoftonline.com/{tenant}/v2.0` and the matching JWKS
-/// (`/discovery/v2.0/keys`). `opts.audience` is typically the API's App ID URI
-/// or client id.
+/// (`/discovery/v2.0/keys`).
+///
+/// `opts.audience` is the application (client) id of the API's own app
+/// registration, which Entra stamps as `aud` in every v2.0 access token for
+/// that API. Register the MCP server as its own API application rather than
+/// reusing the registration a client signs users in with: an OIDC `id_token`
+/// is issued for the signing-in client's id, so a shared registration makes
+/// id_tokens carry the API's audience. As a second line of defence the preset
+/// accepts only tokens bearing the access-token-only `scp` (delegated) or
+/// `roles` (app-only) claim, which Entra never puts in an id_token.
 ///
 /// `tenant` must be a concrete tenant GUID or a registered domain name.
 /// The pseudo-tenants `"common"`, `"organizations"`, and `"consumers"` are
@@ -123,7 +133,41 @@ ResourceServerConfig entraId(string tenant, JwtPresetOptions opts) @safe
 	requireConcreteEntraTenant(tenant, "entraId");
 	const issuer = "https://login.microsoftonline.com/" ~ tenant ~ "/v2.0";
 	const jwks = "https://login.microsoftonline.com/" ~ tenant ~ "/discovery/v2.0/keys";
-	return jwtResourceServer(issuer, jwks, opts);
+	JwtVerifierConfig vc;
+	vc.issuer = issuer;
+	vc.jwksUri = jwks;
+	vc.audience = opts.audience.length ? opts.audience : opts.resource;
+	vc.requiredScopes = opts.scopes.dup;
+	return entraResourceServer(vc, opts.resource);
+}
+
+/// `resourceServer` for an Entra issuer, additionally requiring the `scp` or
+/// `roles` claim that distinguishes an Entra access token from an id_token.
+private ResourceServerConfig entraResourceServer(JwtVerifierConfig vc, string resource) @safe
+{
+	import mcp.auth.resource_server : TokenInfo, TokenValidator;
+
+	auto cfg = resourceServer(vc, resource);
+	TokenValidator inner = cfg.validator;
+	cfg.validator = (string token) @safe {
+		auto info = inner(token);
+		if (info.valid && !hasEntraAccessTokenClaim(info.claims))
+			return TokenInfo.invalid();
+		return info;
+	};
+	return cfg;
+}
+
+/// Whether `claims` carries a non-empty `scp` string or `roles` array.
+private bool hasEntraAccessTokenClaim(Json claims) @safe
+{
+	if (claims.type != Json.Type.object)
+		return false;
+	const scp = claims["scp"];
+	if (scp.type == Json.Type.string && scp.get!string.length)
+		return true;
+	const roles = claims["roles"];
+	return roles.type == Json.Type.array && roles.length > 0;
 }
 
 /// Microsoft Entra ID for a multi-tenant app: accepts tokens from any of the
@@ -637,4 +681,63 @@ unittest  // the Google passthrough preset authorizes an opaque upstream token i
 		.toResourceServer();
 	TokenInfo info;
 	assert(authorize(rs, "Bearer gho_valid", info) == AuthFailure.none);
+}
+
+version (unittest)
+{
+	private enum entraApiClientId = "11111111-2222-3333-4444-555555555555";
+
+	/// The Entra preset's validation, verifying against the pinned test key.
+	private ResourceServerConfig entraPinnedConfig() @safe
+	{
+		JwtVerifierConfig vc;
+		vc.issuer = entraIssuer;
+		vc.staticPublicKeysPem = [presetEcPubPem];
+		vc.audience = entraApiClientId;
+		return entraResourceServer(vc, mcpUrl);
+	}
+
+	/// An ES256 JWT from the Entra test issuer for the API's client id, with
+	/// `extraClaims` (a JSON object fragment, possibly empty) merged in.
+	private string entraToken(string extraClaims) @safe
+	{
+		import std.conv : to;
+		import std.datetime.systime : Clock;
+		import mcp.auth.jwt : signEs256;
+		import mcp.auth.oauth : base64UrlNoPad;
+
+		const payload = `{"iss":"` ~ entraIssuer ~ `","aud":"` ~ entraApiClientId
+			~ `","sub":"user-1","exp":` ~ (Clock.currTime.toUnixTime + 3600)
+				.to!string ~ (extraClaims.length ? "," ~ extraClaims : "") ~ "}";
+		const si = base64UrlNoPad(cast(const(ubyte)[]) `{"alg":"ES256","typ":"JWT"}`)
+			~ "." ~ base64UrlNoPad(cast(const(ubyte)[]) payload);
+		return si ~ "." ~ base64UrlNoPad(signEs256(presetEcPrivPem, cast(const(ubyte)[]) si));
+	}
+}
+
+unittest  // ENTRA: an id_token issued to the API's own client id is not accepted as an access token
+{
+	import mcp.auth.resource_server : AuthFailure, authorize;
+
+	TokenInfo info;
+	assert(authorize(entraPinnedConfig(), "Bearer " ~ entraToken(""),
+			info) == AuthFailure.invalidToken);
+}
+
+unittest  // ENTRA: a delegated access token (scp) is accepted
+{
+	import mcp.auth.resource_server : AuthFailure, authorize;
+
+	TokenInfo info;
+	assert(authorize(entraPinnedConfig(),
+			"Bearer " ~ entraToken(`"scp":"mcp.read"`), info) == AuthFailure.none);
+}
+
+unittest  // ENTRA: an app-only access token (roles) is accepted
+{
+	import mcp.auth.resource_server : AuthFailure, authorize;
+
+	TokenInfo info;
+	assert(authorize(entraPinnedConfig(),
+			"Bearer " ~ entraToken(`"roles":["Mcp.Invoke"]`), info) == AuthFailure.none);
 }
