@@ -1850,6 +1850,12 @@ private void handleEventsStream(McpServer server, Message msg,
 	import vibe.core.core : sleep;
 	import core.time : msecs;
 
+	if (auto e = server.modernStreamRequestError(RequestMeta.fromParams(msg.params)))
+	{
+		res.statusCode = httpStatusForResponse(makeErrorResponse(msg.id, e), true);
+		res.writeBody(makeErrorResponse(msg.id, e).toString(), "application/json");
+		return;
+	}
 	auto rt = server.events();
 	if (rt is null)
 	{
@@ -5200,6 +5206,41 @@ unittest  // an events/stream POST whose Accept excludes text/event-stream is 40
 	assert(res.statusCode == HTTPStatus.notAcceptable);
 }
 
+unittest  // an events/stream POST without _meta client capabilities is refused with -32602
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.server.event_context : EventContext;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableEvents();
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.emitOnly = true;
+	server.registerEventType(reg);
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
+		~ `"name":"n","_meta":{"protocolVersion":"2026-07-28"}}}`;
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json, text/event-stream",
+		"MCP-Protocol-Version": "2026-07-28",
+		"Mcp-Method": "events/stream"
+	]);
+	router.handleRequest(req, res);
+	assert(res.contentType != "text/event-stream", "the stream must not open");
+	auto resp = parseJsonString(() @trusted { return cast(string) sink.data; }());
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(resp["error"]["data"]["missingMeta"][0].get!string
+			== "io.modelcontextprotocol/clientCapabilities");
+}
+
 unittest  // an events/stream POST with a negative maxAgeMs answers InvalidParams
 {
 	import vibe.data.json : parseJsonString;
@@ -5215,7 +5256,8 @@ unittest  // an events/stream POST with a negative maxAgeMs answers InvalidParam
 	auto sink = createMemoryOutputStream();
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
-		~ `"name":"x","maxAgeMs":-1,"_meta":{"protocolVersion":"2026-07-28"}}}`;
+		~ `"name":"x","maxAgeMs":-1,"_meta":{"protocolVersion":"2026-07-28",`
+		~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
 	auto req = makeInitPostReq(body_, [
 		"Accept": "application/json, text/event-stream",
 		"MCP-Protocol-Version": "2026-07-28",
@@ -5250,7 +5292,8 @@ unittest  // an events/stream POST whose on_subscribe throws a plain Exception a
 	auto sink = createMemoryOutputStream();
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
-		~ `"name":"n","_meta":{"protocolVersion":"2026-07-28"}}}`;
+		~ `"name":"n","_meta":{"protocolVersion":"2026-07-28",`
+		~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
 	auto req = makeInitPostReq(body_, [
 		"Accept": "application/json, text/event-stream",
 		"MCP-Protocol-Version": "2026-07-28",

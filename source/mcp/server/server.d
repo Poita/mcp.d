@@ -1647,7 +1647,7 @@ final class McpServer : ServerCore
 		if (!meta.protocolVersion.length
 				|| !tryParseVersion(meta.protocolVersion, mv) || !mv.isModern)
 			return false;
-		if (auto err = stdioStreamRequestError(meta))
+		if (auto err = modernStreamRequestError(meta))
 		{
 			writeLine(makeErrorResponse(msg.id, err).toString());
 			return true;
@@ -1703,12 +1703,12 @@ final class McpServer : ServerCore
 		return true;
 	}
 
-	/// The error a modern stdio stream request (`subscriptions/listen`,
-	/// `events/stream`) is answered with instead of opening its stream: a stateful
+	/// The error a modern stream request (`subscriptions/listen`, `events/stream`)
+	/// on any transport is answered with instead of opening its stream: a stateful
 	/// server never speaks the modern protocol these streams belong to, and a
 	/// stateless one requires the `_meta` client capabilities. Null when the stream
 	/// may open.
-	private McpException stdioStreamRequestError(RequestMeta meta) @safe
+	package(mcp) McpException modernStreamRequestError(RequestMeta meta) @safe
 	{
 		if (mode_ == ServerMode.stateful)
 			return unsupportedVersionError(meta.protocolVersion);
@@ -1756,7 +1756,7 @@ final class McpServer : ServerCore
 		if (!meta.protocolVersion.length
 				|| !tryParseVersion(meta.protocolVersion, mv) || !mv.isModern)
 			return false;
-		if (auto err = stdioStreamRequestError(meta))
+		if (auto err = modernStreamRequestError(meta))
 		{
 			writeLine(makeErrorResponse(msg.id, err).toString());
 			return true;
