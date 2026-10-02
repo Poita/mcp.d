@@ -236,10 +236,9 @@ struct ClientSettings
 	/// pre-cache behavior; a positive value caches even unhinted responses for
 	/// this long. A server-supplied hint always takes precedence over this.
 	///
-	/// This governs only whether a response is *served* from cache. The
-	/// `tools/list` response is always retained (stale-for-serving) so the
-	/// `x-mcp-header` mirroring and output-schema validation derived from it keep
-	/// working without a local `listTools` even at this default; see `cachedTool`.
+	/// This governs only which responses are cached. The tool schemas used for
+	/// `x-mcp-header` mirroring and output-schema validation are kept from every
+	/// `listTools` independently of the cache, until `tools/list_changed`.
 	Duration defaultCacheTtl = Duration.zero;
 
 	/// This client's cache partition — a stable principal identifier (user / tenant
@@ -427,17 +426,21 @@ final class McpClient : ClientProtocol
 	// The JSON-RPC id used for the `initialize` request, so cancel() can enforce
 	// the spec rule that clients MUST NOT cancel initialize. 0 until sent.
 	private long initializeRequestId;
-	// Parse cache of the cached tools/list response (name -> Tool descriptor),
-	// shared by `headersFor` (x-mcp-header mirroring, reads inputSchema) and
-	// `callTool(string, ...)` (output-schema validation, reads outputSchema). It
-	// is a pure derivative of the authoritative response cache: `cachedTool`
-	// re-derives it whenever the underlying CacheStore entry changes (a different
-	// physical key or expiry) and drops it when the entry is gone, so it never
-	// outlives or diverges from the store — including a shared/pre-seeded one.
-	private Tool[string] toolIndex_;
-	private CacheKey toolIndexKey_;
-	private SysTime toolIndexStamp_;
-	private bool toolIndexValid_;
+	// The tool descriptors (name -> Tool) from this client's last `listTools`,
+	// read by `headersFor` (x-mcp-header mirroring, inputSchema) and `callTool`
+	// (output-schema validation, outputSchema). It lives outside the CacheStore
+	// so neither `noCache` nor eviction from a bounded store loses the schemas;
+	// `notifications/tools/list_changed` and an identity change clear it.
+	private Tool[string] listedTools_;
+	private bool haveListedTools_;
+	// A memoized parse of a `tools/list` entry found in the CacheStore, used
+	// only before this client has run `listTools` (a shared or pre-seeded store).
+	// It is re-derived whenever the underlying entry changes (a different
+	// physical key or expiry) and dropped when the entry is gone.
+	private Tool[string] storeToolIndex_;
+	private CacheKey storeToolIndexKey_;
+	private SysTime storeToolIndexStamp_;
+	private bool storeToolIndexValid_;
 	// Modern (2026-07-28) per-request logging opt-in. The modern protocol has no
 	// `logging/setLevel` RPC; a client instead controls verbosity by stamping
 	// `_meta["io.modelcontextprotocol/logLevel"]` on each request, and a
@@ -928,6 +931,7 @@ final class McpClient : ClientProtocol
 		// other principals' partitions intact.
 		if (cacheStore_ !is null)
 			cacheStore_.invalidatePartition(cachePartition_);
+		clearToolIndex();
 	}
 
 	/// Attach an OAuth bearer provider, called for every request so a token that
@@ -938,6 +942,7 @@ final class McpClient : ClientProtocol
 		transport.setBearerProvider(provider);
 		if (cacheStore_ !is null)
 			cacheStore_.invalidatePartition(cachePartition_);
+		clearToolIndex();
 	}
 
 	/// Perform the initialize handshake and send `notifications/initialized`.
@@ -1249,8 +1254,21 @@ final class McpClient : ClientProtocol
 			if (useModern)
 				a.tools = excludeInvalidHeaderTools(a.tools);
 			return a;
-		}, true); // retainForSchema: keep tools/list available to cachedTool
+		});
+		listedTools_ = null;
+		foreach (t; acc.tools)
+			listedTools_[t.name] = t;
+		haveListedTools_ = true;
 		return acc;
+	}
+
+	/// Forget the tool descriptors held for schema lookups, so mirroring and
+	/// output validation stop until the next `listTools`.
+	private void clearToolIndex() @safe nothrow
+	{
+		listedTools_ = null;
+		haveListedTools_ = false;
+		storeToolIndexValid_ = false;
 	}
 
 	/// Filter out any tool whose `inputSchema` has an invalid `x-mcp-header`
@@ -1386,36 +1404,40 @@ final class McpClient : ClientProtocol
 		return Nullable!CacheEntry.init;
 	}
 
-	/// The descriptor for tool `name` taken from the cached `tools/list` response
-	/// — the single source for both `x-mcp-header` mirroring and output-schema
-	/// validation. Returns a null `Nullable` only when no `tools/list` response is
-	/// held at all (locally OR in a shared/pre-seeded store), so a caller that
-	/// never ran `listTools` still gets schemas from a populated cache. The read
-	/// ignores serving-freshness (`requireFresh: false`): a tool's schema stays
-	/// valid for as long as the entry is held, and `notifications/*/list_changed`
-	/// eviction — not the TTL clock — is what stops mirroring/validation. The
-	/// parsed `name -> Tool` index is memoized and re-derived only when the backing
-	/// cache entry changes (a different physical key or expiry stamp).
+	/// The descriptor for tool `name` — the single source for both `x-mcp-header`
+	/// mirroring and output-schema validation. After a local `listTools` this is
+	/// the listed tool set, independent of the response cache. Before one, a
+	/// `tools/list` entry held in the CacheStore (a shared or pre-seeded store)
+	/// supplies it; that read ignores serving-freshness, since a schema stays
+	/// valid until `notifications/tools/list_changed` evicts the entry. Null when
+	/// no descriptor for `name` is known.
 	private Nullable!Tool cachedTool(string name) @safe
 	{
+		if (haveListedTools_)
+		{
+			if (auto t = name in listedTools_)
+				return nullable(*t);
+			return Nullable!Tool.init;
+		}
 		CacheKey hitKey;
 		auto entry = cachedEntry(CacheKey("tools/list", ""), hitKey, false);
 		if (entry.isNull)
 		{
-			toolIndexValid_ = false;
+			storeToolIndexValid_ = false;
 			return Nullable!Tool.init;
 		}
-		if (!toolIndexValid_ || hitKey != toolIndexKey_ || entry.get.expiresAt != toolIndexStamp_)
+		if (!storeToolIndexValid_ || hitKey != storeToolIndexKey_
+				|| entry.get.expiresAt != storeToolIndexStamp_)
 		{
 			auto list = ListToolsResult.fromJson(entry.get.value);
-			toolIndex_ = null;
+			storeToolIndex_ = null;
 			foreach (t; list.tools)
-				toolIndex_[t.name] = t;
-			toolIndexKey_ = hitKey;
-			toolIndexStamp_ = entry.get.expiresAt;
-			toolIndexValid_ = true;
+				storeToolIndex_[t.name] = t;
+			storeToolIndexKey_ = hitKey;
+			storeToolIndexStamp_ = entry.get.expiresAt;
+			storeToolIndexValid_ = true;
 		}
-		if (auto t = name in toolIndex_)
+		if (auto t = name in storeToolIndex_)
 			return nullable(*t);
 		return Nullable!Tool.init;
 	}
@@ -1435,18 +1457,9 @@ final class McpClient : ClientProtocol
 	/// so a shared store never serves it to another identity. Because the scope is
 	/// only known after fetching, a read probes this client's own partition first
 	/// and then the shared one.
-	///
-	/// `retainForSchema` (set by `listTools`) keeps the result available to
-	/// `cachedTool` even when it is not cached for serving: on a non-positive `ttl`
-	/// the body is stored stale-for-serving (expiry = now) instead of being
-	/// dropped, so `x-mcp-header` mirroring and output-schema validation work after
-	/// a local `listTools` regardless of `defaultCacheTtl`, while a cached
-	/// `listTools` still refetches per its hint.
-	private R cachedFetch(R)(CacheKey logical, CacheMode mode,
-			scope R delegate() @safe fetch, bool retainForSchema = false) @safe
+	private R cachedFetch(R)(CacheKey logical, CacheMode mode, scope R delegate() @safe fetch) @safe
 	{
-		return cachedFetch!R(logical, mode, (out bool uncacheable) @safe => fetch(),
-				retainForSchema);
+		return cachedFetch!R(logical, mode, (out bool uncacheable) @safe => fetch());
 	}
 
 	/// `cachedFetch` over a `fetch` that reports, through `uncacheable`, a result
@@ -1454,7 +1467,7 @@ final class McpClient : ClientProtocol
 	/// `mrtrLoop`). The flag travels with the call rather than through client
 	/// state, so concurrent requests on other tasks cannot affect it.
 	private R cachedFetch(R)(CacheKey logical, CacheMode mode,
-			scope R delegate(out bool uncacheable) @safe fetch, bool retainForSchema = false) @safe
+			scope R delegate(out bool uncacheable) @safe fetch) @safe
 	{
 		bool uncacheable;
 		if (cacheStore_ is null || mode == CacheMode.bypass)
@@ -1479,18 +1492,6 @@ final class McpClient : ClientProtocol
 			cacheStore_.put(storeKey, CacheEntry(result.toJson(), now_() + ttl, scope_));
 			// If the scope flipped since a prior fetch, drop the now-stale entry
 			// that was stored under the other partition for this logical key.
-			const otherKey = (storeKey == ownKey) ? sharedKey : ownKey;
-			if (otherKey != storeKey)
-				cacheStore_.invalidate(otherKey);
-		}
-		else if (retainForSchema)
-		{
-			// Not cached for serving, but keep the body for schema lookups: store it
-			// already-expired (expiry = now) under the shared partition so a cached
-			// `listTools` still refetches, while `cachedTool` (which ignores
-			// serving-freshness) can read the descriptors until a `list_changed`.
-			const storeKey = scopedKey(logical, CacheScope.public_);
-			cacheStore_.put(storeKey, CacheEntry(result.toJson(), now_(), CacheScope.public_));
 			const otherKey = (storeKey == ownKey) ? sharedKey : ownKey;
 			if (otherKey != storeKey)
 				cacheStore_.invalidate(otherKey);
@@ -3867,6 +3868,7 @@ final class McpClient : ClientProtocol
 		{
 		case "notifications/tools/list_changed":
 			invalidateLogical("tools/list", "");
+			clearToolIndex();
 			if (onToolsListChanged !is null)
 				onToolsListChanged();
 			break;
@@ -4985,6 +4987,83 @@ unittest  // a local listTools with no server hint still enables header mirrorin
 
 	assert("Mcp-Param-Region" in c.headersFor(msg),
 			"header mirroring must work after a local listTools even with no cache hint");
+}
+
+version (unittest)
+{
+	// A modern client whose `tools/list` returns the `locate` tool with a
+	// `Region` x-mcp-header annotation, and every other method an empty result.
+	private McpClient headerToolClient() @safe
+	{
+		auto c = McpClient.http("http://localhost");
+		c.enableModern();
+		Tool t = headerTool("locate", [
+			"region": Json([
+				"type": Json("string"),
+				"x-mcp-header": Json("Region")
+			])
+		]);
+		c.onRpcForTest = (string method, Json params) @safe {
+			if (method == "tools/list")
+				return Json(["tools": Json([t.toJson()])]);
+			if (method == "resources/read")
+				return Json(["contents": Json.emptyArray, "ttlMs": Json(60_000)]);
+			return Json.emptyObject;
+		};
+		return c;
+	}
+
+	private Json locateCallMessage() @safe
+	{
+		Json params = Json.emptyObject;
+		params["name"] = "locate";
+		params["arguments"] = Json(["region": Json("us-west1")]);
+		return Json(["method": Json("tools/call"), "params": params]);
+	}
+}
+
+unittest  // header mirroring works after listTools with caching disabled
+{
+	auto c = headerToolClient();
+	c.setCache(noCache);
+	c.listTools();
+	assert("Mcp-Param-Region" in c.headersFor(locateCallMessage()));
+}
+
+unittest  // header mirroring survives eviction of tools/list from a full response cache
+{
+	import std.conv : to;
+
+	auto c = headerToolClient();
+	c.setCache(new InMemoryCacheStore(4));
+	c.listTools();
+	foreach (i; 0 .. 8)
+		c.readResource("file:///r" ~ i.to!string);
+	assert("Mcp-Param-Region" in c.headersFor(locateCallMessage()));
+}
+
+unittest  // a private-scoped tools/list with no freshness is not left in the shared partition
+{
+	auto c = McpClient.http("http://localhost");
+	auto store = new InMemoryCacheStore();
+	c.setCache(store);
+	c.setCachePartition("alice");
+	c.onRpcForTest = (string method, Json params) @safe => Json([
+		"tools": Json.emptyArray,
+		"ttlMs": Json(0),
+		"cacheScope": Json("private")
+	]);
+	c.listTools();
+	assert(store.get(CacheKey("tools/list", "", "", "http://localhost")).isNull);
+}
+
+unittest  // tools/list_changed clears the tool index built by listTools
+{
+	auto c = headerToolClient();
+	c.setCache(noCache);
+	c.listTools();
+	c.dispatchNotification("notifications/tools/list_changed", Json.emptyObject);
+	assert("Mcp-Param-Region" !in c.headersFor(locateCallMessage()));
 }
 
 unittest  // the tool index re-derives when the underlying cache entry changes
@@ -8025,9 +8104,8 @@ unittest  // connect() negotiates a legacy version with a stateful server that r
 unittest  // connect() falls back to initialize when the discover probe gets any non-version JSON-RPC error
 {
 	foreach (code; [
-			ErrorCode.invalidRequest, ErrorCode.invalidParams,
-			cast(ErrorCode)-32002
-		])
+		ErrorCode.invalidRequest, ErrorCode.invalidParams, cast(ErrorCode)-32002
+	])
 	{
 		auto transport = new RecordingClientTransport();
 		auto c = new McpClient(transport);
