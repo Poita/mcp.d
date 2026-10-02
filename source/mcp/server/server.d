@@ -1612,25 +1612,31 @@ final class McpServer : ServerCore
 			writeLine(makeErrorResponse(msg.id, err).toString());
 			return true;
 		}
-		// Stdio carries one listen stream: a new listen replaces the open one,
-		// which is answered with its result so the client's request completes.
-		closeStdioListen(cs());
-
 		// Do NOT overwrite the shared session `clientCaps` here: 2026-07-28
 		// listen request's _meta capabilities are per-request and 2026-07-28
 		// `tools/call` gate already reads them from RequestMeta.fromParams(params);
 		// clobbering the field would wipe the capabilities a prior/concurrent
 		// stateful initialize negotiated. (Delivery on this stream is governed by
 		// the per-stream filter captured below, not a connection-level version.)
-		// Record the opted-in filters; the one-shot {acknowledged:true} result is
-		// discarded (the spec defines no such Result — the ack is a notification).
+		// The filter is parsed onto a scratch state first, so an invalid request
+		// is rejected without disturbing the open stream; the one-shot
+		// {acknowledged:true} result is discarded (the spec defines no such
+		// Result — the ack is a notification).
+		auto parsed = new ConnectionState;
 		try
-			doSubscribeListen(msg.params, cs());
+			doSubscribeListen(msg.params, parsed);
 		catch (McpException e)
 		{
 			writeLine(makeErrorResponse(msg.id, e).toString());
 			return true;
 		}
+
+		// Stdio carries one listen stream: a new listen replaces the open one,
+		// which is answered with its result so the client's request completes.
+		closeStdioListen(cs());
+		foreach (u; parsed.listenFilter.resourceUris)
+			cs().subscriptions[u] = true;
+		cs().listenFilter = parsed.listenFilter;
 
 		// The listen request's id is the stream's subscriptionId; every
 		// notification on this channel (starting with the acknowledgement) is
@@ -1671,20 +1677,24 @@ final class McpServer : ServerCore
 		return null;
 	}
 
-	/// Close the open stdio `subscriptions/listen` stream, if any: answer the
-	/// listen request with its `SubscriptionsListenResult`, then drop the sink,
+	/// Close the open stdio `subscriptions/listen` stream, if any: drop the sink,
 	/// the per-stream filter, and the per-URI subscriptions it recorded on `conn`,
-	/// so a later notify writes nothing. Returns whether a stream was open.
+	/// then answer the listen request with its `SubscriptionsListenResult`. The
+	/// stream is detached before the (possibly yielding) write, so a notify racing
+	/// it can never land after the final response. Returns whether a stream was
+	/// open.
 	private bool closeStdioListen(ConnectionState conn) @safe
 	{
-		if (stdioListenSink is null)
+		auto sink = stdioListenSink;
+		if (sink is null)
 			return false;
-		stdioListenSink(subscriptionsListenResult(stdioListenSubscriptionId).toString());
+		const id = stdioListenSubscriptionId;
 		stdioListenSink = null;
 		stdioListenSubscriptionId = Json.init;
 		foreach (u; stdioListenFilter_.resourceUris)
 			conn.subscriptions.remove(u);
 		stdioListenFilter_ = ListenFilter.init;
+		sink(subscriptionsListenResult(id).toString());
 		return true;
 	}
 
@@ -6965,6 +6975,59 @@ unittest  // a second stdio subscriptions/listen closes the first with its resul
 	assert(s.notifyToolsListChanged() == 1);
 	assert(frames[before].canFind(`subscriptionId":2`),
 			"notifications flow to the newest listen stream");
+}
+
+unittest  // no stdio listen notification follows the stream's closing result
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+		// A notify that runs while the closing result is being written (the
+		// write yields on a real transport) must not reach the closed stream.
+		if (("result" in parseJsonString(line)) !is null)
+			s.notifyToolsListChanged();
+	}
+
+	assert(s.tryServeStdioListen(stdioListenReq(1), &sink));
+	s.handle(Message(makeNotification("notifications/cancelled", Json([
+				"requestId": Json(1)
+	]))));
+	assert(frames.length == 2, "ack then the closing result, nothing after it");
+	assert("result" in parseJsonString(frames[$ - 1]));
+}
+
+unittest  // an invalid replacement stdio listen leaves the open stream untouched
+{
+	import std.conv : to;
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	assert(s.tryServeStdioListen(stdioListenReq(1), &sink));
+	auto bad = stdioListenReq(2);
+	Json uris = Json.emptyArray;
+	foreach (i; 0 .. maxResourceSubscriptions + 1)
+		uris ~= Json("test://r" ~ i.to!string);
+	bad.params["notifications"]["resourceSubscriptions"] = uris;
+	assert(s.tryServeStdioListen(bad, &sink));
+	assert(frames.length == 2);
+	auto err = parseJsonString(frames[1]);
+	assert(err["id"].get!long == 2 && "error" in err);
+
+	// Stream 1 is still open and still receives its notifications.
+	assert(s.notifyToolsListChanged() == 1);
+	assert(parseJsonString(frames[2])["params"]["_meta"][MetaKey.subscriptionId].get!long == 1);
 }
 
 unittest  // a stdio subscriptions/listen missing _meta clientCapabilities is -32602
