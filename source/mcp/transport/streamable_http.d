@@ -3640,8 +3640,10 @@ private final class StatelessInFlight
 	this() @safe
 	{
 		// Allocate the table up front: an empty AA is null, and a null AA copied
-		// into a state would not alias this one.
-		tokens = new CancellationToken[string];
+		// into a state would not alias this one. Inserting then removing a key
+		// allocates it without `new V[K]`, which DMD does not infer as @safe.
+		tokens[""] = null;
+		tokens.remove("");
 	}
 
 	/// The connection token scoping `principal`'s requests in the registry.
