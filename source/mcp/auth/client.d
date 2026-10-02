@@ -302,19 +302,20 @@ final class OAuthClient
 	/// discovery itself injected so the security-critical downgrade rule is unit
 	/// testable. Only a genuinely-absent document (`PrmAbsentException`) downgrades
 	/// to the 2025-03-26 origin-issuer fallback; any other failure (a fetch error,
-	/// an SSRF/insecure-URL rejection, a malformed document) propagates so the flow
-	/// fails closed rather than silently relaxing issuer binding.
+	/// an SSRF/insecure-URL rejection, a malformed document, or a document naming
+	/// no authorization server, which RFC 9728 makes the only way to locate one)
+	/// propagates so the flow fails closed rather than silently relaxing issuer
+	/// binding.
 	private static string resolveIssuerFrom(scope ProtectedResourceMetadata delegate() @safe discover,
 			string mcpEndpoint, out bool fromProtectedResourceMetadata) @safe
 	{
 		try
 		{
 			auto prm = discover();
-			if (prm.authorizationServers.length)
-			{
-				fromProtectedResourceMetadata = true;
-				return prm.authorizationServers[0];
-			}
+			if (prm.authorizationServers.length == 0)
+				throw internalError("Protected resource metadata lists no authorization_servers");
+			fromProtectedResourceMetadata = true;
+			return prm.authorizationServers[0];
 		}
 		catch (PrmAbsentException)
 		{
@@ -989,6 +990,16 @@ unittest  // resolveIssuerFrom does NOT silently downgrade on a fetch/security e
 	bool fromPrm;
 	assertThrown!McpException(OAuthClient.resolveIssuerFrom(() @safe {
 			throw internalError("Refusing to fetch URL with no parseable host");
+			return ProtectedResourceMetadata.init;
+		}, "https://mcp.example.com/sse", fromPrm));
+}
+
+unittest  // resolveIssuerFrom refuses a PRM document that names no authorization server
+{
+	import std.exception : assertThrown;
+
+	bool fromPrm;
+	assertThrown!McpException(OAuthClient.resolveIssuerFrom(() @safe {
 			return ProtectedResourceMetadata.init;
 		}, "https://mcp.example.com/sse", fromPrm));
 }
