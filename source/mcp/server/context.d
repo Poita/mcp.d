@@ -101,17 +101,19 @@ ConnectionState connectionStateOf(RequestContext ctx) @safe
 /// Per-request context handed to tool handlers. It is the channel through which
 /// a handler emits server->client traffic while a request is in flight:
 /// progress + logging notifications, and (blocking) sampling / elicitation
-/// requests. Transports supply a concrete implementation; the in-process and
-/// stdio paths use `NullContext` (notifications are dropped, server->client
+/// requests. Transports supply a concrete implementation: stdio uses
+/// `StdioContext`, Streamable HTTP its SSE contexts, and the bare in-process
+/// `handle(msg)` uses `NullContext` (notifications are dropped, server->client
 /// requests are unsupported).
 interface RequestContext
 {
 	/// Whether the client has sent a `notifications/cancelled` for this request
 	/// (basic/utilities/cancellation). A long-running handler SHOULD poll this
 	/// and, when true, stop work and free resources promptly; the server
-	/// suppresses the late response for a cancelled request regardless. Always
-	/// false on transports that cannot deliver an out-of-band cancellation while
-	/// a request is in flight (e.g. the in-process / stdio `NullContext`).
+	/// suppresses the late response for a cancelled request regardless. For a
+	/// request the server core dispatches, this reflects the in-flight token an
+	/// inbound `notifications/cancelled` flips, on stdio as on HTTP. Always false
+	/// on a context that has no way to receive one (e.g. a bare `NullContext`).
 	bool isCancelled() @safe;
 
 	/// Emit a `notifications/progress`. No-op if the originating request carried
@@ -504,7 +506,7 @@ final class StdioContext : RequestContext
 	/// version-specific wire fields on the notifications this context emits (e.g.
 	/// the `message` field on `notifications/progress`, which only exists from
 	/// 2025-03-26 onward). This overload wires no server->client request channel
-	/// (`sendRequest` throws, `clientSupports` is false).
+	/// (`sampleRaw`/`elicitRaw`/`listRootsRaw` throw, `clientSupports` is false).
 	this(void delegate(string) @safe sink, Json progressToken = Json.undefined,
 			ProtocolVersion negotiated = latestLegacy) @safe
 	{

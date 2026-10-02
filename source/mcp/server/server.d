@@ -2079,8 +2079,8 @@ final class McpServer : ServerCore
 	}
 
 	/// As `handleRaw(text, sink)`, but with the stdio server->client request
-	/// channel: when a handler calls `ctx.sendRequest` (e.g. via
-	/// `ctx.sample`/`ctx.elicit`) `serverRequest(method, params)` is invoked to
+	/// channel: when a handler calls `ctx.sampleRaw`/`elicitRaw`/`listRootsRaw`
+	/// (e.g. via `ctx.sample`/`ctx.elicit`) `serverRequest(method, params)` is invoked to
 	/// write the request and block the current task for the client's reply (the
 	/// `DuplexChannel` correlates it on its read loop). `null` reproduces the
 	/// no-channel behaviour (server->client requests throw).
