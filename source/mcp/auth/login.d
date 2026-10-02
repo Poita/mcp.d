@@ -1947,37 +1947,62 @@ unittest  // requestTargetPath strips the query and fragment from a request targ
 	assert(requestTargetPath("") == "");
 }
 
-version (Posix) unittest  // openSystemBrowser does not leave a zombie process after the launcher exits
+version (Posix) unittest  // openSystemBrowser leaves no direct child process behind
 {
-	// openSystemBrowser must spawn the launcher with Config.detached so the OS
-	// never keeps a zombie entry after the process exits.  Without Config.detached,
-	// discarding the Pid without calling wait() causes the exited child to remain
-	// in the process table as a zombie until the parent process exits.
+	// openSystemBrowser must spawn the launcher with Config.detached: the
+	// launcher then runs as a grandchild and spawnProcess reaps the intermediate
+	// fork itself, so the call leaves this process no new direct child. Without
+	// it the discarded launcher stays a direct child, running or as a zombie.
 	//
-	// Call openSystemBrowser with a URL scheme that the platform launcher cannot
-	// handle, causing it to exit within milliseconds with an error — fast enough
-	// to reliably produce a zombie before the assertion if Config.detached is absent.
-	// With Config.detached the launcher runs as a grandchild (double-fork), so this
-	// process has no direct child to reap and waitpid returns ECHILD.
-	import core.stdc.errno : errno, ECHILD;
-	import core.sys.posix.sys.types : pid_t;
-	import core.sys.posix.sys.wait : waitpid, WNOHANG;
-	import core.thread : Thread;
-	import core.time : msecs;
+	// The check compares this process's direct children before and after the
+	// call, so children other tests leave behind (running, or exited and
+	// unreaped) neither fail it nor get reaped by it, and it does not depend on
+	// how quickly the launcher exits.
+	import std.algorithm : canFind, filter;
+	import std.array : array;
+	import std.process : spawnProcess, wait;
 
+	// An unrelated child that has exited but is not yet reaped, as another test
+	// can leave behind.
+	auto unrelated = spawnProcess(["true"]);
+	scope (exit)
+		wait(unrelated);
+
+	const before = directChildPids();
 	cast(void) openSystemBrowser("mcp-sdk-test-zombie://localhost/verify-detach");
+	const added = directChildPids().filter!(p => !before.canFind(p)).array;
 
-	Thread.sleep(300.msecs); // allow the launcher to exit and become a zombie if not detached
+	assert(added.length == 0,
+			"openSystemBrowser left a direct child process; it must spawn with Config.detached");
+}
 
-	// Reap any zombie direct children.  With Config.detached, the grandchild is
-	// not a direct child of this process, so waitpid returns -1/ECHILD.
-	// Without Config.detached the exited launcher is a zombie child and waitpid
-	// returns its PID, causing the assertion to fail.
-	int status;
-	pid_t reaped = () @trusted { return waitpid(-1, &status, WNOHANG); }();
+/// The PIDs of this process's direct children, zombies included (`pgrep -P`
+/// omits zombies on macOS, so `ps` is used), excluding the `ps` run itself.
+version (Posix) version (unittest) private int[] directChildPids() @trusted
+{
+	import core.sys.posix.unistd : getpid;
+	import std.algorithm : filter, splitter;
+	import std.array : array;
+	import std.conv : to;
+	import std.process : pipeProcess, Redirect, wait;
+	import std.string : strip;
 
-	assert(reaped == -1 && errno == ECHILD,
-			"openSystemBrowser left a zombie child process; it must spawn with Config.detached");
+	auto ps = pipeProcess(["ps", "-A", "-o", "pid=,ppid="], Redirect.stdout);
+	const psPid = ps.pid.processID;
+	const output = ps.stdout.byLineCopy.array;
+	wait(ps.pid);
+
+	const self = getpid();
+	int[] pids;
+	foreach (line; output)
+	{
+		auto cols = line.strip.splitter(' ').filter!(c => c.length);
+		const pid = cols.front.to!int;
+		cols.popFront();
+		if (cols.front.to!int == self && pid != psPid)
+			pids ~= pid;
+	}
+	return pids;
 }
 
 unittest  // the cache fast-path carries the registered client_id (DCR/CIMD have no static client_id)
