@@ -1269,7 +1269,7 @@ final class EventsRuntime
 		{
 			int held;
 			foreach (s; webhookStore_.all())
-				if (s.principal == principal)
+				if (s.principal == principal && !s.isExpired(now))
 					held++;
 			if (held >= opts_.webhookMaxSubscriptionsPerPrincipal)
 				throw resourceExhausted("Too many webhook subscriptions for this principal",
@@ -4544,6 +4544,24 @@ unittest  // subscribeWebhook caps live subscriptions per principal with resourc
 
 	// Refreshing an existing subscription reuses its slot and is never rejected.
 	assertNotThrown!McpException(rt.subscribeWebhook(sub(1), "user-1"));
+}
+
+unittest  // a lapsed webhook subscription not yet swept does not count against the cap
+{
+	import std.exception : assertNotThrown;
+
+	long now = 1_000_000;
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.webhookMaxSubscriptionsPerPrincipal = 1;
+	o.webhookTtlCap = 1.minutes;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/a"), "user-1");
+	now += 2 * 60 * 1000;
+	assertNotThrown!McpException(rt.subscribeWebhook(webhookSub("n", "https://proxy/b"), "user-1"));
 }
 
 unittest  // a per-principal cap of 0 disables the limit
