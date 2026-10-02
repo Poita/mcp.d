@@ -3580,18 +3580,9 @@ final class McpServer : ServerCore
 			throw invalidParams("initialize requires a non-empty string 'protocolVersion'");
 
 		auto p = InitializeParams.fromJson(params);
+		// `negotiate` answers a modern request with the latest legacy version:
+		// 2026-07-28 defines no `initialize`, so the handshake cannot claim it.
 		conn.negotiated = negotiate(p.protocolVersion);
-		// The 2026-07-28 revision defines NO `initialize`/`InitializeResult`: modern
-		// peers establish the session via `server/discover` plus per-request
-		// `_meta`, never the stateful `initialize` handshake. So the `initialize`
-		// channel does not actually "support" modern. Per the Version Negotiation
-		// rule ("if the server supports the requested version it MUST respond with
-		// the same version, otherwise it MUST respond with another version it
-		// supports — SHOULD be the latest"), clamp a modern negotiation down to the
-		// latest stable rather than emitting an InitializeResult that claims a
-		// version with no initialize semantics.
-		if (conn.negotiated.isModern)
-			conn.negotiated = latestLegacy;
 		conn.clientCaps = p.capabilities;
 		// Record that this stateful session has processed its `initialize`, so the
 		// re-init guard above rejects a second one even if it arrives before the

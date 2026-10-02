@@ -74,13 +74,14 @@ bool tryParseVersion(string s, out ProtocolVersion v) pure nothrow
 	return false;
 }
 
-/// `initialize`-handshake negotiation: accept the client's version if
-/// supported, otherwise offer the latest legacy version (the handshake itself
-/// only exists on legacy revisions, so a modern fallback could not be answered).
+/// `initialize`-handshake negotiation: accept the client's version if it is a
+/// supported legacy revision, otherwise offer the latest legacy version. The
+/// handshake only exists on legacy revisions, so a modern request (which has no
+/// `initialize` semantics) is answered with the latest legacy version too.
 ProtocolVersion negotiate(string clientRequested) pure nothrow
 {
 	ProtocolVersion v;
-	return tryParseVersion(clientRequested, v) ? v : latestLegacy;
+	return tryParseVersion(clientRequested, v) && v.isLegacy ? v : latestLegacy;
 }
 
 /// Whether elicitation (client feature) is available at this version.
@@ -159,8 +160,11 @@ unittest  // tryParseVersion does not throw on unknown
 unittest  // negotiation: client version supported -> echo it back
 {
 	assert(negotiate("2025-06-18") == ProtocolVersion.v2025_06_18);
-	// The modern revision echoes back too; the handshake path clamps it afterwards.
-	assert(negotiate("2026-07-28") == ProtocolVersion.v2026_07_28);
+}
+
+unittest  // negotiation: a modern request falls back to the latest legacy version
+{
+	assert(negotiate("2026-07-28") == latestLegacy);
 }
 
 unittest  // negotiation: client version unknown/newer -> fall back to the latest legacy version
