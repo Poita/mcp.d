@@ -14,11 +14,16 @@ import mcp.server.task_store : TaskStore, TaskRecord, InMemoryTaskStore,
 
 @safe:
 
+/// The TTL that keeps a settled task's record forever (wire `ttlMs: null`). Pass
+/// it as a creator's `ttl` or as `TaskOptions.defaultTtl`; the record then lives
+/// until the store removes it.
+enum Duration unlimitedTaskTtl = Duration.max;
+
 /// Tuning for the task runtime. `idGenerator` mints task IDs (default
 /// `defaultTaskIdGenerator`). `defaultTtl` / `defaultPollInterval` seed a task's
 /// TTL / suggested poll cadence when a creator does not specify them. A task's
-/// TTL is how long its record is kept once it settles; a task that is still
-/// working or awaiting input never expires.
+/// TTL is how long its record is kept once it settles (`unlimitedTaskTtl` keeps
+/// it forever); a task that is still working or awaiting input never expires.
 /// `sweepInterval` is how often `enableTasks`'s background sweep removes expired
 /// tasks (zero disables it; expired tasks are still hidden on access). `nowIso` is an
 /// injectable clock returning an ISO-8601 timestamp; null uses the system clock.
@@ -102,7 +107,8 @@ final class TaskRuntime
 	/// on each dispatch. The returned `Task` seeds a `CreateTaskResult`. The
 	/// generated ID is guaranteed unique against the store. `ttl`/`pollInterval`
 	/// default to the runtime options when null; both are serialized to integer
-	/// milliseconds on the wire `Task`. A non-empty `owner` (the creating
+	/// milliseconds on the wire `Task`, except `unlimitedTaskTtl`, which is
+	/// `ttlMs: null` and keeps the settled record forever. A non-empty `owner` (the creating
 	/// request's authenticated principal) binds the task: `requireAccess` then
 	/// admits only that principal.
 	Task createFor(string toolName, Json executorInput,
@@ -131,7 +137,8 @@ final class TaskRuntime
 		const now = opts_.nowIso();
 		r.meta.createdAt = now;
 		r.meta.lastUpdatedAt = now;
-		r.meta.ttlMs = nullable(ttlDur.total!"msecs");
+		r.meta.ttlMs = ttlDur == unlimitedTaskTtl ? Nullable!long.init
+			: nullable(ttlDur.total!"msecs");
 		r.meta.pollIntervalMs = nullable(pollDur.total!"msecs");
 		r.toolName = toolName;
 		r.owner = owner;
@@ -949,6 +956,30 @@ unittest  // a task with an unlimited ttl never expires
 	now = "2100-01-01T00:00:00Z";
 	assert(rt.sweepExpired() == 0);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
+}
+
+unittest  // a task created with unlimitedTaskTtl has a null ttl and is kept forever once settled
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	auto store = new InMemoryTaskStore();
+	auto rt = new TaskRuntime(store, o);
+	auto t = rt.create(nullable(unlimitedTaskTtl));
+	assert(t.ttlMs.isNull);
+	rt.complete(t.taskId, Json.emptyObject);
+	now = "2100-01-01T00:00:00Z";
+	assert(rt.sweepExpired() == 0);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
+}
+
+unittest  // a defaultTtl of unlimitedTaskTtl makes tasks unlimited unless a ttl is given
+{
+	TaskOptions o;
+	o.defaultTtl = unlimitedTaskTtl;
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	assert(rt.create().ttlMs.isNull);
+	assert(rt.create(nullable(1_000.msecs)).ttlMs.get == 1_000);
 }
 
 unittest  // progress, requireInput, and resumeWorking leave a terminal task untouched
