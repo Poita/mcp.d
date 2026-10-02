@@ -208,7 +208,7 @@ final class StdioClientTransport : ClientTransport
 				try
 					ch.deliver(message, listenId.get!long, Duration.max);
 				catch (McpException e)
-					failure = e;
+					failure = closedOr(e);
 				catch (Exception e)
 					failure = internalError(e.msg);
 				stream.finish(failure);
@@ -263,7 +263,28 @@ final class StdioClientTransport : ClientTransport
 
 		// `McpClient` owns the request deadline (and aborts through `abort`), so the
 		// channel waits without a timeout of its own.
-		return chan().deliver(message, expectId, Duration.max);
+		auto ch = chan();
+		try
+			return ch.deliver(message, expectId, Duration.max);
+		catch (McpException e)
+			throw closedOr(e);
+	}
+
+	/// `e`, or a `TransportClosedException` carrying its message when the channel
+	/// has closed, so the client can tell a dead server from a failed request.
+	private McpException closedOr(McpException e) @safe nothrow
+	{
+		import mcp.client.client : TransportClosedException;
+
+		bool closed;
+		try
+			closed = channel !is null && channel.closed;
+		catch (Exception)
+		{
+		}
+		if (!closed || cast(TransportClosedException) e || e.code != ErrorCode.internalError)
+			return e;
+		return new TransportClosedException(e.msg);
 	}
 
 	void abort(long expectId, McpException reason) @safe
@@ -293,7 +314,10 @@ final class StdioClientTransport : ClientTransport
 	/// to the server's stdin.
 	private void send(Json message) @safe
 	{
-		chan().send(message);
+		try
+			chan().send(message);
+		catch (McpException e)
+			throw closedOr(e);
 	}
 
 	/// Attach owned subprocess pipes so `close()` runs the stdio shutdown
@@ -1393,6 +1417,31 @@ unittest  // cancelling a call's CancellationToken fails it at once and sends no
 	assert(took < 5.seconds);
 	assert(cancelled["method"].get!string == "notifications/cancelled");
 	assert(cancelled["params"]["reason"].get!string == "user aborted");
+}
+
+unittest  // a request on a stdio channel the server closed fails with TransportClosedException
+{
+	import mcp.client.client : TransportClosedException;
+
+	auto toClient = new TestLines;
+	bool closedError;
+	const failure = inLoopCapturing(() @safe {
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+		});
+		toClient.closeEnd();
+		foreach (_; 0 .. 2)
+		{
+			try
+				client.ping();
+			catch (TransportClosedException)
+				closedError = true;
+			catch (McpException)
+			{
+			}
+		}
+	});
+	assert(failure.length == 0, failure);
+	assert(closedError, "a closed channel must surface as TransportClosedException");
 }
 
 unittest  // a call whose CancellationToken is already cancelled sends nothing

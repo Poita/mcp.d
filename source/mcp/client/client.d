@@ -332,6 +332,21 @@ class RequestTimeoutException : McpException
 	}
 }
 
+/// Thrown by a request that cannot be carried because the connection to the
+/// server is gone for good: the client was closed, or the stdio channel ended
+/// (the server exited or closed its stdout). Retrying on the same client cannot
+/// succeed, so managed event subscriptions end rather than retry on it.
+///
+/// `code` is `ErrorCode.internalError`; catch this type to tell a dead
+/// connection apart from a server's own internal error.
+class TransportClosedException : McpException
+{
+	this(string message) @safe pure nothrow
+	{
+		super(ErrorCode.internalError, message);
+	}
+}
+
 /// The client-side bookkeeping of one request awaiting its response.
 private final class InFlightRequest
 {
@@ -879,7 +894,7 @@ final class McpClient : ClientProtocol
 	private void ensureOpen() @safe
 	{
 		if (closed_)
-			throw internalError("the client is closed");
+			throw new TransportClosedException("the client is closed");
 	}
 
 	/// Throw when `close()` has released the transport, so a request or
@@ -887,7 +902,7 @@ final class McpClient : ClientProtocol
 	private void ensureNotReleased() @safe
 	{
 		if (released_)
-			throw internalError("the client is closed");
+			throw new TransportClosedException("the client is closed");
 	}
 
 	/// The protocol version negotiated with the server (valid after initialize).
@@ -2978,10 +2993,12 @@ final class McpClient : ClientProtocol
 
 	/// Whether a managed-subscription failure may clear on its own, so retrying
 	/// is worthwhile: a local request timeout, a lost connection or server
-	/// internal error, or an HTTP 5xx / 408 / 429. A JSON-RPC rejection or any
-	/// other HTTP 4xx will repeat on every retry.
+	/// internal error, or an HTTP 5xx / 408 / 429. A JSON-RPC rejection, any
+	/// other HTTP 4xx, or a closed transport will repeat on every retry.
 	private static bool isTransientEventFailure(McpException e) @safe
 	{
+		if (cast(TransportClosedException) e)
+			return false;
 		if (cast(RequestTimeoutException) e)
 			return true;
 		if (auto h = cast(HttpStatusException) e)
@@ -9480,6 +9497,40 @@ unittest  // a throwing stream onEvent ends the subscription without advancing p
 	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
 	assert(!sub.active, "a handler failure must end the subscription");
 	assert(t.streams[0].ended, "the ended subscription must close its stream");
+}
+
+unittest  // a poll on a closed transport ends the subscription instead of retrying forever
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		throw new TransportClosedException("stdio channel closed");
+	};
+	EventControl[] ctrls;
+	auto sub = new EventSubscription();
+	c.onEventPollSleepForTest = (Duration d) @safe {
+		if (polls > 3)
+			sub.cancel();
+	};
+	c.runPollLoop(sub, PollParams("incident.created"), null, (EventControl ctrl) @safe {
+		ctrls ~= ctrl;
+	});
+	assert(polls == 1, "a closed transport must not be retried");
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
+	assert(!sub.active);
+}
+
+unittest  // a request on a closed client fails with TransportClosedException
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.close();
+	bool closedError;
+	try
+		c.ping();
+	catch (TransportClosedException)
+		closedError = true;
+	assert(closedError);
 }
 
 unittest  // a transient poll failure is retried with backoff instead of ending the subscription
