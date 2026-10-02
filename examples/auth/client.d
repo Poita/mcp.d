@@ -26,7 +26,7 @@
  *   2. The advertised Protected Resource Metadata document (RFC 9728):
  *      `resource`, `authorization_servers`, `scopes_supported`.
  *   3. Happy path: a token obtained via the SDK OAuth client-credentials
- *      acquisition surface -> initialize succeeds, tools/list contains
+ *      acquisition surface -> connect() succeeds, tools/list contains
  *      `whoami` + `secret_note`, `whoami` returns the token's subject + scopes
  *      in its TYPED structuredContent (inferred from the server's WhoamiResult
  *      struct), `secret_note` returns the privileged payload.
@@ -248,7 +248,7 @@ int run() @safe
 		}(), "PRM scopes_supported mismatch (raw)");
 	}
 
-	// ---- 3. Happy path: full-scope token, initialize + tools ----
+	// ---- 3. Happy path: full-scope token, connect + tools ----
 	//
 	// ACQUISITION: obtain the bearer token through the SDK's OAuth client
 	// surface rather than hand-minting it inline. A tiny in-process token endpoint
@@ -270,7 +270,7 @@ int run() @safe
 		scope (exit)
 			client.close();
 		client.setBearerToken(ts.accessToken);
-		client.initialize();
+		client.connect();
 
 		auto tools = client.listTools().tools;
 		bool haveWhoami, haveSecret;
@@ -310,7 +310,7 @@ int run() @safe
 		scope (exit)
 			client.close();
 		client.setBearerToken(mintToken("reader", "mcp:read", serverUrl));
-		client.initialize();
+		client.connect();
 
 		auto who = client.callTool("whoami", Json.emptyObject);
 		check(!who.isError, "whoami should still work for a read-only token");
@@ -333,7 +333,7 @@ int run() @safe
 				"https://other.example.com/mcp"));
 		bool rejected = false;
 		try
-			client.initialize();
+			client.connect();
 		catch (Exception)
 			rejected = true;
 		check(rejected, "a token for the wrong audience must be rejected (RFC 8707)");

@@ -219,7 +219,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		auto plain = makeClient();
 		scope (exit)
 			plain.close();
-		plain.initialize();
+		plain.initialize(); // stateful session, as above: ctx.elicit needs one
 		// Add a note so remove_all actually tries to elicit (an empty board would
 		// short-circuit to "empty" before any elicitation).
 		plain.callTool("add_note", addArgs("To be confirmed"));

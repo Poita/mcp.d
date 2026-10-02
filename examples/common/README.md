@@ -33,7 +33,10 @@ to exit code 1.
 - otherwise → `McpClient.spawnSibling(siblingServerName)` (stdio, spawning
   the named sibling binary next to the running executable)
 
-The returned client is not yet initialized; call `.initialize()` before use.
+The returned client is not yet connected; call `.connect()` before use. Examples
+that exercise server→client requests over a stateful 2025-11-25 session
+(elicitation, sampling) call `.initialize()` instead, since `connect()` against
+an SDK server negotiates the stateless 2026-07-28 protocol.
 
 ### Server transport selector — `runServerFromArgs`
 

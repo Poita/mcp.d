@@ -25,8 +25,9 @@
  * a `callTool` is in flight.
  *
  * Typed/ergonomic SDK APIs used here:
- *   - per-call progress sink: `callTool(name, args, onProgress)` (the delegate
- *     overload) delivers THIS call's progress to a local callback.
+ *   - per-call progress sink and log level: `callTool(name, args, opts)` with
+ *     `RequestOptions.withProgress(cb)` delivers THIS call's progress to a local
+ *     callback, and `opts.logLevel` requests its log messages.
  *   - `result.structuredContentAs!T` decodes structured output into a struct.
  *   - the call `arguments` are built as a JSON object (the untyped client
  *     request surface — see the repo-root DESIGN.md).
@@ -119,11 +120,9 @@ private int run(string[] args, bool useHttp, string httpUrl) @safe
 	auto client = connectFromArgs(args, "streaming-server");
 	scope (exit)
 		client.close();
-	client.initialize();
-	// The streaming server is stateless and refuses the `logging/setLevel` RPC
-	// (-32601) on every transport. The server's default minimum log level is "info",
-	// so the countdown's info-level logs flow on both transports without setLogLevel.
-	// The Phase A assertion checks for level == "info", which holds at the default.
+	client.connect();
+	// connect() negotiates 2026-07-28, where there is no `logging/setLevel` RPC: a
+	// request opts into log messages through its own log level (RequestOptions.logLevel).
 
 	const int progressSeen = phaseListProgressLogging(client, steps);
 	phaseErrorCode(client);
@@ -188,12 +187,13 @@ private int phaseListProgressLogging(McpClient client, int steps) @safe
 
 	// Per-call progress sink: the SDK mints a unique progressToken for THIS call
 	// and routes only its progress notifications to this callback for the
-	// duration of the call.
-	auto result = client.callTool("countdown", countdownArgs(steps, 20),
-			(ProgressNotification n) @safe {
+	// duration of the call. logLevel "info" asks for the countdown's log messages.
+	auto opts = RequestOptions.withProgress((ProgressNotification n) @safe {
 		progress ~= ProgressUpdate(n.progress, n.total.isNull
 			? -1 : n.total.get, n.progressTokenString);
 	});
+	opts.logLevel = "info";
+	auto result = client.callTool("countdown", countdownArgs(steps, 20), opts);
 
 	// Final structured result, decoded into the typed CountdownResult.
 	check(result.structuredContent.type == Json.Type.object, "result must carry structuredContent");
@@ -339,7 +339,7 @@ private int readCancelCount(string url) @safe
 	auto client = McpClient.http(url);
 	scope (exit)
 		client.close();
-	client.initialize();
+	client.connect();
 	auto r = client.callTool("cancel_stats");
 	check(r.structuredContent.type == Json.Type.object,
 			"cancel_stats must return structuredContent");
