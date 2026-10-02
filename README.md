@@ -55,14 +55,31 @@ void main()
 
 ## Installation
 
-Add mcp.d to your project with dub:
+This README documents the `main` branch. Tagged releases on
+[code.dlang.org](https://code.dlang.org/packages/mcp-d) (see the Dub version
+badge above) can lag well behind it, so to build against the API described here,
+depend on `main` through git in your `dub.sdl`:
 
-```bash
-dub add mcp-d
+```sdl
+dependency "mcp-d" repository="git+https://github.com/Poita/mcp.d.git" version="~main"
 ```
 
-This always pulls the latest release (see the Dub version badge above). Then
-`import mcp;` in your source files.
+or in `dub.json`:
+
+```json
+"dependencies": {
+    "mcp-d": { "repository": "git+https://github.com/Poita/mcp.d.git", "version": "~main" }
+}
+```
+
+For reproducible builds, replace `~main` with a full commit hash; `dub.selections.json`
+otherwise records the branch, not the commit. A local checkout works too:
+`dependency "mcp-d" path="../mcp.d"`.
+
+To use the latest tagged release instead, run `dub add mcp-d` and read the README
+at that release's tag, since its API may differ from `main`.
+
+Then `import mcp;` in your source files.
 
 ## Goals
 
