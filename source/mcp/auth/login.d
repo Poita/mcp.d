@@ -1127,6 +1127,7 @@ RegisteredClient persistedClient(RegisteredClient rc, OAuthLogin opts) @safe pur
 OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @safe
 {
 	import std.datetime.systime : Clock;
+	import vibe.core.log : logWarn;
 
 	auto store = opts.store !is null ? opts.store : new FileTokenStore(defaultTokenStorePath());
 
@@ -1186,11 +1187,13 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 				return attachSession(client, new OAuthSession(oauth, as_, prior,
 						store, oauth.resource, refreshed));
 			}
+			logWarn(
+					"OAuth refresh for %s returned no access token; " ~ "starting an interactive login",
+					oauth.resource);
 		}
-		catch (Exception)
-		{
-			// Fall through to the interactive flow.
-		}
+		catch (Exception e)
+			logWarn("OAuth refresh for %s failed (%s); starting an interactive login",
+					oauth.resource, e.msg);
 	}
 
 	// Select / obtain a client registration. Runs once the loopback listener
@@ -2458,6 +2461,7 @@ version (unittest)
 		HTTPListener listener;
 		string base;
 		int refreshCalls;
+		bool failRefresh;
 
 		void stop() @trusted
 		{
@@ -2495,7 +2499,15 @@ version (unittest)
 			else if (req.path == "/token")
 			{
 				if (req.form.get("grant_type", "") == "refresh_token")
+				{
 					srv.refreshCalls++;
+					if (srv.failRefresh)
+					{
+						res.statusCode = 400;
+						res.writeBody(`{"error":"invalid_grant"}`, "application/json");
+						return;
+					}
+				}
 				res.writeBody(
 					`{"access_token":"new-access","token_type":"Bearer","expires_in":3600}`,
 					"application/json");
@@ -2655,6 +2667,62 @@ unittest  // useOAuth re-authorizes instead of reusing a valid cached token that
 
 	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
 	assert(browserOpened, "a step-up must run a new authorization");
+}
+
+unittest  // a failed cached refresh is logged before useOAuth falls back to the browser
+{
+	import core.time : msecs;
+	import std.algorithm : any, canFind;
+	import std.exception : assertThrown;
+	import vibe.core.log : deregisterLogger, LogLevel, Logger, LogLine, registerLogger;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	static final class CaptureLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.warn;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	auto logger = new CaptureLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	srv.failRefresh = true;
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt";
+	t.clientId = "abc123";
+	t.expiresAt = 1;
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe {};
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert(srv.refreshCalls == 1);
+	auto lines = () @trusted { return (cast() logger).lines; }();
+	assert(lines.any!(l => l.canFind("refresh")), "a failed refresh must not be silent");
 }
 
 unittest  // useOAuth does not refresh a cached token that lacks a requested scope
