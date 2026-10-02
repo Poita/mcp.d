@@ -449,6 +449,10 @@ final class ServerPushChannel : PushChannel
 		/// Signalled when the listener is removed, so the handler holding its
 		/// response open can end it promptly.
 		ListenerClosed closed;
+		/// Set when this listener resumed a POST-initiated stream. It carries only
+		/// that request's events, so fan-out and session requests skip it, and it
+		/// ends once the request's stream closes.
+		bool postStream;
 	}
 
 	private static final class ListenerClosed
@@ -475,6 +479,8 @@ final class ServerPushChannel : PushChannel
 	/// history eviction, so the stream never reuses an event id that a client may
 	/// already hold as its `Last-Event-ID`.
 	private string[long] openStreams;
+	/// Ordinals of the POST-initiated streams that are still open or resumable.
+	private bool[long] postStreams;
 	private long nextListenerId = 1;
 
 	/// Stream ordinal -> the session/connection token that owns it. A Last-Event-ID
@@ -580,6 +586,7 @@ final class ServerPushChannel : PushChannel
 			auto lWriteMtx = new TaskMutex;
 			long id;
 			string[] replay; // frames to replay, snapshotted under the lock
+			bool finishedPost; // resumed a POST stream whose request already ended
 
 			// Phase 1 (under mtx): register the listener and decide its stream
 			// ordinal + starting seq. For a resume, SNAPSHOT the frames to replay and
@@ -620,6 +627,11 @@ final class ServerPushChannel : PushChannel
 							superseded ~= lid;
 					foreach (lid; superseded)
 						removeListenerLocked(lid, id);
+					if (resumeOrdinal in postStreams)
+					{
+						listeners[$ - 1].postStream = true;
+						finishedPost = resumeOrdinal !in openStreams;
+					}
 					streamOf[id] = resumeOrdinal;
 					touchHistory(resumeOrdinal);
 					long maxSeq = resumeSeq;
@@ -667,6 +679,11 @@ final class ServerPushChannel : PushChannel
 						write(frame);
 				}
 			}
+			// The resumed POST stream already carried its final response, so the
+			// replay completes it.
+			if (finishedPost)
+				synchronized (mtx)
+					removeListenerLocked(id);
 			return id;
 		}();
 	}
@@ -921,7 +938,7 @@ final class ServerPushChannel : PushChannel
 			{
 				bool[string] seen;
 				foreach (l; listeners)
-					if (l.id in live && (l.group in seen) is null && eligible(l))
+					if (l.id in live && !l.postStream && (l.group in seen) is null && eligible(l))
 					{
 						seen[l.group] = true;
 						groups ~= l.group;
@@ -989,7 +1006,7 @@ final class ServerPushChannel : PushChannel
 			synchronized (mtx)
 			{
 				foreach (l; listeners)
-					if (eligible(l) && l.id in live)
+					if (!l.postStream && eligible(l) && l.id in live)
 						candidates ~= l;
 			}
 		}();
@@ -1122,6 +1139,8 @@ final class ServerPushChannel : PushChannel
 				attached = true;
 		if (!attached && ordinal !in openStreams)
 			nextSeq.remove(ordinal);
+		if (ordinal !in openStreams)
+			postStreams.remove(ordinal);
 	}
 
 	/// Mark `ordinal` as most-recently used in the history LRU order: move it to the
@@ -1169,12 +1188,16 @@ final class ServerPushChannel : PushChannel
 	{
 		() @trusted {
 			synchronized (mtx)
+			{
 				openStreams[ordinal] = owner;
+				postStreams[ordinal] = true;
+			}
 		}();
 	}
 
-	/// End the POST-initiated stream `ordinal` opened by `openStream`. Its event
-	/// sequence is kept while history or a resumed listener still refers to it.
+	/// End the POST-initiated stream `ordinal` opened by `openStream`. A GET
+	/// listener that resumed it has received the final response and is closed.
+	/// Its event sequence is kept while history still refers to it.
 	void closeStream(long ordinal) @safe
 	{
 		() @trusted {
@@ -1186,12 +1209,17 @@ final class ServerPushChannel : PushChannel
 	private void closeStreamLocked(long ordinal) @safe
 	{
 		openStreams.remove(ordinal);
-		bool attached;
+		long[] resumed;
 		foreach (lid, ord; streamOf)
 			if (ord == ordinal)
-				attached = true;
-		if (!attached && ordinal !in history)
+				resumed ~= lid;
+		foreach (lid; resumed)
+			removeListenerLocked(lid);
+		if (ordinal !in history)
+		{
 			nextSeq.remove(ordinal);
+			postStreams.remove(ordinal);
+		}
 	}
 
 	/// Whether the POST-initiated stream `ordinal` is still open: its request is
@@ -3381,6 +3409,72 @@ unittest  // a POST-initiated stream is resumable via GET Last-Event-ID
 	ch.addListener((string f) @safe { other ~= f; }, Json.init,
 			ListenFilter.init, primingId, null, "sess-B");
 	assert(other.length == 0);
+}
+
+version (unittest) private HttpStreamContext resumablePostStream(ServerPushChannel ch, string sid) @safe
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.versions : ProtocolVersion;
+
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, ch.coordinator, caps, Json.undefined,
+			TokenInfo.invalid(), false, ProtocolVersion.v2025_11_25, sid);
+	ctx.enableReplay(ch);
+	return ctx;
+}
+
+unittest  // a GET that resumed a POST stream ends once the POST's response is sent
+{
+	auto ch = new ServerPushChannel(new StreamCoordinator);
+	auto ctx = resumablePostStream(ch, "sess-A");
+	const primingId = ctx.nextEventId();
+	ctx.log("info", Json("before-drop"));
+
+	string[] resumed;
+	ch.addListener((string f) @safe { resumed ~= f; }, Json.init,
+			ListenFilter.init, primingId, null, "sess-A");
+	assert(ch.listenerCount == 1);
+	ctx.finishWith(makeResponse(Json(7), Json.emptyObject));
+	ctx.endReplay();
+	assert(resumed.length == 2);
+	assert(ch.listenerCount == 0, "the resumed POST stream must end after its final response");
+}
+
+unittest  // a GET that resumes an already-finished POST stream is replayed and then ends
+{
+	import std.algorithm : canFind;
+
+	auto ch = new ServerPushChannel(new StreamCoordinator);
+	auto ctx = resumablePostStream(ch, "sess-A");
+	const primingId = ctx.nextEventId();
+	ctx.log("info", Json("before-drop"));
+	ctx.finishWith(makeResponse(Json(7), Json.emptyObject));
+	ctx.endReplay();
+
+	string[] resumed;
+	ch.addListener((string f) @safe { resumed ~= f; }, Json.init,
+			ListenFilter.init, primingId, null, "sess-A");
+	assert(resumed.length == 2 && resumed[1].canFind("\"id\":7"));
+	assert(ch.listenerCount == 0, "a finished POST stream must end after its replay");
+}
+
+unittest  // a GET that resumed a POST stream carries only that request's messages
+{
+	auto ch = new ServerPushChannel(new StreamCoordinator);
+	auto ctx = resumablePostStream(ch, "sess-A");
+	const primingId = ctx.nextEventId();
+	ctx.log("info", Json("before-drop"));
+
+	string[] resumed;
+	ch.addListener((string f) @safe { resumed ~= f; }, Json.init,
+			ListenFilter.init, primingId, null, "sess-A");
+	assert(resumed.length == 1);
+	assert(ch.notify("notifications/tools/list_changed") == 0);
+	assert(resumed.length == 1);
+	ctx.endReplay();
 }
 
 unittest  // modern HttpStreamContext: a disconnected client reports cancelled
