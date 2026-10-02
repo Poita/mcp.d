@@ -297,11 +297,11 @@ final class HttpClientTransport : ClientTransport
 	// its own slot, so overlapping or reentrant legacy requests never clobber one
 	// another's response (the modern path is already per-call by ref locals).
 	private LegacyWaiter*[long] legacyWaiters;
-	// Set when a oneway send (notification / server->client reply) is rejected
-	// with a session-gone status (404/410): the session no longer exists, so the
-	// next request `deliver()` throws a clear "session expired" error rather than
-	// silently issuing requests under a dead session. An `initialize` clears it,
-	// since it starts a new session.
+	// Set when the server rejects a message under the session with a session-gone
+	// status (a request answered 404, a oneway send answered 404/410): the session
+	// no longer exists, so the next request `deliver()` throws a clear "session
+	// expired" error rather than issuing requests without the session id. An
+	// `initialize` clears it, since it starts a new session.
 	private bool sessionExpired;
 	// True when the negotiated protocol version is modern (2026-07-28), which has
 	// no Last-Event-ID resumption or standalone GET SSE streams;
@@ -808,10 +808,11 @@ final class HttpClientTransport : ClientTransport
 		if (req.aborted !is null)
 			throw req.aborted;
 
-		// A 404 under a session means the session is gone: drop the id so the
-		// next `initialize` starts a new session without it.
+		// A 404 under a session means the session is gone: drop the id and mark it
+		// so later requests fail until an `initialize` starts a new session.
 		if (status == 404 && sentSession && !got && err is null)
 		{
+			sessionExpired = true;
 			sessionId = null;
 			throw new HttpStatusException(status,
 					"MCP session expired (server answered HTTP 404 for the session)");
@@ -3912,6 +3913,7 @@ version (unittest)
 		string live;
 		int minted;
 		string[] initializeSessionHeaders; // the Mcp-Session-Id each initialize carried
+		int sessionlessRequests; // non-initialize POSTs that carried no Mcp-Session-Id
 
 		void expire() @safe
 		{
@@ -3933,6 +3935,8 @@ version (unittest)
 					res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
 					return;
 				}
+				if (sid.length == 0)
+					++sessionlessRequests;
 				if (sid != live || live.length == 0)
 				{
 					res.statusCode = 404;
@@ -3979,6 +3983,32 @@ unittest  // a mid-session 404 surfaces as a typed McpException and a fresh init
 	assert(srv.initializeSessionHeaders == ["", ""],
 			"the re-initialize must not carry the expired session id");
 	assert(tools == 0);
+}
+
+unittest  // after a request is answered 404 for its session, the next request fails without being sent sessionless
+{
+	import mcp.client.client : McpClient;
+
+	auto srv = new SessionFakeServer;
+	int typed;
+	const failure = runAgainstFakeServer(srv.router(), (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		srv.expire();
+		foreach (_; 0 .. 2)
+		{
+			try
+				client.listTools();
+			catch (McpException)
+				++typed;
+		}
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(typed == 2);
+	assert(srv.sessionlessRequests == 0,
+			"a request after the session expired must not go out without Mcp-Session-Id");
 }
 
 unittest  // re-running initialize on a live session starts a new session without the old id
