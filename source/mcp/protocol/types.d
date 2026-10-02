@@ -2883,9 +2883,9 @@ struct Resource
 	/// Return a copy of this `Resource` with any fields newer than the
 	/// negotiated protocol version stripped, so the wire output stays valid for
 	/// the peer's version. The 2024-11-05 `Resource` type carried only
-	/// `uri`/`name`/`description`/`mimeType`/`annotations`/`_meta`. Later fields
-	/// are version-gated: `BaseMetadata.title` and `Resource.size` were introduced
-	/// by 2025-06-18 / 2025-03-26 respectively (both absent from 2024-11-05), and
+	/// `uri`/`name`/`description`/`mimeType`/`annotations`. Later fields are
+	/// version-gated: `BaseMetadata.title` and `_meta` were introduced by
+	/// 2025-06-18, `Resource.size` by 2025-03-26, and
 	/// `Resource.icons` by 2025-11-25 (absent from every earlier version, present
 	/// in the modern protocol which is >= 2025-11-25). Annotation sub-fields are themselves
 	/// version-gated: `audience`/`priority` existed in 2024-11-05 but
@@ -2902,13 +2902,15 @@ struct Resource
 		// Annotation sub-fields are themselves version-gated (lastModified is
 		// 2025-06-18+), so project them rather than copying verbatim.
 		projected.annotations = annotations.forVersion(v);
-		projected.meta = meta;
 		// `Resource.size` was introduced by 2025-03-26 (absent from 2024-11-05).
 		if (v >= ProtocolVersion.v2025_03_26)
 			projected.size = size;
-		// `BaseMetadata.title` was introduced by 2025-06-18.
+		// `BaseMetadata.title` and `Resource._meta` were introduced by 2025-06-18.
 		if (v >= ProtocolVersion.v2025_06_18)
+		{
 			projected.title = title;
+			projected.meta = meta;
+		}
 		// `Resource.icons` was introduced by 2025-11-25.
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
@@ -2974,11 +2976,11 @@ struct ResourceTemplate
 	}
 
 	/// Return a copy of this `ResourceTemplate` with any fields newer than the
-	/// negotiated protocol version stripped. `BaseMetadata.title` was
-	/// introduced by 2025-06-18; `ResourceTemplate.icons` was introduced by
+	/// negotiated protocol version stripped. `BaseMetadata.title` and `_meta`
+	/// were introduced by 2025-06-18; `ResourceTemplate.icons` was introduced by
 	/// 2025-11-25 (present in the modern protocol which is >= 2025-11-25).
-	/// `uriTemplate`/`name`/`description`/`mimeType`/`annotations`/`_meta` all
-	/// existed in 2024-11-05 and are preserved unchanged. Mirrors
+	/// `uriTemplate`/`name`/`description`/`mimeType`/`annotations` all existed
+	/// in 2024-11-05 and are preserved unchanged. Mirrors
 	/// `Tool.forVersion` / `Prompt.forVersion`.
 	ResourceTemplate forVersion(ProtocolVersion v) const @safe
 	{
@@ -2988,10 +2990,13 @@ struct ResourceTemplate
 		projected.description = description;
 		projected.mimeType = mimeType;
 		projected.annotations = annotations.forVersion(v);
-		projected.meta = meta;
-		// `BaseMetadata.title` was introduced by 2025-06-18.
+		// `BaseMetadata.title` and `ResourceTemplate._meta` were introduced by
+		// 2025-06-18.
 		if (v >= ProtocolVersion.v2025_06_18)
+		{
 			projected.title = title;
+			projected.meta = meta;
+		}
 		// `ResourceTemplate.icons` was introduced by 2025-11-25.
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
@@ -4476,8 +4481,8 @@ struct Prompt
 
 	/// Return a copy of this `Prompt` with any fields newer than the negotiated
 	/// protocol version stripped, so the wire output stays valid for the peer's
-	/// version. `BaseMetadata.title` was introduced by 2025-06-18 (absent from
-	/// 2025-03-26 and 2024-11-05); `Prompt.icons` was introduced by 2025-11-25
+	/// version. `BaseMetadata.title` and `_meta` were introduced by 2025-06-18
+	/// (absent from 2025-03-26 and 2024-11-05); `Prompt.icons` was introduced by 2025-11-25
 	/// (absent from every earlier version, present in the modern protocol which is
 	/// >= 2025-11-25). Mirrors `Tool.forVersion`.
 	Prompt forVersion(ProtocolVersion v) const @safe
@@ -4487,9 +4492,11 @@ struct Prompt
 		projected.description = description;
 		foreach (a; arguments)
 			projected.arguments ~= a.forVersion(v);
-		projected.meta = meta;
 		if (v >= ProtocolVersion.v2025_06_18)
+		{
 			projected.title = title;
+			projected.meta = meta;
+		}
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
 			foreach (icon; icons)
@@ -4497,6 +4504,33 @@ struct Prompt
 		}
 		return projected;
 	}
+}
+
+unittest  // Resource.forVersion keeps _meta only from 2025-06-18
+{
+	Resource r = {uri: "file:///a", name: "a"};
+	r.meta = Json(["k": Json("v")]);
+	assert("_meta" !in r.forVersion(ProtocolVersion.v2024_11_05).toJson());
+	assert("_meta" !in r.forVersion(ProtocolVersion.v2025_03_26).toJson());
+	assert(r.forVersion(ProtocolVersion.v2025_06_18).toJson()["_meta"]["k"].get!string == "v");
+}
+
+unittest  // ResourceTemplate.forVersion keeps _meta only from 2025-06-18
+{
+	ResourceTemplate t = {uriTemplate: "file:///{x}", name: "t"};
+	t.meta = Json(["k": Json("v")]);
+	assert("_meta" !in t.forVersion(ProtocolVersion.v2024_11_05).toJson());
+	assert("_meta" !in t.forVersion(ProtocolVersion.v2025_03_26).toJson());
+	assert(t.forVersion(ProtocolVersion.v2025_06_18).toJson()["_meta"]["k"].get!string == "v");
+}
+
+unittest  // Prompt.forVersion keeps _meta only from 2025-06-18
+{
+	Prompt p = {name: "greet"};
+	p.meta = Json(["k": Json("v")]);
+	assert("_meta" !in p.forVersion(ProtocolVersion.v2024_11_05).toJson());
+	assert("_meta" !in p.forVersion(ProtocolVersion.v2025_03_26).toJson());
+	assert(p.forVersion(ProtocolVersion.v2025_06_18).toJson()["_meta"]["k"].get!string == "v");
 }
 
 unittest  // Prompt.forVersion strips title for 2024-11-05 (BaseMetadata.title introduced 2025-06-18)
