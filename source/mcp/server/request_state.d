@@ -111,18 +111,22 @@ struct RequestStateSecurity
 final class RequestStateCodec
 {
 	private const ubyte[32] cipherKey;
-	private const ubyte[32] macSubkey;
+	private const ubyte[32] bindSubkey;
+	private const ubyte[32] payloadMacSubkey;
 	private const RequestStateMode mode;
 	private const Duration ttl;
 	private const RequestStateBinding bindTo;
 
 	this(RequestStateSecurity sec) @safe
 	{
-		// Split the operator secret into two independent sub-keys via HKDF-SHA256
-		// (RFC 5869) with distinct info labels, so the AES key and the HMAC key
-		// share no bytes even when the secret is exactly 32 bytes long.
+		// Split the operator secret into independent sub-keys via HKDF-SHA256
+		// (RFC 5869) with distinct info labels, one per use, so the AES key, the
+		// bind-tag key and the payload-MAC key share no bytes even when the
+		// secret is exactly 32 bytes long, and a bind tag can never double as a
+		// payload MAC.
 		this.cipherKey = hkdfSha256Subkey(sec.key, "mcp.requestState aes-256-gcm key");
-		this.macSubkey = hkdfSha256Subkey(sec.key, "mcp.requestState bind-hmac key");
+		this.bindSubkey = hkdfSha256Subkey(sec.key, "mcp.requestState bind-hmac key");
+		this.payloadMacSubkey = hkdfSha256Subkey(sec.key, "mcp.requestState payload-hmac key");
 		this.mode = sec.mode;
 		this.ttl = sec.ttl;
 		this.bindTo = sec.bindTo;
@@ -147,7 +151,7 @@ final class RequestStateCodec
 		final switch (mode)
 		{
 		case RequestStateMode.signed:
-			const mac = hmacSha256(macKey(), payloadBytes);
+			const mac = hmacSha256(payloadMacKey(), payloadBytes);
 			return "v1." ~ base64UrlNoPad(payloadBytes) ~ "." ~ base64UrlNoPad(mac);
 		case RequestStateMode.encrypted:
 			ubyte[12] nonce;
@@ -190,7 +194,7 @@ final class RequestStateCodec
 		// Reject an absent or wrong-length MAC outright; a valid MAC is 32 bytes.
 		if (presentedMac.length != 32)
 			return Nullable!string.init;
-		const expectedMac = hmacSha256(macKey(), payloadBytes);
+		const expectedMac = hmacSha256(payloadMacKey(), payloadBytes);
 		if (!constantTimeEquals(presentedMac, expectedMac))
 			return Nullable!string.init;
 		return openEnvelope(payloadBytes, subject, toolName);
@@ -246,7 +250,7 @@ final class RequestStateCodec
 		string material = subject;
 		if (bindTo == RequestStateBinding.authSubjectAndTool)
 			material = subject ~ "\0" ~ toolName;
-		const mac = hmacSha256(macKey(), cast(const(ubyte)[]) material.representation);
+		const mac = hmacSha256(bindKey(), cast(const(ubyte)[]) material.representation);
 		return toHex(mac);
 	}
 
@@ -256,10 +260,16 @@ final class RequestStateCodec
 		return cipherKey[];
 	}
 
-	/// The HMAC sub-key for bind tags and signed-mode payload MACs.
-	private const(ubyte)[] macKey() @safe
+	/// The HMAC sub-key for bind tags.
+	private const(ubyte)[] bindKey() @safe
 	{
-		return macSubkey[];
+		return bindSubkey[];
+	}
+
+	/// The HMAC sub-key for signed-mode payload MACs.
+	private const(ubyte)[] payloadMacKey() @safe
+	{
+		return payloadMacSubkey[];
 	}
 }
 
@@ -663,7 +673,14 @@ unittest  // encrypted: AES and bind-HMAC keys are independent (no key reuse)
 	// key length. The AES sub-key and the bind-HMAC sub-key MUST NOT share bytes,
 	// otherwise recovering one key compromises the other.
 	auto codec = encryptedCodec();
-	assert(codec.aesKey() != codec.macKey());
+	assert(codec.aesKey() != codec.bindKey());
+	assert(codec.aesKey() != codec.payloadMacKey());
+}
+
+unittest  // signed: bind tags and payload MACs are keyed independently
+{
+	auto codec = encryptedCodec();
+	assert(codec.bindKey() != codec.payloadMacKey());
 }
 
 unittest  // authSubjectAndTool rejects a requestState minted for another method with the same name
