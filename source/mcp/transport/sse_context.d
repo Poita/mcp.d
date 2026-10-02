@@ -545,6 +545,14 @@ final class ServerPushChannel : PushChannel
 		this.mtx = new TaskMutex;
 	}
 
+	/// The coordinator this channel allocates stream ordinals and correlates
+	/// server->client requests with. Every mount of the server must share it, so
+	/// POST-initiated stream ordinals never collide with the channel's listeners.
+	StreamCoordinator coordinator() @safe
+	{
+		return coord;
+	}
+
 	/// Register a connected GET listener and return its id. Each listener gets a
 	/// distinct stream ordinal so its event ids stay globally unique within the
 	/// mount/session. When `subscriptionId` is non-empty (a `subscriptions/listen`

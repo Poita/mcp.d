@@ -109,7 +109,8 @@ struct StreamableHttpOptions
 
 	/// How long a server->client request (elicitation, sampling, roots) waits for
 	/// the client's reply before it fails with `RequestTimeoutException` and is
-	/// cancelled toward the client with `notifications/cancelled`.
+	/// cancelled toward the client with `notifications/cancelled`. When one server
+	/// is mounted more than once, the first mount's value applies to every mount.
 	Duration serverRequestTimeout = defaultServerRequestTimeout;
 
 	/// Stateful servers only: a session with no request and no open GET stream
@@ -188,8 +189,13 @@ unittest  // a disabled (no-validator) config is never rejected, even with no AS
 void mountMcp(URLRouter router, McpServer server,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
-	auto coord = new StreamCoordinator;
-	coord.requestTimeout = opts.serverRequestTimeout;
+	// Every mount of one server shares the push channel and its coordinator, so
+	// stream ordinals and server->client request waiters stay unique across
+	// mounts. The first mount's `serverRequestTimeout` applies.
+	auto fresh = new StreamCoordinator;
+	fresh.requestTimeout = opts.serverRequestTimeout;
+	auto push = ensurePushChannel(server, fresh);
+	auto coord = push.coordinator;
 	// Session minting is derived from the server's mode: a `stateful`
 	// server mints/tracks an `Mcp-Session-Id`; a `stateless` server never does.
 	auto sessions = server.mode == ServerMode.stateful
@@ -238,7 +244,6 @@ void mountMcp(URLRouter router, McpServer server,
 			return;
 		handlePost(server, coord, sessions, statelessInFlight, token, payload, req, res);
 	});
-	auto push = ensurePushChannel(server, coord);
 	if (sessions !is null)
 		sessions.onExpire = (string sid) @safe { push.closeSession(sid); };
 	router.get(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
@@ -4140,6 +4145,91 @@ unittest  // evicting a session past the cap closes its open GET stream at once
 	runEventLoop();
 	assert(!endedBeforeEviction, "the GET stream must stay open while its session lives");
 	assert(ended, "evicting the session must close its GET stream promptly");
+}
+
+version (unittest) private string initSession(URLRouter router, string ver = "2025-11-25") @safe
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(initializeBody(ver),
+			["Accept": "application/json, text/event-stream"]), res);
+	return res.headers.get(SessionHeader, "");
+}
+
+version (unittest) private HTTPServerRequest sessionReq(HTTPMethod method,
+		string sid, string body_ = "", string accept = "application/json, text/event-stream") @safe
+{
+	string[string] h = ["Accept": accept, "MCP-Protocol-Version": "2025-11-25"];
+	if (sid.length)
+		h[SessionHeader] = sid;
+	auto req = makeInitPostReq(body_, h);
+	req.method = method;
+	return req;
+}
+
+unittest  // two mounts of one stateful server keep each session's events on its own streams
+{
+	import core.time : msecs;
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	Tool descriptor;
+	descriptor.name = "progress";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		ctx.reportProgress(1);
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto routerA = new URLRouter;
+	auto routerB = new URLRouter;
+	mountMcp(routerA, server);
+	mountMcp(routerB, server);
+	const sidA = initSession(routerA);
+	const sidB = initSession(routerB);
+
+	auto sinkA = createMemoryOutputStream();
+	auto sinkB = createMemoryOutputStream();
+	runTask(() @safe nothrow{
+		try
+			routerA.handleRequest(sessionReq(HTTPMethod.GET, sidA, "", "text/event-stream"),
+				createTestHTTPServerResponse(sinkA, null, TestHTTPResponseMode.bodyOnly));
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			routerB.handleRequest(sessionReq(HTTPMethod.POST, sidB,
+				`{"jsonrpc":"2.0","id":2,"method":"tools/call",`
+				~ `"params":{"name":"progress","arguments":{},"_meta":{"progressToken":"p"}}}`),
+				createTestHTTPServerResponse(sinkB, null, TestHTTPResponseMode.bodyOnly));
+			routerA.handleRequest(sessionReq(HTTPMethod.DELETE, sidA),
+				createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly));
+			sleep(100.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	const a = () @trusted { return cast(string) sinkA.data.idup; }();
+	const b = () @trusted { return cast(string) sinkB.data.idup; }();
+	assert(b.canFind("notifications/progress") && b.canFind("\"id\":2"),
+			"session B's POST stream must carry its own events: " ~ b);
+	assert(!a.canFind("notifications/progress") && !a.canFind("\"id\":2"),
+			"session B's events must never reach session A's GET stream: " ~ a);
 }
 
 unittest  // the version gate rejects a version the server does not serve
