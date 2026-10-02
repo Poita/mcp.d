@@ -1094,8 +1094,9 @@ unittest  // skills/list and skills/get do not exist below 2025-11-25
 	conn.negotiated = ProtocolVersion.v2025_06_18;
 	foreach (method; ["skills/list", "skills/get"])
 	{
-		auto outText = s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"` ~ method
-				~ `","params":{"uri":"skill://office/pdf-forms/SKILL.md"}}`, conn, "");
+		auto outText = s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"`
+				~ method ~ `","params":{"uri":"skill://office/pdf-forms/SKILL.md"}}`,
+				conn, "", TokenInfo.invalid());
 		auto resp = parseJsonString(outText);
 		assert(resp["error"]["code"].get!int == cast(int) ErrorCode.methodNotFound);
 	}
@@ -1730,6 +1731,7 @@ unittest  // verifyResourceDigest fails everything for an entry without a manife
 
 version (unittest)
 {
+	import mcp.auth.resource_server : TokenInfo;
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import core.time : Duration;
 	import mcp.client.transport : BearerProvider, ClientTransport,
@@ -2010,7 +2012,7 @@ unittest  // resources/directory/read does not exist below 2025-11-25
 	auto conn = new ConnectionState;
 	conn.negotiated = ProtocolVersion.v2025_06_18;
 	auto outText = s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"resources/directory/read",`
-			~ `"params":{"uri":"skill://office/pdf-forms"}}`, conn, "");
+			~ `"params":{"uri":"skill://office/pdf-forms"}}`, conn, "", TokenInfo.invalid());
 	auto resp = parseJsonString(outText);
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.methodNotFound);
 }

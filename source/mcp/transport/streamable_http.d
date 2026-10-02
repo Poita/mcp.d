@@ -2320,7 +2320,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// 2025-03-26 back-compat: the non-streaming batch path (no in-flight
 		// server->client traffic), dispatched against the resolved state so the
 		// legacy path is actually reachable for a session that negotiated 2025-03-26.
-		const txt = server.handleRaw(payload, reqState, cancelScope);
+		const txt = server.handleRaw(payload, reqState, cancelScope, token);
 		if (txt.length == 0)
 		{
 			res.statusCode = HTTPStatus.accepted;
@@ -2712,6 +2712,48 @@ unittest  // with auth on, a session id only works with its creator's token
 	assert(send("", "tok-bob", sid, HTTPMethod.DELETE).statusCode == 404,
 			"another principal must not terminate alice's session");
 	assert(send(ping, "tok-alice", sid).statusCode == 200);
+}
+
+unittest  // with auth on, every member of a 2025-03-26 batch sees the caller's token
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.types : Tool, CallToolResult, Content;
+
+	StreamableHttpOptions opts;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = t == "tok-alice";
+		info.subject = "alice";
+		return info;
+	};
+	auto server = new McpServer("t", "1");
+	Tool whoami = {name: "whoami"};
+	server.registerTool(whoami, (Json args, RequestContext ctx) @safe {
+		CallToolResult r;
+		r.content = [
+			Content.makeText(ctx.auth().valid ? ctx.auth().subject : "<anonymous>")
+		];
+		return r;
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server, opts);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(`[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}]`,
+			[
+				"Accept": "application/json, text/event-stream",
+				"Authorization": "Bearer tok-alice"
+	]), res);
+	const reply = () @trusted { return cast(string) sink.data.idup; }();
+	assert(res.statusCode == HTTPStatus.ok, reply);
+	auto arr = parseJsonString(reply);
+	assert(arr[0]["result"]["content"][0]["text"].get!string == "alice",
+			"a batch member must run under the request's authenticated principal: " ~ reply);
 }
 
 unittest  // the standalone GET SSE stream uses the same session gate as POST/DELETE
@@ -4226,9 +4268,9 @@ unittest  // concurrent legacy stateless clients never observe each other's init
 	}
 
 	auto a = freshStatelessState("", Json.undefined);
-	server.handleRaw(initialize("2025-03-26"), a, "");
+	server.handleRaw(initialize("2025-03-26"), a, "", TokenInfo.invalid());
 	auto b = freshStatelessState("", Json.undefined);
-	server.handleRaw(initialize("2025-11-25"), b, "");
+	server.handleRaw(initialize("2025-11-25"), b, "", TokenInfo.invalid());
 
 	// Client A's next request (no header, so 2025-03-26) resolves to its own
 	// state: B's initialize must not change the version or caps A is served with.

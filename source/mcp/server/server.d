@@ -15,6 +15,7 @@ import mcp.protocol.modern;
 import mcp.protocol.mrtr;
 import mcp.server.context;
 import mcp.server.connection : ConnectionState;
+import mcp.auth.resource_server : TokenInfo;
 import mcp.server.request_state : RequestStateSecurity, RequestStateMode,
 	RequestStateBinding, RequestStateCodec,
 	generateEphemeralKey, verifyIncomingRequestState, secureOutgoingRequestState;
@@ -168,11 +169,18 @@ private final class ConnectionScopedContext : BaseRequestContext, ConnectionScop
 {
 	private ConnectionState conn_;
 	private string token_;
+	private TokenInfo auth_;
 
-	this(ConnectionState conn, string token) @safe
+	this(ConnectionState conn, string token, TokenInfo auth) @safe
 	{
 		this.conn_ = conn;
 		this.token_ = token;
+		this.auth_ = auth;
+	}
+
+	override TokenInfo auth() @safe
+	{
+		return auth_;
 	}
 
 	override bool clientSupports(ClientCapability cap) @safe
@@ -2056,14 +2064,15 @@ final class McpServer : ServerCore
 	/// can actually reach the legacy batch path and a modern session is gated on its
 	/// own negotiated version. `connectionToken` identifies the session (its
 	/// `Mcp-Session-Id`) so a `notifications/cancelled` sent on another request of
-	/// the same session matches these requests. `null` falls back to the no-arg
-	/// behaviour.
-	string handleRaw(string text, ConnectionState conn, string connectionToken) @safe
+	/// the same session matches these requests. `auth` is the request's validated
+	/// bearer token, reported to every message's handler as `ctx.auth()`. A `null`
+	/// `conn` falls back to the no-arg behaviour.
+	string handleRaw(string text, ConnectionState conn, string connectionToken, TokenInfo auth) @safe
 	{
 		if (conn is null)
 			return handleRaw(text);
 		return dispatchRaw(text, conn, (Message m) @safe => handle(m,
-				new ConnectionScopedContext(conn, connectionToken)));
+				new ConnectionScopedContext(conn, connectionToken, auth)));
 	}
 
 	/// As `handleRaw`, but with a server->client write `sink` for transports (such
@@ -4444,7 +4453,7 @@ unittest  // a connection-scoped batch context reports the connection's declared
 	conn.clientCaps = ClientCapabilities.fromJson(Json([
 		"elicitation": Json.emptyObject
 	]));
-	auto ctx = new ConnectionScopedContext(conn, "sess");
+	auto ctx = new ConnectionScopedContext(conn, "sess", TokenInfo.invalid());
 	assert(ctx.clientSupports(ClientCapability.elicitationForm));
 	assert(!ctx.clientSupports(ClientCapability.sampling));
 }
@@ -5666,7 +5675,7 @@ unittest  // a batch member with by-position params is answered with its own id
 	conn.negotiated = ProtocolVersion.v2025_03_26;
 	auto resp = parseJsonString(
 			s.handleRaw(`[{"jsonrpc":"2.0","id":4,"method":"ping","params":[]},`
-			~ `{"jsonrpc":"2.0","id":5,"method":"ping"}]`, conn, ""));
+			~ `{"jsonrpc":"2.0","id":5,"method":"ping"}]`, conn, "", TokenInfo.invalid()));
 	assert(resp.type == Json.Type.array && resp.length == 2);
 	bool sawError;
 	foreach (i; 0 .. resp.length)
@@ -5692,14 +5701,14 @@ unittest  // handleRaw(text, conn) gates a batch on the supplied state's version
 	auto conn = new ConnectionState;
 	conn.negotiated = ProtocolVersion.v2025_06_18;
 	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
-		{"jsonrpc":"2.0","id":2,"method":"ping"}]`, conn, "");
+		{"jsonrpc":"2.0","id":2,"method":"ping"}]`, conn, "", TokenInfo.invalid());
 	auto resp = parseJsonString(outText);
 	assert(resp.type == Json.Type.object);
 	assert(resp["id"].type == Json.Type.null_);
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
 }
 
-unittest  // handleRaw(text, conn, token) registers in-flight requests under the connection token
+unittest  // handleRaw(text, conn, token, auth) registers in-flight requests under the connection token
 {
 	// A notifications/cancelled arriving on another POST of the same session is
 	// matched by (token, id), so the batch path must register under that token.
@@ -5715,7 +5724,7 @@ unittest  // handleRaw(text, conn, token) registers in-flight requests under the
 		return r;
 	});
 	s.handleRaw(`[{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"probe"}}]`,
-			conn, "sess-1");
+			conn, "sess-1", TokenInfo.invalid());
 	assert(keys == [McpServer.inFlightKey("sess-1", Json(7))]);
 }
 
@@ -5730,7 +5739,7 @@ unittest  // handleRaw(text, conn) processes a batch on a 2025-03-26 state
 	auto conn = new ConnectionState;
 	conn.negotiated = ProtocolVersion.v2025_03_26;
 	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
-		{"jsonrpc":"2.0","id":2,"method":"ping"}]`, conn, "");
+		{"jsonrpc":"2.0","id":2,"method":"ping"}]`, conn, "", TokenInfo.invalid());
 	auto arr = parseJsonString(outText);
 	assert(arr.type == Json.Type.array);
 	assert(arr.length == 2);
@@ -5742,7 +5751,7 @@ unittest  // handleRaw(null) falls back to the no-arg activeConnection behaviour
 
 	auto s = makeTestServer();
 	auto j = parseJsonString(s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"ping"}`,
-			cast(ConnectionState) null, ""));
+			cast(ConnectionState) null, "", TokenInfo.invalid()));
 	assert(j["id"].get!int == 1);
 	assert("result" in j);
 }
@@ -8936,7 +8945,8 @@ unittest  // a modern request with no _meta at all names both required keys
 	auto conn = new ConnectionState;
 	conn.negotiated = ProtocolVersion.v2026_07_28;
 	auto resp = parseJsonString(s.handleRaw(
-			`{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}`, conn, ""));
+			`{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}`,
+			conn, "", TokenInfo.invalid()));
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
 	auto missing = resp["error"]["data"]["missingMeta"];
 	assert(missing.length == 2);
@@ -8953,7 +8963,8 @@ unittest  // a modern request whose _meta lacks only protocolVersion is -32602, 
 	auto conn = new ConnectionState;
 	conn.negotiated = ProtocolVersion.v2026_07_28;
 	auto resp = parseJsonString(s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"server/discover",`
-			~ `"params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{}}}}`, conn, ""));
+			~ `"params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{}}}}`,
+			conn, "", TokenInfo.invalid()));
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
 	assert(resp["error"]["data"]["missingMeta"].length == 1);
 	assert(resp["error"]["data"]["missingMeta"][0].get!string == MetaKey.protocolVersion);
@@ -8968,7 +8979,7 @@ unittest  // a modern notification is exempt from the required-_meta check
 	conn.negotiated = ProtocolVersion.v2026_07_28;
 	// Notifications get no reply at all; the check must not turn one into an error.
 	const outText = s.handleRaw(`{"jsonrpc":"2.0","method":"notifications/cancelled",`
-			~ `"params":{"requestId":7}}`, conn, "");
+			~ `"params":{"requestId":7}}`, conn, "", TokenInfo.invalid());
 	assert(outText.length == 0);
 }
 
