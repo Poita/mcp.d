@@ -851,6 +851,10 @@ final class OAuthSession
 	// is unit-testable without network access.
 	private TokenSet delegate(string refreshToken) @safe refreshFn_;
 	private TaskMutex refreshLock_;
+	// `invalidate` discarded a rejected token, so the next refresh replaces it.
+	private bool rejectionPending_;
+	// The current token came from a refresh that replaced a rejected one.
+	private bool refreshedOnRejection_;
 
 	/// `oauth` must already carry the canonical `resource`. `token` is the
 	/// initial (possibly empty) stored token for `resource`.
@@ -894,7 +898,9 @@ final class OAuthSession
 	/// the only way a token without a known expiry is ever replaced.
 	///
 	/// Returns whether a replacement token can be obtained: false when no
-	/// refresh token is held, so the rejection (and its `WWW-Authenticate`
+	/// refresh token is held, or when the rejected token is itself the
+	/// replacement for a rejected one (the server would reject any refresh the
+	/// same way, until the token is replaced on expiry), so the rejection (and its `WWW-Authenticate`
 	/// challenge, which a re-authenticating `useOAuth` needs) reaches the caller.
 	///
 	/// Naming the rejected token keeps concurrent rejections idempotent: a
@@ -914,8 +920,24 @@ final class OAuthSession
 		const replaceable = token_.refreshToken.length > 0;
 		if (!token_.hasToken || !constantTimeEquals(token_.accessToken, rejectedAccessToken))
 			return token_.hasToken || replaceable;
+		if (refreshedOnRejection_)
+		{
+			// The token a rejection-driven refresh produced is rejected too
+			// (e.g. an audience mismatch), so another refresh would only be
+			// rejected again. Keep sending it, surfacing each 401, and drop it
+			// from the store so a later `useOAuth` does not reuse it.
+			if (store_ !is null)
+			{
+				auto discarded = token_;
+				discarded.accessToken = "";
+				discarded.expiresAt = 0;
+				store_.save(resource_, discarded);
+			}
+			return false;
+		}
 		token_.accessToken = "";
 		token_.expiresAt = 0;
+		rejectionPending_ = replaceable;
 		if (store_ !is null)
 			store_.save(resource_, token_);
 		return replaceable;
@@ -966,6 +988,8 @@ final class OAuthSession
 			auto prev = token_;
 			auto issuer = prev.issuer.length ? prev.issuer : as_.issuer;
 			token_ = StoredToken.fromTokenSet(ts, resource_, now, prev.refreshToken);
+			refreshedOnRejection_ = rejectionPending_;
+			rejectionPending_ = false;
 			if (token_.scope_.length == 0)
 				token_.scope_ = prev.scope_;
 			if (prev.clientId.length)
@@ -3343,4 +3367,45 @@ unittest  // a rejected token with no refresh token surfaces the server's 401 ch
 	assert(failure.status == 401);
 	assert(failure.wwwAuthenticate == `Bearer error="invalid_token"`);
 	assert(srv.toolsAuth == ["Bearer old-access"], "nothing new to retry with");
+}
+
+unittest  // a refreshed token the server also rejects is not refreshed again on every request
+{
+	import mcp.client.http_transport : HttpStatusException;
+
+	auto srv = startRejectingMcpServer("never-issued");
+	scope (exit)
+		srv.stop();
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old-access";
+	t.refreshToken = "the-refresh";
+	int refreshes;
+	auto sess = new OAuthSession(srv.endpoint, t, store, (string rt) @safe {
+		++refreshes;
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		return ts;
+	});
+	auto client = McpClient.http(srv.endpoint);
+	scope (exit)
+		client.close();
+	cast(void) attachSession(client, sess);
+	client.initialize("2025-11-25");
+	foreach (_; 0 .. 3)
+	{
+		bool rejected;
+		try
+			client.listTools();
+		catch (HttpStatusException e)
+			rejected = e.status == 401;
+		assert(rejected);
+	}
+	assert(refreshes == 1, "the authorization server must not be hit on every request");
+	assert(srv.toolsAuth == [
+		"Bearer old-access", "Bearer new-access", "Bearer new-access",
+		"Bearer new-access"
+	]);
+	assert(!store.load(srv.endpoint).hasToken, "a later useOAuth must not reuse the token");
 }
