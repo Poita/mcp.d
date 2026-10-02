@@ -3088,14 +3088,14 @@ private bool isLoopbackHostname(string h) @safe
 	return sicmp(h, "localhost") == 0 || h == "127.0.0.1" || h == "::1";
 }
 
-/// Whether the server is bound to a public (non-loopback) address while accepting
-/// no extra Host values — the configuration in which the DNS-rebinding guard
+/// Whether `opts` binds a public (non-loopback) address while validating `Host`
+/// against no extra values — the configuration in which the DNS-rebinding guard
 /// rejects every external request with 403. Used to warn at startup.
-private bool publicBindWithoutAllowlist(const string[] bindAddresses, const string[] allowedHosts) @safe
+private bool publicBindWithoutAllowlist(StreamableHttpOptions opts) @safe
 {
-	if (allowedHosts.length)
+	if (!opts.validateHost || opts.allowedHosts.length)
 		return false;
-	foreach (a; bindAddresses)
+	foreach (a; opts.bindAddresses)
 		if (!isLoopbackHostname(a))
 			return true;
 	return false;
@@ -3134,7 +3134,7 @@ void runStreamableHttp(McpServer server, StreamableHttpOptions opts = Streamable
 	import vibe.core.log : logWarn;
 	import std.array : join;
 
-	if (publicBindWithoutAllowlist(opts.bindAddresses, opts.allowedHosts))
+	if (publicBindWithoutAllowlist(opts))
 		logWarn("Streamable HTTP bound to a public address (%s) with an empty "
 				~ "allowedHosts: the DNS-rebinding guard will reject external requests "
 				~ "with 403. Set StreamableHttpOptions.allowedHosts to your public host(s).",
@@ -3169,16 +3169,31 @@ void runStreamableHttp(McpServer server, ServerSettings settings) @safe
 
 unittest  // a public bind with no allowedHosts is flagged (would 403 external hosts)
 {
+	StreamableHttpOptions bound(string[] addrs, string[] hosts = []) @safe
+	{
+		StreamableHttpOptions o;
+		o.bindAddresses = addrs;
+		o.allowedHosts = hosts;
+		return o;
+	}
 	// 0.0.0.0 / :: are wildcard (public) binds; with an empty allowlist the
 	// DNS-rebinding guard rejects every non-loopback Host.
-	assert(publicBindWithoutAllowlist(["0.0.0.0"], []));
-	assert(publicBindWithoutAllowlist(["::"], []));
-	assert(publicBindWithoutAllowlist(["10.0.0.5", "127.0.0.1"], []));
+	assert(publicBindWithoutAllowlist(bound(["0.0.0.0"])));
+	assert(publicBindWithoutAllowlist(bound(["::"])));
+	assert(publicBindWithoutAllowlist(bound(["10.0.0.5", "127.0.0.1"])));
 	// Loopback-only binds are fine without an allowlist.
-	assert(!publicBindWithoutAllowlist(["127.0.0.1"], []));
-	assert(!publicBindWithoutAllowlist(["localhost"], []));
+	assert(!publicBindWithoutAllowlist(bound(["127.0.0.1"])));
+	assert(!publicBindWithoutAllowlist(bound(["localhost"])));
 	// An allowlist resolves the public-bind case.
-	assert(!publicBindWithoutAllowlist(["0.0.0.0"], ["myapp.fly.dev"]));
+	assert(!publicBindWithoutAllowlist(bound(["0.0.0.0"], ["myapp.fly.dev"])));
+}
+
+unittest  // a public bind with Host validation off (behind a proxy) is not flagged
+{
+	StreamableHttpOptions o;
+	o.bindAddresses = ["0.0.0.0"];
+	o.validateHost = false;
+	assert(!publicBindWithoutAllowlist(o));
 }
 
 unittest  // access logging is off by default
