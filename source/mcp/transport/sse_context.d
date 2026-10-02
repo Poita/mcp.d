@@ -465,10 +465,11 @@ final class ServerPushChannel : PushChannel
 	/// ordinal rather than per listener so a resumed stream, and a POST-initiated
 	/// stream that a GET resumes, continue one monotonic id sequence.
 	private long[long] nextSeq;
-	/// Ordinals of the POST-initiated streams whose request is still running. Their
-	/// `nextSeq` entry outlives any history eviction, so the stream never reuses an
-	/// event id that a client may already hold as its `Last-Event-ID`.
-	private bool[long] openStreams;
+	/// Ordinals of the POST-initiated streams whose request is still running,
+	/// mapped to their owning session token. Their `nextSeq` entry outlives any
+	/// history eviction, so the stream never reuses an event id that a client may
+	/// already hold as its `Last-Event-ID`.
+	private string[long] openStreams;
 	private long nextListenerId = 1;
 
 	/// Stream ordinal -> the session/connection token that owns it. A Last-Event-ID
@@ -605,7 +606,7 @@ final class ServerPushChannel : PushChannel
 						if (ord == resumeOrdinal)
 							superseded ~= lid;
 					foreach (lid; superseded)
-						removeListenerLocked(lid);
+						removeListenerLocked(lid, id);
 					streamOf[id] = resumeOrdinal;
 					touchHistory(resumeOrdinal);
 					long maxSeq = resumeSeq;
@@ -673,8 +674,10 @@ final class ServerPushChannel : PushChannel
 	/// List-mutation half of `removeListener`, assuming the delivery mutex is
 	/// already held (so it can be called from inside `deliver`/`emitTo` dead-stream
 	/// cleanup without re-acquiring the non-recursive mutex). Fails the in-flight
-	/// requests bound to this listener.
-	private void removeListenerLocked(long id) @safe
+	/// requests bound to this listener, unless `successor` names the listener that
+	/// resumed its stream: the request frames are replayed there, so the requests
+	/// are rebound to it and stay pending.
+	private void removeListenerLocked(long id, long successor = 0) @safe
 	{
 		import std.algorithm : remove;
 
@@ -700,6 +703,12 @@ final class ServerPushChannel : PushChannel
 		foreach (key, lid; requestListener)
 			if (lid == id)
 				orphaned ~= key;
+		if (successor > 0)
+		{
+			foreach (key; orphaned)
+				requestListener[key] = successor;
+			return;
+		}
 		foreach (key; orphaned)
 		{
 			requestListener.remove(key);
@@ -731,6 +740,12 @@ final class ServerPushChannel : PushChannel
 						owned ~= ordinal;
 				foreach (ordinal; owned)
 					dropHistory(ordinal);
+				long[] open;
+				foreach (ordinal, owner; openStreams)
+					if (owner == token)
+						open ~= ordinal;
+				foreach (ordinal; open)
+					closeStreamLocked(ordinal);
 				return ids.length;
 			}
 		}();
@@ -794,18 +809,17 @@ final class ServerPushChannel : PushChannel
 		}();
 	}
 
-	/// Whether a listener with `id` is still connected. Used as the liveness probe
-	/// for `requestOnSession`'s `awaitLive`, so a server->client request awaiter is
-	/// released promptly if its target stream drops.
-	private bool isListenerLive(long listenerId) @safe
+	/// Whether the in-flight request `key` is still bound to a connected
+	/// listener (the one it was delivered on, or one that resumed that stream).
+	/// Used as the liveness probe for `requestOnSession`'s `awaitLive`, so a
+	/// server->client request awaiter is released promptly if its stream drops.
+	private bool isRequestBound(WaiterKey key) @safe
 	{
 		return () @trusted {
 			synchronized (mtx)
 			{
-				foreach (l; listeners)
-					if (l.id == listenerId)
-						return true;
-				return false;
+				auto lid = key in requestListener;
+				return lid !is null && (*lid in live) !is null;
 			}
 		}();
 	}
@@ -1135,13 +1149,14 @@ final class ServerPushChannel : PushChannel
 		}
 	}
 
-	/// Mark the POST-initiated stream `ordinal` as in progress, so its event
-	/// sequence survives the eviction of its replay history until `closeStream`.
-	void openStream(long ordinal) @safe
+	/// Mark the POST-initiated stream `ordinal` of session `owner` as in progress,
+	/// so its event sequence survives the eviction of its replay history until
+	/// `closeStream` or the session closes.
+	void openStream(long ordinal, string owner) @safe
 	{
 		() @trusted {
 			synchronized (mtx)
-				openStreams[ordinal] = true;
+				openStreams[ordinal] = owner;
 		}();
 	}
 
@@ -1151,15 +1166,28 @@ final class ServerPushChannel : PushChannel
 	{
 		() @trusted {
 			synchronized (mtx)
-			{
-				openStreams.remove(ordinal);
-				bool attached;
-				foreach (lid, ord; streamOf)
-					if (ord == ordinal)
-						attached = true;
-				if (!attached && ordinal !in history)
-					nextSeq.remove(ordinal);
-			}
+				closeStreamLocked(ordinal);
+		}();
+	}
+
+	private void closeStreamLocked(long ordinal) @safe
+	{
+		openStreams.remove(ordinal);
+		bool attached;
+		foreach (lid, ord; streamOf)
+			if (ord == ordinal)
+				attached = true;
+		if (!attached && ordinal !in history)
+			nextSeq.remove(ordinal);
+	}
+
+	/// Whether the POST-initiated stream `ordinal` is still open: its request is
+	/// running and its session has not closed.
+	bool streamOpen(long ordinal) @safe
+	{
+		return () @trusted {
+			synchronized (mtx)
+				return (ordinal in openStreams) !is null;
 		}();
 	}
 
@@ -1319,7 +1347,7 @@ final class ServerPushChannel : PushChannel
 		// Liveness defense-in-depth: even if a disconnect is somehow missed, polling
 		// whether the bound listener is still connected releases the fiber within one
 		// slice instead of the full timeout (mirrors the POST path's `awaitLive`).
-		return coord.awaitLive(id, () @safe => isListenerLive(listenerId),
+		return coord.awaitLive(id, () @safe => isRequestBound(WaiterKey(sessionToken, id)),
 				internalError("GET SSE listener disconnected before the client responded"),
 				timeout, 250.msecs, sessionToken);
 	}
@@ -2399,7 +2427,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	void enableReplay(ServerPushChannel channel) @safe
 	{
 		replay_ = channel;
-		channel.openStream(streamId);
+		channel.openStream(streamId, token_);
 	}
 
 	/// Release the replay channel's hold on this stream once the request is done;
@@ -2601,16 +2629,27 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 			coord.cancel(id, token_);
 			throw e;
 		}
-		if (disconnected_)
+		// A resumable stream records the request for replay, so a dropped POST
+		// connection does not lose it: the client can resume the stream with a GET
+		// and answer. Only a stream that cannot be resumed fails on disconnect.
+		if (disconnected_ && replay_ is null)
 		{
 			coord.cancel(id, token_);
 			throw internalError("client disconnected before the request could be sent");
 		}
-		// Bind the awaiting fiber to this connection's liveness. The response to
-		// this server->client request arrives on a SEPARATE POST, so a disconnect of
-		// the issuing connection would otherwise leave this fiber parked for the
-		// full timeout. Polling `connAlive_` in short slices releases it promptly on
-		// disconnect, mirroring the GET path's listener-disconnect handling.
+		// Bind the awaiting fiber to the stream's liveness. The response to this
+		// server->client request arrives on a SEPARATE POST, so a dead stream would
+		// otherwise leave this fiber parked for the full timeout. A resumable stream
+		// lives as long as its request and session; any other stream lives as long
+		// as its connection.
+		if (replay_ !is null)
+		{
+			auto replay = replay_;
+			const ordinal = streamId;
+			return coord.awaitLive(id, () @safe => replay.streamOpen(ordinal),
+					internalError("session closed before the client responded"),
+					60.seconds, 250.msecs, token_);
+		}
 		return coord.awaitLive(id, connAlive_,
 				internalError("client disconnected before responding"),
 				60.seconds, 250.msecs, token_);
@@ -3824,4 +3863,131 @@ unittest  // events after a GET resumes a live POST stream go only to the GET st
 	assert(body_.canFind("before-resume"));
 	assert(!body_.canFind("after-resume"), "the resumed event is duplicated on the POST stream");
 	assert(!body_.canFind("\"id\":3"));
+}
+
+unittest  // a pending server->client request survives a GET resume that supersedes its stream
+{
+	import std.string : indexOf;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
+	import vibe.data.json : parseJsonString;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string[] stale;
+	ch.addListener((string f) @safe { stale ~= f; }, Json.init, ListenFilter.init, "", null, "S");
+	ch.notify("notifications/message", Json(["n": Json(1)]));
+	const cursor = stale[0]["id: ".length .. stale[0].indexOf("\n")];
+
+	bool answered;
+	string failure;
+	runTask(() nothrow{
+		try
+		{
+			ch.requestOnSession("S", "ping");
+			answered = true;
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runTask(() nothrow{
+		try
+		{
+			while (stale.length < 2)
+				yield();
+			// The client reconnects with the cursor before the request, so the
+			// request is replayed on the resumed stream, which answers it.
+			string[] fresh;
+			ch.addListener((string f) @safe { fresh ~= f; }, Json.init,
+				ListenFilter.init, cursor, null, "S");
+			assert(fresh.length == 1);
+			yield();
+			const data = fresh[0][fresh[0].indexOf("data: ") + "data: ".length .. $];
+			coord.resolve(parseJsonString(data)["id"], Json.emptyObject, Json.undefined, "S");
+		}
+		catch (Exception e)
+			failure = e.msg;
+	});
+	runEventLoop();
+	assert(answered, failure);
+}
+
+unittest  // a resumable POST stream's server->client request survives the POST connection dropping
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.versions : ProtocolVersion;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
+			TokenInfo.invalid(), false, ProtocolVersion.v2025_11_25, "sess-A");
+	ctx.enableReplay(ch);
+	ctx.setConnectionProbe(() @safe => false);
+
+	bool answered;
+	string failure;
+	runTask(() nothrow{
+		try
+		{
+			ctx.elicitRaw(Json.emptyObject);
+			answered = true;
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runTask(() nothrow{
+		try
+		{
+			yield();
+			coord.resolve(Json(1), Json.emptyObject, Json.undefined, "sess-A");
+		}
+		catch (Exception e)
+			failure = e.msg;
+	});
+	runEventLoop();
+	assert(answered, failure);
+}
+
+unittest  // a resumable POST stream's server->client request fails once its session closes
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.versions : ProtocolVersion;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
+			TokenInfo.invalid(), false, ProtocolVersion.v2025_11_25, "sess-A");
+	ctx.enableReplay(ch);
+
+	string failure;
+	runTask(() nothrow{
+		try
+			ctx.elicitRaw(Json.emptyObject);
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runTask(() nothrow{
+		try
+		{
+			yield();
+			ch.closeSession("sess-A");
+		}
+		catch (Exception e)
+		{
+		}
+	});
+	runEventLoop();
+	assert(failure == "session closed before the client responded", failure);
 }
