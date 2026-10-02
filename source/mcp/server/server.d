@@ -1512,11 +1512,37 @@ final class McpServer : ServerCore
 		return "";
 	}
 
-	/// Install (or, with null, remove) the stdio transport's write sink. Called by
-	/// `serveStdio` around its read loop.
+	/// Install the stdio transport's write sink. Called by `serveStdio` before its
+	/// read loop starts.
 	package(mcp) void attachStdioSink(void delegate(string) @safe sink) @safe
 	{
 		stdioSink_ = sink;
+	}
+
+	/// Drop every piece of stdio stream state once `serveStdio` returns: the write
+	/// sink, the `subscriptions/listen` stream and the per-URI subscriptions it
+	/// recorded, and every open `events/stream` (closing each releases its
+	/// subscription). The client has gone, so no closing frames are written.
+	package(mcp) void detachStdio() @safe
+	{
+		stdioSink_ = null;
+		stdioListenSink = null;
+		stdioListenSubscriptionId = Json.init;
+		foreach (u; stdioListenFilter_.resourceUris)
+			activeConnection.subscriptions.remove(u);
+		stdioListenFilter_ = ListenFilter.init;
+		auto streams = stdioEventStreams_;
+		stdioEventStreams_ = null;
+		foreach (handle; streams.byValue)
+		{
+			handle.stream.onTerminated = null;
+			try
+				handle.close();
+			catch (Exception)
+			{
+				// Teardown continues for the remaining streams.
+			}
+		}
 	}
 
 	/// Write `method` unstamped to a 2025-era stdio client: one whose stateful
@@ -6995,7 +7021,7 @@ unittest  // no stdio listen notification follows the stream's closing result
 
 	assert(s.tryServeStdioListen(stdioListenReq(1), &sink));
 	s.handle(Message(makeNotification("notifications/cancelled", Json([
-				"requestId": Json(1)
+		"requestId": Json(1)
 	]))));
 	assert(frames.length == 2, "ack then the closing result, nothing after it");
 	assert("result" in parseJsonString(frames[$ - 1]));

@@ -202,7 +202,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	// Change notifications for a 2025-era client ride the same serialized writer.
 	server.attachStdioSink(&sink);
 	scope (exit)
-		server.attachStdioSink(null);
+		server.detachStdio();
 
 	channel.runReadLoop();
 	readLoopDone = true;
@@ -2304,6 +2304,41 @@ unittest  // notify() and notifyElicitationComplete reach a 2025-era stdio clien
 	auto done = parseJsonString(outputs[2]);
 	assert(done["method"].get!string == "notifications/elicitation/complete");
 	assert(done["params"]["elicitationId"].get!string == "e-1");
+}
+
+unittest  // stdio listen and events streams do not outlive serveStdio
+{
+	import mcp.server.events_runtime : EventRegistration;
+	import mcp.protocol.events : EventOccurrence;
+	import mcp.protocol.jsonrpc : makeRequest;
+
+	auto s = new McpServer("listen-srv", "1.0");
+	s.enableToolsListChanged();
+	auto rt = s.enableEvents();
+	EventRegistration reg;
+	reg.descriptor.name = "incident.created";
+	reg.emitOnly = true;
+	s.registerEventType(reg);
+
+	ServerLink served;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(modernListenLine(5, Json(["toolsListChanged": Json(true)])));
+		Json meta = Json.emptyObject;
+		meta[MetaKey.protocolVersion] = "2026-07-28";
+		meta[MetaKey.clientCapabilities] = Json.emptyObject;
+		link.feed(makeRequest(Json(6), "events/stream",
+			Json(["name": Json("incident.created"), "_meta": meta])).toString());
+		foreach (_; 0 .. 8)
+			yield();
+		assert(s.hasStdioEventStreams());
+		served = link;
+	});
+
+	const before = served.outbound.length;
+	assert(s.notifyToolsListChanged() == 0, "the listen stream must close with serveStdio");
+	assert(!s.hasStdioEventStreams(), "events streams must close with serveStdio");
+	rt.emit(EventOccurrence("evt_1", "incident.created", "", Json.emptyObject));
+	assert(served.outbound.length == before);
 }
 
 unittest  // a stdio server writes no plain notifications before the 2025-era handshake
