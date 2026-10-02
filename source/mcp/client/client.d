@@ -3011,11 +3011,11 @@ final class McpClient : ClientProtocol
 		// Bind deliveries to the subscription's watermark, dedup, and terminal
 		// state before the caller's handlers, as the poll and stream modes do.
 		rx.register(id, p.delivery.secret, (EventOccurrence o) @safe {
-			sub.advanceCursor(o.cursor);
-			if (sub.alreadySeen(o.eventId))
-				return;
-			if (onEvent !is null)
+			// The watermark moves past an occurrence only once it is handled, so
+			// a throwing handler leaves the cursor at the last processed event.
+			if (!sub.alreadySeen(o.eventId) && onEvent !is null)
 				onEvent(o);
+			sub.advanceCursor(o.cursor);
 		}, (EventControl c) @safe {
 			sub.advanceCursor(c.cursor);
 			if (c.kind == EventControlKind.terminated)
@@ -9771,6 +9771,39 @@ unittest  // webhook `gap` envelopes and occurrences advance the subscription cu
 	h.deliver(occ.toJson(), "m2");
 	assert(h.sub.cursor.get == "c8");
 	assert(h.events.length == 1);
+}
+
+unittest  // a webhook occurrence whose handler throws does not advance the cursor
+{
+	import mcp.server.webhook_delivery : signDeliveryHeaders;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	c.onRpcForTest = (string method, Json params) @safe {
+		SubscribeResult r;
+		r.id = "sub_x";
+		r.cursor = "c0";
+		return method == "events/subscribe" ? r.toJson() : Json.emptyObject;
+	};
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+	auto sub = c.subscribeWebhook(rx, sp, (EventOccurrence o) @safe {
+		throw new Exception("handler failed");
+	});
+	auto occ = EventOccurrence("e1", "incident.created", "t", Json.emptyObject);
+	occ.cursor = "c8";
+	const 
+	body = occ.toJson().toString();
+	auto headers = signDeliveryHeaders(managedTestWhsec, "", 0, 1000, "m1",
+			1700, body, "sub_x", null);
+	try
+		rx.processDelivery(body, headers);
+	catch (Exception)
+	{
+	}
+	assert(sub.cursor.get == "c0");
 }
 
 unittest  // a no-expiry grant still refreshes at the health-check cadence
