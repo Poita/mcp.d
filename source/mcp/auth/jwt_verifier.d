@@ -59,6 +59,9 @@ struct JwtVerifierConfig
 	string audience;
 
 	/// Scopes the token must carry (from `scope` or `scp`). All must be present.
+	/// A token missing one is rejected as invalid (401 `invalid_token`); to answer
+	/// with 403 `insufficient_scope` so the client can step up, require the scopes
+	/// via `ResourceServerConfig.requiredScopes` instead (as `resourceServer` does).
 	string[] requiredScopes;
 
 	/// JOSE `typ` header values accepted for a bearer access token, compared

@@ -48,7 +48,10 @@ struct IntrospectionConfig
 	string audience;
 
 	/// Scopes the token must carry. All must be present in the introspection
-	/// response `scope` for the token to be accepted.
+	/// response `scope` for the token to be accepted. A token missing one is
+	/// rejected as invalid (401 `invalid_token`); to answer with 403
+	/// `insufficient_scope` so the client can step up, require the scopes via
+	/// `ResourceServerConfig.requiredScopes` instead.
 	string[] requiredScopes;
 
 	/// Optional TTL for caching positive (`active:true`) introspection results,

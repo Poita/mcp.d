@@ -132,9 +132,10 @@ struct ResourceServerConfig
 	/// The scopes advertised in the metadata document.
 	string[] scopesSupported;
 
-	/// A scope every request must carry, enforced after token validation. Empty
-	/// means no scope requirement.
-	string requiredScope;
+	/// Scopes every request must carry, enforced after token validation: a
+	/// valid token missing any of them gets 403 `insufficient_scope`, so the
+	/// client can step up its authorization. Empty means no scope requirement.
+	string[] requiredScopes;
 
 	/// The server's scope hierarchy: returns true when a token that was granted
 	/// `granted` thereby also holds `required` (for example an `admin` scope that
@@ -168,14 +169,14 @@ struct ResourceServerConfig
 	/// The scope hint to surface in a `WWW-Authenticate` challenge so clients know
 	/// which scopes to request (basic/authorization §Protected Resource Metadata
 	/// Discovery Requirements / §Scope Selection Strategy). Prefers the concrete
-	/// `requiredScope`; otherwise falls back to the space-joined `scopesSupported`.
+	/// `requiredScopes`; otherwise falls back to the space-joined `scopesSupported`.
 	/// Empty when the operator configured neither.
 	string scopeHint() const @safe
 	{
 		import std.array : join;
 
-		if (requiredScope.length)
-			return requiredScope;
+		if (requiredScopes.length)
+			return requiredScopes.join(" ");
 		return scopesSupported.join(" ");
 	}
 
@@ -259,10 +260,13 @@ AuthFailure authorize(ResourceServerConfig cfg, string authHeader, out TokenInfo
 	// Scope enforcement comes after authentication (RFC 6750 §3.1), honouring
 	// the server's scope hierarchy: a broader granted scope may imply the
 	// required one.
-	if (cfg.requiredScope.length && !cfg.satisfiesScope(ti, cfg.requiredScope))
+	foreach (required; cfg.requiredScopes)
 	{
-		info = ti;
-		return AuthFailure.insufficientScope;
+		if (!cfg.satisfiesScope(ti, required))
+		{
+			info = ti;
+			return AuthFailure.insufficientScope;
+		}
 	}
 
 	info = ti;
@@ -360,7 +364,7 @@ version (unittest) private ResourceServerConfig adminOnlyScopeConfig() @safe
 {
 	ResourceServerConfig cfg;
 	cfg.allowAnyAudience = true;
-	cfg.requiredScope = "mcp:read";
+	cfg.requiredScopes = ["mcp:read"];
 	cfg.validator = (string t) {
 		TokenInfo ti;
 		ti.valid = true;
@@ -530,7 +534,7 @@ unittest  // allowAnyAudience opts out of mandatory binding (dev/test escape hat
 unittest  // a token lacking the required scope yields insufficientScope
 {
 	ResourceServerConfig cfg;
-	cfg.requiredScope = "mcp:write";
+	cfg.requiredScopes = ["mcp:write"];
 	// Audience binding passes first (no resource configured -> opt out) so the
 	// scope check is what rejects the request.
 	cfg.allowAnyAudience = true;
@@ -598,12 +602,29 @@ unittest  // WWW-Authenticate never lets a reflected value break out of the quot
 	assert(v == `Bearer resource_metadata="https://x%22 foo=%22bar/meta", error="invalid_token"`);
 }
 
-unittest  // scopeHint prefers requiredScope when set
+unittest  // scopeHint prefers requiredScopes when set
 {
 	ResourceServerConfig cfg;
-	cfg.requiredScope = "mcp:write";
+	cfg.requiredScopes = ["mcp:write"];
 	cfg.scopesSupported = ["mcp:read", "mcp:write"];
 	assert(cfg.scopeHint() == "mcp:write");
+}
+
+unittest  // every required scope must be granted; one missing yields insufficientScope
+{
+	ResourceServerConfig cfg;
+	cfg.requiredScopes = ["mcp:read", "mcp:write"];
+	cfg.allowAnyAudience = true;
+	cfg.validator = (string t) {
+		TokenInfo ti;
+		ti.valid = true;
+		ti.scopes = t == "both" ? ["mcp:read", "mcp:write"] : ["mcp:read"];
+		return ti;
+	};
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer one", info) == AuthFailure.insufficientScope);
+	assert(authorize(cfg, "Bearer both", info) == AuthFailure.none);
+	assert(cfg.scopeHint() == "mcp:read mcp:write");
 }
 
 unittest  // scopeHint falls back to space-joined scopesSupported

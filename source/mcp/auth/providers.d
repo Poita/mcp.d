@@ -56,7 +56,8 @@ struct JwtPresetOptions
 }
 
 /// Build a `ResourceServerConfig` for a JWT/JWKS IdP in one call: pins `issuer` +
-/// `jwksUri` + the audience + required scopes on a `jwtVerifier`, and fills the
+/// `jwksUri` + the audience on a `jwtVerifier`, requires `opts.scopes` on every
+/// request (403 `insufficient_scope` when one is missing), and fills the
 /// public metadata fields (`resource`, `authorizationServers`, `scopesSupported`)
 /// from the same options. The result is the single `auth` object the transport
 /// accepts (`StreamableHttpOptions.auth` / `mountMcp`), the D analogue of
@@ -77,6 +78,10 @@ ResourceServerConfig jwtResourceServer(string issuer, string jwksUri, JwtPresetO
 /// published in the protected-resource metadata; `authorizationServers` comes
 /// from `vc.issuer` and `scopesSupported` from `vc.requiredScopes`.
 ///
+/// `vc.requiredScopes` move to `ResourceServerConfig.requiredScopes`, so a valid
+/// token missing one is answered with 403 `insufficient_scope` (prompting the
+/// client to step up) rather than being rejected by the verifier as invalid.
+///
 /// When `vc.audience` is set the verifier enforces it, so a token that passes is
 /// also bound to `resource` (see `bindResourceAudience`); this lets an IdP whose
 /// `aud` is an API identifier rather than the MCP URL pass `authorize`'s RFC 8707
@@ -88,12 +93,14 @@ ResourceServerConfig resourceServer(JwtVerifierConfig vc, string resource) @safe
 	enforce(resource.length > 0,
 			"resourceServer: resource (the canonical MCP server URL) must be set.");
 	ResourceServerConfig cfg;
+	cfg.requiredScopes = vc.requiredScopes.dup;
+	cfg.scopesSupported = vc.requiredScopes.dup;
+	vc.requiredScopes = null;
 	cfg.validator = vc.audience.length ? bindResourceAudience(jwtVerifier(vc),
 			resource) : jwtVerifier(vc);
 	cfg.resource = resource;
 	if (vc.issuer.length)
 		cfg.authorizationServers = [vc.issuer];
-	cfg.scopesSupported = vc.requiredScopes.dup;
 	return cfg;
 }
 
@@ -154,6 +161,7 @@ ResourceServerConfig entraIdTenants(string[] tenants, JwtPresetOptions opts) @sa
 	cfg.resource = opts.resource;
 	cfg.authorizationServers = issuers;
 	cfg.scopesSupported = opts.scopes.dup;
+	cfg.requiredScopes = opts.scopes.dup;
 	return cfg;
 }
 
@@ -573,6 +581,18 @@ unittest  // a preset with a distinct audience still rejects a token minted for 
 	TokenInfo info;
 	assert(authorize(entraStyleConfig(),
 			"Bearer " ~ presetToken("api://other-api"), info) == AuthFailure.invalidToken);
+}
+
+unittest  // a preset answers a token missing a required scope with insufficient_scope (step-up)
+{
+	import mcp.auth.resource_server : AuthFailure, TokenInfo, authorize;
+
+	auto cfg = entraStyleConfig(["mcp.read", "mcp.write"]);
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer " ~ presetToken("api://my-mcp-server",
+			"mcp.read"), info) == AuthFailure.insufficientScope);
+	assert(authorize(cfg, "Bearer " ~ presetToken("api://my-mcp-server",
+			"mcp.read mcp.write"), info) == AuthFailure.none);
 }
 
 version (unittest)

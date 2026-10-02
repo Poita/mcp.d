@@ -136,7 +136,7 @@ void main(string[] args)
 	auth.resource = resource;
 	auth.authorizationServers = [Issuer];
 	auth.scopesSupported = ["mcp:read", "mcp:write"];
-	auth.requiredScope = "mcp:read"; // every request needs at least mcp:read
+	auth.requiredScopes = ["mcp:read"]; // every request needs at least mcp:read
 
 	opts.auth = auth;
 
