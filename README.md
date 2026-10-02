@@ -531,7 +531,9 @@ It discovers the protected-resource and authorization-server metadata, then:
   protected-resource metadata's `scopes_supported`.
 
 - **Reuses a stored token** for the endpoint when one is still valid, or redeems
-  its refresh token, without opening a browser.
+  its refresh token, without opening a browser — unless it lacks one of the
+  requested scopes (a step-up after `insufficient_scope`), which needs a new
+  authorization.
 - Otherwise **registers the client** — a pre-registered `OAuthLogin.clientId`, a
   Client ID Metadata Document (`clientIdMetadataUrl`, when the AS supports it), or
   Dynamic Client Registration — and **runs authorization-code + PKCE** in the system
@@ -548,7 +550,11 @@ It discovers the protected-resource and authorization-server metadata, then:
 - **Refreshes transparently**: every request asks the returned `OAuthSession` for
   its bearer, which runs the refresh-token grant when the access token is within
   30 seconds of expiry and saves the new token. Concurrent refreshes are
-  single-flighted.
+  single-flighted. A request the server rejects with `401 invalid_token` is
+  refreshed and retried once; with no refresh token, or when the refreshed token
+  is rejected too, the 401 (an `HttpStatusException` carrying the
+  `WWW-Authenticate` challenge) reaches the caller, who can pass the challenge
+  to `useOAuth` as `OAuthLogin.wwwAuthenticate` to sign in again.
 
 `OAuthLogin.openBrowser` replaces the platform browser launcher (for example, to
 print the URL instead). For non-interactive flows (client credentials, token
