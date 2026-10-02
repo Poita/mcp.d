@@ -13,7 +13,7 @@ import vibe.stream.tls : createTLSContext, createTLSStream, TLSContext, TLSConte
 import vibe.stream.wrapper : ProxyStream, createProxyStream;
 import vibe.core.stream : Stream;
 import vibe.internal.interfaceproxy : InterfaceProxy, interfaceProxy;
-import vibe.core.sync : LocalManualEvent, createManualEvent, LocalTaskSemaphore;
+import vibe.core.sync : LocalManualEvent, createManualEvent;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
@@ -183,6 +183,42 @@ private final class PostRequest
 	}
 }
 
+/// A counting semaphore bounding concurrent request POSTs. Unlike vibe's
+/// `LocalTaskSemaphore`, a task parked in `acquire` is woken by
+/// `Task.interrupt`, so a request that times out or is cancelled while waiting
+/// for a permit fails at once instead of waiting for one to free up.
+private final class InFlightPermits
+{
+	private uint max_;
+	private uint held_;
+	private LocalManualEvent released_;
+
+	this(uint max) @safe
+	{
+		max_ = max;
+		released_ = createManualEvent();
+	}
+
+	/// Take a permit, parking the calling task until one is free. Throws
+	/// `InterruptException` when the task is interrupted while parked.
+	void acquire() @safe
+	{
+		while (held_ >= max_)
+		{
+			const ec = released_.emitCount;
+			released_.wait(ec);
+		}
+		held_++;
+	}
+
+	/// Return a permit taken by `acquire`.
+	void release() @safe nothrow
+	{
+		held_--;
+		released_.emit();
+	}
+}
+
 /// A single in-flight legacy (2024-11-05) request's response slot, owned by the
 /// `legacyRpc` call that registered it under its request id. The legacy GET-SSE
 /// reader fills `result`/`err` and sets `got` on the matching id; any unmatched
@@ -347,13 +383,13 @@ final class HttpClientTransport : ClientTransport
 
 	// Optional cap on the number of request POSTs in flight at once. Zero (the
 	// default) means unlimited: no semaphore is created and every request issues
-	// its POST immediately. When positive, a `LocalTaskSemaphore` admits at most
+	// its POST immediately. When positive, an `InFlightPermits` admits at most
 	// this many concurrent request POSTs (notifications and replies bypass it,
 	// see `post`) and an excess
 	// caller awaits a permit instead of minting another socket, bounding the
 	// ephemeral-port / TIME_WAIT pressure a burst of concurrent requests creates.
 	private uint maxInFlight;
-	private LocalTaskSemaphore inFlightSem;
+	private InFlightPermits inFlightSem;
 
 	this(string url, uint maxInFlight = 0) @safe
 	{
@@ -578,15 +614,16 @@ final class HttpClientTransport : ClientTransport
 	/// Acquire one in-flight POST permit, blocking the calling task until one is
 	/// free when the cap is reached, and return the semaphore so the caller can
 	/// release it. Returns null when no cap is configured (`maxInFlight == 0`), in
-	/// which case the POST proceeds unthrottled. The `LocalTaskSemaphore` is created
-	/// lazily on first use because it must be constructed on the event loop.
-	private LocalTaskSemaphore acquireInFlight() @safe
+	/// which case the POST proceeds unthrottled. The permits are created lazily on
+	/// first use because their event must be constructed on the event loop. An
+	/// `abort` of the waiting request interrupts the wait.
+	private InFlightPermits acquireInFlight() @safe
 	{
 		if (maxInFlight == 0)
 			return null;
 		if (inFlightSem is null)
-			inFlightSem = new LocalTaskSemaphore(maxInFlight);
-		inFlightSem.lock();
+			inFlightSem = new InFlightPermits(maxInFlight);
+		inFlightSem.acquire();
 		return inFlightSem;
 	}
 
@@ -654,7 +691,7 @@ final class HttpClientTransport : ClientTransport
 		auto permit = isRequest ? acquireInFlight() : null;
 		scope (exit)
 			if (permit !is null)
-				permit.unlock();
+				permit.release();
 		// Funnel the pooled-client oneway POST through the resolve-validate-pin
 		// connector with the user-configured policy: the user-chosen endpoint host
 		// is resolved and the connection pinned to that vetted address (preserving
@@ -857,7 +894,7 @@ final class HttpClientTransport : ClientTransport
 		auto permit = acquireInFlight();
 		scope (exit)
 			if (permit !is null)
-				permit.unlock();
+				permit.release();
 
 		// Register a slot so `close()` can force-close this POST's socket even while
 		// it is parked reading a long-lived SSE response stream.
@@ -4697,6 +4734,76 @@ unittest  // a reply to a server->client request is sent while every in-flight p
 	});
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(replied, "the ping reply must not wait for the request POST's permit");
+}
+
+unittest  // cancelling a request parked on the in-flight cap wakes it at once
+{
+	import core.time : msecs, seconds, MonoTime, Duration;
+	import mcp.client.client : McpClient, ClientSettings, RequestOptions, CancellationToken;
+	import vibe.core.core : sleep, runTask;
+
+	auto r = new URLRouter;
+	r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auto j = requestJson(req);
+		const method = ("method" in j) ? j["method"].get!string : "";
+		if (method == "initialize")
+			res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+		else if ("id" !in j || method.length == 0)
+		{
+			res.statusCode = 202;
+			res.writeBody("", "text/plain");
+		}
+		else
+		{
+			// Hold the only permit for 2s before answering.
+			sleep(2.seconds);
+			auto resp = parseJsonString(`{"jsonrpc":"2.0","result":{"content":[]}}`);
+			resp["id"] = j["id"];
+			res.writeBody(resp.toString(), "application/json");
+		}
+	});
+	ClientSettings settings;
+	settings.maxInFlight = 1;
+	settings.requestTimeout = Duration.zero;
+	int code;
+	Duration took;
+	const failure = runAgainstFakeServer(r, (string url) @safe {
+		auto client = McpClient.http(url, settings);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		auto holder = runTask(() nothrow{
+			try
+				client.callTool("slow", Json.emptyObject);
+			catch (Exception)
+			{
+			}
+		});
+		sleep(100.msecs);
+		auto token = new CancellationToken;
+		runTask(() nothrow{
+			try
+			{
+				sleep(200.msecs);
+				token.cancel();
+			}
+			catch (Exception)
+			{
+			}
+		});
+		RequestOptions opts;
+		opts.cancellation = token;
+		const start = MonoTime.currTime;
+		try
+			client.callTool("parked", Json.emptyObject, opts);
+		catch (McpException e)
+			code = e.code;
+		took = MonoTime.currTime - start;
+		holder.join();
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(code == ErrorCode.requestCancelled);
+	assert(took < 1.seconds, "a cancelled call must not wait for an in-flight permit");
 }
 
 unittest  // a subscriptions/listen POST accepts both JSON and SSE responses
