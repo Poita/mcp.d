@@ -386,7 +386,8 @@ interface WebhookSubscriptionStore
 	void remove(string id) @safe;
 
 	/// Every stored subscription. The runtime applies expiry filtering; the store
-	/// need not. Used only by the periodic sweep; per-event paths use `byName`.
+	/// need not. Used by the periodic sweep and by `terminatePrincipal` across all
+	/// event types (revoking a principal's access); per-event paths use `byName`.
 	WebhookSubscription[] all() @safe;
 
 	/// Every stored subscription to event type `name`, lapsed or not. Called on
