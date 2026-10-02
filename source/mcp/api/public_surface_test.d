@@ -65,6 +65,14 @@ unittest
 	static assert(visibleFromMcp!"makeErrorResponse");
 }
 
+// `Json`, which handler and client signatures use, and its parser come with
+// `import mcp;`.
+unittest
+{
+	static assert(visibleFromMcp!"Json");
+	static assert(visibleFromMcp!"parseJsonString");
+}
+
 // The UDA / reflection API stays at the top level.
 unittest
 {

@@ -8,9 +8,11 @@
  *   - the server / client entry points (`McpServer`, `McpClient`,
  *     `RequestContext`),
  *   - the declarative UDA / reflection layer (`@tool`, `@resource`,
- *     `@prompt`, `registerModule`, schema generation), and
+ *     `@prompt`, `registerModule`, schema generation),
  *   - the error builders (`McpException`, `ErrorCode`, `toErrorJson`,
- *     `makeErrorResponse`).
+ *     `makeErrorResponse`), and
+ *   - vibe's `Json` value type and `parseJsonString`, which the handler and
+ *     client signatures use.
  *
  * Transport wiring and auth plumbing are deliberately kept out of the
  * top-level surface to avoid name collisions and to signal stable-public-API
@@ -22,6 +24,9 @@
  *     resource-server / OAuth proxy.
  */
 module mcp;
+
+// --- JSON value type used throughout the public signatures ---
+public import vibe.data.json : Json, parseJsonString;
 
 // --- Protocol types ---
 public import mcp.protocol.versions;

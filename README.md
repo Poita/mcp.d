@@ -49,7 +49,6 @@ scenario's value (see [Concurrency model](#concurrency-model)). Save it as
 +/
 import mcp;
 import std.stdio : writeln;
-import vibe.data.json : parseJsonString;
 
 void main()
 {
@@ -1089,7 +1088,6 @@ exception on your side:
 
 ```d
 import mcp; // re-exports runWithEventLoop
-import vibe.data.json : parseJsonString;
 
 void main()
 {

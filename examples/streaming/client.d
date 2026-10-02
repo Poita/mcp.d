@@ -58,7 +58,6 @@ import std.conv : to;
 import std.getopt : getopt;
 
 import vibe.core.core : runTask, sleep;
-import vibe.data.json : Json;
 
 import mcp;
 import mcp.client.client : McpClient;

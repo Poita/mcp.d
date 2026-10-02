@@ -61,7 +61,6 @@ import std.datetime.systime : Clock;
 import std.getopt : getopt;
 import std.string : indexOf;
 
-import vibe.data.json : Json, parseJsonString;
 import vibe.http.client : requestHTTP, HTTPClientRequest, HTTPClientResponse;
 import vibe.http.common : HTTPMethod;
 import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;

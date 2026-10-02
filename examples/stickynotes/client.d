@@ -40,7 +40,6 @@ import std.algorithm : canFind, count, map;
 import std.array : array;
 import std.stdio : writeln;
 
-import vibe.data.json : Json;
 
 import mcp;
 import examples_common : check, checkEq, runClient, connectFromArgs;

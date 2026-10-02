@@ -47,7 +47,6 @@ module mrtr_client;
 import std.conv : to;
 import std.stdio : writeln;
 
-import vibe.data.json : Json;
 
 import mcp;
 

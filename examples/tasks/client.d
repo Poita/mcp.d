@@ -36,7 +36,6 @@ module tasks_client;
 
 import std.stdio : writeln;
 
-import vibe.data.json : Json;
 
 import mcp;
 import examples_common : check, checkEq, runClient, connectFromArgs;

@@ -30,7 +30,6 @@ import std.stdio : writeln;
 import core.time : msecs;
 import std.conv : to;
 import vibe.core.core : sleep;
-import vibe.data.json : Json, parseJsonString;
 import vibe.http.server : listenHTTP, HTTPListener, HTTPServerSettings,
 	HTTPServerRequest, HTTPServerResponse;
 import vibe.stream.operations : readAllUTF8;
