@@ -893,26 +893,32 @@ final class OAuthSession
 	/// refresh token is held, and a later `useOAuth` does not reuse it. This is
 	/// the only way a token without a known expiry is ever replaced.
 	///
+	/// Returns whether a replacement token can be obtained: false when no
+	/// refresh token is held, so the rejection (and its `WWW-Authenticate`
+	/// challenge, which a re-authenticating `useOAuth` needs) reaches the caller.
+	///
 	/// Naming the rejected token keeps concurrent rejections idempotent: a
 	/// request that failed with a token another request has already replaced
 	/// does not discard the replacement.
 	///
 	/// `useOAuth` installs this as the client's `BearerProvider.onRejected`, so
 	/// the HTTP transport calls it with the bearer a rejected request carried and
-	/// then retries that request once.
-	void invalidate(string rejectedAccessToken) @safe
+	/// retries that request once when it returns true.
+	bool invalidate(string rejectedAccessToken) @safe
 	{
 		import mcp.auth.oauth : constantTimeEquals;
 
 		refreshLock_.lock();
 		scope (exit)
 			refreshLock_.unlock();
+		const replaceable = token_.refreshToken.length > 0;
 		if (!token_.hasToken || !constantTimeEquals(token_.accessToken, rejectedAccessToken))
-			return;
+			return token_.hasToken || replaceable;
 		token_.accessToken = "";
 		token_.expiresAt = 0;
 		if (store_ !is null)
 			store_.save(resource_, token_);
+		return replaceable;
 	}
 
 	/// `bearerForRequest` at the current wall-clock time. `useOAuth` installs this
@@ -948,8 +954,8 @@ final class OAuthSession
 				if (token_.hasToken && token_.expiresAt == 0)
 					return token_.accessToken; // no expiry known, no refresh possible
 				throw internalError(
-						"OAuth access token expired and no refresh token is available; "
-						~ "re-authentication required");
+						"OAuth access token has expired or was rejected and no refresh token "
+						~ "is available; call useOAuth again to re-authenticate");
 			}
 			auto ts = refreshFn_(token_.refreshToken);
 			if (ts.accessToken.length == 0)
@@ -3213,68 +3219,128 @@ unittest  // the client is registered with the redirect URI the listener actuall
 	assert(registeredWith == oauth.redirectUri);
 }
 
-unittest  // a 401 invalid_token replaces a token with no known expiry and retries the request once
+version (unittest)
 {
-	import std.conv : to;
-	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
-		HTTPServerSettings, listenHTTP;
-	import vibe.stream.operations : readAllUTF8;
+	/// A loopback MCP server that answers `initialize` and accepts `tools/list`
+	/// only with the bearer `accepted`, answering any other with a 401
+	/// `invalid_token` challenge. Records the `Authorization` header of every
+	/// `tools/list`.
+	private final class RejectingMcpServer
+	{
+		import vibe.http.server : HTTPListener;
 
-	string[] toolsAuth;
-	auto settings = new HTTPServerSettings;
-	settings.bindAddresses = ["127.0.0.1"];
-	settings.port = 0;
-	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
-			scope HTTPServerResponse res) @safe {
-		auto j = parseJsonString(() @trusted {
-			return req.bodyReader.readAllUTF8();
-		}());
-		if ("id" !in j)
+		HTTPListener listener;
+		string endpoint;
+		string accepted;
+		string[] toolsAuth;
+
+		void stop() @trusted
 		{
-			res.statusCode = 202;
-			res.writeBody("", "text/plain");
-			return;
+			listener.stopListening();
 		}
-		auto reply = Json.emptyObject;
-		reply["jsonrpc"] = "2.0";
-		reply["id"] = j["id"];
-		if (j["method"].get!string == "initialize")
-			reply["result"] = parseJsonString(`{"protocolVersion":"2025-11-25",`
-				~ `"capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}`);
-		else
-		{
-			const auth = req.headers.get("Authorization", "");
-			toolsAuth ~= auth;
-			if (auth != "Bearer new-access")
+	}
+
+	/// ditto
+	private RejectingMcpServer startRejectingMcpServer(string accepted) @trusted
+	{
+		import std.conv : to;
+		import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+			HTTPServerSettings, listenHTTP;
+		import vibe.stream.operations : readAllUTF8;
+
+		auto srv = new RejectingMcpServer;
+		srv.accepted = accepted;
+		auto settings = new HTTPServerSettings;
+		settings.bindAddresses = ["127.0.0.1"];
+		settings.port = 0;
+		srv.listener = listenHTTP(settings, (scope HTTPServerRequest req,
+				scope HTTPServerResponse res) @safe {
+			auto j = parseJsonString(() @trusted {
+				return req.bodyReader.readAllUTF8();
+			}());
+			if ("id" !in j)
 			{
-				res.statusCode = 401;
-				res.headers["WWW-Authenticate"] = `Bearer error="invalid_token"`;
+				res.statusCode = 202;
 				res.writeBody("", "text/plain");
 				return;
 			}
-			reply["result"] = parseJsonString(`{"tools":[]}`);
-		}
-		res.writeBody(reply.toString(), "application/json");
-	});
+			auto reply = Json.emptyObject;
+			reply["jsonrpc"] = "2.0";
+			reply["id"] = j["id"];
+			if (j["method"].get!string == "initialize")
+				reply["result"] = parseJsonString(`{"protocolVersion":"2025-11-25",`
+					~ `"capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}`);
+			else
+			{
+				const auth = req.headers.get("Authorization", "");
+				srv.toolsAuth ~= auth;
+				if (auth != "Bearer " ~ srv.accepted)
+				{
+					res.statusCode = 401;
+					res.headers["WWW-Authenticate"] = `Bearer error="invalid_token"`;
+					res.writeBody("", "text/plain");
+					return;
+				}
+				reply["result"] = parseJsonString(`{"tools":[]}`);
+			}
+			res.writeBody(reply.toString(), "application/json");
+		});
+		srv.endpoint = "http://127.0.0.1:" ~ srv.listener.bindAddresses[0].port.to!string ~ "/mcp";
+		return srv;
+	}
+}
+
+unittest  // a 401 invalid_token replaces a token with no known expiry and retries the request once
+{
+	auto srv = startRejectingMcpServer("new-access");
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
-	const endpoint = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/mcp";
+		srv.stop();
 
 	auto store = new MemoryTokenStore();
 	StoredToken t;
 	t.accessToken = "old-access";
 	t.refreshToken = "the-refresh";
-	auto sess = new OAuthSession(endpoint, t, store, (string rt) @safe {
+	auto sess = new OAuthSession(srv.endpoint, t, store, (string rt) @safe {
 		TokenSet ts;
 		ts.accessToken = "new-access";
 		return ts;
 	});
-	auto client = McpClient.http(endpoint);
+	auto client = McpClient.http(srv.endpoint);
 	scope (exit)
 		client.close();
 	cast(void) attachSession(client, sess);
 	client.initialize("2025-11-25");
 	client.listTools();
-	assert(toolsAuth == ["Bearer old-access", "Bearer new-access"]);
-	assert(store.load(endpoint).accessToken == "new-access");
+	assert(srv.toolsAuth == ["Bearer old-access", "Bearer new-access"]);
+	assert(store.load(srv.endpoint).accessToken == "new-access");
+}
+
+unittest  // a rejected token with no refresh token surfaces the server's 401 challenge
+{
+	import mcp.client.http_transport : HttpStatusException;
+
+	auto srv = startRejectingMcpServer("never-sent");
+	scope (exit)
+		srv.stop();
+
+	StoredToken t;
+	t.accessToken = "old-access";
+	auto sess = new OAuthSession(srv.endpoint, t, new MemoryTokenStore(), (string rt) @safe {
+		assert(0, "no refresh token to present");
+		return TokenSet.init;
+	});
+	auto client = McpClient.http(srv.endpoint);
+	scope (exit)
+		client.close();
+	cast(void) attachSession(client, sess);
+	client.initialize("2025-11-25");
+	HttpStatusException failure;
+	try
+		client.listTools();
+	catch (HttpStatusException e)
+		failure = e;
+	assert(failure !is null, "the caller needs the 401 and its challenge to re-authenticate");
+	assert(failure.status == 401);
+	assert(failure.wwwAuthenticate == `Bearer error="invalid_token"`);
+	assert(srv.toolsAuth == ["Bearer old-access"], "nothing new to retry with");
 }

@@ -18,9 +18,11 @@ struct BearerProvider
 
 	/// Called with the access token a request carried when the server rejected
 	/// it as invalid (RFC 6750 §3.1: HTTP 401 whose challenge has no error code
-	/// or `error="invalid_token"`). The request is then retried once with a
-	/// fresh `token()`. Optional; without it a 401 is surfaced to the caller.
-	void delegate(string rejectedToken) @safe onRejected;
+	/// or `error="invalid_token"`). Returns whether a replacement token is
+	/// available: when true the request is retried once with a fresh `token()`,
+	/// otherwise the 401 is surfaced to the caller with its `WWW-Authenticate`
+	/// challenge. Optional; without it a 401 is surfaced to the caller.
+	bool delegate(string rejectedToken) @safe onRejected;
 }
 
 /// The protocol-side collaborator an `McpClient` hands to its transport at

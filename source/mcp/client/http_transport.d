@@ -648,9 +648,9 @@ final class HttpClientTransport : ClientTransport
 			return postAndAwait(message, expectId);
 		catch (HttpStatusException e)
 		{
-			if (sentBearer.length == 0 || !isRejectedBearer(e))
+			if (sentBearer.length == 0 || !isRejectedBearer(e)
+					|| !bearerProvider.onRejected(sentBearer))
 				throw e;
-			bearerProvider.onRejected(sentBearer);
 		}
 		return postAndAwait(message, expectId);
 	}
@@ -4092,7 +4092,7 @@ version (unittest)
 	/// Run `listTools` with a bearer provider against a server that answers
 	/// every `tools/list` with a 401 carrying `challenge`. Returns the tokens
 	/// passed to `onRejected` and the number of `tools/list` attempts.
-	private string[] rejectedBearers(string challenge, out int attempts)
+	private string[] rejectedBearers(string challenge, out int attempts, bool replaced = true)
 	{
 		import mcp.client.client : McpClient;
 
@@ -4110,6 +4110,7 @@ version (unittest)
 				client.close();
 			client.setBearerProvider(BearerProvider(() @safe => "tok", (string t) @safe {
 					rejected ~= t;
+					return replaced;
 				}));
 			client.initialize("2025-11-25");
 			try
@@ -4131,6 +4132,15 @@ unittest  // a rejected bearer is reported once and the request retried only onc
 	assert(attempts == 2);
 	assert(rejectedBearers(`Bearer realm="mcp"`, attempts) == ["tok"]);
 	assert(attempts == 2);
+}
+
+unittest  // a rejected bearer with no replacement surfaces the 401 without a retry
+{
+	int attempts;
+	assert(rejectedBearers(`Bearer error="invalid_token"`, attempts, false) == [
+		"tok"
+	]);
+	assert(attempts == 1);
 }
 
 unittest  // a 401 for a reason other than the token itself is not retried
