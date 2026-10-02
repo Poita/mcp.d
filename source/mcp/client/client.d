@@ -2653,9 +2653,13 @@ final class McpClient : ClientProtocol
 		return p;
 	}
 
-	/// `resources/subscribe` / `resources/unsubscribe`.
+	/// `resources/subscribe` / `resources/unsubscribe`, on a released protocol
+	/// (<= 2025-11-25). The 2026-07-28 protocol removed both RPCs in favour of
+	/// `subscriptionsListen`, so on a modern session these throw a
+	/// `methodNotFound` `McpException` without sending anything.
 	void subscribe(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
+		ensureLegacyOnly("resources/subscribe");
 		Json p = Json.emptyObject;
 		p["uri"] = uri;
 		rpcWith("resources/subscribe", p, opts);
@@ -2664,6 +2668,7 @@ final class McpClient : ClientProtocol
 	/// ditto
 	void unsubscribe(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
+		ensureLegacyOnly("resources/unsubscribe");
 		Json p = Json.emptyObject;
 		p["uri"] = uri;
 		rpcWith("resources/unsubscribe", p, opts);
@@ -2683,19 +2688,31 @@ final class McpClient : ClientProtocol
 	/// when the server refuses the stream; a stream the server ends later reports
 	/// it through the handle's `ended`/`error`.
 	///
-	/// Only meaningful for modern servers (call `enableModern`/`connect` first);
-	/// legacy servers do not implement `subscriptions/listen`.
+	/// Modern sessions only (call `enableModern`/`connect` first): on a released
+	/// protocol, which has no `subscriptions/listen`, this throws a
+	/// `methodNotFound` `McpException` without opening a stream.
 	SubscriptionStream subscriptionsListen(SubscriptionFilter filter) @safe
 	{
+		if (!useModern)
+			throw new McpException(ErrorCode.methodNotFound,
+					"subscriptions/listen requires the 2026-07-28 protocol; "
+					~ "call enableModern() or connect() first");
 		const id = nextId++;
-		Json params = buildSubscriptionsListenParams(filter);
-		if (useModern)
-			params = injectModernMeta(params);
+		Json params = injectModernMeta(buildSubscriptionsListenParams(filter));
 		auto message = makeRequest(Json(id), "subscriptions/listen", params);
 		ensureOpen();
 		auto stream = transport.openListen(message);
 		trackStream(stream);
 		return stream;
+	}
+
+	/// Throw when `method`, which the 2026-07-28 protocol removed, is called on a
+	/// modern session.
+	private void ensureLegacyOnly(string method) @safe
+	{
+		if (useModern)
+			throw new McpException(ErrorCode.methodNotFound,
+					method ~ " is not part of the 2026-07-28 protocol; use subscriptionsListen");
 	}
 
 	// --- MCP Events extension (2026-07-28) --------------------------------------
@@ -10375,6 +10392,7 @@ unittest  // close() cancels every open subscriptions/listen stream
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	auto a = c.subscriptionsListen(SubscriptionFilter.init);
 	auto b = c.streamEvents(StreamParams("incident.created"), null);
 	c.close();
@@ -10397,12 +10415,40 @@ unittest  // close() cancels managed subscriptions and their watchdog does not r
 	assert(t.listens.length == 1, "a closed client must not reopen a managed stream");
 }
 
+unittest  // resources/subscribe and resources/unsubscribe fail locally on a modern session
+{
+	import std.exception : collectException;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	string[] sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		sent ~= method;
+		return Json.emptyObject;
+	};
+	assert(collectException!McpException(c.subscribe("file:///a")) !is null);
+	assert(collectException!McpException(c.unsubscribe("file:///a")) !is null);
+	assert(sent.length == 0, "a verb the modern protocol removed must not be sent");
+}
+
+unittest  // subscriptionsListen fails locally on a legacy session
+{
+	import std.exception : collectException;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	assert(collectException!McpException(c.subscriptionsListen(SubscriptionFilter.init)) !is null);
+	assert(t.listens.length == 0, "a modern-only stream must not be opened on a legacy session");
+}
+
 unittest  // a closed client refuses to open a new listen stream
 {
 	import std.exception : collectException;
 
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	c.close();
 	assert(collectException(c.subscriptionsListen(SubscriptionFilter.init)) !is null);
 	assert(t.listens.length == 0);
