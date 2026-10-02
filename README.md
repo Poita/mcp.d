@@ -731,8 +731,9 @@ arguments. When
 you need to survive a restart, call plain `callTool` instead: if the server made a
 task the result is the handle (`result.isTask`, with the seed `Task` in
 `result.task`). Persist `result.task.taskId`, then resume any time — even in a fresh
-process — with `awaitTask(taskId)`, which polls to completion (and surfaces mid-task
-input requests to an optional callback).
+process — with `awaitTask(taskId, opts, onInputRequired)`, which polls to completion
+(cancellable through `opts.cancellation`, and surfacing mid-task input requests
+to the optional callback).
 
 ```d
 auto r = client.callTool("deploy", args);   // sync or task — you needn't know

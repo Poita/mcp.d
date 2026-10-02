@@ -2108,10 +2108,20 @@ final class McpClient : ClientProtocol
 	/// `respondTaskInput`; with no handler the task
 	/// can never progress, so this throws. Works from a bare `taskId` string, so a
 	/// client can resume a task persisted across a restart.
-	CallToolResult awaitTask(string taskId, void delegate(string taskId,
-			Json inputRequests) @safe onInputRequired = null) @safe
+	///
+	/// Cancelling `opts.cancellation` stops polling, cancels the task on the server
+	/// (best effort), and throws the cancellation error. When `opts.onProgress`
+	/// and `opts.progressToken` are both set, progress the server reports under
+	/// that token (the one the task's originating call carried) is routed to
+	/// `opts.onProgress` while the task is polled.
+	CallToolResult awaitTask(string taskId, RequestOptions opts = RequestOptions.init,
+			void delegate(string taskId, Json inputRequests) @safe onInputRequired = null) @safe
 	{
-		return awaitTaskImpl(taskId, onInputRequired, null);
+		if (!opts.progressToken.isSet)
+			opts.onProgress = null;
+		return withPerCallProgress!CallToolResult(opts, () @safe {
+			return awaitTaskImpl(taskId, onInputRequired, opts.cancellation);
+		});
 	}
 
 	/// `awaitTask`, stopping once `cancellation` (when non-null) is cancelled: the
@@ -4797,13 +4807,39 @@ unittest  // awaitTask surfaces input_required to the callback and continues to 
 		assert(params["inputResponses"]["k1"]["answer"].get!string == "yes");
 		return Json.emptyObject;
 	};
-	auto result = c.awaitTask("t1", (string id, Json reqs) @safe {
+	auto result = c.awaitTask("t1", RequestOptions.init, (string id, Json reqs) @safe {
 		sawInput = true;
 		assert("k1" in reqs);
 		c.respondTaskInput(id, Json(["k1": Json(["answer": Json("yes")])]));
 	});
 	assert(sawInput && polls == 2);
 	assert(result.content.length == 0);
+}
+
+unittest  // awaitTask stops polling and cancels the task once its RequestOptions token is cancelled
+{
+	import std.exception : collectException;
+
+	auto c = McpClient.http("http://localhost");
+	auto token = new CancellationToken;
+	int polls;
+	bool cancelledOnServer;
+	c.onTaskSleepForTest = (Duration d) @safe { token.cancel("stop"); };
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tasks/cancel")
+		{
+			cancelledOnServer = true;
+			return Json.emptyObject;
+		}
+		polls++;
+		return Json(["taskId": Json("t1"), "status": Json("working")]);
+	};
+	RequestOptions opts;
+	opts.cancellation = token;
+	auto e = cast(McpException) collectException(c.awaitTask("t1", opts));
+	assert(e !is null && e.code == ErrorCode.requestCancelled);
+	assert(polls == 1);
+	assert(cancelledOnServer);
 }
 
 unittest  // awaitTask hands each inputRequests key to onInputRequired only once
@@ -4837,7 +4873,7 @@ unittest  // awaitTask hands each inputRequests key to onInputRequired only once
 			"result": Json(["content": Json.emptyArray])
 		]);
 	};
-	c.awaitTask("t1", (string id, Json reqs) @safe {
+	c.awaitTask("t1", RequestOptions.init, (string id, Json reqs) @safe {
 		import std.algorithm : sort;
 
 		auto keys = () @trusted { return reqs.get!(Json[string]).keys; }();
@@ -4872,7 +4908,9 @@ unittest  // awaitTask re-delivers an input request key after the task leaves in
 			"result": Json(["content": Json.emptyArray])
 		]);
 	};
-	c.awaitTask("t1", (string id, Json reqs) @safe { calls++; });
+	c.awaitTask("t1", RequestOptions.init, (string id, Json reqs) @safe {
+		calls++;
+	});
 	assert(calls == 2);
 }
 
