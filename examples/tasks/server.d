@@ -147,7 +147,7 @@ void main(string[] args) @safe
 	// executor purely from the task ID:
 	//
 	//   final class RedisTaskStore : TaskStore {
-	//       void put(TaskRecord r)               { redis.set(r.meta.taskId, r.toJson.toString); }
+	//       bool put(TaskRecord r)               { return redis.setNx(r.meta.taskId, r.toJson.toString); }
 	//       Nullable!TaskRecord get(string id)   { ... TaskRecord.fromJson(...) ... }
 	//       bool compareAndSwap(TaskRecord r, ulong expected) { /* WATCH id; check revision; MULTI; SET */ }
 	//       void remove(string id)               { redis.del(id); }

@@ -155,25 +155,11 @@ final class TaskRuntime
 	Task createFor(string toolName, Json executorInput,
 			TaskCreateOptions opts = TaskCreateOptions.init) @safe
 	{
-		string id;
-		// Defend against a misbehaving custom generator returning a duplicate.
-		foreach (_; 0 .. 8)
-		{
-			id = opts_.idGenerator();
-			if (store_.get(id).isNull)
-				break;
-			id = "";
-		}
-		if (id.length == 0)
-			throw new McpException(ErrorCode.internalError,
-					"task id generator failed to produce a unique id");
-
 		const ttlDur = opts.ttl.isNull ? opts_.defaultTtl : opts.ttl.get;
 		const pollDur = opts.pollInterval.isNull ? opts_.defaultPollInterval : opts
 			.pollInterval.get;
 
 		TaskRecord r;
-		r.meta.taskId = id;
 		r.meta.status = TaskStatus.working;
 		const now = opts_.nowIso();
 		r.meta.createdAt = now;
@@ -184,8 +170,17 @@ final class TaskRuntime
 		r.toolName = toolName;
 		r.owner = opts.owner;
 		r.executorInput = executorInput;
-		store_.put(r);
-		return r.meta;
+		// The store's insert-if-absent rejects an id already taken (a misbehaving
+		// custom generator, or another node minting the same id), so retry with
+		// a fresh one rather than overwrite.
+		foreach (_; 0 .. 8)
+		{
+			r.meta.taskId = opts_.idGenerator();
+			if (store_.put(r))
+				return r.meta;
+		}
+		throw new McpException(ErrorCode.internalError,
+				"task id generator failed to produce a unique id");
 	}
 
 	/// Enforce the task's principal binding for a tasks/* request made by
@@ -1082,7 +1077,7 @@ unittest  // a task with an unlimited ttl never expires
 	TaskRecord r = store.get(t.taskId).get;
 	r.meta.ttlMs = Nullable!long.init;
 	r.meta.status = TaskStatus.completed;
-	store.put(r);
+	assert(store.compareAndSwap(r, r.revision));
 	now = "2100-01-01T00:00:00Z";
 	assert(rt.sweepExpired() == 0);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
@@ -1253,9 +1248,9 @@ version (unittest) private final class RacingTaskStore : TaskStore
 		inner = new InMemoryTaskStore();
 	}
 
-	void put(TaskRecord r) @safe
+	bool put(TaskRecord r) @safe
 	{
-		inner.put(r);
+		return inner.put(r);
 	}
 
 	Nullable!TaskRecord get(string id) @safe
@@ -1384,4 +1379,55 @@ unittest  // deliverInput rejects answers for a terminal task with -32602
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 	assert(ex.data["taskId"].get!string == t.taskId);
 	assert(rt.takenInput(t.taskId).length == 0);
+}
+
+version (unittest) private final class StaleReadTaskStore : TaskStore
+{
+	InMemoryTaskStore inner;
+
+	this() @safe
+	{
+		inner = new InMemoryTaskStore();
+	}
+
+	// Never sees a record, as a replica lagging behind another node's insert.
+	Nullable!TaskRecord get(string id) @safe
+	{
+		return Nullable!TaskRecord.init;
+	}
+
+	bool put(TaskRecord r) @safe
+	{
+		return inner.put(r);
+	}
+
+	bool compareAndSwap(TaskRecord r, ulong expected) @safe
+	{
+		return inner.compareAndSwap(r, expected);
+	}
+
+	void remove(string id) @safe
+	{
+		inner.remove(id);
+	}
+
+	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe
+	{
+		return inner.removeIf(pred);
+	}
+}
+
+unittest  // createFor retries a fresh id when the store already holds the generated one
+{
+	auto store = new StaleReadTaskStore();
+	string[] ids = ["a", "a", "b"];
+	TaskOptions o;
+	o.store = store;
+	o.idGenerator = () @safe { auto id = ids[0]; ids = ids[1 .. $]; return id; };
+	auto rt = new TaskRuntime(o);
+	auto first = rt.createFor("one", Json("first"));
+	auto second = rt.createFor("two", Json("second"));
+	assert(first.taskId == "a");
+	assert(second.taskId == "b");
+	assert(store.inner.get("a").get.toolName == "one", "the first task must not be clobbered");
 }

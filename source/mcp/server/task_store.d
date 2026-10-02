@@ -154,9 +154,12 @@ private Json cloneJson(const Json j) @safe
 /// — the task ID is the only handle.
 interface TaskStore
 {
-	/// Store a newly created record. The runtime guarantees `record.meta.taskId`
-	/// is not already present.
-	void put(TaskRecord record) @safe;
+	/// Store a newly created record unless a record with `record.meta.taskId`
+	/// already exists. Returns false, changing nothing, when the id is taken; the
+	/// runtime then retries with a fresh id. A shared store implements this as
+	/// one atomic insert-if-absent (e.g. Redis `SET NX` or a SQL `INSERT` on a
+	/// unique key), so two nodes minting the same id cannot clobber each other.
+	bool put(TaskRecord record) @safe;
 
 	/// The record with `taskId`, or null if unknown (or already removed/expired).
 	Nullable!TaskRecord get(string taskId) @safe;
@@ -188,9 +191,12 @@ final class InMemoryTaskStore : TaskStore
 {
 	private TaskRecord[string] records;
 
-	void put(TaskRecord record) @safe
+	bool put(TaskRecord record) @safe
 	{
+		if (record.meta.taskId in records)
+			return false;
 		records[record.meta.taskId] = record.dup;
+		return true;
 	}
 
 	Nullable!TaskRecord get(string taskId) @safe
@@ -263,6 +269,20 @@ unittest  // TaskRecord round-trips all execution state through JSON
 	assert(back.toolName == "deploy");
 	assert(back.executorInput["build"].get!string == "v2");
 	assert(back.checkpoints["stage"].get!string == "approved");
+}
+
+unittest  // InMemoryTaskStore.put refuses an id that is already stored
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	auto s = new InMemoryTaskStore();
+	TaskRecord r;
+	r.meta.taskId = "id1";
+	r.toolName = "first";
+	assert(s.put(r));
+	r.toolName = "second";
+	assert(!s.put(r));
+	assert(s.get("id1").get.toolName == "first");
 }
 
 unittest  // InMemoryTaskStore stores, fetches, updates, and removes a record
