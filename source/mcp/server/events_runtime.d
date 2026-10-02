@@ -1010,7 +1010,8 @@ final class EventsRuntime
 	/// carried. The backlog is read without a poll lease — the stream's own
 	/// lifecycle reference covers it — and the stream's cursor only moves forward.
 	/// A backlog that cannot be read (a throwing check) still sends `active` at
-	/// the client's cursor. Returns the suggested poll cadence in milliseconds.
+	/// the client's cursor, followed by a recoverable `notifications/events/error`.
+	/// Returns the suggested poll cadence in milliseconds.
 	long startPushStream(PushStream s, Nullable!string cursor, Nullable!long maxAgeMs) @safe
 	{
 		auto reg = s.name in types_;
@@ -1022,17 +1023,22 @@ final class EventsRuntime
 			cursor = s.openHead_;
 		PollResult first;
 		bool read;
+		Exception readError;
 		try
 		{
 			first = runPoll(*reg, s.name, s.arguments, s.principal, cursor,
 					maxAgeMs, Nullable!long.init);
 			read = true;
 		}
-		catch (Exception)
-		{
-		}
+		catch (Exception e)
+			readError = e;
 		s.deliver(eventsActiveNotification, withSubscriptionId(activeParams(read
 				? first.cursor : cursor, read && first.truncated), s.subscriptionId));
+		if (readError !is null)
+		{
+			logEventsError("push stream backlog check threw", readError);
+			deliverCheckError(s, readError);
+		}
 		if (read)
 			foreach (ev; first.events)
 				s.deliver(eventsEventNotification,
@@ -1126,10 +1132,7 @@ final class EventsRuntime
 					Nullable!long.init, Nullable!long.init);
 		catch (Exception e)
 		{
-			Json err = (cast(McpException) e) !is null ? toErrorJson(cast(McpException) e)
-				: toErrorJson(internalError(e.msg));
-			s.deliver(eventsErrorNotification,
-					withSubscriptionId(eventErrorParams(err), s.subscriptionId));
+			deliverCheckError(s, e);
 			return;
 		}
 		if (r.truncated)
@@ -1139,6 +1142,16 @@ final class EventsRuntime
 			s.deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), s.subscriptionId));
 		if (!r.cursor.isNull)
 			s.cursor = r.cursor;
+	}
+
+	// Report a check that threw on a push stream as a recoverable
+	// `notifications/events/error`; the stream stays open.
+	private static void deliverCheckError(PushStream s, Exception e) @safe
+	{
+		auto mcp = cast(McpException) e;
+		Json err = mcp !is null ? toErrorJson(mcp) : toErrorJson(internalError(e.msg));
+		s.deliver(eventsErrorNotification,
+				withSubscriptionId(eventErrorParams(err), s.subscriptionId));
 	}
 
 	/// End a push stream from the server side: deliver `notifications/events/
@@ -3490,6 +3503,22 @@ unittest  // advancePushStream delivers a recoverable error frame when the check
 	assert(methods[$ - 1] == eventsEventNotification);
 	assert(handle.stream.cursor.get == "c1");
 	handle.close();
+}
+
+unittest  // a push stream whose backlog check throws reports a recoverable error after active
+{
+	auto rt = testRuntime();
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.check = (EventContext ctx) @safe { throw new Exception("upstream down"); };
+	rt.register(reg);
+	string[] frames;
+	auto h = rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		frames ~= m;
+	});
+	rt.startPushStream(h.stream, nullable("c0"), Nullable!long.init);
+	assert(frames == [eventsActiveNotification, eventsErrorNotification]);
+	assert(!h.stream.terminated);
 }
 
 unittest  // advancePushStream re-sends active{truncated:true} with the fresh cursor on a gap
