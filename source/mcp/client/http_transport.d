@@ -19,7 +19,7 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.mrtr : isHeaderValueUnsafe;
 import mcp.protocol.ssrf : FetchOptions, TlsTrust;
-import mcp.client.transport : ClientTransport, ClientProtocol;
+import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol;
 import mcp.client.subscription : SubscriptionStream, ListenGate;
 
 /// A request rejected at the HTTP layer: the server answered with a non-success
@@ -277,7 +277,7 @@ final class HttpClientTransport : ClientTransport
 	private string url;
 	private string sessionId;
 	private string bearerToken;
-	private string delegate() @safe bearerProvider;
+	private BearerProvider bearerProvider;
 	// Set after the first plaintext-bearer warning so the cleartext-credential
 	// notice is logged at most once per transport instead of on every request.
 	private bool warnedInsecureBearer;
@@ -414,10 +414,10 @@ final class HttpClientTransport : ClientTransport
 	void setBearerToken(string token) @safe
 	{
 		bearerToken = token;
-		bearerProvider = null;
+		bearerProvider = BearerProvider.init;
 	}
 
-	void setBearerProvider(string delegate() @safe provider) @safe
+	void setBearerProvider(BearerProvider provider) @safe
 	{
 		bearerProvider = provider;
 		bearerToken = null;
@@ -427,8 +427,8 @@ final class HttpClientTransport : ClientTransport
 	/// token when one is installed, else the static token.
 	private string currentBearer() @safe
 	{
-		if (bearerProvider !is null)
-			bearerToken = bearerProvider();
+		if (bearerProvider.token !is null)
+			bearerToken = bearerProvider.token();
 		return bearerToken;
 	}
 
@@ -641,7 +641,32 @@ final class HttpClientTransport : ClientTransport
 					"MCP session expired (server rejected a prior request with HTTP 404/410)");
 		if (legacyMode)
 			return legacyRpc(message, expectId);
+		// The token this request carries. A refresh between here and the send can
+		// only make it stale, and `onRejected` ignores a token already replaced.
+		const sentBearer = bearerProvider.onRejected !is null ? currentBearer() : null;
+		try
+			return postAndAwait(message, expectId);
+		catch (HttpStatusException e)
+		{
+			if (sentBearer.length == 0 || !isRejectedBearer(e))
+				throw e;
+			bearerProvider.onRejected(sentBearer);
+		}
 		return postAndAwait(message, expectId);
+	}
+
+	/// Whether `e` rejects the bearer token a request carried (RFC 6750 §3.1): a
+	/// 401 whose Bearer challenge has `error="invalid_token"` or no error code.
+	/// Other errors (`invalid_request`, `insufficient_scope`) would recur with a
+	/// fresh token.
+	private static bool isRejectedBearer(HttpStatusException e) @safe
+	{
+		import mcp.auth.oauth : parseWwwAuthenticate;
+
+		if (e.status != 401)
+			return false;
+		const error = parseWwwAuthenticate(e.wwwAuthenticate).error;
+		return error.length == 0 || error == "invalid_token";
 	}
 
 	void sendOneway(Json message) @safe
@@ -3491,9 +3516,9 @@ unittest  // a bearer provider is consulted on every request, so a refreshed tok
 
 	auto t = new HttpClientTransport("https://host:8080/mcp");
 	int calls;
-	t.setBearerProvider(() @safe {
-		return ++calls == 1 ? "first-token" : "refreshed-token";
-	});
+	t.setBearerProvider(BearerProvider(() @safe {
+			return ++calls == 1 ? "first-token" : "refreshed-token";
+		}));
 	auto first = t.buildHttpRequest("GET", "/mcp", "host:8080",
 			"text/event-stream", "keep-alive", true, (string[string]).init, null, null);
 	auto second = t.buildHttpRequest("GET", "/mcp", "host:8080",
@@ -3507,7 +3532,7 @@ unittest  // setBearerToken replaces an installed bearer provider
 	import std.algorithm : canFind;
 
 	auto t = new HttpClientTransport("https://host:8080/mcp");
-	t.setBearerProvider(() @safe => "provided");
+	t.setBearerProvider(BearerProvider(() @safe => "provided"));
 	t.setBearerToken("static");
 	const req = t.buildHttpRequest("GET", "/mcp", "host:8080",
 			"text/event-stream", "keep-alive", true, (string[string]).init, null, null);
@@ -4060,6 +4085,59 @@ unittest  // a 401 surfaces as an HttpStatusException carrying the status and WW
 	assert(h !is null, "a 401 must raise HttpStatusException");
 	assert(h.status == 401);
 	assert(h.wwwAuthenticate == challenge);
+}
+
+version (unittest)
+{
+	/// Run `listTools` with a bearer provider against a server that answers
+	/// every `tools/list` with a 401 carrying `challenge`. Returns the tokens
+	/// passed to `onRejected` and the number of `tools/list` attempts.
+	private string[] rejectedBearers(string challenge, out int attempts)
+	{
+		import mcp.client.client : McpClient;
+
+		int seen;
+		string[] rejected;
+		auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+			++seen;
+			res.statusCode = 401;
+			res.headers["WWW-Authenticate"] = challenge;
+			res.writeBody("", "text/plain");
+		});
+		const failure = runAgainstFakeServer(router, (string url) @safe {
+			auto client = McpClient.http(url);
+			scope (exit)
+				client.close();
+			client.setBearerProvider(BearerProvider(() @safe => "tok", (string t) @safe {
+					rejected ~= t;
+				}));
+			client.initialize("2025-11-25");
+			try
+				client.listTools();
+			catch (HttpStatusException)
+			{
+			}
+		});
+		assert(failure.length == 0, "scenario failed: " ~ failure);
+		attempts = seen;
+		return rejected;
+	}
+}
+
+unittest  // a rejected bearer is reported once and the request retried only once
+{
+	int attempts;
+	assert(rejectedBearers(`Bearer error="invalid_token"`, attempts) == ["tok"]);
+	assert(attempts == 2);
+	assert(rejectedBearers(`Bearer realm="mcp"`, attempts) == ["tok"]);
+	assert(attempts == 2);
+}
+
+unittest  // a 401 for a reason other than the token itself is not retried
+{
+	int attempts;
+	assert(rejectedBearers(`Bearer error="invalid_request"`, attempts).length == 0);
+	assert(attempts == 1);
 }
 
 unittest  // a 500 with an HTML body surfaces its HTTP status rather than a JSON parse error
@@ -5049,7 +5127,7 @@ unittest  // close() DELETEs the session with a bearer fetched from the provider
 	int callsBeforeClose;
 	const failure = runAgainstFakeServer(router, (string url) @safe {
 		auto client = McpClient.http(url);
-		client.setBearerProvider(() @safe => "t" ~ (++calls).to!string);
+		client.setBearerProvider(BearerProvider(() @safe => "t" ~ (++calls).to!string));
 		client.initialize("2025-11-25");
 		callsBeforeClose = calls;
 		client.close();

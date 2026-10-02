@@ -352,6 +352,11 @@ unittest  // the task-tool UDA is `@taskTool`
 	static assert(visibleFromMcp!"taskTool");
 }
 
+unittest  // the client's bearer provider settings are reachable from `import mcp;`
+{
+	static assert(visibleFromMcp!"BearerProvider");
+}
+
 unittest  // the unlimited task TTL sentinel is reachable from `import mcp;`
 {
 	static assert(visibleFromMcp!"unlimitedTaskTtl");

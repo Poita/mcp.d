@@ -1873,7 +1873,8 @@ version (unittest)
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import core.time : Duration;
-	import mcp.client.transport : ClientTransport, SubscriptionStream, ClientProtocol;
+	import mcp.client.transport : BearerProvider, ClientTransport,
+		SubscriptionStream, ClientProtocol;
 	import mcp.protocol.errors : McpException;
 
 	// A client transport that hands each request straight to an in-process
@@ -1940,7 +1941,7 @@ version (unittest)
 		{
 		}
 
-		void setBearerProvider(string delegate() @safe) @safe
+		void setBearerProvider(BearerProvider) @safe
 		{
 		}
 

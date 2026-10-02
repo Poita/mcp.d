@@ -8,6 +8,21 @@ import mcp.protocol.jsonrpc : Message;
 
 public import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 
+/// The source of the OAuth bearer token an HTTP client sends (`OAuthSession`
+/// supplies one through `useOAuth`).
+struct BearerProvider
+{
+	/// Return the access token for the request being sent; called for every
+	/// request, so a token refreshed between requests is always the one sent.
+	string delegate() @safe token;
+
+	/// Called with the access token a request carried when the server rejected
+	/// it as invalid (RFC 6750 §3.1: HTTP 401 whose challenge has no error code
+	/// or `error="invalid_token"`). The request is then retried once with a
+	/// fresh `token()`. Optional; without it a 401 is surfaced to the caller.
+	void delegate(string rejectedToken) @safe onRejected;
+}
+
 /// The protocol-side collaborator an `McpClient` hands to its transport at
 /// construction (`ClientTransport.setProtocol`). It lets the transport pull the
 /// protocol-derived request headers and consult the cancelled-request set
@@ -113,7 +128,7 @@ interface ClientTransport
 	/// Attach a bearer provider consulted for every request, so a token that is
 	/// refreshed between requests is always the one sent. Replaces any static
 	/// token set by `setBearerToken` (and vice versa); a no-op on stdio.
-	void setBearerProvider(string delegate() @safe provider) @safe;
+	void setBearerProvider(BearerProvider provider) @safe;
 
 	/// Signal whether the negotiated protocol version is modern (2026-07-28).
 	/// The HTTP transport uses this to skip Last-Event-ID resumption (GET), which

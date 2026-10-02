@@ -17,7 +17,7 @@ import mcp.protocol.tasks : Task, TaskStatus;
 import mcp.protocol.sampling : validateSamplingMessages, CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.modern;
 import mcp.protocol.mrtr;
-import mcp.client.transport : ClientTransport, ClientProtocol;
+import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol;
 import mcp.client.http_transport : HttpClientTransport, HttpStatusException,
 	isLegacyFallbackStatus, defaultMaxMessageBytes;
 import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
@@ -1022,10 +1022,12 @@ final class McpClient : ClientProtocol
 		clearToolIndex();
 	}
 
-	/// Attach an OAuth bearer provider, called for every request so a token that
-	/// is refreshed between requests (e.g. `OAuthSession.bearer`) is always the
-	/// one sent. Replaces any token set by `setBearerToken`; a no-op over stdio.
-	void setBearerProvider(string delegate() @safe provider) @safe
+	/// Attach an OAuth bearer provider, whose `token` is called for every request
+	/// so a token that is refreshed between requests (e.g. `OAuthSession.bearer`)
+	/// is always the one sent, and whose optional `onRejected` is told of a token
+	/// the server rejects before the request is retried once. Replaces any token
+	/// set by `setBearerToken`; a no-op over stdio.
+	void setBearerProvider(BearerProvider provider) @safe
 	{
 		transport.setBearerProvider(provider);
 		if (cacheStore_ !is null)
@@ -8619,7 +8621,7 @@ version (unittest)
 		{
 		}
 
-		void setBearerProvider(string delegate() @safe provider) @safe
+		void setBearerProvider(BearerProvider provider) @safe
 		{
 		}
 
@@ -8765,7 +8767,7 @@ version (unittest)
 		{
 		}
 
-		void setBearerProvider(string delegate() @safe) @safe
+		void setBearerProvider(BearerProvider) @safe
 		{
 		}
 

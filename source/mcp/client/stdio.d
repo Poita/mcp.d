@@ -6,7 +6,7 @@ import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
-import mcp.client.transport : ClientTransport, ClientProtocol;
+import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol;
 import mcp.client.subscription : SubscriptionStream, ListenGate;
 import mcp.transport.duplex : DuplexChannel, defaultMaxLineBytes;
 import mcp.protocol.events : subscriptionIdMetaKey;
@@ -102,7 +102,7 @@ final class StdioClientTransport : ClientTransport
 	}
 
 	/// No-op: there is no OAuth bearer token over stdio.
-	void setBearerProvider(string delegate() @safe provider) @safe
+	void setBearerProvider(BearerProvider provider) @safe
 	{
 	}
 
