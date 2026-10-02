@@ -711,10 +711,16 @@ final class McpServer : ServerCore
 	/// any other instance or after a restart (no cross-instance/restart
 	/// continuity). Binding is a no-op on transports without an authenticated
 	/// identity (stdio / in-process, empty subject).
+	///
+	/// Throws when `sec.ttl` is under one second: blobs carry a whole-second
+	/// expiry, so a shorter ttl would expire every state as it is issued.
 	void secureRequestState(RequestStateSecurity sec) @safe
 	{
+		import core.time : seconds;
 		import vibe.core.log : logWarn;
 
+		if (sec.ttl < 1.seconds)
+			throw new Exception("secureRequestState: ttl must be at least one second");
 		if (sec.key.length == 0)
 		{
 			sec.key = generateEphemeralKey();
@@ -9777,6 +9783,23 @@ unittest  // SEP-2322: a stateless server emits requestState and reads it back o
 	auto retry = s.handle(Message(makeRequest(Json(11), "tools/call", params))).get;
 	assert("inputRequests" !in retry["result"]);
 	assert(retry["result"]["content"][0]["text"].get!string == "resumed:awaiting-date day:friday");
+}
+
+unittest  // secureRequestState rejects a ttl under one second
+{
+	import std.exception : assertThrown, assertNotThrown;
+	import core.time : msecs, seconds;
+
+	RequestStateSecurity sec;
+	sec.key = new ubyte[32];
+	sec.ttl = Duration.zero;
+	assertThrown(new McpServer("t", "1").secureRequestState(sec));
+	sec.ttl = -(1.seconds);
+	assertThrown(new McpServer("t", "1").secureRequestState(sec));
+	sec.ttl = 500.msecs;
+	assertThrown(new McpServer("t", "1").secureRequestState(sec));
+	sec.ttl = 1.seconds;
+	assertNotThrown(new McpServer("t", "1").secureRequestState(sec));
 }
 
 version (unittest) private McpServer secureStatebookServer() @safe
