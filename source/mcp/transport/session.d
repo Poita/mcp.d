@@ -6,12 +6,13 @@ import mcp.protocol.errors : McpException, internalError;
 import mcp.server.connection : ConnectionState;
 
 /// A string-keyed cache of `V` with a per-entry insertion/activity timestamp,
-/// bounded by an idle TTL and a maximum live-entry count. It owns the value map
-/// and the parallel timestamp map together so the "remove from both" invariant
-/// lives in one place, and runs the TTL sweep + LRU cap eviction internally.
+/// bounded by an idle TTL and a maximum live-entry count. It keeps each entry in
+/// a key map and in a least-recently-active list, and runs the TTL sweep + LRU
+/// cap eviction internally.
 ///
 /// A lookup checks only its own key's expiry; the full TTL sweep runs at most
-/// once per quarter-TTL, so per-request cost stays constant as the table grows.
+/// once per quarter-TTL, and cap eviction takes the head of the activity list,
+/// so per-request cost stays constant as the table grows.
 /// Past the cap, entries never marked used (`markUsed`) are evicted before used
 /// ones, so a burst of fresh entries cannot push out the ones in active use.
 ///
@@ -22,9 +23,50 @@ import mcp.server.connection : ConnectionState;
 /// or vibe.d's single-fiber loop).
 struct BoundedExpiringMap(V)
 {
-	private V[string] values;
-	private MonoTime[string] stamps;
-	private bool[string] used;
+	/// One entry, linked into the never-used or the used activity list.
+	private static final class Node
+	{
+		string key;
+		V value;
+		MonoTime stamp;
+		bool used;
+		Node prev, next;
+	}
+
+	/// Entries linked from least- to most-recently active. Stamps come from a
+	/// non-decreasing clock and a restamped entry moves to the tail, so list
+	/// order is stamp order.
+	private static struct Order
+	{
+		Node head, tail;
+
+		void append(Node n) @safe
+		{
+			n.prev = tail;
+			n.next = null;
+			if (tail !is null)
+				tail.next = n;
+			else
+				head = n;
+			tail = n;
+		}
+
+		void unlink(Node n) @safe
+		{
+			if (n.prev !is null)
+				n.prev.next = n.next;
+			else
+				head = n.next;
+			if (n.next !is null)
+				n.next.prev = n.prev;
+			else
+				tail = n.prev;
+			n.prev = n.next = null;
+		}
+	}
+
+	private Node[string] nodes;
+	private Order unusedOrder, usedOrder;
 	private MonoTime lastSweep;
 	private Duration ttl;
 	private size_t maxEntries;
@@ -60,12 +102,22 @@ struct BoundedExpiringMap(V)
 	{
 		const t = now();
 		sweepDue(t);
-		if (maxEntries != 0 && (key in values) is null)
-			while (values.length >= maxEntries)
+		if (auto p = key in nodes)
+		{
+			(*p).value = value;
+			restamp(*p, t);
+			return true;
+		}
+		if (maxEntries != 0)
+			while (nodes.length >= maxEntries)
 				if (!evictOldest())
 					return false;
-		values[key] = value;
-		stamps[key] = t;
+		auto n = new Node;
+		n.key = key;
+		n.value = value;
+		n.stamp = t;
+		nodes[key] = n;
+		unusedOrder.append(n);
 		return true;
 	}
 
@@ -75,12 +127,11 @@ struct BoundedExpiringMap(V)
 	{
 		const t = now();
 		sweepDue(t);
-		if (auto p = live(key, t))
+		if (auto n = live(key, t))
 		{
 			found = true;
-			auto v = *p;
-			drop(key);
-			return v;
+			drop(n);
+			return n.value;
 		}
 		found = false;
 		return V.init;
@@ -94,11 +145,11 @@ struct BoundedExpiringMap(V)
 	{
 		const t = now();
 		sweepDue(t);
-		if (auto p = live(key, t))
+		if (auto n = live(key, t))
 		{
 			if (refresh)
-				stamps[key] = t;
-			return p;
+				restamp(n, t);
+			return &n.value;
 		}
 		return null;
 	}
@@ -115,67 +166,89 @@ struct BoundedExpiringMap(V)
 	/// Record that `key` has been used, so cap eviction prefers other entries.
 	void markUsed(string key) @safe
 	{
-		if ((key in values) !is null)
-			used[key] = true;
+		auto p = key in nodes;
+		if (p is null || (*p).used)
+			return;
+		unusedOrder.unlink(*p);
+		(*p).used = true;
+		usedOrder.append(*p);
 	}
 
-	/// Remove the entry for `key` from both maps. Returns whether it existed.
+	/// Remove the entry for `key`. Returns whether it existed.
 	bool remove(string key) @safe
 	{
-		if ((key in values) is null)
+		auto p = key in nodes;
+		if (p is null)
 			return false;
-		drop(key);
+		drop(*p);
 		return true;
 	}
 
 	/// Number of live entries.
 	size_t length() @safe
 	{
-		return values.length;
+		return nodes.length;
 	}
 
-	private void drop(string key) @safe
+	private void restamp(Node n, MonoTime t) @safe
 	{
-		values.remove(key);
-		stamps.remove(key);
-		used.remove(key);
+		n.stamp = t;
+		if (n.used)
+		{
+			usedOrder.unlink(n);
+			usedOrder.append(n);
+		}
+		else
+		{
+			unusedOrder.unlink(n);
+			unusedOrder.append(n);
+		}
 	}
 
-	/// Drop `key` as expired or evicted and report it to `onEvict`.
-	private void evict(string key) @safe
+	private void drop(Node n) @safe
 	{
-		auto v = values[key];
-		drop(key);
+		nodes.remove(n.key);
+		if (n.used)
+			usedOrder.unlink(n);
+		else
+			unusedOrder.unlink(n);
+	}
+
+	/// Drop `n` as expired or evicted and report it to `onEvict`.
+	private void evict(Node n) @safe
+	{
+		drop(n);
 		if (onEvict !is null)
-			onEvict(key, v);
+			onEvict(n.key, n.value);
 	}
 
-	/// The value for `key` if present and within its TTL; an expired entry is
+	/// The entry for `key` if present and within its TTL; an expired entry is
 	/// dropped.
-	private V* live(string key, MonoTime t) @safe
+	private Node live(string key, MonoTime t) @safe
 	{
-		auto p = key in values;
+		auto p = key in nodes;
 		if (p is null)
 			return null;
-		if (expired(key, t))
+		auto n = *p;
+		if (expired(n, t))
 		{
-			evict(key);
+			evict(n);
 			return null;
 		}
-		return p;
+		return n;
 	}
 
-	/// Whether `key` is past its idle TTL. A busy entry is restamped instead.
-	private bool expired(string key, MonoTime t) @safe
+	/// Whether `n` is past its idle TTL. A busy entry is restamped instead.
+	private bool expired(Node n, MonoTime t) @safe
 	{
 		if (ttl <= Duration.zero)
 			return false;
-		if (busy !is null && busy(values[key]))
+		if (busy !is null && busy(n.value))
 		{
-			stamps[key] = t;
+			restamp(n, t);
 			return false;
 		}
-		return t - stamps[key] >= ttl;
+		return t - n.stamp >= ttl;
 	}
 
 	private void sweepDue(MonoTime t) @safe
@@ -188,22 +261,22 @@ struct BoundedExpiringMap(V)
 
 	private void sweep(MonoTime t) @safe
 	{
-		if (ttl <= Duration.zero || values.length == 0)
+		if (ttl <= Duration.zero || nodes.length == 0)
 			return;
-		string[] stale;
-		foreach (k; stamps.keys)
-			if (expired(k, t))
-				stale ~= k;
-		foreach (k; stale)
-			evict(k);
+		Node[] stale;
+		foreach (n; nodes.values)
+			if (expired(n, t))
+				stale ~= n;
+		foreach (n; stale)
+			evict(n);
 	}
 
 	/// Number of live entries for which `pred` holds.
 	size_t count(scope bool delegate(ref V value) @safe pred) @safe
 	{
 		size_t n;
-		foreach (ref v; values)
-			if (pred(v))
+		foreach (node; nodes)
+			if (pred(node.value))
 				n++;
 		return n;
 	}
@@ -212,33 +285,41 @@ struct BoundedExpiringMap(V)
 	/// least-recently-active entry when every entry has been used, among the
 	/// entries `among` accepts (every entry when null). A busy entry is never
 	/// evicted. Returns false when there was no candidate.
+	///
+	/// Each list is walked from its oldest entry, skipping only busy or
+	/// filtered-out entries, so with no filter and no busy entries this is O(1).
 	bool evictOldest(scope bool delegate(ref V value) @safe among = null) @safe
 	{
-		string oldest, oldestUnused;
-		MonoTime oldestTs, oldestUnusedTs;
-		bool found, foundUnused;
-		foreach (k, ts; stamps)
-		{
-			if ((among !is null && !among(values[k])) || (busy !is null && busy(values[k])))
-				continue;
-			if (!found || ts < oldestTs)
-			{
-				oldest = k;
-				oldestTs = ts;
-				found = true;
-			}
-			if ((k in used) is null && (!foundUnused || ts < oldestUnusedTs))
-			{
-				oldestUnused = k;
-				oldestUnusedTs = ts;
-				foundUnused = true;
-			}
-		}
-		if (!found)
-			return false;
-		evict(foundUnused ? oldestUnused : oldest);
-		return true;
+		foreach (head; [unusedOrder.head, usedOrder.head])
+			for (auto n = head; n !is null; n = n.next)
+				if ((among is null || among(n.value)) && (busy is null || !busy(n.value)))
+				{
+					evict(n);
+					return true;
+				}
+		return false;
 	}
+}
+
+unittest  // BoundedExpiringMap at its cap evicts in insertion order across many puts
+{
+	auto m = BoundedExpiringMap!int(Duration.zero, 3, null);
+	foreach (i; 0 .. 10)
+		m.put([cast(char)('a' + i)], i);
+	assert(m.length == 3);
+	assert(m.contains("h") && m.contains("i") && m.contains("j"));
+}
+
+unittest  // BoundedExpiringMap re-putting a key refreshes its eviction position
+{
+	auto m = BoundedExpiringMap!int(Duration.zero, 2, null);
+	m.put("a", 1);
+	m.put("b", 2);
+	m.put("a", 3);
+	m.put("c", 4);
+	assert(!m.contains("b"));
+	bool found;
+	assert(m.take("a", found) == 3 && found);
 }
 
 unittest  // BoundedExpiringMap put/take round-trips and consumes the entry
