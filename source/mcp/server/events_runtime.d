@@ -345,6 +345,7 @@ struct EventsOptions
 	Duration defaultPollInterval = 30.seconds; /// seeds `nextPollMs` when a type sets none
 	Duration pollLeaseTtl = 5.minutes; /// poll subscription lease window (drives on_unsubscribe)
 	int pollMaxLeasesPerPrincipal = 1000; /// cap on distinct live poll subscriptions one principal may hold (0 = unlimited)
+	int pollMaxAnonymousLeases = 10_000; /// cap on distinct live poll subscriptions all unauthenticated callers hold together (0 = unlimited)
 	Duration webhookTtlCap = 30.minutes; /// max granted webhook TTL (clamps suggestions down)
 	Duration webhookMinTtl = 1.minutes; /// min granted webhook TTL (clamps tiny suggestions up)
 	bool allowNoExpiry; /// permit `ttlMs:null` no-expiry grants (requires a durable store)
@@ -2716,11 +2717,19 @@ final class EventsRuntime
 		const subId = pollSubscriptionId(name, arguments, principal);
 		// Each distinct (name, arguments) a principal polls holds a lease and may
 		// provision an upstream via on_subscribe, so the number it may hold at once
-		// is capped. A renewal reuses its slot and is never rejected.
-		const cap = opts_.pollMaxLeasesPerPrincipal;
-		if (fresh && cap > 0 && pollLeaseCount_.get(principal, 0) >= cap)
-			throw resourceExhausted("Too many poll subscriptions for this principal",
-					"pollSubscriptions", cap);
+		// is capped. A renewal reuses its slot and is never rejected. Unauthenticated
+		// callers are indistinguishable from one another (a stateless poll carries
+		// no connection identity), so they share one bucket under its own cap
+		// rather than all counting as a single principal.
+		if (fresh)
+		{
+			const anonymous = principal.length == 0;
+			const cap = anonymous ? opts_.pollMaxAnonymousLeases : opts_.pollMaxLeasesPerPrincipal;
+			if (cap > 0 && pollLeaseCount_.get(principal, 0) >= cap)
+				throw resourceExhausted(anonymous ? "Too many unauthenticated poll subscriptions"
+						: "Too many poll subscriptions for this principal", anonymous
+						? "anonymousPollSubscriptions" : "pollSubscriptions", cap);
+		}
 		// on_subscribe runs before the lease is recorded, so a throwing hook is
 		// retried by the next poll rather than never firing again.
 		if (fresh)
@@ -4014,6 +4023,34 @@ unittest  // poll leases are capped per principal with resourceExhausted
 	now += 10 * 60 * 1000;
 	rt.sweepPollLeases(); // expired leases free their slots
 	assertNotThrown!McpException(poll(3, "user-1"));
+}
+
+unittest  // unauthenticated poll leases share their own cap, not one principal's budget
+{
+	import std.exception : assertNotThrown, collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.pollMaxLeasesPerPrincipal = 1;
+	o.pollMaxAnonymousLeases = 3;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c");
+	rt.register(reg);
+	PollResult poll(int i, string principal) @safe
+	{
+		return rt.poll("n", Json(["i": Json(i)]), principal,
+				Nullable!string.init, Nullable!long.init, Nullable!long.init);
+	}
+
+	foreach (i; 0 .. 3)
+		assertNotThrown!McpException(poll(i, ""));
+	auto e = collectException!McpException(poll(3, ""));
+	assert(e !is null && e.code == ErrorCode.resourceExhausted);
+	assertNotThrown!McpException(poll(0, "user-1")); // principals keep their own budget
 }
 
 unittest  // lifecycle is refcounted across modes: fires once per (principal,name,args)
