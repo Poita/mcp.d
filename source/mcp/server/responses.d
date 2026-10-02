@@ -25,13 +25,14 @@ alias MrtrToolHandler = ToolResponse delegate(Json arguments, RequestContext ctx
 
 /// The MRTR (input-required) machinery shared by `ToolResponse` and
 /// `PromptResponse`: the `needsInput_`/`required_` state, the
-/// `needsInput`/`inputRequests`/`requestState` accessors, the two non-typed
-/// `inputRequired` factories, and `withInputRequests`/`toJson`. Both response
-/// types carry an `InputRequiredResult required_` plus a `result_` final result
-/// of their respective type; `toJson` switches on `needsInput_`. The mixin keeps
-/// these in lockstep so MRTR edits land on both. The genuine divergences —
-/// `ToolResponse`'s task outcome and typed
-/// `complete(T)`/`inputRequired(T)` helpers — stay per-struct.
+/// `needsInput`/`inputRequests`/`requestState` accessors, the `inputRequired`
+/// factories (verbatim and typed `requestState`), and
+/// `withInputRequests`/`toJson`. Both response types carry an
+/// `InputRequiredResult required_` plus a `result_` final result of their
+/// respective type; `toJson` switches on `needsInput_`. The mixin keeps these in
+/// lockstep so MRTR edits land on both. The genuine divergences —
+/// `ToolResponse`'s task outcome and typed `complete(T)` helper — stay
+/// per-struct.
 mixin template InputRequiredPart()
 {
 	private bool needsInput_;
@@ -58,6 +59,20 @@ mixin template InputRequiredPart()
 		r.required_.inputRequests = requests;
 		r.required_.requestState = requestState;
 		return r;
+	}
+
+	/// As `inputRequired`, but encodes a typed `state` as the opaque
+	/// `requestState`. Serialises `state` to JSON and stores its string form.
+	/// ENCODING CONTRACT: the stored value is `serializeToJson(state).toString()`,
+	/// which `RequestContext.requestStateAs!T()` decodes via
+	/// `deserializeJson!T(parseJsonString(state))`. Constrained off `string` so it
+	/// does not collide with the verbatim-string overload above.
+	static typeof(this) inputRequired(T)(InputRequest[] requests, T state) @safe
+			if (!is(T : string))
+	{
+		import vibe.data.json : serializeToJson;
+
+		return inputRequired(requests, serializeToJson(state).toString());
 	}
 
 	/// Whether this outcome asks the client for more input.
@@ -104,11 +119,7 @@ struct ToolResponse
 {
 	private CallToolResult result_;
 
-	mixin InputRequiredPart ireq;
-	// Merge the mixed-in non-typed `inputRequired` factories into the same
-	// overload set as the typed `inputRequired(T)` declared below; without this
-	// the local template would hide the mixin's overloads.
-	alias inputRequired = ireq.inputRequired;
+	mixin InputRequiredPart;
 
 	/// The handler is done; `r` is the final result. A `CallToolResult` carrying
 	/// a task handle or MRTR `inputRequests`/`requestState` is classified as
@@ -132,20 +143,6 @@ struct ToolResponse
 	static ToolResponse complete(T)(T value) @safe if (!is(T : CallToolResult))
 	{
 		return ToolResponse.complete(CallToolResult.structured(value));
-	}
-
-	/// As `inputRequired`, but encodes a typed `state` as the opaque
-	/// `requestState`. Serialises `state` to JSON and stores its string form.
-	/// ENCODING CONTRACT: the stored value is `serializeToJson(state).toString()`,
-	/// which `RequestContext.requestStateAs!T()` decodes via
-	/// `deserializeJson!T(parseJsonString(state))`. Constrained off `string` so it
-	/// does not collide with the verbatim-string overload above.
-	static ToolResponse inputRequired(T)(InputRequest[] requests, T state) @safe
-			if (!is(T : string))
-	{
-		import vibe.data.json : serializeToJson;
-
-		return ToolResponse.inputRequired(requests, serializeToJson(state).toString());
 	}
 
 	/// The handler created an asynchronous task: `j` is the `CreateTaskResult`
@@ -259,6 +256,26 @@ unittest  // PromptResponse.forVersion rejects an input-required result on a non
 	]);
 	assertThrown!McpException(pr.forVersion(ProtocolVersion.v2025_11_25));
 	assertNotThrown(pr.forVersion(ProtocolVersion.v2026_07_28));
+}
+
+unittest  // PromptResponse.inputRequired(T) encodes a typed requestState like ToolResponse's
+{
+	import vibe.data.json : parseJsonString;
+
+	static struct Step
+	{
+		int round;
+		string topic;
+	}
+
+	auto reqs = [InputRequest("q1", "elicitation", Json.emptyObject)];
+	auto pr = PromptResponse.inputRequired(reqs, Step(2, "d"));
+	assert(pr.needsInput);
+	auto state = parseJsonString(pr.requestState);
+	assert(state["round"].get!int == 2);
+	assert(state["topic"].get!string == "d");
+	assert(pr.requestState == ToolResponse.inputRequired(reqs, Step(2, "d")).requestState);
+	assert(PromptResponse.inputRequired(reqs, "raw").requestState == "raw");
 }
 
 unittest  // ToolResponse.complete(T) wraps a non-struct value under `result`
