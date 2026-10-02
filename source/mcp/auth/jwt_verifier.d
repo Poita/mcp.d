@@ -1496,7 +1496,7 @@ unittest  // JwksCache refuses to fetch from an insecure (plaintext http) JWKS U
 	assert(cache.keysFor("any-kid").length == 0);
 }
 
-unittest  // a JWKS on a non-loopback internal address loads only under a policy that permits it
+version (Posix) unittest  // a JWKS on a non-loopback internal address loads only under a policy that permits it
 {
 	import std.conv : to;
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
@@ -1522,7 +1522,7 @@ unittest  // a JWKS on a non-loopback internal address loads only under a policy
 			scope (exit)
 				() @trusted { listener.stopListening(); }();
 			// 0.0.0.0 is an internal, non-loopback address that still reaches
-			// this host's listener.
+			// this host's listener on POSIX (Windows refuses to connect to it).
 			const uri = "http://0.0.0.0:" ~ listener.bindAddresses[0].port.to!string ~ "/jwks";
 			defaultKeys = new JwksCache(uri, 300.seconds).keysFor("rsa-1").length;
 			permittedKeys = new JwksCache(uri, 300.seconds, SsrfPolicy.allowUserConfigured).keysFor(

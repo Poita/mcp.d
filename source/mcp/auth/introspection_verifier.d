@@ -692,7 +692,7 @@ unittest  // HttpIntrospector refuses an insecure (plaintext http) introspection
 	assertThrown(introspector.introspect("some-token"));
 }
 
-unittest  // an introspection endpoint on a non-loopback internal address is reached only when permitted
+version (Posix) unittest  // an introspection endpoint on a non-loopback internal address is reached only when permitted
 {
 	import std.conv : to;
 	import std.exception : assertThrown;
@@ -715,7 +715,7 @@ unittest  // an introspection endpoint on a non-loopback internal address is rea
 			scope (exit)
 				() @trusted { listener.stopListening(); }();
 			// 0.0.0.0 is an internal, non-loopback address that still reaches
-			// this host's listener.
+			// this host's listener on POSIX (Windows refuses to connect to it).
 			IntrospectionConfig cfg;
 			cfg.introspectionEndpoint = "http://0.0.0.0:"
 				~ listener.bindAddresses[0].port.to!string ~ "/introspect";
