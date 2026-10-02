@@ -1,9 +1,9 @@
 module mcp.server.task_runtime;
 
-import core.time : Duration, minutes, seconds, msecs;
+import core.time : Duration, hours, minutes, seconds, msecs;
 import std.datetime.systime : SysTime;
 import std.typecons : Nullable, nullable;
-import vibe.data.json : Json;
+import vibe.data.json : Json, serializeToJson;
 
 import mcp.internal.background_loop : BackgroundLoop;
 import mcp.internal.clock : systemNowIso;
@@ -23,7 +23,11 @@ enum Duration unlimitedTaskTtl = Duration.max;
 /// `defaultTaskIdGenerator`). `defaultTtl` / `defaultPollInterval` seed a task's
 /// TTL / suggested poll cadence when a creator does not specify them. A task's
 /// TTL is how long its record is kept once it settles (`unlimitedTaskTtl` keeps
-/// it forever); a task that is still working or awaiting input never expires.
+/// it forever); a task that is still working or awaiting input does not expire
+/// by TTL. `maxUnsettledAge` bounds that instead: a task still unsettled that
+/// long after `createdAt` (its executor hung or its node vanished) is failed —
+/// or cancelled, when a cancel was requested — and then expires by its TTL like
+/// any settled task; zero disables the bound.
 /// `sweepInterval` is how often `enableTasks`'s background sweep removes expired
 /// tasks (zero disables it; expired tasks are still hidden on access). `nowIso` is an
 /// injectable clock returning an ISO-8601 timestamp; null uses the system clock.
@@ -33,6 +37,7 @@ struct TaskOptions
 	Duration defaultTtl = 10.minutes;
 	Duration defaultPollInterval = 5.seconds;
 	Duration sweepInterval = 30.seconds;
+	Duration maxUnsettledAge = 24.hours;
 	string delegate() @safe nowIso;
 }
 
@@ -169,16 +174,57 @@ final class TaskRuntime
 	}
 
 	/// The stored record for `id`, or null when unknown or expired. An expired
-	/// record is removed on sight, so expiry holds between sweeps.
+	/// record is removed on sight, and one unsettled past `maxUnsettledAge` is
+	/// settled on sight, so both hold between sweeps.
 	private Nullable!TaskRecord fetch(string id) @safe
 	{
 		auto r = store_.get(id);
-		if (!r.isNull && isExpired(r.get, currentTime()))
+		if (r.isNull)
+			return r;
+		const now = currentTime();
+		if (isExpired(r.get, now))
 		{
 			store_.remove(id);
 			return Nullable!TaskRecord.init;
 		}
+		if (isOverdue(r.get, now))
+			return settleOverdue(r.get);
 		return r;
+	}
+
+	/// Whether `r` is still unsettled `maxUnsettledAge` after it was created.
+	private bool isOverdue(const TaskRecord r, SysTime now) @safe
+	{
+		if (opts_.maxUnsettledAge <= Duration.zero || isTerminal(r.meta.status))
+			return false;
+		try
+			return now >= SysTime.fromISOExtString(r.meta.createdAt) + opts_.maxUnsettledAge;
+		catch (Exception)
+			return false;
+	}
+
+	/// Settle an overdue task: `cancelled` when a cancel was requested (its
+	/// executor never honored it), `failed` otherwise. The cancel flag is set so
+	/// an executor still running stops. Written by compare-and-swap, so a
+	/// transition that lands first wins and the next access re-evaluates.
+	/// Returns the record as it now stands.
+	private Nullable!TaskRecord settleOverdue(TaskRecord r) @safe
+	{
+		const expected = r.revision;
+		if (r.cancelRequested)
+			transition(r, TaskStatus.cancelled);
+		else
+		{
+			transition(r, TaskStatus.failed);
+			r.error = nullable(toErrorJson(internalError(
+					"Task did not settle within the server's maximum unsettled age")));
+		}
+		r.cancelRequested = true;
+		r.inputRequests = Json.emptyObject;
+		r.meta.lastUpdatedAt = opts_.nowIso();
+		if (store_.compareAndSwap(r, expected))
+			notifyStatusChange(r);
+		return store_.get(r.meta.taskId);
 	}
 
 	/// The injected clock as a `SysTime`, falling back to the system clock when
@@ -208,12 +254,23 @@ final class TaskRuntime
 			return false;
 	}
 
-	/// Remove every expired task from the store, returning how many were removed.
-	/// `enableTasks` runs this every `TaskOptions.sweepInterval`.
+	/// Remove every expired task from the store, returning how many were removed,
+	/// and settle every task unsettled past `maxUnsettledAge`. `enableTasks` runs
+	/// this every `TaskOptions.sweepInterval`.
 	size_t sweepExpired() @safe
 	{
 		const now = currentTime();
-		return store_.removeIf((const TaskRecord r) @safe => isExpired(r, now));
+		// The store offers no enumeration, so the removal pass also collects the
+		// overdue tasks; they are settled afterwards, outside the store's scan.
+		string[] overdue;
+		const removed = store_.removeIf((const TaskRecord r) @safe {
+			if (isOverdue(r, now))
+				overdue ~= r.meta.taskId;
+			return isExpired(r, now);
+		});
+		foreach (id; overdue)
+			fetch(id);
+		return removed;
 	}
 
 	/// Run `sweepExpired` every `interval` in a background fiber until
@@ -482,10 +539,11 @@ final class TaskRuntime
 		return r.isNull || r.get.cancelRequested;
 	}
 
-	/// Record `tasks/update` input responses for a task. Unknown/satisfied keys
-	/// are accepted silently (the runtime keeps the latest value per key). Throws
-	/// `-32602` when `inputResponses` is not an object, when the task is unknown,
-	/// or when it is already terminal (no executor will ever read the answers).
+	/// Record `tasks/update` input responses for a task, keeping the latest value
+	/// per key. Throws `-32602` when `inputResponses` is not an object, when the
+	/// task is unknown, when it is already terminal (no executor will ever read
+	/// the answers), or when any key is not among the task's current
+	/// `inputRequests` (nothing is recorded then; `data.keys` lists them).
 	void deliverInput(string id, Json inputResponses) @safe
 	{
 		import mcp.protocol.errors : invalidParams;
@@ -500,6 +558,22 @@ final class TaskRuntime
 				data["taskId"] = id;
 				throw new McpException(ErrorCode.invalidParams,
 					"Task is already " ~ taskStatusToWire(r.meta.status), data);
+			}
+			// Only answers to the current requests are kept, so a client cannot
+			// grow the stored record with keys no executor will read.
+			string[] unrequested;
+			foreach (string k, v; inputResponses)
+				if (r.inputRequests.type != Json.Type.object || k !in r.inputRequests)
+					unrequested ~= k;
+			if (unrequested.length)
+			{
+				import std.array : join;
+
+				Json data = Json.emptyObject;
+				data["taskId"] = id;
+				data["keys"] = serializeToJson(unrequested);
+				throw new McpException(ErrorCode.invalidParams,
+					"Task has not requested input for: " ~ unrequested.join(", "), data);
 			}
 			foreach (string k, v; inputResponses)
 				r.inputResponses[k] = v;
@@ -980,6 +1054,106 @@ unittest  // a defaultTtl of unlimitedTaskTtl makes tasks unlimited unless a ttl
 	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
 	assert(rt.create().ttlMs.isNull);
 	assert(rt.create(nullable(1_000.msecs)).ttlMs.get == 1_000);
+}
+
+unittest  // a task unsettled past maxUnsettledAge fails, stops its executor, then expires by ttl
+{
+	import std.exception : collectException;
+
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	o.maxUnsettledAge = 1.hours;
+	auto store = new InMemoryTaskStore();
+	auto rt = new TaskRuntime(store, o);
+	string[] seen;
+	rt.onStatusChange((Json d, string owner) @safe {
+		seen ~= d["status"].get!string;
+	});
+	auto t = rt.createFor("slow", Json.undefined, nullable(10_000.msecs));
+	now = "2026-06-07T10:59:59Z";
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
+	now = "2026-06-07T11:00:00Z";
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "failed");
+	assert(d["error"]["code"].get!int == cast(int) ErrorCode.internalError);
+	assert(rt.cancelRequested(t.taskId), "the executor is told to stop");
+	assert(seen == ["failed"]);
+	now = "2026-06-07T11:00:10Z";
+	auto ex = cast(McpException) collectException(rt.getDetailed(t.taskId));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // the sweep fails a task unsettled past maxUnsettledAge
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	o.maxUnsettledAge = 1.hours;
+	auto store = new InMemoryTaskStore();
+	auto rt = new TaskRuntime(store, o);
+	auto t = rt.createFor("slow", Json.undefined);
+	rt.requireInput(t.taskId, Json([
+			"k": Json(["method": Json("elicitation/create")])
+	]));
+	now = "2026-06-07T11:00:00Z";
+	assert(rt.sweepExpired() == 0);
+	assert(store.get(t.taskId).get.meta.status == TaskStatus.failed);
+}
+
+unittest  // a task whose cancel never settled is cancelled, not failed, at maxUnsettledAge
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	o.maxUnsettledAge = 1.hours;
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	auto t = rt.createFor("slow", Json.undefined);
+	rt.cancel(t.taskId);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
+	now = "2026-06-07T11:00:00Z";
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
+}
+
+unittest  // a zero maxUnsettledAge never fails an unsettled task
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	o.maxUnsettledAge = Duration.zero;
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	auto t = rt.createFor("slow", Json.undefined);
+	now = "2027-06-07T10:00:00Z";
+	assert(rt.sweepExpired() == 0);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
+}
+
+unittest  // the default maxUnsettledAge bounds an unsettled task to a day
+{
+	TaskOptions o;
+	assert(o.maxUnsettledAge == 24.hours);
+}
+
+unittest  // deliverInput rejects a key the task has not requested and records nothing
+{
+	import std.exception : collectException;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	auto none = cast(McpException) collectException(rt.deliverInput(t.taskId, Json([
+				"a": Json(1)
+	])));
+	assert(none !is null && none.code == ErrorCode.invalidParams);
+	rt.requireInput(t.taskId, Json([
+			"a": Json(["method": Json("elicitation/create")])
+	]));
+	auto ex = cast(McpException) collectException(rt.deliverInput(t.taskId,
+			Json(["a": Json(1), "junk": Json(2)])));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	assert(ex.data["taskId"].get!string == t.taskId);
+	assert(rt.takenInput(t.taskId).length == 0);
+	rt.deliverInput(t.taskId, Json(["a": Json(1)]));
+	assert(rt.takenInput(t.taskId)["a"].get!int == 1);
 }
 
 unittest  // progress, requireInput, and resumeWorking leave a terminal task untouched

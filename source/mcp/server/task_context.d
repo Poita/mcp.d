@@ -620,7 +620,11 @@ unittest  // re-requesting one key keeps the answers to other keys from earlier 
 
 	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
 	auto t = rt.createFor("two", Json.undefined);
+	rt.requireInput(t.taskId, Json([
+			"a": Json(["method": Json("elicitation/create")])
+	]));
 	rt.deliverInput(t.taskId, Json(["a": Json(1)]));
+	rt.resumeWorking(t.taskId);
 	rt.requireInput(t.taskId, Json([
 			"b": Json(["method": Json("elicitation/create")])
 	]));
