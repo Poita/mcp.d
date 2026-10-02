@@ -431,6 +431,10 @@ struct BrokeredToken
 {
 	string token; /// the opaque MCP bearer the proxy returns to the client
 	IssuedToken issued; /// the stored principal the token resolves to
+	/// Seconds until `token` expires, measured by the token store's clock, for
+	/// the token response's `expires_in`. 0 when the token never expires
+	/// (`expiresAt == long.max`) or is already dead.
+	long expiresIn;
 }
 
 /// The `TokenInfo.claims` key under which the proxy stashes the upstream access
@@ -1223,7 +1227,10 @@ final class OAuthProxy
 			claims[upstreamRefreshTokenClaim] = upstream.refreshToken;
 		issued.claims = claims;
 		const token = cfg.tokenStore.issue(issued);
-		return BrokeredToken(token, issued);
+		const now = cfg.tokenStore.now();
+		const expiresIn = issued.expiresAt == long.max || issued.expiresAt <= now
+			? 0 : issued.expiresAt - now;
+		return BrokeredToken(token, issued, expiresIn);
 	}
 
 	/// A `TokenValidator` for the MCP bearer token clients present: in broker

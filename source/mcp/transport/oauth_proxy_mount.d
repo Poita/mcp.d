@@ -816,7 +816,7 @@ in (exchange !is null)
 			const brokered = proxy.issueClientToken(upstream);
 			res.statusCode = HTTPStatus.ok;
 			res.writeJsonBody(brokerTokenResponseJson(brokered.token,
-				upstream.expiresIn, upstream.scope_));
+				brokered.expiresIn, upstream.scope_));
 			return;
 		}
 
@@ -2296,6 +2296,11 @@ version (unittest)
 	// call is made: the injected exchange returns a fixed upstream token body.
 	private OAuthProxy brokerMountProxy(ReferenceTokenStore store) @safe
 	{
+		return new OAuthProxy(brokerMountConfig(store));
+	}
+
+	private OAuthProxyConfig brokerMountConfig(ReferenceTokenStore store) @safe
+	{
 		OAuthProxyConfig cfg;
 		cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
 		cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
@@ -2312,7 +2317,7 @@ version (unittest)
 			t.expiresAt = long.max;
 			return t;
 		};
-		return new OAuthProxy(cfg);
+		return cfg;
 	}
 
 	/// Record a relayed code "C" for the verifier "V" and return a `/token` form
@@ -2568,6 +2573,50 @@ unittest  // BROKER MOUNT: a 200 upstream response carrying an OAuth error mints
 	assert(res.status == 400);
 	assert(res.body_.canFind("bad_verification_code"));
 	assert(!res.body_.canFind("access_token"));
+}
+
+unittest  // BROKER MOUNT: expires_in reflects the minted token's lifetime, not the upstream token's
+{
+	import mcp.auth.reference_token : ReferenceTokenStoreOptions;
+	import vibe.data.json : parseJsonString;
+
+	ReferenceTokenStoreOptions o;
+	o.clock = () @safe => 1_700_000_000L;
+	auto store = new ReferenceTokenStore(o);
+	auto cfg = brokerMountConfig(store);
+	cfg.issueToken = (TokenSet upstream) @safe {
+		IssuedToken t;
+		t.subject = "octocat";
+		t.expiresAt = 1_700_000_600;
+		return t;
+	};
+	auto proxy = new OAuthProxy(cfg);
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(
+				`{"access_token":"gho_upstream","token_type":"bearer","expires_in":28800}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 200);
+	assert(parseJsonString(res.body_)["expires_in"].get!long == 600);
+}
+
+unittest  // BROKER MOUNT: a non-expiring minted token carries no expires_in
+{
+	import vibe.data.json : parseJsonString;
+
+	auto store = new ReferenceTokenStore();
+	auto proxy = brokerMountProxy(store); // mints expiresAt = long.max
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(
+				`{"access_token":"gho_upstream","token_type":"bearer","expires_in":28800}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 200);
+	assert("expires_in" !in parseJsonString(res.body_));
 }
 
 unittest  // BROKER MOUNT: a 200 upstream response with no access_token mints no token

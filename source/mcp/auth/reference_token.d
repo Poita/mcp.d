@@ -113,7 +113,9 @@ final class ReferenceTokenStore
 		return tokens.length;
 	}
 
-	private long now() @safe
+	/// The store's current Unix time in seconds: its injected clock, else the
+	/// system clock.
+	long now() @safe
 	{
 		return opts.clock !is null ? opts.clock() : nowUnixSeconds();
 	}
