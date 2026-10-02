@@ -89,10 +89,9 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 				static foreach (attr; __traits(getAttributes, overload))
 				{
 					static if (is(attr))
-						static assert(!isHandlerUda!attr,
-								"@" ~ attr.stringof ~ " on '" ~ memberName
-								~ "' is missing its argument list (e.g. @" ~ attr.stringof
-								~ "(\"name\", \"description\")); a bare @" ~ attr.stringof
+						static assert(!isHandlerUda!attr, "@" ~ attr.stringof ~ " on '"
+								~ memberName ~ "' is missing its argument list (e.g. "
+								~ handlerUdaExample!attr ~ "); a bare @" ~ attr.stringof
 								~ " attaches the type, not a value, and registers nothing");
 					else static if (is(typeof(attr) == tool))
 					{
@@ -156,6 +155,22 @@ private void checkHandlerSafety(string memberName, alias f)()
 private enum isHandlerUda(A) = is(A == tool) || is(A == task) || is(A == event)
 	|| is(A == prompt) || is(A == resource) || is(A == resourceTemplate)
 	|| is(A == skill) || is(A == skillDir);
+
+/// An applied form of the handler UDA `A` with placeholder arguments, shown when
+/// `A` is attached bare.
+private template handlerUdaExample(A)
+{
+	static if (is(A == resource))
+		enum handlerUdaExample = `@resource("uri", "name")`;
+	else static if (is(A == resourceTemplate))
+		enum handlerUdaExample = `@resourceTemplate("uriTemplate", "name")`;
+	else static if (is(A == skill))
+		enum handlerUdaExample = `@skill("path", "description")`;
+	else static if (is(A == skillDir))
+		enum handlerUdaExample = `@skillDir("path") or @skillDir()`;
+	else
+		enum handlerUdaExample = "@" ~ A.stringof ~ `("name", "description")`;
+}
 
 /// Convenience variadic form of `registerModule`: register the annotated free
 /// functions of several modules in one call.
@@ -1923,6 +1938,16 @@ unittest  // @resourceTemplate parameters may bind any operator-prefixed or modi
 {
 	auto s = new McpServer("t", "1");
 	assert(__traits(compiles, registerHandlers(s, new OperatorTemplateApi)));
+}
+
+unittest  // the bare-UDA diagnostic shows each handler UDA's own argument list
+{
+	static assert(handlerUdaExample!tool == `@tool("name", "description")`);
+	static assert(handlerUdaExample!prompt == `@prompt("name", "description")`);
+	static assert(handlerUdaExample!resource == `@resource("uri", "name")`);
+	static assert(handlerUdaExample!resourceTemplate == `@resourceTemplate("uriTemplate", "name")`);
+	static assert(handlerUdaExample!skill == `@skill("path", "description")`);
+	static assert(handlerUdaExample!skillDir == `@skillDir("path") or @skillDir()`);
 }
 
 unittest  // a bare @tool (without its argument list) is rejected at compile time
