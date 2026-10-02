@@ -2942,7 +2942,7 @@ final class McpServer : ServerCore
 	{
 		DiscoverResult d;
 		foreach (v; servedVersions)
-			d.protocolVersions ~= v.toWire;
+			d.supportedVersions ~= v.toWire;
 		d.capabilities = capabilities().forVersion(ProtocolVersion.v2026_07_28);
 		// Identity is stamped into `_meta` by the dispatch path, along with every
 		// other modern result.

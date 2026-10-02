@@ -1101,7 +1101,7 @@ final class McpClient : ClientProtocol
 			disc = discoverProbe();
 			haveDisc = true;
 			discoverResult_ = disc;
-			serverVersions = disc.protocolVersions;
+			serverVersions = disc.supportedVersions;
 		}
 		catch (HttpStatusException e)
 		{
@@ -1197,7 +1197,7 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Connect using a `server/discover` result obtained earlier, performing the
-	/// same version selection as `connect()` over `prior.protocolVersions` but
+	/// same version selection as `connect()` over `prior.supportedVersions` but
 	/// WITHOUT any network probe. This is the zero-round-trip reconnect: a caller
 	/// that persisted a previous session's `discoverResult()` (it round-trips via
 	/// `DiscoverResult.toJson`/`fromJson`) can rehydrate it and reconnect without
@@ -1209,14 +1209,14 @@ final class McpClient : ClientProtocol
 	/// framing is cleared and a single `initialize(chosen.toWire)` handshake runs
 	/// (one round trip), because a stable session still requires the handshake.
 	/// Throws `McpException(unsupportedProtocolVersion)` when there is no mutually
-	/// supported version in `prior.protocolVersions`. Records `prior` as the
+	/// supported version in `prior.supportedVersions`. Records `prior` as the
 	/// client's `discoverResult()`.
 	ProtocolVersion connect(DiscoverResult prior) @safe
 	{
 		discoverResult_ = prior;
 
 		ProtocolVersion chosen;
-		if (!selectMutualVersion(prior.protocolVersions, chosen))
+		if (!selectMutualVersion(prior.supportedVersions, chosen))
 			throw new McpException(ErrorCode.unsupportedProtocolVersion,
 					"No mutually supported protocol version");
 
@@ -9118,7 +9118,7 @@ version (unittest)
 	private DiscoverResult fixtureDiscover(string[] versions) @safe
 	{
 		DiscoverResult d;
-		d.protocolVersions = versions;
+		d.supportedVersions = versions;
 		d.serverInfo = Implementation("cached-srv", "3.1");
 		d.instructions = "from cache";
 		return d;
@@ -9146,7 +9146,7 @@ unittest  // connect(DiscoverResult) adopts a modern session with zero round tri
 	assert(!c.serverInstructions().isNull && c.serverInstructions().get == "from cache");
 	// The adopted result is exposed via discoverResult().
 	assert(!c.discoverResult().isNull);
-	assert(c.discoverResult().get.protocolVersions == [
+	assert(c.discoverResult().get.supportedVersions == [
 		ProtocolVersion.v2026_07_28.toWire
 	]);
 }

@@ -113,7 +113,7 @@ unittest  // RequestMeta.fromParams records whether clientCapabilities was prese
 /// and identity so a client can select a version up front (stateless lifecycle).
 struct DiscoverResult
 {
-	string[] protocolVersions;
+	string[] supportedVersions;
 	ServerCapabilities capabilities;
 	/// Server identity. Serialised into `_meta` under
 	/// `io.modelcontextprotocol/serverInfo` (the schema has no top-level
@@ -133,10 +133,8 @@ struct DiscoverResult
 		// result; a complete discover response uses "complete".
 		j["resultType"] = "complete";
 		Json pv = Json.emptyArray;
-		foreach (v; protocolVersions)
+		foreach (v; supportedVersions)
 			pv ~= Json(v);
-		// Spec wire field name is `supportedVersions` (2026-07-28 server/discover
-		// Response Fields table), even though the D member is `protocolVersions`.
 		j["supportedVersions"] = pv;
 		j["capabilities"] = capabilities.toJson();
 		if (serverInfo.name.length || serverInfo.version_.length)
@@ -161,7 +159,7 @@ struct DiscoverResult
 			auto arr = j["supportedVersions"];
 			foreach (i; 0 .. arr.length)
 				if (arr[i].type == Json.Type.string)
-					r.protocolVersions ~= arr[i].get!string;
+					r.supportedVersions ~= arr[i].get!string;
 		}
 		if ("capabilities" in j)
 			r.capabilities = ServerCapabilities.fromJson(j["capabilities"]);
@@ -177,7 +175,7 @@ struct DiscoverResult
 	import core.time : msecs;
 
 	DiscoverResult r;
-	r.protocolVersions = ["2026-07-28"];
+	r.supportedVersions = ["2026-07-28"];
 	r.cache = CacheHint(60_000.msecs, CacheScope.private_);
 	auto j = r.toJson();
 	assert(j["ttlMs"].get!long == 60_000);
@@ -191,7 +189,7 @@ struct DiscoverResult
 @safe unittest  // a DiscoverResult with no hint emits no cache fields and parses back null
 {
 	DiscoverResult r;
-	r.protocolVersions = ["2026-07-28"];
+	r.supportedVersions = ["2026-07-28"];
 	auto j = r.toJson();
 	assert("ttlMs" !in j);
 	assert("cacheScope" !in j);
@@ -355,11 +353,11 @@ unittest  // RequestMeta.fromParams ignores non-object clientInfo and clientCapa
 unittest  // DiscoverResult round-trips
 {
 	DiscoverResult d;
-	d.protocolVersions = ["2026-07-28", "2025-11-25"];
+	d.supportedVersions = ["2026-07-28", "2025-11-25"];
 	d.serverInfo = Implementation("srv", "1.0");
 	d.capabilities.logging = true;
 	auto back = DiscoverResult.fromJson(d.toJson());
-	assert(back.protocolVersions.length == 2);
+	assert(back.supportedVersions.length == 2);
 	assert(back.serverInfo.name == "srv");
 	assert(back.capabilities.logging);
 }
@@ -367,7 +365,7 @@ unittest  // DiscoverResult round-trips
 unittest  // server identity travels in result `_meta`, not a top-level `serverInfo`
 {
 	DiscoverResult d;
-	d.protocolVersions = ["2026-07-28"];
+	d.supportedVersions = ["2026-07-28"];
 	d.serverInfo = Implementation("srv", "1.0");
 	auto j = d.toJson();
 	// `DiscoverResult` has no `serverInfo` member in the schema; identity is a
@@ -380,7 +378,7 @@ unittest  // server identity travels in result `_meta`, not a top-level `serverI
 unittest  // an identity-less DiscoverResult emits no `_meta` serverInfo
 {
 	DiscoverResult d;
-	d.protocolVersions = ["2026-07-28"];
+	d.supportedVersions = ["2026-07-28"];
 	auto j = d.toJson();
 	assert("_meta" !in j || MetaKey.serverInfo !in j["_meta"]);
 }
@@ -399,15 +397,20 @@ unittest  // DiscoverResult.fromJson reads serverInfo out of `_meta`
 unittest  // DiscoverResult.toJson emits the spec wire field `supportedVersions`
 {
 	DiscoverResult d;
-	d.protocolVersions = ["2026-07-28", "2025-11-25"];
+	d.supportedVersions = ["2026-07-28", "2025-11-25"];
 	d.serverInfo = Implementation("srv", "1.0");
 	auto j = d.toJson();
-	// 2026-07-28 server/discover Response Fields table requires `supportedVersions`,
-	// not the internal name `protocolVersions`.
+	// 2026-07-28 server/discover Response Fields table requires `supportedVersions`.
 	assert("supportedVersions" in j);
 	assert("protocolVersions" !in j);
 	assert(j["supportedVersions"].length == 2);
 	assert(j["supportedVersions"][0].get!string == "2026-07-28");
+}
+
+unittest  // DiscoverResult names its versions member after the supportedVersions wire field
+{
+	static assert(__traits(hasMember, DiscoverResult, "supportedVersions"));
+	static assert(!__traits(hasMember, DiscoverResult, "protocolVersions"));
 }
 
 unittest  // DiscoverResult.fromJson reads versions only from the spec supportedVersions field
@@ -415,7 +418,7 @@ unittest  // DiscoverResult.fromJson reads versions only from the spec supported
 	import vibe.data.json : parseJsonString;
 
 	auto r = DiscoverResult.fromJson(parseJsonString(`{"protocolVersions": ["2026-07-28"]}`));
-	assert(r.protocolVersions.length == 0);
+	assert(r.supportedVersions.length == 0);
 }
 
 unittest  // DiscoverResult.fromJson skips non-string entries in supportedVersions
@@ -426,15 +429,15 @@ unittest  // DiscoverResult.fromJson skips non-string entries in supportedVersio
 
 	auto j = parseJsonString(`{"supportedVersions": ["2026-07-28", 42, null, true, "2025-11-25"]}`);
 	auto r = DiscoverResult.fromJson(j);
-	assert(r.protocolVersions.length == 2);
-	assert(r.protocolVersions[0] == "2026-07-28");
-	assert(r.protocolVersions[1] == "2025-11-25");
+	assert(r.supportedVersions.length == 2);
+	assert(r.supportedVersions[0] == "2026-07-28");
+	assert(r.supportedVersions[1] == "2025-11-25");
 }
 
 unittest  // DiscoverResult.toJson carries the required resultType discriminator
 {
 	DiscoverResult d;
-	d.protocolVersions = ["2026-07-28"];
+	d.supportedVersions = ["2026-07-28"];
 	auto j = d.toJson();
 	// The 2026-07-28 base Result mandates a resultType discriminator on every result;
 	// a complete discover response uses "complete".
@@ -451,8 +454,8 @@ unittest  // DiscoverResult.fromJson reads the spec wire field `supportedVersion
 	j["resultType"] = Json("complete");
 	j["supportedVersions"] = sv;
 	auto r = DiscoverResult.fromJson(j);
-	assert(r.protocolVersions.length == 2);
-	assert(r.protocolVersions[0] == "2026-07-28");
+	assert(r.supportedVersions.length == 2);
+	assert(r.supportedVersions[0] == "2026-07-28");
 }
 
 unittest  // withCache attaches ttlMs (ms) and cacheScope from a CacheHint Duration

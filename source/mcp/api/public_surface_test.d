@@ -114,7 +114,7 @@ unittest
 	assert(hint.cacheScope == CacheScope.private_);
 
 	DiscoverResult r;
-	r.protocolVersions = ["2025-11-25"];
+	r.supportedVersions = ["2025-11-25"];
 	// Spec wire field is `supportedVersions` (modern DiscoverResult).
 	assert(r.toJson()["supportedVersions"][0].get!string == "2025-11-25");
 }

@@ -109,9 +109,9 @@ private int runE2E(McpClient client, McpClient delegate() @safe makeClient, bool
 	// --- 1. server/discover (stateless, up-front version negotiation) ---------
 	client.enableModern();
 	auto disc = client.discover();
-	check(disc.protocolVersions.canFind("2026-07-28"),
+	check(disc.supportedVersions.canFind("2026-07-28"),
 			"discover.supportedVersions should contain the modern 2026-07-28; got "
-			~ disc.protocolVersions.to!string);
+			~ disc.supportedVersions.to!string);
 	checkEq(disc.serverInfo.name, "modern-server", "discover.serverInfo.name");
 
 	// --- 2. connect() selects the modern protocol -----------------------------
