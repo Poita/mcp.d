@@ -145,11 +145,13 @@ struct FetchContext
 /// stop it in `onUnsubscribe`.
 ///
 /// NODE-LOCAL: "once per distinct key" holds within a single `EventsRuntime`
-/// instance — the lifecycle refcount is node-local. Webhook subscriptions are
-/// shared across a cluster via the subscription store, so on a multi-node
-/// deployment these hooks fire once per node, not once cluster-wide; write them to
-/// be idempotent across nodes. A cluster-coherent shared-store refcount is future
-/// work.
+/// instance — the lifecycle refcount is node-local. A webhook subscription fires
+/// `onSubscribe` on the node that creates it, and on every node that registers the
+/// type's `onSubscribe` while the subscription is in the shared or durable store
+/// (so a restarted node provisions its upstream sources again); it does not fire on
+/// a node for a webhook subscription another node creates later. `onUnsubscribe`
+/// fires on each node holding the key once the subscription is gone. Write the
+/// hooks to be idempotent across nodes.
 struct SubContext
 {
 	string principal;

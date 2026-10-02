@@ -781,11 +781,12 @@ fetch handler: once `onFetch` is set, poll reads from the handler, so `publish`
 reaches live streams and webhook subscribers but never a poller. The handle also carries typed `onSubscribe`/`onUnsubscribe`
 lifecycle hooks (start an author-owned live source task in `onSubscribe` that
 `publish`es, and stop it in `onUnsubscribe`) and `pollInterval`. The hooks fire **exactly once per `(principal, name,
-arguments)` per node**: the lifecycle refcount is node-local, so on a multi-node
-deployment (where webhook subscriptions are shared via the `WebhookSubscriptionStore`) the
-hooks fire once per node that first/last sees the key, not once cluster-wide — write
-them to be idempotent across nodes. A cluster-coherent shared-store atomic refcount
-is future work.
+arguments)` per node**: the lifecycle refcount is node-local. A webhook subscription
+fires `onSubscribe` on the node that creates it and on every node that registers the
+hook while the subscription is in the `WebhookSubscriptionStore`, so a node restarted
+over a durable store provisions its upstream sources again; it does not fire on a node
+for a webhook subscription another node creates later. Write the hooks to be
+idempotent across nodes.
 
 A **pull** source (a cursor-addressable upstream — Gmail history, Kafka offsets)
 supplies a fetch handler instead, declared with the `@event` UDA — `EventBatch!P

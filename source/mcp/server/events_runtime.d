@@ -190,11 +190,12 @@ final class EventHandle(A, P)
 	/// `(principal, arguments)` — provision the upstream source here.
 	///
 	/// NODE-LOCAL: the lifecycle refcount that drives this hook lives in this
-	/// `EventsRuntime` instance, so the 0->1 transition is per-node. Webhook
-	/// subscriptions are shared across a cluster via the subscription store, so on a
-	/// multi-node deployment `onSubscribe` fires once per node that first sees the
-	/// key — not once cluster-wide. A cluster-coherent (shared-store atomic) refcount
-	/// is future work; today, write the hook to be idempotent across nodes.
+	/// `EventsRuntime` instance, so the 0->1 transition is per-node. For a webhook
+	/// subscription the hook fires on the node that creates it, and on every node
+	/// that attaches this hook while the subscription is in the (shared or durable)
+	/// store — so after a restart the upstream source is provisioned again. It does
+	/// not fire on a node for a webhook subscription another node creates later.
+	/// Write the hook to be idempotent across nodes.
 	EventHandle onSubscribe(void delegate(A args, scope SubContext ctx) @safe hook) @safe
 	{
 		reg_.onSubscribe = (EventContext ctx, string id) @safe {
@@ -719,8 +720,44 @@ final class EventsRuntime
 						existing.descriptor.meta) != canonicalJsonString(reg.descriptor.meta);
 		}
 		types_[name] = reg;
+		if (reg.onSubscribe !is null)
+			adoptStoredWebhooks(name);
 		if (descriptorChanged)
 			notifyListChanged();
+	}
+
+	// Take a lifecycle reference for every live stored webhook subscription to
+	// `name` this node does not yet hold, firing `onSubscribe` per new key. Over a
+	// durable store this restarts the upstream sources of subscriptions created
+	// before a restart (or on another node), which would otherwise never fire the
+	// hook here and never tear down. A throwing hook is logged and the
+	// subscription left unheld, so the next registration retries it.
+	private void adoptStoredWebhooks(string name) @safe
+	{
+		const now = opts_.nowMs();
+		foreach (sub; webhookStore_.byName(name))
+		{
+			if ((sub.id in heldWebhookRefs_) !is null || sub.isExpired(now))
+				continue;
+			auto reg = name in types_;
+			if (reg is null)
+				return;
+			try
+				acquireLifecycle(*reg, name, sub.arguments, sub.principal, sub.id);
+			catch (Exception e)
+			{
+				logEventsError("on_subscribe hook threw", e);
+				continue;
+			}
+			// on_subscribe may yield: the subscription may meanwhile have been
+			// removed, or adopted by a concurrent registration.
+			if ((sub.id in heldWebhookRefs_) !is null || webhookStore_.get(sub.id).isNull)
+			{
+				releaseLifecycle(name, sub.arguments, sub.principal);
+				continue;
+			}
+			heldWebhookRefs_[sub.id] = WebhookRef(name, sub.arguments, sub.principal);
+		}
 	}
 
 	// Compile an event type's `inputSchema` once at registration. A malformed
@@ -4926,6 +4963,54 @@ unittest  // unsubscribeWebhook removes the subscription and fires on_unsubscrib
 	u.url = "https://proxy/hooks";
 	rt.unsubscribeWebhook(u, "user-1");
 	assert(rt.webhookStore().get(r.id).isNull && unsubs == 1);
+}
+
+unittest  // a runtime over a store holding webhook subscriptions fires on_subscribe for each stored key
+{
+	auto store = new InMemoryWebhookSubscriptionStore();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	auto first = new EventsRuntime(store, o);
+	EventRegistration plain = {descriptor: EventType("n"), emitOnly: true};
+	first.register(plain);
+	auto r = first.subscribeWebhook(webhookSub("n", "https://proxy/hooks",
+			Json(["k": Json(1)])), "user-1");
+	first.subscribeWebhook(webhookSub("n", "https://proxy/other", Json([
+				"k": Json(1)
+	])), "user-1");
+	first.subscribeWebhook(webhookSub("n", "https://proxy/hooks", Json([
+				"k": Json(2)
+	])), "user-1");
+
+	// A restarted node over the same store provisions each live key once.
+	auto restarted = new EventsRuntime(store, o);
+	string[] subscribed;
+	int unsubs;
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		subscribed ~= ctx.arguments["k"].toString();
+	};
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	restarted.register(reg);
+	import std.algorithm : sort;
+
+	subscribed.sort();
+	assert(subscribed == ["1", "2"]);
+
+	// Re-registering does not provision again, and ending the subscriptions tears down.
+	restarted.register(reg);
+	assert(subscribed.length == 2);
+	UnsubscribeParams u;
+	u.name = "n";
+	u.arguments = Json(["k": Json(1)]);
+	u.url = "https://proxy/hooks";
+	restarted.unsubscribeWebhook(u, "user-1");
+	assert(unsubs == 0); // the other subscription of key 1 still holds it
+	u.url = "https://proxy/other";
+	restarted.unsubscribeWebhook(u, "user-1");
+	assert(unsubs == 1);
+	assert(restarted.webhookStore().get(r.id).isNull);
 }
 
 unittest  // concurrent first webhook subscribes for one key hold a single lifecycle reference
