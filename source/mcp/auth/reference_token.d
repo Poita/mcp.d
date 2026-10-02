@@ -100,6 +100,12 @@ final class ReferenceTokenStore
 		return nullable(*p);
 	}
 
+	/// Resolve `token` as `lookup(token, now)` does, at the store's clock.
+	Nullable!IssuedToken lookup(string token) @safe
+	{
+		return lookup(token, now());
+	}
+
 	/// The number of tokens currently held, including any expired ones not yet
 	/// swept.
 	size_t length() const @safe
@@ -167,7 +173,7 @@ in (store !is null)
 	import std.algorithm : canFind;
 
 	return (string token) @safe {
-		auto found = store.lookup(token, nowUnixSeconds());
+		auto found = store.lookup(token);
 		if (found.isNull)
 			return TokenInfo.invalid();
 		auto t = found.get;
@@ -384,4 +390,21 @@ unittest  // cap eviction skips tokens already removed by expiry
 	assert(store.lookup(b, 0).isNull);
 	assert(!store.lookup(c, 0).isNull);
 	assert(!store.lookup(d, 0).isNull);
+}
+
+@safe unittest  // the validator judges expiry by the store's injected clock
+{
+	long fakeNow = 1_000;
+	ReferenceTokenStoreOptions o;
+	o.clock = () @safe => fakeNow;
+	auto store = new ReferenceTokenStore(o);
+	IssuedToken t;
+	t.subject = "alice";
+	t.expiresAt = 2_000;
+	const token = store.issue(t);
+
+	auto validate = referenceTokenValidator(store, "https://mcp.example.com/mcp");
+	assert(validate(token).valid);
+	fakeNow = 2_000;
+	assert(!validate(token).valid);
 }
