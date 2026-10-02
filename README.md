@@ -785,8 +785,9 @@ HMAC (`v1,`) signing with the client-supplied secret and a secret-rotation
 dual-signing grace window; mandatory **endpoint verification** before delivery
 (a receiver-published `/.well-known/mcp-webhook-receiver.json`, the challenge
 handshake, server allowlist, or out-of-band) cached per `(principal, url)`;
-bounded retry with exponential backoff (`410`/`413` are non-retryable) and a
-safe-to-persist watermark cursor; and `deliveryStatus` surfaced on refresh.
+bounded retry with exponential backoff (a `410` ends the subscription; a `413`
+skips the event with a gap) and a safe-to-persist watermark cursor; and
+`deliveryStatus` surfaced on refresh.
 
 **Termination.** `rt.unregister(name)` removes a type and ends every subscription
 to it with `NotFound {kind: "event"}`; re-registering a type whose schema changed

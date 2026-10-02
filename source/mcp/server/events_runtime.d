@@ -2059,8 +2059,9 @@ final class EventsRuntime
 	/// success the subscription's watermark cursor advances; on exhaustion the lost
 	/// position is recorded as missed, and a signed `gap` envelope is queued for it
 	/// once the endpoint takes deliveries again. The job is acked (removed) only
-	/// once its position is settled — success, 410/413 abandonment, or exhaustion —
-	/// never on a mere transient failure (so it survives to be re-leased).
+	/// once its position is settled — success, a 410 (which ends the subscription)
+	/// or 413, or exhaustion — never on a mere transient failure (so it survives to
+	/// be re-leased).
 	private void deliverWithRetry(Delivery job) @safe
 	{
 		const subId = job.subscriptionId;
@@ -2132,12 +2133,18 @@ final class EventsRuntime
 				flushMissed(sn.get);
 				return;
 			}
-			// A receiver that rejects with 410 Gone or 413 too-large does not want a
-			// retry; abandon this event (its position is settled for the watermark).
-			if (res.statusCode == 410 || res.statusCode == 413)
+			// 410 Gone: the receiver no longer wants this subscription, so it ends.
+			if (res.statusCode == 410)
 			{
-				recordSuccess(subId, occ.cursor); // settled (abandoned), watermark advances
 				ackJob(job.jobId);
+				removeWebhookState(sn.get);
+				return;
+			}
+			// 413 too large: retrying cannot succeed, so the event is skipped and
+			// the client is owed a gap. It is no evidence the endpoint is healthy.
+			if (res.statusCode == 413)
+			{
+				abandonUndelivered(job);
 				return;
 			}
 			// Each failed attempt is one sample for the suspension policy, so an
@@ -5663,6 +5670,38 @@ unittest  // a 410 Gone response is not retried (single event attempt)
 	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	assert(ft.eventPosts().length == 1); // no retry after 410
+}
+
+unittest  // a 410 Gone response ends the subscription and fires on_unsubscribe
+{
+	auto ft = new FakeWebhookTransport();
+	ft.eventStatuses = [410];
+	auto rt = engineRuntime(ft);
+	int unsubs;
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(rt.webhookStore().get(r.id).isNull && unsubs == 1);
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	assert(ft.eventPosts().length == 1);
+}
+
+unittest  // a 413 response skips the event with a gap and does not count as a healthy delivery
+{
+	auto ft = new FakeWebhookTransport();
+	ft.eventStatuses = [413];
+	auto rt = engineRuntime(ft);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	const lost = rt.buffer_.headCursor();
+	auto sub = rt.webhookStore().get(r.id).get;
+	assert(sub.lastDeliveryAtMs == 0);
+	assert(sub.cursor.get == lost); // the position is settled
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	auto gaps = controlPostsOf(ft, "gap");
+	assert(gaps.length == 1 && parseJsonString(gaps[0].body)["cursor"].get!string == lost);
 }
 
 unittest  // a transient 503 is retried and then succeeds
