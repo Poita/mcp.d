@@ -11,6 +11,7 @@ module mcp.server.settings;
 import std.typecons : Nullable;
 
 import mcp.protocol.capabilities : Implementation;
+import mcp.server.request_state : RequestStateSecurity;
 import mcp.server.server : McpServer, ServerMode;
 import mcp.transport.streamable_http : StreamableHttpOptions;
 import mcp.transport.stdio : StdioOptions;
@@ -71,12 +72,23 @@ struct ServerSettings
 	/// `enableOutputSchemaValidation`). Off by default, matching the method.
 	bool outputSchemaValidation;
 
-	/// Tri-state control of input-schema validation, which is **on by default** on
-	/// the server. `null` (the default) leaves that default untouched; `true` calls
-	/// `enableInputSchemaValidation`; `false` calls `disableInputSchemaValidation`.
-	/// The tri-state lets the settings express "leave default" as well as an
-	/// explicit on/off, since the underlying default is enabled.
-	Nullable!bool inputSchemaValidation;
+	/// Validate each tool call's `arguments` against the tool's `inputSchema`
+	/// before its handler runs. On by default, since the spec says servers MUST
+	/// validate tool inputs; `false` calls `disableInputSchemaValidation`.
+	bool inputSchemaValidation = true;
+
+	/// Reject a stateful session's requests (other than `ping`) that arrive before
+	/// its `notifications/initialized` with -32002 (calls `requireInitialized`).
+	/// Off by default: the lifecycle rule is a SHOULD.
+	bool requireInitialized;
+
+	/// The most items one page of a paginated list method returns (calls
+	/// `setPageSize`). `0` (the default) returns every item in a single page.
+	size_t pageSize;
+
+	/// When set, protect the MRTR `requestState` with the secure codec (calls
+	/// `secureRequestState`). Null (the default) passes it through as plaintext.
+	Nullable!RequestStateSecurity requestStateSecurity;
 
 	/// Advertise the MCP Apps extension capability (calls `enableApps` from
 	/// `mcp.api.apps` with its default mime types). Off by default.
@@ -119,13 +131,14 @@ struct ServerSettings
 			server.enableLogging();
 		if (outputSchemaValidation)
 			server.enableOutputSchemaValidation();
-		if (!inputSchemaValidation.isNull)
-		{
-			if (inputSchemaValidation.get)
-				server.enableInputSchemaValidation();
-			else
-				server.disableInputSchemaValidation();
-		}
+		if (!inputSchemaValidation)
+			server.disableInputSchemaValidation();
+		if (requireInitialized)
+			server.requireInitialized();
+		if (pageSize > 0)
+			server.setPageSize(pageSize);
+		if (!requestStateSecurity.isNull)
+			server.secureRequestState(requestStateSecurity.get);
 		if (apps)
 			enableApps(server);
 		// Last: a stateless-mode resourceSubscriptions opt-in throws here, exactly
@@ -306,8 +319,8 @@ version (unittest)
 
 @safe unittest
 {
-	// inputSchemaValidation defaults to null = leave the server default (ON), so a
-	// call with arguments missing a required field is rejected (isError content).
+	// inputSchemaValidation defaults to on, so a call with arguments missing a
+	// required field is rejected (isError content).
 	import mcp.protocol.schema : jsonSchemaOf;
 	import mcp.protocol.types : Tool, CallToolResult, Content;
 	import std.typecons : nullable;
@@ -321,7 +334,6 @@ version (unittest)
 
 	ServerSettings s;
 	s.serverInfo = Implementation("settings-srv", "1.0");
-	// inputSchemaValidation left null -> default (ON).
 	auto server = s.newServer();
 	Tool add = {
 		name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!Args
@@ -344,7 +356,7 @@ version (unittest)
 	// inputSchemaValidation = false disables validation: the same call now succeeds.
 	import mcp.protocol.schema : jsonSchemaOf;
 	import mcp.protocol.types : Tool, CallToolResult, Content;
-	import std.typecons : nullable, Nullable;
+	import std.typecons : nullable;
 	import vibe.data.json : Json;
 
 	struct Args
@@ -355,7 +367,7 @@ version (unittest)
 
 	ServerSettings s;
 	s.serverInfo = Implementation("settings-srv", "1.0");
-	s.inputSchemaValidation = Nullable!bool(false);
+	s.inputSchemaValidation = false;
 	auto server = s.newServer();
 	Tool add = {
 		name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!Args
@@ -371,4 +383,84 @@ version (unittest)
 	auto resp = server.handle(callReq(1, params)).get;
 	assert("error" !in resp);
 	assert(resp["result"]["content"][0]["text"].get!string == "ok");
+}
+
+@safe unittest
+{
+	// inputSchemaValidation is a plain bool, on by default.
+	ServerSettings s;
+	assert(s.inputSchemaValidation);
+}
+
+@safe unittest
+{
+	// requireInitialized gates a stateful request sent before notifications/initialized.
+	import vibe.data.json : Json;
+
+	ServerSettings s;
+	s.serverInfo = Implementation("settings-srv", "1.0");
+	s.mode = ServerMode.stateful;
+	s.requireInitialized = true;
+	auto server = s.newServer();
+	Json init = Json.emptyObject;
+	init["protocolVersion"] = "2025-11-25";
+	init["capabilities"] = Json.emptyObject;
+	init["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	server.handle(Message(makeRequest(Json(1), "initialize", init)));
+	auto early = server.handle(Message(makeRequest(Json(2), "tools/list", Json.emptyObject))).get;
+	assert(early["error"]["code"].get!int == -32002);
+}
+
+@safe unittest
+{
+	// pageSize paginates the list methods.
+	import mcp.protocol.types : Tool, CallToolResult;
+	import vibe.data.json : Json;
+
+	ServerSettings s;
+	s.serverInfo = Implementation("settings-srv", "1.0");
+	s.pageSize = 1;
+	auto server = s.newServer();
+	foreach (name; ["a", "b"])
+	{
+		Tool t = {name: name};
+		server.registerTool(t, (Json) @safe => CallToolResult.init);
+	}
+	auto list = server.handle(Message(makeRequest(Json(1), "tools/list", Json.emptyObject))).get;
+	assert(list["result"]["tools"].length == 1);
+	assert("nextCursor" in list["result"]);
+}
+
+@safe unittest
+{
+	// requestStateSecurity installs the secure requestState codec.
+	import std.algorithm.searching : startsWith;
+	import std.typecons : nullable;
+	import mcp.protocol.mrtr : InputRequest, MetaKey;
+	import mcp.protocol.types : Tool;
+	import mcp.server.context : RequestContext;
+	import mcp.server.request_state : RequestStateSecurity;
+	import mcp.server.responses : ToolResponse;
+	import vibe.data.json : Json;
+
+	ServerSettings s;
+	s.serverInfo = Implementation("settings-srv", "1.0");
+	RequestStateSecurity sec;
+	sec.key = new ubyte[32];
+	s.requestStateSecurity = nullable(sec);
+	auto server = s.newServer();
+	Tool t = {name: "ask"};
+	server.registerTool(t, (Json, RequestContext) @safe => ToolResponse.inputRequired(
+			[InputRequest.elicitation("q", "Why?")], "plain"));
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json(["elicitation": Json.emptyObject]);
+	Json params = Json.emptyObject;
+	params["name"] = "ask";
+	params["arguments"] = Json.emptyObject;
+	params["_meta"] = meta;
+	auto resp = server.handle(callReq(1, params)).get;
+	const state = resp["result"]["requestState"].get!string;
+	assert(state != "plain" && state.startsWith("v1"), state);
 }
