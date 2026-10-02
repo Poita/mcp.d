@@ -143,12 +143,18 @@ final class EmitBuffer
 
 		auto entries = byName_.get(name, null);
 		bool truncated;
+		// The furthest position the caller can no longer read: evicted, or
+		// skipped by the replay floor.
+		long lostThrough = fromSeq;
 
 		// Gap from eviction: an event of this name after the cursor was dropped.
 		// Sequence numbers are shared across names, so this is judged against the
 		// name's own eviction point rather than the distance to its oldest entry.
 		if (evictedThrough_.get(name, 0) > fromSeq)
+		{
 			truncated = true;
+			lostThrough = evictedThrough_[name];
+		}
 
 		const hasFloor = !maxAgeMs.isNull;
 		const floorMs = hasFloor ? (nowMs() - maxAgeMs.get) : 0;
@@ -163,15 +169,18 @@ final class EmitBuffer
 				// An event newer than the cursor but older than the floor is
 				// skipped — that is a (bounded) gap.
 				truncated = true;
+				if (e.seq > lostThrough)
+					lostThrough = e.seq;
 				continue;
 			}
 			selected ~= e.occ;
 		}
 
-		// The cursor to return when the batch is empty: the last event the caller has
-		// already seen (its supplied cursor), not the buffer head — advancing to head
-		// would skip any retained-but-unselected events on the next poll.
-		string emptyCursor = selected.length ? selected[$ - 1].cursor.get : cursor.get;
+		// The cursor to return when the batch is empty: past whatever the caller
+		// can no longer read, so the gap is reported once, but not the buffer head —
+		// advancing to head would skip retained-but-unselected events next poll.
+		string emptyCursor = selected.length ? selected[$ - 1].cursor.get
+			: (lostThrough > fromSeq ? seqString(lostThrough) : cursor.get);
 
 		bool hasMore;
 		// A non-positive cap is treated as no cap: capping to zero would drop the whole
@@ -675,6 +684,35 @@ unittest  // age eviction followed by other names' events still reports a gap on
 	buf.append("a", EventOccurrence("a2", "a", "t")); // a1 aged out, but c1 already saw it
 	auto r = buf.readSince("a", nullable(c1), Nullable!long.init, Nullable!long.init);
 	assert(!r.truncated && r.events.length == 1);
+}
+
+unittest  // a truncated read that selects nothing moves the cursor past the evicted events
+{
+	long now = 1_000_000;
+	auto buf = new EmitBuffer(EmitBufferOptions(1.minutes, 100));
+	buf.nowMs = () @safe => now;
+	const start = buf.headCursor();
+	buf.append("a", EventOccurrence("a1", "a", "t"));
+	now += 2 * 60 * 1000;
+	buf.evictExpired();
+	auto r = buf.readSince("a", nullable(start), Nullable!long.init, Nullable!long.init);
+	assert(r.truncated && r.events.length == 0);
+	auto again = buf.readSince("a", r.cursor, Nullable!long.init, Nullable!long.init);
+	assert(!again.truncated);
+}
+
+unittest  // a truncated read whose floor skips every event moves the cursor past them
+{
+	long now = 1_000_000;
+	auto buf = new EmitBuffer();
+	buf.nowMs = () @safe => now;
+	const start = buf.headCursor();
+	buf.append("a", EventOccurrence("a1", "a", "t"));
+	now += 500_000;
+	auto r = buf.readSince("a", nullable(start), nullable(300_000L), Nullable!long.init);
+	assert(r.truncated && r.events.length == 0);
+	auto again = buf.readSince("a", r.cursor, nullable(300_000L), Nullable!long.init);
+	assert(!again.truncated);
 }
 
 unittest  // WebhookSubscription round-trips through JSON
