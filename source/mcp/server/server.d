@@ -1586,6 +1586,18 @@ final class McpServer : ServerCore
 			return true;
 		}
 
+		// Keyed like in-flight requests, so string id "9" and numeric 9 stay distinct.
+		// The id routes cancellation and the closing response, so it must not name
+		// a stream that is still open.
+		const streamKey = cancellationKey(msg.id);
+		if (streamKey in stdioEventStreams_)
+		{
+			writeLine(makeErrorResponse(msg.id,
+					invalidRequest("events/stream: request id is already in use by an open stream"))
+					.toString());
+			return true;
+		}
+
 		const subId = msg.id;
 		void deliver(string method, Json params) @safe
 		{
@@ -1605,8 +1617,6 @@ final class McpServer : ServerCore
 			writeLine(makeErrorResponse(msg.id, internalError(e.msg)).toString());
 			return true;
 		}
-		// Keyed like in-flight requests, so string id "9" and numeric 9 stay distinct.
-		const streamKey = cancellationKey(msg.id);
 		stdioEventStreams_[streamKey] = handle;
 		// A server-initiated close drops the stream and answers the request with
 		// the StreamEventsResult so the client's pending request completes.
@@ -7052,6 +7062,37 @@ unittest  // stdio events/stream opens with an active frame, then delivers emitt
 	assert(ev["method"].get!string == "notifications/events/event");
 	assert(ev["params"]["eventId"].get!string == "evt_1");
 	assert(ev["params"]["_meta"][subscriptionIdMetaKey].get!long == 9);
+}
+
+unittest  // stdio events/stream rejects a request id that already names an open stream
+{
+	import std.algorithm : count, canFind;
+	import mcp.protocol.events : EventOccurrence;
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableEvents();
+	registerDemoEvent(s);
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "incident.created";
+	assert(s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink));
+	const opened = lines.length;
+	assert(s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink));
+	assert(lines.length == opened + 1);
+	auto resp = parseJsonString(lines[$ - 1]);
+	assert(resp["id"].get!long == 9);
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
+
+	rt.emit(EventOccurrence("evt_1", "incident.created", "", Json([
+				"sev": Json("P1")
+	])));
+	assert(lines.count!(l => l.canFind("evt_1")) == 1);
 }
 
 unittest  // stdio events/stream answers a negative maxAgeMs with InvalidParams
