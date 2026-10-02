@@ -1,6 +1,6 @@
 module mcp.client.client;
 
-import core.time : Duration, seconds, msecs, hours;
+import core.time : Duration, MonoTime, seconds, msecs, hours;
 import std.algorithm : canFind, startsWith;
 import std.datetime : Clock, SysTime;
 import std.typecons : Nullable, nullable;
@@ -298,6 +298,13 @@ struct ClientSettings
 	/// is not cut off (basic/utilities/progress).
 	bool resetTimeoutOnProgress = true;
 
+	/// Absolute bound on how long a request may wait for its response, measured
+	/// from when it is sent and including time spent answering server requests
+	/// made on its behalf. Unlike `requestTimeout`, progress never extends it, so
+	/// a server that keeps reporting progress cannot hold a request open forever.
+	/// `Duration.zero` (the default) imposes no cap beyond `requestTimeout`.
+	Duration maxTotalTimeout = Duration.zero;
+
 	/// How long `awaitTask` waits between `tasks/get` polls when the server gives
 	/// no `pollIntervalMs`.
 	Duration taskPollInterval = 1.seconds;
@@ -310,7 +317,8 @@ struct ClientSettings
 
 /// Thrown by a request that received no response within
 /// `ClientSettings.requestTimeout` (restarted by progress when
-/// `resetTimeoutOnProgress` is set). The client has already cancelled the request
+/// `resetTimeoutOnProgress` is set) or within `ClientSettings.maxTotalTimeout`.
+/// The client has already cancelled the request
 /// on the server.
 ///
 /// JSON-RPC has no timeout code, so `code` is `ErrorCode.internalError`, the same
@@ -327,10 +335,17 @@ class RequestTimeoutException : McpException
 /// The client-side bookkeeping of one request awaiting its response.
 private final class InFlightRequest
 {
+	import core.time : Duration, MonoTime;
 	import vibe.core.core : Timer;
 
 	Timer timer;
 	bool armed;
+	// When the `requestTimeout` window ends; `MonoTime.max` when there is none.
+	MonoTime deadline = MonoTime.max;
+	// When `maxTotalTimeout` ends; `MonoTime.max` when there is no cap.
+	MonoTime hardDeadline = MonoTime.max;
+	// What was left of the window when `pauseDeadlines` stopped the timer.
+	Duration remaining;
 	string progressKey; // the request's progress token rendered as JSON, or empty
 	McpException abortReason;
 	void* owner; // the fiber awaiting the response
@@ -696,6 +711,7 @@ final class McpClient : ClientProtocol
 		eventSettings_ = settings.events;
 		requestTimeout = settings.requestTimeout;
 		resetTimeoutOnProgress_ = settings.resetTimeoutOnProgress;
+		maxTotalTimeout_ = settings.maxTotalTimeout;
 		taskPollInterval_ = settings.taskPollInterval;
 		taskTimeout_ = settings.taskTimeout;
 		return this;
@@ -706,6 +722,7 @@ final class McpClient : ClientProtocol
 
 	private Duration requestTimeout_ = ClientSettings.init.requestTimeout;
 	private bool resetTimeoutOnProgress_ = ClientSettings.init.resetTimeoutOnProgress;
+	private Duration maxTotalTimeout_ = ClientSettings.init.maxTotalTimeout;
 
 	/// How long a request may wait for its response; see
 	/// `ClientSettings.requestTimeout`. Settable after construction; applies to
@@ -3332,7 +3349,12 @@ final class McpClient : ClientProtocol
 		if (params.type == Json.Type.object && "_meta" in params
 				&& params["_meta"].type == Json.Type.object && "progressToken" in params["_meta"])
 			req.progressKey = params["_meta"]["progressToken"].toString();
+		const now = MonoTime.currTime;
 		if (requestTimeout_ > Duration.zero)
+			req.deadline = now + requestTimeout_;
+		if (maxTotalTimeout_ > Duration.zero)
+			req.hardDeadline = now + maxTotalTimeout_;
+		if (req.deadline != MonoTime.max || req.hardDeadline != MonoTime.max)
 		{
 			req.timer = createTimer(() @safe nothrow{
 				try
@@ -3341,8 +3363,8 @@ final class McpClient : ClientProtocol
 				{
 				}
 			});
-			req.timer.rearm(requestTimeout_);
 			req.armed = true;
+			armDeadline(req, now);
 		}
 		inFlight_[id] = req;
 		return req;
@@ -3370,9 +3392,21 @@ final class McpClient : ClientProtocol
 		auto r = id in inFlight_;
 		if (r is null || (*r).abortReason !is null || (*r).paused)
 			return;
-		abortRequest(id, new RequestTimeoutException(
-				"Request " ~ id.to!string ~ " timed out after " ~ requestTimeout_.toString()),
+		const capped = MonoTime.currTime >= (*r).hardDeadline;
+		abortRequest(id,
+				new RequestTimeoutException("Request " ~ id.to!string ~ " timed out after " ~ (capped
+					? maxTotalTimeout_.toString() ~ " (maxTotalTimeout)" : requestTimeout_.toString())),
 				"Request timed out");
+	}
+
+	/// Arm `req`'s timer to fire at the earlier of its `requestTimeout` window
+	/// and its `maxTotalTimeout` cap.
+	private static void armDeadline(InFlightRequest req, MonoTime now) @safe nothrow
+	{
+		import std.algorithm.comparison : max, min;
+
+		const due = min(req.deadline, req.hardDeadline);
+		req.timer.rearm(max(due - now, Duration.zero));
 	}
 
 	/// Abort in-flight request `id`: wake its waiter with `reason`, then signal
@@ -3393,9 +3427,15 @@ final class McpClient : ClientProtocol
 	{
 		if (!resetTimeoutOnProgress_ || progressKey.length == 0)
 			return;
+		if (requestTimeout_ <= Duration.zero)
+			return;
+		const now = MonoTime.currTime;
 		foreach (r; inFlight_.byValue)
 			if (r.armed && r.progressKey == progressKey && r.abortReason is null && !r.paused)
-				r.timer.rearm(requestTimeout_);
+			{
+				r.deadline = now + requestTimeout_;
+				armDeadline(r, now);
+			}
 	}
 
 	/// Stop the deadlines of the requests a server->client request may belong to
@@ -3415,21 +3455,33 @@ final class McpClient : ClientProtocol
 		if (related.length == 0)
 			foreach (r; inFlight_.byValue)
 				related ~= r;
+		const now = MonoTime.currTime;
 		foreach (r; related)
 		{
 			if (r.paused++ == 0 && r.armed)
+			{
 				r.timer.stop();
+				if (r.deadline != MonoTime.max)
+					r.remaining = r.deadline > now ? r.deadline - now : Duration.zero;
+			}
 		}
 		return related;
 	}
 
-	/// Restart, with a full `requestTimeout`, the deadlines `pauseDeadlines`
-	/// stopped once no handler holds them paused.
+	/// Restart the deadlines `pauseDeadlines` stopped, once no handler holds them
+	/// paused, with the `requestTimeout` time that was left when they paused. The
+	/// `maxTotalTimeout` cap keeps running throughout, so a request whose cap
+	/// passed while paused times out at once.
 	private void resumeDeadlines(InFlightRequest[] paused) @safe nothrow
 	{
+		const now = MonoTime.currTime;
 		foreach (r; paused)
 			if (--r.paused == 0 && r.armed && r.abortReason is null)
-				r.timer.rearm(requestTimeout_);
+			{
+				if (r.deadline != MonoTime.max)
+					r.deadline = now + r.remaining;
+				armDeadline(r, now);
+			}
 	}
 
 	/// Identity of the running task for `callTokens_` (its fiber; null outside
@@ -4047,7 +4099,9 @@ final class McpClient : ClientProtocol
 		import vibe.core.core : runTask;
 
 		Json response;
-		auto paused = pauseDeadlines();
+		// A ping is answered at once and holds up no request, so it leaves the
+		// deadlines running.
+		auto paused = msg.method == "ping" ? null : pauseDeadlines();
 		scope (exit)
 			resumeDeadlines(paused);
 		try

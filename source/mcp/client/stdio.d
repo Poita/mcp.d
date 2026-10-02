@@ -1193,6 +1193,153 @@ unittest  // progress for a stdio request resets its timeout
 	assert(progressSeen == 6);
 }
 
+unittest  // server pings do not hold a stdio request's deadline open
+{
+	import core.time : msecs, seconds, MonoTime, Duration;
+	import vibe.core.core : sleep;
+	import mcp.client.client : ClientSettings, RequestTimeoutException;
+
+	auto toClient = new TestLines;
+	auto toServer = new TestLines;
+	bool timedOut;
+	Duration took;
+	const failure = inLoopCapturing(() @safe {
+		ClientSettings s;
+		s.requestTimeout = 400.msecs;
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			toServer.put(l);
+		}, s);
+		// The server never answers, but pings the client every 100ms for 2s.
+		runTask(() nothrow{
+			try
+			{
+				toServer.take();
+				foreach (i; 0 .. 20)
+				{
+					sleep(100.msecs);
+					toClient.put(makeRequest(Json(1000 + i), "ping", Json.emptyObject).toString());
+				}
+			}
+			catch (Exception)
+			{
+			}
+		});
+		const start = MonoTime.currTime;
+		try
+			client.callTool("hang", Json.emptyObject);
+		catch (RequestTimeoutException)
+			timedOut = true;
+		took = MonoTime.currTime - start;
+		sleep(2.seconds);
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(timedOut);
+	assert(took < 1200.msecs, "pings must not extend the deadline");
+}
+
+unittest  // a server request pauses a stdio deadline and resumes it with the time that was left
+{
+	import core.time : msecs, seconds, MonoTime, Duration;
+	import vibe.core.core : sleep;
+	import mcp.client.client : ClientSettings, RequestTimeoutException;
+	import mcp.protocol.types : ListRootsResult;
+
+	auto toClient = new TestLines;
+	auto toServer = new TestLines;
+	bool timedOut;
+	Duration took;
+	const failure = inLoopCapturing(() @safe {
+		ClientSettings s;
+		s.requestTimeout = 800.msecs;
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			toServer.put(l);
+		}, s);
+		// Answering roots/list takes 400ms, during which the deadline is paused.
+		client.onListRoots = () @safe {
+			sleep(400.msecs);
+			return ListRootsResult.init;
+		};
+		runTask(() nothrow{
+			try
+			{
+				toServer.take();
+				sleep(500.msecs);
+				toClient.put(makeRequest(Json(1000), "roots/list", Json.emptyObject).toString());
+			}
+			catch (Exception)
+			{
+			}
+		});
+		const start = MonoTime.currTime;
+		try
+			client.callTool("hang", Json.emptyObject);
+		catch (RequestTimeoutException)
+			timedOut = true;
+		took = MonoTime.currTime - start;
+		sleep(200.msecs);
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(timedOut);
+	// 500ms elapsed + 400ms paused + the remaining 300ms.
+	assert(took >= 1100.msecs, "the paused time must not count against the deadline");
+	assert(took < 1500.msecs, "resuming must not restart the full timeout");
+}
+
+unittest  // ClientSettings.maxTotalTimeout caps a stdio request that keeps reporting progress
+{
+	import core.time : msecs, seconds, MonoTime, Duration;
+	import vibe.core.core : sleep;
+	import mcp.client.client : ClientSettings, RequestOptions, RequestTimeoutException;
+	import mcp.protocol.types : ProgressNotification;
+
+	auto toClient = new TestLines;
+	auto toServer = new TestLines;
+	bool timedOut;
+	Duration took;
+	const failure = inLoopCapturing(() @safe {
+		ClientSettings s;
+		s.requestTimeout = 300.msecs;
+		s.maxTotalTimeout = 700.msecs;
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			toServer.put(l);
+		}, s);
+		// The server reports progress every 100ms for 2s and never answers.
+		runTask(() nothrow{
+			try
+			{
+				auto req = parseJsonString(toServer.take());
+				auto token = req["params"]["_meta"]["progressToken"];
+				foreach (i; 0 .. 20)
+				{
+					sleep(100.msecs);
+					Json p = Json.emptyObject;
+					p["progressToken"] = token;
+					p["progress"] = i;
+					toClient.put(makeNotification("notifications/progress", p).toString());
+				}
+			}
+			catch (Exception)
+			{
+			}
+		});
+		const start = MonoTime.currTime;
+		try
+			client.callTool("slow", Json.emptyObject,
+				RequestOptions.withProgress((ProgressNotification) @safe {}));
+		catch (RequestTimeoutException)
+			timedOut = true;
+		took = MonoTime.currTime - start;
+		sleep(2.seconds);
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(timedOut);
+	assert(took >= 600.msecs);
+	assert(took < 1200.msecs, "progress must not extend a request past maxTotalTimeout");
+}
+
 unittest  // cancelling a call's CancellationToken fails it at once and sends notifications/cancelled
 {
 	import core.time : msecs, seconds, MonoTime, Duration;
