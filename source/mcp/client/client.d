@@ -1094,13 +1094,13 @@ final class McpClient : ClientProtocol
 		transport.setBearerToken(token);
 		identityEpoch_++;
 		// The identity behind requests just changed; evict this client's own
-		// partition so a re-authenticated session cannot read the previous
-		// identity's `private` results. For the default per-client store the
-		// partition is "" and this drops every entry (the prior safety-net
-		// behavior); for a shared store it leaves the shared `public` entries and
-		// other principals' partitions intact.
+		// partition of this server's entries so a re-authenticated session cannot
+		// read the previous identity's `private` results. For the default
+		// per-client store the partition is "" and this drops every entry; for a
+		// shared store it leaves the shared `public` entries, other principals'
+		// partitions, and other servers' entries intact.
 		if (cacheStore_ !is null)
-			cacheStore_.invalidatePartition(cachePartition_);
+			cacheStore_.invalidatePartition(cacheServer_, cachePartition_);
 		clearToolIndex();
 	}
 
@@ -1114,7 +1114,7 @@ final class McpClient : ClientProtocol
 		transport.setBearerProvider(provider);
 		identityEpoch_++;
 		if (cacheStore_ !is null)
-			cacheStore_.invalidatePartition(cachePartition_);
+			cacheStore_.invalidatePartition(cacheServer_, cachePartition_);
 		clearToolIndex();
 	}
 
@@ -8623,6 +8623,21 @@ version (unittest)
 		};
 		return c;
 	}
+}
+
+unittest  // a bearer switch on one server's client keeps the principal's entries for other servers
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	auto a = sharedCacheClient(store, "alice", "private", aCalls, "http://10.0.0.1/mcp");
+	auto b = sharedCacheClient(store, "alice", "private", bCalls, "http://10.0.0.2/mcp");
+	a.listTools();
+	b.listTools();
+	a.setBearerToken("rotated");
+	b.listTools();
+	assert(bCalls == 1, "server B's entry must survive a re-authentication against server A");
+	a.listTools();
+	assert(aCalls == 2, "server A's own private entry must be evicted");
 }
 
 unittest  // a public result in a shared store is hit by every partition (one fetch total)

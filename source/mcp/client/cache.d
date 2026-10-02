@@ -72,15 +72,13 @@ interface CacheStore
 	/// Drop the single entry under `key` (no-op if absent).
 	void invalidate(CacheKey key) @safe;
 
-	/// Drop every entry whose `CacheKey.method` equals `method` (e.g. all
-	/// `resources/read` URIs at once).
-	void invalidateMethod(string method) @safe;
-
-	/// Drop every entry whose `CacheKey.partition` equals `partition` — i.e. one
-	/// principal's slice of a shared cache, leaving the shared (`""`) public
-	/// entries and other principals' entries intact. The client uses this on
-	/// `setBearerToken` to evict just its own private results on an identity change.
-	void invalidatePartition(string partition) @safe;
+	/// Drop every entry whose `CacheKey.server` equals `server` and whose
+	/// `CacheKey.partition` equals `partition` — one principal's slice of one
+	/// server's entries in a shared cache, leaving the shared (`""`) public
+	/// entries, other principals' entries, and other servers' entries intact. The
+	/// client uses this on `setBearerToken` to evict just its own private results
+	/// on an identity change.
+	void invalidatePartition(string server, string partition) @safe;
 
 	/// Drop every entry.
 	void clear() @safe;
@@ -151,18 +149,10 @@ final class InMemoryCacheStore : CacheStore
 		compactOrder();
 	}
 
-	override void invalidateMethod(string method) @safe
+	override void invalidatePartition(string server, string partition) @safe
 	{
 		foreach (k; entries_.keys)
-			if (k.method == method)
-				entries_.remove(k);
-		compactOrder();
-	}
-
-	override void invalidatePartition(string partition) @safe
-	{
-		foreach (k; entries_.keys)
-			if (k.partition == partition)
+			if (k.server == server && k.partition == partition)
 				entries_.remove(k);
 		compactOrder();
 	}
@@ -227,11 +217,7 @@ final class NullCacheStore : CacheStore
 	{
 	}
 
-	override void invalidateMethod(string) @safe
-	{
-	}
-
-	override void invalidatePartition(string) @safe
+	override void invalidatePartition(string, string) @safe
 	{
 	}
 
@@ -274,18 +260,6 @@ CacheStore noCache() @safe nothrow
 	s.invalidate(CacheKey("resources/read", "a"));
 	assert(s.get(CacheKey("resources/read", "a")).isNull);
 	assert(!s.get(CacheKey("resources/read", "b")).isNull);
-}
-
-@safe unittest  // invalidateMethod drops every entry for that method, leaving siblings
-{
-	auto s = new InMemoryCacheStore();
-	s.put(CacheKey("resources/read", "a"), CacheEntry(Json("a")));
-	s.put(CacheKey("resources/read", "b"), CacheEntry(Json("b")));
-	s.put(CacheKey("tools/list", ""), CacheEntry(Json("t")));
-	s.invalidateMethod("resources/read");
-	assert(s.get(CacheKey("resources/read", "a")).isNull);
-	assert(s.get(CacheKey("resources/read", "b")).isNull);
-	assert(!s.get(CacheKey("tools/list", "")).isNull);
 }
 
 @safe unittest  // clear empties the store
@@ -347,10 +321,20 @@ CacheStore noCache() @safe nothrow
 	s.put(CacheKey("tools/list", "", ""), CacheEntry(Json("shared")));
 	s.put(CacheKey("tools/list", "", "alice"), CacheEntry(Json("alice")));
 	s.put(CacheKey("tools/list", "", "bob"), CacheEntry(Json("bob")));
-	s.invalidatePartition("alice");
+	s.invalidatePartition("", "alice");
 	assert(s.get(CacheKey("tools/list", "", "alice")).isNull);
 	assert(!s.get(CacheKey("tools/list", "", "")).isNull, "shared public entry survives");
 	assert(!s.get(CacheKey("tools/list", "", "bob")).isNull, "other principal survives");
+}
+
+@safe unittest  // invalidatePartition spares the same principal's entries for other servers
+{
+	auto s = new InMemoryCacheStore();
+	s.put(CacheKey("tools/list", "", "alice", "a"), CacheEntry(Json("a")));
+	s.put(CacheKey("tools/list", "", "alice", "b"), CacheEntry(Json("b")));
+	s.invalidatePartition("a", "alice");
+	assert(s.get(CacheKey("tools/list", "", "alice", "a")).isNull);
+	assert(!s.get(CacheKey("tools/list", "", "alice", "b")).isNull);
 }
 
 @safe unittest  // eviction never drops a re-put key through the stale order slot of its earlier incarnation

@@ -431,8 +431,8 @@ s.defaultCacheTtl = 30.seconds; // cache even responses the server left unhinted
 auto c = McpClient.http(url, s);
 ```
 
-A `CacheStore` is a small `get`/`put`/`invalidate`/`invalidateMethod`/
-`invalidatePartition`/`clear` interface; supply your own to pre-seed entries and
+A `CacheStore` is a small `get`/`put`/`invalidate`/`invalidatePartition`/`clear`
+interface; supply your own to pre-seed entries and
 skip round-trips, or share one across clients. The default `InMemoryCacheStore`
 is per-client and bounded by an LRU-style size cap. `client.setCache`,
 `setDefaultCacheTtl`, and `clearCache` adjust this at runtime; `cache()` exposes
