@@ -86,6 +86,19 @@ struct StoredToken
 		return accessToken.length > 0;
 	}
 
+	/// Whether the token's granted `scope_` includes every scope in `requested`.
+	/// A step-up request for a scope the token lacks needs a new authorization:
+	/// neither reusing nor refreshing the token can widen it.
+	bool grantsScopes(const string[] requested) const @safe pure
+	{
+		import std.algorithm : canFind, splitter;
+
+		foreach (sc; requested)
+			if (!scope_.splitter(' ').canFind(sc))
+				return false;
+		return true;
+	}
+
 	/// Build a `StoredToken` from a freshly issued `TokenSet`, computing the
 	/// absolute expiry from `now + expiresIn` (only when `expiresIn` is
 	/// positive). A `TokenSet` from a refresh that omits `refresh_token` keeps
@@ -947,6 +960,8 @@ final class OAuthSession
 			auto prev = token_;
 			auto issuer = prev.issuer.length ? prev.issuer : as_.issuer;
 			token_ = StoredToken.fromTokenSet(ts, resource_, now, prev.refreshToken);
+			if (token_.scope_.length == 0)
+				token_.scope_ = prev.scope_;
 			if (prev.clientId.length)
 			{
 				token_.clientId = prev.clientId;
@@ -1111,7 +1126,10 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	// registration (and the tokens bound to it) must be replaced.
 	if (cached.clientSecretExpired(now))
 		cached = StoredToken.init;
-	if (cached.hasToken && !needsRefresh(cached, now))
+	// A token lacking a requested scope (a step-up after `insufficient_scope`)
+	// cannot be reused or refreshed into one that has it.
+	const scopesGranted = cached.grantsScopes(opts.scopes);
+	if (scopesGranted && cached.hasToken && !needsRefresh(cached, now))
 	{
 		return attachSession(client, new OAuthSession(oauth, as_,
 				cacheHitClient(cached, opts), store, oauth.resource, cached));
@@ -1121,7 +1139,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	// try it under that client id — persisted from the first login, or the
 	// pre-registered one — before registering anything new.
 	auto prior = cacheHitClient(cached, opts);
-	if (cached.refreshToken.length && prior.clientId.length)
+	if (scopesGranted && cached.refreshToken.length && prior.clientId.length)
 	{
 		try
 		{
@@ -1130,6 +1148,8 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 			{
 				auto refreshed = StoredToken.fromTokenSet(ts, oauth.resource,
 						now, cached.refreshToken);
+				if (refreshed.scope_.length == 0)
+					refreshed.scope_ = cached.scope_;
 				refreshed.setClient(persistedClient(prior, opts));
 				refreshed.issuer = as_.issuer;
 				store.save(oauth.resource, refreshed);
@@ -1179,6 +1199,9 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	// interactive browser wait by however long the user took to authenticate).
 	const long issuedAt = () @trusted { return Clock.currTime().toUnixTime(); }();
 	auto stored = StoredToken.fromTokenSet(ts, oauth.resource, issuedAt);
+	// An omitted `scope` means the requested scope was granted (RFC 6749 §5.1).
+	if (stored.scope_.length == 0)
+		stored.scope_ = opts.scopeString();
 	stored.setClient(persistedClient(rc, opts));
 	stored.issuer = as_.issuer;
 	store.save(oauth.resource, stored);
@@ -2571,6 +2594,115 @@ unittest  // useOAuth reuses a cached token whose issuer matches the discovered 
 	};
 
 	assert(useOAuth(McpClient.http(endpoint), endpoint, opts).token.accessToken == "still-valid");
+}
+
+unittest  // useOAuth re-authorizes instead of reusing a valid cached token that lacks a requested scope
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "narrow";
+	t.scope_ = "files:read";
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.wwwAuthenticate = `Bearer error="insufficient_scope", scope="files:read files:write"`;
+	opts.callbackTimeout = 50.msecs;
+	bool browserOpened;
+	opts.openBrowser = (string url) @safe { browserOpened = true; };
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert(browserOpened, "a step-up must run a new authorization");
+}
+
+unittest  // useOAuth does not refresh a cached token that lacks a requested scope
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "narrow";
+	t.refreshToken = "rt";
+	t.clientId = "abc123";
+	t.expiresAt = 1;
+	t.scope_ = "files:read";
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.scopes = ["files:read", "files:write"];
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe {};
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert(srv.refreshCalls == 0, "a refresh cannot widen the granted scope");
+}
+
+unittest  // useOAuth reuses a cached token whose scope covers the requested scopes
+{
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "wide";
+	t.scope_ = "files:write files:read";
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.scopes = ["files:read"];
+	opts.openBrowser = (string url) @safe {
+		assert(0, "no interactive login expected");
+	};
+
+	assert(useOAuth(McpClient.http(endpoint), endpoint, opts).token.accessToken == "wide");
+}
+
+unittest  // a refresh response that omits scope keeps the previously granted scope
+{
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt";
+	t.expiresAt = 1000;
+	t.scope_ = "files:read";
+	auto sess = new OAuthSession("https://mcp.example.com", t,
+			new MemoryTokenStore(), (string rt) @safe {
+		TokenSet ts;
+		ts.accessToken = "new";
+		return ts;
+	});
+	sess.bearerForRequest(5000);
+	assert(sess.token.scope_ == "files:read");
 }
 
 unittest  // refreshing an expired token preserves the registered client_id for later refreshes
