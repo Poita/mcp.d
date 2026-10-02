@@ -165,9 +165,11 @@ final class ReferenceTokenStore
 
 /// Adapt a `ReferenceTokenStore` into a `TokenValidator` for the resource
 /// server. On a live-token hit it returns a valid `TokenInfo` carrying the
-/// issued subject/scopes/claims, with `resource` added to the audience so
-/// `hasAudience(resource)` holds (satisfying the RFC 8707 binding even when the
-/// token was issued without an explicit audience). On a miss or expiry it
+/// issued subject/scopes/claims. A token issued without an audience is bound to
+/// `resource` (its audience becomes `[resource]`, satisfying the RFC 8707
+/// binding); a token issued with an explicit audience is accepted only when that
+/// audience names `resource`, so a store shared across resources never lets one
+/// resource's token through at another. On a miss, expiry or audience mismatch it
 /// returns `TokenInfo.invalid()`.
 TokenValidator referenceTokenValidator(ReferenceTokenStore store, string resource) @safe
 in (store !is null)
@@ -179,12 +181,14 @@ in (store !is null)
 		if (found.isNull)
 			return TokenInfo.invalid();
 		auto t = found.get;
+		if (t.audience.length && !t.audience.canFind(resource))
+			return TokenInfo.invalid();
 		TokenInfo info;
 		info.valid = true;
 		info.subject = t.subject;
 		info.scopes = t.scopes;
 		info.claims = t.claims;
-		info.audience = t.audience.canFind(resource) ? t.audience : t.audience ~ resource;
+		info.audience = t.audience.length ? t.audience : [resource];
 		return info;
 	};
 }
@@ -203,6 +207,32 @@ private long nowUnixSeconds() @safe
 // ===========================================================================
 // Tests
 // ===========================================================================
+
+@safe unittest  // referenceTokenValidator rejects a token issued for a different audience
+{
+	auto store = new ReferenceTokenStore();
+	IssuedToken t;
+	t.subject = "alice";
+	t.audience = ["https://other.example.com"];
+	t.expiresAt = long.max;
+	const tok = store.issue(t);
+
+	auto validate = referenceTokenValidator(store, "https://api.example.com");
+	assert(!validate(tok).valid);
+}
+
+@safe unittest  // referenceTokenValidator binds an audience-less token to the resource
+{
+	auto store = new ReferenceTokenStore();
+	IssuedToken t;
+	t.subject = "alice";
+	t.expiresAt = long.max;
+	const tok = store.issue(t);
+
+	auto info = referenceTokenValidator(store, "https://api.example.com")(tok);
+	assert(info.valid);
+	assert(info.audience == ["https://api.example.com"]);
+}
 
 @safe unittest  // the validator measures "now" in Unix seconds, matching IssuedToken.expiresAt
 {
