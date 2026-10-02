@@ -206,19 +206,32 @@ private alias ParamWireNames(alias func) = staticMap!(wireName, ParameterIdentif
 
 /// Reject a parameter of `func` with no name unless it is an injected context:
 /// every other parameter is an argument whose name is its wire name, and D
-/// gives an unnamed one an internal `__param_N` identifier.
+/// gives an unnamed one an internal `__param_N` identifier. Also reject two
+/// arguments sharing a wire name (`limit` and `limit_`).
 private void checkParamNames(alias func)()
 {
 	import std.algorithm.searching : startsWith;
 	import std.conv : to;
 
 	alias ids = ParameterIdentifierTuple!func;
-	static foreach (i, P; BoundParameters!func)
-		static if (!is(P : RequestContext) && !is(P == TaskContext))
+	alias names = ParamWireNames!func;
+	alias types = BoundParameters!func;
+	enum isArgument(size_t i) = !is(types[i] : RequestContext) && !is(types[i] == TaskContext);
+	static foreach (i, P; types)
+	{
+		static if (isArgument!i)
+		{
 			static assert(ids[i].length && !ids[i].startsWith("__param_"),
 					"parameter #" ~ (i + 1)
 						.to!string ~ " (" ~ P.stringof ~ ") of '" ~ __traits(identifier,
 							func) ~ "' has no name; name it, since its name is the argument's name");
+			static foreach (j; 0 .. i)
+				static if (isArgument!j)
+					static assert(names[j] != names[i],
+							"parameters '" ~ ids[j] ~ "' and '" ~ ids[i] ~ "' of '" ~ __traits(identifier,
+								func) ~ "' share the argument name '" ~ names[i] ~ "'");
+		}
+	}
 }
 
 /// Reject any method-level `@describeParam` or `@mcpHeader` UDA whose
@@ -4364,4 +4377,19 @@ unittest  // registerHandlers with a pointer to a struct dispatches to that stru
 	callToolArgs(s, "bump", `{}`);
 	callToolArgs(s, "bump", `{}`);
 	assert(api.calls == 2);
+}
+
+version (unittest) private final class SharedWireNameApi
+{
+	@tool("dup", "Two parameters with one wire name")
+	string dup(int limit, int limit_) @safe
+	{
+		return "";
+	}
+}
+
+unittest  // parameters whose names differ only by a trailing underscore are rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new SharedWireNameApi)));
 }
