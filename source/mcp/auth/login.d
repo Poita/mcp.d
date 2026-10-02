@@ -748,6 +748,36 @@ final class OAuthSession
 		return token_;
 	}
 
+	/// Record that the resource server rejected `rejectedAccessToken` (an HTTP
+	/// 401 whose `WWW-Authenticate` challenge carries `error="invalid_token"`).
+	/// When it is still the current access token, it is discarded here and in
+	/// the token store, so the next `bearerForRequest` refreshes via the
+	/// refresh-token grant, or throws demanding re-authentication when no
+	/// refresh token is held, and a later `useOAuth` does not reuse it. This is
+	/// the only way a token without a known expiry is ever replaced.
+	///
+	/// Naming the rejected token keeps concurrent rejections idempotent: a
+	/// request that failed with a token another request has already replaced
+	/// does not discard the replacement.
+	///
+	/// A transport wires this by retrying a request once after calling
+	/// `invalidate` with the bearer it sent, when the response is a 401
+	/// `invalid_token` challenge.
+	void invalidate(string rejectedAccessToken) @safe
+	{
+		import mcp.auth.oauth : constantTimeEquals;
+
+		refreshLock_.lock();
+		scope (exit)
+			refreshLock_.unlock();
+		if (!token_.hasToken || !constantTimeEquals(token_.accessToken, rejectedAccessToken))
+			return;
+		token_.accessToken = "";
+		token_.expiresAt = 0;
+		if (store_ !is null)
+			store_.save(resource_, token_);
+	}
+
 	/// `bearerForRequest` at the current wall-clock time. `useOAuth` installs this
 	/// as the client's bearer provider, so every request carries a fresh token.
 	string bearer() @safe
@@ -1404,6 +1434,66 @@ unittest  // OAuthSession returns an unknown-expiry token even with no refresh t
 	t.expiresAt = 0;
 	auto sess = new OAuthSession(new OAuthClient(), as_, rc, store, "https://mcp.example.com", t);
 	assert(sess.bearerForRequest(long.max - 100) == "no-expiry-token");
+}
+
+unittest  // a token the server rejected is refreshed on the next request even with no known expiry
+{
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "rejected-access";
+	t.refreshToken = "the-refresh";
+	t.expiresAt = 0;
+
+	string seenRefresh;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		seenRefresh = rt;
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		return ts;
+	};
+
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+	sess.invalidate("rejected-access");
+	assert(sess.bearerForRequest(5000) == "new-access");
+	assert(seenRefresh == "the-refresh");
+	assert(store.load("https://mcp.example.com").accessToken == "new-access");
+}
+
+unittest  // a rejected token with no refresh token demands re-authentication and leaves the store
+{
+	import std.exception : assertThrown;
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "rejected-access";
+	store.save("https://mcp.example.com", t);
+
+	int refreshes;
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, (string rt) @safe {
+		++refreshes;
+		return TokenSet.init;
+	});
+	sess.invalidate("rejected-access");
+	assertThrown(sess.bearerForRequest(5000));
+	assert(refreshes == 0);
+	// A later useOAuth must not reuse the rejected token from the store.
+	assert(!store.load("https://mcp.example.com").hasToken);
+}
+
+unittest  // invalidating a token that has already been replaced keeps the current one
+{
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "current-access";
+
+	int refreshes;
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, (string rt) @safe {
+		++refreshes;
+		return TokenSet.init;
+	});
+	sess.invalidate("stale-access");
+	assert(sess.bearerForRequest(5000) == "current-access");
+	assert(refreshes == 0);
 }
 
 unittest  // loopbackResponseHtml differs for success and failure
