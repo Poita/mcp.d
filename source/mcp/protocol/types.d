@@ -1099,10 +1099,11 @@ struct CallToolResult
 		// as such so the carrier round-trips.
 		if (isTask())
 			return makeCreateTaskResult(task);
-		// An `InputRequiredResult` is a distinct result shape (only `inputRequests`),
-		// not a `CallToolResult` with content — serialise it as such, tagged with
-		// its `resultType` discriminator like the other input-required results.
-		if (inputRequests.length)
+		// An `InputRequiredResult` is a distinct result shape (`inputRequests` and
+		// `requestState` only), not a `CallToolResult` with content — serialise it
+		// as such, tagged with its `resultType` discriminator like the other
+		// input-required results.
+		if (isInputRequired())
 		{
 			j["resultType"] = "input_required";
 			emitInputRequired(j, inputRequests, requestState);
@@ -1150,11 +1151,12 @@ struct CallToolResult
 	}
 
 	/// Whether this result is an MRTR `InputRequiredResult`: the server needs the
-	/// client to gather input (`inputRequests`) and retry the original `tools/call`
-	/// with matching `inputResponses`, rather than a completed tool result.
+	/// client to gather input (`inputRequests`) and/or echo its `requestState`,
+	/// retrying the original `tools/call`, rather than a completed tool result.
+	/// Either field alone marks the result as input-required.
 	bool isInputRequired() const @safe nothrow
 	{
-		return inputRequests.length > 0;
+		return inputRequests.length > 0 || requestState.length > 0;
 	}
 
 	/// Whether this result is a SEP-2663 task handle (`CreateTaskResult`): the
@@ -2703,6 +2705,20 @@ unittest  // an input-required CallToolResult serialises with the input_required
 	assert(r.toJson()["resultType"].get!string == "input_required");
 }
 
+unittest  // a requestState-only CallToolResult is input-required and round-trips its state
+{
+	import vibe.data.json : parseJsonString;
+
+	auto r = CallToolResult.fromJson(
+			parseJsonString(`{"resultType":"input_required","requestState":"s"}`));
+	assert(r.isInputRequired());
+	assert(r.requestState == "s");
+	auto j = r.toJson();
+	assert(j["resultType"].get!string == "input_required");
+	assert(j["requestState"].get!string == "s");
+	assert("content" !in j);
+}
+
 unittest  // a completed CallToolResult is not an InputRequiredResult
 {
 	CallToolResult r;
@@ -4191,10 +4207,10 @@ struct ReadResourceResult
 	Nullable!CacheHint cache;
 
 	/// Returns `true` when the server responded with an `InputRequiredResult`
-	/// instead of the resource contents.
+	/// (`inputRequests` and/or `requestState`) instead of the resource contents.
 	bool isInputRequired() const @safe nothrow
 	{
-		return inputRequests.length > 0;
+		return inputRequests.length > 0 || requestState.length > 0;
 	}
 
 	Json toJson() const @safe
@@ -4270,6 +4286,34 @@ unittest  // an input-required ReadResourceResult serialises with the input_requ
 	assert("date" in j["inputRequests"]);
 	assert(j["requestState"].get!string == "s1");
 	assert("contents" !in j);
+}
+
+unittest  // a requestState-only ReadResourceResult is input-required and round-trips its state
+{
+	import vibe.data.json : parseJsonString;
+
+	auto r = ReadResourceResult.fromJson(
+			parseJsonString(`{"resultType":"input_required","requestState":"s"}`));
+	assert(r.isInputRequired);
+	assert(r.requestState == "s");
+	auto j = r.toJson();
+	assert(j["resultType"].get!string == "input_required");
+	assert(j["requestState"].get!string == "s");
+	assert("contents" !in j);
+}
+
+unittest  // a requestState-only GetPromptResult is input-required and round-trips its state
+{
+	import vibe.data.json : parseJsonString;
+
+	auto r = GetPromptResult.fromJson(
+			parseJsonString(`{"resultType":"input_required","requestState":"s"}`));
+	assert(r.isInputRequired);
+	assert(r.requestState == "s");
+	auto j = r.toJson();
+	assert(j["resultType"].get!string == "input_required");
+	assert(j["requestState"].get!string == "s");
+	assert("messages" !in j);
 }
 
 unittest  // a plain ReadResourceResult is not input-required
@@ -4681,7 +4725,7 @@ struct GetPromptResult
 	/// instead of a final prompt result. Mirrors `CallToolResult.isInputRequired`.
 	bool isInputRequired() const @safe nothrow
 	{
-		return inputRequests.length > 0;
+		return inputRequests.length > 0 || requestState.length > 0;
 	}
 
 	Json toJson() const @safe

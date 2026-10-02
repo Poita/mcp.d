@@ -8345,6 +8345,36 @@ unittest  // MRTR: getPrompt stops at maxRounds prompts/get requests
 	assert(result.isInputRequired);
 }
 
+unittest  // MRTR: callTool retries a requestState-only input_required result, echoing the state
+{
+	auto c = McpClient.http("http://localhost/mcp");
+	int calls;
+	string echoed;
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "tools/call");
+		calls++;
+		Json res = Json.emptyObject;
+		if (calls == 1)
+		{
+			res["resultType"] = "input_required";
+			res["requestState"] = "s";
+			return res;
+		}
+		if ("requestState" in params)
+			echoed = params["requestState"].get!string;
+		res["content"] = Json([
+			Json(["type": Json("text"), "text": Json("done")])
+		]);
+		return res;
+	};
+
+	auto result = c.callTool("t", Json.emptyObject);
+	assert(calls == 2);
+	assert(echoed == "s");
+	assert(!result.isInputRequired);
+	assert(result.content[0].text == "done");
+}
+
 unittest  // a request on a closed client is refused without reaching the transport
 {
 	auto c = McpClient.http("http://localhost");
