@@ -2399,12 +2399,11 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		return streamRefused_;
 	}
 
-	/// The per-connection cancellation scope for this request. This is
-	/// the `Mcp-Session-Id` when stateful sessions are enabled, so a request and its
-	/// later `notifications/cancelled` -- which arrive on SEPARATE POSTs sharing only
-	/// that header -- resolve to the SAME `RequestScope` cancellation key. When
-	/// sessions are disabled there is no shared identifier across the two POSTs, so
-	/// the empty (shared) token is returned and bare-id cancellation is unscoped.
+	/// The per-connection cancellation scope for this request, as supplied by
+	/// the transport: the `Mcp-Session-Id` when stateful sessions are enabled, or a
+	/// per-principal scope on a stateless mount, so a request and its later
+	/// `notifications/cancelled` -- which arrive on SEPARATE POSTs -- resolve to
+	/// the SAME `RequestScope` cancellation key.
 	string connectionToken() @safe
 	{
 		return token_;

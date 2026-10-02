@@ -194,6 +194,7 @@ void mountMcp(URLRouter router, McpServer server,
 	// server mints/tracks an `Mcp-Session-Id`; a `stateless` server never does.
 	auto sessions = server.mode == ServerMode.stateful
 		? new SessionManager(opts.sessionIdleTtl, opts.maxSessions) : null;
+	auto statelessInFlight = sessions is null ? new StatelessInFlight : null;
 
 	// This mount owns a single fallback `ConnectionState`, which the server core
 	// threads through dispatch and reads back for the notify/push path. It is the
@@ -235,7 +236,7 @@ void mountMcp(URLRouter router, McpServer server,
 		string payload;
 		if (!readPostBody(req, res, opts.maxRequestBytes, payload))
 			return;
-		handlePost(server, coord, sessions, token, payload, req, res);
+		handlePost(server, coord, sessions, statelessInFlight, token, payload, req, res);
 	});
 	auto push = ensurePushChannel(server, coord);
 	if (sessions !is null)
@@ -1623,9 +1624,9 @@ private final class HttpScopedContext : BaseRequestContext, ConnectionScoped
 {
 	private string token_;
 	// The request's ConnectionState. For an inbound `notifications/cancelled` this
-	// is the session's state, so the cancellation flips the token in the SAME
-	// per-session in-flight registry the request side used (null in stateless mode,
-	// which has no cross-POST cancellation correlation). For the modern listen route
+	// is the session's state (or, stateless, a state over the mount's shared
+	// registry), so the cancellation flips the token in the SAME in-flight registry
+	// the request side used. For the modern listen route
 	// it is the per-request modern state, so dispatch resolves the modern effective
 	// version and serves the modern-only listen RPC.
 	private ConnectionState connState_;
@@ -1837,6 +1838,7 @@ private bool readPostBody(HTTPServerRequest req, HTTPServerResponse res,
 }
 
 private void handlePost(McpServer server, StreamCoordinator coord, SessionManager sessions,
+		StatelessInFlight statelessInFlight,
 		TokenInfo token, string payload, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 
@@ -1881,14 +1883,13 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 	}
 
 	// Per-connection cancellation scope. A request and its later
-	// `notifications/cancelled` arrive on SEPARATE POSTs that share only the
-	// `Mcp-Session-Id` header, so the cancellation registry must be keyed by that
-	// session id for the two to match. The token is therefore the session id when
-	// stateful sessions are enabled and applicable; otherwise the empty (shared)
-	// token, in which case bare-id cancellation is unscoped across connections
-	// (documented in `mcp.transport.session` -- stateful sessions are required for
-	// cross-client cancellation isolation).
+	// `notifications/cancelled` arrive on SEPARATE POSTs, so both must resolve to
+	// the same in-flight registry key. A stateful request is scoped by its
+	// `Mcp-Session-Id`; a stateless one by its authenticated principal, in the
+	// mount's shared `StatelessInFlight` registry.
 	const connToken = (sessions !is null) ? req.headers.get(SessionHeader, "") : "";
+	const cancelScope = (sessions !is null) ? connToken : StatelessInFlight.scopeFor(
+			principalOf(token));
 
 	// JSON-RPC batching (an array body) was introduced in 2025-03-26 and removed
 	// in every later revision: 2025-06-18 / 2025-11-25 / modern all require the
@@ -1915,8 +1916,8 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		// A batch is never an `initialize` (that is a single message), so no session
 		// is minted on this path: the only session id is the `Mcp-Session-Id` header
 		// (`connToken`).
-		ConnectionState reqState = postState(server, sessions, "", connToken,
-				req.headers.get(HttpHeader.protocolVersion, ""), Json.undefined);
+		ConnectionState reqState = postState(server, sessions, statelessInFlight, "",
+				connToken, req.headers.get(HttpHeader.protocolVersion, ""), Json.undefined);
 		const ver = (reqState !is null) ? reqState.negotiated : latestLegacy;
 		if (!streamableBatchAllowed(ver))
 		{
@@ -1931,7 +1932,7 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		// 2025-03-26 back-compat: the non-streaming batch path (no in-flight
 		// server->client traffic), dispatched against the resolved state so the
 		// legacy path is actually reachable for a session that negotiated 2025-03-26.
-		const txt = server.handleRaw(payload, reqState, connToken);
+		const txt = server.handleRaw(payload, reqState, cancelScope);
 		if (txt.length == 0)
 		{
 			res.statusCode = HTTPStatus.accepted;
@@ -1984,13 +1985,12 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		// `notifications/cancelled` resolves to the SAME per-session in-flight key the
 		// request side (HttpStreamContext) uses. Without this it would go through
 		// NullContext (token ""), never matching the scoped in-flight request.
-		// Carry the session's ConnectionState so a
-		// `notifications/cancelled` flips the cancellation token in the SAME
-		// per-session in-flight registry the request side used. Stateful only —
-		// stateless has no cross-POST correlation, so the state is null there.
+		// Carry the session's ConnectionState (stateful) or a state over the
+		// mount's shared stateless registry, so a `notifications/cancelled` flips the
+		// cancellation token in the SAME in-flight registry the request side used.
 		ConnectionState noteState = sessions !is null
-			? sessions.stateFor(connToken) : null;
-		server.handle(msg, new HttpScopedContext(connToken, noteState));
+			? sessions.stateFor(connToken) : statelessInFlight.share(new ConnectionState);
+		server.handle(msg, new HttpScopedContext(cancelScope, noteState));
 		res.statusCode = HTTPStatus.accepted;
 		res.writeBody("", "text/plain");
 		return;
@@ -2125,7 +2125,7 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		// for this session id (the just-minted id on `initialize`, else the
 		// `Mcp-Session-Id` header). Stateless HTTP -> a FRESH per-request state
 		// seeded from the effective version + `_meta`, retained nowhere.
-		ConnectionState reqState = postState(server, sessions, mintedSessionId,
+		ConnectionState reqState = postState(server, sessions, statelessInFlight, mintedSessionId,
 				connToken, req.headers.get(HttpHeader.protocolVersion, ""), msg.params);
 		// This request's version (its session's, or the stateless request's own)
 		// decides whether a server-initiated SSE stream leads with the
@@ -2138,7 +2138,7 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		const reqAcceptsSse = acceptsEventStream(req.headers.get("Accept", ""));
 		auto ctx = new HttpStreamContext(res, coord, clientCapsFor(server, reqState),
 				extractProgressToken(msg.params),
-				token, isModernReq, effVersion, connToken, reqState,
+				token, isModernReq, effVersion, cancelScope, reqState,
 				server.mode == ServerMode.stateless, reqAcceptsSse);
 		// A session-bound 2025-11-25 stream advertises resumability with its
 		// priming event, so record its events for a GET Last-Event-ID resume.
@@ -3609,7 +3609,11 @@ private ProtocolVersion effectivePostVersion(string protoHeader, ProtocolVersion
 ///     absent) and its capabilities are empty, since stateless legacy has no
 ///     session to carry an `initialize` handshake across requests. Features that
 ///     need the client's capabilities or later correlation require `stateful`.
+///
+/// Every stateless state shares the mount's `statelessInFlight` registry, so a
+/// `notifications/cancelled` on a later POST can find the request it names.
 private ConnectionState postState(McpServer server, SessionManager sessions,
+		StatelessInFlight statelessInFlight,
 		string mintedSessionId, string connToken, string protoHeader, Json params) @safe
 {
 	if (sessions !is null)
@@ -3618,7 +3622,40 @@ private ConnectionState postState(McpServer server, SessionManager sessions,
 			return sessions.stateFor(mintedSessionId, false);
 		return sessions.stateFor(connToken);
 	}
-	return freshStatelessState(protoHeader, params);
+	return statelessInFlight.share(freshStatelessState(protoHeader, params));
+}
+
+/// The in-flight cancellation registry a stateless mount shares across its
+/// POSTs. Each stateless request gets a fresh `ConnectionState`, so without a
+/// shared registry a `notifications/cancelled` arriving on a later POST could
+/// never find the request it names. Keys are scoped by the authenticated
+/// principal (see `scopeFor`), so one principal cannot cancel another's
+/// requests; unauthenticated callers share one scope.
+private final class StatelessInFlight
+{
+	import mcp.server.context : CancellationToken;
+
+	private CancellationToken[string] tokens;
+
+	this() @safe
+	{
+		// Allocate the table up front: an empty AA is null, and a null AA copied
+		// into a state would not alias this one.
+		tokens = new CancellationToken[string];
+	}
+
+	/// The connection token scoping `principal`'s requests in the registry.
+	static string scopeFor(string principal) @safe
+	{
+		return "\x1estateless\x1e" ~ principal;
+	}
+
+	/// Point `state`'s in-flight registry at the shared table and return it.
+	ConnectionState share(ConnectionState state) @safe
+	{
+		state.inFlight = tokens;
+		return state;
+	}
 }
 
 /// The client capabilities a `HttpStreamContext` should advertise for a request,
@@ -4967,4 +5004,78 @@ unittest  // CORS: disallowed and absent origins get no CORS headers and no pref
 	assert(none.statusCode == 200);
 	assert("Access-Control-Allow-Origin" !in none.headers);
 	assert("Access-Control-Expose-Headers" !in none.headers);
+}
+
+unittest  // stateless: notifications/cancelled reaches the same principal's in-flight request only
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	StreamableHttpOptions opts;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = t == "tok-alice" || t == "tok-bob";
+		info.subject = t == "tok-alice" ? "alice" : "bob";
+		return info;
+	};
+	auto server = McpServer.stateless("t", "1");
+	bool cancelled, release;
+	Tool descriptor;
+	descriptor.name = "wait";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		while (!release && !ctx.isCancelled())
+			yield();
+		cancelled = ctx.isCancelled();
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server, opts);
+
+	string[string] headersFor(string bearer) @safe
+	{
+		return [
+			"Accept": "application/json, text/event-stream",
+			"Content-Type": "application/json",
+			"MCP-Protocol-Version": "2025-06-18",
+			"Authorization": "Bearer " ~ bearer,
+		];
+	}
+
+	enum cancel5 = `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}`;
+	int callStatus;
+	bool cancelledByOther;
+	runTask(() nothrow{
+		try
+			callStatus = corsRequest(router, HTTPMethod.POST, headersFor("tok-alice"), `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"wait","arguments":{}}}`)
+				.statusCode;
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runTask(() nothrow{
+		try
+		{
+			foreach (_; 0 .. 8)
+				yield();
+			corsRequest(router, HTTPMethod.POST, headersFor("tok-bob"), cancel5);
+			foreach (_; 0 .. 8)
+				yield();
+			cancelledByOther = cancelled;
+			corsRequest(router, HTTPMethod.POST, headersFor("tok-alice"), cancel5);
+			foreach (_; 0 .. 64)
+				yield();
+			release = true;
+		}
+		catch (Exception)
+			release = true;
+	});
+	runEventLoop();
+	assert(!cancelledByOther, "another principal must not cancel the request");
+	assert(cancelled, "the requesting principal's notifications/cancelled must reach it");
+	assert(callStatus == 202, "a cancelled request sends no response");
 }
