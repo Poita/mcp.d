@@ -3217,7 +3217,7 @@ final class McpClient : ClientProtocol
 			// The occurrence is recorded and the watermark moved past it only once
 			// it is handled, so a throwing handler leaves the server's redelivery
 			// to be processed and the cursor at the last processed event.
-			if (sub.isSeen(o.eventId))
+			if (!sub.active || sub.isSeen(o.eventId))
 				return;
 			if (onEvent !is null)
 				onEvent(o);
@@ -3231,6 +3231,12 @@ final class McpClient : ClientProtocol
 				onControl(c);
 		});
 		sub.onTeardown(() @safe nothrow{
+			// Deregister first so a failed unsubscribe still stops local delivery.
+			try
+				rx.unregister(id);
+			catch (Exception)
+			{
+			}
 			try
 			{
 				UnsubscribeParams u;
@@ -3238,7 +3244,6 @@ final class McpClient : ClientProtocol
 				u.arguments = p.arguments;
 				u.url = p.delivery.url;
 				unsubscribeWebhookEvents(u);
-				rx.unregister(id);
 			}
 			catch (Exception)
 			{
@@ -10352,6 +10357,28 @@ unittest  // subscribeWebhook registers the receiver under the server id and tea
 	sub.cancel();
 	assert(unsubs == 1);
 	assert(rx.processDelivery("{}", known).status == 503); // deregistered
+}
+
+unittest  // cancelling a webhook subscription deregisters the receiver even when unsubscribe fails
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "events/unsubscribe")
+			throw new McpException(ErrorCode.internalError, "server down");
+		SubscribeResult r;
+		r.id = "sub_x";
+		return r.toJson();
+	};
+	auto rx = new WebhookReceiver();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+	auto sub = c.subscribeWebhook(rx, sp, (EventOccurrence o) @safe {});
+	sub.cancel();
+	string[string] known;
+	known["x-mcp-subscription-id"] = "sub_x";
+	assert(rx.processDelivery("{}", known).status == 503,
+			"a cancelled subscription must stop being routed by the receiver");
 }
 
 version (unittest)
