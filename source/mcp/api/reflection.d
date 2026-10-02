@@ -191,6 +191,23 @@ private alias BoundParameters(alias func) = staticMap!(Unqual, Parameters!func);
 /// prompt arguments, and URI template variables use.
 private alias ParamWireNames(alias func) = staticMap!(wireName, ParameterIdentifierTuple!func);
 
+/// Reject a parameter of `func` with no name unless it is an injected context:
+/// every other parameter is an argument whose name is its wire name, and D
+/// gives an unnamed one an internal `__param_N` identifier.
+private void checkParamNames(alias func)()
+{
+	import std.algorithm.searching : startsWith;
+	import std.conv : to;
+
+	alias ids = ParameterIdentifierTuple!func;
+	static foreach (i, P; BoundParameters!func)
+		static if (!is(P : RequestContext) && !is(P == TaskContext))
+			static assert(ids[i].length && !ids[i].startsWith("__param_"),
+					"parameter #" ~ (i + 1)
+						.to!string ~ " (" ~ P.stringof ~ ") of '" ~ __traits(identifier,
+							func) ~ "' has no name; name it, since its name is the argument's name");
+}
+
 /// Reject any method-level `@describeParam` or `@mcpHeader` UDA whose
 /// `parameter` does not name a schema parameter of `func`. A parameter that is
 /// not declared at all, or one that is an injected context parameter (a trailing
@@ -274,6 +291,7 @@ private Json parametersSchema(alias func)() @safe
 	import mcp.protocol.mrtr : validateHeaderName;
 	import std.traits : ParameterDefaultValueTuple;
 
+	checkParamNames!func();
 	validateParamUdas!func();
 
 	alias names = ParamWireNames!func;
@@ -865,6 +883,7 @@ private GetPromptResult toPromptResult(R)(R ret) @safe
 private void registerPromptMethod(string memberName, alias overload, alias parent)(
 		McpServer server, prompt attr) @safe
 {
+	checkParamNames!overload();
 	validateParamUdas!overload();
 
 	Prompt descriptor;
@@ -1024,6 +1043,7 @@ private void registerTemplateMethod(string memberName, alias overload,
 	if (attr.title.length)
 		descriptor.title = nullable(attr.title);
 
+	checkParamNames!overload();
 	// Every bound parameter must name a template variable; any other name would
 	// silently receive an empty or default value on every read.
 	static foreach (i, P; BoundParameters!overload)
@@ -4179,4 +4199,49 @@ unittest  // a @resource method taking a non-context parameter is rejected at co
 {
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new ArgResourceApi)));
+}
+
+version (unittest) private final class UnnamedToolParamApi
+{
+	@tool("anon", "A tool with an unnamed parameter")
+	string anon(int) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class UnnamedPromptParamApi
+{
+	@prompt("anon", "A prompt with an unnamed parameter")
+	string anon(string) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class UnnamedContextParamApi
+{
+	@tool("ctx", "A tool whose unnamed parameter is the injected context")
+	string ctx(int n, RequestContext) @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a tool with an unnamed schema parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UnnamedToolParamApi)));
+}
+
+unittest  // a prompt with an unnamed argument parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UnnamedPromptParamApi)));
+}
+
+unittest  // an unnamed injected context parameter needs no name
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new UnnamedContextParamApi);
 }
