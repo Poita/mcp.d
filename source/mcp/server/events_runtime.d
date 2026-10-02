@@ -1292,7 +1292,17 @@ final class EventsRuntime
 		// on_subscribe runs before the subscription is stored, so a throwing hook
 		// leaves nothing behind that delivers to a client that got an error.
 		if (isNew)
+		{
 			acquireLifecycle(*reg, p.name, p.arguments, principal, id);
+			// on_subscribe may yield, letting a concurrent subscribe of the same
+			// key store it first: that one holds the reference, so this call
+			// drops its own and proceeds as a refresh.
+			if (!webhookStore_.get(id).isNull)
+			{
+				releaseLifecycle(p.name, p.arguments, principal);
+				return subscribeWebhook(p, principal);
+			}
+		}
 		webhookStore_.put(sub);
 		// A fresh subscription replays from its cursor (or bootstraps a fresh one);
 		// the backfill reports whether delivery starts later than that cursor.
@@ -2650,7 +2660,7 @@ final class EventsRuntime
 	{
 		const key = leaseKey(name, arguments, principal);
 		const now = opts_.nowMs();
-		const fresh = (key in pollLeases_) is null;
+		bool fresh = (key in pollLeases_) is null;
 		const subId = pollSubscriptionId(name, arguments, principal);
 		// Each distinct (name, arguments) a principal polls holds a lease and may
 		// provision an upstream via on_subscribe, so the number it may hold at once
@@ -2662,7 +2672,16 @@ final class EventsRuntime
 		// on_subscribe runs before the lease is recorded, so a throwing hook is
 		// retried by the next poll rather than never firing again.
 		if (fresh)
+		{
 			acquireLifecycle(reg, name, arguments, principal, subId);
+			// on_subscribe may yield, letting a concurrent poll of the same key
+			// record the lease first; that lease already holds a reference.
+			if ((key in pollLeases_) !is null)
+			{
+				releaseLifecycle(name, arguments, principal);
+				fresh = false;
+			}
+		}
 		pollLeases_[key] = PollLease(name, principal, arguments, subId,
 				now + opts_.pollLeaseTtl.total!"msecs");
 		if (fresh)
@@ -3772,6 +3791,31 @@ unittest  // a throwing on_subscribe leaves no poll lease behind, so the next po
 	assert(calls == 2);
 }
 
+unittest  // concurrent first polls for one key hold a single lease and lifecycle reference
+{
+	long now = 1_000_000;
+	auto rt = testRuntime(() @safe => now);
+	int subs, unsubs;
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c");
+	// A second poll running while the first one's on_subscribe yields.
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		if (++subs == 1)
+			rt.poll("n", Json.emptyObject, "u", Nullable!string.init,
+					Nullable!long.init, Nullable!long.init);
+	};
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	rt.register(reg);
+	rt.poll("n", Json.emptyObject, "u", Nullable!string.init,
+			Nullable!long.init, Nullable!long.init);
+	assert(rt.pollLeaseCount_.get("u", 0) == 1);
+	now += 10 * 60 * 1000;
+	rt.sweepPollLeases();
+	assert(subs == 1 && unsubs == 1);
+	assert(rt.pollLeaseCount_.get("u", 0) == 0);
+}
+
 unittest  // a throwing on_subscribe does not leave a push stream registered
 {
 	auto rt = testRuntime();
@@ -4469,6 +4513,27 @@ unittest  // unsubscribeWebhook removes the subscription and fires on_unsubscrib
 	u.url = "https://proxy/hooks";
 	rt.unsubscribeWebhook(u, "user-1");
 	assert(rt.webhookStore().get(r.id).isNull && unsubs == 1);
+}
+
+unittest  // concurrent first webhook subscribes for one key hold a single lifecycle reference
+{
+	auto rt = testRuntime();
+	int subs, unsubs;
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	// A second subscribe running while the first one's on_subscribe yields.
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		if (++subs == 1)
+			rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	};
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	UnsubscribeParams u;
+	u.name = "n";
+	u.arguments = Json.emptyObject;
+	u.url = "https://proxy/hooks";
+	rt.unsubscribeWebhook(u, "user-1");
+	assert(subs == 1 && unsubs == 1);
 }
 
 unittest  // a throwing on_subscribe stores no webhook subscription
