@@ -296,8 +296,17 @@ final class TaskRuntime
 			logWarn("task %s: status notification failed: %s", id, e.msg);
 	}
 
+	/// Move `r` to `status`. The status message describes the state being left,
+	/// so it is cleared; a caller with a message for the new state sets it after.
+	private static void transition(ref TaskRecord r, TaskStatus status) @safe
+	{
+		r.meta.status = status;
+		r.meta.statusMessage = Nullable!string.init;
+	}
+
 	/// Update a `working`/`input_required` task's human-readable status message.
-	/// A no-op if the task is already terminal.
+	/// A no-op if the task is already terminal. The next status transition
+	/// clears it.
 	void progress(string id, string statusMessage) @safe
 	{
 		modify(id, (ref TaskRecord r) @safe {
@@ -315,7 +324,7 @@ final class TaskRuntime
 		modify(id, (ref TaskRecord r) @safe {
 			if (isTerminal(r.meta.status))
 				return Change.none;
-			r.meta.status = TaskStatus.completed;
+			transition(r, TaskStatus.completed);
 			r.result = nullable(result);
 			r.inputRequests = Json.emptyObject;
 			return Change.status;
@@ -329,7 +338,7 @@ final class TaskRuntime
 		modify(id, (ref TaskRecord r) @safe {
 			if (isTerminal(r.meta.status))
 				return Change.none;
-			r.meta.status = TaskStatus.failed;
+			transition(r, TaskStatus.failed);
 			r.error = nullable(error);
 			r.inputRequests = Json.emptyObject;
 			return Change.status;
@@ -357,12 +366,12 @@ final class TaskRuntime
 				return Change.none;
 			if (r.cancelRequested)
 			{
-				r.meta.status = TaskStatus.cancelled;
+				transition(r, TaskStatus.cancelled);
 				r.inputRequests = Json.emptyObject;
 			}
 			else
 			{
-				r.meta.status = TaskStatus.inputRequired;
+				transition(r, TaskStatus.inputRequired);
 				r.inputRequests = (inputRequests.type == Json.Type.object)
 					? inputRequests : Json.emptyObject;
 				// A key asked for again needs a fresh answer: drop the earlier one
@@ -386,7 +395,7 @@ final class TaskRuntime
 				return Change.none;
 			if (r.cancelRequested)
 			{
-				r.meta.status = TaskStatus.cancelled;
+				transition(r, TaskStatus.cancelled);
 				return Change.status;
 			}
 			r.detached = true;
@@ -402,7 +411,7 @@ final class TaskRuntime
 		return modify(id, (ref TaskRecord r) @safe {
 			if (r.meta.status != TaskStatus.inputRequired)
 				return Change.none;
-			r.meta.status = TaskStatus.working;
+			transition(r, TaskStatus.working);
 			r.inputRequests = Json.emptyObject;
 			r.detached = false;
 			return Change.status;
@@ -423,7 +432,7 @@ final class TaskRuntime
 			r.cancelRequested = true;
 			if (r.toolName.length == 0 || r.detached || r.meta.status == TaskStatus.inputRequired)
 			{
-				r.meta.status = TaskStatus.cancelled;
+				transition(r, TaskStatus.cancelled);
 				r.inputRequests = Json.emptyObject;
 				return Change.status;
 			}
@@ -438,7 +447,7 @@ final class TaskRuntime
 		modify(id, (ref TaskRecord r) @safe {
 			if (isTerminal(r.meta.status))
 				return Change.none;
-			r.meta.status = TaskStatus.cancelled;
+			transition(r, TaskStatus.cancelled);
 			return Change.status;
 		});
 	}
@@ -704,6 +713,34 @@ unittest  // a throwing status-change sink neither fails the transition nor reac
 	]));
 	auto d = rt.getDetailed(t.taskId);
 	assert(d["status"].get!string == "input_required");
+}
+
+unittest  // a status transition clears the previous status message
+{
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto done = rt.createFor("t", Json.undefined);
+	rt.progress(done.taskId, "halfway");
+	rt.complete(done.taskId, Json.emptyObject);
+	assert("statusMessage" !in rt.getDetailed(done.taskId));
+
+	auto failed = rt.createFor("t", Json.undefined);
+	rt.progress(failed.taskId, "halfway");
+	rt.fail(failed.taskId, Json(["code": Json(-32000), "message": Json("boom")]));
+	assert("statusMessage" !in rt.getDetailed(failed.taskId));
+
+	auto cancelled = rt.createFor("t", Json.undefined);
+	rt.progress(cancelled.taskId, "halfway");
+	rt.cancel(cancelled.taskId);
+	rt.markCancelled(cancelled.taskId);
+	assert("statusMessage" !in rt.getDetailed(cancelled.taskId));
+
+	auto resumed = rt.createFor("t", Json.undefined);
+	rt.requireInput(resumed.taskId, Json([
+			"k": Json(["method": Json("elicitation/create")])
+	]));
+	rt.progress(resumed.taskId, "waiting for approval");
+	assert(rt.resumeWorking(resumed.taskId));
+	assert("statusMessage" !in rt.getDetailed(resumed.taskId));
 }
 
 unittest  // a unique-id collision from a bad generator is retried, then errors
