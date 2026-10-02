@@ -3029,7 +3029,7 @@ private void writeCanonical(R)(ref R sink, Json j) @safe
 		sink.put(j.toString());
 		break;
 	case Json.Type.float_:
-		sink.put(to!string(j.get!double));
+		sink.put(roundTripDouble(j.get!double));
 		break;
 	case Json.Type.string:
 		sink.put(Json(j.get!string).toString()); // properly escaped
@@ -3063,6 +3063,24 @@ private void writeCanonical(R)(ref R sink, Json j) @safe
 		sink.put('}');
 		break;
 	}
+}
+
+/// The shortest `%g` rendering of `d` (15 to 17 significant digits) that parses
+/// back to exactly `d`, so distinct doubles never share a canonical form.
+private string roundTripDouble(double d) @safe
+{
+	import std.format : format;
+	import std.string : toStringz;
+	import core.stdc.stdlib : strtod;
+
+	// strtod parses correctly rounded, unlike std.conv for some magnitudes.
+	foreach (precision; 15 .. 17)
+	{
+		auto s = format("%.*g", precision, d);
+		if (()@trusted { return strtod(s.toStringz, null); }() == d)
+			return s;
+	}
+	return format("%.17g", d);
 }
 
 /// Lowercase hex SHA-256 of `s`. Used to derive stable subscription/lease ids.
@@ -3178,6 +3196,25 @@ unittest  // canonicalJsonString is key-order independent
 	auto b = canonicalJsonString(Json(["a": Json(2), "b": Json(1)]));
 	assert(a == b);
 	assert(a == `{"a":2,"b":1}`);
+}
+
+unittest  // canonicalJsonString distinguishes floats that differ past six significant digits
+{
+	assert(canonicalJsonString(Json(1.0000001)) != canonicalJsonString(Json(1.0000002)));
+	assert(canonicalJsonString(Json(123456789.0)) != canonicalJsonString(Json(123456790.0)));
+}
+
+unittest  // canonicalJsonString writes floats in a form that round-trips
+{
+	import std.string : toStringz;
+	import core.stdc.stdlib : strtod;
+
+	foreach (d; [0.1, 1.0000001, 123456789.0, 1e-300, 2.5, -3.75e20])
+		assert(() @trusted {
+			return strtod(canonicalJsonString(Json(d)).toStringz, null);
+		}() == d);
+	assert(canonicalJsonString(Json(2.5)) == "2.5");
+	assert(canonicalJsonString(Json(0.1)) == "0.1");
 }
 
 unittest  // sha256Hex is stable and lowercase hex
