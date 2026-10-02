@@ -1387,7 +1387,7 @@ unittest  // an embedded IPv4 tail after hextets parses into the low 32 bits
 	assert(classifyIpv6Literal("::ffff:127.0.0.1") == AddressClass.loopback);
 	assert(classifyIpv6Literal("64:ff9b::10.0.0.1") == AddressClass.privateOrLinkLocal);
 	assert(classifyIpv6Literal("2001:db8:1:2:3:4:8.8.8.8") == AddressClass.public_);
-	classifyHost("[::FFFF:8.8.8.8]", pin);
+	assert(classifyHost("[::FFFF:8.8.8.8]", pin) == AddressClass.public_);
 	assert(pin == "::ffff:808:808", pin);
 }
 
@@ -1398,19 +1398,19 @@ unittest  // an embedded IPv4 tail octet of a single zero is still accepted
 
 unittest  // classifyHost pins an IPv6 literal as the canonical rendering of its bytes
 {
-	string pin;
-	classifyHost("[2001:0DB8:0:0::1]:443", pin);
-	assert(pin == "2001:db8::1", pin);
-	classifyHost("[::8.8.8.8]", pin);
-	assert(pin == "::808:808", pin);
-	classifyHost("[::FFFF:808:808]", pin);
-	assert(pin == "::ffff:808:808", pin);
-	classifyHost("[2001:db8:0:1:0:0:0:1]", pin);
-	assert(pin == "2001:db8:0:1::1", pin);
-	classifyHost("[2001:db8:1:2:3:4:5:6]", pin);
-	assert(pin == "2001:db8:1:2:3:4:5:6", pin);
-	classifyHost("[fe80::1%25eth0]", pin);
-	assert(pin == "fe80::1%25eth0", pin);
+	static string pinOf(string host)
+	{
+		string pin;
+		cast(void) classifyHost(host, pin);
+		return pin;
+	}
+
+	assert(pinOf("[2001:0DB8:0:0::1]:443") == "2001:db8::1");
+	assert(pinOf("[::8.8.8.8]") == "::808:808");
+	assert(pinOf("[::FFFF:808:808]") == "::ffff:808:808");
+	assert(pinOf("[2001:db8:0:1:0:0:0:1]") == "2001:db8:0:1::1");
+	assert(pinOf("[2001:db8:1:2:3:4:5:6]") == "2001:db8:1:2:3:4:5:6");
+	assert(pinOf("[fe80::1%25eth0]") == "fe80::1%25eth0");
 }
 
 unittest  // classifyHost leaves an unparseable IPv6 literal unpinned
