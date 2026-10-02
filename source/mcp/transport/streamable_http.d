@@ -246,10 +246,18 @@ unittest  // a disabled (no-validator) config is never rejected, even with no AS
 /// implementing the modern Streamable HTTP transport (single endpoint):
 ///   - POST: a JSON-RPC message/batch; returns `application/json` for requests,
 ///     or `202 Accepted` with no body when the payload needs no reply.
-///   - GET:  on the stable revisions, opens a standalone server->client SSE
-///     stream wired to the server-push channel (`McpServer.notify`); on the
-///     modern, which drops the standalone stream, GET -> 405.
-///   - DELETE: 2026-07-28 has no protocol-level sessions to tear down -> 405.
+///   - GET: on a stateful server, opens the session's standalone
+///     server->client SSE stream wired to the server-push channel
+///     (`McpServer.notify`): 400 without `Mcp-Session-Id`, 404 for an unknown
+///     session, 406 when Accept excludes `text/event-stream`, 429 past
+///     `StreamLimits.maxGetStreamsPerSession`. A stateless
+///     server keeps no session to push on, so GET is always 405 (`Allow: POST`).
+///   - DELETE: on a stateful server, terminates the session named by
+///     `Mcp-Session-Id` (204; 400 without the header, 404 for an unknown
+///     session). A stateless server has no session to tear down -> 405.
+///
+/// A stateful server never speaks 2026-07-28, so GET and DELETE are 2025-era
+/// only; an unsupported `MCP-Protocol-Version` on either is 400.
 ///
 /// On a stateless server a `notifications/cancelled` POST reaches only requests
 /// of the same authenticated principal. Unauthenticated callers cannot be told
