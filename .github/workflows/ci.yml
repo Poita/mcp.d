@@ -100,6 +100,13 @@ jobs:
       - name: Build
         run: dub build
 
+      # bench/ is a separate dub package that nothing else builds, so compile
+      # both of its programs here to catch API drift.
+      - name: Build bench
+        if: runner.os == 'Linux'
+        working-directory: bench
+        run: dub build -c server -b release && dub build -c client -b release
+
       - name: Test
         run: dub test
 
