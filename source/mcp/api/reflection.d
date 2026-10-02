@@ -1023,6 +1023,7 @@ private void registerTemplateMethod(string memberName, alias overload,
 		import mcp.protocol.errors : invalidParams;
 
 		alias names = ParameterIdentifierTuple!overload;
+		alias defs = ParameterDefaultValueTuple!overload;
 		Tuple!(BoundParameters!overload) argv;
 		static foreach (i, P; BoundParameters!overload)
 		{
@@ -1031,13 +1032,12 @@ private void registerTemplateMethod(string memberName, alias overload,
 			// exactly as the tool path does.
 			static if (is(P : RequestContext))
 				argv[i] = ctx;
-			else static if (is(P == string))
-				argv[i] = (names[i] in params) ? params[names[i]] : "";
 			else
 			{
 				// A captured URI variable is always a string; parse it into the
 				// declared parameter type and surface a conversion failure as
-				// InvalidParams.
+				// InvalidParams. A variable the URI does not supply binds the
+				// parameter's declared default, or `P.init` when it has none.
 				if (auto pv = names[i] in params)
 				{
 					try
@@ -1046,8 +1046,8 @@ private void registerTemplateMethod(string memberName, alias overload,
 						throw invalidParams("resource template parameter '" ~ names[i]
 							~ "' could not be parsed as " ~ P.stringof ~ ": " ~ e.msg);
 				}
-				else
-					setBound(argv[i], P.init);
+				else static if (!is(defs[i] == void))
+					setBound!P(argv[i], defs[i]);
 			}
 		}
 		auto ret = __traits(getMember, parent, memberName)(argv.expand);
@@ -3862,6 +3862,34 @@ version (unittest) private final class QualifiedParamApi
 
 		return "q-" ~ id.to!string;
 	}
+}
+
+version (unittest) private final class DefaultTemplateParamApi
+{
+	@resourceTemplate("item://{id}{?fmt,n}", "Item", "text/plain")
+	string item(string id, string fmt = "json", int n = 3) @safe
+	{
+		import std.conv : to;
+
+		return id ~ "/" ~ fmt ~ "/" ~ n.to!string;
+	}
+}
+
+unittest  // a @resourceTemplate parameter absent from the URI binds its declared default
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DefaultTemplateParamApi);
+
+	Json rp = Json.emptyObject;
+	rp["uri"] = "item://42";
+	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	assert(rr["result"]["contents"][0]["text"].get!string == "42/json/3", rr.toString);
+
+	rp["uri"] = "item://42?fmt=xml&n=5";
+	rr = s.handle(Message(makeRequest(Json(2), "resources/read", rp))).get;
+	assert(rr["result"]["contents"][0]["text"].get!string == "42/xml/5", rr.toString);
 }
 
 unittest  // handlers with in/const/immutable parameters register and dispatch
