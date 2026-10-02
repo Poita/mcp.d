@@ -863,10 +863,12 @@ in (exchange !is null)
 				res.writeJsonBody(err);
 				return;
 			}
+			import std.array : join;
+
 			const brokered = proxy.issueClientToken(upstream);
 			res.statusCode = HTTPStatus.ok;
 			res.writeJsonBody(brokerTokenResponseJson(brokered.token,
-				brokered.expiresIn, upstream.scope_));
+				brokered.expiresIn, brokered.issued.scopes.join(" ")));
 			return;
 		}
 
@@ -2741,6 +2743,55 @@ unittest  // BROKER MOUNT: expires_in reflects the minted token's lifetime, not 
 			redeemableCodeForm(proxy), "");
 	assert(res.status == 200);
 	assert(parseJsonString(res.body_)["expires_in"].get!long == 600);
+}
+
+unittest  // BROKER MOUNT: scope reflects the minted token's scopes, not the upstream token's
+{
+	import vibe.data.json : parseJsonString;
+
+	auto store = new ReferenceTokenStore();
+	auto cfg = brokerMountConfig(store);
+	cfg.issueToken = (TokenSet upstream) @safe {
+		IssuedToken t;
+		t.subject = "octocat";
+		t.scopes = ["mcp:read", "mcp:write"];
+		t.expiresAt = long.max;
+		return t;
+	};
+	auto proxy = new OAuthProxy(cfg);
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(
+				`{"access_token":"gho_upstream","token_type":"bearer","scope":"repo user"}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 200);
+	assert(parseJsonString(res.body_)["scope"].get!string == "mcp:read mcp:write");
+}
+
+unittest  // BROKER MOUNT: a minted token without scopes carries no scope
+{
+	import vibe.data.json : parseJsonString;
+
+	auto store = new ReferenceTokenStore();
+	auto cfg = brokerMountConfig(store);
+	cfg.issueToken = (TokenSet upstream) @safe {
+		IssuedToken t;
+		t.subject = "octocat";
+		t.expiresAt = long.max;
+		return t;
+	};
+	auto proxy = new OAuthProxy(cfg);
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(
+				`{"access_token":"gho_upstream","token_type":"bearer","scope":"repo user"}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 200);
+	assert("scope" !in parseJsonString(res.body_));
 }
 
 unittest  // BROKER MOUNT: a non-expiring minted token carries no expires_in
