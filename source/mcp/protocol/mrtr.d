@@ -664,9 +664,6 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 // Multi Round-Trip Requests (MRTR) — SEP-2322
 // ===========================================================================
 
-/// One unit of input the server needs from the client to continue (replacing a
-/// server-initiated `sampling/createMessage`, `elicitation/create`, or
-/// `roots/list` request).
 /// The kind of server->client request an MRTR `InputRequest` stands in for.
 /// Maps to the wire `type` discriminator (`"sampling"`/`"elicitation"`/`"roots"`).
 enum InputKind
@@ -676,6 +673,9 @@ enum InputKind
 	roots,
 }
 
+/// One unit of input the server needs from the client to continue (replacing a
+/// server-initiated `sampling/createMessage`, `elicitation/create`, or
+/// `roots/list` request).
 struct InputRequest
 {
 	string id; /// correlation id chosen by the server (the `InputRequests` map key)
@@ -783,7 +783,7 @@ struct InputRequest
 	/// Read `params["url"]` as a string (`""` when absent) — the reader
 	/// counterpart to the `elicitationUrl` builder. Non-empty only for url-mode
 	/// elicitation requests (`params["mode"] == "url"`).
-	string elicitationUrl() @safe
+	string url() @safe
 	{
 		if (params.type == Json.Type.object && "url" in params
 				&& params["url"].type == Json.Type.string)
@@ -1900,7 +1900,7 @@ unittest  // InputRequest.elicitationUrl builds modern url-mode params (no elici
 unittest  // InputRequest.elicitationUrl readers round-trip url and message
 {
 	auto ir = InputRequest.elicitationUrl("e1", "msg", "https://example.com/consent");
-	assert(ir.elicitationUrl() == "https://example.com/consent");
+	assert(ir.url() == "https://example.com/consent");
 	assert(ir.elicitationMessage() == "msg");
 }
 

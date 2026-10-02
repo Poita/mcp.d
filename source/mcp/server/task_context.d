@@ -238,14 +238,15 @@ private final class DispatchOutcome
 alias TaskExecutor = Json delegate(TaskContext tc) @safe;
 
 /// Drives the task lifecycle for one dispatch: build the context, run `executor`,
-/// and record the outcome on the durable task. A normal return completes the task
-/// and any other exception fails it, except that either marks it `cancelled` when
-/// a cancel was requested during the run (an executor may abort by throwing);
-/// `TaskSuspended` leaves it `input_required`. Once
-/// the executor has suspended or detached, the dispatch ends there whatever it
-/// does afterwards. A task whose record was removed during the run is left gone. Pure over the store, so it is correct whether invoked
-/// in-process or by a remote worker. Throws only when the outcome cannot be
-/// recorded (e.g. the store is unreachable).
+/// and record the outcome on the durable task. A normal return completes the
+/// task and any other exception fails it, except that either marks it
+/// `cancelled` when a cancel was requested during the run (an executor may abort
+/// by throwing); `TaskSuspended` leaves it `input_required`. Once the executor
+/// has suspended or detached, the dispatch ends there whatever it does
+/// afterwards. A task whose record was removed during the run is left gone.
+/// Pure over the store, so it is correct whether invoked in-process or by a
+/// remote worker. Throws only when the outcome cannot be recorded (e.g. the
+/// store is unreachable).
 void runTaskExecutor(TaskRuntime rt, string taskId, TaskExecutor executor) @safe
 {
 	auto tc = TaskContext(rt, taskId);
