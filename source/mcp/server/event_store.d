@@ -86,11 +86,11 @@ private string newSeqEpoch() @safe nothrow
 }
 
 /// Configuration for the emit ring buffer: how long and how many events to retain
-/// per event type before eviction.
+/// per event type before eviction. A zero bound disables that bound.
 struct EmitBufferOptions
 {
-	Duration maxAge = 10.minutes; /// retain events younger than this
-	size_t maxEvents = 10_000; /// cap retained events per event type
+	Duration maxAge = 10.minutes; /// retain events younger than this (zero = no age limit)
+	size_t maxEvents = 10_000; /// cap retained events per event type (0 = no count cap)
 }
 
 /// A bounded, in-memory ring buffer of emitted events per event type. Backs
@@ -243,11 +243,14 @@ final class EmitBuffer
 		auto entries = byName_.get(name, null);
 		if (entries is null)
 			return;
-		const cutoff = nowMs() - opts_.maxAge.total!"msecs";
 		size_t start;
-		while (start < entries.length && entries[start].atMs < cutoff)
-			start++;
-		if (entries.length - start > opts_.maxEvents)
+		if (opts_.maxAge > Duration.zero)
+		{
+			const cutoff = nowMs() - opts_.maxAge.total!"msecs";
+			while (start < entries.length && entries[start].atMs < cutoff)
+				start++;
+		}
+		if (opts_.maxEvents > 0 && entries.length - start > opts_.maxEvents)
 			start = entries.length - opts_.maxEvents;
 		if (start > 0)
 			evictedThrough_[name] = entries[start - 1].seq;
@@ -684,6 +687,28 @@ unittest  // EmitBuffer evicts by maxEvents so the buffer stays bounded
 	auto r = buf.readSince("n", nullable(start), Nullable!long.init, Nullable!long.init);
 	// only the last 3 are retained; the earlier ones were evicted -> truncated
 	assert(r.events.length == 3 && r.truncated);
+}
+
+unittest  // EmitBuffer maxEvents==0 retains events without a count cap
+{
+	auto buf = new EmitBuffer(EmitBufferOptions(10.minutes, 0));
+	const start = buf.headCursor();
+	foreach (i; 0 .. 3)
+		buf.append("n", EventOccurrence("e", "n", "t"));
+	assert(buf.retained("n") == 3);
+	auto r = buf.readSince("n", nullable(start), Nullable!long.init, Nullable!long.init);
+	assert(r.events.length == 3 && !r.truncated);
+}
+
+unittest  // EmitBuffer maxAge==0 retains events without an age limit
+{
+	long now = 1_000_000;
+	auto buf = new EmitBuffer(EmitBufferOptions(Duration.zero, 100));
+	buf.nowMs = () @safe => now;
+	buf.append("n", EventOccurrence("e", "n", "t"));
+	now += 24 * 60 * 60 * 1000;
+	buf.evictExpired();
+	assert(buf.retained("n") == 1);
 }
 
 unittest  // events of other names between two of one name are not reported as a gap
