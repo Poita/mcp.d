@@ -250,7 +250,7 @@ version (unittest)
 @safe unittest
 {
 	// resourceSubscriptions on a STATELESS server makes newServer() throw the same
-	// loud error enableResourceSubscriptions() raises directly (PR 2.2 interaction).
+	// loud error enableResourceSubscriptions() raises directly.
 	import std.algorithm.searching : canFind;
 
 	ServerSettings s;

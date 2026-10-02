@@ -1023,7 +1023,7 @@ final class McpServer : ServerCore
 	}
 
 	/// Register a completer for a single `(reference, argumentName)` pair, so a
-	/// consumer no longer hand-routes every completable argument inside one global
+	/// consumer need not hand-route every completable argument inside one global
 	/// `setCompletionRequestHandler` delegate. The delegate receives the partial
 	/// value typed so far and returns the candidate completions; the server wraps
 	/// them in a `CompleteResult` (use `CompleteResult.prefixMatch` for the common
@@ -9397,13 +9397,12 @@ unittest  // acknowledgedSubsetFor of an empty filter is an empty object
 
 unittest  // per-stream ack does not leak a concurrent stream's opt-in
 {
-	// Regression for the cross-subscription leak: one shared McpServer handles two
-	// concurrent subscriptions/listen requests. Stream A opts into toolsListChanged
+	// One shared McpServer handles two concurrent subscriptions/listen requests. Stream A opts into toolsListChanged
 	// only; stream B opts into resourceSubscriptions only. Per modern §Multiple
 	// Concurrent Subscriptions each subscription is independent, so B's ack must NOT
-	// report toolsListChanged (and A's must NOT report resourceSubscriptions). The
-	// fix builds each ack from the per-stream filter the transport captured right
-	// after routing that listen request — never the server-wide accumulator.
+	// report toolsListChanged (and A's must NOT report resourceSubscriptions): each
+	// ack is built from the per-stream filter the transport captured right after
+	// routing that listen request, never a server-wide accumulator.
 	auto s = makeTestServer();
 	s.enableToolsListChanged();
 
@@ -10751,8 +10750,7 @@ unittest  // enableToolsListChanged is the consistent name and advertises listCh
 
 unittest  // modern: concurrent listen streams only receive the type each opted into
 {
-	// Regression for per-stream notification filtering (2026-07-28 basic/utilities/
-	// subscriptions): "The server MUST NOT send notification types the client has not
+	// Per-stream notification filtering (2026-07-28 basic/utilities/subscriptions): "The server MUST NOT send notification types the client has not
 	// explicitly requested." Two concurrent subscriptions/listen streams: A opted into
 	// toolsListChanged only, B into resourceSubscriptions only. notifyToolsListChanged
 	// MUST reach A and never B, even though B registered first.
