@@ -688,7 +688,8 @@ struct Content
 		return copy;
 	}
 
-	/// Throws -32602 when `j` is not an object or its `type` is not a string.
+	/// Throws -32602 when `j` is not an object or its REQUIRED `type` is absent
+	/// or not a string.
 	static Content fromJson(Json j) @safe
 	{
 		import mcp.protocol.errors : invalidParams;
@@ -696,7 +697,9 @@ struct Content
 
 		if (j.type != Json.Type.object)
 			throw invalidParams("a content block must be an object");
-		const t = ("type" in j) ? stringOrThrow(j["type"], "type") : "text";
+		if ("type" !in j)
+			throw invalidParams("a content block requires a 'type'");
+		const t = stringOrThrow(j["type"], "type");
 		switch (t)
 		{
 		case "text":
@@ -6148,6 +6151,16 @@ unittest  // Content.fromJson rejects a non-string type with -32602
 
 	auto ex = cast(McpException) collectException(Content.fromJson(Json([
 		"type": Json(1)
+	])));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // Content.fromJson rejects a block with no type with -32602
+{
+	import std.exception : collectException;
+
+	auto ex = collectException!McpException(Content.fromJson(Json([
+		"text": Json("hi")
 	])));
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }
