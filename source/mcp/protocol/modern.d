@@ -275,7 +275,7 @@ Json withCache(Json result, CacheHint hint) @safe
 }
 
 /// Parse a modern `CacheableResult` freshness hint from a result object. Reads
-/// `ttlMs` (accepting an integer or a float) and `cacheScope` (a string mapped to
+/// `ttlMs` (accepting an integer, bigInt or float) and `cacheScope` (a string mapped to
 /// the `CacheScope` enum, defaulting to `public`). Returns null when no `ttlMs`
 /// field is present.
 Nullable!CacheHint parseCacheHint(Json result) @safe
@@ -300,6 +300,13 @@ Nullable!CacheHint parseCacheHint(Json result) @safe
 		const v = ttl.get!double;
 		// `!(v > 0)` also catches NaN.
 		ttlMs = !(v > 0) ? 0 : v >= maxTtlMs ? maxTtlMs : cast(long) v;
+	}
+	else if (ttl.type == Json.Type.bigInt)
+	{
+		import std.bigint : BigInt;
+
+		// vibe parses only out-of-`long`-range integers as bigInt.
+		ttlMs = ttl.get!BigInt < 0 ? 0 : maxTtlMs;
 	}
 	else
 		return Nullable!CacheHint.init;
@@ -558,6 +565,24 @@ unittest  // round-trip: CacheHint(5.seconds) -> wire ttlMs:5000 -> 5.seconds
 	auto h = parseCacheHint(c);
 	assert(!h.isNull);
 	assert(h.get.ttl == 5.seconds);
+}
+
+unittest  // parseCacheHint clamps a bigInt ttlMs to the maximum Duration
+{
+	import vibe.data.json : parseJsonString;
+
+	auto h = parseCacheHint(`{"ttlMs":99999999999999999999}`.parseJsonString);
+	assert(!h.isNull);
+	assert(h.get.ttl == Duration.max.total!"msecs".msecs);
+}
+
+unittest  // parseCacheHint clamps a negative bigInt ttlMs to zero
+{
+	import vibe.data.json : parseJsonString;
+
+	auto h = parseCacheHint(`{"ttlMs":-99999999999999999999}`.parseJsonString);
+	assert(!h.isNull);
+	assert(h.get.ttl == Duration.zero);
 }
 
 unittest  // parseCacheHint returns null when ttlMs is absent
