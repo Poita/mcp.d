@@ -407,7 +407,9 @@ struct icon
 /// Apps `_meta.ui` field on `Tool`). `resourceUri` points at the `ui://`
 /// resource a host renders for this tool; the optional trailing `visibility`
 /// roles name who may invoke the tool ("model" and/or "app"). The reflection
-/// layer folds this into the tool's `_meta.ui`, merging with any `@meta` object.
+/// layer folds this into the tool's `_meta.ui`, merging with any `@meta` object,
+/// and rejects at compile time a `resourceUri` outside the `ui://` scheme or a
+/// role other than "model" / "app".
 ///
 /// Example:
 /// ---

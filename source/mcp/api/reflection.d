@@ -803,7 +803,14 @@ private Tool toolDescriptor(alias overload, A)(A attr) @safe
 	static foreach (a; __traits(getAttributes, overload))
 	{
 		static if (is(typeof(a) == ui))
+		{
+			static assert(a.resourceUri.length > 5 && a.resourceUri[0 .. 5] == "ui://",
+					"@ui resourceUri must be a ui:// URI, got: \"" ~ a.resourceUri ~ "\"");
+			static foreach (v; a.visibility)
+				static assert(v == "model" || v == "app",
+						"@ui visibility must be \"model\" or \"app\", got: \"" ~ v ~ "\"");
 			setUiToolMeta(descriptor, UiToolMeta(a.resourceUri, a.visibility));
+		}
 	}
 	return descriptor;
 }
@@ -4562,6 +4569,36 @@ unittest  // @ui on a @taskTool attaches _meta.ui to its descriptor
 	auto t = s.handle(MakeListMessage()).get["result"]["tools"][0];
 	assert(t["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget", t.toString);
 	assert(t["_meta"]["ui"]["visibility"] == Json([Json("model")]), t.toString);
+}
+
+version (unittest) private final class UiBadSchemeApi
+{
+	@tool("f", "f") @ui("https://example.com/widget")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class UiBadVisibilityApi
+{
+	@tool("f", "f") @ui("ui://demo/widget", "user")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a @ui resourceUri outside the ui:// scheme is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UiBadSchemeApi)));
+}
+
+unittest  // a @ui visibility other than "model" or "app" is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UiBadVisibilityApi)));
 }
 
 unittest  // a JSON Schema facet on a handler method is rejected at compile time
