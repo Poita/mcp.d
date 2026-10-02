@@ -1617,6 +1617,7 @@ struct InitializeParams
 	string protocolVersion;
 	ClientCapabilities capabilities;
 	Implementation clientInfo;
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -1624,13 +1625,14 @@ struct InitializeParams
 		j["protocolVersion"] = protocolVersion;
 		j["capabilities"] = capabilities.toJson();
 		j["clientInfo"] = clientInfo.toJson();
+		emitMetaField(j);
 		return j;
 	}
 
 	static InitializeParams fromJson(Json j) @safe
 	{
-		requireObject(j, "InitializeParams");
 		InitializeParams p;
+		p.parseMetaField(j);
 		p.protocolVersion = j.getOr("protocolVersion", "");
 		if ("capabilities" in j)
 			p.capabilities = ClientCapabilities.fromJson(j["capabilities"]);
@@ -1647,6 +1649,7 @@ struct InitializeResult
 	ServerCapabilities capabilities;
 	Implementation serverInfo;
 	Nullable!string instructions;
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -1656,13 +1659,14 @@ struct InitializeResult
 		j["serverInfo"] = serverInfo.toJson();
 		if (!instructions.isNull)
 			j["instructions"] = instructions.get;
+		emitMetaField(j);
 		return j;
 	}
 
 	static InitializeResult fromJson(Json j) @safe
 	{
-		requireObject(j, "InitializeResult");
 		InitializeResult r;
+		r.parseMetaField(j);
 		r.protocolVersion = j.getOr("protocolVersion", "");
 		if ("capabilities" in j)
 			r.capabilities = ServerCapabilities.fromJson(j["capabilities"]);
@@ -1671,6 +1675,26 @@ struct InitializeResult
 		tryGet(j, "instructions", r.instructions);
 		return r;
 	}
+}
+
+unittest  // InitializeResult round-trips _meta and omits it when unset
+{
+	InitializeResult r;
+	r.protocolVersion = "2025-11-25";
+	assert("_meta" !in r.toJson());
+	r.meta = Json(["x.example/k": Json("v")]);
+	auto back = InitializeResult.fromJson(r.toJson());
+	assert(back.meta["x.example/k"].get!string == "v");
+}
+
+unittest  // InitializeParams round-trips _meta and omits it when unset
+{
+	InitializeParams p;
+	p.protocolVersion = "2025-11-25";
+	assert("_meta" !in p.toJson());
+	p.meta = Json(["progressToken": Json(7)]);
+	auto back = InitializeParams.fromJson(p.toJson());
+	assert(back.meta["progressToken"].get!long == 7);
 }
 
 unittest  // text content round-trips
