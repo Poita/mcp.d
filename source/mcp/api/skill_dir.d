@@ -204,10 +204,10 @@ private Json[] buildNestedEntries(McpServer server, string path, RawFile[] raws)
 
 /// Parse the leading `---`-delimited YAML frontmatter of a `SKILL.md` into a
 /// JSON object (the verbatim `frontmatter` SEP-2640 puts in a skill entry). The
-/// fence is matched a line at a time: the file must open with a line that is
-/// exactly `---`, and the frontmatter ends at the next line that is exactly
-/// `---` or `...` — so a `---` appearing inside a value does not close it early,
-/// and CRLF line endings work. Hosts use this to compare a fetched `SKILL.md`'s
+/// fence is matched a line at a time, ignoring trailing whitespace: the file
+/// must open (after an optional UTF-8 byte order mark) with a `---` line, and
+/// the frontmatter ends at the next `---` or `...` line — so a `---` appearing
+/// inside a value does not close it early, and CRLF line endings work. Hosts use this to compare a fetched `SKILL.md`'s
 /// frontmatter against its entry (see `verifySkillMarkdown`).
 Json parseSkillFrontmatter(string md) @safe
 {
@@ -218,8 +218,12 @@ Json parseSkillFrontmatter(string md) @safe
 	// also breaks on U+2028 / U+2029 / vertical tab and would corrupt a value
 	// containing one. Normalizing first means the reconstructed YAML carries no
 	// stray \r either.
+	import std.algorithm.searching : skipOver;
+
+	// Editors commonly save a UTF-8 byte order mark ahead of the opening fence.
+	md.skipOver("﻿");
 	auto lines = md.replace("\r\n", "\n").split('\n');
-	if (lines.length == 0 || lines[0] != "---")
+	if (lines.length == 0 || lines[0].stripRight != "---")
 		throw new Exception("SKILL.md must begin with a '---' frontmatter line");
 	size_t end = size_t.max;
 	foreach (i; 1 .. lines.length)
@@ -1354,4 +1358,16 @@ unittest  // verifySkillMarkdown still rejects a numerically different frontmatt
 	auto e = wireEntryFor(md);
 	e.frontmatter["version"] = Json(2);
 	assert(verifySkillMarkdown(e, md) !is null);
+}
+
+unittest  // parseSkillFrontmatter accepts a SKILL.md opening with a UTF-8 byte order mark
+{
+	auto fm = parseSkillFrontmatter("﻿---\nname: x\ndescription: d\n---\n\n# Body\n");
+	assert(fm["name"].get!string == "x", fm.toString);
+}
+
+unittest  // parseSkillFrontmatter accepts trailing whitespace after the opening fence
+{
+	auto fm = parseSkillFrontmatter("--- \t\r\nname: x\r\ndescription: d\r\n---\r\n\r\n# Body\r\n");
+	assert(fm["name"].get!string == "x", fm.toString);
 }
