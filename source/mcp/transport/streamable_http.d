@@ -2058,6 +2058,8 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		// priming event, so record its events for a GET Last-Event-ID resume.
 		if (sessions !is null && sendsPrimingEvent(effVersion))
 			ctx.enableReplay(ensurePushChannel(server, coord));
+		scope (exit)
+			ctx.endReplay();
 		auto resp = server.handle(msg, ctx);
 		// Modern basic/utilities/cancellation §Transport-Specific Cancellation: on
 		// Streamable HTTP "Closing the SSE response stream is the cancellation

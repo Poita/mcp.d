@@ -465,6 +465,10 @@ final class ServerPushChannel : PushChannel
 	/// ordinal rather than per listener so a resumed stream, and a POST-initiated
 	/// stream that a GET resumes, continue one monotonic id sequence.
 	private long[long] nextSeq;
+	/// Ordinals of the POST-initiated streams whose request is still running. Their
+	/// `nextSeq` entry outlives any history eviction, so the stream never reuses an
+	/// event id that a client may already hold as its `Last-Event-ID`.
+	private bool[long] openStreams;
 	private long nextListenerId = 1;
 
 	/// Stream ordinal -> the session/connection token that owns it. A Last-Event-ID
@@ -682,7 +686,7 @@ final class ServerPushChannel : PushChannel
 			}
 		listeners = listeners.remove!(l => l.id == id);
 		if (auto ord = id in streamOf)
-			if (*ord !in history)
+			if (*ord !in history && *ord !in openStreams)
 				nextSeq.remove(*ord);
 		streamOf.remove(id);
 		live.remove(id);
@@ -1089,7 +1093,7 @@ final class ServerPushChannel : PushChannel
 		foreach (lid, ord; streamOf)
 			if (ord == ordinal)
 				attached = true;
-		if (!attached)
+		if (!attached && ordinal !in openStreams)
 			nextSeq.remove(ordinal);
 	}
 
@@ -1129,6 +1133,34 @@ final class ServerPushChannel : PushChannel
 				*entries = (*entries)[1 .. $];
 			}
 		}
+	}
+
+	/// Mark the POST-initiated stream `ordinal` as in progress, so its event
+	/// sequence survives the eviction of its replay history until `closeStream`.
+	void openStream(long ordinal) @safe
+	{
+		() @trusted {
+			synchronized (mtx)
+				openStreams[ordinal] = true;
+		}();
+	}
+
+	/// End the POST-initiated stream `ordinal` opened by `openStream`. Its event
+	/// sequence is kept while history or a resumed listener still refers to it.
+	void closeStream(long ordinal) @safe
+	{
+		() @trusted {
+			synchronized (mtx)
+			{
+				openStreams.remove(ordinal);
+				bool attached;
+				foreach (lid, ord; streamOf)
+					if (ord == ordinal)
+						attached = true;
+				if (!attached && ordinal !in history)
+					nextSeq.remove(ordinal);
+			}
+		}();
 	}
 
 	/// Register the POST-initiated SSE stream `ordinal` (owned by session `owner`)
@@ -2356,6 +2388,15 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	void enableReplay(ServerPushChannel channel) @safe
 	{
 		replay_ = channel;
+		channel.openStream(streamId);
+	}
+
+	/// Release the replay channel's hold on this stream once the request is done;
+	/// call it exactly once after `enableReplay`.
+	void endReplay() @safe
+	{
+		if (replay_ !is null)
+			replay_.closeStream(streamId);
 	}
 
 	/// Whether the response has been upgraded to an SSE stream.
@@ -3703,4 +3744,34 @@ unittest  // concurrent writes on one POST stream never interleave their frames
 		assert(f.startsWith("id: "), f);
 		assert(f.count("data: ") == 1, f);
 	}
+}
+
+unittest  // a live POST stream keeps its event ids monotonic after its replay history is evicted
+{
+	import std.algorithm : canFind;
+	import std.array : replicate;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.versions : ProtocolVersion;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
+			TokenInfo.invalid(), false, ProtocolVersion.v2025_11_25, "sess-A");
+	ctx.enableReplay(ch);
+	const primingId = ctx.nextEventId();
+	const ordinal = primingId[0 .. $ - "-0".length];
+	ctx.log("info", Json("first"));
+
+	// Other streams push this stream's history out of the LRU.
+	const big = Json("x".replicate(64 * 1024));
+	foreach (_; 0 .. 130)
+		ch.publishStreamEvent(coord.allocStream(), "sess-B", big);
+
+	ctx.log("info", Json("second"));
+	const body_ = () @trusted { return cast(string) sink.data.idup; }();
+	assert(body_.canFind("id: " ~ ordinal ~ "-2\n"), body_);
 }
