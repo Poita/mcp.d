@@ -45,9 +45,32 @@ struct TaskRecord
 	Json executorInput = Json.undefined; /// durable input, reconstituted on each dispatch
 	Json[string] checkpoints; /// re-entry state persisted via TaskContext.checkpoint
 
-	/// Serialize to a self-contained JSON object. A real store persists this; the
-	/// in-memory store round-trips through it to guarantee stored records do not
-	/// alias the caller's mutable state (mirroring a network/disk boundary).
+	/// A deep copy sharing no mutable state (`Json` values or associative
+	/// arrays) with this record.
+	TaskRecord dup() const @safe
+	{
+		TaskRecord r;
+		r.meta = meta;
+		if (!result.isNull)
+			r.result = nullable(cloneJson(result.get));
+		if (!error.isNull)
+			r.error = nullable(cloneJson(error.get));
+		r.inputRequests = cloneJson(inputRequests);
+		foreach (k, v; inputResponses)
+			r.inputResponses[k] = cloneJson(v);
+		r.cancelRequested = cancelRequested;
+		r.detached = detached;
+		r.toolName = toolName;
+		r.owner = owner;
+		r.revision = revision;
+		r.executorInput = cloneJson(executorInput);
+		foreach (k, v; checkpoints)
+			r.checkpoints[k] = cloneJson(v);
+		return r;
+	}
+
+	/// Serialize to a self-contained JSON object, the form a persistent store
+	/// writes. `fromJson` is its inverse.
 	Json toJson() const @safe
 	{
 		Json j = Json.emptyObject;
@@ -115,15 +138,11 @@ struct TaskRecord
 	}
 }
 
-/// Deep-copy a `Json` value by serializing and re-parsing, so the copy shares no
-/// underlying storage with the original. Used at the store boundary.
-private Json cloneJson(Json j) @safe
+/// Deep-copy a `Json` value, so the copy shares no underlying storage with the
+/// original. Used at the store boundary.
+private Json cloneJson(const Json j) @safe
 {
-	import vibe.data.json : parseJsonString;
-
-	if (j.type == Json.Type.undefined)
-		return Json.undefined;
-	return parseJsonString(j.toString());
+	return j.clone();
 }
 
 /// Durable storage for the complete `TaskRecord`, keyed by task ID. The SDK
@@ -161,33 +180,33 @@ interface TaskStore
 }
 
 /// In-memory `TaskStore` backed by an associative array. The default store; it
-/// keeps task records until the runtime expires them. Records are stored
-/// as serialized JSON and re-parsed on read, so a returned record never aliases
+/// keeps task records until the runtime expires them. Records are deep-copied
+/// on the way in and out (`TaskRecord.dup`), so a returned record never aliases
 /// stored state — the same isolation a networked store provides for free, which
 /// makes the in-memory store a faithful single-process stand-in for a shared one.
 final class InMemoryTaskStore : TaskStore
 {
-	private Json[string] records;
+	private TaskRecord[string] records;
 
 	void put(TaskRecord record) @safe
 	{
-		records[record.meta.taskId] = record.toJson();
+		records[record.meta.taskId] = record.dup;
 	}
 
 	Nullable!TaskRecord get(string taskId) @safe
 	{
 		if (auto p = taskId in records)
-			return nullable(TaskRecord.fromJson(*p));
+			return nullable(p.dup);
 		return Nullable!TaskRecord.init;
 	}
 
 	bool compareAndSwap(TaskRecord record, ulong expectedRevision) @safe
 	{
 		auto p = record.meta.taskId in records;
-		if (p is null || TaskRecord.fromJson(*p).revision != expectedRevision)
+		if (p is null || p.revision != expectedRevision)
 			return false;
-		record.revision = expectedRevision + 1;
-		*p = record.toJson();
+		*p = record.dup;
+		p.revision = expectedRevision + 1;
 		return true;
 	}
 
@@ -199,8 +218,8 @@ final class InMemoryTaskStore : TaskStore
 	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe
 	{
 		string[] doomed;
-		foreach (id, j; records)
-			if (pred(TaskRecord.fromJson(j)))
+		foreach (id, ref r; records)
+			if (pred(r))
 				doomed ~= id;
 		foreach (id; doomed)
 			records.remove(id);
@@ -316,6 +335,44 @@ unittest  // a returned record does not alias stored state (store boundary isola
 	auto fetched = s.get("iso").get;
 	fetched.inputResponses["k"] = Json("mutated");
 	assert(s.get("iso").get.inputResponses["k"].get!string == "first");
+}
+
+unittest  // nested Json in a fetched or written record does not alias stored state
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	auto s = new InMemoryTaskStore();
+	TaskRecord r;
+	r.meta.taskId = "deep";
+	r.meta.status = TaskStatus.working;
+	r.inputRequests = Json(["k": Json(["method": Json("elicitation/create")])]);
+	r.executorInput = Json(["list": Json([Json(1)])]);
+	r.checkpoints["c"] = Json(["v": Json(1)]);
+	r.result = nullable(Json(["ok": Json(true)]));
+	s.put(r);
+
+	// The caller's own copy stays independent after the write.
+	r.inputRequests["k"]["method"] = "sampling/createMessage";
+	r.executorInput["list"][0] = 2;
+	r.checkpoints["c"]["v"] = 2;
+	r.result.get["ok"] = false;
+
+	auto fetched = s.get("deep").get;
+	fetched.inputRequests["k"]["method"] = "roots/list";
+	fetched.executorInput["list"][0] = 3;
+	fetched.checkpoints["c"]["v"] = 3;
+	fetched.result.get["ok"] = false;
+
+	auto again = s.get("deep").get;
+	assert(again.inputRequests["k"]["method"].get!string == "elicitation/create");
+	assert(again.executorInput["list"][0].get!int == 1);
+	assert(again.checkpoints["c"]["v"].get!int == 1);
+	assert(again.result.get["ok"].get!bool);
+
+	// compareAndSwap stores its own copy too.
+	assert(s.compareAndSwap(again, again.revision));
+	again.checkpoints["c"]["v"] = 4;
+	assert(s.get("deep").get.checkpoints["c"]["v"].get!int == 1);
 }
 
 unittest  // defaultTaskIdGenerator yields distinct 32-char hex ids
