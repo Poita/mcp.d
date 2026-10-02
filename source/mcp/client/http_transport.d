@@ -2389,34 +2389,153 @@ bool sameOrigin(string base, string candidate) @safe
 	return b.tls == c.tls && b.host.toLower == c.host.toLower && b.port == c.port;
 }
 
-/// Resolve a legacy `endpoint` event URI (which may be absolute, root-relative,
-/// or document-relative) against the GET-SSE base URL, yielding the absolute URL
-/// to POST subsequent JSON-RPC messages to. An absolute URI is only accepted when
-/// it is same-origin with the base; a cross-origin absolute URI yields null so the
-/// legacy fallback fails closed rather than POSTing the bearer token off-origin.
+/// The components of a URI reference (RFC 3986 §3). A `has*` flag distinguishes
+/// an absent component from an empty one, which resolution treats differently.
+private struct UriParts
+{
+	string scheme, authority, path, query;
+	bool hasScheme, hasAuthority, hasQuery;
+}
+
+/// Split a URI reference into its components (RFC 3986 Appendix B), dropping
+/// any fragment, which never reaches an HTTP request target.
+private UriParts splitUri(string uri) @safe
+{
+	import std.string : indexOf, indexOfAny, toLower;
+
+	UriParts p;
+	const hash = uri.indexOf('#');
+	if (hash >= 0)
+		uri = uri[0 .. hash];
+	const delim = uri.indexOfAny(":/?");
+	if (delim > 0 && uri[delim] == ':')
+	{
+		p.hasScheme = true;
+		p.scheme = uri[0 .. delim].toLower;
+		uri = uri[delim + 1 .. $];
+	}
+	if (uri.length >= 2 && uri[0 .. 2] == "//")
+	{
+		uri = uri[2 .. $];
+		const end = uri.indexOfAny("/?");
+		p.hasAuthority = true;
+		p.authority = end < 0 ? uri : uri[0 .. end];
+		uri = end < 0 ? null : uri[end .. $];
+	}
+	const q = uri.indexOf('?');
+	if (q >= 0)
+	{
+		p.hasQuery = true;
+		p.query = uri[q + 1 .. $];
+		uri = uri[0 .. q];
+	}
+	p.path = uri;
+	return p;
+}
+
+/// Remove `.` and `..` segments from `path` (RFC 3986 §5.2.4).
+private string removeDotSegments(string path) @safe
+{
+	import std.string : indexOf, lastIndexOf, startsWith;
+
+	string output;
+	while (path.length)
+	{
+		if (path.startsWith("../"))
+			path = path[3 .. $];
+		else if (path.startsWith("./"))
+			path = path[2 .. $];
+		else if (path.startsWith("/./"))
+			path = path[2 .. $];
+		else if (path == "/.")
+			path = "/";
+		else if (path.startsWith("/../") || path == "/..")
+		{
+			path = path == "/.." ? "/" : path[3 .. $];
+			const cut = output.lastIndexOf('/');
+			output = cut < 0 ? null : output[0 .. cut];
+		}
+		else if (path == "." || path == "..")
+			path = null;
+		else
+		{
+			const start = path[0] == '/' ? 1 : 0;
+			const next = path[start .. $].indexOf('/');
+			const end = next < 0 ? path.length : start + next;
+			output ~= path[0 .. end];
+			path = path[end .. $];
+		}
+	}
+	return output;
+}
+
+/// Resolve a legacy `endpoint` event URI reference against the GET-SSE base URL
+/// (RFC 3986 §5.2), yielding the absolute URL to POST subsequent JSON-RPC
+/// messages to. A reference naming its own scheme or authority is only accepted
+/// when it is an http(s) URL with the base's origin; anything else yields null so
+/// the legacy fallback fails closed rather than POSTing the bearer token
+/// off-origin.
 string resolveEndpointUri(string baseUrl, string endpoint) @safe
 {
-	import std.string : indexOf, startsWith, lastIndexOf;
+	import std.string : lastIndexOf;
 
-	if (endpoint.startsWith("http://") || endpoint.startsWith("https://"))
-		return sameOrigin(baseUrl, endpoint) ? endpoint : null;
-
-	// Split base into scheme://authority and path.
-	const sep = baseUrl.indexOf("://");
-	if (sep < 0)
+	const base = splitUri(baseUrl);
+	if (!base.hasScheme)
 		return endpoint;
-	const afterScheme = sep + 3;
-	const slash = baseUrl[afterScheme .. $].indexOf('/');
-	string origin = (slash < 0) ? baseUrl : baseUrl[0 .. afterScheme + slash];
-	string basePath = (slash < 0) ? "/" : baseUrl[afterScheme + slash .. $];
+	const r = splitUri(endpoint);
 
-	if (endpoint.startsWith("/"))
-		return origin ~ endpoint;
+	UriParts t;
+	if (r.hasScheme)
+		t = UriParts(r.scheme, r.authority, removeDotSegments(r.path), r.query,
+				true, r.hasAuthority, r.hasQuery);
+	else
+	{
+		t.scheme = base.scheme;
+		t.hasScheme = true;
+		if (r.hasAuthority)
+		{
+			t.authority = r.authority;
+			t.path = removeDotSegments(r.path);
+			t.query = r.query;
+			t.hasQuery = r.hasQuery;
+		}
+		else
+		{
+			t.authority = base.authority;
+			if (r.path.length == 0)
+			{
+				t.path = base.path;
+				t.query = r.hasQuery ? r.query : base.query;
+				t.hasQuery = r.hasQuery || base.hasQuery;
+			}
+			else
+			{
+				if (r.path[0] == '/')
+					t.path = removeDotSegments(r.path);
+				else
+				{
+					// Merge (RFC 3986 §5.2.3): the base path up to its last '/'.
+					const cut = base.path.lastIndexOf('/');
+					const dir = (base.hasAuthority && base.path.length == 0) ? "/" : cut < 0
+						? "" : base.path[0 .. cut + 1];
+					t.path = removeDotSegments(dir ~ r.path);
+				}
+				t.query = r.query;
+				t.hasQuery = r.hasQuery;
+			}
+		}
+		t.hasAuthority = true;
+	}
+	if (t.path.length == 0)
+		t.path = "/";
 
-	// Document-relative: replace the last path segment of the base.
-	const lastSlash = basePath.lastIndexOf('/');
-	string dir = (lastSlash < 0) ? "/" : basePath[0 .. lastSlash + 1];
-	return origin ~ dir ~ endpoint;
+	const resolved = t.scheme ~ "://" ~ t.authority ~ t.path ~ (t.hasQuery ? "?" ~ t.query : "");
+	if (r.hasScheme || r.hasAuthority)
+	{
+		if ((t.scheme != "http" && t.scheme != "https") || !sameOrigin(baseUrl, resolved))
+			return null;
+	}
+	return resolved;
 }
 
 unittest  // httpStatusError keeps the code and message of a null-id JSON-RPC error body
@@ -2723,6 +2842,59 @@ unittest  // resolveEndpointUri resolves a relative path against the base direct
 {
 	assert(resolveEndpointUri("http://host:8080/api/sse",
 			"messages") == "http://host:8080/api/messages");
+}
+
+unittest  // resolveEndpointUri keeps the base path for a query-only reference
+{
+	assert(resolveEndpointUri("http://h/sse", "?sessionId=abc") == "http://h/sse?sessionId=abc");
+	assert(resolveEndpointUri("http://h/sse?old=1",
+			"?sessionId=abc") == "http://h/sse?sessionId=abc");
+}
+
+unittest  // resolveEndpointUri removes dot segments from a relative path
+{
+	assert(resolveEndpointUri("http://h/a/b/sse", "./messages?x=1") == "http://h/a/b/messages?x=1");
+	assert(resolveEndpointUri("http://h/a/b/sse", "../messages") == "http://h/a/messages");
+	assert(resolveEndpointUri("http://h/a/sse", "../../../messages") == "http://h/messages");
+	assert(resolveEndpointUri("http://h/a/sse", "/x/../messages") == "http://h/messages");
+	assert(resolveEndpointUri("http://h/a/sse", "..") == "http://h/");
+	assert(resolveEndpointUri("http://h", "messages") == "http://h/messages");
+}
+
+unittest  // resolveEndpointUri matches the RFC 3986 §5.4 reference resolution examples
+{
+	enum b = "http://a/b/c/d;p?q";
+	assert(resolveEndpointUri(b, "g") == "http://a/b/c/g");
+	assert(resolveEndpointUri(b, "g/") == "http://a/b/c/g/");
+	assert(resolveEndpointUri(b, "?y") == "http://a/b/c/d;p?y");
+	assert(resolveEndpointUri(b, "g?y") == "http://a/b/c/g?y");
+	assert(resolveEndpointUri(b, "g;x?y#s") == "http://a/b/c/g;x?y");
+	assert(resolveEndpointUri(b, ".") == "http://a/b/c/");
+	assert(resolveEndpointUri(b, "./") == "http://a/b/c/");
+	assert(resolveEndpointUri(b, "..") == "http://a/b/");
+	assert(resolveEndpointUri(b, "../g") == "http://a/b/g");
+	assert(resolveEndpointUri(b, "../..") == "http://a/");
+	assert(resolveEndpointUri(b, "../../g") == "http://a/g");
+	assert(resolveEndpointUri(b, "/./g") == "http://a/g");
+	assert(resolveEndpointUri(b, "g.") == "http://a/b/c/g.");
+	assert(resolveEndpointUri(b, "..g") == "http://a/b/c/..g");
+	assert(resolveEndpointUri(b, "./g/.") == "http://a/b/c/g/");
+	assert(resolveEndpointUri(b, "g/../h") == "http://a/b/c/h");
+	assert(resolveEndpointUri(b, "g;x=1/../y") == "http://a/b/c/y");
+}
+
+unittest  // resolveEndpointUri treats an empty reference as the base without its fragment
+{
+	assert(resolveEndpointUri("http://h/sse?q=1#f", "") == "http://h/sse?q=1");
+	assert(resolveEndpointUri("http://h/sse", "#frag") == "http://h/sse");
+}
+
+unittest  // resolveEndpointUri applies the same-origin check to network-path and absolute references
+{
+	assert(resolveEndpointUri("http://h:8080/sse", "//h:8080/messages") == "http://h:8080/messages");
+	assert(resolveEndpointUri("http://h:8080/sse", "//evil.example/messages") is null);
+	assert(resolveEndpointUri("http://h/sse", "HTTP://h/a/../messages") == "http://h/messages");
+	assert(resolveEndpointUri("http://h/sse", "javascript:alert(1)") is null);
 }
 
 unittest  // close() fails every outstanding legacy waiter so an in-flight legacyRpc returns at once
