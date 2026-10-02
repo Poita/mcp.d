@@ -479,8 +479,11 @@ final class McpClient : ClientProtocol
 	// Insertion order of the ids in `cancelledRequests_`, used to evict the
 	// single oldest id when the set is full (FIFO) rather than clearing it
 	// wholesale. May contain ids already removed by `isCancelled`; those are
-	// skipped during eviction.
+	// skipped during eviction, and dropped once they outnumber the live ids.
 	private long[] cancelledOrder_;
+	// The order queue is compacted once it holds more than twice this many
+	// entries or twice the live set, whichever is larger.
+	private enum size_t minCancelledOrderCompaction_ = 64;
 	// Size backstop for `cancelledRequests_`: ids are normally evicted when their
 	// late response is observed (`isCancelled`), but a late response that never
 	// arrives would otherwise pin its id forever. Once the tracked set is full,
@@ -3810,6 +3813,16 @@ final class McpClient : ClientProtocol
 			signalCancellation(requestId, reason);
 	}
 
+	/// Drop the ids `isCancelled` already consumed from `cancelledOrder_`, keeping
+	/// the live ones in insertion order.
+	private void compactCancelledOrder() @safe
+	{
+		import std.algorithm : filter;
+		import std.array : array;
+
+		cancelledOrder_ = cancelledOrder_.filter!(id => id in cancelledRequests_).array;
+	}
+
 	/// Record `requestId` as cancelled (so a late response is dropped) and signal
 	/// it to the server: `notifications/cancelled`, or nothing more over a modern
 	/// Streamable HTTP transport, where closing the request's stream is the signal.
@@ -3826,10 +3839,7 @@ final class McpClient : ClientProtocol
 				// Drop ids from the order queue that isCancelled() already removed
 				// from the set, so the eviction pick below always reaches a live
 				// entry in O(1) rather than scanning an unbounded stale prefix.
-				import std.algorithm : filter;
-				import std.array : array;
-
-				cancelledOrder_ = cancelledOrder_.filter!(id => id in cancelledRequests_).array;
+				compactCancelledOrder();
 				if (cancelledOrder_.length)
 				{
 					cancelledRequests_.remove(cancelledOrder_[0]);
@@ -3838,6 +3848,13 @@ final class McpClient : ClientProtocol
 			}
 			cancelledRequests_[requestId] = true;
 			cancelledOrder_ ~= requestId;
+			// Ids consumed by `isCancelled` stay in the order queue; drop them once
+			// they dominate it, so the queue is bounded by the live set (amortized
+			// O(1) per cancel).
+			const live = cancelledRequests_.length > minCancelledOrderCompaction_
+				? cancelledRequests_.length : minCancelledOrderCompaction_;
+			if (cancelledOrder_.length > 2 * live)
+				compactCancelledOrder();
 		}
 		// Over a modern Streamable HTTP transport, closing the request's SSE response
 		// stream is itself the cancellation signal and no `notifications/cancelled`
@@ -7516,6 +7533,19 @@ unittest  // cancel() eviction does not O(n)-scan unbounded stale cancelledOrder
 	const newId = cast(long)(N + McpClient.maxCancelledTracked_);
 	c.cancel(newId);
 	assert(c.isResponseCancelled(newId));
+}
+
+unittest  // the cancelled-id order queue stays bounded when late responses keep consuming ids
+{
+	auto c = McpClient.http("http://localhost");
+	c.onNotifyForTest = (Json message) @safe {};
+	foreach (i; 0 .. 10_000)
+	{
+		c.cancel(cast(long) i);
+		c.isCancelled(cast(long) i);
+	}
+	assert(c.cancelledOrder_.length <= 2 * McpClient.minCancelledOrderCompaction_,
+			"consumed ids must not accumulate in the order queue");
 }
 
 unittest  // a server that keeps requesting input stops at exactly maxRounds tools/call requests
