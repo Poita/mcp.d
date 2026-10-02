@@ -30,9 +30,18 @@ test:
 fmt:
     ulimit -n 65536 && dub run dfmt -- --inplace source/ conformance/
 
-# Run the exact D-Scanner lint gate CI runs (with documented filters).
+# Run CI's lint gates: D-Scanner (with documented filters) + README toolchain check.
 lint:
     ./scripts/dscanner-lint.sh
+    ./scripts/check-readme-versions.sh
+
+# Build every example and run its self-verifying client over stdio and HTTP.
+examples:
+    ./scripts/run-examples.sh
+
+# Generate the API documentation into docs/ (adrdox if installed, else ddox).
+docs:
+    ulimit -n 65536 && ./scripts/gen-docs.sh
 
 # Build the two conformance harness targets.
 conformance-build:
@@ -58,6 +67,7 @@ conformance-server-lane revision: conformance-build
         -H 'Content-Type: application/json' \
         -X POST -d '{}' || true)
       if [ "$CODE" != "000" ]; then break; fi
+      if [ "$i" -eq 30 ]; then echo "conformance-server did not start on port $PORT" >&2; exit 1; fi
       sleep 1
     done
     npx --yes "@modelcontextprotocol/conformance@{{conformance_version}}" \
