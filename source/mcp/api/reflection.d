@@ -388,6 +388,8 @@ private Json parametersSchema(alias func)() @safe
 	s["properties"] = props;
 	if (required.length > 0)
 		s["required"] = required;
+	static if (hasUDA!(func, strictArgs))
+		s["additionalProperties"] = false;
 	return s;
 }
 
@@ -609,7 +611,8 @@ private Nullable!CacheHint collectCache(alias overload)() @safe
 /// Bind every non-injected parameter of the tool or task method `overload`
 /// from the call's `args` into `argv`, leaving injected context slots untouched.
 /// Returns `null` on success, or an attributed message for a required argument
-/// that is missing (checked even when input-schema validation is disabled) or a
+/// that is missing or, for a `@strictArgs` method, an argument it does not
+/// declare (both checked even when input-schema validation is disabled), or a
 /// value that cannot be converted; the caller reports it as an `isError` result,
 /// the classification this SDK uses for tool input failures. An `McpException`
 /// raised while binding propagates unchanged.
@@ -619,6 +622,19 @@ private string bindToolArgs(alias overload)(Json args, ref Tuple!(BoundParameter
 
 	alias names = ParamWireNames!overload;
 	alias defs = ParameterDefaultValueTuple!overload;
+	static if (hasUDA!(overload, strictArgs))
+	{
+		if (args.type == Json.Type.object)
+			foreach (kv; args.byKeyValue)
+			{
+				bool declared;
+				static foreach (i, P; BoundParameters!overload)
+					static if (!is(P : RequestContext) && !is(P == TaskContext))
+						declared |= kv.key == names[i];
+				if (!declared)
+					return "argument '" ~ kv.key ~ "': unknown argument";
+			}
+	}
 	static foreach (i, P; BoundParameters!overload)
 	{
 		static if (!is(P : RequestContext) && !is(P == TaskContext))
@@ -4244,4 +4260,67 @@ unittest  // an unnamed injected context parameter needs no name
 {
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new UnnamedContextParamApi);
+}
+
+version (unittest) private final class StrictArgsApi
+{
+	@tool("strict", "Rejects unknown arguments")
+	@strictArgs string strict(string q, int limit = 1) @safe
+	{
+		return q;
+	}
+
+	@tool("lenient", "Ignores unknown arguments")
+	string lenient(string q) @safe
+	{
+		return q;
+	}
+}
+
+version (unittest) private Json strictToolSchema(string name) @safe
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new StrictArgsApi);
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	foreach (i; 0 .. tools.length)
+		if (tools[i]["name"].get!string == name)
+			return tools[i]["inputSchema"];
+	assert(false, name ~ " not found");
+}
+
+unittest  // a @strictArgs tool's input schema closes its properties
+{
+	auto schema = strictToolSchema("strict");
+	assert(schema["additionalProperties"].type == Json.Type.bool_, schema.toString);
+	assert(!schema["additionalProperties"].get!bool);
+	assert("additionalProperties" !in strictToolSchema("lenient"));
+}
+
+unittest  // a @strictArgs tool rejects an unknown argument
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new StrictArgsApi);
+	auto r = callToolArgs(s, "strict", `{"q":"x","limt":5}`);
+	assert(r["isError"].get!bool, r.toString);
+}
+
+unittest  // a @strictArgs tool rejects an unknown argument with input validation off
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.disableInputSchemaValidation();
+	registerHandlers(s, new StrictArgsApi);
+	auto r = callToolArgs(s, "strict", `{"q":"x","limt":5}`);
+	assert(r["isError"].get!bool, r.toString);
+	assert(r["content"][0]["text"].get!string.canFind("'limt'"), r.toString);
+	assert("isError" !in callToolArgs(s, "strict", `{"q":"x","limit":5}`));
+}
+
+unittest  // a tool without @strictArgs ignores an unknown argument
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new StrictArgsApi);
+	auto r = callToolArgs(s, "lenient", `{"q":"x","extra":true}`);
+	assert("isError" !in r, r.toString);
 }

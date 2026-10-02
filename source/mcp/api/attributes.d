@@ -150,6 +150,19 @@ enum idempotent;
 /// (`ToolAnnotations.openWorldHint`). Presence = `true`; absence = unset.
 enum openWorld;
 
+/// Marker UDA on a `@tool` or `@taskTool` method rejecting arguments it does not
+/// declare. Its input schema carries `"additionalProperties": false`, and a
+/// call naming an unknown argument fails as an input error even with input
+/// schema validation disabled. Without it an unknown argument is ignored.
+///
+/// Example:
+/// ---
+/// @tool("search", "Search records")
+/// @strictArgs
+/// string[] search(string q, int limit = 10) @safe { ... }
+/// ---
+enum strictArgs;
+
 /// Marker UDA on a struct bound from tool arguments making every field
 /// optional: an omitted field keeps the struct's own default. Without it a
 /// field is required unless it is `Nullable`, vibe-`@optional`, or has an

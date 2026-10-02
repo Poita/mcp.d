@@ -622,9 +622,11 @@ D default value (`int page = 1`), which is also emitted as the property's
 the bare primitive type `x-mcp-header` requires. A parameter is named on the wire
 like a struct field, minus one trailing `_`, so `string version_` is the `version`
 argument (and `@describeParam` / `@mcpHeader` name it `"version"`).
-Field/parameter constraints are added with UDAs: `@minimum` / `@maximum`, `@minLength` / `@maxLength`, `@pattern`, `@minItems` / `@maxItems`,
+Field/parameter constraints are added with UDAs: `@minimum` / `@maximum`,
+`@minLength` / `@maxLength`, `@pattern`, `@minItems` / `@maxItems`,
 `@schemaFormat` (JSON Schema `format`), `@title`, `@schemaDefault`, and
-`@fieldDescription`.
+`@fieldDescription`. An argument a tool does not declare is ignored; mark the
+method `@strictArgs` to advertise `"additionalProperties": false` and reject one.
 
 ## MCP Apps (interactive UI)
 
