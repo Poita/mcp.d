@@ -310,6 +310,23 @@ unittest  // runTaskExecutor completes a task with the executor's result
 	assert(d["result"]["structuredContent"]["v"].get!int == 7);
 }
 
+unittest  // a throwing status-change sink leaves a suspended task input_required
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	rt.onStatusChange((Json d, string owner) @safe {
+		throw new Exception("stdout closed");
+	});
+	auto t = rt.createFor("gate", Json.undefined);
+	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
+		tc.progress("asking");
+		return tc.requireInput([InputRequest.elicitation("ok", "Proceed?")]);
+	});
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "input_required");
+}
+
 unittest  // requireInput suspends into input_required; re-run completes after answer
 {
 	import mcp.server.task_store : InMemoryTaskStore;

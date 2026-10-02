@@ -273,11 +273,27 @@ final class TaskRuntime
 				r.meta.lastUpdatedAt = opts_.nowIso();
 			if (!store_.compareAndSwap(r, expected))
 				continue;
-			if (change == Change.status && onStatusChange_ !is null)
-				onStatusChange_(getDetailed(id), r.owner);
+			if (change == Change.status)
+				notifyStatusChange(id, r.owner);
 			return true;
 		}
 		throw internalError("task '" ~ id ~ "' is contended; the update was not applied");
+	}
+
+	/// Push a committed status change to the `onStatusChange` sink. Best-effort:
+	/// the transition is already stored and visible via `tasks/get`, so a failing
+	/// sink (e.g. a closed output stream) is logged rather than propagated into
+	/// the caller, which would otherwise fail or abort a healthy task.
+	private void notifyStatusChange(string id, string owner) @safe
+	{
+		import vibe.core.log : logWarn;
+
+		if (onStatusChange_ is null)
+			return;
+		try
+			onStatusChange_(getDetailed(id), owner);
+		catch (Exception e)
+			logWarn("task %s: status notification failed: %s", id, e.msg);
 	}
 
 	/// Update a `working`/`input_required` task's human-readable status message.
@@ -671,6 +687,21 @@ unittest  // onStatusChange fires with the DetailedTask on each transition
 	rt.complete(t.taskId, Json.emptyObject);
 	assert(calls >= 1);
 	assert(lastStatus == "completed");
+}
+
+unittest  // a throwing status-change sink neither fails the transition nor reaches the caller
+{
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	rt.onStatusChange((Json d, string owner) @safe {
+		throw new Exception("sink closed");
+	});
+	auto t = rt.createFor("gate", Json.undefined);
+	rt.progress(t.taskId, "step 1");
+	rt.requireInput(t.taskId, Json([
+			"k": Json(["method": Json("elicitation/create")])
+	]));
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "input_required");
 }
 
 unittest  // a unique-id collision from a bad generator is retried, then errors
