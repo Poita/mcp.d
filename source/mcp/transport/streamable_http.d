@@ -43,6 +43,12 @@ struct StreamLimits
 	/// `subscriptions/listen` and `events/stream` response streams open at once
 	/// across the mount; past it such a request is answered 503.
 	size_t maxPushStreams = 1_000;
+	/// `subscriptions/listen` and `events/stream` response streams one
+	/// authenticated principal holds open at once; past it that principal's
+	/// request is answered 429, so one client cannot take every `maxPushStreams`
+	/// slot. Unauthenticated callers share no principal and are bounded only by
+	/// `maxPushStreams`.
+	size_t maxPushStreamsPerPrincipal = 100;
 	/// Bytes queued for one long-lived SSE stream whose client is not reading.
 	/// Past it, delivery waits briefly (`SseWriter.queueStallTimeout`) for the
 	/// client to catch up, then closes and drops the stream, so a stalled client
@@ -50,31 +56,54 @@ struct StreamLimits
 	size_t maxQueuedStreamBytes = defaultMaxQueuedStreamBytes;
 }
 
-/// Counts a mount's open streams of one kind against a cap (`0`: unbounded).
+/// Counts a mount's open streams of one kind against a mount-wide cap and, for
+/// authenticated callers, a per-principal cap (`0`: unbounded).
 private final class StreamGate
 {
 	private size_t open;
 	private size_t max;
+	private size_t maxPerPrincipal;
+	private size_t[string] openBy;
 
-	this(size_t max) @safe
+	/// Why `tryAcquire` refused a slot.
+	enum Refusal
+	{
+		none, /// the slot was claimed
+		mount, /// the mount-wide cap is reached
+		principal /// the caller's per-principal cap is reached
+	}
+
+	this(size_t max, size_t maxPerPrincipal = 0) @safe
 	{
 		this.max = max;
+		this.maxPerPrincipal = maxPerPrincipal;
 	}
 
-	/// Claim a stream slot, returning false when the cap is reached. Pair with
-	/// `release`.
-	bool tryAcquire() @safe
+	/// Claim a stream slot for `principal` ("" when unauthenticated). Pair a
+	/// claimed slot (`Refusal.none`) with `release(principal)`.
+	Refusal tryAcquire(string principal = "") @safe
 	{
 		if (max != 0 && open >= max)
-			return false;
+			return Refusal.mount;
+		if (principal.length && maxPerPrincipal != 0 && openBy.get(principal, 0) >= maxPerPrincipal)
+			return Refusal.principal;
 		open++;
-		return true;
+		if (principal.length)
+			openBy[principal] = openBy.get(principal, 0) + 1;
+		return Refusal.none;
 	}
 
-	void release() @safe
+	void release(string principal = "") @safe
 	{
 		if (open > 0)
 			open--;
+		if (auto n = principal in openBy)
+		{
+			if (*n <= 1)
+				openBy.remove(principal);
+			else
+				(*n)--;
+		}
 	}
 }
 
@@ -278,7 +307,8 @@ void mountMcp(URLRouter router, McpServer server,
 	auto sessions = server.mode == ServerMode.stateful ? new SessionManager(opts.sessionLimits)
 		: null;
 	auto statelessInFlight = sessions is null ? new StatelessInFlight : null;
-	auto pushStreams = new StreamGate(opts.streamLimits.maxPushStreams);
+	auto pushStreams = new StreamGate(opts.streamLimits.maxPushStreams,
+			opts.streamLimits.maxPushStreamsPerPrincipal);
 
 	// This mount owns a single fallback `ConnectionState`, which the server core
 	// threads through dispatch and reads back for the notify/push path. It is the
@@ -2248,14 +2278,17 @@ private bool readPostBody(HTTPServerRequest req, HTTPServerResponse res,
 	return true;
 }
 
-/// Answer a `subscriptions/listen` or `events/stream` request with 503 because
-/// the mount already holds `StreamLimits.maxPushStreams` such streams.
-private void refuseTooManyPushStreams(HTTPServerResponse res, Json id) @safe
+/// Answer a `subscriptions/listen` or `events/stream` request refused a stream
+/// slot: 503 when the mount already holds `StreamLimits.maxPushStreams` such
+/// streams, 429 when the caller holds `StreamLimits.maxPushStreamsPerPrincipal`.
+private void refuseTooManyPushStreams(HTTPServerResponse res, Json id, StreamGate.Refusal why) @safe
 {
-	res.statusCode = HTTPStatus.serviceUnavailable;
+	const mine = why == StreamGate.Refusal.principal;
+	res.statusCode = mine ? HTTPStatus.tooManyRequests : HTTPStatus.serviceUnavailable;
 	res.headers["Retry-After"] = "30";
-	res.writeBody(makeErrorResponse(id,
-			internalError("too many open notification streams")).toString(), "application/json");
+	res.writeBody(makeErrorResponse(id, internalError(mine
+			? "too many open notification streams for this principal"
+			: "too many open notification streams")).toString(), "application/json");
 }
 
 /// The token a POST's request is scoped by (its cancellation, server->client
@@ -2544,13 +2577,14 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 						eventStreamNotAcceptable()).toString(), "application/json");
 				return;
 			}
-			if (!pushStreams.tryAcquire())
+			const principal = principalOf(token);
+			if (const why = pushStreams.tryAcquire(principal))
 			{
-				refuseTooManyPushStreams(res, msg.id);
+				refuseTooManyPushStreams(res, msg.id, why);
 				return;
 			}
 			scope (exit)
-				pushStreams.release();
+				pushStreams.release(principal);
 			handleListenStream(server, coord, msg, res, req.headers.get(HttpHeader.protocolVersion,
 					""), connToken, principalOf(token), maxQueued);
 			return;
@@ -2571,13 +2605,14 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 						eventStreamNotAcceptable()).toString(), "application/json");
 				return;
 			}
-			if (!pushStreams.tryAcquire())
+			const principal = principalOf(token);
+			if (const why = pushStreams.tryAcquire(principal))
 			{
-				refuseTooManyPushStreams(res, msg.id);
+				refuseTooManyPushStreams(res, msg.id, why);
 				return;
 			}
 			scope (exit)
-				pushStreams.release();
+				pushStreams.release(principal);
 			handleEventsStream(server, msg, res, token.valid ? token.subject : "", maxQueued);
 			return;
 		}
@@ -4964,6 +4999,84 @@ unittest  // a subscriptions/listen past the push-stream cap is refused with 503
 	});
 	runEventLoop();
 	assert(second == HTTPStatus.serviceUnavailable);
+}
+
+unittest  // one principal past its push-stream cap is refused with 429 while others still connect
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableToolsListChanged();
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxPushStreamsPerPrincipal = 1;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = true;
+		info.subject = t;
+		return info;
+	};
+	mountMcp(router, server, opts);
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	const body_ = makeRequest(Json(1), "subscriptions/listen", params).toString();
+
+	void listen(string who, HTTPServerResponse res) @safe
+	{
+		router.handleRequest(makeInitPostReq(body_,
+				[
+					"Accept": "application/json, text/event-stream",
+					"Authorization": "Bearer " ~ who,
+					"MCP-Protocol-Version": "2026-07-28",
+					HttpHeader.method: "subscriptions/listen",
+		]), res);
+	}
+
+	HTTPServerResponse response() @safe
+	{
+		return createTestHTTPServerResponse(createMemoryOutputStream(), null,
+				TestHTTPResponseMode.bodyOnly);
+	}
+
+	auto first = response(), second = response(), other = response();
+	runTask(() @safe nothrow{
+		try
+			listen("alice", first);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+			listen("bob", other);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			listen("alice", second);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second.statusCode == HTTPStatus.tooManyRequests);
+	assert(other.contentType == "text/event-stream", "another principal still gets a stream");
 }
 
 unittest  // a stateful server answers a body-signalled 2026-07-28 subscriptions/listen with 400
