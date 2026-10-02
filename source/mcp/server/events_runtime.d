@@ -498,6 +498,9 @@ private enum Verification
 	inProgress, /// another delivery's probe for the same endpoint is in flight
 }
 
+/// The longest wait between two delivery attempts of one job.
+private enum Duration maxRetryBackoff = 60.minutes;
+
 /// The verification backoff bounds: the first probe after a failure waits this long,
 /// doubling on each failure up to the cap.
 private enum long verifyBackoffBaseMs = 30 * 1000;
@@ -2895,13 +2898,21 @@ final class EventsRuntime
 		}
 	}
 
+	// Exponential: base * 2^(attempt-1), capped at `maxRetryBackoff` (or the base,
+	// if larger) so a large attempt bound neither overflows nor sleeps for days.
 	private Duration backoffFor(int attempt) @safe
 	{
-		// Exponential: base * 2^(attempt-1).
-		long mult = 1;
+		import std.algorithm : max;
+
+		const cap = max(opts_.webhookRetryBase, maxRetryBackoff);
+		Duration d = opts_.webhookRetryBase;
 		foreach (_; 1 .. attempt)
-			mult *= 2;
-		return opts_.webhookRetryBase * mult;
+		{
+			if (d >= cap)
+				break;
+			d *= 2;
+		}
+		return d < cap ? d : cap;
 	}
 
 	/// The JWKS document for server-identity (`v1a,`) verification, published at
@@ -3357,6 +3368,19 @@ unittest  // a node that claimed a full batch claims the next once its runs fini
 		t();
 	}
 	assert(ft.eventPosts().length == 5);
+}
+
+unittest  // the retry backoff doubles per attempt and is capped, never overflowing
+{
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	auto rt = new EventsRuntime(null, o);
+	assert(rt.backoffFor(1) == 30.seconds);
+	assert(rt.backoffFor(4) == 240.seconds);
+	assert(rt.backoffFor(8) == 60.minutes);
+	assert(rt.backoffFor(40) == 60.minutes);
+	assert(rt.backoffFor(1000) == 60.minutes);
 }
 
 unittest  // canonicalJsonString is key-order independent
