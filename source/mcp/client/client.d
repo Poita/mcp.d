@@ -97,7 +97,10 @@ final class CancellationToken
 {
 	private bool cancelled_;
 	private string reason_;
-	private void delegate(string reason) @safe[long] hooks_;
+	// Keyed by a token-local counter, not a request id: a token may be shared by
+	// calls on several clients whose request ids overlap.
+	private void delegate(string reason) @safe[ulong] hooks_;
+	private ulong nextHookKey_;
 
 	/// Cancel the call(s) using this token. `reason` is sent to the server when
 	/// non-empty. Idempotent.
@@ -134,14 +137,17 @@ final class CancellationToken
 		return reason_;
 	}
 
-	private void bind(long id, void delegate(string reason) @safe hook) @safe nothrow
+	/// Register `hook` to run on `cancel`; returns the key `unbind` takes.
+	private ulong bind(void delegate(string reason) @safe hook) @safe nothrow
 	{
-		hooks_[id] = hook;
+		const key = nextHookKey_++;
+		hooks_[key] = hook;
+		return key;
 	}
 
-	private void unbind(long id) @safe nothrow
+	private void unbind(ulong key) @safe nothrow
 	{
-		hooks_.remove(id);
+		hooks_.remove(key);
 	}
 }
 
@@ -149,11 +155,70 @@ unittest  // CancellationToken.cancel runs every hook even when one throws
 {
 	auto token = new CancellationToken;
 	int ran;
-	token.bind(1, (string) @safe { ran++; throw new Exception("hook failed"); });
-	token.bind(2, (string) @safe { ran++; throw new Exception("hook failed"); });
+	token.bind((string) @safe { ran++; throw new Exception("hook failed"); });
+	token.bind((string) @safe { ran++; throw new Exception("hook failed"); });
 	token.cancel("stop");
 	assert(ran == 2);
 	assert(token.isCancelled);
+}
+
+unittest  // one CancellationToken shared by two clients aborts both clients' in-flight requests
+{
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	// Each transport holds its request open until the client aborts it, so both
+	// clients' first request (JSON-RPC id 1 on each) is in flight at once.
+	McpClient makeClient(RecordingClientTransport t)
+	{
+		t.responder = (Json, long) @safe {
+			foreach (_; 0 .. 200)
+			{
+				if (t.aborted.length)
+					throw new McpException(ErrorCode.internalError, "aborted");
+				sleep(10.msecs);
+			}
+			return Json.emptyObject;
+		};
+		return new McpClient(t);
+	}
+
+	auto ta = new RecordingClientTransport;
+	auto tb = new RecordingClientTransport;
+	auto a = makeClient(ta);
+	auto b = makeClient(tb);
+	auto token = new CancellationToken;
+	RequestOptions opts;
+	opts.cancellation = token;
+	int[2] codes;
+	int finished;
+	void run(McpClient c, size_t slot) nothrow
+	{
+		try
+			c.ping(opts);
+		catch (McpException e)
+			codes[slot] = e.code;
+		catch (Exception)
+		{
+		}
+		if (++finished == 2)
+			exitEventLoop();
+	}
+
+	runTask(() nothrow{ run(a, 0); });
+	runTask(() nothrow{ run(b, 1); });
+	runTask(() nothrow{
+		try
+		{
+			sleep(50.msecs);
+			token.cancel();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(codes[0] == ErrorCode.requestCancelled, "client A's request must be cancelled");
+	assert(codes[1] == ErrorCode.requestCancelled, "client B's request must be cancelled");
 }
 
 /// The error a cancelled request fails with.
@@ -2245,16 +2310,19 @@ final class McpClient : ClientProtocol
 			pollWakeInit_ = true;
 		}
 		const ec = pollWake_.emitCount;
-		const hookId = --pollWakeHookIds_;
+		ulong hookKey;
 		if (cancellation !is null)
 		{
-			cancellation.bind(hookId, (string) @safe { pollWake_.emit(); });
+			hookKey = cancellation.bind((string) @safe { pollWake_.emit(); });
 			if (cancellation.isCancelled)
+			{
+				cancellation.unbind(hookKey);
 				return;
+			}
 		}
 		scope (exit)
 			if (cancellation !is null)
-				cancellation.unbind(hookId);
+				cancellation.unbind(hookKey);
 		pollWake_.wait(d, ec);
 	}
 
@@ -2262,9 +2330,6 @@ final class McpClient : ClientProtocol
 	// sleeps out a long poll interval after its caller has gone away.
 	private LocalManualEvent pollWake_;
 	private bool pollWakeInit_;
-	// Keys for the cancellation hooks a task wait binds, kept negative so they
-	// never collide with request ids.
-	private long pollWakeHookIds_;
 
 	version (unittest) package void delegate(Duration) @safe onTaskSleepForTest;
 
@@ -3433,15 +3498,16 @@ final class McpClient : ClientProtocol
 			auto req = beginRequest(id, params);
 			scope (exit)
 				endRequest(id, req);
+			ulong hookKey;
 			if (token !is null)
 			{
-				token.bind(id, (string reason) @safe {
+				hookKey = token.bind((string reason) @safe {
 					abortRequest(id, cancelledError(reason), reason);
 				});
 			}
 			scope (exit)
 				if (token !is null)
-					token.unbind(id);
+					token.unbind(hookKey);
 			Json result;
 			try
 				result = transport.deliver(message, id);
