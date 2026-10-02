@@ -344,17 +344,14 @@ final class HttpClientTransport : ClientTransport
 	// round-trip to a modern server is avoided.
 	private bool modernProtocol;
 	// Set by `close()` to ask the background stream readers to stop between reads;
-	// the held sockets are closed so a blocked read returns immediately.
-	private shared(bool) closeRequested;
-	// Live sockets for the spawned server / legacy background streams, closed by
-	// `close()` so a parked `conn.read` unblocks. Guarded for @safe access only on
-	// the owning event loop.
-	// Slots for the sockets of the standalone server->client SSE stream. Each
-	// connect attempt in `runServerStream` registers a slot before connecting and
-	// removes it on scope exit; `close()` force-closes every registered slot so a
-	// reader parked on `conn.read` unblocks immediately. Tracking the live sockets
-	// in a slot array (rather than a single shared field) ensures `close()` tears
-	// down every server-stream socket, not only the last one connected.
+	// the held sockets are closed so a blocked read returns immediately. Like all
+	// transport state it is only touched from the owning event loop's tasks.
+	private bool closeRequested;
+	// Slots for the sockets of the standalone server->client SSE stream and of
+	// resume GETs. Each connect attempt in `runServerStream` / `resumeViaGet`
+	// registers a slot before connecting and removes it on scope exit; `close()`
+	// aborts every registered slot so a reader parked on `conn.read` unblocks
+	// immediately, whichever connection it is reading.
 	private ListenSocketSlot[] serverStreamSlots;
 	// The socket and reader task of the legacy GET-SSE stream, aborted by `close()`.
 	private ListenSocketSlot legacyStreamSlot;
@@ -547,11 +544,7 @@ final class HttpClientTransport : ClientTransport
 	/// `ended` with no `error`.
 	void close() @safe
 	{
-		() @trusted {
-			import core.atomic : atomicStore;
-
-			atomicStore(closeRequested, true);
-		}();
+		closeRequested = true;
 		// Close every stream socket and interrupt its reader, so a reader parked on
 		// `conn.read` unblocks at once even where closing a socket does not wake a
 		// pending read (the Windows event driver). A reader running an inbound
@@ -615,11 +608,7 @@ final class HttpClientTransport : ClientTransport
 
 	private bool closing() @safe
 	{
-		return () @trusted {
-			import core.atomic : atomicLoad;
-
-			return atomicLoad(closeRequested);
-		}();
+		return closeRequested;
 	}
 
 	/// Lazily create the legacy-path completion event (a `LocalManualEvent` must be
