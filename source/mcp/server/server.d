@@ -1118,12 +1118,11 @@ final class McpServer : ServerCore
 		resourceSubscriptionsEnabled = true;
 	}
 
-	/// Whether resource subscriptions are effectively active: the author called
-	/// `enableResourceSubscriptions()` AND the server is `stateful`. A `stateless`
-	/// server keeps no per-peer state across HTTP calls, so the `subscribe`
-	/// capability is neither advertised nor honoured even if opted in. Gated on
-	/// the server MODE, not the protocol version, so modern and
-	/// legacy stateless are treated identically.
+	/// Whether 2025-era `resources/subscribe` is effectively active: the author
+	/// called `enableResourceSubscriptions()` AND the server is `stateful`. A
+	/// `stateless` server keeps no per-peer state across HTTP calls, so it never
+	/// serves `resources/subscribe`; on 2026-07-28 it offers resource updates
+	/// through `subscriptions/listen` instead (`listenResourceSubscriptions`).
 	private bool effectiveResourceSubscriptions() const @safe
 	{
 		return resourceSubscriptionsEnabled && mode_ == ServerMode.stateful;
@@ -2948,7 +2947,10 @@ final class McpServer : ServerCore
 		DiscoverResult d;
 		foreach (v; servedVersions)
 			d.supportedVersions ~= v.toWire;
-		d.capabilities = capabilities().forVersion(ProtocolVersion.v2026_07_28);
+		auto caps = capabilities();
+		if (!caps.resources.isNull && listenResourceSubscriptions())
+			caps.resources.get.subscribe = true;
+		d.capabilities = caps.forVersion(ProtocolVersion.v2026_07_28);
 		// Identity is stamped into `_meta` by the dispatch path, along with every
 		// other modern result.
 		d.instructions = instructions;
@@ -3060,13 +3062,20 @@ final class McpServer : ServerCore
 		case "resourcesListChanged":
 			return resourcesListChangedEnabled;
 		case "resourceSubscriptions":
-			// The `subscriptions/listen` stream's per-stream filter IS the client's
-			// resource-update opt-in, so the listen filter alone drives delivery. Only
-			// a stateless server serves 2026-07-28, so only it serves listen.
-			return mode_ == ServerMode.stateless;
+			return listenResourceSubscriptions();
 		default:
 			return false;
 		}
+	}
+
+	/// Whether `subscriptions/listen` accepts `resourceSubscriptions`, which is
+	/// also what `server/discover` advertises as `resources.subscribe`. The
+	/// listen stream's per-stream filter is the client's resource-update opt-in,
+	/// so any stateless server (the only mode serving 2026-07-28) that advertises
+	/// the resources capability supports it.
+	private bool listenResourceSubscriptions() const @safe
+	{
+		return mode_ == ServerMode.stateless && !capabilities().resources.isNull;
 	}
 
 	/// The acknowledged subset for a single `subscriptions/listen` request's filter,
@@ -7045,6 +7054,7 @@ unittest  // an invalid replacement stdio listen leaves the open stream untouche
 	import vibe.data.json : parseJsonString;
 
 	auto s = new McpServer("t", "1");
+	registerStubResources(s, "test://stub");
 	s.enableToolsListChanged();
 	string[] frames;
 	void sink(string line) @safe
@@ -9224,6 +9234,7 @@ unittest  // modern resources/read unknown uri uses invalidParams (-32602)
 unittest  // subscriptions/listen reads the spec-shaped filter nested under params.notifications
 {
 	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	// The server must support the requested notification types for them to be
 	// recorded/acknowledged (2026-07-28 basic/utilities/subscriptions Acknowledgment).
 	s.enableToolsListChanged();
@@ -9241,9 +9252,31 @@ unittest  // subscriptions/listen reads the spec-shaped filter nested under para
 	assert(("file:///project/config.json" in s.activeConnection.subscriptions));
 }
 
+unittest  // a modern stateless server with resources advertises resources.subscribe on discover
+{
+	auto s = makeTestServer();
+	registerStubResources(s, "test://w");
+	auto resp = s.handle(modernReq(1, "server/discover")).get;
+	assert(resp["result"]["capabilities"]["resources"]["subscribe"].get!bool);
+}
+
+unittest  // a server without resources neither advertises subscribe nor acks resourceSubscriptions
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(modernReq(1, "server/discover")).get;
+	assert("resources" !in resp["result"]["capabilities"]);
+	Json p = Json.emptyObject;
+	p["notifications"] = Json([
+		"resourceSubscriptions": Json([Json("file:///a")])
+	]);
+	s.handle(modernReq(2, "subscriptions/listen", p));
+	assert(!s.cs().listenFilter.resourceSubscriptions);
+}
+
 unittest  // subscriptions/listen accepts the flat (top-level) filter shape
 {
 	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	s.enableToolsListChanged();
 	Json p = Json.emptyObject;
 	p["toolsListChanged"] = true;
@@ -9258,6 +9291,7 @@ unittest  // subscriptions/listen accepts the flat (top-level) filter shape
 unittest  // subscriptions/listen ignores a non-array resourceSubscriptions
 {
 	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	s.enableToolsListChanged();
 	Json p = Json.emptyObject;
 	p["toolsListChanged"] = true;
@@ -9273,6 +9307,7 @@ unittest  // subscriptions/listen ignores a non-array resourceSubscriptions
 unittest  // subscriptions/listen with an empty resourceSubscriptions array does not opt in
 {
 	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json.emptyArray;
 	Json p = Json.emptyObject;
@@ -9284,6 +9319,7 @@ unittest  // subscriptions/listen with an empty resourceSubscriptions array does
 unittest  // the per-stream ack reflects exactly the opted-in change types
 {
 	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	s.enableToolsListChanged();
 	// Nothing opted in yet -> empty object.
 	assert(s.acknowledgedSubsetFor(s.cs().listenFilter).type == Json.Type.object);
@@ -9312,6 +9348,7 @@ unittest  // subscriptions/listen rejects more resourceSubscriptions URIs than t
 	import std.conv : to;
 
 	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	Json uris = Json.emptyArray;
 	foreach (i; 0 .. maxResourceSubscriptions + 1)
 		uris ~= Json("file:///" ~ i.to!string);
@@ -9327,6 +9364,7 @@ unittest  // subscriptions/listen rejects more resourceSubscriptions URIs than t
 unittest  // subscriptions/listen deduplicates repeated URIs
 {
 	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	Json uris = Json.emptyArray;
 	foreach (i; 0 .. maxResourceSubscriptions * 4)
 		uris ~= Json(i % 2 ? "file:///a" : "file:///b");
@@ -9344,6 +9382,7 @@ unittest  // stdio subscriptions/listen over the URI cap answers an error instea
 	import std.conv : to;
 
 	auto s = new McpServer("t", "1");
+	registerStubResources(s, "test://stub");
 	Json uris = Json.emptyArray;
 	foreach (i; 0 .. maxResourceSubscriptions + 1)
 		uris ~= Json("note:///" ~ i.to!string);
@@ -9364,6 +9403,7 @@ unittest  // stdio subscriptions/listen over the URI cap answers an error instea
 unittest  // ack echoes every opted-in resourceSubscriptions URI in request order
 {
 	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json([
 		Json("file:///a.txt"), Json("file:///b.txt")
@@ -9429,6 +9469,7 @@ unittest  // per-stream ack does not leak a concurrent stream's opt-in
 	// ack is built from the per-stream filter the transport captured right after
 	// routing that listen request, never a server-wide accumulator.
 	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	s.enableToolsListChanged();
 
 	Json fa = Json.emptyObject;
@@ -9525,6 +9566,7 @@ unittest  // a stateless/modern server honours a subscriptions/listen resourceSu
 	// opt-in; a modern (2026-07-28) server honours it without (and cannot use)
 	// `enableResourceSubscriptions()`.
 	auto s = McpServer.stateless("t", "1");
+	registerStubResources(s, "test://stub");
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
 	Json p = Json.emptyObject;
@@ -10309,6 +10351,7 @@ unittest  // notifyResourceUpdated reaches every listen stream subscribed to the
 	import std.algorithm : canFind;
 
 	auto s = new McpServer("t", "1");
+	registerStubResources(s, "test://stub");
 	auto ch = ensurePushChannel(s, new StreamCoordinator);
 	string a, b, other;
 	ListenFilter f;
@@ -10799,6 +10842,7 @@ unittest  // modern: concurrent listen streams only receive the type each opted 
 	import std.algorithm : canFind;
 
 	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	s.enableToolsListChanged();
 	auto coord = new StreamCoordinator;
 	auto push = ensurePushChannel(s, coord);
@@ -10853,6 +10897,7 @@ unittest  // STATELESS HTTP subscriptions/listen delivers resources/updated per-
 	// Delivery is driven by the open listener's own ListenFilter, not by
 	// enableResourceSubscriptions() (which a stateless server cannot call).
 	auto s = McpServer.stateless("t", "1");
+	registerStubResources(s, "test://stub");
 	auto coord = new StreamCoordinator;
 	auto push = ensurePushChannel(s, coord);
 
@@ -10920,6 +10965,7 @@ unittest  // stdio listen sink is per-URI filtered (subscribed delivered, other 
 	// Delivery is driven by the stdio listen stream's own recorded filter, not by
 	// enableResourceSubscriptions() (which a stateless server cannot call).
 	auto s = new McpServer("t", "1");
+	registerStubResources(s, "test://stub");
 
 	string[] sink;
 	// Open a modern stdio listen subscribed to note:///a only.

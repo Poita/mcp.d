@@ -334,7 +334,10 @@ is resolved.
 | Session id minted | never | never | yes |
 
 The `subscribe` capability advertisement follows the same rule: a stateless server
-does **not** advertise the resources `subscribe` capability. Calling
+does **not** advertise the resources `subscribe` capability on a 2025-era session. On
+2026-07-28 its `server/discover` advertises `resources.subscribe` whenever it
+advertises `resources`, meaning `subscriptions/listen` accepts `resourceSubscriptions`
+(a server without resources acknowledges no `resourceSubscriptions`). Calling
 `enableResourceSubscriptions()` on a stateless server **throws** rather than
 silently doing nothing — it names `McpServer.stateful()` as the remedy — so the
 mistake surfaces at construction instead of as a missing capability at runtime. The
