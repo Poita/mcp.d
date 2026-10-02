@@ -674,6 +674,8 @@ string deploy(string gitRef, TaskContext tc) @safe
     return tc.detach("deploying " ~ gitRef);    // leave it working; the webhook below completes it
 }
 
+registerModule!deployments(server);   // the module declaring `deploy`; must follow enableTasks()
+
 // The deploy system's callback — runs on any node, holds no fiber:
 void onDeployFinished(string taskId, bool ok) @safe
 {
@@ -683,6 +685,10 @@ void onDeployFinished(string taskId, bool ok) @safe
         rt.fail(taskId, internalError("deploy failed"));
 }
 ```
+
+Register task functions (`registerModule` / `registerHandlers`) only after
+`enableTasks()`: a task tool needs the runtime, so registering one before it
+throws.
 
 The three exits cover the lifecycle: `return` a value completes the task,
 `tc.requireInput(...)` suspends it for a client answer (delivered via `tasks/update`),
