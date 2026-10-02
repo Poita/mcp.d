@@ -652,8 +652,11 @@ and `tc.detach(...)` leaves it `working` for `onDeployFinished` to complete out 
 band via `rt.complete` / `rt.fail` — no fiber held, so it works on any node. See
 [`examples/tasks`](examples/tasks/) for cancellation, durable stores, and the client side.
 
-On the client, `callToolAwait` hides the whole flow — it drives the poll loop and
-returns the final `CallToolResult`, so task and non-task tools look identical. When
+On the client, `callToolAwait(name, args, opts, onInputRequired)` hides the whole
+flow — it drives the poll loop and returns the final `CallToolResult`, so task and
+non-task tools look identical. Like `callTool` and every other request verb, it
+takes its `RequestOptions` (progress, log level, cancellation) after the call's own
+arguments. When
 you need to survive a restart, call plain `callTool` instead: if the server made a
 task the result is the handle (`result.isTask`, with the seed `Task` in
 `result.task`). Persist `result.task.taskId`, then resume any time — even in a fresh

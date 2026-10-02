@@ -152,8 +152,8 @@ int main(string[] args) @safe
 			Json a = Json.emptyObject;
 			a["text"] = "hello world";
 			bool answered;
-			auto r = client.callToolAwait("labeled_count", a, (string taskId,
-				Json inputRequests) @safe {
+			auto r = client.callToolAwait("labeled_count", a,
+				RequestOptions.init, (string taskId, Json inputRequests) @safe {
 				check((("label" in inputRequests) !is null),
 				"labeled_count should surface a 'label' input request");
 				check(inputRequests["label"]["method"].get!string == "elicitation/create",

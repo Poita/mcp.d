@@ -1185,9 +1185,21 @@ final class McpClient : ClientProtocol
 	}
 
 	/// `ping` — returns when the server acknowledges.
-	void ping() @safe
+	void ping(RequestOptions opts = RequestOptions.init) @safe
 	{
-		rpc("ping", Json.emptyObject);
+		rpcWith("ping", Json.emptyObject, opts);
+	}
+
+	/// Send `method` with the per-call `opts` applied: its progress token and log
+	/// level travel in `params._meta`, its progress sink receives the call's
+	/// progress, and its cancellation token aborts the call. A token minted for
+	/// `opts.onProgress` is kept in `opts`, so a caller issuing several requests
+	/// (a paginated listing) correlates them all under one token.
+	private Json rpcWith(string method, Json params, ref RequestOptions opts) @safe
+	{
+		auto token = effectiveToken(opts);
+		auto p = withRequestLogLevel(withProgressToken(params, token), opts.logLevel);
+		return withPerCallProgress!Json(opts, () @safe => rpc(method, p));
 	}
 
 	/// Drive an auto-paginating list call. `fetchPage` is invoked once per page
@@ -1233,7 +1245,8 @@ final class McpClient : ClientProtocol
 	/// Owns the cursor-param building, the first-page `cache` capture, and the
 	/// `nextCursor` reset shared by every `list*` method; `append` is the only
 	/// per-call variation, concatenating one page's items onto the accumulator.
-	private R drainList(R)(string method, scope void delegate(ref R acc, ref R page) @safe append) @safe
+	private R drainList(R)(string method, scope void delegate(ref R acc,
+			ref R page) @safe append, RequestOptions opts = RequestOptions.init) @safe
 	{
 		R acc;
 		bool first = true;
@@ -1241,7 +1254,7 @@ final class McpClient : ClientProtocol
 			Json p = Json.emptyObject;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
-			auto res = R.fromJson(rpc(method, p));
+			auto res = R.fromJson(rpcWith(method, p, opts));
 			append(acc, res);
 			if (first)
 			{
@@ -1925,35 +1938,36 @@ final class McpClient : ClientProtocol
 	/// Fetch a task's current state (`tasks/get`). Returns the raw `DetailedTask`
 	/// JSON, which carries the `Task` fields plus, for terminal/blocked states,
 	/// `result` (completed), `error` (failed), or `inputRequests` (input_required).
-	Json getTaskState(string taskId) @safe
+	Json getTaskState(string taskId, RequestOptions opts = RequestOptions.init) @safe
 	{
-		return rpc("tasks/get", Json(["taskId": Json(taskId)]));
+		return rpcWith("tasks/get", Json(["taskId": Json(taskId)]), opts);
 	}
 
 	/// The typed `Task` metadata for `taskId` (status/timestamps/ttl), parsed from
 	/// `getTaskState`.
-	Task getTask(string taskId) @safe
+	Task getTask(string taskId, RequestOptions opts = RequestOptions.init) @safe
 	{
-		return Task.fromJson(getTaskState(taskId));
+		return Task.fromJson(getTaskState(taskId, opts));
 	}
 
 	/// Supply responses to a task's outstanding `inputRequests` (`tasks/update`).
 	/// `inputResponses` is a map keyed by the request keys surfaced under the
 	/// `input_required` state.
-	void respondTaskInput(string taskId, Json inputResponses) @safe
+	void respondTaskInput(string taskId, Json inputResponses,
+			RequestOptions opts = RequestOptions.init) @safe
 	{
 		Json p = Json.emptyObject;
 		p["taskId"] = taskId;
 		p["inputResponses"] = (inputResponses.type == Json.Type.object) ? inputResponses
 			: Json.emptyObject;
-		rpc("tasks/update", p);
+		rpcWith("tasks/update", p, opts);
 	}
 
 	/// Request cancellation of a task (`tasks/cancel`). Cancellation is
 	/// cooperative: the server acknowledges but may still finish the work.
-	void cancelTask(string taskId) @safe
+	void cancelTask(string taskId, RequestOptions opts = RequestOptions.init) @safe
 	{
-		rpc("tasks/cancel", Json(["taskId": Json(taskId)]));
+		rpcWith("tasks/cancel", Json(["taskId": Json(taskId)]), opts);
 	}
 
 	/// Poll `tasks/get` until the task reaches a terminal status, honoring the
@@ -2091,9 +2105,8 @@ final class McpClient : ClientProtocol
 	/// directly, store `result.task.taskId` when `result.isTask`, and later resume
 	/// with `awaitTask`.
 	CallToolResult callToolAwait(string name, Json arguments = Json.emptyObject,
-			void delegate(string taskId,
-				Json inputRequests) @safe onInputRequired = null,
-			RequestOptions opts = RequestOptions.init) @safe
+			RequestOptions opts = RequestOptions.init,
+			void delegate(string taskId, Json inputRequests) @safe onInputRequired = null) @safe
 	{
 		// Mint the progress token up front so the task phase routes the same
 		// token's progress to `opts.onProgress` as the initial call did.
@@ -2283,7 +2296,7 @@ final class McpClient : ClientProtocol
 	/// otherwise the server answers -32601 (method not found). Not cached: a
 	/// directory listing is cheap and the skill catalogs that motivate it are
 	/// often generated on demand.
-	ListResourcesResult readDirectory(string uri) @safe
+	ListResourcesResult readDirectory(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
 		ListResourcesResult acc;
 		paginate((Nullable!string cursor) @safe {
@@ -2291,7 +2304,7 @@ final class McpClient : ClientProtocol
 			p["uri"] = uri;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
-			auto res = ListResourcesResult.fromJson(rpc("resources/directory/read", p));
+			auto res = ListResourcesResult.fromJson(rpcWith("resources/directory/read", p, opts));
 			acc.resources ~= res.resources;
 			return res.nextCursor;
 		});
@@ -2307,10 +2320,10 @@ final class McpClient : ClientProtocol
 	/// skills. `cache` carries the first page's `ttlMs`/`cacheScope` (a modern
 	/// server always sends them); the listing is not served from the response
 	/// cache, since the per-entry digests are the signal hosts act on.
-	ListSkillsResult skillsList() @safe
+	ListSkillsResult skillsList(RequestOptions opts = RequestOptions.init) @safe
 	{
 		return drainList!ListSkillsResult("skills/list", (ref ListSkillsResult a,
-				ref ListSkillsResult r) @safe { a.skills ~= r.skills; });
+				ref ListSkillsResult r) @safe { a.skills ~= r.skills; }, opts);
 	}
 
 	/// `skills/get` (Skills extension): the entry for the single skill whose
@@ -2320,11 +2333,11 @@ final class McpClient : ClientProtocol
 	/// always sends them): how long the entry may be treated as current before
 	/// re-calling. Never served from the response cache: the point of the call is
 	/// a fresh snapshot of the skill's digests.
-	GetSkillResult skillsGet(string uri) @safe
+	GetSkillResult skillsGet(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
 		Json p = Json.emptyObject;
 		p["uri"] = uri;
-		return GetSkillResult.fromJson(rpc("skills/get", p));
+		return GetSkillResult.fromJson(rpcWith("skills/get", p, opts));
 	}
 
 	/// `prompts/list`, auto-paginated. Returns the drained `ListPromptsResult`:
@@ -2445,18 +2458,19 @@ final class McpClient : ClientProtocol
 	}
 
 	/// `resources/subscribe` / `resources/unsubscribe`.
-	void subscribe(string uri) @safe
+	void subscribe(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
 		Json p = Json.emptyObject;
 		p["uri"] = uri;
-		rpc("resources/subscribe", p);
+		rpcWith("resources/subscribe", p, opts);
 	}
 
-	void unsubscribe(string uri) @safe
+	/// ditto
+	void unsubscribe(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
 		Json p = Json.emptyObject;
 		p["uri"] = uri;
-		rpc("resources/unsubscribe", p);
+		rpcWith("resources/unsubscribe", p, opts);
 	}
 
 	/// Open a modern `subscriptions/listen` notification stream (modern
@@ -2501,14 +2515,14 @@ final class McpClient : ClientProtocol
 
 	/// `events/list`, auto-paginated. Returns the drained `EventListResult` whose
 	/// `events` aggregates every page (and `nextCursor` is null).
-	EventListResult listEvents() @safe
+	EventListResult listEvents(RequestOptions opts = RequestOptions.init) @safe
 	{
 		EventListResult acc;
 		paginate((Nullable!string cursor) @safe {
 			Json p = Json.emptyObject;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
-			auto res = EventListResult.fromJson(rpc("events/list", p));
+			auto res = EventListResult.fromJson(rpcWith("events/list", p, opts));
 			acc.events ~= res.events;
 			return res.nextCursor;
 		});
@@ -2519,9 +2533,9 @@ final class McpClient : ClientProtocol
 	/// One `events/poll` round-trip for a single subscription. The low-level
 	/// primitive; a poll-mode subscription loops this at the server-recommended
 	/// `nextPollMs`, persisting the returned `cursor` and passing it back.
-	PollResult pollEvents(PollParams p) @safe
+	PollResult pollEvents(PollParams p, RequestOptions opts = RequestOptions.init) @safe
 	{
-		return PollResult.fromJson(rpc("events/poll", p.toJson()));
+		return PollResult.fromJson(rpcWith("events/poll", p.toJson(), opts));
 	}
 
 	/// Open a push `events/stream` for one subscription. Occurrences are delivered
@@ -2564,20 +2578,17 @@ final class McpClient : ClientProtocol
 	/// subscription. Idempotent on `(principal, url, name, arguments)`. Returns the
 	/// server's `SubscribeResult` (id, granted `refreshBefore`, watermark cursor,
 	/// and — on a refresh — `deliveryStatus`).
-	SubscribeResult subscribeWebhookEvents(SubscribeParams p) @safe
+	SubscribeResult subscribeWebhookEvents(SubscribeParams p,
+			RequestOptions opts = RequestOptions.init) @safe
 	{
-		return SubscribeResult.fromJson(rpc("events/subscribe", p.toJson()));
+		return SubscribeResult.fromJson(rpcWith("events/subscribe", p.toJson(), opts));
 	}
 
 	/// `events/unsubscribe` (webhook delivery): eager teardown of the subscription
 	/// keyed by `(principal, url, name, arguments)`.
-	void unsubscribeWebhookEvents(string name, Json arguments, string url) @safe
+	void unsubscribeWebhookEvents(UnsubscribeParams p, RequestOptions opts = RequestOptions.init) @safe
 	{
-		UnsubscribeParams p;
-		p.name = name;
-		p.arguments = arguments;
-		p.url = url;
-		rpc("events/unsubscribe", p.toJson());
+		rpcWith("events/unsubscribe", p.toJson(), opts);
 	}
 
 	// --- Managed subscriptions (poll / push / webhook) ---------------------
@@ -2995,7 +3006,11 @@ final class McpClient : ClientProtocol
 		sub.onTeardown(() @safe nothrow{
 			try
 			{
-				unsubscribeWebhookEvents(p.name, p.arguments, p.delivery.url);
+				UnsubscribeParams u;
+				u.name = p.name;
+				u.arguments = p.arguments;
+				u.url = p.delivery.url;
+				unsubscribeWebhookEvents(u);
 				rx.unregister(id);
 			}
 			catch (Exception)
@@ -3191,13 +3206,13 @@ final class McpClient : ClientProtocol
 	/// Typed entry point: pass a `LogLevel` for compile-time safety, so an invalid
 	/// level name can never reach the wire. Forwards to the string overload (whose
 	/// runtime validation always passes for a `LogLevel`).
-	void setLogLevel(LogLevel level) @safe
+	void setLogLevel(LogLevel level, RequestOptions opts = RequestOptions.init) @safe
 	{
-		setLogLevel(cast(string) level);
+		setLogLevel(cast(string) level, opts);
 	}
 
 	/// an empty `level` clears the modern opt-in.
-	void setLogLevel(string level) @safe
+	void setLogLevel(string level, RequestOptions opts = RequestOptions.init) @safe
 	{
 		// Reject an unrecognised level locally rather than POSTing it to a server
 		// that will reject it (released protocol) or silently stamping it into
@@ -3213,7 +3228,7 @@ final class McpClient : ClientProtocol
 		}
 		Json p = Json.emptyObject;
 		p["level"] = level;
-		rpc("logging/setLevel", p);
+		rpcWith("logging/setLevel", p, opts);
 	}
 
 	// --- transport internals -------------------------------------------------
@@ -4750,11 +4765,74 @@ unittest  // callToolAwait routes progress to opts.onProgress while it polls the
 			"result": Json(["content": Json.emptyArray])
 		]);
 	};
-	c.callToolAwait("slow", Json.emptyObject, null,
+	c.callToolAwait("slow", Json.emptyObject,
 			RequestOptions.withProgress((ProgressNotification n) @safe {
 				progressSeen++;
 			}));
 	assert(progressSeen == 2, "progress during task polling must reach opts.onProgress");
+}
+
+unittest  // plain verbs honour RequestOptions: progress token, log level and cancellation
+{
+	auto c = McpClient.http("http://localhost");
+	Json[string] seen;
+	c.onRpcForTest = (string method, Json params) @safe {
+		seen[method] = params;
+		if (method == "skills/list")
+			return Json(["skills": Json.emptyArray]);
+		if (method == "events/list")
+			return Json(["events": Json.emptyArray]);
+		if (method == "resources/directory/read")
+			return Json(["resources": Json.emptyArray]);
+		if (method == "tasks/get")
+			return Json(["taskId": Json("t1"), "status": Json("working")]);
+		if (method == "skills/get")
+			return Json(["skill": Json.emptyObject]);
+		return Json.emptyObject;
+	};
+	RequestOptions opts;
+	opts.progressToken = ProgressToken("p1");
+	c.ping(opts);
+	c.subscribe("file:///a", opts);
+	c.unsubscribe("file:///a", opts);
+	c.readDirectory("file:///d", opts);
+	c.skillsList(opts);
+	c.listEvents(opts);
+	c.getTaskState("t1", opts);
+	c.cancelTask("t1", opts);
+	c.setLogLevel("info", opts);
+	UnsubscribeParams u;
+	u.name = "e";
+	u.url = "https://example.com/hook";
+	c.unsubscribeWebhookEvents(u, opts);
+	foreach (method; [
+		"ping", "resources/subscribe", "resources/unsubscribe",
+		"resources/directory/read", "skills/list", "events/list", "tasks/get",
+		"tasks/cancel", "logging/setLevel", "events/unsubscribe"
+	])
+		assert(seen[method]["_meta"]["progressToken"].get!string == "p1", method);
+
+	auto cancel = new CancellationToken;
+	cancel.cancel();
+	RequestOptions cancelled;
+	cancelled.cancellation = cancel;
+	int code;
+	try
+		c.ping(cancelled);
+	catch (McpException e)
+		code = e.code;
+	assert(code == ErrorCode.requestCancelled);
+}
+
+unittest  // callToolAwait takes RequestOptions in the same position as callTool
+{
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe => Json([
+		"content": Json.emptyArray
+	]);
+	RequestOptions opts;
+	auto r = c.callToolAwait("add", Json.emptyObject, opts, null);
+	assert(!r.isTask);
 }
 
 unittest  // cancelling callToolAwait's token stops polling and cancels the task
@@ -4779,7 +4857,7 @@ unittest  // cancelling callToolAwait's token stops polling and cancels the task
 	opts.cancellation = cancel;
 	int code;
 	try
-		c.callToolAwait("slow", Json.emptyObject, null, opts);
+		c.callToolAwait("slow", Json.emptyObject, opts);
 	catch (McpException e)
 		code = e.code;
 	assert(code == ErrorCode.requestCancelled, "a cancelled await must fail as cancelled");
