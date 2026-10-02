@@ -14,7 +14,9 @@ import vibe.data.json : Json;
 /// Returns true when `t` is a JSON type that can legitimately hold a value of
 /// type `T`. For integral `T`, both `Type.int_` and `Type.bigInt` are accepted:
 /// vibe.d parses JSON integers outside `long`'s range as `Type.bigInt`, and the
-/// range check against `T` happens when the value is read.
+/// range check against `T` happens when the value is read. A floating `T`
+/// accepts every JSON number, since a whole number is encoded without a
+/// fraction (`3`, not `3.0`).
 private bool typeMatchesFor(T)(Json.Type t) pure nothrow @safe @nogc
 {
 	static if (is(T == string))
@@ -24,7 +26,7 @@ private bool typeMatchesFor(T)(Json.Type t) pure nothrow @safe @nogc
 	else static if (isIntegral!T)
 		return t == Json.Type.int_ || t == Json.Type.bigInt;
 	else static if (isFloatingPoint!T)
-		return t == Json.Type.float_;
+		return t == Json.Type.float_ || t == Json.Type.int_ || t == Json.Type.bigInt;
 	else
 		static assert(false, "jsonhelpers: unsupported scalar type " ~ T.stringof);
 }
@@ -77,6 +79,11 @@ T getOr(T)(Json j, string key, T fallback) @safe
 		T parsed;
 		return integralInRange(*p, parsed) ? parsed : fallback;
 	}
+	else static if (isFloatingPoint!T)
+	{
+		double d;
+		return tryNumber(*p, d) ? cast(T) d : fallback;
+	}
 	else
 	{
 		return (*p).get!T;
@@ -98,6 +105,13 @@ bool tryGet(T)(Json j, string key, ref T val) @safe if (!is(T : Nullable!U, U))
 	{
 		if (!integralInRange(*p, val))
 			return false;
+	}
+	else static if (isFloatingPoint!T)
+	{
+		double d;
+		if (!tryNumber(*p, d))
+			return false;
+		val = cast(T) d;
 	}
 	else
 	{
@@ -319,6 +333,23 @@ bool tryGet(N : Nullable!T, T)(Json j, string key, ref N val) @safe
 	bool assigned = tryGet(j, "code", val);
 	assert(!assigned);
 	assert(val == 99);
+}
+
+@safe unittest  // getOr and tryGet read an integer-encoded JSON number into a floating type
+{
+	import vibe.data.json : parseJsonString;
+
+	Json j = parseJsonString(`{"i": 3, "f": 2.5, "big": 18446744073709551616, "s": "1"}`);
+	assert(j.getOr("i", 0.0) == 3.0);
+	assert(j.getOr("f", 0.0) == 2.5);
+	assert(j.getOr("big", 0.0) == 18446744073709551616.0);
+	assert(j.getOr("s", -1.0) == -1.0);
+	double d = -1;
+	assert(tryGet(j, "i", d) && d == 3.0);
+	float f = -1;
+	assert(tryGet(j, "big", f) && f == 18446744073709551616.0f);
+	Nullable!double n;
+	assert(tryGet(j, "i", n) && n.get == 3.0);
 }
 
 @safe unittest  // requireObject throws -32602 naming the field for a non-object value
