@@ -1610,16 +1610,21 @@ final class McpClient : ClientProtocol
 			RequestOptions opts = RequestOptions.init) @safe
 	{
 		auto result = callToolImpl(name, arguments, opts);
-		// When output-schema validation is enabled and the cached tools/list carries
-		// this tool's outputSchema, validate the returned structuredContent against
-		// it so a string-name call gets the same guarantee as `callTool(Tool, ...)`.
-		if (validateOutputSchema_)
-		{
-			auto tool = cachedTool(name);
-			if (!tool.isNull)
-				enforceOutputSchema(name, tool.get.outputSchema, result);
-		}
+		enforceKnownOutputSchema(name, result);
 		return result;
+	}
+
+	/// When output-schema validation is enabled and tool `name`'s descriptor is
+	/// known (see `cachedTool`), validate `result`'s structuredContent against its
+	/// outputSchema, so a string-name call gets the same guarantee as
+	/// `callTool(Tool, ...)`.
+	private void enforceKnownOutputSchema(string name, const CallToolResult result) @safe
+	{
+		if (!validateOutputSchema_)
+			return;
+		auto tool = cachedTool(name);
+		if (!tool.isNull)
+			enforceOutputSchema(name, tool.get.outputSchema, result);
 	}
 
 	/// Issue the `tools/call` (with per-call progress routing and MRTR looping)
@@ -2107,7 +2112,8 @@ final class McpClient : ClientProtocol
 	/// polling and cancels the task on the server. A caller that instead needs
 	/// to persist the task and resume after a restart should call `callTool`
 	/// directly, store `result.task.taskId` when `result.isTask`, and later resume
-	/// with `awaitTask`.
+	/// with `awaitTask`. With output-schema validation enabled, the final result
+	/// is validated like a `callTool` result.
 	CallToolResult callToolAwait(string name, Json arguments = Json.emptyObject,
 			RequestOptions opts = RequestOptions.init,
 			void delegate(string taskId, Json inputRequests) @safe onInputRequired = null) @safe
@@ -2118,9 +2124,11 @@ final class McpClient : ClientProtocol
 		auto r = callTool(name, arguments, opts);
 		if (!r.isTask())
 			return r;
-		return withPerCallProgress!CallToolResult(opts, () @safe {
+		auto done = withPerCallProgress!CallToolResult(opts, () @safe {
 			return awaitTaskImpl(r.task.taskId, onInputRequired, opts.cancellation);
 		});
+		enforceKnownOutputSchema(name, done);
+		return done;
 	}
 
 	private McpException taskFailedError(string taskId, Json state) @safe
@@ -4861,6 +4869,47 @@ unittest  // a request timeout is a transient event failure, identified by type
 {
 	assert(McpClient.isTransientEventFailure(new RequestTimeoutException("slow")));
 	assert(!McpClient.isTransientEventFailure(new McpException(ErrorCode.invalidParams, "bad")));
+}
+
+unittest  // callToolAwait validates the awaited task result against the listed outputSchema
+{
+	import mcp.protocol.schema : jsonSchemaOf;
+
+	struct AddResult
+	{
+		int result;
+	}
+
+	auto c = McpClient.http("http://localhost");
+	c.enableOutputSchemaValidation();
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tools/list")
+			return Json(["tools": Json([t.toJson()])]);
+		if (method == "tools/call")
+			return Json([
+			"resultType": Json("task"),
+			"taskId": Json("t1"),
+			"status": Json("working")
+		]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json([
+				"content": Json.emptyArray,
+				"structuredContent": Json(["result": Json("oops")])
+			])
+		]);
+	};
+	c.listTools();
+	int code;
+	try
+		c.callToolAwait("add");
+	catch (McpException e)
+		code = e.code;
+	assert(code == ErrorCode.invalidParams,
+			"a non-conforming awaited result must fail output-schema validation");
 }
 
 unittest  // cancelling callToolAwait's token stops polling and cancels the task
