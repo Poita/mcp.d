@@ -417,8 +417,6 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 		manifest ~= resourceRef(fu, skillDigest(bytes), bytes.length);
 	}
 
-	enableSkills(server);
-
 	// Roll back any resources registered for THIS skill if a later registration
 	// throws (e.g. a URI already taken by another skill), so a failed registration
 	// never leaves orphaned resources behind. The entry is added last, after every
@@ -459,6 +457,9 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 	entry["frontmatter"] = frontmatter;
 	entry["resources"] = manifest;
 	addSkillEntry(server, entry);
+	// Advertised only once the skill is fully registered, so a throw above
+	// leaves the server unchanged.
+	enableSkills(server);
 }
 
 /// One `{uri, digest, size}` element of a skill entry's `resources` manifest:
@@ -532,8 +533,6 @@ void registerDynamicSkill(McpServer server, DynamicSkill skill) @safe
 	if (uri in server.ensureSkillIndex().byUri)
 		throw new Exception("a skill at '" ~ uri ~ "' is already registered");
 
-	enableSkills(server);
-
 	Resource descriptor;
 	descriptor.uri = uri;
 	descriptor.name = name;
@@ -557,6 +556,7 @@ void registerDynamicSkill(McpServer server, DynamicSkill skill) @safe
 	entry["frontmatter"] = frontmatterJson(name, description, metadata);
 	entry["resources"] = "dynamic";
 	addSkillEntry(server, entry);
+	enableSkills(server);
 }
 
 /// Whether the client behind `ctx` advertised the skills extension (at
@@ -2147,4 +2147,37 @@ unittest  // resources/directory/read does not exist below 2025-11-25
 			~ `"params":{"uri":"skill://office/pdf-forms"}}`, conn, "");
 	auto resp = parseJsonString(outText);
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.methodNotFound);
+}
+
+unittest  // a skill registration that throws registering its resource leaves the extension unadvertised
+{
+	import std.exception : assertThrown;
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.mrtr : MetaKey;
+
+	auto s = new McpServer("t", "1");
+	Resource taken;
+	taken.uri = skillUri("clash");
+	taken.name = "taken";
+	s.registerResource(taken, () @safe => ResourceContents.makeText(taken.uri, "text/plain", ""));
+	Skill sk;
+	sk.path = "clash";
+	sk.description = "d";
+	sk.instructions = "body";
+	assertThrown(registerSkill(s, sk));
+	DynamicSkill dyn;
+	dyn.path = "clash";
+	dyn.description = "d";
+	dyn.instructions = () @safe => "body";
+	assertThrown(registerDynamicSkill(s, dyn));
+
+	Json params = Json.emptyObject;
+	Json m = Json.emptyObject;
+	m[MetaKey.protocolVersion] = "2026-07-28";
+	m[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	m[MetaKey.clientCapabilities] = Json.emptyObject;
+	params["_meta"] = m;
+	auto caps = s.handle(Message(makeRequest(Json(1), "server/discover",
+			params))).get["result"]["capabilities"];
+	assert("extensions" !in caps || skillsExtensionKey !in caps["extensions"], caps.toString);
 }
