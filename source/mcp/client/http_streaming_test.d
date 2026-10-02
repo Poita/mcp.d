@@ -133,6 +133,7 @@ unittest
 	// A stateless server answers the standalone GET with 405, so there is no
 	// stream to push onto.
 	auto server = McpServer.stateful("server-stream-e2e", "1.0.0");
+	server.enableToolsListChanged();
 
 	auto router = new URLRouter;
 	mountMcp(router, server);

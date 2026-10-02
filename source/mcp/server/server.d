@@ -748,7 +748,8 @@ final class McpServer : ServerCore
 	/// the number of listeners reached; `0` when no GET stream is open. Call
 	/// after a runtime `registerTool` / `removeTool`. For the modern protocol,
 	/// the notification is suppressed unless a client opted in via
-	/// `subscriptions/listen` with `toolsListChanged:true`.
+	/// `subscriptions/listen` with `toolsListChanged:true`. Sends nothing
+	/// unless `enableToolsListChanged` advertised the capability.
 	size_t notifyToolsListChanged() @safe
 	{
 		return notifyChange("notifications/tools/list_changed", Json.undefined, "");
@@ -761,7 +762,8 @@ final class McpServer : ServerCore
 	/// stream is open. Call after a runtime `registerResource` /
 	/// `registerResourceTemplate` (or a removal). For the modern protocol, the
 	/// notification is suppressed unless a client opted in via
-	/// `subscriptions/listen` with `resourcesListChanged:true`.
+	/// `subscriptions/listen` with `resourcesListChanged:true`. Sends nothing
+	/// unless `enableResourcesListChanged` advertised the capability.
 	size_t notifyResourcesListChanged() @safe
 	{
 		return notifyChange("notifications/resources/list_changed", Json.undefined, "");
@@ -773,7 +775,8 @@ final class McpServer : ServerCore
 	/// Returns the number of listeners reached; `0` when no GET stream is open.
 	/// Call after a runtime `registerPrompt` (or a removal). For 2026-07-28
 	/// protocol, the notification is suppressed unless a client opted in via
-	/// `subscriptions/listen` with `promptsListChanged:true`.
+	/// `subscriptions/listen` with `promptsListChanged:true`. Sends nothing
+	/// unless `enablePromptsListChanged` advertised the capability.
 	size_t notifyPromptsListChanged() @safe
 	{
 		return notifyChange("notifications/prompts/list_changed", Json.undefined, "");
@@ -1496,9 +1499,12 @@ final class McpServer : ServerCore
 	/// transport). On a stdio server with an
 	/// active modern `subscriptions/listen` it is additionally written to stdout
 	/// (stamped with the listen subscriptionId), since that transport shares one
-	/// channel for all server->client traffic.
+	/// channel for all server->client traffic. A list-changed notification whose
+	/// `listChanged` capability the server does not advertise is not sent.
 	size_t notify(string method, Json params = Json.undefined) @safe
 	{
+		if (!listChangedAdvertised(method))
+			return 0;
 		size_t delivered = writeStdioListen(method, params);
 		delivered += writeStdioPlain(method, params, resourceUriOf(method, params));
 		if (pushChannel !is null)
@@ -1562,10 +1568,10 @@ final class McpServer : ServerCore
 	/// Write `method` unstamped to a 2025-era stdio client: one whose stateful
 	/// `initialize` has been processed on the bound connection (a stateful server
 	/// never speaks 2026-07-28, whose clients use `subscriptions/listen` instead).
-	/// Delivery follows the 2025-era rules: a list-changed notification only when
-	/// the server advertises that `listChanged` capability, and
-	/// `notifications/resources/updated` only for a URI the client subscribed to.
-	/// Returns the number of clients reached (0 or 1).
+	/// Delivery follows the 2025-era rules: `notifications/resources/updated`
+	/// only for a URI the client subscribed to (callers gate list-changed
+	/// notifications on `listChangedAdvertised`). Returns the number of clients
+	/// reached (0 or 1).
 	private size_t writeStdioPlain(string method, Json params, string uri) @safe
 	{
 		if (stdioSink_ is null || mode_ != ServerMode.stateful)
@@ -1573,7 +1579,7 @@ final class McpServer : ServerCore
 		auto conn = activeConnection;
 		if (!conn.initializeProcessed || conn.negotiated.isModern)
 			return 0;
-		if (!listChangedAdvertised(method) || !plainGetEligibleFor(conn, method, uri))
+		if (!plainGetEligibleFor(conn, method, uri))
 			return 0;
 		stdioSink_(makeNotification(method, params).toString());
 		return 1;
@@ -1879,6 +1885,10 @@ final class McpServer : ServerCore
 	/// sessions / listen streams reached.
 	private size_t notifyChange(string method, Json params, string uri) @safe
 	{
+		// A list-changed notification is sent only when the server advertises
+		// the matching `listChanged` capability, on every transport.
+		if (!listChangedAdvertised(method))
+			return 0;
 		// The stdio transport has no `pushChannel`; its listen stream filters by
 		// its own per-URI `ListenFilter`.
 		size_t delivered = writeStdioListen(method, params, uri);
@@ -10555,6 +10565,7 @@ unittest  // removeTool unregisters a previously registered tool
 unittest  // notifyToolsListChanged broadcasts notifications/tools/list_changed
 {
 	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
@@ -10565,6 +10576,18 @@ unittest  // notifyToolsListChanged broadcasts notifications/tools/list_changed
 
 	assert(received.length == 1);
 	assert(received[0].canFind("notifications/tools/list_changed"));
+}
+
+unittest  // a plain GET stream gets no list_changed whose listChanged capability is unadvertised
+{
+	auto s = McpServer.stateful("t", "1");
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	string[] received;
+	ch.addListener((string f) @safe { received ~= f; });
+	assert(s.notifyToolsListChanged() == 0);
+	assert(s.notifyResourcesListChanged() == 0);
+	assert(s.notifyPromptsListChanged() == 0);
+	assert(received.length == 0);
 }
 
 unittest  // notifyToolsListChanged is a no-op before a push channel exists
@@ -10582,6 +10605,7 @@ unittest  // notifyToolsListChanged fans out to EVERY connected session, not jus
 	import std.algorithm : canFind;
 
 	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string aFrame, bFrame;
@@ -10601,6 +10625,7 @@ unittest  // a list_changed broadcast still delivers only ONE stream within a si
 	// Multiple Connections rule: within ONE session two open GET streams must not
 	// both receive the same broadcast — only one of the session's streams does.
 	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	int aCount, bCount;
@@ -10665,6 +10690,7 @@ unittest  // enableResourceSubscriptions advertises resources capability with ze
 unittest  // notifyResourcesListChanged broadcasts notifications/resources/list_changed
 {
 	auto s = new McpServer("t", "1");
+	s.enableResourcesListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
@@ -10722,6 +10748,7 @@ unittest  // enablePromptsListChanged advertises listChanged:true for prompts
 unittest  // notifyPromptsListChanged broadcasts notifications/prompts/list_changed
 {
 	auto s = new McpServer("t", "1");
+	s.enablePromptsListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
