@@ -225,12 +225,17 @@ final class EventHandle(A, P)
 		return this;
 	}
 
-	/// Restrict delivery: opt this type out of the given modes. The advertised
-	/// `delivery` list becomes the server-available modes minus these (and minus any
-	/// server-wide `EventsOptions.disabledModes`). Chainable.
+	/// Restrict delivery: opt this type out of the given modes, in addition to any
+	/// disabled before. The advertised `delivery` list becomes the server-available
+	/// modes minus these (and minus any server-wide `EventsOptions.disabledModes`).
+	/// Chainable.
 	EventHandle disable(DeliveryMode[] modes...) @safe
 	{
-		reg_.disabledModes = modes.dup;
+		import std.algorithm : canFind;
+
+		foreach (m; modes)
+			if (!reg_.disabledModes.canFind(m))
+				reg_.disabledModes ~= m;
 		rt_.register(reg_);
 		return this;
 	}
@@ -3061,6 +3066,15 @@ unittest  // EventHandle.disable opts a typed event out of a delivery mode
 	auto modes = rt.effectiveDelivery("x");
 	assert(modes.length == 2);
 	assert(modes[0] == DeliveryMode.push && modes[1] == DeliveryMode.webhook);
+}
+
+unittest  // successive EventHandle.disable calls accumulate without duplicates
+{
+	auto rt = testRuntime();
+	auto h = rt.define!(DemoArgs, DemoPayload)("x");
+	h.disable(DeliveryMode.poll).disable(DeliveryMode.push).disable(DeliveryMode.poll);
+	assert(rt.effectiveDelivery("x") == [DeliveryMode.webhook]);
+	assert(h.reg_.disabledModes.length == 2);
 }
 
 unittest  // EventHandle.webhookOnly leaves only webhook delivery
