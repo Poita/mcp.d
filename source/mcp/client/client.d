@@ -4284,8 +4284,14 @@ final class McpClient : ClientProtocol
 		runTask((Json r) nothrow{
 			try
 				transport.sendOneway(r);
-			catch (Exception)
+			catch (Exception e)
 			{
+				import vibe.core.log : logWarn;
+
+				// The server is left waiting for this reply, so the failure must
+				// be visible even though no caller can receive it.
+				logWarn("[mcp.client] failed to send the reply to server request %s: %s",
+					r["id"].toString(), e.msg);
 			}
 		}, response);
 	}
@@ -6759,6 +6765,53 @@ unittest  // the URL elicitation ids awaiting completion are capped, evicting th
 	assert("e0" !in c.elicitationIds_, "the oldest id is evicted first");
 }
 
+unittest  // a reply to a server request that fails to send is logged
+{
+	import std.algorithm : any, canFind;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, yield;
+	import vibe.core.log : deregisterLogger, registerLogger, LogLevel, Logger, LogLine;
+
+	static final class CaptureLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.warn;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	auto logger = new CaptureLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+
+	auto t = new RecordingClientTransport();
+	t.sendFailure = new Exception("reply pipe broken");
+	auto c = new McpClient(t);
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			c.dispatchInbound(Message(makeRequest(Json(5), "ping", Json.emptyObject)));
+			foreach (_; 0 .. 4)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	auto lines = () @trusted { return (cast() logger).lines; }();
+	assert(lines.any!(l => l.canFind("reply pipe broken")), "a failed reply must be logged");
+}
+
 unittest  // elicitation/complete without an elicitationId is ignored
 {
 	auto c = McpClient.http("http://localhost");
@@ -8640,8 +8693,12 @@ version (unittest)
 			return responder is null ? Json.emptyObject : responder(message, expectId);
 		}
 
+		Exception sendFailure; // thrown by every sendOneway when set
+
 		void sendOneway(Json message) @safe
 		{
+			if (sendFailure !is null)
+				throw sendFailure;
 		}
 
 		long[] aborted; // every id passed to abort, in order
