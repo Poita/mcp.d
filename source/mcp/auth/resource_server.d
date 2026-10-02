@@ -55,6 +55,36 @@ struct TokenInfo
 /// with HTTP 401.
 alias TokenValidator = TokenInfo delegate(string token) @safe;
 
+/// Wrap `validator` so every token it accepts also lists `resource` among its
+/// audiences, satisfying `authorize`'s RFC 8707 resource check. Use it only when
+/// `validator` itself establishes that the token was issued for this server:
+/// a JWT verifier pinned to an IdP-specific audience (an App ID URI or API
+/// identifier rather than the MCP URL), or an upstream lookup that ties an
+/// opaque token to this server's OAuth client.
+TokenValidator bindResourceAudience(TokenValidator validator, string resource) @safe
+in (validator !is null)
+{
+	return (string token) @safe {
+		auto info = validator(token);
+		if (info.valid && resource.length && !info.hasAudience(resource))
+			info.audience ~= resource;
+		return info;
+	};
+}
+
+unittest  // bindResourceAudience adds the resource to an accepted token only
+{
+	TokenValidator v = (string t) @safe {
+		TokenInfo ti;
+		ti.valid = t == "good";
+		ti.audience = ["api://x"];
+		return ti;
+	};
+	auto bound = bindResourceAudience(v, "https://mcp.example.com/mcp");
+	assert(bound("good").audience == ["api://x", "https://mcp.example.com/mcp"]);
+	assert(!bound("bad").hasAudience("https://mcp.example.com/mcp"));
+}
+
 /// The kind of authorization failure, mapped to an HTTP status + WWW-Authenticate
 /// `error` parameter by the transport (RFC 6750 §3.1).
 enum AuthFailure

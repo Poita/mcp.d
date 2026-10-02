@@ -76,12 +76,20 @@ ResourceServerConfig jwtResourceServer(string issuer, string jwksUri, JwtPresetO
 /// through the single `auth` entry. `resource` is the canonical MCP server URL
 /// published in the protected-resource metadata; `authorizationServers` comes
 /// from `vc.issuer` and `scopesSupported` from `vc.requiredScopes`.
+///
+/// When `vc.audience` is set the verifier enforces it, so a token that passes is
+/// also bound to `resource` (see `bindResourceAudience`); this lets an IdP whose
+/// `aud` is an API identifier rather than the MCP URL pass `authorize`'s RFC 8707
+/// resource check. With no `vc.audience`, tokens must name `resource` itself.
 ResourceServerConfig resourceServer(JwtVerifierConfig vc, string resource) @safe
 {
+	import mcp.auth.resource_server : bindResourceAudience;
+
 	enforce(resource.length > 0,
 			"resourceServer: resource (the canonical MCP server URL) must be set.");
 	ResourceServerConfig cfg;
-	cfg.validator = jwtVerifier(vc);
+	cfg.validator = vc.audience.length ? bindResourceAudience(jwtVerifier(vc),
+			resource) : jwtVerifier(vc);
 	cfg.resource = resource;
 	if (vc.issuer.length)
 		cfg.authorizationServers = [vc.issuer];
@@ -490,4 +498,66 @@ unittest  // the public jwtResourceServer one-liner produces a protected config
 	assert(cfg.authorizationServers == ["https://issuer.example"]);
 	assert(cfg.scopesSupported == ["mcp:read"]);
 	assert(cfg.validator !is null);
+}
+
+version (unittest)
+{
+	// Throwaway P-256 key pair for end-to-end preset tests.
+	private enum presetEcPrivPem = "-----BEGIN PRIVATE KEY-----\n"
+		~ "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgy5nLkurotTseFLEh\n"
+		~ "TcetOpmlWQKsY10kx9Dcg6b7m02hRANCAARdpXuunF3oDfCSUKOtGkybZPpwLUPF\n"
+		~ "lCYgn/nxuirfH7L2jXQ/brpaEHPPPTMZgp6p33PDD6VGlbXVXCchEIe0\n"
+		~ "-----END PRIVATE KEY-----\n";
+
+	private enum presetEcPubPem = "-----BEGIN PUBLIC KEY-----\n"
+		~ "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEXaV7rpxd6A3wklCjrRpMm2T6cC1D\n"
+		~ "xZQmIJ/58boq3x+y9o10P266WhBzzz0zGYKeqd9zww+lRpW11VwnIRCHtA==\n"
+		~ "-----END PUBLIC KEY-----\n";
+
+	private enum entraIssuer = "https://login.microsoftonline.com/tenant-1/v2.0";
+
+	/// A preset-shaped config (Entra issuer, App ID URI audience) that verifies
+	/// against the pinned test key instead of fetching a JWKS.
+	private ResourceServerConfig entraStyleConfig(string[] scopes = null) @safe
+	{
+		JwtVerifierConfig vc;
+		vc.issuer = entraIssuer;
+		vc.staticPublicKeysPem = [presetEcPubPem];
+		vc.audience = "api://my-mcp-server";
+		vc.requiredScopes = scopes;
+		return resourceServer(vc, mcpUrl);
+	}
+
+	private string presetToken(string aud, string scope_ = "") @safe
+	{
+		import std.datetime.systime : Clock;
+		import mcp.auth.jwt : JwtClaims, mintJwtEs256;
+
+		JwtClaims c;
+		c.iss = entraIssuer;
+		c.aud = aud;
+		c.sub = "user-1";
+		c.scope_ = scope_;
+		c.exp = Clock.currTime.toUnixTime + 3600;
+		return mintJwtEs256(presetEcPrivPem, c);
+	}
+}
+
+unittest  // a preset with a distinct audience authorizes a token carrying that audience
+{
+	import mcp.auth.resource_server : AuthFailure, TokenInfo, authorize;
+
+	TokenInfo info;
+	assert(authorize(entraStyleConfig(),
+			"Bearer " ~ presetToken("api://my-mcp-server"), info) == AuthFailure.none);
+	assert(info.subject == "user-1");
+}
+
+unittest  // a preset with a distinct audience still rejects a token minted for another audience
+{
+	import mcp.auth.resource_server : AuthFailure, TokenInfo, authorize;
+
+	TokenInfo info;
+	assert(authorize(entraStyleConfig(),
+			"Bearer " ~ presetToken("api://other-api"), info) == AuthFailure.invalidToken);
 }
