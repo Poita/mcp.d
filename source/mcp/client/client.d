@@ -468,8 +468,14 @@ final class McpClient : ClientProtocol
 	// `notifications/elicitation/complete` has been forwarded, so the set holds
 	// only ids still awaiting completion. Used to honour the spec rule "Clients
 	// MUST ignore notifications referencing unknown or already-completed IDs": an
-	// evicted (completed) or never-issued id is absent and so ignored.
+	// evicted (completed) or never-issued id is absent and so ignored. Capped at
+	// `maxTrackedElicitations_`, evicting the oldest, so a server that never
+	// completes its elicitations cannot grow it without bound.
 	private void[0][string] elicitationIds_;
+	// Insertion order of `elicitationIds_`; may hold ids already completed, which
+	// eviction skips and compaction drops.
+	private string[] elicitationOrder_;
+	private enum size_t maxTrackedElicitations_ = 1024;
 	// Request ids this client has cancelled via notifications/cancelled. Per
 	// basic/utilities/cancellation, "The sender of the cancellation notification
 	// SHOULD ignore any response to the request that arrives afterward", so a
@@ -3660,9 +3666,29 @@ final class McpClient : ClientProtocol
 					|| e["elicitationId"].type != Json.Type.string)
 				continue;
 			const eid = e["elicitationId"].get!string;
-			if (eid.length && eid !in elicitationIds_)
-				elicitationIds_[eid] = (void[0]).init;
+			trackElicitationId(eid);
 		}
+	}
+
+	/// Remember URL elicitation `eid` as awaiting completion. Once
+	/// `maxTrackedElicitations_` ids are tracked the oldest is forgotten, so its
+	/// eventual completion notification is ignored as unknown.
+	private void trackElicitationId(string eid) @safe
+	{
+		import std.algorithm : filter;
+		import std.array : array;
+
+		if (eid.length == 0 || eid in elicitationIds_)
+			return;
+		if (elicitationOrder_.length >= 2 * maxTrackedElicitations_)
+			elicitationOrder_ = elicitationOrder_.filter!(id => id in elicitationIds_).array;
+		while (elicitationIds_.length >= maxTrackedElicitations_ && elicitationOrder_.length)
+		{
+			elicitationIds_.remove(elicitationOrder_[0]);
+			elicitationOrder_ = elicitationOrder_[1 .. $];
+		}
+		elicitationIds_[eid] = (void[0]).init;
+		elicitationOrder_ ~= eid;
 	}
 
 	/// The capabilities actually advertised on the wire: `capabilities` augmented
@@ -4302,8 +4328,7 @@ final class McpClient : ClientProtocol
 						&& params["elicitationId"].type == Json.Type.string)
 				{
 					const eid = params["elicitationId"].get!string;
-					if (eid.length && eid !in elicitationIds_)
-						elicitationIds_[eid] = (void[0]).init;
+					trackElicitationId(eid);
 				}
 			}
 			return onElicitation(ElicitParams.fromJson(params)).toJson();
@@ -6710,6 +6735,28 @@ unittest  // registerUrlElicitations tolerates a malformed/absent elicitations p
 	note["elicitationId"] = "not-an-object";
 	c.dispatchNotification("notifications/elicitation/complete", note);
 	assert(!forwarded);
+}
+
+unittest  // the URL elicitation ids awaiting completion are capped, evicting the oldest
+{
+	auto c = McpClient.http("http://localhost");
+	enum total = 5_000;
+	Json[] elicitations;
+	foreach (i; 0 .. total)
+	{
+		import std.conv : to;
+
+		elicitations ~= Json([
+			"mode": Json("url"),
+			"elicitationId": Json("e" ~ i.to!string)
+		]);
+	}
+	Json error = Json.emptyObject;
+	error["data"] = Json(["elicitations": Json(elicitations)]);
+	c.registerUrlElicitations(error);
+	assert(c.elicitationIds_.length < total, "ids awaiting completion must be capped");
+	assert("e4999" in c.elicitationIds_, "the newest id must still be tracked");
+	assert("e0" !in c.elicitationIds_, "the oldest id is evicted first");
 }
 
 unittest  // elicitation/complete without an elicitationId is ignored
