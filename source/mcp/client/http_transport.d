@@ -1577,9 +1577,6 @@ final class HttpClientTransport : ClientTransport
 		// Resolve + pin the user-configured endpoint host to a numeric address.
 		const pinnedHost = pinnedEndpointHost(ep);
 
-		// Protocol-version header for the GET stream (set after initialize).
-		auto verHeaders = requestHeaders(Json.undefined);
-
 		// `id:`/`retry:` resumption state is tracked in this reconnect loop's own
 		// cursor by the decoder; the loop reads it between attempts. Keeping it local
 		// (not a shared transport field) prevents a concurrent POST/listen reader from
@@ -1615,9 +1612,11 @@ final class HttpClientTransport : ClientTransport
 					scope (exit)
 						conn.release();
 
+					// The protocol-version header is read per attempt, so a reconnect
+					// after a re-negotiation carries the current version.
 					const req = buildHttpRequest("GET", ep.path, ep.hostHeader,
-							"text/event-stream",
-							"keep-alive", true, verHeaders, cursor.lastEventId, null);
+							"text/event-stream", "keep-alive",
+							true, requestHeaders(Json.undefined), cursor.lastEventId, null);
 					conn.write(cast(const(ubyte)[]) req);
 
 					bool chunked;
@@ -4338,6 +4337,54 @@ unittest  // the standalone server stream keeps reconnecting after repeated clos
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(getIds.length >= 4, "the standalone stream must keep reconnecting");
 	assert(getIds[0 .. 4] == ["", "s1", "s2", "s3"]);
+}
+
+unittest  // each reconnect of the standalone stream sends the current protocol-version header
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	static final class ChangingProtocol : ClientProtocol
+	{
+		string version_ = "2025-06-18";
+
+		string[string] headersFor(Json message) @safe
+		{
+			return ["MCP-Protocol-Version": version_];
+		}
+
+		bool isCancelled(long id) @safe
+		{
+			return false;
+		}
+	}
+
+	string[] versions;
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		versions ~= req.headers.get("MCP-Protocol-Version", "");
+		writeSse(res, "retry: 20\n: tick\n\n");
+	});
+	auto proto = new ChangingProtocol;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.setProtocol(proto);
+		t.startServerStream();
+		auto until = MonoTime.currTime + 3.seconds;
+		while (versions.length < 1 && MonoTime.currTime < until)
+			sleep(10.msecs);
+		proto.version_ = "2025-11-25";
+		const seen = versions.length;
+		until = MonoTime.currTime + 3.seconds;
+		while (versions.length < seen + 2 && MonoTime.currTime < until)
+			sleep(10.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(versions.length >= 3);
+	assert(versions[0] == "2025-06-18");
+	assert(versions[$ - 1] == "2025-11-25", "a reconnect must send the current version header");
 }
 
 unittest  // a legacy HTTP+SSE request whose POST is rejected fails at once with the HTTP status
