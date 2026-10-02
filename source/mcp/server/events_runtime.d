@@ -845,15 +845,18 @@ final class EventsRuntime
 	/// `P`. Returns a typed `EventHandle` for attaching a fetch handler / lifecycle
 	/// hooks / `match`, and for `publish`. The typed surface is the primary author
 	/// API; `register(EventRegistration)` remains the dynamic (raw-`Json`) escape
-	/// hatch. A freshly-defined type is emit-only until `onFetch` is set.
+	/// hatch. A freshly-defined type is emit-only until `onFetch` is set. An empty
+	/// `description` or `title` is left unset.
 	EventHandle!(A, P) define(A, P)(string name, string description = "", string title = "") @safe
 	{
 		import mcp.protocol.schema : jsonSchemaOf;
 
 		EventRegistration reg;
 		reg.descriptor.name = name;
-		reg.descriptor.description = description;
-		reg.descriptor.title = title;
+		if (description.length)
+			reg.descriptor.description = description;
+		if (title.length)
+			reg.descriptor.title = title;
 		// Subscription arguments are filters: an absent field means "no filter" and
 		// deserializes to the field's default, so the advertised schema declares
 		// every field optional rather than the generator's non-Nullable => required.

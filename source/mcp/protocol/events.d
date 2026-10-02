@@ -81,8 +81,8 @@ Nullable!DeliveryMode deliveryModeFromWire(string s) @safe pure nothrow
 struct EventType
 {
 	string name;
-	string description;
-	string title; /// optional human-readable display name (empty = unset)
+	Nullable!string description;
+	Nullable!string title; /// optional human-readable display name
 	DeliveryMode[] delivery; /// non-empty subset of poll/push/webhook
 	Json inputSchema = Json.undefined; /// JSON Schema for subscription arguments
 	Json payloadSchema = Json.undefined; /// JSON Schema for delivered `data`
@@ -92,10 +92,10 @@ struct EventType
 	{
 		Json j = Json.emptyObject;
 		j["name"] = name;
-		if (description.length)
-			j["description"] = description;
-		if (title.length)
-			j["title"] = title;
+		if (!description.isNull)
+			j["description"] = description.get;
+		if (!title.isNull)
+			j["title"] = title.get;
 		Json arr = Json.emptyArray;
 		foreach (m; delivery)
 			arr ~= deliveryModeToWire(m);
@@ -114,8 +114,8 @@ struct EventType
 		requireObject(j, "EventType");
 		EventType e;
 		e.name = j.getOr("name", "");
-		e.description = j.getOr("description", "");
-		e.title = j.getOr("title", "");
+		tryGet(j, "description", e.description);
+		tryGet(j, "title", e.title);
 		if ("delivery" in j && j["delivery"].type == Json.Type.array)
 			foreach (i; 0 .. j["delivery"].length)
 			{
@@ -890,6 +890,26 @@ unittest  // EventType carries an optional title and round-trips it
 	assert(back.title == "New Email");
 }
 
+unittest  // EventType leaves an absent title/description null on parse
+{
+	auto e = EventType.fromJson(Json([
+			"name": Json("x"),
+			"delivery": Json.emptyArray
+	]));
+	assert(e.title.isNull && e.description.isNull);
+}
+
+unittest  // EventType keeps an explicitly empty title distinct from an absent one
+{
+	auto e = EventType.fromJson(Json([
+		"name": Json("x"),
+		"title": Json(""),
+		"delivery": Json.emptyArray
+	]));
+	assert(!e.title.isNull && e.title.get == "");
+	assert(e.toJson()["title"].get!string == "");
+}
+
 unittest  // EventType omits description and schemas when unset
 {
 	EventType e;
@@ -918,7 +938,7 @@ unittest  // EventType.fromJson skips unknown delivery strings
 unittest  // EventListResult carries events and an optional nextCursor
 {
 	EventListResult r;
-	r.events = [EventType("a", "", [DeliveryMode.poll])];
+	r.events = [EventType(name: "a", delivery: [DeliveryMode.poll])];
 	auto j = r.toJson();
 	assert(j["events"].length == 1);
 	assert("nextCursor" !in j);

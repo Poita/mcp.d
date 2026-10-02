@@ -9873,7 +9873,7 @@ unittest  // the poll loop delivers a redelivered eventId only once
 unittest  // selectDeliveryMode prefers webhook, then push, then poll among advertised modes
 {
 	auto c = new McpClient(new RecordingClientTransport());
-	EventType all = EventType("t", "", "", [
+	EventType all = EventType(name: "t", delivery: [
 		DeliveryMode.poll, DeliveryMode.push, DeliveryMode.webhook
 	]);
 	assert(c.selectDeliveryMode(all) == DeliveryMode.push); // no webhook config
@@ -9884,7 +9884,7 @@ unittest  // selectDeliveryMode prefers webhook, then push, then poll among adve
 	c.eventSettings = es;
 	assert(c.selectDeliveryMode(all) == DeliveryMode.webhook);
 
-	EventType pollOnly = EventType("t", "", "", [DeliveryMode.poll]);
+	EventType pollOnly = EventType(name: "t", delivery: [DeliveryMode.poll]);
 	assert(c.selectDeliveryMode(pollOnly) == DeliveryMode.poll);
 }
 
@@ -9894,14 +9894,18 @@ unittest  // a mode the client removed from preferredModes is never selected
 	EventClientSettings es;
 	es.preferredModes = [DeliveryMode.poll];
 	c.eventSettings = es;
-	EventType t = EventType("t", "", "", [DeliveryMode.push, DeliveryMode.poll]);
+	EventType t = EventType(name: "t", delivery: [
+		DeliveryMode.push, DeliveryMode.poll
+	]);
 	assert(c.selectDeliveryMode(t) == DeliveryMode.poll);
 }
 
 unittest  // selectDeliveryMode throws NoCompatibleDeliveryMode when nothing fits
 {
 	auto c = new McpClient(new RecordingClientTransport());
-	EventType webhookOnly = EventType("t", "", "", [DeliveryMode.webhook]);
+	EventType webhookOnly = EventType(name: "t", delivery: [
+		DeliveryMode.webhook
+	]);
 	bool threw;
 	try
 		c.selectDeliveryMode(webhookOnly);
@@ -9913,7 +9917,9 @@ unittest  // selectDeliveryMode throws NoCompatibleDeliveryMode when nothing fit
 unittest  // a forced mode is honoured when advertised and rejected otherwise
 {
 	auto c = new McpClient(new RecordingClientTransport());
-	EventType t = EventType("t", "", "", [DeliveryMode.push, DeliveryMode.poll]);
+	EventType t = EventType(name: "t", delivery: [
+		DeliveryMode.push, DeliveryMode.poll
+	]);
 	assert(c.selectDeliveryMode(t, nullable(DeliveryMode.poll)) == DeliveryMode.poll);
 	bool threw;
 	try
@@ -9931,7 +9937,7 @@ unittest  // subscribeEvents looks the type up and opens a push stream for a pus
 		assert(method == "events/list");
 		EventListResult r;
 		r.events = [
-			EventType("incident.created", "", "", [
+			EventType(name: "incident.created", delivery: [
 				DeliveryMode.poll, DeliveryMode.push
 			])
 		];
@@ -9950,7 +9956,9 @@ unittest  // subscribeEvents falls back to poll and reports an unknown type as N
 	auto c = new McpClient(new RecordingClientTransport());
 	c.onRpcForTest = (string method, Json params) @safe {
 		EventListResult r;
-		r.events = [EventType("email.received", "", "", [DeliveryMode.poll])];
+		r.events = [
+			EventType(name: "email.received", delivery: [DeliveryMode.poll])
+		];
 		return r.toJson();
 	};
 	auto sub = c.subscribeEvents("email.received", SubscribeOptions.init, null);
@@ -9978,7 +9986,7 @@ unittest  // subscribeEvents in webhook mode mints a secret, registers the recei
 		{
 			EventListResult r;
 			r.events = [
-				EventType("incident.created", "", "", [
+				EventType(name: "incident.created", delivery: [
 					DeliveryMode.webhook, DeliveryMode.poll
 				])
 			];
