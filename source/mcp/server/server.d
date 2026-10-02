@@ -150,7 +150,9 @@ enum ServerMode
 /// single bound `activeConnection`. Used by the non-streaming raw batch path
 /// (the 2025-03-26 Streamable HTTP batch back-compat path) where a transport has
 /// already resolved the request's connection state but supplies no server->client
-/// channel. Notifications are dropped and server->client requests are rejected.
+/// channel. Notifications are dropped and server->client requests are rejected;
+/// `clientSupports` still reports what the connection's client declared, so a
+/// refused `elicit`/`sample` names the missing channel rather than a capability.
 private final class ConnectionScopedContext : BaseRequestContext, ConnectionScoped
 {
 	private ConnectionState conn_;
@@ -160,6 +162,11 @@ private final class ConnectionScopedContext : BaseRequestContext, ConnectionScop
 	{
 		this.conn_ = conn;
 		this.token_ = token;
+	}
+
+	override bool clientSupports(ClientCapability cap) @safe
+	{
+		return conn_.clientCaps.supports(cap);
 	}
 
 	string connectionToken() @safe
@@ -4144,6 +4151,17 @@ unittest  // legacy subscriptions/listen on the normal route path is method-not-
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
+unittest  // a connection-scoped batch context reports the connection's declared client capabilities
+{
+	auto conn = new ConnectionState;
+	conn.clientCaps = ClientCapabilities.fromJson(Json([
+			"elicitation": Json.emptyObject
+	]));
+	auto ctx = new ConnectionScopedContext(conn, "sess");
+	assert(ctx.clientSupports(ClientCapability.elicitationForm));
+	assert(!ctx.clientSupports(ClientCapability.sampling));
+}
+
 unittest  // duplicate in-flight id: the first request's teardown does not evict the second's token
 {
 	import mcp.server.context : CancellationToken;
@@ -7090,7 +7108,7 @@ unittest  // stdio events/stream rejects a request id that already names an open
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
 
 	rt.emit(EventOccurrence("evt_1", "incident.created", "", Json([
-				"sev": Json("P1")
+		"sev": Json("P1")
 	])));
 	assert(lines.count!(l => l.canFind("evt_1")) == 1);
 }
