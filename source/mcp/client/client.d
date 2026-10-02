@@ -310,6 +310,10 @@ struct ClientSettings
 /// `ClientSettings.requestTimeout` (restarted by progress when
 /// `resetTimeoutOnProgress` is set). The client has already cancelled the request
 /// on the server.
+///
+/// JSON-RPC has no timeout code, so `code` is `ErrorCode.internalError`, the same
+/// code a server reports for its own internal errors. Tell a local timeout apart
+/// by catching this type rather than by inspecting `code`.
 class RequestTimeoutException : McpException
 {
 	this(string message) @safe
@@ -2042,7 +2046,7 @@ final class McpClient : ClientProtocol
 			case "failed":
 				throw taskFailedError(taskId, state);
 			case "cancelled":
-				throw new McpException(ErrorCode.invalidRequest, "Task was cancelled: " ~ taskId);
+				throw new McpException(ErrorCode.requestCancelled, "Task was cancelled: " ~ taskId);
 			case "input_required":
 				if (onInputRequired is null)
 					throw new McpException(ErrorCode.internalError,
@@ -2908,10 +2912,13 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Whether a managed-subscription failure may clear on its own, so retrying
-	/// is worthwhile: a lost connection or internal error, or an HTTP 5xx / 408 /
-	/// 429. A JSON-RPC rejection or any other HTTP 4xx will repeat on every retry.
+	/// is worthwhile: a local request timeout, a lost connection or server
+	/// internal error, or an HTTP 5xx / 408 / 429. A JSON-RPC rejection or any
+	/// other HTTP 4xx will repeat on every retry.
 	private static bool isTransientEventFailure(McpException e) @safe
 	{
+		if (cast(RequestTimeoutException) e)
+			return true;
 		if (auto h = cast(HttpStatusException) e)
 			return h.status >= 500 || h.status == 408 || h.status == 429;
 		return e.code == ErrorCode.internalError;
@@ -4833,6 +4840,27 @@ unittest  // callToolAwait takes RequestOptions in the same position as callTool
 	RequestOptions opts;
 	auto r = c.callToolAwait("add", Json.emptyObject, opts, null);
 	assert(!r.isTask);
+}
+
+unittest  // a task the server cancelled fails awaitTask with requestCancelled
+{
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe => Json([
+		"taskId": Json("t1"),
+		"status": Json("cancelled")
+	]);
+	int code;
+	try
+		c.awaitTask("t1");
+	catch (McpException e)
+		code = e.code;
+	assert(code == ErrorCode.requestCancelled);
+}
+
+unittest  // a request timeout is a transient event failure, identified by type
+{
+	assert(McpClient.isTransientEventFailure(new RequestTimeoutException("slow")));
+	assert(!McpClient.isTransientEventFailure(new McpException(ErrorCode.invalidParams, "bad")));
 }
 
 unittest  // cancelling callToolAwait's token stops polling and cancels the task
