@@ -769,8 +769,8 @@ final class McpServer : ServerCore
 	/// `resources/list`). It is delivered only when a client is currently
 	/// subscribed to `uri` (via `resources/subscribe`); for an unsubscribed URI
 	/// it is a no-op returning `0`. For the modern protocol the notification is
-	/// additionally suppressed unless a client opted in via `subscriptions/listen`
-	/// with `resourceSubscriptions:true`. Returns the number of GET-stream
+	/// additionally suppressed unless a client listed `uri` in a
+	/// `subscriptions/listen` `resourceSubscriptions`. Returns the number of GET-stream
 	/// listeners reached; `0` when no GET stream is open.
 	size_t notifyResourceUpdated(string uri) @safe
 	{
@@ -2871,12 +2871,6 @@ final class McpServer : ServerCore
 						conn.subscriptions[u] = true;
 					if (perStream.resourceUris.length)
 						perStream.resourceSubscriptions = true;
-				}
-				else if (rs.type == Json.Type.bool_ && rs.get!bool)
-				{
-					// A boolean opt-in: blanket interest in resource-update
-					// notifications without per-URI URIs.
-					perStream.resourceSubscriptions = true;
 				}
 			}
 		}
@@ -8795,12 +8789,27 @@ unittest  // subscriptions/listen accepts the flat (top-level) filter shape
 	s.enableToolsListChanged();
 	Json p = Json.emptyObject;
 	p["toolsListChanged"] = true;
-	p["resourceSubscriptions"] = true;
+	p["resourceSubscriptions"] = Json([Json("file:///a")]);
 	s.handle(modernReq(4, "subscriptions/listen", p)).get;
 	auto f = s.cs().listenFilter;
 	assert(f.toolsListChanged);
 	assert(f.resourceSubscriptions);
 	assert(!f.promptsListChanged);
+}
+
+unittest  // subscriptions/listen ignores a non-array resourceSubscriptions
+{
+	auto s = makeTestServer();
+	s.enableToolsListChanged();
+	Json p = Json.emptyObject;
+	p["toolsListChanged"] = true;
+	p["resourceSubscriptions"] = true;
+	s.handle(modernReq(4, "subscriptions/listen", p)).get;
+	auto f = s.cs().listenFilter;
+	assert(f.toolsListChanged);
+	assert(!f.resourceSubscriptions);
+	assert(f.accepts("notifications/resources/updated", "file:///a") == false);
+	assert("resourceSubscriptions" !in s.acknowledgedSubsetFor(f));
 }
 
 unittest  // subscriptions/listen with an empty resourceSubscriptions array does not opt in

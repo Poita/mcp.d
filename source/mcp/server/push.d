@@ -60,11 +60,8 @@ struct ListenFilter
 		case "notifications/resources/updated":
 			import std.algorithm : canFind;
 
-			if (!resourceSubscriptions)
-				return false;
-			// A blanket boolean opt-in (no per-URI list) accepts any URI;
-			// otherwise only the explicitly named URIs are accepted.
-			return resourceUris.length == 0 || resourceUris.canFind(uri);
+			// Only the explicitly named URIs are accepted.
+			return resourceSubscriptions && resourceUris.canFind(uri);
 		case "notifications/elicitation/complete":
 			// Removed in 2026-07-28; an active filter marks a modern stream.
 			return false;
@@ -106,11 +103,11 @@ unittest  // resourceSubscriptions matches only the opted-in URIs
 	assert(f.accepts("notifications/resources/updated", "file:///project/config.json"));
 	assert(!f.accepts("notifications/resources/updated", "file:///other"));
 
-	// A blanket boolean opt-in (no per-URI list) accepts any resource URI.
-	ListenFilter blanket;
-	blanket.active = true;
-	blanket.resourceSubscriptions = true;
-	assert(blanket.accepts("notifications/resources/updated", "file:///x"));
+	// An opt-in naming no URI accepts none.
+	ListenFilter noUris;
+	noUris.active = true;
+	noUris.resourceSubscriptions = true;
+	assert(!noUris.accepts("notifications/resources/updated", "file:///x"));
 
 	// Without resourceSubscriptions opt-in, resources/updated is rejected.
 	ListenFilter none;
