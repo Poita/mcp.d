@@ -246,6 +246,41 @@ private struct SseCursor
 	long retryMs;
 }
 
+/// The status and the framing, session and auth headers of a raw HTTP response.
+private struct ResponseHead
+{
+	/// The status code, 0 when the status line does not parse.
+	int status;
+	/// `Transfer-Encoding: chunked`.
+	bool chunked;
+	/// A `text/event-stream` body.
+	bool sse;
+	/// The `Mcp-Session-Id` header, empty when absent.
+	string sessionId;
+	/// The `WWW-Authenticate` challenge, empty when absent.
+	string wwwAuthenticate;
+
+	/// Record one header line (`Name: value`, CR stripped).
+	void addHeader(string line) @safe
+	{
+		import std.string : indexOf, strip, toLower;
+
+		const c = line.indexOf(':');
+		if (c <= 0)
+			return;
+		const name = line[0 .. c].strip.toLower;
+		const value = line[c + 1 .. $].strip;
+		if (name == "transfer-encoding" && value.toLower.indexOf("chunked") >= 0)
+			chunked = true;
+		else if (name == "content-type" && value.toLower.indexOf("text/event-stream") >= 0)
+			sse = true;
+		else if (name == "mcp-session-id")
+			sessionId = value;
+		else if (name == "www-authenticate")
+			wwwAuthenticate = value;
+	}
+}
+
 /// Default bound on a single response body or SSE event (16 MiB).
 enum size_t defaultMaxMessageBytes = 16 * 1024 * 1024;
 
@@ -907,10 +942,6 @@ final class HttpClientTransport : ClientTransport
 			ref Json result, ref bool got, ref McpException err, out int status,
 			PostRequest req = null) @safe
 	{
-		import vibe.stream.operations : readLine;
-		import std.string : indexOf, startsWith, strip, toLower;
-		import std.conv : to;
-
 		const ep = parseHttpEndpoint(url);
 		// Resolve + pin the user-configured endpoint host to a numeric address; the
 		// connect targets the pinned IP while `ep.host` is still used for SNI/Host.
@@ -959,25 +990,12 @@ final class HttpClientTransport : ClientTransport
 						"application/json, text/event-stream", "close", true, hdrs, null, payload);
 				conn.write(cast(const(ubyte)[]) req);
 
-				// Status line + response headers.
-				auto statusLine = cast(string) readLine(conn, maxHeaderLineBytes).idup;
-				status = parseHttpStatus(statusLine);
-				bool chunked;
-				bool sse;
-				string wwwAuthenticate;
-				foreach (h; readHeaderLines(conn))
-				{
-					const lower = h.toLower;
-					if (lower.startsWith("transfer-encoding:") && lower.indexOf("chunked") >= 0)
-						chunked = true;
-					if (lower.startsWith("content-type:") && lower.indexOf("text/event-stream") >= 0)
-						sse = true;
-					const c = h.indexOf(':');
-					if (c > 0 && h[0 .. c].toLower == "mcp-session-id")
-						sessionId = h[c + 1 .. $].strip;
-					if (c > 0 && h[0 .. c].toLower == "www-authenticate")
-						wwwAuthenticate = h[c + 1 .. $].strip;
-				}
+				const head = readResponseHead(conn);
+				status = head.status;
+				const chunked = head.chunked;
+				const wwwAuthenticate = head.wwwAuthenticate;
+				if (head.sessionId.length)
+					sessionId = head.sessionId;
 
 				// A 400/404/405 is the legacy-fallback signal: read the (small) body
 				// and surface a recognised modern JSON-RPC error if present.
@@ -999,7 +1017,7 @@ final class HttpClientTransport : ClientTransport
 					return;
 				}
 
-				if (!sse)
+				if (!head.sse)
 				{
 					// A single JSON body (the common non-streaming response): it must be
 					// the response to this request.
@@ -1223,13 +1241,13 @@ final class HttpClientTransport : ClientTransport
 						cursor.lastEventId, null);
 				conn.write(cast(const(ubyte)[]) getReq);
 
-				bool chunked;
-				if (!readSseResponseHead(conn, chunked))
+				const head = readResponseHead(conn);
+				if (head.status != 200)
 					return;
 				opened = true;
 
 				bool done;
-				readSseBody(conn, chunked, cursor, () @safe => done,
+				readSseBody(conn, head.chunked, cursor, () @safe => done,
 						(string eventType, string data) @safe {
 					// Reuse the POST-path dispatcher: it isolates parseJsonString
 					// (keep-alive tolerance), applies the cancelled-id guard, and
@@ -1413,25 +1431,17 @@ final class HttpClientTransport : ClientTransport
 		return req;
 	}
 
-	/// Read the status line and header block of an SSE GET/POST response from
-	/// `conn`, the single status gate replacing the four hand-written
-	/// `statusLine.indexOf(" 200") < 0` + chunked-detection loops. Returns true iff
-	/// the status is 200, and sets `chunked` when the response uses chunked
-	/// transfer-encoding. Must run inside a `@trusted` block (raw socket I/O).
-	private static bool readSseResponseHead(Conn)(Conn conn, out bool chunked) @trusted
+	/// Read the status line and header block of a raw HTTP response from `conn`.
+	/// Must run inside a `@trusted` block (raw socket I/O).
+	private static ResponseHead readResponseHead(Conn)(Conn conn) @trusted
 	{
 		import vibe.stream.operations : readLine;
-		import std.string : indexOf, toLower;
 
-		auto statusLine = cast(string) readLine(conn, maxHeaderLineBytes).idup;
-		const ok = statusLine.indexOf(" 200") >= 0;
+		ResponseHead head;
+		head.status = parseHttpStatus(cast(string) readLine(conn, maxHeaderLineBytes).idup);
 		foreach (h; readHeaderLines(conn))
-		{
-			const lower = h.toLower;
-			if (lower.indexOf("transfer-encoding:") == 0 && lower.indexOf("chunked") >= 0)
-				chunked = true;
-		}
-		return ok;
+			head.addHeader(h);
+		return head;
 	}
 
 	/// Read and decode an SSE response body from `conn`, the single tested state
@@ -1650,14 +1660,14 @@ final class HttpClientTransport : ClientTransport
 							true, requestHeaders(Json.undefined), cursor.lastEventId, null);
 					conn.write(cast(const(ubyte)[]) req);
 
-					bool chunked;
-					if (!readSseResponseHead(conn, chunked))
+					const head = readResponseHead(conn);
+					if (head.status != 200)
 					{
 						refused = true;
 						return;
 					}
 
-					readSseBody(conn, chunked, cursor, () @safe => closing,
+					readSseBody(conn, head.chunked, cursor, () @safe => closing,
 							(string eventType, string data) @safe {
 						sawData = true;
 						try
@@ -1761,8 +1771,6 @@ final class HttpClientTransport : ClientTransport
 	private void runListenStream(Json message, shared(bool)* cancelled, ListenSocketSlot slot,
 			SubscriptionStream stream, void delegate(bool frame) @safe nothrow onEstablished) @safe
 	{
-		import std.string : indexOf, startsWith, toLower, strip;
-
 		const ep = parseHttpEndpoint(url);
 		// Resolve + pin the user-configured endpoint host to a numeric address.
 		const pinnedHost = pinnedEndpointHost(ep);
@@ -1835,28 +1843,17 @@ final class HttpClientTransport : ClientTransport
 						reqHeaders, null, body);
 				conn.write(cast(const(ubyte)[]) req);
 
-				const status = parseHttpStatus(cast(string) readLine(conn, maxHeaderLineBytes).idup);
-				bool chunked;
-				bool sse;
-				string wwwAuthenticate;
-				foreach (h; readHeaderLines(conn))
-				{
-					const lower = h.toLower;
-					if (lower.startsWith("transfer-encoding:") && lower.indexOf("chunked") >= 0)
-						chunked = true;
-					if (lower.startsWith("content-type:") && lower.indexOf("text/event-stream") >= 0)
-						sse = true;
-					const c = h.indexOf(':');
-					if (c > 0 && h[0 .. c].toLower == "www-authenticate")
-						wwwAuthenticate = h[c + 1 .. $].strip;
-				}
+				const head = readResponseHead(conn);
+				const status = head.status;
+				const chunked = head.chunked;
+				const wwwAuthenticate = head.wwwAuthenticate;
 				if (status < 200 || status >= 300)
 				{
 					failure = httpStatusError(status, readRemaining(conn,
 							chunked, maxMessageBytes), wwwAuthenticate);
 					return;
 				}
-				if (!sse)
+				if (!head.sse)
 				{
 					// A plain JSON answer: the server answered the request outright
 					// instead of opening a stream.
@@ -2062,12 +2059,12 @@ final class HttpClientTransport : ClientTransport
 						"text/event-stream", "keep-alive", true, null, null, null);
 				conn.write(cast(const(ubyte)[]) req);
 
-				bool chunked;
-				if (!readSseResponseHead(conn, chunked))
+				const head = readResponseHead(conn);
+				if (head.status != 200)
 					return;
 
 				SseCursor cursor;
-				readSseBody(conn, chunked, cursor, () @safe => closing,
+				readSseBody(conn, head.chunked, cursor, () @safe => closing,
 						(string eventType, string data) @safe {
 					if (eventType == "endpoint")
 					{
@@ -2777,6 +2774,28 @@ unittest  // parseHttpStatus reads the code out of an HTTP status line
 	// Unparseable lines yield 0 (treated as no status).
 	assert(HttpClientTransport.parseHttpStatus("garbage") == 0);
 	assert(HttpClientTransport.parseHttpStatus("") == 0);
+}
+
+unittest  // ResponseHead.addHeader records framing, session and challenge headers case-insensitively
+{
+	ResponseHead h;
+	h.addHeader("Transfer-Encoding: Chunked");
+	h.addHeader("content-type: text/event-stream; charset=utf-8");
+	h.addHeader("MCP-Session-Id:  abc ");
+	h.addHeader("WWW-Authenticate: Bearer realm=\"mcp\"");
+	h.addHeader("X-Other: chunked");
+	assert(h.chunked && h.sse);
+	assert(h.sessionId == "abc");
+	assert(h.wwwAuthenticate == `Bearer realm="mcp"`);
+}
+
+unittest  // ResponseHead.addHeader leaves the flags unset for a JSON, unchunked response
+{
+	ResponseHead h;
+	h.addHeader("Content-Type: application/json");
+	h.addHeader("Content-Length: 12");
+	h.addHeader("malformed");
+	assert(!h.chunked && !h.sse && h.sessionId.length == 0);
 }
 
 unittest  // isLegacyFallbackStatus recognises the spec's 400/404/405 triggers
