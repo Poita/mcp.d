@@ -17,6 +17,10 @@ fail=0
 # Raise the file-descriptor limit; the D toolchain opens many files at once.
 ulimit -n 65536 2>/dev/null || true
 
+# The PID of the HTTP server currently running, stopped on any exit.
+srvpid=
+trap '[ -n "$srvpid" ] && kill "$srvpid" 2>/dev/null' EXIT
+
 # Per-example HTTP port, kept distinct so the servers never collide.
 port_for() {
   case "$1" in
@@ -68,11 +72,13 @@ for d in examples/*/; do
   p=$(port_for "$n")
   url="http://127.0.0.1:${p}/mcp"
   echo "[http] ${n}: server on ${url}"
+  # Run the already-built server binary with `exec` so `$!` is the server's
+  # own PID, which is then the only process stopped afterwards.
   if [ "$n" = "auth" ]; then
-    ( cd "$d" && dub run -c server --quiet -- --port "$p" >"/tmp/ex-${n}-srv.log" 2>&1 ) &
+    ( cd "$d" && exec "./${n}-server" --port "$p" >"/tmp/ex-${n}-srv.log" 2>&1 ) &
     clientflag="--url"
   else
-    ( cd "$d" && dub run -c server --quiet -- --http --port "$p" >"/tmp/ex-${n}-srv.log" 2>&1 ) &
+    ( cd "$d" && exec "./${n}-server" --http --port "$p" >"/tmp/ex-${n}-srv.log" 2>&1 ) &
     clientflag="--http"
   fi
   srvpid=$!
@@ -89,7 +95,8 @@ for d in examples/*/; do
     echo "E2E FAILED (http): ${n}"; echo "--- server log ---"; tail -20 "/tmp/ex-${n}-srv.log"; fail=1
   fi
   kill "$srvpid" 2>/dev/null || true
-  pkill -f "${n}-server" 2>/dev/null || true
+  wait "$srvpid" 2>/dev/null || true
+  srvpid=
 
   echo "::endgroup::"
 done
