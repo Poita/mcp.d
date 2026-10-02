@@ -1142,7 +1142,7 @@ final class McpServer : ServerCore
 	/// Advertises the extension in `server/discover` capabilities (modern only) and
 	/// routes `tasks/get` / `tasks/update` / `tasks/cancel` against `store`
 	/// (default: in-memory). `opts` tunes the ID generator, default TTL / poll
-	/// interval, and TTL sweep cadence. `dispatcher` decides where a `@task`
+	/// interval, and TTL sweep cadence. `dispatcher` decides where a `@taskTool`
 	/// executor runs (default: an in-process fiber; supply a queue-backed
 	/// dispatcher for a durable, multi-node deployment). The runtime emits
 	/// `notifications/tasks` on status changes to the task owner's streams (for
@@ -1178,7 +1178,7 @@ final class McpServer : ServerCore
 		return taskRuntime_;
 	}
 
-	/// Register a `@task` tool: a tool whose `tools/call` returns a task handle
+	/// Register a `@taskTool` tool: a tool whose `tools/call` returns a task handle
 	/// immediately and runs `executor` asynchronously via the dispatcher. The
 	/// executor is stored by `descriptor.name` so the dispatcher can re-invoke it
 	/// on each `tasks/update`. `ttl` / `pollInterval` seed the task's TTL and

@@ -37,7 +37,7 @@
  * variants, and no "sync client" wrapper. Tool calls can run for minutes;
  * parking a host thread on one is a foot-gun. Fiber-blocking already delivers the
  * Go model on the loop's own thread, and long-running work is addressed at the
- * MCP level by `RequestOptions.onProgress` and the Tasks extension (`@task` /
+ * MCP level by `RequestOptions.onProgress` and the Tasks extension (`@taskTool` /
  * `awaitTask`). Reach for those, not a thread bridge.
  */
 module mcp.client.runner;

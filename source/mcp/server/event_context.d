@@ -1,6 +1,6 @@
 /// The execution context handed to an event type's check function and lifecycle
 /// hooks, plus the `EventResult` such a check returns. Mirrors the role
-/// `TaskContext` plays for `@task`: the SDK injects it as a trailing parameter
+/// `TaskContext` plays for `@taskTool`: the SDK injects it as a trailing parameter
 /// (omitted from the input schema), carrying the incoming cursor, the raw
 /// subscription arguments, the authenticated principal, and the replay floor.
 module mcp.server.event_context;

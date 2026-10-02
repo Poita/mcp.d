@@ -139,7 +139,7 @@ the one remaining check is the harness's own wire-schema validator rejecting any
   offline-access, DCR, pre-registration, resource-mismatch, **cross-app access**
   (token-exchange → JWT-bearer); **elicitation** with schema defaults; and **SSE
   resumption** (`retry:` + `Last-Event-ID`).
-- ✅ **FastMCP-style UDA API** — `@tool` / `@resource` / `@prompt` / `@task` / `@skill` with auto JSON-Schema.
+- ✅ **FastMCP-style UDA API** — `@tool` / `@resource` / `@prompt` / `@taskTool` / `@skill` with auto JSON-Schema.
 - ✅ **2026-07-28 (modern)** — stateless per-request `_meta`, `server/discover`,
   `subscriptions/listen`, `CacheableResult` (`ttlMs`/`cacheScope`), MRTR types, the standard
   request headers (`Mcp-Method`/`Mcp-Name`/`MCP-Protocol-Version`) with `HeaderMismatch`
@@ -572,7 +572,7 @@ Auth, which is HTTP-only.
 | Modern | the 2026-07-28 protocol end to end (`server/discover`, per-request `_meta`, `connect()`) | [server](examples/modern/server.d) | [client](examples/modern/client.d) |
 | Streaming | progress notifications from a long-running tool | [server](examples/streaming/server.d) | [client](examples/streaming/client.d) |
 | MRTR | multi-round-trip tool input (carried in the result) | [server](examples/mrtr/server.d) | [client](examples/mrtr/client.d) |
-| Tasks | MCP Tasks extension (SEP-2663): async `@task` tools with progress, cancellation, and `input_required` | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
+| Tasks | MCP Tasks extension (SEP-2663): async `@taskTool` tools with progress, cancellation, and `input_required` | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
 | Sampling | server-initiated LLM sampling (`ctx.sample`) | [server](examples/sampling/server.d) | [client](examples/sampling/client.d) |
 | Elicitation | server-initiated, typed user input (`ctx.elicit!T`) | [server](examples/elicitation/server.d) | [client](examples/elicitation/client.d) |
 | Sticky notes | stateful tools + a resource per note + elicitation-confirmed clear | [server](examples/stickynotes/server.d) | [client](examples/stickynotes/client.d) |
@@ -660,7 +660,7 @@ The [MCP Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overv
 (`io.modelcontextprotocol/tasks`, [SEP-2663](https://modelcontextprotocol.io/seps/2663-tasks-extension))
 lets a server answer a long-running `tools/call` with a durable task handle
 instead of blocking — the client polls `tasks/get` until it completes, and may
-`tasks/update` (mid-flight input) or `tasks/cancel`. Mark a function `@task` and it
+`tasks/update` (mid-flight input) or `tasks/cancel`. Mark a function `@taskTool` and it
 becomes one of these tools: the call returns a handle at once, the body runs
 asynchronously, and its return value becomes the result; the injected `TaskContext`
 reports progress, observes cancellation, and elicits input mid-task.
@@ -670,7 +670,7 @@ auto rt = server.enableTasks();   // keep the runtime; pass a TaskStore for dura
 
 struct Approval { bool deploy; }
 
-@task("deploy", "Deploy a build, confirming first; finishes when the deploy signals back.")
+@taskTool("deploy", "Deploy a build, confirming first; finishes when the deploy signals back.")
 @taskTtl(10.minutes) @taskPollInterval(2.seconds)
 string deploy(string gitRef, TaskContext tc) @safe
 {
@@ -1103,7 +1103,7 @@ thread and hand results to the rest of the app over your own channel, rather tha
 entering and exiting the loop per call.
 
 **Long-running work** belongs to `RequestOptions.onProgress` and the
-[Tasks extension](#mcp-tasks-asynchronous-execution) (`@task` / `awaitTask`), not
+[Tasks extension](#mcp-tasks-asynchronous-execution) (`@taskTool` / `awaitTask`), not
 to a blocked thread.
 
 **No sync wrapper, by design.** There is deliberately no blocking cross-thread

@@ -6,7 +6,7 @@
  *   - STDIO (default): spawns the sibling `tasks-server` binary.
  *   - HTTP (`--http <url>`): connects to a running server via Streamable HTTP.
  *
- * Exercises the SEP-2663 task flow against the server's three `@task` tools:
+ * Exercises the SEP-2663 task flow against the server's three `@taskTool` tools:
  *
  *   1. word_count — `callToolAwait` calls the tool, detects the CreateTaskResult,
  *      polls `tasks/get` to completion, and returns the final CallToolResult.

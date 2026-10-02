@@ -2,7 +2,7 @@
 /// registered event types, serves `events/poll`, fans `emit()`ed events out to
 /// active push streams (and, in the webhook engine, to subscribers), and drives
 /// the poll-lease lifecycle that fires `on_subscribe`/`on_unsubscribe`. It mirrors
-/// the role `TaskRuntime` plays for `@task`: the server obtains one from
+/// the role `TaskRuntime` plays for `@taskTool`: the server obtains one from
 /// `enableEvents()` and the UDA reflection layer registers types against it.
 module mcp.server.events_runtime;
 
@@ -310,7 +310,7 @@ final class EventHandle(A, P)
 
 	// Marshal the payload `P` to/from JSON through `EnumByNamePolicy`, so any enum —
 	// `P` itself or one nested in a field/array — is (de)serialized by its member
-	// name, matching the derived payloadSchema and the @tool/@task marshalling.
+	// name, matching the derived payloadSchema and the @tool/@taskTool marshalling.
 	private static Json serializePayload(P payload) @safe
 	{
 		return () @trusted {

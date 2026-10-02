@@ -43,18 +43,18 @@ struct tool
 ///
 /// Example:
 /// ---
-/// @task("word_count", "Count words asynchronously")
+/// @taskTool("word_count", "Count words asynchronously")
 /// @readOnly
 /// WordCount count(string text, TaskContext tc) @safe { ... }
 /// ---
-struct task
+struct taskTool
 {
 	string name;
 	string description;
 	string title; /// optional human-readable display name (empty = unset)
 }
 
-/// Per-task time-to-live UDA, attached alongside `@task`: how long the task's
+/// Per-task time-to-live UDA, attached alongside `@taskTool`: how long the task's
 /// record is kept after it settles (a task still working never expires). Intrinsic to the work the task does (a long-running job vs a
 /// quick computation), so it belongs on the task, not the server. Omit it to
 /// inherit `TaskOptions.defaultTtl`.
@@ -62,7 +62,7 @@ struct task
 /// Example:
 /// ---
 /// import core.time : hours;
-/// @task("build", "Run the build")
+/// @taskTool("build", "Run the build")
 /// @taskTtl(1.hours)
 /// BuildResult build(string target, TaskContext tc) @safe { ... }
 /// ---
@@ -73,14 +73,14 @@ struct taskTtl
 	Duration value; /// task TTL (serialized to integer ms on the wire)
 }
 
-/// Per-task poll-cadence UDA, attached alongside `@task`: the interval the client
+/// Per-task poll-cadence UDA, attached alongside `@taskTool`: the interval the client
 /// SHOULD wait between `tasks/get` polls. Like `@taskTtl`, it is intrinsic to the
 /// task. Omit it to inherit `TaskOptions.defaultPollInterval`.
 ///
 /// Example:
 /// ---
 /// import core.time : seconds;
-/// @task("build", "Run the build")
+/// @taskTool("build", "Run the build")
 /// @taskTtl(1.hours) @taskPollInterval(5.seconds)
 /// BuildResult build(string target, TaskContext tc) @safe { ... }
 /// ---
@@ -314,7 +314,7 @@ struct lastModified
 	string value; /// ISO 8601 last-modified timestamp
 }
 
-/// Method-level UDA documenting a named parameter of a `@tool`, `@task`, or
+/// Method-level UDA documenting a named parameter of a `@tool`, `@taskTool`, or
 /// `@prompt` method. Attach it to the method declaration (never inline to a
 /// parameter); `parameter` names the argument it documents and `description`
 /// is the human-readable text folded into that property's JSON Schema

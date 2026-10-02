@@ -2,7 +2,7 @@
 
 A self-contained example of the **`io.modelcontextprotocol/tasks`** extension
 (SEP-2663) in the D MCP SDK ([mcp.d](https://github.com/Poita/mcp.d)): a
-`@task` method becomes a tool whose `tools/call` returns a task handle
+`@taskTool` method becomes a tool whose `tools/call` returns a task handle
 immediately, runs asynchronously, and delivers its typed return value as the
 task's final result. It is its own dub package with path dependencies on the
 root `mcp-d` library and the shared `examples/common` scaffold, so it never
@@ -15,7 +15,7 @@ that runs the same assertions over either transport.
 
 ## What it teaches
 
-**Server side (`server.d`)** — three `@task` methods on `TasksApi`, wired by one
+**Server side (`server.d`)** — three `@taskTool` methods on `TasksApi`, wired by one
 `registerHandlers` call after `server.enableTasks()`:
 
 - **`word_count`** — a plain async task that reports progress with

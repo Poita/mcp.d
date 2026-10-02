@@ -1,8 +1,8 @@
 /**
  * MCP Tasks example server — dual-transport (stdio + Streamable HTTP).
  *
- * Demonstrates the SDK's ergonomic `@task` UDA for the SEP-2663
- * `io.modelcontextprotocol/tasks` extension. A `@task` method becomes a tool
+ * Demonstrates the SDK's ergonomic `@taskTool` UDA for the SEP-2663
+ * `io.modelcontextprotocol/tasks` extension. A `@taskTool` method becomes a tool
  * whose `tools/call` returns a task handle immediately; the body runs
  * asynchronously via the server's task dispatcher and its typed return value
  * becomes the task's final result. The matching client polls `tasks/get` and
@@ -75,7 +75,7 @@ struct LabeledCount
 	int chars;
 }
 
-/// All three tasks as `@task`-annotated methods. `registerHandlers` derives each
+/// All three tasks as `@taskTool`-annotated methods. `registerHandlers` derives each
 /// tool's input schema from the typed parameters, injects the `TaskContext`
 /// (omitted from the schema), and runs the body asynchronously via the
 /// dispatcher, wrapping the return value as the task result.
@@ -86,7 +86,7 @@ final class TasksApi
 
 	/// Plain async task: count words and characters, with a progress update.
 	/// @taskTtl / @taskPollInterval set this task's timing (per-task, not global).
-	@task("word_count", "Count words and characters in text (runs asynchronously).")
+	@taskTool("word_count", "Count words and characters in text (runs asynchronously).")
 	@taskTtl(10.seconds) @taskPollInterval(200.msecs)
 	@readOnly WordCountResult wordCount(string text, TaskContext tc) @safe
 	{
@@ -97,7 +97,7 @@ final class TasksApi
 	/// Async task with cooperative cancellation: reverse the string one character
 	/// at a time, checking `cancelRequested` between characters. Returns the
 	/// partial result with `cancelled = true` if a cancel was observed.
-	@task("slow_reverse", "Reverse a string one character at a time (cancellable).")
+	@taskTool("slow_reverse", "Reverse a string one character at a time (cancellable).")
 	@taskTtl(30.seconds) @taskPollInterval(100.msecs)
 	ReverseResult slowReverse(string text, TaskContext tc) @safe
 	{
@@ -117,7 +117,7 @@ final class TasksApi
 	/// answer yet, so `requireInput` suspends the task into `input_required`; once
 	/// the client answers via `tasks/update`, the executor is re-invoked and the
 	/// answer is present.
-	@task("labeled_count", "Count words under a label the client supplies mid-task.")
+	@taskTool("labeled_count", "Count words under a label the client supplies mid-task.")
 	@taskTtl(60.seconds) @taskPollInterval(200.msecs)
 	@readOnly LabeledCount labeledCount(string text, TaskContext tc) @safe
 	{
@@ -139,10 +139,10 @@ void main(string[] args) @safe
 
 	// Enable the tasks extension. A null store uses the in-memory default and a
 	// null dispatcher uses the in-process (fiber) default — fine for a single-node
-	// demo. Per-task timing comes from each @task's @taskTtl / @taskPollInterval.
+	// demo. Per-task timing comes from each @taskTool's @taskTtl / @taskPollInterval.
 	//
 	// For a durable, horizontally-scaled deployment you supply your own store and
-	// dispatcher; the @task handlers above do not change. Because all task state
+	// dispatcher; the @taskTool handlers above do not change. Because all task state
 	// lives in the store, any node can serve tasks/get|update|cancel and re-run an
 	// executor purely from the task ID:
 	//
@@ -154,7 +154,7 @@ void main(string[] args) @safe
 	//       size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) { /* SCAN + DEL */ }
 	//   }
 	//   // A dispatcher that enqueues the task ID; a worker process running the same
-	//   // server + @task registration picks it up and runs the executor.
+	//   // server + @taskTool registration picks it up and runs the executor.
 	//   final class QueueTaskDispatcher : TaskDispatcher {
 	//       void dispatch(string taskId, void delegate(string) @safe run) { queue.publish(taskId); }
 	//   }
@@ -162,7 +162,7 @@ void main(string[] args) @safe
 	//
 	server.enableTasks();
 
-	// Register all @task methods in one call — no per-tool wiring.
+	// Register all @taskTool methods in one call — no per-tool wiring.
 	registerHandlers(server, new TasksApi);
 
 	runServerFromArgs(server, args, defaultPort);

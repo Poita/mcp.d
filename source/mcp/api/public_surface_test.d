@@ -336,3 +336,18 @@ unittest  // `import mcp;` alongside std.algorithm leaves `cache` unambiguous
 			auto r = [1, 2].cache;
 		}));
 }
+
+unittest  // `import mcp;` alongside std.parallelism leaves `task` unambiguous
+{
+	static assert(__traits(compiles, {
+			import mcp;
+			import std.parallelism;
+
+			auto t = task!((int x) => x)(1);
+		}));
+}
+
+unittest  // the task-tool UDA is `@taskTool`
+{
+	static assert(visibleFromMcp!"taskTool");
+}

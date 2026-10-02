@@ -100,10 +100,10 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 								"@tool on '" ~ memberName ~ "' has an empty name");
 						registerToolMethod!(memberName, overload, parent)(server, attr);
 					}
-					else static if (is(typeof(attr) == task))
+					else static if (is(typeof(attr) == taskTool))
 					{
 						static assert(attr.name.length,
-								"@task on '" ~ memberName ~ "' has an empty name");
+								"@taskTool on '" ~ memberName ~ "' has an empty name");
 						registerTaskMethod!(memberName, overload, parent)(server, attr);
 					}
 					else static if (is(typeof(attr) == event))
@@ -153,9 +153,9 @@ private void checkHandlerSafety(string memberName, alias f)()
 
 /// Whether the type `A` is one of the handler UDAs that must be applied with an
 /// argument list; a bare `@tool` attaches the type itself rather than a value.
-private enum isHandlerUda(A) = is(A == tool) || is(A == task) || is(A == event)
-	|| is(A == prompt) || is(A == resource) || is(A == resourceTemplate)
-	|| is(A == skill) || is(A == skillDir);
+private enum isHandlerUda(A) = is(A == tool) || is(A == taskTool)
+	|| is(A == event) || is(A == prompt) || is(A == resource)
+	|| is(A == resourceTemplate) || is(A == skill) || is(A == skillDir);
 
 /// An applied form of the handler UDA `A` with placeholder arguments, shown when
 /// `A` is attached bare.
@@ -627,7 +627,7 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 	static foreach (P; BoundParameters!overload)
 	{
 		static assert(!is(P == TaskContext), "@tool method '" ~ memberName
-				~ "' must not take a TaskContext; declare it with @task to run as a task.");
+				~ "' must not take a TaskContext; declare it with @taskTool to run as a task.");
 		static assert(!is(P == EventContext), "@tool method '" ~ memberName
 				~ "' must not take an EventContext; only event handlers receive one.");
 	}
@@ -708,7 +708,7 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 }
 
 private void registerTaskMethod(string memberName, alias overload, alias parent)(
-		McpServer server, task attr) @safe
+		McpServer server, taskTool attr) @safe
 {
 	import std.traits : ReturnType;
 
@@ -718,13 +718,13 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 	static foreach (P; BoundParameters!overload)
 	{
 		static assert(!is(P : RequestContext),
-				"@task method '" ~ memberName ~ "' must not take a RequestContext "
+				"@taskTool method '" ~ memberName ~ "' must not take a RequestContext "
 				~ "(the request has already returned); take a TaskContext instead.");
-		static assert(!is(P == EventContext), "@task method '" ~ memberName
+		static assert(!is(P == EventContext), "@taskTool method '" ~ memberName
 				~ "' must not take an EventContext; only event handlers receive one.");
 	}
 	static assert(!is(ReturnType!overload == ToolResponse),
-			"@task method '" ~ memberName ~ "' must return a value (or void), not ToolResponse");
+			"@taskTool method '" ~ memberName ~ "' must return a value (or void), not ToolResponse");
 
 	Tool descriptor;
 	descriptor.name = attr.name;
@@ -3385,7 +3385,7 @@ version (unittest) private final class TaskUdaApi
 
 	/// A plain async task: returns a typed result the framework wraps. The
 	/// @taskTtl / @taskPollInterval set this task's TTL and poll cadence.
-	@task("async_double", "Double a number asynchronously")
+	@taskTool("async_double", "Double a number asynchronously")
 	@taskTtl(12_345.msecs) @taskPollInterval(250.msecs)
 	@readOnly Doubled asyncDouble(int n, TaskContext tc) @safe
 	{
@@ -3394,7 +3394,7 @@ version (unittest) private final class TaskUdaApi
 	}
 
 	/// A task that elicits mid-execution before finishing (re-entrant model).
-	@task("approve", "Ask for approval, then finish")
+	@taskTool("approve", "Ask for approval, then finish")
 	Approved approve(string topic, TaskContext tc) @safe
 	{
 		if (!tc.hasInput("ok"))
@@ -3410,7 +3410,7 @@ version (unittest) private Json modernMeta() @safe
 	import mcp.protocol.capabilities : tasksExtensionKey;
 	import mcp.protocol.mrtr : MetaKey;
 
-	// A client that declared the Tasks extension: the @task tests exercise the
+	// A client that declared the Tasks extension: the @taskTool tests exercise the
 	// task surface, which the server serves only to such a client.
 	Json ext = Json.emptyObject;
 	ext[tasksExtensionKey] = Json.emptyObject;
@@ -3420,7 +3420,7 @@ version (unittest) private Json modernMeta() @safe
 	return meta;
 }
 
-unittest  // @task UDA: tool is listed with an input schema derived from its params
+unittest  // @taskTool UDA: tool is listed with an input schema derived from its params
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.server.task_context : SyncTaskDispatcher;
@@ -3442,7 +3442,7 @@ unittest  // @task UDA: tool is listed with an input schema derived from its par
 	assert(dbl["annotations"]["readOnlyHint"].get!bool);
 }
 
-unittest  // @task UDA: tools/call returns a task the executor completes
+unittest  // @taskTool UDA: tools/call returns a task the executor completes
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.server.task_context : SyncTaskDispatcher;
@@ -3470,7 +3470,7 @@ unittest  // @task UDA: tools/call returns a task the executor completes
 	assert(got["result"]["pollIntervalMs"].get!long == 250);
 }
 
-unittest  // @task UDA: a missing required argument (schema validation off) completes as an isError result
+unittest  // @taskTool UDA: a missing required argument (schema validation off) completes as an isError result
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.server.task_context : SyncTaskDispatcher;
@@ -3496,7 +3496,7 @@ unittest  // @task UDA: a missing required argument (schema validation off) comp
 	assert(got["result"]["content"][0]["text"].get!string.canFind("'n'"));
 }
 
-unittest  // @task UDA: a mid-task elicitation suspends and resumes via tasks/update
+unittest  // @taskTool UDA: a mid-task elicitation suspends and resumes via tasks/update
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.server.task_context : SyncTaskDispatcher;
@@ -3672,7 +3672,7 @@ version (unittest) private final class EventCtxToolApi
 
 version (unittest) private final class EventCtxTaskApi
 {
-	@task("t", "A task that wrongly takes an EventContext")
+	@taskTool("t", "A task that wrongly takes an EventContext")
 	string t(string msg, EventContext ec) @safe
 	{
 		return msg;
@@ -3691,7 +3691,7 @@ unittest  // a @tool method taking an EventContext is rejected at compile time
 	static assert(!__traits(compiles, registerHandlers(s, new EventCtxToolApi)));
 }
 
-unittest  // a @task method taking an EventContext is rejected at compile time
+unittest  // a @taskTool method taking an EventContext is rejected at compile time
 {
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new EventCtxTaskApi)));
