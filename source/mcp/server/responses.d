@@ -110,9 +110,16 @@ struct ToolResponse
 	// the local template would hide the mixin's overloads.
 	alias inputRequired = ireq.inputRequired;
 
-	/// The handler is done; `r` is the final result.
+	/// The handler is done; `r` is the final result. A `CallToolResult` carrying
+	/// a task handle or MRTR `inputRequests`/`requestState` is classified as
+	/// `task` or `inputRequired`, so it gets the same capability filtering,
+	/// validation, and version gating as one built through those factories.
 	static ToolResponse complete(CallToolResult r) @safe
 	{
+		if (r.isTask)
+			return ToolResponse.task(r.toJson());
+		if (r.isInputRequired)
+			return ToolResponse.inputRequired(r.inputRequests, r.requestState);
 		ToolResponse t;
 		t.result_ = r;
 		return t;

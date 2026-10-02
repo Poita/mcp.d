@@ -3485,7 +3485,7 @@ final class McpServer : ServerCore
 			// Validate the handler's (un-projected) output against the tool's
 			// declared outputSchema before version-shaping, so validation always
 			// sees the full structuredContent regardless of the negotiated version.
-			if (validateOutputSchema_ && !response.isTask)
+			if (validateOutputSchema_ && !response.isTask && !response.needsInput)
 				checkOutputSchema(entry.outputValidator, entry.descriptor.name, response.toJson());
 			// Project the result to the negotiated protocol version so version-
 			// gated fields are not emitted to peers that don't understand them.
@@ -3532,9 +3532,9 @@ final class McpServer : ServerCore
 	///   2. Conformance — that `structuredContent` MUST validate against the
 	///      tool's `outputSchema`.
 	/// No-op when the tool declares no output schema. A tool *execution* error
-	/// (`isError:true`) and an `InputRequiredResult` (MRTR — `inputRequests`
-	/// only, no `content`) are exempt: the MUST governs successful structured
-	/// results, not error reports or input-gathering round trips. Throws an
+	/// (`isError:true`) is exempt, and the caller skips task handles and
+	/// `InputRequiredResult`s: the MUST governs successful structured results,
+	/// not error reports, task handles, or input-gathering round trips. Throws an
 	/// internal `McpException` on a violation.
 	private static void checkOutputSchema(Validator validator, string toolName, Json result) @safe
 	{
@@ -3549,10 +3549,6 @@ final class McpServer : ServerCore
 		// content (no structuredContent); the MUST does not apply to it.
 		if ("isError" in result && result["isError"].type == Json.Type.bool_
 				&& result["isError"].get!bool)
-			return;
-		// An InputRequiredResult is a distinct result shape (only `inputRequests`,
-		// no `content`); it is not a structured tool output.
-		if ("inputRequests" in result && "content" !in result)
 			return;
 		// Presence half of the MUST: a successful result with a declared
 		// outputSchema must provide structuredContent.
@@ -8490,14 +8486,74 @@ unittest  // modern: a raw CallToolResult carrying inputRequests is stamped "inp
 		];
 		return r;
 	});
-	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
-	auto resp = s.handle(modernReq(1, "tools/call", p)).get;
+	auto resp = s.handle(modernCall(1, "raw", [])).get;
 	assert("error" !in resp);
 	// The modern base Result discriminator MUST be "input_required" for an
 	// InputRequiredResult-shaped body, not the default "complete".
 	assert(resp["result"]["resultType"].get!string == "input_required");
 	assert("inputRequests" in resp["result"]);
 	assert("content" !in resp["result"]);
+}
+
+unittest  // modern: a raw CallToolResult's inputRequests are filtered against the client's capabilities
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	auto s = new McpServer("t", "1");
+	Tool t = {name: "raw"};
+	s.registerTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.inputRequests = [
+			InputRequest("date", "elicitation", Json(["message": Json("When?")]))
+		];
+		return r;
+	});
+	// modernReq declares no elicitation capability, so the only request is
+	// unfulfillable and the result violates the at-least-one rule.
+	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
+	auto resp = s.handle(modernReq(1, "tools/call", p)).get;
+	assert("error" in resp);
+	assert(resp["error"]["code"].get!int == ErrorCode.internalError);
+}
+
+unittest  // modern: a raw CallToolResult carrying a task handle bypasses output-schema validation
+{
+	import mcp.protocol.tasks : Task;
+
+	auto s = new McpServer("t", "1");
+	s.enableOutputSchemaValidation();
+	Tool t = {name: "raw"};
+	t.outputSchema = Json(["type": Json("object")]);
+	s.registerTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.task = Task("task-1");
+		r.task.createdAt = "2026-01-01T00:00:00Z";
+		r.task.lastUpdatedAt = "2026-01-01T00:00:00Z";
+		return r;
+	});
+	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
+	auto resp = s.handle(modernReq(1, "tools/call", p)).get;
+	assert("error" !in resp);
+	assert(resp["result"]["resultType"].get!string == "task");
+	assert(resp["result"]["taskId"].get!string == "task-1");
+}
+
+unittest  // modern: a requestState-only input-required result bypasses output-schema validation
+{
+	auto s = new McpServer("t", "1");
+	s.enableOutputSchemaValidation();
+	Tool t = {name: "raw"};
+	t.outputSchema = Json(["type": Json("object")]);
+	s.registerTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.requestState = "resume-here";
+		return r;
+	});
+	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
+	auto resp = s.handle(modernReq(1, "tools/call", p)).get;
+	assert("error" !in resp);
+	assert(resp["result"]["resultType"].get!string == "input_required");
+	assert(resp["result"]["requestState"].get!string == "resume-here");
 }
 
 unittest  // modern resources/read unknown uri uses invalidParams (-32602)
