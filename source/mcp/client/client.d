@@ -230,9 +230,12 @@ struct ClientSettings
 	/// reply POST can both hold a permit.
 	uint maxInFlight = 0;
 
-	/// HTTP transport only: the largest response body or SSE event the client
-	/// accepts from the server. A larger one fails the request it belongs to, so a
-	/// hostile or broken server cannot make the client allocate without bound.
+	/// The largest message the client accepts from the server: an HTTP response
+	/// body or SSE event, or a stdout line of a server started by `spawn`. A
+	/// larger HTTP message fails the request it belongs to, and a longer stdio
+	/// line closes the channel, so a hostile or broken server cannot make the
+	/// client allocate without bound. Ignored by `McpClient.stdio`, whose caller
+	/// supplies `readLine`.
 	size_t maxMessageBytes = defaultMaxMessageBytes;
 
 	/// HTTP transport only: how https/wss servers are validated. The default
@@ -756,7 +759,8 @@ final class McpClient : ClientProtocol
 	/// (without its terminator) or `null` at end-of-input; `writeLine` emits one
 	/// message line (the sink appends the terminator). Every `settings` field
 	/// applies except the HTTP transport knobs (`connectTimeout`, `maxInFlight`,
-	/// `maxMessageBytes`, `tls`), which are ignored.
+	/// `tls`) and `maxMessageBytes` (`readLine` bounds its own lines), which are
+	/// ignored.
 	static McpClient stdio(string delegate() @safe readLine,
 			void delegate(string) @safe writeLine, ClientSettings settings = ClientSettings.init) @safe
 	{
@@ -770,12 +774,14 @@ final class McpClient : ClientProtocol
 	/// initialized — call `initialize()` (or `ping()` for a stateless probe).
 	/// `close()` runs the MCP stdio shutdown sequence on the subprocess. Every
 	/// `settings` field applies except the HTTP transport knobs (`connectTimeout`,
-	/// `maxInFlight`, `maxMessageBytes`, `tls`), which are ignored.
+	/// `maxInFlight`, `tls`), which are ignored; `maxMessageBytes` bounds each
+	/// line the server writes to stdout.
 	static McpClient spawn(string[] command, ClientSettings settings = ClientSettings.init) @safe
 	{
 		import std.array : join;
 
-		auto c = new McpClient(spawnStdioTransport(command), settings.clientInfo);
+		auto c = new McpClient(spawnStdioTransport(command,
+				settings.maxMessageBytes), settings.clientInfo);
 		c.cacheServer_ = "stdio:" ~ command.join(" ");
 		return c.applySettings(settings);
 	}

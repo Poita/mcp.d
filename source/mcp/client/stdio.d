@@ -933,6 +933,32 @@ version (Posix) unittest  // an over-long newline-less stream ends the read loop
 	});
 }
 
+version (Posix) unittest  // McpClient.spawn bounds the server's stdout lines by ClientSettings.maxMessageBytes
+{
+	import core.time : Duration;
+	import std.algorithm.searching : canFind;
+	import mcp.client.client : ClientSettings;
+
+	string msg;
+	inLoop(() @safe {
+		// The child answers the request with a response line far longer than the
+		// cap, then waits for stdin to close.
+		ClientSettings settings;
+		settings.maxMessageBytes = 4096;
+		settings.requestTimeout = Duration.zero;
+		auto client = McpClient.spawn([
+			"sh", "-c",
+			`read line; id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/'); ` ~ `printf '{"jsonrpc":"2.0","id":%s,"result":{"pad":"%08192d"}}\n' "$id" 0; cat >/dev/null`
+		], settings);
+		try
+			client.ping();
+		catch (McpException e)
+			msg = e.msg;
+		client.close();
+	});
+	assert(msg.canFind("closed"), "an over-long line must close the channel, got: " ~ msg);
+}
+
 version (Posix) unittest  // close() is idempotent: a second call does not re-run the child shutdown
 {
 	inLoop(() @safe {
