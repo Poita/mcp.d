@@ -3281,7 +3281,7 @@ final class McpClient : ClientProtocol
 			if (failures == 0 && res.refreshBefore.isNull
 					&& eventSettings_.noExpiryRefreshInterval <= Duration.zero)
 				return;
-			webhookRefreshSleep(failures == 0 ? webhookRefreshDelay(
+			webhookRefreshSleep(sub, failures == 0 ? webhookRefreshDelay(
 					res) : minWebhookRefreshMs.msecs * (1L << (failures < 6 ? failures : 6)));
 			if (!sub.active)
 				return;
@@ -3352,9 +3352,9 @@ final class McpClient : ClientProtocol
 		sub.sleepWhileActive(ms.msecs);
 	}
 
-	/// Sleep `d` before the next webhook refresh. A test seam runs the loop
-	/// synchronously and lets a test end it.
-	private void webhookRefreshSleep(Duration d) @safe
+	/// Sleep `d` before the next webhook refresh, waking early once `sub` stops. A
+	/// test seam runs the loop synchronously and lets a test end it.
+	private void webhookRefreshSleep(EventSubscription sub, Duration d) @safe
 	{
 		version (unittest)
 			if (onWebhookRefreshSleepForTest !is null)
@@ -3362,9 +3362,7 @@ final class McpClient : ClientProtocol
 				onWebhookRefreshSleepForTest(d);
 				return;
 			}
-		import vibe.core.core : sleep;
-
-		() @trusted { sleep(d); }();
+		sub.sleepWhileActive(d);
 	}
 
 	/// How long to wait before refreshing a webhook grant: ~80% of the way to
@@ -10357,6 +10355,43 @@ unittest  // subscribeWebhook registers the receiver under the server id and tea
 	sub.cancel();
 	assert(unsubs == 1);
 	assert(rx.processDelivery("{}", known).status == 503); // deregistered
+}
+
+unittest  // cancelling a webhook subscription wakes its refresh loop from a long sleep
+{
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	c.onRpcForTest = (string method, Json params) @safe => Json.emptyObject;
+	auto sub = new EventSubscription();
+	SubscribeResult first;
+	first.id = "sub_x"; // no expiry: sleeps the hour-long health-check interval
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	Duration took = Duration.max;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		const start = MonoTime.currTime;
+		try
+			c.runWebhookRefreshLoop(sub, sp, first, null);
+		catch (Exception)
+		{
+		}
+		took = MonoTime.currTime - start;
+	});
+	runTask(() nothrow{
+		try
+		{
+			sleep(50.msecs);
+			sub.cancel();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(took < 2.seconds, "a cancelled webhook refresh loop must not sleep out its interval");
 }
 
 unittest  // cancelling a webhook subscription deregisters the receiver even when unsubscribe fails
