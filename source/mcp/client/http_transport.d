@@ -89,9 +89,15 @@ HttpStatusException httpStatusError(int status, string body, string wwwAuthentic
 private final class ListenSocketSlot
 {
 	import vibe.core.net : TCPConnection;
+	import vibe.core.task : Task;
 
 	private TCPConnection sock;
 	private bool open;
+	/// The task reading this socket, which `abort` interrupts.
+	Task owner;
+	/// Nonzero while `owner` runs an inbound handler; `abort` then only closes
+	/// the socket, so application code is never interrupted.
+	uint inHandler;
 
 	/// Record the connected socket. If a cancel already arrived (`closeSocket`
 	/// ran before the task connected), close immediately.
@@ -126,6 +132,16 @@ private final class ListenSocketSlot
 			{
 			}
 		}
+	}
+
+	/// Close the socket and interrupt its reader, so a read parked on a silent
+	/// stream returns at once even where closing a socket does not wake a pending
+	/// read (the Windows event driver).
+	void abort() @safe nothrow
+	{
+		closeSocket();
+		if (inHandler == 0 && owner != Task.init && owner != Task.getThis() && owner.running)
+			owner.interrupt();
 	}
 }
 
@@ -479,7 +495,7 @@ final class HttpClientTransport : ClientTransport
 		foreach (slot; postSockets)
 			slot.closeSocket();
 		foreach (slot; listenSockets)
-			slot.closeSocket();
+			slot.abort();
 		// Fail any in-flight legacy waiter at once so its `legacyRpc` wait returns
 		// immediately instead of waiting out the timeout on a closing transport.
 		foreach (id, w; legacyWaiters)
@@ -1608,20 +1624,15 @@ final class HttpClientTransport : ClientTransport
 
 		auto cancelled = () @trusted { return new shared bool(false); }();
 		// The background task fills this slot with its live socket once connected;
-		// the stream's onCancel delegate force-closes it so a blocked readLine /
-		// conn.read returns immediately rather than parking until the next event.
+		// the stream's onCancel delegate aborts it (closing the socket and
+		// interrupting the reader) so a blocked readLine / conn.read returns
+		// immediately rather than parking until the next event.
 		auto slot = new ListenSocketSlot;
 		// A slot registered after close() is born closed, so the stream ends at once.
 		if (closing)
 			slot.closeSocket();
 		listenSockets ~= slot;
-		auto onCancel = () @safe nothrow{
-			try
-				slot.closeSocket();
-			catch (Exception)
-			{
-			}
-		};
+		auto onCancel = () @safe nothrow{ slot.abort(); };
 		auto stream = new SubscriptionStream(cancelled, onCancel);
 
 		// Gate the return on the server confirming the stream is open. The reader
@@ -1636,7 +1647,7 @@ final class HttpClientTransport : ClientTransport
 		// leading frame within `listenTimeout_` has the stream cancelled and the
 		// open fails with a timeout.
 		auto gate = new ListenGate;
-		runTask(() nothrow{
+		slot.owner = runTask(() nothrow{
 			scope (exit)
 			{
 				import std.algorithm : remove;
@@ -1810,6 +1821,9 @@ final class HttpClientTransport : ClientTransport
 						return;
 					}
 					markEstablished(true);
+					slot.inHandler++;
+					scope (exit)
+						slot.inHandler--;
 					try
 						dispatch(m);
 					catch (Exception)
@@ -4522,6 +4536,56 @@ unittest  // a listen stream the server fails after acknowledging records the er
 	assert(e is null, "an acknowledged listen must open");
 	assert(ended, "the server's error must end the stream");
 	assert(streamError !is null && streamError.code == -32603);
+}
+
+unittest  // aborting a listen slot interrupts its parked reader, but not inside a handler
+{
+	import core.time : msecs, seconds;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+
+	auto slot = new ListenSocketSlot;
+	bool woke;
+	bool handlerFinished;
+	runTask(() nothrow @safe {
+		try
+		{
+			auto reader = runTask(() nothrow @safe {
+				try
+					sleep(5.seconds); // stands in for a read that closing a socket cannot wake
+				catch (Exception)
+					woke = true;
+			});
+			slot.owner = reader;
+			sleep(10.msecs);
+			slot.abort();
+			reader.join();
+
+			auto handler = runTask(() nothrow @safe {
+				slot.inHandler++;
+				scope (exit)
+					slot.inHandler--;
+				try
+				{
+					sleep(50.msecs);
+					handlerFinished = true;
+				}
+				catch (Exception)
+				{
+				}
+			});
+			slot.owner = handler;
+			sleep(10.msecs);
+			slot.abort();
+			handler.join();
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(woke, "abort() must interrupt the reader task");
+	assert(handlerFinished, "abort() must not interrupt a running handler");
 }
 
 unittest  // closing the transport ends its open listen streams
