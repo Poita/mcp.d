@@ -1030,15 +1030,16 @@ final class McpClient : ClientProtocol
 		}
 		catch (McpException e)
 		{
-			if (e.code == ErrorCode.methodNotFound)
+			// Only UnsupportedProtocolVersionError carries a version list to
+			// negotiate from. Any other JSON-RPC error means the peer does not
+			// serve `server/discover` (legacy servers answer -32601, -32600,
+			// -32602 or -32002), so run the initialize handshake instead.
+			if (e.code != ErrorCode.unsupportedProtocolVersion)
 			{
-				initialize(); // legacy initialize-based server
+				initialize();
 				return negotiated;
 			}
-			if (e.code == ErrorCode.unsupportedProtocolVersion)
-				serverVersions = supportedListFromError(e);
-			else
-				throw e;
+			serverVersions = supportedListFromError(e);
 		}
 
 		ProtocolVersion chosen;
@@ -7924,6 +7925,125 @@ version (unittest)
 		void close() @safe
 		{
 		}
+	}
+}
+
+version (unittest)
+{
+	import mcp.server.server : McpServer;
+
+	// A `ClientTransport` that hands each message straight to an in-process
+	// `McpServer`, so `McpClient` runs end-to-end against the real server
+	// dispatcher without a socket.
+	private final class ServerBackedTransport : ClientTransport
+	{
+		private McpServer server_;
+
+		this(McpServer server) @safe
+		{
+			server_ = server;
+		}
+
+		Json deliver(Json message, long) @safe
+		{
+			auto resp = server_.handle(Message(message)).get;
+			if ("error" in resp)
+				throw new McpException(cast(ErrorCode) resp["error"]["code"].get!int,
+						resp["error"]["message"].get!string, "data" in resp["error"]
+						? resp["error"]["data"] : Json.undefined);
+			return resp["result"];
+		}
+
+		void sendOneway(Json message) @safe
+		{
+			server_.handle(Message(message));
+		}
+
+		void abort(long, McpException) @safe
+		{
+		}
+
+		bool repliesSynchronously() @safe
+		{
+			return true;
+		}
+
+		void startServerStream() @safe
+		{
+		}
+
+		SubscriptionStream openListen(Json) @safe
+		{
+			return null;
+		}
+
+		void setInboundHandler(void delegate(Message) @safe) @safe
+		{
+		}
+
+		void setProtocol(ClientProtocol) @safe
+		{
+		}
+
+		void startLegacyFallback() @safe
+		{
+		}
+
+		void setBearerToken(string) @safe
+		{
+		}
+
+		void setBearerProvider(string delegate() @safe) @safe
+		{
+		}
+
+		void setModernProtocol(bool) @safe
+		{
+		}
+
+		bool cancelsByStreamClose() @safe
+		{
+			return false;
+		}
+
+		void close() @safe
+		{
+		}
+	}
+}
+
+unittest  // connect() negotiates a legacy version with a stateful server that requires initialization
+{
+	auto server = McpServer.stateful("stateful-srv", "1.0");
+	server.requireInitialized();
+	auto c = new McpClient(new ServerBackedTransport(server));
+	const chosen = c.connect();
+	assert(!chosen.isModern);
+	assert(c.serverInfo().name == "stateful-srv");
+}
+
+unittest  // connect() falls back to initialize when the discover probe gets any non-version JSON-RPC error
+{
+	foreach (code; [
+			ErrorCode.invalidRequest, ErrorCode.invalidParams,
+			cast(ErrorCode)-32002
+		])
+	{
+		auto transport = new RecordingClientTransport();
+		auto c = new McpClient(transport);
+		transport.responder = (Json message, long expectId) @safe {
+			if (message["method"].get!string == "server/discover")
+				throw new McpException(code, "rejected");
+			Json r = Json.emptyObject;
+			r["protocolVersion"] = latestLegacy.toWire;
+			r["capabilities"] = Json.emptyObject;
+			r["serverInfo"] = Json([
+				"name": Json("legacy-srv"),
+				"version": Json("1.0")
+			]);
+			return r;
+		};
+		assert(c.connect() == latestLegacy);
 	}
 }
 
