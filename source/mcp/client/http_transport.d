@@ -356,8 +356,8 @@ final class HttpClientTransport : ClientTransport
 	// in a slot array (rather than a single shared field) ensures `close()` tears
 	// down every server-stream socket, not only the last one connected.
 	private ListenSocketSlot[] serverStreamSlots;
-	private TCPConnection legacyStreamSock;
-	private bool legacyStreamSockOpen;
+	// The socket and reader task of the legacy GET-SSE stream, aborted by `close()`.
+	private ListenSocketSlot legacyStreamSlot;
 	// Slots for the sockets of in-flight `postAndAwaitRaw` POSTs whose response is
 	// a long-lived SSE stream. Each POST registers a slot before connecting and
 	// removes it on scope exit; `close()` force-closes every registered slot so a
@@ -552,17 +552,19 @@ final class HttpClientTransport : ClientTransport
 
 			atomicStore(closeRequested, true);
 		}();
-		// Force-close every standalone server->client SSE socket so a reader parked
-		// on `conn.read` unblocks at once, rather than only the most recent socket.
+		// Close every stream socket and interrupt its reader, so a reader parked on
+		// `conn.read` unblocks at once even where closing a socket does not wake a
+		// pending read (the Windows event driver). A reader running an inbound
+		// handler is not interrupted; it observes `closing` once the handler returns.
 		foreach (slot; serverStreamSlots)
-			slot.closeSocket();
-		if (legacyStreamSockOpen)
-		{
-			legacyStreamSockOpen = false;
-			() @trusted { legacyStreamSock.close(); }();
-		}
-		// Force-close every in-flight POST socket so a POST parked reading a
-		// long-lived SSE response stream unblocks at once.
+			slot.abort();
+		if (legacyStreamSlot !is null)
+			legacyStreamSlot.abort();
+		// Abort every in-flight request, which closes the socket carrying its
+		// response and interrupts the task awaiting it.
+		auto closed = internalError("HTTP transport closed");
+		foreach (id, r; inflightPosts)
+			r.abort(closed);
 		foreach (slot; postSockets)
 			slot.closeSocket();
 		foreach (slot; listenSockets)
@@ -1619,6 +1621,7 @@ final class HttpClientTransport : ClientTransport
 	{
 		import core.time : msecs;
 		import vibe.core.core : sleep;
+		import vibe.core.task : Task;
 
 		// Clear the liveness flag when the reader task exits, so a later
 		// `startServerStream()` can re-open the stream instead of being suppressed.
@@ -1647,6 +1650,7 @@ final class HttpClientTransport : ClientTransport
 			// Register a slot so `close()` can force-close this connection's socket
 			// even while the reader is parked on a long-lived SSE read.
 			auto slot = new ListenSocketSlot;
+			slot.owner = Task.getThis();
 			serverStreamSlots ~= slot;
 			scope (exit)
 			{
@@ -1688,6 +1692,9 @@ final class HttpClientTransport : ClientTransport
 					readSseBody(conn, head.chunked, cursor, () @safe => closing,
 							(string eventType, string data) @safe {
 						sawData = true;
+						slot.inHandler++;
+						scope (exit)
+							slot.inHandler--;
 						try
 							dispatch(Message(parseJsonString(data)));
 						catch (Exception)
@@ -2058,6 +2065,7 @@ final class HttpClientTransport : ClientTransport
 	private void runLegacyStream() @safe
 	{
 		import std.string : strip;
+		import vibe.core.task : Task;
 
 		const ep = parseHttpEndpoint(url);
 		// Resolve + pin the user-configured endpoint host to a numeric address.
@@ -2067,27 +2075,27 @@ final class HttpClientTransport : ClientTransport
 		scope (exit)
 			legacyStreamAlive = false;
 
+		auto slot = new ListenSocketSlot;
+		slot.owner = Task.getThis();
+		legacyStreamSlot = slot;
+		scope (exit)
+		{
+			slot.closeSocket();
+			if (legacyStreamSlot is slot)
+				legacyStreamSlot = null;
+		}
+
 		() @trusted {
 			try
 			{
 				if (closing)
 					return;
 				auto sock = connectTimed(pinnedHost, ep.port);
-				// `connectTCP` yielded; a `close()` during that yield saw the socket as
-				// not-yet-open and did nothing. Re-check here, in the same fiber with no
-				// intervening yield, so the freshly connected socket is not leaked.
+				// `attach` closes `sock` immediately if a `close()` already ran during
+				// the `connectTCP` yield, so the socket is never leaked or left parked.
+				slot.attach(sock);
 				if (closing)
-				{
-					sock.close();
 					return;
-				}
-				legacyStreamSock = sock;
-				legacyStreamSockOpen = true;
-				scope (exit)
-				{
-					legacyStreamSockOpen = false;
-					sock.close();
-				}
 				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
 				scope (exit)
@@ -3210,6 +3218,103 @@ unittest  // close() force-closes every registered server-stream socket slot
 	t.serverStreamSlots ~= slotB;
 	t.close();
 	assert(slotA.closed && slotB.closed);
+}
+
+version (unittest)
+{
+	import vibe.core.task : Task;
+
+	/// Run `scenario` with a task parked in a long sleep, returning whether the
+	/// task was interrupted (woken by `InterruptException`) within one second.
+	private bool interruptsParkedTask(void delegate(Task parked) @safe scenario)
+	{
+		import core.time : msecs, MonoTime;
+		import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+		import vibe.core.task : InterruptException;
+
+		bool interrupted;
+		bool result;
+		runTask(() nothrow{
+			scope (exit)
+				exitEventLoop();
+			try
+			{
+				auto parked = runTask(() nothrow{
+					try
+						sleep(5.seconds);
+					catch (InterruptException)
+						interrupted = true;
+					catch (Exception)
+					{
+					}
+				});
+				sleep(10.msecs);
+				scenario(parked);
+				const until = MonoTime.currTime + 1.seconds;
+				while (!interrupted && MonoTime.currTime < until)
+					sleep(10.msecs);
+				result = interrupted;
+				if (!interrupted)
+					parked.interrupt();
+			}
+			catch (Exception)
+			{
+			}
+		});
+		runEventLoop();
+		return result;
+	}
+}
+
+unittest  // close() interrupts the reader of a standalone-stream slot, waking a read the socket close may not
+{
+	const interrupted = interruptsParkedTask((Task parked) @safe {
+		auto t = new HttpClientTransport("http://host:8080/mcp");
+		auto slot = new ListenSocketSlot;
+		slot.owner = parked;
+		t.serverStreamSlots ~= slot;
+		t.close();
+	});
+	assert(interrupted);
+}
+
+unittest  // close() leaves a standalone-stream reader running an inbound handler uninterrupted
+{
+	const interrupted = interruptsParkedTask((Task parked) @safe {
+		auto t = new HttpClientTransport("http://host:8080/mcp");
+		auto slot = new ListenSocketSlot;
+		slot.owner = parked;
+		slot.inHandler = 1;
+		t.serverStreamSlots ~= slot;
+		t.close();
+	});
+	assert(!interrupted);
+}
+
+unittest  // close() aborts every in-flight request, interrupting the task awaiting its response
+{
+	McpException reason;
+	const interrupted = interruptsParkedTask((Task parked) @safe {
+		auto t = new HttpClientTransport("http://host:8080/mcp");
+		auto r = new PostRequest;
+		r.owner = parked;
+		t.inflightPosts[7] = r;
+		t.close();
+		reason = r.aborted;
+	});
+	assert(interrupted);
+	assert(reason !is null);
+}
+
+unittest  // close() interrupts the legacy GET-SSE reader
+{
+	const interrupted = interruptsParkedTask((Task parked) @safe {
+		auto t = new HttpClientTransport("http://host:8080/mcp");
+		t.legacyStreamSlot = new ListenSocketSlot;
+		t.legacyStreamSlot.owner = parked;
+		t.close();
+	});
+	assert(interrupted);
 }
 
 unittest  // close() sets closing(), which the post-connect re-check in the stream readers observes
