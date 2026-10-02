@@ -23,8 +23,8 @@ import mcp.server.task_store : TaskStore, InMemoryTaskStore;
 import mcp.server.task_runtime : TaskRuntime, TaskOptions;
 import mcp.server.skill_index : SkillIndex;
 import mcp.protocol.tasks : TaskSupport;
-import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher,
-	InProcessTaskDispatcher, SyncTaskDispatcher, runTaskExecutor;
+import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher, InProcessTaskDispatcher,
+	SyncTaskDispatcher, runTaskExecutor, runTaskExecutorInline, tasksExtensionRequired;
 import mcp.server.push : PushChannel, ListenFilter;
 import mcp.server.pagination : pageBounds;
 import mcp.server.transport : ServerCore;
@@ -1299,9 +1299,10 @@ final class McpServer : ServerCore
 	/// fiber and return its result as an ordinary tool result: the synchronous
 	/// path `startTask` takes for a client that did not declare the Tasks
 	/// extension. A task record exists for the duration of the call, so the
-	/// executor sees the same `TaskContext` as when dispatched. A failed task surfaces as its
-	/// JSON-RPC error; one that needs client input cannot proceed without the
-	/// task surface and is reported as the missing extension.
+	/// executor sees the same `TaskContext` as when dispatched, except that
+	/// cancelling the request cancels the task and `detach` is refused. A failed
+	/// task surfaces as its JSON-RPC error; one that needs client input cannot
+	/// proceed without the task surface and is reported as the missing extension.
 	private CallToolResult runTaskToolInline(string name, Json args, RequestContext ctx) @safe
 	{
 		import mcp.protocol.tasks : TaskStatus;
@@ -1317,7 +1318,7 @@ final class McpServer : ServerCore
 			taskRuntime_.store.remove(seed.taskId);
 			taskRuntime_.setSilent(seed.taskId, false);
 		}
-		runTaskExecutor(taskRuntime_, seed.taskId, *exec);
+		runTaskExecutorInline(taskRuntime_, seed.taskId, *exec, () @safe => ctx.isCancelled());
 		auto detailed = taskRuntime_.getDetailed(seed.taskId);
 		const status = detailed["status"].get!string;
 		switch (status)
@@ -1332,23 +1333,12 @@ final class McpServer : ServerCore
 					("message" in e && e["message"].type == Json.Type.string) ? e["message"]
 						.get!string : "task failed", ("data" in e) ? e["data"] : Json.undefined);
 		case "input_required":
-			throw missingRequiredClientCapability(tasksRequiredCapabilities(),
+			throw tasksExtensionRequired(
 					"The tool needs client input, which requires the Tasks extension");
 		default:
 			throw internalError(
 					"task '" ~ seed.taskId ~ "' did not settle synchronously (" ~ status ~ ")");
 		}
-	}
-
-	/// The `data.requiredCapabilities` of a -32021 for the Tasks extension:
-	/// `{ extensions: { "io.modelcontextprotocol/tasks": {} } }`.
-	private static ClientCapabilities tasksRequiredCapabilities() @safe
-	{
-		ClientCapabilities c;
-		Json ext = Json.emptyObject;
-		ext[tasksExtensionKey] = Json.emptyObject;
-		c.extensions = ext;
-		return c;
 	}
 
 	/// Whether a request on `ver` whose client declared `caps` can receive a task
@@ -2866,7 +2856,7 @@ final class McpServer : ServerCore
 	private void requireTasksDeclared(Json params) @safe
 	{
 		if (!declaresTasksExtension(RequestMeta.fromParams(params).clientCapabilities))
-			throw missingRequiredClientCapability(tasksRequiredCapabilities(),
+			throw tasksExtensionRequired(
 					"The tasks methods require the " ~ tasksExtensionKey ~ " extension");
 	}
 
@@ -3680,8 +3670,8 @@ final class McpServer : ServerCore
 		// tool that requires the extension is rejected with -32021 naming it; any
 		// other tool's handler runs, and `startTask` runs its executor inline.
 		if (entry.taskSupport == TaskSupport.required && !acceptsTasks(declared, ver))
-			throw missingRequiredClientCapability(tasksRequiredCapabilities(),
-					"This tool requires the " ~ tasksExtensionKey ~ " extension");
+			throw tasksExtensionRequired("This tool requires the " ~ tasksExtensionKey
+					~ " extension");
 		// Validate the supplied arguments against the tool's declared inputSchema
 		// before dispatch (spec: server/tools § Security Considerations,
 		// "Servers MUST: Validate all tool inputs"). Per § Error Handling, an
@@ -3711,7 +3701,7 @@ final class McpServer : ServerCore
 			// A task handle is only meaningful to a client that declared the
 			// Tasks extension, whichever way the handler built it.
 			if (response.isTask && !acceptsTasks(declared, ver))
-				throw missingRequiredClientCapability(tasksRequiredCapabilities(),
+				throw tasksExtensionRequired(
 						"This tool requires the " ~ tasksExtensionKey ~ " extension");
 			// MRTR: an InputRequiredResult MUST NOT ask the client for an
 			// input kind it never declared. Drop any unsupported inputRequests
@@ -7958,8 +7948,8 @@ unittest  // tasks/update with no or empty inputResponses is -32602 and re-runs 
 			Json(["name": Json("ask2"), "arguments": Json.emptyObject]))).get;
 	const id = created["result"]["taskId"].get!string;
 	foreach (i, body_; [
-			taskUpdate(id, Json.undefined), taskUpdate(id, Json.emptyObject)
-		])
+		taskUpdate(id, Json.undefined), taskUpdate(id, Json.emptyObject)
+	])
 	{
 		auto resp = s.handle(modernReq(2 + cast(long) i, "tasks/update", body_)).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
@@ -8308,6 +8298,44 @@ unittest  // a task tool that requires the extension rejects a client without it
 	auto ok = s.handle(modernReq(2, "tools/call",
 			Json(["name": Json("must-task"), "arguments": Json.emptyObject]))).get;
 	assert(ok["result"]["resultType"].get!string == "task");
+}
+
+unittest  // an inline task tool observes its request's cancellation through tc.cancelRequested
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	Tool desc;
+	desc.name = "slow";
+	desc.inputSchema = Json(["type": Json("object")]);
+	bool saw;
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		assert(!tc.cancelRequested());
+		Json p = Json.emptyObject;
+		p["requestId"] = 42;
+		s.handle(Message(makeNotification("notifications/cancelled", p)));
+		saw = tc.cancelRequested();
+		return Json(["content": Json.emptyArray]);
+	});
+	auto resp = s.handle(req(42, "tools/call", Json([
+		"name": Json("slow"),
+		"arguments": Json.emptyObject
+	])));
+	assert(saw, "the executor must see the request's cancellation");
+	assert(resp.isNull, "no response is sent for a cancelled request");
+}
+
+unittest  // an inline task tool cannot detach: the client gets -32021 naming the extension
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	Tool desc;
+	desc.name = "handoff";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe => tc.detach());
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("handoff"), "arguments": Json.emptyObject]))).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.missingRequiredClientCapability);
+	assert(tasksExtensionKey in resp["error"]["data"]["requiredCapabilities"]["extensions"]);
 }
 
 unittest  // a handler-built task result is rejected with -32021 for a client without the extension

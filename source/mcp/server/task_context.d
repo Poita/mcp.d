@@ -3,6 +3,7 @@ module mcp.server.task_context;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json, serializeToJson, deserializeJson;
 
+import mcp.protocol.capabilities : tasksExtensionKey;
 import mcp.protocol.errors : McpException, ErrorCode;
 import mcp.protocol.mrtr : InputRequest, inputRequestsToJson;
 import mcp.server.task_runtime : TaskRuntime;
@@ -55,6 +56,9 @@ struct TaskContext
 	private TaskRuntime rt_;
 	private string taskId_;
 	private DispatchOutcome outcome_;
+	// Set when the executor runs inline on the calling request (a client
+	// without the Tasks extension): that request's cancellation state.
+	private bool delegate() @safe requestCancelled_;
 
 	this(TaskRuntime rt, string taskId) @safe
 	{
@@ -85,9 +89,12 @@ struct TaskContext
 
 	/// Whether the client has requested cancellation. Executors should poll this
 	/// at safe points and stop promptly; the dispatcher marks the task `cancelled`
-	/// when an executor returns with this set.
+	/// when an executor returns with this set. For an executor running inline on
+	/// a `tools/call`, cancelling that request cancels the task.
 	bool cancelRequested() @safe
 	{
+		if (requestCancelled_ !is null && requestCancelled_())
+			rt_.cancel(taskId_);
 		return rt_.cancelRequested(taskId_);
 	}
 
@@ -165,8 +172,15 @@ struct TaskContext
 	/// so no fiber is held — any node can later complete the task from the store.
 	/// Never returns — its `noreturn` result type lets an executor write
 	/// `return tc.detach();` from a value-returning method.
+	///
+	/// An executor running inline (the client did not declare the Tasks
+	/// extension) has no task the client could later observe, so `detach` throws
+	/// a -32021 `McpException` naming the extension instead.
 	noreturn detach() @safe
 	{
+		if (requestCancelled_ !is null)
+			throw tasksExtensionRequired("The tool finishes out of band, which requires the "
+					~ tasksExtensionKey ~ " extension");
 		rt_.markDetached(taskId_);
 		if (outcome_ !is null)
 			outcome_.unwound = true;
@@ -207,6 +221,38 @@ alias TaskExecutor = Json delegate(TaskContext tc) @safe;
 /// recorded (e.g. the store is unreachable).
 void runTaskExecutor(TaskRuntime rt, string taskId, TaskExecutor executor) @safe
 {
+	auto tc = TaskContext(rt, taskId);
+	drive(tc, executor);
+}
+
+/// `runTaskExecutor` for an executor running inline on the request that
+/// created the task: `requestCancelled` reports that request's cancellation,
+/// which cancels the task, and `TaskContext.detach` is refused.
+package(mcp) void runTaskExecutorInline(TaskRuntime rt, string taskId,
+		TaskExecutor executor, bool delegate() @safe requestCancelled) @safe
+{
+	auto tc = TaskContext(rt, taskId);
+	tc.requestCancelled_ = requestCancelled;
+	drive(tc, executor);
+}
+
+/// The -32021 error naming the Tasks extension as the missing client capability.
+package(mcp) McpException tasksExtensionRequired(string message) @safe
+{
+	import mcp.protocol.capabilities : ClientCapabilities;
+	import mcp.protocol.errors : missingRequiredClientCapability;
+
+	ClientCapabilities c;
+	Json ext = Json.emptyObject;
+	ext[tasksExtensionKey] = Json.emptyObject;
+	c.extensions = ext;
+	return missingRequiredClientCapability(c, message);
+}
+
+private void drive(ref TaskContext tc, TaskExecutor executor) @safe
+{
+	auto rt = tc.rt_;
+	const taskId = tc.taskId_;
 	// A task removed while its executor ran has no record left to settle.
 	void settleCancelled() @safe
 	{
@@ -214,13 +260,12 @@ void runTaskExecutor(TaskRuntime rt, string taskId, TaskExecutor executor) @safe
 			rt.markCancelled(taskId);
 	}
 
-	auto tc = TaskContext(rt, taskId);
 	try
 	{
 		auto result = executor(tc);
 		if (tc.outcome_.unwound)
 			return;
-		if (rt.cancelRequested(taskId))
+		if (tc.cancelRequested())
 			settleCancelled();
 		else
 			rt.complete(taskId, result);
@@ -237,7 +282,7 @@ void runTaskExecutor(TaskRuntime rt, string taskId, TaskExecutor executor) @safe
 	{
 		if (tc.outcome_.unwound)
 			return;
-		if (rt.cancelRequested(taskId))
+		if (tc.cancelRequested())
 			settleCancelled();
 		else
 			rt.fail(taskId, e);
@@ -246,7 +291,7 @@ void runTaskExecutor(TaskRuntime rt, string taskId, TaskExecutor executor) @safe
 	{
 		if (tc.outcome_.unwound)
 			return;
-		if (rt.cancelRequested(taskId))
+		if (tc.cancelRequested())
 			settleCancelled();
 		else
 			rt.fail(taskId, Json([
