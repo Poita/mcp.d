@@ -1808,14 +1808,16 @@ private void writeJsonRpcError(HTTPServerResponse res, HTTPStatus status, McpExc
 }
 
 /// Read a POST body of at most `maxBytes` as UTF-8. On failure a JSON-RPC error
-/// response has already been written — 413 for an oversized body, 400 with
-/// -32700 for invalid UTF-8 — and false is returned.
+/// response has already been written — 413 for an oversized body, 400 for a
+/// body that could not be read (a dropped connection, a malformed chunked
+/// encoding) or, with -32700, for invalid UTF-8 — and false is returned.
 private bool readPostBody(HTTPServerRequest req, HTTPServerResponse res,
 		size_t maxBytes, out string payload) @safe
 {
+	import std.algorithm : min;
 	import std.conv : to, ConvException;
 	import std.utf : validate, UTFException;
-	import vibe.stream.operations : readAll;
+	import vibe.core.stream : IOMode;
 	import vibe.utils.string : stripUTF8Bom;
 
 	auto tooLarge = invalidRequest("request body exceeds " ~ maxBytes.to!string ~ " bytes");
@@ -1835,10 +1837,25 @@ private bool readPostBody(HTTPServerRequest req, HTTPServerResponse res,
 	}
 	ubyte[] raw;
 	try
-		raw = req.bodyReader.readAll(maxBytes);
-	catch (Exception)
 	{
-		writeJsonRpcError(res, HTTPStatus.requestEntityTooLarge, tooLarge);
+		ubyte[4096] chunk;
+		auto body_ = req.bodyReader;
+		while (!body_.empty)
+		{
+			const n = cast(size_t) min(body_.leastSize, chunk.length);
+			body_.read(chunk[0 .. n], IOMode.all);
+			if (raw.length + n > maxBytes)
+			{
+				writeJsonRpcError(res, HTTPStatus.requestEntityTooLarge, tooLarge);
+				return false;
+			}
+			raw ~= chunk[0 .. n];
+		}
+	}
+	catch (Exception e)
+	{
+		writeJsonRpcError(res, HTTPStatus.badRequest,
+				invalidRequest("could not read the request body: " ~ e.msg));
 		return false;
 	}
 	auto text = () @trusted { return cast(string) raw; }();
@@ -4379,6 +4396,84 @@ unittest  // a POST body over maxRequestBytes is a 413 with a JSON-RPC error
 	auto res = postToMount(initializeBody(), null, opts, reply);
 	assert(res.statusCode == HTTPStatus.requestEntityTooLarge);
 	assert(parseJsonString(reply)["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+version (unittest) import vibe.core.stream : InputStream, IOMode;
+
+version (unittest) private final class FailingBodyStream : InputStream
+{
+@safe:
+	private bool failed;
+
+	bool empty()
+	{
+		return failed;
+	}
+
+	ulong leastSize()
+	{
+		return 8;
+	}
+
+	bool dataAvailableForRead()
+	{
+		return false;
+	}
+
+	const(ubyte)[] peek()
+	{
+		return null;
+	}
+
+	size_t read(scope ubyte[] dst, IOMode mode)
+	{
+		failed = true;
+		throw new Exception("connection reset by peer");
+	}
+}
+
+unittest  // a POST body that fails to read for a reason other than size is a 400, not a 413
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto router = new URLRouter;
+	mountMcp(router, new McpServer("t", "1"));
+	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"),
+			HTTPMethod.POST, new FailingBodyStream);
+	req.headers["Host"] = "127.0.0.1";
+	req.headers["Content-Type"] = "application/json";
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	assert(res.statusCode == HTTPStatus.badRequest);
+	const reply = () @trusted { return cast(string) sink.data.idup; }();
+	assert(parseJsonString(reply)["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // a chunked POST body that grows past maxRequestBytes is a 413
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	StreamableHttpOptions opts;
+	opts.maxRequestBytes = 16;
+	auto router = new URLRouter;
+	mountMcp(router, new McpServer("t", "1"), opts);
+	auto buf = () @trusted { return cast(ubyte[]) initializeBody().dup; }();
+	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"),
+			HTTPMethod.POST, createMemoryStream(buf, false));
+	req.headers["Host"] = "127.0.0.1";
+	req.headers["Content-Type"] = "application/json";
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	assert(res.statusCode == HTTPStatus.requestEntityTooLarge);
 }
 
 unittest  // a POST whose Content-Type is not application/json is a 415 with a JSON-RPC error
