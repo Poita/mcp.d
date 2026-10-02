@@ -213,6 +213,11 @@ package(mcp) JsonNode schemaNode(T, bool omitNull, Ancestors...)()
 	{
 		auto s = typeNode("array");
 		s.set("items", schemaNode!(typeof(T.init[0]), omitNull, Ancestors)());
+		static if (isStaticArray!T)
+		{
+			s.set("minItems", JsonNode(long(T.length)));
+			s.set("maxItems", JsonNode(long(T.length)));
+		}
 		return s;
 	}
 	else static if (isAssociativeArray!T && isSomeString!(KeyType!T))
@@ -534,6 +539,15 @@ unittest  // bindJson rejects an object missing an undefaulted floating-point fi
 	}
 
 	assertThrown!BindException(bindJson!S(parseJsonString(`{}`)));
+}
+
+unittest  // a static array schema pins its length with minItems and maxItems
+{
+	auto s = schemaOf!(int[3], true)();
+	assert(s["type"].get!string == "array");
+	assert(s["minItems"].get!long == 3, s.toString);
+	assert(s["maxItems"].get!long == 3, s.toString);
+	assert("minItems" !in schemaOf!(int[], true)());
 }
 
 unittest  // an undefaulted struct field whose struct type has a defaulted member is required
