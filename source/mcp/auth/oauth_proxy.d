@@ -37,11 +37,9 @@ import std.string : endsWith, indexOf, startsWith;
 import vibe.data.json : Json;
 
 import mcp.auth.oauth : AuthorizationServerMetadata, ClientIdMetadataDocument,
-	ProtectedResourceMetadata,
 	RegisteredClient, TokenEndpointAuthMethod, TokenSet, basicAuthHeader,
-	buildAuthCodeTokenForm,
-	buildAuthorizationUrl,
-	buildRefreshTokenForm, isValidClientIdMetadataUrl, requireSecureUrl, secureRequestHTTP;
+	buildAuthCodeTokenForm, buildAuthorizationUrl, buildRefreshTokenForm,
+	isValidClientIdMetadataUrl, requireSecureUrl, secureRequestHTTP;
 import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore, referenceTokenValidator;
 import mcp.protocol.ssrf : SsrfPolicy;
 import mcp.auth.resource_server : ResourceServerConfig, TokenInfo,
@@ -282,17 +280,6 @@ AuthorizationServerMetadata authorizationServerMetadata(const OAuthProxyConfig c
 	m.tokenEndpointAuthMethodsSupported = ["none"];
 	m.responseTypesSupported = ["code"];
 	m.clientIdMetadataDocumentSupported = cfg.clientIdMetadataDocumentSupported;
-	return m;
-}
-
-/// The RFC 9728 Protected Resource Metadata the proxy publishes: it names the
-/// proxy itself as the sole authorization server for the MCP resource.
-ProtectedResourceMetadata protectedResourceMetadata(const OAuthProxyConfig cfg) @safe
-{
-	ProtectedResourceMetadata m;
-	m.resource = cfg.resource;
-	m.authorizationServers = [stripTrailingSlash(cfg.baseUrl)];
-	m.scopesSupported = cfg.scopesSupported.dup;
 	return m;
 }
 
@@ -1116,12 +1103,6 @@ final class OAuthProxy
 		return authorizationServerMetadataJson(cfg);
 	}
 
-	/// The RFC 9728 PRM document to serve at the protected-resource well-known.
-	ProtectedResourceMetadata resourceMetadata() const @safe
-	{
-		return protectedResourceMetadata(cfg);
-	}
-
 	/// Handle a DCR (`/register`) request: persist the exact client
 	/// `redirect_uris` into the registry (so a later `/authorize` can be checked
 	/// against them) and return the registration response. The fixed upstream
@@ -1831,7 +1812,7 @@ unittest  // a custom grant_types_supported override flows into the published AS
 unittest  // PRM names the proxy itself as the authorization server
 {
 	auto cfg = sampleConfig();
-	auto m = protectedResourceMetadata(cfg);
+	auto m = cfg.toResourceServer().metadata();
 	assert(m.resource == "https://mcp.example.com/mcp");
 	assert(m.authorizationServers == ["https://mcp.example.com"]);
 }
