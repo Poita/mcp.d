@@ -562,6 +562,10 @@ final class PushHandle
 /// Server-side events lifecycle. Construction is via `McpServer.enableEvents`.
 final class EventsRuntime
 {
+	/// Send a throwing check's own message on a push stream's error frame rather
+	/// than a generic "Internal error". Set by `McpServer.exposeInternalErrors`.
+	bool exposeInternalErrors;
+
 	private EventRegistration[string] types_;
 	private EmitBuffer buffer_;
 	private WebhookSubscriptionStore webhookStore_;
@@ -1226,6 +1230,7 @@ final class EventsRuntime
 					Nullable!long.init, Nullable!long.init);
 		catch (Exception e)
 		{
+			logEventsError("push stream check threw", e);
 			deliverCheckError(s, e);
 			return;
 		}
@@ -1240,10 +1245,11 @@ final class EventsRuntime
 
 	// Report a check that threw on a push stream as a recoverable
 	// `notifications/events/error`; the stream stays open.
-	private static void deliverCheckError(PushStream s, Exception e) @safe
+	private void deliverCheckError(PushStream s, Exception e) @safe
 	{
 		auto mcp = cast(McpException) e;
-		Json err = mcp !is null ? toErrorJson(mcp) : toErrorJson(internalError(e.msg));
+		Json err = mcp !is null ? toErrorJson(mcp) : toErrorJson(
+				internalError(exposeInternalErrors ? e.msg : "Internal error"));
 		s.deliver(eventsErrorNotification,
 				withSubscriptionId(eventErrorParams(err), s.subscriptionId));
 	}
@@ -3895,12 +3901,28 @@ unittest  // advancePushStream delivers a recoverable error frame when the check
 	rt.advancePushStream(handle.stream);
 	assert(methods == [eventsErrorNotification]);
 	assert(params[0]["error"]["code"].get!int == -32603);
-	assert(params[0]["error"]["message"].get!string == "Gmail API 503");
+	assert(params[0]["error"]["message"].get!string == "Internal error");
 	assert(params[0]["_meta"][subscriptionIdMetaKey].get!int == 7);
 	fail = false;
 	rt.advancePushStream(handle.stream); // still open: the next advance delivers
 	assert(methods[$ - 1] == eventsEventNotification);
 	assert(handle.stream.cursor.get == "c1");
+	handle.close();
+}
+
+unittest  // a throwing check's message reaches a push stream only when internal errors are exposed
+{
+	auto rt = testRuntime();
+	rt.exposeInternalErrors = true;
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe { throw new Exception("Gmail API 503"); };
+	rt.register(reg);
+	Json[] params;
+	auto handle = openLive(rt, "email.received", Json.emptyObject, "u",
+			Json(7), (string m, Json p) @safe { params ~= p; });
+	rt.advancePushStream(handle.stream);
+	assert(params[0]["error"]["message"].get!string == "Gmail API 503");
 	handle.close();
 }
 

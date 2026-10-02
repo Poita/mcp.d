@@ -715,6 +715,8 @@ final class McpServer : ServerCore
 	void exposeInternalErrors() @safe
 	{
 		exposeInternalErrors_ = true;
+		if (eventsRuntime_ !is null)
+			eventsRuntime_.exposeInternalErrors = true;
 	}
 
 	/// The JSON-RPC error a non-`McpException` thrown while serving `method`
@@ -1412,6 +1414,7 @@ final class McpServer : ServerCore
 		if (eventsRuntime_ !is null)
 			eventsRuntime_.stopDeliveryWorker();
 		eventsRuntime_ = new EventsRuntime(store, opts);
+		eventsRuntime_.exposeInternalErrors = exposeInternalErrors_;
 		eventsRuntime_.onListChanged(() @safe {
 			notify(eventsListChangedNotification);
 		});
@@ -12078,4 +12081,16 @@ unittest  // clientCanSatisfy: samplingContext alone implies sampling capability
 	InputRequest r = InputRequest("s1", "sampling", Json.emptyObject);
 	auto kept = McpServer.supportedInputRequests([r], declared);
 	assert(kept.length == 1, "samplingContext must imply sampling for clientCanSatisfy");
+}
+
+unittest  // McpServer.exposeInternalErrors reaches the events runtime in either call order
+{
+	auto before = McpServer.stateless("t", "1");
+	before.exposeInternalErrors();
+	assert(before.enableEvents().exposeInternalErrors);
+	auto after = McpServer.stateless("t", "1");
+	auto rt = after.enableEvents();
+	assert(!rt.exposeInternalErrors);
+	after.exposeInternalErrors();
+	assert(rt.exposeInternalErrors);
 }
