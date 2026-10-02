@@ -1189,12 +1189,21 @@ final class ServerPushChannel : PushChannel
 		}();
 	}
 
+	/// An event published on a POST-initiated stream: its SSE frame, and whether
+	/// a GET listener that resumed the stream received it.
+	struct StreamEvent
+	{
+		string frame;
+		bool forwarded;
+	}
+
 	/// Frame `msg` as the next event of the POST-initiated stream `ordinal`,
 	/// record it for replay, and forward it to a GET listener that has resumed the
-	/// stream. Returns the frame for the caller to write to the POST response. The
-	/// frame is recorded before the POST write is attempted, so an event produced
+	/// stream. Returns the frame and whether it was forwarded; the caller writes an
+	/// unforwarded frame to the POST response, since a resumed stream replaces the
+	/// POST one. The frame is recorded before either write, so an event produced
 	/// after the client dropped the POST stream is still replayed on resume.
-	string publishStreamEvent(long ordinal, string owner, Json msg) @safe
+	StreamEvent publishStreamEvent(long ordinal, string owner, Json msg) @safe
 	{
 		import std.conv : to;
 
@@ -1224,7 +1233,7 @@ final class ServerPushChannel : PushChannel
 							break;
 						}
 					if (target.isNull)
-						return allocate();
+						return StreamEvent(allocate(), false);
 				}
 				auto l = target.get;
 				synchronized (l.writeMtx)
@@ -1244,7 +1253,7 @@ final class ServerPushChannel : PushChannel
 						synchronized (mtx)
 							removeListenerLocked(l.id);
 					}
-					return frame;
+					return StreamEvent(frame, true);
 				}
 			}
 		}();
@@ -2311,6 +2320,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	private ServerPushChannel replay_;
 	// Set once a write to the response fails; later frames skip the socket.
 	private bool disconnected_;
+	// Set once a GET listener resumes this stream; later frames go only to it.
+	private bool resumedElsewhere_;
 	private TaskMutex writeMtx_;
 
 	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
@@ -2477,10 +2488,18 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 			synchronized (writeMtx_)
 			{
 				beginStream();
-				const frame = replay_ !is null ? replay_.publishStreamEvent(streamId,
-						token_, msg) : formatSseEvent(nextEventId(), msg);
+				string frame;
+				if (replay_ !is null)
+				{
+					const ev = replay_.publishStreamEvent(streamId, token_, msg);
+					frame = ev.frame;
+					resumedElsewhere_ = resumedElsewhere_ || ev.forwarded;
+				}
+				else
+					frame = formatSseEvent(nextEventId(), msg);
 				eventSeq++;
-				writeFrame(frame);
+				if (!resumedElsewhere_)
+					writeFrame(frame);
 			}
 		}();
 	}
@@ -3774,4 +3793,35 @@ unittest  // a live POST stream keeps its event ids monotonic after its replay h
 	ctx.log("info", Json("second"));
 	const body_ = () @trusted { return cast(string) sink.data.idup; }();
 	assert(body_.canFind("id: " ~ ordinal ~ "-2\n"), body_);
+}
+
+unittest  // events after a GET resumes a live POST stream go only to the GET stream
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.versions : ProtocolVersion;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
+			TokenInfo.invalid(), false, ProtocolVersion.v2025_11_25, "sess-A");
+	ctx.enableReplay(ch);
+	const primingId = ctx.nextEventId();
+	ctx.log("info", Json("before-resume"));
+
+	string[] resumed;
+	ch.addListener((string f) @safe { resumed ~= f; }, Json.init,
+			ListenFilter.init, primingId, null, "sess-A");
+	ctx.log("info", Json("after-resume"));
+	ctx.finishWith(makeResponse(Json(3), Json.emptyObject));
+
+	assert(resumed.length == 3 && resumed[1].canFind("after-resume"));
+	const body_ = () @trusted { return cast(string) sink.data.idup; }();
+	assert(body_.canFind("before-resume"));
+	assert(!body_.canFind("after-resume"), "the resumed event is duplicated on the POST stream");
+	assert(!body_.canFind("\"id\":3"));
 }
