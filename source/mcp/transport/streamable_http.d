@@ -85,10 +85,18 @@ struct StreamableHttpOptions
 	string path = "/mcp"; /// the single MCP endpoint path
 	string[] bindAddresses = ["127.0.0.1"]; /// addresses to bind
 
-	/// DNS-rebinding protection: reject requests whose Host/Origin is not a
-	/// recognized localhost value (or in the explicit allow-lists below). On by
-	/// default per the MCP transport security guidance; disable when fronting
-	/// the server with a trusted reverse proxy.
+	/// DNS-rebinding protection, part 1: reject a request whose `Host` is not a
+	/// localhost value or in `allowedHosts`. On by default. Prefer listing the
+	/// public hostname in `allowedHosts`; disable only behind a trusted reverse
+	/// proxy that already restricts `Host`. With it off, the 401 challenge's
+	/// `resource_metadata` URL comes from `auth.resource` rather than the
+	/// client-supplied `Host`.
+	bool validateHost = true;
+	/// DNS-rebinding protection, part 2: reject a request carrying an `Origin`
+	/// that is not a localhost origin or in `allowedOrigins` (MCP transport
+	/// security: servers MUST validate `Origin`). On by default and independent
+	/// of `validateHost`, so it keeps protecting browser callers behind a proxy.
+	/// Requests without an `Origin` (non-browser clients) are unaffected.
 	bool validateOrigin = true;
 	string[] allowedHosts = []; /// extra Host header values to accept
 	/// Extra Origin header values to accept. Requests from these origins, and
@@ -1195,25 +1203,20 @@ string formatLegacyMessageEventRaw(string jsonText) @safe
 private bool guardOrigin(scope HTTPServerRequest req, scope HTTPServerResponse res,
 		StreamableHttpOptions opts) @safe
 {
-	if (opts.validateOrigin)
+	// HTTP/1.1 mandates a Host header; an absent (or disallowed) Host is rejected
+	// so a request carrying neither Host nor Origin cannot fall through the guard.
+	if (opts.validateHost && !hostAllowed(req.headers.get("Host", ""), opts.allowedHosts))
 	{
-		const host = req.headers.get("Host", "");
-		const origin = req.headers.get("Origin", "");
-
-		// HTTP/1.1 mandates a Host header; an absent (or disallowed) Host is rejected
-		// so a request carrying neither Host nor Origin cannot fall through the guard.
-		if (!hostAllowed(host, opts.allowedHosts))
-		{
-			res.statusCode = HTTPStatus.forbidden;
-			res.writeBody("Forbidden: Host not allowed", "text/plain");
-			return false;
-		}
-		if (origin.length && !originAllowed(origin, opts.allowedOrigins))
-		{
-			res.statusCode = HTTPStatus.forbidden;
-			res.writeBody("Forbidden: Origin not allowed", "text/plain");
-			return false;
-		}
+		res.statusCode = HTTPStatus.forbidden;
+		res.writeBody("Forbidden: Host not allowed", "text/plain");
+		return false;
+	}
+	const origin = req.headers.get("Origin", "");
+	if (opts.validateOrigin && origin.length && !originAllowed(origin, opts.allowedOrigins))
+	{
+		res.statusCode = HTTPStatus.forbidden;
+		res.writeBody("Forbidden: Origin not allowed", "text/plain");
+		return false;
 	}
 	applyCorsHeaders(req, res, opts);
 	return true;
@@ -1252,7 +1255,7 @@ private void mountCorsPreflight(URLRouter router, string path, string methods,
 		import std.algorithm : splitter, startsWith;
 		import std.string : strip, toLower;
 
-		if (opts.validateOrigin && !hostAllowed(req.headers.get("Host", ""), opts.allowedHosts))
+		if (opts.validateHost && !hostAllowed(req.headers.get("Host", ""), opts.allowedHosts))
 			return;
 		const origin = corsOrigin(req, opts);
 		if (origin.length == 0)
@@ -1316,10 +1319,10 @@ private bool guardAuth(scope HTTPServerRequest req, scope HTTPServerResponse res
 /// The raw Host header is client-controlled and is reflected verbatim into the
 /// `WWW-Authenticate: ... resource_metadata="..."` challenge, so it is NOT trusted
 /// unconditionally:
-///   - When origin validation is disabled (`validateOrigin == false`, the trusted-
+///   - When Host validation is disabled (`validateHost == false`, the trusted-
 ///     reverse-proxy mode), the configured `resource` origin is preferred as the
 ///     primary source so an attacker-supplied Host cannot steer RFC 9728 discovery.
-///   - A Host that does not satisfy the host/port grammar (or, under enabled origin
+///   - A Host that does not satisfy the host/port grammar (or, under enabled Host
 ///     validation, the allow-list) is rejected before interpolation, so it can never
 ///     break out of the quoted-string or redirect discovery.
 /// `wwwAuthenticate` additionally percent-encodes any residual quoted-string-illegal
@@ -1334,14 +1337,14 @@ private string resourceMetadataUrl(scope HTTPServerRequest req, StreamableHttpOp
 	// configured. In validated mode the Host already cleared the allow-list guard,
 	// so the request's own origin is used. Either way a Host that does not satisfy
 	// the host/port grammar (validated mode: the allow-list) is never interpolated.
-	if (!opts.validateOrigin)
+	if (!opts.validateHost)
 	{
 		if (auto fromResource = resourceOrigin(opts.auth.resource))
 			return fromResource ~ ProtectedResourceMetadataPath;
 	}
 
 	const host = req.headers.get("Host", "");
-	const hostUsable = host.length && (opts.validateOrigin ? hostAllowed(host,
+	const hostUsable = host.length && (opts.validateHost ? hostAllowed(host,
 			opts.allowedHosts) : isAllowedHostGrammar(host));
 	if (hostUsable)
 	{
@@ -6049,6 +6052,31 @@ unittest  // CORS: a response to an allowed origin exposes Mcp-Session-Id and WW
 	const exposed = res.headers.get("Access-Control-Expose-Headers", "");
 	assert(exposed.canFind("Mcp-Session-Id") && exposed.canFind("WWW-Authenticate"));
 	assert(res.headers.get("Vary", "").canFind("Origin"));
+}
+
+unittest  // with Host validation off (behind a proxy) a foreign Origin is still refused
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.validateHost = false;
+	mountMcp(router, server, opts);
+
+	auto proxied = corsRequest(router, HTTPMethod.POST, [
+		"Host": "mcp.example.com",
+		"Content-Type": "application/json",
+		"Accept": "application/json, text/event-stream",
+	], initializeBody());
+	assert(proxied.statusCode == 200, "an unlisted Host passes when Host validation is off");
+
+	auto rebound = corsRequest(router, HTTPMethod.POST,
+			[
+				"Host": "mcp.example.com",
+				"Origin": "https://evil.example.com",
+				"Content-Type": "application/json",
+				"Accept": "application/json, text/event-stream",
+	], initializeBody());
+	assert(rebound.statusCode == 403, "Origin validation stays on independently of Host validation");
 }
 
 unittest  // CORS: disallowed and absent origins get no CORS headers and no preflight

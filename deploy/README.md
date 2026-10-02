@@ -87,7 +87,9 @@ For the container to be reachable on a PaaS, the server must:
    ```
 
    (Leave the guard on and allow-list the host; only disable
-   `validateOrigin` if you front the server with a trusted proxy.)
+   `validateHost` if you front the server with a trusted proxy that already
+   restricts `Host`. Keep `validateOrigin` on: it is the browser-facing half of
+   the DNS-rebinding guard and works the same behind a proxy.)
 
 ## fly.io
 
