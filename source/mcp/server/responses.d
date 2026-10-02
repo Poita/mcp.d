@@ -1,4 +1,5 @@
-/// The tool/prompt handler outcome DTOs returned by `McpServer` handlers.
+/// The handler signatures `McpServer` registers and the outcome DTOs its tool
+/// and prompt handlers return.
 ///
 /// `ToolResponse` and `PromptResponse` are the values a handler returns: either
 /// a final result, or — on a stateless (MRTR) request — a set of `InputRequest`s
@@ -10,7 +11,7 @@ import vibe.data.json : Json;
 
 import mcp.protocol.errors : internalError;
 import mcp.protocol.versions : ProtocolVersion, isModern, usesMRTR;
-import mcp.protocol.types : CallToolResult, GetPromptResult, Content;
+import mcp.protocol.types : CallToolResult, GetPromptResult, Content, ResourceContents;
 import mcp.protocol.mrtr : InputRequest, InputRequiredResult;
 import mcp.server.context : RequestContext;
 
@@ -23,17 +24,37 @@ alias ToolHandler = CallToolResult delegate(Json arguments, RequestContext ctx) 
 /// more input instead of returning a final result. See `ToolResponse`.
 alias MrtrToolHandler = ToolResponse delegate(Json arguments, RequestContext ctx) @safe;
 
+/// A prompt handler receiving the raw `Json arguments` and the per-request
+/// `RequestContext`, always producing a final result. See `MrtrPromptHandler`
+/// for one that may ask the client for more input.
+alias PromptHandler = GetPromptResult delegate(Json arguments, RequestContext ctx) @safe;
+
+/// A prompt handler that may, on a stateless (MRTR) modern request, ask the client
+/// for more input instead of returning a final result. See `PromptResponse`.
+alias MrtrPromptHandler = PromptResponse delegate(Json arguments, RequestContext ctx) @safe;
+
+/// A direct resource reader receiving the per-request `RequestContext` (so it
+/// can log, observe cancellation, or elicit through the real request channel).
+/// It returns every content item of the `resources/read` result.
+alias ResourceReader = ResourceContents[]delegate(RequestContext ctx) @safe;
+
+/// A resource template reader receiving the concrete URI, the captured `{var}`
+/// parameters, and the per-request `RequestContext` (so a template handler can
+/// log, observe cancellation, or elicit through the real request channel).
+/// It returns every content item of the `resources/read` result.
+alias TemplateReader = ResourceContents[]delegate(string uri,
+		string[string] params, RequestContext ctx) @safe;
+
 /// The MRTR (input-required) machinery shared by `ToolResponse` and
 /// `PromptResponse`: the `needsInput_`/`required_` state, the
 /// `needsInput`/`inputRequests`/`requestState` accessors, the `inputRequired`
 /// factories (verbatim and typed `requestState`), and
-/// `withInputRequests`/`toJson`. Both response types carry an
-/// `InputRequiredResult required_` plus a `result_` final result of their
-/// respective type; `toJson` switches on `needsInput_`. The mixin keeps these in
-/// lockstep so MRTR edits land on both. The genuine divergences —
-/// `ToolResponse`'s task outcome and typed `complete(T)` helper — stay
-/// per-struct.
-mixin template InputRequiredPart()
+/// `withInputRequests`. Both response types carry an `InputRequiredResult
+/// required_` plus a `result_` final result of their respective type. The mixin
+/// keeps these in lockstep so MRTR edits land on both. The genuine divergences —
+/// `ToolResponse`'s task outcome and typed `complete(T)` helper, and each
+/// type's `toJson` — stay per-struct.
+private mixin template InputRequiredPart()
 {
 	private bool needsInput_;
 	private InputRequiredResult required_;
@@ -102,13 +123,6 @@ mixin template InputRequiredPart()
 	{
 		return typeof(this).inputRequired(reqs, required_.requestState);
 	}
-
-	/// The JSON-RPC `result` payload (the final result, or an
-	/// `InputRequiredResult`).
-	Json toJson() const @safe
-	{
-		return needsInput_ ? required_.toJson() : result_.toJson();
-	}
 }
 
 /// The outcome of a tool call: either the final `CallToolResult`, or — on a
@@ -166,8 +180,7 @@ struct ToolResponse
 	private Json taskResult_;
 
 	/// The JSON-RPC `result` payload: the verbatim `CreateTaskResult` for a task
-	/// outcome, else the `InputRequiredResult` or final `CallToolResult`. Shadows
-	/// the mixed-in `toJson` to add the task case.
+	/// outcome, else the `InputRequiredResult` or final `CallToolResult`.
 	Json toJson() const @safe
 	{
 		if (isTask_)
@@ -223,6 +236,13 @@ struct PromptResponse
 		return p;
 	}
 
+	/// The JSON-RPC `result` payload (the final result, or an
+	/// `InputRequiredResult`).
+	Json toJson() const @safe
+	{
+		return needsInput_ ? required_.toJson() : result_.toJson();
+	}
+
 	/// Project the final `GetPromptResult` to the negotiated protocol version so
 	/// version-gated message content (audio/resource_link/tool_use/tool_result
 	/// plus content-level `_meta`/`lastModified`) is not emitted to peers that do
@@ -241,10 +261,6 @@ struct PromptResponse
 		return PromptResponse.complete(result_.forVersion(v));
 	}
 }
-
-/// A prompt handler that may, on a stateless (MRTR) modern request, ask the client
-/// for more input instead of returning a final result. See `PromptResponse`.
-alias MrtrPromptHandler = PromptResponse delegate(Json arguments, RequestContext ctx) @safe;
 
 unittest  // PromptResponse.forVersion rejects an input-required result on a non-MRTR session
 {

@@ -136,7 +136,10 @@ unittest
 	static assert(visibleFromMcp!"ToolHandler");
 	static assert(visibleFromMcp!"MrtrToolHandler");
 	static assert(visibleFromMcp!"MrtrPromptHandler");
-	static assert(visibleFromMcp!"InputRequiredPart");
+	static assert(visibleFromMcp!"PromptHandler");
+	static assert(visibleFromMcp!"ResourceReader");
+	static assert(visibleFromMcp!"TemplateReader");
+	static assert(!visibleFromMcp!"InputRequiredPart");
 }
 
 // `mcp.server.server` does not re-export the handler-outcome DTOs; each symbol

@@ -33,8 +33,8 @@ import mcp.server.event_store : WebhookSubscriptionStore;
 import mcp.server.events_runtime : EventsRuntime, EventsOptions,
 	EventRegistration, PushHandle, PushStream;
 
-import mcp.server.responses : ToolHandler, MrtrToolHandler, InputRequiredPart,
-	ToolResponse, PromptResponse, MrtrPromptHandler;
+import mcp.server.responses : ToolHandler, MrtrToolHandler, ToolResponse,
+	PromptResponse, PromptHandler, MrtrPromptHandler, ResourceReader, TemplateReader;
 
 // The push-integration unittests below exercise the server seam against the
 // real Streamable HTTP channel; the library build itself has no transport
@@ -83,23 +83,6 @@ struct RegisteredResource
 	/// not cover these. Empty (the default) means no gating.
 	ClientCapabilities requiredClientCapabilities;
 }
-
-/// A direct resource reader receiving the per-request `RequestContext` (so it
-/// can log, observe cancellation, or elicit through the real request channel).
-/// It returns every content item of the `resources/read` result.
-alias ResourceReader = ResourceContents[]delegate(RequestContext ctx) @safe;
-
-/// A prompt handler receiving the raw `Json arguments` and the per-request
-/// `RequestContext`, always producing a final result. See `MrtrPromptHandler`
-/// for one that may ask the client for more input.
-alias PromptHandler = GetPromptResult delegate(Json arguments, RequestContext ctx) @safe;
-
-/// A resource template reader receiving the concrete URI, the captured `{var}`
-/// parameters, and the per-request `RequestContext` (so a template handler can
-/// log, observe cancellation, or elicit through the real request channel).
-/// It returns every content item of the `resources/read` result.
-alias TemplateReader = ResourceContents[]delegate(string uri,
-		string[string] params, RequestContext ctx) @safe;
 
 /// A registered resource template: descriptor + reader receiving the concrete
 /// URI, the captured `{var}` parameters, and the per-request context.
