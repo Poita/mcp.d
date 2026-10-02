@@ -199,6 +199,10 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	}
 
 	channel = new DuplexChannel(readLine, writeLine, &onInbound, &onInboundBatch);
+	// Change notifications for a 2025-era client ride the same serialized writer.
+	server.attachStdioSink(&sink);
+	scope (exit)
+		server.attachStdioSink(null);
 
 	channel.runReadLoop();
 	readLoopDone = true;
@@ -1581,7 +1585,7 @@ version (unittest)
 {
 	import std.typecons : nullable;
 	import vibe.data.json : parseJsonString;
-	import mcp.protocol.types : Tool, CallToolResult, Content;
+	import mcp.protocol.types : Tool, CallToolResult, Content, Resource, ResourceContents;
 	import mcp.server.context : RequestContext;
 	import mcp.client.client : McpClient;
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
@@ -2209,6 +2213,115 @@ unittest  // background push: notify* with no request in flight reaches a stdio 
 	auto note = parseJsonString(outputs[1]);
 	assert(note["method"].get!string == "notifications/tools/list_changed");
 	assert("id" !in note);
+}
+
+version (unittest)
+{
+	// Feed a 2025-11-25 initialize + notifications/initialized handshake.
+	private void legacyHandshake(ServerLink link) @safe
+	{
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":` ~ `{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+		foreach (_; 0 .. 8)
+			yield();
+	}
+}
+
+unittest  // a 2025-era stdio client that subscribed to a resource receives notifications/resources/updated
+{
+	auto s = McpServer.stateful("legacy-srv", "1.0");
+	s.enableResourceSubscriptions();
+	s.registerResource(Resource("test://w", "w"), () @safe => ResourceContents.init);
+
+	string[] outputs;
+	size_t delivered, unsubscribed;
+	withServer(s, (ServerLink link) @safe {
+		legacyHandshake(link);
+		unsubscribed = s.notifyResourceUpdated("test://w");
+		link.feed(
+			`{"jsonrpc":"2.0","id":2,"method":"resources/subscribe","params":{"uri":"test://w"}}`);
+		foreach (_; 0 .. 8)
+			yield();
+		delivered = s.notifyResourceUpdated("test://w");
+		foreach (_; 0 .. 8)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	assert(unsubscribed == 0, "an unsubscribed URI must not be delivered");
+	assert(delivered == 1);
+	// initialize result, subscribe result, then the update.
+	assert(outputs.length == 3);
+	auto note = parseJsonString(outputs[2]);
+	assert(note["method"].get!string == "notifications/resources/updated");
+	assert(note["params"]["uri"].get!string == "test://w");
+	assert("_meta" !in note["params"], "a 2025-era notification carries no subscriptionId");
+}
+
+unittest  // a 2025-era stdio client receives list-changed notifications the server advertises
+{
+	auto s = McpServer.stateful("legacy-srv", "1.0");
+	s.enableToolsListChanged();
+
+	string[] outputs;
+	size_t tools, prompts;
+	withServer(s, (ServerLink link) @safe {
+		legacyHandshake(link);
+		tools = s.notifyToolsListChanged();
+		prompts = s.notifyPromptsListChanged();
+		foreach (_; 0 .. 8)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	assert(tools == 1);
+	assert(prompts == 0, "prompts.listChanged is not advertised");
+	assert(outputs.length == 2);
+	assert(parseJsonString(outputs[1])["method"].get!string == "notifications/tools/list_changed");
+}
+
+unittest  // notify() and notifyElicitationComplete reach a 2025-era stdio client
+{
+	auto s = McpServer.stateful("legacy-srv", "1.0");
+
+	string[] outputs;
+	size_t custom, complete;
+	withServer(s, (ServerLink link) @safe {
+		legacyHandshake(link);
+		Json p = Json.emptyObject;
+		p["x"] = 1;
+		custom = s.notify("notifications/custom", p);
+		complete = s.notifyElicitationComplete("", "e-1");
+		foreach (_; 0 .. 8)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	assert(custom == 1);
+	assert(complete == 1);
+	assert(outputs.length == 3);
+	assert(parseJsonString(outputs[1])["method"].get!string == "notifications/custom");
+	auto done = parseJsonString(outputs[2]);
+	assert(done["method"].get!string == "notifications/elicitation/complete");
+	assert(done["params"]["elicitationId"].get!string == "e-1");
+}
+
+unittest  // a stdio server writes no plain notifications before the 2025-era handshake
+{
+	auto s = McpServer.stateful("legacy-srv", "1.0");
+	s.enableToolsListChanged();
+
+	string[] outputs;
+	size_t delivered;
+	withServer(s, (ServerLink link) @safe {
+		delivered = s.notifyToolsListChanged();
+		foreach (_; 0 .. 8)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	assert(delivered == 0);
+	assert(outputs.length == 0);
 }
 
 version (unittest)

@@ -276,6 +276,11 @@ final class McpServer : ServerCore
 	// types/URIs that stream opted into. `ListenFilter.init` (inactive) until a
 	// stdio listen opens, so an unset sink is also a no-op.
 	private ListenFilter stdioListenFilter_;
+	// The stdio transport's raw-JSON-line write sink, installed by `serveStdio` for
+	// the life of the read loop. A 2025-era stdio client has no listen stream: it
+	// receives change notifications on the shared stdout channel once its
+	// stateful `initialize` handshake is processed (see `writeStdioPlain`).
+	private void delegate(string) @safe stdioSink_;
 	private bool toolListChangedEnabled;
 	private bool resourcesListChangedEnabled;
 	private bool promptsListChangedEnabled;
@@ -812,9 +817,11 @@ final class McpServer : ServerCore
 			throw invalidParams(method ~ " requires a non-empty elicitationId");
 		Json params = Json.emptyObject;
 		params["elicitationId"] = elicitationId;
-		if (pushChannel is null)
-			return 0;
-		return pushChannel.pushToSession(sessionId, method, params);
+		// stdio carries one implicit peer whose connection token is "".
+		size_t delivered = sessionId.length == 0 ? writeStdioPlain(method, params, "") : 0;
+		if (pushChannel !is null)
+			delivered += pushChannel.pushToSession(sessionId, method, params);
+		return delivered;
 	}
 
 	/// The client capabilities declared on the single bound connection (stdio /
@@ -1435,6 +1442,7 @@ final class McpServer : ServerCore
 	size_t notify(string method, Json params = Json.undefined) @safe
 	{
 		size_t delivered = writeStdioListen(method, params);
+		delivered += writeStdioPlain(method, params, resourceUriOf(method, params));
 		if (pushChannel !is null)
 			delivered += pushChannel.notify(method, params);
 		return delivered;
@@ -1446,12 +1454,62 @@ final class McpServer : ServerCore
 	/// subscriptions). Returns the number of streams reached (0 or 1).
 	private size_t writeStdioListen(string method, Json params) @safe
 	{
-		string uri;
+		return writeStdioListen(method, params, resourceUriOf(method, params));
+	}
+
+	/// The resource URI a `notifications/resources/updated` is about, or "" for
+	/// any other notification.
+	private static string resourceUriOf(string method, Json params) @safe
+	{
 		if (method == "notifications/resources/updated" && params.type == Json.Type.object)
 			if (auto u = "uri" in params)
 				if (u.type == Json.Type.string)
-					uri = u.get!string;
-		return writeStdioListen(method, params, uri);
+					return u.get!string;
+		return "";
+	}
+
+	/// Install (or, with null, remove) the stdio transport's write sink. Called by
+	/// `serveStdio` around its read loop.
+	package(mcp) void attachStdioSink(void delegate(string) @safe sink) @safe
+	{
+		stdioSink_ = sink;
+	}
+
+	/// Write `method` unstamped to a 2025-era stdio client: one whose stateful
+	/// `initialize` has been processed on the bound connection (a stateful server
+	/// never speaks 2026-07-28, whose clients use `subscriptions/listen` instead).
+	/// Delivery follows the 2025-era rules: a list-changed notification only when
+	/// the server advertises that `listChanged` capability, and
+	/// `notifications/resources/updated` only for a URI the client subscribed to.
+	/// Returns the number of clients reached (0 or 1).
+	private size_t writeStdioPlain(string method, Json params, string uri) @safe
+	{
+		if (stdioSink_ is null || mode_ != ServerMode.stateful)
+			return 0;
+		auto conn = activeConnection;
+		if (!conn.initializeProcessed || conn.negotiated.isModern)
+			return 0;
+		if (!listChangedAdvertised(method) || !plainGetEligibleFor(conn, method, uri))
+			return 0;
+		stdioSink_(makeNotification(method, params).toString());
+		return 1;
+	}
+
+	/// Whether the server advertises the `listChanged` capability a list-changed
+	/// `method` belongs to; true for any other method.
+	private bool listChangedAdvertised(string method) @safe
+	{
+		switch (method)
+		{
+		case "notifications/tools/list_changed":
+			return toolListChangedEnabled;
+		case "notifications/resources/list_changed":
+			return resourcesListChangedEnabled;
+		case "notifications/prompts/list_changed":
+			return promptsListChangedEnabled;
+		default:
+			return true;
+		}
 	}
 
 	/// As `writeStdioListen(method, params)`, filtering on the given resource `uri`
@@ -1730,6 +1788,7 @@ final class McpServer : ServerCore
 		// The stdio transport has no `pushChannel`; its listen stream filters by
 		// its own per-URI `ListenFilter`.
 		size_t delivered = writeStdioListen(method, params, uri);
+		delivered += writeStdioPlain(method, params, uri);
 		if (pushChannel !is null)
 		{
 			// Listener-driven delivery: every open stream decides for itself.
