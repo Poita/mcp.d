@@ -57,6 +57,36 @@ struct Message
 	}
 }
 
+/// An envelope error for a request whose id is known, so the error reply
+/// carries that id rather than null (JSON-RPC 2.0 §5).
+class RequestEnvelopeException : McpException
+{
+	Json id; /// the offending request's id
+
+	this(int code, string message, Json data, Json id, string file = __FILE__, size_t line = __LINE__) @safe pure nothrow
+	{
+		super(code, message, data, file, line);
+		this.id = id;
+	}
+}
+
+/// The id for the error reply to a message that failed parsing or envelope
+/// validation with `e`: the request's id when one was determined, else null.
+Json errorReplyId(Exception e) @safe
+{
+	if (auto re = cast(RequestEnvelopeException) e)
+		return re.id;
+	return Json(null);
+}
+
+/// `e` rebound to the id of request `j` when `j` is a request, else `e` itself.
+private McpException requestError(Json j, McpException e) @safe
+{
+	if (("method" in j) && ("id" in j) && j["id"].type != Json.Type.null_)
+		return new RequestEnvelopeException(e.code, e.msg, e.data, j["id"]);
+	return e;
+}
+
 private void validateEnvelope(Json j) @safe
 {
 	if (j.type != Json.Type.object)
@@ -70,15 +100,6 @@ private void validateEnvelope(Json j) @safe
 	// yielding a clean -32600 across every transport.
 	if (("method" in j) && j["method"].type != Json.Type.string)
 		throw invalidRequest("`method` must be a string");
-	// JSON-RPC 2.0 §4.2: `params`, when present, MUST be a structured value
-	// (object or array); a primitive is an invalid request. MCP further defines
-	// every request's and notification's params as an object, so by-position
-	// (array) params are invalid params. Rejecting both here keeps every handler
-	// from having to guard against reading fields off a non-object.
-	if (("params" in j) && j["params"].type == Json.Type.array)
-		throw invalidParams("`params` must be an object");
-	if (("params" in j) && j["params"].type != Json.Type.object)
-		throw invalidRequest("`params` must be an object or array");
 	// A message bearing a `method` with an explicit `id:null` is neither a valid
 	// request (the spec requires a request id that is not null) nor a
 	// notification (which omits `id` entirely). Reject it so the peer receives a
@@ -104,6 +125,16 @@ private void validateEnvelope(Json j) @safe
 		if (v != cast(long) v)
 			throw invalidRequest("JSON-RPC id MUST NOT have a fractional part");
 	}
+	// JSON-RPC 2.0 §4.2: `params`, when present, MUST be a structured value
+	// (object or array); a primitive is an invalid request. MCP further defines
+	// every request's and notification's params as an object, so by-position
+	// (array) params are invalid params. Rejecting both here keeps every handler
+	// from having to guard against reading fields off a non-object. The id is
+	// valid by this point, so a request's error reply carries it.
+	if (("params" in j) && j["params"].type == Json.Type.array)
+		throw requestError(j, invalidParams("`params` must be an object"));
+	if (("params" in j) && j["params"].type != Json.Type.object)
+		throw requestError(j, invalidRequest("`params` must be an object or array"));
 	// Every JSON-RPC 2.0 message is exactly one of: request (has method + non-null id),
 	// notification (has method, no id), response (no method, has non-null id), or an
 	// error response with `id:null`, which JSON-RPC 2.0 §5 prescribes when the
@@ -590,6 +621,18 @@ unittest  // by-position (array) params are rejected with -32602 on requests and
 		auto ex = collectException!McpException(parseMessage(msg));
 		assert(ex !is null && ex.code == ErrorCode.invalidParams, msg);
 	}
+}
+
+unittest  // a params error carries a request's id and a null id for a notification
+{
+	import std.exception : collectException;
+
+	auto req = collectException!McpException(
+			parseMessage(`{"jsonrpc":"2.0","id":"a","method":"ping","params":7}`));
+	assert(req.code == ErrorCode.invalidRequest && errorReplyId(req) == Json("a"));
+	auto note = collectException!McpException(
+			parseMessage(`{"jsonrpc":"2.0","method":"notifications/x","params":[]}`));
+	assert(note.code == ErrorCode.invalidParams && errorReplyId(note).type == Json.Type.null_);
 }
 
 unittest  // a batch member with array params is reported as a -32602 member error

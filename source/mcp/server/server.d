@@ -2108,7 +2108,7 @@ final class McpServer : ServerCore
 		try
 			input = parseAny(text);
 		catch (McpException e)
-			return makeErrorResponse(Json(null), e).toString();
+			return makeErrorResponse(errorReplyId(e), e).toString();
 		catch (Exception e)
 			return makeErrorResponse(Json(null), parseError(e.msg)).toString();
 
@@ -2136,9 +2136,10 @@ final class McpServer : ServerCore
 				responses ~= resp.get;
 		}
 		// A malformed member of an otherwise-recognizable batch yields its own
-		// `id:null` error rather than discarding the valid members alongside it.
+		// error (carrying its id when known) rather than discarding the valid
+		// members alongside it.
 		foreach (err; input.errors)
-			responses ~= makeErrorResponse(Json(null), err.error);
+			responses ~= makeErrorResponse(errorReplyId(err.error), err.error);
 		return responses.length == 0 ? "" : responses.toString();
 	}
 
@@ -2157,8 +2158,8 @@ final class McpServer : ServerCore
 
 	private Nullable!Json handleRequest(Message msg, RequestContext ctx) @safe
 	{
-		// Every MCP request's params is an object; JSON-RPC by-position (array)
-		// or scalar params are malformed.
+		// Every MCP request's params is an object. Parsed wire messages are already
+		// validated, but `handle` also accepts a `Message` built in process.
 		if (msg.params.type != Json.Type.object)
 			return nullable(makeErrorResponse(msg.id, invalidParams("params must be an object")));
 
@@ -5650,6 +5651,44 @@ unittest  // handleRaw rejects a non-string method as -32600 instead of crashing
 	auto s = makeTestServer();
 	auto j = parseJsonString(s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":42}`));
 	assert(j["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // handleRaw answers by-position params with -32602 carrying the request id
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = makeTestServer();
+	auto j = parseJsonString(s.handleRaw(`{"jsonrpc":"2.0","id":7,"method":"ping","params":[]}`));
+	assert(j["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(j["id"] == Json(7));
+	auto k = parseJsonString(
+			s.handleRaw(`{"jsonrpc":"2.0","id":"r1","method":"ping","params":["x"]}`));
+	assert(k["id"] == Json("r1"));
+}
+
+unittest  // a batch member with by-position params is answered with its own id
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = makeTestServer();
+	auto conn = new ConnectionState;
+	conn.negotiated = ProtocolVersion.v2025_03_26;
+	auto resp = parseJsonString(
+			s.handleRaw(`[{"jsonrpc":"2.0","id":4,"method":"ping","params":[]},`
+			~ `{"jsonrpc":"2.0","id":5,"method":"ping"}]`, conn, ""));
+	assert(resp.type == Json.Type.array && resp.length == 2);
+	bool sawError;
+	foreach (i; 0 .. resp.length)
+	{
+		auto r = resp[i];
+		if ("error" in r)
+		{
+			sawError = true;
+			assert(r["id"] == Json(4));
+			assert(r["error"]["code"].get!int == ErrorCode.invalidParams);
+		}
+	}
+	assert(sawError);
 }
 
 unittest  // handleRaw(text, conn) gates a batch on the supplied state's version

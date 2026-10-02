@@ -923,7 +923,7 @@ private bool parseLegacyPayload(LegacySseChannel channel, string sessionId,
 		input = parseAny(payload);
 	catch (McpException e)
 	{
-		channel.deliverTo(sessionId, makeErrorResponse(Json(null), e).toString());
+		channel.deliverTo(sessionId, makeErrorResponse(errorReplyId(e), e).toString());
 		return false;
 	}
 	catch (Exception e)
@@ -1022,7 +1022,7 @@ private void handleLegacyInput(McpServer server, LegacySseChannel channel,
 				responses ~= resp.get;
 		}
 		foreach (err; input.errors)
-			responses ~= makeErrorResponse(Json(null), err.error);
+			responses ~= makeErrorResponse(errorReplyId(err.error), err.error);
 	}
 	if (responses.type == Json.Type.object || responses.length)
 		channel.deliverTo(sessionId, responses.toString());
@@ -2235,7 +2235,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 	catch (McpException e)
 	{
 		res.statusCode = HTTPStatus.badRequest;
-		res.writeBody(makeErrorResponse(Json(null), e).toString(), "application/json");
+		res.writeBody(makeErrorResponse(errorReplyId(e), e).toString(), "application/json");
 		return;
 	}
 	catch (Exception e)
@@ -4956,6 +4956,19 @@ unittest  // a POST body that is not valid UTF-8 is a 400 JSON-RPC parse error
 			null, StreamableHttpOptions.init, reply);
 	assert(res.statusCode == HTTPStatus.badRequest);
 	assert(parseJsonString(reply)["error"]["code"].get!int == ErrorCode.parseError);
+}
+
+unittest  // a POSTed request with by-position params is a 400 whose error carries its id
+{
+	import vibe.data.json : parseJsonString;
+
+	string reply;
+	auto res = postToMount(`{"jsonrpc":"2.0","id":9,"method":"ping","params":[]}`,
+			null, StreamableHttpOptions.init, reply);
+	assert(res.statusCode == HTTPStatus.badRequest);
+	auto j = parseJsonString(reply);
+	assert(j["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(j["id"] == Json(9));
 }
 
 unittest  // a POST body over maxRequestBytes is a 413 with a JSON-RPC error

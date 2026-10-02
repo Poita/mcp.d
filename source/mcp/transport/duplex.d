@@ -167,9 +167,9 @@ final class DuplexChannel
 			input = parseAny(line);
 		catch (McpException e)
 		{
-			// A malformed/invalid line has no recoverable id, so reply with a
-			// null-id JSON-RPC error rather than dropping it silently.
-			send(makeErrorResponse(Json(null), e));
+			// Reply to a malformed/invalid line rather than dropping it silently,
+			// with the request's id when it was determined and null otherwise.
+			send(makeErrorResponse(errorReplyId(e), e));
 			return;
 		}
 		// A batch array on the server inbound path must be dispatched as a unit so the
@@ -191,6 +191,14 @@ final class DuplexChannel
 		// error so the peer is still notified rather than dropped silently.
 		foreach (e; input.errors)
 		{
+			// A malformed request is answered under its own id; it is never a
+			// reply to one of ours.
+			const replyId = errorReplyId(e.error);
+			if (replyId.type != Json.Type.null_)
+			{
+				send(makeErrorResponse(replyId, e.error));
+				continue;
+			}
 			Json id = (e.item.type == Json.Type.object && "id" in e.item) ? e.item["id"] : Json(
 					null);
 			if (id.type == Json.Type.null_ || id.type == Json.Type.undefined)
@@ -582,6 +590,37 @@ unittest  // a malformed inbound line does not kill the read loop
 	runEventLoop();
 	// The good notification after the garbage line was still dispatched.
 	assert(seen == 1);
+}
+
+unittest  // an inbound request with by-position params is answered with -32602 carrying its id
+{
+	import vibe.data.json : parseJsonString;
+
+	auto inbound = new LineLink;
+	string[] written;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
+				written ~= s;
+			}, (Message) @safe {});
+			channel.start();
+			inbound.put(`{"jsonrpc":"2.0","id":3,"method":"ping","params":[]}`);
+			inbound.closeEnd();
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(written.length == 1);
+	auto j = parseJsonString(written[0]);
+	assert(j["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(j["id"] == Json(3));
 }
 
 unittest  // an inbound batch array routes every contained request/notification to onInbound
