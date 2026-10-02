@@ -1,9 +1,11 @@
 /// Storage backing the MCP Events extension: an in-memory `EmitBuffer` ring
-/// buffer that serves `events/poll` for emit-only event types, and the
+/// buffer that serves `events/poll` for emit-only event types, the
 /// `WebhookSubscriptionStore` that holds webhook subscription identity/config
-/// with per-subscription TTLs. The runtime (`mcp.server.events_runtime`) owns the
-/// ephemeral delivery bookkeeping (retry queue, in-flight acks); what lives here
-/// is the state a server MAY choose to persist when it grants long TTLs.
+/// with per-subscription TTLs, and the `DeliveryQueue` outbox that holds pending
+/// webhook deliveries with their attempt counts and leases. The stores and queue
+/// are the state a server MAY persist or share across nodes; the runtime
+/// (`mcp.server.events_runtime`) keeps only node-local bookkeeping derived from
+/// them (positions in flight for the watermark, owed gap signals).
 module mcp.server.event_store;
 
 import std.typecons : Nullable, nullable;
@@ -265,8 +267,8 @@ final class EmitBuffer
 
 /// A webhook subscription's stored identity and config. The runtime upserts this
 /// idempotently on the key `(principal, url, name, arguments)`; the `id` is a
-/// deterministic hash of that key. Ephemeral delivery state (retry queue,
-/// in-flight ack positions) is NOT here — it lives in the runtime.
+/// deterministic hash of that key. Pending deliveries and their attempt counts
+/// are NOT here — they live in the `DeliveryQueue`.
 struct WebhookSubscription
 {
 	string id; /// derived routing handle (hash of the subscription key)

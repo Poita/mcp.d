@@ -12,6 +12,7 @@ import std.algorithm : sort;
 import vibe.data.json : Json;
 
 import mcp.internal.background_loop : BackgroundLoop;
+import mcp.internal.clock : systemNowIso;
 import mcp.protocol.events;
 import mcp.protocol.jsonhelpers : getOr;
 import mcp.protocol.schema : makeValidator, validationError;
@@ -374,14 +375,6 @@ struct EventsOptions
 	Json webhookSigningJwks = Json.undefined; /// JWKS published at the server-identity well-known path
 	string delegate() @safe nowIso; /// injectable ISO-8601 clock
 	long delegate() @safe nowMs; /// injectable ms-epoch clock
-}
-
-/// The system clock as an ISO-8601 UTC timestamp.
-string systemNowIso() @safe
-{
-	import std.datetime.systime : Clock;
-
-	return () @trusted { return Clock.currTime().toUTC().toISOExtString(); }();
 }
 
 /// Format a millisecond epoch instant as an ISO-8601 UTC timestamp (used for the

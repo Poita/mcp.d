@@ -6,6 +6,7 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
 import mcp.internal.background_loop : BackgroundLoop;
+import mcp.internal.clock : systemNowIso;
 import mcp.protocol.tasks;
 import mcp.protocol.errors : McpException, ErrorCode, toErrorJson, internalError;
 import mcp.server.task_store : TaskStore, TaskRecord, InMemoryTaskStore,
@@ -28,15 +29,6 @@ struct TaskOptions
 	Duration defaultPollInterval = 5.seconds;
 	Duration sweepInterval = 30.seconds;
 	string delegate() @safe nowIso;
-}
-
-/// The system clock as an ISO-8601 UTC timestamp, used when `TaskOptions.nowIso`
-/// is not supplied.
-string systemNowIso() @safe
-{
-	import std.datetime.systime : Clock;
-
-	return () @trusted { return Clock.currTime().toUTC().toISOExtString(); }();
 }
 
 /// Server-side task lifecycle over a `TaskStore`. Every piece of task state —
