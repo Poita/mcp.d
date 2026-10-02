@@ -227,10 +227,15 @@ in (store !is null)
 
 /// GitHub OAuth app. Fills in GitHub's fixed authorize/token endpoints; the IdP
 /// has no DCR and issues opaque tokens, so the proxy fronts it. The author still
-/// supplies a `tokenVerifier` (e.g. one that maps `/user` -> subject) and a
-/// `baseUrl`/`resource` for the proxy surface. Defaults to passthrough; a server
-/// that calls GitHub's API with the issued token should chain `.brokered(...)` to
-/// switch to issue-own-token mode.
+/// supplies a `tokenVerifier` and a `baseUrl`/`resource` for the proxy surface.
+/// Defaults to passthrough; a server that calls GitHub's API with the issued
+/// token should chain `.brokered(...)` to switch to issue-own-token mode.
+///
+/// GitHub tokens carry no audience, so the preset sets
+/// `verifierBindsResource`: every token the `tokenVerifier` accepts is treated as
+/// issued for `resource`. The verifier must therefore confirm the token belongs
+/// to this OAuth app (`POST /applications/{client_id}/token`), not merely that
+/// it is a live GitHub token (`GET /user` accepts any user's token).
 OAuthProxyConfig github(string clientId, string clientSecret, string[] scopes = [
 ]) @safe
 {
@@ -241,6 +246,7 @@ OAuthProxyConfig github(string clientId, string clientSecret, string[] scopes = 
 	cfg.upstreamClientSecret = clientSecret;
 	cfg.tokenEndpointAuthMethod = TokenEndpointAuthMethod.clientSecretPost;
 	cfg.scopesSupported = scopes.dup;
+	cfg.verifierBindsResource = true;
 	return cfg;
 }
 
@@ -249,6 +255,12 @@ OAuthProxyConfig github(string clientId, string clientSecret, string[] scopes = 
 /// `baseUrl`/`resource`. Defaults to passthrough; a server that calls Google's
 /// API with the issued token should chain `.brokered(...)` to switch to
 /// issue-own-token mode.
+///
+/// Google access tokens are opaque to the resource server, so the preset sets
+/// `verifierBindsResource`: every token the `tokenVerifier` accepts is treated as
+/// issued for `resource`. The verifier must therefore confirm the token was
+/// issued to `clientId` (the `aud`/`azp` returned by Google's tokeninfo
+/// endpoint), not merely that it is a live Google token.
 OAuthProxyConfig google(string clientId, string clientSecret, string[] scopes = [
 ]) @safe
 {
@@ -259,6 +271,7 @@ OAuthProxyConfig google(string clientId, string clientSecret, string[] scopes = 
 	cfg.upstreamClientSecret = clientSecret;
 	cfg.tokenEndpointAuthMethod = TokenEndpointAuthMethod.clientSecretPost;
 	cfg.scopesSupported = scopes.dup;
+	cfg.verifierBindsResource = true;
 	return cfg;
 }
 
@@ -560,4 +573,48 @@ unittest  // a preset with a distinct audience still rejects a token minted for 
 	TokenInfo info;
 	assert(authorize(entraStyleConfig(),
 			"Bearer " ~ presetToken("api://other-api"), info) == AuthFailure.invalidToken);
+}
+
+version (unittest)
+{
+	import mcp.auth.resource_server : TokenInfo;
+
+	/// An upstream verifier for opaque tokens: it resolves the subject but, like a
+	/// GitHub `/user` lookup, knows no audience.
+	private TokenInfo opaqueUpstreamLookup(string token) @safe
+	{
+		TokenInfo ti;
+		ti.valid = token == "gho_valid";
+		ti.subject = "octocat";
+		return ti;
+	}
+
+	private OAuthProxyConfig withProxySurface(OAuthProxyConfig cfg) @safe
+	{
+		cfg.baseUrl = "https://mcp.example.com";
+		cfg.resource = mcpUrl;
+		cfg.tokenVerifier = (string t) @safe => opaqueUpstreamLookup(t);
+		return cfg;
+	}
+}
+
+unittest  // the GitHub passthrough preset authorizes an opaque upstream token its verifier accepts
+{
+	import mcp.auth.resource_server : AuthFailure, authorize;
+
+	auto rs = withProxySurface(github("Iv1.client", "ghsecret")).toResourceServer();
+	TokenInfo info;
+	assert(authorize(rs, "Bearer gho_valid", info) == AuthFailure.none);
+	assert(info.subject == "octocat");
+	assert(authorize(rs, "Bearer gho_forged", info) == AuthFailure.invalidToken);
+}
+
+unittest  // the Google passthrough preset authorizes an opaque upstream token its verifier accepts
+{
+	import mcp.auth.resource_server : AuthFailure, authorize;
+
+	auto rs = withProxySurface(google("client.apps.googleusercontent.com", "gsecret"))
+		.toResourceServer();
+	TokenInfo info;
+	assert(authorize(rs, "Bearer gho_valid", info) == AuthFailure.none);
 }

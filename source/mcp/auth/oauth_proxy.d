@@ -44,7 +44,8 @@ import mcp.auth.oauth : AuthorizationServerMetadata, ClientIdMetadataDocument,
 	buildRefreshTokenForm, isValidClientIdMetadataUrl, requireSecureUrl, secureRequestHTTP;
 import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore, referenceTokenValidator;
 import mcp.protocol.ssrf : SsrfPolicy;
-import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidator;
+import mcp.auth.resource_server : ResourceServerConfig, TokenInfo,
+	TokenValidator, bindResourceAudience;
 import mcp.transport.session : BoundedExpiringMap;
 
 @safe:
@@ -131,6 +132,16 @@ struct OAuthProxyConfig
 	/// enforce auth on incoming MCP requests.
 	TokenValidator tokenVerifier;
 
+	/// In passthrough mode, treat every token `tokenVerifier` accepts as issued
+	/// for `resource` (see `bindResourceAudience`). Upstreams such as GitHub and
+	/// Google issue opaque tokens with no `aud`, which `authorize`'s RFC 8707
+	/// resource check would otherwise reject; their presets set this. With it
+	/// set, `tokenVerifier` carries the audience guarantee and MUST confirm the
+	/// token was issued to this proxy's `upstreamClientId` (e.g. GitHub's
+	/// `POST /applications/{client_id}/token`, or the `aud`/`azp` from Google's
+	/// tokeninfo endpoint), not merely that it is a live upstream token.
+	bool verifierBindsResource;
+
 	/// The RFC 8707 canonical resource identifier of the MCP server, advertised
 	/// in the PRM document and forwarded to the upstream as the `resource`
 	/// parameter so issued tokens are audience-bound to this server.
@@ -212,8 +223,12 @@ struct OAuthProxyConfig
 		ResourceServerConfig rs;
 		if (issueToken !is null && tokenStore !is null)
 			rs.validator = referenceTokenValidator(tokenStore, resource);
+		else if (tokenVerifier is null)
+			rs.validator = (string t) => TokenInfo.invalid();
+		else if (verifierBindsResource)
+			rs.validator = bindResourceAudience(tokenVerifier, resource);
 		else
-			rs.validator = tokenVerifier !is null ? tokenVerifier : (string t) => TokenInfo.invalid();
+			rs.validator = tokenVerifier;
 		rs.resource = resource;
 		if (baseUrl.length)
 			rs.authorizationServers = [stripTrailingSlash(baseUrl)];
