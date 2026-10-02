@@ -186,6 +186,11 @@ unittest  // a disabled (no-validator) config is never rejected, even with no AS
 ///     stream wired to the server-push channel (`McpServer.notify`); on the
 ///     modern, which drops the standalone stream, GET -> 405.
 ///   - DELETE: 2026-07-28 has no protocol-level sessions to tear down -> 405.
+///
+/// On a stateless server a `notifications/cancelled` POST reaches only requests
+/// of the same authenticated principal. Unauthenticated callers cannot be told
+/// apart, so their requests ignore `notifications/cancelled`; a 2026-07-28
+/// client still cancels by closing the response stream.
 void mountMcp(URLRouter router, McpServer server,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
@@ -1920,9 +1925,10 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 	// `notifications/cancelled` arrive on SEPARATE POSTs, so both must resolve to
 	// the same in-flight registry key. A stateful request is scoped by its
 	// `Mcp-Session-Id`; a stateless one by its authenticated principal, in the
-	// mount's shared `StatelessInFlight` registry.
+	// mount's shared `StatelessInFlight` registry. An unauthenticated stateless
+	// request cannot be cancelled by a later POST, since any caller could forge it.
 	const connToken = (sessions !is null) ? req.headers.get(SessionHeader, "") : "";
-	const cancelScope = (sessions !is null) ? connToken : StatelessInFlight.scopeFor(
+	const cancelScope = (sessions !is null) ? connToken : statelessInFlight.scopeFor(
 			principalOf(token));
 
 	// JSON-RPC batching (an array body) was introduced in 2025-03-26 and removed
@@ -3664,12 +3670,14 @@ private ConnectionState postState(McpServer server, SessionManager sessions,
 /// shared registry a `notifications/cancelled` arriving on a later POST could
 /// never find the request it names. Keys are scoped by the authenticated
 /// principal (see `scopeFor`), so one principal cannot cancel another's
-/// requests; unauthenticated callers share one scope.
+/// requests. Unauthenticated callers cannot be told apart, so each of their
+/// requests gets a scope of its own that no `notifications/cancelled` matches.
 private final class StatelessInFlight
 {
 	import mcp.server.context : CancellationToken;
 
 	private CancellationToken[string] tokens;
+	private ulong nextAnonymous;
 
 	this() @safe
 	{
@@ -3680,9 +3688,14 @@ private final class StatelessInFlight
 		tokens.remove("");
 	}
 
-	/// The connection token scoping `principal`'s requests in the registry.
-	static string scopeFor(string principal) @safe
+	/// The connection token scoping `principal`'s requests in the registry. An
+	/// unauthenticated caller ("") gets a fresh, unshared scope per call.
+	string scopeFor(string principal) @safe
 	{
+		import std.conv : to;
+
+		if (principal.length == 0)
+			return "\x1eanonymous\x1e" ~ (nextAnonymous++).to!string;
 		return "\x1estateless\x1e" ~ principal;
 	}
 
@@ -5301,4 +5314,58 @@ unittest  // stateless: notifications/cancelled reaches the same principal's in-
 	assert(!cancelledByOther, "another principal must not cancel the request");
 	assert(cancelled, "the requesting principal's notifications/cancelled must reach it");
 	assert(callStatus == 202, "a cancelled request sends no response");
+}
+
+unittest  // stateless: an unauthenticated caller cannot cancel another caller's request
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateless("t", "1");
+	bool cancelled, release;
+	Tool descriptor;
+	descriptor.name = "wait";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		while (!release && !ctx.isCancelled())
+			yield();
+		cancelled = ctx.isCancelled();
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	string[string] headers = [
+		"Accept": "application/json, text/event-stream",
+		"Content-Type": "application/json", "MCP-Protocol-Version": "2025-06-18",
+	];
+	int callStatus;
+	runTask(() nothrow{
+		try
+			callStatus = corsRequest(router, HTTPMethod.POST, headers, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"wait","arguments":{}}}`)
+				.statusCode;
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runTask(() nothrow{
+		try
+		{
+			foreach (_; 0 .. 8)
+				yield();
+			corsRequest(router, HTTPMethod.POST, headers,
+				`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}`);
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+		release = true;
+	});
+	runEventLoop();
+	assert(!cancelled, "an anonymous caller must not cancel another anonymous caller's request");
+	assert(callStatus == 200);
 }

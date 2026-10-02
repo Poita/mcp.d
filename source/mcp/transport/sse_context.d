@@ -2313,9 +2313,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// SEPARATE POSTs that share only the `Mcp-Session-Id` header, so the token
 	// MUST be that session id when sessions are enabled -- a per-request UUID
 	// would never match the cancellation's own context and would break
-	// cancellation entirely. When sessions are disabled there is no identifier
-	// shared across the two POSTs, so the empty (shared) token is kept and
-	// cancellation is unscoped (documented on the transport).
+	// cancellation entirely. When sessions are disabled the transport supplies a
+	// per-principal scope instead (see `mountMcp`).
 	private string token_;
 	// The per-session (stateful) / per-request (stateless) ConnectionState this
 	// request is bound to. The transport resolves it — looked up by
