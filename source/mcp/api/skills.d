@@ -117,7 +117,8 @@ bool isValidSkillName(string name) @safe pure nothrow
 
 /// Whether `path` is a valid skill path: one or more non-empty `/`-separated
 /// segments whose final segment is a valid skill name (`isValidSkillName`).
-/// Prefix segments only need to be non-empty (RFC 3986 path segments).
+/// Prefix segments need only be non-empty RFC 3986 path segments other than
+/// the dot segments `.` and `..`, which a URI resolver would collapse.
 bool isValidSkillPath(string path) @safe pure nothrow
 {
 	if (path.length == 0)
@@ -131,6 +132,8 @@ bool isValidSkillPath(string path) @safe pure nothrow
 		if (i == segStart) // empty segment (leading, trailing, or doubled '/')
 			return false;
 		last = path[segStart .. i];
+		if (last == "." || last == "..")
+			return false;
 		segStart = i + 1;
 	}
 	if (segStart == path.length) // trailing '/' leaves an empty final segment
@@ -367,10 +370,7 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 	import std.conv : to;
 
 	if (!isValidSkillPath(path))
-		throw new Exception("invalid skill path '" ~ path
-				~ "': each '/'-separated segment must be non-empty and the final segment "
-				~ "must be a valid skill name (1..64 chars of lowercase letters, digits, "
-				~ "and single hyphens, no leading/trailing/consecutive hyphens)");
+		throw new Exception("invalid skill path '" ~ path ~ "': each '/'-separated segment must be non-empty and not '.' or '..', and the final segment " ~ "must be a valid skill name (1..64 chars of lowercase letters, digits, " ~ "and single hyphens, no leading/trailing/consecutive hyphens)");
 
 	const name = skillName(path);
 	const uri = skillUri(path);
@@ -520,10 +520,7 @@ struct DynamicSkill
 void registerDynamicSkill(McpServer server, DynamicSkill skill) @safe
 {
 	if (!isValidSkillPath(skill.path))
-		throw new Exception("invalid skill path '" ~ skill.path
-				~ "': each '/'-separated segment must be non-empty and the final segment "
-				~ "must be a valid skill name (1..64 chars of lowercase letters, digits, "
-				~ "and single hyphens, no leading/trailing/consecutive hyphens)");
+		throw new Exception("invalid skill path '" ~ skill.path ~ "': each '/'-separated segment must be non-empty and not '.' or '..', and the final segment " ~ "must be a valid skill name (1..64 chars of lowercase letters, digits, " ~ "and single hyphens, no leading/trailing/consecutive hyphens)");
 	if (skill.instructions is null)
 		throw new Exception("registerDynamicSkill: '" ~ skill.path
 				~ "' has no instructions delegate");
@@ -878,6 +875,15 @@ unittest  // isValidSkillPath allows multi-segment prefixes but constrains the f
 	assert(!isValidSkillPath("acme//refunds")); // empty middle segment
 	assert(!isValidSkillPath("acme/refunds/")); // empty (invalid) final segment
 	assert(!isValidSkillPath("acme/Bad_Name")); // invalid final segment
+}
+
+unittest  // isValidSkillPath rejects a '.' or '..' prefix segment
+{
+	assert(!isValidSkillPath("../refunds"));
+	assert(!isValidSkillPath("./refunds"));
+	assert(!isValidSkillPath("acme/../refunds"));
+	assert(!isValidSkillPath("acme/./refunds"));
+	assert(isValidSkillPath("acme/.well-known/refunds"));
 }
 
 unittest  // skillDigest renders a lowercase sha256:<hex> of the bytes
