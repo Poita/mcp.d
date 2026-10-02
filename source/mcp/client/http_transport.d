@@ -696,11 +696,18 @@ final class HttpClientTransport : ClientTransport
 	/// fresh token.
 	private static bool isRejectedBearer(HttpStatusException e) @safe
 	{
+		return isRejectedBearer(e.status, e.wwwAuthenticate);
+	}
+
+	/// Whether an HTTP `status` with challenge `wwwAuthenticate` rejects the
+	/// bearer token the request carried.
+	private static bool isRejectedBearer(int status, string wwwAuthenticate) @safe
+	{
 		import mcp.auth.oauth : parseWwwAuthenticate;
 
-		if (e.status != 401)
+		if (status != 401)
 			return false;
-		const error = parseWwwAuthenticate(e.wwwAuthenticate).error;
+		const error = parseWwwAuthenticate(wwwAuthenticate).error;
 		return error.length == 0 || error == "invalid_token";
 	}
 
@@ -1598,11 +1605,14 @@ final class HttpClientTransport : ClientTransport
 
 	/// Open the standalone server->client SSE stream over a raw TCP connection
 	/// (vibe's pooled `requestHTTP` does not reliably surface a long-lived,
-	/// idle-then-active SSE body). Whenever the stream closes or the connection
-	/// fails it reconnects — after the server's SSE `retry:` delay, else a
-	/// backoff that grows while attempts make no progress — resuming with the
-	/// latest `Last-Event-ID`, until `close()`. A server that refuses the GET
-	/// (e.g. 405: it offers no standalone stream) ends the reader.
+	/// idle-then-active SSE body). Whenever the stream closes, the connection
+	/// fails or the server answers the GET with another error status (a 5xx, an
+	/// expired token's 401) it reconnects — after the server's SSE `retry:` delay,
+	/// else a backoff that grows while attempts make no progress — resuming with
+	/// the latest `Last-Event-ID`, until `close()`. A 401 that rejects the bearer
+	/// is reported to the bearer provider's `onRejected` first, so the reconnect
+	/// carries a fresh token. A 405 (the server offers no standalone stream) or a
+	/// 404 (no stream at the endpoint, or the session is gone) ends the reader.
 	private void runServerStream() @safe
 	{
 		import core.time : msecs;
@@ -1628,6 +1638,10 @@ final class HttpClientTransport : ClientTransport
 		{
 			bool refused;
 			bool sawData;
+			int status;
+			string wwwAuthenticate;
+			const sentSession = sessionId;
+			const sentBearer = bearerProvider.onRejected !is null ? currentBearer() : null;
 			// Register a slot so `close()` can force-close this connection's socket
 			// even while the reader is parked on a long-lived SSE read.
 			auto slot = new ListenSocketSlot;
@@ -1661,9 +1675,11 @@ final class HttpClientTransport : ClientTransport
 					conn.write(cast(const(ubyte)[]) req);
 
 					const head = readResponseHead(conn);
-					if (head.status != 200)
+					status = head.status;
+					wwwAuthenticate = head.wwwAuthenticate;
+					if (status != 200)
 					{
-						refused = true;
+						refused = status == 404 || status == 405;
 						return;
 					}
 
@@ -1682,8 +1698,28 @@ final class HttpClientTransport : ClientTransport
 				}
 			}();
 
-			if (closing || refused)
+			if (closing)
 				break;
+			if (refused)
+			{
+				// A 404 for the session this GET carried means it is gone; a session
+				// started since then is left alone.
+				if (status == 404 && sentSession.length && sessionId == sentSession)
+				{
+					sessionExpired = true;
+					sessionId = null;
+				}
+				break;
+			}
+			if (sentBearer.length && isRejectedBearer(status, wwwAuthenticate))
+			{
+				// A failed refresh is retried on the next rejection, after the backoff.
+				try
+					bearerProvider.onRejected(sentBearer);
+				catch (Exception)
+				{
+				}
+			}
 			// A stream that delivered events was healthy: restart the backoff.
 			if (sawData)
 				backoff = 250.msecs;
@@ -4556,6 +4592,107 @@ unittest  // each reconnect of the standalone stream sends the current protocol-
 	assert(versions.length >= 3);
 	assert(versions[0] == "2025-06-18");
 	assert(versions[$ - 1] == "2025-11-25", "a reconnect must send the current version header");
+}
+
+unittest  // the standalone stream reconnects after a transient 5xx and keeps delivering server messages
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	int gets;
+	string[] methods;
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		if (++gets == 1)
+		{
+			res.statusCode = 503;
+			res.writeBody("", "text/plain");
+			return;
+		}
+		writeSse(res,
+			"retry: 20\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}\n\n");
+	});
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.setInboundHandler((Message m) @safe { methods ~= m.method; });
+		t.startServerStream();
+		const until = MonoTime.currTime + 3.seconds;
+		while (methods.length == 0 && MonoTime.currTime < until)
+			sleep(10.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(gets >= 2, "a 503 on the standalone GET must be retried");
+	assert(methods.length && methods[0] == "notifications/ping");
+}
+
+unittest  // a 401 on the standalone stream reports the rejected bearer and reconnects with a fresh one
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	string[] auths;
+	string[] rejected;
+	string token = "old";
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		const auth = req.headers.get("Authorization", "");
+		auths ~= auth;
+		if (auth != "Bearer new")
+		{
+			res.statusCode = 401;
+			res.headers["WWW-Authenticate"] = `Bearer error="invalid_token"`;
+			res.writeBody("", "text/plain");
+			return;
+		}
+		writeSse(res, "retry: 20\n: tick\n\n");
+	});
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.setBearerProvider(BearerProvider(() @safe => token, (string tok) @safe {
+				rejected ~= tok;
+				token = "new";
+				return true;
+			}));
+		t.startServerStream();
+		const until = MonoTime.currTime + 3.seconds;
+		while (!auths.canFind("Bearer new") && MonoTime.currTime < until)
+			sleep(10.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(rejected == ["old"], "the rejected bearer must be reported once");
+	assert(auths.canFind("Bearer new"), "the stream must reconnect with the refreshed bearer");
+}
+
+unittest  // a 405 on the standalone stream ends the reader without reconnecting
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	int gets;
+	bool alive = true;
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		++gets;
+		res.statusCode = 405;
+		res.writeBody("", "text/plain");
+	});
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.startServerStream();
+		const until = MonoTime.currTime + 3.seconds;
+		while (t.serverStreamAlive && MonoTime.currTime < until)
+			sleep(10.msecs);
+		sleep(400.msecs);
+		alive = t.serverStreamAlive;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(!alive && gets == 1, "a 405 must end the standalone stream");
 }
 
 unittest  // a legacy HTTP+SSE request whose POST is rejected fails at once with the HTTP status
