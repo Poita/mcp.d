@@ -21,7 +21,11 @@ import vibe.data.json : Json;
 @safe:
 
 /// Thrown by `bindJson` when a value cannot be bound to the target type. The
-/// message names the offending field path relative to the bound value.
+/// message names the offending field path relative to the bound value and is
+/// written for the caller that sent the value (it reaches an MCP client as a
+/// tool error), so it carries no D-side advice. A field the client should be
+/// able to omit is made optional by declaring it `Nullable`, marking it vibe's
+/// `@optional`, giving it a default, or marking its struct `@allOptional`.
 final class BindException : Exception
 {
 	this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
@@ -395,9 +399,7 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 								cast(FT) getUDAs!(__traits(getMember, T, field), SchemaDefault)[0]
 									.value);
 					else static if (isRequiredField!(T, field))
-						throw new BindException("missing required field '" ~ fieldPath
-								~ "' (to make it optional, declare it Nullable, mark it @optional, "
-								~ "or mark " ~ T.stringof ~ " @allOptional)");
+						throw new BindException("missing required field '" ~ fieldPath ~ "'");
 				}
 			}
 		}
@@ -703,9 +705,8 @@ unittest  // an undefaulted struct field whose struct type has a defaulted membe
 	static assert(!isRequiredField!(Outer, "changed"));
 }
 
-unittest  // a missing required field's error says how to make the field optional
+unittest  // a missing required field's error names only the field, for the client
 {
-	import std.algorithm.searching : canFind;
 	import std.exception : collectException;
 	import vibe.data.json : parseJsonString;
 
@@ -716,8 +717,7 @@ unittest  // a missing required field's error says how to make the field optiona
 
 	auto e = collectException!BindException(bindJson!S(parseJsonString(`{}`)));
 	assert(e !is null);
-	assert(e.msg.canFind("@optional") && e.msg.canFind("Nullable")
-			&& e.msg.canFind("@allOptional"), e.msg);
+	assert(e.msg == "missing required field 'verbose'", e.msg);
 }
 
 unittest  // every field of an @allOptional struct is optional and keeps its default when omitted
