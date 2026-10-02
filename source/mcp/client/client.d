@@ -3010,10 +3010,14 @@ final class McpClient : ClientProtocol
 		// Bind deliveries to the subscription's watermark, dedup, and terminal
 		// state before the caller's handlers, as the poll and stream modes do.
 		rx.register(id, p.delivery.secret, (EventOccurrence o) @safe {
-			// The watermark moves past an occurrence only once it is handled, so
-			// a throwing handler leaves the cursor at the last processed event.
-			if (!sub.alreadySeen(o.eventId) && onEvent !is null)
+			// The occurrence is recorded and the watermark moved past it only once
+			// it is handled, so a throwing handler leaves the server's redelivery
+			// to be processed and the cursor at the last processed event.
+			if (sub.isSeen(o.eventId))
+				return;
+			if (onEvent !is null)
 				onEvent(o);
+			sub.markSeen(o.eventId);
 			sub.advanceCursor(o.cursor);
 		}, (EventControl c) @safe {
 			sub.advanceCursor(c.cursor);
@@ -9803,6 +9807,43 @@ unittest  // a webhook occurrence whose handler throws does not advance the curs
 	{
 	}
 	assert(sub.cursor.get == "c0");
+}
+
+unittest  // a webhook occurrence whose handler throws is handled again on redelivery
+{
+	import mcp.server.webhook_delivery : signDeliveryHeaders;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	c.onRpcForTest = (string method, Json params) @safe {
+		SubscribeResult r;
+		r.id = "sub_x";
+		r.cursor = "c0";
+		return method == "events/subscribe" ? r.toJson() : Json.emptyObject;
+	};
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+	int calls;
+	string[] handled;
+	c.subscribeWebhook(rx, sp, (EventOccurrence o) @safe {
+		if (++calls == 1)
+			throw new Exception("handler failed");
+		handled ~= o.eventId;
+	});
+	auto occ = EventOccurrence("e1", "incident.created", "t", Json.emptyObject);
+	const 
+	body = occ.toJson().toString();
+	auto headers = signDeliveryHeaders(managedTestWhsec, "", 0, 1000, "m1",
+			1700, body, "sub_x", null);
+	try
+		rx.processDelivery(body, headers);
+	catch (Exception)
+	{
+	}
+	rx.processDelivery(body, headers);
+	assert(handled == ["e1"], "the redelivered occurrence must reach the handler");
 }
 
 unittest  // a no-expiry grant still refreshes at the health-check cadence

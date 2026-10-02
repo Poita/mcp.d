@@ -79,17 +79,30 @@ final class EventSubscription
 	/// a duplicate — there is nothing to match on.
 	package bool alreadySeen(string eventId) @safe
 	{
-		if (eventId.length == 0 || seenRing_.length == 0)
-			return false;
-		if ((eventId in seen_) !is null)
+		if (isSeen(eventId))
 			return true;
+		markSeen(eventId);
+		return false;
+	}
+
+	/// Whether `eventId` is in the dedup window, without recording it.
+	package bool isSeen(string eventId) @safe
+	{
+		return eventId.length && (eventId in seen_) !is null;
+	}
+
+	/// Record `eventId` as delivered (evicting the oldest once the window is
+	/// full). A no-op for an empty id, a disabled window, or an id already held.
+	package void markSeen(string eventId) @safe
+	{
+		if (eventId.length == 0 || seenRing_.length == 0 || isSeen(eventId))
+			return;
 		const evicted = seenRing_[seenHead_];
 		if (evicted.length)
 			seen_.remove(evicted);
 		seenRing_[seenHead_] = eventId;
 		seenHead_ = (seenHead_ + 1) % seenRing_.length;
 		seen_[eventId] = true;
-		return false;
 	}
 
 	/// Record the delivery mode the factory chose.
