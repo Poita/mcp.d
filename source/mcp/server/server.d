@@ -115,6 +115,14 @@ struct RegisteredPrompt
 	ClientCapabilities requiredClientCapabilities;
 }
 
+/// The error a registration entry point throws on a name/URI collision rather
+/// than silently clobbering the prior entry; `remover` names the method that
+/// unregisters it.
+private Exception alreadyRegistered(string what, string remover) @safe
+{
+	return new Exception(what ~ " is already registered; call " ~ remover ~ " first to replace it");
+}
+
 /// The most `resources/subscribe` URIs one connection may hold, bounding the
 /// per-session state a client can make the server keep.
 private enum maxResourceSubscriptions = 1024;
@@ -482,8 +490,7 @@ final class McpServer : ServerCore
 	private void requireToolNameAvailable(string name) @safe
 	{
 		if (name in tools)
-			throw new Exception("a tool named '" ~ name
-					~ "' is already registered; call removeTool first to replace it");
+			throw alreadyRegistered("a tool named '" ~ name ~ "'", "removeTool");
 	}
 
 	/// Declare the client capabilities a registered tool's handler requires.
@@ -912,7 +919,8 @@ final class McpServer : ServerCore
 			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
 		if (descriptor.uri in resources)
-			throw new Exception("a resource with uri '" ~ descriptor.uri ~ "' is already registered");
+			throw alreadyRegistered("a resource with uri '" ~ descriptor.uri ~ "'",
+					"removeResource");
 		resources[descriptor.uri] = RegisteredResource(descriptor, reader, cache);
 	}
 
@@ -968,7 +976,8 @@ final class McpServer : ServerCore
 						~ "' has adjacent variables that can never match: " ~ tmpl);
 		foreach (ref t; templates)
 			if (t.descriptor.uriTemplate == tmpl)
-				throw new Exception("a resource template '" ~ tmpl ~ "' is already registered");
+				throw alreadyRegistered("a resource template '" ~ tmpl ~ "'",
+						"removeResourceTemplate");
 		templates ~= RegisteredTemplate(descriptor, reader, cache);
 	}
 
@@ -1015,7 +1024,7 @@ final class McpServer : ServerCore
 	private void requirePromptNameAvailable(string name) @safe
 	{
 		if (name in prompts)
-			throw new Exception("a prompt named '" ~ name ~ "' is already registered");
+			throw alreadyRegistered("a prompt named '" ~ name ~ "'", "removePrompt");
 	}
 
 	/// Register a *dynamic* prompt whose handler may, on a stateless (MRTR) modern
@@ -8658,6 +8667,34 @@ unittest  // stateful (2025-era) prompts/get gates on negotiated session capabil
 	Json p = Json(["name": Json("greet")]);
 	auto resp = s.handle(req(2, "prompts/get", p)).get;
 	assert(resp["error"]["code"].get!long == -32021);
+}
+
+unittest  // duplicate resource, template and prompt registrations name their remover
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	registerStubResources(s, "test://r");
+	ResourceTemplate t = {uriTemplate: "test://{x}", name: "t"};
+	s.registerResourceTemplate(t, (string uri, string[string] p) @safe => ResourceContents.init);
+	Prompt pr = {name: "p"};
+	s.registerPrompt(pr, (Json) @safe => GetPromptResult());
+
+	string msgOf(void delegate() @safe dg) @safe
+	{
+		try
+			dg();
+		catch (Exception e)
+			return e.msg;
+		return "";
+	}
+
+	assert(msgOf(() => registerStubResources(s, "test://r")).canFind("call removeResource first"));
+	assert(msgOf(() => s.registerResourceTemplate(t, (string uri,
+			string[string] p) @safe => ResourceContents.init)).canFind(
+			"call removeResourceTemplate first"));
+	assert(msgOf(() => s.registerPrompt(pr, (Json) @safe => GetPromptResult()))
+			.canFind("call removePrompt first"));
 }
 
 unittest  // tools/call rejects non-object arguments with -32602 before the handler runs
