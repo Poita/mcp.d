@@ -5,23 +5,6 @@ import core.time : Duration, MonoTime, minutes;
 import mcp.protocol.errors : McpException, internalError;
 import mcp.server.connection : ConnectionState;
 
-// fillSecureRandom binds BCryptGenRandom from bcrypt.dll on Windows; druntime
-// does not link its import library implicitly, so request it here.
-version (Windows) pragma(lib, "bcrypt");
-
-// extern (Windows) declarations must be at module scope to receive C linkage;
-// inside a function body they get D name mangling and the linker cannot resolve
-// them against bcrypt.lib.
-version (Windows)
-{
-	import core.sys.windows.windows : ULONG, PUCHAR;
-
-	private alias NTSTATUS = int;
-	private enum ULONG BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002;
-	private extern (Windows) NTSTATUS BCryptGenRandom(void* hAlgorithm,
-			PUCHAR pbBuffer, ULONG cbBuffer, ULONG dwFlags) nothrow @nogc;
-}
-
 /// A string-keyed cache of `V` with a per-entry insertion/activity timestamp,
 /// bounded by an idle TTL and a maximum live-entry count. It owns the value map
 /// and the parallel timestamp map together so the "remove from both" invariant
@@ -419,7 +402,7 @@ final class SessionManager
 	/// DELETE cannot grow the table without bound.
 	///
 	/// Throws: `McpException` (`internalError`) when the host OS CSPRNG is
-	/// unavailable. This is fail-closed (see `generateSessionId`/`fillSecureRandom`),
+	/// unavailable. This is fail-closed (see `generateSessionId`),
 	/// so callers on the request path (e.g. `streamable_http.handlePost`'s
 	/// `initialize` branch) must be prepared for it to throw rather than always
 	/// returning an id. vibe.d converts an escaping `McpException` to an HTTP 500;
@@ -681,7 +664,8 @@ unittest  // terminating a session drops its ConnectionState
 	assert(mgr.stateFor(id) is null);
 }
 
-/// Produce a cryptographically-secure, hex-encoded 256-bit session id.
+/// Produce a cryptographically-secure, hex-encoded 256-bit session id, drawn
+/// from the OS CSPRNG via `cryptoRandomFill`.
 ///
 /// Throws: `McpException` (`internalError`) when no OS CSPRNG can be read. There is
 /// deliberately no non-cryptographic fallback, so this is a fallible path; callers
@@ -689,65 +673,20 @@ unittest  // terminating a session drops its ConnectionState
 string generateSessionId() @safe
 {
 	import std.format : format;
-
-	ubyte[32] buf;
-	fillSecureRandom(buf[]);
-	return format("%(%02x%)", buf[]);
-}
-
-/// Fill `dst` with cryptographically-secure random bytes drawn from the host
-/// OS's CSPRNG (`/dev/urandom` on Posix, `BCryptGenRandom` on Windows). There is
-/// deliberately NO `std.random` fallback: a Mersenne-Twister-derived id would be
-/// predictable and would weaken session-hijacking protection. If no OS crypto
-/// source can be read, this fails closed by throwing rather than emitting a
-/// non-cryptographic id.
-private void fillSecureRandom(ubyte[] dst) @trusted
-{
-	if (dst.length == 0)
-		return;
+	import mcp.auth.csprng : CsprngException, cryptoRandomFill;
 
 	// Test seam: a build configured with this version simulates an unavailable OS
-	// CSPRNG so the fail-closed contract -- create()/generateSessionId() throw
-	// McpException rather than emitting a predictable id -- can be exercised by a
-	// regression test. Never defined in normal builds.
+	// CSPRNG so the fail-closed contract can be exercised by a regression test.
+	// Never defined in normal builds.
 	version (McpForceCsprngFailure)
 		throw internalError("forced CSPRNG failure (test seam)");
 
-	version (Posix)
-	{
-		import std.stdio : File;
-
-		try
-		{
-			auto f = File("/dev/urandom", "rb");
-			const got = f.rawRead(dst);
-			if (got.length == dst.length)
-				return;
-		}
-		catch (Exception)
-		{
-		}
-		throw internalError(
-				"unable to read cryptographically-secure random bytes from /dev/urandom");
-	}
-	else version (Windows)
-	{
-		// BCryptGenRandom with BCRYPT_USE_SYSTEM_PREFERRED_RNG draws from the
-		// system-preferred CSPRNG without needing an algorithm handle. NTSTATUS 0
-		// (STATUS_SUCCESS) indicates success.
-		const status = BCryptGenRandom(null, cast(PUCHAR) dst.ptr,
-				cast(ULONG) dst.length, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-		if (status == 0)
-			return;
-		throw internalError(
-				"BCryptGenRandom failed to provide cryptographically-secure random bytes");
-	}
-	else
-	{
-		// Fail closed on any platform without a known OS CSPRNG rather than
-		// emitting a predictable id.
-		throw internalError("no cryptographically-secure random source available on this platform");
-	}
+	ubyte[32] buf;
+	try
+		cryptoRandomFill(buf[]);
+	catch (CsprngException e)
+		throw internalError("unable to read cryptographically-secure random bytes: " ~ e.msg);
+	return format("%(%02x%)", buf[]);
 }
 
 unittest  // generated ids are visible-ASCII hex of the expected length
