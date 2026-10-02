@@ -343,6 +343,7 @@ enum ClientCapability
 	sampling,
 	samplingTools,
 	samplingContext,
+	/// Any elicitation mode (form or url).
 	elicitation,
 	elicitationForm,
 	elicitationUrl,
@@ -370,15 +371,15 @@ struct ClientCapabilities
 	/// sampling.context sub-capability (soft-deprecated): gates the
 	/// `includeContext` values `thisServer`/`allServers`. Implies `sampling`.
 	bool samplingContext;
-	/// Elicitation presence (>= 2025-06-18). Following the spec's bare `{}`, it
-	/// declares form mode: on its own it serializes as `{}`, and alongside
+	/// Bare elicitation declaration (>= 2025-06-18). Following the spec, a bare
+	/// `elicitation: {}` means form mode, so this flag declares form mode just
+	/// like `elicitationForm`: on its own it serializes as `{}`, and alongside
 	/// `elicitationUrl` it serializes as `{"form":{},"url":{}}`. A url-only
-	/// client sets just `elicitationUrl`, which also implies presence.
+	/// client sets just `elicitationUrl`.
 	bool elicitation;
 	/// elicitation.form submode (2025-11-25): declares support for schema-driven
-	/// form elicitation. Implies `elicitation`. An empty `elicitation` object is
-	/// equivalent to declaring form mode only, so this is treated as set when a
-	/// peer advertises a bare `{}`.
+	/// form elicitation. Equivalent to `elicitation` for capability checks;
+	/// `fromJson` sets both for a bare `{}` or an explicit `form`.
 	bool elicitationForm;
 	/// elicitation.url submode (2025-11-25): declares support for URL-mode
 	/// elicitation (`elicitUrl`). Implies `elicitation`. Servers MUST NOT send
@@ -518,7 +519,9 @@ struct ClientCapabilities
 	/// and the result is a `ClientCapabilities` containing exactly the missing
 	/// ones. A capability is satisfied when the client declared at least the same
 	/// presence flag (sub-capability flags imply their parent presence here, in
-	/// line with `toJson`). The result is null iff every requirement is met; a
+	/// line with `toJson`); `elicitation` and `elicitationForm` both require form
+	/// mode, which either declared flag satisfies. The result is null iff every
+	/// requirement is met; a
 	/// non-null value carries exactly the unmet ones. The `experimental` and
 	/// `extensions` Json maps are compared by required-key presence: any required
 	/// key absent from `declared` is reported.
@@ -528,8 +531,7 @@ struct ClientCapabilities
 		bool anyMissing;
 		const declSampling = declared.sampling || declared.samplingTools || declared
 			.samplingContext;
-		const declElicit = declared.elicitation || declared.elicitationForm
-			|| declared.elicitationUrl;
+		const declForm = declared.elicitation || declared.elicitationForm;
 
 		if (roots && !declared.roots)
 		{
@@ -557,12 +559,12 @@ struct ClientCapabilities
 			missing.samplingContext = true;
 			anyMissing = true;
 		}
-		if (elicitation && !declElicit)
+		if (elicitation && !declForm)
 		{
 			missing.elicitation = true;
 			anyMissing = true;
 		}
-		if (elicitationForm && !declared.elicitationForm)
+		if (elicitationForm && !declForm)
 		{
 			missing.elicitationForm = true;
 			anyMissing = true;
@@ -623,7 +625,7 @@ struct ClientCapabilities
 		case ClientCapability.elicitation:
 			return elicitation || elicitationForm || elicitationUrl;
 		case ClientCapability.elicitationForm:
-			return elicitationForm;
+			return elicitation || elicitationForm;
 		case ClientCapability.elicitationUrl:
 			return elicitationUrl;
 		case ClientCapability.roots:
@@ -652,6 +654,35 @@ unittest  // supports(.elicitation) implies elicitationForm and elicitationUrl s
 	assert(e.supports(ClientCapability.sampling)); // implied by samplingTools
 	ClientCapabilities f = {samplingContext: true};
 	assert(f.supports(ClientCapability.sampling)); // implied by samplingContext
+}
+
+unittest  // supports(.elicitationForm) holds for a bare elicitation declaration
+{
+	ClientCapabilities c = {elicitation: true};
+	assert(c.supports(ClientCapability.elicitationForm));
+	assert(!c.supports(ClientCapability.elicitationUrl));
+}
+
+unittest  // supports(.elicitationForm) holds for a parsed bare `elicitation: {}`
+{
+	auto c = ClientCapabilities.fromJson(Json(["elicitation": Json.emptyObject]));
+	assert(c.supports(ClientCapability.elicitationForm));
+}
+
+unittest  // missingFrom: a required bare elicitation (form mode) is unmet by a url-only client
+{
+	ClientCapabilities required = {elicitation: true};
+	ClientCapabilities declared = {elicitationUrl: true};
+	auto missing = required.missingFrom(declared);
+	assert(!missing.isNull);
+	assert(missing.get.elicitation);
+}
+
+unittest  // missingFrom: a required elicitationForm is met by a bare elicitation declaration
+{
+	ClientCapabilities required = {elicitationForm: true};
+	ClientCapabilities declared = {elicitation: true};
+	assert(required.missingFrom(declared).isNull);
 }
 
 unittest  // missingFrom: an unmet sampling requirement is reported
