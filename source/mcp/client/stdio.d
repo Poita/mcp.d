@@ -375,6 +375,11 @@ final class StdioClientTransport : ClientTransport
 
 		++closeProcessRuns_;
 		auto p = pipes;
+		// Once the child is reaped, release the stdout pipe too: the read loop has
+		// seen (or, parked on it, now sees) end-of-input, and a pipe left open keeps
+		// an eventcore handle alive past the event loop.
+		scope (exit)
+			() @trusted { p.stdout.close(); }();
 		// Step 0: close the child's stdin so a well-behaved server sees EOF and exits.
 		() @trusted { p.stdin.close(); }();
 
