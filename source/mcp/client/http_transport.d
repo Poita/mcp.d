@@ -630,7 +630,12 @@ final class HttpClientTransport : ClientTransport
 	Json deliver(Json message, long expectId) @safe
 	{
 		if (isInitialize(message))
+		{
+			// An initialize always opens a new session; the server assigns its id
+			// in the response.
 			sessionExpired = false;
+			sessionId = null;
+		}
 		else if (sessionExpired)
 			throw new HttpStatusException(404,
 					"MCP session expired (server rejected a prior request with HTTP 404/410)");
@@ -3939,6 +3944,26 @@ unittest  // a mid-session 404 surfaces as a typed McpException and a fresh init
 	assert(typed, "a mid-session 404 must raise an McpException");
 	assert(srv.initializeSessionHeaders == ["", ""],
 			"the re-initialize must not carry the expired session id");
+	assert(tools == 0);
+}
+
+unittest  // re-running initialize on a live session starts a new session without the old id
+{
+	import mcp.client.client : McpClient;
+
+	auto srv = new SessionFakeServer;
+	size_t tools = size_t.max;
+	const failure = runAgainstFakeServer(srv.router(), (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		client.initialize("2025-11-25");
+		tools = client.listTools().tools.length;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(srv.initializeSessionHeaders == ["", ""],
+			"an initialize must not carry the previous session id");
 	assert(tools == 0);
 }
 
