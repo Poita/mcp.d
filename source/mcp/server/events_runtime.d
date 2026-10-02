@@ -2089,6 +2089,8 @@ final class EventsRuntime
 			ackJob(job.jobId); // subscription gone; nothing to deliver
 			return;
 		}
+		if (dropIfLapsed(job, s0.get))
+			return;
 		if (!s0.get.active)
 		{
 			// Delivery is suspended: the job is dropped rather than re-leased on
@@ -2140,6 +2142,8 @@ final class EventsRuntime
 				ackJob(job.jobId);
 				return;
 			}
+			if (dropIfLapsed(job, sn.get))
+				return;
 			auto res = attemptDelivery(sn.get, job);
 			if (res.ok)
 			{
@@ -2186,6 +2190,18 @@ final class EventsRuntime
 			deliveryQueue_.renew(job.jobId, until);
 			renewWaiting(subId, until);
 		}
+	}
+
+	// A subscription whose grant lapsed (but that no sweep has removed yet) takes
+	// no more deliveries: its job is acked unsent and the subscription is torn
+	// down as the sweep would. Returns whether the job was dropped.
+	private bool dropIfLapsed(Delivery job, WebhookSubscription sub) @safe
+	{
+		if (!sub.isExpired(opts_.nowMs()))
+			return false;
+		ackJob(job.jobId);
+		removeWebhookState(sub);
+		return true;
 	}
 
 	// Extend the lease of every job waiting in this node's run for `subId`.
@@ -6173,7 +6189,7 @@ unittest  // deliveries to an endpoint that never verifies are dead-lettered aft
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	foreach (_; 0 .. 4)
 	{
-		now += 60 * 60 * 1000;
+		now += 5 * 60 * 1000;
 		rt.drainDeliveries();
 	}
 	assert(queue.lease(now, 1000).length == 0);
@@ -6400,6 +6416,33 @@ unittest  // publish enqueues a webhook delivery; delivery happens on a queue dr
 	for (size_t i = 0; i < deferred.length; i++)
 		deferred[i]();
 	assert(ft.eventPosts().length == 1);
+}
+
+unittest  // a job for a subscription that lapsed before delivery is acked without a POST
+{
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	auto queue = new InMemoryDeliveryQueue();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryQueue = queue;
+	o.deliverySleep = (Duration d) @safe {};
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	now += rt.opts_.webhookTtlCap.total!"msecs" + 1;
+	for (size_t i = 0; i < deferred.length; i++)
+		deferred[i]();
+	assert(ft.posts.length == 0);
+	assert(queue.lease(now + 10 * 60 * 60 * 1000, 1000).length == 0);
+	assert(rt.webhookStore().get(r.id).isNull);
 }
 
 unittest  // multi-node: node B's worker delivers a job node A enqueued (shared store + queue)
