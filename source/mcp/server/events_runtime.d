@@ -357,7 +357,7 @@ struct EventsOptions
 	bool webhookEnabled = true; /// advertise/serve webhook delivery
 	DeliveryMode[] disabledModes; /// modes disabled for ALL types (a type may narrow further, not re-enable)
 	int webhookMaxSubscriptionsPerPrincipal = 1000; /// cap on live webhook subscriptions one principal may hold (0 = unlimited)
-	string[] callbackAllowlist; /// callback URL prefixes treated as pre-verified
+	string[] callbackAllowlist; /// callback URL prefixes treated as pre-verified (same origin; the path matches on whole segments)
 	bool wellKnownReceiverVerification = true; /// honour a receiver-published /.well-known/mcp-webhook-receiver.json
 	Duration wellKnownCacheTtl = 10.minutes; /// how long a fetched (or absent) receiver document is cached per origin
 	bool allowPrivateCallbackHosts; /// permit non-globally-routable callback IPs (tests/dev)
@@ -1766,8 +1766,6 @@ final class EventsRuntime
 	// prefix matched against the parsed components, not as a byte prefix.
 	private bool urlAllowlisted(string url) @safe
 	{
-		import std.algorithm : startsWith;
-
 		string scheme, host, path;
 		ushort port;
 		bool hasUserinfo;
@@ -1789,10 +1787,23 @@ final class EventsRuntime
 			// a prefix of the URL's path so an origin entry covers everything under it.
 			if (scheme != eScheme || host != eHost || port != ePort)
 				continue;
-			if (path.startsWith(ePath))
+			if (pathUnder(path, ePath))
 				return true;
 		}
 		return false;
+	}
+
+	// Whether `path` is `prefix` itself or lies below it, matching whole path
+	// segments: "/hooks" covers "/hooks" and "/hooks/a" but not "/hooks-other".
+	// A prefix ending in '/' (or empty) covers everything under it.
+	private static bool pathUnder(string path, string prefix) @safe pure nothrow
+	{
+		import std.algorithm : startsWith, endsWith;
+
+		if (!path.startsWith(prefix))
+			return false;
+		return prefix.length == 0 || prefix.endsWith('/')
+			|| path.length == prefix.length || path[prefix.length] == '/';
 	}
 
 	// Parse a URL into its scheme, host, effective port, path and whether it carries
@@ -2547,8 +2558,6 @@ final class EventsRuntime
 	// so verifying many subscriptions against one gateway costs one GET.
 	private bool wellKnownCovers(string url, long now) @safe
 	{
-		import std.algorithm : startsWith;
-
 		string scheme, host, path;
 		ushort port;
 		bool hasUserinfo;
@@ -2565,7 +2574,7 @@ final class EventsRuntime
 			entry = origin in wellKnown_;
 		}
 		foreach (prefix; entry.prefixes)
-			if (prefix.length && path.startsWith(prefix))
+			if (prefix.length && pathUnder(path, prefix))
 				return true;
 		return false;
 	}
@@ -5418,6 +5427,25 @@ unittest  // unsubscribeWebhook throws NotFound for an unknown subscription
 	assertThrown!McpException(rt.unsubscribeWebhook(u, "user-1"));
 }
 
+unittest  // an allowlist path prefix covers only whole path segments
+{
+	EventsOptions o;
+	o.nowMs = () @safe => 0L;
+	o.nowIso = () @safe => "t";
+	o.callbackAllowlist = ["https://proxy.example.com/hooks"];
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto other = rt.subscribeWebhook(webhookSub("n",
+			"https://proxy.example.com/hooks-other/"), "user-1");
+	assert(!rt.webhookStore().get(other.id).get.verified);
+	auto exact = rt.subscribeWebhook(webhookSub("n", "https://proxy.example.com/hooks"), "user-1");
+	assert(rt.webhookStore().get(exact.id).get.verified);
+	auto below = rt.subscribeWebhook(webhookSub("n",
+			"https://proxy.example.com/hooks/a"), "user-1");
+	assert(rt.webhookStore().get(below.id).get.verified);
+}
+
 unittest  // an allowlisted callback URL is pre-verified at subscribe time
 {
 	EventsOptions o;
@@ -6310,6 +6338,30 @@ unittest  // a callback outside the well-known document's prefixes still gets th
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	assert(controlPostsOf(ft, "verification").length == 1);
 	assert(ft.eventPosts().length == 1); // the echoed challenge verified it
+}
+
+unittest  // a well-known receiver prefix covers only whole path segments
+{
+	auto ft = new FakeWebhookTransport();
+	ft.wellKnownBody = `{"receivers": ["/hooks"]}`;
+	auto rt = engineRuntime(ft);
+	// "/hooks-other" shares bytes with "/hooks" but is a different path segment.
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks-other/c1"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(controlPostsOf(ft, "verification").length == 1);
+}
+
+unittest  // a well-known receiver prefix covers the path itself and paths below it
+{
+	auto ft = new FakeWebhookTransport();
+	ft.echoChallenge = false; // a challenge, if sent, would fail
+	ft.wellKnownBody = `{"receivers": ["/hooks"]}`;
+	auto rt = engineRuntime(ft);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks/c1"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(controlPostsOf(ft, "verification").length == 0);
+	assert(ft.eventPosts().length == 2);
 }
 
 unittest  // the well-known document is fetched once per origin and cached
