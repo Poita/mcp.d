@@ -1,6 +1,6 @@
 module mcp.client.client;
 
-import core.time : Duration, MonoTime, seconds, msecs, hours;
+import core.time : Duration, MonoTime, seconds, msecs, minutes, hours;
 import std.algorithm : canFind, startsWith;
 import std.datetime : Clock, SysTime;
 import std.typecons : Nullable, nullable;
@@ -309,6 +309,10 @@ struct ClientSettings
 	/// no `pollIntervalMs`.
 	Duration taskPollInterval = 1.seconds;
 
+	/// Ceiling applied to a task's server-supplied `pollIntervalMs`, so a
+	/// misbehaving server cannot park `awaitTask` indefinitely between polls.
+	Duration maxTaskPollInterval = 1.minutes;
+
 	/// Upper bound on how long `awaitTask` / `callToolAwait` poll a task before
 	/// failing with `RequestTimeoutException` (the task itself is left running;
 	/// `cancelTask` stops it). `Duration.zero` polls until the task finishes.
@@ -376,6 +380,10 @@ struct EventClientSettings
 	/// Floor applied to the server's `nextPollMs`, so a misbehaving server cannot
 	/// drive a tight poll loop.
 	Duration pollFloor = 1.seconds;
+
+	/// Ceiling applied to the server's `nextPollMs`, so a misbehaving server
+	/// cannot park the poll loop indefinitely.
+	Duration pollCeiling = 5.minutes;
 
 	/// How many recent `eventId`s each managed subscription remembers, so an
 	/// occurrence redelivered across a reconnect or replay reaches `onEvent` once.
@@ -729,11 +737,13 @@ final class McpClient : ClientProtocol
 		maxTotalTimeout_ = settings.maxTotalTimeout;
 		taskPollInterval_ = settings.taskPollInterval;
 		taskTimeout_ = settings.taskTimeout;
+		maxTaskPollInterval_ = settings.maxTaskPollInterval;
 		return this;
 	}
 
 	private Duration taskPollInterval_ = ClientSettings.init.taskPollInterval;
 	private Duration taskTimeout_ = ClientSettings.init.taskTimeout;
+	private Duration maxTaskPollInterval_ = ClientSettings.init.maxTaskPollInterval;
 
 	private Duration requestTimeout_ = ClientSettings.init.requestTimeout;
 	private bool resetTimeoutOnProgress_ = ClientSettings.init.resetTimeoutOnProgress;
@@ -858,6 +868,8 @@ final class McpClient : ClientProtocol
 	void close() @safe
 	{
 		closed_ = true;
+		if (pollWakeInit_)
+			pollWake_.emit();
 		foreach (sub; liveSubscriptions_.keys)
 			sub.cancel();
 		liveSubscriptions_ = null;
@@ -2113,7 +2125,15 @@ final class McpClient : ClientProtocol
 			if ("pollIntervalMs" in state && state["pollIntervalMs"].type == Json.Type.int_
 					&& state["pollIntervalMs"].get!long > 0)
 				interval = state["pollIntervalMs"].get!long.msecs;
-			taskPollSleep(interval);
+			if (interval > maxTaskPollInterval_)
+				interval = maxTaskPollInterval_;
+			if (taskTimeout_ > Duration.zero)
+			{
+				const left = taskTimeout_ - (MonoTime.currTime - start);
+				if (interval > left)
+					interval = left;
+			}
+			taskPollSleep(interval, cancellation);
 		}
 	}
 
@@ -2181,9 +2201,10 @@ final class McpClient : ClientProtocol
 		return new McpException(ErrorCode.internalError, "Task failed: " ~ taskId);
 	}
 
-	/// Sleep between task polls. A test seam mirrors `onRpcForTest` so polling
-	/// loops run without a live event loop under `unittest`.
-	private void taskPollSleep(Duration d) @safe
+	/// Sleep between task polls, waking early when `cancellation` (when non-null)
+	/// is cancelled or the client is closed. A test seam mirrors `onRpcForTest`
+	/// so polling loops run without a live event loop under `unittest`.
+	private void taskPollSleep(Duration d, CancellationToken cancellation) @safe
 	{
 		version (unittest)
 			if (onTaskSleepForTest !is null)
@@ -2191,11 +2212,34 @@ final class McpClient : ClientProtocol
 				onTaskSleepForTest(d);
 				return;
 			}
-		import vibe.core.core : sleep;
-
-		if (d > Duration.zero)
-			() @trusted { sleep(d); }();
+		if (d <= Duration.zero || closed_)
+			return;
+		if (!pollWakeInit_)
+		{
+			pollWake_ = createManualEvent();
+			pollWakeInit_ = true;
+		}
+		const ec = pollWake_.emitCount;
+		const hookId = --pollWakeHookIds_;
+		if (cancellation !is null)
+		{
+			cancellation.bind(hookId, (string) @safe { pollWake_.emit(); });
+			if (cancellation.isCancelled)
+				return;
+		}
+		scope (exit)
+			if (cancellation !is null)
+				cancellation.unbind(hookId);
+		pollWake_.wait(d, ec);
 	}
+
+	// Woken by `close()` and by a cancelled task wait, so `taskPollSleep` never
+	// sleeps out a long poll interval after its caller has gone away.
+	private LocalManualEvent pollWake_;
+	private bool pollWakeInit_;
+	// Keys for the cancellation hooks a task wait binds, kept negative so they
+	// never collide with request ids.
+	private long pollWakeHookIds_;
 
 	version (unittest) package void delegate(Duration) @safe onTaskSleepForTest;
 
@@ -2786,8 +2830,8 @@ final class McpClient : ClientProtocol
 				failures++;
 			if (failures)
 			{
-				eventPollSleep(eventSettings_.pollFloor.total!"msecs" << (failures < 6 ? failures
-						: 6));
+				eventPollSleep(sub,
+						eventSettings_.pollFloor.total!"msecs" << (failures < 6 ? failures : 6));
 				continue;
 			}
 			foreach (occ; res.events)
@@ -2813,7 +2857,7 @@ final class McpClient : ClientProtocol
 				return;
 			if (res.hasMore)
 				continue; // more buffered now — re-poll without sleeping
-			eventPollSleep(res.nextPollMs);
+			eventPollSleep(sub, res.nextPollMs);
 		}
 	}
 
@@ -3191,12 +3235,17 @@ final class McpClient : ClientProtocol
 		}
 	}
 
-	/// Sleep between event polls, clamped to `eventSettings.pollFloor` so a
-	/// misbehaving server can't drive a hot loop. A test seam mirrors `taskPollSleep`.
-	private void eventPollSleep(long nextPollMs) @safe
+	/// Sleep between event polls of `sub`, clamped between
+	/// `eventSettings.pollFloor` and `eventSettings.pollCeiling` so a misbehaving
+	/// server can neither drive a hot loop nor park it indefinitely. Wakes early
+	/// when `sub` stops. A test seam mirrors `taskPollSleep`.
+	private void eventPollSleep(EventSubscription sub, long nextPollMs) @safe
 	{
 		const floorMs = eventSettings_.pollFloor.total!"msecs";
+		const ceilingMs = eventSettings_.pollCeiling.total!"msecs";
 		long ms = nextPollMs > 0 ? nextPollMs : floorMs;
+		if (ceilingMs > 0 && ms > ceilingMs)
+			ms = ceilingMs;
 		if (ms < floorMs)
 			ms = floorMs;
 		version (unittest)
@@ -3205,9 +3254,7 @@ final class McpClient : ClientProtocol
 				onEventPollSleepForTest(ms.msecs);
 				return;
 			}
-		import vibe.core.core : sleep;
-
-		() @trusted { sleep(ms.msecs); }();
+		sub.sleepWhileActive(ms.msecs);
 	}
 
 	/// Sleep `d` before the next webhook refresh. A test seam runs the loop
@@ -4784,6 +4831,101 @@ unittest  // awaitTask waits the default poll interval when the server gives non
 	};
 	c.awaitTask("t1");
 	assert(sleeps == [1.seconds, 1.seconds], "a missing pollIntervalMs must not poll back-to-back");
+}
+
+unittest  // awaitTask caps a huge server pollIntervalMs at ClientSettings.maxTaskPollInterval
+{
+	auto c = McpClient.http("http://localhost");
+	Duration[] sleeps;
+	c.onTaskSleepForTest = (Duration d) @safe { sleeps ~= d; };
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (++polls < 2)
+			return Json([
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"pollIntervalMs": Json(10L * 24 * 3600 * 1000)
+		]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json(["content": Json.emptyArray])
+		]);
+	};
+	c.awaitTask("t1");
+	assert(sleeps == [ClientSettings.init.maxTaskPollInterval]);
+}
+
+unittest  // awaitTask never sleeps past ClientSettings.taskTimeout
+{
+	ClientSettings s;
+	s.taskTimeout = 5.seconds;
+	auto c = McpClient.http("http://localhost", s);
+	Duration[] sleeps;
+	c.onTaskSleepForTest = (Duration d) @safe { sleeps ~= d; };
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (++polls < 2)
+			return Json([
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"pollIntervalMs": Json(50_000)
+		]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json(["content": Json.emptyArray])
+		]);
+	};
+	c.awaitTask("t1");
+	assert(sleeps.length == 1 && sleeps[0] <= 5.seconds,
+			"the poll sleep must end by the task deadline");
+}
+
+unittest  // cancelling a task wait wakes it from a long poll interval
+{
+	import core.time : MonoTime;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tasks/cancel")
+			return Json.emptyObject;
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"pollIntervalMs": Json(30_000)
+		]);
+	};
+	auto token = new CancellationToken;
+	Duration took = Duration.max;
+	int code;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		const start = MonoTime.currTime;
+		try
+			c.awaitTaskImpl("t1", null, token);
+		catch (McpException e)
+			code = e.code;
+		catch (Exception)
+		{
+		}
+		took = MonoTime.currTime - start;
+	});
+	runTask(() nothrow{
+		try
+		{
+			sleep(100.msecs);
+			token.cancel();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(code == ErrorCode.requestCancelled);
+	assert(took < 2.seconds, "a cancelled task wait must not sleep out the poll interval");
 }
 
 unittest  // awaitTask fails fast on input_required when no handler is given
@@ -9247,6 +9389,61 @@ unittest  // the poll loop clamps a tiny nextPollMs up to the default 1000 ms fl
 	c.onEventPollSleepForTest = (Duration d) @safe { slept = d; sub.cancel(); };
 	c.runPollLoop(sub, PollParams("incident.created"), null, null);
 	assert(slept == 1.seconds);
+}
+
+unittest  // the poll loop caps a huge nextPollMs at EventClientSettings.pollCeiling
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.onRpcForTest = (string method, Json params) @safe {
+		PollResult r;
+		r.cursor = "c";
+		r.nextPollMs = 10L * 24 * 3600 * 1000;
+		return r.toJson();
+	};
+	Duration slept;
+	auto sub = new EventSubscription();
+	c.onEventPollSleepForTest = (Duration d) @safe { slept = d; sub.cancel(); };
+	c.runPollLoop(sub, PollParams("incident.created"), null, null);
+	assert(slept == EventClientSettings.init.pollCeiling);
+}
+
+unittest  // cancelling a poll subscription wakes its loop from a long nextPollMs
+{
+	import core.time : MonoTime;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	c.onRpcForTest = (string method, Json params) @safe {
+		PollResult r;
+		r.cursor = "c";
+		r.nextPollMs = 30_000;
+		return r.toJson();
+	};
+	auto sub = new EventSubscription();
+	Duration took = Duration.max;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		const start = MonoTime.currTime;
+		try
+			c.runPollLoop(sub, PollParams("incident.created"), null, null);
+		catch (Exception)
+		{
+		}
+		took = MonoTime.currTime - start;
+	});
+	runTask(() nothrow{
+		try
+		{
+			sleep(100.msecs);
+			sub.cancel();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(took < 2.seconds, "a cancelled poll subscription must not sleep out nextPollMs");
 }
 
 unittest  // the poll floor is configurable via EventClientSettings

@@ -5,7 +5,10 @@
 /// watermark, liveness, and to tear the subscription down.
 module mcp.client.event_subscription;
 
+import core.time : Duration;
 import std.typecons : Nullable;
+
+import vibe.core.sync : LocalManualEvent, createManualEvent;
 
 import mcp.protocol.events : DeliveryMode;
 
@@ -29,6 +32,9 @@ final class EventSubscription
 	private bool[string] seen_;
 	private string[] seenRing_;
 	private size_t seenHead_;
+	// Emitted when the subscription stops, waking a loop parked in `sleepWhileActive`.
+	private LocalManualEvent stopped_;
+	private bool stoppedInit_;
 
 	/// The latest safe-to-persist watermark seen on this subscription — from a poll
 	/// result, a delivered occurrence, or an `active`/`heartbeat`/`gap` control.
@@ -59,8 +65,31 @@ final class EventSubscription
 		if (cancelled_)
 			return;
 		cancelled_ = true;
+		wakeSleepers();
 		if (teardown_ !is null)
 			teardown_();
+	}
+
+	/// Park the calling task for up to `d`, returning early once the subscription
+	/// is cancelled or terminated, so a delivery loop never sleeps out a long
+	/// server-chosen interval after it has been stopped.
+	package void sleepWhileActive(Duration d) @safe
+	{
+		if (!active || d <= Duration.zero)
+			return;
+		if (!stoppedInit_)
+		{
+			stopped_ = createManualEvent();
+			stoppedInit_ = true;
+		}
+		const ec = stopped_.emitCount;
+		stopped_.wait(d, ec);
+	}
+
+	private void wakeSleepers() @safe nothrow
+	{
+		if (stoppedInit_)
+			stopped_.emit();
 	}
 
 	// --- factory/loop seams (package-visible) ------------------------------
@@ -126,6 +155,7 @@ final class EventSubscription
 		if (terminated_)
 			return;
 		terminated_ = true;
+		wakeSleepers();
 		if (!cancelled_ && onEnd_ !is null)
 			onEnd_();
 	}
