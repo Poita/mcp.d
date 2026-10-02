@@ -1068,15 +1068,17 @@ final class McpClient : ClientProtocol
 	///   - success → modern server; switch to the newest mutually-supported
 	///     version (modern mode if that version uses per-request
 	///     `_meta`, otherwise an `initialize` handshake for that stable version);
-	///   - `Method not found` (-32601) → legacy server; fall back to the
-	///     `initialize` handshake;
+	///   - `Method not found` (-32601) or another JSON-RPC rejection → legacy
+	///     server; fall back to the `initialize` handshake;
 	///   - `UnsupportedProtocolVersionError` (-32022) → modern server; pick from
 	///     the advertised `supported` list rather than falling back;
 	///   - HTTP 400/404/405 without a recognised modern error → an older server;
 	///     try a Streamable HTTP `initialize`, and only if that is rejected the
 	///     same way fall back to the 2024-11-05 HTTP+SSE transport.
 	/// Returns the negotiated protocol version. Throws if there is no mutually
-	/// supported version, or on any other error.
+	/// supported version, or on any other error — including a probe that times
+	/// out, fails at the transport, or gets an internal error, none of which
+	/// identify a legacy server.
 	ProtocolVersion connect() @safe
 	{
 		string[] serverVersions;
@@ -1118,6 +1120,11 @@ final class McpClient : ClientProtocol
 		}
 		catch (McpException e)
 		{
+			// A timeout, a dead transport, a local failure or a server internal
+			// error says nothing about the peer's protocol era, so it is surfaced
+			// rather than read as a legacy server.
+			if (!isDiscoverRejection(e))
+				throw e;
 			// Only UnsupportedProtocolVersionError carries a version list to
 			// negotiate from. Any other JSON-RPC error means the peer does not
 			// serve `server/discover` (legacy servers answer -32601, -32600,
@@ -1167,6 +1174,17 @@ final class McpClient : ClientProtocol
 			initialize(chosen.toWire); // modern discovery, legacy version
 		}
 		return negotiated;
+	}
+
+	/// Whether `e`, raised by the `server/discover` probe, is the peer's JSON-RPC
+	/// rejection of the method rather than a failure to get any answer: not a
+	/// timeout, a closed transport, a cancellation, or an internal error (the code
+	/// local transport failures carry).
+	private static bool isDiscoverRejection(McpException e) @safe
+	{
+		if (cast(RequestTimeoutException) e || cast(TransportClosedException) e)
+			return false;
+		return e.code != ErrorCode.internalError && e.code != ErrorCode.requestCancelled;
 	}
 
 	/// Connect using a `server/discover` result obtained earlier, performing the
@@ -8686,6 +8704,32 @@ unittest  // connect() falls back to initialize when the discover probe gets any
 			return r;
 		};
 		assert(c.connect() == latestLegacy);
+	}
+}
+
+unittest  // connect() rethrows a probe timeout, transport failure or internal error instead of assuming a legacy server
+{
+	import std.exception : collectException;
+
+	McpException[] failures = [
+		new RequestTimeoutException("timed out"),
+		new TransportClosedException("stdio channel closed"),
+		new McpException(ErrorCode.internalError, "connection refused"),
+	];
+	foreach (failure; failures)
+	{
+		auto transport = new RecordingClientTransport();
+		auto c = new McpClient(transport);
+		bool initialized;
+		transport.responder = (Json message, long expectId) @safe {
+			if (message["method"].get!string == "server/discover")
+				throw failure;
+			initialized = true;
+			return Json.emptyObject;
+		};
+		auto thrown = collectException!McpException(c.connect());
+		assert(thrown is failure, "connect() must surface the probe failure");
+		assert(!initialized, "a failed probe must not fall back to initialize");
 	}
 }
 
