@@ -47,7 +47,8 @@ struct JwtVerifierConfig
 	string jwksUri;
 
 	/// PEM-encoded public keys (`-----BEGIN PUBLIC KEY-----`) pinned directly,
-	/// tried in order. An alternative to `jwksUri` for static deployments.
+	/// tried in order. An alternative to `jwksUri` for static deployments. RSA
+	/// keys shorter than 2048 bits never verify a token.
 	string[] staticPublicKeysPem;
 
 	/// The required token issuer (`iss`). When set, a token whose `iss` differs
@@ -274,6 +275,9 @@ package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) 
 // JWS signature verification (OpenSSL EVP)
 // ===========================================================================
 
+/// The smallest RSA modulus, in bits, accepted for RS256 verification.
+private enum int minRsaKeyBits = 2048;
+
 /// Verify a JWS signature over `signingInput` for the given `alg` using the PEM
 /// public key. For ES256 the signature is the raw 64-byte R||S form (RFC 7518
 /// §3.4), converted to DER before handing to OpenSSL.
@@ -293,7 +297,9 @@ package bool verifyJws(string alg, const(ubyte)[] signingInput,
 	const baseId = EVP_PKEY_base_id(pkey);
 	if (alg == "RS256")
 	{
-		if (baseId != EVP_PKEY_RSA)
+		// The same 2048-bit floor JWKS keys are held to (NIST SP 800-131A), so a
+		// weak pinned PEM key is not a way around it.
+		if (baseId != EVP_PKEY_RSA || EVP_PKEY_bits(pkey) < minRsaKeyBits)
 			return false;
 	}
 	else if (alg == "ES256")
@@ -498,7 +504,7 @@ private string rsaJwkToPem(Jwk jwk) @trusted
 		return null;
 	}
 	// Reject keys shorter than 2048 bits (NIST SP 800-131A / RFC 8017).
-	if (BN_num_bits(n) < 2048)
+	if (BN_num_bits(n) < minRsaKeyBits)
 	{
 		BN_free(n);
 		BN_free(e);
@@ -1130,6 +1136,21 @@ unittest  // a bad-signature ES256 token (verified against the wrong EC key) fai
 
 	auto ti = verifyToken(cfg, tampered, new NoKeys, 1_700_001_000);
 	assert(!ti.valid);
+}
+
+unittest  // a pinned RSA public key shorter than 2048 bits is not used to verify
+{
+	// A 1024-bit RSA key and an RS256 token it signed correctly.
+	enum weakPem = "-----BEGIN PUBLIC KEY-----\n"
+		~ "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC677t17xuMpPQagrUx7LYzqLJh\n"
+		~ "EM/uXXIIPC5rlQh8rZFHNl1Nozt6XWq3Bvd+Gesl3eZ/PVd0B+IYU/V8+Fex/fst\n"
+		~ "W8pqucd+wGhFUUa7Q24u1momdVAhYOW2M+na8V3TBcr7snfNd+L7L8pkmZiGRos3\n"
+		~ "EKi8uzdJlHOeNGMmmQIDAQAB\n" ~ "-----END PUBLIC KEY-----\n";
+	enum weakToken = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ3ZWFrIiwiZXhwIjoxNzAwMDAzNjAwfQ." ~ "Mpded0h9CGy8Ro-2N5OEpJCCMd1E9FLE0XxqEtNXi4D3bxDW1shcbyKNfRNeOMZCOPSdAi3z8etblLoiCDrr3a_" ~ "wfnC_cfHQ9rK2Uq541N77MF1fmvptAdE6VnsRmjh5Kzqu8VaGVP4_q2Gra7OEFciZQ6kXpFMO3w-1_gMMzRs";
+
+	JwtVerifierConfig cfg;
+	cfg.staticPublicKeysPem = [weakPem];
+	assert(!verifyToken(cfg, weakToken, new NoKeys, 1_700_001_000).valid);
 }
 
 unittest  // a malformed signature segment is invalid without raising (no per-request warning)
