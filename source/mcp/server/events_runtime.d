@@ -1186,7 +1186,7 @@ final class EventsRuntime
 	void terminateEventType(string name, Json error) @safe
 	{
 		terminateMatching((PushStream s) @safe => s.name == name,
-				(WebhookSubscription w) @safe => w.name == name, error);
+				(WebhookSubscription w) @safe => w.name == name, error, name);
 	}
 
 	/// End every subscription `principal` holds — to event type `name`, or to
@@ -1197,16 +1197,19 @@ final class EventsRuntime
 		terminateMatching((PushStream s) @safe => s.principal == principal
 				&& (name.length == 0 || s.name == name),
 				(WebhookSubscription w) @safe => w.principal == principal
-				&& (name.length == 0 || w.name == name), error);
+				&& (name.length == 0 || w.name == name), error, name);
 	}
 
+	// End the push streams and webhook subscriptions the predicates select. A
+	// non-empty `name` narrows the webhook candidates to that event type, read
+	// through the store's name index rather than a scan of every subscription.
 	private void terminateMatching(bool delegate(PushStream) @safe pushPred,
-			bool delegate(WebhookSubscription) @safe webhookPred, Json error) @safe
+			bool delegate(WebhookSubscription) @safe webhookPred, Json error, string name = "") @safe
 	{
 		foreach (s; pushStreams_.dup)
 			if (pushPred(s))
 				terminatePush(s, error);
-		foreach (w; webhookStore_.all())
+		foreach (w; name.length ? webhookStore_.byName(name) : webhookStore_.all())
 			if (webhookPred(w))
 				terminateWebhook(w.id, error);
 	}
@@ -1270,16 +1273,11 @@ final class EventsRuntime
 		// so an authenticated caller cannot exhaust server memory (and the outbound
 		// delivery budget) by subscribing without bound. A refresh of an existing
 		// subscription reuses its slot and is never rejected.
-		if (isNew && opts_.webhookMaxSubscriptionsPerPrincipal > 0)
-		{
-			int held;
-			foreach (s; webhookStore_.all())
-				if (s.principal == principal && !s.isExpired(now))
-					held++;
-			if (held >= opts_.webhookMaxSubscriptionsPerPrincipal)
-				throw resourceExhausted("Too many webhook subscriptions for this principal",
-						"webhookSubscriptions", opts_.webhookMaxSubscriptionsPerPrincipal);
-		}
+		if (isNew && opts_.webhookMaxSubscriptionsPerPrincipal > 0
+				&& webhookStore_.countByPrincipal(principal,
+					now) >= opts_.webhookMaxSubscriptionsPerPrincipal)
+			throw resourceExhausted("Too many webhook subscriptions for this principal",
+					"webhookSubscriptions", opts_.webhookMaxSubscriptionsPerPrincipal);
 
 		WebhookSubscription sub = isNew ? WebhookSubscription.init : existing.get;
 		sub.id = id;
@@ -1497,46 +1495,51 @@ final class EventsRuntime
 			return;
 		const now = opts_.nowMs();
 		bool any;
-		foreach (sub; webhookStore_.all())
-		{
-			if (sub.isExpired(now) || !sub.active)
-				continue;
-			auto reg = sub.name in types_;
-			if (regIsEmitOnly(reg))
-				continue;
-			if (auto next = sub.id in nextFetchAt_)
-				if (now < *next)
+		string[] checkBacked;
+		foreach (name; types_.byKey)
+			if (!regIsEmitOnly(name in types_))
+				checkBacked ~= name;
+		foreach (name; checkBacked)
+			foreach (sub; webhookStore_.byName(name))
+			{
+				if (sub.isExpired(now) || !sub.active)
 					continue;
-			nextFetchAt_[sub.id] = now + nextPollMsFor(*reg);
-			auto ctx = new EventContext(sub.fetchCursor, sub.arguments, sub.principal);
-			EventResult er;
-			try
-				er = reg.check(ctx);
-			catch (Exception)
-				continue; // transient upstream failure: try again next pass
-			foreach (ref occ; er.events)
-				if (occ.cursor.isNull)
-					occ.cursor = er.cursor;
-			// The check can yield, so the subscription may have been removed,
-			// refreshed, or advanced meanwhile: apply this pass's cursors to the
-			// current record, and drop the batch if another pass already fetched it.
-			auto fresh = webhookStore_.get(sub.id);
-			if (fresh.isNull || fresh.get.isExpired(opts_.nowMs())
-					|| !fresh.get.active || fresh.get.fetchCursor != sub.fetchCursor)
-				continue;
-			auto cur = fresh.get;
-			const gap = er.truncated && !er.cursor.isNull;
-			cur.fetchCursor = er.cursor;
-			if (!gap && er.events.length == 0 && (cur.id in outstanding_) is null)
-				cur.cursor = er.cursor;
-			webhookStore_.put(cur);
-			foreach (occ; er.events)
-				any |= enqueueForWebhook(cur, reg, occ, false);
-			// The gap is queued behind the batch, so the watermark reaches its
-			// position only after the batch settles and the endpoint is verified.
-			if (gap)
-				any |= enqueueGap(cur, er.cursor);
-		}
+				auto reg = sub.name in types_;
+				if (regIsEmitOnly(reg))
+					continue;
+				if (auto next = sub.id in nextFetchAt_)
+					if (now < *next)
+						continue;
+				nextFetchAt_[sub.id] = now + nextPollMsFor(*reg);
+				auto ctx = new EventContext(sub.fetchCursor, sub.arguments, sub.principal);
+				EventResult er;
+				try
+					er = reg.check(ctx);
+				catch (Exception)
+					continue; // transient upstream failure: try again next pass
+				foreach (ref occ; er.events)
+					if (occ.cursor.isNull)
+						occ.cursor = er.cursor;
+				// The check can yield, so the subscription may have been removed,
+				// refreshed, or advanced meanwhile: apply this pass's cursors to the
+				// current record, and drop the batch if another pass already fetched it.
+				auto fresh = webhookStore_.get(sub.id);
+				if (fresh.isNull || fresh.get.isExpired(opts_.nowMs())
+						|| !fresh.get.active || fresh.get.fetchCursor != sub.fetchCursor)
+					continue;
+				auto cur = fresh.get;
+				const gap = er.truncated && !er.cursor.isNull;
+				cur.fetchCursor = er.cursor;
+				if (!gap && er.events.length == 0 && (cur.id in outstanding_) is null)
+					cur.cursor = er.cursor;
+				webhookStore_.put(cur);
+				foreach (occ; er.events)
+					any |= enqueueForWebhook(cur, reg, occ, false);
+				// The gap is queued behind the batch, so the watermark reaches its
+				// position only after the batch settles and the endpoint is verified.
+				if (gap)
+					any |= enqueueGap(cur, er.cursor);
+			}
 		if (any)
 			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
 	}
@@ -1893,9 +1896,9 @@ final class EventsRuntime
 			return;
 		const now = opts_.nowMs();
 		bool any;
-		foreach (sub; webhookStore_.all())
+		foreach (sub; webhookStore_.byName(occ.name))
 		{
-			if (sub.name != occ.name || sub.isExpired(now))
+			if (sub.isExpired(now))
 				continue;
 			if (!sub.active)
 			{
@@ -4509,6 +4512,53 @@ version (unittest)
 		p.delivery = WebhookDelivery(url, testSecret);
 		return p;
 	}
+
+	// A subscription store forwarding to an in-memory one; tests override the
+	// methods whose behaviour they need to change or observe.
+	private class ForwardingStore : WebhookSubscriptionStore
+	{
+		InMemoryWebhookSubscriptionStore inner;
+
+		this() @safe
+		{
+			inner = new InMemoryWebhookSubscriptionStore();
+		}
+
+		bool durable() @safe
+		{
+			return inner.durable();
+		}
+
+		void put(WebhookSubscription sub) @safe
+		{
+			inner.put(sub);
+		}
+
+		Nullable!WebhookSubscription get(string id) @safe
+		{
+			return inner.get(id);
+		}
+
+		void remove(string id) @safe
+		{
+			inner.remove(id);
+		}
+
+		WebhookSubscription[] all() @safe
+		{
+			return inner.all();
+		}
+
+		WebhookSubscription[] byName(string name) @safe
+		{
+			return inner.byName(name);
+		}
+
+		size_t countByPrincipal(string principal, long nowMs) @safe
+		{
+			return inner.countByPrincipal(principal, nowMs);
+		}
+	}
 }
 
 unittest  // subscribeWebhook requires an authenticated principal
@@ -4588,37 +4638,11 @@ unittest  // subscribeWebhook clamps a suggested TTL down to the cap
 unittest  // subscribeWebhook grants no-expiry only when allowed
 {
 	// Stands in for a store that persists across restarts.
-	static final class DurableStore : WebhookSubscriptionStore
+	static final class DurableStore : ForwardingStore
 	{
-		InMemoryWebhookSubscriptionStore inner;
-		this() @safe
-		{
-			inner = new InMemoryWebhookSubscriptionStore();
-		}
-
-		bool durable() @safe
+		override bool durable() @safe
 		{
 			return true;
-		}
-
-		void put(WebhookSubscription sub) @safe
-		{
-			inner.put(sub);
-		}
-
-		Nullable!WebhookSubscription get(string id) @safe
-		{
-			return inner.get(id);
-		}
-
-		void remove(string id) @safe
-		{
-			inner.remove(id);
-		}
-
-		WebhookSubscription[] all() @safe
-		{
-			return inner.all();
 		}
 	}
 
@@ -4794,35 +4818,9 @@ unittest  // a throwing on_subscribe stores no webhook subscription
 
 unittest  // the delivery worker keeps running when a pass throws
 {
-	static final class FailingAllStore : WebhookSubscriptionStore
+	static final class FailingAllStore : ForwardingStore
 	{
-		InMemoryWebhookSubscriptionStore inner;
-		this() @safe
-		{
-			inner = new InMemoryWebhookSubscriptionStore();
-		}
-
-		bool durable() @safe
-		{
-			return false;
-		}
-
-		void put(WebhookSubscription sub) @safe
-		{
-			inner.put(sub);
-		}
-
-		Nullable!WebhookSubscription get(string id) @safe
-		{
-			return inner.get(id);
-		}
-
-		void remove(string id) @safe
-		{
-			inner.remove(id);
-		}
-
-		WebhookSubscription[] all() @safe
+		override WebhookSubscription[] all() @safe
 		{
 			throw new Exception("store unavailable");
 		}
@@ -6515,6 +6513,41 @@ unittest  // publish enqueues a webhook delivery; delivery happens on a queue dr
 	assert(ft.eventPosts().length == 1);
 }
 
+unittest  // subscribe and publish read only the subscriptions they concern, never the whole store
+{
+	static final class CountingStore : ForwardingStore
+	{
+		int allCalls;
+
+		override WebhookSubscription[] all() @safe
+		{
+			allCalls++;
+			return inner.all();
+		}
+	}
+
+	auto store = new CountingStore();
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliverySleep = (Duration d) @safe {};
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	auto rt = new EventsRuntime(store, o);
+	EventRegistration n = {descriptor: EventType("n"), emitOnly: true};
+	EventRegistration other = {descriptor: EventType("other"), emitOnly: true};
+	rt.register(n);
+	rt.register(other);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/a"), "user-1");
+	rt.subscribeWebhook(webhookSub("other", "https://proxy/b"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(store.allCalls == 0);
+	auto delivered = ft.eventPosts();
+	assert(delivered.length == 1 && delivered[0].url == "https://proxy/a");
+}
+
 unittest  // a job for a subscription that lapsed before delivery is acked without a POST
 {
 	long now = 1_000_000;
@@ -6774,40 +6807,15 @@ unittest  // a delivery whose store throws is dead-lettered, not looped invisibl
 
 	// A store that throws on get() once a subscription has been written, so the
 	// delivery worker's deliverWithRetry throws after the job is enqueued.
-	static final class ThrowingStore : WebhookSubscriptionStore
+	static final class ThrowingStore : ForwardingStore
 	{
-		InMemoryWebhookSubscriptionStore inner;
 		bool throwOnGet;
-		this() @safe
-		{
-			inner = new InMemoryWebhookSubscriptionStore();
-		}
 
-		bool durable() @safe
-		{
-			return false;
-		}
-
-		void put(WebhookSubscription sub) @safe
-		{
-			inner.put(sub);
-		}
-
-		Nullable!WebhookSubscription get(string id) @safe
+		override Nullable!WebhookSubscription get(string id) @safe
 		{
 			if (throwOnGet)
 				throw new Exception("store unavailable");
 			return inner.get(id);
-		}
-
-		void remove(string id) @safe
-		{
-			inner.remove(id);
-		}
-
-		WebhookSubscription[] all() @safe
-		{
-			return inner.all();
 		}
 	}
 

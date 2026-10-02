@@ -385,18 +385,39 @@ interface WebhookSubscriptionStore
 	/// Drop the subscription identified by `id`. A no-op if unknown.
 	void remove(string id) @safe;
 
-	/// Every stored subscription. The runtime applies expiry and name filtering;
-	/// the store need not.
+	/// Every stored subscription. The runtime applies expiry filtering; the store
+	/// need not. Used only by the periodic sweep; per-event paths use `byName`.
 	WebhookSubscription[] all() @safe;
+
+	/// Every stored subscription to event type `name`, lapsed or not. Called on
+	/// every publish, so a store should answer it from an index on `name` rather
+	/// than by scanning.
+	WebhookSubscription[] byName(string name) @safe;
+
+	/// How many of `principal`'s subscriptions are live (not lapsed) at `nowMs`,
+	/// for the per-principal subscription cap.
+	size_t countByPrincipal(string principal, long nowMs) @safe;
 }
 
-/// In-memory `WebhookSubscriptionStore` backed by an associative array. The
-/// default store; records are serialized to JSON and re-parsed on read so a
-/// returned record never aliases stored state. Lost on restart — which is the
-/// deliberate trade for short-TTL soft state (clients re-subscribe on refresh).
+/// In-memory `WebhookSubscriptionStore` backed by an associative array, indexed
+/// by event type name and by principal. The default store; records are
+/// serialized to JSON and re-parsed on read so a returned record never aliases
+/// stored state. Lost on restart — which is the deliberate trade for short-TTL
+/// soft state (clients re-subscribe on refresh).
 final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 {
-	private Json[string] records_;
+	private static struct Record
+	{
+		Json json;
+		string name;
+		string principal;
+		bool noExpiry;
+		long expiresAtMs;
+	}
+
+	private Record[string] records_;
+	private bool[string][string] idsByName_; // name -> ids
+	private bool[string][string] idsByPrincipal_; // principal -> ids
 
 	bool durable() @safe
 	{
@@ -405,27 +426,68 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 
 	void put(WebhookSubscription sub) @safe
 	{
-		records_[sub.id] = sub.toJson();
+		remove(sub.id);
+		records_[sub.id] = Record(sub.toJson(), sub.name, sub.principal,
+				sub.noExpiry, sub.expiresAtMs);
+		idsByName_[sub.name][sub.id] = true;
+		idsByPrincipal_[sub.principal][sub.id] = true;
 	}
 
 	Nullable!WebhookSubscription get(string id) @safe
 	{
 		if (auto p = id in records_)
-			return nullable(WebhookSubscription.fromJson(*p));
+			return nullable(WebhookSubscription.fromJson(p.json));
 		return Nullable!WebhookSubscription.init;
 	}
 
 	void remove(string id) @safe
 	{
+		auto p = id in records_;
+		if (p is null)
+			return;
+		unindex(idsByName_, p.name, id);
+		unindex(idsByPrincipal_, p.principal, id);
 		records_.remove(id);
 	}
 
 	WebhookSubscription[] all() @safe
 	{
 		WebhookSubscription[] result;
-		foreach (_, v; records_)
-			result ~= WebhookSubscription.fromJson(v);
+		foreach (_, r; records_)
+			result ~= WebhookSubscription.fromJson(r.json);
 		return result;
+	}
+
+	WebhookSubscription[] byName(string name) @safe
+	{
+		WebhookSubscription[] result;
+		if (auto ids = name in idsByName_)
+			foreach (id, _; *ids)
+				result ~= WebhookSubscription.fromJson(records_[id].json);
+		return result;
+	}
+
+	size_t countByPrincipal(string principal, long nowMs) @safe
+	{
+		size_t n;
+		if (auto ids = principal in idsByPrincipal_)
+			foreach (id, _; *ids)
+			{
+				const r = records_[id];
+				if (r.noExpiry || nowMs < r.expiresAtMs)
+					n++;
+			}
+		return n;
+	}
+
+	private static void unindex(ref bool[string][string] index, string key, string id) @safe
+	{
+		if (auto ids = key in index)
+		{
+			(*ids).remove(id);
+			if ((*ids).length == 0)
+				index.remove(key);
+		}
 	}
 }
 
@@ -860,6 +922,45 @@ unittest  // InMemoryWebhookSubscriptionStore put/get/remove/all
 	assert(store.all().length == 1);
 	store.remove("id1");
 	assert(store.get("id1").isNull && store.all().length == 0);
+}
+
+unittest  // InMemoryWebhookSubscriptionStore.byName returns only that event type's subscriptions
+{
+	auto store = new InMemoryWebhookSubscriptionStore();
+	foreach (id, name; ["a": "x", "b": "y", "c": "x"])
+	{
+		WebhookSubscription s;
+		s.id = id;
+		s.name = name;
+		store.put(s);
+	}
+	assert(store.byName("x").length == 2 && store.byName("y").length == 1);
+	assert(store.byName("z").length == 0);
+	store.remove("a");
+	assert(store.byName("x").length == 1 && store.byName("x")[0].id == "c");
+}
+
+unittest  // InMemoryWebhookSubscriptionStore.countByPrincipal counts only live subscriptions
+{
+	auto store = new InMemoryWebhookSubscriptionStore();
+	WebhookSubscription live, lapsed, forever, other;
+	live.id = "live";
+	live.principal = "p";
+	live.expiresAtMs = 2_000;
+	lapsed.id = "lapsed";
+	lapsed.principal = "p";
+	lapsed.expiresAtMs = 500;
+	forever.id = "forever";
+	forever.principal = "p";
+	forever.noExpiry = true;
+	other.id = "other";
+	other.principal = "q";
+	other.expiresAtMs = 2_000;
+	foreach (s; [live, lapsed, forever, other])
+		store.put(s);
+	assert(store.countByPrincipal("p", 1_000) == 2);
+	assert(store.countByPrincipal("q", 1_000) == 1);
+	assert(store.countByPrincipal("nobody", 1_000) == 0);
 }
 
 unittest  // InMemoryWebhookSubscriptionStore returns isolated copies (no aliasing)
