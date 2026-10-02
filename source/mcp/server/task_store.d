@@ -354,13 +354,15 @@ unittest  // nested Json in a fetched or written record does not alias stored st
 	// The caller's own copy stays independent after the write.
 	r.inputRequests["k"]["method"] = "sampling/createMessage";
 	r.executorInput["list"][0] = 2;
-	r.checkpoints["c"]["v"] = 2;
+	// Checkpoints are written through `in` pointers: DMD 2.113 crashes compiling
+	// a chained `aa[k][k2] = v` on a `Json[string]`.
+	(*("c" in r.checkpoints))["v"] = 2;
 	r.result.get["ok"] = false;
 
 	auto fetched = s.get("deep").get;
 	fetched.inputRequests["k"]["method"] = "roots/list";
 	fetched.executorInput["list"][0] = 3;
-	fetched.checkpoints["c"]["v"] = 3;
+	(*("c" in fetched.checkpoints))["v"] = 3;
 	fetched.result.get["ok"] = false;
 
 	auto again = s.get("deep").get;
@@ -371,7 +373,7 @@ unittest  // nested Json in a fetched or written record does not alias stored st
 
 	// compareAndSwap stores its own copy too.
 	assert(s.compareAndSwap(again, again.revision));
-	again.checkpoints["c"]["v"] = 4;
+	(*("c" in again.checkpoints))["v"] = 4;
 	assert(s.get("deep").get.checkpoints["c"]["v"].get!int == 1);
 }
 
