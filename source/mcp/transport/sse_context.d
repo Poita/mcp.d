@@ -9,7 +9,8 @@ import vibe.http.server : HTTPServerResponse;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
-import mcp.transport.coordinator : throwOrReturn;
+import mcp.transport.coordinator : throwOrReturn, defaultServerRequestTimeout,
+	RequestTimeoutException, cancelledNotification;
 import mcp.protocol.capabilities;
 import mcp.protocol.mrtr : withListenSubscriptionId;
 import mcp.protocol.versions : ProtocolVersion, latestLegacy, supportsProgressMessage;
@@ -51,6 +52,10 @@ final class StreamCoordinator
 	private long counter = 1;
 	private Waiter[WaiterKey] waiters;
 	private long streamCounter = 0;
+
+	/// How long a server->client request issued through this mount waits for
+	/// the client's reply; set from the transport options.
+	Duration requestTimeout = defaultServerRequestTimeout;
 
 	/// Allocate a fresh outbound request id.
 	long alloc() @safe
@@ -99,7 +104,7 @@ final class StreamCoordinator
 		{
 			const newEc = () @trusted { return w.evt.wait(timeout, ec); }();
 			if (newEc == ec && !w.done)
-				throw internalError("Timed out awaiting client response");
+				throw new RequestTimeoutException("Timed out awaiting client response");
 			ec = newEc;
 		}
 		return throwOrReturn(w.result, w.error, "client error");
@@ -145,7 +150,7 @@ final class StreamCoordinator
 			{
 				remaining -= thisSlice;
 				if (remaining <= Duration.zero)
-					throw internalError("Timed out awaiting client response");
+					throw new RequestTimeoutException("Timed out awaiting client response");
 				continue;
 			}
 			ec = newEc;
@@ -1317,12 +1322,15 @@ final class ServerPushChannel : PushChannel
 	/// resolve this one's pending request. The empty token is the stateless /
 	/// shared path (any unscoped listener, resolvable only by an unscoped reply).
 	///
-	/// Returns the client's result, or throws `McpException` on a client error or
-	/// timeout. Throws `internalError` if no matching GET listener is connected
-	/// (there is nobody to answer). The request/response counterpart to `broadcast`
-	/// / `pushToSession`, and the foundation for the server-initiated `ping`.
+	/// Returns the client's result, or throws `McpException` on a client error.
+	/// Throws `internalError` if no matching GET listener is connected (there is
+	/// nobody to answer), and `RequestTimeoutException` when no reply arrives
+	/// within `timeout` (`Duration.zero`: the coordinator's `requestTimeout`), after
+	/// sending the session `notifications/cancelled` for the request. The
+	/// request/response counterpart to `broadcast` / `pushToSession`, and the
+	/// foundation for the server-initiated `ping`.
 	Json requestOnSession(string sessionToken, string method,
-			Json params = Json.emptyObject, Duration timeout = 60.seconds) @safe
+			Json params = Json.emptyObject, Duration timeout = Duration.zero) @safe
 	{
 		const id = coord.alloc();
 		coord.register(id, sessionToken);
@@ -1347,9 +1355,17 @@ final class ServerPushChannel : PushChannel
 		// Liveness defense-in-depth: even if a disconnect is somehow missed, polling
 		// whether the bound listener is still connected releases the fiber within one
 		// slice instead of the full timeout (mirrors the POST path's `awaitLive`).
-		return coord.awaitLive(id, () @safe => isRequestBound(WaiterKey(sessionToken, id)),
-				internalError("GET SSE listener disconnected before the client responded"),
-				timeout, 250.msecs, sessionToken);
+		try
+			return coord.awaitLive(id, () @safe => isRequestBound(WaiterKey(sessionToken, id)),
+					internalError("GET SSE listener disconnected before the client responded"),
+					timeout == Duration.zero ? coord.requestTimeout : timeout,
+					250.msecs, sessionToken);
+		catch (RequestTimeoutException e)
+		{
+			deliver(cancelledNotification(id, "request timed out"),
+					(ref const Listener l) @safe => l.ownerToken == sessionToken);
+			throw e;
+		}
 	}
 
 	/// Initiate a `ping` toward the client on the session's GET SSE stream and
@@ -2642,17 +2658,29 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		// otherwise leave this fiber parked for the full timeout. A resumable stream
 		// lives as long as its request and session; any other stream lives as long
 		// as its connection.
-		if (replay_ !is null)
+		try
 		{
-			auto replay = replay_;
-			const ordinal = streamId;
-			return coord.awaitLive(id, () @safe => replay.streamOpen(ordinal),
-					internalError("session closed before the client responded"),
-					60.seconds, 250.msecs, token_);
+			if (replay_ !is null)
+			{
+				auto replay = replay_;
+				const ordinal = streamId;
+				return coord.awaitLive(id, () @safe => replay.streamOpen(ordinal),
+						internalError("session closed before the client responded"),
+						coord.requestTimeout, 250.msecs, token_);
+			}
+			return coord.awaitLive(id, connAlive_,
+					internalError("client disconnected before responding"),
+					coord.requestTimeout, 250.msecs, token_);
 		}
-		return coord.awaitLive(id, connAlive_,
-				internalError("client disconnected before responding"),
-				60.seconds, 250.msecs, token_);
+		catch (RequestTimeoutException e)
+		{
+			try
+				writeEvent(cancelledNotification(id, "request timed out"));
+			catch (Exception)
+			{
+			}
+			throw e;
+		}
 	}
 
 	bool clientSupports(ClientCapability cap) @safe
@@ -3990,4 +4018,50 @@ unittest  // a resumable POST stream's server->client request fails once its ses
 	});
 	runEventLoop();
 	assert(failure == "session closed before the client responded", failure);
+}
+
+unittest  // a POST stream's server->client request times out after the mount's timeout and is cancelled
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	coord.requestTimeout = 20.msecs;
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
+			TokenInfo.invalid(), false, latestLegacy, "sess-A");
+	ctx.setConnectionProbe(() @safe => true);
+
+	bool timedOut;
+	try
+		ctx.elicitRaw(Json.emptyObject);
+	catch (RequestTimeoutException)
+		timedOut = true;
+	assert(timedOut);
+	const body_ = () @trusted { return cast(string) sink.data.idup; }();
+	assert(body_.canFind(`"method":"notifications/cancelled"`), body_);
+	assert(body_.canFind(`"requestId":1`), body_);
+}
+
+unittest  // a timed-out push-channel request is cancelled on the session's stream
+{
+	import std.algorithm : canFind;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string[] frames;
+	ch.addListener((string f) @safe { frames ~= f; }, Json.init, ListenFilter.init, "", null, "S");
+
+	bool timedOut;
+	try
+		ch.requestOnSession("S", "ping", Json.emptyObject, 20.msecs);
+	catch (RequestTimeoutException)
+		timedOut = true;
+	assert(timedOut);
+	assert(frames.length == 2);
+	assert(frames[1].canFind(`"method":"notifications/cancelled"`));
+	assert(frames[1].canFind(`"requestId":1`));
 }

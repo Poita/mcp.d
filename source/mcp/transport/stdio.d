@@ -5,6 +5,7 @@ import vibe.data.json : Json;
 
 import mcp.server.server;
 import mcp.server.settings : ServerSettings;
+import mcp.transport.coordinator : defaultServerRequestTimeout;
 import mcp.transport.duplex : DuplexChannel, defaultMaxLineBytes;
 
 @safe:
@@ -80,7 +81,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 
 	Json serverRequest(string method, Json params) @safe
 	{
-		return channel.request(method, params);
+		return channel.request(method, params, opts.serverRequestTimeout);
 	}
 
 	// Background ticker for modern `events/stream` push: poll-driven event types and
@@ -305,6 +306,11 @@ struct StdioOptions
 	/// How long the transport waits, once stdin reaches end-of-input, for request
 	/// handlers still running to finish and write their replies before it returns.
 	Duration drainTimeout = 5.seconds;
+
+	/// How long a server->client request (elicitation, sampling, roots) waits for
+	/// the client's reply before it fails with `RequestTimeoutException` and is
+	/// cancelled toward the client with `notifications/cancelled`.
+	Duration serverRequestTimeout = defaultServerRequestTimeout;
 }
 
 /// Serve `server` over stdio with default options except for `maxLineBytes`

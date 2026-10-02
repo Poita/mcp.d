@@ -1,6 +1,6 @@
 module mcp.transport.coordinator;
 
-import core.time : Duration, seconds;
+import core.time : Duration, seconds, minutes;
 
 import vibe.core.sync : LocalManualEvent, createManualEvent;
 import vibe.data.json : Json;
@@ -8,6 +8,32 @@ import vibe.data.json : Json;
 import mcp.protocol.errors;
 
 @safe:
+
+/// How long a server->client request (elicitation, sampling, roots) waits for
+/// the client's reply unless the transport options say otherwise. Generous,
+/// because elicitation and sampling may wait on a human.
+enum Duration defaultServerRequestTimeout = 5.minutes;
+
+/// Thrown when a peer does not reply to a request within its timeout.
+class RequestTimeoutException : McpException
+{
+	this(string message, string file = __FILE__, size_t line = __LINE__) @safe
+	{
+		super(ErrorCode.internalError, message, Json.undefined, file, line);
+	}
+}
+
+/// The `notifications/cancelled` a requester sends for its request `id` once it
+/// stops waiting for the reply, so the peer can abandon the work.
+Json cancelledNotification(long id, string reason) @safe
+{
+	import mcp.protocol.jsonrpc : makeNotification;
+
+	Json params = Json.emptyObject;
+	params["requestId"] = id;
+	params["reason"] = reason;
+	return makeNotification("notifications/cancelled", params);
+}
 
 /// Resolve a settled waiter's outcome into a value or an exception: if `error`
 /// is a JSON-RPC error object, throw `McpException` decoded from its `code`
@@ -112,7 +138,8 @@ final class DuplexCoordinator
 		{
 			const newEc = () @trusted { return w.evt.wait(timeout, ec); }();
 			if (newEc == ec && !w.done)
-				throw internalError("Timed out awaiting peer response to request " ~ idStr(id));
+				throw new RequestTimeoutException(
+						"Timed out awaiting peer response to request " ~ idStr(id));
 			ec = newEc;
 		}
 		return throwOrReturn(w.result, w.error, "peer error");

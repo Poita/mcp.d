@@ -8,7 +8,8 @@ import vibe.data.json : Json;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
-import mcp.transport.coordinator : DuplexCoordinator;
+import mcp.transport.coordinator : DuplexCoordinator, RequestTimeoutException,
+	cancelledNotification;
 
 @safe:
 
@@ -278,9 +279,10 @@ final class DuplexChannel
 
 	/// Originate a server->client request (the SERVER path: sampling / elicitation
 	/// / roots / ping), allocating a fresh id, and block until the peer replies.
-	/// Returns its result, or throws `McpException` on an error reply / timeout /
-	/// channel close.
-	Json request(string method, Json params, Duration timeout = 60.seconds) @safe
+	/// Returns its result, or throws `McpException` on an error reply / channel
+	/// close, or `RequestTimeoutException` after `timeout`, once the request has
+	/// been cancelled toward the peer with `notifications/cancelled`.
+	Json request(string method, Json params, Duration timeout) @safe
 	{
 		if (closed_)
 			throw internalError("stdio channel closed");
@@ -294,7 +296,17 @@ final class DuplexChannel
 			coord.cancel(id);
 			throw e;
 		}
-		return coord.await(id, timeout);
+		try
+			return coord.await(id, timeout);
+		catch (RequestTimeoutException e)
+		{
+			try
+				send(cancelledNotification(id, "request timed out"));
+			catch (Exception)
+			{
+			}
+			throw e;
+		}
 	}
 
 	/// Write one JSON-RPC `message` as a single newline-delimited line, serialized
@@ -782,7 +794,7 @@ unittest  // a failing writeLine propagates out of request() instead of being sw
 				throw new Exception("stdout write failed (peer closed its read end)");
 			}, (Message) @safe {});
 			try
-				channel.request("ping", Json.emptyObject);
+				channel.request("ping", Json.emptyObject, 30.seconds);
 			catch (Exception)
 				threw = true;
 		}
@@ -1144,4 +1156,40 @@ unittest  // reaching end-of-input reports nothing
 	ch.onError = (string msg) @safe nothrow{ reported ~= msg; };
 	ch.runReadLoop();
 	assert(reported.length == 0);
+}
+
+unittest  // a timed-out server->client request is followed by notifications/cancelled for its id
+{
+	import core.time : msecs;
+	import vibe.data.json : parseJsonString;
+
+	auto toClient = new LineLink;
+	string[] sent;
+	bool timedOut;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return toClient.take(); }, (string s) @safe {
+				sent ~= s;
+			}, (Message) @safe {});
+			channel.start();
+			try
+				channel.request("elicitation/create", Json.emptyObject, 20.msecs);
+			catch (RequestTimeoutException)
+				timedOut = true;
+			toClient.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(timedOut);
+	assert(sent.length == 2, "the timed-out request must be cancelled on the wire");
+	const req = parseJsonString(sent[0]);
+	const note = parseJsonString(sent[1]);
+	assert(note["method"].get!string == "notifications/cancelled");
+	assert(note["params"]["requestId"] == req["id"]);
 }

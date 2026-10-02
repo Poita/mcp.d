@@ -14,6 +14,8 @@ import mcp.protocol.versions;
 import mcp.protocol.modern;
 import mcp.protocol.mrtr;
 import mcp.protocol.events;
+import mcp.transport.coordinator : defaultServerRequestTimeout,
+	RequestTimeoutException, cancelledNotification;
 import mcp.transport.sse_context;
 import mcp.transport.session;
 import mcp.auth.resource_server;
@@ -102,6 +104,11 @@ struct StreamableHttpOptions
 	/// instead of the console. Ignored unless `accessLog` is set.
 	string accessLogFile = "";
 
+	/// How long a server->client request (elicitation, sampling, roots) waits for
+	/// the client's reply before it fails with `RequestTimeoutException` and is
+	/// cancelled toward the client with `notifications/cancelled`.
+	Duration serverRequestTimeout = defaultServerRequestTimeout;
+
 	/// Stateful servers only: a session with no request and no open GET stream
 	/// for this long is expired (`Duration.zero` disables expiry).
 	Duration sessionIdleTtl = SessionManager.defaultIdleTtl;
@@ -179,6 +186,7 @@ void mountMcp(URLRouter router, McpServer server,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
 	auto coord = new StreamCoordinator;
+	coord.requestTimeout = opts.serverRequestTimeout;
 	// Session minting is derived from the server's mode: a `stateful`
 	// server mints/tracks an `Mcp-Session-Id`; a `stateless` server never does.
 	auto sessions = server.mode == ServerMode.stateful
@@ -312,6 +320,7 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
 	auto channel = new LegacySseChannel(opts.legacyMessagePath);
+	channel.coord.requestTimeout = opts.serverRequestTimeout;
 
 	router.get(opts.legacySsePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		if (!guardOrigin(req, res, opts))
@@ -637,9 +646,20 @@ bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 		}
 		// Closing the GET stream leaves nowhere for the reply to come from, so the
 		// waiter fails as soon as the stream is gone rather than at the timeout.
-		return channel.coord.awaitLive(id, () @safe => channel.isOpen(sessionId),
-				internalError("client disconnected before responding"),
-				60.seconds, 250.msecs, sessionId);
+		try
+			return channel.coord.awaitLive(id, () @safe => channel.isOpen(sessionId),
+					internalError("client disconnected before responding"),
+					channel.coord.requestTimeout, 250.msecs, sessionId);
+		catch (RequestTimeoutException e)
+		{
+			try
+				channel.deliverTo(sessionId, cancelledNotification(id,
+						"request timed out").toString());
+			catch (Exception)
+			{
+			}
+			throw e;
+		}
 	}
 
 	Nullable!Json dispatch(Message msg) @safe
