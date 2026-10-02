@@ -54,7 +54,7 @@ class HttpStatusException : McpException
 /// Build the `HttpStatusException` for a non-success HTTP `status` whose response
 /// `body` is not a usable JSON-RPC response: a JSON-RPC error in the body keeps its
 /// code, message and data; any other body yields a generic HTTP error.
-HttpStatusException httpStatusError(int status, string body, string wwwAuthenticate) @safe
+private HttpStatusException httpStatusError(int status, string body, string wwwAuthenticate) @safe
 {
 	import std.conv : to;
 
@@ -2246,7 +2246,7 @@ final class HttpClientTransport : ClientTransport
 /// an `https://`/`wss://` scheme; `port` defaults to the scheme's well-known port
 /// (443 when `tls`, else 80) when the URL omits it, so a TLS URL can never be
 /// silently treated as plaintext on port 80.
-struct HttpEndpoint
+private struct HttpEndpoint
 {
 	string host;
 	ushort port;
@@ -2268,7 +2268,7 @@ struct HttpEndpoint
 /// Parse `scheme://host[:port][/path]` into its components, defaulting the port
 /// to 443 for a TLS scheme (https/wss) and 80 otherwise. An absent path becomes
 /// "/". Tolerates a missing scheme (treated as non-TLS). See `HttpEndpoint`.
-HttpEndpoint parseHttpEndpoint(string url) @safe
+private HttpEndpoint parseHttpEndpoint(string url) @safe
 {
 	import std.string : indexOf, toLower;
 	import std.conv : to;
@@ -2341,7 +2341,7 @@ HttpEndpoint parseHttpEndpoint(string url) @safe
 /// throws. The original `ep.host` is still used for the TLS SNI / `Host` header
 /// by `openClientStream`/`buildHttpRequest`; only the connect target changes.
 /// `@safe`.
-string pinnedEndpointHost(HttpEndpoint ep) @safe
+private string pinnedEndpointHost(HttpEndpoint ep) @safe
 {
 	import mcp.protocol.ssrf : pinnedConnectAddress, SsrfPolicy;
 	import mcp.protocol.errors : internalError;
@@ -2357,7 +2357,7 @@ string pinnedEndpointHost(HttpEndpoint ep) @safe
 /// (`[::1]` -> `::1`), leaving any other host untouched. The TLS SNI/peer name
 /// and the SSRF/connect resolver both want the bare address, while the `Host`
 /// header keeps the brackets.
-string unbracketHost(string host) pure nothrow @safe @nogc
+private string unbracketHost(string host) pure nothrow @safe @nogc
 {
 	if (host.length >= 2 && host[0] == '[' && host[$ - 1] == ']')
 		return host[1 .. $ - 1];
@@ -2433,7 +2433,7 @@ bool isLegacyFallbackStatus(int status) pure nothrow @safe @nogc
 /// `MissingRequiredClientCapabilityError` (-32021), and — for a 404 to an
 /// unimplemented modern method — `Method not found` (-32601). These mirror the
 /// codes the SDK's own server emits via `httpStatusForResponse`.
-bool isModernRpcErrorCode(int code) pure nothrow @safe @nogc
+private bool isModernRpcErrorCode(int code) pure nothrow @safe @nogc
 {
 	return code == ErrorCode.unsupportedProtocolVersion || code == ErrorCode.headerMismatch
 		|| code == ErrorCode.missingRequiredClientCapability || code == ErrorCode.methodNotFound;
@@ -2449,7 +2449,7 @@ bool isModernRpcErrorCode(int code) pure nothrow @safe @nogc
 /// whose code passes `isModernRpcErrorCode`; otherwise returns false (legacy
 /// fallback) and leaves `err` null. Never throws — a malformed/empty body is a
 /// legacy signal, not an error.
-bool modernErrorFromBody(string body, out McpException err) @safe nothrow
+private bool modernErrorFromBody(string body, out McpException err) @safe nothrow
 {
 	import std.string : strip;
 
@@ -2480,69 +2480,13 @@ bool modernErrorFromBody(string body, out McpException err) @safe nothrow
 	}
 }
 
-/// Parse a legacy HTTP+SSE event stream looking for the first `endpoint` event,
-/// returning its `data:` payload (the message-POST URI) in `uri`. Returns false
-/// if no `endpoint` event is found in the supplied buffer. Handles CRLF and LF
-/// line endings and the optional single leading space after `data:`.
-bool parseEndpointEvent(string sse, out string uri) @safe
-{
-	import std.string : startsWith, splitLines;
-
-	string eventType;
-	string data;
-	bool haveData;
-
-	bool flush()
-	{
-		if (eventType == "endpoint" && haveData)
-		{
-			uri = data;
-			return true;
-		}
-		eventType = null;
-		data = null;
-		haveData = false;
-		return false;
-	}
-
-	foreach (raw; sse.splitLines())
-	{
-		auto line = raw;
-		if (line.length && line[$ - 1] == '\r')
-			line = line[0 .. $ - 1];
-		if (line.length == 0)
-		{
-			if (flush())
-				return true;
-			continue;
-		}
-		if (line.startsWith("event:"))
-		{
-			auto v = line["event:".length .. $];
-			if (v.startsWith(" "))
-				v = v[1 .. $];
-			eventType = v;
-		}
-		else if (line.startsWith("data:"))
-		{
-			auto d = line["data:".length .. $];
-			if (d.startsWith(" "))
-				d = d[1 .. $];
-			data ~= (haveData ? "\n" : "") ~ d;
-			haveData = true;
-		}
-	}
-	// A trailing event without a terminating blank line.
-	return flush();
-}
-
 /// Whether `candidate` shares `base`'s security origin: same scheme, host, and
 /// effective port (per-scheme default applied). The legacy POST endpoint a server
 /// supplies on the SSE stream is only trusted when it is same-origin, so the
 /// client never POSTs its bearer token to a server-named cross-origin URI. A
 /// scheme mismatch (e.g. an https base vs. an http candidate) is rejected too, so
 /// a downgrade cannot leak the credential in plaintext.
-bool sameOrigin(string base, string candidate) @safe
+private bool sameOrigin(string base, string candidate) @safe
 {
 	import std.string : toLower;
 
@@ -2637,7 +2581,7 @@ private string removeDotSegments(string path) @safe
 /// when it is an http(s) URL with the base's origin; anything else yields null so
 /// the legacy fallback fails closed rather than POSTing the bearer token
 /// off-origin.
-string resolveEndpointUri(string baseUrl, string endpoint) @safe
+private string resolveEndpointUri(string baseUrl, string endpoint) @safe
 {
 	import std.string : lastIndexOf;
 
@@ -2922,39 +2866,6 @@ unittest  // modernErrorFromBody ignores an error whose code is not a modern dis
 	assert(!modernErrorFromBody(
 			`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"boom"}}`, err));
 	assert(err is null);
-}
-
-unittest  // parseEndpointEvent extracts the message URI from a legacy SSE endpoint event
-{
-	// A real 2024-11-05 HTTP+SSE server's first event on the GET stream.
-	string sse = "event: endpoint\ndata: /messages?sessionId=abc123\n\n";
-	string uri;
-	assert(parseEndpointEvent(sse, uri));
-	assert(uri == "/messages?sessionId=abc123");
-}
-
-unittest  // parseEndpointEvent handles CRLF line endings and leading data space
-{
-	string sse = "event: endpoint\r\ndata:/messages\r\n\r\n";
-	string uri;
-	assert(parseEndpointEvent(sse, uri));
-	assert(uri == "/messages");
-}
-
-unittest  // parseEndpointEvent ignores a message event and finds a later endpoint event
-{
-	string sse = "event: message\ndata: {\"jsonrpc\":\"2.0\"}\n\n"
-		~ "event: endpoint\ndata: /post\n\n";
-	string uri;
-	assert(parseEndpointEvent(sse, uri));
-	assert(uri == "/post");
-}
-
-unittest  // parseEndpointEvent returns false when no endpoint event is present
-{
-	string sse = "event: message\ndata: {}\n\n";
-	string uri;
-	assert(!parseEndpointEvent(sse, uri));
 }
 
 unittest  // resolveEndpointUri keeps a same-origin absolute URI unchanged
