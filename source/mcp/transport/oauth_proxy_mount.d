@@ -738,6 +738,12 @@ in (exchange !is null)
 
 	router.post(tokenPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const form = readFormString(req);
+		if (!formDecodes(form))
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(invalidRequestJson("malformed form encoding"));
+			return;
+		}
 		// Branch on the OAuth grant the client requests. The proxy advertises both
 		// `authorization_code` and `refresh_token` in its AS metadata, so the /token
 		// endpoint MUST honour either: an authorization_code exchange (default, also
@@ -784,7 +790,23 @@ in (exchange !is null)
 		const authHeader = proxy.tokenAuthHeader();
 		string responseBody;
 		int status;
-		exchange(upstreamTokenEndpoint, upstreamBody, authHeader, responseBody, status);
+		try
+			exchange(upstreamTokenEndpoint, upstreamBody, authHeader, responseBody, status);
+		catch (Exception e)
+		{
+			import vibe.core.log : logWarn;
+
+			// An SSRF refusal, connect failure or timeout: the upstream never
+			// answered, so report it as an RFC 6749 error rather than letting the
+			// exception surface as an HTML 500.
+			logWarn("/token: upstream token exchange failed: %s", e.msg);
+			Json err = Json.emptyObject;
+			err["error"] = "server_error";
+			err["error_description"] = "the upstream token endpoint could not be reached";
+			res.statusCode = HTTPStatus.badGateway;
+			res.writeJsonBody(err);
+			return;
+		}
 
 		// In broker mode, mint OUR token for the client from the upstream response
 		// and keep the upstream token server-side — the client never sees the
@@ -896,6 +918,23 @@ private Json parseJsonBody(string payload) @safe
 		return parseJsonString(payload);
 	catch (Exception)
 		return Json.emptyObject;
+}
+
+/// Whether every name and value in an `application/x-www-form-urlencoded` body
+/// percent-decodes cleanly, so `formField` cannot throw on it.
+private bool formDecodes(string form) @safe
+{
+	import std.array : split;
+	import std.uri : decodeComponent;
+
+	foreach (pair; form.split("&"))
+	{
+		try
+			() @trusted { decodeComponent(pair); }();
+		catch (Exception)
+			return false;
+	}
+	return true;
 }
 
 /// Extract a single field value from an `application/x-www-form-urlencoded`
@@ -2409,6 +2448,43 @@ unittest  // PKCE: /token refuses a relayed code presented with a different redi
 			~ "&client_id=Iv1.upstream&redirect_uri=https%3A%2F%2Fother.example%2Fcb", "");
 	assert(res.status == 400);
 	assert(res.body_.canFind("invalid_grant"));
+	assert(!upstreamCalled);
+}
+
+unittest  // /token answers an upstream exchange failure with a 502 JSON server_error
+{
+	import vibe.data.json : parseJsonString;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		throw new Exception("Refusing to fetch URL whose host resolves to a private address");
+	});
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 502);
+	assert(parseJsonString(res.body_)["error"].get!string == "server_error");
+}
+
+unittest  // /token answers a malformed percent-encoding with a 400 JSON invalid_request
+{
+	import vibe.data.json : parseJsonString;
+
+	bool upstreamCalled;
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		status = 200;
+	});
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			"grant_type=authorization_code&code=%zz&code_verifier=V", "");
+	assert(res.status == 400);
+	assert(parseJsonString(res.body_)["error"].get!string == "invalid_request");
 	assert(!upstreamCalled);
 }
 
