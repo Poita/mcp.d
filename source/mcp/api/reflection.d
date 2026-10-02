@@ -1313,7 +1313,9 @@ unittest  // @tool reflection: outputSchema is inferred from the return type
 	// Struct return -> the struct's object schema directly.
 	assert(statsSchema["type"].get!string == "object");
 	assert(statsSchema["properties"]["count"]["type"].get!string == "integer");
-	assert(statsSchema["properties"]["total"]["type"].get!string == "number");
+	assert(statsSchema["properties"]["total"]["type"] == Json([
+		Json("number"), Json("null")
+	]));
 
 	// String return -> unstructured text, no outputSchema.
 	assert("outputSchema" !in greetTool);
@@ -4011,4 +4013,59 @@ unittest  // a Nullable @mcpHeader parameter keeps the bare primitive type x-mcp
 	auto schema = s.handle(MakeListMessage()).get["result"]["tools"][0]["inputSchema"];
 	assert(schema["properties"]["region"]["type"].get!string == "integer", schema.toString);
 	assert(paramHeaders(schema).length == 1);
+}
+
+version (unittest) private final class UnsetFloatApi
+{
+	static struct Reading
+	{
+		string sensor;
+		double value;
+		float[] samples;
+	}
+
+	@tool("read", "Return a reading whose floating-point members are unset")
+	Reading read() @safe
+	{
+		Reading r;
+		r.sensor = "s";
+		r.samples = [float.init];
+		return r;
+	}
+
+	@tool("ratio", "Return an unset double")
+	double ratio() @safe
+	{
+		return double.init;
+	}
+}
+
+unittest  // an unset floating-point result, as sent on the wire, conforms to the tool's outputSchema
+{
+	import mcp.protocol.schema : validateAgainstSchema;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new UnsetFloatApi);
+	Json[string] schemas;
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	foreach (i; 0 .. tools.length)
+		schemas[tools[i]["name"].get!string] = tools[i]["outputSchema"];
+	foreach (name; ["read", "ratio"])
+	{
+		// The wire form: vibe writes a NaN as `null`.
+		auto wire = parseJsonString(callToolArgs(s, name, `{}`).toString);
+		const err = validateAgainstSchema(wire["structuredContent"], schemas[name]);
+		assert(err.length == 0, name ~ ": " ~ err ~ " in " ~ wire.toString);
+	}
+}
+
+unittest  // a floating-point output schema admits the null an unset value serializes as
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new UnsetFloatApi);
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	foreach (i; 0 .. tools.length)
+		if (tools[i]["name"].get!string == "read")
+			assert(tools[i]["outputSchema"]["properties"]["value"]["type"] == Json(
+					[Json("number"), Json("null")]), tools[i].toString);
 }

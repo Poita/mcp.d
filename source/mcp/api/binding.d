@@ -252,7 +252,12 @@ package(mcp) JsonNode schemaNode(T, SchemaUse use, Ancestors...)()
 			s.set("minimum", JsonNode(long(T.min)));
 			s.set("maximum", JsonNode(long(T.max)));
 		}
-		return s;
+		// vibe writes a NaN — such as an unset field's `.init` — as `null`, so
+		// a floating-point output may be `null`.
+		static if (isFloatingPoint!T && use == SchemaUse.output)
+			return admitNull(s);
+		else
+			return s;
 	}
 }
 
