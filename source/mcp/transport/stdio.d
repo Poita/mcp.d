@@ -998,7 +998,8 @@ private struct StdinLineReader
 	private StdioEnd inEnd;
 	private size_t maxLineBytes;
 	private enum size_t chunk = 64 * 1024;
-	private ubyte[] buf; // bytes read but not yet consumed
+	private ubyte[] storage; // fixed chunk-sized backing buffer that every read fills
+	private ubyte[] buf; // the filled prefix of `storage` from the latest read
 	private size_t bufPos; // index of the next unconsumed byte in `buf`
 	private enum size_t idScanBytes = 4096;
 	private bool oversized_; // an over-long line was dropped since the last takeOversized
@@ -1010,24 +1011,28 @@ private struct StdinLineReader
 		this.maxLineBytes = maxLineBytes;
 	}
 
-	// Refill `buf` from stdin (IOMode.once into a chunk-sized buffer): return
-	// false on EOF/error (a 0-byte or non-ok/non-wouldBlock read) with `buf` cleared,
-	// else true with `buf` trimmed to the bytes read and `bufPos` reset to 0.
+	// Refill `buf` from stdin (IOMode.once into `storage`): return false on
+	// EOF/error (a 0-byte or non-ok/non-wouldBlock read) with `buf` cleared, else
+	// true with `buf` set to the bytes read and `bufPos` reset to 0.
 	private bool refill() @safe
+	{
+		return refillFrom(&inEnd.readOnce);
+	}
+
+	private bool refillFrom(scope IoResult delegate(ubyte[]) @safe readFn) @safe
 	{
 		import eventcore.driver : IOStatus;
 
-		if (buf.length < chunk)
-			buf.length = chunk;
+		if (storage is null)
+			storage = new ubyte[chunk];
 		bufPos = 0;
-		auto res = inEnd.readOnce(buf);
+		auto res = readFn(storage);
 		if (res.nbytes == 0 || (res.status != IOStatus.ok && res.status != IOStatus.wouldBlock))
 		{
 			buf = null;
-			bufPos = 0;
 			return false;
 		}
-		buf = buf[0 .. res.nbytes];
+		buf = storage[0 .. res.nbytes];
 		return true;
 	}
 
@@ -1294,6 +1299,25 @@ version (unittest)
 		Json[] ignored;
 		return drainLineReader(maxLineBytes, chunks, ignored);
 	}
+}
+
+unittest  // StdinLineReader refills into one fixed backing buffer across short reads
+{
+	import eventcore.driver : IOStatus;
+
+	auto reader = StdinLineReader.init;
+	IoResult readThree(ubyte[] dst) @safe
+	{
+		dst[0 .. 3] = cast(const(ubyte)[]) "ab\n";
+		return IoResult(IOStatus.ok, 3);
+	}
+
+	assert(reader.refillFrom(&readThree));
+	const first = &reader.buf[0];
+	assert(reader.buf == cast(const(ubyte)[]) "ab\n");
+	assert(reader.refillFrom(&readThree));
+	assert(&reader.buf[0] is first, "a short read must not force a reallocation");
+	assert(reader.buf == cast(const(ubyte)[]) "ab\n");
 }
 
 unittest  // StdinLineReader strips a trailing CR on a CRLF-terminated line
