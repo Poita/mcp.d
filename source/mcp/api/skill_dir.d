@@ -1133,14 +1133,14 @@ unittest  // an include filter opts dot-prefixed paths back in
 	], manifestPaths(s).text);
 }
 
-version (unittest) private void makeSymlink(string target, string link) @trusted
+version (unittest) version (Posix) private void makeSymlink(string target, string link) @trusted
 {
 	import std.file : symlink;
 
 	symlink(target, link);
 }
 
-unittest  // an include filter that excludes a directory prunes it unwalked
+version (Posix) unittest  // an include filter that excludes a directory prunes it unwalked
 {
 	import std.algorithm : canFind, startsWith;
 
@@ -1164,7 +1164,7 @@ unittest  // an include filter that excludes a directory prunes it unwalked
 	assert(!offered.canFind!(p => p.startsWith("node_modules/.bin")), offered.text);
 }
 
-unittest  // a symlink the include filter excludes is skipped rather than rejected
+version (Posix) unittest  // a symlink the include filter excludes is skipped rather than rejected
 {
 	import std.algorithm : endsWith;
 
