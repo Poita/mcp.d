@@ -590,8 +590,10 @@ version (Posix)
 /// hands byte chunks to the cooperative read loop through a thread-safe vibe
 /// `Channel`; `readOnce` drains that channel, yielding the calling fiber (not the
 /// event-loop thread) until a chunk arrives or stdin reaches end-of-input. The
-/// write end issues a blocking `WriteFile` inline -- MCP frames are small and the
-/// host drains stdout promptly, so the brief loop stall is acceptable.
+/// write end mirrors it: a dedicated daemon thread does the blocking `WriteFile`
+/// for each frame handed to it through a channel, and `writeAll` parks only the
+/// calling fiber until that frame is written, so a host slow to drain stdout
+/// never stalls the event loop.
 else version (Windows)
 	private struct StdioEnd
 {
@@ -605,6 +607,8 @@ else version (Windows)
 	private bool isRead_;
 	// Read end only: the chunk channel fed by the reader thread.
 	private Channel!(immutable(ubyte)[]) chan_;
+	// Write end only: the thread doing the blocking writes.
+	private StdoutWriter writer_;
 
 	/// Adopt `h` (the process's stdin) and start pumping it on a daemon thread.
 	static StdioEnd adoptRead(HANDLE h) @safe
@@ -625,13 +629,22 @@ else version (Windows)
 		return e;
 	}
 
-	/// Adopt `h` (the process's stdout) for blocking writes; no thread needed.
+	/// Adopt `h` (the process's stdout) and start its writer thread.
 	static StdioEnd adoptWrite(HANDLE h) @safe
 	{
 		StdioEnd e;
 		e.handle_ = h;
 		e.valid_ = isValidHandle(h);
+		if (e.valid_)
+			e.writer_ = new StdoutWriter(h);
 		return e;
+	}
+
+	/// Whether no frame is being written or waiting to be, so the stdout handle
+	/// can be closed without pulling it from under the writer thread.
+	bool writerIdle() @safe
+	{
+		return writer_ is null || writer_.idle();
 	}
 
 	/// Whether the adopted handle is usable.
@@ -647,6 +660,8 @@ else version (Windows)
 	{
 		if (isRead_ && valid_)
 			() @trusted { chan_.close(); }();
+		if (writer_ !is null)
+			writer_.close();
 	}
 
 	/// Drain the next chunk the reader thread produced into `buf`, blocking the
@@ -665,10 +680,21 @@ else version (Windows)
 		return IoResult(IOStatus.ok, n);
 	}
 
-	/// Write the whole `bytes` frame with a blocking `WriteFile` loop. A failed or
-	/// short write surfaces as `IOStatus.error` so `DuplexChannel.send` observes the
+	/// Write the whole `bytes` frame on the writer thread, parking the calling
+	/// fiber (not the event-loop thread) until it is written. A failed or short
+	/// write surfaces as `IOStatus.error` so `DuplexChannel.send` observes the
 	/// broken channel rather than silently dropping replies.
 	IoResult writeAll(const(ubyte)[] bytes) @safe
+	{
+		import eventcore.driver : IOStatus;
+
+		if (writer_ is null)
+			return IoResult(IOStatus.error, 0);
+		return writer_.write(bytes);
+	}
+
+	/// Write all of `bytes` to `h` with a blocking `WriteFile` loop.
+	private static IoResult writeBlocking(HANDLE h, const(ubyte)[] bytes) @system nothrow
 	{
 		import eventcore.driver : IOStatus;
 
@@ -676,15 +702,85 @@ else version (Windows)
 		while (off < bytes.length)
 		{
 			DWORD wrote;
-			const ok = () @trusted {
-				return WriteFile(handle_, cast(const(void)*)(bytes.ptr + off),
-						cast(DWORD)(bytes.length - off), &wrote, null) != 0;
-			}();
+			const ok = WriteFile(h, cast(const(void)*)(bytes.ptr + off),
+					cast(DWORD)(bytes.length - off), &wrote, null) != 0;
 			if (!ok || wrote == 0)
 				return IoResult(IOStatus.error, off);
 			off += wrote;
 		}
 		return IoResult(IOStatus.ok, off);
+	}
+
+	/// The stdout writer thread: frames arrive through `jobs`, each is written
+	/// with a blocking `WriteFile`, and its result goes back through `results`.
+	/// Frames are written one at a time in order; `mtx` keeps a caller's frame
+	/// paired with its own result.
+	private static final class StdoutWriter
+	{
+		import core.atomic : atomicLoad, atomicOp;
+		import vibe.core.sync : TaskMutex;
+
+		private HANDLE handle;
+		private Channel!(immutable(ubyte)[]) jobs;
+		private Channel!IoResult results;
+		private TaskMutex mtx;
+		/// Frames handed to the thread and not yet written.
+		private shared int pending;
+
+		this(HANDLE h) @trusted
+		{
+			handle = h;
+			jobs = createChannel!(immutable(ubyte)[])();
+			results = createChannel!IoResult();
+			mtx = new TaskMutex;
+			auto t = new Thread(&pump);
+			t.isDaemon = true;
+			t.start();
+		}
+
+		IoResult write(const(ubyte)[] bytes) @trusted
+		{
+			import eventcore.driver : IOStatus;
+
+			synchronized (mtx)
+			{
+				atomicOp!"+="(pending, 1);
+				try
+					jobs.put(bytes.idup);
+				catch (Exception)
+				{
+					atomicOp!"-="(pending, 1);
+					return IoResult(IOStatus.error, 0);
+				}
+				IoResult r;
+				if (!results.tryConsumeOne(r))
+					return IoResult(IOStatus.error, 0);
+				return r;
+			}
+		}
+
+		bool idle() @trusted
+		{
+			return atomicLoad(pending) == 0;
+		}
+
+		/// Stop accepting frames; the thread exits once the queued ones are written.
+		void close() @trusted
+		{
+			jobs.close();
+		}
+
+		private void pump() @system
+		{
+			immutable(ubyte)[] bytes;
+			while (jobs.tryConsumeOne(bytes))
+			{
+				const r = writeBlocking(handle, bytes);
+				atomicOp!"-="(pending, 1);
+				results.put(r);
+			}
+			results.close();
+		}
 	}
 
 	private static bool isValidHandle(HANDLE h) @safe
@@ -990,7 +1086,9 @@ else version (Windows)
 		stdoutDiversion.restore();
 		inFD.releaseRef();
 		outFD.releaseRef();
-		if (outDup !is null)
+		// A frame still being written (a host that stopped reading) keeps the
+		// writer thread in WriteFile on the duplicate, so it is left open then.
+		if (outDup !is null && outFD.writerIdle())
 			() @trusted { CloseHandle(outDup); }();
 		outDup = null;
 	}
@@ -1525,6 +1623,68 @@ version (Windows) unittest  // FdDiversion sends writes on the diverted fd elsew
 	diversion.restore();
 	assert(() @trusted { return _write(fd, "frame".ptr, 5); }() == 5);
 	assert(readSome(protocol[0]) == "frame", "restore must point the fd back at its original");
+}
+
+version (Windows) unittest  // a stdout write the host has not drained does not stall the event loop
+{
+	import core.sys.windows.windef : HANDLE, DWORD;
+	import core.sys.windows.winbase : CreatePipe, ReadFile, CloseHandle;
+	import core.thread : Thread;
+	import core.time : msecs;
+	import eventcore.driver : IOStatus;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+
+	HANDLE r, w;
+	assert(() @trusted { return CreatePipe(&r, &w, null, 4096) != 0; }());
+	scope (exit)
+		() @trusted { CloseHandle(r); CloseHandle(w); }();
+	auto end = StdioEnd.adoptWrite(w);
+	scope (exit)
+		end.releaseRef();
+	auto payload = new ubyte[](256 * 1024);
+	payload[] = 'x';
+
+	// The host starts draining stdout only after a delay, so the write is
+	// pending meanwhile.
+	auto drainer = new Thread({
+		Thread.sleep(300.msecs);
+		ubyte[4096] buf;
+		size_t total;
+		DWORD got;
+		while (total < payload.length && ReadFile(r, buf.ptr,
+			cast(DWORD) buf.length, &got, null) != 0 && got > 0)
+			total += got;
+	});
+	() @trusted { drainer.start(); }();
+
+	bool wrote, tickedWhilePending;
+	IoResult res;
+	runTask(() nothrow{
+		try
+			res = end.writeAll(payload);
+		catch (Exception)
+		{
+		}
+		wrote = true;
+	});
+	runTask(() nothrow{
+		try
+		{
+			foreach (_; 0 .. 5)
+				sleep(10.msecs);
+			tickedWhilePending = !wrote;
+			while (!wrote)
+				sleep(10.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	() @trusted { drainer.join(); }();
+	assert(tickedWhilePending, "the event loop must keep running while stdout is not drained");
+	assert(res.status == IOStatus.ok && res.nbytes == payload.length);
 }
 
 version (Posix) unittest  // StdioEnd.adopt routes a socket fd through the sockets driver, a pipe fd through pipes
