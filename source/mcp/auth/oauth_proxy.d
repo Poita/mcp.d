@@ -516,7 +516,33 @@ interface RedirectUriRegistry
 	void register(string registrationHandle, const string[] redirectUris) @safe;
 
 	/// Whether `redirectUri` is an exact-string member of ANY registered set.
+	/// A pure lookup: it does not change how the registration is retained.
 	bool isRegistered(string redirectUri) @safe;
+
+	/// Record that a client holding `redirectUri` completed a sign-in (the
+	/// proxy relayed it an authorization code, which happens only after user
+	/// consent). A registry may retain such registrations ahead of ones that
+	/// never got that far.
+	void markUsed(string redirectUri) @safe;
+}
+
+/// Bounds for an `InMemoryRedirectUriRegistry`.
+struct RedirectUriRegistryOptions
+{
+	import core.time : MonoTime, hours;
+
+	/// Maximum number of live registrations (one per `/register` call). When
+	/// exceeded on `register`, one registration is evicted as a whole.
+	size_t maxRegistrations = 10_000;
+
+	/// How long a registration that has never completed a sign-in stays live.
+	/// A registration marked used (see `RedirectUriRegistry.markUsed`) does not
+	/// expire.
+	Duration unusedTtl = 1.hours;
+
+	/// Injectable monotonic clock (tests drive expiry with it). Null uses
+	/// `MonoTime.currTime`.
+	MonoTime delegate() @safe clock;
 }
 
 /// A simple in-memory `RedirectUriRegistry` bounded against unauthenticated
@@ -526,11 +552,15 @@ interface RedirectUriRegistry
 /// is what keeps an unauthenticated `POST /register` flood from growing process
 /// memory without bound.
 ///
-/// Eviction prefers the oldest registration none of whose redirect URIs has been
-/// looked up by `isRegistered` (i.e. never used at `/authorize`), and falls back
-/// to the oldest registration only when every older one is in use. A flood of
-/// anonymous registrations therefore displaces other never-used registrations
-/// before a client that is actually signing users in.
+/// A registration counts as used once `markUsed` names one of its redirect URIs,
+/// which the proxy does only when it relays an authorization code (after the
+/// user consented and signed in upstream). Merely presenting a redirect URI at
+/// `/authorize` does not, so an anonymous client cannot make its registration
+/// sticky. Unused registrations expire after `unusedTtl`, and eviction prefers
+/// the oldest unused registration, falling back to the oldest registration only
+/// when every older one is in use. A flood of anonymous registrations therefore
+/// displaces other never-used registrations before a client that is actually
+/// signing users in.
 ///
 /// NOTE: even bounded, the unbounded-default in-memory backing is unsuitable for
 /// an internet-exposed multi-process proxy: state is per-process and lost on
@@ -538,26 +568,23 @@ interface RedirectUriRegistry
 /// integrator's auth or a rate limiter) for such deployments.
 final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 {
-	/// Maximum number of live registrations (one per `/register` call). When
-	/// exceeded on `register`, one registration is evicted as a whole.
-	enum size_t defaultMaxRegistrations = 10_000;
+	import core.time : MonoTime;
 
 	private string[][string] byHandle;
 	private string[] order;
 	private string[][string] handlesByUri;
 	private bool[string] usedHandles;
-	private const size_t maxRegistrations;
+	private MonoTime[string] registeredAt;
+	private const RedirectUriRegistryOptions opts;
 
 	this() @safe
 	{
-		this(defaultMaxRegistrations);
+		this(RedirectUriRegistryOptions.init);
 	}
 
-	/// Construct with an explicit registration cap (used by tests to drive
-	/// eviction deterministically).
-	this(size_t maxRegistrations) @safe
+	this(RedirectUriRegistryOptions opts) @safe
 	{
-		this.maxRegistrations = maxRegistrations;
+		this.opts = opts;
 	}
 
 	override void register(string registrationHandle, const string[] redirectUris) @safe
@@ -566,27 +593,67 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 		// back of the eviction order.
 		if (registrationHandle in byHandle)
 			removeHandle(registrationHandle);
+		sweepExpired();
 		string[] uris;
 		foreach (u; redirectUris)
 			uris ~= u;
 		byHandle[registrationHandle] = uris;
 		order ~= registrationHandle;
+		registeredAt[registrationHandle] = now();
 		foreach (u; uris)
 			handlesByUri[u] ~= registrationHandle;
 		enforceCap();
 	}
 
-	/// Whether `redirectUri` belongs to a live registration. A hit marks every
-	/// registration holding it as in use, which shields it from eviction ahead of
-	/// never-used registrations.
+	/// Whether `redirectUri` belongs to a live registration: one marked used, or
+	/// an unused one younger than `unusedTtl`.
 	override bool isRegistered(string redirectUri) @safe
 	{
 		auto hs = redirectUri in handlesByUri;
 		if (hs is null)
 			return false;
 		foreach (h; *hs)
-			usedHandles[h] = true;
-		return true;
+			if (!isExpired(h))
+				return true;
+		return false;
+	}
+
+	override void markUsed(string redirectUri) @safe
+	{
+		if (auto hs = redirectUri in handlesByUri)
+			foreach (h; *hs)
+				if (!isExpired(h))
+					usedHandles[h] = true;
+	}
+
+	private MonoTime now() @safe
+	{
+		return opts.clock !is null ? opts.clock() : MonoTime.currTime;
+	}
+
+	private bool isExpired(string handle) @safe
+	{
+		if (handle in usedHandles)
+			return false;
+		auto at = handle in registeredAt;
+		return at is null || now() - *at >= opts.unusedTtl;
+	}
+
+	// Drop expired unused registrations. `order` is oldest first, so the sweep
+	// stops at the first unused registration that is still live.
+	private void sweepExpired() @safe
+	{
+		string[] expired;
+		foreach (h; order)
+		{
+			if (h in usedHandles)
+				continue;
+			if (!isExpired(h))
+				break;
+			expired ~= h;
+		}
+		foreach (h; expired)
+			removeHandle(h);
 	}
 
 	private void removeHandle(string handle) @safe
@@ -609,6 +676,7 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 			byHandle.remove(handle);
 		}
 		usedHandles.remove(handle);
+		registeredAt.remove(handle);
 		const at = order.countUntil(handle);
 		if (at >= 0)
 			order = order.dup.remove(at);
@@ -616,7 +684,7 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 
 	private void enforceCap() @safe
 	{
-		while (order.length > maxRegistrations)
+		while (order.length > opts.maxRegistrations)
 		{
 			// The newest registration is exempt, so a registry full of in-use
 			// clients still admits a new one (evicting the oldest).
@@ -1139,6 +1207,10 @@ final class OAuthProxy
 	{
 		synchronized (this)
 			relayedCodes.put(code, binding);
+		// A DCR client that got this far has consented and signed in, so its
+		// registration is retained ahead of never-used ones.
+		if (binding.clientId.length == 0)
+			redirectRegistry.markUsed(binding.clientRedirectUri);
 	}
 
 	/// Check an authorization-code `/token` request against the binding recorded
@@ -2054,7 +2126,7 @@ unittest  // REDIRECT REGISTRY: InMemoryRedirectUriRegistry exact-matches across
 
 unittest  // REDIRECT REGISTRY: the registry caps live registrations, evicting the oldest as a unit
 {
-	auto reg = new InMemoryRedirectUriRegistry(2);
+	auto reg = new InMemoryRedirectUriRegistry(RedirectUriRegistryOptions(2));
 	reg.register("h1", ["https://a/cb"]);
 	reg.register("h2", ["https://b/cb"]);
 	// Third registration exceeds the cap of 2: the oldest ("h1") is evicted whole.
@@ -2066,10 +2138,10 @@ unittest  // REDIRECT REGISTRY: the registry caps live registrations, evicting t
 
 unittest  // REDIRECT REGISTRY: a /register flood evicts never-used registrations before one in use
 {
-	auto reg = new InMemoryRedirectUriRegistry(2);
+	auto reg = new InMemoryRedirectUriRegistry(RedirectUriRegistryOptions(2));
 	reg.register("legit", ["https://app.example/cb"]);
-	// The legitimate client goes on to authorize with its redirect_uri.
-	assert(reg.isRegistered("https://app.example/cb"));
+	// The legitimate client goes on to sign a user in with its redirect_uri.
+	reg.markUsed("https://app.example/cb");
 	// Anonymous registrations flood past the cap.
 	foreach (i; 0 .. 5)
 		reg.register("flood-" ~ cast(char)('0' + i),
@@ -2081,11 +2153,11 @@ unittest  // REDIRECT REGISTRY: a /register flood evicts never-used registration
 
 unittest  // REDIRECT REGISTRY: when every registration is in use the oldest is evicted
 {
-	auto reg = new InMemoryRedirectUriRegistry(2);
+	auto reg = new InMemoryRedirectUriRegistry(RedirectUriRegistryOptions(2));
 	reg.register("h1", ["https://a/cb"]);
 	reg.register("h2", ["https://b/cb"]);
-	assert(reg.isRegistered("https://a/cb"));
-	assert(reg.isRegistered("https://b/cb"));
+	reg.markUsed("https://a/cb");
+	reg.markUsed("https://b/cb");
 	reg.register("h3", ["https://c/cb"]);
 	assert(!reg.isRegistered("https://a/cb"));
 	assert(reg.isRegistered("https://b/cb"));
@@ -2094,7 +2166,7 @@ unittest  // REDIRECT REGISTRY: when every registration is in use the oldest is 
 
 unittest  // REDIRECT REGISTRY: a redirect_uri shared by two registrations survives evicting one
 {
-	auto reg = new InMemoryRedirectUriRegistry(2);
+	auto reg = new InMemoryRedirectUriRegistry(RedirectUriRegistryOptions(2));
 	reg.register("h1", ["https://shared/cb"]);
 	reg.register("h2", ["https://shared/cb"]);
 	// Evict h1 by overflowing the cap; the shared URI is still held by h2.
@@ -2212,7 +2284,7 @@ unittest  // REDIRECT REGISTRY: re-registering the same handle drops its old URI
 	// A duplicate-handle registration must drop the old URIs before overwriting
 	// the handle entry, so that isRegistered never returns true for a URI whose
 	// registration no longer exists.
-	auto reg = new InMemoryRedirectUriRegistry(2);
+	auto reg = new InMemoryRedirectUriRegistry(RedirectUriRegistryOptions(2));
 	reg.register("same-handle", ["https://old.example.com/cb"]);
 	reg.register("same-handle", ["https://new.example.com/cb"]);
 	// Force eviction of the (now phantom) duplicate order entry by adding a third handle.
@@ -2222,6 +2294,54 @@ unittest  // REDIRECT REGISTRY: re-registering the same handle drops its old URI
 	// The new URI and h3 URI remain registered.
 	assert(reg.isRegistered("https://new.example.com/cb"));
 	assert(reg.isRegistered("https://h3.example.com/cb"));
+}
+
+unittest  // REDIRECT REGISTRY: looking a registration up does not shield it from eviction
+{
+	// A flood of registrations that are each looked up at /authorize, without
+	// ever completing a sign-in, must not displace a client that has.
+	auto reg = new InMemoryRedirectUriRegistry(RedirectUriRegistryOptions(2));
+	reg.register("legit", ["https://app.example/cb"]);
+	reg.markUsed("https://app.example/cb");
+	foreach (i; 0 .. 5)
+	{
+		const uri = "https://flood.example/cb" ~ cast(char)('0' + i);
+		reg.register("flood-" ~ cast(char)('0' + i), [uri]);
+		assert(reg.isRegistered(uri));
+	}
+	assert(reg.isRegistered("https://app.example/cb"));
+}
+
+unittest  // REDIRECT REGISTRY: an unused registration expires after the unused TTL
+{
+	import core.time : MonoTime, hours, minutes;
+
+	auto now = MonoTime.currTime;
+	RedirectUriRegistryOptions opts;
+	opts.unusedTtl = 1.hours;
+	opts.clock = () @safe => now;
+	auto reg = new InMemoryRedirectUriRegistry(opts);
+	reg.register("unused", ["https://unused.example/cb"]);
+	reg.register("used", ["https://used.example/cb"]);
+	reg.markUsed("https://used.example/cb");
+
+	now += 59.minutes;
+	assert(reg.isRegistered("https://unused.example/cb"));
+	now += 2.minutes;
+	assert(!reg.isRegistered("https://unused.example/cb"));
+	// A registration that completed a sign-in does not expire.
+	assert(reg.isRegistered("https://used.example/cb"));
+}
+
+unittest  // REDIRECT REGISTRY: relaying a code marks the DCR client's registration as used
+{
+	auto reg = new InMemoryRedirectUriRegistry(RedirectUriRegistryOptions(2));
+	auto proxy = new OAuthProxy(sampleConfig(), new InMemoryConsentStore(), reg);
+	proxy.register(["https://app.example.com/cb"]);
+	proxy.recordRelayedCode("C", RelayedCodeBinding("CH", "https://app.example.com/cb", ""));
+	foreach (i; 0 .. 5)
+		proxy.register(["https://flood.example.com/cb" ~ cast(char)('0' + i)]);
+	proxy.validateRedirectUri("https://app.example.com/cb");
 }
 
 version (unittest)

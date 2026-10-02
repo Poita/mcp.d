@@ -2158,7 +2158,8 @@ unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent 
 	// proxy.authorize throws InvalidRedirectUriException. The handler must catch it
 	// and return 400 (matching the /authorize handler) rather than leaking a 500.
 	import std.algorithm : canFind;
-	import mcp.auth.oauth_proxy : InMemoryConsentStore, InMemoryRedirectUriRegistry;
+	import mcp.auth.oauth_proxy : InMemoryConsentStore,
+		InMemoryRedirectUriRegistry, RedirectUriRegistryOptions;
 	import vibe.http.common : HTTPMethod;
 	import vibe.http.server : createTestHTTPServerRequest,
 		createTestHTTPServerResponse, TestHTTPResponseMode;
@@ -2173,7 +2174,7 @@ unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent 
 	cfg.resource = "https://mcp.example.com/mcp";
 
 	// Registry with cap=1: registering a second client evicts the first.
-	auto reg = new InMemoryRedirectUriRegistry(1);
+	auto reg = new InMemoryRedirectUriRegistry(RedirectUriRegistryOptions(1));
 	auto proxy = new OAuthProxy(cfg, new InMemoryConsentStore(), reg);
 	proxy.register(["http://localhost:5000/cb"]);
 	auto router = new URLRouter;
