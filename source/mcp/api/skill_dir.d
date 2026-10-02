@@ -59,8 +59,9 @@ struct SkillDirOptions
 /// published as its own flat entry whose `resources` cover exactly its subtree.
 ///
 /// Throws if `dir` is not a directory, has no `SKILL.md`, the frontmatter lacks
-/// a string `name`, the resolved skill path is invalid or its final segment does
-/// not match the frontmatter `name`, a symlink is encountered, the file count /
+/// a string `name`, the directory's own name does not match the frontmatter
+/// `name`, the resolved skill path is invalid or its final segment does not
+/// match the frontmatter `name`, a symlink is encountered, the file count /
 /// total size exceeds the configured caps, or (`publishNested`) a nested
 /// `SKILL.md` fails the same frontmatter/naming validation as a top-level one.
 /// Validation runs before registration, so a throw leaves the server unchanged.
@@ -84,6 +85,11 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 		throw new Exception(
 				"registerSkillDir: SKILL.md frontmatter must define a string 'description'");
 	const fmName = frontmatter["name"].get!string;
+	// The Agent Skills spec requires the name to match the skill's directory.
+	const dirName = directoryName(dir);
+	if (dirName != fmName)
+		throw new Exception("registerSkillDir: the skill directory name '"
+				~ dirName ~ "' must equal the SKILL.md frontmatter name '" ~ fmName ~ "'");
 
 	const path = options.path.length ? options.path : fmName;
 	if (!isValidSkillPath(path))
@@ -121,6 +127,15 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 	registerSkillResources(server, path, skillMd, frontmatter, files);
 	foreach (entry; nestedEntries)
 		addSkillEntry(server, entry);
+}
+
+/// The name of the directory `dir` refers to, with `.`/`..` segments and
+/// trailing separators resolved against the working directory.
+private string directoryName(string dir) @safe
+{
+	import std.path : absolutePath, baseName, buildNormalizedPath;
+
+	return baseName(buildNormalizedPath(absolutePath(dir)));
 }
 
 /// One flat entry per nested skill found in `raws` (any `SKILL.md` below the
@@ -655,20 +670,24 @@ version (unittest)
 		write(root ~ "/SKILL.md", skillMd);
 	}
 
+	// Removes a `tmpRoot` skill directory together with its per-test parent.
 	private void removeTree(string root) @trusted
 	{
 		import std.file : rmdirRecurse, exists;
+		import std.path : dirName;
 
-		if (exists(root))
-			rmdirRecurse(root);
+		if (exists(root.dirName))
+			rmdirRecurse(root.dirName);
 	}
 
-	private string tmpRoot(string suffix) @trusted
+	// A skill directory named `name` (the Agent Skills convention requires it to
+	// match the frontmatter name) inside a per-test temporary parent.
+	private string tmpRoot(string suffix, string name) @trusted
 	{
 		import std.path : buildPath;
 		import std.file : tempDir;
 
-		return buildPath(tempDir, "mcp_d_skilldir_" ~ suffix);
+		return buildPath(tempDir, "mcp_d_skilldir_" ~ suffix, name);
 	}
 
 	private Message modernRequest(long id, string method, Json params) @safe
@@ -703,7 +722,7 @@ unittest  // registerSkillDir serves SKILL.md verbatim with authored, type-prese
 {
 	import std.algorithm : canFind;
 
-	const root = tmpRoot("verbatim");
+	const root = tmpRoot("verbatim", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -731,7 +750,7 @@ unittest  // registerSkillDir serves SKILL.md verbatim with authored, type-prese
 
 unittest  // a directory skill's manifest carries each file's byte length
 {
-	const root = tmpRoot("sizes");
+	const root = tmpRoot("sizes", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -760,7 +779,7 @@ unittest  // maxFiles counts SKILL.md itself as one of the skill's resources
 {
 	import std.exception : assertThrown, assertNotThrown;
 
-	const root = tmpRoot("maxfiles");
+	const root = tmpRoot("maxfiles", "pdf-forms");
 	writeSkillFixture(root); // SKILL.md + references/FORMS.md = 2 resources
 	scope (exit)
 		removeTree(root);
@@ -776,7 +795,7 @@ unittest  // maxFiles counts SKILL.md itself as one of the skill's resources
 
 unittest  // registerSkillDir exposes supporting files as sibling resources
 {
-	const root = tmpRoot("files");
+	const root = tmpRoot("files", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -792,7 +811,7 @@ unittest  // registerSkillDir exposes supporting files as sibling resources
 
 unittest  // registerSkillDir auto-exposes subdirectories via resources/directory/read
 {
-	const root = tmpRoot("dirread");
+	const root = tmpRoot("dirread", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -837,7 +856,7 @@ version (unittest)
 
 unittest  // nested files are supporting content: the enclosing manifest lists them all
 {
-	const root = tmpRoot("nest-encl");
+	const root = tmpRoot("nest-encl", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -860,7 +879,7 @@ unittest  // nested files are supporting content: the enclosing manifest lists t
 
 unittest  // a nested skill is additionally published as its own flat entry
 {
-	const root = tmpRoot("nest-flat");
+	const root = tmpRoot("nest-flat", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -890,7 +909,7 @@ unittest  // a nested skill is additionally published as its own flat entry
 
 unittest  // skills/get answers for a nested skill's uri
 {
-	const root = tmpRoot("nest-get");
+	const root = tmpRoot("nest-get", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -908,7 +927,7 @@ unittest  // a nested directory whose name mismatches its frontmatter rejects th
 {
 	import std.exception : assertThrown;
 
-	const root = tmpRoot("nest-bad");
+	const root = tmpRoot("nest-bad", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -928,7 +947,7 @@ unittest  // publishNested=false serves the nested SKILL.md as a plain file only
 {
 	import std.algorithm : canFind;
 
-	const root = tmpRoot("nest-off");
+	const root = tmpRoot("nest-off", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -951,7 +970,7 @@ unittest  // nested files are registered once and serve their authored bytes
 {
 	import std.algorithm : canFind;
 
-	const root = tmpRoot("nest-once");
+	const root = tmpRoot("nest-once", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -975,7 +994,7 @@ unittest  // nested files are registered once and serve their authored bytes
 
 unittest  // a doubly-nested skill publishes three flat entries with subtree manifests
 {
-	const root = tmpRoot("nest-deep");
+	const root = tmpRoot("nest-deep", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -1010,7 +1029,7 @@ unittest  // a doubly-nested skill publishes three flat entries with subtree man
 
 unittest  // registerSkillDir honours an explicit prefixed path matching the frontmatter name
 {
-	const root = tmpRoot("prefix");
+	const root = tmpRoot("prefix", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -1027,7 +1046,7 @@ unittest  // registerSkillDir rejects a path whose final segment != frontmatter 
 {
 	import std.exception : assertThrown;
 
-	const root = tmpRoot("mismatch");
+	const root = tmpRoot("mismatch", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -1038,9 +1057,36 @@ unittest  // registerSkillDir rejects a path whose final segment != frontmatter 
 	assertThrown!Exception(registerSkillDir(s, root, opts));
 }
 
+unittest  // registerSkillDir rejects a directory whose name != frontmatter name
+{
+	import std.exception : assertThrown;
+
+	const root = tmpRoot("dirname", "not-pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	assertThrown!Exception(registerSkillDir(s, root));
+	SkillDirOptions opts;
+	opts.path = "office/pdf-forms";
+	assertThrown!Exception(registerSkillDir(s, root, opts));
+}
+
+unittest  // registerSkillDir accepts a matching directory given with a trailing slash or dot segment
+{
+	const root = tmpRoot("dirslash", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	registerSkillDir(new McpServer("t", "1"), root ~ "/");
+	registerSkillDir(new McpServer("t", "1"), root ~ "/.");
+}
+
 unittest  // a '---' inside a frontmatter value does not close the frontmatter early
 {
-	const root = tmpRoot("fence");
+	const root = tmpRoot("fence", "fence-skill");
 	// `notes` is a block scalar that itself contains a `---` line; `trailing`
 	// comes after it and must survive into the parsed frontmatter.
 	writeRawSkill(root,
@@ -1058,7 +1104,7 @@ unittest  // a '---' inside a frontmatter value does not close the frontmatter e
 
 unittest  // a CRLF SKILL.md parses (fence and values carry trailing \r)
 {
-	const root = tmpRoot("crlf");
+	const root = tmpRoot("crlf", "crlf-skill");
 	writeRawSkill(root, "---\r\nname: crlf-skill\r\ndescription: a value\r\n---\r\n\r\n# Body\r\n");
 	scope (exit)
 		removeTree(root);
@@ -1075,7 +1121,7 @@ unittest  // registerSkillDir requires a string description in the frontmatter
 {
 	import std.exception : assertThrown;
 
-	const root = tmpRoot("nodesc");
+	const root = tmpRoot("nodesc", "x");
 	writeRawSkill(root, "---\nname: x\n---\n\n# Body\n");
 	scope (exit)
 		removeTree(root);
@@ -1088,7 +1134,7 @@ unittest  // an extension-less text file is served as text/plain, not an opaque 
 {
 	import std.algorithm : canFind;
 
-	const root = tmpRoot("license");
+	const root = tmpRoot("license", "pdf-forms");
 	writeSkillFixture(root);
 	writeFile(root ~ "/LICENSE", "MIT License\n\nPermission is hereby granted...\n");
 	scope (exit)
@@ -1106,7 +1152,7 @@ unittest  // a YAML timestamp in frontmatter is rendered as an ISO-8601 string
 {
 	import std.algorithm : canFind;
 
-	const root = tmpRoot("timestamp");
+	const root = tmpRoot("timestamp", "ts-skill");
 	writeRawSkill(root, "---\nname: ts-skill\ndescription: d\ncreated: 2021-01-02\n---\n\n# Body\n");
 	scope (exit)
 		removeTree(root);
@@ -1123,7 +1169,7 @@ unittest  // registerSkillDir rejects a directory whose files exceed maxTotalByt
 {
 	import std.exception : assertThrown;
 
-	const root = tmpRoot("toobig");
+	const root = tmpRoot("toobig", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);

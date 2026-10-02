@@ -219,8 +219,9 @@ struct skill
 /// (one containing a `SKILL.md`); the reflection layer reads `SKILL.md` verbatim,
 /// parses its authored frontmatter for the skill entry, and exposes every file in
 /// the directory tree as a `skill://<path>/<file>` resource (so subdirectories
-/// are walkable via `resources/directory/read`). `path` is the skill path (its
-/// final segment must equal the directory's `SKILL.md` frontmatter `name`);
+/// are walkable via `resources/directory/read`). The directory's name must equal
+/// its `SKILL.md` frontmatter `name`. `path` is the skill path (its final
+/// segment must equal that `name` too);
 /// leave it empty to derive the path from that name. For finer control (read
 /// filters, size caps) use the imperative `registerSkillDir` with
 /// `SkillDirOptions`.

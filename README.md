@@ -928,7 +928,8 @@ elsewhere (e.g. spawned over stdio by a host) will not find it. Return an
 absolute path when the working directory is not fixed, for example one built
 from `std.file.thisExePath`.
 
-The directory's final path segment must equal the frontmatter `name`
+The directory's name, and the final segment of the skill path, must equal the
+frontmatter `name`, as the Agent Skills specification requires
 ([dyaml](https://code.dlang.org/packages/dyaml) parses the frontmatter). A
 symlink or exceeding `maxFiles`/`maxTotalBytes` is rejected. Skills may nest: a
 `SKILL.md` in a descendant directory is ordinary supporting content of the
