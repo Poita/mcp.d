@@ -43,6 +43,11 @@ struct StreamLimits
 	/// `subscriptions/listen` and `events/stream` response streams open at once
 	/// across the mount; past it such a request is answered 503.
 	size_t maxPushStreams = 1_000;
+	/// Bytes queued for one long-lived SSE stream whose client is not reading.
+	/// Past it, delivery waits briefly (`SseWriter.queueStallTimeout`) for the
+	/// client to catch up, then closes and drops the stream, so a stalled client
+	/// never blocks delivery to anyone else for long.
+	size_t maxQueuedStreamBytes = defaultMaxQueuedStreamBytes;
 }
 
 /// Counts a mount's open streams of one kind against a cap (`0`: unbounded).
@@ -312,7 +317,7 @@ void mountMcp(URLRouter router, McpServer server,
 		if (!readPostBody(req, res, opts.maxRequestBytes, payload))
 			return;
 		handlePost(server, coord, sessions, statelessInFlight, pushStreams,
-			token, payload, req, res);
+			opts.streamLimits.maxQueuedStreamBytes, token, payload, req, res);
 	});
 	if (sessions !is null)
 		sessions.onExpire = (string sid) @safe { push.closeSession(sid); };
@@ -422,7 +427,8 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 			res.writeBody("Too many open streams", "text/plain");
 			return;
 		}
-		handleLegacyGet(server, channel, push, principalOf(token), res);
+		handleLegacyGet(server, channel, push, principalOf(token),
+			opts.streamLimits.maxQueuedStreamBytes, res);
 	});
 
 	router.post(opts.legacyMessagePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
@@ -646,26 +652,171 @@ string endpointWithSession(string endpointPath, string sessionId) @safe
 	return endpointPath ~ sep ~ "sessionId=" ~ sessionId;
 }
 
-/// Serialize every write to one response's bodyWriter through a fresh per-stream
-/// TaskMutex and return the resulting write+flush closure. Each SSE handler shares
-/// its connection between a registered-listener writer and a heartbeat loop running
-/// on different fibers, and the underlying channel mutex guards only channel state,
-/// not these foreign writers — so without per-stream serialization two concurrent
-/// writes could interleave the bytes of different SSE frames.
-private void delegate(string) @safe sseFrameWriter(HTTPServerResponse res) @safe
-{
-	import vibe.core.sync : TaskMutex;
+/// The default bound on the bytes queued for one SSE stream
+/// (`StreamLimits.maxQueuedStreamBytes`).
+enum size_t defaultMaxQueuedStreamBytes = 1024 * 1024;
 
-	auto writeMtx = new TaskMutex;
-	return (string frame) @safe {
-		() @trusted {
-			synchronized (writeMtx)
+/// The writer for one long-lived SSE response. Each SSE handler shares its
+/// connection between a push-channel listener and a heartbeat loop running on
+/// different fibers, so frames are queued and written in order by one writer
+/// task, which keeps them whole. Queuing does not wait for the socket, so a
+/// client that stops reading cannot stall `notify*` callers or delivery to
+/// other streams. Once `maxQueued` bytes are waiting and the client has not
+/// read for `queueStallTimeout`, it is deemed gone: the connection is closed
+/// and every later write throws, so the push channel drops the stream.
+private final class SseWriter
+{
+	import vibe.core.sync : LocalManualEvent, createManualEvent;
+	import vibe.core.task : Task;
+
+	private HTTPServerResponse res;
+	private size_t maxQueued;
+	private string[] queue;
+	private size_t queued;
+	private bool dead;
+	private bool closing;
+	private bool started;
+	private Task writer;
+	private LocalManualEvent wake;
+	private LocalManualEvent drained;
+	private LocalManualEvent finished;
+
+	/// How long a full queue waits for its client to read before the stream is
+	/// closed.
+	enum Duration queueStallTimeout = 2.seconds;
+
+	this(HTTPServerResponse res, size_t maxQueued) @safe
+	{
+		this.res = res;
+		this.maxQueued = maxQueued;
+		wake = createManualEvent();
+		drained = createManualEvent();
+		finished = createManualEvent();
+	}
+
+	/// Queue `frame` for writing. When `maxQueued` bytes are already waiting, the
+	/// writer gets up to `queueStallTimeout` to make room, since a burst queued
+	/// without yielding outruns even a healthy client; a client still not reading
+	/// by then is deemed gone. Throws once the stream has failed.
+	void opCall(string frame) @safe
+	{
+		import core.time : MonoTime;
+		import vibe.core.core : runTask;
+
+		if (dead)
+			throw new Exception("SSE stream closed");
+		if (maxQueued != 0 && queued > 0 && queued + frame.length > maxQueued)
+		{
+			const deadline = MonoTime.currTime + queueStallTimeout;
+			while (!dead && queued > 0 && queued + frame.length > maxQueued)
 			{
-				res.bodyWriter.write(cast(const(ubyte)[]) frame);
-				res.bodyWriter.flush();
+				const left = deadline - MonoTime.currTime;
+				if (left <= Duration.zero)
+				{
+					abort();
+					break;
+				}
+				drained.wait(left, drained.emitCount);
 			}
-		}();
-	};
+			if (dead)
+				throw new Exception("SSE client stopped reading; stream closed");
+		}
+		queue ~= frame;
+		queued += frame.length;
+		if (!started)
+		{
+			started = true;
+			writer = runTask(&run);
+		}
+		wake.emit();
+	}
+
+	private void run() nothrow @safe
+	{
+		scope (exit)
+			finished.emit();
+		try
+		{
+			while (true)
+			{
+				while (queue.length == 0)
+				{
+					if (closing || dead)
+						return;
+					wake.wait(wake.emitCount);
+				}
+				auto batch = queue;
+				queue = null;
+				() @trusted {
+					foreach (frame; batch)
+						res.bodyWriter.write(cast(const(ubyte)[]) frame);
+					res.bodyWriter.flush();
+				}();
+				foreach (frame; batch)
+					queued -= frame.length;
+				drained.emit();
+			}
+		}
+		catch (Exception)
+			dead = true;
+	}
+
+	/// Write out what is queued, waiting at most `drain`, then stop the writer;
+	/// a client still not reading by then has its connection closed.
+	void close(Duration drain = 5.seconds) @safe
+	{
+		closing = true;
+		const ec = finished.emitCount;
+		if (!started || !writer.running)
+			return;
+		wake.emit();
+		finished.wait(drain, ec);
+		if (writer.running)
+		{
+			abort();
+			finished.wait(drain, ec);
+		}
+	}
+
+	/// Give up on the stream: drop the queue, close the connection so a write
+	/// parked on the stalled socket fails, and stop the writer.
+	private void abort() @safe
+	{
+		dead = true;
+		queue = null;
+		closeRawConnection(res);
+		if (started && writer.running && writer != Task.getThis())
+			writer.interrupt();
+	}
+}
+
+/// Close the TCP connection under `res`, so a write blocked on a client that
+/// stopped reading fails at once. vibe.d exposes no public close for a server
+/// response, so its private raw-connection field is located by name; a test
+/// response has none, and then nothing happens.
+private void closeRawConnection(HTTPServerResponse res) @trusted nothrow
+{
+	foreach (i, ref field; res.tupleof)
+	{
+		static if (__traits(identifier, res.tupleof[i]) == "m_rawConnection")
+		{
+			try
+			{
+				if (field)
+					field.close();
+			}
+			catch (Exception)
+			{
+			}
+		}
+	}
+}
+
+/// The queued writer for one SSE response; see `SseWriter`.
+private SseWriter sseFrameWriter(HTTPServerResponse res,
+		size_t maxQueued = defaultMaxQueuedStreamBytes) @safe
+{
+	return new SseWriter(res, maxQueued);
 }
 
 /// Hold an SSE connection open, emitting a comment heartbeat every 15s so a write
@@ -712,15 +863,14 @@ private void holdSessionStream(void delegate(string) @safe writeFrame, ServerPus
 /// token, so server notifications and requests reach it as `message` events;
 /// `notifications/resources/updated` is gated on the stream's own subscriptions.
 private void handleLegacyGet(McpServer server, LegacySseChannel channel,
-		ServerPushChannel push, string principal, HTTPServerResponse res) @safe
+		ServerPushChannel push, string principal, size_t maxQueued, HTTPServerResponse res) @safe
 {
 	res.contentType = "text/event-stream";
 	applySseStreamHeaders(res, false);
 
-	// LegacySseChannel.deliverTo itself has no write serialization, so without the
-	// per-stream lock two concurrent deliveries -- or a delivery racing the
-	// heartbeat -- could interleave SSE frames.
-	auto writeFrame = sseFrameWriter(res);
+	auto writeFrame = sseFrameWriter(res, maxQueued);
+	scope (exit)
+		writeFrame.close();
 
 	const listenerId = channel.addListener((string frame) @safe {
 		writeFrame(frame);
@@ -736,7 +886,7 @@ private void handleLegacyGet(McpServer server, LegacySseChannel channel,
 	scope (exit)
 		push.removeListener(pushId);
 
-	holdSessionStream(writeFrame, push, pushId, null, sessionId, 15.seconds);
+	holdSessionStream(&writeFrame.opCall, push, pushId, null, sessionId, 15.seconds);
 }
 
 /// Process a single JSON-RPC message (or 2024-11-05 batch) POSTed to the legacy
@@ -1509,7 +1659,9 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// X-Accel-Buffering: no SHOULD is a modern-only rule, so it is not emitted here.
 	applySseStreamHeaders(res, false);
 
-	auto writeFrame = sseFrameWriter(res);
+	auto writeFrame = sseFrameWriter(res, opts.streamLimits.maxQueuedStreamBytes);
+	scope (exit)
+		writeFrame.close();
 
 	// Resumability and Redelivery (basic/transports §Resumability and Redelivery):
 	// if the reconnecting client supplied the `Last-Event-ID` header, hand it to
@@ -1549,7 +1701,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 		}
 	}
 
-	holdSessionStream(writeFrame, push, listenerId, sessions, ownerToken, 15.seconds);
+	holdSessionStream(&writeFrame.opCall, push, listenerId, sessions, ownerToken, 15.seconds);
 }
 
 /// Serve a modern `subscriptions/listen` request as a long-lived SSE notification
@@ -1566,7 +1718,8 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 /// notifications onto it. The connection is held open (with SSE comment
 /// heartbeats) until the client disconnects.
 private void handleListenStream(McpServer server, StreamCoordinator coord, Message msg,
-		HTTPServerResponse res, string protoHeader, string connToken, string principal) @safe
+		HTTPServerResponse res, string protoHeader, string connToken,
+		string principal, size_t maxQueued) @safe
 {
 	// Record the opted-in filters (route -> doSubscribeListen). The one-shot JSON
 	// result is discarded on success: the acknowledgement is delivered as the
@@ -1598,7 +1751,9 @@ private void handleListenStream(McpServer server, StreamCoordinator coord, Messa
 	// §Receiving Messages).
 	applySseStreamHeaders(res, true);
 
-	auto writeFrame = sseFrameWriter(res);
+	auto writeFrame = sseFrameWriter(res, maxQueued);
+	scope (exit)
+		writeFrame.close();
 
 	auto push = ensurePushChannel(server, coord);
 	// The listen request's id becomes the stream's subscriptionId: every
@@ -1623,7 +1778,7 @@ private void handleListenStream(McpServer server, StreamCoordinator coord, Messa
 	push.emitTo(listenerId,
 			subscriptionsAcknowledgedNotification(server.acknowledgedSubsetFor(streamFilter)));
 
-	runSseHeartbeat(writeFrame);
+	runSseHeartbeat(&writeFrame.opCall);
 }
 
 /// Whether `method` opens a modern `events/stream` push response.
@@ -1690,7 +1845,7 @@ EventStreamTick eventStreamTick(bool emitOnly, long sinceHeartbeatMs) @safe pure
 /// advances during quiet periods. Every frame is stamped with the request id in
 /// `_meta` so a client multiplexing several streams can route it.
 private void handleEventsStream(McpServer server, Message msg,
-		HTTPServerResponse res, string principal) @safe
+		HTTPServerResponse res, string principal, size_t maxQueued) @safe
 {
 	import vibe.core.core : sleep;
 	import core.time : msecs;
@@ -1718,7 +1873,9 @@ private void handleEventsStream(McpServer server, Message msg,
 		return;
 	}
 
-	auto writeFrame = sseFrameWriter(res);
+	auto writeFrame = sseFrameWriter(res, maxQueued);
+	scope (exit)
+		writeFrame.close();
 	const subId = msg.id;
 	void deliver(string method, Json params) @safe
 	{
@@ -2068,7 +2225,7 @@ private void refuseTooManyPushStreams(HTTPServerResponse res, Json id) @safe
 
 private void handlePost(McpServer server, StreamCoordinator coord,
 		SessionManager sessions, StatelessInFlight statelessInFlight,
-		StreamGate pushStreams,
+		StreamGate pushStreams, size_t maxQueued,
 		TokenInfo token, string payload, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 
@@ -2342,8 +2499,8 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			}
 			scope (exit)
 				pushStreams.release();
-			handleListenStream(server, coord, msg, res,
-					req.headers.get(HttpHeader.protocolVersion, ""), connToken, principalOf(token));
+			handleListenStream(server, coord, msg, res, req.headers.get(HttpHeader.protocolVersion,
+					""), connToken, principalOf(token), maxQueued);
 			return;
 		}
 		// Modern events/stream (push): like subscriptions/listen, this POST opens a
@@ -2369,7 +2526,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			}
 			scope (exit)
 				pushStreams.release();
-			handleEventsStream(server, msg, res, token.valid ? token.subject : "");
+			handleEventsStream(server, msg, res, token.valid ? token.subject : "", maxQueued);
 			return;
 		}
 		// Resolve THIS request's per-connection state and hand it to
@@ -3459,54 +3616,60 @@ unittest  // legacy support is opt-in: off by default
 	assert(opts.legacyMessagePath == "/message");
 }
 
-unittest  // legacy GET write serialization keeps concurrent SSE frames non-interleaved
+version (unittest) private final class ByteYieldingSink : OutputStream
 {
-	// LegacySseChannel.deliver has no write serialization, so two
-	// concurrent deliveries to one legacy listener could interleave SSE frame bytes
-	// when the underlying socket write yields. handleLegacyGet routes every write --
-	// the listener writer AND the heartbeat -- through one per-stream TaskMutex
-	// (writeFrame), so a write that yields mid-frame cannot be cut into by another
-	// writer. This test models that writeFrame and proves the mutex prevents
-	// interleaving even when the write yields between its two halves.
-	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
-	import vibe.core.sync : TaskMutex;
-	import core.time : msecs;
-
-	auto writeMtx = new TaskMutex;
+@safe:
 	string log;
-	// A write that yields between writing the frame's head and tail: without the
-	// lock a second writer would slot its bytes into the gap.
-	void writeFrame(string head, string tail) @safe
+
+	size_t write(scope const(ubyte)[] bytes, IOMode)
 	{
-		() @trusted {
-			synchronized (writeMtx)
-			{
-				log ~= head;
-				sleep(5.msecs); // yield mid-frame
-				log ~= tail;
-			}
-		}();
+		import vibe.core.core : yield;
+
+		foreach (b; bytes)
+		{
+			log ~= cast(char) b;
+			yield();
+		}
+		return bytes.length;
 	}
 
+	void flush()
+	{
+	}
+
+	void finalize()
+	{
+	}
+}
+
+unittest  // concurrent writes to one SSE stream keep their frames whole
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto sink = new ByteYieldingSink;
+	auto writer = sseFrameWriter(createTestHTTPServerResponse(sink, null,
+			TestHTTPResponseMode.bodyOnly));
 	runTask(() nothrow{
 		try
 		{
 			auto t1 = runTask(() nothrow{
 				try
-					writeFrame("[A", "A]");
+					writer("[AA]");
 				catch (Exception)
 				{
 				}
 			});
 			auto t2 = runTask(() nothrow{
 				try
-					writeFrame("[B", "B]");
+					writer("[BB]");
 				catch (Exception)
 				{
 				}
 			});
 			t1.join();
 			t2.join();
+			writer.close();
 		}
 		catch (Exception)
 		{
@@ -3514,10 +3677,80 @@ unittest  // legacy GET write serialization keeps concurrent SSE frames non-inte
 		exitEventLoop();
 	});
 	runEventLoop();
+	assert(sink.log == "[AA][BB]" || sink.log == "[BB][AA]", "SSE frames interleaved: " ~ sink.log);
+}
 
-	// Each frame's head and tail are adjacent (no foreign bytes between them):
-	// the only valid serializations are "[AA][BB]" or "[BB][AA]".
-	assert(log == "[AA][BB]" || log == "[BB][AA]", "legacy SSE frames interleaved: " ~ log);
+version (unittest) private final class StallingSink : OutputStream
+{
+@safe:
+	bool released;
+
+	size_t write(scope const(ubyte)[] bytes, IOMode) @trusted
+	{
+		import core.time : MonoTime, msecs;
+		import vibe.core.core : sleep;
+
+		const started = MonoTime.currTime;
+		while (!released && MonoTime.currTime - started < 10.seconds)
+			sleep(10.msecs);
+		return bytes.length;
+	}
+
+	void flush()
+	{
+	}
+
+	void finalize()
+	{
+	}
+}
+
+unittest  // a stalled SSE reader blocks neither notify nor other streams, and is dropped
+{
+	import core.time : MonoTime, msecs;
+	import std.algorithm : count;
+	import std.array : replicate;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto stalled = new StallingSink;
+	auto slow = sseFrameWriter(createTestHTTPServerResponse(stalled, null,
+			TestHTTPResponseMode.bodyOnly));
+	auto okSink = createMemoryOutputStream();
+	auto fast = sseFrameWriter(createTestHTTPServerResponse(okSink, null,
+			TestHTTPResponseMode.bodyOnly));
+	auto ch = new ServerPushChannel(new StreamCoordinator);
+	ch.addListener((string f) @safe { slow(f); }, Json.init, ListenFilter.init, "", null, "A");
+	ch.addListener((string f) @safe { fast(f); }, Json.init, ListenFilter.init, "", null, "B");
+
+	Duration took;
+	size_t received, remaining;
+	runTask(() @safe nothrow{
+		try
+		{
+			const big = Json("x".replicate(64 * 1024));
+			const started = MonoTime.currTime;
+			foreach (_; 0 .. 40)
+				ch.notify("notifications/message", Json(["data": big]));
+			took = MonoTime.currTime - started;
+			sleep(100.msecs);
+			received = () @trusted {
+				return (cast(string) okSink.data).count("notifications/message");
+			}();
+			remaining = ch.listenerCount;
+		}
+		catch (Exception)
+		{
+		}
+		stalled.released = true;
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(took < SseWriter.queueStallTimeout + 1.seconds,
+			"a stalled reader must hold up notify only until its queue gives up on it");
+	assert(received == 40, "a healthy stream must receive every notification");
+	assert(remaining == 1, "a stream whose client stopped reading must be dropped");
 }
 
 unittest  // localhost hosts are accepted, foreign hosts rejected
