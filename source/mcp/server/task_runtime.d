@@ -540,18 +540,24 @@ final class TaskRuntime
 	}
 
 	/// Record `tasks/update` input responses for a task, keeping the latest value
-	/// per key. Throws `-32602` when `inputResponses` is not an object, when the
-	/// task is unknown, when it is already terminal (no executor will ever read
-	/// the answers), or when any key is not among the task's current
-	/// `inputRequests` (nothing is recorded then; `data.keys` lists them).
-	void deliverInput(string id, Json inputResponses) @safe
+	/// per key. When the task is executor-backed and these answers complete its
+	/// outstanding `inputRequests`, it moves back to `working` in the same atomic
+	/// update and `deliverInput` returns true: the caller re-dispatches the
+	/// executor, and of concurrent updates exactly one sees true. A partial answer
+	/// is recorded but leaves the task `input_required`. Throws `-32602` when
+	/// `inputResponses` is not a non-empty object, when the task is unknown, when
+	/// it is already terminal (no executor will ever read the answers), or when
+	/// any key is not among the task's current `inputRequests` (nothing is
+	/// recorded then; `data.keys` lists them).
+	bool deliverInput(string id, Json inputResponses) @safe
 	{
 		import mcp.protocol.errors : invalidParams;
 
-		require(id);
-		if (inputResponses.type != Json.Type.object)
-			throw invalidParams("tasks/update 'inputResponses' must be an object");
+		if (inputResponses.type != Json.Type.object || inputResponses.length == 0)
+			throw invalidParams("tasks/update 'inputResponses' must be a non-empty object");
+		bool resumed;
 		modify(id, (ref TaskRecord r) @trusted {
+			resumed = false;
 			if (isTerminal(r.meta.status))
 			{
 				Json data = Json.emptyObject;
@@ -577,8 +583,18 @@ final class TaskRuntime
 			}
 			foreach (string k, v; inputResponses)
 				r.inputResponses[k] = v;
-			return Change.state;
+			if (r.toolName.length == 0 || r.meta.status != TaskStatus.inputRequired)
+				return Change.state;
+			foreach (string k, v; r.inputRequests)
+				if (k !in r.inputResponses)
+					return Change.state;
+			transition(r, TaskStatus.working);
+			r.inputRequests = Json.emptyObject;
+			r.detached = false;
+			resumed = true;
+			return Change.status;
 		});
+		return resumed;
 	}
 
 	/// The responses delivered so far for a task (keyed by input-request key).

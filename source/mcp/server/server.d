@@ -2885,14 +2885,11 @@ final class McpServer : ServerCore
 		requireTasksDeclared(params);
 		const id = requireTaskId(params);
 		taskRuntime_.requireAccess(id, requestPrincipal(ctx));
-		Json responses = ("inputResponses" in params) ? params["inputResponses"] : Json.emptyObject;
-		taskRuntime_.deliverInput(id, responses); // throws -32602 for an unknown task
-		// Resume an executor-backed task that was waiting on this input: move it
-		// back to `working` and re-dispatch so the executor re-runs and consumes
-		// the delivered answers. Manual (executor-less) tasks are left as-is. Of
-		// concurrent updates, only the one that wins the resume re-dispatches.
-		if (taskRuntime_.toolName(id).length > 0 && taskDispatcher_ !is null
-				&& taskRuntime_.resumeWorking(id))
+		Json responses = ("inputResponses" in params) ? params["inputResponses"] : Json.undefined;
+		// An executor-backed task whose outstanding input is now fully answered
+		// is moved back to `working` by `deliverInput`; re-dispatch it so the
+		// executor re-runs and consumes the answers.
+		if (taskRuntime_.deliverInput(id, responses))
 			taskDispatcher_.dispatch(id, &runTaskExecutorById);
 		return Json.emptyObject; // empty acknowledgement
 	}
@@ -7894,6 +7891,81 @@ unittest  // input_required surfaces inputRequests and tasks/update is acknowled
 	assert("error" !in ack);
 	assert(ack["result"].type == Json.Type.object);
 	assert(rt.takenInput(t.taskId)["k1"]["answer"].get!string == "yes");
+}
+
+version (unittest) private McpServer twoQuestionTaskServer(out int* runs) @safe
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	Tool desc;
+	desc.name = "ask2";
+	desc.inputSchema = Json(["type": Json("object")]);
+	int* counter = new int;
+	runs = counter;
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		(*counter)++;
+		if (!tc.hasInput("a") || !tc.hasInput("b"))
+			return tc.requireInput([
+			InputRequest.elicitation("a", "A?"),
+			InputRequest.elicitation("b", "B?")
+		]);
+		return Json(["content": Json.emptyArray]);
+	});
+	return s;
+}
+
+version (unittest) private Json taskUpdate(string id, Json responses) @safe
+{
+	Json up = Json(["taskId": Json(id)]);
+	if (responses.type != Json.Type.undefined)
+		up["inputResponses"] = responses;
+	return up;
+}
+
+unittest  // tasks/update resumes the executor only once every requested key is answered
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	int* runs;
+	auto s = twoQuestionTaskServer(runs);
+	auto created = s.handle(modernReq(1, "tools/call",
+			Json(["name": Json("ask2"), "arguments": Json.emptyObject]))).get;
+	const id = created["result"]["taskId"].get!string;
+	assert(*runs == 1);
+
+	auto partial = s.handle(modernReq(2, "tasks/update", taskUpdate(id,
+			Json(["a": Json(["action": Json("accept")])])))).get;
+	assert("error" !in partial);
+	assert(*runs == 1, "a partial answer must not re-run the executor");
+	assert(s.tasks.statusOf(id).get == TaskStatus.inputRequired);
+
+	auto rest = s.handle(modernReq(3, "tasks/update", taskUpdate(id,
+			Json(["b": Json(["action": Json("accept")])])))).get;
+	assert("error" !in rest);
+	assert(*runs == 2);
+	assert(s.tasks.statusOf(id).get == TaskStatus.completed);
+}
+
+unittest  // tasks/update with no or empty inputResponses is -32602 and re-runs nothing
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	int* runs;
+	auto s = twoQuestionTaskServer(runs);
+	auto created = s.handle(modernReq(1, "tools/call",
+			Json(["name": Json("ask2"), "arguments": Json.emptyObject]))).get;
+	const id = created["result"]["taskId"].get!string;
+	foreach (i, body_; [
+			taskUpdate(id, Json.undefined), taskUpdate(id, Json.emptyObject)
+		])
+	{
+		auto resp = s.handle(modernReq(2 + cast(long) i, "tasks/update", body_)).get;
+		assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	}
+	assert(*runs == 1);
+	assert(s.tasks.statusOf(id).get == TaskStatus.inputRequired);
 }
 
 unittest  // tasks/cancel acknowledges and cancels a task
