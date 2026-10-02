@@ -3694,6 +3694,9 @@ final class McpServer : ServerCore
 ///   - `{#var}`: an optional `#`-prefixed fragment, which may contain `/`.
 ///   - `{/var}` / `{.var}`: optional `/`- or `.`-prefixed segments, one per
 ///     variable, none containing `/`.
+/// Outside a fragment, a value with a `.` or `..` path segment (raw or
+/// percent-encoded) does not match, so a captured value never walks out of the
+/// path the template names.
 ///   - `{;var}` / `{?var}` / `{&var}`: optional `name=value` pairs, only for the
 ///     variables the expression names, in any order.
 /// Values are percent-decoded per RFC 3986; a malformed escape does not match.
@@ -3804,6 +3807,9 @@ private bool bindUriExpression(string expr, string s, ref string[string] params)
 			string v;
 			if (!decodeUriValue(raw, allowSlash || (mergedPath && i + 1 == parts.length), v))
 				return false;
+			// A fragment is never resolved as a path, so only it may carry dot segments.
+			if (op != '#' && hasDotSegment(v))
+				return false;
 			params[names[i]] = v;
 		}
 		return true;
@@ -3849,6 +3855,15 @@ private bool bindUriExpression(string expr, string s, ref string[string] params)
 	}
 }
 
+/// Whether any `/`-separated segment of the decoded value `v` is `.` or `..`, so
+/// a reader that joins the value onto a path cannot be walked out of it.
+private bool hasDotSegment(string v) @safe
+{
+	import std.algorithm : any, splitter;
+
+	return v.splitter('/').any!(seg => seg == "." || seg == "..");
+}
+
 /// Percent-decode a captured template value. Unless `allowSlash`, a value whose
 /// raw or decoded form contains `/` — or whose raw form contains `?` or `#` — is
 /// rejected. Returns false on a malformed escape.
@@ -3892,6 +3907,29 @@ unittest  // a simple {var} never captures a '/' (no path traversal)
 	string[string] params;
 	assert(!matchUriTemplate("file:///{path}", "file:///a/b/c", params));
 	assert(!matchUriTemplate("file:///docs/{name}", "file:///docs/../../etc/passwd", params));
+}
+
+unittest  // a simple {var} rejects a '.' or '..' value, raw or percent-encoded
+{
+	string[string] params;
+	assert(!matchUriTemplate("file:///{dir}/{file}", "file:///../passwd", params));
+	assert(!matchUriTemplate("file:///{dir}/{file}", "file:///%2e%2e/passwd", params));
+	assert(!matchUriTemplate("file:///{dir}/{file}", "file:///%2E./passwd", params));
+	assert(!matchUriTemplate("file:///docs/{name}", "file:///docs/.", params));
+	assert(matchUriTemplate("file:///docs/{name}", "file:///docs/..hidden", params));
+	assert(params["name"] == "..hidden");
+}
+
+unittest  // segment and reserved expressions reject a '.' or '..' path segment
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://x{/seg}", "res://x/..", params));
+	assert(!matchUriTemplate("res://x{/path*}", "res://x/a/../b", params));
+	assert(!matchUriTemplate("res://x/{+path}", "res://x/a/../../etc", params));
+	assert(!matchUriTemplate("res://x/{+path}", "res://x/a/%2e%2e/etc", params));
+	assert(!matchUriTemplate("res://x/{+path}", "res://x/a%2F..%2Fetc", params));
+	assert(matchUriTemplate("res://x/{+path}", "res://x/a/b.c/d", params));
+	assert(params["path"] == "a/b.c/d");
 }
 
 unittest  // a simple {var} rejects a percent-encoded '/' (no encoded traversal)
