@@ -163,8 +163,8 @@ final class StdioClientTransport : ClientTransport
 	/// request id, per the modern stdio cancellation rule. The server answers the
 	/// listen request only when the stream ends: an error reply before the leading
 	/// frame is thrown from here, and a later reply ends the handle (`ended`,
-	/// `error`). When no leading frame arrives within ten seconds the stream is
-	/// cancelled and this throws `RequestTimeoutException`.
+	/// `error`). When no leading frame arrives within the listen timeout (ten
+	/// seconds) the stream is cancelled and this throws `RequestTimeoutException`.
 	SubscriptionStream openListen(Json message) @safe
 	{
 		import vibe.core.core : runTask;
@@ -368,7 +368,8 @@ final class StdioClientTransport : ClientTransport
 
 	/// Shut the owned child down per the MCP stdio Shutdown sequence and return its
 	/// exit status (a process killed by signal reports a negative status:
-	/// `-SIGTERM` / `-SIGKILL`). Safe to call once.
+	/// `-SIGTERM` / `-SIGKILL`). Call it at most once, since it releases the
+	/// pipes; `close()` runs it only on the first close.
 	version (Posix) package int closeProcess(Duration termGrace, Duration killGrace) @safe
 	{
 		++closeProcessRuns_;
@@ -404,24 +405,16 @@ final class StdioClientTransport : ClientTransport
 		if (!status.isNull)
 			return status.get;
 
-		version (Posix)
-		{
-			// Step 2: escalate to SIGTERM and wait again.
-			() @trusted { p.process.kill(SIGTERM); }();
-			status = () @trusted { return p.process.wait(killGrace); }();
-			if (!status.isNull)
-				return status.get;
+		// Step 2: escalate to SIGTERM and wait again.
+		() @trusted { p.process.kill(SIGTERM); }();
+		status = () @trusted { return p.process.wait(killGrace); }();
+		if (!status.isNull)
+			return status.get;
 
-			// Step 3: still alive -> force kill (SIGKILL) and reap.
-			() @trusted { p.process.kill(SIGKILL); }();
-			() @trusted { p.process.wait(); }();
-			return -SIGKILL;
-		}
-		else
-		{
-			() @trusted { p.process.forceKill(); }();
-			return () @trusted { return p.process.wait(); }();
-		}
+		// Step 3: still alive -> force kill (SIGKILL) and reap.
+		() @trusted { p.process.kill(SIGKILL); }();
+		() @trusted { p.process.wait(); }();
+		return -SIGKILL;
 	}
 
 	/// Windows child shutdown. Windows has no SIGTERM/SIGKILL distinction, so the
