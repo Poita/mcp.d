@@ -3140,8 +3140,7 @@ final class McpServer : ServerCore
 			// Capability gating: mirrors doCallTool — uses per-request
 			// _meta.clientCapabilities on the modern protocol, or the session caps
 			// negotiated at initialize on stateful 2025-era protocols.
-			const ClientCapabilities declared = ver.isModern
-				? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
+			const ClientCapabilities declared = ctx.clientCapabilities();
 			if (auto missing = direct.requiredClientCapabilities.missingFrom(declared))
 				throw missingRequiredClientCapability(missing.get);
 			ReadResourceResult result;
@@ -3155,8 +3154,7 @@ final class McpServer : ServerCore
 			if (matchUriTemplate(t.descriptor.uriTemplate, uri, captured))
 			{
 				// Capability gating: same logic as for direct resources.
-				const ClientCapabilities declared = ver.isModern
-					? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
+				const ClientCapabilities declared = ctx.clientCapabilities();
 				if (auto missing = t.requiredClientCapabilities.missingFrom(declared))
 					throw missingRequiredClientCapability(missing.get);
 				ReadResourceResult result;
@@ -3415,8 +3413,7 @@ final class McpServer : ServerCore
 		// Capability gating: mirrors doCallTool — uses per-request
 		// _meta.clientCapabilities on the modern protocol, or the session caps
 		// negotiated at initialize on stateful 2025-era protocols.
-		const ClientCapabilities declared = ver.isModern
-			? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
+		const ClientCapabilities declared = ctx.clientCapabilities();
 		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
 			throw missingRequiredClientCapability(missing.get);
 
@@ -3638,8 +3635,7 @@ final class McpServer : ServerCore
 		// taken from this request's `_meta.clientCapabilities` on the stateless
 		// modern protocol, or from the session capabilities negotiated at
 		// `initialize` on the stateful 2025-era protocols.
-		const ClientCapabilities declared = ver.isModern
-			? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
+		const ClientCapabilities declared = ctx.clientCapabilities();
 		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
 			throw missingRequiredClientCapability(missing.get);
 
